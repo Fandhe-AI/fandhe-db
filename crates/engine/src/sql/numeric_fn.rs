@@ -352,6 +352,26 @@ mod tests {
         assert_eq!(round2(f64::NEG_INFINITY, -2.0).unwrap(), f64::NEG_INFINITY);
     }
 
+    #[test]
+    fn round2_handles_extreme_magnitudes_without_scientific_notation() {
+        // Bugbot 指摘の確認テスト（false positive の記録）: Rust の `f64` の
+        // `Display`（`{}` フォーマット）は他言語（Python/JavaScript の
+        // `str`/`repr`）と異なり、絶対値の大小によらず科学的記数法
+        // （`1e-10` 等）へ切り替わらない（`std::fmt::Display for f64` の
+        // 実装は常に固定小数点表記。`{:e}` を明示指定した場合のみ指数表記）。
+        // `round2` が `format!("{}", x.abs())` の結果に `'e'`/`'E'` を含む
+        // ケースを一切考慮していない設計は、この Rust の保証に依拠している。
+        // 極小・極大の絶対値でも整数部・小数部の分割と丸めが破綻しないことを
+        // 固定する。
+        assert_eq!(round2(0.00001234, 8.0).unwrap(), 0.00001234);
+        assert_eq!(round2(0.000012349, 8.0).unwrap(), 0.00001235);
+        assert!((round2(1.23e-10, 11.0).unwrap() - 1.2e-10).abs() < 1e-25);
+        assert_eq!(round2(1.0e20, 0.0).unwrap(), 1.0e20);
+        assert_eq!(round2(1.0e20, -25.0).unwrap(), 0.0);
+        assert!(!format!("{}", 1.23e-10_f64).contains(['e', 'E']));
+        assert!(!format!("{}", 1.0e20_f64).contains(['e', 'E']));
+    }
+
     // NUMERIC 型の値は式（`SELECT`/`WHERE` 中の関数呼び出し引数）としては
     // 束縛段で拒否され本関数へ到達しない（`sql/udf_call.rs` の
     // `ColumnType::Numeric` 分岐、TABLE-13〔検討中〕・TASK-197、Issue #885・
