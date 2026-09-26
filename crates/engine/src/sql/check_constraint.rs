@@ -64,6 +64,33 @@ fn render_predicate(predicate: &WherePredicate) -> String {
             )
         }
         WherePredicate::Expression(expr) => render_expression_predicate(expr),
+        // SQL-24（TASK-208 ポインタ）。CHECK 制約は `reject_forbidden_elements`
+        // が構築（`validate_and_build`）の時点でこれらの形を `42601` として
+        // 拒否するため、本関数へは実質到達しない。網羅性のためだけに正規化
+        // レンダリングを用意する（往復一致の対象にはならない）。
+        WherePredicate::InList { column, values } => {
+            let items = values
+                .iter()
+                .map(|v| format!("'{}'", escape_literal(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{column} IN ({items})")
+        }
+        WherePredicate::Between { column, low, high } => {
+            format!(
+                "{column} BETWEEN '{}' AND '{}'",
+                escape_literal(low),
+                escape_literal(high)
+            )
+        }
+        WherePredicate::IsNull { column, negated } => {
+            if *negated {
+                format!("{column} IS NOT NULL")
+            } else {
+                format!("{column} IS NULL")
+            }
+        }
+        WherePredicate::Not(inner) => format!("NOT {}", render_predicate(inner)),
     }
 }
 
@@ -158,6 +185,18 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                 )));
             }
             WherePredicate::Expression(expr) => reject_forbidden_expr(expr)?,
+            // SQL-24（TASK-208 ポインタ）: `IN`／`BETWEEN`／`IS [NOT] NULL`／`NOT`
+            // は CHECK 制約では未対応のまま拒否する（`enforce` の
+            // 「NULL なら常に合格」という短絡が `IS NOT NULL` の意味と相容れない
+            // ため。TABLE-16 の既存挙動は不変。対応は別 Issue へ申し送り）。
+            WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Not(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "IN/BETWEEN/IS NULL/NOT are not supported in CHECK constraints",
+                ));
+            }
             WherePredicate::Equality { .. }
             | WherePredicate::Prefix { .. }
             | WherePredicate::BoolEquality { .. }
@@ -652,6 +691,29 @@ mod tests {
         let schema = schema_of(&v);
         let checks = validate_and_build(&schema, &v.checks).expect("must validate");
         assert_eq!(checks[0].name, "kind_ck");
+    }
+
+    /// SQL-24（TASK-208 ポインタ）: `IN`／`BETWEEN`／`IS [NOT] NULL`／`NOT` は
+    /// 構文段（`sql::allowlist`）では受理されるが、CHECK 制約の構築時に
+    /// `reject_forbidden_elements` が `42601` で拒否する（`enforce` の
+    /// 「NULL なら常に合格」という短絡が `IS NOT NULL` の意味と相容れない
+    /// ため。TABLE-16 の既存挙動は不変のまま）。
+    #[test]
+    fn validate_and_build_rejects_new_sql24_predicate_forms() {
+        for sql in [
+            "CREATE TABLE docs (kind TEXT CHECK (kind IN ('a', 'b')))",
+            "CREATE TABLE docs (kind TEXT CHECK (kind NOT IN ('a', 'b')))",
+            "CREATE TABLE docs (kind TEXT CHECK (kind BETWEEN 'a' AND 'z'))",
+            "CREATE TABLE docs (kind TEXT CHECK (kind IS NULL))",
+            "CREATE TABLE docs (kind TEXT CHECK (kind IS NOT NULL))",
+            "CREATE TABLE docs (kind TEXT CHECK (NOT kind = 'a'))",
+        ] {
+            let v = parse_create_table(sql);
+            let schema = schema_of(&v);
+            let err = validate_and_build(&schema, &v.checks)
+                .expect_err(&format!("{sql:?} must be rejected"));
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]

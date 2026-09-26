@@ -918,8 +918,6 @@ fn push_dml_where_predicates(
     predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-    use crate::sql::allowlist::WherePredicate;
-
     let count = u32::try_from(predicates.len()).map_err(|_| dml_hash_field_too_large())?;
     b.push_raw(&count.to_le_bytes());
 
@@ -928,64 +926,7 @@ fn push_dml_where_predicates(
         std::collections::BTreeMap::new();
 
     for pred in predicates {
-        match pred {
-            WherePredicate::Equality { column, value } => {
-                b.push_u8(1);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_bytes(value.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            WherePredicate::Prefix { column, pattern } => {
-                b.push_u8(2);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_bytes(pattern.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            WherePredicate::PredicateCall { name } => {
-                b.push_u8(3);
-                b.push_bytes(name.to_ascii_lowercase().as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            WherePredicate::Expression(expr) => {
-                b.push_u8(4);
-                push_dml_expr(b, expr, None)?;
-                collect_referenced_udfs(expr, udf_registry, &mut referenced)?;
-            }
-            // `BoolColumn`（`WHERE flag`）と `BoolEquality { value: true }`
-            // （`WHERE flag = true`）は評価結果としては同一だが、構文が異なる
-            // ため安全側に倒し別タグ・別ハッシュとする（Issue #883）。
-            WherePredicate::BoolEquality { column, value } => {
-                b.push_u8(5);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_u8(u8::from(*value));
-            }
-            WherePredicate::BoolColumn { column } => {
-                b.push_u8(6);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
-            // （`< > <= >=`。TABLE-13・TASK-199、Issue #891）。演算子の判別子
-            // （`CompareOp` の宣言順）を末尾へ付け加えることで、列・リテラルが
-            // 同じでも演算子が異なれば別ハッシュになる。
-            WherePredicate::Compare { column, op, value } => {
-                b.push_u8(7);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_bytes(value.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                let op_tag: u8 = match op {
-                    crate::sql::allowlist::CompareOp::Lt => 0,
-                    crate::sql::allowlist::CompareOp::Le => 1,
-                    crate::sql::allowlist::CompareOp::Gt => 2,
-                    crate::sql::allowlist::CompareOp::Ge => 3,
-                };
-                b.push_u8(op_tag);
-            }
-        }
+        push_dml_where_predicate(b, pred, udf_registry, &mut referenced)?;
     }
 
     // 参照 UDF 定義セクション（ADR §4.4.1「6.」）。参照 UDF が無ければ件数
@@ -1013,6 +954,120 @@ fn push_dml_where_predicates(
         }
     }
 
+    Ok(())
+}
+
+/// [`push_dml_where_predicates`] のループ本体（種別タグ 1 件分の直列化）。
+/// `Not`（タグ 11）は内側を再帰でそのまま直列化する（構文段の不変条件により
+/// 深さは常に 1 のため無限再帰は起きない）。`referenced`（Expression 述語が
+/// 参照する UDF の推移閉包）は呼び出し元と共有し、`Not` の内側に `Expression`
+/// が来ることは構文段の不変条件により無いが、将来の拡張に備えて引数として
+/// 引き回す。
+fn push_dml_where_predicate(
+    b: &mut HashInputBuilder,
+    pred: &crate::sql::allowlist::WherePredicate,
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+    referenced: &mut std::collections::BTreeMap<String, crate::sql::udf_call::UdfDefinition>,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::allowlist::WherePredicate;
+
+    match pred {
+        WherePredicate::Equality { column, value } => {
+            b.push_u8(1);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(value.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        WherePredicate::Prefix { column, pattern } => {
+            b.push_u8(2);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(pattern.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        WherePredicate::PredicateCall { name } => {
+            b.push_u8(3);
+            b.push_bytes(name.to_ascii_lowercase().as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        WherePredicate::Expression(expr) => {
+            b.push_u8(4);
+            push_dml_expr(b, expr, None)?;
+            collect_referenced_udfs(expr, udf_registry, referenced)?;
+        }
+        // `BoolColumn`（`WHERE flag`）と `BoolEquality { value: true }`
+        // （`WHERE flag = true`）は評価結果としては同一だが、構文が異なる
+        // ため安全側に倒し別タグ・別ハッシュとする（Issue #883）。
+        WherePredicate::BoolEquality { column, value } => {
+            b.push_u8(5);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_u8(u8::from(*value));
+        }
+        WherePredicate::BoolColumn { column } => {
+            b.push_u8(6);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
+        // （`< > <= >=`。TABLE-13・TASK-199、Issue #891）。演算子の判別子
+        // （`CompareOp` の宣言順）を末尾へ付け加えることで、列・リテラルが
+        // 同じでも演算子が異なれば別ハッシュになる。
+        WherePredicate::Compare { column, op, value } => {
+            b.push_u8(7);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(value.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            let op_tag: u8 = match op {
+                crate::sql::allowlist::CompareOp::Lt => 0,
+                crate::sql::allowlist::CompareOp::Le => 1,
+                crate::sql::allowlist::CompareOp::Gt => 2,
+                crate::sql::allowlist::CompareOp::Ge => 3,
+            };
+            b.push_u8(op_tag);
+        }
+        // `IN`（SQL-24。TASK-208 ポインタ）。件数プレフィクス（u32 LE）に続けて
+        // 各要素を出現順のまま連結する（構文段が要素の順序を保持したまま束縛
+        // するため、順序を変えるとハッシュが不安定になる）。
+        WherePredicate::InList { column, values } => {
+            b.push_u8(8);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            let count = u32::try_from(values.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for value in values {
+                b.push_bytes(value.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+        }
+        // `BETWEEN`（SQL-24。TASK-208 ポインタ）。
+        WherePredicate::Between { column, low, high } => {
+            b.push_u8(9);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(low.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(high.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        // `IS [NOT] NULL`（SQL-24。TASK-208 ポインタ）。`negated` を末尾へ
+        // 付け加えることで `IS NULL` と `IS NOT NULL` が別ハッシュになる。
+        WherePredicate::IsNull { column, negated } => {
+            b.push_u8(10);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_u8(u8::from(*negated));
+        }
+        // `NOT`（SQL-24。TASK-208 ポインタ）。内側を再帰でそのまま直列化する。
+        // 構文段が連続する `NOT` を偶奇で畳んでいる（正規化済み）ため、
+        // `NOT NOT x` と `x` は同じハッシュになる（意図した正規化）。
+        WherePredicate::Not(inner) => {
+            b.push_u8(11);
+            push_dml_where_predicate(b, inner, udf_registry, referenced)?;
+        }
+    }
     Ok(())
 }
 
@@ -2260,6 +2315,83 @@ mod tests {
             h_empty, h_populated,
             "UDF section must be omitted entirely when no UDF is referenced by WHERE"
         );
+    }
+
+    // --- SQL-24（TASK-208 ポインタ）: IN / BETWEEN / IS NULL / NOT のハッシュ --
+
+    fn hash_for(predicate: crate::sql::allowlist::WherePredicate) -> ContentHash {
+        let empty_registry = crate::sql::udf_call::UdfRegistry::default();
+        for_delete_where("t", &[predicate], &empty_registry).expect("hash")
+    }
+
+    #[test]
+    fn new_predicate_forms_each_get_a_distinct_hash() {
+        use crate::sql::allowlist::WherePredicate;
+
+        let in_list = WherePredicate::InList {
+            column: "lang".to_string(),
+            values: vec!["ja".to_string(), "en".to_string()],
+        };
+        let not_in_list = WherePredicate::Not(Box::new(in_list.clone()));
+        let between = WherePredicate::Between {
+            column: "day".to_string(),
+            low: "2024-01-01".to_string(),
+            high: "2024-06-01".to_string(),
+        };
+        let is_null = WherePredicate::IsNull {
+            column: "tag".to_string(),
+            negated: false,
+        };
+        let is_not_null = WherePredicate::IsNull {
+            column: "tag".to_string(),
+            negated: true,
+        };
+
+        let hashes = [
+            hash_for(in_list.clone()),
+            hash_for(not_in_list.clone()),
+            hash_for(between.clone()),
+            hash_for(is_null.clone()),
+            hash_for(is_not_null.clone()),
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for (j, b) in hashes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "predicate forms at index {i} and {j} must not collide"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 構文段が連続する `NOT` を偶奇で正規化する契約（`sql::allowlist::
+    /// Parser::parse_where_leaf`）により、`NOT NOT x` と `x` は同一の
+    /// `WherePredicate` 木になる。ここではその正規化済み木を直接ハッシュし、
+    /// 「畳んだ結果は元と同一ハッシュ」であることを固定する（意図した挙動）。
+    #[test]
+    fn double_not_folds_to_the_same_hash_as_no_not() {
+        use crate::sql::allowlist::WherePredicate;
+
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        };
+        let not_not_eq = eq.clone(); // 構文段で既に畳み込み済みの表現。
+        assert_eq!(hash_for(eq), hash_for(not_not_eq));
+    }
+
+    #[test]
+    fn not_wrapped_predicate_hash_differs_from_unwrapped() {
+        use crate::sql::allowlist::WherePredicate;
+
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        };
+        let not_eq = WherePredicate::Not(Box::new(eq.clone()));
+        assert_ne!(hash_for(eq), hash_for(not_eq));
     }
 
     /// NUMERIC 値（TABLE-13〔検討中〕・TASK-197、Issue #885・D7）のハッシュは、

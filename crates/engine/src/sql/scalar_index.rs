@@ -1238,6 +1238,18 @@ impl ScalarIndex {
         if let FilterOp::TypedCompare { op, value } = filter.op() {
             return self.typed_compare_candidates(filter.column_index(), *op, value);
         }
+        // `BETWEEN`（`FilterOp::Between`。SQL-24・TASK-208 ポインタ）は
+        // `Ge`∧`Le` の交差として導出する（`typed_compare_candidates` を 2 回
+        // 呼ぶ。`BYTEA` は `OrderedColumnIndex` に対応 variant が無く
+        // `typed_compare_candidates` 自身が `None` を返すため、ここでも
+        // 未対応のまま fail-closed に縮退する）。
+        if let FilterOp::Between { low, high } = filter.op() {
+            use crate::declarative_filter::CompareOp;
+            let lower = self.typed_compare_candidates(filter.column_index(), CompareOp::Ge, low)?;
+            let upper =
+                self.typed_compare_candidates(filter.column_index(), CompareOp::Le, high)?;
+            return intersect_sorted(&lower, &upper);
+        }
         let column = self.columns.get(filter.column_index())?.as_ref()?;
         let mut result = match filter.op() {
             FilterOp::Equals(value) => column
@@ -1247,21 +1259,50 @@ impl ScalarIndex {
                 .map(|s| s.to_vec())
                 .unwrap_or_default(),
             FilterOp::StartsWith(prefix) => column.prefix_slots(prefix),
+            // `IN`（`TEXT`／`ENUM` 列。SQL-24・TASK-208 ポインタ）: 値ごとの
+            // 等価スロットの和集合を取る。束縛段（`declarative_filter::
+            // bind_filter_op`）が値を重複除去済みで渡すため本来互いに素だが、
+            // 防御的に `sort_unstable`＋`dedup`（呼び出し元と同じ後処理）で
+            // 冪等にする。
+            FilterOp::InText(values) => {
+                let mut union = Vec::new();
+                for value in values {
+                    if let Some(slots) = column
+                        .equality
+                        .get(value)
+                        .and_then(|&vi| column.slots_for_value_index(vi))
+                    {
+                        union.extend_from_slice(slots);
+                    }
+                }
+                union
+            }
             // BOOLEAN 列は索引化しない（`per_column` が常に `None`。上の
             // `?` で既にここへ到達しない）ため構造的に到達しないが、
             // 網羅性のため fail-closed に `None` を返す。
             FilterOp::BoolEquals(_) => return None,
             // 上の早期リターンで処理済みのため構造的に到達しないが、
             // 網羅性のため fail-closed に `None` を返す。
-            FilterOp::TypedCompare { .. } => return None,
-            // `Compare`（未束縛）は `bind` を経た `MetadataFilter` には
-            // 現れない契約だが網羅性のため同じ腕で扱う。索引で解決しない
-            // ことで `sql::exec` は候補削減を信頼せず既存の全行走査
-            // （フィルタ事前/事後適用）へフォールバックする（fail-closed。
-            // 索引未対応が誤って「一致 0 件」に化けない）。
-            FilterOp::Compare { .. } => return None,
+            FilterOp::TypedCompare { .. } | FilterOp::Between { .. } => return None,
+            // `Compare`／`InListLiteral`／`BetweenLiteral`（未束縛）・
+            // `InTyped`／`IsNull`／`IsNotNull`／`Not`（索引未対応。SQL-24・
+            // TASK-208 ポインタ。`sql::scalar_plan::classify_scalar_plan` が
+            // 事前ゲートで `PlainScan` へ倒すため通常はここへ来ない）は
+            // `bind` を経た `MetadataFilter` に現れうる／現れない契約に
+            // 関わらず同じ腕で扱う。索引で解決しないことで `sql::exec` は
+            // 候補削減を信頼せず既存の全行走査（フィルタ事前/事後適用）へ
+            // フォールバックする（fail-closed。索引未対応が誤って
+            // 「一致 0 件」に化けない）。
+            FilterOp::Compare { .. }
+            | FilterOp::InListLiteral { .. }
+            | FilterOp::BetweenLiteral { .. }
+            | FilterOp::InTyped(_)
+            | FilterOp::IsNull
+            | FilterOp::IsNotNull
+            | FilterOp::Not(_) => return None,
         };
         result.sort_unstable();
+        result.dedup();
         Some(result)
     }
 
@@ -2385,6 +2426,51 @@ mod tests {
         let missing = index.candidates_for(&MetadataFilter_equals(&schema, "kind", "gamma"));
         assert_eq!(missing, Some(Vec::new()));
         let _ = path_col;
+    }
+
+    /// `IN`（`FilterOp::InText`。SQL-24・TASK-208 ポインタ）の候補が全走査
+    /// オラクル（[`oracle_matches`]。`MetadataFilter::matches` を経由するため
+    /// `eval` の三値論理をそのまま踏襲する）と完全一致することを固定する
+    /// （値ごとの等価スロット和集合の導出が正しいことの検証）。
+    #[test]
+    fn in_text_candidates_matches_full_scan_oracle() {
+        let path = unique_db_path("scalar-index-in-text-oracle");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(
+            &storage,
+            &ctx_a,
+            1,
+            Some("alpha"),
+            Some("src/a.rs"),
+            Visibility::Public,
+        );
+        insert(
+            &storage,
+            &ctx_a,
+            2,
+            Some("beta"),
+            Some("src/b.rs"),
+            Visibility::Public,
+        );
+        insert(&storage, &ctx_a, 3, Some("gamma"), None, Visibility::Public);
+        insert(&storage, &ctx_a, 4, None, None, Visibility::Public);
+
+        let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let in_filter = crate::declarative_filter::DeclarativeFilter::in_list(
+            "kind",
+            vec!["alpha".to_string(), "gamma".to_string(), "zzz".to_string()],
+        )
+        .bind(&schema)
+        .expect("bind IN filter");
+        let expected = oracle_matches(&schema, &snapshot, &in_filter);
+        let actual = index.candidates_for(&in_filter).expect("indexed column");
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![0, 2]);
     }
 
     #[test]
@@ -3891,6 +3977,73 @@ mod tests {
             )
             .expect("indexed uuid column");
         assert_eq!(actual, expected, "UUID >= nil");
+    }
+
+    /// `BETWEEN`（`FilterOp::Between`。SQL-24・TASK-208 ポインタ）の候補が
+    /// 全走査オラクル（[`oracle_matches`]）と完全一致することを固定する
+    /// （`Ge`∧`Le` の交差導出が正しいことの検証。レーン B の `DATE` 列で
+    /// 確認する——production 結線済みのため通常の [`ScalarIndex::build`] を
+    /// 使う）。
+    #[test]
+    fn between_typed_range_candidates_matches_full_scan_oracle() {
+        let db_path = unique_db_path("scalar-index-between-oracle");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        // `dt` は 1970-01-01 起点の日数。id=N の `dt = N - 1`（1970-01-01 〜
+        // 1970-01-05）とし、`BETWEEN '1970-01-02' AND '1970-01-04'` が
+        // id=2..4（dt=1..3）だけに一致することを検証する。
+        for (id, dt) in [(1u64, 0i32), (2, 1), (3, 2), (4, 3), (5, 4)] {
+            insert_typed(
+                &storage,
+                &c,
+                id,
+                None,
+                None,
+                None,
+                None,
+                Some(dt),
+                None,
+                None,
+                None,
+                None,
+                Visibility::Public,
+            );
+        }
+        // NULL の `dt` 行（`BETWEEN` は NULL に対して UNKNOWN を返し、
+        // 一致に含まれないことを確認する）。
+        insert_typed(
+            &storage,
+            &c,
+            6,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let dt_col = typed_col(&schema, "dt");
+        assert!(index.typed_column_is_indexed(dt_col));
+
+        let between_filter =
+            crate::declarative_filter::DeclarativeFilter::between("dt", "1970-01-02", "1970-01-04")
+                .bind(&schema)
+                .expect("bind BETWEEN filter");
+        let expected = oracle_matches(&schema, &snapshot, &between_filter);
+        let actual = index
+            .candidates_for(&between_filter)
+            .expect("indexed column");
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![1, 2, 3]);
     }
 
     /// production 経路が実際に呼ぶ [`ScalarIndex::build`] は、レーン B

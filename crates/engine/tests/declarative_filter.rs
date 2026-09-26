@@ -424,15 +424,16 @@ fn ext3_rejects_unsupported_like_forms_with_42601() {
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
+    // `NOT LIKE 'src/%'` は SQL-24（TASK-208 ポインタ）で `Not(Prefix)` として
+    // 受理するようになったため、本テストの対象からは外した（回帰は
+    // `tests/sql24_in_between_null_not.rs`／`sql::allowlist::tests::
+    // accepts_not_like_as_negated_prefix` が固定する）。
     for sql in [
-        "SELECT * FROM docs WHERE path NOT LIKE 'src/%' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         "SELECT * FROM docs WHERE path ILIKE 'src/%' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         "SELECT * FROM docs WHERE path LIKE kind ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         "SELECT * FROM docs WHERE path LIKE 1 ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
     ] {
-        let err = core
-            .execute_sql(&ctx, sql)
-            .unwrap_err_or_else_panic(sql);
+        let err = core.execute_sql(&ctx, sql).unwrap_err_or_else_panic(sql);
         assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
     }
 }

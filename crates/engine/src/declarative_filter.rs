@@ -67,6 +67,193 @@ pub enum FilterOp {
         op: CompareOp,
         literal: CompareLiteral,
     },
+    /// [`FilterOp::InList`]／[`FilterOp::InTyped`] の未束縛版（SQL-24。ポインタ:
+    /// `docs/spec/05-tasks.md` TASK-208、`docs/spec/04-behavior/sql-surface.md`
+    /// SQL-24）。要素は構文段が保持した生の文字列リテラル。`bind_impl` が列型で
+    /// `InList`（TEXT／ENUM）・`InTyped`（DATE／TIMESTAMP／NUMERIC／UUID／BYTEA）
+    /// のいずれかへ確定させる。
+    InListLiteral {
+        values: Vec<String>,
+    },
+    /// 束縛済み `IN` 条件（TEXT／ENUM 列）。値はソート・重複除去済み（二分探索で
+    /// 評価する。[`MetadataFilter::eval`] 参照）。
+    InText(Vec<String>),
+    /// 束縛済み `IN` 条件（DATE／TIMESTAMP／NUMERIC／UUID／BYTEA 列）。
+    InTyped(Vec<TypedLiteral>),
+    /// [`FilterOp::Between`] の未束縛版。`low`／`high` は構文段が保持した生の
+    /// 文字列リテラル。
+    BetweenLiteral {
+        low: String,
+        high: String,
+    },
+    /// 束縛済み `BETWEEN` 条件（DATE／TIMESTAMP／NUMERIC／UUID／BYTEA 列）。
+    /// `low > high` の場合は評価が常に偽になる（[`MetadataFilter::eval`] の
+    /// `Ge`∧`Le` 判定が自然にそうなる。エラーにはしない。PG の `BETWEEN` と
+    /// 同じ扱い）。
+    Between {
+        low: TypedLiteral,
+        high: TypedLiteral,
+    },
+    /// `<col> IS NULL`。
+    IsNull,
+    /// `<col> IS NOT NULL`。
+    IsNotNull,
+    /// 前置・後置 `NOT` による否定。内側の評価結果を三値論理で反転する
+    /// （UNKNOWN は UNKNOWN のまま。[`MetadataFilter::eval`] 参照）。
+    Not(Box<FilterOp>),
+}
+
+impl FilterOp {
+    /// `value`（`None` は NULL）に対する三値論理での評価（SQL-24。TASK-208
+    /// ポインタ）。`None`（UNKNOWN）は NULL 値・型不一致のいずれからも生じる
+    /// （型不一致を `Some(false)` にすると `Not` で誤って真へ反転する
+    /// ——fail-open——ため、UNKNOWN のまま維持する）。`IsNull`／`IsNotNull` のみ
+    /// NULL そのものを判定対象とするため `value` が `None` でも `Some(bool)` を
+    /// 返す。
+    fn eval(&self, value: Option<ScalarRef<'_>>) -> Option<bool> {
+        match self {
+            // `as_dictionary_text` で TEXT／ENUM の両方を等価比較する
+            // （Issue #890 D7。二次索引〔`sql::scalar_index`〕と同じ辞書表現）。
+            FilterOp::Equals(expected) => {
+                let v = value?;
+                v.as_dictionary_text().map(|s| s == expected.as_str())
+            }
+            FilterOp::StartsWith(prefix) => {
+                let v = value?;
+                v.as_text().map(|s| s.starts_with(prefix.as_str()))
+            }
+            FilterOp::BoolEquals(expected) => {
+                let v = value?;
+                v.as_bool().map(|actual| actual == *expected)
+            }
+            FilterOp::TypedCompare {
+                op,
+                value: expected,
+            } => {
+                let v = value?;
+                match expected {
+                    TypedLiteral::Date(e) => v.as_date().map(|a| op.accepts(a.cmp(e))),
+                    TypedLiteral::Timestamp(e) => v.as_timestamp().map(|a| op.accepts(a.cmp(e))),
+                    TypedLiteral::Numeric(e) => v
+                        .as_numeric()
+                        .map(|a| op.accepts(crate::numeric::cmp_exact(&a, e))),
+                    TypedLiteral::Uuid(e) => v.as_uuid().map(|a| op.accepts(a.cmp(e))),
+                    TypedLiteral::Bytes(e) => v.as_bytes().map(|a| op.accepts(a.cmp(e.as_slice()))),
+                }
+            }
+            FilterOp::InText(values) => {
+                let v = value?;
+                let text = v.as_dictionary_text()?;
+                Some(
+                    values
+                        .binary_search_by(|probe| probe.as_str().cmp(text))
+                        .is_ok(),
+                )
+            }
+            FilterOp::InTyped(values) => {
+                let v = value?;
+                typed_in_eval(values, v)
+            }
+            FilterOp::Between { low, high } => {
+                let v = value?;
+                typed_between_eval(low, high, v)
+            }
+            FilterOp::IsNull => Some(value.is_none()),
+            FilterOp::IsNotNull => Some(value.is_some()),
+            FilterOp::Not(inner) => inner.eval(value).map(|b| !b),
+            // 未束縛の値（`Compare`／`InListLiteral`／`BetweenLiteral`）は
+            // `bind`/`bind_all` が常に束縛済み variant へ確定させるため評価に
+            // 到達しない契約（fail-closed の保険腕）。
+            FilterOp::Compare { .. }
+            | FilterOp::InListLiteral { .. }
+            | FilterOp::BetweenLiteral { .. } => None,
+        }
+    }
+}
+
+/// [`FilterOp::InTyped`] の三値評価。要素はすべて同じ [`TypedLiteral`] variant
+/// （`bind_filter_op` が列型ごとに統一して構築する契約）で、先頭要素の variant
+/// から列の実測値 `v` を対応する型で読み出す。空リストは構文段
+/// （`sql::allowlist::Parser::parse_in_list_body`）が拒否するため到達しない
+/// （防御的に `Some(false)` とする）。
+fn typed_in_eval(values: &[TypedLiteral], v: ScalarRef<'_>) -> Option<bool> {
+    match values.first() {
+        None => Some(false),
+        Some(TypedLiteral::Date(_)) => {
+            let actual = v.as_date()?;
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::Date(e) if *e == actual)),
+            )
+        }
+        Some(TypedLiteral::Timestamp(_)) => {
+            let actual = v.as_timestamp()?;
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::Timestamp(e) if *e == actual)),
+            )
+        }
+        Some(TypedLiteral::Numeric(_)) => {
+            let actual = v.as_numeric()?;
+            Some(values.iter().any(|t| matches!(t, TypedLiteral::Numeric(e) if crate::numeric::cmp_exact(&actual, e) == std::cmp::Ordering::Equal)))
+        }
+        Some(TypedLiteral::Uuid(_)) => {
+            let actual = v.as_uuid()?;
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::Uuid(e) if *e == actual)),
+            )
+        }
+        Some(TypedLiteral::Bytes(_)) => {
+            let actual = v.as_bytes()?;
+            Some(
+                values
+                    .iter()
+                    .any(|t| matches!(t, TypedLiteral::Bytes(e) if e.as_slice() == actual)),
+            )
+        }
+    }
+}
+
+/// [`FilterOp::Between`] の三値評価。`low`／`high` は同じ [`TypedLiteral`]
+/// variant（`bind_filter_op` が同一列型から解析する契約）。`low > high` は
+/// `Ge`∧`Le` の判定が自然に常時偽となる（エラーにはしない。PG の `BETWEEN` と
+/// 同じ扱い）。
+fn typed_between_eval(low: &TypedLiteral, high: &TypedLiteral, v: ScalarRef<'_>) -> Option<bool> {
+    match (low, high) {
+        (TypedLiteral::Date(lo), TypedLiteral::Date(hi)) => {
+            let actual = v.as_date()?;
+            Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
+        }
+        (TypedLiteral::Timestamp(lo), TypedLiteral::Timestamp(hi)) => {
+            let actual = v.as_timestamp()?;
+            Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
+        }
+        (TypedLiteral::Numeric(lo), TypedLiteral::Numeric(hi)) => {
+            let actual = v.as_numeric()?;
+            Some(
+                CompareOp::Ge.accepts(crate::numeric::cmp_exact(&actual, lo))
+                    && CompareOp::Le.accepts(crate::numeric::cmp_exact(&actual, hi)),
+            )
+        }
+        (TypedLiteral::Uuid(lo), TypedLiteral::Uuid(hi)) => {
+            let actual = v.as_uuid()?;
+            Some(CompareOp::Ge.accepts(actual.cmp(lo)) && CompareOp::Le.accepts(actual.cmp(hi)))
+        }
+        (TypedLiteral::Bytes(lo), TypedLiteral::Bytes(hi)) => {
+            let actual = v.as_bytes()?;
+            Some(
+                CompareOp::Ge.accepts(actual.cmp(lo.as_slice()))
+                    && CompareOp::Le.accepts(actual.cmp(hi.as_slice())),
+            )
+        }
+        // `bind_filter_op` は low/high を同じ列型で解析するため、異なる
+        // variant の組み合わせは構築されない契約（fail-closed の保険腕）。
+        _ => None,
+    }
 }
 
 /// [`FilterOp::TypedCompare`]／[`FilterOp::Compare`] の比較演算子。
@@ -210,6 +397,61 @@ impl DeclarativeFilter {
         }
     }
 
+    /// `<col> [NOT] IN (...)` フィルタを文字列リテラル形で宣言する（SQL-24。
+    /// TASK-208 ポインタ）。列型に応じた解析（TEXT／ENUM は辞書等価、
+    /// DATE／TIMESTAMP／NUMERIC／UUID／BYTEA は型付き等価）は [`Self::bind`] 時に
+    /// 行う。
+    pub fn in_list(column: impl Into<String>, values: Vec<String>) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::InListLiteral { values },
+        }
+    }
+
+    /// `<col> [NOT] BETWEEN '<low>' AND '<high>'` フィルタを文字列リテラル形で
+    /// 宣言する（SQL-24。TASK-208 ポインタ）。`DATE`／`TIMESTAMP`／`NUMERIC`／
+    /// `UUID`／`BYTEA` 列のみ受理し、他の列型は [`Self::bind`] 時に `22000`。
+    pub fn between(
+        column: impl Into<String>,
+        low: impl Into<String>,
+        high: impl Into<String>,
+    ) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::BetweenLiteral {
+                low: low.into(),
+                high: high.into(),
+            },
+        }
+    }
+
+    /// `<col> IS NULL` フィルタを宣言する（SQL-24。TASK-208 ポインタ）。
+    /// `VECTOR` 列は [`Self::bind`] 時に `22000`。
+    pub fn is_null(column: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::IsNull,
+        }
+    }
+
+    /// `<col> IS NOT NULL` フィルタを宣言する（SQL-24。TASK-208 ポインタ）。
+    pub fn is_not_null(column: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::IsNotNull,
+        }
+    }
+
+    /// 自身を否定した新しいフィルタを返す（SQL-24。TASK-208 ポインタ）。
+    /// [`sql::parser::bind_where_predicates`] が `WherePredicate::Not` を
+    /// 束縛する際、内側を先に構築してから本メソッドで包む。
+    pub fn negate(self) -> Self {
+        Self {
+            column: self.column,
+            op: FilterOp::Not(Box::new(self.op)),
+        }
+    }
+
     /// `schema` と照合して [`MetadataFilter`] へ束縛する。列名解決・列型検査
     /// （`Equals`/`StartsWith` は `TEXT` 列限定・`BoolEquals` は `BOOLEAN` 列限定。
     /// いずれも不一致は `22000`）・リテラル長上限（[`MAX_TEXT_FIELD_LEN`] 超は
@@ -242,129 +484,293 @@ impl DeclarativeFilter {
         let column = schema.columns.get(column_index).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("unknown column: {}", self.column))
         })?;
-        let op = match &self.op {
-            FilterOp::Equals(value) => {
-                // ENUM 列は TEXT と同じ等価述語を受理する（Issue #890 D7。
-                // PostgreSQL の enum 入力と同様、語彙外のラベルは書き込み時と
-                // 同じ `22P02` で拒否する。二次索引〔`sql::scalar_index`〕は
-                // TEXT と同じ辞書を共有するため、この等価意味論のまま
-                // 索引経由の候補削減を信頼できる）。
-                match &column.ty {
-                    ColumnType::Text => {}
-                    ColumnType::Enum(def) => {
-                        // `skip_enum_label_validation` が `true` の場合、この値は
-                        // `sql::params::substitute_dummy` が生成した固定ダミー
-                        // 文字列であり、実際にどのラベルが束縛されるかは Bind
-                        // まで未確定（PR #1012 Cursor Bugbot 指摘: ここで通常どおり
-                        // 語彙照合すると、`WHERE enum_col = $n` を含む文の Describe
-                        // が実リテラルの有無に関わらず常に `22P02` になってしまう）。
-                        if !skip_enum_label_validation && def.validate_label(value).is_err() {
-                            return Err(SqlSurfaceError::invalid_text_representation(format!(
-                                "column {:?} (enum {:?}) does not accept label {value:?}",
-                                self.column,
-                                def.name()
-                            )));
-                        }
-                    }
-                    // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
-                    // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。
-                    ColumnType::Vector(_)
-                    | ColumnType::Integer
-                    | ColumnType::BigInt
-                    | ColumnType::Real
-                    | ColumnType::Double
-                    | ColumnType::Boolean
-                    | ColumnType::Date
-                    | ColumnType::Timestamp
-                    | ColumnType::Array(_)
-                    | ColumnType::Bytea
-                    | ColumnType::Json
-                    | ColumnType::Jsonb
-                    | ColumnType::Numeric { .. }
-                    | ColumnType::Uuid => {
-                        return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {:?} is not a TEXT column",
-                            self.column
+        let op = bind_filter_op(
+            &self.op,
+            &self.column,
+            &column.ty,
+            skip_enum_label_validation,
+        )?;
+        Ok(MetadataFilter { column_index, op })
+    }
+}
+
+/// [`DeclarativeFilter::bind_impl`] の本体（列型検査・リテラル解析）。
+/// [`FilterOp::Not`] は内側を再帰でそのまま束縛する（構文段の不変条件により
+/// 深さは常に 1 のため無限再帰は起きない。`sql::allowlist::WherePredicate::Not`
+/// のドキュメント参照）。
+fn bind_filter_op(
+    op: &FilterOp,
+    column_name: &str,
+    ty: &ColumnType,
+    skip_enum_label_validation: bool,
+) -> Result<FilterOp, SqlSurfaceError> {
+    Ok(match op {
+        FilterOp::Equals(value) => {
+            // ENUM 列は TEXT と同じ等価述語を受理する（Issue #890 D7。
+            // PostgreSQL の enum 入力と同様、語彙外のラベルは書き込み時と
+            // 同じ `22P02` で拒否する。二次索引〔`sql::scalar_index`〕は
+            // TEXT と同じ辞書を共有するため、この等価意味論のまま
+            // 索引経由の候補削減を信頼できる）。
+            match ty {
+                ColumnType::Text => {}
+                ColumnType::Enum(def) => {
+                    // `skip_enum_label_validation` が `true` の場合、この値は
+                    // `sql::params::substitute_dummy` が生成した固定ダミー
+                    // 文字列であり、実際にどのラベルが束縛されるかは Bind
+                    // まで未確定（PR #1012 Cursor Bugbot 指摘: ここで通常どおり
+                    // 語彙照合すると、`WHERE enum_col = $n` を含む文の Describe
+                    // が実リテラルの有無に関わらず常に `22P02` になってしまう）。
+                    if !skip_enum_label_validation && def.validate_label(value).is_err() {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "column {column_name:?} (enum {:?}) does not accept label {value:?}",
+                            def.name()
                         )));
                     }
                 }
-                check_literal_len(value)?;
-                FilterOp::Equals(value.clone())
-            }
-            FilterOp::StartsWith(prefix) => {
-                if !matches!(column.ty, ColumnType::Text) {
+                // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
+                // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。
+                ColumnType::Vector(_)
+                | ColumnType::Integer
+                | ColumnType::BigInt
+                | ColumnType::Real
+                | ColumnType::Double
+                | ColumnType::Boolean
+                | ColumnType::Date
+                | ColumnType::Timestamp
+                | ColumnType::Array(_)
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Numeric { .. }
+                | ColumnType::Uuid => {
                     return Err(SqlSurfaceError::invalid_input(format!(
-                        "column {:?} is not a TEXT column",
-                        self.column
+                        "column {column_name:?} is not a TEXT column"
                     )));
                 }
-                if prefix.is_empty() {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "LIKE prefix must not be empty",
-                    ));
-                }
-                check_literal_len(prefix)?;
-                FilterOp::StartsWith(prefix.clone())
             }
-            FilterOp::BoolEquals(value) => {
-                if !matches!(column.ty, ColumnType::Boolean) {
-                    return Err(SqlSurfaceError::invalid_input(format!(
-                        "column {:?} is not a BOOLEAN column",
-                        self.column
-                    )));
-                }
-                FilterOp::BoolEquals(*value)
+            check_literal_len(value)?;
+            FilterOp::Equals(value.clone())
+        }
+        FilterOp::StartsWith(prefix) => {
+            if !matches!(ty, ColumnType::Text) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column_name:?} is not a TEXT column"
+                )));
             }
-            FilterOp::Compare { op, literal } => {
-                // `skip_enum_label_validation` を「型付きリテラル解析の
-                // スキップ」へ一般化する（Issue #891。ENUM の語彙照合スキップ
-                // と同じ理由: `sql::params::substitute_dummy` が生成する固定
-                // ダミー文字列 `"0"` は DATE／TIMESTAMP／UUID／BYTEA の文法として
-                // 不正なため、Describe 時点でこれを実際に解析すると
-                // `WHERE date_col = $1` 等の Describe が常に失敗してしまう。
-                // 実際の値検証は Bind／Execute で行われる（他の列型と同じ
-                // 縮退方針）。プレースホルダ値は評価（`matches`）に到達しない
-                // 契約（Describe は検索本体を実行しない）。
-                let value = if skip_enum_label_validation {
-                    match &column.ty {
+            if prefix.is_empty() {
+                return Err(SqlSurfaceError::invalid_input(
+                    "LIKE prefix must not be empty",
+                ));
+            }
+            check_literal_len(prefix)?;
+            FilterOp::StartsWith(prefix.clone())
+        }
+        FilterOp::BoolEquals(value) => {
+            if !matches!(ty, ColumnType::Boolean) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column_name:?} is not a BOOLEAN column"
+                )));
+            }
+            FilterOp::BoolEquals(*value)
+        }
+        FilterOp::Compare {
+            op: cmp_op,
+            literal,
+        } => {
+            // `skip_enum_label_validation` を「型付きリテラル解析の
+            // スキップ」へ一般化する（Issue #891。ENUM の語彙照合スキップ
+            // と同じ理由: `sql::params::substitute_dummy` が生成する固定
+            // ダミー文字列 `"0"` は DATE／TIMESTAMP／UUID／BYTEA の文法として
+            // 不正なため、Describe 時点でこれを実際に解析すると
+            // `WHERE date_col = $1` 等の Describe が常に失敗してしまう。
+            // 実際の値検証は Bind／Execute で行われる（他の列型と同じ
+            // 縮退方針）。プレースホルダ値は評価（`matches`）に到達しない
+            // 契約（Describe は検索本体を実行しない）。
+            let value = if skip_enum_label_validation {
+                match ty {
+                    ColumnType::Date => TypedLiteral::Date(0),
+                    ColumnType::Timestamp => TypedLiteral::Timestamp(0),
+                    ColumnType::Numeric { .. } => TypedLiteral::Numeric(
+                        crate::numeric::Decimal::from_parts(0, 0).map_err(|_| {
+                            // `scale=0` は `MAX_PRECISION` 以下のため理論上
+                            // 到達しないが、engine ライブラリコードは panic
+                            // させない契約（`.claude/rules/coding-rust.md`）
+                            // のため fail-closed に `Result` で伝播する。
+                            SqlSurfaceError::Internal {
+                                detail: "Decimal::from_parts(0, 0) must always succeed".to_string(),
+                            }
+                        })?,
+                    ),
+                    ColumnType::Uuid => {
+                        TypedLiteral::Uuid(crate::uuid::Uuid::from_bytes([0u8; 16]))
+                    }
+                    ColumnType::Bytea => TypedLiteral::Bytes(Vec::new()),
+                    _ => return Err(unsupported_compare_column(column_name)),
+                }
+            } else {
+                bind_typed_compare_literal(column_name, ty, literal)?
+            };
+            FilterOp::TypedCompare { op: *cmp_op, value }
+        }
+        FilterOp::TypedCompare { .. }
+        | FilterOp::InText(_)
+        | FilterOp::InTyped(_)
+        | FilterOp::Between { .. } => {
+            // `DeclarativeFilter` の公開コンストラクタはいずれも未束縛の
+            // 値（`Compare`／`InListLiteral`／`BetweenLiteral`）を生成し、
+            // 束縛済み variant を直接構築する経路は無い（fail-closed の
+            // 保険腕。`bind`/`bind_all` は常に未束縛の値を受け取る契約）。
+            return Err(SqlSurfaceError::Internal {
+                detail:
+                    "DeclarativeFilter must not be constructed with an already-bound filter value"
+                        .to_string(),
+            });
+        }
+        // `<col> [NOT] IN ('<lit>'[, ...])`（SQL-24。TASK-208 ポインタ）。
+        // TEXT／ENUM は辞書等価（`InText`）、DATE／TIMESTAMP／NUMERIC／UUID／
+        // BYTEA は型付き等価（`InTyped`）へ確定させる。ソート・重複除去は
+        // `InText` のみ行う（索引側の候補集合〔`sql::scalar_index`〕が辞書
+        // スロットの昇順連結を前提とするため。`InTyped` は索引未対応
+        // 〔`sql::scalar_plan::classify_scalar_plan` が常に `PlainScan` へ
+        // 倒す〕のためソート不要）。
+        FilterOp::InListLiteral { values } => match ty {
+            ColumnType::Text => {
+                let mut bound = Vec::with_capacity(values.len());
+                for v in values {
+                    check_literal_len(v)?;
+                    bound.push(v.clone());
+                }
+                bound.sort();
+                bound.dedup();
+                FilterOp::InText(bound)
+            }
+            ColumnType::Enum(def) => {
+                let mut bound = Vec::with_capacity(values.len());
+                for v in values {
+                    check_literal_len(v)?;
+                    if !skip_enum_label_validation && def.validate_label(v).is_err() {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "column {column_name:?} (enum {:?}) does not accept label {v:?}",
+                            def.name()
+                        )));
+                    }
+                    bound.push(v.clone());
+                }
+                bound.sort();
+                bound.dedup();
+                FilterOp::InText(bound)
+            }
+            ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid
+            | ColumnType::Bytea => {
+                let mut bound = Vec::with_capacity(values.len());
+                for v in values {
+                    let literal = CompareLiteral::Text(v.clone());
+                    bound.push(if skip_enum_label_validation {
+                        match ty {
+                            ColumnType::Date => TypedLiteral::Date(0),
+                            ColumnType::Timestamp => TypedLiteral::Timestamp(0),
+                            ColumnType::Numeric { .. } => {
+                                TypedLiteral::Numeric(Decimal::from_parts(0, 0).map_err(|_| {
+                                    SqlSurfaceError::Internal {
+                                        detail: "Decimal::from_parts(0, 0) must always succeed"
+                                            .to_string(),
+                                    }
+                                })?)
+                            }
+                            ColumnType::Uuid => {
+                                TypedLiteral::Uuid(crate::uuid::Uuid::from_bytes([0u8; 16]))
+                            }
+                            ColumnType::Bytea => TypedLiteral::Bytes(Vec::new()),
+                            _ => return Err(unsupported_compare_column(column_name)),
+                        }
+                    } else {
+                        bind_typed_compare_literal(column_name, ty, &literal)?
+                    });
+                }
+                FilterOp::InTyped(bound)
+            }
+            _ => return Err(unsupported_compare_column(column_name)),
+        },
+        // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24。TASK-208
+        // ポインタ）。`low > high` は解析時にエラーにしない（評価時に
+        // `Ge`∧`Le` が自然に常時偽となる。PG の `BETWEEN` と同じ扱い）。
+        FilterOp::BetweenLiteral { low, high } => match ty {
+            ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid
+            | ColumnType::Bytea => {
+                if skip_enum_label_validation {
+                    let dummy = match ty {
                         ColumnType::Date => TypedLiteral::Date(0),
                         ColumnType::Timestamp => TypedLiteral::Timestamp(0),
-                        ColumnType::Numeric { .. } => TypedLiteral::Numeric(
-                            crate::numeric::Decimal::from_parts(0, 0).map_err(|_| {
-                                // `scale=0` は `MAX_PRECISION` 以下のため理論上
-                                // 到達しないが、engine ライブラリコードは panic
-                                // させない契約（`.claude/rules/coding-rust.md`）
-                                // のため fail-closed に `Result` で伝播する。
+                        ColumnType::Numeric { .. } => {
+                            TypedLiteral::Numeric(Decimal::from_parts(0, 0).map_err(|_| {
                                 SqlSurfaceError::Internal {
                                     detail: "Decimal::from_parts(0, 0) must always succeed"
                                         .to_string(),
                                 }
-                            })?,
-                        ),
+                            })?)
+                        }
                         ColumnType::Uuid => {
                             TypedLiteral::Uuid(crate::uuid::Uuid::from_bytes([0u8; 16]))
                         }
                         ColumnType::Bytea => TypedLiteral::Bytes(Vec::new()),
-                        _ => return Err(unsupported_compare_column(&self.column)),
+                        _ => return Err(unsupported_compare_column(column_name)),
+                    };
+                    FilterOp::Between {
+                        low: dummy.clone(),
+                        high: dummy,
                     }
                 } else {
-                    bind_typed_compare_literal(&self.column, &column.ty, literal)?
-                };
-                FilterOp::TypedCompare { op: *op, value }
+                    let low = bind_typed_compare_literal(
+                        column_name,
+                        ty,
+                        &CompareLiteral::Text(low.clone()),
+                    )?;
+                    let high = bind_typed_compare_literal(
+                        column_name,
+                        ty,
+                        &CompareLiteral::Text(high.clone()),
+                    )?;
+                    FilterOp::Between { low, high }
+                }
             }
-            FilterOp::TypedCompare { .. } => {
-                // `DeclarativeFilter` の公開コンストラクタ（`compare`／
-                // `compare_numeric_literal`）はいずれも未束縛の `Compare` を
-                // 生成し、`TypedCompare` を直接構築する経路は無い
-                // （fail-closed の保険腕。`bind`/`bind_all` は常に未束縛の値を
-                // 受け取る契約）。
-                return Err(SqlSurfaceError::Internal {
-                    detail: "DeclarativeFilter must not be constructed with an already-typed compare value".to_string(),
-                });
+            _ => return Err(unsupported_compare_column(column_name)),
+        },
+        // `<col> IS [NOT] NULL`（SQL-24。TASK-208 ポインタ）。`VECTOR` 列は
+        // 拒否する（`row_codec::scan_scalar_columns_masked` がマスク外・
+        // `VECTOR` 列に常に `None` を積むため、評価させると fail-open
+        // 〔存在しない NULL 行が誤って一致〕になり得る。TASK-208 実装計画
+        // §4.3 のマスク網羅確認と対をなす防御）。
+        FilterOp::IsNull => {
+            if matches!(ty, ColumnType::Vector(_)) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column_name:?} does not support IS NULL (VECTOR column)"
+                )));
             }
-        };
-        Ok(MetadataFilter { column_index, op })
-    }
+            FilterOp::IsNull
+        }
+        FilterOp::IsNotNull => {
+            if matches!(ty, ColumnType::Vector(_)) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column_name:?} does not support IS NOT NULL (VECTOR column)"
+                )));
+            }
+            FilterOp::IsNotNull
+        }
+        // 前置・後置 `NOT`（SQL-24。TASK-208 ポインタ）。内側を再帰で
+        // 束縛してから包む。
+        FilterOp::Not(inner) => FilterOp::Not(Box::new(bind_filter_op(
+            inner,
+            column_name,
+            ty,
+            skip_enum_label_validation,
+        )?)),
+    })
 }
 
 /// 範囲比較（[`FilterOp::Compare`]）を受理しない列型へ束縛しようとした場合の
@@ -528,52 +934,23 @@ impl MetadataFilter {
         &self.op
     }
 
-    /// `value`（対象列の値。`None` は NULL）がこのフィルタに一致するか判定する。
-    /// NULL は等価・前方一致・BOOLEAN 等価のいずれでも常に不一致（fail-closed。
-    /// PG の三値論理での NULL 比較の既定挙動に倣う）。型不一致（`TEXT` フィルタに
-    /// `Bool` 値、`BoolEquals` に `Text` 値）も `bind` が列型で事前に排除している
-    /// 契約だが、念のため不一致として扱う。
+    /// `value`（対象列の値。`None` は NULL）がこのフィルタに一致するかを PG 互換の
+    /// 三値論理（`eval`）で判定し、`Some(true)` のときだけ真とする（SQL-24。
+    /// TASK-208 ポインタ）。UNKNOWN（型不一致・NULL 経由の未確定）は不一致として
+    /// 扱う（fail-closed。`NOT` による反転は [`FilterOp::eval`] 内で UNKNOWN の
+    /// まま保たれるため、ここで `false` に丸めても `NOT` が誤って真に反転する
+    /// ことはない）。
     pub fn matches(&self, value: Option<ScalarRef<'_>>) -> bool {
-        let Some(v) = value else {
-            return false;
-        };
-        match &self.op {
-            // `as_dictionary_text` で TEXT／ENUM の両方を等価比較する
-            // （Issue #890 D7。二次索引〔`sql::scalar_index`〕と同じ辞書表現）。
-            FilterOp::Equals(expected) => v.as_dictionary_text() == Some(expected.as_str()),
-            FilterOp::StartsWith(prefix) => v
-                .as_text()
-                .map(|s| s.starts_with(prefix.as_str()))
-                .unwrap_or(false),
-            FilterOp::BoolEquals(expected) => v.as_bool() == Some(*expected),
-            FilterOp::TypedCompare { op, value } => match (value, v) {
-                (TypedLiteral::Date(expected), v) => v
-                    .as_date()
-                    .map(|actual| op.accepts(actual.cmp(expected)))
-                    .unwrap_or(false),
-                (TypedLiteral::Timestamp(expected), v) => v
-                    .as_timestamp()
-                    .map(|actual| op.accepts(actual.cmp(expected)))
-                    .unwrap_or(false),
-                (TypedLiteral::Numeric(expected), v) => v
-                    .as_numeric()
-                    .map(|actual| op.accepts(crate::numeric::cmp_exact(&actual, expected)))
-                    .unwrap_or(false),
-                (TypedLiteral::Uuid(expected), v) => v
-                    .as_uuid()
-                    .map(|actual| op.accepts(actual.cmp(expected)))
-                    .unwrap_or(false),
-                (TypedLiteral::Bytes(expected), v) => v
-                    .as_bytes()
-                    .map(|actual| op.accepts(actual.cmp(expected.as_slice())))
-                    .unwrap_or(false),
-            },
-            // `bind`/`bind_all` は常に `TypedCompare` へ確定させた
-            // `MetadataFilter` のみを生成する（`bind_impl` の
-            // `FilterOp::TypedCompare` 保険腕参照）。未束縛の `Compare` が
-            // 評価に到達することはない（fail-closed）。
-            FilterOp::Compare { .. } => false,
-        }
+        self.eval(value) == Some(true)
+    }
+
+    /// `value` に対する三値論理での評価結果（`None` は UNKNOWN）。
+    /// [`Self::matches`] の内部実装であり、`FilterOp::Not` が UNKNOWN を保った
+    /// まま反転するために必要（`matches` の bool 版だけでは `NOT` 評価時に
+    /// UNKNOWN と FALSE を区別できず、型不一致行が `NOT` 越しに誤って真になる
+    /// ——fail-open——おそれがある）。
+    pub(crate) fn eval(&self, value: Option<ScalarRef<'_>>) -> Option<bool> {
+        self.op.eval(value)
     }
 }
 
@@ -636,19 +1013,23 @@ pub(crate) fn bind_all_for_describe(
 }
 
 /// `scanned`（`row_codec::scan_scalar_columns` が返す列値。添字は列インデックス）に
-/// 対して `filters` を全件 AND 評価する。範囲外インデックスは不一致として扱う
-/// （fail-closed。`scanned` は投影・フィルタが必要とする列だけを保持する構造の
-/// ため、束縛時に検証済みの列インデックスでも呼び出し元の保持方針次第では
-/// 範囲外になり得る）。
+/// 対して `filters` を全件 AND 評価する。範囲外インデックスは列値が NULL の場合
+/// （`Some(None)`）と区別し、常に不一致として扱う（fail-closed。`scanned` は
+/// 投影・フィルタが必要とする列だけを保持する構造のため、束縛時に検証済みの
+/// 列インデックスでも呼び出し元の保持方針次第では範囲外になり得る）。
+/// [`FilterOp::IsNull`] 導入（SQL-24。TASK-208 ポインタ）により、範囲外を NULL と
+/// 同一視すると「値を読めていない」列が誤って `IS NULL` に一致してしまう
+/// （fail-open）ため、`Option<Option<ScalarRef>>::flatten` は使わずここで明示的に
+/// 分岐する。
 pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<ScalarRef<'_>>]) -> bool {
-    filters.iter().all(|f| {
+    filters.iter().all(|f| match scanned.get(f.column_index) {
         // 型不一致（`TEXT` フィルタに `Bool`／`Real`／`Double` 値、`BoolEquals` に
         // `Text` 値等）は `bind` が列型で事前に排除している契約だが、
-        // `MetadataFilter::matches` 側で防御的に不一致（fail-closed）へ落とす
+        // `MetadataFilter::matches` 側で防御的に UNKNOWN（不一致）へ落とす
         // （F10: TEXT 系フィルタに対する REAL/DOUBLE も同様に「値なし」と同じ
         // 扱いになる）。
-        let value = scanned.get(f.column_index).copied().flatten();
-        f.matches(value)
+        Some(value) => f.matches(*value),
+        None => false,
     })
 }
 
@@ -1075,5 +1456,151 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- SQL-24（TASK-208 ポインタ）: IN / BETWEEN / IS [NOT] NULL / NOT ------
+
+    #[test]
+    fn in_text_matches_and_dedups_across_repeats() {
+        let f = DeclarativeFilter::in_list(
+            "kind",
+            vec!["a".to_string(), "b".to_string(), "a".to_string()],
+        )
+        .bind(&schema())
+        .unwrap();
+        assert!(matches!(f.op(), FilterOp::InText(values) if values.len() == 2));
+        assert!(f.matches(Some(ScalarRef::Text("a"))));
+        assert!(f.matches(Some(ScalarRef::Text("b"))));
+        assert!(!f.matches(Some(ScalarRef::Text("c"))));
+        // NULL は UNKNOWN（不一致）。
+        assert!(!f.matches(None));
+    }
+
+    #[test]
+    fn in_list_rejects_empty_result_from_bind_all_for_unsupported_column() {
+        // VECTOR 列（`embedding`）は IN の対象外（TEXT/ENUM/DATE/TIMESTAMP/
+        // NUMERIC/UUID/BYTEA のいずれでもない）。
+        let err = DeclarativeFilter::in_list("embedding", vec!["x".to_string()])
+            .bind(&schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn in_typed_matches_typed_compare_schema_columns() {
+        let schema = typed_compare_schema();
+        let f = DeclarativeFilter::in_list(
+            "day",
+            vec!["2024-01-01".to_string(), "2024-06-01".to_string()],
+        )
+        .bind(&schema)
+        .unwrap();
+        assert!(matches!(f.op(), FilterOp::InTyped(values) if values.len() == 2));
+        assert!(f.matches(Some(ScalarRef::Date(19723))));
+        assert!(!f.matches(Some(ScalarRef::Date(19724))));
+        assert!(!f.matches(None));
+    }
+
+    #[test]
+    fn between_matches_inclusive_bounds_and_null_is_unknown() {
+        let schema = typed_compare_schema();
+        let f = DeclarativeFilter::between("day", "2024-01-01", "2024-06-01")
+            .bind(&schema)
+            .unwrap();
+        assert!(f.matches(Some(ScalarRef::Date(19723)))); // 2024-01-01（下限）
+        assert!(f.matches(Some(ScalarRef::Date(19875)))); // 2024-06-01（上限）
+        assert!(!f.matches(Some(ScalarRef::Date(19722))));
+        assert!(!f.matches(Some(ScalarRef::Date(19876))));
+        assert!(!f.matches(None));
+    }
+
+    #[test]
+    fn between_low_greater_than_high_is_always_false_not_an_error() {
+        let schema = typed_compare_schema();
+        let f = DeclarativeFilter::between("day", "2024-06-01", "2024-01-01")
+            .bind(&schema)
+            .expect("low > high must bind successfully (PG semantics: always false)");
+        assert!(!f.matches(Some(ScalarRef::Date(19723))));
+        assert!(!f.matches(Some(ScalarRef::Date(19905))));
+    }
+
+    #[test]
+    fn between_rejects_unsupported_column_type() {
+        let err = DeclarativeFilter::between("path", "a", "z")
+            .bind(&schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn is_null_and_is_not_null_partition_null_and_non_null() {
+        let is_null = DeclarativeFilter::is_null("tag").bind(&schema()).unwrap();
+        let is_not_null = DeclarativeFilter::is_not_null("tag")
+            .bind(&schema())
+            .unwrap();
+        assert!(is_null.matches(None));
+        assert!(!is_null.matches(Some(ScalarRef::Text("x"))));
+        assert!(!is_not_null.matches(None));
+        assert!(is_not_null.matches(Some(ScalarRef::Text("x"))));
+    }
+
+    #[test]
+    fn is_null_rejects_vector_column() {
+        let err = DeclarativeFilter::is_null("embedding")
+            .bind(&schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        let err = DeclarativeFilter::is_not_null("embedding")
+            .bind(&schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn negate_inverts_match_and_keeps_unknown_unknown() {
+        let eq = DeclarativeFilter::equals("kind", "code")
+            .bind(&schema())
+            .unwrap();
+        let not_eq = DeclarativeFilter::equals("kind", "code")
+            .negate()
+            .bind(&schema())
+            .unwrap();
+        assert!(eq.matches(Some(ScalarRef::Text("code"))));
+        assert!(!not_eq.matches(Some(ScalarRef::Text("code"))));
+        assert!(!eq.matches(Some(ScalarRef::Text("docs"))));
+        assert!(not_eq.matches(Some(ScalarRef::Text("docs"))));
+        // NULL: 両方とも UNKNOWN のまま（`NOT` で真に反転しない。fail-closed）。
+        assert!(!eq.matches(None));
+        assert!(!not_eq.matches(None));
+    }
+
+    #[test]
+    fn negate_type_mismatch_stays_unknown_not_true() {
+        // `BoolEquals` に `Text` 値を渡す型不一致（`bind` が事前に排除する
+        // 契約だが、`eval` 自身が UNKNOWN を返すことを直接確認する）。
+        let not_flag = DeclarativeFilter::bool_equals("kind", true)
+            .negate()
+            .bind(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("kind", ColumnType::Boolean, true)],
+            ))
+            .unwrap();
+        assert!(!not_flag.matches(Some(ScalarRef::Text("not-a-bool"))));
+    }
+
+    #[test]
+    fn matches_all_out_of_range_index_does_not_satisfy_is_null() {
+        // 範囲外インデックス（列値を読めていない）は NULL と同一視しない
+        // （fail-closed。`IS NULL` が誤って真になってはならない）。
+        let f = DeclarativeFilter::is_null("tag").bind(&schema()).unwrap();
+        assert!(!matches_all(&[f], &[]));
+    }
+
+    #[test]
+    fn matches_all_out_of_range_index_does_not_satisfy_is_not_null() {
+        let f = DeclarativeFilter::is_not_null("tag")
+            .bind(&schema())
+            .unwrap();
+        assert!(!matches_all(&[f], &[]));
     }
 }
