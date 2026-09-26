@@ -507,6 +507,14 @@ pub(crate) fn classify_aggregate_access(
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
 /// （DoS）」対応）。
+///
+/// `Clone`（SQL-30・TASK-214、Issue #930）: `sql::window::execute_window_scan` が
+/// ORDER BY ありのウィンドウ集計で、peer グループ境界ごとに `clone().finish()`
+/// でスナップショットを取りつつ元のアキュムレータへ観測を積み増し続けるために
+/// 使う（`finish` は `self` を消費するため、走査を止めずに中間結果だけ確定する
+/// 手段が必要）。既存の集計経路（`aggregate.rs`・`group_by.rs`）は複製せず単一の
+/// 所有権のまま走査末尾で `finish` するため、この派生追加で挙動は変わらない。
+#[derive(Clone)]
 pub(crate) enum Accumulator {
     /// `COUNT(*)`・`COUNT(id)`・`COUNT(<VECTOR 列>)`・`COUNT(<Scalar 式>)`。
     Count(u64),
@@ -975,6 +983,11 @@ impl Accumulator {
                 };
                 match program.eval(id, embedding, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
+                    // NULL は集計対象から除外する（対象ビヘイビア: SQL-26。
+                    // Issue #921。`SUM`/`AVG`/`MIN`/`MAX` は無視、
+                    // `COUNT(expr)` は `observe_float` が共有する `Count` 腕が
+                    // 非 NULL のみを数える契約に自然に合流する）。
+                    ExprValue::Null => Ok(()),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
                     // 評価結果の型が食い違う実装バグの検出用）。
@@ -1145,6 +1158,15 @@ impl Accumulator {
                 };
                 match program.eval(id, embedding, scratch)? {
                     ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
+                    // NULL は COUNT(DISTINCT expr) の対象から除外する（対象
+                    // ビヘイビア: SQL-26。Issue #921 レビュー指摘対応。非 distinct
+                    // 経路〔本ファイル `ScalarExpr` 分岐の `ExprValue::Null => Ok(())`〕
+                    // と同じ「NULL は集計対象外」契約を distinct 側でも成立させる。
+                    // 他列型（`*Column`）の `None` 分岐と同様、この `None` は
+                    // 「この行は distinct 集合へ加えない」を表し、内部バグとしては
+                    // 扱わない。`COUNT(DISTINCT NULLIF(...))` のように NULL を返す
+                    // 式で誤って内部エラーにしない）。
+                    ExprValue::Null => None,
                     _ => {
                         return Err(accumulator_bug(
                             "scalar-typed BoundExpr evaluated to a non-scalar value (distinct)",
@@ -2130,7 +2152,9 @@ pub(crate) fn execute_aggregate_with_cache(
                 };
                 match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                    // Issue #921）。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
                     _ => {
@@ -2568,7 +2592,9 @@ pub(crate) fn observe_candidate_slots(
             };
             match program.eval(id, embedding, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
-                ExprValue::Bool(false) => continue 'candidates,
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921）。
+                ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",

@@ -1084,6 +1084,30 @@ fn collect_referenced_udfs(
             collect_referenced_udfs(lhs, udf_registry, out)?;
             collect_referenced_udfs(rhs, udf_registry, out)
         }
+        // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
+        // UDF 呼び出しを持たない葉と同じく子を再帰的に走査するだけでよい
+        // （UDF 呼び出しは `Expr::Call` 経由でのみ発生する）。
+        Expr::Null => Ok(()),
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                collect_referenced_udfs(cond, udf_registry, out)?;
+                collect_referenced_udfs(result, udf_registry, out)?;
+            }
+            if let Some(else_result) = else_result {
+                collect_referenced_udfs(else_result, udf_registry, out)?;
+            }
+            Ok(())
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                collect_referenced_udfs(a, udf_registry, out)?;
+            }
+            Ok(())
+        }
+        Expr::NullIf(lhs, rhs) => {
+            collect_referenced_udfs(lhs, udf_registry, out)?;
+            collect_referenced_udfs(rhs, udf_registry, out)
+        }
     }
 }
 
@@ -1132,6 +1156,37 @@ fn push_dml_expr(
         Expr::Binary { op, lhs, rhs } => {
             b.push_u8(4);
             b.push_u8(dml_binop_tag(*op));
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
+        }
+        // タグ 5〜8（対象ビヘイビア: SQL-26。Issue #921。ADR §4.4 タグ表に追記）。
+        Expr::Null => {
+            b.push_u8(5);
+        }
+        Expr::Case { whens, else_result } => {
+            b.push_u8(6);
+            let count = u32::try_from(whens.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for (cond, result) in whens {
+                push_dml_expr(b, cond, params)?;
+                push_dml_expr(b, result, params)?;
+            }
+            // ELSE 有無フラグ（境界の曖昧さを避けるため本体の前に置く）。
+            b.push_u8(u8::from(else_result.is_some()));
+            if let Some(else_result) = else_result {
+                push_dml_expr(b, else_result, params)?;
+            }
+        }
+        Expr::Coalesce(args) => {
+            b.push_u8(7);
+            let count = u32::try_from(args.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for arg in args {
+                push_dml_expr(b, arg, params)?;
+            }
+        }
+        Expr::NullIf(lhs, rhs) => {
+            b.push_u8(8);
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
         }
@@ -2085,6 +2140,89 @@ mod tests {
             lhs: Box::new(lhs),
             rhs: Box::new(Expr::Number("0".to_string())),
         })
+    }
+
+    // --- CASE／COALESCE／NULLIF のタグ直列化（対象ビヘイビア: SQL-26。
+    // Issue #921。ADR §4.4 タグ表のタグ 5〜8） ------------------------------
+
+    /// `Expr::Case`（有無・分岐順・ELSE 有無いずれの差もハッシュへ反映される
+    /// こと。§4.4 の「構文形をハッシュする」設計の回帰防止）を固定する。
+    #[test]
+    fn case_hash_differs_by_branch_order_and_else_presence() {
+        use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
+
+        let registry = UdfRegistry::default();
+        let cond_gt = Expr::Binary {
+            op: BinOp::Gt,
+            lhs: Box::new(Expr::Ident("id".to_string())),
+            rhs: Box::new(Expr::Number("1".to_string())),
+        };
+        let cond_lt = Expr::Binary {
+            op: BinOp::Lt,
+            lhs: Box::new(Expr::Ident("id".to_string())),
+            rhs: Box::new(Expr::Number("1".to_string())),
+        };
+        let with_else = where_predicate_id_gt_zero(Expr::Case {
+            whens: vec![(cond_gt.clone(), Expr::Number("1".to_string()))],
+            else_result: Some(Box::new(Expr::Number("0".to_string()))),
+        });
+        let without_else = where_predicate_id_gt_zero(Expr::Case {
+            whens: vec![(cond_gt.clone(), Expr::Number("1".to_string()))],
+            else_result: None,
+        });
+        let different_branch_order = where_predicate_id_gt_zero(Expr::Case {
+            whens: vec![(cond_lt, Expr::Number("1".to_string()))],
+            else_result: Some(Box::new(Expr::Number("0".to_string()))),
+        });
+        let same_as_with_else = where_predicate_id_gt_zero(Expr::Case {
+            whens: vec![(cond_gt, Expr::Number("1".to_string()))],
+            else_result: Some(Box::new(Expr::Number("0".to_string()))),
+        });
+
+        let h_with_else = for_delete_where("t", &[with_else], &registry).unwrap();
+        let h_without_else = for_delete_where("t", &[without_else], &registry).unwrap();
+        let h_different_order =
+            for_delete_where("t", &[different_branch_order], &registry).unwrap();
+        let h_same = for_delete_where("t", &[same_as_with_else], &registry).unwrap();
+
+        assert_ne!(h_with_else, h_without_else);
+        assert_ne!(h_with_else, h_different_order);
+        assert_eq!(h_with_else, h_same);
+    }
+
+    /// `Expr::Null`／`Expr::Coalesce`／`Expr::NullIf` がそれぞれ他タグ・互いに
+    /// 異なるハッシュを持ち、同一内容は同一ハッシュになることを固定する。
+    #[test]
+    fn null_coalesce_nullif_hash_are_distinct_and_deterministic() {
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+
+        let registry = UdfRegistry::default();
+        let null_pred = where_predicate_id_gt_zero(Expr::Null);
+        let coalesce_pred = where_predicate_id_gt_zero(Expr::Coalesce(vec![
+            Expr::Number("1".to_string()),
+            Expr::Number("2".to_string()),
+        ]));
+        let coalesce_pred_reordered = where_predicate_id_gt_zero(Expr::Coalesce(vec![
+            Expr::Number("2".to_string()),
+            Expr::Number("1".to_string()),
+        ]));
+        let nullif_pred = where_predicate_id_gt_zero(Expr::NullIf(
+            Box::new(Expr::Number("1".to_string())),
+            Box::new(Expr::Number("2".to_string())),
+        ));
+
+        let h_null = for_delete_where("t", std::slice::from_ref(&null_pred), &registry).unwrap();
+        let h_coalesce = for_delete_where("t", &[coalesce_pred], &registry).unwrap();
+        let h_coalesce_reordered =
+            for_delete_where("t", &[coalesce_pred_reordered], &registry).unwrap();
+        let h_nullif = for_delete_where("t", &[nullif_pred], &registry).unwrap();
+        let h_null_again = for_delete_where("t", &[null_pred], &registry).unwrap();
+
+        assert_ne!(h_null, h_coalesce);
+        assert_ne!(h_null, h_nullif);
+        assert_ne!(h_coalesce, h_nullif);
+        assert_ne!(h_coalesce, h_coalesce_reordered);
+        assert_eq!(h_null, h_null_again);
     }
 
     /// ADR §4.4.1「WASM UDF は本節の対象外」の拒否判定（`collect_referenced_udfs` の

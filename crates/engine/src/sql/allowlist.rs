@@ -16,7 +16,8 @@ use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::udf_call::{
-    BinOp, Expr, MAX_CALL_ARGS, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    BinOp, Expr, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
+    MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 
@@ -260,6 +261,11 @@ pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
 /// 参照する（[`check_aggregate_item_count`] 経由。`declarative_filter::
 /// MAX_METADATA_FILTERS`／`check_filter_count` と同じ設計判断）。
 pub const MAX_AGGREGATE_ITEMS: usize = 32;
+
+/// ウィンドウ項目（SQL-30・TASK-214）の `PARTITION BY`・`ORDER BY` 句が持てる
+/// 列数の上限。SQL-25 (d) の列数上限と同じ実装既定値を流用する（無制限 `Vec`
+/// 確保を避ける方針。security.md「不安全な設計」対応）。
+pub(crate) const MAX_WINDOW_KEYS: usize = 8;
 
 /// `count` 件の集計項目が [`MAX_AGGREGATE_ITEMS`] を超えないことを検証する
 /// （`54000`）。`Vec` 確保・要素の複製より**前**に呼べる形にする
@@ -529,6 +535,12 @@ pub enum SqlSurfaceError {
     /// Issue #907。[`crate::catalog::CatalogError::InvalidForeignKey`] の写像。
     /// ERR-6: `42830`）。`detail` はカタログ情報（列名・テーブル名）のみ。
     InvalidForeignKey { detail: String },
+    /// 式の型不一致（`CASE`/`COALESCE`/`NULLIF`。対象ビヘイビア: SQL-26、
+    /// Issue #921）: `CASE WHEN` の条件が Bool でない、`CASE`/`COALESCE` の
+    /// 各枝の型が食い違う、`NULLIF` の引数が非 Scalar。既存の `bind_binary`／
+    /// `bind_call` の型不一致（`22000`。SQL-9 の既存契約）とは独立した分類。
+    /// ERR-6 拡張: `42804`。
+    DatatypeMismatch { detail: String },
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
     /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
     /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
@@ -755,6 +767,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
+            SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
         }
     }
@@ -889,6 +902,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidForeignKey { detail } => {
                 write!(f, "invalid foreign key declaration: {detail}")
+            }
+            SqlSurfaceError::DatatypeMismatch { detail } => {
+                write!(f, "datatype mismatch: {detail}")
             }
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")
@@ -1390,6 +1406,86 @@ pub struct AggregateItem {
     pub(crate) distinct: bool,
 }
 
+/// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の種別。順位関数
+/// （`RowNumber`/`Rank`/`DenseRank`）は引数を取らず、集計関数
+/// （`Count`/`Sum`/`Avg`/`Min`/`Max`）は [`AggregateFunc`] と同じ名前を共有するが、
+/// `OVER (...)` 句を伴う点・`GROUP BY` と併用できない点が異なるため独立の enum に
+/// する（`allowlist::validate_sql_tokens` の振り分け・`sql::parser::bind_window_item`
+/// が本 enum の variant で分岐する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl WindowFunc {
+    /// ウィンドウ関数名の許可リスト照合（大文字小文字を区別しない）。未知の
+    /// 名前は `None`（呼び出し元が `42601` へ変換する）。
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "ROW_NUMBER" => Some(WindowFunc::RowNumber),
+            "RANK" => Some(WindowFunc::Rank),
+            "DENSE_RANK" => Some(WindowFunc::DenseRank),
+            "COUNT" => Some(WindowFunc::Count),
+            "SUM" => Some(WindowFunc::Sum),
+            "AVG" => Some(WindowFunc::Avg),
+            "MIN" => Some(WindowFunc::Min),
+            "MAX" => Some(WindowFunc::Max),
+            _ => None,
+        }
+    }
+
+    /// 順位関数（引数を取らない。[`Parser::parse_window_item`] が引数の有無を
+    /// この判定で分岐する）。
+    pub(crate) fn is_ranking(self) -> bool {
+        matches!(
+            self,
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+        )
+    }
+
+    /// `alias` 省略時の既定列名（[`AggregateFunc::default_alias`] と同じ命名規則）。
+    pub(crate) fn default_alias(self) -> &'static str {
+        match self {
+            WindowFunc::RowNumber => "row_number",
+            WindowFunc::Rank => "rank",
+            WindowFunc::DenseRank => "dense_rank",
+            WindowFunc::Count => "count",
+            WindowFunc::Sum => "sum",
+            WindowFunc::Avg => "avg",
+            WindowFunc::Min => "min",
+            WindowFunc::Max => "max",
+        }
+    }
+}
+
+/// SELECT リストのウィンドウ項目 1 つ（SQL-30・TASK-214、Issue #930）。`position`
+/// は SELECT リスト全体（通常項目・ウィンドウ項目を通した 0 始まりの通し番号）
+/// における出現位置で、実行時（`sql::window::execute_window_scan`）が通常の
+/// 投影列と組み合わせて元の並び順を復元するために使う
+/// （[`Projection`] はウィンドウ項目を保持しないため、位置情報を別途持たせる
+/// 必要がある）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowSelectItem {
+    pub(crate) position: usize,
+    pub(crate) func: WindowFunc,
+    /// 順位関数は常に `None`。集計関数は [`AggregateArg`]（`*`・裸の列名のみ。
+    /// 複合式は対象外——TASK-214 のスコープ縮小、`docs/design/window-functions.md`
+    /// 参照）。
+    pub(crate) arg: Option<AggregateArg>,
+    /// `PARTITION BY` の列名一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
+    pub(crate) partition_by: Vec<String>,
+    /// `ORDER BY` の (列名, 降順か) 一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
+    pub(crate) order_by: Vec<(String, bool)>,
+    pub(crate) alias: Option<String>,
+}
+
 /// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
 /// `GroupKey` は `GROUP BY` 句がある場合にのみ現れ、`GROUP BY` 列と同名の裸の
 /// 識別子（任意で `AS <alias>`）だけを構造上受理する（`allowlist::Parser::parse_select_item`
@@ -1512,6 +1608,11 @@ pub struct ValidatedScan {
     /// 適用する（`sql::scan::execute_scan_with_budget`）。範囲検証は
     /// `sql::parser::bind_scan_with_dummy_flags` が束縛時に行う。
     pub(crate) offset: u32,
+    /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得
+    /// （既存契約を完全に維持）。`Vec<SelectItem>` を返す `projection` とは別に
+    /// 保持し、実行時（`sql::window::execute_window_scan`）が
+    /// [`WindowSelectItem::position`] で元の並び順へ合流する。
+    pub(crate) window_items: Vec<WindowSelectItem>,
 }
 
 impl ValidatedScan {
@@ -2055,6 +2156,22 @@ struct Parser<'a> {
     /// スタック消費も定数に抑える（security.md「不安全な設計｜無制限リソース確保
     /// （DoS）」対応。1 文（`Parser` 1 インスタンス）につき共有）。
     expr_node_budget: usize,
+    /// `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）の現在の
+    /// 入れ子段数。[`enter_case_nesting`]／[`Self::exit_case_nesting`] が
+    /// 対で管理する（構文段の計測。束縛段の独立検査は `udf_call::BindEnv::
+    /// case_nesting` 参照）。
+    case_nesting: usize,
+    /// `NULL` を裸の識別子ではなくリテラル（[`Expr::Null`]）として解釈してよい
+    /// 文脈かどうか（codex-review P1 指摘対応。Issue #921 PR #1101）。既存の
+    /// VECTOR 列名 `null` を参照するクエリ（例: `vec_norm(null)`）が
+    /// `parse_primary_expr` の無条件リテラル化で列参照として束縛されなくなる
+    /// 破壊的変更を防ぐため、`Expr::Null` の束縛が実際に許可される 3 箇所
+    /// （`CASE` の THEN／ELSE 値・`COALESCE`／`NULLIF` の引数。`udf_call::
+    /// bind_expr_in` の `Expr::Null` 分岐参照）を解析する呼び出しの直前でのみ
+    /// `true` へ切り替える。それ以外（`CASE WHEN` 条件式・通常の関数呼び出し
+    /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
+    /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
+    allow_null_literal: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -2063,7 +2180,26 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
+            case_nesting: 0,
+            allow_null_literal: false,
         }
+    }
+
+    /// [`Self::allow_null_literal`] を一時的に `allowed` へ切り替えて `depth+1`
+    /// で式を解析し、呼び出し前の値へ復元する（ネストした式の中で文脈が変わる
+    /// 場合に備えた save/restore。呼び出し元は `CASE` の THEN／ELSE 値・
+    /// `COALESCE`／`NULLIF` の引数・`CASE WHEN` 条件式・通常の関数呼び出し引数の
+    /// いずれかで、それぞれ許可すべき値が異なる）。
+    fn parse_value_expr_with_null_context(
+        &mut self,
+        depth: usize,
+        allowed: bool,
+    ) -> Result<Expr, SqlSurfaceError> {
+        let prev = self.allow_null_literal;
+        self.allow_null_literal = allowed;
+        let result = self.parse_value_expr(depth);
+        self.allow_null_literal = prev;
+        result
     }
 
     /// 式ノードを 1 つ生成する直前に呼び、予算を消費する。予算枯渇時は
@@ -2241,9 +2377,28 @@ impl<'a> Parser<'a> {
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
         if let Some(Token::Ident(name)) = self.peek() {
             let name = name.clone();
-            if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
-                self.advance();
-                let expr = self.parse_call_expr(name, 0)?;
+            // `CASE`（対象ビヘイビア: SQL-26。Issue #921）は `ident '('` 形では
+            // なく頂点に来るため、次が `'('` かに加えて大小無視で照合する。ただし
+            // `WHEN` を伴わない `CASE` は式ではなく既存の列名 `case` の参照
+            // （`SELECT case FROM t` 等）でありうるため、`DISTINCT`／`LIKE` と
+            // 同じ文脈的キーワードの判定方針（1 トークン先読み）で「次が `WHEN`
+            // であるときのみ」式として扱う（codex-review 指摘対応: 先読み無しでは
+            // 既存の列名 `case` の SELECT が構文エラー化する破壊的変更になる）。
+            // `NULL` は後続トークンによる曖昧性解消ができない（`SELECT null FROM t`
+            // は「列 `null` の参照」と「NULL リテラルの投影」のどちらも構文上
+            // 同一の形になる）ため、列名としての後方互換を優先し、ここでは式
+            // トリガーに含めない（`NULL` リテラルは `CASE`／`COALESCE`／`NULLIF`
+            // の内側など `parse_primary_expr` 経由の文脈では従来どおり使える）。
+            let starts_case =
+                name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
+            let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+            if starts_case || starts_call {
+                let expr = if starts_case {
+                    self.parse_value_expr(0)?
+                } else {
+                    self.advance();
+                    self.parse_call_expr(name, 0)?
+                };
                 let alias = if self.peek_ident_matches("AS") {
                     self.advance();
                     Some(self.expect_ident()?)
@@ -2254,6 +2409,208 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(SelectItem::Column(self.expect_ident()?))
+    }
+
+    /// SQL-30・TASK-214（Issue #930）: 広域取得（`ParsedSelect::Scan`）専用の SELECT
+    /// リスト解析。[`Self::parse_select_list`] と異なり、ウィンドウ項目
+    /// （`<func>(...) OVER (...)`）を通常項目（[`SelectItem`]）とは別に
+    /// [`WindowSelectItem`] へ振り分けて返す（[`Projection`] 自体はウィンドウ項目を
+    /// 保持できないため）。呼び出し元（[`parse_select_shape`]）は、ウィンドウ項目が
+    /// 1 つでもあれば広域取得（`LIMIT` 直接。ランキング段を持たない）のみを許可し、
+    /// `ORDER BY`／`USING PLAN` を伴う検索 SELECT 形状とは併用させない
+    /// （§計画 2「対象外」）。
+    ///
+    /// `*` とウィンドウ項目の混在（`SELECT *, ROW_NUMBER() OVER () ...`）は
+    /// 受理しない: 先頭が `*` 単独なら [`Self::parse_select_list`] と同じく即座に
+    /// `Projection::All` を返す（後続のカンマ区切り項目を読まない）ため、
+    /// `SELECT *, ...` の残りトークンが `expect_end_of_statement` で `42601` に
+    /// 落ちる。
+    fn parse_select_list_with_windows(
+        &mut self,
+    ) -> Result<(Projection, Vec<WindowSelectItem>), SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('*'))) {
+            self.advance();
+            return Ok((Projection::All, Vec::new()));
+        }
+        let mut plain_items: Vec<SelectItem> = Vec::new();
+        let mut window_items: Vec<WindowSelectItem> = Vec::new();
+        let mut position: usize = 0;
+        loop {
+            if self.peek_is_window_item_start() {
+                if window_items.len() >= MAX_AGGREGATE_ITEMS {
+                    return Err(SqlSurfaceError::payload_too_large("too many window items"));
+                }
+                let mut item = self.parse_window_item()?;
+                item.position = position;
+                window_items.push(item);
+            } else {
+                plain_items.push(self.parse_select_item()?);
+            }
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("too many SELECT list items"))?;
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let projection = if plain_items
+            .iter()
+            .all(|it| matches!(it, SelectItem::Column(_)))
+        {
+            Projection::Columns(
+                plain_items
+                    .into_iter()
+                    .map(|it| match it {
+                        SelectItem::Column(name) => name,
+                        SelectItem::Expr { .. } => unreachable!("filtered above"),
+                    })
+                    .collect(),
+            )
+        } else {
+            Projection::Items(plain_items)
+        };
+        Ok((projection, window_items))
+    }
+
+    /// 現在位置が「`<ident> '(' ... ')' OVER '('`」の並びで始まるかを、消費せず
+    /// 判定する（[`Self::find_matching_close_paren`] で対応する `')'` を探し、その
+    /// 直後が文脈識別子 `OVER`・その次が `'('` かを見る）。対応する `')'` が
+    /// 見つからない場合は通常項目として扱う（`parse_select_item`／
+    /// `parse_call_expr` 側の既存エラー処理に委ねる）。
+    fn peek_is_window_item_start(&self) -> bool {
+        let Some(Token::Ident(_)) = self.peek() else {
+            return false;
+        };
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
+            return false;
+        }
+        let Some(close_idx) = self.find_matching_close_paren(self.pos + 1) else {
+            return false;
+        };
+        matches!(
+            self.tokens.get(close_idx + 1),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("OVER")
+        ) && matches!(self.tokens.get(close_idx + 2), Some(Token::Punct('(')))
+    }
+
+    /// ウィンドウ項目 1 つ（SQL-30・TASK-214、Issue #930）:
+    /// `<func>(<args>) OVER ( [PARTITION BY <ident>[, ...]] [ORDER BY <ident>
+    /// [ASC|DESC][, ...]] ) [AS <alias>]`。呼び出し元
+    /// （[`Self::parse_select_list_with_windows`]）が [`Self::peek_is_window_item_start`]
+    /// で先読み確定済みの前提で呼ぶ。`position` は呼び出し元が後から設定する
+    /// （ここでは常に `0`）。
+    ///
+    /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
+    /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・名前付き
+    /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・`FILTER (...)`・関数内
+    /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
+    /// （該当する構文を消費する分岐を意図的に持たない）。
+    fn parse_window_item(&mut self) -> Result<WindowSelectItem, SqlSurfaceError> {
+        let name = self.expect_ident()?;
+        let func = WindowFunc::from_name(&name).ok_or_else(|| {
+            SqlSurfaceError::unsupported(format!("unsupported window function: {name}"))
+        })?;
+        self.expect_punct('(')?;
+        let arg = if func.is_ranking() {
+            None
+        } else {
+            // `DISTINCT` は本 Issue のスコープ外（`COUNT(DISTINCT ...) OVER (...)`
+            // は非対応。§計画 2「対象外」）。
+            if is_distinct_modifier(self.tokens, self.pos) {
+                return Err(SqlSurfaceError::unsupported(
+                    "DISTINCT is not supported inside a window aggregate function",
+                ));
+            }
+            if matches!(self.peek(), Some(Token::Punct('*'))) {
+                if func != WindowFunc::Count {
+                    return Err(SqlSurfaceError::unsupported(
+                        "'*' is only allowed inside COUNT(*)",
+                    ));
+                }
+                self.advance();
+                Some(AggregateArg::Star)
+            } else {
+                match self.peek() {
+                    // 引数は裸の列名のみを受理する（複合式・UDF 呼び出しは
+                    // §計画 2「対象外」）。
+                    Some(Token::Ident(_)) => {
+                        let column = self.expect_ident()?;
+                        Some(AggregateArg::Expr(Expr::Ident(column)))
+                    }
+                    Some(Token::Punct(')')) => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "window aggregate function requires exactly one argument",
+                        ));
+                    }
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "window aggregate function argument must be a bare column reference, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        };
+        self.expect_punct(')')?;
+        self.expect_ident_matching("OVER")?;
+        self.expect_punct('(')?;
+        let mut partition_by = Vec::new();
+        if self.peek_contextual_keyword("PARTITION") {
+            self.advance();
+            self.expect_keyword(Keyword::By)?;
+            partition_by.push(self.expect_ident()?);
+            while matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if partition_by.len() >= MAX_WINDOW_KEYS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many PARTITION BY columns",
+                    ));
+                }
+                partition_by.push(self.expect_ident()?);
+            }
+        }
+        let mut order_by = Vec::new();
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+            self.advance();
+            self.expect_keyword(Keyword::By)?;
+            loop {
+                if order_by.len() >= MAX_WINDOW_KEYS {
+                    return Err(SqlSurfaceError::payload_too_large("too many ORDER BY keys"));
+                }
+                let column = self.expect_ident()?;
+                let descending = if self.peek_ident_matches("DESC") {
+                    self.advance();
+                    true
+                } else if self.peek_ident_matches("ASC") {
+                    self.advance();
+                    false
+                } else {
+                    false
+                };
+                order_by.push((column, descending));
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_punct(')')?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(WindowSelectItem {
+            position: 0,
+            func,
+            arg,
+            partition_by,
+            order_by,
+            alias,
+        })
     }
 
     /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13。SQL-25 (c)・TASK-209 で
@@ -2794,10 +3151,36 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// `primary := number | ident | ident '(' [expr {',' expr}] ')' | '(' expr ')'`。
+    /// `primary := number | NULL | CASE-expr | ident | ident '(' [expr {',' expr}] ')'
+    /// | '(' expr ')'`。`NULL`／`CASE` は [`lexer::Keyword`] に含めない文脈的
+    /// キーワードとして扱う（対象ビヘイビア: SQL-26。Issue #921。既存の `AS`／
+    /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         match self.peek().cloned() {
+            // codex-review P1 指摘対応（Issue #921 PR #1101）: `NULL` は
+            // `self.allow_null_literal` が立っている文脈（`CASE` の THEN／ELSE
+            // 値・`COALESCE`／`NULLIF` の引数。[`Self::allow_null_literal`]
+            // 参照）でのみリテラル化する。それ以外では既存の VECTOR 列名 `null`
+            // の後方互換を優先し、下の一般識別子分岐へフォールスルーして列参照
+            // （`Expr::Ident`）として扱う。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("NULL") && self.allow_null_literal =>
+            {
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::Null)
+            }
+            // codex-review P1 指摘対応（Issue #921 PR #1101）: `parse_select_item`
+            // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
+            // 先読み無しで無条件に消費すると既存の VECTOR 列名 `case` の参照
+            // （例: `vec_norm(case)`）が構文エラー化する破壊的変更になる。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") =>
+            {
+                self.advance();
+                self.parse_case_expr(depth)
+            }
             Some(Token::Number(n)) => {
                 self.advance();
                 self.consume_expr_node()?;
@@ -2824,6 +3207,143 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Self::case_nesting`] を 1 段進め、[`MAX_CASE_NESTING`] を超えないか検査
+    /// する（`parse_case_expr`／`parse_coalesce_expr`／`parse_nullif_expr` が共有。
+    /// 対象ビヘイビア: SQL-26。Issue #921）。
+    fn enter_case_nesting(&mut self) -> Result<(), SqlSurfaceError> {
+        let next = self.case_nesting.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(
+                "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+            )
+        })?;
+        if next > MAX_CASE_NESTING {
+            return Err(SqlSurfaceError::payload_too_large(
+                "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+            ));
+        }
+        self.case_nesting = next;
+        Ok(())
+    }
+
+    fn exit_case_nesting(&mut self) {
+        self.case_nesting = self.case_nesting.saturating_sub(1);
+    }
+
+    /// 検索形 `CASE WHEN <lhs> <cmp> <rhs> THEN <value_expr> {WHEN ...}
+    /// [ELSE <value_expr>] END` を解析する（対象ビヘイビア: SQL-26）。呼び出し元は
+    /// `CASE` トークンを消費済み。単純 CASE（`CASE x WHEN v ...`）・WHEN 条件中の
+    /// `AND`/`OR`/`IS NULL` 等の論理演算は本 Issue の対象外として `42601` で拒否
+    /// する（`cond` は常に `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
+    fn parse_case_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        self.enter_case_nesting()?;
+        let result = self.parse_case_expr_inner(depth);
+        self.exit_case_nesting();
+        result
+    }
+
+    fn parse_case_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        // 直後が `WHEN` でなければ単純 CASE 形（`CASE x WHEN v ...`）であり、
+        // 本 Issue の対象外として拒否する（`42601`）。
+        self.expect_ident_matching("WHEN")?;
+        let mut whens = Vec::new();
+        loop {
+            // WHEN 条件式（`<value_expr> <cmp_op> <value_expr>`）は
+            // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
+            // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
+            // false にする。[`Self::allow_null_literal`] 参照）。
+            let lhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            let op = self.expect_cmp_op()?;
+            let rhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
+            let cond = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+            self.expect_ident_matching("THEN")?;
+            // THEN の結果値は `Expr::Null` の束縛が許可される 3 箇所の 1 つ
+            // （`udf_call::bind_expr_in` 参照）のため、ここでは `NULL` を
+            // リテラルとして解析する。
+            let result = self.parse_value_expr_with_null_context(depth + 1, true)?;
+            whens.push((cond, result));
+            if whens.len() > MAX_CASE_BRANCHES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "CASE has too many WHEN branches",
+                ));
+            }
+            if self.peek_ident_matches("WHEN") {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let else_result = if self.peek_ident_matches("ELSE") {
+            self.advance();
+            // ELSE の結果値も THEN と同じく `Expr::Null` 許可箇所。
+            Some(Box::new(
+                self.parse_value_expr_with_null_context(depth + 1, true)?,
+            ))
+        } else {
+            None
+        };
+        self.expect_ident_matching("END")?;
+        self.consume_expr_node()?;
+        Ok(Expr::Case { whens, else_result })
+    }
+
+    /// `COALESCE '(' <value_expr> {',' <value_expr>} ')'`（対象ビヘイビア:
+    /// SQL-26）。呼び出し元は関数名を消費済みで、次のトークンが `'('` である
+    /// 前提。0 引数（`COALESCE()`）は最初の引数の構文解析が失敗する形で自然に
+    /// `42601` へ落ちる。
+    fn parse_coalesce_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.enter_case_nesting()?;
+        let result = self.parse_coalesce_expr_inner(depth);
+        self.exit_case_nesting();
+        result
+    }
+
+    fn parse_coalesce_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        // `COALESCE` の引数は `Expr::Null` の束縛が許可される 3 箇所の 1 つ
+        // （`udf_call::bind_expr_in` 参照）のため、ここでは `NULL` をリテラル
+        // として解析する（[`Self::allow_null_literal`] 参照）。
+        let mut args = vec![self.parse_value_expr_with_null_context(depth + 1, true)?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if args.len() >= MAX_CALL_ARGS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many call arguments",
+                ));
+            }
+            args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
+        }
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::Coalesce(args))
+    }
+
+    /// `NULLIF '(' <value_expr> ',' <value_expr> ')'`（対象ビヘイビア: SQL-26）。
+    /// 引数がちょうど 2 個であることを構造上強制する（過不足は `42601`）。
+    fn parse_nullif_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.enter_case_nesting()?;
+        let result = self.parse_nullif_expr_inner(depth);
+        self.exit_case_nesting();
+        result
+    }
+
+    fn parse_nullif_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        // `NULLIF` の引数も `Expr::Null` の束縛が許可される 3 箇所の 1 つ
+        // （`udf_call::bind_expr_in` 参照）のため、`NULL` をリテラルとして
+        // 解析する（[`Self::allow_null_literal`] 参照）。
+        let lhs = self.parse_value_expr_with_null_context(depth + 1, true)?;
+        self.expect_punct(',')?;
+        let rhs = self.parse_value_expr_with_null_context(depth + 1, true)?;
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::NullIf(Box::new(lhs), Box::new(rhs)))
+    }
+
     /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
     /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
     ///
@@ -2834,6 +3354,17 @@ impl<'a> Parser<'a> {
     /// WHERE 式述語・`CREATE FUNCTION` 本体・集計引数のネスト呼び出し）での出現であり、
     /// いずれも許可形状外（`GROUP BY` を持たない集計のみを SQL-13 の受理形とする）。
     fn parse_call_expr(&mut self, name: String, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        // `COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は遅延評価の
+        // 意味論を持つ専用 AST ノードのため、通常の `Expr::Call`（引数を先に
+        // 評価する関数呼び出し）とは別に、名前を大小無視で照合して専用の構文へ
+        // 振り分ける（`udf_call::Expr::Call` で兼用しない理由は `udf_call.rs`
+        // モジュール doc 参照）。
+        if name.eq_ignore_ascii_case("coalesce") {
+            return self.parse_coalesce_expr(depth);
+        }
+        if name.eq_ignore_ascii_case("nullif") {
+            return self.parse_nullif_expr(depth);
+        }
         if is_aggregate_function_name(&name) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "aggregate function {name} is only allowed as a top-level SELECT item"
@@ -2842,7 +3373,13 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
-            args.push(self.parse_value_expr(depth + 1)?);
+            // 通常の関数呼び出し（`COALESCE`／`NULLIF` 以外）の引数は
+            // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL`
+            // は常に列参照として解析する（外側が `COALESCE`／`NULLIF` の引数
+            // 中でネストして呼ばれた場合でも、この関数自身の引数については
+            // `allow_null_literal` を強制的に false へ戻す。
+            // [`Self::allow_null_literal`] 参照）。
+            args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
             while matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 if args.len() >= MAX_CALL_ARGS {
@@ -2850,7 +3387,7 @@ impl<'a> Parser<'a> {
                         "too many call arguments",
                     ));
                 }
-                args.push(self.parse_value_expr(depth + 1)?);
+                args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
             }
         }
         self.expect_punct(')')?;
@@ -4732,13 +5269,16 @@ struct ParsedShape {
     using_plan: Option<String>,
 }
 
-/// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454）。
+/// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
+/// SQL-30・TASK-214、Issue #930 で `window_items` を追加）。
 struct ParsedScanShape {
     table_name: String,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
     limit: u32,
     offset: u32,
+    /// ウィンドウ項目（SELECT リスト全体での出現位置つき）。空なら通常の広域取得。
+    window_items: Vec<WindowSelectItem>,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -4759,7 +5299,11 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
-    let projection = p.parse_select_list()?;
+    // SQL-30・TASK-214（Issue #930）: ウィンドウ項目は SELECT リストの一部として
+    // 通常項目と混在しうるため、`ORDER BY`／`USING PLAN` を伴う検索 SELECT 経路か
+    // ランキング段を持たない広域取得かを判定する**前**にリストを読み終える必要が
+    // ある（既存の `parse_select_list` 呼び出しをそのまま置き換える）。
+    let (projection, window_items) = p.parse_select_list_with_windows()?;
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
 
@@ -4770,10 +5314,23 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
         Vec::new()
     };
 
+    // SQL-30・TASK-214: ウィンドウ項目は WHERE の中で自分自身の別名を参照できない
+    // （実在列と同名なら列として解釈する。§計画 3.4「WHERE がウィンドウ別名を
+    // 参照する場合」）。ここでは束縛前の構造検証段のため列の実在確認はできず、
+    // 意味論的な判定は `sql::parser::bind_scan_with_dummy_flags` へ委譲する
+    // （構造検証段は `window_items` を `ParsedScanShape` へそのまま伝播するのみ）。
+
     // TASK-77・SQL-5: `USING PLAN(...)` は `ORDER BY` の代替経路（相互排他）。
     // `ORDER BY` 経路は必ずキーワード `ORDER` から始まるため、この位置で文脈的
     // 識別子 `USING` が現れるかどうかだけで両者を衝突なく判定できる。
     if p.peek_ident_matches("USING") {
+        // SQL-30・TASK-214: `USING PLAN` はランキング段を持つ検索 SELECT 専用の
+        // 経路で、ウィンドウ項目とは構造上両立しない（§計画 2「対象外」）。
+        if !window_items.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "window functions cannot be combined with USING PLAN",
+            ));
+        }
         let using_plan = p.parse_using_plan_clause()?;
 
         p.expect_keyword(Keyword::Limit)?;
@@ -4828,7 +5385,18 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             where_predicates,
             limit,
             offset,
+            window_items,
         }));
+    }
+
+    // SQL-30・TASK-214: 残る経路は文全体のスカラー `ORDER BY` を伴う検索 SELECT
+    // （`docs/spec/04-behavior/sql-surface.md` SQL-25 の管轄。本 Issue のスコープ外
+    // ——TASK-209〔#915〕未マージのため §計画 2「対象外」）で、ウィンドウ項目とは
+    // 併用しない。
+    if !window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions cannot be combined with ORDER BY",
+        ));
     }
 
     p.expect_keyword(Keyword::Order)?;
@@ -5129,10 +5697,13 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 /// この関数へ渡し、[`validate_sql`] と同一の判定順序・エラー分類を再利用する。
 /// `sql::view::resolve_from`・`sql::cte::resolve_relation` いずれの名前解決
 /// 結果（[`super::view::Resolved`]）からも、広域取得クエリ自身の形（射影・
-/// `WHERE`・`LIMIT`・`OFFSET`）を合成して [`ValidatedScan`] を組み立てる唯一の
-/// 実装（TABLE-18・TASK-205、TASK-213・Issue #928）。ビュー経由・CTE 経由の
-/// いずれの参照も畳み込み後は完全に同じ形になり、束縛・実行・RLS 適用は
-/// すべて既存経路をそのまま通る（第 2 の実行器を作らない設計）。
+/// `WHERE`・`LIMIT`・`OFFSET`・ウィンドウ項目）を合成して [`ValidatedScan`] を
+/// 組み立てる唯一の実装（TABLE-18・TASK-205、TASK-213・Issue #928、
+/// SQL-30・TASK-214・Issue #930）。ビュー経由・CTE 経由のいずれの参照も
+/// 畳み込み後は完全に同じ形になり、束縛・実行・RLS 適用はすべて既存経路を
+/// そのまま通る（第 2 の実行器を作らない設計）。`window_items` が参照する列
+/// （PARTITION BY／ORDER BY／集計引数）も、通常の投影・WHERE と同じく
+/// ビュー・CTE の公開列集合の範囲内であることを検査する。
 fn build_scan_from_resolved(
     table_name: String,
     resolved: super::view::Resolved,
@@ -5140,6 +5711,7 @@ fn build_scan_from_resolved(
     where_predicates: Vec<WherePredicate>,
     limit: u32,
     offset: u32,
+    window_items: Vec<WindowSelectItem>,
 ) -> Result<ValidatedScan, SqlSurfaceError> {
     match resolved {
         super::view::Resolved::Table => Ok(ValidatedScan {
@@ -5148,6 +5720,7 @@ fn build_scan_from_resolved(
             where_predicates,
             limit,
             offset,
+            window_items,
         }),
         super::view::Resolved::View {
             base_table,
@@ -5159,6 +5732,7 @@ fn build_scan_from_resolved(
                 &projection,
                 &where_predicates,
             )?;
+            super::view::check_window_columns_within_view(view_columns.as_deref(), &window_items)?;
             let projection = if let (Projection::All, Some(cols)) = (&projection, &view_columns) {
                 Projection::Columns(cols.clone())
             } else {
@@ -5172,6 +5746,7 @@ fn build_scan_from_resolved(
                 where_predicates: merged,
                 limit,
                 offset,
+                window_items,
             })
         }
     }
@@ -5223,9 +5798,20 @@ pub(crate) fn validate_sql_tokens(
                 matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
                     && matches!(w[1], Token::Keyword(Keyword::By))
             });
-            let main_is_aggregate_select = (matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-                && matches!(main_tokens.get(2), Some(Token::Punct('('))))
-                || main_contains_group_by;
+            // SQL-30・TASK-214（Issue #930）: トップレベル SELECT の判定
+            // （`contains_window_over`）と同じ理由で、`WITH` の主クエリでも
+            // `COUNT(*) OVER (...)` のようなウィンドウ項目を集計 SELECT と
+            // 誤判定しない（`OVER` の有無を見ずに関数名 + `'('` だけで判定すると、
+            // 集計関数名を使うウィンドウ項目を主クエリとして受理できなくなる）。
+            let main_contains_window_over = main_tokens.windows(3).any(|w| {
+                matches!(w[0], Token::Punct(')'))
+                    && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+                    && matches!(w[2], Token::Punct('('))
+            });
+            let main_is_aggregate_select = !main_contains_window_over
+                && ((matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+                    && matches!(main_tokens.get(2), Some(Token::Punct('('))))
+                    || main_contains_group_by);
             if main_is_aggregate_select {
                 return Err(SqlSurfaceError::unsupported(
                     "WITH does not support an aggregate main query",
@@ -5318,6 +5904,7 @@ pub(crate) fn validate_sql_tokens(
                 shape.where_predicates,
                 shape.limit,
                 shape.offset,
+                shape.window_items,
             )?))
         }
         _ if is_set_statement => {
@@ -5350,6 +5937,16 @@ pub(crate) fn validate_sql_tokens(
             let target = match validate_select_statement(rest, lookup)? {
                 Statement::Select(v) => ExplainTarget::Search(v),
                 Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
+                // SQL-30・TASK-214（Issue #930）: `EXPLAIN` はウィンドウ関数に
+                // 未対応（§計画 2「対象外」）。`validate_select_statement` は
+                // 非 EXPLAIN 経路と共有のため window_items を持つ `ValidatedScan`
+                // も返しうるが、`sql::explain` 側に対応する記述がなくレビュー
+                // 未了のため、ここで明示的に `42601` へ倒す。
+                Statement::Scan(v) if !v.window_items.is_empty() => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for window function queries",
+                    ));
+                }
                 Statement::Scan(v) => ExplainTarget::Scan(v),
                 // `validate_select_statement` は `SELECT` 先頭のトークン列に
                 // 対して常に `Select`／`Aggregate`／`Scan` のいずれかを返す
@@ -5407,9 +6004,32 @@ fn validate_select_statement(
         matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
             && matches!(w[1], Token::Keyword(Keyword::By))
     });
-    let is_aggregate_select = (matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-        && matches!(tokens.get(2), Some(Token::Punct('('))))
-        || contains_group_by;
+    // SQL-30・TASK-214（Issue #930）: `SELECT COUNT(*) OVER (...) ...` のような
+    // ウィンドウ項目は、先頭の集計関数名 `'('` という同じ字面を持つため
+    // 集計 SELECT と誤判定される（`COUNT` の直後の `'('` を見るだけでは `OVER`
+    // の有無が分からない）。トークン列全体に「`')'` の直後に文脈識別子
+    // `OVER`、その直後に `'('`」という並びがあるかを走査して判定する。この
+    // 並びは既存の許可形状（式・集計・WHERE のいずれも）には現れないため、
+    // フォールス・ポジティブなくウィンドウ項目の目印として使える。
+    let contains_window_over = tokens.windows(3).any(|w| {
+        matches!(w[0], Token::Punct(')'))
+            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+            && matches!(w[2], Token::Punct('('))
+    });
+    let is_aggregate_select = !contains_window_over
+        && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+            && matches!(tokens.get(2), Some(Token::Punct('('))))
+            || contains_group_by);
+    // SQL-30・TASK-214: ウィンドウ項目は `GROUP BY`・集計 SELECT・`SELECT DISTINCT`
+    // のいずれとも併用しない（§計画 2「対象外」）。`is_aggregate_select` の判定
+    // から除外しただけでは `contains_group_by` 単独の形（`SELECT ... OVER (...)
+    // ... GROUP BY ...`）が `parse_select_shape`（広域取得）へ素通りしてしまうため、
+    // ここで明示的に `42601` へ倒す。
+    if contains_window_over && contains_group_by {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions cannot be combined with GROUP BY",
+        ));
+    }
     // SQL-25 (c)・TASK-209: `SELECT` の直後（2 番目のトークン）が
     // [`is_distinct_modifier`] の判定する `DISTINCT` 修飾子なら `SELECT DISTINCT`
     // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
@@ -5469,39 +6089,18 @@ fn validate_select_statement(
         // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
         // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
         // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
-        ParsedSelect::Scan(shape) => match super::view::resolve_from(lookup, &shape.table_name)? {
-            super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
-                table_name: shape.table_name,
-                projection: shape.projection,
-                where_predicates: shape.where_predicates,
-                limit: shape.limit,
-                offset: shape.offset,
-            })),
-            super::view::Resolved::View {
-                base_table,
-                view_predicates,
-                view_columns,
-            } => {
-                super::view::check_columns_within_view(
-                    view_columns.as_deref(),
-                    &shape.projection,
-                    &shape.where_predicates,
-                )?;
-                let projection = match (&shape.projection, &view_columns) {
-                    (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
-                    (other, _) => other.clone(),
-                };
-                let mut where_predicates = view_predicates;
-                where_predicates.extend(shape.where_predicates);
-                Ok(Statement::Scan(ValidatedScan {
-                    table_name: base_table,
-                    projection,
-                    where_predicates,
-                    limit: shape.limit,
-                    offset: shape.offset,
-                }))
-            }
-        },
+        ParsedSelect::Scan(shape) => {
+            let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+            Ok(Statement::Scan(build_scan_from_resolved(
+                shape.table_name,
+                resolved,
+                shape.projection,
+                shape.where_predicates,
+                shape.limit,
+                shape.offset,
+                shape.window_items,
+            )?))
+        }
     }
 }
 
@@ -10921,6 +11520,305 @@ mod tests {
         let v = parse_create_table_ok(&sql);
         assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
         assert_eq!(v.checks.len(), 2);
+    }
+
+    // --- CASE／COALESCE／NULLIF 構文（対象ビヘイビア: SQL-26。Issue #921） -----
+
+    fn select_expr_items(stmt: &ValidatedStatement) -> Vec<SelectItem> {
+        match &stmt.projection {
+            Projection::Items(items) => items.clone(),
+            other => panic!("expected Projection::Items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_search_case_expr_as_select_item() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE WHEN id > 1 THEN 1 ELSE 0 END AS c FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("CASE select item should be accepted");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            SelectItem::Expr { expr, alias } => {
+                assert_eq!(alias.as_deref(), Some("c"));
+                assert!(matches!(expr, Expr::Case { .. }));
+            }
+            other => panic!("expected SelectItem::Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_item_named_case_or_null_without_when_is_a_plain_column_reference() {
+        // codex-review P1 指摘対応（Issue #921）: `CASE`／`NULL` を先読み無しで
+        // 常に式のトリガーにすると、既存の列名 `case`／`null` を投影する
+        // `SELECT case, null FROM t` が構文エラー化する破壊的変更になっていた。
+        // `CASE` は直後が `WHEN` のときのみ式として扱い、`NULL` は列名としての
+        // 後方互換を優先して式トリガーに含めない（`parse_select_item` 参照）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT case, null FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("bare `case`/`null` select items should parse as plain column references");
+        // 全項目が裸の列参照のときは `Projection::Items` ではなく
+        // `Projection::Columns` へ畳み込まれる（`parse_select_list` 参照）。
+        assert_eq!(
+            stmt.projection,
+            Projection::Columns(vec!["case".to_string(), "null".to_string()])
+        );
+    }
+
+    #[test]
+    fn call_argument_named_case_or_null_without_when_is_a_plain_column_reference() {
+        // codex-review P1 指摘対応（Issue #921 PR #1101）:
+        // `select_item_named_case_or_null_without_when_is_a_plain_column_reference`
+        // は `parse_select_item` の頂点位置のみを検証しており、`parse_primary_expr`
+        // （関数呼び出し引数・WHERE 式述語などの一般式位置）には先読み無しの
+        // 無条件トリガーが残っていた。既存の VECTOR 列名 `case`／`null` を引数に
+        // 渡す `vec_norm(case)`／`vec_norm(null)` が「列参照として束縛されず
+        // 破壊的変更になる」（`case`）・「構文エラーになる」（実際は
+        // `Expr::Null` へ変換された後 `bind_expr_in` で `0A000` へ落ちる。
+        // `null`）を防ぐ回帰テスト。`vec_norm` は SELECT 式項目の頂点では
+        // `ident '('` 形として `parse_call_expr` を経由するため、
+        // `parse_primary_expr` の `CASE`／`NULL` 分岐を直接踏む。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT vec_norm(case), vec_norm(null) FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("vec_norm(case)/vec_norm(null) should parse with case/null as column refs");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 2);
+        for (item, expected_arg) in items.iter().zip(["case", "null"]) {
+            match item {
+                SelectItem::Expr {
+                    expr: Expr::Call { name, args },
+                    ..
+                } => {
+                    assert_eq!(name, "vec_norm");
+                    assert_eq!(args.len(), 1);
+                    assert_eq!(args[0], Expr::Ident(expected_arg.to_string()));
+                }
+                other => panic!("expected SelectItem::Expr(Call), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn where_predicate_call_argument_named_case_or_null_is_a_plain_column_reference() {
+        // 上のテストの WHERE 式述語版（`parse_where_leaf` の式フォールバック
+        // 経由でも `parse_primary_expr` の同じ分岐を踏む）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT id FROM documents WHERE vec_norm(case) > 0 AND vec_norm(null) > 0 \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect(
+            "WHERE with vec_norm(case)/vec_norm(null) should fall back to the expression predicate",
+        );
+        assert_eq!(stmt.where_predicates.len(), 2);
+        for (pred, expected_arg) in stmt.where_predicates.iter().zip(["case", "null"]) {
+            match pred {
+                WherePredicate::Expression(Expr::Binary { lhs, op, .. }) => {
+                    assert_eq!(*op, BinOp::Gt);
+                    match lhs.as_ref() {
+                        Expr::Call { name, args } => {
+                            assert_eq!(name, "vec_norm");
+                            assert_eq!(args[0], Expr::Ident(expected_arg.to_string()));
+                        }
+                        other => panic!("expected Call, got {other:?}"),
+                    }
+                }
+                other => {
+                    panic!("expected WherePredicate::Expression(Binary(Call, ...)), got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn null_literal_remains_usable_inside_case_coalesce_nullif_and_nested_calls() {
+        // 上 2 件の回帰修正（`allow_null_literal` を既定 false にする）が、
+        // `Expr::Null` の束縛が実際に許可される 3 箇所（`CASE` の THEN／ELSE・
+        // `COALESCE`／`NULLIF` の引数。`udf_call::bind_expr_in` 参照）での
+        // 明示的 `NULL` リテラルの既存挙動を壊していないことを確認する。
+        // あわせて、`COALESCE` の引数中にネストした通常の関数呼び出し
+        // （`vec_norm(null)`）では `null` が引き続き列参照として解析される
+        // ことも検証する（`parse_call_expr` の一般呼び出し分岐が
+        // `allow_null_literal` を強制的に false へ戻すことの回帰テスト）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE WHEN id > 1 THEN NULL ELSE 0 END, \
+             COALESCE(NULL, vec_norm(null), 0), NULLIF(id, NULL) \
+             FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("explicit NULL literal should remain accepted in CASE/COALESCE/NULLIF");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 3);
+        match &items[0] {
+            SelectItem::Expr {
+                expr: Expr::Case { whens, else_result },
+                ..
+            } => {
+                assert_eq!(whens[0].1, Expr::Null);
+                assert_eq!(else_result.as_deref(), Some(&Expr::Number("0".to_string())));
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+        match &items[1] {
+            SelectItem::Expr {
+                expr: Expr::Coalesce(args),
+                ..
+            } => {
+                assert_eq!(args[0], Expr::Null);
+                assert_eq!(
+                    args[1],
+                    Expr::Call {
+                        name: "vec_norm".to_string(),
+                        args: vec![Expr::Ident("null".to_string())],
+                    }
+                );
+            }
+            other => panic!("expected SelectItem::Expr(Coalesce), got {other:?}"),
+        }
+        match &items[2] {
+            SelectItem::Expr {
+                expr: Expr::NullIf(_, rhs),
+                ..
+            } => {
+                assert_eq!(**rhs, Expr::Null);
+            }
+            other => panic!("expected SelectItem::Expr(NullIf), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_coalesce_and_nullif_as_select_items() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT COALESCE(id, 0), NULLIF(id, 2) FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("COALESCE/NULLIF select items should be accepted");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            &items[0],
+            SelectItem::Expr {
+                expr: Expr::Coalesce(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &items[1],
+            SelectItem::Expr {
+                expr: Expr::NullIf(..),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn where_case_expr_falls_back_to_expression_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT id FROM documents WHERE CASE WHEN id > 1 THEN 1 ELSE 0 END = 1 \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("WHERE with CASE lhs should fall back to the expression predicate");
+        assert_eq!(stmt.where_predicates.len(), 1);
+        match &stmt.where_predicates[0] {
+            WherePredicate::Expression(Expr::Binary { lhs, op, .. }) => {
+                assert_eq!(*op, BinOp::Eq);
+                assert!(matches!(**lhs, Expr::Case { .. }));
+            }
+            other => {
+                panic!("expected WherePredicate::Expression(Binary(Case, ...)), got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_simple_case_form() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT CASE id WHEN 1 THEN 2 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_logical_operator_inside_when_condition() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT CASE WHEN id > 1 AND id < 5 THEN 1 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_coalesce_with_zero_arguments() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT COALESCE() FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_nullif_with_three_arguments() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT NULLIF(id, 1, 2) FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_case_exceeding_max_branches() {
+        let lookup = catalog_with(&["documents"]);
+        let whens: String = (0..=MAX_CASE_BRANCHES)
+            .map(|i| format!("WHEN id > {i} THEN {i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = format!(
+            "SELECT CASE {whens} ELSE 0 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+        );
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_case_coalesce_nullif_nesting_beyond_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let mut expr = "0".to_string();
+        for _ in 0..=MAX_CASE_NESTING {
+            expr = format!("COALESCE({expr}, 1)");
+        }
+        let sql =
+            format!("SELECT {expr} FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     // --- 非再帰 CTE（`WITH` 句。SQL-29 (b)・RLS-10 (b)、TASK-213、Issue #928） ---

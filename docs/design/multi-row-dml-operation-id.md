@@ -209,6 +209,22 @@ args }` を呼び出し先の名前・引数のみで直列化すると、`WHERE
 定義直列化と組み合わせても「同名の異なる定義」と「異名の同一定義」を
 どちらも意図どおり別内容として扱える。
 
+**Issue #921（対象ビヘイビア: SQL-26）で追加したタグ**（`Expr` に
+`Null`／`Case`／`Coalesce`／`NullIf` の 4 variant を追加。既存タグ 1〜4 は
+不変）:
+
+- `Null`＝タグ 5（本体なし）
+- `Case { whens, else_result }`＝タグ 6・`whens` の件数（u32 LE）・各
+  `(cond, result)` を順に再帰的に直列化・ELSE 有無フラグ（u8。`0`／`1`）・
+  `else_result` が `Some` の場合のみその本体を再帰的に直列化（フラグを
+  本体の前に置くことで、可変長要素の境界が曖昧にならないようにする）
+- `Coalesce(args)`＝タグ 7・引数件数（u32 LE）・各引数を再帰的に直列化
+- `NullIf(lhs, rhs)`＝タグ 8・lhs を再帰的に直列化・rhs を再帰的に直列化
+
+入力サイズの有界性は既存の上限（`MAX_CALL_ARGS`・`MAX_EXPR_NODES`。
+`sql::udf_call::MAX_CASE_BRANCHES`・`MAX_CASE_NESTING` を新設）の範囲内に
+収まり、本節が追加する新たな上限はない。
+
 入力サイズの有界性: `assignments` は `MAX_UPDATE_SET_ASSIGNMENTS`
 （256）、述語は `MAX_METADATA_FILTERS`（256）、式のノード数は
 `MAX_EXPR_NODES`（1024）で既に上限が掛かっており、`push_bytes` 自体も
