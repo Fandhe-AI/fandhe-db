@@ -80,7 +80,16 @@ fn arg_as_i64(v: f64, what: &str) -> Result<i64, SqlSurfaceError> {
     // `as i64` は範囲外の `f64` を丸めて `i64::MIN`/`MAX` へ飽和させるため
     // （Rust 1.45 以降の既定キャスト仕様）、事前に範囲を検査してから変換する
     // （黙った飽和変換で異なる値を同一視しないため）。
-    if v < (i64::MIN as f64) || v > (i64::MAX as f64) {
+    //
+    // codex-review P1 指摘対応: `i64::MAX`（`2^63 - 1`）は `f64` の 53 bit 仮数部で
+    // 正確に表現できず、`i64::MAX as f64` は丸めにより `2^63` になる。そのため
+    // 旧実装の `v > (i64::MAX as f64)` は `v == 9223372036854775808.0`（`2^63`）を
+    // 上限超過として拒否できず、後続の `v as i64` が `i64::MAX` へ飽和して範囲外
+    // 引数を誤って受理していた（`22000` 拒否契約違反）。`i64::MIN`（`-2^63`）は
+    // 2 の冪で `f64` に正確に表現できるため、上限は `-(i64::MIN as f64)`
+    // （`2^63` を正確な値として算出）を使い、下限はそのまま `i64::MIN as f64` と
+    // 比較する（`sql::group_by::cmp_signed_to_literal` と同じ境界値の考え方）。
+    if v < (i64::MIN as f64) || v >= -(i64::MIN as f64) {
         return Err(SqlSurfaceError::invalid_input(format!(
             "{what} is out of range"
         )));
@@ -255,6 +264,57 @@ mod tests {
     #[test]
     fn substr_is_char_indexed_for_multibyte_text() {
         assert_eq!(substr("あいうえお", 2.0, Some(2.0)).unwrap(), "いう");
+    }
+
+    /// codex-review P1 指摘の回帰テスト: `i64::MAX as f64` は丸めにより `2^63`
+    /// になるため、境界比較を `> (i64::MAX as f64)` のままにすると
+    /// `v == 2^63`（`9223372036854775808.0`）を上限超過として拒否できず、
+    /// 後続の `as i64` が `i64::MAX` へ飽和して範囲外引数を誤って受理して
+    /// しまっていた。`arg_as_i64` が正しい排他的境界（`2^63`／`-2^63`）で
+    /// 拒否・受理することを固定する。
+    #[test]
+    fn arg_as_i64_rejects_exact_two_pow_63_and_accepts_i64_max_min() {
+        // `2^63`（`i64::MAX` を `f64` へキャストした結果と一致する値）は
+        // `i64` の表現域外のため拒否する。
+        let err = arg_as_i64(9_223_372_036_854_775_808.0, "start").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+
+        // `i64::MAX` 自体（`f64` では `2^63` へ丸められるが、丸め後の値でも
+        // 排他的境界の直前として受理してよい。実際に表現可能な最大の `f64`
+        // 整数値としては `2^63` になるため、ここでは境界直下の
+        // `2^63 - 1024.0`〔`f64` で正確に表現できる `i64::MAX` 近傍の整数〕を
+        // 使い、`i64::MAX` に飽和させず正しい値を返すことを確認する）。
+        let near_max = 9_223_372_036_854_774_784.0_f64; // 2^63 - 1024
+        assert_eq!(arg_as_i64(near_max, "start").unwrap(), near_max as i64);
+
+        // `-2^63`（`i64::MIN`）は表現域の下限として受理する。
+        assert_eq!(
+            arg_as_i64(-9_223_372_036_854_775_808.0, "start").unwrap(),
+            i64::MIN
+        );
+
+        // `-2^63` を下回る値（`-2^63 - ε` 相当。`f64` の精度上ここでは
+        // 十分大きく下回る値で確認する）は拒否する。
+        let err = arg_as_i64(-9_223_372_036_854_777_856.0, "start").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+
+        // 非有限値・非整数値の既存契約も維持されていることを確認する。
+        let err = arg_as_i64(f64::NAN, "start").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        let err = arg_as_i64(f64::INFINITY, "start").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        let err = arg_as_i64(f64::NEG_INFINITY, "start").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        let err = arg_as_i64(1.5, "start").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// `SUBSTR` 経由でも境界値拒否が効くことを固定する（`arg_as_i64` の単体
+    /// テストと合わせた end-to-end 確認）。
+    #[test]
+    fn substr_start_at_two_pow_63_is_rejected() {
+        let err = substr("hello", 9_223_372_036_854_775_808.0, Some(1.0)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
