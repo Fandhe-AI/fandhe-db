@@ -66,6 +66,18 @@
 //! - [`statement_splitter`][]: 簡易クエリプロトコル 1 メッセージに含まれる
 //!   セミコロン区切りの複数 SQL 文の分割・文種別分類（WIRE-16・TASK-219）。
 //!   `wire-server::simple_query` から呼ばれる唯一の公開経路
+//! - [`relation`][]: 実行計画の複数テーブル対応基盤（SQL-28・RLS-10、TASK-212、
+//!   Issue #924）その 1。複数テーブル参照スコープの束縛（修飾・非修飾列の解決、
+//!   `42702` の曖昧列判定）。許可リストは本 Issue では JOIN・複数 FROM を
+//!   引き続き拒否するため、本番実行経路からはまだ呼ばれない（結線は Issue #925
+//!   以降）
+//! - [`generation_key`][]: 同基盤その 2。複数テーブルの `(table, generation)`
+//!   集合 + `PolicyContext` を鍵とする汎用の世代整合キャッシュ（既存の
+//!   [`arena_cache`]・[`sparse_cache`]・[`scalar_index`]・[`visible_cache`]・
+//!   [`hnsw_cache`] は単一テーブル専用のまま維持し、本 Issue では移行しない）
+//! - [`relation_snapshot`][]: 同基盤その 3。テーブル単位の RLS 可視スナップショット
+//!   （`(tenant_id, id)` 集合）を [`generation_key`] のキャッシュへ載せ、複数
+//!   テーブルを同一 read トランザクション・同一 ctx から独立に解決する
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
@@ -141,6 +153,7 @@ pub(crate) mod distinct;
 pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;
+pub mod generation_key;
 pub mod group_by;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
@@ -149,6 +162,8 @@ pub mod mode;
 pub mod params;
 pub mod parser;
 pub mod plan;
+pub mod relation;
+pub mod relation_snapshot;
 pub mod returning;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
@@ -160,6 +175,7 @@ pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod visible_cache;
 pub(crate) mod where_tree;
+pub(crate) mod window;
 
 /// [`scalar_plan::ScalarShapeInput`]（`pub`）の `or_filters` フィールドの要素型を
 /// 外部から名前解決可能にするための再エクスポート（TASK-208・SQL-24、

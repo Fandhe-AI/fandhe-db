@@ -278,6 +278,11 @@ const EXPECTED_STATUS: [(&str, u16); 34] = [
     // `CASE`/`COALESCE`/`NULLIF` の型不一致（`42804`。SQL-26・Issue #921）は
     // SQL 表層専用の式レーンの分類で 400。
     ("42804", 400),
+    // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
+    // 参照スコープでの非修飾列の曖昧解決。本 Issue では SQL 表層が JOIN・複数
+    // FROM を受理しないため到達不能で、`err4_f_unreachable_classes_project_via_production_encoder`
+    // が射影のみを検証する。
+    ("42702", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -779,6 +784,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `NULLIF` の型不一致。NoSQL 表層には式レーンの入口（`plan`/`filter`）に
         // これらの構文が無いため到達不能。
         ErrorClass::DatatypeMismatch,
+        // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
+        // 参照スコープの基盤導入のみで、許可リストは JOIN・複数 FROM を引き続き
+        // `42601` で拒否するため NoSQL 表層からは到達不能。
+        ErrorClass::AmbiguousColumn,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());

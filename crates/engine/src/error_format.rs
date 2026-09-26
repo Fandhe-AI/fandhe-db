@@ -261,6 +261,11 @@ define_error_classes! {
     /// `NULLIF` の引数が非 Scalar。
     /// [`crate::sql::allowlist::SqlSurfaceError::DatatypeMismatch`] の写像。
     DatatypeMismatch => ("42804", "DATATYPE_MISMATCH"),
+    /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10、
+    /// Issue #924）で、非修飾列参照が複数の参照テーブルへ一致し一意に解決
+    /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::
+    /// AmbiguousColumn`] の写像。
+    AmbiguousColumn => ("42702", "AMBIGUOUS_COLUMN"),
 }
 
 impl ErrorClass {
