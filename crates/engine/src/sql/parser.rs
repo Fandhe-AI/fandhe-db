@@ -1315,13 +1315,16 @@ fn declarative_leaf_to_filter(
             Ok((filter.negate(), skip))
         }
         // 呼び出し元（[`bind_where_predicates_recursive`]）が `PredicateCall`／
-        // `Expression`／`Or` を専用の腕で先に処理するため到達しない
-        // （構文段の不変条件: `Not` の内側にもこの 3 種は来ない。`Or` は
-        // TASK-208・Issue #912 で追加した分岐で、宣言的フィルタへは写像できない
-        // ため呼び出し元が再帰的に処理する）。
+        // `Expression`／`Or`／`InSubquery`／`Exists` を専用の腕で先に処理する
+        // ため到達しない（構文段の不変条件: `Not` の内側にもこれらは来ない。
+        // `Or` は TASK-208・Issue #912、`InSubquery`／`Exists` は Issue #927・
+        // SQL-29 (a)・TASK-213 で追加した分岐で、いずれも宣言的フィルタへは
+        // 写像できないため呼び出し元が処理する）。
         WherePredicate::PredicateCall { .. }
         | WherePredicate::Expression(_)
-        | WherePredicate::Or(_) => Err(SqlSurfaceError::Internal {
+        | WherePredicate::Or(_)
+        | WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -1409,6 +1412,22 @@ fn bind_where_predicates_recursive(
                     ));
                 }
                 or_filters.push(crate::sql::where_tree::BoundOrGroup::new(bound_branches));
+            }
+            // Issue #927・SQL-29 (a)・TASK-213: サブクエリは束縛（本関数）の
+            // **前**に `sql::subquery::resolve_where_predicates` が同じ
+            // `PolicyContext` で内側を実行し、具体的な `WherePredicate`
+            // （`Or`／`Equality` 等）へ書き換える契約（`core.rs` の
+            // `Statement::Scan`/`Statement::Aggregate` 実行アームのみが解決する。
+            // `sql::where_tree`／本関数は変更しない＝第 2 の評価器を作らない）。
+            // それ以外の経路（ランキング付き検索 SELECT・`EXPLAIN`・カーソル・
+            // `COPY`・CHECK・ビュー本体・述語形 `UPDATE`/`DELETE`）は解決を
+            // 経由せずここへ到達しうるため、未解決のまま束縛に届いた場合は
+            // 一律 `42601` で拒否する（fail-closed。構文段の
+            // `Parser::require_subquery_depth` と二重にゲートする）。
+            WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "subquery is not supported for this statement shape",
+                ));
             }
             // SQL-24（TASK-208 ポインタ）: 等価・前方一致・BOOLEAN 系・範囲比較・
             // `IN`・`BETWEEN`・`IS [NOT] NULL`・`NOT` はいずれも
@@ -4709,6 +4728,21 @@ fn collect_where_predicate_idents(
                 out.insert(column.clone());
             }
             WherePredicate::PredicateCall { .. } => {}
+            // Issue #927・SQL-29 (a)・TASK-213: `IN (SELECT ...)` の対象列
+            // `column` は外側スコープの通常の列参照であり、`Equality` 等と
+            // 同様にウィンドウ別名との衝突判定対象に含める必要がある。
+            // `inner_tokens`（内側の生トークン列）は内側スコープの識別子で
+            // あり、外側の WHERE 参照集合には含めない（未評価のまま保持
+            // されるだけで、束縛前にここへ到達する時点ではまだ列参照として
+            // 解決されていない。`sql::subquery::resolve_where_predicates` が
+            // 束縛前に解決し具体的な `WherePredicate` へ書き換える契約）。
+            WherePredicate::InSubquery { column, .. } => {
+                out.insert(column.clone());
+            }
+            // `EXISTS (SELECT ...)` は外側の列を一切参照しない（内側は常に
+            // 自分の FROM テーブルのスキーマのみで束縛される。
+            // `sql::subquery` モジュールドキュメント参照）。
+            WherePredicate::Exists { .. } => {}
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。
