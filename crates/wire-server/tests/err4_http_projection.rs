@@ -275,8 +275,10 @@ const EXPECTED_STATUS: [(&str, u16); 35] = [
     // SQL 表層専用の DDL の分類で 400。
     ("23503", 409),
     ("42830", 400),
-    // `CASE`/`COALESCE`/`NULLIF` の型不一致（`42804`。SQL-26・Issue #921）は
-    // SQL 表層専用の式レーンの分類で 400。
+    // `DatatypeMismatch`（`42804`）は 2 つの発生源を共有する: `CASE`/
+    // `COALESCE`/`NULLIF` の型不一致（SQL-26・Issue #921）と、集合演算の
+    // 両辺の列数・列型不一致（SQL-29 (c)・TASK-213、Issue #929）。いずれも
+    // SQL 表層専用の分類で 400。
     ("42804", 400),
     // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
     // 参照スコープでの非修飾列の曖昧解決。本 Issue では SQL 表層が JOIN・複数
@@ -780,9 +782,12 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `ForeignKeyViolation`（`23503`）は宣言済みテーブルへの書き込み op から
         // 到達可能なため含めない（`err4_f_foreign_key_violation_reachable_via_*`）。
         ErrorClass::InvalidForeignKey,
-        // `DatatypeMismatch`（`42804`。SQL-26・Issue #921）は `CASE`/`COALESCE`/
-        // `NULLIF` の型不一致。NoSQL 表層には式レーンの入口（`plan`/`filter`）に
-        // これらの構文が無いため到達不能。
+        // `DatatypeMismatch`（`42804`）は 2 つの発生源を共有する:
+        // `CASE`/`COALESCE`/`NULLIF` の型不一致（SQL-26・Issue #921。NoSQL
+        // 表層には式レーンの入口〔`plan`/`filter`〕にこれらの構文が無い）と、
+        // 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`。SQL-29 (c)・
+        // RLS-10 (b)・TASK-213、Issue #929。NoSQL 表層は集合演算に非対応で
+        // `op` 語彙に存在しない）。いずれも到達不能。
         ErrorClass::DatatypeMismatch,
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
         // 参照スコープの基盤導入のみで、許可リストは JOIN・複数 FROM を引き続き
