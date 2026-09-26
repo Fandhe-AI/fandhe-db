@@ -457,32 +457,7 @@ fn is_reserved_function_name(name: &str) -> bool {
         upper.as_str(),
         "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF"
     ) || is_builtin_function_name(name)
-        || is_non_deterministic_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
-}
-
-/// 非決定的関数名（現在時刻・乱数）の一覧（SQL-26。ポインタ:
-/// `docs/spec/04-behavior/sql-surface.md` SQL-26）。これらは束縛時に常に
-/// 「未知の関数」（`22000`。[`bind_call`] の既定フォールバック）として拒否され、
-/// かつ UDF 名としても予約する（[`is_reserved_function_name`]）ことで、同一
-/// 文中で時刻・乱数が複数回評価され結果が食い違う余地を構造的になくす
-/// （非決定的関数を受理しないことで「1 文の中で時刻を固定するか」という論点が
-/// そもそも生じない）。
-fn is_non_deterministic_function_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "now"
-            | "current_timestamp"
-            | "current_date"
-            | "current_time"
-            | "localtime"
-            | "localtimestamp"
-            | "clock_timestamp"
-            | "statement_timestamp"
-            | "transaction_timestamp"
-            | "timeofday"
-            | "random"
-    )
 }
 
 /// セッション内で登録された宣言的 UDF 1 件。本体は構文段の [`Expr`]（パラメータ参照は
@@ -2640,11 +2615,29 @@ mod tests {
     }
 
     #[test]
-    fn defining_a_udf_named_after_a_non_deterministic_function_is_rejected() {
-        let mut registry = UdfRegistry::default();
+    fn defining_and_calling_a_udf_named_after_a_non_deterministic_function_succeeds() {
+        // PR #1107 codex-review P1 是正: `now`/`random` 等の名前を UDF 予約名に
+        // 含めると、これらの名前で登録・呼び出しできていた既存の宣言的 UDF が
+        // 登録時に拒否される破壊的変更になっていた（本 PR は数値関数のみを
+        // 対象とし、非決定的関数の実装は含まないため予約化の理由がない）。
+        // 数値関数の予約名（`round` 等）はそのまま維持しつつ、`now`／`random`／
+        // `current_timestamp` という名前の UDF が従来どおり登録・呼び出し
+        // できることを固定する。非決定的関数名の予約化は、日時スカラー関数群
+        // （`docs/design/numeric-scalar-functions.md`「スコープ外・後続課題」
+        // 参照）を実装する後続作業で spec の決定性要件と対にして判断する。
+        let schema = schema_with_vector();
         for name in ["now", "random", "current_timestamp"] {
-            let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
-            assert_eq!(err.wire_code(), "22000", "function name {name}");
+            let mut registry = UdfRegistry::default();
+            define_function(&mut registry, name, &[], &num("1.0"))
+                .unwrap_or_else(|e| panic!("definition of {name} should succeed, got {e:?}"));
+
+            let mut budget = MAX_EXPR_NODES;
+            let (bound, ty) = bind_expr(&call(name, vec![]), &schema, &registry, &mut budget)
+                .unwrap_or_else(|e| panic!("call to {name} should bind, got {e:?}"));
+            assert_eq!(ty, ExprType::Scalar, "function name {name}");
+            let value = eval(&bound, 1, &[0.0, 0.0, 0.0])
+                .unwrap_or_else(|e| panic!("call to {name} should evaluate, got {e:?}"));
+            assert_eq!(value, ExprValue::Scalar(1.0), "function name {name}");
         }
     }
 

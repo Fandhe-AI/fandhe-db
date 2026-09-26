@@ -39,16 +39,44 @@ pub(crate) fn round1(x: f64) -> Result<f64, SqlSurfaceError> {
     finite_result(x.round(), "round")
 }
 
+/// 大きい順（MSB が先頭）の 10 進数字列（各要素は `0..=9`）を「+1」だけ増分する
+/// （`round2` の桁上げ処理の共有ヘルパー）。`f64` の乗除算を経由せず、`round2` が
+/// 組み立てた 10 進数字列を直接インクリメントすることで、2 回目の浮動小数点誤差を
+/// 混入させない。最上位桁まで繰り上がった場合（例: `"999"` → `"1000"`）は
+/// 先頭に `1` を追加する（`digits` が空スライス、つまり丸め位置より上に
+/// 保持する桁が無い場合も同じ経路で `[1]` になる）。
+fn increment_decimal_digits(digits: &mut Vec<u8>) {
+    for d in digits.iter_mut().rev() {
+        if *d == 9 {
+            *d = 0;
+        } else {
+            *d += 1;
+            return;
+        }
+    }
+    digits.insert(0, 1);
+}
+
 /// `round(x: Scalar, n: Scalar) -> Scalar`（小数点以下 `n` 桁への丸め。`n` は整数値
-/// でなければならず、`i32` の表現域を超える場合は `22003`）。
+/// でなければならず、`i32` の表現域を超える場合は `22003`）。0.5 は 0 から遠い側へ
+/// 丸める（[`round1`] と同じ half-away-from-zero。`docs/design/
+/// numeric-scalar-functions.md` 参照）。
 ///
-/// `n` が大きく `x * 10^n` がオーバーフローする場合は丸めの効果が生じない
-/// （`x` をそのまま返す）。`n` が大きく負で `10^n` がアンダーフローして 0 になる
-/// 場合は丸め先が存在しないとみなし 0 を返す。いずれも黙った精度欠落ではなく、
-/// 数学的に丸め操作が定義できない領域への意図的な縮退である。
-/// 一方、`10^n` 自体は非零（サブノーマル等）で `scaled` も有限だが、桁を
-/// 戻す除算（`rounded / 10^n`）が真にオーバーフローするケースは上記の
-/// 意図的な縮退とは区別し、`22003`（`numeric_out_of_range`）として拒否する。
+/// `x * 10^n` を `f64` で計算して丸めると、10 進小数として厳密に `*.5` である
+/// 中間値（例: `1.005`）が二進浮動小数点の丸め誤差で `*.5` からわずかにずれ、
+/// 丸め方向を誤ることがある（PR #1107 codex-review P1 指摘）。これを避けるため、
+/// `x` の**最短往復表現**（Rust の `Display`／`{}` フォーマットは、その `f64` の値へ
+/// 一意に戻る最短の 10 進数字列を返す。`ryu`/Grisu 系アルゴリズム相当）を 10 進数字列
+/// として取得し、桁の切り捨て・繰り上げを 10 進数字列のまま行う。浮動小数点の
+/// 乗除算を一切経由しないため、`10^n` のオーバーフロー・アンダーフローという
+/// 中間表現由来の誤差そのものが発生しない。
+///
+/// `n` が保持対象の桁数（`x` の小数部・整数部の桁数）を超える場合は丸めの余地が
+/// ないため `x` をそのまま返す。丸め単位（`10^-n`）が `x` の絶対値の桁数を超えて
+/// 大きい場合は、最上位桁で丸めるかどうかだけを判定し、丸め不要なら `0` を返す
+/// （黙った精度欠落ではなく、その桁での丸め操作が数学的に意味を持たない領域への
+/// 意図的な縮退）。丸め後の 10 進数字列を `f64` へ変換する際に有効範囲を超える
+/// （`Infinity` になる）場合のみ `22003`（`numeric_out_of_range`）を返す。
 pub(crate) fn round2(x: f64, n: f64) -> Result<f64, SqlSurfaceError> {
     if !n.is_finite() || n.fract() != 0.0 {
         return Err(SqlSurfaceError::invalid_input(
@@ -62,28 +90,95 @@ pub(crate) fn round2(x: f64, n: f64) -> Result<f64, SqlSurfaceError> {
     }
     // `n as i32`: 直前の範囲検査（`i32::MIN..=i32::MAX`）済みのため安全な変換。
     let n_i32 = n as i32;
-    let pow10 = 10f64.powi(n_i32);
-    let scaled = x * pow10;
-    if !scaled.is_finite() {
+    // 非有限値（`NaN`/`Infinity`）は 10 進展開できないため、丸めの効果が
+    // 生じないとみなしそのまま返す（旧実装で `x * 10^n` が非有限になり
+    // `Ok(x)` を返していたのと同じ観測結果を維持する）。
+    if !x.is_finite() {
         return Ok(x);
     }
-    let rounded = scaled.round();
-    let result = rounded / pow10;
-    if !result.is_finite() {
-        // `pow10 == 0.0`（`10^n` がアンダーフローで真に 0 になった場合）は
-        // `rounded / pow10` が `0.0/0.0`（NaN）等になるだけで、丸め先の桁が
-        // 存在しないという意図どおりの縮退なので 0 を返す。
-        // `pow10 != 0.0`（非零のサブノーマル等）で非有限になった場合は、
-        // `scaled` 自体は有限でも桁を戻す除算で真にオーバーフローしている
-        // ため、黙って 0 を返さず `22003` として拒否する（fail-closed）。
-        if pow10 == 0.0 {
-            return Ok(0.0);
+    if x == 0.0 {
+        return Ok(x);
+    }
+    let negative = x.is_sign_negative();
+    // `{}` フォーマットは f64 の最短往復表現を科学的記数法なしで返すため、
+    // 常に `<整数部>` または `<整数部>.<小数部>` の形になる（`x.abs()` は非有限・
+    // ゼロを上で除外済みのため常に正の有限値）。
+    let formatted = format!("{}", x.abs());
+    let (int_part, frac_part) = match formatted.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (formatted.as_str(), ""),
+    };
+
+    // `combined`: 丸め後に得たい 10 進数字列と、そのうち整数部として解釈する
+    // 桁数（`point`。`combined[..point]` が整数部、`combined[point..]` が
+    // 小数部）。負の `n`（整数部側での丸め）と非負の `n`（小数部側での丸め）を
+    // それぞれ組み立ててから、共通の「10 進数字列 → f64」変換へ合流させる。
+    let (combined, point): (Vec<u8>, usize) = if n_i32 >= 0 {
+        let n_usize = n_i32 as usize;
+        if n_usize >= frac_part.len() {
+            // 保持したい小数桁数が実際の小数部の桁数以上 = 丸める余地がない。
+            return Ok(x);
         }
+        let decision_digit = frac_part.as_bytes()[n_usize] - b'0';
+        let mut digits: Vec<u8> = int_part
+            .bytes()
+            .chain(frac_part.bytes().take(n_usize))
+            .map(|b| b - b'0')
+            .collect();
+        if decision_digit >= 5 {
+            increment_decimal_digits(&mut digits);
+        }
+        // 桁上げで `digits` が 1 桁増えていれば整数部もその分伸びる
+        // （`digits.len() - n_usize` は増分後の長さから逆算するため常に
+        // 正しい整数部長になる）。
+        let point = digits.len() - n_usize;
+        (digits, point)
+    } else {
+        // `n_i32.unsigned_abs()`: `i32::MIN` の単純な符号反転はオーバーフロー
+        // する（`-i32::MIN` は `i32` で表現できない）ため `unsigned_abs` で
+        // 安全に絶対値を取る。
+        let pos = n_i32.unsigned_abs() as usize;
+        if pos > int_part.len() {
+            // 丸め単位が整数部の桁数より大きい = 最上位桁より上を四捨五入する
+            // 余地すらない。この場合は必ず 0 になる（意図的な縮退）。
+            return Ok(if negative { -0.0 } else { 0.0 });
+        }
+        let keep_len = int_part.len() - pos;
+        let decision_digit = int_part.as_bytes()[keep_len] - b'0';
+        let mut digits: Vec<u8> = int_part.bytes().take(keep_len).map(|b| b - b'0').collect();
+        if decision_digit >= 5 {
+            increment_decimal_digits(&mut digits);
+        }
+        digits.extend(std::iter::repeat_n(0u8, pos));
+        let point = digits.len();
+        (digits, point)
+    };
+
+    let mut magnitude = String::with_capacity(combined.len() + 2);
+    for &d in &combined[..point] {
+        magnitude.push((b'0' + d) as char);
+    }
+    if point < combined.len() {
+        magnitude.push('.');
+        for &d in &combined[point..] {
+            magnitude.push((b'0' + d) as char);
+        }
+    }
+    let signed = if negative {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    };
+    // 桁上げ後の数字列を組み立て直しているだけなので `parse` 自体が失敗する
+    // ことはない（10 進数字列として常に整形済み）。唯一非有限になり得るのは
+    // 丸め後の絶対値が `f64::MAX` を超え `Infinity` へ丸め込まれる場合で、
+    // これは真のオーバーフローとして `22003` へ写像する。
+    let Ok(result) = signed.parse::<f64>() else {
         return Err(SqlSurfaceError::numeric_out_of_range(
             "round: result is out of range",
         ));
-    }
-    Ok(result)
+    };
+    finite_result(result, "round")
 }
 
 /// `floor(x: Scalar) -> Scalar`。
@@ -181,33 +276,86 @@ mod tests {
     }
 
     #[test]
-    fn round2_returns_input_unchanged_when_scale_overflows() {
-        // n は i32 範囲内だが 10^n がオーバーフローする（非有限）ため、丸めの
-        // 効果が生じないとみなし x をそのまま返す。
+    fn round2_returns_input_unchanged_when_no_digits_to_drop() {
+        // n が実際の小数桁数以上のため、丸める余地がなく x をそのまま返す
+        // （PR #1107 codex-review P1 是正後: `10^n` のオーバーフローではなく、
+        // `x` の 10 進展開（`frac_part`）の桁数と `n` の比較で判定する）。
         let x = 12345.6789;
         let got = round2(x, 400.0).unwrap();
         assert_eq!(got, x);
     }
 
     #[test]
-    fn round2_returns_zero_when_scale_underflows() {
-        // n が大きく負で 10^n がアンダーフローして 0 になるため、丸め先が
-        // 存在しないとみなし 0 を返す。
+    fn round2_returns_zero_when_rounding_unit_exceeds_magnitude() {
+        // 丸め単位（`10^400`）が `x` の整数部の桁数を大きく超えるため、
+        // 最上位桁でも丸め上げが起こり得ず 0 を返す（意図的な縮退）。
         let got = round2(12345.6789, -400.0).unwrap();
         assert_eq!(got, 0.0);
     }
 
     #[test]
-    fn round2_rejects_overflow_on_scale_back_with_numeric_out_of_range() {
-        // 10^n（n=-308）はサブノーマルだが非零で `scaled` も有限だが、
-        // 桁を戻す除算 `rounded / 10^n` が f64::MAX を超えて真にオーバー
-        // フローする。アンダーフロー由来の 0 と誤判定せず 22003 を返す。
+    fn round2_rejects_overflow_on_round_up_with_numeric_out_of_range() {
+        // 丸め上げの結果が `f64::MAX` を超えて `Infinity` になる真のオーバー
+        // フローは `22003` を返す（10 進数字列の組み立てには乗除算を使わない
+        // ため、旧実装のようなアンダーフロー由来の中間表現とは無関係に、
+        // 最終結果の非有限性のみで判定できる）。
         let err = round2(1.7e308, -308.0).unwrap_err();
         assert_eq!(err.wire_code(), "22003");
 
         let err = round2(f64::MAX, -307.0).unwrap_err();
         assert_eq!(err.wire_code(), "22003");
     }
+
+    #[test]
+    fn round2_rounds_decimal_midpoint_away_from_zero_not_binary_midpoint() {
+        // PR #1107 codex-review P1 回帰テスト: `x * 10^n` を `f64` で計算すると
+        // 二進浮動小数点の丸め誤差により `1.005 * 100` が `100.5` よりわずかに
+        // 小さくなり、期待される `1.01` ではなく `1.00` を返していた
+        // （10 進表現ではちょうど中間値である `*.5` を正しく検出できなかった）。
+        // 10 進数字列ベースの実装では `x` の最短往復表現の桁を直接見るため、
+        // この種の二進化に由来する誤判定が起こらないことを固定する。
+        assert_eq!(round2(1.005, 2.0).unwrap(), 1.01);
+        assert_eq!(round2(2.675, 2.0).unwrap(), 2.68);
+        assert_eq!(round2(-1.005, 2.0).unwrap(), -1.01);
+    }
+
+    #[test]
+    fn round2_with_n_zero_rounds_to_nearest_integer_away_from_zero() {
+        assert_eq!(round2(2.5, 0.0).unwrap(), 3.0);
+        assert_eq!(round2(-2.5, 0.0).unwrap(), -3.0);
+        assert_eq!(round2(2.4, 0.0).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn round2_with_negative_n_rounds_within_integer_digits() {
+        assert_eq!(round2(150.0, -2.0).unwrap(), 200.0);
+        assert_eq!(round2(149.0, -2.0).unwrap(), 100.0);
+        assert_eq!(round2(-150.0, -2.0).unwrap(), -200.0);
+    }
+
+    #[test]
+    fn round2_carries_into_a_new_leading_digit_on_round_up() {
+        // 丸め上げが最上位の保持桁を超えて繰り上がる境界（`99.5` → `100`・
+        // `9.95` → `10.0`）。
+        assert_eq!(round2(99.5, 0.0).unwrap(), 100.0);
+        assert_eq!(round2(9.95, 1.0).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn round2_returns_input_unchanged_for_non_finite_x() {
+        // 非有限な `x`（`NaN`/`Infinity`）は 10 進展開できないため丸めの効果が
+        // 生じないとみなしそのまま返す（`apply_builtin`／`finite_result` を
+        // 経由する他の組み込み関数と異なり、`round2` は `x` 自体の非有限性を
+        // 事前に弾かない設計を維持する）。
+        assert!(round2(f64::NAN, 2.0).unwrap().is_nan());
+        assert_eq!(round2(f64::INFINITY, 2.0).unwrap(), f64::INFINITY);
+        assert_eq!(round2(f64::NEG_INFINITY, -2.0).unwrap(), f64::NEG_INFINITY);
+    }
+
+    // NUMERIC 型の値は式（`SELECT`/`WHERE` 中の関数呼び出し引数）としては
+    // 束縛段で拒否され本関数へ到達しない（`sql/udf_call.rs` の
+    // `ColumnType::Numeric` 分岐、TABLE-13〔検討中〕・TASK-197、Issue #885・
+    // #891）ため、NUMERIC 型専用の丸め経路は本関数に存在しない。
 
     #[test]
     fn floor_and_ceil_match_std() {

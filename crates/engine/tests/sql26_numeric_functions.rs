@@ -351,12 +351,27 @@ fn defining_a_udf_named_after_a_numeric_builtin_is_rejected() {
 }
 
 #[test]
-fn defining_a_udf_named_after_a_non_deterministic_function_is_rejected() {
+fn defining_and_calling_a_udf_named_after_a_non_deterministic_function_succeeds() {
+    // PR #1107 codex-review P1 是正: `now` 等の名前を UDF 予約名に含めると、
+    // これらの名前で登録・呼び出しできていた既存の宣言的 UDF が登録時に
+    // 拒否される破壊的変更になっていた。本 PR（数値関数のみ）は非決定的関数の
+    // 実装を含まないため予約化の理由がなく、従来どおり登録・呼び出しできる
+    // ことを固定する（予約化自体は日時スカラー関数群の後続作業で判断する。
+    // `docs/design/numeric-scalar-functions.md`「スコープ外・後続課題」参照）。
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
-    let err = core
-        .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION now(x) AS x")
-        .expect_err("CREATE FUNCTION now must be rejected as reserved");
-    assert_eq!(err.wire_code(), "22000");
+
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION now(x) AS x")
+        .expect("CREATE FUNCTION now should succeed (not reserved by this Issue)");
+
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT now(1.0) FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
+        )
+        .expect("SELECT calling the now(x) UDF should succeed");
+    let result = expect_query(outcome);
+    assert_eq!(float_cell(&result.rows[0], 0), 1.0);
 }
