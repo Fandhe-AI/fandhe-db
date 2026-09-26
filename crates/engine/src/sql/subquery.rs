@@ -54,6 +54,17 @@
 //!   `EXISTS` の修正前と同種の「必要以上の投影で走査コストを払ってから
 //!   拒否する」問題が `IN` 側にも存在した。`SELECT *` 等の不正な内側クエリ
 //!   を、束縛・全件走査より前に `42601` で拒否する）。
+//! - 内側にウィンドウ関数（`ValidatedScan::window_items`。SQL-30・TASK-214、
+//!   Issue #930）が含まれる場合は `IN`／`EXISTS` いずれも `42601` で一律
+//!   拒否する（PR #1103 Cursor Bugbot 指摘対応: `window_items` が非空だと
+//!   `sql::scan::execute_scan` は `sql::window::execute_window_scan` へ
+//!   分岐し、`LIMIT` による早期終了なしに可視行を全件 materialize する
+//!   契約〔`docs/design/window-functions.md` 参照〕。`EXISTS` 側の
+//!   [`InnerScanIntent::ExistenceOnly`] は投影・`LIMIT` だけを差し替える
+//!   ため、ウィンドウ項目を差し替えずに残すと同じ資源上限問題が
+//!   ウィンドウ関数経由で再発する。サブクエリとウィンドウ関数の組合せは
+//!   設計上未検証のため、正しく動く保証を作り込むのではなく fail-closed に
+//!   倒す。`docs/design/sql-subquery.md` の対象外節に明記する）。
 
 use super::allowlist::{Statement, TableLookup, WherePredicate};
 use super::exec::{Cell, ColumnMeta};
@@ -238,6 +249,23 @@ fn execute_inner_scan(
             ))
         }
     };
+
+    // Cursor Bugbot 指摘対応: ウィンドウ関数（SQL-30・TASK-214、Issue #930）を
+    // 含む内側は `IN`／`EXISTS` いずれも一律拒否する。`window_items` が非空だと
+    // `sql::scan::execute_scan` は `sql::window::execute_window_scan` へ分岐し、
+    // `LIMIT` による早期終了なしに可視行を全件 materialize する契約
+    // （`docs/design/window-functions.md` 参照）。`EXISTS` の
+    // `InnerScanIntent::ExistenceOnly` は投影・`LIMIT` だけを可視性判定に
+    // 不要な形へ差し替える設計であり、ウィンドウ項目をそのまま残すと同じ
+    // 資源上限問題（PR #1103 codex-review P1 指摘対応で一度塞いだもの）が
+    // ウィンドウ関数経由で再発する。サブクエリとウィンドウ関数の組合せは
+    // 設計上未検証のため、正しく動く経路を作り込まず fail-closed に倒す
+    // （`docs/design/sql-subquery.md` 対象外節参照）。
+    if !validated.window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "subquery cannot contain window functions",
+        ));
+    }
 
     let inner_schema = crate::catalog::get_table_schema_in_txn(read_txn, &validated.table_name)
         .map_err(|e| match e {

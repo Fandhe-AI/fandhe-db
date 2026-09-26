@@ -1123,3 +1123,61 @@ fn inner_subquery_without_limit_is_rejected() {
         engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
     ));
 }
+
+// Cursor Bugbot 指摘の回帰テスト: ウィンドウ関数（SQL-30・TASK-214、
+// Issue #930）を含む内側は `IN`／`EXISTS` いずれも一律拒否する。
+// `EXISTS` の `InnerScanIntent::ExistenceOnly` は投影・`LIMIT` だけを
+// 差し替える設計であり、ウィンドウ項目を差し替えずに残すと
+// `sql::scan::execute_scan` が `sql::window::execute_window_scan`
+// （`LIMIT` による早期終了なしに可視行を全件 materialize する）へ分岐して
+// しまい、可視行があっても資源上限で `EXISTS` 全体が失敗しうる（すでに
+// 塞いだ「投影・`LIMIT` をそのまま使う」問題のウィンドウ関数版）。
+// サブクエリとウィンドウ関数の組合せは設計上未検証のため fail-closed に
+// 拒否する（`docs/design/sql-subquery.md` 対象外節参照）。
+
+#[test]
+fn in_subquery_with_window_function_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    insert_allowed_lang(&core, &ctx, 1, "ja");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN \
+             (SELECT lang, ROW_NUMBER() OVER () FROM {ALLOWED_LANGS} LIMIT 10) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { detail }
+            if detail.contains("window functions")
+    ));
+}
+
+#[test]
+fn exists_subquery_with_window_function_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    // visits に可視行を用意する（可視行があっても拒否されることの確認）。
+    insert_visit(&core, &ctx, 1, "hit");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS \
+             (SELECT note, ROW_NUMBER() OVER () FROM {VISITS} LIMIT 10) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { detail }
+            if detail.contains("window functions")
+    ));
+}

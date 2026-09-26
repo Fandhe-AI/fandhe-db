@@ -157,6 +157,30 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
   （本自己点検で他に同種の「検証前に入力を差し替える」箇所が無いことを
   確認した。`OFFSET` は変更しない）。
 
+- 内側にウィンドウ関数（`ValidatedScan::window_items`。SQL-30・TASK-214、
+  Issue #930）が含まれる場合は `IN`／`EXISTS` いずれも `42601` で一律拒否
+  する（PR #1103 Cursor Bugbot 指摘対応）。main へ後から合流した機能が
+  `execute_scan` の内部分岐（`window_items` が非空なら `sql::window::
+  execute_window_scan` へ委譲。`LIMIT` による早期終了なしに可視行を全件
+  materialize する契約）を経由するため、`EXISTS` の `InnerScanIntent::
+  ExistenceOnly`（投影・`LIMIT` の差し替えのみ）だけでは塞げず、ウィンドウ
+  関数経由で同じ資源上限問題が再発しえた。サブクエリとウィンドウ関数の
+  組合せは設計上未検証のため、正しく動く経路を作り込むのではなく
+  fail-closed に倒した。
+
+  自己点検（同種の問題を持つ他の新機能が無いか）: 内側は
+  `sql::allowlist::validate_sql_tokens_with_subquery_ctx` が
+  `Statement::Scan` を返す場合のみ受理し、それ以外（`ORDER BY`・
+  `USING PLAN`・`GROUP BY`／集計・`SELECT DISTINCT`〔集計へ脱糖〕はいずれも
+  `Statement::Select`／`Statement::Aggregate` になる）は構造上すでに一律
+  `42601` で拒否される（`execute_inner_scan` の `_ => Err(unsupported(...))`
+  腕）。集合演算（`UNION`／`INTERSECT`／`EXCEPT`）は `sql::allowlist::
+  Statement` に該当する variant 自体が存在せず非対応。CTE（`WITH` 句）は
+  字句解析段で `Token::Ident("WITH")` となり、`IN (SELECT`／`EXISTS (SELECT`
+  の検出条件（次トークンが `Keyword::Select` であること）を満たさないため
+  構造的にサブクエリ経路へ到達しない。以上より、早期終了を妨げる形で
+  `LIMIT 1`・投影なしの経路をすり抜けられるのはウィンドウ関数のみだった。
+
 ### 拡張クエリプロトコルでの非対応
 
 `sql::params::where_equality_literal_is_param` は Parse 時点の元トークン列
@@ -203,6 +227,11 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 
 - スカラー比較サブクエリ・投影位置のスカラーサブクエリ
 - 内側の集計・ランキング付き検索 SELECT
+- 内側のウィンドウ関数（SQL-30・TASK-214、Issue #930）: `IN`／`EXISTS`
+  いずれも内側に `window_items` が含まれる場合は `42601` で一律拒否する
+  （PR #1103 Cursor Bugbot 指摘対応。理由は「上限（DoS 対策）」節参照。
+  サブクエリとウィンドウ関数の組合せが正しく動く経路は設計上未検証のため、
+  作り込むのではなく fail-closed に倒した）。
 - 相関サブクエリ
 - 拡張クエリプロトコル経由のサブクエリ・Describe 対応
 - `NOT IN`・`NOT EXISTS`（#913 の `NOT` 対応に依存）
