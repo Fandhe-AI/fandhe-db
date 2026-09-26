@@ -764,7 +764,7 @@ Date: <IMF-fixdate>
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（複数テーブル参照スコープの束縛基盤〔SQL-28・RLS-10、Issue #924〕は未結線。後述） |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
-| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF` は SQL 表層専用の式レーン。後述） |
+| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`FOREIGN KEY` の宣言は SQL 表層専用の `CREATE TABLE`。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
@@ -784,8 +784,7 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
 到達不能な 16 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
-`42809`・`42703`・`42704`・`42830`・`25000`・`25001`・`25P01`・`25P02`・
-`42804`）の理由: NoSQL 表層はテナントをセッション
+`42809`・`42703`・`42704`・`42830`・`42804`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -811,6 +810,9 @@ Issue #907）の宣言も SQL 表層専用の `CREATE TABLE` で行うため `42
 しないが、宣言済みテーブルへの `insert`／`update`／`delete` op は engine 内の
 単一検査点を通るため `23503` は到達する（上表。`crates/wire-server/tests/
 err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）。
+集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`。SQL-29 (c)・
+RLS-10 (b)・TASK-213、Issue #929）も SQL 表層専用で、NoSQL `op` 許可リストに
+対応する語彙が無いため `42804` は到達しない。
 参照先が他テナントにだけ存在する場合と、どのテナントにも存在しない場合の
 応答は区別できない（RLS-9・RLS-10）。`CASE`／`COALESCE`／`NULLIF`
 （対象ビヘイビア: SQL-26、Issue #921）は SQL 表層の式レーン専用の構文で、

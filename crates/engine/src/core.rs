@@ -2323,6 +2323,41 @@ impl EngineCore {
                     "EXPLAIN requires a session-aware entry point",
                 ))
             }
+            // Issue #929（SQL-29 (c)・TASK-213）: 集合演算の枝は `Scan` と同じく
+            // セッション UDF レジストリを参照しうるため、`Scan` と同じくセッション
+            // を要する実行本体（`execute_validated_in_session`）へ委譲する。
+            stmt @ crate::sql::allowlist::Statement::SetOperation(_) => {
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_validated_in_session(ctx, &mut session, stmt)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::CreateFunction { .. }
+                    | crate::sql::SqlOutcome::Explain(_)
+                    | crate::sql::SqlOutcome::Insert(_)
+                    | crate::sql::SqlOutcome::Truncate(_)
+                    | crate::sql::SqlOutcome::Delete(_)
+                    | crate::sql::SqlOutcome::Returning(_)
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::AlterTable(_)
+                    | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::CreateIndex(_)
+                    | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::Commit
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected non-Query outcome for a statement already classified as SetOperation"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -2378,6 +2413,47 @@ impl EngineCore {
             },
         )?;
         Ok((read_txn, schema))
+    }
+
+    /// [`Self::read_txn_with_schema`] の複数テーブル版（SQL-29 (c)・RLS-10 (b)・
+    /// TASK-213）。集合演算文（`Statement::SetOperation`）が参照する全テーブルの
+    /// スキーマを、単一の `read_txn`（同一スナップショット）上でまとめて解決する
+    /// ——`storage.db().begin_read()` を枝ごとに開き直さない（`sql::set_op`
+    /// モジュールドキュメント参照）。テーブル不存在は [`Self::read_txn_with_schema`]
+    /// と同じ写像（`UndefinedTable`／`table_lookup_error`）を適用する。
+    fn read_txn_with_schemas(
+        &self,
+        table_names: &[String],
+    ) -> Result<
+        (
+            redb::ReadTransaction,
+            std::collections::HashMap<String, crate::catalog::TableSchema>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let read_txn = self.storage.db().begin_read().map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!(
+                    "failed to begin read transaction: {}",
+                    StorageError::from(e)
+                ),
+            }
+        })?;
+        let mut schemas = std::collections::HashMap::with_capacity(table_names.len());
+        for name in table_names {
+            if schemas.contains_key(name) {
+                continue;
+            }
+            let schema =
+                crate::catalog::get_table_schema_in_txn(&read_txn, name).map_err(|e| match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    other => crate::catalog::table_lookup_error(other),
+                })?;
+            schemas.insert(name.clone(), schema);
+        }
+        Ok((read_txn, schemas))
     }
 
     /// SQL テキストを許可リスト検証だけ行い、実行（行・台帳・世代への到達）は
@@ -3553,6 +3629,23 @@ impl EngineCore {
                 // execute_window_scan`）と同じ写像で組み立てる。
                 Ok(Some(crate::sql::describe::scan_columns(&bound, &schema)?))
             }
+            // Issue #929（SQL-29 (c)・TASK-213）: 検索本体（各枝の行走査）は実行せず、
+            // 全枝を束縛して型整合検証（§2.2）を行った結果列（左端の枝の列）だけを
+            // 返す（Describe は本体を実行しない契約。`Statement::Aggregate`／
+            // `Statement::Scan` アームと同じ方針）。
+            ParsedSql::Statement(Statement::SetOperation(validated)) => {
+                let mut table_names = Vec::new();
+                crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
+                let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let columns = crate::sql::set_op::describe_columns(
+                    &schemas,
+                    &validated.tree,
+                    session.udfs(),
+                    dummy_equality_flags,
+                    validated.limit,
+                )?;
+                Ok(Some(columns))
+            }
             ParsedSql::Statement(Statement::Select(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 if validated.using_plan().is_some() {
@@ -3912,6 +4005,27 @@ impl EngineCore {
                     self.run_relational_explain_scan(&validated, session)
                 }
             },
+            // Issue #929（SQL-29 (c)・RLS-10 (b)・TASK-213）: 集合演算は複数枝
+            // （各枝は独立した単一テーブル広域取得）を単一スナップショット上で
+            // 評価する必要があるため、`Statement::Scan` アームと異なり
+            // `read_txn_with_schemas`（複数テーブル版）で全枝のスキーマを
+            // まとめて解決する。実行本体（束縛・型整合検証・重複除去・RLS 独立
+            // 適用）は `sql::set_op::execute` が担う（第 2 の実行器を作らない
+            // 方針は `Statement::Scan` と同じ）。
+            crate::sql::allowlist::Statement::SetOperation(validated) => {
+                let mut table_names = Vec::new();
+                crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
+                let (read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let result = crate::sql::set_op::execute(
+                    &read_txn,
+                    ctx,
+                    &schemas,
+                    &validated.tree,
+                    session.udfs(),
+                    validated.limit,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
         }
     }
 
