@@ -372,14 +372,11 @@ pub(crate) fn execute_scan_with_budget(
 
     // Issue #353 と同じく、`Computed` 列の式を行ループの外で 1 回だけステップ列
     // コンパイルする（行ループでの再帰評価をなくす）。
-    let computed_programs: Vec<Option<(ExprProgram, bool)>> = bound
+    let computed_programs: Vec<Option<ExprProgram>> = bound
         .projection
         .iter()
         .map(|col| match col {
-            ProjectedColumn::Computed { expr, .. } => Some((
-                ExprProgram::compile(expr),
-                udf_call::references_embedding(expr),
-            )),
+            ProjectedColumn::Computed { expr, .. } => Some(ExprProgram::compile(expr)),
             ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
         })
         .collect();
@@ -472,15 +469,18 @@ pub(crate) fn execute_scan_with_budget(
             }
             for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
                 let references_embedding = udf_call::references_embedding(expr);
-                // `dim == 0`（`VECTOR` 列が NULL。上記コメント参照）の行で embedding を
-                // 参照する式を評価すると、空スライスを実データと区別できず
-                // `vec_norm` 等が `0.0` を返し本来 NULL のはずの比較が意図せず
-                // マッチしてしまう（Cursor Bugbot 指摘）。SQL の NULL 比較は
-                // unknown → `WHERE` では偽と同義に扱われる契約に合わせ、embedding を
-                // 参照する式は NULL 行を評価せず無条件にこの行を除外する。
-                if references_embedding && dim == 0 {
-                    continue 'rows;
-                }
+                // `dim == 0`（`VECTOR` 列が NULL）の行を式が実際に評価すると空
+                // スライスを実データと区別できず `vec_norm` 等が `0.0` を返し
+                // 本来 NULL のはずの比較が意図せずマッチしてしまう（Cursor Bugbot
+                // 指摘）。この判定は `program.eval` 自身（`ExprStep::PushVector`。
+                // `sql::expr_program` 参照）が embedding スライスの空判定で行う
+                // ため、ここでは行を無条件除外しない（codex-review P1 指摘対応:
+                // `references_embedding` は式木全体を静的に走査するため、`CASE`
+                // の選ばれない分岐に embedding 参照があるだけの行まで誤って
+                // 除外していた。実際に選択された枝が embedding を参照する場合
+                // にのみ `eval` が `ExprValue::Null` を返し、下記の NULL 処理
+                // 〔SQL の NULL 比較は unknown → `WHERE` では偽と同義〕で除外
+                // される）。
                 let embedding: &[f32] = if references_embedding {
                     match tier {
                         DecodeTier::Embedding => embedding_scratch.as_slice(),
@@ -495,7 +495,9 @@ pub(crate) fn execute_scan_with_budget(
                 };
                 match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                    // Issue #921）。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
                     _ => {
@@ -770,43 +772,43 @@ pub(crate) fn execute_scan_with_budget(
                         }
                     }
                     ProjectedColumn::Computed { .. } => {
-                        let (program, references_embedding) = computed_programs
+                        let program = computed_programs
                             .get(col_idx)
                             .and_then(|p| p.as_ref())
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "computed projection program missing at evaluation time"
                                     .to_string(),
                             })?;
-                        // `dim == 0`（`VECTOR` 列が NULL）の行で embedding を参照する
-                        // 式を評価すると空スライスを実データと区別できず誤った数値
-                        // （例: `vec_norm` が `0.0`）を返してしまう（Cursor Bugbot
-                        // 指摘）。`ProjectedColumn::Column` の直接投影と同じく NULL を
-                        // 伝播させる。
-                        if *references_embedding && dim == 0 {
-                            cells.push(Cell::Null);
-                        } else {
-                            let embedding_for_eval: &[f32] = match tier {
-                                DecodeTier::Embedding => embedding_scratch.as_slice(),
-                                DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
-                            };
-                            match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
-                                ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                                ExprValue::Vector(v) => {
-                                    // codex-review P1 指摘対応: `Computed` 列のベクトル
-                                    // 結果も `VECTOR` 列直接投影と同じ累計予算
-                                    // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
-                                    // （`into_owned_vector`）自体は `try_reserve_exact`
-                                    // 経由で単発の確保失敗には強いが、累計を見ないと
-                                    // 行数分の蓄積で予算を回避できてしまうため。
-                                    let owned = udf_call::into_owned_vector(v)?;
-                                    cells.push(Cell::Vector(try_accumulate_vector_budget(
-                                        owned,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?));
-                                }
-                                ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
+                        // `dim == 0`（`VECTOR` 列が NULL）の行を式が実際に参照する
+                        // 場合の NULL 伝播は `program.eval` 自身（`ExprStep::
+                        // PushVector` の空スライス判定。`sql::expr_program`
+                        // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査
+                        // （`references_embedding`）による事前判定は `CASE` の
+                        // 選ばれない分岐に embedding 参照があるだけの行まで誤って
+                        // NULL 化していたため撤去し、評価時点の判定へ一本化した）。
+                        let embedding_for_eval: &[f32] = match tier {
+                            DecodeTier::Embedding => embedding_scratch.as_slice(),
+                            DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                        };
+                        match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
+                            ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                            // 対象ビヘイビア: SQL-26（Issue #921）。
+                            ExprValue::Null => cells.push(Cell::Null),
+                            ExprValue::Vector(v) => {
+                                // codex-review P1 指摘対応: `Computed` 列のベクトル
+                                // 結果も `VECTOR` 列直接投影と同じ累計予算
+                                // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
+                                // （`into_owned_vector`）自体は `try_reserve_exact`
+                                // 経由で単発の確保失敗には強いが、累計を見ないと
+                                // 行数分の蓄積で予算を回避できてしまうため。
+                                let owned = udf_call::into_owned_vector(v)?;
+                                cells.push(Cell::Vector(try_accumulate_vector_budget(
+                                    owned,
+                                    &mut byte_budget,
+                                    max_result_bytes,
+                                )?));
                             }
+                            ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
                         }
                     }
                 }
@@ -1168,6 +1170,153 @@ mod tests {
             result.rows.is_empty(),
             "NULL vector 行が WHERE vec_norm(embedding) = 0 に誤ってマッチした: {:?}",
             result.rows
+        );
+    }
+
+    #[test]
+    fn case_where_only_unselected_branch_references_embedding_does_not_exclude_null_vector_rows() {
+        // codex-review P1 指摘の回帰テスト（Issue #921）: `references_embedding`
+        // は式木全体を静的に走査するため、`CASE` の**選ばれない**分岐にだけ
+        // embedding 参照（`vec_norm(embedding)`）があるだけの式でも「embedding を
+        // 参照する式」と誤判定していた。旧実装はこの誤判定に基づき `dim == 0`
+        // （`VECTOR` 列が NULL）の行を無条件除外していたため、実際に選択される
+        // 分岐が embedding を一切参照しない場合でも NULL vector 行が
+        // 除外されてしまっていた。本テストは `id = 2` の行（`dim == 0`）が
+        // `THEN` 分岐（embedding 非参照）を選ぶケースで、行が正しく残ることを
+        // 固定する。
+        let path = unique_db_path("scan-where-case-unselected-branch-null-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        // id=1: 実データを持つ行（ELSE 分岐が選ばれ、embedding を参照し 0 とは
+        // 一致しないため除外される）。
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[3.0, 4.0, 0.0]);
+        // id=2: `VECTOR` 列が NULL（dim == 0）の行。THEN 分岐（embedding 非参照）
+        // が選ばれるため、embedding の NULL 性に関わらず一致するはず。
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[]);
+
+        // `CASE WHEN id = 2 THEN (id = id) ELSE (vec_norm(embedding) = 0) END`
+        let expr = udf_call::BoundExpr::Case {
+            whens: vec![(
+                udf_call::BoundExpr::Binary {
+                    op: udf_call::BinOp::Eq,
+                    lhs: Box::new(udf_call::BoundExpr::IdRef),
+                    rhs: Box::new(udf_call::BoundExpr::Number(2.0)),
+                },
+                udf_call::BoundExpr::Binary {
+                    op: udf_call::BinOp::Eq,
+                    lhs: Box::new(udf_call::BoundExpr::IdRef),
+                    rhs: Box::new(udf_call::BoundExpr::IdRef),
+                },
+            )],
+            else_result: Box::new(udf_call::BoundExpr::Binary {
+                op: udf_call::BinOp::Eq,
+                lhs: Box::new(udf_call::BoundExpr::Builtin {
+                    f: udf_call::BuiltinFn::VecNorm,
+                    args: vec![udf_call::BoundExpr::VectorRef],
+                }),
+                rhs: Box::new(udf_call::BoundExpr::Number(0.0)),
+            }),
+        };
+        // 式木全体には embedding 参照（ELSE 分岐）が含まれることを前提として
+        // 明示する（この前提がないとテストの意図が伝わらないため）。
+        assert!(udf_call::references_embedding(&expr));
+
+        let program = ExprProgram::compile(&expr);
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: vec![expr],
+            expr_filter_programs: vec![program],
+            or_filters: Vec::new(),
+            limit: 10,
+            offset: 0,
+            windows: Vec::new(),
+        };
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![2],
+            "NULL vector 行 (id=2) が選択されない分岐の embedding 参照だけを理由に \
+             誤って除外された（または実データ行が誤って含まれた）: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn computed_case_projection_with_unselected_embedding_branch_is_not_null_for_null_vector_row() {
+        // codex-review P1 指摘の回帰テスト（Issue #921）: `Computed` 列の投影
+        // （`sql/scan.rs` の `ProjectedColumn::Computed` 分岐）でも、WHERE と
+        // 同じ誤判定（`references_embedding` の式木全体走査）により、`CASE` の
+        // 選ばれない分岐にだけ embedding 参照がある行が NULL 投影されていた
+        // （`if *references_embedding && dim == 0 { cells.push(Cell::Null) }`
+        // の旧実装）。`id = 2` の行（`dim == 0`）が embedding を参照しない
+        // `THEN` 分岐を選ぶ場合、`Cell::Null` ではなく選ばれた値が投影される
+        // ことを固定する。
+        let path = unique_db_path("scan-computed-case-unselected-branch-null-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[3.0, 4.0, 0.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[]);
+
+        // `CASE WHEN id = 2 THEN 1 ELSE vec_norm(embedding) END`
+        let expr = udf_call::BoundExpr::Case {
+            whens: vec![(
+                udf_call::BoundExpr::Binary {
+                    op: udf_call::BinOp::Eq,
+                    lhs: Box::new(udf_call::BoundExpr::IdRef),
+                    rhs: Box::new(udf_call::BoundExpr::Number(2.0)),
+                },
+                udf_call::BoundExpr::Number(1.0),
+            )],
+            else_result: Box::new(udf_call::BoundExpr::Builtin {
+                f: udf_call::BuiltinFn::VecNorm,
+                args: vec![udf_call::BoundExpr::VectorRef],
+            }),
+        };
+        assert!(udf_call::references_embedding(&expr));
+
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Computed {
+                    name: "n".to_string(),
+                    expr,
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 10,
+            offset: 0,
+            windows: Vec::new(),
+        };
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+
+        assert_eq!(result.rows.len(), 2);
+        let row1 = result.rows.iter().find(|r| r.id == 1).expect("row 1");
+        assert_eq!(row1.cells[1], Cell::Float(5.0));
+        let row2 = result.rows.iter().find(|r| r.id == 2).expect("row 2");
+        assert_eq!(
+            row2.cells[1],
+            Cell::Float(1.0),
+            "NULL vector 行 (id=2) の CASE 投影が選択されない分岐の embedding 参照 \
+             だけを理由に誤って NULL 化された"
         );
     }
 

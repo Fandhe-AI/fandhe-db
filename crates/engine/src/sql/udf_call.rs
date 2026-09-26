@@ -39,6 +39,16 @@ pub const MAX_EXPR_DEPTH: usize = 32;
 /// （`Parser::expr_node_budget`）としても共有し、左結合ループが `MAX_EXPR_DEPTH`
 /// をすり抜けて木を積み続ける入力（"1+1+...+1" 等）を頭打ちにする（`54000`）。
 pub const MAX_EXPR_NODES: usize = 1024;
+/// `CASE` 式 1 個が持てる `WHEN` 分岐数の上限（対象ビヘイビア: SQL-26。Issue #921）。
+/// `sql::allowlist::Parser::parse_case_expr` が構文段で、[`bind_case`] が
+/// 束縛段（UDF インライン展開後）で独立に検査する（`54000`）。
+pub const MAX_CASE_BRANCHES: usize = 64;
+/// `CASE`／`COALESCE`／`NULLIF` の入れ子段数上限（対象ビヘイビア: SQL-26。
+/// Issue #921）。構文段（`sql::allowlist::Parser`）では字面上のネストを、
+/// 束縛段（[`BindEnv::case_nesting`]）では UDF 本体インライン展開後の実際の
+/// ネストを、それぞれ独立に検査する（構文段の計測値だけでは UDF 呼び出しの
+/// 展開によって実際のネストがすり抜けうるため。`54000`）。
+pub const MAX_CASE_NESTING: usize = 8;
 /// セッションが保持できる UDF 定義数上限（宣言的・WASM 合算。`54000`）。
 pub const MAX_SESSION_UDFS: usize = 64;
 /// WASM UDF 呼び出しの引数数（TASK-149。ABI 固定シグネチャ
@@ -129,6 +139,25 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// `NULL` リテラル（対象ビヘイビア: SQL-26。Issue #921）。束縛段
+    /// （[`bind_expr_in`]）は `CASE` の THEN／ELSE・`COALESCE`／`NULLIF` の
+    /// 引数の 3 箇所でのみこの variant を受理し、型を兄弟枝から単一化する。
+    /// それ以外の位置（`id + NULL` 等）は型を決められない形として
+    /// `FeatureNotSupported`（`0A000`）で拒否する。
+    Null,
+    /// 検索形 `CASE WHEN <cond> THEN <result> {WHEN ...} [ELSE <result>] END`
+    /// （対象ビヘイビア: SQL-26）。単純 CASE（`CASE x WHEN v ...`）・`cond` 中の
+    /// 論理演算（`AND`/`OR`/`IS NULL` 等）は許可リスト（`sql::allowlist::Parser`）が
+    /// 構文段で拒否するため、`cond` は常に比較の [`Expr::Binary`] になる。
+    Case {
+        whens: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
+    /// `COALESCE(<arg>, ...)`（対象ビヘイビア: SQL-26）。最初の非 NULL 引数を返す。
+    Coalesce(Vec<Expr>),
+    /// `NULLIF(<lhs>, <rhs>)`（対象ビヘイビア: SQL-26）。両辺が等しければ NULL、
+    /// 異なれば `lhs` を返す。
+    NullIf(Box<Expr>, Box<Expr>),
 }
 
 /// 束縛済み（列参照・関数呼び出しの解決、UDF 本体のインライン展開が完了した）式。
@@ -167,6 +196,24 @@ pub enum BoundExpr {
         backend: Arc<dyn WasmUdfBackend>,
         args: Vec<BoundExpr>,
     },
+    /// `NULL`（対象ビヘイビア: SQL-26。Issue #921）。[`Expr::Null`] の束縛結果。
+    /// [`bind_case`]・[`bind_coalesce`]・[`bind_nullif`] の 3 箇所からのみ生成される。
+    Null,
+    /// 検索形 `CASE`（対象ビヘイビア: SQL-26）。`else_result` は構文上の `ELSE` 省略時
+    /// にも [`BoundExpr::Null`] を補って正規化済みのため常に存在する
+    /// （[`bind_case`] 参照）。
+    Case {
+        whens: Vec<(BoundExpr, BoundExpr)>,
+        else_result: Box<BoundExpr>,
+    },
+    /// `COALESCE`（対象ビヘイビア: SQL-26）。
+    Coalesce(Vec<BoundExpr>),
+    /// `NULLIF`（対象ビヘイビア: SQL-26）。両辺は常に `Scalar` 型（[`bind_nullif`]
+    /// が検査済み）。
+    NullIf {
+        lhs: Box<BoundExpr>,
+        rhs: Box<BoundExpr>,
+    },
 }
 
 impl PartialEq for BoundExpr {
@@ -175,6 +222,7 @@ impl PartialEq for BoundExpr {
             (BoundExpr::Number(a), BoundExpr::Number(b)) => a == b,
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
+            (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
                 fa == fb && aa == ab
             }
@@ -190,6 +238,20 @@ impl PartialEq for BoundExpr {
                     rhs: rb,
                 },
             ) => opa == opb && la == lb && ra == rb,
+            (
+                BoundExpr::Case {
+                    whens: wa,
+                    else_result: ea,
+                },
+                BoundExpr::Case {
+                    whens: wb,
+                    else_result: eb,
+                },
+            ) => wa == wb && ea == eb,
+            (BoundExpr::Coalesce(a), BoundExpr::Coalesce(b)) => a == b,
+            (BoundExpr::NullIf { lhs: la, rhs: ra }, BoundExpr::NullIf { lhs: lb, rhs: rb }) => {
+                la == lb && ra == rb
+            }
             (
                 BoundExpr::WasmCall {
                     name: na,
@@ -228,6 +290,13 @@ pub enum ExprValue<'a> {
     Scalar(f64),
     Vector(Cow<'a, [f32]>),
     Bool(bool),
+    /// SQL `NULL`（対象ビヘイビア: SQL-26。Issue #921）。`CASE`／`COALESCE`／
+    /// `NULLIF` の評価結果としてのみ生じる。呼び出し元（`sql::exec`・`sql::scan`・
+    /// `sql::group_by`・`sql::aggregate`・`sql::check_constraint`）は UNKNOWN
+    /// （PostgreSQL の 3 値論理）として扱う: `WHERE`/`CHECK` では非該当・充足、
+    /// 投影では `Cell::Null`、`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)` では
+    /// 当該行をスキップする。
+    Null,
 }
 
 /// [`ExprValue::Vector`] を所有 `Vec<f32>` へ変換する（投影段など、評価結果を
@@ -312,8 +381,17 @@ pub(crate) const MAX_BUILTIN_ARITY: usize = 2;
 /// あった。Cursor Bugbot 指摘対応・PR #229）。
 fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    matches!(upper.as_str(), "VISIBLE" | "HYBRID_RRF" | "HYBRID")
-        || builtin_from_name(name).is_some()
+    // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は式文法の
+    // 専用ノード（`Expr::Case`／`Expr::Coalesce`／`Expr::NullIf`）として解析される
+    // ため、同名の UDF を許すと呼び出し不能な定義が登録できてしまう（`CASE` は
+    // `parse_primary_expr` が `'('` の有無を見ず常に文脈的キーワードとして
+    // 消費するため、`case(...)` という呼び出し形は `WHEN` を期待する CASE
+    // 構文解析へ吸われて `42601` になる。`is_reserved_function_name` docs の
+    // 既存 `min`/`集計` と同じ理由。Bugbot 指摘対応）。
+    matches!(
+        upper.as_str(),
+        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF"
+    ) || builtin_from_name(name).is_some()
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
 
@@ -592,6 +670,27 @@ fn validate_closed_expr(
             validate_closed_expr(lhs, params, registry, node_budget)?;
             validate_closed_expr(rhs, params, registry, node_budget)
         }
+        Expr::Null => Ok(()),
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                validate_closed_expr(cond, params, registry, node_budget)?;
+                validate_closed_expr(result, params, registry, node_budget)?;
+            }
+            if let Some(else_result) = else_result {
+                validate_closed_expr(else_result, params, registry, node_budget)?;
+            }
+            Ok(())
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                validate_closed_expr(a, params, registry, node_budget)?;
+            }
+            Ok(())
+        }
+        Expr::NullIf(lhs, rhs) => {
+            validate_closed_expr(lhs, params, registry, node_budget)?;
+            validate_closed_expr(rhs, params, registry, node_budget)
+        }
     }
 }
 
@@ -602,6 +701,12 @@ struct BindEnv<'a> {
     schema: Option<&'a TableSchema>,
     params: std::collections::HashMap<String, (BoundExpr, ExprType)>,
     registry: &'a UdfRegistry,
+    /// `CASE`／`COALESCE`／`NULLIF` の現在の入れ子段数（対象ビヘイビア: SQL-26。
+    /// Issue #921）。構文段（`sql::allowlist::Parser`）のネストカウンタとは別に
+    /// 束縛段でも独立に検査する: UDF 本体をインライン展開すると、呼び出し元の
+    /// ネストと呼び出し先本体のネストが合算され、構文段の計測値（各文が個別に
+    /// 見た字面上のネスト）をすり抜けうるため（[`enter_case_nesting`] 参照）。
+    case_nesting: usize,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -610,10 +715,61 @@ struct BindEnv<'a> {
 /// `node_budget` により上限が掛かっているため、単純な再帰で数え上げてよい。
 fn count_bound_nodes(expr: &BoundExpr) -> usize {
     match expr {
-        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef => 1,
+        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::Null => 1,
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Binary { lhs, rhs, .. } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
         BoundExpr::WasmCall { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::Case { whens, else_result } => {
+            1 + whens
+                .iter()
+                .map(|(c, r)| count_bound_nodes(c) + count_bound_nodes(r))
+                .sum::<usize>()
+                + count_bound_nodes(else_result)
+        }
+        BoundExpr::Coalesce(args) => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::NullIf { lhs, rhs } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
+    }
+}
+
+/// 既に束縛済みの `BoundExpr` 部分木が内部に持つ `CASE`／`COALESCE`／`NULLIF` の
+/// 最大入れ子段数を数える（対象ビヘイビア: SQL-26。Issue #921 レビュー指摘対応）。
+///
+/// `BindEnv::case_nesting` は束縛「実行中」の構文木を辿る間だけ有効なカウンタで
+/// あり、UDF 呼び出しの実引数はそれ自身の呼び出し元コンテキストで一度束縛
+/// し終えた時点でカウンタが呼び出し前の段数へ戻る（[`bind_with_case_nesting`]）。
+/// そのため `bind_call` が実引数を束縛済み `BoundExpr` として `env.params` へ
+/// 格納したあと、UDF 本体側で `Expr::Ident`（パラメータ参照）を介してその部分木を
+/// まるごと展開すると、呼び出し元での「実引数単体としては上限内」だった入れ子と
+/// 展開先（本体側で既に `CASE`/`COALESCE`/`NULLIF` の内側にいる場合の現在段数）の
+/// 入れ子が合算され、どちらの計測時点でも `MAX_CASE_NESTING` 超過として観測され
+/// ないまま実効ネストだけが上限を超えてすり抜けうる。この関数で展開対象の部分木
+/// が持つ最大追加段数を求め、`bind_expr_in` の `Expr::Ident` 分岐で
+/// `env.case_nesting`（展開先での現在段数）に加算した和を検査することで、
+/// UDF 引数展開後の実効ネストを直接検査する。
+fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
+    match expr {
+        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::Null => 0,
+        BoundExpr::Builtin { args, .. } => {
+            args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
+        }
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
+        }
+        BoundExpr::WasmCall { args, .. } => {
+            args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
+        }
+        BoundExpr::Case { whens, else_result } => {
+            let branches_max = whens
+                .iter()
+                .map(|(c, r)| max_bound_case_nesting(c).max(max_bound_case_nesting(r)))
+                .max()
+                .unwrap_or(0);
+            1 + branches_max.max(max_bound_case_nesting(else_result))
+        }
+        BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::NullIf { lhs, rhs } => {
+            1 + max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
+        }
     }
 }
 
@@ -630,12 +786,20 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
 pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::VectorRef => true,
-        BoundExpr::Number(_) | BoundExpr::IdRef => false,
+        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::Null => false,
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Binary { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
         }
         BoundExpr::WasmCall { args, .. } => args.iter().any(references_embedding),
+        BoundExpr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| references_embedding(c) || references_embedding(r))
+                || references_embedding(else_result)
+        }
+        BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
+        BoundExpr::NullIf { lhs, rhs } => references_embedding(lhs) || references_embedding(rhs),
     }
 }
 
@@ -653,8 +817,197 @@ pub fn bind_expr(
         schema: Some(schema),
         params: std::collections::HashMap::new(),
         registry,
+        case_nesting: 0,
     };
     bind_expr_in(expr, &mut env, node_budget)
+}
+
+/// [`BindEnv::case_nesting`] を 1 段進め、[`MAX_CASE_NESTING`] を超えないか検査する
+/// （`bind_case`／`bind_coalesce`／`bind_nullif` が共有する。対象ビヘイビア:
+/// SQL-26。Issue #921）。呼び出し元は対応する `exit_case_nesting` を必ず対で呼ぶ
+/// （[`bind_with_case_nesting`] 参照）。
+fn enter_case_nesting(env: &mut BindEnv<'_>) -> Result<(), SqlSurfaceError> {
+    let next = env.case_nesting.checked_add(1).ok_or_else(|| {
+        SqlSurfaceError::payload_too_large("CASE/COALESCE/NULLIF nesting exceeds the allowed depth")
+    })?;
+    if next > MAX_CASE_NESTING {
+        return Err(SqlSurfaceError::payload_too_large(
+            "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+        ));
+    }
+    env.case_nesting = next;
+    Ok(())
+}
+
+/// `f` を [`BindEnv::case_nesting`] を 1 段進めた状態で実行し、成否によらず
+/// 呼び出し前の段数へ戻す（`bind_case`／`bind_coalesce`／`bind_nullif` が共有する）。
+fn bind_with_case_nesting<F>(
+    env: &mut BindEnv<'_>,
+    f: F,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError>
+where
+    F: FnOnce(&mut BindEnv<'_>) -> Result<(BoundExpr, ExprType), SqlSurfaceError>,
+{
+    enter_case_nesting(env)?;
+    let result = f(env);
+    env.case_nesting = env.case_nesting.saturating_sub(1);
+    result
+}
+
+/// `CASE` の THEN／ELSE・`COALESCE` の引数を束縛する（対象ビヘイビア: SQL-26）。
+/// `Expr::Null` はここでのみ特別扱いし、型が未確定のまま [`BoundExpr::Null`] を
+/// 返す（`Ok` 側の `None` が「型未確定」を表す）。呼び出し元がすべての兄弟枝の
+/// 型を突き合わせて単一化する。
+fn bind_null_aware(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, Option<ExprType>), SqlSurfaceError> {
+    if matches!(expr, Expr::Null) {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        return Ok((BoundExpr::Null, None));
+    }
+    let (bound, ty) = bind_expr_in(expr, env, node_budget)?;
+    Ok((bound, Some(ty)))
+}
+
+/// 兄弟枝（`CASE` の THEN/ELSE・`COALESCE` の引数）の型を単一化する。NULL 由来の
+/// `None` は無視し、非 NULL 同士の型が食い違えば `42804`（`DatatypeMismatch`）で
+/// 拒否する（対象ビヘイビア: SQL-26）。
+fn unify_branch_type(
+    unified: &mut Option<ExprType>,
+    ty: Option<ExprType>,
+    mismatch_detail: &str,
+) -> Result<(), SqlSurfaceError> {
+    let Some(t) = ty else { return Ok(()) };
+    match *unified {
+        None => *unified = Some(t),
+        Some(existing) if existing == t => {}
+        Some(_) => {
+            return Err(SqlSurfaceError::DatatypeMismatch {
+                detail: mismatch_detail.to_string(),
+            })
+        }
+    }
+    Ok(())
+}
+
+/// 検索形 `CASE` を束縛する（対象ビヘイビア: SQL-26。`sql::allowlist::Parser`
+/// が構文段で単純 CASE・WHEN 内の論理演算を拒否済みのため、`cond` は常に
+/// 比較の [`Expr::Binary`] である）。
+fn bind_case(
+    whens: &[(Expr, Expr)],
+    else_result: &Option<Box<Expr>>,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if whens.len() > MAX_CASE_BRANCHES {
+        return Err(SqlSurfaceError::payload_too_large(
+            "CASE has too many WHEN branches",
+        ));
+    }
+    bind_with_case_nesting(env, |env| {
+        let mut bound_whens = Vec::with_capacity(whens.len());
+        let mut unified: Option<ExprType> = None;
+        for (cond, result) in whens {
+            let (cond_bound, cond_ty) = bind_expr_in(cond, env, node_budget)?;
+            if cond_ty != ExprType::Bool {
+                return Err(SqlSurfaceError::DatatypeMismatch {
+                    detail: "CASE WHEN condition must be a boolean comparison".to_string(),
+                });
+            }
+            let (result_bound, result_ty) = bind_null_aware(result, env, node_budget)?;
+            unify_branch_type(
+                &mut unified,
+                result_ty,
+                "CASE branches must have the same type",
+            )?;
+            bound_whens.push((cond_bound, result_bound));
+        }
+        let else_bound = match else_result {
+            Some(expr) => {
+                let (b, t) = bind_null_aware(expr, env, node_budget)?;
+                unify_branch_type(&mut unified, t, "CASE branches must have the same type")?;
+                b
+            }
+            None => BoundExpr::Null,
+        };
+        let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "CASE expression with only NULL results has no determinable type".to_string(),
+        })?;
+        Ok((
+            BoundExpr::Case {
+                whens: bound_whens,
+                else_result: Box::new(else_bound),
+            },
+            final_ty,
+        ))
+    })
+}
+
+/// `COALESCE(<arg>, ...)` を束縛する（対象ビヘイビア: SQL-26）。
+fn bind_coalesce(
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if args.len() > MAX_CALL_ARGS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many call arguments",
+        ));
+    }
+    bind_with_case_nesting(env, |env| {
+        let mut bound_args = Vec::with_capacity(args.len());
+        let mut unified: Option<ExprType> = None;
+        for a in args {
+            let (b, t) = bind_null_aware(a, env, node_budget)?;
+            unify_branch_type(
+                &mut unified,
+                t,
+                "COALESCE arguments must have the same type",
+            )?;
+            bound_args.push(b);
+        }
+        let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "COALESCE with only NULL arguments has no determinable type".to_string(),
+        })?;
+        Ok((BoundExpr::Coalesce(bound_args), final_ty))
+    })
+}
+
+/// `NULLIF(<lhs>, <rhs>)` を束縛する（対象ビヘイビア: SQL-26）。両辺は既存の `=`
+/// 演算子と同じく `Scalar` 限定（`Vector`/`Bool` の等価比較は式層に存在しない）。
+fn bind_nullif(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    bind_with_case_nesting(env, |env| {
+        let (lhs_b, lhs_t) = bind_null_aware(lhs, env, node_budget)?;
+        let (rhs_b, rhs_t) = bind_null_aware(rhs, env, node_budget)?;
+        for t in [lhs_t, rhs_t].into_iter().flatten() {
+            if t != ExprType::Scalar {
+                return Err(SqlSurfaceError::DatatypeMismatch {
+                    detail: "NULLIF arguments must be scalar".to_string(),
+                });
+            }
+        }
+        if lhs_t.is_none() && rhs_t.is_none() {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
+            });
+        }
+        Ok((
+            BoundExpr::NullIf {
+                lhs: Box::new(lhs_b),
+                rhs: Box::new(rhs_b),
+            },
+            ExprType::Scalar,
+        ))
+    })
 }
 
 fn bind_expr_in(
@@ -687,6 +1040,28 @@ fn bind_expr_in(
                 *node_budget = node_budget
                     .checked_sub(expanded_size)
                     .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+                // 実引数（`bound`）は呼び出し元コンテキストで既に単体の入れ子段数
+                // 検査を通過済みだが、その段数は展開先（ここに到達した時点の
+                // `env.case_nesting`。本体側で既に CASE/COALESCE/NULLIF の内側に
+                // いれば正）とは独立に計測されたものであり、単純な `bound.clone()`
+                // ではこの 2 つの段数が合算されずすり抜ける（`max_bound_case_nesting`
+                // のドキュメンテーションコメント参照。Issue #921 レビュー指摘対応）。
+                // 展開後の実効ネストを `env.case_nesting + 実引数内部の最大段数` として
+                // 直接検査し、`MAX_CASE_NESTING` 超過を fail-closed に拒否する。
+                let expanded_nesting = max_bound_case_nesting(bound);
+                let effective_nesting =
+                    env.case_nesting
+                        .checked_add(expanded_nesting)
+                        .ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large(
+                                "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+                            )
+                        })?;
+                if effective_nesting > MAX_CASE_NESTING {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+                    ));
+                }
                 return Ok((bound.clone(), *ty));
             }
             let schema = env.schema.ok_or_else(|| {
@@ -797,6 +1172,16 @@ fn bind_expr_in(
             let (r, rt) = bind_expr_in(rhs, env, node_budget)?;
             bind_binary(*op, l, lt, r, rt)
         }
+        // `Expr::Null` は `CASE` の THEN/ELSE・`COALESCE`／`NULLIF` の引数の 3 箇所
+        // でのみ [`bind_null_aware`] 経由で受理する。それ以外の位置（ここに直接
+        // 到達する裸の `NULL`）は型を決められない形として `0A000` で拒否する
+        // （対象ビヘイビア: SQL-26）。
+        Expr::Null => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "NULL is only allowed as a CASE/COALESCE/NULLIF operand".to_string(),
+        }),
+        Expr::Case { whens, else_result } => bind_case(whens, else_result, env, node_budget),
+        Expr::Coalesce(args) => bind_coalesce(args, env, node_budget),
+        Expr::NullIf(lhs, rhs) => bind_nullif(lhs, rhs, env, node_budget),
     }
 }
 
@@ -913,6 +1298,10 @@ fn bind_call(
             schema: None,
             params: inner_params,
             registry: env.registry,
+            // 呼び出し元の現在のネスト段数を引き継ぐ（UDF 本体のインライン展開
+            // 後、呼び出し元の CASE/COALESCE/NULLIF と本体側のそれが合算される
+            // ことを構造的に保証する。`enter_case_nesting` docs 参照）。
+            case_nesting: env.case_nesting,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -988,7 +1377,24 @@ pub fn eval<'a>(
             // fail-closed な確保を行う（下記 `eval_builtin`・`apply_vector_scalar_op`
             // 参照）。呼び出し元が所有データを要する場合は [`into_owned_vector`] で
             // 変換する（確保は投影段など必要な箇所のみへ限定される）。
-            Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
+            //
+            // `embedding` が空スライスの行は `VECTOR` 列が NULL（`dim == 0`。
+            // 呼び出し元は常に「非 NULL なら実データ・NULL なら空スライス」で
+            // 揃えて渡す契約。`sql::scan`・`sql::where_tree`・
+            // `sql::check_constraint`・`sql::exec` 参照）であるため、ここで NULL
+            // として評価する。`CASE`／`COALESCE` は選ばれない分岐を評価しない
+            // （このモジュールの `Case`／`Coalesce` 分岐が短絡する）ため、
+            // 実際に選択された枝が `VectorRef` を含む場合にのみ NULL が伝播する
+            // （codex-review P1 指摘対応: 未選択分岐に embedding 参照があるだけで
+            // 行全体を NULL 扱いにしていた旧実装の修正。呼び出し元の事前
+            // `references_embedding && dim == 0` ゲートは静的な式木走査で
+            // 選択されない分岐まで拾ってしまうため撤去し、この評価時点の判定へ
+            // 一本化した）。
+            if embedding.is_empty() {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
+            }
         }
         BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding),
         BoundExpr::Binary { op, lhs, rhs } => {
@@ -998,8 +1404,45 @@ pub fn eval<'a>(
         }
         BoundExpr::WasmCall { backend, args, .. } => {
             // ABI 固定シグネチャ（bind_call が保証）: args[0] = Vector, args[1] = Scalar。
-            let v = eval_vector_arg(args, 0, id, embedding)?;
-            let s = eval_scalar_arg(args, 1, id, embedding)?;
+            let v_val = match args.first() {
+                Some(e) => eval(e, id, embedding)?,
+                None => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "missing function argument at evaluation time".to_string(),
+                    })
+                }
+            };
+            let s_val = match args.get(1) {
+                Some(e) => eval(e, id, embedding)?,
+                None => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "missing function argument at evaluation time".to_string(),
+                    })
+                }
+            };
+            // WASM UDF は RETURNS NULL ON NULL INPUT として扱う（対象ビヘイビア:
+            // SQL-26。Issue #921）: いずれかの引数が NULL ならバックエンドを一切
+            // 呼ばず NULL を返す。ABI（`(Vector, Scalar) -> Scalar`）に NULL を
+            // 表現する値が無いため、NULL をバックエンド越しに送らない判断。
+            if matches!(v_val, ExprValue::Null) || matches!(s_val, ExprValue::Null) {
+                return Ok(ExprValue::Null);
+            }
+            let v = match v_val {
+                ExprValue::Vector(v) => v,
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "function argument type mismatch at evaluation time".to_string(),
+                    })
+                }
+            };
+            let s = match s_val {
+                ExprValue::Scalar(s) => s,
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "function argument type mismatch at evaluation time".to_string(),
+                    })
+                }
+            };
             // バックエンドの失敗（deadline 超過・トラップ・メモリ確保失敗・
             // `Mutex` poison 等）は種別を問わずすべて `22000` に写像する（行値・
             // テナント情報を含まない固定文言。`crate::wasm_udf::WasmUdfError` の
@@ -1010,6 +1453,62 @@ pub fn eval<'a>(
                 .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
             finite_scalar(result, "wasm udf")
         }
+        BoundExpr::Null => Ok(ExprValue::Null),
+        BoundExpr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                match eval(cond, id, embedding)? {
+                    ExprValue::Bool(true) => return eval(result, id, embedding),
+                    ExprValue::Bool(false) | ExprValue::Null => continue,
+                    _ => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "CASE condition did not evaluate to boolean".to_string(),
+                        })
+                    }
+                }
+            }
+            eval(else_result, id, embedding)
+        }
+        BoundExpr::Coalesce(args) => {
+            for a in args {
+                match eval(a, id, embedding)? {
+                    ExprValue::Null => continue,
+                    other => return Ok(other),
+                }
+            }
+            Ok(ExprValue::Null)
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            let l = eval(lhs, id, embedding)?;
+            let r = eval(rhs, id, embedding)?;
+            eval_nullif(l, r)
+        }
+    }
+}
+
+/// `NULLIF(lhs, rhs)` を値ベースで評価する（`CASE WHEN lhs = rhs THEN NULL ELSE
+/// lhs END` と等価な意味論。対象ビヘイビア: SQL-26）。再帰 `eval` の
+/// `BoundExpr::NullIf` 分岐と `sql::expr_program::ExprProgram::eval` の
+/// `ExprStep::NullIf` 分岐が共有する（Issue #353 と同じ「値ベース評価を 1 箇所に
+/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar` 限定済みのため、
+/// 非 `Null`・非 `Scalar` の組み合わせは束縛段の不変条件が崩れた場合の保険として
+/// `Internal` に倒す。
+pub(crate) fn eval_nullif<'a>(
+    l: ExprValue<'a>,
+    r: ExprValue<'a>,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    match (l, r) {
+        (ExprValue::Null, _) => Ok(ExprValue::Null),
+        (l, ExprValue::Null) => Ok(l),
+        (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Scalar(a))
+            }
+        }
+        _ => Err(SqlSurfaceError::Internal {
+            detail: "NULLIF operand type mismatch at evaluation time".to_string(),
+        }),
     }
 }
 
@@ -1050,6 +1549,12 @@ pub(crate) fn apply_builtin<'a>(
     f: BuiltinFn,
     args: &mut [Option<ExprValue<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    // 組み込み関数は strict 関数として扱う（対象ビヘイビア: SQL-26。Issue #921）:
+    // いずれかの引数が NULL なら NULL を返す。残りの引数のスロットは未使用のまま
+    // 破棄してよい（呼び出し元はこの 1 回の呼び出し後にスロットを再利用しない）。
+    if args.iter().any(|a| matches!(a, Some(ExprValue::Null))) {
+        return Ok(ExprValue::Null);
+    }
     match f {
         BuiltinFn::VecNorm => {
             let v = take_vector_arg(args, 0)?;
@@ -1130,44 +1635,6 @@ fn take_scalar_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<f64
     }
 }
 
-fn eval_vector_arg<'a>(
-    args: &[BoundExpr],
-    idx: usize,
-    id: u64,
-    embedding: &'a [f32],
-) -> Result<Cow<'a, [f32]>, SqlSurfaceError> {
-    match args.get(idx) {
-        Some(e) => match eval(e, id, embedding)? {
-            ExprValue::Vector(v) => Ok(v),
-            _ => Err(SqlSurfaceError::Internal {
-                detail: "function argument type mismatch at evaluation time".to_string(),
-            }),
-        },
-        None => Err(SqlSurfaceError::Internal {
-            detail: "missing function argument at evaluation time".to_string(),
-        }),
-    }
-}
-
-fn eval_scalar_arg(
-    args: &[BoundExpr],
-    idx: usize,
-    id: u64,
-    embedding: &[f32],
-) -> Result<f64, SqlSurfaceError> {
-    match args.get(idx) {
-        Some(e) => match eval(e, id, embedding)? {
-            ExprValue::Scalar(s) => Ok(s),
-            _ => Err(SqlSurfaceError::Internal {
-                detail: "function argument type mismatch at evaluation time".to_string(),
-            }),
-        },
-        None => Err(SqlSurfaceError::Internal {
-            detail: "missing function argument at evaluation time".to_string(),
-        }),
-    }
-}
-
 /// 非有限値（NaN/∞）を fail-closed に拒否してスカラー値へ包む共通ヘルパー。
 /// `sql::expr_program::ExprProgram::eval` の `WasmCall` ステップも共有する
 /// （Issue #353。fail-closed 判定を 1 箇所に保つ）。
@@ -1190,6 +1657,12 @@ pub(crate) fn eval_binary<'a>(
     l: ExprValue<'a>,
     r: ExprValue<'a>,
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    // NULL 伝播（対象ビヘイビア: SQL-26。Issue #921）: 算術・比較のいずれかの
+    // オペランドが NULL なら結果は NULL（PostgreSQL の 3 値論理と同じ扱い。
+    // 比較の NULL は WHERE 述語側で UNKNOWN として非該当扱いになる）。
+    if matches!(l, ExprValue::Null) || matches!(r, ExprValue::Null) {
+        return Ok(ExprValue::Null);
+    }
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
@@ -1841,6 +2314,339 @@ mod tests {
         match result {
             ExprValue::Scalar(v) => assert!((v - 5.0).abs() < 1e-9),
             other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------
+
+    fn case_expr(whens: Vec<(Expr, Expr)>, else_result: Option<Expr>) -> Expr {
+        Expr::Case {
+            whens,
+            else_result: else_result.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn case_selects_matching_branch_and_evaluates_like_expanded_expression() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(
+            vec![(bin(BinOp::Gt, ident("id"), num("1")), num("10"))],
+            Some(num("0")),
+        );
+        let (bound, ty) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(ty, ExprType::Scalar);
+        assert_eq!(
+            eval(&bound, 2, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(10.0)
+        );
+        assert_eq!(
+            eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(0.0)
+        );
+    }
+
+    #[test]
+    fn case_without_else_evaluates_to_null_when_no_branch_matches() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(
+            vec![(bin(BinOp::Gt, ident("id"), num("100")), num("1"))],
+            None,
+        );
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn case_does_not_evaluate_unselected_branch_division_by_zero() {
+        // 選ばれない分岐の 0 除算はエラーにならない（defer-on-error。
+        // `sql::expr_program` のステップ列コンパイルと同じ契約）。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(
+            vec![(bin(BinOp::Eq, num("1"), num("1")), num("1"))],
+            Some(bin(BinOp::Div, num("1"), num("0"))),
+        );
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(
+            eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(1.0)
+        );
+    }
+
+    #[test]
+    fn case_when_condition_must_be_bool_else_datatype_mismatch() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(vec![(num("1"), num("1"))], Some(num("0")));
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "42804");
+    }
+
+    #[test]
+    fn case_branch_type_mismatch_is_datatype_mismatch() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(
+            vec![(bin(BinOp::Eq, num("1"), num("1")), ident("embedding"))],
+            Some(num("0")),
+        );
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "42804");
+    }
+
+    #[test]
+    fn case_with_only_null_results_is_feature_not_supported() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(vec![(bin(BinOp::Eq, num("1"), num("1")), Expr::Null)], None);
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn bare_null_outside_case_coalesce_nullif_is_feature_not_supported() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&Expr::Null, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn coalesce_returns_first_non_null_argument() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::Coalesce(vec![Expr::Null, Expr::Null, num("7"), num("8")]);
+        let (bound, ty) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(ty, ExprType::Scalar);
+        assert_eq!(
+            eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(7.0)
+        );
+    }
+
+    #[test]
+    fn coalesce_all_null_arguments_is_feature_not_supported() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::Coalesce(vec![Expr::Null, Expr::Null]);
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn coalesce_argument_type_mismatch_is_datatype_mismatch() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::Coalesce(vec![num("1"), ident("embedding")]);
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "42804");
+    }
+
+    #[test]
+    fn nullif_returns_null_when_equal_and_lhs_when_different() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::NullIf(Box::new(ident("id")), Box::new(num("2")));
+        let (bound, ty) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(ty, ExprType::Scalar);
+        assert_eq!(eval(&bound, 2, &[0.0, 0.0, 0.0]).unwrap(), ExprValue::Null);
+        assert_eq!(
+            eval(&bound, 3, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(3.0)
+        );
+    }
+
+    #[test]
+    fn nullif_rhs_null_returns_lhs() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::NullIf(Box::new(num("5")), Box::new(Expr::Null));
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(
+            eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(5.0)
+        );
+    }
+
+    #[test]
+    fn nullif_both_null_is_feature_not_supported() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::NullIf(Box::new(Expr::Null), Box::new(Expr::Null));
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn nullif_vector_argument_is_datatype_mismatch() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = Expr::NullIf(Box::new(ident("embedding")), Box::new(num("1")));
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "42804");
+    }
+
+    #[test]
+    fn defining_a_function_named_coalesce_or_nullif_is_rejected() {
+        let mut registry = UdfRegistry::default();
+        let err = define_function(&mut registry, "coalesce", &["x".to_string()], &ident("x"))
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        let err =
+            define_function(&mut registry, "NULLIF", &["x".to_string()], &ident("x")).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn defining_a_function_named_case_is_rejected() {
+        // Bugbot 指摘の回帰テスト（Issue #921）: `CASE` は `parse_primary_expr`
+        // が `'('` の有無を見ず常に文脈的キーワードとして消費するため、同名の
+        // UDF を許すと `case(...)` という呼び出しが構文解析段で CASE 式に
+        // 吸われ、定義した UDF を呼び出す手段が無くなってしまう。`COALESCE`／
+        // `NULLIF` と同じ理由で定義時に拒否する。
+        let mut registry = UdfRegistry::default();
+        let err =
+            define_function(&mut registry, "case", &["x".to_string()], &ident("x")).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn case_nesting_beyond_limit_is_rejected_at_bind_time() {
+        // 束縛段のネスト上限（`MAX_CASE_NESTING`）を、構文段を経由せず直接
+        // ネストした `Expr::Coalesce` を組み立てて検査する。
+        let mut expr = num("1");
+        for _ in 0..=MAX_CASE_NESTING {
+            expr = Expr::Coalesce(vec![expr]);
+        }
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn case_nesting_beyond_limit_is_rejected_after_udf_argument_inlining() {
+        // codex-review PR #1101 指摘（対象ビヘイビア: SQL-26。Issue #921）:
+        // 実引数が単体では上限 `MAX_CASE_NESTING` ちょうど（合法）でも、その
+        // 実引数を本体側でさらに `COALESCE` に包む UDF に渡すと、展開後の
+        // 実効ネストが上限を超える。呼び出し元の実引数束縛（合法）・UDF 本体の
+        // 定義時検証（`ident("x")` のみで合法）のどちらの計測時点でも単独では
+        // 超過が見えないため、`Expr::Ident` によるパラメータ展開時に検査しないと
+        // すり抜ける（`max_bound_case_nesting` 参照）。
+        let mut registry = UdfRegistry::default();
+        define_function(
+            &mut registry,
+            "wrap_once",
+            &["x".to_string()],
+            &Expr::Coalesce(vec![ident("x")]),
+        )
+        .expect("defining a 1-level-nesting UDF body should succeed");
+
+        let mut nested_arg = num("1");
+        for _ in 0..MAX_CASE_NESTING {
+            nested_arg = Expr::Coalesce(vec![nested_arg]);
+        }
+        // 実引数単体（`nested_arg`）はちょうど `MAX_CASE_NESTING` 段で合法。
+        let schema = schema_with_vector();
+        let mut budget = MAX_EXPR_NODES;
+        bind_expr(&nested_arg, &schema, &UdfRegistry::default(), &mut budget)
+            .expect("the argument alone must still be within the limit");
+
+        let call_expr = call("wrap_once", vec![nested_arg]);
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&call_expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn references_embedding_true_through_case_branch() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = case_expr(
+            vec![(bin(BinOp::Eq, num("1"), num("1")), ident("embedding"))],
+            Some(ident("embedding")),
+        );
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        assert!(references_embedding(&bound));
+    }
+
+    #[test]
+    fn vector_ref_evaluates_to_null_when_embedding_is_empty() {
+        // codex-review P1 指摘の回帰テスト（Issue #921）: `embedding` が空スライス
+        // （`VECTOR` 列が NULL。呼び出し元は非 NULL なら実データ・NULL なら空
+        // スライスで揃えて渡す契約）の行では `VectorRef` 自体が NULL として
+        // 評価される。`vec_norm(embedding)` のような builtin もこの NULL を
+        // strict 関数契約（`apply_builtin`）でそのまま伝播する。
+        assert_eq!(
+            eval(&BoundExpr::VectorRef, 1, &[]).unwrap(),
+            ExprValue::Null
+        );
+        let vec_norm_expr = BoundExpr::Builtin {
+            f: BuiltinFn::VecNorm,
+            args: vec![BoundExpr::VectorRef],
+        };
+        assert_eq!(eval(&vec_norm_expr, 1, &[]).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn case_selected_branch_without_embedding_reference_ignores_empty_embedding() {
+        // codex-review P1 指摘の回帰テスト（Issue #921）: `references_embedding`
+        // は式木全体を静的に走査するため、`CASE` の選ばれない分岐にだけ
+        // embedding 参照があるだけの式を「embedding を参照する式」と誤判定し、
+        // 旧実装はこの誤判定に基づき `dim == 0`（`embedding` が空スライス）の
+        // 行を無条件に NULL 扱いしていた。実際に選択される分岐（`THEN` 側）が
+        // embedding を一切参照しない場合は、`embedding` が空スライスでも
+        // 選ばれた分岐の値がそのまま返る必要がある（`Case` の短絡評価契約。
+        // 本モジュールの `eval` の `Case` 分岐参照）。
+        let expr = bound_case_expr(
+            vec![(
+                BoundExpr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(BoundExpr::IdRef),
+                    rhs: Box::new(BoundExpr::Number(2.0)),
+                },
+                BoundExpr::Number(1.0),
+            )],
+            BoundExpr::Builtin {
+                f: BuiltinFn::VecNorm,
+                args: vec![BoundExpr::VectorRef],
+            },
+        );
+        assert_eq!(eval(&expr, 2, &[]).unwrap(), ExprValue::Scalar(1.0));
+    }
+
+    /// [`references_embedding_true_through_case_branch`] 等の `case_expr`
+    /// ヘルパーは `Expr`（構文段）向けのため、束縛後の `BoundExpr::Case` を
+    /// 直接組み立てる本テスト専用の小さなヘルパー。
+    fn bound_case_expr(whens: Vec<(BoundExpr, BoundExpr)>, else_result: BoundExpr) -> BoundExpr {
+        BoundExpr::Case {
+            whens,
+            else_result: Box::new(else_result),
         }
     }
 }
