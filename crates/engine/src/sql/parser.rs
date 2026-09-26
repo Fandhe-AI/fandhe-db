@@ -4645,6 +4645,21 @@ fn collect_where_predicate_idents(
                 out.insert(column.clone());
             }
             WherePredicate::PredicateCall { .. } => {}
+            // Issue #927・SQL-29 (a)・TASK-213: `IN (SELECT ...)` の対象列
+            // `column` は外側スコープの通常の列参照であり、`Equality` 等と
+            // 同様にウィンドウ別名との衝突判定対象に含める必要がある。
+            // `inner_tokens`（内側の生トークン列）は内側スコープの識別子で
+            // あり、外側の WHERE 参照集合には含めない（未評価のまま保持
+            // されるだけで、束縛前にここへ到達する時点ではまだ列参照として
+            // 解決されていない。`sql::subquery::resolve_where_predicates` が
+            // 束縛前に解決し具体的な `WherePredicate` へ書き換える契約）。
+            WherePredicate::InSubquery { column, .. } => {
+                out.insert(column.clone());
+            }
+            // `EXISTS (SELECT ...)` は外側の列を一切参照しない（内側は常に
+            // 自分の FROM テーブルのスキーマのみで束縛される。
+            // `sql::subquery` モジュールドキュメント参照）。
+            WherePredicate::Exists { .. } => {}
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
             WherePredicate::Or(branches) => {
                 for branch in branches {
