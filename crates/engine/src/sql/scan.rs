@@ -1234,6 +1234,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -1300,6 +1301,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
