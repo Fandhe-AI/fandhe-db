@@ -342,7 +342,7 @@ fn compare_f64(a: f64, b: f64) -> Ordering {
 
 /// 同じ `OrderKind` 由来の 2 値を「昇順が自然な順序」として比較する（呼び出し元
 /// [`compare_order_key`] が ASC/DESC・NULL 位置を適用する前段）。異なる variant の
-/// 組み合わせは同一キーでは構築されない不変条件（[`extract_order_value`] が
+/// 組み合わせは同一キーでは構築されない不変条件（[`extract_order_value_ref`] が
 /// `BoundOrderKey::kind` に従って一意に variant を選ぶ）に反する状態のため、
 /// 到達しても安全側（`Ordering::Equal`）に倒す。
 fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
@@ -390,30 +390,46 @@ fn compare_order_key(a: Option<&OrderValue>, b: Option<&OrderValue>, descending:
     }
 }
 
-/// 可視行 1 件から `bound.order_by` の各キーの実行時比較値を抽出する（Issue #915）。
-/// `scanned` は呼び出し元（[`with_visible_row`]）が `DecodeTier::DimAndScalar` 以上で
-/// デコード済みの前提（`decode_tier_for` が ORDER BY のキー列を `scalar_mask` へ
-/// 反映するため、`bound.order_by` が非空なら常にこの前提を満たす）。列の実型が
-/// 束縛段（`sql::parser::bind_scalar_order_by`）で確定した `kind` と一致しない場合は
+/// [`OrderValue`] の借用版（Issue #915 追加是正: codex-review・Cursor Bugbot
+/// 指摘の 2 件に対応するため、経路 (B) パス 1 の候補判定を「複製せずに」行える
+/// ようにする中間表現）。`Bytes` のみ `&[u8]`（デコード済みバッファからの
+/// 借用）で、それ以外は `Copy` な値のため所有版と同じ表現を使う。
+#[derive(Debug, Clone, Copy)]
+enum ScalarKeyRef<'a> {
+    Id(u64),
+    Bytes(&'a [u8]),
+    SignedInt(i64),
+    Float(f64),
+    Bool(bool),
+    Numeric(crate::numeric::Decimal),
+    Uuid(crate::uuid::Uuid),
+    EnumOrdinal(usize),
+}
+
+/// 可視行 1 件から `bound.order_by` の各キーの実行時比較値を、複製せず
+/// 借用のまま抽出する（Issue #915）。`scanned` は呼び出し元
+/// （[`with_visible_row`]）が `DecodeTier::DimAndScalar` 以上でデコード済みの
+/// 前提（`decode_tier_for` が ORDER BY のキー列を `scalar_mask` へ反映するため、
+/// `bound.order_by` が非空なら常にこの前提を満たす）。列の実型が束縛段
+/// （`sql::parser::bind_scalar_order_by`）で確定した `kind` と一致しない場合は
 /// 実装バグとして `Internal`（`XX000`）を返す（fail-closed。untrusted 入力起因では
 /// なくスキーマとキー種別の対応が壊れているケース）。
 ///
-/// `max_result_bytes` は経路 (B) の候補ヒープ予算上限（codex-review PR #1096
-/// 追加是正: 本関数は TEXT キーを `Vec<u8>` へ複製するが、複製前の借用長
-/// （`t.len()`）が単独でこの上限を超える場合は、以降どの予算判定を通しても
-/// この候補が保持され得ないと確定できるため、[`try_alloc_text_for_budget`]
-/// と同方針で複製前に `54000` へ拒否し、無制限な確保を避ける。確保自体も
-/// `try_reserve_exact` で fallible にし、ホスト側メモリ不足時も abort ではなく
-/// `Err` を返す）。
-fn extract_order_value(
+/// TEXT キーの複製（`Vec<u8>` への所有化）・その際の予算照合はここでは行わない
+/// （呼び出し元が「この候補を実際に採用する」と決めた後にのみ
+/// [`scalar_key_ref_to_owned`] を呼ぶ設計。codex-review PR #1096 追加是正:
+/// 上位候補にならない大きな TEXT キーの行まで複製前に拒否してしまう問題・
+/// 複数 TEXT キーの合計長を見ずに 1 キーずつしか予算照合しない問題〔Cursor
+/// Bugbot 指摘〕への対応。詳細は [`predicted_heap_entry_bytes`]・
+/// [`compare_candidate_ref_to_entry`] 参照）。
+fn extract_order_value_ref<'a>(
     schema: &TableSchema,
     key: &BoundOrderKey,
     id: u64,
-    scanned: &[Option<row_codec::ScalarRef<'_>>],
-    max_result_bytes: usize,
-) -> Result<Option<OrderValue>, SqlSurfaceError> {
+    scanned: &'a [Option<row_codec::ScalarRef<'a>>],
+) -> Result<Option<ScalarKeyRef<'a>>, SqlSurfaceError> {
     let index = match key.target {
-        BoundOrderTarget::Id => return Ok(Some(OrderValue::Id(id))),
+        BoundOrderTarget::Id => return Ok(Some(ScalarKeyRef::Id(id))),
         BoundOrderTarget::Column(index) => index,
     };
     let value = match scanned.get(index) {
@@ -426,47 +442,34 @@ fn extract_order_value(
         .ok_or_else(|| scan_bug("order key column index out of range"))?;
     match (&column.ty, key.kind, value) {
         (ColumnType::Text, OrderKind::Bytes, row_codec::ScalarRef::Text(t)) => {
-            let bytes = t.as_bytes();
-            if bytes.len() > max_result_bytes {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "scan result exceeds capacity",
-                ));
-            }
-            let mut owned = Vec::new();
-            owned
-                .try_reserve_exact(bytes.len())
-                .map_err(|e| SqlSurfaceError::Internal {
-                    detail: format!("failed to reserve order key text field: {e}"),
-                })?;
-            owned.extend_from_slice(bytes);
-            Ok(Some(OrderValue::Bytes(owned)))
+            Ok(Some(ScalarKeyRef::Bytes(t.as_bytes())))
         }
         (ColumnType::Integer, OrderKind::SignedInt, row_codec::ScalarRef::Integer(v)) => {
-            Ok(Some(OrderValue::SignedInt(i64::from(*v))))
+            Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v))))
         }
         (ColumnType::BigInt, OrderKind::SignedInt, row_codec::ScalarRef::BigInt(v)) => {
-            Ok(Some(OrderValue::SignedInt(*v)))
+            Ok(Some(ScalarKeyRef::SignedInt(*v)))
         }
         (ColumnType::Date, OrderKind::SignedInt, row_codec::ScalarRef::Date(v)) => {
-            Ok(Some(OrderValue::SignedInt(i64::from(*v))))
+            Ok(Some(ScalarKeyRef::SignedInt(i64::from(*v))))
         }
         (ColumnType::Timestamp, OrderKind::SignedInt, row_codec::ScalarRef::Timestamp(v)) => {
-            Ok(Some(OrderValue::SignedInt(*v)))
+            Ok(Some(ScalarKeyRef::SignedInt(*v)))
         }
         (ColumnType::Real, OrderKind::Float, row_codec::ScalarRef::Real(v)) => {
-            Ok(Some(OrderValue::Float(f64::from(*v))))
+            Ok(Some(ScalarKeyRef::Float(f64::from(*v))))
         }
         (ColumnType::Double, OrderKind::Float, row_codec::ScalarRef::Double(v)) => {
-            Ok(Some(OrderValue::Float(*v)))
+            Ok(Some(ScalarKeyRef::Float(*v)))
         }
         (ColumnType::Boolean, OrderKind::Bool, row_codec::ScalarRef::Bool(v)) => {
-            Ok(Some(OrderValue::Bool(*v)))
+            Ok(Some(ScalarKeyRef::Bool(*v)))
         }
         (ColumnType::Numeric { .. }, OrderKind::Numeric, row_codec::ScalarRef::Numeric(v)) => {
-            Ok(Some(OrderValue::Numeric(*v)))
+            Ok(Some(ScalarKeyRef::Numeric(*v)))
         }
         (ColumnType::Uuid, OrderKind::Uuid, row_codec::ScalarRef::Uuid(v)) => {
-            Ok(Some(OrderValue::Uuid(*v)))
+            Ok(Some(ScalarKeyRef::Uuid(*v)))
         }
         (ColumnType::Enum(def), OrderKind::Enum, row_codec::ScalarRef::Enum(_)) => {
             let text = value
@@ -477,10 +480,137 @@ fn extract_order_value(
                 .iter()
                 .position(|label| label == text)
                 .ok_or_else(|| scan_bug("ENUM order key value is not in the declared label set"))?;
-            Ok(Some(OrderValue::EnumOrdinal(ordinal)))
+            Ok(Some(ScalarKeyRef::EnumOrdinal(ordinal)))
         }
         _ => Err(scan_bug("order key scalar/column type mismatch")),
     }
+}
+
+/// [`ScalarKeyRef`] を所有値（[`OrderValue`]）へ変換する（採用が確定した候補
+/// にのみ呼ぶ。Issue #915 追加是正）。TEXT（`Bytes`）のみ確保が必要で、
+/// `try_reserve_exact` によりホスト側メモリ不足時も abort ではなく `Err` を
+/// 返す（`try_alloc_text_for_budget` と同方針）。呼び出し元が予算照合
+/// （[`predicted_heap_entry_bytes`] との比較）を先に済ませている前提のため、
+/// ここでは長さの上限判定を重ねて行わない。
+fn scalar_key_ref_to_owned(value: ScalarKeyRef<'_>) -> Result<OrderValue, SqlSurfaceError> {
+    Ok(match value {
+        ScalarKeyRef::Id(v) => OrderValue::Id(v),
+        ScalarKeyRef::Bytes(b) => {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(b.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve order key text field: {e}"),
+                })?;
+            owned.extend_from_slice(b);
+            OrderValue::Bytes(owned)
+        }
+        ScalarKeyRef::SignedInt(v) => OrderValue::SignedInt(v),
+        ScalarKeyRef::Float(v) => OrderValue::Float(v),
+        ScalarKeyRef::Bool(v) => OrderValue::Bool(v),
+        ScalarKeyRef::Numeric(v) => OrderValue::Numeric(v),
+        ScalarKeyRef::Uuid(v) => OrderValue::Uuid(v),
+        ScalarKeyRef::EnumOrdinal(v) => OrderValue::EnumOrdinal(v),
+    })
+}
+
+/// [`ScalarKeyRef`] 1 件分と [`OrderValue`] 1 件分を「昇順が自然な順序」として
+/// 比較する（呼び出し元 [`compare_ref_key`] が ASC/DESC・NULL 位置を適用する
+/// 前段。[`compare_order_values`] の借用対応版・比較規約は完全に同一）。
+fn compare_ref_and_owned_values(a: &ScalarKeyRef<'_>, b: &OrderValue) -> Ordering {
+    match (a, b) {
+        (ScalarKeyRef::Id(x), OrderValue::Id(y)) => x.cmp(y),
+        (ScalarKeyRef::Bytes(x), OrderValue::Bytes(y)) => (*x).cmp(y.as_slice()),
+        (ScalarKeyRef::SignedInt(x), OrderValue::SignedInt(y)) => x.cmp(y),
+        (ScalarKeyRef::Float(x), OrderValue::Float(y)) => compare_f64(*x, *y),
+        (ScalarKeyRef::Bool(x), OrderValue::Bool(y)) => x.cmp(y),
+        (ScalarKeyRef::Numeric(x), OrderValue::Numeric(y)) => crate::numeric::cmp_exact(x, y),
+        (ScalarKeyRef::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
+        (ScalarKeyRef::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
+/// [`compare_order_key`] の借用対応版（NULL 位置・降順の適用規約は同一）。
+fn compare_ref_key(
+    a: Option<&ScalarKeyRef<'_>>,
+    b: Option<&OrderValue>,
+    descending: bool,
+) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if descending {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if descending {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(x), Some(y)) => {
+            let base = compare_ref_and_owned_values(x, y);
+            if descending {
+                base.reverse()
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// 経路 (B) パス 1 の候補（借用のまま、`refs`・`id`・`tenant_id`）を、ヒープが
+/// 保持中の 1 件（`other`）と比較する（[`HeapEntry::order`] の借用対応版。
+/// Issue #915 追加是正: ヒープ満杯時にこの関数で「採用されるか」を複製前に
+/// 判定し、採用されない候補（`Ordering::Less` 以外）は一切複製・確保しない。
+/// `order_by` は `other.spec` と同一の並べ替え仕様である前提〔同一クエリの
+/// 候補は必ず同じ `bound.order_by` から生成される〕）。戻り値は
+/// `HeapEntry::order` と同じく「昇順ソートすると最終的な出力順になる」意味の
+/// `Ordering`。
+fn compare_candidate_ref_to_entry(
+    order_by: &[BoundOrderKey],
+    refs: &[Option<ScalarKeyRef<'_>>],
+    id: u64,
+    tenant_id: &str,
+    other: &HeapEntry,
+) -> Ordering {
+    for (idx, key) in order_by.iter().enumerate() {
+        let a = refs.get(idx).and_then(|o| o.as_ref());
+        let b = other.keys.get(idx).and_then(|o| o.as_ref());
+        let ord = compare_ref_key(a, b, key.descending);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    match id.cmp(&other.id) {
+        Ordering::Equal => tenant_id.as_bytes().cmp(other.tenant_id.as_bytes()),
+        id_ord => id_ord,
+    }
+}
+
+/// `refs`（複製前の候補キー集合）が確保すれば占めるであろう [`heap_entry_bytes`]
+/// を、複製せず借用長だけから見積もる（Issue #915 追加是正: Cursor Bugbot
+/// 指摘「複数 TEXT キーの合計長を見ずに 1 キーずつしか予算照合しない」への
+/// 対応。`heap_entry_bytes` と同じ計算式を、実際に複製する前に借用長だけで
+/// 再現する。両者の対応は `heap_entry_bytes_matches_predicted_heap_entry_bytes`
+/// で固定する）。
+fn predicted_heap_entry_bytes(refs: &[Option<ScalarKeyRef<'_>>], tenant_id_len: usize) -> usize {
+    let mut bytes = std::mem::size_of::<HeapEntry>();
+    bytes = bytes.saturating_add(
+        refs.len()
+            .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
+    );
+    for r in refs {
+        if let Some(ScalarKeyRef::Bytes(b)) = r {
+            bytes = bytes.saturating_add(b.len());
+        }
+    }
+    bytes.saturating_add(tenant_id_len)
 }
 
 /// [`BoundScan`] を実行する（Issue #454・TASK-186・NOSQL-3 の公開 API）。
@@ -521,7 +651,7 @@ pub fn execute_scan(
 /// `Some` へ包んで返す。可視でない・`WHERE` を満たさない行は `Ok(None)`
 /// （呼び出し元は「打ち切りではなくスキップ」として扱う）。`build` は投影段の
 /// 組み立て（[`build_projected_cells`]）・ORDER BY キー抽出
-/// （[`extract_order_value`]）のいずれの用途にも使う。
+/// （[`extract_order_value_ref`]）のいずれの用途にも使う。
 #[allow(clippy::too_many_arguments)]
 fn with_visible_row<T>(
     buf: &[u8],
@@ -1316,7 +1446,19 @@ pub(crate) fn execute_scan_with_budget(
             let (k, v) = entry.map_err(storage_internal)?;
             let (key_tenant, id) = k.value();
             let buf = v.value();
-            let candidate_keys = with_visible_row(
+            // codex-review PR #1096 追加是正（P1 2 件・Cursor Bugbot 1 件の統合
+            // 是正）: 複製（`scalar_key_ref_to_owned`）はこの build クロージャの
+            // 「最後」でのみ行う。まず `extract_order_value_ref` で全キーを
+            // 借用のまま取り出し、(1) ヒープが満杯なら複製前に
+            // `compare_candidate_ref_to_entry` で現在の最悪候補と比較し、
+            // 採用されない（`Ordering::Less` でない）候補は一切複製・確保せず
+            // `Ok(None)` で抜ける（上位候補にならない大きな TEXT キーの行が
+            // クエリ全体を不要に拒否するのを防ぐ）。(2) 採用される・またはヒープに
+            // まだ空きがある場合のみ、全キー合計長・`keys` 配列容量・候補保持量を
+            // 単一の [`predicted_heap_entry_bytes`] で確保前に照合する
+            // （複数 TEXT キーの合計長を見ずに 1 キーずつしか照合しない旧実装の
+            // 抜け穴を解消）。
+            let decision = with_visible_row(
                 buf,
                 key_tenant,
                 id,
@@ -1329,20 +1471,45 @@ pub(crate) fn execute_scan_with_budget(
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |_dim, scanned, _embedding| {
-                    let mut keys = Vec::with_capacity(bound.order_by.len());
+                    let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
+                        Vec::with_capacity(bound.order_by.len());
                     for key in &bound.order_by {
-                        keys.push(extract_order_value(
-                            schema,
-                            key,
-                            id,
-                            scanned,
-                            max_result_bytes,
-                        )?);
+                        refs.push(extract_order_value_ref(schema, key, id, scanned)?);
                     }
-                    Ok(keys)
+                    if heap.len() >= heap_capacity {
+                        let worst = heap.peek().ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "heap reported at capacity but is empty".to_string(),
+                        })?;
+                        let cmp = compare_candidate_ref_to_entry(
+                            &bound.order_by,
+                            &refs,
+                            id,
+                            key_tenant,
+                            worst,
+                        );
+                        if cmp != Ordering::Less {
+                            // 現在の最悪候補以上（採用されない）。複製せずスキップ。
+                            return Ok(None);
+                        }
+                        let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
+                        let remaining_after_evict =
+                            heap_budget.saturating_sub(heap_entry_bytes(worst));
+                        try_accumulate_budget(remaining_after_evict, predicted, max_result_bytes)?;
+                    } else {
+                        let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
+                        try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
+                    }
+                    let mut keys = Vec::with_capacity(refs.len());
+                    for r in refs {
+                        keys.push(match r {
+                            Some(v) => Some(scalar_key_ref_to_owned(v)?),
+                            None => None,
+                        });
+                    }
+                    Ok(Some(keys))
                 },
             )?;
-            let Some(keys) = candidate_keys else {
+            let Some(Some(keys)) = decision else {
                 continue;
             };
             let candidate = HeapEntry {
@@ -1356,18 +1523,17 @@ pub(crate) fn execute_scan_with_budget(
                 heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
                 heap.push(candidate);
             } else {
-                let should_replace = heap
-                    .peek()
-                    .map(|worst| candidate.cmp(worst) == Ordering::Less)
-                    .unwrap_or(false);
-                if should_replace {
-                    if let Some(popped) = heap.pop() {
-                        heap_budget = heap_budget.saturating_sub(heap_entry_bytes(&popped));
-                    }
-                    let bytes = heap_entry_bytes(&candidate);
-                    heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
-                    heap.push(candidate);
+                if let Some(popped) = heap.pop() {
+                    heap_budget = heap_budget.checked_sub(heap_entry_bytes(&popped)).ok_or_else(
+                        || SqlSurfaceError::Internal {
+                            detail: "scan result byte budget underflow while evicting the worst heap candidate"
+                                .to_string(),
+                        },
+                    )?;
                 }
+                let bytes = heap_entry_bytes(&candidate);
+                heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                heap.push(candidate);
             }
         }
 
@@ -1426,43 +1592,60 @@ pub(crate) fn execute_scan_with_budget(
         // `with_visible_row` 呼び出し（`embedding_scratch`／
         // `where_expr_scratch` を直接可変借用）と本クロージャの捕捉が
         // 重ならないようにする（Issue #915）。
-        let mut build_visible_row = |key_tenant: &str, id: u64, buf: &[u8]| {
-            with_visible_row(
-                buf,
-                key_tenant,
-                id,
-                schema,
-                bound,
-                tier,
-                &scalar_mask,
-                expected_dim,
-                ctx,
-                &mut embedding_scratch,
-                &mut where_expr_scratch,
-                |dim, scanned, embedding| {
-                    byte_budget =
-                        try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
-                    let cells = build_projected_cells(
-                        schema,
-                        bound,
-                        tier,
-                        id,
-                        dim,
-                        embedding,
-                        scanned,
-                        &computed_programs,
-                        &mut proj_expr_scratch,
-                        &mut byte_budget,
-                        max_result_bytes,
-                    )?;
-                    Ok(ResultRow {
-                        id,
-                        score: 0.0,
-                        cells,
-                    })
-                },
-            )
-        };
+        // codex-review PR #1096 追加是正（P1）: `winner` は投影後（または
+        // 投影中にエラーで打ち切られた場合も含め）このループの 1 反復で
+        // 破棄されるため、パス 1 が計上したヒープ予算分（`release_heap_bytes`。
+        // 呼び出し元が `heap_entry_bytes(&winner)` を渡す）を投影コストの計上
+        // より前に解放する。offset スキップ済み候補の解放（上のループ）と
+        // 対称に `checked_sub` を使い、対応が崩れていれば fail-closed に
+        // `Internal` へ落とす。
+        let mut build_visible_row =
+            |key_tenant: &str, id: u64, buf: &[u8], release_heap_bytes: usize| {
+                with_visible_row(
+                    buf,
+                    key_tenant,
+                    id,
+                    schema,
+                    bound,
+                    tier,
+                    &scalar_mask,
+                    expected_dim,
+                    ctx,
+                    &mut embedding_scratch,
+                    &mut where_expr_scratch,
+                    |dim, scanned, embedding| {
+                        byte_budget = byte_budget.checked_sub(release_heap_bytes).ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "scan result byte budget underflow while releasing a projected candidate"
+                                .to_string(),
+                        }
+                    })?;
+                        byte_budget = try_accumulate_budget(
+                            byte_budget,
+                            per_row_struct_bytes,
+                            max_result_bytes,
+                        )?;
+                        let cells = build_projected_cells(
+                            schema,
+                            bound,
+                            tier,
+                            id,
+                            dim,
+                            embedding,
+                            scanned,
+                            &computed_programs,
+                            &mut proj_expr_scratch,
+                            &mut byte_budget,
+                            max_result_bytes,
+                        )?;
+                        Ok(ResultRow {
+                            id,
+                            score: 0.0,
+                            cells,
+                        })
+                    },
+                )
+            };
 
         for winner in sorted_winners {
             let guard = table
@@ -1476,7 +1659,9 @@ pub(crate) fn execute_scan_with_budget(
                 });
             };
             let buf = guard.value();
-            let row = build_visible_row(winner.tenant_id.as_str(), winner.id, buf)?;
+            let winner_heap_bytes = heap_entry_bytes(&winner);
+            let row =
+                build_visible_row(winner.tenant_id.as_str(), winner.id, buf, winner_heap_bytes)?;
             let Some(row) = row else {
                 return Err(SqlSurfaceError::Internal {
                     detail: "scan row scan failed: ordered row became invisible on second pass"
@@ -1676,35 +1861,42 @@ mod tests {
         );
         storage.create_table(&schema).expect("create table");
 
+        // codex-review PR #1096 追加是正（P1）の回帰も兼ねるため 2 行にする
+        // （1 行だけだと、パス 2 で唯一の候補を消費した瞬間にヒープ予算が
+        // 解放されて予算超過を再現できない）。両行とも同じ長さの TEXT キーを
+        // 持たせ、`heap_capacity`〔`limit + offset` = 2〕に等しい 2 行のみを
+        // 用意することで、パス 1 終了時点で両方が退避されずヒープに残る。
         let tag_value = "x".repeat(2000);
         let tenant_id = "tenant-a";
-        let write_txn = storage.db().begin_write().expect("begin_write");
-        {
-            let mut table = write_txn
-                .open_table(crate::catalog::user_rows_table_def(
-                    &crate::catalog::user_rows_table_name("docs"),
-                ))
-                .expect("open row table");
-            let metadata = crate::row_codec::encode_scalar_columns(
-                &schema,
-                &[
-                    crate::row_codec::Value::Null,
-                    crate::row_codec::Value::Text(tag_value.clone()),
-                ],
-            )
-            .expect("encode scalar columns");
-            let buf = crate::storage::encode_row(&RowInput {
-                tenant_id,
-                visibility: Visibility::Public,
-                embedding: &[],
-                metadata: &metadata,
-            })
-            .expect("encode row");
-            table
-                .insert((tenant_id, 1u64), buf.as_slice())
-                .expect("insert row");
+        for id in 1..=2u64 {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::catalog::user_rows_table_def(
+                        &crate::catalog::user_rows_table_name("docs"),
+                    ))
+                    .expect("open row table");
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[
+                        crate::row_codec::Value::Null,
+                        crate::row_codec::Value::Text(tag_value.clone()),
+                    ],
+                )
+                .expect("encode scalar columns");
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id,
+                    visibility: Visibility::Public,
+                    embedding: &[],
+                    metadata: &metadata,
+                })
+                .expect("encode row");
+                table
+                    .insert((tenant_id, id), buf.as_slice())
+                    .expect("insert row");
+            }
+            crate::storage::bump_generation_and_commit(write_txn).expect("commit");
         }
-        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
 
         let ctx = PolicyContext::new(tenant_id).expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
@@ -1722,7 +1914,7 @@ mod tests {
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
-            limit: 1,
+            limit: 2,
             order_by: vec![crate::sql::parser::BoundOrderKey {
                 target: crate::sql::parser::BoundOrderTarget::Column(1),
                 kind: crate::sql::parser::OrderKind::Bytes,
@@ -1734,7 +1926,7 @@ mod tests {
 
         // パス 1 のヒープ候補 1 件分（`heap_entry_bytes` と同じ計算式）と、
         // パス 2 の投影結果 1 行分（`per_row_struct_bytes` + テキスト実体）を
-        // それぞれ単独で見積もる。
+        // それぞれ単独で見積もる（2 行とも同じ値になる）。
         let heap_entry_bytes_estimate = std::mem::size_of::<HeapEntry>()
             .saturating_add(
                 bound
@@ -1753,24 +1945,43 @@ mod tests {
             .saturating_add(result_row_struct_bytes)
             .saturating_add(tag_value.len());
 
-        // 単独ではどちらも収まるが合計では超過する予算（各見積りの大きい方に
-        // 小さな余白を足しただけの値）を用意する。
-        let cap = heap_entry_bytes_estimate.max(per_row_bytes_estimate) + 8;
+        // codex-review PR #1096 追加是正（P1）: パス 2 は消費した候補ごとに
+        // `heap_entry_bytes` を解放してから投影コストを計上するため、真に
+        // 必要な予算のピークは「開始時点で 2 候補分」「1 候補消費後は
+        // 残り 1 候補分 + 投影済み 1 行分」「両方消費後は投影済み 2 行分」の
+        // 最大値に留まる（旧実装は解放せず、候補・結果の両方を最後まで
+        // 累積計上していたため `2*(heap + per_row)` まで要求していた）。
+        let true_peak = (2 * heap_entry_bytes_estimate)
+            .max(heap_entry_bytes_estimate + per_row_bytes_estimate)
+            .max(2 * per_row_bytes_estimate);
+        let old_buggy_cumulative_total =
+            (2 * heap_entry_bytes_estimate).saturating_add(2 * per_row_bytes_estimate);
+        let fits_true_peak_cap = true_peak + 8;
         assert!(
-            cap < heap_entry_bytes_estimate.saturating_add(per_row_bytes_estimate),
-            "test cap must fall strictly between the per-side estimate and their combined total \
-             to exercise the shared-budget fix"
+            fits_true_peak_cap < old_buggy_cumulative_total,
+            "test cap must fall strictly between the corrected peak and the old buggy \
+             cumulative total to exercise the per-candidate release fix"
         );
 
         // 十分大きい既定予算では成功する。
         execute_scan(&read_txn, &ctx, &schema, &bound).expect("default budget should succeed");
 
-        // 候補側・結果側それぞれ単独では収まるが合計では超過する予算では、
-        // 行生成中に打ち切られる（旧実装は `heap_budget` と `byte_budget` を
-        // 独立に判定していたためここを通過してしまっていた）。
-        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, cap).expect_err(
-            "combined candidate+result bytes must exceed the caller-supplied cap on path (B)",
-        );
+        // codex-review PR #1096 追加是正（P1）の回帰: 真に必要なピーク予算
+        // ぎりぎりでは成功する（旧実装がここを `54000` で誤って拒否していた
+        // 予算値。消費済み候補のヒープ予算を解放しないと、2 候補分の
+        // ヒープ予算に 2 行分の投影結果が積み上がり、この予算を超過する）。
+        let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, fits_true_peak_cap)
+            .expect(
+                "consumed heap candidates must release their budget before projecting the result",
+            );
+        assert_eq!(result.rows.len(), 2);
+
+        // 各候補・結果の 1 件分単独では収まるが、解放せず単純合算すると
+        // 超過する極小予算では引き続き `54000` で拒否される（予算判定自体が
+        // 無効化されたわけではないことを固定する）。
+        let tiny_cap = 8;
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, tiny_cap)
+            .expect_err("a cap smaller than a single candidate's own bytes must still be rejected");
         assert_eq!(err.wire_code(), "54000");
     }
 
@@ -1799,6 +2010,48 @@ mod tests {
             diff >= option_order_value_size * 7,
             "keys 配列の容量差が heap_entry_bytes に反映されていない: diff={diff}, \
              option_order_value_size={option_order_value_size}"
+        );
+    }
+
+    /// codex-review PR #1096 追加是正の回帰（Cursor Bugbot 指摘）: 複製前に
+    /// 借用長だけで見積もる [`predicted_heap_entry_bytes`] が、実際に複製した
+    /// 後の [`heap_entry_bytes`] と一致することを固定する（TEXT キー複数本を
+    /// 含む場合の合計長のずれ・計算式の drift を検知する回帰。過去に
+    /// `heap_entry_bytes` 自体の計算式が一度ずれた実績があるため、2 つの
+    /// 独立した実装を突き合わせる）。
+    #[test]
+    fn heap_entry_bytes_matches_predicted_heap_entry_bytes() {
+        let tenant_id = "tenant-ab";
+        let text_a = "x".repeat(37);
+        let text_b = "y".repeat(4001);
+        let refs = vec![
+            Some(ScalarKeyRef::Bytes(text_a.as_bytes())),
+            Some(ScalarKeyRef::Id(42)),
+            None,
+            Some(ScalarKeyRef::Bytes(text_b.as_bytes())),
+        ];
+        // 実装（pass 1）と同じく `Vec::with_capacity(refs.len())` + push で
+        // 構築する（`collect()` はサイズヒント次第で容量が一致しない可能性が
+        // あるため、`heap_entry_bytes` の容量ベース計上と確実に揃える）。
+        let mut owned_keys: Vec<Option<OrderValue>> = Vec::with_capacity(refs.len());
+        for r in &refs {
+            owned_keys
+                .push(r.map(|v| scalar_key_ref_to_owned(v).expect("fallible alloc must succeed")));
+        }
+        let spec: Rc<[BoundOrderKey]> = Rc::from(Vec::<BoundOrderKey>::new());
+        let entry = HeapEntry {
+            keys: owned_keys,
+            tenant_id: tenant_id.to_string(),
+            id: 1,
+            spec,
+        };
+
+        assert_eq!(
+            heap_entry_bytes(&entry),
+            predicted_heap_entry_bytes(&refs, tenant_id.len()),
+            "predicted_heap_entry_bytes must exactly match heap_entry_bytes for the same \
+             candidate, otherwise the pre-copy budget check and the post-copy accounting can \
+             disagree"
         );
     }
 
@@ -1929,11 +2182,13 @@ mod tests {
         assert_eq!(ids, vec![6, 7]);
     }
 
-    /// codex-review PR #1096 追加是正の回帰: 経路 (B) の並べ替えキー抽出
-    /// （[`extract_order_value`]）は、単独で `max_result_bytes` を超える TEXT
-    /// キーを `to_vec()` で複製する前に長さを予算と照合し、`54000` で拒否する
-    /// （AGENTS.md の無制限リソース確保回避。修正前は複製後にしか判定せず、
-    /// 大きな TEXT 値・小さい予算〔`DECLARE CURSOR`〕の組合せで判定前に
+    /// codex-review PR #1096 追加是正の回帰: 経路 (B) がヒープにまだ空きが
+    /// あり候補を必ず追加する場合（[`predicted_heap_entry_bytes`] を
+    /// [`extract_order_value_ref`] の借用結果から算出し、複製〔`to_vec`〕する
+    /// 前に予算照合する）、単独で `max_result_bytes` を超える TEXT キーは
+    /// `54000` で拒否する（AGENTS.md の無制限リソース確保回避。修正前は複製後
+    /// にしか判定せず、大きな TEXT 値・小さい予算〔`DECLARE CURSOR`〕の
+    /// 組合せで判定前に
     /// 過大確保が起こり得た）。
     #[test]
     fn path_b_order_by_text_key_larger_than_budget_is_rejected_before_copying() {
@@ -1996,6 +2251,87 @@ mod tests {
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
             .expect_err("a single ORDER BY key larger than the cap must be rejected");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review PR #1096 追加是正の回帰（P1・最新ラウンド）: 経路 (B) は
+    /// ヒープが満杯（`heap.len() >= heap_capacity`）の時、複製前に借用値のまま
+    /// 現在の最悪候補と比較し、採用されない（上位候補にならない）行は複製・
+    /// 予算照合の対象にしない。修正前は複製前の借用長を無条件に
+    /// `max_result_bytes` と照合していたため、上位候補にならないほど大きな
+    /// TEXT キーを持つ行が 1 件でも存在するだけでクエリ全体を `54000` へ
+    /// 誤って拒否していた（例: `ORDER BY text_col ASC LIMIT 1` で既に小さい
+    /// キーの勝者があり、後続行の巨大なキーが明らかに後順位でも拒否されて
+    /// いた）。
+    #[test]
+    fn path_b_large_key_that_never_becomes_a_top_candidate_does_not_reject_the_query() {
+        let path = unique_db_path("scan-path-b-loser-large-key");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("tag", ColumnType::Text, true)]);
+        storage.create_table(&schema).expect("create table");
+
+        let write_row = |id: u64, tag: &str| {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::catalog::user_rows_table_def(
+                        &crate::catalog::user_rows_table_name("docs"),
+                    ))
+                    .expect("open row table");
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[crate::row_codec::Value::Text(tag.to_string())],
+                )
+                .expect("encode scalar columns");
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[],
+                    metadata: &metadata,
+                })
+                .expect("encode row");
+                table
+                    .insert(("tenant-a", id), buf.as_slice())
+                    .expect("insert row");
+            }
+            crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+        };
+
+        // id を昇順にした物理走査順どおりに、まず小さい TEXT キーの行 2 件で
+        // ヒープ（`heap_capacity` = `limit + offset` = 2）を満杯にしてから、
+        // 昇順ソートで明らかに最後尾（"z" は "a"/"b" より大きい）になる巨大な
+        // TEXT キーの行を末尾の id に置く。
+        write_row(1, "a");
+        write_row(2, "b");
+        let huge_tag = "z".repeat(200_000);
+        write_row(3, &huge_tag);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 2,
+            order_by: vec![crate::sql::parser::BoundOrderKey {
+                target: crate::sql::parser::BoundOrderTarget::Column(0),
+                kind: crate::sql::parser::OrderKind::Bytes,
+                descending: false,
+            }],
+            offset: 0,
+            windows: Vec::new(),
+        };
+
+        // 巨大なキーを複製すれば単独でも超過するが、上位候補にならないため
+        // 複製されず、実際に採用される 2 件（"a"・"b"）だけなら十分収まる
+        // 予算。
+        let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
+            .expect("a row whose key never becomes a top candidate must not be copied or rejected");
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     /// codex-review PR #1096 追加是正の回帰: 経路 (B) パス 2 で `OFFSET` に
