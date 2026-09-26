@@ -354,6 +354,11 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         // `check_predicate_columns_within` が `Or` を個別に再帰処理するため
         // 到達しない（本関数へは単純形の述語のみが渡る）。
         WherePredicate::Or(_) => None,
+        // Issue #927・SQL-29 (a)・TASK-213: `<列> IN (SELECT ...)` の `column` は
+        // 外側クエリが参照する実在の列（ビューの公開列範囲チェック対象）。
+        // `EXISTS (...)` は外側の列を参照しないため対象外。
+        WherePredicate::InSubquery { column, .. } => Some(column),
+        WherePredicate::Exists { .. } => None,
     }
 }
 

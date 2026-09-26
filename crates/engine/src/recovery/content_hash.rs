@@ -1043,6 +1043,15 @@ fn push_dml_where_predicate(
                 }
             }
         }
+        // Issue #927・SQL-29 (a)・TASK-213: サブクエリは述語形 `UPDATE`/`DELETE`
+        // の WHERE では構文解析段（`Parser::require_subquery_depth`）が既定
+        // `subquery_ctx == None` により `42601` で拒否するため、DML の content
+        // hash 対象へ到達しない（fail-closed の防御的経路）。
+        WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "unresolved subquery reached DML content hash".to_string(),
+            });
+        }
     }
     Ok(())
 }
