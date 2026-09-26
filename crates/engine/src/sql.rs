@@ -170,6 +170,7 @@ pub(crate) mod scalar_plan;
 pub mod scan;
 pub(crate) mod sparse_cache;
 pub mod statement_splitter;
+pub(crate) mod subquery;
 pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
