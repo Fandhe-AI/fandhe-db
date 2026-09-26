@@ -818,6 +818,62 @@ fn exists_subquery_select_star_with_large_text_column_is_false_for_other_tenant_
     );
 }
 
+// PR #1103 再々レビュー codex-review P1 指摘の回帰テスト: `EXISTS` の内側を
+// `InnerScanIntent::ExistenceOnly`（投影を空へ差し替え）で評価する際、投影の
+// 差し替えは元の投影を束縛・検証した**後**に行う。差し替えを先に行うと、
+// `EXISTS (SELECT <存在しない列> FROM ... LIMIT 1)` のような不正な内側
+// クエリが、実際には使わないという理由だけで列検証をすり抜け、可視行の
+// 有無だけで成否が決まってしまう（列検証・エラー契約を破る）。可視行の
+// 有無に関わらず（0 行・1 行以上のいずれでも）、通常の `SELECT` の
+// 未知列と同じ `22000`（`unknown column`）で拒否されることを固定する。
+
+#[test]
+fn exists_subquery_unknown_column_projection_is_rejected_without_visible_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    // visits は空のまま（可視行なし）。
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT nonexistent_col FROM {VISITS} LIMIT 1) \
+             LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("unknown column")
+    ));
+}
+
+#[test]
+fn exists_subquery_unknown_column_projection_is_rejected_with_visible_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    // visits に可視行が 1 件存在する（行の有無だけでは成功しないことの確認）。
+    insert_visit(&core, &ctx, 1, "hit");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT nonexistent_col FROM {VISITS} LIMIT 1) \
+             LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("unknown column")
+    ));
+}
+
 // --- RLS 境界（RECOVER-4 と同型: テナント越境なし） -------------------------
 
 #[test]

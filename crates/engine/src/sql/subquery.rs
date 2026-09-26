@@ -297,6 +297,24 @@ fn execute_inner_scan(
         // 差し替えても「`OFFSET` 分だけ読み飛ばした後に可視行が 1 件以上
         // あるか」という元の意味論と同値になる）。
         super::parser::validate_search_limit(validated.limit)?;
+        // ユーザー指定の投影も、実行用に空へ差し替える前に必ず束縛検証する
+        // （PR #1103 追加 codex-review P1 指摘対応: 検証前に入力を差し替え
+        // ない。差し替えを先に行うと、`EXISTS (SELECT missing_column FROM
+        // ... LIMIT 1)` のような存在しない列・非対応の投影を指定した内側
+        // クエリが、実際には使わないという理由だけで列検証をすり抜け、
+        // 可視行の有無だけで成否が決まってしまう＝列検証・エラー契約を
+        // 破ってしまう）。ここでの束縛結果自体は使わない（`bind_projection`
+        // が返す `Result` のエラーだけを見る）ため、専用の `node_budget` を
+        // 新規に用意する（式項目のノード数上限 `MAX_EXPR_NODES` は呼び出し
+        // ごとに独立というのが `bind_scan` 等の既存契約であり、ここでも
+        // 同じ契約を保つ）。
+        let mut probe_node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+        super::parser::bind_projection(
+            &validated.projection,
+            &inner_schema,
+            udfs,
+            &mut probe_node_budget,
+        )?;
         validated.projection = super::allowlist::Projection::Columns(Vec::new());
         validated.limit = 1;
     }

@@ -139,6 +139,17 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 （`execute_scan`）より前に検査するよう修正した（`resolve_in_subquery` 側の
 実行後チェックは多層防御として残す）。
 
+- `EXISTS (SELECT ...)` の投影を空へ差し替えるタイミングは、元の投影を
+  `sql::parser::bind_projection` で束縛・検証した**後**に限る（PR #1103
+  再々レビュー codex-review P1 指摘対応: 差し替えを先に行うと、
+  `EXISTS (SELECT <存在しない列> FROM ... LIMIT 1)` のような不正な内側
+  クエリが、実際には使わないという理由だけで列検証をすり抜け、可視行の
+  有無だけで成否が決まってしまい、列検証・エラー契約〔通常の `SELECT` の
+  未知列と同じ `22000`〕を破ってしまう）。`LIMIT` の差し替えは元々、
+  差し替え前の値を `sql::parser::validate_search_limit` で検証済みだった
+  （本自己点検で他に同種の「検証前に入力を差し替える」箇所が無いことを
+  確認した。`OFFSET` は変更しない）。
+
 ### 拡張クエリプロトコルでの非対応
 
 `sql::params::where_equality_literal_is_param` は Parse 時点の元トークン列
