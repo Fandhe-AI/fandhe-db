@@ -849,7 +849,8 @@ pub(crate) fn execute_statement_with_cache(
                     .map_err(expr_eval_error_to_arena)?
                 {
                     udf_call::ExprValue::Bool(true) => {}
-                    // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                    // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
+                    // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
                     udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => {
                         return Ok(false)
                     }
@@ -2033,6 +2034,8 @@ pub(crate) fn execute_statement_with_cache(
                 for program in &bound.expr_filter_programs {
                     match program.eval(row_id, embedding, &text_columns, &mut expr_scratch)? {
                         udf_call::ExprValue::Bool(true) => {}
+                        // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26
+                        // （AC2）と Issue #921・SQL-26 の共有契約）。
                         udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => {
                             expr_ok = false;
                             break;
@@ -2960,6 +2963,8 @@ fn project_rows(
                         })?;
                     match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        // 対象ビヘイビア: SQL-26（Issue #921）。
+                        udf_call::ExprValue::Null => cells.push(Cell::Null),
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
                             // だけになった（確保ゼロ）ため、応答行として行データより
@@ -3551,9 +3556,9 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
 ///
 /// `WHERE` 述語の評価は `sql/scan.rs::execute_scan` の走査ループと同一の意味論
 /// （`declarative_filter::matches_all` → 各 `expr_filters` を `ExprProgram::eval`。
-/// `references_embedding && dim == 0` の行は無条件除外。第 2 の述語評価器を
-/// 作らない）を、候補行列挙のクロージャとして `tenant::delete_rows_where_unchecked`
-/// へ注入する。
+/// `dim == 0`（`VECTOR` 列が NULL）の行を式が実際に参照する場合は `eval` 自身が
+/// `ExprValue::Null` を返し非該当扱いになる。第 2 の述語評価器を作らない）を、
+/// 候補行列挙のクロージャとして `tenant::delete_rows_where_unchecked` へ注入する。
 pub(crate) fn execute_predicate_delete(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -3591,9 +3596,11 @@ pub(crate) fn execute_predicate_delete(
             .collect();
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
-            if references_embedding && candidate.dim == 0 {
-                return Ok(false);
-            }
+            // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
+            // 自身（`ExprStep::PushVector` の空スライス判定。`sql::expr_program`
+            // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査による事前
+            // 除外は `CASE` の選ばれない分岐に embedding 参照があるだけの行まで
+            // 誤って除外していたため撤去し、評価時点の判定へ一本化した）。
             let embedding: &[f32] = if references_embedding {
                 candidate.embedding
             } else {
@@ -3601,7 +3608,8 @@ pub(crate) fn execute_predicate_delete(
             };
             match program.eval(candidate.id, embedding, &text_columns, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
-                // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
+                // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
                 udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => return Ok(false),
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
@@ -3703,9 +3711,11 @@ pub(crate) fn execute_predicate_update(
             .collect();
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
-            if references_embedding && candidate.dim == 0 {
-                return Ok(false);
-            }
+            // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
+            // 自身（`ExprStep::PushVector` の空スライス判定。`sql::expr_program`
+            // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査による事前
+            // 除外は `CASE` の選ばれない分岐に embedding 参照があるだけの行まで
+            // 誤って除外していたため撤去し、評価時点の判定へ一本化した）。
             let embedding: &[f32] = if references_embedding {
                 candidate.embedding
             } else {
@@ -3713,7 +3723,8 @@ pub(crate) fn execute_predicate_update(
             };
             match program.eval(candidate.id, embedding, &text_columns, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
-                // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
+                // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
                 udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => return Ok(false),
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(

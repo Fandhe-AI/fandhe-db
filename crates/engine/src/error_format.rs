@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 35;
+    count = 36;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -256,6 +256,11 @@ define_error_classes! {
     /// 一致しない（`42830`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidForeignKey`] の写像。
     InvalidForeignKey => ("42830", "INVALID_FOREIGN_KEY"),
+    /// `CASE`/`COALESCE`/`NULLIF` の型不一致（`42804`。対象ビヘイビア: SQL-26、
+    /// Issue #921）: `CASE WHEN` の条件が Bool でない、各枝の型が食い違う、
+    /// `NULLIF` の引数が非 Scalar。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DatatypeMismatch`] の写像。
+    DatatypeMismatch => ("42804", "DATATYPE_MISMATCH"),
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10、
     /// Issue #924）で、非修飾列参照が複数の参照テーブルへ一致し一意に解決
     /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::

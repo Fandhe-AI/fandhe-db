@@ -1009,13 +1009,14 @@ impl Accumulator {
                     .collect();
                 match program.eval(id, embedding, &text_columns, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
-                    // Issue #919・SQL-26: 部分式が `TEXT` 列を参照する
-                    // `ScalarExpr`（例: `SUM(LENGTH(text_col))`）は、対象行の
-                    // その列が NULL なら strict な文字列関数の NULL 伝播契約
-                    // （AC2）により式全体が NULL になりうる。他の列型（`RealColumn`
-                    // 等）の `None` と同じ「その行を観測対象から除外する」契約に
-                    // 揃え、`SUM`/`AVG`/`MIN`/`MAX` の NULL 無視規則
-                    // （PostgreSQL 互換）を満たす。
+                    // NULL は集計対象から除外する（Issue #919・SQL-26 の
+                    // `TEXT` 列参照〔例: `SUM(LENGTH(text_col))`〕と Issue #921・
+                    // SQL-26 の `CASE`／`COALESCE`／`NULLIF` の共有契約）。他の
+                    // 列型（`RealColumn` 等）の `None` と同じ「その行を観測対象
+                    // から除外する」扱いに揃え、`SUM`/`AVG`/`MIN`/`MAX` の
+                    // NULL 無視規則（PostgreSQL 互換）を満たす。`COUNT(expr)` は
+                    // `observe_float` が共有する `Count` 腕が非 NULL のみを
+                    // 数える契約に自然に合流する。
                     ExprValue::Null => Ok(()),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
@@ -1196,11 +1197,16 @@ impl Accumulator {
                     .collect();
                 match program.eval(id, embedding, &text_columns, scratch)? {
                     ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
-                    // Issue #919・SQL-26: 部分式の `TEXT` 列が NULL なら式全体が
-                    // NULL になりうる（strict な文字列関数の NULL 伝播、AC2）。
-                    // `COUNT(DISTINCT)` は NULL を異なり数から除外する契約
-                    // （本関数冒頭のドキュメンテーションコメント参照）のため
-                    // `None`（キー無し）として扱う。
+                    // NULL は COUNT(DISTINCT expr) の対象から除外する（Issue
+                    // #919・SQL-26 の `TEXT` 列参照の NULL 伝播、AC2）と Issue
+                    // #921・SQL-26 の `CASE`／`COALESCE`／`NULLIF` の共有契約）。
+                    // 非 distinct 経路〔本ファイル `ScalarExpr` 分岐の
+                    // `ExprValue::Null => Ok(())`〕と同じ「NULL は集計対象外」
+                    // 契約を distinct 側でも成立させる。他列型（`*Column`）の
+                    // `None` 分岐と同様、この `None` は「この行は distinct 集合へ
+                    // 加えない」を表し、内部バグとしては扱わない
+                    // （`COUNT(DISTINCT NULLIF(...))` のように NULL を返す式で
+                    // 誤って内部エラーにしない）。
                     ExprValue::Null => None,
                     _ => {
                         return Err(accumulator_bug(
@@ -2195,7 +2201,8 @@ pub(crate) fn execute_aggregate_with_cache(
                 };
                 match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                    // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
+                    // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
                     ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
@@ -2642,6 +2649,8 @@ pub(crate) fn observe_candidate_slots(
             };
             match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
+                // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26（AC2）と
+                // Issue #921・SQL-26 の共有契約）。
                 ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(

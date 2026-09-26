@@ -273,6 +273,30 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
             expr_columns_within(columns, lhs)?;
             expr_columns_within(columns, rhs)
         }
+        // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
+        // 列参照を子に持ちうるため再帰的に検査する。`Expr::Null` は列参照を
+        // 持たない。
+        Expr::Null => Ok(()),
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                expr_columns_within(columns, cond)?;
+                expr_columns_within(columns, result)?;
+            }
+            if let Some(else_result) = else_result {
+                expr_columns_within(columns, else_result)?;
+            }
+            Ok(())
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                expr_columns_within(columns, a)?;
+            }
+            Ok(())
+        }
+        Expr::NullIf(lhs, rhs) => {
+            expr_columns_within(columns, lhs)?;
+            expr_columns_within(columns, rhs)
+        }
     }
 }
 

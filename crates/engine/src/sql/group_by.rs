@@ -874,6 +874,8 @@ fn observe_candidate_slots_grouped_inner(
             };
             match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
+                // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26（AC2）と
+                // Issue #921・SQL-26 の共有契約）。
                 ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(GroupAccumulateError::Other(SqlSurfaceError::invalid_input(
@@ -1546,6 +1548,8 @@ pub(crate) fn execute_grouped_aggregate(
                     };
                     match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                         ExprValue::Bool(true) => {}
+                        // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26
+                        // （AC2）と Issue #921・SQL-26 の共有契約）。
                         ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                         _ => {
                             return Err(SqlSurfaceError::invalid_input(
