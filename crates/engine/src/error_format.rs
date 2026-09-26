@@ -256,8 +256,11 @@ define_error_classes! {
     /// 一致しない（`42830`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidForeignKey`] の写像。
     InvalidForeignKey => ("42830", "INVALID_FOREIGN_KEY"),
-    /// 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`。SQL-29 (c)・
-    /// RLS-10 (b)・TASK-213）の両辺で列数・列型が一致しない（`42804`）。
+    /// 型不一致（`42804`）: `CASE`/`COALESCE`/`NULLIF`（対象ビヘイビア: SQL-26、
+    /// Issue #921。`CASE WHEN` の条件が Bool でない、各枝の型が食い違う、
+    /// `NULLIF` の引数が非 Scalar）と、集合演算（`UNION`／`UNION ALL`／
+    /// `INTERSECT`／`EXCEPT`。SQL-29 (c)・RLS-10 (b)・TASK-213。両辺で列数・
+    /// 列型が一致しない）の 2 つの発生源を共有する。
     /// [`crate::sql::allowlist::SqlSurfaceError::DatatypeMismatch`] の写像。
     DatatypeMismatch => ("42804", "DATATYPE_MISMATCH"),
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10、

@@ -94,10 +94,12 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `FOREIGN KEY` 宣言（`CREATE TABLE`。NoSQL 表層の `op` 語彙に DDL が無く
         // 構造的に到達しない）の不正。ERR-6 新設行の射影規則に従い 400 とする。
         | ErrorClass::InvalidForeignKey
-        // `DatatypeMismatch`（`42804`。SQL-29 (c)・RLS-10 (b)・TASK-213、
-        // Issue #929）は集合演算の両辺の列数・列型不一致というクライアント入力
-        // 起因の拒否。NoSQL 表層の `op` 語彙に集合演算が無く構造的に到達しないが、
-        // `ErrorClass` の網羅性のため他の 42xxx 系と同じ 400 とする。
+        // `DatatypeMismatch`（`42804`）は 2 つの発生源を共有する: `CASE`/
+        // `COALESCE`/`NULLIF` の型不一致（SQL-26・Issue #921）と、集合演算の
+        // 両辺の列数・列型不一致（SQL-29 (c)・RLS-10 (b)・TASK-213、Issue
+        // #929）。いずれも NoSQL 表層の `op` 語彙に対応する経路が無く構造的に
+        // 到達しないが、`ErrorClass` の網羅性のため他の 42xxx 系と同じ
+        // 400 とする。
         | ErrorClass::DatatypeMismatch
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
         // 参照スコープでの非修飾列の曖昧解決。SQL 表層は本 Issue でまだ受理し

@@ -129,6 +129,36 @@ cargo test -p engine --release --lib \
 記録する。専有環境での SQL 表層 C1/WHERE 経路の再測定（`bench-c1` 等）は
 オーナー／管理者作業として引き続き別途の実測対象とする。
 
+## 分岐命令の追加（Issue #921・対象ビヘイビア: SQL-26）
+
+`CASE`／`COALESCE`／`NULLIF` の追加に伴い、`ExprProgram::eval` の実行ループを
+`for step in &self.steps`（逐次実行のみ）からプログラムカウンタ（`pc`）による
+`while let Some(step) = self.steps.get(pc)` ループへ変更した。
+
+- 新規ステップ: `ConstNull`（定数 `NULL`）・`Jump { target }`（無条件前方
+  ジャンプ）・`JumpIfNotTrue { target }`（Bool を pop し、真でなければ飛ぶ。
+  `CASE WHEN` の不成立分岐）・`JumpIfNotNull { target }`（先頭を peek し、
+  非 NULL なら値を残したまま飛ぶ。`COALESCE` の早期確定）・`Pop`（`COALESCE`
+  が NULL だった引数を捨てる）・`NullIf`
+- コンパイル: `compile_case`（`cond_i → JumpIfNotTrue(next_i) → result_i →
+  Jump(end)` を WHEN ごとに並べ、末尾に ELSE〔省略時は `ConstNull`〕を置く）・
+  `compile_coalesce`（`a_1 → JumpIfNotNull(end) → Pop → a_2 → …`）。ジャンプ先は
+  いったん `usize::MAX` で仮置きし、実アドレス確定後に `steps.get_mut` で
+  書き換える
+- 停止性: ジャンプは前方（`target > pc`）のみを許可し（`validate_jump_target`）、
+  `pc` は単調に増加するためループを構成できない。書き換え漏れ・実装バグで
+  不正な `target` になっていた場合も `Internal`（固定文言）で fail-closed に
+  拒否する（`.claude/rules/security.md`「不安全な設計」対応）
+- `CASE`/`COALESCE` は定数畳み込み（`try_fold_scalar`）の対象に含めない。
+  選ばれない分岐を評価しないという実行時契約（defer-on-error）は、分岐命令
+  そのもの（ジャンプによる制御フロー）だけで満たされるため、畳み込みの対象を
+  広げる必要がない
+- NULL 伝播: `eval_binary`／`apply_builtin`（`sql::udf_call`）はいずれかの
+  オペランドが `NULL` なら結果を `NULL` として返す共通ロジックを持ち、
+  `ExprProgram::eval` の `Binary`／`Builtin` ステップはこれをそのまま利用する
+  （複製しない）。`WasmCall` ステップは RETURNS NULL ON NULL INPUT
+  （NULL 引数ならバックエンドを呼ばない）
+
 ## 対象外（out-of-scope-tracking）
 
 - `USING PLAN` のソフトブーストヒント（`path_hint`/`kind_hint`）の

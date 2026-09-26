@@ -1065,6 +1065,11 @@ fn bind_ranking(
 fn default_expr_alias(expr: &Expr) -> String {
     match expr {
         Expr::Call { name, .. } => name.clone(),
+        // PostgreSQL にならった既定エイリアス（対象ビヘイビア: SQL-26。
+        // Issue #921）。
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Coalesce(_) => "coalesce".to_string(),
+        Expr::NullIf(..) => "nullif".to_string(),
         _ => "expr".to_string(),
     }
 }
@@ -4653,6 +4658,29 @@ fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>)
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_idents(lhs, out);
+            collect_expr_idents(rhs, out);
+        }
+        // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
+        // 列参照を子に持ちうるため再帰的に集める（`sql::view::
+        // expr_columns_within` と同じ走査規則）。`Expr::Null` は列参照を
+        // 持たない。
+        Expr::Null => {}
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                collect_expr_idents(cond, out);
+                collect_expr_idents(result, out);
+            }
+            if let Some(else_result) = else_result {
+                collect_expr_idents(else_result, out);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::NullIf(lhs, rhs) => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }

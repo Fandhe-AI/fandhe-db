@@ -764,7 +764,7 @@ Date: <IMF-fixdate>
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（複数テーブル参照スコープの束縛基盤〔SQL-28・RLS-10、Issue #924〕は未結線。後述） |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
-| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（集合演算は SQL 表層専用。後述） |
+| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`FOREIGN KEY` の宣言は SQL 表層専用の `CREATE TABLE`。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
@@ -814,7 +814,10 @@ err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）�
 RLS-10 (b)・TASK-213、Issue #929）も SQL 表層専用で、NoSQL `op` 許可リストに
 対応する語彙が無いため `42804` は到達しない。
 参照先が他テナントにだけ存在する場合と、どのテナントにも存在しない場合の
-応答は区別できない（RLS-9・RLS-10）。明示トランザクション（SQL-31・TASK-221）の
+応答は区別できない（RLS-9・RLS-10）。`CASE`／`COALESCE`／`NULLIF`
+（対象ビヘイビア: SQL-26、Issue #921）は SQL 表層の式レーン専用の構文で、
+NoSQL 表層の式レーンの入口（`plan`／`filter`）にこれらの構文は無いため
+`42804` は到達しない。明示トランザクション（SQL-31・TASK-221）の
 `BEGIN`／`COMMIT`／`ROLLBACK` は SQL 表層専用の機構で、NoSQL 表層の `op`
 許可リストにトランザクション制御に対応する語彙が無いため、その状態エラー
 （`25xxx`）は到達しない（一方、ロック待ちの `55P03` は SQL 表層のトランザク
