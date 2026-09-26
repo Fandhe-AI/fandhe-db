@@ -317,6 +317,20 @@ pub(crate) fn execute_scan_with_budget(
     bound: &BoundScan,
     max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を持つ広域取得は専用の実行器
+    // （`sql::window::execute_window_scan`）へ委譲する。本体側の変更をこの
+    // dispatch 1 行に留めることで、`sql::scan` を編集する他 PR との衝突を
+    // 最小化する（`docs/design/window-functions.md` 参照）。
+    if !bound.windows().is_empty() {
+        return crate::sql::window::execute_window_scan(
+            read_txn,
+            ctx,
+            schema,
+            bound,
+            max_result_bytes,
+        );
+    }
+
     let expected_dim = schema.vector_dim();
     let (tier, scalar_mask) = decode_tier_for(schema, bound);
 
@@ -912,6 +926,7 @@ mod tests {
             or_filters: Vec::new(),
             limit,
             offset: 0,
+            windows: Vec::new(),
         }
     }
 
@@ -1075,6 +1090,7 @@ mod tests {
             or_filters: Vec::new(),
             limit,
             offset: 0,
+            windows: Vec::new(),
         }
     }
 
@@ -1141,6 +1157,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -1189,6 +1206,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -1356,6 +1374,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::DimAndScalar);
@@ -1374,6 +1393,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Fast);
@@ -1398,6 +1418,7 @@ mod tests {
             or_filters: Vec::new(),
             limit: 10,
             offset: 0,
+            windows: Vec::new(),
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Embedding);
