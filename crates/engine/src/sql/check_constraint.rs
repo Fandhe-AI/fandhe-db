@@ -110,6 +110,10 @@ fn render_expression_predicate(expr: &Expr) -> String {
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Number(s) => s.clone(),
+        // Issue #919・SQL-26: 文字列リテラルは SQL の標準的な引用符エスケープ
+        // （`'` → `''`）で往復可能にレンダリングする（`parse(render(x)) == x`
+        // 契約。`escape_literal` は同モジュールの既存ヘルパーを共有する）。
+        Expr::String(s) => format!("'{}'", escape_literal(s)),
         Expr::Ident(name) => name.clone(),
         Expr::Call { name, args } => {
             let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
@@ -193,7 +197,7 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
 
 fn reject_forbidden_expr(expr: &Expr) -> Result<(), SqlSurfaceError> {
     match expr {
-        Expr::Number(_) | Expr::Ident(_) => Ok(()),
+        Expr::Number(_) | Expr::Ident(_) | Expr::String(_) => Ok(()),
         Expr::Call { name, args } => {
             if !udf_call::is_builtin_function_name(name) {
                 return Err(SqlSurfaceError::unsupported(format!(
@@ -246,9 +250,23 @@ fn referenced_column_names(
             push(&column.name);
         }
     }
+    // Issue #919・SQL-26: 束縛済み式フィルタが参照する `TEXT` 列も同様に依存
+    // 列へ含める（`lower(label)` 等。取りこぼすと `ALTER TABLE DROP COLUMN`
+    // の依存検査をすり抜け、CHECK が参照する列を削除できてしまう）。
+    let mut text_mask = vec![false; schema.columns.len()];
+    for expr in expr_filters {
+        udf_call::mark_referenced_scalar_columns(expr, &mut text_mask);
+    }
+    for (index, wanted) in text_mask.iter().enumerate() {
+        if *wanted {
+            if let Some(column) = schema.columns.get(index) {
+                push(&column.name);
+            }
+        }
+    }
     fn collect_idents<'a>(expr: &'a Expr, acc: &mut Vec<&'a str>) {
         match expr {
-            Expr::Number(_) => {}
+            Expr::Number(_) | Expr::String(_) => {}
             Expr::Ident(name) => acc.push(name.as_str()),
             Expr::Call { args, .. } => {
                 for arg in args {
@@ -532,6 +550,12 @@ impl CompiledChecks {
                 conjuncts.push(CompiledConjunct::Declarative(filter));
             }
             for expr in &expr_filters {
+                // Issue #919・SQL-26: 式述語が参照する `TEXT` 列も
+                // `column_mask` へ反映する（`enforce` の `scan_scalar_columns_masked`
+                // 呼び出しがこのマスクを使ってデコードするため、反映漏れは
+                // マスク外参照＝実 NULL との取り違えという fail-closed 判定に
+                // 落ちる）。
+                udf_call::mark_referenced_scalar_columns(expr, &mut column_mask);
                 conjuncts.push(CompiledConjunct::Expr {
                     references_embedding: udf_call::references_embedding(expr),
                     program: ExprProgram::compile(expr),
@@ -578,6 +602,12 @@ impl CompiledChecks {
                 })?;
         let dim = embedding.len();
         let mut expr_scratch: Vec<StackValue> = Vec::new();
+        // Issue #919・SQL-26: `column_mask` は `TEXT` 参照を反映済み
+        // （`CompiledChecks::compile` 参照）。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for check in &self.checks {
             for conjunct in &check.conjuncts {
                 let satisfied_or_unknown = match conjunct {
@@ -600,8 +630,12 @@ impl CompiledChecks {
                         if *references_embedding && dim == 0 {
                             true
                         } else {
-                            match program.eval(id, embedding, &mut expr_scratch) {
+                            match program.eval(id, embedding, &text_columns, &mut expr_scratch) {
                                 Ok(ExprValue::Bool(b)) => b,
+                                // Issue #919・SQL-26（AC2）: NULL（UNKNOWN）は
+                                // 満たしたとみなす（三値論理。既存の宣言的フィルタ
+                                // NULL 分岐と同じ扱い）。
+                                Ok(ExprValue::Null) => true,
                                 Ok(_) => {
                                     // 束縛段（`bind_where_predicates`）が式述語の
                                     // 型を Bool に限定済みのため到達しない。

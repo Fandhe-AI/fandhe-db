@@ -1061,7 +1061,7 @@ fn collect_referenced_udfs(
     use crate::sql::udf_call::Expr;
 
     match expr {
-        Expr::Number(_) | Expr::Ident(_) => Ok(()),
+        Expr::Number(_) | Expr::Ident(_) | Expr::String(_) => Ok(()),
         Expr::Call { name, args } => {
             if udf_registry.get_wasm(name).is_some() {
                 return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
@@ -1118,6 +1118,15 @@ fn push_dml_expr(
                 b.push_bytes(name.as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
             }
+        }
+        // Issue #919・SQL-26（P0・RECOVER-10）: 文字列リテラルはタグ＋長さ前置＋
+        // 内容込みで直列化する。ここを欠くと、文字列リテラルだけが異なる 2 つの
+        // DML（`WHERE lower(label) = 'a'` と `'b'` 等）が同じ content hash に
+        // なり、operation_id の内容照合が誤って「内容一致」と判定してしまう。
+        Expr::String(s) => {
+            b.push_u8(5);
+            b.push_bytes(s.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
         }
         Expr::Call { name, args } => {
             b.push_u8(3);

@@ -230,6 +230,13 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if udf_call::references_embedding(expr) {
                     needs_embedding = true;
                 }
+                // Issue #919・SQL-26: 投影の式項目が参照する `TEXT` 列を
+                // `scalar_mask` へ反映する（マスク外参照を実 NULL と取り違え
+                // させない fail-closed 契約。`mark_referenced_scalar_columns`
+                // ドキュメント参照）。
+                if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+                    has_scalar_reference = true;
+                }
             }
             ProjectedColumn::Id => {}
         }
@@ -245,6 +252,9 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
     for expr in &bound.expr_filters {
         if udf_call::references_embedding(expr) {
             needs_embedding = true;
+        }
+        if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+            has_scalar_reference = true;
         }
     }
     // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群が参照する列・embedding も
@@ -451,6 +461,16 @@ pub(crate) fn execute_scan_with_budget(
                     row_codec::scan_scalar_columns_masked(schema, metadata, Some(&scalar_mask))?
                 }
             };
+            // Issue #919・SQL-26: `WHERE`/投影の式評価（`BoundExpr::TextColumnRef`）
+            // が使う行スカラービュー。`decode_tier_for` が式の参照する `TEXT` 列を
+            // `scalar_mask` へ反映済み（`DecodeTier::Fast` ならそもそも式評価に
+            // 到達しない――`Fast` 選択条件は `expr_filters`／`Computed` が空か
+            // `TEXT`／embedding いずれも参照しない場合のみ）なので、ここでは
+            // `scanned` の値をそのまま `.as_text()` へ写すだけでよい。
+            let text_columns: Vec<Option<&str>> = scanned
+                .iter()
+                .map(|v| v.and_then(|s| s.as_text()))
+                .collect();
 
             // SCALAR 段（WHERE）。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -479,9 +499,11 @@ pub(crate) fn execute_scan_with_budget(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, &mut expr_scratch)? {
+                match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // Issue #919・SQL-26（AC2）: NULL（UNKNOWN）は `WHERE` では偽と
+                    // 同義に扱い、当該行を除外する（3 値論理）。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
                     _ => {
@@ -775,7 +797,12 @@ pub(crate) fn execute_scan_with_budget(
                                 DecodeTier::Embedding => embedding_scratch.as_slice(),
                                 DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
                             };
-                            match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
+                            match program.eval(
+                                id,
+                                embedding_for_eval,
+                                &text_columns,
+                                &mut expr_scratch,
+                            )? {
                                 ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
                                 ExprValue::Vector(v) => {
                                     // codex-review P1 指摘対応: `Computed` 列のベクトル
@@ -792,6 +819,18 @@ pub(crate) fn execute_scan_with_budget(
                                     )?));
                                 }
                                 ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
+                                // Issue #919・SQL-26（AC2）: 投影の式結果は
+                                // `Cell::Text`/`Cell::Null` へそのまま写像する
+                                // （wire 層は既存の `Computed` → text OID 25 の
+                                // 経路をそのまま使うため wire 側の変更は不要）。
+                                ExprValue::Text(t) => {
+                                    cells.push(Cell::Text(try_alloc_text_for_budget(
+                                        &t,
+                                        &mut byte_budget,
+                                        max_result_bytes,
+                                    )?))
+                                }
+                                ExprValue::Null => cells.push(Cell::Null),
                             }
                         }
                     }

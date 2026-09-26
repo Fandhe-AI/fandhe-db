@@ -253,6 +253,12 @@ impl ReferencedColumns {
             if udf_call::references_embedding(expr) {
                 needs_embedding = true;
             }
+            // Issue #919・SQL-26: `WHERE` の式述語が参照する `TEXT` 列も
+            // `scalar_mask` へ反映する（`sql::scan::decode_tier_for` と同じ理由。
+            // マスク外参照を実 NULL と取り違えない fail-closed 契約）。
+            if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+                has_scalar_reference = true;
+            }
         }
         if let Some(index) = extra_scalar_index {
             has_scalar_reference = true;
@@ -761,7 +767,11 @@ impl Accumulator {
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, scratch)? {
+                // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）は
+                // `sql::parser`（`AggregateArg::Expr` 束縛）が `ExprType::Scalar`
+                // のみを受理するため `TextColumnRef` を含み得ず、空スライスで
+                // 安全に評価できる。
+                match program.eval(id, embedding, &[], scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
@@ -1672,6 +1682,14 @@ pub(crate) fn execute_aggregate_with_cache(
                     )?
                 }
             };
+            // Issue #919・SQL-26: `expr_filters`（`WHERE`）が参照する `TEXT` 列は
+            // `ReferencedColumns::derive` が `scalar_mask` へ反映済みのため、
+            // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` と同じ
+            // 契約）。
+            let text_columns: Vec<Option<&str>> = scanned
+                .iter()
+                .map(|v| v.and_then(|s| s.as_text()))
+                .collect();
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。
@@ -1698,9 +1716,10 @@ pub(crate) fn execute_aggregate_with_cache(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, &mut expr_scratch)? {
+                match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
                     _ => {
@@ -2112,6 +2131,14 @@ pub(crate) fn observe_candidate_slots(
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;
         }
+        // Issue #919・SQL-26: `classify_scalar_plan` の gate により通常この経路の
+        // `expr_filters` は `id` 単純比較のみだが、`referenced.scalar_mask()` は
+        // 上位の `ReferencedColumns::derive` が `TEXT` 参照も反映済みのため、
+        // `sql::scan`／本モジュール上部の走査ループと同じ変換で安全に対応できる。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
             let embedding: &[f32] = if udf_call::references_embedding(expr) {
                 arena
@@ -2120,9 +2147,9 @@ pub(crate) fn observe_candidate_slots(
             } else {
                 &[]
             };
-            match program.eval(id, embedding, &mut expr_scratch)? {
+            match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
-                ExprValue::Bool(false) => continue 'candidates,
+                ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",

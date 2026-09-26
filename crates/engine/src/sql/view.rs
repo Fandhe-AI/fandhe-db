@@ -252,7 +252,7 @@ fn check_predicate_columns_within(
 /// `Expr::Binary` は子孫を再帰的に辿る。
 fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurfaceError> {
     match expr {
-        Expr::Number(_) => Ok(()),
+        Expr::Number(_) | Expr::String(_) => Ok(()),
         Expr::Ident(name) => {
             if columns.iter().any(|vc| vc == name) {
                 Ok(())

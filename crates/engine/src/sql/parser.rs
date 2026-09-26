@@ -4007,9 +4007,13 @@ fn resolve_aggregate_input(
                         program,
                     })
                 }
-                ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
-                    "aggregate argument must evaluate to a scalar",
-                )),
+                // Issue #919・SQL-26: 文字列スカラー関数の式は投影・`WHERE` から
+                // 使えるが、集計関数の引数（`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)`）
+                // としては受理しない（対象外事項。式評価の結果がスカラーである
+                // ことを要求する既存契約を維持する）。
+                ExprType::Vector | ExprType::Bool | ExprType::Text => Err(
+                    SqlSurfaceError::invalid_input("aggregate argument must evaluate to a scalar"),
+                ),
             }
         }
     }

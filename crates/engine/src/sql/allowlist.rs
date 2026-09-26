@@ -2600,6 +2600,15 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 Ok(Expr::Number(n))
             }
+            // Issue #919・SQL-26: 文字列リテラルを式項として受理する。値は字句段で
+            // 既にクォート解除済み（`Token::StringLiteral`）。PostgreSQL の
+            // unknown 型リテラルの暗黙型変換は行わず、常に TEXT 型として束縛する
+            // （`udf_call::bind_expr_in` の `Expr::String` 分岐）。
+            Some(Token::StringLiteral(s)) => {
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::String(s))
+            }
             Some(Token::Punct('(')) => {
                 self.advance();
                 let inner = self.parse_value_expr(depth + 1)?;
@@ -2637,6 +2646,32 @@ impl<'a> Parser<'a> {
             )));
         }
         self.expect_punct('(')?;
+        // Issue #919・SQL-26: `POSITION(needle IN haystack)` は唯一の SQL 標準
+        // 特殊構文形（カンマ区切りではなく `IN` キーワード区切り）。`name` が
+        // 大小無視で `position` の場合に限りこの専用形を解析し、`haystack`／
+        // `needle` の順（`udf_call::BuiltinFn::Position` の引数順）で
+        // `Expr::Call` を組み立てる。カンマ形 `POSITION(a, b)` は PostgreSQL に
+        // 存在しないため受理しない（構文拒否＝`42601`）。
+        if name.eq_ignore_ascii_case("position") {
+            let needle = self.parse_value_expr(depth + 1)?;
+            match self.peek() {
+                Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("in") => {
+                    self.advance();
+                }
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "expected IN in POSITION(needle IN haystack), near {other:?}"
+                    )))
+                }
+            }
+            let haystack = self.parse_value_expr(depth + 1)?;
+            self.expect_punct(')')?;
+            self.consume_expr_node()?;
+            return Ok(Expr::Call {
+                name,
+                args: vec![haystack, needle],
+            });
+        }
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             args.push(self.parse_value_expr(depth + 1)?);

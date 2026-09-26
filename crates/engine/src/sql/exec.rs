@@ -710,13 +710,22 @@ pub(crate) fn execute_statement_with_cache(
         .iter()
         .filter_map(|col| match col {
             ProjectedColumn::Column { index, .. } => Some(*index),
-            // `Computed`（TASK-79・SQL-9）は候補構築時に保持した `candidate_columns`
-            // （`Text` 列のデコード結果）を参照しない。評価に使うのは `arena` 由来の
-            // `id`／embedding のみ（`sql::udf_call::eval` 参照。`TEXT` 列参照は
-            // 束縛段で拒否済み）。
+            // `Computed`（TASK-79・SQL-9）は既定では候補構築時に保持した
+            // `candidate_columns` を参照しない（評価に使うのは `arena` 由来の
+            // `id`／embedding のみ）が、Issue #919・SQL-26 以降は `TEXT` 列参照
+            // （`BoundExpr::TextColumnRef`）を持ちうるため、その列だけは下で
+            // 個別に追加する（この `filter_map` 自体は単一列版のみを返せるため
+            // `None` のまま素通しし、複数列を返せる下のループへ委ねる）。
             ProjectedColumn::Id | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
+    for col in &bound.projection {
+        if let ProjectedColumn::Computed { expr, .. } = col {
+            udf_call::visit_referenced_scalar_columns(expr, &mut |idx| {
+                needed_column_indices.insert(idx);
+            });
+        }
+    }
     if !plan.scalar_prefilter {
         needed_column_indices.extend(bound.metadata_filters.iter().map(|f| f.column_index()));
         // TASK-208・Issue #912: OR 群が参照する列も同様に保持する（DISTANCE
@@ -724,6 +733,15 @@ pub(crate) fn execute_statement_with_cache(
         // 保持しておかないと事後適用の時点で値が無く、OR 条件が判定不能になる）。
         for group in &bound.or_filters {
             group.visit_column_indices(&mut |idx| {
+                needed_column_indices.insert(idx);
+            });
+        }
+        // Issue #919・SQL-26: `WHERE` の式述語（DISTANCE 先行時に事後適用する
+        // `expr_filter_programs`）が参照する `TEXT` 列も同様に候補構築時に保持する
+        // （postfilter が `candidate_columns` から復元する `scanned` に値が無いと
+        // 常に NULL 扱いになり、比較・関数の結果が誤る）。
+        for expr in &bound.expr_filters {
+            udf_call::visit_referenced_scalar_columns(expr, &mut |idx| {
                 needed_column_indices.insert(idx);
             });
         }
@@ -805,6 +823,12 @@ pub(crate) fn execute_statement_with_cache(
         // 下のループで選択的に複製する。
         let scanned = row_codec::scan_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+        // Issue #919・SQL-26: `scan_scalar_columns`（マスクなし）は全列を
+        // デコードするため、マスク外＝実 NULL の取り違えは生じない。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         // SCALAR 先行（既定）の場合のみここでメタデータフィルタ（TASK-147・EXT-3。
         // 等価・前方一致）を事前適用する。DISTANCE 先行（`HINT ORDER`）の場合は
         // 可視行を無条件に通過させ、DISTANCE 段の後で `apply_scalar_postfilter` が
@@ -821,11 +845,14 @@ pub(crate) fn execute_statement_with_cache(
             // （`expr_eval_error_to_arena` 経由で `22000`／`54000` へ写像）。
             for program in &bound.expr_filter_programs {
                 match program
-                    .eval(id, embedding, &mut expr_scratch)
+                    .eval(id, embedding, &text_columns, &mut expr_scratch)
                     .map_err(expr_eval_error_to_arena)?
                 {
                     udf_call::ExprValue::Bool(true) => {}
-                    udf_call::ExprValue::Bool(false) => return Ok(false),
+                    // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                    udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => {
+                        return Ok(false)
+                    }
                     // 束縛段（`sql::parser::bind_in_session`）が `WHERE` 式述語の型を
                     // `Bool` に限定済みのため到達しない（`ExprType::Bool` 検査参照）。
                     _ => {
@@ -1984,6 +2011,13 @@ pub(crate) fn execute_statement_with_cache(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
+            // Issue #919・SQL-26: `needed_column_indices`（本関数入口）が
+            // `expr_filters`／OR 群の `TEXT` 参照を候補構築時に含め済みのため、
+            // `scanned`（`columns` 由来）をそのまま `.as_text()` へ写せる。
+            let text_columns: Vec<Option<&str>> = scanned
+                .iter()
+                .map(|v| v.and_then(|s| s.as_text()))
+                .collect();
             // TASK-208・Issue #912: OR 群も式述語と同じく embedding・行 `id` を
             // 要する（式が embedding を参照しうるため）。式述語・OR 群の
             // いずれかが非空の場合にのみ取得する（従来どおり、両方空なら
@@ -1997,9 +2031,9 @@ pub(crate) fn execute_statement_with_cache(
                 };
                 let mut expr_ok = true;
                 for program in &bound.expr_filter_programs {
-                    match program.eval(row_id, embedding, &mut expr_scratch)? {
+                    match program.eval(row_id, embedding, &text_columns, &mut expr_scratch)? {
                         udf_call::ExprValue::Bool(true) => {}
-                        udf_call::ExprValue::Bool(false) => {
+                        udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => {
                             expr_ok = false;
                             break;
                         }
@@ -2578,6 +2612,15 @@ fn project_rows(
                 )?)
             }
         };
+        // Issue #919・SQL-26: `Computed` 投影の式が参照する `TEXT` 列
+        // （`needed_mask`／`needed_column_indices` に含め済み）を、`decoded` の
+        // 型差（`Value` 由来）を吸収したビューへ変換する。
+        let text_columns: Vec<Option<&str>> = (0..schema.columns.len())
+            .map(|idx| match decoded.get(idx) {
+                Some(Value::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
             match col {
@@ -2915,7 +2958,7 @@ fn project_rows(
                             detail: "computed projection program missing at evaluation time"
                                 .to_string(),
                         })?;
-                    match program.eval(id, embedding, &mut expr_scratch)? {
+                    match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
@@ -2927,6 +2970,11 @@ fn project_rows(
                             cells.push(Cell::Vector(udf_call::into_owned_vector(v)?))
                         }
                         udf_call::ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
+                        // Issue #919・SQL-26（AC2）: `Cell::Text`/`Cell::Null` へ
+                        // 写像する（`ColumnType::Text` 直接投影と同じ複製経路
+                        // `try_clone_text` を共有する）。
+                        udf_call::ExprValue::Text(t) => cells.push(Cell::Text(try_clone_text(&t)?)),
+                        udf_call::ExprValue::Null => cells.push(Cell::Null),
                     }
                 }
             }
@@ -3536,6 +3584,11 @@ pub(crate) fn execute_predicate_delete(
         if !declarative_filter::matches_all(metadata_filters, &scanned) {
             return Ok(false);
         }
+        // Issue #919・SQL-26: マスクなし全列デコードのため取り違えは生じない。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
             if references_embedding && candidate.dim == 0 {
@@ -3546,9 +3599,10 @@ pub(crate) fn execute_predicate_delete(
             } else {
                 &[]
             };
-            match program.eval(candidate.id, embedding, &mut scratch)? {
+            match program.eval(candidate.id, embedding, &text_columns, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
-                udf_call::ExprValue::Bool(false) => return Ok(false),
+                // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => return Ok(false),
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",
@@ -3642,6 +3696,11 @@ pub(crate) fn execute_predicate_update(
         if !declarative_filter::matches_all(metadata_filters, &scanned) {
             return Ok(false);
         }
+        // Issue #919・SQL-26: マスクなし全列デコードのため取り違えは生じない。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
             if references_embedding && candidate.dim == 0 {
@@ -3652,9 +3711,10 @@ pub(crate) fn execute_predicate_update(
             } else {
                 &[]
             };
-            match program.eval(candidate.id, embedding, &mut scratch)? {
+            match program.eval(candidate.id, embedding, &text_columns, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
-                udf_call::ExprValue::Bool(false) => return Ok(false),
+                // Issue #919・SQL-26（AC2）: NULL は `WHERE` で偽と同義。
+                udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => return Ok(false),
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",
