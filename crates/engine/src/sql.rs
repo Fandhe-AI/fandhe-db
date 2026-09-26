@@ -169,6 +169,7 @@ pub mod returning;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
+pub(crate) mod set_op;
 pub(crate) mod sparse_cache;
 pub mod statement_splitter;
 pub(crate) mod subquery;
