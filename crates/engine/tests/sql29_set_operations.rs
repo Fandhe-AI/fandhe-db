@@ -519,6 +519,97 @@ fn paren_nesting_depth_exceeding_limit_is_rejected() {
     assert_eq!(err.wire_code(), "54000");
 }
 
+/// PR #1105 レビュー指摘の回帰（codex P1）: `looks_like_set_operation`
+/// （`starts_with_select_after_parens`）は演算子の右枝を包む括弧の個数に
+/// 上限を設けず走査する。従来は検出専用の小さい固定上限で打ち切っていたため、
+/// それを超える深さの括弧で右枝を包むと集合演算として検出されず
+/// （`parse_set_primary` の入れ子上限検査〔`54000`〕に到達する前に）無関係な
+/// `42601` へ落ちていた。ちょうど上限（4 段）は受理・上限+1（5 段）と
+/// 大幅超過（20 段）はいずれも走査後に到達する構文解析側の入れ子上限検査で
+/// `54000` になることを固定する。
+#[test]
+fn right_branch_paren_nesting_depth_exceeding_limit_is_rejected() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    // ちょうど上限（4 段）は受理される。
+    let at_limit = "SELECT lang FROM docs UNION ((((SELECT lang FROM other_docs))))";
+    let _ = run(&core, "tenant-a", at_limit);
+
+    // 上限+1（5 段）は `54000`（従来はここで誤って `42601` になっていた）。
+    let over_by_one = "SELECT lang FROM docs UNION (((((SELECT lang FROM other_docs)))))";
+    let err = run_err(&core, "tenant-a", over_by_one);
+    assert_eq!(err.wire_code(), "54000");
+
+    // 大幅超過（20 段）でも同じ `54000`（検出側の走査に上限が無いことの確認。
+    // 固定上限で打ち切っていた旧実装ではこの深さは検出漏れし `42601` に
+    // なっていた）。
+    let opens = "(".repeat(20);
+    let closes = ")".repeat(20);
+    let far_over_limit =
+        format!("SELECT lang FROM docs UNION {opens}SELECT lang FROM other_docs{closes}");
+    let err = run_err(&core, "tenant-a", &far_over_limit);
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// 上と同じ「大幅超過」の文が Describe 経路でも同じ分類（`54000`）になる
+/// ことを固定する（構造検証〔括弧入れ子上限〕は Execute／Describe の両方が
+/// 共有する単一の構文解析段で完結するため、本来 Execute と分岐しようがない
+/// ことの回帰防止）。
+#[test]
+fn right_branch_paren_nesting_depth_exceeding_limit_is_rejected_by_describe_too() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let opens = "(".repeat(20);
+    let closes = ")".repeat(20);
+    let far_over_limit =
+        format!("SELECT lang FROM docs UNION {opens}SELECT lang FROM other_docs{closes}");
+
+    let exec_err = run_err(&core, "tenant-a", &far_over_limit);
+    assert_eq!(exec_err.wire_code(), "54000");
+
+    let describe_err = core
+        .parse_sql(&far_over_limit)
+        .expect_err("Describe path (shared parsing) must reject with the same classification");
+    assert_eq!(describe_err.wire_code(), "54000");
+}
+
+/// PR #1105 レビュー指摘の回帰: 括弧走査の上限撤廃後も、UDF・組み込み関数の
+/// 呼び出し形（`union(score)` 等）を集合演算と誤検出しない既存の保証は
+/// 変わらないこと（`starts_with_select_after_parens` は呼び出し括弧の先が
+/// `SELECT` に到達しない限り `false` のまま）。
+#[test]
+fn udf_call_form_is_still_not_misdetected_as_set_operation_after_paren_scan_change() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &tenant_ctx,
+        &mut session,
+        "CREATE FUNCTION union(v) AS vec_norm(v)",
+    )
+    .expect("CREATE FUNCTION named union should succeed");
+
+    // `union(...)` は呼び出し括弧の先が `SELECT` に到達しないため、深い
+    // 括弧走査を導入した後も集合演算とは誤検出されず UDF 呼び出しとして
+    // 実行される（従来どおり）。
+    let outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "SELECT id, union(embedding) AS n FROM docs \
+             ORDER BY embedding <=> '[3.0,4.0]' LIMIT 3",
+        )
+        .expect("SELECT calling a UDF named union should still succeed");
+    let result = expect_query(outcome);
+    assert_eq!(result.rows.len(), 3);
+}
+
 // ---------- 誤検出防止（UDF・列名・テーブル名としての union/intersect/except。
 // Issue #929 最終レビュー指摘の回帰） ----------
 

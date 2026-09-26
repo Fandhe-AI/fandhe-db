@@ -5452,15 +5452,25 @@ fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
     }
 }
 
-/// 文頭の `(` の連なり（集合演算の括弧入れ子。上限は構文解析側で別途検証する）を
-/// 読み飛ばした先が `SELECT` キーワードかどうかを判定する。
+/// 文頭の `(` の連なり（集合演算の括弧入れ子。実際の入れ子上限
+/// （[`MAX_SET_OP_PAREN_DEPTH`]。超過は `54000`）は構文解析側
+/// （[`parse_set_primary`]）が別途検証する）を読み飛ばした先が `SELECT`
+/// キーワードかどうかを判定する。読み飛ばす `(` の個数に上限を設けない
+/// （PR #1105 レビュー指摘対応: 従来は検出専用に小さい固定上限
+/// （`MAX_SET_OP_PAREN_DEPTH + 1`）で打ち切っていたため、それを超える深さの
+/// 括弧入れ子（例: `SELECT a FROM t UNION (((((((SELECT b FROM u)))))))`）が
+/// 集合演算として検出されず、`parse_set_primary` の入れ子上限検査
+/// （`54000`）に到達する前に無関係な分類〔`42601`〕へ落ちていた。この走査
+/// 自体はトークン列の長さ〔`tokens.len()`〕で有界な単純な線形走査であり、
+/// 追加のアロケーションも行わないため上限を設けなくても無制限リソース確保
+/// にはならない〔security.md「不安全な設計」の対象外〕。UDF・組み込み関数
+/// 呼び出し形〔`union(score)` 等〕を誤って集合演算と検出しない既存の保証
+/// （呼び出し元 [`set_operator_is_followed_by_branch`] のドキュメンテーション
+/// コメント参照）はこの変更で緩めない——`(` の連なりの先が `SELECT` に
+/// 到達しない限り `false` を返す判定方式自体は変えていない）。
 fn starts_with_select_after_parens(tokens: &[Token]) -> bool {
     let mut i = 0usize;
-    // 検出専用の先読みのため、実際の構文解析（括弧の入れ子上限検証）とは別に
-    // 小さい固定上限で打ち切る（無制限走査を避ける）。
-    while i <= MAX_SET_OP_PAREN_DEPTH as usize + 1
-        && matches!(tokens.get(i), Some(Token::Punct('(')))
-    {
+    while matches!(tokens.get(i), Some(Token::Punct('('))) {
         i += 1;
     }
     matches!(tokens.get(i), Some(Token::Keyword(Keyword::Select)))
