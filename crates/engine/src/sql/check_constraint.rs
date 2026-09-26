@@ -119,6 +119,46 @@ fn render_expr(expr: &Expr) -> String {
         // 契約。`escape_literal` は同モジュールの既存ヘルパーを共有する）。
         Expr::String(s) => format!("'{}'", escape_literal(s)),
         Expr::Ident(name) => name.clone(),
+        // codex-review（Cursor Bugbot）P1 指摘対応: `POSITION` は組み込み関数の
+        // 中で唯一カンマ区切りではない SQL 標準特殊構文（`POSITION(needle IN
+        // haystack)`）を持つ（`sql::allowlist::Parser::parse_function_call_expr`
+        // 参照。`args` は評価順どおり `[haystack, needle]` の順で格納される一方、
+        // 構文はカンマ形 `POSITION(a, b)` を明示的に `42601` で拒否する）。他の
+        // 組み込み関数（`LOWER`／`UPPER`／`LENGTH`／`SUBSTR`／`CONCAT`／`TRIM`／
+        // `REPLACE`）はいずれも構文段でカンマ区切りの通常の関数呼び出し形のみを
+        // 受理するため下の汎用腕でそのまま往復するが、`POSITION` だけは汎用の
+        // カンマ形で出力すると永続化された CHECK 定義が再パースできず
+        // `CREATE TABLE` 自体が失敗する（`validate_and_build` の往復検証が
+        // fail-closed に拒否するため、サイレントな破損ではなく作成失敗という
+        // 形で顕在化する）。
+        Expr::Call { name, args } if name.eq_ignore_ascii_case("position") => match args.as_slice()
+        {
+            [haystack, needle] => {
+                // `name` をそのまま使う（`eq_ignore_ascii_case` で判定している
+                // ため、大文字小文字は元のテキストの綴りのまま。他の組み込み
+                // 関数の汎用腕〔`format!("{name}(...)")`〕と同じ「呼び出し元の
+                // 綴りをそのまま往復させる」契約に揃える。ここでリテラル
+                // `"POSITION"` に固定すると、元の綴りが `"position"` 等だった
+                // 場合に再パース結果の `name` フィールドが一致せず往復が
+                // 壊れる）。
+                format!(
+                    "{name}({} IN {})",
+                    render_expr(needle),
+                    render_expr(haystack)
+                )
+            }
+            // 束縛済み `Expr::Call { name: "position", .. }` は構文段が常に
+            // 2 引数（`haystack`／`needle`）で構築する不変条件を持つ（`parse_
+            // function_call_expr` 参照）。崩れた場合でも `unreachable!` にはせず
+            // （coding-rust.md「panic させない」）、下の汎用カンマ形へフォール
+            // スルーする。生成テキストは呼び出し元の往復検証
+            // （`validate_and_build`）が再パースの不一致として fail-closed に
+            // 拒否するため、誤ったテキストが永続化されることはない。
+            _ => {
+                let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
+                format!("{name}({})", rendered_args.join(", "))
+            }
+        },
         Expr::Call { name, args } => {
             let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{name}({})", rendered_args.join(", "))
@@ -1103,6 +1143,101 @@ mod tests {
                 op: BinOp::Eq,
                 lhs: Box::new(expr.clone()),
                 rhs: Box::new(Expr::Number("1".to_string())),
+            };
+            let rendered = render_expression_predicate(&top);
+            let reparsed = parse_check_predicate_text(&rendered)
+                .unwrap_or_else(|e| panic!("reparse of {rendered:?} failed: {e:?}"));
+            assert_eq!(
+                reparsed,
+                vec![WherePredicate::Expression(top)],
+                "round trip mismatch for rendered text {rendered:?}"
+            );
+        }
+    }
+
+    /// codex-review（Cursor Bugbot）P1 指摘の回帰テスト: 文字列スカラー関数群
+    /// （Issue #919・SQL-26）8 種すべてについて `render_expr` が生成するテキストが
+    /// 再パースで同じ木へ戻ることを固定する。`POSITION` は組み込み関数の中で
+    /// 唯一カンマ区切りでない特殊構文（`POSITION(needle IN haystack)`）を持つため
+    /// （`sql::allowlist::Parser` はカンマ形 `POSITION(a, b)` を `42601` で拒否する）、
+    /// 汎用のカンマ形レンダリングでは往復できず `CREATE TABLE` 自体が失敗して
+    /// いた（`render_expr` の `POSITION` 専用腕を参照）。他の 7 関数は構文段が
+    /// 通常のカンマ区切り関数呼び出し形のみを受理するため、この単体テストで
+    /// 既に往復が保証されていることも合わせて固定する。
+    #[test]
+    fn render_expr_round_trips_all_string_scalar_functions_through_reparse() {
+        use crate::sql::allowlist::{parse_check_predicate_text, WherePredicate};
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        fn call(name: &str, args: Vec<Expr>) -> Expr {
+            Expr::Call {
+                name: name.to_string(),
+                args,
+            }
+        }
+
+        let cases: Vec<Expr> = vec![
+            call("lower", vec![Expr::Ident("label".to_string())]),
+            call("upper", vec![Expr::Ident("label".to_string())]),
+            call("length", vec![Expr::Ident("label".to_string())]),
+            call(
+                "substr",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("1".to_string()),
+                ],
+            ),
+            call(
+                "substr",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("1".to_string()),
+                    Expr::Number("2".to_string()),
+                ],
+            ),
+            call(
+                "concat",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("suffix".to_string()),
+                ],
+            ),
+            call("trim", vec![Expr::Ident("label".to_string())]),
+            call(
+                "replace",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                    Expr::String("b".to_string()),
+                ],
+            ),
+            // `args` は評価順どおり `[haystack, needle]`（`sql::allowlist::
+            // Parser::parse_function_call_expr` の `POSITION` 専用構文が
+            // 組み立てる順序と同じ）。
+            call(
+                "position",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                ],
+            ),
+            // 大文字綴り（`POSITION`）でも綴りがそのまま往復することを固定する
+            // （`render_expr` が `name` フィールドをそのまま使い、リテラル
+            // `"POSITION"` に固定していない回帰の確認）。
+            call(
+                "POSITION",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                ],
+            ),
+        ];
+
+        for expr in cases {
+            let top = Expr::Binary {
+                op: BinOp::Gt,
+                lhs: Box::new(expr.clone()),
+                rhs: Box::new(Expr::Number("0".to_string())),
             };
             let rendered = render_expression_predicate(&top);
             let reparsed = parse_check_predicate_text(&rendered)

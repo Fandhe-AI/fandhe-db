@@ -347,3 +347,87 @@ fn check_constraint_using_length_enforces_at_write_time_and_treats_null_as_satis
         .expect_err("empty label should violate length(label) > 0");
     assert_eq!(err.wire_code(), "23514");
 }
+
+/// codex-review（Cursor Bugbot）P1 指摘の回帰テスト: `POSITION` は組み込み関数の
+/// 中で唯一カンマ区切りでない特殊構文（`POSITION(needle IN haystack)`）を持つ。
+/// `sql::check_constraint::render_expr` が汎用のカンマ形（`POSITION(a, b)`。
+/// 構文段が `42601` で拒否する形）で出力すると、`CHECK` 定義の永続化時点の
+/// 往復検証（`validate_and_build` の設計 D2）が再パース不一致として
+/// fail-closed に拒否し、`CREATE TABLE` 自体が失敗していた。
+///
+/// `tests/uuid_column.rs::uuid_column_roundtrips_through_storage_reopen` と
+/// 同じ「`Storage` を閉じて同じパスで再オープンする」流儀で、`CHECK` 定義
+/// テキスト（`predicate_sql`）がカタログへ永続化され、再オープン後の
+/// `CompiledChecks::compile` による再パース・再束縛を経ても同じ評価結果
+/// （enforce の成否）になることを固定する（実際の再起動を跨ぐ永続化と
+/// 同じ経路——`schema.checks()` は `predicate_sql` の生テキストから
+/// 都度再構築される）。
+#[test]
+fn check_constraint_using_position_round_trips_through_storage_reopen() {
+    let path = unique_db_path("sql26-check-position-reopen");
+    let _guard = CleanupGuard(path.clone());
+    let ctx = ctx_for("tenant-a");
+
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let mut session = SessionState::default();
+        session.allow_ddl();
+
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "CREATE TABLE docs (label TEXT CHECK (POSITION('a' IN label) > 0))",
+        )
+        .expect("CREATE TABLE with POSITION(...) CHECK should succeed");
+
+        // NULL の label は CHECK を満たしたとみなす（AC2・三値論理。既存の
+        // length(...) CHECK テストと同じ流儀）。
+        core.execute_insert_sql(
+            &ctx,
+            "INSERT INTO docs (id) VALUES (10) USING OPERATION_ID 'op-check-null'",
+        )
+        .expect("NULL label should satisfy CHECK (UNKNOWN)");
+
+        // 'a' を含む label は CHECK を満たす。
+        core.execute_insert_sql(
+            &ctx,
+            "INSERT INTO docs (id, label) VALUES (11, 'banana') USING OPERATION_ID 'op-check-pass'",
+        )
+        .expect("label containing 'a' should satisfy POSITION(...) CHECK");
+
+        // 'a' を含まない label は CHECK 違反。
+        let err = core
+            .execute_insert_sql(
+                &ctx,
+                "INSERT INTO docs (id, label) VALUES (12, 'xyz') USING OPERATION_ID 'op-check-violation'",
+            )
+            .expect_err("label without 'a' should violate POSITION(...) CHECK");
+        assert_eq!(err.wire_code(), "23514");
+    }
+
+    // 再オープン後（`CompiledChecks::compile` が永続化された `predicate_sql` を
+    // 再パース・再束縛する）も同じ評価結果になることを確認する。
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    core.execute_insert_sql(
+        &ctx,
+        "INSERT INTO docs (id) VALUES (20) USING OPERATION_ID 'op-check-null-after-reopen'",
+    )
+    .expect("NULL label should still satisfy CHECK (UNKNOWN) after reopen");
+
+    core.execute_insert_sql(
+        &ctx,
+        "INSERT INTO docs (id, label) VALUES (21, 'apple') USING OPERATION_ID 'op-check-pass-after-reopen'",
+    )
+    .expect("label containing 'a' should still satisfy POSITION(...) CHECK after reopen");
+
+    let err = core
+        .execute_insert_sql(
+            &ctx,
+            "INSERT INTO docs (id, label) VALUES (22, 'xyz') USING OPERATION_ID 'op-check-violation-after-reopen'",
+        )
+        .expect_err("label without 'a' should still violate POSITION(...) CHECK after reopen");
+    assert_eq!(err.wire_code(), "23514");
+}
