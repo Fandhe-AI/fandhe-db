@@ -211,6 +211,40 @@ fn insert_satisfying_check_succeeds() {
     .expect("satisfying row must be accepted");
 }
 
+/// SQL-24・TASK-208、Issue #914: `CHECK` 本体の `LIKE` も中間一致・後方一致の
+/// 一般形を受理し、書き込み時検査（`23514`）が新しい意味論で動作することを
+/// 固定する（`declarative_filter::DeclarativeFilter::like` 経由。`sql::
+/// allowlist::parse_check_body` は `parse_where` と同じ文法を共有するため
+/// 構文層は無改造）。
+#[test]
+fn insert_violating_like_general_form_check_is_rejected_with_23514() {
+    let (core, path) = new_core("check-insert-like-general-form");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (path TEXT CONSTRAINT path_ck CHECK (path LIKE '%.rs'))",
+    )
+    .expect("create table");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, path) VALUES (1, 'notes.md') USING OPERATION_ID 'op-1'",
+        )
+        .expect_err("path not ending with .rs must violate the CHECK");
+    assert_eq!(err.wire_code(), "23514");
+    assert!(err.client_message().contains("path_ck"));
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, path) VALUES (2, 'src/lib.rs') USING OPERATION_ID 'op-2'",
+    )
+    .expect("path ending with .rs must satisfy the CHECK");
+}
+
 #[test]
 fn insert_null_column_is_treated_as_unknown_not_violation() {
     // 三値論理（設計 D1）: CHECK が参照する列が NULL の行は違反にしない。

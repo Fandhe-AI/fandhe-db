@@ -133,6 +133,10 @@ pub enum AggregateError {
     /// 要素数が 1 でない、または `having`（空配列を含む）が `group_by` なしに
     /// 単独で指定されている。黙って無視すると `GROUP BY` なしの単一行集計
     /// 〔TASK-166・SQL-13〕として fail-open に実行してしまうため拒否する。
+    /// `group_by` 配列形（複数列）の受理は本 Issue の対象外（NOSQL-16 (b)。
+    /// 別 Issue）。engine 側は `BoundAggregate::new_grouped_by_columns`・
+    /// `allowlist::check_group_by_column_count`（SQL-25 (d)）を公開済みのため、
+    /// 本モジュールはそれらへ写像するだけで拡張できる。
     GroupByShape,
     /// `having[].op` が [`parse_having_op`] の 5 記号（`=`／`<`／`<=`／`>`／
     /// `>=`）に完全一致しない。

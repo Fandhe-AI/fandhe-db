@@ -1,9 +1,10 @@
 # ADR: SCRAM チャネルバインディング用 `tls-server-end-point` の実装既定値
 
-- ステータス: Proposed（署名アルゴリズム別ハッシュ選択・TLS 未確立時 `None`
+- ステータス: Accepted（署名アルゴリズム別ハッシュ選択・TLS 未確立時 `None`
   の 2 点は実装・テストで確定済み。`PLUS` 提示既定 `false` は下記実測に
-  基づく実装判断であり、オーナー確認待ち）
-- 対応: TASK-228・WIRE-9・WIRE-18・HTTP-10 ポインタ（Issue #970・親 #941）
+  基づき、オーナー判断（2026-09-26）で最終確定した。Issue #971 で本 ADR を
+  Accepted へ更新）
+- 対応: TASK-228・WIRE-9・WIRE-18・HTTP-10 ポインタ（Issue #970・#1088・親 #941）
 - 関連: `docs/design/tls-server-handshake.md`・`docs/design/tls-scram-design.md`
 
 ## 背景
@@ -69,11 +70,56 @@ Ed25519 の署名アルゴリズムに対応するダイジェストを libpq �
 この実測結果に基づき、`PLUS` 機構を既定で提示しないことで、libpq の
 既定設定（`channel_binding=prefer`）を使う一般的なクライアントが
 （`disable`・`prefer` いずれでも）認証成功する状態を維持する。`PLUS`
-を使いたい運用（`channel_binding=require` かつクライアント側が本
-サーバーの制約を把握している場合）は
-`TlsServerConfig::with_scram_channel_binding(true)` の opt-in で有効化
-できる。CLI からの結線は `--tls-scram-channel-binding enable|disable`
-（既定 `disable`。`crates/wire-server/src/tls_opt.rs`）が担う。
+を使いたい運用は `TlsServerConfig::with_scram_channel_binding(true)` の
+opt-in で有効化できる。CLI からの結線は
+`--tls-scram-channel-binding enable|disable`（既定 `disable`。
+`crates/wire-server/src/tls_opt.rs`）が担うが、下記§4 のとおり CLI 経由の
+`enable` は葉証明書の署名アルゴリズムを条件に起動時拒否されうる。
+
+### 4. CLI の `enable` は、RFC 5929 が定義するハッシュを持たない署名アルゴリズムの葉証明書を起動時に拒否する（オーナー判断 2026-09-26・Issue #1088）
+
+上記§3 の実測結果が示すとおり、`PLUS` 提示を有効化した状態で本サーバーの
+Ed25519 葉証明書（署名アルゴリズムが Ed25519＝RFC 5929 が単一ハッシュを
+定義しない方式）を使うと、libpq の `channel_binding=prefer`／`require`
+は既定の接続すら失敗させる（`disable` のみ成功）。これは「フラグを
+有効化すると一般的なクライアントの既定接続が壊れる」という落とし穴で
+あり、`--tls-scram-channel-binding enable` を選んだ運用者が気づかずに
+踏みうる。
+
+オーナー判断（2026-09-26）により、`--tls-scram-channel-binding enable`
+と、葉証明書の署名アルゴリズムに RFC 5929 が定義するハッシュが無い
+構成（現時点では Ed25519 のみ。
+[`channel_binding::has_rfc5929_defined_hash`]）の組合せは、§3 のように
+黙って `PLUS` 非提示へ縮退させるのではなく、**起動時に fail-closed で
+拒否する**。判定は `tls_opt::check_scram_channel_binding` が担い、
+`main.rs` が TLS 設定読み込み直後・bind 検証より前に 1 回呼ぶ。判定は
+`--auth-method` に依存させない（`cleartext` との組合せでも同じく拒否し、
+「フラグが効かないまま受理される」経路を作らない）。
+
+判定基準は葉証明書の **鍵種別（SPKI）ではなく `signatureAlgorithm`** で
+ある。`x509.rs` は SPKI が Ed25519 であることは強制するが証明書の署名
+アルゴリズムまでは強制しないため、Ed25519 鍵の葉を RSA／ECDSA の CA が
+署名した構成（例: `ecdsa-with-SHA256`）は RFC 5929 上のハッシュが決まり
+libpq も解決できるので、この構成では `enable` を許可する。運用者が
+`enable` を使うには、RSA／ECDSA（署名ハッシュが MD5／SHA-1／SHA-256／
+SHA-512。SHA-384 は本サーバーの自作実装が未対応のため同じく拒否される）
+の CA が署名した葉証明書を用意すればよい（サーバー鍵自体は引き続き
+Ed25519 のみ）。
+
+ライブラリ API（`TlsServerConfig::with_scram_channel_binding`）はこの
+拒否を行わない。自前クライアントでの `PLUS` 検証テスト
+（`tests/wire_scram_plus_tls.rs`・`tests/wire_scram_plus_psql_interop.rs`）
+が、起動時拒否の対象になりうる Ed25519 葉証明書のままテストを続行できる
+必要があるため（`crates/wire-server/tests/common/tls_client.rs::
+test_config_with_scram_channel_binding`）。
+
+`main.rs` のこの起動時拒否は **SQL 表層（`--surface sql`。既定）限定**
+である。NoSQL 表層は後述の「スコープ外」節のとおりチャネルバインディング
+自体を適用しない（SASL 往復を持たないため `enable` は実際には何も提示
+しない no-op。H5・Issue #968）ので、`--surface nosql` では葉証明書の
+署名アルゴリズムに関わらず `enable` を無条件で受理する（codex-review
+PR #1089 P1 是正: 本判定が表層分岐より前に実行されており、nosql でも
+拒否されてしまう回帰が入っていた）。
 
 ## 受け入れ基準への対応
 
@@ -88,10 +134,9 @@ Ed25519 の署名アルゴリズムに対応するダイジェストを libpq �
 
 - HTTPS 表層（NoSQL・HTTP-10）へのチャネルバインディング適用
 - libpq 以外のクライアント（psycopg・node-postgres 等）での相互運用実測
-- `PLUS` 提示 opt-in 時に libpq 側の制約を回避する追加実装（証明書の
-  署名アルゴリズムを libpq が解決可能な形へ変更する等）
+- 自作 SHA-384 の実装による非対応署名アルゴリズム（sha384WithRSA 等）の
+  解消
 - libpq 側の失敗箇所の特定（`fe-secure-openssl.c` 等の追跡）そのもの
-- `PLUS` 提示既定 `false` の最終確定（オーナー承認）
 
 ## 参照
 
@@ -105,4 +150,11 @@ Ed25519 の署名アルゴリズムに対応するダイジェストを libpq �
 - `crates/wire-server/tests/wire_scram_plus_tls.rs`
 - `crates/wire-server/tests/wire_scram_plus_psql_interop.rs`（手動専用）
 - `crates/wire-server/tests/wire_tls_cli.rs`（R8: `--tls-scram-channel-binding`
-  の CLI 結線・機構リスト反映の結合テスト）
+  の CLI 結線・機構リスト反映の結合テスト。
+  `tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected`・
+  `tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected_
+  under_cleartext_auth`・
+  `tls_scram_channel_binding_explicit_disable_does_not_advertise_plus_
+  mechanism`・
+  `tls_scram_channel_binding_enable_with_ecdsa_sha256_signed_leaf_
+  advertises_plus_mechanism` が Issue #1088 の起動時拒否／許可を固定）

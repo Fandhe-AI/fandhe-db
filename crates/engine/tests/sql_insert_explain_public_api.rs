@@ -359,6 +359,7 @@ fn build_explain_result_is_reachable_and_matches_sql_explain_rows() {
             .scalar_prefilter,
         metadata_filters: &[],
         expr_filters: &[],
+        or_filters: &[],
     });
     let explain_engine = ExplainEngine::new(core.search_engine_kind(), ann_plan, scalar_plan);
     let external_result = build_explain_result(&planned, &explain_engine);
@@ -403,6 +404,7 @@ fn explain_engine_accessors_round_trip() {
         scalar_prefilter: true,
         metadata_filters: &[],
         expr_filters: &[],
+        or_filters: &[],
     });
     let engine = ExplainEngine::new(
         Some(engine::search_engine::SearchEngineKind::ParallelBruteForce),

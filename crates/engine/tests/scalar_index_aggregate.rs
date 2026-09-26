@@ -760,6 +760,44 @@ fn count_star_index_trusted_path_matches_plain_scan_for_each_predicate_shape() {
     );
 }
 
+/// SQL-24・TASK-208、Issue #914: `LIKE` の一般形（中間一致）は `COUNT(*)` の
+/// 索引信頼経路（`count_star_only`。`aggregate_index_scans` を増やす経路）に
+/// 「索引で完全被覆済み」と誤って信頼されず、常に plain scan と同じ結果に
+/// なることを固定する（`sql::scalar_plan::classify_scalar_plan` が `Like` を
+/// 単一情報源で `PlainScan` へ倒すことの回帰防止）。
+#[test]
+fn count_star_never_trusts_like_general_form_and_matches_plain_scan_oracle() {
+    let path = unique_db_path("scalar-index-aggregate-count-like-not-trusted");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // `kind` は "a"／"b" の 2 文字のみのため、`%` を挟んだ `LIKE` 述語は
+    // 索引が対応する `Equals`／`StartsWith` のいずれにも振り分けられない
+    // 一般形（`%a%`）になる。
+    let sql = "SELECT COUNT(*) AS n FROM docs WHERE kind LIKE '%a%'";
+    let control_sql = "SELECT COUNT(*) AS n FROM docs WHERE kind LIKE '%a%' AND id + 0 > 0";
+
+    // 索引を温めても（他クエリで構築されていても）`LIKE` 一般形のクエリ自身は
+    // 索引経路を一切消費しない（vacuous のまま）。
+    let before = core.scalar_index_cache_stats().aggregate_index_scans;
+    let like_result = run(&core, "tenant-a", sql);
+    let after = core.scalar_index_cache_stats().aggregate_index_scans;
+    assert_eq!(
+        after, before,
+        "LIKE general-form COUNT(*) must never take the index-trusted path: {sql}"
+    );
+
+    let control = run(&core, "tenant-a", control_sql);
+    assert_eq!(
+        group_rows(&like_result),
+        group_rows(&control),
+        "LIKE general-form COUNT(*) must match the plain-scan oracle: {sql} vs {control_sql}"
+    );
+}
+
 #[test]
 fn group_by_count_star_enumeration_matches_plain_scan_including_null_group() {
     let path = unique_db_path("scalar-index-aggregate-group-count-trusted");

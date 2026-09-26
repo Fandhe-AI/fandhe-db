@@ -104,12 +104,15 @@ fn never_silently_executes_an_unrecognized_where_condition_as_unfiltered_top_k()
     // 未対応 WHERE 条件が黙殺されず明示的に拒否されることを固定する（SQL-8）。
     // TASK-79（SQL-9）で `<expr> <cmp> <expr>` 形の式述語（`1 = 1` 等の数値比較を
     // 含む）を正式に受理するようになったため、旧 `1 = 1` はもはや「未対応構文」の
-    // 例として不適切になった（意図した仕様拡張であり、非回帰ではない）。本テストの
-    // 意図（`OR` によるバイパスを黙って許可しない）を保つため、依然として拒否される
-    // `OR` 結合へ置き換える。
+    // 例として不適切になった（意図した仕様拡張であり、非回帰ではない）。
+    // TASK-208・SQL-24（Issue #912）で `OR` 結合・括弧グルーピングも正式に受理
+    // するようになったため、旧 `lang = 'ja' OR lang = 'en'` も同様に不適切になった
+    // （こちらも意図した仕様拡張）。本テストの意図（許可形状に無い構文を黙って
+    // 通過させない）を保つため、依然としてスコープ外のままの構文（サブクエリ）へ
+    // 置き換える。
     let (storage, _guard) = open_storage_with_documents_table("no-silent-fallback");
     let err = validate_statement(
-        "SELECT * FROM documents WHERE lang = 'ja' OR lang = 'en' ORDER BY embedding <=> '[0.1]' LIMIT 10",
+        "SELECT * FROM documents WHERE id = (SELECT 1) ORDER BY embedding <=> '[0.1]' LIMIT 10",
         &storage,
     )
     .expect_err("unrecognized WHERE condition must be rejected, never silently dropped");

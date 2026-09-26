@@ -284,6 +284,50 @@ fn predicate_delete_resend_with_reordered_predicates_is_content_mismatch() {
     assert_eq!(err.wire_code(), "22023");
 }
 
+/// SQL-24・TASK-208、Issue #914: `LIKE` の一般形（中間一致）を含む述語つき
+/// `DELETE ... WHERE` も件数一致・再送契約（`23505`／`22023`）に従う
+/// （`declarative_filter::DeclarativeFilter::like` 経由での束縛が第 2 の
+/// 述語評価器を作らない契約を守ることの回帰防止）。
+#[test]
+fn predicate_delete_with_like_general_form_matches_count_and_resend_contract() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, "ja", "src/a.rs", "1");
+    insert_row(&core, &alice, TABLE, 2, "en", "src/b.rs", "2");
+    insert_row(&core, &alice, TABLE, 3, "ja", "README.md", "3");
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE body LIKE '%.rs' USING OPERATION_ID 'op-like-del'"),
+    )
+    .expect("predicate DELETE with LIKE general form should succeed");
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+
+    // 同一 `operation_id`・同一パターンの再送は `23505`。
+    let err = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE body LIKE '%.rs' USING OPERATION_ID 'op-like-del'"),
+    )
+    .expect_err("resend of a recorded operation_id must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 同一 `operation_id`・パターン違いの再送は内容不一致（`22023`）。
+    let err = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE body LIKE '%.md' USING OPERATION_ID 'op-like-del'"),
+    )
+    .expect_err("same operation_id with a different pattern must be a content mismatch");
+    assert_eq!(err.wire_code(), "22023");
+}
+
 /// `WHERE visible()` のみの述語つき DELETE は自テナント全行を候補にする
 /// （#870 の決定を継承。歯止めは影響行数上限のみ。本テストは #870 の
 /// 決定を再決定しない）。

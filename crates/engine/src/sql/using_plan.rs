@@ -148,13 +148,14 @@ pub(crate) fn pre_check_bindable(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
-    let (metadata_filters, expr_filters, _rls_predicate_present) = parser::bind_where_predicates(
-        stmt.where_predicates(),
-        schema,
-        udfs,
-        &mut node_budget,
-        &[],
-    )?;
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
+        parser::bind_where_predicates(
+            stmt.where_predicates(),
+            schema,
+            udfs,
+            &mut node_budget,
+            &[],
+        )?;
     // Issue #474・#765: `EXPLAIN` の `scalar_plan:` 行（`sql::explain`）が
     // 要求する静的判定は [`crate::sql::explain::ExplainShape::from_filters`]
     // （`scalar_prefilter: true` 固定。`USING PLAN` は `HINT ORDER` を受理
@@ -162,6 +163,7 @@ pub(crate) fn pre_check_bindable(
     Ok(crate::sql::explain::ExplainShape::from_filters(
         &metadata_filters,
         &expr_filters,
+        &or_filters,
     ))
 }
 
@@ -223,13 +225,14 @@ pub(crate) fn bind_expansion(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
-    let (metadata_filters, expr_filters, rls_predicate_present) = parser::bind_where_predicates(
-        stmt.where_predicates(),
-        schema,
-        udfs,
-        &mut node_budget,
-        &[],
-    )?;
+    let (metadata_filters, expr_filters, rls_predicate_present, or_filters) =
+        parser::bind_where_predicates(
+            stmt.where_predicates(),
+            schema,
+            udfs,
+            &mut node_budget,
+            &[],
+        )?;
 
     // `core.rs::EngineCore::execute_sql_in_session` の `USING PLAN` 分岐が
     // `plan_using_plan_expansion`（高コスト I/O）より前に同じ検証
@@ -259,6 +262,7 @@ pub(crate) fn bind_expansion(
         rls_predicate_present,
         expr_filters,
         expr_filter_programs,
+        or_filters,
         ranking: Ranking::Hybrid {
             query: query_vector,
             text_column_index,

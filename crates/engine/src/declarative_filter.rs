@@ -1,9 +1,13 @@
 //! 宣言的メタデータフィルタ API（TASK-147・EXT-3。ポインタ:
 //! `docs/spec/05-tasks.md` TASK-147・`docs/spec/04-behavior/extensions.md` EXT-3）。
 //!
-//! 責務境界: メタデータ列（`TEXT` 列）に対する**等価**と**前方一致**のフィルタを、
-//! 任意の列名に対して宣言（[`DeclarativeFilter`]）・スキーマへ束縛（[`bind`]/
-//! [`bind_all`]）・評価（[`MetadataFilter::matches`]/[`matches_all`]）する。
+//! 責務境界: メタデータ列（`TEXT` 列）に対する**等価**・**前方一致**・
+//! **`LIKE` 一般形**（中間一致・後方一致・`_` 1 文字ワイルドカード。SQL-24・
+//! TASK-208、Issue #914）のフィルタを、任意の列名に対して宣言
+//! （[`DeclarativeFilter`]）・スキーマへ束縛（[`bind`]/[`bind_all`]）・評価
+//! （[`MetadataFilter::matches`]/[`matches_all`]）する。`LIKE` の一般形は
+//! 二次索引が対応せず plain scan へ縮退する（`sql::scalar_plan`・
+//! `sql::scalar_index` 参照）。
 //!
 //! 呼び出し文脈: `sql::allowlist::parse_where` が構文（`<col> = '<literal>'`・
 //! `<col> LIKE '<prefix>%'`・`<col> (< | > | <= | >=) '<literal>'`）を
@@ -36,6 +40,14 @@ use crate::uuid::Uuid;
 /// `catalog::MAX_COLUMN_COUNT` と同値を採用する（1 列あたり複数フィルタを許すため
 /// 列数と独立の定数だが、桁の妥当性は同じ方針に揃える）。
 pub const MAX_METADATA_FILTERS: usize = 256;
+
+/// `LIKE` パターン（生パターン。エスケープ解除前）のバイト長上限
+/// （SQL-24／TASK-208、Issue #914）。[`parse_like_pattern`] が確保・解析より
+/// **前**に判定し、超過は `54000`。中間一致・後方一致を含む一般形は
+/// [`LikePattern::matches`] の評価コストが O(n·m)（n = 値のバイト長、
+/// m = パターン長）になるため、この上限で m を定数に抑え DoS を防ぐ
+/// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」）。
+pub const MAX_LIKE_PATTERN_LEN: usize = 4096;
 
 /// フィルタの意味論。等価はバイト列一致、前方一致は `str::starts_with` による
 /// バイト前方一致（`prefix` 自体が構築時点で valid `str` のため UTF-8 境界は安全）。
@@ -101,6 +113,24 @@ pub enum FilterOp {
     /// 前置・後置 `NOT` による否定。内側の評価結果を三値論理で反転する
     /// （UNKNOWN は UNKNOWN のまま。[`MetadataFilter::eval`] 参照）。
     Not(Box<FilterOp>),
+    /// `TEXT` 列に対する `LIKE` の一般形（中間一致・後方一致・`_` 1 文字
+    /// ワイルドカードを含む。SQL-24／TASK-208、Issue #914）。純粋な前方一致
+    /// （末尾 `%` のみ）は [`FilterOp::StartsWith`] へ、ワイルドカードを
+    /// 含まない完全一致は [`FilterOp::Equals`] へ束縛時に振り分けるため
+    /// （[`parse_like_pattern`] 参照）、本 variant はそれ以外の一般形のみを
+    /// 保持する。二次索引（`sql::scalar_index::ScalarIndex::candidates_for`）は
+    /// 対応せず、`sql::scalar_plan::classify_scalar_plan` が常に
+    /// `PlainScan` へ縮退させる（索引の有無で結果が変わらないための契約）。
+    Like(LikePattern),
+    /// [`FilterOp::Like`] の未束縛版（列名指定・生パターン未解析）。
+    /// `sql::parser::bind_where_predicates` が `WherePredicate::Prefix`
+    /// （名前は互換性のため据え置き。実体は LIKE の生パターン全般）から
+    /// ここへ構築し、[`DeclarativeFilter::bind`] が列型検査後に
+    /// [`parse_like_pattern`] を呼んで `Equals`／`StartsWith`／`Like` の
+    /// いずれかへ確定させる。束縛済み [`MetadataFilter`] には現れない契約
+    /// （`bind_all`/`bind_all_for_describe` は常にこの variant を解決済みに
+    /// 変換する）。
+    LikeUnbound(String),
 }
 
 impl FilterOp {
@@ -161,12 +191,22 @@ impl FilterOp {
             FilterOp::IsNull => Some(value.is_none()),
             FilterOp::IsNotNull => Some(value.is_some()),
             FilterOp::Not(inner) => inner.eval(value).map(|b| !b),
-            // 未束縛の値（`Compare`／`InListLiteral`／`BetweenLiteral`）は
-            // `bind`/`bind_all` が常に束縛済み variant へ確定させるため評価に
-            // 到達しない契約（fail-closed の保険腕）。
+            // SQL-24／TASK-208、Issue #914: 中間一致・後方一致・`_` を含む
+            // 一般形。`TEXT` 列限定（`bind_impl` が事前検査済み）で、
+            // ENUM／VECTOR 等の型不一致値は `as_text()` が `None` を返すため
+            // UNKNOWN として扱う（fail-closed。二値論理時代の `unwrap_or(false)`
+            // と異なり、`NOT LIKE` 越しでも誤って真へ反転しない）。
+            FilterOp::Like(pattern) => {
+                let v = value?;
+                v.as_text().map(|s| pattern.matches(s))
+            }
+            // 未束縛の値（`Compare`／`InListLiteral`／`BetweenLiteral`／
+            // `LikeUnbound`）は `bind`/`bind_all` が常に束縛済み variant へ
+            // 確定させるため評価に到達しない契約（fail-closed の保険腕）。
             FilterOp::Compare { .. }
             | FilterOp::InListLiteral { .. }
-            | FilterOp::BetweenLiteral { .. } => None,
+            | FilterOp::BetweenLiteral { .. }
+            | FilterOp::LikeUnbound(_) => None,
         }
     }
 }
@@ -452,6 +492,18 @@ impl DeclarativeFilter {
         }
     }
 
+    /// `TEXT` 列に対する `LIKE` フィルタを宣言する（SQL-24／TASK-208、
+    /// Issue #914）。`pattern` は生パターン（エスケープ解除前）で、
+    /// [`Self::bind`] 時に [`parse_like_pattern`] で解析し、
+    /// `Equals`／`StartsWith`／`Like` のいずれかへ確定させる（振り分けの
+    /// 詳細は同関数のドキュメント参照）。
+    pub fn like(column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::LikeUnbound(pattern.into()),
+        }
+    }
+
     /// `schema` と照合して [`MetadataFilter`] へ束縛する。列名解決・列型検査
     /// （`Equals`/`StartsWith` は `TEXT` 列限定・`BoolEquals` は `BOOLEAN` 列限定。
     /// いずれも不一致は `22000`）・リテラル長上限（[`MAX_TEXT_FIELD_LEN`] 超は
@@ -565,6 +617,31 @@ fn bind_filter_op(
             check_literal_len(prefix)?;
             FilterOp::StartsWith(prefix.clone())
         }
+        FilterOp::LikeUnbound(pattern) => {
+            // SQL-24／TASK-208、Issue #914: `TEXT` 列限定（`Equals`／
+            // `StartsWith` と同じ制約）。ENUM／VECTOR／BOOLEAN 等は
+            // 従来どおり `22000`。
+            if !matches!(ty, ColumnType::Text) {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column_name:?} is not a TEXT column"
+                )));
+            }
+            match parse_like_pattern(pattern)? {
+                // 索引を最大限利用するため、ワイルドカードを含まない
+                // 完全一致・純粋な前方一致（末尾 `%` のみ）は既存の
+                // `Equals`／`StartsWith` へ振り分ける（`sql::scalar_index`
+                // が引き続き `index_equality`／`index_prefix` を提供する）。
+                CompiledLike::Exact(literal) => {
+                    check_literal_len(&literal)?;
+                    FilterOp::Equals(literal)
+                }
+                CompiledLike::Prefix(prefix) => {
+                    check_literal_len(&prefix)?;
+                    FilterOp::StartsWith(prefix)
+                }
+                CompiledLike::General(pattern) => FilterOp::Like(pattern),
+            }
+        }
         FilterOp::BoolEquals(value) => {
             if !matches!(ty, ColumnType::Boolean) {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -615,10 +692,11 @@ fn bind_filter_op(
         FilterOp::TypedCompare { .. }
         | FilterOp::InText(_)
         | FilterOp::InTyped(_)
-        | FilterOp::Between { .. } => {
+        | FilterOp::Between { .. }
+        | FilterOp::Like(_) => {
             // `DeclarativeFilter` の公開コンストラクタはいずれも未束縛の
-            // 値（`Compare`／`InListLiteral`／`BetweenLiteral`）を生成し、
-            // 束縛済み variant を直接構築する経路は無い（fail-closed の
+            // 値（`Compare`／`InListLiteral`／`BetweenLiteral`／`LikeUnbound`）を
+            // 生成し、束縛済み variant を直接構築する経路は無い（fail-closed の
             // 保険腕。`bind`/`bind_all` は常に未束縛の値を受け取る契約）。
             return Err(SqlSurfaceError::Internal {
                 detail:
@@ -888,6 +966,12 @@ fn check_literal_len(value: &str) -> Result<(), SqlSurfaceError> {
 
 /// `pattern`（`LIKE` 句の右辺リテラル）を前方一致の prefix へ変換する。
 ///
+/// SQL 表層の `LIKE` は Issue #914（SQL-24）以降 [`DeclarativeFilter::like`]／
+/// [`parse_like_pattern`] を経由し、本関数は通らない（中間一致・後方一致・
+/// `_` を受理するため）。本関数は Rust API 直接呼び出し
+/// （[`DeclarativeFilter::starts_with`] 等）向けの前方一致限定パーサーとして
+/// 公開 API のまま残す。
+///
 /// 受理する形状は「末尾がちょうど 1 つの `%` で、それ以外に `%`・`_`・`\` を
 /// 含まず、prefix が非空」のみ（PG の `LIKE` 全体は実装せず前方一致だけに限定して
 /// fail-closed に倒す）。以下はすべて `22000` で拒否する:
@@ -913,6 +997,191 @@ pub fn parse_prefix_pattern(pattern: &str) -> Result<String, SqlSurfaceError> {
         ));
     }
     Ok(prefix.to_string())
+}
+
+/// [`LikePattern`] を構成する 1 トークン。パターンをエスケープ解除しながら
+/// 1 パス（`chars()`）で分解した中間表現で、[`LikePattern::matches`] が
+/// この列に対して評価する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LikeToken {
+    /// リテラル 1 文字（エスケープ解除済み。`\%`・`\_`・`\\` を含む）。
+    Char(char),
+    /// `_`: ちょうど 1 **文字**（Unicode scalar）に一致する。
+    Any,
+    /// `%`: 空列を含む任意の文字列に一致する。連続する `%%` は構築時に 1 つへ
+    /// 正規化する（[`parse_like_pattern`] 参照）。
+    Star,
+}
+
+/// `LIKE` の一般形（中間一致・後方一致・`_` を含む）を表す、コンパイル済み
+/// パターン（SQL-24／TASK-208、Issue #914）。`MetadataFilter::matches` から
+/// [`Self::matches`] で評価する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LikePattern {
+    tokens: Vec<LikeToken>,
+}
+
+impl LikePattern {
+    /// `s`（対象列の値）がこのパターンに一致するか判定する。
+    ///
+    /// 貪欲法による古典的なワイルドカード照合アルゴリズム（`%` を跨ぐ再走査は
+    /// 直近の `%` 位置へ戻るだけで、再帰・バックトラックの指数爆発は起きない）。
+    /// 計算量は最悪 O(n·m)（n = `s` の文字数、m = パターンの文字数。m は
+    /// [`MAX_LIKE_PATTERN_LEN`] で定数に抑えられる）。`s` の走査はバイト
+    /// オフセット `ti`（`str::get()` でその位置から 1 文字だけ復号する）で
+    /// 行い、`Vec<char>` へ事前展開しない（行ごとの評価コストを抑えるため）。
+    /// 添字アクセス `[]` は使わず `get()` で明示的に処理する
+    /// （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
+    pub fn matches(&self, s: &str) -> bool {
+        let pat = &self.tokens;
+
+        // `ti`／`resume_at` は `s` の**バイト**オフセット。`s.get(ti..)` の
+        // 先頭 1 文字を都度復号することでマルチバイト文字を 1 文字として
+        // 扱う（`char_indices` を回さず、現在位置だけを毎回 `get()` する）。
+        let mut ti = 0usize;
+        let mut pi = 0usize;
+        let mut star_at: Option<usize> = None;
+        let mut resume_at = 0usize;
+
+        while let Some(current) = s.get(ti..).and_then(|rest| rest.chars().next()) {
+            let advanced = match pat.get(pi) {
+                Some(LikeToken::Char(c)) if *c == current => {
+                    ti += current.len_utf8();
+                    pi += 1;
+                    true
+                }
+                Some(LikeToken::Any) => {
+                    ti += current.len_utf8();
+                    pi += 1;
+                    true
+                }
+                Some(LikeToken::Star) => {
+                    star_at = Some(pi);
+                    resume_at = ti;
+                    pi += 1;
+                    true
+                }
+                _ => false,
+            };
+            if advanced {
+                continue;
+            }
+            match star_at {
+                Some(star_pi) => {
+                    pi = star_pi + 1;
+                    // 直近の `%` の再走査開始位置を 1 文字分だけ進める。
+                    let step = s
+                        .get(resume_at..)
+                        .and_then(|rest| rest.chars().next())
+                        .map(char::len_utf8)
+                        .unwrap_or(1);
+                    resume_at += step;
+                    ti = resume_at;
+                }
+                None => return false,
+            }
+        }
+        while matches!(pat.get(pi), Some(LikeToken::Star)) {
+            pi += 1;
+        }
+        pi == pat.len()
+    }
+}
+
+/// [`parse_like_pattern`] が返す、振り分け済みのコンパイル結果
+/// （SQL-24／TASK-208、Issue #914）。索引利用を最大化するため、ワイルドカード
+/// を含まない完全一致・純粋な前方一致（末尾 `%` のみ）は専用 variant へ、
+/// それ以外の一般形（中間一致・後方一致・`_`）だけを [`Self::General`] に
+/// 収める。呼び出し元（[`DeclarativeFilter::bind_impl`]）はこれを
+/// `FilterOp::Equals`／`FilterOp::StartsWith`／`FilterOp::Like` へ写像する。
+#[derive(Debug)]
+pub enum CompiledLike {
+    Exact(String),
+    Prefix(String),
+    General(LikePattern),
+}
+
+/// `pattern`（`LIKE` 句の右辺リテラル。生パターン・エスケープ解除前）を
+/// コンパイルする（SQL-24／TASK-208、Issue #914。PostgreSQL 互換のワイルドカード
+/// 意味論。詳細な契約は ADR `docs/design/like-wildcard-patterns.md` 参照）。
+///
+/// 意味論:
+/// - `%`: 空列を含む任意の文字列に一致する（連続する `%%` は 1 つに正規化）。
+/// - `_`: ちょうど 1 文字（Unicode scalar）に一致する。
+/// - `\`: 既定のエスケープ文字。`\%`・`\_`・`\\` はそれぞれリテラルの
+///   `%`・`_`・`\` として扱い、`\<その他>` はリテラル `<その他>` として扱う。
+///   パターン末尾の単独 `\`（次の文字が無い）は `22000`。
+/// - `ESCAPE` 句は未対応（構文層で受理しない。呼び出し元は本関数に到達しない）。
+///
+/// 長さ検証はアロケーション・パース**より前**に行う（`.claude/rules/
+/// coding-rust.md`「untrusted 入力の扱い」）。[`MAX_LIKE_PATTERN_LEN`] 超は
+/// `54000`。`unwrap`/`expect`/添字アクセス `[]` は使わない。
+pub fn parse_like_pattern(pattern: &str) -> Result<CompiledLike, SqlSurfaceError> {
+    if pattern.len() > MAX_LIKE_PATTERN_LEN {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "LIKE pattern length {} exceeds limit {MAX_LIKE_PATTERN_LEN}",
+            pattern.len()
+        )));
+    }
+
+    let mut tokens: Vec<LikeToken> = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped) => tokens.push(LikeToken::Char(escaped)),
+                None => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "LIKE pattern must not end with a trailing escape character '\\'",
+                    ));
+                }
+            },
+            '%' => {
+                if !matches!(tokens.last(), Some(LikeToken::Star)) {
+                    tokens.push(LikeToken::Star);
+                }
+            }
+            '_' => tokens.push(LikeToken::Any),
+            other => tokens.push(LikeToken::Char(other)),
+        }
+    }
+
+    let has_any = tokens.iter().any(|t| matches!(t, LikeToken::Any));
+    let star_count = tokens
+        .iter()
+        .filter(|t| matches!(t, LikeToken::Star))
+        .count();
+
+    if !has_any && star_count == 0 {
+        let literal: String = tokens
+            .iter()
+            .filter_map(|t| match t {
+                LikeToken::Char(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        return Ok(CompiledLike::Exact(literal));
+    }
+
+    // 添字アクセス `[]` を使わず `split_last()` で末尾要素と残りを同時に取得する
+    // （`.claude/rules/coding-rust.md`「untrusted 入力の扱い」。`pattern` は
+    // wire 経路由来の untrusted な SQL リテラル）。
+    if !has_any && star_count == 1 {
+        if let Some((LikeToken::Star, rest)) = tokens.split_last() {
+            if !rest.is_empty() {
+                let prefix: String = rest
+                    .iter()
+                    .filter_map(|t| match t {
+                        LikeToken::Char(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(CompiledLike::Prefix(prefix));
+            }
+        }
+    }
+
+    Ok(CompiledLike::General(LikePattern { tokens }))
 }
 
 /// 束縛済みのメタデータフィルタ 1 件（列インデックス解決済み）。
@@ -1602,5 +1871,247 @@ mod tests {
             .bind(&schema())
             .unwrap();
         assert!(!matches_all(&[f], &[]));
+    }
+
+    // --- SQL-24・TASK-208、Issue #914: LIKE の中間一致・後方一致・ワイルドカード ---
+
+    #[test]
+    fn parse_like_pattern_classifies_prefix_exact_and_general_forms() {
+        assert!(matches!(
+            parse_like_pattern("src/%").unwrap(),
+            CompiledLike::Prefix(p) if p == "src/"
+        ));
+        assert!(matches!(
+            parse_like_pattern("a\\_b%").unwrap(),
+            CompiledLike::Prefix(p) if p == "a_b"
+        ));
+        assert!(matches!(
+            parse_like_pattern("abc").unwrap(),
+            CompiledLike::Exact(p) if p == "abc"
+        ));
+        assert!(matches!(
+            parse_like_pattern("a\\%b").unwrap(),
+            CompiledLike::Exact(p) if p == "a%b"
+        ));
+        for general in ["%", "%abc", "a%b", "a_c", "%mid%"] {
+            assert!(
+                matches!(
+                    parse_like_pattern(general).unwrap(),
+                    CompiledLike::General(_)
+                ),
+                "pattern {general:?} must classify as General"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_like_pattern_normalizes_consecutive_percent() {
+        // `a%%` は `a%` と同じ意味（連続する `%` を 1 つへ正規化）で、末尾が
+        // 単一の `%` になるため `Prefix` へ振り分けられる。
+        assert!(matches!(
+            parse_like_pattern("a%%").unwrap(),
+            CompiledLike::Prefix(p) if p == "a"
+        ));
+    }
+
+    #[test]
+    fn parse_like_pattern_escape_semantics() {
+        assert!(matches!(
+            parse_like_pattern("100\\%").unwrap(),
+            CompiledLike::Exact(p) if p == "100%"
+        ));
+        assert!(matches!(
+            parse_like_pattern("a\\\\b").unwrap(),
+            CompiledLike::Exact(p) if p == "a\\b"
+        ));
+        // `\<その他>` はリテラル `<その他>` として扱う。
+        assert!(matches!(
+            parse_like_pattern("a\\xb").unwrap(),
+            CompiledLike::Exact(p) if p == "axb"
+        ));
+    }
+
+    #[test]
+    fn parse_like_pattern_rejects_trailing_backslash() {
+        assert_eq!(
+            parse_like_pattern("src\\").unwrap_err().wire_code(),
+            "22000"
+        );
+    }
+
+    #[test]
+    fn parse_like_pattern_rejects_over_limit_length() {
+        let at_limit = "a".repeat(MAX_LIKE_PATTERN_LEN);
+        assert!(parse_like_pattern(&at_limit).is_ok());
+        let over_limit = "a".repeat(MAX_LIKE_PATTERN_LEN + 1);
+        assert_eq!(
+            parse_like_pattern(&over_limit).unwrap_err().wire_code(),
+            "54000"
+        );
+    }
+
+    #[test]
+    fn like_pattern_matches_suffix_middle_and_wildcard() {
+        let suffix = match parse_like_pattern("%.rs").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(suffix.matches("lib.rs"));
+        assert!(!suffix.matches("lib.rsx"));
+
+        let middle = match parse_like_pattern("%/lib%").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(middle.matches("src/lib.rs"));
+        assert!(!middle.matches("src/main.rs"));
+
+        let single = match parse_like_pattern("src/_.rs").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(single.matches("src/a.rs"));
+        assert!(!single.matches("src/ab.rs"));
+        assert!(!single.matches("src/.rs"));
+    }
+
+    #[test]
+    fn like_pattern_underscore_matches_one_unicode_char() {
+        let pattern = match parse_like_pattern("日_語").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(pattern.matches("日本語"));
+        assert!(!pattern.matches("日語"));
+        assert!(!pattern.matches("日本本語"));
+    }
+
+    #[test]
+    fn like_pattern_percent_alone_matches_all_non_empty_and_empty() {
+        let pattern = match parse_like_pattern("%").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(pattern.matches(""));
+        assert!(pattern.matches("anything"));
+    }
+
+    #[test]
+    fn like_pattern_greedy_matching_is_correct() {
+        // 貪欲法でも `%a%b%` と `xaxbx` のような複数候補がある形で正しく
+        // 一致すること（バックトラックの正しさの固定）。
+        let pattern = match parse_like_pattern("%a%b%").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(pattern.matches("xaxbx"));
+        assert!(!pattern.matches("xbxax"));
+
+        let overlap = match parse_like_pattern("ab%ba").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert!(overlap.matches("ababa"));
+        assert!(!overlap.matches("aba"));
+    }
+
+    #[test]
+    fn like_pattern_brute_force_oracle_over_small_alphabet() {
+        // `{a, b}` 上の全パターン（長さ 0..=3、`%`・`_` を含む）× 全値
+        // （長さ 0..=4）を、再帰的な参照実装（オラクル）と突き合わせる
+        // 小規模な網羅比較（貪欲法の正しさの追加固定）。
+        fn oracle_matches(pattern: &[char], value: &[char]) -> bool {
+            match pattern.split_first() {
+                None => value.is_empty(),
+                Some((&'%', rest)) => (0..=value.len()).any(|i| oracle_matches(rest, &value[i..])),
+                Some((&'_', rest)) => !value.is_empty() && oracle_matches(rest, &value[1..]),
+                Some((&c, rest)) => {
+                    !value.is_empty() && value[0] == c && oracle_matches(rest, &value[1..])
+                }
+            }
+        }
+
+        let alphabet = ['a', 'b', '%', '_'];
+        let values_alphabet = ['a', 'b'];
+
+        fn combinations(alphabet: &[char], len: usize) -> Vec<Vec<char>> {
+            if len == 0 {
+                return vec![Vec::new()];
+            }
+            let mut out = Vec::new();
+            for rest in combinations(alphabet, len - 1) {
+                for &c in alphabet {
+                    let mut v = vec![c];
+                    v.extend(rest.iter().copied());
+                    out.push(v);
+                }
+            }
+            out
+        }
+
+        let mut patterns: Vec<Vec<char>> = vec![Vec::new()];
+        for len in 1..=3 {
+            patterns.extend(combinations(&alphabet, len));
+        }
+        let mut values: Vec<Vec<char>> = vec![Vec::new()];
+        for len in 1..=4 {
+            values.extend(combinations(&values_alphabet, len));
+        }
+
+        for pattern_chars in &patterns {
+            let pattern_str: String = pattern_chars.iter().collect();
+            let compiled = match parse_like_pattern(&pattern_str) {
+                Ok(CompiledLike::General(p)) => p,
+                Ok(CompiledLike::Exact(literal)) => LikePattern {
+                    tokens: literal.chars().map(LikeToken::Char).collect(),
+                },
+                Ok(CompiledLike::Prefix(prefix)) => {
+                    let mut tokens: Vec<LikeToken> = prefix.chars().map(LikeToken::Char).collect();
+                    tokens.push(LikeToken::Star);
+                    LikePattern { tokens }
+                }
+                Err(_) => continue,
+            };
+            for value_chars in &values {
+                let value_str: String = value_chars.iter().collect();
+                let expected = oracle_matches(pattern_chars, value_chars);
+                assert_eq!(
+                    compiled.matches(&value_str),
+                    expected,
+                    "pattern {pattern_str:?} value {value_str:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declarative_filter_like_binds_to_equals_starts_with_or_like() {
+        let s = schema();
+        let exact = DeclarativeFilter::like("kind", "code").bind(&s).unwrap();
+        assert!(matches!(exact.op(), FilterOp::Equals(v) if v == "code"));
+
+        let prefix = DeclarativeFilter::like("path", "src/%").bind(&s).unwrap();
+        assert!(matches!(prefix.op(), FilterOp::StartsWith(v) if v == "src/"));
+
+        let general = DeclarativeFilter::like("path", "%mid%").bind(&s).unwrap();
+        assert!(matches!(general.op(), FilterOp::Like(_)));
+        assert!(general.matches(Some(ScalarRef::Text("a/mid/b"))));
+        assert!(!general.matches(Some(ScalarRef::Text("a/b"))));
+    }
+
+    #[test]
+    fn declarative_filter_like_rejects_non_text_column() {
+        let err = DeclarativeFilter::like("embedding", "%x%")
+            .bind(&schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn declarative_filter_like_null_never_matches() {
+        let f = DeclarativeFilter::like("tag", "%x%")
+            .bind(&schema())
+            .unwrap();
+        assert!(!f.matches(None));
     }
 }

@@ -27,6 +27,13 @@
 //! 実装既定値として動作する）参照。順序は同一スナップショット内の redb
 //! 行テーブルの物理走査順（`(tenant_id, id)` 昇順）であり、`ORDER BY` 相当の意味的
 //! 順序を持たない。
+//!
+//! `OFFSET`（Issue #916・SQL-25 (b)・TASK-209。詳細は
+//! `docs/design/sql-offset-paging.md`）は「可視かつ `WHERE` 一致」の行のみを対象に
+//! 読み飛ばす。RLS 判定・`WHERE` 評価が確定した後でのみ計数するため、不可視行は
+//! 読み飛ばし数にも結果にも現れず、ページ境界の出方から他テナント行の存在・件数を
+//! 推測できない。読み飛ばした行は投影・`cells` 確保・byte 予算計上のいずれも行わない
+//! （深いページングでもメモリは O(`limit`) を保つ）。
 
 use crate::catalog::{self, ColumnType, TableSchema};
 use crate::declarative_filter;
@@ -240,6 +247,25 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
             needs_embedding = true;
         }
     }
+    // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群が参照する列・embedding も
+    // 同様に反映する。ここを取りこぼすと、OR 群が参照する列が
+    // `scalar_mask`（`scan_scalar_columns_masked`）から漏れて常に `None` に
+    // なり、あるいは embedding 未デコードのまま OR を評価することになり、
+    // OR 条件が誤って評価される（fail-open のバグになりうる。
+    // security.md「不安全な設計」対応）。
+    if !bound.or_filters.is_empty() {
+        has_scalar_reference = true;
+    }
+    for group in &bound.or_filters {
+        group.visit_column_indices(&mut |idx| {
+            if let Some(slot) = scalar_mask.get_mut(idx) {
+                *slot = true;
+            }
+        });
+        if group.references_embedding() {
+            needs_embedding = true;
+        }
+    }
 
     let tier = if needs_embedding {
         DecodeTier::Embedding
@@ -350,6 +376,11 @@ pub(crate) fn execute_scan_with_budget(
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     let mut byte_budget: usize = 0;
     let mut rows: Vec<ResultRow> = Vec::new();
+    // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` で読み飛ばした「可視かつ WHERE 一致」
+    // 行数。RLS 判定（デコード前・再適用の両方）と WHERE 評価より後でのみ加算する
+    // ことで、不可視行・WHERE 不一致行が読み飛ばし数に一切現れないようにする
+    // （不可視行のスキップ手段にしない。RLS-7/8）。
+    let mut skipped: usize = 0;
 
     // codex-review P1 指摘対応: `cells`（`Vec<Cell>`）・`rows`（`Vec<ResultRow>`）
     // 双方の確保量を累計予算へ計上する。テキスト・ベクトルの実体バイトのみを
@@ -460,11 +491,39 @@ pub(crate) fn execute_scan_with_budget(
                     }
                 }
             }
+            // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
+            // フィルタ・式述語と同じ SCALAR 段の一部として適用する。
+            for group in &bound.or_filters {
+                let group_embedding: &[f32] = match tier {
+                    DecodeTier::Embedding => embedding_scratch.as_slice(),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                };
+                if !group.matches(
+                    &scanned,
+                    id,
+                    group_embedding,
+                    dim as usize,
+                    &mut expr_scratch,
+                )? {
+                    continue 'rows;
+                }
+            }
 
             // defense-in-depth（`RlsSafetyNet` と同趣旨）: デコード前判定が唯一の
             // 防御線にならないよう、同じ `tenant_id`・`visibility` へ再適用する
             // （security.md P0）。
             if !ctx.is_visible(tenant_id, visibility) {
+                continue;
+            }
+
+            // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` 段。ここまでに到達した行は
+            // 可視かつ WHERE 一致が確定済み（上記 2 回の `is_visible` 再適用・
+            // `metadata_filters`／`expr_filters` 評価をすべて通過している）ため、
+            // ここで数えても他テナントの存在・件数の漏えいにはならない。投影・
+            // `cells` 確保・byte 予算計上より前に読み飛ばすことで、スキップされた
+            // 行はメモリを消費しない（深いページングでも O(n) を保つ）。
+            if skipped < bound.offset {
+                skipped += 1;
                 continue;
             }
 
@@ -805,6 +864,38 @@ mod tests {
         crate::storage::bump_generation_and_commit(write_txn).expect("commit");
     }
 
+    /// [`write_row_direct`] の `Visibility` 明示指定版（Issue #916・SQL-25 (b)・
+    /// TASK-209 の RLS 回帰テスト専用。他テナントの行を `Private` として書き込み、
+    /// `OFFSET` の計数が可視行のみを対象にすることを検証するために使う）。
+    fn write_row_direct_with_visibility(
+        storage: &Storage,
+        table_name: &str,
+        tenant_id: &str,
+        id: u64,
+        embedding: &[f32],
+        visibility: Visibility,
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((tenant_id, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
     fn bound_star_scan(limit: usize) -> BoundScan {
         BoundScan {
             table: "docs".to_string(),
@@ -818,7 +909,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit,
+            offset: 0,
         }
     }
 
@@ -895,6 +988,72 @@ mod tests {
         assert_eq!(result.rows.len(), 3);
     }
 
+    /// Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は物理走査順の先頭から可視行を
+    /// 読み飛ばし、`LIMIT` と組み合わせて連続するページに分割できることを確認する
+    /// （`(tenant_id, id)` 昇順の走査順は本モジュールドキュメント「順序保証なし」
+    /// 契約の一部。`id` 昇順で書き込んだため走査順は `id` 昇順に一致する）。
+    #[test]
+    fn offset_skips_leading_visible_rows_before_limit_applies() {
+        let path = unique_db_path("scan-offset-paging");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        for id in 1..=10u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let mut bound = bound_star_scan(3);
+        bound.offset = 5;
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![6, 7, 8]);
+    }
+
+    /// Issue #916・SQL-25 (b)・TASK-209（RLS-7/8）: `OFFSET` の計数は可視行のみを
+    /// 対象にする——不可視（他テナント）行が物理走査順の先頭に挟まっていても、
+    /// 読み飛ばし数には一切現れない。挟まっていない場合と同じ結果になることで、
+    /// 不可視行の存在・件数を `OFFSET` の挙動から推測できないことを確認する。
+    #[test]
+    fn offset_counts_only_visible_rows_not_other_tenant_rows() {
+        let path = unique_db_path("scan-offset-rls");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        // 物理走査順の先頭に他テナントの不可視行を多数挟む（`(tenant_id, id)` の
+        // 辞書順で "tenant-a" より前に来るよう "tenant-0" を使う。`Private` にする
+        // ことで `PolicyContext::new("tenant-a")`〔既定は `Public` のみ許可〕から
+        // 不可視にする——`Public` は可視性ラベルに関わらずテナントを跨いで見える
+        // 契約〔`policy::PolicyContext::is_visible`〕のため）。
+        for id in 1..=5u64 {
+            write_row_direct_with_visibility(
+                &storage,
+                "docs",
+                "tenant-0",
+                id,
+                &[9.0, 9.0, 9.0],
+                Visibility::Private,
+            );
+        }
+        for id in 1..=3u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let mut bound = bound_star_scan(10);
+        bound.offset = 1;
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        // 不可視行が計数に混入すれば 1 件目からずれて `[2, 3]` にならない。
+        assert_eq!(ids, vec![2, 3]);
+    }
+
     /// `vec_norm(embedding)` を投影する `Computed` 列を持つ `BoundScan` を組み立てる
     /// （Cursor Bugbot 指摘の回帰テスト用ヘルパー）。
     fn bound_scan_with_vec_norm_projection(limit: usize) -> BoundScan {
@@ -913,7 +1072,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit,
+            offset: 0,
         }
     }
 
@@ -977,7 +1138,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: vec![expr],
             expr_filter_programs: vec![program],
+            or_filters: Vec::new(),
             limit: 10,
+            offset: 0,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -1023,7 +1186,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
+            offset: 0,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -1188,7 +1353,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
+            offset: 0,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::DimAndScalar);
@@ -1204,7 +1371,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
+            offset: 0,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Fast);
@@ -1226,7 +1395,9 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
+            offset: 0,
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Embedding);

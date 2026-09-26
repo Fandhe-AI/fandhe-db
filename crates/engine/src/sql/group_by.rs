@@ -39,13 +39,14 @@ use crate::sql::aggregate::{
     accumulator_bug, storage_internal, try_clone_str, Accumulator, DecodeTier, ReferencedColumns,
     RowVector,
 };
-use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::allowlist::{SqlSurfaceError, MAX_GROUP_BY_COLUMNS};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{self, BinOp, ExprValue};
 use crate::storage;
 use redb::ReadableTable;
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 /// `GROUP BY` が生成してよいグループ数の上限（無制限 `BTreeMap` 確保を避ける）。
@@ -133,14 +134,21 @@ struct ResultBudget {
 }
 
 impl ResultBudget {
-    /// `bound` の結果形状（投影列数・集計項目数）から 1 グループあたりの固定分を
-    /// 求める。メモリ上はグループキー 1 個＋集計項目ごとのアキュムレータを保持し、
-    /// 結果は投影列数ぶんのセルになるため、両者の大きい方で見積もる。
+    /// `bound` の結果形状（投影列数・集計項目数・`GROUP BY` キー列数）から
+    /// 1 グループあたりの固定分を求める。メモリ上はグループキー
+    /// `key_count`（SQL-25 (d) で複数列に一般化）個＋集計項目ごとの
+    /// アキュムレータを保持し、結果は投影列数ぶんのセルになるため、両者の
+    /// 大きい方で見積もる（`key_count == 1` では従来と同じ見積り値になる）。
     fn new(bound: &BoundAggregate, max_result_bytes: usize) -> Result<Self, SqlSurfaceError> {
+        let key_count = bound
+            .group_by
+            .as_ref()
+            .map(|g| g.column_indices.len())
+            .unwrap_or(1);
         let cells = bound
             .projection
             .len()
-            .max(bound.items.len().saturating_add(1));
+            .max(bound.items.len().saturating_add(key_count));
         let per_group_bytes = cells
             .checked_mul(RESULT_CELL_FIXED_BYTES)
             .and_then(|b| b.checked_add(RESULT_ROW_FIXED_BYTES))
@@ -233,15 +241,113 @@ impl From<SqlSurfaceError> for GroupAccumulateError {
     }
 }
 
-/// グループキー（`GROUP BY` 対象列の値）。`None` は NULL 値のグループ（`TEXT` 列の
-/// NULL は 1 つのグループへまとめる。PostgreSQL 互換）。`Ord` はバイト順、`None` は
-/// 常に末尾（既定の昇順ソート・[`crate::sql::exec::ColumnMeta`] へ渡す前の表示順を
-/// 決定的にする）。`Option<String>` の派生 `Ord`（`None` が先頭）とは逆順になるため
-/// 手動実装する（PR #230 codex-review/Bugbot 指摘: 派生 `Ord` のままだと既定順序・
-/// `ORDER BY` 未指定時に `NULL` グループが先頭に来て `LIMIT` が意図した先頭の
-/// 非 `NULL` グループを取りこぼす）。
+/// グループキー（`GROUP BY` 対象列の組の値。SQL-25 (d) で単一列から複数列
+/// タプルへ一般化した）。各成分の `None` は NULL 値のグループ（`TEXT` 列の
+/// NULL は 1 つのグループへまとめる。PostgreSQL 互換）。`Ord` は成分ごとの
+/// 辞書式比較で、各成分は `Some` 同士ならバイト順、`Some` は常に `None` より
+/// 小さい（NULL は末尾。既定の昇順ソート・[`crate::sql::exec::ColumnMeta`] へ
+/// 渡す前の表示順を決定的にする）。単一成分（`vec![Some(_)]`／`vec![None]`）
+/// では旧 `GroupKey(Option<String>)` と完全に同じ順序になる。派生 `Ord`
+/// （`Option` は `None` が先頭）とは逆順になるため手動実装する（PR #230
+/// codex-review/Bugbot 指摘: 派生 `Ord` のままだと既定順序・`ORDER BY` 未指定時に
+/// `NULL` グループが先頭に来て `LIMIT` が意図した先頭の非 `NULL` グループを
+/// 取りこぼす）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GroupKey(Option<String>);
+struct GroupKey(Vec<Option<String>>);
+
+/// [`GroupKey`]（所有）と、複数列 `GROUP BY` の行走査ループが構築する借用成分列
+/// （[`BorrowedGroupKey`]）を同一の比較規約で扱うためのビュー。`GroupKey::cmp`・
+/// [`cmp_group_key_views`] は本トレイトの同じ実装へ委譲するため両者の順序は
+/// 構造的に一致する（`Borrow` の契約である「借用後も `Ord` が変わらない」を
+/// 保証する）。
+///
+/// PR #1099 レビュー指摘（Cursor Bugbot・codex-review、複数列 `GROUP BY` 経路）
+/// 対応: 単一列経路（`string_groups: BTreeMap<String, _>`。`String: Borrow<str>`）
+/// と同様に、複数列経路でも `multi_groups: BTreeMap<GroupKey, _>` を借用キーで
+/// 先に検索できるようにする（[`Borrow<dyn GroupKeyView>`] impl 参照）。これにより
+/// 既存グループへの累積行では成分の所有化（[`try_clone_str`]）が発生せず、新規
+/// グループが確定した行のみ [`check_new_group_budget`] の予算検査を経てから
+/// キーを 1 回所有化する。
+trait GroupKeyView {
+    /// キーの成分数（`GROUP BY` 対象列数）。
+    fn len(&self) -> usize;
+    /// `i` 番目の成分（`None` は NULL 値のグループ）。範囲外は NULL 相当。
+    fn component(&self, i: usize) -> Option<&str>;
+}
+
+impl GroupKeyView for GroupKey {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn component(&self, i: usize) -> Option<&str> {
+        self.0.get(i).and_then(|c| c.as_deref())
+    }
+}
+
+/// 行走査ループが構築する借用成分列（各成分は `scanned` から借用した `&str`）。
+/// 所有化前に [`GroupKeyView`] 経由で既存グループを検索するための一時ビュー。
+struct BorrowedGroupKey<'a>(&'a [Option<&'a str>]);
+
+impl GroupKeyView for BorrowedGroupKey<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn component(&self, i: usize) -> Option<&str> {
+        self.0.get(i).copied().flatten()
+    }
+}
+
+/// [`GroupKeyView`] 実装同士の辞書式比較（成分ごとに `Some` は常に `None` より
+/// 小さい＝NULL は末尾）。所有 [`GroupKey`] 同士の比較（`Ord`）・所有と借用の
+/// 比較（`BTreeMap` 探索、`Borrow<dyn GroupKeyView>` 経由）の両方がこの 1 つの
+/// 実装に委譲するため、順序が食い違うことはない。
+fn cmp_group_key_views(a: &dyn GroupKeyView, b: &dyn GroupKeyView) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let len = a.len().min(b.len());
+    for i in 0..len {
+        let component_order = match (a.component(i), b.component(i)) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        if component_order != Ordering::Equal {
+            return component_order;
+        }
+    }
+    // 成分数は同一クエリ内では常に揃う（`bound.group_by.column_indices` の
+    // 宣言列数で固定されるため）。念のため長さの違いも決定的に扱う。
+    a.len().cmp(&b.len())
+}
+
+impl PartialEq for dyn GroupKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        cmp_group_key_views(self, other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for dyn GroupKeyView + '_ {}
+
+impl PartialOrd for dyn GroupKeyView + '_ {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for dyn GroupKeyView + '_ {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_group_key_views(self, other)
+    }
+}
+
+/// `BTreeMap<GroupKey, _>::get_mut` を所有化前の借用キー（[`BorrowedGroupKey`]）
+/// で呼ぶための `Borrow` 実装。`&self` の生存期間のまま `&dyn GroupKeyView` を
+/// 返すだけで新たな確保は発生しない。
+impl<'a> Borrow<dyn GroupKeyView + 'a> for GroupKey {
+    fn borrow(&self) -> &(dyn GroupKeyView + 'a) {
+        self
+    }
+}
 
 impl PartialOrd for GroupKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -251,12 +357,7 @@ impl PartialOrd for GroupKey {
 
 impl Ord for GroupKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (&self.0, &other.0) {
-            (Some(a), Some(b)) => a.cmp(b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
+        cmp_group_key_views(self, other)
     }
 }
 
@@ -316,7 +417,7 @@ fn new_accumulators(
         )
     })?;
     for item in items {
-        accs.push(Accumulator::new(item.func, &item.input)?);
+        accs.push(Accumulator::for_item(item)?);
     }
     Ok(accs)
 }
@@ -348,6 +449,12 @@ fn accumulate_row(
     total_key_bytes: usize,
     budget: &ResultBudget,
     expr_scratch: &mut Vec<StackValue>,
+    // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
+    // （全グループ・全項目の合計）で 1 つ。呼び出し元
+    // （`execute_grouped_aggregate` の直接呼び出し・`observe_group_slots`・
+    // `observe_candidate_slots_grouped_inner` のいずれも同一インスタンスを
+    // 使い回す）。
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), SqlSurfaceError> {
     for (accumulator, item) in accs.iter_mut().zip(items) {
         // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
@@ -356,8 +463,18 @@ fn accumulate_row(
         // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
         // 実際の保持量を正確に反映する）。
         let before = accumulator.text_len();
+        let (distinct_entries_before, distinct_bytes_before) = accumulator.distinct_footprint();
         accumulator.observe(&item.input, id, vector, scanned, expr_scratch)?;
         let after = accumulator.text_len();
+        let (distinct_entries_after, distinct_bytes_after) = accumulator.distinct_footprint();
+        if distinct_entries_after > distinct_entries_before {
+            let delta = distinct_bytes_after
+                .checked_sub(distinct_bytes_before)
+                .ok_or_else(|| {
+                    accumulator_bug("COUNT(DISTINCT) footprint bytes decreased unexpectedly")
+                })?;
+            distinct_budget.charge(delta)?;
+        }
         if after > before {
             let delta = after - before;
             *total_text_accumulator_bytes = total_text_accumulator_bytes
@@ -430,11 +547,23 @@ fn observe_group_enumeration(
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<bool, SqlSurfaceError> {
-    let Some(groups) = index.column_groups(group_by.column_index) else {
+    // 列挙形（[`observe_group_enumeration`]）は単一キー専用（呼び出し元
+    // `execute_grouped_aggregate` が `column_indices.len() == 1` の場合のみ
+    // 呼ぶ。複数キーは全走査〔[`execute_grouped_aggregate_multi_key`]〕に
+    // 一本化する。§計画 3.5）。束縛段（`bind_group_by_clause`）が
+    // `column_indices` を必ず 1 件以上で構築するため、空は到達しない想定だが
+    // 添字アクセスを避け `.first()` で明示的に扱う。
+    let column_index = group_by
+        .column_indices
+        .first()
+        .copied()
+        .ok_or_else(|| accumulator_bug("single-key GROUP BY path called with no columns"))?;
+    let Some(groups) = index.column_groups(column_index) else {
         return Ok(false);
     };
-    let Some(null_slots) = index.slots_without_value(group_by.column_index) else {
+    let Some(null_slots) = index.slots_without_value(column_index) else {
         return Ok(false);
     };
 
@@ -482,17 +611,22 @@ fn observe_group_enumeration(
             current_group_count.saturating_add(1),
             *total_key_bytes,
             budget,
+            distinct_budget,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
                 // PR #603 codex-review P1 指摘対応: キー順の列挙による一時的な
                 // TEXT 容量超過の誤検出。ここまでに構築した索引経路の途中結果
                 // （このグループを含め）を破棄し、呼び出し元に全走査への
-                // フォールバックを促す。
+                // フォールバックを促す。SQL-25 (c)・TASK-209:
+                // `distinct_budget`（クエリ全体で共有）もここまでの部分計上を
+                // 巻き戻す（全走査の再実行は 0 から数え直すため、二重計上を
+                // 避ける）。
                 string_groups.clear();
                 *null_group = None;
                 *total_key_bytes = 0;
                 *total_text_accumulator_bytes = 0;
+                *distinct_budget = crate::sql::distinct::DistinctBudget::new();
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -525,6 +659,7 @@ fn observe_group_enumeration(
             current_group_count.saturating_add(1),
             *total_key_bytes,
             budget,
+            distinct_budget,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
@@ -532,6 +667,7 @@ fn observe_group_enumeration(
                 *null_group = None;
                 *total_key_bytes = 0;
                 *total_text_accumulator_bytes = 0;
+                *distinct_budget = crate::sql::distinct::DistinctBudget::new();
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -574,6 +710,7 @@ fn observe_group_slots(
     group_count: usize,
     total_key_bytes: usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), SqlSurfaceError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -617,6 +754,7 @@ fn observe_group_slots(
             total_key_bytes,
             budget,
             &mut expr_scratch,
+            distinct_budget,
         )?;
     }
     Ok(())
@@ -651,6 +789,7 @@ fn observe_candidate_slots_grouped(
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<bool, SqlSurfaceError> {
     match observe_candidate_slots_grouped_inner(
         snapshot,
@@ -664,6 +803,7 @@ fn observe_candidate_slots_grouped(
         total_key_bytes,
         total_text_accumulator_bytes,
         budget,
+        distinct_budget,
     ) {
         Ok(()) => Ok(true),
         Err(GroupAccumulateError::TextBudgetExceeded) => {
@@ -671,6 +811,9 @@ fn observe_candidate_slots_grouped(
             *null_group = None;
             *total_key_bytes = 0;
             *total_text_accumulator_bytes = 0;
+            // SQL-25 (c)・TASK-209: 全走査への退避時は `distinct_budget` も
+            // 巻き戻す（`observe_group_enumeration` と同じ理由）。
+            *distinct_budget = crate::sql::distinct::DistinctBudget::new();
             Ok(false)
         }
         Err(GroupAccumulateError::Other(err)) => Err(err),
@@ -692,6 +835,7 @@ fn observe_candidate_slots_grouped_inner(
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), GroupAccumulateError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -731,13 +875,41 @@ fn observe_candidate_slots_grouped_inner(
                 }
             }
         }
+        // TASK-208・Issue #912: `classify_scalar_plan` は OR 群を含む述語を常に
+        // `PlainScan` へ縮退させるため通常到達しないが、多層防御として評価する
+        // （`aggregate::observe_candidate_slots` と同じ判断）。
+        for group in &bound.or_filters {
+            let group_embedding: &[f32] = if group.references_embedding() {
+                arena
+                    .vector(slot_idx)
+                    .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?
+            } else {
+                &[]
+            };
+            if !group.matches(
+                &scanned,
+                id,
+                group_embedding,
+                arena.dim() as usize,
+                &mut expr_scratch,
+            )? {
+                continue 'candidates;
+            }
+        }
 
+        // 候補走査形（[`observe_candidate_slots_grouped`]）も列挙形と同じく
+        // 単一キー専用（呼び出し元の呼び分けは [`observe_group_enumeration`]
+        // と同じ）。
+        let column_index =
+            group_by.column_indices.first().copied().ok_or_else(|| {
+                accumulator_bug("single-key GROUP BY path called with no columns")
+            })?;
         // GROUP BY キー列は束縛段（`sql::parser::bind_group_by_clause`）で TEXT
         // 列に限定済み（BOOLEAN 列は `22000` で拒否）のため常に `Text` のはずだが、
         // untrusted な格納済みデータに由来する不変条件のため念のため
         // fail-closed に扱う（`as_text()` が `None` を返す＝NULL 相当として扱う）。
         let key_value = scanned
-            .get(group_by.column_index)
+            .get(column_index)
             .copied()
             .flatten()
             .and_then(|v| v.as_text());
@@ -768,6 +940,7 @@ fn observe_candidate_slots_grouped_inner(
                         *total_key_bytes,
                         budget,
                         &mut expr_scratch,
+                        distinct_budget,
                     )?;
                 } else {
                     check_new_group_budget(
@@ -789,6 +962,7 @@ fn observe_candidate_slots_grouped_inner(
                         *total_key_bytes,
                         budget,
                         &mut expr_scratch,
+                        distinct_budget,
                     )?;
                     string_groups.insert(try_clone_str(key_str)?, accs);
                 }
@@ -821,6 +995,7 @@ fn observe_candidate_slots_grouped_inner(
                     *total_key_bytes,
                     budget,
                     &mut expr_scratch,
+                    distinct_budget,
                 )?;
             }
         }
@@ -1022,8 +1197,10 @@ fn order_with_nulls_last(
 /// codex-review P1 指摘（PR #603）: `bound.items` に `MIN`/`MAX(<TEXT 列>)`
 /// 集計が 1 つでも含まれるかを判定する。列挙形（[`observe_group_enumeration`]）
 /// はこの判定が真の場合、[`execute_grouped_aggregate`] から呼ばれない
-/// （下記「列挙形を使わない理由」参照）。
-fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
+/// （下記「列挙形を使わない理由」参照）。`pub(crate)`: `sql::aggregate::
+/// classify_aggregate_access`（Issue #922・SQL-27の EXPLAIN 静的判定）が
+/// executor と同じ単一情報源として本関数を共有する。
+pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
     items.iter().any(|item| {
         matches!(
             item.func,
@@ -1071,16 +1248,18 @@ pub(crate) fn execute_grouped_aggregate(
 
     let expected_dim = schema.vector_dim();
 
-    // Issue #350: `GROUP BY` キー列（`group_by.column_index`）は必ず参照するため
-    // `extra_scalar_index` へ渡す。`GROUP BY` は複数グループの走査を要するため
-    // `aggregate.rs::DecodeTier::Fast`（ヘッダのみ）は選ばず、embedding 参照の
-    // 有無だけで `DimAndScalar`／`Embedding` の 2 段階を切り替える。
+    // Issue #350: `GROUP BY` キー列（`group_by.column_indices`。SQL-25 (d) で
+    // 複数列へ一般化）は必ず参照するため `extra_scalar_indices` へ渡す。
+    // `GROUP BY` は複数グループの走査を要するため `aggregate.rs::
+    // DecodeTier::Fast`（ヘッダのみ）は選ばず、embedding 参照の有無だけで
+    // `DimAndScalar`／`Embedding` の 2 段階を切り替える。
     let referenced = ReferencedColumns::derive(
         schema,
         &bound.items,
         &bound.metadata_filters,
         &bound.expr_filters,
-        Some(group_by.column_index),
+        &bound.or_filters,
+        &group_by.column_indices,
     );
     let tier = if referenced.needs_embedding() {
         DecodeTier::Embedding
@@ -1088,18 +1267,33 @@ pub(crate) fn execute_grouped_aggregate(
         DecodeTier::DimAndScalar
     };
 
+    // 単一キー（`column_indices.len() == 1`）は既存の索引経路・
+    // `string_groups`／`null_group` 分割（Issue #351）をそのまま使う。複数キー
+    // （SQL-25 (d)）は全走査限定の `multi_groups: BTreeMap<GroupKey, _>` に
+    // 一本化する（§計画 3.5「複数列経路は全走査のみ」）。
+    let key_count = group_by.column_indices.len();
     // 集計表を非 NULL（`string_groups`）と NULL（`null_group`）に分割する
     // （Issue #351）。`string_groups: BTreeMap<String, _>` は `String: Borrow<str>`
     // により `get_mut(&str)` の借用キー検索が標準 API のまま可能で、既存グループ
     // への累積では追加のヒープ確保・二重探索が発生しない。索引経路（Issue #475）・
-    // 全走査経路のいずれも同じ変数へ書き込む共有の集計表。
+    // 全走査経路のいずれも同じ変数へ書き込む共有の集計表（単一キー限定）。
     let mut string_groups: BTreeMap<String, Vec<Accumulator>> = BTreeMap::new();
     let mut null_group: Option<Vec<Accumulator>> = None;
+    // 複数キー（`key_count >= 2`）専用の集計表。索引経路を使わない全走査のみが
+    // 書き込む。
+    let mut multi_groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
     // PR #1049 レビュー指摘 codex P1 対応: 生成中の結果全体に対する予算判定器
     // （[`ResultBudget`]）。索引経路・全走査経路の双方が共有する。
     let budget = ResultBudget::new(bound, max_result_bytes)?;
+    // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
+    // （全グループ・全項目の合計）で 1 つ。索引経路が
+    // `is_text_accumulator_budget_error` で全走査へ退避する際は呼び出し先
+    // （`observe_group_enumeration`・`observe_candidate_slots_grouped`）が
+    // このインスタンスを空へ巻き戻すため、下の全走査はそのまま同じ変数を
+    // 使い回せる（二重計上しない）。
+    let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
 
     // Issue #475: `WHERE` なしの `GROUP BY`（列挙形。`ScalarIndex::column_groups`/
     // `slots_without_value` で索引済みの値ごとにグループを直接構築する）、また
@@ -1112,14 +1306,29 @@ pub(crate) fn execute_grouped_aggregate(
     // クエリの正しさに影響しない（fail-closed。`aggregate.rs` モジュール
     // ドキュメント「Issue #475」節と同じ設計）。
     let mut used_index_path = false;
-    if let (Some(expected_dim_value), Some(arena_access), Some(scalar_access)) =
+    if key_count != 1 {
+        // `ScalarIndex::column_groups`／`resolve_candidates` 経由の索引経路は
+        // 単一キー専用（`sql::scalar_index::ScalarIndex::column_groups` の
+        // 契約）。複数列 `GROUP BY`（SQL-25 (d)）は全走査に一本化するため
+        // （§計画 3.5）、使わない索引スナップショットを cold cache で構築
+        // しない（`text_min_max_blocks_enumeration` 分岐と同じ判断）。
+        if let Some(scalar_access) = scalar_cache.as_ref() {
+            scalar_access.cache.record_aggregate_plain_scan_fallback();
+        }
+    } else if let (Some(expected_dim_value), Some(arena_access), Some(scalar_access)) =
         (expected_dim, arena_cache.as_ref(), scalar_cache.as_ref())
     {
-        let where_less = bound.metadata_filters.is_empty() && bound.expr_filters.is_empty();
+        // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b` だけの
+        // `GROUP BY`（`metadata_filters`／`expr_filters` は両方空）が
+        // 「WHERE なし」と誤判定され、列挙形（`ScalarIndex::column_groups`。
+        // フィルタを一切適用しない）へ流れて OR 条件が黙って無視される
+        // fail-open のバグになる（security.md「不安全な設計」対応）。
+        let where_less = !bound.has_where_filters();
         let scalar_shape = crate::sql::scalar_plan::ScalarShapeInput {
             scalar_prefilter: true,
             metadata_filters: &bound.metadata_filters,
             expr_filters: &bound.expr_filters,
+            or_filters: &bound.or_filters,
         };
         let candidate_walk = !where_less
             && crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
@@ -1178,6 +1387,7 @@ pub(crate) fn execute_grouped_aggregate(
                             &mut total_key_bytes,
                             &mut total_text_accumulator_bytes,
                             &budget,
+                            &mut distinct_budget,
                         )?;
                     } else {
                         let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
@@ -1205,6 +1415,7 @@ pub(crate) fn execute_grouped_aggregate(
                                 &mut total_key_bytes,
                                 &mut total_text_accumulator_bytes,
                                 &budget,
+                                &mut distinct_budget,
                             )?;
                         }
                     }
@@ -1332,6 +1543,23 @@ pub(crate) fn execute_grouped_aggregate(
                         }
                     }
                 }
+                // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存の
+                // メタデータフィルタ・式述語と同じ SCALAR 段の一部として適用する。
+                for group in &bound.or_filters {
+                    let group_embedding: &[f32] = match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                    };
+                    if !group.matches(
+                        &scanned,
+                        id,
+                        group_embedding,
+                        dim as usize,
+                        &mut expr_scratch,
+                    )? {
+                        continue 'rows;
+                    }
+                }
 
                 // defense-in-depth（RlsSafetyNet と同趣旨）。ヘッダから取り出した
                 // `tenant_id`・`visibility` に対して再適用する（独立した二重検証では
@@ -1343,20 +1571,8 @@ pub(crate) fn execute_grouped_aggregate(
 
                 // GROUP 段: グループキーを確定してから、可視行のみをグループ表へ
                 // 反映する（このため他テナントにしか存在しないキーはグループとして
-                // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。借用キー（`&str`）で
-                // まず既存グループを 1 回だけ探索し、ヒットした行では所有 `String` を
-                // 一切確保しない（Issue #351）。
-                // GROUP BY キー列は束縛段（`sql::parser::bind_group_by_clause`）で TEXT
-                // 列に限定済み（BOOLEAN 列は `22000` で拒否）のため常に `Text` のはずだが、
-                // untrusted な格納済みデータに由来する不変条件のため念のため
-                // fail-closed に扱う（`as_text()` が `None` を返す＝NULL 相当として扱う）。
-                let key_value = scanned
-                    .get(group_by.column_index)
-                    .copied()
-                    .flatten()
-                    .and_then(|v| v.as_text());
-                let total_group_count = string_groups.len() + usize::from(null_group.is_some());
-
+                // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。
+                //
                 // 行 1 件分の `VECTOR` 列ビュー（Issue #350）。`tier` が
                 // `DecodeTier::Embedding` を選んだ場合のみ実体（`embedding_scratch`）を
                 // 持ち、それ以外は `dim` のみで `values: None`（`Accumulator::observe`
@@ -1369,10 +1585,88 @@ pub(crate) fn execute_grouped_aggregate(
                         DecodeTier::Fast | DecodeTier::DimAndScalar => None,
                     },
                 };
-                match key_value {
-                    Some(key_str) => {
-                        if let Some(accs) = string_groups.get_mut(key_str) {
-                            // 既存グループへの累積: 探索 1 回・String 確保 0 回。
+
+                if key_count == 1 {
+                    // 単一キー: 借用キー（`&str`）でまず既存グループを 1 回だけ
+                    // 探索し、ヒットした行では所有 `String` を一切確保しない
+                    // （Issue #351）。GROUP BY キー列は束縛段
+                    // （`sql::parser::bind_group_by_clause`）で TEXT 列に限定済み
+                    // （BOOLEAN 列は `22000` で拒否）のため常に `Text` のはずだが、
+                    // untrusted な格納済みデータに由来する不変条件のため念のため
+                    // fail-closed に扱う（`as_text()` が `None` を返す＝NULL 相当
+                    // として扱う）。
+                    let column_index =
+                        group_by.column_indices.first().copied().ok_or_else(|| {
+                            accumulator_bug("single-key GROUP BY path called with no columns")
+                        })?;
+                    let key_value = scanned
+                        .get(column_index)
+                        .copied()
+                        .flatten()
+                        .and_then(|v| v.as_text());
+                    let total_group_count = string_groups.len() + usize::from(null_group.is_some());
+                    match key_value {
+                        Some(key_str) => {
+                            if let Some(accs) = string_groups.get_mut(key_str) {
+                                // 既存グループへの累積: 探索 1 回・String 確保 0 回。
+                                accumulate_row(
+                                    accs,
+                                    &bound.items,
+                                    id,
+                                    &vector,
+                                    &scanned,
+                                    &mut total_text_accumulator_bytes,
+                                    total_group_count,
+                                    total_key_bytes,
+                                    &budget,
+                                    &mut expr_scratch,
+                                    &mut distinct_budget,
+                                )?;
+                            } else {
+                                // 新規グループ: 予算検査 → ローカルでアキュムレータを
+                                // 確保・累積 → 確定後に 1 回だけキーを所有化して挿入
+                                // する（挿入後の再探索は不要）。
+                                check_new_group_budget(
+                                    total_group_count,
+                                    &mut total_key_bytes,
+                                    key_str.len(),
+                                    total_text_accumulator_bytes,
+                                    &budget,
+                                )?;
+                                let mut accs = new_accumulators(&bound.items)?;
+                                accumulate_row(
+                                    &mut accs,
+                                    &bound.items,
+                                    id,
+                                    &vector,
+                                    &scanned,
+                                    &mut total_text_accumulator_bytes,
+                                    total_group_count.saturating_add(1),
+                                    total_key_bytes,
+                                    &budget,
+                                    &mut expr_scratch,
+                                    &mut distinct_budget,
+                                )?;
+                                string_groups.insert(try_clone_str(key_str)?, accs);
+                            }
+                        }
+                        None => {
+                            if null_group.is_none() {
+                                check_new_group_budget(
+                                    total_group_count,
+                                    &mut total_key_bytes,
+                                    0,
+                                    total_text_accumulator_bytes,
+                                    &budget,
+                                )?;
+                                null_group = Some(new_accumulators(&bound.items)?);
+                            }
+                            // NULL グループは直前で存在が確定しているため、グループ数は
+                            // 非 NULL グループ数＋1。
+                            let group_count = string_groups.len().saturating_add(1);
+                            let accs = null_group.as_mut().ok_or_else(|| {
+                                accumulator_bug("null group entry disappeared after insertion")
+                            })?;
                             accumulate_row(
                                 accs,
                                 &bound.items,
@@ -1380,55 +1674,68 @@ pub(crate) fn execute_grouped_aggregate(
                                 &vector,
                                 &scanned,
                                 &mut total_text_accumulator_bytes,
-                                total_group_count,
+                                group_count,
                                 total_key_bytes,
                                 &budget,
                                 &mut expr_scratch,
+                                &mut distinct_budget,
                             )?;
-                        } else {
-                            // 新規グループ: 予算検査 → ローカルでアキュムレータを
-                            // 確保・累積 → 確定後に 1 回だけキーを所有化して挿入
-                            // する（挿入後の再探索は不要）。
-                            check_new_group_budget(
-                                total_group_count,
-                                &mut total_key_bytes,
-                                key_str.len(),
-                                total_text_accumulator_bytes,
-                                &budget,
-                            )?;
-                            let mut accs = new_accumulators(&bound.items)?;
-                            accumulate_row(
-                                &mut accs,
-                                &bound.items,
-                                id,
-                                &vector,
-                                &scanned,
-                                &mut total_text_accumulator_bytes,
-                                total_group_count.saturating_add(1),
-                                total_key_bytes,
-                                &budget,
-                                &mut expr_scratch,
-                            )?;
-                            string_groups.insert(try_clone_str(key_str)?, accs);
                         }
                     }
-                    None => {
-                        if null_group.is_none() {
-                            check_new_group_budget(
-                                total_group_count,
-                                &mut total_key_bytes,
-                                0,
-                                total_text_accumulator_bytes,
-                                &budget,
-                            )?;
-                            null_group = Some(new_accumulators(&bound.items)?);
+                } else {
+                    // 複数キー（SQL-25 (d)）: 索引経路を持たない全走査専用の
+                    // `multi_groups` へ振り分ける。各成分は単一キーと同じ規約
+                    // （`TEXT` 限定・fail-closed で NULL 扱い）で解決する。
+                    //
+                    // PR #1099 レビュー指摘（Cursor Bugbot・codex-review）対応:
+                    // 単一キー経路（`string_groups.get_mut(key_str)`。上記
+                    // 484〜489 行目のコメント参照）と同じく、まず借用成分列
+                    // （`scanned` から借用した `&str`。所有化なし）で
+                    // `multi_groups` を検索し（[`GroupKey`] の
+                    // `Borrow<dyn GroupKeyView>` impl 経由）、既存グループへの
+                    // 累積だけで済む行では成分の所有化（[`try_clone_str`]）を
+                    // 一切発生させない。新規グループが確定した行のみ
+                    // [`check_new_group_budget`] の予算検査を経てから成分を
+                    // 1 回所有化する（旧実装は探索前に毎行 `try_clone_str` で
+                    // 所有化しており、既存グループ更新行でも不要な複製が発生し、
+                    // かつ予算超過で拒否される行でも複製コストを先払いしていた）。
+                    //
+                    // PR #1099 レビュー再指摘（codex-review P2）対応: 借用成分列
+                    // 自体（`Vec<Option<&str>>`）も既存グループに一致する行で
+                    // 毎行ヒープ確保していた。`GROUP BY` 列数は束縛段
+                    // （[`crate::sql::allowlist::check_group_by_column_count`]）で
+                    // 列を `push` する前に [`MAX_GROUP_BY_COLUMNS`] 以下へ検査済み
+                    // のため、固定長スタック配列で足り、行走査のたびの確保が
+                    // 不要になる。束縛段の不変条件が破れて上限を超えていた場合は
+                    // fail-closed で `accumulator_bug`（`XX000`）へ落とす。
+                    let key_count = group_by.column_indices.len();
+                    if key_count > MAX_GROUP_BY_COLUMNS {
+                        return Err(accumulator_bug(
+                            "GROUP BY column count exceeds MAX_GROUP_BY_COLUMNS at execution time",
+                        ));
+                    }
+                    let mut borrowed_storage: [Option<&str>; MAX_GROUP_BY_COLUMNS] =
+                        [None; MAX_GROUP_BY_COLUMNS];
+                    let mut key_len: usize = 0;
+                    for (slot, &column_index) in
+                        borrowed_storage.iter_mut().zip(&group_by.column_indices)
+                    {
+                        let value = scanned
+                            .get(column_index)
+                            .copied()
+                            .flatten()
+                            .and_then(|v| v.as_text());
+                        if let Some(s) = value {
+                            key_len = key_len.checked_add(s.len()).ok_or_else(|| {
+                                accumulator_bug("GROUP BY key length accounting overflowed")
+                            })?;
                         }
-                        // NULL グループは直前で存在が確定しているため、グループ数は
-                        // 非 NULL グループ数＋1。
-                        let group_count = string_groups.len().saturating_add(1);
-                        let accs = null_group.as_mut().ok_or_else(|| {
-                            accumulator_bug("null group entry disappeared after insertion")
-                        })?;
+                        *slot = value;
+                    }
+                    let borrowed_components = &borrowed_storage[..key_count];
+                    let probe = BorrowedGroupKey(borrowed_components);
+                    let total_group_count = multi_groups.len();
+                    if let Some(accs) = multi_groups.get_mut(&probe as &dyn GroupKeyView) {
                         accumulate_row(
                             accs,
                             &bound.items,
@@ -1436,11 +1743,57 @@ pub(crate) fn execute_grouped_aggregate(
                             &vector,
                             &scanned,
                             &mut total_text_accumulator_bytes,
-                            group_count,
+                            total_group_count,
                             total_key_bytes,
                             &budget,
                             &mut expr_scratch,
+                            &mut distinct_budget,
                         )?;
+                    } else {
+                        check_new_group_budget(
+                            total_group_count,
+                            &mut total_key_bytes,
+                            key_len,
+                            total_text_accumulator_bytes,
+                            &budget,
+                        )?;
+                        // 予算検査を通過した行のみ、各成分を所有化する
+                        // （`str::to_string` 等の無条件のインフォリブルな確保は、
+                        // untrusted な格納済み TEXT 列値のサイズに対して確保失敗時
+                        // に abort し得るため使わず、単一キー経路の
+                        // `try_clone_str` と同じ `try_reserve_exact` ベースの
+                        // 確保にする。`.claude/rules/security.md`「不安全な設計」
+                        // 対応）。
+                        let mut key_components: Vec<Option<String>> = Vec::new();
+                        key_components
+                            .try_reserve_exact(borrowed_components.len())
+                            .map_err(|_| {
+                                SqlSurfaceError::payload_too_large(
+                                    "GROUP BY key allocation exceeds available memory",
+                                )
+                            })?;
+                        for value in borrowed_components {
+                            key_components.push(match value {
+                                Some(s) => Some(try_clone_str(s)?),
+                                None => None,
+                            });
+                        }
+                        let group_key = GroupKey(key_components);
+                        let mut accs = new_accumulators(&bound.items)?;
+                        accumulate_row(
+                            &mut accs,
+                            &bound.items,
+                            id,
+                            &vector,
+                            &scanned,
+                            &mut total_text_accumulator_bytes,
+                            total_group_count.saturating_add(1),
+                            total_key_bytes,
+                            &budget,
+                            &mut expr_scratch,
+                            &mut distinct_budget,
+                        )?;
+                        multi_groups.insert(group_key, accs);
                     }
                 }
             }
@@ -1453,15 +1806,29 @@ pub(crate) fn execute_grouped_aggregate(
     // 保証済みの内部添字だが、untrusted 入力に由来する添字アクセスを避ける
     // 方針（`.claude/rules/coding-rust.md`）に従い、ここでも `.get()` で明示的に
     // 扱い、万一の不整合は panic ではなく [`accumulator_bug`]（`XX000`）へ落とす。
-    // 分割前の `GroupKey::Ord`（非 NULL はバイト昇順・NULL は常に末尾）と同一の
-    // 走査順にするため、`string_groups`（`BTreeMap` の昇順 `into_iter`）→
-    // `null_group` の順で連結する（Issue #351。`sort-determinism-check`・
-    // 決定性テストが前提とする順序を維持）。
-    let total_group_count = string_groups.len() + usize::from(null_group.is_some());
-    let group_entries = string_groups
-        .into_iter()
-        .map(|(k, accs)| (GroupKey(Some(k)), accs))
-        .chain(null_group.into_iter().map(|accs| (GroupKey(None), accs)));
+    //
+    // 単一キー（`key_count == 1`）は分割前の `GroupKey::Ord`（非 NULL はバイト
+    // 昇順・NULL は常に末尾）と同一の走査順にするため、`string_groups`
+    // （`BTreeMap` の昇順 `into_iter`）→ `null_group` の順で連結する
+    // （Issue #351。`sort-determinism-check`・決定性テストが前提とする順序を
+    // 維持）。複数キー（SQL-25 (d)）は `multi_groups`（`BTreeMap<GroupKey, _>`。
+    // 既に `GroupKey::Ord` の昇順）をそのまま使う。
+    let total_group_count =
+        string_groups.len() + usize::from(null_group.is_some()) + multi_groups.len();
+    let group_entries: Box<dyn Iterator<Item = (GroupKey, Vec<Accumulator>)>> = if key_count == 1 {
+        Box::new(
+            string_groups
+                .into_iter()
+                .map(|(k, accs)| (GroupKey(vec![Some(k)]), accs))
+                .chain(
+                    null_group
+                        .into_iter()
+                        .map(|accs| (GroupKey(vec![None]), accs)),
+                ),
+        )
+    } else {
+        Box::new(multi_groups.into_iter())
+    };
 
     let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(total_group_count);
     for (key, accs) in group_entries {
@@ -1493,15 +1860,24 @@ pub(crate) fn execute_grouped_aggregate(
         Some(order_by) => {
             finished.sort_by(|(ka, ca), (kb, cb)| {
                 let primary = match order_by.target {
-                    OrderTarget::GroupKey => order_with_nulls_last(
-                        ka.0.is_none(),
-                        kb.0.is_none(),
-                        match (&ka.0, &kb.0) {
-                            (Some(a), Some(b)) => a.cmp(b),
-                            _ => std::cmp::Ordering::Equal,
-                        },
-                        order_by.descending,
-                    ),
+                    OrderTarget::GroupKey(key_index) => {
+                        // `key_index` は束縛段（`bind_group_by_clause`）が
+                        // `column_indices` の範囲内であることを保証済みの内部
+                        // 添字だが、`.get()` で明示的に扱い範囲外は NULL 相当
+                        // （末尾）へ安全側にフォールバックする（防御的分岐。
+                        // 到達しない想定）。
+                        let a_component = ka.0.get(key_index).and_then(Option::as_ref);
+                        let b_component = kb.0.get(key_index).and_then(Option::as_ref);
+                        order_with_nulls_last(
+                            a_component.is_none(),
+                            b_component.is_none(),
+                            match (a_component, b_component) {
+                                (Some(a), Some(b)) => a.cmp(b),
+                                _ => std::cmp::Ordering::Equal,
+                            },
+                            order_by.descending,
+                        )
+                    }
                     OrderTarget::Aggregate(idx) => {
                         let ca_cell = ca.get(idx).unwrap_or(&Cell::Null);
                         let cb_cell = cb.get(idx).unwrap_or(&Cell::Null);
@@ -1522,6 +1898,16 @@ pub(crate) fn execute_grouped_aggregate(
         None => finished.sort_by(|(ka, _), (kb, _)| ka.cmp(kb)),
     }
 
+    // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
+    // 適用する（グループはすでに可視行のみから構成済み〔`sql::aggregate` の
+    // 走査ループが RLS を適用してから集約する〕ため、この段で読み飛ばしても RLS
+    // 契約は変わらない）。`drain` の範囲は `finished.len()` でクランプし、添字
+    // アクセス（`[]`）を使わない（`.claude/rules/coding-rust.md`）。
+    if group_by.offset > 0 {
+        let drop_to = group_by.offset.min(finished.len());
+        finished.drain(..drop_to);
+    }
+
     if let Some(limit) = group_by.limit {
         finished.truncate(limit);
     }
@@ -1530,7 +1916,7 @@ pub(crate) fn execute_grouped_aggregate(
     let mut columns = Vec::with_capacity(bound.projection.len());
     for col in &bound.projection {
         let name = match col {
-            ProjectionColumn::GroupKey { name } => name.clone(),
+            ProjectionColumn::GroupKey { name, .. } => name.clone(),
             ProjectionColumn::Aggregate { name, .. } => name.clone(),
         };
         columns.push(ColumnMeta::Computed { name });
@@ -1542,9 +1928,18 @@ pub(crate) fn execute_grouped_aggregate(
         for col in &bound.projection {
             let cell =
                 match col {
-                    ProjectionColumn::GroupKey { .. } => match &key.0 {
-                        Some(s) => Cell::Text(s.clone()),
-                        None => Cell::Null,
+                    // `key_index` は束縛段が `column_indices`（＝ `key.0`）の範囲内で
+                    // あることを保証済みの内部添字だが、`.get()` で明示的に扱い
+                    // 範囲外は fail-closed に `accumulator_bug`（`XX000`）へ落とす
+                    // （`.claude/rules/coding-rust.md`）。
+                    ProjectionColumn::GroupKey { key_index, .. } => match key.0.get(*key_index) {
+                        Some(Some(s)) => Cell::Text(s.clone()),
+                        Some(None) => Cell::Null,
+                        None => {
+                            return Err(accumulator_bug(
+                                "projection key_index out of bounds for GROUP BY key",
+                            ))
+                        }
                     },
                     ProjectionColumn::Aggregate { item_index, .. } => cells
                         .get(*item_index)
@@ -1622,13 +2017,16 @@ mod tests {
                 func: AggregateFunc::Count,
                 input: AggregateInput::AllVisible,
                 name: "result".to_string(),
+                distinct: false,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
+                    key_index: 0,
                     name: "lang".to_string(),
                 },
                 crate::sql::parser::ProjectionColumn::Aggregate {
@@ -1637,12 +2035,62 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
-                column_index: 1,
+                column_indices: vec![1],
                 having: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         }
+    }
+
+    /// Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
+    /// 適用する（3.3 節）ことを、`ORDER BY` なし（既定のグループキー昇順ソート）の
+    /// `GROUP BY` 集計で確認する。5 グループ（"a".."e"）を昇順ソート後、
+    /// `OFFSET 2 LIMIT 2` は 3・4 番目（"c"・"d"）だけを返す。
+    #[test]
+    fn group_by_offset_skips_leading_sorted_groups_before_limit_applies() {
+        let path = unique_db_path("group-by-offset-paging");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+        write_lang_rows(
+            &storage,
+            &schema,
+            &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+        );
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let mut bound = bound_count_star_grouped_by_lang();
+        if let Some(group_by) = bound.group_by.as_mut() {
+            group_by.offset = 2;
+            group_by.limit = Some(2);
+        }
+
+        let result = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+        )
+        .expect("grouped aggregate with OFFSET should succeed");
+
+        let keys: Vec<&str> = result
+            .rows
+            .iter()
+            .map(|row| match &row.cells[0] {
+                Cell::Text(s) => s.as_str(),
+                other => panic!("expected group key cell to be Text, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, vec!["c", "d"]);
     }
 
     // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
@@ -1697,19 +2145,23 @@ mod tests {
                     func: AggregateFunc::Min,
                     input: AggregateInput::TextColumn(1),
                     name: "result_min".to_string(),
+                    distinct: false,
                 },
                 BoundAggregateItem {
                     func: AggregateFunc::Max,
                     input: AggregateInput::TextColumn(1),
                     name: "result_max".to_string(),
+                    distinct: false,
                 },
             ],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
+                    key_index: 0,
                     name: "lang".to_string(),
                 },
                 crate::sql::parser::ProjectionColumn::Aggregate {
@@ -1722,10 +2174,11 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
-                column_index: 1,
+                column_indices: vec![1],
                 having: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         }
     }
@@ -1980,13 +2433,16 @@ mod tests {
                 func: AggregateFunc::Count,
                 input: AggregateInput::UuidColumn(2),
                 name: "result".to_string(),
+                distinct: false,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
+                    key_index: 0,
                     name: "lang".to_string(),
                 },
                 crate::sql::parser::ProjectionColumn::Aggregate {
@@ -1995,10 +2451,11 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
-                column_index: 1,
+                column_indices: vec![1],
                 having: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         }
     }
@@ -2034,7 +2491,12 @@ mod tests {
             &bound.items,
             &bound.metadata_filters,
             &bound.expr_filters,
-            bound.group_by.as_ref().map(|g| g.column_index),
+            &bound.or_filters,
+            bound
+                .group_by
+                .as_ref()
+                .map(|g| g.column_indices.as_slice())
+                .unwrap_or(&[]),
         );
         assert!(
             !referenced.needs_embedding(),

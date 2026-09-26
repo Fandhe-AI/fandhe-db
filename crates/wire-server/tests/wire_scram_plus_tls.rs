@@ -20,6 +20,9 @@ use std::time::Duration;
 use wire_server::auth::hmac_sha256::{hmac_sha256, pbkdf2_hmac_sha256_one_block};
 use wire_server::auth::{base64_std, scram, UserStore};
 use wire_server::limits::ConnectionLimiter;
+use wire_server::tls::ed25519::SigningKey;
+use wire_server::tls::server_handshake::TlsServerConfig;
+use wire_server::tls::x509::ServerCertificateChain;
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 
@@ -236,6 +239,18 @@ fn spawn_tls_scram_server(
     users_path: &std::path::Path,
     advertise_scram_channel_binding: bool,
 ) -> std::net::SocketAddr {
+    let tls = tls_client::test_config_with_scram_channel_binding(advertise_scram_channel_binding);
+    spawn_tls_scram_server_with_config(users_path, tls)
+}
+
+/// [`spawn_tls_scram_server`] の一般化版（Issue #1088）。任意の
+/// `TlsServerConfig` で起動できるようにし、Ed25519 署名以外の葉証明書
+/// （ECDSA-SHA256 署名 OID 等）でも同じ SCRAM-PLUS 交換ヘルパー一式を
+/// 再利用できるようにする。
+fn spawn_tls_scram_server_with_config(
+    users_path: &std::path::Path,
+    tls: Arc<TlsServerConfig>,
+) -> std::net::SocketAddr {
     let store = Arc::new(
         UserStore::load_from_file(users_path)
             .expect("valid user store")
@@ -245,7 +260,6 @@ fn spawn_tls_scram_server(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let limiter = ConnectionLimiter::new(16);
-    let tls = tls_client::test_config_with_scram_channel_binding(advertise_scram_channel_binding);
 
     std::thread::spawn(move || {
         wire_server::server::accept_loop_with_tls(
@@ -325,6 +339,106 @@ fn tls_plus_channel_binding_authenticates_successfully() {
 
     let gs2_header: &[u8] = b"p=tls-server-end-point,,";
     let client_nonce = "plus-test-nonce-1";
+    let client_first_bare = format!("n=,r={client_nonce}").into_bytes();
+    let mut client_first_body = gs2_header.to_vec();
+    client_first_body.extend_from_slice(&client_first_bare);
+    send_sasl_initial_response(&mut channel, scram::MECHANISM_NAME_PLUS, &client_first_body);
+
+    let server_first = parse_server_first(read_sasl_continue(&mut channel));
+
+    let client_final_no_proof =
+        client_final_without_proof(gs2_header, &cbind_data, &server_first.nonce);
+    let auth_message = compute_auth_message(
+        &client_first_bare,
+        &server_first.server_first_body,
+        &client_final_no_proof,
+    );
+    let proof = compute_client_proof(
+        password,
+        &server_first.salt,
+        server_first.iterations,
+        &auth_message,
+    );
+    let mut client_final = client_final_no_proof.clone();
+    client_final.extend_from_slice(b",p=");
+    client_final.extend_from_slice(base64_std::encode(&proof).as_bytes());
+    send_sasl_response(&mut channel, &client_final);
+
+    let (ty, body) = read_message(&mut channel);
+    assert_eq!(ty, b'R', "expected AuthenticationSASLFinal");
+    let mut code_buf = [0u8; 4];
+    code_buf.copy_from_slice(&body[..4]);
+    assert_eq!(i32::from_be_bytes(code_buf), 12);
+
+    let (ty, body) = read_message(&mut channel);
+    assert_eq!(ty, b'R', "expected AuthenticationOk");
+    let mut code_buf = [0u8; 4];
+    code_buf.copy_from_slice(&body[..4]);
+    assert_eq!(i32::from_be_bytes(code_buf), 0);
+
+    let mut safety = 0;
+    loop {
+        let (ty, _) = read_message(&mut channel);
+        if ty == b'Z' {
+            break;
+        }
+        safety += 1;
+        assert!(safety < 20, "too many messages before ReadyForQuery");
+    }
+}
+
+/// 受入基準（Issue #1088 codex-review P2 指摘への対応）: 署名アルゴリズム
+/// OID が `ecdsa-with-SHA256`（鍵種別は SPKI 上 Ed25519 のまま）の葉証明書
+/// でも `--tls-scram-channel-binding enable` の accept 側が実クライアント
+/// 接続で機能し、PLUS 交換が最後まで成功して `ReadyForQuery` へ到達する
+/// こと。`tls_channel_binding.rs::ecdsa_signed_ed25519_key_leaf_is_rfc5929_
+/// defined_and_enable_is_accepted` は判定関数の単体確認に留まるため、本
+/// テストは実際にサーバーへ証明書を載せ、クライアント接続・SCRAM-PLUS
+/// 交換の最後まで駆動する。証明書は
+/// [`tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der`] が返す
+/// 実際に CA が署名した DER（README/ADR が案内する「RSA/ECDSA CA 署名済み
+/// 葉証明書」を代表する fixture。codex-review 再指摘で全 0 埋め
+/// `signatureValue` から差し替えた）を使う。`signatureValue` 自体の
+/// 暗号学的検証は `x509.rs` モジュール doc が明記するとおり本実装の
+/// スコープ外（発行者鍵の検証はクライアントの責務）で、実 CA 署名か
+/// どうかでサーバー側の受理判定は変わらないが、本テストは判定を
+/// 変えるためではなく、現実の CA 署名済み証明書が持つ形状（実サイズの
+/// ECDSA 署名・拡張・非空 issuer/subject）でもパーサと PLUS 交換一式が
+/// 通ることを検証する。
+#[test]
+fn tls_plus_channel_binding_authenticates_successfully_with_ecdsa_signed_leaf() {
+    let password = b"correct horse battery staple";
+    let users_path = write_scram_user_store_file(password);
+
+    let der = tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der();
+    let chain = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &tls_client::RFC8032_TEST1_PUBLIC_KEY,
+        1_600_000_000,
+    )
+    .expect("valid synthetic chain");
+    let key = SigningKey::from_seed_bytes(tls_client::hex_decode32(tls_client::RFC8032_TEST1_SEED));
+    let tls = Arc::new(
+        TlsServerConfig::new(chain, key)
+            .expect("matching leaf/key")
+            .with_scram_channel_binding(true),
+    );
+
+    let addr = spawn_tls_scram_server_with_config(&users_path, tls);
+    let mut channel = connect_and_upgrade_to_tls(addr);
+    write_startup_message(&mut channel, "alice", "irrelevant-db");
+
+    let mechanisms = read_authentication_sasl_mechanisms(&mut channel);
+    assert!(mechanisms.contains(&scram::MECHANISM_NAME_PLUS.to_string()));
+
+    let cbind_data =
+        wire_server::tls::channel_binding::tls_server_end_point(channel.client_leaf_der())
+            .expect("ecdsa-with-SHA256 signature OID is RFC 5929 defined")
+            .as_bytes()
+            .to_vec();
+
+    let gs2_header: &[u8] = b"p=tls-server-end-point,,";
+    let client_nonce = "plus-test-nonce-ecdsa-leaf";
     let client_first_bare = format!("n=,r={client_nonce}").into_bytes();
     let mut client_first_body = gs2_header.to_vec();
     client_first_body.extend_from_slice(&client_first_bare);

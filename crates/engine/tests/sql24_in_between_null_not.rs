@@ -363,6 +363,43 @@ fn distance_first_is_null_excludes_non_null_integer_column() {
     );
 }
 
+/// origin/main マージ時の回帰テスト（Issue #912 の `OR` と #913 の `IS NULL` の
+/// 統合）: `HINT ORDER(DISTANCE, SCALAR, RLS)`（DISTANCE 先行）の下で、`OR` 群の
+/// 分岐に INTEGER 列（`qty`。全行が非 NULL）への `IS NULL` を含む `WHERE`。
+/// `bound.or_filters` の判定は `on_visible_row` が保持する生の `scanned`
+/// （`row_codec::ScalarRef`）に対して行う（`candidate_columns`〔`Value`〕への
+/// 逆変換を経由しない）ことを固定する。逆変換経由だと `Value::Integer` が実
+/// NULL と区別できず、上の単純 `IS NULL` テストと同じ理由で fail-open になる。
+#[test]
+fn distance_first_or_group_is_null_excludes_non_null_integer_column() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_five_rows(&core, &alice);
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE lang = 'zz' OR qty IS NULL \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 100 \
+                 HINT ORDER(DISTANCE, SCALAR, RLS)"
+            ),
+        )
+        .expect("DISTANCE-first HINT ORDER should still apply OR-group IS NULL");
+    assert!(
+        ids(&result
+            .rows
+            .iter()
+            .map(|r| r.cells.clone())
+            .collect::<Vec<_>>())
+        .is_empty(),
+        "no row has lang='zz' and no row has a NULL qty; a non-empty result means \
+         the OR group's IS NULL fail-opened on a non-NULL INTEGER column under \
+         DISTANCE-first postfilter"
+    );
+}
+
 #[test]
 fn distance_first_is_not_null_includes_non_null_integer_column() {
     let (core, path) = new_core();

@@ -29,11 +29,16 @@
 //! - R6: 非ループバック bind × `allow` は非 0 終了し hint 行が出ること
 //! - R7: R2・R5 の stderr に鍵・証明書の内容（seed の hex・PKCS#8 の
 //!   base64 本文・証明書 PEM の本文）が含まれないこと
-//! - R8（Issue #970）: `--tls-scram-channel-binding` 単独指定は組合せ不正・
-//!   未知の語彙値は fail-closed 拒否。`enable` は AuthenticationSASL の
-//!   機構リストへ `SCRAM-SHA-256-PLUS` を追加し起動ログへ運用上の注意行を
-//!   1 行出す一方、未指定（既定 `disable`）は機構リストが `SCRAM-SHA-256`
-//!   のみのまま・注意行も出ないこと
+//! - R8（Issue #970・#1088）: `--tls-scram-channel-binding` 単独指定は
+//!   組合せ不正・未知の語彙値は fail-closed 拒否。葉証明書の署名アルゴリズム
+//!   に RFC 5929 が定義するハッシュが無い（Ed25519 など）場合の `enable` は
+//!   `--auth-method` に関わらず起動時に非 0 終了で拒否され、機構リスト自体
+//!   が構築されない（黙って PLUS 非提示へ縮退しない）。RFC 5929 が定義する
+//!   ハッシュを持つ署名（ECDSA-SHA256 等）の葉証明書であれば `enable` は
+//!   受理され、AuthenticationSASL の機構リストへ `SCRAM-SHA-256-PLUS` を
+//!   追加し起動ログへ運用上の注意行を 1 行出す。未指定（既定 `disable`）・
+//!   明示 `disable` はいずれも機構リストが `SCRAM-SHA-256` のみのまま・
+//!   注意行も出ないこと
 
 #[path = "common/mod.rs"]
 mod common;
@@ -1103,11 +1108,208 @@ fn connect_tls_and_read_sasl_mechanisms(addr: std::net::SocketAddr) -> Vec<Strin
     read_authentication_sasl_mechanisms(&mut channel)
 }
 
+/// [`write_valid_tls_pair`] の実 CA 署名版（codex-review P2
+/// 指摘・Issue #1088）: 手組み DER の全 0 埋め `signatureValue` ではなく、
+/// [`tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der`] が返す
+/// 実際に CA が `ecdsa-with-SHA256` で署名した葉証明書を使う。鍵材料は
+/// [`tls_client::RFC8032_TEST1_SEED`] で他ヘルパーと共通のため、
+/// `drive_client_handshake_over_socket`／SCRAM の鍵一致検査はそのまま通る。
+fn write_ca_signed_ecdsa_leaf_tls_pair(
+    fixture: &TempFixtureDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let seed = tls_client::hex_decode32(tls_client::RFC8032_TEST1_SEED);
+    let cert_der = tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der();
+    let cert_path = fixture.path("cert.pem");
+    tls_client::write_pem_file(&cert_path, &tls_client::pem_wrap("CERTIFICATE", &cert_der));
+    let key_path = fixture.path("key.pem");
+    tls_client::write_pem_file(&key_path, &tls_client::ed25519_pkcs8_pem(&seed));
+    (cert_path, key_path)
+}
+
+/// Issue #1088: `--tls-scram-channel-binding enable` と、RFC 5929 が定義
+/// するハッシュを持たない署名アルゴリズムの葉証明書（Ed25519 署名。
+/// `write_valid_tls_pair` が組む証明書）の組合せは起動時に fail-closed で
+/// 拒否され、`SCRAM-SHA-256-PLUS` は一切提示されない（黙って PLUS 非提示へ
+/// 縮退しない。R1）。
 #[test]
-fn tls_scram_channel_binding_enable_advertises_plus_mechanism() {
-    let fixture = TempFixtureDir::new("r8-scram-cb-enable");
+fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-ed25519-rejected");
     let (users_path, mock_key_path) = write_scram_user_store_and_mock_key(&fixture);
     let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    let output = common::run_wire_server_to_exit(&[
+        "--users",
+        users_path.to_str().expect("utf-8 path"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--auth-method",
+        "scram-sha-256",
+        "--scram-mock-key-file",
+        mock_key_path.to_str().expect("utf-8 path"),
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+        "--tls-scram-channel-binding",
+        "enable",
+    ]);
+    assert!(
+        !output.status.success(),
+        "enable with an Ed25519-signed leaf must be rejected at startup"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in ["--tls-scram-channel-binding", "RFC 5929", "Ed25519"] {
+        assert!(
+            stderr.contains(expected),
+            "expected stderr to contain {expected:?}, got: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("listening on"),
+        "rejected startup must not reach listen: {stderr}"
+    );
+    assert!(
+        !stderr.contains("TLS enabled"),
+        "rejected startup must not reach the TLS-enabled log line: {stderr}"
+    );
+    let lines: Vec<String> = stderr.lines().map(str::to_string).collect();
+    assert_no_secret_leak(&lines, &fixture);
+}
+
+/// Issue #1088: `--auth-method` 未指定（既定 cleartext）でも、`enable` と
+/// Ed25519 署名の葉証明書の組合せは同じく拒否される（判定を
+/// `--auth-method` に依存させないことの確認。「フラグが効かないまま受理
+/// される」経路を作らない）。`assert_startup_rejected` の期待文字列に
+/// `RFC 5929` を使い、単独指定拒否（`tls_scram_channel_binding_alone_
+/// is_rejected` 等）の別経路のエラーと取り違えないようにする（そちらは
+/// フラグ名しか含まない）。
+#[test]
+fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected_under_cleartext_auth() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-ed25519-rejected-cleartext");
+    write_user_store_with_alice(&fixture.path("users.txt"));
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    assert_startup_rejected(
+        &[
+            "--users",
+            &fixture.path_str("users.txt"),
+            "--db",
+            &fixture.db_path_str(),
+            "--bind",
+            "127.0.0.1:0",
+            "--tls-cert",
+            cert_path.to_str().expect("utf-8 path"),
+            "--tls-key",
+            key_path.to_str().expect("utf-8 path"),
+            "--tls-scram-channel-binding",
+            "enable",
+        ],
+        "RFC 5929",
+    );
+}
+
+/// Issue #1088 の起動時拒否は SQL 表層限定であり、NoSQL 表層は SASL 往復
+/// 自体を持たないため `enable` を無条件で no-op として受理する契約
+/// （H5・Issue #968）を維持すること（codex-review PR #1089 P1 是正の回帰
+/// テスト）。`tls_scram_channel_binding_enable_with_ed25519_signed_leaf_
+/// is_rejected_under_cleartext_auth` と同じ Ed25519 葉証明書・
+/// `enable` の組合せでも、`--surface nosql` では起動を拒否せず listening
+/// まで到達すること・拒否理由（`RFC 5929`）が stderr に出ないことを確認する。
+#[test]
+fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_accepted_under_nosql_surface() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-ed25519-accepted-nosql");
+    write_user_store_with_alice(&fixture.path("users.txt"));
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    let mut server = common::SpawnedServer::spawn(&[
+        "--users",
+        &fixture.path_str("users.txt"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--surface",
+        "nosql",
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+        "--tls-scram-channel-binding",
+        "enable",
+    ]);
+    server
+        .wait_for_listening(Instant::now() + Duration::from_secs(10))
+        .expect("nosql surface must accept --tls-scram-channel-binding enable as a no-op");
+
+    let lines = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !lines.iter().any(|l| l.contains("RFC 5929")),
+        "nosql surface must not run the SQL-only Ed25519 rejection check: {lines:?}"
+    );
+    assert_no_secret_leak(&lines, &fixture);
+}
+
+/// Issue #1088・R2: `disable` を明示しても機構リストは `SCRAM-SHA-256` の
+/// みで、`--tls-scram-channel-binding enable` 時にだけ出る注意行も出ない
+/// こと（未指定〔既定〕と同じ挙動）。
+#[test]
+fn tls_scram_channel_binding_explicit_disable_does_not_advertise_plus_mechanism() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-explicit-disable");
+    let (users_path, mock_key_path) = write_scram_user_store_and_mock_key(&fixture);
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    let mut server = common::SpawnedServer::spawn(&[
+        "--users",
+        users_path.to_str().expect("utf-8 path"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--auth-method",
+        "scram-sha-256",
+        "--scram-mock-key-file",
+        mock_key_path.to_str().expect("utf-8 path"),
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+        "--tls-scram-channel-binding",
+        "disable",
+    ]);
+    let addr = server
+        .wait_for_listening(Instant::now() + Duration::from_secs(10))
+        .expect("server must reach listening state");
+
+    let mechanisms = connect_tls_and_read_sasl_mechanisms(addr.parse().expect("valid addr"));
+    assert_eq!(
+        mechanisms,
+        vec![wire_server::auth::scram::MECHANISM_NAME.to_string()],
+        "expected only SCRAM-SHA-256 (no PLUS) with explicit disable: {mechanisms:?}"
+    );
+
+    let lines = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertisement enabled")),
+        "unexpected PLUS advisory line with explicit disable: {lines:?}"
+    );
+    assert_no_secret_leak(&lines, &fixture);
+}
+
+/// Issue #1088: ECDSA-SHA256 署名の葉証明書（鍵は本サーバーが要求する
+/// Ed25519 のまま）であれば、`enable` は受理され `SCRAM-SHA-256-PLUS` が
+/// 提示される（判定が SPKI ではなく署名アルゴリズムを見ていることの、
+/// CLI 結線を通した確認）。codex-review P2 指摘への対応
+/// （`write_ca_signed_ecdsa_leaf_tls_pair` 参照）で、手組みの全 0 埋め
+/// `signatureValue` ではなく実際に CA が署名した葉証明書を使う。
+#[test]
+fn tls_scram_channel_binding_enable_with_ecdsa_sha256_signed_leaf_advertises_plus_mechanism() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-ecdsa-accepted");
+    let (users_path, mock_key_path) = write_scram_user_store_and_mock_key(&fixture);
+    let (cert_path, key_path) = write_ca_signed_ecdsa_leaf_tls_pair(&fixture);
 
     let mut server = common::SpawnedServer::spawn(&[
         "--users",

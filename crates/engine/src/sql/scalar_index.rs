@@ -1293,13 +1293,22 @@ impl ScalarIndex {
             // 候補削減を信頼せず既存の全行走査（フィルタ事前/事後適用）へ
             // フォールバックする（fail-closed。索引未対応が誤って
             // 「一致 0 件」に化けない）。
+            //
+            // `LIKE` の一般形（中間一致・後方一致・`_`。SQL-24／TASK-208、
+            // Issue #914）は二次索引が対応しない（`OrderedColumnIndex`／
+            // `column.equality`・`prefix_slots` のいずれの表現にも一般形の
+            // 照会手段が無い）ため同じく `None` を返す（fail-closed。索引の
+            // 有無で結果が変わらない契約を守る）。`LikeUnbound`（未束縛）も
+            // `Compare` と同じ網羅性のための保険腕。
             FilterOp::Compare { .. }
             | FilterOp::InListLiteral { .. }
             | FilterOp::BetweenLiteral { .. }
             | FilterOp::InTyped(_)
             | FilterOp::IsNull
             | FilterOp::IsNotNull
-            | FilterOp::Not(_) => return None,
+            | FilterOp::Not(_)
+            | FilterOp::Like(_)
+            | FilterOp::LikeUnbound(_) => return None,
         };
         result.sort_unstable();
         result.dedup();
@@ -2471,6 +2480,34 @@ mod tests {
         let actual = index.candidates_for(&in_filter).expect("indexed column");
         assert_eq!(actual, expected);
         assert_eq!(actual, vec![0, 2]);
+    }
+
+    /// SQL-24・TASK-208、Issue #914: `LIKE` の一般形（中間一致・後方一致・`_`）は
+    /// 二次索引が対応せず `candidates_for` が `None` を返す（「一致 0 件」
+    /// `Some(vec![])` と区別する。呼び出し元は全行走査へ縮退する）。
+    #[test]
+    fn candidates_for_like_general_form_is_none() {
+        let path = unique_db_path("scalar-index-like-not-indexed");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(
+            &storage,
+            &ctx_a,
+            1,
+            Some("alpha"),
+            Some("src/a.rs"),
+            Visibility::Public,
+        );
+
+        let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let like_filter = crate::declarative_filter::DeclarativeFilter::like("path", "%a%")
+            .bind(&schema)
+            .expect("bind like filter");
+        assert_eq!(index.candidates_for(&like_filter), None);
     }
 
     #[test]

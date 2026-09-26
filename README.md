@@ -23,6 +23,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
 - **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）。ただし複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`）では、同点タイブレークは常駐行列の行スロット昇順であり、行を `(tenant_id, id)` キー順（`Storage` の行キー順）で常駐行列へ渡すという事前条件のもとで `(tenant_id, id)` 昇順になる（単一テナント内では従来どおり id 昇順。CPU 経路・GPU 経路とも同一）
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
+- **通信路暗号化（TLS 1.3・opt-in）**: 外部クレートを追加しない自作 TLS 1.3（X25519・`TLS_AES_128_GCM_SHA256`・Ed25519 証明書。TASK-228・WIRE-9・HTTP-10 ポインタ。実装リスクはセキュリティ監査〔Issue #971〕の実施を条件にオーナー判断で受容済み）。`--tls-cert <PEM> --tls-key <Ed25519 PKCS#8 PEM>` で有効化し、未指定時は従来どおり平文・loopback 限定のまま。`--tls-mode`（既定 `require`）で非ループバック bind の可否を制御し、`--surface nosql` では HTTPS 終端として同じ設定を共有する。クライアント側は loopback 限定の開発時は `sslmode=require` で接続できるが、`sslmode=require` は通信路の暗号化のみでサーバー証明書検証を行わないため中間者を正規サーバーと誤認しうる。**非ループバック運用では信頼する CA 証明書を `sslrootcert` に設定した `sslmode=verify-full` を使用する**こと。SCRAM-SHA-256-PLUS の提示は既定無効。詳細は下記「wire-server の起動（TASK-73）」節・[`docs/design/tls-wire-connection.md`](docs/design/tls-wire-connection.md)・[`docs/design/tls-scram-design.md`](docs/design/tls-scram-design.md) を参照
 - **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ。GPU 側 workgroup 内部分 Top-k（共有メモリ上の bitonic ソート網＋CPU 側 `TopKSelector` 最終マージ）は [`docs/design/gpu-batch-topk.md`](docs/design/gpu-batch-topk.md)（Issue #535 で設計・#536 で実装済み・#537 で前後比較実測済み。readback バイト数は
 12.66〜12.79x 削減を確定的カウンタで確認し、ADR ステータスは Accepted）
 - **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（posting へのスコアリング走査のみがコーパス文書数への線形走査から脱却し、可視集合走査 `O(|visible_ids|)`・スコアアキュムレータ初期化 `O(N)` は残る。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
@@ -240,7 +241,12 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
 - TLS 自体は `--tls-cert`／`--tls-key`（下記参照）で opt-in できます。SCRAM
   channel binding（`SCRAM-SHA-256-PLUS`・`p=` フラグ）は結線済みですが、
   機構リストへの提示は `--tls-scram-channel-binding enable`（下記参照。
-  既定 `disable`）を明示指定した場合のみです（Issue #941・#970）。
+  既定 `disable`）を明示指定した場合のみです（Issue #941・#970）。`enable`
+  かつ葉証明書の署名アルゴリズムに RFC 5929 が定義するハッシュが無い
+  （Ed25519 など）場合は、SQL 表層（`--surface sql`。既定）に限り起動時に
+  拒否されます（Issue #1088）。NoSQL 表層（`--surface nosql`）は本項冒頭の
+  とおり SCRAM 自体を併用しないため、この判定は適用されず `enable` は
+  無条件で no-op として受理されます（Issue #968）。
 - **`--scram-mock-key-file <path>` が必須です**（`scram-sha-256` 選択時のみ。
   未指定・`cleartext` との組合せ・32 バイト未満のファイルはいずれも
   fail-closed で起動拒否）。未知ユーザー向けモック検証子（列挙攻撃対策）の
@@ -304,20 +310,31 @@ TLS 有効時は起動ログへ `TLS enabled (mode=require|allow)` の 1 行の�
 Issue #969・#968 の担当です。詳細は
 `docs/design/tls-wire-connection.md` を参照してください。
 
-`--tls-scram-channel-binding`（`enable`／`disable`。Issue #970・WIRE-18
-ポインタ）は SCRAM-SHA-256-PLUS（`p=tls-server-end-point`。RFC 5929 §4）
-を機構リストへ提示するかを選ぶ opt-in CLI 引数です。`--tls-mode` と同じく
-`--tls-cert`／`--tls-key` を指定したときのみ意味を持ち、単独指定は
-fail-closed で起動エラーになります。**未指定時の既定は `disable`**（非
-提示）です。本サーバーが受理する唯一の葉鍵種別である Ed25519 証明書に
-対し、libpq（psql 18.6・OpenSSL 3.5.5 で実測）の既定設定
-`channel_binding=prefer`・`channel_binding=require` は `enable` を選ぶと
-TLS 確立後の SCRAM 交換で失敗しうる（`could not find digest for NID
-UNDEF`。TLS ハンドシェイク自体は成立します）ため、一般的な libpq
-クライアントとの互換性を優先し既定を `disable` にしています。`enable`
-を選んだ場合は起動ログへ運用上の注意を 1 行追加で出します。実測結果・
-判断根拠の詳細は `docs/design/tls-channel-binding.md`（ADR）を参照して
-ください。
+`--tls-scram-channel-binding`（`enable`／`disable`。Issue #970・#1088・
+WIRE-9・WIRE-18 ポインタ）は SCRAM-SHA-256-PLUS
+（`p=tls-server-end-point`。RFC 5929 §4）を機構リストへ提示するかを選ぶ
+opt-in CLI 引数です。`--tls-mode` と同じく `--tls-cert`／`--tls-key` を
+指定したときのみ意味を持ち、単独指定は fail-closed で起動エラーに
+なります。**未指定時の既定は `disable`**（非提示）です。
+
+`enable` を選び、かつ葉証明書の署名アルゴリズムに RFC 5929 が定義する
+ハッシュが無い場合（本サーバーが受理する唯一の葉鍵種別である Ed25519 鍵を、
+Ed25519 で自己署名した証明書を含む）は、**SQL 表層（`--surface sql`。既定）
+に限り起動時に非 0 終了で拒否されます**（Issue #1088）。NoSQL 表層
+（`--surface nosql`）は SASL 往復自体を持たないためこの判定を適用せず、
+同じ Ed25519 葉証明書のままでも `enable` は無条件で no-op として起動を
+継続します（Issue #968・上記「NoSQL 表層とは併用できません」項参照）。
+libpq（psql 18.6・OpenSSL 3.5.5 で実測）の既定設定
+`channel_binding=prefer`・`channel_binding=require` はそのような葉証明書に
+対し TLS 確立後の SCRAM 交換で失敗する（`could not find digest for NID
+UNDEF`。TLS ハンドシェイク自体は成立します）ため、黙って PLUS を非提示へ
+縮退させるのではなく起動時に構成ミスとして拒否する判断です。`enable` を
+使うには、RSA／ECDSA（署名ハッシュが MD5／SHA-1／SHA-256／SHA-512。
+SHA-384 は本サーバーの自作実装が対応していないため同じく拒否されます）の
+CA が署名した葉証明書を用意してください（サーバー鍵自体は引き続き
+Ed25519 のみです）。受理される構成で `enable` を選んだ場合は起動ログへ
+運用上の注意を 1 行追加で出します。実測結果・判断根拠の詳細は
+`docs/design/tls-channel-binding.md`（ADR）を参照してください。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

@@ -290,6 +290,45 @@ fn view_read_applies_referencing_session_rls_not_creator_visibility() {
     // 既に固定済み）。
 }
 
+/// SQL-24・TASK-208、Issue #914: `CREATE VIEW` 本体の `LIKE` も中間一致の
+/// 一般形を受理し、往復（定義の保存・参照時の再検証）で意味論が壊れない
+/// ことを固定する（`sql::allowlist::render_view_body` は生パターンを無加工で
+/// 保持するため、`DeclarativeFilter::like` の振り分けは参照のたびに再実行
+/// される）。
+#[test]
+fn view_body_like_general_form_matches_direct_query() {
+    let path = unique_db_path("view-like-general-form");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    let core = new_core(storage);
+    let mut session = allowed_session();
+
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW body_has_public AS SELECT id, lang, body FROM docs WHERE body LIKE '%public%'",
+    )
+    .expect("create view should succeed");
+
+    for tenant in ["alice", "bob", "carol"] {
+        let via_view =
+            scan(&core, tenant, "SELECT id FROM body_has_public LIMIT 100").expect("view scan");
+        let direct = scan(
+            &core,
+            tenant,
+            "SELECT id FROM docs WHERE body LIKE '%public%' LIMIT 100",
+        )
+        .expect("direct scan");
+        assert_eq!(
+            result_ids(&via_view),
+            result_ids(&direct),
+            "tenant={tenant}: view result must match direct query for LIKE general form"
+        );
+    }
+}
+
 /// ビュー経由のクエリでも、ビュー自身の未知列参照は `22000` で拒否する。
 #[test]
 fn view_column_scope_rejects_unknown_column() {

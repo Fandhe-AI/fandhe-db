@@ -21,6 +21,10 @@ use std::time::Duration;
 use wire_server::auth::UserStore;
 use wire_server::limits::ConnectionLimiter;
 use wire_server::tls::channel_binding::{self, TlsServerEndPoint};
+use wire_server::tls::ed25519::SigningKey;
+use wire_server::tls::server_handshake::TlsServerConfig;
+use wire_server::tls::x509::ServerCertificateChain;
+use wire_server::tls_opt::{self, ScramChannelBindingRejection};
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 
@@ -143,4 +147,58 @@ fn scram_channel_binding_disabled_config_does_not_change_export_value() {
     let disabled = tls_client::test_config_with_scram_channel_binding(false);
     assert!(!disabled.scram_channel_binding_enabled());
     assert_eq!(disabled.tls_server_end_point().copied(), enabled);
+}
+
+// --- Issue #1088: `enable` と RFC 5929 が定義するハッシュを持たない
+// 署名アルゴリズム（Ed25519 など）の組合せの起動時拒否 ----------------------
+
+/// Ed25519 自己署名の葉証明書（`tls_client::test_config` と同じ鍵材料）は、
+/// RFC 5929 が単一ハッシュを定義しない署名アルゴリズムのため
+/// `tls_server_end_point_is_rfc5929_defined()` が `false`、
+/// `check_scram_channel_binding(&cfg, true)` が `NoRfc5929Hash` を返す。
+#[test]
+fn ed25519_signed_leaf_is_not_rfc5929_defined_and_enable_is_rejected() {
+    let config = tls_client::test_config_with_scram_channel_binding(true);
+    assert!(!config.tls_server_end_point_is_rfc5929_defined());
+    assert_eq!(
+        tls_opt::check_scram_channel_binding(&config, true),
+        Err(ScramChannelBindingRejection::NoRfc5929Hash)
+    );
+    // R2: `enabled == false` は同じ証明書でも常に許容する。
+    assert_eq!(tls_opt::check_scram_channel_binding(&config, false), Ok(()));
+}
+
+/// Ed25519 鍵の葉証明書でも、署名アルゴリズム OID を `ecdsa-with-SHA256`
+/// （RFC 5929 が SHA-256 を定義する）にすれば `enable` は受理される。
+/// 判定は SPKI（鍵種別）ではなく `signatureAlgorithm` を見ていることの確認。
+#[test]
+fn ecdsa_signed_ed25519_key_leaf_is_rfc5929_defined_and_enable_is_accepted() {
+    let der = tls_client::build_ed25519_leaf_certificate_der_with_signature_algorithm(
+        &tls_client::RFC8032_TEST1_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &tls_client::OID_ECDSA_WITH_SHA256_BYTES,
+    );
+    let chain = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &tls_client::RFC8032_TEST1_PUBLIC_KEY,
+        1_600_000_000,
+    )
+    .expect("valid synthetic chain");
+    let key = SigningKey::from_seed_bytes(tls_client::hex_decode32(tls_client::RFC8032_TEST1_SEED));
+    let config = TlsServerConfig::new(chain, key)
+        .expect("matching leaf/key")
+        .with_scram_channel_binding(true);
+
+    assert!(config.tls_server_end_point_is_rfc5929_defined());
+    assert_eq!(tls_opt::check_scram_channel_binding(&config, true), Ok(()));
+}
+
+/// Ed25519 の設定でも、`with_scram_channel_binding(true)` はライブラリ API
+/// として従来どおり構築できること（R3: CLI 拒否とライブラリ API 構築可能性
+/// を混同しない）。
+#[test]
+fn with_scram_channel_binding_still_constructs_for_ed25519_signed_leaf() {
+    let config = tls_client::test_config_with_scram_channel_binding(true);
+    assert!(config.scram_channel_binding_enabled());
 }

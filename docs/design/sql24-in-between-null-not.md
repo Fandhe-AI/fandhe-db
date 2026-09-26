@@ -123,9 +123,12 @@ flatten()` で NULL と同一視すると、`IsNull` が誤って真になる（
 ## 再送判定のハッシュ（RECOVER-11）
 
 `recovery::content_hash::push_dml_where_predicate` に新しい種別タグ
-（8=`InList`、9=`Between`、10=`IsNull`〔`negated` を付加〕、11=`Not`〔内側を
-再帰で直列化〕）を追加した。構文段が連続する `NOT` を偶奇で正規化するため、
-`NOT NOT x` と `x` は同じハッシュになる（意図した正規化）。
+（9=`InList`、10=`Between`、11=`IsNull`〔`negated` を付加〕、12=`Not`〔内側を
+再帰で直列化〕）を追加した（origin/main の Issue #912・`OR` が先にタグ 8 を
+採番済みだったため、本 PR を origin/main へマージした際に 9〜12 へ採番し
+直した。実装記録は `docs/design/implementation-status.md` のマージ記録参照）。
+構文段が連続する `NOT` を偶奇で正規化するため、`NOT NOT x` と `x` は
+同じハッシュになる（意図した正規化）。
 
 ## レビュー是正（PR #913・codex-review）
 

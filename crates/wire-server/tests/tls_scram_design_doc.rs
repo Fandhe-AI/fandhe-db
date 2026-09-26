@@ -150,3 +150,106 @@ fn design_doc_does_not_claim_finalized_while_proposed() {
         "ステータスが Proposed のままタイトルが確定を主張している: {title_line}"
     );
 }
+
+/// Issue #971 でのセキュリティ監査完了に伴い、ステータス行が Accepted へ
+/// 更新されていることを検証する（実装完了後も Proposed のまま放置されない
+/// ようにするための回帰テスト）。
+#[test]
+fn design_doc_status_is_accepted() {
+    let content = read_design_doc();
+    let status_line = content
+        .lines()
+        .find(|line| line.starts_with("- ステータス:"))
+        .expect("ステータス行が見つからない");
+    assert!(
+        status_line.contains("Accepted"),
+        "ステータス行が Accepted を含まない: {status_line}"
+    );
+}
+
+/// '## セキュリティ監査' 節（Issue #971）が存在し、節本文（次の `## ` 見出し
+/// までを添字アクセスなしに `lines()` で切り出した範囲）に定数時間性
+/// （A1）・untrusted 長さ検証（A2）双方の監査対象識別子が現れることを
+/// 検証する。他節にたまたま同じ語が含まれるだけの vacuous pass を防ぐため、
+/// 節本文のみで判定する。
+#[test]
+fn design_doc_has_security_audit_section_with_targets() {
+    let content = read_design_doc();
+
+    let mut section_lines: Vec<&str> = Vec::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        if line.starts_with("## セキュリティ監査") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if line.starts_with("## ") {
+                break;
+            }
+            section_lines.push(line);
+        }
+    }
+    assert!(
+        !section_lines.is_empty(),
+        "'## セキュリティ監査' 見出しが見つからない、または節本文が空"
+    );
+    let section_body = section_lines.join("\n");
+
+    // A1: 定数時間性の監査対象（x25519・ed25519・aes・GHASH〔gf128_mul〕・
+    // ct_eq・finished）。
+    for token in ["x25519", "ed25519", "aes", "gf128_mul", "ct_eq", "finished"] {
+        assert!(
+            section_body.to_lowercase().contains(token),
+            "セキュリティ監査節に '{token}' の言及が見つからない"
+        );
+    }
+
+    // A2: untrusted 長さ検証の監査対象（レコード・ハンドシェイク・DER）。
+    for token in ["record", "handshake", "der"] {
+        assert!(
+            section_body.to_lowercase().contains(token),
+            "セキュリティ監査節に '{token}' の言及が見つからない"
+        );
+    }
+}
+
+/// '## スコープ外' 節（TLS 対象外 5 項目）が実装完了後も明記されていることを
+/// 検証する。
+#[test]
+fn design_doc_scope_out_section_lists_excluded_items() {
+    let content = read_design_doc();
+
+    let mut section_lines: Vec<&str> = Vec::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        if line.starts_with("## スコープ外") {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            if line.starts_with("## ") {
+                break;
+            }
+            section_lines.push(line);
+        }
+    }
+    assert!(
+        !section_lines.is_empty(),
+        "'## スコープ外' 見出しが見つからない、または節本文が空"
+    );
+    let section_body = section_lines.join("\n");
+
+    for token in [
+        "0-RTT",
+        "KeyUpdate",
+        "TLS 1.2",
+        "セッション再開",
+        "クライアント証明書",
+    ] {
+        assert!(
+            section_body.contains(token),
+            "スコープ外節に '{token}' の言及が見つからない"
+        );
+    }
+}

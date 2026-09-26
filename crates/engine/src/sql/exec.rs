@@ -571,7 +571,12 @@ pub(crate) fn execute_statement_with_cache(
     // キャッシュ済み索引をそのまま使う。
     // `sparse_cache` が `None`（公開ラッパー `execute_statement` 経由。モジュール
     // 冒頭ドキュメント参照）の場合はキャッシュを一切経由しない。
-    let filters_empty = bound.metadata_filters.is_empty() && bound.expr_filters.is_empty();
+    // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b` だけの
+    // クエリが「フィルタなし」と誤判定され、疎索引・HNSW フィルタなし専用
+    // キャッシュ経路（下記 `sparse_cache_eligible`／`hnsw_full_visible_eligible`）
+    // が OR 条件を一切適用せず全可視行を対象にしてしまう fail-open のバグに
+    // なる（security.md「不安全な設計」対応）。
+    let filters_empty = !bound.has_where_filters();
     let sparse_cache_eligible = sparse_cache.is_some() && is_hybrid && filters_empty;
     // Issue #408: `HnswIndexCache` の適用条件は `Ranking::Distance`（hybrid でない）
     // かつフィルタなし。`sparse_cache_eligible` の hybrid 版と対称の条件（`sql/
@@ -729,6 +734,14 @@ pub(crate) fn execute_statement_with_cache(
         .collect();
     if !plan.scalar_prefilter {
         needed_column_indices.extend(bound.metadata_filters.iter().map(|f| f.column_index()));
+        // TASK-208・Issue #912: OR 群が参照する列も同様に保持する（DISTANCE
+        // 先行時は SCALAR 条件を DISTANCE 段の後で事後適用するため、候補構築時に
+        // 保持しておかないと事後適用の時点で値が無く、OR 条件が判定不能になる）。
+        for group in &bound.or_filters {
+            group.visit_column_indices(&mut |idx| {
+                needed_column_indices.insert(idx);
+            });
+        }
     }
 
     // Issue #453（SQL-1・SQL-3。ポインタ: `docs/spec/04-behavior/sql-surface.md`
@@ -751,8 +764,7 @@ pub(crate) fn execute_statement_with_cache(
     // Top-k 確定後（`ScalarSource::Deferred`）へ安全に遅らせられる
     // （hybrid の Top-k スロット番号はアリーナ＝スナップショットのスロット
     // 番号そのものであり、`DeferredScalars::Snapshot` の添字と一致する）。
-    let defer_projection = bound.metadata_filters.is_empty()
-        && bound.expr_filters.is_empty()
+    let defer_projection = !bound.has_where_filters()
         && (!is_hybrid || skip_sparse_accumulation)
         && !needed_column_indices.is_empty();
 
@@ -775,6 +787,10 @@ pub(crate) fn execute_statement_with_cache(
     // 境界を越える借用の衝突（E0521）を避けるためクロージャ本体のローカルとして
     // 毎呼び出し新規確保していた）。
     let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+    // TASK-208・Issue #912: `WHERE` の OR 群評価（`BoundOrGroup::matches`）用の
+    // スクラッチバッファ。`expr_scratch` と同じ理由で行ループの外に 1 回だけ
+    // 確保し、行ごとに使い回す。
+    let mut or_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
 
     let on_visible_row = |slot: usize,
                           id: u64,
@@ -814,8 +830,27 @@ pub(crate) fn execute_statement_with_cache(
         // BIGINT・ARRAY 列）が区別できなくなる（上記 `postfilter_verdicts`
         // 宣言のコメント参照）ため、区別可能なこの時点で 1 回だけ評価する。
         // SCALAR 先行時は下の早期 return が担保する（到達すれば常に一致済み）。
-        let scalar_postfilter_matched = plan.scalar_prefilter
-            || declarative_filter::matches_all(&bound.metadata_filters, &scanned);
+        // TASK-208・Issue #912/#913: DISTANCE 先行時は OR 群（`bound.or_filters`）も
+        // ここで、同じ生の `scanned`（`row_codec::ScalarRef`）に対して判定する。
+        // `needed_column_indices`（上記）が OR 群参照列を含むため必要な値は必ず
+        // 保持済み。DISTANCE 段の後で `candidate_columns`（`Value`）から `ScalarRef`
+        // へ逆変換して判定し直すと、`postfilter_verdicts` 宣言のコメントと同じ理由で
+        // fail-open になるため、区別可能なこの時点で 1 回だけ評価する。
+        let scalar_postfilter_matched = if plan.scalar_prefilter {
+            true
+        } else {
+            declarative_filter::matches_all(&bound.metadata_filters, &scanned)
+                && bound
+                    .or_filters
+                    .iter()
+                    .try_fold(true, |acc, group| {
+                        if !acc {
+                            return Ok(false);
+                        }
+                        group.matches(&scanned, id, embedding, embedding.len(), &mut or_scratch)
+                    })
+                    .map_err(expr_eval_error_to_arena)?
+        };
         // SCALAR 先行（既定）の場合のみここでメタデータフィルタ（TASK-147・EXT-3。
         // 等価・前方一致）を事前適用する。DISTANCE 先行（`HINT ORDER`）の場合は
         // 可視行を無条件に通過させ、DISTANCE 段の後で `apply_scalar_postfilter` が
@@ -844,6 +879,17 @@ pub(crate) fn execute_statement_with_cache(
                             "WHERE expression did not evaluate to a boolean".to_string(),
                         ))
                     }
+                }
+            }
+            // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存の
+            // メタデータフィルタ・式述語と同じ SCALAR 事前フィルタ段の一部として
+            // 適用する（宣言順で AND 結合される最後の条件群という位置づけ）。
+            for group in &bound.or_filters {
+                if !group
+                    .matches(&scanned, id, embedding, embedding.len(), &mut or_scratch)
+                    .map_err(expr_eval_error_to_arena)?
+                {
+                    return Ok(false);
                 }
             }
         }
@@ -1032,9 +1078,8 @@ pub(crate) fn execute_statement_with_cache(
     // 遅延デコードを担うため、高速経路側に追加条件は要らない
     // （`defer_projection` と本条件はいずれも同じ「SCALAR 段が恒等写像」を
     // 判定しており、hybrid 時の `skip_sparse_accumulation` 要求も共通）。
-    let cache_fast_path_eligible = bound.metadata_filters.is_empty()
-        && bound.expr_filters.is_empty()
-        && (!is_hybrid || skip_sparse_accumulation);
+    let cache_fast_path_eligible =
+        !bound.has_where_filters() && (!is_hybrid || skip_sparse_accumulation);
 
     // Issue #474: SCALAR 事前フィルタの索引対応述語形状の静的判定
     // （`sql::scalar_plan::classify_scalar_plan`）。索引の gated 構築（下記）と
@@ -1047,6 +1092,7 @@ pub(crate) fn execute_statement_with_cache(
             scalar_prefilter: plan.scalar_prefilter,
             metadata_filters: &bound.metadata_filters,
             expr_filters: &bound.expr_filters,
+            or_filters: &bound.or_filters,
         });
 
     let rls_hook = ImplicitRlsHook::new(ctx);
@@ -1980,6 +2026,11 @@ pub(crate) fn execute_statement_with_cache(
             if !matched {
                 continue;
             }
+            // `bound.or_filters`（メタデータ側の判定）は `matched`
+            // （`postfilter_verdicts`。上記）に既に含まれる——`on_visible_row` が
+            // OR 群参照列を保持済みの生 `scanned` に対して判定済みのため、ここでは
+            // `expr_filter_programs`（embedding・行 `id` を要する式述語）のみを
+            // 事後適用する（従来どおり非空の場合にのみ取得する）。
             if !bound.expr_filter_programs.is_empty() {
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
@@ -3498,7 +3549,11 @@ pub(crate) fn execute_predicate_delete(
 
     let metadata_filters = bound.metadata_filters();
     let expr_filters = bound.expr_filters();
-    let needs_embedding = expr_filters.iter().any(udf_call::references_embedding);
+    let or_filters = bound.or_filters();
+    let needs_embedding = expr_filters.iter().any(udf_call::references_embedding)
+        || or_filters
+            .iter()
+            .any(crate::sql::where_tree::BoundOrGroup::references_embedding);
     let expr_programs: Vec<crate::sql::expr_program::ExprProgram> = expr_filters
         .iter()
         .map(crate::sql::expr_program::ExprProgram::compile)
@@ -3528,6 +3583,24 @@ pub(crate) fn execute_predicate_delete(
                         "WHERE expression did not evaluate to a boolean",
                     ))
                 }
+            }
+        }
+        // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
+        // フィルタ・式述語と同じ述語評価の一部として適用する。
+        for group in or_filters {
+            let group_embedding: &[f32] = if group.references_embedding() {
+                candidate.embedding
+            } else {
+                &[]
+            };
+            if !group.matches(
+                &scanned,
+                candidate.id,
+                group_embedding,
+                candidate.dim as usize,
+                &mut scratch,
+            )? {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -3582,7 +3655,11 @@ pub(crate) fn execute_predicate_update(
 
     let metadata_filters = bound.metadata_filters();
     let expr_filters = bound.expr_filters();
-    let needs_embedding = expr_filters.iter().any(udf_call::references_embedding);
+    let or_filters = bound.or_filters();
+    let needs_embedding = expr_filters.iter().any(udf_call::references_embedding)
+        || or_filters
+            .iter()
+            .any(crate::sql::where_tree::BoundOrGroup::references_embedding);
     let expr_programs: Vec<crate::sql::expr_program::ExprProgram> = expr_filters
         .iter()
         .map(crate::sql::expr_program::ExprProgram::compile)
@@ -3612,6 +3689,24 @@ pub(crate) fn execute_predicate_update(
                         "WHERE expression did not evaluate to a boolean",
                     ))
                 }
+            }
+        }
+        // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
+        // フィルタ・式述語と同じ述語評価の一部として適用する。
+        for group in or_filters {
+            let group_embedding: &[f32] = if group.references_embedding() {
+                candidate.embedding
+            } else {
+                &[]
+            };
+            if !group.matches(
+                &scanned,
+                candidate.id,
+                group_embedding,
+                candidate.dim as usize,
+                &mut scratch,
+            )? {
+                return Ok(false);
             }
         }
         Ok(true)

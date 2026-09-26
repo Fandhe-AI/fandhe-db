@@ -206,20 +206,43 @@ pub(crate) fn check_columns_within_view(
         }
     }
     for pred in where_predicates {
-        match pred {
-            WherePredicate::Expression(expr) => expr_columns_within(columns, expr)?,
-            _ => {
-                if let Some(c) = predicate_column(pred) {
-                    if !columns.iter().any(|vc| vc == c) {
-                        return Err(SqlSurfaceError::InvalidInput {
-                            detail: format!("unknown column: {c}"),
-                        });
-                    }
-                }
-            }
-        }
+        check_predicate_columns_within(columns, pred)?;
     }
     Ok(())
+}
+
+/// `pred` が参照する列がすべて `columns`（ビューが公開する列集合）に収まることを
+/// 検査する（TASK-208・SQL-24、Issue #912）。[`WherePredicate::Or`] の分岐へ
+/// **再帰する**ことが本関数の存在理由: 再帰しないと、ビューが公開していない列を
+/// `WHERE exposed = 'x' OR hidden = 'secret'` のようにフィルタへ使え、非公開列の
+/// 値を推測する手段（filter oracle）になる（security.md「アクセス制御の不備」
+/// P0）。[`predicate_column`] は単純な `column` フィールドを持つ形のみを扱うため、
+/// `Or`・`Expression` はここで個別に分岐する。
+fn check_predicate_columns_within(
+    columns: &[String],
+    pred: &WherePredicate,
+) -> Result<(), SqlSurfaceError> {
+    match pred {
+        WherePredicate::Expression(expr) => expr_columns_within(columns, expr),
+        WherePredicate::Or(branches) => {
+            for branch in branches {
+                for leaf in branch {
+                    check_predicate_columns_within(columns, leaf)?;
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            if let Some(c) = predicate_column(pred) {
+                if !columns.iter().any(|vc| vc == c) {
+                    return Err(SqlSurfaceError::InvalidInput {
+                        detail: format!("unknown column: {c}"),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// 式木（[`Expr`]）が参照する列（[`Expr::Ident`]）をすべて再帰的に検査し、
@@ -272,6 +295,9 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         // （A01 アクセス制御の不備。`.claude/rules/security.md` 対応）。
         WherePredicate::Not(inner) => predicate_column(inner),
         WherePredicate::PredicateCall { .. } | WherePredicate::Expression(_) => None,
+        // `check_predicate_columns_within` が `Or` を個別に再帰処理するため
+        // 到達しない（本関数へは単純形の述語のみが渡る）。
+        WherePredicate::Or(_) => None,
     }
 }
 

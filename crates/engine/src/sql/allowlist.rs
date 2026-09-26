@@ -121,9 +121,65 @@ fn is_where_predicate_boundary_token(token: Option<&Token>, extra_close_paren: b
                 || w.eq_ignore_ascii_case("RETURNING")
                 || w.eq_ignore_ascii_case("GROUP")
                 || w.eq_ignore_ascii_case("HAVING")
+                || w.eq_ignore_ascii_case("OR")
         }
         _ => false,
     }
+}
+
+/// `WHERE`（・`CHECK` 本体）述語ツリーが持てる葉（`Or` を含まない末端述語）の
+/// 総数上限（TASK-208・SQL-24、Issue #912）。`declarative_filter::
+/// MAX_METADATA_FILTERS` と同じ値を採用する（下流の索引・束縛段が同じ上限を
+/// 前提にできるよう単一の数値基準に揃える）。`push` の**前**に検査し、超過分の
+/// アロケーションを発生させない（security.md「不安全な設計｜無制限リソース確保
+/// （DoS）」対応）。
+const MAX_WHERE_LEAVES: usize = crate::declarative_filter::MAX_METADATA_FILTERS;
+
+/// `WHERE` 述語ツリーの括弧グルーピング（`Or` の入れ子）が持てる最大深さ
+/// （TASK-208・SQL-24、Issue #912）。`sql::udf_call::MAX_EXPR_DEPTH` と同じ実装
+/// 既定値を採用する（式の再帰深さ上限と同じ設計判断）。再帰呼び出しの**前**に
+/// 検査し、深いネスト入力によるスタック消費を定数に抑える。
+const MAX_WHERE_GROUP_DEPTH: usize = MAX_EXPR_DEPTH;
+
+/// `WHERE` の括弧グループ `(...)` の直後のトークンが、値式（`(id + 1) > 5` 等）の
+/// 一部であることを示す比較・算術演算子かどうかを判定する（TASK-208・SQL-24、
+/// Issue #912。[`Parser::parse_where_atom`] の決定的先読みが使う）。それ以外の
+/// トークンは BOOLEAN グループ（`(a OR b)`）として解析する。
+fn is_where_group_operator_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Punct('=')
+            | Token::Punct('<')
+            | Token::Punct('>')
+            | Token::Le
+            | Token::Ge
+            | Token::Punct('+')
+            | Token::Punct('-')
+            | Token::Punct('*')
+            | Token::Punct('/')
+    )
+}
+
+/// `predicates`（`AND` 列）が `visible()` 述語呼び出しを直接含むかどうかを判定する
+/// （RLS-7・Issue #912）。`Or` の腕へは再帰しない（`Or` 分岐内の `visible()` は
+/// 呼び出し元（[`Parser::parse_where_or`]）が分岐生成時点で個別に拒否するため、
+/// ここでは「1 つの AND 列の直下」だけを見れば十分）。
+fn where_predicates_contain_visible(predicates: &[WherePredicate]) -> bool {
+    predicates.iter().any(|predicate| {
+        matches!(
+            predicate,
+            WherePredicate::PredicateCall { name } if name.eq_ignore_ascii_case("VISIBLE")
+        )
+    })
+}
+
+/// `predicates` が [`WherePredicate::Or`] を（直接またはネストした分岐の内部に）
+/// 1 つでも含むかどうかを判定する（TASK-208・Issue #912）。`CHECK (...)` 本体
+/// （[`Parser::parse_check_clause`]）が `OR` を明示的に拒否するために使う。
+fn where_predicates_contain_or(predicates: &[WherePredicate]) -> bool {
+    predicates
+        .iter()
+        .any(|predicate| matches!(predicate, WherePredicate::Or(_)))
 }
 
 /// `token` が `WHERE` 述語の範囲比較演算子（`< > <= >=`）トークンであれば
@@ -149,6 +205,56 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
         name.to_ascii_uppercase().as_str(),
         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
     )
+}
+
+/// `DISTINCT` が字句解析上 `Token::Ident` であること（[`catalog::validate_identifier`]
+/// は列名 `distinct` を許可している）に由来する文脈判定（SQL-25 (c)・TASK-209）。
+/// `tokens[pos]` が大文字小文字を無視して `DISTINCT` に一致し、かつ次のトークンが
+/// `Ident`（`AS` を除く）または `'*'` の場合に限り修飾子とみなす。次が `FROM`・
+/// `,`・`)`・`(`・文末のときは列名として扱う（`SELECT distinct FROM t`・
+/// `COUNT(distinct)`・`WHERE distinct = 'x'` 等の既存の列参照としての解釈を
+/// 壊さない）。
+///
+/// 次トークンが `Ident` として字句解析される `AS` の場合はさらに 2 つの読みが
+/// 衝突する（`catalog::validate_identifier` は列名 `as` も許可しているため）。
+/// PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
+/// - `DISTINCT AS <alias>`（`tokens[pos+2]` が `Ident` で、かつそれ自身が
+///   `AS` 由来の連鎖ではない）: `DISTINCT` 自体が列名で、`AS <alias>` は
+///   その別名（[`Parser::parse_aggregate_select_item`] が受理する「裸の
+///   識別子 ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列として使う
+///   `SELECT distinct AS d, COUNT(*) FROM t GROUP BY distinct` 等）。
+///   この場合は列名側（`false`）へ振り分ける。
+/// - `DISTINCT AS`（`tokens[pos+2]` が `Ident` でない＝`FROM`・`,`・`)`・
+///   文末等）: 列名 `as` の前に置かれた `DISTINCT` 修飾子（
+///   `COUNT(DISTINCT as)`・`SELECT DISTINCT as FROM t`）。この場合は修飾子側
+///   （`true`）へ振り分ける。
+/// - `DISTINCT as AS <alias>`（`tokens[pos+2]` も `AS` 由来の `Ident` で、
+///   その次（`tokens[pos+3]`）が `Ident`）: `tokens[pos+1]` の `as` は列名
+///   （`DISTINCT` は修飾子）、`tokens[pos+2]` の `AS` は列名 `as` に付く
+///   別名節の導入（`SELECT DISTINCT as AS alias FROM t`）。列名 `AS` を
+///   単なる別名（上記 1 つ目のケース）と誤読すると、2 段目の `AS <alias>`
+///   が余剰トークンとして構文エラーになり、この形状が拒否されてしまう
+///   （PR #1098 レビュー対応・codex/review P1 再指摘）。この場合は修飾子側
+///   （`true`）へ振り分ける。
+pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
+    matches!(tokens.get(pos), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DISTINCT"))
+        && match tokens.get(pos + 1) {
+            Some(Token::Ident(next)) if next.eq_ignore_ascii_case("AS") => {
+                match tokens.get(pos + 2) {
+                    Some(Token::Ident(next2))
+                        if next2.eq_ignore_ascii_case("AS")
+                            && matches!(tokens.get(pos + 3), Some(Token::Ident(_))) =>
+                    {
+                        true
+                    }
+                    Some(Token::Ident(_)) => false,
+                    _ => true,
+                }
+            }
+            Some(Token::Ident(_)) => true,
+            Some(Token::Punct('*')) => true,
+            _ => false,
+        }
 }
 
 /// 1 文の集計項目リストが持てる要素数の上限（TASK-166・SQL-13）。無制限 `Vec` 確保を
@@ -185,6 +291,27 @@ pub fn check_having_predicate_count(count: usize) -> Result<(), SqlSurfaceError>
     if count > MAX_AGGREGATE_ITEMS {
         return Err(SqlSurfaceError::payload_too_large(format!(
             "HAVING predicate count {count} exceeds limit {MAX_AGGREGATE_ITEMS}"
+        )));
+    }
+    Ok(())
+}
+
+/// `GROUP BY` 句が持てるグループキー列数の上限（TASK-167・SQL-25 (d) の実装既定値）。
+/// [`check_group_by_column_count`] が確保前検査に使う（`.claude/rules/security.md`
+/// 「不安全な設計｜無制限リソース確保（DoS）」対応）。
+///
+/// `pub`（TASK-186 と同じ設計判断）: `wire-server::http::query::aggregate` が
+/// NoSQL 表層の `group_by` 配列形（NOSQL-16 (b)）を写像する前に、SQL 表層と同じ
+/// 上限を検査するために参照できるようにする。
+pub const MAX_GROUP_BY_COLUMNS: usize = 8;
+
+/// `count` 件の `GROUP BY` 列が [`MAX_GROUP_BY_COLUMNS`] を超えないことを検証する
+/// （`54000`）。[`Parser::parse_group_by_clause`] が列を `push` する**前**に呼ぶ
+/// （[`check_having_predicate_count`] と同じ「確保前検査」の設計判断）。
+pub fn check_group_by_column_count(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_GROUP_BY_COLUMNS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "GROUP BY column count {count} exceeds limit {MAX_GROUP_BY_COLUMNS}"
         )));
     }
     Ok(())
@@ -409,6 +536,12 @@ pub enum SqlSurfaceError {
     /// Issue #907。[`crate::catalog::CatalogError::InvalidForeignKey`] の写像。
     /// ERR-6: `42830`）。`detail` はカタログ情報（列名・テーブル名）のみ。
     InvalidForeignKey { detail: String },
+    /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
+    /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
+    /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
+    /// 含め、候補テーブルの列挙はしない（security.md P0「存在情報を漏らさない」
+    /// 対応。曖昧な列は「どのテーブルの候補があるか」自体が情報になり得る）。
+    AmbiguousColumn { name: String },
 }
 
 impl SqlSurfaceError {
@@ -573,6 +706,15 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
+    /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
+    /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
+    pub(crate) fn ambiguous_column(name: impl Into<String>) -> Self {
+        SqlSurfaceError::AmbiguousColumn {
+            name: truncate_for_error(&name.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -620,6 +762,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
+            SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
         }
     }
 
@@ -754,6 +897,9 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InvalidForeignKey { detail } => {
                 write!(f, "invalid foreign key declaration: {detail}")
             }
+            SqlSurfaceError::AmbiguousColumn { name } => {
+                write!(f, "column reference {name:?} is ambiguous")
+            }
         }
     }
 }
@@ -786,6 +932,28 @@ pub trait TableLookup {
         &self,
         name: &str,
     ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// `name` が実テーブルであれば、束縛時（`sql::parser::bind_projection`）に
+    /// 許可される投影列名の集合（実カラム名 ＋ `id` 疑似列。スキーマが実カラム
+    /// `id` を宣言していれば重複させない）を返す。テーブルが存在しない場合・
+    /// 呼び出し側がこの照会に対応していない場合は `Ok(None)`（「列集合が
+    /// 分からないため、ここでは検査しない」を意味する。既定実装。`table_exists`
+    /// 自体の存在確認とは独立）。
+    ///
+    /// 参照される CTE・VIEW は最終的に `sql::parser::bind` が実テーブル
+    /// スキーマに対して列存在を検査するため、このメソッドが `None` を返しても
+    /// fail-open にはならない。唯一の例外はどこからも参照されない leaf CTE
+    /// （`sql::allowlist::validate_sql_tokens` の WITH 事前検証ループ）で、
+    /// これは bind に到達しないため、実テーブル直下の場合はこのメソッドの
+    /// 戻り値で列存在を検査する（Issue #928 レビュー指摘: Codex P1、
+    /// PR #1100 追加指摘）。既定実装が `Ok(None)` を返す既存の `TableLookup`
+    /// 実装（テスト用モック等）は、この場合に限り列存在検査を省略したまま
+    /// 動作し続ける（無変更でコンパイル・実行可能。`view_definition` の
+    /// 既定実装と同じ後方互換の方針）。
+    fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
         let _ = name;
         Ok(None)
     }
@@ -844,16 +1012,22 @@ pub enum OrderByForm {
 /// `<expr> <cmp> <expr>`。式の意味論検証は `sql::parser::bind_in_session` の責務）。
 ///
 /// **TASK-147（EXT-3）で追加した破壊的変更（BREAKING CHANGE）**: `Prefix` variant
-/// を追加した（`<col> LIKE '<prefix>%'` の前方一致条件。網羅的 `match` を持つ
-/// 外部コードは要対応）。パターン文字列は無加工で保持し、意味論的な検証
-/// （末尾 `%` のみ許可・空 prefix 拒否等）は `declarative_filter::parse_prefix_pattern`
-/// （`sql::parser::bind_in_session` から呼ばれる）の責務とする。
+/// を追加した（`<col> LIKE '<pattern>'` の LIKE 条件。網羅的 `match` を持つ
+/// 外部コードは要対応）。パターン文字列は無加工で保持し、意味論的な検証・
+/// 振り分け（等価・前方一致・SQL-24・TASK-208・Issue #914 で追加した中間一致・
+/// 後方一致・`_` を含む一般形）は `declarative_filter::DeclarativeFilter::like`
+/// （内部で `parse_like_pattern` を呼ぶ。`sql::parser::bind_in_session` から
+/// 呼ばれる）の責務とする。`ESCAPE` 句は本構文層で受理しない（後続トークンが
+/// 境界と一致せず `42601` になる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WherePredicate {
     /// 列と文字列リテラルの等価条件（TASK-75: リテラル値を保持する）。
     Equality { column: String, value: String },
-    /// 前方一致条件（TASK-147・EXT-3）。`LIKE` は [`Keyword`] へ追加せず、TASK-80 と
-    /// 同じ「`Token::Ident` をパーサー位置でのみ文脈照合」方式にして `like` という
+    /// `LIKE` 条件（TASK-147・EXT-3。SQL-24・TASK-208・Issue #914 で前方一致
+    /// 限定から中間一致・後方一致・`_` を含む一般形へ拡張）。`pattern` は
+    /// 生パターン（無加工）を保持する。名前は互換性のため `Prefix` のまま
+    /// 据え置く。`LIKE` は [`Keyword`] へ追加せず、TASK-80 と同じ
+    /// 「`Token::Ident` をパーサー位置でのみ文脈照合」方式にして `like` という
     /// 列名を壊さない（[`Parser::parse_where`] 参照）。
     Prefix { column: String, pattern: String },
     /// 許可された名前の述語呼び出し形（空引数）。
@@ -902,6 +1076,17 @@ pub enum WherePredicate {
     /// `NOT visible()`・`NOT <式述語>`・`NOT (` はいずれも構文段で `42601` に
     /// 拒否し、この variant としては構築されない）。
     Not(Box<WherePredicate>),
+    /// `OR` で結ぶ分岐の集合（TASK-208・SQL-24、Issue #912）。各分岐は
+    /// `Vec<WherePredicate>`（`AND` で結ぶ述語列。分岐の中にさらに `Or` を
+    /// 含めてよい＝ネスト可）で、`Or` は分岐が 2 個以上あるときのみ生成される
+    /// （分岐 1 個・`AND` だけの括弧グループは呼び出し元が親の列へ平坦化する。
+    /// [`Parser::parse_where_or`] 参照）。この構造により、`AND` だけの文は
+    /// 本 variant 追加前と完全に同じ AST になる（content hash 不変）。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （[`WherePredicate::Expression`]・[`WherePredicate::Prefix`] 追加時と同じ
+    /// 既存の破壊的変更運用）。
+    Or(Vec<Vec<WherePredicate>>),
 }
 
 /// [`WherePredicate::Compare`] の比較演算子（TABLE-13・TASK-199、Issue #891）。
@@ -1119,14 +1304,15 @@ pub enum Statement {
     /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
     /// （TASK-166・SQL-13。C6a）。`FROM` 単一テーブルのカタログ存在確認を通過済み。
     Aggregate(ValidatedAggregate),
-    /// `EXPLAIN SELECT ... USING PLAN('<query>') ...`（TASK-78・SQL-6）。`USING PLAN`
-    /// を伴う検索 SELECT の前置のみを受理し（`using_plan()` が必ず `Some`）、
-    /// `FROM` 単一テーブルのカタログ存在確認を通過済み。`EXPLAIN` は検索本体を
-    /// 実行しない（LLM クエリ展開・モード解決結果を可視化する応答を構築するのみ。
-    /// `core.rs::EngineCore::execute_sql_in_session` の管轄）。`USING PLAN` を伴わない
-    /// 通常 SELECT・集計・`SET`・`CREATE FUNCTION` への `EXPLAIN` 前置は許可リスト外
-    /// として `42601` で拒否する。
-    Explain(ValidatedStatement),
+    /// `EXPLAIN <target>`（TASK-78・SQL-6、Issue #922・SQL-27）。対象文
+    /// （[`ExplainTarget`]）は検索 SELECT（`USING PLAN` の有無いずれも）・集計
+    /// （`GROUP BY`・`DISTINCT` の脱糖形いずれも）・広域取得のいずれかで、
+    /// `FROM` 単一テーブルのカタログ存在確認を通過済み。`EXPLAIN` は検索本体・
+    /// 集計走査・広域取得走査のいずれも実行しない（LLM クエリ展開・モード解決・
+    /// 静的な走査方式判定を可視化する応答を構築するのみ。`core.rs::EngineCore::
+    /// execute_sql_in_session` の管轄）。`SET`・`CREATE FUNCTION` への `EXPLAIN`
+    /// 前置は許可リスト外として `42601` で拒否する。
+    Explain(ExplainTarget),
     /// `SELECT <投影> FROM <table> [WHERE ...] LIMIT n`（`ORDER BY`・`USING PLAN`
     /// のいずれも伴わない、ソートなしのフィルタ取得。Issue #454。本 DB の
     /// 「正解を含むデータ群を広く返す」設計思想を SQL 表層で直接表現する経路で、
@@ -1139,6 +1325,45 @@ pub enum Statement {
     /// `match` はワイルドカードアームの追加が必要（`Aggregate`・`Explain` 追加時と
     /// 同じ運用）。
     Scan(ValidatedScan),
+}
+
+/// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
+/// 検索 SELECT 限定から、通常検索・集計・広域取得へ対象を拡大した際に
+/// [`Statement::Explain`] のペイロードへ導入した）。いずれの variant も
+/// 検索本体・集計走査・広域取得走査を実行しない契約は共通で、`core.rs::
+/// EngineCore::execute_sql_in_session` の `Statement::Explain` アームが
+/// variant ごとに異なる静的分類・応答整形（[`crate::sql::explain`]）へ振り分ける。
+///
+/// **本 enum の追加および [`Statement::Explain`] のペイロード変更（`ValidatedStatement`
+/// → `ExplainTarget`）は破壊的変更（BREAKING CHANGE）**: `Statement::Explain(v)` を
+/// 分解して `ValidatedStatement` のメソッドを直接呼んでいた既存コードは
+/// `ExplainTarget::Search(v)` へのパターンマッチを経由するよう修正が必要。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ExplainTarget {
+    /// 検索 SELECT（`USING PLAN` の有無いずれも受理。TASK-78・SQL-6／Issue #922・
+    /// SQL-27）。`using_plan()` が `Some` なら既存の `USING PLAN` 経路（LLM クエリ
+    /// 展開・モード解決の可視化。行の形式は不変）、`None` なら `ORDER BY <=>`・
+    /// `HYBRID` 検索の静的判定のみを可視化する新経路（`core.rs::EngineCore::
+    /// run_search_explain`）を通る。
+    Search(ValidatedStatement),
+    /// 集計 SELECT（`GROUP BY` の有無・`SELECT DISTINCT` の脱糖形のいずれも。
+    /// Issue #922・SQL-27）。
+    Aggregate(ValidatedAggregate),
+    /// 広域取得（ソートなしのフィルタ取得。ビュー展開後の形・`OFFSET` を含む。
+    /// Issue #922・SQL-27）。
+    Scan(ValidatedScan),
+}
+
+impl ExplainTarget {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        match self {
+            ExplainTarget::Search(v) => v.table_name(),
+            ExplainTarget::Aggregate(v) => v.table_name(),
+            ExplainTarget::Scan(v) => v.table_name(),
+        }
+    }
 }
 
 /// 集計関数の種別（TASK-166・SQL-13）。関数名は [`is_aggregate_function_name`] で
@@ -1187,11 +1412,15 @@ pub enum AggregateArg {
 
 /// SELECT リストの集計項目 1 つ（TASK-166・SQL-13）。`alias` 省略時の列名は
 /// [`AggregateFunc::default_alias`] を使う（`sql::parser::bind_aggregate` の責務）。
+/// `distinct`（SQL-25 (c)・TASK-209）は `COUNT(DISTINCT <expr>)` の修飾子。
+/// `COUNT` 以外の関数で `true` になることはない（[`Parser::parse_aggregate_item`]
+/// が構造的に絞り込む）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregateItem {
     pub(crate) func: AggregateFunc,
     pub(crate) arg: AggregateArg,
     pub(crate) alias: Option<String>,
+    pub(crate) distinct: bool,
 }
 
 /// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
@@ -1231,15 +1460,20 @@ pub struct AggregateOrderBy {
     pub(crate) descending: bool,
 }
 
-/// `GROUP BY <column> [HAVING ...] [ORDER BY ...] [LIMIT ...]`（TASK-167・SQL-14）の
-/// 許可形状。`column` はカタログ照会前の識別子のまま保持し（`TEXT` 列限定等の
+/// `GROUP BY <column> (',' <column>)* [HAVING ...] [ORDER BY ...] [LIMIT ...]`
+/// （TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張）の許可形状。`columns` は宣言順
+/// を保持したカタログ照会前の識別子のまま保持し（`TEXT` 列限定・重複検査済み等の
 /// 意味論的検査は束縛段）、`having`/`order_by`/`limit` はいずれも省略可能。
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupByClause {
-    pub(crate) column: String,
+    pub(crate) columns: Vec<String>,
     pub(crate) having: Vec<HavingPredicate>,
     pub(crate) order_by: Option<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
+    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
+    /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
+    /// `0`。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
+    pub(crate) offset: u32,
 }
 
 /// 許可形状の構造判定を通過した集計 `SELECT` 文（TASK-166・SQL-13。TASK-167・
@@ -1306,6 +1540,11 @@ pub struct ValidatedScan {
     /// （早期終了。順序保証はスナップショット内の物理走査順のみで、`ORDER BY`
     /// 相当の意味的順序は持たない）。
     pub(crate) limit: u32,
+    /// `OFFSET` 句の生値（既定 0。Issue #916・SQL-25 (b)・TASK-209）。可視かつ
+    /// WHERE を満たす行のうち先頭からこの件数だけ読み飛ばしてから `limit` を
+    /// 適用する（`sql::scan::execute_scan_with_budget`）。範囲検証は
+    /// `sql::parser::bind_scan_with_dummy_flags` が束縛時に行う。
+    pub(crate) offset: u32,
 }
 
 impl ValidatedScan {
@@ -1328,6 +1567,12 @@ impl ValidatedScan {
     /// が束縛時に行う）。
     pub fn limit(&self) -> u32 {
         self.limit
+    }
+
+    /// `OFFSET` 句の値（構造検証済みの生値。既定 0。範囲検証は
+    /// `sql::parser::validate_search_offset` が束縛時に行う）。
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 }
 
@@ -1978,6 +2223,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `LIMIT n` の直後に現れうる任意の `OFFSET m` を判定・消費する（Issue #916・
+    /// SQL-25 (b)・TASK-209）。`USING`・`SET` と同じ理由（[`Self::peek_ident_matches`]
+    /// 参照）で `OFFSET` は [`crate::sql::lexer::Keyword`] に追加せず、この位置限定の
+    /// 文脈識別子として扱う（既存の列名・テーブル名 `offset` を壊さない）。値の構文
+    /// エラー（小数・`u32` 超過）は呼び出し元と同じ `42601` に分類する。範囲上限の
+    /// 検証はここでは行わない（束縛段の `sql::parser::validate_search_offset`）。
+    fn parse_optional_offset(&mut self) -> Result<Option<u32>, SqlSurfaceError> {
+        if !self.peek_ident_matches("OFFSET") {
+            return Ok(None);
+        }
+        self.advance();
+        let offset_str = self.expect_number()?;
+        let offset: u32 = offset_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed OFFSET value: {offset_str}"))
+        })?;
+        Ok(Some(offset))
+    }
+
     /// SELECT リストの許可形状（`*`・単純な列名リスト・TASK-79（SQL-9）で追加した
     /// 式項目〔関数呼び出しを頂点に持つ式、任意で `AS <alias>`〕の混在リスト）。
     /// 全項目が単純な列名の場合は従来どおり [`Projection::Columns`]（後方互換。
@@ -2026,21 +2289,43 @@ impl<'a> Parser<'a> {
         Ok(SelectItem::Column(self.expect_ident()?))
     }
 
-    /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13）:
-    /// `<agg_name> '(' ('*' | <expr>) ')' [AS <alias>]`。`*` は `COUNT` 専用
-    /// （それ以外の関数での出現は `42601`）。空引数（`COUNT()`）・複数引数・
-    /// `DISTINCT` 修飾はいずれも構造的に受理しない（`)` を期待する位置で不一致となり
-    /// `42601` へ落ちる）。
+    /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13。SQL-25 (c)・TASK-209 で
+    /// `COUNT(DISTINCT <expr>)` を追加）:
+    /// `<agg_name> '(' [DISTINCT] ('*' | <expr>) ')' [AS <alias>]`。`*` は
+    /// `COUNT` 専用（それ以外の関数での出現は `42601`）。空引数（`COUNT()`）・
+    /// 複数引数はいずれも構造的に受理しない（`)` を期待する位置で不一致となり
+    /// `42601` へ落ちる）。`DISTINCT` は `COUNT` 以外の関数・`COUNT(DISTINCT *)`
+    /// では `42601`（SQL-25 (c) の対象は `COUNT` のみ）。
     fn parse_aggregate_item(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
         let func = AggregateFunc::from_name(&name).ok_or_else(|| {
             SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
         })?;
         self.expect_punct('(')?;
+        // `DISTINCT` は `'('` の直後・引数の直前という文脈でのみ修飾子として
+        // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
+        // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
+        // でない場合は消費しない）。
+        let distinct = if is_distinct_modifier(self.tokens, self.pos) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        if distinct && func != AggregateFunc::Count {
+            return Err(SqlSurfaceError::unsupported(
+                "DISTINCT is only allowed inside COUNT(DISTINCT ...)",
+            ));
+        }
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
             if func != AggregateFunc::Count {
                 return Err(SqlSurfaceError::unsupported(
                     "'*' is only allowed inside COUNT(*)",
+                ));
+            }
+            if distinct {
+                return Err(SqlSurfaceError::unsupported(
+                    "COUNT(DISTINCT *) is not supported",
                 ));
             }
             self.advance();
@@ -2061,7 +2346,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(AggregateItem { func, arg, alias })
+        Ok(AggregateItem {
+            func,
+            arg,
+            alias,
+            distinct,
+        })
     }
 
     /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
@@ -2089,14 +2379,33 @@ impl<'a> Parser<'a> {
         Ok(AggregateSelectItem::GroupKey { column, alias })
     }
 
-    /// `GROUP BY <column>`（TASK-167・SQL-14）。`GROUP BY` は単一の裸識別子のみ
-    /// 受理する（式・関数・複数列・位置番号はいずれも `expect_ident`／後続の
-    /// `expect_end_of_statement` 系の失敗で `42601`）。`GROUP` は予約語化せず
+    /// `GROUP BY <column> (',' <column>)*`（TASK-167・SQL-14。SQL-25 (d) で複数列へ
+    /// 拡張）。裸識別子のカンマ区切り列のみ受理する（式・関数・位置番号・`$n` は
+    /// いずれも `expect_ident` の失敗で `42601`）。`GROUP` は予約語化せず
     /// [`Parser::expect_contextual_keyword`] で文脈的に照合する（PR #189 の方針）。
-    fn parse_group_by_clause(&mut self) -> Result<String, SqlSurfaceError> {
+    /// 列数は [`check_group_by_column_count`] で `push` 前に検査し（`54000`。
+    /// [`Parser::parse_having`] と同じ「確保前検査」）、重複する列名は `42601` で
+    /// 拒否する（spec に規定が無いため fail-closed に倒す）。
+    fn parse_group_by_clause(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
         self.expect_contextual_keyword("GROUP")?;
         self.expect_keyword(Keyword::By)?;
-        self.expect_ident()
+        let mut columns = Vec::new();
+        loop {
+            let column = self.expect_ident()?;
+            if columns.contains(&column) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "duplicate GROUP BY column {column:?}"
+                )));
+            }
+            check_group_by_column_count(columns.len() + 1)?;
+            columns.push(column);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(columns)
     }
 
     /// `HAVING <having_pred> [AND <having_pred>]*`（TASK-167・SQL-14）。
@@ -2185,7 +2494,8 @@ impl<'a> Parser<'a> {
     /// `ILIKE`・`LIKE` の右辺が非リテラルの各形は、この確定判定に一致しないため
     /// 式述語フォールバックへ流れ、通常は `42601` で拒否される。
     fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-        self.parse_where_predicates(false)
+        let mut leaf_count = 0usize;
+        self.parse_where_or(false, 0, &mut leaf_count)
     }
 
     /// `CHECK (<body>)` の本体（TABLE-16・TASK-204、Issue #906）を [`Self::parse_where`]
@@ -2195,17 +2505,59 @@ impl<'a> Parser<'a> {
     /// 落ちずに受理される。呼び出し元（[`Self::parse_check_clause`]）が `(` を消費
     /// した直後に呼び、本体解析の完了後に `expect_punct(')')` で閉じ括弧を消費する。
     fn parse_check_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-        self.parse_where_predicates(true)
+        let mut leaf_count = 0usize;
+        self.parse_where_or(true, 0, &mut leaf_count)
     }
 
-    /// [`Self::parse_where`]・[`Self::parse_check_body`] が共有する述語列の解析本体。
-    fn parse_where_predicates(
+    /// [`Self::parse_where`]・[`Self::parse_check_body`] が共有する述語ツリーの
+    /// 文法入口（TASK-208・SQL-24、Issue #912）: `or_expr := and_expr { OR
+    /// and_expr }`。`OR` は [`Keyword`] へ追加せず `Token::Ident` を文脈的に照合する
+    /// （`LIKE` と同じ方式。`or` という列名の等価条件を壊さない）。
+    ///
+    /// 分岐が 1 個だけなら親の列へそのまま平坦化し（`AND` だけの文は本機能追加前と
+    /// 完全に同じ AST になる）、2 個以上なら 1 要素の [`WherePredicate::Or`] として
+    /// 返す。`visible()`（RLS 述語）が 2 分岐以上の `Or` の中に現れる場合は
+    /// `42601` で拒否する（RLS-7: `visible() OR ...` で RLS を解除したように見せる
+    /// 式を作らせない）。
+    fn parse_where_or(
         &mut self,
         extra_close_paren: bool,
+        depth: usize,
+        leaf_count: &mut usize,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let mut branches = vec![self.parse_where_and(extra_close_paren, depth, leaf_count)?];
+        while matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OR")) {
+            self.advance();
+            branches.push(self.parse_where_and(extra_close_paren, depth, leaf_count)?);
+        }
+        if branches.len() == 1 {
+            Ok(branches
+                .into_iter()
+                .next()
+                .expect("branches has exactly one element in this arm"))
+        } else {
+            if branches
+                .iter()
+                .any(|branch| where_predicates_contain_visible(branch))
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "visible() predicate is not allowed inside an OR branch",
+                ));
+            }
+            Ok(vec![WherePredicate::Or(branches)])
+        }
+    }
+
+    /// `and_expr := atom { AND atom }`。
+    fn parse_where_and(
+        &mut self,
+        extra_close_paren: bool,
+        depth: usize,
+        leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut predicates = Vec::new();
         loop {
-            predicates.push(self.parse_where_leaf(extra_close_paren)?);
+            predicates.extend(self.parse_where_atom(extra_close_paren, depth, leaf_count)?);
             if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
                 self.advance();
                 continue;
@@ -2215,19 +2567,85 @@ impl<'a> Parser<'a> {
         Ok(predicates)
     }
 
-    /// `WHERE`／`CHECK` 本体が `AND` で連結する 1 述語（SQL-24。TASK-208 ポインタ）。
-    /// まず構造的に確定できる葉（[`Self::try_parse_structural_leaf`]）を試し、
-    /// 一致しなければ前置 `NOT`（[`WherePredicate::Not`]）、最後に式述語
-    /// フォールバックへ落ちる。`NOT` は連続する個数をループで数えて偶奇で畳む
-    /// （再帰させない。三値論理では `NOT NOT x ≡ x` が厳密に成り立つ）。
+    /// `atom := '(' or_expr ')' | leaf`。`(` の直後が値式グループ
+    /// （`(id + 1) > 5` 等。既存の式フォールバックへ委譲する）か BOOLEAN
+    /// グループ（`(a OR b)`）かを、後戻りせず決定的な先読みで判定する
+    /// （対応する `)` をトークン走査で探し、直後のトークンが比較・算術演算子
+    /// なら値式、それ以外なら BOOLEAN グループ。ネストした括弧で「グループとして
+    /// 解析し、失敗したら葉として解析し直す」後戻りをすると指数時間になるため
+    /// 禁止する。security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    fn parse_where_atom(
+        &mut self,
+        extra_close_paren: bool,
+        depth: usize,
+        leaf_count: &mut usize,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            let close_idx = self.find_matching_close_paren(self.pos).ok_or_else(|| {
+                SqlSurfaceError::unsupported("unmatched parenthesis in WHERE clause")
+            })?;
+            let is_value_group = matches!(
+                self.tokens.get(close_idx + 1),
+                Some(token) if is_where_group_operator_token(token)
+            );
+            if !is_value_group {
+                let next_depth = depth
+                    .checked_add(1)
+                    .filter(|d| *d <= MAX_WHERE_GROUP_DEPTH)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large(format!(
+                            "WHERE grouping nesting exceeds limit {MAX_WHERE_GROUP_DEPTH}"
+                        ))
+                    })?;
+                self.advance(); // '(' を消費する
+                let inner = self.parse_where_or(true, next_depth, leaf_count)?;
+                self.expect_punct(')')?;
+                return Ok(inner);
+            }
+            // 値式グループ（`(id + 1) > 5` 等）。既存の式フォールバックへ委譲する
+            // （`parse_primary_expr` が '(' expr ')' を再帰的に処理する）。
+        }
+        Ok(vec![self.parse_where_leaf(extra_close_paren, leaf_count)?])
+    }
+
+    /// `(` の位置（`open_idx`）に対応する `)` のトークン位置を探す。`get()` のみを
+    /// 使い（添字アクセス・`unwrap`・`expect` 禁止。coding-rust.md）、対応する
+    /// 閉じ括弧が無い場合は `None`（呼び出し元が `42601` に変換する）。
+    fn find_matching_close_paren(&self, open_idx: usize) -> Option<usize> {
+        let mut depth: u32 = 0;
+        let mut idx = open_idx;
+        loop {
+            match self.tokens.get(idx)? {
+                Token::Punct('(') => depth = depth.checked_add(1)?,
+                Token::Punct(')') => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+            idx = idx.checked_add(1)?;
+        }
+    }
+
+    /// 述語ツリーの 1 葉（末端述語）を解析する（SQL-24。TASK-208 ポインタ）。まず
+    /// 構造的に確定できる葉（[`Self::try_parse_structural_leaf`]。等価・前方一致・
+    /// 述語呼び出し形・BOOLEAN 系・範囲比較・`IN`・`BETWEEN`・`IS [NOT] NULL`・
+    /// BOOLEAN 裸参照）を試し、一致しなければ前置 `NOT`（[`WherePredicate::Not`]）、
+    /// 最後に式述語フォールバックへ落ちる（`OR`・括弧の導入で `AND` だけの文の
+    /// 受理形状・優先順位を変えない。Issue #912）。`NOT` は連続する個数をループで
+    /// 数えて偶奇で畳む（再帰させない。三値論理では `NOT NOT x ≡ x` が厳密に
+    /// 成り立つ）。葉を返す**前**に総数上限（[`MAX_WHERE_LEAVES`]）を検査し、
+    /// 超過時は `54000`（`push` 前に検査し、超過分のアロケーションを増やさない）。
     fn parse_where_leaf(
         &mut self,
         extra_close_paren: bool,
+        leaf_count: &mut usize,
     ) -> Result<WherePredicate, SqlSurfaceError> {
-        if let Some(leaf) = self.try_parse_structural_leaf(extra_close_paren)? {
-            return Ok(leaf);
-        }
-        if matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")) {
+        let predicate = if let Some(leaf) = self.try_parse_structural_leaf(extra_close_paren)? {
+            leaf
+        } else if matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")) {
             let mut negate_odd = false;
             while matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")) {
                 self.advance();
@@ -2260,23 +2678,33 @@ impl<'a> Parser<'a> {
             // だが評価コストが二重になる）、前置 `NOT` を偶数個重ねた時と同型の
             // 冗長な入れ子が際限なく増える。二重否定を畳んで単一の `Not` へ
             // 正規化する（codex-review 実機再現: `NOT lang NOT IN (...)`）。
-            return Ok(if negate_odd {
+            if negate_odd {
                 match inner {
                     WherePredicate::Not(x) => *x,
                     other => WherePredicate::Not(Box::new(other)),
                 }
             } else {
                 inner
-            });
+            }
+        } else {
+            let lhs = self.parse_value_expr(0)?;
+            let op = self.expect_cmp_op()?;
+            let rhs = self.parse_value_expr(0)?;
+            WherePredicate::Expression(Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })
+        };
+        *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("WHERE predicate leaf count overflow")
+        })?;
+        if *leaf_count > MAX_WHERE_LEAVES {
+            return Err(SqlSurfaceError::payload_too_large(format!(
+                "WHERE predicate leaf count exceeds limit {MAX_WHERE_LEAVES}"
+            )));
         }
-        let lhs = self.parse_value_expr(0)?;
-        let op = self.expect_cmp_op()?;
-        let rhs = self.parse_value_expr(0)?;
-        Ok(WherePredicate::Expression(Expr::Binary {
-            op,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        }))
+        Ok(predicate)
     }
 
     /// 構造的に確定できる `WHERE`／`CHECK` の葉を 1 つ試す。列名 `Ident` を先頭に
@@ -2317,7 +2745,9 @@ impl<'a> Parser<'a> {
             }));
         }
         // `<col> NOT LIKE '<lit>'`（SQL-24。後置 NOT を `Not(Prefix)` として受理する。
-        // #914 側の中間一致等の拡張は本 Issue の対象外のまま）。
+        // `Prefix.pattern` は生パターンをそのまま保持するため、束縛段
+        // （`declarative_filter::DeclarativeFilter::like`）が処理する中間一致・
+        // 後方一致等の一般形〔#914〕にも `NOT` 越しに対応する）。
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT"))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
             && matches!(self.tokens.get(self.pos + 3), Some(Token::StringLiteral(_)))
@@ -3613,6 +4043,15 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let predicates = self.parse_check_body()?;
         self.expect_punct(')')?;
+        if where_predicates_contain_or(&predicates) {
+            // TASK-208・SQL-24（Issue #912）の対象は読み取り文・書き込み文の
+            // `WHERE` のみで、`CHECK (...)` 本体（TABLE-16）は含まない。
+            // 明示的に `42601` で拒否する（将来解禁する場合に備え、
+            // `render_predicate` 側は既に `Or` を網羅描画できる）。
+            return Err(SqlSurfaceError::unsupported(
+                "OR is not supported inside a CHECK clause",
+            ));
+        }
         Ok((name, predicates))
     }
 
@@ -4069,6 +4508,75 @@ impl<'a> Parser<'a> {
         self.expect_ident_matching("VIEW")?;
         self.expect_ident()
     }
+
+    /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
+    /// RLS-10 (b)、TASK-213、Issue #928）を切り出し、各定義を
+    /// [`super::cte::CteDef`] へ積む。`<body>` は [`parse_view_body`]（`CREATE
+    /// VIEW` 本文と同一の許可パーサー）で検証する——本関数は第 2 の SELECT
+    /// パーサーを持たない。呼び出し元（[`validate_sql_tokens`] の `WITH`
+    /// 分岐）が、返した `Vec<CteDef>` と本関数消費後の残りトークン列
+    /// （主クエリ）を [`super::cte::resolve_relation`] へ渡す。
+    ///
+    /// 受理しない形（いずれも `42601`。SQL-29 (b) の対象外規定）:
+    /// `WITH RECURSIVE`・列名リスト `<name>(a, b)`・`MATERIALIZED`／
+    /// `NOT MATERIALIZED` 指定・本文内の `;`（`split_parenthesized` で切り出した
+    /// 括弧内トークン列に対して明示的に検査する。`parse_view_body` の
+    /// `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、
+    /// ここで先に弾かないと `WITH x AS (SELECT * FROM t;) ...` のような入力を
+    /// 誤って受理しうる）。定義数の上限は [`super::cte::check_definition_count`]、
+    /// 名前重複は [`super::cte::check_no_duplicate_name`] が判定する。
+    fn parse_with_clause(&mut self) -> Result<Vec<super::cte::CteDef>, SqlSurfaceError> {
+        self.expect_ident_matching("WITH")?;
+        if self.peek_ident_matches("RECURSIVE") {
+            return Err(SqlSurfaceError::unsupported(
+                "WITH RECURSIVE is not supported",
+            ));
+        }
+        let mut ctes: Vec<super::cte::CteDef> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            // `AS` を消費する前に `(` が現れるのは列名リスト形のみ（本文の
+            // `(` は必ず `AS` の後）。
+            if matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE column name list is not supported",
+                ));
+            }
+            self.expect_ident_matching("AS")?;
+            if self.peek_ident_matches("MATERIALIZED") || self.peek_ident_matches("NOT") {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE MATERIALIZED hint is not supported",
+                ));
+            }
+            if !matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "expected '(' to start CTE body",
+                ));
+            }
+            let (inner, after) = split_parenthesized(self.remaining())?;
+            if inner.iter().any(|t| matches!(t, Token::Punct(';'))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE body must not contain a statement separator",
+                ));
+            }
+            let body = parse_view_body(inner)?;
+            super::cte::check_no_duplicate_name(&ctes, &name)?;
+            ctes.push(super::cte::CteDef { name, body });
+            super::cte::check_definition_count(ctes.len())?;
+            // `split_parenthesized` はスライスのみを返す（`Parser` の内部位置を
+            // 持たない）ため、残りトークン数から `self.pos` を復元する。`after`
+            // は構造的に `self.tokens` の suffix であり `after.len()` は
+            // `self.tokens.len()` を超えないが、coding-rust.md の checked/
+            // saturating 演算方針に従い `saturating_sub` で明示する。
+            self.pos = self.tokens.len().saturating_sub(after.len());
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(ctes)
+    }
 }
 
 /// `CREATE VIEW ... AS` 本文の許可形状（TABLE-18・SQL-23・TASK-205、
@@ -4125,6 +4633,15 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
                     "view body WHERE predicate form is not supported",
                 ));
             }
+            WherePredicate::Or(_) => {
+                // TASK-208・SQL-24（Issue #912）の対象は SQL-19 の書き込み文と
+                // 読み取り SELECT で、TABLE-18 のビュー定義文本体は含まない
+                // （ビューに対する**外側クエリ**の OR は `sql::view::resolve_from`
+                // 経由で通常どおり受理される。ここで拒否するのは定義文本体のみ）。
+                return Err(SqlSurfaceError::unsupported(
+                    "view body WHERE predicate form is not supported",
+                ));
+            }
         }
     }
     p.expect_end_of_statement()?;
@@ -4176,9 +4693,11 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         WherePredicate::Equality { column, value } => {
             format!("{column} = '{}'", escape_string_literal(value))
         }
-        // `pattern` は末尾の `%` を含む文字列リテラルの生値をそのまま保持する
-        // （`Parser::parse_where` の LIKE 分岐参照。呼び出し元が既に `%` 込みで
-        // 検証済みのため、ここで追加の `%` を付与しない）。
+        // `pattern` は LIKE の生パターン全般（SQL-24・TASK-208、Issue #914 で
+        // 前方一致限定から拡張）をそのまま無加工で保持する（`Parser::
+        // parse_where` の LIKE 分岐参照）。意味論的な検証・振り分けは
+        // `declarative_filter::DeclarativeFilter::like` の責務で、ここでは
+        // 追加のワイルドカードを付与しない。
         WherePredicate::Prefix { column, pattern } => {
             format!("{column} LIKE '{}'", escape_string_literal(pattern))
         }
@@ -4203,6 +4722,19 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::Between { .. }
         | WherePredicate::IsNull { .. }
         | WherePredicate::Not(_) => String::new(),
+        // `parse_view_body` が Or も拒否するため現時点では到達しない。将来の
+        // ビュー本体 OR 解禁（別 Issue）に備え、往復可能な形で網羅描画だけ
+        // 先に用意しておく（TASK-208・Issue #912）。
+        WherePredicate::Or(branches) => {
+            let rendered_branches: Vec<String> = branches
+                .iter()
+                .map(|branch| {
+                    let rendered: Vec<String> = branch.iter().map(render_where_predicate).collect();
+                    rendered.join(" AND ")
+                })
+                .collect();
+            format!("({})", rendered_branches.join(" OR "))
+        }
     }
 }
 
@@ -4473,6 +5005,7 @@ struct ParsedScanShape {
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
     limit: u32,
+    offset: u32,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -4549,6 +5082,11 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
         })?;
 
+        // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
+        // 受理する（広域取得のみ。検索 SELECT の `ORDER BY`／`USING PLAN` 経路は
+        // 対象外のまま `expect_end_of_statement` が `42601` に落とす）。
+        let offset = p.parse_optional_offset()?.unwrap_or(0);
+
         p.expect_end_of_statement()?;
 
         return Ok(ParsedSelect::Scan(ParsedScanShape {
@@ -4556,6 +5094,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             projection,
             where_predicates,
             limit,
+            offset,
         }));
     }
 
@@ -4639,15 +5178,16 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
     let has_group_by =
         matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"));
     let group_by = if has_group_by {
-        let column = p.parse_group_by_clause()?;
-        // SELECT リストの `GroupKey` 項目は `GROUP BY` 列と同名でなければならない
-        // （§計画 3.1）。不一致・`GROUP BY` 句を持たない `GroupKey` 項目（下の
-        // `else` 分岐）はいずれも許可リスト外として `42601` に落とす。
+        let columns = p.parse_group_by_clause()?;
+        // SELECT リストの `GroupKey` 項目は、いずれかの `GROUP BY` 列と同名で
+        // なければならない（§計画 3.1）。不一致・`GROUP BY` 句を持たない
+        // `GroupKey` 項目（下の `else` 分岐）はいずれも許可リスト外として
+        // `42601` に落とす。
         for item in &items {
             if let AggregateSelectItem::GroupKey { column: c, .. } = item {
-                if c != &column {
+                if !columns.contains(c) {
                     return Err(SqlSurfaceError::unsupported(format!(
-                        "SELECT list bare identifier {c:?} does not match GROUP BY column {column:?}"
+                        "SELECT list bare identifier {c:?} does not match any GROUP BY column {columns:?}"
                     )));
                 }
             }
@@ -4663,16 +5203,22 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
         } else {
             None
         };
-        let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-            Some(p.parse_aggregate_limit()?)
+        let (limit, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            let limit = p.parse_aggregate_limit()?;
+            // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` を伴う場合のみ
+            // 受理する（`LIMIT` なしの `OFFSET` 単独は後続の `expect_end_of_statement`
+            // が `42601` へ落とす。§計画 3.1）。
+            let offset = p.parse_optional_offset()?.unwrap_or(0);
+            (Some(limit), offset)
         } else {
-            None
+            (None, 0)
         };
         Some(GroupByClause {
-            column,
+            columns,
             having,
             order_by,
             limit,
+            offset,
         })
     } else {
         // `GROUP BY` 句が無いのに SELECT リストへ裸の識別子（`GroupKey` 候補）が
@@ -4695,6 +5241,74 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
         items,
         where_predicates,
         group_by,
+    })
+}
+
+/// `SELECT DISTINCT <column> [AS <alias>] FROM <table> [WHERE ...]
+/// [ORDER BY ...] [LIMIT ...]`（SQL-25 (c)・TASK-209）の許可形状。`GROUP BY`
+/// 実行器（[`ValidatedAggregate`]）へ直接脱糖する（SELECT リストに集計項目を
+/// 持たない `GroupKey` 単独の形。[`validate_sql_tokens`] がここで組み立てた
+/// `ParsedAggregateShape` を `parse_aggregate_shape` と同じ `Statement::
+/// Aggregate` へ写像するため、実行経路〔`bind_aggregate`・
+/// `execute_grouped_aggregate`〕は完全に共有される）。
+///
+/// 対象は単一の裸列参照のみ（複数列・`*`・式は `42601`。列名一致の判定を
+/// 経ないため `GroupByClause::column` はここでの唯一の列名をそのまま使う）。
+/// `GROUP BY`・`HAVING`・`OFFSET`・ベクトル順位付け（`ORDER BY <=>`・`HYBRID`・
+/// `USING PLAN`・`USING MODE`・`HINT ORDER`）はいずれもこの構文自体が持たない
+/// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) 参照）。列の型が
+/// `TEXT` であることの検査は意味論層（`sql::parser::bind_group_by_clause`）が
+/// 担う（`VECTOR` 列・`TEXT` 以外のスカラー列はいずれも `22000`）。
+fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+
+    p.expect_keyword(Keyword::Select)?;
+    p.expect_ident_matching("DISTINCT")?;
+    let column = p.expect_ident()?;
+    let alias = if p.peek_ident_matches("AS") {
+        p.advance();
+        Some(p.expect_ident()?)
+    } else {
+        None
+    };
+    p.expect_keyword(Keyword::From)?;
+    let table_name = p.expect_ident()?;
+
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        p.parse_where()?
+    } else {
+        Vec::new()
+    };
+    let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        Some(p.parse_aggregate_order_by()?)
+    } else {
+        None
+    };
+    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+        Some(p.parse_aggregate_limit()?)
+    } else {
+        None
+    };
+    p.expect_end_of_statement()?;
+
+    Ok(ParsedAggregateShape {
+        table_name,
+        items: vec![AggregateSelectItem::GroupKey {
+            column: column.clone(),
+            alias,
+        }],
+        where_predicates,
+        group_by: Some(GroupByClause {
+            columns: vec![column],
+            having: Vec::new(),
+            order_by,
+            limit,
+            // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
+            // ため常に `0`（Issue #916・SQL-25 (b)・TASK-209 の `offset` 追加に
+            // 伴う base 取り込みでの構造体フィールド整合）。
+            offset: 0,
+        }),
     })
 }
 
@@ -4780,6 +5394,56 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 /// `sql::params`（Issue #935・WIRE-12。拡張クエリプロトコルの `$n` 束縛）も、Bind 時に
 /// `Token::Param` を実値のトークンへ置換したトークン列を SQL テキストを経由せず
 /// この関数へ渡し、[`validate_sql`] と同一の判定順序・エラー分類を再利用する。
+/// `sql::view::resolve_from`・`sql::cte::resolve_relation` いずれの名前解決
+/// 結果（[`super::view::Resolved`]）からも、広域取得クエリ自身の形（射影・
+/// `WHERE`・`LIMIT`・`OFFSET`）を合成して [`ValidatedScan`] を組み立てる唯一の
+/// 実装（TABLE-18・TASK-205、TASK-213・Issue #928）。ビュー経由・CTE 経由の
+/// いずれの参照も畳み込み後は完全に同じ形になり、束縛・実行・RLS 適用は
+/// すべて既存経路をそのまま通る（第 2 の実行器を作らない設計）。
+fn build_scan_from_resolved(
+    table_name: String,
+    resolved: super::view::Resolved,
+    projection: Projection,
+    where_predicates: Vec<WherePredicate>,
+    limit: u32,
+    offset: u32,
+) -> Result<ValidatedScan, SqlSurfaceError> {
+    match resolved {
+        super::view::Resolved::Table => Ok(ValidatedScan {
+            table_name,
+            projection,
+            where_predicates,
+            limit,
+            offset,
+        }),
+        super::view::Resolved::View {
+            base_table,
+            view_predicates,
+            view_columns,
+        } => {
+            super::view::check_columns_within_view(
+                view_columns.as_deref(),
+                &projection,
+                &where_predicates,
+            )?;
+            let projection = if let (Projection::All, Some(cols)) = (&projection, &view_columns) {
+                Projection::Columns(cols.clone())
+            } else {
+                projection
+            };
+            let mut merged = view_predicates;
+            merged.extend(where_predicates);
+            Ok(ValidatedScan {
+                table_name: base_table,
+                projection,
+                where_predicates: merged,
+                limit,
+                offset,
+            })
+        }
+    }
+}
+
 pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
@@ -4789,12 +5453,213 @@ pub(crate) fn validate_sql_tokens(
     // 区別せず判定する。
     let is_set_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SET"));
+    // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）も `SET`・`CREATE`
+    // と同方針で、statement 先頭という文脈でのみ大文字小文字を区別せず判定する。
+    let is_with_statement =
+        matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("WITH"));
     let is_create_function_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"));
     // `EXPLAIN` も `SET`・`CREATE` と同方針（字句解析段階のキーワードにせず、
     // statement 先頭という文脈でのみ大文字小文字を区別せず判定する。TASK-78・SQL-6）。
     let is_explain_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("EXPLAIN"));
+    match tokens.first() {
+        Some(Token::Keyword(Keyword::Select)) => validate_select_statement(tokens, lookup),
+        // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
+        // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
+        // resolve_relation` を経由し `sql::view::resolve_from` と同じ
+        // `build_scan_from_resolved` へ合流させる（第 2 の実行器を作らない）。
+        // 主クエリは広域取得（`ParsedSelect::Scan`）のみを受理し、順位付き
+        // （`ORDER BY`／`USING PLAN`）・集計は明示的に拒否する（`WITH` 句を
+        // 剥がして後段へ流すと同名の実テーブルを黙って読む危険があるため、
+        // 絶対に行わない）。CTE と `EXPLAIN`・集計 SELECT との併用は
+        // `is_explain_statement`／`validate_select_statement` 側の先読みが
+        // 先頭トークンで振り分けるため、本アームには到達しない
+        // （out-of-scope。Issue #928 対象外事項）。
+        _ if is_with_statement => {
+            let mut p = Parser::new(tokens);
+            let ctes = p.parse_with_clause()?;
+            let main_tokens = p.remaining();
+
+            if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "WITH must be followed by a SELECT statement",
+                ));
+            }
+            let main_contains_group_by = main_tokens.windows(2).any(|w| {
+                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+                    && matches!(w[1], Token::Keyword(Keyword::By))
+            });
+            let main_is_aggregate_select = (matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+                && matches!(main_tokens.get(2), Some(Token::Punct('('))))
+                || main_contains_group_by;
+            if main_is_aggregate_select {
+                return Err(SqlSurfaceError::unsupported(
+                    "WITH does not support an aggregate main query",
+                ));
+            }
+            let shape = match parse_select_shape(main_tokens)? {
+                ParsedSelect::Scan(shape) => shape,
+                ParsedSelect::Search(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
+                    ));
+                }
+            };
+
+            // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
+            // fail-closed のため。構造検証・存在確認を省略しない）。
+            // 上限カウンタ（`ResolveBudget`）は「1 回のトップレベル呼び出し
+            // （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに
+            // 新規生成する（`cte::MAX_CTE_REFERENCES` のドキュメント参照。
+            // Issue #928 レビュー指摘）。文全体で 1 つのカウンタを使い回すと、
+            // このループが各定義のチェーンを再帰的に辿るたびに参照回数が
+            // 名前ごとではなく呼び出し回数分累積し、定義数・連鎖の深さの
+            // どちらも上限内の有効なクエリを誤って `54000` で拒否する。
+            // 連鎖の深さは `MAX_CTE_NESTING_DEPTH` で呼び出しごとに独立して
+            // 上限が掛かるため、リセットしても DoS 対策としての上限は失われない。
+            //
+            // `resolve_relation` は `def.body.table_name`（FROM）の名前解決
+            // 連鎖だけを検証し、`def` 自身の射影・`WHERE`（`compose` が本来
+            // 適用する `check_columns_within_view`）は「他の CTE・主クエリから
+            // 参照され `compose` を通る」場合にしか検証されない。参照されない
+            // leaf CTE はどこからも `compose` されないため、FROM 解決結果
+            // （`resolved` の公開列集合）に対して `def` 自身の射影・`WHERE` を
+            // ここで明示的に検証しないと、先行 CTE が非公開列を隠していても
+            // 参照されない後続 CTE がそれを射影・条件に使う文を通してしまう
+            // （Issue #928 レビュー指摘: Codex P1・Cursor Bugbot Low、同一欠陥）。
+            //
+            // `resolved` の公開列集合が `None`（`Resolved::Table` か、連鎖の
+            // どの段も列を絞り込んでいない `Resolved::View { view_columns: None,
+            // .. }`）の場合、実テーブル直下の列存在検査は通常
+            // `sql::parser::bind` に委ねている（`sql::view::resolve_from` の
+            // 同種コメント参照）。これは**参照される** CTE・VIEW には妥当
+            // （最終的に `ValidatedScan` へ畳み込まれ bind を通る）だが、
+            // どこからも参照されない leaf CTE は bind に到達しないため、
+            // ここで実テーブルのスキーマへ問い合わせて代わりに検証する
+            // （PR #1100 追加レビュー指摘: Codex P1・Cursor Bugbot Low）。
+            // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
+            // 後方互換）を返すため、これに対応しない `TableLookup` 実装
+            // （テスト用モック等）は無変更のまま今まで通り動作する。
+            for (idx, def) in ctes.iter().enumerate() {
+                let mut budget = super::cte::ResolveBudget::new();
+                let resolved = super::cte::resolve_relation(
+                    lookup,
+                    &ctes,
+                    idx,
+                    &def.body.table_name,
+                    0,
+                    &mut budget,
+                )?;
+                let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
+                    super::view::Resolved::Table => (def.body.table_name.as_str(), None),
+                    super::view::Resolved::View {
+                        base_table,
+                        view_columns,
+                        ..
+                    } => (base_table.as_str(), view_columns.clone()),
+                };
+                let exposed = match view_columns {
+                    Some(cols) => Some(cols),
+                    None => lookup.table_columns(base_table)?,
+                };
+                super::view::check_columns_within_view(
+                    exposed.as_deref(),
+                    &def.body.projection,
+                    &def.body.where_predicates,
+                )?;
+            }
+            let mut budget = super::cte::ResolveBudget::new();
+            let resolved = super::cte::resolve_relation(
+                lookup,
+                &ctes,
+                ctes.len(),
+                &shape.table_name,
+                0,
+                &mut budget,
+            )?;
+            Ok(Statement::Scan(build_scan_from_resolved(
+                shape.table_name,
+                resolved,
+                shape.projection,
+                shape.where_predicates,
+                shape.limit,
+                shape.offset,
+            )?))
+        }
+        _ if is_set_statement => {
+            let value = parse_set_search_mode(tokens)?;
+            Ok(Statement::SetSearchMode { value })
+        }
+        _ if is_create_function_statement => {
+            let (name, params, body) = parse_create_function(tokens)?;
+            Ok(Statement::CreateFunction { name, params, body })
+        }
+        // Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索・集計・広域取得へ
+        // 拡大した。先頭の `EXPLAIN` トークンを消費した残りを、非 EXPLAIN の
+        // `SELECT` と完全に同じ振り分け・パース・カタログ存在確認
+        // （[`validate_select_statement`]）へそのまま渡すことで、42601 → 42P01 →
+        // 束縛エラーという判定順序が EXPLAIN の有無で変わらないことを構造的に
+        // 保証する（第 2 の実装を持たない）。残り先頭が `SELECT` でない場合
+        // （`EXPLAIN EXPLAIN`／`EXPLAIN SET`／`EXPLAIN CREATE FUNCTION`／
+        // `EXPLAIN INSERT`／`EXPLAIN WITH` 等の DML・DDL・CTE）は許可リスト外
+        // として一律 `42601`（`EXPLAIN` と CTE の併用は Issue #928 の対象外
+        // 事項であり、`validate_select_statement` は `WITH` 句を扱わないため
+        // 自然にここへ落ちる）。untrusted 入力経路のため添字アクセスではなく
+        // `get` でスライスする（`.claude/rules/coding-rust.md`）。
+        _ if is_explain_statement => {
+            let rest = tokens.get(1..).unwrap_or(&[]);
+            if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN requires a SELECT statement",
+                ));
+            }
+            let target = match validate_select_statement(rest, lookup)? {
+                Statement::Select(v) => ExplainTarget::Search(v),
+                Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
+                Statement::Scan(v) => ExplainTarget::Scan(v),
+                // `validate_select_statement` は `SELECT` 先頭のトークン列に
+                // 対して常に `Select`／`Aggregate`／`Scan` のいずれかを返す
+                // （関数ドキュメント参照）。到達は同関数の契約違反時のみの
+                // 防御的経路として fail-closed に拒否する（`unreachable!` の
+                // panic ではなくエラー応答にする。ライブラリコードは panic
+                // させない方針。`.claude/rules/coding-rust.md`）。
+                Statement::SetSearchMode { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::Explain(_) => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "validate_select_statement returned a non-SELECT statement"
+                            .to_string(),
+                    });
+                }
+            };
+            Ok(Statement::Explain(target))
+        }
+        other => Err(SqlSurfaceError::unsupported(format!(
+            "expected SELECT, SET, CREATE FUNCTION, or EXPLAIN, got {other:?}"
+        ))),
+    }
+}
+
+/// 通常 SELECT・集計 SELECT（`GROUP BY` の有無いずれも）・`SELECT DISTINCT`
+/// の脱糖形・広域取得（ビュー展開後の形を含む）の共有振り分け（TASK-166・
+/// SQL-13／TASK-167・SQL-14／SQL-25 (c)・TASK-209／Issue #454 の先読み判定と
+/// パースを 1 箇所へ集約したもの。Issue #922・SQL-27）。`tokens` の先頭は
+/// `SELECT` キーワードであることが前提（呼び出し元が
+/// `matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))` を
+/// 確認済みであること。違反時の挙動は各内部パーサーの構文エラーに委ねる）。
+/// 戻り値は常に [`Statement::Select`]・[`Statement::Aggregate`]・
+/// [`Statement::Scan`] のいずれか（[`Statement::SetSearchMode`]・
+/// [`Statement::CreateFunction`]・[`Statement::Explain`] を返すことはない）。
+///
+/// [`validate_sql_tokens`] の非 EXPLAIN 経路と `EXPLAIN`（[`ExplainTarget`]）
+/// の両方がこの関数を呼ぶことで、`EXPLAIN` の対象拡大が既存の判定順序
+/// （`42601` → `42P01` → 束縛エラー）を変えないことを構造的に保証する
+/// （第 2 の実装を持たない）。
+fn validate_select_statement(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<Statement, SqlSurfaceError> {
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
@@ -4809,151 +5674,51 @@ pub(crate) fn validate_sql_tokens(
         matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
             && matches!(w[1], Token::Keyword(Keyword::By))
     });
-    let is_aggregate_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
-        && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-            && matches!(tokens.get(2), Some(Token::Punct('('))))
-            || contains_group_by);
-    match tokens.first() {
-        Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
-            let shape = parse_aggregate_shape(tokens)?;
+    let is_aggregate_select = (matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+        && matches!(tokens.get(2), Some(Token::Punct('('))))
+        || contains_group_by;
+    // SQL-25 (c)・TASK-209: `SELECT` の直後（2 番目のトークン）が
+    // [`is_distinct_modifier`] の判定する `DISTINCT` 修飾子なら `SELECT DISTINCT`
+    // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
+    // （`GROUP BY` を含む形）より前に判定する（`SELECT DISTINCT lang, COUNT(*)
+    // FROM t GROUP BY lang` のような両方に一致しうる入力は存在しない——
+    // `parse_distinct_shape` は単一の裸列参照のみを受理するため、集計項目や
+    // 複数列を伴う形は自然に `42601` へ落ちる）。
+    let is_distinct_select = is_distinct_modifier(tokens, 1);
+
+    if is_distinct_select {
+        let shape = parse_distinct_shape(tokens)?;
+        let exists = lookup.table_exists(&shape.table_name)?;
+        if !exists {
+            return Err(SqlSurfaceError::undefined_table(shape.table_name));
+        }
+        return Ok(Statement::Aggregate(ValidatedAggregate {
+            table_name: shape.table_name,
+            items: shape.items,
+            where_predicates: shape.where_predicates,
+            group_by: shape.group_by,
+        }));
+    }
+    if is_aggregate_select {
+        let shape = parse_aggregate_shape(tokens)?;
+        let exists = lookup.table_exists(&shape.table_name)?;
+        if !exists {
+            return Err(SqlSurfaceError::undefined_table(shape.table_name));
+        }
+        return Ok(Statement::Aggregate(ValidatedAggregate {
+            table_name: shape.table_name,
+            items: shape.items,
+            where_predicates: shape.where_predicates,
+            group_by: shape.group_by,
+        }));
+    }
+    match parse_select_shape(tokens)? {
+        ParsedSelect::Search(shape) => {
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {
                 return Err(SqlSurfaceError::undefined_table(shape.table_name));
             }
-            Ok(Statement::Aggregate(ValidatedAggregate {
-                table_name: shape.table_name,
-                items: shape.items,
-                where_predicates: shape.where_predicates,
-                group_by: shape.group_by,
-            }))
-        }
-        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(tokens)? {
-            ParsedSelect::Search(shape) => {
-                let exists = lookup.table_exists(&shape.table_name)?;
-                if !exists {
-                    return Err(SqlSurfaceError::undefined_table(shape.table_name));
-                }
-                Ok(Statement::Select(ValidatedStatement {
-                    table_name: shape.table_name,
-                    projection: shape.projection,
-                    order_by: shape.order_by,
-                    where_predicates: shape.where_predicates,
-                    limit: shape.limit,
-                    search_mode: shape.search_mode,
-                    evaluation_order: shape.evaluation_order,
-                    using_plan: shape.using_plan,
-                }))
-            }
-            // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
-            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。TABLE-18・SQL-23・
-            // TASK-205（Issue #909）: FROM がビュー（`CREATE VIEW`）を指す場合、
-            // `sql::view::resolve_from` が連鎖を畳み込んで基底テーブル名＋
-            // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
-            // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
-            // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
-            ParsedSelect::Scan(shape) => {
-                match super::view::resolve_from(lookup, &shape.table_name)? {
-                    super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
-                        table_name: shape.table_name,
-                        projection: shape.projection,
-                        where_predicates: shape.where_predicates,
-                        limit: shape.limit,
-                    })),
-                    super::view::Resolved::View {
-                        base_table,
-                        view_predicates,
-                        view_columns,
-                    } => {
-                        super::view::check_columns_within_view(
-                            view_columns.as_deref(),
-                            &shape.projection,
-                            &shape.where_predicates,
-                        )?;
-                        let projection = match (&shape.projection, &view_columns) {
-                            (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
-                            (other, _) => other.clone(),
-                        };
-                        let mut where_predicates = view_predicates;
-                        where_predicates.extend(shape.where_predicates);
-                        Ok(Statement::Scan(ValidatedScan {
-                            table_name: base_table,
-                            projection,
-                            where_predicates,
-                            limit: shape.limit,
-                        }))
-                    }
-                }
-            }
-        },
-        _ if is_set_statement => {
-            let value = parse_set_search_mode(tokens)?;
-            Ok(Statement::SetSearchMode { value })
-        }
-        _ if is_create_function_statement => {
-            let (name, params, body) = parse_create_function(tokens)?;
-            Ok(Statement::CreateFunction { name, params, body })
-        }
-        // TASK-78（SQL-6）: `EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置
-        // のみを受理する（fail-closed。将来の拡張は別タスクの管轄）。先頭の
-        // `EXPLAIN` トークンを消費した残りを既存の検索 SELECT 形状パーサー
-        // （[`parse_select_shape`]）へそのまま渡し、`USING PLAN` を含まない形
-        // （通常 SELECT・`ORDER BY` 経路）は `shape.using_plan` が `None` になる
-        // ことを利用して一律 `42601` へ落とす（`SET`・`CREATE FUNCTION` への
-        // 前置は残り先頭が `SELECT` キーワードでないため、同じ `42601` へ自然に
-        // 落ちる）。
-        //
-        // 集計 SELECT（TASK-166・SQL-13／TASK-167・SQL-14）は非 EXPLAIN 経路では
-        // `is_aggregate_select` の先読みで `parse_aggregate_shape` へ振り分けられ
-        // `parse_select_shape` には到達しないが、この分岐は残りトークンを無条件に
-        // `parse_select_shape` へ渡すため、同じ先読みを適用しないと内側の
-        // `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` が集計ではなく UDF 呼び出しの検索射影
-        // として誤って受理されうる（Issue #267 Bugbot 指摘）。`EXPLAIN` に集計
-        // SELECT の対応契約は無い（`ValidatedAggregate` に `using_plan` は無く
-        // `USING PLAN` と両立しない）ため、`is_aggregate_select` と同じ先読みを
-        // 残りトークンに適用し、集計形状に見える場合は fail-closed で拒否する。
-        _ if is_explain_statement => {
-            let rest = &tokens[1..];
-            if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN requires a SELECT ... USING PLAN(...) statement",
-                ));
-            }
-            let rest_contains_group_by = rest.windows(2).any(|w| {
-                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
-                    && matches!(w[1], Token::Keyword(Keyword::By))
-            });
-            let rest_is_aggregate_select = (matches!(rest.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-                && matches!(rest.get(2), Some(Token::Punct('('))))
-                || rest_contains_group_by;
-            if rest_is_aggregate_select {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN is not supported for aggregate SELECT statements",
-                ));
-            }
-            // Issue #454: 広域取得（`ParsedSelect::Scan`）は `USING PLAN` を
-            // 持てない形（ランキング段自体を持たない）ため、既存の
-            // `shape.using_plan.is_none()` 判定と同じ理由で一律 `42601` に
-            // 落とす（`EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置のみを
-            // 受理する契約。本モジュールドキュメントの `Statement::Explain`
-            // 参照）。
-            let shape = match parse_select_shape(rest)? {
-                ParsedSelect::Search(shape) => shape,
-                ParsedSelect::Scan(_) => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
-                    ));
-                }
-            };
-            if shape.using_plan.is_none() {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
-                ));
-            }
-            let exists = lookup.table_exists(&shape.table_name)?;
-            if !exists {
-                return Err(SqlSurfaceError::undefined_table(shape.table_name));
-            }
-            Ok(Statement::Explain(ValidatedStatement {
+            Ok(Statement::Select(ValidatedStatement {
                 table_name: shape.table_name,
                 projection: shape.projection,
                 order_by: shape.order_by,
@@ -4964,9 +5729,46 @@ pub(crate) fn validate_sql_tokens(
                 using_plan: shape.using_plan,
             }))
         }
-        other => Err(SqlSurfaceError::unsupported(format!(
-            "expected SELECT, SET, CREATE FUNCTION, or EXPLAIN, got {other:?}"
-        ))),
+        // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
+        // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。TABLE-18・SQL-23・
+        // TASK-205（Issue #909）: FROM がビュー（`CREATE VIEW`）を指す場合、
+        // `sql::view::resolve_from` が連鎖を畳み込んで基底テーブル名＋
+        // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
+        // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
+        // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
+        ParsedSelect::Scan(shape) => match super::view::resolve_from(lookup, &shape.table_name)? {
+            super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
+                table_name: shape.table_name,
+                projection: shape.projection,
+                where_predicates: shape.where_predicates,
+                limit: shape.limit,
+                offset: shape.offset,
+            })),
+            super::view::Resolved::View {
+                base_table,
+                view_predicates,
+                view_columns,
+            } => {
+                super::view::check_columns_within_view(
+                    view_columns.as_deref(),
+                    &shape.projection,
+                    &shape.where_predicates,
+                )?;
+                let projection = match (&shape.projection, &view_columns) {
+                    (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
+                    (other, _) => other.clone(),
+                };
+                let mut where_predicates = view_predicates;
+                where_predicates.extend(shape.where_predicates);
+                Ok(Statement::Scan(ValidatedScan {
+                    table_name: base_table,
+                    projection,
+                    where_predicates,
+                    limit: shape.limit,
+                    offset: shape.offset,
+                }))
+            }
+        },
     }
 }
 
@@ -5454,7 +6256,8 @@ pub enum CopyStatement {
 }
 
 /// `(<items>)` の対応する丸括弧を見つけ、内側・外側後続のトークン列へ分割する
-/// （`COPY (<SELECT>) TO STDOUT` の内側 SELECT を切り出すための唯一の実装。
+/// （`COPY (<SELECT>) TO STDOUT` の内側 SELECT、`WITH <name> AS (<body>)`
+/// の CTE 本文〔TASK-213・SQL-29 (b)、Issue #928〕の双方が使う唯一の実装。
 /// 文字列リテラル内の `(`/`)` は字句解析時点で既に 1 個の `Token::StringLiteral`
 /// へ吸収されているため、本関数はトークン列上の `Token::Punct('('/')')` だけを
 /// 深さで数えれば安全に対応を取れる）。`tokens` の先頭は必ず `(` であること
@@ -5469,10 +6272,10 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
                 depth -= 1;
                 if depth == 0 {
                     let inner = tokens.get(1..i).ok_or_else(|| {
-                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                        SqlSurfaceError::unsupported("malformed parenthesized clause")
                     })?;
                     let after = tokens.get(i + 1..).ok_or_else(|| {
-                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                        SqlSurfaceError::unsupported("malformed parenthesized clause")
                     })?;
                     return Ok((inner, after));
                 }
@@ -5481,7 +6284,7 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
         }
     }
     Err(SqlSurfaceError::unsupported(
-        "unterminated parenthesized expression in COPY statement",
+        "unterminated parenthesized expression",
     ))
 }
 
@@ -6422,6 +7225,235 @@ mod tests {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents WHERE unknown() ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
+    }
+
+    // --- TASK-208・SQL-24（Issue #912）: `WHERE` の `OR` 結合・括弧グルーピング --
+
+    fn where_predicates_for(sql: &str) -> Vec<WherePredicate> {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(sql, &lookup)
+            .unwrap_or_else(|e| panic!("expected acceptance, got {e:?} for sql={sql:?}"))
+            .where_predicates()
+            .to_vec()
+    }
+
+    #[test]
+    fn accepts_simple_or() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE lang = 'ja' OR lang = 'en' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(
+            preds,
+            vec![WherePredicate::Or(vec![
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                }],
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "en".to_string(),
+                }],
+            ])]
+        );
+    }
+
+    #[test]
+    fn and_only_parenthesized_group_flattens_to_the_same_ast_as_without_parens() {
+        // `(a AND b)` は AND だけのグループなので、括弧なしと完全に同じ AST になる
+        // （TASK-208 導入前の content hash・既存受理形状との後方互換の核心）。
+        let with_parens = where_predicates_for(
+            "SELECT * FROM documents WHERE (lang = 'ja' AND flag) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        let without_parens = where_predicates_for(
+            "SELECT * FROM documents WHERE lang = 'ja' AND flag ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(with_parens, without_parens);
+    }
+
+    #[test]
+    fn accepts_and_of_two_or_groups() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE (lang = 'ja' OR lang = 'en') AND (flag OR active = true) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 2, "two independent OR groups ANDed together");
+        assert!(matches!(preds[0], WherePredicate::Or(_)));
+        assert!(matches!(preds[1], WherePredicate::Or(_)));
+    }
+
+    #[test]
+    fn accepts_nested_or_inside_and_branch() {
+        // `a OR (b AND c)`: 分岐 2 の中に AND、`Or` 自体はネストしない。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE lang = 'ja' OR (flag AND active = true) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        match &preds[..] {
+            [WherePredicate::Or(branches)] => {
+                assert_eq!(branches.len(), 2);
+                assert_eq!(branches[1].len(), 2);
+            }
+            other => panic!("expected a single Or predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_value_expression_parenthesized_group_unaffected_by_or_support() {
+        // `(id + 1) > 5`: 既存の式フォールバック経路（値式グループ）が壊れて
+        // いないことを固定する（決定的先読みが値式グループと BOOLEAN グループを
+        // 取り違えない）。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE (id + 1) > 5 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 1);
+        assert!(matches!(preds[0], WherePredicate::Expression(_)));
+    }
+
+    #[test]
+    fn accepts_doubly_parenthesized_value_expression() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE ((id)) > 5 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 1);
+        assert!(matches!(preds[0], WherePredicate::Expression(_)));
+    }
+
+    #[test]
+    fn accepts_bare_boolean_column_wrapped_in_parens() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE (flag) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(
+            preds,
+            vec![WherePredicate::BoolColumn {
+                column: "flag".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn accepts_column_named_or_as_equality() {
+        // 列名 `or` はキーワード化しないため、通常の等価条件として通る。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE or = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(
+            preds,
+            vec![WherePredicate::Equality {
+                column: "or".to_string(),
+                value: "x".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_or() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE lang = 'ja' OR ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_unmatched_open_paren_in_where() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE (lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_empty_paren_group_in_where() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE () ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn accepts_where_leaf_count_at_the_limit() {
+        let clause = (0..MAX_WHERE_LEAVES)
+            .map(|i| format!("lang = 'v{i}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(&sql, &lookup)
+            .expect("exactly MAX_WHERE_LEAVES leaves must be accepted");
+    }
+
+    #[test]
+    fn rejects_where_leaf_count_over_the_limit() {
+        let clause = (0..=MAX_WHERE_LEAVES)
+            .map(|i| format!("lang = 'v{i}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(&sql, &lookup).expect_err("must exceed MAX_WHERE_LEAVES");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn accepts_where_group_depth_at_the_limit() {
+        let mut clause = "flag".to_string();
+        for _ in 0..MAX_WHERE_GROUP_DEPTH {
+            clause = format!("({clause})");
+        }
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(&sql, &lookup)
+            .expect("exactly MAX_WHERE_GROUP_DEPTH nesting must be accepted");
+    }
+
+    #[test]
+    fn rejects_where_group_depth_over_the_limit() {
+        let mut clause = "flag".to_string();
+        for _ in 0..=MAX_WHERE_GROUP_DEPTH {
+            clause = format!("({clause})");
+        }
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(&sql, &lookup).expect_err("must exceed MAX_WHERE_GROUP_DEPTH");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_visible_inside_or_branch() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE visible() OR lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn accepts_visible_inside_and_only_group() {
+        // `visible()` は「2 分岐以上の OR」の中にだけ現れなければ許可される
+        // （AND だけのグループはそもそも `Or` へ包まれない）。
+        where_predicates_for(
+            "SELECT * FROM documents WHERE (visible() AND lang = 'ja') ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_visible_inside_and_branch_of_an_or() {
+        // `(visible() AND x) OR y`: OR 分岐の 1 つが visible() を含むため拒否する。
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE (visible() AND flag) OR lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_or_inside_check_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "CREATE TABLE t (kind TEXT, CHECK (kind = 'a' OR kind = 'b'))",
+            &lookup,
+        )
+        .expect_err("OR must remain rejected inside CHECK bodies");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     // 許可された ORDER BY 関数の引数形状回帰テスト。
@@ -7986,15 +9018,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_statement_with_or_combined_predicate() {
+    fn accepts_delete_statement_with_or_combined_predicate() {
+        // TASK-208・SQL-24（Issue #912）: `OR` 結合は述語つき DELETE の許可形状に
+        // 含まれるようになった（従来は `42601` で拒否していた）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_delete_statement(
+        let stmt = validate_delete_statement(
             "DELETE FROM documents WHERE lang = 'ja' OR lang = 'en' USING OPERATION_ID 'op-0001'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect_err("OR-combined predicate is out of the allowed shape");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("OR-combined predicate is now accepted");
+        match stmt {
+            DeleteStatement::Predicate(predicate) => {
+                assert_eq!(
+                    predicate.where_predicates,
+                    vec![WherePredicate::Or(vec![
+                        vec![WherePredicate::Equality {
+                            column: "lang".to_string(),
+                            value: "ja".to_string(),
+                        }],
+                        vec![WherePredicate::Equality {
+                            column: "lang".to_string(),
+                            value: "en".to_string(),
+                        }],
+                    ])]
+                );
+            }
+            other => panic!("expected DeleteStatement::Predicate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8861,7 +9912,7 @@ mod tests {
             &lookup,
         );
         let group_by = agg.group_by().expect("GROUP BY clause must be accepted");
-        assert_eq!(group_by.column, "lang");
+        assert_eq!(group_by.columns, vec!["lang".to_string()]);
         assert_eq!(group_by.having.len(), 1);
         assert_eq!(group_by.having[0].item_name, "n");
         assert_eq!(group_by.having[0].literal, 1.0);
@@ -8869,6 +9920,32 @@ mod tests {
         assert_eq!(order_by.target, "n");
         assert!(order_by.descending);
         assert_eq!(group_by.limit, Some(10));
+    }
+
+    #[test]
+    fn accepts_group_by_limit_with_offset() {
+        // Issue #916・SQL-25 (b)・TASK-209: GROUP BY 集計の `LIMIT n OFFSET m`。
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang LIMIT 3 OFFSET 2",
+            &lookup,
+        );
+        let group_by = agg.group_by().expect("GROUP BY clause must be accepted");
+        assert_eq!(group_by.limit, Some(3));
+        assert_eq!(group_by.offset, 2);
+    }
+
+    #[test]
+    fn rejects_group_by_offset_without_limit() {
+        // Issue #916・SQL-25 (b)・TASK-209: `LIMIT` を伴わない `OFFSET` 単独は
+        // `GROUP BY` 集計でも受理しない（後続の `expect_end_of_statement` が拒否）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang OFFSET 2",
+            &lookup,
+        )
+        .expect_err("OFFSET without LIMIT must be rejected for GROUP BY aggregates");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
@@ -8897,14 +9974,72 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_group_by_columns() {
+    fn accepts_multiple_group_by_columns_at_syntax_layer() {
+        // SQL-25 (d): 複数列 `GROUP BY` は構文層を通過する（列数上限・重複検査は
+        // 別テストで確認する）。`id` 列は非 TEXT のため束縛段（`sql::parser`）で
+        // `22000` になるが、それは構文層の関知するところではない
+        // （`bind_group_by_column_type_mismatch_is_rejected` 相当。本モジュールは
+        // 構造の受理までを担う）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
+        let statement = validate_sql(
             "SELECT lang, COUNT(*) FROM documents GROUP BY lang, id",
             &lookup,
         )
-        .expect_err("multi-column GROUP BY must be rejected");
+        .expect("multi-column GROUP BY must be accepted at the syntax layer");
+        let Statement::Aggregate(aggregate) = statement else {
+            panic!("expected Aggregate statement");
+        };
+        assert_eq!(
+            aggregate.group_by().expect("GROUP BY clause").columns,
+            vec!["lang".to_string(), "id".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_group_by_columns() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang, lang",
+            &lookup,
+        )
+        .expect_err("duplicate GROUP BY column must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn accepts_group_by_column_count_at_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let columns: Vec<String> = (0..MAX_GROUP_BY_COLUMNS).map(|i| format!("c{i}")).collect();
+        let sql = format!(
+            "SELECT {}, COUNT(*) FROM documents GROUP BY {}",
+            columns[0],
+            columns.join(", ")
+        );
+        let statement =
+            validate_sql(&sql, &lookup).expect("GROUP BY column count at limit must be accepted");
+        let Statement::Aggregate(aggregate) = statement else {
+            panic!("expected Aggregate statement");
+        };
+        assert_eq!(
+            aggregate.group_by().expect("GROUP BY clause").columns.len(),
+            MAX_GROUP_BY_COLUMNS
+        );
+    }
+
+    #[test]
+    fn rejects_group_by_column_count_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let columns: Vec<String> = (0..=MAX_GROUP_BY_COLUMNS)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let sql = format!(
+            "SELECT {}, COUNT(*) FROM documents GROUP BY {}",
+            columns[0],
+            columns.join(", ")
+        );
+        let err = validate_sql(&sql, &lookup)
+            .expect_err("GROUP BY column count over limit must be rejected");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
@@ -9035,11 +10170,182 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// SQL-25 (c)・TASK-209 で `COUNT(DISTINCT <expr>)` を受理するよう仕様変更
+    /// （旧名 `rejects_distinct_modifier` から反転。アサーションの弱体化ではなく
+    /// 許可リストの構造判定のみを確認する回帰テスト）。
     #[test]
-    fn rejects_distinct_modifier() {
+    fn accepts_count_distinct_modifier() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT COUNT(DISTINCT lang) FROM documents", &lookup)
-            .expect_err("COUNT(DISTINCT ...) must be rejected");
+        validate_sql("SELECT COUNT(DISTINCT lang) FROM documents", &lookup)
+            .expect("COUNT(DISTINCT ...) must be accepted (SQL-25 (c))");
+    }
+
+    #[test]
+    fn rejects_count_distinct_star() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT(DISTINCT *) FROM documents", &lookup)
+            .expect_err("COUNT(DISTINCT *) must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_sum_distinct() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT SUM(DISTINCT id) FROM documents", &lookup)
+            .expect_err("DISTINCT is only allowed inside COUNT");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `distinct` という列名の後方互換（SQL-25 (c) 追加前の既存解釈を維持する）。
+    #[test]
+    fn accepts_count_of_column_named_distinct() {
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT COUNT(distinct) FROM documents", &lookup)
+            .expect("COUNT(distinct) (column named 'distinct') must remain accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column() {
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT DISTINCT lang FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column> must be accepted (SQL-25 (c))");
+    }
+
+    #[test]
+    fn accepts_select_distinct_bare_column_named_distinct_as_projection() {
+        // `distinct` という列名を持つ表への `SELECT distinct FROM t LIMIT n`
+        // （既存の広域取得としての解釈）は `is_distinct_modifier` の「次が
+        // `FROM` なら列名」判定で維持される。
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT distinct FROM documents LIMIT 5", &lookup)
+            .expect("bare column named 'distinct' must remain accepted as a projection");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_with_alias_in_group_by_projection() {
+        // PR #1098 レビュー対応（codex/review P1）: `is_distinct_modifier` が
+        // 次トークンを任意の `Ident` とみなして `DISTINCT` 修飾子と誤判定すると、
+        // `distinct` という列名に `AS <alias>` を付けた既存の集計 SELECT リスト
+        // 項目（[`Parser::parse_aggregate_select_item`] が受理する「裸の識別子
+        // ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列として使う場合に現れる）
+        // まで `parse_distinct_shape` へ誤って振り分けられ `42601` で拒否されて
+        // いた。次トークンが `AS` の場合は列名側へ振り分けることで、この形状が
+        // 引き続き受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql(
+            "SELECT distinct AS d, COUNT(*) FROM documents GROUP BY distinct",
+            &lookup,
+        )
+        .expect(
+            "column named 'distinct' with AS alias in GROUP BY projection must remain accepted",
+        );
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(
+                    agg.group_by
+                        .as_ref()
+                        .and_then(|g| g.columns.first().map(String::as_str)),
+                    Some("distinct")
+                );
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_named_as() {
+        // PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
+        // `is_distinct_modifier` が次トークン `Ident("AS")` を常に列名側の目印と
+        // 誤判定すると、列名 `as`（`catalog::validate_identifier` が許可する
+        // 識別子）を対象にした `SELECT DISTINCT as ...` まで列名 `distinct` の
+        // 投影として解釈され `42601` で拒否されていた。`AS` の 1 つ先の
+        // トークンまで見て「別名なし＝列名 as に対する DISTINCT 修飾子」と
+        // 判定することで、この形状が受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql("SELECT DISTINCT as FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column named 'as'> must be accepted");
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(
+                    agg.group_by
+                        .as_ref()
+                        .and_then(|g| g.columns.first().map(String::as_str)),
+                    Some("as")
+                );
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_count_distinct_column_named_as() {
+        // 上記と同じ曖昧さの `COUNT(DISTINCT <expr>)`（[`Parser::parse_aggregate_item`]）
+        // 側での固定（PR #1098 レビュー対応）。
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT COUNT(DISTINCT as) FROM documents", &lookup)
+            .expect("COUNT(DISTINCT <column named 'as'>) must be accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_named_as_with_alias() {
+        // PR #1098 レビュー再指摘（codex/review P1）: `is_distinct_modifier` が
+        // `tokens[pos+1]` の `Ident("AS")` を見た時点で `tokens[pos+2]` が
+        // `Ident` なら無条件に「`DISTINCT` 自体が列名」と判定すると、列名 `as`
+        // （`AS` と字句上区別できない）自体に別名を付ける
+        // `SELECT DISTINCT as AS alias FROM t` まで、2 段目の `AS alias` を
+        // 余剰トークンとして `42601` で拒否していた。`tokens[pos+2]` 自体が
+        // さらに `AS` 由来で `tokens[pos+3]` が識別子（真の別名）の場合は
+        // 列名 `as` に対する `DISTINCT` 修飾子と判定することで、この形状が
+        // 受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql("SELECT DISTINCT as AS alias FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column named 'as'> AS <alias> must be accepted");
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(
+                    agg.group_by
+                        .as_ref()
+                        .and_then(|g| g.columns.first().map(String::as_str)),
+                    Some("as")
+                );
+                match agg.items.as_slice() {
+                    [AggregateSelectItem::GroupKey { column, alias }] => {
+                        assert_eq!(column, "as");
+                        assert_eq!(alias.as_deref(), Some("alias"));
+                    }
+                    other => panic!("expected single GroupKey item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_select_distinct_star_with_vector_ranking() {
+        // `SELECT DISTINCT *` とベクトル順位付けの併用は引き続き `42601` で
+        // 拒否する（SQL-25 (a) 参照。既存の `rejects_distinct` と同じ入力を、
+        // `SELECT DISTINCT` 対応後も一貫して拒否することを確認する）。
+        assert_rejected_as_syntax_error(
+            "SELECT DISTINCT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_select_distinct_with_explicit_group_by() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT DISTINCT lang FROM documents GROUP BY lang", &lookup)
+            .expect_err("SELECT DISTINCT does not accept an explicit GROUP BY clause");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_explain_select_distinct() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "EXPLAIN SELECT DISTINCT lang FROM documents USING PLAN(full_scan())",
+            &lookup,
+        )
+        .expect_err("EXPLAIN does not support SELECT DISTINCT");
         assert_eq!(err.wire_code(), "42601");
     }
 
@@ -9139,6 +10445,85 @@ mod tests {
         assert!(matches!(scan.projection(), Projection::Columns(cols) if cols == &["id", "body"]));
     }
 
+    // --- OFFSET（Issue #916・SQL-25 (b)・TASK-209） ----------------------------
+
+    #[test]
+    fn accepts_scan_with_limit_and_offset() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 5 OFFSET 10", &lookup);
+        assert_eq!(scan.limit(), 5);
+        assert_eq!(scan.offset(), 10);
+    }
+
+    #[test]
+    fn accepts_scan_with_offset_zero() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 5 OFFSET 0", &lookup);
+        assert_eq!(scan.offset(), 0);
+    }
+
+    #[test]
+    fn accepts_scan_without_offset_defaults_to_zero() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 5", &lookup);
+        assert_eq!(scan.offset(), 0);
+    }
+
+    #[test]
+    fn offset_does_not_shadow_offset_as_column_or_table_name() {
+        // `OFFSET` は `lexer::Keyword` に追加していない（`peek_ident_matches` による
+        // この位置限定の文脈識別子）ため、列名・テーブル名としての `offset` は
+        // 従来どおり使える。
+        let lookup = catalog_with(&["offset"]);
+        let scan = expect_scan("SELECT offset FROM offset LIMIT 5", &lookup);
+        assert_eq!(scan.table_name(), "offset");
+        assert!(matches!(scan.projection(), Projection::Columns(cols) if cols == &["offset"]));
+    }
+
+    #[test]
+    fn rejects_offset_before_limit() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents OFFSET 10 LIMIT 5");
+    }
+
+    #[test]
+    fn rejects_offset_without_limit() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents OFFSET 10");
+    }
+
+    #[test]
+    fn rejects_offset_rows_suffix() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET 10 ROWS");
+    }
+
+    #[test]
+    fn rejects_negative_offset() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET -1");
+    }
+
+    #[test]
+    fn rejects_fractional_offset() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET 1.5");
+    }
+
+    #[test]
+    fn rejects_offset_exceeding_u32() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET 4294967296");
+    }
+
+    #[test]
+    fn rejects_offset_with_trailing_using_mode() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents LIMIT 5 OFFSET 10 USING MODE 'precision'",
+        );
+    }
+
+    #[test]
+    fn rejects_search_select_with_using_plan_and_offset() {
+        // `USING PLAN(...)` 経路（ランキング段を `USING PLAN` の展開結果が決める）も
+        // 検索 SELECT の一種であり、`OFFSET` は構造上受理しない（§計画 3.1）。
+        assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q') LIMIT 5 OFFSET 1");
+    }
+
     #[test]
     fn rejects_scan_missing_limit() {
         let lookup = catalog_with(&["documents"]);
@@ -9186,11 +10571,19 @@ mod tests {
     }
 
     #[test]
-    fn explain_rejects_scan_shape() {
+    fn explain_accepts_scan_shape() {
+        // Issue #922（SQL-27）: `EXPLAIN` の対象を広域取得へ拡大したため、
+        // bare LIMIT scan の前置はもはや拒否されず `ExplainTarget::Scan` として
+        // 受理される（受理テストへ反転）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("EXPLAIN SELECT * FROM documents LIMIT 10", &lookup)
-            .expect_err("EXPLAIN must reject a bare LIMIT scan (no USING PLAN)");
-        assert_eq!(err.wire_code(), "42601");
+        let stmt = validate_sql("EXPLAIN SELECT * FROM documents LIMIT 10", &lookup)
+            .expect("EXPLAIN over a bare LIMIT scan must be accepted");
+        match stmt {
+            Statement::Explain(ExplainTarget::Scan(scan)) => {
+                assert_eq!(scan.table_name(), "documents");
+            }
+            other => panic!("expected ExplainTarget::Scan, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10080,5 +11473,401 @@ mod tests {
         let v = parse_create_table_ok(&sql);
         assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
         assert_eq!(v.checks.len(), 2);
+    }
+
+    // --- 非再帰 CTE（`WITH` 句。SQL-29 (b)・RLS-10 (b)、TASK-213、Issue #928） ---
+
+    #[test]
+    fn accepts_single_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+        assert_eq!(scan.limit(), 10);
+    }
+
+    #[test]
+    fn accepts_cte_chain() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH a AS (SELECT id FROM documents), b AS (SELECT id FROM a) SELECT * FROM b LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+    }
+
+    #[test]
+    fn accepts_cte_referencing_view() {
+        struct ViewCatalog;
+        impl TableLookup for ViewCatalog {
+            fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+                Ok(name == "documents")
+            }
+            fn view_definition(
+                &self,
+                name: &str,
+            ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
+                if name == "docs_view" {
+                    Ok(Some(crate::catalog::ViewDef {
+                        base_relation: "documents".to_string(),
+                        body_sql: "SELECT id FROM documents".to_string(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let scan = expect_scan(
+            "WITH x AS (SELECT id FROM docs_view) SELECT * FROM x LIMIT 10",
+            &ViewCatalog,
+        );
+        assert_eq!(scan.table_name(), "documents");
+    }
+
+    #[test]
+    fn accepts_cte_composed_with_main_query_where() {
+        // CTE 本文が `SELECT *`（列を絞り込まない）であれば、主クエリの
+        // `WHERE` は CTE 本文が公開しない列という制約を受けない。
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH x AS (SELECT * FROM documents WHERE lang = 'ja') SELECT * FROM x WHERE flag LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(
+            scan.where_predicates(),
+            &[
+                WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                },
+                WherePredicate::BoolColumn {
+                    column: "flag".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_select_star_over_column_restricted_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(
+            scan.projection(),
+            &Projection::Columns(vec!["id".to_string()])
+        );
+    }
+
+    #[test]
+    fn accepts_unreferenced_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH unused AS (SELECT id FROM documents) SELECT * FROM documents LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+    }
+
+    #[test]
+    fn cte_name_hides_real_table_of_the_same_name() {
+        // `documents` という名前の CTE を定義すると、主クエリの `FROM
+        // documents` は実テーブルではなく CTE を指す（PostgreSQL と同じ
+        // 名前解決の意味論）。CTE 本文は実テーブルを参照する。
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH documents AS (SELECT id FROM documents WHERE lang = 'ja') SELECT * FROM documents LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+        assert_eq!(
+            scan.where_predicates(),
+            &[WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn accepts_cte_definition_count_at_limit_rejects_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let defs_at_limit: Vec<String> = (0..crate::sql::cte::MAX_CTE_DEFINITIONS)
+            .map(|i| format!("c{i} AS (SELECT id FROM documents)"))
+            .collect();
+        let sql_ok = format!(
+            "WITH {} SELECT * FROM c0 LIMIT 10",
+            defs_at_limit.join(", ")
+        );
+        expect_scan(&sql_ok, &lookup);
+
+        let defs_over_limit: Vec<String> = (0..=crate::sql::cte::MAX_CTE_DEFINITIONS)
+            .map(|i| format!("c{i} AS (SELECT id FROM documents)"))
+            .collect();
+        let sql_over = format!(
+            "WITH {} SELECT * FROM c0 LIMIT 10",
+            defs_over_limit.join(", ")
+        );
+        let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE definition limit");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn accepts_many_definitions_referencing_a_shared_chain_within_documented_limits() {
+        // Issue #928 レビュー指摘の回帰テスト: 定義数（<= MAX_CTE_DEFINITIONS =
+        // 16）・連鎖の深さ（主クエリが参照する d11 の解決は d11→c2→c1→c0→
+        // documents の 4 回のリレー、すなわち MAX_CTE_NESTING_DEPTH = 4 の
+        // 境界ちょうど）のどちらも文書化された上限内に収まる有効なクエリが、
+        // 事前検証ループでの参照回数の誤積算により `54000`（"CTE reference
+        // count exceeds limit"）へ誤って拒否されないことを確認する。
+        // c0..c2 の 3 段連鎖に加え、末尾の c2 を直接参照する d0..d11 の
+        // 12 定義（計 15 定義）を用意する。事前検証ループは各 d_i の FROM を
+        // 独立に解決し（c2→c1→c0 の 3 回の CTE 名マッチ）、ResolveBudget が
+        // 文全体で 1 つに共有されていた旧実装では d_i 12 件分だけで 36 回
+        // （> MAX_CTE_REFERENCES = 32）を消費し誤って拒否されていた。
+        let lookup = catalog_with(&["documents"]);
+        let mut defs = vec!["c0 AS (SELECT id FROM documents)".to_string()];
+        for i in 1..3 {
+            defs.push(format!("c{i} AS (SELECT id FROM c{})", i - 1));
+        }
+        for i in 0..12 {
+            defs.push(format!("d{i} AS (SELECT id FROM c2)"));
+        }
+        assert_eq!(defs.len(), 15);
+        let sql = format!("WITH {} SELECT * FROM d11 LIMIT 10", defs.join(", "));
+        expect_scan(&sql, &lookup);
+    }
+
+    #[test]
+    fn accepts_cte_nesting_depth_at_limit_rejects_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        // `MAX_CTE_NESTING_DEPTH` 件の CTE 連鎖（c0 は基底テーブルを直接参照し、
+        // c1..c{depth-1} はそれぞれ 1 つ前を参照する）はちょうど上限内で受理する。
+        // 1 件多い連鎖（`depth + 1` 件）は基底テーブル解決の 1 手前で深さが
+        // 上限を超え `54000` になる。
+        let depth = crate::sql::cte::MAX_CTE_NESTING_DEPTH as usize;
+        let mut defs = vec!["c0 AS (SELECT id FROM documents)".to_string()];
+        for i in 1..depth {
+            defs.push(format!("c{i} AS (SELECT id FROM c{})", i - 1));
+        }
+        let last = depth - 1;
+        let sql_ok = format!("WITH {} SELECT * FROM c{last} LIMIT 10", defs.join(", "));
+        expect_scan(&sql_ok, &lookup);
+
+        defs.push(format!("c{depth} AS (SELECT id FROM c{last})"));
+        let sql_over = format!("WITH {} SELECT * FROM c{depth} LIMIT 10", defs.join(", "));
+        let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE nesting depth");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_with_recursive() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH RECURSIVE x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("WITH RECURSIVE must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_cte_column_name_list() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x (a) AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("CTE column name list must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_cte_materialized_hint() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS NOT MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("MATERIALIZED hint must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_cte_name() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("duplicate CTE name must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_cte_body_with_order_by_limit_aggregate_or_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS (SELECT id FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents LIMIT 5) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT COUNT(*) FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents;) SELECT * FROM x LIMIT 10",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_main_query_ranked_or_aggregate_over_cte() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "WITH x AS (SELECT id FROM documents) SELECT COUNT(*) FROM x",
+        ] {
+            let err = validate_sql(sql, &lookup)
+                .expect_err("ranked or aggregate main query over CTE must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_data_modifying_cte() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS (DELETE FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents) INSERT INTO documents (id) VALUES ('1')",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("data-modifying CTE must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_cte_referencing_undefined_relation() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM ghost) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("undefined relation in CTE body must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn rejects_out_of_scope_column_over_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE body = 'y' LIMIT 10",
+            &lookup,
+        )
+        .expect_err("column outside CTE's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_unreferenced_cte_projecting_column_outside_preceding_ctes_exposed_set() {
+        // Issue #928 レビュー指摘の回帰テスト（Codex P1・Cursor Bugbot Low、
+        // 同一欠陥）: 先行 CTE `x` が `id` のみを公開していても、後続 CTE
+        // `unused` がどこからも参照されない（`compose` を通らない）ことを
+        // 悪用して非公開列を射影・条件に使う文を通してはならない。事前検証
+        // ループは各定義の FROM 解決結果に対して定義自身の射影・`WHERE` も
+        // 検証すること（`check_columns_within_view` 相当）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), unused AS (SELECT body FROM x) SELECT * FROM documents LIMIT 10",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE projecting a column outside its FROM's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), unused AS (SELECT id FROM x WHERE body = 'y') SELECT * FROM documents LIMIT 10",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE filtering on a column outside its FROM's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// `table_columns` を実装するフェイク（PR #1100 追加レビュー指摘の
+    /// 回帰テスト専用）。既存の `FakeCatalog` は `table_columns` 未実装
+    /// （既定実装 `Ok(None)` のまま）で、それらのテストは本回帰の対象外
+    /// （後方互換の確認を兼ねる）。
+    struct SchemaCatalog {
+        tables: std::collections::HashMap<&'static str, &'static [&'static str]>,
+    }
+
+    impl TableLookup for SchemaCatalog {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(self.tables.contains_key(name))
+        }
+        fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+            // `catalog::Storage` の実装契約（実カラム ＋ 未宣言なら `id` 疑似列）
+            // を模す（`TableLookup::table_columns` のドキュメント参照）。
+            Ok(self.tables.get(name).map(|cols| {
+                let mut columns: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+                if !columns.iter().any(|c| c == "id") {
+                    columns.push("id".to_string());
+                }
+                columns
+            }))
+        }
+    }
+
+    #[test]
+    fn rejects_unreferenced_cte_projecting_unknown_real_table_column() {
+        // PR #1100 追加レビュー指摘の回帰テスト（Codex P1・Cursor Bugbot Low、
+        // 同一欠陥）: 事前検証ループは `Resolved::Table`（FROM が実テーブル）の
+        // 場合に公開列集合を `None` のまま `check_columns_within_view` へ渡して
+        // いたため、実テーブルに存在しない列を射影・条件に使う未参照 CTE も
+        // 検査をすり抜けて受理していた。`TableLookup::table_columns` で実テーブル
+        // のスキーマへ問い合わせて検証すること。
+        let lookup = SchemaCatalog {
+            tables: [("documents", ["id", "body"].as_slice())].into(),
+        };
+        let err = validate_sql(
+            "WITH unused AS (SELECT missing FROM documents) SELECT id FROM documents LIMIT 1",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE projecting an unknown real table column must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = validate_sql(
+            "WITH unused AS (SELECT id FROM documents WHERE missing = 'y') SELECT id FROM documents LIMIT 1",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE filtering on an unknown real table column must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn accepts_unreferenced_cte_projecting_id_pseudo_column_over_real_table() {
+        // 対照確認（regression guard）: `table_columns` は実カラムに加えて
+        // 疑似列 `id` も許可列へ含めること（`sql::parser::bind_projection` が
+        // `id` を疑似列として受理する契約と一致させる）。スキーマが `id` という
+        // 実カラムを宣言していない場合の対照。
+        let lookup = SchemaCatalog {
+            tables: [("documents", ["body"].as_slice())].into(),
+        };
+        expect_scan(
+            "WITH unused AS (SELECT id FROM documents) SELECT * FROM documents LIMIT 1",
+            &lookup,
+        );
+    }
+
+    #[test]
+    fn accepts_with_statement_containing_literal_where_param_placeholder_check_is_deferred() {
+        // TASK-213: `$n` を含む WITH 文は `sql::params::validate_param_positions`
+        // が拒否する（本テストは構造検証自体〔`validate_sql`〕が受理し得ることを
+        // 確認するのみで、`$n` 拒否は `sql::params` の単体テストが担う）。
+        let lookup = catalog_with(&["documents"]);
+        expect_scan(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE id = 'lit' LIMIT 10",
+            &lookup,
+        );
     }
 }

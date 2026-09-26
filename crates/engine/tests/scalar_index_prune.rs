@@ -186,6 +186,58 @@ fn prefix_predicate_cold_hot_equivalence_and_index_consumption() {
     assert_eq!(result_ids(&result), vec![1, 3, 5, 7, 9]);
 }
 
+/// SQL-24・TASK-208、Issue #914: `LIKE` の一般形（中間一致）は二次索引が
+/// 対応せず、索引が構築済み（他述語の索引消費で温まった状態）でも
+/// `index_scans` を一切消費しないこと、かつ結果が全走査オラクル（`id + 0 > 0`
+/// で強制的に残余述語を持たせた対照クエリ）と完全一致することを固定する
+/// （索引の有無で結果が変わらない SQL-24 の契約）。
+#[test]
+fn like_general_form_never_consumes_index_and_matches_plain_scan_oracle() {
+    let path = unique_db_path("scalar-index-prune-like-general-form");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    // 索引を先に温める（等価述語クエリで構築）。
+    let _ = run(
+        &core,
+        "tenant-a",
+        "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20",
+    );
+
+    let sql =
+        "SELECT id FROM docs WHERE path LIKE '%/1' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let control_sql = "SELECT id FROM docs WHERE path LIKE '%/1' AND id + 0 > 0 \
+         ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+
+    let before = core.scalar_index_cache_stats().index_scans;
+    let cold = run(&core, "tenant-a", sql);
+    let hot = run(&core, "tenant-a", sql);
+    let after = core.scalar_index_cache_stats().index_scans;
+    assert_eq!(
+        after, before,
+        "LIKE general form must never consume the scalar index even when it is already built"
+    );
+    assert_eq!(
+        result_ids(&cold),
+        result_ids(&hot),
+        "cold/hot results must match exactly for the LIKE general form"
+    );
+
+    let control = run(&core, "tenant-a", control_sql);
+    assert_eq!(
+        result_ids(&hot),
+        result_ids(&control),
+        "LIKE general form must match the forced plain-scan oracle"
+    );
+    // オラクル: `path` は奇数 id が `odd/{id}`・偶数 id が `even/{id}`
+    // （`seed_ten_rows`）。末尾が `/1` の値は `odd/1`（id=1）のみ
+    // （`even/10` は `/10` で終わるため不一致）。
+    assert_eq!(result_ids(&hot), vec![1]);
+}
+
 #[test]
 fn id_range_predicate_cold_hot_equivalence_and_index_consumption() {
     let path = unique_db_path("scalar-index-prune-id-range");

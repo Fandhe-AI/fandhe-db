@@ -210,7 +210,12 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
   `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
-- スカラー `ORDER BY`／`OFFSET`（SQL-25。未実装）の形のカーソル化。
+- スカラー `ORDER BY`（SQL-25 (a)。未実装）の形のカーソル化。`OFFSET`
+  （SQL-25 (b)・TASK-209、Issue #916）は広域取得・`GROUP BY` 集計の `LIMIT`
+  経由で実装済みで、本カーソル経路（`bind_scan`／`bind_group_by_clause` を
+  そのまま通す）でも追加実装なしに使える（`crates/engine/tests/
+  sql25_offset.rs::declare_cursor_with_offset_matches_direct_execution`
+  参照。詳細は [sql-offset-paging.md](sql-offset-paging.md)）。
 - 自トランザクションの未 commit 変更の可視化（Issue #942 の既知の逸脱を
   引き継ぐ）。
 - `DECLARE`／`FETCH`／`CLOSE` での `$n` パラメータ（今回は `42601`）。

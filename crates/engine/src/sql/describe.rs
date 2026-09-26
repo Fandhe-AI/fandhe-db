@@ -58,7 +58,7 @@ pub(crate) fn aggregate_columns(projection: &[ProjectionColumn]) -> Vec<ColumnMe
         .iter()
         .map(|col| {
             let name = match col {
-                ProjectionColumn::GroupKey { name } => name.clone(),
+                ProjectionColumn::GroupKey { name, .. } => name.clone(),
                 ProjectionColumn::Aggregate { name, .. } => name.clone(),
             };
             ColumnMeta::Computed { name }

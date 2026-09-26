@@ -206,12 +206,12 @@ fn explain_entry_lines(
         .collect()
 }
 
-/// フィルタなしの binder closure（`ExplainShape::from_filters(&[], &[])`）。
+/// フィルタなしの binder closure（`ExplainShape::from_filters(&[], &[], &[])`）。
 fn no_filter_bind(
     _schema: &engine::catalog::TableSchema,
     _udfs: &engine::sql::udf_call::UdfRegistry,
 ) -> Result<ExplainShape, SqlSurfaceError> {
-    Ok(ExplainShape::from_filters(&[], &[]))
+    Ok(ExplainShape::from_filters(&[], &[], &[]))
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn explain_entry_matches_sql_explain_rows_with_equality_filter() {
         |schema, _udfs| {
             let filters =
                 declarative_filter::bind_all(&[DeclarativeFilter::equals("lang", "ja")], schema)?;
-            Ok(ExplainShape::from_filters(&filters, &[]))
+            Ok(ExplainShape::from_filters(&filters, &[], &[]))
         },
     );
     let entry_lines = explain_entry_lines(entry_result);
@@ -370,7 +370,7 @@ fn explain_entry_rejects_undefined_table_before_invoking_binder() {
         None,
         |_schema, _udfs| -> Result<ExplainShape, SqlSurfaceError> {
             binder_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(ExplainShape::from_filters(&[], &[]))
+            Ok(ExplainShape::from_filters(&[], &[], &[]))
         },
     );
     let err = result.expect_err("undefined table must be rejected");
@@ -406,7 +406,7 @@ fn explain_entry_rejects_undefined_table_before_invalid_mode_literal() {
         Some("fuzzy"),
         |_schema, _udfs| -> Result<ExplainShape, SqlSurfaceError> {
             binder_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(ExplainShape::from_filters(&[], &[]))
+            Ok(ExplainShape::from_filters(&[], &[], &[]))
         },
     );
     let err = result.expect_err("undefined table must be rejected before mode literal parsing");

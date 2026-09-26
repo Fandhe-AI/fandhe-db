@@ -5377,6 +5377,34 @@ impl TableLookup for Storage {
     fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
         Storage::view_definition(self, name).map_err(table_lookup_error)
     }
+
+    /// `sql::allowlist` の WITH 事前検証（どこからも参照されない leaf CTE）が
+    /// 実テーブル直下の列存在を検査するために呼ぶ（Issue #928 レビュー指摘。
+    /// `TableLookup::table_columns` のドキュメント参照）。`sql::parser::
+    /// bind_projection` が受理する投影列名の集合と一致させる: 生存列（`ALTER
+    /// TABLE DROP COLUMN` 済みの列は `get_table_schema` の時点で既に除外
+    /// 済み）の実カラム名に加え、スキーマが実カラム `id` を宣言していなければ
+    /// 疑似列 `id` を追加する（`bind_projection` は実カラム `id` を疑似列より
+    /// 優先するため、二重に加えない）。テーブル不存在は `Ok(None)`（検査省略。
+    /// 呼び出し元の事前検証はこの後 FROM 解決で `UndefinedTable` を返すため、
+    /// ここで `None` を返しても fail-open にはならない）。
+    fn table_columns(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => {
+                let mut columns: Vec<String> =
+                    schema.columns.iter().map(|c| c.name.clone()).collect();
+                if !columns.iter().any(|c| c == "id") {
+                    columns.push("id".to_string());
+                }
+                Ok(Some(columns))
+            }
+            Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
 }
 
 /// [`TableLookup::table_exists`]（`impl TableLookup for Storage`）と

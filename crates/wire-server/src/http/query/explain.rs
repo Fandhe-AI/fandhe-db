@@ -210,7 +210,13 @@ pub fn execute(
             question.ok_or(ExplainError::ExplainRequiresPlan)?;
             match bind_search(validated, schema)? {
                 BoundSearch::Plan(plan) => {
-                    Ok(ExplainShape::from_filters(plan.metadata_filters(), &[]))
+                    // NoSQL 表層の `plan` 検索経路は `OR` 未対応（TASK-208・
+                    // Issue #912。計画§「対象外」参照）。
+                    Ok(ExplainShape::from_filters(
+                        plan.metadata_filters(),
+                        &[],
+                        &[],
+                    ))
                 }
                 BoundSearch::Vector(_) => Err(ExplainError::ExplainRequiresPlan),
             }

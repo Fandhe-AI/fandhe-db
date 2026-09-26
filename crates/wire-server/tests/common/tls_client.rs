@@ -97,14 +97,78 @@ fn version_v3() -> Vec<u8> {
     tlv(0xa0, &tlv(0x02, &[0x02]))
 }
 
+/// `ecdsa-with-SHA256`（1.2.840.10045.4.3.2。RFC 5929 が SHA-256 を定義する
+/// 署名アルゴリズム）。Issue #1088: `--tls-scram-channel-binding enable` が
+/// 受理される正例（Ed25519 鍵だが署名 OID は ECDSA-SHA256）を組むために使う。
+pub const OID_ECDSA_WITH_SHA256_BYTES: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+
+fn algorithm_identifier(oid: &[u8]) -> Vec<u8> {
+    sequence(&[&tlv(0x06, oid)])
+}
+
+/// 実際に CA が署名した葉証明書の DER（16 進）。codex-review P2 指摘
+/// （Issue #1088）への対応: [`build_ed25519_leaf_certificate_der_with_
+/// signature_algorithm`] が組む手組み証明書は `signatureValue` が全 0 の
+/// プレースホルダで、README/ADR が案内する「RSA/ECDSA CA 署名済み葉証明書」
+/// を実際には代表していなかった。本定数は次のコマンドでオフラインに
+/// 生成した本物の署名済み DER で、リポジトリはこの DER のみを保持し
+/// CA 秘密鍵は生成後に破棄済み（本テスト資産に秘密鍵は含まれない）。
+///
+/// - 葉の鍵ペア: [`RFC8032_TEST1_SEED`]（Ed25519。SPKI はテスト全体で
+///   共有する既存の鍵材料と同一）
+/// - CA: 使い捨ての P-256 鍵で自己署名した検証専用ルート（`openssl req
+///   -x509 -newkey ec:<(openssl ecparam -name prime256v1)`）
+/// - 葉証明書: 上記 CA が `openssl x509 -req -sha256` で署名（P-256 鍵 +
+///   SHA-256 のため signatureAlgorithm は `ecdsa-with-SHA256` になる）
+/// - validity は既存の手組み証明書と同じ 2016〜2040 年の UTCTime 窓
+///   （`-not_before 20160801121924Z -not_after 20401231235959Z`）
+///
+/// `crates/wire-server/src/tls/x509.rs` のモジュール doc が明記すると
+/// おり本サーバーは `signatureValue` の暗号学的検証をスコープ外とする
+/// （発行者鍵の検証はクライアントの責務）ため、この DER は「サーバーの
+/// 判定を変える」ためではなく「README/ADR が示す構成の葉証明書を実際に
+/// 生成し、パーサ・PLUS 交換が現実の CA 署名済み証明書の形状（実サイズの
+/// ECDSA 署名・subjectKeyIdentifier/authorityKeyIdentifier 拡張・非空の
+/// issuer/subject 等）でも通ることを検証する」ために使う。
+const CA_SIGNED_ECDSA_SHA256_LEAF_CERTIFICATE_DER_HEX: &str = "3082013d3081e3a00302010202144455c282ee68a52c2bbec19a7df78840e079502e300a06082a8648ce3d04030230123110300e06035504030c07746573742d6361301e170d3136303830313132313932345a170d3430313233313233353935395a30163114301206035504030c0b746573742d697373756572302a300506032b6570032100d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511aa3423040301d0603551d0e041604145b27aa5589179770e47575b162a1ded97b8bfc6d301f0603551d23041830168014a3289f875b9f22d9ee38da932b312d83619a718a300a06082a8648ce3d0403020349003046022100804e11eb54191ed9cc75c71dcebe115db09caf38549d95a4ba8282f2e0ec6736022100848bf89d55fb6f4100abbd42d023259ccee9fcbdb03d7bc48fd190a9b2a73db4";
+
+/// [`CA_SIGNED_ECDSA_SHA256_LEAF_CERTIFICATE_DER_HEX`] をデコードした
+/// 実 CA 署名済み葉証明書の DER（Issue #1088）。鍵ペアは
+/// [`RFC8032_TEST1_SEED`]／[`RFC8032_TEST1_PUBLIC_KEY`] と同一のため、
+/// 対応する秘密鍵は [`ed25519_pkcs8_pem`] で得られる。
+pub fn ca_signed_ecdsa_sha256_leaf_certificate_der() -> Vec<u8> {
+    hex_decode(CA_SIGNED_ECDSA_SHA256_LEAF_CERTIFICATE_DER_HEX)
+}
+
 /// テスト専用: Ed25519 葉証明書の DER を手組みする（署名は検証対象外の
 /// ため全 0 で埋める）。
 fn build_ed25519_leaf_certificate_der(public_key: &[u8; 32]) -> Vec<u8> {
-    let signature_algorithm = ed25519_algorithm_identifier();
+    build_ed25519_leaf_certificate_der_with_signature_algorithm(
+        public_key,
+        "160801121924Z",
+        "401231235959Z",
+        &OID_ED25519_BYTES,
+    )
+}
+
+/// [`build_ed25519_leaf_certificate_der_with_validity`] の一般化版
+/// （Issue #1088）。SPKI（鍵）は常に Ed25519 のまま、`tbsCertificate.
+/// signature`・外側 `signatureAlgorithm`（両者は DER バイト列一致を要求
+/// されるため同じ OID にする。`x509::validate_algorithm_identifier_
+/// structure` 参照）にだけ任意の署名 OID を指定できる。既存 2 関数は
+/// `OID_ED25519_BYTES` を渡してこれへ委譲する薄いラッパーとし、出力は
+/// ビット同一のまま保つ。
+pub fn build_ed25519_leaf_certificate_der_with_signature_algorithm(
+    public_key: &[u8; 32],
+    not_before: &str,
+    not_after: &str,
+    signature_oid: &[u8],
+) -> Vec<u8> {
+    let signature_algorithm = algorithm_identifier(signature_oid);
     let mut spki_bits = vec![0x00u8];
     spki_bits.extend_from_slice(public_key);
     let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
-    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let validity = sequence(&[&utc_time(not_before), &utc_time(not_after)]);
     let tbs_certificate = sequence(&[
         &version_v3(),
         &tlv(0x02, &[0x01]),
@@ -155,27 +219,12 @@ pub fn build_ed25519_leaf_certificate_der_with_validity(
     not_before: &str,
     not_after: &str,
 ) -> Vec<u8> {
-    let signature_algorithm = ed25519_algorithm_identifier();
-    let mut spki_bits = vec![0x00u8];
-    spki_bits.extend_from_slice(public_key);
-    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
-    let validity = sequence(&[&utc_time(not_before), &utc_time(not_after)]);
-    let tbs_certificate = sequence(&[
-        &version_v3(),
-        &tlv(0x02, &[0x01]),
-        &signature_algorithm,
-        &issuer_name(),
-        &validity,
-        &empty_name(),
-        &spki,
-    ]);
-    let mut signature_bits = vec![0x00u8];
-    signature_bits.extend_from_slice(&[0u8; 64]);
-    sequence(&[
-        &tbs_certificate,
-        &signature_algorithm,
-        &tlv(0x03, &signature_bits),
-    ])
+    build_ed25519_leaf_certificate_der_with_signature_algorithm(
+        public_key,
+        not_before,
+        not_after,
+        &OID_ED25519_BYTES,
+    )
 }
 
 /// `label`（`"CERTIFICATE"`／`"PRIVATE KEY"`）で `der` を PEM 形式（64 カラム
