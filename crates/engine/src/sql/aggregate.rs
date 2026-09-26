@@ -507,6 +507,14 @@ pub(crate) fn classify_aggregate_access(
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
 /// （DoS）」対応）。
+///
+/// `Clone`（SQL-30・TASK-214、Issue #930）: `sql::window::execute_window_scan` が
+/// ORDER BY ありのウィンドウ集計で、peer グループ境界ごとに `clone().finish()`
+/// でスナップショットを取りつつ元のアキュムレータへ観測を積み増し続けるために
+/// 使う（`finish` は `self` を消費するため、走査を止めずに中間結果だけ確定する
+/// 手段が必要）。既存の集計経路（`aggregate.rs`・`group_by.rs`）は複製せず単一の
+/// 所有権のまま走査末尾で `finish` するため、この派生追加で挙動は変わらない。
+#[derive(Clone)]
 pub(crate) enum Accumulator {
     /// `COUNT(*)`・`COUNT(id)`・`COUNT(<VECTOR 列>)`・`COUNT(<Scalar 式>)`。
     Count(u64),

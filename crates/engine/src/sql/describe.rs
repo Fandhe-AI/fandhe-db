@@ -11,8 +11,9 @@
 //! 完全に一致する契約（`crates/engine/tests/describe_parity.rs` で機械検証）。
 
 use crate::catalog::{ColumnType, TableSchema};
+use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::ColumnMeta;
-use crate::sql::parser::{ProjectedColumn, ProjectionColumn};
+use crate::sql::parser::{BoundScan, ProjectedColumn, ProjectionColumn};
 
 /// `SELECT`・広域取得（scan）が共有する `ProjectedColumn` 列から `ColumnMeta` を
 /// 導出する。`sql::exec::execute_statement_with_cache`・`sql::scan::execute_scan`
@@ -43,6 +44,65 @@ pub(crate) fn projected_columns(
                     .unwrap_or(ColumnType::Text),
             },
             ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
+        })
+        .collect()
+}
+
+/// 広域取得（scan）の [`BoundScan`] から結果列メタデータを導出する（SQL-30・
+/// TASK-214、Issue #930）。`bound.windows()` が空なら [`projected_columns`] と
+/// 同じ結果になる。非空の場合は、ウィンドウ以外の列（[`projected_columns`]
+/// 相当）へ [`crate::sql::parser::BoundWindowItem::position`] に基づいてウィンドウ
+/// 列（`ColumnMeta::Computed`）を差し込む——`sql::window::execute_window_scan`
+/// の列組み立てと同一の写像（`crates/engine/tests/describe_parity.rs` で機械
+/// 検証する契約）。
+pub(crate) fn scan_columns(
+    bound: &BoundScan,
+    schema: &TableSchema,
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    let plain = projected_columns(bound.projection(), schema);
+    if bound.windows().is_empty() {
+        return Ok(plain);
+    }
+
+    let total_len = plain.len() + bound.windows().len();
+    let mut window_positions: Vec<usize> = bound.windows().iter().map(|w| w.position).collect();
+    window_positions.sort_unstable();
+    let mut plain_positions: Vec<usize> = Vec::with_capacity(plain.len());
+    {
+        let mut wpos_iter = window_positions.iter().peekable();
+        for pos in 0..total_len {
+            if wpos_iter.peek() == Some(&&pos) {
+                wpos_iter.next();
+            } else {
+                plain_positions.push(pos);
+            }
+        }
+    }
+    if plain_positions.len() != plain.len() {
+        return Err(SqlSurfaceError::Internal {
+            detail: "window scan describe position mismatch".to_string(),
+        });
+    }
+
+    let mut out: Vec<Option<ColumnMeta>> = vec![None; total_len];
+    for (pos, meta) in plain_positions.into_iter().zip(plain) {
+        if let Some(slot) = out.get_mut(pos) {
+            *slot = Some(meta);
+        }
+    }
+    for item in bound.windows() {
+        if let Some(slot) = out.get_mut(item.position) {
+            *slot = Some(ColumnMeta::Computed {
+                name: item.name.clone(),
+            });
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(pos, c)| {
+            c.ok_or_else(|| SqlSurfaceError::Internal {
+                detail: format!("window scan describe column missing at position {pos}"),
+            })
         })
         .collect()
 }

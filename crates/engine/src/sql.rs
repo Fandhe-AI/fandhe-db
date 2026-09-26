@@ -175,6 +175,7 @@ pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod visible_cache;
 pub(crate) mod where_tree;
+pub(crate) mod window;
 
 /// [`scalar_plan::ScalarShapeInput`]（`pub`）の `or_filters` フィールドの要素型を
 /// 外部から名前解決可能にするための再エクスポート（TASK-208・SQL-24、
