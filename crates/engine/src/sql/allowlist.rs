@@ -100,8 +100,19 @@ pub fn is_allowed_where_predicate_name(name: &str) -> bool {
 /// `extra_close_paren` が `true` の場合に限り `)` も境界として扱う（`CHECK (...)`
 /// の本体を [`Parser::parse_check_body`] が解析する場合のみ。通常の `WHERE` 句
 /// 解析は `false` を渡し、既存の受理範囲を一切変えない。TABLE-16・TASK-204、
-/// Issue #906）。
-fn is_where_predicate_boundary_token(token: Option<&Token>, extra_close_paren: bool) -> bool {
+/// Issue #906）。`set_operators` が `true` の場合に限り `UNION`／`INTERSECT`／
+/// `EXCEPT` も境界として扱う（集合演算の枝の `WHERE`〔[`Parser::
+/// parse_where_in_set_branch`]〕でのみ `true`。`ALL` は演算子の直後に現れる
+/// トークンであり `WHERE` 述語の直後には現れないため対象に含めない。PR #1105
+/// レビュー指摘対応: 従来この境界集合に集合演算子が含まれておらず、
+/// `WHERE flag UNION SELECT ...` のような正当な文が式フォールバックへ誤って
+/// 落ち `42601` になっていた。トップレベルの非集合演算文は `set_operators =
+/// false` のままのため既存挙動を一切変えない）。
+fn is_where_predicate_boundary_token(
+    token: Option<&Token>,
+    extra_close_paren: bool,
+    set_operators: bool,
+) -> bool {
     match token {
         None => true,
         Some(Token::Punct(';')) => true,
@@ -116,6 +127,7 @@ fn is_where_predicate_boundary_token(token: Option<&Token>, extra_close_paren: b
                 || w.eq_ignore_ascii_case("GROUP")
                 || w.eq_ignore_ascii_case("HAVING")
                 || w.eq_ignore_ascii_case("OR")
+                || (set_operators && is_set_operator_ident(w))
         }
         _ => false,
     }
@@ -2882,7 +2894,25 @@ impl<'a> Parser<'a> {
     /// 式述語フォールバックへ流れ、通常は `42601` で拒否される。
     fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut leaf_count = 0usize;
-        self.parse_where_or(false, 0, &mut leaf_count)
+        self.parse_where_or(false, false, 0, &mut leaf_count)
+    }
+
+    /// [`Self::parse_where`] と同じ文法で、集合演算の枝
+    /// （[`parse_set_branch`]）専用に `WHERE` を解析する（PR #1105 レビュー
+    /// 指摘対応）。2 点の違いがある: (1) `UNION`／`INTERSECT`／`EXCEPT` も境界
+    /// トークンとして扱う（`is_where_predicate_boundary_token` の
+    /// `set_operators`）ため、裸の BOOLEAN 列参照（`WHERE flag UNION
+    /// SELECT ...`）が式フォールバックへ誤って落ちずに受理される。(2) `)` も
+    /// 境界として扱う（`extra_close_paren`）ため、枝全体を括弧で囲んだ形
+    /// （`(SELECT ... WHERE flag) UNION ...`）で `flag` の直後に枝を閉じる
+    /// `)` が来ても同様に受理される（`)` が続かない通常の枝では何も変わらず、
+    /// 括弧で囲んでいない枝に紛れ込んだ `)` は後続の `parse_set_operation` の
+    /// 構造検証〔`expect_end_of_statement` 等〕が結局 `42601` に落とすため
+    /// fail-closed のまま）。トップレベルの非集合演算文（[`Self::parse_where`]
+    /// を呼ぶ経路）はこれらの境界を持たないため既存挙動を変えない。
+    fn parse_where_in_set_branch(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let mut leaf_count = 0usize;
+        self.parse_where_or(true, true, 0, &mut leaf_count)
     }
 
     /// `CHECK (<body>)` の本体（TABLE-16・TASK-204、Issue #906）を [`Self::parse_where`]
@@ -2893,13 +2923,14 @@ impl<'a> Parser<'a> {
     /// した直後に呼び、本体解析の完了後に `expect_punct(')')` で閉じ括弧を消費する。
     fn parse_check_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut leaf_count = 0usize;
-        self.parse_where_or(true, 0, &mut leaf_count)
+        self.parse_where_or(true, false, 0, &mut leaf_count)
     }
 
-    /// [`Self::parse_where`]・[`Self::parse_check_body`] が共有する述語ツリーの
-    /// 文法入口（TASK-208・SQL-24、Issue #912）: `or_expr := and_expr { OR
-    /// and_expr }`。`OR` は [`Keyword`] へ追加せず `Token::Ident` を文脈的に照合する
-    /// （`LIKE` と同じ方式。`or` という列名の等価条件を壊さない）。
+    /// [`Self::parse_where`]・[`Self::parse_check_body`]・[`Self::
+    /// parse_where_in_set_branch`] が共有する述語ツリーの文法入口（TASK-208・
+    /// SQL-24、Issue #912）: `or_expr := and_expr { OR and_expr }`。`OR` は
+    /// [`Keyword`] へ追加せず `Token::Ident` を文脈的に照合する（`LIKE` と
+    /// 同じ方式。`or` という列名の等価条件を壊さない）。
     ///
     /// 分岐が 1 個だけなら親の列へそのまま平坦化し（`AND` だけの文は本機能追加前と
     /// 完全に同じ AST になる）、2 個以上なら 1 要素の [`WherePredicate::Or`] として
@@ -2909,13 +2940,20 @@ impl<'a> Parser<'a> {
     fn parse_where_or(
         &mut self,
         extra_close_paren: bool,
+        set_operators: bool,
         depth: usize,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-        let mut branches = vec![self.parse_where_and(extra_close_paren, depth, leaf_count)?];
+        let mut branches =
+            vec![self.parse_where_and(extra_close_paren, set_operators, depth, leaf_count)?];
         while matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OR")) {
             self.advance();
-            branches.push(self.parse_where_and(extra_close_paren, depth, leaf_count)?);
+            branches.push(self.parse_where_and(
+                extra_close_paren,
+                set_operators,
+                depth,
+                leaf_count,
+            )?);
         }
         if branches.len() == 1 {
             Ok(branches
@@ -2939,12 +2977,18 @@ impl<'a> Parser<'a> {
     fn parse_where_and(
         &mut self,
         extra_close_paren: bool,
+        set_operators: bool,
         depth: usize,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut predicates = Vec::new();
         loop {
-            predicates.extend(self.parse_where_atom(extra_close_paren, depth, leaf_count)?);
+            predicates.extend(self.parse_where_atom(
+                extra_close_paren,
+                set_operators,
+                depth,
+                leaf_count,
+            )?);
             if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
                 self.advance();
                 continue;
@@ -2964,6 +3008,7 @@ impl<'a> Parser<'a> {
     fn parse_where_atom(
         &mut self,
         extra_close_paren: bool,
+        set_operators: bool,
         depth: usize,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -2985,14 +3030,18 @@ impl<'a> Parser<'a> {
                         ))
                     })?;
                 self.advance(); // '(' を消費する
-                let inner = self.parse_where_or(true, next_depth, leaf_count)?;
+                let inner = self.parse_where_or(true, set_operators, next_depth, leaf_count)?;
                 self.expect_punct(')')?;
                 return Ok(inner);
             }
             // 値式グループ（`(id + 1) > 5` 等）。既存の式フォールバックへ委譲する
             // （`parse_primary_expr` が '(' expr ')' を再帰的に処理する）。
         }
-        Ok(vec![self.parse_where_leaf(extra_close_paren, leaf_count)?])
+        Ok(vec![self.parse_where_leaf(
+            extra_close_paren,
+            set_operators,
+            leaf_count,
+        )?])
     }
 
     /// `(` の位置（`open_idx`）に対応する `)` のトークン位置を探す。`get()` のみを
@@ -3025,6 +3074,7 @@ impl<'a> Parser<'a> {
     fn parse_where_leaf(
         &mut self,
         extra_close_paren: bool,
+        set_operators: bool,
         leaf_count: &mut usize,
     ) -> Result<WherePredicate, SqlSurfaceError> {
         let start = self.pos;
@@ -3103,13 +3153,15 @@ impl<'a> Parser<'a> {
                 && is_where_predicate_boundary_token(
                     self.tokens.get(self.pos + 1),
                     extra_close_paren,
+                    set_operators,
                 )
             {
                 // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが WHERE 句の
                 // 終端（`AND`・`OR`・`ORDER`・`LIMIT`・`;`・EOF・後続構文キーワード・
-                // グループの `)`）である場合に限り受理する。受理範囲の拡大を最小限に
-                // とどめ、それ以外（`flag + 1` 等）は式フォールバックへ回す
-                // （Issue #883・D-c）。
+                // グループの `)`・集合演算の枝では `UNION`／`INTERSECT`／`EXCEPT`）
+                // である場合に限り受理する。受理範囲の拡大を最小限にとどめ、
+                // それ以外（`flag + 1` 等）は式フォールバックへ回す
+                // （Issue #883・D-c。集合演算子は PR #1105 レビュー指摘対応）。
                 self.advance();
                 result = Some(WherePredicate::BoolColumn { column: name });
             }
@@ -5466,7 +5518,7 @@ fn parse_set_branch(
 
     let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
         p.advance();
-        p.parse_where()?
+        p.parse_where_in_set_branch()?
     } else {
         Vec::new()
     };

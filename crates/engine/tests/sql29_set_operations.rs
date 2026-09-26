@@ -44,6 +44,47 @@ fn int_schema(name: &str) -> TableSchema {
     )
 }
 
+/// 裸の BOOLEAN 列参照（`WHERE flag`）の境界判定回帰テスト専用のスキーマ
+/// （Cursor Bugbot 指摘対応。PR #1105）。
+fn flag_schema(name: &str) -> TableSchema {
+    TableSchema::new(
+        name,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+            ColumnDef::new("flag", ColumnType::Boolean, false),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_flag_row(
+    storage: &Storage,
+    table: &str,
+    tenant_ctx: &PolicyContext,
+    id: u64,
+    lang: &str,
+    flag: bool,
+    visibility: Visibility,
+) {
+    let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("seed-{table}-{id}"))
+        .expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        storage,
+        table,
+        tenant_ctx,
+        id,
+        visibility,
+        &[
+            Value::Vector(vec![id as f32, 0.0]),
+            Value::Text(lang.to_string()),
+            Value::Bool(flag),
+        ],
+        &op_id,
+    )
+    .expect("insert row");
+}
+
 fn new_core(storage: Storage) -> EngineCore {
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
 }
@@ -907,4 +948,332 @@ fn repeated_calls_are_deterministic() {
         "SELECT lang FROM docs UNION SELECT lang FROM other_docs",
     );
     assert_eq!(langs(&first), langs(&second));
+}
+
+// ---------- 裸の BOOLEAN 列参照（`WHERE flag`）の境界判定
+// （Cursor Bugbot 指摘対応。PR #1105） ----------
+//
+// `parse_set_branch` は枝の `WHERE` を通常の `parse_where` で解析するが、
+// 裸の BOOLEAN 列参照（`WHERE flag`）は直後のトークンが WHERE 句の境界
+// （`AND`・`ORDER`・`LIMIT`・文末・`)` 等）である場合に限り受理する
+// （`is_where_predicate_boundary_token`）。従来この境界集合に
+// `UNION`／`INTERSECT`／`EXCEPT` が含まれていなかったため、
+// `WHERE flag UNION SELECT ...` のような正当な集合演算文が式フォールバック
+// へ誤って落ち `42601` になっていた（`WHERE (flag) UNION ...` は括弧で
+// 囲むと `)` が既存の境界に該当するため通っていた）。
+
+#[test]
+fn bare_bool_column_before_union_is_accepted_and_filters_correctly() {
+    let path = unique_db_path("set-op-flag-boundary-union");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    storage.create_table(&flag_schema("b")).expect("create b");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        2,
+        "en",
+        false,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        3,
+        "fr",
+        true,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM a WHERE flag UNION SELECT lang FROM b",
+    );
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["fr".to_string(), "ja".to_string()]);
+}
+
+#[test]
+fn bare_bool_column_before_intersect_is_accepted_and_filters_correctly() {
+    let path = unique_db_path("set-op-flag-boundary-intersect");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    storage.create_table(&flag_schema("b")).expect("create b");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        2,
+        "en",
+        false,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        3,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM a WHERE flag INTERSECT SELECT lang FROM b",
+    );
+    assert_eq!(langs(&result), vec!["ja".to_string()]);
+}
+
+#[test]
+fn bare_bool_column_before_except_is_accepted_and_filters_correctly() {
+    let path = unique_db_path("set-op-flag-boundary-except");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    storage.create_table(&flag_schema("b")).expect("create b");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        2,
+        "en",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        3,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM a WHERE flag EXCEPT SELECT lang FROM b",
+    );
+    assert_eq!(langs(&result), vec!["en".to_string()]);
+}
+
+/// 括弧で囲んだ枝（`(SELECT ... WHERE flag) UNION ...`）でも同じ境界問題が
+/// 起き得る（`)` の直前で境界判定される点は同じだが、枝の WHERE 自体は
+/// 通常の `parse_where` 経路であることを確認する回帰）。
+#[test]
+fn bare_bool_column_inside_parenthesized_branch_is_accepted() {
+    let path = unique_db_path("set-op-flag-boundary-paren");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    storage.create_table(&flag_schema("b")).expect("create b");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        2,
+        "en",
+        false,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        3,
+        "fr",
+        true,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "(SELECT lang FROM a WHERE flag) UNION SELECT lang FROM b",
+    );
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["fr".to_string(), "ja".to_string()]);
+}
+
+/// 裸の BOOLEAN 列参照が `AND` 連鎖の最後の述語として現れる場合。
+#[test]
+fn bare_bool_column_as_last_and_predicate_before_union_is_accepted() {
+    let path = unique_db_path("set-op-flag-boundary-and-chain");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    storage.create_table(&flag_schema("b")).expect("create b");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        2,
+        "ja",
+        false,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        3,
+        "fr",
+        true,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM a WHERE lang = 'ja' AND flag UNION SELECT lang FROM b",
+    );
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["fr".to_string(), "ja".to_string()]);
+}
+
+/// 全体 `LIMIT`（最後の枝の直後）の境界判定は本修正の対象外のまま従来どおり
+/// 機能すること（`LIMIT` は既存の境界集合に含まれている）。
+#[test]
+fn bare_bool_column_in_last_branch_with_top_level_limit_is_accepted() {
+    let path = unique_db_path("set-op-flag-boundary-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    storage.create_table(&flag_schema("b")).expect("create b");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        2,
+        "fr",
+        true,
+        Visibility::Public,
+    );
+    insert_flag_row(
+        &storage,
+        "b",
+        &tenant_ctx,
+        3,
+        "en",
+        false,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM a UNION SELECT lang FROM b WHERE flag LIMIT 5",
+    );
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["fr".to_string(), "ja".to_string()]);
+}
+
+/// 非集合演算文の既存挙動は変えないことの固定（回帰防止）。`union` の直後が
+/// `SELECT`／`(` でないため `looks_like_set_operation` は偽になり、通常の
+/// `Statement::Scan` 経路（`parse_where`。境界集合は変更前のまま）を通る。
+/// `WHERE flag union LIMIT 10` は「`flag` の直後が `union`」であり、
+/// `union` は境界トークンではないため式フォールバックへ落ち、比較演算子が
+/// 無く `42601` になる——この挙動は本修正の前後で変わらない。
+#[test]
+fn bare_bool_column_followed_by_non_operator_union_ident_is_unaffected() {
+    let path = unique_db_path("set-op-flag-boundary-unaffected");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&flag_schema("a")).expect("create a");
+    let tenant_ctx = ctx("tenant-a");
+    insert_flag_row(
+        &storage,
+        "a",
+        &tenant_ctx,
+        1,
+        "ja",
+        true,
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM a WHERE flag union LIMIT 10",
+    );
+    assert_eq!(err.wire_code(), "42601");
 }
