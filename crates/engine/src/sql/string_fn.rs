@@ -159,12 +159,47 @@ pub(crate) fn trim(s: &str) -> Result<String, SqlSurfaceError> {
 /// `s` をそのまま返す（無限ループ・空文字区切りでの異常な膨張を避ける。
 /// `str::replace` は空パターンで各文字境界に `to` を挿入してしまうため、
 /// ここで明示的に素通しへ倒す）。
+///
+/// `s`／`from`／`to` はそれぞれ個別には [`MAX_RESULT_LEN`] 以下でも、`from` が
+/// 短く `to` が長い場合（例: 1 バイトの `from` を大量に含む `s` を巨大な `to`
+/// へ置換）は出現回数に比例して結果が乗算的に膨張しうる。`String::replace` は
+/// 置換後の文字列をその場で構築するため、`check_result_len` に到達する前に
+/// 巨大なアロケーションが発生してしまう（security.md「不安全な設計｜無制限
+/// リソース確保（DoS）」対応）。`str::matches` によるカウントは追加確保を伴わない
+/// ため、確保前に `checked_*` 演算で最終長を見積もり、上限超過を先に検査する
+/// （coding-rust.md「untrusted 入力の扱い」）。
 pub(crate) fn replace(s: &str, from: &str, to: &str) -> Result<String, SqlSurfaceError> {
     if from.is_empty() {
         return check_result_len(s.to_string());
     }
+    let occurrences = s.matches(from).count();
+    let removed = occurrences
+        .checked_mul(from.len())
+        .ok_or_else(replace_overflow)?;
+    let added = occurrences
+        .checked_mul(to.len())
+        .ok_or_else(replace_overflow)?;
+    let estimated_len = s
+        .len()
+        .checked_sub(removed)
+        .ok_or_else(replace_overflow)?
+        .checked_add(added)
+        .ok_or_else(replace_overflow)?;
+    if estimated_len > MAX_RESULT_LEN {
+        return Err(SqlSurfaceError::payload_too_large(
+            "string function result exceeds the maximum TEXT field length",
+        ));
+    }
     let out = s.replace(from, to);
     check_result_len(out)
+}
+
+/// [`replace`] の見積り計算がオーバーフローした場合の fail-closed エラー
+/// （到達し得ても [`MAX_RESULT_LEN`] 超過と同じ拒否として扱う）。
+fn replace_overflow() -> SqlSurfaceError {
+    SqlSurfaceError::payload_too_large(
+        "string function result exceeds the maximum TEXT field length",
+    )
 }
 
 /// `POSITION(needle IN haystack)`: 1 始まりの文字位置。見つからなければ 0、
@@ -242,6 +277,21 @@ mod tests {
     #[test]
     fn replace_with_empty_from_is_identity() {
         assert_eq!(replace("abc", "", "X").unwrap(), "abc");
+    }
+
+    /// レビュー指摘（PR 自己レビュー）: `REPLACE(s, from, to)` は `from` が短く
+    /// `to` が長い場合に出現回数へ比例して乗算的に膨張しうる。
+    /// `String::replace` を呼ぶ前に見積り計算で拒否できることを固定する
+    /// （実際に `MAX_RESULT_LEN` を超える巨大な `String::replace` 確保を
+    /// 発生させずに `54000` を返すことが本テストの主眼）。
+    #[test]
+    fn replace_rejects_before_allocating_when_expansion_exceeds_limit() {
+        // 1 文字を 1 KiB 文字列へ 5000 回置換すると期待長は約 5 MiB となり、
+        // `MAX_RESULT_LEN`（4 MiB）を超える。
+        let s = "a".repeat(5000);
+        let to = "x".repeat(1024);
+        let err = replace(&s, "a", &to).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

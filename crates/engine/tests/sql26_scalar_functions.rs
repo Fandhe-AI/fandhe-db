@@ -222,6 +222,42 @@ fn where_clause_with_string_function_excludes_null_rows() {
     assert_eq!(ids, vec![1, 2]);
 }
 
+/// PR 自己レビューで判明した回帰の固定テスト。`ReferencedColumns::derive`
+/// （`sql::aggregate`）が集計関数引数（`AggregateInput::ScalarExpr`）の部分式に
+/// 現れる `TEXT` 列参照（`BoundExpr::TextColumnRef`）を `scalar_mask` へ
+/// 反映していなかったため、`SUM(LENGTH(text_col))` のように集計関数の直接引数が
+/// 文字列スカラー関数である式は、返り値型こそ `ExprType::Scalar` でも
+/// 評価時に `text_columns` から読めず常に `Internal`（fail-closed だが正当な
+/// クエリを常に失敗させる回帰）になっていた。`COUNT(DISTINCT <expr>)` も
+/// 同じ `ReferencedColumns::derive` を共有するため同様に固定する。
+#[test]
+fn aggregate_argument_containing_string_scalar_function_is_computed_correctly() {
+    let path = unique_db_path("sql26-aggregate-string-arg");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // label: "Hello"(5)・"world"(5)・NULL。SUM(LENGTH(label)) は NULL を
+    // 除外して 5 + 5 = 10。
+    let result = core
+        .execute_sql(&ctx, "SELECT SUM(LENGTH(label)) FROM docs")
+        .expect("SUM(LENGTH(...)) should succeed");
+    match &result.rows[0].cells[0] {
+        Cell::Float(v) => assert_eq!(*v, 10.0),
+        other => panic!("expected Cell::Float, got {other:?}"),
+    }
+
+    // COUNT(DISTINCT LENGTH(label)) は "Hello"/"world" とも長さ 5 で同一・
+    // NULL は除外するため異なり数は 1。
+    let result = core
+        .execute_sql(&ctx, "SELECT COUNT(DISTINCT LENGTH(label)) FROM docs")
+        .expect("COUNT(DISTINCT LENGTH(...)) should succeed");
+    match &result.rows[0].cells[0] {
+        Cell::Integer(v) => assert_eq!(*v, 1),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+}
+
 // --- 予約名・型不一致（AC4） ---------------------------------------------------
 
 #[test]

@@ -279,6 +279,16 @@ impl ReferencedColumns {
                     if udf_call::references_embedding(source) {
                         needs_embedding = true;
                     }
+                    // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）の返り値は
+                    // `ExprType::Scalar` だが、その部分式が `TEXT` 列を参照する
+                    // ことはある（例: `SUM(LENGTH(text_col))`）。`scalar_mask` へ
+                    // 反映し損ねると評価時に `text_columns` から読めず
+                    // fail-closed の `Internal` エラーへ縮退してしまう
+                    // （黙った誤集計ではなく安全側の拒否だが、正当なクエリを
+                    // 常に失敗させる回帰になる。§3-7 の他呼び出し元と同じ契約）。
+                    if udf_call::mark_referenced_scalar_columns(source, &mut scalar_mask) {
+                        has_scalar_reference = true;
+                    }
                 }
                 AggregateInput::VectorColumnPresence => needs_vector_presence = true,
                 AggregateInput::AllVisible | AggregateInput::IdU64 => {}
@@ -987,12 +997,26 @@ impl Accumulator {
                 } else {
                     &[]
                 };
-                // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）は
-                // `sql::parser`（`AggregateArg::Expr` 束縛）が `ExprType::Scalar`
-                // のみを受理するため `TextColumnRef` を含み得ず、空スライスで
-                // 安全に評価できる。
-                match program.eval(id, embedding, &[], scratch)? {
+                // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）の返り値は
+                // `ExprType::Scalar` に限定されるが、その部分式は `TEXT` 列を
+                // 参照しうる（例: `SUM(LENGTH(text_col))`）。`ReferencedColumns::derive`
+                // が `source` の `TextColumnRef` を `scalar_mask` へ反映済みのため、
+                // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` の
+                // `WHERE` 評価と同じ契約）。
+                let text_columns: Vec<Option<&str>> = scanned
+                    .iter()
+                    .map(|v| v.and_then(|s| s.as_text()))
+                    .collect();
+                match program.eval(id, embedding, &text_columns, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
+                    // Issue #919・SQL-26: 部分式が `TEXT` 列を参照する
+                    // `ScalarExpr`（例: `SUM(LENGTH(text_col))`）は、対象行の
+                    // その列が NULL なら strict な文字列関数の NULL 伝播契約
+                    // （AC2）により式全体が NULL になりうる。他の列型（`RealColumn`
+                    // 等）の `None` と同じ「その行を観測対象から除外する」契約に
+                    // 揃え、`SUM`/`AVG`/`MIN`/`MAX` の NULL 無視規則
+                    // （PostgreSQL 互換）を満たす。
+                    ExprValue::Null => Ok(()),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
                     // 評価結果の型が食い違う実装バグの検出用）。
@@ -1161,8 +1185,23 @@ impl Accumulator {
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, scratch)? {
+                // Issue #919・SQL-26: `COUNT(DISTINCT <expr>)` の `expr` も
+                // 部分式が `TEXT` 列を参照しうる（例:
+                // `COUNT(DISTINCT LENGTH(text_col))`。非 distinct 経路と同じ
+                // `ReferencedColumns::derive` を共有するため `scalar_mask` は
+                // 反映済み）。`scanned` をそのまま `.as_text()` へ写す。
+                let text_columns: Vec<Option<&str>> = scanned
+                    .iter()
+                    .map(|v| v.and_then(|s| s.as_text()))
+                    .collect();
+                match program.eval(id, embedding, &text_columns, scratch)? {
                     ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
+                    // Issue #919・SQL-26: 部分式の `TEXT` 列が NULL なら式全体が
+                    // NULL になりうる（strict な文字列関数の NULL 伝播、AC2）。
+                    // `COUNT(DISTINCT)` は NULL を異なり数から除外する契約
+                    // （本関数冒頭のドキュメンテーションコメント参照）のため
+                    // `None`（キー無し）として扱う。
+                    ExprValue::Null => None,
                     _ => {
                         return Err(accumulator_bug(
                             "scalar-typed BoundExpr evaluated to a non-scalar value (distinct)",
