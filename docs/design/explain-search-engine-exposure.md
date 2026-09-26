@@ -194,7 +194,41 @@ build_explain_result` を `BoundScan`（Issue #726）・`BoundAggregate`
 `ScalarShapeInput` を自前で組み立てればよく、単一情報源（分類関数）は共有
 される）。
 
+## 追記（Issue #922・SQL-27: `EXPLAIN` の対象拡大）
+
+上記「スコープ外」節の「`EXPLAIN` の受理形状拡張」を実装した。`EXPLAIN` の
+対象を「`USING PLAN` を伴う検索 SELECT」限定から、通常検索 SELECT（`USING
+PLAN` の有無いずれも）・集計 SELECT（`GROUP BY`・`SELECT DISTINCT` の脱糖形
+いずれも）・広域取得（`OFFSET` を含む）へ拡大した。`sql::allowlist::
+Statement::Explain` のペイロードを `ValidatedStatement` から
+`ExplainTarget`（`Search`／`Aggregate`／`Scan` の 3 variant）へ変更した
+（**BREAKING CHANGE**）。
+
+出力形式は対象文の種別ごとに 3 系統になった（いずれも実行本体〔行走査・
+キャッシュ消費・LLM/Embedder 呼び出し・テーブル世代の更新〕を一切行わない
+契約は共通）。
+
+- **`USING PLAN` 付き検索**: 既存の 9 行（`search_terms[i]` 〜
+  `scalar_plan`）を無変更で維持
+- **`USING PLAN` なし検索**: `mode`／`mode_source`／`engine`／
+  （`hnsw` のときのみ）`hnsw_params`／`ann_plan`／`scalar_plan` の末尾行
+  のみ（LLM I/O を行わないため `search_terms[i]`／`path_hint`／`kind_hint`
+  を持たない）。末尾行の書式は `push_engine_tail_rows`（`sql/explain.rs`）
+  で両系統が共有し発散しない
+- **集計・広域取得**: `scalar_plan`／`access_path` の 2 行のみ。`mode`・
+  `engine`・`ann_plan` は出さない（広域取得は取得モードを参照せず、
+  どちらの文にもランキング段が無いため）
+
+`access_path` は新設の閉じた語彙（`visible_bitmap_cache`／
+`scalar_index_candidates`／`scalar_index_group_enumeration`／`full_scan`）で、
+executor の実行時ゲートと 1 対 1 対応する静的判定のみを表す（可視
+カーディナリティ・索引の構築可否・キャッシュのヒット/ミス等の実行時縮退の
+結果は非露出）。集計向けの分類は `sql::aggregate::classify_aggregate_access`
+が `select_decode_tier`／`classify_scalar_plan`／`has_text_min_max_aggregate`
+という executor と同じ判定式から導出する単一情報源（矛盾出力の防止）。
+語彙数・出さない行の選定は SQL-27 確定時に spec 側と擦り合わせる事項。
+
 ## ポインタ
 
-SQL-6・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・PLAN-11・
-TASK-186（NOSQL-6・NOSQL-10）
+SQL-6・SQL-27・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・
+PLAN-11・TASK-186（NOSQL-6・NOSQL-10）

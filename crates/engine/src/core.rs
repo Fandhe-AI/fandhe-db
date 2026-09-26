@@ -3134,7 +3134,8 @@ impl EngineCore {
                 self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
             ParsedSql::Statement(stmt @ Statement::Explain(v)) => {
-                self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
+                let table = v.table_name().to_string();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
@@ -3739,71 +3740,102 @@ impl EngineCore {
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
-            // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
-            // （ハイブリッド実行）を実行しない。行うのは LIMIT 範囲検証 →
-            // テーブル解決 → `VECTOR` 列・投影列／`WHERE` 述語の事前束縛検証
-            // （[`crate::sql::using_plan::pre_check_bindable`]。PR #267 の
-            // 是正対応）→ `question`（`USING PLAN` 本文）の空文字・長さ上限
-            // 検証（束縛検証より後。codex-review P1 指摘対応・PR #828）→
-            // 辞書必須列（`path`/`body`）の事前スキーマ検証（`question` 検証
-            // より後。同 PR）→ `USING MODE` リテラルの解析（辞書必須列検証
-            // より後）→ LLM クエリ展開・モード解決（`Self::
-            // plan_query_with_mode`）までで、すべての拒否を LLM I/O 開始前に
-            // 完結させる（`Statement::Select` アームの `USING PLAN` 経路
-            // 〔PR #266・#267 の是正方針〕を踏襲。security.md「不安全な設計」
-            // 対応。正確な手順は [`Self::run_explain_plan`] のドキュメント
-            // 参照）。再埋め込み（`Embedder`）は
-            // 応答に不要なため呼ばない（`embedder` 未注入でも `EXPLAIN` 可能）。
-            crate::sql::allowlist::Statement::Explain(validated) => {
-                // `allowlist::validate_sql` は `using_plan` が `Some` の場合のみ
-                // `Statement::Explain` を構築する（`sql::allowlist` モジュール
-                // ドキュメント参照）ため、ここでの `None` 到達は公開 API の誤用
-                // （`ValidatedStatement::new` 等の外部 constructor 経由）時のみの
-                // 防御的経路として fail-closed に拒否する。
-                let question = validated.using_plan().ok_or_else(|| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "EXPLAIN statement missing USING PLAN question".to_string(),
-                    }
-                })?;
+            // TASK-78（SQL-6）・Issue #922（SQL-27）: `EXPLAIN` は対象文（検索・
+            // 集計・広域取得のいずれも）の本体（ハイブリッド実行・行走査・
+            // キャッシュ消費）を一切実行しない。`ExplainTarget` の variant ごとに
+            // 異なる静的分類・応答整形へ振り分ける（[`crate::sql::explain`]
+            // モジュールドキュメント参照）。
+            crate::sql::allowlist::Statement::Explain(target) => match target {
+                // `USING PLAN` を伴う検索 SELECT（TASK-78・SQL-6）は既存の
+                // LLM クエリ展開・モード解決を可視化する経路をそのまま維持する
+                // （行の形式・fail-closed 順序は不変。詳細手順は
+                // [`Self::run_explain_plan`] のドキュメント参照）。行うのは
+                // LIMIT 範囲検証 → テーブル解決 → `VECTOR` 列・投影列／`WHERE`
+                // 述語の事前束縛検証（[`crate::sql::using_plan::
+                // pre_check_bindable`]。PR #267 の是正対応）→ `question`
+                // （`USING PLAN` 本文）の空文字・長さ上限検証（束縛検証より後。
+                // codex-review P1 指摘対応・PR #828）→ 辞書必須列（`path`/
+                // `body`）の事前スキーマ検証（`question` 検証より後。同 PR）→
+                // `USING MODE` リテラルの解析（辞書必須列検証より後）→ LLM
+                // クエリ展開・モード解決（`Self::plan_query_with_mode`）まで
+                // で、すべての拒否を LLM I/O 開始前に完結させる
+                // （`Statement::Select` アームの `USING PLAN` 経路〔PR #266・
+                // #267 の是正方針〕を踏襲。security.md「不安全な設計」対応）。
+                // 再埋め込み（`Embedder`）は応答に不要なため呼ばない
+                // （`embedder` 未注入でも `EXPLAIN` 可能）。
+                crate::sql::allowlist::ExplainTarget::Search(validated)
+                    if validated.using_plan().is_some() =>
+                {
+                    // `using_plan().is_some()` を確認済みのため `ok_or_else` は
+                    // 到達しない防御的経路（構文段の [`ExplainTarget::Search`]
+                    // 構築規則が破られない限り）。
+                    let question = validated.using_plan().ok_or_else(|| {
+                        crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "EXPLAIN statement missing USING PLAN question".to_string(),
+                        }
+                    })?;
 
-                crate::sql::parser::validate_search_limit(validated.limit())?;
+                    crate::sql::parser::validate_search_limit(validated.limit())?;
 
-                // `USING MODE` リテラルの解析は `run_explain_plan` に委譲し、
-                // ここでは行わない（cursor[bot] Bugbot 指摘対応・Issue #765
-                // 後続。`Statement::Select` アームの `USING PLAN` 経路
-                // 〔`run_using_plan_select`。PR #827〕と同じ理由: ここで先に
-                // 解析すると、テーブル未存在（`42P01` 相当）と `USING MODE`
-                // 値の不正（`22000`）が同時に成立する要求で、テーブル解決
-                // より先に mode 解析エラーが確定してしまう。
-                // `run_explain_plan` はテーブル解決（`read_txn_with_schema`）
-                // を終えた後で初めて mode リテラルを解析するため、生
-                // リテラルをそのまま渡すことで両表層（SQL テキスト経由・
-                // 束縛済み計画経由）が共有する fail-closed 順序〔LIMIT →
-                // テーブル解決 → 束縛検証（`plan` 欠落判定を含む） →
-                // `question` 検証 → 辞書必須列検証 → mode 解析 →
-                // I/O（LLM 展開・再埋め込み）→ 世代照合 → 辞書必須列の
-                // 再検証〕を保つ。詳細は [`Self::run_explain_plan`] の
-                // ドキュメント参照）。
-                //
-                // 手順本体（テーブル世代の事前記録 → 束縛検証（`plan`
-                // 欠落判定を含む） → `question` 検証 → 辞書必須列検証 →
-                // mode 解析 → LLM クエリ展開・モード解決 → 世代の事後照合 →
-                // 辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 →
-                // `QUERY PLAN` 整形）は [`Self::run_explain_plan`] が
-                // [`Self::explain_bound_plan_in_session`]（TASK-186・
-                // NOSQL-10・Issue #765）と共有する（第 2 の実装を持たない）。
-                let result = self.run_explain_plan(
-                    ctx,
-                    session,
-                    validated.table_name(),
-                    question,
-                    validated.search_mode(),
-                    |schema, udfs| {
-                        crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
-                    },
-                )?;
-                Ok(crate::sql::SqlOutcome::Explain(result))
-            }
+                    // `USING MODE` リテラルの解析は `run_explain_plan` に委譲し、
+                    // ここでは行わない（cursor[bot] Bugbot 指摘対応・Issue #765
+                    // 後続。`Statement::Select` アームの `USING PLAN` 経路
+                    // 〔`run_using_plan_select`。PR #827〕と同じ理由: ここで先に
+                    // 解析すると、テーブル未存在（`42P01` 相当）と `USING MODE`
+                    // 値の不正（`22000`）が同時に成立する要求で、テーブル解決
+                    // より先に mode 解析エラーが確定してしまう。
+                    // `run_explain_plan` はテーブル解決（`read_txn_with_schema`）
+                    // を終えた後で初めて mode リテラルを解析するため、生
+                    // リテラルをそのまま渡すことで両表層（SQL テキスト経由・
+                    // 束縛済み計画経由）が共有する fail-closed 順序〔LIMIT →
+                    // テーブル解決 → 束縛検証（`plan` 欠落判定を含む） →
+                    // `question` 検証 → 辞書必須列検証 → mode 解析 →
+                    // I/O（LLM 展開・再埋め込み）→ 世代照合 → 辞書必須列の
+                    // 再検証〕を保つ。詳細は [`Self::run_explain_plan`] の
+                    // ドキュメント参照）。
+                    //
+                    // 手順本体（テーブル世代の事前記録 → 束縛検証（`plan`
+                    // 欠落判定を含む） → `question` 検証 → 辞書必須列検証 →
+                    // mode 解析 → LLM クエリ展開・モード解決 → 世代の事後照合 →
+                    // 辞書必須列の再検証 → 使用エンジン・ANN／SCALAR 静的判定 →
+                    // `QUERY PLAN` 整形）は [`Self::run_explain_plan`] が
+                    // [`Self::explain_bound_plan_in_session`]（TASK-186・
+                    // NOSQL-10・Issue #765）と共有する（第 2 の実装を持たない）。
+                    let result = self.run_explain_plan(
+                        ctx,
+                        session,
+                        validated.table_name(),
+                        question,
+                        validated.search_mode(),
+                        |schema, udfs| {
+                            crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
+                        },
+                    )?;
+                    Ok(crate::sql::SqlOutcome::Explain(result))
+                }
+                // Issue #922（SQL-27）: `USING PLAN` を伴わない検索 SELECT
+                // （`ORDER BY <=>`・`HYBRID`）。LLM I/O を一切行わず、
+                // `Statement::Select` アームの非 `USING PLAN` 経路と同じ
+                // `bind_in_session` の束縛結果だけから ANN／SCALAR の静的判定を
+                // 報告する（[`Self::run_search_explain`] 参照）。
+                crate::sql::allowlist::ExplainTarget::Search(validated) => {
+                    self.run_search_explain(&validated, session)
+                }
+                // Issue #922（SQL-27）: 集計 SELECT（`GROUP BY`・`DISTINCT` の
+                // 脱糖形いずれも）。行走査・索引消費を一切行わず、`bind_aggregate`
+                // の束縛結果だけから走査方式を報告する
+                // （[`Self::run_relational_explain_aggregate`] 参照）。
+                crate::sql::allowlist::ExplainTarget::Aggregate(validated) => {
+                    self.run_relational_explain_aggregate(&validated, session)
+                }
+                // Issue #922（SQL-27）: 広域取得（ビュー展開後の形・`OFFSET` を
+                // 含む）。`sql::scan` はランキング段・索引を持たないため、
+                // `scalar_plan: plain_scan`／`access_path: full_scan` に固定
+                // （[`Self::run_relational_explain_scan`] 参照）。
+                crate::sql::allowlist::ExplainTarget::Scan(validated) => {
+                    self.run_relational_explain_scan(&validated, session)
+                }
+            },
         }
     }
 
@@ -4371,29 +4403,19 @@ impl EngineCore {
 
         // Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の入力を
         // 組み立てる。`EXPLAIN` は `USING PLAN` 専用（束縛結果は常に
-        // `Ranking::Hybrid`）のため `is_hybrid` は常に `true`。
-        // `hnsw_enabled`（`self.hnsw_state`）は実行時に executor が経由する
-        // 索引キャッシュそのものの有無であり、`EXPLAIN` はこの判定のためだけに
-        // `hnsw_state` の `lookup`／`prepare_*`（索引構築・統計加算という
-        // 副作用を持つ）を一切呼ばず、`is_some()` の有無だけを見る（検索本体を
-        // 実行しない契約は不変）。`USING PLAN` は `HINT ORDER` を受理しない
-        // （SQL-5・許可リスト層）ため評価順序は常に既定（`EvaluationOrder::
-        // DEFAULT`）であり、`scalar_prefilter` はここで固定的に導出できる。
-        let ann_plan =
-            crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
-                hnsw_enabled: self.hnsw_state.is_some(),
-                engine_kind_unknown: self.search_engine_kind().is_none(),
-                is_hybrid: true,
-                is_precision: planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
-                filters_empty: explain_shape.filters_empty(),
-                scalar_prefilter: crate::sql::plan::ExecutionPlan::from_evaluation_order(
-                    crate::sql::plan::EvaluationOrder::DEFAULT,
-                )
-                .scalar_prefilter,
-            });
-        let explain_engine = crate::sql::explain::ExplainEngine::new(
-            self.search_engine_kind(),
-            ann_plan,
+        // `Ranking::Hybrid`）のため `is_hybrid` は常に `true`。`USING PLAN` は
+        // `HINT ORDER` を受理しない（SQL-5・許可リスト層）ため評価順序は常に
+        // 既定（`EvaluationOrder::DEFAULT`）であり、`scalar_prefilter` は
+        // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
+        // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出）へ委譲する。
+        let explain_engine = self.explain_engine_for(
+            true,
+            planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
+            explain_shape.filters_empty(),
+            crate::sql::plan::ExecutionPlan::from_evaluation_order(
+                crate::sql::plan::EvaluationOrder::DEFAULT,
+            )
+            .scalar_prefilter,
             // Issue #474: `bind` が構文段のみから確定させた静的判定（LLM
             // I/O・世代照合の影響を受けない。上記コメントと同じ理由）。
             explain_shape.scalar_plan(),
@@ -4401,6 +4423,129 @@ impl EngineCore {
         Ok(crate::sql::explain::build_explain_result(
             &planned,
             &explain_engine,
+        ))
+    }
+
+    /// [`Self::run_explain_plan`]（`USING PLAN` 付き検索 EXPLAIN。TASK-78・
+    /// SQL-6）と [`Self::run_search_explain`]（`USING PLAN` なし検索 EXPLAIN。
+    /// Issue #922・SQL-27）が共有する `ExplainEngine` の組み立て（Issue #411・
+    /// Issue #474）。使用エンジン種別（`self.search_engine_kind()`）・ANN 静的
+    /// 判定（[`crate::sql::hnsw_cache::classify_ann_plan`]）を単一箇所へ
+    /// 集約し、`hnsw_state` の `lookup`／`prepare_*`（索引構築・統計加算という
+    /// 副作用を持つ）を一切呼ばず `is_some()` の有無だけを見る（検索本体を
+    /// 実行しない契約はどちらの呼び出し元でも不変）。
+    fn explain_engine_for(
+        &self,
+        is_hybrid: bool,
+        is_precision: bool,
+        filters_empty: bool,
+        scalar_prefilter: bool,
+        scalar_plan: crate::sql::scalar_plan::ScalarPlan,
+    ) -> crate::sql::explain::ExplainEngine {
+        let ann_plan =
+            crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
+                hnsw_enabled: self.hnsw_state.is_some(),
+                engine_kind_unknown: self.search_engine_kind().is_none(),
+                is_hybrid,
+                is_precision,
+                filters_empty,
+                scalar_prefilter,
+            });
+        crate::sql::explain::ExplainEngine::new(self.search_engine_kind(), ann_plan, scalar_plan)
+    }
+
+    /// `EXPLAIN SELECT ...`（`USING PLAN` を伴わない検索 SELECT。`ORDER BY
+    /// <=>`・`HYBRID`。Issue #922・SQL-27）。LLM I/O・検索本体（ハイブリッド
+    /// 実行）のいずれも行わず、`Statement::Select` アームの非 `USING PLAN`
+    /// 経路（`bind_in_session` → `run_select_plan`）と同じ束縛
+    /// （`run_select_plan` は呼ばない）だけから ANN／SCALAR の静的判定を報告
+    /// する。束縛（`bind_in_session`）を共有するため、テーブル未存在・型不整合・
+    /// LIMIT／`USING MODE` 不正等のエラー分類は EXPLAIN なしの同じ文と同一
+    /// （`wire_code` のパリティ）。
+    fn run_search_explain(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedStatement,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let bound = crate::sql::parser::bind_in_session(
+            validated,
+            &schema,
+            session.search_mode(),
+            session.udfs(),
+        )?;
+        let is_hybrid = matches!(bound.ranking(), crate::sql::parser::Ranking::Hybrid { .. });
+        let is_precision = bound.mode().mode() == crate::sql::mode::SearchMode::Precision;
+        let filters_empty = !bound.has_where_filters();
+        // HINT ORDER（TASK-76・SQL-7）で DISTANCE 先行に切り替わっている場合、
+        // executor（`sql::exec::execute_statement_with_cache`）は SCALAR 段を
+        // 事後フィルタへ回す。`ExecutionPlan::from_evaluation_order` は executor
+        // と同じ単一情報源（D6・core.rs モジュールドキュメント同様の方針）。
+        let scalar_prefilter =
+            crate::sql::plan::ExecutionPlan::from_evaluation_order(bound.evaluation_order())
+                .scalar_prefilter;
+        let scalar_plan = crate::sql::scalar_plan::classify_scalar_plan(
+            &crate::sql::scalar_plan::ScalarShapeInput {
+                scalar_prefilter,
+                metadata_filters: bound.metadata_filters(),
+                expr_filters: bound.expr_filters(),
+                or_filters: bound.or_filters(),
+            },
+        );
+        let engine = self.explain_engine_for(
+            is_hybrid,
+            is_precision,
+            filters_empty,
+            scalar_prefilter,
+            scalar_plan,
+        );
+        Ok(crate::sql::SqlOutcome::Explain(
+            crate::sql::explain::build_search_explain_result(bound.mode(), &engine),
+        ))
+    }
+
+    /// `EXPLAIN SELECT <集計>`（`GROUP BY`・`SELECT DISTINCT` の脱糖形いずれも。
+    /// Issue #922・SQL-27）。行走査・キャッシュ消費（`sql::aggregate::
+    /// execute_aggregate_with_cache`・`sql::group_by::execute_grouped_aggregate`）
+    /// を一切行わず、`bind_aggregate` の束縛結果だけから走査方式
+    /// （[`crate::sql::explain::AccessPath`]）を静的に分類する
+    /// （[`crate::sql::aggregate::classify_aggregate_access`] が executor の
+    /// ゲートと同じ判定式〔`select_decode_tier`・`classify_scalar_plan`・
+    /// `has_text_min_max_aggregate`〕を共有する単一情報源）。`bind_aggregate`
+    /// を共有するためエラー分類は EXPLAIN なしの同じ文と同一。
+    fn run_relational_explain_aggregate(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedAggregate,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+        let (scalar_plan, access_path) =
+            crate::sql::aggregate::classify_aggregate_access(&schema, &bound);
+        Ok(crate::sql::SqlOutcome::Explain(
+            crate::sql::explain::build_relational_explain_result(scalar_plan, access_path),
+        ))
+    }
+
+    /// `EXPLAIN SELECT ... LIMIT n [OFFSET m]`（広域取得。ビュー展開後の形を
+    /// 含む。Issue #922・SQL-27）。`sql::scan` はランキング段・索引・キャッシュ
+    /// のいずれも消費しない（`sql::scan` モジュールドキュメント参照）ため、
+    /// `scalar_plan: plain_scan`／`access_path: full_scan` に固定する
+    /// （executor の実経路が常にこの 2 値である事実どおり。D5「矛盾出力の
+    /// 防止」）。`bind_scan` を呼ぶのは LIMIT／`OFFSET`・投影列／`WHERE` 述語の
+    /// 妥当性検証を EXPLAIN なしの同じ文と共有するため（エラー分類のパリティ）。
+    fn run_relational_explain_scan(
+        &self,
+        validated: &crate::sql::allowlist::ValidatedScan,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let _bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+        Ok(crate::sql::SqlOutcome::Explain(
+            crate::sql::explain::build_relational_explain_result(
+                crate::sql::scalar_plan::ScalarPlan::PlainScan,
+                crate::sql::explain::AccessPath::FullScan,
+            ),
         ))
     }
 
