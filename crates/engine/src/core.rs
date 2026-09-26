@@ -3579,10 +3579,10 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                 )?;
-                Ok(Some(crate::sql::describe::projected_columns(
-                    bound.projection(),
-                    &schema,
-                )))
+                // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を含む広域取得の
+                // Describe 列は `scan_columns` が実行時（`sql::window::
+                // execute_window_scan`）と同じ写像で組み立てる。
+                Ok(Some(crate::sql::describe::scan_columns(&bound, &schema)?))
             }
             // Issue #929（SQL-29 (c)・TASK-213）: 検索本体（各枝の行走査）は実行せず、
             // 全枝を束縛して型整合検証（§2.2）を行った結果列（左端の枝の列）だけを

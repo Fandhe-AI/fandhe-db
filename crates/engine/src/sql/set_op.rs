@@ -749,6 +749,7 @@ mod tests {
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
             offset: 0,
+            window_items: Vec::new(),
         }))
     }
 
@@ -956,6 +957,7 @@ mod tests {
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
             offset: 0,
+            window_items: Vec::new(),
         }))
     }
 

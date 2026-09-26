@@ -4351,6 +4351,10 @@ pub struct BoundScan {
     /// Issue #916・SQL-25 (b)・TASK-209）。既定は 0（no-op）で、[`Self::new`] 経由の
     /// 直接構築（TASK-186・NOSQL-3）や既存呼び出し元との後方互換を保つ。
     pub(crate) offset: usize,
+    /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得と
+    /// 完全に同一の実行経路（`sql::scan::execute_scan_with_budget`）を通る。
+    /// [`Self::new`]（NoSQL 表層の直接構築経路）は常に空にする。
+    pub(crate) windows: Vec<BoundWindowItem>,
 }
 
 impl BoundScan {
@@ -4385,6 +4389,7 @@ impl BoundScan {
             or_filters: Vec::new(),
             limit,
             offset: 0,
+            windows: Vec::new(),
         }
     }
 
@@ -4441,6 +4446,217 @@ impl BoundScan {
     pub fn limit(&self) -> usize {
         self.limit
     }
+
+    /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得。
+    /// `BoundWindowItem` が `pub(crate)` のためクレート外には公開しない
+    /// （`sql::scan::execute_scan_with_budget` が dispatch 判定に使う）。
+    pub(crate) fn windows(&self) -> &[BoundWindowItem] {
+        &self.windows
+    }
+}
+
+/// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の束縛済み比較キー。
+/// `PARTITION BY`／`ORDER BY` が参照する列を、パーティション分割・安定ソートが
+/// 直接使える形へ解決する（[`resolve_window_key`] 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowKeyKind {
+    Text,
+    Integer,
+    BigInt,
+    Real,
+    Double,
+    Boolean,
+    Date,
+    Timestamp,
+    Numeric,
+    Uuid,
+}
+
+/// ウィンドウ項目の `PARTITION BY`／`ORDER BY` キー 1 つ（SQL-30・TASK-214）。
+/// `Id` は疑似列 `id`（`u64`。全順序を持ち NULL を取らない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowKeyRef {
+    Id,
+    Column { index: usize, kind: WindowKeyKind },
+}
+
+/// 束縛済みのウィンドウ項目（SQL-30・TASK-214、Issue #930）。
+/// [`crate::sql::window::execute_window_scan`] がパーティション分割・安定ソート・
+/// peer 評価の入力として使う。`input`（`None` は順位関数・`Some` は集計関数の
+/// 引数）は [`AggregateInput`] を再利用し、集計本体（`Accumulator`）を
+/// `sql::aggregate` と共有する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundWindowItem {
+    /// SELECT リスト全体（通常項目・ウィンドウ項目を通した）における出現位置。
+    pub(crate) position: usize,
+    pub(crate) func: crate::sql::allowlist::WindowFunc,
+    pub(crate) input: Option<AggregateInput>,
+    pub(crate) partition_by: Vec<WindowKeyRef>,
+    /// `(キー, 降順か)` の順序保持リスト。
+    pub(crate) order_by: Vec<(WindowKeyRef, bool)>,
+    pub(crate) name: String,
+}
+
+/// ウィンドウ項目の `PARTITION BY`／`ORDER BY` キー 1 つの列名を `schema` と
+/// 照合する（SQL-30・TASK-214）。受理する型は [`resolve_aggregate_input`] の
+/// `MIN`/`MAX` 受理型と同じ全順序を持つ型（`TEXT`／`INTEGER`／`BIGINT`／
+/// `REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／
+/// `UUID`／疑似列 `id`）。正準等価・全順序を持たない `VECTOR`／`ARRAY`／
+/// `JSON`／`JSONB`／`BYTEA`／`ENUM` は型不整合（`22000`）で拒否する
+/// （SQL-25 の `DISTINCT(VECTOR)` 拒否・`resolve_count_distinct_input` の
+/// `VECTOR`/`ARRAY`/`JSON` 拒否と同じ設計判断）。
+fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, SqlSurfaceError> {
+    if let Some((index, column)) = schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.name == name)
+    {
+        let kind = match &column.ty {
+            ColumnType::Text => WindowKeyKind::Text,
+            ColumnType::Integer => WindowKeyKind::Integer,
+            ColumnType::BigInt => WindowKeyKind::BigInt,
+            ColumnType::Real => WindowKeyKind::Real,
+            ColumnType::Double => WindowKeyKind::Double,
+            ColumnType::Boolean => WindowKeyKind::Boolean,
+            ColumnType::Date => WindowKeyKind::Date,
+            ColumnType::Timestamp => WindowKeyKind::Timestamp,
+            ColumnType::Numeric { .. } => WindowKeyKind::Numeric,
+            ColumnType::Uuid => WindowKeyKind::Uuid,
+            ColumnType::Vector(_)
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"
+                )));
+            }
+        };
+        return Ok(WindowKeyRef::Column { index, kind });
+    }
+    if name == "id" {
+        return Ok(WindowKeyRef::Id);
+    }
+    Err(SqlSurfaceError::invalid_input(format!(
+        "unknown column: {name}"
+    )))
+}
+
+/// [`crate::sql::allowlist::WindowSelectItem`] を `schema`・UDF レジストリ `udfs`
+/// と照合して [`BoundWindowItem`] へ束縛する（SQL-30・TASK-214、Issue #930）。
+/// 集計引数の型検査（`TEXT` の `SUM`/`AVG` は `22000` 等）は
+/// [`resolve_aggregate_input`] へ委譲し、集計 SELECT（`sql::aggregate`）と同じ
+/// 規約を共有する（第 2 の型検査を作らない）。
+fn bind_window_item(
+    item: &crate::sql::allowlist::WindowSelectItem,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundWindowItem, SqlSurfaceError> {
+    use crate::sql::allowlist::{AggregateFunc, WindowFunc};
+
+    let input = match &item.arg {
+        None => None,
+        Some(arg) => {
+            let agg_func = match item.func {
+                WindowFunc::Count => AggregateFunc::Count,
+                WindowFunc::Sum => AggregateFunc::Sum,
+                WindowFunc::Avg => AggregateFunc::Avg,
+                WindowFunc::Min => AggregateFunc::Min,
+                WindowFunc::Max => AggregateFunc::Max,
+                // 構文層（`Parser::parse_window_item`）が順位関数に引数を
+                // 持たせないため到達しない（防御的に内部バグとして扱う）。
+                WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "ranking window function unexpectedly carries an argument"
+                            .to_string(),
+                    });
+                }
+            };
+            Some(resolve_aggregate_input(
+                agg_func,
+                arg,
+                schema,
+                udfs,
+                node_budget,
+            )?)
+        }
+    };
+
+    let mut partition_by = Vec::with_capacity(item.partition_by.len());
+    for name in &item.partition_by {
+        partition_by.push(resolve_window_key(name, schema)?);
+    }
+    let mut order_by = Vec::with_capacity(item.order_by.len());
+    for (name, descending) in &item.order_by {
+        order_by.push((resolve_window_key(name, schema)?, *descending));
+    }
+
+    let name = item
+        .alias
+        .clone()
+        .unwrap_or_else(|| item.func.default_alias().to_string());
+
+    Ok(BoundWindowItem {
+        position: item.position,
+        func: item.func,
+        input,
+        partition_by,
+        order_by,
+        name,
+    })
+}
+
+/// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を
+/// すべて `out` へ集める（SQL-30・TASK-214。WHERE がウィンドウ別名を参照する形の
+/// 拒否判定でのみ使う）。`Or` の分岐へ再帰する（`sql::view::
+/// check_predicate_columns_within` と同じ理由: 非公開の判定漏れを防ぐ）。
+fn collect_where_predicate_idents(
+    predicates: &[WherePredicate],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for pred in predicates {
+        match pred {
+            WherePredicate::Equality { column, .. }
+            | WherePredicate::Prefix { column, .. }
+            | WherePredicate::BoolEquality { column, .. }
+            | WherePredicate::Compare { column, .. } => {
+                out.insert(column.clone());
+            }
+            WherePredicate::BoolColumn { column } => {
+                out.insert(column.clone());
+            }
+            WherePredicate::PredicateCall { .. } => {}
+            WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    collect_where_predicate_idents(branch, out);
+                }
+            }
+        }
+    }
+}
+
+/// [`Expr::Ident`] をすべて再帰的に集める（[`collect_where_predicate_idents`] の
+/// 式項目向け実装。`sql::view::expr_columns_within` と同じ走査規則）。
+fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Number(_) => {}
+        Expr::Ident(name) => {
+            out.insert(name.clone());
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_idents(lhs, out);
+            collect_expr_idents(rhs, out);
+        }
+    }
 }
 
 /// `expr_filters` を束縛時に 1 回だけステップ列コンパイルする（Issue #353）。
@@ -4485,6 +4701,33 @@ pub(crate) fn bind_scan_with_dummy_flags(
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
 
+    // SQL-30・TASK-214（Issue #930）: WHERE がウィンドウ項目の別名を参照する形
+    // （`SELECT rn AS rn2, ROW_NUMBER() OVER () AS rn FROM t WHERE rn = 1`
+    // 相当）は、ウィンドウ値が WHERE 評価より後（走査全体の完了後）に確定する
+    // ため構造上評価できず `42601` で拒否する。ただし実在する同名スキーマ列が
+    // あれば、既存の列参照として解釈する（ウィンドウ別名を優先しない）。
+    if !stmt.window_items.is_empty() {
+        let mut window_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for item in &stmt.window_items {
+            let alias = item
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| item.func.default_alias());
+            window_aliases.insert(alias);
+        }
+        let mut where_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_where_predicate_idents(stmt.where_predicates(), &mut where_idents);
+        for ident in &where_idents {
+            if window_aliases.contains(ident.as_str())
+                && !schema.columns.iter().any(|c| &c.name == ident)
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "WHERE cannot reference a window function alias",
+                ));
+            }
+        }
+    }
+
     let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         bind_where_predicates(
             stmt.where_predicates(),
@@ -4503,6 +4746,11 @@ pub(crate) fn bind_scan_with_dummy_flags(
     // する（行ループでの再帰評価をなくす）。
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
+    let mut windows = Vec::with_capacity(stmt.window_items.len());
+    for item in &stmt.window_items {
+        windows.push(bind_window_item(item, schema, udfs, &mut node_budget)?);
+    }
+
     Ok(BoundScan {
         table: stmt.table_name().to_string(),
         projection,
@@ -4512,6 +4760,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         or_filters,
         limit,
         offset,
+        windows,
     })
 }
 

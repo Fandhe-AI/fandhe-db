@@ -17,7 +17,8 @@
 //! 可視性が参照者へ引き継がれることは構造的に起こらない。
 
 use super::allowlist::{
-    parse_view_body, Projection, SelectItem, SqlSurfaceError, TableLookup, WherePredicate,
+    parse_view_body, AggregateArg, Projection, SelectItem, SqlSurfaceError, TableLookup,
+    WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -273,6 +274,45 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
             expr_columns_within(columns, rhs)
         }
     }
+}
+
+/// クエリのウィンドウ項目（SQL-30・TASK-214、Issue #930）が参照する列
+/// （`PARTITION BY`・`ORDER BY`・集計引数）が、参照先が公開する列集合
+/// （`view_columns`）に収まっているかを検査する（[`check_columns_within_view`]の
+/// ウィンドウ項目向け実装。RLS-10 (b) の趣旨: ビューの非公開列を順位・累積集計の
+/// キー・引数に使い、値の推測手段にすることを防ぐ）。順位関数（`ROW_NUMBER`／
+/// `RANK`／`DENSE_RANK`）・`COUNT(*)` は列参照を持たないため対象外。
+pub(crate) fn check_window_columns_within_view(
+    view_columns: Option<&[String]>,
+    window_items: &[WindowSelectItem],
+) -> Result<(), SqlSurfaceError> {
+    let Some(columns) = view_columns else {
+        return Ok(());
+    };
+    for item in window_items {
+        for col in &item.partition_by {
+            if !columns.iter().any(|vc| vc == col) {
+                return Err(SqlSurfaceError::InvalidInput {
+                    detail: format!("unknown column: {col}"),
+                });
+            }
+        }
+        for (col, _) in &item.order_by {
+            if !columns.iter().any(|vc| vc == col) {
+                return Err(SqlSurfaceError::InvalidInput {
+                    detail: format!("unknown column: {col}"),
+                });
+            }
+        }
+        if let Some(AggregateArg::Expr(Expr::Ident(name))) = &item.arg {
+            if !columns.iter().any(|vc| vc == name) {
+                return Err(SqlSurfaceError::InvalidInput {
+                    detail: format!("unknown column: {name}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 単純な `column` フィールドを持つ述語からその列名を取り出す。`PredicateCall`は
