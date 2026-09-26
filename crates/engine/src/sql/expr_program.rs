@@ -213,10 +213,39 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 ExprValue::Vector(_) => None,
             }
         }
-        BoundExpr::IdRef
-        | BoundExpr::VectorRef
-        | BoundExpr::Builtin { .. }
-        | BoundExpr::WasmCall { .. } => None,
+        BoundExpr::Builtin { f, args } => {
+            // 数値スカラー関数群（SQL-26、Issue #920）のうち行に依存しない
+            // ものだけを畳み込む（`udf_call::is_foldable_builtin` 参照。
+            // `vec_norm` 等の Vector 引数を取る組み込みは常に `VectorRef` を
+            // 引数に持つため実質畳み込み対象にならないが、念のため名前空間で
+            // 明示的に除外する）。引数のいずれかが畳み込めない（行依存・
+            // 非決定的）場合は `None` を返して通常のステップ平坦化へ委ねる。
+            if !udf_call::is_foldable_builtin(*f) {
+                return None;
+            }
+            let mut values: Vec<Option<ExprValue<'static>>> = Vec::with_capacity(args.len());
+            for a in args {
+                match try_fold_scalar(a)? {
+                    FoldedConst::Scalar(v) => values.push(Some(ExprValue::Scalar(v))),
+                    // 数値スカラー関数群の引数は常に Scalar のため理論上
+                    // 到達しないが、`Bool` が畳み込まれてきた場合は畳み込み
+                    // 対象外として defer-on-error にフォールバックする
+                    // （fail-safe。`unreachable!` は使わない）。
+                    FoldedConst::Bool(_) => return None,
+                }
+            }
+            // 畳み込み中にエラーになる部分式（0 除算・非有限値等）は畳み込まず、
+            // `None` を返して実行時評価に委ねる（defer-on-error。§モジュール
+            // ドキュメント参照）。
+            match apply_builtin(*f, &mut values).ok()? {
+                ExprValue::Scalar(v) => Some(FoldedConst::Scalar(v)),
+                // 数値スカラー関数群の戻り値は常に Scalar のため理論上到達
+                // しないが、他の値種別が返ってきた場合も畳み込み対象外として
+                // fail-safe に扱う。
+                _ => None,
+            }
+        }
+        BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::WasmCall { .. } => None,
     }
 }
 
@@ -666,6 +695,70 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         assert!(program.steps.len() <= MAX_EXPR_NODES);
         assert!(program.max_stack <= program.steps.len());
+    }
+
+    // --- 数値スカラー関数群の定数畳み込み（Issue #920・AC3） --------------------
+
+    #[test]
+    fn deterministic_numeric_builtin_folds_to_const_scalar() {
+        // `abs(0 - 1)` は行に依存しない部分式のみで構成されるため 1 ステップへ
+        // 畳み込まれる。
+        let expr = BoundExpr::Builtin {
+            f: BuiltinFn::Abs,
+            args: vec![bin(BinOp::Sub, num(0.0), num(1.0))],
+        };
+        let program = ExprProgram::compile(&expr);
+        assert_eq!(program.steps, vec![ExprStep::ConstScalar(1.0)]);
+    }
+
+    #[test]
+    fn numeric_builtin_over_row_dependent_argument_is_not_folded() {
+        // `abs(id)` は行 `id` に依存するため畳み込まれず、`Builtin` ステップが
+        // 実行時まで残る（defer-on-error と同じ「行に依存する式は畳み込まない」
+        // 方針）。
+        let expr = BoundExpr::Builtin {
+            f: BuiltinFn::Abs,
+            args: vec![BoundExpr::IdRef],
+        };
+        let program = ExprProgram::compile(&expr);
+        assert!(matches!(
+            program.steps.last(),
+            Some(ExprStep::Builtin(BuiltinFn::Abs))
+        ));
+    }
+
+    #[test]
+    fn numeric_builtin_that_errors_when_folded_defers_to_runtime() {
+        // `sqrt(0 - 1)` は定数のみから成るが計算がエラーになるため、
+        // defer-on-error により畳み込まれず実行時評価に委ねられる。可視行が
+        // 0 件のテーブルでは実行時評価自体が起きないため、これによって
+        // クエリ全体が失敗することはない（既存の defer-on-error 契約）。
+        let expr = BoundExpr::Builtin {
+            f: BuiltinFn::Sqrt,
+            args: vec![bin(BinOp::Sub, num(0.0), num(1.0))],
+        };
+        let program = ExprProgram::compile(&expr);
+        assert!(matches!(
+            program.steps.last(),
+            Some(ExprStep::Builtin(BuiltinFn::Sqrt))
+        ));
+        let mut scratch = Vec::new();
+        assert!(program.eval(1, &[], &mut scratch).is_err());
+    }
+
+    #[test]
+    fn vec_norm_builtin_is_never_folded_regardless_of_argument() {
+        // `is_foldable_builtin` が Vector 系組み込みを畳み込み対象外にしている
+        // ことの直接的な回帰固定。
+        let expr = BoundExpr::Builtin {
+            f: BuiltinFn::VecNorm,
+            args: vec![BoundExpr::VectorRef],
+        };
+        let program = ExprProgram::compile(&expr);
+        assert!(matches!(
+            program.steps.last(),
+            Some(ExprStep::Builtin(BuiltinFn::VecNorm))
+        ));
     }
 
     /// PR #373 codex-review 指摘 1 対応の回帰テスト: `scratch`（[`StackValue`]

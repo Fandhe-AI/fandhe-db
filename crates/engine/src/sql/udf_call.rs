@@ -252,8 +252,12 @@ pub fn into_owned_vector(v: Cow<'_, [f32]>) -> Result<Vec<f32>, SqlSurfaceError>
     }
 }
 
-/// 組み込み関数（対象ビヘイビア SQL-9。`sqrt`/`abs` 等の追加は本タスクのスコープ外
-/// （out-of-scope-tracking 参照）で、UDF 本体を書くのに十分な最小集合に絞る）。
+/// 組み込み関数（対象ビヘイビア SQL-9・SQL-26。ポインタ:
+/// `docs/spec/05-tasks.md` TASK-210・`docs/spec/04-behavior/sql-surface.md`
+/// SQL-26）。数値スカラー関数群（`Abs`〜`Sqrt`）の値レベルの計算は
+/// `sql::numeric_fn` へ委譲し、本 enum は解決済み関数の識別子のみを保持する。
+/// 日時スカラー関数群（`EXTRACT`/`date_part`/`date_trunc`・`DATE`/`TIMESTAMP`
+/// 算術）は本 Issue の対象外（後続課題。Issue #920 実装ノート参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
     /// `vec_norm(v: Vector) -> Scalar`（L2 ノルム）。
@@ -262,6 +266,24 @@ pub enum BuiltinFn {
     VecSum,
     /// `vec_div(v: Vector, s: Scalar) -> Vector`（成分ごとの除算）。
     VecDiv,
+    /// `abs(x: Scalar) -> Scalar`。
+    Abs,
+    /// `round(x: Scalar) -> Scalar`（1 引数形。`round` は arity で `Round1`／
+    /// `Round2` へオーバーロード解決される。[`bind_call`] 参照）。
+    Round1,
+    /// `round(x: Scalar, n: Scalar) -> Scalar`（2 引数形。小数点以下 `n` 桁）。
+    Round2,
+    /// `floor(x: Scalar) -> Scalar`。
+    Floor,
+    /// `ceil(x: Scalar) -> Scalar`（`ceiling` はこの variant の別名として解決
+    /// される）。
+    Ceil,
+    /// `mod(x: Scalar, y: Scalar) -> Scalar`（剰余。符号は被除数に従う）。
+    Mod,
+    /// `power(x: Scalar, y: Scalar) -> Scalar`。
+    Power,
+    /// `sqrt(x: Scalar) -> Scalar`。
+    Sqrt,
 }
 
 /// `name` が組み込み関数（[`BuiltinFn`]）の名前かどうかを判定する。`pub(crate)`:
@@ -269,9 +291,11 @@ pub enum BuiltinFn {
 /// `Expr::Call` を束縛より**前**に検査し、組み込み関数以外（セッション UDF・
 /// WASM UDF・未知関数）の呼び出しを `42601` として拒否するために使う
 /// （空の [`UdfRegistry`] で束縛すると「未知の関数」として `22000` へ丸まって
-/// しまい、CHECK の禁止要素として区別できないため）。
+/// しまい、CHECK の禁止要素として区別できないため）。`round` は arity で
+/// `Round1`／`Round2` へオーバーロード解決されるため [`builtin_from_name`] の
+/// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
 pub(crate) fn is_builtin_function_name(name: &str) -> bool {
-    builtin_from_name(name).is_some()
+    builtin_from_name(name).is_some() || name.eq_ignore_ascii_case("round")
 }
 
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
@@ -279,6 +303,16 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "vec_norm" => Some(BuiltinFn::VecNorm),
         "vec_sum" => Some(BuiltinFn::VecSum),
         "vec_div" => Some(BuiltinFn::VecDiv),
+        "abs" => Some(BuiltinFn::Abs),
+        "floor" => Some(BuiltinFn::Floor),
+        "ceil" | "ceiling" => Some(BuiltinFn::Ceil),
+        "mod" => Some(BuiltinFn::Mod),
+        "power" => Some(BuiltinFn::Power),
+        "sqrt" => Some(BuiltinFn::Sqrt),
+        // `round` は arity オーバーロード（1 引数／2 引数）のため、名前だけでは
+        // 一意に variant を決定できない。呼び出し元（`bind_call`・
+        // `validate_closed_expr`）が引数個数を見て `Round1`／`Round2` を
+        // 個別に解決する（[`is_builtin_function_name`] 参照）。
         _ => None,
     }
 }
@@ -292,6 +326,37 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::VecNorm => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecSum => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
+        BuiltinFn::Abs => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Round1 => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Round2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Floor => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Ceil => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Mod => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Power => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Sqrt => (&[ExprType::Scalar], ExprType::Scalar),
+    }
+}
+
+/// [`BuiltinFn`] が定数畳み込み（`sql::expr_program::try_fold_scalar`）の対象に
+/// なりうるかを判定する。行依存（`VectorRef`・行 `id`）を引数に取りうる・
+/// 非決定的な関数は対象外にする。`_ =>` を使わない網羅 `match` にすることで、
+/// 将来 `BuiltinFn` に variant を追加した際にここへの追随漏れをコンパイル
+/// エラーとして検出できるようにする（AC3・security.md「不安全な設計」対応の
+/// ための明示化）。
+pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
+    match f {
+        // Vector を引数に取る組み込みは、実引数が定数（`Number`）になることが
+        // 実務上ない（`vec_norm` 等は常に `VectorRef` を受け取る）ため、
+        // 畳み込み対象に含める意味がない。
+        BuiltinFn::VecNorm | BuiltinFn::VecSum | BuiltinFn::VecDiv => false,
+        BuiltinFn::Abs
+        | BuiltinFn::Round1
+        | BuiltinFn::Round2
+        | BuiltinFn::Floor
+        | BuiltinFn::Ceil
+        | BuiltinFn::Mod
+        | BuiltinFn::Power
+        | BuiltinFn::Sqrt => true,
     }
 }
 
@@ -313,8 +378,33 @@ pub(crate) const MAX_BUILTIN_ARITY: usize = 2;
 fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(upper.as_str(), "VISIBLE" | "HYBRID_RRF" | "HYBRID")
-        || builtin_from_name(name).is_some()
+        || is_builtin_function_name(name)
+        || is_non_deterministic_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
+}
+
+/// 非決定的関数名（現在時刻・乱数）の一覧（SQL-26。ポインタ:
+/// `docs/spec/04-behavior/sql-surface.md` SQL-26）。これらは束縛時に常に
+/// 「未知の関数」（`22000`。[`bind_call`] の既定フォールバック）として拒否され、
+/// かつ UDF 名としても予約する（[`is_reserved_function_name`]）ことで、同一
+/// 文中で時刻・乱数が複数回評価され結果が食い違う余地を構造的になくす
+/// （非決定的関数を受理しないことで「1 文の中で時刻を固定するか」という論点が
+/// そもそも生じない）。
+fn is_non_deterministic_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "now"
+            | "current_timestamp"
+            | "current_date"
+            | "current_time"
+            | "localtime"
+            | "localtimestamp"
+            | "clock_timestamp"
+            | "statement_timestamp"
+            | "transaction_timestamp"
+            | "timeofday"
+            | "random"
+    )
 }
 
 /// セッション内で登録された宣言的 UDF 1 件。本体は構文段の [`Expr`]（パラメータ参照は
@@ -552,7 +642,18 @@ fn validate_closed_expr(
             // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
             // 引数数不一致の関数本体が「定義時検証」という公開契約に反して登録
             // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
-            if let Some(builtin) = builtin_from_name(name) {
+            if name.eq_ignore_ascii_case("round") {
+                // `round` は arity オーバーロード（1／2 引数）。他の組み込みと
+                // 異なり単一の `BuiltinFn` に定まらないため、ここでは引数個数の
+                // 妥当性のみ検査する（実際の variant 解決は呼び出し時の
+                // `bind_call` が行う）。
+                if !(1..=2).contains(&args.len()) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "function {name} expects 1 or 2 argument(s), got {}",
+                        args.len()
+                    )));
+                }
+            } else if let Some(builtin) = builtin_from_name(name) {
                 let (param_types, _ret) = builtin_signature(builtin);
                 if args.len() != param_types.len() {
                     return Err(SqlSurfaceError::invalid_input(format!(
@@ -855,6 +956,40 @@ fn bind_call(
             "too many call arguments",
         ));
     }
+    if name.eq_ignore_ascii_case("round") {
+        // `round` は arity オーバーロード（SQL-26）: 1 引数形は
+        // `BuiltinFn::Round1`、2 引数形（小数点以下 `n` 桁）は `BuiltinFn::Round2`
+        // へ解決する。他の組み込みのように `builtin_from_name` 1 個には
+        // 定まらないため、ここで名前を先に見て arity から variant を選ぶ。
+        let builtin = match args.len() {
+            1 => BuiltinFn::Round1,
+            2 => BuiltinFn::Round2,
+            n => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "function round expects 1 or 2 argument(s), got {n}"
+                )));
+            }
+        };
+        let (param_types, ret) = builtin_signature(builtin);
+        let mut bound_args = Vec::with_capacity(args.len());
+        for (a, expected) in args.iter().zip(param_types.iter()) {
+            let (b, ty) = bind_expr_in(a, env, node_budget)?;
+            if ty != *expected {
+                return Err(SqlSurfaceError::invalid_input(
+                    "function round argument type mismatch",
+                ));
+            }
+            bound_args.push(b);
+        }
+        return Ok((
+            BoundExpr::Builtin {
+                f: builtin,
+                args: bound_args,
+            },
+            ret,
+        ));
+    }
+
     if let Some(builtin) = builtin_from_name(name) {
         let (param_types, ret) = builtin_signature(builtin);
         if args.len() != param_types.len() {
@@ -1094,6 +1229,41 @@ pub(crate) fn apply_builtin<'a>(
                 out.push(r32);
             }
             Ok(ExprValue::Vector(Cow::Owned(out)))
+        }
+        BuiltinFn::Abs => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::abs(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Round1 => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::round1(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Round2 => {
+            let x = take_scalar_arg(args, 0)?;
+            let n = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::round2(x, n).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Floor => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::floor(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Ceil => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::ceil(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Mod => {
+            let x = take_scalar_arg(args, 0)?;
+            let y = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::modulo(x, y).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Power => {
+            let x = take_scalar_arg(args, 0)?;
+            let y = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::power(x, y).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Sqrt => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::sqrt(x).map(ExprValue::Scalar)
         }
     }
 }
@@ -1816,7 +1986,19 @@ mod tests {
     /// fail-closed に拒否する）と乖離しないようにする。
     #[test]
     fn builtin_arities_fit_max_arity() {
-        for f in [BuiltinFn::VecNorm, BuiltinFn::VecSum, BuiltinFn::VecDiv] {
+        for f in [
+            BuiltinFn::VecNorm,
+            BuiltinFn::VecSum,
+            BuiltinFn::VecDiv,
+            BuiltinFn::Abs,
+            BuiltinFn::Round1,
+            BuiltinFn::Round2,
+            BuiltinFn::Floor,
+            BuiltinFn::Ceil,
+            BuiltinFn::Mod,
+            BuiltinFn::Power,
+            BuiltinFn::Sqrt,
+        ] {
             let (params, _) = builtin_signature(f);
             assert!(
                 params.len() <= MAX_BUILTIN_ARITY,
@@ -1842,5 +2024,163 @@ mod tests {
             ExprValue::Scalar(v) => assert!((v - 5.0).abs() < 1e-9),
             other => panic!("expected scalar, got {other:?}"),
         }
+    }
+
+    // --- 数値スカラー関数群（Issue #920・SQL-26） -------------------------------
+
+    #[test]
+    fn round_resolves_to_round1_for_a_single_argument() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(
+            &call("round", vec![num("2.5")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind should succeed");
+        assert_eq!(ty, ExprType::Scalar);
+        assert!(matches!(
+            bound,
+            BoundExpr::Builtin {
+                f: BuiltinFn::Round1,
+                ..
+            }
+        ));
+        let value = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval should succeed");
+        assert_eq!(value, ExprValue::Scalar(3.0));
+    }
+
+    #[test]
+    fn round_resolves_to_round2_for_two_arguments() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _) = bind_expr(
+            &call("round", vec![num("3.14159"), num("2")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind should succeed");
+        assert!(matches!(
+            bound,
+            BoundExpr::Builtin {
+                f: BuiltinFn::Round2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn round_with_wrong_arity_is_rejected_at_bind_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&call("round", vec![]), &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn numeric_builtin_functions_evaluate_end_to_end() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let cases: &[(&str, Vec<Expr>, f64)] = &[
+            ("abs", vec![bin(BinOp::Sub, num("0"), num("3"))], 3.0),
+            ("floor", vec![num("2.9")], 2.0),
+            ("ceil", vec![num("2.1")], 3.0),
+            ("ceiling", vec![num("2.1")], 3.0),
+            ("sqrt", vec![num("9")], 3.0),
+        ];
+        for (name, args, expected) in cases {
+            let mut budget = MAX_EXPR_NODES;
+            let (bound, ty) = bind_expr(&call(name, args.clone()), &schema, &registry, &mut budget)
+                .unwrap_or_else(|e| panic!("bind {name} should succeed: {e:?}"));
+            assert_eq!(ty, ExprType::Scalar);
+            let value = eval(&bound, 1, &[0.0, 0.0, 0.0])
+                .unwrap_or_else(|e| panic!("eval {name} should succeed: {e:?}"));
+            assert_eq!(value, ExprValue::Scalar(*expected), "function {name}");
+        }
+
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _) = bind_expr(
+            &call("mod", vec![num("5"), num("3")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind mod should succeed");
+        assert_eq!(
+            eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(2.0)
+        );
+
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _) = bind_expr(
+            &call("power", vec![num("2"), num("10")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind power should succeed");
+        assert_eq!(
+            eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap(),
+            ExprValue::Scalar(1024.0)
+        );
+    }
+
+    #[test]
+    fn power_overflow_is_rejected_with_numeric_out_of_range_at_eval_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _) = bind_expr(
+            &call("power", vec![num("10"), num("400")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind should succeed");
+        let err = eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap_err();
+        assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn sqrt_of_negative_is_rejected_with_22000_at_eval_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = call("sqrt", vec![bin(BinOp::Sub, num("0"), num("1"))]);
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        let err = eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn defining_a_udf_named_round_is_rejected_as_reserved() {
+        let mut registry = UdfRegistry::default();
+        let err =
+            define_function(&mut registry, "round", &["x".to_string()], &ident("x")).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn defining_a_udf_named_after_a_non_deterministic_function_is_rejected() {
+        let mut registry = UdfRegistry::default();
+        for name in ["now", "random", "current_timestamp"] {
+            let err = define_function(&mut registry, name, &[], &num("1.0")).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "function name {name}");
+        }
+    }
+
+    #[test]
+    fn calling_a_non_deterministic_function_is_rejected_with_22000() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&call("now", vec![]), &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 }
