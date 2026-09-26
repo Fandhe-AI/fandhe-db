@@ -90,8 +90,9 @@
 //!   Issue #965）まで実装済み。`SSLRequest` への `'S'` 応答・接続への実結線
 //!   （[`tls::stream::TlsStream`]・`handshake.rs` の二段ネゴシエーション）は
 //!   Issue #966（詳細は `docs/design/tls-wire-connection.md`）。CLI からの
-//!   証明書・鍵読み込み（#967）・HTTPS 表層（#968）・実クライアント接続試験
-//!   （#969）・channel binding（#970）はいずれも後続 sub-issue の担当
+//!   証明書・鍵読み込み（#967）・HTTPS 表層（#968）・channel binding
+//!   （#970）は実装済み。実クライアント接続試験（#969）は後続 sub-issue の
+//!   担当
 //! - [`wire_stream`][]: 認証後接続ハンドラが読み書きするストリームの抽象
 //!   [`wire_stream::WireStream`]（`Read + Write` + タイムアウト設定・
 //!   shutdown・緊急応答用複製・終了処理）。`TcpStream`（平文）・

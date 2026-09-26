@@ -21,9 +21,11 @@
 //! - R4: `--tls-mode allow` は TLS 完走・平文完走の双方が成立し、ログは
 //!   `mode=allow` になること
 //! - R5: 組合せ不正・値欠落・重複指定・読み込み失敗（存在しないファイル・
-//!   不正な PEM・鍵と証明書の公開鍵不一致・期限切れ証明書）・
-//!   `--surface nosql` との併用はいずれも非 0 終了・フラグ名を含む説明が
-//!   出ること
+//!   不正な PEM・鍵と証明書の公開鍵不一致・期限切れ証明書）はいずれも
+//!   非 0 終了・フラグ名を含む説明が出ること。`--surface nosql` との併用は
+//!   Issue #968 で HTTPS 終端へ置き換え済み
+//!   （`tls_with_nosql_surface_serves_https`。層 A 網羅は
+//!   `tests/http10_tls_surface.rs`）
 //! - R6: 非ループバック bind × `allow` は非 0 終了し hint 行が出ること
 //! - R7: R2・R5 の stderr に鍵・証明書の内容（seed の hex・PKCS#8 の
 //!   base64 本文・証明書 PEM の本文）が含まれないこと
@@ -754,25 +756,152 @@ fn tls_expired_certificate_is_rejected() {
     );
 }
 
+/// `POST <target>` の HTTP/1.1 要求バイト列を組み立てる（`http_common::
+/// build_request` の最小限のコピー。本ファイルは `http_common` を取り込む
+/// 構成ではないため、CLI 結合テストの流儀（自己完結したヘルパー）に合わせて
+/// 複製する）。
+fn build_http_request(target: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"POST ");
+    out.extend_from_slice(target.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    for (name, value) in headers {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    out
+}
+
+/// 受信済みバイト列が完全な 1 応答（ヘッダ終端＋`Content-Length` ぶんの
+/// 本文）になっていれば、その総バイト長を返す（`TlsTestChannel::read` が
+/// `close_notify` レコードに到達すると `read_application_data` が panic
+/// するため、応答受信後に追加で `read` を呼ばない設計が必要。
+/// `http10_tls_surface.rs::complete_response_len` と同じ実装）。
+fn complete_http_response_len(bytes: &[u8]) -> Option<usize> {
+    let sep = bytes.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(bytes.get(..sep)?).ok()?;
+    let content_length: usize = head
+        .split("\r\n")
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|v| v.parse().ok())?;
+    Some(sep + 4 + content_length)
+}
+
+/// TLS チャネル上で 1 応答ぶんちょうど読み切り、`HTTP/1.1 <status>` 行を返す。
+fn read_one_http_status_line(channel: &mut (impl Read + Write)) -> String {
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(total) = complete_http_response_len(&received) {
+            if received.len() >= total {
+                break;
+            }
+        }
+        let n = channel.read(&mut buf).expect("read response chunk");
+        assert!(
+            n > 0,
+            "connection closed before a complete response arrived"
+        );
+        received.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&received);
+    text.lines()
+        .next()
+        .expect("status line present")
+        .to_string()
+}
+
+// --- #968: NoSQL 表層も同じ TLS opt-in で HTTPS 終端する -------------------
+
+/// R5 の旧テスト（`tls_with_nosql_surface_is_rejected`）は Issue #968 で
+/// 置き換え済み: `--surface nosql` は `--tls-cert`／`--tls-key`／
+/// `--tls-mode` を SQL 表層と同じ意味で受理し、HTTP リスナーを HTTPS として
+/// 終端する（`wire_server::http::tls_transport`）。接続処理の中身（TLS／
+/// 平文判定・ハンドシェイク・上限超過時の挙動等）の層 A 網羅は
+/// `tests/http10_tls_surface.rs` が担い、本テストは CLI 結線（起動ログ・
+/// 実バイナリ経由での TLS 完走・平文拒否）の外形のみを確認する。
 #[test]
-fn tls_with_nosql_surface_is_rejected() {
+fn tls_with_nosql_surface_serves_https() {
     let fixture = TempFixtureDir::new("r5-nosql");
     write_user_store_with_alice(&fixture.path("users.txt"));
     let (cert_path, key_path) = write_valid_tls_pair(&fixture);
-    assert_startup_rejected(
-        &[
-            "--users",
-            &fixture.path_str("users.txt"),
-            "--db",
-            &fixture.db_path_str(),
-            "--surface",
-            "nosql",
-            "--tls-cert",
-            cert_path.to_str().expect("utf-8 path"),
-            "--tls-key",
-            key_path.to_str().expect("utf-8 path"),
-        ],
+
+    let mut server = common::SpawnedServer::spawn(&[
+        "--users",
+        &fixture.path_str("users.txt"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--surface",
         "nosql",
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+    ]);
+    let addr = server
+        .wait_for_listening(Instant::now() + Duration::from_secs(10))
+        .expect("server must reach listening state")
+        .parse::<std::net::SocketAddr>()
+        .expect("valid addr");
+
+    // TLS 経路: ハンドシェイク → `/v1/session` が 200 で完走すること。
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let client = tls_client::drive_client_handshake_over_socket(&mut socket);
+    let mut channel = tls_client::TlsTestChannel::new(client, socket);
+    let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
+    let request = build_http_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", &login_body.len().to_string()),
+        ],
+        login_body,
+    );
+    channel
+        .write_all(&request)
+        .expect("write session request over tls");
+    let status_line = read_one_http_status_line(&mut channel);
+    assert_eq!(
+        status_line, "HTTP/1.1 200 OK",
+        "nosql surface must terminate TLS and complete /v1/session"
+    );
+    drop(channel);
+
+    // 平文経路: `--tls-mode` 未指定＝既定 `require` の下では、TLS
+    // ハンドシェイクを経ない平文 HTTP 接続へ一切応答しない。
+    let mut plaintext = TcpStream::connect(addr).expect("connect plaintext");
+    plaintext
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let _ = plaintext.write_all(&request);
+    let mut buf = [0u8; 8];
+    match plaintext.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => {
+            panic!("expected no HTTP response over plaintext when tls-mode=require, got {other:?}")
+        }
+    }
+
+    let lines = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        lines.iter().any(|l| l.contains("surface nosql")),
+        "expected a 'surface nosql' line, got: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("TLS enabled (mode=require)")),
+        "expected a 'TLS enabled (mode=require)' line, got: {lines:?}"
     );
 }
 

@@ -38,6 +38,13 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// 拒否応答自体が accept ループのブロッキング点にならないよう小さく設定する。
 pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// NoSQL 表層で TLS 構成済み・`--tls-mode allow` の下、同時接続数上限超過時に
+/// 平文／TLS を判別するための先頭バイト `peek` に適用する読み取りタイムアウト
+/// （Issue #968 codex-review P1 是正。`docs/design/tls-wire-connection.md`
+/// 「HTTPS 表層」節）。`REJECT_WRITE_TIMEOUT` と同じ理由（拒否経路が accept
+/// ループ・`RejectWorkerLimiter` の枠を無期限に占有しない）で小さく設定する。
+pub const REJECT_TLS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// commit 成功境界を跨いだ panic 発生時に緊急応答（TASK-153・ERR-1・ERR-5 の
 /// `crate::error_response::encode_with_detail` が組み立てる `S`/`C`/`M`＋`D`
 /// （`D`=`crate::error_response::MAY_BE_COMMITTED_DETAIL`）の ErrorResponse。

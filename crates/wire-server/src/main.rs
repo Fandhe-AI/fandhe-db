@@ -119,18 +119,16 @@
 //! 安全側）は `--tls-cert`／`--tls-key` を指定したときのみ意味を持ち、単独
 //! 指定は組合せ不正として fail-closed 拒否する（`--hnsw-*` が
 //! `--search-engine` を要求するのと同じ設計）。`--surface nosql` との併用も
-//! 拒否する（HTTP リスナーは #968 まで平文のまま。TLS フラグと組み合わせると
-//! bind ガードだけが `TlsRequired`／`TlsOptional` へ緩み、HTTP-10 が意図しない
-//! 経路で平文 HTTP が非ループバックへ露出しうるため）。`bind_guard::
+//! 同じ意味で受理する（Issue #968。HTTP リスナーも先頭バイトで TLS／平文を
+//! 判定し HTTPS として終端する。`wire_server::http::tls_transport` 参照。
+//! `require` の下では平文 HTTP 接続へ一切応答せず切断する）。`bind_guard::
 //! TransportSecurity` は TLS 未指定時 `Cleartext`、`require` 選択時
 //! `TlsRequired`（非ループバック bind を許可。WIRE-9 を満たす）、`allow` 選択時
 //! `TlsOptional`（`Cleartext` と同じくループバック限定。D1: `allow` は平文
 //! 接続を受理する以上、非ループバックでは WIRE-9 を満たせないため警告のみで
 //! 済ませず起動を拒否する。`docs/design/tls-wire-connection.md` 参照）。
 //! TLS 有効時は起動ログへ `TLS enabled (mode=...)` の 1 行のみを出す
-//! （鍵・証明書の内容は出さない）。`SSLRequest` への `'S'` 応答・TLS
-//! ハンドシェイク本体（Issue #965・#966）・実クライアント接続試験（#969）は
-//! 本 Issue の対象外のまま。
+//! （鍵・証明書の内容は出さない）。
 //!
 //! `--tls-scram-channel-binding`（`enable`／`disable`。未指定時の既定は
 //! `disable`。Issue #970・WIRE-18 ポインタ）: SCRAM-SHA-256-PLUS
@@ -762,21 +760,14 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // D5: NoSQL 表層（HTTP リスナー）は #968 まで平文のまま TLS を結線して
-    // いない。TLS フラグと `--surface nosql` を組み合わせると bind ガード
-    // だけが `TlsRequired`／`TlsOptional` へ緩み、実際には平文の HTTP が
-    // 非ループバックへ露出しうる（HTTP-10 違反）ため、`--auth-method
-    // scram-sha-256 × nosql` と同じ場所・同じ流儀で起動時に拒否する。
-    if tls_options.is_some() && surface == wire_server::surface::Surface::Nosql {
-        eprintln!(
-            "wire-server: {}/{} cannot be combined with {} nosql (NoSQL surface does not yet \
-             terminate TLS; see HTTP-9/HTTP-10)",
-            wire_server::tls_opt::CERT_FLAG,
-            wire_server::tls_opt::KEY_FLAG,
-            wire_server::surface::FLAG
-        );
-        return ExitCode::FAILURE;
-    }
+    // 旧 D5（NoSQL 表層は TLS 未結線として起動を拒否）は Issue #968 で置き換え
+    // 済み: `--surface nosql` も `--tls-cert`／`--tls-key`／`--tls-mode` を
+    // SQL 表層と同じ意味で受理し、HTTP リスナーを HTTPS として終端する
+    // （`http::listener::accept_loop_with_router_tls`。詳細は
+    // `docs/design/tls-wire-connection.md`「HTTPS 表層（#968）」節）。
+    // `--auth-method scram-sha-256 × nosql`（SASL 往復を持たないため別方式の
+    // 新設を禁じる HTTP-10 により対応しない）とは独立の判断であり、上の
+    // 拒否は変更しない。
 
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
@@ -1100,9 +1091,10 @@ fn run_server(args: &[String]) -> ExitCode {
     match surface {
         wire_server::surface::Surface::Sql => {
             // Issue #967: TLS 有効時は `accept_loop_with_tls_mode` へ切り替える
-            // （`tls_options` は D5 により `Surface::Nosql` と同時に `Some` へは
-            // ならない）。無効時は従来どおり `accept_loop_with_engine` を呼び、
-            // 既存経路とビット同一のまま維持する。
+            // （`Surface::Sql` 分岐。`Surface::Nosql` は Issue #968 で TLS 併用が
+            // 許可されており独自の accept ループへ分岐する。旧 D5 の
+            // 併用拒否は撤廃済み）。無効時は従来どおり `accept_loop_with_engine`
+            // を呼び、既存経路とビット同一のまま維持する。
             match (&tls_config, &tls_options) {
                 (Some(cfg), Some((_, _, mode, _))) => {
                     server::accept_loop_with_tls_mode(
@@ -1141,12 +1133,32 @@ fn run_server(args: &[String]) -> ExitCode {
                 sessions,
                 Arc::clone(&core),
             );
-            wire_server::http::listener::accept_loop_with_router(
-                listener,
-                limiter,
-                limits::READ_TIMEOUT,
-                router,
-            );
+            // Issue #968: TLS 有効時は `accept_loop_with_router_tls` へ切り替える
+            // （SQL 表層の `accept_loop_with_tls_mode` 分岐と同じ流儀。
+            // `tls_config`／`tls_options` は D3・D4 の組合せ検証を経て両方
+            // `Some` のときのみ意味を持つ）。無効時は従来どおり
+            // `accept_loop_with_router` を呼び、既存経路とビット同一のまま
+            // 維持する。
+            match (&tls_config, &tls_options) {
+                (Some(cfg), Some((_, _, mode, _))) => {
+                    wire_server::http::listener::accept_loop_with_router_tls(
+                        listener,
+                        limiter,
+                        limits::READ_TIMEOUT,
+                        router,
+                        Arc::clone(cfg),
+                        *mode,
+                    );
+                }
+                _ => {
+                    wire_server::http::listener::accept_loop_with_router(
+                        listener,
+                        limiter,
+                        limits::READ_TIMEOUT,
+                        router,
+                    );
+                }
+            }
         }
     }
     ExitCode::SUCCESS

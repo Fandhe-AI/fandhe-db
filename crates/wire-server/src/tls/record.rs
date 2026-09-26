@@ -23,8 +23,9 @@
 //! - alert の送出・状態機械・middlebox 互換 `ChangeCipherSpec` の破棄判定は
 //!   #965 が担う。本モジュールは [`AlertDescription`] という定型コードの
 //!   対応表を提供するのみで、実際に alert を送出しない
-//! - 接続経路（`handshake.rs`・`server.rs`）への組み込みは #966・#968 が担う。
-//!   本 Issue（#952）の時点では未接続のまま維持する
+//! - 接続経路（`handshake.rs`・`server.rs`・`http::tls_transport`）への
+//!   組み込みは本 Issue（#952）の時点では未接続だったが、#966（pg wire）・
+//!   #968（NoSQL 表層）で実装済み
 //!
 //! 定数時間についての整理: レコードヘッダ（type・version・length）は通信路上で
 //! 公開されている値であり、それによる分岐は秘密値に依存しない。本モジュールは

@@ -47,10 +47,19 @@ RLS-7・RLS-9・TABLE-12。
 
 ## 転送路の共通規則
 
-`wire-server --users <path> --db <path> --surface nosql [--bind <addr:port>]` で
-起動する。`--users`・`--db` は必須（fail-closed。省略時は起動しない）。`--bind`
-の既定値は `127.0.0.1:5432`。TLS 未構成時は非ループバックアドレスへの bind を
-起動時に拒否する（loopback 限定）。
+`wire-server --users <path> --db <path> --surface nosql [--bind <addr:port>]
+[--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]]` で起動する。
+`--users`・`--db` は必須（fail-closed。省略時は起動しない）。`--bind` の既定値は
+`127.0.0.1:5432`。TLS 未構成時は非ループバックアドレスへの bind を起動時に
+拒否する（loopback 限定）。
+
+`--tls-cert`／`--tls-key`／`--tls-mode` は SQL 表層（pg wire）と同じ意味で
+NoSQL 表層にも適用される（Issue #968）。HTTP には `SSLRequest` のような明示
+ネゴシエーションが無いため、接続受理直後の先頭バイトで TLS レコード
+（`0x16`）か平文 HTTP かを判定し、TLS と判定した接続だけをハンドシェイクへ
+進める。`--tls-mode require`（既定）の下では平文 HTTP 接続へ要求を解釈せず
+応答なしで切断し、`allow` の下では平文・TLS の双方を受理する。TLS 構成時は
+非ループバックアドレスへの bind が許可される（WIRE-9）。
 
 要求の受理条件（いずれも接続ハンドラ層で判定し、違反はすべて `08P01`）:
 

@@ -291,11 +291,18 @@ CLI 引数です。`--tls-cert`（サーバー証明書チェーン PEM）・`--
 
 TLS 有効時は起動ログへ `TLS enabled (mode=require|allow)` の 1 行のみを
 出します（未指定時はこの行を一切出さず、既存の起動ログはビット同一の
-まま不変です）。`--surface nosql`（HTTP リスナー）との併用は現時点では
-拒否されます（NoSQL 表層はまだ TLS を終端しないため。Issue #968 で対応
-予定）。実クライアント（psql・openssl s_client 等）での接続試験は
-Issue #969 の担当です。詳細は `docs/design/tls-wire-connection.md` を
-参照してください。
+まま不変です）。`--surface nosql`（HTTP リスナー）も同じ意味で TLS を
+受理し、HTTPS として終端します（Issue #968）。NoSQL 表層は HTTP に
+`SSLRequest` のような明示ネゴシエーションが無いため、接続受理直後の
+先頭バイトで TLS レコード（`0x16`）か平文 HTTP かを判定します。`require`
+の下では平文 HTTP 接続へ要求を解釈せず応答なしで切断し、`allow` の下では
+平文・TLS の双方を受理します。TLS 構成時に同時接続数上限を超えた接続は、
+`allow` では平文と判定した接続に限り既存の平文 503 応答を維持し、TLS
+レコードと判定した接続はハンドシェイクをせず無応答で切断します。`require`
+では平文・TLS いずれの接続も要求を解釈せず無応答で切断します。実
+クライアント（psql・openssl s_client・curl 等）での接続試験は
+Issue #969・#968 の担当です。詳細は
+`docs/design/tls-wire-connection.md` を参照してください。
 
 `--tls-scram-channel-binding`（`enable`／`disable`。Issue #970・WIRE-18
 ポインタ）は SCRAM-SHA-256-PLUS（`p=tls-server-end-point`。RFC 5929 §4）

@@ -82,6 +82,11 @@
 //! - [`response`]: ステータスコード＋JSON 本文 → HTTP/1.1 応答バイト列
 //!   （ステータス行・`Connection: close`・`Content-Type`／`Content-Length`・
 //!   CRLF の組み立て。Issue #746・HTTP-2・HTTP-3・ERR-4・ERR-5）
+//! - [`tls_transport`]: `--surface nosql` を TLS opt-in（`--tls-cert`／
+//!   `--tls-key`／`--tls-mode`）と組み合わせたときの接続 1 本の TLS 終端
+//!   （先頭バイトで TLS／平文を判定 → ハンドシェイク → `conn::
+//!   handle_connection_with` への委譲。Issue #968・親 #941・TASK-228。
+//!   対象ビヘイビア WIRE-9・HTTP-9・HTTP-10）
 //!
 //! 後続 Issue で追加予定（本モジュールでは未実装）:
 //! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
@@ -97,6 +102,7 @@
 pub mod body;
 pub(crate) mod conn;
 pub mod date;
+pub(crate) mod deadline_stream;
 pub mod error_body;
 pub mod headers;
 pub mod listener;
@@ -106,3 +112,4 @@ pub mod response;
 pub mod router;
 pub mod session;
 pub mod status;
+pub(crate) mod tls_transport;

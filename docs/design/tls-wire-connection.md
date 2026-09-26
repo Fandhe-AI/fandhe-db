@@ -162,10 +162,11 @@ pipelined_plaintext_after_ssl_request_is_not_processed_as_startup` で
   の既存ガード（`GuardedBindAddrs::resolve`）と同じ場所・同じ判定順序で
   拒否し、`--tls-mode allow` から `require` への切り替えを促す hint 行を
   `main.rs` が追加で出す。
-- **D5**: `--surface nosql` と TLS フラグの併用は拒否する（HTTP リスナーは
-  #968 まで平文のまま。TLS フラグと組み合わせると bind ガードだけが
-  `TlsRequired`／`TlsOptional` へ緩み、平文 HTTP が非ループバックへ露出
-  しうるため）。
+- **D5（Issue #968 で置き換え済み）**: 当初は `--surface nosql` と TLS
+  フラグの併用を拒否していた（HTTP リスナーが平文のままだと bind ガード
+  だけが `TlsRequired`／`TlsOptional` へ緩み、平文 HTTP が非ループバックへ
+  露出しうるため）。#968 で NoSQL 表層も HTTPS として TLS を終端するように
+  なり、この拒否は撤去した。詳細は本ファイル「HTTPS 表層（#968）」節参照。
 - 依存追加なし。`unsafe` なし。秘密値（鍵の seed・PKCS#8 本文）に依存する
   分岐は作らない。
 
@@ -209,8 +210,96 @@ PKCS#8 DER/PEM 生成（`ed25519_pkcs8_der`／`ed25519_pkcs8_pem`。RFC 8032
 
 - CLI からの証明書・鍵読み込みと平文ポリシーは Issue #967 として実装済み
   （上記「CLI opt-in と平文ポリシー」節参照）
-- HTTPS 表層（#968。`http/` 配下は無変更）
+- HTTPS 表層は Issue #968 として実装済み（下記「HTTPS 表層（#968）」節参照）
 - 実クライアント（psql・openssl s_client 等）3 種での接続試験（#969）
 - channel binding（#970）
 - 緊急応答（RECOVER-6）の TLS 接続対応（engine 側 API の変更が必要。
-  上記「既知の制約」参照）
+  上記「既知の制約」参照。NoSQL 表層の TLS 経路でも同じ制約が残る。
+  下記「HTTPS 表層（#968）」節参照）
+
+## HTTPS 表層（#968）
+
+NoSQL 表層（`--surface nosql`。HTTP/1.1 最小サブセット）へ SQL 表層と同じ
+TLS opt-in（`--tls-cert`／`--tls-key`／`--tls-mode`）を接続した
+（`crates/wire-server/src/http/tls_transport.rs`）。
+
+設計判断（H 番号で記録）:
+
+- **H1（TLS 判定の方式）**: HTTP には `SSLRequest` のような明示ネゴシエー
+  ションが無いため、接続受理直後の先頭 1 バイトを `peek` して判定する
+  （`0x16`＝TLS ハンドシェイクレコードなら TLS、それ以外は平文。HTTP 要求行
+  の先頭にこのバイトは現れないため曖昧さは無い）。判定は純関数
+  `tls_transport::classify_first_byte` に切り出し単体テストで網羅する。
+- **H2（`--tls-mode` の意味）**: `require` は平文と判定した接続へ要求を
+  一切解釈せず・応答も書かずに閉じる。`allow` は平文ハンドラへそのまま
+  進む。bind ガードは SQL 表層と共有済みのため変更なし。
+- **H3（ハンドシェイクの期限）**: SQL 表層と同じ `perform_server_handshake`
+  （`HANDSHAKE_READ_TIMEOUT` 固定）を使う。前後で接続の read/write
+  タイムアウトを退避・復元する（`crate::handshake::handle_tls_upgrade` と
+  同型）。1 接続の占有時間の上限は「ハンドシェイク期限＋要求読み取り期限」
+  で有界になる。
+- **H4（TLS 下の同時接続超過）**: `--tls-mode` で分岐する（codex-review
+  指摘・是正。旧実装は TLS 構成の有無のみで無応答クローズしており、
+  `allow` 下の平文クライアントにも 503 が返らなくなる退行があった）。
+  `require` は平文・TLS レコードいずれでも要求を解釈せず・応答も書かずに
+  閉じる（`require` 下で平文バイト列を送出しないため、かつ TLS
+  ハンドシェイクをしていない相手には意味のない応答になるため）。`allow`
+  は平文接続を受理するモードのため、拒否ワーカー（`RejectWorkerLimiter`
+  で有界化済み）の中で先頭バイトを期限付きで `peek` し、平文なら既存の
+  503／`53300` 応答を維持する。TLS レコードと判定した場合も
+  （codex-review 再指摘・是正。旧実装はハンドシェイクをせず無応答
+  クローズしており、`allow` の下でも HTTPS クライアントだけがこの
+  エラー契約から取り残されていた）ハンドシェイクを完了したうえで同じ
+  503 応答を TLS 上で返す。`RejectWorkerLimiter` の 1 枠＝1 スレッドで
+  既に有界化済みのため、ハンドシェイク自体の絶対期限
+  （`HANDSHAKE_READ_TIMEOUT`）がそのままこの拒否ワーカーの専有時間の
+  上限になる。拒否応答の書き込み後も H8 と同じ `DeadlineStream` を経由
+  させ、トリクル送信によるワーカー専有の無期限化を防ぐ。TLS 未構成時は
+  既存の 503／`53300` 経路とバイト単位で同一のまま。
+- **H5（`--tls-scram-channel-binding enable` × nosql）**: 起動を拒否せず
+  no-op として受理する（`--auth-method cleartext` と組み合わせたときと
+  同じ扱い。NoSQL 表層は SASL 往復を持たないため実際には提示されない）。
+- **H6（EOF の扱いの差）**: `close_notify` を経ない TLS 下層 EOF は
+  `TlsStream` が `UnexpectedEof`／`InvalidData` を返すため、平文なら
+  「宣言長より短い本文」として `08P01` 応答になる経路が、TLS では失敗した
+  ストリームへ応答を書けないため無応答クローズになる（許容する既知の差）。
+  `close_notify` による正常な half-close は平文と同じ応答になる。
+- **H7（終端処理）**: 応答経路（`conn::respond_and_close`）は
+  `drain_and_close` 内の `shutdown_write` が TLS 上では `close_notify` の
+  送出を兼ねる。無応答クローズ経路（`Outcome::CloseSilently`）は
+  `graceful_close`（TLS では `close_notify`。平文では no-op）してから
+  `shutdown_both` する。
+- **H8（TLS 上のトリクル送信に対する絶対期限）**: `tls::stream::TlsStream::
+  read` は 1 レコード分がそろうまで内部で `inner.read` を複数回ループする
+  ため、`http::conn` が `read` 呼び出し前に一度だけ設定するソケット
+  タイムアウトは内部ループの各反復で使い回され、相手が 1 レコードの中身を
+  期限ぎりぎりの間隔で 1 バイトずつ送り続けると 1 回の `read` 呼び出しが
+  「レコード長 × タイムアウト値」まで際限なく延びる（Slowloris の変種。
+  平文経路には無い問題）。`http::deadline_stream::DeadlineStream` で生
+  ソケットを包んでから `TlsStream::new` へ渡すことで是正した。
+  `set_read_timeout` を絶対時刻へ変換して保持し、内部ループから複数回
+  呼ばれる `Read::read` の直前に毎回「残り時間」を下位ソケットへ
+  再設定する。平文経路（`DeadlineStream` を経由しない）は無変更。
+
+既知の制約（対象外として持ち越し）:
+
+- curl 実クライアントとの接続試験（`tests/http10_curl_interop.rs`。
+  `#[ignore]` の手動 gate。CI 常時実行化は対象外）
+- TLS 接続での緊急応答（RECOVER-6）対応（engine 側 API の変更が必要）
+
+追記（codex-review・Cursor Bugbot 指摘の是正。H4 更新）: `conn::
+reject_too_many_connections` は `write_all` 直後の `shutdown(Both)` から、
+`respond_and_close` と同じ「書き込み → 有界 lingering close
+（`drain_and_close`） → drop」の形へ変更した。呼び出し元（`tls_transport::
+serve_connection`／`reject_or_close_over_limit`）は判定のため先頭 1 バイトを
+`peek` 済みで要求本体が未読のまま残るため、旧実装では未読データありの
+クローズにより TCP RST が発生し、送出済みの 503 応答をクライアントが
+読めなくなりうる回帰があった。
+
+`crates/wire-server/tests/http10_tls_surface.rs`（新設・層 A・CI 常時実行）:
+TLS 完走（`/v1/session` → `/v1/query` → `/v1/session/close`）・`require` 下
+での平文拒否・`allow` 下での平文/TLS 双方の受理・不正な ClientHello が
+panic せず後続接続に波及しないことを検証する。`tests/wire_tls_cli.rs::
+tls_with_nosql_surface_serves_https`（旧
+`tls_with_nosql_surface_is_rejected` を置き換え）は CLI 結線の外形
+（起動ログ・TLS 完走・平文拒否）のみを確認する。
