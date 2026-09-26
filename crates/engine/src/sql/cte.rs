@@ -143,10 +143,16 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
         } => (base_table, view_predicates, view_columns),
     };
 
+    // `ParsedViewBody`（CTE 本文）は構文上 `ORDER BY` を持たない
+    // （`sql::allowlist::parse_view_body` のドキュメント参照）ため、
+    // Issue #915・SQL-25 のスカラー ORDER BY 検査は空スライスで無効化する
+    // （主クエリ自身の ORDER BY は `sql::allowlist::build_scan_from_resolved`
+    // 呼び出し側で別途検証する）。
     check_columns_within_view(
         exposed.as_deref(),
         &def.body.projection,
         &def.body.where_predicates,
+        &[],
     )?;
 
     let next_exposed = if let Projection::Columns(cols) = &def.body.projection {

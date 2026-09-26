@@ -1561,6 +1561,7 @@ mod budget_regression_tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit: 10,
+            order_by: Vec::new(),
             offset: 0,
             windows: vec![BoundWindowItem {
                 position: 1,

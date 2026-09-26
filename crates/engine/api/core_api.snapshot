@@ -208,6 +208,10 @@ impl PolicyContext {
     pub fn is_owner(&self, row_tenant: &str) -> bool {
         row_tenant.as_bytes() == self.tenant_id.as_bytes()
     }
+    #[inline]
+    pub(crate) fn allows_public(&self) -> bool {
+        self.allowed.public
+    }
 }
 
 # source: crates/engine/src/policy.rs :: PolicyError

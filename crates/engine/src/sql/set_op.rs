@@ -748,6 +748,7 @@ mod tests {
             projection: Projection::Columns(vec!["body".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
         }))
@@ -956,6 +957,7 @@ mod tests {
             projection: Projection::Columns(vec!["score".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
         }))
