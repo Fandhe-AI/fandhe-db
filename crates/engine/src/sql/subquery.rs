@@ -419,6 +419,18 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
     }
 }
 
+/// [`resolve_in_subquery`] が展開済みの葉と重複判定するための正規化キー
+/// （Cursor Bugbot 指摘対応。`IN` は集合所属であり、同じ値の行が何件
+/// 内側にあっても展開後の述語は 1 個で足りる）。`cell_to_equality_predicate`
+/// が返しうるのは `Equality`（`TEXT`／`ENUM` 列。ラベル文字列をキーにする）・
+/// `BoolEquality`（`BOOLEAN` 列。真偽値をキーにする）のいずれかのみ
+/// （[`inner_value_family`] が事前にこの 2 種類だけを許可する）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InSubqueryDedupKey {
+    Text(String),
+    Bool(bool),
+}
+
 /// `<column> IN (SELECT ...)` を解決する。内側は投影列がちょうど 1 列である
 /// ことを要求し（`22000`）、[`validate_in_target_column`] で対象列
 /// `column`（外側スキーマ）を検証した上で、内側の投影列の値族
@@ -430,8 +442,21 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
 /// セルを [`cell_to_equality_predicate`] で `<column> = <値>` 相当の葉へ
 /// 変換し `WherePredicate::Or` として束ねる（0 行なら空の `Or` ＝常に偽）。
 ///
+/// `IN` は集合所属の判定であり同じ値の重複は結果に影響しないため、
+/// [`InSubqueryDedupKey`] で正規化した値ごとに高々 1 個の葉だけを生成する
+/// （Cursor Bugbot 指摘対応: 以前は内側の行ごとに無条件で葉を積み・葉予算を
+/// 消費していたため、同一ラベルを大量に持つ参照テーブル〔例: 同じラベルが
+/// 257 件〕を `IN` の内側に指定するだけで、実質的な distinct 値が 1 個しか
+/// なくても [`MAX_SUBQUERY_IN_LEAVES`] を使い切って `54000` になり得た）。
+/// 重複排除の集合は「予算内で採用した distinct 値」だけを保持するため
+/// （`in_leaf_budget` を消費した値のみ `seen` へ追加する）、集合自体のサイズは
+/// [`MAX_SUBQUERY_IN_LEAVES`] で自然に有界となる（別途上限を設けない）。
+/// NULL（`cell_to_equality_predicate` が `None` を返す）・語彙外 ENUM ラベル
+/// の除外は重複排除より前に行い、これらは重複排除・葉予算のいずれも
+/// 消費しない（既存の扱いを維持）。
+///
 /// `in_leaf_budget` は文全体で共有する残り葉数予算（[`MAX_SUBQUERY_IN_LEAVES`]
-/// 参照）。生成する葉ごとに 1 消費し、枯渇したら `54000` で拒否する
+/// 参照）。distinct 値ごとに 1 消費し、枯渇したら `54000` で拒否する
 /// （PR #1103 codex-review P1 指摘対応: 内側最大可視行数×内側実行回数上限の
 /// 組合せだけでは、通常の `WHERE` 述語数上限より大きな評価コストを 1 文から
 /// 発生させられた）。
@@ -492,6 +517,7 @@ fn resolve_in_subquery(
     }
 
     let mut branches = Vec::with_capacity(result.rows.len());
+    let mut seen: std::collections::HashSet<InSubqueryDedupKey> = std::collections::HashSet::new();
     for row in &result.rows {
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery row missing projected cell".to_string(),
@@ -514,6 +540,24 @@ fn resolve_in_subquery(
             if !def.contains(value) {
                 continue;
             }
+        }
+        // 重複排除（Cursor Bugbot 指摘対応。[`InSubqueryDedupKey`] ドキュメント
+        // 参照）。同じ正規化値が既に採用済みなら、葉予算を消費せず展開対象
+        // からも除外する（`IN` は集合所属であり同じ値の 2 個目以降の葉は
+        // 冗長）。`inner_value_family` の事前検証により、ここへ到達する
+        // `leaf` は必ず `Equality`／`BoolEquality` のいずれかである。
+        let dedup_key = match &leaf {
+            WherePredicate::Equality { value, .. } => InSubqueryDedupKey::Text(value.clone()),
+            WherePredicate::BoolEquality { value, .. } => InSubqueryDedupKey::Bool(*value),
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "cell_to_equality_predicate returned an unexpected predicate variant"
+                        .to_string(),
+                });
+            }
+        };
+        if !seen.insert(dedup_key) {
+            continue;
         }
         *in_leaf_budget = in_leaf_budget.checked_sub(1).ok_or_else(|| {
             SqlSurfaceError::payload_too_large(format!(

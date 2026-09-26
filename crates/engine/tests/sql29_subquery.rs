@@ -540,6 +540,70 @@ fn in_subquery_expansion_leaf_count_exceeds_limit_is_rejected() {
     ));
 }
 
+// Cursor Bugbot 指摘（Medium）の回帰テスト: `IN` は集合所属の判定であり、
+// 同じ値の内側行が何件あっても展開後の述語は 1 個で足りる。以前は内側の
+// 行ごとに無条件で葉を積み葉予算（`MAX_SUBQUERY_IN_LEAVES` = 256）を
+// 消費していたため、同一ラベルを大量に持つ参照テーブルを `IN` の内側に
+// 指定するだけで、実質的な distinct 値が 1 個しかなくても資源上限
+// エラー（54000）になり得た（多数の重複値 × `LIMIT` 256 超で誤失敗）。
+// 同一値 1,000 件でも成功し、distinct 値 257 件（256 を 1 件超過）でのみ
+// 資源上限エラーになることを固定する。
+
+#[test]
+fn in_subquery_duplicate_values_do_not_exhaust_leaf_budget() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    insert_allowed_lang(&core, &ctx, 0, "ja");
+    // `sql::subquery::MAX_SUBQUERY_IN_LEAVES`（256）を大幅に超える件数の
+    // 同一値（"ja"）を用意する。重複排除が働かなければ、以前の実装では
+    // 257 件目で資源上限エラーになっていた。
+    for i in 1..1_000u64 {
+        insert_allowed_lang(&core, &ctx, i, "ja");
+    }
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT 1000) LIMIT 100"
+        ),
+    );
+    assert_eq!(ids, vec![1]);
+}
+
+#[test]
+fn in_subquery_distinct_values_exceeding_limit_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc(&core, &ctx, 1, "en");
+    // `sql::subquery::MAX_SUBQUERY_IN_LEAVES`（256）をちょうど 1 件超える
+    // distinct 値（257 件）を用意する。重複排除後の distinct 数自体が
+    // 上限を超えるため、資源上限エラーになることを確認する（重複排除の
+    // 有無に関わらず拒否されるべきケース。上の
+    // `in_subquery_duplicate_values_do_not_exhaust_leaf_budget` と対比）。
+    let distinct_count = 257u64;
+    for i in 0..distinct_count {
+        insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
+    }
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {distinct_count}) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        err,
+        engine::sql::allowlist::SqlSurfaceError::PayloadTooLarge { .. }
+    ));
+}
+
 // PR #1103 追加 codex-review P1 指摘の回帰テスト: 対象列が ENUM の場合、
 // 内側の投影値に語彙外のラベルが混ざっていても、それは「一致しない値」
 // として展開対象から除外するだけで、文全体を失敗させてはならない
