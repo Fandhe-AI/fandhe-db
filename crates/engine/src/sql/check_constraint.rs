@@ -123,6 +123,54 @@ fn render_expr(expr: &Expr) -> String {
                 render_expr(rhs)
             )
         }
+        // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）。
+        // いずれも決定的な式のため CHECK 述語での使用を許可する
+        // （`reject_forbidden_expr` 参照）。このテキストは永続化されて
+        // 再パースされるため、`parse(render(x)) == x` の往復を単体テストで
+        // 固定する。
+        Expr::Null => "NULL".to_string(),
+        Expr::Case { whens, else_result } => {
+            let mut s = String::from("(CASE");
+            for (cond, result) in whens {
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    render_condition(cond),
+                    render_expr(result)
+                ));
+            }
+            if let Some(else_result) = else_result {
+                s.push_str(&format!(" ELSE {}", render_expr(else_result)));
+            }
+            s.push_str(" END)");
+            s
+        }
+        Expr::Coalesce(args) => {
+            let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
+            format!("COALESCE({})", rendered_args.join(", "))
+        }
+        Expr::NullIf(lhs, rhs) => {
+            format!("NULLIF({}, {})", render_expr(lhs), render_expr(rhs))
+        }
+    }
+}
+
+/// `CASE WHEN` の条件（許可リストが常に比較の [`Expr::Binary`] に限定する）を、
+/// 周囲を括弧で囲まずレンダリングする（`render_expression_predicate` の
+/// トップレベル比較と同じ形。`sql::allowlist::Parser::parse_case_expr_inner` の
+/// `cond` 文法〔`<value_expr> <cmp_op> <value_expr>`〕は括弧で囲まれた比較全体を
+/// 受理しないため、`render_expr` の `Binary` 腕（常に括弧で囲む）をそのまま
+/// 使うと往復〔`parse(render(x)) == x`〕が壊れる）。
+fn render_condition(cond: &Expr) -> String {
+    match cond {
+        Expr::Binary { op, lhs, rhs } => {
+            format!(
+                "{} {} {}",
+                render_expr(lhs),
+                binop_str(*op),
+                render_expr(rhs)
+            )
+        }
+        other => render_expr(other),
     }
 }
 
@@ -209,6 +257,29 @@ fn reject_forbidden_expr(expr: &Expr) -> Result<(), SqlSurfaceError> {
             reject_forbidden_expr(lhs)?;
             reject_forbidden_expr(rhs)
         }
+        // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
+        // それ自体が決定的なので許可し、子を再帰的に検査する。
+        Expr::Null => Ok(()),
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                reject_forbidden_expr(cond)?;
+                reject_forbidden_expr(result)?;
+            }
+            if let Some(else_result) = else_result {
+                reject_forbidden_expr(else_result)?;
+            }
+            Ok(())
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                reject_forbidden_expr(a)?;
+            }
+            Ok(())
+        }
+        Expr::NullIf(lhs, rhs) => {
+            reject_forbidden_expr(lhs)?;
+            reject_forbidden_expr(rhs)
+        }
     }
 }
 
@@ -256,6 +327,25 @@ fn referenced_column_names(
                 }
             }
             Expr::Binary { lhs, rhs, .. } => {
+                collect_idents(lhs, acc);
+                collect_idents(rhs, acc);
+            }
+            Expr::Null => {}
+            Expr::Case { whens, else_result } => {
+                for (cond, result) in whens {
+                    collect_idents(cond, acc);
+                    collect_idents(result, acc);
+                }
+                if let Some(else_result) = else_result {
+                    collect_idents(else_result, acc);
+                }
+            }
+            Expr::Coalesce(args) => {
+                for a in args {
+                    collect_idents(a, acc);
+                }
+            }
+            Expr::NullIf(lhs, rhs) => {
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
@@ -471,14 +561,7 @@ struct CompiledCheck {
 
 enum CompiledConjunct {
     Declarative(MetadataFilter),
-    /// `references_embedding` は束縛済み [`BoundExpr`]（`udf_call::
-    /// references_embedding`）から前計算した結果。`ExprProgram` はコンパイル後
-    /// 平坦化されたステップ列のみを保持し元の `BoundExpr` 木を持たないため、
-    /// コンパイル時に判定して一緒に保持する。
-    Expr {
-        references_embedding: bool,
-        program: ExprProgram,
-    },
+    Expr { program: ExprProgram },
 }
 
 impl CompiledChecks {
@@ -533,7 +616,6 @@ impl CompiledChecks {
             }
             for expr in &expr_filters {
                 conjuncts.push(CompiledConjunct::Expr {
-                    references_embedding: udf_call::references_embedding(expr),
                     program: ExprProgram::compile(expr),
                 });
             }
@@ -576,7 +658,6 @@ impl CompiledChecks {
                 .map_err(|e| {
                     TenantWriteError::Catalog(crate::catalog::CatalogError::Invalid(e.to_string()))
                 })?;
-        let dim = embedding.len();
         let mut expr_scratch: Vec<StackValue> = Vec::new();
         for check in &self.checks {
             for conjunct in &check.conjuncts {
@@ -588,27 +669,29 @@ impl CompiledChecks {
                             Some(value) => filter.matches(Some(value)),
                         }
                     }
-                    CompiledConjunct::Expr {
-                        references_embedding,
-                        program,
-                    } => {
-                        // `sql/scan.rs` の WHERE 式評価と同じ判断: embedding を
-                        // 参照する式は `VECTOR` 列が NULL（`dim == 0`）の行では
-                        // 評価せず UNKNOWN として扱う。現状の CHECK 式は `id`／
-                        // `VECTOR` 列のみ参照可能（レーン A 未実装）ため、
-                        // embedding を参照しない式は常に有効な値を持つ。
-                        if *references_embedding && dim == 0 {
-                            true
-                        } else {
-                            match program.eval(id, embedding, &mut expr_scratch) {
-                                Ok(ExprValue::Bool(b)) => b,
-                                Ok(_) => {
-                                    // 束縛段（`bind_where_predicates`）が式述語の
-                                    // 型を Bool に限定済みのため到達しない。
-                                    return Err(TenantWriteError::CheckEvaluationFailed);
-                                }
-                                Err(_) => return Err(TenantWriteError::CheckEvaluationFailed),
+                    CompiledConjunct::Expr { program } => {
+                        // `VECTOR` 列が NULL（`dim == 0`）の行を式が実際に参照する
+                        // 場合の NULL（UNKNOWN）伝播は `program.eval` 自身
+                        // （`ExprStep::PushVector` の空スライス判定。
+                        // `sql::expr_program` 参照）が行う（codex-review P1 指摘
+                        // 対応: 静的な式木走査（`references_embedding`）による
+                        // 事前判定は `CASE` の選ばれない分岐に embedding 参照が
+                        // あるだけの行まで誤って UNKNOWN 扱いにしていたため撤去
+                        // し、評価時点の判定へ一本化した）。
+                        match program.eval(id, embedding, &mut expr_scratch) {
+                            Ok(ExprValue::Bool(b)) => b,
+                            // UNKNOWN（NULL）は充足扱いにする（対象ビヘイビア:
+                            // SQL-26。Issue #921。PostgreSQL 互換。上の
+                            // `Declarative` 腕「参照列 NULL は違反にしない」と
+                            // 同じ意図的判断——NULL を返す式を書けるのは DDL
+                            // 権限を持つ主体のみのため制約の迂回にはならない）。
+                            Ok(ExprValue::Null) => true,
+                            Ok(_) => {
+                                // 束縛段（`bind_where_predicates`）が式述語の
+                                // 型を Bool に限定済みのため到達しない。
+                                return Err(TenantWriteError::CheckEvaluationFailed);
                             }
+                            Err(_) => return Err(TenantWriteError::CheckEvaluationFailed),
                         }
                     }
                 };
@@ -924,6 +1007,70 @@ mod tests {
         let schema = schema_of(&v);
         let checks = validate_and_build(&schema, &v.checks).expect("must validate");
         assert_eq!(checks[0].predicate_sql, "kind = 'a' AND body LIKE 'ab%'");
+    }
+
+    /// `render_expr`（`CASE`／`COALESCE`／`NULLIF`。対象ビヘイビア: SQL-26。
+    /// Issue #921）が生成するテキストが再パースで同じ木へ戻ることを固定する
+    /// （このテキストは永続化されて再パースされるため）。CHECK 述語の頂点は
+    /// 常に比較の `Expr::Binary` という既存の構造的保証（`render_expression_predicate`
+    /// docs 参照）に合わせ、`CASE`/`COALESCE`/`NULLIF` は比較の片辺として置く。
+    #[test]
+    fn render_expr_round_trips_case_coalesce_nullif_through_reparse() {
+        use crate::sql::allowlist::{parse_check_predicate_text, WherePredicate};
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        let cases: Vec<Expr> = vec![
+            Expr::Case {
+                whens: vec![(
+                    Expr::Binary {
+                        op: BinOp::Gt,
+                        lhs: Box::new(Expr::Call {
+                            name: "vec_norm".to_string(),
+                            args: vec![Expr::Ident("embedding".to_string())],
+                        }),
+                        rhs: Box::new(Expr::Number("0".to_string())),
+                    },
+                    Expr::Number("1".to_string()),
+                )],
+                else_result: Some(Box::new(Expr::Number("0".to_string()))),
+            },
+            Expr::Case {
+                whens: vec![(
+                    Expr::Binary {
+                        op: BinOp::Gt,
+                        lhs: Box::new(Expr::Ident("id".to_string())),
+                        rhs: Box::new(Expr::Number("1".to_string())),
+                    },
+                    Expr::Number("1".to_string()),
+                )],
+                else_result: None,
+            },
+            Expr::Coalesce(vec![
+                Expr::Null,
+                Expr::Number("1".to_string()),
+                Expr::Number("2".to_string()),
+            ]),
+            Expr::NullIf(
+                Box::new(Expr::Ident("id".to_string())),
+                Box::new(Expr::Number("2".to_string())),
+            ),
+        ];
+
+        for expr in cases {
+            let top = Expr::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(expr.clone()),
+                rhs: Box::new(Expr::Number("1".to_string())),
+            };
+            let rendered = render_expression_predicate(&top);
+            let reparsed = parse_check_predicate_text(&rendered)
+                .unwrap_or_else(|e| panic!("reparse of {rendered:?} failed: {e:?}"));
+            assert_eq!(
+                reparsed,
+                vec![WherePredicate::Expression(top)],
+                "round trip mismatch for rendered text {rendered:?}"
+            );
+        }
     }
 
     #[test]
