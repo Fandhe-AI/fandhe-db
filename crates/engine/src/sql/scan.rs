@@ -1114,19 +1114,31 @@ impl PartialOrd for HeapEntry {
 /// `keys: Vec<Option<OrderValue>>` の配列容量が未計上だと、複数キー・大きい
 /// `LIMIT + OFFSET` で配列本体が `max_result_bytes` の外側に蓄積し得た）。
 fn heap_entry_bytes(entry: &HeapEntry) -> usize {
-    let mut bytes = std::mem::size_of::<HeapEntry>();
-    bytes = bytes.saturating_add(
-        entry
-            .keys
-            .capacity()
-            .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
-    );
+    heap_entry_keys_bytes(entry).saturating_add(heap_entry_fixed_bytes(entry))
+}
+
+/// [`heap_entry_bytes`] のうち `keys`（並べ替えキー配列。TEXT 実体を含む）分
+/// だけを切り出したもの（codex-review PR #1096 追加是正: パス 2 で投影に不要な
+/// `keys` を先行して実際に破棄し、その分だけ先に予算を解放するために分離した。
+/// `keys` 配列自体のヒープ確保量（容量ベース）と TEXT 実体を計上する）。
+fn heap_entry_keys_bytes(entry: &HeapEntry) -> usize {
+    let mut bytes = entry
+        .keys
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
     for key in &entry.keys {
         if let Some(OrderValue::Bytes(b)) = key {
             bytes = bytes.saturating_add(b.len());
         }
     }
-    bytes.saturating_add(entry.tenant_id.len())
+    bytes
+}
+
+/// [`heap_entry_bytes`] のうち `keys` 以外（構造体本体・`tenant_id`）分だけを
+/// 切り出したもの（[`heap_entry_keys_bytes`] と対になる残り。`entry` 自体が
+/// 実際に破棄されるまで生存し続ける部分）。
+fn heap_entry_fixed_bytes(entry: &HeapEntry) -> usize {
+    std::mem::size_of::<HeapEntry>().saturating_add(entry.tenant_id.len())
 }
 
 /// [`BoundScan::order_by`] の先頭キーが疑似列 `id` かどうか（経路 (A) の判定条件の
@@ -1491,10 +1503,18 @@ pub(crate) fn execute_scan_with_budget(
                             // 現在の最悪候補以上（採用されない）。複製せずスキップ。
                             return Ok(None);
                         }
+                        // codex-review PR #1096 追加是正（最新ラウンド）: 採用が
+                        // 決まった時点では最悪候補（`worst`）はまだヒープ内に
+                        // 残っており（`heap.pop()` は複製・push が終わった後で
+                        // 呼ぶ）実メモリ上も生存し続けている。複製前の見積り
+                        // （`predicted`）は、この一時的な同時保持（`worst` を
+                        // 含む現在の `heap_budget` 全体 + 新候補）を基準に照合
+                        // する（`worst` を先に差し引いた残り予算と照合すると、
+                        // 複製〜実際の追い出しまでの間、実際の同時保持量が
+                        // 計上額を超えうる。「計上額 ≥ 実際の同時保持量」を
+                        // 常に保つ不変条件）。
                         let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
-                        let remaining_after_evict =
-                            heap_budget.saturating_sub(heap_entry_bytes(worst));
-                        try_accumulate_budget(remaining_after_evict, predicted, max_result_bytes)?;
+                        try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
                     } else {
                         let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
                         try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
@@ -1523,17 +1543,28 @@ pub(crate) fn execute_scan_with_budget(
                 heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
                 heap.push(candidate);
             } else {
+                // codex-review PR #1096 追加是正（最新ラウンド）: 新候補を先に
+                // 計上・push してから最悪候補を追い出す（追い出し中は新旧
+                // 両方が実際にヒープ内へ同時に存在するため、計上額はこの
+                // 一時的な合計を下回ってはならない。閉包内の
+                // `try_accumulate_budget(heap_budget, predicted, ...)` と
+                // 対称）。追い出した候補（`popped`）は明示的に `drop` して
+                // 実際に破棄したことを確定させてから、その分だけ解放する
+                // （解放が実際の破棄より先に起きないことを保証する。
+                // 「計上額 ≥ 実際の同時保持量」の不変条件）。
+                let bytes = heap_entry_bytes(&candidate);
+                heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                heap.push(candidate);
                 if let Some(popped) = heap.pop() {
-                    heap_budget = heap_budget.checked_sub(heap_entry_bytes(&popped)).ok_or_else(
+                    let popped_bytes = heap_entry_bytes(&popped);
+                    drop(popped);
+                    heap_budget = heap_budget.checked_sub(popped_bytes).ok_or_else(
                         || SqlSurfaceError::Internal {
                             detail: "scan result byte budget underflow while evicting the worst heap candidate"
                                 .to_string(),
                         },
                     )?;
                 }
-                let bytes = heap_entry_bytes(&candidate);
-                heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
-                heap.push(candidate);
             }
         }
 
@@ -1570,84 +1601,40 @@ pub(crate) fn execute_scan_with_budget(
         // `build_visible_row` クロージャが `byte_budget` を排他的に借用する
         // 「前」に完了させる必要があるため（クロージャは存続期間中ずっと
         // 借用を保持し、途中で直接代入できない）、読み飛ばし専用のループを
-        // クロージャ定義より前に独立させている。加算と解放が対称であることを
-        // 保証するため `saturating_sub` ではなく `checked_sub` を使い、対応が
-        // 崩れていれば fail-closed に `Internal` へ落とす（過小申告のまま
-        // 静かに処理を続けない）。
+        // クロージャ定義より前に独立させている。
+        //
+        // codex-review PR #1096 追加是正（最新ラウンド）: 「計上額 ≥ 実際の
+        // 同時保持量」を常に保つため、バイト数は `winner` を実際に `drop`
+        // した**後**に解放する（先に解放すると、まだ実メモリ上に残っている
+        // `winner` を計上から除外したことになり、瞬間的に計上額が実際の
+        // 保持量を下回りうる）。加算と解放が対称であることを保証するため
+        // `saturating_sub` ではなく `checked_sub` を使い、対応が崩れていれば
+        // fail-closed に `Internal` へ落とす（過小申告のまま静かに処理を
+        // 続けない）。
         let mut sorted_winners = heap.into_sorted_vec().into_iter();
         for winner in sorted_winners.by_ref().take(bound.offset) {
-            byte_budget = byte_budget
-                .checked_sub(heap_entry_bytes(&winner))
-                .ok_or_else(|| SqlSurfaceError::Internal {
+            let bytes = heap_entry_bytes(&winner);
+            drop(winner);
+            byte_budget = byte_budget.checked_sub(bytes).ok_or_else(|| {
+                SqlSurfaceError::Internal {
                     detail: "scan result byte budget underflow while releasing an offset-skipped candidate"
                         .to_string(),
-                })?;
+                }
+            })?;
         }
 
         // パス 2: 全順序で確定してから（`BinaryHeap::into_sorted_vec` は
         // `Ord` の昇順。`(tenant_id, id)` が一意な全順序のため安定性は
         // 問題にならない）、同じ read txn 内で勝者のみを再取得し投影する
         // （`sort_unstable_*` を使わない。`make sort-determinism-check`）。
-        // パス 1 のループが終わった後で定義することで、パス 1 の
-        // `with_visible_row` 呼び出し（`embedding_scratch`／
-        // `where_expr_scratch` を直接可変借用）と本クロージャの捕捉が
-        // 重ならないようにする（Issue #915）。
-        // codex-review PR #1096 追加是正（P1）: `winner` は投影後（または
-        // 投影中にエラーで打ち切られた場合も含め）このループの 1 反復で
-        // 破棄されるため、パス 1 が計上したヒープ予算分（`release_heap_bytes`。
-        // 呼び出し元が `heap_entry_bytes(&winner)` を渡す）を投影コストの計上
-        // より前に解放する。offset スキップ済み候補の解放（上のループ）と
-        // 対称に `checked_sub` を使い、対応が崩れていれば fail-closed に
-        // `Internal` へ落とす。
-        let mut build_visible_row =
-            |key_tenant: &str, id: u64, buf: &[u8], release_heap_bytes: usize| {
-                with_visible_row(
-                    buf,
-                    key_tenant,
-                    id,
-                    schema,
-                    bound,
-                    tier,
-                    &scalar_mask,
-                    expected_dim,
-                    ctx,
-                    &mut embedding_scratch,
-                    &mut where_expr_scratch,
-                    |dim, scanned, embedding| {
-                        byte_budget = byte_budget.checked_sub(release_heap_bytes).ok_or_else(|| {
-                        SqlSurfaceError::Internal {
-                            detail: "scan result byte budget underflow while releasing a projected candidate"
-                                .to_string(),
-                        }
-                    })?;
-                        byte_budget = try_accumulate_budget(
-                            byte_budget,
-                            per_row_struct_bytes,
-                            max_result_bytes,
-                        )?;
-                        let cells = build_projected_cells(
-                            schema,
-                            bound,
-                            tier,
-                            id,
-                            dim,
-                            embedding,
-                            scanned,
-                            &computed_programs,
-                            &mut proj_expr_scratch,
-                            &mut byte_budget,
-                            max_result_bytes,
-                        )?;
-                        Ok(ResultRow {
-                            id,
-                            score: 0.0,
-                            cells,
-                        })
-                    },
-                )
-            };
-
-        for winner in sorted_winners {
+        // codex-review PR #1096 追加是正（最新ラウンド）: `with_visible_row`
+        // 呼び出しをループの外へ括り出さず反復ごとにインラインで行う。
+        // 括り出したクロージャが `byte_budget` を排他的に可変借用し続けると
+        // （元の設計）、`keys` の解放（下記）を投影より前の任意の位置で
+        // 直接代入できなくなるため（借用チェッカーに拒否される）、反復ごとに
+        // 独立した一時クロージャとして渡す形へ変更した（パス 1 の候補判定
+        // クロージャと同型。Issue #915）。
+        for mut winner in sorted_winners {
             let guard = table
                 .get((winner.tenant_id.as_str(), winner.id))
                 .map_err(storage_internal)?;
@@ -1659,9 +1646,60 @@ pub(crate) fn execute_scan_with_budget(
                 });
             };
             let buf = guard.value();
-            let winner_heap_bytes = heap_entry_bytes(&winner);
-            let row =
-                build_visible_row(winner.tenant_id.as_str(), winner.id, buf, winner_heap_bytes)?;
+
+            // codex-review PR #1096 追加是正（最新ラウンド）: 投影は再デコード
+            // した `scanned`／`embedding` のみを使い、`winner.keys`（並べ替え
+            // 用に複製した TEXT 等）は不要。投影セルの確保より前に `keys` を
+            // 実際に破棄してから、その分だけ予算を解放する（実際の破棄が
+            // 解放より先に完了することを保証する。「計上額 ≥ 実際の同時
+            // 保持量」の不変条件。大きな TEXT キーが `DECLARE CURSOR` の
+            // 小さい `max_result_bytes` を一時的に超える余地を残さない）。
+            let keys_bytes = heap_entry_keys_bytes(&winner);
+            let owned_keys = std::mem::take(&mut winner.keys);
+            drop(owned_keys);
+            byte_budget = byte_budget.checked_sub(keys_bytes).ok_or_else(|| {
+                SqlSurfaceError::Internal {
+                    detail:
+                        "scan result byte budget underflow while releasing a projected candidate's sort keys"
+                            .to_string(),
+                }
+            })?;
+
+            let row = with_visible_row(
+                buf,
+                winner.tenant_id.as_str(),
+                winner.id,
+                schema,
+                bound,
+                tier,
+                &scalar_mask,
+                expected_dim,
+                ctx,
+                &mut embedding_scratch,
+                &mut where_expr_scratch,
+                |dim, scanned, embedding| {
+                    byte_budget =
+                        try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
+                    let cells = build_projected_cells(
+                        schema,
+                        bound,
+                        tier,
+                        winner.id,
+                        dim,
+                        embedding,
+                        scanned,
+                        &computed_programs,
+                        &mut proj_expr_scratch,
+                        &mut byte_budget,
+                        max_result_bytes,
+                    )?;
+                    Ok(ResultRow {
+                        id: winner.id,
+                        score: 0.0,
+                        cells,
+                    })
+                },
+            )?;
             let Some(row) = row else {
                 return Err(SqlSurfaceError::Internal {
                     detail: "scan row scan failed: ordered row became invisible on second pass"
@@ -1672,6 +1710,24 @@ pub(crate) fn execute_scan_with_budget(
                 detail: format!("failed to reserve scan result rows: {e}"),
             })?;
             rows.push(row);
+
+            // `winner`（`keys` は既に破棄済みなので残りは構造体本体・
+            // `tenant_id`）は `build_visible_row` へ `tenant_id` を貸す
+            // 必要があったためここまで生存させた。ここで実際に破棄して
+            // から、対応するバイト数を解放する（上の `keys` 解放と同じ
+            // 「実際の破棄が解放より先」の順序）。
+            let fixed_bytes = heap_entry_fixed_bytes(&winner);
+            drop(winner);
+            byte_budget =
+                byte_budget
+                    .checked_sub(fixed_bytes)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                    detail:
+                        "scan result byte budget underflow while releasing a projected candidate"
+                            .to_string(),
+                }
+                    })?;
         }
     }
 
@@ -1924,18 +1980,17 @@ mod tests {
             windows: Vec::new(),
         };
 
-        // パス 1 のヒープ候補 1 件分（`heap_entry_bytes` と同じ計算式）と、
-        // パス 2 の投影結果 1 行分（`per_row_struct_bytes` + テキスト実体）を
-        // それぞれ単独で見積もる（2 行とも同じ値になる）。
-        let heap_entry_bytes_estimate = std::mem::size_of::<HeapEntry>()
-            .saturating_add(
-                bound
-                    .order_by
-                    .len()
-                    .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
-            )
-            .saturating_add(tag_value.len())
-            .saturating_add(tenant_id.len());
+        // パス 1 のヒープ候補 1 件分の内訳（[`heap_entry_keys_bytes`]・
+        // [`heap_entry_fixed_bytes`] と同じ計算式）と、パス 2 の投影結果
+        // 1 行分（`per_row_struct_bytes` + テキスト実体）をそれぞれ単独で
+        // 見積もる（2 行とも同じ値になる）。
+        let keys_bytes_estimate = bound
+            .order_by
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<OrderValue>>())
+            .saturating_add(tag_value.len());
+        let fixed_bytes_estimate = std::mem::size_of::<HeapEntry>().saturating_add(tenant_id.len());
+        let heap_entry_bytes_estimate = keys_bytes_estimate.saturating_add(fixed_bytes_estimate);
         let cell_struct_bytes = bound
             .projection
             .len()
@@ -1945,15 +2000,33 @@ mod tests {
             .saturating_add(result_row_struct_bytes)
             .saturating_add(tag_value.len());
 
-        // codex-review PR #1096 追加是正（P1）: パス 2 は消費した候補ごとに
-        // `heap_entry_bytes` を解放してから投影コストを計上するため、真に
-        // 必要な予算のピークは「開始時点で 2 候補分」「1 候補消費後は
-        // 残り 1 候補分 + 投影済み 1 行分」「両方消費後は投影済み 2 行分」の
-        // 最大値に留まる（旧実装は解放せず、候補・結果の両方を最後まで
-        // 累積計上していたため `2*(heap + per_row)` まで要求していた）。
-        let true_peak = (2 * heap_entry_bytes_estimate)
-            .max(heap_entry_bytes_estimate + per_row_bytes_estimate)
-            .max(2 * per_row_bytes_estimate);
+        // codex-review PR #1096 追加是正（最新ラウンド）: パス 2 は候補の
+        // `keys`（投影に不要）を投影セル確保より前に実際に破棄してから
+        // その分だけ解放し、`tenant_id`・構造体本体（`fixed`。投影呼び出しに
+        // 貸す必要があるため投影後まで生存）は行を確定させた後に破棄・解放
+        // する。2 候補（K・F は 1 候補分の keys／fixed、R は 1 行分の投影
+        // コスト）を順に消費する過程の各時点の計上額を列挙し、その最大値が
+        // 真に必要なピーク予算になる（「計上額 ≥ 実際の同時保持量」を
+        // 各時点で満たす最小の値。詳細な導出根拠は PR #1096 レビュー対応
+        // コメント参照）。
+        let k = keys_bytes_estimate;
+        let f = fixed_bytes_estimate;
+        let r = per_row_bytes_estimate;
+        let true_peak = [
+            2 * k + 2 * f, // パス 1 終了時点（2 候補とも keys・fixed 生存）
+            k + 2 * f,     // 候補 1 の keys 解放後
+            k + 2 * f + r, // 候補 1 の投影コスト計上後
+            k + f + r,     // 候補 1 の fixed 解放後（行 1 件確定）
+            f + r,         // 候補 2 の keys 解放後
+            f + 2 * r,     // 候補 2 の投影コスト計上後
+            2 * r,         // 候補 2 の fixed 解放後（行 2 件確定）
+        ]
+        .into_iter()
+        .max()
+        .expect("non-empty array");
+        // 旧実装（消費した候補を一切解放しない）が要求していた累積総量。
+        // 真のピークはこれを確実に下回ることを固定する（解放しないと
+        // 依然として拒否される予算であることの対照）。
         let old_buggy_cumulative_total =
             (2 * heap_entry_bytes_estimate).saturating_add(2 * per_row_bytes_estimate);
         let fits_true_peak_cap = true_peak + 8;
@@ -1975,6 +2048,22 @@ mod tests {
                 "consumed heap candidates must release their budget before projecting the result",
             );
         assert_eq!(result.rows.len(), 2);
+
+        // codex-review PR #1096 追加是正（最新ラウンド）の回帰: `true_peak`
+        // ちょうどでは成功し、`true_peak - 1` では必ず `54000` になる境界を
+        // 固定する。「先行解放」バグ（`winner` の所有メモリを実際に破棄する
+        // 前に予算を解放し、続けて投影セルを確保する）が再混入すると、
+        // 一時的な同時保持量を実際より少なく見積もるため `true_peak` 未満の
+        // 予算でも誤って成功してしまう。
+        let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, true_peak)
+            .expect("a cap exactly at the true simultaneous-holding peak must still succeed");
+        assert_eq!(result.rows.len(), 2);
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, true_peak - 1)
+            .expect_err(
+                "a cap one byte below the true simultaneous-holding peak must be rejected \
+                 (a premature-release regression would under-count usage and let this succeed)",
+            );
+        assert_eq!(err.wire_code(), "54000");
 
         // 各候補・結果の 1 件分単独では収まるが、解放せず単純合算すると
         // 超過する極小予算では引き続き `54000` で拒否される（予算判定自体が
@@ -2332,6 +2421,100 @@ mod tests {
             .expect("a row whose key never becomes a top candidate must not be copied or rejected");
         let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// codex-review PR #1096 追加是正の回帰（P1・最新ラウンド）: 経路 (B)
+    /// パス 1 がヒープ満杯時に候補を置き換える際、新候補を複製する前に
+    /// 追い出し予定の最悪候補（`worst`）はまだヒープ内に残っており実メモリ上も
+    /// 生存している。予算照合を「現在の `heap_budget`（`worst` を含む）+
+    /// 新候補」で行わず、`worst` を先に差し引いた残り予算で照合すると、
+    /// 複製〜実際の追い出しまでの一時的な同時保持量が計上額を超えうる。
+    /// 大きなキーを持つ `worst` 1 件分ぎりぎりの予算では、置き換え中の
+    /// 一時的な同時保持（`worst` + 新候補）を賄えないため `54000` になる
+    /// ことを固定する。
+    #[test]
+    fn path_b_heap_replacement_accounts_for_worst_still_alive_during_copy() {
+        let path = unique_db_path("scan-path-b-replace-worst-alive");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("tag", ColumnType::Text, true)]);
+        storage.create_table(&schema).expect("create table");
+
+        let write_row = |id: u64, tag: &str| {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::catalog::user_rows_table_def(
+                        &crate::catalog::user_rows_table_name("docs"),
+                    ))
+                    .expect("open row table");
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[crate::row_codec::Value::Text(tag.to_string())],
+                )
+                .expect("encode scalar columns");
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[],
+                    metadata: &metadata,
+                })
+                .expect("encode row");
+                table
+                    .insert(("tenant-a", id), buf.as_slice())
+                    .expect("insert row");
+            }
+            crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+        };
+
+        // id=1（大きな TEXT キー）がまずヒープ（`heap_capacity` = 1）を
+        // 満たし、id=2（小さいキー・昇順で id=1 より先頭）がそれを置き換える。
+        let big_tag = "b".repeat(5000);
+        write_row(1, &big_tag);
+        write_row(2, "a");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 1,
+            order_by: vec![crate::sql::parser::BoundOrderKey {
+                target: crate::sql::parser::BoundOrderTarget::Column(0),
+                kind: crate::sql::parser::OrderKind::Bytes,
+                descending: false,
+            }],
+            offset: 0,
+            windows: Vec::new(),
+        };
+
+        // 十分大きい既定予算では、最終的に id=2（"a"）だけが残る。
+        let result =
+            execute_scan(&read_txn, &ctx, &schema, &bound).expect("default budget should succeed");
+        assert_eq!(
+            result.rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        // `worst`（id=1、大きなキー）1 件分ぎりぎりの予算では、置き換え中に
+        // 一時的に新候補（id=2）と同時保持する分の余地がなく `54000` になる
+        // （`worst` を先に解放したことにしてから照合する実装だと、この余地
+        // 不足を見逃して誤って成功してしまう）。
+        let worst_alone_cap = std::mem::size_of::<HeapEntry>()
+            .saturating_add(std::mem::size_of::<Option<OrderValue>>())
+            .saturating_add(big_tag.len())
+            .saturating_add("tenant-a".len())
+            + 4;
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, worst_alone_cap)
+            .expect_err(
+                "replacing the worst candidate must account for holding both the worst and the \
+                 new candidate simultaneously during the copy",
+            );
+        assert_eq!(err.wire_code(), "54000");
     }
 
     /// codex-review PR #1096 追加是正の回帰: 経路 (B) パス 2 で `OFFSET` に
