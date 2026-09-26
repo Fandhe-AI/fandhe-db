@@ -215,19 +215,29 @@ fn intersect_binds_tighter_than_union() {
     storage.create_table(&schema("b")).expect("create b");
     storage.create_table(&schema("c")).expect("create c");
     let tenant_ctx = ctx("tenant-a");
-    // a = {x}, b = {y}, c = {x}
-    insert_row(&storage, "a", &tenant_ctx, 1, "x", Visibility::Public);
-    insert_row(&storage, "b", &tenant_ctx, 2, "y", Visibility::Public);
-    insert_row(&storage, "c", &tenant_ctx, 3, "x", Visibility::Public);
+    // a = {a}, b = {b}, c = {b}
+    // Cursor Bugbot 指摘対応（PR #1105）: 旧 fixture（a={x}・b={y}・c={x}）は
+    // 正しい優先順位（`A UNION (B INTERSECT C)` = {x}）と誤って `UNION`／
+    // `INTERSECT` を同一優先順位に平坦化した場合（`(A UNION B) INTERSECT C`
+    // = {x,y} ∩ {x} = {x}）のどちらでも同じ {x} になり、優先順位バグを検出
+    // できなかった。本 fixture は両者が異なる結果になる（`A UNION (B
+    // INTERSECT C)` = {a} ∪ ({b}∩{b}) = {a,b}、`(A UNION B) INTERSECT C`
+    // = {a,b} ∩ {b} = {b}）ため、`INTERSECT` を誤って `UNION` と同一優先順位
+    // に平坦化する回帰を検出できる。
+    insert_row(&storage, "a", &tenant_ctx, 1, "a", Visibility::Public);
+    insert_row(&storage, "b", &tenant_ctx, 2, "b", Visibility::Public);
+    insert_row(&storage, "c", &tenant_ctx, 3, "b", Visibility::Public);
     let core = new_core(storage);
 
-    // `A UNION B INTERSECT C` == `A UNION (B INTERSECT C)` == {x} UNION ({y} ∩ {x}) == {x}
+    // `A UNION B INTERSECT C` == `A UNION (B INTERSECT C)` == {a} UNION ({b} ∩ {b}) == {a,b}
     let result = run(
         &core,
         "tenant-a",
         "SELECT lang FROM a UNION SELECT lang FROM b INTERSECT SELECT lang FROM c",
     );
-    assert_eq!(langs(&result), vec!["x".to_string()]);
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[test]
@@ -239,15 +249,21 @@ fn explicit_parens_change_result_vs_default_precedence() {
     storage.create_table(&schema("b")).expect("create b");
     storage.create_table(&schema("c")).expect("create c");
     let tenant_ctx = ctx("tenant-a");
-    // a = {x}, b = {x, y}, c = {x}
-    insert_row(&storage, "a", &tenant_ctx, 1, "x", Visibility::Public);
-    insert_row(&storage, "b", &tenant_ctx, 2, "x", Visibility::Public);
-    insert_row(&storage, "b", &tenant_ctx, 3, "y", Visibility::Public);
-    insert_row(&storage, "c", &tenant_ctx, 4, "x", Visibility::Public);
+    // a = {a}, b = {b}, c = {b}
+    // Cursor Bugbot 指摘対応（PR #1105）: 旧 fixture（a={x}・b={x,y}・c={x}）は
+    // デフォルト形（`A UNION (B INTERSECT C)` = {x}）と明示括弧形
+    // （`(A UNION B) INTERSECT C` = {x,y} ∩ {x} = {x}）が同じ {x} になり、
+    // 括弧を無視する・`INTERSECT` を `UNION` と同一優先順位に平坦化する
+    // パーサでも通ってしまっていた。本 fixture は両者が異なる結果になる
+    // （デフォルト = {a,b}、明示括弧 = {b}）ため、両方に別々の期待値を
+    // 固定できる。
+    insert_row(&storage, "a", &tenant_ctx, 1, "a", Visibility::Public);
+    insert_row(&storage, "b", &tenant_ctx, 2, "b", Visibility::Public);
+    insert_row(&storage, "c", &tenant_ctx, 3, "b", Visibility::Public);
     let core = new_core(storage);
 
     // デフォルト（左結合・INTERSECT が高優先）: A UNION (B INTERSECT C)
-    //   = {x} UNION ({x,y} ∩ {x}) = {x} UNION {x} = {x}
+    //   = {a} UNION ({b} ∩ {b}) = {a} UNION {b} = {a,b}
     let default_form = run(
         &core,
         "tenant-a",
@@ -255,10 +271,9 @@ fn explicit_parens_change_result_vs_default_precedence() {
     );
     let mut default_got = langs(&default_form);
     default_got.sort();
-    assert_eq!(default_got, vec!["x".to_string()]);
+    assert_eq!(default_got, vec!["a".to_string(), "b".to_string()]);
 
-    // 明示括弧: (A UNION B) INTERSECT C = {x,y} ∩ {x} = {x}
-    // （区別できる fixture にするため、a に無い値を c にだけ入れて確認する別ケース）
+    // 明示括弧: (A UNION B) INTERSECT C = {a,b} ∩ {b} = {b}
     let parenthesized = run(
         &core,
         "tenant-a",
@@ -266,7 +281,7 @@ fn explicit_parens_change_result_vs_default_precedence() {
     );
     let mut paren_got = langs(&parenthesized);
     paren_got.sort();
-    assert_eq!(paren_got, vec!["x".to_string()]);
+    assert_eq!(paren_got, vec!["b".to_string()]);
 }
 
 /// 演算子の右枝が丸括弧で囲まれた形（`UNION (SELECT ...)`）が
