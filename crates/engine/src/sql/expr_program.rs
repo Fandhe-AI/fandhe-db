@@ -229,7 +229,6 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Null => StackValue::Null,
         ExprValue::Vector(Cow::Borrowed(_)) => StackValue::VectorRef,
         ExprValue::Vector(Cow::Owned(v)) => StackValue::VectorOwned(v),
-        ExprValue::Null => StackValue::Null,
         // `apply_builtin`／`udf_call::eval_binary` が返す `Text` は常に
         // `Cow::Owned`（`crate::sql::string_fn` は新規 `String` を構築する）。
         // `Cow::Borrowed`（`TextColumnRef` を直接消費した結果）がここへ渡る
@@ -631,9 +630,20 @@ impl ExprProgram {
                     scratch.push(expr_value_to_stack(result));
                     pc += 1;
                 }
-                ExprStep::ConstText(s) => scratch.push(StackValue::Text(s.clone())),
+                // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点: `eval` が
+                // `for step in &self.steps` の逐次実行から `pc`（プログラム
+                // カウンタ）によるジャンプ対応ループへ置き換わったため、既存の
+                // 全ステップが自前で `pc` を進める契約になった。この 2 腕は
+                // マージ時に conflict marker の外（auto-merge）で取り残され、
+                // `pc` が進まないまま無限ループ・無限確保に陥っていた
+                // （origin/main 取り込み時の是正）。
+                ExprStep::ConstText(s) => {
+                    scratch.push(StackValue::Text(s.clone()));
+                    pc += 1;
+                }
                 ExprStep::PushTextColumn(index) => {
                     scratch.push(StackValue::TextColumnRef(*index));
+                    pc += 1;
                 }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();
@@ -1066,7 +1076,7 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
         assert_eq!(
-            program.eval(1, &[], &mut scratch).unwrap(),
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
             ExprValue::Scalar(1.0)
         );
     }
@@ -1080,7 +1090,10 @@ mod tests {
         assert_matches_recursive_eval(&expr, 1, &[]);
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
-        assert_eq!(program.eval(1, &[], &mut scratch).unwrap(), ExprValue::Null);
+        assert_eq!(
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
+            ExprValue::Null
+        );
     }
 
     #[test]
@@ -1090,7 +1103,7 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
         assert_eq!(
-            program.eval(1, &[], &mut scratch).unwrap(),
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
             ExprValue::Scalar(7.0)
         );
     }
@@ -1101,7 +1114,7 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
         assert_eq!(
-            program.eval(1, &[], &mut scratch).unwrap(),
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
             ExprValue::Scalar(1.0)
         );
     }
@@ -1121,7 +1134,10 @@ mod tests {
         let program = ExprProgram::compile(&BoundExpr::Null);
         assert_eq!(program.steps, vec![ExprStep::ConstNull]);
         let mut scratch = Vec::new();
-        assert_eq!(program.eval(1, &[], &mut scratch).unwrap(), ExprValue::Null);
+        assert_eq!(
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
+            ExprValue::Null
+        );
     }
 
     #[test]
@@ -1139,7 +1155,7 @@ mod tests {
         let mut scratch = Vec::new();
         // 条件が true のため JumpIfNotTrue は分岐しないが、他の分岐（false 側）を
         // 検査するために別プログラムで範囲外ジャンプも確認する。
-        let _ = program.eval(1, &[], &mut scratch);
+        let _ = program.eval(1, &[], &[], &mut scratch);
 
         let program_out_of_range = ExprProgram {
             steps: vec![
@@ -1149,7 +1165,9 @@ mod tests {
             ],
             max_stack: 1,
         };
-        let err = program_out_of_range.eval(1, &[], &mut scratch).unwrap_err();
+        let err = program_out_of_range
+            .eval(1, &[], &[], &mut scratch)
+            .unwrap_err();
         assert_eq!(err.wire_code(), "XX000");
     }
 }

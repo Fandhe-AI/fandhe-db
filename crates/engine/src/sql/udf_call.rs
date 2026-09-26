@@ -849,7 +849,12 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
 /// UDF 引数展開後の実効ネストを直接検査する。
 fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
     match expr {
-        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::Null => 0,
+        BoundExpr::Number(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::IdRef
+        | BoundExpr::VectorRef
+        | BoundExpr::Null => 0,
         BoundExpr::Builtin { args, .. } => {
             args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
         }
@@ -1831,10 +1836,17 @@ pub(crate) fn eval_with_scalars<'a>(
             finite_scalar(result, "wasm udf")
         }
         BoundExpr::Null => Ok(ExprValue::Null),
+        // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点: `CASE`／
+        // `COALESCE`／`NULLIF` の分岐は `text_columns` を持つ `eval_with_scalars`
+        // で再帰する（引数 3 個版の `eval` は `text_columns` を常に空スライスへ
+        // 縮退させるため、`COALESCE(LOWER(text_col), 'x')` のように分岐が
+        // `TextColumnRef` を含む式で誤った `Internal` 拒否になっていた）。
         BoundExpr::Case { whens, else_result } => {
             for (cond, result) in whens {
-                match eval(cond, id, embedding)? {
-                    ExprValue::Bool(true) => return eval(result, id, embedding),
+                match eval_with_scalars(cond, id, embedding, text_columns)? {
+                    ExprValue::Bool(true) => {
+                        return eval_with_scalars(result, id, embedding, text_columns)
+                    }
                     ExprValue::Bool(false) | ExprValue::Null => continue,
                     _ => {
                         return Err(SqlSurfaceError::Internal {
@@ -1843,11 +1855,11 @@ pub(crate) fn eval_with_scalars<'a>(
                     }
                 }
             }
-            eval(else_result, id, embedding)
+            eval_with_scalars(else_result, id, embedding, text_columns)
         }
         BoundExpr::Coalesce(args) => {
             for a in args {
-                match eval(a, id, embedding)? {
+                match eval_with_scalars(a, id, embedding, text_columns)? {
                     ExprValue::Null => continue,
                     other => return Ok(other),
                 }
@@ -1855,8 +1867,8 @@ pub(crate) fn eval_with_scalars<'a>(
             Ok(ExprValue::Null)
         }
         BoundExpr::NullIf { lhs, rhs } => {
-            let l = eval(lhs, id, embedding)?;
-            let r = eval(rhs, id, embedding)?;
+            let l = eval_with_scalars(lhs, id, embedding, text_columns)?;
+            let r = eval_with_scalars(rhs, id, embedding, text_columns)?;
             eval_nullif(l, r)
         }
     }
@@ -1930,7 +1942,13 @@ pub(crate) fn apply_builtin<'a>(
     // 組み込み関数は strict 関数として扱う（対象ビヘイビア: SQL-26。Issue #921）:
     // いずれかの引数が NULL なら NULL を返す。残りの引数のスロットは未使用のまま
     // 破棄してよい（呼び出し元はこの 1 回の呼び出し後にスロットを再利用しない）。
-    if args.iter().any(|a| matches!(a, Some(ExprValue::Null))) {
+    // `CONCAT`（Issue #919・SQL-26、AC2）だけは例外で、NULL を空文字として扱い
+    // 常に非 NULL を返す唯一の組み込み関数のため、この一律 strict ガードでは
+    // なく後段の `BuiltinFn::Concat2` 自身の分岐（`take_text_or_null_arg` の
+    // `unwrap_or(Cow::Borrowed(""))`）に NULL 処理を委ねる（origin/main（Issue
+    // #921）取り込み時、この一律ガードが先に働き `CONCAT` の非 strict 契約を
+    // 踏みつぶしていたため是正）。
+    if f != BuiltinFn::Concat2 && args.iter().any(|a| matches!(a, Some(ExprValue::Null))) {
         return Ok(ExprValue::Null);
     }
     match f {

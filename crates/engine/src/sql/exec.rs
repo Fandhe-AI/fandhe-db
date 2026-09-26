@@ -2963,8 +2963,6 @@ fn project_rows(
                         })?;
                     match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                        // 対象ビヘイビア: SQL-26（Issue #921）。
-                        udf_call::ExprValue::Null => cells.push(Cell::Null),
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
                             // だけになった（確保ゼロ）ため、応答行として行データより
@@ -2979,6 +2977,8 @@ fn project_rows(
                         // 写像する（`ColumnType::Text` 直接投影と同じ複製経路
                         // `try_clone_text` を共有する）。
                         udf_call::ExprValue::Text(t) => cells.push(Cell::Text(try_clone_text(&t)?)),
+                        // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
+                        // 契約: NULL は `Cell::Null` へ写像する。
                         udf_call::ExprValue::Null => cells.push(Cell::Null),
                     }
                 }
