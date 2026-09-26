@@ -341,40 +341,60 @@ fn explain_does_not_require_an_embedder() {
     .expect("EXPLAIN must succeed without a configured embedder");
 }
 
+// Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索・集計・広域取得へ拡大した
+// ため、`USING PLAN` を伴わない検索 SELECT・集計 SELECT はもはや拒否されず
+// 受理される（下記 2 ケースは拒否テストから受理テストへ反転）。`USING PLAN`
+// を伴う既存の EXPLAIN 出力（本ファイル冒頭のその他のテスト）は不変。
+
 #[test]
-fn explain_rejects_plain_select_without_using_plan() {
-    let path = unique_db_path("sql-explain-rejects-plain-select");
+fn explain_accepts_plain_select_without_using_plan() {
+    let path = unique_db_path("sql-explain-accepts-plain-select");
     let _guard = CleanupGuard(path.clone());
     let storage = seeded_storage(&path);
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     let mut session = SessionState::default();
-    let err = core
+    let outcome = core
         .execute_sql_in_session(
             &ctx("tenant-a"),
             &mut session,
             "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
         )
-        .expect_err("EXPLAIN without USING PLAN must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("EXPLAIN over a plain search SELECT (no USING PLAN) must be accepted");
+    let lines = explain_result_lines(outcome);
+    // `USING PLAN` を伴わない検索 EXPLAIN は `search_terms`／`path_hint`／
+    // `kind_hint` を含まない（LLM I/O を行わないため）。
+    assert_eq!(lines[0], "mode: recall");
+    assert_eq!(lines[1], "mode_source: default");
+    assert!(lines.iter().any(|l| l == "scalar_plan: plain_scan"));
+    assert!(!lines.iter().any(|l| l.starts_with("search_terms")));
 }
 
 #[test]
-fn explain_rejects_aggregate_select() {
-    let path = unique_db_path("sql-explain-rejects-aggregate");
+fn explain_accepts_aggregate_select() {
+    let path = unique_db_path("sql-explain-accepts-aggregate");
     let _guard = CleanupGuard(path.clone());
     let storage = seeded_storage(&path);
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     let mut session = SessionState::default();
-    let err = core
+    let outcome = core
         .execute_sql_in_session(
             &ctx("tenant-a"),
             &mut session,
             "EXPLAIN SELECT COUNT(id) FROM docs",
         )
-        .expect_err("EXPLAIN over an aggregate SELECT must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("EXPLAIN over an aggregate SELECT must be accepted");
+    let lines = explain_result_lines(outcome);
+    // `WHERE` なしの単一行集計は `visible_bitmap_cache`（可視ビットマップ
+    // キャッシュを使える形）。
+    assert_eq!(
+        lines,
+        vec![
+            "scalar_plan: plain_scan",
+            "access_path: visible_bitmap_cache"
+        ]
+    );
 }
 
 #[test]

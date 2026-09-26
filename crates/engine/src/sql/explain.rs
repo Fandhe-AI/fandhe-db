@@ -43,6 +43,7 @@ use crate::query_planner::PlannedQuery;
 use crate::search_engine::SearchEngineKind;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::hnsw_cache::AnnPlan;
+use crate::sql::mode::ResolvedMode;
 use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
 use crate::sql::udf_call::BoundExpr;
 
@@ -225,31 +226,48 @@ fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
     }
 }
 
-/// [`PlannedQuery`]（LLM 展開結果＋解決済み実効モード）と [`ExplainEngine`]
-/// （使用エンジン・ANN 静的判定〔Issue #411〕・SCALAR 索引静的判定
-/// 〔Issue #474〕）から `EXPLAIN` の [`QueryResult`] を決定的に構築する
-/// （副作用なし。同一入力には常に同一の行を返す）。
-/// 行順序: `search_terms[i]`（展開結果の件数分）→ `path_hint` → `kind_hint` →
-/// `mode` → `mode_source` → `engine` → （`engine: hnsw` のときのみ）
-/// `hnsw_params` → `ann_plan` → `scalar_plan`。
-pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> QueryResult {
-    let expansion = planned.expansion();
-    let resolved = planned.mode();
+/// 集計・広域取得の走査方式（Issue #922・SQL-27）。executor の実行時ゲート
+/// （`sql::aggregate::execute_aggregate_with_cache`・`sql::group_by::
+/// execute_grouped_aggregate`・`sql::scan`）と 1 対 1 対応する**静的判定**の
+/// みを表す（可視カーディナリティ・索引の構築可否・キャッシュのヒット/ミス
+/// 等の実行時縮退の結果はいずれも含まない。security.md「テナント境界」
+/// 対応）。`access_path:` 行の値になる閉じた語彙（`&'static str`・
+/// snake_case）。executor の実経路は 4 種（列挙形を候補削減と別に数える）
+/// あるため 4 variant を持つ（SQL-27 確定時に spec 側と語彙数を擦り合わせる
+/// 事項。`docs/design/explain-search-engine-exposure.md` 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum AccessPath {
+    /// `GROUP BY` なし集計で `DecodeTier::Fast` 相当（`WHERE` なし、
+    /// `COUNT(*)`／`id` 系のみ）。可視ビットマップキャッシュを使える形。
+    VisibleBitmapCache,
+    /// `VECTOR` 列ありのテーブルで、索引対応述語のみで構成される `WHERE` を
+    /// 持つ集計（`GROUP BY` の有無いずれも。索引経由の候補削減が使える形）。
+    ScalarIndexCandidates,
+    /// `GROUP BY` あり・`WHERE` なし・`VECTOR` 列あり・`TEXT` 列の `MIN`／`MAX`
+    /// を含まない集計（索引によるグループ列挙形）。
+    ScalarIndexGroupEnumeration,
+    /// 上記のいずれにも該当しない（`VECTOR` 列なしテーブルの集計・非索引の
+    /// 式述語を含む集計・広域取得は常にこれ）。
+    FullScan,
+}
 
-    let mut lines: Vec<String> = Vec::with_capacity(expansion.search_terms.len() + 7);
-    for (i, term) in expansion.search_terms.iter().enumerate() {
-        lines.push(format!("search_terms[{i}]: {term}"));
+fn access_path_token(path: AccessPath) -> &'static str {
+    match path {
+        AccessPath::VisibleBitmapCache => "visible_bitmap_cache",
+        AccessPath::ScalarIndexCandidates => "scalar_index_candidates",
+        AccessPath::ScalarIndexGroupEnumeration => "scalar_index_group_enumeration",
+        AccessPath::FullScan => "full_scan",
     }
-    lines.push(format!(
-        "path_hint: {}",
-        expansion.path_hint.as_deref().unwrap_or(NONE_LABEL)
-    ));
-    lines.push(format!(
-        "kind_hint: {}",
-        expansion.kind_hint.as_deref().unwrap_or(NONE_LABEL)
-    ));
-    lines.push(format!("mode: {}", resolved.mode().as_str()));
-    lines.push(format!("mode_source: {}", resolved.source().as_str()));
+}
+
+/// `mode:` から `scalar_plan:` までの末尾行を組み立てる（TASK-78・SQL-6 の
+/// [`build_explain_result`]〔`USING PLAN` 付き検索〕と Issue #922・SQL-27 の
+/// [`build_search_explain_result`]〔`USING PLAN` なし検索〕が共有する。
+/// 書式の発散を構造的に防ぐ）。
+fn push_engine_tail_rows(lines: &mut Vec<String>, mode: ResolvedMode, engine: &ExplainEngine) {
+    lines.push(format!("mode: {}", mode.mode().as_str()));
+    lines.push(format!("mode_source: {}", mode.source().as_str()));
     lines.push(format!("engine: {}", engine_token(engine.kind)));
     if let Some(SearchEngineKind::Hnsw(params)) = engine.kind {
         // `ValidatedHnswParams::get()` は検証済み `m`／`ef_construction`／
@@ -282,7 +300,13 @@ pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> Q
         "scalar_plan: {}",
         scalar_plan_token(engine.scalar_plan)
     ));
+}
 
+/// `lines` の各要素を `QUERY PLAN` 単一列の 1 行（`id`/`score` は実在行を持た
+/// ない疑似値 `0`）へ変換する（[`build_explain_result`]・
+/// [`build_search_explain_result`]・[`build_relational_explain_result`] が
+/// 共有する終端処理）。
+fn lines_to_query_result(lines: Vec<String>) -> QueryResult {
     let rows = lines
         .into_iter()
         .map(|text| ResultRow {
@@ -298,6 +322,66 @@ pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> Q
         }],
         rows,
     }
+}
+
+/// [`PlannedQuery`]（LLM 展開結果＋解決済み実効モード）と [`ExplainEngine`]
+/// （使用エンジン・ANN 静的判定〔Issue #411〕・SCALAR 索引静的判定
+/// 〔Issue #474〕）から `EXPLAIN` の [`QueryResult`] を決定的に構築する
+/// （副作用なし。同一入力には常に同一の行を返す）。
+/// 行順序: `search_terms[i]`（展開結果の件数分）→ `path_hint` → `kind_hint` →
+/// `mode` → `mode_source` → `engine` → （`engine: hnsw` のときのみ）
+/// `hnsw_params` → `ann_plan` → `scalar_plan`。
+pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> QueryResult {
+    let expansion = planned.expansion();
+    let resolved = planned.mode();
+
+    let mut lines: Vec<String> = Vec::with_capacity(expansion.search_terms.len() + 7);
+    for (i, term) in expansion.search_terms.iter().enumerate() {
+        lines.push(format!("search_terms[{i}]: {term}"));
+    }
+    lines.push(format!(
+        "path_hint: {}",
+        expansion.path_hint.as_deref().unwrap_or(NONE_LABEL)
+    ));
+    lines.push(format!(
+        "kind_hint: {}",
+        expansion.kind_hint.as_deref().unwrap_or(NONE_LABEL)
+    ));
+    push_engine_tail_rows(&mut lines, resolved, engine);
+
+    lines_to_query_result(lines)
+}
+
+/// `EXPLAIN SELECT ...`（`USING PLAN` を伴わない検索 SELECT。`ORDER BY <=>`・
+/// `HYBRID`。Issue #922・SQL-27）の [`QueryResult`] を構築する。行順序:
+/// `mode` → `mode_source` → `engine` → （`engine: hnsw` のときのみ）
+/// `hnsw_params` → `ann_plan` → `scalar_plan`（[`build_explain_result`] の
+/// 末尾部分から LLM 由来の `search_terms[i]`／`path_hint`／`kind_hint` を
+/// 除いたもの。[`push_engine_tail_rows`] を共有するため書式は発散しない）。
+pub(crate) fn build_search_explain_result(
+    mode: ResolvedMode,
+    engine: &ExplainEngine,
+) -> QueryResult {
+    let mut lines: Vec<String> = Vec::with_capacity(6);
+    push_engine_tail_rows(&mut lines, mode, engine);
+    lines_to_query_result(lines)
+}
+
+/// `EXPLAIN SELECT <集計>`・`EXPLAIN SELECT ... LIMIT n`（集計・広域取得。
+/// Issue #922・SQL-27）の [`QueryResult`] を構築する。行順序: `scalar_plan` →
+/// `access_path`。`mode`・`mode_source`・`engine`・`ann_plan` は出さない
+/// （広域取得は `search_mode` を参照せず、どちらの文にもランキング段が無い
+/// ため `mode:` を出すと誤情報になる。SQL-27 確定時に spec 側と擦り合わせる
+/// 事項）。
+pub(crate) fn build_relational_explain_result(
+    scalar_plan: ScalarPlan,
+    access_path: AccessPath,
+) -> QueryResult {
+    let lines = vec![
+        format!("scalar_plan: {}", scalar_plan_token(scalar_plan)),
+        format!("access_path: {}", access_path_token(access_path)),
+    ];
+    lines_to_query_result(lines)
 }
 
 #[cfg(test)]

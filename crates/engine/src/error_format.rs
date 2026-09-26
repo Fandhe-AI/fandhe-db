@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 34;
+    count = 35;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -256,6 +256,11 @@ define_error_classes! {
     /// 一致しない（`42830`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidForeignKey`] の写像。
     InvalidForeignKey => ("42830", "INVALID_FOREIGN_KEY"),
+    /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10、
+    /// Issue #924）で、非修飾列参照が複数の参照テーブルへ一致し一意に解決
+    /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::
+    /// AmbiguousColumn`] の写像。
+    AmbiguousColumn => ("42702", "AMBIGUOUS_COLUMN"),
 }
 
 impl ErrorClass {

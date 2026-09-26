@@ -361,11 +361,15 @@ fn scan_result_is_unaffected_by_session_search_mode() {
     assert_eq!(recall_result, precision_result);
 }
 
-// ---------- EXPLAIN 前置の拒否 ----------
+// ---------- EXPLAIN 前置の受理（Issue #922・SQL-27） ----------
 
 #[test]
-fn explain_rejects_bare_limit_scan() {
-    let path = unique_db_path("scan-explain-reject");
+fn explain_accepts_bare_limit_scan() {
+    // Issue #922（SQL-27）: `EXPLAIN` の対象を広域取得へ拡大したため、`USING
+    // PLAN` を伴わない bare LIMIT scan はもはや拒否されず受理される（受理
+    // テストへ反転）。`sql::scan` はランキング段・索引を持たないため
+    // `scalar_plan: plain_scan`／`access_path: full_scan` に固定。
+    let path = unique_db_path("scan-explain-accept");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
     seed_single_tenant_corpus(&storage, "tenant-a", 3);
@@ -373,8 +377,24 @@ fn explain_rejects_bare_limit_scan() {
     let ctx = ctx_for("tenant-a");
 
     let mut session = SessionState::default();
-    let err = core
+    let outcome = core
         .execute_sql_in_session(&ctx, &mut session, "EXPLAIN SELECT * FROM docs LIMIT 10")
-        .expect_err("EXPLAIN must reject a bare LIMIT scan (no USING PLAN)");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("EXPLAIN over a bare LIMIT scan must be accepted");
+    match outcome {
+        SqlOutcome::Explain(result) => {
+            let lines: Vec<String> = result
+                .rows
+                .iter()
+                .map(|row| match &row.cells[0] {
+                    Cell::Text(s) => s.clone(),
+                    other => panic!("expected Cell::Text, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                lines,
+                vec!["scalar_plan: plain_scan", "access_path: full_scan"]
+            );
+        }
+        other => panic!("expected SqlOutcome::Explain, got {other:?}"),
+    }
 }
