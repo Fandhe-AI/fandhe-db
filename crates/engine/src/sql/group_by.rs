@@ -867,7 +867,9 @@ fn observe_candidate_slots_grouped_inner(
             };
             match program.eval(id, embedding, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
-                ExprValue::Bool(false) => continue 'candidates,
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921）。
+                ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(GroupAccumulateError::Other(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",
@@ -1535,7 +1537,9 @@ pub(crate) fn execute_grouped_aggregate(
                     };
                     match program.eval(id, embedding, &mut expr_scratch)? {
                         ExprValue::Bool(true) => {}
-                        ExprValue::Bool(false) => continue 'rows,
+                        // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア:
+                        // SQL-26。Issue #921）。
+                        ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                         _ => {
                             return Err(SqlSurfaceError::invalid_input(
                                 "WHERE expression did not evaluate to a boolean",

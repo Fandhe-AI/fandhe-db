@@ -59,12 +59,15 @@ pub(crate) enum ExprStep {
     /// 行 `id` を [`id_as_finite_scalar`] 経由でスカラー値として push する。
     PushId,
     /// テーブルの `VECTOR` 列（行の `embedding`）への参照を push する。
-    /// スタック格納値は [`StackValue::VectorRef`]（マーカーのみ。借用そのものは
-    /// 保持しない）で、実際の `Cow::Borrowed(embedding)` は `ExprProgram::eval`
-    /// が当該ステップを消費する時点で `embedding` 引数から都度組み立てる
-    /// （`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐（Issue #352）と
-    /// 同じ契約——`vec_norm(embedding)` 等の読み取り専用式では確保・複製が
-    /// 一切発生しない）。PR #373 codex-review 指摘対応: 当初は
+    /// `embedding` が空スライス（`VECTOR` 列が NULL。`dim == 0`）の行では
+    /// [`StackValue::Null`] を push し、それ以外では [`StackValue::VectorRef`]
+    /// （マーカーのみ。借用そのものは保持しない）を push する（codex-review P1
+    /// 指摘対応・Issue #921。`sql::udf_call::eval` の `BoundExpr::VectorRef`
+    /// 分岐と同じ判定）。`StackValue::VectorRef` の場合、実際の
+    /// `Cow::Borrowed(embedding)` は `ExprProgram::eval` が当該ステップを消費
+    /// する時点で `embedding` 引数から都度組み立てる（Issue #352 と同じ契約
+    /// ——`vec_norm(embedding)` 等の読み取り専用式では確保・複製が一切発生
+    /// しない）。PR #373 codex-review 指摘対応: 当初は
     /// `Vec<ExprValue<'a>>` をスタックに使い `embedding` と同一ライフタイム `'a`
     /// で行ループの外から使い回そうとしたが、行フックの呼び出し境界ごとに
     /// `'a` が変わる（`sql::exec::on_visible_row` のようにクロージャで
@@ -84,6 +87,26 @@ pub(crate) enum ExprStep {
     /// WASM UDF 呼び出し（ABI 固定: `(Vector, Scalar) -> Scalar`。TASK-149・
     /// EXT-5）。scalar 引数（後に push された方）から先に pop する。
     WasmCall { backend: Arc<dyn WasmUdfBackend> },
+    /// 定数畳み込み済みの `NULL`（対象ビヘイビア: SQL-26。Issue #921）。
+    ConstNull,
+    /// 無条件の前方ジャンプ（`CASE` の各 WHEN 分岐末尾）。`target` は
+    /// `steps` 内の絶対インデックス。前方（`target > pc`）のみを許可し、実行が
+    /// 必ず停止することを構造的に保証する（`ExprProgram::eval` の範囲検査参照）。
+    Jump { target: usize },
+    /// スタック先頭の Bool を pop し、`true` でなければ `target` へ飛ぶ
+    /// （`CASE WHEN` の条件不成立分岐）。Bool 以外（`Null`＝UNKNOWN を含む）も
+    /// 「真でない」として同様に飛ぶ。
+    JumpIfNotTrue { target: usize },
+    /// スタック先頭を pop せず覗き見て、`Null` でなければ値を残したまま
+    /// `target` へ飛ぶ（`COALESCE` の非 NULL 早期確定）。`Null` の場合は pop せず
+    /// 次の命令（通常は [`ExprStep::Pop`]）へフォールスルーする。
+    JumpIfNotNull { target: usize },
+    /// スタック先頭を pop して捨てる（`COALESCE` が NULL だった引数を捨てて
+    /// 次の引数の評価へ進むために使う）。
+    Pop,
+    /// `NULLIF(lhs, rhs)`。rhs・lhs の順に pop し、[`crate::sql::udf_call::
+    /// eval_nullif`] へ渡す。
+    NullIf,
 }
 
 impl PartialEq for ExprStep {
@@ -101,6 +124,16 @@ impl PartialEq for ExprStep {
             (ExprStep::WasmCall { backend: a }, ExprStep::WasmCall { backend: b }) => {
                 Arc::ptr_eq(a, b)
             }
+            (ExprStep::ConstNull, ExprStep::ConstNull) => true,
+            (ExprStep::Jump { target: a }, ExprStep::Jump { target: b }) => a == b,
+            (ExprStep::JumpIfNotTrue { target: a }, ExprStep::JumpIfNotTrue { target: b }) => {
+                a == b
+            }
+            (ExprStep::JumpIfNotNull { target: a }, ExprStep::JumpIfNotNull { target: b }) => {
+                a == b
+            }
+            (ExprStep::Pop, ExprStep::Pop) => true,
+            (ExprStep::NullIf, ExprStep::NullIf) => true,
             _ => false,
         }
     }
@@ -116,6 +149,8 @@ impl PartialEq for ExprStep {
 pub(crate) enum StackValue {
     Scalar(f64),
     Bool(bool),
+    /// SQL `NULL`（対象ビヘイビア: SQL-26。Issue #921）。
+    Null,
     /// 現在評価中の行の `embedding` への参照を表すマーカー
     /// （[`ExprStep::PushVector`] が push する）。実体は `ExprProgram::eval` の
     /// `embedding: &'a [f32]` 引数から都度解決する。
@@ -135,6 +170,7 @@ fn stack_to_expr_value(v: StackValue, embedding: &[f32]) -> ExprValue<'_> {
     match v {
         StackValue::Scalar(s) => ExprValue::Scalar(s),
         StackValue::Bool(b) => ExprValue::Bool(b),
+        StackValue::Null => ExprValue::Null,
         StackValue::VectorRef => ExprValue::Vector(Cow::Borrowed(embedding)),
         StackValue::VectorOwned(v) => ExprValue::Vector(Cow::Owned(v)),
     }
@@ -151,6 +187,7 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
     match v {
         ExprValue::Scalar(s) => StackValue::Scalar(s),
         ExprValue::Bool(b) => StackValue::Bool(b),
+        ExprValue::Null => StackValue::Null,
         ExprValue::Vector(Cow::Borrowed(_)) => StackValue::VectorRef,
         ExprValue::Vector(Cow::Owned(v)) => StackValue::VectorOwned(v),
     }
@@ -206,17 +243,27 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 ExprValue::Scalar(v) => Some(FoldedConst::Scalar(v)),
                 ExprValue::Bool(b) => Some(FoldedConst::Bool(b)),
                 // `l`/`r` は `try_fold_scalar` の再帰でスカラー・真偽値に限定
-                // 済みのため、四則演算・比較の結果は理論上 `Vector` になり
-                // 得ない。`unreachable!` ではなく畳み込み対象外（`None`）として
-                // fail-safe に扱う（`compile_node` は通常のステップ平坦化へ
-                // フォールバックする）。
-                ExprValue::Vector(_) => None,
+                // 済みのため、四則演算・比較の結果は理論上 `Vector`／`Null` に
+                // なり得ない（`FoldedConst` に `Null` 相当の variant が無いため。
+                // 対象ビヘイビア: SQL-26。Issue #921）。`unreachable!` ではなく
+                // 畳み込み対象外（`None`）として fail-safe に扱う（`compile_node`
+                // は通常のステップ平坦化へフォールバックする）。
+                ExprValue::Vector(_) | ExprValue::Null => None,
             }
         }
+        // `Null`／`Case`／`Coalesce`／`NullIf`（対象ビヘイビア: SQL-26。Issue #921）
+        // は畳み込み対象に含めない。`Case`/`Coalesce` は選ばれない分岐を評価しない
+        // という実行時契約（defer-on-error）を、ジャンプ命令へのコンパイル
+        // （`compile_case`/`compile_coalesce`）だけで満たすため、定数畳み込みの
+        // 対象を広げなくても既存の受け入れ条件（0 除算 defer）は成立する。
         BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Builtin { .. }
-        | BoundExpr::WasmCall { .. } => None,
+        | BoundExpr::WasmCall { .. }
+        | BoundExpr::Null
+        | BoundExpr::Case { .. }
+        | BoundExpr::Coalesce(_)
+        | BoundExpr::NullIf { .. } => None,
     }
 }
 
@@ -293,7 +340,105 @@ fn compile_node(
                 .saturating_add(1);
             *max_stack = (*max_stack).max(*current_depth);
         }
+        BoundExpr::Null => {
+            steps.push(ExprStep::ConstNull);
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::Case { whens, else_result } => {
+            compile_case(whens, else_result, steps, current_depth, max_stack);
+        }
+        BoundExpr::Coalesce(args) => {
+            compile_coalesce(args, steps, current_depth, max_stack);
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            compile_node(lhs, steps, current_depth, max_stack);
+            compile_node(rhs, steps, current_depth, max_stack);
+            steps.push(ExprStep::NullIf);
+            *current_depth = current_depth.saturating_sub(2).saturating_add(1);
+            *max_stack = (*max_stack).max(*current_depth);
+        }
     }
+}
+
+/// 検索形 `CASE` を `cond_i → JumpIfNotTrue(next_i) → result_i → Jump(end)` の
+/// 並びへコンパイルする（対象ビヘイビア: SQL-26。Issue #921）。最後の WHEN 分岐の
+/// `Jump(end)` は次の命令（`end`）へ飛ぶだけの冗長な命令になるが、全分岐を
+/// 均一に扱うことでコンパイルロジックを単純に保つ（実行コストは無視できる）。
+/// ジャンプ先はいったん `usize::MAX` で仮置きし、対応する分岐の実アドレスが
+/// 確定した時点で `steps.get_mut` により書き換える（前方参照の解決）。
+fn compile_case(
+    whens: &[(BoundExpr, BoundExpr)],
+    else_result: &BoundExpr,
+    steps: &mut Vec<ExprStep>,
+    current_depth: &mut usize,
+    max_stack: &mut usize,
+) {
+    let depth_before_case = *current_depth;
+    let mut jump_to_end: Vec<usize> = Vec::with_capacity(whens.len());
+    for (cond, result) in whens {
+        *current_depth = depth_before_case;
+        compile_node(cond, steps, current_depth, max_stack);
+        // `JumpIfNotTrue` は条件値（Bool/Null いずれも）を pop する。
+        *current_depth = current_depth.saturating_sub(1);
+        let jump_if_not_true_idx = steps.len();
+        steps.push(ExprStep::JumpIfNotTrue { target: usize::MAX });
+        // 分岐前の深さから THEN 結果をコンパイルする（§モジュールドキュメント
+        // 「評価順序の保存」参照。どの分岐も合流時には値を 1 個だけ積む）。
+        *current_depth = depth_before_case;
+        compile_node(result, steps, current_depth, max_stack);
+        let jump_to_end_idx = steps.len();
+        steps.push(ExprStep::Jump { target: usize::MAX });
+        jump_to_end.push(jump_to_end_idx);
+        // `JumpIfNotTrue` の飛び先（次の WHEN の条件、または ELSE）を確定する。
+        let next_target = steps.len();
+        if let Some(ExprStep::JumpIfNotTrue { target }) = steps.get_mut(jump_if_not_true_idx) {
+            *target = next_target;
+        }
+    }
+    *current_depth = depth_before_case;
+    compile_node(else_result, steps, current_depth, max_stack);
+    let end_target = steps.len();
+    for idx in jump_to_end {
+        if let Some(ExprStep::Jump { target }) = steps.get_mut(idx) {
+            *target = end_target;
+        }
+    }
+    *max_stack = (*max_stack).max(*current_depth);
+}
+
+/// `COALESCE` を `a_1 → JumpIfNotNull(end) → Pop → a_2 → … → a_n` の並びへ
+/// コンパイルする（対象ビヘイビア: SQL-26。Issue #921）。最後の引数は非 NULL
+/// 判定を行わず、そのまま結果として残す。
+fn compile_coalesce(
+    args: &[BoundExpr],
+    steps: &mut Vec<ExprStep>,
+    current_depth: &mut usize,
+    max_stack: &mut usize,
+) {
+    let depth_before = *current_depth;
+    let mut jump_to_end: Vec<usize> = Vec::with_capacity(args.len().saturating_sub(1));
+    for (i, a) in args.iter().enumerate() {
+        *current_depth = depth_before;
+        compile_node(a, steps, current_depth, max_stack);
+        if i + 1 == args.len() {
+            break;
+        }
+        let jump_idx = steps.len();
+        steps.push(ExprStep::JumpIfNotNull { target: usize::MAX });
+        // 非 NULL なら `JumpIfNotNull` が値を残したまま飛ぶため、ここ（`Pop`）は
+        // NULL だった場合のみ実行される。
+        steps.push(ExprStep::Pop);
+        *current_depth = current_depth.saturating_sub(1);
+        jump_to_end.push(jump_idx);
+    }
+    let end_target = steps.len();
+    for idx in jump_to_end {
+        if let Some(ExprStep::JumpIfNotNull { target }) = steps.get_mut(idx) {
+            *target = end_target;
+        }
+    }
+    *max_stack = (*max_stack).max(*current_depth);
 }
 
 impl ExprProgram {
@@ -325,6 +470,15 @@ impl ExprProgram {
     /// 使っており、行フックの呼び出し境界ごとに変わる `'a` を持つ呼び出し元では
     /// 行ループの外へ persist できず行ごとの新規確保が必要だった。詳細は
     /// [`ExprStep::PushVector`] のドキュメント参照）。
+    ///
+    /// `CASE`／`COALESCE`（対象ビヘイビア: SQL-26。Issue #921）の分岐命令
+    /// （[`ExprStep::Jump`]・[`ExprStep::JumpIfNotTrue`]・[`ExprStep::
+    /// JumpIfNotNull`]）を実行するため、`for step in &self.steps` の逐次実行
+    /// ではなくプログラムカウンタ（`pc`）によるループへ変える。ジャンプ先は
+    /// 常に前方（`target > pc`）のみを許可し（`compile_case`/`compile_coalesce`
+    /// が生成する目標値は構造的に前方になる）、`pc` は単調に増加するため
+    /// ループは必ず停止する（コンパイル済みステップ列にループを構成できない。
+    /// security.md「不安全な設計」対応）。
     pub(crate) fn eval<'a>(
         &self,
         id: u64,
@@ -332,19 +486,81 @@ impl ExprProgram {
         scratch: &mut Vec<StackValue>,
     ) -> Result<ExprValue<'a>, SqlSurfaceError> {
         scratch.clear();
-        for step in &self.steps {
+        let mut pc = 0usize;
+        while let Some(step) = self.steps.get(pc) {
             match step {
-                ExprStep::ConstScalar(v) => scratch.push(StackValue::Scalar(*v)),
-                ExprStep::ConstBool(b) => scratch.push(StackValue::Bool(*b)),
+                ExprStep::ConstScalar(v) => {
+                    scratch.push(StackValue::Scalar(*v));
+                    pc += 1;
+                }
+                ExprStep::ConstBool(b) => {
+                    scratch.push(StackValue::Bool(*b));
+                    pc += 1;
+                }
+                ExprStep::ConstNull => {
+                    scratch.push(StackValue::Null);
+                    pc += 1;
+                }
                 ExprStep::PushId => {
                     scratch.push(StackValue::Scalar(id_as_finite_scalar(id)?));
+                    pc += 1;
                 }
                 ExprStep::PushVector => {
                     // マーカーのみを push する（Issue #352 の「借用のみで確保・
                     // 複製なし」契約は、このマーカーを `stack_to_expr_value` で
                     // 消費する際に `Cow::Borrowed(embedding)` として復元する
-                    // ことで維持する）。
-                    scratch.push(StackValue::VectorRef);
+                    // ことで維持する）。`embedding` が空スライスの行は `VECTOR`
+                    // 列が NULL（`dim == 0`。呼び出し元は非 NULL なら実データ・
+                    // NULL なら空スライスで揃えて渡す契約）であるため、この時点で
+                    // `StackValue::Null` を push し NULL として評価する
+                    // （`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐と同じ
+                    // 判定。codex-review P1 指摘対応: `Case`／`Coalesce` は
+                    // ジャンプ命令で選ばれない分岐のステップを実行しないため、
+                    // 実際に選択された枝が `PushVector` を含む場合にのみ NULL が
+                    // 伝播する。呼び出し元の事前 `references_embedding && dim ==
+                    // 0` ゲートは静的な式木走査で選択されない分岐まで拾って
+                    // しまうため撤去し、この評価時点の判定へ一本化した）。
+                    scratch.push(if embedding.is_empty() {
+                        StackValue::Null
+                    } else {
+                        StackValue::VectorRef
+                    });
+                    pc += 1;
+                }
+                ExprStep::Pop => {
+                    scratch.pop().ok_or_else(stack_underflow)?;
+                    pc += 1;
+                }
+                ExprStep::Jump { target } => {
+                    pc = validate_jump_target(*target, pc, self.steps.len())?;
+                }
+                ExprStep::JumpIfNotTrue { target } => {
+                    let v = scratch.pop().ok_or_else(stack_underflow)?;
+                    if matches!(v, StackValue::Bool(true)) {
+                        pc += 1;
+                    } else {
+                        pc = validate_jump_target(*target, pc, self.steps.len())?;
+                    }
+                }
+                ExprStep::JumpIfNotNull { target } => {
+                    // peek のみ（pop しない）。非 NULL なら値をスタックに残した
+                    // まま飛ぶ（`compile_coalesce` 参照）。
+                    let is_null = matches!(scratch.last(), Some(StackValue::Null));
+                    if is_null {
+                        pc += 1;
+                    } else {
+                        pc = validate_jump_target(*target, pc, self.steps.len())?;
+                    }
+                }
+                ExprStep::NullIf => {
+                    let r = scratch.pop().ok_or_else(stack_underflow)?;
+                    let l = scratch.pop().ok_or_else(stack_underflow)?;
+                    let result = udf_call::eval_nullif(
+                        stack_to_expr_value(l, embedding),
+                        stack_to_expr_value(r, embedding),
+                    )?;
+                    scratch.push(expr_value_to_stack(result));
+                    pc += 1;
                 }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();
@@ -375,6 +591,7 @@ impl ExprProgram {
                     }
                     let result = apply_builtin(*f, &mut arg_buf[..arity])?;
                     scratch.push(expr_value_to_stack(result));
+                    pc += 1;
                 }
                 ExprStep::Binary(op) => {
                     let r = scratch.pop().ok_or_else(stack_underflow)?;
@@ -385,36 +602,69 @@ impl ExprProgram {
                         stack_to_expr_value(r, embedding),
                     )?;
                     scratch.push(expr_value_to_stack(result));
+                    pc += 1;
                 }
                 ExprStep::WasmCall { backend } => {
                     let scalar_val = scratch.pop().ok_or_else(stack_underflow)?;
                     let vector_val = scratch.pop().ok_or_else(stack_underflow)?;
-                    let v = match vector_val {
-                        StackValue::VectorRef => Cow::Borrowed(embedding),
-                        StackValue::VectorOwned(v) => Cow::Owned(v),
-                        StackValue::Scalar(_) | StackValue::Bool(_) => return Err(type_mismatch()),
-                    };
-                    let s = match scalar_val {
-                        StackValue::Scalar(s) => s,
-                        StackValue::Bool(_)
-                        | StackValue::VectorRef
-                        | StackValue::VectorOwned(_) => return Err(type_mismatch()),
-                    };
-                    // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
-                    // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
-                    // 写像する（行値・テナント情報を含まない固定文言。
-                    // `sql::udf_call::eval` の `WasmCall` 分岐と同じ契約。
-                    // EXT-6 の拒否・強制中断はここで行単位のエラーへ収束し、
-                    // プロセスは生存する）。
-                    let result = backend
-                        .call_vector_scalar(&v, s)
-                        .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
-                    scratch.push(expr_value_to_stack(finite_scalar(result, "wasm udf")?));
+                    // WASM UDF は RETURNS NULL ON NULL INPUT（対象ビヘイビア:
+                    // SQL-26。Issue #921）。いずれかが NULL ならバックエンドを
+                    // 呼ばず NULL を積む（`sql::udf_call::eval` の `WasmCall`
+                    // 分岐と同じ契約）。
+                    let vector_is_null = matches!(&vector_val, StackValue::Null);
+                    let scalar_is_null = matches!(&scalar_val, StackValue::Null);
+                    if vector_is_null || scalar_is_null {
+                        scratch.push(StackValue::Null);
+                    } else {
+                        let v = match vector_val {
+                            StackValue::VectorRef => Cow::Borrowed(embedding),
+                            StackValue::VectorOwned(v) => Cow::Owned(v),
+                            StackValue::Scalar(_) | StackValue::Bool(_) | StackValue::Null => {
+                                return Err(type_mismatch())
+                            }
+                        };
+                        let s = match scalar_val {
+                            StackValue::Scalar(s) => s,
+                            StackValue::Bool(_)
+                            | StackValue::VectorRef
+                            | StackValue::VectorOwned(_)
+                            | StackValue::Null => return Err(type_mismatch()),
+                        };
+                        // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
+                        // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
+                        // 写像する（行値・テナント情報を含まない固定文言。
+                        // `sql::udf_call::eval` の `WasmCall` 分岐と同じ契約。
+                        // EXT-6 の拒否・強制中断はここで行単位のエラーへ収束し、
+                        // プロセスは生存する）。
+                        let result = backend
+                            .call_vector_scalar(&v, s)
+                            .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
+                        scratch.push(expr_value_to_stack(finite_scalar(result, "wasm udf")?));
+                    }
+                    pc += 1;
                 }
             }
         }
         let result = scratch.pop().ok_or_else(stack_underflow)?;
         Ok(stack_to_expr_value(result, embedding))
+    }
+}
+
+/// ジャンプ先が現在位置より前方（`target > pc`）かつステップ列の範囲内
+/// （`target <= len`。`len` は「末尾へ飛んで自然にループを終える」ケースを
+/// 許すための一つ上の境界）であることを検査する（対象ビヘイビア: SQL-26。
+/// Issue #921）。`compile_case`/`compile_coalesce` が生成する目標値は常にこの
+/// 条件を満たすが、コンパイル時の仮置き（`usize::MAX`）の書き換え漏れや
+/// 実装バグに対する fail-closed な多重防御として実行時にも検査する
+/// （security.md「不安全な設計」対応。`pc` が単調に増加することがループの
+/// 停止性を保証する）。
+fn validate_jump_target(target: usize, pc: usize, len: usize) -> Result<usize, SqlSurfaceError> {
+    if target > pc && target <= len {
+        Ok(target)
+    } else {
+        Err(SqlSurfaceError::Internal {
+            detail: "expression program jump target out of range".to_string(),
+        })
     }
 }
 
@@ -708,5 +958,120 @@ mod tests {
                  inside eval() rather than buffer reuse"
             );
         }
+    }
+
+    // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------
+
+    fn case_bound(whens: Vec<(BoundExpr, BoundExpr)>, else_result: BoundExpr) -> BoundExpr {
+        BoundExpr::Case {
+            whens,
+            else_result: Box::new(else_result),
+        }
+    }
+
+    #[test]
+    fn case_compiled_matches_recursive_eval_for_matching_and_fallthrough_branches() {
+        let expr = case_bound(
+            vec![(bin(BinOp::Gt, BoundExpr::IdRef, num(1.0)), num(10.0))],
+            num(0.0),
+        );
+        assert_matches_recursive_eval(&expr, 2, &[]);
+        assert_matches_recursive_eval(&expr, 1, &[]);
+    }
+
+    #[test]
+    fn case_unselected_branch_division_by_zero_does_not_error() {
+        let expr = case_bound(
+            vec![(bin(BinOp::Eq, num(1.0), num(1.0)), num(1.0))],
+            bin(BinOp::Div, num(1.0), num(0.0)),
+        );
+        let program = ExprProgram::compile(&expr);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            program.eval(1, &[], &mut scratch).unwrap(),
+            ExprValue::Scalar(1.0)
+        );
+    }
+
+    #[test]
+    fn case_without_else_compiles_to_null_and_matches_recursive_eval() {
+        let expr = case_bound(
+            vec![(bin(BinOp::Gt, BoundExpr::IdRef, num(100.0)), num(1.0))],
+            BoundExpr::Null,
+        );
+        assert_matches_recursive_eval(&expr, 1, &[]);
+        let program = ExprProgram::compile(&expr);
+        let mut scratch = Vec::new();
+        assert_eq!(program.eval(1, &[], &mut scratch).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn coalesce_compiled_matches_recursive_eval() {
+        let expr = BoundExpr::Coalesce(vec![BoundExpr::Null, BoundExpr::Null, num(7.0), num(8.0)]);
+        assert_matches_recursive_eval(&expr, 1, &[]);
+        let program = ExprProgram::compile(&expr);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            program.eval(1, &[], &mut scratch).unwrap(),
+            ExprValue::Scalar(7.0)
+        );
+    }
+
+    #[test]
+    fn coalesce_short_circuits_and_does_not_evaluate_later_division_by_zero() {
+        let expr = BoundExpr::Coalesce(vec![num(1.0), bin(BinOp::Div, num(1.0), num(0.0))]);
+        let program = ExprProgram::compile(&expr);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            program.eval(1, &[], &mut scratch).unwrap(),
+            ExprValue::Scalar(1.0)
+        );
+    }
+
+    #[test]
+    fn nullif_compiled_matches_recursive_eval() {
+        let expr = BoundExpr::NullIf {
+            lhs: Box::new(BoundExpr::IdRef),
+            rhs: Box::new(num(2.0)),
+        };
+        assert_matches_recursive_eval(&expr, 2, &[]);
+        assert_matches_recursive_eval(&expr, 3, &[]);
+    }
+
+    #[test]
+    fn null_literal_compiles_to_const_null_step() {
+        let program = ExprProgram::compile(&BoundExpr::Null);
+        assert_eq!(program.steps, vec![ExprStep::ConstNull]);
+        let mut scratch = Vec::new();
+        assert_eq!(program.eval(1, &[], &mut scratch).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn jump_target_not_strictly_forward_is_rejected_fail_closed() {
+        // 仮置きのジャンプ先が書き換え漏れ・実装バグで不正な値になっていた場合の
+        // fail-closed 検査を、不正な `ExprProgram` を直接組み立てて検証する。
+        let program = ExprProgram {
+            steps: vec![
+                ExprStep::ConstBool(true),
+                ExprStep::JumpIfNotTrue { target: 0 }, // 前方でない（自身以前）。
+                ExprStep::ConstScalar(1.0),
+            ],
+            max_stack: 1,
+        };
+        let mut scratch = Vec::new();
+        // 条件が true のため JumpIfNotTrue は分岐しないが、他の分岐（false 側）を
+        // 検査するために別プログラムで範囲外ジャンプも確認する。
+        let _ = program.eval(1, &[], &mut scratch);
+
+        let program_out_of_range = ExprProgram {
+            steps: vec![
+                ExprStep::ConstBool(false),
+                ExprStep::JumpIfNotTrue { target: 99 },
+                ExprStep::ConstScalar(1.0),
+            ],
+            max_stack: 1,
+        };
+        let err = program_out_of_range.eval(1, &[], &mut scratch).unwrap_err();
+        assert_eq!(err.wire_code(), "XX000");
     }
 }

@@ -11,9 +11,11 @@
 //! 評価意味論: 分岐（`branches`）は宣言順に評価し、最初に真になった分岐で
 //! 短絡する（`OR` の標準意味論）。1 分岐の中は `AND` と同じ短絡評価
 //! （`metadata_filters` → `expr_filters` → 入れ子の `or_groups` の順）。
-//! NULL・埋め込み欠如（`references_embedding && dim == 0`）は既存の葉と同じく
-//! 「不一致（false）」としてその葉だけを false にする（`AND` のように行全体を
-//! 除外しない。分岐の他の葉・他の分岐は評価を続ける）。
+//! NULL・埋め込み欠如（`dim == 0` の行で `VECTOR` 列を実際に参照する式が
+//! `ExprProgram::eval` で `ExprValue::Null` を返すケース。`sql::expr_program`
+//! の `ExprStep::PushVector` 参照）は既存の葉と同じく「不一致（false）」として
+//! その葉だけを false にする（`AND` のように行全体を除外しない。分岐の他の
+//! 葉・他の分岐は評価を続ける）。
 
 use crate::declarative_filter::{self, MetadataFilter};
 use crate::row_codec::ScalarRef;
@@ -133,13 +135,18 @@ impl BoundConjunction {
         }
         for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
-            if references_embedding && dim == 0 {
-                return Ok(false);
-            }
+            // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
+            // 自身（`ExprStep::PushVector` の空スライス判定。`sql::expr_program`
+            // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査
+            // （`references_embedding`）による事前除外は `CASE` の選ばれない
+            // 分岐に embedding 参照があるだけの葉まで誤って偽にしていたため撤去
+            // し、評価時点の判定へ一本化した）。
             let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
             match program.eval(id, row_embedding, scratch)? {
                 ExprValue::Bool(true) => {}
-                ExprValue::Bool(false) => return Ok(false),
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921。PostgreSQL の 3 値論理と同じ扱い）。
+                ExprValue::Bool(false) | ExprValue::Null => return Ok(false),
                 // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式述語の
                 // 型を `Bool` に限定済みのため到達しない。
                 _ => {
