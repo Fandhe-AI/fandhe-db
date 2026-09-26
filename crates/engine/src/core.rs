@@ -2184,7 +2184,7 @@ impl EngineCore {
         // 異なるエラーコードを返す非決定的な契約になっていた。fail-closed の観点でも
         // エラー契約は入力の意味論的妥当性に関わらず一貫させるべきであり、statement
         // 種別のみで判定する）。
-        match crate::sql::allowlist::validate_sql(sql, &self.storage)? {
+        match crate::sql::allowlist::validate_sql_with_subquery_ctx(sql, &self.storage)? {
             crate::sql::allowlist::Statement::SetSearchMode { .. } => {
                 Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "SET search_mode requires a session-aware entry point",
@@ -2637,8 +2637,36 @@ impl EngineCore {
             return Ok(ParsedSql::AlterTable(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_sql_tokens(&tokens, &self.storage)?;
+        let stmt = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx(
+            &tokens,
+            &self.storage,
+            0,
+        )?;
         Ok(ParsedSql::Statement(stmt))
+    }
+
+    /// Issue #927・SQL-29 (a)・TASK-213: `Self::parse_sql_prepared` が拡張
+    /// クエリプロトコル経由のサブクエリを一律拒否するための、安価なテキスト
+    /// 走査（`Parser::require_subquery_depth` を経由せず、`sql::allowlist::
+    /// Parser` と同じ「直後が `SELECT` の `IN (`／`EXISTS (`」という判定条件
+    /// だけをトークン列全体に対して行う）。誤検出（列名 `in`／`exists` の
+    /// 通常参照）があっても安全側（拒否）に倒れるだけで、見逃し
+    /// （実際にサブクエリを含むのに検出しない）は無い判定条件そのもの
+    /// （`Parser::parse_where_leaf` の受理条件と同一）。
+    fn contains_subquery_syntax(tokens: &[crate::sql::lexer::Token]) -> bool {
+        use crate::sql::lexer::{Keyword, Token};
+        for i in 0..tokens.len() {
+            let is_exists = matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXISTS"))
+                && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
+                && matches!(tokens.get(i + 2), Some(Token::Keyword(Keyword::Select)));
+            let is_in = matches!(tokens.get(i + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN"))
+                && matches!(tokens.get(i + 2), Some(Token::Punct('(')))
+                && matches!(tokens.get(i + 3), Some(Token::Keyword(Keyword::Select)));
+            if is_exists || is_in {
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse（拡張クエリプロトコルの 'P' 種別。Issue #935・WIRE-12・TASK-217）:
@@ -2683,6 +2711,23 @@ impl EngineCore {
             ));
         }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
+        // Issue #927・SQL-29 (a)・TASK-213（拡張クエリプロトコルの注意点）:
+        // `sql::params::where_equality_literal_is_param` は元トークン列全体を
+        // 位置で走査し `Ident '=' $n` を数えて `equality_ordinal` 用の
+        // ダミーフラグ配列を組み立てる。本 Issue のサブクエリ解決
+        // （`sql::subquery::resolve_where_predicates`）は束縛前に新たな
+        // `WherePredicate::Equality` 葉を追加しうるため、これを許すと
+        // フラグ配列の添字と実際の束縛順序がずれ得る（`$n` を含まない
+        // 通常の等価条件の enum ダミー値検証スキップ判定が誤る恐れがある）。
+        // 拡張クエリプロトコル（Parse/Bind）経由のサブクエリは対象外とし、
+        // ダミー置換・束縛より前にここで検出して一律 `42601` で拒否する
+        // （fail-closed。簡易クエリプロトコル〔`Self::parse_sql`〕はこの
+        // 経路を通らないため影響しない）。
+        if Self::contains_subquery_syntax(&tokens) {
+            return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                "subquery is not supported over the extended query protocol (Parse/Bind)",
+            ));
+        }
         // ダミー置換前の元トークン列から判定する（置換後は `$n` 自体が
         // 消えるため、置換後トークン列からは判定できない）。
         let order_by_distance_literal_is_param =
@@ -3712,8 +3757,25 @@ impl EngineCore {
             // [`Self::run_aggregate_plan`] を共有する（TASK-186・NOSQL-4・NOSQL-5:
             // [`Self::execute_bound_aggregate_in_session`] が同じ実行本体を束縛済み
             // 計画向けに再利用する）。
-            crate::sql::allowlist::Statement::Aggregate(validated) => {
+            crate::sql::allowlist::Statement::Aggregate(mut validated) => {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
+                // （`bind_aggregate`）の前に WHERE 中のサブクエリ
+                // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
+                // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
+                // 解決する（`sql::subquery` モジュールドキュメント参照）。
+                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+                    validated.where_predicates,
+                    &schema,
+                    &read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_leaf_budget,
+                )?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
                 let result = self.run_aggregate_plan(
@@ -3734,8 +3796,22 @@ impl EngineCore {
             // [`Self::read_txn_with_schema`] を、実行本体は [`Self::run_scan_plan`]
             // を共有する（TASK-186・NOSQL-3: [`Self::execute_bound_scan_in_session`]
             // が同じ実行本体を束縛済み計画向けに再利用する）。
-            crate::sql::allowlist::Statement::Scan(validated) => {
+            crate::sql::allowlist::Statement::Scan(mut validated) => {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: `Statement::
+                // Aggregate` アームと同じ理由・同じ経路でサブクエリを解決する。
+                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+                    validated.where_predicates,
+                    &schema,
+                    &read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_leaf_budget,
+                )?;
                 let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
