@@ -327,6 +327,69 @@ fn is_null_and_is_not_null_partition_rows() {
     // 投影するため、このテスト自体がその形状を固定する。
 }
 
+/// codex-review 実機再現（PR #913 review 対応）: `HINT ORDER(DISTANCE, SCALAR,
+/// RLS)`（DISTANCE 先行）の下で `IS NULL`／`IS NOT NULL` を INTEGER 列（`qty`。
+/// 全行が非 NULL）へ適用する。DISTANCE 段の後で `candidate_columns`
+/// （`Value`）を `row_codec::ScalarRef` へ逆変換する経路が
+/// `Value::Integer`/`BigInt`/`Array` を実 NULL と同じ `None` へ丸めていたため、
+/// 非 NULL の INTEGER 列が `IS NULL` に fail-open で一致していた
+/// （`sql::exec` の `postfilter_verdicts` 修正で解消）。
+#[test]
+fn distance_first_is_null_excludes_non_null_integer_column() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_five_rows(&core, &alice);
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE qty IS NULL \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 100 \
+                 HINT ORDER(DISTANCE, SCALAR, RLS)"
+            ),
+        )
+        .expect("DISTANCE-first HINT ORDER should still apply IS NULL");
+    assert!(
+        ids(&result
+            .rows
+            .iter()
+            .map(|r| r.cells.clone())
+            .collect::<Vec<_>>())
+        .is_empty(),
+        "no row has a NULL qty; a non-empty result means IS NULL fail-opened \
+         on a non-NULL INTEGER column under DISTANCE-first postfilter"
+    );
+}
+
+#[test]
+fn distance_first_is_not_null_includes_non_null_integer_column() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_five_rows(&core, &alice);
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE qty IS NOT NULL \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 100 \
+                 HINT ORDER(DISTANCE, SCALAR, RLS)"
+            ),
+        )
+        .expect("DISTANCE-first HINT ORDER should still apply IS NOT NULL");
+    assert_eq!(
+        ids(&result
+            .rows
+            .iter()
+            .map(|r| r.cells.clone())
+            .collect::<Vec<_>>()),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
 #[test]
 fn not_equals_excludes_null_rows_via_three_valued_logic() {
     let (core, path) = new_core();

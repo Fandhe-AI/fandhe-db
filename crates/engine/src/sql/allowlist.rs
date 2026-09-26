@@ -2254,8 +2254,17 @@ impl<'a> Parser<'a> {
                     ));
                 }
             };
+            // `inner` は後置 `NOT`（`NOT LIKE`／`NOT IN`／`NOT BETWEEN`）により
+            // 既に `WherePredicate::Not(..)` を返している場合がある。前置 `NOT`
+            // をそのまま重ねると `Not(Not(x))` になり（三値論理では `x` と等価
+            // だが評価コストが二重になる）、前置 `NOT` を偶数個重ねた時と同型の
+            // 冗長な入れ子が際限なく増える。二重否定を畳んで単一の `Not` へ
+            // 正規化する（codex-review 実機再現: `NOT lang NOT IN (...)`）。
             return Ok(if negate_odd {
-                WherePredicate::Not(Box::new(inner))
+                match inner {
+                    WherePredicate::Not(x) => *x,
+                    other => WherePredicate::Not(Box::new(other)),
+                }
             } else {
                 inner
             });
@@ -6180,6 +6189,35 @@ mod tests {
             vec![WherePredicate::Not(Box::new(WherePredicate::Equality {
                 column: "lang".to_string(),
                 value: "ja".to_string(),
+            }))]
+        );
+    }
+
+    #[test]
+    fn folds_prefix_not_combined_with_postfix_negated_leaf() {
+        // codex-review 実機再現（PR #913）: 後置 NOT（`NOT IN`／`NOT BETWEEN`／
+        // `NOT LIKE`）が既に `WherePredicate::Not(..)` を返すため、前置 `NOT` を
+        // 単純に重ねると `Not(Not(x))` になっていた（三値論理では `x` と等価だが
+        // 「`Not` の内側が `Not` にならない」という構文段の不変条件が崩れる）。
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE NOT lang NOT IN ('ja', 'en') \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![WherePredicate::InList {
+                column: "lang".to_string(),
+                values: vec!["ja".to_string(), "en".to_string()],
+            }]
+        );
+        // 前置 `NOT` が偶数個（2 個）なら、後置 `NOT` 1 個分がそのまま残る。
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE NOT NOT lang NOT IN ('ja', 'en') \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![WherePredicate::Not(Box::new(WherePredicate::InList {
+                column: "lang".to_string(),
+                values: vec!["ja".to_string(), "en".to_string()],
             }))]
         );
     }

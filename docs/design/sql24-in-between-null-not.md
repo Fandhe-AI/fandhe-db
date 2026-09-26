@@ -127,6 +127,26 @@ flatten()` で NULL と同一視すると、`IsNull` が誤って真になる（
 再帰で直列化〕）を追加した。構文段が連続する `NOT` を偶奇で正規化するため、
 `NOT NOT x` と `x` は同じハッシュになる（意図した正規化）。
 
+## レビュー是正（PR #913・codex-review）
+
+- `sql::exec` の DISTANCE 先行（`HINT ORDER(DISTANCE, ...)`）SCALAR 事後
+  フィルタが、`candidate_columns`（`Value`）を判定直前に `row_codec::
+  ScalarRef` へ逆変換していたため、`Value::Integer`／`BigInt`／`Array`
+  （他の演算子では TEXT 前提のため従来 `None` へ丸めていた）が実 NULL
+  （`Value::Null` の逆変換結果も `None`）と区別できなくなっていた。本 Issue
+  で列型を問わず許容する `IsNull`/`IsNotNull` がこの `None` を「NULL」と
+  解釈するため、非 NULL の INTEGER/BIGINT/ARRAY 列が `IS NULL` に fail-open
+  で一致していた。`on_visible_row` が生の `ScalarRef`（実 NULL と型不一致を
+  区別できる）を見ている時点で判定結果を `postfilter_verdicts` として記録し、
+  DISTANCE 段の後は逆変換を経ずその真偽値を引くだけに変更して解消した
+  （`crates/engine/tests/sql24_in_between_null_not.rs` に回帰テストを追加）。
+- `sql::allowlist::Parser::parse_where_leaf` で、前置 `NOT` の内側が後置
+  `NOT`（`NOT LIKE`／`NOT IN`／`NOT BETWEEN`）由来の `WherePredicate::Not`
+  だった場合、それをそのまま包むと `Not(Not(x))` になり、上記「`Not` の内側が
+  `Not` になることはない」という構文段の不変条件に反していた（三値論理では
+  `x` と評価結果は等価）。畳み込み処理を追加し、単一の `Not`（または前置
+  `NOT` が偶数個なら畳んで消える）へ正規化した。
+
 ## 対象外・申し送り
 
 - CHECK 制約での新しい形の対応（`enforce` の三値化）

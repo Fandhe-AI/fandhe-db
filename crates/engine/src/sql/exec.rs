@@ -690,6 +690,21 @@ pub(crate) fn execute_statement_with_cache(
     // `on_visible_row` が `true` を返した行だけが順番に push される契約で担保する。
     let mut candidate_columns: Vec<Vec<Value>> = Vec::new();
 
+    // DISTANCE 先行（`!plan.scalar_prefilter`）の SCALAR 事後フィルタが読む
+    // 判定結果（SQL-24・TASK-208 是正）。`candidate_columns`（`Value`）を
+    // DISTANCE 段の後で `row_codec::ScalarRef` へ逆変換すると、`Value::Integer`／
+    // `BigInt`／`Array`（IN/BETWEEN 等 TEXT 前提の他フィルタでは未対応のため
+    // 従来 `None` へ倒していた）が実 NULL（`Value::Null` の逆変換結果も `None`）と
+    // 区別できなくなる。`IsNull`/`IsNotNull`（本 Issue で追加。VECTOR 以外の
+    // 全列型を許容する）はこの `None` を「NULL」と解釈するため、非 NULL の
+    // INTEGER/BIGINT/ARRAY 列が `IS NULL` に誤って一致する fail-open が生じる
+    // （codex-review 実機再現）。ここでは逆変換を経由せず、`on_visible_row` が
+    // 生の `row_codec::ScalarRef`（`scan_scalar_columns` 由来。実 NULL と
+    // 型不一致を区別できる）を直接見ている時点で判定結果だけを記録し、DISTANCE
+    // 段の後でその真偽値を引くだけにする（`candidate_columns` と 1 対 1、push 順も
+    // 同一。SCALAR 先行時は既に事前判定済みのため常に `true` を積む）。
+    let mut postfilter_verdicts: Vec<bool> = Vec::new();
+
     // 投影段（下記ループ）が実際に参照する Text 列インデックスの集合。`VECTOR` 列は
     // `scan_scalar_columns` が常に `None` を返すだけ（実体は `arena` から引く）ため
     // 対象外。この集合に含まれない列は `on_visible_row` で借用のまま素通りし、
@@ -776,6 +791,9 @@ pub(crate) fn execute_statement_with_cache(
         if defer_projection {
             debug_assert_eq!(candidate_columns.len(), slot);
             candidate_columns.push(Vec::new());
+            // `defer_projection` は `bound.metadata_filters.is_empty()` を前提と
+            // する（上記算出式）ため、SCALAR 事後フィルタは常に無条件一致。
+            postfilter_verdicts.push(true);
             return Ok(true);
         }
         // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
@@ -789,6 +807,15 @@ pub(crate) fn execute_statement_with_cache(
         // 下のループで選択的に複製する。
         let scanned = row_codec::scan_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+        // DISTANCE 先行時（`!plan.scalar_prefilter`）の SCALAR 事後フィルタ判定を
+        // ここで（生の `scanned: Vec<Option<ScalarRef>>` に対して）確定させ、
+        // `postfilter_verdicts` へ記録する。DISTANCE 段の後で `Value` から
+        // `ScalarRef` へ逆変換して判定し直すと実 NULL と型不一致（INTEGER・
+        // BIGINT・ARRAY 列）が区別できなくなる（上記 `postfilter_verdicts`
+        // 宣言のコメント参照）ため、区別可能なこの時点で 1 回だけ評価する。
+        // SCALAR 先行時は下の早期 return が担保する（到達すれば常に一致済み）。
+        let scalar_postfilter_matched = plan.scalar_prefilter
+            || declarative_filter::matches_all(&bound.metadata_filters, &scanned);
         // SCALAR 先行（既定）の場合のみここでメタデータフィルタ（TASK-147・EXT-3。
         // 等価・前方一致）を事前適用する。DISTANCE 先行（`HINT ORDER`）の場合は
         // 可視行を無条件に通過させ、DISTANCE 段の後で `apply_scalar_postfilter` が
@@ -960,6 +987,8 @@ pub(crate) fn execute_statement_with_cache(
         // 後続の投影で誤った行を返しうるため、デバッグビルドで不変条件を固定する。
         debug_assert_eq!(candidate_columns.len(), slot);
         candidate_columns.push(kept);
+        debug_assert_eq!(postfilter_verdicts.len(), slot);
+        postfilter_verdicts.push(scalar_postfilter_matched);
         Ok(true)
     };
 
@@ -1106,6 +1135,20 @@ pub(crate) fn execute_statement_with_cache(
                     for _ in 0..snapshot.arena().len() {
                         candidate_columns.push(Vec::new());
                     }
+                    // `cache_fast_path_eligible` は `bound.metadata_filters.is_empty()`
+                    // を前提とする（上記算出式）ため、SCALAR 事後フィルタは常に
+                    // 無条件一致（`postfilter_verdicts` のドキュメント参照）。
+                    postfilter_verdicts
+                        .try_reserve_exact(snapshot.arena().len())
+                        .map_err(|e| {
+                            map_arena_error(
+                                &bound.table,
+                                ArenaError::AllocationFailed(format!(
+                                    "failed to reserve postfilter verdict slots: {e}"
+                                )),
+                            )
+                        })?;
+                    postfilter_verdicts.resize(snapshot.arena().len(), true);
                     // Issue #453: `cache_hit_snapshot` を `.insert()`（排他借用）
                     // ではなく通常代入 + `.as_ref()`（共有借用）で埋める。投影段
                     // （`defer_projection`）が Top-k 確定後に `cache_hit_snapshot`
@@ -1902,10 +1945,10 @@ pub(crate) fn execute_statement_with_cache(
 
     // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
     // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
-    // いるため、ここで `candidate_columns`（`needed_column_indices` により対象列を
-    // 保持済み）と突合する。不一致・値の取得不能（データ不整合。fail-closed）は
-    // 除去する。返却件数が `limit` 未満になり得る（under-fetch。オーバーサンプルに
-    // よる救済は行わない）。
+    // いるため、ここで `postfilter_verdicts`（`on_visible_row` が生の
+    // `row_codec::ScalarRef` に対して判定済みの真偽値。宣言箇所のコメント参照）を
+    // 引く。値の取得不能（データ不整合。fail-closed）は除去する。返却件数が
+    // `limit` 未満になり得る（under-fetch。オーバーサンプルによる救済は行わない）。
     let hits: Vec<(u64, f64)> = if plan.scalar_prefilter {
         hits
     } else {
@@ -1927,34 +1970,14 @@ pub(crate) fn execute_statement_with_cache(
             let Some(slot) = usize::try_from(slot_id).ok() else {
                 continue;
             };
-            let Some(columns) = candidate_columns.get(slot) else {
+            // 索引信頼マスク経路（`mask_trusted_defer`）等、`on_visible_row` が
+            // 呼ばれずスロットに判定結果が記録されていない場合は fail-closed に
+            // 除去する（`candidate_columns` も同様に空のままであり従来から
+            // 同じ挙動）。
+            let Some(&matched) = postfilter_verdicts.get(slot) else {
                 continue;
             };
-            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = columns
-                .iter()
-                .map(|v| match v {
-                    Value::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
-                    Value::Real(r) => Some(row_codec::ScalarRef::Real(*r)),
-                    Value::Double(d) => Some(row_codec::ScalarRef::Double(*d)),
-                    Value::Enum(label) => Some(row_codec::ScalarRef::Enum(label.as_str())),
-                    Value::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
-                    Value::Bytes(b) => Some(row_codec::ScalarRef::Bytes(b.as_slice())),
-                    Value::Json(t) => Some(row_codec::ScalarRef::Json(t.as_str())),
-                    Value::Numeric(d) => Some(row_codec::ScalarRef::Numeric(*d)),
-                    Value::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
-                    Value::Date(d) => Some(row_codec::ScalarRef::Date(*d)),
-                    Value::Timestamp(t) => Some(row_codec::ScalarRef::Timestamp(*t)),
-                    // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector`・
-                    // `Integer`／`BigInt` と同じく型不一致として `None` へ倒す
-                    // （D-A8）。
-                    Value::Null
-                    | Value::Vector(_)
-                    | Value::Array(_)
-                    | Value::Integer(_)
-                    | Value::BigInt(_) => None,
-                })
-                .collect();
-            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
+            if !matched {
                 continue;
             }
             if !bound.expr_filter_programs.is_empty() {
