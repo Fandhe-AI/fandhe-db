@@ -397,11 +397,20 @@ fn compare_order_key(a: Option<&OrderValue>, b: Option<&OrderValue>, descending:
 /// 束縛段（`sql::parser::bind_scalar_order_by`）で確定した `kind` と一致しない場合は
 /// 実装バグとして `Internal`（`XX000`）を返す（fail-closed。untrusted 入力起因では
 /// なくスキーマとキー種別の対応が壊れているケース）。
+///
+/// `max_result_bytes` は経路 (B) の候補ヒープ予算上限（codex-review PR #1096
+/// 追加是正: 本関数は TEXT キーを `Vec<u8>` へ複製するが、複製前の借用長
+/// （`t.len()`）が単独でこの上限を超える場合は、以降どの予算判定を通しても
+/// この候補が保持され得ないと確定できるため、[`try_alloc_text_for_budget`]
+/// と同方針で複製前に `54000` へ拒否し、無制限な確保を避ける。確保自体も
+/// `try_reserve_exact` で fallible にし、ホスト側メモリ不足時も abort ではなく
+/// `Err` を返す）。
 fn extract_order_value(
     schema: &TableSchema,
     key: &BoundOrderKey,
     id: u64,
     scanned: &[Option<row_codec::ScalarRef<'_>>],
+    max_result_bytes: usize,
 ) -> Result<Option<OrderValue>, SqlSurfaceError> {
     let index = match key.target {
         BoundOrderTarget::Id => return Ok(Some(OrderValue::Id(id))),
@@ -417,7 +426,20 @@ fn extract_order_value(
         .ok_or_else(|| scan_bug("order key column index out of range"))?;
     match (&column.ty, key.kind, value) {
         (ColumnType::Text, OrderKind::Bytes, row_codec::ScalarRef::Text(t)) => {
-            Ok(Some(OrderValue::Bytes(t.as_bytes().to_vec())))
+            let bytes = t.as_bytes();
+            if bytes.len() > max_result_bytes {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "scan result exceeds capacity",
+                ));
+            }
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(bytes.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve order key text field: {e}"),
+                })?;
+            owned.extend_from_slice(bytes);
+            Ok(Some(OrderValue::Bytes(owned)))
         }
         (ColumnType::Integer, OrderKind::SignedInt, row_codec::ScalarRef::Integer(v)) => {
             Ok(Some(OrderValue::SignedInt(i64::from(*v))))
@@ -1293,7 +1315,13 @@ pub(crate) fn execute_scan_with_budget(
                 |_dim, scanned, _embedding| {
                     let mut keys = Vec::with_capacity(bound.order_by.len());
                     for key in &bound.order_by {
-                        keys.push(extract_order_value(schema, key, id, scanned)?);
+                        keys.push(extract_order_value(
+                            schema,
+                            key,
+                            id,
+                            scanned,
+                            max_result_bytes,
+                        )?);
                     }
                     Ok(keys)
                 },
@@ -1339,6 +1367,40 @@ pub(crate) fn execute_scan_with_budget(
         // カウンタとして扱い、以降の `try_accumulate_budget` 呼び出しが両者の
         // 合計を `max_result_bytes` 以下に fail-closed で制限する。
         byte_budget = heap_budget;
+
+        // Issue #916・SQL-25 (b)・TASK-209: 経路 (B) の `OFFSET` は
+        // `docs/design/sql-offset-paging.md`「ORDER BY なし OFFSET の意味論」節が
+        // 申し送る #915 統合事項（ソート確定後にスキップする契約）を、上のパス 1
+        // でのヒープ容量を `bound.limit + bound.offset` へ広げることで満たす
+        // （`heap.len() < ...` の判定を参照）。ここでは `heap.into_sorted_vec()`
+        // が返す確定済み順序の先頭から `bound.offset` 件を読み飛ばす（不可視行・
+        // WHERE 不一致行は既に候補から除外済みのため、ここで数えても他テナントの
+        // 存在・件数は漏えいしない）。
+        //
+        // codex-review PR #1096 追加是正: `OFFSET` で読み飛ばす候補は投影されない
+        // ため `byte_budget` へ加算されないが、`winner` 自体はここで破棄される
+        // まで、パス 1 が計上した分のメモリを実際に保持していた。この解放を
+        // 怠ると、読み飛ばし対象に大きな TEXT キーが集中する入力で、以降の
+        // 残り行の投影が実際の保持量より小さい `byte_budget` のまま
+        // `max_result_bytes` を実質迂回できた（line 1369 の
+        // `byte_budget = heap_budget` 引き継ぎと対称に、破棄のたびに同じ
+        // [`heap_entry_bytes`] で計上分を戻す）。この解放は下の
+        // `build_visible_row` クロージャが `byte_budget` を排他的に借用する
+        // 「前」に完了させる必要があるため（クロージャは存続期間中ずっと
+        // 借用を保持し、途中で直接代入できない）、読み飛ばし専用のループを
+        // クロージャ定義より前に独立させている。加算と解放が対称であることを
+        // 保証するため `saturating_sub` ではなく `checked_sub` を使い、対応が
+        // 崩れていれば fail-closed に `Internal` へ落とす（過小申告のまま
+        // 静かに処理を続けない）。
+        let mut sorted_winners = heap.into_sorted_vec().into_iter();
+        for winner in sorted_winners.by_ref().take(bound.offset) {
+            byte_budget = byte_budget
+                .checked_sub(heap_entry_bytes(&winner))
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "scan result byte budget underflow while releasing an offset-skipped candidate"
+                        .to_string(),
+                })?;
+        }
 
         // パス 2: 全順序で確定してから（`BinaryHeap::into_sorted_vec` は
         // `Ord` の昇順。`(tenant_id, id)` が一意な全順序のため安定性は
@@ -1386,19 +1448,7 @@ pub(crate) fn execute_scan_with_budget(
             )
         };
 
-        // Issue #916・SQL-25 (b)・TASK-209: 経路 (B) の `OFFSET` は
-        // `docs/design/sql-offset-paging.md`「ORDER BY なし OFFSET の意味論」節が
-        // 申し送る #915 統合事項（ソート確定後にスキップする契約）を、上のパス 1
-        // でのヒープ容量を `bound.limit + bound.offset` へ広げることで満たす
-        // （`heap.len() < ...` の判定を参照）。ここでは `heap.into_sorted_vec()`
-        // が返す確定済み順序の先頭から `bound.offset` 件を読み飛ばしてから
-        // 投影する（不可視行・WHERE 不一致行は既に候補から除外済みのため、ここで
-        // 数えても他テナントの存在・件数は漏えいしない）。
-        for winner in heap.into_sorted_vec() {
-            if skipped < bound.offset {
-                skipped += 1;
-                continue;
-            }
+        for winner in sorted_winners {
             let guard = table
                 .get((winner.tenant_id.as_str(), winner.id))
                 .map_err(storage_internal)?;
@@ -1857,6 +1907,190 @@ mod tests {
         // される 5 行分まで誤って計上すると（約 140000 バイト）超過する予算。
         let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 60_000)
             .expect("skipped rows must not count toward the result byte budget");
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![6, 7]);
+    }
+
+    /// codex-review PR #1096 追加是正の回帰: 経路 (B) の並べ替えキー抽出
+    /// （[`extract_order_value`]）は、単独で `max_result_bytes` を超える TEXT
+    /// キーを `to_vec()` で複製する前に長さを予算と照合し、`54000` で拒否する
+    /// （AGENTS.md の無制限リソース確保回避。修正前は複製後にしか判定せず、
+    /// 大きな TEXT 値・小さい予算〔`DECLARE CURSOR`〕の組合せで判定前に
+    /// 過大確保が起こり得た）。
+    #[test]
+    fn path_b_order_by_text_key_larger_than_budget_is_rejected_before_copying() {
+        let path = unique_db_path("scan-path-b-order-key-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("tag", ColumnType::Text, true)]);
+        storage.create_table(&schema).expect("create table");
+
+        // 並べ替えキー自体の長さが、以下で使う `max_result_bytes` を単独で
+        // 超えるようにする（複製すればどのみち予算超過だが、複製前に拒否
+        // されることを「複製せずに `54000` を返す」という観測可能な挙動
+        // （成功しないこと）で確認する）。
+        let huge_tag = "x".repeat(200_000);
+        let tenant_id = "tenant-a";
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            let metadata = crate::row_codec::encode_scalar_columns(
+                &schema,
+                &[crate::row_codec::Value::Text(huge_tag)],
+            )
+            .expect("encode scalar columns");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &metadata,
+            })
+            .expect("encode row");
+            table
+                .insert((tenant_id, 1u64), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+
+        let ctx = PolicyContext::new(tenant_id).expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 1,
+            order_by: vec![crate::sql::parser::BoundOrderKey {
+                target: crate::sql::parser::BoundOrderTarget::Column(0),
+                kind: crate::sql::parser::OrderKind::Bytes,
+                descending: false,
+            }],
+            offset: 0,
+        };
+
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
+            .expect_err("a single ORDER BY key larger than the cap must be rejected");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review PR #1096 追加是正の回帰: 経路 (B) パス 2 で `OFFSET` に
+    /// より読み飛ばす候補が保持していたヒープ予算（`byte_budget`）を解放する。
+    /// 修正前は破棄した候補分がそのまま計上され続け、読み飛ばし対象に大きい
+    /// TEXT キーが集中すると、実際には十分収まる残り行の投影までもが
+    /// `max_result_bytes` を実質迂回できないまま `54000` に誤って落ちていた。
+    #[test]
+    fn path_b_offset_skipped_candidates_release_their_heap_budget() {
+        let path = unique_db_path("scan-path-b-offset-release-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("tag", ColumnType::Text, true)]);
+        storage.create_table(&schema).expect("create table");
+
+        let write_row = |id: u64, tag: &str| {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(crate::catalog::user_rows_table_def(
+                        &crate::catalog::user_rows_table_name("docs"),
+                    ))
+                    .expect("open row table");
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[crate::row_codec::Value::Text(tag.to_string())],
+                )
+                .expect("encode scalar columns");
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[],
+                    metadata: &metadata,
+                })
+                .expect("encode row");
+                table
+                    .insert(("tenant-a", id), buf.as_slice())
+                    .expect("insert row");
+            }
+            crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+        };
+
+        // 昇順ソートで先頭（"a" < "z"）に来て `OFFSET` により読み飛ばされる、
+        // 大きな TEXT キーを持つ行。
+        let skipped_tag = "a".repeat(20_000);
+        for id in 1..=5u64 {
+            write_row(id, &skipped_tag);
+        }
+        // 昇順ソートで末尾に来て、実際に返却される小さな TEXT キーの行。
+        for id in 6..=7u64 {
+            write_row(id, "z");
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 0,
+                    name: "tag".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 10,
+            order_by: vec![crate::sql::parser::BoundOrderKey {
+                target: crate::sql::parser::BoundOrderTarget::Column(0),
+                kind: crate::sql::parser::OrderKind::Bytes,
+                descending: false,
+            }],
+            offset: 5,
+        };
+
+        // パス 1 終了時点のヒープ候補 7 件分（`heap_entry_bytes` と同じ計算式。
+        // `heap_capacity`〔`limit + offset` = 15〕が実件数 7 を上回るため、
+        // どちらの候補も追い出されず全件がパス 2 開始時点の予算を占める）。
+        let tenant_id_len = "tenant-a".len();
+        let heap_entry_overhead = std::mem::size_of::<HeapEntry>()
+            .saturating_add(std::mem::size_of::<Option<OrderValue>>())
+            .saturating_add(tenant_id_len);
+        let skipped_entry_bytes = heap_entry_overhead.saturating_add(skipped_tag.len());
+        let kept_entry_bytes = heap_entry_overhead.saturating_add(1); // tag == "z"
+        let peak_heap_bytes = 5usize
+            .saturating_mul(skipped_entry_bytes)
+            .saturating_add(2usize.saturating_mul(kept_entry_bytes));
+
+        // 返却される行 1 件分の投影コスト（`per_row_struct_bytes` + TEXT 実体）。
+        let cell_struct_bytes = bound
+            .projection
+            .len()
+            .saturating_mul(std::mem::size_of::<Cell>());
+        let per_row_struct_bytes =
+            cell_struct_bytes.saturating_add(std::mem::size_of::<ResultRow>());
+        let per_kept_row_projection_bytes = per_row_struct_bytes.saturating_add(1); // tag == "z"
+
+        // 解放しなければ「パス 1 のピーク（5 行分の巨大 TEXT キーを含む）＋
+        // 返却 2 行分の投影コスト」が必要になるが、解放すれば「返却 2 行分の
+        // ヒープ候補＋投影コスト」で足りる。両者の間に収まる予算を使うことで、
+        // 解放漏れがあれば必ず `54000` になる（解放されていれば十分な余白で
+        // 成功する）ことを固定する。
+        let cap = peak_heap_bytes.saturating_add(2 * per_kept_row_projection_bytes) - 1;
+        let with_release_requirement =
+            (2 * kept_entry_bytes).saturating_add(2 * per_kept_row_projection_bytes);
+        assert!(
+            cap > with_release_requirement,
+            "test cap must leave headroom once offset-skipped candidates are released"
+        );
+
+        let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, cap)
+            .expect("offset-skipped candidates must release their heap budget");
         let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![6, 7]);
     }
