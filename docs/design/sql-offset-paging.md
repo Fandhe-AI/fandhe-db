@@ -97,9 +97,12 @@
 別の文でページを取得する間に書き込み（挿入・削除）があれば、他の RDBMS の
 `OFFSET`（例: PostgreSQL）と同様に行の重複・欠落が起こりうる。安定したページング
 が必要な場合は明示トランザクション内のカーソル（`DECLARE`/`FETCH`。WIRE-15）を
-推奨する。スカラー `ORDER BY`（SQL-25 (a)、Issue #915）実装後は「ソート確定後に
-`OFFSET` を適用する」契約（本 ADR の `GROUP BY` 経路と同型）を広域取得側にも
-適用する必要があり、#915 の統合事項として申し送る。
+推奨する。スカラー `ORDER BY`（SQL-25 (a)、Issue #915）との統合により、「ソート
+確定後に `OFFSET` を適用する」契約（本 ADR の `GROUP BY` 経路と同型）は広域取得
+側にも適用済み: 経路 (A)（先頭キーが疑似列 `id`）は物理走査順がソート確定順と
+一致するためスキャン中に読み飛ばし、経路 (B)（上位 N 件 2 パス）はパス 1 の
+`BinaryHeap` 容量を `limit + offset` に広げてからパス 2 の確定済み順序の先頭
+`offset` 件を読み飛ばす（`crates/engine/src/sql/scan.rs::execute_scan_with_budget`）。
 
 ## 方式比較: `OFFSET` とカーソル・keyset
 
@@ -137,5 +140,3 @@ O(可視行数 + `G log G`)（`G` はグループ数）のまま変わらない�
 - NoSQL `scan`/`aggregate` の `offset`: #947（NOSQL-15・TASK-224）。本 Issue は
   `validate_search_offset`・`BoundScan::with_offset` を再利用可能な形で用意する
   のみ。
-- スカラー `ORDER BY` との組み合わせ（ソート後スキップの統合）: #915 の統合事項
-  （上記「`ORDER BY` なし `OFFSET` の意味論」節参照）。
