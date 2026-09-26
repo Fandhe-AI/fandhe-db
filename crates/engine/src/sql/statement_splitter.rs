@@ -264,6 +264,14 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         Token::Ident(name) if name.eq_ignore_ascii_case("DECLARE") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("FETCH") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("CLOSE") => StatementEffect::ReadOnly,
+        // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）は
+        // `sql::allowlist::validate_sql_tokens` の `WITH` 分岐が主クエリを
+        // 広域取得（`Statement::Scan`）のみに限定し、データ変更 CTE
+        // （`WITH x AS (DELETE ...)` 等）は本文が `SELECT` 以外のため構造検証
+        // 段で `42601` になり `Statement` 自体が生成されない。したがって
+        // `WITH` を `ReadOnly` に分類しても、複数文メッセージの書き込み配置
+        // 制約（本関数の呼び出し元）をすり抜けて副作用が生じることはない。
+        Token::Ident(name) if name.eq_ignore_ascii_case("WITH") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("SET") => StatementEffect::SessionLocal,
         Token::Ident(name) if name.eq_ignore_ascii_case("BEGIN") => {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
@@ -510,6 +518,13 @@ mod tests {
             StatementEffect::Write
         );
         assert_eq!(classify_statement("DROP INDEX i"), StatementEffect::Write);
+        // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）は読み取り系
+        // （`sql::allowlist::validate_sql_tokens` の `WITH` 分岐が受理する形は
+        // 主クエリが広域取得のみで、書き込みを持たない）。
+        assert_eq!(
+            classify_statement("WITH x AS (SELECT id FROM t) SELECT * FROM x LIMIT 1"),
+            StatementEffect::ReadOnly
+        );
         assert!(check_write_placement(&["CREATE INDEX i ON t (body)", "SELECT 1"], false).is_err());
         assert!(check_write_placement(&["SELECT 1", "DROP INDEX i"], false).is_ok());
         assert_eq!(

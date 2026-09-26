@@ -3515,6 +3515,11 @@ pub struct BoundAggregateItem {
     /// `AS <alias>` の指定値、省略時は関数名小文字
     /// （[`crate::sql::allowlist::AggregateFunc::default_alias`]）。
     pub(crate) name: String,
+    /// `COUNT(DISTINCT <expr>)` の修飾子（SQL-25 (c)・TASK-209）。`func !=
+    /// Count` では常に `false`（[`resolve_aggregate_input`] が `COUNT` 以外での
+    /// `DISTINCT` を構造的に拒否済み）。[`Self::bind`]（クレート外からの直接
+    /// 構築経路）は常に `false` 固定（NoSQL 表層での DISTINCT はスコープ外）。
+    pub(crate) distinct: bool,
 }
 
 impl BoundAggregateItem {
@@ -3556,7 +3561,12 @@ impl BoundAggregateItem {
         let input = resolve_aggregate_input(func, &arg, schema, &udfs, &mut node_budget)?;
         let name = func.default_alias().to_string();
 
-        Ok(BoundAggregateItem { func, input, name })
+        Ok(BoundAggregateItem {
+            func,
+            input,
+            name,
+            distinct: false,
+        })
     }
 
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）。
@@ -3570,14 +3580,15 @@ impl BoundAggregateItem {
     }
 }
 
-/// SELECT リストの出力列 1 つ（TASK-167・SQL-14）。`GROUP BY` なしの単一行集計
-/// （TASK-166・SQL-13）では `bind_aggregate` が `items` の宣言順で自動生成し、既存
-/// 挙動を変えない。`GROUP BY` ありの場合は `AggregateSelectItem::GroupKey`／
-/// `Aggregate` の並び順をそのまま反映する。
+/// SELECT リストの出力列 1 つ（TASK-167・SQL-14。SQL-25 (d) で複数列 `GROUP BY`
+/// へ拡張）。`GROUP BY` なしの単一行集計（TASK-166・SQL-13）では `bind_aggregate`
+/// が `items` の宣言順で自動生成し、既存挙動を変えない。`GROUP BY` ありの場合は
+/// `AggregateSelectItem::GroupKey`／`Aggregate` の並び順をそのまま反映する。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProjectionColumn {
-    /// `GROUP BY` 列の値（`sql::group_by::GroupKey` から復元）。
-    GroupKey { name: String },
+    /// `GROUP BY` 列の値（`sql::group_by::GroupKey` の `key_index` 番目の成分から
+    /// 復元。`key_index` は [`BoundGroupBy::column_indices`] の添字）。
+    GroupKey { key_index: usize, name: String },
     /// `items[item_index]` の集計結果。
     Aggregate { item_index: usize, name: String },
 }
@@ -3592,10 +3603,11 @@ pub(crate) struct BoundHaving {
     pub(crate) literal: f64,
 }
 
-/// `ORDER BY` 対象を束縛した形（TASK-167・SQL-14）。
+/// `ORDER BY` 対象を束縛した形（TASK-167・SQL-14。SQL-25 (d) で `GroupKey` に
+/// キー番号〔[`BoundGroupBy::column_indices`] の添字〕を持たせた）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum OrderTarget {
-    GroupKey,
+    GroupKey(usize),
     Aggregate(usize),
 }
 
@@ -3605,11 +3617,12 @@ pub(crate) struct BoundOrderBy {
     pub(crate) descending: bool,
 }
 
-/// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14）。`column_index` は `schema.columns`
-/// の添字（束縛段で `TEXT` 列であることを確認済み）。
+/// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張）。
+/// `column_indices` は宣言順を保持した `schema.columns` の添字列（束縛段で全て
+/// `TEXT` 列であることを確認済み）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundGroupBy {
-    pub(crate) column_index: usize,
+    pub(crate) column_indices: Vec<usize>,
     pub(crate) having: Vec<BoundHaving>,
     pub(crate) order_by: Option<BoundOrderBy>,
     pub(crate) limit: Option<usize>,
@@ -3714,28 +3727,12 @@ impl BoundAggregate {
         })
     }
 
-    /// クレート外から `GROUP BY`／`HAVING` 付き実行計画を直接構築する
-    /// constructor（TASK-186・NOSQL-5。[`Self::new`] の `GROUP BY` あり版。
-    /// SQL テキストを一切組み立てず、列名解決（[`resolve_group_by_column`]）・
-    /// HAVING 対象の型検査（[`check_having_target_is_numeric`]）を SQL テキスト
-    /// 経由の [`bind_group_by_clause`] と共有する）。
-    ///
-    /// `items`（空・[`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 超過）は
-    /// [`Self::new`] と同じ検査・分類（`42601`／`54000`）。`having` の件数は
-    /// [`crate::sql::allowlist::check_having_predicate_count`]（`54000`。
-    /// `Vec` 確保より前）、各 [`HavingSpec::literal`] の非有限は
-    /// [`SqlSurfaceError::unsupported`]（`42601`。SQL 側の数値リテラル構文
-    /// 自体が非有限値を表現できないのと同じ分類）、`item_index` が `items` の
-    /// 範囲外・対象が `TEXT` 型の `MIN`/`MAX` は
-    /// [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する。
-    ///
-    /// `group_by_column` は `schema` 上の既存 `TEXT` 列名限定（未知列・
-    /// `VECTOR` 列・疑似列 `id` はいずれも `22000`）。`ORDER BY`／`LIMIT`
-    /// 相当は本入口の対象外（`order_by: None`・`limit: None` 固定。NoSQL
-    /// 表層のスキーマにこれらに相当するキーが存在しないため）。`projection`
-    /// は `[GroupKey{name: group_by_column}] ++ items`（宣言順）の規範形に
-    /// 固定する（SQL の規範形 `SELECT <col>, <aggs...> FROM t GROUP BY <col>`
-    /// と同一の列順・既定エイリアス名）。`rls_predicate_present` は
+    /// クレート外から単一列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
+    /// constructor（TASK-186・NOSQL-5。[`Self::new`] の `GROUP BY` あり版）。
+    /// SQL-25 (d) で複数列へ拡張した [`Self::new_grouped_by_columns`] へ
+    /// `&[group_by_column]` を渡すだけの委譲になり、挙動・エラー分類は変わらない
+    /// （既存呼び出し元の互換性を維持する。破壊的変更にしない）。詳細な検査内容は
+    /// [`Self::new_grouped_by_columns`] のドキュメント参照。
     /// [`Self::new`] と同じ理由で常に `false` 固定。
     pub fn new_grouped(
         table: String,
@@ -3743,6 +3740,48 @@ impl BoundAggregate {
         metadata_filters: Vec<MetadataFilter>,
         expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
         group_by_column: &str,
+        having: Vec<HavingSpec>,
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
+        Self::new_grouped_by_columns(
+            table,
+            items,
+            metadata_filters,
+            expr_filters,
+            &[group_by_column],
+            having,
+            schema,
+        )
+    }
+
+    /// クレート外から複数列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
+    /// constructor（SQL-25 (d)。[`Self::new_grouped`] の複数キー版で、単一列
+    /// 経路は本関数へ `&[group_by_column]` を渡すだけの委譲になった）。
+    /// SQL テキストを一切組み立てず、列名解決（[`resolve_group_by_column`]）・
+    /// HAVING 対象の型検査（[`check_having_target_is_numeric`]）を SQL テキスト
+    /// 経由の [`bind_group_by_clause`] と共有する。
+    ///
+    /// `items`（空・[`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 超過）・
+    /// `having`（件数・非有限リテラル・範囲外 `item_index`・非数値対象）の検査は
+    /// [`Self::new_grouped`] と同じ。`group_by_columns` は空スライスなら `42601`
+    /// （SQL テキスト側で `GROUP BY` に列 0 個は構文的に書けないのと同じ分類）、
+    /// [`crate::sql::allowlist::MAX_GROUP_BY_COLUMNS`] 超過は `54000`
+    /// （[`crate::sql::allowlist::check_group_by_column_count`] と同じ判定を
+    /// `Vec` 確保より前に行う）、重複する列名は `42601`（SQL テキスト経由の
+    /// `Parser::parse_group_by_clause` と同じ分類）、各列は `schema` 上の既存
+    /// `TEXT` 列名限定（未知列・`VECTOR` 列・疑似列 `id` はいずれも `22000`）。
+    /// `ORDER BY`／`LIMIT` 相当は本入口の対象外（`order_by: None`・`limit: None`
+    /// 固定。NoSQL 表層のスキーマにこれらに相当するキーが存在しないため）。
+    /// `projection` は `[GroupKey{0..k}] ++ items`（宣言順）の規範形に固定する
+    /// （SQL の規範形 `SELECT <col...>, <aggs...> FROM t GROUP BY <col...>` と
+    /// 同一の列順・既定エイリアス名）。`rls_predicate_present` は [`Self::new`]
+    /// と同じ理由で常に `false` 固定。
+    pub fn new_grouped_by_columns(
+        table: String,
+        items: Vec<BoundAggregateItem>,
+        metadata_filters: Vec<MetadataFilter>,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        group_by_columns: &[&str],
         having: Vec<HavingSpec>,
         schema: &TableSchema,
     ) -> Result<Self, SqlSurfaceError> {
@@ -3754,7 +3793,24 @@ impl BoundAggregate {
         crate::sql::allowlist::check_aggregate_item_count(items.len())?;
         crate::sql::allowlist::check_having_predicate_count(having.len())?;
 
-        let column_index = resolve_group_by_column(schema, group_by_column)?;
+        if group_by_columns.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "GROUP BY must reference at least one column",
+            ));
+        }
+        crate::sql::allowlist::check_group_by_column_count(group_by_columns.len())?;
+        for (i, a) in group_by_columns.iter().enumerate() {
+            if group_by_columns[..i].contains(a) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "duplicate GROUP BY column {a:?}"
+                )));
+            }
+        }
+
+        let mut column_indices = Vec::with_capacity(group_by_columns.len());
+        for column in group_by_columns {
+            column_indices.push(resolve_group_by_column(schema, column)?);
+        }
 
         let mut bound_having = Vec::with_capacity(having.len());
         for spec in having {
@@ -3777,10 +3833,13 @@ impl BoundAggregate {
             });
         }
 
-        let mut projection = Vec::with_capacity(items.len() + 1);
-        projection.push(ProjectionColumn::GroupKey {
-            name: group_by_column.to_string(),
-        });
+        let mut projection = Vec::with_capacity(items.len() + group_by_columns.len());
+        for (key_index, column) in group_by_columns.iter().enumerate() {
+            projection.push(ProjectionColumn::GroupKey {
+                key_index,
+                name: column.to_string(),
+            });
+        }
         for (item_index, item) in items.iter().enumerate() {
             projection.push(ProjectionColumn::Aggregate {
                 item_index,
@@ -3799,7 +3858,7 @@ impl BoundAggregate {
             rls_predicate_present: false,
             projection,
             group_by: Some(BoundGroupBy {
-                column_index,
+                column_indices,
                 having: bound_having,
                 order_by: None,
                 limit: None,
@@ -4019,6 +4078,103 @@ fn resolve_aggregate_input(
     }
 }
 
+/// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）の入力解決。関数は常に
+/// `COUNT` のため `resolve_aggregate_input` と異なり `func` を引数に取らない。
+/// `resolve_aggregate_input` との差分:
+///
+/// - `id` は（`COUNT(id)` が `AllVisible` へ縮退するのと異なり）実際の値が
+///   異なり数の判定に必要なため常に [`AggregateInput::IdU64`] に束縛する。
+/// - `VECTOR` 列は正準等価の定義を持たないため `22000`
+///   （[`SqlSurfaceError::invalid_input`]）で拒否する（非 DISTINCT の
+///   `COUNT(<VECTOR 列>)` は `VectorColumnPresence` へ縮退するが、DISTINCT は
+///   実際の embedding 値同士の比較を要求するため対象外）。
+/// - `ARRAY`／`JSON`／`JSONB` 列も同じ理由（正準等価未定義）で `22000`。
+/// - それ以外の列型（`TEXT`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
+///   `BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`BYTEA`／`UUID`／`ENUM`）は
+///   `resolve_aggregate_input` と同じ `AggregateInput::*Column` へ束縛する
+///   （`sql::aggregate::Accumulator::observe_distinct` が `scanned` から実値を
+///   直接読み、`Accumulator::observe` の「存在のみを数える」経路とは独立に
+///   異なり値を判定する）。
+/// - `<Scalar 式>`（組み込み関数・UDF・四則演算）は受理する（結果の `f64` を
+///   [`crate::sql::distinct::canon_f64`] で正準化してキーにする）。
+fn resolve_count_distinct_input(
+    arg: &crate::sql::allowlist::AggregateArg,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateArg;
+    use crate::sql::udf_call::ExprType;
+
+    match arg {
+        // 構文層（`Parser::parse_aggregate_item`）が `COUNT(DISTINCT *)` を
+        // 既に `42601` で拒否しているため、ここへは到達しない想定だが、直接
+        // 構築経路が生まれた場合に備えて fail-closed に扱う。
+        AggregateArg::Star => Err(SqlSurfaceError::unsupported(
+            "COUNT(DISTINCT *) is not supported",
+        )),
+        AggregateArg::Expr(Expr::Ident(name)) => {
+            if let Some((index, column)) = schema
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| &c.name == name)
+            {
+                return match &column.ty {
+                    ColumnType::Text => Ok(AggregateInput::TextColumn(index)),
+                    ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
+                    ColumnType::BigInt => Ok(AggregateInput::BigIntColumn(index)),
+                    ColumnType::Real => Ok(AggregateInput::RealColumn(index)),
+                    ColumnType::Double => Ok(AggregateInput::DoubleColumn(index)),
+                    ColumnType::Boolean => Ok(AggregateInput::BooleanColumn(index)),
+                    ColumnType::Date => Ok(AggregateInput::DateColumn(index)),
+                    ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
+                    ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::Bytea => Ok(AggregateInput::ByteaColumn(index)),
+                    ColumnType::Json | ColumnType::Jsonb => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is JSON and cannot be used with COUNT(DISTINCT ...)"
+                        )))
+                    }
+                    ColumnType::Enum(_) => Ok(AggregateInput::EnumColumn(index)),
+                    ColumnType::Numeric { precision, scale } => Ok(AggregateInput::NumericColumn {
+                        index,
+                        precision: *precision,
+                        scale: *scale,
+                    }),
+                    ColumnType::Uuid => Ok(AggregateInput::UuidColumn(index)),
+                };
+            }
+            if name == "id" {
+                return Ok(AggregateInput::IdU64);
+            }
+            Err(SqlSurfaceError::invalid_input(format!(
+                "unknown column: {name}"
+            )))
+        }
+        AggregateArg::Expr(expr) => {
+            let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+            match ty {
+                ExprType::Scalar => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::ScalarExpr {
+                        source: bound,
+                        program,
+                    })
+                }
+                ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
+                    "aggregate argument must evaluate to a scalar",
+                )),
+            }
+        }
+    }
+}
+
 /// [`crate::sql::allowlist::ValidatedAggregate`] を `schema`・UDF レジストリ `udfs`
 /// と照合して [`BoundAggregate`] へ束縛する（TASK-166・SQL-13 の公開 API。
 /// TASK-167・SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` の束縛を追加。
@@ -4060,9 +4216,9 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
-    // GROUP BY 列名（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/`LIMIT`
-    // 束縛より前に確定させる。`GROUP BY` なしなら `None`）。
-    let group_by_column = stmt.group_by().map(|g| g.column.as_str());
+    // GROUP BY 列名一覧（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/
+    // `LIMIT` 束縛より前に確定させる。`GROUP BY` なしなら空スライス）。
+    let group_by_columns: &[String] = stmt.group_by().map(|g| g.columns.as_slice()).unwrap_or(&[]);
 
     let mut items = Vec::new();
     let mut projection = Vec::with_capacity(stmt.items().len());
@@ -4073,13 +4229,22 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // `ORDER BY` から unknown 扱いされる。PR #230 codex-review P1 指摘対応:
     // `SELECT lang AS a, lang AS b, ...` のように同一 `GROUP BY` 列を複数回
     // 別名で射影できるため、単一 `Option<String>` では後勝ちで先のエイリアスが
-    // 失われる。全エイリアスを保持する `Vec<String>` にする）。
-    let mut group_key_aliases: Vec<String> = Vec::new();
+    // 失われる。全エイリアスを保持する。SQL-25 (d) で複数列化: どのキー番号
+    // （`group_by_columns` の添字）に付けられたエイリアスかを保持するため
+    // `Vec<(usize, String)>` にする）。
+    let mut group_key_aliases: Vec<(usize, String)> = Vec::new();
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
-                let input =
-                    resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?;
+                // SQL-25 (c)・TASK-209: `DISTINCT` 修飾の有無で入力解決を分ける
+                // （`resolve_count_distinct_input` は `id`/`VECTOR`/`ARRAY`/
+                // `JSON` の扱いが非 DISTINCT の `resolve_aggregate_input` と
+                // 異なる。`item.distinct` は構文層で `COUNT` 限定に絞り込み済み）。
+                let input = if item.distinct {
+                    resolve_count_distinct_input(&item.arg, schema, udfs, &mut node_budget)?
+                } else {
+                    resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?
+                };
                 let name = item
                     .alias
                     .clone()
@@ -4089,20 +4254,34 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                     func: item.func,
                     input,
                     name: name.clone(),
+                    distinct: item.distinct,
                 });
                 projection.push(ProjectionColumn::Aggregate { item_index, name });
             }
             // `allowlist::parse_aggregate_shape` が `GROUP BY` 句自体の有無・
-            // 列名一致を構造検証済みのため、ここへ到達する `GroupKey` 項目は常に
-            // `group_by_column` と同名（構造上の前提。念のため `unwrap_or` で
-            // フォールバックせず明示的に確認する）。
+            // 列名一致（いずれかの `GROUP BY` 列と同名）を構造検証済みのため、
+            // ここへ到達する `GroupKey` 項目は必ず `group_by_columns` のいずれか
+            // 1 つと同名（構造上の前提）。`key_index` はその位置。
             AggregateSelectItem::GroupKey { column, alias } => {
-                debug_assert_eq!(Some(column.as_str()), group_by_column);
+                let key_index = match group_by_columns.iter().position(|c| c == column) {
+                    Some(index) => index,
+                    None => {
+                        // 構文層が既に列名一致を検証済み（上記コメント参照）。
+                        // 到達しないはずの分岐だが、行経路の `unwrap`/`expect`
+                        // 相当を避けるため internal エラーへ落とし panic も
+                        // fail-open な既定値継続もさせず、`Err` を返す
+                        // （`.claude/rules/coding-rust.md`・`security.md`
+                        // 「fail-open にする変更は P0」）。
+                        return Err(crate::sql::aggregate::accumulator_bug(
+                            "GroupKey column must match a GROUP BY column at this point",
+                        ));
+                    }
+                };
                 let name = alias.clone().unwrap_or_else(|| column.clone());
                 if let Some(alias) = alias.clone() {
-                    group_key_aliases.push(alias);
+                    group_key_aliases.push((key_index, alias));
                 }
-                projection.push(ProjectionColumn::GroupKey { name });
+                projection.push(ProjectionColumn::GroupKey { key_index, name });
             }
         }
     }
@@ -4176,6 +4355,10 @@ pub struct BoundScan {
     /// Issue #916・SQL-25 (b)・TASK-209）。既定は 0（no-op）で、[`Self::new`] 経由の
     /// 直接構築（TASK-186・NOSQL-3）や既存呼び出し元との後方互換を保つ。
     pub(crate) offset: usize,
+    /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得と
+    /// 完全に同一の実行経路（`sql::scan::execute_scan_with_budget`）を通る。
+    /// [`Self::new`]（NoSQL 表層の直接構築経路）は常に空にする。
+    pub(crate) windows: Vec<BoundWindowItem>,
 }
 
 impl BoundScan {
@@ -4210,6 +4393,7 @@ impl BoundScan {
             or_filters: Vec::new(),
             limit,
             offset: 0,
+            windows: Vec::new(),
         }
     }
 
@@ -4266,6 +4450,217 @@ impl BoundScan {
     pub fn limit(&self) -> usize {
         self.limit
     }
+
+    /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得。
+    /// `BoundWindowItem` が `pub(crate)` のためクレート外には公開しない
+    /// （`sql::scan::execute_scan_with_budget` が dispatch 判定に使う）。
+    pub(crate) fn windows(&self) -> &[BoundWindowItem] {
+        &self.windows
+    }
+}
+
+/// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の束縛済み比較キー。
+/// `PARTITION BY`／`ORDER BY` が参照する列を、パーティション分割・安定ソートが
+/// 直接使える形へ解決する（[`resolve_window_key`] 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowKeyKind {
+    Text,
+    Integer,
+    BigInt,
+    Real,
+    Double,
+    Boolean,
+    Date,
+    Timestamp,
+    Numeric,
+    Uuid,
+}
+
+/// ウィンドウ項目の `PARTITION BY`／`ORDER BY` キー 1 つ（SQL-30・TASK-214）。
+/// `Id` は疑似列 `id`（`u64`。全順序を持ち NULL を取らない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowKeyRef {
+    Id,
+    Column { index: usize, kind: WindowKeyKind },
+}
+
+/// 束縛済みのウィンドウ項目（SQL-30・TASK-214、Issue #930）。
+/// [`crate::sql::window::execute_window_scan`] がパーティション分割・安定ソート・
+/// peer 評価の入力として使う。`input`（`None` は順位関数・`Some` は集計関数の
+/// 引数）は [`AggregateInput`] を再利用し、集計本体（`Accumulator`）を
+/// `sql::aggregate` と共有する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundWindowItem {
+    /// SELECT リスト全体（通常項目・ウィンドウ項目を通した）における出現位置。
+    pub(crate) position: usize,
+    pub(crate) func: crate::sql::allowlist::WindowFunc,
+    pub(crate) input: Option<AggregateInput>,
+    pub(crate) partition_by: Vec<WindowKeyRef>,
+    /// `(キー, 降順か)` の順序保持リスト。
+    pub(crate) order_by: Vec<(WindowKeyRef, bool)>,
+    pub(crate) name: String,
+}
+
+/// ウィンドウ項目の `PARTITION BY`／`ORDER BY` キー 1 つの列名を `schema` と
+/// 照合する（SQL-30・TASK-214）。受理する型は [`resolve_aggregate_input`] の
+/// `MIN`/`MAX` 受理型と同じ全順序を持つ型（`TEXT`／`INTEGER`／`BIGINT`／
+/// `REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／
+/// `UUID`／疑似列 `id`）。正準等価・全順序を持たない `VECTOR`／`ARRAY`／
+/// `JSON`／`JSONB`／`BYTEA`／`ENUM` は型不整合（`22000`）で拒否する
+/// （SQL-25 の `DISTINCT(VECTOR)` 拒否・`resolve_count_distinct_input` の
+/// `VECTOR`/`ARRAY`/`JSON` 拒否と同じ設計判断）。
+fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, SqlSurfaceError> {
+    if let Some((index, column)) = schema
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.name == name)
+    {
+        let kind = match &column.ty {
+            ColumnType::Text => WindowKeyKind::Text,
+            ColumnType::Integer => WindowKeyKind::Integer,
+            ColumnType::BigInt => WindowKeyKind::BigInt,
+            ColumnType::Real => WindowKeyKind::Real,
+            ColumnType::Double => WindowKeyKind::Double,
+            ColumnType::Boolean => WindowKeyKind::Boolean,
+            ColumnType::Date => WindowKeyKind::Date,
+            ColumnType::Timestamp => WindowKeyKind::Timestamp,
+            ColumnType::Numeric { .. } => WindowKeyKind::Numeric,
+            ColumnType::Uuid => WindowKeyKind::Uuid,
+            ColumnType::Vector(_)
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+            | ColumnType::Enum(_) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} cannot be used as a window PARTITION BY/ORDER BY key"
+                )));
+            }
+        };
+        return Ok(WindowKeyRef::Column { index, kind });
+    }
+    if name == "id" {
+        return Ok(WindowKeyRef::Id);
+    }
+    Err(SqlSurfaceError::invalid_input(format!(
+        "unknown column: {name}"
+    )))
+}
+
+/// [`crate::sql::allowlist::WindowSelectItem`] を `schema`・UDF レジストリ `udfs`
+/// と照合して [`BoundWindowItem`] へ束縛する（SQL-30・TASK-214、Issue #930）。
+/// 集計引数の型検査（`TEXT` の `SUM`/`AVG` は `22000` 等）は
+/// [`resolve_aggregate_input`] へ委譲し、集計 SELECT（`sql::aggregate`）と同じ
+/// 規約を共有する（第 2 の型検査を作らない）。
+fn bind_window_item(
+    item: &crate::sql::allowlist::WindowSelectItem,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundWindowItem, SqlSurfaceError> {
+    use crate::sql::allowlist::{AggregateFunc, WindowFunc};
+
+    let input = match &item.arg {
+        None => None,
+        Some(arg) => {
+            let agg_func = match item.func {
+                WindowFunc::Count => AggregateFunc::Count,
+                WindowFunc::Sum => AggregateFunc::Sum,
+                WindowFunc::Avg => AggregateFunc::Avg,
+                WindowFunc::Min => AggregateFunc::Min,
+                WindowFunc::Max => AggregateFunc::Max,
+                // 構文層（`Parser::parse_window_item`）が順位関数に引数を
+                // 持たせないため到達しない（防御的に内部バグとして扱う）。
+                WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "ranking window function unexpectedly carries an argument"
+                            .to_string(),
+                    });
+                }
+            };
+            Some(resolve_aggregate_input(
+                agg_func,
+                arg,
+                schema,
+                udfs,
+                node_budget,
+            )?)
+        }
+    };
+
+    let mut partition_by = Vec::with_capacity(item.partition_by.len());
+    for name in &item.partition_by {
+        partition_by.push(resolve_window_key(name, schema)?);
+    }
+    let mut order_by = Vec::with_capacity(item.order_by.len());
+    for (name, descending) in &item.order_by {
+        order_by.push((resolve_window_key(name, schema)?, *descending));
+    }
+
+    let name = item
+        .alias
+        .clone()
+        .unwrap_or_else(|| item.func.default_alias().to_string());
+
+    Ok(BoundWindowItem {
+        position: item.position,
+        func: item.func,
+        input,
+        partition_by,
+        order_by,
+        name,
+    })
+}
+
+/// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を
+/// すべて `out` へ集める（SQL-30・TASK-214。WHERE がウィンドウ別名を参照する形の
+/// 拒否判定でのみ使う）。`Or` の分岐へ再帰する（`sql::view::
+/// check_predicate_columns_within` と同じ理由: 非公開の判定漏れを防ぐ）。
+fn collect_where_predicate_idents(
+    predicates: &[WherePredicate],
+    out: &mut std::collections::HashSet<String>,
+) {
+    for pred in predicates {
+        match pred {
+            WherePredicate::Equality { column, .. }
+            | WherePredicate::Prefix { column, .. }
+            | WherePredicate::BoolEquality { column, .. }
+            | WherePredicate::Compare { column, .. } => {
+                out.insert(column.clone());
+            }
+            WherePredicate::BoolColumn { column } => {
+                out.insert(column.clone());
+            }
+            WherePredicate::PredicateCall { .. } => {}
+            WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    collect_where_predicate_idents(branch, out);
+                }
+            }
+        }
+    }
+}
+
+/// [`Expr::Ident`] をすべて再帰的に集める（[`collect_where_predicate_idents`] の
+/// 式項目向け実装。`sql::view::expr_columns_within` と同じ走査規則）。
+fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Number(_) => {}
+        Expr::Ident(name) => {
+            out.insert(name.clone());
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_expr_idents(arg, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_idents(lhs, out);
+            collect_expr_idents(rhs, out);
+        }
+    }
 }
 
 /// `expr_filters` を束縛時に 1 回だけステップ列コンパイルする（Issue #353）。
@@ -4310,6 +4705,33 @@ pub(crate) fn bind_scan_with_dummy_flags(
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
 
+    // SQL-30・TASK-214（Issue #930）: WHERE がウィンドウ項目の別名を参照する形
+    // （`SELECT rn AS rn2, ROW_NUMBER() OVER () AS rn FROM t WHERE rn = 1`
+    // 相当）は、ウィンドウ値が WHERE 評価より後（走査全体の完了後）に確定する
+    // ため構造上評価できず `42601` で拒否する。ただし実在する同名スキーマ列が
+    // あれば、既存の列参照として解釈する（ウィンドウ別名を優先しない）。
+    if !stmt.window_items.is_empty() {
+        let mut window_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for item in &stmt.window_items {
+            let alias = item
+                .alias
+                .as_deref()
+                .unwrap_or_else(|| item.func.default_alias());
+            window_aliases.insert(alias);
+        }
+        let mut where_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_where_predicate_idents(stmt.where_predicates(), &mut where_idents);
+        for ident in &where_idents {
+            if window_aliases.contains(ident.as_str())
+                && !schema.columns.iter().any(|c| &c.name == ident)
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "WHERE cannot reference a window function alias",
+                ));
+            }
+        }
+    }
+
     let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         bind_where_predicates(
             stmt.where_predicates(),
@@ -4328,6 +4750,11 @@ pub(crate) fn bind_scan_with_dummy_flags(
     // する（行ループでの再帰評価をなくす）。
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
+    let mut windows = Vec::with_capacity(stmt.window_items.len());
+    for item in &stmt.window_items {
+        windows.push(bind_window_item(item, schema, udfs, &mut node_budget)?);
+    }
+
     Ok(BoundScan {
         table: stmt.table_name().to_string(),
         projection,
@@ -4337,6 +4764,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         or_filters,
         limit,
         offset,
+        windows,
     })
 }
 
@@ -4402,43 +4830,59 @@ fn check_having_target_is_numeric(
 }
 
 /// [`crate::sql::allowlist::GroupByClause`] を `schema`・束縛済み `items`（アキュムレータ
-/// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14）。`HAVING`/
-/// `ORDER BY` の対象名は SELECT リストの集計項目の実効名（`item.name`）、
-/// `GROUP BY` 列名そのもの、または SELECT リストで `GROUP BY` 列に付けた
-/// `group_key_aliases`（SELECT リストで `GROUP BY` 列に付けられた全エイリアス）
+/// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14。SQL-25 (d) で
+/// 複数キーへ拡張）。`HAVING`/`ORDER BY` の対象名は SELECT リストの集計項目の
+/// 実効名（`item.name`）、いずれかの `GROUP BY` 列名そのもの、または SELECT
+/// リストでそのキーに付けた `group_key_aliases`（キー番号ごとの全エイリアス）
 /// のいずれかに解決する（これらのエイリアスは SELECT リストの実効名であり
 /// `ORDER BY` から参照できて然るべきため。PR #230 Bugbot 指摘対応。同一
 /// `GROUP BY` 列を複数回別名で射影できるため複数保持する。PR #230
-/// codex-review P1 指摘対応）。
+/// codex-review P1 指摘対応）。複数キーに一致する識別子（例: 2 つのキーへ同じ
+/// 別名を付けた場合）・キーと集計項目の双方に一致する識別子はいずれも曖昧
+/// として `22000` で拒否する（§計画 3.2）。
 fn bind_group_by_clause(
     clause: &crate::sql::allowlist::GroupByClause,
     schema: &TableSchema,
     items: &[BoundAggregateItem],
-    group_key_aliases: &[String],
+    group_key_aliases: &[(usize, String)],
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
     // GROUP BY 列は TEXT 列のみ許可する（VECTOR・疑似列 `id`・未知列はいずれも
     // 型不整合として拒否。§計画 3.2。`id` によるグルーピングは本タスクの対象外
     // ＝将来拡張候補）。SQL テキスト経由・直接構築経由（[`BoundAggregate::
-    // new_grouped`]・TASK-186・NOSQL-5）が [`resolve_group_by_column`] を共有する。
-    let column_index = resolve_group_by_column(schema, &clause.column)?;
+    // new_grouped_by_columns`]・TASK-186・NOSQL-5・SQL-25 (d)）が
+    // [`resolve_group_by_column`] を共有する。
+    let mut column_indices = Vec::with_capacity(clause.columns.len());
+    for column in &clause.columns {
+        column_indices.push(resolve_group_by_column(schema, column)?);
+    }
 
-    // HAVING/ORDER BY の対象名解決: `GROUP BY` 列名そのもの、`GROUP BY` 列の
-    // SELECT リストでの実効名（`group_key_aliases` のいずれか）、または `items`
-    // のいずれか 1 つの実効名に一意に一致する識別子のみを受理する（曖昧・非存在
-    // は `22000`）。
+    // HAVING/ORDER BY の対象名解決: いずれかの `GROUP BY` 列名そのもの、その
+    // キーの SELECT リストでの実効名（`group_key_aliases` のいずれか）、または
+    // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
+    // （曖昧・非存在は `22000`）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
-        let matches_group_key =
-            name == clause.column || group_key_aliases.iter().any(|alias| alias == name);
+        let mut key_matches: Vec<usize> = clause
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.as_str() == name)
+            .map(|(idx, _)| idx)
+            .collect();
+        for (idx, alias) in group_key_aliases {
+            if alias == name && !key_matches.contains(idx) {
+                key_matches.push(*idx);
+            }
+        }
         let item_matches: Vec<usize> = items
             .iter()
             .enumerate()
             .filter(|(_, it)| it.name == name)
             .map(|(idx, _)| idx)
             .collect();
-        match (matches_group_key, item_matches.as_slice()) {
-            (true, []) => Ok(OrderTarget::GroupKey),
-            (false, [idx]) => Ok(OrderTarget::Aggregate(*idx)),
-            (false, []) => Err(SqlSurfaceError::invalid_input(format!(
+        match (key_matches.as_slice(), item_matches.as_slice()) {
+            ([key_idx], []) => Ok(OrderTarget::GroupKey(*key_idx)),
+            ([], [idx]) => Ok(OrderTarget::Aggregate(*idx)),
+            ([], []) => Err(SqlSurfaceError::invalid_input(format!(
                 "unknown GROUP BY reference: {name}"
             ))),
             _ => Err(SqlSurfaceError::invalid_input(format!(
@@ -4452,7 +4896,7 @@ fn bind_group_by_clause(
         let target = resolve_target(&pred.item_name)?;
         let item_index = match target {
             OrderTarget::Aggregate(idx) => idx,
-            OrderTarget::GroupKey => {
+            OrderTarget::GroupKey(_) => {
                 // GROUP BY 列（TEXT）は数値比較の対象にならない（HAVING 右辺は
                 // 常に数値リテラル）。列名一致でも `GroupKey` を指した場合は
                 // 型不整合として拒否する。
@@ -4509,7 +4953,7 @@ fn bind_group_by_clause(
     let offset = validate_search_offset(clause.offset)?;
 
     Ok(BoundGroupBy {
-        column_index,
+        column_indices,
         having,
         order_by,
         limit,
@@ -6124,6 +6568,7 @@ mod tests {
                     rhs: Box::new(Expr::Number("1".to_string())),
                 }),
                 alias: None,
+                distinct: false,
             })],
             where_predicates: Vec::new(),
             group_by: None,

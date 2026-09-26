@@ -53,7 +53,7 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 | `USING MODE`／`HINT ORDER` | 構造上受理しない（`LIMIT n [OFFSET m]` の後は文末のみ）。集計文が `USING MODE` を受理しない既存判断（「取得モードの余地を持たない」）と同じ理由 |
 | `OFFSET`（Issue #916・SQL-25 (b)・TASK-209） | `LIMIT n` の直後に任意で受理する。詳細（受理範囲・順序保証との関係・カーソル方式との選択・深いページングのコスト特性）は [sql-offset-paging.md](sql-offset-paging.md) 参照。本節「順序」の性質（順序保証なし・同一スナップショット内で決定的）はそのまま `OFFSET` の前提になる |
 | セッション変数 `SET search_mode` | 広域取得は参照しない（ランキング段・確信度ゲートが存在しないため） |
-| `EXPLAIN` 前置 | 従来どおり `42601`（`USING PLAN` を伴わないため） |
+| `EXPLAIN` 前置 | Issue #922・SQL-27 で受理へ拡大済み（`scalar_plan: plain_scan`／`access_path: full_scan` の 2 行を返す。詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md)「追記（Issue #922・SQL-27）」節参照） |
 | 順序 | **順序保証なし**。実装は同一スナップショット内で決定的（redb 行テーブルのキー順＝`(tenant_id, id)` 昇順。他テナントの `Public` 行が可視な場合はテナント文字列順で交錯し、`id` 昇順が成り立つのは同一テナント内のみ）。グローバル `id` 順へ「修正」しない・決定性テストの前提として明記する |
 | 件数 | 可視かつ `WHERE` を満たす行を先頭から最大 `n` 件。`n` 件集まった時点で走査を打ち切る（早期終了） |
 | RLS | `PolicyContext::is_visible` をデコード前に無条件適用（`WHERE visible()` の有無に依存しない。RLS-8）。TABLE-12 のキー/ヘッダ tenant 整合検査を維持 |
@@ -129,7 +129,8 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 - しきい値による可変件数の広域取得構文（SQL-15 のスコープ外。別タスク）。
 - 検索 SELECT（`ORDER BY`）経路の投影固定コスト削減（Issue #453 の管轄。本
   Issue では `bulk_knn_*` の self 実測値は変わらない）。
-- 広域取得への二次索引（Issue #359 ADR）適用・`EXPLAIN` 露出。
+- 広域取得への二次索引（Issue #359 ADR）適用（`EXPLAIN` 露出自体は Issue #922・
+  SQL-27 で対応済み）。
 - `make bench-crossdb`／`make e2e-three-client` の実行環境が無い場合の再実測・
   実行はオーナー作業。
 

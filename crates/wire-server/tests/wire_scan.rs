@@ -203,15 +203,27 @@ fn plain_select_without_order_by_or_limit_still_rejected_with_42601() {
     read_ready_for_query(&mut stream);
 }
 
-/// Issue #454: `EXPLAIN` は広域取得の前置として許可しない（`USING PLAN` を伴う
-/// 検索 SELECT のみを受理する既存契約を維持）。
+/// Issue #922（SQL-27）: `EXPLAIN` の対象を広域取得へ拡大したため、bare LIMIT
+/// scan の前置はもはや拒否されず受理される（受理テストへ反転。`sql::scan` は
+/// ランキング段・索引を持たないため `scalar_plan: plain_scan`／
+/// `access_path: full_scan` に固定）。
 #[test]
-fn explain_rejects_bare_limit_scan_with_42601() {
+fn explain_accepts_bare_limit_scan_with_query_plan() {
     let (core, _guard) = new_core_scan_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
     send_simple_query(&mut stream, "EXPLAIN SELECT id FROM docs LIMIT 10");
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+
+    for expected in ["scalar_plan: plain_scan", "access_path: full_scan"] {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
 }
 

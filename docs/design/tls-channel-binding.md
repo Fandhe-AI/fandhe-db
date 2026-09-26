@@ -1,8 +1,9 @@
 # ADR: SCRAM チャネルバインディング用 `tls-server-end-point` の実装既定値
 
-- ステータス: Proposed（署名アルゴリズム別ハッシュ選択・TLS 未確立時 `None`
+- ステータス: Accepted（署名アルゴリズム別ハッシュ選択・TLS 未確立時 `None`
   の 2 点は実装・テストで確定済み。`PLUS` 提示既定 `false` は下記実測に
-  基づく実装判断であり、オーナー確認待ち）
+  基づき、オーナー判断（2026-09-26）で最終確定した。Issue #971 で本 ADR を
+  Accepted へ更新）
 - 対応: TASK-228・WIRE-9・WIRE-18・HTTP-10 ポインタ（Issue #970・#1088・親 #941）
 - 関連: `docs/design/tls-server-handshake.md`・`docs/design/tls-scram-design.md`
 
@@ -131,13 +132,11 @@ PR #1089 P1 是正: 本判定が表層分岐より前に実行されており、
 
 ## スコープ外
 
-- 本 ADR のステータスを Accepted へ更新すること（#971）
 - HTTPS 表層（NoSQL・HTTP-10）へのチャネルバインディング適用
 - libpq 以外のクライアント（psycopg・node-postgres 等）での相互運用実測
 - 自作 SHA-384 の実装による非対応署名アルゴリズム（sha384WithRSA 等）の
   解消
 - libpq 側の失敗箇所の特定（`fe-secure-openssl.c` 等の追跡）そのもの
-- `PLUS` 提示既定 `false` の最終確定（オーナー承認）
 
 ## 参照
 

@@ -93,7 +93,12 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は
         // `FOREIGN KEY` 宣言（`CREATE TABLE`。NoSQL 表層の `op` 語彙に DDL が無く
         // 構造的に到達しない）の不正。ERR-6 新設行の射影規則に従い 400 とする。
-        | ErrorClass::InvalidForeignKey => 400,
+        | ErrorClass::InvalidForeignKey
+        // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
+        // 参照スコープでの非修飾列の曖昧解決。SQL 表層は本 Issue でまだ受理し
+        // ないため到達しないが（許可リストは JOIN・複数 FROM を拒否）、
+        // `ErrorClass` の網羅性のため ERR-6 新設行の射影規則（400）を定める。
+        | ErrorClass::AmbiguousColumn => 400,
     }
 }
 
@@ -103,7 +108,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 34] = [
+    const EXPECTED: [(ErrorClass, u16); 35] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -138,6 +143,7 @@ mod tests {
         (ErrorClass::CheckViolation, 409),
         (ErrorClass::ForeignKeyViolation, 409),
         (ErrorClass::InvalidForeignKey, 400),
+        (ErrorClass::AmbiguousColumn, 400),
     ];
 
     #[test]

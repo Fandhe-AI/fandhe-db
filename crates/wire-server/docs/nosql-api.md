@@ -258,8 +258,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 応答には `score` 列相当が一切含まれない（`ORDER BY`／`hybrid` を経由しないため
 合成スコア列が構造上存在しない）。
 
-`explain: true` は `scan`（SQL-15 の bare 形）への `EXPLAIN` 前置が拒否される
-契約の写像として `42601`。
+`explain: true` は NOSQL-16（Issue #948）で対応するまで `42601`（SQL 表層は
+Issue #922・SQL-27 で `scan` 相当の広域取得への `EXPLAIN` 前置を受理済みだが、
+NoSQL 表層の束縛済み計画向けエントリはまだこれを結線していない）。
 
 ### `aggregate`
 
@@ -573,8 +574,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 
 - `vector` 指定＋`explain: true` → `42601`
 - `plan` 欠落＋`explain: true`（`vector`も欠落）→ `42601`
-- `scan`／`aggregate` への `explain: true` → `42601`（別 op なので `search` の
-  上記条件とは独立に、各 op のハンドラが拒否する）
+- `scan`／`aggregate` への `explain: true` → `42601`（NOSQL-16・Issue #948 で
+  対応するまで。別 op なので `search` の上記条件とは独立に、各 op のハンドラが
+  拒否する）
 
 検証コード: `crates/wire-server/tests/nosql10_explain.rs`・`wire_explain.rs`。
 
@@ -759,6 +761,7 @@ Date: <IMF-fixdate>
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
+| `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（複数テーブル参照スコープの束縛基盤〔SQL-28・RLS-10、Issue #924〕は未結線。後述） |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
@@ -779,7 +782,7 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 14 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+到達不能な 15 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
 `42809`・`42703`・`42704`・`42830`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
@@ -792,7 +795,11 @@ Date: <IMF-fixdate>
 （SQL-23・TASK-202・Issue #899）・`ALTER TABLE ADD COLUMN`（`42701` のみ。
 Issue #900）が誘発する分類だが、NoSQL 表層の `op` 許可リストに DDL 相当が
 無いため実要求からは到達しない（`docs/design/sql-create-table.md`・
-`docs/design/sql-alter-table-add-column.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+`docs/design/sql-alter-table-add-column.md` 参照）。`AmbiguousColumn`（`42702`。
+SQL-28・RLS-10、Issue #924）は複数テーブル参照スコープの束縛基盤（`sql::relation`）
+が新設する分類だが、許可リストは本 Issue でも引き続き JOIN・複数 FROM を
+`42601` で拒否し、`EngineCore` への結線も行わないため実要求からは到達しない
+（`docs/design/multi-relation-plan-foundation.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・

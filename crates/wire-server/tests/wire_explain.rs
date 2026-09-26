@@ -164,10 +164,12 @@ fn explain_reports_query_clause_mode_source() {
     read_ready_for_query(&mut stream);
 }
 
-/// SQL-6: `EXPLAIN` は検索本体を実行しないため、`USING PLAN` を伴わない通常
-/// `SELECT` への前置は許可リスト外として `42601` で拒否する。
+/// Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索へ拡大したため、`USING
+/// PLAN` を伴わない通常 `SELECT` への前置はもはや拒否されず受理される
+/// （受理テストへ反転。LLM I/O を行わないため `search_terms`／`path_hint`／
+/// `kind_hint` を含まない、`mode` から始まる短い行のみを返す）。
 #[test]
-fn explain_rejects_plain_select_without_using_plan() {
+fn explain_accepts_plain_select_without_using_plan() {
     let (core, _guard) = new_core_with_docs_table();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
@@ -175,7 +177,24 @@ fn explain_rejects_plain_select_without_using_plan() {
         &mut stream,
         "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
     );
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+
+    let expected_lines = [
+        "mode: recall",
+        "mode_source: default",
+        "engine: (custom_provider)",
+        "ann_plan: unknown_custom_provider",
+        "scalar_plan: plain_scan",
+    ];
+    for expected in expected_lines {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
 }
 

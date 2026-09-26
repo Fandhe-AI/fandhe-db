@@ -257,6 +257,23 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）を先頭語に持つ文は
+    // `$n` を含む場合、一律拒否する（カーソルと同じ fail-closed 方針）。
+    // 理由: 本モジュールのパターン判定（特にパターン 4「WHERE 等価」）は
+    // 文の先頭語を見ずトークン列上の位置だけで許可位置を判定するが、CTE を
+    // 含む文では `sql::cte::resolve_relation` が CTE の `WHERE` 述語を主クエリの
+    // 述語の前へ挿入する（`build_scan_from_resolved`）ため、束縛時に `$n` の
+    // 対応先が組み立て後の述語列とトークン列上の位置とでずれる恐れがある。
+    if matches!(
+        tokens.first(),
+        Some(Token::Ident(name)) if name.eq_ignore_ascii_case("WITH")
+    ) && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in WITH statements",
+        ));
+    }
+
     let is_insert_statement = ident_eq_ignore_case(tokens.first(), "INSERT");
 
     // パターン 5（INSERT VALUES）の受理範囲: `VALUES` キーワード（文脈識別子。
@@ -695,6 +712,15 @@ mod tests {
     fn rejects_using_mode_position() {
         let err =
             positions("SELECT * FROM documents ORDER BY embedding <=> '[0]' LIMIT 5 USING MODE $1")
+                .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_param_in_with_statement() {
+        // TASK-213・SQL-29 (b)（Issue #928）。
+        let err =
+            positions("WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE id = $1 LIMIT 5")
                 .unwrap_err();
         assert_eq!(err.wire_code(), "42601");
     }
