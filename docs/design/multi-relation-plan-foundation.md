@@ -114,7 +114,14 @@ ERR-6 に相関名重複専用の SQLSTATE 行が無いため、公開名重複�
 
 ## 対象外（Issue は起票しない。申し送りのみ）
 
-- 許可リストでの JOIN・修飾列・別名の受理、`EngineCore` への `RelationSnapshotCache` 保持と
-  実行経路への結線、中間結果行数上限、結合アルゴリズムの ADR → #925／#926
+- 許可リストでの JOIN・修飾列・別名の受理、中間結果行数上限、結合アルゴリズムの ADR
+  → **#925（INNER JOIN）で消化済み**。詳細は `docs/design/inner-join.md` 参照
+- `EngineCore` への `RelationSnapshotCache`（本基盤が提供する `sql::relation_snapshot`）の
+  保持と実行経路への結線 → **#925 でも結線しない**（`docs/design/inner-join.md` の
+  「基盤の申し送り項目の扱い」参照。理由: JOIN の実行には列の値そのものが必要だが、
+  スナップショットは `(tenant_id, id)` しか持たないため、使うと値取得のための 2 回目の
+  点照会走査が必要になる。既存の広域取得経路なら RLS・WHERE・値の取得が 1 パスで済む）。
+  キャッシュによる最適化は #926 以降の後続検討事項のまま据え置く
+- 外部結合（`LEFT`／`RIGHT`／`FULL`／`CROSS`／`NATURAL` JOIN）・3 テーブル以上の連鎖 JOIN → #926
 - FROM 参照先のビュー展開 → #928 以降
 - `docs/spec/05-tasks.md` の TASK-212 状況更新は spec リポ側の作業
