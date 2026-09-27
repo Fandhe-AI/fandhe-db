@@ -456,9 +456,9 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
     let addr = spawn(Arc::clone(&core));
 
     // `nosql9_op_allowlist.rs` と同じ語彙外集合（`update`／`delete` は
-    // Issue #875 で語彙へ加わったため対象外。その 2 op の `filter`
-    // （述語形）指定での「実行可能な状態でも副作用なし」は下の
-    // `update_and_delete_predicate_form_pass_allowlist_but_have_no_side_effect`
+    // Issue #875 で語彙へ加わったため対象外。その 2 op の `filter: []`
+    // （空配列）指定での「実行可能な状態でも副作用なし」は下の
+    // `update_and_delete_empty_filter_form_rejects_with_42601_and_has_no_side_effect`
     // が固定する）。
     // 受理形（`vector`／`limit` 等）の残りフィールドを備えた本文で送り、
     // 「op 判定が実行可能な状態でも手前で止まる」ことを固定する。
@@ -512,15 +512,14 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
     );
 }
 
-// --- update／delete: filter（述語形）は実行結線未接続で副作用なし（Issue #875・#876） ---
+// --- update／delete: filter: []（空配列）は 42601 で副作用なし（Issue #875・#876・#1062） ---
 
 #[test]
-fn update_and_delete_predicate_form_pass_allowlist_but_have_no_side_effect() {
-    // `update`／`delete`（Issue #875・NOSQL-12）の `filter`（述語形）は
-    // 語彙・スキーマ検証を通過するが実行結線は Issue #871 の担当のため、
-    // seed 済み・実行可能な状態でも `42P01`（`where` 形が到達する証跡）
-    // ではなく `0A000`／501 のまま留まり、行データへの副作用も生じない
-    // ことを固定する。
+fn update_and_delete_empty_filter_form_rejects_with_42601_and_has_no_side_effect() {
+    // `update`／`delete`（Issue #875・NOSQL-12）の `filter: []`（空配列）は
+    // SQL 表層の `WHERE` 句省略とのパリティで `42601`（Issue #1062）。
+    // engine を一切呼ばないため、seed 済み・実行可能な状態でも行データへの
+    // 副作用は生じない。
     let (core, _guard) = new_core_two_tenant_docs();
     let addr = spawn(Arc::clone(&core));
 
@@ -530,8 +529,8 @@ fn update_and_delete_predicate_form_pass_allowlist_but_have_no_side_effect() {
     ];
     for body in bodies {
         let resp = query_as_alice(addr, body);
-        assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
-        assert_eq!(http_common::wire_code_of(&resp), "0A000");
+        assert_eq!(resp.status, 400, "body={body:?} resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "42601");
     }
 
     let resp = query_as_alice(
@@ -541,6 +540,45 @@ fn update_and_delete_predicate_form_pass_allowlist_but_have_no_side_effect() {
     assert_eq!(resp.status, 200, "resp={resp:?}");
     assert!(
         body_utf8(&resp).contains(r#""row_count":4"#),
+        "{}",
+        body_utf8(&resp)
+    );
+}
+
+// --- update／delete: filter（述語形。非空）は実行結線済み（Issue #1062） -----
+
+#[test]
+fn update_and_delete_non_empty_filter_form_executes_and_affects_only_own_tenant_rows() {
+    // `update`／`delete`（Issue #1062）の `filter`（述語形・非空）は
+    // 語彙・スキーマ検証を通過した後 engine まで到達し、自テナント
+    // （alice/tenant-a）が所有する行のみを対象に実行する
+    // （`new_core_two_tenant_docs` は tenant-a に `lang: "ja"` を 2 行・
+    // `lang: "en"` を 1 行、tenant-b に `lang: "trap-b-99"` の罠行を 1 行
+    // 持つ。罠行は `eq` にどちらの値でも一致せず、対象テナントの計数にも
+    // 現れない）。
+    let (core, _guard) = new_core_two_tenant_docs();
+    let addr = spawn(Arc::clone(&core));
+
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[{"column":"lang","op":"eq","value":"ja"}],"operation_id":"n1-pred-update-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""updated":2"#),
+        "{}",
+        body_utf8(&resp)
+    );
+
+    // tenant-a の可視行は 3 件すべて `lang: "en"` になった状態のため、
+    // 述語形 `delete` は 3 件を対象とする（tenant-b の罠行は変更しない）。
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"delete","table":"docs","filter":[{"column":"lang","op":"eq","value":"en"}],"operation_id":"n1-pred-delete-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        body_utf8(&resp).contains(r#""deleted":3"#),
         "{}",
         body_utf8(&resp)
     );
