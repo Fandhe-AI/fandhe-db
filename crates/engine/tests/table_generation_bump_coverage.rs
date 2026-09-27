@@ -231,7 +231,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // CheckViolation` 等の追加）で行が移動したための追随（旧: 406）。
     // Issue #907（`FOREIGN KEY` 制約。`TenantWriteError::ForeignKeyViolation`
     // の追加）で行が移動したための追随（旧: 417）。
-    ("tenant.rs", 425),
+    // Issue #997（`MAX_SCANNED_ROWS` の `pub(crate)` 化に伴うドキュメント
+    // コメント追記）で行が移動したための追随（旧: 425）。
+    ("tenant.rs", 428),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

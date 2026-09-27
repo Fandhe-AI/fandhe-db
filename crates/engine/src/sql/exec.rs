@@ -297,9 +297,12 @@ pub struct TruncateOutcome {}
 /// security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）。
 ///
 /// 述語形（SQL-19・TASK-192、Issue #871。[`execute_predicate_delete`]）では
-/// `rows_affected` は `0..=MAX_DML_AFFECTED_ROWS`（`sql::parser::
-/// MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
-/// 件数をそのまま表す（同じく他テナント行・不可視行は候補にすら含まれない）。
+/// `rows_affected` は一致した自テナント所有行の件数をそのまま表す（同じく
+/// 他テナント行・不可視行は候補にすら含まれない）。呼び出し元
+/// `core.rs::EngineCore::dml_limits.max_affected_rows`（`Option<NonZeroUsize>`。
+/// Issue #997 オーナー判断の改訂〔2026-09-27〕で既定 `None`＝上限なしへ変更）が
+/// `Some(limit)` の場合は `0..=limit.get()`、`None` の場合は
+/// `crate::tenant::MAX_SCANNED_ROWS`（総走査行数上限）が資源上限として働く。
 ///
 /// `rows_affected` は自テナントの結果を表すのみのため、`TruncateOutcome` と
 /// 異なり露出しても再送側の件数推定材料にはならない（`INSERT 0 <rows>` と
@@ -338,10 +341,10 @@ pub struct ReturningOutcome {
 /// `Ok(UpdateOutcome { rows_affected: 0 })` を返す（区別しない。
 /// `tenant::update_row_columns_unchecked` ドキュメント参照）。
 ///
-/// 述語形: `rows_affected` は `0..=MAX_DML_AFFECTED_ROWS`（`sql::parser::
-/// MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
-/// 件数をそのまま表す（他テナント行・不可視行は候補にすら含まれない。
-/// [`DeleteOutcome`] の述語形と同じ意味論）。
+/// 述語形: `rows_affected` は一致した自テナント所有行の件数をそのまま表す
+/// （他テナント行・不可視行は候補にすら含まれない。[`DeleteOutcome`] の
+/// 述語形と同じ意味論。`EngineCore::dml_limits.max_affected_rows` の
+/// `Some`/`None` に応じた範囲・資源上限の扱いも同じ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateOutcome {
     pub rows_affected: u64,
@@ -3748,6 +3751,14 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
 /// `dim == 0`（`VECTOR` 列が NULL）の行を式が実際に参照する場合は `eval` 自身が
 /// `ExprValue::Null` を返し非該当扱いになる。第 2 の述語評価器を作らない）を、
 /// 候補行列挙のクロージャとして `tenant::delete_rows_where_unchecked` へ注入する。
+///
+/// `max_affected_rows` は呼び出し元（`core.rs::execute_predicate_delete_form`）が
+/// `EngineCore::dml_limits.max_affected_rows` から渡す 1 文あたり影響行数上限
+/// （Issue #997・オーナー判断の改訂〔2026-09-27〕。`None`＝上限なし・既定。
+/// `Some(limit)`＝`wire-server` の `--max-dml-affected-rows` で明示指定した値。
+/// プロセス全体で起動時に 1 回だけ設定する契約——`execute_predicate_update` と
+/// 同じ上限判定 API [`crate::sql::parser::check_dml_affected_rows_with_limit`]
+/// を共有する）。
 pub(crate) fn execute_predicate_delete(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -3755,6 +3766,7 @@ pub(crate) fn execute_predicate_delete(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     schema: &TableSchema,
     content_hash_value: &crate::recovery::content_hash::ContentHash,
+    max_affected_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -3824,9 +3836,10 @@ pub(crate) fn execute_predicate_delete(
         Ok(true)
     };
 
-    // 上限は UPDATE と共有する唯一の上限 API（`MAX_DML_AFFECTED_ROWS`・
-    // `check_dml_affected_rows`。Issue #997 で統合）を直接参照する。
-    let limit = crate::sql::parser::MAX_DML_AFFECTED_ROWS;
+    // 上限は UPDATE と共有する唯一の上限 API（`check_dml_affected_rows_with_limit`。
+    // Issue #997 で CLI 起動時設定値まで一本化）に、呼び出し元から渡された
+    // `max_affected_rows`（`EngineCore::dml_limits`）を渡す。
+    let limit = max_affected_rows;
     match crate::tenant::delete_rows_where_unchecked(
         storage,
         bound.table(),
@@ -3842,7 +3855,7 @@ pub(crate) fn execute_predicate_delete(
             rows_affected: rows_affected as u64,
         }),
         Ok(crate::tenant::PredicateDmlOutcome::LimitExceeded { count }) => {
-            crate::sql::parser::check_dml_affected_rows(count)?;
+            crate::sql::parser::check_dml_affected_rows_with_limit(count, limit)?;
             Err(SqlSurfaceError::Internal {
                 detail: "predicate DELETE limit check did not reject an over-limit count"
                     .to_string(),
@@ -3861,6 +3874,13 @@ pub(crate) fn execute_predicate_delete(
 /// 呼び出し元から受け取る）で、適用段のみ `tenant::update_rows_where_unchecked`
 /// の read-merge-write（`upsert_typed_rows_unchecked` の `DoUpdate` 腕と同型）に
 /// 委譲する。
+///
+/// Issue #997 で `max_affected_rows`（起動時 CLI 設定値）を追加した結果
+/// `clippy::too_many_arguments` の閾値（7）を超える。`pub(crate)` 専用の内部
+/// 関数であり（唯一の呼び出し元は上記 `EngineCore::execute_predicate_update_form`）、
+/// 各引数は意味の異なる独立した値のため構造体へまとめると可読性が下がる
+/// （`execute_statement_with_cache` と同じ判断）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_predicate_update(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -3874,6 +3894,9 @@ pub(crate) fn execute_predicate_update(
     // 呼び出し元（`core.rs::execute_predicate_update_form`）が
     // `content_hash::needs_legacy_vector_hash` で必要な場合のみ計算する。
     legacy_hashes: &[crate::recovery::content_hash::ContentHash],
+    // Issue #997: `EngineCore::dml_limits.max_affected_rows`（起動時 CLI 設定値・
+    // 既定 `None`＝上限なし）。[`execute_predicate_delete`] のドキュメント参照。
+    max_affected_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -3943,9 +3966,10 @@ pub(crate) fn execute_predicate_update(
         Ok(true)
     };
 
-    // 上限は DELETE と共有する唯一の上限 API（`MAX_DML_AFFECTED_ROWS`・
-    // `check_dml_affected_rows`。ADR §6「上限 API の統合」。Issue #997 で統合済み）。
-    let limit = crate::sql::parser::MAX_DML_AFFECTED_ROWS;
+    // 上限は DELETE と共有する唯一の上限 API（`check_dml_affected_rows_with_limit`。
+    // ADR §6「上限 API の統合」。Issue #997 で CLI 起動時設定値まで一本化）に、
+    // 呼び出し元から渡された `max_affected_rows`（`EngineCore::dml_limits`）を渡す。
+    let limit = max_affected_rows;
     match crate::tenant::update_rows_where_unchecked(
         storage,
         bound.table(),
@@ -3963,7 +3987,7 @@ pub(crate) fn execute_predicate_update(
             rows_affected: rows_affected as u64,
         }),
         Ok(crate::tenant::PredicateDmlOutcome::LimitExceeded { count }) => {
-            crate::sql::parser::check_dml_affected_rows(count)?;
+            crate::sql::parser::check_dml_affected_rows_with_limit(count, limit)?;
             Err(SqlSurfaceError::Internal {
                 detail: "predicate UPDATE limit check did not reject an over-limit count"
                     .to_string(),
