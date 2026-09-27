@@ -74,6 +74,23 @@ fn insert_file_sql(table: &str, path: &str, body: &str, op_id: &str) -> String {
     )
 }
 
+/// テンプレート列 `lang` を伴うファイル形 `INSERT`（UNIQUE 制約の対象列として使う。
+/// `lang` を渡さない場合は NULL になる（NULLS DISTINCT の検証用）。
+fn insert_file_sql_with_lang(
+    table: &str,
+    path: &str,
+    body: &str,
+    lang: &str,
+    op_id: &str,
+) -> String {
+    format!(
+        "INSERT INTO {table} (path, body, lang) VALUES ('{}', '{}', '{}') USING OPERATION_ID '{op_id}'",
+        sql_escape(path),
+        sql_escape(body),
+        sql_escape(lang)
+    )
+}
+
 fn body_text_cells(result: &engine::sql::exec::QueryResult) -> Vec<String> {
     result
         .rows
@@ -699,48 +716,159 @@ fn missing_embedder_is_rejected_fail_closed_with_no_side_effects() {
     assert_eq!(rows.rows.len(), 0);
 }
 
-/// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）を持つテーブルへのファイル形
-/// `INSERT` は、`tenant::replace_typed_rows_by_text_key` が意図的にサイレント
-/// バイパスせず fail-closed に拒否する（`docs/design/unique-constraint.md`
-/// 「対象外」節）。この回帰テストは、拒否がクライアント起因のエラー分類
-/// （`SqlSurfaceError::InvalidInput`）へ写像され、内部エラー（`XX000`。
-/// `SqlSurfaceError::Internal`）へ丸められないことを固定する（codex-review
-/// 指摘・Issue #905 PR レビュー: コード自体は正しく分類済みだったが、この
-/// 分類を固定するテストが存在しなかった）。
-#[test]
-fn file_form_insert_on_table_with_unique_constraint_is_rejected_as_invalid_input() {
-    let path = unique_db_path("index-unique-constraint-reject");
-    let _guard = CleanupGuard(path.clone());
-    let storage = Storage::open(&path).expect("open storage");
+// --- UNIQUE 制約つきテーブルへのファイル形 INSERT（TABLE-16・TASK-204、Issue #1072）---
+//
+// Issue #905（PR #1053）ではこの経路を早期ガードで一律拒否していたが、Issue #1072 で
+// 撤去した。ガードを外しても既存の一意性検査点（`constraint::enforce_row_constraints_in_txn`。
+// `tenant::replace_typed_rows_by_text_key` ドキュメント参照）が同一 write トランザクション内
+// で必ず走るため、契約の変更は「一律 `22000` 拒否」から「置換成功、または宣言どおりの
+// `23505`」へ変わる。これはアサーションの弱体化ではなく、Issue #905 時点では未実装だった
+// 意味論（旧チャンクを母集合から除いた一意性検査）を実装した契約変更である。
+
+fn new_core_with_unique_table(path: &std::path::Path, table_sql: &str) -> EngineCore {
+    let storage = Storage::open(path).expect("open storage");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
         .with_incremental_config(small_chunk_config());
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = engine::sql::mode::SessionState::default();
     session.allow_ddl();
+    core.execute_sql_in_session(&ctx, &mut session, table_sql)
+        .expect("create table with UNIQUE constraint should succeed");
+    core
+}
 
-    core.execute_sql_in_session(
-        &ctx,
-        &mut session,
+/// (a) 成否判定: `UNIQUE(path)` の 1 チャンクファイルを同じパス・新しい本文で
+/// 再送すると、旧チャンクが一意性検査の母集合から除かれているため成功する
+/// （`23505` になった場合は、旧チャンク除外の前提が崩れている）。
+#[test]
+fn file_insert_resend_same_path_succeeds_on_unique_path_column() {
+    let path = unique_db_path("index-unique-path-resend-success");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_unique_table(
+        &path,
         &format!("CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT UNIQUE, body TEXT)"),
-    )
-    .expect("create table with UNIQUE constraint should succeed");
+    );
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "docs/a.txt", "first version", "op-a-1"),
+    )
+    .expect("first file insert should succeed");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "docs/a.txt", "second version", "op-a-2"),
+    )
+    .expect(
+        "resend of the same path must succeed: the old chunk is excluded from the \
+         UNIQUE population by the same-transaction delete-before-check ordering",
+    );
+
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let rows = core
+        .execute_sql(&read_ctx, "SELECT body FROM documents LIMIT 100")
+        .expect("select should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(body_text_cells(&rows), vec!["second version".to_string()]);
+}
+
+/// (b) ロールバックの証明: `UNIQUE(lang)` で他パスと衝突するファイルを送ると
+/// `23505` になり、削除予定だった旧チャンク・台帳記録・世代のいずれも副作用が
+/// 残らない（`write_txn` は `?` による早期 return で drop され abort する）。
+#[test]
+fn file_insert_unique_violation_rolls_back_the_deleted_old_chunk() {
+    let path = unique_db_path("index-unique-lang-rollback");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_unique_table(
+        &path,
+        &format!(
+            "CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT, body TEXT, lang TEXT UNIQUE)"
+        ),
+    );
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql_with_lang("documents", "docs/a.txt", "alpha content", "ja", "op-b-a1"),
+    )
+    .expect("first file insert should succeed");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql_with_lang("documents", "docs/b.txt", "bravo content", "en", "op-b-b1"),
+    )
+    .expect("second file insert should succeed");
+
+    // `docs/a.txt` を lang='en' で再送すると、`docs/b.txt` の既存 lang='en' と衝突する。
     let err = core
         .execute_insert_sql(
             &ctx,
-            &insert_file_sql("documents", "docs/unique.txt", "line one", "op-uniq-1"),
+            &insert_file_sql_with_lang(
+                "documents",
+                "docs/a.txt",
+                "alpha content updated",
+                "en",
+                "op-b-a2",
+            ),
         )
-        .expect_err("file-form insert on a UNIQUE-constrained table must be rejected");
+        .expect_err("UNIQUE(lang) violation across files must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 旧チャンク（`docs/a.txt` の元の本文・lang='ja'）がそのまま残っている（削除も
+    // 巻き戻っている）こと。
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let rows = core
+        .execute_sql(
+            &read_ctx,
+            "SELECT body FROM documents WHERE path = 'docs/a.txt' LIMIT 100",
+        )
+        .expect("select should succeed");
+    assert_eq!(body_text_cells(&rows), vec!["alpha content".to_string()]);
+
+    // 台帳未記録。
+    let op = OperationId::parse("op-b-a2").expect("valid operation_id");
     assert_eq!(
-        err.wire_code(),
-        "22000",
-        "file-form INSERT on a UNIQUE-constrained table must be classified as a client-input \
-         error (InvalidInput), not an internal error (XX000): {err:?}"
+        core.operation_recorded(&ctx, "documents", &op)
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
     );
 
-    // 拒否は副作用ゼロ（台帳未記録・行未挿入）である。
-    let op = OperationId::parse("op-uniq-1").expect("valid operation_id");
+    // 総行数が変わっていない（2 ファイル分、各 1 行）。
+    let all_rows = core
+        .execute_sql(&read_ctx, "SELECT body FROM documents LIMIT 100")
+        .expect("select should succeed");
+    assert_eq!(all_rows.rows.len(), 2);
+}
+
+/// (c) チャンク間で値が変わらない列だけで構成された UNIQUE（`UNIQUE(path)`）は、
+/// 2 チャンク以上に分割されるファイルを、新規チャンクどうしの衝突として宣言どおり
+/// `23505` で拒否する（特別扱いしない）。副作用ゼロも併せて確認する。
+#[test]
+fn file_insert_multi_chunk_file_violates_unique_path_within_itself() {
+    let path = unique_db_path("index-unique-path-multi-chunk-reject");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_unique_table(
+        &path,
+        &format!("CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT UNIQUE, body TEXT)"),
+    );
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // lines_per_chunk=2 で 4 行 → 2 チャンク。両チャンクとも path 列は同じ値になる。
+    let body = "line one\nline two\nline three\nline four";
+    let err = core
+        .execute_insert_sql(
+            &ctx,
+            &insert_file_sql("documents", "docs/multi.txt", body, "op-c-1"),
+        )
+        .expect_err("multi-chunk file with UNIQUE(path) must collide with itself");
+    assert_eq!(err.wire_code(), "23505");
+
+    let op = OperationId::parse("op-c-1").expect("valid operation_id");
     assert_eq!(
         core.operation_recorded(&ctx, "documents", &op)
             .expect("ledger lookup should succeed"),
@@ -749,16 +877,149 @@ fn file_form_insert_on_table_with_unique_constraint_is_rejected_as_invalid_input
     let read_ctx =
         PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
             .expect("valid tenant");
-    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
     let rows = core
-        .execute_sql(
-            &read_ctx,
-            &format!(
-                "SELECT body FROM documents WHERE path = 'docs/unique.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
-            ),
-        )
+        .execute_sql(&read_ctx, "SELECT body FROM documents LIMIT 100")
         .expect("select should succeed");
     assert_eq!(rows.rows.len(), 0);
+}
+
+/// (d) `body` を含む UNIQUE（`UNIQUE(path, body)`）は、チャンク本文が互いに異なる
+/// 限り複数チャンクでも成功し、同じパスへの再送も置換として成功する。
+#[test]
+fn file_insert_multi_chunk_file_succeeds_when_unique_includes_body() {
+    let path = unique_db_path("index-unique-path-body-multi-chunk");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_unique_table(
+        &path,
+        &format!(
+            "CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT, body TEXT, UNIQUE (path, body))"
+        ),
+    );
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let first_body = "line one\nline two\nline three\nline four";
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "docs/multi.txt", first_body, "op-d-1"),
+    )
+    .expect("multi-chunk file with UNIQUE(path, body) should succeed (bodies differ per chunk)");
+
+    let second_body = "second one\nsecond two\nsecond three\nsecond four";
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "docs/multi.txt", second_body, "op-d-2"),
+    )
+    .expect("resend with different chunk bodies should succeed as a replacement");
+
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let rows = core
+        .execute_sql(&read_ctx, "SELECT body FROM documents LIMIT 100")
+        .expect("select should succeed");
+    let bodies = body_text_cells(&rows);
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies.iter().all(|b| b.starts_with("second")));
+}
+
+/// (e) NULLS DISTINCT: `UNIQUE(lang)` で `lang` を省略した（NULL の）複数チャンクの
+/// ファイルは、NULL 同士が一意性検査の対象外であるため成功する。
+#[test]
+fn file_insert_multi_chunk_file_with_null_unique_column_succeeds() {
+    let path = unique_db_path("index-unique-lang-null-multi-chunk");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_unique_table(
+        &path,
+        &format!(
+            "CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT, body TEXT, lang TEXT UNIQUE)"
+        ),
+    );
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // `lang` を指定しない（NULL）4 行・2 チャンクのファイル。
+    let body = "line one\nline two\nline three\nline four";
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "docs/nolang.txt", body, "op-e-1"),
+    )
+    .expect("multi-chunk file with NULL UNIQUE(lang) values should succeed (NULLS DISTINCT)");
+
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let rows = core
+        .execute_sql(&read_ctx, "SELECT body FROM documents LIMIT 100")
+        .expect("select should succeed");
+    assert_eq!(rows.rows.len(), 2);
+}
+
+/// (f) テナント境界: tenant-b が同じ `path`／`lang` の値を持っていても、tenant-a の
+/// 書き込みには影響しない（走査範囲はテナント名前空間に限定。TABLE-12・RLS-9）。
+/// 応答（成功／`wire_code`）が tenant-b のデータの有無で変わらないことも確認する
+/// （他テナントの存在情報を漏らさない。security.md）。
+#[test]
+fn file_insert_unique_check_is_scoped_per_tenant() {
+    let path = unique_db_path("index-unique-tenant-scope");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_unique_table(
+        &path,
+        &format!(
+            "CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT, body TEXT, lang TEXT UNIQUE)"
+        ),
+    );
+    let tenant_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    core.execute_insert_sql(
+        &tenant_b,
+        &insert_file_sql_with_lang(
+            "documents",
+            "docs/shared.txt",
+            "tenant-b content",
+            "ja",
+            "op-f-b1",
+        ),
+    )
+    .expect("tenant-b insert should succeed");
+
+    let tenant_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    core.execute_insert_sql(
+        &tenant_a,
+        &insert_file_sql_with_lang(
+            "documents",
+            "docs/shared.txt",
+            "tenant-a content",
+            "ja",
+            "op-f-a1",
+        ),
+    )
+    .expect(
+        "tenant-a insert must succeed regardless of tenant-b holding the same path/lang values \
+         (RLS-9: the UNIQUE scan is scoped to the tenant namespace)",
+    );
+
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let rows = core
+        .execute_sql(&read_ctx, "SELECT body FROM documents LIMIT 100")
+        .expect("select should succeed");
+    assert_eq!(body_text_cells(&rows), vec!["tenant-a content".to_string()]);
+
+    // 違反側の対称性: tenant-a 内で自己衝突させると `23505` になり、この
+    // `wire_code` は tenant-b が同じ path/lang の値を持っているかどうかに
+    // 依存しない（他テナントの存在情報を漏らさない。security.md）。
+    let err = core
+        .execute_insert_sql(
+            &tenant_a,
+            &insert_file_sql_with_lang(
+                "documents",
+                "docs/other.txt",
+                "tenant-a other content",
+                "ja",
+                "op-f-a2",
+            ),
+        )
+        .expect_err("tenant-a self-collision on UNIQUE(lang) must be rejected");
+    assert_eq!(err.wire_code(), "23505");
 }
 
 #[test]

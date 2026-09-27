@@ -3603,6 +3603,14 @@ pub struct ReplaceOutcome {
 ///   `crate::storage::decode_row_metadata_borrowed` で `metadata`（スカラー列
 ///   ペイロード）のみを借用取得し、比較に不要な embedding は確保しない
 ///   （coding-rust.md「不安全な設計 / DoS」対応）
+/// - PRIMARY KEY・UNIQUE 制約（TABLE-16・TASK-204）を持つテーブルも対象とする
+///   （Issue #1072）。旧チャンク行の削除（上記）は一意性検査（下記の
+///   `crate::constraint::enforce_row_constraints_in_txn` 呼び出し）より前に同一
+///   write トランザクション内で完了しているため、旧チャンクは検査時の母集合に
+///   含まれない。違反時は commit 前の `?` でトランザクションごと abort し、台帳記録・
+///   削除・挿入のいずれも残らない（副作用ゼロ）。チャンク間で値が変わらない列
+///   のみで構成される UNIQUE は、複数チャンクに分割されるファイルを宣言どおり
+///   `23505` で拒否する（特別扱いはしない）
 ///
 /// エラー契約は [`insert_row`]/[`delete_row`] と同一（`TenantWriteError`。他テナントの
 /// 存在情報を漏らさない fail-closed）。`key_column` がスキーマに存在しない・
@@ -3658,18 +3666,6 @@ pub(crate) fn replace_typed_rows_by_text_key(
     // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
     let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
         let schema = require_table_schema_write(&write_txn, table)?;
-        // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）を持つテーブルへの
-        // ファイル形 INSERT（増分インデックス反映。TASK-120）は対象外として
-        // fail-closed に拒否する。同じ `path` を持つ複数チャンク行を書き込む
-        // 置換書き込みは、`path` 等を含む UNIQUE 制約と意味論的に噛み合わない
-        // ため、一意性検査に任せて環境依存の `23505` にするのではなく、書き込み
-        // 前に一律で拒否する（サイレントバイパスもしない。security.md
-        // 「不安全な設計」対応）。commit 前の拒否のため副作用はゼロ。
-        if !schema.unique_constraints().is_empty() {
-            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                "file-form INSERT does not support tables with UNIQUE constraints".to_string(),
-            )));
-        }
         let vector_idx = schema
             .columns
             .iter()
@@ -3885,12 +3881,16 @@ pub(crate) fn replace_typed_rows_by_text_key(
         drop(write_txn);
         return Ok(outcome);
     }
-    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査。
+    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905・#1072。TABLE-16・TASK-204）のテナント内一意性制約検査。
     // このファイル形 `INSERT`（同一パス置換）は採番 id が `first_id` から連番で
     // 割り当てられる（上記クロージャの `next_id` 採番規則）ため、書き込んだ id
     // 集合は `first_id..first_id + inserted` の連続範囲として再構築できる。
     // `removed` のみで `inserted == 0` の場合（`rows` が空で既存行を削除しただけ）
     // は新規に書き込んだ行がないため検査不要（削除は一意性制約に違反し得ない）。
+    // 旧チャンク行の削除は上記クロージャ内（この検査より前）で同一 write
+    // トランザクション内に完了しているため、走査時の母集合から除外済み
+    // （関数 doc コメント参照。redb の write トランザクションは自分が消した
+    // 行をそのまま読める）。
     if outcome.inserted > 0 {
         if let Some(first_id) = outcome.first_id {
             let ids: Vec<u64> = (0..outcome.inserted as u64)
