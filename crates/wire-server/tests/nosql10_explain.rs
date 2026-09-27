@@ -458,15 +458,24 @@ fn explain_true_reports_hnsw_params_and_does_not_touch_hnsw_index_cache() {
 }
 
 #[test]
-fn vector_with_explain_true_rejects_with_42601() {
+fn vector_with_explain_true_matches_sql_explain_rows() {
+    // Issue #948（NOSQL-16・SQL-27）で `vector` 指定 `search` への `explain:
+    // true` を受理するよう拡大した。旧来は `42601` で拒否していた
+    // （`crates/wire-server/tests/nosql16_explain_targets.rs` が新経路の
+    // 網羅的な行一致・非実行・非露出を固定する。本テストは既存ファイルの
+    // 回帰確認として引き続き 1 ケースだけ残す）。
     let (core, _guard) = new_core();
+    let ctx_a = ctx_for("tenant-a");
     let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 5";
+    let expected = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {sql}"));
 
     let body = br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,
         "explain":true}"#;
     let resp = query(addr, &token, body);
-    assert_eq!(resp.status, 400, "resp={resp:?}");
-    assert_eq!(http_common::wire_code_of(&resp), "42601");
+    let got = parse_explain_lines(&resp);
+    assert_eq!(got, expected, "resp={resp:?}");
 }
 
 #[test]
@@ -511,19 +520,30 @@ fn parse_explain_lines_allow_error(resp: &HttpResponse) -> bool {
 }
 
 #[test]
-fn aggregate_and_scan_explain_true_still_reject_with_42601() {
+fn aggregate_and_scan_explain_true_match_sql_explain_rows() {
+    // Issue #948（NOSQL-16・SQL-27）で `aggregate`／`scan` op への `explain:
+    // true` を受理するよう拡大した（旧来は `42601` で拒否）。網羅的な
+    // カバレッジは `crates/wire-server/tests/nosql16_explain_targets.rs`
+    // が持つ。本テストは既存ファイルの回帰確認として最小ケースを残す。
     let (core, _guard) = new_core();
+    let ctx_a = ctx_for("tenant-a");
     let (addr, token) = spawn_alice_session(Arc::clone(&core));
 
+    let aggregate_sql = "SELECT COUNT(*) FROM docs";
+    let expected_aggregate = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {aggregate_sql}"));
     let aggregate_body =
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],
             "explain":true}"#;
     let resp = query(addr, &token, aggregate_body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    let got_aggregate = parse_explain_lines(&resp);
+    assert_eq!(got_aggregate, expected_aggregate, "resp={resp:?}");
 
+    let scan_sql = "SELECT id FROM docs LIMIT 5";
+    let expected_scan = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {scan_sql}"));
     let scan_body = br#"{"op":"scan","table":"docs","limit":5,"explain":true}"#;
     let resp = query(addr, &token, scan_body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    let got_scan = parse_explain_lines(&resp);
+    assert_eq!(got_scan, expected_scan, "resp={resp:?}");
 }
 
 #[test]

@@ -493,7 +493,10 @@ fn sort_on_aggregate_op_rejects_with_42601_unknown_key() {
 }
 
 #[test]
-fn sort_combined_with_explain_true_rejects_with_42601() {
+fn sort_combined_with_explain_true_is_accepted_and_returns_scan_plan() {
+    // Issue #948（NOSQL-16・SQL-27・TASK-186）で `scan` op の `explain: true`
+    // が結線され、`PreparedScan::prepare`／`bind` を共有するため `sort` との
+    // 併用も同じ束縛経路を通って受理される（旧: `42601` 拒否）。
     let (core, _guard) = new_core_scan_docs();
     let addr = spawn(core);
 
@@ -502,8 +505,14 @@ fn sort_combined_with_explain_true_rejects_with_42601() {
         br#"{"op":"scan","table":"docs","limit":10,"explain":true,
              "sort":[{"column":"lang","dir":"asc"}]}"#,
     );
-    assert_eq!(resp.status, 400, "body={resp:?}");
-    assert_eq!(http_common::wire_code_of(&resp), "42601");
+    assert_eq!(resp.status, 200, "body={resp:?}");
+    let body_str = String::from_utf8_lossy(&resp.body);
+    // `scan_explain_result`（engine 側）は `sort` の有無に関わらず固定の
+    // `scalar_plan: plain_scan`／`access_path: full_scan` を返す（検索本体
+    // 〔ソート実行含む〕は呼ばれない設計。`docs/design/bound-plan-session-entry.md`
+    // 参照）。
+    assert!(body_str.contains("plain_scan"), "body={body_str}");
+    assert!(body_str.contains("full_scan"), "body={body_str}");
 }
 
 // --- RLS: 他テナントの Private 行が並び順・境界・件数に影響しない ------------

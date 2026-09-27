@@ -249,7 +249,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `offset` | △ | number | `0..=10000`。非整数・負値・`u32` 超過等の形状不正は `42601`、`10001` 以上の範囲外は `22000`。省略時の既定値は `0`（`0` を明示指定した場合と等価） |
 | `filter` | △ | object[] | |
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
-| `explain` | △ | bool | `true` は `42601`（拒否。後述）。`false`／省略時は通常実行 |
+| `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す。`false`／省略時は通常実行 |
 | `sort` | △ | object[]（`{"column","dir"}`。非空、上限 8 要素） | `dir` は `"asc"`／`"desc"`（小文字完全一致）。省略時は順序保証なし |
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
@@ -287,10 +287,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 ことを推奨する。詳細は `docs/design/sql-offset-paging.md`「`ORDER BY` なし
 `OFFSET` の意味論」節を参照（本節はその要約のみで内容を重複しない）。
 
-`explain: true` は NOSQL-16（Issue #948）で対応するまで `42601`（SQL 表層は
-Issue #922・SQL-27 で `scan` 相当の広域取得への `EXPLAIN` 前置を受理済みだが、
-NoSQL 表層の束縛済み計画向けエントリはまだこれを結線していない）。`sort` と
-`explain: true` の併用も同じ理由で `42601`。
+`explain: true`（[`explain`](#explain) 参照。Issue #948・NOSQL-16）は `sort`・
+`offset` を指定した場合も同じ束縛（`PreparedScan::bind`）を経由するため
+併用できる。
 
 `sort` の主な `wire_code`:
 
@@ -314,7 +313,7 @@ NoSQL 表層の束縛済み計画向けエントリはまだこれを結線し�
 | `filter` | △ | object[] | |
 | `group_by` | △ | string[]（ちょうど 1 要素） | `TEXT` 列限定 |
 | `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
-| `explain` | △ | bool | `true` は `42601`（拒否）。`false`／省略時は通常実行 |
+| `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having` 付きでも受理）。`false`／省略時は通常実行 |
 
 要求例（単一行集計）:
 
@@ -606,14 +605,38 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 
 ## `explain`
 
-`op: search` かつ `plan` 指定かつ `explain: true` のときのみ、検索本体を実行せず
-SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
+`explain: true` は `search`（`vector`・`plan` いずれも）・`scan`・`aggregate`
+（`group_by`／`having` の有無を問わない）で受理し、検索・走査・集計の本体を
+実行せず SQL 表層の対応する `EXPLAIN` 文と同一内容の `QUERY PLAN` を返す
+（`vector` 指定 `search`・`scan`・`aggregate` は Issue #948・NOSQL-16・SQL-27、
+`plan` 指定 `search` は TASK-186・NOSQL-10・Issue #765）。索引の構築・
+ルックアップ・キャッシュ消費・行走査・書き込みはいずれの op でも一切行わない。
 
-要求例:
+要求例（`plan` 指定 `search`）:
 
 ```json
 {"op": "search", "table": "docs", "plan": "find content", "limit": 10,
  "explain": true}
+```
+
+要求例（`vector` 指定 `search`）:
+
+```json
+{"op": "search", "table": "docs", "vector": [0.1, 0.2, 0.3, 0.4], "limit": 10,
+ "explain": true}
+```
+
+要求例（`scan`）:
+
+```json
+{"op": "scan", "table": "docs", "limit": 10, "explain": true}
+```
+
+要求例（`aggregate`）:
+
+```json
+{"op": "aggregate", "table": "docs",
+ "aggregates": [{"fn": "count", "column": "*"}], "explain": true}
 ```
 
 応答例（`200`）:
@@ -622,13 +645,16 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 {"explain": ["<QUERY PLAN の行>", "..."]}
 ```
 
-- `vector` 指定＋`explain: true` → `42601`
-- `plan` 欠落＋`explain: true`（`vector`も欠落）→ `42601`
-- `scan`／`aggregate` への `explain: true` → `42601`（NOSQL-16・Issue #948 で
-  対応するまで。別 op なので `search` の上記条件とは独立に、各 op のハンドラが
-  拒否する）
+- `vector`・`plan` 同時指定＋`explain: true` → `42601`
+- `vector`・`plan` 両方欠落＋`explain: true` → `42601`
+- `insert`／`update`／`delete` への `explain` はいずれもスキーマが宣言しない
+  未知キーとして `42601`
+- `explain` が非 bool → `42601`
 
-検証コード: `crates/wire-server/tests/nosql10_explain.rs`・`wire_explain.rs`。
+検証コード: `crates/wire-server/tests/nosql10_explain.rs`（`plan` 指定
+`search` の網羅的カバレッジ）・`crates/wire-server/tests/
+nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` の
+網羅的カバレッジ）・`wire_explain.rs`。
 
 ## 応答スキーマ
 
@@ -675,11 +701,14 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 | `WHERE lang = 'ja'` | `filter` 要素 `{"op":"eq",...}` |
 | `WHERE lang LIKE 'j%'` | `filter` 要素 `{"op":"prefix",...}` |
 | `EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10` | `search` + `plan` + `"explain":true` |
+| `EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10` | `search` + `vector` + `"explain":true`（Issue #948） |
 | `SELECT id, lang FROM docs WHERE lang = 'ja' LIMIT 10`（広域取得 SQL-15） | `scan` |
+| `EXPLAIN SELECT id FROM docs LIMIT 10` | `scan` + `"explain":true`（Issue #948） |
 | `SELECT id, lang FROM docs ORDER BY lang DESC LIMIT 10`（スカラー `ORDER BY`。SQL-25 (a)） | `scan` + `sort`（Issue #946・NOSQL-15） |
 | `SELECT id, lang FROM docs LIMIT 10 OFFSET 20`（広域取得 `OFFSET`。SQL-25 (b)） | `scan` + `offset`（Issue #947・NOSQL-15） |
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
+| `EXPLAIN SELECT COUNT(*) FROM docs` | `aggregate` + `"explain":true`（Issue #948） |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
 | `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
 | `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
@@ -696,8 +725,6 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 - UDF 呼び出し・`CREATE FUNCTION`
 - `SET`（`search_mode` 等のセッション変数設定）
 - 定数のみの `SELECT`
-- `ORDER BY` 形／集計／広域取得への `EXPLAIN` 前置（`USING PLAN` 付き検索
-  `SELECT` への `EXPLAIN` のみ受理）
 - `aggregate` への `offset`（`GROUP BY ... LIMIT n OFFSET m` 相当。NoSQL 側は
   `limit` 相当の受理形も engine 側の公開 offset setter も持たないため未対応）
 - `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
@@ -948,6 +975,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
   `nosql4_5_aggregate_wire_parity.rs`
+- `explain`（`vector` 指定 `search`・`scan`・`aggregate` への対象拡大。
+  Issue #948・NOSQL-16・SQL-27）: `nosql16_explain_targets.rs`
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
   `http_insert_response_boundary.rs`・`wire_insert_operation_id.rs`
 - `filter`: `nosql7_filter_mapping.rs`

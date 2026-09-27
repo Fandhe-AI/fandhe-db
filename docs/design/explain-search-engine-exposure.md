@@ -228,7 +228,19 @@ executor の実行時ゲートと 1 対 1 対応する静的判定のみを表�
 という executor と同じ判定式から導出する単一情報源（矛盾出力の防止）。
 語彙数・出さない行の選定は SQL-27 確定時に spec 側と擦り合わせる事項。
 
+## 追記（Issue #948・NOSQL-16）: NoSQL 表層からの露出は SQL と同一
+
+`wire-server` の NoSQL 表層（`POST /v1/query`）の `vector` 指定
+`search`・`scan`・`aggregate` への `explain: true`（Issue #948）は、
+`engine::core::EngineCore::search_explain_from_bound`・
+`scan_explain_result`・`aggregate_explain_from_bound`（`docs/design/
+bound-plan-session-entry.md` 追記節参照）を SQL `EXPLAIN` アームと共有する
+ため、本ドキュメントが定めた出力形式（`USING PLAN` なし検索の末尾行・
+集計／広域取得の `scalar_plan`／`access_path` の 2 行）・非露出方針（実行時
+縮退・カーディナリティを出さない）は NoSQL 表層から見ても不変である。
+NoSQL 表層が独自の行・語彙を追加することはない。
+
 ## ポインタ
 
 SQL-6・SQL-27・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・
-PLAN-11・TASK-186（NOSQL-6・NOSQL-10）
+PLAN-11・TASK-186（NOSQL-6・NOSQL-10・NOSQL-16）
