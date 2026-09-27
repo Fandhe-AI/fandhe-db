@@ -361,7 +361,15 @@ where
         };
         if let Some(existing_id) = existing.insert(key, id) {
             if existing_id != id {
-                return Err(TenantWriteError::UniqueViolation);
+                // 同一 UNIQUE キーを共有する既存行が 2 件以上見つかった場合は
+                // 一意性の不変条件が破れている内部矛盾であり（呼び出し元の
+                // incoming VALUES 同士の衝突ではない）、UniqueViolation
+                // （呼び出し元の衝突用 wire code）を誤って返すと非衝突の
+                // UPSERT まで巻き込んで失敗させてしまう。ドキュメント通り
+                // `internal` で fail-closed に拒否する。
+                return Err(internal(
+                    "duplicate existing rows share a UNIQUE key: catalog invariant violated",
+                ));
             }
         }
     }
