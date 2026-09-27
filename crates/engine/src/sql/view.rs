@@ -371,6 +371,14 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         WherePredicate::BoolEquality { column, .. } => Some(column),
         WherePredicate::BoolColumn { column } => Some(column),
         WherePredicate::Compare { column, .. } => Some(column),
+        // SQL-24（TASK-208 ポインタ）。
+        WherePredicate::InList { column, .. } => Some(column),
+        WherePredicate::Between { column, .. } => Some(column),
+        WherePredicate::IsNull { column, .. } => Some(column),
+        // `NOT` は列スコープ検査の対象外にできない: 再帰して内側の列を見ないと
+        // `NOT hidden_col = 'x'` のような否定越しに非公開列の存在情報が漏れる
+        // （A01 アクセス制御の不備。`.claude/rules/security.md` 対応）。
+        WherePredicate::Not(inner) => predicate_column(inner),
         WherePredicate::PredicateCall { .. } | WherePredicate::Expression(_) => None,
         // `check_predicate_columns_within` が `Or` を個別に再帰処理するため
         // 到達しない（本関数へは単純形の述語のみが渡る）。
@@ -388,6 +396,28 @@ mod tests {
     use super::super::allowlist::render_view_body;
     use super::super::lexer;
     use super::*;
+
+    /// SQL-24（TASK-208 ポインタ）・A01（`.claude/rules/security.md`）回帰:
+    /// `NOT hidden_col = 'x'` のように `WHERE` 述語が `Not` で列参照を包んでも、
+    /// 列スコープ検査（`check_columns_within_view`）が再帰して内側の列を検出し、
+    /// ビューが公開しない列への参照を拒否する（否定越しに非公開列の存在情報が
+    /// 漏れない）。
+    #[test]
+    fn check_columns_within_view_rejects_hidden_column_through_not() {
+        let view_columns = vec!["id".to_string()]; // "hidden" は非公開。
+        let where_predicates = vec![WherePredicate::Not(Box::new(WherePredicate::Equality {
+            column: "hidden".to_string(),
+            value: "x".to_string(),
+        }))];
+        let err = check_columns_within_view(
+            Some(&view_columns),
+            &Projection::All,
+            &where_predicates,
+            &[],
+        )
+        .expect_err("NOT-wrapped reference to a hidden column must be rejected");
+        assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+    }
 
     /// render_view_body → 再トークン化 → parse_view_body が元と等価な AST を
     /// 復元することを固定する（TABLE-18・SQL-23・TASK-205、Issue #909 の

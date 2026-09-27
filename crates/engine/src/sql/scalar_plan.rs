@@ -48,8 +48,14 @@ pub enum ScalarPlan {
     /// 索引対応述語がちょうど 1 件で、`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`
     /// 列の範囲比較（`FilterOp::TypedCompare`。`BYTEA` は対象外——索引が
     /// 未対応のため常に `PlainScan`。Issue #891・TASK-199 で production
-    /// 結線済み・Issue #893 で二次索引へ接続済み）。
+    /// 結線済み・Issue #893 で二次索引へ接続済み）。`FilterOp::Between`
+    /// （`BYTEA` 以外。SQL-24・TASK-208 ポインタ）も同じ分類へ合流する
+    /// （`sql::scalar_index::ScalarIndex::candidates_for` が `Ge`∧`Le` の
+    /// 積で候補を導出する）。
     IndexTypedRange,
+    /// 索引対応述語がちょうど 1 件で、`TEXT`／`ENUM` 列の `IN` 条件
+    /// （`FilterOp::InText`。SQL-24・TASK-208 ポインタ）。
+    IndexInList,
     /// 索引対応述語が 2 件以上（交差が必要）。
     IndexConjunction,
 }
@@ -181,6 +187,29 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
                 value: crate::declarative_filter::TypedLiteral::Bytes(_),
                 ..
             }
+        ) || matches!(
+            f.op(),
+            crate::declarative_filter::FilterOp::Between {
+                low: crate::declarative_filter::TypedLiteral::Bytes(_),
+                ..
+            }
+        )
+    }) {
+        return ScalarPlan::PlainScan;
+    }
+    // `Not`／`IsNull`／`IsNotNull`／`InTyped`（SQL-24・TASK-208 ポインタ）は
+    // 索引未対応（`sql::scalar_index::ScalarIndex::candidates_for` が `None` を
+    // 返す）。`mask_trusted_defer`／`count_star_only` は「索引が返した候補集合が
+    // 厳密一致」を前提に再評価を省略するため、索引側が対応しない op が複合述語
+    // へ紛れ込んだまま `IndexConjunction` に分類されるのを防ぐ単一の事前ゲート
+    // （`BoolEquals`・`TypedCompare{Bytes}` と同じ設計）。
+    if input.metadata_filters.iter().any(|f| {
+        matches!(
+            f.op(),
+            crate::declarative_filter::FilterOp::Not(_)
+                | crate::declarative_filter::FilterOp::IsNull
+                | crate::declarative_filter::FilterOp::IsNotNull
+                | crate::declarative_filter::FilterOp::InTyped(_)
         )
     }) {
         return ScalarPlan::PlainScan;
@@ -230,17 +259,31 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
             // （`BYTEA` は上の事前判定で既に `PlainScan` を返し済みのため
             // ここへは到達しない）。Issue #891・TASK-199 の production 結線・
             // Issue #893 の二次索引接続により索引対応述語として扱う。
-            crate::declarative_filter::FilterOp::TypedCompare { .. } => ScalarPlan::IndexTypedRange,
-            // `Compare`（未束縛）は `bind` 済み `MetadataFilter` には
-            // 現れない契約だが網羅性のため plain scan へ倒す（fail-closed
-            // の保険腕）。
-            crate::declarative_filter::FilterOp::Compare { .. } => ScalarPlan::PlainScan,
+            crate::declarative_filter::FilterOp::TypedCompare { .. }
+            // `Between`（`BYTEA` は上の事前判定で `PlainScan` 済みのため
+            // ここへは到達しない。SQL-24・TASK-208 ポインタ）。
+            | crate::declarative_filter::FilterOp::Between { .. } => ScalarPlan::IndexTypedRange,
+            // `TEXT`／`ENUM` 列の `IN`（SQL-24・TASK-208 ポインタ）。
+            crate::declarative_filter::FilterOp::InText(_) => ScalarPlan::IndexInList,
+            // `Compare`／`InListLiteral`／`BetweenLiteral`（未束縛）は `bind`
+            // 済み `MetadataFilter` には現れない契約だが網羅性のため plain
+            // scan へ倒す（fail-closed の保険腕）。`Not`／`IsNull`／
+            // `IsNotNull`／`InTyped` は上の事前ゲートで既に `PlainScan` 済み
+            // のためここへは到達しない。
+            //
             // `Like` は上の事前判定で既に `PlainScan` を返し済みのため
             // ここへは到達しないが、網羅性のため保険腕として同じ結果を返す
             // （SQL-24／TASK-208、Issue #914）。`LikeUnbound`（未束縛）は
             // `bind` 済み `MetadataFilter` には現れない契約（`Compare` と同じ
             // fail-closed の保険腕）。
-            crate::declarative_filter::FilterOp::Like(_)
+            crate::declarative_filter::FilterOp::Compare { .. }
+            | crate::declarative_filter::FilterOp::InListLiteral { .. }
+            | crate::declarative_filter::FilterOp::BetweenLiteral { .. }
+            | crate::declarative_filter::FilterOp::Not(_)
+            | crate::declarative_filter::FilterOp::IsNull
+            | crate::declarative_filter::FilterOp::IsNotNull
+            | crate::declarative_filter::FilterOp::InTyped(_)
+            | crate::declarative_filter::FilterOp::Like(_)
             | crate::declarative_filter::FilterOp::LikeUnbound(_) => ScalarPlan::PlainScan,
         }
     }
@@ -440,6 +483,194 @@ mod tests {
         )
         .expect("bind compare filter");
         bound.into_iter().next().expect("one filter")
+    }
+
+    /// `TEXT` 列の `IN` 述語（SQL-24・TASK-208 ポインタ）。
+    fn in_text_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::in_list(
+                schema.columns[column_index].name.clone(),
+                vec!["a".to_string(), "b".to_string()],
+            )],
+            &schema,
+        )
+        .expect("bind IN filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// `DATE` 列の `BETWEEN` 述語（`Bytes` 以外。SQL-24・TASK-208 ポインタ）。
+    fn between_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::between(
+                schema.columns[column_index].name.clone(),
+                "2024-01-01".to_string(),
+                "2024-06-01".to_string(),
+            )],
+            &schema,
+        )
+        .expect("bind BETWEEN filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// `BYTEA` 列の `BETWEEN` 述語（`OrderedColumnIndex` 未対応。SQL-24・
+    /// TASK-208 ポインタ）。
+    fn between_bytea_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::between(
+                schema.columns[column_index].name.clone(),
+                "\\x00".to_string(),
+                "\\xff".to_string(),
+            )],
+            &schema,
+        )
+        .expect("bind BETWEEN filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// `IS NULL` 述語（SQL-24・TASK-208 ポインタ）。
+    fn is_null_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::is_null(
+                schema.columns[column_index].name.clone(),
+            )],
+            &schema,
+        )
+        .expect("bind IS NULL filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// `NOT <col> = '<lit>'` 述語（SQL-24・TASK-208 ポインタ）。
+    fn not_eq_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::equals(
+                schema.columns[column_index].name.clone(),
+                "v".to_string(),
+            )
+            .negate()],
+            &schema,
+        )
+        .expect("bind NOT filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    /// `DATE` 列の `IN` 述語（`InTyped`。SQL-24・TASK-208 ポインタ。索引
+    /// 未対応のため常に `PlainScan`）。
+    fn in_typed_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::in_list(
+                schema.columns[column_index].name.clone(),
+                vec!["2024-01-01".to_string()],
+            )],
+            &schema,
+        )
+        .expect("bind IN filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
+    // --- SQL-24（TASK-208 ポインタ）: IN / BETWEEN / IS NULL / NOT ------------
+
+    #[test]
+    fn index_in_list_for_single_in_text_predicate() {
+        let filters = vec![in_text_filter(1)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexInList);
+    }
+
+    #[test]
+    fn index_typed_range_for_single_between_predicate() {
+        let filters = vec![between_filter(4)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexTypedRange);
+    }
+
+    #[test]
+    fn plain_scan_for_single_bytea_between_predicate() {
+        let filters = vec![between_bytea_filter(5)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_when_bytea_between_predicate_mixed_with_text_equality() {
+        let filters = vec![eq_filter(1), between_bytea_filter(5)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_for_single_is_null_predicate() {
+        let filters = vec![is_null_filter(1)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_for_single_not_predicate() {
+        let filters = vec![not_eq_filter(1)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_for_single_in_typed_predicate() {
+        let filters = vec![in_typed_filter(4)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_when_not_predicate_mixed_with_indexable_equality() {
+        // `Not`／`IsNull`／`IsNotNull`／`InTyped` は複合述語に混在しても
+        // `IndexConjunction` へ進まない（事前ゲート）。
+        let filters = vec![eq_filter(1), not_eq_filter(2)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
 
     /// Issue #891・TASK-199（production 結線）・Issue #893（二次索引接続）:

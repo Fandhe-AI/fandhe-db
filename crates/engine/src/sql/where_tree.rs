@@ -105,6 +105,70 @@ impl BoundOrGroup {
             branch.visit_column_indices(out);
         }
     }
+
+    /// `self`（またはネストした分岐）が式述語（[`BoundConjunction::expr_filters`]）
+    /// を 1 つでも持つか（再帰的に判定。codex-review 指摘対応・Issue #913
+    /// マージ時レビュー是正）。`sql::exec` の DISTANCE 先行 SCALAR 事後フィルタが、
+    /// 式述語を含まない（＝評価がエラーを返し得ない）OR 群だけを
+    /// `on_visible_row` で即時確定させ、式述語を含む OR 群は式述語の評価を
+    /// DISTANCE 段の後（実際に Top-k として選ばれた行だけ）まで遅延させるか
+    /// どうかを判定するために使う。
+    pub(crate) fn contains_expr(&self) -> bool {
+        self.branches.iter().any(BoundConjunction::contains_expr)
+    }
+
+    /// 生の `scanned`（`row_codec::scan_scalar_columns` 由来。実 NULL と型不一致を
+    /// 区別できる）に対して、宣言的（メタデータ）述語の部分だけを評価した結果を
+    /// 木として保持する（`self` と同じ形状。[`Self`]・[`BoundConjunction`] と
+    /// 1 対 1）。式述語は一切評価しない（エラーを返さない）。`sql::exec` の
+    /// `on_visible_row` がこの場限りの一時的な判定にのみ使う（返り値は行ごとに
+    /// 保持しない。codex-review 指摘対応: 可視行数 × OR 群の分岐数分のメモリを
+    /// 無制限に保持しない）: [`OrGroupMetadataVerdict::is_definitely_false`] が
+    /// 真なら、式述語の値に関わらず不一致が確定するため、式を一切評価せずに
+    /// 安全に除外できる（`AND` の短絡評価。式述語自体の評価は DISTANCE 段の後、
+    /// `candidate_columns` から再構成した `scanned` 相当に対して
+    /// [`Self::matches`] を呼ぶ）。
+    pub(crate) fn metadata_verdict(
+        &self,
+        scanned: &[Option<ScalarRef<'_>>],
+    ) -> OrGroupMetadataVerdict {
+        OrGroupMetadataVerdict {
+            branches: self
+                .branches
+                .iter()
+                .map(|b| b.metadata_verdict(scanned))
+                .collect(),
+        }
+    }
+}
+
+/// [`BoundOrGroup::metadata_verdict`] が返す、宣言的（メタデータ）述語だけを
+/// 事前評価した結果の木（形状は元の `BoundOrGroup` と 1 対 1）。式述語の
+/// 評価結果は含まない。呼び出し元（`sql::exec`）はこの場限りの判定
+/// （[`Self::is_definitely_false`]）にのみ使い、行ごとに保持しない。
+#[derive(Debug, Clone)]
+pub(crate) struct OrGroupMetadataVerdict {
+    branches: Vec<ConjunctionMetadataVerdict>,
+}
+
+impl OrGroupMetadataVerdict {
+    /// この OR 群が、式述語の値に関わらず不一致であることが宣言的部分だけで
+    /// 確定しているか（`OR` の全分岐が `metadata_ok == false`。`AND` の短絡評価
+    /// により、分岐が持つ式述語・ネストした OR 群の値は結果に影響しない）。
+    /// `true` を返す行は、式述語を一切評価せず安全に（エラーを起こさず）除外
+    /// できる（`sql::exec` の DISTANCE 先行 SCALAR 事後フィルタが使う）。
+    pub(crate) fn is_definitely_false(&self) -> bool {
+        self.branches.iter().all(|b| !b.metadata_ok)
+    }
+}
+
+/// [`BoundConjunction::metadata_verdict`] が返す 1 分岐ぶんの宣言的判定。
+/// [`OrGroupMetadataVerdict::is_definitely_false`] は `metadata_ok` だけを見る
+/// （`AND` の短絡評価により、ある分岐の `metadata_filters` が不一致なら
+/// ネストした `or_groups` の値に関わらずその分岐は不一致が確定するため）。
+#[derive(Debug, Clone)]
+struct ConjunctionMetadataVerdict {
+    metadata_ok: bool,
 }
 
 impl BoundConjunction {
@@ -141,27 +205,10 @@ impl BoundConjunction {
             .map(|v| v.and_then(|s| s.as_text()))
             .collect();
         for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
-            let references_embedding = udf_call::references_embedding(expr);
-            // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
-            // 自身（`ExprStep::PushVector` の空スライス判定。`sql::expr_program`
-            // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査
-            // （`references_embedding`）による事前除外は `CASE` の選ばれない
-            // 分岐に embedding 参照があるだけの葉まで誤って偽にしていたため撤去
-            // し、評価時点の判定へ一本化した）。
-            let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
-            match program.eval(id, row_embedding, &text_columns, scratch)? {
-                ExprValue::Bool(true) => {}
-                // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有契約
-                // （PostgreSQL の 3 値論理）: NULL は `WHERE`（OR 分岐内）でも
-                // 偽と同義。
-                ExprValue::Bool(false) | ExprValue::Null => return Ok(false),
-                // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式述語の
-                // 型を `Bool` に限定済みのため到達しない。
-                _ => {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "WHERE expression did not evaluate to a boolean",
-                    ))
-                }
+            if let Some(false) =
+                eval_expr_predicate(expr, program, id, embedding, &text_columns, scratch)?
+            {
+                return Ok(false);
             }
         }
         for group in &self.or_groups {
@@ -193,5 +240,49 @@ impl BoundConjunction {
         for group in &self.or_groups {
             group.visit_column_indices(out);
         }
+    }
+
+    fn contains_expr(&self) -> bool {
+        !self.expr_filters.is_empty() || self.or_groups.iter().any(BoundOrGroup::contains_expr)
+    }
+
+    /// [`BoundOrGroup::metadata_verdict`] の分岐単位の本体。`scanned` に対して
+    /// `metadata_filters` だけを評価する（式述語には触れない。エラーを返さない）。
+    fn metadata_verdict(&self, scanned: &[Option<ScalarRef<'_>>]) -> ConjunctionMetadataVerdict {
+        ConjunctionMetadataVerdict {
+            metadata_ok: declarative_filter::matches_all(&self.metadata_filters, scanned),
+        }
+    }
+}
+
+/// [`BoundConjunction::expr_filters`] の 1 要素を評価する（[`BoundConjunction::
+/// matches`] が使い、第 2 の評価器を作らない）。`Ok(Some(false))` は分岐全体を
+/// 不一致として打ち切るべきことを示し、`Ok(None)` は一致（呼び出し元は次の
+/// 式述語へ進む）を示す。
+fn eval_expr_predicate(
+    expr: &BoundExpr,
+    program: &ExprProgram,
+    id: u64,
+    embedding: &[f32],
+    text_columns: &[Option<&str>],
+    scratch: &mut Vec<StackValue>,
+) -> Result<Option<bool>, SqlSurfaceError> {
+    let references_embedding = udf_call::references_embedding(expr);
+    // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval` 自身
+    // （`ExprStep::PushVector` の空スライス判定。`sql::expr_program` 参照）が
+    // 行う（codex-review P1 指摘対応: 静的な式木走査（`references_embedding`）
+    // による事前除外は `CASE` の選ばれない分岐に embedding 参照があるだけの
+    // 葉まで誤って偽にしていたため撤去し、評価時点の判定へ一本化した）。
+    let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
+    match program.eval(id, row_embedding, text_columns, scratch)? {
+        ExprValue::Bool(true) => Ok(None),
+        // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。Issue #921・
+        // Issue #919（AC2）。PostgreSQL の 3 値論理と同じ扱い）。
+        ExprValue::Bool(false) | ExprValue::Null => Ok(Some(false)),
+        // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式述語の型を
+        // `Bool` に限定済みのため到達しない。
+        _ => Err(SqlSurfaceError::invalid_input(
+            "WHERE expression did not evaluate to a boolean",
+        )),
     }
 }

@@ -1181,3 +1181,65 @@ fn exists_subquery_with_window_function_is_rejected() {
             if detail.contains("window functions")
     ));
 }
+
+// --- NOT EXISTS / NOT IN (SELECT ...)（Cursor Bugbot Medium 指摘対応） ------
+
+/// `docs/design/sql-subquery.md`「スコープ（当初計画との差分）」は `NOT IN`・
+/// `NOT EXISTS` を「非対応（文法自体が `NOT` を持たない）」と明記している。
+/// 前置 `NOT`（`sql::allowlist::Parser::parse_where_leaf`）が構造的に確定した
+/// `EXISTS (SELECT ...)`（`WherePredicate::Exists`）をそのまま `Not` で包むと、
+/// 束縛段（`sql::parser::declarative_leaf_to_filter`）がこれを宣言的フィルタ
+/// として扱えず `Internal` エラー（内部実装詳細の漏えい）になってしまう回帰が
+/// あった。構文段で `0A000`（`FeatureNotSupported`）として明示的に拒否する。
+#[test]
+fn not_exists_subquery_is_rejected_with_feature_not_supported() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    // visits に可視行を用意する（可視行があっても構文段で拒否されることの確認。
+    // 「実行時に false 相当になるから受理してよい」という誤った緩和を防ぐ）。
+    insert_visit(&core, &ctx, 1, "hit");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
+        ),
+    );
+    assert!(
+        matches!(
+            &err,
+            engine::sql::allowlist::SqlSurfaceError::FeatureNotSupported { .. }
+        ),
+        "expected FeatureNotSupported (0A000), got {err:?}"
+    );
+}
+
+/// [`not_exists_subquery_is_rejected_with_feature_not_supported`] の
+/// `IN (SELECT ...)` 版。同じ理由（`WherePredicate::InSubquery` を `Not` で
+/// 包むと束縛段で `Internal` エラーになっていた）で `0A000` を固定する。
+#[test]
+fn not_in_subquery_is_rejected_with_feature_not_supported() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    insert_allowed_lang(&core, &ctx, 1, "ja");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(
+        matches!(
+            &err,
+            engine::sql::allowlist::SqlSurfaceError::FeatureNotSupported { .. }
+        ),
+        "expected FeatureNotSupported (0A000), got {err:?}"
+    );
+}
