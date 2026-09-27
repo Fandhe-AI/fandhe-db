@@ -145,6 +145,7 @@ pub(crate) mod check_constraint;
 pub mod copy;
 pub(crate) mod cte;
 pub mod cursor;
+pub(crate) mod datetime_fn;
 pub mod ddl;
 pub(crate) mod ddl_column_type;
 pub(crate) mod describe;
