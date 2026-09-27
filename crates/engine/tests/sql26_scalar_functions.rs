@@ -431,3 +431,153 @@ fn check_constraint_using_position_round_trips_through_storage_reopen() {
         .expect_err("label without 'a' should still violate POSITION(...) CHECK after reopen");
     assert_eq!(err.wire_code(), "23514");
 }
+
+// --- codex-review（Cursor Bugbot）High 指摘の回帰テスト: COALESCE/NULLIF/CASE
+// と NULL の TEXT 列の相互作用（`sql::expr_program::ExprStep::JumpIfNotNull` が
+// `StackValue::TextColumnRef` を解決せず非 NULL 扱いしていた不具合。§3-7 に
+// 追記済みのため対象ビヘイビアは引き続き SQL-26／Issue #919・#921）
+// ---------------------------------------------------------------------------
+//
+// `seed()` のコーパス（id=1 label="Hello"・id=2 label="world"・id=3 label=NULL）
+// をそのまま使う。`COALESCE`/`NULLIF`/`CASE` はいずれも構文段のトップレベル
+// 式評価（投影・`WHERE`）でコンパイル済みステップ列（`ExprProgram`）を経由する
+// ため、修正前は id=3（label が NULL）の行で `COALESCE(label, ...)` が
+// フォールバック値ではなく NULL を返す・`WHERE COALESCE(...) = ...` が
+// 誤って非該当になる、という回帰が投影・WHERE の両方で再現していた。
+
+#[test]
+fn coalesce_with_null_text_column_falls_back_in_projection() {
+    let path = unique_db_path("sql26-coalesce-null-projection");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id, coalesce(label, 'default') FROM docs LIMIT 10",
+        )
+        .expect("SELECT with coalesce should succeed");
+    // 非 NULL の TEXT 列（id=1, 2）は自身の値をそのまま返す（修正前から
+    // 正しく動いていた経路。回帰していないことを確認する）。
+    assert_eq!(cell_for(&result, 1, 1), Cell::Text("Hello".to_string()));
+    assert_eq!(cell_for(&result, 2, 1), Cell::Text("world".to_string()));
+    // NULL の TEXT 列（id=3）は 'default' へフォールバックする（修正前は
+    // `TextColumnRef` マーカーを非 NULL と誤判定し NULL を返していた）。
+    assert_eq!(cell_for(&result, 3, 1), Cell::Text("default".to_string()));
+}
+
+#[test]
+fn coalesce_with_null_text_column_falls_back_in_where_clause() {
+    let path = unique_db_path("sql26-coalesce-null-where");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // label が NULL の行だけが 'fallback' へ解決される。修正前は
+    // `COALESCE(label, 'fallback')` が誤って NULL を返し続けるため
+    // `= 'fallback'` に一致せず、0 行になっていた。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id FROM docs WHERE coalesce(label, 'fallback') = 'fallback' LIMIT 10",
+        )
+        .expect("SELECT with WHERE coalesce should succeed");
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![3]);
+
+    // 非 NULL の行（id=1, 2）は自身の値と比較され、'fallback' には一致しない。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id FROM docs WHERE coalesce(label, 'fallback') = 'Hello' LIMIT 10",
+        )
+        .expect("SELECT with WHERE coalesce should succeed");
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1]);
+}
+
+#[test]
+fn multi_stage_coalesce_skips_multiple_null_text_arguments() {
+    let path = unique_db_path("sql26-coalesce-multi-stage");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // id=3 は label が NULL のため、`label` を 2 回連続で NULL として
+    // スキップし、3 番目の引数（リテラル）へたどり着く必要がある
+    // （`JumpIfNotNull` が最初の `TextColumnRef` を誤って非 NULL と判定すると
+    // 2 回目の引数へ進まずマーカーのまま止まってしまう）。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id, coalesce(label, label, 'final-default') FROM docs LIMIT 10",
+        )
+        .expect("SELECT with multi-stage coalesce should succeed");
+    assert_eq!(cell_for(&result, 1, 1), Cell::Text("Hello".to_string()));
+    assert_eq!(
+        cell_for(&result, 3, 1),
+        Cell::Text("final-default".to_string())
+    );
+}
+
+#[test]
+fn nullif_rejects_text_operands_and_propagates_null_via_derived_scalar_expr() {
+    let path = unique_db_path("sql26-nullif-text");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // NULLIF は `sql::udf_call::bind_nullif` が両辺を `ExprType::Scalar` に
+    // 限定するため、`TEXT` 型（`BoundExpr::TextColumnRef` そのもの）は
+    // オペランドとして構造的に受理されない（`=` 演算子と同じ既存契約）。
+    // そのため NULLIF の直接オペランドとして生の `TextColumnRef` マーカーが
+    // スタックへ積まれる経路は存在せず、本バグ（`JumpIfNotNull` の
+    // 誤判定）の影響を受けようがないことをまず固定する。
+    let err = core
+        .execute_sql(&ctx, "SELECT nullif(label, 'Hello') FROM docs LIMIT 10")
+        .expect_err("NULLIF must reject TEXT operands");
+    assert_eq!(err.wire_code(), "42804");
+
+    // TEXT 列由来の Scalar 式（`LENGTH(label)`）を経由した NULLIF は受理される。
+    // `LENGTH` は Builtin ステップの `stack_to_expr_value` を経由して既に
+    // 解決済みのスカラー値をスタックへ積むため生のマーカーは残らないが、
+    // NULL 伝播（strict な `LENGTH` が NULL の `label` に対し NULL を返す）が
+    // NULLIF まで正しく伝わることを固定する。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id, nullif(length(label), 100) FROM docs LIMIT 10",
+        )
+        .expect("SELECT with nullif(length(...), ...) should succeed");
+    // id=1, 2: length は 5（'Hello'/'world'）で 100 と異なるため自身の値。
+    assert_eq!(cell_for(&result, 1, 1), Cell::Float(5.0));
+    assert_eq!(cell_for(&result, 2, 1), Cell::Float(5.0));
+    // id=3: label が NULL のため length(label) も NULL、NULLIF 自体も NULL
+    // （`(Null, _) => Null` 契約）。
+    assert_eq!(cell_for(&result, 3, 1), Cell::Null);
+}
+
+#[test]
+fn case_when_comparing_null_text_column_takes_else_branch() {
+    let path = unique_db_path("sql26-case-text");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // CASE の WHEN 条件は比較（`Expr::Binary`）に限定されるため、TEXT 列が
+    // NULL の行では条件自体が NULL（UNKNOWN）に解決され、ELSE 分岐を取る
+    // （`JumpIfNotTrue` は Binary 比較の結果〔Bool/Null〕のみを見るため、この
+    // バグの影響は受けない経路だが、TEXT 列との組み合わせで回帰しないことを
+    // 固定する）。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id, case when label = 'Hello' then 'yes' else 'no' end FROM docs LIMIT 10",
+        )
+        .expect("SELECT with case should succeed");
+    assert_eq!(cell_for(&result, 1, 1), Cell::Text("yes".to_string()));
+    assert_eq!(cell_for(&result, 2, 1), Cell::Text("no".to_string()));
+    // id=3: label が NULL のため `label = 'Hello'` は UNKNOWN → ELSE 分岐。
+    assert_eq!(cell_for(&result, 3, 1), Cell::Text("no".to_string()));
+}

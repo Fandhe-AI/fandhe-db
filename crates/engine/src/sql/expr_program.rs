@@ -613,7 +613,36 @@ impl ExprProgram {
                 ExprStep::JumpIfNotNull { target } => {
                     // peek のみ（pop しない）。非 NULL なら値をスタックに残した
                     // まま飛ぶ（`compile_coalesce` 参照）。
-                    let is_null = matches!(scratch.last(), Some(StackValue::Null));
+                    //
+                    // codex-review（Cursor Bugbot）High 指摘対応: `TextColumnRef`
+                    // は行の実値を持たない遅延マーカー（実際の NULL 性は
+                    // `text_columns` を引かないと分からない）。旧実装は
+                    // `StackValue::Null` かどうかだけを見ていたため、NULL な
+                    // `TEXT` 列の `TextColumnRef` マーカーを「非 NULL」と
+                    // 誤判定し、`COALESCE(text_col, 'default')` が後続の
+                    // フォールバック引数へ進まずマーカーのまま `Jump` してしまい
+                    // （最終的に `stack_to_expr_value` で NULL に解決されるため
+                    // `'default'` ではなく NULL を返す）、NULL 伝播契約
+                    // （Issue #919・SQL-26 AC2）に違反していた。マーカーを
+                    // pop せず `text_columns` で覗き見て実際の NULL 性を判定する
+                    // （`stack_to_expr_value` と同じマスク外参照の fail-closed
+                    // 判定〔`Internal`〕を共有し、値そのものは複製しない）。
+                    let is_null = match scratch.last() {
+                        Some(StackValue::Null) => true,
+                        Some(StackValue::TextColumnRef(index)) => match text_columns.get(*index) {
+                            Some(Some(_)) => false,
+                            Some(None) => true,
+                            None => return Err(SqlSurfaceError::Internal {
+                                detail:
+                                    "TEXT column reference is outside the decoded row scalar view"
+                                        .to_string(),
+                            }),
+                        },
+                        // `Scalar`/`Bool`/`VectorRef`/`VectorOwned`/`Text`（既に
+                        // 所有済みの文字列）はいずれも実値を持つため非 NULL。
+                        Some(_) => false,
+                        None => return Err(stack_underflow()),
+                    };
                     if is_null {
                         pc += 1;
                     } else {
