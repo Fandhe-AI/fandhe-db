@@ -11,6 +11,7 @@
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, MAX_COLUMN_DEFAULT_LEN};
+use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
@@ -3876,6 +3877,53 @@ impl<'a> Parser<'a> {
                 self.expect_punct(')')?;
                 Ok(inner)
             }
+            // `DATE '<literal>'`／`TIMESTAMP '<literal>'`（型付きリテラル。
+            // 対象ビヘイビア: SQL-26。Issue #920）。直後が文字列リテラルの
+            // 場合に限って型付きリテラルとして消費する——先読みなしで無条件に
+            // 消費すると、既存の列名 `date`／`timestamp`（`sql::parser::
+            // bind_datetime_literal` が示すとおり列型としては既に存在する識別子）
+            // の参照が壊れる破壊的変更になる（`CASE`/`WHEN` 先読みと同じ方針）。
+            // AST には解析済みの内部表現を保持する（§2-8。CHECK・ビューの
+            // render→再パース往復での区切り文字表記揺れを避けるため、生文字列は
+            // 保持しない）。
+            Some(Token::Ident(name))
+                if (name.eq_ignore_ascii_case("DATE")
+                    || name.eq_ignore_ascii_case("TIMESTAMP"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::StringLiteral(_))) =>
+            {
+                let is_date = name.eq_ignore_ascii_case("DATE");
+                self.advance();
+                let literal = match self.advance() {
+                    Some(Token::StringLiteral(s)) => s.clone(),
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected string literal after DATE/TIMESTAMP, got {other:?}"
+                        )))
+                    }
+                };
+                self.consume_expr_node()?;
+                if is_date {
+                    match crate::datetime::parse_date(&literal) {
+                        Ok(days) => Ok(Expr::DateLiteral(days)),
+                        Err(DateTimeLiteralError::Format(detail)) => {
+                            Err(SqlSurfaceError::invalid_input(detail))
+                        }
+                        Err(DateTimeLiteralError::Overflow(detail)) => {
+                            Err(SqlSurfaceError::datetime_field_overflow(detail))
+                        }
+                    }
+                } else {
+                    match crate::datetime::parse_timestamp(&literal) {
+                        Ok(micros) => Ok(Expr::TimestampLiteral(micros)),
+                        Err(DateTimeLiteralError::Format(detail)) => {
+                            Err(SqlSurfaceError::invalid_input(detail))
+                        }
+                        Err(DateTimeLiteralError::Overflow(detail)) => {
+                            Err(SqlSurfaceError::datetime_field_overflow(detail))
+                        }
+                    }
+                }
+            }
             Some(Token::Ident(name)) => {
                 self.advance();
                 if matches!(self.peek(), Some(Token::Punct('('))) {
@@ -4088,6 +4136,33 @@ impl<'a> Parser<'a> {
                 name,
                 args: vec![haystack, needle],
             });
+        }
+        // codex 指摘対応（PR #1120）: `date_part`／`date_trunc` は
+        // `docs/design/datetime-scalar-functions.md` の契約上「NULL 入力は
+        // すべて strict（いずれかの引数が NULL なら NULL）」であり、これは
+        // 第 2 引数（`src`）だけでなく第 1 引数（field/unit）にも適用される
+        // （`date_part(NULL, at)` は `NULL` を返すべきで、field が文字列
+        // リテラルであることを要求する束縛時検査〔`udf_call::
+        // bind_date_part_or_trunc`〕は「非 NULL の場合」に限定する）。当初は
+        // 第 1 引数のみ `false` のままにしていたが、これは strict 契約と
+        // 矛盾していたため是正し、`CONCAT` と同じく全引数一律で `true` にする。
+        if name.eq_ignore_ascii_case("date_part") || name.eq_ignore_ascii_case("date_trunc") {
+            let mut args = Vec::new();
+            if !matches!(self.peek(), Some(Token::Punct(')'))) {
+                args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
+                while matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    if args.len() >= MAX_CALL_ARGS {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "too many call arguments",
+                        ));
+                    }
+                    args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
+                }
+            }
+            self.expect_punct(')')?;
+            self.consume_expr_node()?;
+            return Ok(Expr::Call { name, args });
         }
         // codex-review 指摘対応: `CONCAT` は NULL 引数を空文字として扱い常に
         // 非 NULL を返す契約（`udf_call::bind_concat`・`apply_builtin` の

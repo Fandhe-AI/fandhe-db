@@ -318,6 +318,9 @@ fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(), SqlSurface
             expr_columns_within(columns, lhs)?;
             expr_columns_within(columns, rhs)
         }
+        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
+        // Issue #920）は列参照を持たない。
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
     }
 }
 

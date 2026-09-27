@@ -526,24 +526,63 @@ fn having_predicate_count_over_limit_rejects_with_54000() {
     assert_eq!(http_common::wire_code_of(&resp), "54000", "resp={resp:?}");
 }
 
+/// Issue #948（NOSQL-16・SQL-27）で `group_by` 付き `aggregate` への
+/// `explain: true` も受理するよう拡大した（旧来は `42601` で拒否）。
+/// `group_by`／`having` も `aggregate.rs::bind` を共有するため、`QUERY
+/// PLAN` 応答が SQL の `EXPLAIN SELECT ... GROUP BY` と行単位で一致する
+/// ことを固定する（オラクルは同じ `Arc<EngineCore>` への
+/// `execute_sql_in_session`。行一致の網羅的なカバレッジは
+/// `nosql16_explain_targets.rs` が持つ）。
 #[test]
-fn explain_true_is_still_rejected_with_42601_even_with_group_by() {
-    // SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用」契約の写像
-    // として `42601` へ拒否する（NOSQL-10・Issue #765）。
+fn explain_true_matches_sql_explain_rows_with_group_by() {
+    use engine::json::JsonValue;
+
     let (core, _guard) = new_core();
+    let ctx_a =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant ctx");
     let addr = spawn(Arc::clone(&core));
+
+    let sql = "SELECT COUNT(*) FROM docs GROUP BY lang";
+    let mut session = SessionState::default();
+    let expected = match core
+        .execute_sql_in_session(&ctx_a, &mut session, &format!("EXPLAIN {sql}"))
+        .expect("SQL EXPLAIN should succeed")
+    {
+        SqlOutcome::Explain(result) => result
+            .rows
+            .iter()
+            .map(|row| match &row.cells[0] {
+                engine::sql::exec::Cell::Text(s) => s.clone(),
+                other => panic!("expected Cell::Text, got {other:?}"),
+            })
+            .collect::<Vec<String>>(),
+        other => panic!("expected SqlOutcome::Explain, got {other:?}"),
+    };
 
     let body = br#"{"op":"aggregate","table":"docs",
         "aggregates":[{"fn":"count","column":"*"}],
         "group_by":["lang"],
         "explain":true}"#;
     let resp = query_as_alice(addr, body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
-    assert!(
-        !body_utf8(&resp).contains("row_count"),
-        "{}",
-        body_utf8(&resp)
-    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let text = body_utf8(&resp);
+    assert!(!text.contains("row_count"), "{text}");
+    let JsonValue::Object(mut top) = engine::json::parse_json(&text).expect("valid json body")
+    else {
+        panic!("expected json object body: {text}");
+    };
+    let JsonValue::Array(items) = top.remove("explain").expect("missing \"explain\" key") else {
+        panic!("\"explain\" must be an array: {text}");
+    };
+    let got: Vec<String> = items
+        .into_iter()
+        .map(|v| match v {
+            JsonValue::String(s) => s,
+            other => panic!("expected string element, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, expected);
 }
 
 #[test]

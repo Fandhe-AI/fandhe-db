@@ -523,10 +523,11 @@ fn group_count_over_max_groups_with_two_keys_rejects_with_54000_and_sql_agrees()
 }
 
 #[test]
-fn explain_true_is_still_rejected_with_42601_even_with_multi_column_group_by() {
-    // SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用」契約の写像
-    // として `42601` へ拒否する（NOSQL-10・Issue #765）。複数列 `group_by`
-    // （Issue #949）でも同じ拒否が維持されることを固定する。
+fn explain_true_is_accepted_with_multi_column_group_by_and_returns_fixed_plan() {
+    // Issue #948（NOSQL-16・SQL-27・TASK-186）で `aggregate` op の
+    // `explain: true` が結線されたため、複数列 `group_by`（Issue #949）でも
+    // 同じ束縛（`aggregate.rs::bind`）を経由して受理される（旧: `42601` 拒否）。
+    // 検索本体は実行されないため、集計結果（`row_count` 等）は含まれない。
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
@@ -535,10 +536,8 @@ fn explain_true_is_still_rejected_with_42601_even_with_multi_column_group_by() {
         "group_by":["lang","region"],
         "explain":true}"#;
     let resp = query_as_alice(addr, body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
-    assert!(
-        !body_utf8(&resp).contains("row_count"),
-        "{}",
-        body_utf8(&resp)
-    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let body_str = body_utf8(&resp);
+    assert!(body_str.contains("\"explain\""), "{body_str}");
+    assert!(!body_str.contains("row_count"), "{body_str}");
 }

@@ -726,16 +726,18 @@ fn oversized_plan_alone_rejects_with_54000() {
     assert_eq!(http_common::wire_code_of(&resp), "54000", "resp={resp:?}");
 }
 
-/// `vector` + `explain: true` は `42601`（SQL-6 の `EXPLAIN SELECT ...
-/// ORDER BY` 拒否と同じ分類）。
+/// `vector` + `explain: true` は Issue #948（NOSQL-16・SQL-27）で受理する
+/// よう拡大した（旧来は `42601` で拒否）。`super::explain::handle` へ
+/// 委譲され `200` で `QUERY PLAN` を返すことの回帰確認（網羅的なカバレッジ・
+/// 行一致は `nosql16_explain_targets.rs`・`nosql10_explain.rs` が持つ）。
 #[test]
-fn explain_with_vector_rejects_with_42601() {
+fn explain_with_vector_is_accepted_and_routed_to_explain_handler() {
     let (core, _guard) = new_core_seed();
     let addr = spawn(Arc::clone(&core));
 
     let body = br#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"explain":true}"#;
     let resp = query_as_alice(addr, body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    assert_eq!(resp.status, 200, "resp={resp:?}");
 }
 
 /// `vector` と `plan` を両方指定した要求に `explain: true` を伴っても、

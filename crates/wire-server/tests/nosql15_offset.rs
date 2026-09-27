@@ -585,17 +585,27 @@ fn out_of_range_offset_values_are_rejected_with_22000() {
     }
 }
 
-/// `offset` と `explain: true` の同時指定は `42601`
-/// （検証順は `explain` → `table` → `limit` → `offset` → `columns` に固定。
-/// `explain` 拒否が最初に確定する）。
+/// `offset` と `explain: true` の同時指定は受理される（Issue #948・
+/// NOSQL-16・SQL-27・TASK-186 で `scan` op の `explain: true` が
+/// `PreparedScan::prepare`／`bind` を共有する経路へ結線されたため、`sort`
+/// （`nosql15_scan_sort.rs::sort_combined_with_explain_true_is_accepted_and_
+/// returns_scan_plan`）と同じく `offset` との併用も同じ束縛経路を通って
+/// 受理される。旧: `42601` 拒否）。
 #[test]
-fn offset_with_explain_true_is_rejected_with_42601() {
+fn offset_combined_with_explain_true_is_accepted_and_returns_scan_plan() {
     let (core, _guard) = new_core_with_tenant_a_rows(1);
     let addr = spawn(Arc::clone(&core));
 
     let body = br#"{"op":"scan","table":"docs","limit":10,"offset":1,"explain":true}"#;
     let resp = query_as_alice(addr, body);
-    http_common::assert_rejected(&resp, 400, "42601");
+    assert_eq!(resp.status, 200, "body={resp:?}");
+    let body_str = String::from_utf8_lossy(&resp.body);
+    // `scan_explain_result`（engine 側）は `offset` の有無に関わらず固定の
+    // `scalar_plan: plain_scan`／`access_path: full_scan` を返す（検索本体
+    // 〔offset 適用含む〕は呼ばれない設計。`docs/design/bound-plan-session-entry.md`
+    // 参照）。
+    assert!(body_str.contains("plain_scan"), "body={body_str}");
+    assert!(body_str.contains("full_scan"), "body={body_str}");
 }
 
 /// `search`／`aggregate` op への `offset` 付与は未知キーとして `42601` になる

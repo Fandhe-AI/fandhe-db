@@ -718,11 +718,6 @@ fn with_visible_row<T>(
     // `scalar_mask` へ反映済み（`DecodeTier::Fast` ならそもそも式評価に到達
     // しない）なので、ここでは `scanned` の値をそのまま `.as_text()` へ写す
     // だけでよい（`sql::aggregate`／`sql::group_by` 等と同じ契約）。
-    let text_columns: Vec<Option<&str>> = scanned
-        .iter()
-        .map(|v| v.and_then(|s| s.as_text()))
-        .collect();
-
     // SCALAR 段（WHERE）。
     if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
         return Ok(None);
@@ -752,7 +747,7 @@ fn with_visible_row<T>(
             } else {
                 &[]
             };
-        match program.eval(id, embedding, &text_columns, where_expr_scratch)? {
+        match program.eval(id, embedding, &scanned, where_expr_scratch)? {
             ExprValue::Bool(true) => {}
             // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
             // Issue #921）。
@@ -820,11 +815,6 @@ fn build_projected_cells(
     // 使う行スカラービュー。`decode_tier_for` が式の参照する `TEXT` 列を
     // `scalar_mask` へ反映済みのため、`scanned` の値をそのまま `.as_text()` へ
     // 写すだけでよい（`with_visible_row` の `WHERE` 評価と同じ契約）。
-    let text_columns: Vec<Option<&str>> = scanned
-        .iter()
-        .map(|v| v.and_then(|s| s.as_text()))
-        .collect();
-
     // 投影段。確保失敗時に abort せず `Err` を返せるよう `try_reserve_exact`
     // を使う（`try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
     // と同方針）。
@@ -1062,7 +1052,7 @@ fn build_projected_cells(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding_for_eval, &text_columns, proj_expr_scratch)? {
+                match program.eval(id, embedding_for_eval, scanned, proj_expr_scratch)? {
                     ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
                     ExprValue::Vector(v) => {
                         // codex-review P1 指摘対応: `Computed` 列のベクトル
@@ -1090,6 +1080,11 @@ fn build_projected_cells(
                             max_result_bytes,
                         )?));
                     }
+                    // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP`
+                    // を返す式（`date_trunc` 等）を `Cell::Date`／
+                    // `Cell::Timestamp` へ写像する。
+                    ExprValue::Date(d) => cells.push(Cell::Date(d)),
+                    ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
                     // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                     // 契約: NULL は `Cell::Null` へ写像する。
                     ExprValue::Null => cells.push(Cell::Null),

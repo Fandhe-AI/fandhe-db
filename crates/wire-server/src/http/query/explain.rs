@@ -1,24 +1,35 @@
 //! `POST /v1/query`（`op: search`・`explain: true`）を検索本体を一切実行せず
-//! SQL 表層 `EXPLAIN SELECT ... USING PLAN(...)` と同一内容の `QUERY PLAN`
-//! 行へ写像するモジュール（Issue #765・TASK-186・NOSQL-10。ポインタ:
-//! `docs/spec/05-tasks.md` TASK-175・TASK-186・
-//! `docs/spec/04-behavior/nosql-surface.md` NOSQL-10・
-//! `docs/spec/04-behavior/sql-surface.md` SQL-6）。
+//! SQL 表層 `EXPLAIN` と同一内容の `QUERY PLAN` 行へ写像するモジュール
+//! （`vector` 指定は Issue #948・NOSQL-16・SQL-27・TASK-186、`plan` 指定は
+//! Issue #765・TASK-186・NOSQL-10。ポインタ: `docs/spec/05-tasks.md`
+//! TASK-175・TASK-186・`docs/spec/04-behavior/nosql-surface.md` NOSQL-10・
+//! NOSQL-16・`docs/spec/04-behavior/sql-surface.md` SQL-6・SQL-27）。
 //!
 //! 責務境界: [`super::gate::handle`] が `op: search`・`explain: true` の要求を
 //! 通常の `search` 実行（`search::execute`）より前に [`handle`] へ委譲する
 //! （`explain: true` は構造的に実行経路へ落ちない。`aggregate.rs` の
 //! `explain: true` 拒否と同じ fail-open 防止の思想）。SQL テキストは一切
-//! 組み立てず、[`super::search::bind_search`]（Issue #763）が組み立てる
-//! [`super::search::PlanSearch`] の投影・フィルタ・`limit`・原質問文字列を
-//! [`engine::core::EngineCore::explain_bound_plan_in_session`]（Issue #765・
-//! `core.rs::run_explain_plan`）が SQL `Statement::Explain` アームと共有する
-//! 私的ヘルパーへそのまま渡す（第 2 の実行器を作らない方針）。
+//! 組み立てない。
 //!
-//! `vector` 指定・`plan` 未指定はいずれも SQL-6 の「`USING PLAN` 専用」契約の
-//! 写像として [`ExplainError::ExplainRequiresPlan`]（`42601`）で拒否する
-//! （`sql::allowlist` が `ORDER BY` 形・集計・広域取得への `EXPLAIN` 前置を
-//! 拒否するのと同じ分類）。
+//! - `vector` 指定（`plan` 欠落）: [`super::search::bind_vector_statement`]
+//!   （[`super::search::execute`] の通常実行と共有する binder closure）が
+//!   組み立てる [`engine::sql::parser::BoundStatement`] を
+//!   [`engine::core::EngineCore::explain_bound_search_in_session`]（Issue
+//!   #948・`core.rs::search_explain_from_bound`）へそのまま渡す。
+//! - `plan` 指定: [`super::search::bind_search`]（Issue #763）が組み立てる
+//!   [`super::search::PlanSearch`] の投影・フィルタ・`limit`・原質問文字列を
+//!   [`engine::core::EngineCore::explain_bound_plan_in_session`]（Issue #765・
+//!   `core.rs::run_explain_plan`）が SQL `Statement::Explain` アームと共有する
+//!   私的ヘルパーへそのまま渡す。
+//!
+//! いずれも第 2 の実行器を作らない方針で、通常実行（`search::execute`）と
+//! 同一の binder closure を共有するため、`42P01`（未知テーブル）等のエラー
+//! 分類・優先順位が `explain` の有無で変わらない。
+//!
+//! `vector`・`plan` 同時指定は [`ExplainError::Search`]
+//! （[`SearchError::VectorAndPlanBothPresent`]。`42601`）、両方欠落は
+//! SQL-6 の「`USING PLAN` 専用」契約の写像として [`ExplainError::
+//! ExplainRequiresPlan`]（`42601`）で拒否する。
 //!
 //! `table` の識別子形状・`USING PLAN` 質問文字列の長さ検証は
 //! [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶより前に
@@ -48,7 +59,7 @@ use engine::sql::parser::validate_search_limit;
 use super::ident::{self, InvalidIdentifier};
 use super::response::{self, ResponseEncodeError};
 use super::schema::{SchemaError, Validated};
-use super::search::{bind_search, BoundSearch, SearchError};
+use super::search::{bind_search, bind_vector_statement, BoundSearch, SearchError};
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
@@ -60,8 +71,12 @@ pub enum ExplainError {
     /// 同一の分類・文言をそのまま透過する（`table`／`mode`／`columns`／
     /// `filter` の識別子形状・型不整合等）。
     Search(SearchError),
-    /// `vector` 指定、または `plan` 未指定（SQL-6 の「`USING PLAN` 専用」
-    /// 契約の写像。`42601`）。
+    /// `vector`・`plan` のいずれも指定されていない（SQL-6 の「`USING PLAN`
+    /// 専用」契約の写像。`42601`）。Issue #948 で `vector` のみの指定は
+    /// [`Self::Search`]（`bind_vector_statement` 経由）・
+    /// `explain_bound_search_in_session` を通る別経路になったため、本
+    /// variant は両方欠落のときにのみ返る（多層防御としては引き続き
+    /// `execute` 内の到達しないはずの分岐でも使う）。
     ExplainRequiresPlan,
     /// [`engine::core::EngineCore::explain_bound_plan_in_session`] の実行時
     /// エラー（プランナー未注入・世代競合・辞書必須列不備等）をそのまま透過
@@ -116,7 +131,7 @@ impl ClassifiedError for ExplainError {
         match self {
             ExplainError::Search(err) => err.client_message(),
             ExplainError::ExplainRequiresPlan => {
-                "explain is only supported for search requests with \"plan\"".to_string()
+                "search request must specify exactly one of \"vector\" or \"plan\"".to_string()
             }
             ExplainError::Engine(err) => err.client_message(),
             ExplainError::Encode(err) => err.client_message(),
@@ -130,21 +145,31 @@ impl ClassifiedError for ExplainError {
 ///
 /// 処理順序（fail-closed。順序自体が契約の一部。[`super::search::execute`]・
 /// SQL `EXPLAIN` 経路〔`core.rs::run_explain_plan`〕と同一の優先順位に
-/// 揃える。codex-review P1 指摘対応・PR #828）:
+/// 揃える。codex-review P1 指摘対応・PR #828。手順 2・3 は Issue #948 で
+/// 追加）:
 /// 1. `table`（識別子形状検査）を読み取る。
-/// 2. `vector` 指定を拒否する（`42601`。`plan` の有無によらずテーブル解決を
-///    要さない構造的な契約違反のため最優先。`vector`／`plan` 同時指定も
-///    この分岐で拒否される）。
-/// 3. `plan` が指定されている場合のみ、[`validate_using_plan_question`] で
+/// 2. `vector`・`plan` の同時指定を拒否する（`42601`。[`SearchError::
+///    VectorAndPlanBothPresent`]。テーブル解決を要さない構造的な契約違反
+///    のため最優先——[`super::search::execute`] の同名判定と同じ優先順位）。
+/// 3. `vector` のみが指定されている場合、`limit` 検証をここでは行わずに
+///    [`engine::core::EngineCore::explain_bound_search_in_session`]（Issue
+///    #948）を呼ぶ。`limit` の型・範囲検証は [`super::search::
+///    bind_vector_statement`]（通常実行と共有する binder closure。中身は
+///    `bind_search`）がテーブル解決後に行う——[`super::search::execute`]
+///    の `vector` 分岐（`else` 側）も `limit` 検証をテーブル解決前には行わ
+///    ず `bind_search` に委ねているのと同じ優先順位（未知テーブル＋
+///    `limit` 範囲外の要求で `42P01` が `22000` より優先される）。以降の
+///    手順（4〜7）はこの分岐を経由しない。
+/// 4. `plan` が指定されている場合のみ、[`validate_using_plan_question`] で
 ///    長さ上限を検証する（`54000`。[`super::search::execute`] の `plan`
 ///    分岐と同じくテーブル解決より前に行う）。`plan` 未指定（`None`）は
-///    ここでは拒否せず手順 6 へ委ねる。
-/// 4. `limit` の型・範囲を [`validate_search_limit`] で検証する（`22000`。
+///    ここでは拒否せず手順 7 へ委ねる。
+/// 5. `limit` の型・範囲を [`validate_search_limit`] で検証する（`22000`。
 ///    SQL `EXPLAIN` 経路が `run_explain_plan` 呼び出し前に同じ検証を行うのと
 ///    同一の優先順位でテーブル解決より前に行う）。
-/// 5. `mode` は識別子形状検査を含め一切ここでは検証しない（生リテラルの
-///    まま手順 6 へ渡す）。
-/// 6. [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶ
+/// 6. `mode` は識別子形状検査を含め一切ここでは検証しない（生リテラルの
+///    まま手順 7 へ渡す）。
+/// 7. [`engine::core::EngineCore::explain_bound_plan_in_session`] を呼ぶ
 ///    （`plan` 未指定の場合もプレースホルダの空文字列を渡して呼び出し自体は
 ///    行う。テーブル解決が先に走り、テーブルが存在すれば binder closure が
 ///    テーブル解決後に初めて `plan` 欠落を判定するため、未知テーブルの
@@ -154,7 +179,7 @@ impl ClassifiedError for ExplainError {
 ///    の識別子形状検査・語彙解析（`SearchMode::parse_literal`）の双方を
 ///    行うため、未知テーブル（`42P01`）・`plan` 欠落（`42601`）のいずれも
 ///    `mode` 値不正（`22000`）より優先される（`BoundSearch::Vector` への
-///    到達は手順 2 により構造上ないが、多層防御として [`ExplainError::
+///    到達は手順 2・3 により構造上ないが、多層防御として [`ExplainError::
 ///    ExplainRequiresPlan`] へ拒否する）。`run_explain_plan` はこの
 ///    binder closure（`bind`）が返す `explain_shape` を得たあとに初めて
 ///    `mode_literal` を独立に再解析して `SearchMode` へ変換するが、その
@@ -168,14 +193,39 @@ pub fn execute(
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
 
-    if validated.optional_array("vector")?.is_some() {
-        return Err(ExplainError::ExplainRequiresPlan);
+    let vector_present = validated.optional_array("vector")?.is_some();
+    let question = validated.optional_str("plan")?;
+    let plan_present = question.is_some();
+
+    // 手順 2: 同時指定はテーブル解決より前に確定させる（`search::execute`
+    // と同一の優先順位。codex-review P1 指摘対応・PR #827 と同じ判断を
+    // `explain` 経路にも適用する）。
+    if vector_present && plan_present {
+        return Err(ExplainError::Search(SearchError::VectorAndPlanBothPresent));
+    }
+
+    // 手順 3: `vector` のみ指定された要求は Issue #948 の新経路（NoSQL 表層
+    // `vector` 指定検索への `EXPLAIN` 拡大）。`limit` の型・範囲検証は
+    // ここでは行わない——`search::execute` の `vector` 分岐（`else` 側）が
+    // `limit` 検証をテーブル解決前に行わず、`bind_search`（binder closure
+    // 内・テーブル解決後）に委ねているのと同じ順序を保つため（未知テーブル
+    // ＋ `limit` 範囲外の要求で `42P01` が `22000` より優先される）。通常
+    // 実行（`search::execute`）と同一の binder closure
+    // （`bind_vector_statement` → `bind_search`）を共有するため、未知
+    // テーブル・`limit` 範囲外・型不整合等のエラー分類・優先順位は
+    // `explain` の有無で変わらない。
+    if vector_present {
+        let session = SessionState::default();
+        let result =
+            core.explain_bound_search_in_session(ctx, &session, table, |schema, udfs| {
+                bind_vector_statement(validated, schema, udfs)
+            })?;
+        return Ok(result);
     }
 
     // `plan` が指定されている場合のみ長さ上限を検証する。未指定はここでは
-    // 拒否しない（手順 6 のコメント参照。未知テーブルの `42P01` を `plan`
+    // 拒否しない（手順 7 のコメント参照。未知テーブルの `42P01` を `plan`
     // 欠落の `42601` より優先させるため）。
-    let question = validated.optional_str("plan")?;
     if let Some(q) = question {
         validate_using_plan_question(q)?;
     }

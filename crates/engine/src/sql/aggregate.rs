@@ -282,7 +282,7 @@ impl ReferencedColumns {
                     // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）の返り値は
                     // `ExprType::Scalar` だが、その部分式が `TEXT` 列を参照する
                     // ことはある（例: `SUM(LENGTH(text_col))`）。`scalar_mask` へ
-                    // 反映し損ねると評価時に `text_columns` から読めず
+                    // 反映し損ねると評価時に行スカラービュー（`row_scalars`）から読めず
                     // fail-closed の `Internal` エラーへ縮退してしまう
                     // （黙った誤集計ではなく安全側の拒否だが、正当なクエリを
                     // 常に失敗させる回帰になる。§3-7 の他呼び出し元と同じ契約）。
@@ -1003,11 +1003,7 @@ impl Accumulator {
                 // が `source` の `TextColumnRef` を `scalar_mask` へ反映済みのため、
                 // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` の
                 // `WHERE` 評価と同じ契約）。
-                let text_columns: Vec<Option<&str>> = scanned
-                    .iter()
-                    .map(|v| v.and_then(|s| s.as_text()))
-                    .collect();
-                match program.eval(id, embedding, &text_columns, scratch)? {
+                match program.eval(id, embedding, scanned, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
                     // NULL は集計対象から除外する（Issue #919・SQL-26 の
                     // `TEXT` 列参照〔例: `SUM(LENGTH(text_col))`〕と Issue #921・
@@ -1191,11 +1187,7 @@ impl Accumulator {
                 // `COUNT(DISTINCT LENGTH(text_col))`。非 distinct 経路と同じ
                 // `ReferencedColumns::derive` を共有するため `scalar_mask` は
                 // 反映済み）。`scanned` をそのまま `.as_text()` へ写す。
-                let text_columns: Vec<Option<&str>> = scanned
-                    .iter()
-                    .map(|v| v.and_then(|s| s.as_text()))
-                    .collect();
-                match program.eval(id, embedding, &text_columns, scratch)? {
+                match program.eval(id, embedding, scanned, scratch)? {
                     ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
                     // NULL は COUNT(DISTINCT expr) の対象から除外する（Issue
                     // #919・SQL-26 の `TEXT` 列参照の NULL 伝播、AC2）と Issue
@@ -2169,10 +2161,6 @@ pub(crate) fn execute_aggregate_with_cache(
             // `ReferencedColumns::derive` が `scalar_mask` へ反映済みのため、
             // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` と同じ
             // 契約）。
-            let text_columns: Vec<Option<&str>> = scanned
-                .iter()
-                .map(|v| v.and_then(|s| s.as_text()))
-                .collect();
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。
@@ -2199,7 +2187,7 @@ pub(crate) fn execute_aggregate_with_cache(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
+                match program.eval(id, embedding, &scanned, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
                     // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
@@ -2635,10 +2623,6 @@ pub(crate) fn observe_candidate_slots(
         // `expr_filters` は `id` 単純比較のみだが、`referenced.scalar_mask()` は
         // 上位の `ReferencedColumns::derive` が `TEXT` 参照も反映済みのため、
         // `sql::scan`／本モジュール上部の走査ループと同じ変換で安全に対応できる。
-        let text_columns: Vec<Option<&str>> = scanned
-            .iter()
-            .map(|v| v.and_then(|s| s.as_text()))
-            .collect();
         for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
             let embedding: &[f32] = if udf_call::references_embedding(expr) {
                 arena
@@ -2647,7 +2631,7 @@ pub(crate) fn observe_candidate_slots(
             } else {
                 &[]
             };
-            match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
+            match program.eval(id, embedding, &scanned, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
                 // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26（AC2）と
                 // Issue #921・SQL-26 の共有契約）。

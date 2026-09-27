@@ -33,11 +33,12 @@
 //! `ImplicitRlsHook`。RLS-7）が担い、本モジュールはテナント判定を一切行わ
 //! ない。
 //!
-//! `explain: true` は [`execute`] が実行前に拒否する（黙って無視すると
-//! fail-open になるため。`vector` 指定は `42601`——SQL-6 の `EXPLAIN SELECT
-//! ... ORDER BY` 拒否と同じ分類、`plan` 指定は `0A000`——[`super::gate::
-//! PLACEHOLDER_MESSAGE`] と同型の未実装扱い。正式な `explain` op 写像は
-//! NOSQL-10・Issue #765 の担当）。
+//! `explain: true` の要求は通常 [`super::gate::handle`] が [`execute`] より
+//! 前に [`super::explain::execute`] へ振り分ける（`vector` 指定は Issue
+//! #948・NOSQL-16・SQL-27、`plan` 指定は NOSQL-10・Issue #765）。[`execute`]
+//! 内の [`SearchError::ExplainRequiresPlan`]／[`SearchError::
+//! ExplainNotSupported`] 拒否は、ゲートを迂回して直接呼ばれた場合に備える
+//! 多層防御としてのみ残る（黙って無視して fail-open にしない）。
 
 use std::time::SystemTime;
 
@@ -170,12 +171,15 @@ pub enum SearchError {
     /// execute_bound_plan_search_in_session`] の実行エラーをそのまま透過する
     /// （`22000`／`54000`／`42P01`／`XX000` 等）。
     Bind(SqlSurfaceError),
-    /// `vector` 指定に `explain: true` を伴う要求（SQL-6 の `EXPLAIN SELECT
-    /// ... ORDER BY` 拒否と同じ分類。`42601`）。
+    /// `vector` 指定に `explain: true` を伴う要求（`42601`）。通常は
+    /// [`super::gate::handle`] が [`super::explain::execute`]（Issue #948・
+    /// NOSQL-16・SQL-27）へ振り分けるため到達しない。ゲートを迂回した場合の
+    /// 多層防御としてのみ残る。
     ExplainRequiresPlan,
-    /// `plan` 指定に `explain: true` を伴う要求（正式な `explain` op 写像は
-    /// NOSQL-10・Issue #765 の担当。[`super::gate::PLACEHOLDER_MESSAGE`] と
-    /// 同型の未実装扱い。`0A000`）。
+    /// `plan` 指定に `explain: true` を伴う要求（`0A000`）。通常は
+    /// [`super::gate::handle`] が [`super::explain::execute`]（NOSQL-10・
+    /// Issue #765）へ振り分けるため到達しない。ゲートを迂回した場合の
+    /// 多層防御としてのみ残る。
     ExplainNotSupported,
 }
 
@@ -482,10 +486,38 @@ fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
     }
 }
 
+/// `vector` 指定の `search` op を [`engine::sql::parser::BoundStatement`] へ
+/// 束縛する binder closure 本体（Issue #948・NOSQL-16。`bind_search` の完全な
+/// 束縛結果から `BoundSearch::Vector` のみを取り出す）。[`execute`]（通常
+/// 実行。[`EngineCore::execute_bound_search_in_session`] へ渡す）と
+/// [`super::explain::execute`]（`explain: true`。[`EngineCore::
+/// explain_bound_search_in_session`] へ渡す）の両方が同一の closure を共有
+/// することで、`42P01`（未知テーブル）が排他判定・型不整合より先に確定する
+/// 等のエラー分類・優先順位が両経路でビット同一になる（第 2 の binder を
+/// 作らない設計）。
+pub(crate) fn bind_vector_statement(
+    validated: &Validated<'_>,
+    schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
+) -> Result<BoundStatement, SqlSurfaceError> {
+    match bind_search(validated, schema, udfs).map_err(to_sql_surface_error)? {
+        BoundSearch::Vector(stmt) => Ok(stmt),
+        // `execute`（通常実行）側の対称コメント参照: `explain::execute` は
+        // `vector` 指定であることを呼び出し前に確定させているため、この
+        // 分岐が実際に到達することはない。受信データ経路での `unwrap`/
+        // `expect` を避けつつ fail-closed に拒否する
+        // （`.claude/rules/coding-rust.md`）。
+        BoundSearch::Plan(_) => Err(SqlSurfaceError::Internal {
+            detail: "search binder returned a plan form for a vector request".to_string(),
+        }),
+    }
+}
+
 /// `validated`（`search` op のスキーマ検証済み要求本文）を `engine` 上で
 /// 実行する。`principal` の [`SessionPrincipal::policy_context`] のみから
-/// RLS 境界（テナント）を導出し（RLS-7・本モジュールはテナント判定を一切
-/// 行わない）、`explain: true` の拒否をここで行う。
+/// RLS 境界（テナント）を導出する（RLS-7・本モジュールはテナント判定を
+/// 一切行わない）。`explain: true` の拒否（多層防御。モジュール doc 参照）
+/// もここで行う。
 ///
 /// `vector`・`plan` の両方指定（排他違反）は、スキーマ解決を要さない
 /// 構造的な契約違反として本関数の先頭で確定させ（[`SearchError::
@@ -608,16 +640,7 @@ pub fn execute(
     } else {
         let result =
             engine.execute_bound_search_in_session(ctx, &session, table, |schema, udfs| {
-                match bind_search(validated, schema, udfs).map_err(to_sql_surface_error)? {
-                    BoundSearch::Vector(stmt) => Ok(stmt),
-                    // 上記と対称の到達しないはずの分岐（`plan_present ==
-                    // false` の間は `bind_search` が `BoundSearch::Plan` を
-                    // 返すことはない）。
-                    BoundSearch::Plan(_) => Err(SqlSurfaceError::Internal {
-                        detail: "search binder returned a plan form for a vector request"
-                            .to_string(),
-                    }),
-                }
+                bind_vector_statement(validated, schema, udfs)
             })?;
         Ok(result)
     }

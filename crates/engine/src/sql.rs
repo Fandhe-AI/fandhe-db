@@ -145,6 +145,7 @@ pub(crate) mod check_constraint;
 pub mod copy;
 pub(crate) mod cte;
 pub mod cursor;
+pub(crate) mod datetime_fn;
 pub mod ddl;
 pub(crate) mod ddl_column_type;
 /// NoSQL `filter` 語彙拡張（範囲比較・`IN`・`OR`。Issue #945・NOSQL-14）の
