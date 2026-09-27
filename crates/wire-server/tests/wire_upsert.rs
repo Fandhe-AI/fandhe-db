@@ -263,3 +263,92 @@ fn wire_upsert_response_is_byte_identical_for_other_tenant_row_and_nonexistent_i
     read_command_complete(&mut bob_check);
     read_ready_for_query(&mut bob_check);
 }
+
+// --- ON CONFLICT の UNIQUE 制約列への拡張（TABLE-16、Issue #1074） --------
+
+fn new_core_with_unique_column_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-upsert-unique-docs");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("a", ColumnType::Text, false)],
+        ))
+        .expect("create table");
+    storage
+        .alter_table_add_unique_constraint("docs", &["a"])
+        .expect("add UNIQUE(a) constraint");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+fn insert_a_sql(id: u64, a: &str, op_id: &str) -> String {
+    format!("INSERT INTO docs (id, a) VALUES ({id}, '{a}') USING OPERATION_ID '{op_id}'")
+}
+
+fn upsert_on_conflict_a_do_nothing_sql(id: u64, a: &str, op_id: &str) -> String {
+    format!(
+        "INSERT INTO docs (id, a) VALUES ({id}, '{a}') \
+         ON CONFLICT (a) DO NOTHING USING OPERATION_ID '{op_id}'"
+    )
+}
+
+/// RLS-9: UNIQUE 対象（`(id)` ではなく `(a)`）の UPSERT でも、他テナントが同じ
+/// 値を保持している場合と、どこにも存在しない場合とで応答が完全に一致する
+/// （`wire_upsert_response_is_byte_identical_for_other_tenant_row_and_
+/// nonexistent_id` の UNIQUE 対象版。同じ確定オラクル・同じ読み取りヘルパーを
+/// 再利用する）。
+#[test]
+fn wire_upsert_unique_target_response_is_byte_identical_for_other_tenant_row_and_nonexistent_value()
+{
+    let (core, _guard) = new_core_with_unique_column_table();
+    let addrs = spawn_with_users(
+        core,
+        &[
+            ("alice", "tenant-a", "pw-alice"),
+            ("bob", "tenant-b", "pw-bob"),
+        ],
+    );
+
+    // bob が `a='x'` を保持する。
+    let mut bob_stream = connect_as(addrs[0], "bob", "pw-bob");
+    send_simple_query(
+        &mut bob_stream,
+        &insert_a_sql(1, "x", "wire-upsert-u-bob-seed"),
+    );
+    assert_eq!(read_command_complete(&mut bob_stream), "INSERT 0 1");
+    read_ready_for_query(&mut bob_stream);
+
+    // alice から他テナント保持値（`a='x'`）への UNIQUE 対象 UPSERT。
+    let mut alice_stream_a = connect_as(addrs[0], "alice", "pw-alice");
+    send_simple_query(
+        &mut alice_stream_a,
+        &upsert_on_conflict_a_do_nothing_sql(2, "x", "wire-upsert-u-op-other-tenant"),
+    );
+    let response_other_tenant = read_raw_message(&mut alice_stream_a);
+    read_ready_for_query(&mut alice_stream_a);
+
+    // alice から未存在値（`a='z'`）への UNIQUE 対象 UPSERT。
+    let mut alice_stream_b = connect_as(addrs[0], "alice", "pw-alice");
+    send_simple_query(
+        &mut alice_stream_b,
+        &upsert_on_conflict_a_do_nothing_sql(3, "z", "wire-upsert-u-op-nonexistent"),
+    );
+    let response_nonexistent = read_raw_message(&mut alice_stream_b);
+    read_ready_for_query(&mut alice_stream_b);
+
+    assert_eq!(response_other_tenant, response_nonexistent);
+    assert!(std::str::from_utf8(&response_other_tenant)
+        .unwrap_or("")
+        .contains("INSERT 0 1"));
+
+    // bob の行は無傷のまま。
+    let mut bob_check = connect_as(addrs[0], "bob", "pw-bob");
+    send_simple_query(&mut bob_check, "SELECT a FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut bob_check);
+    let row = read_data_row(&mut bob_check);
+    assert_eq!(row, vec![Some("x".to_string())]);
+    read_command_complete(&mut bob_check);
+    read_ready_for_query(&mut bob_check);
+}

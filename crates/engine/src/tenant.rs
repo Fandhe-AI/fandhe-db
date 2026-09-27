@@ -1359,6 +1359,23 @@ pub(crate) enum UpsertAction<'a> {
     DoUpdate(&'a [(usize, UpsertSetValue<'a>)]),
 }
 
+/// [`upsert_typed_rows_unchecked`] の衝突対象（TABLE-16・Issue #1074）。
+/// `sql::parser::BoundConflictTarget` に対応する最小表現（`sql` に依存しない
+/// 設計を維持するため独自 enum を持つ。`sql::exec::execute_upsert` が変換する）。
+pub(crate) enum UpsertTarget<'a> {
+    /// `ON CONFLICT (id)`（既存挙動。SQL-20・TASK-193、Issue #872）。衝突判定は
+    /// `(ctx.tenant_id(), id)` の物理キー所有で行う。
+    RowId,
+    /// `ON CONFLICT (<UNIQUE 制約の構成列>)`（Issue #1074）。`indices` は
+    /// `schema.columns` に対する論理インデックス（解決した制約の宣言順。
+    /// `sql::parser::BoundConflictTarget::Unique` と同じ規約）。衝突判定は
+    /// `docs/design/sql-upsert.md`「衝突判定スコープ」節参照——テナントが
+    /// 所有する**全行**（可視性を問わない）を母集合に、書き込み**前**の 1 回の
+    /// 走査で対象キーの一致を判定する（`constraint::enforce_unique_keys_in_txn`
+    /// と同じ RLS-9・RLS-10 (c) の判断）。
+    Unique(&'a [usize]),
+}
+
 /// [`upsert_typed_rows_unchecked`] の成功時の結果（SQL-20・TASK-193、
 /// Issue #872）。`inserted + updated` が `sql::exec::InsertOutcome::rows_affected`
 /// へそのまま写像される（`DO NOTHING` で衝突した行はいずれにも数えない）。
@@ -1410,6 +1427,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
     ctx: &PolicyContext,
     insert_visibility: crate::storage::Visibility,
     rows: &[(u64, &[crate::row_codec::Value])],
+    target: &UpsertTarget<'_>,
     action: &UpsertAction<'_>,
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
@@ -1421,7 +1439,10 @@ pub(crate) fn upsert_typed_rows_unchecked(
 
     // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。呼び出し元
     // `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として拒否済みの
-    // ため通常は到達しないが、本関数単体でも fail-closed を保つ）。
+    // ため通常は到達しないが、本関数単体でも fail-closed を保つ）。`VALUES` の
+    // `id` は対象が `Unique`（Issue #1074）の場合も衝突判定には使わないが、
+    // 新規挿入分岐で使う一意な行識別子であることに変わりはないため、対象に
+    // 関わらず検出する。
     let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     seen_ids.try_reserve(rows.len()).map_err(|_| {
         TenantWriteError::Storage(StorageError::Codec(
@@ -1431,6 +1452,34 @@ pub(crate) fn upsert_typed_rows_unchecked(
     for (id, _) in rows {
         if !seen_ids.insert(*id) {
             return Err(TenantWriteError::IdConflict);
+        }
+    }
+
+    // バッチ内の対象キー重複検出（Issue #1074。UNIQUE 対象のみ）。呼び出し元
+    // `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として拒否済みの
+    // ため通常は到達しないが、`(id)` 対象の `seen_ids` と同じ理由で本関数単体
+    // でも fail-closed を保つ（防御的二重検査。indices の解決自体は
+    // `expected_schema` 照合により本 write トランザクション内の `schema` と
+    // 整合することが保証されている）。NULL を含むキー（`unique_key_from_values`
+    // が `Ok(None)` を返す行）は NULLS DISTINCT のため対象外。
+    if let UpsertTarget::Unique(indices) = target {
+        let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        seen_keys.try_reserve(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve upsert batch target key set".to_string(),
+            ))
+        })?;
+        for (_, values) in rows {
+            let Some(key) = crate::constraint::unique_key_from_values(indices, values)
+                .map_err(|m| TenantWriteError::Catalog(CatalogError::Invalid(m.to_string())))?
+            else {
+                continue;
+            };
+            if !seen_keys.insert(key) {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "duplicate ON CONFLICT target key within the same UPSERT statement".to_string(),
+                )));
+            }
         }
     }
 
@@ -1549,7 +1598,32 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 content_hash::UpsertHashAction::DoUpdate(&hash_assignments)
             }
         };
-        let content_hash_value = content_hash::for_typed_upsert(&hash_action, &hash_input)?;
+        // UNIQUE 対象の列名（解決した制約の宣言順。`target` の `indices` と同じ
+        // 並び）を `content_hash::for_typed_upsert` へ渡す（Issue #1074）。
+        let hash_target_columns: Vec<&str> = match target {
+            UpsertTarget::RowId => Vec::new(),
+            UpsertTarget::Unique(indices) => indices
+                .iter()
+                .map(|&idx| {
+                    schema
+                        .columns
+                        .get(idx)
+                        .map(|c| c.name.as_str())
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "internal: ON CONFLICT target column index out of range"
+                                    .to_string(),
+                            ))
+                        })
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        let hash_target = match target {
+            UpsertTarget::RowId => content_hash::UpsertHashTarget::RowId,
+            UpsertTarget::Unique(_) => content_hash::UpsertHashTarget::Unique(&hash_target_columns),
+        };
+        let content_hash_value =
+            content_hash::for_typed_upsert(&hash_target, &hash_action, &hash_input)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -1563,6 +1637,23 @@ pub(crate) fn upsert_typed_rows_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
 
+        // UNIQUE 対象（Issue #1074）は書き込み**前**のスナップショットで対象
+        // テナントの既存行を 1 回だけ走査し、対象キー → 既存行 id の対応表を
+        // 作る（`docs/design/sql-upsert.md`「衝突判定スコープ」節。可視性を
+        // 問わない全行が母集合。`row_table` はまだ本文で 1 行も書き込んでいない
+        // ためこの時点のスキャンが「この文の書き込みより前」の状態と一致する）。
+        let unique_existing: Option<std::collections::HashMap<Vec<u8>, u64>> = match target {
+            UpsertTarget::RowId => None,
+            UpsertTarget::Unique(indices) => {
+                Some(crate::constraint::scan_tenant_rows_by_unique_key(
+                    &row_table,
+                    &schema,
+                    ctx.tenant_id(),
+                    indices,
+                )?)
+            }
+        };
+
         // 主キー制約検査（下記ブロック終端）の対象 id。`DO NOTHING` で実際には
         // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
         // `constraint.rs` モジュールドキュメント参照）。
@@ -1572,27 +1663,57 @@ pub(crate) fn upsert_typed_rows_unchecked(
         // 積む（新規挿入行は「更新」ではないため対象外）。
         let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         for (id, values) in rows {
-            let key = (ctx.tenant_id(), *id);
+            // 衝突判定の対象行 id を対象ごとに決定する（Issue #1074）。`(id)`
+            // 対象は常に VALUES 自身の `id` で判定する（既存挙動、無変更）。
+            // UNIQUE 対象は上記の事前走査で一致した既存行の `id` を使う（対象
+            // キーに NULL を含む行・未一致はいずれも非衝突＝新規挿入分岐へ）。
+            let conflict_id: Option<u64> = match target {
+                UpsertTarget::RowId => Some(*id),
+                UpsertTarget::Unique(indices) => {
+                    crate::constraint::unique_key_from_values(indices, values)
+                        .map_err(|m| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(m.to_string()))
+                        })?
+                        .and_then(|key| unique_existing.as_ref().and_then(|m| m.get(&key).copied()))
+                }
+            };
             // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
             // （`insert`）と衝突しないようにする（`update_row_unchecked` と
             // 同じパターン）。所有権判定は `decode_row_for_key`（キー↔ヘッダ
             // tenant 整合検査。TABLE-12）＋ `ctx.is_owner` の二重防御。
-            let existing_owned: Option<crate::storage::Row> =
-                match row_table.get(&key).map_err(CatalogError::from)? {
+            let existing_owned: Option<crate::storage::Row> = match conflict_id {
+                Some(cid) => match row_table
+                    .get(&(ctx.tenant_id(), cid))
+                    .map_err(CatalogError::from)?
+                {
                     Some(guard) => {
                         let row =
-                            crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
+                            crate::storage::decode_row_for_key(ctx.tenant_id(), cid, guard.value())
                                 .map_err(TenantWriteError::Storage)?;
                         Some(row)
                     }
                     None => None,
-                };
+                },
+                None => None,
+            };
             let owns_existing = existing_owned
                 .as_ref()
                 .map(|row| ctx.is_owner(row.tenant_id.as_str()))
                 .unwrap_or(false);
 
             if owns_existing {
+                // `owns_existing` が真になり得るのは `conflict_id` が `Some`
+                // の場合のみ（`existing_owned` の構築規則）であり、以降の
+                // 分岐は常に `Some` の中身（衝突した既存行の id）を使う。
+                let write_id = match conflict_id {
+                    Some(cid) => cid,
+                    None => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "internal: owns_existing without a conflict id".to_string(),
+                        )));
+                    }
+                };
+                let key = (ctx.tenant_id(), write_id);
                 let existing = match existing_owned {
                     Some(row) => row,
                     None => {
@@ -1696,12 +1817,17 @@ pub(crate) fn upsert_typed_rows_unchecked(
                                 "upsert updated row counter overflow".to_string(),
                             ))
                         })?;
-                        written_ids.push(*id);
+                        written_ids.push(write_id);
                     }
                 }
             } else {
-                // 非衝突（新規挿入）。既存 `insert_typed_rows_unchecked` と同じ
-                // 組み立て（Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
+                // 非衝突（新規挿入）。VALUES 自身の `id` を書き込み先の物理キーに
+                // 使う（対象に関わらず不変。UNIQUE 対象で同じ `id` を持つ既存行が
+                // 既にあれば `insert_unique_row` が `IdConflict`〔`23505`〕で
+                // 拒否する——PostgreSQL の「arbiter でない制約の違反は吸収しない」
+                // 挙動と同じ）。既存 `insert_typed_rows_unchecked` と同じ組み立て
+                // （Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
+                let key = (ctx.tenant_id(), *id);
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -6703,6 +6829,7 @@ mod tests {
             &ctx,
             Visibility::Private,
             &rows,
+            &UpsertTarget::RowId,
             &action,
             LedgerWrite::Disabled,
             None,

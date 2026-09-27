@@ -318,6 +318,80 @@ pub(crate) fn enforce_unique_keys_in_txn(
     Ok(())
 }
 
+/// `tenant::upsert_typed_rows_unchecked` の UNIQUE 対象 UPSERT（TABLE-16、
+/// Issue #1074）が、書き込み**前**に 1 回だけ呼ぶ既存行スキャン。対象テナント
+/// （`ctx.tenant_id()` 由来の物理キー範囲。[`enforce_unique_keys_in_txn`] と同じ
+/// `(tenant_id, 0)..=(tenant_id, u64::MAX)` の閉区間）が所有する**全行**
+/// （`Public`／`Private` を問わない。可視性フィルタ・二次索引・世代キャッシュの
+/// いずれも経由しない生の走査。RLS-9・RLS-10 (c)）を走査し、`indices`
+/// （UNIQUE 制約の構成列。解決した制約の宣言順）が示す一意キーの正準バイト列
+/// から行 `id` への対応を返す。NULL を含む行はキーを持たない（NULLS DISTINCT。
+/// [`key_bytes`] と同じ扱い）ため対象外。
+///
+/// キー構築は書き込み時の検査点 [`enforce_unique_keys_in_txn`] と同じ
+/// [`decode_key_columns`]／[`key_bytes`] を再利用する（第 2 の正準化を作らない。
+/// `unique_key_from_values`〔`Value` 行専用〕とバイト単位で一致する契約は
+/// 両者が同じ [`push_canonical_component`] を経由することで保証される）。
+///
+/// 1 つのキーに一致する既存行が 2 件以上ある場合は一意性の不変条件が破れて
+/// いる内部矛盾であり、黙って上書きせず [`TenantWriteError::Catalog`]
+/// （`CatalogError::Invalid`）で fail-closed に拒否する。
+pub(crate) fn scan_tenant_rows_by_unique_key<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    tenant_id: &str,
+    indices: &[usize],
+) -> Result<HashMap<Vec<u8>, u64>, TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let spec = KeySpec {
+        indices: indices.to_vec(),
+        null_policy: NullPolicy::Skip,
+    };
+    let mut mask = vec![false; schema.columns.len()];
+    for &idx in indices {
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+    }
+
+    let mut existing: HashMap<Vec<u8>, u64> = HashMap::new();
+    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    for entry in row_table
+        .range::<(&str, u64)>((range_start, range_end))
+        .map_err(crate::catalog::CatalogError::from)?
+    {
+        let (k, v) = entry.map_err(crate::catalog::CatalogError::from)?;
+        let (key_tenant, id) = k.value();
+        if key_tenant != tenant_id {
+            // 閉区間により理論上到達しないが、defense-in-depth として維持する
+            // （`enforce_unique_keys_in_txn` と同じ判断）。
+            break;
+        }
+        let buf = v.value();
+        let values = decode_key_columns(schema, &mask, buf)?;
+        let Some(key) = key_bytes(&spec, &values).map_err(internal)? else {
+            continue;
+        };
+        if let Some(existing_id) = existing.insert(key, id) {
+            if existing_id != id {
+                // 同一 UNIQUE キーを共有する既存行が 2 件以上見つかった場合は
+                // 一意性の不変条件が破れている内部矛盾であり（呼び出し元の
+                // incoming VALUES 同士の衝突ではない）、UniqueViolation
+                // （呼び出し元の衝突用 wire code）を誤って返すと非衝突の
+                // UPSERT まで巻き込んで失敗させてしまう。ドキュメント通り
+                // `internal` で fail-closed に拒否する。
+                return Err(internal(
+                    "duplicate existing rows share a UNIQUE key: catalog invariant violated",
+                ));
+            }
+        }
+    }
+    Ok(existing)
+}
+
 /// [`crate::catalog::Storage::alter_table_add_unique_constraint`]（Rust API。
 /// TABLE-16・TASK-204、Issue #905）が制約追加前に呼ぶ既存行の重複判定。
 /// `row_table`（対象テーブルの行ストア全体）を物理キー順に走査し、テナントごと
@@ -548,6 +622,82 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
         }
     }
     Ok(())
+}
+
+/// 束縛済み `VALUES`（`crate::row_codec::Value`。UPSERT の新規挿入予定値・
+/// UNIQUE 対象列の一致判定の両方で使う）から一意キーの正準バイト列を計算する
+/// （TABLE-16・Issue #1074。`sql::parser::bind_upsert_form` のバッチ内対象キー
+/// 重複検出、`tenant::upsert_typed_rows_unchecked` の UNIQUE 対象衝突判定が
+/// 本関数を共有する。既存行側の [`key_bytes`]／[`decode_key_columns`] と同じ
+/// 正準表現（型タグ＋長さ前置）を独立に再実装せず、[`push_canonical_component`]
+/// を再利用することでバイト単位の一致を構造的に保証する）。
+///
+/// `indices` は UNIQUE 制約の構成列（`schema.columns` に対する論理インデックス。
+/// `key_specs` が解決したものと同じ規約）。構成列のいずれかが `Value::Null`
+/// または列欠落の場合は `Ok(None)`（NULLS DISTINCT。本関数は UNIQUE 制約専用の
+/// 呼び出しを想定し、`NullPolicy::Reject`〔主キー〕は扱わない）。
+///
+/// `ColumnType::is_unique_constraint_allowed`（Issue #1073）が PK 許可型の
+/// 上位集合として REAL／DOUBLE PRECISION／NUMERIC／JSON／JSONB／ARRAY を
+/// UNIQUE 制約の構成列として許可するため、`resolve_conflict_target` が解決する
+/// `indices` はこれらの型の列も指しうる。本関数はそれらも
+/// [`push_canonical_component`] へ委譲することで、UNIQUE 制約が許可する型と
+/// `ON CONFLICT` 対象列として扱える型を一致させる。
+pub(crate) fn unique_key_from_values(
+    indices: &[usize],
+    values: &[crate::row_codec::Value],
+) -> Result<Option<Vec<u8>>, &'static str> {
+    use crate::row_codec::Value;
+    let mut out = Vec::new();
+    for &idx in indices {
+        let value = match values.get(idx) {
+            None | Some(Value::Null) => return Ok(None),
+            Some(v) => v,
+        };
+        // ARRAY 列（`Value::Array`）は `ScalarRef::Array` が要素列の生バイト列
+        // （`ArrayRef`）への借用を要求するため、一時バッファへ組み立ててから
+        // 借用する（`array_payload` は Array 分岐でのみ初期化され、`scalar` が
+        // それを借用している間だけこのループの 1 反復内で生存する）。
+        let array_payload: Vec<u8>;
+        let scalar = match value {
+            Value::Text(s) => ScalarRef::Text(s.as_str()),
+            Value::Integer(i) => ScalarRef::Integer(*i),
+            Value::BigInt(i) => ScalarRef::BigInt(*i),
+            Value::Bool(b) => ScalarRef::Bool(*b),
+            Value::Date(d) => ScalarRef::Date(*d),
+            Value::Timestamp(t) => ScalarRef::Timestamp(*t),
+            Value::Bytes(b) => ScalarRef::Bytes(b.as_slice()),
+            Value::Enum(s) => ScalarRef::Enum(s.as_str()),
+            Value::Uuid(u) => ScalarRef::Uuid(*u),
+            Value::Real(r) => ScalarRef::Real(*r),
+            Value::Double(d) => ScalarRef::Double(*d),
+            Value::Numeric(d) => ScalarRef::Numeric(*d),
+            Value::Json(s) => ScalarRef::Json(s.as_str()),
+            Value::Array(a) => {
+                let mut payload = Vec::new();
+                crate::row_codec::write_array_elements_payload(&mut payload, a)
+                    .map_err(|_| "unique key column has an array value that cannot be encoded")?;
+                array_payload = payload;
+                let count = u32::try_from(a.len())
+                    .map_err(|_| "unique key column has an array value that cannot be encoded")?;
+                ScalarRef::Array(crate::row_codec::ArrayRef::from_owned(
+                    a.elem(),
+                    count,
+                    &array_payload,
+                ))
+            }
+            Value::Null | Value::Vector(_) => {
+                // `ColumnType::is_unique_constraint_allowed` が事前に拒否する
+                // 型であり、UNIQUE 制約の構成列としては `validate_schema` を
+                // 通過したスキーマから到達しないはずの内部矛盾
+                // （`push_canonical_component` と同じ判断）。
+                return Err("unique key column has a type that is not allowed as a unique key");
+            }
+        };
+        push_canonical_component(&mut out, scalar)
+            .map_err(|_| "unique key column has a type that is not allowed as a unique key")?;
+    }
+    Ok(Some(out))
 }
 
 /// NUMERIC の正準 `(unscaled, scale)`: 末尾ゼロを除去した最簡表現（`1.50` と

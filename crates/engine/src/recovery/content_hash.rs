@@ -583,6 +583,17 @@ pub(crate) enum UpsertHashAction<'a> {
     DoUpdate(&'a [(String, UpsertAssignmentHashValue<'a>)]),
 }
 
+/// [`for_typed_upsert`] の衝突対象（SQL-20・TABLE-16、Issue #1074）。
+/// `sql::parser::BoundConflictTarget` に対応する最小表現。`RowId` は本 Issue
+/// 導入前と完全に同じレイアウトを出力する（golden テストで固定）。
+pub(crate) enum UpsertHashTarget<'a> {
+    /// `ON CONFLICT (id)`。
+    RowId,
+    /// `ON CONFLICT (<UNIQUE 制約の構成列>)`。列名は解決した制約の宣言順
+    /// （`sql::parser` が `schema.unique_constraints()` から解決した順）。
+    Unique(&'a [&'a str]),
+}
+
 /// `tenant::upsert_typed_rows_unchecked` 用（SQL-20・TASK-193、Issue #872）。
 /// `INSERT ... ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...` を単一の
 /// 「新規挿入かもしれないし更新かもしれない」操作として、[`OpTag::Upsert`]
@@ -591,8 +602,14 @@ pub(crate) enum UpsertHashAction<'a> {
 /// `DO UPDATE`／`SET` 内容差は必ず異なるハッシュになる——衝突分岐そのものを
 /// 先頭で `push_u8` してから行データを連結するため）。
 ///
-/// 入力レイアウト: `push_u8(action_tag)`（`0` = DO NOTHING、`1` = DO UPDATE）
-/// → DO UPDATE のみ `push_raw(assignment_count)` に続けて各割当を宣言順で
+/// 入力レイアウト: `push_u8(action_tag)`（`(id)` 対象: `0` = DO NOTHING、
+/// `1` = DO UPDATE。UNIQUE 対象〔Issue #1074〕: `2` = DO NOTHING、
+/// `3` = DO UPDATE——`(id)` 対象と同一 `VALUES`／同一 action でも異なる
+/// ハッシュになることを action tag の時点で保証する）→ UNIQUE 対象のみ
+/// `push_raw(target_column_count)` に続けて対象列名を解決した制約の宣言順で
+/// `push_bytes(column_name)`（`(a,b)` と `(b,a)` は同じ制約に解決されるため
+/// 同一の並びになり、同一ハッシュになる） → DO UPDATE のみ
+/// `push_raw(assignment_count)` に続けて各割当を宣言順で
 /// `push_bytes(target_column_name)` → `push_u8(value_kind)`（`0` = `EXCLUDED`、
 /// `1` = リテラル）→ `EXCLUDED` なら `push_bytes(src_column_name)`、リテラル
 /// なら [`push_value`] → その後は [`for_typed_insert_batch`] と**完全に同一**の
@@ -603,15 +620,26 @@ pub(crate) enum UpsertHashAction<'a> {
 /// `OpTag` の違いで機械的に内容不一致〔`22023`〕として検出させるため）。
 /// 行境界の曖昧性回避（[`for_typed_insert_batch`] ドキュメント参照）は行数
 /// プレフィクスを持つ本レイアウトにもそのまま適用される。
+///
+/// `target` が [`UpsertHashTarget::RowId`] の場合、出力バイト列は本 Issue
+/// （#1074）導入前と**完全に同一**（golden テストで固定。`for_typed_upsert_
+/// row_id_layout_is_stable` 参照）。
 pub(crate) fn for_typed_upsert(
+    target: &UpsertHashTarget<'_>,
     action: &UpsertHashAction<'_>,
     rows: &[TypedInsertBatchRow<'_>],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::Upsert);
+    // UNIQUE 対象は action tag を `2`／`3` へずらすことで、`(id)` 対象と
+    // 同一の action・`VALUES` でも先頭バイトの時点でハッシュが分岐する。
+    let action_tag_base: u8 = match target {
+        UpsertHashTarget::RowId => 0,
+        UpsertHashTarget::Unique(_) => 2,
+    };
     match action {
-        UpsertHashAction::DoNothing => b.push_u8(0),
+        UpsertHashAction::DoNothing => b.push_u8(action_tag_base),
         UpsertHashAction::DoUpdate(assignments) => {
-            b.push_u8(1);
+            b.push_u8(action_tag_base + 1);
             let count = u32::try_from(assignments.len()).map_err(|_| {
                 StorageError::Codec("content hash upsert assignment count too large".to_string())
             })?;
@@ -629,6 +657,15 @@ pub(crate) fn for_typed_upsert(
                     }
                 }
             }
+        }
+    }
+    if let UpsertHashTarget::Unique(columns) = target {
+        let count = u32::try_from(columns.len()).map_err(|_| {
+            StorageError::Codec("content hash upsert target column count too large".to_string())
+        })?;
+        b.push_raw(&count.to_le_bytes());
+        for name in *columns {
+            b.push_bytes(name.as_bytes())?;
         }
     }
 
@@ -2208,8 +2245,18 @@ mod tests {
         let lang = Value::Text("ja".to_string());
         let cols: [(&str, &Value); 1] = [("lang", &lang)];
         let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
-        let a = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
-        let b = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
+        let a = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let b = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
         assert_eq!(a, b);
     }
 
@@ -2221,7 +2268,12 @@ mod tests {
         let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
         let plain_insert =
             for_typed_insert(1, Visibility::Private, &embedding, &cols).expect("hash");
-        let do_nothing = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
+        let do_nothing = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
         assert_ne!(plain_insert, do_nothing);
     }
 
@@ -2235,9 +2287,18 @@ mod tests {
             "lang".to_string(),
             UpsertAssignmentHashValue::Literal(&lang),
         )];
-        let do_nothing = for_typed_upsert(&UpsertHashAction::DoNothing, &rows).expect("hash");
-        let do_update =
-            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments), &rows).expect("hash");
+        let do_nothing = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let do_update = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments),
+            &rows,
+        )
+        .expect("hash");
         assert_ne!(do_nothing, do_update);
     }
 
@@ -2256,10 +2317,18 @@ mod tests {
             "lang".to_string(),
             UpsertAssignmentHashValue::Literal(&lang_en),
         )];
-        let h_ja =
-            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_ja), &rows).expect("hash");
-        let h_en =
-            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_en), &rows).expect("hash");
+        let h_ja = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments_ja),
+            &rows,
+        )
+        .expect("hash");
+        let h_en = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments_en),
+            &rows,
+        )
+        .expect("hash");
         assert_ne!(h_ja, h_en);
     }
 
@@ -2277,11 +2346,18 @@ mod tests {
             "lang".to_string(),
             UpsertAssignmentHashValue::Literal(&lang),
         )];
-        let h_excluded =
-            for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_excluded), &rows)
-                .expect("hash");
-        let h_literal = for_typed_upsert(&UpsertHashAction::DoUpdate(&assignments_literal), &rows)
-            .expect("hash");
+        let h_excluded = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments_excluded),
+            &rows,
+        )
+        .expect("hash");
+        let h_literal = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments_literal),
+            &rows,
+        )
+        .expect("hash");
         assert_ne!(h_excluded, h_literal);
     }
 
@@ -2299,11 +2375,113 @@ mod tests {
             (2, Visibility::Private, &embedding_b, &cols),
             (1, Visibility::Private, &embedding_a, &cols),
         ];
-        let h_forward =
-            for_typed_upsert(&UpsertHashAction::DoNothing, &rows_forward).expect("hash");
-        let h_reversed =
-            for_typed_upsert(&UpsertHashAction::DoNothing, &rows_reversed).expect("hash");
+        let h_forward = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows_forward,
+        )
+        .expect("hash");
+        let h_reversed = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows_reversed,
+        )
+        .expect("hash");
         assert_ne!(h_forward, h_reversed);
+    }
+
+    /// golden 固定（Issue #1074）: `(id)` 対象（[`UpsertHashTarget::RowId`]）の
+    /// レイアウトが本 Issue の `UpsertHashTarget` 導入前後でバイト単位に不変で
+    /// あることを固定する。`RowId` 分岐が変わって数値がずれた場合は「バグを
+    /// 直した」のではなく「永続化済み台帳エントリとの互換性を壊した」ことを
+    /// 意味するため、この定数は変更前の実装から採取した値のまま更新しない。
+    #[test]
+    fn for_typed_upsert_row_id_layout_is_golden() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        let do_nothing = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        assert_eq!(
+            to_hex(do_nothing.as_bytes()),
+            "f02cbdf3fd5dde7d08444243919a222cc5917fb160ea6785c8c779a60c04e2ed"
+        );
+
+        let new_lang = Value::Text("en".to_string());
+        let assignments = [(
+            "lang".to_string(),
+            UpsertAssignmentHashValue::Literal(&new_lang),
+        )];
+        let do_update = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&assignments),
+            &rows,
+        )
+        .expect("hash");
+        assert_eq!(
+            to_hex(do_update.as_bytes()),
+            "384049cb628efadc559112030ad153a3edb6b8707d548134bd6ec85aa4eb41bb"
+        );
+    }
+
+    /// UNIQUE 対象（Issue #1074）は `(id)` 対象と action tag の時点で分岐する
+    /// ため、同一 `VALUES`・同一 action でも異なるハッシュになる。
+    #[test]
+    fn for_typed_upsert_unique_target_differs_from_row_id() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+
+        let row_id_hash = for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let unique_a_hash = for_typed_upsert(
+            &UpsertHashTarget::Unique(&["a"]),
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let unique_b_hash = for_typed_upsert(
+            &UpsertHashTarget::Unique(&["b"]),
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let unique_ab_hash = for_typed_upsert(
+            &UpsertHashTarget::Unique(&["a", "b"]),
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let unique_ba_hash = for_typed_upsert(
+            &UpsertHashTarget::Unique(&["b", "a"]),
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+
+        assert_ne!(row_id_hash, unique_a_hash);
+        assert_ne!(unique_a_hash, unique_b_hash);
+        assert_ne!(unique_a_hash, unique_ab_hash);
+        // 本関数は渡された列名の並びをそのままハッシュ化し、並べ替えは行わない
+        // （`(a,b)` と `(b,a)` を同一制約として同一ハッシュに正規化する責務は
+        // 呼び出し元の `sql::parser::bind_upsert_form` にあり、常に解決した
+        // 制約の宣言順で本関数へ渡す契約——`sql/parser.rs` の結合テスト参照）。
+        assert_ne!(unique_ab_hash, unique_ba_hash);
     }
 
     // --- for_update_where / for_delete_where（Issue #871・SQL-19・TASK-192） --------

@@ -517,6 +517,19 @@ impl<'a> ArrayRef<'a> {
     pub(crate) fn payload(&self) -> &'a [u8] {
         self.bytes
     }
+
+    /// 束縛済み `VALUES`（`Value::Array`）から一意キー計算専用のスクラッチ
+    /// `ArrayRef` を組み立てる（`pub(crate)`: [`crate::constraint::
+    /// unique_key_from_values`] が UPSERT の `ON CONFLICT` 対象キー（TABLE-16・
+    /// Issue #1074）として使う）。`bytes` は呼び出し元が
+    /// [`write_array_elements_payload`] で組み立てた、走査結果の借用
+    /// （[`scan_scalar_columns_masked`] 等）と同一フォーマットのバッファへの
+    /// 借用。永続化された行から走査した結果とは異なり構造検証を経ていないが、
+    /// `Value::Array` は列挿入時の束縛（`bind_insert_row`）で既にスキーマ検証
+    /// 済みの値であるため、ここでの再検証は行わない契約とする。
+    pub(crate) fn from_owned(elem: ArrayElemType, count: u32, bytes: &'a [u8]) -> Self {
+        ArrayRef { elem, count, bytes }
+    }
 }
 
 /// BOOLEAN 値のバイト表現（presence タグに続く 1 バイト）。`0x00`/`0x01`
@@ -626,6 +639,18 @@ fn write_array_value(buf: &mut Vec<u8>, array_ty: ArrayType, value: &ArrayValue)
     buf.push(ARRAY_FLAGS_RESERVED);
     buf.extend_from_slice(&count.to_le_bytes());
     buf.extend_from_slice(&payload_len.to_le_bytes());
+    write_array_elements_payload(buf, value)
+}
+
+/// 配列要素列（フレームヘッダを含まない本文のみ）を `buf` へ書き込む
+/// （[`write_array_value`] の本体部分を切り出したもの。ヘッダ
+/// （`ARRAY_FLAGS_RESERVED`・`count`・`payload_len`）の書き込みは呼び出し元の
+/// 責務）。`pub(crate)`: [`crate::constraint::unique_key_from_values`] が
+/// UPSERT の `ON CONFLICT` 対象キー（TABLE-16・Issue #1074）として ARRAY 列の
+/// 束縛値から一意キー計算用のスクラッチ `ArrayRef`（[`ArrayRef::from_owned`]）を
+/// 組み立てる際、この要素書き込みロジックを独立に再実装せず共有するために
+/// `write_array_value` から公開する。
+pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue) -> Result<()> {
     match value {
         ArrayValue::Text(items) => {
             for item in items {
