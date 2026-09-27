@@ -311,7 +311,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `table` | ○ | string | |
 | `aggregates` | ○ | object[]（`{"fn","column"}`。1〜32 要素） | `fn` は `count`／`sum`／`avg`／`min`／`max`（小文字完全一致）。`column` は列名、または `count` 専用の `"*"` |
 | `filter` | △ | object[] | |
-| `group_by` | △ | string[]（ちょうど 1 要素） | `TEXT` 列限定 |
+| `group_by` | △ | string[]（1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | `TEXT` 列限定 |
 | `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
 | `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having` 付きでも受理）。`false`／省略時は通常実行 |
 
@@ -335,10 +335,10 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 - `aggregates` が空配列 → `group_by`／`having` の有無を問わず一律 `42601`
   （`having` の参照解決より必ず先に検査する）
-- `group_by` 要素数が 1 でない・`having` のみ単独指定（`group_by` なし）・
+- `group_by` 要素数が 0・`having` のみ単独指定（`group_by` なし）・
   `fn`／`op` が語彙外・識別子形状不正 → `42601`
-- グループ数上限（10,000）・グループキー累計バイト・`having` 述語数上限超過
-  → `54000`
+- `group_by` 要素数が 8（`MAX_GROUP_BY_COLUMNS`）超過・グループ数上限
+  （10,000）・グループキー累計バイト・`having` 述語数上限超過 → `54000`
 - `group_by` 列が `TEXT` 列でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
   参照先が `aggregates` に存在しない／曖昧 → `22000`
 - `VECTOR` 列の集計: `count` は列の裸の列参照を受理し非 `NULL` 行数を数える
@@ -1062,6 +1062,14 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `tests/three_client_http/{urllib_client.py,fetch_client.js}`
   （`make e2e-three-client-http`。opt-in・`ci` 非包含）。実行記録の様式は
   `docs/design/three-client-e2e-harness.md` 参照
+- 層 B パリティ総合検証（Phase 7 機能・insert・DDL 3 op を含む `Op::ALL`
+  全網羅・Issue #950）: 同じ `three_client_http_e2e.rs` の
+  `PARITY_CASES`（範囲比較・`IN`・`OR`・`sort`・`offset`・複数列
+  `group_by`）・`REJECTION_CASES`・`run_phase7_write_parity_scenario`
+  （insert／DDL／述語形 `delete`）・`parity_matrix_covers_every_nosql_op`
+  （op カバレッジガード。`#[ignore]` なし・常時 `make ci`）。詳細は
+  `docs/design/three-client-e2e-harness.md`「パリティ総合検証（Issue
+  #950）」節参照
 
 ## spec 側への申し送り候補
 
