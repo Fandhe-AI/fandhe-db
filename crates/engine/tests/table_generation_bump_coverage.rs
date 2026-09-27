@@ -132,7 +132,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 3854）。
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4138）。
-    ("catalog.rs", 4676),
+    // Issue #1070（永続一意索引化）で `user_uniq_table_name`／`user_uniq_table_def`
+    // ヘルパ・`primary_key_tag` ドキュメンテーションコメントの追加により
+    // `catalog.rs` 冒頭側にさらに行が追加され、再度追随（旧: 4676）。
+    ("catalog.rs", 4726),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -157,7 +160,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 3933）。
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4217）。
-    ("catalog.rs", 4755),
+    // Issue #1070（永続一意索引化）の行追加で再度追随（旧: 4755）。
+    ("catalog.rs", 4805),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -174,7 +178,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 4014）。
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4298）。
-    ("catalog.rs", 4836),
+    // Issue #1070（永続一意索引化）の行追加で再度追随（旧: 4836）。
+    ("catalog.rs", 4886),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -190,7 +195,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 4047）。
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4331）。
-    ("catalog.rs", 4869),
+    // Issue #1070（永続一意索引化）の行追加で再度追随（旧: 4869）。
+    ("catalog.rs", 4919),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

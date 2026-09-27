@@ -39,19 +39,22 @@
 //! 等価判定は型タグ＋長さ前置の正準キーバイト列で行い、許可型は主キーと共有する
 //! 単一の許可リスト（`ColumnType::is_primary_key_allowed`）に限る。
 //!
-//! # 実装方式（既知の制約）
+//! # 実装方式（永続一意索引・Issue #1070）
 //!
-//! 永続一意索引は導入せず、書き込み対象行を除いたテナント全行
-//! （`(tenant_id, 0)..=(tenant_id, u64::MAX)` の物理キー範囲。可視性・
-//! テーブル世代キャッシュのいずれも経由しない生の redb 走査）を 1 文あたり
-//! 1 回だけ線形走査し、全キーの衝突をまとめて判定する。計算量はテナントの
-//! 保有行数に比例するため、一意キーを宣言したテーブルへの書き込みは行数の
-//! 多いテナントほど遅くなる（`docs/design/sql-primary-key.md`・
-//! `docs/design/unique-constraint.md` 参照。永続索引化は将来の別課題）。
+//! 旧実装（テナント全行の毎文線形走査）は永続一意索引
+//! （`user_uniq/{table}`。[`unique_index`] モジュール）へ置き換え済み。
+//! 判定は正引きサブキーの点照会（O(k・log n)。k は宣言済み一意キー数）で行い、
+//! 検査コストはテナントの保有行数に比例しない（`docs/design/unique-index.md`
+//! 参照。設計・不変条件・後方互換の詳細は [`unique_index`] モジュール
+//! ドキュメント参照）。既存 DB（索引テーブル未作成）では各テナントの
+//! 最初の書き込みで 1 回だけ自テナントの既存行をバックフィルする
+//! （その回のみ O(n)）。
+//!
 //! `tenant::enumerate_dml_candidates` が持つ [`crate::tenant`] 内部の総走査上限
 //! （`MAX_SCANNED_ROWS`）は意図的に継承しない——継承すると、その上限を超える
 //! 行数を既に保有するテナントが一意キー宣言テーブルへ一切書き込めなくなる
-//! fail-closed 過ぎる制約になってしまうため。
+//! fail-closed 過ぎる制約になってしまうため（バックフィルはテナントごとに
+//! 高々 1 回であり、以降の書き込みは索引照会のみで完結する）。
 //!
 //! # テナント境界（RLS-9・RLS-10 (c)）
 //!
@@ -64,11 +67,13 @@
 //! （TABLE-16・RLS-10 (c)）。違反時のエラー（`TenantWriteError::UniqueViolation`）
 //! はキー値・列名・行 id・テナント名を含まない固定文言。
 
+mod unique_index;
+
 use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, TableSchema};
 use crate::row_codec::ScalarRef;
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 /// 一意キー 1 個分の NULL の扱い。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,15 +203,13 @@ fn enforce_check_constraints_in_txn(
 /// 既に書き込み済みであることが前提で、本関数はそれらを同一 txn 内で読み戻す
 /// （redb の write トランザクションは自身が書いた値を同一 txn 内で読める）。
 ///
-/// 判定手順（全キーをまとめて扱い、テナント範囲の走査は 1 回だけ行う）:
-/// 1. `written_ids` 各行について各キーの正準バイト列を計算し、`written_ids`
-///    同士の重複（同一文内で 2 行が同じキー値を持つ）を検出する。
-/// 2. 対象テナントの全行（`written_ids` を除く）を走査し、1. のいずれかと
-///    一致するキー値を持つ行がないか調べる（自己更新の除外は `written_ids`
-///    からの除外そのもので実現される。新旧値の比較は行わない）。
-/// 3. いずれかで衝突が見つかった時点で [`TenantWriteError::UniqueViolation`]
-///    を返す（最初の 1 件で打ち切り。副作用は呼び出し元が `write_txn` を
-///    commit しないことで防ぐ）。
+/// 判定は永続一意索引（`user_uniq/{table}`）への点照会に委譲する
+/// （[`unique_index::ensure_tenant_index`] でテナントの索引が最新であることを
+/// 保証してから、[`unique_index::check_and_update`] で `written_ids` を索引へ
+/// 反映しつつ衝突を検出する。設計・不変条件は [`unique_index`] モジュール
+/// ドキュメント参照。Issue #1070）。衝突を検出した時点で
+/// [`TenantWriteError::UniqueViolation`] を返し、呼び出し元は `write_txn` を
+/// commit しない（索引への書き込みも同じ txn に含まれるため副作用は残らない）。
 pub(crate) fn enforce_unique_keys_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -226,77 +229,59 @@ pub(crate) fn enforce_unique_keys_in_txn(
     let row_table = write_txn
         .open_table(crate::catalog::user_rows_table_def(&row_table_name))
         .map_err(crate::catalog::map_row_table_error)?;
+    let index_table_name = crate::catalog::user_uniq_table_name(table_name);
+    let mut index_table = write_txn
+        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
 
-    // 1. 今回書き込んだ行同士のキー値衝突を検出する（キーごとに独立した表）。
     let written_id_set: HashSet<u64> = written_ids.iter().copied().collect();
-    let mut written_keys: Vec<HashMap<Vec<u8>, u64>> =
-        specs.iter().map(|_| HashMap::new()).collect();
-    for &id in &written_id_set {
-        let Some(guard) = row_table
-            .get((tenant_id, id))
-            .map_err(crate::catalog::CatalogError::from)?
-        else {
-            // 呼び出し元は必ず同一 txn 内で先に書き込み済みのはずだが、内部
-            // 不変条件の欠落があっても黙って読み飛ばさず、判定対象から
-            // 除外するに留める（この行が存在しない以上、一意性判定の対象には
-            // なり得ない）。
-            continue;
-        };
-        let buf = guard.value();
-        let values = decode_key_columns(schema, &mask, buf)?;
-        for (spec, keys) in specs.iter().zip(written_keys.iter_mut()) {
-            let Some(key) = key_bytes(spec, &values).map_err(internal)? else {
-                continue;
-            };
-            if let Some(existing_id) = keys.insert(key, id) {
-                if existing_id != id {
-                    return Err(TenantWriteError::UniqueViolation);
-                }
-            }
-        }
-    }
-    if written_keys.iter().all(HashMap::is_empty) {
-        return Ok(());
-    }
+    unique_index::ensure_tenant_index(
+        &row_table,
+        &mut index_table,
+        schema,
+        &specs,
+        &mask,
+        tenant_id,
+        &written_id_set,
+    )?;
+    unique_index::check_and_update(
+        &row_table,
+        &mut index_table,
+        schema,
+        &specs,
+        tenant_id,
+        &written_id_set,
+        &mask,
+    )
+}
 
-    // 2. 対象テナントの残り全行（今回書き込んだ id を除く）を 1 回だけ走査する。
-    // 物理キーは `(tenant_id, id)` の辞書順であり、`(tenant, 0)..=(tenant,
-    // u64::MAX)` の閉区間が対象テナントの物理キー空間の全域を過不足なく覆う
-    // （`tenant::enumerate_dml_candidates` と同じ範囲構築。RLS-9・TABLE-12）。
-    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
-    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
-    for entry in row_table
-        .range::<(&str, u64)>((range_start, range_end))
-        .map_err(crate::catalog::CatalogError::from)?
-    {
-        let (k, v) = entry.map_err(crate::catalog::CatalogError::from)?;
-        let (key_tenant, id) = k.value();
-        if key_tenant != tenant_id {
-            // 閉区間により理論上到達しないが、defense-in-depth として維持する
-            // （`enumerate_dml_candidates` と同じ判断）。
-            break;
-        }
-        if written_id_set.contains(&id) {
-            // 自己更新・自己挿入の除外は id 一致そのもので行う（新旧値の
-            // 比較はしない。§モジュールドキュメント参照）。
-            continue;
-        }
-        let buf = v.value();
-        let values = decode_key_columns(schema, &mask, buf)?;
-        for (spec, keys) in specs.iter().zip(written_keys.iter()) {
-            if keys.is_empty() {
-                continue;
-            }
-            let Some(key) = key_bytes(spec, &values).map_err(internal)? else {
-                continue;
-            };
-            if keys.contains_key(&key) {
-                return Err(TenantWriteError::UniqueViolation);
-            }
-        }
-    }
+/// 削除経路（`tenant.rs` の `delete_row_impl`・`delete_rows_where_unchecked`・
+/// `replace_typed_rows_by_text_key`）が、行削除の直後・同一 write トランザクション
+/// 内から呼ぶ永続一意索引の後片付け窓口（[`unique_index::forget_rows_in_txn`] の
+/// 薄いラッパー。Issue #1070）。行ストアの可変ハンドルを保持したまま呼んでよい
+/// （索引テーブルのみを開くため `TableAlreadyOpen` にならない）。後片付けは
+/// 索引肥大化を防ぐ衛生措置であり、呼び出し漏れがあっても [`enforce_unique_keys_in_txn`]
+/// の読み戻し判定（stale 検出）が正しさを保証する。
+pub(crate) fn forget_unique_index_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    ids: &[u64],
+) -> Result<(), TenantWriteError> {
+    unique_index::forget_rows_in_txn(write_txn, table_name, schema, tenant_id, ids)
+}
 
-    Ok(())
+/// TRUNCATE（`tenant.rs::truncate_table_unchecked`）が、行ストアの `retain_in`
+/// 後・`row_table` を drop した後の同一 write トランザクション内から呼ぶ、
+/// テナント範囲の永続一意索引クリア窓口（[`unique_index::clear_tenant_in_txn`]
+/// の薄いラッパー。Issue #1070）。他テナントの索引エントリには一切触れない。
+pub(crate) fn clear_unique_index_for_tenant_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    tenant_id: &str,
+) -> Result<(), TenantWriteError> {
+    unique_index::clear_tenant_in_txn(write_txn, table_name, tenant_id)
 }
 
 /// [`crate::catalog::Storage::alter_table_add_unique_constraint`]（Rust API。

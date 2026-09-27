@@ -2913,6 +2913,18 @@ fn delete_row_impl(
         }
         (owns_existing, schema)
     };
+    // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。行を実際に
+    // 削除した場合のみ行う（`row_table` の可変ハンドルは上のブロック終端で
+    // 既に解放済みのため、索引テーブルのみを別途開いても衝突しない）。
+    if owns_existing {
+        crate::constraint::forget_unique_index_rows_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            std::slice::from_ref(&id),
+        )?;
+    }
     // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
     // 参照先側の検査。行を実際に削除した場合のみ行う——対象行が不存在・他テナント
     // 所有（いずれも区別しない `NotFound`）の場合は何も変化していないため走査
@@ -3302,6 +3314,19 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         }
     }
 
+    // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。
+    // `row_table`（`mut`）の可変ハンドルは上のブロック終端で既に解放済み。
+    if !candidate_ids.is_empty() {
+        crate::constraint::forget_unique_index_rows_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            &candidate_ids,
+        )
+        .map_err(dml_write_err)?;
+    }
+
     // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
     // 参照先側の検査（行を 1 件以上削除した場合のみ。候補は自テナント所有の行に
     // 限られる）。
@@ -3524,6 +3549,10 @@ pub(crate) fn truncate_table_unchecked(
             .retain_in((start, end), |_, _| false)
             .map_err(CatalogError::from)?;
         drop(row_table);
+        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲を
+        // クリアする（他テナントの索引エントリには触れない）。次回の書き込み
+        // で行数 0 の状態から遅延再構築される。
+        crate::constraint::clear_unique_index_for_tenant_in_txn(write_txn, table, tenant)?;
         // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）
         // の参照先側の検査。自テナントの参照元行が 1 件でも残れば `23503`（他テナントの
         // 行は削除も走査もしないため、他テナントの参照元行の有無は結果に影響しない）。
@@ -3779,6 +3808,14 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 .remove(&(tenant, *id))
                 .map_err(CatalogError::from)?;
         }
+        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。この経路は
+        // UNIQUE 制約を持つテーブルを事前に拒否しているが、主キーだけの
+        // テーブルは通るため、旧行の後片付けが必要（`row_table` はこの後も
+        // 新行の挿入に使うため開いたままだが、索引テーブルは別名のため
+        // `TableAlreadyOpen` にならない）。
+        crate::constraint::forget_unique_index_rows_in_txn(
+            &write_txn, table, &schema, tenant, &to_remove,
+        )?;
 
         // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
         // （`Vec<u8>` 新規確保）を避け、`scratch.clear()` → `encode_row_into` で

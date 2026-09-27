@@ -127,15 +127,16 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
   触れない。エラー応答（`TenantWriteError::UniqueViolation`）はキー値・行 id・
   テナント名・テーブル名を含まない固定文言。
 
-### 既知の制約（永続一意索引は未導入）
+### 永続一意索引（Issue #1070）
 
-判定は永続一意索引を経由せず、対象テナントの保有行数に比例する線形走査で行う
-（`tenant::enumerate_dml_candidates` が持つ総走査上限 `MAX_SCANNED_ROWS` は意図的
+判定は `user_uniq/{table}`（redb 二次テーブル）への点照会で行い、検査コストは
+対象テナントの保有行数に比例しない（1 行あたり O(k・log n)。k は宣言済み一意
+キー数）。設計・不変条件・後方互換は `docs/design/unique-index.md` 参照。
+`tenant::enumerate_dml_candidates` が持つ総走査上限 `MAX_SCANNED_ROWS` は意図的
 に継承しない——継承すると、その上限を超える行数を既に保有するテナントが主キー
-宣言テーブルへ一切書き込めなくなる過剰に fail-closed な制約になってしまうため）。
-主キー宣言テーブルへの書き込みは行数の多いテナントほど遅くなる。永続一意索引化は
-将来の別課題（`docs/design/scalar-index-generation-cache.md` の二次索引と共有
-候補になり得る）。
+宣言テーブルへ一切書き込めなくなる過剰に fail-closed な制約になってしまうため
+（既存 DB からの遅延バックフィルはテナントごとに高々 1 回であり、以降の書き込み
+は索引照会のみで完結する）。
 
 ## エラー契約
 
@@ -154,7 +155,6 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
   `docs/design/foreign-key.md`）。
 - `ALTER TABLE ADD/DROP CONSTRAINT`・`ADD PRIMARY KEY`、`ON CONFLICT (<主キー列>)`、
   NoSQL 表層の DDL op。
-- 主キー用の永続一意索引（書き込み時のテナント全行走査の解消）。
 - `42703`（未知列）・`42P16`・`2BP01` の `ErrorClass` 追加と SQL 写像。
 - 台帳由来 `23505` のラベル `DUPLICATE_OPERATION_ID` 分離（別 Issue の管轄。現状
   台帳由来の重複〔`DuplicateOperationId`〕も `ErrorClass::UniqueViolation` 経由で

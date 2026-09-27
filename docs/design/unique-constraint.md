@@ -59,12 +59,10 @@ UNIQUE 制約を載せ替えた。
   走査し、他テナントの範囲は構造的に一切読まない。二次索引・世代整合キャッシュは
   流用しない。
 
-**既知の制約**: 永続一意索引は導入しないため、一意キーを宣言したテーブルへの
-書き込みは 1 文あたり O(自テナント行数) の走査を伴う（`MAX_SCANNED_ROWS` のような
-上限は課さない——課すと大規模テナントの制約付きテーブルが書き込み不能になるため）。
-redb は単一ライターのため、この走査中は他テナントの書き込みも待たされる。走査を
-文あたり 1 回に保つことが直接的な緩和策であり、永続一意索引（redb 二次テーブルに
-よる O(log n) 判定）は将来検討事項として残す。
+**永続一意索引（Issue #1070）**: 判定は `user_uniq/{table}`（redb 二次テーブル）
+への点照会に置き換え済みで、一意キーを宣言したテーブルへの書き込みコストは
+自テナントの保有行数に比例しない（1 行あたり O(k・log n)。k は宣言済み一意
+キー数）。設計・不変条件・後方互換は `docs/design/unique-index.md` 参照。
 
 ### D2. 明示トランザクション内の書き込み（SQL-31・TASK-221）
 
@@ -189,7 +187,6 @@ CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは
 ## スコープ外・申し送り
 
 - SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名
-- 永続一意索引（redb 二次テーブル）による O(log n) 判定
 - ファイル形 INSERT（`replace_typed_rows_by_text_key`）の UNIQUE 制約対応
   （現状は fail-closed 拒否）
 - `UPSERT` の `ON CONFLICT` 対象列（`id` 固定）への UNIQUE 列拡張
