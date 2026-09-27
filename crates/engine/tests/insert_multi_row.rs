@@ -185,22 +185,43 @@ fn execute_insert_sql_single_row_behavior_is_unchanged() {
 // 受け入れ条件②: 行数上限超過 → 54000・副作用ゼロ
 // ---------------------------------------------------------------------
 
+/// Issue #997・オーナー判断の改訂（2026-09-27、汎用 RDB との整合）: 既定
+/// （`--max-insert-rows` 未指定＝`DmlLimits::default().max_insert_rows_per_statement
+/// == None`）では構文段の行数上限判定を行わない。本テストは
+/// `batch_limits.max_files_per_batch`（既定 64。Issue #860）を明示的に引き上げて
+/// 構文段が上限なしで通過することを固定したうえで、`dml_limits` を明示設定
+/// （`Some(1_000)`）した場合にのみ旧既定値相当の `54000`・副作用ゼロが成立する
+/// ことを確認する（BREAKING CHANGE: 既定構成のみでは 2,000 行の複数行 `VALUES`
+/// はもはや構文段では拒否されない）。
 #[test]
-fn multi_row_insert_exceeding_row_limit_is_rejected_with_54000_and_no_side_effects() {
-    let (core, path) = open_engine("insert-multi-row-over-limit");
+fn multi_row_insert_exceeding_configured_row_limit_is_rejected_with_54000_and_no_side_effects() {
+    let path = unique_db_path("insert-multi-row-configured-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_dml_limits(engine::sql::parser::DmlLimits {
+            max_insert_rows_per_statement: Some(
+                std::num::NonZeroUsize::new(1_000).expect("1_000 is nonzero"),
+            ),
+            ..engine::sql::parser::DmlLimits::default()
+        })
+        .with_batch_limits(engine::batch_limits::BatchLimits {
+            max_files_per_batch: 2_000,
+            ..engine::batch_limits::BatchLimits::default()
+        });
     let _guard = CleanupGuard(path);
     let policy = ctx("tenant-a");
 
-    // 実装既定値の上限（本リポ独自）へ依存せず「明らかに超過する規模」を投入する
-    // （`tests/sql_group_by.rs::group_count_over_max_groups_is_rejected_as_payload_too_large`
-    // と同じ方針）。行数上限の判定は構文解析段階（テーブル存在確認より前）で
-    // 完結するため、テーブル名の実在有無に関係なく判定される。
+    // 「明らかに超過する規模」を投入する（`tests/sql_group_by.rs::
+    // group_count_over_max_groups_is_rejected_as_payload_too_large` と同じ方針）。
+    // 行数上限の判定は構文解析段階（テーブル存在確認より前）で完結するため、
+    // テーブル名の実在有無に関係なく判定される。
     let ids: Vec<u64> = (1..=2_000).collect();
     let sql = multi_row_sql(TABLE, &ids, "op-over-limit");
 
     let err = core
         .execute_insert_sql(&policy, &sql)
-        .expect_err("row count over the limit must be rejected");
+        .expect_err("row count over the configured limit must be rejected");
     assert_eq!(err.wire_code(), "54000");
 
     // 副作用ゼロ: 台帳・行のいずれも書き込まれていない（同じ operation_id で
@@ -215,10 +236,37 @@ fn multi_row_insert_exceeding_row_limit_is_rejected_with_54000_and_no_side_effec
 
 // ---------------------------------------------------------------------
 // Issue #997: `--max-insert-rows`（`EngineCore::dml_limits.
-// max_insert_rows_per_statement`）による行数上限の起動時設定。
+// max_insert_rows_per_statement`）による行数上限の起動時設定。オーナー判断の
+// 改訂（2026-09-27、汎用 RDB との整合）により既定は上限なし（`None`）。
 // ---------------------------------------------------------------------
 
-/// 既定値（1,000）より低い値へ絞った構成では、既定値以下の行数でも構文段
+/// 既定（`--max-insert-rows` 未指定）では複数行 `VALUES` の行数に上限がない
+/// （`batch_limits.max_files_per_batch` を明示的に引き上げて構文段の判定のみを
+/// 切り分ける。旧既定値・1,000 行を明らかに超える規模で成功することを固定する。
+/// BREAKING CHANGE の外部観測）。
+#[test]
+fn multi_row_insert_default_has_no_row_count_cap() {
+    let path = unique_db_path("insert-multi-row-no-cap");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(
+        engine::batch_limits::BatchLimits {
+            max_files_per_batch: 1_500,
+            ..engine::batch_limits::BatchLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let ids: Vec<u64> = (1..=1_200).collect();
+    let sql = multi_row_sql(TABLE, &ids, "op-no-cap");
+    let outcome = core
+        .execute_insert_sql(&policy, &sql)
+        .expect("no default row count cap must accept rows beyond the old default");
+    assert_eq!(outcome.rows_affected, 1_200);
+}
+
+/// 明示指定した値へ絞った構成では、その行数以下でも構文段
 /// （`sql::allowlist::Parser::parse_insert`）で `54000`（副作用ゼロ）になる。
 /// `batch_limits.max_files_per_batch`（既定 64）はここでは変更しないため、
 /// 本テストが検出する拒否が `dml_limits`（本 Issue が新設した経路）由来であり
@@ -231,7 +279,9 @@ fn multi_row_insert_respects_configured_lower_insert_row_limit() {
     storage.create_table(&row_schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_dml_limits(
         engine::sql::parser::DmlLimits {
-            max_insert_rows_per_statement: 2,
+            max_insert_rows_per_statement: Some(
+                std::num::NonZeroUsize::new(2).expect("2 is nonzero"),
+            ),
             ..engine::sql::parser::DmlLimits::default()
         },
     );
@@ -252,13 +302,12 @@ fn multi_row_insert_respects_configured_lower_insert_row_limit() {
     assert_eq!(outcome.rows_affected, 2);
 }
 
-/// 既定値（1,000）より高い値へ引き上げた構成では、既定値超過の行数でも
-/// 1 文の複数行 `VALUES` として成功する（Issue #997 導入前は構文段の
-/// `MAX_INSERT_ROWS_PER_STATEMENT`＝1,000 で構造的に不可能だった）。
-/// `batch_limits.max_files_per_batch`（既定 64）も同時に引き上げないと
-/// Issue #860 の別上限で `54000` になる（`multi_row_insert_over_batch_limits_
-/// row_count_is_rejected_with_54000` が示す既存契約）ため、本テストは両方を
-/// 引き上げて `dml_limits` 側の引き上げが実際に効いていることを確認する。
+/// 明示指定した値へ引き上げた構成では、旧既定値超過の行数でも 1 文の複数行
+/// `VALUES` として成功する。`batch_limits.max_files_per_batch`（既定 64）も
+/// 同時に引き上げないと Issue #860 の別上限で `54000` になる
+/// （`multi_row_insert_over_batch_limits_row_count_is_rejected_with_54000` が
+/// 示す既存契約）ため、本テストは両方を引き上げて `dml_limits` 側の引き上げが
+/// 実際に効いていることを確認する。
 #[test]
 fn multi_row_insert_respects_configured_higher_insert_row_limit() {
     let path = unique_db_path("insert-multi-row-higher-dml-limit");
@@ -266,7 +315,9 @@ fn multi_row_insert_respects_configured_higher_insert_row_limit() {
     storage.create_table(&row_schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_dml_limits(engine::sql::parser::DmlLimits {
-            max_insert_rows_per_statement: 1_500,
+            max_insert_rows_per_statement: Some(
+                std::num::NonZeroUsize::new(1_500).expect("1_500 is nonzero"),
+            ),
             ..engine::sql::parser::DmlLimits::default()
         })
         .with_batch_limits(engine::batch_limits::BatchLimits {

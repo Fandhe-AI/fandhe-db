@@ -132,11 +132,14 @@
 //! 返す。既存 `validate_update` は id 指定形専用のまま無変更）、束縛は
 //! [`parser::bind_update_form`]（`WHERE` 述語表現は [`parser::bind_where_predicates`]
 //! を `SELECT`・集計 `SELECT`・広域取得 `SELECT` と共有し二重実装を作らない）。
-//! 1 文あたりの影響行数上限は [`parser::MAX_DML_AFFECTED_ROWS`]／
-//! [`parser::check_dml_affected_rows`] として用意し（`UPDATE`・`DELETE`
-//! 述語形共通の唯一の上限 API。以前 `DELETE` 側に存在した別系統は Issue #997 で
-//! 本 API へ統合済み）、実行結線（候補行の確定・一括適用・原子性）は
-//! `sql/exec.rs` の `execute_predicate_update`／`execute_predicate_delete` の担当。
+//! 1 文あたりの影響行数上限は [`parser::check_dml_affected_rows_with_limit`]
+//! として用意する（`UPDATE`・`DELETE` 述語形共通の唯一の上限判定 API。以前
+//! `DELETE` 側に存在した別系統は Issue #997 で本 API へ統合済み）。Issue #997
+//! オーナー判断の改訂（2026-09-27・汎用 RDB 整合）により**既定では上限を
+//! 持たない**（[`parser::DmlLimits`] の `None`。`wire-server` 起動時 CLI
+//! フラグ `--max-dml-affected-rows` で明示指定した場合のみ有効化）。実行結線
+//! （候補行の確定・一括適用・原子性）は `sql/exec.rs` の
+//! `execute_predicate_update`／`execute_predicate_delete` の担当。
 
 pub mod aggregate;
 pub mod allowlist;
