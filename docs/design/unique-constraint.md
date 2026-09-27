@@ -163,10 +163,16 @@ DISTINCT・行ヘッダと物理キーのテナント整合検査つき）。1 �
 cascade しない）。
 
 **ファイル形 INSERT**（`replace_typed_rows_by_text_key`。増分インデックス反映・
-TASK-120）: 同じ `path` を持つ複数チャンク行を書く置換書き込みは UNIQUE 制約と
-意味論的に噛み合わないため、UNIQUE 制約を持つテーブルへの書き込みは一意性検査に
-委ねず、書き込み前に一律で fail-closed に拒否する（`22000`。サイレント
-バイパスもしない）。
+TASK-120。UNIQUE 制約テーブルへの対応は Issue #1072）: 旧チャンク行の削除・
+新規行の挿入・D6 の一意性検査（`constraint::enforce_row_constraints_in_txn`）を
+すべて同一 write トランザクション内で行い、削除を検査より先に完了させる。redb の
+write トランザクションは自分が消した行をそのまま読めるため、旧チャンクは検査時の
+母集合から自然に除外される。これにより、同じ `path` への再送は旧チャンクと
+衝突せず成功し、宣言された UNIQUE 制約はそのまま（特別扱いなく）検査される
+（チャンク間で値が変わらない列だけで構成される UNIQUE は、複数チャンクに
+分割されるファイルを新規チャンクどうしの衝突として `23505` で拒否する）。
+違反時は commit 前の `?` でトランザクションごと abort し、台帳記録・削除・
+挿入のいずれも副作用として残らない。
 
 ### D6. エラー契約
 
@@ -210,8 +216,10 @@ CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは
   未 commit 行との重複検出・`TRUNCATE` 後の再挿入、他テナントの値に依存しない
   応答、`Storage::alter_table_add_unique_constraint` の拒否・成功・事後強制、
   `alter_table_drop_column` の依存検査
-- `crates/engine/tests/incremental_index.rs`: UNIQUE 制約付きテーブルへの
-  ファイル形 INSERT の fail-closed 拒否（`22000`・副作用ゼロ）
+- `crates/engine/tests/incremental_index.rs`（Issue #1072）: UNIQUE 制約付き
+  テーブルへのファイル形 INSERT の同一パス再送成功・違反時のロールバック
+  （旧チャンク復元・台帳未記録）・複数チャンクファイルの宣言どおりの `23505`・
+  `body` を含む UNIQUE での複数チャンク成功・NULLS DISTINCT・テナント境界
 - `crates/engine/src/constraint.rs` 単体テスト: NULLS DISTINCT・複合キーの完全
   一致判定とテナント境界・制約追加前の既存行重複判定
 - `crates/engine/src/catalog.rs` 単体テスト: v6 の往復（主キー・`DEFAULT`・墓標と
