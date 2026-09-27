@@ -1894,7 +1894,10 @@ pub(crate) fn upsert_typed_rows_unchecked(
 /// security.md P0）。
 ///
 /// スキーマ取得・次元検証・既存行の所有権判定・書き込みを単一の write トランザクション
-/// 内で行う（[`insert_row`] と同じ TOCTOU 対策）。
+/// 内で行う（[`insert_row`] と同じ TOCTOU 対策）。次元検証は
+/// [`crate::catalog::TableSchema::validate_row_embedding_dim`] を使うため、`VECTOR`
+/// 列を持たないテーブルでは embedding 空（dim 0）の行全体置換のみを受理する
+/// （TABLE-1・Issue #1079）。
 ///
 /// `operation_id` を必須引数として要求し、[`LedgerMode::Ledgered`] で内部ガードして
 /// から [`update_row_unchecked`] へ委譲する（[`insert_row`] と同じ設計。TASK-92・
@@ -1939,7 +1942,7 @@ pub(crate) fn update_row_unchecked(
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
-        schema.validate_embedding_dim(row.embedding.len())?;
+        schema.validate_row_embedding_dim(row.embedding.len())?;
         // エンコードは 1 回のみ（Issue #397）: `for_update` が内部で `encode_row` し、
         // 書き込み側で同じ行をもう一度 `encode_row` していた二重実行を排除する。
         // ここでの `encode_row` は変更前も `owns_existing` 判定より前（台帳ハッシュ
