@@ -851,3 +851,67 @@ fn on_delete_set_null_for_id_reference_with_unrelated_parent_unique_column_succe
         Some(Cell::Null)
     );
 }
+
+// --- `id` 参照 FK・親テーブルが主キー・UNIQUE を一切宣言しない場合の
+// 述語 DELETE（codex-review 指摘・PR #1138）------------------------------------
+//
+// `id` 参照 FK（`REFERENCES parent`。D2）は親テーブルの物理キー `id` を参照先に
+// でき、これは親テーブルが主キー・UNIQUE を一切宣言していなくても成立する。
+// `tenant::delete_rows_where_unchecked`（述語 DELETE・SQL-19）の削除前
+// pre-image 記録要否をこの事実を含めずに（親テーブル自身の主キー・UNIQUE 宣言
+// の有無だけで）判定すると、`needs_fk_removed_pre_image` が偽になり
+// `collect_action_targets` の限定版（`Removed` 分岐）を使えなくなる（`tenant.rs`
+// の `needs_fk_removed_pre_image` 代入箇所のドキュメント参照）。本テストは複数
+// 親行を 1 文でまとめて削除する経路（`delete_rows_where_unchecked`）で、この
+// 判定が新しいカタログ走査を含めても壊れておらず、主キー・UNIQUE 未宣言の親
+// テーブルでも各親行の CASCADE が正しく自分の子行にだけ適用されることを固定
+// する。
+//
+// 注意（708〜721 行目の既存コメントと同じ限界）: 限定版とフォールバック
+// （全走査）が実際に異なる結果を返すのは、削除対象と無関係な孤立行が
+// トランザクション内に既に存在する場合のみ（`INITIALLY DEFERRED` の一時的な
+// 合法孤立行 等）。`DELETE`／`UPDATE` は明示トランザクション内では未対応のため
+// 単一の SQL 文（本テストを含む）だけではその分岐を判別できない——修正前の
+// コードでも本テストは成功する。本テストは「新しい判定条件（カタログ走査）が
+// 既存の正しい CASCADE 適用を壊していない」ことの回帰であり、フォールバックへの
+// 意図しない分岐そのものを再現するものではない。
+#[test]
+fn predicate_delete_cascades_correctly_for_id_reference_when_parent_has_no_key() {
+    let (core, path) = new_core("fkact-id-ref-no-key-predicate-delete");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    // `parents` は主キー・UNIQUE を一切宣言しない（`id` 疑似列のみが参照先）。
+    ok(&core, &sys, "CREATE TABLE parents (group_name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (parent_id BIGINT REFERENCES parents ON DELETE CASCADE, note TEXT)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, group_name) VALUES (1, 'target'), (2, 'target'), (3, 'keep') \
+         USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, parent_id, note) VALUES (10, 1, 'c1'), (11, 2, 'c2'), \
+         (12, 3, 'c3') USING OPERATION_ID 'op-c'",
+    );
+    // 述語一致（`group_name = 'target'`）で親行 1・2 をまとめて削除する
+    // （`delete_rows_where_unchecked`。単一 `id = N` の最適化経路とは別）。
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM parents WHERE group_name = 'target' USING OPERATION_ID 'op-d'",
+    );
+    assert_eq!(row_count(&core, &alice, "parents"), 1);
+    // 削除された親（1・2）の子だけが連鎖削除され、無関係な親（3）の子は残る。
+    assert_eq!(row_count(&core, &alice, "children"), 1);
+    assert_eq!(
+        select_cell(&core, &alice, "children", 12, "note"),
+        Some(Cell::Text("c3".to_string()))
+    );
+}

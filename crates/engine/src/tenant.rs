@@ -3064,23 +3064,37 @@ fn delete_row_impl(
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let mut captured_row: Option<CapturedRow> = None;
     // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
-    // `FOREIGN KEY` の参照先キー（主キー・UNIQUE 構成列）を持ちうる場合のみ、
-    // `remove` の直前に読み取った旧値を積む——`collect_action_targets` の
-    // `Removed` 分岐がこれを使い、「今回削除で実際に失われたキー」のみを
-    // CASCADE 対象へ限定する（`present_keys` を全走査してその時点で親に無い
-    // キー全体を対象にすると、`INITIALLY DEFERRED` の `FOREIGN KEY` が同一
-    // トランザクション内で許す一時的な合法孤立行まで誤って連鎖削除してしまう。
-    // codex-review 指摘）。主キー・UNIQUE を宣言しないテーブルは FK の参照先に
-    // なり得ないため記録コストを払わない（ON UPDATE 側の `pre_images.record`
-    // と同じ判定条件）。
+    // `FOREIGN KEY` の参照先キー（主キー・UNIQUE 構成列、または `id` 参照 FK の
+    // 疑似列 `id`）を持ちうる場合のみ、`remove` の直前に読み取った旧値を積む
+    // ——`collect_action_targets` の `Removed` 分岐がこれを使い、「今回削除で
+    // 実際に失われたキー」のみを CASCADE 対象へ限定する（`present_keys` を
+    // 全走査してその時点で親に無いキー全体を対象にすると、`INITIALLY DEFERRED`
+    // の `FOREIGN KEY` が同一トランザクション内で許す一時的な合法孤立行まで
+    // 誤って連鎖削除してしまう。codex-review 指摘）。
+    //
+    // 判定条件は「主キー・UNIQUE を宣言する」だけでは不十分（codex-review
+    // 指摘・PR #1138）: `id` 参照 FK（`REFERENCES parent` で参照先列を省略した
+    // 宣言。D2）は物理キー `id` を参照先にでき、これは親テーブルが主キー・
+    // UNIQUE を一切宣言していなくても成立する。この場合を見落とすと
+    // `needs_fk_removed_pre_image` が偽になり、上記の限定版を使えず全走査
+    // フォールバックへ落ちて、無関係な親行の DELETE が同一トランザクション内の
+    // 一時的な孤立行まで連鎖削除しうる。そのため「自テーブルに主キー・UNIQUE が
+    // ある」に加え、「他テーブルが自テーブルを `id` 参照 FK で参照している」も
+    // 条件に含める（`referencing_foreign_keys_in_txn` でカタログを走査し、
+    // `fk.references_parent_id()` を持つものが 1 件でもあれば真）。ON UPDATE 側の
+    // `pre_images.record` は `id` 参照 FK が ON UPDATE で発火しない（A7）ため
+    // この考慮が不要——判定条件が異なる。
     let needs_fk_removed_pre_image;
     let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
     let (owns_existing, schema) = {
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
         // `insert_row`/`update_row` と同じ前段を通す。
         let schema = require_table_schema_write(&write_txn, table)?;
-        needs_fk_removed_pre_image =
-            schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
+        needs_fk_removed_pre_image = schema.primary_key().is_some()
+            || !schema.unique_constraints().is_empty()
+            || crate::catalog::referencing_foreign_keys_in_txn(&write_txn, table)?
+                .iter()
+                .any(|(_, fk)| fk.references_parent_id());
         if let Some(expected) = capture.as_ref() {
             if expected.schema != &schema {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -3569,11 +3583,15 @@ pub(crate) fn delete_rows_where_unchecked<E>(
     }
 
     // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`
-    // と同じ判定条件・同じ理由（`removed_pre_images` のドキュメント参照）で、
-    // 主キー・UNIQUE を宣言するテーブルのみ `remove` の戻り値（削除前の物理行）
-    // から旧値を復元して積む。
-    let needs_fk_removed_pre_image =
-        schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
+    // と同じ判定条件・同じ理由（`removed_pre_images` のドキュメント参照。
+    // `id` 参照 FK を考慮する PR #1138 の修正を含む）で `remove` の戻り値
+    // （削除前の物理行）から旧値を復元して積む。
+    let needs_fk_removed_pre_image = schema.primary_key().is_some()
+        || !schema.unique_constraints().is_empty()
+        || crate::catalog::referencing_foreign_keys_in_txn(&write_txn, table)
+            .map_err(dml_write_err)?
+            .iter()
+            .any(|(_, fk)| fk.references_parent_id());
     let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
     {
         let row_table_name = user_rows_table_name(table);
@@ -4103,13 +4121,16 @@ pub(crate) fn replace_typed_rows_by_text_key(
 
         // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`・
         // `delete_rows_where_unchecked` と同じ判定条件・同じ理由
-        // （`removed_pre_images` のドキュメント参照）で、主キー・UNIQUE を宣言する
-        // テーブルのみ `remove` の戻り値（削除前の物理行）から旧値を復元して積む。
-        // `needs_fk_removed_pre_image`・`removed_pre_images` は本クロージャの外で
-        // 宣言し可変参照で捕捉する（`ReplaceOutcome` は他クレートも参照する
-        // 公開構造体のため、フィールド追加で契約を広げない）。
-        needs_fk_removed_pre_image =
-            schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
+        // （`removed_pre_images` のドキュメント参照。`id` 参照 FK を考慮する
+        // PR #1138 の修正を含む）で `remove` の戻り値（削除前の物理行）から
+        // 旧値を復元して積む。`needs_fk_removed_pre_image`・`removed_pre_images`
+        // は本クロージャの外で宣言し可変参照で捕捉する（`ReplaceOutcome` は
+        // 他クレートも参照する公開構造体のため、フィールド追加で契約を広げない）。
+        needs_fk_removed_pre_image = schema.primary_key().is_some()
+            || !schema.unique_constraints().is_empty()
+            || crate::catalog::referencing_foreign_keys_in_txn(&write_txn, table)?
+                .iter()
+                .any(|(_, fk)| fk.references_parent_id());
         for id in &to_remove {
             let removed_guard = row_table
                 .remove(&(tenant, *id))
