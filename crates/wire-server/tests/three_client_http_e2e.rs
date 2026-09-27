@@ -2976,6 +2976,27 @@ fn seed_empty_db_no_table(label: &str) -> (PathBuf, temp_db::CleanupGuard) {
 /// パリティ・RLS 非漏えいは層 A（`nosql12_update_delete.rs` 述語形節）が
 /// 固定済みのため、本ファイルでは表層横断の insert／DDL 到達性確認に
 /// 絞った（`docs/design/three-client-e2e-harness.md` Issue #950 節に記録）。
+///
+/// [`run_phase7_write_parity_scenario`] が実際に送信する JSON 本文（宣言順。
+/// `create_table` → `drop_table`（bob 拒否）→ `insert` ×2 → `alter_table` →
+/// 述語形 `delete` → `scan` ×2）。`parity_matrix_covers_every_nosql_op` が
+/// この配列と `PARITY_CASES`／`REJECTION_CASES`／`DML_STEPS`／`BOB_STEP` の
+/// `json_body` から実使用の `op` 値を収集して `Op::ALL` 網羅を固定するため、
+/// 関数内へ文字列リテラルを直書きせず本配列を参照させる（レビュー指摘
+/// Issue #950: ソース全文への `contains` 判定では実行対象のケース定義から
+/// 外れた文字列一致まで拾ってしまい網羅漏れを検知できないため、実際に
+/// 送信される値そのものを単一情報源にする）。
+const PHASE7_WRITE_CASES: &[&str] = &[
+    r#"{"op":"create_table","table":"widgets","columns":[{"name":"name","type":"text"},{"name":"qty","type":"integer"}]}"#,
+    r#"{"op":"drop_table","table":"widgets"}"#,
+    r#"{"op":"insert","table":"widgets","rows":[{"id":1,"name":"gadget","qty":5}],"operation_id":"op-insert-1"}"#,
+    r#"{"op":"insert","table":"widgets","rows":[{"id":2,"name":"sprocket","qty":9}],"operation_id":"op-insert-2"}"#,
+    r#"{"op":"alter_table","table":"widgets","add_column":{"name":"note","type":"text"}}"#,
+    r#"{"op":"delete","table":"widgets","filter":[{"column":"name","op":"eq","value":"sprocket"}],"operation_id":"op-del-1"}"#,
+    r#"{"op":"scan","table":"widgets","limit":100,"columns":["id","name","qty","note"]}"#,
+    r#"{"op":"scan","table":"widgets","limit":1}"#,
+];
+
 fn run_phase7_write_parity_scenario(client: HttpClient) {
     let client_version = client.version();
     let psql_version = psql_version();
@@ -3155,59 +3176,31 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         )
     };
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"create_table","table":"widgets","columns":[{"name":"name","type":"text"},{"name":"qty","type":"integer"}]}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[0], &mut seq);
     assert_eq!(status, 200, "NoSQL create_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
 
-    let (status, body) = query(
-        &bob_token,
-        r#"{"op":"drop_table","table":"widgets"}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&bob_token, PHASE7_WRITE_CASES[1], &mut seq);
     assert_ne!(status, 200, "bob drop_table unexpectedly succeeded: {body}");
     assert_eq!(nosql_wire_code_of(&body), "42501", "bob drop_table: {body}");
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"insert","table":"widgets","rows":[{"id":1,"name":"gadget","qty":5}],"operation_id":"op-insert-1"}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[2], &mut seq);
     assert_eq!(status, 200, "NoSQL insert 1: {body}");
     assert_eq!(affected_count_from_nosql_body(&body), 1);
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"insert","table":"widgets","rows":[{"id":2,"name":"sprocket","qty":9}],"operation_id":"op-insert-2"}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[3], &mut seq);
     assert_eq!(status, 200, "NoSQL insert 2: {body}");
     assert_eq!(affected_count_from_nosql_body(&body), 1);
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"alter_table","table":"widgets","add_column":{"name":"note","type":"text"}}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[4], &mut seq);
     assert_eq!(status, 200, "NoSQL alter_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"delete","table":"widgets","filter":[{"column":"name","op":"eq","value":"sprocket"}],"operation_id":"op-del-1"}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[5], &mut seq);
     assert_eq!(status, 200, "NoSQL predicate delete: {body}");
     assert_eq!(affected_count_from_nosql_body(&body), 1);
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"scan","table":"widgets","limit":100,"columns":["id","name","qty","note"]}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[6], &mut seq);
     assert_eq!(status, 200, "NoSQL read-back: {body}");
     let result_obj = json_object(&body);
     let rows_json = match result_obj.get("rows") {
@@ -3239,19 +3232,11 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         "read-back after predicate delete must match between SQL and NoSQL surfaces"
     );
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"drop_table","table":"widgets"}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[1], &mut seq);
     assert_eq!(status, 200, "NoSQL drop_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
 
-    let (status, body) = query(
-        &alice_token,
-        r#"{"op":"scan","table":"widgets","limit":1}"#,
-        &mut seq,
-    );
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[7], &mut seq);
     assert_ne!(status, 200, "post-drop scan unexpectedly succeeded: {body}");
     assert_eq!(nosql_wire_code_of(&body), "42P01", "post-drop scan: {body}");
 
@@ -3292,38 +3277,67 @@ fn fetch_matches_psql_on_insert_ddl_and_predicate_delete() {
     run_phase7_write_parity_scenario(HttpClient::Fetch);
 }
 
+/// `json_body`（`r#"{"op":"<name>",...}"#` 形の静的文字列）から `op` フィールド
+/// の値を取り出す。[`PARITY_CASES`]・[`REJECTION_CASES`]・[`DML_STEPS`]・
+/// [`BOB_STEP`]・[`PHASE7_WRITE_CASES`] はいずれもこの形を前提にしており
+/// （本ファイルの各定義を参照）、値そのものは各ケース定義から取得するため
+/// untrusted 入力ではない。想定形から外れる場合は本ファイルの前提が崩れた
+/// ことを示すので `panic!` で即座に検知する（fail-closed）。
+fn op_name_from_json_body(json_body: &str) -> &str {
+    let after_key = json_body
+        .split_once("\"op\":\"")
+        .unwrap_or_else(|| panic!("json_body has no \"op\" field: {json_body}"))
+        .1;
+    after_key
+        .split_once('"')
+        .unwrap_or_else(|| panic!("json_body has malformed \"op\" field: {json_body}"))
+        .0
+}
+
 /// 全 [`Op`] 語彙が本ファイル（Issue #950）の層 B パリティケースのいずれかで
 /// 最低 1 回使われていることを機械的に固定する（`#[ignore]` を付けない・
 /// `make ci` で常時実行。`.claude/rules/coding-rust.md`「テストの skip・
 /// ignore・アサーション弱体化で CI を通さない」の精神を、層 B カバレッジの
 /// 陳腐化検知としても適用する）。
 ///
-/// レビュー指摘（Issue #950）: 旧実装は手動維持の固定文字列配列
-/// （`EXERCISED_BY_PARITY_MATRIX`）と `Op::ALL` の名前集合を突き合わせる
-/// だけで、その文字列が実際に `PARITY_CASES`／`REJECTION_CASES`／
-/// `run_phase7_write_parity_scenario` の JSON ボディで使われているかまでは
-/// 検査していなかった（配列の更新漏れ・誤記が検知できない）。本実装では
-/// `include_str!` で本ファイル自身のソーステキストを検査対象にし、各
-/// `Op::name()` に対応する `"op":"<name>"` リテラルが実際に出現するかを
-/// 直接判定することで、手動維持配列を廃し実使用箇所と直結させる。
+/// レビュー指摘（Issue #950・PR #1135）: 旧実装は本ファイルのソーステキスト
+/// 全体（`include_str!`）に対して `"op":"<name>"` の文字列出現を
+/// `str::contains` で判定していた。この方式ではコメント・実行されない
+/// コード・別目的の箇所に同じリテラルが残っているだけで通ってしまい、
+/// 該当する層 B ケースが削除・無効化されても検知できない。本実装では
+/// ソース全文の grep をやめ、[`PARITY_CASES`]・[`REJECTION_CASES`]・
+/// [`DML_STEPS`]・[`BOB_STEP`]・[`PHASE7_WRITE_CASES`]——各シナリオ関数が
+/// 実際に反復・送信するケース定義の値そのもの——から
+/// [`op_name_from_json_body`] で `op` 値を収集し、その集合に対して
+/// `Op::ALL` の網羅を判定する。ケース定義の削除・改変は収集元の値ごと
+/// 消えるため、コメント等への残存では回避できない。
 #[test]
 fn parity_matrix_covers_every_nosql_op() {
+    use std::collections::BTreeSet;
     use wire_server::http::query::op::Op;
 
-    // 本ファイル自身のソーステキスト（コンパイル時に埋め込み）。
-    // `PARITY_CASES`・`REJECTION_CASES`・`run_phase7_write_parity_scenario`
-    // はいずれも `json_body: r#"{"op":"<name>",...}"#` 形の静的文字列で op を
-    // 指定するため、そのリテラル出現を直接 grep すれば実使用を検査できる。
-    let source = include_str!("three_client_http_e2e.rs");
+    let mut exercised: BTreeSet<&str> = BTreeSet::new();
+    for case in PARITY_CASES {
+        exercised.insert(op_name_from_json_body(case.json_body));
+    }
+    for (_label, json_body, _expected_wire_code) in REJECTION_CASES {
+        exercised.insert(op_name_from_json_body(json_body));
+    }
+    for step in DML_STEPS {
+        exercised.insert(op_name_from_json_body(step.json_body));
+    }
+    exercised.insert(op_name_from_json_body(BOB_STEP.json_body));
+    for json_body in PHASE7_WRITE_CASES {
+        exercised.insert(op_name_from_json_body(json_body));
+    }
 
     for op in Op::ALL {
         let name = op.name();
-        let needle = format!("\"op\":\"{name}\"");
         assert!(
-            source.contains(needle.as_str()),
-            "Op::{name} is not exercised by any Issue #950 layer B parity case in this file \
-             (no literal occurrence of {needle:?} found); add a three_client_http_e2e.rs case \
-             using it"
+            exercised.contains(name),
+            "Op::{name} is not exercised by any Issue #950 layer B parity case definition \
+             (PARITY_CASES/REJECTION_CASES/DML_STEPS/BOB_STEP/PHASE7_WRITE_CASES); add a \
+             three_client_http_e2e.rs case using it"
         );
     }
 }
