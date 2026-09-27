@@ -1411,10 +1411,11 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
     /// `match` はワイルドカードアームの追加が必要（`Scan` 追加時と同じ運用）。
     SetOperation(ValidatedSetOperation),
-    /// `INNER JOIN`（2 テーブル等価結合。Issue #925・SQL-28・RLS-10、TASK-212）。
-    /// 束縛・実行本体は `sql::join` が担う（`sql::set_op` と同じく第 2 の実行器を
-    /// 作らず、既存の広域取得経路〔`sql::scan::execute_scan_with_budget`〕を
-    /// 両辺で独立に通す設計。`docs/design/inner-join.md` 参照）。
+    /// `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`（2 テーブル等価結合。Issue #925・
+    /// #926・SQL-28・RLS-10、TASK-212）。束縛・実行本体は `sql::join` が担う
+    /// （`sql::set_op` と同じく第 2 の実行器を作らず、既存の広域取得経路
+    /// 〔`sql::scan::execute_scan_with_budget`〕を両辺で独立に通す設計。
+    /// `docs/design/inner-join.md`・`docs/design/outer-join.md` 参照）。
     ///
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
     /// `match` はワイルドカードアームの追加が必要（`SetOperation` 追加時と同じ
@@ -1471,15 +1472,29 @@ pub(crate) const MAX_JOIN_CONDITIONS: usize = 8;
 /// 超過は `54000`。
 pub(crate) const MAX_JOIN_WHERE_CONJUNCTS: usize = MAX_WHERE_LEAVES;
 
-/// 許可形状の構造判定を通過した `INNER JOIN` 文（Issue #925・SQL-28・RLS-10、
-/// TASK-212）。束縛（列解決・型検証・WHERE プッシュダウン）・実行（ハッシュ結合・
-/// RLS 独立適用・行数上限）は `sql::join` の責務（本モジュールは構造情報のみを
-/// 保証する）。
+/// JOIN の結合種別（Issue #926・SQL-28）。`Inner` は #925 の既定挙動（保存側
+/// なし）。`Left`／`Right`／`Full` は該当側を保存側として NULL 補完する
+/// （`sql::join::JoinPlan::preserve_left`／`preserve_right` の判定は
+/// `sql::join::build_plan` の責務。`docs/design/outer-join.md` 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// 許可形状の構造判定を通過した JOIN 文（Issue #925・#926・SQL-28・RLS-10、
+/// TASK-212）。束縛（列解決・型検証・WHERE プッシュダウン／簡約）・実行
+/// （ハッシュ結合・RLS 独立適用・行数上限・NULL 補完）は `sql::join` の責務
+/// （本モジュールは構造情報のみを保証する）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedJoin {
     /// FROM に指定された 2 つのテーブル参照（カタログ存在確認・ビュー拒否済み。
     /// 常に長さ 2）。
     pub(crate) relations: Vec<TableRef>,
+    /// 結合種別（Issue #926）。`Inner` の場合は #925 と完全に同じ挙動になる。
+    pub(crate) kind: JoinKind,
     /// `ON` の等値結合条件（`AND` 結合順。常に 1 個以上、[`MAX_JOIN_CONDITIONS`]
     /// 以下）。
     pub(crate) on: Vec<(ColumnRef, ColumnRef)>,
@@ -5831,7 +5846,7 @@ fn starts_with_select_after_parens(tokens: &[Token]) -> bool {
     matches!(tokens.get(i), Some(Token::Keyword(Keyword::Select)))
 }
 
-/// `INNER JOIN`（Issue #925・SQL-28・RLS-10、TASK-212）の予約文脈語（別名として
+/// `JOIN`（Issue #925・#926・SQL-28・RLS-10、TASK-212）の予約文脈語（別名として
 /// 使えない語。大小文字を区別しない）。既存の `FROM t USING PLAN(...)` の
 /// `USING` を別名と誤認しないための一覧でもある。
 const JOIN_RESERVED_ALIAS_WORDS: &[&str] = &[
@@ -5846,11 +5861,12 @@ fn is_join_reserved_word(w: &str) -> bool {
 }
 
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
-/// §2.2）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定より前に
-/// 呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
+/// §2.2・#926）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
+/// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
 /// (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|NATURAL)` の並びのときのみ真になる
-/// （外部結合キーワードも検出して `parse_join_statement` 側で `42601` に
-/// 分類させる——構文段の判定順序〔`42601` が `42P01` に先行する〕を保つため）。
+/// （`CROSS`・`NATURAL`〔対象外〕も検出して `parse_join_statement` 側で
+/// `42601` に分類させる——構文段の判定順序〔`42601` が `42P01` に先行する〕を
+/// 保つため。`LEFT`／`RIGHT`／`FULL [OUTER]` は Issue #926 で受理対象になった）。
 pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
     if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
         return false;
@@ -6075,12 +6091,12 @@ fn parse_join_where_conjuncts(
     Ok(preds)
 }
 
-/// `INNER JOIN`（2 テーブル等価結合。Issue #925・SQL-28・RLS-10、TASK-212）の
-/// 許可形状を先頭から再帰下降で判定する。[`looks_like_join`] が真を返した文に
-///対してのみ呼ばれる。構文の完全な解析（`42601`）→ 各テーブル参照のカタログ
-/// 存在確認・ビュー拒否（`42P01`・`42601`）の順で検証する（§2.5 のエラー優先
-/// 順位）。列解決・型検証・WHERE プッシュダウンは束縛段（`sql::join::bind_join`）
-/// の責務。
+/// `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`（2 テーブル等価結合。Issue #925・
+/// #926・SQL-28・RLS-10、TASK-212）の許可形状を先頭から再帰下降で判定する。
+/// [`looks_like_join`] が真を返した文に対してのみ呼ばれる。構文の完全な解析
+/// （`42601`）→ 各テーブル参照のカタログ存在確認・ビュー拒否（`42P01`・
+/// `42601`）の順で検証する（§2.5 のエラー優先順位）。列解決・型検証・WHERE
+/// プッシュダウン／簡約は束縛段（`sql::join::build_plan`）の責務。
 fn parse_join_statement(
     tokens: &[Token],
     lookup: &impl TableLookup,
@@ -6091,18 +6107,43 @@ fn parse_join_statement(
     p.expect_keyword(Keyword::From)?;
     let left = p.parse_join_relation()?;
 
-    if p.peek_ident_matches("INNER") {
+    let kind = if p.peek_ident_matches("INNER") {
         p.advance();
         p.expect_ident_matching("JOIN")?;
+        JoinKind::Inner
     } else if p.peek_ident_matches("JOIN") {
         p.advance();
+        JoinKind::Inner
+    } else if p.peek_ident_matches("LEFT") {
+        p.advance();
+        if p.peek_ident_matches("OUTER") {
+            p.advance();
+        }
+        p.expect_ident_matching("JOIN")?;
+        JoinKind::Left
+    } else if p.peek_ident_matches("RIGHT") {
+        p.advance();
+        if p.peek_ident_matches("OUTER") {
+            p.advance();
+        }
+        p.expect_ident_matching("JOIN")?;
+        JoinKind::Right
+    } else if p.peek_ident_matches("FULL") {
+        p.advance();
+        if p.peek_ident_matches("OUTER") {
+            p.advance();
+        }
+        p.expect_ident_matching("JOIN")?;
+        JoinKind::Full
     } else {
-        // `LEFT`／`RIGHT`／`FULL [OUTER]`／`CROSS`／`NATURAL` JOIN（外部結合・
-        // 直積）は本 Issue の対象外（#926 の管轄）。fail-closed に `42601`。
+        // `CROSS`／`NATURAL` JOIN（直積・自然結合）、および単独の `OUTER
+        // JOIN`（`LEFT`／`RIGHT`／`FULL` を伴わない形）は対象外（fail-closed に
+        // `42601`）。`USING (...)` は `ON` の代わりに `p.expect_ident_matching
+        // ("ON")` が失敗する形で自然に `42601` になる。
         return Err(SqlSurfaceError::unsupported(
-            "only INNER JOIN (or bare JOIN) is supported",
+            "only INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
         ));
-    }
+    };
 
     let right = p.parse_join_relation()?;
     if left.exposed_name() == right.exposed_name() {
@@ -6143,6 +6184,7 @@ fn parse_join_statement(
 
     Ok(ValidatedJoin {
         relations,
+        kind,
         on,
         projection,
         where_conjuncts,
