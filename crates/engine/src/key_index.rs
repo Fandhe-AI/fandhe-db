@@ -30,7 +30,7 @@
 //! 共有する。`FOREIGN KEY` が `id` 疑似列を参照する場合も、子列（`INTEGER`／
 //! `BIGINT`）の値をそのまま同じ正準エンコードで索引化する——参照先の `id` は
 //! 常に子列と同じ数値としてしか比較され得ないため、`id` 専用の別エンコードは
-//! 不要（[`id_key_bytes`] が `u64` の物理 id を子列の型へ変換してから
+//! 不要（[`parent_id_key_bytes`] が `u64` の物理 id を子列の型へ変換してから
 //! [`crate::constraint::push_canonical_component`] へ渡す）。
 //!
 //! # テナント境界（RLS-9・RLS-10 (c)）
