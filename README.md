@@ -72,6 +72,7 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>] \
   [--durability immediate|none] \
+  [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>] \
@@ -211,6 +212,21 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 含意を運用者が見落とさないよう、`none` を選んだ場合に限り起動ログへ英語の
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
+
+`--max-dml-affected-rows`・`--max-insert-rows`（Issue #997）は、それぞれ
+述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の 1 文あたり影響行数上限・
+複数行 `VALUES` の 1 文あたり行数上限を、プロセス全体に対して設定する
+opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
+起動時にのみ明示指定する注入点」で、セッション・テナント単位では設定でき
+ません。未指定時の既定値はいずれも現行挙動と同じ `1,000`、指定可能範囲は
+`1`〜`1,000,000`（総走査行数上限と同値）です。範囲外の値・非数値・値欠落・
+2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、既定へ
+黙って読み替わることはありません。上限超過時の応答（`wire_code` `54000`・
+副作用ゼロ）自体の契約は変わらず、`detail` に表示される上限値が設定値に
+なるだけです。複数行 `VALUES` は本フラグに加えて一括投入の別上限
+（`self.batch_limits.max_files_per_batch`。既定 64。Issue #860）も通るため、
+1,000 行を超える単一の複数行 `VALUES` を受理させるには両方を引き上げる
+必要があります（詳細: `docs/design/predicate-dml-exec.md` §6）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス

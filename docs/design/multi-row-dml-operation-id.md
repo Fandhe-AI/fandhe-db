@@ -439,11 +439,13 @@ SQL 表層と NoSQL 表層のどちらから送っても同一ハッシュ空間
    応答も可視行数に依存させない）。
 3. テナント所有範囲（`(tenant, 0)..=(tenant, u64::MAX)`）を走査し、
    `is_owner` 判定と述語（`ExprProgram::compile` した式評価を含む）で
-   候補行を確定する。`MAX_DML_AFFECTED_ROWS + 1` 件で列挙を打ち切る
-   （`check_dml_affected_rows` の入力契約と同じ「打ち切った列挙結果を
-   渡す」設計）。
-4. `check_dml_affected_rows`（`UPDATE`・`DELETE` 共通の唯一の上限 API。
-   Issue #997 で統合済み）を**変更を開始する前**に呼ぶ。超過時はトランザクションを drop する
+   候補行を確定する。`limit + 1` 件で列挙を打ち切る（`limit` は
+   `EngineCore::dml_limits.max_affected_rows`。Issue #997 でプロセス全体の
+   CLI 起動時設定値まで一般化した。`check_dml_affected_rows_with_limit` の
+   入力契約と同じ「打ち切った列挙結果を渡す」設計）。
+4. `check_dml_affected_rows_with_limit(count, limit)`（`UPDATE`・`DELETE`
+   共通の唯一の上限 API。Issue #997 で統合・CLI 設定可能化）を**変更を開始
+   する前**に呼ぶ。超過時はトランザクションを drop する
    （台帳エントリ・行変更のいずれも残らない。INDEX-4 の `54000` と同じ
    「副作用ゼロで拒否」の扱い）。
 5. 候補行すべてへ変更を適用する。
@@ -480,8 +482,11 @@ RECOVER-5／RECOVER-6 の既存ガード（`recovery::commit_boundary`・
 `check_affected_row_count(count, limit)` という、シグネチャの異なる 2 つの
 上限 API に並立していた（いずれも `crates/engine/src/sql/parser.rs`）。
 Issue #871 実装時の申し送り事項だったこの並立は Issue #997 で
-`MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows` へ統合し、`DELETE` 側の
-別系統は削除した（詳細・既定値の確定は
+`check_dml_affected_rows_with_limit` へ統合し、`DELETE` 側の別系統は削除した
+（既存 pub API `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows` は
+`with_limit` 版への薄い委譲として維持）。同 Issue でオーナー判断
+（2026-09-27）により、この上限をプロセス全体に対して `wire-server` の
+起動時 CLI フラグで設定可能にした（詳細・既定値・指定可能範囲の確定は
 `docs/design/predicate-dml-exec.md` §6 参照）。
 
 ## 7. 単一行 `UPDATE` 実行結線（Issue #865）への申し送り

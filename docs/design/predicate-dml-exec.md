@@ -146,32 +146,82 @@ validate_delete_statement_tokens`／`validate_update_form_tokens` が呼び出�
 （`22000`。`sql/scan.rs` と同じ失敗点） → 内容照合ハッシュ計算（WASM UDF 呼び出し
 の拒否・`42601`） → 実行本体（台帳照合 `23505`／`22023`・上限超過 `54000`）。
 
-## 6. 上限 API の統合と既定値（Issue #997。既定値決定の正本）
+## 6. 上限 API の統合と既定値・CLI 設定可能化（Issue #997。オーナー判断 2026-09-27 の正本）
 
 以前は `DELETE` 側が `DEFAULT_MAX_DML_AFFECTED_ROWS`＋`check_affected_row_count(count,
 limit)`、`UPDATE` 側が `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(count)`と
 いう、シグネチャの異なる 2 つの上限 API に並立していた（申し送り。ADR §6）。
-Issue #997 でこれを解消し、以下へ統合済み:
+Issue #997 でこれを解消し、以下へ統合済み（PR #1116 で API の統合のみ先行実装した
+後、本節はオーナー判断〔2026-09-27〕により CLI 設定可能化まで含めて更新した）:
 
-- **唯一の上限 API**: `crates/engine/src/sql/parser.rs` の
-  `MAX_DML_AFFECTED_ROWS`（`pub const usize`）＋
-  `check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>`。
-  `UPDATE`・`DELETE`（述語形）の両実行結線（`sql/exec.rs` の
-  `execute_predicate_update`／`execute_predicate_delete`）がこれを直接参照する。
-  `DEFAULT_MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`・
-  `BoundPredicateDelete::max_affected_rows()`（および `BoundPredicateDelete::new`
-  の同名引数）は削除した（破壊的変更）。
-- **既定値**: `1,000`（本リポの実装既定値であり、spec 由来の数値ではない）。
-- **設定可能化**: CLI・セッション単位などの設定機構は導入しない。この既定値・
-  非設定化は**オーナー判断待ちの暫定確定**であり、オーナーが後から見直せる。
-  将来設定可能にする場合の接続点は、既存の
-  `tenant::delete_rows_where_unchecked`／`update_rows_where_unchecked` の
-  `limit: usize` 引数（`pub(crate)`）とする。
+- **唯一の判定 API**: `crates/engine/src/sql/parser.rs` の
+  `check_dml_affected_rows_with_limit(count: usize, limit: usize) -> Result<(),
+  SqlSurfaceError>`。`UPDATE`・`DELETE`（述語形）の両実行結線（`sql/exec.rs` の
+  `execute_predicate_update`／`execute_predicate_delete`）が、呼び出し元
+  （`core.rs::EngineCore` の `execute_predicate_update_form`／
+  `execute_predicate_delete_form`）から渡された `max_affected_rows: usize` 引数
+  （`self.dml_limits.max_affected_rows`）とともにこれを呼ぶ。既存 pub API
+  `MAX_DML_AFFECTED_ROWS`（`pub const usize` ＝ 1,000）・
+  `check_dml_affected_rows(count: usize)` はいずれも削除せず、`with_limit` 版へ
+  `MAX_DML_AFFECTED_ROWS` を固定して渡す薄い委譲として維持する（pub API を壊さない
+  設計判断。`DEFAULT_MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`・
+  `BoundPredicateDelete::max_affected_rows()`〔および `BoundPredicateDelete::new`
+  の同名引数〕は PR #1116 の時点で削除済み〔破壊的変更〕のまま）。
+- **設定可能化**: オーナー判断（2026-09-27）により、プロセス全体の上限を
+  `wire-server` 起動時 CLI フラグで設定可能にした（セッション・テナント単位は
+  対象外）。`crates/engine/src/sql/parser.rs::DmlLimits`
+  （`max_affected_rows`・`max_insert_rows_per_statement` の 2 フィールド）を
+  `core.rs::EngineCore::with_dml_limits`（`crate::batch_limits::BatchLimits` と
+  同じビルダー流儀）経由で注入する。`wire-server` 側は
+  `crates/wire-server/src/dml_limits_opt.rs` が `--max-dml-affected-rows`・
+  `--max-insert-rows` の 2 フラグを解析し、`main.rs` が起動時に 1 回だけ
+  `core.with_dml_limits(..)` を呼ぶ。
+- **既定値・指定可能範囲**: 既定値はいずれも `1,000`（本リポの実装既定値であり、
+  spec 由来の数値ではない。現行挙動を維持）。指定可能範囲は `1..=1,000,000`
+  （`crate::tenant::MAX_SCANNED_ROWS`＝総走査行数上限と同値。定数を共有し値の
+  ドリフトを防ぐ）。範囲外・非数値・多重指定はいずれも起動時に fail-closed で
+  拒否する（`engine::sql::parser::validate_dml_row_limit` が範囲判定、
+  `dml_limits_opt::parse_strict_decimal` が untrusted な CLI 文字列の厳密パース、
+  `main.rs` の引数走査ループが多重指定拒否を担う——他の閉じた語彙フラグ
+  〔`--search-engine` 等〕と同じ「2 回目以降の指定を fail-closed に拒否する」
+  流儀）。
 - **契約は不変**: 上限超過は `54000`（`SqlSurfaceError::PayloadTooLarge`）・
   副作用ゼロ（write トランザクション drop・台帳未記録。RECOVER-11）。`detail` は
-  件数と上限のみを含め、テナント・行内容には触れない。統合に伴い `detail` の
-  文言は `DELETE` 側の形式（`DML affected row count {count} exceeds limit
-  {MAX_DML_AFFECTED_ROWS}`）へ統一した（既存テストは文言をアサートしていない）。
+  件数と設定値の上限のみを含め、テナント・行内容には触れない（文言の形式自体は
+  変えない。表示される数値が設定値になる）。
+- **INSERT 側との対称性**: 複数行 `VALUES` の 1 文あたり行数上限
+  （`sql::allowlist::MAX_INSERT_ROWS_PER_STATEMENT`。SQL-16・TASK-190）も同じ
+  `DmlLimits`・同じ CLI 起動時設定の仕組みで揃えた。構文解析段（`Parser::
+  parse_insert`）が判定するため、`Parser` に `max_insert_rows` フィールドを追加し
+  （既定値は同定数。`Parser::new` の初期化のみで既存 30 箇所超の呼び出しに影響を
+  与えない）、`validate_insert_tokens_with_limit`（`pub(crate)`）・
+  `validate_insert_with_limit`（`pub`。`validate_insert` は本関数へ既定値を
+  渡すだけの薄い委譲）を新設して `core.rs` の 3 つの INSERT 実行エントリポイント
+  （`execute_insert_sql`・`parse_tokens` の INSERT 分岐・`execute_insert_sql_batch`）
+  すべてから到達させた。
+- **`batch_limits.max_files_per_batch` との二重ゲート**: 複数行 `VALUES`
+  （`BoundInsertForm::RowBatch`）は本節の `max_insert_rows_per_statement`
+  （構文解析段）に加え、`self.batch_limits.max_files_per_batch`（既定 64。
+  Issue #860 SQL/NoSQL 機能パリティ。`Self::validate_insert_row_batch_limits`）
+  の 2 つの独立した上限を通る。`max_insert_rows_per_statement` を引き上げただけ
+  では既定 64 行を超える複数行 `VALUES` は `batch_limits` 側で `54000` になる
+  ため、1,000 行超を単一の複数行 `VALUES` で受理させるテストでは両方を引き上げる
+  必要がある（`crates/engine/tests/insert_multi_row.rs::
+  multi_row_insert_respects_configured_higher_insert_row_limit` 参照）。
+- **NoSQL（HTTP）表層・ファイル形 INSERT は対象外（理由）**: NoSQL 表層の
+  `delete`／`update` op はいずれも単一行形（`BoundDelete`／
+  `execute_update_with_schema`）を経由し、述語形 DML
+  （`execute_predicate_delete`／`execute_predicate_update`）へ到達しないため
+  `max_affected_rows` の対象外（`grep -rn "BoundPredicateDelete\|
+  BoundPredicateUpdate" crates/wire-server/src` は 0 件。将来 NoSQL 側が
+  `BoundPredicateDelete::new` 経由で述語形 DELETE を追加した場合も、同じ
+  process-wide 設定値を自動的に共有する設計にしてある）。NoSQL `insert` op は
+  `max_insert_rows_per_statement`（構文解析段の上限）自体を経由せず、既存の
+  `batch_limits.max_files_per_batch` のみで行数を制御する（SQL 表層の複数行
+  `VALUES` と同じ土俵——上記の二重ゲート注記参照）。ファイル形 INSERT
+  （`execute_file_insert`）は 1 文＝1 ファイルであり複数行 `VALUES` 構文を
+  持たないため `max_insert_rows_per_statement` の対象外（チャンク数・バイト量の
+  上限は `incremental.rs`／`batch_limits.rs` が別途担う）。
 
 ## 7. PR #989（#865 単一行 UPDATE 実行結線）・PR #991（RETURNING）との整合ルール
 
@@ -213,7 +263,27 @@ Issue #997 でこれを解消し、以下へ統合済み:
   影響行数上限超過（`54000`・副作用ゼロ。DELETE 側
   `predicate_delete_over_limit_is_rejected_with_no_side_effects`・UPDATE 側
   `predicate_update_over_limit_is_rejected_with_no_side_effects`——DELETE・
-  UPDATE が同一上限 API（§6。Issue #997 で統合）を共有することを両経路で固定）。
+  UPDATE が同一上限 API（§6。Issue #997 で統合）を共有することを両経路で固定）・
+  CLI 起動時設定値の反映（`EngineCore::with_dml_limits` 経由。既定値より低い
+  設定で少数行でも `54000` になること・既定値より高い設定で 1,000 件超でも
+  成功すること——DELETE・UPDATE それぞれ引き上げ・引き下げの両方向を
+  `predicate_delete_respects_configured_lower_affected_rows_limit`／
+  `predicate_delete_respects_configured_higher_affected_rows_limit`／
+  `predicate_update_respects_configured_lower_affected_rows_limit`／
+  `predicate_update_respects_configured_higher_affected_rows_limit` で固定）。
+- `crates/engine/tests/insert_multi_row.rs`: 複数行 `VALUES` の行数上限
+  （`sql::allowlist::MAX_INSERT_ROWS_PER_STATEMENT`）の CLI 起動時設定値対応
+  （`multi_row_insert_respects_configured_lower_insert_row_limit`／
+  `multi_row_insert_respects_configured_higher_insert_row_limit`——引き上げ側は
+  `batch_limits.max_files_per_batch` も同時に引き上げる必要があることを含めて
+  固定。§6「`batch_limits.max_files_per_batch` との二重ゲート」参照）。
+- `crates/wire-server/tests/wire_dml_limits_cli.rs`: `--max-dml-affected-rows`・
+  `--max-insert-rows` の CLI 解析の外形確認（範囲内値での起動成功・値欠落／
+  多重指定／範囲外／非数値の起動時拒否）。
+- `crates/wire-server/src/dml_limits_opt.rs`（`#[cfg(test)]`）・
+  `crates/engine/src/sql/parser.rs`（`#[cfg(test)]`）: `resolve`／
+  `validate_dml_row_limit`／`check_dml_affected_rows_with_limit`／
+  `DmlLimits::default` の単体テスト。
 - `crates/engine/tests/predicate_dml_failure_injection.rs`: 候補列挙途中の式評価
   エラー（0 除算）が write トランザクション全体を副作用ゼロで拒否すること（RLS 可視
   列は `TEXT` を算術に使えないため、疑似列 `id` の算術で誘発）・台帳未記録（同一
@@ -225,8 +295,8 @@ Issue #997 でこれを解消し、以下へ統合済み:
 ## 9. 申し送り・スコープ外
 
 - NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
-- 上限 API の統合は Issue #997 で解消済み（§6 参照）。既定値
-  （現行 1,000・設定機構なし）の最終確定はオーナー判断待ち。
+- 上限 API の統合・CLI 設定可能化はいずれも Issue #997 で解消済み（§6 参照。
+  オーナー判断 2026-09-27 で最終確定）。
 - spec 側 RECOVER-11 は 2026-09-23 に確定済み（`docs/spec` submodule を確定後の参照へ更新。
   確定は本 PR のマージを条件とする）。
 - `WasmUdfBackend` への安定な定義識別子の追加（wasmtime 接続時）。
