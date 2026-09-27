@@ -105,8 +105,19 @@ pub(crate) fn substr(s: &str, start: f64, len: Option<f64>) -> Result<String, Sq
     let total = chars.len() as i64;
     let start_i = arg_as_i64(start, "substr start")?;
     // PostgreSQL の窓計算: 論理区間は [start, start+len) だが 1 始まりなので
-    // 文字配列上のオフセットは (start-1) を基準にする。`checked_*` で
-    // オーバーフローを未定義動作にしない（coding-rust.md「untrusted 入力の扱い」）。
+    // 文字配列上のオフセットは (start-1) を基準にする。
+    // codex-review P1 指摘対応: `start`/`len` はそれぞれ `arg_as_i64` で
+    // 個別には `i64` の表現域内と検証済みでも、両者の和（窓の終端）は
+    // `i64` の範囲を超えうる（例: `start` が `i64::MAX` 近傍かつ `len` が
+    // 大きい値）。PostgreSQL の `substr` はこの場合も単に「文字列の範囲を
+    // 超えた窓」として空文字列・部分文字列を返すのが正しい契約であり、
+    // `22000` で拒否するのは誤り（有効な引数の組を拒否してしまう）。
+    // `i64` の和を計算する代わりに `i128`（`i64` の全表現域同士の和が
+    // 絶対にオーバーフローしない十分な余裕を持つ）で終端を求め、文字列の
+    // 文字数 `total`（`MAX_TEXT_FIELD_LEN` 由来で `i64` に収まる小さな値）に
+    // 飽和させてから `i64` へ戻す。これにより「各引数が個別に有効なら
+    // オーバーフローを理由に拒否しない」という契約を保ちつつ、後続の
+    // クランプ計算は常に `i64` の範囲内で行える。
     let (from, to): (i64, i64) = match len {
         None => (start_i, total.saturating_add(1)),
         Some(len_raw) => {
@@ -116,9 +127,12 @@ pub(crate) fn substr(s: &str, start: f64, len: Option<f64>) -> Result<String, Sq
                     "substr length must not be negative",
                 ));
             }
-            let end = start_i
-                .checked_add(len_i)
-                .ok_or_else(|| SqlSurfaceError::invalid_input("substr start + length overflows"))?;
+            // `len_i >= 0`（上で検査済み）のため `end_i128 >= start_i128 >=
+            // i64::MIN` が常に成り立つ。上限のみ `total + 1`（`i64` に収まる
+            // 小さな値）へ飽和させれば、結果は必ず `i64` の範囲に収まる。
+            let end_i128 = i128::from(start_i) + i128::from(len_i);
+            let end = end_i128.min(i128::from(total) + 1);
+            let end = i64::try_from(end).unwrap_or(total.saturating_add(1));
             (start_i, end)
         }
     };
@@ -259,6 +273,51 @@ mod tests {
     fn substr_negative_length_is_rejected() {
         let err = substr("hello", 1.0, Some(-1.0)).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// codex-review P1 指摘の回帰テスト: `start`/`len` はそれぞれ `arg_as_i64`
+    /// の境界検査（`i64` 表現域内）を個別に満たしていても、両者の和（窓の
+    /// 終端）は `i64` の範囲を超えうる。修正前は `start_i.checked_add(len_i)`
+    /// が `None` を返して `22000` で拒否していたが、PostgreSQL の `substr` は
+    /// この場合も単に「文字列の範囲を超えた窓」として結果を返すべきであり、
+    /// 有効な引数の組を拒否するのは契約違反だった。
+    #[test]
+    fn substr_start_near_i64_max_with_large_len_returns_empty_string_without_overflow_error() {
+        // `i64::MAX - 999`（個別には有効域内）+ `len = 5000` は `i64` の
+        // 加算では確実にオーバーフローする組み合わせ（修正前は `22000` で
+        // 拒否していた）。文字列 "hello" の範囲をはるかに超えるため、
+        // 正しい結果は空文字列。
+        let start = (i64::MAX - 999) as f64;
+        let result = substr("hello", start, Some(5000.0))
+            .expect("start/len that individually fit i64 must not be rejected for overflow");
+        assert_eq!(result, "");
+    }
+
+    /// `start` が非常に大きな負の値でも（`arg_as_i64` の境界検査は通過する
+    /// `i64::MIN`）、`len` が大きければ窓は文字列全体を覆うように正しく
+    /// クランプされることを固定する（回帰テスト。オーバーフロー拒否とは
+    /// 独立に、負方向の極端な `start` でも正しく動作することを確認する）。
+    #[test]
+    fn substr_start_at_large_negative_with_large_len_covers_whole_string() {
+        // `len` は `arg_as_i64` の表現域（`< 2^63`）を超えられないため、
+        // `start = i64::MIN` を使うと `start + len` は必ず 0 以下に留まり
+        // 「文字列全体を覆う」結果にはならない（`i64::MIN` の絶対値が
+        // 表現可能な最大の `len` 以上のため）。ここでは同じ性質
+        // （負方向に極端な `start` と正方向に大きな `len` の組み合わせで
+        // オーバーフローせず正しくクランプされること）を、文字列全体を
+        // 覆う具体的な組み合わせで固定する。
+        let start = -1_000_000.0_f64;
+        let len = 1_000_010.0_f64;
+        let result = substr("hello", start, Some(len))
+            .expect("large negative start with a large len must not error");
+        assert_eq!(result, "hello");
+    }
+
+    /// `len = 0` は空文字列を返す（既存の負の `len` 拒否とは別に、`len` の
+    /// 下限である 0 自体は有効な値であることを固定する）。
+    #[test]
+    fn substr_len_zero_returns_empty_string() {
+        assert_eq!(substr("hello", 1.0, Some(0.0)).unwrap(), "");
     }
 
     #[test]
