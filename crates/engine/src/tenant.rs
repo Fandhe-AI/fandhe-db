@@ -3343,6 +3343,16 @@ pub(crate) fn update_rows_where_unchecked<E>(
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
     content_hash_value: &content_hash::ContentHash,
+    // Issue #1061: 述語形 UPDATE の VECTOR 列 SET 割当ハッシュを正準表現
+    // （タグ 5・f32 LE 列）へ揃えたことに伴う既存台帳エントリとの互換用。
+    // 正準化前のレイアウト（VECTOR 列への `String` をタグ 1・生テキストで
+    // 連結）で記録された台帳エントリを「同一内容の再送」として引き続き
+    // 受理するために `ledger::record_in_txn_accepting` の `legacy_hashes` へ
+    // そのまま渡す。新規記録・上書きには常に `content_hash_value`（正準
+    // ハッシュ）を使うため、内容不一致判定（`22023`）は弱まらない
+    // （`content_hash::needs_legacy_vector_hash` が false の呼び出し元は
+    // 空スライスを渡す）。
+    legacy_hashes: &[content_hash::ContentHash],
     expected_schema: Option<&crate::catalog::TableSchema>,
     assignments: &[(usize, crate::row_codec::Value)],
     needs_embedding: bool,
@@ -3374,12 +3384,13 @@ pub(crate) fn update_rows_where_unchecked<E>(
         // 通ってしまい、同じ `operation_id` が正当な後続再送に使えなくなる）。
         validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
 
-        ledger::record_in_txn(
+        ledger::record_in_txn_accepting(
             &write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
             content_hash_value,
+            legacy_hashes,
         )
         .map_err(dml_write_err)?;
 
@@ -4943,6 +4954,7 @@ mod tests {
             &a,
             LedgerWrite::Record(&op_id),
             &content_hash_value,
+            &[],
             None,
             &assignments,
             false,
@@ -4972,6 +4984,7 @@ mod tests {
             &a,
             LedgerWrite::Record(&op_id),
             &content_hash_value,
+            &[],
             None,
             &ok_assignments,
             false,
@@ -5036,6 +5049,7 @@ mod tests {
             &a,
             LedgerWrite::Record(&op_id),
             &content_hash_value,
+            &[],
             None,
             &assignments,
             false,
@@ -5141,6 +5155,7 @@ mod tests {
             &ctx,
             LedgerWrite::Record(&op_id),
             &content_hash_value,
+            &[],
             None,
             &assignments,
             false,
@@ -5356,6 +5371,7 @@ mod tests {
                 &ctx,
                 LedgerWrite::Record(&op_id),
                 &content_hash_value,
+                &[],
                 None,
                 &assignments,
                 assignments.iter().any(|(idx, _)| *idx == 0),
@@ -5498,6 +5514,162 @@ mod tests {
         .expect_err("content-mismatched resend must still be rejected");
         assert!(
             matches!(err_mismatch, TenantWriteError::OperationIdContentMismatch),
+            "unexpected error shape for mismatched resend: {err_mismatch:?}"
+        );
+    }
+
+    /// 述語形 UPDATE の VECTOR 列 SET ハッシュ正規化（Issue #1061）に伴う
+    /// legacy 互換テスト。[`update_row_columns_resend_matches_pre_normalization_declared_order_ledger_entry`]
+    /// の predicate-form 版: 正規化前のコードが記録したであろう「`VECTOR` 列への
+    /// `String` 割当をタグ 1・生テキストのまま連結したハッシュ」の台帳エントリを
+    /// 直接シードし、現行コード（正準ハッシュ計算 + `legacy_hashes` 経由の照合）が
+    /// 同一内容の再送を `Duplicate`（`23505`）として受理し、異なる内容の再送は
+    /// 引き続き `ContentMismatch`（`22023`）として拒否することを固定する。
+    #[test]
+    fn update_rows_where_unchecked_resend_matches_pre_normalization_vector_string_ledger_entry() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let path = unique_db_path("predicate-update-legacy-vector-hash-compat");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        insert_typed_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            Visibility::Public,
+            &row_values([0.1, 0.2], "note.txt", "v1"),
+            &OperationId::parse("seed-legacy-vector-hash-compat").expect("valid operation_id"),
+        )
+        .expect("seed row");
+
+        let schema = file_schema("docs");
+        let registry = UdfRegistry::default();
+        let vector_literal = InsertLiteral::String("[1,2]".to_string());
+        let literal_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &vector_literal)];
+
+        // 正規化前のコードが実際に記録したであろうハッシュ（タグ 1・生テキスト）。
+        let legacy_hash = crate::recovery::content_hash::for_update_where_legacy_text_vector(
+            "docs",
+            &literal_assignments,
+            &[],
+            &registry,
+        )
+        .expect("legacy content hash");
+        // 現行コードが新規記録に使う正準ハッシュ（タグ 5・f32 LE 列）。
+        let canonical_hash = crate::recovery::content_hash::for_update_where(
+            "docs",
+            &literal_assignments,
+            &[],
+            &registry,
+            &schema,
+        )
+        .expect("canonical content hash");
+        assert_ne!(
+            legacy_hash.as_bytes(),
+            canonical_hash.as_bytes(),
+            "legacy と canonical のハッシュ表現は異なるはず（正規化の前提）"
+        );
+
+        // 正規化前のコードが記録したであろう台帳エントリを、旧 `record_in_txn`
+        // 契約（`legacy_hashes` なし）で直接シードする。
+        let legacy_op = OperationId::parse("op-legacy-vector-string").expect("valid operation_id");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        ledger::record_in_txn(
+            &write_txn,
+            a.tenant_id(),
+            "docs",
+            LedgerWrite::Record(&legacy_op),
+            &legacy_hash,
+        )
+        .expect("seed legacy ledger entry");
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit legacy ledger entry");
+
+        // 同一 `operation_id`・同一内容（embedding=[1,2]）を現行コード経由で
+        // 再送する。`content_hash_value` は正準ハッシュだが `legacy_hashes` に
+        // シード済みの旧ハッシュを渡すため、`Duplicate` として扱われるはず。
+        let resend_assignments = [(0usize, crate::row_codec::Value::Vector(vec![1.0, 2.0]))];
+        let match_target =
+            |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == 1) };
+        let err = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&legacy_op),
+            &canonical_hash,
+            std::slice::from_ref(&legacy_hash),
+            None,
+            &resend_assignments,
+            true,
+            100,
+            match_target,
+        )
+        .expect_err(
+            "resend against a pre-normalization ledger entry must not succeed as a fresh write",
+        );
+        assert!(
+            matches!(
+                err,
+                PredicateDmlError::Write(TenantWriteError::DuplicateOperationId)
+            ),
+            "resend matching the pre-normalization legacy hash must be Duplicate (23505), \
+             not ContentMismatch (22023): {err:?}"
+        );
+
+        // 対照: 内容が異なる再送は引き続き内容不一致になる（legacy 受理が
+        // `22023` 契約を弱めていないことの確認）。同一 `operation_id` で
+        // 異なる値（`[9,9]`）を送るため、正準・legacy 両ハッシュとも
+        // 「その内容」から計算し直す（実運用の呼び出し元と同じ手順）。
+        let mismatched_literal = InsertLiteral::String("[9,9]".to_string());
+        let mismatched_literal_assignments: [(&str, &InsertLiteral); 1] =
+            [("embedding", &mismatched_literal)];
+        let mismatched_canonical_hash = crate::recovery::content_hash::for_update_where(
+            "docs",
+            &mismatched_literal_assignments,
+            &[],
+            &registry,
+            &schema,
+        )
+        .expect("canonical content hash for mismatched content");
+        let mismatched_legacy_hash =
+            crate::recovery::content_hash::for_update_where_legacy_text_vector(
+                "docs",
+                &mismatched_literal_assignments,
+                &[],
+                &registry,
+            )
+            .expect("legacy content hash for mismatched content");
+
+        let mismatched_assignments = [(0usize, crate::row_codec::Value::Vector(vec![9.0, 9.0]))];
+        let match_target2 =
+            |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == 1) };
+        let err_mismatch = update_rows_where_unchecked(
+            &storage,
+            "docs",
+            &a,
+            LedgerWrite::Record(&legacy_op),
+            &mismatched_canonical_hash,
+            std::slice::from_ref(&mismatched_legacy_hash),
+            None,
+            &mismatched_assignments,
+            true,
+            100,
+            match_target2,
+        )
+        .expect_err("content-mismatched resend must still be rejected");
+        assert!(
+            matches!(
+                err_mismatch,
+                PredicateDmlError::Write(TenantWriteError::OperationIdContentMismatch)
+            ),
             "unexpected error shape for mismatched resend: {err_mismatch:?}"
         );
     }
@@ -5805,6 +5977,7 @@ mod tests {
             &ctx,
             LedgerWrite::Record(&op),
             &content_hash_value,
+            &[],
             None,
             &assignments,
             false,

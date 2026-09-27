@@ -53,6 +53,19 @@ ADR §4 のレイアウトをそのまま `crates/engine/src/recovery/content_ha
 定義セクションの推移閉包・WASM UDF 呼び出しの拒否判定順序）は ADR §4.3／§4.4／
 §4.4.1 のとおり実装した。
 
+3. **`VECTOR` 列 `SET` 割当の正準化と `schema` 引数（Issue #1061）**:
+   `for_update_where` に `schema: &TableSchema` を追加し、`SET` 割当のうち
+   対象列がスキーマ上 `VECTOR(dim)` の `InsertLiteral::String` は
+   `sql::parser::parse_vector_literal` でパースしてから `InsertLiteral::Vector`
+   と同一のタグ 5・f32 LE 列レイアウトへ正準化する（`VECTOR` 以外の列は
+   従来どおりタグ 1・生テキスト）。SQL・NoSQL 表層跨ぎの同一 `operation_id`
+   再送で `content_hash` が食い違い `22023` に誤判定される問題の是正。
+   正規化前に記録されえた台帳エントリとの互換は `legacy_hashes`
+   （`ledger::record_in_txn_accepting`）で扱う。詳細は
+   `docs/design/multi-row-dml-operation-id.md`「9.6 改訂（Issue #1061）」・
+   `docs/design/nosql-update-delete-mapping.md`「述語形 VECTOR 割当の表現
+   統一と既存台帳エントリの互換性」参照。
+
 ## 3. 実行契約（ADR §6）
 
 `tenant.rs::delete_rows_where_unchecked`／`update_rows_where_unchecked` は以下の順序

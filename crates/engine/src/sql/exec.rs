@@ -3835,6 +3835,12 @@ pub(crate) fn execute_predicate_update(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     schema: &TableSchema,
     content_hash_value: &crate::recovery::content_hash::ContentHash,
+    // Issue #1061: VECTOR 列 SET 割当ハッシュの正準化前に記録されえた台帳
+    // エントリと照合するための候補群（`tenant::update_rows_where_unchecked`
+    // 経由で `ledger::record_in_txn_accepting` の `legacy_hashes` へ渡す）。
+    // 呼び出し元（`core.rs::execute_predicate_update_form`）が
+    // `content_hash::needs_legacy_vector_hash` で必要な場合のみ計算する。
+    legacy_hashes: &[crate::recovery::content_hash::ContentHash],
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -3917,6 +3923,7 @@ pub(crate) fn execute_predicate_update(
         ctx,
         ledger_write,
         content_hash_value,
+        legacy_hashes,
         Some(schema),
         bound.assignments(),
         needs_embedding,

@@ -524,6 +524,94 @@ fn predicate_update_set_vector_column_replaces_embedding_for_matching_rows() {
     assert_eq!(embedding_of(&core, &alice, TABLE, 2), vec![0.1, 0.2]);
 }
 
+/// 述語形 UPDATE の `VECTOR` 列 SET 再送が、表記ゆれ・`-0.0` を正しく
+/// 内容一致／不一致判定すること（Issue #1061・RECOVER-11）。SQL・NoSQL
+/// 表層跨ぎの直接検証は `recovery::content_hash` の単体テスト（`for_update_where`
+/// に両 variant を直接渡す）で固定しており、本テストは同一 SQL 表層内での
+/// 表記ゆれ・`-0.0` 保持を production 経路（`execute_sql_in_session`）で
+/// 固定する。
+#[test]
+fn predicate_update_set_vector_column_resend_content_hash_matches_spelling_variants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[1,2]' WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec-resend'"
+        ),
+    )
+    .expect("first predicate UPDATE with VECTOR column SET should succeed");
+    assert!(matches!(outcome, SqlOutcome::Update(o) if o.rows_affected == 1));
+    assert_eq!(embedding_of(&core, &alice, TABLE, 1), vec![1.0, 2.0]);
+
+    // 同一 operation_id・表記ゆれのある同一値の再送は Duplicate（23505）に
+    // なり、行は再更新されない（0 件のまま）。
+    let resend = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[1.0, 2.0]' WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec-resend'"
+        ),
+    )
+    .expect_err("resend with the same value under different spelling must be rejected");
+    assert_eq!(resend.wire_code(), "23505");
+    assert_eq!(embedding_of(&core, &alice, TABLE, 1), vec![1.0, 2.0]);
+
+    // 異なる値（[1,4]）での再送は内容不一致（22023）。
+    let mismatch = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[1,4]' WHERE lang = 'ja' \
+             USING OPERATION_ID 'op-upd-vec-resend'"
+        ),
+    )
+    .expect_err("resend with a different value must be rejected as content mismatch");
+    assert_eq!(mismatch.wire_code(), "22023");
+    assert_eq!(embedding_of(&core, &alice, TABLE, 1), vec![1.0, 2.0]);
+
+    // D2 の `-0.0` 保持契約: `-0.0` を含む値での再送は別内容として拒否される。
+    let neg_zero_op = "op-upd-vec-resend-neg-zero";
+    let outcome2 = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[-0,3]' WHERE lang = 'ja' \
+             USING OPERATION_ID '{neg_zero_op}'"
+        ),
+    )
+    .expect("predicate UPDATE with negative-zero VECTOR literal should succeed");
+    assert!(matches!(outcome2, SqlOutcome::Update(o) if o.rows_affected == 1));
+
+    let pos_zero_resend = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[0,3]' WHERE lang = 'ja' \
+             USING OPERATION_ID '{neg_zero_op}'"
+        ),
+    )
+    .expect_err("+0.0 must not be treated as the same content as -0.0 (D2 contract)");
+    assert_eq!(pos_zero_resend.wire_code(), "22023");
+
+    let neg_zero_resend = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET embedding = '[-0,3]' WHERE lang = 'ja' \
+             USING OPERATION_ID '{neg_zero_op}'"
+        ),
+    )
+    .expect_err("resend with the identical -0.0 spelling must be Duplicate");
+    assert_eq!(neg_zero_resend.wire_code(), "23505");
+}
+
 /// `VECTOR` 列への SET でリテラルの次元がスキーマと不一致なら束縛段で `22000`
 /// （`sql::parser::bind_set_assignments` を単一行 UPDATE と共有するため、
 /// `sql_update_single_row.rs::set_embedding_with_wrong_dimension_is_rejected_with_22000`
