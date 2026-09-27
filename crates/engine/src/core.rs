@@ -6167,16 +6167,35 @@ impl EngineCore {
         // read txn を開く（検索本体の `search_with_hnsw`／`search_with` は
         // 内部で別途 txn を開くため、ここでの読み取りは判定用の一時的なもの）。
         // 読み取り失敗は fail-closed に「対象外」（brute-force）へ倒す。
-        let hnsw_targeted = self.hnsw_state.is_some()
-            && match self.storage.db().begin_read() {
-                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
-                    &read_txn,
-                    &self.index_catalog_gate_cache,
-                    table,
-                    true,
-                ),
-                Err(_) => false,
-            };
+        let (hnsw_targeted, gate_generation) = match self.storage.db().begin_read() {
+            Ok(read_txn) => {
+                let targeted = self.hnsw_state.is_some()
+                    && crate::catalog::hnsw_targeted_in_txn(
+                        &read_txn,
+                        &self.index_catalog_gate_cache,
+                        table,
+                        true,
+                    );
+                let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
+                (targeted, generation)
+            }
+            Err(_) => (false, None),
+        };
+        // 上記ゲート用 read txn はここで既に閉じている。判定〜`search_with_hnsw`
+        // 呼び出しの間に別の書き込み（索引宣言を含む、テーブルを問わない任意の
+        // コミット）が挟まると、`hnsw_targeted` はもう最新のカタログ状態を反映せず、
+        // 古い判定 `true` のまま HNSW 経路（`search_with_hnsw` 内部の
+        // `sql::hnsw_cache::search_or_fallback`）へ進み得る（codex-review P1
+        // 指摘・PR #1124）。`search_with_hnsw` 自身の世代照合（`built_generation`
+        // との比較）はスナップショット構築時点からの失効しか検出せず、この判定〜
+        // 呼び出し間の失効を必ずしも捉えない。ここで判定時に読んだストレージ世代
+        // （`gate_generation`）を呼び出し直前に再照合し、その間に何か 1 件でも
+        // コミットされていれば `hnsw_targeted` を強制的に `false` へ倒して
+        // brute-force 側（`snapshot.search_with`）へ縮退させる（fail-closed。
+        // 縮退先は既存の非 HNSW 経路そのままで、近似ではなく厳密な結果になる）。
+        let hnsw_targeted = hnsw_targeted
+            && gate_generation.is_some()
+            && self.storage.current_generation().ok() == gate_generation;
         let result = match (hnsw_targeted, &self.hnsw_state) {
             (true, Some(state)) => {
                 let access = crate::sql::hnsw_cache::HnswCacheAccess {
