@@ -237,8 +237,24 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
         "CREATE TABLE c (v BIGINT REFERENCES p ON UPDATE SET DEFAULT (v))",
         "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE RESTRICT ON DELETE RESTRICT)",
         "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE CASCADE ON DELETE CASCADE)",
-        "CREATE TABLE c (v BIGINT REFERENCES p MATCH FULL)",
-        "CREATE TABLE c (v BIGINT REFERENCES p DEFERRABLE)",
+        // `MATCH PARTIAL` は非対応（TABLE-17・TASK-205、Issue #1077）。
+        "CREATE TABLE c (v BIGINT REFERENCES p MATCH PARTIAL)",
+        "CREATE TABLE c (v BIGINT REFERENCES p MATCH FULL MATCH FULL)",
+        // `MATCH` は `ON` 句より前にのみ置ける（順序違反）。
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE RESTRICT MATCH FULL)",
+        // 遅延属性の矛盾・重複（TABLE-17・TASK-205、Issue #1077）。
+        "CREATE TABLE c (v BIGINT REFERENCES p NOT DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE c (v BIGINT REFERENCES p DEFERRABLE DEFERRABLE)",
+        "CREATE TABLE c (v BIGINT REFERENCES p DEFERRABLE NOT DEFERRABLE)",
+        "CREATE TABLE c (v BIGINT REFERENCES p INITIALLY LATER)",
+        // `RESTRICT`（即時検査が契約）と `INITIALLY DEFERRED`（COMMIT まで
+        // 検査を遅延）の併用は fail-closed に拒否する（PR #1137 レビュー指摘）。
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE c (v BIGINT REFERENCES p ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT \
+         DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE c (v BIGINT UNIQUE DEFERRABLE)",
+        "CREATE TABLE c (v BIGINT REFERENCES p NOT NULL)",
         "CREATE TABLE c (v BIGINT, FOREIGN KEY (missing) REFERENCES p)",
         "CREATE TABLE c (v BIGINT, FOREIGN KEY (id) REFERENCES p)",
         "CREATE TABLE c (v BIGINT, CONSTRAINT fk_v FOREIGN KEY (v) REFERENCES p)",
@@ -255,6 +271,12 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
             &sys,
             "ALTER TABLE p ADD COLUMN v BIGINT REFERENCES p"
         ),
+        "42601"
+    );
+    // `SET CONSTRAINTS` 自体が非対応（TABLE-17・TASK-205、Issue #1077。
+    // `docs/design/foreign-key.md` D5 参照）。
+    assert_eq!(
+        err_code(&core, &sys, "SET CONSTRAINTS ALL DEFERRED"),
         "42601"
     );
 }
@@ -929,4 +951,606 @@ fn explicit_transaction_sees_its_own_parent_rows_and_rejects_violations() {
         .expect("rollback");
     assert_eq!(row_count(&core, &alice, "parents"), 1);
     assert_eq!(row_count(&core, &alice, "children"), 1);
+}
+
+// --- MATCH FULL・DEFERRABLE（TABLE-17・TASK-205、Issue #1077）---------------
+
+use engine::catalog::{ForeignKeyDeferrability, ForeignKeyMatch};
+use engine::sql::transaction::TransactionStatus;
+
+/// `MATCH FULL` の複合 FK 宣言（R2）。NULL 混在の組は違反、全 NULL・全非 NULL は
+/// `MATCH SIMPLE` と同じ扱い。単一列は挙動が変わらない。
+#[test]
+fn match_full_rejects_mixed_null_and_accepts_all_null_or_all_present() {
+    let (core, path) = new_core("fk-match-full");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE p (a TEXT NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (x TEXT, y INTEGER, FOREIGN KEY (x, y) REFERENCES p MATCH FULL)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c_simple (x TEXT, y INTEGER, FOREIGN KEY (x, y) REFERENCES p)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO p (id, a, b) VALUES (1, 'k', 7) USING OPERATION_ID 'op-p'",
+    );
+    // 全 NULL は検査対象外。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id) VALUES (1) USING OPERATION_ID 'op-c1'",
+    );
+    // 全て非 NULL かつ参照先が存在すれば受理。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, x, y) VALUES (2, 'k', 7) USING OPERATION_ID 'op-c2'",
+    );
+    // 全て非 NULL だが参照先が無ければ違反（MATCH SIMPLE と同じ）。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "INSERT INTO c (id, x, y) VALUES (3, 'k', 8) USING OPERATION_ID 'op-c3'"
+        ),
+        "23503"
+    );
+    // NULL 混在は MATCH FULL では違反（`y` を省略＝NULL、`x` は非 NULL）。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "INSERT INTO c (id, x) VALUES (4, 'no-such') USING OPERATION_ID 'op-c4'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "INSERT INTO c (id, y) VALUES (5, 7) USING OPERATION_ID 'op-c5'"
+        ),
+        "23503"
+    );
+    // 対照: 同じ NULL 混在の組は MATCH SIMPLE（既定）なら受理される。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c_simple (id, x) VALUES (1, 'no-such') USING OPERATION_ID 'op-cs1'",
+    );
+    assert_eq!(row_count(&core, &alice, "c"), 2);
+}
+
+/// 単一列の `MATCH FULL` は `MATCH SIMPLE` と同じ挙動になる（NULL は 0 個か
+/// 全部＝1 個のいずれかしかあり得ないため）。
+#[test]
+fn match_full_on_single_column_behaves_like_match_simple() {
+    let (core, path) = new_core("fk-match-full-single");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p MATCH FULL)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO p (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id) VALUES (1) USING OPERATION_ID 'op-c1'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, parent_id) VALUES (2, 1) USING OPERATION_ID 'op-c2'",
+    );
+}
+
+/// 宣言した `MATCH`・遅延属性がカタログへ永続化され、再オープン後も残る
+/// （TABLE-17・TASK-205、Issue #1077）。
+#[test]
+fn foreign_key_options_persist_across_reopen() {
+    let (core, path) = new_core("fk-options-persist");
+    let _guard = CleanupGuard(path.clone());
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c1 (parent_id BIGINT REFERENCES p MATCH FULL DEFERRABLE INITIALLY DEFERRED)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c2 (parent_id BIGINT REFERENCES p DEFERRABLE)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c3 (parent_id BIGINT REFERENCES p INITIALLY DEFERRED)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c4 (parent_id BIGINT REFERENCES p INITIALLY IMMEDIATE DEFERRABLE)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c5 (parent_id BIGINT REFERENCES p NOT DEFERRABLE)",
+    );
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let assert_options =
+        |table: &str, match_type: ForeignKeyMatch, deferrability: ForeignKeyDeferrability| {
+            let schema = storage.get_table_schema(table).expect(table);
+            let [fk] = schema.foreign_keys() else {
+                panic!("{table} must declare exactly one foreign key");
+            };
+            assert_eq!(fk.match_type(), match_type, "{table}");
+            assert_eq!(fk.deferrability(), deferrability, "{table}");
+        };
+    assert_options(
+        "c1",
+        ForeignKeyMatch::Full,
+        ForeignKeyDeferrability::DeferrableInitiallyDeferred,
+    );
+    assert_options(
+        "c2",
+        ForeignKeyMatch::Simple,
+        ForeignKeyDeferrability::DeferrableInitiallyImmediate,
+    );
+    // `INITIALLY DEFERRED` 単独は `DEFERRABLE` を含意する。
+    assert_options(
+        "c3",
+        ForeignKeyMatch::Simple,
+        ForeignKeyDeferrability::DeferrableInitiallyDeferred,
+    );
+    assert_options(
+        "c4",
+        ForeignKeyMatch::Simple,
+        ForeignKeyDeferrability::DeferrableInitiallyImmediate,
+    );
+    assert_options(
+        "c5",
+        ForeignKeyMatch::Simple,
+        ForeignKeyDeferrability::NotDeferrable,
+    );
+}
+
+/// `INITIALLY DEFERRED` の FK は autocommit では文単位で検査される（R1 の
+/// 「遅延は検査しないことを意味しない」不変条件。TABLE-17・TASK-205、
+/// Issue #1077）。
+#[test]
+fn autocommit_still_checks_deferred_foreign_key_per_statement() {
+    let (core, path) = new_core("fk-deferred-autocommit");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "INSERT INTO c (id, parent_id) VALUES (1, 999) USING OPERATION_ID 'op-c1'"
+        ),
+        "23503"
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO p (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, parent_id) VALUES (2, 1) USING OPERATION_ID 'op-c2'",
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "DELETE FROM p WHERE id = 1 USING OPERATION_ID 'op-d'"
+        ),
+        "23503"
+    );
+}
+
+/// `DEFERRABLE INITIALLY IMMEDIATE`（`DEFERRABLE` 単独）は文単位で検査される
+/// （`SET CONSTRAINTS` 非対応のため実行時に遅延へ切り替える経路がない。
+/// TABLE-17・TASK-205、Issue #1077）。
+#[test]
+fn deferrable_initially_immediate_is_checked_per_statement_inside_explicit_transaction() {
+    let (core, path) = new_core("fk-deferrable-immediate");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE)",
+    );
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &alice,
+            &mut session,
+            &mut txn,
+            "INSERT INTO c (id, parent_id) VALUES (1, 999) USING OPERATION_ID 'op-c1'",
+        )
+        .expect_err("DEFERRABLE INITIALLY IMMEDIATE must still check per statement");
+    assert_eq!(err.wire_code(), "23503");
+}
+
+/// R1 の中核シナリオ: `INITIALLY DEFERRED` の FK は明示トランザクション中の
+/// 文単位検査を省き、COMMIT 時にまとめて検査する。子→親の順で書いても
+/// COMMIT が成功する（自トランザクション内の未 commit 書き込みが母集合に
+/// 含まれる。TABLE-17・TASK-205、Issue #1077）。
+#[test]
+fn deferred_foreign_key_check_is_postponed_to_commit_and_sees_same_transaction_writes() {
+    let (core, path) = new_core("fk-deferred-commit-ok");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        // 子を先に書いても、文単位検査が遅延されているため成功する。
+        "INSERT INTO c (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c'",
+        "INSERT INTO p (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-p'",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert_eq!(row_count(&core, &alice, "p"), 1);
+    assert_eq!(row_count(&core, &alice, "c"), 1);
+}
+
+/// R1: COMMIT 時に遅延 FK が違反すれば、同一トランザクションで書いた無関係の
+/// 行（親テーブル自身の行を含む）ごとトランザクション全体が破棄される
+/// （TABLE-17・TASK-205、Issue #1077）。COMMIT 後の状態は `Idle` になり
+/// （PostgreSQL と同じくロールバック扱い）、続く `ROLLBACK` は `25P01`。
+/// セッション状態も `BEGIN` 時点へ復元される。
+#[test]
+fn deferred_foreign_key_violation_at_commit_discards_entire_transaction() {
+    let (core, path) = new_core("fk-deferred-commit-violation");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(&core, &sys, "CREATE TABLE unrelated (label TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO unrelated (id, label) VALUES (1, 'x') USING OPERATION_ID 'op-u'",
+    )
+    .expect("insert unrelated must succeed inside the transaction");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        // 親が存在しない（文単位検査は遅延されているため、この時点では成功する）。
+        "INSERT INTO c (id, parent_id) VALUES (1, 999) USING OPERATION_ID 'op-c'",
+    )
+    .expect("insert with a dangling deferred reference must succeed at statement time");
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect_err("COMMIT must fail when a deferred foreign key is still violated");
+    assert_eq!(err.wire_code(), "23503");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+        .expect_err("ROLLBACK after an already-resolved COMMIT must be 25P01");
+    assert_eq!(err.wire_code(), "25P01");
+    assert_eq!(row_count(&core, &alice, "c"), 0);
+    assert_eq!(row_count(&core, &alice, "unrelated"), 0);
+}
+
+/// R1: 親を `TRUNCATE` してから同じキーで再挿入した場合、COMMIT 時点の事後
+/// 状態だけを見るため成功する。`TRUNCATE` だけで終えた場合は COMMIT が違反に
+/// なり、親の行は残る（TABLE-17・TASK-205、Issue #1077）。
+#[test]
+fn deferred_foreign_key_checks_post_commit_state_around_truncate() {
+    let (core, path) = new_core("fk-deferred-truncate");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO p (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-p0'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c0'",
+    );
+
+    // シナリオ 1: TRUNCATE してから同じキーで再挿入 → COMMIT 成功。
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        "TRUNCATE TABLE p USING OPERATION_ID 'op-t1'",
+        "INSERT INTO p (id, name) VALUES (1, 'p2') USING OPERATION_ID 'op-p1'",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    assert_eq!(row_count(&core, &alice, "c"), 1);
+
+    // シナリオ 2: TRUNCATE のみ → COMMIT が違反、親行は残る。
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "TRUNCATE TABLE p USING OPERATION_ID 'op-t2'",
+    )
+    .expect("truncate must succeed at statement time (check is deferred)");
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect_err("COMMIT must fail: the deferred child row would dangle");
+    assert_eq!(err.wire_code(), "23503");
+    assert_eq!(row_count(&core, &alice, "p"), 1);
+}
+
+/// 自己参照の遅延 FK は、後から挿入される行を先に参照しても COMMIT 時点の
+/// 事後状態で成立していれば成功する（TABLE-17・TASK-205、Issue #1077）。
+#[test]
+fn self_referencing_deferred_foreign_key_is_checked_at_commit() {
+    let (core, path) = new_core("fk-deferred-self");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE nodes (parent_id BIGINT REFERENCES nodes DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        // 2 が 3 を先に参照するが、3 は後の文で挿入される。
+        "INSERT INTO nodes (id, parent_id) VALUES (2, 3) USING OPERATION_ID 'op-n2'",
+        "INSERT INTO nodes (id, parent_id) VALUES (3, 2) USING OPERATION_ID 'op-n3'",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    assert_eq!(row_count(&core, &alice, "nodes"), 2);
+
+    // 参照先が最後まで現れない場合は COMMIT が違反になる。
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO nodes (id, parent_id) VALUES (10, 999) USING OPERATION_ID 'op-n10'",
+    )
+    .expect("insert with a dangling deferred self-reference must succeed at statement time");
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect_err("COMMIT must fail: the self-reference never resolves");
+    assert_eq!(err.wire_code(), "23503");
+    assert_eq!(row_count(&core, &alice, "nodes"), 2);
+}
+
+/// `MATCH FULL` と `DEFERRABLE INITIALLY DEFERRED` の併用: COMMIT 時点の事後
+/// 状態で NULL 混在が残っていれば違反になる（TABLE-17・TASK-205、Issue #1077）。
+#[test]
+fn deferred_foreign_key_with_match_full_checks_null_mixing_at_commit() {
+    let (core, path) = new_core("fk-deferred-match-full");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE p (a TEXT NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (x TEXT, y INTEGER, \
+         FOREIGN KEY (x, y) REFERENCES p MATCH FULL DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO c (id, x) VALUES (1, 'k') USING OPERATION_ID 'op-c'",
+    )
+    .expect("NULL-mixed deferred insert must succeed at statement time");
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect_err("COMMIT must fail: MATCH FULL rejects the NULL-mixed tuple");
+    assert_eq!(err.wire_code(), "23503");
+}
+
+/// RLS: 他テナントにだけ存在する親を参照した遅延 FK の COMMIT 違反は、親が
+/// 存在しない場合と `wire_code` が同一になる（RLS-9・RLS-10 (c)）。他テナントの
+/// 子行は自テナントの `TRUNCATE`・COMMIT を妨げない。
+#[test]
+fn deferred_foreign_key_commit_violation_does_not_reveal_other_tenant_rows() {
+    let (core, path) = new_core("fk-deferred-rls");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let bob = ctx("bob");
+    ok(
+        &core,
+        &bob,
+        "INSERT INTO p (id, name) VALUES (1, 'bob-p') USING OPERATION_ID 'op-bob-p'",
+    );
+
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO c (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c'",
+    )
+    .expect("insert referencing only another tenant's row must succeed at statement time");
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect_err("COMMIT must fail: id 1 does not exist in alice's own rows");
+    assert_eq!(err.wire_code(), "23503");
+
+    // alice が自テナント内で有効な親子を確定させる（同じ id 1 を alice の
+    // テナント名前空間で使う。TABLE-12: 物理キーはテナントで名前空間化される
+    // ため bob の id 1 とは衝突しない）。
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    for sql in [
+        "INSERT INTO p (id, name) VALUES (1, 'alice-p') USING OPERATION_ID 'op-alice-p'",
+        "INSERT INTO c (id, parent_id) VALUES (2, 1) USING OPERATION_ID 'op-alice-c'",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+
+    // bob の `TRUNCATE TABLE p`・COMMIT は、alice が今テナント境界を越えて
+    // bob の id 1 を（もう存在しないダングリング参照として）指す子行
+    // （`c.id=1`）を残していても成功する——COMMIT 時の逆引き走査が bob
+    // 自身のテナント範囲に閉じており、alice の行を「参照元」として拾わない
+    // ことを固定する（RLS-9・RLS-10 (c)）。bob には子行が無いため、この
+    // 検査を素通りしても成功して当然にならないよう、bob 自身の子テーブルへの
+    // 書き込みは一切行わない。
+    let mut bob_session = SessionState::default();
+    let mut bob_txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        "TRUNCATE TABLE p USING OPERATION_ID 'op-bob-t'",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&bob, &mut bob_session, &mut bob_txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    // alice 自身の（有効な）参照は残ったまま（bob の TRUNCATE の影響を受けない）。
+    assert_eq!(row_count(&core, &alice, "c"), 1);
+}
+
+/// P0 回帰: `MATCH FULL`／`DEFERRABLE` 宣言を持つ FK（カタログ v9）は、
+/// 通常の（オプション既定の）FK と同じく `DELETE`／`TRUNCATE`（`23503`）・
+/// `DROP TABLE`（`2BP01`）・子の `DROP COLUMN`（依存エラー）の逆引き検査が効く
+/// （`catalog::referencing_foreign_keys_in_txn` の v9 対応。TABLE-17・TASK-205、
+/// Issue #1077）。v9 をこの逆引きが見落とすと、これらすべてが fail-open になる。
+#[test]
+fn v9_catalog_children_are_covered_by_reverse_lookup_checks() {
+    let (core, path) = new_core("fk-v9-reverse-lookup");
+    let _guard = CleanupGuard(path.clone());
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p MATCH FULL DEFERRABLE)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO p (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c'",
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "DELETE FROM p WHERE id = 1 USING OPERATION_ID 'op-d'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        err_code(&core, &alice, "TRUNCATE TABLE p USING OPERATION_ID 'op-t'"),
+        "23503"
+    );
+    assert_eq!(err_code(&core, &sys, "DROP TABLE p"), "2BP01");
+    drop(core);
+
+    // `DROP COLUMN` は SQL 表層に無く `Storage` API 専用
+    // （`drop_column_of_foreign_key_column_is_rejected_and_definitions_survive_reopen`
+    // と同じ流儀）。
+    let storage = Storage::open(&path).expect("reopen storage");
+    let err = storage
+        .alter_table_drop_column("c", "parent_id")
+        .expect_err("dropping a v9 foreign key column must be rejected");
+    assert!(matches!(err, CatalogError::DependentObjectsStillExist(_)));
 }

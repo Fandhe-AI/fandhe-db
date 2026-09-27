@@ -1941,16 +1941,28 @@ struct ParsedCreateTableColumn {
     /// 列定義の後ろに続く列制約 `[CONSTRAINT <name>] CHECK (...)`（0 個以上。
     /// TABLE-16・TASK-204、Issue #906）。
     checks: Vec<ParsedCheck>,
-    /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)] [ON DELETE ...] [ON UPDATE ...]`
-    /// （TABLE-17・TASK-205、Issue #907。参照アクションは Issue #1076）の
-    /// 参照先テーブル名・参照先列名（省略時は空）・`ON DELETE`／`ON UPDATE` の
-    /// 参照アクション。
-    references: Option<(
-        String,
-        Vec<String>,
-        crate::catalog::ReferentialAction,
-        crate::catalog::ReferentialAction,
-    )>,
+    /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)] [MATCH ...] [ON ...]
+    /// [<遅延属性>]`（TABLE-17・TASK-205、Issue #907／#1076／#1077）の解析結果。
+    references: Option<ParsedReferences>,
+}
+
+/// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
+/// Issue #907／#1076／#1077）の解析結果。[`Parser::parse_references_clause`] が
+/// 返す。
+struct ParsedReferences {
+    parent_table: String,
+    /// 参照先列名（省略時は空。[`crate::catalog::resolve_foreign_key_target`] が
+    /// 解決する）。
+    parent_columns: Vec<String>,
+    /// `ON DELETE` の参照アクション（未指定時は `NoAction`。Issue #1076）。
+    on_delete: crate::catalog::ReferentialAction,
+    /// `ON UPDATE` の参照アクション（未指定時は `NoAction`。Issue #1076）。
+    on_update: crate::catalog::ReferentialAction,
+    /// `MATCH` 句（未指定時は `Simple`）。
+    match_type: crate::catalog::ForeignKeyMatch,
+    /// `[NOT] DEFERRABLE`／`INITIALLY {DEFERRED|IMMEDIATE}` 句
+    /// （未指定時は `NotDeferrable`）。
+    deferrability: crate::catalog::ForeignKeyDeferrability,
 }
 
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
@@ -5142,21 +5154,22 @@ impl<'a> Parser<'a> {
                     }
                     unique_constraints.push(vec![parsed.column.name.clone()]);
                 }
-                if let Some((parent_table, parent_columns, on_delete, on_update)) =
-                    parsed.references
-                {
+                if let Some(refs) = parsed.references {
                     if foreign_keys.len() >= crate::catalog::MAX_FOREIGN_KEYS_PER_TABLE {
                         return Err(SqlSurfaceError::payload_too_large(
                             "too many FOREIGN KEY constraints in CREATE TABLE",
                         ));
                     }
-                    foreign_keys.push(crate::catalog::ForeignKeyDef::new(
-                        vec![parsed.column.name.clone()],
-                        parent_table,
-                        parent_columns,
-                        on_delete,
-                        on_update,
-                    ));
+                    foreign_keys.push(
+                        crate::catalog::ForeignKeyDef::new(
+                            vec![parsed.column.name.clone()],
+                            refs.parent_table,
+                            refs.parent_columns,
+                            refs.on_delete,
+                            refs.on_update,
+                        )
+                        .with_options(refs.match_type, refs.deferrability),
+                    );
                 }
                 columns.push(parsed.column);
             }
@@ -5471,31 +5484,35 @@ impl<'a> Parser<'a> {
         Ok(cols)
     }
 
-    /// `REFERENCES <table> [(<col>[, <col>]*)] [ON DELETE <act>] [ON UPDATE <act>]`
-    /// （TABLE-17・TASK-205、Issue #907。参照アクションは Issue #1076）。列制約・
-    /// 表制約の双方から呼ばれる。参照先テーブルの存在・参照先列の一意性・型の
-    /// 照合はカタログ照会を要するため構造検証の対象外（`catalog::Storage::create_table`
-    /// の write トランザクション内で判定する）。参照先列を省略した場合は空リストを
-    /// 返す（参照先の主キー、未宣言なら `id` へ解決される）。
+    /// `REFERENCES <table> [(<col>[, <col>]*)] [MATCH {SIMPLE|FULL}]
+    /// [ON DELETE <act>] [ON UPDATE <act>] [<遅延属性>]`（TABLE-17・TASK-205、
+    /// Issue #907／#1076／#1077）。列制約・表制約の双方から呼ばれる。参照先
+    /// テーブルの存在・参照先列の一意性・型の照合はカタログ照会を要するため構造
+    /// 検証の対象外（`catalog::Storage::create_table` の write トランザクション内で
+    /// 判定する）。参照先列を省略した場合は空リストを返す（参照先の主キー、未宣言
+    /// なら `id` へ解決される）。
     ///
     /// `ON DELETE`／`ON UPDATE` にはそれぞれ `NO ACTION`・`RESTRICT`（いずれも
     /// [`ReferentialAction::NoAction`] へ正規化）・`CASCADE`・`SET NULL`・
     /// `SET DEFAULT` を各 1 回まで受理する。列リスト形の `SET NULL (col, ...)`・
     /// `SET DEFAULT (col, ...)`（後ろに `(` が続く形）は未実装のため `42601`。
-    /// 重複指定も `42601`。`MATCH`・`DEFERRABLE`／`INITIALLY`・`CONSTRAINT <name>`
-    /// 等は本メソッドが消費しないため、呼び出し元の後続判定（カンマ・閉じ括弧）が
+    /// 重複指定も `42601`。
+    ///
+    /// `MATCH {SIMPLE|FULL}` は列リストの直後・`ON` 句の前にのみ置ける
+    /// （PostgreSQL の句順序）。`MATCH PARTIAL`・重複指定・`ON` 句より後ろに
+    /// 置いた `MATCH` はこの位置で消費されず、呼び出し元の後続判定（カンマ・
+    /// 閉じ括弧）が余剰トークンとして `42601` で拒否する。
+    ///
+    /// 遅延属性 `{[NOT] DEFERRABLE | INITIALLY {DEFERRED|IMMEDIATE}}`（任意順・
+    /// 各グループ高々 1 回）は `ON` 句の後ろにのみ置ける。`NOT DEFERRABLE
+    /// INITIALLY DEFERRED`（矛盾）・各グループの重複は `42601`。`REFERENCES` 句の
+    /// 後ろで `NOT` を消費するのは次の識別子が `DEFERRABLE` のときだけで
+    /// （`NOT NULL` は列型キーワード直後で先に受理済みのため曖昧さはない）、
+    /// それ以外の `NOT ...` は消費せず呼び出し元の余剰トークン判定に委ねる。
+    /// `SET CONSTRAINTS`・PK/UNIQUE への `DEFERRABLE`・`CONSTRAINT <name>` 等は
+    /// 本メソッドが消費しないため、呼び出し元の後続判定（カンマ・閉じ括弧）が
     /// 余剰トークンとして `42601` で拒否する。
-    fn parse_references_clause(
-        &mut self,
-    ) -> Result<
-        (
-            String,
-            Vec<String>,
-            crate::catalog::ReferentialAction,
-            crate::catalog::ReferentialAction,
-        ),
-        SqlSurfaceError,
-    > {
+    fn parse_references_clause(&mut self) -> Result<ParsedReferences, SqlSurfaceError> {
         self.expect_contextual_keyword("REFERENCES")?;
         let parent_table = self.expect_ident()?;
         crate::catalog::validate_identifier(&parent_table).map_err(|e| {
@@ -5508,14 +5525,40 @@ impl<'a> Parser<'a> {
         };
         let mut on_delete = crate::catalog::ReferentialAction::NoAction;
         let mut on_update = crate::catalog::ReferentialAction::NoAction;
+        let match_type = if self.peek_ident_matches("MATCH") {
+            self.advance();
+            if self.peek_ident_matches("SIMPLE") {
+                self.advance();
+                crate::catalog::ForeignKeyMatch::Simple
+            } else if self.peek_ident_matches("FULL") {
+                self.advance();
+                crate::catalog::ForeignKeyMatch::Full
+            } else {
+                return Err(SqlSurfaceError::unsupported(
+                    "only MATCH SIMPLE or MATCH FULL is supported in FOREIGN KEY",
+                ));
+            }
+        } else {
+            crate::catalog::ForeignKeyMatch::Simple
+        };
         let mut seen_delete = false;
         let mut seen_update = false;
+        // `ON DELETE`／`ON UPDATE` に `RESTRICT` が指定されたか（Issue #1077
+        // レビュー指摘・PR #1137）。`RESTRICT` は SQL 標準上つねに即時検査
+        // （非遅延）の参照動作であり、`INITIALLY DEFERRED` と併用すると
+        // 「RESTRICT なのに COMMIT まで検査を遅延する」という契約違反になる
+        // （`constraint::FkCheckMode::includes` は現状 `deferrability` のみで
+        // 文単位検査の対象可否を決めており、参照動作〔`NO ACTION`／`RESTRICT`〕
+        // を保持していないため区別できない）。参照動作を保持して個別に即時検査
+        // する経路は追加しず、下の検査で宣言そのものを fail-closed に拒否する。
+        let mut on_delete_restrict = false;
+        let mut on_update_restrict = false;
         while self.peek_ident_matches("ON") {
             self.advance();
-            let (seen, slot) = if self.peek_ident_matches("DELETE") {
-                (&mut seen_delete, &mut on_delete)
+            let (seen, slot, restrict_flag) = if self.peek_ident_matches("DELETE") {
+                (&mut seen_delete, &mut on_delete, &mut on_delete_restrict)
             } else if self.peek_ident_matches("UPDATE") {
-                (&mut seen_update, &mut on_update)
+                (&mut seen_update, &mut on_update, &mut on_update_restrict)
             } else {
                 return Err(SqlSurfaceError::unsupported(
                     "expected DELETE or UPDATE after ON in FOREIGN KEY",
@@ -5534,6 +5577,7 @@ impl<'a> Parser<'a> {
                 crate::catalog::ReferentialAction::NoAction
             } else if self.peek_ident_matches("RESTRICT") {
                 self.advance();
+                *restrict_flag = true;
                 crate::catalog::ReferentialAction::NoAction
             } else if self.peek_ident_matches("CASCADE") {
                 self.advance();
@@ -5559,15 +5603,101 @@ impl<'a> Parser<'a> {
                 self.advance();
                 crate::catalog::ReferentialAction::SetDefault
             } else {
-                // 列リスト形（`SET NULL (col, ...)`・`SET DEFAULT (col, ...)`）・
-                // `MATCH`・`DEFERRABLE` 等はいずれも未実装。本エラーへ統一して
-                // fail-closed に拒否する（Issue #1076 スコープ外。docs/design 参照）。
+                // 列リスト形（`SET NULL (col, ...)`・`SET DEFAULT (col, ...)`）は
+                // 未実装。本エラーへ統一して fail-closed に拒否する（Issue #1076
+                // スコープ外。docs/design 参照）。
                 return Err(SqlSurfaceError::unsupported(
                     "unsupported FOREIGN KEY referential action",
                 ));
             };
         }
-        Ok((parent_table, parent_columns, on_delete, on_update))
+        // 遅延属性（`[NOT] DEFERRABLE`・`INITIALLY {DEFERRED|IMMEDIATE}`。
+        // TABLE-17・TASK-205、Issue #1077）。`ON` 句の後ろに任意順・各グループ
+        // 高々 1 回で置ける。
+        let mut seen_deferrable_clause = false;
+        let mut seen_initially_clause = false;
+        let mut deferrable: Option<bool> = None;
+        let mut initially_deferred: Option<bool> = None;
+        loop {
+            if self.peek_ident_matches("DEFERRABLE") {
+                if seen_deferrable_clause {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate DEFERRABLE clause in FOREIGN KEY",
+                    ));
+                }
+                seen_deferrable_clause = true;
+                self.advance();
+                deferrable = Some(true);
+                continue;
+            }
+            // `NOT DEFERRABLE` の `NOT` は次の識別子が `DEFERRABLE` のときだけ
+            // 消費する（他の `NOT ...` は本メソッドの対象外として素通しする）。
+            if self.peek_ident_matches("NOT") && self.peek_ident_matches_at(1, "DEFERRABLE") {
+                if seen_deferrable_clause {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate DEFERRABLE clause in FOREIGN KEY",
+                    ));
+                }
+                seen_deferrable_clause = true;
+                self.advance();
+                self.advance();
+                deferrable = Some(false);
+                continue;
+            }
+            if self.peek_ident_matches("INITIALLY") {
+                if seen_initially_clause {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate INITIALLY clause in FOREIGN KEY",
+                    ));
+                }
+                seen_initially_clause = true;
+                self.advance();
+                if self.peek_ident_matches("DEFERRED") {
+                    self.advance();
+                    initially_deferred = Some(true);
+                } else if self.peek_ident_matches("IMMEDIATE") {
+                    self.advance();
+                    initially_deferred = Some(false);
+                } else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expected DEFERRED or IMMEDIATE after INITIALLY in FOREIGN KEY",
+                    ));
+                }
+                continue;
+            }
+            break;
+        }
+        if deferrable == Some(false) && initially_deferred == Some(true) {
+            return Err(SqlSurfaceError::unsupported(
+                "NOT DEFERRABLE cannot be combined with INITIALLY DEFERRED",
+            ));
+        }
+        let deferrability = if initially_deferred == Some(true) {
+            crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyDeferred
+        } else if deferrable == Some(true) {
+            crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyImmediate
+        } else {
+            crate::catalog::ForeignKeyDeferrability::NotDeferrable
+        };
+        // `RESTRICT`（即時検査が契約）と `INITIALLY DEFERRED`（COMMIT まで
+        // 検査を遅延）の併用を fail-closed に拒否する（Issue #1077 レビュー
+        // 指摘・PR #1137。上の `on_delete_restrict`／`on_update_restrict` 参照）。
+        if deferrability == crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyDeferred
+            && (on_delete_restrict || on_update_restrict)
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "ON DELETE RESTRICT / ON UPDATE RESTRICT cannot be combined with INITIALLY DEFERRED",
+            ));
+        }
+
+        Ok(ParsedReferences {
+            parent_table,
+            parent_columns,
+            on_delete,
+            on_update,
+            match_type,
+            deferrability,
+        })
     }
 
     /// 表制約 `FOREIGN KEY (<col>[, <col>]*) REFERENCES ...`（TABLE-17・TASK-205、
@@ -5579,15 +5709,15 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("FOREIGN")?;
         self.expect_contextual_keyword("KEY")?;
         let columns = self.parse_foreign_key_column_list()?;
-        let (parent_table, parent_columns, on_delete, on_update) =
-            self.parse_references_clause()?;
+        let refs = self.parse_references_clause()?;
         Ok(crate::catalog::ForeignKeyDef::new(
             columns,
-            parent_table,
-            parent_columns,
-            on_delete,
-            on_update,
-        ))
+            refs.parent_table,
+            refs.parent_columns,
+            refs.on_delete,
+            refs.on_update,
+        )
+        .with_options(refs.match_type, refs.deferrability))
     }
 
     /// 表制約 `UNIQUE (<col>[, <col>]*)`（TABLE-16・TASK-204、Issue #905）の

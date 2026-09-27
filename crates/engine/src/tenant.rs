@@ -402,9 +402,10 @@ fn convert_write_txn_err(e: StorageError) -> TenantWriteError {
 /// 開いて 1 文ごとに commit する。
 ///
 /// 現時点で `InTxn` を受理するのは [`insert_row_unchecked`]・
-/// [`insert_rows_unchecked`]・[`truncate_table_unchecked`] の 3 経路のみ
-/// （`docs/design/explicit-transaction.md` 参照。他の書き込み系 API は
-/// 明示トランザクション内では `0A000` で拒否され、本 enum に到達しない）。
+/// [`insert_rows_unchecked`]・[`insert_typed_row_unchecked`]・
+/// [`truncate_table_unchecked`] の 4 経路のみ（`docs/design/explicit-transaction.md`
+/// 参照。他の書き込み系 API は明示トランザクション内では `0A000` で拒否され、
+/// 本 enum に到達しない）。
 pub(crate) enum WriteTarget<'a> {
     Autocommit(&'a Storage),
     InTxn(&'a redb::WriteTransaction),
@@ -440,6 +441,20 @@ impl<'a> WriteTarget<'a> {
                 Ok(value)
             }
             WriteTarget::InTxn(write_txn) => f(write_txn).map(|(value, _)| value),
+        }
+    }
+
+    /// この `target` の下で `FOREIGN KEY` の文単位検査をどこまで行うか
+    /// （`constraint::FkCheckMode`。TABLE-17・TASK-205、Issue #1077）。
+    /// `Autocommit`（1 文＝1 トランザクション）は `INITIALLY DEFERRED` の
+    /// 宣言でも必ず文単位で検査する（`All`）。`InTxn`（明示トランザクション。
+    /// 上記 4 経路のみ）は `INITIALLY DEFERRED` の FK を文単位検査から除外し
+    /// （`ImmediateOnly`）、COMMIT 時
+    /// （`constraint::enforce_deferred_foreign_keys_in_txn`）へ先送りする。
+    fn fk_check_mode(&self) -> crate::constraint::FkCheckMode {
+        match self {
+            WriteTarget::Autocommit(_) => crate::constraint::FkCheckMode::All,
+            WriteTarget::InTxn(_) => crate::constraint::FkCheckMode::ImmediateOnly,
         }
     }
 }
@@ -802,6 +817,7 @@ pub(crate) fn insert_row_unchecked(
             &schema,
             ctx.tenant_id(),
             &[id],
+            target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -989,6 +1005,7 @@ pub(crate) fn insert_rows_unchecked(
             &schema,
             ctx.tenant_id(),
             &ids,
+            target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -1157,6 +1174,7 @@ pub(crate) fn insert_typed_row_unchecked(
             &schema,
             ctx.tenant_id(),
             &[id],
+            target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -1330,6 +1348,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             &schema_for_pk,
             ctx.tenant_id(),
             &ids,
+            crate::constraint::FkCheckMode::All,
         )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -1877,6 +1896,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 &schema,
                 ctx.tenant_id(),
                 &written_ids,
+                crate::constraint::FkCheckMode::All,
             )?;
         }
         // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
@@ -1892,6 +1912,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
                     ctx.tenant_id(),
                     crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
                     Some(&pre_images),
+                    crate::constraint::FkCheckMode::All,
                 )?;
             }
         }
@@ -2038,6 +2059,7 @@ pub(crate) fn update_row_unchecked(
             &schema_for_pk,
             ctx.tenant_id(),
             &[id],
+            crate::constraint::FkCheckMode::All,
         )?;
         // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
         // 参照先とする `FOREIGN KEY` の参照先側も検査する（TABLE-17・TASK-205、
@@ -2049,6 +2071,7 @@ pub(crate) fn update_row_unchecked(
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::AllColumnsReplaced,
             Some(&pre_images),
+            crate::constraint::FkCheckMode::All,
         )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -2841,6 +2864,7 @@ pub(crate) fn update_row_columns_unchecked(
                 &schema,
                 ctx.tenant_id(),
                 &[id],
+                crate::constraint::FkCheckMode::All,
             )?;
             // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
             // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ走査）。
@@ -2852,6 +2876,7 @@ pub(crate) fn update_row_columns_unchecked(
                 ctx.tenant_id(),
                 crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
                 Some(&pre_images),
+                crate::constraint::FkCheckMode::All,
             )?;
         }
     }
@@ -3144,6 +3169,7 @@ fn delete_row_impl(
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
             None,
+            crate::constraint::FkCheckMode::All,
         )?;
     }
     // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
@@ -3544,6 +3570,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
             None,
+            crate::constraint::FkCheckMode::All,
         )
         .map_err(dml_write_err)?;
     }
@@ -3714,6 +3741,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
             &schema,
             ctx.tenant_id(),
             &candidate_ids,
+            crate::constraint::FkCheckMode::All,
         )
         .map_err(dml_write_err)?;
         // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
@@ -3726,6 +3754,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
             Some(&pre_images),
+            crate::constraint::FkCheckMode::All,
         )
         .map_err(dml_write_err)?;
     }
@@ -3784,6 +3813,7 @@ pub(crate) fn truncate_table_unchecked(
             tenant,
             crate::constraint::ReferencedRowsChange::Truncated,
             None,
+            target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -4117,6 +4147,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 &schema_for_pk,
                 ctx.tenant_id(),
                 &ids,
+                crate::constraint::FkCheckMode::All,
             )?;
         }
     }
@@ -4132,6 +4163,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
             None,
+            crate::constraint::FkCheckMode::All,
         )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;

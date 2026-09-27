@@ -83,7 +83,9 @@
 //! （TABLE-16・RLS-10 (c)）。違反時のエラー（`TenantWriteError::UniqueViolation`）
 //! はキー値・列名・行 id・テナント名を含まない固定文言。
 
-use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, ReferentialAction, TableSchema};
+use crate::catalog::{
+    CatalogError, ColumnType, ForeignKeyDef, ForeignKeyMatch, ReferentialAction, TableSchema,
+};
 use crate::row_codec::ScalarRef;
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
@@ -149,21 +151,58 @@ fn key_specs(schema: &TableSchema) -> Result<(Vec<KeySpec>, Vec<bool>), CatalogE
     Ok((specs, mask))
 }
 
+/// COMMIT 時に検査すべき遅延 `FOREIGN KEY` の範囲（TABLE-17・TASK-205、
+/// Issue #1077）。autocommit（1 文＝1 トランザクション）は常に `All`——遅延指定
+/// （`DEFERRABLE`／`INITIALLY DEFERRED`）でも「検査しない」ことにはならず、
+/// 文単位で必ず検査する。明示トランザクション（SQL-31・TASK-221）中の
+/// `tenant::WriteTarget::InTxn` 経路（`insert_row_unchecked`・
+/// `insert_rows_unchecked`・`insert_typed_row_unchecked`・
+/// `truncate_table_unchecked` の 4 経路のみ）だけが `ImmediateOnly` を渡し、
+/// `INITIALLY DEFERRED` の FK を文単位検査から除外して COMMIT 時
+/// （[`enforce_deferred_foreign_keys_in_txn`]）へ先送りする。`fail-closed`:
+/// 先送りした FK は `sql::transaction::SessionTransaction::commit` が
+/// 必ず検査してから commit する契約（省き忘れは fail-open のバグ）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FkCheckMode {
+    All,
+    ImmediateOnly,
+}
+
+impl FkCheckMode {
+    /// `fk` をこのモードの下で文単位検査の対象に含めるか。
+    fn includes(self, fk: &ForeignKeyDef) -> bool {
+        match self {
+            FkCheckMode::All => true,
+            FkCheckMode::ImmediateOnly => !fk.is_initially_deferred(),
+        }
+    }
+}
+
 /// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
 /// （TABLE-16・TASK-204）。`CHECK` 制約（Issue #906）→ 一意性制約（主キー・
 /// UNIQUE）→ `FOREIGN KEY` の参照元側（TABLE-17・TASK-205、Issue #907。書いた行が
 /// 参照する値の組が参照先に存在するか）の順に検査する。`written_ids` の契約は [`enforce_unique_keys_in_txn`]
-/// と同じ。いずれの制約も宣言しないテーブルは即座に成功する。
+/// と同じ。いずれの制約も宣言しないテーブルは即座に成功する。`fk_mode` は
+/// `INITIALLY DEFERRED` の FK を文単位検査から除外するかどうか
+/// （[`FkCheckMode`] 参照。`CHECK`・一意性制約には遅延の概念がなく常時検査する）。
 pub(crate) fn enforce_row_constraints_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     written_ids: &[u64],
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
-    enforce_foreign_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)
+    enforce_foreign_keys_in_txn(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        written_ids,
+        fk_mode,
+    )
 }
 
 /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）の検査。`written_ids` の各行を
@@ -794,9 +833,14 @@ fn foreign_key_specs(
 }
 
 /// 復元済みの参照元列の値から、参照先に存在しなければならない値の組を
-/// `required` へ積む。いずれかの構成列が NULL の組は検査対象外（MATCH SIMPLE。
-/// PostgreSQL の既定）。`id` 参照で負値（物理キー `id` は `u64`）は参照先が
+/// `required` へ積む。`id` 参照で負値（物理キー `id` は `u64`）は参照先が
 /// 存在し得ないため即座に違反とする。
+///
+/// `MATCH SIMPLE`（既定）はいずれかの構成列が NULL の組を検査対象外とする
+/// （PostgreSQL の既定）。`MATCH FULL`（TABLE-17・TASK-205、Issue #1077）は
+/// **すべて** NULL の組のみ検査対象外とし、NULL と非 NULL が混在する組は
+/// `Err(ForeignKeyViolation)` にする（単一列の FK は NULL が 0 個か全部＝1 個の
+/// いずれかしかあり得ないため `MATCH SIMPLE` と同じ挙動になる）。
 fn push_required_key(
     spec: &ForeignKeySpec<'_>,
     values: &[Option<ScalarRef<'_>>],
@@ -823,6 +867,16 @@ fn push_required_key(
             ids.insert(id);
         }
         RequiredParentKeys::Keys(keys) => {
+            if spec.fk.match_type() == ForeignKeyMatch::Full {
+                let null_count = spec
+                    .indices
+                    .iter()
+                    .filter(|&&idx| values.get(idx).and_then(|v| v.as_ref()).is_none())
+                    .count();
+                if null_count > 0 && null_count < spec.indices.len() {
+                    return Err(TenantWriteError::ForeignKeyViolation);
+                }
+            }
             let key_spec = KeySpec {
                 indices: spec.indices.clone(),
                 null_policy: NullPolicy::Skip,
@@ -958,18 +1012,29 @@ fn parent_schema_for(
 /// 全行に存在することを確かめる。同一文・同一明示トランザクション内で先に書いた
 /// 参照先の行（自己参照で同じ文が書いた行を含む）も redb の write トランザクションが
 /// 自身の未 commit の書き込みを読めるため母集合に含まれる。`FOREIGN KEY` を宣言
-/// しないテーブルは即座に成功する。
+/// しないテーブルは即座に成功する。`fk_mode` が `ImmediateOnly` のとき
+/// `INITIALLY DEFERRED` の FK は検査対象から除く（COMMIT 時
+/// [`enforce_deferred_foreign_keys_in_txn`] へ先送りする。TABLE-17・TASK-205、
+/// Issue #1077）。
 fn enforce_foreign_keys_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     written_ids: &[u64],
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     if schema.foreign_keys().is_empty() || written_ids.is_empty() {
         return Ok(());
     }
     let (specs, mask) = foreign_key_specs(schema)?;
+    let specs: Vec<ForeignKeySpec<'_>> = specs
+        .into_iter()
+        .filter(|spec| fk_mode.includes(spec.fk))
+        .collect();
+    if specs.is_empty() {
+        return Ok(());
+    }
     let mut required: Vec<RequiredParentKeys> = specs
         .iter()
         .map(|spec| RequiredParentKeys::new(spec.fk))
@@ -1239,6 +1304,15 @@ struct ActionState {
 /// 連鎖の深さ・総行数が [`MAX_REFERENTIAL_ACTION_DEPTH`]・
 /// [`MAX_REFERENTIAL_ACTION_ROWS`] を超えた場合は
 /// [`TenantWriteError::ReferentialActionLimitExceeded`]（副作用ゼロ。適用前に判定）。
+///
+/// 更新（[`ReferencedRowsChange::ColumnsUpdated`]／`AllColumnsReplaced`）で主キー・
+/// UNIQUE 制約の構成列に触れない場合は、参照先キーが変わり得ないためカタログの
+/// 逆引きすら行わない（主キー・UNIQUE を宣言しないテーブルの `UPDATE` はコスト
+/// ゼロ）。計算量は参照元のテナント保有行数に比例する（一意性検査と同じく永続
+/// 索引は持たない。`docs/design/foreign-key.md` 参照）。
+/// `fk_mode` が `ImmediateOnly` のとき `INITIALLY DEFERRED` の FK は検査対象から
+/// 除く（COMMIT 時 [`enforce_deferred_foreign_keys_in_txn`] へ先送りする。
+/// TABLE-17・TASK-205、Issue #1077）。
 pub(crate) fn enforce_referencing_rows_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -1246,6 +1320,7 @@ pub(crate) fn enforce_referencing_rows_in_txn(
     tenant_id: &str,
     change: ReferencedRowsChange<'_>,
     pre_images: Option<&UpdatedKeyPreImages>,
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     let is_key_column = |name: &str| -> bool {
         schema
@@ -1280,7 +1355,8 @@ pub(crate) fn enforce_referencing_rows_in_txn(
     };
     if let Some(propagated) = PropagatedChange::from_public(change, schema) {
         propagate_referential_actions(
-            write_txn, table_name, schema, tenant_id, propagated, pre_images, 0, &mut state,
+            write_txn, table_name, schema, tenant_id, propagated, pre_images, fk_mode, 0,
+            &mut state,
         )?;
     }
 
@@ -1290,11 +1366,19 @@ pub(crate) fn enforce_referencing_rows_in_txn(
         schema,
         tenant_id,
         updated_names.as_deref(),
+        fk_mode,
     )?;
     // 連鎖で変更した各テーブルも全 FK について事後検証する（重複するテーブルへの
     // 再検証は無駄だが安全側であり、連鎖の総行数は上限で有界なため許容する）。
     for (touched_table, touched_schema) in &state.touched {
-        verify_no_action_backstop(write_txn, touched_table, touched_schema, tenant_id, None)?;
+        verify_no_action_backstop(
+            write_txn,
+            touched_table,
+            touched_schema,
+            tenant_id,
+            None,
+            fk_mode,
+        )?;
     }
     Ok(())
 }
@@ -1303,13 +1387,16 @@ pub(crate) fn enforce_referencing_rows_in_txn(
 /// `table_name` を参照する各 `FOREIGN KEY` について、参照元の同一テナント全行の
 /// 値の組が現在の `table_name` にすべて存在することを確かめる。`updated_names`
 /// が `Some` の場合、参照先列がそれらに含まれない FK は検査を省く（連鎖で変更した
-/// テーブルは `None` を渡し、常に全 FK を検査する）。
+/// テーブルは `None` を渡し、常に全 FK を検査する）。`fk_mode` が `ImmediateOnly`
+/// のとき `INITIALLY DEFERRED` の FK は検査対象から除く（TABLE-17・TASK-205、
+/// Issue #1077）。
 fn verify_no_action_backstop(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     updated_names: Option<&[&str]>,
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
     for (child_schema, fk) in &referencing {
@@ -1325,43 +1412,121 @@ fn verify_no_action_backstop(
                 continue;
             }
         }
-        // 参照元の同一テナント全行から、参照先に存在すべき値の組を集める。
-        let (specs, mask) = foreign_key_specs(child_schema)?;
-        let Some(spec) = specs.iter().find(|s| s.fk == fk) else {
-            return Err(internal(
-                "referencing foreign key not found in child schema",
-            ));
-        };
-        let mut required = RequiredParentKeys::new(fk);
-        {
-            let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-            let row_table =
-                match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
-                    Ok(t) => t,
-                    // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
-                    Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                    Err(e) => {
-                        return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                            e,
-                        )))
-                    }
-                };
-            let range_start = std::ops::Bound::Included((tenant_id, 0u64));
-            let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
-            for entry in row_table
-                .range::<(&str, u64)>((range_start, range_end))
-                .map_err(CatalogError::from)?
-            {
-                let (k, v) = entry.map_err(CatalogError::from)?;
-                let (key_tenant, _id) = k.value();
-                if key_tenant != tenant_id {
-                    break;
-                }
-                let values = decode_key_columns(child_schema, &mask, v.value())?;
-                push_required_key(spec, &values, &mut required)?;
-            }
+        if !fk_mode.includes(fk) {
+            continue;
         }
-        verify_required_parent_keys(write_txn, table_name, schema, fk, tenant_id, required)?;
+        verify_child_rows_for_tenant(write_txn, child_schema, fk, table_name, schema, tenant_id)?;
+    }
+    Ok(())
+}
+
+/// 子テーブル `child_schema` の同一テナント全行から `fk` が要求する値の組を集め、
+/// 参照先 `parent_table`（スキーマ `parent_schema`）にすべて存在するか確かめる
+/// （TABLE-17・TASK-205、Issue #907／#1077）。[`enforce_referencing_rows_in_txn`]
+/// （事後状態の検証）と [`enforce_deferred_foreign_keys_in_txn`]（COMMIT 時の
+/// 遅延検査）が共有する唯一の実装（挙動を 2 か所で重複させない）。
+fn verify_child_rows_for_tenant(
+    write_txn: &redb::WriteTransaction,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    tenant_id: &str,
+) -> Result<(), TenantWriteError> {
+    // 参照元の同一テナント全行から、参照先に存在すべき値の組を集める。
+    let (specs, mask) = foreign_key_specs(child_schema)?;
+    let Some(spec) = specs.iter().find(|s| s.fk == fk) else {
+        return Err(internal(
+            "referencing foreign key not found in child schema",
+        ));
+    };
+    let mut required = RequiredParentKeys::new(fk);
+    {
+        let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+        let row_table =
+            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+                Ok(t) => t,
+                // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => {
+                    return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                        e,
+                    )))
+                }
+            };
+        let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+        let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+        for entry in row_table
+            .range::<(&str, u64)>((range_start, range_end))
+            .map_err(CatalogError::from)?
+        {
+            let (k, v) = entry.map_err(CatalogError::from)?;
+            let (key_tenant, _id) = k.value();
+            if key_tenant != tenant_id {
+                break;
+            }
+            let values = decode_key_columns(child_schema, &mask, v.value())?;
+            push_required_key(spec, &values, &mut required)?;
+        }
+        // `row_table` はここで drop してから `verify_required_parent_keys` が
+        // 参照先の行ストアを開く（自己参照で redb の `TableAlreadyOpen` を
+        // 避けるための順序。`parent_schema_for` 呼び出し元と同じ契約）。
+    }
+    verify_required_parent_keys(
+        write_txn,
+        parent_table,
+        parent_schema,
+        fk,
+        tenant_id,
+        required,
+    )
+}
+
+/// 明示トランザクション（SQL-31・TASK-221）の COMMIT 時に、文単位検査から
+/// 先送りしていた `INITIALLY DEFERRED` の `FOREIGN KEY` をまとめて検査する
+/// （TABLE-17・TASK-205、Issue #1077）。`sql::transaction::SessionTransaction::commit`
+/// が `written_by_tenant`（このトランザクション内で書き込んだ `(tenant, table)` の
+/// 集合）の各要素について呼ぶ——記録漏れは検査漏れ＝fail-open のバグになるため、
+/// 呼び出し元は書き込みのたびに必ず記録する契約（`sql::transaction::ActiveTxn`
+/// ドキュメント参照）。
+///
+/// 事後状態（COMMIT 直前の最終状態）の全件検証を行う: `table` 自身が親として
+/// 持つ `INITIALLY DEFERRED` の子（[`crate::catalog::referencing_foreign_keys_in_txn`]。
+/// v9 対応が前提——v8 のみの逆引きだと v9 の子が漏れて fail-open になる）と、
+/// `table` 自身が子として持つ `INITIALLY DEFERRED` の宣言の両方を、
+/// [`verify_child_rows_for_tenant`] で検証する（`enforce_referencing_rows_in_txn`
+/// と同じ実装を共有）。同一トランザクション内で複数文が同じ `(child, fk)` の
+/// 組に触れても検査は 1 回で済むよう、呼び出し元がテーブル単位で重複排除する。
+pub(crate) fn enforce_deferred_foreign_keys_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    let schema = crate::catalog::require_table_schema_write(write_txn, table)?;
+
+    // `table` を子とする宣言（このスキーマの `foreign_keys()`）。
+    for fk in schema.foreign_keys() {
+        if !fk.is_initially_deferred() {
+            continue;
+        }
+        let parent = parent_schema_for(write_txn, table, fk)?;
+        verify_child_rows_for_tenant(
+            write_txn,
+            &schema,
+            fk,
+            fk.parent_table(),
+            parent.as_ref().unwrap_or(&schema),
+            tenant_id,
+        )?;
+    }
+
+    // `table` を親とする他テーブル（自己参照は上のループで既に検査済み）の宣言。
+    let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?;
+    for (child_schema, fk) in &referencing {
+        if !fk.is_initially_deferred() || child_schema.name == table {
+            continue;
+        }
+        verify_child_rows_for_tenant(write_txn, child_schema, fk, table, &schema, tenant_id)?;
     }
     Ok(())
 }
@@ -1386,6 +1551,7 @@ fn propagate_referential_actions(
     tenant_id: &str,
     change: PropagatedChange,
     pre_images: Option<&UpdatedKeyPreImages>,
+    fk_mode: FkCheckMode,
     depth: u32,
     state: &mut ActionState,
 ) -> Result<(), TenantWriteError> {
@@ -1473,6 +1639,7 @@ fn propagate_referential_actions(
                 child_schema,
                 tenant_id,
                 &child_ids,
+                fk_mode,
             )?;
         }
         state
@@ -1486,6 +1653,7 @@ fn propagate_referential_actions(
             tenant_id,
             child_change,
             child_pre_images.as_ref(),
+            fk_mode,
             new_depth,
             state,
         )?;
