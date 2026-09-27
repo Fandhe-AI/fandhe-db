@@ -1062,6 +1062,14 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `tests/three_client_http/{urllib_client.py,fetch_client.js}`
   （`make e2e-three-client-http`。opt-in・`ci` 非包含）。実行記録の様式は
   `docs/design/three-client-e2e-harness.md` 参照
+- 層 B パリティ総合検証（Phase 7 機能・insert・DDL 3 op を含む `Op::ALL`
+  全網羅・Issue #950）: 同じ `three_client_http_e2e.rs` の
+  `PARITY_CASES`（範囲比較・`IN`・`OR`・`sort`・`offset`・複数列
+  `group_by`）・`REJECTION_CASES`・`run_phase7_write_parity_scenario`
+  （insert／DDL／述語形 `delete`）・`parity_matrix_covers_every_nosql_op`
+  （op カバレッジガード。`#[ignore]` なし・常時 `make ci`）。詳細は
+  `docs/design/three-client-e2e-harness.md`「パリティ総合検証（Issue
+  #950）」節参照
 
 ## spec 側への申し送り候補
 
