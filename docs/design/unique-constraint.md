@@ -192,7 +192,10 @@ CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは
 - 永続一意索引（redb 二次テーブル）による O(log n) 判定
 - ファイル形 INSERT（`replace_typed_rows_by_text_key`）の UNIQUE 制約対応
   （現状は fail-closed 拒否）
-- `UPSERT` の `ON CONFLICT` 対象列（`id` 固定）への UNIQUE 列拡張
+- `UPSERT` の `ON CONFLICT` 対象列への UNIQUE 列拡張は実装済み（TABLE-16、
+  Issue #1074。設計判断は `docs/design/sql-upsert.md`「ON CONFLICT 対象の
+  UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を対象にすることは
+  引き続きスコープ外（`42601`）。
 - `NUMERIC`／`REAL`／`DOUBLE PRECISION`／`JSON`／`JSONB`／配列型への拡張
 - NoSQL 表層の DDL op（`create table` 相当）・wire-server 経由の専用結合テスト
   （NoSQL 表層は `execute_bound_insert_in_session`／`execute_bound_update_in_session`

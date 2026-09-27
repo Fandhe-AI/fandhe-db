@@ -2014,6 +2014,19 @@ pub enum OnConflictAction {
     DoUpdate(Vec<(String, UpsertValue)>),
 }
 
+/// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`（SQL-20・
+/// TABLE-16、Issue #1074）。対象列リストは構文段階（本モジュール）では列名の
+/// 宣言順の並びとしてのみ受理し、スキーマ照合（`id` 疑似列か、UNIQUE 制約の
+/// 構成列集合と一致するか）は `sql::parser::bind_upsert_form` の責務とする
+/// （`ValidatedStatement` の一般契約と同じ「構造検証はここまで」の分担）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflictClause {
+    /// `ON CONFLICT (...)` に書かれた列名の宣言順（`push` 前に列数上限
+    /// [`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]・重複列名を検査済み）。
+    pub target: Vec<String>,
+    pub action: OnConflictAction,
+}
+
 /// 許可形状の構造判定を通過した INSERT 文（SQL-10・SQL-16、TASK-80・TASK-190）。
 /// `ValidatedStatement` と同様、本モジュールが保証するのはここまでの構造情報のみで、
 /// 列名・値の意味論的妥当性は検証しない（`sql::parser::bind_insert` の責務）。
@@ -2045,12 +2058,15 @@ pub struct ValidatedInsert {
     /// 句の直前にのみ置ける（[`Parser::parse_returning_clause`] 参照）。関数呼び出し
     /// 項目（[`Projection::Items`]）はここには到達しない（構造検証段で `42601`）。
     pub returning: Option<Projection>,
-    /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
-    /// Issue #872）。句の省略は `None`（本 Issue 導入前と完全に同じ「行 `id`
-    /// 衝突は常に `23505`」の挙動）。複数行 `VALUES` と併用可能（全行が同じ
-    /// 衝突分岐を共有する）。ファイル形 INSERT との併用は
+    /// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`
+    /// （SQL-20・TASK-193、Issue #872。対象列を UNIQUE 制約列へ拡張:
+    /// TABLE-16、Issue #1074）。句の省略は `None`。対象列が `(id)` のみの
+    /// 場合は本 Issue（#1074）導入前と完全に同じ「行 `id` 衝突は常に
+    /// `23505`」の挙動になる（`sql::parser::bind_upsert_form` が
+    /// `BoundConflictTarget::RowId` へ解決する）。複数行 `VALUES` と併用可能
+    /// （全行が同じ衝突分岐を共有する）。ファイル形 INSERT との併用は
     /// `sql::parser::bind_insert_form` が `42601` で拒否する。
-    pub on_conflict: Option<OnConflictAction>,
+    pub on_conflict: Option<OnConflictClause>,
 }
 
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
@@ -4580,40 +4596,58 @@ impl<'a> Parser<'a> {
     /// `ON CONFLICT (ID)` / `(Id)` は実在しない列名として `42601` になる
     /// （キーワードの大文字小文字非依存と矛盾しない、識別子側の既定契約
     /// どおりの挙動）。
-    fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictAction>, SqlSurfaceError> {
+    ///
+    /// 対象列リストは `id` に限らず任意の識別子の列（TABLE-16、Issue #1074）を
+    /// 構文段階で受理する。列数上限（[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）
+    /// 超過・列名の重複はここで `42601` として拒否するが、対象列が実在する
+    /// スキーマ列か・`id` 単独か・宣言済み UNIQUE 制約の構成列集合と一致するかの
+    /// 意味論的検証は本モジュールの管轄外（`sql::parser::bind_upsert_form`）。
+    /// `ON CONFLICT ON CONSTRAINT ...`・空の対象リスト（`ON CONFLICT ()`）は
+    /// 未対応のまま `42601`（対象外・申し送り: Issue #1074 §8）。
+    fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictClause>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("ON") {
             return Ok(None);
         }
         self.advance();
         self.expect_contextual_keyword("CONFLICT")?;
         self.expect_punct('(')?;
-        match self.advance() {
-            Some(Token::Ident(name)) if name == "id" => {}
-            other => {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "ON CONFLICT target list must be (id), got {other:?}"
-                )))
+        let mut target = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if target.len() >= crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many ON CONFLICT target columns",
+                ));
             }
+            let name = self.expect_ident()?;
+            if target.iter().any(|c: &String| c == &name) {
+                return Err(SqlSurfaceError::unsupported(
+                    "duplicate ON CONFLICT target column",
+                ));
+            }
+            target.push(name);
         }
         self.expect_punct(')')?;
         self.expect_contextual_keyword("DO")?;
-        if self.peek_contextual_keyword("NOTHING") {
+        let action = if self.peek_contextual_keyword("NOTHING") {
             self.advance();
-            return Ok(Some(OnConflictAction::DoNothing));
-        }
-        self.expect_contextual_keyword("UPDATE")?;
-        self.expect_contextual_keyword("SET")?;
-        let mut assignments = vec![self.parse_upsert_assignment()?];
-        while matches!(self.peek(), Some(Token::Punct(','))) {
-            self.advance();
-            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
-                return Err(SqlSurfaceError::unsupported(
-                    "too many ON CONFLICT DO UPDATE SET assignments",
-                ));
+            OnConflictAction::DoNothing
+        } else {
+            self.expect_contextual_keyword("UPDATE")?;
+            self.expect_contextual_keyword("SET")?;
+            let mut assignments = vec![self.parse_upsert_assignment()?];
+            while matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+                    return Err(SqlSurfaceError::unsupported(
+                        "too many ON CONFLICT DO UPDATE SET assignments",
+                    ));
+                }
+                assignments.push(self.parse_upsert_assignment()?);
             }
-            assignments.push(self.parse_upsert_assignment()?);
-        }
-        Ok(Some(OnConflictAction::DoUpdate(assignments)))
+            OnConflictAction::DoUpdate(assignments)
+        };
+        Ok(Some(OnConflictClause { target, action }))
     }
 
     /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = (EXCLUDED.<col> |
@@ -7895,7 +7929,7 @@ struct ParsedInsertShape {
     rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
-    on_conflict: Option<OnConflictAction>,
+    on_conflict: Option<OnConflictClause>,
 }
 
 /// `DELETE` の `WHERE` 句の構造形状（Issue #870・SQL-19）。単一行・`id` 完全
@@ -10290,7 +10324,13 @@ mod tests {
             LedgerMode::Ledgered,
         )
         .expect("DO NOTHING should be accepted");
-        assert_eq!(stmt.on_conflict, Some(OnConflictAction::DoNothing));
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
     }
 
     #[test]
@@ -10306,16 +10346,19 @@ mod tests {
         .expect("DO UPDATE SET should be accepted");
         assert_eq!(
             stmt.on_conflict,
-            Some(OnConflictAction::DoUpdate(vec![
-                (
-                    "embedding".to_string(),
-                    UpsertValue::Excluded("embedding".to_string())
-                ),
-                (
-                    "lang".to_string(),
-                    UpsertValue::Literal(InsertLiteral::String("en".to_string()))
-                ),
-            ]))
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoUpdate(vec![
+                    (
+                        "embedding".to_string(),
+                        UpsertValue::Excluded("embedding".to_string())
+                    ),
+                    (
+                        "lang".to_string(),
+                        UpsertValue::Literal(InsertLiteral::String("en".to_string()))
+                    ),
+                ]),
+            })
         );
     }
 
@@ -10330,7 +10373,13 @@ mod tests {
         )
         .expect("multi-row VALUES with ON CONFLICT should be accepted");
         assert_eq!(stmt.rows.len(), 2);
-        assert_eq!(stmt.on_conflict, Some(OnConflictAction::DoNothing));
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
     }
 
     #[test]
@@ -10347,41 +10396,106 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upsert_non_id_target_column() {
+    fn accepts_upsert_non_id_target_column_at_syntax_level() {
+        // 構文段階（本モジュール）では `id` に限らず任意の列名を対象列として
+        // 受理する（TABLE-16、Issue #1074）。宣言済み UNIQUE 制約の構成列
+        // 集合と一致するかの意味論的検証は `sql::parser::bind_upsert_form` の
+        // 責務であり、`lang` に UNIQUE 制約が無いスキーマでは最終的に `42601`
+        // になることを `sql::parser` の結合テストで固定する
+        // （`rejects_upsert_target_not_matching_any_unique_constraint` 参照）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (lang) DO NOTHING \
              USING OPERATION_ID 'op-upsert-5'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("non-id target column should be accepted at the syntax level");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["lang".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
     }
 
     #[test]
-    fn rejects_upsert_target_column_with_mismatched_case() {
+    fn accepts_upsert_target_column_with_mismatched_case_at_syntax_level() {
         // `id` は列識別子であり、`ON`/`CONFLICT`/`DO` のような文脈的キーワード
         // ではない（大文字小文字保存・区別。`parse_on_conflict_clause` の
         // ドキュメンテーションコメント参照。cursor(Bugbot) 指摘
         // https://github.com/Fandhe-AI/vector-db/pull/990#discussion_r4075151521）。
+        // 構文段階では任意の識別子を対象列として受理するため（Issue #1074）、
+        // `(ID)`／`(Id)` もここでは受理される。大小文字違いが実在しない列名と
+        // して最終的に `42601` になることは bind 段（`sql::parser`）の結合
+        // テストで固定する（`rejects_upsert_target_column_with_mismatched_case`
+        // 参照）。
         let lookup = catalog_with(&["documents"]);
         for target in ["ID", "Id"] {
             let sql = format!(
                 "INSERT INTO documents (id) VALUES (1) ON CONFLICT ({target}) DO NOTHING \
                  USING OPERATION_ID 'op-upsert-case'"
             );
-            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601");
+            let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered)
+                .expect("case-mismatched target column should be accepted at the syntax level");
+            assert_eq!(
+                stmt.on_conflict,
+                Some(OnConflictClause {
+                    target: vec![target.to_string()],
+                    action: OnConflictAction::DoNothing,
+                })
+            );
         }
     }
 
     #[test]
-    fn rejects_upsert_multiple_target_columns() {
+    fn accepts_upsert_multiple_target_columns_at_syntax_level() {
+        // 複数対象列の構文自体は本モジュールで受理する（TABLE-16、Issue #1074）。
+        // `(id, lang)` が宣言済み UNIQUE 制約のいずれとも一致しない場合に
+        // 最終的に `42601` になることは bind 段の結合テストで固定する
+        // （`rejects_upsert_target_not_matching_any_unique_constraint` 参照）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (id, lang) DO NOTHING \
              USING OPERATION_ID 'op-upsert-6'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("multiple target columns should be accepted at the syntax level");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string(), "lang".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_upsert_target_column_count_over_limit() {
+        // 列数上限（[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）超過は
+        // 構文段階で `42601`（TABLE-16、Issue #1074）。
+        let lookup = catalog_with(&["documents"]);
+        let target_list = (0..=crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT ({target_list}) DO NOTHING \
+             USING OPERATION_ID 'op-upsert-too-many-targets'"
+        );
+        let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_duplicate_target_column() {
+        // 対象列名の重複は構文段階で `42601`（TABLE-16、Issue #1074）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (lang, lang) \
+             DO NOTHING USING OPERATION_ID 'op-upsert-dup-target'",
             &lookup,
             LedgerMode::Ledgered,
         )
