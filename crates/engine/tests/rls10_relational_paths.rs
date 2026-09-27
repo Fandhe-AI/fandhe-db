@@ -181,14 +181,18 @@ fn leak_tenant_name(tenant: &str) -> &'static str {
     }
 }
 
-/// 共有フィクスチャを構築する。`flood=false` は「閲覧テナント（tenant-a）の
-/// Public/Private 行 ＋ 他テナントの Public 行のみ」（baseline）、`flood=true`
-/// は baseline に「他テナントの Private 行」（全テナント対称の Private 行 ＋
-/// 結合キー・`lang` を故意に一致させた flood 行）を追加した状態（flooded）。
-/// baseline/flooded の差分が「他テナントの不可視行のみ」になるよう、Public 行は
-/// 両方で同一内容にする（TABLE-12: 同一 `id`／結合キー／`lang` を複数テナントが
-/// 保持しても物理キー `(tenant_id, id)` で分離されることの確認を兼ねる）。
-fn seed_fixture(storage: &Storage, flood: bool) -> Vec<RowTruth> {
+/// 共有フィクスチャを構築する。`viewer` は「Private 行を保持する自テナント」
+/// （T2 の結果不変性比較を tenant-a 以外の閲覧テナントでも固定できるよう
+/// 引数化してある。advisor 指摘）。`flood=false` は「`viewer` の Public/Private
+/// 行 ＋ 他テナントの Public 行のみ」（baseline）、`flood=true` は baseline に
+/// 「`viewer` 以外の 1 テナント（`TENANTS` 内で `viewer` の次に現れるもの。
+/// 全呼び出しが `viewer=TENANT_A` の既存軸では従来どおり tenant-b になる）の
+/// Private 行」（全テナント対称の Private 行 ＋ 結合キー・`lang` を故意に
+/// 一致させた flood 行）を追加した状態（flooded）。baseline/flooded の差分が
+/// 「他テナントの不可視行のみ」になるよう、Public 行は両方で同一内容にする
+/// （TABLE-12: 同一 `id`／結合キー／`lang` を複数テナントが保持しても物理キー
+/// `(tenant_id, id)` で分離されることの確認を兼ねる）。
+fn seed_fixture(storage: &Storage, viewer: &str, flood: bool) -> Vec<RowTruth> {
     storage.create_table(&authors_schema()).expect("authors");
     storage
         .create_table(&documents_schema())
@@ -201,7 +205,7 @@ fn seed_fixture(storage: &Storage, flood: bool) -> Vec<RowTruth> {
     let mut truths = Vec::new();
 
     for &tenant in TENANTS.iter() {
-        let include_private = tenant == TENANT_A || flood;
+        let include_private = tenant == viewer || flood;
 
         // authors: id=1 Public（結合キーとして全テナントが再利用）、id=2 Private。
         insert_row(
@@ -357,19 +361,28 @@ fn seed_fixture(storage: &Storage, flood: bool) -> Vec<RowTruth> {
     }
 
     if flood {
-        // tenant-b の flood 行: tenant-a の author id=1 と同じ結合キーを持つ
+        // `viewer` 以外の 1 テナント（flooder）を flood 行の保持者にする。
+        // 既存呼び出し（`viewer=TENANT_A`）では `TENANTS` の並びから従来どおり
+        // tenant-b になり、T4 のハードコードされた tenant-b 前提と両立する。
+        let flooder = TENANTS
+            .iter()
+            .copied()
+            .find(|&t| t != viewer)
+            .expect("TENANTS has at least one entry other than viewer");
+
+        // flooder の flood 行: viewer の author id=1 と同じ結合キーを持つ
         // documents を大量に Private で追加する（外部結合・カーディナリティが
         // 他テナントの不可視行数に依存しないことの確認用、T2・T4）。
         for i in 0..20u64 {
             insert_row(
                 storage,
                 DOCUMENTS,
-                TENANT_B,
+                flooder,
                 1000 + i,
                 Visibility::Private,
                 &[
                     Value::Vector(vec![(1000 + i) as f32, 0.0]),
-                    Value::Text(unique_token(DOCUMENTS, TENANT_B, 1000 + i)),
+                    Value::Text(unique_token(DOCUMENTS, flooder, 1000 + i)),
                     Value::BigInt(1),
                     Value::Text("ja".to_string()),
                     Value::BigInt(i as i64),
@@ -377,17 +390,17 @@ fn seed_fixture(storage: &Storage, flood: bool) -> Vec<RowTruth> {
                 &mut truths,
             );
         }
-        // tenant-b だけが可視な langs 行（`EXISTS` の真偽が他テナント行に
+        // flooder だけが可視な langs 行（`EXISTS` の真偽が他テナント行に
         // 依存しないことの確認用、T4）。
         insert_row(
             storage,
             LANGS,
-            TENANT_B,
+            flooder,
             2500,
             Visibility::Private,
             &[
                 Value::Vector(vec![25.0, 0.0]),
-                Value::Text("zz-only-tenant-b".to_string()),
+                Value::Text(format!("zz-only-{flooder}")),
             ],
             &mut truths,
         );
@@ -406,7 +419,7 @@ fn create_view(core: &EngineCore) {
         &ctx_for(TENANT_A, true),
         &mut session,
         &format!(
-            "CREATE VIEW {VIEW_JA_DOCS} AS SELECT id, lang FROM {DOCUMENTS} WHERE lang = 'ja'"
+            "CREATE VIEW {VIEW_JA_DOCS} AS SELECT id, title, lang FROM {DOCUMENTS} WHERE lang = 'ja'"
         ),
     )
     .expect("CREATE VIEW should succeed");
@@ -436,6 +449,13 @@ enum Check {
     Token,
     /// `id` 疑似列（`ColumnMeta::Id`）が `documents` テーブルの許可 id 集合の
     /// 部分集合であることを確認する（`documents` 単独スキャン系の形）。
+    /// codex 指摘（PRRT_kwDOUAKASM6mXX2L）: 複数テナントが同一 `documents.id`
+    /// を再利用するフィクスチャでは、id 単独の部分集合検査は「別テナントの
+    /// 同一 id 行が混入した」ケースを見逃す（混入 id が閲覧テナント自身の
+    /// 許可 id 集合とたまたま一致するため）。このためこの形はすべて `title`
+    /// （一意トークン）も併せて投影し、`assert_no_leak` の禁止トークン検査
+    /// （`Token` と共通の経路）を主検出手段として使う。id の部分集合検査は
+    /// 補助（過小返却ではない不許可 id の直接検出用）に留める。
     DocumentsId,
     /// 統計値のみを投影する形（T1 の混入検出は行わず、T2 の差分比較のみに
     /// 委ねる。値自体からテナント帰属を復元できないため）。
@@ -474,17 +494,17 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             axis: "subquery_in",
-            sql: "SELECT id FROM documents WHERE lang IN (SELECT lang FROM langs LIMIT 1000) LIMIT 50",
+            sql: "SELECT id, title FROM documents WHERE lang IN (SELECT lang FROM langs LIMIT 1000) LIMIT 50",
             check: Check::DocumentsId,
         },
         Shape {
             axis: "subquery_exists",
-            sql: "SELECT id FROM documents WHERE EXISTS (SELECT id FROM langs LIMIT 1) LIMIT 50",
+            sql: "SELECT id, title FROM documents WHERE EXISTS (SELECT id FROM langs LIMIT 1) LIMIT 50",
             check: Check::DocumentsId,
         },
         Shape {
             axis: "cte",
-            sql: "WITH ja AS (SELECT id, lang FROM documents WHERE lang = 'ja') SELECT id FROM ja LIMIT 50",
+            sql: "WITH ja AS (SELECT id, title, lang FROM documents WHERE lang = 'ja') SELECT id, title FROM ja LIMIT 50",
             check: Check::DocumentsId,
         },
         Shape {
@@ -509,17 +529,17 @@ fn shapes() -> Vec<Shape> {
         },
         Shape {
             axis: "window_row_number",
-            sql: "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score DESC) FROM documents LIMIT 50",
+            sql: "SELECT id, title, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score DESC) FROM documents LIMIT 50",
             check: Check::DocumentsId,
         },
         Shape {
             axis: "window_count",
-            sql: "SELECT id, COUNT(*) OVER (PARTITION BY lang) FROM documents LIMIT 50",
+            sql: "SELECT id, title, COUNT(*) OVER (PARTITION BY lang) FROM documents LIMIT 50",
             check: Check::DocumentsId,
         },
         Shape {
             axis: "view",
-            sql: "SELECT id FROM ja_docs LIMIT 50",
+            sql: "SELECT id, title FROM ja_docs LIMIT 50",
             check: Check::DocumentsId,
         },
         Shape {
@@ -552,7 +572,7 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
     let path = unique_db_path("rls10-t0-shapes");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
-    let truths = seed_fixture(&storage, true);
+    let truths = seed_fixture(&storage, TENANT_A, true);
     let core = new_core(storage);
     create_view(&core);
 
@@ -698,7 +718,7 @@ fn relational_paths_never_leak_rows_per_independent_oracle() {
     let path = unique_db_path("rls10-t1-oracle");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
-    let truths = seed_fixture(&storage, true);
+    let truths = seed_fixture(&storage, TENANT_A, true);
     let core = new_core(storage);
     create_view(&core);
 
@@ -706,6 +726,22 @@ fn relational_paths_never_leak_rows_per_independent_oracle() {
         for &viewer in TENANTS.iter() {
             for allow_private in [false, true] {
                 let result = run(&core, viewer, allow_private, shape.sql);
+                // codex 指摘（PRRT_kwDOUAKASM6mXX2L）対応の回帰ガード:
+                // `Check::DocumentsId` の形は id の部分集合検査だけでは
+                // 同一 id を複数テナントが再利用するケースの混入を見逃す
+                // ため、`title`（一意トークン）も併せて投影して禁止トークン
+                // 検査（`Token` と共通の経路）で主検出させる設計にした
+                // （`shapes()` のコメント参照）。この投影が将来の編集で
+                // 誤って落とされ検査が id 単独へ静かに後退しないよう、
+                // 実クエリ結果は必ず TEXT セルを持つことを固定する。
+                if matches!(shape.check, Check::DocumentsId) {
+                    assert!(
+                        result.rows.iter().all(|row| !text_cells(row).is_empty()),
+                        "DocumentsId shape must project a text column (title) so the token-based \
+                         leak check stays the primary detector: axis={}",
+                        shape.axis
+                    );
+                }
                 assert_no_leak(
                     &result,
                     shape.check,
@@ -723,29 +759,35 @@ fn relational_paths_never_leak_rows_per_independent_oracle() {
 
 #[test]
 fn relational_results_are_identical_with_and_without_other_tenant_private_rows() {
-    let path_baseline = unique_db_path("rls10-t2-baseline");
-    let _guard_baseline = CleanupGuard(path_baseline.clone());
-    let storage_baseline = Storage::open(&path_baseline).expect("open storage");
-    seed_fixture(&storage_baseline, false);
-    let core_baseline = new_core(storage_baseline);
-    create_view(&core_baseline);
+    // codex 指摘（PRRT_kwDOUAKASM6mXX2N）: 従来は閲覧テナントを tenant-a に
+    // 固定していたため、tenant-b・tenant-c を閲覧者とする結果不変性
+    // （他テナント Private 行の増減に対する自テナント行の不変性）が固定
+    // されていなかった。`TENANTS` 全件を閲覧テナントとして回す。
+    for &viewer in TENANTS.iter() {
+        let path_baseline = unique_db_path(&format!("rls10-t2-baseline-{viewer}"));
+        let _guard_baseline = CleanupGuard(path_baseline.clone());
+        let storage_baseline = Storage::open(&path_baseline).expect("open storage");
+        seed_fixture(&storage_baseline, viewer, false);
+        let core_baseline = new_core(storage_baseline);
+        create_view(&core_baseline);
 
-    let path_flooded = unique_db_path("rls10-t2-flooded");
-    let _guard_flooded = CleanupGuard(path_flooded.clone());
-    let storage_flooded = Storage::open(&path_flooded).expect("open storage");
-    seed_fixture(&storage_flooded, true);
-    let core_flooded = new_core(storage_flooded);
-    create_view(&core_flooded);
+        let path_flooded = unique_db_path(&format!("rls10-t2-flooded-{viewer}"));
+        let _guard_flooded = CleanupGuard(path_flooded.clone());
+        let storage_flooded = Storage::open(&path_flooded).expect("open storage");
+        seed_fixture(&storage_flooded, viewer, true);
+        let core_flooded = new_core(storage_flooded);
+        create_view(&core_flooded);
 
-    for shape in shapes() {
-        for allow_private in [false, true] {
-            let r1 = run(&core_baseline, TENANT_A, allow_private, shape.sql);
-            let r2 = run(&core_flooded, TENANT_A, allow_private, shape.sql);
-            assert_eq!(
-                r1, r2,
-                "result changed when other tenants' Private rows were added: axis={} allow_private={allow_private}",
-                shape.axis
-            );
+        for shape in shapes() {
+            for allow_private in [false, true] {
+                let r1 = run(&core_baseline, viewer, allow_private, shape.sql);
+                let r2 = run(&core_flooded, viewer, allow_private, shape.sql);
+                assert_eq!(
+                    r1, r2,
+                    "result changed when other tenants' Private rows were added: axis={} viewer={viewer} allow_private={allow_private}",
+                    shape.axis
+                );
+            }
         }
     }
 }
@@ -757,13 +799,13 @@ fn outer_join_padding_and_exists_truth_do_not_depend_on_other_tenants() {
     let path_baseline = unique_db_path("rls10-t4-baseline");
     let _guard_baseline = CleanupGuard(path_baseline.clone());
     let storage_baseline = Storage::open(&path_baseline).expect("open storage");
-    seed_fixture(&storage_baseline, false);
+    seed_fixture(&storage_baseline, TENANT_A, false);
     let core_baseline = new_core(storage_baseline);
 
     let path_flooded = unique_db_path("rls10-t4-flooded");
     let _guard_flooded = CleanupGuard(path_flooded.clone());
     let storage_flooded = Storage::open(&path_flooded).expect("open storage");
-    seed_fixture(&storage_flooded, true);
+    seed_fixture(&storage_flooded, TENANT_A, true);
     let core_flooded = new_core(storage_flooded);
 
     // tenant-b が author_id=1（tenant-a の可視 author と同じ結合キー）の
@@ -817,13 +859,13 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
     let path_baseline = unique_db_path("rls10-t3-baseline");
     let _guard_baseline = CleanupGuard(path_baseline.clone());
     let storage_baseline = Storage::open(&path_baseline).expect("open storage");
-    seed_fixture(&storage_baseline, false);
+    seed_fixture(&storage_baseline, TENANT_A, false);
     let core_baseline = new_core(storage_baseline);
 
     let path_flooded = unique_db_path("rls10-t3-flooded");
     let _guard_flooded = CleanupGuard(path_flooded.clone());
     let storage_flooded = Storage::open(&path_flooded).expect("open storage");
-    seed_fixture(&storage_flooded, true);
+    seed_fixture(&storage_flooded, TENANT_A, true);
     let core_flooded = new_core(storage_flooded);
 
     let static_error_shapes = [
@@ -1148,7 +1190,7 @@ fn cache_warming_order_does_not_change_results() {
     let path_cold = unique_db_path("rls10-t5-cold");
     let _guard_cold = CleanupGuard(path_cold.clone());
     let storage_cold = Storage::open(&path_cold).expect("open storage");
-    seed_fixture(&storage_cold, true);
+    seed_fixture(&storage_cold, TENANT_A, true);
     let core_cold = new_core(storage_cold);
     let cold_results: Vec<QueryResult> = representative_sql
         .iter()
@@ -1159,7 +1201,7 @@ fn cache_warming_order_does_not_change_results() {
     let path_warm_b_first = unique_db_path("rls10-t5-warm-b-first");
     let _guard_warm_b_first = CleanupGuard(path_warm_b_first.clone());
     let storage_warm_b_first = Storage::open(&path_warm_b_first).expect("open storage");
-    seed_fixture(&storage_warm_b_first, true);
+    seed_fixture(&storage_warm_b_first, TENANT_A, true);
     let core_warm_b_first = new_core(storage_warm_b_first);
     for sql in representative_sql {
         run(&core_warm_b_first, TENANT_B, true, sql);
@@ -1177,7 +1219,7 @@ fn cache_warming_order_does_not_change_results() {
     let path_warm_a_first = unique_db_path("rls10-t5-warm-a-first");
     let _guard_warm_a_first = CleanupGuard(path_warm_a_first.clone());
     let storage_warm_a_first = Storage::open(&path_warm_a_first).expect("open storage");
-    seed_fixture(&storage_warm_a_first, true);
+    seed_fixture(&storage_warm_a_first, TENANT_A, true);
     let core_warm_a_first = new_core(storage_warm_a_first);
     for (i, sql) in representative_sql.iter().enumerate() {
         let first = run(&core_warm_a_first, TENANT_A, true, sql);
@@ -1198,7 +1240,7 @@ fn checker_negative_control_detects_fabricated_violation() {
     let path = unique_db_path("rls10-t6-negative-control");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
-    let truths = seed_fixture(&storage, true);
+    let truths = seed_fixture(&storage, TENANT_A, true);
 
     // 実在する他テナント Private 行（tenant-b の documents id=11）を、本来
     // 不許可であるにもかかわらず「許可された結果」として検査ヘルパへ渡す。
@@ -1263,5 +1305,43 @@ fn checker_negative_control_detects_fabricated_violation() {
     assert!(
         caught_id,
         "the DocumentsId leak-detection assertion failed to catch a fabricated violation"
+    );
+
+    // codex 指摘（PRRT_kwDOUAKASM6mXX2L）の収束確認: 旧オラクル（id 部分集合
+    // 検査のみ）は、混入した他テナント行の `id` が閲覧テナント自身の許可 id
+    // 集合とたまたま一致するケース（tenant-a・tenant-b の双方が id=11 の
+    // Private 行を持つ TABLE-12 衝突）を見逃していた。`title` 投影を追加した
+    // 現在の `Check::DocumentsId` 経路（禁止トークン検査が主検出手段）が、
+    // その具体的な衝突ケースを検出できることを固定する。
+    let collision_forbidden_token = unique_token(DOCUMENTS, TENANT_B, 11);
+    let collision_result = QueryResult {
+        columns: vec![
+            ColumnMeta::Id,
+            ColumnMeta::Scalar {
+                name: "title".to_string(),
+                ty: ColumnType::Text,
+            },
+        ],
+        rows: vec![engine::sql::exec::ResultRow {
+            id: 11,
+            score: 0.0,
+            cells: vec![Cell::Text(collision_forbidden_token)],
+        }],
+    };
+    let caught_collision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_no_leak(
+            &collision_result,
+            Check::DocumentsId,
+            &truths,
+            TENANT_A,
+            true,
+            "negative-control-id-collision",
+        );
+    }))
+    .is_err();
+    assert!(
+        caught_collision,
+        "the DocumentsId leak-detection assertion failed to catch a same-id cross-tenant \
+         collision (tenant-b's id=11 row masquerading as tenant-a's own id=11 row)"
     );
 }
