@@ -1311,27 +1311,45 @@ fn bind_nullif(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    // codex-review／Cursor Bugbot 指摘対応: この PR で `=` 演算子が
+    // `(Text, Text) => Bool` を新たに受理するようになった（`bind_binary`
+    // 参照）が、`NULLIF(a, b)` は `a = b` と等価な意味論（PostgreSQL
+    // 互換。`docs/spec/04-behavior/sql-surface.md` SQL-26 の
+    // 「PostgreSQL 互換」契約）を持つため、比較演算子と同じ型（`Scalar`
+    // または `Text`）の組を受理すべきだが、旧実装は `Scalar` に限定して
+    // いた。`unify_branch_type`（`CASE` の分岐型統一と共通）を使い、
+    // `Vector`／`Bool` を拒否しつつ `Scalar`／`Text` のいずれかで両辺の
+    // 型が一致することを要求する。
     bind_with_case_nesting(env, |env| {
         let (lhs_b, lhs_t) = bind_null_aware(lhs, env, node_budget)?;
         let (rhs_b, rhs_t) = bind_null_aware(rhs, env, node_budget)?;
         for t in [lhs_t, rhs_t].into_iter().flatten() {
-            if t != ExprType::Scalar {
+            if !matches!(t, ExprType::Scalar | ExprType::Text) {
                 return Err(SqlSurfaceError::DatatypeMismatch {
-                    detail: "NULLIF arguments must be scalar".to_string(),
+                    detail: "NULLIF arguments must be scalar or text".to_string(),
                 });
             }
         }
-        if lhs_t.is_none() && rhs_t.is_none() {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
-            });
-        }
+        let mut unified: Option<ExprType> = None;
+        unify_branch_type(
+            &mut unified,
+            lhs_t,
+            "NULLIF arguments must have the same type",
+        )?;
+        unify_branch_type(
+            &mut unified,
+            rhs_t,
+            "NULLIF arguments must have the same type",
+        )?;
+        let result_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
+        })?;
         Ok((
             BoundExpr::NullIf {
                 lhs: Box::new(lhs_b),
                 rhs: Box::new(rhs_b),
             },
-            ExprType::Scalar,
+            result_ty,
         ))
     })
 }
@@ -2048,9 +2066,10 @@ pub(crate) fn eval_with_scalars<'a>(
 /// lhs END` と等価な意味論。対象ビヘイビア: SQL-26）。再帰 `eval` の
 /// `BoundExpr::NullIf` 分岐と `sql::expr_program::ExprProgram::eval` の
 /// `ExprStep::NullIf` 分岐が共有する（Issue #353 と同じ「値ベース評価を 1 箇所に
-/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar` 限定済みのため、
-/// 非 `Null`・非 `Scalar` の組み合わせは束縛段の不変条件が崩れた場合の保険として
-/// `Internal` に倒す。
+/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar`／`Text` の
+/// いずれか一方に限定・統一済みのため、非 `Null`・非 `Scalar`・非 `Text` の
+/// 組み合わせ（型が食い違う場合を含む）は束縛段の不変条件が崩れた場合の
+/// 保険として `Internal` に倒す。
 pub(crate) fn eval_nullif<'a>(
     l: ExprValue<'a>,
     r: ExprValue<'a>,
@@ -2063,6 +2082,16 @@ pub(crate) fn eval_nullif<'a>(
                 Ok(ExprValue::Null)
             } else {
                 Ok(ExprValue::Scalar(a))
+            }
+        }
+        // codex-review／Cursor Bugbot 指摘対応: `=` 演算子が `(Text, Text) =>
+        // Bool` を受理するようになったことに合わせ、`NULLIF` も TEXT 同士の
+        // 組を受理する（PostgreSQL 互換。`bind_nullif` 参照）。
+        (ExprValue::Text(a), ExprValue::Text(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Text(a))
             }
         }
         _ => Err(SqlSurfaceError::Internal {

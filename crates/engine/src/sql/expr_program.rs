@@ -231,10 +231,11 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Vector(Cow::Owned(v)) => StackValue::VectorOwned(v),
         // `apply_builtin`／`udf_call::eval_binary` が返す `Text` は常に
         // `Cow::Owned`（`crate::sql::string_fn` は新規 `String` を構築する）。
-        // `Cow::Borrowed`（`TextColumnRef` を直接消費した結果）がここへ渡る
-        // 経路は現状存在しないが、網羅性のため所有化して落とす（fail-safe。
-        // `unreachable!` にはしない——`.claude/rules/coding-rust.md`「panic
-        // させない」）。
+        // `udf_call::eval_nullif` が `TextColumnRef` 由来の非等価オペランド
+        // （`stack_to_expr_value` が返す `Cow::Borrowed`）をそのまま返す経路が
+        // 追加されたため、`Cow::Borrowed` もここへ到達しうる。いずれの場合も
+        // 所有化して落とす（fail-safe。`unreachable!` にはしない——
+        // `.claude/rules/coding-rust.md`「panic させない」）。
         ExprValue::Text(s) => StackValue::Text(s.into_owned()),
     }
 }

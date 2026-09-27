@@ -522,28 +522,31 @@ fn multi_stage_coalesce_skips_multiple_null_text_arguments() {
 }
 
 #[test]
-fn nullif_rejects_text_operands_and_propagates_null_via_derived_scalar_expr() {
+fn nullif_accepts_text_operands_and_propagates_null_through_text_column() {
     let path = unique_db_path("sql26-nullif-text");
     let _guard = CleanupGuard(path.clone());
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
 
-    // NULLIF は `sql::udf_call::bind_nullif` が両辺を `ExprType::Scalar` に
-    // 限定するため、`TEXT` 型（`BoundExpr::TextColumnRef` そのもの）は
-    // オペランドとして構造的に受理されない（`=` 演算子と同じ既存契約）。
-    // そのため NULLIF の直接オペランドとして生の `TextColumnRef` マーカーが
-    // スタックへ積まれる経路は存在せず、本バグ（`JumpIfNotNull` の
-    // 誤判定）の影響を受けようがないことをまず固定する。
-    let err = core
-        .execute_sql(&ctx, "SELECT nullif(label, 'Hello') FROM docs LIMIT 10")
-        .expect_err("NULLIF must reject TEXT operands");
-    assert_eq!(err.wire_code(), "42804");
+    // codex-review／Cursor Bugbot 指摘対応: `=` 演算子が `(Text, Text) =>
+    // Bool` を新たに受理するようになったことに合わせ、`NULLIF` も PostgreSQL
+    // 互換（`docs/spec/04-behavior/sql-surface.md` SQL-26）で TEXT 同士の
+    // 組を受理する（`bind_nullif`／`eval_nullif` 参照）。旧実装は `Scalar`
+    // 限定で `42804` 拒否していたが、本回帰テストは受理・NULL 伝播を固定する。
+    let result = core
+        .execute_sql(&ctx, "SELECT id, nullif(label, 'Hello') FROM docs LIMIT 10")
+        .expect("NULLIF must accept TEXT operands (PostgreSQL-compatible)");
+    // id=1: label = 'Hello' と一致するため NULLIF は NULL。
+    assert_eq!(cell_for(&result, 1, 1), Cell::Null);
+    // id=2: label = 'world' は 'Hello' と異なるため自身の値。
+    assert_eq!(cell_for(&result, 2, 1), Cell::Text("world".to_string()));
+    // id=3: label が NULL のため `(Null, _) => Null` 契約により NULL。
+    // `TextColumnRef` マーカーが `stack_to_expr_value` を経由して正しく
+    // 解決されることを固定する（`JumpIfNotNull` とは別の消費経路）。
+    assert_eq!(cell_for(&result, 3, 1), Cell::Null);
 
-    // TEXT 列由来の Scalar 式（`LENGTH(label)`）を経由した NULLIF は受理される。
-    // `LENGTH` は Builtin ステップの `stack_to_expr_value` を経由して既に
-    // 解決済みのスカラー値をスタックへ積むため生のマーカーは残らないが、
-    // NULL 伝播（strict な `LENGTH` が NULL の `label` に対し NULL を返す）が
-    // NULLIF まで正しく伝わることを固定する。
+    // TEXT 列由来の Scalar 式（`LENGTH(label)`）を経由した NULLIF も引き続き
+    // 受理される。
     let result = core
         .execute_sql(
             &ctx,
@@ -556,6 +559,24 @@ fn nullif_rejects_text_operands_and_propagates_null_via_derived_scalar_expr() {
     // id=3: label が NULL のため length(label) も NULL、NULLIF 自体も NULL
     // （`(Null, _) => Null` 契約）。
     assert_eq!(cell_for(&result, 3, 1), Cell::Null);
+}
+
+#[test]
+fn nullif_rejects_mismatched_scalar_and_text_operand_types() {
+    let path = unique_db_path("sql26-nullif-mismatch");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // `Scalar` と `Text` の組は `unify_branch_type` が型不一致として拒否する
+    // （`CASE` の分岐型統一と同じ規約）。
+    let err = core
+        .execute_sql(
+            &ctx,
+            "SELECT nullif(length(label), 'Hello') FROM docs LIMIT 10",
+        )
+        .expect_err("NULLIF must reject mismatched Scalar/Text operand types");
+    assert_eq!(err.wire_code(), "42804");
 }
 
 #[test]
