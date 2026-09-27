@@ -525,31 +525,14 @@ fn default_check_name(table: &str, column: Option<&str>) -> String {
     }
 }
 
-/// `candidate` が識別子として妥当（`crate::catalog::validate_identifier`）かつ
-/// `used` に未登録なら採用し、そうでなければ `_2`・`_3`... の接尾辞を試す
-/// （PostgreSQL の暗黙制約名衝突解決に倣う）。識別子長超過でどの接尾辞候補も
-/// 妥当にならない場合は `check<N>`（`N` は `used.len()` 起点の連番）へ
-/// フォールバックする（設計 D1 参照）。
+/// `candidate` が識別子として妥当かつ `used` に未登録なら採用し、そうでなければ
+/// `_2`・`_3`... の接尾辞、それでも決まらなければ `check<N>` へフォールバックする
+/// （PostgreSQL の暗黙制約名衝突解決に倣う。設計 D1 参照）。実装は
+/// `catalog::resolve_constraint_name`（UNIQUE の既定名導出と共有する唯一の
+/// 実装。Issue #1067）へ委譲し、フォールバック接頭辞のみ `"check"` を渡す
+/// （挙動は本置き換え前と完全に同一）。
 fn resolve_unique_name(candidate: &str, used: &[String]) -> String {
-    if crate::catalog::validate_identifier(candidate).is_ok()
-        && !used.contains(&candidate.to_string())
-    {
-        return candidate.to_string();
-    }
-    for suffix in 2..=used.len() + 2 {
-        let attempt = format!("{candidate}_{suffix}");
-        if crate::catalog::validate_identifier(&attempt).is_ok() && !used.contains(&attempt) {
-            return attempt;
-        }
-    }
-    let mut fallback_index = used.len();
-    loop {
-        let attempt = format!("check{fallback_index}");
-        if !used.contains(&attempt) {
-            return attempt;
-        }
-        fallback_index += 1;
-    }
+    crate::catalog::resolve_constraint_name(candidate, used, "check")
 }
 
 /// `CREATE TABLE` の構文段が組み立てた [`ParsedCheck`] 一覧を意味論検証し、

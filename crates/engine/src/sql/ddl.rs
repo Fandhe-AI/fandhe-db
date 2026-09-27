@@ -40,7 +40,8 @@
 
 use crate::catalog::{CatalogError, ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema};
 use crate::sql::allowlist::{
-    SqlSurfaceError, ValidatedAlterTableAddColumn, ValidatedCreateIndex, ValidatedCreateTable,
+    SqlSurfaceError, ValidatedAlterTableAddColumn, ValidatedAlterTableAddUnique,
+    ValidatedAlterTableDropConstraint, ValidatedCreateIndex, ValidatedCreateTable,
     ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::SqlColumnTypeName;
@@ -162,7 +163,15 @@ pub(crate) fn execute_create_table(
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
-        | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::IndexLimitExceeded(_)
+        // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
+        // 変種で、`Storage::create_table` からは返らない（到達不能。`CREATE TABLE`
+        // での明示制約名指定はスコープ外〔設計 D6〕であり、`allowlist` が常に
+        // 未確定名の `UniqueConstraint` を渡す）。
+        | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::ConstraintNotFound(_)
+        | CatalogError::ConstraintDropNotSupported(_)
+        | CatalogError::ConstraintLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
@@ -240,13 +249,33 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
-/// `ALTER TABLE ... ADD COLUMN ...`（SQL-23・TASK-202、Issue #900）の成功応答。
-/// 返す情報は文に書かれたテーブル名・列名のみに限定する（行数・テナント固有の
-/// 件数は持たない。[`CreateTableOutcome`]・[`DropTableOutcome`] と同じ設計）。
+/// `ALTER TABLE ...`（SQL-23・TASK-202・TASK-204、Issue #900・#1067）の成功応答。
+/// 返す情報は文に書かれたテーブル名と、確定した変更内容（[`AlterTableAction`]）に
+/// 限定する（行数・テナント固有の件数は持たない。[`CreateTableOutcome`]・
+/// [`DropTableOutcome`] と同じ設計）。`wire-server::simple_query` は中身を見ず
+/// `CommandComplete "ALTER TABLE"` のみを返すため、本構造体の変更は wire 層に
+/// 影響しない（**BREAKING CHANGE**〔Issue #1067〕: 旧 `column_name: String`
+/// フィールドを `action: AlterTableAction` へ置き換えた。クレート外でこの構造体を
+/// 直接構築・分解するコードは追随が必要）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlterTableOutcome {
     pub table_name: String,
-    pub column_name: String,
+    pub action: AlterTableAction,
+}
+
+/// [`AlterTableOutcome`] が運ぶ、確定した `ALTER TABLE` の変更内容
+/// （Issue #900・#1067）。`AddConstraint`／`DropConstraint` の `constraint_name`
+/// は確定済みの実名（`ADD` で名前省略時は設計 D2 の既定名。カタログに
+/// `pg_constraint` 相当の照会手段が無いため、呼び出し元がこの応答で確定名を
+/// 知る唯一の手段）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterTableAction {
+    /// `ADD COLUMN`（TASK-202、Issue #900）。
+    AddColumn { column_name: String },
+    /// `ADD [CONSTRAINT <name>] UNIQUE (...)`（TABLE-16・TASK-204、Issue #1067）。
+    AddConstraint { constraint_name: String },
+    /// `DROP CONSTRAINT <name>`（Issue #1067）。
+    DropConstraint { constraint_name: String },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -290,8 +319,161 @@ pub(crate) fn execute_alter_table_add_column(
         })?;
     Ok(AlterTableOutcome {
         table_name: stmt.table_name.clone(),
-        column_name: stmt.column_name.clone(),
+        action: AlterTableAction::AddColumn {
+            column_name: stmt.column_name.clone(),
+        },
     })
+}
+
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE (<col>[, ...])` の実行本体
+/// （TABLE-16・TASK-204、Issue #1067）。呼び出し元（`core.rs`）は
+/// [`require_ddl_permission`] を必ず先に呼んでいる前提。
+///
+/// 判定順序（決定的。設計 D7）:
+/// 1. 対象テーブルの存在確認（`execute_alter_table_add_column` と同じ
+///    `undefined_table_or_view` 判定。`42P01`／`42809`）
+/// 2. `catalog::Storage::alter_table_add_named_unique_constraint`
+///    （単一 write トランザクション内で名前衝突・件数上限・列存在・型・
+///    既存行の重複を判定。TOCTOU なし）。
+pub(crate) fn execute_alter_table_add_unique(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAddUnique,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    match storage.get_table_schema(&stmt.table_name) {
+        Ok(_) => {}
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_alter_constraint_error(other)),
+    }
+    let columns: Vec<&str> = stmt.columns.iter().map(|c| c.as_str()).collect();
+    let confirmed_name = storage
+        .alter_table_add_named_unique_constraint(
+            &stmt.table_name,
+            stmt.constraint_name.as_deref(),
+            &columns,
+        )
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_constraint_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AddConstraint {
+            constraint_name: confirmed_name,
+        },
+    })
+}
+
+/// `ALTER TABLE <table> DROP CONSTRAINT <name>` の実行本体（Issue #1067）。
+/// 呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に呼んでいる
+/// 前提。判定順序は [`execute_alter_table_add_unique`] と同じ
+/// テーブル存在確認 → 実行本体（`catalog::Storage::alter_table_drop_constraint`。
+/// 設計 D7: 名前検索 → CHECK 名なら `0A000`／未検出なら `42704` → FK 依存検査
+/// 〔`2BP01`〕）。
+pub(crate) fn execute_alter_table_drop_constraint(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableDropConstraint,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    match storage.get_table_schema(&stmt.table_name) {
+        Ok(_) => {}
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_alter_constraint_error(other)),
+    }
+    storage
+        .alter_table_drop_constraint(&stmt.table_name, &stmt.constraint_name)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_constraint_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::DropConstraint {
+            constraint_name: stmt.constraint_name.clone(),
+        },
+    })
+}
+
+/// `ParsedSql::AlterTable`（[`crate::sql::allowlist::ValidatedAlterTable`]）の
+/// 唯一の実行入口（Issue #1067）。`core.rs::EngineCore::execute_parsed_in_session`
+/// から `require_ddl_permission` 通過後に呼ばれ、3 つの許可形状
+/// （`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／`DROP CONSTRAINT`）を対応する
+/// 実行本体へ振り分ける（構文の許可リスト判定は `sql::allowlist` の管轄、
+/// ディスパッチはここと `core.rs` の管轄という既存の責務分担を維持する）。
+pub(crate) fn execute_alter_table(
+    storage: &Storage,
+    validated: &crate::sql::allowlist::ValidatedAlterTable,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    match validated {
+        crate::sql::allowlist::ValidatedAlterTable::AddColumn(stmt) => {
+            execute_alter_table_add_column(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::AddUnique(stmt) => {
+            execute_alter_table_add_unique(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::DropConstraint(stmt) => {
+            execute_alter_table_drop_constraint(storage, stmt)
+        }
+    }
+}
+
+/// `Storage::alter_table_add_named_unique_constraint`／
+/// `Storage::alter_table_drop_constraint` の [`CatalogError`] を SQL 表層の
+/// 契約へ写像する（設計 D4・Issue #1067）。ERR-6 の既存行のみを使い、新しい
+/// `wire_code` は追加しない——制約名衝突は索引名衝突と同じ `42P07`
+/// （[`SqlSurfaceError::DuplicateTable`] を流用）、未検出は `DROP INDEX` と同じ
+/// `42704`（[`SqlSurfaceError::UndefinedObject`]）。エラー文言にテナント・行
+/// 内容・redb 内部詳細は含めない（security.md P0）。
+fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::ConstraintNotFound(name) => SqlSurfaceError::UndefinedObject { name },
+        CatalogError::ConstraintDropNotSupported(name) => SqlSurfaceError::FeatureNotSupported {
+            detail: format!("dropping CHECK constraint {name} is not supported"),
+        },
+        CatalogError::ConstraintLimitExceeded(detail) => {
+            SqlSurfaceError::PayloadTooLarge { detail }
+        }
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
+        CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
+        // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
+        // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        // ストレージ側の内部破損・想定外事象・本 DDL からは到達しないはずの
+        // variant はいずれも詳細を露出しない `Internal`（`XX000`）へ丸める
+        // （fail-closed。ワイルドカード腕を置かず全 variant を明示列挙する
+        // ことで、将来の追加 variant をコンパイラに検出させる）。
+        CatalogError::Backend(_)
+        | CatalogError::CorruptSchema(_)
+        | CatalogError::TableAlreadyExists(_)
+        | CatalogError::ColumnAlreadyExists(_)
+        | CatalogError::RowNotFound(_)
+        | CatalogError::IncompatibleRowKeyFormat
+        | CatalogError::TableGenerationCounterOverflow
+        | CatalogError::TypeNotFound(_)
+        | CatalogError::TypeAlreadyExists(_)
+        | CatalogError::ViewNotFound(_)
+        | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::ProtectedColumn(_)
+        | CatalogError::IncompatibleTypeChange { .. }
+        | CatalogError::TooManyColumns { .. }
+        | CatalogError::IndexAlreadyExists(_)
+        | CatalogError::IndexNotFound(_)
+        | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexLimitExceeded(_)
+        | CatalogError::InvalidForeignKey(_) => SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        },
+    }
 }
 
 /// テーブルとして存在しない `name` について、ビューまたは索引（TASK-206・
@@ -420,7 +602,13 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexLimitExceeded(_)
         // `FOREIGN KEY` 宣言の照合（`create_table` 専用。TABLE-17・TASK-205、
         // Issue #907）は `alter_table_add_column` からは返らない（到達不能）。
-        | CatalogError::InvalidForeignKey(_) => SqlSurfaceError::Internal {
+        | CatalogError::InvalidForeignKey(_)
+        // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
+        // 変種で、`alter_table_add_column` からは返らない（到達不能）。
+        | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::ConstraintNotFound(_)
+        | CatalogError::ConstraintDropNotSupported(_)
+        | CatalogError::ConstraintLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }

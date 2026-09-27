@@ -188,7 +188,9 @@ CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは
 
 ## スコープ外・申し送り
 
-- SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名
+- SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名は
+  Issue #1067 で実装済み。詳細は
+  [alter-table-unique-constraint.md](./alter-table-unique-constraint.md) 参照
 - 永続一意索引（redb 二次テーブル）による O(log n) 判定
 - ファイル形 INSERT（`replace_typed_rows_by_text_key`）の UNIQUE 制約対応
   （現状は fail-closed 拒否）
