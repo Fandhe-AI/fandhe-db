@@ -3060,9 +3060,9 @@ pub(crate) enum PredicateDmlOutcome {
     /// （台帳エントリも commit されている）。
     Applied { rows_affected: usize },
     /// 一致行数が上限を超えた（`limit + 1` 件目で列挙を打ち切った時点の件数を
-    /// そのまま運ぶ。呼び出し元が `check_dml_affected_rows`／
-    /// `check_affected_row_count` へ渡す）。write トランザクションは commit
-    /// されず、行・台帳エントリのいずれにも痕跡が残らない。
+    /// そのまま運ぶ。呼び出し元が `check_dml_affected_rows`（UPDATE／DELETE
+    /// 共通の唯一の上限 API。Issue #997 で統合）へ渡す）。write トランザクションは
+    /// commit されず、行・台帳エントリのいずれにも痕跡が残らない。
     LimitExceeded { count: usize },
 }
 
