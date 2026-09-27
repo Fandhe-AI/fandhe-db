@@ -4225,11 +4225,13 @@ mod tests {
     // 対象ビヘイビア: RECOVER-4（負方向・生 API の到達範囲確認）。
     // `crate::catalog::Storage::insert_row_into_table` は codex-review P0 指摘
     // （PR #194）を受けて `pub(crate)` 化し、クレート外（`tests/` 配下の結合テスト・
-    // wire-server 等）からは到達不能にした。この生 API は本モジュール内では
-    // （例: 将来の移行ツール等で）引き続き参照しうるため、クレート内ユニットテストとして
-    // 「テナント境界チェックを経由しない書き込みは実際に行を書き換える」ことを確認する。
-    // 旧・結合テスト版（`tests/tenant_breach.rs::recover4_checker_detects_unguarded_mutation`）
-    // は `pub(crate)` 化に伴いクレート外から呼べなくなったため、このユニットテストへ
+    // wire-server 等）からは到達不能にした。さらに Issue #1078 で `#[cfg(test)]` 化し、
+    // 呼び出し元がクレート内ユニットテストのみであることをコンパイル構成でも保証した
+    // （テスト専用であり、production の移行ツール等からは参照しない）。クレート内
+    // ユニットテストとして「テナント境界チェックを経由しない書き込みは実際に行を
+    // 書き換える」ことを確認する。旧・結合テスト版
+    // （`tests/tenant_breach.rs::recover4_checker_detects_unguarded_mutation`）は
+    // `pub(crate)` 化に伴いクレート外から呼べなくなったため、このユニットテストへ
     // 移設した。
     #[test]
     fn raw_insert_row_into_table_bypasses_tenant_guard() {

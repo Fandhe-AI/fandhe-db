@@ -258,7 +258,9 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - NoSQL 表層への DDL op（`create_table` 相当）。
 - `CHECK` 参照列への `ALTER COLUMN TYPE` の許可（現状は安全側で拒否）。
 - `catalog.rs` の生書き込み API（`#[cfg(test)]` 限定・production では到達不能）は
-  検査点を経由しない（一意性制約と同じ既知のギャップ）。
+  検査点を経由しない。Issue #1078 で、これら 3 API 自身が `CHECK` を含む制約付き
+  テーブルへの書き込みを fail-closed に拒否するガードを追加したため、検査点を
+  経由しなくても制約違反状態は作れない（一意性制約・FOREIGN KEY も同様）。
 
 ## 自動生成名と明示名の衝突（PR レビュー指摘 Low の是正）
 
