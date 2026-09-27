@@ -95,8 +95,10 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
   （独自に read txn を開く）はクエリ経路から呼ばない。
 - カタログ値のデコード失敗・走査上限（`MAX_INDEX_COUNT`）超過は「宣言なし→
   自動」へは倒さず、**索引を使わない側**（スカラー: 索引構築失敗扱い →
-  plain scan／HNSW: brute-force）へ倒す。いずれも厳密結果になるため結果は
-  変わらず、fail-soft かつ安全側。
+  plain scan／HNSW: brute-force）へ倒す。いずれも厳密（brute-force）結果に
+  なるため誤った結果を返すことはなく、fail-soft かつ安全側（HNSW 側は通常の
+  近似経路と Top-k が異なり得るが、それは前項の近似/厳密切り替えと同じ性質の
+  差異であり本フォールバック固有の問題ではない）。
 - `EXPLAIN`（`core.rs::explain_engine_for`）はこの判定専用に新規の read txn を
   開く（検索本体を実行しない契約を保つため、計画開始時の txn を引き回さない）。
   読み取り失敗は `false`（brute-force 表示）へ倒す。
