@@ -274,6 +274,20 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN 文も一律拒否する
+    // （fail-closed。カーソル・`WITH` と同じ方針）。理由: `where_equality_
+    // literal_is_param`（パターン 4）は `Ident '='` の形しか数えず、JOIN の
+    // WHERE 述語が束縛時に左右いずれかの `ValidatedScan::where_predicates` へ
+    // 分かれてプッシュダウンされるため、トークン列上のフラグ位置と束縛後の
+    // 述語列の対応付けが保証できない（Issue #925 §2.7・対象外事項）。
+    if crate::sql::allowlist::looks_like_join(tokens)
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in JOIN statements",
+        ));
+    }
+
     let is_insert_statement = ident_eq_ignore_case(tokens.first(), "INSERT");
 
     // パターン 5（INSERT VALUES）の受理範囲: `VALUES` キーワード（文脈識別子。

@@ -96,14 +96,17 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidForeignKey
         // `DatatypeMismatch`（`42804`）は 2 つの発生源を共有する: `CASE`/
         // `COALESCE`/`NULLIF` の型不一致（SQL-26・Issue #921）と、集合演算の
-        // 両辺の列数・列型不一致（SQL-29 (c)・RLS-10 (b)・TASK-213、Issue
-        // #929）。いずれも NoSQL 表層の `op` 語彙に対応する経路が無く構造的に
-        // 到達しないが、`ErrorClass` の網羅性のため他の 42xxx 系と同じ
-        // 400 とする。
+        // 両辺の列数・列型不一致（SQL-29 (c)・RLS-10 (b)・TASK-213、Issue #929）
+        // に加え、`INNER JOIN` の結合キー型不一致（SQL-28・RLS-10、TASK-212、
+        // Issue #925）でも到達するようになった。いずれも NoSQL 表層の `op`
+        // 語彙に対応する経路が無く構造的に到達しないが、`ErrorClass` の
+        // 網羅性のため他の 42xxx 系と同じ 400 とする。
         | ErrorClass::DatatypeMismatch
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
-        // 参照スコープでの非修飾列の曖昧解決。SQL 表層は本 Issue でまだ受理し
-        // ないため到達しないが（許可リストは JOIN・複数 FROM を拒否）、
+        // 参照スコープでの非修飾列の曖昧解決。SQL 表層は `INNER JOIN`（Issue
+        // #925）で到達可能になったが、NoSQL 表層は引き続き `op` 語彙に対応する
+        // 経路が無く到達不能（許可リストは JOIN・複数 FROM を拒否したままの
+        // NoSQL 表層 API から SQL 表層の JOIN 文を組み立てる経路が無い）。
         // `ErrorClass` の網羅性のため ERR-6 新設行の射影規則（400）を定める。
         | ErrorClass::AmbiguousColumn => 400,
     }
