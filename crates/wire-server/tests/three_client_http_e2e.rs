@@ -3006,15 +3006,61 @@ fn seed_empty_db_no_table(label: &str) -> (PathBuf, temp_db::CleanupGuard) {
 /// 実際に送信される値そのものを単一情報源にする）。`REJECTION_CASES` は
 /// この網羅集合に含めない（拒否ケースは成功パリティを検証しないため。
 /// PR #1135 レビュー指摘・[`parity_matrix_covers_every_nosql_op`] doc 参照）。
-const PHASE7_WRITE_CASES: &[&str] = &[
-    r#"{"op":"create_table","table":"widgets","columns":[{"name":"name","type":"text"},{"name":"qty","type":"integer"}]}"#,
-    r#"{"op":"drop_table","table":"widgets"}"#,
-    r#"{"op":"insert","table":"widgets","rows":[{"id":1,"name":"gadget","qty":5}],"operation_id":"op-insert-1"}"#,
-    r#"{"op":"insert","table":"widgets","rows":[{"id":2,"name":"sprocket","qty":9}],"operation_id":"op-insert-2"}"#,
-    r#"{"op":"alter_table","table":"widgets","add_column":{"name":"note","type":"text"}}"#,
-    r#"{"op":"delete","table":"widgets","filter":[{"column":"name","op":"eq","value":"sprocket"}],"operation_id":"op-del-1"}"#,
-    r#"{"op":"scan","table":"widgets","limit":100,"columns":["id","name","qty","note"]}"#,
-    r#"{"op":"scan","table":"widgets","limit":1}"#,
+///
+/// 各要素は `expect` で成功パリティ集計対象か否かを明示する（PR #1135・
+/// Codex P2 レビュー指摘）。`bob-drop-denied`（index 1）は bob による拒否
+/// （`42501`）にのみ使う body だが、同一 body で alice が後続で `drop_table`
+/// を成功させる呼び出し（`drop-table-success`）もあるため `Success` 扱いで
+/// 問題ない。`post-drop-scan`（index 7・`scan` limit 1）はテーブル削除後の
+/// `42P01` 拒否確認専用で成功呼び出しが存在しないため `RejectionOnly` とし、
+/// 網羅ガードの集計対象から除外する（`scan` 自体は index 6 の成功ケースで
+/// 別途網羅済み）。
+enum Phase7CaseExpectation {
+    /// このシナリオ内で実際に成功応答（200・`ok:true` 等）を得る呼び出しが
+    /// 存在する body。
+    Success,
+    /// このシナリオ内では拒否（非 200）呼び出しにしか使わない body。
+    RejectionOnly,
+}
+
+struct Phase7WriteCase {
+    json_body: &'static str,
+    expect: Phase7CaseExpectation,
+}
+
+const PHASE7_WRITE_CASES: &[Phase7WriteCase] = &[
+    Phase7WriteCase {
+        json_body: r#"{"op":"create_table","table":"widgets","columns":[{"name":"name","type":"text"},{"name":"qty","type":"integer"}]}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"drop_table","table":"widgets"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"insert","table":"widgets","rows":[{"id":1,"name":"gadget","qty":5}],"operation_id":"op-insert-1"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"insert","table":"widgets","rows":[{"id":2,"name":"sprocket","qty":9}],"operation_id":"op-insert-2"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"alter_table","table":"widgets","add_column":{"name":"note","type":"text"}}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"delete","table":"widgets","filter":[{"column":"name","op":"eq","value":"sprocket"}],"operation_id":"op-del-1"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"scan","table":"widgets","limit":100,"columns":["id","name","qty","note"]}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"scan","table":"widgets","limit":1}"#,
+        expect: Phase7CaseExpectation::RejectionOnly,
+    },
 ];
 
 fn run_phase7_write_parity_scenario(client: HttpClient) {
@@ -3196,31 +3242,31 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         )
     };
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[0], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[0].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL create_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
 
-    let (status, body) = query(&bob_token, PHASE7_WRITE_CASES[1], &mut seq);
+    let (status, body) = query(&bob_token, PHASE7_WRITE_CASES[1].json_body, &mut seq);
     assert_ne!(status, 200, "bob drop_table unexpectedly succeeded: {body}");
     assert_eq!(nosql_wire_code_of(&body), "42501", "bob drop_table: {body}");
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[2], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[2].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL insert 1: {body}");
     assert_eq!(affected_count_from_nosql_body(&body), 1);
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[3], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[3].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL insert 2: {body}");
     assert_eq!(affected_count_from_nosql_body(&body), 1);
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[4], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[4].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL alter_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[5], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[5].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL predicate delete: {body}");
     assert_eq!(affected_count_from_nosql_body(&body), 1);
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[6], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[6].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL read-back: {body}");
     let result_obj = json_object(&body);
     let rows_json = match result_obj.get("rows") {
@@ -3252,11 +3298,11 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         "read-back after predicate delete must match between SQL and NoSQL surfaces"
     );
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[1], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[1].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL drop_table: {body}");
     assert_eq!(body.trim(), r#"{"ok":true}"#);
 
-    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[7], &mut seq);
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[7].json_body, &mut seq);
     assert_ne!(status, 200, "post-drop scan unexpectedly succeeded: {body}");
     assert_eq!(nosql_wire_code_of(&body), "42P01", "post-drop scan: {body}");
 
@@ -3334,7 +3380,7 @@ fn op_name_from_json_body(json_body: &str) -> &str {
 /// 収集し、その集合に対して `Op::ALL` の網羅を判定する。ケース定義の削除・
 /// 改変は収集元の値ごと消えるため、コメント等への残存では回避できない。
 ///
-/// レビュー指摘（PR #1135・Codex P2）: [`REJECTION_CASES`] の `op` は
+/// レビュー指摘（PR #1135・Codex P2・1 巡目）: [`REJECTION_CASES`] の `op` は
 /// この網羅集合へ加えない。拒否ケースは意図的に非成功応答（`wire_code`）
 /// のみを固定する層であり、SQL/NoSQL 両表層でのパリティ（成功応答・
 /// 影響行数・最終状態の一致）を検証していない。成功ケースと拒否ケースの
@@ -3343,6 +3389,16 @@ fn op_name_from_json_body(json_body: &str) -> &str {
 /// 見かけ上の網羅を偽装しうる（fail-closed 原則に反する）。そのため
 /// 拒否ケースの `op` 収集はこのガードから独立させ、`Op::ALL` の成功パリティ
 /// 網羅判定には使わない。
+///
+/// レビュー指摘（PR #1135・Codex P2・2 巡目）: 1 巡目の修正後も
+/// [`DML_STEPS`] の `DmlExpectation::Error` ケース（例: `e-no-opid`・
+/// `e-undefined-table`）と [`PHASE7_WRITE_CASES`] の bob 拒否専用 body
+/// （`post-drop-scan`）を無条件に集計しており、成功パリティを検証しない
+/// ケースまで「網羅済み」扱いにしていた。本実装では `DML_STEPS` は
+/// `DmlExpectation::Affected(_)`（成功。RLS 等で 0 行になる場合を含む）
+/// のみ、`PHASE7_WRITE_CASES` は [`Phase7CaseExpectation::Success`] の
+/// みを収集対象にし、`DmlExpectation::Error`／
+/// [`Phase7CaseExpectation::RejectionOnly`] は除外する。
 #[test]
 fn parity_matrix_covers_every_nosql_op() {
     use std::collections::BTreeSet;
@@ -3353,11 +3409,19 @@ fn parity_matrix_covers_every_nosql_op() {
         exercised.insert(op_name_from_json_body(case.json_body));
     }
     for step in DML_STEPS {
-        exercised.insert(op_name_from_json_body(step.json_body));
+        if matches!(step.expect, DmlExpectation::Affected(_)) {
+            exercised.insert(op_name_from_json_body(step.json_body));
+        }
     }
+    assert!(
+        matches!(BOB_STEP.expect, DmlExpectation::Affected(_)),
+        "BOB_STEP must be a success case (Affected) to count toward success parity coverage"
+    );
     exercised.insert(op_name_from_json_body(BOB_STEP.json_body));
-    for json_body in PHASE7_WRITE_CASES {
-        exercised.insert(op_name_from_json_body(json_body));
+    for case in PHASE7_WRITE_CASES {
+        if matches!(case.expect, Phase7CaseExpectation::Success) {
+            exercised.insert(op_name_from_json_body(case.json_body));
+        }
     }
 
     for op in Op::ALL {
