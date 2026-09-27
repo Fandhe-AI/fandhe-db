@@ -41,10 +41,31 @@ pub trait WireStream: Read + Write {
     /// 緊急応答（RECOVER-6・panic フック経由の応答送出）用の生ソケット複製。
     /// `engine::recovery::panic_hook::EmergencyResponseRegistration` が
     /// `TcpStream` 固定の API のため、平文接続でのみ `Some` を返す。TLS
-    /// 接続では平文バイト列が TLS レコードへ混入するのを防ぐため `None`
-    /// を返し、緊急応答の登録自体をスキップする（Issue #966 の既知の
-    /// 制約。詳細は `docs/design/tls-wire-connection.md` 参照）。
+    /// 接続はこの生複製へ平文を直接書けない（TLS レコードへ混入する）ため
+    /// 常に `None`（[`Self::emergency_response_channel`] の既定実装が使う
+    /// 経路とは別に、旧経路として直接呼ばれても平文混入させないための
+    /// fail-closed）。
     fn emergency_channel(&self) -> Option<TcpStream>;
+
+    /// 緊急応答（RECOVER-6・Issue #966／#1080）の登録に使う
+    /// 「送出済み形式のバイト列」と「書き込み先の生ソケット複製」を返す。
+    /// `engine::recovery::panic_hook::EmergencyResponseRegistration::
+    /// register` はこの組を受け取り、panic フック内で `response_bytes` を
+    /// 生ソケットへそのまま書く契約（[`Self::emergency_channel`] と同じ
+    /// クローン）。`response` は wire プロトコルの平文 ErrorResponse
+    /// バイト列（呼び出し元は `simple_query`／`copy` の登録ヘルパー）。
+    /// `None` は登録しない（fail-closed。接続断のみへ縮退）。
+    ///
+    /// 既定実装は [`Self::emergency_channel`] をそのまま使い、`response`
+    /// を素通しする（平文 `TcpStream` はこれで従来と**ビット同一**）。
+    /// TLS 接続（[`crate::tls::stream::TlsStream`]）はこれを上書きし、
+    /// `response` を TLS レコードとして暗号化してから返す（詳細は
+    /// `docs/design/tls-wire-connection.md`「緊急応答（RECOVER-6）との
+    /// 関係」節）。
+    fn emergency_response_channel(&self, response: &[u8]) -> Option<(Vec<u8>, TcpStream)> {
+        let clone = self.emergency_channel()?;
+        Some((response.to_vec(), clone))
+    }
 
     /// 接続終了時の best-effort な後始末（TLS では `close_notify` の送出）。
     /// 平文では no-op（既存挙動とビット同一）。
