@@ -114,7 +114,33 @@ fn check_predicate_limits(
                 *leaves = next;
             }
             DeclarativePredicate::Or(branches) => {
+                // `wire-server::http::query::filter::map_element` は JSON 走査時点で
+                // 分岐数（`declarative_filter::check_filter_count`）・空配列
+                // （`branches_json.is_empty()`）を既に拒否しているが、engine の
+                // 公開 API を直接呼ぶ経路（本関数のドキュメント冒頭参照）はその
+                // 一次防御を経ない。分岐数を `Vec::with_capacity`（`bind_one`）
+                // より前に上限検査しないと確保量が無制限になり、空分岐を拒否
+                // しないと空の `AND` 列（`BoundConjunction`）が恒真として評価され
+                // （`sql::where_tree::BoundConjunction::matches` は空の
+                // `metadata_filters`／`expr_filters`／`or_groups` を全て
+                // 素通りさせ `Ok(true)` を返す契約）`OR` 全体を無条件で真にできて
+                // しまうため、ここで二重に検査する。
+                if branches.len() < 2 {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "OR group must have at least 2 branches",
+                    ));
+                }
+                if branches.len() > MAX_LEAVES {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "OR branch count exceeds the allowed limit",
+                    ));
+                }
                 for branch in branches {
+                    if branch.is_empty() {
+                        return Err(SqlSurfaceError::invalid_input(
+                            "OR branch must not be empty",
+                        ));
+                    }
                     check_predicate_limits(branch, depth + 1, leaves)?;
                 }
             }
@@ -296,6 +322,49 @@ mod tests {
             .collect();
         let err = bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default())
             .expect_err("must reject");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_or_with_empty_branch() {
+        // PR #1118 codex-review P1 指摘: 空分岐（`AND` 列が 0 要素）を束縛すると
+        // `BoundConjunction::matches`（`sql::where_tree`）が恒真（`Ok(true)`）を
+        // 返すため、`OR` 群全体が他の分岐・条件に関わらず無条件で真になって
+        // しまう。束縛前に空分岐を拒否することを確認する。
+        let preds = vec![DeclarativePredicate::Or(vec![
+            vec![],
+            vec![DeclarativePredicate::Leaf(DeclarativeFilter::equals(
+                "lang", "ja",
+            ))],
+        ])];
+        let err = bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default())
+            .expect_err("must reject empty OR branch");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_or_with_single_branch() {
+        let preds = vec![DeclarativePredicate::Or(vec![vec![
+            DeclarativePredicate::Leaf(DeclarativeFilter::equals("lang", "ja")),
+        ]])];
+        let err = bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default())
+            .expect_err("must reject single-branch OR");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_or_branch_count_over_limit() {
+        // PR #1118 codex-review P1 指摘: 分岐数を `Vec::with_capacity`
+        // （`bind_one`）より前に検査しないと、大量の（空でない）分岐を渡す
+        // 呼び出しで確保量が無制限になり得る。
+        let branch = vec![DeclarativePredicate::Leaf(DeclarativeFilter::equals(
+            "lang", "ja",
+        ))];
+        let branches: Vec<Vec<DeclarativePredicate>> =
+            (0..=MAX_LEAVES).map(|_| branch.clone()).collect();
+        let preds = vec![DeclarativePredicate::Or(branches)];
+        let err = bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default())
+            .expect_err("must reject OR branch count over limit");
         assert_eq!(err.wire_code(), "54000");
     }
 
