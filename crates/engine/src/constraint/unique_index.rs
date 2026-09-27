@@ -132,7 +132,7 @@ fn schema_signature(schema: &TableSchema, specs: &[KeySpec]) -> Vec<u8> {
         });
         out.extend_from_slice(&(spec.indices.len() as u32).to_be_bytes());
         for &idx in &spec.indices {
-            let tag = schema.columns.get(idx).map(|c| c.ty.primary_key_tag());
+            let tag = schema.columns.get(idx).map(|c| c.ty.unique_key_tag());
             out.push(tag.unwrap_or(0));
         }
     }
