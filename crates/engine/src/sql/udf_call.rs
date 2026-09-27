@@ -2043,27 +2043,38 @@ fn bind_date_part_or_trunc(
             "function {lower_name} expects 2 argument(s), got 1"
         ))
     })?;
-    let (field_bound, field_ty) = bind_expr_in(field_arg, env, node_budget)?;
-    if field_ty != ExprType::Text {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "function {lower_name} expects a text literal as its first argument"
-        )));
-    }
-    let BoundExpr::Text(field_name) = field_bound else {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "function {lower_name} requires its first argument to be a literal (not a column reference or expression)"
-        )));
+    // codex 指摘対応（PR #1120）: 本 ADR の「NULL 入力はすべて strict」契約
+    // （`docs/design/datetime-scalar-functions.md`）は第 1 引数（field/unit）
+    // にも適用される。`bind_null_aware`（`CASE`/`COALESCE`/`NULLIF`/`CONCAT`
+    // と共有）で `Expr::Null` を型未確定の `BoundExpr::Null` として受理し、
+    // `field_ty` が `None`（裸の NULL）の場合は `DatePartField`／
+    // `DateTruncUnit::from_name` による field 名解決自体を行わず、結果型を
+    // 固定したまま無条件で `BoundExpr::Null` を返す（field が定まらない以上
+    // `BuiltinFn::DatePart`／`DateTrunc` のペイロードを構築できないため）。
+    // 第 2 引数（src）は型検査のため引き続き束縛する（strict 関数として、
+    // NULL でない側の型不正は変わらず bind 時エラーにする）。
+    let (field_bound, field_ty) = bind_null_aware(field_arg, env, node_budget)?;
+    let result_ty = if lower_name == "date_part" {
+        ExprType::Scalar
+    } else {
+        ExprType::Timestamp
     };
-    // Cursor Bugbot 指摘対応（PR #1120）: 第 2 引数（src）は本 ADR の「NULL 入力
-    // はすべて strict」契約（`docs/design/datetime-scalar-functions.md`）を満たす
-    // 必要があるが、素の `bind_expr_in` は裸の `Expr::Null` を「型が決められない
-    // 位置」として `0A000` で拒否してしまう。`bind_null_aware`（`CASE`/
-    // `COALESCE`/`NULLIF`/`CONCAT` と共有）で `Expr::Null` を型未確定の
-    // `BoundExpr::Null` として受理し、`apply_builtin` の一律 strict ガード
-    // （いずれかの引数が NULL なら NULL を返す）に評価を委ねる。第 1 引数
-    // （field/unit）は従来どおり NULL を許可しない（`sql::allowlist::Parser::
-    // parse_call_expr` の `date_part`／`date_trunc` 分岐が第 1 引数の `NULL`
-    // リテラル許可を立てないことと対）。
+    let field_name = match field_ty {
+        None => None,
+        Some(ExprType::Text) => {
+            let BoundExpr::Text(name) = field_bound else {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "function {lower_name} requires its first argument to be a literal (not a column reference or expression)"
+                )));
+            };
+            Some(name)
+        }
+        Some(_) => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "function {lower_name} expects a text literal as its first argument"
+            )));
+        }
+    };
     let (src_bound, src_ty) = bind_null_aware(src_arg, env, node_budget)?;
     let src = match src_ty {
         Some(ExprType::Timestamp) => src_bound,
@@ -2075,6 +2086,11 @@ fn bind_date_part_or_trunc(
             )))
         }
     };
+    let Some(field_name) = field_name else {
+        // 第 1 引数が裸の NULL: field/unit が定まらないため、第 2 引数の値に
+        // 関わらず無条件で NULL を返す（strict NULL 伝播）。
+        return Ok((BoundExpr::Null, result_ty));
+    };
     if lower_name == "date_part" {
         let field = DatePartField::from_name(&field_name).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("unknown date_part field: {field_name}"))
@@ -2084,7 +2100,7 @@ fn bind_date_part_or_trunc(
                 f: BuiltinFn::DatePart(field),
                 args: vec![src],
             },
-            ExprType::Scalar,
+            result_ty,
         ))
     } else {
         let unit = DateTruncUnit::from_name(&field_name).ok_or_else(|| {
@@ -2095,7 +2111,7 @@ fn bind_date_part_or_trunc(
                 f: BuiltinFn::DateTrunc(unit),
                 args: vec![src],
             },
-            ExprType::Timestamp,
+            result_ty,
         ))
     }
 }

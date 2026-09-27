@@ -674,9 +674,41 @@ fn date_part_with_bare_null_second_argument_works_nested_in_coalesce() {
 }
 
 #[test]
-fn date_part_rejects_bare_null_first_argument() {
-    // 第 1 引数（field）は NULL を許可しない契約（`bind_date_part_or_trunc` が
-    // 文字列リテラルを要求）を維持する回帰。
+fn date_part_and_date_trunc_accept_bare_null_first_argument() {
+    // codex 指摘対応（PR #1120）: 第 1 引数（field/unit）も ADR の
+    // 「NULL 入力はすべて strict」契約に従い、裸の NULL は NULL を返す
+    // （field が定まらないため `bind_date_part_or_trunc` は field 名解決を
+    // 行わず、無条件で NULL を返す）。
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT date_part(NULL, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("date_part with a bare NULL first argument should be accepted");
+    assert_eq!(result.rows[0].cells[0], Cell::Null);
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT date_trunc(NULL, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("date_trunc with a bare NULL first argument should be accepted");
+    assert_eq!(result.rows[0].cells[0], Cell::Null);
+}
+
+#[test]
+fn date_part_rejects_non_literal_first_argument_when_not_null() {
+    // 第 1 引数が NULL でない場合は従来どおり「文字列リテラルであること」を
+    // 要求する契約を維持する回帰（`bind_date_part_or_trunc` の
+    // `field_ty == Some(Text)` 分岐で `BoundExpr::Text` 以外を拒否するパス）。
     let (core, _guard) = new_core();
     let ctx = ctx_for("tenant-a");
     core.execute_insert_sql(
@@ -688,7 +720,15 @@ fn date_part_rejects_bare_null_first_argument() {
     let err = core
         .execute_sql(
             &ctx,
-            &format!("SELECT date_part(NULL, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+            &format!("SELECT date_part(lang, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+
+    let err = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT date_part(1, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
