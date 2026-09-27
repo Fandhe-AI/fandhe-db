@@ -44,11 +44,26 @@
 //! 既存契約）、`hybrid`／スカラー `ORDER BY`（`sort` 指定時を含む）を経由
 //! しない広域取得には合成スコア列が構造上存在しない。
 //!
-//! [`execute`]・[`explain`] は、`table`／`limit`／`columns`／`filter`／`sort` の
-//! スキーマ非依存な検証・写像（[`PreparedScan::prepare`]）とスキーマ依存の
-//! 束縛（[`PreparedScan::bind`]）を共有する（Issue #948）。同じ binder を
-//! 通ることで、`42P01`（未知テーブル）・`22000`（未知列等）のエラー分類が
-//! `explain` の有無で変わらない。
+//! [`execute`]・[`explain`] は、`table`／`limit`／`offset`／`columns`／
+//! `filter`／`sort` のスキーマ非依存な検証・写像（[`PreparedScan::prepare`]）
+//! とスキーマ依存の束縛（[`PreparedScan::bind`]）を共有する（Issue #948）。
+//! 同じ binder を通ることで、`42P01`（未知テーブル）・`22000`（未知列等）の
+//! エラー分類が `explain` の有無で変わらない。
+//!
+//! `offset`（Issue #947・NOSQL-15・TASK-224）は SQL 表層の広域取得
+//! `LIMIT n OFFSET m`（SQL-25 (b)）と同一の実行計画へ写像する
+//! （[`BoundScan::with_offset`]。第 2 の実行器は作らない、という本モジュール
+//! 冒頭の方針を `offset` にも適用する）。`sort`（NOSQL-15。Issue #946）未指定
+//! 時の `offset` は物理走査順の上で適用され、値による意味的な順序ではない
+//! （同一スナップショット内では決定的だが、ページ取得の合間に書き込みが
+//! あると重複・欠落が起こりうる。詳細は
+//! `docs/design/sql-offset-paging.md` の「`ORDER BY` なし `OFFSET` の
+//! 意味論」節を参照）。`sort` 指定時は `ORDER BY` 適用後の順序に対して
+//! `offset` が適用される（[`BoundScan::with_order_by`] を先に適用し、続けて
+//! [`BoundScan::with_offset`] を適用する束縛順序に対応）。`aggregate` op には
+//! 対応する受理形が engine 側に無いため（`limit` 相当のキーも
+//! `BoundAggregate` の offset setter も存在しない）対象外とする（NOSQL-15 の
+//! aggregate 部分は未対応）。
 
 use std::time::SystemTime;
 
@@ -60,7 +75,9 @@ use engine::policy::PolicyContext;
 use engine::sql::allowlist::{Projection, ScalarOrderKey, SqlSurfaceError, MAX_SCALAR_ORDER_KEYS};
 use engine::sql::exec::QueryResult;
 use engine::sql::mode::SessionState;
-use engine::sql::parser::{bind_projection, validate_search_limit, BoundScan};
+use engine::sql::parser::{
+    bind_projection, validate_search_limit, validate_search_offset, BoundScan,
+};
 use engine::sql::udf_call::{UdfRegistry, MAX_EXPR_NODES};
 
 use super::filter::{bind_filter, FilterError};
@@ -82,6 +99,12 @@ pub enum ScanError {
     /// [`validate_search_limit`] の範囲（`1..=`
     /// [`engine::core::MAX_SEARCH_K`]）外（固定文言。SQL-15 と同じ分類 `42601`）。
     InvalidLimit,
+    /// `offset`（Issue #947・NOSQL-15）が有限の非負整数として `u32` の範囲に
+    /// 収まらない（固定文言。`limit_to_u32`／[`InvalidLimit`](Self::InvalidLimit)
+    /// と同じ形状検査。[`validate_search_offset`] の範囲外〔`10001..`〕は
+    /// [`ScanError::Engine`] 経由で `22000` になり、こちらとは別の分類——
+    /// SQL 表層・spec（NOSQL-15・SQL-25 (b)）と揃えた 2 段構えの判断）。
+    InvalidOffset,
     /// `table`／`columns` の要素が識別子形状検査（[`super::ident::
     /// check_identifier`]）を満たさない。`search`／`aggregate` の
     /// `InvalidIdentifier` と同じ判断（cursor[bot] 指摘。SQL レキサーが
@@ -135,6 +158,7 @@ impl ClassifiedError for ScanError {
             ScanError::Shape(err) => err.error_class(),
             ScanError::Filter(err) => err.error_class(),
             ScanError::InvalidLimit
+            | ScanError::InvalidOffset
             | ScanError::InvalidIdentifier
             | ScanError::InvalidColumns
             | ScanError::ExplainNotSupported
@@ -149,6 +173,9 @@ impl ClassifiedError for ScanError {
             ScanError::Filter(err) => err.client_message(),
             ScanError::InvalidLimit => {
                 "limit must be a positive integer within the supported range".to_string()
+            }
+            ScanError::InvalidOffset => {
+                "offset must be a non-negative integer within the supported range".to_string()
             }
             ScanError::InvalidIdentifier => "invalid identifier".to_string(),
             ScanError::InvalidColumns => {
@@ -174,6 +201,19 @@ fn limit_to_u32(raw: f64) -> Result<u32, ScanError> {
     }
     // 直前の範囲検査で `[0, u32::MAX]` の整数値であることを確定させたため、
     // `as` 変換は値の損失を伴わない（`u32::try_from` と同じ結果になる）。
+    Ok(raw as u32)
+}
+
+/// JSON `offset`（`f64`。[`Validated::optional_number`] が返す）が非負の
+/// 有限整数として `u32` の範囲へ丸めなく収まることを検証する（[`limit_to_u32`]
+/// と同じ形状検査。範囲は [`validate_search_offset`] がさらに
+/// `0..=MAX_SEARCH_K` へ絞り込む）。
+fn offset_to_u32(raw: f64) -> Result<u32, ScanError> {
+    if !raw.is_finite() || raw.fract() != 0.0 || raw < 0.0 || raw > f64::from(u32::MAX) {
+        return Err(ScanError::InvalidOffset);
+    }
+    // 直前の範囲検査で `[0, u32::MAX]` の整数値であることを確定させたため、
+    // `as` 変換は値の損失を伴わない（`limit_to_u32` と同じ根拠）。
     Ok(raw as u32)
 }
 
@@ -258,24 +298,26 @@ fn build_sort(validated: &Validated<'_>) -> Result<Vec<ScalarOrderKey>, ScanErro
 
 /// `scan` op のスキーマ非依存な前処理結果（Issue #948。`execute`・
 /// [`explain`] の両方が [`Self::prepare`]・[`Self::bind`] を共有する）。
-/// `table`／`limit`／`columns`／`sort` はスキーマを必要としないためテーブル
-/// 解決より前に検証・写像し、`filter`（`TableSchema` の列型ごとに値レーンを
-/// 振り分けるため schema 到達後にしか束縛できない。Issue #896・NOSQL-17）
-/// は [`Self::bind`] まで生の JSON 配列参照のまま保持する。
+/// `table`／`limit`／`offset`／`columns`／`sort` はスキーマを必要としないため
+/// テーブル解決より前に検証・写像し、`filter`（`TableSchema` の列型ごとに
+/// 値レーンを振り分けるため schema 到達後にしか束縛できない。Issue #896・
+/// NOSQL-17）は [`Self::bind`] まで生の JSON 配列参照のまま保持する。
 struct PreparedScan<'a> {
     table: &'a str,
     limit: usize,
+    offset: usize,
     projection: Projection,
     filter_items: &'a [JsonValue],
     sort_keys: Vec<ScalarOrderKey>,
 }
 
 impl<'a> PreparedScan<'a> {
-    /// `table`／`limit`／`columns`／`sort` をスキーマに依存しない範囲で検証・
-    /// 写像する（[`limit_to_u32`]・[`validate_search_limit`]・
-    /// [`build_projection`]・[`build_sort`]）。未知テーブルへの要求でも
-    /// `limit`／`columns`／`sort` の構文エラーを先に確定させて構わない
-    /// （SQL 表層の許可リスト検証段と同じ判定順序の思想）。
+    /// `table`／`limit`／`offset`／`columns`／`sort` をスキーマに依存しない
+    /// 範囲で検証・写像する（[`limit_to_u32`]・[`validate_search_limit`]・
+    /// [`offset_to_u32`]・[`validate_search_offset`]・[`build_projection`]・
+    /// [`build_sort`]）。未知テーブルへの要求でも `limit`／`offset`／
+    /// `columns`／`sort` の構文エラーを先に確定させて構わない（SQL 表層の
+    /// 許可リスト検証段と同じ判定順序の思想）。
     fn prepare(validated: &'a Validated<'_>) -> Result<Self, ScanError> {
         let table = validated.required_str("table")?;
         // `search`／`aggregate` と同じ識別子形状検査を engine のスキーマ
@@ -286,12 +328,19 @@ impl<'a> PreparedScan<'a> {
         ident::check_identifier(table)?;
         let raw_limit = validated.required_number("limit")?;
         let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
+        // `offset`（Issue #947・NOSQL-15）は任意キー。省略時は 0（no-op。
+        // SQL 表層の bare `LIMIT n`〔`OFFSET` 省略〕と同じ意味）。
+        let offset = match validated.optional_number("offset")? {
+            Some(raw_offset) => validate_search_offset(offset_to_u32(raw_offset)?)?,
+            None => 0,
+        };
         let projection = build_projection(validated)?;
         let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
         let sort_keys = build_sort(validated)?;
         Ok(Self {
             table,
             limit,
+            offset,
             projection,
             filter_items,
             sort_keys,
@@ -301,21 +350,24 @@ impl<'a> PreparedScan<'a> {
     /// [`bind_projection`]・[`super::filter::bind_filter`]（いずれもスキーマ
     /// 依存の検証。未知列・`VECTOR` 列は `22000`）を適用して
     /// [`BoundScan::new`] を組み立て、続けて [`BoundScan::with_order_by`]
-    /// （Issue #946・NOSQL-15）で `sort` を束縛する（未知列・`VECTOR` 列は
-    /// `22000`、上限超過は `54000`）。
+    /// （Issue #946・NOSQL-15）で `sort` を束縛し（未知列・`VECTOR` 列は
+    /// `22000`、上限超過は `54000`）、さらに [`BoundScan::with_offset`] で
+    /// `offset` を適用する（`sort` 適用後の順序に対する `OFFSET`。
+    /// Issue #947・NOSQL-15）。
     fn bind(&self, schema: &TableSchema, udfs: &UdfRegistry) -> Result<BoundScan, SqlSurfaceError> {
         let mut node_budget = MAX_EXPR_NODES;
         let bound_projection = bind_projection(&self.projection, schema, udfs, &mut node_budget)?;
         let bound_filters =
             bind_filter(self.filter_items, schema).map_err(FilterError::into_sql_surface_error)?;
-        BoundScan::new(
+        Ok(BoundScan::new(
             self.table.to_string(),
             bound_projection,
             bound_filters,
             Vec::new(),
             self.limit,
         )
-        .with_order_by(&self.sort_keys, schema)
+        .with_order_by(&self.sort_keys, schema)?
+        .with_offset(self.offset))
     }
 }
 
@@ -323,7 +375,8 @@ impl<'a> PreparedScan<'a> {
 /// 上で行う（[`EngineCore::execute_bound_scan_in_session`] の契約）。
 /// `explain: true` の拒否は多層防御としてのみ残す（通常は
 /// [`super::gate::handle`] が [`explain`] へ振り分けるため到達しない。
-/// モジュール doc 参照）。
+/// モジュール doc 参照）。手順の詳細（`limit`／`offset`／`columns`／`sort` の
+/// 検証・写像と `filter` の束縛順序）は [`PreparedScan`] のドキュメントを参照。
 pub fn execute(
     core: &EngineCore,
     ctx: &PolicyContext,
@@ -429,11 +482,47 @@ mod tests {
     }
 
     #[test]
+    fn offset_to_u32_accepts_boundary_integers() {
+        assert_eq!(offset_to_u32(0.0).unwrap(), 0);
+        assert_eq!(offset_to_u32(10_000.0).unwrap(), 10_000);
+        assert_eq!(offset_to_u32(f64::from(u32::MAX)).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn offset_to_u32_rejects_non_integers_and_out_of_range_values() {
+        for raw in [
+            -1.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from(u32::MAX) + 1.0,
+        ] {
+            assert!(
+                matches!(offset_to_u32(raw), Err(ScanError::InvalidOffset)),
+                "raw={raw}"
+            );
+        }
+    }
+
+    #[test]
     fn scan_error_wire_codes_match_expected_classes() {
         assert_eq!(ScanError::InvalidLimit.wire_code(), "42601");
+        assert_eq!(ScanError::InvalidOffset.wire_code(), "42601");
         assert_eq!(ScanError::InvalidIdentifier.wire_code(), "42601");
         assert_eq!(ScanError::InvalidColumns.wire_code(), "42601");
         assert_eq!(ScanError::ExplainNotSupported.wire_code(), "42601");
+    }
+
+    /// `ScanError::InvalidOffset` の応答文言は固定文言であり、untrusted な
+    /// 入力値をそのまま含まない（`InvalidLimit`／`InvalidIdentifier` と
+    /// 同じ非漏えい方針）。
+    #[test]
+    fn invalid_offset_client_message_is_fixed_and_does_not_leak_input() {
+        assert_eq!(
+            ScanError::InvalidOffset.client_message(),
+            "offset must be a non-negative integer within the supported range"
+        );
     }
 
     /// `ScanError::InvalidIdentifier` の応答文言は固定文言であり、

@@ -246,6 +246,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `op` | ○ | string | `"scan"` |
 | `table` | ○ | string | |
 | `limit` | ○ | number | `1..=10000`。非整数・負値・`u32` 超過等の形状不正は `42601`、`0` または `10001` 以上の範囲外は `22000` |
+| `offset` | △ | number | `0..=10000`。非整数・負値・`u32` 超過等の形状不正は `42601`、`10001` 以上の範囲外は `22000`。省略時の既定値は `0`（`0` を明示指定した場合と等価） |
 | `filter` | △ | object[] | |
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す。`false`／省略時は通常実行 |
@@ -253,12 +254,13 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
-持たない）。
+持たない）。`offset` も同じ理由で `search`／`aggregate` へ付与すると `42601`
+になる（Issue #947・NOSQL-15。`scan` op 専用）。
 
 要求例:
 
 ```json
-{"op": "scan", "table": "docs", "limit": 10, "columns": ["id", "lang"],
+{"op": "scan", "table": "docs", "limit": 10, "offset": 20, "columns": ["id", "lang"],
  "filter": [{"column": "lang", "op": "eq", "value": "ja"}]}
 ```
 
@@ -272,8 +274,22 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 応答には `score` 列相当が一切含まれない（`ORDER BY`／`hybrid` を経由しないため
 合成スコア列が構造上存在しない。`sort` 指定〔スカラー `ORDER BY`〕でも同様）。
 
-`explain: true`（[`explain`](#explain) 参照）は `sort` を指定した場合も
-同じ束縛（`PreparedScan::bind`）を経由するため併用できる（Issue #948）。
+#### `offset`（ページング）と `sort` 未指定時の意味論
+
+`offset`（Issue #947・NOSQL-15・TASK-224）は SQL 表層の広域取得
+`LIMIT n OFFSET m`（SQL-25 (b)）と同一の実行計画へ写像する（第 2 の実行器は
+作らない）。`sort`（NOSQL-15。Issue #946）を指定していない場合でも `offset`
+は拒否されない——SQL 表層が `ORDER BY` なしの `LIMIT n OFFSET m` を受理する
+契約とパリティを保つためで、この場合の `offset` は物理走査順の上で適用され、
+値による意味的な順序ではない。同一スナップショット内では決定的だが、
+ページ取得の合間に書き込みがあると行の重複や欠落が起こりうる。安定した
+ページングが必要な場合は `sort`（`id` をキーにする）の導入後に組み合わせる
+ことを推奨する。詳細は `docs/design/sql-offset-paging.md`「`ORDER BY` なし
+`OFFSET` の意味論」節を参照（本節はその要約のみで内容を重複しない）。
+
+`explain: true`（[`explain`](#explain) 参照。Issue #948・NOSQL-16）は `sort`・
+`offset` を指定した場合も同じ束縛（`PreparedScan::bind`）を経由するため
+併用できる。
 
 `sort` の主な `wire_code`:
 
@@ -689,6 +705,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `SELECT id, lang FROM docs WHERE lang = 'ja' LIMIT 10`（広域取得 SQL-15） | `scan` |
 | `EXPLAIN SELECT id FROM docs LIMIT 10` | `scan` + `"explain":true`（Issue #948） |
 | `SELECT id, lang FROM docs ORDER BY lang DESC LIMIT 10`（スカラー `ORDER BY`。SQL-25 (a)） | `scan` + `sort`（Issue #946・NOSQL-15） |
+| `SELECT id, lang FROM docs LIMIT 10 OFFSET 20`（広域取得 `OFFSET`。SQL-25 (b)） | `scan` + `offset`（Issue #947・NOSQL-15） |
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
 | `EXPLAIN SELECT COUNT(*) FROM docs` | `aggregate` + `"explain":true`（Issue #948） |
@@ -708,6 +725,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - UDF 呼び出し・`CREATE FUNCTION`
 - `SET`（`search_mode` 等のセッション変数設定）
 - 定数のみの `SELECT`
+- `aggregate` への `offset`（`GROUP BY ... LIMIT n OFFSET m` 相当。NoSQL 側は
+  `limit` 相当の受理形も engine 側の公開 offset setter も持たないため未対応）
 - `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
   中間一致・後方一致・`_` を受理するが、NoSQL `filter` 側は未対応のまま。
   NoSQL 側の対応は NOSQL-14 の担当）
@@ -952,7 +971,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
 - `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・`nosql10_explain.rs`・
   `wire_using_plan.rs`・`wire_explain.rs`
 - `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
-  `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）
+  `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
+  `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
   `nosql4_5_aggregate_wire_parity.rs`
 - `explain`（`vector` 指定 `search`・`scan`・`aggregate` への対象拡大。
