@@ -18,7 +18,11 @@
 //!   全体単位のゲート）
 //! - `DROP INDEX`／`CREATE INDEX` によるテーブル世代の変化で、キャッシュ経路が
 //!   追随して切り替わること
-//! - いずれの構成でも結果集合・RLS 境界（テナント間非漏えい）が変わらないこと
+//! - いずれの構成でも RLS 境界（テナント間非漏えい）は変わらないこと。ただし
+//!   HNSW 宣言がある場合、未宣言テーブルは近似（HNSW）から厳密（brute-force）
+//!   へ切り替わるため、その Top-k 結果集合は宣言の有無で変わり得る（本テストは
+//!   経路の切り替わり自体を統計で固定し、Top-k の一致は主張しない。
+//!   `docs/design/index-declaration-effects.md`「テナント境界・RLS への影響」）
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
