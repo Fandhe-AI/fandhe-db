@@ -1196,6 +1196,29 @@ mod tests {
         assert!(compiled.enforce(&schema, 1, &[], &ok).is_ok());
     }
 
+    /// 複数の数値列（INTEGER・BIGINT）を跨ぐ算術・比較式の往復一致
+    /// （`parse(render(x)) == x`）と依存列記録（両列とも含む）を固定する。
+    #[test]
+    fn validate_and_build_round_trips_multi_column_numeric_arithmetic_predicate() {
+        let v = parse_create_table(
+            "CREATE TABLE docs (qty INTEGER, lim BIGINT, CHECK ((qty * 2) >= (lim + 1)))",
+        );
+        let schema = schema_of(&v);
+        let checks = validate_and_build(&schema, &v.checks).expect("must validate");
+        assert_eq!(checks[0].predicate_sql, "(qty * 2) >= (lim + 1)");
+        assert_eq!(
+            checks[0].columns,
+            vec!["qty".to_string(), "lim".to_string()]
+        );
+
+        let v2 = parse_create_table(&format!(
+            "CREATE TABLE docs (qty INTEGER, lim BIGINT, CHECK ({}))",
+            checks[0].predicate_sql
+        ));
+        let checks2 = validate_and_build(&schema_of(&v2), &v2.checks).expect("must re-validate");
+        assert_eq!(checks[0].predicate_sql, checks2[0].predicate_sql);
+    }
+
     /// `BIGINT` 列の値が `2^53` を超える場合、`f64` へ黙って丸めず `XX000`
     /// （`CheckEvaluationFailed`）で fail-closed に拒否する（設計 D-2・D-4）。
     #[test]

@@ -1075,6 +1075,73 @@ fn drop_column_referenced_by_numeric_check_is_rejected() {
     ));
 }
 
+/// `CHECK` が参照する数値列は `ALTER TABLE ... ALTER COLUMN TYPE` 相当の型変更
+/// （`alter_table_widen_numeric_precision`）からも拒否される（設計 D5。
+/// `schema_check_references_column` の依存判定は列型を問わず先に走るため、
+/// `ColumnType::Numeric` 以外の列（ここでは INTEGER）でも
+/// `IncompatibleTypeChange` より前に `DependentObjectsStillExist` になる。
+/// Issue #1075 以前は CHECK が INTEGER 列を参照できず、この経路自体が到達
+/// 不能だった＝実際には検証されていなかった分岐）。
+#[test]
+fn widen_numeric_precision_on_check_referenced_integer_column_is_rejected() {
+    let (core, path) = new_core("check-integer-widen-precision");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
+    )
+    .expect("create table");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let err = storage
+        .alter_table_widen_numeric_precision("docs", "qty", 10)
+        .expect_err("widening a CHECK-referenced column must be rejected");
+    assert!(matches!(
+        err,
+        engine::catalog::CatalogError::DependentObjectsStillExist(_)
+    ));
+}
+
+/// 複数の数値列（INTEGER・BIGINT）を跨ぐ表制約 `CHECK` の宣言・依存列記録・
+/// 書き込み時検査を固定する（列制約と表制約が混在するケース）。
+#[test]
+fn multi_column_integer_bigint_table_check_enforces_and_records_both_columns() {
+    let (core, path) = new_core("check-integer-bigint-multi-column");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (qty > 0), lim BIGINT, CONSTRAINT c CHECK (qty <= lim))",
+    )
+    .expect("create table");
+
+    // 列制約（qty > 0）には違反しないが、表制約（qty <= lim）に違反する行。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, qty, lim) VALUES (1, 5, 1) USING OPERATION_ID 'op-1'",
+        )
+        .expect_err("qty <= lim violation must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+    assert!(err.client_message().contains('c'));
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, qty, lim) VALUES (1, 5, 10) USING OPERATION_ID 'op-2'",
+    )
+    .expect("qty <= lim satisfied must be accepted");
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+        1
+    );
+}
+
 /// 回帰: `CHECK` 専用ポリシー（`ColumnRefPolicy::AllowNumericColumns`）を
 /// 追加しても、汎用の `WHERE` 経路（`ColumnRefPolicy::IdAndVectorOnly`）が
 /// 数値列の式内参照を拒否する既存挙動は変わらない（レーン A は対象外。
