@@ -213,20 +213,31 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 `WARNING` 行を 1 行出します（`immediate`・未指定では出力されません）。
 `EXPLAIN` への durability 設定の露出は対象外です。
 
-`--max-dml-affected-rows`・`--max-insert-rows`（Issue #997）は、それぞれ
-述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の 1 文あたり影響行数上限・
-複数行 `VALUES` の 1 文あたり行数上限を、プロセス全体に対して設定する
-opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
-起動時にのみ明示指定する注入点」で、セッション・テナント単位では設定でき
-ません。未指定時の既定値はいずれも現行挙動と同じ `1,000`、指定可能範囲は
-`1`〜`1,000,000`（総走査行数上限と同値）です。範囲外の値・非数値・値欠落・
-2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、既定へ
-黙って読み替わることはありません。上限超過時の応答（`wire_code` `54000`・
-副作用ゼロ）自体の契約は変わらず、`detail` に表示される上限値が設定値に
-なるだけです。複数行 `VALUES` は本フラグに加えて一括投入の別上限
-（`self.batch_limits.max_files_per_batch`。既定 64。Issue #860）も通るため、
-1,000 行を超える単一の複数行 `VALUES` を受理させるには両方を引き上げる
-必要があります（詳細: `docs/design/predicate-dml-exec.md` §6）。
+`--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
+改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の
+1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限を、プロセス
+全体に対して設定する opt-in CLI 引数です。`--search-engine`／`--durability`
+と同型の「プロセス起動時にのみ明示指定する注入点」で、セッション・テナント
+単位では設定できません。**汎用 RDB（PostgreSQL 等）の挙動に合わせ、いずれも
+未指定時は既定で上限なし**です（BREAKING CHANGE: 以前の実装既定値
+〔1,000〕を超える行数でも、本フラグを指定しない限り成功します）。指定可能
+範囲は `1`〜`1,000,000`（総走査行数上限と同値）で、範囲外の値・非数値・
+値欠落・2 回目以降の重複指定はいずれも fail-closed で起動エラーとなり、
+既定へ黙って読み替わることはありません。上限を明示指定して超過した場合の
+応答（`wire_code` `54000`・副作用ゼロ）自体の契約は変わりません。上限を
+指定しない場合でも、既存の SQL 文長上限・1 文あたり総走査行数上限
+（`MAX_SCANNED_ROWS`）は変更されないため、計算量 DoS に対する資源上限は
+引き続き機能します。複数行 `VALUES` は本フラグに加えて一括投入の別上限
+（`batch_limits.max_files_per_batch`。既定 64。Issue #860）も通るため、
+64 行を超える単一の複数行 `VALUES` を受理させるには環境変数
+`VECTOR_DB_BATCH_MAX_FILES`（`engine::batch_limits` モジュールドキュメント
+参照）も併せて引き上げる必要があります（`--max-insert-rows` 未指定・既定の
+上限なし構成でも同様です）。`wire-server` は `batch_limits` を設定する専用
+CLI フラグを持たないため（Issue #997 のオーナー承認範囲外）、
+`--max-insert-rows` を明示指定し、その値が `batch_limits.max_files_per_batch`
+（既定値または `VECTOR_DB_BATCH_MAX_FILES` で設定した値）を超える場合、
+起動ログへ `WARNING` 行が 1 行出ます（`--max-insert-rows` 未指定〔既定〕では
+出ません。詳細: `docs/design/predicate-dml-exec.md` §6）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス

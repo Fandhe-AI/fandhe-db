@@ -17,9 +17,11 @@
   `crates/engine/src/sql/allowlist.rs`（`ValidatedPredicateUpdate`・
   `ValidatedPredicateDelete`・`WherePredicate`・`InsertLiteral`）・
   `crates/engine/src/sql/parser.rs`（`bind_update_form`・`bind_predicate_delete`・
-  `check_dml_affected_rows`・`MAX_DML_AFFECTED_ROWS`。DELETE 側の別系統
-  〔`check_affected_row_count`・`DEFAULT_MAX_DML_AFFECTED_ROWS`〕は Issue #997 で
-  本 API へ統合済み）・`crates/engine/src/sql/udf_call.rs`（`Expr`・
+  `check_dml_affected_rows_with_limit`・`DmlLimits`。UPDATE 側の旧 `pub const
+  usize` 系〔`MAX_DML_AFFECTED_ROWS`・`check_dml_affected_rows`〕・DELETE 側の
+  別系統〔`check_affected_row_count`・`DEFAULT_MAX_DML_AFFECTED_ROWS`〕は
+  いずれも Issue #997 で本 API へ統合・削除済み。オーナー判断の改訂
+  〔2026-09-27〕により既定は上限なし）・`crates/engine/src/sql/udf_call.rs`（`Expr`・
   `BinOp`・`parse_number_literal`・`MAX_EXPR_NODES`・`UdfRegistry`・
   `UdfDefinition`・`define_function`・`MAX_SESSION_UDFS`）・
   `crates/engine/src/sql/expr_program.rs`（`ExprProgram::compile`）・
@@ -482,11 +484,14 @@ RECOVER-5／RECOVER-6 の既存ガード（`recovery::commit_boundary`・
 `check_affected_row_count(count, limit)` という、シグネチャの異なる 2 つの
 上限 API に並立していた（いずれも `crates/engine/src/sql/parser.rs`）。
 Issue #871 実装時の申し送り事項だったこの並立は Issue #997 で
-`check_dml_affected_rows_with_limit` へ統合し、`DELETE` 側の別系統は削除した
-（既存 pub API `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows` は
-`with_limit` 版への薄い委譲として維持）。同 Issue でオーナー判断
-（2026-09-27）により、この上限をプロセス全体に対して `wire-server` の
-起動時 CLI フラグで設定可能にした（詳細・既定値・指定可能範囲の確定は
+`check_dml_affected_rows_with_limit(count, limit: Option<NonZeroUsize>)` へ
+統合し、`DELETE` 側の別系統は削除した。同 Issue のオーナー判断は改訂され
+（2026-09-27・前回の判断を置き換え）、最終的に「既定は上限なし・
+`wire-server` 起動時 CLI フラグで明示指定した場合のみ有効」という設計に
+なったため、旧 pub API `MAX_DML_AFFECTED_ROWS`（`pub const usize`）・
+`check_dml_affected_rows(count: usize)`（`limit` 引数を取らない版）は
+「既定＝上限なし」を型で表現できず維持できないため削除した
+（**BREAKING CHANGE**。詳細・最終判断・指定可能範囲の確定は
 `docs/design/predicate-dml-exec.md` §6 参照）。
 
 ## 7. 単一行 `UPDATE` 実行結線（Issue #865）への申し送り
