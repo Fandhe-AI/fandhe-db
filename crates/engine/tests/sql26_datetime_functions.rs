@@ -14,7 +14,6 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
-use engine::recovery::required_op_id::OperationId;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::storage::{Storage, Visibility};
@@ -502,14 +501,4 @@ fn date_part_is_deterministic_across_two_evaluations_of_the_same_row() {
         )
         .expect("second projection should succeed");
     assert_eq!(first.rows[0].cells[0], second.rows[0].cells[0]);
-}
-
-#[allow(dead_code)]
-fn unused_session_state_import_anchor() -> SessionState {
-    // `execute_sql_in_session` を使う既存テストとの記法揃えのため
-    // `SessionState`/`OperationId` を import しているが、本ファイルは
-    // `execute_sql`（暗黙セッション）のみを使う。未使用 import 警告を避ける
-    // ための到達しないアンカー関数。
-    let _ = OperationId::parse("op-anchor");
-    SessionState::default()
 }
