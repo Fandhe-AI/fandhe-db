@@ -576,6 +576,103 @@ UPSERT・複数行 `INSERT` は NoSQL 表層が公開していないためパリ
 production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
 無変更（テスト・docs 専任）。
 
+### パリティ総合検証（Issue #950）
+
+**目的**: Phase 7（親 #944）で NoSQL 表層に追加された機能——`filter` の
+範囲比較・`IN`・`OR`（#945・NOSQL-14）、`sort`（#946・NOSQL-15）、
+`offset`（#947・NOSQL-15）、`explain` 対象拡大（#948）、複数列
+`group_by`（#949・NOSQL-16）、DDL 3 op（#1063・NOSQL-13）——は個別の
+層 A テストで固定済みだが、実バイナリ・無改造クライアント越しに SQL 表層
+と NoSQL 表層が同じ結果を返すことを横断的に固定する層 B 検証は #779
+（読み取り 10 ケース）・#877（単一行 DML）の範囲に留まっていた。本 Issue
+は既存 3 クライアントハーネスを拡張し、Phase 7 機能・insert・DDL 3 op を
+含めた `Op::ALL`（9 語彙）すべてに層 B 到達性を持たせた。
+
+**読み取りパリティの拡張**: `seed_parity_db` に `category`（`TEXT`）・
+`price`（`NUMERIC(10,2)`）列を追加し（既存 10 ケースが参照する
+`id`／`lang`／`embedding`・`expected_rows_*` は不変）、`PARITY_CASES` へ
+6 ケース（`range-price-gte`・`in-category`・`or-lang-or-price`・
+`sort-category-id`・`offset-sorted-id`・`group-by-lang-category`）を
+追加した。`run_sql_nosql_parity_scenario`（#779 と共有）がそのまま
+SQL↔NoSQL↔固定オラクルの三者一致を検証する。`price` はどのケースからも
+投影列（`columns`）へは含めない——NoSQL `columns[].type` の期待値表
+（同関数内 `expected_nosql_types`）が `id`／`embedding` 以外を一律
+`"text"` とみなす簡易表のままのため、`NUMERIC` 列を投影すると型名比較が
+誤って失敗する。**SQL 側の構文上の制約（実装時に判明）**: SQL `WHERE`
+句で `NUMERIC` 列を裸の数値リテラルと比較すると
+`udf_call::bind_expr`（式評価経路）が `NUMERIC` 列を未対応として拒否する
+ため（`crates/wire-server/src/http/query/filter.rs` モジュール doc の
+「`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
+対象外」と同種の非対称）、`price >= '7.00'`（数値文字列リテラル）の形で
+宣言的比較経路へ渡す必要がある——`engine/tests/scalar_types_predicates.rs`
+の既存パターンに倣った。NoSQL 側の `filter` 値は数値・数値文字列いずれも
+受理するため JSON 側は素の数値のままでよい。
+
+**拒否ケース（§3.6 相当・スコープ縮小）**: `search`／`aggregate` への
+`sort`／`offset`・語彙外 `op`（`begin`）・`filter` への RLS 述語名
+（`visible`）指定が NoSQL 側で固定 `wire_code`（`42601`／`0A000`）を
+返すことを alice 1 テナントで確認する（`REJECTION_CASES`）。psql 側の
+受理確認（SQL 表層にはそもそも対応する構文形が無いか意味が異なる）は
+本ファイルのスコープ外とした——`nosql-api.md`「対応の無いもの」節が
+非対称の一次情報源であり、二重管理を避けた。
+
+**insert／DDL／述語形 DML パリティ（§3.3〜§3.5 相当・スコープ縮小）**:
+`run_phase7_write_parity_scenario` が、DDL 非依存の独立テーブル
+（`widgets`）に対して create_table → 非許可ユーザーの drop_table 拒否
+（`42501`）→ insert 2 行 → alter_table（`ADD COLUMN`）→ 述語形
+`delete`（`filter: [{"eq"}]`）→ 読み戻し一致 → drop_table → post-drop
+`42P01` を SQL 表層（生 wire）・NoSQL 表層（curl／urllib／fetch）の両方で
+適用し、影響行数・`wire_code`・最終状態の一致を固定する。**計画時点からの
+スコープ縮小**: RLS-9 応答同一性の述語形版（他テナント行向け／未存在 id
+向けの同一 `operation_id` 応答一致）と 3 テナント横断の述語形 DML は
+本関数では扱わない——単一行 `id` 完全一致形の RLS-9 は
+`run_sql_nosql_dml_parity_scenario`（#877）が固定済みであり、述語形の
+テナント境界パリティ自体は層 A（`nosql12_update_delete.rs` 述語形節）が
+固定済みのため、本節は表層横断の insert／DDL 到達性確認に絞った。
+
+**カバレッジガード**: `parity_matrix_covers_every_nosql_op`
+（`#[ignore]` を付けない・常時 `make ci` で実行）が
+`wire_server::http::query::op::Op::ALL`（9 語彙）のすべてが本ファイルの
+いずれかの**成功系**層 B ケースで使われていることを確認する。判定は
+`include_str!` によるソース全文の文字列出現検査ではなく、
+`PARITY_CASES`／`DML_STEPS`／`BOB_STEP`／`PHASE7_WRITE_CASES`——各シナリオ
+関数が実際に反復・送信するケース定義の値そのもの——から `op` 値を収集し、
+その集合に対して `Op::ALL` の網羅を判定する方式に実装している（レビュー
+指摘により、手動維持の固定文字列配列と `Op::ALL` を突き合わせるだけの
+旧実装、およびその後のソース全文 grep 方式から変更。コメント等への
+リテラル残存や実行されないコード上の文字列一致では検知できない抜けを
+防ぐ）。`REJECTION_CASES`（拒否ケース）の `op` はこの網羅判定に加えない
+——拒否ケースは非成功応答の `wire_code` のみを固定し、SQL/NoSQL 両表層の
+成功パリティを検証していないため、拒否ケースにしか現れない `op` で
+本ガードを見かけ上通過させない（PR #1135 レビュー指摘）。10 個目の
+`Op` が追加され、対応する成功系ケースが本ファイルに存在しない場合は
+このテストが赤くなり、層 B ケースの追加を強制する。
+
+**実測結果**: 3 クライアント（curl／urllib／fetch）すべてで新規 6 読み取り
+ケース・拒否 4 ケース・insert/DDL/述語形 delete シナリオが 3 テナント
+（読み取り）・alice/bob（DDL）の両方で green（本開発環境。
+`make e2e-three-client-http` の `[e2e-record] parity/<client>: ...`・
+`[e2e-record] ddl-parity/<client>: ...` 行を参照）。既存 #776〜#779・#877
+テストも回帰なし。実測で発見した意味差は無かった。
+
+**ドキュメント追随**: `nosql-api.md`「`aggregate`」節の `group_by` が
+「ちょうど 1 要素」と誤って記載されていた（#949 で複数列対応済み。実上限は
+`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`）ため、実装に合わせて
+1〜8 要素の記述へ更新した（レビュー指摘。PR #1135）。
+
+**スコープ外**（PR 本文にも記載）: NoSQL 述語形 DML の
+拡張語彙（範囲・`in`・`or`）非対応・`aggregate` への `sort`／`offset`・
+`LIKE` 中間／後方一致・`create_index` 等の既知非対称の深掘り、`explain`
+の SQL `EXPLAIN` 出力とのプラン行テキスト完全一致比較（層 A
+`nosql16_explain_targets.rs`・`sql27_explain_targets.rs` がそれぞれの
+表層内で固定済みであり、プランナ出力形式の差異を正規化する追加調査は
+本 Issue のスコープ外とした）、DATE／TIMESTAMP／UUID／BYTEA 列での範囲
+比較（`NUMERIC` のみを検証材料に採用）、層 B を CI 必須チェックへ組み
+込むこと（既存 ADR の方針どおり別途ユーザー承認事項）。
+
+production コード（`crates/engine/src/`・`crates/wire-server/src/`）は
+無変更（テスト・docs 専任）。
+
 ### Issue #878: wire セッションの可視性非対称と DML の相互作用（判断記録）
 
 Phase 0（#972）の最終 Issue として、旧「スコープ外」項の可視性非対称を
