@@ -118,8 +118,12 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
 - 索引の物理表現は引き続き `(table, PolicyContext)` 可視スナップショットから構築される
   （索引が他テナントの行を含むことはない）。索引宣言は `PolicyContext` を取らない
   全テナント共有の DDL であり、RLS の暗黙適用を一切変更しない。
-- 宣言の作成前後・削除後でテナントごとの検索・述語付き取得・集計の結果が完全に
-  一致することを `crates/engine/tests/sql_index_ddl.rs` で固定している。
+- 宣言の作成前後・削除後でテナントごとの述語付き取得・集計の結果が完全に
+  一致することを `crates/engine/tests/sql_index_ddl.rs` で固定している。検索結果に
+  ついても、既定エンジン（brute-force）下、またはスカラー宣言のみの場合は同様に
+  完全一致する。ただし `--search-engine hnsw*` opt-in 下での HNSW 宣言は対象テーブル
+  の Top-k を変え得る（後述「対象外（申し送り）」・
+  [index-declaration-effects.md](index-declaration-effects.md) を参照）。
 
 **索引宣言の構築対象への反映**（本ドキュメント初版で「対象外」としていた事項）は
 Issue #1065 で実装済み。詳細・設計判断は
