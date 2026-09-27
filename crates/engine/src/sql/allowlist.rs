@@ -4135,6 +4135,35 @@ impl<'a> Parser<'a> {
                 args: vec![haystack, needle],
             });
         }
+        // Cursor Bugbot 指摘対応（PR #1120）: `date_part`／`date_trunc` は
+        // `docs/design/datetime-scalar-functions.md` の契約上、第 2 引数
+        // （`src`）が NULL なら strict に NULL を返すべきだが、通常の関数呼び出し
+        // 引数は `allow_null_literal` を強制的に `false` に戻すため、裸の `NULL`
+        // トークンは列参照として解析され `bind_date_part_or_trunc` 側の
+        // `bind_null_aware` 対応（下記）に到達できなかった。第 1 引数（field/unit）
+        // は束縛時に文字列リテラルであることを要求する（`udf_call::
+        // bind_date_part_or_trunc` 参照）ため `NULL` を許可せず従来どおり
+        // `false` のまま、第 2 引数のみ `true` にする（`POSITION` と同じ
+        // 「関数ごとに引数位置で許可を分ける」方針。`CONCAT` のような全引数
+        // 一律の許可にはしない）。
+        if name.eq_ignore_ascii_case("date_part") || name.eq_ignore_ascii_case("date_trunc") {
+            let mut args = Vec::new();
+            if !matches!(self.peek(), Some(Token::Punct(')'))) {
+                args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
+                while matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    if args.len() >= MAX_CALL_ARGS {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "too many call arguments",
+                        ));
+                    }
+                    args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
+                }
+            }
+            self.expect_punct(')')?;
+            self.consume_expr_node()?;
+            return Ok(Expr::Call { name, args });
+        }
         // codex-review 指摘対応: `CONCAT` は NULL 引数を空文字として扱い常に
         // 非 NULL を返す契約（`udf_call::bind_concat`・`apply_builtin` の
         // `BuiltinFn::Concat2` 実装参照）だが、通常の関数呼び出し引数は

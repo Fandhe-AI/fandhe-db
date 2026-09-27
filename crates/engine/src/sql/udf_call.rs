@@ -2054,10 +2054,21 @@ fn bind_date_part_or_trunc(
             "function {lower_name} requires its first argument to be a literal (not a column reference or expression)"
         )));
     };
-    let (src_bound, src_ty) = bind_expr_in(src_arg, env, node_budget)?;
+    // Cursor Bugbot 指摘対応（PR #1120）: 第 2 引数（src）は本 ADR の「NULL 入力
+    // はすべて strict」契約（`docs/design/datetime-scalar-functions.md`）を満たす
+    // 必要があるが、素の `bind_expr_in` は裸の `Expr::Null` を「型が決められない
+    // 位置」として `0A000` で拒否してしまう。`bind_null_aware`（`CASE`/
+    // `COALESCE`/`NULLIF`/`CONCAT` と共有）で `Expr::Null` を型未確定の
+    // `BoundExpr::Null` として受理し、`apply_builtin` の一律 strict ガード
+    // （いずれかの引数が NULL なら NULL を返す）に評価を委ねる。第 1 引数
+    // （field/unit）は従来どおり NULL を許可しない（`sql::allowlist::Parser::
+    // parse_call_expr` の `date_part`／`date_trunc` 分岐が第 1 引数の `NULL`
+    // リテラル許可を立てないことと対）。
+    let (src_bound, src_ty) = bind_null_aware(src_arg, env, node_budget)?;
     let src = match src_ty {
-        ExprType::Timestamp => src_bound,
-        ExprType::Date => wrap_date_to_timestamp(src_bound),
+        Some(ExprType::Timestamp) => src_bound,
+        Some(ExprType::Date) => wrap_date_to_timestamp(src_bound),
+        None => src_bound,
         _ => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "function {lower_name} expects a DATE or TIMESTAMP as its second argument"

@@ -613,3 +613,83 @@ fn nullif_rejects_mismatched_date_and_scalar() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "42804");
 }
+
+// --- date_part/date_trunc の裸の NULL 第 2 引数（codex P1 指摘対応。PR #1120） -
+//
+// `docs/design/datetime-scalar-functions.md` の契約「NULL 入力はすべて
+// strict（結果は NULL）」を、列参照だけでなく裸の `NULL` リテラルでも満たす。
+// `sql::allowlist::Parser::parse_call_expr` の `date_part`／`date_trunc` 分岐
+// （第 2 引数のみ NULL リテラルを許可）と `bind_date_part_or_trunc` の
+// `bind_null_aware` 対応の組み合わせで動作する回帰を固定する。
+
+#[test]
+fn date_part_and_date_trunc_accept_bare_null_second_argument() {
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT date_part('year', NULL) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("date_part with a bare NULL second argument should be accepted");
+    assert_eq!(result.rows[0].cells[0], Cell::Null);
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT date_trunc('day', NULL) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("date_trunc with a bare NULL second argument should be accepted");
+    assert_eq!(result.rows[0].cells[0], Cell::Null);
+}
+
+#[test]
+fn date_part_with_bare_null_second_argument_works_nested_in_coalesce() {
+    // 第 2 引数の NULL 許可が `COALESCE` 等のネスト文脈でも正しく機能することを
+    // 固定する（`position_argument_parsing_does_not_leak_null_literal_permission`
+    // と対になる「許可が漏れない／欠けない」の両面確認）。
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT COALESCE(date_part('year', NULL), 0) FROM {TABLE} WHERE id = 1 LIMIT 10"
+            ),
+        )
+        .expect("date_part(..., NULL) nested in COALESCE should be accepted");
+    assert_eq!(float_cell(&result.rows[0].cells[0]), 0.0);
+}
+
+#[test]
+fn date_part_rejects_bare_null_first_argument() {
+    // 第 1 引数（field）は NULL を許可しない契約（`bind_date_part_or_trunc` が
+    // 文字列リテラルを要求）を維持する回帰。
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let err = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT date_part(NULL, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+}
