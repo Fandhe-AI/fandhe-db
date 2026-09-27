@@ -2,11 +2,12 @@
 //! 正規化レンダリング・書き込み時コンパイル/評価を担う。
 //!
 //! 責務境界: 構文段（`sql::allowlist::Parser::parse_check_clause`）が組み立てた
-//! [`ParsedCheck`] を受け取り、`sql::parser::bind_where_predicates`（TASK-79・SQL-9
-//! の既存束縛）へそのまま委譲して意味論検証する（第 2 の評価器を作らない。
-//! CLAUDE.md「委譲方針」）。CHECK 固有の追加検証は「参照可能な要素の絞り込み」
-//! （`visible()`・セッション UDF・WASM UDF・未知関数の拒否）と「正規化レンダリング
-//! の往復一致」のみ。
+//! [`ParsedCheck`] を受け取り、`sql::parser::bind_check_predicates`（`sql::parser::
+//! bind_where_predicates` と束縛経路を共有する CHECK 専用の薄いラッパー。
+//! Issue #1075・TABLE-16 ポインタ）へそのまま委譲して意味論検証する（第 2 の
+//! 評価器を作らない。CLAUDE.md「委譲方針」）。CHECK 固有の追加検証は「参照可能な
+//! 要素の絞り込み」（`visible()`・セッション UDF・WASM UDF・未知関数の拒否）と
+//! 「正規化レンダリングの往復一致」のみ。
 //!
 //! `CompiledChecks` は書き込み時の単一検査点 `constraint::enforce_row_constraints_in_txn`
 //! （`tenant.rs` の全書き込み関数が行の書き込み後・commit 前に呼ぶ。明示
@@ -15,19 +16,19 @@
 //! `sql::expr_program::ExprProgram`（式フィルタ側。TASK-79・SQL-9 の既存
 //! コンパイラをそのまま再利用）で評価する。
 //!
-//! 既知の制約（レーン A 未実装。`sql::udf_call::bind_expr_in` が INTEGER/BIGINT/
-//! REAL/DOUBLE/TEXT 列の式内参照を拒否するため）: `CHECK` の式比較
-//! （`WherePredicate::Expression`）で参照できるのは疑似列 `id`・`VECTOR` 列
-//! （`vec_norm`/`vec_sum`/`vec_div` 経由）のみ。数値列を含む式比較
-//! （`CHECK (qty > 0)` 等）は既存の束縛エラーのまま拒否される。レーン A が
-//! 実装されれば `bind_where_predicates` を経由するだけの本モジュールは変更
-//! なしに数値列比較へ対応する（drop-in）。
+//! `CHECK` の式比較（`WherePredicate::Expression`）で参照できるのは疑似列
+//! `id`・`VECTOR` 列（`vec_norm`/`vec_sum`/`vec_div` 経由）・INTEGER/BIGINT/
+//! REAL/DOUBLE 列（Issue #1075・TABLE-16 ポインタ。`sql::udf_call::
+//! ColumnRefPolicy::AllowNumericColumns` による CHECK 専用の opt-in 拡張）。
+//! TEXT/BOOLEAN/DATE/NUMERIC 等の他の列型は引き続き拒否される。NULL・非有限値・
+//! 精度の評価規則は `docs/design/sql-check-constraint.md` 参照。汎用の
+//! `WHERE`／`SELECT` へ数値列の式参照を広げるレーン A は対象外（別 Issue）。
 
 use crate::catalog::{CheckConstraint, TableSchema};
 use crate::declarative_filter::MetadataFilter;
 use crate::sql::allowlist::{ParsedCheck, SqlSurfaceError, WherePredicate};
 use crate::sql::expr_program::{ExprProgram, StackValue};
-use crate::sql::udf_call::{self, Expr, ExprValue, UdfRegistry};
+use crate::sql::udf_call::{self, Expr, ExprValue};
 use crate::tenant::TenantWriteError;
 
 /// `predicates` を `sql::allowlist::Parser::parse_where`／`parse_check_body` と
@@ -292,7 +293,7 @@ fn escape_literal(s: &str) -> String {
 /// `visible()`（`WherePredicate::PredicateCall`。RLS 文脈に依存し `id`／`VECTOR`
 /// 列のみという CHECK の参照可能範囲〔テーブル列と `id` のみ〕を破る）と、
 /// 組み込み関数以外の `Expr::Call`（セッション UDF・WASM UDF・未知関数。空の
-/// [`UdfRegistry`] で束縛すると「未知の関数」〔`22000`〕へ丸まってしまい、CHECK の
+/// `UdfRegistry` で束縛すると「未知の関数」〔`22000`〕へ丸まってしまい、CHECK の
 /// 禁止要素として区別できないため、束縛より前にここで `42601` として検出する）
 /// をいずれも `Err`（`42601`）として返す。
 fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSurfaceError> {
@@ -421,14 +422,15 @@ fn referenced_column_names(
             push(&column.name);
         }
     }
-    // Issue #919・SQL-26: 束縛済み式フィルタが参照する `TEXT` 列も同様に依存
-    // 列へ含める（`lower(label)` 等。取りこぼすと `ALTER TABLE DROP COLUMN`
-    // の依存検査をすり抜け、CHECK が参照する列を削除できてしまう）。
-    let mut text_mask = vec![false; schema.columns.len()];
+    // Issue #919・SQL-26、Issue #1075・TABLE-16 ポインタ: 束縛済み式フィルタが
+    // 参照する TEXT/DATE/TIMESTAMP/数値（INTEGER/BIGINT/REAL/DOUBLE）列も同様に
+    // 依存列へ含める（`lower(label)`・`qty > 0` 等。取りこぼすと `ALTER TABLE
+    // DROP COLUMN` の依存検査をすり抜け、CHECK が参照する列を削除できてしまう）。
+    let mut scalar_column_mask = vec![false; schema.columns.len()];
     for expr in expr_filters {
-        udf_call::mark_referenced_scalar_columns(expr, &mut text_mask);
+        udf_call::mark_referenced_scalar_columns(expr, &mut scalar_column_mask);
     }
-    for (index, wanted) in text_mask.iter().enumerate() {
+    for (index, wanted) in scalar_column_mask.iter().enumerate() {
         if *wanted {
             if let Some(column) = schema.columns.get(index) {
                 push(&column.name);
@@ -501,13 +503,7 @@ pub(crate) fn recompute_referenced_columns(
     reject_forbidden_elements(&predicates)?;
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
-        crate::sql::parser::bind_where_predicates(
-            &predicates,
-            schema,
-            &UdfRegistry::default(),
-            &mut node_budget,
-            &[],
-        )?;
+        crate::sql::parser::bind_check_predicates(&predicates, schema, &mut node_budget)?;
     Ok(referenced_column_names(
         schema,
         &predicates,
@@ -596,7 +592,6 @@ pub(crate) fn validate_and_build(
         }
     }
 
-    let empty_udfs = UdfRegistry::default();
     let mut used_names: Vec<String> = Vec::with_capacity(parsed.len());
     used_names.extend(explicit_names.iter().map(|n| n.to_string()));
     let mut built = Vec::with_capacity(parsed.len());
@@ -605,13 +600,7 @@ pub(crate) fn validate_and_build(
 
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
         let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
-            crate::sql::parser::bind_where_predicates(
-                &check.predicates,
-                schema,
-                &empty_udfs,
-                &mut node_budget,
-                &[],
-            )?;
+            crate::sql::parser::bind_check_predicates(&check.predicates, schema, &mut node_budget)?;
 
         let columns =
             referenced_column_names(schema, &check.predicates, &metadata_filters, &expr_filters);
@@ -695,7 +684,6 @@ impl CompiledChecks {
         if raw_checks.is_empty() {
             return Ok(None);
         }
-        let empty_udfs = UdfRegistry::default();
         let mut column_mask = vec![false; schema.columns.len()];
         let mut compiled = Vec::with_capacity(raw_checks.len());
         for check in raw_checks {
@@ -705,14 +693,8 @@ impl CompiledChecks {
             reject_forbidden_elements(&predicates).map_err(corrupt_check)?;
             let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
             let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
-                crate::sql::parser::bind_where_predicates(
-                    &predicates,
-                    schema,
-                    &empty_udfs,
-                    &mut node_budget,
-                    &[],
-                )
-                .map_err(corrupt_check)?;
+                crate::sql::parser::bind_check_predicates(&predicates, schema, &mut node_budget)
+                    .map_err(corrupt_check)?;
 
             // 依存列の記録（`CheckConstraint::columns`）が再計算結果を覆っていること
             // を検査する。欠けていれば `ALTER TABLE` の依存検査が素通りし得た
@@ -1183,6 +1165,126 @@ mod tests {
             .enforce(&schema, 1, &[100.0, 0.0, 0.0], &metadata)
             .expect_err("norm 100 must violate");
         assert!(matches!(err, TenantWriteError::CheckViolation { .. }));
+    }
+
+    /// 回帰ガード（設計 D-3）: 式述語が参照する `INTEGER` 列を `column_mask` へ
+    /// OR し忘れると、`scan_scalar_columns_masked` はマスク外＝NULL として扱い
+    /// `enforce` の NULL スキップ（UNKNOWN＝合格）で違反が黙って通過する
+    /// fail-open になる。違反値で確実に `CheckViolation` になることを固定する。
+    #[test]
+    fn compiled_checks_enforce_integer_column_compare() {
+        let v = parse_create_table("CREATE TABLE docs (qty INTEGER CHECK (qty > 0))");
+        let checks = validate_and_build(&schema_of(&v), &v.checks).expect("must validate");
+        assert_eq!(checks[0].columns, vec!["qty".to_string()]);
+        let schema = schema_of(&v).with_checks(checks);
+        let compiled = CompiledChecks::compile(&schema)
+            .expect("compile must succeed")
+            .expect("checks must be present");
+
+        let violating = crate::row_codec::encode_scalar_columns(&schema, &[Value::Integer(-1)])
+            .expect("encode");
+        let err = compiled
+            .enforce(&schema, 1, &[], &violating)
+            .expect_err("qty=-1 must violate");
+        assert!(matches!(
+            err,
+            TenantWriteError::CheckViolation { constraint } if constraint == "docs_qty_check"
+        ));
+
+        let ok =
+            crate::row_codec::encode_scalar_columns(&schema, &[Value::Integer(1)]).expect("encode");
+        assert!(compiled.enforce(&schema, 1, &[], &ok).is_ok());
+    }
+
+    /// `BIGINT` 列の値が `2^53` を超える場合、`f64` へ黙って丸めず `XX000`
+    /// （`CheckEvaluationFailed`）で fail-closed に拒否する（設計 D-2・D-4）。
+    #[test]
+    fn compiled_checks_enforce_bigint_value_exceeding_exact_range_fails_closed() {
+        let v = parse_create_table("CREATE TABLE docs (n BIGINT CHECK (n > 0))");
+        let checks = validate_and_build(&schema_of(&v), &v.checks).expect("must validate");
+        let schema = schema_of(&v).with_checks(checks);
+        let compiled = CompiledChecks::compile(&schema)
+            .expect("compile must succeed")
+            .expect("checks must be present");
+
+        let too_big = (1i64 << 53) + 1;
+        let metadata = crate::row_codec::encode_scalar_columns(&schema, &[Value::BigInt(too_big)])
+            .expect("encode");
+        let err = compiled
+            .enforce(&schema, 1, &[], &metadata)
+            .expect_err("BIGINT exceeding 2^53 must fail closed");
+        assert!(matches!(err, TenantWriteError::CheckEvaluationFailed));
+    }
+
+    /// 0 除算は違反（`23514`）にも通過にも丸めず `XX000` で fail-closed に
+    /// 拒否する（設計 D-4）。
+    #[test]
+    fn compiled_checks_enforce_division_by_zero_fails_closed() {
+        let v = parse_create_table("CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))");
+        let checks = validate_and_build(&schema_of(&v), &v.checks).expect("must validate");
+        let schema = schema_of(&v).with_checks(checks);
+        let compiled = CompiledChecks::compile(&schema)
+            .expect("compile must succeed")
+            .expect("checks must be present");
+
+        let metadata =
+            crate::row_codec::encode_scalar_columns(&schema, &[Value::Integer(0)]).expect("encode");
+        let err = compiled
+            .enforce(&schema, 1, &[], &metadata)
+            .expect_err("division by zero must fail closed");
+        assert!(matches!(err, TenantWriteError::CheckEvaluationFailed));
+    }
+
+    /// `REAL`／`DOUBLE` 列比較（対象外事項: `CREATE TABLE` の SQL DDL からは
+    /// 宣言できないため、`TableSchema`／`CheckConstraint` を直接構築して
+    /// `CompiledChecks::compile` の再束縛経路を固定する）。
+    #[test]
+    fn compiled_checks_enforce_real_and_double_column_compare() {
+        for (ty, ok_value, bad_value) in [
+            (ColumnType::Real, Value::Real(1.0), Value::Real(-1.0)),
+            (ColumnType::Double, Value::Double(1.0), Value::Double(-1.0)),
+        ] {
+            let schema = TableSchema::new("docs", vec![ColumnDef::new("qty", ty, true)])
+                .with_checks(vec![CheckConstraint {
+                    name: "c".to_string(),
+                    columns: vec!["qty".to_string()],
+                    predicate_sql: "qty > 0".to_string(),
+                }]);
+            let compiled = CompiledChecks::compile(&schema)
+                .expect("compile must succeed")
+                .expect("checks must be present");
+
+            let ok = crate::row_codec::encode_scalar_columns(&schema, &[ok_value]).expect("encode");
+            assert!(compiled.enforce(&schema, 1, &[], &ok).is_ok());
+
+            let bad =
+                crate::row_codec::encode_scalar_columns(&schema, &[bad_value]).expect("encode");
+            assert!(matches!(
+                compiled.enforce(&schema, 1, &[], &bad),
+                Err(TenantWriteError::CheckViolation { .. })
+            ));
+        }
+    }
+
+    /// 数値列（INTEGER/BIGINT/REAL/DOUBLE）以外の式内参照は、`CHECK` 専用
+    /// ポリシーが追加された後も引き続き拒否される（TEXT/BOOLEAN/DATE/NUMERIC
+    /// 等はポリシーに関わらず対象外のまま。設計 D-1・D-2）。
+    #[test]
+    fn validate_and_build_rejects_non_numeric_column_types_in_expressions() {
+        // `bind_check_predicates`（`ColumnRefPolicy::AllowNumericColumns`）でも
+        // 数値列（INTEGER/BIGINT/REAL/DOUBLE）以外の式内参照は引き続き拒否
+        // されることを固定する（設計 D-1・D-2。BOOLEAN 列を式の一方の被演算子
+        // に置く比較は `Expr::Ident` 経由で `bind_expr_in` に到達する）。
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("flag", ColumnType::Boolean, false)],
+        );
+        let predicates =
+            crate::sql::allowlist::parse_check_predicate_text("flag = id").expect("parse");
+        let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+        let err = crate::sql::parser::bind_check_predicates(&predicates, &schema, &mut node_budget)
+            .expect_err("BOOLEAN column must still be rejected under the CHECK policy");
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]

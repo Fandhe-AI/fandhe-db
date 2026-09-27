@@ -879,3 +879,221 @@ fn drop_column_rejected_by_check_keeps_index_declarations() {
         1
     );
 }
+
+// --- 数値列（INTEGER/BIGINT）の CHECK 式比較（Issue #1075・TABLE-16 ポインタ）
+// -----------------------------------------------------------------------
+
+/// 数値列比較を含む `CHECK` の宣言・永続化・再オープン後の継続検査
+/// （`create_table_with_column_level_check_persists_and_survives_reopen` と
+/// 同じ流儀）。
+#[test]
+fn create_table_with_integer_column_check_persists_and_survives_reopen() {
+    let (core, path) = new_core("check-integer-persist");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CONSTRAINT qty_ck CHECK (qty > 0))",
+    )
+    .expect("CREATE TABLE with numeric CHECK should succeed");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, qty) VALUES (1, -1) USING OPERATION_ID 'op-1'",
+        )
+        .expect_err("violating row must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+    assert!(err.client_message().contains("qty_ck"));
+
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, qty) VALUES (1, -1) USING OPERATION_ID 'op-2'",
+        )
+        .expect_err("violating row must still be rejected after reopen");
+    assert_eq!(err.wire_code(), "23514");
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, qty) VALUES (1, 1) USING OPERATION_ID 'op-3'",
+    )
+    .expect("satisfying row must be accepted after reopen");
+}
+
+/// 回帰ガード（設計 D-3: 式述語が参照する数値列を `column_mask` へ OR
+/// し忘れると、`scan_scalar_columns_masked` がマスク外＝NULL 扱いにし、
+/// `enforce` の NULL スキップにより違反が黙って通過する fail-open になる）。
+/// 複数行 INSERT で 1 行でも違反すればバッチ全体が拒否されることも併せて
+/// 固定する。
+#[test]
+fn multi_row_insert_rejects_batch_with_numeric_check_violation() {
+    let (core, path) = new_core("check-integer-multi-insert");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
+    )
+    .expect("create table");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, qty) VALUES (1, 1), (2, -1) \
+             USING OPERATION_ID 'op-1'",
+        )
+        .expect_err("batch with one violating row must be rejected entirely");
+    assert_eq!(err.wire_code(), "23514");
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+        0
+    );
+}
+
+/// 三値論理（SQL 標準）: 数値列が NULL の行は UNKNOWN として通過する
+/// （TEXT 列の `compiled_checks_enforce_treats_null_column_as_unknown_not_violation`
+/// と同じ契約を INSERT 経路で固定する）。
+#[test]
+fn insert_with_null_numeric_column_passes_check() {
+    let (core, path) = new_core("check-integer-null");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
+    )
+    .expect("create table");
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id) VALUES (1) USING OPERATION_ID 'op-1'",
+    )
+    .expect("NULL qty must pass the CHECK (UNKNOWN, not a violation)");
+}
+
+/// 単一行 UPDATE でも数値列 CHECK が検査される
+/// （`single_row_update_violating_check_is_rejected_with_no_side_effects` と
+/// 同じ流儀）。
+#[test]
+fn single_row_update_violating_numeric_check_is_rejected() {
+    let (core, path) = new_core("check-integer-update");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (qty > 0))",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, qty) VALUES (1, 1) USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            "UPDATE docs SET qty = -1 WHERE id = 1 USING OPERATION_ID 'op-upd'",
+        )
+        .expect_err("violating UPDATE must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+    // 副作用ゼロ: 行はそのまま残る（`qty = 1` は等価述語が文字列リテラルのみ
+    // 受理する既存の制約により WHERE で直接検証できないため、`id` で存在を
+    // 確認する）。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs WHERE id = 1 LIMIT 100"),
+        1
+    );
+}
+
+/// 評価エラー（0 除算）は違反（`23514`）にも通過にも丸めず、`XX000` で
+/// fail-closed に拒否する（設計 D-4。行の値・id・テナントを含まない固定文言）。
+#[test]
+fn insert_triggering_division_by_zero_in_check_fails_closed_with_internal_error() {
+    let (core, path) = new_core("check-integer-div-zero");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))",
+    )
+    .expect("create table");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, qty) VALUES (1, 0) USING OPERATION_ID 'op-1'",
+        )
+        .expect_err("division by zero during CHECK evaluation must fail closed");
+    assert_eq!(err.wire_code(), "XX000");
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+        0
+    );
+}
+
+/// `CHECK` が参照する数値列も `TEXT` 列と同じく `ALTER TABLE ... DROP COLUMN`
+/// の依存検査で拒否される（`drop_column_rejected_by_check_keeps_index_declarations`
+/// と同じ流儀の対象列違い）。
+#[test]
+fn drop_column_referenced_by_numeric_check_is_rejected() {
+    let (core, path) = new_core("check-integer-drop-column");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (qty > 0), body TEXT)",
+    )
+    .expect("create table");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let err = storage
+        .alter_table_drop_column("docs", "qty")
+        .expect_err("dropping a CHECK-referenced numeric column must be rejected");
+    assert!(matches!(
+        err,
+        engine::catalog::CatalogError::DependentObjectsStillExist(_)
+    ));
+}
+
+/// 回帰: `CHECK` 専用ポリシー（`ColumnRefPolicy::AllowNumericColumns`）を
+/// 追加しても、汎用の `WHERE` 経路（`ColumnRefPolicy::IdAndVectorOnly`）が
+/// 数値列の式内参照を拒否する既存挙動は変わらない（レーン A は対象外。
+/// `sql::udf_call::bind_expr_in` の `Expr::Ident` 分岐参照）。
+#[test]
+fn select_where_numeric_column_expression_is_still_rejected() {
+    let (core, path) = new_core("check-integer-where-regression");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (qty INTEGER)")
+        .expect("create table");
+
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            "SELECT id FROM docs WHERE qty > 0 LIMIT 100",
+        )
+        .expect_err("numeric column expression in WHERE must still be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}

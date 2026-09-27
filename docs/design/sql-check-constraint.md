@@ -42,18 +42,23 @@ CREATE TABLE <table> (
 
 `CHECK` の本体は `sql::allowlist::Parser::parse_check_body`（`parse_where` と
 同一の文法。唯一の違いは `)` を境界トークンとして扱う点）で解析する。束縛は
-`sql::parser::bind_where_predicates` を空の `UdfRegistry` で呼ぶ（セッションの
-UDF を解決させない）ため、評価器は完全に既存のものを再利用する（第 2 の実装
-を作らない）。
+`sql::parser::bind_check_predicates`（`sql::parser::bind_where_predicates` と
+束縛経路〔`bind_where_predicates_recursive`〕を共有する CHECK 専用の薄い
+ラッパー。空の `UdfRegistry` で呼び、セッションの UDF を解決させない）で行う
+ため、評価器は完全に既存のものを再利用する（第 2 の実装を作らない）。
 
-**既知の制約（レーン A 未実装）**: `sql::udf_call::bind_expr_in` は
-INTEGER/BIGINT/REAL/DOUBLE/TEXT 列の式内参照を拒否する。したがって
-`CHECK (qty > 0)` のような数値列の算術・比較は既存の束縛エラーのまま拒否
-される。実際に `CHECK` で参照できるのは TEXT 列（等価・前方一致）・疑似列
-`id`・`VECTOR` 列（`vec_norm`/`vec_sum`/`vec_div` 経由）のみ。レーン A が実装
-されれば、`bind_where_predicates` を経由するだけの本実装は変更なしに数値列
-比較へ対応する（drop-in）。CREATE TABLE の SQL 表層自体が現状 TEXT／VECTOR
-列しか宣言できない点もあわせて既知の制約とする。
+**数値列の式参照（Issue #1075・TABLE-16 ポインタ）**: `sql::udf_call::
+bind_expr_in` の `Expr::Ident` 分岐は、束縛環境の列参照ポリシー
+（`ColumnRefPolicy`）に応じて INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可
+する。`WHERE`／`SELECT`／Describe 系の汎用式束縛（`bind_expr`。常に
+`ColumnRefPolicy::IdAndVectorOnly`）は挙動を変えず、`CHECK` の式述語束縛
+（`bind_check_predicates`。`ColumnRefPolicy::AllowNumericColumns`）だけが
+数値列の算術・比較（`CHECK (qty > 0)` 等）を受理する opt-in 拡張であり、
+汎用の `WHERE`／`SELECT` へ数値列の式参照を広げるレーン A は依然として
+別 Issue の対象（未起票）。TEXT/BOOLEAN/DATE/NUMERIC 等の他の列型は
+ポリシーに関わらず引き続き拒否される。CREATE TABLE の SQL 表層は現状
+TEXT／VECTOR／INTEGER／BIGINT 列のみ宣言できる（REAL/DOUBLE 列は Rust API
+経由に限る）。
 
 **禁止要素**（`sql::check_constraint::reject_forbidden_elements`。`42601`）:
 
@@ -77,6 +82,28 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   （`dim == 0`）なら UNKNOWN としてスキップする（`sql/scan.rs` の `WHERE` 式
   評価と同じ判断。現状 CREATE TABLE の `VECTOR` 列は常に non-null のため
   実際には到達しないが、将来の拡張に備えた防御的処理）。
+
+## D1'. 数値列比較の評価規則（Issue #1075・TABLE-16 ポインタ）
+
+- **NULL**: 参照している数値列のいずれかが NULL なら、その連言は UNKNOWN
+  になり違反にしない（D1 の三値論理を式にも一様に適用する。既存の宣言的
+  フィルタ・`VECTOR` 列参照と同じ規則）。
+- **非有限値**: 格納値としての NaN/±∞ は `row_codec` が encode 時にも decode
+  時にも拒否するため実際には到達しない。評価の途中で生じる非有限値
+  （オーバーフロー）・0 除算（例: `CHECK (100 / qty > 1)` で `qty = 0`）は、
+  既存の評価器契約どおり `Err` になり、`TenantWriteError::
+  CheckEvaluationFailed`（`XX000`、詳細はクライアントへ返さない）で書き込みを
+  拒否する（違反〔`23514`〕に丸めない・黙って通過もさせない）。
+- **精度**: `BIGINT` の絶対値が `2^53` を超える値は `f64` で正確に表現できない
+  ため `XX000` で拒否する（`id`（`id_as_finite_scalar`）と同じ境界。黙って
+  丸めて誤った判定をしない）。`INTEGER`／`REAL` は `f64` で常に正確に表現
+  できる。
+- **既知の PostgreSQL との相違**（記録のみ）: 算術は `f64` で行うため `/` は
+  整数の切り捨て除算にならない。`REAL` と小数リテラルの比較は `f32` を
+  `f64` へ昇格した値で行う。単項マイナスがないため `CHECK (qty > -1)` は
+  `42601` になり、`CHECK (qty > 0 - 1)` なら受理される。
+- **エラーコード**: 新しい variant も写像変更もない。SQL-26（`docs/spec/
+  04-behavior/sql-surface.md`）の `22012`/`22003` 化は対象外（後続課題）。
 
 ## D2. 永続化（カタログ v7）
 
@@ -215,8 +242,18 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 
 ## 対象外（申し送り）
 
-- レーン A（INTEGER/BIGINT/REAL/DOUBLE 列の式参照。未起票）。実装されれば
-  CHECK は自動的に数値列の比較に対応する。
+- レーン A（`WHERE`／`SELECT`／集計での INTEGER/BIGINT/REAL/DOUBLE 列の式
+  参照。未起票）。`CHECK` は Issue #1075 で `ColumnRefPolicy::
+  AllowNumericColumns` による opt-in 拡張として対応済みだが、汎用の
+  `WHERE`／`SELECT` への拡大は別 Issue の対象。
+- `CREATE TABLE` の列型へ `REAL`／`DOUBLE PRECISION` を追加すること
+  （現状 SQL から宣言できる数値型は `INTEGER`／`BIGINT` のみ。`CHECK` も
+  `CREATE TABLE` 限定〔`ALTER TABLE ADD CONSTRAINT CHECK` は別 Issue〕のため、
+  `REAL`／`DOUBLE` の `CHECK` は SQL 表層からは現状到達できず単体テストで
+  担保する）。
+- SQL-26 準拠のエラーコード（`22012`/`22003`）・単項マイナス・整数の
+  切り捨て除算（数値列比較の評価規則。D1' 参照）。
+- `qty > '5'`（INTEGER 列に文字列リテラルの `Compare` 形）の受理。
 - `ALTER TABLE ADD/DROP CONSTRAINT`。
 - NoSQL 表層への DDL op（`create_table` 相当）。
 - `CHECK` 参照列への `ALTER COLUMN TYPE` の許可（現状は安全側で拒否）。
@@ -242,9 +279,16 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   fail-closed 拒否〔`DROP TYPE` 依存判定を含む〕・ALTER 相互作用）。
 - `crates/engine/src/sql/check_constraint.rs`（意味論検証・制約名の自動生成
   と衝突解決〔宣言順非依存〕・禁止要素・往復一致検証・`CompiledChecks` の
-  compile/enforce・三値論理）。
+  compile/enforce・三値論理・数値列比較〔INTEGER/BIGINT/REAL/DOUBLE の
+  合否・列マスク OR の fail-open 回帰ガード・BIGINT 精度超過・0 除算の
+  fail-closed・数値列以外は引き続き拒否〕）。
+- `crates/engine/src/sql/udf_call.rs`・`crates/engine/src/sql/
+  expr_program.rs`（`ColumnRefPolicy`・`BoundExpr::ColumnRef` の束縛・
+  評価差分テスト。既定ポリシーでの回帰確認を含む）。
 - `crates/engine/tests/table16_check_constraint.rs`（結合テスト。単一行
   INSERT・複数行 INSERT・UPSERT〔`DO UPDATE`／`DO NOTHING`〕・単一行
   UPDATE・述語つき UPDATE・ファイル形 INSERT・COPY FROM・明示トランザクション・
   Rust API の生 `RowInput` 経路で `23514`・副作用ゼロ・台帳再送成功・永続化
-  再オープン・CHECK と UNIQUE の評価順・曖昧な列定義の拒否を固定）。
+  再オープン・CHECK と UNIQUE の評価順・曖昧な列定義の拒否・数値列 CHECK の
+  宣言/永続化/再オープン後の継続検査・NULL 通過・0 除算の `XX000`・
+  `DROP COLUMN` 依存拒否・`WHERE` 側の既存拒否の非回帰を固定）。
