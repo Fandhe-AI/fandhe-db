@@ -4153,6 +4153,11 @@ fn decode_schema_body(
     Ok(schema)
 }
 
+/// [`parse_unique_section`] が返す 1 制約ぶんの中間表現（制約名〔`named` が
+/// `false` のときは常に `None`〕・列リスト）。呼び出し元ごとに異なる型を
+/// 書かないための共有エイリアス（clippy `type_complexity` 対応）。
+type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
+
 /// カタログ v6 の `uniq:` セクション（`uniq:<n>` 行と `n` 個の
 /// `U:<col>[,<col>]*` 行。TABLE-16・TASK-204、Issue #905）を構造検証しつつ
 /// 読み取る共有パーサー。[`decode_schema_body`] と軽量パーサー
@@ -4173,11 +4178,6 @@ fn decode_schema_body(
 /// 参照列の実在・型適格性は呼び出し元が判定する（列行の集合が必要なため）。
 /// エラーは呼び出し元が自身の分類（`Invalid`／`CorruptSchema`）へ包む文言のみを
 /// 返す。
-/// [`parse_unique_section`] が返す 1 制約ぶんの中間表現（制約名〔`named` が
-/// `false` のときは常に `None`〕・列リスト）。呼び出し元ごとに異なる型を
-/// 書かないための共有エイリアス（clippy `type_complexity` 対応）。
-type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
-
 fn parse_unique_section<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     allow_empty: bool,
