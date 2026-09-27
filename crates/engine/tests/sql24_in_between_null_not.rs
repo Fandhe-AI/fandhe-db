@@ -400,6 +400,109 @@ fn distance_first_or_group_is_null_excludes_non_null_integer_column() {
     );
 }
 
+/// PR #1108 codex-review 指摘対応（P1）: DISTANCE 先行時、`bound.or_filters` に
+/// 式述語を含む OR 群があると、[`distance_first_or_group_is_null_excludes_non_null_integer_column`]
+/// と異なりその式述語の評価を DISTANCE 段の後（実際に Top-k として選ばれた行
+/// だけ）まで遅延させる必要がある（`sql::where_tree::BoundOrGroup::
+/// matches_deferred`）。ここでは式述語を含む OR 群の中で `IS NULL`（宣言的・
+/// エラーを返さない部分）を固定し、遅延評価経路（`OrGroupMetadataVerdict`）
+/// でも INTEGER 列の非 NULL 値が誤って NULL 扱いされない（fail-open しない）
+/// ことを確認する。式述語（`(1 / (id - 1000)) > 1000000`）はテストデータの
+/// `id`（1..=5）に対して常に偽になるよう設計し、`OR` の真偽が `IS NULL` 側の
+/// 正しさのみに依存するようにする。
+#[test]
+fn distance_first_or_group_with_expr_branch_is_null_excludes_non_null_integer_column() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_five_rows(&core, &alice);
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE (1 / (id - 1000)) > 1000000 OR qty IS NULL \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 100 \
+                 HINT ORDER(DISTANCE, SCALAR, RLS)"
+            ),
+        )
+        .expect(
+            "DISTANCE-first HINT ORDER should still apply OR-group IS NULL with an expr sibling",
+        );
+    assert!(
+        ids(&result
+            .rows
+            .iter()
+            .map(|r| r.cells.clone())
+            .collect::<Vec<_>>())
+        .is_empty(),
+        "the expr branch is always false and no row has a NULL qty; a non-empty result \
+         means the deferred OR-group evaluation fail-opened on a non-NULL INTEGER column"
+    );
+}
+
+/// PR #1108 codex-review 指摘対応（P1）: DISTANCE 先行時に `bound.or_filters` の
+/// 式述語（ゼロ除算等でエラーを返しうる）を全可視行へ前倒しで評価すると、
+/// DISTANCE 段で Top-k に選ばれない行のエラーまでクエリ全体の失敗にしてしまう
+/// （評価順序・エラー契約の回帰）。「危険な」行（id=4。式 `1 / (id - 4)` が
+/// ゼロ除算になる）のクエリベクトルとの内積を他行より明確に小さくして
+/// （`ORDER BY embedding <=> ...` のランキングは内積が大きいほど上位）
+/// DISTANCE ランキングで確実に Top-k 外へ追いやり、`LIMIT` を Top-k 内の行数に
+/// 絞ったクエリが成功することを固定する（遅延評価が効いていなければ
+/// `on_visible_row` の時点でエラーになり、クエリ全体が失敗する）。
+#[test]
+fn distance_first_or_group_expr_branch_error_on_non_topk_row_does_not_fail_query() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    let insert = |id: u64, embedding: &str| {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang) VALUES ({id}, '{embedding}', 'ja') \
+                 USING OPERATION_ID 'op-expr-defer-{id}'"
+            ),
+        )
+        .expect("insert should succeed");
+    };
+    // クエリベクトル `[0.1,0.2]` との内積が僅かに異なる行（Top-k に入る）。
+    // 内積: id1=0.05・id2=0.051・id3=0.052（降順ランキングで id3, id2 が上位）。
+    insert(1, "[0.1,0.2]");
+    insert(2, "[0.11,0.2]");
+    insert(3, "[0.12,0.2]");
+    // クエリベクトルとの内積が明確に小さい（負の）「危険な」行。`1 / (id - 4)` は
+    // id=4 でゼロ除算になるが、DISTANCE ランキングでは最下位
+    // （`LIMIT 2` の Top-k 外）になる。
+    insert(4, "[-10.0,-10.0]");
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE tag = 'never-matches' OR (1 / (id - 4)) < 1000000 \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 2 \
+                 HINT ORDER(DISTANCE, SCALAR, RLS)"
+            ),
+        )
+        .expect(
+            "a division-by-zero in an OR group's expr branch on a row outside the DISTANCE \
+             Top-k must not fail the query (deferred evaluation regression)",
+        );
+    let result_ids = ids(&result
+        .rows
+        .iter()
+        .map(|r| r.cells.clone())
+        .collect::<Vec<_>>());
+    assert_eq!(
+        result_ids,
+        vec![2, 3],
+        "expected exactly the 2 highest-ranked rows (LIMIT 2, no under-fetch expected \
+         here); id=4 (the division-by-zero row) must not appear"
+    );
+}
+
 #[test]
 fn distance_first_is_not_null_includes_non_null_integer_column() {
     let (core, path) = new_core();

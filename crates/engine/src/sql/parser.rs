@@ -1320,7 +1320,11 @@ fn declarative_leaf_to_filter(
         // ため到達しない（構文段の不変条件: `Not` の内側にもこれらは来ない。
         // `Or` は TASK-208・Issue #912、`InSubquery`／`Exists` は Issue #927・
         // SQL-29 (a)・TASK-213 で追加した分岐で、いずれも宣言的フィルタへは
-        // 写像できないため呼び出し元が処理する）。
+        // 写像できないため呼び出し元が処理する。`NOT EXISTS (...)`／
+        // `NOT <col> IN (SELECT ...)` は構文段〔`sql::allowlist::Parser::
+        // parse_where_leaf`〕が `0A000` で拒否するため、`Not` の内側に
+        // `InSubquery`／`Exists` が来ることもない——Cursor Bugbot 指摘対応:
+        // 従来はここまで到達して `Internal` エラーになっていた）。
         WherePredicate::PredicateCall { .. }
         | WherePredicate::Expression(_)
         | WherePredicate::Or(_)

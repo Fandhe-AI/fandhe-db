@@ -3246,6 +3246,26 @@ impl<'a> Parser<'a> {
                         "NOT visible() is not supported",
                     ));
                 }
+                // `NOT EXISTS (SELECT ...)`／`NOT <col> IN (SELECT ...)`
+                // （Cursor Bugbot Medium 指摘対応。Issue #927 の設計文書
+                // `docs/design/sql-subquery.md`「スコープ（当初計画との差分）」で
+                // `NOT IN`・`NOT EXISTS` は「非対応（文法自体が `NOT` を持たない）」
+                // と明記済み）。`try_parse_structural_leaf` が構造的に確定させた
+                // `Exists`／`InSubquery` を前置 `NOT` でそのまま包むと、束縛段
+                // （`sql::parser::declarative_leaf_to_filter`）が宣言的フィルタとして
+                // 扱えず `Internal` エラーになる（未解決サブクエリが束縛に到達した
+                // 場合の fail-closed 保険腕に落ちる）。`0A000`（`FeatureNotSupported`）
+                // で構文段のうちに明示的に拒否し、内部エラーへ落とさない。
+                Some(WherePredicate::Exists { .. }) => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "NOT EXISTS (SELECT ...) is not supported".to_string(),
+                    });
+                }
+                Some(WherePredicate::InSubquery { .. }) => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
+                    });
+                }
                 Some(leaf) => leaf,
                 None => {
                     return Err(SqlSurfaceError::unsupported(
@@ -3500,6 +3520,22 @@ impl<'a> Parser<'a> {
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN"))
             && matches!(self.tokens.get(self.pos + 3), Some(Token::Punct('(')))
         {
+            // `<col> NOT IN (SELECT ...)`（Cursor Bugbot Medium 指摘対応。Issue #927
+            // の設計文書 `docs/design/sql-subquery.md`「スコープ（当初計画との
+            // 差分）」で `NOT IN` は「非対応（文法自体が `NOT` を持たない）」と
+            // 明記済み）。`(` の直後が `SELECT` の場合はサブクエリ形と判断し、
+            // 下の `parse_in_list_body`（文字列リテラルしか受理しない）へ回さず
+            // ここで `0A000` として明示的に拒否する（回さないと `parse_in_list_body`
+            // が `SELECT` キーワードを非リテラル要素として `42601` にしてしまい、
+            // 意図が伝わらないエラーメッセージになる）。
+            if matches!(
+                self.tokens.get(self.pos + 4),
+                Some(Token::Keyword(Keyword::Select))
+            ) {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
+                });
+            }
             self.advance();
             self.advance();
             self.advance();
