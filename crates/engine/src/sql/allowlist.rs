@@ -5530,12 +5530,22 @@ impl<'a> Parser<'a> {
         };
         let mut seen_delete = false;
         let mut seen_update = false;
+        // `ON DELETE`／`ON UPDATE` に `RESTRICT` が指定されたか（Issue #1077
+        // レビュー指摘・PR #1137）。`RESTRICT` は SQL 標準上つねに即時検査
+        // （非遅延）の参照動作であり、`INITIALLY DEFERRED` と併用すると
+        // 「RESTRICT なのに COMMIT まで検査を遅延する」という契約違反になる
+        // （`constraint::FkCheckMode::includes` は現状 `deferrability` のみで
+        // 文単位検査の対象可否を決めており、参照動作〔`NO ACTION`／`RESTRICT`〕
+        // を保持していないため区別できない）。参照動作を保持して個別に即時検査
+        // する経路は追加しず、下の検査で宣言そのものを fail-closed に拒否する。
+        let mut on_delete_restrict = false;
+        let mut on_update_restrict = false;
         while self.peek_ident_matches("ON") {
             self.advance();
-            let seen = if self.peek_ident_matches("DELETE") {
-                &mut seen_delete
+            let (seen, restrict_flag) = if self.peek_ident_matches("DELETE") {
+                (&mut seen_delete, &mut on_delete_restrict)
             } else if self.peek_ident_matches("UPDATE") {
-                &mut seen_update
+                (&mut seen_update, &mut on_update_restrict)
             } else {
                 return Err(SqlSurfaceError::unsupported(
                     "expected DELETE or UPDATE after ON in FOREIGN KEY",
@@ -5553,6 +5563,7 @@ impl<'a> Parser<'a> {
                 self.advance();
             } else if self.peek_ident_matches("RESTRICT") {
                 self.advance();
+                *restrict_flag = true;
             } else {
                 return Err(SqlSurfaceError::unsupported(
                     "only NO ACTION or RESTRICT is supported as a FOREIGN KEY referential action",
@@ -5627,6 +5638,16 @@ impl<'a> Parser<'a> {
         } else {
             crate::catalog::ForeignKeyDeferrability::NotDeferrable
         };
+        // `RESTRICT`（即時検査が契約）と `INITIALLY DEFERRED`（COMMIT まで
+        // 検査を遅延）の併用を fail-closed に拒否する（Issue #1077 レビュー
+        // 指摘・PR #1137。上の `on_delete_restrict`／`on_update_restrict` 参照）。
+        if deferrability == crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyDeferred
+            && (on_delete_restrict || on_update_restrict)
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "ON DELETE RESTRICT / ON UPDATE RESTRICT cannot be combined with INITIALLY DEFERRED",
+            ));
+        }
 
         Ok(ParsedReferences {
             parent_table,
