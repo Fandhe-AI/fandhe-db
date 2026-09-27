@@ -1013,6 +1013,14 @@ struct UsingPlanExpansionResult {
 pub struct PlanSearchBinding {
     projection: Vec<crate::sql::parser::ProjectedColumn>,
     metadata_filters: Vec<crate::declarative_filter::MetadataFilter>,
+    /// `WHERE` の式述語（Issue #945・NOSQL-14。NoSQL `plan` 検索の `filter` に
+    /// 範囲比較・`IN`・`OR` を拡張した際、`INTEGER`／`BIGINT`／`REAL`／
+    /// `DOUBLE PRECISION` 列への比較を式レーンへ渡す入口）。[`Self::new`] の
+    /// 既存呼び出し元との互換を保つため既定は空（[`Self::with_where_filters`]
+    /// で設定する）。
+    expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    /// `WHERE` の `OR` 群（Issue #945・NOSQL-14）。既定は空。
+    or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
 }
 
 impl PlanSearchBinding {
@@ -1023,7 +1031,24 @@ impl PlanSearchBinding {
         Self {
             projection,
             metadata_filters,
+            expr_filters: Vec::new(),
+            or_filters: Vec::new(),
         }
+    }
+
+    /// `WHERE` の式述語・`OR` 群を設定したコピーを返すビルダー的メソッド
+    /// （Issue #945・NOSQL-14。`sql::declarative_predicate::
+    /// bind_declarative_predicates` の束縛結果〔`BoundWhereFilters::into_parts`〕
+    /// をそのまま渡す入口。`BoundStatement::with_where_filters` と同じ設計）。
+    #[must_use]
+    pub fn with_where_filters(
+        mut self,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
+    ) -> Self {
+        self.expr_filters = expr_filters;
+        self.or_filters = or_filters;
+        self
     }
 }
 
@@ -4420,16 +4445,20 @@ impl EngineCore {
                         "USING PLAN re-embedded vector must not contain NaN/Inf".to_string(),
                     ));
                 }
+                // Issue #945・NOSQL-14: NoSQL 表層の `plan` 検索経路も `filter` の
+                // 範囲比較・IN・OR 拡張を受ける（`bind` closure が
+                // `PlanSearchBinding::with_where_filters` 経由で設定した式述語・
+                // OR 群をそのまま素通しする。第 2 のコンパイル経路を作らない）。
+                let expr_filter_programs =
+                    crate::sql::parser::compile_expr_filter_programs(&parts.expr_filters);
                 Ok(crate::sql::parser::BoundStatement {
                     table: table.to_string(),
                     projection: parts.projection,
                     metadata_filters: parts.metadata_filters,
                     rls_predicate_present: false,
-                    expr_filters: Vec::new(),
-                    expr_filter_programs: Vec::new(),
-                    // NoSQL 表層の `plan` 検索経路は `OR` 未対応
-                    // （TASK-208・Issue #912。計画§「対象外」参照）。
-                    or_filters: Vec::new(),
+                    expr_filters: parts.expr_filters,
+                    expr_filter_programs,
+                    or_filters: parts.or_filters,
                     ranking: crate::sql::parser::Ranking::Hybrid {
                         query: planned.query_vector,
                         text_column_index,

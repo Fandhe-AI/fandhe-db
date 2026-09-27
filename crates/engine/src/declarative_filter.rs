@@ -41,6 +41,13 @@ use crate::uuid::Uuid;
 /// 列数と独立の定数だが、桁の妥当性は同じ方針に揃える）。
 pub const MAX_METADATA_FILTERS: usize = 256;
 
+/// `<col> [NOT] IN (...)` 1 個が持てる要素数の上限（SQL-24。TASK-208 ポインタ）。
+/// `sql::allowlist::MAX_IN_LIST_ITEMS`（SQL テキスト経由の構文段）と同値を
+/// 採用し、二重定義を避けるため同モジュールがこの定数を再エクスポートする形で
+/// 参照する（NoSQL 表層 `wire-server::http::query::filter`（Issue #945・
+/// NOSQL-14）が `in` 要素数上限の多層防御にも使う公開 API）。
+pub const MAX_IN_LIST_ITEMS: usize = 256;
+
 /// `LIKE` パターン（生パターン。エスケープ解除前）のバイト長上限
 /// （SQL-24／TASK-208、Issue #914）。[`parse_like_pattern`] が確保・解析より
 /// **前**に判定し、超過は `54000`。中間一致・後方一致を含む一般形は
@@ -711,67 +718,82 @@ fn bind_filter_op(
         // スロットの昇順連結を前提とするため。`InTyped` は索引未対応
         // 〔`sql::scalar_plan::classify_scalar_plan` が常に `PlainScan` へ
         // 倒す〕のためソート不要）。
-        FilterOp::InListLiteral { values } => match ty {
-            ColumnType::Text => {
-                let mut bound = Vec::with_capacity(values.len());
-                for v in values {
-                    check_literal_len(v)?;
-                    bound.push(v.clone());
-                }
-                bound.sort();
-                bound.dedup();
-                FilterOp::InText(bound)
+        FilterOp::InListLiteral { values } => {
+            // `sql::allowlist::parse_in_list_body`（SQL テキスト経由）は構文段で
+            // 既に `MAX_IN_LIST_ITEMS` を検査済みだが、`DeclarativeFilter::
+            // in_list` は engine の公開 API であり、SQL テキストを経由しない
+            // 呼び出し元（`sql::declarative_predicate::bind_declarative_predicates`
+            // の直接呼び出し等）は構文段の検査を経ない。ここが `Vec::with_capacity`
+            // より前の唯一の共通防御点になるため、束縛の最初に必ず検査する
+            // （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
+            // （DoS）」対応）。
+            if values.len() > MAX_IN_LIST_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                )));
             }
-            ColumnType::Enum(def) => {
-                let mut bound = Vec::with_capacity(values.len());
-                for v in values {
-                    check_literal_len(v)?;
-                    if !skip_enum_label_validation && def.validate_label(v).is_err() {
-                        return Err(SqlSurfaceError::invalid_text_representation(format!(
-                            "column {column_name:?} (enum {:?}) does not accept label {v:?}",
-                            def.name()
-                        )));
+            match ty {
+                ColumnType::Text => {
+                    let mut bound = Vec::with_capacity(values.len());
+                    for v in values {
+                        check_literal_len(v)?;
+                        bound.push(v.clone());
                     }
-                    bound.push(v.clone());
+                    bound.sort();
+                    bound.dedup();
+                    FilterOp::InText(bound)
                 }
-                bound.sort();
-                bound.dedup();
-                FilterOp::InText(bound)
-            }
-            ColumnType::Date
-            | ColumnType::Timestamp
-            | ColumnType::Numeric { .. }
-            | ColumnType::Uuid
-            | ColumnType::Bytea => {
-                let mut bound = Vec::with_capacity(values.len());
-                for v in values {
-                    let literal = CompareLiteral::Text(v.clone());
-                    bound.push(if skip_enum_label_validation {
-                        match ty {
-                            ColumnType::Date => TypedLiteral::Date(0),
-                            ColumnType::Timestamp => TypedLiteral::Timestamp(0),
-                            ColumnType::Numeric { .. } => {
-                                TypedLiteral::Numeric(Decimal::from_parts(0, 0).map_err(|_| {
-                                    SqlSurfaceError::Internal {
-                                        detail: "Decimal::from_parts(0, 0) must always succeed"
-                                            .to_string(),
-                                    }
-                                })?)
-                            }
-                            ColumnType::Uuid => {
-                                TypedLiteral::Uuid(crate::uuid::Uuid::from_bytes([0u8; 16]))
-                            }
-                            ColumnType::Bytea => TypedLiteral::Bytes(Vec::new()),
-                            _ => return Err(unsupported_compare_column(column_name)),
+                ColumnType::Enum(def) => {
+                    let mut bound = Vec::with_capacity(values.len());
+                    for v in values {
+                        check_literal_len(v)?;
+                        if !skip_enum_label_validation && def.validate_label(v).is_err() {
+                            return Err(SqlSurfaceError::invalid_text_representation(format!(
+                                "column {column_name:?} (enum {:?}) does not accept label {v:?}",
+                                def.name()
+                            )));
                         }
-                    } else {
-                        bind_typed_compare_literal(column_name, ty, &literal)?
-                    });
+                        bound.push(v.clone());
+                    }
+                    bound.sort();
+                    bound.dedup();
+                    FilterOp::InText(bound)
                 }
-                FilterOp::InTyped(bound)
+                ColumnType::Date
+                | ColumnType::Timestamp
+                | ColumnType::Numeric { .. }
+                | ColumnType::Uuid
+                | ColumnType::Bytea => {
+                    let mut bound = Vec::with_capacity(values.len());
+                    for v in values {
+                        let literal = CompareLiteral::Text(v.clone());
+                        bound.push(if skip_enum_label_validation {
+                            match ty {
+                                ColumnType::Date => TypedLiteral::Date(0),
+                                ColumnType::Timestamp => TypedLiteral::Timestamp(0),
+                                ColumnType::Numeric { .. } => TypedLiteral::Numeric(
+                                    Decimal::from_parts(0, 0).map_err(|_| {
+                                        SqlSurfaceError::Internal {
+                                            detail: "Decimal::from_parts(0, 0) must always succeed"
+                                                .to_string(),
+                                        }
+                                    })?,
+                                ),
+                                ColumnType::Uuid => {
+                                    TypedLiteral::Uuid(crate::uuid::Uuid::from_bytes([0u8; 16]))
+                                }
+                                ColumnType::Bytea => TypedLiteral::Bytes(Vec::new()),
+                                _ => return Err(unsupported_compare_column(column_name)),
+                            }
+                        } else {
+                            bind_typed_compare_literal(column_name, ty, &literal)?
+                        });
+                    }
+                    FilterOp::InTyped(bound)
+                }
+                _ => return Err(unsupported_compare_column(column_name)),
             }
-            _ => return Err(unsupported_compare_column(column_name)),
-        },
+        }
         // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24。TASK-208
         // ポインタ）。`low > high` は解析時にエラーにしない（評価時に
         // `Ge`∧`Le` が自然に常時偽となる。PG の `BETWEEN` と同じ扱い）。
@@ -1494,6 +1516,22 @@ mod tests {
             .map(|i| DeclarativeFilter::equals("kind", i.to_string()))
             .collect();
         let err = bind_all(&filters, &schema()).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn in_list_rejects_over_limit_element_count_before_allocating() {
+        // PR #1118 codex-review P1 指摘: `check_predicate_limits`
+        // （`sql::declarative_predicate`）は葉の総数しか数えず、`in_list` の
+        // 要素数自体は検査しないため、SQL テキスト（`sql::allowlist::
+        // parse_in_list_body`）を経由しない engine 公開 API の直接呼び出しでは
+        // `MAX_IN_LIST_ITEMS` 超の `IN` が無検査で束縛され得た。`bind`（本モジュール
+        // 側の唯一の共通防御点）がこの上限を検査することを確認する。
+        let values = (0..=MAX_IN_LIST_ITEMS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>();
+        let filter = DeclarativeFilter::in_list("kind", values);
+        let err = filter.bind(&schema()).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 

@@ -16,8 +16,13 @@ use engine::error_format::ClassifiedError;
 use engine::json::{parse_json, JsonValue};
 use engine::sql::allowlist::{validate_sql, SqlSurfaceError, Statement, TableLookup};
 use engine::sql::parser::bind;
-use wire_server::http::query::filter::{bind_filter, map_filter_items, FilterError};
+use engine::sql::udf_call::UdfRegistry;
+use wire_server::http::query::filter::{bind_filter, FilterError};
 use wire_server::http::query::schema::{schema_for, Validated};
+
+fn udfs() -> UdfRegistry {
+    UdfRegistry::default()
+}
 
 const TABLE: &str = "docs";
 
@@ -98,8 +103,8 @@ fn search_scan_aggregate_share_identical_binding_for_same_filter_array() {
     for (op, text) in &cases {
         let value = parse_json(text).expect("valid JSON fixture");
         let items = filter_items_for_op(op, &value);
-        let bound = bind_filter(items, &schema()).expect("bind_filter ok");
-        results.push(bound);
+        let bound = bind_filter(items, &schema(), &udfs()).expect("bind_filter ok");
+        results.push(bound.metadata_filters().to_vec());
     }
 
     // 3 op すべてで同一の束縛結果になる（NoSQL 表層内での一貫性）。
@@ -114,17 +119,18 @@ fn search_scan_aggregate_share_identical_binding_for_same_filter_array() {
 }
 
 #[test]
-fn or_negation_and_range_operators_are_rejected_as_unsupported_syntax() {
-    // NoSQL `filter` 配列は AND のみ（`or`）・否定・範囲比較の構文を
-    // そもそも受理しない。ここでは「語彙外 `op` はすべて拒否する」契約を
-    // 代表 3 種で固定する（詳細な語彙網羅は `filter.rs` の単体テスト）。
-    for op in ["or", "not", "gt"] {
+fn negation_and_unknown_operators_are_rejected_as_unsupported_syntax() {
+    // Issue #945・NOSQL-14 で `gt`（範囲比較）は受理語彙へ移った。本テストは
+    // 「語彙外 `op` はすべて拒否する」契約を、範囲比較・`in`・`or`（グループ
+    // キーであり `op` 値ではない）以外の代表例で固定する（詳細な語彙網羅は
+    // `filter.rs` の単体テスト）。
+    for op in ["not", "neq", "between", "OR"] {
         let text = format!(
             r#"{{"op":"search","table":"docs","vector":[0.1],"limit":10,"filter":[{{"column":"lang","op":"{op}","value":"ja"}}]}}"#
         );
         let value = parse_json(&text).expect("valid JSON fixture");
         let items = filter_items_for_op("search", &value);
-        let err = map_filter_items(items).expect_err("must reject");
+        let err = bind_filter(items, &schema(), &udfs()).expect_err("must reject");
         assert!(matches!(err, FilterError::UnsupportedOperator));
         assert_eq!(ClassifiedError::wire_code(&err), "42601");
     }
@@ -152,7 +158,7 @@ fn over_limit_filter_count_is_rejected_with_payload_too_large_across_ops() {
         let text = format!(r#"{{"op":"{op}","table":"docs",{extra}"filter":{items_json}}}"#);
         let value = parse_json(&text).expect("valid JSON fixture");
         let items = filter_items_for_op(op, &value);
-        let err = bind_filter(items, &schema()).expect_err("must reject");
+        let err = bind_filter(items, &schema(), &udfs()).expect_err("must reject");
         assert_eq!(ClassifiedError::wire_code(&err), "54000");
     }
 }

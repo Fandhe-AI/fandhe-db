@@ -364,6 +364,7 @@ fn bind_having_item(
 pub fn bind(
     validated: &Validated<'_>,
     schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
 ) -> Result<BoundAggregate, AggregateError> {
     let items_json = validated.required_array("aggregates")?;
     // `Vec` 確保・`String` 複製より前に件数上限を検査する
@@ -398,9 +399,9 @@ pub fn bind(
         }));
     }
 
-    let metadata_filters = match validated.optional_array("filter")? {
-        Some(filter_items) => filter::bind_filter(filter_items, schema)?,
-        None => Vec::new(),
+    let (metadata_filters, expr_filters, or_filters) = match validated.optional_array("filter")? {
+        Some(filter_items) => filter::bind_filter(filter_items, schema, udfs)?.into_parts(),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
 
     let group_by_json = validated.optional_array("group_by")?;
@@ -441,7 +442,9 @@ pub fn bind(
     };
 
     let Some(group_by_columns) = group_by_columns else {
-        let bound = BoundAggregate::new(schema.name.clone(), items, metadata_filters, Vec::new())?;
+        let bound =
+            BoundAggregate::new(schema.name.clone(), items, metadata_filters, expr_filters)?
+                .with_or_filters(or_filters);
         return Ok(bound);
     };
 
@@ -460,11 +463,12 @@ pub fn bind(
         schema.name.clone(),
         items,
         metadata_filters,
-        Vec::new(),
+        expr_filters,
         &group_by_columns,
         having,
         schema,
-    )?;
+    )?
+    .with_or_filters(or_filters);
     Ok(bound)
 }
 
@@ -490,7 +494,7 @@ pub fn execute(
         principal.policy_context(),
         &session,
         table,
-        |schema, _udfs| bind(validated, schema).map_err(to_sql_surface_error),
+        |schema, udfs| bind(validated, schema, udfs).map_err(to_sql_surface_error),
     )?;
     Ok(result)
 }
@@ -515,7 +519,7 @@ pub fn explain(
         principal.policy_context(),
         &session,
         table,
-        |schema, _udfs| bind(validated, schema).map_err(to_sql_surface_error),
+        |schema, udfs| bind(validated, schema, udfs).map_err(to_sql_surface_error),
     )?;
     Ok(result)
 }
@@ -624,6 +628,10 @@ mod tests {
         parse_json(json).expect("test fixture must be valid JSON")
     }
 
+    fn udfs() -> engine::sql::udf_call::UdfRegistry {
+        engine::sql::udf_call::UdfRegistry::default()
+    }
+
     // `Validated<'a>` は `value` への借用を保持するため、fixture の `JsonValue`
     // をテスト側で先に確保してから `AGGREGATE_SCHEMA.validate` を呼ぶ
     // （`schema.rs` の既存テストと同じ流儀）。
@@ -660,7 +668,7 @@ mod tests {
             r#"{"op":"aggregate","table":"docs",
                "aggregates":[{"fn":"count","column":"*"},{"fn":"min","column":"lang"}]}"#
         );
-        let bound = bind(&v, &schema()).expect("bind should succeed");
+        let bound = bind(&v, &schema(), &udfs()).expect("bind should succeed");
         assert_eq!(bound.items().len(), 2);
     }
 
@@ -670,7 +678,7 @@ mod tests {
             v,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"*"}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("SUM(*) must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("SUM(*) must be rejected");
         assert_eq!(err.wire_code(), "42601");
     }
 
@@ -680,7 +688,7 @@ mod tests {
             v,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"COUNT","column":"id"}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("unknown fn must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("unknown fn must be rejected");
         assert!(matches!(err, AggregateError::UnsupportedFunction));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -691,7 +699,7 @@ mod tests {
             v,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"do cs"}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("malformed identifier must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("malformed identifier must be rejected");
         assert!(matches!(err, AggregateError::InvalidIdentifier));
         assert_eq!(err.wire_code(), "42601");
         // untrusted な列名文字列を含まない固定文言であること。
@@ -708,7 +716,7 @@ mod tests {
             items.join(",")
         );
         validated_aggregate!(v, &json);
-        let err = bind(&v, &schema()).expect_err("over-limit must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("over-limit must be rejected");
         assert_eq!(err.wire_code(), "54000");
     }
 
@@ -732,7 +740,7 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "filter":[{"column":"lang","op":"eq","value":"ja"}]}"#
         );
-        let bound = bind(&v, &schema()).expect("bind should succeed");
+        let bound = bind(&v, &schema(), &udfs()).expect("bind should succeed");
         assert_eq!(bound.metadata_filters().len(), 1);
     }
 
@@ -742,7 +750,7 @@ mod tests {
             v,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"nope"}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("unknown column must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("unknown column must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 
@@ -752,14 +760,14 @@ mod tests {
             v_sum,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"embedding"}]}"#
         );
-        let err = bind(&v_sum, &schema()).expect_err("SUM(VECTOR) must be rejected");
+        let err = bind(&v_sum, &schema(), &udfs()).expect_err("SUM(VECTOR) must be rejected");
         assert_eq!(err.wire_code(), "22000");
 
         validated_aggregate!(
             v_count,
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"embedding"}]}"#
         );
-        bind(&v_count, &schema()).expect("COUNT(VECTOR) must be accepted");
+        bind(&v_count, &schema(), &udfs()).expect("COUNT(VECTOR) must be accepted");
     }
 
     #[test]
@@ -814,7 +822,7 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":["lang"]}"#
         );
-        let bound = bind(&v, &schema()).expect("group_by should bind");
+        let bound = bind(&v, &schema(), &udfs()).expect("group_by should bind");
         assert!(bound.has_group_by());
     }
 
@@ -829,7 +837,8 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":["lang","lang"]}"#
         );
-        let err = bind(&v, &schema()).expect_err("duplicate group_by columns must be rejected");
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("duplicate group_by columns must be rejected");
         assert!(matches!(err, AggregateError::Engine(_)));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -842,7 +851,7 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":["lang","region"]}"#
         );
-        let bound = bind(&v, &schema()).expect("two-column group_by should bind");
+        let bound = bind(&v, &schema(), &udfs()).expect("two-column group_by should bind");
         assert!(bound.has_group_by());
     }
 
@@ -858,7 +867,7 @@ mod tests {
             columns.join(",")
         );
         validated_aggregate!(v, &json);
-        let err = bind(&v, &schema()).expect_err("over-limit group_by must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("over-limit group_by must be rejected");
         assert_eq!(err.wire_code(), "54000");
     }
 
@@ -873,8 +882,8 @@ mod tests {
                        "group_by":["lang","{column}"]}}"#
                 )
             );
-            let err =
-                bind(&v, &schema()).expect_err("non-TEXT second group_by column must be rejected");
+            let err = bind(&v, &schema(), &udfs())
+                .expect_err("non-TEXT second group_by column must be rejected");
             assert_eq!(err.wire_code(), "22000", "column={column}");
         }
     }
@@ -887,8 +896,8 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":["lang","do cs"]}"#
         );
-        let err =
-            bind(&v, &schema()).expect_err("malformed second group_by identifier must be rejected");
+        let err = bind(&v, &schema(), &udfs())
+            .expect_err("malformed second group_by identifier must be rejected");
         assert!(matches!(err, AggregateError::InvalidIdentifier));
         assert_eq!(err.wire_code(), "42601");
         assert!(!err.client_message().contains("do cs"));
@@ -903,7 +912,8 @@ mod tests {
                "group_by":["lang","region"],
                "having":[{"fn":"count","column":"*","op":">=","value":1}]}"#
         );
-        let bound = bind(&v, &schema()).expect("having should resolve under multi-column group_by");
+        let bound = bind(&v, &schema(), &udfs())
+            .expect("having should resolve under multi-column group_by");
         assert!(bound.has_group_by());
     }
 
@@ -915,7 +925,7 @@ mod tests {
                "aggregates":[],
                "group_by":["lang","region"]}"#
         );
-        let err = bind(&v, &schema()).expect_err("aggregates:[] must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("aggregates:[] must be rejected");
         assert_eq!(err.wire_code(), "42601");
     }
 
@@ -927,7 +937,7 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":[]}"#
         );
-        let err = bind(&v, &schema()).expect_err("empty group_by must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("empty group_by must be rejected");
         assert!(matches!(err, AggregateError::GroupByShape));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -940,7 +950,8 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "having":[{"fn":"count","column":"*","op":">=","value":1}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("having without group_by must be rejected");
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("having without group_by must be rejected");
         assert!(matches!(err, AggregateError::GroupByShape));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -953,7 +964,8 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "having":[]}"#
         );
-        let err = bind(&v, &schema()).expect_err("having:[] without group_by must be rejected");
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("having:[] without group_by must be rejected");
         assert!(matches!(err, AggregateError::GroupByShape));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -971,7 +983,7 @@ mod tests {
                "group_by":["lang"],
                "having":[{"fn":"count","column":"*","op":"=","value":1}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("aggregates:[] must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("aggregates:[] must be rejected");
         assert_eq!(err.wire_code(), "42601");
 
         // `group_by` なし経路（`BoundAggregate::new`）も同じ `42601` のまま
@@ -981,7 +993,7 @@ mod tests {
             r#"{"op":"aggregate","table":"docs","aggregates":[]}"#
         );
         let err_ungrouped =
-            bind(&v_ungrouped, &schema()).expect_err("aggregates:[] must be rejected");
+            bind(&v_ungrouped, &schema(), &udfs()).expect_err("aggregates:[] must be rejected");
         assert_eq!(err_ungrouped.wire_code(), "42601");
     }
 
@@ -993,7 +1005,8 @@ mod tests {
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":["do cs"]}"#
         );
-        let err = bind(&v, &schema()).expect_err("malformed group_by identifier must be rejected");
+        let err = bind(&v, &schema(), &udfs())
+            .expect_err("malformed group_by identifier must be rejected");
         assert!(matches!(err, AggregateError::InvalidIdentifier));
         assert_eq!(err.wire_code(), "42601");
         assert!(!err.client_message().contains("do cs"));
@@ -1010,7 +1023,8 @@ mod tests {
                        "group_by":["{column}"]}}"#
                 )
             );
-            let err = bind(&v, &schema()).expect_err("non-TEXT group_by column must be rejected");
+            let err = bind(&v, &schema(), &udfs())
+                .expect_err("non-TEXT group_by column must be rejected");
             assert_eq!(err.wire_code(), "22000", "column={column}");
         }
     }
@@ -1024,7 +1038,7 @@ mod tests {
                "group_by":["lang"],
                "having":[{"fn":"min","column":"lang","op":">=","value":1}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("HAVING on MIN(TEXT) must be rejected");
+        let err = bind(&v, &schema(), &udfs()).expect_err("HAVING on MIN(TEXT) must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 
@@ -1037,7 +1051,8 @@ mod tests {
                "group_by":["lang"],
                "having":[{"fn":"sum","column":"id","op":">=","value":1}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("unknown HAVING reference must be rejected");
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("unknown HAVING reference must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 
@@ -1050,7 +1065,8 @@ mod tests {
                "group_by":["lang"],
                "having":[{"fn":"count","column":"*","op":">=","value":1}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("ambiguous HAVING reference must be rejected");
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("ambiguous HAVING reference must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 
@@ -1063,7 +1079,8 @@ mod tests {
                "group_by":["lang"],
                "having":[{"fn":"count","column":"*","op":"gt","value":1}]}"#
         );
-        let err = bind(&v, &schema()).expect_err("unsupported HAVING operator must be rejected");
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("unsupported HAVING operator must be rejected");
         assert!(matches!(err, AggregateError::UnsupportedHavingOperator));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -1105,7 +1122,7 @@ mod tests {
                "group_by":["lang"],
                "having":[{"fn":"count","column":"*","op":">=","value":1}]}"#
         );
-        let bound = bind(&v, &schema()).expect("group_by+having+filter should bind");
+        let bound = bind(&v, &schema(), &udfs()).expect("group_by+having+filter should bind");
         assert!(bound.has_group_by());
         assert_eq!(bound.metadata_filters().len(), 1);
     }
