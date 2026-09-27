@@ -279,9 +279,10 @@ pub(crate) fn forget_unique_index_rows_in_txn(
 pub(crate) fn clear_unique_index_for_tenant_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
+    schema: &TableSchema,
     tenant_id: &str,
 ) -> Result<(), TenantWriteError> {
-    unique_index::clear_tenant_in_txn(write_txn, table_name, tenant_id)
+    unique_index::clear_tenant_in_txn(write_txn, table_name, schema, tenant_id)
 }
 
 /// [`crate::catalog::Storage::alter_table_add_unique_constraint`]（Rust API。

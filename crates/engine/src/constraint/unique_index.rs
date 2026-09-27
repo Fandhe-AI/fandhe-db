@@ -266,14 +266,22 @@ fn clear_tenant_chunk(
 /// テナント `tenant_id` の索引エントリ（マーカー含む）をすべて削除する。
 /// [`crate::tenant::truncate_table_unchecked`]（TRUNCATE）から、行ストアの
 /// `retain_in` 後・`row_table` を drop した後の同一 write トランザクション
-/// 内で呼ぶ。索引テーブルが物理的に未作成（`PRIMARY KEY`・`UNIQUE` いずれも
-/// 未宣言、または初回書き込み前）の場合は何もしない。他テナントの範囲には
-/// 一切触れない（範囲は `(tenant_id, ..)` に閉じる。RLS-9）。
+/// 内で呼ぶ。`PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブルでは索引
+/// テーブルを開かず何もしない——`redb::WriteTransaction::open_table` は
+/// 存在しないテーブルを作成してしまうため、`TableDoesNotExist` を no-op
+/// 扱いする判定だけでは不十分で、宣言の有無を呼び出し前に見て素通りする
+/// 必要がある（PK/UNIQUE 未宣言テーブルへの TRUNCATE で空の索引テーブルが
+/// 永続化される副作用を防ぐ）。他テナントの範囲には一切触れない（範囲は
+/// `(tenant_id, ..)` に閉じる。RLS-9）。
 pub(super) fn clear_tenant_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
+    schema: &TableSchema,
     tenant_id: &str,
 ) -> Result<(), TenantWriteError> {
+    if schema.primary_key().is_none() && schema.unique_constraints().is_empty() {
+        return Ok(());
+    }
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
     let mut index_table =
         match write_txn.open_table(crate::catalog::user_uniq_table_def(&index_table_name)) {
@@ -384,10 +392,17 @@ where
     // 既存行（`written_ids` を除く）を再構築する。
     while clear_tenant_chunk(index_table, tenant_id)? {}
 
-    let mut seen: Vec<HashMap<Vec<u8>, u64>> = specs.iter().map(|_| HashMap::new()).collect();
+    // 行ストアを走査しながら索引テーブルへ逐次書き込む（Issue #1123 レビュー
+    // 対応）。旧実装は全行の正引きキーを `entries` に、重複判定用の全キーを
+    // `seen` にそれぞれ蓄積してから一括書き込みしており、大きなテナントでは
+    // 保持量が行数・キー長に比例して増大し OOM の要因になっていた
+    // （行ストア自体の O(n) 走査は変わらないが、追加で保持する量は 1 行分
+    // （`values`・`forward_subs`）に定数化する）。重複判定は「直前に
+    // `clear_tenant_chunk` で丸ごと消した索引テーブル」への点照会で行う——
+    // 既に挿入済みの正引きキーだけがヒットしうるため、`HashMap` での全件
+    // 保持と同じ判定結果になる。
     let start = std::ops::Bound::Included((tenant_id, 0u64));
     let end = std::ops::Bound::Included((tenant_id, u64::MAX));
-    let mut entries: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
     {
         let iter = row_table
             .range::<(&str, u64)>((start, end))
@@ -410,37 +425,36 @@ where
                 };
                 let ordinal_u16 = u16::try_from(ordinal)
                     .map_err(|_| internal("unique key ordinal exceeds u16 range"))?;
-                if let Some(prev) = seen
-                    .get_mut(ordinal)
-                    .ok_or_else(|| internal("unique key ordinal out of range"))?
-                    .insert(canonical.clone(), id)
+                let sub = forward_subkey(ordinal_u16, &canonical);
+                let owner = match index_table
+                    .get((tenant_id, sub.as_slice()))
+                    .map_err(storage_error)?
                 {
-                    if prev != id {
+                    Some(guard) => Some(decode_row_id(guard.value())?),
+                    None => None,
+                };
+                if let Some(owner) = owner {
+                    if owner != id {
                         return Err(internal(
                             "internal: duplicate unique key found while backfilling persistent index",
                         ));
                     }
                 }
-                forward_subs.push(forward_subkey(ordinal_u16, &canonical));
+                index_table
+                    .insert((tenant_id, sub.as_slice()), id.to_be_bytes().as_slice())
+                    .map_err(storage_error)?;
+                forward_subs.push(sub);
             }
             if !forward_subs.is_empty() {
-                entries.push((id, forward_subs));
+                let rev_value = encode_reverse(forward_subs.iter())?;
+                index_table
+                    .insert(
+                        (tenant_id, reverse_subkey(id).as_slice()),
+                        rev_value.as_slice(),
+                    )
+                    .map_err(storage_error)?;
             }
         }
-    }
-    for (id, forward_subs) in &entries {
-        for sub in forward_subs {
-            index_table
-                .insert((tenant_id, sub.as_slice()), id.to_be_bytes().as_slice())
-                .map_err(storage_error)?;
-        }
-        let rev_value = encode_reverse(forward_subs.iter())?;
-        index_table
-            .insert(
-                (tenant_id, reverse_subkey(*id).as_slice()),
-                rev_value.as_slice(),
-            )
-            .map_err(storage_error)?;
     }
 
     let mut marker_value = Vec::with_capacity(4 + signature.len());

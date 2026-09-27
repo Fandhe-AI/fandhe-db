@@ -3552,7 +3552,7 @@ pub(crate) fn truncate_table_unchecked(
         // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲を
         // クリアする（他テナントの索引エントリには触れない）。次回の書き込み
         // で行数 0 の状態から遅延再構築される。
-        crate::constraint::clear_unique_index_for_tenant_in_txn(write_txn, table, tenant)?;
+        crate::constraint::clear_unique_index_for_tenant_in_txn(write_txn, table, &schema, tenant)?;
         // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）
         // の参照先側の検査。自テナントの参照元行が 1 件でも残れば `23503`（他テナントの
         // 行は削除も走査もしないため、他テナントの参照元行の有無は結果に影響しない）。
