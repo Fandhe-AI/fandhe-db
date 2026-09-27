@@ -322,7 +322,12 @@ fn seed_fixture(storage: &Storage, flood: bool) -> Vec<RowTruth> {
             );
         }
 
-        // other_docs: 集合演算の対向テーブル。
+        // other_docs: 集合演算の対向テーブル。Private 行の lang は意図的に
+        // `documents` の lang 語彙（ja/en）と異なる値（de）にする。両者を
+        // 同じ語彙にすると、allow_private=true で「自テナントの Private 行を
+        // 含めた documents.lang 集合」と「同 other_docs.lang 集合」が完全一致
+        // してしまい、EXCEPT が常に空集合になって非空虚性検査が意味を失う
+        // （advisor 指摘: T0 の空虚化防止と両立させるための設計判断）。
         insert_row(
             storage,
             OTHER_DOCS,
@@ -344,7 +349,7 @@ fn seed_fixture(storage: &Storage, flood: bool) -> Vec<RowTruth> {
                 Visibility::Private,
                 &[
                     Value::Vector(vec![11.0, 1.0]),
-                    Value::Text("en".to_string()),
+                    Value::Text("de".to_string()),
                 ],
                 &mut truths,
             );
@@ -547,7 +552,7 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
     let path = unique_db_path("rls10-t0-shapes");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
-    seed_fixture(&storage, true);
+    let truths = seed_fixture(&storage, true);
     let core = new_core(storage);
     create_view(&core);
 
@@ -558,10 +563,43 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
             for allow_private in [false, true] {
                 // 受理ゲート: 空虚化（全形が拒否されて T1/T2 が vacuous に通る
                 // こと）を防ぐため、ここで成功を assert する。
-                run(&core, tenant, allow_private, shape.sql);
+                let result = run(&core, tenant, allow_private, shape.sql);
+                // 非空虚性の要（advisor 指摘）: 全テナントが Public 行を持つ
+                // フィクスチャ設計のため、いずれの形・テナント・モードでも
+                // 空結果にはならない。RLS が過剰に絞り込んで常に空集合を
+                // 返す退行（T1 の部分集合検査・T2 の差分比較は空集合同士でも
+                // 素通りしてしまう）を検出する。
+                assert!(
+                    !result.rows.is_empty(),
+                    "shape must not be vacuously empty: axis={} tenant={tenant} allow_private={allow_private}",
+                    shape.axis
+                );
             }
         }
         axes.insert(shape.axis);
+    }
+
+    // 非空虚性のさらなる要（advisor 指摘）: `COUNT(*)` は独立オラクルの許可
+    // documents 件数と厳密に一致することを固定する（部分集合検査だけでは
+    // 過小返却〔一部だけ返して残りを黙って落とす退行〕を見逃す）。
+    for &tenant in TENANTS.iter() {
+        for allow_private in [false, true] {
+            let result = run(
+                &core,
+                tenant,
+                allow_private,
+                "SELECT COUNT(*) FROM documents",
+            );
+            let got = match result.rows.first().and_then(|r| r.cells.first()) {
+                Some(Cell::Integer(n)) => *n,
+                other => panic!("expected Cell::Integer for COUNT(*), got {other:?}"),
+            };
+            let want = allowed_documents_count(&truths, tenant, allow_private);
+            assert_eq!(
+                got, want,
+                "COUNT(*) must equal the independent oracle's allowed documents count: tenant={tenant} allow_private={allow_private}"
+            );
+        }
     }
 
     for required in [
@@ -593,6 +631,17 @@ fn allowed_documents_ids(truths: &[RowTruth], viewer: &str, allow_private: bool)
         .filter(|t| t.table == DOCUMENTS && is_allowed(t, viewer, allow_private))
         .map(|t| t.id)
         .collect()
+}
+
+/// `documents` の許可済み**物理行**数（`(tenant, id)` 単位）。TABLE-12: 複数
+/// テナントが同一 `id` を再利用するフィクスチャのため、`allowed_documents_ids`
+/// の `HashSet<u64>` では異なるテナントの同一 `id` 行が 1 件に潰れてしまい
+/// `COUNT(*)` との比較に使えない（advisor 指摘）。
+fn allowed_documents_count(truths: &[RowTruth], viewer: &str, allow_private: bool) -> u64 {
+    truths
+        .iter()
+        .filter(|t| t.table == DOCUMENTS && is_allowed(t, viewer, allow_private))
+        .count() as u64
 }
 
 fn forbidden_tokens(truths: &[RowTruth], viewer: &str, allow_private: bool) -> HashSet<String> {
@@ -778,10 +827,18 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
     let core_flooded = new_core(storage_flooded);
 
     let static_error_shapes = [
+        // 構文解析段（データに触れる前）の拒否。他テナント行の有無で変化し
+        // ようがないことを固定する。
         "SELECT id FROM nonexistent_table_xyz LIMIT 5",
         "SELECT * FROM documents NATURAL JOIN authors LIMIT 5",
         "SELECT * FROM documents CROSS JOIN authors LIMIT 5",
         "SELECT * FROM documents JOIN authors USING (id) LIMIT 5",
+        // 意味検証段（`sql::subquery::validate_in_target_column` 相当。SQL-29
+        // (a)）の拒否。対象列 `lang`（TEXT）と内側投影 `id`（疑似列。整数）の
+        // 型不整合は列定義（スキーマ）のみで決まり、内側の行内容・行数
+        // （他テナント行の有無を含む）に依存しないことを確認する（AC3 の
+        // 対象を構文エラーだけに限定しない）。
+        "SELECT id FROM documents WHERE lang IN (SELECT id FROM langs LIMIT 1) LIMIT 5",
     ];
 
     for sql in static_error_shapes {
