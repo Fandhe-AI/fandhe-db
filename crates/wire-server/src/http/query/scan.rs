@@ -20,19 +20,26 @@
 //! `vector`／`plan`／`mode`／`hybrid` の付与は [`super::schema::SCAN_SCHEMA`]
 //! が宣言しないフィールドのため、スキーマ検証（[`super::gate::handle`] 手順 4）
 //! の未知キー判定で本モジュールへ到達する前に `42601` へ落ちる（個別の除外
-//! ロジックをここに持たない）。`explain: true` は `SCAN_SCHEMA` が型としては
-//! 受理するが、SQL-15 の bare 形への `EXPLAIN` 前置は `42601`
-//! （`docs/design/wide-retrieval-scan.md`）であるため、本モジュールが
-//! fail-closed に拒否する（NOSQL-10〔`USING PLAN` の `EXPLAIN`〕とは別の判断。
-//! 「spec 側への申し送り」は呼び出し元 PR 本文が担う）。
+//! ロジックをここに持たない）。`explain: true` の要求は [`super::gate::handle`]
+//! が本モジュールの実行アーム（[`execute`]）より前に [`explain`]（Issue #948・
+//! NOSQL-16・SQL-27）へ振り分ける。[`execute`] 内の [`ScanError::
+//! ExplainNotSupported`] 拒否は、ゲートを迂回して直接呼ばれた場合に備える
+//! 多層防御としてのみ残す（通常はゲートの振り分けにより到達しない）。
 //!
 //! 応答は `score` を一切含まない: `Projection::All`（`columns` 省略時）は
 //! `schema.columns` の実列と疑似列 `id` のみを列挙し（`bind_projection` の
 //! 既存契約）、`hybrid`／`ORDER BY` を経由しない広域取得には合成スコア列が
 //! 構造上存在しない。
+//!
+//! [`execute`]・[`explain`] は、`table`／`limit`／`columns`／`filter` の
+//! スキーマ非依存な検証・写像（[`PreparedScan::prepare`]）とスキーマ依存の
+//! 束縛（[`PreparedScan::bind`]）を共有する（Issue #948）。同じ binder を
+//! 通ることで、`42P01`（未知テーブル）・`22000`（未知列等）のエラー分類が
+//! `explain` の有無で変わらない。
 
 use std::time::SystemTime;
 
+use engine::catalog::TableSchema;
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
@@ -41,7 +48,7 @@ use engine::sql::allowlist::{Projection, SqlSurfaceError};
 use engine::sql::exec::QueryResult;
 use engine::sql::mode::SessionState;
 use engine::sql::parser::{bind_projection, validate_search_limit, BoundScan};
-use engine::sql::udf_call::MAX_EXPR_NODES;
+use engine::sql::udf_call::{UdfRegistry, MAX_EXPR_NODES};
 
 use super::filter::{bind_filter, FilterError};
 use super::ident::{self, InvalidIdentifier};
@@ -173,21 +180,67 @@ fn build_projection(validated: &Validated<'_>) -> Result<Projection, ScanError> 
     Ok(Projection::Columns(names))
 }
 
-/// [`execute`] の本体。`table` のスキーマ取得・束縛・実行を単一スナップショット
-/// 上で行う（[`EngineCore::execute_bound_scan_in_session`] の契約）。
-///
-/// 手順: (1) `explain: true` の拒否、(2) `table`／`limit`／`columns` をスキーマ
-/// に依存しない範囲で検証・写像（[`limit_to_u32`]・[`validate_search_limit`]・
-/// [`build_projection`]。いずれも `TableSchema` を必要としないため、テーブル
-/// 解決より前に完結させる——未知テーブルへの要求でも `limit`／`columns` の
-/// 構文エラーを先に確定させて構わない。SQL 表層の許可リスト検証段と同じ
-/// 判定順序の思想）、(3) [`EngineCore::execute_bound_scan_in_session`] の bind
-/// closure 内で [`bind_projection`]・[`super::filter::bind_filter`]（いずれも
-/// スキーマ依存の検証。`filter` は列型ごとに値レーンを振り分けるため
-/// `schema` が届くまで束縛できない——Issue #896・NOSQL-17 で `search`／
-/// `aggregate` と同じ「schema 到達後に単一段で束縛する」構成へ揃えた。未知列・
-/// `VECTOR` 列は `22000`）を適用して [`BoundScan::new`] を組み立て、(4) 実行
-/// する。
+/// `scan` op のスキーマ非依存な前処理結果（Issue #948。`execute`・
+/// [`explain`] の両方が [`Self::prepare`]・[`Self::bind`] を共有する）。
+/// `table`／`limit`／`columns` はスキーマを必要としないためテーブル解決
+/// より前に検証・写像し、`filter`（`TableSchema` の列型ごとに値レーンを
+/// 振り分けるため schema 到達後にしか束縛できない。Issue #896・NOSQL-17）
+/// は [`Self::bind`] まで生の JSON 配列参照のまま保持する。
+struct PreparedScan<'a> {
+    table: &'a str,
+    limit: usize,
+    projection: Projection,
+    filter_items: &'a [JsonValue],
+}
+
+impl<'a> PreparedScan<'a> {
+    /// `table`／`limit`／`columns` をスキーマに依存しない範囲で検証・写像
+    /// する（[`limit_to_u32`]・[`validate_search_limit`]・
+    /// [`build_projection`]）。未知テーブルへの要求でも `limit`／`columns`
+    /// の構文エラーを先に確定させて構わない（SQL 表層の許可リスト検証段と
+    /// 同じ判定順序の思想）。
+    fn prepare(validated: &'a Validated<'_>) -> Result<Self, ScanError> {
+        let table = validated.required_str("table")?;
+        // `search`／`aggregate` と同じ識別子形状検査を engine のスキーマ
+        // 解決（`resolve_scan_input`）より前に適用する（cursor[bot] 指摘。
+        // SQL レキサーが拒否する形状の `table` を `42P01`／`22000` ではなく
+        // `42601` へ揃え、63 文字を超える長大文字列を schema 走査より前に
+        // 打ち切る）。
+        ident::check_identifier(table)?;
+        let raw_limit = validated.required_number("limit")?;
+        let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
+        let projection = build_projection(validated)?;
+        let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
+        Ok(Self {
+            table,
+            limit,
+            projection,
+            filter_items,
+        })
+    }
+
+    /// [`bind_projection`]・[`super::filter::bind_filter`]（いずれもスキーマ
+    /// 依存の検証。未知列・`VECTOR` 列は `22000`）を適用して
+    /// [`BoundScan::new`] を組み立てる。
+    fn bind(&self, schema: &TableSchema, udfs: &UdfRegistry) -> Result<BoundScan, SqlSurfaceError> {
+        let mut node_budget = MAX_EXPR_NODES;
+        let bound_projection = bind_projection(&self.projection, schema, udfs, &mut node_budget)?;
+        let bound_filters =
+            bind_filter(self.filter_items, schema).map_err(FilterError::into_sql_surface_error)?;
+        Ok(BoundScan::new(
+            self.table.to_string(),
+            bound_projection,
+            bound_filters,
+            Vec::new(),
+            self.limit,
+        ))
+    }
+}
+
+/// `table` のスキーマ取得・束縛・実行を単一スナップショット上で行う
+/// （[`EngineCore::execute_bound_scan_in_session`] の契約）。`explain: true`
+/// の拒否は多層防御としてのみ残す（通常は [`super::gate::handle`] が
+/// [`explain`] へ振り分けるため到達しない。モジュール doc 参照）。
 pub fn execute(
     core: &EngineCore,
     ctx: &PolicyContext,
@@ -197,31 +250,30 @@ pub fn execute(
         return Err(ScanError::ExplainNotSupported);
     }
 
-    let table = validated.required_str("table")?;
-    // `search`／`aggregate` と同じ識別子形状検査を engine のスキーマ解決
-    // （`resolve_scan_input`）より前に適用する（cursor[bot] 指摘。SQL レキサー
-    // が拒否する形状の `table` を `42P01`／`22000` ではなく `42601` へ揃え、
-    // 63 文字を超える長大文字列を schema 走査より前に打ち切る）。
-    ident::check_identifier(table)?;
-    let raw_limit = validated.required_number("limit")?;
-    let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
-    let projection = build_projection(validated)?;
-    let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
-
+    let prepared = PreparedScan::prepare(validated)?;
     let session = SessionState::default();
-    let result = core.execute_bound_scan_in_session(ctx, &session, table, |schema, udfs| {
-        let mut node_budget = MAX_EXPR_NODES;
-        let bound_projection = bind_projection(&projection, schema, udfs, &mut node_budget)?;
-        let bound_filters =
-            bind_filter(filter_items, schema).map_err(FilterError::into_sql_surface_error)?;
-        Ok(BoundScan::new(
-            table.to_string(),
-            bound_projection,
-            bound_filters,
-            Vec::new(),
-            limit,
-        ))
-    })?;
+    let result =
+        core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
+            prepared.bind(schema, udfs)
+        })?;
+    Ok(result)
+}
+
+/// `scan` op の `EXPLAIN`（Issue #948・NOSQL-16・SQL-27）。検索本体
+/// （[`execute`] が呼ぶ [`EngineCore::execute_bound_scan_in_session`]）を
+/// 呼ばず、[`EngineCore::explain_bound_scan_in_session`] へ同じ
+/// [`PreparedScan::bind`] を渡す（第 2 の binder を作らない設計）。
+pub fn explain(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    validated: &Validated<'_>,
+) -> Result<QueryResult, ScanError> {
+    let prepared = PreparedScan::prepare(validated)?;
+    let session = SessionState::default();
+    let result =
+        core.explain_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
+            prepared.bind(schema, udfs)
+        })?;
     Ok(result)
 }
 
@@ -235,6 +287,26 @@ pub fn handle(
 ) -> Vec<u8> {
     match execute(core, principal.policy_context(), validated) {
         Ok(result) => match super::response::encode(&result) {
+            Ok(body) => http_response::encode_ok(&body, now_wall),
+            Err(err) => {
+                http_response::encode_error(err.error_class(), &err.client_message(), now_wall)
+            }
+        },
+        Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
+}
+
+/// `POST /v1/query`（`op: "scan"`・`explain: true`）を処理し応答バイト列を
+/// 返す（[`super::gate`] から呼ばれる。認証・スキーマ検証済みの要求のみ。
+/// Issue #948）。
+pub fn handle_explain(
+    core: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: SystemTime,
+) -> Vec<u8> {
+    match explain(core, principal.policy_context(), validated) {
+        Ok(result) => match super::response::encode_explain(&result) {
             Ok(body) => http_response::encode_ok(&body, now_wall),
             Err(err) => {
                 http_response::encode_error(err.error_class(), &err.client_message(), now_wall)

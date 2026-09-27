@@ -445,6 +445,9 @@ pub fn execute(
     principal: &SessionPrincipal,
     validated: &Validated<'_>,
 ) -> Result<engine::sql::exec::QueryResult, AggregateError> {
+    // `explain: true` の要求は通常 [`super::gate::handle`] が本関数より前に
+    // [`explain`]（Issue #948）へ振り分けるため到達しない。ゲートを迂回して
+    // 直接呼ばれた場合に備える多層防御としてのみ残す。
     reject_explain(validated)?;
 
     let table = validated.required_str("table")?;
@@ -452,6 +455,31 @@ pub fn execute(
 
     let session = SessionState::default();
     let result = engine.execute_bound_aggregate_in_session(
+        principal.policy_context(),
+        &session,
+        table,
+        |schema, _udfs| bind(validated, schema).map_err(to_sql_surface_error),
+    )?;
+    Ok(result)
+}
+
+/// `aggregate` op の `EXPLAIN`（Issue #948・NOSQL-16・SQL-27）。検索本体
+/// （[`execute`] が呼ぶ [`EngineCore::execute_bound_aggregate_in_session`]。
+/// `VisibleBitmapCache`／`SqlArenaCache`／`ScalarIndexCache` を消費する）を
+/// 呼ばず、[`EngineCore::explain_bound_aggregate_in_session`] へ [`execute`]
+/// と同一の [`bind`] を渡す（第 2 の binder を作らない設計。`group_by`／
+/// `having` も同じ `bind` を通るため、上限・形状検査〔`54000`／`42601`／
+/// `22000`〕もそのまま引き継ぐ）。
+pub fn explain(
+    engine: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+) -> Result<engine::sql::exec::QueryResult, AggregateError> {
+    let table = validated.required_str("table")?;
+    ident::check_identifier(table)?;
+
+    let session = SessionState::default();
+    let result = engine.explain_bound_aggregate_in_session(
         principal.policy_context(),
         &session,
         table,
@@ -504,6 +532,30 @@ pub fn handle(
 ) -> Vec<u8> {
     match execute(engine, principal, validated) {
         Ok(result) => match super::response::encode(&result) {
+            Ok(body) => crate::http::response::encode_ok(&body, now_wall),
+            Err(encode_err) => crate::http::response::encode_error(
+                encode_err.error_class(),
+                &encode_err.client_message(),
+                now_wall,
+            ),
+        },
+        Err(err) => {
+            crate::http::response::encode_error(err.error_class(), &err.client_message(), now_wall)
+        }
+    }
+}
+
+/// `POST /v1/query`（`op: aggregate`・`explain: true`）を処理し応答バイト列を
+/// 返す（[`super::gate::handle`] から呼ばれる。認証・スキーマ検証済みの
+/// 要求のみ。Issue #948）。
+pub fn handle_explain(
+    engine: &EngineCore,
+    principal: &SessionPrincipal,
+    validated: &Validated<'_>,
+    now_wall: std::time::SystemTime,
+) -> Vec<u8> {
+    match explain(engine, principal, validated) {
+        Ok(result) => match super::response::encode_explain(&result) {
             Ok(body) => crate::http::response::encode_ok(&body, now_wall),
             Err(encode_err) => crate::http::response::encode_error(
                 encode_err.error_class(),

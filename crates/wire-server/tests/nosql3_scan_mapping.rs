@@ -235,8 +235,13 @@ fn vector_plan_mode_hybrid_fields_reject_with_42601() {
 
 // --- (6) explain ------------------------------------------------------------
 
+/// Issue #948（NOSQL-16・SQL-27）で `scan` op への `explain: true` を受理
+/// するよう拡大した（旧来は `42601` で拒否）。`explain: true` は `QUERY
+/// PLAN` 応答（行データを含まない）を返し、`explain: false` は通常どおり
+/// 実行される（網羅的なカバレッジ・行一致は `nosql16_explain_targets.rs`・
+/// `nosql10_explain.rs` が持つ）。
 #[test]
-fn explain_true_rejects_with_42601_and_false_executes() {
+fn explain_true_returns_query_plan_and_false_executes() {
     let (core, _guard) = new_core_scan_docs();
     let (addr, token) = spawn_alice_session(core);
 
@@ -245,8 +250,10 @@ fn explain_true_rejects_with_42601_and_false_executes() {
         &token,
         br#"{"op":"scan","table":"docs","limit":1,"explain":true}"#,
     );
-    assert_eq!(true_resp.status, 400, "body={true_resp:?}");
-    assert_eq!(http_common::wire_code_of(&true_resp), "42601");
+    assert_eq!(true_resp.status, 200, "body={true_resp:?}");
+    let text = String::from_utf8_lossy(&true_resp.body);
+    assert!(text.contains("\"explain\""), "body={true_resp:?}");
+    assert!(!text.contains("\"rows\""), "body={true_resp:?}");
 
     let false_resp = query(
         addr,

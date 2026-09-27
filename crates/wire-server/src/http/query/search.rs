@@ -467,6 +467,32 @@ fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
     }
 }
 
+/// `vector` 指定の `search` op を [`engine::sql::parser::BoundStatement`] へ
+/// 束縛する binder closure 本体（Issue #948・NOSQL-16。`bind_search` の完全な
+/// 束縛結果から `BoundSearch::Vector` のみを取り出す）。[`execute`]（通常
+/// 実行。[`EngineCore::execute_bound_search_in_session`] へ渡す）と
+/// [`super::explain::execute`]（`explain: true`。[`EngineCore::
+/// explain_bound_search_in_session`] へ渡す）の両方が同一の closure を共有
+/// することで、`42P01`（未知テーブル）が排他判定・型不整合より先に確定する
+/// 等のエラー分類・優先順位が両経路でビット同一になる（第 2 の binder を
+/// 作らない設計）。
+pub(crate) fn bind_vector_statement(
+    validated: &Validated<'_>,
+    schema: &TableSchema,
+) -> Result<BoundStatement, SqlSurfaceError> {
+    match bind_search(validated, schema).map_err(to_sql_surface_error)? {
+        BoundSearch::Vector(stmt) => Ok(stmt),
+        // `execute`（通常実行）側の対称コメント参照: `explain::execute` は
+        // `vector` 指定であることを呼び出し前に確定させているため、この
+        // 分岐が実際に到達することはない。受信データ経路での `unwrap`/
+        // `expect` を避けつつ fail-closed に拒否する
+        // （`.claude/rules/coding-rust.md`）。
+        BoundSearch::Plan(_) => Err(SqlSurfaceError::Internal {
+            detail: "search binder returned a plan form for a vector request".to_string(),
+        }),
+    }
+}
+
 /// `validated`（`search` op のスキーマ検証済み要求本文）を `engine` 上で
 /// 実行する。`principal` の [`SessionPrincipal::policy_context`] のみから
 /// RLS 境界（テナント）を導出し（RLS-7・本モジュールはテナント判定を一切
@@ -587,16 +613,7 @@ pub fn execute(
     } else {
         let result =
             engine.execute_bound_search_in_session(ctx, &session, table, |schema, _udfs| {
-                match bind_search(validated, schema).map_err(to_sql_surface_error)? {
-                    BoundSearch::Vector(stmt) => Ok(stmt),
-                    // 上記と対称の到達しないはずの分岐（`plan_present ==
-                    // false` の間は `bind_search` が `BoundSearch::Plan` を
-                    // 返すことはない）。
-                    BoundSearch::Plan(_) => Err(SqlSurfaceError::Internal {
-                        detail: "search binder returned a plan form for a vector request"
-                            .to_string(),
-                    }),
-                }
+                bind_vector_statement(validated, schema)
             })?;
         Ok(result)
     }

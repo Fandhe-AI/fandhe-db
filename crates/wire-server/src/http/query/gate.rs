@@ -25,13 +25,19 @@
 //! 5. `op` と `engine`（接続済み `EngineCore`。`Router::new` 経由では
 //!    `None`・`Router::with_engine` 経由でのみ `Some`）の組でディスパッチ
 //!    する。`(Op::Search, Some(engine))` かつ `explain: true` は
-//!    [`super::explain::handle`]（TASK-186・NOSQL-10・Issue #765。検索本体を
-//!    実行せず `QUERY PLAN` を返す。通常の `search` 実行より必ず先に
-//!    判定される）、`(Op::Scan, Some(engine))` は [`crate::http::query::scan::
-//!    handle`]（TASK-186・NOSQL-3・Issue #766）、`(Op::Aggregate,
-//!    Some(engine))` は [`super::aggregate::handle`]（Issue #768・
-//!    TASK-177・NOSQL-4）、`explain` なしの `(Op::Search, Some(engine))` は
-//!    [`super::search::handle`]（TASK-186・NOSQL-2・Issue #764）、
+//!    [`super::explain::handle`]（`search` 本体〔`vector`・`plan` いずれも〕
+//!    を実行せず `QUERY PLAN` を返す。`vector` は Issue #948・NOSQL-16・
+//!    SQL-27、`plan` は TASK-186・NOSQL-10・Issue #765）、
+//!    `(Op::Scan, Some(engine))` かつ `explain: true` は
+//!    [`crate::http::query::scan::handle_explain`]（Issue #948）、
+//!    `(Op::Aggregate, Some(engine))` かつ `explain: true` は
+//!    [`super::aggregate::handle_explain`]（Issue #948）が、いずれも通常
+//!    実行より必ず先に判定される。`explain` なしの `(Op::Scan, Some(engine))`
+//!    は [`crate::http::query::scan::handle`]（TASK-186・NOSQL-3・
+//!    Issue #766）、`(Op::Aggregate, Some(engine))` は [`super::aggregate::
+//!    handle`]（Issue #768・TASK-177・NOSQL-4）、`explain` なしの
+//!    `(Op::Search, Some(engine))` は [`super::search::handle`]（TASK-186・
+//!    NOSQL-2・Issue #764）、
 //!    `(Op::Insert, Some(engine))` は [`super::insert::handle`]（Issue
 //!    #772・TASK-178・NOSQL-6）へ、`(Op::Update, Some(engine))` は
 //!    [`super::update::handle`]（Issue #876・TASK-186・NOSQL-6・NOSQL-12）
@@ -126,13 +132,20 @@ pub fn handle(
     // 留める。全 6 op が実行結線済みのため `(_, _)` は `engine` 未接続時
     // （`Router::new` 経由）にのみ到達する。
     match (op, engine) {
-        // `explain: true` は通常の `search` 実行（#764 が結線する
-        // `(Op::Search, Some(engine)) => search::handle(...)` 相当）より
-        // 必ず先に判定する（Issue #765・TASK-186・NOSQL-10）。`explain: true`
-        // が構造的に実行経路へ落ちないことを match の腕の順序自体で保証する
-        // （`aggregate.rs::reject_explain` と同じ fail-open 防止の思想）。
+        // `explain: true` は各 op の通常実行より必ず先に判定する
+        // （`search` は Issue #765・TASK-186・NOSQL-10、`scan`／`aggregate` は
+        // Issue #948・NOSQL-16・SQL-27 で対象拡大）。`explain: true` が
+        // 構造的に実行経路へ落ちないことを match の腕の順序自体で保証する
+        // （各モジュールの `reject_explain`／`ExplainNotSupported` 拒否は
+        // ゲートを迂回した場合に備える多層防御としてのみ残る）。
         (Op::Search, Some(engine)) if explain_requested(&validated) => {
             super::explain::handle(engine, principal, &validated, now_wall)
+        }
+        (Op::Scan, Some(engine)) if explain_requested(&validated) => {
+            scan::handle_explain(engine, principal, &validated, now_wall)
+        }
+        (Op::Aggregate, Some(engine)) if explain_requested(&validated) => {
+            super::aggregate::handle_explain(engine, principal, &validated, now_wall)
         }
         (Op::Scan, Some(engine)) => scan::handle(engine, principal, &validated, now_wall),
         (Op::Aggregate, Some(engine)) => {
@@ -235,6 +248,30 @@ mod tests {
         let path = unique_temp_db_path("query-gate");
         let guard = CleanupGuard(path.clone());
         let core = EngineCore::open(&path).expect("open throwaway engine core");
+        (core, guard)
+    }
+
+    /// `docs`（`id`／`lang` の 2 列。`VECTOR` 列なし）を作成済みの
+    /// `EngineCore`（Issue #948。`explain: true` の scan／aggregate が
+    /// `42P01` ではなく `QUERY PLAN` 応答を返すことを確認するために、
+    /// 既知テーブルが必要な回帰テストが使う）。
+    fn core_with_docs_table() -> (EngineCore, CleanupGuard) {
+        let path = unique_temp_db_path("query-gate-docs-table");
+        let guard = CleanupGuard(path.clone());
+        {
+            let storage = engine::storage::Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&engine::catalog::TableSchema::new(
+                    "docs",
+                    vec![engine::catalog::ColumnDef::new(
+                        "lang",
+                        engine::catalog::ColumnType::Text,
+                        false,
+                    )],
+                ))
+                .expect("create docs table");
+        }
+        let core = EngineCore::open(&path).expect("open engine core");
         (core, guard)
     }
 
@@ -377,6 +414,36 @@ mod tests {
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 404 "), "got: {text}");
         assert!(text.contains("42P01"), "got: {text}");
+        assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+    }
+
+    #[test]
+    fn scan_and_aggregate_explain_true_are_dispatched_to_the_explain_arm_not_the_execute_arm() {
+        // Issue #948（NOSQL-16・SQL-27）: `explain: true` を伴う `scan`／
+        // `aggregate` は `(Op::Scan, Some(engine)) if explain_requested(...)`／
+        // `(Op::Aggregate, Some(engine)) if explain_requested(...)` の腕へ
+        // 振り分けられ、後続の実行アーム（`scan::handle`／
+        // `aggregate::handle`）へは落ちない。両アームは match の腕の順序上
+        // 実行アームより先に置かれている必要がある——本テストは腕の順序が
+        // 入れ替わった場合に検出する回帰確認（存在しないテーブルへの要求が
+        // `QUERY PLAN` 応答〔`200`〕になることで、実行アームの `42P01` では
+        // なく `explain` アームへ到達したことを非 vacuous に確認する。
+        // `EXPLAIN` はテーブルのスキーマ解決自体は行うため未知テーブルは
+        // 依然 `42P01` になる点に注意し、既存テーブルへの要求で判定する）。
+        let (core, _guard) = core_with_docs_table();
+        let scan_body = br#"{"op":"scan","table":"docs","limit":1,"explain":true}"#;
+        let response = run_with_engine(&core, scan_body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 200 "), "got: {text}");
+        assert!(text.contains("\"explain\""), "got: {text}");
+        assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
+
+        let aggregate_body = br#"{"op":"aggregate","table":"docs",
+            "aggregates":[{"fn":"count","column":"*"}],"explain":true}"#;
+        let response = run_with_engine(&core, aggregate_body, &[]);
+        let text = String::from_utf8(response).expect("utf-8 response");
+        assert!(text.starts_with("HTTP/1.1 200 "), "got: {text}");
+        assert!(text.contains("\"explain\""), "got: {text}");
         assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
     }
 
