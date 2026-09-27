@@ -757,6 +757,14 @@ pub(crate) fn execute_with_limits(
     let end = start.saturating_add(limit).min(pairs.len());
     let sliced = pairs.get(start..end).unwrap_or(&[]);
 
+    // 出力行 1 行あたりの構造体オーバーヘッド（`result_bytes` の
+    // per_row_struct_bytes と同じ計算式）。行ごとの見積もりに使う。
+    let per_row_struct_bytes = plan
+        .output
+        .len()
+        .saturating_mul(std::mem::size_of::<Cell>())
+        .saturating_add(std::mem::size_of::<ResultRow>());
+
     let mut rows = Vec::with_capacity(sliced.len());
     for &(l, r) in sliced {
         let left_row =
@@ -773,6 +781,27 @@ pub(crate) fn execute_with_limits(
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "JOIN right row index out of range".to_string(),
                 })?;
+
+        // codex-review 指摘（PR #1110）: 大きなセルを持つ入力行が多数の出力行に
+        // 一致すると、`.cloned()` で全行を複製してから予算照合すると `LIMIT`
+        // の範囲内でも同じペイロードを大量に複製し、共有バイト予算を超える
+        // メモリを確保した後にしか `54000` を返せない（security.md「不安全な
+        // 設計｜無制限リソース確保（DoS）」に抵触）。複製前に借用のまま
+        // この 1 行の見積もりを算出し、残予算と照合してから複製する
+        // （超過時は複製・確保そのものを行わない fail-closed）。
+        let mut row_payload_bytes = 0usize;
+        for out_col in &plan.output {
+            let cell = match out_col {
+                OutputColumn::Left(pos, _) => left_row.cells.get(*pos),
+                OutputColumn::Right(pos, _) => right_row.cells.get(*pos),
+            }
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "JOIN output column position out of range".to_string(),
+            })?;
+            row_payload_bytes = row_payload_bytes.saturating_add(cell_payload_bytes(cell));
+        }
+        budget.charge(per_row_struct_bytes.saturating_add(row_payload_bytes))?;
+
         let mut cells = Vec::with_capacity(plan.output.len());
         for out_col in &plan.output {
             let cell = match out_col {
@@ -791,7 +820,6 @@ pub(crate) fn execute_with_limits(
             cells,
         });
     }
-    budget.charge(result_bytes(plan.output.len(), &rows))?;
 
     let columns = plan
         .output
@@ -999,6 +1027,91 @@ mod tests {
 
         let err = execute_with_limits(&read_txn, &ctx, &schemas, &validated, &udfs, &limits)
             .expect_err("combined side bytes must exceed the injected shared budget");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review 指摘（PR #1110・join.rs:786）の回帰: 1 件の大きなセルを
+    /// 持つビルド側の行が、プローブ側の複数行と一致して出力側で多数回
+    /// 複製される（fan-out）場合でも、走査段（両辺のスキャン・ハッシュキー）
+    /// だけでは収まる予算を注入すると出力段の複製で `54000` に落ちること
+    /// （出力行ごとの見積もりが複製前に残予算と照合されていること）を確認する。
+    /// ビルド側（`tag` を結合キーに使うため走査段では小さい値のまま）1 行の
+    /// 大きな `embedding`（VECTOR）だけがプローブ側の一致数だけ出力へ複製される
+    /// ため、走査段の合計とは別に出力段だけが予算超過することを再現できる。
+    #[test]
+    fn output_row_fan_out_of_a_large_cell_is_rejected_before_exceeding_the_budget() {
+        let path = unique_db_path("join-fan-out-large-cell");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        let big_schema = |name: &str| {
+            TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(512), false),
+                    ColumnDef::new("tag", ColumnType::Text, false),
+                ],
+            )
+        };
+        storage.create_table(&big_schema("l")).expect("create l");
+        storage.create_table(&big_schema("r")).expect("create r");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let op_id = OperationId::parse("seed-l-0").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "l",
+            &ctx,
+            0,
+            Visibility::Public,
+            &[Value::Vector(vec![1.0; 512]), Value::Text("k".to_string())],
+            &op_id,
+        )
+        .expect("insert build-side row");
+        // プローブ側は結合キー（`tag` = "k"）だけを共有する多数の小さな行。
+        // 走査段の合計バイト量は小さいまま、出力段の一致ペア数（fan-out）だけが
+        // 増える構図にする。
+        const PROBE_ROWS: u64 = 32;
+        for i in 0..PROBE_ROWS {
+            let op_id = OperationId::parse(&format!("seed-r-{i}")).expect("valid operation_id");
+            crate::tenant::insert_typed_row(
+                &storage,
+                "r",
+                &ctx,
+                i,
+                Visibility::Public,
+                &[Value::Vector(vec![0.0; 512]), Value::Text("k".to_string())],
+                &op_id,
+            )
+            .expect("insert probe-side row");
+        }
+
+        let validated = ValidatedJoin {
+            relations: vec![TableRef::new("l"), TableRef::new("r")],
+            on: vec![(
+                ColumnRef::qualified("l", "tag"),
+                ColumnRef::qualified("r", "tag"),
+            )],
+            projection: JoinProjection::Columns(vec![ColumnRef::qualified("l", "embedding")]),
+            where_conjuncts: Vec::new(),
+            limit: PROBE_ROWS as u32,
+            offset: 0,
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("l".to_string(), big_schema("l"));
+        schemas.insert("r".to_string(), big_schema("r"));
+        let udfs = UdfRegistry::default();
+        // 走査段（両辺のスキャン結果・結合キー）の合計は大きな embedding が
+        // 1 個分（512 次元 * 4 byte = 2048 byte）＋プローブ側の小さな行群で
+        // 収まるが、出力段は同じ embedding を `PROBE_ROWS` 回複製するため
+        // 大きく超過する上限を注入する。
+        let limits = JoinLimits {
+            budget_cap: 8192,
+            ..JoinLimits::default()
+        };
+
+        let err = execute_with_limits(&read_txn, &ctx, &schemas, &validated, &udfs, &limits)
+            .expect_err("fan-out duplication of the large cell must exceed the injected budget");
         assert_eq!(err.wire_code(), "54000");
     }
 
