@@ -905,10 +905,6 @@ pub(crate) fn execute_statement_with_cache(
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
         // Issue #919・SQL-26: `scan_scalar_columns`（マスクなし）は全列を
         // デコードするため、マスク外＝実 NULL の取り違えは生じない。
-        let text_columns: Vec<Option<&str>> = scanned
-            .iter()
-            .map(|v| v.and_then(|s| s.as_text()))
-            .collect();
         // DISTANCE 先行時（`!plan.scalar_prefilter`）の SCALAR 事後フィルタ判定を
         // ここで（生の `scanned: Vec<Option<ScalarRef>>` に対して）確定させ、
         // `postfilter_verdicts` へ記録する。DISTANCE 段の後で `Value` から
@@ -978,7 +974,7 @@ pub(crate) fn execute_statement_with_cache(
             // （`expr_eval_error_to_arena` 経由で `22000`／`54000` へ写像）。
             for program in &bound.expr_filter_programs {
                 match program
-                    .eval(id, embedding, &text_columns, &mut expr_scratch)
+                    .eval(id, embedding, &scanned, &mut expr_scratch)
                     .map_err(expr_eval_error_to_arena)?
                 {
                     udf_call::ExprValue::Bool(true) => {}
@@ -2172,10 +2168,6 @@ pub(crate) fn execute_statement_with_cache(
                 };
                 let scanned_view: Vec<Option<ScalarRef<'_>>> =
                     columns.iter().map(candidate_value_to_scalar_ref).collect();
-                let text_columns: Vec<Option<&str>> = scanned_view
-                    .iter()
-                    .map(|v| v.and_then(|s| s.as_text()))
-                    .collect();
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
                 };
@@ -2184,7 +2176,7 @@ pub(crate) fn execute_statement_with_cache(
                 };
                 let mut expr_ok = true;
                 for program in &bound.expr_filter_programs {
-                    match program.eval(row_id, embedding, &text_columns, &mut expr_scratch)? {
+                    match program.eval(row_id, embedding, &scanned_view, &mut expr_scratch)? {
                         udf_call::ExprValue::Bool(true) => {}
                         // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26
                         // （AC2）と Issue #921・SQL-26 の共有契約）。
@@ -2767,14 +2759,13 @@ fn project_rows(
                 )?)
             }
         };
-        // Issue #919・SQL-26: `Computed` 投影の式が参照する `TEXT` 列
-        // （`needed_mask`／`needed_column_indices` に含め済み）を、`decoded` の
-        // 型差（`Value` 由来）を吸収したビューへ変換する。
-        let text_columns: Vec<Option<&str>> = (0..schema.columns.len())
-            .map(|idx| match decoded.get(idx) {
-                Some(Value::Text(t)) => Some(t.as_str()),
-                _ => None,
-            })
+        // Issue #919・SQL-26・Issue #920（SQL-26 日時関数群）: `Computed` 投影の
+        // 式が参照する列（`needed_mask`／`needed_column_indices` に含め済み）を、
+        // `decoded` の型差（`Value` 由来）を吸収したビューへ変換する。
+        // `candidate_value_to_scalar_ref` を共有することで、`TEXT` に加えて
+        // `DATE`／`TIMESTAMP` 列参照もこの遅延投影経路で正しく解決できる。
+        let row_scalars: Vec<Option<ScalarRef<'_>>> = (0..schema.columns.len())
+            .map(|idx| decoded.get(idx).and_then(candidate_value_to_scalar_ref))
             .collect();
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
@@ -3113,7 +3104,7 @@ fn project_rows(
                             detail: "computed projection program missing at evaluation time"
                                 .to_string(),
                         })?;
-                    match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
+                    match program.eval(id, embedding, &row_scalars, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
@@ -3129,6 +3120,12 @@ fn project_rows(
                         // 写像する（`ColumnType::Text` 直接投影と同じ複製経路
                         // `try_clone_text` を共有する）。
                         udf_call::ExprValue::Text(t) => cells.push(Cell::Text(try_clone_text(&t)?)),
+                        // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／
+                        // `TIMESTAMP` を返す式（`date_trunc` 等）を
+                        // `Cell::Date`／`Cell::Timestamp` へ写像する（`ColumnType`
+                        // 直接投影と同じテキスト整形経路を共有する）。
+                        udf_call::ExprValue::Date(d) => cells.push(Cell::Date(d)),
+                        udf_call::ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
                         // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
                         // 契約: NULL は `Cell::Null` へ写像する。
                         udf_call::ExprValue::Null => cells.push(Cell::Null),
@@ -3742,10 +3739,6 @@ pub(crate) fn execute_predicate_delete(
             return Ok(false);
         }
         // Issue #919・SQL-26: マスクなし全列デコードのため取り違えは生じない。
-        let text_columns: Vec<Option<&str>> = scanned
-            .iter()
-            .map(|v| v.and_then(|s| s.as_text()))
-            .collect();
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
             // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
@@ -3758,7 +3751,7 @@ pub(crate) fn execute_predicate_delete(
             } else {
                 &[]
             };
-            match program.eval(candidate.id, embedding, &text_columns, &mut scratch)? {
+            match program.eval(candidate.id, embedding, &scanned, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
                 // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
                 // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
@@ -3857,10 +3850,6 @@ pub(crate) fn execute_predicate_update(
             return Ok(false);
         }
         // Issue #919・SQL-26: マスクなし全列デコードのため取り違えは生じない。
-        let text_columns: Vec<Option<&str>> = scanned
-            .iter()
-            .map(|v| v.and_then(|s| s.as_text()))
-            .collect();
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
             // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
@@ -3873,7 +3862,7 @@ pub(crate) fn execute_predicate_update(
             } else {
                 &[]
             };
-            match program.eval(candidate.id, embedding, &text_columns, &mut scratch)? {
+            match program.eval(candidate.id, embedding, &scanned, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
                 // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
                 // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。

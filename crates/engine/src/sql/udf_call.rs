@@ -25,7 +25,9 @@ use std::sync::Arc;
 
 use crate::catalog;
 use crate::catalog::{ColumnType, TableSchema};
+use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::datetime_fn::{self, DatePartField, DateTruncUnit};
 use crate::sql::string_fn;
 use crate::wasm_udf::WasmUdfBackend;
 
@@ -163,6 +165,15 @@ pub enum Expr {
     /// `NULLIF(<lhs>, <rhs>)`（対象ビヘイビア: SQL-26）。両辺が等しければ NULL、
     /// 異なれば `lhs` を返す。
     NullIf(Box<Expr>, Box<Expr>),
+    /// `DATE '<literal>'`（型付きリテラル。対象ビヘイビア: SQL-26。Issue #920）。
+    /// 構文段（`allowlist::Parser::parse_primary_expr`）で
+    /// `crate::datetime::parse_date` を即座に解析済みの値を保持する（生文字列を
+    /// 保持しないのは、CHECK・ビューの render→再パース往復で区切り文字の表記
+    /// 揺れ〔`T` 区切り／空白区切り〕が食い違って壊れるのを避けるため）。
+    DateLiteral(i32),
+    /// `TIMESTAMP '<literal>'`（[`Expr::DateLiteral`] と同じ理由。値は
+    /// `crate::datetime::parse_timestamp` の解析結果＝マイクロ秒）。
+    TimestampLiteral(i64),
 }
 
 /// 束縛済み（列参照・関数呼び出しの解決、UDF 本体のインライン展開が完了した）式。
@@ -179,7 +190,7 @@ pub enum BoundExpr {
     /// nullable TEXT 列の参照（Issue #919・SQL-26）。`index` は `schema.columns`
     /// と同じ論理列インデックス（`ScalarRef` を返す既存の走査 API・
     /// `AggregateInput::TextColumn` 等と同じ添字系列）。評価時は呼び出し元が
-    /// 渡す行スカラー値（`eval_with_scalars` の `text_columns`）から解決する。
+    /// 渡す行スカラー値（`eval_with_scalars` の `row_scalars`）から解決する。
     /// マスク外参照（呼び出し元がこの列をデコード対象に含め忘れた場合）は
     /// 実 NULL と取り違えず `Internal` として fail-closed に拒否する
     /// （[`eval_with_scalars`] のドキュメント参照）。
@@ -231,6 +242,21 @@ pub enum BoundExpr {
         lhs: Box<BoundExpr>,
         rhs: Box<BoundExpr>,
     },
+    /// `DATE` 定数（対象ビヘイビア: SQL-26。Issue #920）。内部表現は
+    /// 1970-01-01 起点の日数（`crate::datetime` 参照）。
+    Date(i32),
+    /// `TIMESTAMP` 定数（マイクロ秒。[`BoundExpr::Date`] 参照）。
+    Timestamp(i64),
+    /// nullable `DATE` 列の参照。`index` は `TextColumnRef` と同じ論理列
+    /// インデックス系列（`schema.columns` 添字）。値は行スカラー値
+    /// （[`eval_with_scalars`] の `row_scalars`）から解決する。
+    DateColumnRef {
+        index: usize,
+    },
+    /// nullable `TIMESTAMP` 列の参照（[`BoundExpr::DateColumnRef`] 参照）。
+    TimestampColumnRef {
+        index: usize,
+    },
 }
 
 impl PartialEq for BoundExpr {
@@ -241,6 +267,15 @@ impl PartialEq for BoundExpr {
             (BoundExpr::TextColumnRef { index: a }, BoundExpr::TextColumnRef { index: b }) => {
                 a == b
             }
+            (BoundExpr::Date(a), BoundExpr::Date(b)) => a == b,
+            (BoundExpr::Timestamp(a), BoundExpr::Timestamp(b)) => a == b,
+            (BoundExpr::DateColumnRef { index: a }, BoundExpr::DateColumnRef { index: b }) => {
+                a == b
+            }
+            (
+                BoundExpr::TimestampColumnRef { index: a },
+                BoundExpr::TimestampColumnRef { index: b },
+            ) => a == b,
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
             (BoundExpr::Null, BoundExpr::Null) => true,
@@ -298,6 +333,10 @@ pub enum ExprType {
     Bool,
     /// TEXT 値（Issue #919・SQL-26）。
     Text,
+    /// `DATE` 値（対象ビヘイビア: SQL-26。Issue #920）。
+    Date,
+    /// `TIMESTAMP` 値（[`ExprType::Date`] 参照）。
+    Timestamp,
 }
 
 /// 評価結果の値。
@@ -317,6 +356,10 @@ pub enum ExprValue<'a> {
     /// 関数結果（`LOWER`/`CONCAT` 等）は新規構築のため所有（`Cow::Owned`）で返す
     /// （`Vector` と同じ借用/所有の使い分け方針）。
     Text(Cow<'a, str>),
+    /// `DATE` 値（1970-01-01 起点の日数。対象ビヘイビア: SQL-26。Issue #920）。
+    Date(i32),
+    /// `TIMESTAMP` 値（マイクロ秒。[`ExprValue::Date`] 参照）。
+    Timestamp(i64),
     /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
     /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
     /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
@@ -402,6 +445,17 @@ pub enum BuiltinFn {
     Power,
     /// `sqrt(x: Scalar) -> Scalar`。
     Sqrt,
+    /// `date_part(field: Text, src: Timestamp) -> Scalar`／`EXTRACT(field FROM
+    /// src)`（対象ビヘイビア: SQL-26。Issue #920）。`field` は束縛時に解決済み
+    /// （`bind_call` 参照。実行時の引数は `src` 1 個のみ）。
+    DatePart(DatePartField),
+    /// `date_trunc(unit: Text, src: Timestamp) -> Timestamp`（`field` と同じく
+    /// `unit` は束縛時に解決済み）。
+    DateTrunc(DateTruncUnit),
+    /// `DATE` を深夜 0 時の `TIMESTAMP` へ昇格する内部専用関数（名前では
+    /// 解決できない。`bind_call`／`bind_binary` が `date_part`／`date_trunc` の
+    /// `DATE` 引数、および `DATE`／`TIMESTAMP` 比較の `DATE` 側に挿入する）。
+    DateToTimestamp,
 }
 
 /// `name` が組み込み関数（[`BuiltinFn`]）の名前かどうかを判定する。`pub(crate)`:
@@ -455,7 +509,10 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
 fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "substr" | "concat" | "round"
+        // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
+        // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
+        // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
+        "substr" | "concat" | "round" | "date_part" | "date_trunc"
     )
 }
 
@@ -491,6 +548,13 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::Mod => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Power => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Sqrt => (&[ExprType::Scalar], ExprType::Scalar),
+        // `date_part`／`date_trunc` の実行時引数は `src`（`Timestamp`。`DATE`
+        // 入力は束縛時に `DateToTimestamp` で昇格済み）1 個のみ。field／unit は
+        // `BuiltinFn` のペイロードとして束縛時に解決済みのため実行時引数には
+        // 含まれない（§2-4）。
+        BuiltinFn::DatePart(_) => (&[ExprType::Timestamp], ExprType::Scalar),
+        BuiltinFn::DateTrunc(_) => (&[ExprType::Timestamp], ExprType::Timestamp),
+        BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
     }
 }
 
@@ -526,6 +590,15 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Trim
         | BuiltinFn::Replace
         | BuiltinFn::Position => false,
+        // 対象ビヘイビア: SQL-26（Issue #920）。`sql::expr_program::FoldedConst`
+        // は `Scalar`／`Bool` のみを表現できる型（文字列組み込みと同じ制約。
+        // 上記コメント参照）で `DATE`／`TIMESTAMP` 値を持てないため、
+        // `date_trunc`／`DateToTimestamp`（戻り値が `Timestamp`／`Date`）は
+        // 畳み込み対象に含めない。`date_part`（戻り値は `Scalar`）も対称性の
+        // ため同様に対象外とする。正しさには影響しない（defer-on-error で
+        // 実行時に評価される。対象外事項として `docs/design/
+        // datetime-scalar-functions.md` に記録）。
+        BuiltinFn::DatePart(_) | BuiltinFn::DateTrunc(_) | BuiltinFn::DateToTimestamp => false,
     }
 }
 
@@ -809,6 +882,18 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
+            } else if name.eq_ignore_ascii_case("date_part")
+                || name.eq_ignore_ascii_case("date_trunc")
+            {
+                // 対象ビヘイビア: SQL-26（Issue #920）。field／unit の解決は
+                // 呼び出し時（`bind_call`）に第 1 引数が Text リテラルか検査する
+                // ため、定義時はここで arity（常に 2）のみ検査する。
+                if args.len() != 2 {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "function {name} expects 2 argument(s), got {}",
+                        args.len()
+                    )));
+                }
             } else if name.eq_ignore_ascii_case("round") {
                 // `round` は arity オーバーロード（1／2 引数）。他の組み込みと
                 // 異なり単一の `BuiltinFn` に定まらないため、ここでは引数個数の
@@ -881,6 +966,7 @@ fn validate_closed_expr(
             validate_closed_expr(lhs, params, registry, node_budget)?;
             validate_closed_expr(rhs, params, registry, node_budget)
         }
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
     }
 }
 
@@ -908,6 +994,10 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::Date(_)
+        | BoundExpr::Timestamp(_)
+        | BoundExpr::DateColumnRef { .. }
+        | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Null => 1,
@@ -946,6 +1036,10 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::Date(_)
+        | BoundExpr::Timestamp(_)
+        | BoundExpr::DateColumnRef { .. }
+        | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Null => 0,
@@ -989,6 +1083,10 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::Date(_)
+        | BoundExpr::Timestamp(_)
+        | BoundExpr::DateColumnRef { .. }
+        | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::Null => false,
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
@@ -1013,9 +1111,13 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
 /// インデックスをすべて `visit` へ渡す。
 pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn FnMut(usize)) {
     match expr {
-        BoundExpr::TextColumnRef { index } => visit(*index),
+        BoundExpr::TextColumnRef { index }
+        | BoundExpr::DateColumnRef { index }
+        | BoundExpr::TimestampColumnRef { index } => visit(*index),
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
+        | BoundExpr::Date(_)
+        | BoundExpr::Timestamp(_)
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Null => {}
@@ -1065,7 +1167,9 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
 /// コンパイルエラーとして検出する（`references_embedding` と同じ設計意図）。
 pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]) -> bool {
     match expr {
-        BoundExpr::TextColumnRef { index } => {
+        BoundExpr::TextColumnRef { index }
+        | BoundExpr::DateColumnRef { index }
+        | BoundExpr::TimestampColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
             }
@@ -1073,6 +1177,8 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         }
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
+        | BoundExpr::Date(_)
+        | BoundExpr::Timestamp(_)
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Null => false,
@@ -1464,7 +1570,7 @@ fn bind_expr_in(
                     // Issue #919・SQL-26（検討中）: TEXT 列参照を解禁し、文字列
                     // スカラー関数（`LOWER`/`UPPER`/`SUBSTR` 等）・TEXT 同士の比較で
                     // 使えるようにする。値は行コンテキスト（`eval_with_scalars` の
-                    // `text_columns`）から解決し、nullable 列の実 NULL は
+                    // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
                     ColumnType::Text => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
                     // `INTEGER`／`BIGINT` 列の式参照対応は Issue #891 の担当。
@@ -1485,12 +1591,17 @@ fn bind_expr_in(
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
-                    ColumnType::Date => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (DATE columns are not supported)"
-                    ))),
-                    ColumnType::Timestamp => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (TIMESTAMP columns are not supported)"
-                    ))),
+                    // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP`
+                    // 列参照を解禁する（TABLE-13・TASK-197、Issue #884 で列型を
+                    // 導入して以来、式内参照は本 Issue まで拒否してきた）。値は
+                    // 行コンテキスト（`eval_with_scalars` の `row_scalars`）から
+                    // 解決し、nullable 列の実 NULL は `ExprValue::Null` として
+                    // 伝播する（TEXT 列と同じ契約）。
+                    ColumnType::Date => Ok((BoundExpr::DateColumnRef { index }, ExprType::Date)),
+                    ColumnType::Timestamp => Ok((
+                        BoundExpr::TimestampColumnRef { index },
+                        ExprType::Timestamp,
+                    )),
                     ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ARRAY columns are not supported)"
                     ))),
@@ -1540,6 +1651,12 @@ fn bind_expr_in(
         Expr::Case { whens, else_result } => bind_case(whens, else_result, env, node_budget),
         Expr::Coalesce(args) => bind_coalesce(args, env, node_budget),
         Expr::NullIf(lhs, rhs) => bind_nullif(lhs, rhs, env, node_budget),
+        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。Issue #920）。
+        // 構文段（`allowlist::Parser::parse_primary_expr`）が既に
+        // `crate::datetime::parse_date`／`parse_timestamp` で解析・範囲検証済みの
+        // 値を保持しているため、束縛段では単に値を引き継ぐだけでよい。
+        Expr::DateLiteral(days) => Ok((BoundExpr::Date(*days), ExprType::Date)),
+        Expr::TimestampLiteral(micros) => Ok((BoundExpr::Timestamp(*micros), ExprType::Timestamp)),
     }
 }
 
@@ -1558,8 +1675,22 @@ fn bind_binary(
     match op {
         BinOp::Add | BinOp::Sub => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Scalar)),
+            // `DATE + n`／`DATE - n`（対象ビヘイビア: SQL-26。Issue #920）。
+            // `n` は日数。`n - DATE`（`Sub` の左右反転）は PostgreSQL でも
+            // 未定義のため受理しない。
+            (ExprType::Date, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Date)),
+            // `n + DATE`（`Add` のみ左右対称に受理。`n - DATE` は意味が
+            // 定まらないため `Sub` では受理しない）。
+            (ExprType::Scalar, ExprType::Date) if op == BinOp::Add => {
+                Ok((mk(op, l, r), ExprType::Date))
+            }
+            // `DATE - DATE` は日数差（`Scalar`）を返す。`DATE + DATE` は
+            // PostgreSQL でも未定義のため `Add` では受理しない。
+            (ExprType::Date, ExprType::Date) if op == BinOp::Sub => {
+                Ok((mk(op, l, r), ExprType::Scalar))
+            }
             _ => Err(SqlSurfaceError::invalid_input(
-                "'+'/'-' require both operands to be scalar",
+                "'+'/'-' require both operands to be scalar, or a DATE combined with a day-count scalar",
             )),
         },
         BinOp::Mul => match (lt, rt) {
@@ -1583,10 +1714,33 @@ fn bind_binary(
             // Issue #919・SQL-26: TEXT 同士の比較（バイト順＝UTF-8 コードポイント順。
             // PostgreSQL の `"C"` 照合相当）。TEXT と Scalar の混在は許可しない。
             (ExprType::Text, ExprType::Text) => Ok((mk(op, l, r), ExprType::Bool)),
+            // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` 同士の
+            // 比較は内部表現（日数／マイクロ秒）の全順序で行う。
+            (ExprType::Date, ExprType::Date) | (ExprType::Timestamp, ExprType::Timestamp) => {
+                Ok((mk(op, l, r), ExprType::Bool))
+            }
+            // `DATE` ⋈ `TIMESTAMP` は `DATE` 側を深夜 0 時の `TIMESTAMP` へ
+            // 暗黙昇格してから比較する（PostgreSQL 互換。§2-3）。
+            (ExprType::Date, ExprType::Timestamp) => {
+                Ok((mk(op, wrap_date_to_timestamp(l), r), ExprType::Bool))
+            }
+            (ExprType::Timestamp, ExprType::Date) => {
+                Ok((mk(op, l, wrap_date_to_timestamp(r)), ExprType::Bool))
+            }
             _ => Err(SqlSurfaceError::invalid_input(
-                "comparison operators require both operands to be scalar or both to be text",
+                "comparison operators require both operands to be scalar, both text, or both date/timestamp",
             )),
         },
+    }
+}
+
+/// `DATE` 値を深夜 0 時の `TIMESTAMP` へ暗黙昇格する（`BuiltinFn::DateToTimestamp`
+/// で包む）。`bind_binary`（`DATE`／`TIMESTAMP` 比較）・`bind_call`
+/// （`date_part`／`date_trunc` の `DATE` 引数）が共有する（§2-4）。
+fn wrap_date_to_timestamp(e: BoundExpr) -> BoundExpr {
+    BoundExpr::Builtin {
+        f: BuiltinFn::DateToTimestamp,
+        args: vec![e],
     }
 }
 
@@ -1640,6 +1794,10 @@ fn bind_call(
             },
             ret,
         ));
+    }
+
+    if lower_name == "date_part" || lower_name == "date_trunc" {
+        return bind_date_part_or_trunc(&lower_name, args, env, node_budget);
     }
 
     if let Some(builtin) = builtin_from_name(name) {
@@ -1838,6 +1996,71 @@ fn bind_concat(
     Ok((result, ExprType::Text))
 }
 
+/// `date_part(field, src)`／`date_trunc(unit, src)`（対象ビヘイビア: SQL-26。
+/// Issue #920。`EXTRACT(field FROM src)` は構文段でこの形へ脱糖しないため
+/// 本 Issue の対象外——`docs/design/datetime-scalar-functions.md` 参照）。
+/// `field`／`unit` は束縛後の第 1 引数が [`BoundExpr::Text`] リテラルである
+/// 場合のみ解決する（UDF パラメータ経由でも、展開後に Text リテラルであれば
+/// 受理する。§2-4）。`src`（第 2 引数）は `DATE` または `TIMESTAMP` を受理し、
+/// `DATE` は [`wrap_date_to_timestamp`] で昇格する。
+fn bind_date_part_or_trunc(
+    lower_name: &str,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if args.len() != 2 {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "function {lower_name} expects 2 argument(s), got {}",
+            args.len()
+        )));
+    }
+    let (field_bound, field_ty) = bind_expr_in(&args[0], env, node_budget)?;
+    if field_ty != ExprType::Text {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "function {lower_name} expects a text literal as its first argument"
+        )));
+    }
+    let BoundExpr::Text(field_name) = field_bound else {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "function {lower_name} requires its first argument to be a literal (not a column reference or expression)"
+        )));
+    };
+    let (src_bound, src_ty) = bind_expr_in(&args[1], env, node_budget)?;
+    let src = match src_ty {
+        ExprType::Timestamp => src_bound,
+        ExprType::Date => wrap_date_to_timestamp(src_bound),
+        _ => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "function {lower_name} expects a DATE or TIMESTAMP as its second argument"
+            )))
+        }
+    };
+    if lower_name == "date_part" {
+        let field = DatePartField::from_name(&field_name).ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!("unknown date_part field: {field_name}"))
+        })?;
+        Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::DatePart(field),
+                args: vec![src],
+            },
+            ExprType::Scalar,
+        ))
+    } else {
+        let unit = DateTruncUnit::from_name(&field_name).ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!("unknown date_trunc unit: {field_name}"))
+        })?;
+        Ok((
+            BoundExpr::Builtin {
+                f: BuiltinFn::DateTrunc(unit),
+                args: vec![src],
+            },
+            ExprType::Timestamp,
+        ))
+    }
+}
+
 /// `SUBSTR(s, start[, len])`（Issue #919・SQL-26）。引数 2 個は
 /// [`BuiltinFn::Substr2`]、3 個は [`BuiltinFn::Substr3`] へ束縛する。
 fn bind_substr(
@@ -1903,36 +2126,69 @@ pub fn eval<'a>(
     eval_with_scalars(expr, id, embedding, &[])
 }
 
-/// [`eval`] の行スカラー対応版（Issue #919・SQL-26、§3-7）。`text_columns` は
-/// `schema.columns` と同じ論理列インデックスを持つ `TEXT` 値のビューで、
-/// `BoundExpr::TextColumnRef` の解決に使う。要素は「その行のその列値」を表し、
-/// `None` は実 NULL を意味する。呼び出し元は、式が参照しうる `TEXT` 列を
-/// 事前に `mark_referenced_scalar_columns` でマスクへ反映してから正しくデコード
-/// する責務を負う（`sql::scan`／`sql::aggregate`／`sql::group_by`／`sql::exec`／
-/// `sql::check_constraint` それぞれの呼び出し元を参照）。`text_columns` の長さが
-/// 参照インデックスに満たない場合（呼び出し元の配線不備）は、実 NULL と取り違えず
-/// `Internal` として fail-closed に拒否する。[`eval`]（引数 3 個版）は
-/// `text_columns` を空スライスで呼ぶ薄いラッパーとして残す（差分テスト・
-/// `TextColumnRef` を含まない式のみを評価する既存呼び出し元向け）。
+/// [`eval`] の行スカラー対応版（Issue #919・SQL-26、§3-7。`DATE`／`TIMESTAMP`
+/// 対応は対象ビヘイビア: SQL-26、Issue #920）。`row_scalars` は `schema.columns`
+/// と同じ論理列インデックスを持つ行スカラー値（`TEXT`／`DATE`／`TIMESTAMP`）の
+/// ビューで、`BoundExpr::TextColumnRef`／`DateColumnRef`／`TimestampColumnRef`
+/// の解決に使う。要素は「その行のその列値」を表し、`None` は実 NULL を意味する。
+/// 呼び出し元は、式が参照しうる列を事前に `mark_referenced_scalar_columns` で
+/// マスクへ反映してから正しくデコードする責務を負う（`sql::scan`／
+/// `sql::aggregate`／`sql::group_by`／`sql::exec`／`sql::check_constraint`
+/// それぞれの呼び出し元を参照）。`row_scalars` の長さが参照インデックスに
+/// 満たない場合（呼び出し元の配線不備）は、実 NULL と取り違えず `Internal` として
+/// fail-closed に拒否する。列の型と参照 variant が食い違う場合（束縛段の
+/// 不変条件が崩れた場合の保険）も同様に `Internal` とする。[`eval`]（引数 3 個版）
+/// は `row_scalars` を空スライスで呼ぶ薄いラッパーとして残す（差分テスト・
+/// 列参照を含まない式のみを評価する既存呼び出し元向け）。
 pub(crate) fn eval_with_scalars<'a>(
     expr: &BoundExpr,
     id: u64,
     embedding: &'a [f32],
-    text_columns: &'a [Option<&'a str>],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match expr {
         BoundExpr::Number(v) => Ok(ExprValue::Scalar(*v)),
         // リテラルの寿命は `expr`（呼び出し元が指定する任意の借用）に紐付き、
-        // 戻り値のライフタイム `'a`（`embedding`/`text_columns` と共有）より
-        // 短い場合がありうるため、常に複製して返す（`VectorRef`／
-        // `TextColumnRef` の借用最適化とは異なる）。
+        // 戻り値のライフタイム `'a`（`embedding`/`row_scalars` と共有）より
+        // 短い場合がありうるため、常に複製して返す（`VectorRef`／列参照の
+        // 借用最適化とは異なる）。
         BoundExpr::Text(s) => Ok(ExprValue::Text(Cow::Owned(s.clone()))),
-        BoundExpr::TextColumnRef { index } => match text_columns.get(*index) {
+        BoundExpr::Date(d) => Ok(ExprValue::Date(*d)),
+        BoundExpr::Timestamp(t) => Ok(ExprValue::Timestamp(*t)),
+        BoundExpr::TextColumnRef { index } => match row_scalars.get(*index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
             }),
             Some(None) => Ok(ExprValue::Null),
-            Some(Some(s)) => Ok(ExprValue::Text(Cow::Borrowed(s))),
+            Some(Some(v)) => match v.as_text() {
+                Some(s) => Ok(ExprValue::Text(Cow::Borrowed(s))),
+                None => Err(SqlSurfaceError::Internal {
+                    detail: "TEXT column reference resolved to a non-TEXT row scalar value"
+                        .to_string(),
+                }),
+            },
+        },
+        BoundExpr::DateColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "DATE column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Date(d))) => Ok(ExprValue::Date(*d)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "DATE column reference resolved to a non-DATE row scalar value".to_string(),
+            }),
+        },
+        BoundExpr::TimestampColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TIMESTAMP column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Timestamp(t))) => Ok(ExprValue::Timestamp(*t)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
+                    .to_string(),
+            }),
         },
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::VectorRef => {
@@ -1962,20 +2218,20 @@ pub(crate) fn eval_with_scalars<'a>(
                 Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
             }
         }
-        BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding, text_columns),
+        BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding, row_scalars),
         BoundExpr::Binary { op, lhs, rhs } => {
-            let l = eval_with_scalars(lhs, id, embedding, text_columns)?;
-            let r = eval_with_scalars(rhs, id, embedding, text_columns)?;
+            let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
+            let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
             eval_binary(*op, l, r)
         }
         BoundExpr::WasmCall { backend, args, .. } => {
             // ABI 固定シグネチャ（bind_call が保証）: args[0] = Vector, args[1] = Scalar。
-            // どちらも `TEXT` 型を取らないため `text_columns` はこの階層では
+            // どちらも `TEXT` 型を取らないため `row_scalars` はこの階層では
             // 未使用だが、更に内側の入れ子式（例: `wasm_fn(embedding,
             // length(label))`）が `TextColumnRef` を含みうるため下位呼び出しへは
             // 引き続き渡す（Issue #919・SQL-26）。
             let v_val = match args.first() {
-                Some(e) => eval_with_scalars(e, id, embedding, text_columns)?,
+                Some(e) => eval_with_scalars(e, id, embedding, row_scalars)?,
                 None => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "missing function argument at evaluation time".to_string(),
@@ -1983,7 +2239,7 @@ pub(crate) fn eval_with_scalars<'a>(
                 }
             };
             let s_val = match args.get(1) {
-                Some(e) => eval_with_scalars(e, id, embedding, text_columns)?,
+                Some(e) => eval_with_scalars(e, id, embedding, row_scalars)?,
                 None => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "missing function argument at evaluation time".to_string(),
@@ -2025,15 +2281,15 @@ pub(crate) fn eval_with_scalars<'a>(
         }
         BoundExpr::Null => Ok(ExprValue::Null),
         // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点: `CASE`／
-        // `COALESCE`／`NULLIF` の分岐は `text_columns` を持つ `eval_with_scalars`
-        // で再帰する（引数 3 個版の `eval` は `text_columns` を常に空スライスへ
+        // `COALESCE`／`NULLIF` の分岐は `row_scalars` を持つ `eval_with_scalars`
+        // で再帰する（引数 3 個版の `eval` は `row_scalars` を常に空スライスへ
         // 縮退させるため、`COALESCE(LOWER(text_col), 'x')` のように分岐が
         // `TextColumnRef` を含む式で誤った `Internal` 拒否になっていた）。
         BoundExpr::Case { whens, else_result } => {
             for (cond, result) in whens {
-                match eval_with_scalars(cond, id, embedding, text_columns)? {
+                match eval_with_scalars(cond, id, embedding, row_scalars)? {
                     ExprValue::Bool(true) => {
-                        return eval_with_scalars(result, id, embedding, text_columns)
+                        return eval_with_scalars(result, id, embedding, row_scalars)
                     }
                     ExprValue::Bool(false) | ExprValue::Null => continue,
                     _ => {
@@ -2043,11 +2299,11 @@ pub(crate) fn eval_with_scalars<'a>(
                     }
                 }
             }
-            eval_with_scalars(else_result, id, embedding, text_columns)
+            eval_with_scalars(else_result, id, embedding, row_scalars)
         }
         BoundExpr::Coalesce(args) => {
             for a in args {
-                match eval_with_scalars(a, id, embedding, text_columns)? {
+                match eval_with_scalars(a, id, embedding, row_scalars)? {
                     ExprValue::Null => continue,
                     other => return Ok(other),
                 }
@@ -2055,8 +2311,8 @@ pub(crate) fn eval_with_scalars<'a>(
             Ok(ExprValue::Null)
         }
         BoundExpr::NullIf { lhs, rhs } => {
-            let l = eval_with_scalars(lhs, id, embedding, text_columns)?;
-            let r = eval_with_scalars(rhs, id, embedding, text_columns)?;
+            let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
+            let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
             eval_nullif(l, r)
         }
     }
@@ -2109,7 +2365,7 @@ fn eval_builtin<'a>(
     args: &[BoundExpr],
     id: u64,
     embedding: &'a [f32],
-    text_columns: &'a [Option<&'a str>],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     // 参照実装（再帰 `eval`）専用の非ホットパス。ステップ列実行
     // （`sql::expr_program::ExprProgram::eval`）は固定長スタック配列を使う別経路
@@ -2117,7 +2373,7 @@ fn eval_builtin<'a>(
     // 行ごとのホットパスには影響しない。
     let mut values: Vec<Option<ExprValue<'a>>> = Vec::with_capacity(args.len());
     for a in args {
-        values.push(Some(eval_with_scalars(a, id, embedding, text_columns)?));
+        values.push(Some(eval_with_scalars(a, id, embedding, row_scalars)?));
     }
     apply_builtin(f, &mut values)
 }
@@ -2307,6 +2563,21 @@ pub(crate) fn apply_builtin<'a>(
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::sqrt(x).map(ExprValue::Scalar)
         }
+        // 対象ビヘイビア: SQL-26（Issue #920）。`date_part`／`date_trunc` の
+        // 実行時引数は `src`（`Timestamp`）1 個のみ（field／unit は束縛済みの
+        // `BuiltinFn` ペイロード。§2-4）。
+        BuiltinFn::DatePart(field) => {
+            let t = take_timestamp_arg(args, 0)?;
+            finite_scalar(datetime_fn::date_part(field, t), "date_part")
+        }
+        BuiltinFn::DateTrunc(unit) => {
+            let t = take_timestamp_arg(args, 0)?;
+            datetime_fn::date_trunc(unit, t).map(ExprValue::Timestamp)
+        }
+        BuiltinFn::DateToTimestamp => {
+            let d = take_date_arg(args, 0)?;
+            Ok(ExprValue::Timestamp(datetime_fn::date_to_timestamp(d)))
+        }
     }
 }
 
@@ -2378,6 +2649,36 @@ fn take_scalar_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<f64
     }
 }
 
+/// `args[idx]` を `Date` として取り出す（[`take_scalar_arg`] と対の値ベース
+/// 抽出ヘルパー。対象ビヘイビア: SQL-26。Issue #920）。
+fn take_date_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<i32, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Date(d)) => Ok(d),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// `args[idx]` を `Timestamp` として取り出す（[`take_date_arg`] 参照）。
+fn take_timestamp_arg(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<i64, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Timestamp(t)) => Ok(t),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
 /// 非有限値（NaN/∞）を fail-closed に拒否してスカラー値へ包む共通ヘルパー。
 /// `sql::expr_program::ExprProgram::eval` の `WasmCall` ステップも共有する
 /// （Issue #353。fail-closed 判定を 1 箇所に保つ）。
@@ -2424,6 +2725,21 @@ pub(crate) fn eval_binary<'a>(
             (ExprValue::Scalar(s), ExprValue::Vector(v)) if op == BinOp::Mul => {
                 apply_vector_scalar_op(op, &v, s)
             }
+            // 対象ビヘイビア: SQL-26（Issue #920）。`DATE ± n`／`n + DATE`／
+            // `DATE - DATE`（束縛段〔`bind_binary`〕が受理する組み合わせのみ
+            // ここに到達する）。
+            (ExprValue::Date(d), ExprValue::Scalar(n)) if op == BinOp::Add => {
+                datetime_fn::date_add_days(d, n).map(ExprValue::Date)
+            }
+            (ExprValue::Date(d), ExprValue::Scalar(n)) if op == BinOp::Sub => {
+                datetime_fn::date_add_days(d, -n).map(ExprValue::Date)
+            }
+            (ExprValue::Scalar(n), ExprValue::Date(d)) if op == BinOp::Add => {
+                datetime_fn::date_add_days(d, n).map(ExprValue::Date)
+            }
+            (ExprValue::Date(a), ExprValue::Date(b)) if op == BinOp::Sub => {
+                Ok(ExprValue::Scalar(datetime_fn::date_diff_days(a, b)))
+            }
             _ => Err(SqlSurfaceError::Internal {
                 detail: "operand type mismatch at evaluation time".to_string(),
             }),
@@ -2463,11 +2779,36 @@ pub(crate) fn eval_binary<'a>(
                 };
                 Ok(ExprValue::Bool(result))
             }
+            // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` 同士の
+            // 比較（`bind_binary` が `DATE`⋈`TIMESTAMP` を `DateToTimestamp` で
+            // 昇格済みのため、ここに到達するのは同種同士のみ）。
+            (ExprValue::Date(a), ExprValue::Date(b)) => Ok(ExprValue::Bool(compare(op, a, b)?)),
+            (ExprValue::Timestamp(a), ExprValue::Timestamp(b)) => {
+                Ok(ExprValue::Bool(compare(op, a, b)?))
+            }
             _ => Err(SqlSurfaceError::Internal {
                 detail: "operand type mismatch at evaluation time".to_string(),
             }),
         },
     }
+}
+
+/// `Ord` を実装する値同士の比較演算子を適用する共通ヘルパー
+/// （`DATE`／`TIMESTAMP` の内部表現〔`i32`／`i64`〕比較で使う。対象ビヘイビア:
+/// SQL-26。Issue #920）。
+fn compare<T: PartialOrd>(op: BinOp, a: T, b: T) -> Result<bool, SqlSurfaceError> {
+    Ok(match op {
+        BinOp::Gt => a > b,
+        BinOp::Lt => a < b,
+        BinOp::Ge => a >= b,
+        BinOp::Le => a <= b,
+        BinOp::Eq => a == b,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "non-comparison operator in comparison evaluation".to_string(),
+            });
+        }
+    })
 }
 
 fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {

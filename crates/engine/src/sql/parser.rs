@@ -4170,9 +4170,16 @@ fn resolve_aggregate_input(
                 // 使えるが、集計関数の引数（`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)`）
                 // としては受理しない（対象外事項。式評価の結果がスカラーである
                 // ことを要求する既存契約を維持する）。
-                ExprType::Vector | ExprType::Bool | ExprType::Text => Err(
-                    SqlSurfaceError::invalid_input("aggregate argument must evaluate to a scalar"),
-                ),
+                // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` を
+                // 直接返す式（集計せず素通しする形）も、上記 TEXT と同じ理由で
+                // 集計引数としては対象外とする。
+                ExprType::Vector
+                | ExprType::Bool
+                | ExprType::Text
+                | ExprType::Date
+                | ExprType::Timestamp => Err(SqlSurfaceError::invalid_input(
+                    "aggregate argument must evaluate to a scalar",
+                )),
             }
         }
     }
@@ -4272,9 +4279,16 @@ fn resolve_count_distinct_input(
                 // 受理しない。TEXT 列そのものの直接参照は上の
                 // `AggregateArg::Expr(Expr::Ident(name))` 分岐が
                 // `AggregateInput::TextColumn` として別途受理する）。
-                ExprType::Vector | ExprType::Bool | ExprType::Text => Err(
-                    SqlSurfaceError::invalid_input("aggregate argument must evaluate to a scalar"),
-                ),
+                // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` を
+                // 直接返す式（集計せず素通しする形）も、上記 TEXT と同じ理由で
+                // 集計引数としては対象外とする。
+                ExprType::Vector
+                | ExprType::Bool
+                | ExprType::Text
+                | ExprType::Date
+                | ExprType::Timestamp => Err(SqlSurfaceError::invalid_input(
+                    "aggregate argument must evaluate to a scalar",
+                )),
             }
         }
     }
@@ -4934,6 +4948,9 @@ fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>)
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
+        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
+        // Issue #920）は列識別子を参照しない。
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {}
     }
 }
 

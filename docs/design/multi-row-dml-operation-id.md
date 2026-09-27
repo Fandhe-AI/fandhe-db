@@ -230,6 +230,17 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 - `String(s)`＝タグ 9・`push_bytes(s)`（長さ前置＋内容込み。文字列リテラル
   だけが異なる 2 つの DML が同一ハッシュへ衝突するのを防ぐ）
 
+**Issue #920（対象ビヘイビア: SQL-26）で追加したタグ**（`Expr::DateLiteral`／
+`TimestampLiteral`。既存タグ 1〜9 は不変）:
+
+- `DateLiteral(days)`＝タグ 10・型バイト `0`・`days`（`i32`、LE）
+- `TimestampLiteral(micros)`＝タグ 10・型バイト `1`・`micros`（`i64`、LE）
+
+型バイトで `DATE`／`TIMESTAMP` を区別するのは、同じ暦日を表す
+`DATE '2024-01-01'` と `TIMESTAMP '2024-01-01 00:00:00'` を型バイトなしで
+連結すると異なる型の 2 リテラルが同じハッシュになってしまうため
+（RECOVER-10 の要件: 内容が異なる DML は異なるハッシュを持つ）。
+
 入力サイズの有界性は既存の上限（`MAX_CALL_ARGS`・`MAX_EXPR_NODES`。
 `sql::udf_call::MAX_CASE_BRANCHES`・`MAX_CASE_NESTING` を新設）の範囲内に
 収まり、本節が追加する新たな上限はない。

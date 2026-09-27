@@ -378,10 +378,6 @@ fn materialize_rows(
             // Issue #919・SQL-26: `sql::scan::execute_scan_with_budget` と同じ
             // 契約（`decode_tier_for_window` が `TextColumnRef` を `scalar_mask`
             // へ反映済みのため、`scanned` をそのまま `.as_text()` へ写せばよい）。
-            let text_columns: Vec<Option<&str>> = scanned
-                .iter()
-                .map(|v| v.and_then(|s| s.as_text()))
-                .collect();
 
             if !declarative_filter::matches_all(bound.metadata_filters(), &scanned) {
                 continue;
@@ -403,7 +399,7 @@ fn materialize_rows(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
+                match program.eval(id, embedding, &scanned, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     // Issue #919・SQL-26（AC2）: NULL（UNKNOWN）は `WHERE` では
                     // 偽と同義に扱う（`sql::scan` と同じ三値論理契約）。

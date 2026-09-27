@@ -2,8 +2,9 @@
 
 ## ステータス
 
-Accepted（数値関数群のみ）。日時スカラー関数群は本 Issue のスコープ外（下記
-「スコープ外・後続課題」参照）。
+Accepted（数値関数群のみ）。日時スカラー関数群は別 PR で実装済み
+（`docs/design/datetime-scalar-functions.md` 参照。下記「スコープ外・
+後続課題」は当時の記録として残す）。
 
 ## 背景
 
@@ -92,11 +93,13 @@ codex-review P1 是正）。`x * 10^n` を `f64` で計算すると、10 進小�
 日時スカラー関数群を実装する後続作業（下記「スコープ外・後続課題」参照）で
 spec と対にして判断する。
 
-## スコープ外・後続課題
+## スコープ外・後続課題（当時の記録。実装済みの部分は `docs/design/datetime-scalar-functions.md` を参照）
 
-`EXTRACT(field FROM src)`・`date_part('field', src)`・`date_trunc('unit', src)`・
-`DATE`/`TIMESTAMP` リテラルの式内利用・日付算術（`DATE ± Scalar`・
-`DATE - DATE`）は本 Issue のスコープ外とした。
+`date_part('field', src)`・`date_trunc('unit', src)`・`DATE`/`TIMESTAMP`
+リテラルの式内利用・日付算術（`DATE ± Scalar`・`DATE - DATE`）・
+`DATE`/`TIMESTAMP` 列の式内参照は別 PR（`docs/design/
+datetime-scalar-functions.md`）で実装済み。`EXTRACT(field FROM src)` 構文の
+みは同 ADR のスコープ外として残っている（`date_part` で代替可能）。
 
 理由: 上記は次の変更を要し、数値関数群（構文追加なし・`content_hash`/
 `check_constraint` 無変更）と比べてリスク・変更範囲が大きく異なる。
