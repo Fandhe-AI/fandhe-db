@@ -95,8 +95,7 @@ v9 を知らない旧バイナリは「未知のフォーマットバージョ�
 | 同一制約内の列重複 | ― | `42701` |
 | 1 制約あたりの列数上限を超過 | ― | `54000` |
 | テーブルが無い／ビュー・索引名を指定 | `TableNotFound` | `42P01`／`42809` |
-| 列が無い | `ColumnNotFound`（既存） | `42703` |
-| 型が一意キーに使えない／同一列リストの制約が既にある | `Invalid` | `42601` |
+| 列が無い／型が一意キーに使えない／同一列リストの制約が既にある | `Invalid`（`validate_schema` 経由。既存 Issue #905 由来のロジックを継続） | `42601` |
 | **制約名の衝突**（UNIQUE または CHECK と同名） | `ConstraintAlreadyExists` | `42P07`（索引名衝突と同じ既存行を流用） |
 | テーブルあたり制約数の上限（`MAX_UNIQUE_CONSTRAINTS` = 32）を超過 | `ConstraintLimitExceeded` | `54000` |
 | 既存行に重複あり | `UniqueConstraintViolation`（既存） | `23505` |
@@ -152,11 +151,12 @@ AddConstraint`）で知る設計とする。
 ### D7. 判定順（決定的・fail-closed。データに依存するのは最後の `23505` だけ）
 
 **ADD**: 構文検証 → `require_ddl_permission`（`42501`）→ テーブル存在確認
-（`42P01`／`42809`）→ write txn 内で: スキーマ再取得 → 列存在（`42703`）→
-制約名の衝突（`42P07`）→ 件数上限（`54000`）→ 名前確定後のスキーマで
-`validate_schema`（`42601`）→ `constraint::table_has_duplicate_unique_key` で
-全行走査（`23505`。重複時は commit せず破棄・副作用ゼロ）→ `encode_schema` →
-カタログへ挿入 → 世代 bump → commit。
+（`42P01`／`42809`）→ write txn 内で: スキーマ再取得 → 制約名の衝突
+（`42P07`）→ 件数上限（`54000`）→ 名前確定後のスキーマで `validate_schema`
+（列が無い／型不適格／重複を含めすべて `42601`）→
+`constraint::table_has_duplicate_unique_key` で全行走査（`23505`。重複時は
+commit せず破棄・副作用ゼロ）→ `encode_schema` → カタログへ挿入 → 世代 bump
+→ commit。
 
 **DROP**: 構文検証 → `42501` → 存在確認 → write txn 内で: 名前の検索
 （UNIQUE にあれば削除対象。CHECK にあれば `0A000`。どちらにも無ければ
