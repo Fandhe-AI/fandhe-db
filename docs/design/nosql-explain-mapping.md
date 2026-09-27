@@ -167,15 +167,26 @@
 Issue 本文の受け入れ条件からは対象外とした（`docs/design/
 benchmark-judgement-policy.md` の計測規約と同じ判断）。
 
-## spec 側への申し送り事項
+## spec 側への申し送り事項（Issue #948 で解消）
 
-NOSQL-10 は `search`／`scan`／`aggregate` を対象に挙げるが、対応する SQL-6
+NOSQL-10 は `search`／`scan`／`aggregate` を対象に挙げるが、当時の SQL-6
 の `EXPLAIN` は `USING PLAN` 付き検索 `SELECT` 専用（`scan`／`aggregate`／
-`vector` 形は `42601`）。本実装は SQL-6 と同一の拒否契約を写像した。集計・
-広域取得向け `EXPLAIN` を規範化するかは spec 側の判断に委ねる。
+`vector` 形は `42601`）だったため、本実装（Issue #765）は SQL-6 と同一の
+拒否契約を写像していた。その後 SQL 表層が Issue #922・SQL-27 で `USING
+PLAN` なし検索 `SELECT`・集計・広域取得への `EXPLAIN` を受理するよう拡大
+したため、NoSQL 表層の `vector` 指定 `search`・`scan`・`aggregate` への
+`explain: true` も Issue #948・NOSQL-16 (a) で同様に受理するよう拡大した
+（`crates/wire-server/docs/nosql-api.md` の `explain` 節・
+`crates/wire-server/tests/nosql16_explain_targets.rs` 参照）。
 
 ## 対象外（後続 Issue の担当）
 
 - `search`（`explain` なし）の実行結線（#764）
 - `insert` の `gate.rs` 結線・成功応答（別 Issue）
 - 3 クライアント統合テスト（TASK-183）・確定化判定（TASK-185）
+
+（NoSQL 表層の `group_by` 配列形・複数列受理〔NOSQL-16 (b)〕は Issue #949 で
+既に実装済み。`aggregate` の `explain: true`〔本 Issue #948〕は `execute` と
+同一の `bind`（`crates/wire-server/src/http/query/aggregate.rs`）を経由する
+ため複数列 `group_by` とも併用でき、後続 Issue の対象ではなくなったため
+本節から除いた）

@@ -20,8 +20,10 @@ pub const DATE_MIN_DAYS: i32 = -719_162;
 pub const DATE_MAX_DAYS: i32 = 2_932_896;
 
 /// 1 日あたりのマイクロ秒数。`TIMESTAMP` の内部表現（マイクロ秒精度）と
-/// `DATE`（日精度）の変換で共有する。
-const MICROS_PER_DAY: i64 = 86_400_000_000;
+/// `DATE`（日精度）の変換で共有する。`pub(crate)`: `sql::datetime_fn`
+/// （TASK-210・SQL-26。Issue #920）が `date_part`／`date_trunc` の
+/// マイクロ秒⇔日変換で同じ定数を使う。
+pub(crate) const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// `TIMESTAMP` の最小値（`0001-01-01 00:00:00.000000`）をマイクロ秒で表した値。
 pub const TIMESTAMP_MIN_MICROS: i64 = DATE_MIN_DAYS as i64 * MICROS_PER_DAY;
@@ -86,7 +88,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 /// 妥当）。1970-01-01 起点の日数を返す。`year`・`month`・`day` は呼び出し前に
 /// 暦上妥当な組であることを検証済みであることを前提とする（本関数自体は暦
 /// 妥当性を検証しない純粋な変換）。
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
@@ -98,7 +100,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 
 /// `days_from_civil` の逆変換。1970-01-01 起点の日数から (year, month, day) を
 /// 復元する（先発グレゴリオ暦。全整数域で妥当）。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]

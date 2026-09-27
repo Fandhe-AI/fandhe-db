@@ -378,25 +378,24 @@ fn malformed_identifier_shape_is_rejected_without_leaking_input() {
     assert!(!body_utf8(&resp).contains("do cs"), "{}", body_utf8(&resp));
 }
 
+/// Issue #948（NOSQL-16・SQL-27）で `aggregate` op への `explain: true` を
+/// 受理するよう拡大した（旧来は `42601` で拒否）。`explain: true` は
+/// `QUERY PLAN` 応答を返し、集計本体（`row_count`・行データ）を含まない
+/// （網羅的なカバレッジ・行一致は `nosql16_explain_targets.rs`・
+/// `nosql10_explain.rs` が持つ）。
 #[test]
-fn explain_true_rejects_with_42601_and_does_not_execute() {
-    // `explain: true` は SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索
-    // `SELECT` 専用」契約の写像として `42601` で拒否する
-    // （NOSQL-10・Issue #765。`scan.rs::ScanError::ExplainNotSupported` と
-    // 同型の判断）。
+fn explain_true_returns_query_plan_and_does_not_execute() {
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
     let body =
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"explain":true}"#;
     let resp = query_as_alice(addr, body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let text = body_utf8(&resp);
+    assert!(text.contains("\"explain\""), "{text}");
     // 実行していない（`row_count` が本文に一切現れない）ことを確認する。
-    assert!(
-        !body_utf8(&resp).contains("row_count"),
-        "{}",
-        body_utf8(&resp)
-    );
+    assert!(!text.contains("row_count"), "{text}");
 }
 
 #[test]

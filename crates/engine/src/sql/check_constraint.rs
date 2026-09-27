@@ -226,6 +226,13 @@ fn render_expr(expr: &Expr) -> String {
         Expr::NullIf(lhs, rhs) => {
             format!("NULLIF({}, {})", render_expr(lhs), render_expr(rhs))
         }
+        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
+        // Issue #920）。解析済みの内部表現から正規化済みテキストを再構成する
+        // （生文字列を保持しないため、区切り文字の表記揺れが往復で発生しない）。
+        Expr::DateLiteral(days) => format!("DATE '{}'", crate::datetime::format_date(*days)),
+        Expr::TimestampLiteral(micros) => {
+            format!("TIMESTAMP '{}'", crate::datetime::format_timestamp(*micros))
+        }
     }
 }
 
@@ -374,6 +381,9 @@ fn reject_forbidden_expr(expr: &Expr) -> Result<(), SqlSurfaceError> {
             reject_forbidden_expr(lhs)?;
             reject_forbidden_expr(rhs)
         }
+        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
+        // Issue #920）は定数のため許可する。
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
     }
 }
 
@@ -457,6 +467,7 @@ fn referenced_column_names(
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
+            Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();
@@ -775,10 +786,6 @@ impl CompiledChecks {
         let mut expr_scratch: Vec<StackValue> = Vec::new();
         // Issue #919・SQL-26: `column_mask` は `TEXT` 参照を反映済み
         // （`CompiledChecks::compile` 参照）。
-        let text_columns: Vec<Option<&str>> = scanned
-            .iter()
-            .map(|v| v.and_then(|s| s.as_text()))
-            .collect();
         for check in &self.checks {
             for conjunct in &check.conjuncts {
                 let satisfied_or_unknown = match conjunct {
@@ -798,7 +805,7 @@ impl CompiledChecks {
                         // 事前判定は `CASE` の選ばれない分岐に embedding 参照が
                         // あるだけの行まで誤って UNKNOWN 扱いにしていたため撤去
                         // し、評価時点の判定へ一本化した）。
-                        match program.eval(id, embedding, &text_columns, &mut expr_scratch) {
+                        match program.eval(id, embedding, &scanned, &mut expr_scratch) {
                             Ok(ExprValue::Bool(b)) => b,
                             // UNKNOWN（NULL）は充足扱いにする（Issue #919・
                             // SQL-26（AC2）と Issue #921・SQL-26 の共有契約。
@@ -861,6 +868,43 @@ mod tests {
         assert_eq!(checks[0].name, "docs_kind_check");
         assert_eq!(checks[0].columns, vec!["kind".to_string()]);
         assert_eq!(checks[0].predicate_sql, "kind = 'a'");
+    }
+
+    /// 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` 型付きリテラルを
+    /// 含む CHECK 述語が `render_expr` → 永続化 → 再パースの往復
+    /// （`parse(render(x)) == x`）で同じ判定を保つことを固定する（§2-8）。
+    /// `CREATE TABLE` の SQL DDL は `DATE`／`TIMESTAMP` 列型を受理しない
+    /// （TABLE-13・TASK-197 の列宣言は Rust API 経由に限る。別 Issue の対象）
+    /// ため、ここでは列参照を持たない定数のみの述語で往復を検証する。
+    #[test]
+    fn check_constraint_with_datetime_literals_round_trips() {
+        let v = parse_create_table(
+            "CREATE TABLE docs (kind TEXT CHECK (DATE '2020-01-01' <= DATE '2024-01-01'))",
+        );
+        let schema = schema_of(&v);
+        let checks = validate_and_build(&schema, &v.checks).expect("must validate");
+        assert_eq!(
+            checks[0].predicate_sql,
+            "DATE '2020-01-01' <= DATE '2024-01-01'"
+        );
+
+        let v2 = parse_create_table(&format!(
+            "CREATE TABLE docs (kind TEXT CHECK ({}))",
+            checks[0].predicate_sql
+        ));
+        let schema2 = schema_of(&v2);
+        let checks2 = validate_and_build(&schema2, &v2.checks).expect("must re-validate");
+        assert_eq!(checks[0].predicate_sql, checks2[0].predicate_sql);
+
+        let v3 = parse_create_table(
+            "CREATE TABLE docs (kind TEXT CHECK (TIMESTAMP '2020-01-01 12:00:00.5' > TIMESTAMP '2019-01-01 00:00:00'))",
+        );
+        let schema3 = schema_of(&v3);
+        let checks3 = validate_and_build(&schema3, &v3.checks).expect("must validate");
+        assert_eq!(
+            checks3[0].predicate_sql,
+            "TIMESTAMP '2020-01-01 12:00:00.5' > TIMESTAMP '2019-01-01 00:00:00'"
+        );
     }
 
     #[test]

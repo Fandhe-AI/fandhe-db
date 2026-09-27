@@ -27,9 +27,10 @@
 //! execute_bound_delete_in_session`（`where` 形）、
 //! `execute_bound_predicate_delete_in_session`（`filter` 形。Issue #1062）へ
 //! 束縛・実行する（Issue #876・TASK-186・NOSQL-6・NOSQL-12）。[`aggregate`] は
-//! `op: aggregate`（`group_by`／`having`／`explain: true` を除く）を
+//! `op: aggregate`（`group_by`／`having` を含む）を
 //! SQL テキストを経由せずに `engine::sql::parser::BoundAggregate` へ束縛・
-//! 実行する（Issue #768・TASK-177・NOSQL-4）。他 op の実行計画への写像は
+//! 実行する（Issue #768・TASK-177・NOSQL-4。`explain: true` は
+//! [`aggregate::explain`] が別途扱う。Issue #948）。他 op の実行計画への写像は
 //! 後続 Issue（#763・#771）がここへ追加する。[`response`] は
 //! `search`／`scan`／`aggregate` 成功時の `engine::sql::exec::QueryResult`
 //! → JSON 応答本文（`columns`／`rows`／`row_count`）への写像を担う
@@ -57,9 +58,14 @@
 //! `gate.rs` の `Op::Insert` アームへ結線する
 //! （Issue #771・#772・TASK-178・NOSQL-6・TABLE-12・RLS-9）。
 //! [`explain`] は `op: search`・`explain: true` を検索本体を実行せず
-//! `EngineCore::explain_bound_plan_in_session` へ写像し、SQL `EXPLAIN
-//! SELECT ... USING PLAN(...)` と同一内容の `{"explain":[...]}` 応答を返す
-//! （Issue #765・TASK-186・NOSQL-10。`vector` 指定・`plan` 未指定は `42601`）。
+//! `plan` 指定は `EngineCore::explain_bound_plan_in_session`
+//! （Issue #765・TASK-186・NOSQL-10）、`vector` 指定は `EngineCore::
+//! explain_bound_search_in_session`（Issue #948・NOSQL-16・SQL-27）へ写像し、
+//! SQL 表層の対応する `EXPLAIN` 文と同一内容の `{"explain":[...]}` 応答を
+//! 返す（`vector`・`plan` 両方欠落は `42601`）。`scan`・`aggregate` の
+//! `explain: true` も同じく Issue #948 で受理し、[`scan::handle_explain`]・
+//! [`aggregate::handle_explain`] が同様の写像を行う（`group_by`／`having`
+//! 付き `aggregate` も対象）。
 //! [`typed_json`] は `insert`／`update`／`filter` が共有する
 //! 「JSON 値 → `engine::sql::allowlist::InsertLiteral`」写像を集約し、
 //! `INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／`NUMERIC`／`BOOLEAN`／`DATE`／

@@ -1271,6 +1271,9 @@ fn collect_referenced_udfs(
             collect_referenced_udfs(lhs, udf_registry, out)?;
             collect_referenced_udfs(rhs, udf_registry, out)
         }
+        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
+        // Issue #920）は UDF 呼び出しを持たない葉。
+        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
     }
 }
 
@@ -1364,6 +1367,23 @@ fn push_dml_expr(
             b.push_u8(8);
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
+        }
+        // タグ 10（対象ビヘイビア: SQL-26。Issue #920。ADR §4.4 タグ表に追記）。
+        // `DATE`／`TIMESTAMP` を型バイト（0/1）で区別してから内部表現（LE）を
+        // 連結する。同じ暦日を表す `DATE '2024-01-01'` と
+        // `TIMESTAMP '2024-01-01 00:00:00'` を型バイトで区別しないと、日付だけが
+        // 異なる DML と衝突しないことは保証できても、型違いの 2 リテラルが
+        // 同じハッシュになってしまう（RECOVER-10 の要件: 内容が異なる DML は
+        // 異なるハッシュを持つ）。
+        Expr::DateLiteral(days) => {
+            b.push_u8(10);
+            b.push_u8(0);
+            b.push_raw(&days.to_le_bytes());
+        }
+        Expr::TimestampLiteral(micros) => {
+            b.push_u8(10);
+            b.push_u8(1);
+            b.push_raw(&micros.to_le_bytes());
         }
     }
     Ok(())

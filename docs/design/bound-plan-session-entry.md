@@ -294,3 +294,23 @@ SQL 経由の実行と束縛済み計画経由の実行が混在しても結果�
 
 再実測した wire 回帰の pass 件数（本 Issue 時点で無変更）: `wire_scan.rs`
 7 件・`wire_aggregate.rs` 7 件、いずれも pass。
+
+## 追記（Issue #948・NOSQL-16・SQL-27・TASK-186）: EXPLAIN 用エントリ 3 本
+
+上記の実行用エントリ（`execute_bound_search_in_session`・
+`execute_bound_scan_in_session`・`execute_bound_aggregate_in_session`）と
+同型・同一処理順序（(1) スキーマ取得、(2) `bind` で束縛、(3) 対象テーブル
+一致検証、(4) 実行）の EXPLAIN 版として `explain_bound_search_in_session`・
+`explain_bound_scan_in_session`・`explain_bound_aggregate_in_session` を
+追加した。相違点は手順 (4) が実行本体（`run_select_plan`／`run_scan_plan`／
+`run_aggregate_plan`）を呼ばず、SQL `EXPLAIN` アームと共有する私的ヘルパー
+（`search_explain_from_bound`・`scan_explain_result`・
+`aggregate_explain_from_bound`）だけを呼ぶ点のみ。`ctx`
+（`PolicyContext`）は execute 系との対称性のために残すが、EXPLAIN は行を
+読まないため本体では使わない（各エントリの doc コメント参照）。
+
+行の一致（SQL 経由・NoSQL 経由でビット同一）は、SQL `Statement::Explain`
+アームと新エントリの両方がこの私的ヘルパーを共有する構造によって保証される
+（第 2 の実装を作らない設計。テストでの後追い確認ではなく構造上の保証）。
+契約テストは `crates/engine/tests/core_explain_bound_entries.rs`
+（Refs #948）。

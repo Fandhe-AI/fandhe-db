@@ -40,6 +40,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
     self, apply_builtin, finite_scalar, id_as_finite_scalar, BinOp, BoundExpr, BuiltinFn,
@@ -85,10 +86,24 @@ pub(crate) enum ExprStep {
     ConstText(String),
     /// 行の `TEXT` 列参照を push する。スタック格納値は
     /// [`StackValue::TextColumnRef`]（マーカーのみ）で、実際の値は
-    /// `ExprProgram::eval` が当該ステップを消費する時点で `text_columns` 引数
+    /// `ExprProgram::eval` が当該ステップを消費する時点で `row_scalars` 引数
     /// から都度解決する（[`ExprStep::PushVector`] と同じ「借用は行ループの外の
     /// 引数から都度復元する」設計）。
     PushTextColumn(usize),
+    /// 定数畳み込み対象外の `DATE` 定数（対象ビヘイビア: SQL-26。Issue #920）。
+    /// `date_part`／`date_trunc`／`DateToTimestamp` を `is_foldable_builtin` の
+    /// 対象外にした設計判断（`udf_call::is_foldable_builtin` 参照）に合わせ、
+    /// `BoundExpr::Date` リテラル自体も常にこのステップへ平坦化するだけで
+    /// 畳み込みは行わない。
+    ConstDate(i32),
+    /// [`ExprStep::ConstDate`] の `TIMESTAMP` 版。
+    ConstTimestamp(i64),
+    /// 行の `DATE` 列参照を push する（[`ExprStep::PushTextColumn`] と同じ
+    /// 「借用は行ループの外の引数から都度復元する」設計。対象ビヘイビア:
+    /// SQL-26。Issue #920）。
+    PushDateColumn(usize),
+    /// [`ExprStep::PushDateColumn`] の `TIMESTAMP` 版。
+    PushTimestampColumn(usize),
     /// 組み込み関数呼び出し。arity 分（[`udf_call::builtin_signature`]）を
     /// スタックから pop し、[`apply_builtin`] へ渡す。
     Builtin(BuiltinFn),
@@ -129,6 +144,10 @@ impl PartialEq for ExprStep {
             (ExprStep::PushVector, ExprStep::PushVector) => true,
             (ExprStep::ConstText(a), ExprStep::ConstText(b)) => a == b,
             (ExprStep::PushTextColumn(a), ExprStep::PushTextColumn(b)) => a == b,
+            (ExprStep::ConstDate(a), ExprStep::ConstDate(b)) => a == b,
+            (ExprStep::ConstTimestamp(a), ExprStep::ConstTimestamp(b)) => a == b,
+            (ExprStep::PushDateColumn(a), ExprStep::PushDateColumn(b)) => a == b,
+            (ExprStep::PushTimestampColumn(a), ExprStep::PushTimestampColumn(b)) => a == b,
             (ExprStep::Builtin(a), ExprStep::Builtin(b)) => a == b,
             (ExprStep::Binary(a), ExprStep::Binary(b)) => a == b,
             // `Arc<dyn WasmUdfBackend>` は `dyn` 型のため構造的な `PartialEq` を
@@ -180,8 +199,17 @@ pub(crate) enum StackValue {
     Text(String),
     /// 現在評価中の行の `TEXT` 列参照を表すマーカー
     /// （[`ExprStep::PushTextColumn`] が push する）。実体は `ExprProgram::eval`
-    /// の `text_columns` 引数から都度解決する。
+    /// の `row_scalars` 引数から都度解決する。
     TextColumnRef(usize),
+    /// `DATE` 値（対象ビヘイビア: SQL-26。Issue #920）。
+    Date(i32),
+    /// `TIMESTAMP` 値（[`StackValue::Date`] 参照）。
+    Timestamp(i64),
+    /// 現在評価中の行の `DATE` 列参照を表すマーカー（[`StackValue::
+    /// TextColumnRef`] と同じ「実体は行スカラービューから都度解決する」設計）。
+    DateColumnRef(usize),
+    /// [`StackValue::DateColumnRef`] の `TIMESTAMP` 版。
+    TimestampColumnRef(usize),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -189,14 +217,14 @@ pub(crate) enum StackValue {
 /// 直前にのみ使う。変換結果を `'a` を超えて `Vec<StackValue>` へ書き戻すことは
 /// ない——書き戻しは必ず [`expr_value_to_stack`] を経由し、借用ではなく
 /// マーカー／所有データへ変換し直す）。
-/// [`StackValue`] を `'a`（`embedding`／`text_columns` と共有するライフタイム）の
+/// [`StackValue`] を `'a`（`embedding`／`row_scalars` と共有するライフタイム）の
 /// [`ExprValue`] へ変換する。`TextColumnRef` マーカーの解決はここで
-/// `text_columns` から行うため `Result` を返す（マスク外参照は
+/// `row_scalars` から行うため `Result` を返す（マスク外参照は
 /// `udf_call::eval_with_scalars` と同じ `Internal` に写像する。fail-closed）。
 fn stack_to_expr_value<'a>(
     v: StackValue,
     embedding: &'a [f32],
-    text_columns: &'a [Option<&'a str>],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match v {
         StackValue::Scalar(s) => Ok(ExprValue::Scalar(s)),
@@ -205,12 +233,42 @@ fn stack_to_expr_value<'a>(
         StackValue::VectorOwned(v) => Ok(ExprValue::Vector(Cow::Owned(v))),
         StackValue::Null => Ok(ExprValue::Null),
         StackValue::Text(s) => Ok(ExprValue::Text(Cow::Owned(s))),
-        StackValue::TextColumnRef(index) => match text_columns.get(index) {
+        StackValue::Date(d) => Ok(ExprValue::Date(d)),
+        StackValue::Timestamp(t) => Ok(ExprValue::Timestamp(t)),
+        StackValue::TextColumnRef(index) => match row_scalars.get(index) {
             None => Err(SqlSurfaceError::Internal {
                 detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
             }),
             Some(None) => Ok(ExprValue::Null),
-            Some(Some(s)) => Ok(ExprValue::Text(Cow::Borrowed(s))),
+            Some(Some(v)) => match v.as_text() {
+                Some(s) => Ok(ExprValue::Text(Cow::Borrowed(s))),
+                None => Err(SqlSurfaceError::Internal {
+                    detail: "TEXT column reference resolved to a non-TEXT row scalar value"
+                        .to_string(),
+                }),
+            },
+        },
+        StackValue::DateColumnRef(index) => match row_scalars.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "DATE column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Date(d))) => Ok(ExprValue::Date(*d)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "DATE column reference resolved to a non-DATE row scalar value".to_string(),
+            }),
+        },
+        StackValue::TimestampColumnRef(index) => match row_scalars.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TIMESTAMP column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(ScalarRef::Timestamp(t))) => Ok(ExprValue::Timestamp(*t)),
+            Some(Some(_)) => Err(SqlSurfaceError::Internal {
+                detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
+                    .to_string(),
+            }),
         },
     }
 }
@@ -237,6 +295,8 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         // 所有化して落とす（fail-safe。`unreachable!` にはしない——
         // `.claude/rules/coding-rust.md`「panic させない」）。
         ExprValue::Text(s) => StackValue::Text(s.into_owned()),
+        ExprValue::Date(d) => StackValue::Date(d),
+        ExprValue::Timestamp(t) => StackValue::Timestamp(t),
     }
 }
 
@@ -295,7 +355,11 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 // 無いため）。`unreachable!` ではなく畳み込み対象外（`None`）
                 // として fail-safe に扱う（`compile_node` は通常のステップ平坦化
                 // へフォールバックする）。
-                ExprValue::Vector(_) | ExprValue::Text(_) | ExprValue::Null => None,
+                ExprValue::Vector(_)
+                | ExprValue::Text(_)
+                | ExprValue::Date(_)
+                | ExprValue::Timestamp(_)
+                | ExprValue::Null => None,
             }
         }
         // Issue #919・SQL-26: 文字列は `try_fold_scalar` の対象外（`FoldedConst`
@@ -340,8 +404,16 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         // コンパイル（`compile_case`/`compile_coalesce`）だけで満たすため、
         // 定数畳み込みの対象を広げなくても既存の受け入れ条件（0 除算 defer）は
         // 成立する。
+        // 対象ビヘイビア: SQL-26（Issue #920）。`udf_call::is_foldable_builtin`
+        // が `DatePart`／`DateTrunc`／`DateToTimestamp` を対象外にした設計判断
+        // （`FoldedConst` が `Scalar`／`Bool` のみを表現できる型のため）に揃え、
+        // `Date`／`Timestamp` リテラル・列参照も畳み込み対象に含めない。
         BoundExpr::Text(_)
         | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::Date(_)
+        | BoundExpr::Timestamp(_)
+        | BoundExpr::DateColumnRef { .. }
+        | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::WasmCall { .. }
@@ -395,6 +467,26 @@ fn compile_node(
         }
         BoundExpr::TextColumnRef { index } => {
             steps.push(ExprStep::PushTextColumn(*index));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::Date(d) => {
+            steps.push(ExprStep::ConstDate(*d));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::Timestamp(t) => {
+            steps.push(ExprStep::ConstTimestamp(*t));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::DateColumnRef { index } => {
+            steps.push(ExprStep::PushDateColumn(*index));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::TimestampColumnRef { index } => {
+            steps.push(ExprStep::PushTimestampColumn(*index));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -565,7 +657,7 @@ impl ExprProgram {
     /// 使っており、行フックの呼び出し境界ごとに変わる `'a` を持つ呼び出し元では
     /// 行ループの外へ persist できず行ごとの新規確保が必要だった。詳細は
     /// [`ExprStep::PushVector`] のドキュメント参照）。
-    /// `text_columns` は [`udf_call::eval_with_scalars`] と同じ契約
+    /// `row_scalars` は [`udf_call::eval_with_scalars`] と同じ契約
     /// （`schema.columns` と同じ論理列インデックスの `TEXT` 値ビュー。`None` は
     /// 実 NULL）。`TextColumnRef` を含まない式（既存呼び出し元の大半）は
     /// 空スライスで呼べる。
@@ -582,7 +674,7 @@ impl ExprProgram {
         &self,
         id: u64,
         embedding: &'a [f32],
-        text_columns: &'a [Option<&'a str>],
+        row_scalars: &'a [Option<ScalarRef<'a>>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<ExprValue<'a>, SqlSurfaceError> {
         scratch.clear();
@@ -648,7 +740,7 @@ impl ExprProgram {
                     //
                     // codex-review（Cursor Bugbot）High 指摘対応: `TextColumnRef`
                     // は行の実値を持たない遅延マーカー（実際の NULL 性は
-                    // `text_columns` を引かないと分からない）。旧実装は
+                    // `row_scalars` を引かないと分からない）。旧実装は
                     // `StackValue::Null` かどうかだけを見ていたため、NULL な
                     // `TEXT` 列の `TextColumnRef` マーカーを「非 NULL」と
                     // 誤判定し、`COALESCE(text_col, 'default')` が後続の
@@ -656,22 +748,32 @@ impl ExprProgram {
                     // （最終的に `stack_to_expr_value` で NULL に解決されるため
                     // `'default'` ではなく NULL を返す）、NULL 伝播契約
                     // （Issue #919・SQL-26 AC2）に違反していた。マーカーを
-                    // pop せず `text_columns` で覗き見て実際の NULL 性を判定する
+                    // pop せず `row_scalars` で覗き見て実際の NULL 性を判定する
                     // （`stack_to_expr_value` と同じマスク外参照の fail-closed
                     // 判定〔`Internal`〕を共有し、値そのものは複製しない）。
+                    // 対象ビヘイビア: SQL-26（Issue #920）。`DateColumnRef`／
+                    // `TimestampColumnRef` も `TextColumnRef` と同じ遅延マーカー
+                    // であり、同じ理由で `row_scalars` を覗いて実際の NULL 性を
+                    // 判定する必要がある（取りこぼすと `COALESCE(date_col, DATE
+                    // '…')` が NULL 伝播契約に違反する）。
                     let is_null = match scratch.last() {
                         Some(StackValue::Null) => true,
-                        Some(StackValue::TextColumnRef(index)) => match text_columns.get(*index) {
-                            Some(Some(_)) => false,
-                            Some(None) => true,
-                            None => return Err(SqlSurfaceError::Internal {
-                                detail:
-                                    "TEXT column reference is outside the decoded row scalar view"
-                                        .to_string(),
-                            }),
-                        },
-                        // `Scalar`/`Bool`/`VectorRef`/`VectorOwned`/`Text`（既に
-                        // 所有済みの文字列）はいずれも実値を持つため非 NULL。
+                        Some(StackValue::TextColumnRef(index))
+                        | Some(StackValue::DateColumnRef(index))
+                        | Some(StackValue::TimestampColumnRef(index)) => {
+                            match row_scalars.get(*index) {
+                                Some(Some(_)) => false,
+                                Some(None) => true,
+                                None => return Err(SqlSurfaceError::Internal {
+                                    detail:
+                                        "column reference is outside the decoded row scalar view"
+                                            .to_string(),
+                                }),
+                            }
+                        }
+                        // `Scalar`/`Bool`/`VectorRef`/`VectorOwned`/`Text`/`Date`/
+                        // `Timestamp`（既に所有済みの値）はいずれも実値を持つため
+                        // 非 NULL。
                         Some(_) => false,
                         None => return Err(stack_underflow()),
                     };
@@ -685,8 +787,8 @@ impl ExprProgram {
                     let r = scratch.pop().ok_or_else(stack_underflow)?;
                     let l = scratch.pop().ok_or_else(stack_underflow)?;
                     let result = udf_call::eval_nullif(
-                        stack_to_expr_value(l, embedding, text_columns)?,
-                        stack_to_expr_value(r, embedding, text_columns)?,
+                        stack_to_expr_value(l, embedding, row_scalars)?,
+                        stack_to_expr_value(r, embedding, row_scalars)?,
                     )?;
                     scratch.push(expr_value_to_stack(result));
                     pc += 1;
@@ -704,6 +806,22 @@ impl ExprProgram {
                 }
                 ExprStep::PushTextColumn(index) => {
                     scratch.push(StackValue::TextColumnRef(*index));
+                    pc += 1;
+                }
+                ExprStep::ConstDate(d) => {
+                    scratch.push(StackValue::Date(*d));
+                    pc += 1;
+                }
+                ExprStep::ConstTimestamp(t) => {
+                    scratch.push(StackValue::Timestamp(*t));
+                    pc += 1;
+                }
+                ExprStep::PushDateColumn(index) => {
+                    scratch.push(StackValue::DateColumnRef(*index));
+                    pc += 1;
+                }
+                ExprStep::PushTimestampColumn(index) => {
+                    scratch.push(StackValue::TimestampColumnRef(*index));
                     pc += 1;
                 }
                 ExprStep::Builtin(f) => {
@@ -732,7 +850,7 @@ impl ExprProgram {
                     let mut arg_buf: [Option<ExprValue<'a>>; MAX_BUILTIN_ARITY] =
                         [None, None, None];
                     for (slot, value) in arg_buf.iter_mut().zip(scratch.drain(split_at..)) {
-                        *slot = Some(stack_to_expr_value(value, embedding, text_columns)?);
+                        *slot = Some(stack_to_expr_value(value, embedding, row_scalars)?);
                     }
                     let result = apply_builtin(*f, &mut arg_buf[..arity])?;
                     scratch.push(expr_value_to_stack(result));
@@ -743,8 +861,8 @@ impl ExprProgram {
                     let l = scratch.pop().ok_or_else(stack_underflow)?;
                     let result = udf_call::eval_binary(
                         *op,
-                        stack_to_expr_value(l, embedding, text_columns)?,
-                        stack_to_expr_value(r, embedding, text_columns)?,
+                        stack_to_expr_value(l, embedding, row_scalars)?,
+                        stack_to_expr_value(r, embedding, row_scalars)?,
                     )?;
                     scratch.push(expr_value_to_stack(result));
                     pc += 1;
@@ -768,7 +886,11 @@ impl ExprProgram {
                             | StackValue::Bool(_)
                             | StackValue::Null
                             | StackValue::Text(_)
-                            | StackValue::TextColumnRef(_) => return Err(type_mismatch()),
+                            | StackValue::TextColumnRef(_)
+                            | StackValue::Date(_)
+                            | StackValue::Timestamp(_)
+                            | StackValue::DateColumnRef(_)
+                            | StackValue::TimestampColumnRef(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_val {
                             StackValue::Scalar(s) => s,
@@ -777,7 +899,11 @@ impl ExprProgram {
                             | StackValue::VectorOwned(_)
                             | StackValue::Null
                             | StackValue::Text(_)
-                            | StackValue::TextColumnRef(_) => return Err(type_mismatch()),
+                            | StackValue::TextColumnRef(_)
+                            | StackValue::Date(_)
+                            | StackValue::Timestamp(_)
+                            | StackValue::DateColumnRef(_)
+                            | StackValue::TimestampColumnRef(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
                         // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
@@ -795,7 +921,7 @@ impl ExprProgram {
             }
         }
         let result = scratch.pop().ok_or_else(stack_underflow)?;
-        stack_to_expr_value(result, embedding, text_columns)
+        stack_to_expr_value(result, embedding, row_scalars)
     }
 }
 

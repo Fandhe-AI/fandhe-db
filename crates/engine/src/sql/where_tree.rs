@@ -197,16 +197,9 @@ impl BoundConjunction {
         if !declarative_filter::matches_all(&self.metadata_filters, scanned) {
             return Ok(false);
         }
-        // Issue #919・SQL-26: `visit_column_indices` が `TEXT` 参照を反映済みの
-        // マスクで呼び出し元がデコードした `scanned` を、そのまま `.as_text()` へ
-        // 写す。
-        let text_columns: Vec<Option<&str>> = scanned
-            .iter()
-            .map(|v| v.and_then(|s| s.as_text()))
-            .collect();
         for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
             if let Some(false) =
-                eval_expr_predicate(expr, program, id, embedding, &text_columns, scratch)?
+                eval_expr_predicate(expr, program, id, embedding, scanned, scratch)?
             {
                 return Ok(false);
             }
@@ -264,7 +257,7 @@ fn eval_expr_predicate(
     program: &ExprProgram,
     id: u64,
     embedding: &[f32],
-    text_columns: &[Option<&str>],
+    row_scalars: &[Option<ScalarRef<'_>>],
     scratch: &mut Vec<StackValue>,
 ) -> Result<Option<bool>, SqlSurfaceError> {
     let references_embedding = udf_call::references_embedding(expr);
@@ -274,7 +267,7 @@ fn eval_expr_predicate(
     // による事前除外は `CASE` の選ばれない分岐に embedding 参照があるだけの
     // 葉まで誤って偽にしていたため撤去し、評価時点の判定へ一本化した）。
     let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
-    match program.eval(id, row_embedding, text_columns, scratch)? {
+    match program.eval(id, row_embedding, row_scalars, scratch)? {
         ExprValue::Bool(true) => Ok(None),
         // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。Issue #921・
         // Issue #919（AC2）。PostgreSQL の 3 値論理と同じ扱い）。
