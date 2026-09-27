@@ -6296,7 +6296,29 @@ impl EngineCore {
             &assignment_refs,
             validated.where_predicates(),
             session.udfs(),
+            &schema,
         )?;
+        // Issue #1061: VECTOR 列への SET 割当を含む場合のみ、正準化前
+        // （タグ 1・生テキスト）のレイアウトでもハッシュを計算し
+        // `legacy_hashes` として渡す。正準化前に記録された台帳エントリを
+        // 持つ再送を `22023`（内容不一致）へ誤判定しないための互換経路
+        // （新規記録には常に正準ハッシュ `content_hash_value` を使うため
+        // `23505`／`22023` の判定は弱まらない。`docs/design/
+        // nosql-update-delete-mapping.md`「述語形 VECTOR 割当の表現統一と
+        // 既存台帳エントリの互換性」参照）。
+        let legacy_hash;
+        let legacy_hashes: &[crate::recovery::content_hash::ContentHash] =
+            if crate::recovery::content_hash::needs_legacy_vector_hash(&assignment_refs, &schema) {
+                legacy_hash = crate::recovery::content_hash::for_update_where_legacy_text_vector(
+                    validated.table_name(),
+                    &assignment_refs,
+                    validated.where_predicates(),
+                    session.udfs(),
+                )?;
+                std::slice::from_ref(&legacy_hash)
+            } else {
+                &[]
+            };
         crate::sql::exec::execute_predicate_update(
             &self.storage,
             ctx,
@@ -6304,6 +6326,7 @@ impl EngineCore {
             self.ledger_mode,
             &schema,
             &content_hash_value,
+            legacy_hashes,
         )
     }
 

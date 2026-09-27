@@ -38,6 +38,16 @@
 //! write トランザクション内でハッシュ計算済みの値を渡す設計）。各操作種別の入力
 //! レイアウトは対応する `for_*` 関数のコメントを参照。
 //!
+//! Issue #1061: [`push_dml_assignments`] は述語形 `UPDATE` の `SET` 割当を
+//! ハッシュする際、対象列がスキーマ上 `VECTOR(dim)` かどうかを `TableSchema`
+//! から読む（`VECTOR` 列への `String` 割当をタグ 5・f32 LE 列へ正準化する
+//! ため）。これは「列型」への依存であり、先例は [`for_typed_insert`] の
+//! スキーマ列順依存（`ALTER TABLE ADD COLUMN` を挟んでも列名基準で解決する
+//! ため不変。PR #248）と同じ性質——列の**型**は `ALTER TABLE MODIFY COLUMN`
+//! でも `VECTOR` 列については変更できない（`ProtectedColumn` で拒否。
+//! `docs/design/alter-table-drop-modify-column.md` D3）ため、この依存も
+//! 「同一クライアント要求は常に同一ハッシュ」という不変条件を壊さない。
+//!
 //! `encode_row` を経由する操作種別（挿入・バッチ挿入・更新）は、呼び出し元が
 //! **1 回だけ** `encode_row` した結果（`&[u8]`）を受け取る `for_*_encoded` 系を
 //! production から呼ぶ（Issue #397。encoded バイト列は台帳ハッシュと redb 書き込みの
@@ -823,13 +833,65 @@ pub(crate) fn for_update_where(
     assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
+    // Issue #1061: `SET` 割当のうち `VECTOR` 列を対象とする `InsertLiteral::String`
+    // を正準表現（タグ 5・f32 LE 列）へ正規化するための列型参照。
+    // [`push_dml_assignments`] 参照。
+    schema: &crate::catalog::TableSchema,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
     let mut b = HashInputBuilder::new(OpTag::UpdateWhere);
     b.push_bytes(table.as_bytes())
         .map_err(|_| dml_hash_field_too_large())?;
-    push_dml_assignments(&mut b, assignments)?;
+    push_dml_assignments(&mut b, assignments, DmlVectorRepr::Canonical, schema)?;
     push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
     Ok(b.finish())
+}
+
+/// [`for_update_where`] の legacy 版（Issue #1061）。`legacy_hashes`
+/// （[`crate::recovery::ledger::record_in_txn_accepting`] 参照）専用で、
+/// 正規化前のレイアウト（`VECTOR` 列への `String` 割当もタグ 1・生テキストの
+/// まま連結する）を再現する。**新規記録には使わない**——呼び出し元
+/// （`core.rs::EngineCore::execute_predicate_update_form`）は
+/// [`needs_legacy_vector_hash`] が true の場合のみ本関数を呼び、結果を
+/// `legacy_hashes` へだけ渡す（保存対象の正準ハッシュは常に [`for_update_where`]）。
+pub(crate) fn for_update_where_legacy_text_vector(
+    table: &str,
+    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    let mut b = HashInputBuilder::new(OpTag::UpdateWhere);
+    b.push_bytes(table.as_bytes())
+        .map_err(|_| dml_hash_field_too_large())?;
+    // Legacy モードは列型を参照しないため、空スキーマ（列 0 件）を渡す
+    // （`push_dml_assignments` は `DmlVectorRepr::LegacyText` のとき
+    // `schema` を参照しない）。
+    let empty_schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+    push_dml_assignments(
+        &mut b,
+        assignments,
+        DmlVectorRepr::LegacyText,
+        &empty_schema,
+    )?;
+    push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
+    Ok(b.finish())
+}
+
+/// [`assignments`] に `VECTOR` 列を対象とする `InsertLiteral::String` 割当が
+/// 1 つ以上含まれるかを判定する（Issue #1061）。true の場合のみ、呼び出し元は
+/// [`for_update_where_legacy_text_vector`] を計算して `legacy_hashes` へ渡す
+/// 必要がある（該当割当が無ければ正準ハッシュと旧レイアウトのハッシュは
+/// 常に一致するため、legacy 側の計算・受理は不要）。
+pub(crate) fn needs_legacy_vector_hash(
+    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    schema: &crate::catalog::TableSchema,
+) -> bool {
+    assignments.iter().any(|(name, literal)| {
+        matches!(literal, crate::sql::allowlist::InsertLiteral::String(_))
+            && schema
+                .columns
+                .iter()
+                .any(|c| &c.name == name && matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+    })
 }
 
 /// 述語つき `DELETE ... WHERE`（SQL-19・TASK-192、Issue #871・対象ビヘイビア:
@@ -849,15 +911,44 @@ pub(crate) fn for_delete_where(
     Ok(b.finish())
 }
 
+/// [`push_dml_assignments`] における `VECTOR` 列 `String` 割当の表現モード
+/// （Issue #1061。SQL・NoSQL 跨ぎの DML 再送で `content_hash` が食い違う問題の
+/// 是正）。SQL 表層の述語形 `UPDATE ... SET <vector列> = '[...]'`（字句上は
+/// `InsertLiteral::String`）と、NoSQL 表層が JSON 配列から直接構築する
+/// `InsertLiteral::Vector` は、正規化前は別タグ（1 対 5）でハッシュされ、
+/// 同一ベクトル値でも表層を跨ぐ再送が内容不一致（`22023`）に誤判定されていた。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DmlVectorRepr {
+    /// 新規記録用。`VECTOR` 列を対象とする `String` 割当を
+    /// `sql::parser::parse_vector_literal` でパースし、タグ 5（f32 LE 列。
+    /// `InsertLiteral::Vector` と同一レイアウト）へ正規化する。
+    Canonical,
+    /// [`for_update_where_legacy_text_vector`] 専用（`legacy_hashes` 判定にのみ
+    /// 使う）。`VECTOR` 列への `String` もタグ 1・生テキストのまま連結する
+    /// 正規化前のレイアウトを再現する。
+    LegacyText,
+}
+
 /// `SET` 割当（宣言順）を連結する（ADR §4.3 の 2 番）。件数プレフィクス（u32 LE）
 /// → 各要素につき `push_bytes(列名)`・リテラル種別タグ（`String`＝1・`Number`＝2）・
 /// `push_bytes(リテラル生文字列)`。列名は宣言どおりの大文字小文字のまま連結する
 /// （`bind_set_assignments` の厳密一致と揃える）。`push_named_scalar_columns`
 /// （`Value::Null` を除外する実装）は再利用しない——将来 `SET col = NULL` が
 /// 追加されたときに黙って脱落させない前方ガード（ADR §4.3 参照）。
+///
+/// `repr == Canonical` かつ対象列がスキーマ上 `VECTOR(dim)` の場合、
+/// `InsertLiteral::String` は生テキストのままハッシュせず
+/// `sql::parser::parse_vector_literal` でパースしてからタグ 5（f32 LE 列）で
+/// 連結する（Issue #1061）。列の解決は [`bind_set_assignments`]
+/// （`sql/parser.rs`）と同じ厳密一致（`c.name == name`）。パース失敗は
+/// `Err` をそのまま返す（fail-closed。タグ 1 へフォールバックしない）。
+/// `VECTOR` 以外の列・`repr == LegacyText` のときは従来どおりタグ 1 ＋
+/// 生テキストで連結する（ビット同一）。
 fn push_dml_assignments(
     b: &mut HashInputBuilder,
     assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    repr: DmlVectorRepr,
+    schema: &crate::catalog::TableSchema,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     use crate::sql::allowlist::InsertLiteral;
 
@@ -868,9 +959,29 @@ fn push_dml_assignments(
             .map_err(|_| dml_hash_field_too_large())?;
         match literal {
             InsertLiteral::String(s) => {
-                b.push_u8(1);
-                b.push_bytes(s.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
+                let vector_dim = if repr == DmlVectorRepr::Canonical {
+                    schema.columns.iter().find_map(|c| {
+                        if &c.name == name {
+                            match c.ty {
+                                crate::catalog::ColumnType::Vector(dim) => Some(dim),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+                if let Some(dim) = vector_dim {
+                    let values = crate::sql::parser::parse_vector_literal(s, dim)?;
+                    b.push_u8(5);
+                    push_vector(b, &values).map_err(|_| dml_hash_field_too_large())?;
+                } else {
+                    b.push_u8(1);
+                    b.push_bytes(s.as_bytes())
+                        .map_err(|_| dml_hash_field_too_large())?;
+                }
             }
             InsertLiteral::Number(s) => {
                 b.push_u8(2);
@@ -894,12 +1005,13 @@ fn push_dml_assignments(
             // NoSQL 表層 `insert`／`update` op の `insert.rs`／`update.rs::
             // map_set_assignments` が JSON 配列から直接構築する variant）。
             // 述語つき `UPDATE ... WHERE`（本関数の呼び出し元）の `SET` は
-            // NoSQL 表層の `filter` 形からは到達しない（`update.rs` の
-            // `map_set_assignments` は `where`〔単一行 `id` 完全一致形〕
-            // 専用であり `bind_set_assignments` の Value ベースハッシュ
-            // （`for_update_columns`）を経由する。本関数へは SQL 表層の
-            // 字句規則からも `InsertLiteral::Vector` が構築されないため
-            // 実質未到達だが、`Null` と同じ前方ガードとしてタグ 5 を割り当てる。
+            // NoSQL 表層の `filter` 形からは現状到達しないが（`update.rs` の
+            // `map_set_assignments` は `where`〔単一行 `id` 完全一致形〕専用）、
+            // `filter` 結線（#871 系）後は同じタグ 5 で到達しうる。
+            // Issue #1061: 上の `InsertLiteral::String` 分岐が `VECTOR` 列を
+            // `Canonical` モードで同じタグ 5・[`push_vector`] レイアウトへ
+            // 正規化しているため、SQL 表層 `'[1,2,3]'` と NoSQL 表層
+            // `[1,2,3]` は表層を跨いでも同一 `content_hash` になる。
             InsertLiteral::Vector(values) => {
                 b.push_u8(5);
                 push_vector(b, values).map_err(|_| dml_hash_field_too_large())?;
@@ -2326,10 +2438,292 @@ mod tests {
         });
         let value = InsertLiteral::String("ja".to_string());
         let assignments: [(&str, &InsertLiteral); 1] = [("lang", &value)];
+        let schema = crate::catalog::TableSchema::new("t", Vec::new());
 
-        let err = for_update_where("t", &assignments, &[predicate], &registry)
+        let err = for_update_where("t", &assignments, &[predicate], &registry, &schema)
             .expect_err("WASM UDF calls must be rejected in predicate-form WHERE clauses");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    // --- Issue #1061: 述語形 UPDATE の VECTOR 割当 content_hash 表現統一 -----
+
+    /// `embedding VECTOR(3)`・`lang TEXT` を持つテストスキーマ（[`push_dml_assignments`]
+    /// の列型解決対象）。
+    fn vector_dml_test_schema() -> crate::catalog::TableSchema {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    /// (a) 表層跨ぎ一致の直接証明: SQL 表層由来の `InsertLiteral::String`
+    /// （`'[1,2,3]'`）と NoSQL 表層由来の `InsertLiteral::Vector`
+    /// （`[1.0,2.0,3.0]`）が、同じ `VECTOR` 列への割当として同一
+    /// `content_hash` になること（正準化の主目的）。
+    #[test]
+    fn for_update_where_vector_string_and_vector_literal_match_across_surfaces() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let schema = vector_dml_test_schema();
+        let registry = UdfRegistry::default();
+        let predicate =
+            where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
+
+        let sql_literal = InsertLiteral::String("[1,2,3]".to_string());
+        let sql_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &sql_literal)];
+        let sql_hash = for_update_where(
+            "t",
+            &sql_assignments,
+            std::slice::from_ref(&predicate),
+            &registry,
+            &schema,
+        )
+        .expect("SQL-form VECTOR string assignment must hash successfully");
+
+        let nosql_literal = InsertLiteral::Vector(vec![1.0, 2.0, 3.0]);
+        let nosql_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &nosql_literal)];
+        let nosql_hash =
+            for_update_where("t", &nosql_assignments, &[predicate], &registry, &schema)
+                .expect("NoSQL-form VECTOR literal assignment must hash successfully");
+
+        assert_eq!(
+            sql_hash, nosql_hash,
+            "SQL 表層の VECTOR 文字列リテラルと NoSQL 表層の Vector リテラルは \
+             同一値なら同一 content_hash になるべき（Issue #1061）"
+        );
+    }
+
+    /// (b) 表記ゆれ不変: `'[1,2,3]'`・`'[1.0, 2.0, 3.0]'`・`' [1,2,3] '` は
+    /// いずれも同一 `f32` 列にパースされるため同一ハッシュになる。
+    #[test]
+    fn for_update_where_vector_string_hash_is_unaffected_by_literal_spelling() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let schema = vector_dml_test_schema();
+        let registry = UdfRegistry::default();
+        let predicate =
+            where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
+
+        let hash_for = |literal: &str| -> ContentHash {
+            let value = InsertLiteral::String(literal.to_string());
+            let assignments: [(&str, &InsertLiteral); 1] = [("embedding", &value)];
+            for_update_where(
+                "t",
+                &assignments,
+                std::slice::from_ref(&predicate),
+                &registry,
+                &schema,
+            )
+            .expect("well-formed vector literal must hash successfully")
+        };
+
+        let base = hash_for("[1,2,3]");
+        assert_eq!(base, hash_for("[1.0, 2.0, 3.0]"));
+        assert_eq!(base, hash_for(" [1,2,3] "));
+    }
+
+    /// (c) D2 の `-0.0` 保持契約: `'[-0,1,2]'` は `Vector([-0.0,1.0,2.0])` と
+    /// 一致し、`'[0,1,2]'`（`+0.0`）とは不一致のまま（[`push_vector`] は
+    /// REAL／DOUBLE の `canonicalize_*` と異なり符号付きゼロを正規化しない）。
+    #[test]
+    fn for_update_where_vector_negative_zero_is_preserved_and_distinct_from_positive_zero() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let schema = vector_dml_test_schema();
+        let registry = UdfRegistry::default();
+        let predicate =
+            where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
+
+        let neg_zero_string = InsertLiteral::String("[-0,1,2]".to_string());
+        let neg_zero_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &neg_zero_string)];
+        let neg_zero_hash = for_update_where(
+            "t",
+            &neg_zero_assignments,
+            std::slice::from_ref(&predicate),
+            &registry,
+            &schema,
+        )
+        .expect("negative-zero vector literal must hash successfully");
+
+        let neg_zero_vector = InsertLiteral::Vector(vec![-0.0, 1.0, 2.0]);
+        let neg_zero_vector_assignments: [(&str, &InsertLiteral); 1] =
+            [("embedding", &neg_zero_vector)];
+        let neg_zero_vector_hash = for_update_where(
+            "t",
+            &neg_zero_vector_assignments,
+            std::slice::from_ref(&predicate),
+            &registry,
+            &schema,
+        )
+        .expect("negative-zero Vector literal must hash successfully");
+        assert_eq!(neg_zero_hash, neg_zero_vector_hash);
+
+        let pos_zero_string = InsertLiteral::String("[0,1,2]".to_string());
+        let pos_zero_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &pos_zero_string)];
+        let pos_zero_hash =
+            for_update_where("t", &pos_zero_assignments, &[predicate], &registry, &schema)
+                .expect("positive-zero vector literal must hash successfully");
+        assert_ne!(
+            neg_zero_hash, pos_zero_hash,
+            "-0.0 と +0.0 は別内容として区別され続けるべき（D2 契約）"
+        );
+    }
+
+    /// (d) 異なる値は不一致になる。
+    #[test]
+    fn for_update_where_vector_string_hash_differs_for_different_values() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let schema = vector_dml_test_schema();
+        let registry = UdfRegistry::default();
+        let predicate =
+            where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
+
+        let a = InsertLiteral::String("[1,2,3]".to_string());
+        let a_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &a)];
+        let a_hash = for_update_where(
+            "t",
+            &a_assignments,
+            std::slice::from_ref(&predicate),
+            &registry,
+            &schema,
+        )
+        .expect("well-formed vector literal must hash successfully");
+
+        let b = InsertLiteral::String("[1,2,4]".to_string());
+        let b_assignments: [(&str, &InsertLiteral); 1] = [("embedding", &b)];
+        let b_hash = for_update_where("t", &b_assignments, &[predicate], &registry, &schema)
+            .expect("well-formed vector literal must hash successfully");
+
+        assert_ne!(a_hash, b_hash);
+    }
+
+    /// (e) VECTOR 以外の割当（TEXT 列 `lang = 'en'` のみ）は、正準モードと
+    /// legacy モードでビット同一（[`push_dml_assignments`] は列型が `VECTOR`
+    /// でなければモードに関わらずタグ 1・生テキストのまま連結する）。
+    /// 加えて、モジュール内の [`HashInputBuilder`] で直接組み立てた期待値と
+    /// 一致することを固定し、VECTOR 以外の割当のレイアウトへドリフトが
+    /// 無いことを保証する。
+    #[test]
+    fn for_update_where_non_vector_assignment_hash_is_unaffected_by_normalization() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let schema = vector_dml_test_schema();
+        let registry = UdfRegistry::default();
+        let predicate =
+            where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
+
+        let value = InsertLiteral::String("en".to_string());
+        let assignments: [(&str, &InsertLiteral); 1] = [("lang", &value)];
+
+        let canonical_hash = for_update_where(
+            "t",
+            &assignments,
+            std::slice::from_ref(&predicate),
+            &registry,
+            &schema,
+        )
+        .expect("non-vector assignment must hash successfully");
+        let legacy_hash =
+            for_update_where_legacy_text_vector("t", &assignments, &[predicate], &registry)
+                .expect("legacy-mode non-vector assignment must hash successfully");
+        assert_eq!(
+            canonical_hash, legacy_hash,
+            "VECTOR 以外の割当は正準／legacy 両モードでビット同一のはず"
+        );
+
+        // タグ・レイアウトの直接固定（`push_dml_assignments` のドリフト検知）:
+        // ドメインタグ＋OpTag::UpdateWhere＋table("t")＋assignments件数(1)＋
+        // 列名("lang")＋タグ1＋テキスト("en")＋WHERE述語件数(0) を手動で組み立て、
+        // predicate 無しの `for_update_where` 出力と一致することを固定する。
+        let no_predicate_hash = for_update_where("t", &assignments, &[], &registry, &schema)
+            .expect("non-vector assignment without WHERE predicates must hash successfully");
+        let mut expected2 = HashInputBuilder::new(OpTag::UpdateWhere);
+        expected2.push_bytes(b"t").expect("short field");
+        expected2.push_raw(&1u32.to_le_bytes());
+        expected2.push_bytes(b"lang").expect("short field");
+        expected2.push_u8(1);
+        expected2.push_bytes(b"en").expect("short field");
+        expected2.push_raw(&0u32.to_le_bytes()); // WHERE 述語件数 0
+        assert_eq!(no_predicate_hash, expected2.finish());
+    }
+
+    /// (f) legacy モードは変更前レイアウト（`VECTOR` 列への `String` も
+    /// タグ 1・生テキストで連結する）を再現する。`push_dml_assignments` の
+    /// `DmlVectorRepr::LegacyText` 分岐は `vector_dim` を常に `None` にする
+    /// ため、[`HashInputBuilder`] で手動組み立てた「常にタグ 1」の期待値と
+    /// 一致することを固定する。
+    #[test]
+    fn for_update_where_legacy_text_vector_reproduces_pre_normalization_layout() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let registry = UdfRegistry::default();
+
+        let value = InsertLiteral::String("[1,2,3]".to_string());
+        let assignments: [(&str, &InsertLiteral); 1] = [("embedding", &value)];
+        let legacy_hash = for_update_where_legacy_text_vector("t", &assignments, &[], &registry)
+            .expect("legacy-mode vector-column string assignment must hash successfully");
+
+        let mut expected = HashInputBuilder::new(OpTag::UpdateWhere);
+        expected.push_bytes(b"t").expect("short field");
+        expected.push_raw(&1u32.to_le_bytes());
+        expected.push_bytes(b"embedding").expect("short field");
+        expected.push_u8(1);
+        expected.push_bytes(b"[1,2,3]").expect("short field");
+        expected.push_raw(&0u32.to_le_bytes());
+        assert_eq!(legacy_hash, expected.finish());
+    }
+
+    /// (g) VECTOR 列への不正な `String`（次元不一致）は `Err`（`22000`）に
+    /// なり、タグ 1 へフォールバックしない（fail-closed）。
+    #[test]
+    fn for_update_where_vector_string_dimension_mismatch_is_rejected_fail_closed() {
+        use crate::sql::allowlist::InsertLiteral;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let schema = vector_dml_test_schema();
+        let registry = UdfRegistry::default();
+        let predicate =
+            where_predicate_id_gt_zero(crate::sql::udf_call::Expr::Ident("id".to_string()));
+
+        let value = InsertLiteral::String("[1,2]".to_string());
+        let assignments: [(&str, &InsertLiteral); 1] = [("embedding", &value)];
+        let err = for_update_where("t", &assignments, &[predicate], &registry, &schema)
+            .expect_err("dimension-mismatched vector literal must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// (h) `needs_legacy_vector_hash` の真偽判定。
+    #[test]
+    fn needs_legacy_vector_hash_detects_vector_column_string_assignments_only() {
+        use crate::sql::allowlist::InsertLiteral;
+
+        let schema = vector_dml_test_schema();
+
+        let vector_string = InsertLiteral::String("[1,2,3]".to_string());
+        let with_vector_string: [(&str, &InsertLiteral); 1] = [("embedding", &vector_string)];
+        assert!(needs_legacy_vector_hash(&with_vector_string, &schema));
+
+        let vector_literal = InsertLiteral::Vector(vec![1.0, 2.0, 3.0]);
+        let with_vector_literal: [(&str, &InsertLiteral); 1] = [("embedding", &vector_literal)];
+        assert!(
+            !needs_legacy_vector_hash(&with_vector_literal, &schema),
+            "NoSQL 由来の Vector リテラルは正準・legacy 両方でタグ 5 のため不要"
+        );
+
+        let text_only = InsertLiteral::String("en".to_string());
+        let with_text_only: [(&str, &InsertLiteral); 1] = [("lang", &text_only)];
+        assert!(!needs_legacy_vector_hash(&with_text_only, &schema));
     }
 
     /// 宣言的 UDF を 2 段（`outer` が `inner` を呼ぶ）で登録したレジストリを
