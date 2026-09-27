@@ -116,6 +116,7 @@ pub mod auth_method_opt;
 pub mod bind_guard;
 pub(crate) mod copy;
 pub mod ddl_permission_opt;
+pub mod dml_limits_opt;
 pub mod durability_opt;
 pub mod error_response;
 pub mod extended_query;
