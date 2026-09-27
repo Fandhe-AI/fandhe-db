@@ -93,17 +93,19 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 ## 影響行数上限（実行結線への引き継ぎ）
 
 許可リスト・束縛層では対象行数を知り得ないため、契約の**器**のみを本 Issue で
-用意する:
+用意した（**Issue #997 で以下の別系統は削除し、`UPDATE` 側と共有する唯一の
+上限 API へ統合済み**。詳細・既定値の確定は
+`docs/design/predicate-dml-exec.md` §6 参照）:
 
-- `sql::parser::DEFAULT_MAX_DML_AFFECTED_ROWS`（`1_000`。本リポの実装既定値。
-  spec 由来の数値ではない。`INSERT` の `MAX_INSERT_ROWS_PER_STATEMENT`
-  ―`allowlist.rs`・private・`1_000`―と同じ桁に揃える）
-- `sql::parser::check_affected_row_count(count, limit)`（超過は
-  `SqlSurfaceError::PayloadTooLarge`・`54000`）
-- `BoundPredicateDelete::max_affected_rows()`（既定値を運搬するのみ）
+- ~~`sql::parser::DEFAULT_MAX_DML_AFFECTED_ROWS`~~（削除。`1_000` という値自体は
+  `sql::parser::MAX_DML_AFFECTED_ROWS` に引き継がれている）
+- ~~`sql::parser::check_affected_row_count(count, limit)`~~（削除。
+  `sql::parser::check_dml_affected_rows(count)` に統合）
+- ~~`BoundPredicateDelete::max_affected_rows()`~~（削除。実行結線が
+  `MAX_DML_AFFECTED_ROWS` を直接参照するため運搬値を廃止）
 
 実際の判定（候補行を数え終えた直後・書き込み開始前・副作用ゼロの時点で
-`check_affected_row_count` を呼ぶこと）は Issue #871 の担当。
+`check_dml_affected_rows` を呼ぶこと）は Issue #871 の担当。
 
 ## RECOVER-11: 内容照合の正規化情報源
 

@@ -230,10 +230,16 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - 未知テーブル → `42P01`
 - 未知列・`VECTOR` 列でない列への `ORDER BY` 相当・非有限ベクトル要素等 → `22000`
 
+`sort`（`scan` op のみが持つ、スカラー列の決定的な並べ替え指定。後述）は
+本スキーマに宣言していないため、指定すると未知キー `42601` になる（ベクトル
+順位付けとの相互排他。NOSQL-15・SQL-25 (a)・Issue #946）。
+
 ### `scan`
 
 順序保証なしの広域取得（SQL-15 の bare 形 `SELECT ... [WHERE ...] LIMIT n` と
-同一実行意味論。`limit` 件到達で早期終了・取得モード非適用）。
+同一実行意味論。`limit` 件到達で早期終了・取得モード非適用）。`sort` を指定
+すると SQL 表層のスカラー `ORDER BY`（SQL-25 (a)）と同一の決定的な順序になる
+（Issue #946・NOSQL-15・TASK-224）。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
@@ -243,6 +249,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `filter` | △ | object[] | |
 | `columns` | △ | string[]（非空） | 省略時は `id`＋全実列 |
 | `explain` | △ | bool | `true` は `42601`（拒否。後述）。`false`／省略時は通常実行 |
+| `sort` | △ | object[]（`{"column","dir"}`。非空、上限 8 要素） | `dir` は `"asc"`／`"desc"`（小文字完全一致）。省略時は順序保証なし |
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
@@ -255,12 +262,29 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
  "filter": [{"column": "lang", "op": "eq", "value": "ja"}]}
 ```
 
+要求例（`sort` 指定）:
+
+```json
+{"op": "scan", "table": "docs", "limit": 10, "columns": ["id", "lang"],
+ "sort": [{"column": "lang", "dir": "desc"}, {"column": "id", "dir": "asc"}]}
+```
+
 応答には `score` 列相当が一切含まれない（`ORDER BY`／`hybrid` を経由しないため
-合成スコア列が構造上存在しない）。
+合成スコア列が構造上存在しない。`sort` 指定〔スカラー `ORDER BY`〕でも同様）。
 
 `explain: true` は NOSQL-16（Issue #948）で対応するまで `42601`（SQL 表層は
 Issue #922・SQL-27 で `scan` 相当の広域取得への `EXPLAIN` 前置を受理済みだが、
-NoSQL 表層の束縛済み計画向けエントリはまだこれを結線していない）。
+NoSQL 表層の束縛済み計画向けエントリはまだこれを結線していない）。`sort` と
+`explain: true` の併用も同じ理由で `42601`。
+
+`sort` の主な `wire_code`:
+
+- `sort` が空配列・非オブジェクト要素・`column`／`dir` 欠落・`dir` が
+  `"asc"`／`"desc"` 以外（大文字混じりを含む）・`column` の識別子形状不正
+  → `42601`
+- `sort[].column` が未知列、または `VECTOR`／`ARRAY`／`BYTEA`／`JSON`／
+  `JSONB` 列（並べ替え不能な型） → `22000`
+- `sort` の要素数が 8 を超える → `54000`（HTTP `413`）
 
 ### `aggregate`
 
@@ -307,6 +331,10 @@ NoSQL 表層の束縛済み計画向けエントリはまだこれを結線し�
   （`resolve_aggregate_input` の `AggregateInput::VectorColumnPresence`）。
   `sum`／`avg`／`min`／`max` は同じ `VECTOR` 列参照を一律 `22000` で拒否
 - `sum` オーバーフロー → `22003`
+
+`sort` は本スキーマに宣言していないため未知キー `42601` になる（Issue #946 の
+スコープ外。engine の集計 `ORDER BY` を SQL-25 (a) 相当へ揃える先行作業が
+必要。[spec 側への申し送り候補](#spec-側への申し送り候補)参照）。
 
 ### `insert`
 
@@ -626,6 +654,7 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 | `WHERE lang LIKE 'j%'` | `filter` 要素 `{"op":"prefix",...}` |
 | `EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10` | `search` + `plan` + `"explain":true` |
 | `SELECT id, lang FROM docs WHERE lang = 'ja' LIMIT 10`（広域取得 SQL-15） | `scan` |
+| `SELECT id, lang FROM docs ORDER BY lang DESC LIMIT 10`（スカラー `ORDER BY`。SQL-25 (a)） | `scan` + `sort`（Issue #946・NOSQL-15） |
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
@@ -889,7 +918,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `nosql1_op_vocabulary.rs`・`nosql9_op_allowlist.rs`・`nosql8_schema_validation.rs`
 - `search`: `nosql2_search.rs`・`nosql2_search_binding.rs`・`nosql10_explain.rs`・
   `wire_using_plan.rs`・`wire_explain.rs`
-- `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`
+- `scan`: `nosql3_scan_mapping.rs`・`nosql3_scan_wire_parity.rs`・
+  `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
   `nosql4_5_aggregate_wire_parity.rs`
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
@@ -915,3 +945,8 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   （本リポの実装判断であり spec 側での明文化は未定）
 - 集計 `id` 列等の巨大整数（`u64`。2^53 超）を JSON number としてそのまま返す
   ことの是非（文字列化への変更は spec 側判断に委ねられている）
+- `aggregate` への `sort` は engine の集計 `ORDER BY` を SQL-25 (a) 相当へ揃える
+  先行作業が未着手のため対象外とした（Issue #946。現状は未知キー `42601` を
+  維持）
+- `sort[].dir` を必須・小文字完全一致（`"asc"`／`"desc"`）とした実装既定
+  （Issue #946。`filter[].op`・`having[].op` と同じ厳格な語彙判断を踏襲）

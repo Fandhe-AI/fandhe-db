@@ -1074,9 +1074,10 @@ pub struct ScalarOrderKey {
     pub descending: bool,
 }
 
-/// スカラー `ORDER BY` に指定できるキー数の上限（Issue #915 実装既定値。
-/// NOSQL-15〔#946・#947、対象外〕の同種上限と揃える）。超過は `54000`
-/// （[`SqlSurfaceError::payload_too_large`]）。
+/// スカラー `ORDER BY` に指定できるキー数の上限（Issue #915 実装既定値）。
+/// NoSQL `scan` の `sort` 配列要素数上限（NOSQL-15・Issue #946）にも同じ値を
+/// 採用する（`crate::sql::parser::BoundScan::with_order_by` が超過時に同一の
+/// `54000` へ写像する。二重の上限を持たない）。
 pub const MAX_SCALAR_ORDER_KEYS: usize = 8;
 
 /// WHERE 句の許可形状。名前を照合する述語呼び出し形は、許可された名前

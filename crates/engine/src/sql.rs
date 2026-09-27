@@ -133,8 +133,10 @@
 //! [`parser::bind_update_form`]（`WHERE` 述語表現は [`parser::bind_where_predicates`]
 //! を `SELECT`・集計 `SELECT`・広域取得 `SELECT` と共有し二重実装を作らない）。
 //! 1 文あたりの影響行数上限は [`parser::MAX_DML_AFFECTED_ROWS`]／
-//! [`parser::check_dml_affected_rows`] として用意し、実行結線（候補行の確定・
-//! 一括適用・原子性）は別 Issue（#871）の担当。
+//! [`parser::check_dml_affected_rows`] として用意し（`UPDATE`・`DELETE`
+//! 述語形共通の唯一の上限 API。以前 `DELETE` 側に存在した別系統は Issue #997 で
+//! 本 API へ統合済み）、実行結線（候補行の確定・一括適用・原子性）は
+//! `sql/exec.rs` の `execute_predicate_update`／`execute_predicate_delete` の担当。
 
 pub mod aggregate;
 pub mod allowlist;
