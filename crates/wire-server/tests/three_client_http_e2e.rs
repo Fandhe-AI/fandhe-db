@@ -102,8 +102,11 @@
 //! ## DML パリティ（Issue #877）
 //!
 //! 上記 2 シナリオ（読み取り専用）とは異なり、`UPDATE`／`DELETE`（SQL-17・
-//! SQL-18・SQL-19。単一行 `id` 完全一致形のみ。述語形 `filter` は NoSQL 側
-//! 未接続のため対象外）が SQL 表層と NoSQL 表層で同一の実行結果（影響行数・
+//! SQL-18・SQL-19。単一行 `id` 完全一致形のみ。述語形 `filter` は
+//! Issue #1062 で実行結線済みだが、複数プロセス・複数言語クライアントを
+//! 要する本ファイルへは拡張せず、層 A（`nosql12_update_delete.rs` の
+//! 述語形節）でパリティ・台帳照合・RLS-9 を固定する）が SQL 表層と NoSQL
+//! 表層で同一の実行結果（影響行数・
 //! エラー `wire_code`・操作後の状態）を返すことを `run_sql_nosql_dml_parity_scenario`
 //! で固定する（curl／urllib／fetch の 3 テストが共有）。エラー時の `message`
 //! はケースごとに束縛段階が表層間で異なりうるため比較対象に含めない
@@ -143,10 +146,12 @@
 //! 留まるため、この永続性は本ファイルが固有に検証する）。
 //!
 //! **スコープ外**: 述語つき `UPDATE ... WHERE`／`DELETE ... WHERE`
-//! （NoSQL `filter` は `0A000`／501 のまま未接続）・`RETURNING`・
-//! UPSERT・複数行 `INSERT` は NoSQL 表層が公開していないためパリティが
-//! 成立せず対象外。ヘッダを含む HTTP 応答全体のバイト同一性は層 A
-//! （`nosql12_update_delete.rs::strip_date` 比較）の担当で、本ファイルは
+//! （NoSQL `filter` は Issue #1062 で実行結線済みだが、本ファイル特有の
+//! 複数プロセス・複数言語クライアント e2e への拡張はスコープ外。パリティ・
+//! 台帳照合・RLS-9 は層 A `nosql12_update_delete.rs` の述語形節が担う）・
+//! `RETURNING`・UPSERT・複数行 `INSERT` は NoSQL 表層が公開していないため
+//! パリティが成立せず対象外。ヘッダを含む HTTP 応答全体のバイト同一性は
+//! 層 A（`nosql12_update_delete.rs::strip_date` 比較）の担当で、本ファイルは
 //! ステータス・本文までの一致に留める。
 
 #[path = "common/mod.rs"]

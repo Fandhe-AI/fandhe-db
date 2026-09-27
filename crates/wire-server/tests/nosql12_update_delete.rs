@@ -15,10 +15,10 @@
 //!   `bind_target_form` の境界を検証済み。本ファイルはルータ・HTTP
 //!   フレーミングを経由した **wire 越し** の観測に徹する。
 //! - `crates/wire-server/tests/nosql9_op_allowlist.rs`・
-//!   `nosql1_op_vocabulary.rs`: `filter`（述語形）が `0A000` のまま留まる
-//!   こと・`where` 形が実行結線済みで基本的な成功／`23502` 経路を固定済み。
-//!   本ファイルはそれらと重複せず、台帳照合（`23505`／`22023`）・
-//!   SQL↔NoSQL パリティ・RLS-9 秘匿に集中する。
+//!   `nosql1_op_vocabulary.rs`: `filter: []`（空配列）が `42601` になること・
+//!   `where` 形が実行結線済みで基本的な成功／`23502` 経路を固定済み。
+//!   本ファイルはそれらと重複せず、述語形（`filter` 非空。Issue #1062）の
+//!   台帳照合（`23505`／`22023`）・SQL↔NoSQL パリティ・RLS-9 秘匿に集中する。
 //! - `crates/engine/tests/sql_update_delete_session_public_api.rs`:
 //!   `EngineCore::execute_bound_update_in_session`／
 //!   `execute_bound_delete_in_session` が SQL 表層と同一の実行器・台帳
@@ -543,10 +543,10 @@ fn delete_zero_row_response_is_identical_for_foreign_tenant_and_missing_id() {
     assert_eq!(strip_date(&resp_missing), strip_date(&resp_foreign));
 }
 
-// --- H: filter（述語形）は 0A000 かつ副作用なし -----------------------------
+// --- H: filter: []（空配列）は 42601 かつ副作用なし --------------------------
 
 #[test]
-fn update_and_delete_filter_only_reject_with_0a000_and_no_side_effect() {
+fn update_and_delete_empty_filter_reject_with_42601_and_no_side_effect() {
     let (core, _guard) = new_core();
     let (both, _sql) = spawn_both(core.clone());
     query(&both, &insert_body(1, "ja", "n12-seed-h"));
@@ -557,11 +557,285 @@ fn update_and_delete_filter_only_reject_with_0a000_and_no_side_effect() {
     ];
     for body in bodies {
         let resp = query(&both, body);
-        assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
-        assert_eq!(http_common::wire_code_of(&resp), "0A000");
+        assert_eq!(resp.status, 400, "body={body:?} resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "42601");
     }
     let rows = read_back_langs(&core);
     assert_eq!(rows, vec![(1, Some("ja".to_string()))]);
+}
+
+// --- H2: filter（述語形。非空。Issue #1062）は SQL 表層の述語形 DML と
+//         同一の実行結果・台帳照合を共有する ---------------------------------
+
+fn predicate_update_body(lang_match: &str, new_lang: &str, op_id: &str) -> Vec<u8> {
+    format!(
+        r#"{{"op":"update","table":"docs","set":{{"lang":"{new_lang}"}},"filter":[{{"column":"lang","op":"eq","value":"{lang_match}"}}],"operation_id":"{op_id}"}}"#
+    )
+    .into_bytes()
+}
+
+fn predicate_delete_body(lang_match: &str, op_id: &str) -> Vec<u8> {
+    format!(
+        r#"{{"op":"delete","table":"docs","filter":[{{"column":"lang","op":"eq","value":"{lang_match}"}}],"operation_id":"{op_id}"}}"#
+    )
+    .into_bytes()
+}
+
+fn predicate_update_sql(lang_match: &str, new_lang: &str, op_id: &str) -> String {
+    format!(
+        "UPDATE docs SET lang = '{new_lang}' WHERE lang = '{lang_match}' USING OPERATION_ID '{op_id}'"
+    )
+}
+
+fn predicate_delete_sql(lang_match: &str, op_id: &str) -> String {
+    format!("DELETE FROM docs WHERE lang = '{lang_match}' USING OPERATION_ID '{op_id}'")
+}
+
+#[test]
+fn predicate_update_success_updates_matching_rows() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-seed-1"));
+    query(&both, &insert_body(2, "ja", "n12-pred-seed-2"));
+    query(&both, &insert_body(3, "en", "n12-pred-seed-3"));
+
+    let resp = query(
+        &both,
+        &predicate_update_body("ja", "fr", "n12-pred-update-1"),
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    assert!(body.contains(r#""updated":2"#), "{body}");
+
+    let mut rows = read_back_langs(&core);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some("fr".to_string())),
+            (2, Some("fr".to_string())),
+            (3, Some("en".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn predicate_delete_success_deletes_matching_rows() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-seed-4"));
+    query(&both, &insert_body(2, "ja", "n12-pred-seed-5"));
+    query(&both, &insert_body(3, "en", "n12-pred-seed-6"));
+
+    let resp = query(&both, &predicate_delete_body("ja", "n12-pred-delete-1"));
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
+    assert!(body.contains(r#""deleted":2"#), "{body}");
+
+    let rows = read_back_langs(&core);
+    assert_eq!(rows, vec![(3, Some("en".to_string()))]);
+}
+
+/// SQL 表層の述語形 `UPDATE ... WHERE lang = '<match>'` と NoSQL 表層の
+/// `filter:[{"column":"lang","op":"eq","value":"<match>"}]` は同一の
+/// `content_hash` を生成するため、同一 `operation_id` への跨表層再送は
+/// 内容一致（`23505`）として扱われる（RECOVER-10。第 2 の実行器を作らない
+/// ことの直接の検証）。
+#[test]
+fn cross_surface_predicate_update_resend_with_same_content_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-cross-seed-1"));
+
+    common::send_simple_query(
+        &mut sql,
+        &predicate_update_sql("ja", "en", "n12-pred-cross-1"),
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        &predicate_update_body("ja", "en", "n12-pred-cross-1"),
+    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// 述語形 `UPDATE` の `SET` に `VECTOR` 列を含む場合も、Issue #1061 の正準化
+/// （`InsertLiteral::String` を `VECTOR` 列向けにタグ 5・f32 LE 列へ正規化する
+/// 経路。`run_predicate_update` 内の `needs_legacy_vector_hash` 分岐）を
+/// NoSQL 経路が引き継ぐため、SQL 表層のベクトルリテラル文字列と NoSQL 表層の
+/// JSON 配列は同一 `content_hash` になる（`WHERE` 対象列は非 VECTOR 列
+/// `lang`。`filter` の `eq` は `VECTOR` 列を対象にできないが、`SET` 側は
+/// 対象にできる）。
+#[test]
+fn cross_surface_predicate_update_with_vector_set_resend_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-vec-seed"));
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET embedding = '[-0,0.5,0.6]' WHERE lang = 'ja' \
+         USING OPERATION_ID 'n12-pred-vec-1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"embedding":[-0.0,0.5,0.6]},"filter":[{"column":"lang","op":"eq","value":"ja"}],"operation_id":"n12-pred-vec-1"}"#,
+    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// `prefix`（`filter.rs::like_escape` 経由で `WherePredicate::Prefix` へ
+/// 写像される。A03 インジェクション境界）が SQL 表層の `LIKE 'j%'` と同一の
+/// `content_hash` を生成することを跨表層再送で固定する。
+#[test]
+fn cross_surface_predicate_delete_with_prefix_filter_resend_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-prefix-seed"));
+
+    common::send_simple_query(
+        &mut sql,
+        "DELETE FROM docs WHERE lang LIKE 'j%' USING OPERATION_ID 'n12-pred-prefix-1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "DELETE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        br#"{"op":"delete","table":"docs","filter":[{"column":"lang","op":"prefix","value":"j"}],"operation_id":"n12-pred-prefix-1"}"#,
+    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// 複数要素 `filter`（`AND` 結合。宣言順が `content_hash` の入力順になる）が
+/// SQL 表層の複数 `WHERE ... AND ...` 述語と同一の `content_hash` を生成する
+/// ことを跨表層再送で固定する。
+#[test]
+fn cross_surface_predicate_update_with_multiple_filter_elements_resend_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-multi-seed"));
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET lang = 'fr' WHERE lang = 'ja' AND lang LIKE 'j%' \
+         USING OPERATION_ID 'n12-pred-multi-1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"lang":"fr"},"filter":[{"column":"lang","op":"eq","value":"ja"},{"column":"lang","op":"prefix","value":"j"}],"operation_id":"n12-pred-multi-1"}"#,
+    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// 同一の 2 要素 `filter` でも宣言順が異なれば別ハッシュとして扱われ、
+/// 同一 `operation_id` は内容不一致（`22023`）になる（`content_hash` が
+/// 宣言順に依存することの直接固定。`sql_predicate_dml_exec.rs::
+/// predicate_delete_resend_with_reordered_predicates_is_content_mismatch`
+/// の NoSQL 版）。
+#[test]
+fn predicate_update_resend_with_reordered_filter_elements_is_content_mismatch() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-reorder-seed"));
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"lang":"fr"},"filter":[{"column":"lang","op":"eq","value":"ja"},{"column":"lang","op":"prefix","value":"j"}],"operation_id":"n12-pred-reorder-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"lang":"fr"},"filter":[{"column":"lang","op":"prefix","value":"j"},{"column":"lang","op":"eq","value":"ja"}],"operation_id":"n12-pred-reorder-1"}"#,
+    );
+    assert_eq!(resp.status, 400, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "22023");
+}
+
+/// 同一 `operation_id` でも内容（`SET` の新値）が異なれば `22023`（内容不一致）
+/// になる（RECOVER-10）。
+#[test]
+fn cross_surface_predicate_update_resend_with_different_content_is_content_mismatch() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-cross-seed-2"));
+
+    common::send_simple_query(
+        &mut sql,
+        &predicate_update_sql("ja", "en", "n12-pred-cross-2"),
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        &predicate_update_body("ja", "fr", "n12-pred-cross-2"),
+    );
+    assert_eq!(resp.status, 400, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "22023");
+}
+
+/// 述語形 `DELETE` も同じ台帳キー空間 `(tenant, table, operation_id)` を
+/// 共有し、SQL→NoSQL の同一内容再送は `23505` になる。
+#[test]
+fn cross_surface_predicate_delete_resend_with_same_content_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-pred-cross-seed-3"));
+
+    common::send_simple_query(&mut sql, &predicate_delete_sql("ja", "n12-pred-cross-3"));
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "DELETE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(&both, &predicate_delete_body("ja", "n12-pred-cross-3"));
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// RLS-9: tenant-b に述語一致行が「ある場合」と「ない場合」で、tenant-a の
+/// 述語形 `update` の応答（ステータス・本文）がバイト単位で一致する
+/// （他テナントの存在情報を漏らさない）。
+#[test]
+fn predicate_update_rls9_response_identity_regardless_of_foreign_tenant_match() {
+    let (core_missing, _guard_missing) = new_core();
+    let (both_missing, _sql_missing) = spawn_both(core_missing.clone());
+    query(&both_missing, &insert_body(1, "ja", "n12-pred-rls9-seed-1"));
+    let resp_missing = query(
+        &both_missing,
+        &predicate_update_body("ja", "en", "n12-pred-rls9-1"),
+    );
+    assert_eq!(resp_missing.status, 200, "resp={resp_missing:?}");
+
+    let (core_foreign, _guard_foreign) = new_core();
+    seed_foreign_tenant(&core_foreign);
+    let (both_foreign, _sql_foreign) = spawn_both(core_foreign.clone());
+    query(&both_foreign, &insert_body(1, "ja", "n12-pred-rls9-seed-1"));
+    let resp_foreign = query(
+        &both_foreign,
+        &predicate_update_body("ja", "en", "n12-pred-rls9-1"),
+    );
+    assert_eq!(resp_foreign.status, 200, "resp={resp_foreign:?}");
+
+    assert_eq!(strip_date(&resp_missing), strip_date(&resp_foreign));
 }
 
 // --- I: explain: true は未知キーとして 42601 --------------------------------
@@ -629,9 +903,11 @@ fn cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_treated_
 //     文字列（`sql::parser::parse_vector_literal`）と NoSQL 表層の JSON 配列
 //     （`JsonNumber::as_f32`）はいずれも `json::parse_f32_text` の単一丸めを
 //     経由し、束縛前から同一表現になる。本節はそのことを本番ルータ経由
-//     （wire 越し）で固定する（述語形〔`filter`〕はまだ `0A000` で未結線の
-//     ため対象外。述語形の表現統一自体は `recovery::content_hash` の単体
-//     テストで固定済み）。
+//     （wire 越し）で固定する。述語形（`filter`。`WHERE` 対象列は `lang` の
+//     ような非 VECTOR 列だが、`SET` 側に VECTOR 列を含めることは単一行形と
+//     同様に可能）の VECTOR SET 表層跨ぎは
+//     `cross_surface_predicate_update_with_vector_set_resend_is_duplicate`
+//     （#H2 節）で固定する。
 
 /// SQL 表層で書いた VECTOR 値を、NoSQL 表層から同一 `operation_id` で
 /// 再送すると `23505`（重複）になる。

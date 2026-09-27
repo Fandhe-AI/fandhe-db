@@ -12,18 +12,17 @@
 //! エラーコード・メッセージ）を確認する。
 //!
 //! 許可リストの `search`／`scan`／`aggregate`／`insert`／`update`（`where`
-//! 形）／`delete`（`where` 形）の 6 op はいずれも実行結線済み
-//! （TASK-186・NOSQL-2〜6・NOSQL-12・Issue #764・#766・#768・#772・#876）の
-//! ため、`engine` 接続済みでは暫定 `0A000`／501
-//! （[`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]）を返さず、
-//! 存在しないテーブルへの到達を示す `42P01`／404 で「認証 → op 許可リスト →
-//! スキーマ検証 → engine 呼び出し」が走ったことを確認する。一方
-//! `update`／`delete` の `filter`（述語形）指定は語彙・スキーマ検証を通過
-//! するが実行結線は Issue #871 の担当のため、`engine` 接続有無を問わず
-//! `0A000`／501 のままに留まる（本ファイルでは実行結線 6 op と分けて
-//! 確認する）。語彙外拒否は HTTP 501・`wire_code` `0A000`・`code`
-//! `FEATURE_NOT_SUPPORTED` で status だけでは区別できないため、必ず
-//! `error_message_of` で
+//! 形・`filter` 形の両方）／`delete`（同左）の 6 op はいずれも実行結線済み
+//! （TASK-186・NOSQL-2〜6・NOSQL-12・Issue #764・#766・#768・#772・#876・
+//! `filter`〔述語形〕は #1062）のため、`engine` 接続済みでは暫定
+//! `0A000`／501（[`wire_server::http::query::gate::PLACEHOLDER_MESSAGE`]）を
+//! 返さず、存在しないテーブルへの到達を示す `42P01`／404 で「認証 →
+//! op 許可リスト → スキーマ検証 → engine 呼び出し」が走ったことを確認する。
+//! 一方 `update`／`delete` の `filter: []`（空配列）は SQL 表層の `WHERE`
+//! 句省略とのパリティで `42601`（engine を一切呼ばない。Issue #1062）に
+//! 留まる（本ファイルでは実行結線 6 op と分けて確認する）。語彙外拒否は
+//! HTTP 501・`wire_code` `0A000`・`code` `FEATURE_NOT_SUPPORTED` で status
+//! だけでは区別できないため、必ず `error_message_of` で
 //! [`wire_server::http::query::gate::UNSUPPORTED_OP_MESSAGE`] を突き合わせる。
 //!
 //! 役割分担（Issue #774）: seed 済み 2 テナント fixture 上での 4 op **成功
@@ -131,16 +130,13 @@ fn six_allowlisted_ops_reach_the_engine_and_report_undefined_table() {
     }
 }
 
-// --- update／delete: `filter`（述語形）は実行器未接続のため 0A000 のまま ---
+// --- update／delete: `filter: []`（空配列）は engine を呼ばず 42601 ---
 
 #[test]
-fn update_and_delete_predicate_form_pass_allowlist_but_stay_at_placeholder() {
-    // `update`／`delete`（Issue #875・NOSQL-12）は `where`（単一行 `id`
-    // 指定形）は Issue #876 で実行結線済みだが、`filter`（述語形）は実行器
-    // 未接続（Issue #871 の担当）のため語彙・スキーマ検証を通過しても
-    // `42P01` には到達せず、`0A000`／501 のまま留まる
-    // （`super::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE`。
-    // `gate::PLACEHOLDER_MESSAGE` とは異なる固定文言）。
+fn update_and_delete_empty_filter_rejects_with_42601_without_reaching_engine() {
+    // `filter: []`（空配列）は SQL 表層の `WHERE` 句省略とのパリティで
+    // `42601`（Issue #1062）。engine を一切呼ばないため `42P01` には到達
+    // しない。
     let addr = spawn();
     let bodies: [&[u8]; 2] = [
         br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[]}"#,
@@ -148,12 +144,25 @@ fn update_and_delete_predicate_form_pass_allowlist_but_stay_at_placeholder() {
     ];
     for body in bodies {
         let resp = query(addr, body);
-        assert_eq!(resp.status, 501, "body={body:?} resp={resp:?}");
-        assert_eq!(http_common::wire_code_of(&resp), "0A000");
-        assert_eq!(
-            http_common::error_message_of(&resp),
-            wire_server::http::query::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE
-        );
+        assert_eq!(resp.status, 400, "body={body:?} resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "42601");
+    }
+}
+
+#[test]
+fn update_and_delete_non_empty_filter_reach_the_engine_and_report_undefined_table() {
+    // 述語形（`filter` 非空。TASK-186・NOSQL-12、Issue #1062 で実行結線済み）
+    // は語彙・スキーマ検証を通過した後 engine まで到達し、存在しないテーブル
+    // への要求は `where` 形と同じ `42P01`／404 になる。
+    let addr = spawn();
+    let bodies: [&[u8]; 2] = [
+        br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[{"column":"lang","op":"eq","value":"ja"}],"operation_id":"n9-pred-update-1"}"#,
+        br#"{"op":"delete","table":"docs","filter":[{"column":"lang","op":"eq","value":"ja"}],"operation_id":"n9-pred-delete-1"}"#,
+    ];
+    for body in bodies {
+        let resp = query(addr, body);
+        assert_eq!(resp.status, 404, "body={body:?} resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "42P01");
     }
 }
 
