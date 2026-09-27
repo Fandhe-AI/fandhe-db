@@ -907,14 +907,24 @@ const PARITY_CASES: &[ParityCase] = &[
         expected_rows_bob: &[&["1"], &["3"]],
         expected_rows_carol: &[&["1"], &["3"]],
     },
+    // レビュー指摘（PR #1135・Cursor Bugbot）: 旧値（`lang = 'en'`）は
+    // `seed_parity_db` 上で `id=2`（`lang=en`・`price=7.25`）にしか一致せず、
+    // `price >= 7` 単独の一致集合（id=2,3／bob のみ+id=12）へ完全に包含
+    // されていた。そのため「最後の分岐だけを残す」誤った OR 実装
+    // （左辺を無視する等）でも `price >= 7` 単独と同じ結果になり、オラクル
+    // に一致してしまい OR パリティを実質検証できていなかった。`lang = 'ja'`
+    // （`id=1`: `price=3.50 < 7` で `price` 条件を満たさない・全テナント
+    // 可視）へ変更し、`price >= 7` 単独では含まれない行を OR の左辺だけが
+    // 追加することで、両辺を実際に評価する OR 実装でなければ一致しない
+    // オラクルにした。
     ParityCase {
         label: "or-lang-or-price",
-        sql: "SELECT id FROM docs WHERE (lang = 'en' OR price >= '7.00') LIMIT 10",
-        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"or":[{"column":"lang","op":"eq","value":"en"},{"column":"price","op":"gte","value":7}]}]}"#,
+        sql: "SELECT id FROM docs WHERE (lang = 'ja' OR price >= '7.00') LIMIT 10",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"or":[{"column":"lang","op":"eq","value":"ja"},{"column":"price","op":"gte","value":7}]}]}"#,
         ordered: false,
-        expected_rows_alice: &[&["2"], &["3"]],
-        expected_rows_bob: &[&["2"], &["3"], &["12"]],
-        expected_rows_carol: &[&["2"], &["3"]],
+        expected_rows_alice: &[&["1"], &["2"], &["3"]],
+        expected_rows_bob: &[&["1"], &["2"], &["3"], &["12"]],
+        expected_rows_carol: &[&["1"], &["2"], &["3"]],
     },
     ParityCase {
         label: "sort-category-id",
@@ -3294,23 +3304,32 @@ fn op_name_from_json_body(json_body: &str) -> &str {
         .0
 }
 
-/// 全 [`Op`] 語彙が本ファイル（Issue #950）の層 B パリティケースのいずれかで
-/// 最低 1 回使われていることを機械的に固定する（`#[ignore]` を付けない・
-/// `make ci` で常時実行。`.claude/rules/coding-rust.md`「テストの skip・
-/// ignore・アサーション弱体化で CI を通さない」の精神を、層 B カバレッジの
-/// 陳腐化検知としても適用する）。
+/// 全 [`Op`] 語彙が本ファイル（Issue #950）の層 B **成功**パリティケースの
+/// いずれかで最低 1 回使われていることを機械的に固定する（`#[ignore]` を
+/// 付けない・`make ci` で常時実行。`.claude/rules/coding-rust.md`「テストの
+/// skip・ignore・アサーション弱体化で CI を通さない」の精神を、層 B
+/// カバレッジの陳腐化検知としても適用する）。
 ///
 /// レビュー指摘（Issue #950・PR #1135）: 旧実装は本ファイルのソーステキスト
 /// 全体（`include_str!`）に対して `"op":"<name>"` の文字列出現を
 /// `str::contains` で判定していた。この方式ではコメント・実行されない
 /// コード・別目的の箇所に同じリテラルが残っているだけで通ってしまい、
 /// 該当する層 B ケースが削除・無効化されても検知できない。本実装では
-/// ソース全文の grep をやめ、[`PARITY_CASES`]・[`REJECTION_CASES`]・
-/// [`DML_STEPS`]・[`BOB_STEP`]・[`PHASE7_WRITE_CASES`]——各シナリオ関数が
-/// 実際に反復・送信するケース定義の値そのもの——から
-/// [`op_name_from_json_body`] で `op` 値を収集し、その集合に対して
-/// `Op::ALL` の網羅を判定する。ケース定義の削除・改変は収集元の値ごと
-/// 消えるため、コメント等への残存では回避できない。
+/// ソース全文の grep をやめ、[`PARITY_CASES`]・[`DML_STEPS`]・[`BOB_STEP`]・
+/// [`PHASE7_WRITE_CASES`]——各シナリオ関数が実際に反復・送信する**成功系**
+/// ケース定義の値そのもの——から [`op_name_from_json_body`] で `op` 値を
+/// 収集し、その集合に対して `Op::ALL` の網羅を判定する。ケース定義の削除・
+/// 改変は収集元の値ごと消えるため、コメント等への残存では回避できない。
+///
+/// レビュー指摘（PR #1135・Codex P2）: [`REJECTION_CASES`] の `op` は
+/// この網羅集合へ加えない。拒否ケースは意図的に非成功応答（`wire_code`）
+/// のみを固定する層であり、SQL/NoSQL 両表層でのパリティ（成功応答・
+/// 影響行数・最終状態の一致）を検証していない。成功ケースと拒否ケースの
+/// `op` 集合を合算すると、将来 `Op::ALL` へ追加された新語彙が拒否ケースにしか
+/// 現れない場合でも本ガードが通過してしまい、パリティ未検証のまま
+/// 見かけ上の網羅を偽装しうる（fail-closed 原則に反する）。そのため
+/// 拒否ケースの `op` 収集はこのガードから独立させ、`Op::ALL` の成功パリティ
+/// 網羅判定には使わない。
 #[test]
 fn parity_matrix_covers_every_nosql_op() {
     use std::collections::BTreeSet;
@@ -3319,9 +3338,6 @@ fn parity_matrix_covers_every_nosql_op() {
     let mut exercised: BTreeSet<&str> = BTreeSet::new();
     for case in PARITY_CASES {
         exercised.insert(op_name_from_json_body(case.json_body));
-    }
-    for (_label, json_body, _expected_wire_code) in REJECTION_CASES {
-        exercised.insert(op_name_from_json_body(json_body));
     }
     for step in DML_STEPS {
         exercised.insert(op_name_from_json_body(step.json_body));
@@ -3335,9 +3351,10 @@ fn parity_matrix_covers_every_nosql_op() {
         let name = op.name();
         assert!(
             exercised.contains(name),
-            "Op::{name} is not exercised by any Issue #950 layer B parity case definition \
-             (PARITY_CASES/REJECTION_CASES/DML_STEPS/BOB_STEP/PHASE7_WRITE_CASES); add a \
-             three_client_http_e2e.rs case using it"
+            "Op::{name} is not exercised by any Issue #950 layer B success parity case \
+             definition (PARITY_CASES/DML_STEPS/BOB_STEP/PHASE7_WRITE_CASES); \
+             REJECTION_CASES alone does not count (rejection-only coverage does not verify \
+             SQL/NoSQL parity). Add a three_client_http_e2e.rs success case using it"
         );
     }
 }
