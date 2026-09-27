@@ -64,12 +64,13 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &["TEXT", "VECTOR", "INTEGER"
 /// 定数を共有しドリフトを防ぐ。
 use crate::catalog::MAX_PRIMARY_KEY_COLUMNS;
 
-/// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）が 1 文に持てる行数の上限。
-/// `sql/group_by.rs::MAX_GROUPS` と同じ「本リポ独自の実装既定値・無制限 `Vec`
-/// 確保を避ける」設計方針を踏襲する（security.md「不安全な設計｜無制限リソース
-/// 確保（DoS）」対応）。超過は行を `rows` へ追加する直前（書き込みトランザクション
-/// 開始のはるか手前・構造検証段階）に検出し、[`SqlSurfaceError::payload_too_large`]
-/// （`54000`）で fail-closed に拒否する（副作用ゼロ）。
+/// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）の行数上限として
+/// 過去（PR #1122 以前）に既定値だった値。Issue #997・オーナー判断の改訂
+/// （2026-09-27、汎用 RDB との整合）により既定は上限なし（`None`）へ変更した
+/// ため、非テストコードでは参照しない（実際の判定は [`Parser::max_insert_rows`]
+/// フィールド経由・既定 `None`）。テストで「旧既定値相当の境界値」を明示
+/// 指定する際の可読な定数としてのみ残す（`#[cfg(test)]`）。
+#[cfg(test)]
 const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 
 /// `<col> IN (...)`（SQL-24。ポインタ: `docs/spec/05-tasks.md` TASK-208、
@@ -2462,6 +2463,15 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// 複数行 `VALUES` が持てる行数の上限（[`Self::parse_insert`] が判定に使う）。
+    /// 既定値は `None`＝上限なし（Issue #997・オーナー判断の改訂
+    /// 〔2026-09-27、汎用 RDB との整合〕）。`Some(limit)` は `wire-server` の
+    /// `--max-insert-rows` で明示指定した値のみ。[`Self::with_max_insert_rows`]
+    /// で差し替える呼び出し元（`validate_insert_tokens_with_limit`）以外は
+    /// すべて既定値（`None`）のまま構文検証する（CLI 起動時設定値の到達点は
+    /// 単一の構文検証エントリポイントに限定し、他の `Parser::new` 呼び出しには
+    /// 影響を与えない）。
+    max_insert_rows: Option<std::num::NonZeroUsize>,
 }
 
 impl<'a> Parser<'a> {
@@ -2473,7 +2483,15 @@ impl<'a> Parser<'a> {
             subquery_ctx: None,
             case_nesting: 0,
             allow_null_literal: false,
+            max_insert_rows: None,
         }
+    }
+
+    /// 複数行 `VALUES` の行数上限を CLI 設定値へ差し替える（Issue #997）。
+    /// [`validate_insert_tokens_with_limit`] のみが呼ぶ。
+    fn with_max_insert_rows(mut self, limit: Option<std::num::NonZeroUsize>) -> Self {
+        self.max_insert_rows = limit;
+        self
     }
 
     /// サブクエリを許可する文脈で構築する（Issue #927・TASK-213）。`depth` は
@@ -4496,10 +4514,16 @@ impl<'a> Parser<'a> {
     /// `INSERT INTO <table> (<col>[, <col>]*)
     /// VALUES (<lit>[, <lit>]*)[, (<lit>[, <lit>]*)]*
     /// USING OPERATION_ID '<id>' [;]` を受理する（SQL-10・SQL-16、TASK-80・TASK-190）。
-    /// 複数行 `VALUES` は行の繰り返し（`, (...)`）として受理し、行数は
-    /// [`MAX_INSERT_ROWS_PER_STATEMENT`] を超えない（超過は `54000`）。各行の
-    /// リテラル数は列数と一致する必要がある（不一致は行ごとに検出して拒否）。
-    /// RETURNING・可視性ラベル指定は引き続き構造的に受理しない。
+    /// 複数行 `VALUES` は行の繰り返し（`, (...)`）として受理し、
+    /// [`Self::max_insert_rows`] が `Some(limit)`（`wire-server` の
+    /// `--max-insert-rows` で明示指定した値。Issue #997）の場合のみ行数が
+    /// `limit` を超えないか判定する（超過は `54000`）。既定（`None`。オーナー
+    /// 判断の改訂 2026-09-27・汎用 RDB との整合）では本関数はこの上限判定を
+    /// 行わない——資源上限は SQL 文長上限（`sql::lexer` の入力長上限）・
+    /// 一括投入上限（`crate::batch_limits::BatchLimits`）が別途担保する
+    /// （`docs/design/predicate-dml-exec.md` §6 参照）。各行のリテラル数は
+    /// 列数と一致する必要がある（不一致は行ごとに検出して拒否）。RETURNING・
+    /// 可視性ラベル指定は引き続き構造的に受理しない。
     fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
         self.expect_contextual_keyword("INSERT")?;
         self.expect_contextual_keyword("INTO")?;
@@ -4520,10 +4544,12 @@ impl<'a> Parser<'a> {
         let mut rows: Vec<Vec<InsertLiteral>> = vec![self.parse_insert_values_row(&columns)?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            if rows.len() >= MAX_INSERT_ROWS_PER_STATEMENT {
-                return Err(SqlSurfaceError::payload_too_large(format!(
-                    "INSERT statement exceeds the allowed row count ({MAX_INSERT_ROWS_PER_STATEMENT})"
-                )));
+            if let Some(max_insert_rows) = self.max_insert_rows {
+                if rows.len() >= max_insert_rows.get() {
+                    return Err(SqlSurfaceError::payload_too_large(format!(
+                        "INSERT statement exceeds the allowed row count ({max_insert_rows})"
+                    )));
+                }
             }
             rows.push(self.parse_insert_values_row(&columns)?);
         }
@@ -8076,24 +8102,42 @@ pub fn validate_insert(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
-    validate_insert_tokens(&tokens, lookup, mode)
+    // Issue #997・オーナー判断の改訂（2026-09-27、汎用 RDB との整合）: 既定は
+    // 上限なし（`None`）。`MAX_INSERT_ROWS_PER_STATEMENT`（旧既定値）は
+    // `wire-server` の `--max-insert-rows` で明示指定しない限りもう使わない。
+    validate_insert_with_limit(sql, lookup, mode, None)
 }
 
-/// [`validate_insert`] の本体（Issue #485・単文 INSERT 経路の上位段改善）。
-/// トークン列を受け取ることで、呼び出し元
-/// （`core.rs::execute_sql_in_session`）が既に先頭トークン判定のために
-/// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
-/// （TASK-83 条件7・Issue #314 で `execute_validated_in_session` が SELECT 側に
-/// 行った「二重パース排除」の INSERT 側対応）。`validate_insert`（`sql: &str`
-/// を受け取る公開 API）は内部でトークナイズしてから本関数へ委譲するため、
-/// 挙動・エラー契約・検証順序はいずれも分割前と不変。
-pub(crate) fn validate_insert_tokens(
+/// [`validate_insert`] の行数上限差し替え版（Issue #997。CLI 起動時設定値
+/// `EngineCore::dml_limits.max_insert_rows_per_statement` を到達させる唯一の
+/// 公開エントリポイント）。`validate_insert` は本関数へ `None`（上限なし・
+/// 既定）を渡すだけの薄い委譲であり、既存呼び出し元のシグネチャは不変
+/// （`validate_insert` の**挙動**は Issue #997 で変わる。BREAKING CHANGE:
+/// 従来 `MAX_INSERT_ROWS_PER_STATEMENT`〔1,000〕件超で `54000` を返して
+/// いた複数行 `VALUES` が、`--max-insert-rows` 未指定の構成では成功するように
+/// なる）。
+pub fn validate_insert_with_limit(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+    max_insert_rows: Option<std::num::NonZeroUsize>,
+) -> Result<ValidatedInsert, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_insert_tokens_with_limit(&tokens, lookup, mode, max_insert_rows)
+}
+
+/// [`validate_insert_tokens`] の行数上限差し替え版（Issue #997）。
+/// `core.rs::EngineCore` の 3 つの INSERT 実行エントリポイント
+/// （`execute_insert_sql`・`parse_tokens` の INSERT 分岐・`execute_insert_sql_batch`）は
+/// いずれも本関数（または [`validate_insert_with_limit`]）を経由し、
+/// `self.dml_limits.max_insert_rows_per_statement` を渡す。
+pub(crate) fn validate_insert_tokens_with_limit(
     tokens: &[lexer::Token],
     lookup: &impl TableLookup,
     mode: LedgerMode,
+    max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
     let shape = p.parse_insert()?;
     p.expect_end_of_statement()?;
 
@@ -11351,13 +11395,16 @@ mod tests {
     }
 
     #[test]
-    fn accepts_insert_at_max_row_count_boundary() {
-        // SQL-16・TASK-190: 実装既定値ちょうど（[`MAX_INSERT_ROWS_PER_STATEMENT`]）の
-        // 行数は受理される（境界値検証。`tests/insert_multi_row.rs` の結合テストは
-        // 定数値へ依存せず「明らかに超過する規模」を使う方針のため、境界値ちょうどの
-        // 検証は本ユニットテストが担う）。
+    fn validate_insert_default_has_no_row_count_cap() {
+        // Issue #997・オーナー判断の改訂（2026-09-27、汎用 RDB との整合）:
+        // `validate_insert`（`max_insert_rows` 未指定＝`None`）は既定で上限を
+        // 持たないため、旧既定値（`MAX_INSERT_ROWS_PER_STATEMENT`＝1,000）を
+        // 超える行数でも構造検証段では拒否されない（BREAKING CHANGE の外部
+        // 観測）。`tests/insert_multi_row.rs` の結合テストは定数値へ依存せず
+        // 「明らかに超過する規模」を使う方針のため、境界値ちょうどの検証は
+        // 本ユニットテストが担う。
         let lookup = catalog_with(&["documents"]);
-        let rows: Vec<String> = (0..MAX_INSERT_ROWS_PER_STATEMENT)
+        let rows: Vec<String> = (0..MAX_INSERT_ROWS_PER_STATEMENT + 1)
             .map(|i| format!("({i})"))
             .collect();
         let sql = format!(
@@ -11365,13 +11412,32 @@ mod tests {
             rows.join(", ")
         );
         let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered)
-            .expect("row count at the limit must be accepted");
+            .expect("no default row count cap must accept rows beyond the old default");
+        assert_eq!(stmt.rows.len(), MAX_INSERT_ROWS_PER_STATEMENT + 1);
+    }
+
+    #[test]
+    fn accepts_insert_at_configured_max_row_count_boundary() {
+        // SQL-16・TASK-190: `--max-insert-rows` で明示指定した上限ちょうどの
+        // 行数は受理される（境界値検証）。
+        let lookup = catalog_with(&["documents"]);
+        let limit = std::num::NonZeroUsize::new(MAX_INSERT_ROWS_PER_STATEMENT)
+            .expect("MAX_INSERT_ROWS_PER_STATEMENT is nonzero");
+        let rows: Vec<String> = (0..MAX_INSERT_ROWS_PER_STATEMENT)
+            .map(|i| format!("({i})"))
+            .collect();
+        let sql = format!(
+            "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-0001'",
+            rows.join(", ")
+        );
+        let stmt = validate_insert_with_limit(&sql, &lookup, LedgerMode::Ledgered, Some(limit))
+            .expect("row count at the configured limit must be accepted");
         assert_eq!(stmt.rows.len(), MAX_INSERT_ROWS_PER_STATEMENT);
     }
 
     #[test]
-    fn rejects_insert_exceeding_max_row_count_before_catalog_lookup() {
-        // SQL-16・TASK-190: [`MAX_INSERT_ROWS_PER_STATEMENT`] を 1 行超えると
+    fn rejects_insert_exceeding_configured_max_row_count_before_catalog_lookup() {
+        // SQL-16・TASK-190: `--max-insert-rows` で明示指定した上限を 1 行超えると
         // `54000` で拒否され、かつ判定は行を積む最中（構造検証段階）に完結する
         // ため `TableLookup::table_exists` へは一切到達しない（副作用ゼロの
         // 根拠。`explicit_null_operation_id_does_not_reach_catalog_lookup` と
@@ -11388,6 +11454,8 @@ mod tests {
         let lookup = FlaggingCatalog {
             called: std::cell::Cell::new(false),
         };
+        let limit = std::num::NonZeroUsize::new(MAX_INSERT_ROWS_PER_STATEMENT)
+            .expect("MAX_INSERT_ROWS_PER_STATEMENT is nonzero");
         let rows: Vec<String> = (0..MAX_INSERT_ROWS_PER_STATEMENT + 1)
             .map(|i| format!("({i})"))
             .collect();
@@ -11395,8 +11463,8 @@ mod tests {
             "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-0001'",
             rows.join(", ")
         );
-        let err =
-            validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect_err("must be rejected");
+        let err = validate_insert_with_limit(&sql, &lookup, LedgerMode::Ledgered, Some(limit))
+            .expect_err("must be rejected");
         assert_eq!(err.wire_code(), "54000");
         assert!(
             !lookup.called.get(),

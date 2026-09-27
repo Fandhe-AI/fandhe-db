@@ -108,6 +108,32 @@
 //! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
 //! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
+//! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
+//! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
+//! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
+//! を、プロセス全体に対して起動時に設定する opt-in 注入点（`--search-engine`／
+//! `--durability` と同型。セッション・テナント単位の設定は対象外）。**汎用
+//! RDB（PostgreSQL 等）の挙動に合わせ、未指定時は既定で上限なし**
+//! （`engine::sql::parser::DmlLimits::default`＝両フィールドとも `None`。
+//! BREAKING CHANGE: 旧実装既定値〔1,000〕を超える行数でも、本フラグを
+//! 指定しない限り成功する）。指定可能範囲は `1`〜`1,000,000`
+//! （`engine::sql::parser::MAX_DML_ROW_LIMIT`＝総走査行数上限と同値）。
+//! 範囲外・非数値・値欠落・2 回目以降の重複指定はいずれも fail-closed で
+//! 起動エラー。値の解決は `wire_server::dml_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_dml_limits` へ 1 回だけ注入する（`docs/design/
+//! predicate-dml-exec.md` §6 参照）。上限を指定しない場合でも、既存の
+//! SQL 文長上限・1 文あたり総走査行数上限（`MAX_SCANNED_ROWS`）は変更しない
+//! ため資源上限は引き続き機能する。複数行 `VALUES` は本上限に加えて独立した
+//! 別上限 `batch_limits.max_files_per_batch`（既定 64。Issue #860）も通るため、
+//! `--max-insert-rows` を明示指定した値・または未指定時の既定（上限なし）が
+//! 64 超であっても、環境変数 `VECTOR_DB_BATCH_MAX_FILES` を併せて引き上げない
+//! 限り複数行 `VALUES` は 64 行超で `54000` のまま（wire-server は
+//! `--max-insert-rows`／`--max-dml-affected-rows` 以外に `batch_limits` を
+//! 設定する CLI フラグを持たない。専用フラグの追加は Issue #997 のオーナー
+//! 承認範囲外）。`--max-insert-rows` を明示指定してこの上限を超える場合のみ
+//! 起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
+//! `wire_server::dml_limits_opt::insert_rows_cap_warning`）。
+//!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
 //! チェーン PEM）・`--tls-key`（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って
@@ -234,6 +260,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
+    let mut max_dml_affected_rows_raw: Option<String> = None;
+    let mut max_insert_rows_raw: Option<String> = None;
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
@@ -416,6 +444,47 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 durability_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #997: 起動後に変更できない構成値のため、他の閉じた
+                // 語彙フラグ（`--search-engine` 等）と同じ理由で 2 回目以降の
+                // 指定を fail-closed に拒否する（last-wins にしない）。
+                if max_dml_affected_rows_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_dml_affected_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::MAX_INSERT_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::MAX_INSERT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #997: `--max-dml-affected-rows` と同じ理由で 2 回目
+                // 以降の指定を fail-closed に拒否する（last-wins にしない）。
+                if max_insert_rows_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::MAX_INSERT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_insert_rows_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::ddl_permission_opt::FLAG => {
@@ -658,6 +727,22 @@ fn run_server(args: &[String]) -> ExitCode {
                 "wire-server: invalid {}: {e}",
                 wire_server::durability_opt::FLAG
             );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #997: `--search-engine`／`--durability` と同じく bind・ユーザー
+    // ストア読込より前に決着させる（fail-closed。受理不能な構成のまま
+    // listen へ進む経路を作らない）。未指定は `dml_limits_opt::resolve` が
+    // 既定値（`engine::sql::parser::DmlLimits::default`＝現行挙動の 1,000）を
+    // 返す。
+    let dml_limits = match wire_server::dml_limits_opt::resolve(
+        max_dml_affected_rows_raw.as_deref(),
+        max_insert_rows_raw.as_deref(),
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            eprintln!("wire-server: invalid DML row limit configuration: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1032,6 +1117,11 @@ fn run_server(args: &[String]) -> ExitCode {
     if let Some(query_planner) = query_planner {
         core = core.with_query_planner(query_planner);
     }
+    // Issue #997: 未指定でも常に呼ぶ（`dml_limits` は `dml_limits_opt::resolve`
+    // が既定値まで含めて解決済みのため、`embedder`／`query_planner` のような
+    // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
+    // 既存挙動とビット同一）。
+    core = core.with_dml_limits(dml_limits);
     let core = Arc::new(core);
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
@@ -1067,6 +1157,21 @@ fn run_server(args: &[String]) -> ExitCode {
             "wire-server: WARNING: --durability {} selected; commit success responses do not guarantee data survives a process crash or power loss until a later durable commit (see docs/design/ingest-write-path.md, RECOVER-5/RECOVER-6)",
             wire_server::durability_opt::token_for(durability)
         );
+    }
+
+    // Issue #997（codex-review P1 指摘・PR #1122）: `--max-insert-rows` を
+    // `batch_limits.max_files_per_batch`（既定 64。wire-server は本 CLI から
+    // `EngineCore::with_batch_limits` を呼ばないため常に既定値）超に設定した
+    // 場合、複数行 `VALUES` は引き続き `max_files_per_batch` 側で `54000` に
+    // なり CLI の引き上げが黙って無効化される。`--durability none` の
+    // `WARNING` 行と同じ「安全上の含意を見落とさせない」設計判断でログへ
+    // 出す（エラーにはしない。`dml_limits_opt::insert_rows_cap_warning`
+    // ドキュメント参照）。
+    if let Some(warning) = wire_server::dml_limits_opt::insert_rows_cap_warning(
+        &dml_limits,
+        &engine::batch_limits::BatchLimits::default(),
+    ) {
+        eprintln!("wire-server: WARNING: {warning}");
     }
 
     // Issue #735（HTTP-1）: `nosql` 選択時のみ、選ばれた表層を示す 1 行を
