@@ -503,6 +503,20 @@ impl<'a> ArrayRef<'a> {
     pub fn to_value(&self) -> Result<ArrayValue> {
         decode_array_elements(self.elem, self.bytes, self.count)
     }
+
+    /// 要素列本文（フレームヘッダを含まない。走査時点で構造・UTF-8・要素数上限を
+    /// 検証済み）への借用（`pub(crate)`。[`crate::constraint::push_canonical_component`]
+    /// が UNIQUE 制約の正準キー（Issue #1073）を組み立てる際に使う）。
+    ///
+    /// エンコーダ（[`write_array_value`]）は要素順を保持し、flags を
+    /// [`ARRAY_FLAGS_RESERVED`]（`0x00`）固定、TEXT 要素は長さ前置＋本文、
+    /// BOOL 要素は 1 バイトのいずれも代替表現を持たない決定的な形式でのみ
+    /// エンコードするため、`(elem, count, payload)` の組は値に対して単射になる
+    /// （呼び出し元がこの単射性に依存する契約。エンコーダの決定性を崩す変更は
+    /// 一意性判定の正しさに影響する）。
+    pub(crate) fn payload(&self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 /// BOOLEAN 値のバイト表現（presence タグに続く 1 バイト）。`0x00`/`0x01`
