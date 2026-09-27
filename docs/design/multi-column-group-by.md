@@ -59,8 +59,9 @@ fail-closed に倒す）。既存の `MAX_GROUPS`（10,000 グループ）・
 
 ## 対象外（後続課題）
 
-- NoSQL 表層で `group_by` の配列形（複数列）を受理すること（NOSQL-16 (b)。
-  別 Issue。`new_grouped_by_columns`／`check_group_by_column_count` を使えば
-  写像できる）
+- NoSQL 表層で `group_by` の配列形（複数列）を受理すること: **Issue #949 で
+  実装済み**（`new_grouped_by_columns`／`check_group_by_column_count` へ写像。
+  `group_by` の裸の文字列形〔単一文字列。配列でない形〕の受理は Issue #949
+  でも対象外のまま）
 - 複数列 `GROUP BY` での索引候補走査形（`resolve_candidates`）の利用（D3）
 - `TEXT` 以外の列（整数・日時等）をグループキーにすること
