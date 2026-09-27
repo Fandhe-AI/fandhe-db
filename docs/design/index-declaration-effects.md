@@ -125,9 +125,29 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
 
 ## 対象外（申し送り）
 
-- `EXPLAIN` への索引名露出（`scalar_plan:` 行は束縛時の静的判定のまま。平均値長
-  ゲートと同じく、宣言で除外された列も静的判定上は索引適格と表示されうる既知の
-  制約）
+- **`EXPLAIN` の `scalar_plan:` は「索引が実際に使われる」ことを意味しない**:
+  `scalar_plan:`（`sql::scalar_plan::classify_scalar_plan`）は `WHERE`
+  述語の**形**（列型・演算子の組み合わせ）だけを見る束縛時の静的判定であり、
+  カタログ・スキーマ・行データを一切参照しない（`ScalarShapeInput` に
+  storage/schema を渡さない設計。§2 系の `ann_plan:` が
+  `catalog::hnsw_targeted_in_txn` で実行時ゲートと揃えているのとは対照的）。
+  このため `scalar_plan:` が索引適格と表示されても、実行時に対象列が
+  索引化されていなければ `ScalarIndex::resolve_candidates`
+  （`sql/scalar_index.rs`）は該当述語で `CandidateResolution::FallbackNoIndex`
+  を返し、**クエリ全体が全走査（plain scan）へフォールバックする**
+  （索引化した候補だけ通して残りを事後フィルタする、ではない）。これは
+  宣言で除外された列に限らず、平均値長ゲート（Issue #632）・`2^53` ゲート
+  （Issue #893）でも既に起きている既知の制約であり、宣言（本 Issue）は
+  `scalar_plan:` が反映しない実行時ビルドゲートの 3 件目にすぎない
+  （RLS・可視性・結果の正しさには影響しない。fail-closed に全走査へ倒れる
+  だけで誤った結果を返さない）。
+  `scalar_plan:`／`access_path:` を実行時ビルドゲート（宣言・平均値長・
+  `2^53`）まで反映させる修正は、`ann_plan:` と同じ「実行時判定・`EXPLAIN`
+  表示の単一情報源化」パターンを `search_explain_from_bound`・
+  `aggregate_explain_from_bound`（現状 `self` を使わない静的関数）・
+  `run_explain_plan` の 3 経路すべてに広げる設計変更（SQL／NoSQL 表層の
+  bit 同一性テストの更新を伴う）になるため、宣言のみを対象にした部分修正は
+  行わず別 Issue の対象とする。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
