@@ -127,9 +127,18 @@ Issue #1065 で実装済み。詳細・設計判断は
 
 ## 対象外（申し送り）
 
-1. **`EXPLAIN` への索引名露出**: `scalar_plan:`／`ann_plan:` 行への索引名の追記は
-   [index-declaration-effects.md](index-declaration-effects.md) の構築対象反映に
-   依存するため対象外。宣言前後で `EXPLAIN` の出力は不変。
+1. **`EXPLAIN` への索引名露出**: `scalar_plan:`／`ann_plan:` 行への索引名（宣言名）
+   そのものの追記は対象外のまま（引き続き未実装）。ただし `ann_plan:` の**判定結果**
+   （HNSW／brute-force のいずれで実行されるか）は Issue #1065 で構築対象反映に組み込み
+   済みで、`catalog::hnsw_targeted_in_txn` を経由して宣言の有無を反映する
+   （[index-declaration-effects.md](index-declaration-effects.md) 参照）。そのため
+   HNSW 宣言（`CREATE INDEX ... USING hnsw`）の作成・削除は対象テーブル・他テーブルの
+   `ann_plan:` 表示を変え得る。一方 `scalar_plan:` は束縛時の静的判定のまま宣言の影響を
+   受けないため、宣言前後で `EXPLAIN` の出力が不変なのはスカラー宣言のみ（HNSW 宣言では
+   不変ではない）。HNSW 対象テーブルは近似（HNSW）と厳密（brute-force）が原理的に
+   一致しない Top-k を返し得る差異も伴う
+   （[index-declaration-effects.md](index-declaration-effects.md)「テナント境界・RLS
+   への影響」節参照）。
 2. **疎索引（BM25）の宣言**: Issue #908 本文は「ベクトル・スカラー・疎」の 3 種別を
    挙げるが、本実装は INDEX-7 のポインタに従いスカラー宣言と `USING hnsw` のみを
    受理し、`USING bm25` 等は `0A000` とする（疎索引は hybrid のたびに自動構築する
