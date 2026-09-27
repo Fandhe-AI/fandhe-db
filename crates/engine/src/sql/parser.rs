@@ -1207,6 +1207,135 @@ type BoundWherePredicates = (
     Vec<crate::sql::where_tree::BoundOrGroup>,
 );
 
+/// [`bind_where_predicates_recursive`] のループ本体が委譲する、宣言的フィルタへ
+/// 写像できる葉（`PredicateCall`／`Expression`／`Or` を除く全 variant）1 件分の
+/// 変換（SQL-24。ポインタ: `docs/spec/05-tasks.md` TASK-208、`docs/spec/
+/// 04-behavior/sql-surface.md` SQL-24）。戻り値は `(未束縛の DeclarativeFilter,
+/// Prepared Describe 用の ENUM/型付きリテラル検証スキップフラグ)`。
+///
+/// `WherePredicate::Not(inner)` は `inner` を同じ `equality_ordinal` カウンタで
+/// 再帰的に変換してから [`DeclarativeFilter::negate`] で包む——`NOT col = $n`
+/// でも `dummy_equality_flags` の序数がトークン出現順（`sql::params::
+/// where_equality_literal_is_param` と同じ数え方）のまま一致し続ける
+/// （構文段の不変条件により `Not` の内側は常に深さ 1）。
+fn declarative_leaf_to_filter(
+    predicate: &WherePredicate,
+    schema: &TableSchema,
+    equality_ordinal: &mut usize,
+    dummy_equality_flags: &[bool],
+) -> Result<(DeclarativeFilter, bool), SqlSurfaceError> {
+    match predicate {
+        WherePredicate::Equality { column, value } => {
+            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の `=` は
+            // 算術を持たない宣言的経路（レーン B。TABLE-13・TASK-199、
+            // Issue #891）へ振り分ける。列が未知の場合（後続の `bind_all`
+            // が「unknown column」で拒否する既存契約）はそのまま
+            // `DeclarativeFilter::equals` へ流し、挙動を変えない。
+            let is_typed_compare_column = schema
+                .columns
+                .iter()
+                .find(|c| &c.name == column)
+                .map(|c| is_typed_compare_column_type(&c.ty))
+                .unwrap_or(false);
+            let filter = if is_typed_compare_column {
+                DeclarativeFilter::compare(
+                    column.clone(),
+                    declarative_filter::CompareOp::Eq,
+                    value.clone(),
+                )
+            } else {
+                DeclarativeFilter::equals(column.clone(), value.clone())
+            };
+            let skip = dummy_equality_flags
+                .get(*equality_ordinal)
+                .copied()
+                .unwrap_or(false);
+            *equality_ordinal += 1;
+            Ok((filter, skip))
+        }
+        WherePredicate::Compare { column, op, value } => {
+            // `< > <= >=`（TABLE-13・TASK-199、Issue #891・レーン B）。
+            // `$n` はこの述語形の右辺に束縛できない（`sql::params` の
+            // パターン 4 は `Ident '=' $n` のみ）ため、常に「実値」として
+            // 扱う（Describe 専用のダミー値スキップは対象外）。
+            Ok((
+                DeclarativeFilter::compare(column.clone(), (*op).into(), value.clone()),
+                false,
+            ))
+        }
+        WherePredicate::Prefix { column, pattern } => {
+            // SQL-24／TASK-208、Issue #914: `WherePredicate::Prefix`
+            // （名前は互換性のため据え置き）は LIKE の生パターン全般を
+            // 保持する。意味論・振り分け（Equals／StartsWith／Like）は
+            // `declarative_filter::DeclarativeFilter::like`（内部で
+            // `parse_like_pattern` を呼ぶ）に委ねる。
+            // `LIKE` パターン右辺には `$n` を束縛できない（`sql::params`
+            // モジュールドキュメント。パターン 4 は `Ident '=' $n` のみ）ため
+            // 常に「実値」として扱う。
+            Ok((
+                DeclarativeFilter::like(column.clone(), pattern.clone()),
+                false,
+            ))
+        }
+        WherePredicate::BoolEquality { column, value } => {
+            // `$n` は常に `Token::StringLiteral` へ置換されるため
+            // `Ident '=' Ident("true"/"false")` の形にはならず、この述語の
+            // 右辺も `$n` に由来し得ない。
+            Ok((
+                DeclarativeFilter::bool_equals(column.clone(), *value),
+                false,
+            ))
+        }
+        WherePredicate::BoolColumn { column } => {
+            Ok((DeclarativeFilter::bool_equals(column.clone(), true), false))
+        }
+        // `<col> [NOT] IN (...)`（SQL-24）。要素の値には `$n` を束縛できない
+        // （構文段〔`sql::allowlist::Parser::parse_in_list_body`〕は文字列
+        // リテラルしか受理しない）ため常に「実値」として扱う。
+        WherePredicate::InList { column, values } => Ok((
+            DeclarativeFilter::in_list(column.clone(), values.clone()),
+            false,
+        )),
+        // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24）。
+        WherePredicate::Between { column, low, high } => Ok((
+            DeclarativeFilter::between(column.clone(), low.clone(), high.clone()),
+            false,
+        )),
+        // `<col> IS [NOT] NULL`（SQL-24）。
+        WherePredicate::IsNull { column, negated } => Ok((
+            if *negated {
+                DeclarativeFilter::is_not_null(column.clone())
+            } else {
+                DeclarativeFilter::is_null(column.clone())
+            },
+            false,
+        )),
+        WherePredicate::Not(inner) => {
+            let (filter, skip) =
+                declarative_leaf_to_filter(inner, schema, equality_ordinal, dummy_equality_flags)?;
+            Ok((filter.negate(), skip))
+        }
+        // 呼び出し元（[`bind_where_predicates_recursive`]）が `PredicateCall`／
+        // `Expression`／`Or`／`InSubquery`／`Exists` を専用の腕で先に処理する
+        // ため到達しない（構文段の不変条件: `Not` の内側にもこれらは来ない。
+        // `Or` は TASK-208・Issue #912、`InSubquery`／`Exists` は Issue #927・
+        // SQL-29 (a)・TASK-213 で追加した分岐で、いずれも宣言的フィルタへは
+        // 写像できないため呼び出し元が処理する。`NOT EXISTS (...)`／
+        // `NOT <col> IN (SELECT ...)` は構文段〔`sql::allowlist::Parser::
+        // parse_where_leaf`〕が `0A000` で拒否するため、`Not` の内側に
+        // `InSubquery`／`Exists` が来ることもない——Cursor Bugbot 指摘対応:
+        // 従来はここまで到達して `Internal` エラーになっていた）。
+        WherePredicate::PredicateCall { .. }
+        | WherePredicate::Expression(_)
+        | WherePredicate::Or(_)
+        | WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. } => Err(SqlSurfaceError::Internal {
+            detail: "declarative predicate binding reached a non-declarative WherePredicate"
+                .to_string(),
+        }),
+    }
+}
+
 pub(crate) fn bind_where_predicates(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1249,76 +1378,11 @@ fn bind_where_predicates_recursive(
     let mut or_filters = Vec::new();
     for predicate in where_predicates {
         match predicate {
-            WherePredicate::Equality { column, value } => {
-                // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の `=` は
-                // 算術を持たない宣言的経路（レーン B。TABLE-13・TASK-199、
-                // Issue #891）へ振り分ける。列が未知の場合（後続の `bind_all`
-                // が「unknown column」で拒否する既存契約）はそのまま
-                // `DeclarativeFilter::equals` へ流し、挙動を変えない。
-                let is_typed_compare_column = schema
-                    .columns
-                    .iter()
-                    .find(|c| &c.name == column)
-                    .map(|c| is_typed_compare_column_type(&c.ty))
-                    .unwrap_or(false);
-                if is_typed_compare_column {
-                    declarative_filters.push(DeclarativeFilter::compare(
-                        column.clone(),
-                        declarative_filter::CompareOp::Eq,
-                        value.clone(),
-                    ));
-                } else {
-                    declarative_filters
-                        .push(DeclarativeFilter::equals(column.clone(), value.clone()));
-                }
-                filter_skip_enum_validation.push(
-                    dummy_equality_flags
-                        .get(*equality_ordinal)
-                        .copied()
-                        .unwrap_or(false),
-                );
-                *equality_ordinal += 1;
-            }
-            WherePredicate::Compare { column, op, value } => {
-                // `< > <= >=`（TABLE-13・TASK-199、Issue #891・レーン B）。
-                // `$n` はこの述語形の右辺に束縛できない（`sql::params` の
-                // パターン 4 は `Ident '=' $n` のみ）ため、常に「実値」として
-                // 扱う（Describe 専用のダミー値スキップは対象外）。
-                declarative_filters.push(DeclarativeFilter::compare(
-                    column.clone(),
-                    (*op).into(),
-                    value.clone(),
-                ));
-                filter_skip_enum_validation.push(false);
-            }
-            WherePredicate::Prefix { column, pattern } => {
-                // SQL-24／TASK-208、Issue #914: `WherePredicate::Prefix`
-                // （名前は互換性のため据え置き）は LIKE の生パターン全般を
-                // 保持する。意味論・振り分け（Equals／StartsWith／Like）は
-                // `declarative_filter::DeclarativeFilter::like`（内部で
-                // `parse_like_pattern` を呼ぶ）に委ねる。
-                declarative_filters.push(DeclarativeFilter::like(column.clone(), pattern.clone()));
-                // `LIKE` パターン右辺には `$n` を束縛できない（`sql::params`
-                // モジュールドキュメント。パターン 4 は `Ident '=' $n` のみ）ため
-                // 常に「実値」として扱う。
-                filter_skip_enum_validation.push(false);
-            }
             WherePredicate::PredicateCall { .. } => {
                 // allowlist が許可する述語呼び出し形は `visible()` のみ
                 // （`is_allowed_where_predicate_name`）。名前の再検証はしない
                 // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
                 rls_predicate_present = true;
-            }
-            WherePredicate::BoolEquality { column, value } => {
-                declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), *value));
-                // `$n` は常に `Token::StringLiteral` へ置換されるため
-                // `Ident '=' Ident("true"/"false")` の形にはならず、この述語の
-                // 右辺も `$n` に由来し得ない。
-                filter_skip_enum_validation.push(false);
-            }
-            WherePredicate::BoolColumn { column } => {
-                declarative_filters.push(DeclarativeFilter::bool_equals(column.clone(), true));
-                filter_skip_enum_validation.push(false);
             }
             WherePredicate::Expression(expr) => {
                 let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
@@ -1369,6 +1433,20 @@ fn bind_where_predicates_recursive(
                 return Err(SqlSurfaceError::unsupported(
                     "subquery is not supported for this statement shape",
                 ));
+            }
+            // SQL-24（TASK-208 ポインタ）: 等価・前方一致・BOOLEAN 系・範囲比較・
+            // `IN`・`BETWEEN`・`IS [NOT] NULL`・`NOT` はいずれも
+            // [`declarative_filter::DeclarativeFilter`] へ写像できる葉
+            // （`declarative_leaf_to_filter` に集約）。
+            _ => {
+                let (filter, skip) = declarative_leaf_to_filter(
+                    predicate,
+                    schema,
+                    equality_ordinal,
+                    dummy_equality_flags,
+                )?;
+                declarative_filters.push(filter);
+                filter_skip_enum_validation.push(skip);
             }
         }
     }
@@ -4774,7 +4852,11 @@ fn collect_where_predicate_idents(
             WherePredicate::Equality { column, .. }
             | WherePredicate::Prefix { column, .. }
             | WherePredicate::BoolEquality { column, .. }
-            | WherePredicate::Compare { column, .. } => {
+            | WherePredicate::Compare { column, .. }
+            // SQL-24（TASK-208 ポインタ）。
+            | WherePredicate::InList { column, .. }
+            | WherePredicate::Between { column, .. }
+            | WherePredicate::IsNull { column, .. } => {
                 out.insert(column.clone());
             }
             WherePredicate::BoolColumn { column } => {
@@ -4797,6 +4879,11 @@ fn collect_where_predicate_idents(
             // `sql::subquery` モジュールドキュメント参照）。
             WherePredicate::Exists { .. } => {}
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
+            // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
+            // と同じ理由: 否定越しの列参照見落としを防ぐ）。
+            WherePredicate::Not(inner) => {
+                collect_where_predicate_idents(std::slice::from_ref(inner.as_ref()), out);
+            }
             WherePredicate::Or(branches) => {
                 for branch in branches {
                     collect_where_predicate_idents(branch, out);

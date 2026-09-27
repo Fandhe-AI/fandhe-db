@@ -958,12 +958,17 @@ fn push_dml_where_predicates(
 }
 
 /// [`push_dml_where_predicates`] が各述語 1 個ぶんを直列化する再帰本体
-/// （TASK-208・SQL-24、Issue #912）。`WherePredicate::Or`（タグ 8）は
+/// （TASK-208・SQL-24、Issue #912／#913）。`WherePredicate::Or`（タグ 8）は
 /// 「分岐数（u32 LE）→ 分岐ごとの述語数（u32 LE）→ 各述語を本関数で再帰的に
 /// 直列化」という形にすることで、`a OR (b AND c)` と `(a OR b) AND c` が異なる
-/// ハッシュになる（分岐の木構造そのものを直列化に反映する）。タグ 1〜7 の
-/// 直列化形式は本 Issue 以前と一切変えない（`AND` だけの既存述語列の
-/// content hash は不変。回帰テストで固定する）。
+/// ハッシュになる（分岐の木構造そのものを直列化に反映する）。`InList`（タグ 9）・
+/// `Between`（タグ 10）・`IsNull`（タグ 11）・`Not`（タグ 12）は Issue #912 の
+/// `Or`（タグ 8）採番後に追加したため 9 番から採番する（タグ値の再利用は異なる
+/// 構文が同一ハッシュへ衝突する事故を招くため、未使用の番号を新規に割り当てる）。
+/// `Not` は内側を再帰でそのまま直列化する（構文段が連続する `NOT` を偶奇で
+/// 畳んでいる〔正規化済み〕ため、`NOT NOT x` と `x` は同じハッシュになる。意図した
+/// 正規化）。タグ 1〜7 の直列化形式は本 Issue 以前と一切変えない（`AND` だけの
+/// 既存述語列の content hash は不変。回帰テストで固定する）。
 fn push_dml_where_predicate(
     b: &mut HashInputBuilder,
     pred: &crate::sql::allowlist::WherePredicate,
@@ -1042,6 +1047,43 @@ fn push_dml_where_predicate(
                     push_dml_where_predicate(b, leaf, udf_registry, referenced)?;
                 }
             }
+        }
+        // `IN`（SQL-24。TASK-208 ポインタ）。件数プレフィクス（u32 LE）に続けて
+        // 各要素を出現順のまま連結する（構文段が要素の順序を保持したまま束縛
+        // するため、順序を変えるとハッシュが不安定になる）。
+        WherePredicate::InList { column, values } => {
+            b.push_u8(9);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            let count = u32::try_from(values.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&count.to_le_bytes());
+            for value in values {
+                b.push_bytes(value.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+        }
+        // `BETWEEN`（SQL-24。TASK-208 ポインタ）。
+        WherePredicate::Between { column, low, high } => {
+            b.push_u8(10);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(low.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(high.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        // `IS [NOT] NULL`（SQL-24。TASK-208 ポインタ）。`negated` を末尾へ
+        // 付け加えることで `IS NULL` と `IS NOT NULL` が別ハッシュになる。
+        WherePredicate::IsNull { column, negated } => {
+            b.push_u8(11);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_u8(u8::from(*negated));
+        }
+        // `NOT`（SQL-24。TASK-208 ポインタ）。内側を再帰でそのまま直列化する。
+        WherePredicate::Not(inner) => {
+            b.push_u8(12);
+            push_dml_where_predicate(b, inner, udf_registry, referenced)?;
         }
         // Issue #927・SQL-29 (a)・TASK-213: サブクエリは述語形 `UPDATE`/`DELETE`
         // の WHERE では構文解析段（`Parser::require_subquery_depth`）が既定
@@ -2450,6 +2492,83 @@ mod tests {
             h_empty, h_populated,
             "UDF section must be omitted entirely when no UDF is referenced by WHERE"
         );
+    }
+
+    // --- SQL-24（TASK-208 ポインタ）: IN / BETWEEN / IS NULL / NOT のハッシュ --
+
+    fn hash_for(predicate: crate::sql::allowlist::WherePredicate) -> ContentHash {
+        let empty_registry = crate::sql::udf_call::UdfRegistry::default();
+        for_delete_where("t", &[predicate], &empty_registry).expect("hash")
+    }
+
+    #[test]
+    fn new_predicate_forms_each_get_a_distinct_hash() {
+        use crate::sql::allowlist::WherePredicate;
+
+        let in_list = WherePredicate::InList {
+            column: "lang".to_string(),
+            values: vec!["ja".to_string(), "en".to_string()],
+        };
+        let not_in_list = WherePredicate::Not(Box::new(in_list.clone()));
+        let between = WherePredicate::Between {
+            column: "day".to_string(),
+            low: "2024-01-01".to_string(),
+            high: "2024-06-01".to_string(),
+        };
+        let is_null = WherePredicate::IsNull {
+            column: "tag".to_string(),
+            negated: false,
+        };
+        let is_not_null = WherePredicate::IsNull {
+            column: "tag".to_string(),
+            negated: true,
+        };
+
+        let hashes = [
+            hash_for(in_list.clone()),
+            hash_for(not_in_list.clone()),
+            hash_for(between.clone()),
+            hash_for(is_null.clone()),
+            hash_for(is_not_null.clone()),
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for (j, b) in hashes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "predicate forms at index {i} and {j} must not collide"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 構文段が連続する `NOT` を偶奇で正規化する契約（`sql::allowlist::
+    /// Parser::parse_where_leaf`）により、`NOT NOT x` と `x` は同一の
+    /// `WherePredicate` 木になる。ここではその正規化済み木を直接ハッシュし、
+    /// 「畳んだ結果は元と同一ハッシュ」であることを固定する（意図した挙動）。
+    #[test]
+    fn double_not_folds_to_the_same_hash_as_no_not() {
+        use crate::sql::allowlist::WherePredicate;
+
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        };
+        let not_not_eq = eq.clone(); // 構文段で既に畳み込み済みの表現。
+        assert_eq!(hash_for(eq), hash_for(not_not_eq));
+    }
+
+    #[test]
+    fn not_wrapped_predicate_hash_differs_from_unwrapped() {
+        use crate::sql::allowlist::WherePredicate;
+
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        };
+        let not_eq = WherePredicate::Not(Box::new(eq.clone()));
+        assert_ne!(hash_for(eq), hash_for(not_eq));
     }
 
     /// TASK-208・SQL-24（Issue #912）: `WherePredicate::Or`（タグ 8）の直列化が

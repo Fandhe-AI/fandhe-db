@@ -153,22 +153,40 @@ fn accepts_where_like_prefix_against_real_catalog() {
     .expect("LIKE prefix shape against a real table must be accepted");
 }
 
+// SQL-24（TASK-208 ポインタ）で `NOT LIKE` は `Not(Prefix)` として受理する
+// ようになったため、`ILIKE` のみを不正形として固定する（`NOT LIKE` の受理は
+// `accepts_not_like_as_negated_prefix_against_real_catalog` が別途固定する）。
 #[test]
-fn rejects_not_like_and_ilike_against_real_catalog() {
+fn rejects_ilike_against_real_catalog() {
     let (storage, _guard) = open_storage_with_documents_table("like-reject");
-    let not_like = validate_statement(
-        "SELECT * FROM documents WHERE lang NOT LIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
-        &storage,
-    )
-    .expect_err("NOT LIKE must be rejected");
-    assert_eq!(not_like.wire_code(), "42601");
-
     let ilike = validate_statement(
         "SELECT * FROM documents WHERE lang ILIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
         &storage,
     )
     .expect_err("ILIKE must be rejected");
     assert_eq!(ilike.wire_code(), "42601");
+}
+
+/// SQL-24（TASK-208 ポインタ）: `<col> NOT LIKE '<lit>'` は `Not(Prefix)` として
+/// 実カタログ結合でも受理される（`sql::allowlist::tests::
+/// accepts_not_like_as_negated_prefix` の storage 非依存版との対）。
+#[test]
+fn accepts_not_like_as_negated_prefix_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("not-like-accept");
+    let stmt = validate_statement(
+        "SELECT * FROM documents WHERE lang NOT LIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        &storage,
+    )
+    .expect("NOT LIKE against a real table must be accepted as Not(Prefix)");
+    assert_eq!(
+        stmt.where_predicates(),
+        vec![engine::sql::allowlist::WherePredicate::Not(Box::new(
+            engine::sql::allowlist::WherePredicate::Prefix {
+                column: "lang".to_string(),
+                pattern: "j%".to_string(),
+            }
+        ))]
+    );
 }
 
 #[test]

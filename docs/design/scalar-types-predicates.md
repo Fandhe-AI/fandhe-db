@@ -124,7 +124,11 @@ Issue #880〜#890 で `INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／`BOOLEAN`／`DA
 - INTEGER/BIGINT/REAL/DOUBLE（レーン A）・投影/式中での新型列参照・
   非数値型の列同士の比較は対象外。
 - 二次索引（`sql::scalar_index`）による候補削減は対象外（常に `PlainScan`）。
-- `<>`／`!=`・`IN`・`BETWEEN`・`IS NULL`・`OR`・`NOT` は対象外（SQL-24 系）。
+- `<>`／`!=` は対象外のまま。`OR`・括弧グループ（SQL-24 系）は Issue #912
+  （TASK-208）で、`IN`・`BETWEEN`・`IS [NOT] NULL`・`NOT` は Issue #913
+  （TASK-208・SQL-24）で対応済み（本 Issue #891 の範囲外だった当時の記述を
+  更新。codex-review 指摘対応）。詳細は
+  [sql24-in-between-null-not.md](./sql24-in-between-null-not.md) 参照。
 
 ## テスト
 
