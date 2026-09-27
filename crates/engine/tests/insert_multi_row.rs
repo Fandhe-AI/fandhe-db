@@ -13,14 +13,14 @@
 //! （Issue #860 SQL/NoSQL 機能パリティ）に限定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::core::EngineCore;
+use engine::core::{EngineCore, ParsedSql};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::ledger::LedgerLookup;
 use engine::recovery::required_op_id::{LedgerMode, OperationId};
-use engine::sql::allowlist::validate_insert;
+use engine::sql::allowlist::{validate_insert, SqlSurfaceError, TableLookup};
 use engine::sql::mode::SessionState;
-use engine::sql::parser::{bind_insert_form, BoundInsertForm};
+use engine::sql::parser::{bind_insert_form, BoundInsertForm, DmlLimits};
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -687,4 +687,68 @@ fn multi_row_insert_then_single_row_same_operation_id_is_content_mismatch() {
     let mut ids = read_back_ids(&core, "tenant-a");
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
+}
+
+// ---------------------------------------------------------------------
+// Issue #997（codex-review P1 指摘・PR #1122）: 構文解析段の行数上限
+// （`sql::allowlist::Parser::parse_insert`）を迂回する経路（`validate_insert`
+// が返した `ValidatedInsert` を `ParsedSql::Insert` へ包んで
+// `execute_parsed_in_session` へ渡す。拡張クエリプロトコルの Parse／Execute
+// 分離〔Issue #933〕が正当に使う経路）でも、`EngineCore::dml_limits.
+// max_insert_rows_per_statement` を実行時に必ず検査する
+// （`EngineCore::check_insert_row_count_limit`）。
+// ---------------------------------------------------------------------
+
+/// 最小限の `TableLookup`（テーブル名の一致のみ判定。`validate_insert` が
+/// `ValidatedInsert` を得るためだけに要求する契約——束縛・実行そのものは
+/// `EngineCore` 側のスキーマ・redb 走査で行うため、この最小実装で足りる。
+/// `crates/engine/tests/bound_plan_public_api.rs::FixedTableLookup` と同型）。
+struct FixedTableLookup;
+
+impl TableLookup for FixedTableLookup {
+    fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        Ok(name == TABLE)
+    }
+}
+
+#[test]
+fn execute_parsed_in_session_rejects_insert_over_configured_row_limit_even_when_parsed_without_a_limit(
+) {
+    // `validate_insert`（`pub fn`）は常に `max_insert_rows: None`（上限なし）で
+    // 構文解析する——`EngineCore::dml_limits` の設定値を一切参照しない独立した
+    // エントリポイント。ここで得た `ValidatedInsert`（3 行）を、行数上限
+    // `Some(2)` を明示設定した `EngineCore` へ `ParsedSql::Insert` として渡す。
+    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-parsed-over-limit");
+    let stmt = validate_insert(&sql, &FixedTableLookup, LedgerMode::Ledgered)
+        .expect("validate_insert (no cap) must accept 3 rows");
+    assert_eq!(stmt.rows.len(), 3);
+    let parsed = ParsedSql::Insert(stmt);
+
+    let path = unique_db_path("insert-multi-row-parsed-bypass-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core =
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_dml_limits(DmlLimits {
+            max_insert_rows_per_statement: Some(
+                std::num::NonZeroUsize::new(2).expect("2 is nonzero"),
+            ),
+            ..DmlLimits::default()
+        });
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+    let mut session = SessionState::default();
+
+    let err = core
+        .execute_parsed_in_session(&policy, &mut session, &parsed)
+        .expect_err(
+            "execute_parsed_in_session must re-check the configured row limit at execution time",
+        );
+    assert_eq!(err.wire_code(), "54000");
+
+    // 副作用ゼロ: 台帳未消費（同一 operation_id が上限内の行数で再送できる）。
+    let follow_up_sql = multi_row_sql(TABLE, &[1, 2], "op-parsed-over-limit");
+    let outcome = core
+        .execute_insert_sql(&policy, &follow_up_sql)
+        .expect("operation_id must be unused after the rejected over-limit statement");
+    assert_eq!(outcome.rows_affected, 2);
 }

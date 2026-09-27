@@ -5647,6 +5647,38 @@ impl EngineCore {
         self.run_predicate_delete(ctx, &udfs, &validated, &schema)
     }
 
+    /// `--max-insert-rows`（`self.dml_limits.max_insert_rows_per_statement`）を、
+    /// `stmt.rows.len()`（`ValidatedInsert` の行数。単一行形も `rows.len() == 1`
+    /// として同じ形を持つ）に対して**実行時にも**検査する（codex-review P1
+    /// 指摘・PR #1122）。
+    ///
+    /// 行数上限は本来 `sql::allowlist::Parser::parse_insert`（構文解析段）が
+    /// 判定する契約だが、`validate_insert`（`pub fn`。`max_insert_rows: None`
+    /// 固定で解析する）が返した `ValidatedInsert` を `ParsedSql::Insert` へ
+    /// 包んで [`Self::execute_parsed_in_session`]（`pub fn`）へ渡す経路では、
+    /// 解析時の上限判定を経由しない。設定済みの `EngineCore`（`--max-insert-
+    /// rows` 指定済み）に対してこの経路で上限超過の文を渡すと、構文解析段の
+    /// ゲートを迂回して素通りしてしまう（AGENTS.md の公開 API・エラー契約の
+    /// 相互運用性、および設定した上限の契約に反する）。本メソッドを
+    /// `execute_insert_form`・`execute_insert_returning_form` の冒頭
+    /// （スキーマ取得・書き込みトランザクション開始より前）で呼ぶことで、
+    /// 到達経路に関わらず設定済み上限を必ず適用する（超過は `54000`・
+    /// 副作用ゼロ。メッセージは構文解析段と同一形式に揃える）。
+    fn check_insert_row_count_limit(
+        &self,
+        row_count: usize,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let Some(max_insert_rows) = self.dml_limits.max_insert_rows_per_statement else {
+            return Ok(());
+        };
+        if row_count > max_insert_rows.get() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                format!("INSERT statement exceeds the allowed row count ({max_insert_rows})"),
+            ));
+        }
+        Ok(())
+    }
+
     /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
     /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
     /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも
@@ -6246,6 +6278,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.check_insert_row_count_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -6347,6 +6380,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.check_insert_row_count_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self

@@ -226,6 +226,17 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   `MAX_INSERT_ROWS_PER_STATEMENT` 定数は非テストコードから参照しなくなった
   ため `#[cfg(test)]` 限定・`pub(crate)` を外して残す（外部への破壊的変更には
   当たらない。元々 `pub(crate)` で crate 外から到達不能だったため）。
+- **実行時の再検査（codex-review P1 指摘・PR #1122 対応）**: 行数上限判定は
+  本来 `Parser::parse_insert`（構文解析段）が一元的に担う契約だが、`pub fn
+  validate_insert`（常に `max_insert_rows: None` で解析する）が返した
+  `ValidatedInsert` を `ParsedSql::Insert` へ包んで `pub fn
+  execute_parsed_in_session`（拡張クエリプロトコルの Parse／Execute 分離
+  〔Issue #933〕が正当に使う経路）へ渡すと、解析時の上限判定を経由しない
+  まま実行されてしまう。`EngineCore::check_insert_row_count_limit`（新設）を
+  `execute_insert_form`・`execute_insert_returning_form` の冒頭（スキーマ
+  取得・書き込みトランザクション開始より前）で呼び、到達経路に関わらず
+  `self.dml_limits.max_insert_rows_per_statement` を実行時にも必ず検査する
+  （超過は `54000`・副作用ゼロ。構文解析段のメッセージ形式と同一）。
 - **`batch_limits.max_files_per_batch` との二重ゲート（codex-review P1 指摘・
   PR #1122 対応）**: 複数行 `VALUES`（`BoundInsertForm::RowBatch`）は本節の
   `max_insert_rows_per_statement`（`Some` のときのみ判定する構文解析段の上限）
@@ -329,7 +340,12 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   （`multi_row_insert_respects_configured_lower_insert_row_limit`／
   `multi_row_insert_respects_configured_higher_insert_row_limit`——引き上げ側は
   `batch_limits.max_files_per_batch` も同時に引き上げる必要があることを含めて
-  固定。§6「`batch_limits.max_files_per_batch` との二重ゲート」参照）。
+  固定。§6「`batch_limits.max_files_per_batch` との二重ゲート」参照）・
+  構文解析段の上限判定を経由しない到達経路（`validate_insert` が返した
+  `ValidatedInsert` を `ParsedSql::Insert` へ包んで `execute_parsed_in_session`
+  へ渡す）でも実行時に上限を再検査すること（`execute_parsed_in_session_
+  rejects_insert_over_configured_row_limit_even_when_parsed_without_a_limit`。
+  §6「実行時の再検査」参照）。
 - `crates/wire-server/tests/wire_dml_limits_cli.rs`: `--max-dml-affected-rows`・
   `--max-insert-rows` の CLI 解析の外形確認（範囲内値での起動成功・値欠落／
   多重指定／範囲外／非数値の起動時拒否）。
