@@ -1670,28 +1670,6 @@ pub fn bind_delete(stmt: &ValidatedDelete) -> Result<BoundDelete, SqlSurfaceErro
     })
 }
 
-/// 述語つき `DELETE`／`UPDATE`（Issue #870・#869）が 1 文で変更してよい行数の
-/// 既定上限（本リポの実装既定値であり、spec 由来の数値ではない）。`INSERT` の
-/// `MAX_INSERT_ROWS_PER_STATEMENT`（`allowlist.rs`・private・1_000）と同じ
-/// 桁に揃える。実際の判定（[`check_affected_row_count`]）は変更開始前・
-/// 副作用ゼロの時点で呼ぶ実行結線（#871）の担当（本モジュールは上限値を
-/// [`BoundPredicateDelete::max_affected_rows`] として運搬するのみ）。
-pub const DEFAULT_MAX_DML_AFFECTED_ROWS: usize = 1_000;
-
-/// 影響行数 `count` が上限 `limit` を超えないことを検査する（Issue #870・#871
-/// が結線する実行時判定の共有ヘルパー）。超過は
-/// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。呼び出し元は書き込み開始前・
-/// 副作用ゼロの時点で本関数を呼ぶことで、上限超過を「変更を一部だけ適用して
-/// から中断」ではなく「一切変更しないまま拒否」にする契約を維持する。
-pub fn check_affected_row_count(count: usize, limit: usize) -> Result<(), SqlSurfaceError> {
-    if count > limit {
-        return Err(SqlSurfaceError::payload_too_large(format!(
-            "DML affected row count {count} exceeds limit {limit}"
-        )));
-    }
-    Ok(())
-}
-
 /// 束縛済みの述語つき `DELETE ... WHERE` 文（Issue #870・TASK-192・SQL-19）。
 /// `BoundScan`（Issue #454）と同じく `WHERE` の意味論
 /// （`metadata_filters`／`expr_filters`）を共有し、第 2 の述語評価器を作らない。
@@ -1719,9 +1697,6 @@ pub struct BoundPredicateDelete {
     /// スコープ外（計画§「対象外」参照）。
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     pub(crate) operation_id: Option<OperationId>,
-    /// 影響行数の上限（[`check_affected_row_count`] へ渡す運搬役。既定値は
-    /// [`DEFAULT_MAX_DML_AFFECTED_ROWS`]）。
-    pub(crate) max_affected_rows: usize,
 }
 
 impl BoundPredicateDelete {
@@ -1729,12 +1704,14 @@ impl BoundPredicateDelete {
     /// （NoSQL 表層 `delete` op〔#875・#876・NOSQL-12〕の入口。`BoundScan::new`
     /// と同じ契約。`expr_filters` のステップ列コンパイルは内部で行う）。
     /// `or_filters` は常に空（NoSQL 表層は `OR` 未対応。TASK-208・Issue #912）。
+    /// 影響行数上限は `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows`
+    /// （UPDATE と共有する唯一の上限 API。Issue #997 で統合）を実行結線側が
+    /// 直接参照するため、本 constructor は上限値を引数に取らない。
     pub fn new(
         table: String,
         metadata_filters: Vec<MetadataFilter>,
         expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
         operation_id: Option<OperationId>,
-        max_affected_rows: usize,
     ) -> Self {
         let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
         Self {
@@ -1744,7 +1721,6 @@ impl BoundPredicateDelete {
             expr_filter_programs,
             or_filters: Vec::new(),
             operation_id,
-            max_affected_rows,
         }
     }
 
@@ -1779,11 +1755,6 @@ impl BoundPredicateDelete {
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
     }
-
-    /// 影響行数の上限（[`check_affected_row_count`] へ渡す値）。
-    pub fn max_affected_rows(&self) -> usize {
-        self.max_affected_rows
-    }
 }
 
 /// [`ValidatedPredicateDelete`] を `schema`・UDF レジストリ `udfs` と照合して
@@ -1791,9 +1762,10 @@ impl BoundPredicateDelete {
 /// API）。`WHERE` の意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT
 /// （[`bind_aggregate`]）・広域取得（[`bind_scan`]）と共有する
 /// （[`bind_where_predicates`]。第 2 の述語評価器を作らない）。影響行数上限は
-/// 既定値（[`DEFAULT_MAX_DML_AFFECTED_ROWS`]）を保持するのみで、実際の判定
-/// （[`check_affected_row_count`]）は実行結線（#871）が変更開始前・副作用
-/// ゼロの時点で呼ぶ。
+/// UPDATE と共有する唯一の上限 API（[`MAX_DML_AFFECTED_ROWS`]・
+/// [`check_dml_affected_rows`]。Issue #997 で統合）を実行結線
+/// （`sql/exec.rs::execute_predicate_delete`）が変更開始前・副作用ゼロの時点で
+/// 直接参照するため、本関数は上限値を運搬しない。
 pub fn bind_predicate_delete(
     stmt: &ValidatedPredicateDelete,
     schema: &TableSchema,
@@ -1813,7 +1785,6 @@ pub fn bind_predicate_delete(
         expr_filter_programs,
         or_filters,
         operation_id: stmt.operation_id().cloned(),
-        max_affected_rows: DEFAULT_MAX_DML_AFFECTED_ROWS,
     })
 }
 
@@ -2589,15 +2560,19 @@ fn bind_set_assignments(
 }
 
 /// 1 文の `UPDATE`／`DELETE`（述語形。SQL-19・SQL-20 系）が変更してよい行数の
-/// 上限（本リポの実装既定値。SQL-16・TASK-190 の `MAX_INSERT_ROWS_PER_STATEMENT`
-/// と同じ「1 文あたり」の桁に揃える）。束縛段階では対象行数が確定しないため、
-/// 実行結線（Issue #871・#870）が変更を開始する前に [`check_dml_affected_rows`]
-/// を呼ぶ契約とする（構造検証・束縛のみを担う本モジュールは値を提供するのみで、
-/// 判定自体はここでは行わない）。`count` は対象行集合の全件列挙結果である必要は
-/// なく、広い述語（例: 全行に一致する `WHERE`）による無制限列挙を避けるため、
-/// 呼び出し元は候補行を `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を
-/// 打ち切ってその件数を渡してよい（早期終了。security.md「不安全な設計」＝
-/// 未検証入力によるリソース増幅の回避）。
+/// 上限（本リポの実装既定値であり、spec 由来の数値ではない。SQL-16・TASK-190 の
+/// `MAX_INSERT_ROWS_PER_STATEMENT` と同じ「1 文あたり」の桁に揃える）。束縛段階
+/// では対象行数が確定しないため、実行結線（`sql/exec.rs` の
+/// `execute_predicate_update`／`execute_predicate_delete`）が変更を開始する前に
+/// [`check_dml_affected_rows`] を呼ぶ契約とする（構造検証・束縛のみを担う本
+/// モジュールは値を提供するのみで、判定自体はここでは行わない）。`count` は
+/// 対象行集合の全件列挙結果である必要はなく、広い述語（例: 全行に一致する
+/// `WHERE`）による無制限列挙を避けるため、呼び出し元は候補行を
+/// `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を打ち切ってその件数を渡して
+/// よい（早期終了。security.md「不安全な設計」＝未検証入力によるリソース増幅の
+/// 回避）。UPDATE／DELETE（述語形）共通の唯一の上限 API であり、以前 DELETE 側に
+/// 存在した別系統（`DEFAULT_MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`）は
+/// Issue #997 で本 API へ統合済み。
 pub const MAX_DML_AFFECTED_ROWS: usize = 1_000;
 
 /// `count`（対象行数。[`MAX_DML_AFFECTED_ROWS`] を超えたかどうかの判定にのみ
@@ -2605,12 +2580,12 @@ pub const MAX_DML_AFFECTED_ROWS: usize = 1_000;
 /// 渡してよい）が [`MAX_DML_AFFECTED_ROWS`] を超えないか検証する。超過は
 /// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail` には件数と上限のみを
 /// 含め、テナント・行内容には触れない（fail-closed。実行前・副作用ゼロの段階で
-/// 拒否する契約。呼び出し元は Issue #871（述語つき `UPDATE` 実行結線）・#870
-/// （述語つき `DELETE`）が変更開始前に呼ぶ）。
+/// 拒否する契約。呼び出し元は `execute_predicate_update`・`execute_predicate_delete`
+/// が変更開始前に呼ぶ）。
 pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError> {
     if count > MAX_DML_AFFECTED_ROWS {
         return Err(SqlSurfaceError::payload_too_large(format!(
-            "statement would affect {count} rows, exceeding the per-statement limit of {MAX_DML_AFFECTED_ROWS}"
+            "DML affected row count {count} exceeds limit {MAX_DML_AFFECTED_ROWS}"
         )));
     }
     Ok(())
@@ -6017,7 +5992,6 @@ mod tests {
             bound.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
         );
-        assert_eq!(bound.max_affected_rows, DEFAULT_MAX_DML_AFFECTED_ROWS);
     }
 
     #[test]
@@ -6118,43 +6092,6 @@ mod tests {
 
         assert_eq!(delete_bound.metadata_filters, scan_bound.metadata_filters);
         assert_eq!(delete_bound.expr_filters, scan_bound.expr_filters);
-    }
-
-    // --- check_affected_row_count（Issue #870・#871 が結線する実行時判定の
-    // 共有ヘルパー。本 Issue の時点では呼び出し元が存在しないため、境界値
-    // （`count == limit` と `count == limit + 1`）を直接固定する） -------------
-
-    #[test]
-    fn check_affected_row_count_accepts_count_at_limit() {
-        assert!(check_affected_row_count(
-            DEFAULT_MAX_DML_AFFECTED_ROWS,
-            DEFAULT_MAX_DML_AFFECTED_ROWS
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn check_affected_row_count_rejects_count_over_limit_by_one() {
-        let err = check_affected_row_count(
-            DEFAULT_MAX_DML_AFFECTED_ROWS + 1,
-            DEFAULT_MAX_DML_AFFECTED_ROWS,
-        )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "54000");
-    }
-
-    #[test]
-    fn check_affected_row_count_accepts_zero_count_against_zero_limit() {
-        // `limit == 0` は「一切変更を許さない」極端値。0 行の変更は許容される
-        // ことを固定する（`count > limit` の厳密な比較が境界で崩れていないか
-        // の確認）。
-        assert!(check_affected_row_count(0, 0).is_ok());
-    }
-
-    #[test]
-    fn check_affected_row_count_rejects_any_count_against_zero_limit() {
-        let err = check_affected_row_count(1, 0).unwrap_err();
-        assert_eq!(err.wire_code(), "54000");
     }
 
     // --- bind_update（SQL-17、TASK-191） ----------------------------------------
@@ -6487,6 +6424,14 @@ mod tests {
         assert!(check_dml_affected_rows(MAX_DML_AFFECTED_ROWS).is_ok());
         let err = check_dml_affected_rows(MAX_DML_AFFECTED_ROWS + 1).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn check_dml_affected_rows_accepts_zero_count() {
+        // Issue #997 で DELETE 側の別系統（`check_affected_row_count`）を統合した
+        // ことで失われた「`count == 0` は常に許容される」境界を、唯一の上限 API
+        // 側でも固定する（`count > MAX_DML_AFFECTED_ROWS` の厳密比較の確認）。
+        assert!(check_dml_affected_rows(0).is_ok());
     }
 
     // --- bind_insert_form: 形判別（TASK-120・INDEX-1, INDEX-2） -----------------
