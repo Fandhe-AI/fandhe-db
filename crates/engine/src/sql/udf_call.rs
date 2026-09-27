@@ -2015,7 +2015,20 @@ fn bind_date_part_or_trunc(
             args.len()
         )));
     }
-    let (field_bound, field_ty) = bind_expr_in(&args[0], env, node_budget)?;
+    // 添字アクセスを避け get() で取得する（coding-rust.md: 受信 SQL 経路での [] 禁止）。
+    // 直前の args.len() != 2 検査により両方 Some になるが、兄弟実装（bind_substr・
+    // bind_concat）の様式に合わせ、ここでも fail-closed な Err 経路を明示する。
+    let field_arg = args.first().ok_or_else(|| {
+        SqlSurfaceError::invalid_input(format!(
+            "function {lower_name} expects 2 argument(s), got 0"
+        ))
+    })?;
+    let src_arg = args.get(1).ok_or_else(|| {
+        SqlSurfaceError::invalid_input(format!(
+            "function {lower_name} expects 2 argument(s), got 1"
+        ))
+    })?;
+    let (field_bound, field_ty) = bind_expr_in(field_arg, env, node_budget)?;
     if field_ty != ExprType::Text {
         return Err(SqlSurfaceError::invalid_input(format!(
             "function {lower_name} expects a text literal as its first argument"
@@ -2026,7 +2039,7 @@ fn bind_date_part_or_trunc(
             "function {lower_name} requires its first argument to be a literal (not a column reference or expression)"
         )));
     };
-    let (src_bound, src_ty) = bind_expr_in(&args[1], env, node_budget)?;
+    let (src_bound, src_ty) = bind_expr_in(src_arg, env, node_budget)?;
     let src = match src_ty {
         ExprType::Timestamp => src_bound,
         ExprType::Date => wrap_date_to_timestamp(src_bound),
