@@ -251,14 +251,18 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   ——`batch_limits.max_files_per_batch` は本 Issue 以前から常に適用されて
   きた既存の暗黙上限であり、フラグ未指定という「何も選択していない」状態を
   毎回警告すると通常起動のたびにノイズになるため）。
-- **NoSQL（HTTP）表層・ファイル形 INSERT は対象外（理由）**: NoSQL 表層の
-  `delete`／`update` op はいずれも単一行形（`BoundDelete`／
-  `execute_update_with_schema`）を経由し、述語形 DML
-  （`execute_predicate_delete`／`execute_predicate_update`）へ到達しないため
-  `max_affected_rows` の対象外（`grep -rn "BoundPredicateDelete\|
-  BoundPredicateUpdate" crates/wire-server/src` は 0 件。将来 NoSQL 側が
-  `BoundPredicateDelete::new` 経由で述語形 DELETE を追加した場合も、同じ
-  process-wide 設定値を自動的に共有する設計にしてある）。NoSQL `insert` op は
+- **NoSQL（HTTP）表層の `insert` op・単一行 `update`／`delete`・ファイル形
+  INSERT は `max_affected_rows`／`max_insert_rows_per_statement` の対象外
+  （理由）**: NoSQL `update`／`delete` op は `TargetForm::Predicate`（`filter`
+  指定。Issue #1062）の場合のみ `EngineCore::
+  execute_bound_predicate_update_in_session`／
+  `execute_bound_predicate_delete_in_session` 経由で述語形 DML
+  （`execute_predicate_delete`／`execute_predicate_update`）へ到達し、
+  `self.dml_limits.max_affected_rows` を共有する（§9 参照）。`id` 指定の
+  単一行形（`TargetForm` の他 variant）は引き続き `BoundDelete`／
+  `execute_update_with_schema` を経由し、`max_affected_rows` は無関係
+  （単一行形は常に `rows_affected` が `0`／`1` のいずれかで、複数行への
+  上限判定自体が意味を持たない）。NoSQL `insert` op は
   `max_insert_rows_per_statement`（構文解析段の上限）自体を経由せず、既存の
   `batch_limits.max_files_per_batch` のみで行数を制御する（SQL 表層の複数行
   `VALUES` と同じ土俵——上記の二重ゲート注記参照）。ファイル形 INSERT
@@ -341,9 +345,46 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   session_executes_predicate_delete_statement`: #870 が固定していた「まだ拒否され
   る」テストを「0 件一致で成功する」へ反転。
 
-## 9. 申し送り・スコープ外
+## 9. NoSQL 表層からの到達経路（Issue #1062）
 
-- NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
+NoSQL `update`／`delete` op の `filter`（述語形。TASK-186・NOSQL-12）は、
+本ドキュメントが記す SQL 表層の実行本体を**そのまま**共有する。到達経路:
+
+- `EngineCore` に `execute_bound_predicate_update_in_session`／
+  `execute_bound_predicate_delete_in_session`（セッション対応の束縛済み
+  入口。[`Self::execute_bound_update_in_session`] と同型の closure 方式）を
+  追加した。判定順序は `operation_id` 必須化ガード → スキーマ取得 → `bind`
+  closure（`wire-server` が JSON `filter` から `WherePredicate` を構築する）
+  → 述語形の多層防御（`reject_unsupported_predicate_dml_forms`。空列・
+  `PredicateCall`／`Expression`／`Or`／`InSubquery`／`Exists` を `42601` で
+  拒否）→ `ValidatedPredicateUpdate`／`ValidatedPredicateDelete` を engine
+  内部で構築（`pub(crate)` フィールドへの struct リテラル。公開コンストラクタは
+  追加しない）→ 本ドキュメント §5〜7 の共通実行本体（`Self::
+  run_predicate_update`／`run_predicate_delete`）。
+- `core.rs::execute_predicate_update_form`／`execute_predicate_delete_form`
+  （SQL 表層。§5）は、スキーマ取得より後の部分をこの共通実行本体へ切り出した
+  だけで、挙動は本 Issue 導入前と完全に同一（既存の engine テストで回帰確認
+  済み）。
+- `parser.rs::bind_update_form` の `Predicate` 分岐も同様に
+  `bind_predicate_update`（新設）へ切り出し、`core.rs` の
+  `run_predicate_update` から直接呼べるようにした。
+- NoSQL `filter` → `WherePredicate` の写像・content_hash 一致条件は
+  `docs/design/nosql-update-delete-mapping.md`「D1」節を参照（spec 本文は
+  転記しない）。
+- `run_predicate_update`／`run_predicate_delete` はいずれも
+  `self.dml_limits.max_affected_rows`（§6。Issue #997。既定 `None`＝
+  上限なし・`wire-server` の `--max-dml-affected-rows` で明示指定時のみ
+  有効）を `sql::exec::execute_predicate_update`／`execute_predicate_delete`
+  へ渡す。したがって NoSQL 表層からの述語形 `UPDATE`／`DELETE`（`filter`）も
+  SQL 表層と同じ process-wide 設定値を共有する（Issue #997・#1062 の統合。
+  §6「NoSQL（HTTP）表層・ファイル形 INSERT は対象外」の記述は、NoSQL
+  `insert` op・ファイル形 INSERT に限る注記として引き続き有効）。
+
+## 10. 申し送り・スコープ外
+
+- NoSQL `update`／`delete` op の束縛・結線（#876・述語形は #1062 で実装済み）・
+  SQL/NoSQL パリティ（#877。読み取り専用シナリオのみ。述語形パリティは層 A
+  `nosql12_update_delete.rs` が #1062 で固定）。
 - 上限 API の統合・CLI 設定可能化はいずれも Issue #997 で解消済み（§6 参照。
   オーナー判断の改訂〔2026-09-27〕で最終確定。既定は上限なし・CLI 明示指定時
   のみ有効）。
