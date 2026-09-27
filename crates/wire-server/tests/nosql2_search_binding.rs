@@ -16,8 +16,13 @@ use engine::json::parse_json;
 use engine::sql::allowlist::{validate_sql, SqlSurfaceError, Statement, TableLookup};
 use engine::sql::mode::ModeSource;
 use engine::sql::parser::{bind, BoundStatement};
+use engine::sql::udf_call::UdfRegistry;
 use wire_server::http::query::schema::SEARCH_SCHEMA;
 use wire_server::http::query::search::{bind_search, BoundSearch};
+
+fn udfs() -> UdfRegistry {
+    UdfRegistry::default()
+}
 
 const TABLE: &str = "docs";
 
@@ -58,7 +63,7 @@ fn sql_side_bound(sql: &str) -> BoundStatement {
 fn nosql_side_bound(text: &str) -> BoundSearch {
     let value = parse_json(text).expect("valid JSON fixture");
     let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-    bind_search(&validated, &schema()).expect("bind_search")
+    bind_search(&validated, &schema(), &udfs()).expect("bind_search")
 }
 
 fn expect_vector(bound: BoundSearch) -> BoundStatement {
@@ -163,7 +168,8 @@ fn plan_only_binds_projection_filter_and_limit_matching_a_placeholder_order_by_f
     )
     .expect("valid JSON fixture");
     let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-    let BoundSearch::Plan(plan) = bind_search(&validated, &schema()).expect("bind_search") else {
+    let BoundSearch::Plan(plan) = bind_search(&validated, &schema(), &udfs()).expect("bind_search")
+    else {
         panic!("expected BoundSearch::Plan");
     };
 

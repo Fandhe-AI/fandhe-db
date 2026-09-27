@@ -79,7 +79,12 @@ use crate::http::session::middleware::SessionPrincipal;
 pub struct PlanSearch {
     table: String,
     projection: Vec<ProjectedColumn>,
-    metadata_filters: Vec<MetadataFilter>,
+    /// `filter` の束縛結果（メタデータフィルタ・式述語・`OR` 群。Issue #945・
+    /// NOSQL-14）。`engine::sql::declarative_predicate::BoundWhereFilters` は
+    /// `pub mod` の `pub` 型のためクレート外（本モジュール）から名指しできる
+    /// （`crate::sql::where_tree` が `pub(crate) mod` のため個々のフィールド型
+    /// までは名指しできないが、この不透明な入れ物のまま持ち回せる）。
+    filters: engine::sql::declarative_predicate::BoundWhereFilters,
     limit: usize,
     question: String,
     query_mode: Option<SearchMode>,
@@ -96,7 +101,14 @@ impl PlanSearch {
     }
 
     pub fn metadata_filters(&self) -> &[MetadataFilter] {
-        &self.metadata_filters
+        self.filters.metadata_filters()
+    }
+
+    /// `filter` の束縛結果一式（メタデータフィルタ・式述語・`OR` 群）。
+    /// [`PlanSearchBinding::with_where_filters`] へそのまま渡す入口
+    /// （Issue #945・NOSQL-14）。
+    pub fn filters(&self) -> &engine::sql::declarative_predicate::BoundWhereFilters {
+        &self.filters
     }
 
     pub fn limit(&self) -> usize {
@@ -323,6 +335,7 @@ fn vector_as_f32(items: &[JsonValue]) -> Result<Vec<f32>, SearchError> {
 pub fn bind_search(
     validated: &Validated<'_>,
     schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
 ) -> Result<BoundSearch, SearchError> {
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
@@ -355,7 +368,7 @@ pub fn bind_search(
     let projection = bind_column_projection(columns.as_deref(), schema)?;
 
     let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
-    let metadata_filters = bind_filter(filter_items, schema)?;
+    let filters = bind_filter(filter_items, schema, udfs)?;
 
     // `mode` は `table`／`columns` と同じ識別子形状検査（`ident::
     // check_identifier`）を先に通す（cursor[bot] 指摘・PR #820。`"recall"`／
@@ -399,6 +412,7 @@ pub fn bind_search(
             None => Ranking::Distance { query },
         };
         let resolved_mode = mode::resolve_mode(query_mode, None);
+        let (metadata_filters, expr_filters, or_filters) = filters.into_parts();
         let bound = BoundStatement::new(
             table.to_string(),
             projection,
@@ -408,7 +422,8 @@ pub fn bind_search(
             limit,
             EvaluationOrder::DEFAULT,
         )
-        .with_mode(resolved_mode);
+        .with_mode(resolved_mode)
+        .with_where_filters(expr_filters, or_filters);
         return Ok(BoundSearch::Vector(bound));
     }
 
@@ -429,7 +444,7 @@ pub fn bind_search(
     Ok(BoundSearch::Plan(PlanSearch {
         table: table.to_string(),
         projection,
-        metadata_filters,
+        filters,
         limit,
         question: question.to_string(),
         query_mode,
@@ -483,8 +498,9 @@ fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
 pub(crate) fn bind_vector_statement(
     validated: &Validated<'_>,
     schema: &TableSchema,
+    udfs: &engine::sql::udf_call::UdfRegistry,
 ) -> Result<BoundStatement, SqlSurfaceError> {
-    match bind_search(validated, schema).map_err(to_sql_surface_error)? {
+    match bind_search(validated, schema, udfs).map_err(to_sql_surface_error)? {
         BoundSearch::Vector(stmt) => Ok(stmt),
         // `execute`（通常実行）側の対称コメント参照: `explain::execute` は
         // `vector` 指定であることを呼び出し前に確定させているため、この
@@ -599,11 +615,17 @@ pub fn execute(
             question,
             mode_literal,
             limit_raw,
-            |schema, _udfs| match bind_search(validated, schema).map_err(to_sql_surface_error)? {
-                BoundSearch::Plan(plan) => Ok(PlanSearchBinding::new(
-                    plan.projection().to_vec(),
-                    plan.metadata_filters().to_vec(),
-                )),
+            |schema, udfs| match bind_search(validated, schema, udfs)
+                .map_err(to_sql_surface_error)?
+            {
+                BoundSearch::Plan(plan) => {
+                    let (metadata_filters, expr_filters, or_filters) =
+                        plan.filters().clone().into_parts();
+                    Ok(
+                        PlanSearchBinding::new(plan.projection().to_vec(), metadata_filters)
+                            .with_where_filters(expr_filters, or_filters),
+                    )
+                }
                 // `plan_present` が `true` の間は `bind_search` が
                 // `BoundSearch::Vector` を返すことはない（両者は同一の
                 // `validated` を見て同じ排他判定を行うため）。到達した場合は
@@ -617,8 +639,8 @@ pub fn execute(
         Ok(result)
     } else {
         let result =
-            engine.execute_bound_search_in_session(ctx, &session, table, |schema, _udfs| {
-                bind_vector_statement(validated, schema)
+            engine.execute_bound_search_in_session(ctx, &session, table, |schema, udfs| {
+                bind_vector_statement(validated, schema, udfs)
             })?;
         Ok(result)
     }
@@ -670,10 +692,14 @@ mod tests {
         parse_json(text).expect("valid JSON fixture")
     }
 
+    fn udfs() -> engine::sql::udf_call::UdfRegistry {
+        engine::sql::udf_call::UdfRegistry::default()
+    }
+
     fn bind(text: &str) -> Result<BoundSearch, SearchError> {
         let value = validate(text);
         let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-        bind_search(&validated, &schema())
+        bind_search(&validated, &schema(), &udfs())
     }
 
     #[test]
@@ -775,7 +801,7 @@ mod tests {
         let value =
             validate(r#"{"op":"search","table":"notes","plan":"find something","limit":5}"#);
         let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-        let err = bind_search(&validated, &scan_only_schema()).expect_err("must reject");
+        let err = bind_search(&validated, &scan_only_schema(), &udfs()).expect_err("must reject");
         assert!(matches!(err, SearchError::Bind(_)));
         assert_eq!(err.wire_code(), "22000");
     }
@@ -936,7 +962,7 @@ mod tests {
         );
         let value = JsonValue::Object(object);
         let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-        let err = bind_search(&validated, &schema()).expect_err("must reject");
+        let err = bind_search(&validated, &schema(), &udfs()).expect_err("must reject");
         assert!(matches!(err, SearchError::InvalidIdentifier));
         assert_eq!(err.wire_code(), "42601");
         assert_eq!(err.client_message(), "invalid identifier");
@@ -976,7 +1002,7 @@ mod tests {
             r#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":5,"hybrid":{"text":"x"}}"#,
         );
         let validated = SEARCH_SCHEMA.validate(&value).expect("must validate shape");
-        let err = bind_search(&validated, &schema_without_body).expect_err("must reject");
+        let err = bind_search(&validated, &schema_without_body, &udfs()).expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
     }
 
