@@ -584,10 +584,9 @@ fn predicate_update_set_vector_column_with_non_vector_value_is_rejected_with_220
 }
 
 /// DELETE 側（[`predicate_delete_over_limit_is_rejected_with_no_side_effects`]）
-/// と同じ契約が述語つき UPDATE 側にも成立することを固定する（`§6` の上限 API
-/// 並立〔`MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows`〕は DELETE 側の
-/// `DEFAULT_MAX_DML_AFFECTED_ROWS`＋`check_affected_row_count`と値は同じ
-/// 1,000 だが別 API のため、UPDATE 側でも独立に検証する）。
+/// と同じ契約が述語つき UPDATE 側にも成立することを固定する（DELETE・UPDATE が
+/// 同一上限 API〔`MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows`。
+/// Issue #997 で統合〕を共有することを両経路で固定する）。
 #[test]
 fn predicate_update_over_limit_is_rejected_with_no_side_effects() {
     let (core, path) = new_core_with_table();
