@@ -1556,6 +1556,22 @@ fn propagate_referential_actions(
     state: &mut ActionState,
 ) -> Result<(), TenantWriteError> {
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
+    // 同一の子テーブルが同一の親テーブルを複数の `FOREIGN KEY` で参照する場合
+    // （`referencing` に同じ `child_schema.name` が複数回現れる）の対応
+    // （Issue #1076・codex-review 指摘）: `enforce_row_constraints_in_txn`
+    // （対象行の**全** FK を検査する）を FK ごとに即座に呼ぶと、この時点で
+    // まだアクションを適用していない同じ子テーブルの別 FK が旧値のまま検査され
+    // `23503` に誤って失敗する。子テーブル名 → (スキーマ, 検証対象 id) へ
+    // 蓄積し、このテーブルを参照する全 FK のアクション適用が終わってから
+    // まとめて 1 回ずつ検証する（子孫段への再帰も同様に、全 FK 適用後へ
+    // 遅延する）。
+    let mut pending_validation: HashMap<String, (TableSchema, Vec<u64>)> = HashMap::new();
+    let mut pending_recursions: Vec<(
+        TableSchema,
+        PropagatedChange,
+        Option<UpdatedKeyPreImages>,
+        u32,
+    )> = Vec::new();
     for (child_schema, fk) in &referencing {
         let action = match &change {
             PropagatedChange::Removed => fk.on_delete(),
@@ -1628,28 +1644,51 @@ fn propagate_referential_actions(
         crate::catalog::bump_table_generation_in_txn(write_txn, &child_schema.name)?;
 
         if let PropagatedChange::ColumnsUpdated(_) = &child_change {
-            // 書いた値が壊れていないか（CHECK → UNIQUE → 子自身の FK 参照元側）を
-            // 即座に検証する（`SET DEFAULT` の値が参照先に無い・UNIQUE 衝突・
-            // CHECK 違反はここで検出される）。削除（`CASCADE` の ON DELETE 側）は
-            // 行が既に無いため対象外。
+            // 書いた値が壊れていないか（CHECK → UNIQUE → 子自身の FK 参照元側）の
+            // 検証対象 id を蓄積する（`SET DEFAULT` の値が参照先に無い・UNIQUE
+            // 衝突・CHECK 違反はここで検出される）。削除（`CASCADE` の ON DELETE
+            // 側）は行が既に無いため対象外。実際の検証はこのテーブルを参照する
+            // 全 FK のループを終えた後、子テーブルごとに 1 回だけ行う（上記
+            // `pending_validation` ドキュメント参照）。
             let child_ids: Vec<u64> = affected.iter().map(|(id, _)| *id).collect();
-            enforce_row_constraints_in_txn(
-                write_txn,
-                &child_schema.name,
-                child_schema,
-                tenant_id,
-                &child_ids,
-                fk_mode,
-            )?;
+            pending_validation
+                .entry(child_schema.name.clone())
+                .and_modify(|(_, ids)| ids.extend(child_ids.iter().copied()))
+                .or_insert_with(|| ((*child_schema).clone(), child_ids));
         }
         state
             .touched
             .push((child_schema.name.clone(), child_schema.clone()));
 
+        pending_recursions.push((
+            (*child_schema).clone(),
+            child_change,
+            child_pre_images,
+            new_depth,
+        ));
+    }
+
+    // 蓄積した検証をここでまとめて行う（同じ子テーブルへ複数 FK が action を
+    // 適用していても、全アクション適用後の最終値を 1 回だけ検査する）。
+    for (child_table, (child_schema, child_ids)) in pending_validation {
+        enforce_row_constraints_in_txn(
+            write_txn,
+            &child_table,
+            &child_schema,
+            tenant_id,
+            &child_ids,
+            fk_mode,
+        )?;
+    }
+
+    // 検証後に子孫段の連鎖を辿る（親段の全 FK 適用・検証が確定した状態で
+    // 再帰するため、孫段の `collect_action_targets` が中途半端な親状態を
+    // 読むことはない）。
+    for (child_schema, child_change, child_pre_images, new_depth) in pending_recursions {
         propagate_referential_actions(
             write_txn,
             &child_schema.name,
-            child_schema,
+            &child_schema,
             tenant_id,
             child_change,
             child_pre_images.as_ref(),
@@ -1691,6 +1730,90 @@ fn collect_action_targets(
 ) -> Result<ActionTargets, TenantWriteError> {
     match change {
         PropagatedChange::Removed => {
+            if let Some(pre) = pre_images {
+                // 限定版（Issue #1076 A14・codex-review 指摘対応）: `pre_images` に
+                // 積まれた「今回の文で実際に削除された行」の削除前キー値のみを
+                // CASCADE 等の対象にする。下記のグローバルスキャン（フォールバック）は
+                // 「現在の親に存在しないキーを持つ子行全体」を対象にしてしまうため、
+                // `INITIALLY DEFERRED` の `FOREIGN KEY` が同一トランザクション内で
+                // 許す一時的な合法孤立行（このステートメントより前の文が作り、以降の
+                // 文で解消される予定の孤立行）まで誤って連鎖削除・連鎖更新の対象に
+                // 含めてしまう。全削除呼び出し元（`tenant.rs` の各削除関数）は
+                // `remove` の戻り値（削除前の物理行）から復元した旧値を積んで渡す
+                // 契約（`UpdatedKeyPreImages` ドキュメント参照）。
+                if pre.old_values.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
+                if child_rows.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let parent_indices: Vec<usize> = fk
+                    .parent_columns()
+                    .iter()
+                    .map(|name| {
+                        parent_schema
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == name)
+                            .ok_or_else(|| internal("referenced column not found in parent schema"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                // 列参照 FK は親テーブルを 1 回だけ走査し、存在するキーの集合を作る
+                // （`ColumnsUpdated` 分岐の点照会 `read_parent_row_values` と異なり、
+                // 削除された行はもう `id` で読み戻せないため、キーバイト列の集合との
+                // 突合せに寄せる。`id` 参照は物理キーの点照会のままにする）。
+                let present_keys: Option<HashSet<Vec<u8>>> = if fk.references_parent_id() {
+                    None
+                } else {
+                    Some(scan_parent_key_bytes(
+                        write_txn,
+                        parent_table,
+                        parent_schema,
+                        fk,
+                        tenant_id,
+                    )?)
+                };
+                let mut out = Vec::new();
+                let mut seen_keys: HashSet<ChildKey> = HashSet::new();
+                for (removed_id, old_values) in &pre.old_values {
+                    let old_key = if fk.references_parent_id() {
+                        Some(ChildKey::Id(*removed_id))
+                    } else {
+                        build_owned_key(old_values, &parent_indices, fk)?
+                    };
+                    let Some(old_key) = old_key else { continue };
+                    // 複数行が同じキーを共有することは PK／UNIQUE 制約上あり得ないが、
+                    // 同一テナント内の重複走査を避ける保険として重複キーは 1 回のみ扱う。
+                    if !seen_keys.insert(old_key.clone()) {
+                        continue;
+                    }
+                    let exists = match &old_key {
+                        ChildKey::Id(id) => {
+                            parent_row_exists(write_txn, parent_table, tenant_id, *id)?
+                        }
+                        ChildKey::Bytes(bytes) => present_keys
+                            .as_ref()
+                            .is_some_and(|present| present.contains(bytes)),
+                    };
+                    if exists {
+                        // 同一トランザクション内の別の文が、削除されたのと同じキーを
+                        // 持つ親行を既に再投入している。最終状態としてキーは失われて
+                        // いないため対象外（`ColumnsUpdated` 分岐と同じ最終状態判定）。
+                        continue;
+                    }
+                    if let Some(ids) = child_rows.get(&old_key) {
+                        for &id in ids {
+                            out.push((id, None));
+                        }
+                    }
+                }
+                return Ok(out);
+            }
+            // フォールバック（`pre_images` を渡さない呼び出し元向け。現状の
+            // `tenant.rs` 側呼び出し元はすべて上記の限定版を使うため通常は
+            // 到達しない）: 現在の親に存在しないキーを持つ子行全体を対象にする、
+            // より広い（保守的だが `INITIALLY DEFERRED` では過剰連鎖になり得る）走査。
             let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
             if child_rows.is_empty() {
                 return Ok(Vec::new());

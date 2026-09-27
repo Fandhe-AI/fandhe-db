@@ -3508,12 +3508,15 @@ fn parse_foreign_key_column_list(
 ///
 /// 検証順序: `fks:` 行の存在・件数の数値形式・`1..=MAX_FOREIGN_KEYS_PER_TABLE`
 /// （0 件は「`FOREIGN KEY` を持たないスキーマは v2〜v7 で書く」形式の一意性契約に
-/// 反する）→ 各行の `fk:` 接頭辞・フィールド数（`has_options` なら 7、そうでなければ
-/// 3）→ 列リスト・テーブル名の識別子形状・参照アクション・`MATCH`／遅延属性トークン
-/// （TABLE-17・TASK-205、Issue #1076／#1077）。参照元列の実在・参照先との照合は
-/// 呼び出し元の [`validate_schema`] が判定する。確保は宣言件数（上限検査済み）の
-/// 範囲に限る。`has_options` はカタログ v9（[`CATALOG_FORMAT_VERSION_V9`]）選択時
-/// のみ `true`。
+/// 反する）→ 各行の `fk:` 接頭辞・フィールド数（`has_options` なら 7 または
+/// （後方互換の）5、そうでなければ 3）→ 列リスト・テーブル名の識別子形状・
+/// 参照アクション・`MATCH`／遅延属性トークン（TABLE-17・TASK-205、
+/// Issue #1076／#1077）。`has_options` の 5 フィールド形は Issue #1077 時点の
+/// v9（参照アクション追加前）が書いた既存カタログ値の読み取り専用互換パス
+/// （codex-review 指摘対応。`parse_foreign_key_section` 本体のコメント参照）。
+/// 参照元列の実在・参照先との照合は呼び出し元の [`validate_schema`] が判定する。
+/// 確保は宣言件数（上限検査済み）の範囲に限る。`has_options` はカタログ v9
+/// （[`CATALOG_FORMAT_VERSION_V9`]）選択時のみ `true`。
 fn parse_foreign_key_section<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     has_options: bool,
@@ -3552,24 +3555,54 @@ fn parse_foreign_key_section<'a>(
         // 参照アクション・`MATCH`／遅延属性フィールド（v9 のみ。TABLE-17・
         // TASK-205、Issue #1076／#1077）。v8 は 3 フィールド固定のため、ここで
         // 余剰フィールドが無いことを検証する。
+        //
+        // v9 は `fk:` 行として 2 世代の形式を許容する（後方互換。Issue #1076・
+        // codex-review 指摘対応）: (a) 旧形式（Issue #1077 時点の 5 フィールド。
+        // `MATCH`／遅延属性のみで参照アクションは持たない）、(b) 新形式（本
+        // Issue #1076 が参照アクションを追加した 7 フィールド）。バージョン
+        // 文字列 `v9` を変えずに新形式へ拡張したため、旧形式のまま既に
+        // 永続化済みのカタログ値（本 Issue のマージ前に作成された、既定以外の
+        // `MATCH`／遅延属性を持つスキーマ）を新形式専用のパーサーで読むと
+        // 構造検証エラーで拒否してしまう（fail-closed だが可用性を損なう）。
+        // フィールド数で判別する: 5 番目のフィールドが有るかどうかで、新形式
+        // （`on_delete`・`on_update` を含む）か旧形式（`MATCH`／遅延属性のみ、
+        // 参照アクションは記録されておらず既定の `NoAction`）かが確定する。
+        // `encode_foreign_key_section` は常に新形式（7 フィールド）でのみ書く
+        // ため、旧形式は読み取り専用の互換パスであり正規形の一意性を損なわない。
         let (on_delete, on_update, match_type, deferrability) = if has_options {
-            let on_delete_field = fields
+            let field1 = fields
                 .next()
                 .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-            let on_update_field = fields
+            let field2 = fields
                 .next()
                 .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-            let match_field = fields
-                .next()
-                .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-            let deferral_field = fields
-                .next()
-                .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-            if fields.next().is_some() {
-                return Err(format!("malformed foreign key line: {line:?}"));
-            }
-            let on_delete = parse_referential_action_token(on_delete_field)?;
-            let on_update = parse_referential_action_token(on_update_field)?;
+            let (on_delete, on_update, match_field, deferral_field) = match fields.next() {
+                Some(field3) => {
+                    // 新形式（7 フィールド）: field1/field2 が on_delete/on_update。
+                    let field4 = fields
+                        .next()
+                        .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
+                    if fields.next().is_some() {
+                        return Err(format!("malformed foreign key line: {line:?}"));
+                    }
+                    (
+                        parse_referential_action_token(field1)?,
+                        parse_referential_action_token(field2)?,
+                        field3,
+                        field4,
+                    )
+                }
+                None => {
+                    // 旧形式（5 フィールド。Issue #1077 時点の v9）: field1/field2 が
+                    // match/deferral。参照アクションは既定値へ補完する。
+                    (
+                        ReferentialAction::NoAction,
+                        ReferentialAction::NoAction,
+                        field1,
+                        field2,
+                    )
+                }
+            };
             let match_type = match match_field {
                 "simple" => ForeignKeyMatch::Simple,
                 "full" => ForeignKeyMatch::Full,
@@ -9534,6 +9567,33 @@ mod tests {
             decode_schema("children", &encoded).expect("decode"),
             with_options
         );
+    }
+
+    /// 後方互換: Issue #1076 が参照アクションを追加する前の v9（Issue #1077
+    /// 時点。`MATCH`／遅延属性のみの 5 フィールド `fk:` 行）で永続化済みの
+    /// カタログ値を、参照アクション追加後の本バイナリでも読み取れる
+    /// （codex-review 指摘対応: バージョン文字列 `v9` を変えずに 7 フィールドへ
+    /// 拡張したため、旧形式のまま既存 DB に残るカタログ値を新形式専用の
+    /// パーサーで読むと構造検証エラーで拒否してしまっていた）。参照アクションは
+    /// 記録されていないため `NoAction` へ既定値補完する。
+    #[test]
+    fn decode_v9_accepts_legacy_five_field_foreign_key_line() {
+        let legacy = "v9\ncols:2\npk:\nparent_id:bigint:-:1:L:-\ncode:text:-:1:L:-\n\
+                      uniq:0\nchecks:0\nfks:1\nfk:parent_id:parents:id:full:deferred\n";
+        let decoded = decode_schema("children", legacy.as_bytes()).expect("decode legacy v9");
+        let fk = decoded.foreign_keys().first().expect("one fk");
+        assert_eq!(fk.on_delete(), ReferentialAction::NoAction);
+        assert_eq!(fk.on_update(), ReferentialAction::NoAction);
+        assert_eq!(fk.match_type(), ForeignKeyMatch::Full);
+        assert_eq!(
+            fk.deferrability(),
+            ForeignKeyDeferrability::DeferrableInitiallyDeferred
+        );
+        // 再エンコードは常に新形式（7 フィールド）で書く（正規形の一意性を
+        // 損なわない。読み取り専用の互換パス）。
+        let reencoded = encode_schema(&decoded).expect("re-encode");
+        let text = std::str::from_utf8(&reencoded).expect("utf8");
+        assert!(text.contains("fk:parent_id:parents:id:noaction:noaction:full:deferred\n"));
     }
 
     /// v9 の破損入力を fail-closed に拒否する（v8 と同じ共有パーサーを通す。

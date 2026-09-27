@@ -3060,10 +3060,24 @@ fn delete_row_impl(
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let mut captured_row: Option<CapturedRow> = None;
+    // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
+    // `FOREIGN KEY` の参照先キー（主キー・UNIQUE 構成列）を持ちうる場合のみ、
+    // `remove` の直前に読み取った旧値を積む——`collect_action_targets` の
+    // `Removed` 分岐がこれを使い、「今回削除で実際に失われたキー」のみを
+    // CASCADE 対象へ限定する（`present_keys` を全走査してその時点で親に無い
+    // キー全体を対象にすると、`INITIALLY DEFERRED` の `FOREIGN KEY` が同一
+    // トランザクション内で許す一時的な合法孤立行まで誤って連鎖削除してしまう。
+    // codex-review 指摘）。主キー・UNIQUE を宣言しないテーブルは FK の参照先に
+    // なり得ないため記録コストを払わない（ON UPDATE 側の `pre_images.record`
+    // と同じ判定条件）。
+    let needs_fk_removed_pre_image;
+    let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
     let (owns_existing, schema) = {
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
         // `insert_row`/`update_row` と同じ前段を通す。
         let schema = require_table_schema_write(&write_txn, table)?;
+        needs_fk_removed_pre_image =
+            schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
         if let Some(expected) = capture.as_ref() {
             if expected.schema != &schema {
                 return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -3093,7 +3107,7 @@ fn delete_row_impl(
                 let (existing_tenant, _existing_visibility) =
                     decode_row_tenant_and_visibility(guard.value())?;
                 let owns = ctx.is_owner(existing_tenant);
-                if owns && capture.is_some() {
+                if owns && (capture.is_some() || needs_fk_removed_pre_image) {
                     // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
                     // （削除後では対象バイト列が失われるため）。物理行フォーマット
                     // は `storage.rs::decode_row`（`ROW_FORMAT_VERSION`。tenant_id・
@@ -3136,12 +3150,17 @@ fn delete_row_impl(
                             }
                         }
                     }
-                    captured_row = Some(CapturedRow {
-                        id,
-                        tenant_id: row.tenant_id,
-                        visibility: row.visibility,
-                        values,
-                    });
+                    if needs_fk_removed_pre_image {
+                        removed_pre_images.record(id, values.clone());
+                    }
+                    if capture.is_some() {
+                        captured_row = Some(CapturedRow {
+                            id,
+                            tenant_id: row.tenant_id,
+                            visibility: row.visibility,
+                            values,
+                        });
+                    }
                 }
                 owns
             }
@@ -3168,7 +3187,7 @@ fn delete_row_impl(
             &schema,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
-            None,
+            needs_fk_removed_pre_image.then_some(&removed_pre_images),
             crate::constraint::FkCheckMode::All,
         )?;
     }
@@ -3546,6 +3565,13 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         });
     }
 
+    // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`
+    // と同じ判定条件・同じ理由（`removed_pre_images` のドキュメント参照）で、
+    // 主キー・UNIQUE を宣言するテーブルのみ `remove` の戻り値（削除前の物理行）
+    // から旧値を復元して積む。
+    let needs_fk_removed_pre_image =
+        schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
+    let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
     {
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
@@ -3553,9 +3579,25 @@ pub(crate) fn delete_rows_where_unchecked<E>(
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
         for id in &candidate_ids {
             let key = (ctx.tenant_id(), *id);
-            row_table
+            let removed_guard = row_table
                 .remove(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+            if needs_fk_removed_pre_image {
+                if let Some(guard) = removed_guard {
+                    let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
+                        dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
+                            "removed row decode failed: {e}"
+                        )))
+                    })?;
+                    let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                        .map_err(|e| {
+                            dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
+                                "removed row decode failed: {e}"
+                            )))
+                        })?;
+                    removed_pre_images.record(*id, values);
+                }
+            }
         }
     }
 
@@ -3569,7 +3611,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
             &schema,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
-            None,
+            needs_fk_removed_pre_image.then_some(&removed_pre_images),
             crate::constraint::FkCheckMode::All,
         )
         .map_err(dml_write_err)?;
@@ -3912,6 +3954,11 @@ pub(crate) fn replace_typed_rows_by_text_key(
     } = req;
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
+    // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。クロージャ内で
+    // 可変参照として捕捉し、削除した旧チャンク行の削除前の値を積む（下記の
+    // `needs_fk_removed_pre_image` 代入箇所のドキュメント参照）。
+    let mut needs_fk_removed_pre_image = false;
+    let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
     // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
     // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
     // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
@@ -4051,10 +4098,35 @@ pub(crate) fn replace_typed_rows_by_text_key(
             &content_hash,
         )?;
 
+        // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`・
+        // `delete_rows_where_unchecked` と同じ判定条件・同じ理由
+        // （`removed_pre_images` のドキュメント参照）で、主キー・UNIQUE を宣言する
+        // テーブルのみ `remove` の戻り値（削除前の物理行）から旧値を復元して積む。
+        // `needs_fk_removed_pre_image`・`removed_pre_images` は本クロージャの外で
+        // 宣言し可変参照で捕捉する（`ReplaceOutcome` は他クレートも参照する
+        // 公開構造体のため、フィールド追加で契約を広げない）。
+        needs_fk_removed_pre_image =
+            schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
         for id in &to_remove {
-            row_table
+            let removed_guard = row_table
                 .remove(&(tenant, *id))
                 .map_err(CatalogError::from)?;
+            if needs_fk_removed_pre_image {
+                if let Some(guard) = removed_guard {
+                    let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
+                        TenantWriteError::CapturedRowDecodeFailed(format!(
+                            "removed row decode failed: {e}"
+                        ))
+                    })?;
+                    let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                        .map_err(|e| {
+                            TenantWriteError::CapturedRowDecodeFailed(format!(
+                                "removed row decode failed: {e}"
+                            ))
+                        })?;
+                    removed_pre_images.record(*id, values);
+                }
+            }
         }
 
         // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
@@ -4162,7 +4234,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
             &schema_for_fk,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
-            None,
+            needs_fk_removed_pre_image.then_some(&removed_pre_images),
             crate::constraint::FkCheckMode::All,
         )?;
     }

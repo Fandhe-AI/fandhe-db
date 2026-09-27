@@ -704,3 +704,65 @@ fn truncate_does_not_fire_referential_actions() {
     assert_eq!(row_count(&core, &alice, "parents"), 1);
     assert_eq!(row_count(&core, &alice, "children"), 1);
 }
+
+// --- 連鎖対象の限定（Issue #1076 codex-review 指摘対応） -----------------------
+//
+// `collect_action_targets` の `Removed` 分岐は、`tenant.rs` の各削除経路
+// （`delete_row_impl`・`delete_rows_where_unchecked`・ファイル形 `INSERT` の
+// 旧チャンク行置換）が `remove` の戻り値から復元して渡す `pre_images` を使い、
+// 「その文で実際に削除された親キー」だけを連鎖対象にする（グローバルスキャン
+// ＝「現在の親に存在しないキーを持つ子行全体」ではない）。`DELETE`／`UPDATE`
+// は明示トランザクション内では未対応（`docs/design/explicit-transaction.md`）
+// で、かつ自動コミットの各文は `INITIALLY DEFERRED` でも文単位で検査される
+// （`autocommit_still_checks_deferred_foreign_key_per_statement`。
+// `table17_foreign_key.rs`）ため、現行の SQL 表層では「無関係な既存孤立行が
+// 誤って連鎖削除される」具体的な再現を単一の SQL 文だけでは組み立てられない。
+// 直接検証できる範囲（同一親テーブルを参照する複数 FK の適用順序）は下記の
+// テストで担保する。
+
+/// 同一子テーブルが同一親テーブルを複数の `FOREIGN KEY`（別列）で参照する
+/// 場合、親行の削除で発火する各 `ON DELETE SET NULL` はすべて適用されてから
+/// 検証される（Issue #1076 codex-review 指摘対応）。最初の 1 件を適用した
+/// 直後に子行の**全** FK を検証すると、まだ書き換えていない残りの FK が旧値
+/// （削除済みの親キー）のまま検査され `23503` に誤って失敗する。
+#[test]
+fn multiple_foreign_keys_to_the_same_parent_all_apply_before_validation() {
+    let (core, path) = new_core("fkact-multi-fk-same-parent");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE parents (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (\
+         parent_a BIGINT REFERENCES parents ON DELETE SET NULL, \
+         parent_b BIGINT REFERENCES parents ON DELETE SET NULL, \
+         note TEXT)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, name) VALUES (1, 'p1') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, parent_a, parent_b, note) VALUES (10, 1, 1, 'n') \
+         USING OPERATION_ID 'op-c'",
+    );
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'",
+    );
+    assert_eq!(row_count(&core, &alice, "children"), 1);
+    assert_eq!(
+        select_cell(&core, &alice, "children", 10, "parent_a"),
+        Some(Cell::Null)
+    );
+    assert_eq!(
+        select_cell(&core, &alice, "children", 10, "parent_b"),
+        Some(Cell::Null)
+    );
+}
