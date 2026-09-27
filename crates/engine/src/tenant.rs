@@ -62,7 +62,10 @@ const MAX_VISIBLE_ROWS: usize = 100_000;
 /// デコード・`PolicyContext::is_visible` 評価が実行され、計算量 DoS 経路になる
 /// （codex-review 指摘・PR #153）。総走査行数にも明示的な上限を設け、超過時は
 /// 部分結果を返さず [`TenantError::TooManyRowsScanned`] で fail-closed に拒否する。
-const MAX_SCANNED_ROWS: usize = 1_000_000;
+///
+/// `pub(crate)`（Issue #997）: `sql::parser::MAX_DML_ROW_LIMIT`（CLI で設定可能な
+/// DML 行数上限の上限値）が同じ定数を参照し、値のドリフトを防ぐ。
+pub(crate) const MAX_SCANNED_ROWS: usize = 1_000_000;
 
 /// [`visible_rows`]・[`verify_hits`] のエラー型。`Display`・`Debug`・
 /// `std::error::Error::source` のいずれにもテナント ID・行 id・テーブル名を含めず、
@@ -3059,10 +3062,13 @@ pub(crate) enum PredicateDmlOutcome {
     /// 影響行数（`0` を含む）。write トランザクションは commit 済み
     /// （台帳エントリも commit されている）。
     Applied { rows_affected: usize },
-    /// 一致行数が上限を超えた（`limit + 1` 件目で列挙を打ち切った時点の件数を
-    /// そのまま運ぶ。呼び出し元が `check_dml_affected_rows`（UPDATE／DELETE
-    /// 共通の唯一の上限 API。Issue #997 で統合）へ渡す）。write トランザクションは
-    /// commit されず、行・台帳エントリのいずれにも痕跡が残らない。
+    /// 一致行数が上限を超えた（`limit` が `Some` のときのみ発生し、`limit + 1`
+    /// 件目で列挙を打ち切った時点の件数をそのまま運ぶ。呼び出し元が
+    /// `check_dml_affected_rows_with_limit`（UPDATE／DELETE 共通の唯一の上限
+    /// 判定 API。Issue #997）へ渡す。`limit` が `None`〔既定。オーナー判断の
+    /// 改訂 2026-09-27〕の場合は本 variant に到達せず、`MAX_SCANNED_ROWS` の
+    /// 総走査上限のみが効く）。write トランザクションは commit されず、行・
+    /// 台帳エントリのいずれにも痕跡が残らない。
     LimitExceeded { count: usize },
 }
 
@@ -3111,19 +3117,23 @@ pub(crate) struct DmlCandidate<'a> {
 /// 他テナント領域まで読み進めることがなくなった後も、`verify_row_key_tenant`
 /// が保証するキー↔ヘッダ整合の帰結として常に真になる不変条件を defense-in-
 /// depth として明示検査する（TABLE-12・security.md）。`predicate` が真を
-/// 返した行の `id` を `limit + 1` 件に達するまで `Vec` へ蓄積する（早期終了。
-/// 行データそのものは複製せず `id` のみを保持する）。
+/// 返した行の `id` を `limit` が `Some` の場合のみ `limit + 1` 件に達するまで
+/// `Vec` へ蓄積する（早期終了。行データそのものは複製せず `id` のみを保持
+/// する）。`limit` が `None`（Issue #997・オーナー判断の改訂〔汎用 RDB 整合〕
+/// で一致行数上限を CLI 未指定＝無効にした既定状態）の場合はこの早期打ち切り
+/// を行わず、[`MAX_SCANNED_ROWS`] による総走査上限のみで頭打ちにする。
 ///
 /// 総走査行数上限（[`MAX_SCANNED_ROWS`]。対象テナント所有行のみを 1 行デコ
 /// ードするたびに加算する）は [`visible_rows`] と同じ計算量 DoS 対策
-/// （codex-review P1 指摘・Issue #871）。`limit`（一致行数上限）は述語に
-/// 一致した行にしか効かないため、一致しない述語では上限に到達しないまま
-/// 任意規模の走査を繰り返せてしまう経路を、この独立した総走査上限で塞ぐ。
-/// 走査が対象テナントの名前空間内に限定された結果、この上限は他テナントの
-/// データ量に一切依存しない（テナント境界越しの情報漏えいを構造的に排除）。
-/// 超過時は [`TenantWriteError::TooManyRowsScanned`] で部分結果を返さず
-/// fail-closed に拒否し、呼び出し元が `write_txn` を commit せず破棄する
-/// ことで副作用ゼロを保つ。
+/// （codex-review P1 指摘・Issue #871）で、`limit` の設定有無に関わらず常に
+/// 適用する。`limit`（一致行数上限。`Some` のときのみ）は述語に一致した行に
+/// しか効かないため、一致しない述語では上限に到達しないまま任意規模の走査を
+/// 繰り返せてしまう経路を、この独立した総走査上限で塞ぐ。走査が対象テナント
+/// の名前空間内に限定された結果、この上限は他テナントのデータ量に一切
+/// 依存しない（テナント境界越しの情報漏えいを構造的に排除）。超過時は
+/// [`TenantWriteError::TooManyRowsScanned`] で部分結果を返さず fail-closed に
+/// 拒否し、呼び出し元が `write_txn` を commit せず破棄することで副作用ゼロを
+/// 保つ。
 ///
 /// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
 /// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
@@ -3131,7 +3141,7 @@ fn enumerate_dml_candidates<E>(
     row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
     ctx: &PolicyContext,
     needs_embedding: bool,
-    limit: usize,
+    limit: Option<std::num::NonZeroUsize>,
     predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
     let mut candidate_ids: Vec<u64> = Vec::new();
@@ -3208,12 +3218,16 @@ fn enumerate_dml_candidates<E>(
         };
         if predicate(&candidate).map_err(PredicateDmlError::Predicate)? {
             candidate_ids.push(id);
-            // `limit + 1` 件に達した時点で打ち切る（副作用ゼロで `54000` を
-            // 返すために、呼び出し元が超過を判定できる最小限の 1 件超過分だけ
-            // 余分に蓄積する。ADR `docs/design/multi-row-dml-operation-id.md`
-            // §6「3.」）。
-            if candidate_ids.len() > limit {
-                break;
+            // `limit` が `Some` のときのみ `limit + 1` 件に達した時点で打ち切る
+            // （副作用ゼロで `54000` を返すために、呼び出し元が超過を判定できる
+            // 最小限の 1 件超過分だけ余分に蓄積する。ADR `docs/design/
+            // multi-row-dml-operation-id.md` §6「3.」）。`None`（上限無効。
+            // Issue #997 オーナー判断の改訂）の場合は打ち切らず、
+            // `MAX_SCANNED_ROWS` の総走査上限のみで頭打ちにする。
+            if let Some(limit) = limit {
+                if candidate_ids.len() > limit.get() {
+                    break;
+                }
             }
         }
     }
@@ -3245,7 +3259,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
     content_hash_value: &content_hash::ContentHash,
     expected_schema: Option<&crate::catalog::TableSchema>,
     needs_embedding: bool,
-    limit: usize,
+    limit: Option<std::num::NonZeroUsize>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
@@ -3281,7 +3295,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         (candidate_ids, schema)
     };
 
-    if candidate_ids.len() > limit {
+    if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
         // `write_txn` をここで drop する（commit しない）。台帳の tentative
         // 追記・行変更のいずれも痕跡が残らない（ADR §6「4.」）。
         return Ok(PredicateDmlOutcome::LimitExceeded {
@@ -3356,7 +3370,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
     expected_schema: Option<&crate::catalog::TableSchema>,
     assignments: &[(usize, crate::row_codec::Value)],
     needs_embedding: bool,
-    limit: usize,
+    limit: Option<std::num::NonZeroUsize>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
@@ -3403,7 +3417,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
         (candidate_ids, schema)
     };
 
-    if candidate_ids.len() > limit {
+    if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
         return Ok(PredicateDmlOutcome::LimitExceeded {
             count: candidate_ids.len(),
         });
@@ -3574,6 +3588,14 @@ pub struct ReplaceOutcome {
 ///   `crate::storage::decode_row_metadata_borrowed` で `metadata`（スカラー列
 ///   ペイロード）のみを借用取得し、比較に不要な embedding は確保しない
 ///   （coding-rust.md「不安全な設計 / DoS」対応）
+/// - PRIMARY KEY・UNIQUE 制約（TABLE-16・TASK-204）を持つテーブルも対象とする
+///   （Issue #1072）。旧チャンク行の削除（上記）は一意性検査（下記の
+///   `crate::constraint::enforce_row_constraints_in_txn` 呼び出し）より前に同一
+///   write トランザクション内で完了しているため、旧チャンクは検査時の母集合に
+///   含まれない。違反時は commit 前の `?` でトランザクションごと abort し、台帳記録・
+///   削除・挿入のいずれも残らない（副作用ゼロ）。チャンク間で値が変わらない列
+///   のみで構成される UNIQUE は、複数チャンクに分割されるファイルを宣言どおり
+///   `23505` で拒否する（特別扱いはしない）
 ///
 /// エラー契約は [`insert_row`]/[`delete_row`] と同一（`TenantWriteError`。他テナントの
 /// 存在情報を漏らさない fail-closed）。`key_column` がスキーマに存在しない・
@@ -3629,18 +3651,6 @@ pub(crate) fn replace_typed_rows_by_text_key(
     // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
     let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
         let schema = require_table_schema_write(&write_txn, table)?;
-        // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）を持つテーブルへの
-        // ファイル形 INSERT（増分インデックス反映。TASK-120）は対象外として
-        // fail-closed に拒否する。同じ `path` を持つ複数チャンク行を書き込む
-        // 置換書き込みは、`path` 等を含む UNIQUE 制約と意味論的に噛み合わない
-        // ため、一意性検査に任せて環境依存の `23505` にするのではなく、書き込み
-        // 前に一律で拒否する（サイレントバイパスもしない。security.md
-        // 「不安全な設計」対応）。commit 前の拒否のため副作用はゼロ。
-        if !schema.unique_constraints().is_empty() {
-            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                "file-form INSERT does not support tables with UNIQUE constraints".to_string(),
-            )));
-        }
         let vector_idx = schema
             .columns
             .iter()
@@ -3848,12 +3858,16 @@ pub(crate) fn replace_typed_rows_by_text_key(
         drop(write_txn);
         return Ok(outcome);
     }
-    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査。
+    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905・#1072。TABLE-16・TASK-204）のテナント内一意性制約検査。
     // このファイル形 `INSERT`（同一パス置換）は採番 id が `first_id` から連番で
     // 割り当てられる（上記クロージャの `next_id` 採番規則）ため、書き込んだ id
     // 集合は `first_id..first_id + inserted` の連続範囲として再構築できる。
     // `removed` のみで `inserted == 0` の場合（`rows` が空で既存行を削除しただけ）
     // は新規に書き込んだ行がないため検査不要（削除は一意性制約に違反し得ない）。
+    // 旧チャンク行の削除は上記クロージャ内（この検査より前）で同一 write
+    // トランザクション内に完了しているため、走査時の母集合から除外済み
+    // （関数 doc コメント参照。redb の write トランザクションは自分が消した
+    // 行をそのまま読める）。
     if outcome.inserted > 0 {
         if let Some(first_id) = outcome.first_id {
             let ids: Vec<u64> = (0..outcome.inserted as u64)
@@ -4958,7 +4972,7 @@ mod tests {
             None,
             &assignments,
             false,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             never_matches,
         )
         .expect_err("oversized SET value must be rejected even when zero rows would match");
@@ -4988,7 +5002,7 @@ mod tests {
             None,
             &ok_assignments,
             false,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             never_matches,
         )
         .expect(
@@ -5053,7 +5067,7 @@ mod tests {
             None,
             &assignments,
             false,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             match_all,
         )
         .expect_err("decode failure on stored data must not succeed");
@@ -5159,7 +5173,7 @@ mod tests {
             None,
             &assignments,
             false,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             match_lang_ja,
         )
         .expect("predicate UPDATE on a table without a VECTOR column should succeed");
@@ -5375,7 +5389,7 @@ mod tests {
                 None,
                 &assignments,
                 assignments.iter().any(|(idx, _)| *idx == 0),
-                100,
+                Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
                 match_only_target_id,
             )
             .unwrap_or_else(|e| match e {
@@ -5609,7 +5623,7 @@ mod tests {
             None,
             &resend_assignments,
             true,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             match_target,
         )
         .expect_err(
@@ -5661,7 +5675,7 @@ mod tests {
             None,
             &mismatched_assignments,
             true,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             match_target2,
         )
         .expect_err("content-mismatched resend must still be rejected");
@@ -5981,7 +5995,7 @@ mod tests {
             None,
             &assignments,
             false,
-            100,
+            Some(std::num::NonZeroUsize::new(100).expect("100 is nonzero")),
             matches_seeded_id,
         )
         .expect_err(
