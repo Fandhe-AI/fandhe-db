@@ -587,9 +587,14 @@ pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
-/// `scan` op のトップレベルスキーマ（NOSQL-3 ポインタ）。`vector`／`plan`／
-/// `mode`／`hybrid` は未知キーとして `42601` で拒否される（スキーマに宣言
-/// しないことで一般則から自然に成立する。個別の除外ロジックは持たない）。
+/// `scan` op のトップレベルスキーマ（NOSQL-3・NOSQL-15 ポインタ）。`vector`／
+/// `plan`／`mode`／`hybrid` は未知キーとして `42601` で拒否される（スキーマに
+/// 宣言しないことで一般則から自然に成立する。個別の除外ロジックは持たない）。
+/// `offset`（Issue #947・NOSQL-15・TASK-224）は SQL 表層の広域取得
+/// `LIMIT n OFFSET m` と同じ実行計画（[`engine::sql::parser::BoundScan::
+/// with_offset`]）へ写像する（[`super::scan::execute`] 参照）。`aggregate` op
+/// には対応する受理形が無いため宣言しない（`super::scan` モジュール doc の
+/// 対象外注記を参照）。
 pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
     name: "scan",
     fields: &[
@@ -608,6 +613,12 @@ pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "limit",
             presence: Presence::Required,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "offset",
+            presence: Presence::Optional,
             ty: FieldType::Number,
             nullable: false,
         },
@@ -1195,10 +1206,52 @@ mod tests {
 
     #[test]
     fn scan_accepts_full_valid_object() {
-        let v = obj(r#"{"op":"scan","table":"docs","limit":500,
+        let v = obj(r#"{"op":"scan","table":"docs","limit":500,"offset":20,
                "filter":[{"column":"lang","op":"eq","value":"ja"}],
                "columns":["id"],"explain":false}"#);
         assert!(SCAN_SCHEMA.validate(&v).is_ok());
+    }
+
+    /// `offset`（Issue #947・NOSQL-15）は任意キーで、省略しても受理される。
+    #[test]
+    fn scan_accepts_missing_offset() {
+        let v = obj(r#"{"op":"scan","table":"docs","limit":10}"#);
+        assert!(SCAN_SCHEMA.validate(&v).is_ok());
+    }
+
+    /// `offset` の型不一致（文字列・真偽値・`null`）は `TypeMismatch` になる
+    /// （値の範囲・形状検査は [`super::scan::offset_to_u32`] が担う）。
+    #[test]
+    fn scan_offset_type_mismatches_are_rejected() {
+        for offset_json in [r#""offset":"5""#, r#""offset":true"#, r#""offset":null"#] {
+            let json = format!(r#"{{"op":"scan","table":"docs","limit":10,{offset_json}}}"#);
+            let v = obj(&json);
+            assert_eq!(
+                SCAN_SCHEMA.validate(&v).unwrap_err(),
+                SchemaError::TypeMismatch { key: "offset" },
+                "offset_json={offset_json}"
+            );
+        }
+    }
+
+    /// `offset` は `scan` op 専用のキーであり、`search`／`aggregate` へ
+    /// 付与すると未知キーとして `42601` へ落ちる（NOSQL-15 のスコープ注記。
+    /// `super::scan` モジュール doc の「対象は scan のみ」判断を固定する）。
+    #[test]
+    fn offset_is_unknown_key_for_search_and_aggregate() {
+        let search_v =
+            obj(r#"{"op":"search","table":"docs","limit":10,"vector":[0.1],"offset":5}"#);
+        assert_eq!(
+            SEARCH_SCHEMA.validate(&search_v).unwrap_err(),
+            SchemaError::UnknownKey
+        );
+
+        let aggregate_v = obj(r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"id"}],"offset":5}"#);
+        assert_eq!(
+            AGGREGATE_SCHEMA.validate(&aggregate_v).unwrap_err(),
+            SchemaError::UnknownKey
+        );
     }
 
     #[test]
