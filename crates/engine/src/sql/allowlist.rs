@@ -77,7 +77,9 @@ const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 /// `declarative_filter::MAX_METADATA_FILTERS` と同値を採用する（無制限 `Vec`
 /// 確保を避ける。`.claude/rules/security.md`「不安全な設計｜無制限リソース
 /// 確保（DoS）」対応）。構文段で要素を `Vec` へ push する**前**に判定する。
-pub(crate) const MAX_IN_LIST_ITEMS: usize = 256;
+/// [`crate::declarative_filter::MAX_IN_LIST_ITEMS`]（NoSQL 表層と共有する公開
+/// 定数。Issue #945）と二重定義しないよう、同じ値をそちらから参照する。
+pub(crate) const MAX_IN_LIST_ITEMS: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS;
 
 /// UPDATE の SET 句が持てる代入要素数の上限（SQL-17、TASK-191）。`MAX_INSERT_COLUMNS`
 /// とは独立した定数にする（UPDATE は部分更新であり INSERT の列数上限とは意味論が
