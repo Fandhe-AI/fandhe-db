@@ -444,8 +444,18 @@ fn seed_parity_db() -> (PathBuf, temp_db::CleanupGuard) {
         &'static str,
         i128,
     );
+    // レビュー指摘（PR #1135・Codex P2・2 巡目）: `category` が "A"／"B" の
+    // 2 値のみだと `category IN ('A', 'B')` は可視行全件に一致し、`IN`
+    // フィルターを適用しない回帰でも固定オラクルに一致してしまい検証対象の
+    // 欠落を検知できない（`in-category` ケースの doc コメント参照）。
+    // alice 所有の Private 行（id=11）の `category` を集合外の値 `"Z"` に
+    // することで、`IN ('A', 'B')` は alice 視点で id=11 を除外しなければ
+    // ならなくなる（`in-category`／`sort-category-id`／
+    // `group-by-lang-category` の `expected_rows_alice` を本行の値に合わせて
+    // 更新済み）。bob・carol には id=11 が見えないため両者の期待値には影響
+    // しない。
     let private_rows: [PrivateRowSpec; 2] = [
-        ("tenant-a", 11, [1.0, 0.0], "xx", "A", 100),
+        ("tenant-a", 11, [1.0, 0.0], "xx", "Z", 100),
         ("tenant-b", 12, [0.0, 1.0], "ja", "B", 800),
     ];
     for (tenant, id, dir, lang, category, price_unscaled) in private_rows {
@@ -898,20 +908,29 @@ const PARITY_CASES: &[ParityCase] = &[
         expected_rows_bob: &[&["2"], &["3"], &["12"]],
         expected_rows_carol: &[&["2"], &["3"]],
     },
-    // レビュー指摘（PR #1135・Cursor Bugbot）: `seed_parity_db` は category が
-    // "A"／"B" の 2 値のみのため、旧値 `IN ('A')`（要素 1 個）は
+    // レビュー指摘（PR #1135・Cursor Bugbot・1 巡目）: `seed_parity_db` は
+    // category が "A"／"B" の 2 値のみのため、旧値 `IN ('A')`（要素 1 個）は
     // `category = 'A'` と完全に同一の結果集合になり、IN を EQ にマップする
     // 回帰や IN リストの先頭要素のみを見る実装でもオラクルに一致してしまい
     // IN の複数要素セマンティクスを実際にはロックできていなかった。
     // `IN ('A', 'B')` へ変更し、先頭要素のみを見る実装（'A' 一致のみ）では
     // category='B' の行（id=2 と各テナント自身の private B 行）が欠落して
     // オラクルに一致しなくなるようにした。
+    //
+    // レビュー指摘（PR #1135・Codex P2・2 巡目）: 1 巡目修正後も
+    // `seed_parity_db` の可視行が全て category "A"／"B" のいずれかだった
+    // ため、`IN ('A', 'B')` は alice/bob/carol いずれの視点でも可視行全件に
+    // 一致し、`IN` フィルターを一切適用しない回帰（全件返却）でもオラクルに
+    // 一致してしまっていた。alice 所有の Private 行（id=11）の `category` を
+    // 集合外の値 `"Z"` へ変更し（`seed_parity_db` 参照）、alice の期待行から
+    // id=11 を除外した。bob・carol には id=11 が見えないため両者の期待値は
+    // 不変。
     ParityCase {
         label: "in-category",
         sql: "SELECT id FROM docs WHERE category IN ('A', 'B') LIMIT 10",
         json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"column":"category","op":"in","value":["A","B"]}]}"#,
         ordered: false,
-        expected_rows_alice: &[&["1"], &["2"], &["3"], &["11"]],
+        expected_rows_alice: &[&["1"], &["2"], &["3"]],
         expected_rows_bob: &[&["1"], &["2"], &["3"], &["12"]],
         expected_rows_carol: &[&["1"], &["2"], &["3"]],
     },
@@ -939,7 +958,9 @@ const PARITY_CASES: &[ParityCase] = &[
         sql: "SELECT id, category FROM docs ORDER BY category ASC, id ASC LIMIT 10",
         json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id","category"],"sort":[{"column":"category","dir":"asc"},{"column":"id","dir":"asc"}]}"#,
         ordered: true,
-        expected_rows_alice: &[&["1", "A"], &["3", "A"], &["11", "A"], &["2", "B"]],
+        // id=11 の category は `"Z"`（`seed_parity_db`・`in-category` の
+        // レビュー指摘対応コメント参照）のため ASC 順で "B" の後に並ぶ。
+        expected_rows_alice: &[&["1", "A"], &["3", "A"], &["2", "B"], &["11", "Z"]],
         expected_rows_bob: &[&["1", "A"], &["3", "A"], &["2", "B"], &["12", "B"]],
         expected_rows_carol: &[&["1", "A"], &["3", "A"], &["2", "B"]],
     },
@@ -957,7 +978,9 @@ const PARITY_CASES: &[ParityCase] = &[
         sql: "SELECT lang, category, COUNT(*) FROM docs GROUP BY lang, category",
         json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","category"]}"#,
         ordered: false,
-        expected_rows_alice: &[&["en", "B", "1"], &["ja", "A", "2"], &["xx", "A", "1"]],
+        // id=11 の category は `"Z"`（`seed_parity_db`・`in-category` の
+        // レビュー指摘対応コメント参照）。
+        expected_rows_alice: &[&["en", "B", "1"], &["ja", "A", "2"], &["xx", "Z", "1"]],
         expected_rows_bob: &[&["en", "B", "1"], &["ja", "A", "2"], &["ja", "B", "1"]],
         expected_rows_carol: &[&["en", "B", "1"], &["ja", "A", "2"]],
     },
