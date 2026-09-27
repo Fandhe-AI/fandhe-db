@@ -219,17 +219,18 @@ enum SideProjection {
 impl SideProjection {
     fn position(&self, name: &str, schema: &TableSchema) -> Option<usize> {
         match self {
-            SideProjection::All => {
-                if name == "id" {
-                    Some(0)
-                } else {
-                    schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == name)
-                        .map(|i| i + 1)
-                }
-            }
+            // `bind_projection`（`Projection::All`）・`BindingScope::
+            // resolve_in_relation` はいずれも実カラムを疑似列 `id` より優先して
+            // 照合する（スキーマが `id` という実カラムを持つ場合、その値を
+            // 指す）。ここで疑似列を先に判定すると、その規則と矛盾する誤った
+            // 位置（実カラム `id` の値ではなく行キー）を返してしまう
+            // （advisor 指摘の回帰: `tests::star_projection_key_position_prefers_real_id_column_over_pseudo_column`）。
+            SideProjection::All => schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .map(|i| i + 1)
+                .or(if name == "id" { Some(0) } else { None }),
             SideProjection::Columns(v) => v.iter().position(|s| s == name),
         }
     }
@@ -1044,6 +1045,115 @@ mod tests {
         assert_eq!(
             cols.to_projection(),
             Projection::Columns(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    /// advisor 指摘の回帰: スキーマが `id` という実カラムを持つ場合、
+    /// `SideProjection::All::position` は疑似列（位置 0）ではなく実カラムの
+    /// 位置（`1 + index`）を返さなければならない（`bind_projection`・
+    /// `BindingScope::resolve_in_relation` と同じ優先規則）。
+    #[test]
+    fn side_projection_all_position_prefers_real_id_column_over_pseudo_column() {
+        let schema = TableSchema::new(
+            "t",
+            vec![
+                ColumnDef::new("id", ColumnType::Text, false),
+                ColumnDef::new("tag", ColumnType::Text, false),
+            ],
+        );
+        assert_eq!(SideProjection::All.position("id", &schema), Some(1));
+        assert_eq!(SideProjection::All.position("tag", &schema), Some(2));
+    }
+
+    /// 実カラム `id` を持たないスキーマでは疑似列（位置 0）を返す
+    /// （上のテストの対照。回帰が常に失敗するだけの壊れた検証になっていない
+    /// ことの確認）。
+    #[test]
+    fn side_projection_all_position_falls_back_to_pseudo_id_when_no_real_column() {
+        let schema = TableSchema::new("t", vec![ColumnDef::new("tag", ColumnType::Text, false)]);
+        assert_eq!(SideProjection::All.position("id", &schema), Some(0));
+    }
+
+    /// advisor 指摘の統合回帰: 実カラム `id` を持つテーブルを `*` 投影で
+    /// JOIN すると、結合キーの抽出・出力の両方が実カラムの値を使うこと
+    /// （行キーではなく）。
+    #[test]
+    fn star_projection_join_key_uses_real_id_column_not_pseudo_row_key() {
+        let path = unique_db_path("join-star-real-id-column");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        let left_schema = TableSchema::new(
+            "l",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("id", ColumnType::Text, false),
+            ],
+        );
+        let right_schema = TableSchema::new(
+            "r",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("xx", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&left_schema).expect("create l");
+        storage.create_table(&right_schema).expect("create r");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        // 行キー（疑似列）は l=100・r=200（互いに一致しない）だが、実カラム
+        // `id`／`xx` は "shared-key" で一致させる。誤って疑似列を結合キーに
+        // 使うと 0 件、正しく実カラムを使うと 1 件になる。
+        let op_id = OperationId::parse("seed-l-100").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "l",
+            &ctx,
+            100,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0, 0.0]),
+                Value::Text("shared-key".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert l row");
+        let op_id = OperationId::parse("seed-r-200").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "r",
+            &ctx,
+            200,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0, 0.0]),
+                Value::Text("shared-key".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert r row");
+
+        let validated = ValidatedJoin {
+            relations: vec![TableRef::new("l"), TableRef::new("r")],
+            on: vec![(
+                ColumnRef::qualified("l", "id"),
+                ColumnRef::qualified("r", "xx"),
+            )],
+            projection: JoinProjection::All,
+            where_conjuncts: Vec::new(),
+            limit: 10,
+            offset: 0,
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("l".to_string(), left_schema);
+        schemas.insert("r".to_string(), right_schema);
+        let udfs = UdfRegistry::default();
+
+        let result = execute(&read_txn, &ctx, &schemas, &validated, &udfs)
+            .expect("join on real id/xx columns should succeed");
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "join must match on the real id/xx column values, not the pseudo row key"
         );
     }
 }

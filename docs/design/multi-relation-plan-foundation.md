@@ -2,7 +2,9 @@
 
 ## ステータス
 
-Accepted（基盤のみ実装済み。許可リストの開放・`EngineCore` への結線は Issue #925 以降に申し送り）。
+Accepted（基盤実装済み。許可リストの開放・`EngineCore` への結線は `INNER JOIN`
+〔Issue #925〕で消化済み。詳細は `docs/design/inner-join.md` 参照。外部結合
+〔#926〕・JOIN 経路の RLS 境界の網羅検証〔#931〕は引き続き対象外）。
 
 ## ポインタ
 

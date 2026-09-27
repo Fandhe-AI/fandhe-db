@@ -31,7 +31,7 @@ rel         := <table_ident> [[AS] <alias_ident>]
 join_list   := '*' | colref { ',' colref }
 colref      := <ident> | <qualifier>.<ident>
 cond        := colref '=' colref
-conj        := colref <op> <literal>        -- op: = <> < <= > >= / LIKE '<pattern>'
+conj        := colref <op> <literal>        -- op: = < <= > >= / LIKE '<pattern>'
 ```
 
 relation は常にちょうど 2 個。以下はいずれも `42601`（fail-closed）:

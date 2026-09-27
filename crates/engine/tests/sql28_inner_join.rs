@@ -808,3 +808,202 @@ fn describe_rejects_type_mismatch_like_execute() {
         .expect_err("describe must reject the same type mismatch as execute");
     assert_eq!(err.wire_code(), "42804");
 }
+
+// ---------- JOIN と他構文の組み合わせ（対象外事項の防御的確認） ----------
+
+/// Issue #925 §2.6・対象外事項: `DECLARE ... FOR` の内側は `Statement::Scan`／
+/// `Statement::Aggregate` のみを受理するため（`sql::cursor::
+/// validate_declare_inner`）、JOIN を含む内側は `42601`。
+#[test]
+fn declare_cursor_for_join_is_rejected() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "DECLARE c CURSOR FOR SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+        )
+        .expect_err("DECLARE ... FOR JOIN must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// Issue #925 §2.6・対象外事項: `CREATE VIEW` 本文は専用の単一テーブルパーサー
+/// （`parse_view_body`）で検証され、`looks_like_join` を経由しないため JOIN は
+/// 構造的に `42601` になる。
+#[test]
+fn create_view_with_join_body_is_rejected() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    assert_rejected(
+        &core,
+        "tenant-a",
+        "CREATE VIEW v AS SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+        "42601",
+    );
+}
+
+/// Issue #925 §2.6・対象外事項: `IN (SELECT ...)` の内側は `Statement::Scan`
+/// のみを受理するため（`sql::subquery::resolve_where_predicates`）、JOIN を
+/// 含む内側は `42601`。
+#[test]
+fn in_subquery_with_join_body_is_rejected() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    assert_rejected(
+        &core,
+        "tenant-a",
+        "SELECT title FROM documents WHERE author_id IN (SELECT documents.author_id FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10) LIMIT 10",
+        "42601",
+    );
+}
+
+/// Issue #925 §2.6・対象外事項: `EXPLAIN` は `validate_select_statement`
+/// （単一テーブル専用の文法）を直接呼ぶため（`looks_like_join` を経由しない）、
+/// JOIN 形の入力は単一テーブル文法の解析失敗として `42601` になる。
+#[test]
+fn explain_with_join_is_rejected() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    assert_rejected(
+        &core,
+        "tenant-a",
+        "EXPLAIN SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+        "42601",
+    );
+}
+
+/// Issue #925 §2.6・対象外事項: 集合演算の枝パーサー（`parse_set_branch`）は
+/// 専用の単一テーブル文法のため、JOIN を含む枝は `42601`。
+#[test]
+fn union_branch_with_join_is_rejected() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    assert_rejected(
+        &core,
+        "tenant-a",
+        "SELECT title FROM documents UNION SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+        "42601",
+    );
+}
+
+// ---------- NULL・不一致キーの意味論 ----------
+
+#[test]
+fn null_join_key_never_matches() {
+    // `documents_schema` の `author_id` は非 NULL 制約付きのため、この検証専用に
+    // NULL を許容するスキーマを使う。
+    fn nullable_documents_schema(name: &str) -> TableSchema {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("title", ColumnType::Text, false),
+                ColumnDef::new("author_id", ColumnType::BigInt, true),
+            ],
+        )
+    }
+
+    let path = unique_db_path("join-null-key");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage
+        .create_table(&authors_schema(AUTHORS))
+        .expect("create authors");
+    storage
+        .create_table(&nullable_documents_schema(DOCS))
+        .expect("create documents");
+    let tenant_ctx = ctx("tenant-a");
+    insert_author(
+        &storage,
+        AUTHORS,
+        &tenant_ctx,
+        1,
+        "alice",
+        Visibility::Public,
+    );
+    // `author_id` を NULL にした文書は、`authors.id = 1` と一致する値を持たない
+    // ため、NULL キーの行はビルド・プローブいずれからも除外され結合されない。
+    let op_id = engine::recovery::required_op_id::OperationId::parse("seed-null-doc")
+        .expect("valid operation_id");
+    engine::tenant::insert_typed_row(
+        &storage,
+        DOCS,
+        &tenant_ctx,
+        50,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![50.0, 0.0]),
+            Value::Text("doc-null".to_string()),
+            Value::Null,
+        ],
+        &op_id,
+    )
+    .expect("insert document with NULL author_id");
+
+    let core = new_core(storage);
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+    );
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "a NULL join key must never match, even against a row with the same pseudo id"
+    );
+}
+
+#[test]
+fn mismatched_negative_join_key_never_matches() {
+    let path = unique_db_path("join-negative-key");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage
+        .create_table(&authors_schema(AUTHORS))
+        .expect("create authors");
+    storage
+        .create_table(&documents_schema(DOCS))
+        .expect("create documents");
+    let tenant_ctx = ctx("tenant-a");
+    insert_author(
+        &storage,
+        AUTHORS,
+        &tenant_ctx,
+        1,
+        "alice",
+        Visibility::Public,
+    );
+    insert_document(
+        &storage,
+        DOCS,
+        &tenant_ctx,
+        60,
+        "doc-neg",
+        -1,
+        Visibility::Public,
+    );
+
+    let core = new_core(storage);
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+    );
+    assert_eq!(
+        result.rows.len(),
+        0,
+        "a negative BIGINT key must never match the unsigned pseudo id column"
+    );
+}
