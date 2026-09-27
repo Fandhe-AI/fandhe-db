@@ -4166,9 +4166,13 @@ fn resolve_aggregate_input(
                         program,
                     })
                 }
-                ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
-                    "aggregate argument must evaluate to a scalar",
-                )),
+                // Issue #919・SQL-26: 文字列スカラー関数の式は投影・`WHERE` から
+                // 使えるが、集計関数の引数（`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)`）
+                // としては受理しない（対象外事項。式評価の結果がスカラーである
+                // ことを要求する既存契約を維持する）。
+                ExprType::Vector | ExprType::Bool | ExprType::Text => Err(
+                    SqlSurfaceError::invalid_input("aggregate argument must evaluate to a scalar"),
+                ),
             }
         }
     }
@@ -4263,9 +4267,14 @@ fn resolve_count_distinct_input(
                         program,
                     })
                 }
-                ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
-                    "aggregate argument must evaluate to a scalar",
-                )),
+                // Issue #919・SQL-26: `resolve_aggregate_input` と同じ契約
+                // （文字列スカラー関数の式は `COUNT(DISTINCT ...)` の引数として
+                // 受理しない。TEXT 列そのものの直接参照は上の
+                // `AggregateArg::Expr(Expr::Ident(name))` 分岐が
+                // `AggregateInput::TextColumn` として別途受理する）。
+                ExprType::Vector | ExprType::Bool | ExprType::Text => Err(
+                    SqlSurfaceError::invalid_input("aggregate argument must evaluate to a scalar"),
+                ),
             }
         }
     }
@@ -4888,7 +4897,8 @@ fn collect_where_predicate_idents(
 /// 式項目向け実装。`sql::view::expr_columns_within` と同じ走査規則）。
 fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
-        Expr::Number(_) => {}
+        // Issue #919・SQL-26: 文字列リテラルは列識別子を参照しない。
+        Expr::Number(_) | Expr::String(_) => {}
         Expr::Ident(name) => {
             out.insert(name.clone());
         }

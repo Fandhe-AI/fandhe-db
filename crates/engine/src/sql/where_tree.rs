@@ -141,20 +141,23 @@ impl BoundOrGroup {
     }
 
     /// [`Self::metadata_verdict`] が確定させた宣言的判定と、DISTANCE 段の後に
-    /// 確定する行コンテキスト（`id`・`embedding`）を使って最終判定する
-    /// （式述語をここで初めて評価する。エラーを返しうる）。`verdict` は同じ
-    /// `self` に対して呼んだ [`Self::metadata_verdict`] の戻り値を渡す契約
-    /// （形状は常に一致する。同一の束縛済み `BoundOrGroup` から導出するため）。
+    /// 確定する行コンテキスト（`id`・`embedding`・`text_columns`）を使って
+    /// 最終判定する（式述語をここで初めて評価する。エラーを返しうる）。
+    /// `verdict` は同じ `self` に対して呼んだ [`Self::metadata_verdict`] の
+    /// 戻り値を渡す契約（形状は常に一致する。同一の束縛済み `BoundOrGroup`
+    /// から導出するため）。`text_columns`（Issue #919・SQL-26）は
+    /// [`BoundConjunction::matches_deferred`] のドキュメント参照。
     pub(crate) fn matches_deferred(
         &self,
         verdict: &OrGroupMetadataVerdict,
         id: u64,
         embedding: &[f32],
+        text_columns: &[Option<&str>],
         dim: usize,
         scratch: &mut Vec<StackValue>,
     ) -> Result<bool, SqlSurfaceError> {
         for (branch, branch_verdict) in self.branches.iter().zip(verdict.branches.iter()) {
-            if branch.matches_deferred(branch_verdict, id, embedding, dim, scratch)? {
+            if branch.matches_deferred(branch_verdict, id, embedding, text_columns, dim, scratch)? {
                 return Ok(true);
             }
         }
@@ -218,8 +221,17 @@ impl BoundConjunction {
         if !declarative_filter::matches_all(&self.metadata_filters, scanned) {
             return Ok(false);
         }
+        // Issue #919・SQL-26: `visit_column_indices` が `TEXT` 参照を反映済みの
+        // マスクで呼び出し元がデコードした `scanned` を、そのまま `.as_text()` へ
+        // 写す。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
-            if let Some(false) = eval_expr_predicate(expr, program, id, embedding, scratch)? {
+            if let Some(false) =
+                eval_expr_predicate(expr, program, id, embedding, &text_columns, scratch)?
+            {
                 return Ok(false);
             }
         }
@@ -242,6 +254,12 @@ impl BoundConjunction {
     fn visit_column_indices(&self, out: &mut dyn FnMut(usize)) {
         for filter in &self.metadata_filters {
             out(filter.column_index());
+        }
+        // Issue #919・SQL-26: OR 分岐内の式述語が参照する `TEXT` 列も
+        // デコード対象へ含める（欠けるとマスク外参照＝実 NULL との取り違えに
+        // なる。`sql::scan`／`sql::aggregate` 等の `scalar_mask` 導出と同じ理由）。
+        for expr in &self.expr_filters {
+            udf_call::visit_referenced_scalar_columns(expr, out);
         }
         for group in &self.or_groups {
             group.visit_column_indices(out);
@@ -269,11 +287,18 @@ impl BoundConjunction {
     /// が `false` なら（`AND` の短絡評価により）式述語を評価せず不一致を返す。
     /// `true` の場合のみ式述語・ネストした OR 群を評価する（[`Self::matches`] と
     /// 同じ評価順序・NULL 意味論。式述語だけがここで初めて評価されうる）。
+    /// `text_columns`（Issue #919・SQL-26 の文字列関数が参照する `TEXT` 列）は
+    /// 呼び出し元（`sql::exec`）が `candidate_columns`（`Value::Text` のみ
+    /// `Some` になる、型不一致のない安全な変換。`postfilter_verdicts`
+    /// 宣言のコメントが警告する `IS NULL` fail-open は `Value::Integer`／
+    /// `BigInt`／`Array` を巻き込む変換に限られ、`Value::Text` の判別は
+    /// 曖昧にならない）から導出して渡す。
     fn matches_deferred(
         &self,
         verdict: &ConjunctionMetadataVerdict,
         id: u64,
         embedding: &[f32],
+        text_columns: &[Option<&str>],
         dim: usize,
         scratch: &mut Vec<StackValue>,
     ) -> Result<bool, SqlSurfaceError> {
@@ -281,12 +306,14 @@ impl BoundConjunction {
             return Ok(false);
         }
         for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
-            if let Some(false) = eval_expr_predicate(expr, program, id, embedding, scratch)? {
+            if let Some(false) =
+                eval_expr_predicate(expr, program, id, embedding, text_columns, scratch)?
+            {
                 return Ok(false);
             }
         }
         for (group, group_verdict) in self.or_groups.iter().zip(verdict.or_groups.iter()) {
-            if !group.matches_deferred(group_verdict, id, embedding, dim, scratch)? {
+            if !group.matches_deferred(group_verdict, id, embedding, text_columns, dim, scratch)? {
                 return Ok(false);
             }
         }
@@ -303,6 +330,7 @@ fn eval_expr_predicate(
     program: &ExprProgram,
     id: u64,
     embedding: &[f32],
+    text_columns: &[Option<&str>],
     scratch: &mut Vec<StackValue>,
 ) -> Result<Option<bool>, SqlSurfaceError> {
     let references_embedding = udf_call::references_embedding(expr);
@@ -312,10 +340,10 @@ fn eval_expr_predicate(
     // による事前除外は `CASE` の選ばれない分岐に embedding 参照があるだけの
     // 葉まで誤って偽にしていたため撤去し、評価時点の判定へ一本化した）。
     let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
-    match program.eval(id, row_embedding, scratch)? {
+    match program.eval(id, row_embedding, text_columns, scratch)? {
         ExprValue::Bool(true) => Ok(None),
-        // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。Issue #921。
-        // PostgreSQL の 3 値論理と同じ扱い）。
+        // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。Issue #921・
+        // Issue #919（AC2）。PostgreSQL の 3 値論理と同じ扱い）。
         ExprValue::Bool(false) | ExprValue::Null => Ok(Some(false)),
         // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式述語の型を
         // `Bool` に限定済みのため到達しない。

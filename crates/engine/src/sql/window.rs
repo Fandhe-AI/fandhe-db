@@ -375,6 +375,14 @@ fn materialize_rows(
                 }
             };
 
+            // Issue #919・SQL-26: `sql::scan::execute_scan_with_budget` と同じ
+            // 契約（`decode_tier_for_window` が `TextColumnRef` を `scalar_mask`
+            // へ反映済みのため、`scanned` をそのまま `.as_text()` へ写せばよい）。
+            let text_columns: Vec<Option<&str>> = scanned
+                .iter()
+                .map(|v| v.and_then(|s| s.as_text()))
+                .collect();
+
             if !declarative_filter::matches_all(bound.metadata_filters(), &scanned) {
                 continue;
             }
@@ -395,9 +403,11 @@ fn materialize_rows(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, &mut expr_scratch)? {
+                match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // Issue #919・SQL-26（AC2）: NULL（UNKNOWN）は `WHERE` では
+                    // 偽と同義に扱う（`sql::scan` と同じ三値論理契約）。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     _ => {
                         return Err(SqlSurfaceError::invalid_input(
                             "WHERE expression did not evaluate to a boolean",
@@ -545,6 +555,12 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
         if udf_call::references_embedding(expr) {
             needs_embedding = true;
         }
+        // Issue #919・SQL-26: `WHERE` 式が参照する `TEXT` 列を `scalar_mask` へ
+        // 反映する（`sql::scan::decode_tier_for` と同一契約。取りこぼすと
+        // マスク外参照＝実 NULL の誤判定になる fail-closed 違反）。
+        if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+            has_scalar_reference = true;
+        }
     }
     if !bound.or_filters().is_empty() {
         has_scalar_reference = true;
@@ -614,7 +630,10 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
 
     let tier = if needs_embedding {
         DecodeTier::Embedding
-    } else if has_scalar_reference || scalar_mask.iter().any(|&wanted| wanted) {
+    } else if has_scalar_reference
+        || scalar_mask.iter().any(|&wanted| wanted)
+        || !bound.expr_filters().is_empty()
+    {
         DecodeTier::DimAndScalar
     } else {
         DecodeTier::Fast
