@@ -140,14 +140,33 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   autocommit 専用）はすべて `FkCheckMode::All` を明示する。詳細は下記
   「COMMIT 時の遅延検査」参照。
 
-### 計算量（既知の制約）
+### 計算量（Issue #1071 で索引化）
 
-永続索引は導入しない。参照先側の検査は参照元の同一テナントの行数に比例し、
-列参照の参照元側の検査は参照先の同一テナントの行数に比例する（一意性検査
-〔`docs/design/unique-constraint.md`〕と同じ位置づけ。永続索引化は将来の別課題）。
-走査上限（`tenant::MAX_SCANNED_ROWS`）は一意性検査と同じ理由で継承しない
-（上限を超える行数を保有するテナントが一切書き込めなくなる fail-closed 過ぎる
-制約になるため）。
+`crates/engine/src/key_index.rs` の永続キー索引により、参照元側（列参照の
+存在確認）・参照先側（被参照確認）とも**テナントの保有行数に比例しない**
+判定へ切り替えた（`id` 参照は索引導入前から物理キーの点照会で行数に比例
+しない）。
+
+- 索引の形: `(テーブル, 索引名)` で識別する 2 本の redb テーブル（順引き
+  `(tenant, key, row_id) -> ()`・逆引き `(tenant, row_id) -> key`）。索引名は
+  対象列集合から一意に決まり、参照先側（親の被参照列）・参照元側（子の FK
+  列）が同じテーブル・同じ列集合を指す場合は 1 本に集約される（自己参照等）。
+- 維持点: `constraint::enforce_row_constraints_in_txn`（書き込み直後）が
+  登録済み索引を同期する単一箇所（一意性・`CHECK` 検査と同じ検査点）。
+  `DELETE`／`TRUNCATE` は `enforce_referencing_rows_in_txn` が自ら同期・
+  消去する。
+- フォールバック: 索引が未登録（旧 DB・初回参照）の FK・テーブルの組み合わせ
+  に限り、索引導入前と同一の全行走査で判定し、成功後に索引を構築・登録して
+  以後の文から索引経路に切り替える。この構築（backfill）は該当テーブルの
+  **全テナント**を 1 回だけ読むが、結果は応答へ一切影響せず、1 回限りの
+  レイテンシだけが観測可能（テナント境界節参照）。
+- 走査上限（`tenant::MAX_SCANNED_ROWS`）を継承しない理由は変わらない
+  （フォールバック走査に限りテナントの保有行数に比例するため、上限を課すと
+  索引未構築のテナントが書き込めなくなる fail-closed 過ぎる制約になる）。
+- 対象外: `enforce_referencing_rows_in_txn` が呼ぶ
+  `catalog::referencing_foreign_keys_in_txn`（このテーブルを参照する FK の
+  逆引き）はカタログの**テーブル数**に比例する走査のままで、行数には比例
+  しない（索引化は別課題。§対象外・後続候補参照）。
 
 ## テナント境界（RLS-9・RLS-10 (c)）
 
@@ -254,14 +273,19 @@ err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）�
 
 ## 対象外・後続候補
 
-- `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要）
+- `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要。
+  着手時は `key_index::ensure_index_in_txn`／`drop_indexes_for_table_in_txn` を
+  流用できる）
 - `ON DELETE CASCADE`／`SET NULL`／`SET DEFAULT`、制約名
   （`CONSTRAINT <name> FOREIGN KEY`）
 - `SET CONSTRAINTS { ALL | name } { DEFERRED | IMMEDIATE }`（`DEFERRABLE
   INITIALLY IMMEDIATE` を実行時に遅延へ切り替える機能。Issue #1077 のスコープ外）
 - `MATCH PARTIAL`（Issue #1077 のスコープ外。D13）
 - `PRIMARY KEY`／`UNIQUE` 制約への `DEFERRABLE`（Issue #1077 のスコープ外）
-- 参照先側・列参照の検査の索引化（現状はテナント範囲の線形走査）
+- `catalog::referencing_foreign_keys_in_txn`（テーブル数比例のカタログ走査）の
+  索引化（Issue #1071 の対象外。テーブル数は行数と異なり実運用上小さいため）
+- `#[cfg(test)]` の生書き込み API（`catalog.rs`）が索引・制約を迂回する点
+  （production では到達不能。Issue #1078）
 - 明示トランザクション内の `UPDATE`／`DELETE`／`UPSERT`／複数行 `INSERT`
   （単一行 `INSERT`・`TRUNCATE` のみ対応。`docs/design/explicit-transaction.md`）。
   対応すれば `INITIALLY DEFERRED` の遅延検査の観測可能範囲が広がる
