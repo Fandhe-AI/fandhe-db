@@ -212,15 +212,17 @@ pub fn execute(
     let result = core.execute_bound_scan_in_session(ctx, &session, table, |schema, udfs| {
         let mut node_budget = MAX_EXPR_NODES;
         let bound_projection = bind_projection(&projection, schema, udfs, &mut node_budget)?;
-        let bound_filters =
-            bind_filter(filter_items, schema).map_err(FilterError::into_sql_surface_error)?;
+        let (metadata_filters, expr_filters, or_filters) = bind_filter(filter_items, schema, udfs)
+            .map_err(FilterError::into_sql_surface_error)?
+            .into_parts();
         Ok(BoundScan::new(
             table.to_string(),
             bound_projection,
-            bound_filters,
-            Vec::new(),
+            metadata_filters,
+            expr_filters,
             limit,
-        ))
+        )
+        .with_or_filters(or_filters))
     })?;
     Ok(result)
 }

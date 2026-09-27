@@ -41,6 +41,13 @@ use crate::uuid::Uuid;
 /// 列数と独立の定数だが、桁の妥当性は同じ方針に揃える）。
 pub const MAX_METADATA_FILTERS: usize = 256;
 
+/// `<col> [NOT] IN (...)` 1 個が持てる要素数の上限（SQL-24。TASK-208 ポインタ）。
+/// `sql::allowlist::MAX_IN_LIST_ITEMS`（SQL テキスト経由の構文段）と同値を
+/// 採用し、二重定義を避けるため同モジュールがこの定数を再エクスポートする形で
+/// 参照する（NoSQL 表層 `wire-server::http::query::filter`（Issue #945・
+/// NOSQL-14）が `in` 要素数上限の多層防御にも使う公開 API）。
+pub const MAX_IN_LIST_ITEMS: usize = 256;
+
 /// `LIKE` パターン（生パターン。エスケープ解除前）のバイト長上限
 /// （SQL-24／TASK-208、Issue #914）。[`parse_like_pattern`] が確保・解析より
 /// **前**に判定し、超過は `54000`。中間一致・後方一致を含む一般形は

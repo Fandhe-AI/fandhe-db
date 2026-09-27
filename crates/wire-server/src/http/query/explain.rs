@@ -202,20 +202,24 @@ pub fn execute(
         table,
         question.unwrap_or(""),
         mode_literal,
-        |schema, _udfs| -> Result<ExplainShape, ExplainError> {
+        |schema, udfs| -> Result<ExplainShape, ExplainError> {
             // テーブル解決後に初めて `plan` 欠落を判定する（codex-review P1
             // 指摘対応・PR #828。`super::search::execute` が `vector`／`plan`
             // 両方欠落の判定を `bind_search` 自身のテーブル解決後へ委ねるのと
             // 同じ設計）。
             question.ok_or(ExplainError::ExplainRequiresPlan)?;
-            match bind_search(validated, schema)? {
+            match bind_search(validated, schema, udfs)? {
                 BoundSearch::Plan(plan) => {
-                    // NoSQL 表層の `plan` 検索経路は `OR` 未対応（TASK-208・
-                    // Issue #912。計画§「対象外」参照）。
+                    // Issue #945・NOSQL-14: NoSQL 表層の `plan` 検索経路も
+                    // `filter` の範囲比較・IN・OR 拡張を受けるため、式述語・
+                    // OR 群も EXPLAIN の計画分類（`classify_scalar_plan`）へ渡す
+                    // （渡し漏れは OR・式述語が ANN 適用条件判定で無視される
+                    // fail-open のバグになる。security.md「不安全な設計」対応）。
+                    let filters = plan.filters();
                     Ok(ExplainShape::from_filters(
-                        plan.metadata_filters(),
-                        &[],
-                        &[],
+                        filters.metadata_filters(),
+                        filters.expr_filters(),
+                        filters.or_filters(),
                     ))
                 }
                 BoundSearch::Vector(_) => Err(ExplainError::ExplainRequiresPlan),

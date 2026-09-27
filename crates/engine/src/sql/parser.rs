@@ -182,6 +182,25 @@ impl BoundStatement {
         self
     }
 
+    /// `WHERE` の式述語・`OR` 群を設定したコピーを返すビルダー的メソッド
+    /// （Issue #945・NOSQL-14。NoSQL 表層 `filter` の範囲比較・`IN`・`OR` 拡張が、
+    /// `sql::declarative_predicate::bind_declarative_predicates` の束縛結果
+    /// （`BoundWhereFilters::into_parts`）をそのまま渡す入口）。`expr_filters` は
+    /// [`Self::new`] が既定で持つ空の値を置き換え、ステップ列コンパイル
+    /// （[`compile_expr_filter_programs`]）を内部でやり直す（`expr_filters` と
+    /// `expr_filter_programs` の 1 対 1 対応契約を保つ）。
+    #[must_use]
+    pub fn with_where_filters(
+        mut self,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
+    ) -> Self {
+        self.expr_filter_programs = compile_expr_filter_programs(&expr_filters);
+        self.expr_filters = expr_filters;
+        self.or_filters = or_filters;
+        self
+    }
+
     /// 束縛対象のテーブル名。
     pub fn table(&self) -> &str {
         &self.table
@@ -3827,6 +3846,21 @@ impl BoundAggregate {
         })
     }
 
+    /// `WHERE` の `OR` 群を設定した [`Self`] を返す（Issue #945・NOSQL-14。
+    /// NoSQL 表層 `filter` の範囲比較・`IN`・`OR` 拡張が、
+    /// `sql::declarative_predicate::bind_declarative_predicates` の束縛結果
+    /// （`BoundWhereFilters::into_parts`）をそのまま渡す入口。[`Self::new`]・
+    /// [`Self::new_grouped`]・[`Self::new_grouped_by_columns`] のいずれの戻り値にも
+    /// 適用できる）。
+    #[must_use]
+    pub fn with_or_filters(
+        mut self,
+        or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
+    ) -> Self {
+        self.or_filters = or_filters;
+        self
+    }
+
     /// クレート外から単一列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
     /// constructor（TASK-186・NOSQL-5。[`Self::new`] の `GROUP BY` あり版）。
     /// SQL-25 (d) で複数列へ拡張した [`Self::new_grouped_by_columns`] へ
@@ -4623,6 +4657,20 @@ impl BoundScan {
         }
     }
 
+    /// `WHERE` の `OR` 群を設定した [`Self`] を返す（Issue #945・NOSQL-14。
+    /// NoSQL 表層 `filter` の範囲比較・`IN`・`OR` 拡張が、
+    /// `sql::declarative_predicate::bind_declarative_predicates` の束縛結果
+    /// （`BoundWhereFilters::into_parts`）をそのまま渡す入口。`expr_filters` は
+    /// [`Self::new`] が既に受け取るため、ここでは `or_filters` のみを差し替える）。
+    #[must_use]
+    pub fn with_or_filters(
+        mut self,
+        or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
+    ) -> Self {
+        self.or_filters = or_filters;
+        self
+    }
+
     /// `offset` を設定した [`Self`] を返す（Issue #916・SQL-25 (b)・TASK-209。
     /// TASK-186・NOSQL-3 の直接構築経路〔`Self::new`〕から `OFFSET` 付き広域取得を
     /// 組み立てるための builder）。**ここでは検証しない**契約は [`Self::new`] の
@@ -4939,8 +4987,11 @@ fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>)
 
 /// `expr_filters` を束縛時に 1 回だけステップ列コンパイルする（Issue #353）。
 /// [`bind_scan`]・[`BoundScan::new`] の双方が共有する（行ループでの再帰評価を
-/// なくす契約は SQL テキスト経由・直接構築経由のいずれでも同一）。
-fn compile_expr_filter_programs(
+/// なくす契約は SQL テキスト経由・直接構築経由のいずれでも同一）。`pub(crate)`
+/// なのは `core.rs::EngineCore::execute_bound_plan_search_in_session` が
+/// `BoundStatement` を構造体リテラルで直接組み立てる際に共有するため
+/// （Issue #945・NOSQL-14。第 2 のコンパイル経路を作らない）。
+pub(crate) fn compile_expr_filter_programs(
     expr_filters: &[crate::sql::udf_call::BoundExpr],
 ) -> Vec<crate::sql::expr_program::ExprProgram> {
     expr_filters
