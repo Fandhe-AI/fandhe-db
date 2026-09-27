@@ -408,6 +408,306 @@ fn multi_row_upsert_rejects_internal_duplicate_among_new_insert_branches() {
     assert!(rows.is_empty(), "no row must have been written");
 }
 
+// --- ON CONFLICT の UNIQUE 制約列への拡張（TABLE-16、Issue #1074） --------
+
+/// 単一列 UNIQUE への `ON CONFLICT (a) DO NOTHING`: 既存行と衝突する場合は
+/// 変更なし、衝突しない場合は新規挿入になる。
+#[test]
+fn upsert_on_conflict_unique_column_do_nothing() {
+    let (core, path) = new_core("uniq-on-conflict-do-nothing");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT UNIQUE, b TEXT)",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (1, 'x', 'old') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    // 既存の `a='x'` と衝突 → 変更なし・新規挿入もされない。
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (99, 'x', 'new') \
+             ON CONFLICT (a) DO NOTHING USING OPERATION_ID 'op-conflict'",
+        )
+        .expect("DO NOTHING on UNIQUE column conflict must succeed");
+    assert_eq!(outcome.rows_affected, 0);
+    let rows = core
+        .execute_sql(&alice, "SELECT id FROM docs LIMIT 10")
+        .expect("scan should succeed")
+        .rows;
+    assert_eq!(rows.len(), 1, "no new row must have been inserted");
+
+    // 衝突しない場合は通常どおり新規挿入になる。
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (2, 'y', 'new') \
+             ON CONFLICT (a) DO NOTHING USING OPERATION_ID 'op-no-conflict'",
+        )
+        .expect("non-conflicting insert must succeed");
+    assert_eq!(outcome.rows_affected, 1);
+}
+
+/// 単一列 UNIQUE への `ON CONFLICT (a) DO UPDATE SET ...`: 衝突した既存行を
+/// 更新し、`VALUES` 側の `id`（99）の行は作られない。
+#[test]
+fn upsert_on_conflict_unique_column_do_update_updates_existing_row() {
+    let (core, path) = new_core("uniq-on-conflict-do-update");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT UNIQUE, b TEXT)",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (1, 'x', 'old') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (99, 'x', 'new') \
+             ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b USING OPERATION_ID 'op-update'",
+        )
+        .expect("DO UPDATE on UNIQUE column conflict must succeed");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let rows = core
+        .execute_sql(&alice, "SELECT id FROM docs LIMIT 10")
+        .expect("scan should succeed")
+        .rows;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the VALUES-side id (99) must not create a new row"
+    );
+    assert_eq!(
+        rows[0].id, 1,
+        "the existing row (id=1) must be the one updated"
+    );
+}
+
+/// 複合 UNIQUE `(b, c)`: 対象列を `(c, b)`（宣言順と逆）で書いても同じ制約に
+/// 解決され、衝突判定が働く。
+#[test]
+fn upsert_on_conflict_composite_unique_target_order_independent() {
+    let (core, path) = new_core("uniq-on-conflict-composite");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (b TEXT, c TEXT, UNIQUE (b, c))",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, b, c) VALUES (1, 'x', 'y') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, b, c) VALUES (99, 'x', 'y') \
+             ON CONFLICT (c, b) DO NOTHING USING OPERATION_ID 'op-reversed'",
+        )
+        .expect("target written in reverse declaration order must still resolve");
+    assert_eq!(outcome.rows_affected, 0);
+
+    // `(b)` だけの部分一致は制約全体と一致しないため `42601`。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, b, c) VALUES (2, 'x', 'z') \
+             ON CONFLICT (b) DO NOTHING USING OPERATION_ID 'op-partial'",
+        )
+        .expect_err("partial composite target must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// NULL を含む UNIQUE 対象キーは NULLS DISTINCT のため衝突しない（新規挿入）。
+#[test]
+fn upsert_on_conflict_unique_column_null_never_conflicts() {
+    let (core, path) = new_core("uniq-on-conflict-null");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id) VALUES (1) USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row with a=NULL (omitted, nullable)");
+
+    let outcome = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id) VALUES (2) ON CONFLICT (a) DO NOTHING \
+             USING OPERATION_ID 'op-null-2'",
+        )
+        .expect("NULL target key must never conflict");
+    assert_eq!(outcome.rows_affected, 1);
+}
+
+/// テナント境界（受け入れ基準 2）: 同じテナントが所有する**不可視**行
+/// （`Private`）とも UNIQUE 対象で衝突する（可視性フィルタを経由しない
+/// 母集合。RLS-9・RLS-10 (c)）。
+#[test]
+fn upsert_on_conflict_unique_column_conflicts_with_invisible_own_row() {
+    let (core, path) = new_core("uniq-on-conflict-invisible");
+    let _guard = CleanupGuard(path);
+    let alice_full = ctx("alice");
+    let alice_public_only =
+        PolicyContext::with_visibilities("alice", [engine::storage::Visibility::Public])
+            .expect("valid tenant");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice_full,
+        &mut session,
+        "CREATE TABLE docs (a TEXT UNIQUE)",
+    )
+    .expect("create table");
+    core.execute_sql_in_session(
+        &alice_full,
+        &mut SessionState::default(),
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-private'",
+    )
+    .expect("insert as Private (default insert_visibility)");
+
+    // `alice_public_only` からは `id=1` は不可視だが、UNIQUE 対象の衝突判定は
+    // 可視性を問わずテナント所有の全行を母集合にするため、`DO NOTHING` は
+    // 既存の不可視行に吸収される（新規挿入されない）。
+    let outcome = core
+        .execute_insert_sql(
+            &alice_public_only,
+            "INSERT INTO docs (id, a) VALUES (2, 'x') ON CONFLICT (a) DO NOTHING \
+             USING OPERATION_ID 'op-invisible-conflict'",
+        )
+        .expect("conflict with an invisible own row must succeed as DO NOTHING");
+    assert_eq!(outcome.rows_affected, 0);
+}
+
+/// テナント境界: 他テナントが同じ値を持っていても、UNIQUE 対象の母集合は
+/// 自テナントの行に限られるため衝突せず新規挿入になる。
+#[test]
+fn upsert_on_conflict_unique_column_does_not_conflict_across_tenants() {
+    let (core, path) = new_core("uniq-on-conflict-cross-tenant");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-alice'",
+    )
+    .expect("alice seed row");
+
+    let outcome = core
+        .execute_insert_sql(
+            &bob,
+            "INSERT INTO docs (id, a) VALUES (1, 'x') ON CONFLICT (a) DO NOTHING \
+             USING OPERATION_ID 'op-bob'",
+        )
+        .expect("other tenant's same value must not conflict");
+    assert_eq!(outcome.rows_affected, 1);
+}
+
+/// 対象がどの UNIQUE 制約とも一致しない場合は `42601`。
+#[test]
+fn upsert_on_conflict_target_not_matching_any_unique_constraint_is_rejected() {
+    let (core, path) = new_core("uniq-on-conflict-no-match");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT, b TEXT UNIQUE)",
+    )
+    .expect("create table");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (1, 'x', 'y') \
+             ON CONFLICT (a) DO NOTHING USING OPERATION_ID 'op-no-match'",
+        )
+        .expect_err("target not matching any UNIQUE constraint must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// バッチ内の対象キー重複（NULL 以外）は束縛時に `22000` で拒否され、副作用は
+/// ゼロ（台帳・行のいずれも変更されない）。
+#[test]
+fn upsert_on_conflict_unique_column_rejects_duplicate_target_key_within_batch() {
+    let (core, path) = new_core("uniq-on-conflict-batch-dup");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (1, 'x'), (2, 'x') \
+             ON CONFLICT (a) DO NOTHING USING OPERATION_ID 'op-batch-dup'",
+        )
+        .expect_err("duplicate target key within the same batch must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+
+    let rows = core
+        .execute_sql(&alice, "SELECT id FROM docs LIMIT 10")
+        .expect("scan should succeed")
+        .rows;
+    assert!(rows.is_empty(), "no row must have been written");
+}
+
+/// UNIQUE 対象の新規挿入分岐で `VALUES` の `id` が同じテナントの既存 `id` と
+/// 衝突した場合は通常の行キー衝突と同じ `23505`。
+#[test]
+fn upsert_on_conflict_unique_column_new_insert_branch_id_conflict() {
+    let (core, path) = new_core("uniq-on-conflict-insert-id-conflict");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    // `a='y'` は衝突しない（非衝突・新規挿入分岐）が、`id=1` は既存行と衝突する。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (1, 'y') ON CONFLICT (a) DO NOTHING \
+             USING OPERATION_ID 'op-insert-id-conflict'",
+        )
+        .expect_err("new-insert branch id collision must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+}
+
 // --- ALTER TABLE ADD UNIQUE（Rust API）・DROP COLUMN 依存検査 ----------
 
 #[test]

@@ -239,7 +239,10 @@ O(JSON サイズ) の係数が乗る（既知の制約として記録するの�
 
 - SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名
 - 永続一意索引（redb 二次テーブル）による O(log n) 判定
-- `UPSERT` の `ON CONFLICT` 対象列（`id` 固定）への UNIQUE 列拡張
+- `UPSERT` の `ON CONFLICT` 対象列への UNIQUE 列拡張は実装済み（TABLE-16、
+  Issue #1074。設計判断は `docs/design/sql-upsert.md`「ON CONFLICT 対象の
+  UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を対象にすることは
+  引き続きスコープ外（`42601`）。
 - `PRIMARY KEY`／`FOREIGN KEY` 参照元列の対象型拡張（Issue #1073 は UNIQUE
   のみを拡張し、PK・FK は据え置き。D3・D7 参照）
 - SQL `CREATE TABLE` での `REAL`・`NUMERIC`・`JSON`・配列型の列型受理・
