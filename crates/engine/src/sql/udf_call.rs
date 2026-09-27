@@ -1631,21 +1631,51 @@ fn bind_concat(
             detail: "concat argument list unexpectedly empty after validation".to_string(),
         });
     };
-    let acc = iter.fold(None::<BoundExpr>, |acc, next| {
-        let base = acc.unwrap_or_else(|| first.clone());
-        Some(BoundExpr::Builtin {
-            f: BuiltinFn::Concat2,
-            args: vec![base, next],
-        })
-    });
-    let result = match acc {
-        Some(folded) => folded,
-        // 1 引数の CONCAT は空文字との結合として扱う（NULL を返さない契約と
-        // 一貫させる）。
-        None => BoundExpr::Builtin {
-            f: BuiltinFn::Concat2,
-            args: vec![first, BoundExpr::Text(String::new())],
-        },
+    // codex-review P2 指摘対応: 左畳み込みは引数 1 個につき最大 1 個の
+    // `BoundExpr::Builtin { f: Concat2, .. }` ラッパーノードを新規生成するが、
+    // 元の `for a in args { bind_expr_in(...) }` ループは各引数それ自身の
+    // ノード数しか `node_budget` へ課金しておらず、この畳み込みで追加生成
+    // されるラッパーノード自体は未計上だった。`CONCAT(a, b, c, ...)` を多数の
+    // 引数で呼ぶと、束縛結果のノード数が `MAX_EXPR_NODES`（式ノード数上限）を
+    // 実際には超えているのに検査をすり抜けうる（security.md「不安全な設計｜
+    // 無制限リソース確保（DoS）」対応）。ラッパーノードを 1 個生成するたびに
+    // 確保前に `node_budget` から差し引き、超過は他の経路と同じ
+    // `payload_too_large`（`54000`）で fail-closed に拒否する。
+    let mut charge_one_node = || -> Result<(), SqlSurfaceError> {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        Ok(())
+    };
+    let result = match iter.next() {
+        None => {
+            // 1 引数の CONCAT は空文字との結合として扱う（NULL を返さない契約と
+            // 一貫させる）。ラッパーノードを 1 個生成する。
+            charge_one_node()?;
+            BoundExpr::Builtin {
+                f: BuiltinFn::Concat2,
+                args: vec![first, BoundExpr::Text(String::new())],
+            }
+        }
+        Some(second) => {
+            // `first` はここで 1 回だけ最初のラッパーノードへ move する
+            // （複製しない。旧実装の `fold` はクロージャに `first` を参照
+            // キャプチャしていたため 1 回目の反復でのみ `first.clone()` が
+            // 必要だったが、この明示ループ構造では `first` を直接 move できる）。
+            charge_one_node()?;
+            let mut acc = BoundExpr::Builtin {
+                f: BuiltinFn::Concat2,
+                args: vec![first, second],
+            };
+            for next in iter {
+                charge_one_node()?;
+                acc = BoundExpr::Builtin {
+                    f: BuiltinFn::Concat2,
+                    args: vec![acc, next],
+                };
+            }
+            acc
+        }
     };
     Ok((result, ExprType::Text))
 }
@@ -2868,6 +2898,55 @@ mod tests {
                 params.len()
             );
         }
+    }
+
+    /// codex-review P2 指摘の回帰テスト（`bind_concat`）: 多引数 `CONCAT` の
+    /// 左畳み込みが新規生成する `BoundExpr::Builtin { f: Concat2, .. }`
+    /// ラッパーノードが `node_budget` へ課金されることを固定する。
+    /// `concat(label, label, label)` の課金内訳: 最上位の `Expr::Call` ノード
+    /// 自身で 1（`bind_expr_in` が全 variant 共通で入口に課す 1 ノード分）、
+    /// 各 `label` 参照で 1 ずつ計 3（同じく `bind_expr_in` の `Expr::Ident`
+    /// 分岐）、畳み込みで新規生成する `Concat2` ラッパーノードが 2 個（合計
+    /// 6 ノード）。修正前はラッパーノード分（2）が未計上のため実際のコストは
+    /// 4 だったが、修正後は 6 ノード必要になる。予算 5 では（修正前の実コスト
+    /// 4 なら成功するが）ラッパーノード込みで不足し `payload_too_large`
+    /// （`54000`）で拒否されることを確認する。
+    #[test]
+    fn bind_concat_charges_fold_wrapper_nodes_against_node_budget() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+
+        // 予算 6（Call ノード 1 + ident 参照 3 個 + Concat2 ラッパー 2 個）は
+        // ちょうど足りる。
+        let mut budget = 6usize;
+        let (_, ty) = bind_expr(
+            &call(
+                "concat",
+                vec![ident("label"), ident("label"), ident("label")],
+            ),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("budget of exactly 6 nodes should be sufficient");
+        assert_eq!(ty, ExprType::Text);
+        assert_eq!(budget, 0, "all 6 charged nodes should exhaust the budget");
+
+        // 予算 5 はラッパーノード分を課金すると不足するため拒否される
+        // （修正前は実コストが 4〔ラッパーノード未計上〕だったため誤って
+        // 成功していた）。
+        let mut budget = 5usize;
+        let err = bind_expr(
+            &call(
+                "concat",
+                vec![ident("label"), ident("label"), ident("label")],
+            ),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect_err("budget of 4 nodes must be insufficient once wrapper nodes are charged");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     /// [`apply_builtin`] がスライス（`&mut [Option<ExprValue>]`）で引数を受け取り、
