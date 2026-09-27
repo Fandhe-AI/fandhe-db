@@ -1376,12 +1376,41 @@ pub(crate) fn bind_where_predicates(
         node_budget,
         dummy_equality_flags,
         &mut equality_ordinal,
+        crate::sql::udf_call::ColumnRefPolicy::IdAndVectorOnly,
     )
 }
 
-/// [`bind_where_predicates`] の再帰本体。トップレベルの述語列だけでなく、
-/// [`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも自分自身を
-/// 再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
+/// `CHECK` 制約の式述語束縛専用（Issue #1075・TABLE-16 ポインタ）。
+/// [`bind_where_predicates`] と同じ束縛経路（`bind_where_predicates_recursive`）
+/// を共有しつつ、`WherePredicate::Expression` の束縛だけを
+/// [`crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns`] へ切り替え、
+/// INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可する opt-in 拡張（`WHERE`／
+/// `SELECT`／Describe 系の挙動は一切変えない。汎用のレーン A は対象外）。
+/// `sql::check_constraint::CompiledChecks::compile`・`validate_and_build`・
+/// `recompute_referenced_columns` の 3 箇所から呼ばれる。
+pub(crate) fn bind_check_predicates(
+    where_predicates: &[WherePredicate],
+    schema: &TableSchema,
+    node_budget: &mut usize,
+) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    let empty_udfs = crate::sql::udf_call::UdfRegistry::default();
+    let mut equality_ordinal: usize = 0;
+    bind_where_predicates_recursive(
+        where_predicates,
+        schema,
+        &empty_udfs,
+        node_budget,
+        &[],
+        &mut equality_ordinal,
+        crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns,
+    )
+}
+
+/// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
+/// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
+/// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。`column_ref_policy` は
+/// `WherePredicate::Expression` の束縛（`udf_call::bind_expr_with_policy`）へ
+/// そのまま伝播する（Issue #1075・TABLE-16 ポインタ）。
 fn bind_where_predicates_recursive(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1389,6 +1418,7 @@ fn bind_where_predicates_recursive(
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
     equality_ordinal: &mut usize,
+    column_ref_policy: crate::sql::udf_call::ColumnRefPolicy,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
@@ -1404,7 +1434,13 @@ fn bind_where_predicates_recursive(
                 rls_predicate_present = true;
             }
             WherePredicate::Expression(expr) => {
-                let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                let (bound, ty) = crate::sql::udf_call::bind_expr_with_policy(
+                    expr,
+                    schema,
+                    udfs,
+                    node_budget,
+                    column_ref_policy,
+                )?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression must evaluate to a boolean (use a comparison)",
@@ -1428,6 +1464,7 @@ fn bind_where_predicates_recursive(
                             node_budget,
                             dummy_equality_flags,
                             equality_ordinal,
+                            column_ref_policy,
                         )?;
                     bound_branches.push(crate::sql::where_tree::BoundConjunction::new(
                         branch_metadata,
