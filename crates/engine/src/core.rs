@@ -6167,19 +6167,26 @@ impl EngineCore {
         // read txn を開く（検索本体の `search_with_hnsw`／`search_with` は
         // 内部で別途 txn を開くため、ここでの読み取りは判定用の一時的なもの）。
         // 読み取り失敗は fail-closed に「対象外」（brute-force）へ倒す。
-        let (hnsw_targeted, gate_generation) = match self.storage.db().begin_read() {
-            Ok(read_txn) => {
-                let targeted = self.hnsw_state.is_some()
-                    && crate::catalog::hnsw_targeted_in_txn(
+        // `hnsw_state.is_none()`（起動時 opt-in なしの既定デプロイ）では
+        // この read txn 自体を開かない――HNSW opt-in が無効な限り
+        // `search_with_hnsw` 経路には絶対に進まないため、判定用の読み取りは
+        // 無駄なホットパスコストにしかならない（既定デプロイの回帰防止）。
+        let (hnsw_targeted, gate_generation) = if self.hnsw_state.is_none() {
+            (false, None)
+        } else {
+            match self.storage.db().begin_read() {
+                Ok(read_txn) => {
+                    let targeted = crate::catalog::hnsw_targeted_in_txn(
                         &read_txn,
                         &self.index_catalog_gate_cache,
                         table,
                         true,
                     );
-                let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
-                (targeted, generation)
+                    let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
+                    (targeted, generation)
+                }
+                Err(_) => (false, None),
             }
-            Err(_) => (false, None),
         };
         // 上記ゲート用 read txn はここで既に閉じている。判定〜`search_with_hnsw`
         // 呼び出しの間に別の書き込み（索引宣言を含む、テーブルを問わない任意の
