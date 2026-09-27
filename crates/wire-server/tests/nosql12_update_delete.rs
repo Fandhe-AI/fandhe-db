@@ -622,3 +622,113 @@ fn cross_surface_multi_column_set_declared_out_of_alphabetical_order_is_treated_
     assert_eq!(resp.status, 409, "resp={resp:?}");
     assert_eq!(http_common::wire_code_of(&resp), "23505");
 }
+
+// --- 単一行 UPDATE の VECTOR 値表層跨ぎ content_hash 統一（Issue #1061） ----
+//     単一行形（`WHERE id = n`）は束縛後の `Value::Vector` を
+//     `for_update_columns` でハッシュするため、SQL 表層のベクトルリテラル
+//     文字列（`sql::parser::parse_vector_literal`）と NoSQL 表層の JSON 配列
+//     （`JsonNumber::as_f32`）はいずれも `json::parse_f32_text` の単一丸めを
+//     経由し、束縛前から同一表現になる。本節はそのことを本番ルータ経由
+//     （wire 越し）で固定する（述語形〔`filter`〕はまだ `0A000` で未結線の
+//     ため対象外。述語形の表現統一自体は `recovery::content_hash` の単体
+//     テストで固定済み）。
+
+/// SQL 表層で書いた VECTOR 値を、NoSQL 表層から同一 `operation_id` で
+/// 再送すると `23505`（重複）になる。
+#[test]
+fn cross_surface_vector_value_sql_then_nosql_resend_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+    query(&both, &insert_body(1, "ja", "n12-vec-seed"));
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET embedding = '[-0,0.5,0.6]' WHERE id = 1 \
+         USING OPERATION_ID 'n12-vec-1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"embedding":[-0.0,0.5,0.6]},"where":{"id":1},"operation_id":"n12-vec-1"}"#,
+    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// SQL 表層の表記ゆれ（`'1.0'`／`'2.0'`／`'3.0'`）は NoSQL 表層の整数表記
+/// （`[1,2,3]`）と同一値としてハッシュされ、同一 `operation_id` の再送は
+/// `23505`（重複）になる。
+#[test]
+fn cross_surface_vector_value_spelling_variants_are_treated_as_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+    query(&both, &insert_body(1, "ja", "n12-vec-spelling-seed"));
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET embedding = '[1.0,2.0,3.0]' WHERE id = 1 \
+         USING OPERATION_ID 'n12-vec-spelling-1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"embedding":[1,2,3]},"where":{"id":1},"operation_id":"n12-vec-spelling-1"}"#,
+    );
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+}
+
+/// D2 の `-0.0` 保持契約: SQL 表層の `'[0,0.5,0.6]'`（`+0.0`）に対し、
+/// NoSQL 表層から `-0.0` を含む値で同一 `operation_id` を再送すると
+/// `22023`（内容不一致）になる（表層を跨いでも符号付きゼロは正規化しない）。
+#[test]
+fn cross_surface_vector_value_negative_zero_is_distinct_from_positive_zero() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+    query(&both, &insert_body(1, "ja", "n12-vec-negzero-seed"));
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET embedding = '[0,0.5,0.6]' WHERE id = 1 \
+         USING OPERATION_ID 'n12-vec-negzero-1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"embedding":[-0.0,0.5,0.6]},"where":{"id":1},"operation_id":"n12-vec-negzero-1"}"#,
+    );
+    assert_eq!(resp.status, 400, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "22023");
+}
+
+/// 逆順（NoSQL 表層で書いた VECTOR 値を SQL 表層から再送）でも `23505`
+/// になることを 1 ケース固定する。
+#[test]
+fn cross_surface_vector_value_nosql_then_sql_resend_is_duplicate() {
+    let (core, _guard) = new_core();
+    let (both, mut sql) = spawn_both(core);
+    query(&both, &insert_body(1, "ja", "n12-vec-reverse-seed"));
+
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"embedding":[0.4,0.5,0.6]},"where":{"id":1},"operation_id":"n12-vec-reverse-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET embedding = '[0.4,0.5,0.6]' WHERE id = 1 \
+         USING OPERATION_ID 'n12-vec-reverse-1'",
+    );
+    common::expect_error_response_with_sqlstate(&mut sql, "23505");
+    common::read_ready_for_query(&mut sql);
+}

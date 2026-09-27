@@ -49,16 +49,18 @@ engine 側のエラー文言〔`unknown column: {name}`〕へ埋め込まれて 
 として `42601`（SQL 文法は SET 項目 ≥ 1 を要求するため）。
 
 `VECTOR` 列の値は **JSON 配列形のみ**を受理する（`insert` op と同じ
-「文字列形のベクトルリテラルは受理しない」非対称）。各要素は
-`engine::json::JsonNumber::as_f32`（`insert.rs::bind_row` と同一の単一丸め
-経路）で有限性を検証したうえで、SQL ベクトルリテラル文字列
-`"[t1,t2,...]"` へ直列化して `bind_update`（内部で
-`sql::parser::parse_vector_literal` を呼ぶ）へ渡す。`NegInt(0)`（JSON
-`-0`）は明示的に `"-0"` として直列化する——SQL 表層の `-0.0` 保持契約
-（`content_hash` 一致）と揃えるためであり、`"0"` へ丸めると SQL
-`'[-0,1]'`（`-0.0f32`）と NoSQL `[-0,1]`（`+0.0f32` に丸めた場合）の
-`content_hash` が食い違い、同一リテラルの再送が「内容不一致」（`22023`）と
-誤判定されうる（`insert.rs::bind_row` の同種コメント参照）。
+「文字列形のベクトルリテラルは受理しない」非対称）。**訂正（Issue #1061。
+PR #1038〔Issue #896 レビュー指摘〕以降の実装に合わせた記述の是正）**:
+各要素は `typed_json::vector_literal_values`（内部で
+`engine::json::JsonNumber::as_f32` を呼ぶ。`insert.rs::bind_row` と同一の
+単一丸め経路）で有限性を検証したうえで `Vec<f32>` を直接組み立て、
+`InsertLiteral::Vector`（テキストリテラルの 64 KiB 上限を経由しない
+`f32` 列の直接構築。SQL ベクトルリテラル文字列への直列化は経由しない）
+として `bind_update`（内部で `engine::sql::parser::bind_vector_literal_values`
+を呼ぶ。`sql::parser::parse_vector_literal` は経由しない）へ渡す。
+`-0.0`（JSON `-0`）は `JsonNumber::as_f32` がビット列のまま `f32` へ
+変換するため、SQL 表層の `-0.0` 保持契約（`content_hash` 一致）と自然に
+揃う——文字列直列化を経由しないため、丸めによる符号情報の欠落は起こらない。
 
 ### D3: engine 側に NoSQL 向けセッション入口を 2 つ新設
 
@@ -180,6 +182,50 @@ treated_as_duplicate`）。
 回帰テストで固定済み（`crates/engine/src/tenant.rs::tests::
 update_row_columns_resend_matches_pre_normalization_declared_order_
 ledger_entry`）。
+
+### 述語形 VECTOR 割当の表現統一と既存台帳エントリの互換性（Issue #1061）
+
+述語つき `UPDATE ... SET <vector列> = '文字列リテラル'`（単一行形〔`WHERE
+id = n`〕ではなく `filter` 相当・SQL 表層は `WHERE <述語>`）は、対象列が
+`VECTOR` の場合、SQL 表層由来の `InsertLiteral::String`（タグ 1・生
+テキスト）と NoSQL 表層由来の `InsertLiteral::Vector`（タグ 5・f32 LE
+列。上記 D2 訂正の PR #1038）とで別ドメインのハッシュになっていた。この
+ため、`filter` 結線（#871 系）後に同一 `operation_id` を表層を跨いで
+再送すると、本来 `23505`（同一内容の再送）であるべきものが `22023`
+（内容不一致）へ誤判定される余地があった。
+
+- **影響範囲**: 変わるのは述語形 `UPDATE` で `VECTOR` 列を `SET` した
+  `InsertLiteral::String` 割当を含むハッシュだけ。単一行形（`WHERE
+  id = n`。束縛後の `Value::Vector` を `for_update_columns` でハッシュ
+  するため、正規化前から表層横断で一致済み）・`DELETE`・`INSERT`・
+  `UPSERT`・`VECTOR` 以外の列を対象とする述語形 `UPDATE` はビット不変。
+- **正準化**: `VECTOR` 列を対象とする `String` 割当を
+  `sql::parser::parse_vector_literal` でパースし、`InsertLiteral::Vector`
+  と同一のタグ 5・f32 LE 列レイアウトへ揃える
+  （`recovery::content_hash::push_dml_assignments`）。パース失敗は
+  `Err`（fail-closed。タグ 1 へのフォールバックなし）。
+- **legacy 受理の仕組み**: 正規化前に記録されえたハッシュ
+  （`VECTOR` 列への `String` もタグ 1 のまま連結したもの）を
+  `for_update_where_legacy_text_vector` で計算し、`content_hash::
+  needs_legacy_vector_hash` が true の場合のみ `ledger::
+  record_in_txn_accepting` の `legacy_hashes` へ渡す。新規記録・以降の
+  照合には常に正準ハッシュのみを使う（keep-first 契約は変えない）。
+  同一 `operation_id` だが内容が異なる再送は、正準ハッシュ・legacy
+  ハッシュのいずれとも一致しないため引き続き `22023`（`22023` 契約は
+  弱めていない）。
+- **回帰テスト**: `crates/engine/src/recovery/content_hash.rs::tests::
+  for_update_where_vector_string_and_vector_literal_match_across_surfaces`
+  （表層跨ぎ一致の直接証明）・`for_update_where_legacy_text_vector_
+  reproduces_pre_normalization_layout`（legacy 受理）・
+  `crates/engine/src/tenant.rs::tests::update_rows_where_unchecked_
+  resend_matches_pre_normalization_vector_string_ledger_entry`
+  （legacy 台帳エントリとの互換）・`crates/engine/tests/
+  sql_predicate_dml_exec.rs::predicate_update_set_vector_column_resend_
+  content_hash_matches_spelling_variants`（表記ゆれ・`-0.0` 保持を
+  production 経路で固定）。`filter` 未結線のため wire-server 越しの
+  述語形 E2E は本 Issue の対象外（単一行形の表層跨ぎは元々一致済みだが
+  `crates/wire-server/tests/nosql12_update_delete.rs::
+  cross_surface_vector_value_*` で層 A 固定を追加した）。
 
 ## 対象外・申し送り
 

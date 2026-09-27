@@ -435,7 +435,14 @@ SQL 表層の `UPDATE ... SET col1 = .., col2 = ..` はクライアントが記�
 アルファベット順でない宣言順で書いた `UPDATE` と同一値の NoSQL `update`
 は、同一 `operation_id` への再送であれば内容一致の再送（`23505`）として
 正しく判定される（詳細は `docs/design/nosql-update-delete-mapping.md`
-「複数列 `set` の宣言順と `content_hash`」節参照）。
+「複数列 `set` の宣言順と `content_hash`」節参照）。`VECTOR` 列の値
+（SQL 表層のベクトルリテラル文字列と NoSQL 表層の数値配列）は、この
+`where` 形（単一行）では元々同一の内容照合ハッシュに一致しており、
+Issue #1061 では層 A の固定テスト（`nosql12_update_delete.rs::
+cross_surface_vector_value_*`）を追加した（述語形〔`filter`〕の表現統一は
+同 Issue の主眼だが `filter` は未結線のため本節の対象外。詳細は
+`docs/design/nosql-update-delete-mapping.md`「述語形 VECTOR 割当の表現
+統一と既存台帳エントリの互換性」節参照）。
 
 要求例（`where` 形）:
 

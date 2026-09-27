@@ -298,7 +298,7 @@ pub struct TruncateOutcome {}
 ///
 /// 述語形（SQL-19・TASK-192、Issue #871。[`execute_predicate_delete`]）では
 /// `rows_affected` は `0..=MAX_DML_AFFECTED_ROWS`（`sql::parser::
-/// DEFAULT_MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
+/// MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
 /// 件数をそのまま表す（同じく他テナント行・不可視行は候補にすら含まれない）。
 ///
 /// `rows_affected` は自テナントの結果を表すのみのため、`TruncateOutcome` と
@@ -339,7 +339,7 @@ pub struct ReturningOutcome {
 /// `tenant::update_row_columns_unchecked` ドキュメント参照）。
 ///
 /// 述語形: `rows_affected` は `0..=MAX_DML_AFFECTED_ROWS`（`sql::parser::
-/// DEFAULT_MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
+/// MAX_DML_AFFECTED_ROWS`）の範囲を取り、一致した自テナント所有行の
 /// 件数をそのまま表す（他テナント行・不可視行は候補にすら含まれない。
 /// [`DeleteOutcome`] の述語形と同じ意味論）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3791,7 +3791,9 @@ pub(crate) fn execute_predicate_delete(
         Ok(true)
     };
 
-    let limit = bound.max_affected_rows();
+    // 上限は UPDATE と共有する唯一の上限 API（`MAX_DML_AFFECTED_ROWS`・
+    // `check_dml_affected_rows`。Issue #997 で統合）を直接参照する。
+    let limit = crate::sql::parser::MAX_DML_AFFECTED_ROWS;
     match crate::tenant::delete_rows_where_unchecked(
         storage,
         bound.table(),
@@ -3807,7 +3809,7 @@ pub(crate) fn execute_predicate_delete(
             rows_affected: rows_affected as u64,
         }),
         Ok(crate::tenant::PredicateDmlOutcome::LimitExceeded { count }) => {
-            crate::sql::parser::check_affected_row_count(count, limit)?;
+            crate::sql::parser::check_dml_affected_rows(count)?;
             Err(SqlSurfaceError::Internal {
                 detail: "predicate DELETE limit check did not reject an over-limit count"
                     .to_string(),
@@ -3833,6 +3835,12 @@ pub(crate) fn execute_predicate_update(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     schema: &TableSchema,
     content_hash_value: &crate::recovery::content_hash::ContentHash,
+    // Issue #1061: VECTOR 列 SET 割当ハッシュの正準化前に記録されえた台帳
+    // エントリと照合するための候補群（`tenant::update_rows_where_unchecked`
+    // 経由で `ledger::record_in_txn_accepting` の `legacy_hashes` へ渡す）。
+    // 呼び出し元（`core.rs::execute_predicate_update_form`）が
+    // `content_hash::needs_legacy_vector_hash` で必要な場合のみ計算する。
+    legacy_hashes: &[crate::recovery::content_hash::ContentHash],
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -3906,8 +3914,8 @@ pub(crate) fn execute_predicate_update(
         Ok(true)
     };
 
-    // `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows`（ADR §6「上限 API の
-    // 並立（申し送り）」。両上限 API の統合は本 Issue の対象外のまま）。
+    // 上限は DELETE と共有する唯一の上限 API（`MAX_DML_AFFECTED_ROWS`・
+    // `check_dml_affected_rows`。ADR §6「上限 API の統合」。Issue #997 で統合済み）。
     let limit = crate::sql::parser::MAX_DML_AFFECTED_ROWS;
     match crate::tenant::update_rows_where_unchecked(
         storage,
@@ -3915,6 +3923,7 @@ pub(crate) fn execute_predicate_update(
         ctx,
         ledger_write,
         content_hash_value,
+        legacy_hashes,
         Some(schema),
         bound.assignments(),
         needs_embedding,

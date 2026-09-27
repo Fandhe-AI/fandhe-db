@@ -53,6 +53,19 @@ ADR §4 のレイアウトをそのまま `crates/engine/src/recovery/content_ha
 定義セクションの推移閉包・WASM UDF 呼び出しの拒否判定順序）は ADR §4.3／§4.4／
 §4.4.1 のとおり実装した。
 
+3. **`VECTOR` 列 `SET` 割当の正準化と `schema` 引数（Issue #1061）**:
+   `for_update_where` に `schema: &TableSchema` を追加し、`SET` 割当のうち
+   対象列がスキーマ上 `VECTOR(dim)` の `InsertLiteral::String` は
+   `sql::parser::parse_vector_literal` でパースしてから `InsertLiteral::Vector`
+   と同一のタグ 5・f32 LE 列レイアウトへ正準化する（`VECTOR` 以外の列は
+   従来どおりタグ 1・生テキスト）。SQL・NoSQL 表層跨ぎの同一 `operation_id`
+   再送で `content_hash` が食い違い `22023` に誤判定される問題の是正。
+   正規化前に記録されえた台帳エントリとの互換は `legacy_hashes`
+   （`ledger::record_in_txn_accepting`）で扱う。詳細は
+   `docs/design/multi-row-dml-operation-id.md`「9.6 改訂（Issue #1061）」・
+   `docs/design/nosql-update-delete-mapping.md`「述語形 VECTOR 割当の表現
+   統一と既存台帳エントリの互換性」参照。
+
 ## 3. 実行契約（ADR §6）
 
 `tenant.rs::delete_rows_where_unchecked`／`update_rows_where_unchecked` は以下の順序
@@ -133,13 +146,32 @@ validate_delete_statement_tokens`／`validate_update_form_tokens` が呼び出�
 （`22000`。`sql/scan.rs` と同じ失敗点） → 内容照合ハッシュ計算（WASM UDF 呼び出し
 の拒否・`42601`） → 実行本体（台帳照合 `23505`／`22023`・上限超過 `54000`）。
 
-## 6. 上限 API の並立（申し送り。ADR §6 の既存申し送り）
+## 6. 上限 API の統合と既定値（Issue #997。既定値決定の正本）
 
-`DELETE` 側は `DEFAULT_MAX_DML_AFFECTED_ROWS`＋`check_affected_row_count(count,
-limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(count)`と
-いう、シグネチャの異なる 2 つの上限 API が並立している（いずれも
-`crates/engine/src/sql/parser.rs`。値はいずれも 1,000）。両者の統合は本 Issue の対
-象外のまま。
+以前は `DELETE` 側が `DEFAULT_MAX_DML_AFFECTED_ROWS`＋`check_affected_row_count(count,
+limit)`、`UPDATE` 側が `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(count)`と
+いう、シグネチャの異なる 2 つの上限 API に並立していた（申し送り。ADR §6）。
+Issue #997 でこれを解消し、以下へ統合済み:
+
+- **唯一の上限 API**: `crates/engine/src/sql/parser.rs` の
+  `MAX_DML_AFFECTED_ROWS`（`pub const usize`）＋
+  `check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>`。
+  `UPDATE`・`DELETE`（述語形）の両実行結線（`sql/exec.rs` の
+  `execute_predicate_update`／`execute_predicate_delete`）がこれを直接参照する。
+  `DEFAULT_MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`・
+  `BoundPredicateDelete::max_affected_rows()`（および `BoundPredicateDelete::new`
+  の同名引数）は削除した（破壊的変更）。
+- **既定値**: `1,000`（本リポの実装既定値であり、spec 由来の数値ではない）。
+- **設定可能化**: CLI・セッション単位などの設定機構は導入しない。この既定値・
+  非設定化は**オーナー判断待ちの暫定確定**であり、オーナーが後から見直せる。
+  将来設定可能にする場合の接続点は、既存の
+  `tenant::delete_rows_where_unchecked`／`update_rows_where_unchecked` の
+  `limit: usize` 引数（`pub(crate)`）とする。
+- **契約は不変**: 上限超過は `54000`（`SqlSurfaceError::PayloadTooLarge`）・
+  副作用ゼロ（write トランザクション drop・台帳未記録。RECOVER-11）。`detail` は
+  件数と上限のみを含め、テナント・行内容には触れない。統合に伴い `detail` の
+  文言は `DELETE` 側の形式（`DML affected row count {count} exceeds limit
+  {MAX_DML_AFFECTED_ROWS}`）へ統一した（既存テストは文言をアサートしていない）。
 
 ## 7. PR #989（#865 単一行 UPDATE 実行結線）・PR #991（RETURNING）との整合ルール
 
@@ -180,8 +212,8 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
   のみの DELETE・`operation_id` 欠落・`execute_sql`（セッション無し）の既存拒否・
   影響行数上限超過（`54000`・副作用ゼロ。DELETE 側
   `predicate_delete_over_limit_is_rejected_with_no_side_effects`・UPDATE 側
-  `predicate_update_over_limit_is_rejected_with_no_side_effects`——§6 の上限
-  API 並立を踏まえ両者を独立に固定）。
+  `predicate_update_over_limit_is_rejected_with_no_side_effects`——DELETE・
+  UPDATE が同一上限 API（§6。Issue #997 で統合）を共有することを両経路で固定）。
 - `crates/engine/tests/predicate_dml_failure_injection.rs`: 候補列挙途中の式評価
   エラー（0 除算）が write トランザクション全体を副作用ゼロで拒否すること（RLS 可視
   列は `TEXT` を算術に使えないため、疑似列 `id` の算術で誘発）・台帳未記録（同一
@@ -193,7 +225,8 @@ limit)`、`UPDATE` 側は `MAX_DML_AFFECTED_ROWS`＋`check_dml_affected_rows(cou
 ## 9. 申し送り・スコープ外
 
 - NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
-- 上限 API（§6）の統合・既定値の確定（オーナー判断）。
+- 上限 API の統合は Issue #997 で解消済み（§6 参照）。既定値
+  （現行 1,000・設定機構なし）の最終確定はオーナー判断待ち。
 - spec 側 RECOVER-11 は 2026-09-23 に確定済み（`docs/spec` submodule を確定後の参照へ更新。
   確定は本 PR のマージを条件とする）。
 - `WasmUdfBackend` への安定な定義識別子の追加（wasmtime 接続時）。

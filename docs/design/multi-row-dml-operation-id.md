@@ -17,8 +17,9 @@
   `crates/engine/src/sql/allowlist.rs`（`ValidatedPredicateUpdate`・
   `ValidatedPredicateDelete`・`WherePredicate`・`InsertLiteral`）・
   `crates/engine/src/sql/parser.rs`（`bind_update_form`・`bind_predicate_delete`・
-  `check_dml_affected_rows`・`MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`・
-  `DEFAULT_MAX_DML_AFFECTED_ROWS`）・`crates/engine/src/sql/udf_call.rs`（`Expr`・
+  `check_dml_affected_rows`・`MAX_DML_AFFECTED_ROWS`。DELETE 側の別系統
+  〔`check_affected_row_count`・`DEFAULT_MAX_DML_AFFECTED_ROWS`〕は Issue #997 で
+  本 API へ統合済み）・`crates/engine/src/sql/udf_call.rs`（`Expr`・
   `BinOp`・`parse_number_literal`・`MAX_EXPR_NODES`・`UdfRegistry`・
   `UdfDefinition`・`define_function`・`MAX_SESSION_UDFS`）・
   `crates/engine/src/sql/expr_program.rs`（`ExprProgram::compile`）・
@@ -430,9 +431,8 @@ SQL 表層と NoSQL 表層のどちらから送っても同一ハッシュ空間
    候補行を確定する。`MAX_DML_AFFECTED_ROWS + 1` 件で列挙を打ち切る
    （`check_dml_affected_rows` の入力契約と同じ「打ち切った列挙結果を
    渡す」設計）。
-4. `check_dml_affected_rows`（`UPDATE`）／`check_affected_row_count`
-   （`DELETE`。`DEFAULT_MAX_DML_AFFECTED_ROWS` を limit として渡す）を
-   **変更を開始する前**に呼ぶ。超過時はトランザクションを drop する
+4. `check_dml_affected_rows`（`UPDATE`・`DELETE` 共通の唯一の上限 API。
+   Issue #997 で統合済み）を**変更を開始する前**に呼ぶ。超過時はトランザクションを drop する
    （台帳エントリ・行変更のいずれも残らない。INDEX-4 の `54000` と同じ
    「副作用ゼロで拒否」の扱い）。
 5. 候補行すべてへ変更を適用する。
@@ -463,13 +463,15 @@ RECOVER-5／RECOVER-6 の既存ガード（`recovery::commit_boundary`・
 ならないため、件数・エラー文言・`wire_code` のいずれにも他テナントの
 存在情報を含めない（RLS-9・RLS-10）。
 
-**上限 API の並立（申し送り）**: `UPDATE` 側は `MAX_DML_AFFECTED_ROWS`
-（`pub const`）＋`check_dml_affected_rows(count)`、`DELETE` 側は
-`DEFAULT_MAX_DML_AFFECTED_ROWS`（`pub const`）＋
+**上限 API の統合（Issue #997 で解消）**: 当初 `UPDATE` 側は
+`MAX_DML_AFFECTED_ROWS`（`pub const`）＋`check_dml_affected_rows(count)`、
+`DELETE` 側は `DEFAULT_MAX_DML_AFFECTED_ROWS`（`pub const`）＋
 `check_affected_row_count(count, limit)` という、シグネチャの異なる 2 つの
-上限 API が並立している（いずれも `crates/engine/src/sql/parser.rs`）。
-両者の統合は本 ADR の対象外とし、#871 実装時の申し送り事項として記録する
-に留める。
+上限 API に並立していた（いずれも `crates/engine/src/sql/parser.rs`）。
+Issue #871 実装時の申し送り事項だったこの並立は Issue #997 で
+`MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows` へ統合し、`DELETE` 側の
+別系統は削除した（詳細・既定値の確定は
+`docs/design/predicate-dml-exec.md` §6 参照）。
 
 ## 7. 単一行 `UPDATE` 実行結線（Issue #865）への申し送り
 
@@ -523,6 +525,41 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
 （§4.2 の計算位置・エラー型）も同 doc に記録済み。`OpTag::UpdateWhere = 9`／
 `DeleteWhere = 10`（既存 1〜8 の続番。値の変更なし）。
 
+## 9.6 改訂（Issue #1061）
+
+述語つき `UPDATE ... SET <vector列> = '文字列リテラル'` は、SQL 表層由来の
+`InsertLiteral::String`（タグ 1・生テキスト）と NoSQL 表層由来の
+`InsertLiteral::Vector`（タグ 5・f32 LE 列。PR #1038）とで別ドメインの
+ハッシュになっており、同一 `operation_id` を表層を跨いで再送すると本来
+`23505`（同一内容の再送）であるべきものが `22023`（内容不一致）に誤判定
+されうる問題を是正した（`filter` 結線〔#871 系〕前に表現を揃える対応）。
+
+- **§4.2 シグネチャの変更**: `for_update_where` に列型参照用の
+  `schema: &TableSchema` 引数を追加した（`push_dml_assignments` 内で
+  `VECTOR` 列を対象とする `String` 割当をパースして正準化するため）。
+- **§4.3「2. `SET` 割当」の意図の一部修正**: 「`String` は生テキストの
+  まま連結する」という根拠は TEXT 系列には成り立つが、`VECTOR` 列では
+  成り立たない——永続化される内容は `sql::parser::parse_vector_literal`
+  でパースされた後の `f32` 列であり、文字列としての表記ゆれ（`'[1,2,3]'`
+  対 `'[1.0, 2.0, 3.0]'`）は行内容の差にならない。対象列がスキーマ上
+  `VECTOR(dim)` の場合のみ、`String` をパースしてから
+  `InsertLiteral::Vector` と同一のタグ 5・f32 LE 列レイアウトで連結する。
+  `VECTOR` 以外の列への `String`・`Number`・`Bool`・`Null` 割当はビット
+  同一のまま変更しない。
+- **割当リテラルのタグ表（追補）**: `String`＝1（`VECTOR` 以外の列）・
+  `Number`＝2・`Bool`＝3・`Null`＝4・`Vector`＝5（NoSQL 由来、および
+  `VECTOR` 列への `String` の正準形。Issue #1061）。
+- **fail-closed**: `VECTOR` 列への `String` のパースに失敗した場合は
+  `Err`（`sql::parser::parse_vector_literal` が返す `22000`／`54000`）を
+  そのまま返す。タグ 1（生テキスト）へはフォールバックしない。
+- **既存台帳エントリとの互換**: 正規化前に記録されえた「`VECTOR` 列への
+  `String` 割当をタグ 1 のまま連結したハッシュ」は `legacy_hashes`
+  （`ledger::record_in_txn_accepting`。PR #992 の先例と同型）として
+  同一内容の再送判定にのみ使う。新規記録・上書きは常に正準ハッシュを
+  使うため keep-first・`22023` 契約は変わらない。影響範囲・回帰テストは
+  `docs/design/nosql-update-delete-mapping.md`「述語形 VECTOR 割当の
+  表現統一と既存台帳エントリの互換性」節を参照。
+
 ## 10. 判断記録（オーナー記入欄）
 
 | 項目 | 内容 |
@@ -539,8 +576,8 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
   #876 が担当）
 - 実行結線（候補行列挙・一括適用・応答生成・キャッシュ失効通知）の実装
   （#871・#870 の実行結線部分）
-- 上限既定値（`MAX_DML_AFFECTED_ROWS`・`DEFAULT_MAX_DML_AFFECTED_ROWS`）の
-  統合・数値の見直し
+- 上限既定値の数値見直し・設定可能化（API 統合自体は Issue #997 で解消済み。
+  詳細は `docs/design/predicate-dml-exec.md` §6 参照）
 - `OpTag::UpdateWhere`／`DeleteWhere` の実コード追加（#871 の担当。本 ADR は
   値の割当方針〔既存 1〜6 の続番〕のみを示す）
 - UPSERT（#872）・明示トランザクション台帳（RECOVER-12・#942）の詳細設計
