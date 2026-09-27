@@ -17,8 +17,9 @@
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OnConflictAction, OrderByForm, Projection, UpsertValue,
-    ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
+    FunctionArg, InsertLiteral, OnConflictAction, OrderByForm, Projection, ScalarOrderKey,
+    UpsertValue, ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement,
+    WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -4442,6 +4443,13 @@ pub struct BoundScan {
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
     pub(crate) limit: usize,
+    /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。SQL テキスト経由の
+    /// [`bind_scan`]・[`bind_scan_with_dummy_flags`] のみが非空値を設定する。
+    /// [`Self::new`]（TASK-186・NOSQL-3 の直接構築入口）は常に空を設定する
+    /// （NoSQL 表層の `sort` 対応は NOSQL-15・別 Issue #946・#947 の対象外
+    /// スコープで、既存の公開 API 契約を変えない）。クレート外へは公開しない
+    /// （型 [`crate::sql::parser::BoundOrderKey`] 自体が `pub(crate)`）。
+    pub(crate) order_by: Vec<BoundOrderKey>,
     /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。[`validate_search_offset`]。
     /// Issue #916・SQL-25 (b)・TASK-209）。既定は 0（no-op）で、[`Self::new`] 経由の
     /// 直接構築（TASK-186・NOSQL-3）や既存呼び出し元との後方互換を保つ。
@@ -4450,6 +4458,117 @@ pub struct BoundScan {
     /// 完全に同一の実行経路（`sql::scan::execute_scan_with_budget`）を通る。
     /// [`Self::new`]（NoSQL 表層の直接構築経路）は常に空にする。
     pub(crate) windows: Vec<BoundWindowItem>,
+}
+
+/// スカラー `ORDER BY` の対象（Issue #915・SQL-25）。`Id` は疑似列
+/// （[`ProjectedColumn::Id`] と同じ行キー由来）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundOrderTarget {
+    Id,
+    Column(usize),
+}
+
+/// 型ごとの比較規約の分類（[`crate::sql::scan`] の比較器がこの分類で分岐する。
+/// Issue #915・SQL-25）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderKind {
+    /// 疑似列 `id`（`u64`。テナント内で一意）。
+    Id,
+    /// `TEXT`（バイト列順。実装既定値として C collation とみなす）。
+    Bytes,
+    /// `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP`（いずれも符号付き整数として
+    /// 全順序を持つ内部表現。§比較規約）。
+    SignedInt,
+    /// `REAL`／`DOUBLE`（NaN はすべての非 NaN より大きく NaN 同士は等しい。
+    /// `-0.0 == 0.0`）。
+    Float,
+    /// `BOOLEAN`（`false < true`）。
+    Bool,
+    /// `NUMERIC`（[`crate::numeric::cmp_exact`] で scale 差を丸めず比較する）。
+    Numeric,
+    /// `UUID`（バイト列順。[`crate::uuid::Uuid`] の派生 `Ord`）。
+    Uuid,
+    /// `ENUM`（宣言順のラベル添字。文字列順ではない）。
+    Enum,
+}
+
+/// スカラー `ORDER BY` の束縛済み 1 キー分（Issue #915・SQL-25）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundOrderKey {
+    pub(crate) target: BoundOrderTarget,
+    pub(crate) kind: OrderKind,
+    pub(crate) descending: bool,
+}
+
+/// [`ColumnType`] から比較規約の分類を導出する（Issue #915・SQL-25）。
+/// `VECTOR`・`ARRAY`・`BYTEA`・`JSON`／`JSONB` は並べ替え不能として `None`
+/// （呼び出し元が `SqlSurfaceError::InvalidInput`〔`22000`〕へ写像する。
+/// SQL-25 (c) で `VECTOR` への `DISTINCT` を `22000` とするのと同じ判断）。
+fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
+    match ty {
+        ColumnType::Text => Some(OrderKind::Bytes),
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Date | ColumnType::Timestamp => {
+            Some(OrderKind::SignedInt)
+        }
+        ColumnType::Real | ColumnType::Double => Some(OrderKind::Float),
+        ColumnType::Boolean => Some(OrderKind::Bool),
+        ColumnType::Numeric { .. } => Some(OrderKind::Numeric),
+        ColumnType::Uuid => Some(OrderKind::Uuid),
+        ColumnType::Enum(_) => Some(OrderKind::Enum),
+        ColumnType::Vector(_)
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Json
+        | ColumnType::Jsonb => None,
+    }
+}
+
+/// [`crate::sql::allowlist::ScalarOrderKey`] 列を `schema` と照合して
+/// [`BoundOrderKey`] 列へ束縛する（Issue #915・SQL-25）。列名の解決は
+/// [`bind_projection`] の `Projection::Columns` 分岐と同じ優先順位
+/// （カタログ上の実カラムを疑似列 `id` より優先して照合する。Issue #56
+/// レビュー指摘対応の方針を踏襲）。未知列・並べ替え不能な型はいずれも
+/// `SqlSurfaceError::InvalidInput`（`22000`）で拒否する。
+fn bind_scalar_order_by(
+    order_by: &[ScalarOrderKey],
+    schema: &TableSchema,
+) -> Result<Vec<BoundOrderKey>, SqlSurfaceError> {
+    let mut bound = Vec::new();
+    for key in order_by {
+        if let Some(index) = schema.columns.iter().position(|c| c.name == key.column) {
+            let column = schema
+                .columns
+                .get(index)
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "order key column index out of range".to_string(),
+                })?;
+            let kind = resolve_order_kind(&column.ty).ok_or_else(|| {
+                SqlSurfaceError::invalid_input(format!(
+                    "unsupported ORDER BY column type: {}",
+                    key.column
+                ))
+            })?;
+            bound.push(BoundOrderKey {
+                target: BoundOrderTarget::Column(index),
+                kind,
+                descending: key.descending,
+            });
+            continue;
+        }
+        if key.column == "id" {
+            bound.push(BoundOrderKey {
+                target: BoundOrderTarget::Id,
+                kind: OrderKind::Id,
+                descending: key.descending,
+            });
+            continue;
+        }
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "unknown column: {}",
+            key.column
+        )));
+    }
+    Ok(bound)
 }
 
 impl BoundScan {
@@ -4483,6 +4602,9 @@ impl BoundScan {
             expr_filter_programs,
             or_filters: Vec::new(),
             limit,
+            // Issue #915・SQL-25: NoSQL 表層からの直接構築（NOSQL-3）は
+            // 対象外スコープ（NOSQL-15・別 Issue #946・#947）のため常に空。
+            order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
         }
@@ -4884,6 +5006,9 @@ pub(crate) fn bind_scan_with_dummy_flags(
     // （構文段の許可リストは値の上限を持たない生値のまま通すため）。
     let offset = validate_search_offset(stmt.offset())?;
 
+    // Issue #915・SQL-25: スカラー ORDER BY の列名解決・比較規約の割り当て。
+    let order_by = bind_scalar_order_by(stmt.order_by(), schema)?;
+
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
@@ -4901,6 +5026,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         expr_filter_programs,
         or_filters,
         limit,
+        order_by,
         offset,
         windows,
     })

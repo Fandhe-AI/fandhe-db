@@ -17,8 +17,8 @@
 //! 可視性が参照者へ引き継がれることは構造的に起こらない。
 
 use super::allowlist::{
-    parse_view_body, AggregateArg, Projection, SelectItem, SqlSurfaceError, TableLookup,
-    WherePredicate, WindowSelectItem,
+    parse_view_body, AggregateArg, Projection, ScalarOrderKey, SelectItem, SqlSurfaceError,
+    TableLookup, WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -112,7 +112,16 @@ pub(crate) fn resolve_from(
     let mut exposed: Option<Vec<String>> = None;
     let mut acc_predicates: Vec<WherePredicate> = Vec::new();
     for view in chain.into_iter().rev() {
-        check_columns_within_view(exposed.as_deref(), &view.projection, &view.where_predicates)?;
+        // ビュー本文（`ParsedViewBody`）は構文上 `ORDER BY` を持たない
+        // （[`parse_view_body`] のドキュメント参照）ため、連鎖の各段の検査には
+        // 空スライスを渡す（クエリ自身の ORDER BY 検査は呼び出し元
+        // `sql::allowlist::validate_sql_tokens` が別途行う）。
+        check_columns_within_view(
+            exposed.as_deref(),
+            &view.projection,
+            &view.where_predicates,
+            &[],
+        )?;
         if let Projection::Columns(cols) = view.projection {
             exposed = Some(cols);
         }
@@ -176,6 +185,7 @@ pub(crate) fn check_columns_within_view(
     view_columns: Option<&[String]>,
     projection: &Projection,
     where_predicates: &[WherePredicate],
+    order_by: &[ScalarOrderKey],
 ) -> Result<(), SqlSurfaceError> {
     let Some(columns) = view_columns else {
         return Ok(());
@@ -208,6 +218,17 @@ pub(crate) fn check_columns_within_view(
     }
     for pred in where_predicates {
         check_predicate_columns_within(columns, pred)?;
+    }
+    // Issue #915・SQL-25: スカラー ORDER BY のキー列（疑似列 `id` は
+    // `columns` に含まれないため常に許可リスト外——ビュー経由の広域取得で
+    // `id` 順は使えない。将来の拡張候補として `docs/design/
+    // scalar-order-by-scan.md` に記録する）。
+    for key in order_by {
+        if !columns.iter().any(|vc| vc == &key.column) {
+            return Err(SqlSurfaceError::InvalidInput {
+                detail: format!("unknown column: {}", key.column),
+            });
+        }
     }
     Ok(())
 }
@@ -388,9 +409,13 @@ mod tests {
             column: "hidden".to_string(),
             value: "x".to_string(),
         }))];
-        let err =
-            check_columns_within_view(Some(&view_columns), &Projection::All, &where_predicates)
-                .expect_err("NOT-wrapped reference to a hidden column must be rejected");
+        let err = check_columns_within_view(
+            Some(&view_columns),
+            &Projection::All,
+            &where_predicates,
+            &[],
+        )
+        .expect_err("NOT-wrapped reference to a hidden column must be rejected");
         assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
     }
 
