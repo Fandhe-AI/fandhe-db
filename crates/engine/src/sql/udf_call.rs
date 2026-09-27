@@ -1742,13 +1742,25 @@ fn bind_concat(
             "function concat expects at least 1 argument, got 0",
         ));
     }
+    // codex-review P1 指摘対応: `CONCAT` は NULL 引数を空文字として扱い常に
+    // 非 NULL を返す契約（`apply_builtin` の `BuiltinFn::Concat2` 実装・
+    // `take_text_or_null_arg` 参照）だが、素の `bind_expr_in` は裸の
+    // `Expr::Null` を「型が決められない」として `0A000` で拒否するため
+    // （`Expr::Null` は `CASE`/`COALESCE`/`NULLIF` 以外の位置では拒否する設計。
+    // `bind_expr_in` 内の `Expr::Null` 腕のコメント参照）、`CONCAT(NULL, 'x')`
+    // が束縛段で拒否されてしまい実行時契約に到達できなかった。`CASE`/
+    // `COALESCE` と同じ [`bind_null_aware`] を使い、`Expr::Null` を型未確定の
+    // `BoundExpr::Null` として受理する（実行時は `ExprStep::ConstNull` →
+    // `take_text_or_null_arg` の NULL 分岐が空文字として扱う）。
     let mut bound_args = Vec::with_capacity(args.len());
     for a in args {
-        let (b, ty) = bind_expr_in(a, env, node_budget)?;
-        if ty != ExprType::Text {
-            return Err(SqlSurfaceError::invalid_input(
-                "function concat arguments must be text",
-            ));
+        let (b, ty) = bind_null_aware(a, env, node_budget)?;
+        if let Some(ty) = ty {
+            if ty != ExprType::Text {
+                return Err(SqlSurfaceError::invalid_input(
+                    "function concat arguments must be text",
+                ));
+            }
         }
         bound_args.push(b);
     }
@@ -3118,6 +3130,58 @@ mod tests {
         )
         .expect_err("budget of 4 nodes must be insufficient once wrapper nodes are charged");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review P1 指摘の回帰テスト（`bind_concat`）: `CONCAT` は NULL 引数を
+    /// 空文字として扱い常に非 NULL を返す契約（AC2）だが、修正前は裸の
+    /// `Expr::Null` を `bind_expr_in` に渡していたため `0A000`
+    /// （`FeatureNotSupported`）で束縛段から拒否され、`CONCAT(NULL, 'x')` を
+    /// 実行できなかった。`bind_null_aware`（`CASE`/`COALESCE` と共有）を使う
+    /// ことで NULL リテラルを受理し、実行時は空文字として結合されることを
+    /// 固定する。
+    #[test]
+    fn concat_with_null_literal_argument_binds_and_evaluates_as_empty_string() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = 100usize;
+        let (bound, ty) = bind_expr(
+            &call("concat", vec![Expr::Null, Expr::String("x".to_string())]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("concat(NULL, 'x') must bind successfully (NULL is empty string in CONCAT)");
+        assert_eq!(ty, ExprType::Text);
+
+        let value = eval_with_scalars(&bound, 1, &[], &[]).expect("evaluation must succeed");
+        match value {
+            ExprValue::Text(s) => assert_eq!(s.as_ref(), "x"),
+            other => panic!("expected Text(\"x\"), got {other:?}"),
+        }
+    }
+
+    /// [`concat_with_null_literal_argument_binds_and_evaluates_as_empty_string`]
+    /// の追加ケース: 唯一の引数が NULL の場合（1 引数 CONCAT は自身と空文字の
+    /// 結合として扱う既存契約と組み合わさる）も空文字を返す。
+    #[test]
+    fn concat_with_only_null_literal_argument_evaluates_as_empty_string() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = 100usize;
+        let (bound, ty) = bind_expr(
+            &call("concat", vec![Expr::Null]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("concat(NULL) must bind successfully");
+        assert_eq!(ty, ExprType::Text);
+
+        let value = eval_with_scalars(&bound, 1, &[], &[]).expect("evaluation must succeed");
+        match value {
+            ExprValue::Text(s) => assert_eq!(s.as_ref(), ""),
+            other => panic!("expected Text(\"\"), got {other:?}"),
+        }
     }
 
     /// [`apply_builtin`] がスライス（`&mut [Option<ExprValue>]`）で引数を受け取り、
