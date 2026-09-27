@@ -4194,6 +4194,15 @@ pub fn execute_upsert(
             crate::tenant::UpsertAction::DoUpdate(&tenant_assignments)
         }
     };
+    // `sql::parser::BoundConflictTarget` を `tenant::UpsertTarget`（`sql` へ
+    // 依存しない最小表現）へ変換する（Issue #1074。`tenant.rs` モジュール
+    // ドキュメント参照）。
+    let tenant_target = match &bound.target {
+        crate::sql::parser::BoundConflictTarget::RowId => crate::tenant::UpsertTarget::RowId,
+        crate::sql::parser::BoundConflictTarget::Unique(indices) => {
+            crate::tenant::UpsertTarget::Unique(indices)
+        }
+    };
 
     let outcome = crate::tenant::upsert_typed_rows_unchecked(
         storage,
@@ -4201,6 +4210,7 @@ pub fn execute_upsert(
         ctx,
         Visibility::Private,
         &rows,
+        &tenant_target,
         &tenant_action,
         ledger_write,
         Some(bound_schema),
@@ -4759,6 +4769,7 @@ mod tests {
                     ],
                     operation_id: Some(upsert_op_id.clone()),
                 }],
+                target: crate::sql::parser::BoundConflictTarget::RowId,
                 action: BoundConflictAction::DoUpdate(vec![(
                     2,
                     BoundUpsertValue::Literal(Value::Text("stale".to_string())),
