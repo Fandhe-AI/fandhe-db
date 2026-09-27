@@ -1186,11 +1186,16 @@ struct HnswEngineState {
 ///   （SQL 表層の `WHERE` 句省略が構文段で拒否されることとのパリティ。
 ///   `bind_predicate_delete` 自体には空列を拒否するガードが無いため、
 ///   NoSQL 経路はこの関数が唯一の防御になる）。
-/// - `PredicateCall`（RLS 述語 `visible()`。NoSQL `filter` は列名として
-///   RLS 述語名を拒否するため生成されない契約）・`Expression`（wire 層は
-///   `Expr` を構築しない）・`Or`（PR #1118〔未マージ〕がマージされるまで
-///   NoSQL `filter` に OR 語彙が無い）・`InSubquery`／`Exists`（NoSQL に
-///   サブクエリ構文が無い）はいずれも `42601` で拒否する。
+/// - `Equality`／`BoolEquality`／`Prefix` の 3 variant のみを明示的に許可し、
+///   それ以外（`PredicateCall`〔RLS 述語 `visible()`。NoSQL `filter` は列名として
+///   RLS 述語名を拒否するため生成されない契約〕・`Expression`〔wire 層は
+///   `Expr` を構築しない〕・`BoolColumn`・`Compare`・`InList`・`Between`・
+///   `IsNull`・`Not`（内側が許可 3 variant であっても `Not` 自体は許可語彙に
+///   無いため無条件で拒否する）・`Or`（PR #1118〔未マージ〕がマージされるまで
+///   NoSQL `filter` に OR 語彙が無い）・`InSubquery`／`Exists`〔NoSQL に
+///   サブクエリ構文が無い〕）はすべて `42601` で拒否する（codex-review P2
+///   指摘対応、PR #1121。`_ => {}` によるワイルドカード許可は将来 variant
+///   追加時に無言で穴を開けるため使わず、網羅的 `match` にする）。
 fn reject_unsupported_predicate_dml_forms(
     predicates: &[crate::sql::allowlist::WherePredicate],
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
@@ -1203,8 +1208,27 @@ fn reject_unsupported_predicate_dml_forms(
     }
     for predicate in predicates {
         match predicate {
+            // 契約上 `bind` closure が生成してよい 3 variant のみ許可する
+            // （関数ドキュメント参照）。
+            WherePredicate::Equality { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::Prefix { .. } => {}
+            // 契約外の variant はすべて拒否する（codex-review P2 指摘対応、
+            // PR #1121）。`_ => {}` によるワイルドカード許可を排し、`WherePredicate`
+            // へ将来 variant が追加された際もコンパイルエラーで気付けるよう
+            // 網羅的に列挙する。`Not` は内側が許可 3 variant（`Equality`・
+            // `BoolEquality`・`Prefix`）であっても、契約が定める NoSQL 述語形
+            // DML の許可語彙（`Not` を含まない）に無いため、内側を再帰検査して
+            // 通す（誤って `Ok` を返す）のではなく `Not` 自体を無条件で拒否する
+            // （codex-review 指摘: `Not(Equality)` が再帰検査を通過していた欠陥）。
             WherePredicate::PredicateCall { .. }
             | WherePredicate::Expression(_)
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Not(_)
             | WherePredicate::Or(_)
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. } => {
@@ -1212,14 +1236,6 @@ fn reject_unsupported_predicate_dml_forms(
                     "predicate form is not supported for NoSQL update/delete filter",
                 ));
             }
-            // `Not` は構文段の不変条件として内側が `PredicateCall`・
-            // `Expression` になることはない（`sql::allowlist::WherePredicate::Not`
-            // ドキュメント参照）が、NoSQL の `bind` closure はこの不変条件の
-            // 外にあるため、念のため内側も同じ検査に通す（多層防御）。
-            WherePredicate::Not(inner) => {
-                reject_unsupported_predicate_dml_forms(std::slice::from_ref(inner.as_ref()))?;
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -5503,10 +5519,12 @@ impl EngineCore {
     /// 3. `bind` closure で SET 割当・`WHERE` 述語列を得る（呼び出し元は
     ///    `wire-server::http::query::update::map_set_assignments` と
     ///    `filter::bind_filter_where_predicates` を使う）
-    /// 4. `bind` が返した `WherePredicate` 列を検査する（空列・
-    ///    `PredicateCall`／`Expression`／`Or`／`InSubquery`／`Exists` を
-    ///    `42601` で拒否。NoSQL `filter` 経由では構造上生成されない形への
-    ///    多層防御）
+    /// 4. `bind` が返した `WherePredicate` 列を検査する（`Equality`／
+    ///    `BoolEquality`／`Prefix` の 3 variant のみ許可し、空列を含む
+    ///    それ以外〔`PredicateCall`／`Expression`／`BoolColumn`／`Compare`／
+    ///    `InList`／`Between`／`IsNull`／`Not`／`Or`／`InSubquery`／`Exists`〕
+    ///    は `42601` で拒否。NoSQL `filter` 経由では構造上生成されない形への
+    ///    多層防御。[`reject_unsupported_predicate_dml_forms`] 参照）
     /// 5. ガード済みの `operation_id`（`bind` closure の外で確定済みの
     ///    引数そのもの）から [`crate::sql::allowlist::ValidatedPredicateUpdate`]
     ///    を engine 内部で構築する（`pub(crate)` フィールドへの struct
@@ -9237,5 +9255,77 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("truncate of an unknown relation must fail"));
         assert_eq!(err.wire_code(), "42P01");
+    }
+
+    // codex-review P2 指摘対応（PR #1121）: `reject_unsupported_predicate_dml_forms`
+    // が契約外の `WherePredicate` variant（`Compare`／`BoolColumn`・`Not` に包んだ
+    // `Equality`）を `_ => {}` で通過させていた欠陥の回帰テスト。許可 3 variant
+    // （`Equality`／`BoolEquality`／`Prefix`）は受理し、それ以外はすべて
+    // `42601` で拒否することを確認する。
+    #[test]
+    fn reject_unsupported_predicate_dml_forms_allows_only_the_documented_three_variants() {
+        use crate::sql::allowlist::{CompareOp, WherePredicate};
+
+        let allowed = [
+            WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            },
+            WherePredicate::BoolEquality {
+                column: "flag".to_string(),
+                value: true,
+            },
+            WherePredicate::Prefix {
+                column: "path".to_string(),
+                pattern: "src/%".to_string(),
+            },
+        ];
+        for predicate in allowed {
+            assert!(
+                reject_unsupported_predicate_dml_forms(std::slice::from_ref(&predicate)).is_ok(),
+                "documented predicate form must be accepted: {predicate:?}"
+            );
+        }
+
+        let rejected = [
+            WherePredicate::BoolColumn {
+                column: "flag".to_string(),
+            },
+            WherePredicate::Compare {
+                column: "amount".to_string(),
+                op: CompareOp::Lt,
+                value: "1".to_string(),
+            },
+            WherePredicate::InList {
+                column: "lang".to_string(),
+                values: vec!["ja".to_string()],
+            },
+            WherePredicate::Between {
+                column: "amount".to_string(),
+                low: "1".to_string(),
+                high: "2".to_string(),
+            },
+            WherePredicate::IsNull {
+                column: "flag".to_string(),
+                negated: false,
+            },
+            // `Not(Equality)` は許可 3 variant の 1 つを包んでいても、
+            // 述語形 DML では `Not` 自体が語彙外（契約は `WherePredicate::Not`
+            // ドキュメント参照）であり、内側の検査を通過させて `Ok` を返して
+            // はならない（欠陥の再現ケース）。
+            WherePredicate::Not(Box::new(WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            })),
+        ];
+        for predicate in rejected {
+            let err = reject_unsupported_predicate_dml_forms(std::slice::from_ref(&predicate))
+                .expect_err("undocumented predicate form must be rejected");
+            assert_eq!(
+                err.wire_code(),
+                "42601",
+                "unexpected wire_code for {predicate:?}: {err:?}"
+            );
+        }
     }
 }
