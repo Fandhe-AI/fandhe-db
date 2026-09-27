@@ -114,7 +114,51 @@ fn render_expression_predicate(expr: &Expr) -> String {
 fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Number(s) => s.clone(),
+        // Issue #919・SQL-26: 文字列リテラルは SQL の標準的な引用符エスケープ
+        // （`'` → `''`）で往復可能にレンダリングする（`parse(render(x)) == x`
+        // 契約。`escape_literal` は同モジュールの既存ヘルパーを共有する）。
+        Expr::String(s) => format!("'{}'", escape_literal(s)),
         Expr::Ident(name) => name.clone(),
+        // codex-review（Cursor Bugbot）P1 指摘対応: `POSITION` は組み込み関数の
+        // 中で唯一カンマ区切りではない SQL 標準特殊構文（`POSITION(needle IN
+        // haystack)`）を持つ（`sql::allowlist::Parser::parse_function_call_expr`
+        // 参照。`args` は評価順どおり `[haystack, needle]` の順で格納される一方、
+        // 構文はカンマ形 `POSITION(a, b)` を明示的に `42601` で拒否する）。他の
+        // 組み込み関数（`LOWER`／`UPPER`／`LENGTH`／`SUBSTR`／`CONCAT`／`TRIM`／
+        // `REPLACE`）はいずれも構文段でカンマ区切りの通常の関数呼び出し形のみを
+        // 受理するため下の汎用腕でそのまま往復するが、`POSITION` だけは汎用の
+        // カンマ形で出力すると永続化された CHECK 定義が再パースできず
+        // `CREATE TABLE` 自体が失敗する（`validate_and_build` の往復検証が
+        // fail-closed に拒否するため、サイレントな破損ではなく作成失敗という
+        // 形で顕在化する）。
+        Expr::Call { name, args } if name.eq_ignore_ascii_case("position") => match args.as_slice()
+        {
+            [haystack, needle] => {
+                // `name` をそのまま使う（`eq_ignore_ascii_case` で判定している
+                // ため、大文字小文字は元のテキストの綴りのまま。他の組み込み
+                // 関数の汎用腕〔`format!("{name}(...)")`〕と同じ「呼び出し元の
+                // 綴りをそのまま往復させる」契約に揃える。ここでリテラル
+                // `"POSITION"` に固定すると、元の綴りが `"position"` 等だった
+                // 場合に再パース結果の `name` フィールドが一致せず往復が
+                // 壊れる）。
+                format!(
+                    "{name}({} IN {})",
+                    render_expr(needle),
+                    render_expr(haystack)
+                )
+            }
+            // 束縛済み `Expr::Call { name: "position", .. }` は構文段が常に
+            // 2 引数（`haystack`／`needle`）で構築する不変条件を持つ（`parse_
+            // function_call_expr` 参照）。崩れた場合でも `unreachable!` にはせず
+            // （coding-rust.md「panic させない」）、下の汎用カンマ形へフォール
+            // スルーする。生成テキストは呼び出し元の往復検証
+            // （`validate_and_build`）が再パースの不一致として fail-closed に
+            // 拒否するため、誤ったテキストが永続化されることはない。
+            _ => {
+                let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
+                format!("{name}({})", rendered_args.join(", "))
+            }
+        },
         Expr::Call { name, args } => {
             let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{name}({})", rendered_args.join(", "))
@@ -252,7 +296,7 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
 
 fn reject_forbidden_expr(expr: &Expr) -> Result<(), SqlSurfaceError> {
     match expr {
-        Expr::Number(_) | Expr::Ident(_) => Ok(()),
+        Expr::Number(_) | Expr::Ident(_) | Expr::String(_) => Ok(()),
         Expr::Call { name, args } => {
             if !udf_call::is_builtin_function_name(name) {
                 return Err(SqlSurfaceError::unsupported(format!(
@@ -328,9 +372,23 @@ fn referenced_column_names(
             push(&column.name);
         }
     }
+    // Issue #919・SQL-26: 束縛済み式フィルタが参照する `TEXT` 列も同様に依存
+    // 列へ含める（`lower(label)` 等。取りこぼすと `ALTER TABLE DROP COLUMN`
+    // の依存検査をすり抜け、CHECK が参照する列を削除できてしまう）。
+    let mut text_mask = vec![false; schema.columns.len()];
+    for expr in expr_filters {
+        udf_call::mark_referenced_scalar_columns(expr, &mut text_mask);
+    }
+    for (index, wanted) in text_mask.iter().enumerate() {
+        if *wanted {
+            if let Some(column) = schema.columns.get(index) {
+                push(&column.name);
+            }
+        }
+    }
     fn collect_idents<'a>(expr: &'a Expr, acc: &mut Vec<&'a str>) {
         match expr {
-            Expr::Number(_) => {}
+            Expr::Number(_) | Expr::String(_) => {}
             Expr::Ident(name) => acc.push(name.as_str()),
             Expr::Call { args, .. } => {
                 for arg in args {
@@ -626,6 +684,12 @@ impl CompiledChecks {
                 conjuncts.push(CompiledConjunct::Declarative(filter));
             }
             for expr in &expr_filters {
+                // Issue #919・SQL-26: 式述語が参照する `TEXT` 列も
+                // `column_mask` へ反映する（`enforce` の `scan_scalar_columns_masked`
+                // 呼び出しがこのマスクを使ってデコードするため、反映漏れは
+                // マスク外参照＝実 NULL との取り違えという fail-closed 判定に
+                // 落ちる）。
+                udf_call::mark_referenced_scalar_columns(expr, &mut column_mask);
                 conjuncts.push(CompiledConjunct::Expr {
                     program: ExprProgram::compile(expr),
                 });
@@ -670,6 +734,12 @@ impl CompiledChecks {
                     TenantWriteError::Catalog(crate::catalog::CatalogError::Invalid(e.to_string()))
                 })?;
         let mut expr_scratch: Vec<StackValue> = Vec::new();
+        // Issue #919・SQL-26: `column_mask` は `TEXT` 参照を反映済み
+        // （`CompiledChecks::compile` 参照）。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for check in &self.checks {
             for conjunct in &check.conjuncts {
                 let satisfied_or_unknown = match conjunct {
@@ -689,13 +759,14 @@ impl CompiledChecks {
                         // 事前判定は `CASE` の選ばれない分岐に embedding 参照が
                         // あるだけの行まで誤って UNKNOWN 扱いにしていたため撤去
                         // し、評価時点の判定へ一本化した）。
-                        match program.eval(id, embedding, &mut expr_scratch) {
+                        match program.eval(id, embedding, &text_columns, &mut expr_scratch) {
                             Ok(ExprValue::Bool(b)) => b,
-                            // UNKNOWN（NULL）は充足扱いにする（対象ビヘイビア:
-                            // SQL-26。Issue #921。PostgreSQL 互換。上の
-                            // `Declarative` 腕「参照列 NULL は違反にしない」と
-                            // 同じ意図的判断——NULL を返す式を書けるのは DDL
-                            // 権限を持つ主体のみのため制約の迂回にはならない）。
+                            // UNKNOWN（NULL）は充足扱いにする（Issue #919・
+                            // SQL-26（AC2）と Issue #921・SQL-26 の共有契約。
+                            // PostgreSQL 互換。上の `Declarative` 腕「参照列
+                            // NULL は違反にしない」と同じ意図的判断——NULL を
+                            // 返す式を書けるのは DDL 権限を持つ主体のみのため
+                            // 制約の迂回にはならない）。
                             Ok(ExprValue::Null) => true,
                             Ok(_) => {
                                 // 束縛段（`bind_where_predicates`）が式述語の
@@ -1072,6 +1143,101 @@ mod tests {
                 op: BinOp::Eq,
                 lhs: Box::new(expr.clone()),
                 rhs: Box::new(Expr::Number("1".to_string())),
+            };
+            let rendered = render_expression_predicate(&top);
+            let reparsed = parse_check_predicate_text(&rendered)
+                .unwrap_or_else(|e| panic!("reparse of {rendered:?} failed: {e:?}"));
+            assert_eq!(
+                reparsed,
+                vec![WherePredicate::Expression(top)],
+                "round trip mismatch for rendered text {rendered:?}"
+            );
+        }
+    }
+
+    /// codex-review（Cursor Bugbot）P1 指摘の回帰テスト: 文字列スカラー関数群
+    /// （Issue #919・SQL-26）8 種すべてについて `render_expr` が生成するテキストが
+    /// 再パースで同じ木へ戻ることを固定する。`POSITION` は組み込み関数の中で
+    /// 唯一カンマ区切りでない特殊構文（`POSITION(needle IN haystack)`）を持つため
+    /// （`sql::allowlist::Parser` はカンマ形 `POSITION(a, b)` を `42601` で拒否する）、
+    /// 汎用のカンマ形レンダリングでは往復できず `CREATE TABLE` 自体が失敗して
+    /// いた（`render_expr` の `POSITION` 専用腕を参照）。他の 7 関数は構文段が
+    /// 通常のカンマ区切り関数呼び出し形のみを受理するため、この単体テストで
+    /// 既に往復が保証されていることも合わせて固定する。
+    #[test]
+    fn render_expr_round_trips_all_string_scalar_functions_through_reparse() {
+        use crate::sql::allowlist::{parse_check_predicate_text, WherePredicate};
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        fn call(name: &str, args: Vec<Expr>) -> Expr {
+            Expr::Call {
+                name: name.to_string(),
+                args,
+            }
+        }
+
+        let cases: Vec<Expr> = vec![
+            call("lower", vec![Expr::Ident("label".to_string())]),
+            call("upper", vec![Expr::Ident("label".to_string())]),
+            call("length", vec![Expr::Ident("label".to_string())]),
+            call(
+                "substr",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("1".to_string()),
+                ],
+            ),
+            call(
+                "substr",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("1".to_string()),
+                    Expr::Number("2".to_string()),
+                ],
+            ),
+            call(
+                "concat",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("suffix".to_string()),
+                ],
+            ),
+            call("trim", vec![Expr::Ident("label".to_string())]),
+            call(
+                "replace",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                    Expr::String("b".to_string()),
+                ],
+            ),
+            // `args` は評価順どおり `[haystack, needle]`（`sql::allowlist::
+            // Parser::parse_function_call_expr` の `POSITION` 専用構文が
+            // 組み立てる順序と同じ）。
+            call(
+                "position",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                ],
+            ),
+            // 大文字綴り（`POSITION`）でも綴りがそのまま往復することを固定する
+            // （`render_expr` が `name` フィールドをそのまま使い、リテラル
+            // `"POSITION"` に固定していない回帰の確認）。
+            call(
+                "POSITION",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String("a".to_string()),
+                ],
+            ),
+        ];
+
+        for expr in cases {
+            let top = Expr::Binary {
+                op: BinOp::Gt,
+                lhs: Box::new(expr.clone()),
+                rhs: Box::new(Expr::Number("0".to_string())),
             };
             let rendered = render_expression_predicate(&top);
             let reparsed = parse_check_predicate_text(&rendered)

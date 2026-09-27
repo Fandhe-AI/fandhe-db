@@ -279,6 +279,16 @@ impl ReferencedColumns {
                     if udf_call::references_embedding(source) {
                         needs_embedding = true;
                     }
+                    // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）の返り値は
+                    // `ExprType::Scalar` だが、その部分式が `TEXT` 列を参照する
+                    // ことはある（例: `SUM(LENGTH(text_col))`）。`scalar_mask` へ
+                    // 反映し損ねると評価時に `text_columns` から読めず
+                    // fail-closed の `Internal` エラーへ縮退してしまう
+                    // （黙った誤集計ではなく安全側の拒否だが、正当なクエリを
+                    // 常に失敗させる回帰になる。§3-7 の他呼び出し元と同じ契約）。
+                    if udf_call::mark_referenced_scalar_columns(source, &mut scalar_mask) {
+                        has_scalar_reference = true;
+                    }
                 }
                 AggregateInput::VectorColumnPresence => needs_vector_presence = true,
                 AggregateInput::AllVisible | AggregateInput::IdU64 => {}
@@ -295,6 +305,12 @@ impl ReferencedColumns {
         for expr in expr_filters {
             if udf_call::references_embedding(expr) {
                 needs_embedding = true;
+            }
+            // Issue #919・SQL-26: `WHERE` の式述語が参照する `TEXT` 列も
+            // `scalar_mask` へ反映する（`sql::scan::decode_tier_for` と同じ理由。
+            // マスク外参照を実 NULL と取り違えない fail-closed 契約）。
+            if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+                has_scalar_reference = true;
             }
         }
         if !extra_scalar_indices.is_empty() {
@@ -981,12 +997,26 @@ impl Accumulator {
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, scratch)? {
+                // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）の返り値は
+                // `ExprType::Scalar` に限定されるが、その部分式は `TEXT` 列を
+                // 参照しうる（例: `SUM(LENGTH(text_col))`）。`ReferencedColumns::derive`
+                // が `source` の `TextColumnRef` を `scalar_mask` へ反映済みのため、
+                // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` の
+                // `WHERE` 評価と同じ契約）。
+                let text_columns: Vec<Option<&str>> = scanned
+                    .iter()
+                    .map(|v| v.and_then(|s| s.as_text()))
+                    .collect();
+                match program.eval(id, embedding, &text_columns, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
-                    // NULL は集計対象から除外する（対象ビヘイビア: SQL-26。
-                    // Issue #921。`SUM`/`AVG`/`MIN`/`MAX` は無視、
-                    // `COUNT(expr)` は `observe_float` が共有する `Count` 腕が
-                    // 非 NULL のみを数える契約に自然に合流する）。
+                    // NULL は集計対象から除外する（Issue #919・SQL-26 の
+                    // `TEXT` 列参照〔例: `SUM(LENGTH(text_col))`〕と Issue #921・
+                    // SQL-26 の `CASE`／`COALESCE`／`NULLIF` の共有契約）。他の
+                    // 列型（`RealColumn` 等）の `None` と同じ「その行を観測対象
+                    // から除外する」扱いに揃え、`SUM`/`AVG`/`MIN`/`MAX` の
+                    // NULL 無視規則（PostgreSQL 互換）を満たす。`COUNT(expr)` は
+                    // `observe_float` が共有する `Count` 腕が非 NULL のみを
+                    // 数える契約に自然に合流する。
                     ExprValue::Null => Ok(()),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
@@ -1156,16 +1186,27 @@ impl Accumulator {
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, scratch)? {
+                // Issue #919・SQL-26: `COUNT(DISTINCT <expr>)` の `expr` も
+                // 部分式が `TEXT` 列を参照しうる（例:
+                // `COUNT(DISTINCT LENGTH(text_col))`。非 distinct 経路と同じ
+                // `ReferencedColumns::derive` を共有するため `scalar_mask` は
+                // 反映済み）。`scanned` をそのまま `.as_text()` へ写す。
+                let text_columns: Vec<Option<&str>> = scanned
+                    .iter()
+                    .map(|v| v.and_then(|s| s.as_text()))
+                    .collect();
+                match program.eval(id, embedding, &text_columns, scratch)? {
                     ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
-                    // NULL は COUNT(DISTINCT expr) の対象から除外する（対象
-                    // ビヘイビア: SQL-26。Issue #921 レビュー指摘対応。非 distinct
-                    // 経路〔本ファイル `ScalarExpr` 分岐の `ExprValue::Null => Ok(())`〕
-                    // と同じ「NULL は集計対象外」契約を distinct 側でも成立させる。
-                    // 他列型（`*Column`）の `None` 分岐と同様、この `None` は
-                    // 「この行は distinct 集合へ加えない」を表し、内部バグとしては
-                    // 扱わない。`COUNT(DISTINCT NULLIF(...))` のように NULL を返す
-                    // 式で誤って内部エラーにしない）。
+                    // NULL は COUNT(DISTINCT expr) の対象から除外する（Issue
+                    // #919・SQL-26 の `TEXT` 列参照の NULL 伝播、AC2）と Issue
+                    // #921・SQL-26 の `CASE`／`COALESCE`／`NULLIF` の共有契約）。
+                    // 非 distinct 経路〔本ファイル `ScalarExpr` 分岐の
+                    // `ExprValue::Null => Ok(())`〕と同じ「NULL は集計対象外」
+                    // 契約を distinct 側でも成立させる。他列型（`*Column`）の
+                    // `None` 分岐と同様、この `None` は「この行は distinct 集合へ
+                    // 加えない」を表し、内部バグとしては扱わない
+                    // （`COUNT(DISTINCT NULLIF(...))` のように NULL を返す式で
+                    // 誤って内部エラーにしない）。
                     ExprValue::Null => None,
                     _ => {
                         return Err(accumulator_bug(
@@ -2124,6 +2165,14 @@ pub(crate) fn execute_aggregate_with_cache(
                     )?
                 }
             };
+            // Issue #919・SQL-26: `expr_filters`（`WHERE`）が参照する `TEXT` 列は
+            // `ReferencedColumns::derive` が `scalar_mask` へ反映済みのため、
+            // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` と同じ
+            // 契約）。
+            let text_columns: Vec<Option<&str>> = scanned
+                .iter()
+                .map(|v| v.and_then(|s| s.as_text()))
+                .collect();
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。
@@ -2150,10 +2199,10 @@ pub(crate) fn execute_aggregate_with_cache(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding, &mut expr_scratch)? {
+                match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
-                    // Issue #921）。
+                    // NULL（UNKNOWN）は `WHERE` で偽と同義に扱う（Issue #919・
+                    // SQL-26（AC2）と Issue #921・SQL-26 の共有契約）。
                     ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
@@ -2582,6 +2631,14 @@ pub(crate) fn observe_candidate_slots(
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;
         }
+        // Issue #919・SQL-26: `classify_scalar_plan` の gate により通常この経路の
+        // `expr_filters` は `id` 単純比較のみだが、`referenced.scalar_mask()` は
+        // 上位の `ReferencedColumns::derive` が `TEXT` 参照も反映済みのため、
+        // `sql::scan`／本モジュール上部の走査ループと同じ変換で安全に対応できる。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
             let embedding: &[f32] = if udf_call::references_embedding(expr) {
                 arena
@@ -2590,10 +2647,10 @@ pub(crate) fn observe_candidate_slots(
             } else {
                 &[]
             };
-            match program.eval(id, embedding, &mut expr_scratch)? {
+            match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
-                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
-                // Issue #921）。
+                // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26（AC2）と
+                // Issue #921・SQL-26 の共有契約）。
                 ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::catalog;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::string_fn;
 use crate::wasm_udf::WasmUdfBackend;
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
@@ -130,6 +131,10 @@ pub enum BinOp {
 pub enum Expr {
     /// 数値リテラル（`lexer::Token::Number` の生文字列。小数を許容）。
     Number(String),
+    /// 文字列リテラル（Issue #919・SQL-26。値は字句段でクォート解除済み）。
+    /// PostgreSQL の unknown 型リテラルの暗黙型変換は行わず、常に TEXT 型として
+    /// 束縛する（対象外事項。docs/design/implementation-status.md 参照）。
+    String(String),
     /// 識別子（列参照・UDF パラメータ参照のいずれかは束縛段で解決する）。
     Ident(String),
     /// 関数呼び出し（組み込みまたは登録済み UDF のいずれかは束縛段で解決する）。
@@ -169,6 +174,18 @@ pub enum Expr {
 #[derive(Debug, Clone)]
 pub enum BoundExpr {
     Number(f64),
+    /// 文字列リテラル（束縛済み。Issue #919・SQL-26）。
+    Text(String),
+    /// nullable TEXT 列の参照（Issue #919・SQL-26）。`index` は `schema.columns`
+    /// と同じ論理列インデックス（`ScalarRef` を返す既存の走査 API・
+    /// `AggregateInput::TextColumn` 等と同じ添字系列）。評価時は呼び出し元が
+    /// 渡す行スカラー値（`eval_with_scalars` の `text_columns`）から解決する。
+    /// マスク外参照（呼び出し元がこの列をデコード対象に含め忘れた場合）は
+    /// 実 NULL と取り違えず `Internal` として fail-closed に拒否する
+    /// （[`eval_with_scalars`] のドキュメント参照）。
+    TextColumnRef {
+        index: usize,
+    },
     /// 疑似列 `id`（行 `id` を `f64` として扱う）。
     IdRef,
     /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、TABLE-1。
@@ -220,6 +237,10 @@ impl PartialEq for BoundExpr {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (BoundExpr::Number(a), BoundExpr::Number(b)) => a == b,
+            (BoundExpr::Text(a), BoundExpr::Text(b)) => a == b,
+            (BoundExpr::TextColumnRef { index: a }, BoundExpr::TextColumnRef { index: b }) => {
+                a == b
+            }
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
             (BoundExpr::Null, BoundExpr::Null) => true,
@@ -275,6 +296,8 @@ pub enum ExprType {
     Scalar,
     Vector,
     Bool,
+    /// TEXT 値（Issue #919・SQL-26）。
+    Text,
 }
 
 /// 評価結果の値。
@@ -290,12 +313,17 @@ pub enum ExprValue<'a> {
     Scalar(f64),
     Vector(Cow<'a, [f32]>),
     Bool(bool),
-    /// SQL `NULL`（対象ビヘイビア: SQL-26。Issue #921）。`CASE`／`COALESCE`／
-    /// `NULLIF` の評価結果としてのみ生じる。呼び出し元（`sql::exec`・`sql::scan`・
-    /// `sql::group_by`・`sql::aggregate`・`sql::check_constraint`）は UNKNOWN
-    /// （PostgreSQL の 3 値論理）として扱う: `WHERE`/`CHECK` では非該当・充足、
-    /// 投影では `Cell::Null`、`SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)` では
-    /// 当該行をスキップする。
+    /// TEXT 値（Issue #919・SQL-26、AC1）。列参照は借用（`Cow::Borrowed`）、
+    /// 関数結果（`LOWER`/`CONCAT` 等）は新規構築のため所有（`Cow::Owned`）で返す
+    /// （`Vector` と同じ借用/所有の使い分け方針）。
+    Text(Cow<'a, str>),
+    /// SQL の NULL（Issue #919・SQL-26、AC2 と Issue #921・SQL-26 の共有
+    /// variant）。nullable TEXT 列参照・strict な関数への NULL 入力、および
+    /// `CASE`／`COALESCE`／`NULLIF` の評価結果から生じる。呼び出し元
+    /// （`sql::exec`/`sql::scan`/`sql::aggregate`/`sql::group_by`/
+    /// `sql::check_constraint`）は PostgreSQL の 3 値論理に基づく UNKNOWN として
+    /// 扱う: `WHERE`/`CHECK` では非該当・充足、投影では `Cell::Null`、
+    /// `SUM`/`AVG`/`MIN`/`MAX`/`COUNT(expr)` では当該行をスキップする。
     Null,
 }
 
@@ -335,6 +363,27 @@ pub enum BuiltinFn {
     VecSum,
     /// `vec_div(v: Vector, s: Scalar) -> Vector`（成分ごとの除算）。
     VecDiv,
+    /// `lower(s: Text) -> Text`（Issue #919・SQL-26）。
+    Lower,
+    /// `upper(s: Text) -> Text`。
+    Upper,
+    /// `length(s: Text) -> Scalar`（文字数。Unicode スカラー値単位）。
+    Length,
+    /// `substr(s: Text, start: Scalar) -> Text`（`len` 省略形）。
+    Substr2,
+    /// `substr(s: Text, start: Scalar, len: Scalar) -> Text`。
+    Substr3,
+    /// `concat(a: Text, b: Text) -> Text`。可変長 `CONCAT` は束縛段
+    /// （[`bind_call`]）でこの 2 引数版の左畳み込みへ展開する。
+    Concat2,
+    /// `trim(s: Text) -> Text`（半角空白のみ除去。PostgreSQL 既定）。
+    Trim,
+    /// `replace(s: Text, from: Text, to: Text) -> Text`。
+    Replace,
+    /// `position(haystack: Text, needle: Text) -> Scalar`（`POSITION(needle IN
+    /// haystack)` 構文。`sql::allowlist::Parser` が引数順を並べ替えてこの順で
+    /// `Expr::Call` を組み立てる）。
+    Position,
     /// `abs(x: Scalar) -> Scalar`。
     Abs,
     /// `round(x: Scalar) -> Scalar`（1 引数形。`round` は arity で `Round1`／
@@ -364,14 +413,25 @@ pub enum BuiltinFn {
 /// `Round1`／`Round2` へオーバーロード解決されるため [`builtin_from_name`] の
 /// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
 pub(crate) fn is_builtin_function_name(name: &str) -> bool {
-    builtin_from_name(name).is_some() || name.eq_ignore_ascii_case("round")
+    builtin_from_name(name).is_some() || is_variadic_or_overloaded_builtin_name(name)
 }
 
+/// `substr`／`concat` は arity に応じて `BuiltinFn` variant（`Substr2`/`Substr3`）
+/// を選ぶか可変長を左畳み込みへ展開する必要があるため、この一意な名前解決には
+/// 含めない（[`bind_call`]・[`validate_closed_expr`] が個別に扱う）。予約名判定
+/// （[`is_reserved_function_name`]・[`is_builtin_function_name`]）はこの関数とは
+/// 別に `substr`／`concat` を明示的に含める。
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     match name.to_ascii_lowercase().as_str() {
         "vec_norm" => Some(BuiltinFn::VecNorm),
         "vec_sum" => Some(BuiltinFn::VecSum),
         "vec_div" => Some(BuiltinFn::VecDiv),
+        "lower" => Some(BuiltinFn::Lower),
+        "upper" => Some(BuiltinFn::Upper),
+        "length" => Some(BuiltinFn::Length),
+        "trim" => Some(BuiltinFn::Trim),
+        "replace" => Some(BuiltinFn::Replace),
+        "position" => Some(BuiltinFn::Position),
         "abs" => Some(BuiltinFn::Abs),
         "floor" => Some(BuiltinFn::Floor),
         "ceil" | "ceiling" => Some(BuiltinFn::Ceil),
@@ -386,6 +446,19 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     }
 }
 
+/// `name` が `substr`／`concat`／`round`（arity 依存で個別解決する組み込み
+/// 関数名。`builtin_from_name` 単体では variant が一意に定まらない）かを
+/// 判定する（大小無視）。main の数値スカラー関数群（Issue #920）マージ時に
+/// `round` の追加漏れがあると `is_builtin_function_name` が `round` を予約名
+/// として認識せず、`CREATE FUNCTION round(...)` の再定義を許してしまう
+/// （`defining_a_udf_named_round_is_rejected_as_reserved` の回帰）。
+fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "substr" | "concat" | "round"
+    )
+}
+
 /// 組み込み関数の引数個数・型シグネチャ（束縛時の検査に使う）。
 /// `sql::expr_program::ExprStep::Builtin` の実行時（明示スタックからの pop 数決定）
 /// でも束縛時と同じ arity 判定を使うため `pub(crate)` で共有する
@@ -395,6 +468,21 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::VecNorm => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecSum => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
+        BuiltinFn::Lower => (&[ExprType::Text], ExprType::Text),
+        BuiltinFn::Upper => (&[ExprType::Text], ExprType::Text),
+        BuiltinFn::Length => (&[ExprType::Text], ExprType::Scalar),
+        BuiltinFn::Substr2 => (&[ExprType::Text, ExprType::Scalar], ExprType::Text),
+        BuiltinFn::Substr3 => (
+            &[ExprType::Text, ExprType::Scalar, ExprType::Scalar],
+            ExprType::Text,
+        ),
+        BuiltinFn::Concat2 => (&[ExprType::Text, ExprType::Text], ExprType::Text),
+        BuiltinFn::Trim => (&[ExprType::Text], ExprType::Text),
+        BuiltinFn::Replace => (
+            &[ExprType::Text, ExprType::Text, ExprType::Text],
+            ExprType::Text,
+        ),
+        BuiltinFn::Position => (&[ExprType::Text, ExprType::Text], ExprType::Scalar),
         BuiltinFn::Abs => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round1 => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
@@ -426,6 +514,18 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Mod
         | BuiltinFn::Power
         | BuiltinFn::Sqrt => true,
+        // Issue #919・SQL-26: 文字列組み込みは `try_fold_scalar`
+        // （`FoldedConst::Scalar`/`Bool` のみを表現できる型）の畳み込み対象に
+        // 含めない。正しさには影響しない（§3-8 は対象外事項）。
+        BuiltinFn::Lower
+        | BuiltinFn::Upper
+        | BuiltinFn::Length
+        | BuiltinFn::Substr2
+        | BuiltinFn::Substr3
+        | BuiltinFn::Concat2
+        | BuiltinFn::Trim
+        | BuiltinFn::Replace
+        | BuiltinFn::Position => false,
     }
 }
 
@@ -435,7 +535,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
 /// （PR #373 codex-review 指摘対応・追加 `Vec` 確保の排除）。新しい組み込み関数を
 /// 追加してこの上限を超える arity になる場合はここも合わせて引き上げる
 /// （`builtin_arities_fit_max_arity` で全 [`BuiltinFn`] 網羅的に検証する）。
-pub(crate) const MAX_BUILTIN_ARITY: usize = 2;
+pub(crate) const MAX_BUILTIN_ARITY: usize = 3;
 
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
 /// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
@@ -672,6 +772,7 @@ fn validate_closed_expr(
     })?;
     match expr {
         Expr::Number(_) => Ok(()),
+        Expr::String(_) => Ok(()),
         Expr::Ident(name) => {
             // `params` は `define_function` で正規化済み（小文字）。本体側の参照は
             // 引用なし識別子として書かれた原文字列のままなので、比較のたびに同じ
@@ -695,7 +796,20 @@ fn validate_closed_expr(
             // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
             // 引数数不一致の関数本体が「定義時検証」という公開契約に反して登録
             // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
-            if name.eq_ignore_ascii_case("round") {
+            if name.eq_ignore_ascii_case("concat") {
+                if args.is_empty() {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "function concat expects at least 1 argument, got 0",
+                    ));
+                }
+            } else if name.eq_ignore_ascii_case("substr") {
+                if !matches!(args.len(), 2 | 3) {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "function {name} expects 2 or 3 arguments, got {}",
+                        args.len()
+                    )));
+                }
+            } else if name.eq_ignore_ascii_case("round") {
                 // `round` は arity オーバーロード（1／2 引数）。他の組み込みと
                 // 異なり単一の `BuiltinFn` に定まらないため、ここでは引数個数の
                 // 妥当性のみ検査する（実際の variant 解決は呼び出し時の
@@ -791,7 +905,12 @@ struct BindEnv<'a> {
 /// `node_budget` により上限が掛かっているため、単純な再帰で数え上げてよい。
 fn count_bound_nodes(expr: &BoundExpr) -> usize {
     match expr {
-        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::Null => 1,
+        BoundExpr::Number(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::IdRef
+        | BoundExpr::VectorRef
+        | BoundExpr::Null => 1,
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Binary { lhs, rhs, .. } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
         BoundExpr::WasmCall { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
@@ -824,7 +943,12 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
 /// UDF 引数展開後の実効ネストを直接検査する。
 fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
     match expr {
-        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::Null => 0,
+        BoundExpr::Number(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::IdRef
+        | BoundExpr::VectorRef
+        | BoundExpr::Null => 0,
         BoundExpr::Builtin { args, .. } => {
             args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
         }
@@ -862,7 +986,11 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
 pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::VectorRef => true,
-        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::Null => false,
+        BoundExpr::Number(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::IdRef
+        | BoundExpr::Null => false,
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Binary { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
@@ -876,6 +1004,128 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         }
         BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
         BoundExpr::NullIf { lhs, rhs } => references_embedding(lhs) || references_embedding(rhs),
+    }
+}
+
+/// [`mark_referenced_scalar_columns`] のクロージャ版（`sql::where_tree` の
+/// `BoundOrGroup::visit_column_indices` のように、事前に `schema.columns.len()`
+/// を知らずマスク配列を確保できない呼び出し元向け）。式木が参照する `TEXT` 列
+/// インデックスをすべて `visit` へ渡す。
+pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn FnMut(usize)) {
+    match expr {
+        BoundExpr::TextColumnRef { index } => visit(*index),
+        BoundExpr::Number(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::IdRef
+        | BoundExpr::VectorRef
+        | BoundExpr::Null => {}
+        BoundExpr::Builtin { args, .. } | BoundExpr::WasmCall { args, .. } => {
+            for a in args {
+                visit_referenced_scalar_columns(a, visit);
+            }
+        }
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            visit_referenced_scalar_columns(lhs, visit);
+            visit_referenced_scalar_columns(rhs, visit);
+        }
+        // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点: `CASE`／`COALESCE`／
+        // `NULLIF` の分岐にも `TEXT` 列参照（`COALESCE(LOWER(text_col), 'x')` 等）が
+        // 現れうるため、各分岐へ再帰する（取りこぼすとマスク外参照＝実 NULL の
+        // 誤判定になる fail-closed 違反。§3-7 の他 variant と同じ契約）。
+        BoundExpr::Case { whens, else_result } => {
+            for (c, r) in whens {
+                visit_referenced_scalar_columns(c, visit);
+                visit_referenced_scalar_columns(r, visit);
+            }
+            visit_referenced_scalar_columns(else_result, visit);
+        }
+        BoundExpr::Coalesce(args) => {
+            for a in args {
+                visit_referenced_scalar_columns(a, visit);
+            }
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            visit_referenced_scalar_columns(lhs, visit);
+            visit_referenced_scalar_columns(rhs, visit);
+        }
+    }
+}
+
+/// 式木が参照する `TEXT` 列（[`BoundExpr::TextColumnRef`]）を `mask` へ反映する
+/// （Issue #919・§3-7。`sql::aggregate::ReferencedColumns::derive`・`sql::scan`
+/// の `decode_tier_for`・`sql::exec` の `needed_column_indices` 計算・
+/// `sql::check_constraint` の列マスクが共有する）。戻り値は 1 つでも `TEXT` 列を
+/// 参照すれば `true`（[`references_embedding`] と同じ「呼び出し元がデコード
+/// tier・延期投影の判定に使う直接シグナル」の位置づけ）。`mask` への反映が
+/// `get_mut` の範囲外判定で無視された場合でも、この戻り値を別途
+/// `has_scalar_reference` 相当のフラグへ反映することで `DecodeTier::Fast` の
+/// 誤選択・`defer_projection` の誤った真化を防ぐ（呼び出し元の責務。
+/// security.md「不安全な設計」対応）。`BoundExpr` の全 variant を網羅する
+/// `match`（`_` 禁止）とし、新 variant 追加時にここへの追随漏れを
+/// コンパイルエラーとして検出する（`references_embedding` と同じ設計意図）。
+pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]) -> bool {
+    match expr {
+        BoundExpr::TextColumnRef { index } => {
+            if let Some(slot) = mask.get_mut(*index) {
+                *slot = true;
+            }
+            true
+        }
+        BoundExpr::Number(_)
+        | BoundExpr::Text(_)
+        | BoundExpr::IdRef
+        | BoundExpr::VectorRef
+        | BoundExpr::Null => false,
+        // `any`/`fold` は短絡評価となり、先頭の一致以降の引数をマークし損ねる
+        // （複数引数が別々の TEXT 列を参照しうる。例: `concat(a, b)`）ため、
+        // 明示ループで全引数を必ず走査する（`references_embedding` の `any`
+        // 使用とは異なり、ここでは「1 つでも該当するか」だけでなく「該当する
+        // 添字をすべて `mask` へ反映する」副作用が主目的）。
+        BoundExpr::Builtin { args, .. } | BoundExpr::WasmCall { args, .. } => {
+            let mut any = false;
+            for a in args {
+                if mark_referenced_scalar_columns(a, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            let l = mark_referenced_scalar_columns(lhs, mask);
+            let r = mark_referenced_scalar_columns(rhs, mask);
+            l || r
+        }
+        // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点（`visit_referenced_
+        // scalar_columns` と同じ理由。`COALESCE(LOWER(text_col), 'x')` 等）。
+        BoundExpr::Case { whens, else_result } => {
+            let mut any = false;
+            for (c, r) in whens {
+                if mark_referenced_scalar_columns(c, mask) {
+                    any = true;
+                }
+                if mark_referenced_scalar_columns(r, mask) {
+                    any = true;
+                }
+            }
+            if mark_referenced_scalar_columns(else_result, mask) {
+                any = true;
+            }
+            any
+        }
+        BoundExpr::Coalesce(args) => {
+            let mut any = false;
+            for a in args {
+                if mark_referenced_scalar_columns(a, mask) {
+                    any = true;
+                }
+            }
+            any
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            let l = mark_referenced_scalar_columns(lhs, mask);
+            let r = mark_referenced_scalar_columns(rhs, mask);
+            l || r
+        }
     }
 }
 
@@ -1061,27 +1311,45 @@ fn bind_nullif(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    // codex-review／Cursor Bugbot 指摘対応: この PR で `=` 演算子が
+    // `(Text, Text) => Bool` を新たに受理するようになった（`bind_binary`
+    // 参照）が、`NULLIF(a, b)` は `a = b` と等価な意味論（PostgreSQL
+    // 互換。`docs/spec/04-behavior/sql-surface.md` SQL-26 の
+    // 「PostgreSQL 互換」契約）を持つため、比較演算子と同じ型（`Scalar`
+    // または `Text`）の組を受理すべきだが、旧実装は `Scalar` に限定して
+    // いた。`unify_branch_type`（`CASE` の分岐型統一と共通）を使い、
+    // `Vector`／`Bool` を拒否しつつ `Scalar`／`Text` のいずれかで両辺の
+    // 型が一致することを要求する。
     bind_with_case_nesting(env, |env| {
         let (lhs_b, lhs_t) = bind_null_aware(lhs, env, node_budget)?;
         let (rhs_b, rhs_t) = bind_null_aware(rhs, env, node_budget)?;
         for t in [lhs_t, rhs_t].into_iter().flatten() {
-            if t != ExprType::Scalar {
+            if !matches!(t, ExprType::Scalar | ExprType::Text) {
                 return Err(SqlSurfaceError::DatatypeMismatch {
-                    detail: "NULLIF arguments must be scalar".to_string(),
+                    detail: "NULLIF arguments must be scalar or text".to_string(),
                 });
             }
         }
-        if lhs_t.is_none() && rhs_t.is_none() {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
-            });
-        }
+        let mut unified: Option<ExprType> = None;
+        unify_branch_type(
+            &mut unified,
+            lhs_t,
+            "NULLIF arguments must have the same type",
+        )?;
+        unify_branch_type(
+            &mut unified,
+            rhs_t,
+            "NULLIF arguments must have the same type",
+        )?;
+        let result_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
+        })?;
         Ok((
             BoundExpr::NullIf {
                 lhs: Box::new(lhs_b),
                 rhs: Box::new(rhs_b),
             },
-            ExprType::Scalar,
+            result_ty,
         ))
     })
 }
@@ -1098,6 +1366,17 @@ fn bind_expr_in(
         Expr::Number(raw) => {
             let v = parse_number_literal(raw)?;
             Ok((BoundExpr::Number(v), ExprType::Scalar))
+        }
+        Expr::String(s) => {
+            // 字句段は既に上限内の長さで 1 トークン化しているが、束縛時にも
+            // 行の `TEXT` 列と同じ上限（`MAX_TEXT_FIELD_LEN`）で重ねて検査する
+            // （fail-closed。`.claude/rules/security.md`「不安全な設計」対応）。
+            if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "string literal exceeds the maximum TEXT field length",
+                ));
+            }
+            Ok((BoundExpr::Text(s.clone()), ExprType::Text))
         }
         Expr::Ident(name) => {
             // `env.params`（UDF 本体束縛時のみ非空）のキーは `define_function` で
@@ -1182,9 +1461,12 @@ fn bind_expr_in(
                         }
                         Ok((BoundExpr::VectorRef, ExprType::Vector))
                     }
-                    ColumnType::Text => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} cannot be used in an expression (TEXT columns are not supported)"
-                    ))),
+                    // Issue #919・SQL-26（検討中）: TEXT 列参照を解禁し、文字列
+                    // スカラー関数（`LOWER`/`UPPER`/`SUBSTR` 等）・TEXT 同士の比較で
+                    // 使えるようにする。値は行コンテキスト（`eval_with_scalars` の
+                    // `text_columns`）から解決し、nullable 列の実 NULL は
+                    // `ExprValue::Null` として伝播する（AC1・AC2）。
+                    ColumnType::Text => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
                     // `INTEGER`／`BIGINT` 列の式参照対応は Issue #891 の担当。
                     // 本 Issue（#881）では TEXT 列と同じ fail-closed 拒否に倒す。
                     ColumnType::Integer | ColumnType::BigInt => {
@@ -1298,8 +1580,11 @@ fn bind_binary(
         },
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Bool)),
+            // Issue #919・SQL-26: TEXT 同士の比較（バイト順＝UTF-8 コードポイント順。
+            // PostgreSQL の `"C"` 照合相当）。TEXT と Scalar の混在は許可しない。
+            (ExprType::Text, ExprType::Text) => Ok((mk(op, l, r), ExprType::Bool)),
             _ => Err(SqlSurfaceError::invalid_input(
-                "comparison operators require both operands to be scalar",
+                "comparison operators require both operands to be scalar or both to be text",
             )),
         },
     }
@@ -1315,6 +1600,13 @@ fn bind_call(
         return Err(SqlSurfaceError::payload_too_large(
             "too many call arguments",
         ));
+    }
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name == "concat" {
+        return bind_concat(args, env, node_budget);
+    }
+    if lower_name == "substr" {
+        return bind_substr(name, args, env, node_budget);
     }
     if name.eq_ignore_ascii_case("round") {
         // `round` は arity オーバーロード（SQL-26）: 1 引数形は
@@ -1451,6 +1743,138 @@ fn bind_call(
     )))
 }
 
+/// `CONCAT(a, b, c, ...)`（可変長・1〜[`MAX_CALL_ARGS`] 引数）を束縛する
+/// （Issue #919・SQL-26）。引数はすべて `TEXT` 型に限定する（数値等の暗黙
+/// 文字列化は PostgreSQL の表現と一致しない恐れがあるため対象外とし `22000` で
+/// 拒否する。既知の制約として `docs/design/implementation-status.md` に記す）。
+/// 2 引数以上は [`BuiltinFn::Concat2`] の左畳み込み
+/// （`concat2(concat2(a,b),c)`）へ展開し、1 引数は `concat2(a, "")` 相当にする
+/// （CONCAT は NULL を空文字として扱い常に非 NULL を返す契約と整合する）。
+fn bind_concat(
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if args.is_empty() {
+        return Err(SqlSurfaceError::invalid_input(
+            "function concat expects at least 1 argument, got 0",
+        ));
+    }
+    // codex-review P1 指摘対応: `CONCAT` は NULL 引数を空文字として扱い常に
+    // 非 NULL を返す契約（`apply_builtin` の `BuiltinFn::Concat2` 実装・
+    // `take_text_or_null_arg` 参照）だが、素の `bind_expr_in` は裸の
+    // `Expr::Null` を「型が決められない」として `0A000` で拒否するため
+    // （`Expr::Null` は `CASE`/`COALESCE`/`NULLIF` 以外の位置では拒否する設計。
+    // `bind_expr_in` 内の `Expr::Null` 腕のコメント参照）、`CONCAT(NULL, 'x')`
+    // が束縛段で拒否されてしまい実行時契約に到達できなかった。`CASE`/
+    // `COALESCE` と同じ [`bind_null_aware`] を使い、`Expr::Null` を型未確定の
+    // `BoundExpr::Null` として受理する（実行時は `ExprStep::ConstNull` →
+    // `take_text_or_null_arg` の NULL 分岐が空文字として扱う）。
+    let mut bound_args = Vec::with_capacity(args.len());
+    for a in args {
+        let (b, ty) = bind_null_aware(a, env, node_budget)?;
+        if let Some(ty) = ty {
+            if ty != ExprType::Text {
+                return Err(SqlSurfaceError::invalid_input(
+                    "function concat arguments must be text",
+                ));
+            }
+        }
+        bound_args.push(b);
+    }
+    let mut iter = bound_args.into_iter();
+    // `args.is_empty()` を上で拒否済みのため必ず 1 要素目が存在する。
+    let Some(first) = iter.next() else {
+        return Err(SqlSurfaceError::Internal {
+            detail: "concat argument list unexpectedly empty after validation".to_string(),
+        });
+    };
+    // codex-review P2 指摘対応: 左畳み込みは引数 1 個につき最大 1 個の
+    // `BoundExpr::Builtin { f: Concat2, .. }` ラッパーノードを新規生成するが、
+    // 元の `for a in args { bind_expr_in(...) }` ループは各引数それ自身の
+    // ノード数しか `node_budget` へ課金しておらず、この畳み込みで追加生成
+    // されるラッパーノード自体は未計上だった。`CONCAT(a, b, c, ...)` を多数の
+    // 引数で呼ぶと、束縛結果のノード数が `MAX_EXPR_NODES`（式ノード数上限）を
+    // 実際には超えているのに検査をすり抜けうる（security.md「不安全な設計｜
+    // 無制限リソース確保（DoS）」対応）。ラッパーノードを 1 個生成するたびに
+    // 確保前に `node_budget` から差し引き、超過は他の経路と同じ
+    // `payload_too_large`（`54000`）で fail-closed に拒否する。
+    let mut charge_one_node = || -> Result<(), SqlSurfaceError> {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        Ok(())
+    };
+    let result = match iter.next() {
+        None => {
+            // 1 引数の CONCAT は空文字との結合として扱う（NULL を返さない契約と
+            // 一貫させる）。ラッパーノードを 1 個生成する。
+            charge_one_node()?;
+            BoundExpr::Builtin {
+                f: BuiltinFn::Concat2,
+                args: vec![first, BoundExpr::Text(String::new())],
+            }
+        }
+        Some(second) => {
+            // `first` はここで 1 回だけ最初のラッパーノードへ move する
+            // （複製しない。旧実装の `fold` はクロージャに `first` を参照
+            // キャプチャしていたため 1 回目の反復でのみ `first.clone()` が
+            // 必要だったが、この明示ループ構造では `first` を直接 move できる）。
+            charge_one_node()?;
+            let mut acc = BoundExpr::Builtin {
+                f: BuiltinFn::Concat2,
+                args: vec![first, second],
+            };
+            for next in iter {
+                charge_one_node()?;
+                acc = BoundExpr::Builtin {
+                    f: BuiltinFn::Concat2,
+                    args: vec![acc, next],
+                };
+            }
+            acc
+        }
+    };
+    Ok((result, ExprType::Text))
+}
+
+/// `SUBSTR(s, start[, len])`（Issue #919・SQL-26）。引数 2 個は
+/// [`BuiltinFn::Substr2`]、3 個は [`BuiltinFn::Substr3`] へ束縛する。
+fn bind_substr(
+    name: &str,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let builtin = match args.len() {
+        2 => BuiltinFn::Substr2,
+        3 => BuiltinFn::Substr3,
+        got => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "function {name} expects 2 or 3 arguments, got {got}"
+            )))
+        }
+    };
+    let (param_types, ret) = builtin_signature(builtin);
+    let mut bound_args = Vec::with_capacity(args.len());
+    for (a, expected) in args.iter().zip(param_types.iter()) {
+        let (b, ty) = bind_expr_in(a, env, node_budget)?;
+        if ty != *expected {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "function {name} argument type mismatch"
+            )));
+        }
+        bound_args.push(b);
+    }
+    Ok((
+        BoundExpr::Builtin {
+            f: builtin,
+            args: bound_args,
+        },
+        ret,
+    ))
+}
+
 /// 行コンテキスト（行 `id`・その行の `VECTOR` 列の embedding）で束縛済み式を評価する。
 /// `sql::exec` の RLS→SCALAR 段のフック（`WHERE` の式述語）・投影段（結果列の式）の
 /// 両方から呼ばれる。呼び出し元は、可視行（RLS-8 の暗黙適用を通過した行）にのみ
@@ -1476,8 +1900,40 @@ pub fn eval<'a>(
     id: u64,
     embedding: &'a [f32],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    eval_with_scalars(expr, id, embedding, &[])
+}
+
+/// [`eval`] の行スカラー対応版（Issue #919・SQL-26、§3-7）。`text_columns` は
+/// `schema.columns` と同じ論理列インデックスを持つ `TEXT` 値のビューで、
+/// `BoundExpr::TextColumnRef` の解決に使う。要素は「その行のその列値」を表し、
+/// `None` は実 NULL を意味する。呼び出し元は、式が参照しうる `TEXT` 列を
+/// 事前に `mark_referenced_scalar_columns` でマスクへ反映してから正しくデコード
+/// する責務を負う（`sql::scan`／`sql::aggregate`／`sql::group_by`／`sql::exec`／
+/// `sql::check_constraint` それぞれの呼び出し元を参照）。`text_columns` の長さが
+/// 参照インデックスに満たない場合（呼び出し元の配線不備）は、実 NULL と取り違えず
+/// `Internal` として fail-closed に拒否する。[`eval`]（引数 3 個版）は
+/// `text_columns` を空スライスで呼ぶ薄いラッパーとして残す（差分テスト・
+/// `TextColumnRef` を含まない式のみを評価する既存呼び出し元向け）。
+pub(crate) fn eval_with_scalars<'a>(
+    expr: &BoundExpr,
+    id: u64,
+    embedding: &'a [f32],
+    text_columns: &'a [Option<&'a str>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match expr {
         BoundExpr::Number(v) => Ok(ExprValue::Scalar(*v)),
+        // リテラルの寿命は `expr`（呼び出し元が指定する任意の借用）に紐付き、
+        // 戻り値のライフタイム `'a`（`embedding`/`text_columns` と共有）より
+        // 短い場合がありうるため、常に複製して返す（`VectorRef`／
+        // `TextColumnRef` の借用最適化とは異なる）。
+        BoundExpr::Text(s) => Ok(ExprValue::Text(Cow::Owned(s.clone()))),
+        BoundExpr::TextColumnRef { index } => match text_columns.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(s)) => Ok(ExprValue::Text(Cow::Borrowed(s))),
+        },
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::VectorRef => {
             // Issue #352: 行の embedding をそのまま借用する。テーブル `VECTOR` 列の
@@ -1506,16 +1962,20 @@ pub fn eval<'a>(
                 Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
             }
         }
-        BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding),
+        BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding, text_columns),
         BoundExpr::Binary { op, lhs, rhs } => {
-            let l = eval(lhs, id, embedding)?;
-            let r = eval(rhs, id, embedding)?;
+            let l = eval_with_scalars(lhs, id, embedding, text_columns)?;
+            let r = eval_with_scalars(rhs, id, embedding, text_columns)?;
             eval_binary(*op, l, r)
         }
         BoundExpr::WasmCall { backend, args, .. } => {
             // ABI 固定シグネチャ（bind_call が保証）: args[0] = Vector, args[1] = Scalar。
+            // どちらも `TEXT` 型を取らないため `text_columns` はこの階層では
+            // 未使用だが、更に内側の入れ子式（例: `wasm_fn(embedding,
+            // length(label))`）が `TextColumnRef` を含みうるため下位呼び出しへは
+            // 引き続き渡す（Issue #919・SQL-26）。
             let v_val = match args.first() {
-                Some(e) => eval(e, id, embedding)?,
+                Some(e) => eval_with_scalars(e, id, embedding, text_columns)?,
                 None => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "missing function argument at evaluation time".to_string(),
@@ -1523,7 +1983,7 @@ pub fn eval<'a>(
                 }
             };
             let s_val = match args.get(1) {
-                Some(e) => eval(e, id, embedding)?,
+                Some(e) => eval_with_scalars(e, id, embedding, text_columns)?,
                 None => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "missing function argument at evaluation time".to_string(),
@@ -1564,10 +2024,17 @@ pub fn eval<'a>(
             finite_scalar(result, "wasm udf")
         }
         BoundExpr::Null => Ok(ExprValue::Null),
+        // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点: `CASE`／
+        // `COALESCE`／`NULLIF` の分岐は `text_columns` を持つ `eval_with_scalars`
+        // で再帰する（引数 3 個版の `eval` は `text_columns` を常に空スライスへ
+        // 縮退させるため、`COALESCE(LOWER(text_col), 'x')` のように分岐が
+        // `TextColumnRef` を含む式で誤った `Internal` 拒否になっていた）。
         BoundExpr::Case { whens, else_result } => {
             for (cond, result) in whens {
-                match eval(cond, id, embedding)? {
-                    ExprValue::Bool(true) => return eval(result, id, embedding),
+                match eval_with_scalars(cond, id, embedding, text_columns)? {
+                    ExprValue::Bool(true) => {
+                        return eval_with_scalars(result, id, embedding, text_columns)
+                    }
                     ExprValue::Bool(false) | ExprValue::Null => continue,
                     _ => {
                         return Err(SqlSurfaceError::Internal {
@@ -1576,11 +2043,11 @@ pub fn eval<'a>(
                     }
                 }
             }
-            eval(else_result, id, embedding)
+            eval_with_scalars(else_result, id, embedding, text_columns)
         }
         BoundExpr::Coalesce(args) => {
             for a in args {
-                match eval(a, id, embedding)? {
+                match eval_with_scalars(a, id, embedding, text_columns)? {
                     ExprValue::Null => continue,
                     other => return Ok(other),
                 }
@@ -1588,8 +2055,8 @@ pub fn eval<'a>(
             Ok(ExprValue::Null)
         }
         BoundExpr::NullIf { lhs, rhs } => {
-            let l = eval(lhs, id, embedding)?;
-            let r = eval(rhs, id, embedding)?;
+            let l = eval_with_scalars(lhs, id, embedding, text_columns)?;
+            let r = eval_with_scalars(rhs, id, embedding, text_columns)?;
             eval_nullif(l, r)
         }
     }
@@ -1599,9 +2066,10 @@ pub fn eval<'a>(
 /// lhs END` と等価な意味論。対象ビヘイビア: SQL-26）。再帰 `eval` の
 /// `BoundExpr::NullIf` 分岐と `sql::expr_program::ExprProgram::eval` の
 /// `ExprStep::NullIf` 分岐が共有する（Issue #353 と同じ「値ベース評価を 1 箇所に
-/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar` 限定済みのため、
-/// 非 `Null`・非 `Scalar` の組み合わせは束縛段の不変条件が崩れた場合の保険として
-/// `Internal` に倒す。
+/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar`／`Text` の
+/// いずれか一方に限定・統一済みのため、非 `Null`・非 `Scalar`・非 `Text` の
+/// 組み合わせ（型が食い違う場合を含む）は束縛段の不変条件が崩れた場合の
+/// 保険として `Internal` に倒す。
 pub(crate) fn eval_nullif<'a>(
     l: ExprValue<'a>,
     r: ExprValue<'a>,
@@ -1614,6 +2082,16 @@ pub(crate) fn eval_nullif<'a>(
                 Ok(ExprValue::Null)
             } else {
                 Ok(ExprValue::Scalar(a))
+            }
+        }
+        // codex-review／Cursor Bugbot 指摘対応: `=` 演算子が `(Text, Text) =>
+        // Bool` を受理するようになったことに合わせ、`NULLIF` も TEXT 同士の
+        // 組を受理する（PostgreSQL 互換。`bind_nullif` 参照）。
+        (ExprValue::Text(a), ExprValue::Text(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Text(a))
             }
         }
         _ => Err(SqlSurfaceError::Internal {
@@ -1631,6 +2109,7 @@ fn eval_builtin<'a>(
     args: &[BoundExpr],
     id: u64,
     embedding: &'a [f32],
+    text_columns: &'a [Option<&'a str>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     // 参照実装（再帰 `eval`）専用の非ホットパス。ステップ列実行
     // （`sql::expr_program::ExprProgram::eval`）は固定長スタック配列を使う別経路
@@ -1638,7 +2117,7 @@ fn eval_builtin<'a>(
     // 行ごとのホットパスには影響しない。
     let mut values: Vec<Option<ExprValue<'a>>> = Vec::with_capacity(args.len());
     for a in args {
-        values.push(Some(eval(a, id, embedding)?));
+        values.push(Some(eval_with_scalars(a, id, embedding, text_columns)?));
     }
     apply_builtin(f, &mut values)
 }
@@ -1662,7 +2141,13 @@ pub(crate) fn apply_builtin<'a>(
     // 組み込み関数は strict 関数として扱う（対象ビヘイビア: SQL-26。Issue #921）:
     // いずれかの引数が NULL なら NULL を返す。残りの引数のスロットは未使用のまま
     // 破棄してよい（呼び出し元はこの 1 回の呼び出し後にスロットを再利用しない）。
-    if args.iter().any(|a| matches!(a, Some(ExprValue::Null))) {
+    // `CONCAT`（Issue #919・SQL-26、AC2）だけは例外で、NULL を空文字として扱い
+    // 常に非 NULL を返す唯一の組み込み関数のため、この一律 strict ガードでは
+    // なく後段の `BuiltinFn::Concat2` 自身の分岐（`take_text_or_null_arg` の
+    // `unwrap_or(Cow::Borrowed(""))`）に NULL 処理を委ねる（origin/main（Issue
+    // #921）取り込み時、この一律ガードが先に働き `CONCAT` の非 strict 契約を
+    // 踏みつぶしていたため是正）。
+    if f != BuiltinFn::Concat2 && args.iter().any(|a| matches!(a, Some(ExprValue::Null))) {
         return Ok(ExprValue::Null);
     }
     match f {
@@ -1710,6 +2195,83 @@ pub(crate) fn apply_builtin<'a>(
             }
             Ok(ExprValue::Vector(Cow::Owned(out)))
         }
+        // Issue #919・SQL-26: 文字列スカラー関数群。NULL 伝播規約（AC2）:
+        // `CONCAT` 以外は strict（引数のいずれかが NULL なら NULL を返し、
+        // `crate::sql::string_fn` の純粋関数を呼び出さない）。`CONCAT` は NULL を
+        // 空文字として扱い常に非 NULL を返す。
+        BuiltinFn::Lower | BuiltinFn::Upper | BuiltinFn::Trim => {
+            match take_text_or_null_arg(args, 0)? {
+                None => Ok(ExprValue::Null),
+                Some(s) => {
+                    let out = match f {
+                        BuiltinFn::Lower => string_fn::lower(&s)?,
+                        BuiltinFn::Upper => string_fn::upper(&s)?,
+                        BuiltinFn::Trim => string_fn::trim(&s)?,
+                        _ => unreachable!("guarded by outer match arm"),
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+            }
+        }
+        BuiltinFn::Length => match take_text_or_null_arg(args, 0)? {
+            None => Ok(ExprValue::Null),
+            Some(s) => finite_scalar(string_fn::length(&s), "length"),
+        },
+        BuiltinFn::Substr2 => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+            ) {
+                (Some(s), Some(start)) => {
+                    let out = string_fn::substr(&s, start, None)?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::Substr3 => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+                take_scalar_or_null_arg(args, 2)?,
+            ) {
+                (Some(s), Some(start), Some(len)) => {
+                    let out = string_fn::substr(&s, start, Some(len))?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::Concat2 => {
+            let a = take_text_or_null_arg(args, 0)?.unwrap_or(Cow::Borrowed(""));
+            let b = take_text_or_null_arg(args, 1)?.unwrap_or(Cow::Borrowed(""));
+            let out = string_fn::concat2(&a, &b)?;
+            Ok(ExprValue::Text(Cow::Owned(out)))
+        }
+        BuiltinFn::Replace => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+                take_text_or_null_arg(args, 2)?,
+            ) {
+                (Some(s), Some(from), Some(to)) => {
+                    let out = string_fn::replace(&s, &from, &to)?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::Position => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+            ) {
+                (Some(haystack), Some(needle)) => {
+                    finite_scalar(string_fn::position(&haystack, &needle), "position")
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Abs => {
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::abs(x).map(ExprValue::Scalar)
@@ -1745,6 +2307,42 @@ pub(crate) fn apply_builtin<'a>(
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::sqrt(x).map(ExprValue::Scalar)
         }
+    }
+}
+
+/// `args[idx]` を `Text`（あれば）または `Null`（`ExprValue::Null` だった場合）
+/// として取り出す（strict な文字列関数の NULL 伝播（AC2）を呼び出し元で
+/// 一様に判定できるようにする共通ヘルパー）。型不一致・欠落は `Internal`。
+fn take_text_or_null_arg<'a>(
+    args: &mut [Option<ExprValue<'a>>],
+    idx: usize,
+) -> Result<Option<Cow<'a, str>>, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Text(s)) => Ok(Some(s)),
+        Some(ExprValue::Null) => Ok(None),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// [`take_text_or_null_arg`] のスカラー版（`SUBSTR` の `start`/`len` 引数用）。
+fn take_scalar_or_null_arg(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<Option<f64>, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Scalar(s)) => Ok(Some(s)),
+        Some(ExprValue::Null) => Ok(None),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
     }
 }
 
@@ -1802,9 +2400,13 @@ pub(crate) fn eval_binary<'a>(
     l: ExprValue<'a>,
     r: ExprValue<'a>,
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
-    // NULL 伝播（対象ビヘイビア: SQL-26。Issue #921）: 算術・比較のいずれかの
-    // オペランドが NULL なら結果は NULL（PostgreSQL の 3 値論理と同じ扱い。
-    // 比較の NULL は WHERE 述語側で UNKNOWN として非該当扱いになる）。
+    // NULL 伝播（Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有契約）:
+    // 算術・比較のどちらかのオペランド（nullable TEXT 列由来・`CASE`／
+    // `COALESCE`／`NULLIF` 由来のいずれも）が NULL なら、束縛段の型検査を経た
+    // 演算であっても NULL を返す（3 値論理の UNKNOWN。`WHERE` 側の消費は
+    // 呼び出し元が `ExprValue::Null` を偽と同義に扱う）。これは
+    // `try_fold_scalar` の定数畳み込み経由でも共有する契約であるため、
+    // `eval_binary` の入口で一元的に処理する。
     if matches!(l, ExprValue::Null) || matches!(r, ExprValue::Null) {
         return Ok(ExprValue::Null);
     }
@@ -1828,6 +2430,25 @@ pub(crate) fn eval_binary<'a>(
         },
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
+                let result = match op {
+                    BinOp::Gt => a > b,
+                    BinOp::Lt => a < b,
+                    BinOp::Ge => a >= b,
+                    BinOp::Le => a <= b,
+                    BinOp::Eq => a == b,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "non-comparison operator in comparison evaluation".to_string(),
+                        });
+                    }
+                };
+                Ok(ExprValue::Bool(result))
+            }
+            // Issue #919・SQL-26: TEXT 同士の比較はバイト順（UTF-8 コードポイント
+            // 順）で行う。束縛段（`bind_binary`）が TEXT/TEXT の組しか許可しない
+            // ため、他の型混在はここでも `Internal`（束縛段の不変条件が崩れた
+            // 場合の保険）。
+            (ExprValue::Text(a), ExprValue::Text(b)) => {
                 let result = match op {
                     BinOp::Gt => a > b,
                     BinOp::Lt => a < b,
@@ -2031,11 +2652,33 @@ mod tests {
     }
 
     #[test]
-    fn text_column_reference_is_rejected() {
+    fn text_column_reference_is_accepted_since_issue_919() {
+        // Issue #919・SQL-26: TEXT 列参照は解禁され `TextColumnRef` として束縛
+        // される（ENUM／JSON／BYTEA 等の他の非対応型は引き続き拒否を維持する。
+        // 下の `non_text_scalar_columns_remain_rejected` 参照）。
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr(&ident("label"), &schema, &registry, &mut budget).unwrap_err();
+        let (bound, ty) = bind_expr(&ident("label"), &schema, &registry, &mut budget)
+            .expect("TEXT column reference should now bind");
+        assert_eq!(ty, ExprType::Text);
+        assert_eq!(bound, BoundExpr::TextColumnRef { index: 1 });
+    }
+
+    #[test]
+    fn non_text_scalar_columns_remain_rejected() {
+        // BOOLEAN 列は本 Issue のスコープ外のまま拒否を維持する（TEXT 解禁の
+        // 副作用で他の非対応型まで誤って通してしまわないことの回帰確認）。
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("flag", ColumnType::Boolean, false),
+            ],
+        );
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&ident("flag"), &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 
@@ -2231,8 +2874,10 @@ mod tests {
     fn real_id_column_takes_precedence_over_pseudo_column() {
         // codex-review PR #209 指摘対応: 実カラム `id`（TEXT 型）を宣言したスキーマで
         // `id` を参照すると、`parser.rs` の投影束縛と同じ優先順位で実カラムが
-        // 解決され、TEXT 列であるため「TEXT 列は式内で使えない」エラーになるべき
-        // （黙って行キー疑似列 `BoundExpr::IdRef` へフォールバックしてはならない）。
+        // 解決される（黙って行キー疑似列 `BoundExpr::IdRef` へフォールバックしては
+        // ならない）。Issue #919・SQL-26 以降 TEXT 列参照は解禁されたため、
+        // 期待する解決結果は「エラー」から「`TextColumnRef`（`ExprType::Text`）」へ
+        // 変わった（優先順位そのものの回帰確認としての意味は維持する）。
         let schema = TableSchema::new(
             "docs",
             vec![
@@ -2242,8 +2887,10 @@ mod tests {
         );
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr(&ident("id"), &schema, &registry, &mut budget).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        let (bound, ty) = bind_expr(&ident("id"), &schema, &registry, &mut budget)
+            .expect("real TEXT column named id should now bind as TextColumnRef");
+        assert_eq!(ty, ExprType::Text);
+        assert_eq!(bound, BoundExpr::TextColumnRef { index: 0 });
     }
 
     #[test]
@@ -2438,6 +3085,15 @@ mod tests {
             BuiltinFn::VecNorm,
             BuiltinFn::VecSum,
             BuiltinFn::VecDiv,
+            BuiltinFn::Lower,
+            BuiltinFn::Upper,
+            BuiltinFn::Length,
+            BuiltinFn::Substr2,
+            BuiltinFn::Substr3,
+            BuiltinFn::Concat2,
+            BuiltinFn::Trim,
+            BuiltinFn::Replace,
+            BuiltinFn::Position,
             BuiltinFn::Abs,
             BuiltinFn::Round1,
             BuiltinFn::Round2,
@@ -2456,6 +3112,107 @@ mod tests {
         }
     }
 
+    /// codex-review P2 指摘の回帰テスト（`bind_concat`）: 多引数 `CONCAT` の
+    /// 左畳み込みが新規生成する `BoundExpr::Builtin { f: Concat2, .. }`
+    /// ラッパーノードが `node_budget` へ課金されることを固定する。
+    /// `concat(label, label, label)` の課金内訳: 最上位の `Expr::Call` ノード
+    /// 自身で 1（`bind_expr_in` が全 variant 共通で入口に課す 1 ノード分）、
+    /// 各 `label` 参照で 1 ずつ計 3（同じく `bind_expr_in` の `Expr::Ident`
+    /// 分岐）、畳み込みで新規生成する `Concat2` ラッパーノードが 2 個（合計
+    /// 6 ノード）。修正前はラッパーノード分（2）が未計上のため実際のコストは
+    /// 4 だったが、修正後は 6 ノード必要になる。予算 5 では（修正前の実コスト
+    /// 4 なら成功するが）ラッパーノード込みで不足し `payload_too_large`
+    /// （`54000`）で拒否されることを確認する。
+    #[test]
+    fn bind_concat_charges_fold_wrapper_nodes_against_node_budget() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+
+        // 予算 6（Call ノード 1 + ident 参照 3 個 + Concat2 ラッパー 2 個）は
+        // ちょうど足りる。
+        let mut budget = 6usize;
+        let (_, ty) = bind_expr(
+            &call(
+                "concat",
+                vec![ident("label"), ident("label"), ident("label")],
+            ),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("budget of exactly 6 nodes should be sufficient");
+        assert_eq!(ty, ExprType::Text);
+        assert_eq!(budget, 0, "all 6 charged nodes should exhaust the budget");
+
+        // 予算 5 はラッパーノード分を課金すると不足するため拒否される
+        // （修正前は実コストが 4〔ラッパーノード未計上〕だったため誤って
+        // 成功していた）。
+        let mut budget = 5usize;
+        let err = bind_expr(
+            &call(
+                "concat",
+                vec![ident("label"), ident("label"), ident("label")],
+            ),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect_err("budget of 4 nodes must be insufficient once wrapper nodes are charged");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review P1 指摘の回帰テスト（`bind_concat`）: `CONCAT` は NULL 引数を
+    /// 空文字として扱い常に非 NULL を返す契約（AC2）だが、修正前は裸の
+    /// `Expr::Null` を `bind_expr_in` に渡していたため `0A000`
+    /// （`FeatureNotSupported`）で束縛段から拒否され、`CONCAT(NULL, 'x')` を
+    /// 実行できなかった。`bind_null_aware`（`CASE`/`COALESCE` と共有）を使う
+    /// ことで NULL リテラルを受理し、実行時は空文字として結合されることを
+    /// 固定する。
+    #[test]
+    fn concat_with_null_literal_argument_binds_and_evaluates_as_empty_string() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = 100usize;
+        let (bound, ty) = bind_expr(
+            &call("concat", vec![Expr::Null, Expr::String("x".to_string())]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("concat(NULL, 'x') must bind successfully (NULL is empty string in CONCAT)");
+        assert_eq!(ty, ExprType::Text);
+
+        let value = eval_with_scalars(&bound, 1, &[], &[]).expect("evaluation must succeed");
+        match value {
+            ExprValue::Text(s) => assert_eq!(s.as_ref(), "x"),
+            other => panic!("expected Text(\"x\"), got {other:?}"),
+        }
+    }
+
+    /// [`concat_with_null_literal_argument_binds_and_evaluates_as_empty_string`]
+    /// の追加ケース: 唯一の引数が NULL の場合（1 引数 CONCAT は自身と空文字の
+    /// 結合として扱う既存契約と組み合わさる）も空文字を返す。
+    #[test]
+    fn concat_with_only_null_literal_argument_evaluates_as_empty_string() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = 100usize;
+        let (bound, ty) = bind_expr(
+            &call("concat", vec![Expr::Null]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("concat(NULL) must bind successfully");
+        assert_eq!(ty, ExprType::Text);
+
+        let value = eval_with_scalars(&bound, 1, &[], &[]).expect("evaluation must succeed");
+        match value {
+            ExprValue::Text(s) => assert_eq!(s.as_ref(), ""),
+            other => panic!("expected Text(\"\"), got {other:?}"),
+        }
+    }
+
     /// [`apply_builtin`] がスライス（`&mut [Option<ExprValue>]`）で引数を受け取り、
     /// 呼び出し元が `Vec` を所有・生成する必要がないことを確認する
     /// （PR #373 codex-review 指摘 2 対応）。固定長配列をスタックに確保し、
@@ -2465,6 +3222,7 @@ mod tests {
     fn apply_builtin_accepts_fixed_size_array_slice_without_owning_vec() {
         let mut args: [Option<ExprValue<'_>>; MAX_BUILTIN_ARITY] = [
             Some(ExprValue::Vector(Cow::Borrowed(&[3.0f32, 4.0][..]))),
+            None,
             None,
         ];
         let result = apply_builtin(BuiltinFn::VecNorm, &mut args[..1]).expect("should evaluate");

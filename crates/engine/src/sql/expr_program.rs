@@ -78,6 +78,17 @@ pub(crate) enum ExprStep {
     /// 新規確保していた。[`StackValue`] は借用を保持しないためこの制約を受けず、
     /// `Vec<StackValue>` は行ループの外で 1 回だけ確保して使い回せる。
     PushVector,
+    /// 束縛済み文字列リテラルを push する（Issue #919・SQL-26。定数畳み込み
+    /// 対象外——[`try_fold_scalar`] はスカラー/真偽値のみを畳み込む——だが、
+    /// リテラル自体は行に依存しないため `BoundExpr::Text` から常に 1 対 1 で
+    /// 生成される）。
+    ConstText(String),
+    /// 行の `TEXT` 列参照を push する。スタック格納値は
+    /// [`StackValue::TextColumnRef`]（マーカーのみ）で、実際の値は
+    /// `ExprProgram::eval` が当該ステップを消費する時点で `text_columns` 引数
+    /// から都度解決する（[`ExprStep::PushVector`] と同じ「借用は行ループの外の
+    /// 引数から都度復元する」設計）。
+    PushTextColumn(usize),
     /// 組み込み関数呼び出し。arity 分（[`udf_call::builtin_signature`]）を
     /// スタックから pop し、[`apply_builtin`] へ渡す。
     Builtin(BuiltinFn),
@@ -116,6 +127,8 @@ impl PartialEq for ExprStep {
             (ExprStep::ConstBool(a), ExprStep::ConstBool(b)) => a == b,
             (ExprStep::PushId, ExprStep::PushId) => true,
             (ExprStep::PushVector, ExprStep::PushVector) => true,
+            (ExprStep::ConstText(a), ExprStep::ConstText(b)) => a == b,
+            (ExprStep::PushTextColumn(a), ExprStep::PushTextColumn(b)) => a == b,
             (ExprStep::Builtin(a), ExprStep::Builtin(b)) => a == b,
             (ExprStep::Binary(a), ExprStep::Binary(b)) => a == b,
             // `Arc<dyn WasmUdfBackend>` は `dyn` 型のため構造的な `PartialEq` を
@@ -149,7 +162,9 @@ impl PartialEq for ExprStep {
 pub(crate) enum StackValue {
     Scalar(f64),
     Bool(bool),
-    /// SQL `NULL`（対象ビヘイビア: SQL-26。Issue #921）。
+    /// SQL `NULL`（Issue #919・SQL-26 の nullable TEXT 列・strict 関数の NULL
+    /// 入力と、Issue #921・SQL-26 の `CASE`／`COALESCE`／`NULLIF` のいずれの
+    /// 評価結果からも生じる共有 variant）。
     Null,
     /// 現在評価中の行の `embedding` への参照を表すマーカー
     /// （[`ExprStep::PushVector`] が push する）。実体は `ExprProgram::eval` の
@@ -159,6 +174,14 @@ pub(crate) enum StackValue {
     /// vector×scalar 演算）。行データとは独立した所有データのため、そのまま
     /// スタックへ持ち回れる。
     VectorOwned(Vec<f32>),
+    /// 文字列値（リテラル畳み込み・関数結果いずれも所有データ。
+    /// `crate::sql::string_fn` の関数は常に新規 `String` を返すため、`Vector` の
+    /// ような借用マーカーは不要）。
+    Text(String),
+    /// 現在評価中の行の `TEXT` 列参照を表すマーカー
+    /// （[`ExprStep::PushTextColumn`] が push する）。実体は `ExprProgram::eval`
+    /// の `text_columns` 引数から都度解決する。
+    TextColumnRef(usize),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -166,13 +189,29 @@ pub(crate) enum StackValue {
 /// 直前にのみ使う。変換結果を `'a` を超えて `Vec<StackValue>` へ書き戻すことは
 /// ない——書き戻しは必ず [`expr_value_to_stack`] を経由し、借用ではなく
 /// マーカー／所有データへ変換し直す）。
-fn stack_to_expr_value(v: StackValue, embedding: &[f32]) -> ExprValue<'_> {
+/// [`StackValue`] を `'a`（`embedding`／`text_columns` と共有するライフタイム）の
+/// [`ExprValue`] へ変換する。`TextColumnRef` マーカーの解決はここで
+/// `text_columns` から行うため `Result` を返す（マスク外参照は
+/// `udf_call::eval_with_scalars` と同じ `Internal` に写像する。fail-closed）。
+fn stack_to_expr_value<'a>(
+    v: StackValue,
+    embedding: &'a [f32],
+    text_columns: &'a [Option<&'a str>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match v {
-        StackValue::Scalar(s) => ExprValue::Scalar(s),
-        StackValue::Bool(b) => ExprValue::Bool(b),
-        StackValue::Null => ExprValue::Null,
-        StackValue::VectorRef => ExprValue::Vector(Cow::Borrowed(embedding)),
-        StackValue::VectorOwned(v) => ExprValue::Vector(Cow::Owned(v)),
+        StackValue::Scalar(s) => Ok(ExprValue::Scalar(s)),
+        StackValue::Bool(b) => Ok(ExprValue::Bool(b)),
+        StackValue::VectorRef => Ok(ExprValue::Vector(Cow::Borrowed(embedding))),
+        StackValue::VectorOwned(v) => Ok(ExprValue::Vector(Cow::Owned(v))),
+        StackValue::Null => Ok(ExprValue::Null),
+        StackValue::Text(s) => Ok(ExprValue::Text(Cow::Owned(s))),
+        StackValue::TextColumnRef(index) => match text_columns.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "TEXT column reference is outside the decoded row scalar view".to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(s)) => Ok(ExprValue::Text(Cow::Borrowed(s))),
+        },
     }
 }
 
@@ -190,6 +229,14 @@ fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
         ExprValue::Null => StackValue::Null,
         ExprValue::Vector(Cow::Borrowed(_)) => StackValue::VectorRef,
         ExprValue::Vector(Cow::Owned(v)) => StackValue::VectorOwned(v),
+        // `apply_builtin`／`udf_call::eval_binary` が返す `Text` は常に
+        // `Cow::Owned`（`crate::sql::string_fn` は新規 `String` を構築する）。
+        // `udf_call::eval_nullif` が `TextColumnRef` 由来の非等価オペランド
+        // （`stack_to_expr_value` が返す `Cow::Borrowed`）をそのまま返す経路が
+        // 追加されたため、`Cow::Borrowed` もここへ到達しうる。いずれの場合も
+        // 所有化して落とす（fail-safe。`unreachable!` にはしない——
+        // `.claude/rules/coding-rust.md`「panic させない」）。
+        ExprValue::Text(s) => StackValue::Text(s.into_owned()),
     }
 }
 
@@ -243,14 +290,18 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
                 ExprValue::Scalar(v) => Some(FoldedConst::Scalar(v)),
                 ExprValue::Bool(b) => Some(FoldedConst::Bool(b)),
                 // `l`/`r` は `try_fold_scalar` の再帰でスカラー・真偽値に限定
-                // 済みのため、四則演算・比較の結果は理論上 `Vector`／`Null` に
-                // なり得ない（`FoldedConst` に `Null` 相当の variant が無いため。
-                // 対象ビヘイビア: SQL-26。Issue #921）。`unreachable!` ではなく
-                // 畳み込み対象外（`None`）として fail-safe に扱う（`compile_node`
-                // は通常のステップ平坦化へフォールバックする）。
-                ExprValue::Vector(_) | ExprValue::Null => None,
+                // 済みのため、四則演算・比較の結果は理論上 `Vector`/`Text`/`Null`
+                // になり得ない（`FoldedConst` に `Text`/`Null` 相当の variant が
+                // 無いため）。`unreachable!` ではなく畳み込み対象外（`None`）
+                // として fail-safe に扱う（`compile_node` は通常のステップ平坦化
+                // へフォールバックする）。
+                ExprValue::Vector(_) | ExprValue::Text(_) | ExprValue::Null => None,
             }
         }
+        // Issue #919・SQL-26: 文字列は `try_fold_scalar` の対象外（`FoldedConst`
+        // は `Scalar`/`Bool` のみを表す型のため）。`Text`/`TextColumnRef` は
+        // 常に平坦化のみ行い（`compile_node`）、定数畳み込みの最適化は行わない
+        // （正しさには影響しない。§3-8 は本 Issue のスコープ外＝対象外事項）。
         BoundExpr::Builtin { f, args } => {
             // 数値スカラー関数群（SQL-26、Issue #920）のうち行に依存しない
             // ものだけを畳み込む（`udf_call::is_foldable_builtin` 参照。
@@ -284,11 +335,14 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
             }
         }
         // `Null`／`Case`／`Coalesce`／`NullIf`（対象ビヘイビア: SQL-26。Issue #921）
-        // は畳み込み対象に含めない。`Case`/`Coalesce` は選ばれない分岐を評価しない
-        // という実行時契約（defer-on-error）を、ジャンプ命令へのコンパイル
-        // （`compile_case`/`compile_coalesce`）だけで満たすため、定数畳み込みの
-        // 対象を広げなくても既存の受け入れ条件（0 除算 defer）は成立する。
-        BoundExpr::IdRef
+        // も同様に畳み込み対象に含めない。`Case`/`Coalesce` は選ばれない分岐を
+        // 評価しないという実行時契約（defer-on-error）を、ジャンプ命令への
+        // コンパイル（`compile_case`/`compile_coalesce`）だけで満たすため、
+        // 定数畳み込みの対象を広げなくても既存の受け入れ条件（0 除算 defer）は
+        // 成立する。
+        BoundExpr::Text(_)
+        | BoundExpr::TextColumnRef { .. }
+        | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
@@ -331,6 +385,16 @@ fn compile_node(
         }
         BoundExpr::VectorRef => {
             steps.push(ExprStep::PushVector);
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::Text(s) => {
+            steps.push(ExprStep::ConstText(s.clone()));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::TextColumnRef { index } => {
+            steps.push(ExprStep::PushTextColumn(*index));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -501,6 +565,10 @@ impl ExprProgram {
     /// 使っており、行フックの呼び出し境界ごとに変わる `'a` を持つ呼び出し元では
     /// 行ループの外へ persist できず行ごとの新規確保が必要だった。詳細は
     /// [`ExprStep::PushVector`] のドキュメント参照）。
+    /// `text_columns` は [`udf_call::eval_with_scalars`] と同じ契約
+    /// （`schema.columns` と同じ論理列インデックスの `TEXT` 値ビュー。`None` は
+    /// 実 NULL）。`TextColumnRef` を含まない式（既存呼び出し元の大半）は
+    /// 空スライスで呼べる。
     ///
     /// `CASE`／`COALESCE`（対象ビヘイビア: SQL-26。Issue #921）の分岐命令
     /// （[`ExprStep::Jump`]・[`ExprStep::JumpIfNotTrue`]・[`ExprStep::
@@ -514,6 +582,7 @@ impl ExprProgram {
         &self,
         id: u64,
         embedding: &'a [f32],
+        text_columns: &'a [Option<&'a str>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<ExprValue<'a>, SqlSurfaceError> {
         scratch.clear();
@@ -576,7 +645,36 @@ impl ExprProgram {
                 ExprStep::JumpIfNotNull { target } => {
                     // peek のみ（pop しない）。非 NULL なら値をスタックに残した
                     // まま飛ぶ（`compile_coalesce` 参照）。
-                    let is_null = matches!(scratch.last(), Some(StackValue::Null));
+                    //
+                    // codex-review（Cursor Bugbot）High 指摘対応: `TextColumnRef`
+                    // は行の実値を持たない遅延マーカー（実際の NULL 性は
+                    // `text_columns` を引かないと分からない）。旧実装は
+                    // `StackValue::Null` かどうかだけを見ていたため、NULL な
+                    // `TEXT` 列の `TextColumnRef` マーカーを「非 NULL」と
+                    // 誤判定し、`COALESCE(text_col, 'default')` が後続の
+                    // フォールバック引数へ進まずマーカーのまま `Jump` してしまい
+                    // （最終的に `stack_to_expr_value` で NULL に解決されるため
+                    // `'default'` ではなく NULL を返す）、NULL 伝播契約
+                    // （Issue #919・SQL-26 AC2）に違反していた。マーカーを
+                    // pop せず `text_columns` で覗き見て実際の NULL 性を判定する
+                    // （`stack_to_expr_value` と同じマスク外参照の fail-closed
+                    // 判定〔`Internal`〕を共有し、値そのものは複製しない）。
+                    let is_null = match scratch.last() {
+                        Some(StackValue::Null) => true,
+                        Some(StackValue::TextColumnRef(index)) => match text_columns.get(*index) {
+                            Some(Some(_)) => false,
+                            Some(None) => true,
+                            None => return Err(SqlSurfaceError::Internal {
+                                detail:
+                                    "TEXT column reference is outside the decoded row scalar view"
+                                        .to_string(),
+                            }),
+                        },
+                        // `Scalar`/`Bool`/`VectorRef`/`VectorOwned`/`Text`（既に
+                        // 所有済みの文字列）はいずれも実値を持つため非 NULL。
+                        Some(_) => false,
+                        None => return Err(stack_underflow()),
+                    };
                     if is_null {
                         pc += 1;
                     } else {
@@ -587,10 +685,25 @@ impl ExprProgram {
                     let r = scratch.pop().ok_or_else(stack_underflow)?;
                     let l = scratch.pop().ok_or_else(stack_underflow)?;
                     let result = udf_call::eval_nullif(
-                        stack_to_expr_value(l, embedding),
-                        stack_to_expr_value(r, embedding),
+                        stack_to_expr_value(l, embedding, text_columns)?,
+                        stack_to_expr_value(r, embedding, text_columns)?,
                     )?;
                     scratch.push(expr_value_to_stack(result));
+                    pc += 1;
+                }
+                // Issue #919・SQL-26 と Issue #921・SQL-26 の合流点: `eval` が
+                // `for step in &self.steps` の逐次実行から `pc`（プログラム
+                // カウンタ）によるジャンプ対応ループへ置き換わったため、既存の
+                // 全ステップが自前で `pc` を進める契約になった。この 2 腕は
+                // マージ時に conflict marker の外（auto-merge）で取り残され、
+                // `pc` が進まないまま無限ループ・無限確保に陥っていた
+                // （origin/main 取り込み時の是正）。
+                ExprStep::ConstText(s) => {
+                    scratch.push(StackValue::Text(s.clone()));
+                    pc += 1;
+                }
+                ExprStep::PushTextColumn(index) => {
+                    scratch.push(StackValue::TextColumnRef(*index));
                     pc += 1;
                 }
                 ExprStep::Builtin(f) => {
@@ -616,9 +729,10 @@ impl ExprProgram {
                     // codex-review 指摘対応）。取り出した [`StackValue`] は
                     // 行ループの外に持ち出さない固定長配列（スタック確保）へ
                     // 積み替えてから `apply_builtin` へ渡す。
-                    let mut arg_buf: [Option<ExprValue<'a>>; MAX_BUILTIN_ARITY] = [None, None];
+                    let mut arg_buf: [Option<ExprValue<'a>>; MAX_BUILTIN_ARITY] =
+                        [None, None, None];
                     for (slot, value) in arg_buf.iter_mut().zip(scratch.drain(split_at..)) {
-                        *slot = Some(stack_to_expr_value(value, embedding));
+                        *slot = Some(stack_to_expr_value(value, embedding, text_columns)?);
                     }
                     let result = apply_builtin(*f, &mut arg_buf[..arity])?;
                     scratch.push(expr_value_to_stack(result));
@@ -629,8 +743,8 @@ impl ExprProgram {
                     let l = scratch.pop().ok_or_else(stack_underflow)?;
                     let result = udf_call::eval_binary(
                         *op,
-                        stack_to_expr_value(l, embedding),
-                        stack_to_expr_value(r, embedding),
+                        stack_to_expr_value(l, embedding, text_columns)?,
+                        stack_to_expr_value(r, embedding, text_columns)?,
                     )?;
                     scratch.push(expr_value_to_stack(result));
                     pc += 1;
@@ -650,16 +764,20 @@ impl ExprProgram {
                         let v = match vector_val {
                             StackValue::VectorRef => Cow::Borrowed(embedding),
                             StackValue::VectorOwned(v) => Cow::Owned(v),
-                            StackValue::Scalar(_) | StackValue::Bool(_) | StackValue::Null => {
-                                return Err(type_mismatch())
-                            }
+                            StackValue::Scalar(_)
+                            | StackValue::Bool(_)
+                            | StackValue::Null
+                            | StackValue::Text(_)
+                            | StackValue::TextColumnRef(_) => return Err(type_mismatch()),
                         };
                         let s = match scalar_val {
                             StackValue::Scalar(s) => s,
                             StackValue::Bool(_)
                             | StackValue::VectorRef
                             | StackValue::VectorOwned(_)
-                            | StackValue::Null => return Err(type_mismatch()),
+                            | StackValue::Null
+                            | StackValue::Text(_)
+                            | StackValue::TextColumnRef(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
                         // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
@@ -677,7 +795,7 @@ impl ExprProgram {
             }
         }
         let result = scratch.pop().ok_or_else(stack_underflow)?;
-        Ok(stack_to_expr_value(result, embedding))
+        stack_to_expr_value(result, embedding, text_columns)
     }
 }
 
@@ -733,7 +851,7 @@ mod tests {
     fn assert_matches_recursive_eval(expr: &BoundExpr, id: u64, embedding: &[f32]) {
         let program = ExprProgram::compile(expr);
         let mut scratch = Vec::new();
-        let compiled = program.eval(id, embedding, &mut scratch);
+        let compiled = program.eval(id, embedding, &[], &mut scratch);
         let recursive = udf_call::eval(expr, id, embedding);
         match (compiled, recursive) {
             (Ok(a), Ok(b)) => assert_eq!(a, b, "compiled/recursive eval diverged"),
@@ -779,7 +897,7 @@ mod tests {
         ));
         // 実行時（行が評価された時点）でのみ 22000 相当のエラーになる。
         let mut scratch = Vec::new();
-        assert!(program.eval(1, &[], &mut scratch).is_err());
+        assert!(program.eval(1, &[], &[], &mut scratch).is_err());
     }
 
     #[test]
@@ -795,7 +913,7 @@ mod tests {
         let expr = BoundExpr::IdRef;
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
-        assert!(program.eval(1u64 << 60, &[], &mut scratch).is_err());
+        assert!(program.eval(1u64 << 60, &[], &[], &mut scratch).is_err());
     }
 
     #[test]
@@ -816,7 +934,7 @@ mod tests {
         let embedding = [1.0f32, 2.0, 3.0];
         let mut scratch = Vec::new();
         let value = program
-            .eval(1, &embedding, &mut scratch)
+            .eval(1, &embedding, &[], &mut scratch)
             .expect("VectorRef eval should succeed");
         match value {
             ExprValue::Vector(Cow::Borrowed(borrowed)) => {
@@ -865,7 +983,7 @@ mod tests {
         assert_matches_recursive_eval(&expr, 1, &[1.0, 2.0]);
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
-        assert!(program.eval(1, &[1.0, 2.0], &mut scratch).is_err());
+        assert!(program.eval(1, &[1.0, 2.0], &[], &mut scratch).is_err());
     }
 
     #[test]
@@ -912,7 +1030,7 @@ mod tests {
         // ウォームアップ（ページフォールト・分岐予測のコールドスタートを両者から除く）。
         for id in 0..1000u64 {
             let _ = udf_call::eval(&expr, id, &embedding);
-            let _ = program.eval(id, &embedding, &mut scratch);
+            let _ = program.eval(id, &embedding, &[], &mut scratch);
         }
 
         let start = Instant::now();
@@ -923,7 +1041,7 @@ mod tests {
 
         let start = Instant::now();
         for id in 0..ITERS {
-            std::hint::black_box(program.eval(id, &embedding, &mut scratch).unwrap());
+            std::hint::black_box(program.eval(id, &embedding, &[], &mut scratch).unwrap());
         }
         let compiled_elapsed = start.elapsed();
 
@@ -995,7 +1113,7 @@ mod tests {
             Some(ExprStep::Builtin(BuiltinFn::Sqrt))
         ));
         let mut scratch = Vec::new();
-        assert!(program.eval(1, &[], &mut scratch).is_err());
+        assert!(program.eval(1, &[], &[], &mut scratch).is_err());
     }
 
     #[test]
@@ -1041,7 +1159,7 @@ mod tests {
 
         for id in 0..100u64 {
             let result = program
-                .eval(id, &embedding, &mut scratch)
+                .eval(id, &embedding, &[], &mut scratch)
                 .expect("vec_norm(embedding) > 2.0 should evaluate successfully");
             assert_eq!(result, ExprValue::Bool(true));
             // `eval` は `clear()` のみを行うため、事前に確保した容量を
@@ -1083,7 +1201,7 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
         assert_eq!(
-            program.eval(1, &[], &mut scratch).unwrap(),
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
             ExprValue::Scalar(1.0)
         );
     }
@@ -1097,7 +1215,10 @@ mod tests {
         assert_matches_recursive_eval(&expr, 1, &[]);
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
-        assert_eq!(program.eval(1, &[], &mut scratch).unwrap(), ExprValue::Null);
+        assert_eq!(
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
+            ExprValue::Null
+        );
     }
 
     #[test]
@@ -1107,7 +1228,7 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
         assert_eq!(
-            program.eval(1, &[], &mut scratch).unwrap(),
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
             ExprValue::Scalar(7.0)
         );
     }
@@ -1118,7 +1239,7 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         let mut scratch = Vec::new();
         assert_eq!(
-            program.eval(1, &[], &mut scratch).unwrap(),
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
             ExprValue::Scalar(1.0)
         );
     }
@@ -1138,7 +1259,10 @@ mod tests {
         let program = ExprProgram::compile(&BoundExpr::Null);
         assert_eq!(program.steps, vec![ExprStep::ConstNull]);
         let mut scratch = Vec::new();
-        assert_eq!(program.eval(1, &[], &mut scratch).unwrap(), ExprValue::Null);
+        assert_eq!(
+            program.eval(1, &[], &[], &mut scratch).unwrap(),
+            ExprValue::Null
+        );
     }
 
     #[test]
@@ -1156,7 +1280,7 @@ mod tests {
         let mut scratch = Vec::new();
         // 条件が true のため JumpIfNotTrue は分岐しないが、他の分岐（false 側）を
         // 検査するために別プログラムで範囲外ジャンプも確認する。
-        let _ = program.eval(1, &[], &mut scratch);
+        let _ = program.eval(1, &[], &[], &mut scratch);
 
         let program_out_of_range = ExprProgram {
             steps: vec![
@@ -1166,7 +1290,9 @@ mod tests {
             ],
             max_stack: 1,
         };
-        let err = program_out_of_range.eval(1, &[], &mut scratch).unwrap_err();
+        let err = program_out_of_range
+            .eval(1, &[], &[], &mut scratch)
+            .unwrap_err();
         assert_eq!(err.wire_code(), "XX000");
     }
 }

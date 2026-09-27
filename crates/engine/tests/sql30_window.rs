@@ -308,6 +308,36 @@ fn where_combines_with_window_and_filters_output_rows_but_not_window_population(
     }
 }
 
+/// Issue #919（SQL-26）と Issue #930（SQL-30。ウィンドウ関数）の合流点の回帰
+/// テスト。origin/main 取り込み時、`sql::window::decode_tier_for_window` が
+/// `WHERE` 式の `TextColumnRef` を `scalar_mask` へ反映しておらず（本来は
+/// `sql::scan::decode_tier_for` と同じ契約を共有すべき箇所）、`LOWER(lang)` の
+/// ような文字列スカラー関数を含む `WHERE` がウィンドウ付きクエリで常に
+/// NULL・UNKNOWN 扱いになり得た。両 Issue のマージ時に判明したため専用テストを
+/// 追加した。
+#[test]
+fn where_with_string_scalar_function_combines_with_window_correctly() {
+    let path = unique_db_path("window-where-string-fn");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_basic(&storage, &ctx);
+    let core = new_core(storage);
+
+    // WHERE LOWER(lang) = 'ja' で出力は ja の 3 行のみだが、
+    // COUNT(*) OVER () は WHERE 適用後の母集合（ja の 3 行のみ）で計算される
+    // （`where_combines_with_window_and_filters_output_rows_but_not_window_population`
+    // と同一の意図を、TEXT 列を参照する式で固定する）。
+    let result = expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, COUNT(*) OVER () FROM docs WHERE LOWER(lang) = 'ja' LIMIT 10",
+    ));
+    assert_eq!(result.rows.len(), 3);
+    for row in &result.rows {
+        assert_eq!(cell_int(&row.cells[1]), 3);
+    }
+}
+
 #[test]
 fn offset_skips_output_rows_but_window_values_reflect_full_population() {
     let path = unique_db_path("window-offset");

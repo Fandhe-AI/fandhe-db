@@ -133,6 +133,13 @@ impl BoundConjunction {
         if !declarative_filter::matches_all(&self.metadata_filters, scanned) {
             return Ok(false);
         }
+        // Issue #919・SQL-26: `visit_column_indices` が `TEXT` 参照を反映済みの
+        // マスクで呼び出し元がデコードした `scanned` を、そのまま `.as_text()` へ
+        // 写す。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
             // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
@@ -142,10 +149,11 @@ impl BoundConjunction {
             // 分岐に embedding 参照があるだけの葉まで誤って偽にしていたため撤去
             // し、評価時点の判定へ一本化した）。
             let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
-            match program.eval(id, row_embedding, scratch)? {
+            match program.eval(id, row_embedding, &text_columns, scratch)? {
                 ExprValue::Bool(true) => {}
-                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
-                // Issue #921。PostgreSQL の 3 値論理と同じ扱い）。
+                // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有契約
+                // （PostgreSQL の 3 値論理）: NULL は `WHERE`（OR 分岐内）でも
+                // 偽と同義。
                 ExprValue::Bool(false) | ExprValue::Null => return Ok(false),
                 // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式述語の
                 // 型を `Bool` に限定済みのため到達しない。
@@ -175,6 +183,12 @@ impl BoundConjunction {
     fn visit_column_indices(&self, out: &mut dyn FnMut(usize)) {
         for filter in &self.metadata_filters {
             out(filter.column_index());
+        }
+        // Issue #919・SQL-26: OR 分岐内の式述語が参照する `TEXT` 列も
+        // デコード対象へ含める（欠けるとマスク外参照＝実 NULL との取り違えに
+        // なる。`sql::scan`／`sql::aggregate` 等の `scalar_mask` 導出と同じ理由）。
+        for expr in &self.expr_filters {
+            udf_call::visit_referenced_scalar_columns(expr, out);
         }
         for group in &self.or_groups {
             group.visit_column_indices(out);
