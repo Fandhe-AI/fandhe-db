@@ -221,6 +221,15 @@ args }` を呼び出し先の名前・引数のみで直列化すると、`WHERE
 - `Coalesce(args)`＝タグ 7・引数件数（u32 LE）・各引数を再帰的に直列化
 - `NullIf(lhs, rhs)`＝タグ 8・lhs を再帰的に直列化・rhs を再帰的に直列化
 
+**Issue #919（対象ビヘイビア: SQL-26）で追加したタグ**（`Expr::String`。
+origin/main 取り込み時の是正: 並行実装していた Issue #921 のタグ割り当てと
+独立に着手したためどちらも「タグ 5」を割り当てており衝突していた。マージ時に
+`String` を末尾の未使用番号へ採番し直し、既存タグ 1〜8 は不変のまま
+解消した）:
+
+- `String(s)`＝タグ 9・`push_bytes(s)`（長さ前置＋内容込み。文字列リテラル
+  だけが異なる 2 つの DML が同一ハッシュへ衝突するのを防ぐ）
+
 入力サイズの有界性は既存の上限（`MAX_CALL_ARGS`・`MAX_EXPR_NODES`。
 `sql::udf_call::MAX_CASE_BRANCHES`・`MAX_CASE_NESTING` を新設）の範囲内に
 収まり、本節が追加する新たな上限はない。

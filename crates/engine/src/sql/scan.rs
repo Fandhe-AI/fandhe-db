@@ -244,6 +244,13 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                 if udf_call::references_embedding(expr) {
                     needs_embedding = true;
                 }
+                // Issue #919・SQL-26: 投影の式項目が参照する `TEXT` 列を
+                // `scalar_mask` へ反映する（マスク外参照を実 NULL と取り違え
+                // させない fail-closed 契約。`mark_referenced_scalar_columns`
+                // ドキュメント参照）。
+                if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+                    has_scalar_reference = true;
+                }
             }
             ProjectedColumn::Id => {}
         }
@@ -259,6 +266,9 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
     for expr in &bound.expr_filters {
         if udf_call::references_embedding(expr) {
             needs_embedding = true;
+        }
+        if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+            has_scalar_reference = true;
         }
     }
     // Issue #915・SQL-25: スカラー ORDER BY のキー列も、投影されていなくても
@@ -703,6 +713,16 @@ fn with_visible_row<T>(
         }
     };
 
+    // Issue #919・SQL-26: `WHERE`/投影の式評価（`BoundExpr::TextColumnRef`）が
+    // 使う行スカラービュー。`decode_tier_for` が式の参照する `TEXT` 列を
+    // `scalar_mask` へ反映済み（`DecodeTier::Fast` ならそもそも式評価に到達
+    // しない）なので、ここでは `scanned` の値をそのまま `.as_text()` へ写す
+    // だけでよい（`sql::aggregate`／`sql::group_by` 等と同じ契約）。
+    let text_columns: Vec<Option<&str>> = scanned
+        .iter()
+        .map(|v| v.and_then(|s| s.as_text()))
+        .collect();
+
     // SCALAR 段（WHERE）。
     if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
         return Ok(None);
@@ -732,7 +752,7 @@ fn with_visible_row<T>(
             } else {
                 &[]
             };
-        match program.eval(id, embedding, where_expr_scratch)? {
+        match program.eval(id, embedding, &text_columns, where_expr_scratch)? {
             ExprValue::Bool(true) => {}
             // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
             // Issue #921）。
@@ -796,6 +816,15 @@ fn build_projected_cells(
     byte_budget: &mut usize,
     max_result_bytes: usize,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
+    // Issue #919・SQL-26: `Computed` 列の式評価（`BoundExpr::TextColumnRef`）が
+    // 使う行スカラービュー。`decode_tier_for` が式の参照する `TEXT` 列を
+    // `scalar_mask` へ反映済みのため、`scanned` の値をそのまま `.as_text()` へ
+    // 写すだけでよい（`with_visible_row` の `WHERE` 評価と同じ契約）。
+    let text_columns: Vec<Option<&str>> = scanned
+        .iter()
+        .map(|v| v.and_then(|s| s.as_text()))
+        .collect();
+
     // 投影段。確保失敗時に abort せず `Err` を返せるよう `try_reserve_exact`
     // を使う（`try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
     // と同方針）。
@@ -1033,10 +1062,8 @@ fn build_projected_cells(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding_for_eval, proj_expr_scratch)? {
+                match program.eval(id, embedding_for_eval, &text_columns, proj_expr_scratch)? {
                     ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                    // 対象ビヘイビア: SQL-26（Issue #921）。
-                    ExprValue::Null => cells.push(Cell::Null),
                     ExprValue::Vector(v) => {
                         // codex-review P1 指摘対応: `Computed` 列のベクトル
                         // 結果も `VECTOR` 列直接投影と同じ累計予算
@@ -1052,6 +1079,20 @@ fn build_projected_cells(
                         )?));
                     }
                     ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
+                    // Issue #919・SQL-26（AC2）: 投影の式結果は `Cell::Text`/
+                    // `Cell::Null` へそのまま写像する（wire 層は既存の
+                    // `Computed` → text OID 25 の経路をそのまま使うため
+                    // wire 側の変更は不要）。
+                    ExprValue::Text(t) => {
+                        cells.push(Cell::Text(try_alloc_text_for_budget(
+                            &t,
+                            byte_budget,
+                            max_result_bytes,
+                        )?));
+                    }
+                    // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
+                    // 契約: NULL は `Cell::Null` へ写像する。
+                    ExprValue::Null => cells.push(Cell::Null),
                 }
             }
         }

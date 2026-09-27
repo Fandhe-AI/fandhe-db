@@ -857,6 +857,13 @@ fn observe_candidate_slots_grouped_inner(
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;
         }
+        // Issue #919・SQL-26: `scalar_mask` は `ReferencedColumns::derive` が
+        // `expr_filters` の `TEXT` 参照も反映済み（`sql::aggregate` と共有する
+        // 導出ロジック）。
+        let text_columns: Vec<Option<&str>> = scanned
+            .iter()
+            .map(|v| v.and_then(|s| s.as_text()))
+            .collect();
         for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
             let embedding: &[f32] = if udf_call::references_embedding(expr) {
                 arena
@@ -865,10 +872,10 @@ fn observe_candidate_slots_grouped_inner(
             } else {
                 &[]
             };
-            match program.eval(id, embedding, &mut expr_scratch)? {
+            match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
-                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
-                // Issue #921）。
+                // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26（AC2）と
+                // Issue #921・SQL-26 の共有契約）。
                 ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(GroupAccumulateError::Other(SqlSurfaceError::invalid_input(
@@ -1517,6 +1524,10 @@ pub(crate) fn execute_grouped_aggregate(
                         metadata,
                         Some(referenced.scalar_mask()),
                     )?;
+                let text_columns: Vec<Option<&str>> = scanned
+                    .iter()
+                    .map(|v| v.and_then(|s| s.as_text()))
+                    .collect();
 
                 // SCALAR 段（WHERE）。
                 if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -1535,10 +1546,10 @@ pub(crate) fn execute_grouped_aggregate(
                     } else {
                         &[]
                     };
-                    match program.eval(id, embedding, &mut expr_scratch)? {
+                    match program.eval(id, embedding, &text_columns, &mut expr_scratch)? {
                         ExprValue::Bool(true) => {}
-                        // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア:
-                        // SQL-26。Issue #921）。
+                        // NULL（UNKNOWN）は非該当として扱う（Issue #919・SQL-26
+                        // （AC2）と Issue #921・SQL-26 の共有契約）。
                         ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                         _ => {
                             return Err(SqlSurfaceError::invalid_input(
