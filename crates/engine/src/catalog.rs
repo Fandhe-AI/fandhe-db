@@ -1154,18 +1154,19 @@ impl ColumnType {
         matches!(self, ColumnType::Vector(_))
     }
 
-    /// `PRIMARY KEY`（Issue #903）の構成列・UNIQUE 制約（Issue #905）の参照列
-    /// として宣言できる型かどうか（TABLE-16・TASK-204。両者で共有する単一の
-    /// 一意キー許可リストであり、第 2 の許可リストは作らない）。行バイト列上の
-    /// 値表現がバイト単位で一意に決まる型のみを許可する fail-closed な許可
-    /// リストであり、`constraint::enforce_unique_keys_in_txn`
-    /// が構築する正準キーバイト列の一意性が値の一意性と一致することの前提になる。
-    /// `VECTOR`（検索対象・等価比較の対象外）・`REAL`／`DOUBLE`（`-0.0` 正規化はある
-    /// ものの浮動小数の等価性は一般に不安定）・`NUMERIC`（スケール違いの表現差が
-    /// 未検証）・`JSON`／`JSONB`（正規化の有無で表現が割れる）・`ARRAY`（要素単位の
-    /// 順序等価性が未検証）は対象外とする。`sql::allowlist::validate_create_table_tokens`
-    /// が SQL 表層の構造検証段階でも同じ判定を行う（第 2 の許可リストを作らず、
-    /// ここへ委譲する）。
+    /// `PRIMARY KEY`（Issue #903）の構成列・`FOREIGN KEY`（Issue #907）の参照元列
+    /// として宣言できる型かどうか（TABLE-16・TASK-204。PK・FK が共有する許可
+    /// リスト。UNIQUE 制約は [`Self::is_unique_constraint_allowed`] という別の
+    /// 上位集合を持つ——理由は同メソッドの doc 参照）。行バイト列上の値表現が
+    /// バイト単位で一意に決まる型のみを許可する fail-closed な許可リストであり、
+    /// `constraint::enforce_unique_keys_in_txn` が構築する正準キーバイト列の
+    /// 一意性が値の一意性と一致することの前提になる。`VECTOR`（検索対象・
+    /// 等価比較の対象外）・`REAL`／`DOUBLE`／`NUMERIC`／`JSON`／`JSONB`／`ARRAY`
+    /// は対象外とする（Issue #1073 で UNIQUE のみへ拡張。PK・FK 側は据え置き。
+    /// `docs/design/foreign-key.md` D3「参照元は PK 許可型であること」が前提に
+    /// しているため、この共有リストを広げると FK・PK の対象型が意図せず広がる）。
+    /// `sql::allowlist::validate_create_table_tokens` が SQL 表層の構造検証段階
+    /// でも同じ判定を行う（第 2 の許可リストを作らず、ここへ委譲する）。
     pub(crate) fn is_primary_key_allowed(&self) -> bool {
         matches!(
             self,
@@ -1181,13 +1182,51 @@ impl ColumnType {
         )
     }
 
+    /// UNIQUE 制約（Issue #905・#1073）の参照列として宣言できる型かどうか
+    /// （TABLE-16・TASK-204）。[`Self::is_primary_key_allowed`] の上位集合
+    /// （PK 許可型はすべて UNIQUE でも許可する）で、REAL・DOUBLE PRECISION・
+    /// NUMERIC・JSON・JSONB・配列型を追加で許可する。PK・FK 側の許可リストは
+    /// 意図的に据え置く（`is_primary_key_allowed` の doc 参照）。正準キーの
+    /// 型ごとの正規化（`-0.0` 正規化・NUMERIC の末尾ゼロ除去・JSON の値として
+    /// の等価正規化・配列要素の生ペイロード連結）は
+    /// [`crate::constraint::push_canonical_component`] が担う
+    /// （`docs/design/unique-constraint.md` D7 参照）。`VECTOR`（検索対象・
+    /// 等価比較の対象外）は引き続き対象外。
+    pub(crate) fn is_unique_constraint_allowed(&self) -> bool {
+        self.is_primary_key_allowed()
+            || matches!(
+                self,
+                ColumnType::Real
+                    | ColumnType::Double
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Array(_)
+            )
+    }
+
     /// [`crate::constraint::enforce_unique_keys_in_txn`] が正準キーバイト列を
-    /// 組み立てる際に使う、一意キー許可型ごとの固定タグ（TABLE-16・TASK-204、
-    /// Issue #903）。[`Self::is_primary_key_allowed`] が `true` を返す型にのみ
-    /// 呼び出す契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。値は
-    /// 永続化されない（`constraint.rs` の判定用スクラッチにのみ使う）ため、
-    /// カタログの `catalog_fields` タグとは独立に採番してよい。
-    pub(crate) fn primary_key_tag(&self) -> u8 {
+    /// 組み立てる際に使う、一意キー許可型（[`Self::is_unique_constraint_allowed`]。
+    /// PK・FK は狭い方の [`Self::is_primary_key_allowed`] のみを使う）ごとの
+    /// 固定タグ（TABLE-16・TASK-204、Issue #903・#1073）。
+    /// [`Self::is_unique_constraint_allowed`] が `true` を返す型にのみ呼び出す
+    /// 契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。値は永続化
+    /// されない（`constraint.rs` の判定用スクラッチにのみ使う）ため、カタログの
+    /// `catalog_fields` タグとは独立に採番してよい。
+    /// [`Self::unique_key_tag`] の `ColumnType::Array` に対応する値。
+    /// [`crate::constraint::push_canonical_component`] は要素値（借用結果
+    /// [`crate::row_codec::ArrayRef`]）だけを持ち、宣言時の `max_len` を含む
+    /// 完全な `ArrayType` を構築できないため、単独の定数として公開する
+    /// （`unique_key_tag` の `match` 側の値と同一であることを機械的に保証する）。
+    pub(crate) const ARRAY_UNIQUE_KEY_TAG: u8 = 14;
+    /// [`Self::unique_key_tag`] の `ColumnType::Numeric` に対応する値。
+    /// [`crate::constraint::push_canonical_component`] は借用結果
+    /// [`crate::numeric::Decimal`] だけを持ち、宣言時の `precision`／`scale`
+    /// を含む `ColumnType::Numeric` を構築する必要がないため、[`Self::
+    /// ARRAY_UNIQUE_KEY_TAG`] と同じ理由で単独の定数として公開する。
+    pub(crate) const NUMERIC_UNIQUE_KEY_TAG: u8 = 12;
+
+    pub(crate) fn unique_key_tag(&self) -> u8 {
         match self {
             ColumnType::Text => 1,
             ColumnType::Integer => 2,
@@ -1198,14 +1237,13 @@ impl ColumnType {
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
-            ColumnType::Vector(_)
-            | ColumnType::Real
-            | ColumnType::Double
-            | ColumnType::Array(_)
-            | ColumnType::Json
-            | ColumnType::Jsonb
-            | ColumnType::Numeric { .. } => {
-                // 呼び出し元が `is_primary_key_allowed` の契約を破っている
+            ColumnType::Real => 10,
+            ColumnType::Double => 11,
+            ColumnType::Numeric { .. } => Self::NUMERIC_UNIQUE_KEY_TAG,
+            ColumnType::Json | ColumnType::Jsonb => 13,
+            ColumnType::Array(_) => Self::ARRAY_UNIQUE_KEY_TAG,
+            ColumnType::Vector(_) => {
+                // 呼び出し元が `is_unique_constraint_allowed` の契約を破っている
                 // （非許可型からタグを取得しようとした）。永続化しない内部
                 // スクラッチ用の値のため panic ではなく判別可能な番兵を返し、
                 // 呼び出し元（`constraint.rs`）が別途 fail-closed に拒否する。
@@ -2251,8 +2289,8 @@ impl<'a> Iterator for PhysicalSlots<'a> {
 /// 検査する。RLS 可視集合ではない）。列は宣言順を保持する。
 ///
 /// `columns()` が返す各列名は、この制約を保持する [`TableSchema`] の**生存列**
-/// （`schema.columns`）に存在し、かつ [`ColumnType::is_primary_key_allowed`]
-/// （主キーと共有する一意キー許可型の単一の許可リスト）を満たす型であることを
+/// （`schema.columns`）に存在し、かつ [`ColumnType::is_unique_constraint_allowed`]
+/// （PK・FK が共有する許可リストの上位集合。Issue #1073）を満たす型であることを
 /// [`validate_schema`] が保証する契約とする（構築時点では検証しない。
 /// [`ColumnDef::new`] と同じ「検証は呼び出し元が別途通す」設計）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3063,9 +3101,8 @@ fn validate_check_constraints(schema: &TableSchema) -> Result<()> {
 /// [`validate_primary_key`] と同じ分類）:
 /// - 制約数が [`MAX_UNIQUE_CONSTRAINTS`] 以下
 /// - 各制約が非空・[`MAX_UNIQUE_CONSTRAINT_COLUMNS`] 以下・制約内の列名重複なし
-/// - 各列名が**生存列**に存在し、[`ColumnType::is_primary_key_allowed`]
-///   （主キーと共有する単一の一意キー許可型リスト。第 2 の許可リストを
-///   作らない）を満たす型
+/// - 各列名が**生存列**に存在し、[`ColumnType::is_unique_constraint_allowed`]
+///   （PK・FK が共有する許可リストの上位集合。Issue #1073）を満たす型
 /// - 同一列リスト（宣言順そのままの比較）の制約が重複しない
 ///
 /// 主キーと異なり NULL 許容列を参照できる（NULLS DISTINCT。
@@ -3108,7 +3145,7 @@ fn validate_unique_constraints(schema: &TableSchema) -> Result<()> {
                         "unique constraint references unknown column: {name}"
                     ))
                 })?;
-            if !column.ty.is_primary_key_allowed() {
+            if !column.ty.is_unique_constraint_allowed() {
                 return Err(CatalogError::Invalid(format!(
                     "column {name} has a type that cannot be used in a unique constraint"
                 )));
@@ -7525,14 +7562,14 @@ mod tests {
                 vec![
                     ColumnDef::new("embedding", ColumnType::Vector(4), false),
                     ColumnDef::new("a", ColumnType::Text, true),
-                    ColumnDef::new("r", ColumnType::Real, true),
                 ],
             )
         };
         let cases: Vec<Vec<Vec<&str>>> = vec![
             vec![vec!["missing"]],
+            // `VECTOR` は UNIQUE 制約でも引き続き拒否される
+            // （`is_unique_constraint_allowed` は許可型を広げない。Issue #1073）。
             vec![vec!["embedding"]],
-            vec![vec!["r"]],
             vec![vec!["a", "a"]],
             vec![vec!["a"], vec!["a"]],
             vec![vec![]],
@@ -7556,6 +7593,121 @@ mod tests {
         assert!(matches!(
             validate_schema(&too_many),
             Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// UNIQUE 制約の対象型拡張（TABLE-16・TASK-204、Issue #1073）: REAL・
+    /// DOUBLE PRECISION・NUMERIC・JSON・JSONB・配列型のいずれも単一 UNIQUE 制約
+    /// の対象として受理する。`VECTOR` は引き続き拒否される
+    /// （直前の `validate_unique_constraints_rejects_invalid_declarations` 参照）。
+    #[test]
+    fn validate_unique_constraints_accepts_extended_types() {
+        let extended_types = [
+            ColumnType::Real,
+            ColumnType::Double,
+            ColumnType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            ColumnType::Json,
+            ColumnType::Jsonb,
+            ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).expect("valid array type")),
+            ColumnType::Array(ArrayType::new(ArrayElemType::Bool, 8).expect("valid array type")),
+        ];
+        for ty in extended_types {
+            let schema = TableSchema::new("docs", vec![ColumnDef::new("v", ty.clone(), true)])
+                .with_unique_constraints(vec![UniqueConstraint::new(vec!["v".to_string()])]);
+            assert!(
+                validate_schema(&schema).is_ok(),
+                "expected column type {ty:?} to be accepted in a UNIQUE constraint"
+            );
+        }
+    }
+
+    /// PRIMARY KEY・FOREIGN KEY の対象型は Issue #1073 で拡張しない
+    /// （`is_primary_key_allowed` は据え置き。`docs/design/foreign-key.md` D3 が
+    /// 前提にする「参照元は PK 許可型」を崩さないための固定回帰）。
+    #[test]
+    fn validate_primary_key_still_rejects_extended_unique_only_types() {
+        for ty in [
+            ColumnType::Real,
+            ColumnType::Double,
+            ColumnType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            ColumnType::Json,
+            ColumnType::Jsonb,
+            ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).expect("valid array type")),
+        ] {
+            let schema = TableSchema::new("docs", vec![ColumnDef::new("v", ty.clone(), false)])
+                .with_primary_key(vec!["v".to_string()]);
+            assert!(
+                matches!(validate_schema(&schema), Err(CatalogError::Invalid(_))),
+                "expected column type {ty:?} to still be rejected as a PRIMARY KEY column"
+            );
+        }
+    }
+
+    /// UNIQUE 制約の対象型拡張後も v6 カタログ値との往復が保たれる（新しい型を
+    /// 含む UNIQUE 宣言を持つスキーマの encode/decode 往復。Issue #1073）。
+    #[test]
+    fn encode_decode_roundtrip_preserves_extended_type_unique_constraints_v6() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("j", ColumnType::Json, true),
+                ColumnDef::new(
+                    "arr",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Text, 8).expect("valid array type"),
+                    ),
+                    true,
+                ),
+            ],
+        )
+        .with_unique_constraints(vec![
+            UniqueConstraint::new(vec!["r".to_string()]),
+            UniqueConstraint::new(vec!["n".to_string()]),
+            UniqueConstraint::new(vec!["j".to_string()]),
+            UniqueConstraint::new(vec!["arr".to_string()]),
+        ]);
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        assert_eq!(decoded, schema);
+    }
+
+    /// FK の参照元列許可型は Issue #1073 の UNIQUE 拡張から独立して据え置かれる
+    /// （`docs/design/foreign-key.md` D3 の「参照元は PK 許可型」という前提を
+    /// 維持する固定回帰）。参照先が `UNIQUE(r REAL)` を宣言できても
+    /// （Issue #1073 で UNIQUE の対象へ追加）、REAL 列から `FOREIGN KEY` を
+    /// 宣言することはできない。
+    #[test]
+    fn validate_foreign_keys_still_rejects_real_referencing_column_after_unique_extension() {
+        let parent = TableSchema::new("parents", vec![ColumnDef::new("r", ColumnType::Real, true)])
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["r".to_string()])]);
+        assert!(
+            validate_schema(&parent).is_ok(),
+            "parent schema with UNIQUE(r REAL) must validate (Issue #1073)"
+        );
+
+        let child = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("r", ColumnType::Real, true)],
+        )
+        .with_foreign_keys(vec![fk(&["r"], "parents", &["r"])]);
+        assert!(matches!(
+            validate_schema(&child),
+            Err(CatalogError::InvalidForeignKey(_))
         ));
     }
 
