@@ -11,6 +11,12 @@
 //! - R3: 重複指定は非 0 終了・stderr に "specified more than once" を含むこと
 //! - R4: 範囲外（`0`・`1_000_001`）・非数値（先頭 `+`・空白・英字混じり）は
 //!   非 0 終了・stderr にフラグ名を含むこと
+//! - R5（codex-review P1 指摘・PR #1122 対応）: `--max-insert-rows` を
+//!   `batch_limits.max_files_per_batch`（既定 64）超に設定すると起動ログへ
+//!   `WARNING` 行が出ること・環境変数 `VECTOR_DB_BATCH_MAX_FILES` で
+//!   `max_files_per_batch` を引き上げれば同じ `--max-insert-rows` 値でも
+//!   `WARNING` が出ないこと（いずれも `listening on` には到達する。
+//!   `wire_server::dml_limits_opt::insert_rows_cap_warning` 参照）
 //!
 //! 実際に上限値が engine 側の判定（`54000`・副作用ゼロ）へ届くことは
 //! `crates/engine/tests/sql_predicate_dml_exec.rs`・
@@ -102,6 +108,48 @@ fn wait_for_listening(child: &mut Child) -> bool {
             Ok(line) if line.contains("listening on") => return true,
             Ok(_) => continue,
             Err(_) => return false,
+        }
+    }
+}
+
+/// 子プロセスの stderr を `listening on` に到達するまで全行集めて返す
+/// （`wire_durability_cli.rs::wait_for_listening_addr_and_lines` と同じ理由。
+/// R5 の `WARNING` 行の有無を判定するため、`listening on` の 1 行だけでなく
+/// 途中の全行を保持する）。
+fn wait_for_listening_lines(child: &mut Child) -> Vec<String> {
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut lines = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("did not observe listening state within timeout; lines so far: {lines:?}");
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                let trimmed = line.trim_end().to_string();
+                let is_listening = line.contains("listening on");
+                lines.push(trimmed);
+                if is_listening {
+                    return lines;
+                }
+            }
+            Err(_) => panic!(
+                "stderr channel closed before observing listening state; lines so far: {lines:?}"
+            ),
         }
     }
 }
@@ -228,6 +276,87 @@ fn invalid_missing_duplicate_or_out_of_range_values_are_rejected() {
         assert!(
             stderr.contains(expected_flag),
             "args={extra_args:?}: expected stderr to mention {expected_flag}, got: {stderr}"
+        );
+    }
+}
+
+/// R5: `--max-insert-rows` を `batch_limits.max_files_per_batch`（既定 64）超に
+/// 設定すると起動ログへ `WARNING` 行が出る（`listening on` には到達する）。
+/// 環境変数 `VECTOR_DB_BATCH_MAX_FILES` で `max_files_per_batch` を同じ値まで
+/// 引き上げれば `WARNING` は出ない（子プロセスの環境変数は
+/// `Command::env` 経由で設定するため、他テストとのグローバル環境変数の
+/// 競合は起こらない）。
+#[test]
+fn max_insert_rows_over_batch_limits_default_emits_warning_unless_env_raised() {
+    // ケース 1: `VECTOR_DB_BATCH_MAX_FILES` 未設定 → 既定の 64 を超えるため WARNING。
+    {
+        let fixture = TempFixtureDir::new("r5-warning");
+        let users_path = fixture.users_path_str();
+        write_empty_user_store(&users_path);
+        let db_path = fixture.db_path_str();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args([
+                "--users",
+                &users_path,
+                "--db",
+                &db_path,
+                "--bind",
+                "127.0.0.1:0",
+                "--max-insert-rows",
+                "100",
+            ])
+            .env_remove("VECTOR_DB_BATCH_MAX_FILES")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wire-server");
+
+        let lines = wait_for_listening_lines(&mut child);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            lines.iter().any(|l| l.contains("WARNING")
+                && l.contains("--max-insert-rows")
+                && l.contains("VECTOR_DB_BATCH_MAX_FILES")),
+            "expected a WARNING line mentioning --max-insert-rows and \
+             VECTOR_DB_BATCH_MAX_FILES, got: {lines:?}"
+        );
+    }
+
+    // ケース 2: `VECTOR_DB_BATCH_MAX_FILES=100` で引き上げ済み → WARNING なし。
+    {
+        let fixture = TempFixtureDir::new("r5-no-warning");
+        let users_path = fixture.users_path_str();
+        write_empty_user_store(&users_path);
+        let db_path = fixture.db_path_str();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args([
+                "--users",
+                &users_path,
+                "--db",
+                &db_path,
+                "--bind",
+                "127.0.0.1:0",
+                "--max-insert-rows",
+                "100",
+            ])
+            .env("VECTOR_DB_BATCH_MAX_FILES", "100")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wire-server");
+
+        let lines = wait_for_listening_lines(&mut child);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            !lines.iter().any(|l| l.contains("WARNING")),
+            "expected no WARNING line once VECTOR_DB_BATCH_MAX_FILES raises the batch limit, \
+             got: {lines:?}"
         );
     }
 }
