@@ -829,6 +829,10 @@ listen 後の stderr）を出力する。回帰テスト
 接続エラーのログ後もサーバーが生存し新規接続へ認証要求を返すことを固定する。
 production コードは変更していない（stderr の消費側が閉じた場合に
 サーバーが abort する挙動の扱いは、本 Issue のスコープ外として別途判断する）。
+**追記（Issue #1081）**: production コード側の扱いは Issue #1081 で決着した
+（`engine::log_stderr!` へ一本化し、診断ログの書き込み失敗は abort させない。
+判断の記録: `docs/design/stderr-log-write-failure.md`）。本ハーネスの読み続け
+契約自体は失敗時診断のため変更なく維持する。
 
 ## TLS 上の 3 クライアント検証（Issue #969・WIRE-9）
 

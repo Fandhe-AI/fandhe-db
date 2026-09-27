@@ -38,6 +38,13 @@
 //! `catch_unwind` を使うテスト・engine をライブラリとして使う他バイナリの
 //! panic 挙動を暗黙に変えないため）。`install()` を呼ぶのは
 //! `wire-server::main::run_server` のみを想定する。
+//!
+//! 診断出力の書き込み失敗は本モジュールの対象外（Issue #1081、
+//! ポインタ: `docs/design/stderr-log-write-failure.md`）: 本フックが出す固定
+//! 文言も含め、stderr への診断ログ出力自体は
+//! [`crate::recovery::stderr_log::write_line`]／[`crate::log_stderr`] を通し、
+//! 読み手が閉じた後の書き込み失敗（`EPIPE` 等）を無視する。panic 自体を捕捉
+//! しない点・panic が発生した場合に必ず abort する点は従来どおり変わらない。
 
 use std::sync::Once;
 
@@ -63,7 +70,7 @@ pub fn install() {
             // みを stderr へ出す（panic_info の Display 実装は既に前フック側で
             // 出力済み・出力するかは前フックの判断に委ねる。ここでは fail-fast
             // が発動したことのみを明示する）。
-            eprintln!(
+            crate::log_stderr!(
                 "wire-server: fatal: unrecovered panic, aborting process (fail-fast, RECOVER-8)"
             );
             // 経路（読み取り・書き込み）・発生スレッドを問わず、ここへ到達した

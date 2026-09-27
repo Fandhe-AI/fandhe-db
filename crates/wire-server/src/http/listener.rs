@@ -68,7 +68,7 @@ pub fn accept_loop_stub(listener: TcpListener) {
                 let _ = stream.shutdown(Shutdown::Both);
             }
             Err(e) => {
-                eprintln!("wire-server: accept error: {e}");
+                engine::log_stderr!("wire-server: accept error: {e}");
             }
         }
     }
@@ -177,7 +177,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
         let stream = match incoming {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("wire-server: accept error: {e}");
+                engine::log_stderr!("wire-server: accept error: {e}");
                 continue;
             }
         };
@@ -185,7 +185,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
         let Some(permit) = limiter.try_acquire() else {
             // 上限超過: ハンドラへ進ませず、スレッドを生成せずにクローズする
             // （WIRE-6）。ピアアドレス等の識別情報はログに出さない。
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: rejecting connection: too many connections (active={}, max={})",
                 limiter.active(),
                 limiter.max()
@@ -243,7 +243,9 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                             conn::reject_too_many_connections(stream);
                         }
                     }) {
-                        eprintln!("wire-server: failed to spawn reject worker thread: {e}");
+                        engine::log_stderr!(
+                            "wire-server: failed to spawn reject worker thread: {e}"
+                        );
                     }
                 }
                 None => {
@@ -257,7 +259,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
         };
 
         if let Err(e) = limits::apply_read_timeout(&stream, read_timeout) {
-            eprintln!("wire-server: failed to configure connection timeouts: {e}");
+            engine::log_stderr!("wire-server: failed to configure connection timeouts: {e}");
             // `permit` はここでスコープを抜けて解放される。
             continue;
         }
@@ -293,7 +295,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                 }
             }
         }) {
-            eprintln!("wire-server: failed to spawn connection handler thread: {e}");
+            engine::log_stderr!("wire-server: failed to spawn connection handler thread: {e}");
             // クロージャへ move された `permit` はスレッド生成失敗時に
             // 即座に Drop され枠が解放される。ストリームは outgoing の
             // `spawn` 失敗で誰も所有しなくなるため、OS の接続クローズに

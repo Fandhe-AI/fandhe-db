@@ -942,7 +942,7 @@ fn build_error_response_body(err: &HandlerError) -> Result<Vec<u8>, result_encod
 /// （モジュールドキュメント「エラー後の同期回復」節）場合に、有界
 /// lingering close で接続を終える。
 fn respond_error_and_close<S: WireStream>(stream: &mut S, err: &HandlerError) -> io::Result<()> {
-    eprintln!(
+    engine::log_stderr!(
         "wire-server: extended query rejecting message ({})",
         err.error_class().wire_code()
     );
@@ -975,7 +975,7 @@ fn respond_error_and_await_sync<S: WireStream>(
     err: &HandlerError,
     state: &mut ExtendedQueryState,
 ) -> io::Result<()> {
-    eprintln!(
+    engine::log_stderr!(
         "wire-server: extended query error, awaiting Sync ({})",
         err.error_class().wire_code()
     );
