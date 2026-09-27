@@ -1825,6 +1825,95 @@ mod tests {
         assert_eq!(err.wire_code(), "22000");
     }
 
+    /// `ColumnType::Array` を持つスキーマ（TABLE-14・TASK-198、Issue #888）。
+    /// PR #1108 codex-review 指摘対応（P1: DISTANCE 先行時の OR 式評価の遅延化）
+    /// で `sql::exec::candidate_value_to_scalar_ref` が `Value::Array` を
+    /// `ScalarRef::Bytes(&[])`（内容を読まれないプレースホルダ）へ写す設計の
+    /// 前提となる、`IsNull`/`IsNotNull` 以外は ARRAY 列に束縛できないという
+    /// 不変条件をこのテストで固定する（この不変条件が崩れると、あの変換は
+    /// 誤った結果を静かに返すようになる）。
+    fn array_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "tags",
+                    ColumnType::Array(
+                        crate::catalog::ArrayType::new(crate::catalog::ArrayElemType::Text, 8)
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn is_null_and_is_not_null_accept_array_column() {
+        // `sql::exec::candidate_value_to_scalar_ref` の `Value::Array` プレース
+        // ホルダ設計が安全である前提（IsNull/IsNotNull は ARRAY 列へ束縛できる）。
+        assert!(DeclarativeFilter::is_null("tags")
+            .bind(&array_schema())
+            .is_ok());
+        assert!(DeclarativeFilter::is_not_null("tags")
+            .bind(&array_schema())
+            .is_ok());
+    }
+
+    #[test]
+    fn non_is_null_filters_reject_array_column() {
+        // `sql::exec::candidate_value_to_scalar_ref` の `Value::Array` プレース
+        // ホルダ（`ScalarRef::Bytes(&[])`）は内容を読まれない前提で安全と
+        // している。この前提は、ARRAY 列が `IsNull`/`IsNotNull` 以外の
+        // フィルタへ束縛できないことに依存する。ここで崩れていないことを固定する
+        // （崩れた場合、あのプレースホルダはこれらのフィルタから誤って
+        // 「空バイト列」として読まれてしまう）。
+        let schema = array_schema();
+        assert_eq!(
+            DeclarativeFilter::equals("tags", "x")
+                .bind(&schema)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            DeclarativeFilter::starts_with("tags", "x")
+                .bind(&schema)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            DeclarativeFilter::like("tags", "%x%")
+                .bind(&schema)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            DeclarativeFilter::in_list("tags", vec!["x".to_string()])
+                .bind(&schema)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            DeclarativeFilter::between("tags", "a", "b")
+                .bind(&schema)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+        assert_eq!(
+            DeclarativeFilter::compare("tags", CompareOp::Gt, "x")
+                .bind(&schema)
+                .unwrap_err()
+                .wire_code(),
+            "22000"
+        );
+    }
+
     #[test]
     fn negate_inverts_match_and_keeps_unknown_unknown() {
         let eq = DeclarativeFilter::equals("kind", "code")

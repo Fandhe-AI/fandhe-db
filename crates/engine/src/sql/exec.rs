@@ -42,7 +42,7 @@ use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
-use crate::row_codec::{self, RowCodecError, Value};
+use crate::row_codec::{self, RowCodecError, ScalarRef, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{
@@ -402,6 +402,54 @@ fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
     }
 }
 
+/// `candidate_columns[slot]`（`on_visible_row` が `needed_column_indices` に
+/// 含まれる列だけ実値を保持し、それ以外は `Value::Null` で埋めた `Vec<Value>`）
+/// から、DISTANCE 段の後（`sql::exec::execute_statement_with_cache` の
+/// SCALAR 事後フィルタ）で `row_codec::ScalarRef` へ再構成する（TASK-208・
+/// Issue #912/#913、codex-review 指摘対応）。
+///
+/// **前提（呼び出し元が保証する不変条件）**: `values` の各要素は
+/// `needed_column_indices` に含まれる列のみが `on_visible_row` の生の
+/// `scan_scalar_columns` 結果をそのまま複製した値で、それ以外は
+/// `Value::Null`（投影・フィルタのいずれにも不要な列。実 NULL とは限らない）
+/// である。本関数は `needed_column_indices` に含まれない列へは呼ばれない
+/// 契約（呼び出し元が `bound.or_filters`／`bound.expr_filter_programs` が
+/// 参照する列だけを対象にする）ため、`Value::Null` は常に「実 NULL」と解釈して
+/// 安全（`is_null` 判定・SCALAR 事後フィルタの唯一の消費者である宣言的フィルタ
+/// ・式述語の双方がこの契約を前提にする）。
+///
+/// `Value::Integer`／`BigInt` は主要な `codex-review` 指摘の対象（`IS NULL` の
+/// fail-open）で、実値をそのまま `Some(ScalarRef::Integer/BigInt)` へ写す
+/// （`None` へ丸めない）。`Value::Array` は `ArrayRef`（`row_codec` 内部限定の
+/// 非公開フィールドを持つ借用型）を本モジュールから再構成できないため、
+/// `bind_filter_op`（`declarative_filter.rs`）が `ARRAY` 列に対して
+/// `IsNull`／`IsNotNull`（`Some`／`None` の判別のみで内容を読まない）以外の
+/// フィルタを束縛時に一切許可しない不変条件に頼り、内容を読まれない
+/// プレースホルダ（`ScalarRef::Bytes(&[])`）で「非 NULL」を表す。`Value::Vector`
+/// は `scan_scalar_columns` が常に `None` を返す列（実体は `arena` 経由）のため
+/// 到達しない契約だが、防御的に `None` へ倒す。
+fn candidate_value_to_scalar_ref(value: &Value) -> Option<ScalarRef<'_>> {
+    match value {
+        Value::Null | Value::Vector(_) => None,
+        Value::Text(t) => Some(ScalarRef::Text(t.as_str())),
+        Value::Integer(v) => Some(ScalarRef::Integer(*v)),
+        Value::BigInt(v) => Some(ScalarRef::BigInt(*v)),
+        Value::Real(v) => Some(ScalarRef::Real(*v)),
+        Value::Double(v) => Some(ScalarRef::Double(*v)),
+        Value::Bool(v) => Some(ScalarRef::Bool(*v)),
+        Value::Date(v) => Some(ScalarRef::Date(*v)),
+        Value::Timestamp(v) => Some(ScalarRef::Timestamp(*v)),
+        Value::Bytes(b) => Some(ScalarRef::Bytes(b.as_slice())),
+        Value::Json(t) => Some(ScalarRef::Json(t.as_str())),
+        Value::Enum(label) => Some(ScalarRef::Enum(label.as_str())),
+        Value::Numeric(d) => Some(ScalarRef::Numeric(*d)),
+        Value::Uuid(u) => Some(ScalarRef::Uuid(*u)),
+        // 上記ドキュメント参照: `ARRAY` 列は `IsNull`/`IsNotNull` 以外の
+        // フィルタを束縛できないため、内容を読まれない前提でプレースホルダを返す。
+        Value::Array(_) => Some(ScalarRef::Bytes(&[])),
+    }
+}
+
 fn map_kernel_error(_e: KernelError) -> SqlSurfaceError {
     // クエリの次元・有限性は `sql::parser::bind`（ベクトルリテラル解析）が既に
     // 検証済みのため、ここへ到達するのは provider 側の契約違反・実装バグのみ
@@ -723,13 +771,6 @@ pub(crate) fn execute_statement_with_cache(
         .or_filters
         .iter()
         .any(crate::sql::where_tree::BoundOrGroup::contains_expr);
-    // `or_filters_have_expr` が真の場合のみ使う、宣言的部分だけを事前評価した
-    // 判定結果（`postfilter_verdicts`・`candidate_columns` と同じくスロット番号で
-    // 1 対 1。`on_visible_row` が生の `scanned` に対して記録し、DISTANCE 段の後
-    // （`bound.or_filters` を経由する箇所）で式述語込みの最終判定
-    // （`BoundOrGroup::matches_deferred`）に使う）。
-    let mut or_metadata_verdicts: Vec<Vec<crate::sql::where_tree::OrGroupMetadataVerdict>> =
-        Vec::new();
 
     // 投影段（下記ループ）が実際に参照する Text 列インデックスの集合。`VECTOR` 列は
     // `scan_scalar_columns` が常に `None` を返すだけ（実体は `arena` から引く）ため
@@ -878,33 +919,34 @@ pub(crate) fn execute_statement_with_cache(
         // TASK-208・Issue #912/#913: DISTANCE 先行時は OR 群（`bound.or_filters`）の
         // 宣言的（メタデータ）部分も、同じ生の `scanned`（`row_codec::ScalarRef`）に
         // 対してここで判定する。`needed_column_indices`（上記）が OR 群参照列を
-        // 含むため必要な値は必ず保持済み。DISTANCE 段の後で `candidate_columns`
-        // （`Value`）から `ScalarRef` へ逆変換して判定し直すと、`postfilter_verdicts`
-        // 宣言のコメントと同じ理由で fail-open になるため、区別可能なこの時点で
-        // 1 回だけ評価する。
+        // 含むため必要な値は必ず保持済み。
         //
-        // 式述語を含む OR 群（`or_filters_have_expr`）は、宣言的部分の判定結果
-        // （`OrGroupMetadataVerdict`。エラーを返さない）だけをここで記録し、式述語
-        // 自体の評価（ゼロ除算等でエラーを返しうる）は DISTANCE 段の後、実際に
-        // Top-k として選ばれた行に限って行う（`BoundOrGroup::matches_deferred`。
-        // codex-review 指摘対応: 式評価を全可視行へ前倒しすると、Top-k 外の行の
-        // エラーまでクエリ全体の失敗にしてしまう）。ただし、宣言的部分だけで
-        // 「式述語の値に関わらず不一致」と確定できる行（`is_definitely_false`）は
-        // ここで安全に除外してよい（式を一切評価しないため）。
+        // 式述語を含む OR 群（`or_filters_have_expr`）は、式述語自体の評価
+        // （ゼロ除算等でエラーを返しうる）を DISTANCE 段の後、実際に Top-k として
+        // 選ばれた行に限って行う（codex-review 指摘対応: 式評価を全可視行へ
+        // 前倒しすると、Top-k 外の行のエラーまでクエリ全体の失敗にしてしまう）。
+        // ここでは判定結果を（`postfilter_verdicts` 以外に）一切保持せず、宣言的
+        // 部分だけで「式述語の値に関わらず不一致」と確定できる行
+        // （`OrGroupMetadataVerdict::is_definitely_false`）だけを、この場限りの
+        // 一時的な木（`&scanned` を借用するだけで `candidate_columns` とは独立）
+        // で判定し安全に除外する（式を一切評価しないため）。DISTANCE 段の後の
+        // 最終判定（式述語を含む場合）は `candidate_columns`（`Value`。`Value::Text`
+        // 以外の型も含め、`needed_column_indices` に含まれる列は取り違えなく
+        // 保持される）から `scanned` 相当を再構成し、既存の `BoundOrGroup::matches`
+        // をそのまま再利用する（第 2 の評価器・行ごとの無制限な判定結果保持を
+        // 作らない。codex-review 指摘対応: `Vec<OrGroupMetadataVerdict>` を
+        // スロットごとに保持すると、最大可視行数〔100 万〕× OR 群の分岐数分の
+        // メモリをアリーナのバイト予算とは別に無制限に消費してしまう）。
         let scalar_postfilter_matched = if plan.scalar_prefilter {
             true
         } else {
             let metadata_matched =
                 declarative_filter::matches_all(&bound.metadata_filters, &scanned);
             if or_filters_have_expr {
-                let verdicts: Vec<crate::sql::where_tree::OrGroupMetadataVerdict> = bound
+                let or_definitely_false = bound
                     .or_filters
                     .iter()
-                    .map(|group| group.metadata_verdict(&scanned))
-                    .collect();
-                let or_definitely_false = verdicts.iter().any(|v| v.is_definitely_false());
-                debug_assert_eq!(or_metadata_verdicts.len(), slot);
-                or_metadata_verdicts.push(verdicts);
+                    .any(|group| group.metadata_verdict(&scanned).is_definitely_false());
                 metadata_matched && !or_definitely_false
             } else {
                 metadata_matched
@@ -2084,7 +2126,7 @@ pub(crate) fn execute_statement_with_cache(
         // 使い回す）。
         let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
         // TASK-208・Issue #912/#913（codex-review 指摘対応）: `or_filters_have_expr`
-        // の場合に `BoundOrGroup::matches_deferred` が使うスクラッチ（`on_visible_row`
+        // の場合に `BoundOrGroup::matches` が使うスクラッチ（`on_visible_row`
         // の `or_scratch` と同じ理由で個別に確保。行数分使い回す）。
         let mut or_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
         for (slot_id, score) in hits {
@@ -2108,34 +2150,32 @@ pub(crate) fn execute_statement_with_cache(
             // OR 群参照列を保持済みの生 `scanned` に対して判定済みのため、ここでは
             // `expr_filter_programs`（embedding・行 `id` を要する式述語）のみを
             // 事後適用すればよい。式述語を含む OR 群（`or_filters_have_expr`）は
-            // `on_visible_row` が宣言的部分（`OrGroupMetadataVerdict`）だけを記録
-            // 済みで、式述語自体の評価はここで初めて行う（codex-review 指摘対応:
-            // Top-k として選ばれた行だけに限定することで、選ばれない行のゼロ除算等
-            // のエラーがクエリ全体を失敗させないようにする）。
+            // 式述語自体の評価をここで初めて行う（codex-review 指摘対応: Top-k
+            // として選ばれた行だけに限定することで、選ばれない行のゼロ除算等の
+            // エラーがクエリ全体を失敗させないようにする）。
             if !bound.expr_filter_programs.is_empty() || or_filters_have_expr {
-                // Issue #919・SQL-26: `needed_column_indices`（本関数入口）が
-                // `expr_filters`／OR 群の `TEXT` 参照を候補構築時に含め済みのため、
-                // `candidate_columns[slot]`（`Value`。投影に不要な列は
-                // `Value::Null` で埋められているだけで、必要な列は生の
-                // `scan_scalar_columns` 結果をそのまま保持している）から
-                // `Value::Text` のみを取り出せば安全に再現できる。`postfilter_verdicts`
-                // 宣言のコメントが警告する fail-open は `Value::Integer`／`BigInt`／
-                // `Array` を実 NULL と取り違える問題であり、`Value::Text` の判別
-                // （`Some` になるのは `Value::Text` の場合のみ）には曖昧さがないため
-                // 対象外（`sql::where_tree::BoundConjunction::matches_deferred` の
-                // ドキュメント参照）。
-                let text_columns: Vec<Option<&str>> = candidate_columns
-                    .get(slot)
-                    .map(|columns| {
-                        columns
-                            .iter()
-                            .map(|v| match v {
-                                Value::Text(t) => Some(t.as_str()),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Issue #919・SQL-26、TASK-208・Issue #912/#913（codex-review
+                // 指摘対応）: `needed_column_indices`（本関数入口）が
+                // `expr_filters`／OR 群の参照列を候補構築時に含め済みのため、
+                // `candidate_columns[slot]`（`Value`）から `scan_scalar_columns`
+                // 相当（`row_codec::ScalarRef`）を安全に再構成できる
+                // （`candidate_value_to_scalar_ref` のドキュメント参照。
+                // `Value::Integer`／`BigInt` を実値のまま復元するため、単純な
+                // `Value → ScalarRef` 変換にありがちな `IS NULL` fail-open は
+                // 生じない）。行ごとの判定結果を保持する第 2 のデータ構造
+                // （スロット数 × OR 群の分岐数分のメモリを無制限に消費する
+                // `Vec<OrGroupMetadataVerdict>` 等）を作らず、既存の
+                // `BoundOrGroup::matches`（`on_visible_row` の非 `or_filters_have_expr`
+                // 経路と同じ評価器。第 2 の評価器を作らない）をそのまま再利用する。
+                let Some(columns) = candidate_columns.get(slot) else {
+                    continue;
+                };
+                let scanned_view: Vec<Option<ScalarRef<'_>>> =
+                    columns.iter().map(candidate_value_to_scalar_ref).collect();
+                let text_columns: Vec<Option<&str>> = scanned_view
+                    .iter()
+                    .map(|v| v.and_then(|s| s.as_text()))
+                    .collect();
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
                 };
@@ -2162,19 +2202,11 @@ pub(crate) fn execute_statement_with_cache(
                     }
                 }
                 if expr_ok && or_filters_have_expr {
-                    // `on_visible_row` が push した順序は可視行の処理順序（スロット
-                    // 番号の昇順）と一致し、`or_metadata_verdicts` は
-                    // `candidate_columns`／`postfilter_verdicts` と同じ「スロット
-                    // 番号で 1 対 1」の契約を共有する。
-                    let Some(verdicts) = or_metadata_verdicts.get(slot) else {
-                        continue;
-                    };
-                    for (group, verdict) in bound.or_filters.iter().zip(verdicts.iter()) {
-                        if !group.matches_deferred(
-                            verdict,
+                    for group in &bound.or_filters {
+                        if !group.matches(
+                            &scanned_view,
                             row_id,
                             embedding,
-                            &text_columns,
                             embedding.len(),
                             &mut or_scratch,
                         )? {

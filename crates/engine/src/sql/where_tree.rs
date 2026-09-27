@@ -110,9 +110,9 @@ impl BoundOrGroup {
     /// を 1 つでも持つか（再帰的に判定。codex-review 指摘対応・Issue #913
     /// マージ時レビュー是正）。`sql::exec` の DISTANCE 先行 SCALAR 事後フィルタが、
     /// 式述語を含まない（＝評価がエラーを返し得ない）OR 群だけを
-    /// `on_visible_row` で即時確定させ、式述語を含む OR 群は
-    /// [`Self::metadata_verdict`]／[`Self::matches_deferred`] 経由で DISTANCE 段の
-    /// 後まで評価を遅延させるかどうかを判定するために使う。
+    /// `on_visible_row` で即時確定させ、式述語を含む OR 群は式述語の評価を
+    /// DISTANCE 段の後（実際に Top-k として選ばれた行だけ）まで遅延させるか
+    /// どうかを判定するために使う。
     pub(crate) fn contains_expr(&self) -> bool {
         self.branches.iter().any(BoundConjunction::contains_expr)
     }
@@ -120,13 +120,14 @@ impl BoundOrGroup {
     /// 生の `scanned`（`row_codec::scan_scalar_columns` 由来。実 NULL と型不一致を
     /// 区別できる）に対して、宣言的（メタデータ）述語の部分だけを評価した結果を
     /// 木として保持する（`self` と同じ形状。[`Self`]・[`BoundConjunction`] と
-    /// 1 対 1）。式述語は一切評価しない（エラーを返さない）ため、DISTANCE 先行時
-    /// （`sql::exec::execute_statement_with_cache` の `on_visible_row`）が
-    /// 全可視行に対して安全に呼べる（codex-review 指摘対応: 式評価を全可視行へ
-    /// 前倒しすると、Top-k 外の行のゼロ除算等がクエリ全体の失敗になってしまう。
-    /// また `Value` へ複製してから DISTANCE 段の後で `ScalarRef` へ逆変換すると
-    /// `postfilter_verdicts`〔`sql::exec`〕のコメントと同じ理由で `IS NULL` の
-    /// fail-open が再発するため、生の `scanned` を見られるこの時点でのみ判定する）。
+    /// 1 対 1）。式述語は一切評価しない（エラーを返さない）。`sql::exec` の
+    /// `on_visible_row` がこの場限りの一時的な判定にのみ使う（返り値は行ごとに
+    /// 保持しない。codex-review 指摘対応: 可視行数 × OR 群の分岐数分のメモリを
+    /// 無制限に保持しない）: [`OrGroupMetadataVerdict::is_definitely_false`] が
+    /// 真なら、式述語の値に関わらず不一致が確定するため、式を一切評価せずに
+    /// 安全に除外できる（`AND` の短絡評価。式述語自体の評価は DISTANCE 段の後、
+    /// `candidate_columns` から再構成した `scanned` 相当に対して
+    /// [`Self::matches`] を呼ぶ）。
     pub(crate) fn metadata_verdict(
         &self,
         scanned: &[Option<ScalarRef<'_>>],
@@ -139,36 +140,12 @@ impl BoundOrGroup {
                 .collect(),
         }
     }
-
-    /// [`Self::metadata_verdict`] が確定させた宣言的判定と、DISTANCE 段の後に
-    /// 確定する行コンテキスト（`id`・`embedding`・`text_columns`）を使って
-    /// 最終判定する（式述語をここで初めて評価する。エラーを返しうる）。
-    /// `verdict` は同じ `self` に対して呼んだ [`Self::metadata_verdict`] の
-    /// 戻り値を渡す契約（形状は常に一致する。同一の束縛済み `BoundOrGroup`
-    /// から導出するため）。`text_columns`（Issue #919・SQL-26）は
-    /// [`BoundConjunction::matches_deferred`] のドキュメント参照。
-    pub(crate) fn matches_deferred(
-        &self,
-        verdict: &OrGroupMetadataVerdict,
-        id: u64,
-        embedding: &[f32],
-        text_columns: &[Option<&str>],
-        dim: usize,
-        scratch: &mut Vec<StackValue>,
-    ) -> Result<bool, SqlSurfaceError> {
-        for (branch, branch_verdict) in self.branches.iter().zip(verdict.branches.iter()) {
-            if branch.matches_deferred(branch_verdict, id, embedding, text_columns, dim, scratch)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 }
 
 /// [`BoundOrGroup::metadata_verdict`] が返す、宣言的（メタデータ）述語だけを
 /// 事前評価した結果の木（形状は元の `BoundOrGroup` と 1 対 1）。式述語の
-/// 評価結果は含まない（[`BoundOrGroup::matches_deferred`] がこれと行コンテキスト
-/// を合わせて最終判定する）。
+/// 評価結果は含まない。呼び出し元（`sql::exec`）はこの場限りの判定
+/// （[`Self::is_definitely_false`]）にのみ使い、行ごとに保持しない。
 #[derive(Debug, Clone)]
 pub(crate) struct OrGroupMetadataVerdict {
     branches: Vec<ConjunctionMetadataVerdict>,
@@ -186,13 +163,12 @@ impl OrGroupMetadataVerdict {
 }
 
 /// [`BoundConjunction::metadata_verdict`] が返す 1 分岐ぶんの宣言的判定。
+/// [`OrGroupMetadataVerdict::is_definitely_false`] は `metadata_ok` だけを見る
+/// （`AND` の短絡評価により、ある分岐の `metadata_filters` が不一致なら
+/// ネストした `or_groups` の値に関わらずその分岐は不一致が確定するため）。
 #[derive(Debug, Clone)]
 struct ConjunctionMetadataVerdict {
-    /// [`BoundConjunction::metadata_filters`] を `matches_all` で判定した結果。
-    /// `false` の場合、この分岐は式述語の値に関わらず不一致が確定する
-    /// （`AND` の短絡評価。[`BoundConjunction::matches_deferred`] 参照）。
     metadata_ok: bool,
-    or_groups: Vec<OrGroupMetadataVerdict>,
 }
 
 impl BoundConjunction {
@@ -275,56 +251,14 @@ impl BoundConjunction {
     fn metadata_verdict(&self, scanned: &[Option<ScalarRef<'_>>]) -> ConjunctionMetadataVerdict {
         ConjunctionMetadataVerdict {
             metadata_ok: declarative_filter::matches_all(&self.metadata_filters, scanned),
-            or_groups: self
-                .or_groups
-                .iter()
-                .map(|g| g.metadata_verdict(scanned))
-                .collect(),
         }
-    }
-
-    /// [`BoundOrGroup::matches_deferred`] の分岐単位の本体。`verdict.metadata_ok`
-    /// が `false` なら（`AND` の短絡評価により）式述語を評価せず不一致を返す。
-    /// `true` の場合のみ式述語・ネストした OR 群を評価する（[`Self::matches`] と
-    /// 同じ評価順序・NULL 意味論。式述語だけがここで初めて評価されうる）。
-    /// `text_columns`（Issue #919・SQL-26 の文字列関数が参照する `TEXT` 列）は
-    /// 呼び出し元（`sql::exec`）が `candidate_columns`（`Value::Text` のみ
-    /// `Some` になる、型不一致のない安全な変換。`postfilter_verdicts`
-    /// 宣言のコメントが警告する `IS NULL` fail-open は `Value::Integer`／
-    /// `BigInt`／`Array` を巻き込む変換に限られ、`Value::Text` の判別は
-    /// 曖昧にならない）から導出して渡す。
-    fn matches_deferred(
-        &self,
-        verdict: &ConjunctionMetadataVerdict,
-        id: u64,
-        embedding: &[f32],
-        text_columns: &[Option<&str>],
-        dim: usize,
-        scratch: &mut Vec<StackValue>,
-    ) -> Result<bool, SqlSurfaceError> {
-        if !verdict.metadata_ok {
-            return Ok(false);
-        }
-        for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
-            if let Some(false) =
-                eval_expr_predicate(expr, program, id, embedding, text_columns, scratch)?
-            {
-                return Ok(false);
-            }
-        }
-        for (group, group_verdict) in self.or_groups.iter().zip(verdict.or_groups.iter()) {
-            if !group.matches_deferred(group_verdict, id, embedding, text_columns, dim, scratch)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 }
 
 /// [`BoundConjunction::expr_filters`] の 1 要素を評価する（[`BoundConjunction::
-/// matches`]・[`BoundConjunction::matches_deferred`] が共有し、第 2 の評価器を
-/// 作らない）。`Ok(Some(false))` は分岐全体を不一致として打ち切るべきことを
-/// 示し、`Ok(None)` は一致（呼び出し元は次の式述語へ進む）を示す。
+/// matches`] が使い、第 2 の評価器を作らない）。`Ok(Some(false))` は分岐全体を
+/// 不一致として打ち切るべきことを示し、`Ok(None)` は一致（呼び出し元は次の
+/// 式述語へ進む）を示す。
 fn eval_expr_predicate(
     expr: &BoundExpr,
     program: &ExprProgram,
