@@ -151,10 +151,15 @@ impl ClassifiedError for ExplainError {
 /// 2. `vector`・`plan` の同時指定を拒否する（`42601`。[`SearchError::
 ///    VectorAndPlanBothPresent`]。テーブル解決を要さない構造的な契約違反
 ///    のため最優先——[`super::search::execute`] の同名判定と同じ優先順位）。
-/// 3. `vector` のみが指定されている場合、[`super::search::
-///    bind_vector_statement`]（通常実行と共有する binder closure）で束縛し
+/// 3. `vector` のみが指定されている場合、`limit` 検証をここでは行わずに
 ///    [`engine::core::EngineCore::explain_bound_search_in_session`]（Issue
-///    #948）を呼んで返す。以降の手順（4〜7）はこの分岐を経由しない。
+///    #948）を呼ぶ。`limit` の型・範囲検証は [`super::search::
+///    bind_vector_statement`]（通常実行と共有する binder closure。中身は
+///    `bind_search`）がテーブル解決後に行う——[`super::search::execute`]
+///    の `vector` 分岐（`else` 側）も `limit` 検証をテーブル解決前には行わ
+///    ず `bind_search` に委ねているのと同じ優先順位（未知テーブル＋
+///    `limit` 範囲外の要求で `42P01` が `22000` より優先される）。以降の
+///    手順（4〜7）はこの分岐を経由しない。
 /// 4. `plan` が指定されている場合のみ、[`validate_using_plan_question`] で
 ///    長さ上限を検証する（`54000`。[`super::search::execute`] の `plan`
 ///    分岐と同じくテーブル解決より前に行う）。`plan` 未指定（`None`）は
@@ -200,13 +205,16 @@ pub fn execute(
     }
 
     // 手順 3: `vector` のみ指定された要求は Issue #948 の新経路（NoSQL 表層
-    // `vector` 指定検索への `EXPLAIN` 拡大）。通常実行
-    // （`search::execute`）と同一の binder closure（`bind_vector_statement`）
-    // を共有するため、未知テーブル・型不整合等のエラー分類は `explain` の
-    // 有無で変わらない。
+    // `vector` 指定検索への `EXPLAIN` 拡大）。`limit` の型・範囲検証は
+    // ここでは行わない——`search::execute` の `vector` 分岐（`else` 側）が
+    // `limit` 検証をテーブル解決前に行わず、`bind_search`（binder closure
+    // 内・テーブル解決後）に委ねているのと同じ順序を保つため（未知テーブル
+    // ＋ `limit` 範囲外の要求で `42P01` が `22000` より優先される）。通常
+    // 実行（`search::execute`）と同一の binder closure
+    // （`bind_vector_statement` → `bind_search`）を共有するため、未知
+    // テーブル・`limit` 範囲外・型不整合等のエラー分類・優先順位は
+    // `explain` の有無で変わらない。
     if vector_present {
-        let limit_raw = validated.required_u32("limit")?;
-        validate_search_limit(limit_raw)?;
         let session = SessionState::default();
         let result =
             core.explain_bound_search_in_session(ctx, &session, table, |schema, _udfs| {

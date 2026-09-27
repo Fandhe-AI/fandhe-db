@@ -14,12 +14,14 @@
 //! `resolve_group_by_column`・`check_having_target_is_numeric`）を SQL テキスト
 //! 経由の `bind_aggregate` と完全に共有する。
 //!
-//! `explain: true` は SQL-6 の「`EXPLAIN` は `USING PLAN` 付き検索 `SELECT`
-//! 専用」契約の写像として `42601`（[`AggregateError::ExplainNotSupported`]）
-//! で拒否し実行しない（黙って無視すると `explain` なしの通常実行へ fail-open
-//! に縮退してしまうため。Issue #765・NOSQL-10）。`group_by`／`having` は
-//! Issue #769 で SQL-14（`sql::group_by::execute_grouped_aggregate`）へ
-//! 写像する。
+//! `explain: true` は Issue #948（NOSQL-16・SQL-27）で受理するよう拡大した。
+//! 通常 [`super::gate::handle`] が [`execute`] より前に [`explain`] へ
+//! 振り分けるため（`group_by`／`having` の有無を問わない）、[`execute`]
+//! 内の [`reject_explain`]（`42601`。[`AggregateError::
+//! ExplainNotSupported`]）はゲートを迂回して直接呼ばれた場合に備える多層
+//! 防御としてのみ残る（黙って無視して `explain` なしの通常実行へ
+//! fail-open に縮退させないため）。`group_by`／`having` は Issue #769 で
+//! SQL-14（`sql::group_by::execute_grouped_aggregate`）へ写像する。
 //!
 //! `table`／`aggregates[].column`／`group_by[0]`／`having[].column`
 //! （`*` を除く）は [`super::ident::check_identifier`] で識別子形状を検査
@@ -215,12 +217,14 @@ impl ClassifiedError for AggregateError {
 }
 
 /// `validated`（[`super::schema::AGGREGATE_SCHEMA`] を通過済みの `aggregate`
-/// 要求本文）が `explain: true` を伴うかを判定する（SQL-6 の「`EXPLAIN` は
-/// `USING PLAN` 付き検索 `SELECT` 専用」契約の写像。Issue #765・NOSQL-10）。
-/// 伴う場合は `Err(AggregateError::ExplainNotSupported)` を返し、呼び出し元は
-/// 束縛・実行を一切行わない（黙って無視すると `explain` なしの通常実行へ
-/// fail-open に縮退してしまうため）。`group_by`／`having` は [`bind`] が
-/// 直接処理する（TASK-186・NOSQL-5・Issue #769）。
+/// 要求本文）が `explain: true` を伴うかを判定する。伴う場合は
+/// `Err(AggregateError::ExplainNotSupported)` を返し、呼び出し元
+/// （[`execute`]）は束縛・実行を一切行わない。通常は [`super::gate::
+/// handle`] が [`explain`]（Issue #948・NOSQL-16・SQL-27）へ振り分けるため
+/// [`execute`] 自体に到達しないが、ゲートを迂回した場合に備える多層防御
+/// として維持する（黙って無視して `explain` なしの通常実行へ fail-open に
+/// 縮退させないため）。`group_by`／`having` は [`bind`] が直接処理する
+/// （TASK-186・NOSQL-5・Issue #769）。
 fn reject_explain(validated: &Validated<'_>) -> Result<(), AggregateError> {
     if validated.optional_bool("explain")? == Some(true) {
         return Err(AggregateError::ExplainNotSupported);

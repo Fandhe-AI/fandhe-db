@@ -88,16 +88,12 @@
 //!   handle_connection_with` への委譲。Issue #968・親 #941・TASK-228。
 //!   対象ビヘイビア WIRE-9・HTTP-9・HTTP-10）
 //!
-//! 後続 Issue で追加予定（本モジュールでは未実装）:
-//! - `explain: true` 時の `{"explain":[...]}` 応答（#765）
-//! - [`query::gate`] の暫定 `0A000`／501 応答を op ごとの束縛・実行計画への
-//!   写像で置き換える（op 許可リスト自体は [`query::op`] として実装済み
-//!   〔Issue #759・TASK-179・NOSQL-1・NOSQL-9〕。#763・#766・#768 以降が
-//!   本 seam を置き換える）
-//!
 //! 対応: TASK-173〜TASK-175（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア
-//! HTTP-1〜13・NOSQL-1〜NOSQL-10。PoC-15/TASK-182 は private 資産のため
-//! ポインタ参照のみで、コード・所見は転記しない）。
+//! HTTP-1〜13・NOSQL-1〜NOSQL-16。PoC-15/TASK-182 は private 資産のため
+//! ポインタ参照のみで、コード・所見は転記しない）。`explain: true` の
+//! `{"explain":[...]}` 応答（`search`・`scan`・`aggregate`）は実装済み
+//! （[`query::explain`]・[`query::scan::handle_explain`]・
+//! [`query::aggregate::handle_explain`]。Issue #765・#948）。
 
 pub mod body;
 pub(crate) mod conn;

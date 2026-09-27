@@ -459,6 +459,23 @@ fn none_of_the_three_ops_execute_or_touch_visible_bitmap_cache() {
     let ctx_a = ctx_for("tenant-a");
     let (addr, token) = spawn_alice_session(Arc::clone(&core));
 
+    // 可視行数（`SELECT COUNT(id)`）の実測値を要求の前後で比較する（`explain`
+    // 応答の行数〔常に固定〕ではなく、実際の可視行走査結果を見る）。
+    let count_rows = |core: &EngineCore| -> u64 {
+        let mut session = SessionState::default();
+        match core
+            .execute_sql_in_session(&ctx_a, &mut session, "SELECT COUNT(id) FROM docs")
+            .expect("SQL COUNT should succeed")
+        {
+            SqlOutcome::Query(result) => match &result.rows[0].cells[0] {
+                engine::sql::exec::Cell::Integer(n) => *n,
+                other => panic!("expected Cell::Integer count, got {other:?}"),
+            },
+            other => panic!("expected SqlOutcome::Query, got {other:?}"),
+        }
+    };
+    let count_before = count_rows(&core);
+
     let before = core.visible_bitmap_cache_stats();
 
     let vector_body =
@@ -485,12 +502,11 @@ fn none_of_the_three_ops_execute_or_touch_visible_bitmap_cache() {
     assert_eq!(before.misses, after.misses, "misses changed");
     assert_eq!(before.entries, after.entries, "entries changed");
 
-    // 可視行数（`SELECT COUNT(id)`）が要求の前後で変化しないことも確認する。
-    let count_before =
-        sql_explain_lines(&core, &ctx_a, "EXPLAIN SELECT id FROM docs LIMIT 100").len();
-    let count_after =
-        sql_explain_lines(&core, &ctx_a, "EXPLAIN SELECT id FROM docs LIMIT 100").len();
-    assert_eq!(count_before, count_after);
+    let count_after = count_rows(&core);
+    assert_eq!(
+        count_before, count_after,
+        "visible row count changed across explain requests (execution leaked)"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -575,6 +591,46 @@ fn undefined_table_error_matches_with_and_without_explain() {
         );
         assert_eq!(http_common::wire_code_of(&resp_yes), "42P01");
     }
+}
+
+/// `vector` 指定 `search` は `limit` の型・範囲検証を [`bind_search`]
+/// （binder closure・テーブル解決後）に委ねる（`search::execute` の
+/// `vector` 分岐と同じ優先順位。`explain::execute` がこれより前に
+/// ローカルで `limit` を検証してしまうと、未知テーブル＋ `limit` 範囲外の
+/// 要求で `22000` が `42P01` より先に確定してしまう回帰になる）。本テストは
+/// `explain` の有無で `wire_code` の優先順位が変わらないことを固定する。
+#[test]
+fn vector_search_limit_out_of_range_error_order_matches_with_and_without_explain() {
+    let (core, _guard) = new_core();
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    // 未知テーブル＋ `limit:0`（範囲外）→ どちらも `42P01`（テーブル未存在が
+    // `limit` 範囲外より優先される）。
+    let without_explain =
+        br#"{"op":"search","table":"no_such","vector":[0.1,0.2,0.3,0.4],"limit":0}"#;
+    let with_explain = br#"{"op":"search","table":"no_such",
+        "vector":[0.1,0.2,0.3,0.4],"limit":0,"explain":true}"#;
+    let resp_no = query(addr, &token, without_explain);
+    let resp_yes = query(addr, &token, with_explain);
+    assert_eq!(resp_no.status, resp_yes.status);
+    assert_eq!(
+        http_common::wire_code_of(&resp_no),
+        http_common::wire_code_of(&resp_yes)
+    );
+    assert_eq!(http_common::wire_code_of(&resp_yes), "42P01");
+
+    // 既存テーブル＋ `limit:0`（範囲外）→ どちらも `22000`。
+    let without_explain = br#"{"op":"search","table":"docs","vector":[0.1,0.2,0.3,0.4],"limit":0}"#;
+    let with_explain = br#"{"op":"search","table":"docs",
+        "vector":[0.1,0.2,0.3,0.4],"limit":0,"explain":true}"#;
+    let resp_no = query(addr, &token, without_explain);
+    let resp_yes = query(addr, &token, with_explain);
+    assert_eq!(resp_no.status, resp_yes.status);
+    assert_eq!(
+        http_common::wire_code_of(&resp_no),
+        http_common::wire_code_of(&resp_yes)
+    );
+    assert_eq!(http_common::wire_code_of(&resp_yes), "22000");
 }
 
 #[test]

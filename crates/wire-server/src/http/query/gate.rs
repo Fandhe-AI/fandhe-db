@@ -187,11 +187,15 @@ pub fn handle(
     }
 }
 
-/// `validated`（`Op::Search` のスキーマ検証済み要求）が `explain: true` を
-/// 伴うかを判定する（Issue #765）。`optional_bool` の `Err`（多層防御の域。
-/// `SEARCH_SCHEMA` 検証を既に通過しているため通常到達しない）は `false`
-/// 扱いにせず、後段のスキーマ検証と同じ判定経路（`(_, _)` アーム）へ
-/// 委ねる意図で `matches!` により厳密に `Ok(Some(true))` のみを真とする。
+/// `validated`（`Op::Search`／`Op::Scan`／`Op::Aggregate` いずれかのスキーマ
+/// 検証済み要求）が `explain: true` を伴うかを判定する（`search` は Issue
+/// #765・TASK-186・NOSQL-10、`scan`／`aggregate` は Issue #948・NOSQL-16・
+/// SQL-27）。op に依存しない判定のため 3 op のいずれの呼び出し元
+/// （[`handle`] の match アーム）からも共有される。`optional_bool` の
+/// `Err`（多層防御の域。各 op のスキーマ検証を既に通過しているため通常
+/// 到達しない）は `false` 扱いにせず、後段のスキーマ検証と同じ判定経路
+/// （`(_, _)` アーム）へ委ねる意図で `matches!` により厳密に
+/// `Ok(Some(true))` のみを真とする。
 fn explain_requested(validated: &Validated<'_>) -> bool {
     matches!(validated.optional_bool("explain"), Ok(Some(true)))
 }
