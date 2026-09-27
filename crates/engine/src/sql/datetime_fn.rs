@@ -282,22 +282,45 @@ fn validate_and_narrow_date_arithmetic_operand(n: f64) -> Result<i32, SqlSurface
     Ok(n as i32)
 }
 
+/// `DATE ± n` の共有実装。`n` を符号反転前に検証し（`sign` が減算方向を表す）、
+/// 実際の加減算は `i64` の広い範囲で行ってから `i32`／`DATE` 受理範囲を検証
+/// する（[`date_add_days`]・[`date_sub_days`] の前段）。
+///
+/// codex 指摘対応（PR #1120）: 当初は「`n` を先に符号反転してから `i32` の
+/// `checked_add`／`checked_sub` で計算し、桁あふれを `22003`
+/// （[`SqlSurfaceError::numeric_out_of_range`]、オペランド範囲外の意味）に
+/// 写像する」実装だったが、これには 2 つの契約違反があった:
+/// (a) `n == i32::MIN` の符号反転自体が `i32` の範囲をオーバーフローし、
+/// 妥当な `n` が「オペランド範囲外」として誤検出される。
+/// (b) `n` は妥当（`i32` 範囲内）で `days` も妥当（`DATE` 受理範囲内）でも、
+/// 両者の和・差が `i32` の全域（`DATE` の受理範囲よりはるかに広い）を
+/// 超えうる。この場合の正しい分類は「オペランドが無効」ではなく「計算結果が
+/// `DATE` の受理範囲外」（`22008`）であり、`docs/design/
+/// datetime-scalar-functions.md` の型規約が定める 2 分類
+/// （`n` 自体が無効なら `22003`、結果が無効なら `22008`）と食い違う。
+/// `i64` で計算し、`i32` へ収まるか否かに関わらず「`DATE` として有効か」の
+/// 単一の判定（[`crate::datetime::validate_date_days`]）だけで結果の可否を
+/// 決めることで、この 2 分類を正しく再現する。
+fn date_add_or_sub_days(days: i32, n: f64, sign: i64) -> Result<i32, SqlSurfaceError> {
+    let n_i32 = validate_and_narrow_date_arithmetic_operand(n)?;
+    // `i32::MIN` を含むすべての `i32` 値・`sign`（`±1`）は `i64` へ無損失に
+    // 拡張できるため、ここでの加減算は桁あふれしない。
+    let result_i64 = i64::from(days) + sign * i64::from(n_i32);
+    let result = i32::try_from(result_i64)
+        .ok()
+        .filter(|&r| crate::datetime::validate_date_days(r));
+    result.ok_or_else(|| {
+        SqlSurfaceError::datetime_field_overflow(
+            "DATE arithmetic result is out of the representable range",
+        )
+    })
+}
+
 /// `DATE + n`／`n + DATE`（`n` は日数のスカラー）。`n` が整数でない場合は
 /// `22000`、`i32` 範囲外は `22003`（[`SqlSurfaceError::numeric_out_of_range`]）、
 /// 結果が `DATE` の受理範囲外は `22008` で拒否する（§2-2）。
 pub(crate) fn date_add_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
-    let n_i32 = validate_and_narrow_date_arithmetic_operand(n)?;
-    let result = days.checked_add(n_i32).ok_or_else(|| {
-        SqlSurfaceError::numeric_out_of_range(
-            "DATE arithmetic result overflows the day-count range",
-        )
-    })?;
-    if !crate::datetime::validate_date_days(result) {
-        return Err(SqlSurfaceError::datetime_field_overflow(
-            "DATE arithmetic result is out of the representable range",
-        ));
-    }
-    Ok(result)
+    date_add_or_sub_days(days, n, 1)
 }
 
 /// `DATE - n`（`n` は日数のスカラー）。エラー分類は [`date_add_days`] と同じ
@@ -308,24 +331,10 @@ pub(crate) fn date_add_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
 /// （`-2147483648`。これ自体は妥当な `i32` 値）の符号反転が `i32` の範囲を
 /// オーバーフローし（`-i32::MIN == 2147483648 > i32::MAX`）、妥当な `n` が
 /// 「`i32` 範囲外」という誤ったエラー（`22003`）で拒否されてしまっていた。
-/// `n` 自身は符号反転前に検証し、実際の減算は `i64` の広い範囲で行うことで
-/// この境界値を正しく扱う。
+/// `date_add_or_sub_days`（`sign = -1`）で `n` 自身を符号反転前に検証し、
+/// 実際の減算は `i64` の広い範囲で行うことでこの境界値を正しく扱う。
 pub(crate) fn date_sub_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
-    let n_i32 = validate_and_narrow_date_arithmetic_operand(n)?;
-    // `i32::MIN` を含むすべての `i32` 値は `i64` へ無損失に拡張できるため、
-    // ここでの減算は桁あふれしない。
-    let result_i64 = i64::from(days) - i64::from(n_i32);
-    let result = i32::try_from(result_i64).map_err(|_| {
-        SqlSurfaceError::numeric_out_of_range(
-            "DATE arithmetic result overflows the day-count range",
-        )
-    })?;
-    if !crate::datetime::validate_date_days(result) {
-        return Err(SqlSurfaceError::datetime_field_overflow(
-            "DATE arithmetic result is out of the representable range",
-        ));
-    }
-    Ok(result)
+    date_add_or_sub_days(days, n, -1)
 }
 
 /// `DATE - DATE`（日数差。両辺は既に `DATE` の受理範囲内に検証済みの内部表現
@@ -482,5 +491,19 @@ mod tests {
             date_sub_days(normal_base, 10.0).unwrap(),
             crate::datetime::parse_date("2023-12-22").unwrap()
         );
+    }
+
+    /// codex 指摘対応（PR #1120）: `n` 自体は `i32` 範囲内でも、`days + n` が
+    /// `i32` の全域（`DATE` の受理範囲よりはるかに広い）を超える場合、拒否
+    /// 理由は「オペランドが範囲外」（`22003`）ではなく「計算結果が `DATE` の
+    /// 受理範囲外」（`22008`）であるべき（`docs/design/
+    /// datetime-scalar-functions.md` の型規約が定める 2 分類と一致させる）。
+    /// 旧実装は `i32::checked_add` の桁あふれを `22003` に写像していたため、
+    /// この分類が食い違っていた。
+    #[test]
+    fn date_add_days_result_overflowing_i32_is_datetime_field_overflow_not_numeric_out_of_range() {
+        let near_max = crate::datetime::DATE_MAX_DAYS;
+        let err = date_add_days(near_max, f64::from(i32::MAX)).unwrap_err();
+        assert!(matches!(err, SqlSurfaceError::DatetimeFieldOverflow { .. }));
     }
 }
