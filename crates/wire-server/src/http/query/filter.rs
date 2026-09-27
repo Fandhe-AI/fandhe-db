@@ -103,6 +103,16 @@ pub enum FilterError {
     /// 落ちる）。untrusted な `op` 文字列は文言へ含めない固定文言（security.md
     /// 「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
     UnsupportedOperator,
+    /// 述語形 `update`／`delete` の `filter`（[`map_predicate_dml_item`]）で
+    /// `op` が `eq`／`prefix` のいずれでもない（大文字小文字読み替えなし）。
+    /// [`UnsupportedOperator`]（`search`／`scan`／`aggregate` 用。範囲比較・
+    /// `in` を許可語彙に含む文言）を共用すると、述語形 DML では実際には
+    /// 拒否される `lt`／`in` 等まで許可済みと誤案内するため独立させる
+    /// （codex-review P2 指摘対応、PR #1121）。untrusted な `op` 文字列は
+    /// 文言へ含めない固定文言（security.md 同上）。
+    ///
+    /// [`UnsupportedOperator`]: FilterError::UnsupportedOperator
+    UnsupportedOperatorForPredicateDml,
     /// `column` が RLS 述語名（`is_allowed_where_predicate_name` が真。
     /// 例: `visible`／`visible()`、大文字小文字非区別）と一致した（`or` 分岐の
     /// 内側を含め再帰的に検査する）。
@@ -152,6 +162,7 @@ impl ClassifiedError for FilterError {
     fn error_class(&self) -> ErrorClass {
         match self {
             FilterError::UnsupportedOperator
+            | FilterError::UnsupportedOperatorForPredicateDml
             | FilterError::RlsPredicateNotAllowed
             | FilterError::GroupShape
             | FilterError::InEmpty => ErrorClass::UnsupportedSqlSyntax,
@@ -169,6 +180,9 @@ impl ClassifiedError for FilterError {
         match self {
             FilterError::UnsupportedOperator => {
                 "unsupported filter operator (only \"eq\", \"prefix\", \"lt\", \"le\", \"lte\", \"gt\", \"ge\", \"gte\" and \"in\" are allowed)".to_string()
+            }
+            FilterError::UnsupportedOperatorForPredicateDml => {
+                "unsupported filter operator for predicate-form update/delete (only \"eq\" and \"prefix\" are allowed)".to_string()
             }
             FilterError::RlsPredicateNotAllowed => {
                 "filter column must not reference an RLS predicate name".to_string()
@@ -885,7 +899,7 @@ fn map_predicate_dml_item(item: &JsonValue) -> Result<(&str, &str, &JsonValue), 
         return Err(FilterError::RlsPredicateNotAllowed);
     }
     if op != "eq" && op != "prefix" {
-        return Err(FilterError::UnsupportedOperator);
+        return Err(FilterError::UnsupportedOperatorForPredicateDml);
     }
     validate_leaf_value_shape(op, value)?;
     Ok((column, op, value))
@@ -1485,5 +1499,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unsupported_operator_for_predicate_dml_reports_narrower_message_than_general_filter() {
+        // codex-review P2 指摘対応（PR #1121）: 述語形 DML は `eq`／`prefix` の
+        // 2 語彙しか許可しないため、`FilterError::UnsupportedOperator`（`search`／
+        // `scan`／`aggregate` 用。`lt`／`in` 等も許可語彙に含む文言）を誤って
+        // 案内しないことを確認する。
+        let items = filter_items(r#"[{"column":"lang","op":"lt","value":"ja"}]"#);
+        let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
+        assert!(matches!(
+            err,
+            FilterError::UnsupportedOperatorForPredicateDml
+        ));
+        assert_eq!(err.wire_code(), "42601");
+        let message = err.client_message();
+        assert!(message.contains("eq") && message.contains("prefix"));
+        assert!(!message.contains("\"lt\"") && !message.contains("\"in\""));
     }
 }
