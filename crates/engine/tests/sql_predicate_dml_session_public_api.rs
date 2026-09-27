@@ -329,13 +329,13 @@ fn execute_bound_predicate_delete_in_session_does_not_affect_other_tenant_rows()
 }
 
 // ---------------------------------------------------------------------
-// NUMERIC 列 eq: `wire-server::http::query::filter::declare_one` が使う
-// `CompareLiteral::Literal`（NoSQL scan/search・declare_one().bind() による
+// NUMERIC 列 eq: `wire-server::http::query::filter::declare_leaf` が使う
+// `CompareLiteral::Literal`（NoSQL scan/search・declare_leaf().bind() による
 // 事前検証経路）と、述語形 DML の実際の実行経路（`WherePredicate::Equality`
 // → `sql::parser::declarative_leaf_to_filter` → `DeclarativeFilter::compare`
 // の `CompareLiteral::Text`）が同じ文字列リテラルテキストで整合すること、
 // すなわち `filter.rs::bind_filter_where_predicates` の不変条件
-// 「declare_one で検証してから変換する」が変換後の実行経路でも成功する
+// 「declare_leaf で検証してから変換する」が変換後の実行経路でも成功する
 // ことを固定する（Issue #1062）。
 // ---------------------------------------------------------------------
 

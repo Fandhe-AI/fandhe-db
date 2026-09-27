@@ -37,9 +37,10 @@ predicate-dml-exec.md`「NoSQL 表層からの到達経路」節）へ結線す�
 
 `filter`（述語形）から `engine::sql::allowlist::WherePredicate` への写像は
 `filter.rs::bind_filter_where_predicates` が担う。**不変条件**: 各要素は
-まず `declare_one(item, schema)?.bind(schema)?`（scan／search／aggregate の
-`filter` と共通の検証経路）を通してから構文形へ変換する——検証を経ない値は
-変換しない。述語形 DML の `content_hash`（`for_update_where`／
+まず `declare_leaf(column, op, value, schema)?` の `Leaf` を
+`DeclarativeFilter::bind`（scan／search／aggregate の `filter` の葉と共通の
+検証経路）に通してから構文形へ変換する——検証を経ない値は変換しない。
+述語形 DML の `content_hash`（`for_update_where`／
 `for_delete_where`）は束縛前の構文形 `WherePredicate` をハッシュ源にする
 ため、SQL 表層の等価な文（`WHERE <col> = '<v>'`・`WHERE <col> LIKE
 '<prefix>%'`）と同一の `WherePredicate` を生成することが SQL⇄NoSQL 台帳照合
@@ -58,9 +59,11 @@ predicate-dml-exec.md`「NoSQL 表層からの到達経路」節）へ結線す�
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq` は
   scan／search／aggregate の `filter` と同じ理由（式レーンの入口が無い）で
   `0A000`（Issue #945）。
-- 未マージの PR #1118（filter 演算子の拡充）が導入する `lt`／`le`／`gt`／
-  `ge`／`in`／`or` は、本 Issue の時点では述語形 DML でも受理しない
-  （`map_filter_items` の 2 語彙〔`eq`／`prefix`〕のみ）。
+- PR #1118（filter 演算子の拡充。scan／search／aggregate 向け）が導入した
+  `lt`／`le`／`gt`／`ge`／`in`／`or` は、述語形 DML では対象外のまま据え置く
+  （PR #1118 が明示的に対象外とした範囲。`filter.rs::
+  map_predicate_dml_items` が `eq`／`prefix` の 2 語彙のみを独立に検証し、
+  `bind_filter`／`FilterNode` とは別経路を使う）。
 
 ### D2: `set` の JSON → `InsertLiteral` 写像は engine の `bind_update` を再利用
 

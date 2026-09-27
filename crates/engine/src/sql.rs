@@ -148,6 +148,11 @@ pub mod cursor;
 pub(crate) mod datetime_fn;
 pub mod ddl;
 pub(crate) mod ddl_column_type;
+/// NoSQL `filter` 語彙拡張（範囲比較・`IN`・`OR`。Issue #945・NOSQL-14）の
+/// 束縛入口。`wire-server` が SQL テキストを経由せず `WHERE` 相当の述語ツリーを
+/// 組み立てて `bind_declarative_predicates` へ渡す（`allowlist`／`parser` の
+/// SQL テキスト経由束縛と同一の実行意味論を共有する。第 2 の評価器を作らない）。
+pub mod declarative_predicate;
 pub(crate) mod describe;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`

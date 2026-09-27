@@ -442,9 +442,11 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`・不一致 `22023`（SQL 表層と共有） |
 
-成功応答: `{"updated":<n>,"operation_id":"<echo>"}`（`n` は `0` または `1`。
-他テナント所有 id・未存在 id はいずれも `updated:0`・`200` で応答バイト列が
-完全一致する。RLS-9）。
+成功応答: `{"updated":<n>,"operation_id":"<echo>"}`。`where` 形（単一行）は
+`n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `updated:0`・
+`200` で応答バイト列が完全一致する。RLS-9）。`filter`（述語形）は `n` が
+`0` 以上 `MAX_DML_AFFECTED_ROWS` 以下（一致した自テナント所有行数。上限超過は
+`54000` で応答が返らない）。
 
 複数列 `set` は JSON パース時点でキーのアルファベット順へ正規化される一方、
 SQL 表層の `UPDATE ... SET col1 = .., col2 = ..` はクライアントが記述した
@@ -491,9 +493,11 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により `23505`（内容一致。`DELETE` は行の有無に関わらず同一内容） |
 
-成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`（`n` は `0` または `1`。
-他テナント所有 id・未存在 id はいずれも `deleted:0`・`200` で応答バイト列が
-完全一致する。RLS-9）。
+成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`。`where` 形（単一行）は
+`n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `deleted:0`・
+`200` で応答バイト列が完全一致する。RLS-9）。`filter`（述語形）は `n` が
+`0` 以上 `MAX_DML_AFFECTED_ROWS` 以下（一致した自テナント所有行数。上限超過は
+`54000` で応答が返らない）。
 
 要求例:
 
@@ -576,42 +580,103 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 
 ## `filter` 配列
 
-`search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。`update`／
-`delete` の述語形（本節と同じ形・同じ語彙・同じエラー分類。Issue #1062）
-でも同じ配列を使うが、`WHERE <述語> USING OPERATION_ID` の意味論（影響行数
-上限 `54000`・台帳照合 `23505`／`22023`）は各 op の節を参照。
+`search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。要素は「葉」
+（`column`／`op`／`value`）または「グループ」（`or`）のいずれかの形を取り、
+配列自体・グループ内の分岐はいずれも暗黙に `AND` 結合として扱う（Issue #945・
+NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefix` の 2 語彙・
+`AND` のみだった）。`update`／`delete` の述語形（Issue #1062）でも同じ配列
+表現を使うが、対応語彙は `eq`／`prefix` の 2 語彙・`AND` 結合のみに留まる
+（範囲比較・`IN`・`OR` グループへの拡張は Issue #1118 が明示的に対象外と
+した。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
+台帳照合 `23505`／`22023`〕は各 op の節を参照）。
 
 ```json
-[{"column": "lang", "op": "eq", "value": "ja"}]
+[
+  {"column": "lang", "op": "eq", "value": "ja"},
+  {"column": "price", "op": "gte", "value": "10"}
+]
 ```
 
-- 各要素は `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値の
-  いずれか。Issue #896・NOSQL-17）の 3 つの必須フィールドのみ
-- `op` は `eq`（一致）・`prefix`（前方一致）の 2 語彙のみ（`or`・否定・範囲比較の
-  構文は存在しない）。複数要素は常に AND 結合
-- 要素数は 256 個まで（超過は `54000`）
+（`price` は `NUMERIC` 列を想定。`lt`／`le`／`lte`／`gt`／`ge`／`gte` は
+`DATE`・`TIMESTAMP`・`UUID`・`NUMERIC`・`BYTEA` 列のみ受理し、`INTEGER`／
+`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への範囲比較は `declare_range` が
+`0A000` で拒否する——後述「葉（leaf）」節参照）
+
+```json
+[{"or": [
+  {"column": "lang", "op": "eq", "value": "ja"},
+  {"column": "lang", "op": "in", "value": ["en", "fr"]}
+]}]
+```
+
+### 葉（leaf）
+
+- `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値、または
+  `in` に限り配列）の 3 つの必須フィールドのみ
+- `op` は次の 9 語彙（完全一致。大文字小文字の読み替えなし）:
+  - `eq`（一致）・`prefix`（前方一致。従来どおり）
+  - `lt`／`le`／`lte`／`gt`／`ge`／`gte`（範囲比較。`le`/`lte`・`ge`/`gte` は
+    それぞれ完全一致の同義語として両方受理する——Issue の受け入れ条件と
+    対象ビヘイビア NOSQL-14 とで表記が食い違うため安全側に倒した判断。
+    どちらに一本化するかは spec 側のオーナー判断事項）
+  - `in`（配列の要素のいずれかと一致。空配列は `42601`、256 要素超は
+    `54000`）
 - `column` にサーバー側 RLS 述語名相当（`visible`／`visible()`。大文字小文字
-  非区別）を指定する経路は `42601`（RLS はサーバー側暗黙適用のみで、クライアント
-  は述語を書けない）
+  非区別）を指定する経路は `42601`（`or` 分岐の内側を含め再帰的に検査する。
+  RLS はサーバー側暗黙適用のみで、クライアントは述語を書けない）
 - `eq` は対象列の型に応じたレーンへ振り分ける（Issue #896・NOSQL-17。詳細は
   `docs/design/nosql-typed-json-binding.md`「filter（`eq` の型別レーン）」節
   参照）: `TEXT`（旧来型。値・型不一致は `42601`。insert/update の「TEXT は旧来型
   = `22000`」非対称は filter には適用しない）／`ENUM`（`42601`。語彙外は
   `22P02`）／`BOOLEAN`（`42601`）／`DATE`・`TIMESTAMP`・`UUID`（`42601`。形式・
   範囲は engine 側で検証）／`BYTEA`（base64 の JSON string。`42601`／`54000`。
-  復号後 4 MiB 超で `54000`——`insert`／`update`・SQL 表層
-  `WHERE bytea_col = '\x...'` と同じ実効上限（PR #1038 で hex 再エンコード後
-  長を検査していた過小上限を是正済み。詳細は
-  `docs/design/nosql-typed-json-binding.md`「BYTEA の実効長（PR #1038 是正）」節
-  参照）／
-  `NUMERIC`（数値または数値文字列。`42601`）。`INTEGER`／`BIGINT`／`REAL`／
-  `DOUBLE PRECISION` 列への `eq` は対象外（`0A000`。式レーンの入口が無いため。
-  Issue #945）
+  復号後 4 MiB 超で `54000`）／`NUMERIC`（数値または数値文字列。`42601`）
+- `lt`／`le`／`lte`／`gt`／`ge`／`gte` は `DATE`・`TIMESTAMP`・`UUID`（文字列）・
+  `NUMERIC`（数値または数値文字列）・`BYTEA`（base64 の JSON string）のみ受理
+  する。`TEXT`／`ENUM`／`BOOLEAN`／`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列は
+  engine 側の「範囲比較非対応列」判定（`22000`）へ委譲する
+- `in` は `TEXT`／`ENUM`（文字列配列）・`DATE`／`TIMESTAMP`／`UUID`（文字列配列）・
+  `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 の JSON string の
+  配列）のみ受理する。他の列型は engine 側の「IN 非対応列」判定（`22000`）へ
+  委譲する
+- `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
+  対象外（`0A000`）。`udf_call::bind_expr`（式レーン）がこれらの列型の式内
+  参照を現時点で受理しないため（別 Issue #891 の担当。Issue #945 の計画時点
+  では式レーンへ渡す想定だったが、実装時に engine 側の未対応を確認し対象外へ
+  縮小した）
 - `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
+- `in` は列型に関わらず対応する場合のみ受理する（対象外の列型は `22000`）
 - 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は
   `engine::declarative_filter` の既存契約をそのまま透過する
 
-検証コード: `crates/wire-server/tests/nosql7_filter_mapping.rs`。
+### グループ（`or`）
+
+- `{"or": [<要素>, ...]}` の形のみ許可する。`or` 以外のキーが混在する・`or`
+  の値が配列でない・空配列はいずれも `42601`
+- 各分岐は葉または入れ子の `or` グループ 1 つ。分岐が 1 つだけの場合は
+  親の `AND` 列へ平坦化する（`{"or": [X]}` は `X` と等価）
+- ネスト深さの上限は 32（超過は `54000`）。HTTP 経由では JSON 自体の深さ上限
+  16（NOSQL-8）が先に効くため、実際に 32 段の `or` へ届くのは engine の
+  `sql::declarative_predicate` API を直接呼び出す経路に限られる
+
+### 上限（`Vec` 確保より前に検査する）
+
+- 葉（`Leaf`）の総数: 256 個まで（超過は `54000`）
+- `or` のネスト深さ: 32 段まで（超過は `54000`）
+- `in` の要素数: 256 個まで（超過は `54000`。空配列は `42601`）
+
+検証コード: `crates/wire-server/tests/nosql7_filter_mapping.rs`（`eq`／`prefix`・
+`AND` のみの既存回帰）・`crates/wire-server/tests/nosql14_filter_operators.rs`
+（範囲比較・`IN`・`OR`。Issue #945）。
+
+**`update`／`delete` の `filter`（述語形）における対応範囲**: 本節の語彙
+（範囲比較 6 語彙・`in`・`or` グループ）は `search`／`scan`／`aggregate`
+専用。`update`／`delete` の `filter` は `eq`／`prefix` の 2 語彙・`AND`
+結合のみに対応し、上記の拡張語彙・`or` を渡すと [`filter::
+map_predicate_dml_items`](../src/http/query/filter.rs) が
+`FilterError::UnsupportedOperator`（`42601`）／形状不一致で拒否する
+（Issue #1118 が明示的に対象外とした範囲。上記「`update`」「`delete`」節
+参照）。
 
 ## `explain`
 
