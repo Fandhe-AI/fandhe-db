@@ -2990,12 +2990,14 @@ fn seed_empty_db_no_table(label: &str) -> (PathBuf, temp_db::CleanupGuard) {
 /// [`run_phase7_write_parity_scenario`] が実際に送信する JSON 本文（宣言順。
 /// `create_table` → `drop_table`（bob 拒否）→ `insert` ×2 → `alter_table` →
 /// 述語形 `delete` → `scan` ×2）。`parity_matrix_covers_every_nosql_op` が
-/// この配列と `PARITY_CASES`／`REJECTION_CASES`／`DML_STEPS`／`BOB_STEP` の
-/// `json_body` から実使用の `op` 値を収集して `Op::ALL` 網羅を固定するため、
-/// 関数内へ文字列リテラルを直書きせず本配列を参照させる（レビュー指摘
-/// Issue #950: ソース全文への `contains` 判定では実行対象のケース定義から
-/// 外れた文字列一致まで拾ってしまい網羅漏れを検知できないため、実際に
-/// 送信される値そのものを単一情報源にする）。
+/// この配列と `PARITY_CASES`／`DML_STEPS`／`BOB_STEP` の `json_body` から
+/// 実使用の `op` 値を収集して `Op::ALL` の**成功**パリティ網羅を固定する
+/// ため、関数内へ文字列リテラルを直書きせず本配列を参照させる（レビュー
+/// 指摘 Issue #950: ソース全文への `contains` 判定では実行対象のケース
+/// 定義から外れた文字列一致まで拾ってしまい網羅漏れを検知できないため、
+/// 実際に送信される値そのものを単一情報源にする）。`REJECTION_CASES` は
+/// この網羅集合に含めない（拒否ケースは成功パリティを検証しないため。
+/// PR #1135 レビュー指摘・[`parity_matrix_covers_every_nosql_op`] doc 参照）。
 const PHASE7_WRITE_CASES: &[&str] = &[
     r#"{"op":"create_table","table":"widgets","columns":[{"name":"name","type":"text"},{"name":"qty","type":"integer"}]}"#,
     r#"{"op":"drop_table","table":"widgets"}"#,
@@ -3293,6 +3295,9 @@ fn fetch_matches_psql_on_insert_ddl_and_predicate_delete() {
 /// （本ファイルの各定義を参照）、値そのものは各ケース定義から取得するため
 /// untrusted 入力ではない。想定形から外れる場合は本ファイルの前提が崩れた
 /// ことを示すので `panic!` で即座に検知する（fail-closed）。
+/// [`parity_matrix_covers_every_nosql_op`] は成功パリティ網羅の判定に
+/// `REJECTION_CASES` をこの関数へ渡さない（同関数 doc 参照）が、`json_body`
+/// の形そのものは他ケース定義と共通のためここでは併記する。
 fn op_name_from_json_body(json_body: &str) -> &str {
     let after_key = json_body
         .split_once("\"op\":\"")
