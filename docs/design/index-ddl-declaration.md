@@ -2,7 +2,8 @@
 
 ## ステータス
 
-Accepted（実装済み。宣言の効果の結線は「対象外」節に申し送り）。
+Accepted（実装済み。宣言の効果の結線は Issue #1065 で実装済み。詳細は
+[index-declaration-effects.md](index-declaration-effects.md) 参照）。
 
 ## ポインタ
 
@@ -38,7 +39,7 @@ DROP INDEX <name>
 | `core.rs::EngineCore::execute_parsed_in_session` | `sql::ddl::require_ddl_permission`（全 DDL 共通の唯一の権限判定点）→ 実行本体の順で呼ぶ |
 | `sql::ddl::execute_create_index`／`execute_drop_index` | `CatalogError` を SQL 表層の契約（ERR-6）へ写像 |
 | `catalog::Storage::create_index`／`drop_index` | 単一 write txn 内で名前衝突・対象の種別と存在・列整合・件数上限を判定して保存し、対象テーブルの世代を進める |
-| 既存の索引キャッシュ（`sql::scalar_index::ScalarIndexCache`・`sql::hnsw_cache::HnswIndexCache`） | 索引の物理表現と構築。本 Issue では宣言の有無を参照しない（「対象外」節参照） |
+| 既存の索引キャッシュ（`sql::scalar_index::ScalarIndexCache`・`sql::hnsw_cache::HnswIndexCache`） | 索引の物理表現と構築。宣言の構築対象への反映は Issue #1065（[index-declaration-effects.md](index-declaration-effects.md)）参照 |
 
 「カタログ＝宣言だけを持つ、キャッシュ＝物理表現と構築」という分離を維持し、
 新しい索引の物理表現や第 2 の実行器は作らない。
@@ -120,20 +121,20 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
 - 宣言の作成前後・削除後でテナントごとの検索・述語付き取得・集計の結果が完全に
   一致することを `crates/engine/tests/sql_index_ddl.rs` で固定している。
 
+**索引宣言の構築対象への反映**（本ドキュメント初版で「対象外」としていた事項）は
+Issue #1065 で実装済み。詳細・設計判断は
+[index-declaration-effects.md](index-declaration-effects.md) を参照。
+
 ## 対象外（申し送り）
 
-1. **索引宣言の効果**: `ScalarIndex::build`・`HnswIndexCache` は宣言の有無を参照しない。
-   宣言はカタログへ永続化されるのみで、既存の自動索引化（スカラー列の平均値長ゲート・
-   HNSW の起動時 opt-in）の挙動は本 Issue の前後で不変。「このテーブルは常に HNSW」
-   「この列は必ず索引化する」という効果（起動時 opt-in との優先順位を含む）は後続
-   Issue の担当とする。
-2. **`EXPLAIN` への索引名露出**: `scalar_plan:`／`ann_plan:` 行への索引名の追記は (1) に
+1. **`EXPLAIN` への索引名露出**: `scalar_plan:`／`ann_plan:` 行への索引名の追記は
+   [index-declaration-effects.md](index-declaration-effects.md) の構築対象反映に
    依存するため対象外。宣言前後で `EXPLAIN` の出力は不変。
-3. **疎索引（BM25）の宣言**: Issue #908 本文は「ベクトル・スカラー・疎」の 3 種別を
+2. **疎索引（BM25）の宣言**: Issue #908 本文は「ベクトル・スカラー・疎」の 3 種別を
    挙げるが、本実装は INDEX-7 のポインタに従いスカラー宣言と `USING hnsw` のみを
    受理し、`USING bm25` 等は `0A000` とする（疎索引は hybrid のたびに自動構築する
    既存契約のまま）。Issue 本文との差分は spec 側の再判断事項として報告する。
-4. **NoSQL 表層**: `op` 許可リストに索引 DDL を含めない（NOSQL-13 の担当）。
+3. **NoSQL 表層**: `op` 許可リストに索引 DDL を含めない（NOSQL-13 の担当）。
 
 ## 既知の制約
 

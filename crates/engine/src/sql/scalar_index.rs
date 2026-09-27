@@ -664,6 +664,75 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Option<Vec<u32>> {
     Some(out)
 }
 
+/// [`ScalarIndex::build_targeted`] の構築対象列選択（Issue #1065・TASK-206・
+/// INDEX-7）。`Auto` は現行どおり全対応列（`ScalarIndex::build` と同じ）、
+/// `Declared` はカタログの索引宣言（`catalog::declared_index_targets_in_txn`）が
+/// 返した列集合だけを構築対象にする。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScalarIndexTarget<'a> {
+    Auto,
+    Declared(&'a [String]),
+}
+
+impl ScalarIndexTarget<'_> {
+    /// `column_name` が構築対象かを判定する。`Auto` は常に `true`。
+    fn includes(&self, column_name: &str) -> bool {
+        match self {
+            ScalarIndexTarget::Auto => true,
+            ScalarIndexTarget::Declared(cols) => cols.iter().any(|c| c == column_name),
+        }
+    }
+}
+
+/// [`ScalarIndexTarget`] の所有権付きの版。呼び出し元（`sql::aggregate`・
+/// `sql::exec`）は [`resolve_scalar_index_target_in_txn`] の戻り値をこの型で
+/// 一旦保持し、`ScalarIndex::build_targeted` へ渡す直前に
+/// [`Self::as_target`] で借用へ変換する（宣言列 `Vec<String>` の生存期間を
+/// 呼び出し元のスコープに紐付けるため）。
+#[derive(Debug, Clone)]
+pub(crate) enum ScalarIndexTargetOwned {
+    Auto,
+    Declared(Vec<String>),
+}
+
+impl ScalarIndexTargetOwned {
+    pub(crate) fn as_target(&self) -> ScalarIndexTarget<'_> {
+        match self {
+            ScalarIndexTargetOwned::Auto => ScalarIndexTarget::Auto,
+            ScalarIndexTargetOwned::Declared(cols) => ScalarIndexTarget::Declared(cols),
+        }
+    }
+}
+
+/// `ScalarCacheAccess::declarations_enabled` と対象テーブルの索引宣言から
+/// [`ScalarIndexTarget`] を決定する（Issue #1065）。呼び出し元
+/// （`sql::aggregate::ensure_scalar_index_snapshot`・`sql::exec` の SELECT
+/// 経路）はクエリが使っているのと同一の `read_txn` を渡し、以下の順で解決する:
+///
+/// - `declarations_enabled == false`（起動時 opt-in なし）: 常に `Auto`
+///   （既存の opt-in なし利用者の挙動を変えない）
+/// - `true` かつ対象テーブルにスカラー宣言あり: `Declared`
+/// - `true` かつ宣言なし: `Auto`（現行の自動挙動を維持）
+/// - カタログ読み取り失敗（走査上限超過・デコード破損）: `Err`。呼び出し元は
+///   「宣言なし→自動」へは倒さず、索引を使わない側（構築失敗扱い→plain
+///   scan）へ fail-closed に倒す。
+pub(crate) fn resolve_scalar_index_target_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    declarations_enabled: bool,
+) -> Result<ScalarIndexTargetOwned, ()> {
+    if !declarations_enabled {
+        return Ok(ScalarIndexTargetOwned::Auto);
+    }
+    match crate::catalog::declared_index_targets_in_txn(read_txn, table) {
+        Ok(targets) => Ok(match targets.scalar_columns {
+            Some(cols) => ScalarIndexTargetOwned::Declared(cols),
+            None => ScalarIndexTargetOwned::Auto,
+        }),
+        Err(_) => Err(()),
+    }
+}
+
 impl ScalarIndex {
     /// `schema`（対象テーブルのスキーマ）と `snapshot`（RLS 段適用済みスナップ
     /// ショット）から索引を構築する。`snapshot` の各スロットを 1 回だけ走査し、
@@ -688,11 +757,34 @@ impl ScalarIndex {
     /// 変換・`2^53` ゲート等）を検証するテスト専用の入口は
     /// [`Self::build_including_unwired_typed_range_columns`]（`#[cfg(test)]`）
     /// を使う。
-    pub(crate) fn build(
+    ///
+    /// production 経路（`sql::exec`／`sql::aggregate`）は Issue #1065 以降
+    /// [`Self::build_targeted`]（`ScalarIndexTarget::Auto`／`Declared` を
+    /// 明示選択）を直接呼ぶため、本関数はテストの簡便な入口としてのみ残す
+    /// （`#[cfg(test)]`）。
+    #[cfg(test)]
+    fn build(
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
     ) -> Result<Self, ScalarIndexBuildError> {
-        Self::build_internal(schema, snapshot, false)
+        Self::build_targeted(schema, snapshot, ScalarIndexTarget::Auto)
+    }
+
+    /// [`Self::build`] の構築対象列を宣言（`CREATE INDEX`・Issue #1065・
+    /// TASK-206・INDEX-7）で絞り込める版。`sql::exec`／`sql::aggregate` の
+    /// 呼び出し元は、起動時 opt-in（`SearchEngineKind::Hnsw`）が有効かつ
+    /// 対象テーブルにスカラー宣言があるときのみ `Declared` を渡し、それ以外は
+    /// 現行どおり `Auto`（全対応列）を渡す（`docs/design/
+    /// index-declaration-effects.md`）。`Declared` は「絞り込み」であり
+    /// 「強制」ではない: 宣言列にも平均値長ゲート・バイト予算・`2^53` ゲートを
+    /// 変わらず適用し、`id` の順序索引（`id_index`）は宣言の有無によらず常に
+    /// 構築する。
+    pub(crate) fn build_targeted(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        target: ScalarIndexTarget<'_>,
+    ) -> Result<Self, ScalarIndexBuildError> {
+        Self::build_internal_targeted(schema, snapshot, false, target)
     }
 
     /// [`Self::build`] のうち、レーン A（`INTEGER`／`BIGINT`／`REAL`／
@@ -707,13 +799,14 @@ impl ScalarIndex {
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
     ) -> Result<Self, ScalarIndexBuildError> {
-        Self::build_internal(schema, snapshot, true)
+        Self::build_internal_targeted(schema, snapshot, true, ScalarIndexTarget::Auto)
     }
 
-    fn build_internal(
+    fn build_internal_targeted(
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
         include_unwired_lane_a_columns: bool,
+        target: ScalarIndexTarget<'_>,
     ) -> Result<Self, ScalarIndexBuildError> {
         let row_count = snapshot.arena().len();
         let column_count = schema.columns.len();
@@ -773,6 +866,17 @@ impl ScalarIndex {
         col_nonnull_count.resize(column_count, 0);
 
         for (col_index, column) in schema.columns.iter().enumerate() {
+            // 宣言で絞り込む場合（`ScalarIndexTarget::Declared`）、宣言列に
+            // 無い列は型に関わらず「列が索引未対応」（`per_column`／
+            // `per_column_typed` とも `None`）へ合流させ、バイト予算の計上も
+            // 行わない（Issue #1065。宣言は「絞り込み」であり、対象外の列は
+            // 構築コストを一切払わない）。`id` は本ループの対象外（`id_index`
+            // として別途・宣言によらず常に構築する）。
+            if !target.includes(&column.name) {
+                per_column.push(None);
+                per_column_typed.push(None);
+                continue;
+            }
             match &column.ty {
                 // ENUM 列は TEXT と同じ辞書表現を共有する（Issue #890 D3。
                 // ラベルは短いため平均値長ゲートで除外されることは実質ない）。
@@ -2251,6 +2355,13 @@ impl ScalarIndexCache {
 pub(crate) struct ScalarCacheAccess<'a> {
     pub(crate) storage: &'a Storage,
     pub(crate) cache: &'a ScalarIndexCache,
+    /// 索引宣言（`CREATE INDEX`）を構築対象の絞り込みに使うか（Issue #1065）。
+    /// 起動時 opt-in（`SearchEngineKind::Hnsw`）を上位スイッチとし、`core.rs`
+    /// が `self.hnsw_state.is_some()` を渡す。`false`（opt-in なし）では宣言の
+    /// 有無によらず常に `ScalarIndexTarget::Auto`（現行の全対応列自動）を使い、
+    /// 既存の opt-in なし利用者の挙動を変えない
+    /// （`docs/design/index-declaration-effects.md`）。
+    pub(crate) declarations_enabled: bool,
 }
 
 #[cfg(test)]

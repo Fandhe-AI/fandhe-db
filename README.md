@@ -175,6 +175,11 @@ SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780
 `engine:`／`hnsw_params:` 行（Issue #411）で確認できます。ANN opt-in の性能
 評価ベンチ（`RecallEngine`）が使う `brute_force` トークンは本 CLI では受理し
 ません（本 CLI の語彙は `default`／`hnsw`／`hnsw_f16`／`hnsw_i8` の 4 値に限定）。
+`--search-engine` は `CREATE INDEX`（索引宣言）の効果に対する上位スイッチでも
+あります（Issue #1065）。`hnsw`／`hnsw_f16`／`hnsw_i8` を指定した場合に限り、
+宣言がスカラー索引・HNSW 索引の構築対象を絞り込みます（宣言なしのテーブル・
+列は現行の自動挙動のまま）。`default`（未指定）では宣言の有無によらず挙動は
+変わりません。詳細は `docs/design/index-declaration-effects.md` 参照。
 
 `--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
 `--hnsw-sparse-visited-max`（Issue #657）はフィルタ付き ANN の探索パラメータ

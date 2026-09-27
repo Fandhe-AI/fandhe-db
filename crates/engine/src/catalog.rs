@@ -320,6 +320,118 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
     )
 }
 
+/// [`declared_index_targets_in_txn`] の出力（Issue #1065・TASK-206・INDEX-7）。
+/// 呼び出し元（`sql::exec`・`sql::aggregate`・`core.rs`）はここから
+/// `ScalarIndex::build` の構築対象列・HNSW 経路の適格性を導出する。宣言は
+/// 起動時 opt-in（`SearchEngineKind::Hnsw`）が有効な場合にのみ構築対象へ効く
+/// （`docs/design/index-declaration-effects.md`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredIndexTargets {
+    /// 対象テーブルのスカラー宣言列（複数宣言の和集合・重複排除）。宣言が
+    /// 1 件も無ければ `None`（呼び出し元は `Auto` 〔現行の全列自動〕へ倒す）。
+    pub(crate) scalar_columns: Option<Vec<String>>,
+    /// 対象テーブルに `IndexKind::Hnsw` 宣言があるか。
+    pub(crate) hnsw_on_table: bool,
+    /// カタログ全体（テーブルを問わず）に `IndexKind::Hnsw` 宣言が 1 件でも
+    /// あるか。テーブルは VECTOR 列を高々 1 本しか持てず「テーブル単位で
+    /// 宣言なし→自動」は HNSW では常に真になり無効果（vacuous）になるため、
+    /// カタログ全体単位の切替点を別に持つ（§2.3 `index-declaration-effects.md`）。
+    pub(crate) hnsw_anywhere: bool,
+}
+
+/// 対象テーブルの索引宣言を、クエリが使っているのと同一の `read_txn`
+/// （アリーナ・世代と同一スナップショット）から 1 パスで要約する
+/// （Issue #1065）。`Storage::list_indexes` は独自に read txn を開くため
+/// クエリ経路からは呼ばない。カタログ未作成（宣言 0 件）は空の `Ok`。
+/// 走査件数が [`MAX_INDEX_COUNT`] を超える・値のデコードに失敗する場合は
+/// `Err` とし、呼び出し元は「宣言なし→自動」へは倒さず索引を使わない側
+/// （スカラー: 構築失敗／HNSW: brute-force）へ fail-closed に倒す。
+pub(crate) fn declared_index_targets_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+) -> Result<DeclaredIndexTargets> {
+    let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Ok(DeclaredIndexTargets {
+                scalar_columns: None,
+                hnsw_on_table: false,
+                hnsw_anywhere: false,
+            })
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut scalar_columns: Vec<String> = Vec::new();
+    let mut hnsw_on_table = false;
+    let mut hnsw_anywhere = false;
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        match def.kind {
+            IndexKind::Hnsw => {
+                hnsw_anywhere = true;
+                if def.table == table {
+                    hnsw_on_table = true;
+                }
+            }
+            IndexKind::Scalar => {
+                if def.table == table {
+                    for col in def.columns {
+                        if !scalar_columns.iter().any(|c| c == &col) {
+                            scalar_columns.push(col);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(DeclaredIndexTargets {
+        scalar_columns: if scalar_columns.is_empty() {
+            None
+        } else {
+            Some(scalar_columns)
+        },
+        hnsw_on_table,
+        hnsw_anywhere,
+    })
+}
+
+/// HNSW opt-in（`SearchEngineKind::Hnsw`。呼び出し元が `hnsw_available` で
+/// 渡す）が対象テーブルで実際に有効かを判定する（Issue #1065・TASK-206・
+/// INDEX-7・§2.3 `docs/design/index-declaration-effects.md`）。テーブルは
+/// VECTOR 列を高々 1 本しか持てないため「テーブル単位で宣言なし→自動」は
+/// HNSW では常に真になり無効果（vacuous）になる。よってカタログ全体に
+/// `IndexKind::Hnsw` 宣言が 1 件でもあるかを切替点とする:
+///
+/// - `hnsw_available == false`: 常に `false`
+/// - カタログ全体で HNSW 宣言が 0 件: `true`（現行どおり全テーブルで HNSW）
+/// - カタログ全体で HNSW 宣言が 1 件以上: 対象テーブルに宣言がある場合のみ
+///   `true`（他テーブルは厳密 brute-force）
+/// - カタログ読み取り失敗: `false`（fail-closed。索引を使わない側＝
+///   brute-force へ倒す。結果は近似ではなく厳密になるため安全側）
+///
+/// `sql::exec`（`AnnShapeInput.hnsw_enabled`）・`core.rs`（Rust API
+/// `search_with_snapshot`・`EXPLAIN` の `ann_plan:` 行）が同一のこの関数を
+/// 呼ぶことで、実行時判定と `EXPLAIN` 表示の乖離を作らない。
+pub(crate) fn hnsw_targeted_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    hnsw_available: bool,
+) -> bool {
+    if !hnsw_available {
+        return false;
+    }
+    match declared_index_targets_in_txn(read_txn, table) {
+        Ok(targets) => !targets.hnsw_anywhere || targets.hnsw_on_table,
+        Err(_) => false,
+    }
+}
+
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
 /// 判定する（relation 名前空間の衝突・種別判定用）。索引カタログ自体が未作成
 /// （宣言 0 件）の場合は `false`。

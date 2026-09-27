@@ -4150,6 +4150,7 @@ impl EngineCore {
             Some(crate::sql::scalar_index::ScalarCacheAccess {
                 storage: &self.storage,
                 cache: &self.scalar_index_cache,
+                declarations_enabled: self.hnsw_state.is_some(),
             }),
         )
     }
@@ -4500,6 +4501,7 @@ impl EngineCore {
             Some(crate::sql::scalar_index::ScalarCacheAccess {
                 storage: &self.storage,
                 cache: &self.scalar_index_cache,
+                declarations_enabled: self.hnsw_state.is_some(),
             }),
         )
     }
@@ -4672,6 +4674,7 @@ impl EngineCore {
         // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
         // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出）へ委譲する。
         let explain_engine = self.explain_engine_for(
+            table,
             true,
             planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
             explain_shape.filters_empty(),
@@ -4699,15 +4702,28 @@ impl EngineCore {
     /// 実行しない契約はどちらの呼び出し元でも不変）。
     fn explain_engine_for(
         &self,
+        table: &str,
         is_hybrid: bool,
         is_precision: bool,
         filters_empty: bool,
         scalar_prefilter: bool,
         scalar_plan: crate::sql::scalar_plan::ScalarPlan,
     ) -> crate::sql::explain::ExplainEngine {
+        // Issue #1065: `ann_plan:` 表示は実行時判定（`sql::exec` の
+        // `hnsw_enabled`）と同じゲート（`catalog::hnsw_targeted_in_txn`）を
+        // 通す（実行時判定と `EXPLAIN` 表示の乖離を作らない。`hnsw_state` の
+        // `lookup`／`prepare_*` は呼ばない副作用なしの読み取り専用判定）。
+        // 読み取りに使う txn はこの表示専用に新規で開き（`EXPLAIN` は検索本体
+        // を実行しないため計画開始時の txn を引き回さない）、失敗時は
+        // fail-closed に `false`（brute-force 表示）へ倒す。
+        let hnsw_enabled = self.hnsw_state.is_some()
+            && match self.storage.db().begin_read() {
+                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(&read_txn, table, true),
+                Err(_) => false,
+            };
         let ann_plan =
             crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
-                hnsw_enabled: self.hnsw_state.is_some(),
+                hnsw_enabled,
                 engine_kind_unknown: self.search_engine_kind().is_none(),
                 is_hybrid,
                 is_precision,
@@ -4774,6 +4790,7 @@ impl EngineCore {
             },
         );
         let engine = self.explain_engine_for(
+            bound.table(),
             is_hybrid,
             is_precision,
             filters_empty,
@@ -5853,8 +5870,20 @@ impl EngineCore {
         // 契約変更の経緯（旧: Rust API は常にキャッシュを迂回していた）は
         // `tests/hnsw_cache.rs::rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback`
         // の docstring・`docs/design/hnsw-rls-cardinality-switch.md` 参照。
-        let result = match &self.hnsw_state {
-            Some(state) => {
+        // Issue #1065: 起動時 opt-in（`hnsw_state.is_some()`）に加え、索引宣言
+        // （`CREATE INDEX ... USING hnsw`）のカタログ全体単位の適格性ゲート
+        // （`catalog::hnsw_targeted_in_txn`。`sql::exec` の `hnsw_enabled` と
+        // 同一の判定）も満たす場合のみ HNSW 経路へ進む。この判定専用に新規の
+        // read txn を開く（検索本体の `search_with_hnsw`／`search_with` は
+        // 内部で別途 txn を開くため、ここでの読み取りは判定用の一時的なもの）。
+        // 読み取り失敗は fail-closed に「対象外」（brute-force）へ倒す。
+        let hnsw_targeted = self.hnsw_state.is_some()
+            && match self.storage.db().begin_read() {
+                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(&read_txn, table, true),
+                Err(_) => false,
+            };
+        let result = match (hnsw_targeted, &self.hnsw_state) {
+            (true, Some(state)) => {
                 let access = crate::sql::hnsw_cache::HnswCacheAccess {
                     storage: &self.storage,
                     cache: &state.cache,
@@ -5869,7 +5898,7 @@ impl EngineCore {
                     k,
                 )
             }
-            None => snapshot.search_with(&self.storage, ctx, self.provider.as_ref(), query, k),
+            _ => snapshot.search_with(&self.storage, ctx, self.provider.as_ref(), query, k),
         };
         match result {
             Ok(hits) => Ok(hits),
