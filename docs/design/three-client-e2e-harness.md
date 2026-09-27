@@ -655,9 +655,12 @@ SQL↔NoSQL↔固定オラクルの三者一致を検証する。`price` はど�
 `[e2e-record] ddl-parity/<client>: ...` 行を参照）。既存 #776〜#779・#877
 テストも回帰なし。実測で発見した意味差は無かった。
 
-**スコープ外**（PR 本文にも記載）: `nosql-api.md` の複数列 `group_by`
-「ちょうど 1 要素」表記の陳腐化（#949 後の実上限は
-`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`）、NoSQL 述語形 DML の
+**ドキュメント追随**: `nosql-api.md`「`aggregate`」節の `group_by` が
+「ちょうど 1 要素」と誤って記載されていた（#949 で複数列対応済み。実上限は
+`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`）ため、実装に合わせて
+1〜8 要素の記述へ更新した（レビュー指摘。PR #1135）。
+
+**スコープ外**（PR 本文にも記載）: NoSQL 述語形 DML の
 拡張語彙（範囲・`in`・`or`）非対応・`aggregate` への `sort`／`offset`・
 `LIKE` 中間／後方一致・`create_index` 等の既知非対称の深掘り、`explain`
 の SQL `EXPLAIN` 出力とのプラン行テキスト完全一致比較（層 A
