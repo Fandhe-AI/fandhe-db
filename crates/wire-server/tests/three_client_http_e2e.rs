@@ -898,14 +898,22 @@ const PARITY_CASES: &[ParityCase] = &[
         expected_rows_bob: &[&["2"], &["3"], &["12"]],
         expected_rows_carol: &[&["2"], &["3"]],
     },
+    // レビュー指摘（PR #1135・Cursor Bugbot）: `seed_parity_db` は category が
+    // "A"／"B" の 2 値のみのため、旧値 `IN ('A')`（要素 1 個）は
+    // `category = 'A'` と完全に同一の結果集合になり、IN を EQ にマップする
+    // 回帰や IN リストの先頭要素のみを見る実装でもオラクルに一致してしまい
+    // IN の複数要素セマンティクスを実際にはロックできていなかった。
+    // `IN ('A', 'B')` へ変更し、先頭要素のみを見る実装（'A' 一致のみ）では
+    // category='B' の行（id=2 と各テナント自身の private B 行）が欠落して
+    // オラクルに一致しなくなるようにした。
     ParityCase {
         label: "in-category",
-        sql: "SELECT id FROM docs WHERE category IN ('A') LIMIT 10",
-        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"column":"category","op":"in","value":["A"]}]}"#,
+        sql: "SELECT id FROM docs WHERE category IN ('A', 'B') LIMIT 10",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"column":"category","op":"in","value":["A","B"]}]}"#,
         ordered: false,
-        expected_rows_alice: &[&["1"], &["3"], &["11"]],
-        expected_rows_bob: &[&["1"], &["3"]],
-        expected_rows_carol: &[&["1"], &["3"]],
+        expected_rows_alice: &[&["1"], &["2"], &["3"], &["11"]],
+        expected_rows_bob: &[&["1"], &["2"], &["3"], &["12"]],
+        expected_rows_carol: &[&["1"], &["2"], &["3"]],
     },
     // レビュー指摘（PR #1135・Cursor Bugbot）: 旧値（`lang = 'en'`）は
     // `seed_parity_db` 上で `id=2`（`lang=en`・`price=7.25`）にしか一致せず、
