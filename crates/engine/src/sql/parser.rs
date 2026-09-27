@@ -2742,40 +2742,54 @@ pub fn bind_update_form(
         ValidatedUpdateForm::Single(single) => {
             Ok(BoundUpdateForm::Single(bind_update(single, schema)?))
         }
-        ValidatedUpdateForm::Predicate(predicate) => {
-            let assignments = bind_set_assignments(&predicate.assignments, schema)?;
-
-            let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-            let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
-                bind_where_predicates(
-                    &predicate.where_predicates,
-                    schema,
-                    udfs,
-                    &mut node_budget,
-                    &[],
-                )?;
-
-            // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b`
-            // だけの述語（`metadata_filters`／`expr_filters` は両方空）が
-            // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
-            // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
-            // 回帰になるため、判定漏れとして修正する）。
-            if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
-                return Err(SqlSurfaceError::unsupported(
-                    "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
-                ));
-            }
-
-            Ok(BoundUpdateForm::Predicate(BoundPredicateUpdate::new(
-                predicate.table_name.clone(),
-                assignments,
-                metadata_filters,
-                expr_filters,
-                or_filters,
-                predicate.operation_id.clone(),
-            )))
-        }
+        ValidatedUpdateForm::Predicate(predicate) => Ok(BoundUpdateForm::Predicate(
+            bind_predicate_update(predicate, schema, udfs)?,
+        )),
     }
+}
+
+/// [`bind_update_form`] の `Predicate` 分岐が呼ぶ束縛本体（Issue #1062 で
+/// 抽出。SQL 表層の述語形 `UPDATE`（[`crate::sql::allowlist::
+/// ValidatedUpdateForm::Predicate`]）と、NoSQL 表層の `update` op `filter`
+/// （述語形。TASK-186・NOSQL-12）が [`crate::core::EngineCore::
+/// execute_bound_predicate_update_in_session`] 経由で共有する唯一の束縛経路
+/// （第 2 の実行器を作らない設計）。[`bind_predicate_delete`] と対になる。
+pub(crate) fn bind_predicate_update(
+    predicate: &crate::sql::allowlist::ValidatedPredicateUpdate,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundPredicateUpdate, SqlSurfaceError> {
+    let assignments = bind_set_assignments(&predicate.assignments, schema)?;
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
+        bind_where_predicates(
+            &predicate.where_predicates,
+            schema,
+            udfs,
+            &mut node_budget,
+            &[],
+        )?;
+
+    // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b`
+    // だけの述語（`metadata_filters`／`expr_filters` は両方空）が
+    // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
+    // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
+    // 回帰になるため、判定漏れとして修正する）。
+    if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
+        ));
+    }
+
+    Ok(BoundPredicateUpdate::new(
+        predicate.table_name.clone(),
+        assignments,
+        metadata_filters,
+        expr_filters,
+        or_filters,
+        predicate.operation_id.clone(),
+    ))
 }
 
 /// ファイル形 `INSERT` の束縛結果（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。

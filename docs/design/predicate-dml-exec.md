@@ -222,9 +222,38 @@ Issue #997 でこれを解消し、以下へ統合済み:
   session_executes_predicate_delete_statement`: #870 が固定していた「まだ拒否され
   る」テストを「0 件一致で成功する」へ反転。
 
-## 9. 申し送り・スコープ外
+## 9. NoSQL 表層からの到達経路（Issue #1062）
 
-- NoSQL `update`／`delete` op の束縛・結線（#876）・SQL/NoSQL パリティ（#877）。
+NoSQL `update`／`delete` op の `filter`（述語形。TASK-186・NOSQL-12）は、
+本ドキュメントが記す SQL 表層の実行本体を**そのまま**共有する。到達経路:
+
+- `EngineCore` に `execute_bound_predicate_update_in_session`／
+  `execute_bound_predicate_delete_in_session`（セッション対応の束縛済み
+  入口。[`Self::execute_bound_update_in_session`] と同型の closure 方式）を
+  追加した。判定順序は `operation_id` 必須化ガード → スキーマ取得 → `bind`
+  closure（`wire-server` が JSON `filter` から `WherePredicate` を構築する）
+  → 述語形の多層防御（`reject_unsupported_predicate_dml_forms`。空列・
+  `PredicateCall`／`Expression`／`Or`／`InSubquery`／`Exists` を `42601` で
+  拒否）→ `ValidatedPredicateUpdate`／`ValidatedPredicateDelete` を engine
+  内部で構築（`pub(crate)` フィールドへの struct リテラル。公開コンストラクタは
+  追加しない）→ 本ドキュメント §5〜7 の共通実行本体（`Self::
+  run_predicate_update`／`run_predicate_delete`）。
+- `core.rs::execute_predicate_update_form`／`execute_predicate_delete_form`
+  （SQL 表層。§5）は、スキーマ取得より後の部分をこの共通実行本体へ切り出した
+  だけで、挙動は本 Issue 導入前と完全に同一（既存の engine テストで回帰確認
+  済み）。
+- `parser.rs::bind_update_form` の `Predicate` 分岐も同様に
+  `bind_predicate_update`（新設）へ切り出し、`core.rs` の
+  `run_predicate_update` から直接呼べるようにした。
+- NoSQL `filter` → `WherePredicate` の写像・content_hash 一致条件は
+  `docs/design/nosql-update-delete-mapping.md`「D1」節を参照（spec 本文は
+  転記しない）。
+
+## 10. 申し送り・スコープ外
+
+- NoSQL `update`／`delete` op の束縛・結線（#876・述語形は #1062 で実装済み）・
+  SQL/NoSQL パリティ（#877。読み取り専用シナリオのみ。述語形パリティは層 A
+  `nosql12_update_delete.rs` が #1062 で固定）。
 - 上限 API の統合は Issue #997 で解消済み（§6 参照）。既定値
   （現行 1,000・設定機構なし）の最終確定はオーナー判断待ち。
 - spec 側 RECOVER-11 は 2026-09-23 に確定済み（`docs/spec` submodule を確定後の参照へ更新。

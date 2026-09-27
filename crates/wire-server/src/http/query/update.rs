@@ -1,22 +1,29 @@
 //! `POST /v1/query` の `update` op を SQL 表層の
-//! `UPDATE ... WHERE id = <n> USING OPERATION_ID`（SQL-17）と**同一の実行器**
-//! （`engine::sql::exec::execute_update_with_schema`）へ、SQL テキストを
-//! 組み立てずに束縛済み計画で到達させるモジュール（Issue #876・TASK-186・
-//! 対象ビヘイビア NOSQL-6・NOSQL-12。ポインタ: `docs/spec/05-tasks.md`
-//! TASK-178・TASK-186・`docs/spec/04-behavior/nosql-surface.md` NOSQL-6・
-//! NOSQL-12・`docs/spec/04-behavior/sql-surface.md` SQL-17）。
+//! `UPDATE ... WHERE id = <n> USING OPERATION_ID`（SQL-17）・述語形
+//! `UPDATE ... WHERE <述語> USING OPERATION_ID`（SQL-19・TASK-192）と
+//! **同一の実行器**（`engine::sql::exec::execute_update_with_schema`・
+//! `execute_predicate_update`）へ、SQL テキストを組み立てずに束縛済み計画で
+//! 到達させるモジュール（Issue #876・#1062・TASK-186・対象ビヘイビア
+//! NOSQL-6・NOSQL-12。ポインタ: `docs/spec/05-tasks.md` TASK-178・TASK-186・
+//! TASK-192・`docs/spec/04-behavior/nosql-surface.md` NOSQL-6・NOSQL-12・
+//! `docs/spec/04-behavior/sql-surface.md` SQL-17・SQL-19）。
 //!
 //! 責務境界: [`super::schema::UPDATE_SCHEMA`] が形を検証済みの JSON
 //! オブジェクトから `table`／`set`／`where`（または `filter`）／
 //! `operation_id` を取り出し、[`map_set_assignments`]（純関数・engine 非依存。
 //! JSON `set` を `engine::sql::allowlist::InsertLiteral` 列へ写像する）と
-//! [`super::dml_target::bind_target_form`]（`where`／`filter` の排他判定）で
-//! 束縛したうえで、[`execute`] が
+//! [`super::dml_target::bind_target_form`]（`where`／`filter` の排他判定。
+//! 単一行形は [`super::dml_target::TargetForm::RowId`]、述語形は
+//! [`super::dml_target::TargetForm::Predicate`]）で束縛したうえで、
+//! [`execute`] が単一行形は
 //! `engine::core::EngineCore::execute_bound_update_in_session`
-//! （[`super::insert`] と同型のセッション対応エントリ）へ委譲する。
-//! `engine::sql::parser::bind_update` が SET 対象の禁止列（`id`／`tenant_id`／
-//! `visibility`）・重複列・未知列・型不一致の検査を担い、第 2 の実行器は
-//! 作らない。
+//! （[`super::insert`] と同型のセッション対応エントリ）、述語形は
+//! `execute_bound_predicate_update_in_session`（Issue #1062）へ委譲する。
+//! 単一行形は `engine::sql::parser::bind_update`、述語形は
+//! [`super::filter::bind_filter_where_predicates`]（`WHERE` 述語列を SQL 表層
+//! と同一の `WherePredicate` へ写像する。`content_hash` 一致のため必須）が
+//! SET 対象の禁止列（`id`／`tenant_id`／`visibility`）・重複列・未知列・
+//! 型不一致の検査を担い、いずれも第 2 の実行器は作らない。
 //!
 //! テナントは `principal`（唯一の入口）からのみ導出する（`security.md` P0）。
 //!
@@ -59,9 +66,9 @@
 //! と同型）。他テナント所有 id・未存在 id はいずれも `updated:0`・`200`
 //! （RLS-9。`execute_update_with_schema` のドキュメント参照）。
 //!
-//! 対象外: `filter`（述語形）の実行結線（Issue #871 の担当。本モジュールは
-//! `filter` のみの要求を [`super::dml_target::DmlTargetError::
-//! PredicateFormUnavailable`] で拒否する）・`RETURNING`（Issue #873）。
+//! 対象外: `RETURNING`（Issue #873）・`filter` の `INTEGER`／`BIGINT`／
+//! `REAL`／`DOUBLE PRECISION` 列への `eq`（Issue #945。`filter.rs` と同じ
+//! `0A000`）。
 
 use std::fmt::Write as _;
 
@@ -79,6 +86,7 @@ use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
 use super::dml_target::{bind_target_form, DmlTargetError, TargetForm};
+use super::filter;
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
 use super::typed_json::{self, TypedJsonError};
@@ -213,6 +221,34 @@ pub fn encode_success_body(success: &UpdateSuccess) -> String {
     out
 }
 
+/// [`map_set_assignments`] の結果を、束縛 closure（`Result<_, SqlSurfaceError>`
+/// を要求する `EngineCore::execute_bound_update_in_session`／
+/// `execute_bound_predicate_update_in_session` の共通契約）が要求する形へ
+/// 写像する（[`execute`] の単一行・述語形の両分岐で共有する。重複実装を
+/// 避けるための抽出。Issue #1062）。
+fn map_set_assignments_for_engine(
+    set: &std::collections::BTreeMap<String, JsonValue>,
+    schema: &TableSchema,
+) -> Result<Vec<(String, InsertLiteral)>, SqlSurfaceError> {
+    map_set_assignments(set, schema).map_err(|e| match e {
+        UpdateError::Engine(err) => err,
+        // `TypedJsonError`（NOSQL-17。Issue #896）の分類は単一の
+        // `into_sql_surface_error` 変換点に集約する（`insert.rs` と共有）。
+        UpdateError::Set(err) => err.into_sql_surface_error(),
+        UpdateError::EmptySet => SqlSurfaceError::UnsupportedSyntax {
+            detail: "SET clause must specify at least one column".to_string(),
+        },
+        // `bind_target_form`／`Shape`／`InvalidIdentifier` はこの
+        // closure より前に確定済みのため到達不能だが、fail-closed の
+        // まま網羅する。
+        UpdateError::Shape(_) | UpdateError::InvalidIdentifier | UpdateError::Target(_) => {
+            SqlSurfaceError::Internal {
+                detail: "unexpected error during UPDATE SET binding".to_string(),
+            }
+        }
+    })
+}
+
 /// `POST /v1/query` の `update` op を実行する。`validated` は
 /// [`super::schema::UPDATE_SCHEMA::validate`] を通過済みの JSON オブジェクト。
 pub fn execute(
@@ -225,7 +261,7 @@ pub fn execute(
         .map_err(UpdateError::Shape)?;
     ident::check_identifier(table)?;
 
-    let TargetForm::RowId(id) = bind_target_form(validated)?;
+    let target = bind_target_form(validated)?;
 
     let set = validated
         .required_object("set")
@@ -240,43 +276,48 @@ pub fn execute(
         .unwrap_or("");
     let operation_id = OperationId::parse(operation_id_raw)?;
 
-    let outcome: UpdateOutcome = core.execute_bound_update_in_session(
-        principal.policy_context(),
-        table,
-        Some(&operation_id),
-        |schema| {
-            let assignments = map_set_assignments(set, schema).map_err(|e| match e {
-                UpdateError::Engine(err) => err,
-                // `TypedJsonError`（NOSQL-17。Issue #896）の分類は単一の
-                // `into_sql_surface_error` 変換点に集約する（`insert.rs` と共有）。
-                UpdateError::Set(err) => err.into_sql_surface_error(),
-                UpdateError::EmptySet => SqlSurfaceError::UnsupportedSyntax {
-                    detail: "SET clause must specify at least one column".to_string(),
-                },
-                // `bind_target_form`／`Shape`／`InvalidIdentifier` はこの
-                // closure より前に確定済みのため到達不能だが、fail-closed の
-                // まま網羅する。
-                UpdateError::Shape(_) | UpdateError::InvalidIdentifier | UpdateError::Target(_) => {
-                    SqlSurfaceError::Internal {
-                        detail: "unexpected error during UPDATE SET binding".to_string(),
-                    }
-                }
-            })?;
-            let stmt = ValidatedUpdate {
-                table_name: table.to_string(),
-                assignments,
-                id_literal: id.to_string(),
-                operation_id: Some(operation_id.clone()),
-                // NoSQL 表層 `op: update` は `RETURNING` を公開しない
-                // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
-                // 実行結線は Issue #873・SQL-21 が別途担当し、
-                // `ValidatedUpdate::returning` を `Some` にする経路は
-                // ここには無い）。
-                returning: None,
-            };
-            bind_update(&stmt, schema)
-        },
-    )?;
+    let outcome: UpdateOutcome = match target {
+        TargetForm::RowId(id) => core.execute_bound_update_in_session(
+            principal.policy_context(),
+            table,
+            Some(&operation_id),
+            |schema| {
+                let assignments = map_set_assignments_for_engine(set, schema)?;
+                let stmt = ValidatedUpdate {
+                    table_name: table.to_string(),
+                    assignments,
+                    id_literal: id.to_string(),
+                    operation_id: Some(operation_id.clone()),
+                    // NoSQL 表層 `op: update` は `RETURNING` を公開しない
+                    // （Issue #876 のスコープ外。SQL 表層の `RETURNING`
+                    // 実行結線は Issue #873・SQL-21 が別途担当し、
+                    // `ValidatedUpdate::returning` を `Some` にする経路は
+                    // ここには無い）。
+                    returning: None,
+                };
+                bind_update(&stmt, schema)
+            },
+        )?,
+        // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: SET 束縛は
+        // 単一行形と同一（`map_set_assignments_for_engine`）を共有し、
+        // `WHERE` 述語列は `filter::bind_filter_where_predicates`
+        // （SQL 表層の述語形 `UPDATE` が使うのと同一の `WherePredicate` を
+        // 生成する。`content_hash` 一致のため必須）で得る。実行本体
+        // （台帳照合・影響行数上限・RLS 適用）は
+        // `EngineCore::execute_bound_predicate_update_in_session` に一任し、
+        // 第 2 の実行器は作らない。
+        TargetForm::Predicate(items) => core.execute_bound_predicate_update_in_session(
+            principal.policy_context(),
+            table,
+            Some(&operation_id),
+            |schema| {
+                let assignments = map_set_assignments_for_engine(set, schema)?;
+                let predicates = filter::bind_filter_where_predicates(items, schema)
+                    .map_err(filter::FilterError::into_sql_surface_error)?;
+                Ok((assignments, predicates))
+            },
+        )?,
+    };
 
     Ok(UpdateSuccess {
         updated: outcome.rows_affected,
