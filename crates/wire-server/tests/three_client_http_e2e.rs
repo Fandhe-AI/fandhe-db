@@ -3296,42 +3296,34 @@ fn fetch_matches_psql_on_insert_ddl_and_predicate_delete() {
 /// 最低 1 回使われていることを機械的に固定する（`#[ignore]` を付けない・
 /// `make ci` で常時実行。`.claude/rules/coding-rust.md`「テストの skip・
 /// ignore・アサーション弱体化で CI を通さない」の精神を、層 B カバレッジの
-/// 陳腐化検知としても適用する）。新しい `Op` variant が追加された際は
-/// `EXERCISED_BY_PARITY_MATRIX` の更新と対応する層 B ケースの追加を対で行う
-/// 契約とし、更新を忘れるとここが赤くなる。
+/// 陳腐化検知としても適用する）。
+///
+/// レビュー指摘（Issue #950）: 旧実装は手動維持の固定文字列配列
+/// （`EXERCISED_BY_PARITY_MATRIX`）と `Op::ALL` の名前集合を突き合わせる
+/// だけで、その文字列が実際に `PARITY_CASES`／`REJECTION_CASES`／
+/// `run_phase7_write_parity_scenario` の JSON ボディで使われているかまでは
+/// 検査していなかった（配列の更新漏れ・誤記が検知できない）。本実装では
+/// `include_str!` で本ファイル自身のソーステキストを検査対象にし、各
+/// `Op::name()` に対応する `"op":"<name>"` リテラルが実際に出現するかを
+/// 直接判定することで、手動維持配列を廃し実使用箇所と直結させる。
 #[test]
 fn parity_matrix_covers_every_nosql_op() {
     use wire_server::http::query::op::Op;
 
-    // `PARITY_CASES`（search／scan／aggregate）・`DML_STEPS`/`BOB_STEP`
-    // （update／delete）・`run_phase7_write_parity_scenario`（insert・
-    // create_table・alter_table・drop_table）の 3 経路で実際に使われている
-    // op 名（このファイル内で `grep` 可能な固定文字列。Op::name() の戻り値と
-    // 1:1）。
-    const EXERCISED_BY_PARITY_MATRIX: [&str; 9] = [
-        "search",
-        "scan",
-        "aggregate",
-        "insert",
-        "update",
-        "delete",
-        "create_table",
-        "alter_table",
-        "drop_table",
-    ];
+    // 本ファイル自身のソーステキスト（コンパイル時に埋め込み）。
+    // `PARITY_CASES`・`REJECTION_CASES`・`run_phase7_write_parity_scenario`
+    // はいずれも `json_body: r#"{"op":"<name>",...}"#` 形の静的文字列で op を
+    // 指定するため、そのリテラル出現を直接 grep すれば実使用を検査できる。
+    let source = include_str!("three_client_http_e2e.rs");
 
-    let all_names: Vec<&'static str> = Op::ALL.iter().map(|op| op.name()).collect();
-    for name in &all_names {
+    for op in Op::ALL {
+        let name = op.name();
+        let needle = format!("\"op\":\"{name}\"");
         assert!(
-            EXERCISED_BY_PARITY_MATRIX.contains(name),
-            "Op::{name} is not exercised by any Issue #950 layer B parity case in this file; \
-             add a three_client_http_e2e.rs case and update EXERCISED_BY_PARITY_MATRIX"
+            source.contains(needle.as_str()),
+            "Op::{name} is not exercised by any Issue #950 layer B parity case in this file \
+             (no literal occurrence of {needle:?} found); add a three_client_http_e2e.rs case \
+             using it"
         );
     }
-    assert_eq!(
-        all_names.len(),
-        EXERCISED_BY_PARITY_MATRIX.len(),
-        "Op::ALL length changed; update EXERCISED_BY_PARITY_MATRIX to keep 1:1 coverage tracking \
-         (a 10th op must gain layer B coverage before this guard goes green again)"
-    );
 }
