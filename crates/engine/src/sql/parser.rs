@@ -7591,4 +7591,43 @@ mod tests {
         .expect("NULL target keys must not be treated as duplicates");
         assert!(matches!(bound, BoundInsertForm::Upsert(_)));
     }
+
+    /// `ON CONFLICT` 対象が `REAL`／`NUMERIC`／`JSON`／`ARRAY` 等の UNIQUE 制約列
+    /// （`ColumnType::is_unique_constraint_allowed` が `is_primary_key_allowed`
+    /// の上位集合として Issue #1073 で追加した型）でも解決できることを確認する
+    /// （回帰: base 取り込みマージで `constraint::unique_key_from_values` が
+    /// これらの型を「UNIQUE キーとして許可されない型」として誤って拒否する
+    /// 退行が入りかけたため、単一行の正常系で検出する）。
+    #[test]
+    fn bind_upsert_form_resolves_unique_target_on_types_beyond_primary_key_allowed() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("r", ColumnType::Real, true)],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "r".to_string()
+        ])]);
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, r) VALUES (1, 1.5) ON CONFLICT (r) DO NOTHING \
+             USING OPERATION_ID 'op-unique-real'",
+            &schema,
+        )
+        .expect("REAL UNIQUE target should resolve, not be rejected as a disallowed type");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![0]));
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+
+        // バッチ内の重複対象キー検出（`unique_key_from_values` 経由）も REAL で
+        // 機能することを確認する。
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, r) VALUES (1, 1.5), (2, 1.5) ON CONFLICT (r) \
+             DO NOTHING USING OPERATION_ID 'op-unique-real-dup'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
 }

@@ -36,8 +36,11 @@
 //! - UNIQUE 制約（`schema.unique_constraints()`）: NULLS DISTINCT。構成列の
 //!   いずれかが NULL の行はその制約の検査対象外とする（NULL 同士は衝突しない）。
 //!
-//! 等価判定は型タグ＋長さ前置の正準キーバイト列で行い、許可型は主キーと共有する
-//! 単一の許可リスト（`ColumnType::is_primary_key_allowed`）に限る。
+//! 等価判定は型タグ＋長さ前置の正準キーバイト列で行う。許可型は主キーが
+//! `ColumnType::is_primary_key_allowed`、UNIQUE 制約はその上位集合
+//! `ColumnType::is_unique_constraint_allowed`（Issue #1073 で REAL・
+//! DOUBLE PRECISION・NUMERIC・JSON／JSONB・配列型を追加）を使う——2 つの
+//! 許可リストを持つ理由は `ColumnType::is_primary_key_allowed` の doc 参照。
 //!
 //! # 実装方式（既知の制約）
 //!
@@ -489,8 +492,24 @@ fn key_bytes(
 }
 
 /// [`key_bytes`] が使う 1 コンポーネント分のエンコード。型タグは
-/// [`ColumnType::is_primary_key_allowed`] が許可する型と 1 対 1 に対応する
-/// （新しい許可型を追加する際はここも同時に拡張する契約）。
+/// [`ColumnType::is_unique_constraint_allowed`] が許可する型と 1 対 1 に対応する
+/// （新しい許可型を追加する際はここも同時に拡張する契約。Issue #1073 で
+/// REAL・DOUBLE PRECISION・NUMERIC・JSON／JSONB・配列型を追加）。
+///
+/// # 型ごとの正規化（Issue #1073 D7。`docs/design/unique-constraint.md` D7 参照）
+///
+/// - REAL／DOUBLE PRECISION: [`crate::scalar_float::canonicalize_real`]／
+///   `canonicalize_double`（`-0.0` を `+0.0` へ正規化）した後のビットパターン。
+///   非有限値（NaN・±∞）は `Err`（`row_codec` の encode 側が非有限値を拒否する
+///   ため通常到達しないが、defense in depth として維持する）。
+/// - NUMERIC: 末尾ゼロを除去した `(unscaled, scale)` の正準形。`1.50` と `1.5`
+///   が同一キーになる（列内では `scale` が固定なので元々単射だが、複合キー・
+///   将来の型跨ぎ比較でも表現の揺れを吸収する）。
+/// - JSON／JSONB: [`crate::json::canonical_equality_text`]（値としての等価
+///   正規化テキスト。キー順・空白だけでなく数値も値として正規化する）。
+/// - 配列: `[要素タグ: u8][要素数: u32 BE][要素列の生ペイロード]`。
+///   [`crate::row_codec::ArrayRef::payload`] のエンコーダ決定性（要素順保持・
+///   flags 固定・代替表現なし）により、この組は値に対して単射になる。
 fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(), &'static str> {
     fn push_len_prefixed(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
         out.push(tag);
@@ -500,30 +519,30 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
 
     match value {
         ScalarRef::Text(s) => {
-            push_len_prefixed(out, ColumnType::Text.primary_key_tag(), s.as_bytes())
+            push_len_prefixed(out, ColumnType::Text.unique_key_tag(), s.as_bytes())
         }
         ScalarRef::Integer(i) => {
-            push_len_prefixed(out, ColumnType::Integer.primary_key_tag(), &i.to_be_bytes())
+            push_len_prefixed(out, ColumnType::Integer.unique_key_tag(), &i.to_be_bytes())
         }
         ScalarRef::BigInt(i) => {
-            push_len_prefixed(out, ColumnType::BigInt.primary_key_tag(), &i.to_be_bytes())
+            push_len_prefixed(out, ColumnType::BigInt.unique_key_tag(), &i.to_be_bytes())
         }
         ScalarRef::Bool(b) => push_len_prefixed(
             out,
-            ColumnType::Boolean.primary_key_tag(),
+            ColumnType::Boolean.unique_key_tag(),
             &[if b { 1u8 } else { 0u8 }],
         ),
         ScalarRef::Date(d) => {
-            push_len_prefixed(out, ColumnType::Date.primary_key_tag(), &d.to_be_bytes())
+            push_len_prefixed(out, ColumnType::Date.unique_key_tag(), &d.to_be_bytes())
         }
         ScalarRef::Timestamp(t) => push_len_prefixed(
             out,
-            ColumnType::Timestamp.primary_key_tag(),
+            ColumnType::Timestamp.unique_key_tag(),
             &t.to_be_bytes(),
         ),
-        ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.primary_key_tag(), b),
+        ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.unique_key_tag(), b),
         ScalarRef::Uuid(u) => {
-            push_len_prefixed(out, ColumnType::Uuid.primary_key_tag(), u.as_bytes())
+            push_len_prefixed(out, ColumnType::Uuid.unique_key_tag(), u.as_bytes())
         }
         ScalarRef::Enum(s) => push_len_prefixed(
             out,
@@ -533,15 +552,49 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
             9,
             s.as_bytes(),
         ),
-        ScalarRef::Real(_)
-        | ScalarRef::Double(_)
-        | ScalarRef::Array(_)
-        | ScalarRef::Json(_)
-        | ScalarRef::Numeric(_) => {
-            // `ColumnType::is_primary_key_allowed` が事前に拒否する型であり、
-            // `validate_schema` を通過したスキーマからは到達しないはずの内部
-            // 矛盾。値を黙って無視せず fail-closed に拒否する。
-            return Err("unique key column has a type that is not allowed as a unique key");
+        ScalarRef::Real(r) => {
+            let canonical = crate::scalar_float::canonicalize_real(r);
+            if !canonical.is_finite() {
+                // `row_codec` の encode 側が非有限値を既に拒否しているため
+                // 通常到達しない内部矛盾。値を黙って無視せず fail-closed に
+                // 拒否する（defense in depth）。
+                return Err("unique key REAL column has a non-finite value");
+            }
+            push_len_prefixed(
+                out,
+                ColumnType::Real.unique_key_tag(),
+                &canonical.to_bits().to_be_bytes(),
+            )
+        }
+        ScalarRef::Double(d) => {
+            let canonical = crate::scalar_float::canonicalize_double(d);
+            if !canonical.is_finite() {
+                return Err("unique key DOUBLE PRECISION column has a non-finite value");
+            }
+            push_len_prefixed(
+                out,
+                ColumnType::Double.unique_key_tag(),
+                &canonical.to_bits().to_be_bytes(),
+            )
+        }
+        ScalarRef::Numeric(d) => {
+            let (unscaled, scale) = canonical_numeric_parts(d);
+            let mut payload = Vec::with_capacity(17);
+            payload.extend_from_slice(&unscaled.to_be_bytes());
+            payload.push(scale);
+            push_len_prefixed(out, ColumnType::NUMERIC_UNIQUE_KEY_TAG, &payload)
+        }
+        ScalarRef::Json(s) => {
+            let canonical = crate::json::canonical_equality_text(s)
+                .map_err(|_| "unique key JSON column has an invalid stored value")?;
+            push_len_prefixed(out, ColumnType::Json.unique_key_tag(), canonical.as_bytes())
+        }
+        ScalarRef::Array(a) => {
+            let mut payload = Vec::new();
+            payload.push(array_elem_tag(a.elem()));
+            payload.extend_from_slice(&a.count().to_be_bytes());
+            payload.extend_from_slice(a.payload());
+            push_len_prefixed(out, ColumnType::ARRAY_UNIQUE_KEY_TAG, &payload)
         }
     }
     Ok(())
@@ -559,6 +612,13 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
 /// `key_specs` が解決したものと同じ規約）。構成列のいずれかが `Value::Null`
 /// または列欠落の場合は `Ok(None)`（NULLS DISTINCT。本関数は UNIQUE 制約専用の
 /// 呼び出しを想定し、`NullPolicy::Reject`〔主キー〕は扱わない）。
+///
+/// `ColumnType::is_unique_constraint_allowed`（Issue #1073）が PK 許可型の
+/// 上位集合として REAL／DOUBLE PRECISION／NUMERIC／JSON／JSONB／ARRAY を
+/// UNIQUE 制約の構成列として許可するため、`resolve_conflict_target` が解決する
+/// `indices` はこれらの型の列も指しうる。本関数はそれらも
+/// [`push_canonical_component`] へ委譲することで、UNIQUE 制約が許可する型と
+/// `ON CONFLICT` 対象列として扱える型を一致させる。
 pub(crate) fn unique_key_from_values(
     indices: &[usize],
     values: &[crate::row_codec::Value],
@@ -570,6 +630,11 @@ pub(crate) fn unique_key_from_values(
             None | Some(Value::Null) => return Ok(None),
             Some(v) => v,
         };
+        // ARRAY 列（`Value::Array`）は `ScalarRef::Array` が要素列の生バイト列
+        // （`ArrayRef`）への借用を要求するため、一時バッファへ組み立ててから
+        // 借用する（`array_payload` は Array 分岐でのみ初期化され、`scalar` が
+        // それを借用している間だけこのループの 1 反復内で生存する）。
+        let array_payload: Vec<u8>;
         let scalar = match value {
             Value::Text(s) => ScalarRef::Text(s.as_str()),
             Value::Integer(i) => ScalarRef::Integer(*i),
@@ -580,17 +645,28 @@ pub(crate) fn unique_key_from_values(
             Value::Bytes(b) => ScalarRef::Bytes(b.as_slice()),
             Value::Enum(s) => ScalarRef::Enum(s.as_str()),
             Value::Uuid(u) => ScalarRef::Uuid(*u),
-            Value::Null
-            | Value::Vector(_)
-            | Value::Real(_)
-            | Value::Double(_)
-            | Value::Array(_)
-            | Value::Json(_)
-            | Value::Numeric(_) => {
-                // `ColumnType::is_primary_key_allowed` が事前に拒否する型であり、
-                // UNIQUE 制約の構成列としては `validate_schema` を通過した
-                // スキーマから到達しないはずの内部矛盾（`push_canonical_component`
-                // と同じ判断）。
+            Value::Real(r) => ScalarRef::Real(*r),
+            Value::Double(d) => ScalarRef::Double(*d),
+            Value::Numeric(d) => ScalarRef::Numeric(*d),
+            Value::Json(s) => ScalarRef::Json(s.as_str()),
+            Value::Array(a) => {
+                let mut payload = Vec::new();
+                crate::row_codec::write_array_elements_payload(&mut payload, a)
+                    .map_err(|_| "unique key column has an array value that cannot be encoded")?;
+                array_payload = payload;
+                let count = u32::try_from(a.len())
+                    .map_err(|_| "unique key column has an array value that cannot be encoded")?;
+                ScalarRef::Array(crate::row_codec::ArrayRef::from_owned(
+                    a.elem(),
+                    count,
+                    &array_payload,
+                ))
+            }
+            Value::Null | Value::Vector(_) => {
+                // `ColumnType::is_unique_constraint_allowed` が事前に拒否する
+                // 型であり、UNIQUE 制約の構成列としては `validate_schema` を
+                // 通過したスキーマから到達しないはずの内部矛盾
+                // （`push_canonical_component` と同じ判断）。
                 return Err("unique key column has a type that is not allowed as a unique key");
             }
         };
@@ -598,6 +674,36 @@ pub(crate) fn unique_key_from_values(
             .map_err(|_| "unique key column has a type that is not allowed as a unique key")?;
     }
     Ok(Some(out))
+}
+
+/// NUMERIC の正準 `(unscaled, scale)`: 末尾ゼロを除去した最簡表現（`1.50` と
+/// `1.5` を同一キーへ正規化する。Issue #1073 D7）。`scale == 0` に達したら
+/// それ以上は割らない。`checked_rem`／`checked_div` で整数演算を明示的に扱う
+/// （coding-rust.md）。
+fn canonical_numeric_parts(d: crate::numeric::Decimal) -> (i128, u8) {
+    let mut unscaled = d.unscaled();
+    let mut scale = d.scale();
+    while scale > 0 {
+        let Some(0) = unscaled.checked_rem(10) else {
+            break;
+        };
+        let Some(next) = unscaled.checked_div(10) else {
+            break;
+        };
+        unscaled = next;
+        scale -= 1;
+    }
+    (unscaled, scale)
+}
+
+/// 配列要素型の一意キー用固定タグ（配列列内部だけで使うスクラッチ値。
+/// [`crate::catalog::ArrayElemType`] のカタログ表現とは独立に採番してよい。
+/// `ColumnType::unique_key_tag` と同じ「非永続化のスクラッチタグ」方針）。
+fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
+    match elem {
+        crate::catalog::ArrayElemType::Text => 0,
+        crate::catalog::ArrayElemType::Bool => 1,
+    }
 }
 
 /// `FOREIGN KEY` 1 件分の参照元側の検査仕様（TABLE-17・TASK-205、Issue #907）。
@@ -1335,6 +1441,147 @@ mod tests {
             assert!(table_has_duplicate_unique_key(&table, &schema, &columns)
                 .expect("scan must succeed"));
         }
+        write_txn.abort().expect("abort");
+    }
+
+    // --- Issue #1073: UNIQUE 制約の対象型拡張（REAL・DOUBLE PRECISION・
+    // NUMERIC・JSON／JSONB・配列型）の正準キー生成 -------------------------
+
+    /// REAL／DOUBLE PRECISION の `-0.0` は `+0.0` と同一の正準キーへ正規化される
+    /// （`push_canonical_component` が `scalar_float::canonicalize_*` を経由する）。
+    /// 非有限値（NaN）は `row_codec` の encode 側が既に拒否するため通常到達
+    /// しないが、defense in depth として本関数レベルでも `Err` を確認する。
+    #[test]
+    fn push_canonical_component_normalizes_real_and_double_negative_zero() {
+        let mut neg = Vec::new();
+        push_canonical_component(&mut neg, ScalarRef::Real(-0.0)).expect("finite");
+        let mut pos = Vec::new();
+        push_canonical_component(&mut pos, ScalarRef::Real(0.0)).expect("finite");
+        assert_eq!(neg, pos);
+
+        let mut neg_d = Vec::new();
+        push_canonical_component(&mut neg_d, ScalarRef::Double(-0.0)).expect("finite");
+        let mut pos_d = Vec::new();
+        push_canonical_component(&mut pos_d, ScalarRef::Double(0.0)).expect("finite");
+        assert_eq!(neg_d, pos_d);
+
+        let mut nan_out = Vec::new();
+        assert!(push_canonical_component(&mut nan_out, ScalarRef::Real(f32::NAN)).is_err());
+        let mut nan_out_d = Vec::new();
+        assert!(push_canonical_component(&mut nan_out_d, ScalarRef::Double(f64::NAN)).is_err());
+    }
+
+    /// NUMERIC は末尾ゼロを除去した最簡表現で同一キーになる（`1.50` と `1.5`）。
+    #[test]
+    fn push_canonical_component_normalizes_numeric_trailing_zeros() {
+        let a = crate::numeric::Decimal::from_parts(150, 2).expect("valid decimal"); // 1.50
+        let b = crate::numeric::Decimal::from_parts(15, 1).expect("valid decimal"); // 1.5
+        let mut out_a = Vec::new();
+        push_canonical_component(&mut out_a, ScalarRef::Numeric(a)).expect("ok");
+        let mut out_b = Vec::new();
+        push_canonical_component(&mut out_b, ScalarRef::Numeric(b)).expect("ok");
+        assert_eq!(out_a, out_b);
+
+        // 末尾ゼロを持たない異なる値は別キーになる。
+        let c = crate::numeric::Decimal::from_parts(151, 2).expect("valid decimal"); // 1.51
+        let mut out_c = Vec::new();
+        push_canonical_component(&mut out_c, ScalarRef::Numeric(c)).expect("ok");
+        assert_ne!(out_a, out_c);
+    }
+
+    fn extended_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("r", crate::catalog::ColumnType::Real, true),
+                ColumnDef::new(
+                    "n",
+                    crate::catalog::ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("j", crate::catalog::ColumnType::Json, true),
+                ColumnDef::new(
+                    "arr",
+                    crate::catalog::ColumnType::Array(
+                        crate::catalog::ArrayType::new(crate::catalog::ArrayElemType::Text, 8)
+                            .expect("valid array type"),
+                    ),
+                    true,
+                ),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::new(vec!["j".to_string()]),
+            crate::catalog::UniqueConstraint::new(vec!["arr".to_string()]),
+        ])
+    }
+
+    /// JSON 列は正準化前のテキスト表現（キー順・空白）が異なっても値として
+    /// 等価なら UNIQUE 制約に違反する（`json::canonical_equality_text` 経由。
+    /// Issue #1073）。
+    #[test]
+    fn unique_constraint_on_json_column_detects_value_equal_but_textually_different_rows() {
+        let (storage, _guard) = tmp_storage("constraint-unique-json");
+        let schema = extended_types_schema();
+        storage.create_table(&schema).expect("create table");
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        let row = |json: &str| {
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Json(json.to_string()),
+                Value::Null,
+            ]
+        };
+        put_raw_row(&write_txn, &schema, "tenant-a", 1, &row(r#"{"a":1,"b":2}"#));
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1])
+            .expect("first row must succeed");
+        // キー順・空白だけが異なるが値として等価な JSON テキスト。
+        put_raw_row(
+            &write_txn,
+            &schema,
+            "tenant-a",
+            2,
+            &row(r#"{ "b": 2, "a": 1 }"#),
+        );
+        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
+            .expect_err("value-equal JSON must conflict despite differing text");
+        assert!(matches!(err, TenantWriteError::UniqueViolation));
+        write_txn.abort().expect("abort");
+    }
+
+    /// 配列列の UNIQUE 制約は要素順を区別する（`{a,b}` と `{b,a}` は衝突しない）。
+    #[test]
+    fn unique_constraint_on_array_column_distinguishes_element_order() {
+        let (storage, _guard) = tmp_storage("constraint-unique-array");
+        let schema = extended_types_schema();
+        storage.create_table(&schema).expect("create table");
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        let row = |items: &[&str]| {
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Array(crate::row_codec::ArrayValue::Text(
+                    items.iter().map(|s| s.to_string()).collect(),
+                )),
+            ]
+        };
+        put_raw_row(&write_txn, &schema, "tenant-a", 1, &row(&["a", "b"]));
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1])
+            .expect("first row must succeed");
+        // 要素順が異なる配列は衝突しない。
+        put_raw_row(&write_txn, &schema, "tenant-a", 2, &row(&["b", "a"]));
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
+            .expect("different element order must not conflict");
+        // 完全一致は衝突する。
+        put_raw_row(&write_txn, &schema, "tenant-a", 3, &row(&["a", "b"]));
+        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[3])
+            .expect_err("identical array must conflict");
+        assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
 }

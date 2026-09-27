@@ -1,18 +1,23 @@
 # UNIQUE 制約（TABLE-16・TASK-204）
 
-- **Issue**: #905（`feat(engine): UNIQUE 制約`）
+- **Issue**: #905（`feat(engine): UNIQUE 制約`）・#1073（対象型の拡張:
+  `feat(engine): UNIQUE 制約の対象型を NUMERIC・REAL・DOUBLE PRECISION・
+  JSON 等へ拡張`）
 - **対象ビヘイビア**（ポインタのみ・本文非転記）: `docs/spec/05-tasks.md`
   TASK-204・`docs/spec/04-behavior/data-model.md` TABLE-16・TABLE-12・
-  `docs/spec/04-behavior/rls.md` RLS-9・RLS-10 (c)・
+  TABLE-13・TABLE-14・`docs/spec/04-behavior/rls.md` RLS-9・RLS-10 (c)・
   `docs/spec/04-behavior/error-format.md` ERR-2・ERR-4・ERR-6・
   `docs/spec/04-behavior/recovery.md` RECOVER-7・RECOVER-12・
   `docs/spec/04-behavior/sql-surface.md` SQL-31
 - **関連**: `docs/design/sql-primary-key.md`（Issue #903。一意性の検査点を共有）・
   `docs/design/not-null-default.md`（Issue #904。カタログ v5）・
-  `docs/design/explicit-transaction.md`（Issue #942。明示トランザクション）
+  `docs/design/explicit-transaction.md`（Issue #942。明示トランザクション）・
+  `docs/design/foreign-key.md`（Issue #907。D3 が前提にする「参照元は PK 許可型」を
+  本 Issue の UNIQUE 対象型拡張と独立に維持する）
 - **ステータス**: 実装済み（本ドキュメントが範囲を確定する。カタログ永続化・
   `PRIMARY KEY` と共有する単一検査点・`CREATE TABLE` 構文・
-  `Storage::alter_table_add_unique_constraint`・層 A テスト）
+  `Storage::alter_table_add_unique_constraint`・層 A テスト。Issue #1073 で
+  対象型を REAL・DOUBLE PRECISION・NUMERIC・JSON／JSONB・配列型へ拡張）
 
 ## 背景・目的
 
@@ -85,13 +90,22 @@ write トランザクション内で走査し、redb の write トランザク�
   fail-closed に拒否する点だけが異なる。
 - キーは主キーと同じ正準バイト列（型タグ＋`u32` BE 長さ前置＋本体。可変長
   コンポーネントの境界曖昧性を構造的に排除）で比較する。
-- 対象型は主キーと共有する単一の許可リスト `ColumnType::is_primary_key_allowed`
-  （`TEXT`・`INTEGER`・`BIGINT`・`BOOLEAN`・`DATE`・`TIMESTAMP`・`UUID`・`BYTEA`・
-  `ENUM`）。`VECTOR`・`REAL`／`DOUBLE PRECISION`・`NUMERIC`・`JSON`／`JSONB`・
-  配列型は対象外。取り込み前の実装は `NUMERIC` も対象にしていたが、第 2 の
-  許可リストを持たない方針に合わせて主キーと同じ範囲へ揃えた（SQL 表層の
-  `CREATE TABLE` は現状 `TEXT`／`VECTOR` のみを受理するため、SQL から到達する
-  範囲は変わらない）。
+- 対象型は `ColumnType::is_unique_constraint_allowed`（Issue #1073）。
+  `PRIMARY KEY`・`FOREIGN KEY` の参照元列が共有する許可リスト
+  `ColumnType::is_primary_key_allowed`（`TEXT`・`INTEGER`・`BIGINT`・
+  `BOOLEAN`・`DATE`・`TIMESTAMP`・`UUID`・`BYTEA`・`ENUM`）の**上位集合**で、
+  `REAL`・`DOUBLE PRECISION`・`NUMERIC`・`JSON`／`JSONB`・配列型を追加で許可する。
+  `VECTOR` のみ引き続き対象外。
+  - **2 つの許可リストを持つ理由**（取り込み時点の「第 2 の許可リストを持たない」
+    という当初方針からの改訂）: `FOREIGN KEY`（Issue #907・`docs/design/
+    foreign-key.md` D3）は「参照元列は PK 許可型であること」を前提に設計されて
+    いる。UNIQUE の許可リストをそのまま拡張すると、`REAL`・`JSON` 等が `PRIMARY
+    KEY`・`FOREIGN KEY` の参照元列としても暗黙に宣言できるようになり、それらの
+    型に対する等価性・参照整合性の設計判断（D7 参照）を経ないままスコープ外の
+    挙動変更が入ってしまう。`is_primary_key_allowed` は据え置き、UNIQUE 専用の
+    上位集合を新設することで、PK・FK の対象型を意図せず広げない
+    （`crates/engine/src/catalog.rs` の `validate_foreign_keys_still_rejects_
+    real_referencing_column_after_unique_extension` が固定回帰）。
 
 ### D4. カタログ永続化（v6）
 
@@ -192,17 +206,50 @@ violation`。値・列名・行 id・テナントを含めない）をそのま�
 CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは到達しない。
 制約宣言の不正は専用 variant を作らず `CatalogError::Invalid` へ揃えた。
 
+### D7. 型ごとの正準キー（Issue #1073）
+
+一意性判定は D3 と同じ「正準バイト列（型タグ＋長さ前置）の完全一致」のまま、
+`constraint::push_canonical_component` が型ごとに**値として等価な表現を同一
+バイト列へ正規化**してから比較する。カタログの互換性（v6 のバイト列形式）は
+変更しない——正規化はキー生成時のスクラッチ処理であり、行バイト表現・カタログ
+形式のいずれにも影響しない。
+
+| 型 | 正規化 |
+| --- | --- |
+| `REAL`／`DOUBLE PRECISION` | `scalar_float::canonicalize_*` 適用後のビットパターン（`-0.0` を `+0.0` へ）。非有限値は `Err`（`row_codec` の encode が既に拒否するため通常到達しない防御層） |
+| `NUMERIC` | 末尾ゼロを除去した `(unscaled, scale)` の最簡表現（`1.50` と `1.5` が同一キー。列内では `scale` が固定のため元々単射だが表現の揺れを構造的に吸収する） |
+| `JSON`／`JSONB` | `json::canonical_equality_text`（値としての等価正規化テキスト。キー順・空白だけでなく数値も値として正規化する。`1`・`1.0`・`1e0` を同一に、`-0`・`0`・`0e5` を同一のゼロに。`JSON`／`JSONB` いずれも UNIQUE キー生成時にこの関数を共通して通す） |
+| 配列 | `[要素タグ][要素数: u32 BE][要素列の生ペイロード]`（`row_codec::ArrayRef` のエンコーダ決定性〔要素順保持・flags 固定・代替表現なし〕により単射。要素順は区別し〔`{a,b}` ≠ `{b,a}`〕、`{}` と NULL も区別する） |
+
+`JSON`／`JSONB` 列の等価正規化テキストは、将来 TABLE-14 の複合型等価述語
+（`=`）を実装する際にも再利用すべき唯一の正準形とする（判断を二重に持たない）。
+
+**コスト**: `JSON`／`JSONB` 列に UNIQUE を宣言した場合、テナント走査の 1 行
+ごとに JSON の再パースが入るため、計算量は D1 の O(テナント行数) に加えて
+O(JSON サイズ) の係数が乗る（既知の制約として記録するのみで、本 Issue では
+対処しない）。
+
+**前方互換**: 新しい型を含む UNIQUE 制約を持つカタログ値（v6）を旧バイナリが
+読むと、`validate_schema` の型判定（`is_unique_constraint_allowed` 拡張前の
+`is_primary_key_allowed` 相当）で `CatalogError::Invalid` となり fail-closed に
+拒否される。カタログのバイト列形式自体は変えていないため、前方互換が無いのは
+新しい型の**受理判定**の差分のみ。
+
 ## スコープ外・申し送り
 
 - SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名
 - 永続一意索引（redb 二次テーブル）による O(log n) 判定
-- ファイル形 INSERT（`replace_typed_rows_by_text_key`）の UNIQUE 制約対応
-  （現状は fail-closed 拒否）
 - `UPSERT` の `ON CONFLICT` 対象列への UNIQUE 列拡張は実装済み（TABLE-16、
   Issue #1074。設計判断は `docs/design/sql-upsert.md`「ON CONFLICT 対象の
   UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を対象にすることは
   引き続きスコープ外（`42601`）。
-- `NUMERIC`／`REAL`／`DOUBLE PRECISION`／`JSON`／`JSONB`／配列型への拡張
+- `PRIMARY KEY`／`FOREIGN KEY` 参照元列の対象型拡張（Issue #1073 は UNIQUE
+  のみを拡張し、PK・FK は据え置き。D3・D7 参照）
+- SQL `CREATE TABLE` での `REAL`・`NUMERIC`・`JSON`・配列型の列型受理・
+  SQL `ALTER TABLE ADD UNIQUE`（別課題の SQL 表層拡張。TABLE-13／TABLE-14）
+- TABLE-14 の複合型等価述語（`=`）の実装（`json::canonical_equality_text` を
+  再利用する前提。D7 参照）
+- JSON 文字列値の Unicode 正規化（NFC 等）
 - NoSQL 表層の DDL op（`create table` 相当）・wire-server 経由の専用結合テスト
   （NoSQL 表層は `execute_bound_insert_in_session`／`execute_bound_update_in_session`
   が同一の書き込みプリミティブを共有するため、同じ検査点の契約を継承する）
@@ -215,17 +262,35 @@ CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは
   `DO UPDATE`／新規挿入分岐、`PRIMARY KEY` との併用、明示トランザクション内の
   未 commit 行との重複検出・`TRUNCATE` 後の再挿入、他テナントの値に依存しない
   応答、`Storage::alter_table_add_unique_constraint` の拒否・成功・事後強制、
-  `alter_table_drop_column` の依存検査
+  `alter_table_drop_column` の依存検査。Issue #1073: 拡張型（`Storage::
+  create_table` ＋ `alter_table_add_unique_constraint` で宣言し、書き込みは
+  SQL `INSERT`／`UPDATE`／UPSERT 経由）の `-0.0`／`0.0`（`REAL`／`DOUBLE
+  PRECISION`）・末尾ゼロ表現の揺れ（`NUMERIC`）・キー順／空白／数値表現の揺れ
+  （`JSON`／`JSONB`）を同一値として検出、配列の要素順区別、NULL 許容・
+  テナント境界・UPDATE 自己代入・バッチ内重複の拡張型版、および
+  `alter_table_add_unique_constraint` が値として等価だがテキストが異なる
+  既存 JSON 行の重複を検出して制約を永続化しないこと（副作用ゼロ）
 - `crates/engine/tests/incremental_index.rs`（Issue #1072）: UNIQUE 制約付き
   テーブルへのファイル形 INSERT の同一パス再送成功・違反時のロールバック
   （旧チャンク復元・台帳未記録）・複数チャンクファイルの宣言どおりの `23505`・
   `body` を含む UNIQUE での複数チャンク成功・NULLS DISTINCT・テナント境界
 - `crates/engine/src/constraint.rs` 単体テスト: NULLS DISTINCT・複合キーの完全
-  一致判定とテナント境界・制約追加前の既存行重複判定
+  一致判定とテナント境界・制約追加前の既存行重複判定。Issue #1073:
+  `push_canonical_component` の `REAL`／`DOUBLE PRECISION` の `-0.0`
+  正規化・非有限値拒否、`NUMERIC` の末尾ゼロ正規化、JSON・配列列の UNIQUE
+  制約結合テスト（`enforce_unique_keys_in_txn` 経由）
+- `crates/engine/src/json.rs` 単体テスト: Issue #1073
+  `canonical_equality_text` のキー順・空白・エスケープ・数値表現（整数・
+  小数点・指数・`i128` の桁数上限を超える巨大な指数を含む）の揺れの同一視、
+  異なる値の区別、無効な JSON・上限超過の拒否
 - `crates/engine/src/catalog.rs` 単体テスト: v6 の往復（主キー・`DEFAULT`・墓標と
   の併存を含む）・v2〜v5 のバイト列不変・`validate_unique_constraints` の拒否・
   v6 破損値の `CorruptSchema` 拒否・`catalog_value_references_enum_type` の v6
-  検証
+  検証。Issue #1073: `validate_unique_constraints_accepts_extended_types`
+  （拡張型の受理）・`validate_primary_key_still_rejects_extended_unique_only_
+  types`／`validate_foreign_keys_still_rejects_real_referencing_column_
+  after_unique_extension`（PK・FK は据え置きの固定回帰）・拡張型を含む v6 の
+  往復
 - `crates/engine/src/sql/allowlist.rs` 単体テスト: `UNIQUE` 構文の受理・拒否形、
   上限ちょうどの列＋表制約（先頭・中間・末尾）の受理、表制約の前・後ろ・間に
   超過列がある場合の `54000`、制約数・制約あたり列数の上限
