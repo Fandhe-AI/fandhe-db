@@ -28,6 +28,22 @@
 //! 主キーも UNIQUE 制約も宣言しないテーブル（大多数）は検査対象のキーが 0 個に
 //! なり、呼び出しは即座に成功する（コストゼロ）。
 //!
+//! # 参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。Issue #1076）
+//!
+//! [`enforce_referencing_rows_in_txn`] は参照先側の検査を 2 段構えで行う:
+//! (1) [`propagate_referential_actions`] が宣言済みの参照アクションを子テーブルへ
+//! 再帰的に適用し、(2) 元の対象テーブルと連鎖で変更した各テーブルについて、
+//! それを参照する全 `FOREIGN KEY`（アクションの有無を問わない）の事後状態検証
+//! （[`verify_no_action_backstop`]。既存の `NO ACTION` 検査）を行う。(1) の実装に
+//! 不具合があっても (2) が最終状態の参照整合性を fail-closed に保証する。連鎖の
+//! 深さ・1 文あたりの対象行数には実装既定の上限
+//! （[`MAX_REFERENTIAL_ACTION_DEPTH`]・[`MAX_REFERENTIAL_ACTION_ROWS`]。
+//! spec 由来ではない）があり、超過は適用前に
+//! `TenantWriteError::ReferentialActionLimitExceeded`（副作用ゼロ）で拒否する。
+//! `TRUNCATE`（[`ReferencedRowsChange::Truncated`]）は連鎖を発火させない（(2) の
+//! 事後検証のみ行う）。詳細な設計判断は `docs/design/foreign-key.md`「D13〜D19」
+//! 節参照。
+//!
 //! # キーの種類と NULL の扱い
 //!
 //! - 主キー（`schema.primary_key()`）: 構成列は `nullable == false`
@@ -67,7 +83,7 @@
 //! （TABLE-16・RLS-10 (c)）。違反時のエラー（`TenantWriteError::UniqueViolation`）
 //! はキー値・列名・行 id・テナント名を含まない固定文言。
 
-use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, TableSchema};
+use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, ReferentialAction, TableSchema};
 use crate::row_codec::ScalarRef;
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
@@ -845,14 +861,210 @@ fn enforce_foreign_keys_in_txn(
 /// 検査（参照元のテナント内全行走査）を省くための情報。
 #[derive(Clone, Copy)]
 pub(crate) enum ReferencedRowsChange<'a> {
-    /// 行の削除（単一行・述語つき `DELETE`・`TRUNCATE`・ファイル形 `INSERT` の
-    /// 旧行置換）。`id` を含むすべての参照先キーが失われ得る。
+    /// 行の削除（単一行・述語つき `DELETE`・ファイル形 `INSERT` の旧行置換）。
+    /// `id` を含むすべての参照先キーが失われ得る。参照アクション（Issue #1076）を
+    /// 発火させる（[`Self::Truncated`] とは異なる）。
     Removed,
     /// 既存行の指定列（論理インデックス）のみの更新（`UPDATE ... SET`・UPSERT の
     /// `DO UPDATE SET`）。`id` は予約列で `SET` できないため失われない。
     ColumnsUpdated(&'a [usize]),
     /// 既存行の全列置換（Rust API の `update_row`）。`id` は不変。
     AllColumnsReplaced,
+    /// `TRUNCATE`（Issue #1076 A4）。全行削除だが、PostgreSQL の `TRUNCATE` と
+    /// 同様に参照アクションを発火させない（`TRUNCATE ... CASCADE` は別構文で
+    /// 未実装のまま `42601`）。事後検証（NO ACTION の背後保証）のみ行う。
+    Truncated,
+}
+
+/// ON DELETE／ON UPDATE の連鎖（Issue #1076）が 1 文あたりに辿ってよい深さ
+/// （元の文を 0 段目とする）。実装既定値であり spec 由来ではない（MySQL の
+/// 15 段と同じ桁を採用）。
+pub(crate) const MAX_REFERENTIAL_ACTION_DEPTH: u32 = 16;
+
+/// ON DELETE／ON UPDATE の連鎖（Issue #1076）が 1 文あたりに削除・更新してよい
+/// 自テナント所有の子行の総数（元の文が直接対象にした行は含まない）。実装既定値
+/// であり spec 由来ではない。
+pub(crate) const MAX_REFERENTIAL_ACTION_ROWS: u32 = 10_000;
+
+/// ON UPDATE CASCADE／SET NULL／SET DEFAULT（Issue #1076）の連鎖起点となる、
+/// 更新前の行の全列値（`row_codec::decode_scalar_columns` が返す論理列順）。
+/// `tenant.rs` の各更新関数が、既存行を書き換える**前**に読み取った値を積む。
+/// 参照先キー（主キー・UNIQUE 構成列）を含まない更新では、呼び出し元は捕捉を
+/// 省いてよい（[`enforce_referencing_rows_in_txn`] は `None` を渡された場合、
+/// ON UPDATE アクションを一切発火させない——事後検証〔NO ACTION 相当〕は
+/// 引き続き行われる）。
+#[derive(Default)]
+pub(crate) struct UpdatedKeyPreImages {
+    old_values: HashMap<u64, Vec<crate::row_codec::Value>>,
+}
+
+impl UpdatedKeyPreImages {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 更新前の id `id` の全列値 `values` を記録する（`tenant.rs` の書き込み
+    /// 関数が既存行を上書きする直前に呼ぶ契約）。
+    pub(crate) fn record(&mut self, id: u64, values: Vec<crate::row_codec::Value>) {
+        self.old_values.insert(id, values);
+    }
+}
+
+/// [`crate::row_codec::Value`] を一意キー判定と同じ正準バイト列の入力
+/// （[`ScalarRef`]）へ変換する。`FOREIGN KEY` 列は
+/// [`ColumnType::is_primary_key_allowed`] が許可する型（`Text`・`Integer`・
+/// `BigInt`・`Boolean`・`Date`・`Timestamp`・`Uuid`・`Bytea`・`Enum`）に限られる
+/// （`validate_foreign_keys` が宣言時に強制する）ため、それ以外の `Value`
+/// variant（`Vector`・`Real`・`Double`・`Numeric`・`Json`・`Array`）は FK 列の値
+/// としては現れないはずの内部不変条件であり `None` を返す（fail-closed。
+/// 呼び出し元は NULL と同様に「キー無し」として扱う）。
+fn value_as_scalar_ref(value: &crate::row_codec::Value) -> Option<ScalarRef<'_>> {
+    use crate::row_codec::Value;
+    match value {
+        Value::Text(s) => Some(ScalarRef::Text(s)),
+        Value::Integer(i) => Some(ScalarRef::Integer(*i)),
+        Value::BigInt(i) => Some(ScalarRef::BigInt(*i)),
+        Value::Bool(b) => Some(ScalarRef::Bool(*b)),
+        Value::Date(d) => Some(ScalarRef::Date(*d)),
+        Value::Timestamp(t) => Some(ScalarRef::Timestamp(*t)),
+        Value::Uuid(u) => Some(ScalarRef::Uuid(*u)),
+        Value::Bytes(b) => Some(ScalarRef::Bytes(b)),
+        Value::Enum(s) => Some(ScalarRef::Enum(s)),
+        Value::Null
+        | Value::Vector(_)
+        | Value::Real(_)
+        | Value::Double(_)
+        | Value::Array(_)
+        | Value::Json(_)
+        | Value::Numeric(_) => None,
+    }
+}
+
+/// 子テーブルの走査で集めた FK 参照元列の値ごとのキー（[`scan_child_fk_rows`]）。
+/// `id` 参照（[`ForeignKeyDef::references_parent_id`]）は物理キーの `id` 値、
+/// それ以外は一意性検査と同じ正準キーバイト列で持つ。
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ChildKey {
+    Id(u64),
+    Bytes(Vec<u8>),
+}
+
+/// `fk` の参照元列（`child_schema` 側）の値から [`ChildKey`] を組み立てる。
+/// いずれかの構成列が NULL の組は `None`（MATCH SIMPLE。参照アクションの対象外）。
+fn child_key_from_values(
+    fk: &ForeignKeyDef,
+    indices: &[usize],
+    values: &[Option<ScalarRef<'_>>],
+) -> Result<Option<ChildKey>, TenantWriteError> {
+    if fk.references_parent_id() {
+        let &idx = indices
+            .first()
+            .ok_or_else(|| internal("id-referencing foreign key must have one column"))?;
+        let id = match values.get(idx).and_then(|v| v.as_ref()) {
+            None => return Ok(None),
+            Some(ScalarRef::Integer(v)) => u64::try_from(*v).ok(),
+            Some(ScalarRef::BigInt(v)) => u64::try_from(*v).ok(),
+            Some(_) => {
+                return Err(internal(
+                    "id-referencing foreign key column has a non-integer value",
+                ))
+            }
+        };
+        Ok(id.map(ChildKey::Id))
+    } else {
+        let key_spec = KeySpec {
+            indices: indices.to_vec(),
+            null_policy: NullPolicy::Skip,
+        };
+        Ok(key_bytes(&key_spec, values)
+            .map_err(internal)?
+            .map(ChildKey::Bytes))
+    }
+}
+
+/// 子テーブル `child_schema` の同一テナントの全行（可視性を問わない。RLS-10 (c)）を
+/// 走査し、`fk` の参照元列の値（非 NULL）ごとに一致する子行 id を集める
+/// （Issue #1076。ON DELETE／ON UPDATE の対象特定・NO ACTION 事後検証のいずれの
+/// 母集合も同一テナント全行である契約〔A9〕に従う）。
+fn scan_child_fk_rows(
+    write_txn: &redb::WriteTransaction,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    tenant_id: &str,
+) -> Result<HashMap<ChildKey, Vec<u64>>, TenantWriteError> {
+    let mut out: HashMap<ChildKey, Vec<u64>> = HashMap::new();
+    let mut indices = Vec::with_capacity(fk.columns().len());
+    let mut mask = vec![false; child_schema.columns.len()];
+    for name in fk.columns() {
+        let idx = child_schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| internal("foreign key column not found in live schema columns"))?;
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+        indices.push(idx);
+    }
+    let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => {
+            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                e,
+            )))
+        }
+    };
+    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    for entry in row_table
+        .range::<(&str, u64)>((range_start, range_end))
+        .map_err(CatalogError::from)?
+    {
+        let (k, v) = entry.map_err(CatalogError::from)?;
+        let (key_tenant, id) = k.value();
+        if key_tenant != tenant_id {
+            break;
+        }
+        let values = decode_key_columns(child_schema, &mask, v.value())?;
+        if let Some(key) = child_key_from_values(fk, &indices, &values)? {
+            out.entry(key).or_default().push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// 再帰の内部で親から子へ渡す、所有版の変更表現（[`ReferencedRowsChange`] は
+/// 借用スライスを持つため再帰境界をまたげない。Issue #1076）。
+enum PropagatedChange {
+    Removed,
+    ColumnsUpdated(Vec<usize>),
+}
+
+impl PropagatedChange {
+    fn from_public(change: ReferencedRowsChange<'_>, schema: &TableSchema) -> Option<Self> {
+        match change {
+            ReferencedRowsChange::Removed => Some(PropagatedChange::Removed),
+            ReferencedRowsChange::ColumnsUpdated(idx) => {
+                Some(PropagatedChange::ColumnsUpdated(idx.to_vec()))
+            }
+            ReferencedRowsChange::AllColumnsReplaced => Some(PropagatedChange::ColumnsUpdated(
+                (0..schema.columns.len()).collect(),
+            )),
+            // TRUNCATE は参照アクションを発火させない（A4）。
+            ReferencedRowsChange::Truncated => None,
+        }
+    }
+}
+
+/// 連鎖の適用中に積み上げる状態（Issue #1076）。深さ・行数の上限判定と、
+/// 事後検証（[`verify_no_action_backstop`]）を後で行う対象テーブルの記録を兼ねる。
+struct ActionState {
+    rows_budget_used: u32,
+    /// 連鎖で変更した (テーブル名, スキーマ) の一覧（事後検証対象。重複しうる）。
+    touched: Vec<(String, TableSchema)>,
 }
 
 /// `FOREIGN KEY` の参照先側の検査（TABLE-17・TASK-205、Issue #907）。テーブル
@@ -860,26 +1072,30 @@ pub(crate) enum ReferencedRowsChange<'a> {
 /// 行の変更・台帳記録の**後**・commit の**前**に呼ぶ（参照元側と同じ検査点・同じ
 /// 順序。`operation_id` の再送判定〔`23505`／`22023`〕が本検査より優先される）。
 ///
-/// このテーブルを参照先とする各 `FOREIGN KEY`（他テーブル・自己参照のいずれも）に
-/// ついて、参照元の**同一テナントの全行**（可視性を問わない。RLS-10 (c)）の値の組が
-/// 変更後の参照先にすべて存在することを確かめる（事後状態の検証。削除・更新前の
-/// 値を保持する必要がなく、自己参照・複数行の同時削除・置換のいずれにも同一の
-/// 実装で効く）。`ALTER TABLE ... ADD FOREIGN KEY` を持たないため、各文の開始時点で
-/// 参照整合性は常に成立しており、この検証は既定の `NO ACTION`（非遅延のため
-/// `RESTRICT` と同値）と等価になる。違反は [`TenantWriteError::ForeignKeyViolation`]
-/// （呼び出し元は `write_txn` を commit しない）。
+/// 実行順序（Issue #1076 A3）: (1) 参照アクション（`CASCADE`・`SET NULL`・
+/// `SET DEFAULT`）を連鎖的にすべて適用する → (2) 元のテーブルおよび連鎖で
+/// 変更した各テーブルについて、それを参照する**全 FK**（アクションを問わない）の
+/// 事後状態検証（[`verify_no_action_backstop`]）を行う。アクション適用にバグが
+/// あっても、最終状態で参照整合性が成り立たなければ `23503` で拒否される
+/// （fail-closed の最終不変条件）。
 ///
-/// 更新（[`ReferencedRowsChange::ColumnsUpdated`]／`AllColumnsReplaced`）で主キー・
-/// UNIQUE 制約の構成列に触れない場合は、参照先キーが変わり得ないためカタログの
-/// 逆引きすら行わない（主キー・UNIQUE を宣言しないテーブルの `UPDATE` はコスト
-/// ゼロ）。計算量は参照元のテナント保有行数に比例する（一意性検査と同じく永続
-/// 索引は持たない。`docs/design/foreign-key.md` 参照）。
+/// `pre_images` は ON UPDATE アクションの起点（更新前のキー値）。`None`（または
+/// `change` が `Removed`／`Truncated`）の場合は ON UPDATE アクションを発火させない
+/// （呼び出し元が主キー・UNIQUE 構成列を含まない更新と判定した場合等）。
+///
+/// 連鎖の走査・変更対象はすべてサーバー側導出テナント `tenant_id` の物理キー範囲
+/// （`(tenant_id, 0)..=(tenant_id, u64::MAX)`。TABLE-12）に閉じ、他テナントの行は
+/// 一切読み書きしない（RLS-9・RLS-10 (c)。テナント所有の不可視行も対象に含む）。
+/// 連鎖の深さ・総行数が [`MAX_REFERENTIAL_ACTION_DEPTH`]・
+/// [`MAX_REFERENTIAL_ACTION_ROWS`] を超えた場合は
+/// [`TenantWriteError::ReferentialActionLimitExceeded`]（副作用ゼロ。適用前に判定）。
 pub(crate) fn enforce_referencing_rows_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     change: ReferencedRowsChange<'_>,
+    pre_images: Option<&UpdatedKeyPreImages>,
 ) -> Result<(), TenantWriteError> {
     let is_key_column = |name: &str| -> bool {
         schema
@@ -891,7 +1107,7 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                 .any(|u| u.columns().iter().any(|c| c == name))
     };
     let updated_names: Option<Vec<&str>> = match change {
-        ReferencedRowsChange::Removed => None,
+        ReferencedRowsChange::Removed | ReferencedRowsChange::Truncated => None,
         ReferencedRowsChange::ColumnsUpdated(indices) => Some(
             indices
                 .iter()
@@ -907,9 +1123,47 @@ pub(crate) fn enforce_referencing_rows_in_txn(
             return Ok(());
         }
     }
+
+    let mut state = ActionState {
+        rows_budget_used: 0,
+        touched: Vec::new(),
+    };
+    if let Some(propagated) = PropagatedChange::from_public(change, schema) {
+        propagate_referential_actions(
+            write_txn, table_name, schema, tenant_id, propagated, pre_images, 0, &mut state,
+        )?;
+    }
+
+    verify_no_action_backstop(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        updated_names.as_deref(),
+    )?;
+    // 連鎖で変更した各テーブルも全 FK について事後検証する（重複するテーブルへの
+    // 再検証は無駄だが安全側であり、連鎖の総行数は上限で有界なため許容する）。
+    for (touched_table, touched_schema) in &state.touched {
+        verify_no_action_backstop(write_txn, touched_table, touched_schema, tenant_id, None)?;
+    }
+    Ok(())
+}
+
+/// [`enforce_referencing_rows_in_txn`] の事後検証本体（Issue #907 の既存挙動）。
+/// `table_name` を参照する各 `FOREIGN KEY` について、参照元の同一テナント全行の
+/// 値の組が現在の `table_name` にすべて存在することを確かめる。`updated_names`
+/// が `Some` の場合、参照先列がそれらに含まれない FK は検査を省く（連鎖で変更した
+/// テーブルは `None` を渡し、常に全 FK を検査する）。
+fn verify_no_action_backstop(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    updated_names: Option<&[&str]>,
+) -> Result<(), TenantWriteError> {
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
     for (child_schema, fk) in &referencing {
-        if let Some(names) = &updated_names {
+        if let Some(names) = updated_names {
             // `id` 参照は更新で失われない。列参照は、参照先列のいずれかが今回
             // 更新された列に含まれる場合のみ検査する。
             if fk.references_parent_id()
@@ -960,6 +1214,546 @@ pub(crate) fn enforce_referencing_rows_in_txn(
         verify_required_parent_keys(write_txn, table_name, schema, fk, tenant_id, required)?;
     }
     Ok(())
+}
+
+/// 連鎖の対象子行 1 件分: `(子行 id, ON UPDATE CASCADE の新しい参照先キー値。
+/// それ以外のアクションでは `None`)`。[`collect_action_targets`] の戻り値・
+/// [`apply_referential_action`] の入力で共有する（Issue #1076）。
+type ActionTargets = Vec<(u64, Option<Vec<crate::row_codec::Value>>)>;
+
+/// `table_name`（スキーマ `schema`）に加えた変更 `change` を起点に、参照アクション
+/// （`CASCADE`・`SET NULL`・`SET DEFAULT`。Issue #1076）を再帰的に子テーブルへ
+/// 適用する。`depth` は元の文を 0 段目とした連鎖の段数。適用した子テーブルは
+/// `state.touched` へ積み、[`enforce_referencing_rows_in_txn`] が最後にまとめて
+/// 事後検証する。引数 7 個超は連鎖 1 段分の呼び出しコンテキスト（トランザクション・
+/// 対象テーブル・変更内容・再帰状態）を素直に渡した結果であり、構造体へまとめる
+/// ほどの凝集性はない（呼び出しは本モジュール内の再帰 1 箇所のみ）。
+#[allow(clippy::too_many_arguments)]
+fn propagate_referential_actions(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    change: PropagatedChange,
+    pre_images: Option<&UpdatedKeyPreImages>,
+    depth: u32,
+    state: &mut ActionState,
+) -> Result<(), TenantWriteError> {
+    let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
+    for (child_schema, fk) in &referencing {
+        let action = match &change {
+            PropagatedChange::Removed => fk.on_delete(),
+            PropagatedChange::ColumnsUpdated(indices) => {
+                // `id` 参照は ON UPDATE で発火しない（`id` 疑似列は不変。A7）。
+                if fk.references_parent_id() {
+                    continue;
+                }
+                let names: Vec<&str> = indices
+                    .iter()
+                    .filter_map(|&i| schema.columns.get(i).map(|c| c.name.as_str()))
+                    .collect();
+                if !fk
+                    .parent_columns()
+                    .iter()
+                    .any(|c| names.contains(&c.as_str()))
+                {
+                    continue;
+                }
+                fk.on_update()
+            }
+        };
+        if matches!(action, ReferentialAction::NoAction) {
+            continue;
+        }
+
+        let affected = collect_action_targets(
+            write_txn,
+            table_name,
+            schema,
+            child_schema,
+            fk,
+            tenant_id,
+            &change,
+            pre_images,
+            action,
+        )?;
+        if affected.is_empty() {
+            continue;
+        }
+
+        let new_depth = depth
+            .checked_add(1)
+            .ok_or_else(|| internal("referential action depth overflow"))?;
+        if new_depth > MAX_REFERENTIAL_ACTION_DEPTH {
+            return Err(TenantWriteError::ReferentialActionLimitExceeded);
+        }
+        let n = u32::try_from(affected.len())
+            .map_err(|_| internal("referential action row count overflow"))?;
+        let new_budget = state
+            .rows_budget_used
+            .checked_add(n)
+            .ok_or_else(|| internal("referential action row budget overflow"))?;
+        if new_budget > MAX_REFERENTIAL_ACTION_ROWS {
+            return Err(TenantWriteError::ReferentialActionLimitExceeded);
+        }
+        state.rows_budget_used = new_budget;
+
+        let is_delete = matches!(change, PropagatedChange::Removed);
+        let (child_change, child_pre_images) = apply_referential_action(
+            write_txn,
+            child_schema,
+            fk,
+            action,
+            &affected,
+            tenant_id,
+            is_delete,
+        )?;
+
+        crate::catalog::bump_table_generation_in_txn(write_txn, &child_schema.name)?;
+
+        if let PropagatedChange::ColumnsUpdated(_) = &child_change {
+            // 書いた値が壊れていないか（CHECK → UNIQUE → 子自身の FK 参照元側）を
+            // 即座に検証する（`SET DEFAULT` の値が参照先に無い・UNIQUE 衝突・
+            // CHECK 違反はここで検出される）。削除（`CASCADE` の ON DELETE 側）は
+            // 行が既に無いため対象外。
+            let child_ids: Vec<u64> = affected.iter().map(|(id, _)| *id).collect();
+            enforce_row_constraints_in_txn(
+                write_txn,
+                &child_schema.name,
+                child_schema,
+                tenant_id,
+                &child_ids,
+            )?;
+        }
+        state
+            .touched
+            .push((child_schema.name.clone(), child_schema.clone()));
+
+        propagate_referential_actions(
+            write_txn,
+            &child_schema.name,
+            child_schema,
+            tenant_id,
+            child_change,
+            child_pre_images.as_ref(),
+            new_depth,
+            state,
+        )?;
+    }
+    Ok(())
+}
+
+/// [`propagate_referential_actions`] が 1 個の `FOREIGN KEY` について連鎖の
+/// 対象となる子行を特定する（Issue #1076 A6）。戻り値は `(子行 id, 新しい
+/// 参照先キー値)` の一覧: `CASCADE` の `ON UPDATE` のみ新しいキー値
+/// （`fk.columns()` の位置に対応する `Value`）を積む。それ以外のアクション
+/// （`ON DELETE` 全般・`SET NULL`／`SET DEFAULT`）は書き込み時に値を必要としない
+/// ため `None`。
+///
+/// - `ON DELETE`（`change == Removed`）: 子行の参照元キー（非 NULL）が、事後状態
+///   （既に削除済みの `parent_table`）に存在しなくなった行（孤立行）。
+/// - `ON UPDATE`（`change == ColumnsUpdated`）: `pre_images` に記録された旧キー値
+///   のうち、現在（書き込み後）の親行の新キー値と異なるものを持つ子行。
+///   `pre_images` が無ければ空を返す（呼び出し元が発火不要と判定済み）。
+///
+/// 引数 7 個超は連鎖 1 段分の呼び出しコンテキスト（参照元・参照先スキーマ・
+/// FK 宣言・変更内容）を素直に渡した結果であり、構造体へまとめるほどの凝集性は
+/// ない（呼び出しは [`propagate_referential_actions`] の 1 箇所のみ）。
+#[allow(clippy::too_many_arguments)]
+fn collect_action_targets(
+    write_txn: &redb::WriteTransaction,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    tenant_id: &str,
+    change: &PropagatedChange,
+    pre_images: Option<&UpdatedKeyPreImages>,
+    action: ReferentialAction,
+) -> Result<ActionTargets, TenantWriteError> {
+    match change {
+        PropagatedChange::Removed => {
+            let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
+            if child_rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            // 列参照 FK は親テーブルを 1 回だけ走査し、存在するキーの集合を作る
+            // （`child_rows` の distinct キーごとに親を再走査すると、自己参照の
+            // 深い木で段あたり O(distinct キー数 × 親行数) に膨らむ。
+            // `id` 参照は物理キーの点照会のままにする——`parent_row_exists` は
+            // O(1) であり、事前に全 id を集めても走査コストを削減しない）。
+            let present_keys: Option<HashSet<Vec<u8>>> =
+                if child_rows.keys().any(|k| matches!(k, ChildKey::Bytes(_))) {
+                    Some(scan_parent_key_bytes(
+                        write_txn,
+                        parent_table,
+                        parent_schema,
+                        fk,
+                        tenant_id,
+                    )?)
+                } else {
+                    None
+                };
+            let mut out = Vec::new();
+            for (key, ids) in child_rows {
+                let exists = match &key {
+                    ChildKey::Id(id) => parent_row_exists(write_txn, parent_table, tenant_id, *id)?,
+                    ChildKey::Bytes(bytes) => present_keys
+                        .as_ref()
+                        .is_some_and(|present| present.contains(bytes)),
+                };
+                if !exists {
+                    for id in ids {
+                        out.push((id, None));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        PropagatedChange::ColumnsUpdated(_) => {
+            let Some(pre) = pre_images else {
+                return Ok(Vec::new());
+            };
+            if pre.old_values.is_empty() {
+                return Ok(Vec::new());
+            }
+            let parent_indices: Vec<usize> = fk
+                .parent_columns()
+                .iter()
+                .map(|name| {
+                    parent_schema
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == name)
+                        .ok_or_else(|| internal("referenced column not found in parent schema"))
+                })
+                .collect::<Result<_, _>>()?;
+            let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
+            if child_rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::new();
+            for (parent_id, old_values) in &pre.old_values {
+                let old_key = build_owned_key(old_values, &parent_indices, fk)?;
+                let Some(old_key) = old_key else { continue };
+                let new_values = read_parent_row_values(
+                    write_txn,
+                    parent_table,
+                    parent_schema,
+                    tenant_id,
+                    *parent_id,
+                )?;
+                let new_key = match &new_values {
+                    Some(values) => build_owned_key(values, &parent_indices, fk)?,
+                    None => None,
+                };
+                if new_key.as_ref() == Some(&old_key) {
+                    continue;
+                }
+                let Some(ids) = child_rows.get(&old_key) else {
+                    continue;
+                };
+                let new_key_values: Option<Vec<crate::row_codec::Value>> =
+                    if matches!(action, ReferentialAction::Cascade) {
+                        match &new_values {
+                            Some(values) => Some(
+                                parent_indices
+                                    .iter()
+                                    .map(|&idx| {
+                                        values.get(idx).cloned().ok_or_else(|| {
+                                            internal("parent row value index out of range")
+                                        })
+                                    })
+                                    .collect::<Result<_, _>>()?,
+                            ),
+                            // 親行自体が同一トランザクション内で削除された（先に
+                            // ON DELETE 連鎖が走った等）。ON UPDATE CASCADE の
+                            // 対象ではなくなっている（削除側の連鎖が別途処理する）。
+                            None => continue,
+                        }
+                    } else {
+                        None
+                    };
+                for &id in ids {
+                    out.push((id, new_key_values.clone()));
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// 親テーブル `parent_table` の `id` 疑似列参照の存在確認（`id` 参照 FK 用）。
+fn parent_row_exists(
+    write_txn: &redb::WriteTransaction,
+    parent_table: &str,
+    tenant_id: &str,
+    id: u64,
+) -> Result<bool, TenantWriteError> {
+    let row_table_name = crate::catalog::user_rows_table_name(parent_table);
+    match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+        Ok(t) => Ok(t
+            .get((tenant_id, id))
+            .map_err(CatalogError::from)?
+            .is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+            e,
+        ))),
+    }
+}
+
+/// 親テーブル `parent_table` の同一テナント全行を 1 回だけ走査し、`fk` の
+/// 参照先列（列参照 FK）の正準キーバイト列の集合を作る（Issue #1076 A6 の
+/// ON DELETE 対象特定用）。子側の distinct キーごとに親を再走査すると、自己
+/// 参照の深い木で連鎖の段あたり O(distinct キー数 × 親行数) に膨らむため
+/// （codex-review P1・A04 不安全な設計〔DoS〕。`enforce_foreign_keys_in_txn` が
+/// 参照元側の検査で採る「必要な組をまとめて 1 回の走査で照合する」設計と同じ
+/// 考え方を、参照先側の対象特定にも適用する）、親走査は 1 回に集約する。
+fn scan_parent_key_bytes(
+    write_txn: &redb::WriteTransaction,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    tenant_id: &str,
+) -> Result<HashSet<Vec<u8>>, TenantWriteError> {
+    let mut out: HashSet<Vec<u8>> = HashSet::new();
+    let row_table_name = crate::catalog::user_rows_table_name(parent_table);
+    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => {
+            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                e,
+            )))
+        }
+    };
+    let mut indices = Vec::with_capacity(fk.parent_columns().len());
+    let mut mask = vec![false; parent_schema.columns.len()];
+    for name in fk.parent_columns() {
+        let idx = parent_schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| internal("referenced column not found in parent schema"))?;
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+        indices.push(idx);
+    }
+    let key_spec = KeySpec {
+        indices,
+        null_policy: NullPolicy::Skip,
+    };
+    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    for entry in row_table
+        .range::<(&str, u64)>((range_start, range_end))
+        .map_err(CatalogError::from)?
+    {
+        let (k, v) = entry.map_err(CatalogError::from)?;
+        let (key_tenant, _id) = k.value();
+        if key_tenant != tenant_id {
+            break;
+        }
+        let values = decode_key_columns(parent_schema, &mask, v.value())?;
+        if let Some(key) = key_bytes(&key_spec, &values).map_err(internal)? {
+            out.insert(key);
+        }
+    }
+    Ok(out)
+}
+
+/// 親テーブル `parent_table` の id `id` の現在（write トランザクション内、
+/// post-write）の全列値を読む（ON UPDATE CASCADE の新キー値取得用）。行が存在
+/// しない（同一トランザクション内で先に削除された等）場合は `None`。
+fn read_parent_row_values(
+    write_txn: &redb::WriteTransaction,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    tenant_id: &str,
+    id: u64,
+) -> Result<Option<Vec<crate::row_codec::Value>>, TenantWriteError> {
+    let row_table_name = crate::catalog::user_rows_table_name(parent_table);
+    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => {
+            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                e,
+            )))
+        }
+    };
+    let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
+        return Ok(None);
+    };
+    let (_dim, metadata) = crate::storage::decode_row_dim_and_metadata_borrowed(guard.value())?;
+    let values = crate::row_codec::decode_scalar_columns(parent_schema, metadata)
+        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+    Ok(Some(values))
+}
+
+/// `values`（`parent_indices` の位置。全列 `Value` 配列からの部分抽出）から
+/// 正準キーバイト列を組み立てる（[`ChildKey::Bytes`] と同じ表現。`id` 参照は
+/// `fk.columns()` の対応列と同じ扱いだが `ON UPDATE` では発火しないため
+/// 呼び出し元が到達させない）。いずれかの構成列が NULL なら `None`。
+fn build_owned_key(
+    values: &[crate::row_codec::Value],
+    indices: &[usize],
+    _fk: &ForeignKeyDef,
+) -> Result<Option<ChildKey>, TenantWriteError> {
+    let refs: Vec<Option<ScalarRef<'_>>> = indices
+        .iter()
+        .map(|&idx| values.get(idx).and_then(value_as_scalar_ref))
+        .collect();
+    let key_spec = KeySpec {
+        indices: (0..indices.len()).collect(),
+        null_policy: NullPolicy::Skip,
+    };
+    Ok(key_bytes(&key_spec, &refs)
+        .map_err(internal)?
+        .map(ChildKey::Bytes))
+}
+
+/// 特定した子行 `affected`（`(id, ON UPDATE CASCADE の新キー値)`）へ参照アクション
+/// `action` を適用する（Issue #1076）。戻り値は子テーブルへの変更内容（さらに
+/// 再帰する [`propagate_referential_actions`] への入力）と、子自身が親となる
+/// 孫段の `ON UPDATE` 連鎖向けの pre-image（更新系アクションのみ）。
+fn apply_referential_action(
+    write_txn: &redb::WriteTransaction,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    action: ReferentialAction,
+    affected: &ActionTargets,
+    tenant_id: &str,
+    is_delete: bool,
+) -> Result<(PropagatedChange, Option<UpdatedKeyPreImages>), TenantWriteError> {
+    if is_delete && matches!(action, ReferentialAction::Cascade) {
+        // `ON DELETE CASCADE`: 子行そのものを削除する。
+        let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+        let mut row_table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+            .map_err(crate::catalog::map_row_table_error)?;
+        for (id, _) in affected {
+            row_table
+                .remove((tenant_id, *id))
+                .map_err(CatalogError::from)?;
+        }
+        return Ok((PropagatedChange::Removed, None));
+    }
+
+    // `SET NULL`／`SET DEFAULT`／`ON UPDATE CASCADE`: 子行の FK 列を書き換える
+    // （read-merge-write。`tenant::merge_row_for_update` を共有する）。
+    let fk_indices: Vec<usize> = fk
+        .columns()
+        .iter()
+        .map(|name| {
+            child_schema
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .ok_or_else(|| internal("foreign key column not found in live schema columns"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut pre_images = UpdatedKeyPreImages::new();
+    {
+        let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+        let mut row_table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+            .map_err(crate::catalog::map_row_table_error)?;
+        for (id, new_key_values) in affected {
+            let key = (tenant_id, *id);
+            let Some(guard) = row_table.get(&key).map_err(CatalogError::from)? else {
+                // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
+                continue;
+            };
+            let existing = crate::storage::decode_row_for_key(tenant_id, *id, guard.value())
+                .map_err(TenantWriteError::Storage)?;
+            // `guard`（`row_table` の不変借用）を、直後の可変借用（`insert`）と
+            // 衝突しないよう明示的に drop する（`existing` は既にデータを
+            // 複製済みのため、以降 `guard`／借用元バッファへは触れない）。
+            drop(guard);
+            // 孫段の ON UPDATE 連鎖のために、書き換える前の全列値を記録する。
+            let old_values =
+                crate::row_codec::decode_scalar_columns(child_schema, &existing.metadata)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            pre_images.record(*id, old_values);
+
+            let assignments: Vec<(usize, crate::row_codec::Value)> = match action {
+                ReferentialAction::SetNull => fk_indices
+                    .iter()
+                    .map(|&idx| (idx, crate::row_codec::Value::Null))
+                    .collect(),
+                ReferentialAction::SetDefault => fk_indices
+                    .iter()
+                    .map(|&idx| {
+                        let column = child_schema.columns.get(idx).ok_or_else(|| {
+                            internal("foreign key column index out of range for live schema")
+                        })?;
+                        let value = match &column.default {
+                            Some(default) => {
+                                crate::sql::parser::bind_column_default(column, default).map_err(
+                                    |_| {
+                                        // 宣言時検査（A8 (b)）を通過した DEFAULT が束縛
+                                        // できないのは内部矛盾であり、値を黙って NULL へ
+                                        // 差し替えず fail-closed に拒否する。
+                                        internal(
+                                            "SET DEFAULT value failed to bind to its column type",
+                                        )
+                                    },
+                                )?
+                            }
+                            None => crate::row_codec::Value::Null,
+                        };
+                        Ok::<_, TenantWriteError>((idx, value))
+                    })
+                    .collect::<Result<_, _>>()?,
+                ReferentialAction::Cascade => {
+                    let Some(new_values) = new_key_values else {
+                        return Err(internal(
+                            "ON UPDATE CASCADE target is missing its new key values",
+                        ));
+                    };
+                    fk_indices
+                        .iter()
+                        .zip(new_values.iter())
+                        .map(|(&idx, value)| (idx, value.clone()))
+                        .collect()
+                }
+                ReferentialAction::NoAction => {
+                    return Err(internal(
+                        "NO ACTION must not reach apply_referential_action",
+                    ))
+                }
+            };
+
+            // `visibility` は既存行のものを維持する（SET で触れない列と同じ扱い。
+            // `tenant::update_row_columns_unchecked` と同じ契約）。`existing` は
+            // 直後の `merge_row_for_update` へ move するため先に控える。
+            let visibility = existing.visibility;
+            let (embedding, metadata) =
+                crate::tenant::merge_row_for_update(child_schema, existing, &assignments)
+                    .map_err(TenantWriteError::Catalog)?;
+            let row_input = crate::storage::RowInput {
+                tenant_id,
+                visibility,
+                embedding: &embedding,
+                metadata: &metadata,
+            };
+            let encoded =
+                crate::storage::encode_row(&row_input).map_err(TenantWriteError::Storage)?;
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(CatalogError::from)?;
+        }
+    }
+    Ok((
+        PropagatedChange::ColumnsUpdated(fk_indices),
+        Some(pre_images),
+    ))
 }
 
 #[cfg(test)]

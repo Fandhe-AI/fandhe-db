@@ -2108,11 +2108,32 @@ pub(crate) struct CheckConstraint {
     pub(crate) predicate_sql: String,
 }
 
-/// `FOREIGN KEY` 制約 1 件分の宣言（TABLE-17・TASK-205、Issue #907）。参照元
-/// （この宣言を保持する [`TableSchema`]）の列 `columns` の値の組が、参照先
-/// テーブル `parent_table` の列 `parent_columns` の値の組として**同一テナント内**に
-/// 存在することを要求する（`constraint` モジュールの単一検査点が判定する。
-/// 母集合はテナント所有の全行で、RLS 可視集合ではない。RLS-10 (c)）。
+/// `FOREIGN KEY` の参照アクション（Issue #1076・TABLE-17・TASK-205）。参照先の
+/// 行が削除・更新（キー変更）されたとき、参照元（このスキーマ側）の行へ何を
+/// 行うかを表す。`ON DELETE`・`ON UPDATE` それぞれ独立に宣言する
+/// （[`ForeignKeyDef::on_delete`]／[`ForeignKeyDef::on_update`]）。
+///
+/// 適用順序・上限・テナント境界は `crate::constraint` モジュールドキュメント
+/// 参照（連鎖の適用 → 変更対象テーブル全体の事後検証、の 2 段構え）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    /// 既定。参照先の変更は、文の最後に行う事後検証（`23503`）でのみ扱う
+    /// （`RESTRICT` 宣言もここへ正規化し、区別して永続化しない）。
+    NoAction,
+    /// 参照元の行を連鎖的に削除・更新する。
+    Cascade,
+    /// 参照元の FK 列をすべて `NULL` にする。
+    SetNull,
+    /// 参照元の FK 列をそれぞれの列 `DEFAULT`（無ければ `NULL`）にする。
+    SetDefault,
+}
+
+/// `FOREIGN KEY` 制約 1 件分の宣言（TABLE-17・TASK-205、Issue #907。参照
+/// アクションは Issue #1076）。参照元（この宣言を保持する [`TableSchema`]）の列
+/// `columns` の値の組が、参照先テーブル `parent_table` の列 `parent_columns` の
+/// 値の組として**同一テナント内**に存在することを要求する（`constraint` モジュール
+/// の単一検査点が判定する。母集合はテナント所有の全行で、RLS 可視集合ではない。
+/// RLS-10 (c)）。
 ///
 /// `parent_columns` は `columns` と位置で対応し（`columns[i]` ↔ `parent_columns[i]`）、
 /// カタログへ永続化される値では常に解決済み（非空）: 参照先の主キー・UNIQUE 制約の
@@ -2126,6 +2147,8 @@ pub struct ForeignKeyDef {
     columns: Vec<String>,
     parent_table: String,
     parent_columns: Vec<String>,
+    on_delete: ReferentialAction,
+    on_update: ReferentialAction,
 }
 
 impl ForeignKeyDef {
@@ -2136,11 +2159,15 @@ impl ForeignKeyDef {
         columns: Vec<String>,
         parent_table: String,
         parent_columns: Vec<String>,
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
     ) -> Self {
         Self {
             columns,
             parent_table,
             parent_columns,
+            on_delete,
+            on_update,
         }
     }
 
@@ -2160,9 +2187,29 @@ impl ForeignKeyDef {
         &self.parent_columns
     }
 
+    /// `ON DELETE` の参照アクション（Issue #1076）。
+    pub fn on_delete(&self) -> ReferentialAction {
+        self.on_delete
+    }
+
+    /// `ON UPDATE` の参照アクション（Issue #1076）。
+    pub fn on_update(&self) -> ReferentialAction {
+        self.on_update
+    }
+
     /// 参照先が `id` 疑似列（物理キー）であるか。
     pub(crate) fn references_parent_id(&self) -> bool {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
+    }
+
+    /// 構造（参照元列・参照先テーブル・参照先列）だけを比較し、アクションの
+    /// 違いは無視する重複判定（Issue #1076 A14）。同じ列の組について矛盾する
+    /// アクションを 2 つ宣言できてしまう抜け穴を塞ぐため、宣言の重複検査
+    /// （[`validate_foreign_keys`]・[`parse_foreign_key_section`]）はこちらを使う。
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.columns == other.columns
+            && self.parent_table == other.parent_table
+            && self.parent_columns == other.parent_columns
     }
 }
 
@@ -2722,16 +2769,61 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 }
             }
         }
-        if schema.foreign_keys.iter().take(i).any(|other| other == fk) {
+        if schema
+            .foreign_keys
+            .iter()
+            .take(i)
+            .any(|other| other.same_target(fk))
+        {
             return Err(CatalogError::Invalid(
                 "duplicate foreign key declaration".to_string(),
             ));
         }
+        // 参照アクションの宣言時検査（Issue #1076 A8）。ALTER で FK 列の
+        // nullability・DEFAULT を後から変える経路が無い（DROP COLUMN は FK 構成列を
+        // 拒否する）ため、この検査は宣言後も恒久的に有効であり続ける。
+        validate_referential_action_declaration(schema, fk)?;
         // 自己参照は参照先の宣言がこのスキーマ自身にあるため、参照先の照合まで
         // 静的に検証できる（解決済みの宣言のみ。未解決は `create_table` の
         // write トランザクション内で解決・照合する）。
         if fk.parent_table == schema.name && !fk.parent_columns.is_empty() {
             resolve_foreign_key_target(schema, fk, schema)?;
+        }
+    }
+    Ok(())
+}
+
+/// `FOREIGN KEY` の参照アクション（Issue #1076 A8）が常に失敗する宣言を拒否する。
+/// (a) `SET NULL`（`ON DELETE`／`ON UPDATE` いずれか）で参照元列に `NOT NULL` の
+/// 列がある。(b) `SET DEFAULT` で参照元列に「`DEFAULT` が無く、かつ `NOT NULL`」の
+/// 列がある。参照元スキーマだけで判定できる（カタログ decode 時にも再検証する
+/// 多層防御）。参照先列の nullable が必要な (c) は [`resolve_foreign_key_target`]
+/// （参照先が確定する `CREATE TABLE` の write トランザクション内）が担う。
+fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKeyDef) -> Result<()> {
+    let uses_set_null = matches!(fk.on_delete, ReferentialAction::SetNull)
+        || matches!(fk.on_update, ReferentialAction::SetNull);
+    let uses_set_default = matches!(fk.on_delete, ReferentialAction::SetDefault)
+        || matches!(fk.on_update, ReferentialAction::SetDefault);
+    if !uses_set_null && !uses_set_default {
+        return Ok(());
+    }
+    for name in &fk.columns {
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| &c.name == name)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("foreign key references unknown column: {name}"))
+            })?;
+        if uses_set_null && !column.nullable {
+            return Err(CatalogError::InvalidForeignKey(format!(
+                "column {name} is NOT NULL and cannot use the SET NULL referential action"
+            )));
+        }
+        if uses_set_default && !column.nullable && column.default.is_none() {
+            return Err(CatalogError::InvalidForeignKey(format!(
+                "column {name} is NOT NULL without a DEFAULT and cannot use the SET DEFAULT referential action"
+            )));
         }
     }
     Ok(())
@@ -2774,7 +2866,13 @@ fn resolve_foreign_key_target(
                 CatalogError::Invalid(format!("foreign key references unknown column: {name}"))
             })
     };
-    let resolved = ForeignKeyDef::new(fk.columns.clone(), fk.parent_table.clone(), parent_columns);
+    let resolved = ForeignKeyDef::new(
+        fk.columns.clone(),
+        fk.parent_table.clone(),
+        parent_columns,
+        fk.on_delete,
+        fk.on_update,
+    );
     if resolved.references_parent_id() {
         for name in &resolved.columns {
             if !matches!(child_type(name)?, ColumnType::Integer | ColumnType::BigInt) {
@@ -2783,6 +2881,9 @@ fn resolve_foreign_key_target(
                 )));
             }
         }
+        // `id` 疑似列（物理キー）は常に非 NULL のため、`ON UPDATE CASCADE` の
+        // 参照先 nullable 検査（(c)）は不要（`id` 自体は更新されず、A7 により
+        // ON UPDATE アクションはそもそも発火しない）。
         return Ok(resolved);
     }
     let same_set = |key: &[String]| -> bool {
@@ -2819,6 +2920,29 @@ fn resolve_foreign_key_target(
             return Err(CatalogError::InvalidForeignKey(format!(
                 "foreign key column {child_name} and referenced column {parent_name} are of incompatible types"
             )));
+        }
+    }
+    // 参照アクションの宣言時検査（Issue #1076 A8 (c)）: `ON UPDATE CASCADE` は
+    // 参照先列の新しい値をそのまま参照元列へ書き込む。参照元列が `NOT NULL` なのに
+    // 参照先列が nullable（NULL にできる UNIQUE 列）だと、参照先が NULL へ更新
+    // された瞬間に必ず失敗する宣言になるため拒否する。
+    if matches!(resolved.on_update, ReferentialAction::Cascade) {
+        for (child_name, parent_name) in resolved.columns.iter().zip(&resolved.parent_columns) {
+            let child_nullable = child
+                .columns
+                .iter()
+                .find(|c| &c.name == child_name)
+                .is_some_and(|c| c.nullable);
+            let parent_nullable = parent
+                .columns
+                .iter()
+                .find(|c| &c.name == parent_name)
+                .is_some_and(|c| c.nullable);
+            if !child_nullable && parent_nullable {
+                return Err(CatalogError::InvalidForeignKey(format!(
+                    "column {child_name} is NOT NULL but referenced column {parent_name} is nullable, which is incompatible with ON UPDATE CASCADE"
+                )));
+            }
         }
     }
     Ok(resolved)
@@ -3203,9 +3327,49 @@ fn encode_foreign_key_section(out: &mut String, foreign_keys: &[ForeignKeyDef]) 
         out.push_str(&fk.parent_table);
         out.push(':');
         out.push_str(&fk.parent_columns.join(","));
+        // 参照アクション（Issue #1076）はどちらも `NO ACTION` の場合、v8 の
+        // バイト列を一切変えない 3 フィールド形のまま書く（既存ゴールデン
+        // テスト・カタログの後方互換を保つ）。どちらかが `NO ACTION` 以外の
+        // 場合のみ 5 フィールド形に拡張する（正規形の一意性は decode 側
+        // （[`parse_foreign_key_section`]）が「5 フィールドで両方 noaction」を
+        // 拒否することで保つ）。
+        if fk.on_delete != ReferentialAction::NoAction
+            || fk.on_update != ReferentialAction::NoAction
+        {
+            out.push(':');
+            out.push_str(referential_action_token(fk.on_delete));
+            out.push(':');
+            out.push_str(referential_action_token(fk.on_update));
+        }
         out.push('\n');
     }
     Ok(())
+}
+
+/// [`ReferentialAction`] のカタログ v8 `fk:` 行トークン（閉じた語彙）。
+/// [`parse_referential_action_token`] と対を成す（往復を保証する多層防御。
+/// Issue #1076）。
+fn referential_action_token(action: ReferentialAction) -> &'static str {
+    match action {
+        ReferentialAction::NoAction => "noaction",
+        ReferentialAction::Cascade => "cascade",
+        ReferentialAction::SetNull => "setnull",
+        ReferentialAction::SetDefault => "setdefault",
+    }
+}
+
+/// [`referential_action_token`] の逆変換。語彙外のトークンは fail-closed に
+/// `Err` とする（decode 経路・軽量パーサーの双方が使う共有パーサー）。
+fn parse_referential_action_token(token: &str) -> std::result::Result<ReferentialAction, String> {
+    match token {
+        "noaction" => Ok(ReferentialAction::NoAction),
+        "cascade" => Ok(ReferentialAction::Cascade),
+        "setnull" => Ok(ReferentialAction::SetNull),
+        "setdefault" => Ok(ReferentialAction::SetDefault),
+        other => Err(format!(
+            "malformed foreign key referential action: {other:?}"
+        )),
+    }
 }
 
 /// カンマ区切りの識別子リスト（`fk:` 行の列リスト）を構造検証しつつ読み取る。
@@ -3267,11 +3431,37 @@ fn parse_foreign_key_section<'a>(
         let body = line
             .strip_prefix("fk:")
             .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-        let mut fields = body.split(':');
-        let (Some(columns_field), Some(parent_table), Some(parent_columns_field), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(format!("malformed foreign key line: {line:?}"));
+        // 参照アクション（Issue #1076）: 両方 `NO ACTION` の宣言は 3 フィールド、
+        // どちらかがそれ以外なら 5 フィールドで永続化する（[`encode_foreign_key_section`]
+        // 参照）。フィールド数が 3 でも 5 でもない行は fail-closed に拒否する。
+        let fields: Vec<&str> = body.split(':').collect();
+        let (columns_field, parent_table, parent_columns_field, on_delete, on_update) = match fields
+            .as_slice()
+        {
+            [c, p, pc] => (
+                *c,
+                *p,
+                *pc,
+                ReferentialAction::NoAction,
+                ReferentialAction::NoAction,
+            ),
+            [c, p, pc, od, ou] => {
+                let on_delete = parse_referential_action_token(od)?;
+                let on_update = parse_referential_action_token(ou)?;
+                if on_delete == ReferentialAction::NoAction
+                    && on_update == ReferentialAction::NoAction
+                {
+                    // 正規形の一意性: 両方 `noaction` は 3 フィールド形でのみ
+                    // 表現する契約（[`encode_foreign_key_section`]）。この形が
+                    // 現れるのは手動改変・旧実装のバグ等の不正な値であり
+                    // fail-closed に拒否する。
+                    return Err(format!(
+                            "malformed foreign key line (both actions are noaction but encoded in the 5-field form): {line:?}"
+                        ));
+                }
+                (*c, *p, *pc, on_delete, on_update)
+            }
+            _ => return Err(format!("malformed foreign key line: {line:?}")),
         };
         let columns = parse_foreign_key_column_list(columns_field, line)?;
         validate_identifier(parent_table)
@@ -3293,7 +3483,13 @@ fn parse_foreign_key_section<'a>(
         if columns.len() != parent_columns.len() {
             return Err(format!("foreign key column count mismatch: {line:?}"));
         }
-        let fk = ForeignKeyDef::new(columns, parent_table.to_string(), parent_columns);
+        let fk = ForeignKeyDef::new(
+            columns,
+            parent_table.to_string(),
+            parent_columns,
+            on_delete,
+            on_update,
+        );
         if fk
             .parent_columns
             .iter()
@@ -3304,7 +3500,10 @@ fn parse_foreign_key_section<'a>(
                 "the id column can only be referenced alone: {line:?}"
             ));
         }
-        if foreign_keys.contains(&fk) {
+        if foreign_keys
+            .iter()
+            .any(|other: &ForeignKeyDef| other.same_target(&fk))
+        {
             return Err("duplicate foreign key declaration".to_string());
         }
         foreign_keys.push(fk);
@@ -8817,6 +9016,24 @@ mod tests {
             columns.iter().map(|c| c.to_string()).collect(),
             parent.to_string(),
             parent_columns.iter().map(|c| c.to_string()).collect(),
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )
+    }
+
+    fn fk_with_actions(
+        columns: &[&str],
+        parent: &str,
+        parent_columns: &[&str],
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
+    ) -> ForeignKeyDef {
+        ForeignKeyDef::new(
+            columns.iter().map(|c| c.to_string()).collect(),
+            parent.to_string(),
+            parent_columns.iter().map(|c| c.to_string()).collect(),
+            on_delete,
+            on_update,
         )
     }
 
@@ -8872,6 +9089,122 @@ mod tests {
         assert!(matches!(
             encode_schema(&unresolved),
             Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 参照アクション（Issue #1076）: `NO ACTION` だけの FK は v8 の 3 フィールド
+    /// 形のままバイト列が不変（既存ゴールデンテストとの互換）。どちらかが
+    /// `NO ACTION` 以外なら 5 フィールド形で永続化し、往復でビット同一に戻る。
+    #[test]
+    fn encode_decode_roundtrips_v8_with_referential_actions() {
+        let schema = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![fk_with_actions(
+            &["parent_id"],
+            "parents",
+            &["id"],
+            ReferentialAction::Cascade,
+            ReferentialAction::SetNull,
+        )]);
+        let encoded = encode_schema(&schema).expect("encode");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert_eq!(
+            text,
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:cascade:setnull\n"
+        );
+        assert_eq!(decode_schema("children", &encoded).expect("decode"), schema);
+
+        // 両方 `NO ACTION` は 3 フィールド形のまま（バイト列不変）。
+        let no_action = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![fk(&["parent_id"], "parents", &["id"])]);
+        let encoded_no_action = encode_schema(&no_action).expect("encode");
+        assert_eq!(
+            std::str::from_utf8(&encoded_no_action).expect("utf8"),
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\nfks:1\nfk:parent_id:parents:id\n"
+        );
+
+        // 5 フィールド形で両方 `noaction` は正規形の一意性違反として拒否する。
+        let malformed = "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+                          fks:1\nfk:parent_id:parents:id:noaction:noaction\n";
+        assert!(decode_schema("children", malformed.as_bytes()).is_err());
+
+        // 語彙外トークン・4/6 フィールドは fail-closed に拒否する。
+        for corrupt in [
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:bogus:noaction\n",
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:cascade\n",
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:cascade:setnull:extra\n",
+        ] {
+            assert!(
+                decode_schema("children", corrupt.as_bytes()).is_err(),
+                "must reject {corrupt:?}"
+            );
+        }
+
+        // 構造は同じでアクションだけが異なる重複宣言は拒否する（A14）。
+        let dup_actions = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![
+            fk(&["parent_id"], "parents", &["id"]),
+            fk_with_actions(
+                &["parent_id"],
+                "parents",
+                &["id"],
+                ReferentialAction::Cascade,
+                ReferentialAction::NoAction,
+            ),
+        ]);
+        assert!(matches!(
+            encode_schema(&dup_actions),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 参照アクション宣言時検査（Issue #1076 A8）: 常に失敗する宣言を拒否する。
+    #[test]
+    fn validate_foreign_keys_rejects_impossible_referential_action_declarations() {
+        // (a) SET NULL だが参照元列が NOT NULL。
+        let set_null_not_null = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, false)],
+        )
+        .with_foreign_keys(vec![fk_with_actions(
+            &["parent_id"],
+            "parents",
+            &["id"],
+            ReferentialAction::SetNull,
+            ReferentialAction::NoAction,
+        )]);
+        assert!(matches!(
+            encode_schema(&set_null_not_null),
+            Err(CatalogError::InvalidForeignKey(_))
+        ));
+
+        // (b) SET DEFAULT だが参照元列が NOT NULL かつ DEFAULT 無し。
+        let set_default_no_default = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, false)],
+        )
+        .with_foreign_keys(vec![fk_with_actions(
+            &["parent_id"],
+            "parents",
+            &["id"],
+            ReferentialAction::NoAction,
+            ReferentialAction::SetDefault,
+        )]);
+        assert!(matches!(
+            encode_schema(&set_default_no_default),
+            Err(CatalogError::InvalidForeignKey(_))
         ));
     }
 

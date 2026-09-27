@@ -1951,7 +1951,11 @@ pub(crate) fn fill_omitted_columns(
 /// （`catalog::ColumnDefault::compatible_with`。`validate_schema` 経由で
 /// 既に検証済み）が型の大分類の整合を保証するが、数値の精度・範囲検証は
 /// 既存の `INSERT` リテラル束縛ヘルパーへ委譲し、第 2 の実装を作らない。
-fn bind_column_default(
+///
+/// `pub(crate)`: `crate::constraint`（`FOREIGN KEY` の `SET DEFAULT` 参照
+/// アクション〔Issue #1076〕が、子行の FK 列を列 `DEFAULT` へ書き換える際に
+/// 同じ束縛ロジックを共有する）からも呼ばれる。
+pub(crate) fn bind_column_default(
     column: &ColumnDef,
     default: &ColumnDefault,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {

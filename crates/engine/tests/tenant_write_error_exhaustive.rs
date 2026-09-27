@@ -45,6 +45,7 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
         TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
         TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
+        TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
         TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
     }
 }
@@ -69,6 +70,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::TooManyRowsScanned,
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
+        TenantWriteError::ReferentialActionLimitExceeded,
         TenantWriteError::CheckViolation {
             constraint: "test_check".to_string(),
         },

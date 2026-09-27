@@ -3661,6 +3661,12 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         TenantWriteError::TooManyRowsScanned => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
+        // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
+        // Issue #1076）の連鎖が深さ・行数の上限を超えた。`_` 節（`XX000`）へ丸めると
+        // クライアントが上限超過をサーバー内部事象と取り違える。
+        TenantWriteError::ReferentialActionLimitExceeded => {
+            SqlSurfaceError::payload_too_large("referential action limit exceeded")
+        }
         // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
         // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
         TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {
@@ -4335,6 +4341,12 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // （`XX000`）へ丸めない。
         IncrementalError::Write(TenantWriteError::ForeignKeyViolation) => {
             SqlSurfaceError::ForeignKeyViolation
+        }
+        // 参照アクション（Issue #1076）の連鎖上限超過。行形 INSERT
+        // （[`map_write_error`]）と同じ `54000` へ写像し、`_` 節（`XX000`）へ
+        // 丸めない。
+        IncrementalError::Write(TenantWriteError::ReferentialActionLimitExceeded) => {
+            SqlSurfaceError::payload_too_large("referential action limit exceeded")
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

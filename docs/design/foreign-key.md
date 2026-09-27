@@ -16,7 +16,7 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | D2 | 参照先列の省略（`REFERENCES <t>`）は参照先の主キー、未宣言なら `id` へ解決し、解決済みの列名をカタログへ永続化する | PostgreSQL と同じ規約。解決結果を永続化することで、後から参照先が変わっても宣言の意味が変わらない |
 | D3 | 参照元列と参照先列の型は位置ごとに一致すること（型タグ＋パラメータ。ENUM は型名を含む）。`id` 参照の参照元列は `INTEGER`／`BIGINT`。不一致は `42830` | 参照先の照合を一意性検査と同じ型タグ付き正準キーで行うため、型が異なる組は常に違反になる（黙って常に失敗する宣言を受理しない） |
 | D4 | SQL 表層 `CREATE TABLE` の列型へ `INTEGER`／`BIGINT` を追加（`NOT NULL`／`DEFAULT <数値>`／`UNIQUE`／`PRIMARY KEY` も受理） | `id` を参照する参照元列を SQL で宣言するための最小限の前提整備 |
-| D5 | 参照動作は既定の `NO ACTION`（非遅延のため `RESTRICT` と同値）のみ。`ON DELETE`／`ON UPDATE` には `NO ACTION`／`RESTRICT` だけを受理し、`CASCADE`／`SET NULL`／`SET DEFAULT`・`MATCH`・`DEFERRABLE`・`CONSTRAINT <name>` 前置は `42601` | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
+| D5 | ~~参照動作は既定の `NO ACTION` のみ~~（Issue #1076 で改訂。D13〜参照）。`MATCH`・`DEFERRABLE`・`CONSTRAINT <name>` 前置は引き続き `42601` | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
 | D6 | NULL を含む値の組は検査しない（MATCH SIMPLE） | PostgreSQL の既定 |
 | D7 | 検査は文単位・即時。台帳記録・行の書き込みの**後**、テーブル世代 bump・commit の**前**に同一 write トランザクション内で行う | 既存の制約検査（TABLE-16）と同じ位置。`operation_id` の再送判定（`23505`／`22023`）が本検査より優先される |
 | D8 | 自己参照を受理する。循環参照は `CREATE TABLE` の時点で参照先が存在する必要があり、`ALTER TABLE ... ADD FOREIGN KEY` を持たないため、自己参照以外の循環は構造的に作れない | 自己参照は参照元＝参照先のスキーマで解決・検査でき、特別な経路を要さない |
@@ -24,6 +24,22 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | D10 | 参照先テーブルの `DROP TABLE` は他テーブルから参照されていれば `2BP01`（データの有無を問わずカタログのみで判定）。自己参照は依存に数えない | TABLE-15 |
 | D11 | 参照元列の `DROP COLUMN` は `DependentObjectsStillExist` で拒否。参照先側の列は主キー・UNIQUE 構成列（既存の検査で拒否済み）か `id`（予約列）に限られる | `DROP CONSTRAINT` を持たないため、制約を黙って消す暗黙 cascade を作らない |
 | D12 | 宣言面は SQL 表層の `CREATE TABLE` のみ（`ALTER TABLE ... ADD COLUMN ... REFERENCES` は `42601`）。Rust API の `TableSchema::with_foreign_keys` は `pub(crate)` | 後付けの宣言は既存の全テナント行の検証を要し別設計になる |
+
+### 参照アクション（Issue #1076・TASK-205 拡張）
+
+以下は `docs/spec/04-behavior/data-model.md` TABLE-17 の現在の記述範囲を超える、
+本リポ側の拡張として実装した（spec 側の記述更新はスコープ外としてユーザーへ
+別途報告する。spec 本文・記述内容は転記しない）。
+
+| # | 決定 | 理由 |
+| --- | ---- | ---- |
+| D13 | `ON DELETE`／`ON UPDATE` は `NO ACTION`・`RESTRICT`（`NoAction` へ正規化）・`CASCADE`・`SET NULL`・`SET DEFAULT` を受理する。列リスト形の `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`・`MATCH`・`DEFERRABLE`・`CONSTRAINT <name>` は引き続き `42601` | PostgreSQL の基本形に揃えつつ、対応しない形は fail-closed に拒否する |
+| D14 | 実行順序: (1) 参照アクションを再帰的にすべて適用する → (2) 元の文の対象テーブルと連鎖で変更した各テーブルについて、それを参照する全 FK（アクションを問わない）の事後状態検証（既存の `NO ACTION` 検証）を行う。`RESTRICT` は `NO ACTION` と区別して永続化せず、両方とも (2) の文末検証に統一する（PG は `RESTRICT` を即時検査するため、本実装は PG が拒否する一部の文を受理しうる既知の差分がある） | PG の `NO ACTION` が文末に検査される意味論に合わせつつ、アクション実装の不具合があっても最終状態の参照整合性を fail-closed な最終防御として保証する |
+| D15 | `TRUNCATE` は参照アクションを発火させない（`ReferencedRowsChange::Truncated`。事後検証のみ行う） | PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを発火させない（`TRUNCATE ... CASCADE` は別構文で未対応のまま） |
+| D16 | 宣言時検査（`42830`）: (a) `SET NULL` で参照元列に `NOT NULL` の列がある、(b) `SET DEFAULT` で参照元列に「`DEFAULT` 無し・`NOT NULL`」の列がある、(c) `ON UPDATE CASCADE` で参照元列が `NOT NULL` なのに参照先列が nullable、のいずれも拒否する | `ALTER` で FK 列の nullability・`DEFAULT` を変える経路が無いため、宣言時検査が恒久的に有効であり続ける |
+| D17 | 連鎖の深さ・1 文あたりの対象行数に実装既定の上限（`constraint::MAX_REFERENTIAL_ACTION_DEPTH`＝16・`MAX_REFERENTIAL_ACTION_ROWS`＝10,000。spec 由来ではない）を設け、超過は `TenantWriteError::ReferentialActionLimitExceeded`（`54000`）で副作用ゼロに拒否する | 永続索引を持たないテナント範囲走査の再帰であり、無制限だと DoS になり得る（coding-rust.md「不安全な設計」） |
+| D18 | FK の重複判定は構造（`columns`・`parent_table`・`parent_columns`）のみで行い、アクションの違いは無視する（`ForeignKeyDef::same_target`） | 同じ列の組に矛盾するアクションを 2 つ宣言できる抜け穴を塞ぐ |
+| D19 | カタログ v8 の `fk:` 行は、両アクションが `NoAction` の場合は従来の 3 フィールド形のままバイト列を変えず、どちらかが `NoAction` 以外の場合のみ `fk:<cols>:<parent>:<pcols>:<on_delete>:<on_update>` の 5 フィールド形で永続化する（トークンは `noaction\|cascade\|setnull\|setdefault` の閉じた語彙）。バージョンは v9 を新設せず v8 のまま拡張する | 既存 v8 ゴールデンテスト・カタログ後方互換を保ちつつ、アクションは既存 `fks:` セクションの属性として素直に表現できる |
 
 ## 構文
 
@@ -34,8 +50,12 @@ CREATE TABLE <table> (
   [, ...]
 ) [;]
 
-<参照動作> ::= ON DELETE (NO ACTION | RESTRICT) | ON UPDATE (NO ACTION | RESTRICT)
+<参照動作> ::= ON DELETE <アクション> | ON UPDATE <アクション>
+<アクション> ::= NO ACTION | RESTRICT | CASCADE | SET NULL | SET DEFAULT
 ```
+
+`SET NULL`／`SET DEFAULT` の列リスト形（`SET NULL (col, ...)`）・`MATCH`・
+`DEFERRABLE`・`CONSTRAINT <name>` 前置は未実装のまま `42601`（D13）。
 
 - 列制約 `REFERENCES` は `PRIMARY KEY` の後ろ・`CHECK` の前に高々 1 個置ける。
 - 表制約は列リスト中の任意の位置に置ける（列数上限の判定対象外。`PRIMARY KEY`／
@@ -51,9 +71,13 @@ CREATE TABLE <table> (
 1 件以上持つスキーマはカタログ v8 で永続化する。v8 は v7 の上位集合で、`pk:` 行・
 6 フィールドの列行・`uniq:` セクション（0 件可）・`checks:` セクション（v8 に限り
 0 件可）の後ろに `fks:<n>`（`n >= 1`）と `n` 行の
-`fk:<col1,col2,...>:<parent_table>:<pcol1,pcol2,...>` を追記する。`FOREIGN KEY` を
-持たないスキーマは従来どおり v2〜v7 のままバイト列を変えない（v2〜v8 は互いに
-排他な正規形）。
+`fk:<col1,col2,...>:<parent_table>:<pcol1,pcol2,...>`（両アクションが `NO ACTION`
+の場合。D19）または
+`fk:<col1,col2,...>:<parent_table>:<pcol1,pcol2,...>:<on_delete>:<on_update>`
+（それ以外。トークンは `noaction|cascade|setnull|setdefault`）を追記する。
+`FOREIGN KEY` を持たないスキーマは従来どおり v2〜v7 のままバイト列を変えない
+（v2〜v8 は互いに排他な正規形）。参照アクション（Issue #1076）は v9 を新設せず
+既存 v8 の `fk:` 行を拡張する形で永続化する（D19）。
 
 - decode は構造（件数・フィールド数・識別子形状・重複・列数一致・`id` 単独）を
   共有パーサー（`parse_foreign_key_section`）で検証し、参照元列の実在・型・
@@ -92,6 +116,27 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   ため母集合に含まれる（`BEGIN; INSERT 親; INSERT 子; COMMIT` が成立する）。
 - エラーは `TenantWriteError::ForeignKeyViolation` 単一 variant（参照元側・参照先側の
   いずれの原因も区別しない固定文言）。
+
+### 参照アクションの適用（Issue #1076）
+
+`enforce_referencing_rows_in_txn` の内部で、事後検証（上記）の**前**に
+`constraint::propagate_referential_actions` が連鎖を適用する（D14）。
+
+- 対象特定: `ON DELETE` は事後状態（削除済みの参照先）に存在しなくなった参照元
+  キーを持つ子行、`ON UPDATE` は呼び出し元が書き込み前に捕捉した
+  `constraint::UpdatedKeyPreImages`（更新前の全列値）と現在の参照先行を突き合わせて
+  「旧キー→新キー」が変わった子行を特定する。`id` 参照は `ON UPDATE` で発火しない
+  （`id` 疑似列は不変）。
+- 適用: `CASCADE`（`ON DELETE` は子行を削除、`ON UPDATE` は子の FK 列を新キー値へ
+  書き換え）・`SET NULL`（FK 列を `NULL` に）・`SET DEFAULT`（FK 列をそれぞれの列
+  `DEFAULT`、無ければ `NULL` に）。書き換えた子行は直ちに
+  `enforce_row_constraints_in_txn`（`CHECK` → UNIQUE → 子自身の FK 参照元側）で
+  再検証し、テーブル世代も bump する（TABLE-16 の単一検査点を再利用）。
+- 再帰: 子テーブル自身がさらに親であれば同じ経路で孫段へ連鎖する（`depth` を
+  1 段ずつ進め、上限は D17）。自己参照では親役・子役で同じ行ストアハンドルを
+  同時に持たないよう、走査（読み取り専用ハンドル）→ 適用（書き込みハンドル）→
+  次段の再帰、の順に厳密に分離する（redb の `TableAlreadyOpen` 回避）。
+- `TRUNCATE` は連鎖を起こさない（D15）。
 
 ### 計算量（既知の制約）
 
@@ -151,6 +196,12 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
 - `ValidatedCreateTable.foreign_keys`（公開フィールド追加）・
   `catalog::ForeignKeyDef`（公開型）・`TableSchema::foreign_keys()`
 - SQL 表層 `CREATE TABLE` が `INTEGER`／`BIGINT` 列を受理するようになった
+- **Issue #1076 の破壊的変更**: `TenantWriteError::ReferentialActionLimitExceeded`
+  （新 variant。`54000`）の追加、`catalog::ReferentialAction`（公開型）・
+  `ForeignKeyDef::on_delete()`／`on_update()`（公開メソッド）の追加、`ON DELETE`／
+  `ON UPDATE` に `CASCADE`／`SET NULL`／`SET DEFAULT` を宣言できるようになったこと
+  （従来 `42601` だった宣言が受理される）、カタログ v8 `fk:` 行の 5 フィールド形は
+  旧バイナリでは読めない（decode 時に `CorruptSchema` として拒否される）
 
 いずれの enum も `#[non_exhaustive]` ではない
 （`docs/design/error-enum-non-exhaustive-policy.md`）ため、外部クレートの網羅
@@ -162,12 +213,21 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
 `insert`／`update`／`delete` op は同じ単一検査点を通るため `23503`／409 は到達する
 （`crates/wire-server/docs/nosql-api.md`・`crates/wire-server/tests/
 err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）。
+NoSQL `create_table` の `foreign_key` 制約（`build_constraint_tokens`）は
+`ON DELETE`／`ON UPDATE` トークンを一切生成しないため、NoSQL 表層から宣言した
+`FOREIGN KEY` は常に `NO ACTION`（Issue #1076 のスコープ外。後続課題）。SQL 表層で
+参照アクションを宣言したテーブルに対する `delete`／`update` op は、宣言側と同じ
+単一検査点（`constraint` モジュール）を通るため連鎖が発火し、上限超過は `54000`／
+413 として到達する。
 
 ## 対象外・後続候補
 
 - `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要）
-- `ON DELETE CASCADE`／`SET NULL`／`SET DEFAULT`、遅延制約（`DEFERRABLE`）、
-  `MATCH FULL`、制約名（`CONSTRAINT <name> FOREIGN KEY`）
+- 遅延制約（`DEFERRABLE`）、`MATCH FULL`、制約名（`CONSTRAINT <name> FOREIGN KEY`）
+- `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`（列リスト形。Issue #1076）
+- `TRUNCATE ... CASCADE`（`TRUNCATE` 自体は参照アクションを発火させない。D15）
+- `RESTRICT` を `NO ACTION` と区別して永続化し即時検査すること（現状は両方とも
+  文末の事後検証に統一。既知の差分として D14 の理由欄に記録）
 - 参照先側・列参照の検査の索引化（現状はテナント範囲の線形走査）
 - 明示トランザクション内の `UPDATE`／`DELETE`（明示トランザクション自体が未対応。
   `docs/design/explicit-transaction.md`）

@@ -365,6 +365,14 @@ pub enum TenantWriteError {
     /// テーブル名・参照先の有無の理由（不在なのか他テナント所有なのか）を一切
     /// 含まない固定文言（RLS-9・RLS-10 (c)。security.md P0）。
     ForeignKeyViolation,
+    /// `FOREIGN KEY` の参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`。
+    /// Issue #1076）の連鎖が、実装既定の上限（連鎖の深さ・1 文あたりの連鎖対象
+    /// 行数。いずれも spec 由来ではない実装値。`crate::constraint` モジュール
+    /// ドキュメント参照）を超えた。`54000`（`PayloadTooLarge`）へ写像し、
+    /// `write_txn` は commit しない（行・台帳とも痕跡ゼロ）。`Display`／`Debug`
+    /// は上限値のみを含む固定文言（テナント・値・テーブル名は含めない。
+    /// RLS-9・security.md P0）。
+    ReferentialActionLimitExceeded,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得（[`Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。`Storage(StorageError::WriteLockTimeout)` へ一般化せず
@@ -479,6 +487,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
             TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
             TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
+            TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
         }
     }
@@ -538,6 +547,14 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::ForeignKeyViolation => {
                 write!(f, "foreign key constraint violation")
             }
+            TenantWriteError::ReferentialActionLimitExceeded => {
+                write!(
+                    f,
+                    "referential action limit exceeded: depth={}, rows={}",
+                    crate::constraint::MAX_REFERENTIAL_ACTION_DEPTH,
+                    crate::constraint::MAX_REFERENTIAL_ACTION_ROWS
+                )
+            }
             TenantWriteError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -576,6 +593,9 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed => f.write_str("CheckEvaluationFailed"),
             TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
+            TenantWriteError::ReferentialActionLimitExceeded => {
+                f.write_str("ReferentialActionLimitExceeded")
+            }
             TenantWriteError::WriteLockTimeout => f.write_str("WriteLockTimeout"),
         }
     }
@@ -1547,6 +1567,10 @@ pub(crate) fn upsert_typed_rows_unchecked(
         // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
         // `constraint.rs` モジュールドキュメント参照）。
         let mut written_ids: Vec<u64> = Vec::new();
+        // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+        // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
+        // 積む（新規挿入行は「更新」ではないため対象外）。
+        let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         for (id, values) in rows {
             let key = (ctx.tenant_id(), *id);
             // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
@@ -1595,6 +1619,14 @@ pub(crate) fn upsert_typed_rows_unchecked(
                         let mut merged_values =
                             crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
                                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                        // 書き換える前の全列値を ON UPDATE 連鎖の pre-image として
+                        // 積む（Issue #1076）。`id` 参照 FK は ON UPDATE で発火
+                        // しない（A7）ため、主キー・UNIQUE を宣言しないテーブルは
+                        // 複製コストを払わない（早期 return と同じ判定条件）。
+                        if schema.primary_key().is_some() || !schema.unique_constraints().is_empty()
+                        {
+                            pre_images.record(*id, merged_values.clone());
+                        }
                         let mut embedding_value: Vec<f32> = existing.embedding.clone();
 
                         for (col_idx, value) in assignments.iter() {
@@ -1727,6 +1759,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
                     &schema,
                     ctx.tenant_id(),
                     crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+                    Some(&pre_images),
                 )?;
             }
         }
@@ -1790,6 +1823,9 @@ pub(crate) fn update_row_unchecked(
         return Err(TenantWriteError::Forbidden);
     }
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
+    // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+    // 全列置換は参照先キーを変え得るため、既存行の全列値を書き換える前に捕捉する。
+    let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
@@ -1823,7 +1859,32 @@ pub(crate) fn update_row_unchecked(
             Some(guard) => {
                 let (existing_tenant, _existing_visibility) =
                     decode_row_tenant_and_visibility(guard.value())?;
-                ctx.is_owner(existing_tenant)
+                if ctx.is_owner(existing_tenant) {
+                    // 上書きする前の全列値を ON UPDATE 連鎖の pre-image として
+                    // 積む（Issue #1076）。所有者判定が確定した後にのみフル
+                    // デコードを試みる（`update_row_columns_unchecked` と同じ
+                    // 「不可視・不存在は内容に触れない」設計）。デコード失敗
+                    // （テスト専用の生 API 等が投入した非正規メタデータ）は
+                    // 全列置換自体の成否には影響させず、この行を pre-image 無し
+                    // として扱う（ON UPDATE アクションは発火しないが、事後検証
+                    // 〔NO ACTION 相当〕は変わらず有効なため fail-open にはならない）。
+                    // `id` 参照 FK は ON UPDATE で発火しない（A7）ため、主キー・
+                    // UNIQUE を宣言しないテーブルはこのデコードを一切行わない。
+                    if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
+                        if let Ok(existing) =
+                            crate::storage::decode_row_for_key(ctx.tenant_id(), id, guard.value())
+                        {
+                            if let Ok(old_values) =
+                                crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+                            {
+                                pre_images.record(id, old_values);
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
             }
             None => false,
         };
@@ -1855,6 +1916,7 @@ pub(crate) fn update_row_unchecked(
             &schema_for_pk,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::AllColumnsReplaced,
+            Some(&pre_images),
         )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -2370,7 +2432,11 @@ fn validate_set_assignments(
 /// 先勝ち（`overrides` の宣言順走査で最初に一致した SET 値を採用）になる。
 /// 旧・述語つき UPDATE 実装は独自ループで後勝ちだったが、本関数への統一
 /// （Issue #996）により単一行 UPDATE と同じ意味論に揃った。
-fn merge_row_for_update(
+///
+/// `pub(crate)`: `crate::constraint`（`FOREIGN KEY` の参照アクション
+/// `CASCADE`／`SET NULL`／`SET DEFAULT` の適用〔Issue #1076〕）からも、子行の
+/// FK 列を書き換える read-merge-write の本体として呼ばれる。
+pub(crate) fn merge_row_for_update(
     schema: &crate::catalog::TableSchema,
     existing: crate::storage::Row,
     assignments: &[(usize, crate::row_codec::Value)],
@@ -2584,6 +2650,8 @@ pub(crate) fn update_row_columns_unchecked(
         // 一方、「不可視な既存行」と「不存在な行」はいずれも `UPDATE 0`・
         // 内容無参照で完全に同一になる。詳細は
         // `docs/design/update-single-row.md`「判断 D」参照。
+        // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+        let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         rows_affected = match visible_row {
             Some(row) => {
                 // read-merge-write 本体は述語つき UPDATE
@@ -2595,6 +2663,21 @@ pub(crate) fn update_row_columns_unchecked(
                 // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
                 // 既存値をそのまま維持する。
                 let visibility = row.visibility;
+                // 書き換える前の全列値を pre-image として積む（`row` は直後の
+                // `merge_row_for_update` へ move するため先に読む）。デコード失敗は
+                // ここでは無視する（本来のデコードエラー分類は直後の
+                // `merge_row_for_update` が引き続き担い、`CorruptSchema` へ正しく
+                // 写像される。pre-image はベストエフォートで、無くても ON UPDATE
+                // アクションが発火しないだけで事後検証は変わらず有効）。`id` 参照
+                // FK は ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を宣言
+                // しないテーブルはこのデコードを一切行わない。
+                if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
+                    if let Ok(old_values) =
+                        crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                    {
+                        pre_images.record(id, old_values);
+                    }
+                }
                 let (embedding, metadata) = merge_row_for_update(&schema, row, assignments)?;
                 let row_input = RowInput {
                     tenant_id: ctx.tenant_id(),
@@ -2636,6 +2719,7 @@ pub(crate) fn update_row_columns_unchecked(
                 &schema,
                 ctx.tenant_id(),
                 crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+                Some(&pre_images),
             )?;
         }
     }
@@ -2927,6 +3011,7 @@ fn delete_row_impl(
             &schema,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
+            None,
         )?;
     }
     // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
@@ -3326,6 +3411,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
             &schema,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
+            None,
         )
         .map_err(dml_write_err)?;
     }
@@ -3423,6 +3509,8 @@ pub(crate) fn update_rows_where_unchecked<E>(
         });
     }
 
+    // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+    let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
     {
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
@@ -3449,6 +3537,19 @@ pub(crate) fn update_rows_where_unchecked<E>(
                 }
             };
             let visibility = existing.visibility;
+            // 書き換える前の全列値を pre-image として積む（`existing` は直後の
+            // `merge_row_for_update` へ move するため先に読む）。デコード失敗は
+            // ここでは無視する（本来のデコードエラー分類は直後の
+            // `merge_row_for_update` が引き続き担う。pre-image はベストエフォート）。
+            // `id` 参照 FK は ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を
+            // 宣言しないテーブルはこのデコードを一切行わない。
+            if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
+                if let Ok(old_values) =
+                    crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+                {
+                    pre_images.record(*id, old_values);
+                }
+            }
 
             // read-merge-write 本体は単一行 UPDATE
             // （`update_row_columns_unchecked`）と共有する
@@ -3492,6 +3593,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
             &schema,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+            Some(&pre_images),
         )
         .map_err(dml_write_err)?;
     }
@@ -3541,12 +3643,15 @@ pub(crate) fn truncate_table_unchecked(
         // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）
         // の参照先側の検査。自テナントの参照元行が 1 件でも残れば `23503`（他テナントの
         // 行は削除も走査もしないため、他テナントの参照元行の有無は結果に影響しない）。
+        // `TRUNCATE` は参照アクション（Issue #1076 A4）を発火させないため
+        // `Truncated`（`Removed` とは異なり連鎖を起こさない）を渡す。
         crate::constraint::enforce_referencing_rows_in_txn(
             write_txn,
             table,
             &schema,
             tenant,
-            crate::constraint::ReferencedRowsChange::Removed,
+            crate::constraint::ReferencedRowsChange::Truncated,
+            None,
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -3894,6 +3999,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
             &schema_for_fk,
             ctx.tenant_id(),
             crate::constraint::ReferencedRowsChange::Removed,
+            None,
         )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
