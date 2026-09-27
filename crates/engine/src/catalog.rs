@@ -470,12 +470,14 @@ const CATALOG_FORMAT_VERSION_V7: &str = "v7";
 /// （v2〜v8 は互いに排他な正規形）。
 const CATALOG_FORMAT_VERSION_V8: &str = "v8";
 
-/// カタログ v9（TABLE-17・TASK-205、Issue #1077）: `FOREIGN KEY` 制約のうち
-/// 1 件以上が既定以外の `MATCH`（`Full`）・遅延属性（`NotDeferrable` 以外）を
-/// 持つスキーマ専用のフォーマット。v8 の上位集合で、本体（`pk:` 行・6 フィールド
-/// 列行・`uniq:`／`checks:` セクション）は同一のまま、`fks:` セクションの `fk:` 行を
-/// `<col1,...>:<parent_table>:<pcol1,...>:<match>:<deferral>` の 5 フィールドに
-/// 拡張する（`match` は `simple`／`full`、`deferral` は `immediate`
+/// カタログ v9（TABLE-17・TASK-205、Issue #1076／#1077）: `FOREIGN KEY` 制約の
+/// うち 1 件以上が既定以外の参照アクション（`NO ACTION` 以外）・`MATCH`
+/// （`Full`）・遅延属性（`NotDeferrable` 以外）を持つスキーマ専用のフォーマット。
+/// v8 の上位集合で、本体（`pk:` 行・6 フィールド列行・`uniq:`／`checks:`
+/// セクション）は同一のまま、`fks:` セクションの `fk:` 行を
+/// `<col1,...>:<parent_table>:<pcol1,...>:<on_delete>:<on_update>:<match>:<deferral>`
+/// の 7 フィールドに拡張する（`on_delete`／`on_update` は `noaction`／`cascade`／
+/// `setnull`／`setdefault`、`match` は `simple`／`full`、`deferral` は `immediate`
 /// 〔`NotDeferrable`〕／`deferrable`〔`DeferrableInitiallyImmediate`〕／`deferred`
 /// 〔`DeferrableInitiallyDeferred`〕）。正規形の一意性を保つため、全 `FOREIGN KEY`
 /// が既定オプションのスキーマは v9 では書かず引き続き v8 のバイト列のまま
@@ -3401,8 +3403,9 @@ fn parse_check_section<'a>(
 /// 列名・テーブル名は `validate_identifier`（[`validate_schema`] 経由で検証済み）に
 /// より `:`／`,`／改行を含み得ないため、区切り文字と衝突しない。
 /// `include_options` は v9（[`CATALOG_FORMAT_VERSION_V9`]）選択時のみ `true` で、
-/// `fk:` 行を 5 フィールド（`MATCH`・遅延属性を含む）で書く。v8 は 3 フィールドの
-/// まま（既存のバイト列を変えない。TABLE-17・TASK-205、Issue #1077）。
+/// `fk:` 行を 7 フィールド（参照アクション・`MATCH`・遅延属性を含む）で書く。
+/// v8 は 3 フィールドのまま（既存のバイト列を変えない。TABLE-17・TASK-205、
+/// Issue #1076／#1077）。
 fn encode_foreign_key_section(
     out: &mut String,
     foreign_keys: &[ForeignKeyDef],
@@ -3711,10 +3714,11 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // セクションを追記するだけの上位集合。
         // `FOREIGN KEY` を持つスキーマは v8（TABLE-17・TASK-205、Issue #907）。
         // v8 は v7 と同じ本体・`uniq:`／`checks:` セクション（いずれも 0 件可）の
-        // 後ろに `fks:` セクションを追記するだけの上位集合。既定以外の `MATCH`・
-        // 遅延属性を 1 件でも持つスキーマは v9（[`CATALOG_FORMAT_VERSION_V9`]。
-        // TABLE-17・TASK-205、Issue #1077）——`fks:` セクションの `fk:` 行のみ
-        // 5 フィールドへ拡張する上位集合。
+        // 後ろに `fks:` セクションを追記するだけの上位集合。既定以外の参照
+        // アクション・`MATCH`・遅延属性を 1 件でも持つスキーマは v9
+        // （[`CATALOG_FORMAT_VERSION_V9`]。TABLE-17・TASK-205、Issue #1076／
+        // #1077）——`fks:` セクションの `fk:` 行のみ 7 フィールドへ拡張する
+        // 上位集合。
         out.push_str(if has_fk_options {
             CATALOG_FORMAT_VERSION_V9
         } else if has_fk {
@@ -3968,8 +3972,9 @@ fn decode_schema_body(
     // v7（TABLE-16・TASK-204、Issue #906）は v6 の上位集合（`pk:` 行・6 フィールド
     // 列行・`uniq:` セクション〔0 件可〕の後ろに `checks:` セクション）。
     // v8（TABLE-17・TASK-205、Issue #907）は v7 の上位集合（`checks:` セクション
-    // 〔0 件可〕の後ろに `fks:` セクション）。v9（TABLE-17・TASK-205、Issue #1077）は
-    // v8 の上位集合（`fks:` セクションの `fk:` 行のみ 5 フィールドへ拡張）。
+    // 〔0 件可〕の後ろに `fks:` セクション）。v9（TABLE-17・TASK-205、
+    // Issue #1076／#1077）は v8 の上位集合（`fks:` セクションの `fk:` 行のみ
+    // 7 フィールドへ拡張）。
     let has_default_field = matches!(
         format_version,
         FormatVersion::V5
@@ -5990,8 +5995,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // v8（TABLE-17・TASK-205、Issue #907）は v7 の上位集合で、`checks:`
         // セクション（0 件可）の後ろに `fks:` セクションを持つ。
         CATALOG_FORMAT_VERSION_V8 => (true, true),
-        // v9（TABLE-17・TASK-205、Issue #1077）は v8 の上位集合で、`fks:`
-        // セクションの `fk:` 行のみ 5 フィールドへ拡張する（下記で検証する）。
+        // v9（TABLE-17・TASK-205、Issue #1076／#1077）は v8 の上位集合で、
+        // `fks:` セクションの `fk:` 行のみ 7 フィールドへ拡張する（下記で検証する）。
         CATALOG_FORMAT_VERSION_V9 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(

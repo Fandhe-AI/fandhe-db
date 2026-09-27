@@ -22,7 +22,7 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | D2 | 参照先列の省略（`REFERENCES <t>`）は参照先の主キー、未宣言なら `id` へ解決し、解決済みの列名をカタログへ永続化する | PostgreSQL と同じ規約。解決結果を永続化することで、後から参照先が変わっても宣言の意味が変わらない |
 | D3 | 参照元列と参照先列の型は位置ごとに一致すること（型タグ＋パラメータ。ENUM は型名を含む）。`id` 参照の参照元列は `INTEGER`／`BIGINT`。不一致は `42830` | 参照先の照合を一意性検査と同じ型タグ付き正準キーで行うため、型が異なる組は常に違反になる（黙って常に失敗する宣言を受理しない） |
 | D4 | SQL 表層 `CREATE TABLE` の列型へ `INTEGER`／`BIGINT` を追加（`NOT NULL`／`DEFAULT <数値>`／`UNIQUE`／`PRIMARY KEY` も受理） | `id` を参照する参照元列を SQL で宣言するための最小限の前提整備 |
-| D5 | ~~参照動作は既定の `NO ACTION` のみ~~（Issue #1076 で改訂。D13〜参照）。`CONSTRAINT <name>` 前置は引き続き `42601`。`MATCH`（D13）・遅延属性（D14）は Issue #1077 で受理するようになった | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
+| D5 | ~~参照動作は既定の `NO ACTION` のみ~~（Issue #1076 で改訂。D16〜参照）。`CONSTRAINT <name>` 前置は引き続き `42601`。`MATCH`（D13）・遅延属性（D14）は Issue #1077 で受理するようになった | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
 | D6 | `MATCH SIMPLE`（既定）は NULL を含む値の組を検査しない。`MATCH FULL`（D13）は全 NULL の組のみ検査しない | PostgreSQL の既定 |
 | D7 | 検査は文単位・即時。台帳記録・行の書き込みの**後**、テーブル世代 bump・commit の**前**に同一 write トランザクション内で行う | 既存の制約検査（TABLE-16）と同じ位置。`operation_id` の再送判定（`23505`／`22023`）が本検査より優先される |
 | D8 | 自己参照を受理する。循環参照は `CREATE TABLE` の時点で参照先が存在する必要があり、`ALTER TABLE ... ADD FOREIGN KEY` を持たないため、自己参照以外の循環は構造的に作れない | 自己参照は参照元＝参照先のスキーマで解決・検査でき、特別な経路を要さない |
@@ -42,13 +42,13 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 
 | # | 決定 | 理由 |
 | --- | ---- | ---- |
-| D13 | `ON DELETE`／`ON UPDATE` は `NO ACTION`・`RESTRICT`（`NoAction` へ正規化）・`CASCADE`・`SET NULL`・`SET DEFAULT` を受理する。列リスト形の `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`・`MATCH`・`DEFERRABLE`・`CONSTRAINT <name>` は引き続き `42601` | PostgreSQL の基本形に揃えつつ、対応しない形は fail-closed に拒否する |
-| D14 | 実行順序: (1) 参照アクションを再帰的にすべて適用する → (2) 元の文の対象テーブルと連鎖で変更した各テーブルについて、それを参照する全 FK（アクションを問わない）の事後状態検証（既存の `NO ACTION` 検証）を行う。`RESTRICT` は `NO ACTION` と区別して永続化せず、両方とも (2) の文末検証に統一する（PG は `RESTRICT` を即時検査するため、本実装は PG が拒否する一部の文を受理しうる既知の差分がある） | PG の `NO ACTION` が文末に検査される意味論に合わせつつ、アクション実装の不具合があっても最終状態の参照整合性を fail-closed な最終防御として保証する |
-| D15 | `TRUNCATE` は参照アクションを発火させない（`ReferencedRowsChange::Truncated`。事後検証のみ行う） | PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを発火させない（`TRUNCATE ... CASCADE` は別構文で未対応のまま） |
-| D16 | 宣言時検査（`42830`）: (a) `SET NULL` で参照元列に `NOT NULL` の列がある、(b) `SET DEFAULT` で参照元列に「`DEFAULT` 無し・`NOT NULL`」の列がある、(c) `ON UPDATE CASCADE` で参照元列が `NOT NULL` なのに参照先列が nullable、のいずれも拒否する | `ALTER` で FK 列の nullability・`DEFAULT` を変える経路が無いため、宣言時検査が恒久的に有効であり続ける |
-| D17 | 連鎖の深さ・1 文あたりの対象行数に実装既定の上限（`constraint::MAX_REFERENTIAL_ACTION_DEPTH`＝16・`MAX_REFERENTIAL_ACTION_ROWS`＝10,000。spec 由来ではない）を設け、超過は `TenantWriteError::ReferentialActionLimitExceeded`（`54000`）で副作用ゼロに拒否する | 永続索引を持たないテナント範囲走査の再帰であり、無制限だと DoS になり得る（coding-rust.md「不安全な設計」） |
-| D18 | FK の重複判定は構造（`columns`・`parent_table`・`parent_columns`）のみで行い、アクション・`MATCH`・遅延属性の違いは無視する（`ForeignKeyDef::shares_reference_shape`） | 同じ列の組に矛盾するアクション・オプションを 2 つ宣言できる抜け穴を塞ぐ |
-| D19 | カタログ v8 の `fk:` 行は、参照アクション・`MATCH`・遅延属性のすべてが既定値の場合は従来の 3 フィールド形のままバイト列を変えず、いずれか 1 つでも既定値以外の場合のみ 7 フィールド形（D13・D14 の `MATCH`・遅延属性を含む。「永続化」節参照）でカタログ v9 として永続化する | 既存 v8 ゴールデンテスト・カタログ後方互換を保ちつつ、アクション・`MATCH`・遅延属性を単一のフォーマット拡張として素直に表現できる |
+| D16 | `ON DELETE`／`ON UPDATE` は `NO ACTION`・`RESTRICT`（`NoAction` へ正規化）・`CASCADE`・`SET NULL`・`SET DEFAULT` を受理する。列リスト形の `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`・`CONSTRAINT <name>` は引き続き `42601` | PostgreSQL の基本形に揃えつつ、対応しない形は fail-closed に拒否する |
+| D17 | 実行順序: (1) 参照アクションを再帰的にすべて適用する → (2) 元の文の対象テーブルと連鎖で変更した各テーブルについて、それを参照する全 FK（アクションを問わない）の事後状態検証（既存の `NO ACTION` 検証）を行う。`RESTRICT` は `NO ACTION` と区別して永続化せず、両方とも (2) の文末検証に統一する（PG は `RESTRICT` を即時検査するため、本実装は PG が拒否する一部の文を受理しうる既知の差分がある） | PG の `NO ACTION` が文末に検査される意味論に合わせつつ、アクション実装の不具合があっても最終状態の参照整合性を fail-closed な最終防御として保証する |
+| D18 | `TRUNCATE` は参照アクションを発火させない（`ReferencedRowsChange::Truncated`。事後検証のみ行う） | PostgreSQL の `TRUNCATE` も `ON DELETE` アクションを発火させない（`TRUNCATE ... CASCADE` は別構文で未対応のまま） |
+| D19 | 宣言時検査（`42830`）: (a) `SET NULL` で参照元列に `NOT NULL` の列がある、(b) `SET DEFAULT` で参照元列に「`DEFAULT` 無し・`NOT NULL`」の列がある、(c) `ON UPDATE CASCADE` で参照元列が `NOT NULL` なのに参照先列が nullable、のいずれも拒否する | `ALTER` で FK 列の nullability・`DEFAULT` を変える経路が無いため、宣言時検査が恒久的に有効であり続ける |
+| D20 | 連鎖の深さ・1 文あたりの対象行数に実装既定の上限（`constraint::MAX_REFERENTIAL_ACTION_DEPTH`＝16・`MAX_REFERENTIAL_ACTION_ROWS`＝10,000。spec 由来ではない）を設け、超過は `TenantWriteError::ReferentialActionLimitExceeded`（`54000`）で副作用ゼロに拒否する | 永続索引を持たないテナント範囲走査の再帰であり、無制限だと DoS になり得る（coding-rust.md「不安全な設計」） |
+| D21 | FK の重複判定は構造（`columns`・`parent_table`・`parent_columns`）のみで行い、アクション・`MATCH`・遅延属性の違いは無視する（`ForeignKeyDef::shares_reference_shape`） | 同じ列の組に矛盾するアクション・オプションを 2 つ宣言できる抜け穴を塞ぐ |
+| D22 | カタログ v8 の `fk:` 行は、参照アクション・`MATCH`・遅延属性のすべてが既定値の場合は従来の 3 フィールド形のままバイト列を変えず、いずれか 1 つでも既定値以外の場合のみ 7 フィールド形（D13・D14 の `MATCH`・遅延属性を含む。「永続化」節参照）でカタログ v9 として永続化する | 既存 v8 ゴールデンテスト・カタログ後方互換を保ちつつ、アクション・`MATCH`・遅延属性を単一のフォーマット拡張として素直に表現できる |
 
 ## 構文
 
@@ -66,8 +66,8 @@ CREATE TABLE <table> (
 <遅延属性> ::= [NOT] DEFERRABLE | INITIALLY (DEFERRED | IMMEDIATE)
 ```
 
-`SET NULL`／`SET DEFAULT` の列リスト形（`SET NULL (col, ...)`）・`MATCH`・
-`DEFERRABLE`・`CONSTRAINT <name>` 前置は未実装のまま `42601`（D13）。
+`SET NULL`／`SET DEFAULT` の列リスト形（`SET NULL (col, ...)`）・
+`CONSTRAINT <name>` 前置は未実装のまま `42601`（D16）。
 
 - 列制約 `REFERENCES` は `PRIMARY KEY` の後ろ・`CHECK` の前に高々 1 個置ける。
 - 表制約は列リスト中の任意の位置に置ける（列数上限の判定対象外。`PRIMARY KEY`／
@@ -167,7 +167,7 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
 ### 参照アクションの適用（Issue #1076）
 
 `enforce_referencing_rows_in_txn` の内部で、事後検証（上記）の**前**に
-`constraint::propagate_referential_actions` が連鎖を適用する（D14）。
+`constraint::propagate_referential_actions` が連鎖を適用する（D17）。
 
 - 対象特定: `ON DELETE` は事後状態（削除済みの参照先）に存在しなくなった参照元
   キーを持つ子行、`ON UPDATE` は呼び出し元が書き込み前に捕捉した
@@ -180,10 +180,10 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   `enforce_row_constraints_in_txn`（`CHECK` → UNIQUE → 子自身の FK 参照元側）で
   再検証し、テーブル世代も bump する（TABLE-16 の単一検査点を再利用）。
 - 再帰: 子テーブル自身がさらに親であれば同じ経路で孫段へ連鎖する（`depth` を
-  1 段ずつ進め、上限は D17）。自己参照では親役・子役で同じ行ストアハンドルを
+  1 段ずつ進め、上限は D20）。自己参照では親役・子役で同じ行ストアハンドルを
   同時に持たないよう、走査（読み取り専用ハンドル）→ 適用（書き込みハンドル）→
   次段の再帰、の順に厳密に分離する（redb の `TableAlreadyOpen` 回避）。
-- `TRUNCATE` は連鎖を起こさない（D15）。
+- `TRUNCATE` は連鎖を起こさない（D18）。
 
 ### 計算量（既知の制約）
 
@@ -280,7 +280,7 @@ v9 対応が前提）の両方について、COMMIT 直前の事後状態を全�
   （新 variant。`54000`）の追加、`catalog::ReferentialAction`（公開型）・
   `ForeignKeyDef::on_delete()`／`on_update()`（公開メソッド）の追加、`ON DELETE`／
   `ON UPDATE` に `CASCADE`／`SET NULL`／`SET DEFAULT` を宣言できるようになったこと
-  （従来 `42601` だった宣言が受理される）、カタログ v8 `fk:` 行の 5 フィールド形は
+  （従来 `42601` だった宣言が受理される）、カタログ v9 `fk:` 行の 7 フィールド形は
   旧バイナリでは読めない（decode 時に `CorruptSchema` として拒否される）
 
 いずれの enum も `#[non_exhaustive]` ではない
@@ -314,9 +314,9 @@ NoSQL `create_table` の `foreign_key` 制約（`build_constraint_tokens`）は
 - `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要）
 - 制約名（`CONSTRAINT <name> FOREIGN KEY`）
 - `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`（列リスト形。Issue #1076）
-- `TRUNCATE ... CASCADE`（`TRUNCATE` 自体は参照アクションを発火させない。D15）
+- `TRUNCATE ... CASCADE`（`TRUNCATE` 自体は参照アクションを発火させない。D18）
 - `RESTRICT` を `NO ACTION` と区別して永続化し即時検査すること（現状は両方とも
-  文末の事後検証に統一。既知の差分として D14 の理由欄に記録）
+  文末の事後検証に統一。既知の差分として D17 の理由欄に記録）
 - `SET CONSTRAINTS { ALL | name } { DEFERRED | IMMEDIATE }`（`DEFERRABLE
   INITIALLY IMMEDIATE` を実行時に遅延へ切り替える機能。Issue #1077 のスコープ外）
 - `MATCH PARTIAL`（Issue #1077 のスコープ外。D13）
