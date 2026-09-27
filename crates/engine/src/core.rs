@@ -4737,6 +4737,24 @@ impl EngineCore {
             session.search_mode(),
             session.udfs(),
         )?;
+        Ok(crate::sql::SqlOutcome::Explain(
+            self.search_explain_from_bound(&bound),
+        ))
+    }
+
+    /// 束縛済み検索計画（[`crate::sql::parser::BoundStatement`]）から
+    /// `QUERY PLAN` 応答を組み立てる（Issue #948・NOSQL-16・SQL-27・
+    /// TASK-186）。[`Self::run_search_explain`]（SQL `EXPLAIN SELECT ...`
+    /// テキスト経由）と [`Self::explain_bound_search_in_session`]（NoSQL 表層の
+    /// `vector` 指定 `explain: true`。wire-server から呼ばれる）の両方が
+    /// この私的ヘルパーを共有することで、同じ意味の要求が SQL 経由・NoSQL
+    /// 経由のどちらでもビット同一の行を返す契約を構造として保証する
+    /// （第 2 の実装を作らない設計）。検索本体（`hnsw_state` の
+    /// `lookup`／`prepare_*`・`SearchProvider::search`）は呼ばない。
+    fn search_explain_from_bound(
+        &self,
+        bound: &crate::sql::parser::BoundStatement,
+    ) -> crate::sql::exec::QueryResult {
         let is_hybrid = matches!(bound.ranking(), crate::sql::parser::Ranking::Hybrid { .. });
         let is_precision = bound.mode().mode() == crate::sql::mode::SearchMode::Precision;
         let filters_empty = !bound.has_where_filters();
@@ -4762,9 +4780,7 @@ impl EngineCore {
             scalar_prefilter,
             scalar_plan,
         );
-        Ok(crate::sql::SqlOutcome::Explain(
-            crate::sql::explain::build_search_explain_result(bound.mode(), &engine),
-        ))
+        crate::sql::explain::build_search_explain_result(bound.mode(), &engine)
     }
 
     /// `EXPLAIN SELECT <集計>`（`GROUP BY`・`SELECT DISTINCT` の脱糖形いずれも。
@@ -4783,11 +4799,27 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
-        let (scalar_plan, access_path) =
-            crate::sql::aggregate::classify_aggregate_access(&schema, &bound);
         Ok(crate::sql::SqlOutcome::Explain(
-            crate::sql::explain::build_relational_explain_result(scalar_plan, access_path),
+            Self::aggregate_explain_from_bound(&schema, &bound),
         ))
+    }
+
+    /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]）から
+    /// `QUERY PLAN` 応答を組み立てる（Issue #948・NOSQL-16・SQL-27・
+    /// TASK-186）。[`Self::run_relational_explain_aggregate`]（SQL
+    /// `EXPLAIN SELECT <集計>` テキスト経由）と
+    /// [`Self::explain_bound_aggregate_in_session`]（NoSQL 表層の `aggregate`
+    /// op の `explain: true`）の両方が共有する（第 2 の実装を作らない設計）。
+    /// `self` を使わない（`classify_aggregate_access` がテーブルスキーマと
+    /// 束縛結果だけから静的判定する純粋関数のため）静的メソッドとし、
+    /// 呼び出し元がどちらの経路でも同一の判定式を通ることを型で示す。
+    fn aggregate_explain_from_bound(
+        schema: &crate::catalog::TableSchema,
+        bound: &crate::sql::parser::BoundAggregate,
+    ) -> crate::sql::exec::QueryResult {
+        let (scalar_plan, access_path) =
+            crate::sql::aggregate::classify_aggregate_access(schema, bound);
+        crate::sql::explain::build_relational_explain_result(scalar_plan, access_path)
     }
 
     /// `EXPLAIN SELECT ... LIMIT n [OFFSET m]`（広域取得。ビュー展開後の形を
@@ -4804,12 +4836,22 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let _bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
-        Ok(crate::sql::SqlOutcome::Explain(
-            crate::sql::explain::build_relational_explain_result(
-                crate::sql::scalar_plan::ScalarPlan::PlainScan,
-                crate::sql::explain::AccessPath::FullScan,
-            ),
-        ))
+        Ok(crate::sql::SqlOutcome::Explain(Self::scan_explain_result()))
+    }
+
+    /// 広域取得（scan）の `QUERY PLAN` 応答を組み立てる（Issue #948・
+    /// NOSQL-16・SQL-27・TASK-186）。`sql::scan` はランキング段・索引・
+    /// キャッシュのいずれも消費しない（`sql::scan` モジュールドキュメント
+    /// 参照）ため、値は常に固定（`scalar_plan: plain_scan`／
+    /// `access_path: full_scan`）。[`Self::run_relational_explain_scan`]
+    /// （SQL `EXPLAIN SELECT ... LIMIT n` テキスト経由）と
+    /// [`Self::explain_bound_scan_in_session`]（NoSQL 表層の `scan` op の
+    /// `explain: true`）の両方が共有する。
+    fn scan_explain_result() -> crate::sql::exec::QueryResult {
+        crate::sql::explain::build_relational_explain_result(
+            crate::sql::scalar_plan::ScalarPlan::PlainScan,
+            crate::sql::explain::AccessPath::FullScan,
+        )
     }
 
     /// 束縛済み `USING PLAN` 検索計画の EXPLAIN（TASK-186・NOSQL-10。
@@ -4936,6 +4978,120 @@ impl EngineCore {
             &bound,
             crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
         )
+    }
+
+    /// 束縛済み検索計画（[`crate::sql::parser::BoundStatement`]）の
+    /// `EXPLAIN`（Issue #948・NOSQL-16・SQL-27・TASK-186）。SQL テキストを
+    /// 経由せず束縛済み計画の `QUERY PLAN` を得たい呼び出し元（`wire-server`
+    /// の NoSQL 表層 `search` op の `vector` 指定 `explain: true`）向けの
+    /// セッション対応エントリで、[`Self::execute_bound_search_in_session`]
+    /// と同型の設計（`docs/design/bound-plan-session-entry.md` 参照）。
+    ///
+    /// 処理順序は execute 系と同一: (1) `table` のスキーマを取得、(2) `bind`
+    /// で束縛、(3) 得られた計画の対象テーブルが `table` と一致するか検証。
+    /// ただしその後は [`Self::run_select_plan`]（実行本体）を呼ばず、
+    /// [`Self::search_explain_from_bound`]（SQL `EXPLAIN` 経路と共有する
+    /// 私的ヘルパー）だけを呼ぶ。検索本体（`hnsw_state` の
+    /// `lookup`／`prepare_*`・`SearchProvider::search`）は実行しないため、
+    /// 索引構築・キャッシュ加算・行走査のいずれも発生しない。
+    ///
+    /// `ctx`（[`PolicyContext`]）は [`Self::execute_bound_search_in_session`]
+    /// とのシグネチャ対称性のために残す（呼び出し元に
+    /// `SessionPrincipal::policy_context()` 由来のテナント文脈を必ず通させる
+    /// ため）。`EXPLAIN` は行を読まないため、本メソッド自身は `ctx` を
+    /// テナント判定に使わない。
+    pub fn explain_bound_search_in_session<F>(
+        &self,
+        _ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<
+            crate::sql::parser::BoundStatement,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound search plan targets a different table than requested",
+            ));
+        }
+        Ok(self.search_explain_from_bound(&bound))
+    }
+
+    /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）の
+    /// `EXPLAIN`（Issue #948・NOSQL-16・SQL-27・TASK-186）。
+    /// [`Self::execute_bound_scan_in_session`] と同型の設計・処理順序
+    /// （`docs/design/bound-plan-session-entry.md` 参照）で、実行本体
+    /// （[`Self::run_scan_plan`]）を呼ばず [`Self::scan_explain_result`]
+    /// （固定値。SQL `EXPLAIN` 経路と共有）だけを呼ぶ。`ctx` を残す理由・
+    /// テナント判定への不使用は [`Self::explain_bound_search_in_session`]
+    /// と同じ。
+    pub fn explain_bound_scan_in_session<F>(
+        &self,
+        _ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        )
+            -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
+    {
+        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound scan plan targets a different table than requested",
+            ));
+        }
+        Ok(Self::scan_explain_result())
+    }
+
+    /// 束縛済み集計計画（[`crate::sql::parser::BoundAggregate`]。`GROUP BY`
+    /// の有無を問わない）の `EXPLAIN`（Issue #948・NOSQL-16・SQL-27・
+    /// TASK-186）。[`Self::execute_bound_aggregate_in_session`] と同型の
+    /// 設計・処理順序（`docs/design/bound-plan-session-entry.md` 参照）で、
+    /// 実行本体（[`Self::run_aggregate_plan`]。`VisibleBitmapCache`／
+    /// `SqlArenaCache`／`ScalarIndexCache` を消費する）を呼ばず
+    /// [`Self::aggregate_explain_from_bound`]（SQL `EXPLAIN` 経路と共有）
+    /// だけを呼ぶため、いずれのキャッシュも変化しない。`ctx` を残す理由・
+    /// テナント判定への不使用は [`Self::explain_bound_search_in_session`]
+    /// と同じ。
+    pub fn explain_bound_aggregate_in_session<F>(
+        &self,
+        _ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+        bind: F,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+            &crate::sql::udf_call::UdfRegistry,
+        ) -> Result<
+            crate::sql::parser::BoundAggregate,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let bound = bind(&schema, session.udfs())?;
+        if bound.table() != table {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "bound aggregate plan targets a different table than requested",
+            ));
+        }
+        Ok(Self::aggregate_explain_from_bound(&schema, &bound))
     }
 
     /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を
