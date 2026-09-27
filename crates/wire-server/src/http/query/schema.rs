@@ -20,7 +20,9 @@
 //! - フィールド値の**語彙・範囲**検査（`filter[].op` の `eq`／`prefix`、
 //!   `aggregates[].fn`／`having[].fn`／`having[].op` の関数名・演算子語彙、
 //!   `limit` の非負性等。#761・#763・#766・#768。`group_by`／`having` の
-//!   意味検証は [`super::aggregate`]（#769）が担う）
+//!   意味検証は [`super::aggregate`]（#769）が担う。`scan` の `sort[].dir`
+//!   語彙〔`"asc"`／`"desc"` 以外の拒否〕は [`super::scan`]（Issue #946・
+//!   NOSQL-15）が担う）
 //!
 //! `insert` op の `operation_id` 欠落／`null`／空文字 → `23502`・`rows[*]` の
 //! 列検証・engine への束縛・実行は [`super::insert`]（Issue #771・NOSQL-6）が担う。
@@ -518,9 +520,34 @@ pub static HAVING_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
+/// `sort` 配列要素のサブスキーマ（`scan` op。Issue #946・NOSQL-15・SQL-25
+/// (a)・TASK-224）。`dir` は語彙・大文字小文字を型検査段では見ず
+/// （`"asc"`／`"desc"` 以外・大文字混じりの拒否は [`super::scan::build_sort`]
+/// が `42601` へ写像する）、値が文字列であることのみ検査する。
+pub static SORT_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "sort_item",
+    fields: &[
+        FieldSpec {
+            key: "column",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "dir",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+    ],
+};
+
 /// `search` op のトップレベルスキーマ（NOSQL-2・NOSQL-3・NOSQL-9・NOSQL-10
 /// ポインタ）。`vector`／`plan` の排他は #763 が担う（本ヘルパーは型のみ
-/// 検査するため両方同時に指定した入力も通過し得る）。
+/// 検査するため両方同時に指定した入力も通過し得る）。`sort`（スカラー列
+/// `ORDER BY` 相当。NOSQL-15・SQL-25 (a)・Issue #946）は本スキーマに宣言
+/// しないため未知キー `42601` で拒否される——ベクトル順位付け（距離・
+/// `hybrid`）との相互排他をスキーマの一般則だけで成立させる判断。
 pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
     name: "search",
     fields: &[
@@ -592,9 +619,12 @@ pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
 /// 宣言しないことで一般則から自然に成立する。個別の除外ロジックは持たない）。
 /// `offset`（Issue #947・NOSQL-15・TASK-224）は SQL 表層の広域取得
 /// `LIMIT n OFFSET m` と同じ実行計画（[`engine::sql::parser::BoundScan::
-/// with_offset`]）へ写像する（[`super::scan::execute`] 参照）。`aggregate` op
-/// には対応する受理形が無いため宣言しない（`super::scan` モジュール doc の
-/// 対象外注記を参照）。
+/// with_offset`]）へ写像する（[`super::scan::execute`] 参照）。`sort`
+/// （Issue #946・NOSQL-15・SQL-25 (a)・TASK-224）は末尾に追加した独立
+/// フィールドで、要素の語彙検査・列名解決・上限判定は
+/// [`super::scan::build_sort`] が担う（本モジュールは形のみ検査する）。
+/// `aggregate` op には対応する受理形が無いため `offset`／`sort` いずれも
+/// 宣言しない（`super::scan` モジュール doc の対象外注記を参照）。
 pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
     name: "scan",
     fields: &[
@@ -640,12 +670,21 @@ pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Bool,
             nullable: false,
         },
+        FieldSpec {
+            key: "sort",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::Object(&SORT_ITEM_SCHEMA)),
+            nullable: false,
+        },
     ],
 };
 
 /// `aggregate` op のトップレベルスキーマ（NOSQL-4〜NOSQL-7 ポインタ）。
 /// `group_by`／`having` の意味検証（語彙・列名解決・上限判定）は
-/// [`super::aggregate`]（#769）が担う。
+/// [`super::aggregate`]（#769）が担う。`sort` は本スキーマに宣言しないため
+/// 未知キー `42601` で拒否される（Issue #946 のスコープ外。engine の集計
+/// `ORDER BY` を SQL-25 (a) 相当へ揃える先行作業が必要——`nosql-api.md`
+/// 「spec 側への申し送り候補」参照）。
 pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
     name: "aggregate",
     fields: &[
