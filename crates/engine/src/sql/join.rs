@@ -848,13 +848,19 @@ pub(crate) fn execute_with_limits(
     }
 
     // 出力前の中間表現（`Option` は NULL 補完を表す。`None` 側はどちらか一方
-    // のみで、両方 `None` の要素は作らない）。
-    let mut combined: Vec<(Option<u32>, Option<u32>)> = Vec::with_capacity(
-        pairs
-            .len()
-            .saturating_add(unmatched_left)
-            .saturating_add(unmatched_right),
-    );
+    // のみで、両方 `None` の要素は作らない）。`pairs`（一致ペア）と要素数が
+    // 重複しうる `combined`（一致ペア＋ NULL 補完行）を別に確保するため、
+    // 確保前にこの容量分を共有バイト予算へ計上する（Issue #926 レビュー
+    // 指摘。`matched_left`／`matched_right` と同じく「確保前に charge」の
+    // 契約——security.md「不安全な設計」対応）。
+    let combined_capacity = pairs
+        .len()
+        .saturating_add(unmatched_left)
+        .saturating_add(unmatched_right);
+    budget.charge(
+        combined_capacity.saturating_mul(std::mem::size_of::<(Option<u32>, Option<u32>)>()),
+    )?;
+    let mut combined: Vec<(Option<u32>, Option<u32>)> = Vec::with_capacity(combined_capacity);
     for &(l, r) in &pairs {
         combined.push((Some(l), Some(r)));
     }
