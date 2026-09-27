@@ -62,7 +62,7 @@ use engine::catalog::{ColumnType, TableSchema};
 use engine::declarative_filter::{self, CompareOp, DeclarativeFilter, MetadataFilter};
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
-use engine::sql::allowlist::{is_allowed_where_predicate_name, SqlSurfaceError};
+use engine::sql::allowlist::{is_allowed_where_predicate_name, SqlSurfaceError, WherePredicate};
 
 use super::schema::{SchemaError, Validated, FILTER_ITEM_SCHEMA};
 use super::typed_json::{self, TypedJsonError};
@@ -354,6 +354,147 @@ pub fn bind_filter(
         bound.push(declared.bind(schema)?);
     }
     Ok(bound)
+}
+
+/// `LIKE` パターンのメタ文字（`\`・`%`・`_`。[`engine::declarative_filter::
+/// parse_like_pattern`] が解釈する 3 文字）をエスケープし、`raw` を無加工の
+/// 前方一致対象文字列として扱えるようにする（[`bind_filter_where_predicates`]
+/// の `prefix` レーン専用。`declare_one` が `DeclarativeFilter::starts_with`
+/// 経由で構築する `MetadataFilter::StartsWith`〔本モジュール内で完結し
+/// `parse_like_pattern` を経由しない、`scan`／`search`／`aggregate` の
+/// `filter` 専用表現〕はこのエスケープを必要としない。DML 経路のみ SQL 表層の
+/// `WHERE <col> LIKE '<pattern>%'`〔`engine::sql::allowlist::
+/// WherePredicate::Prefix`〕と同一の `content_hash` 入力を再現する必要が
+/// あるため、`raw` に含まれるメタ文字を無害化してから `%` を付与する）。
+fn like_escape(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// `item`（列型未確定の [`FilterItem`]）を、SQL 表層の述語形 `UPDATE`／
+/// `DELETE`（[`engine::sql::allowlist::WherePredicate`]）が使うのと同一の
+/// 構文形へ写像する（[`bind_filter_where_predicates`] 専用）。呼び出し元が
+/// 先に `declare_one(item, schema)?.bind(schema)?`（[`bind_filter`] と同じ
+/// 検証経路）を通していることを前提とし、本関数自身は値の型検査をしない
+/// （検証済みの `(op, 列型)` の組み合わせのみが渡る契約。想定外の組み合わせは
+/// `Internal` で fail-closed に落とす）。
+fn where_predicate_for(
+    item: &FilterItem<'_>,
+    column: &engine::catalog::ColumnDef,
+) -> Result<WherePredicate, FilterError> {
+    if item.op == "prefix" {
+        // `declare_one` が `JsonValue::String` であることを既に検証済み
+        // （呼び出し元契約。想定外の値種別は多層防御として fail-closed に拒否する）。
+        let raw = match item.value {
+            JsonValue::String(s) => s.as_str(),
+            _ => {
+                return Err(FilterError::Bind(SqlSurfaceError::Internal {
+                    detail: "unexpected non-string value for a validated prefix filter".to_string(),
+                }))
+            }
+        };
+        return Ok(WherePredicate::Prefix {
+            column: item.column.to_string(),
+            pattern: format!("{}%", like_escape(raw)),
+        });
+    }
+
+    // ここから `op == "eq"`。BOOLEAN のみ `BoolEquality`、それ以外は
+    // `Equality`（値は SQL リテラルテキスト形。`sql::parser::
+    // declarative_leaf_to_filter` が列型に応じて `DeclarativeFilter::compare`
+    // （DATE/TIMESTAMP/NUMERIC/UUID/BYTEA）／`equals`（TEXT/ENUM）へ
+    // 振り分けるため、`WherePredicate` 構築段では列型を分岐する必要が無い）。
+    let internal = || {
+        FilterError::Bind(SqlSurfaceError::Internal {
+            detail: "unexpected value shape for a validated eq filter".to_string(),
+        })
+    };
+    match &column.ty {
+        ColumnType::Boolean => match item.value {
+            JsonValue::Bool(b) => Ok(WherePredicate::BoolEquality {
+                column: item.column.to_string(),
+                value: *b,
+            }),
+            _ => Err(internal()),
+        },
+        ColumnType::Bytea => match item.value {
+            JsonValue::String(s) => {
+                let text = typed_json::bytea_literal_text(s).map_err(FilterError::Value)?;
+                Ok(WherePredicate::Equality {
+                    column: item.column.to_string(),
+                    value: text,
+                })
+            }
+            _ => Err(internal()),
+        },
+        ColumnType::Numeric { .. } => match item.value {
+            JsonValue::Number(n) => Ok(WherePredicate::Equality {
+                column: item.column.to_string(),
+                value: typed_json::number_literal_text(n),
+            }),
+            JsonValue::String(s) => Ok(WherePredicate::Equality {
+                column: item.column.to_string(),
+                value: s.clone(),
+            }),
+            _ => Err(internal()),
+        },
+        // TEXT／ENUM／DATE／TIMESTAMP／UUID はいずれも文字列リテラル形
+        // （`declare_one` が検証済み）。
+        _ => match item.value {
+            JsonValue::String(s) => Ok(WherePredicate::Equality {
+                column: item.column.to_string(),
+                value: s.clone(),
+            }),
+            _ => Err(internal()),
+        },
+    }
+}
+
+/// [`map_filter_items`] の結果を `schema` へ束縛し、SQL 表層の述語形
+/// `UPDATE`／`DELETE`（`WHERE <col> = <lit> AND <col> LIKE '<prefix>%'`）が
+/// 使うのと同一の `Vec<WherePredicate>` を得る（NoSQL 表層 `update`／`delete`
+/// op の `filter`。TASK-186・NOSQL-12、Issue #1062。宣言順を保った `AND`
+/// 結合）。[`bind_filter`]（`MetadataFilter` を返す。`scan`／`search`／
+/// `aggregate` 専用）とは戻り値の型が異なる別 API——述語形 DML の
+/// `content_hash`（[`engine::recovery::content_hash::for_update_where`]・
+/// `for_delete_where`）は束縛前の構文形 `WherePredicate` をハッシュ源にする
+/// ため、SQL 表層と同一のバイト列を再現するには `WherePredicate` そのものが
+/// 必要（`MetadataFilter` へ変換してしまうと SQL⇄NoSQL 間の台帳照合
+/// （`23505`／`22023`、RECOVER-10）が成立しなくなる）。
+///
+/// 各要素は [`declare_one`]`(item, schema)?.bind(schema)?`（[`bind_filter`]
+/// と完全に同じ検証経路。未知列・非 TEXT 列への `prefix`・ENUM 語彙外・
+/// `INTEGER` 系列への `eq`・値の型不一致・件数上限はすべて `bind_filter` と
+/// 同じ分類になる）を通してから [`where_predicate_for`] で構文形へ変換する
+/// （検証してから変換する不変条件。変換器は値の型検査をしない）。
+pub fn bind_filter_where_predicates(
+    items: &[JsonValue],
+    schema: &TableSchema,
+) -> Result<Vec<WherePredicate>, FilterError> {
+    let mapped = map_filter_items(items)?;
+    let mut predicates = Vec::with_capacity(mapped.len());
+    for item in &mapped {
+        let declared = declare_one(item, schema)?;
+        // `bind_filter` と同一の検証（未知列・型不一致・件数上限等）を通す。
+        // 束縛結果（`MetadataFilter`）自体は使わない——構文形への変換は
+        // 独立した `where_predicate_for` が担う。
+        let _ = declared.bind(schema)?;
+        let Some(column) = schema.columns.iter().find(|c| c.name == item.column) else {
+            // 未知列は `declare_one`／`bind` が先に `22000` で拒否済みのため
+            // 到達しない（fail-closed フォールバック）。
+            return Err(FilterError::Bind(SqlSurfaceError::Internal {
+                detail: "unexpected unknown column after successful filter bind".to_string(),
+            }));
+        };
+        predicates.push(where_predicate_for(item, column)?);
+    }
+    Ok(predicates)
 }
 
 #[cfg(test)]
@@ -664,5 +805,147 @@ mod tests {
         let items = filter_items(r#"[{"column":"active","op":"prefix","value":"t"}]"#);
         let err = bind_filter(&items, &schema()).expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_filter_where_predicates（述語形 DML への写像。Issue #1062） ---
+
+    fn predicate_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("active", ColumnType::Boolean, true),
+                ColumnDef::new("note", ColumnType::Bytea, true),
+                ColumnDef::new(
+                    "amount",
+                    ColumnType::Numeric {
+                        precision: 5,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("count", ColumnType::Integer, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn like_escape_escapes_backslash_percent_and_underscore() {
+        assert_eq!(like_escape(r"a%b_c\d"), r"a\%b\_c\\d");
+    }
+
+    #[test]
+    fn like_escape_leaves_ordinary_characters_untouched() {
+        assert_eq!(like_escape("src/"), "src/");
+    }
+
+    #[test]
+    fn prefix_maps_to_where_predicate_prefix_with_escaped_literal_and_trailing_percent() {
+        let items = filter_items(r#"[{"column":"path","op":"prefix","value":"a%b_c\\d"}]"#);
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(
+            bound,
+            vec![WherePredicate::Prefix {
+                column: "path".to_string(),
+                pattern: r"a\%b\_c\\d%".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_prefix_is_rejected_instead_of_matching_all_rows() {
+        let items = filter_items(r#"[{"column":"path","op":"prefix","value":""}]"#);
+        let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn eq_text_maps_to_where_predicate_equality() {
+        let items = filter_items(r#"[{"column":"lang","op":"eq","value":"ja"}]"#);
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(
+            bound,
+            vec![WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn eq_boolean_maps_to_where_predicate_bool_equality() {
+        let items = filter_items(r#"[{"column":"active","op":"eq","value":true}]"#);
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(
+            bound,
+            vec![WherePredicate::BoolEquality {
+                column: "active".to_string(),
+                value: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn eq_bytea_maps_to_where_predicate_equality_with_hex_text() {
+        // base64("\x01\x02") == "AQI="
+        let items = filter_items(r#"[{"column":"note","op":"eq","value":"AQI="}]"#);
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(
+            bound,
+            vec![WherePredicate::Equality {
+                column: "note".to_string(),
+                value: typed_json::bytea_literal_text("AQI=").expect("valid base64"),
+            }]
+        );
+    }
+
+    #[test]
+    fn eq_numeric_json_number_maps_to_where_predicate_equality_with_literal_text() {
+        let items = filter_items(r#"[{"column":"amount","op":"eq","value":1.5}]"#);
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(
+            bound,
+            vec![WherePredicate::Equality {
+                column: "amount".to_string(),
+                value: "1.5".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn eq_on_integer_column_is_rejected_before_where_predicate_mapping() {
+        let items = filter_items(r#"[{"column":"count","op":"eq","value":1}]"#);
+        let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
+        assert!(matches!(err, FilterError::NumericFilterNotSupported));
+    }
+
+    #[test]
+    fn unknown_column_is_rejected_before_where_predicate_mapping() {
+        let items = filter_items(r#"[{"column":"missing","op":"eq","value":"x"}]"#);
+        let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn multiple_elements_preserve_declaration_order_for_and_conjunction() {
+        let items = filter_items(
+            r#"[{"column":"lang","op":"eq","value":"ja"},{"column":"path","op":"prefix","value":"src/"}]"#,
+        );
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(
+            bound,
+            vec![
+                WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                },
+                WherePredicate::Prefix {
+                    column: "path".to_string(),
+                    pattern: "src/%".to_string(),
+                },
+            ]
+        );
     }
 }

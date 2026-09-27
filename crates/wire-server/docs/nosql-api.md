@@ -4,9 +4,9 @@
 `POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 9 値
 （`search`／`scan`／`aggregate`／`insert`／`update`／`delete`／`create_table`／
 `alter_table`／`drop_table`）の JSON スキーマを利用者向けに整理する。
-`update`／`delete` は `where`（単一行・`id` 完全一致形）は束縛・実行結線済みで、
-`filter`（述語形）は語彙・スキーマ検証のみ実装済み（実行結線は未実装。後述の
-各節参照）。`create_table`／`alter_table`／`drop_table`（DDL 3 op）は
+`update`／`delete` は `where`（単一行・`id` 完全一致形）・`filter`（述語形）の
+いずれも束縛・実行結線済み（後述の各節参照）。`create_table`／`alter_table`／
+`drop_table`（DDL 3 op）は
 `--ddl-allowed-users` に列挙したユーザーのみ実行できる（後述の各節参照）。
 
 **この文書の情報源はコードとテストのみ**であり、`docs/spec`（private submodule）
@@ -427,10 +427,12 @@ NoSQL 表層の束縛済み計画向けエントリはまだこれを結線し�
 TASK-186・NOSQL-6・NOSQL-12）で、SQL 表層 `UPDATE ... WHERE id = <n>
 USING OPERATION_ID`（SQL-17）と同一の実行器
 （`engine::sql::exec::execute_update_with_schema`）・同一の台帳キー空間
-（`(tenant, table, operation_id)`）へ到達する。`filter`（述語形）は語彙・
-スキーマ検証のみ実装済みで、**実行結線は未実装**（Issue #871 の担当）の
-ため、指定すると常に `0A000`／501（固定文言。`gate.rs::PLACEHOLDER_MESSAGE`
-とは異なる文言）が返る。
+（`(tenant, table, operation_id)`）へ到達する。`filter`（述語形。非空）も
+束縛・実行結線済み（Issue #1062・TASK-186・NOSQL-12）で、SQL 表層の述語形
+`UPDATE ... WHERE <述語> USING OPERATION_ID`（SQL-19）と同一の実行器
+（`engine::sql::exec::execute_predicate_update`）・同一の台帳キー空間へ
+到達する。`filter: []`（空配列）のみ `42601` で拒否する（engine を呼ばない。
+SQL の `WHERE` 句省略とのパリティ）。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
@@ -438,7 +440,7 @@ USING OPERATION_ID`（SQL-17）と同一の実行器
 | `table` | ○ | string | |
 | `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。他の列型は `insert` と同じ JSON 表現（Issue #896・NOSQL-17。上記参照）。`null` は列型を問わず nullable 判定込みで `bind_update` へ委譲する（非 nullable 列への `null` は `22000`）。型不一致・未知列・次元不一致は `22000`（新型の型不一致は `42601`） |
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層の字句解析・束縛とのパリティ。詳細は design doc 参照）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
-| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。指定のみ（`where` 欠落）だと `0A000`（実行器未接続） |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`・不一致 `22023`（SQL 表層と共有） |
 
 成功応答: `{"updated":<n>,"operation_id":"<echo>"}`（`n` は `0` または `1`。
@@ -456,10 +458,13 @@ SQL 表層の `UPDATE ... SET col1 = .., col2 = ..` はクライアントが記�
 （SQL 表層のベクトルリテラル文字列と NoSQL 表層の数値配列）は、この
 `where` 形（単一行）では元々同一の内容照合ハッシュに一致しており、
 Issue #1061 では層 A の固定テスト（`nosql12_update_delete.rs::
-cross_surface_vector_value_*`）を追加した（述語形〔`filter`〕の表現統一は
-同 Issue の主眼だが `filter` は未結線のため本節の対象外。詳細は
+cross_surface_vector_value_*`）を追加した（詳細は
 `docs/design/nosql-update-delete-mapping.md`「述語形 VECTOR 割当の表現
-統一と既存台帳エントリの互換性」節参照）。
+統一と既存台帳エントリの互換性」節参照）。述語形（`filter`。`WHERE` 対象列
+は `VECTOR` 以外だが、`SET` 側に `VECTOR` 列を含めることは単一行形と同様に
+可能）自体の跨表層一致・台帳照合は Issue #1062・`nosql12_update_delete.rs::
+cross_surface_predicate_*`（`SET` に `VECTOR` 列を含むケースを含む）で
+固定する。
 
 要求例（`where` 形）:
 
@@ -473,16 +478,18 @@ cross_surface_vector_value_*`）を追加した（述語形〔`filter`〕の表�
 `where`（単一行・`id` 完全一致形）は束縛・実行結線済み（Issue #876・
 TASK-186・NOSQL-6・NOSQL-12）で、SQL 表層 `DELETE FROM ... WHERE id = <n>
 USING OPERATION_ID`（SQL-18）と同一の実行器（`engine::sql::exec::
-execute_delete`）・同一の台帳キー空間を共有する。`filter`（述語形）は
-`update` と同様に語彙・スキーマ検証のみ実装済みで `0A000`／501 が返る
-（Issue #871 の担当）。
+execute_delete`）・同一の台帳キー空間を共有する。`filter`（述語形。非空）も
+束縛・実行結線済み（Issue #1062・TASK-186・NOSQL-12）で、SQL 表層の述語形
+`DELETE FROM ... WHERE <述語> USING OPERATION_ID`（SQL-19）と同一の実行器
+（`engine::sql::exec::execute_predicate_delete`）へ到達する。`filter: []`
+（空配列）のみ `42601` で拒否する（engine を呼ばない）。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"delete"` |
 | `table` | ○ | string | |
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層とのパリティ）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
-| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。指定のみだと `0A000`（実行器未接続） |
+| `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により `23505`（内容一致。`DELETE` は行の有無に関わらず同一内容） |
 
 成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`（`n` は `0` または `1`。
@@ -570,7 +577,10 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 
 ## `filter` 配列
 
-`search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。
+`search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。`update`／
+`delete` の述語形（本節と同じ形・同じ語彙・同じエラー分類。Issue #1062）
+でも同じ配列を使うが、`WHERE <述語> USING OPERATION_ID` の意味論（影響行数
+上限 `54000`・台帳照合 `23505`／`22023`）は各 op の節を参照。
 
 ```json
 [{"column": "lang", "op": "eq", "value": "ja"}]
@@ -682,9 +692,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
 | `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
-| `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
+| `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
-| `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
+| `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
 | `ALTER TABLE docs ADD COLUMN note TEXT` | `alter_table` + `add_column`（Issue #910。同一実行器） |
 | `DROP TABLE docs` | `drop_table`（Issue #910。同一実行器） |

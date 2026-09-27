@@ -3,7 +3,7 @@
 - Issue: #876（親 #861・ルート未指定。前提 #864〜#867・#869・#870・#875）
 - 対象タスク: TASK-178・TASK-186
 - 対象ビヘイビア: NOSQL-6・NOSQL-12（関連: SQL-17・SQL-18・RECOVER-1・RECOVER-10・TABLE-12・RLS-9）
-- ステータス: Implemented（`where` 単一行形のみ。`filter` 述語形は Issue #871 待ち）
+- ステータス: Implemented（`where` 単一行形・`filter` 述語形の両方。述語形は Issue #1062 で実行結線）
 
 ## 背景
 
@@ -19,17 +19,48 @@ SQL テキストを組み立てずに束縛済み計画で到達させる。
 
 ## 採用した設計
 
-### D1: `filter`（述語形）は fail-closed に `0A000`／501 で拒否（副作用なし）
+### D1: `filter`（述語形）は SQL 表層の述語形 DML と同一の実行器へ結線する（Issue #1062）
 
-述語形の実行器（Issue #871）が未実装のため、`where` を伴わず `filter` のみを
-持つ要求は engine を一切呼ばず、`dml_target.rs::PREDICATE_FORM_UNAVAILABLE_MESSAGE`
-（固定文言。`gate.rs::PLACEHOLDER_MESSAGE` とは別の文言）で
-`ErrorClass::FeatureNotSupported`（`0A000`／501）を返す。`where` と `filter`
-の両方指定、および双方欠落はいずれも `42601`（対象指定なし。SQL の `WHERE`
-句省略が構文エラーであることとのパリティ）。
+`where` を伴わず `filter` のみを持つ要求は、`filter: []`（空配列）の場合のみ
+`dml_target.rs::DmlTargetError::EmptyFilter`（`42601`）で engine を一切呼ばず
+拒否する（SQL の `WHERE` 句省略が構文エラーであることとのパリティ）。`filter`
+が非空の場合は `TargetForm::Predicate` として、SQL 表層の述語形
+`UPDATE`／`DELETE ... WHERE <述語> USING OPERATION_ID`（SQL-19・TASK-192）と
+**同一の実行器**（`engine::core::EngineCore::
+execute_bound_predicate_update_in_session`／
+`execute_bound_predicate_delete_in_session`。`docs/design/
+predicate-dml-exec.md`「NoSQL 表層からの到達経路」節）へ結線する。`where` と
+`filter` の両方指定、および双方欠落はいずれも `42601`（対象指定なし）。
 
 判定は `dml_target.rs::bind_target_form` に集約し、`update.rs`・`delete.rs`
 がこの単一実装を共有する（第 2 の判定を作らない）。
+
+`filter`（述語形）から `engine::sql::allowlist::WherePredicate` への写像は
+`filter.rs::bind_filter_where_predicates` が担う。**不変条件**: 各要素は
+まず `declare_one(item, schema)?.bind(schema)?`（scan／search／aggregate の
+`filter` と共通の検証経路）を通してから構文形へ変換する——検証を経ない値は
+変換しない。述語形 DML の `content_hash`（`for_update_where`／
+`for_delete_where`）は束縛前の構文形 `WherePredicate` をハッシュ源にする
+ため、SQL 表層の等価な文（`WHERE <col> = '<v>'`・`WHERE <col> LIKE
+'<prefix>%'`）と同一の `WherePredicate` を生成することが SQL⇄NoSQL 台帳照合
+（`23505`／`22023`）成立の必須条件になる。
+
+既知の非対称:
+
+- `prefix` は LIKE のメタ文字（`\`・`%`・`_`）を `filter.rs::like_escape`
+  でエスケープしてから `%` を付与するため、パターン長が最大約 2 倍になる。
+  `MAX_LIKE_PATTERN_LEN` 超過（`54000`）が scan／search の `filter` より
+  短い入力長で起きうる。
+- `eq` × `NUMERIC` は JSON 数値を文字列リテラル形へ変換した
+  `WherePredicate::Equality` になる（SQL の `WHERE col = '1.5'` と同一
+  ハッシュ）。SQL の裸の数値形 `WHERE col = 1.5`（式レーン）とは別ハッシュ
+  になる（既知の差）。
+- `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq` は
+  scan／search／aggregate の `filter` と同じ理由（式レーンの入口が無い）で
+  `0A000`（Issue #945）。
+- 未マージの PR #1118（filter 演算子の拡充）が導入する `lt`／`le`／`gt`／
+  `ge`／`in`／`or` は、本 Issue の時点では述語形 DML でも受理しない
+  （`map_filter_items` の 2 語彙〔`eq`／`prefix`〕のみ）。
 
 ### D2: `set` の JSON → `InsertLiteral` 写像は engine の `bind_update` を再利用
 
@@ -222,22 +253,35 @@ id = n`〕ではなく `filter` 相当・SQL 表層は `WHERE <述語>`）は、
   （legacy 台帳エントリとの互換）・`crates/engine/tests/
   sql_predicate_dml_exec.rs::predicate_update_set_vector_column_resend_
   content_hash_matches_spelling_variants`（表記ゆれ・`-0.0` 保持を
-  production 経路で固定）。`filter` 未結線のため wire-server 越しの
-  述語形 E2E は本 Issue の対象外（単一行形の表層跨ぎは元々一致済みだが
+  production 経路で固定）。単一行形の表層跨ぎは
   `crates/wire-server/tests/nosql12_update_delete.rs::
-  cross_surface_vector_value_*` で層 A 固定を追加した）。
+  cross_surface_vector_value_*` で層 A 固定済み。述語形（`filter`。`WHERE`
+  対象列は `VECTOR` 以外——`filter` の `eq` は `VECTOR` 列を対象にできない
+  が、`SET` 側に `VECTOR` 列を含めることは述語形でも単一行形と同様に可能）の
+  跨表層一致・台帳照合は Issue #1062・`crates/wire-server/tests/
+  nosql12_update_delete.rs::
+  cross_surface_predicate_update_with_vector_set_resend_with_same_content_is_duplicate`
+  で固定する。
 
 ## 対象外・申し送り
 
-- 述語形（`filter`）の実行結線: Issue #871 の担当。結線後は D1 の `0A000`
-  分岐を実行結線へ置換する
 - fault-injection（Issue #829）の update/delete 版
   `maybe_panic_after_http_*_commit`: `FaultKind` 語彙拡張を伴うため本 Issue
   では追加しない
-- `three_client_http_e2e.rs` の update/delete パリティケース追加: Issue #877
-  の担当
+- `three_client_http_e2e.rs` の update/delete パリティケース追加（述語形を
+  含む）: Issue #877 の担当。述語形（`filter`）は複数プロセス・複数言語
+  クライアントを要する同ファイルへは拡張せず、層 A
+  （`nosql12_update_delete.rs`）でパリティ・台帳照合・RLS-9 を固定する
+  （Issue #1062）
 - RETURNING（Issue #873・PR #991）との統合: 本 Issue では `rows_affected`
   のみ
+- `filter` の `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・
+  PR #1118（未マージ）が導入する演算子（`lt`／`le`／`gt`／`ge`／`in`／`or`）
+  の述語形 DML への対応: Issue #945 の担当
+- `bind_predicate_delete` 自体に「`visible()` 単独の述語」を拒否する
+  ガードが無い点（SQL 表層側の既存事項）: NoSQL の入口
+  （`reject_unsupported_predicate_dml_forms`）は `PredicateCall` を拒否する
+  ため防御済みだが、SQL 表層自体のガード追加は別途申し送る
 
 ## 検証
 
