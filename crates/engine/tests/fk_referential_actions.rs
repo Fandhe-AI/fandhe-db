@@ -398,6 +398,56 @@ fn on_update_set_null_via_predicate_and_upsert() {
     );
 }
 
+// UNIQUE 対象（`ON CONFLICT (code)`）の UPSERT で、衝突する既存行の `id` が
+// VALUES 自身の `id` と異なる場合の回帰（PR #1138 codex/review・cursor bugbot
+// 指摘）。ON UPDATE pre-image は「実際に書き換わる既存行」の id で記録しなければ
+// ならず、VALUES の id で記録すると連鎖側が誤った（存在しない）親行を読み直し
+// CASCADE が発火しない。
+#[test]
+fn on_update_cascade_via_unique_target_upsert_uses_existing_row_id() {
+    let (core, path) = new_core("fkact-upd-cascade-unique-upsert");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    // `code` は（`PRIMARY KEY` ではなく）`UNIQUE` 制約として宣言する。
+    // `ON CONFLICT (code)` が `UpsertTarget::Unique` として解決されるには
+    // 宣言済み UNIQUE 制約との一致が必要（`PRIMARY KEY` 単独では一致しない）。
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE countries (code TEXT UNIQUE, label TEXT)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE cities (country TEXT REFERENCES countries(code) ON UPDATE CASCADE, name TEXT)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code) VALUES (1, 'JP') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO cities (id, country, name) VALUES (1, 'JP', 'Tokyo') USING OPERATION_ID 'op-c'",
+    );
+    // VALUES の `id`（99）は既存の衝突行の `id`（1）と異なる。`ON CONFLICT (code)`
+    // は UNIQUE 対象（natural key）なので、実際に書き換わるのは id=1 の既存行。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code) VALUES (99, 'JP') \
+         ON CONFLICT (code) DO UPDATE SET code = 'JPN' USING OPERATION_ID 'op-u'",
+    );
+    assert_eq!(
+        select_cell(&core, &alice, "cities", 1, "country"),
+        Some(Cell::Text("JPN".to_string()))
+    );
+    // 新規行（id=99）は挿入されていない（衝突により UPDATE のみが適用された）。
+    assert_eq!(select_cell(&core, &alice, "countries", 99, "code"), None);
+}
+
 // --- 多段連鎖・自己参照 ----------------------------------------------------------
 
 #[test]

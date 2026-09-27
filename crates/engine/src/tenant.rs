@@ -1741,12 +1741,18 @@ pub(crate) fn upsert_typed_rows_unchecked(
                             crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
                                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
                         // 書き換える前の全列値を ON UPDATE 連鎖の pre-image として
-                        // 積む（Issue #1076）。`id` 参照 FK は ON UPDATE で発火
-                        // しない（A7）ため、主キー・UNIQUE を宣言しないテーブルは
-                        // 複製コストを払わない（早期 return と同じ判定条件）。
+                        // 積む（Issue #1076）。UNIQUE 対象の衝突では実際に書き換える
+                        // 既存行が VALUES 自身の `id`（`*id`）と異なり得るため、必ず
+                        // 衝突判定で確定した `write_id` をキーに記録する（`*id` で
+                        // 記録すると、連鎖側の `collect_action_targets` が入力 id で
+                        // 親行を読み直して新キーを取得できず、`ON UPDATE CASCADE` 等が
+                        // 発火せず参照元行が残留し `23503` で失敗する。codex/review・
+                        // cursor bugbot 指摘）。`id` 参照 FK は ON UPDATE で発火しない
+                        // （A7）ため、主キー・UNIQUE を宣言しないテーブルは複製コストを
+                        // 払わない（早期 return と同じ判定条件）。
                         if schema.primary_key().is_some() || !schema.unique_constraints().is_empty()
                         {
-                            pre_images.record(*id, merged_values.clone());
+                            pre_images.record(write_id, merged_values.clone());
                         }
                         let mut embedding_value: Vec<f32> = existing.embedding.clone();
 
