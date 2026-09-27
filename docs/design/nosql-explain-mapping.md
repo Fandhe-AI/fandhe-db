@@ -184,4 +184,9 @@ PLAN` なし検索 `SELECT`・集計・広域取得への `EXPLAIN` を受理す
 - `search`（`explain` なし）の実行結線（#764）
 - `insert` の `gate.rs` 結線・成功応答（別 Issue）
 - 3 クライアント統合テスト（TASK-183）・確定化判定（TASK-185）
-- NoSQL 表層の `group_by` 配列形（複数列）受理（NOSQL-16 (b)。Issue #949）
+
+（NoSQL 表層の `group_by` 配列形・複数列受理〔NOSQL-16 (b)〕は Issue #949 で
+既に実装済み。`aggregate` の `explain: true`〔本 Issue #948〕は `execute` と
+同一の `bind`（`crates/wire-server/src/http/query/aggregate.rs`）を経由する
+ため複数列 `group_by` とも併用でき、後続 Issue の対象ではなくなったため
+本節から除いた）
