@@ -126,11 +126,13 @@ bind は同じ理由で起動拒否されます。`nosql` を選択すると、�
 集計の双方）は SQL テキストを組み立てずに `engine::sql::parser::BoundAggregate`
 へ直接束縛・実行し、SQL 表層と同一の結果（NULL・オーバーフロー `22003`・
 `VECTOR` 列拒否を含む）を返します（Issue #768・TASK-177・NOSQL-4）。
-`group_by`（単一列限定）・`having`（`=`／`<`／`<=`／`>`／`>=` の 5 演算子）は
-SQL-14 の `GROUP BY` 実行計画（`engine::sql::group_by::execute_grouped_aggregate`）
-へ写像し、グループ数上限（`MAX_GROUPS`＝10,000）・グループキー累計バイト・
-`HAVING` 述語数上限の超過はいずれも `wire_code` `54000` で拒否します
-（Issue #769・TASK-177・NOSQL-5）。`op: search`（`vector`／`plan` 排他・
+`group_by`（1〜8 列の列名配列。SQL-25 (d) の複数列 `GROUP BY` へ写像。
+Issue #949・NOSQL-16 (b)）・`having`（`=`／`<`／`<=`／`>`／`>=` の 5 演算子）は
+SQL-14／SQL-25 (d) の `GROUP BY` 実行計画（`engine::sql::group_by::
+execute_grouped_aggregate`）へ写像し、列数上限（`MAX_GROUP_BY_COLUMNS`＝8）・
+グループ数上限（`MAX_GROUPS`＝10,000）・グループキー累計バイト・`HAVING`
+述語数上限の超過はいずれも `wire_code` `54000` で拒否します
+（Issue #769・#949・TASK-177・NOSQL-5）。`op: search`（`vector`／`plan` 排他・
 `hybrid`／`mode`／`columns`）は SQL 表層の検索 `SELECT` と同一形の
 `engine::sql::parser::BoundStatement` へ束縛・実行し、`vector` 指定は
 `EngineCore::execute_bound_search_in_session`、`plan` 指定は

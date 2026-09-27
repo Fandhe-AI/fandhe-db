@@ -21,10 +21,12 @@ use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::row_codec::Value;
-use engine::sql::allowlist::{validate_sql, SqlSurfaceError, Statement, TableLookup};
+use engine::sql::allowlist::{
+    validate_sql, ScalarOrderKey, SqlSurfaceError, Statement, TableLookup, MAX_SCALAR_ORDER_KEYS,
+};
 use engine::sql::exec::{Cell, QueryResult};
 use engine::sql::mode::SessionState;
-use engine::sql::parser::{bind_aggregate, bind_scan};
+use engine::sql::parser::{bind_aggregate, bind_scan, BoundScan, ProjectedColumn};
 use engine::sql::SqlOutcome;
 use engine::storage::{RowInput, Storage, Visibility};
 
@@ -817,4 +819,162 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
         bound_err2.wire_code(),
         "HAVING key-column comparison wire_code mismatch: sql={sql_err2:?} bound={bound_err2:?}"
     );
+}
+
+// --- T5: `BoundScan::with_order_by`（NoSQL `sort` 表層向け入口。Issue #946・
+// NOSQL-15・SQL-25 (a)・TASK-224）が SQL テキスト経由の `ORDER BY` 束縛と
+// 等価な `BoundScan` を組み立てることの固定 ------------------------------------
+
+fn udf_registry() -> engine::sql::udf_call::UdfRegistry {
+    engine::sql::udf_call::UdfRegistry::default()
+}
+
+/// `SELECT id, lang FROM docs ORDER BY <sql_order_by> LIMIT <limit>` を
+/// `validate_sql` → `bind_scan` で束縛する（SQL テキスト経由のオラクル）。
+fn bind_scan_via_sql_text(
+    schema: &TableSchema,
+    sql_order_by: &str,
+    limit: usize,
+) -> Result<BoundScan, SqlSurfaceError> {
+    let sql = format!("SELECT id, lang FROM docs ORDER BY {sql_order_by} LIMIT {limit}");
+    let validated = validate_sql(&sql, &FixedTableLookup)?;
+    let Statement::Scan(validated_scan) = validated else {
+        panic!("expected Statement::Scan for {sql:?}");
+    };
+    bind_scan(&validated_scan, schema, &udf_registry())
+}
+
+/// `BoundScan::new` + [`BoundScan::with_order_by`]（NoSQL 表層の直接構築経路）
+/// で同じ `ORDER BY` を束縛する（Issue #946 で追加した builder のオラクル）。
+fn bind_scan_via_with_order_by(
+    schema: &TableSchema,
+    keys: &[ScalarOrderKey],
+    limit: usize,
+) -> Result<BoundScan, SqlSurfaceError> {
+    let projection = vec![
+        ProjectedColumn::Id,
+        ProjectedColumn::Column {
+            index: 1,
+            name: "lang".to_string(),
+        },
+    ];
+    BoundScan::new(TABLE.to_string(), projection, Vec::new(), Vec::new(), limit)
+        .with_order_by(keys, schema)
+}
+
+#[test]
+fn with_order_by_matches_sql_text_order_by_for_multiple_keys() {
+    let path = unique_db_path("bound-plan-with-order-by-equivalence");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_two_tenants(&storage);
+    let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
+
+    let keys = [
+        ScalarOrderKey {
+            column: "lang".to_string(),
+            descending: true,
+        },
+        ScalarOrderKey {
+            column: "id".to_string(),
+            descending: false,
+        },
+    ];
+    let via_sql =
+        bind_scan_via_sql_text(&schema, "lang DESC, id ASC", 10).expect("bind_scan via SQL text");
+    let via_builder =
+        bind_scan_via_with_order_by(&schema, &keys, 10).expect("with_order_by should bind");
+
+    assert_eq!(
+        via_sql, via_builder,
+        "BoundScan::with_order_by should produce a BoundScan identical to the SQL ORDER BY path"
+    );
+}
+
+#[test]
+fn with_order_by_empty_slice_is_a_no_op_equivalent_to_bound_scan_new() {
+    let path = unique_db_path("bound-plan-with-order-by-empty");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_two_tenants(&storage);
+    let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
+
+    let projection = vec![
+        ProjectedColumn::Id,
+        ProjectedColumn::Column {
+            index: 1,
+            name: "lang".to_string(),
+        },
+    ];
+    let plain = BoundScan::new(
+        TABLE.to_string(),
+        projection.clone(),
+        Vec::new(),
+        Vec::new(),
+        5,
+    );
+    let with_empty_order_by =
+        BoundScan::new(TABLE.to_string(), projection, Vec::new(), Vec::new(), 5)
+            .with_order_by(&[], &schema)
+            .expect("empty order_by slice should be accepted as a no-op");
+
+    assert_eq!(plain, with_empty_order_by);
+}
+
+#[test]
+fn with_order_by_rejects_more_than_max_scalar_order_keys_with_54000() {
+    let path = unique_db_path("bound-plan-with-order-by-key-limit");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_two_tenants(&storage);
+    let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
+
+    // ちょうど上限（8 キー）は受理される。`lang` を繰り返し指定しても
+    // 束縛段では列名の重複を拒否しないため、件数検査だけを固定できる。
+    let at_limit: Vec<ScalarOrderKey> = (0..MAX_SCALAR_ORDER_KEYS)
+        .map(|_| ScalarOrderKey {
+            column: "lang".to_string(),
+            descending: false,
+        })
+        .collect();
+    assert!(
+        bind_scan_via_with_order_by(&schema, &at_limit, 5).is_ok(),
+        "exactly MAX_SCALAR_ORDER_KEYS keys should be accepted"
+    );
+
+    // 上限超過（9 キー）は `54000`（payload_too_large）で拒否される。
+    let mut over_limit = at_limit;
+    over_limit.push(ScalarOrderKey {
+        column: "id".to_string(),
+        descending: false,
+    });
+    let err = bind_scan_via_with_order_by(&schema, &over_limit, 5)
+        .expect_err("MAX_SCALAR_ORDER_KEYS + 1 keys should be rejected");
+    assert_eq!(err.wire_code(), "54000", "err={err:?}");
+}
+
+#[test]
+fn with_order_by_rejects_unknown_column_and_vector_column_with_22000() {
+    let path = unique_db_path("bound-plan-with-order-by-invalid-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_two_tenants(&storage);
+    let schema = storage.get_table_schema(TABLE).expect("get_table_schema");
+
+    let unknown_column = [ScalarOrderKey {
+        column: "does_not_exist".to_string(),
+        descending: false,
+    }];
+    let err = bind_scan_via_with_order_by(&schema, &unknown_column, 5)
+        .expect_err("unknown column should be rejected");
+    assert_eq!(err.wire_code(), "22000", "err={err:?}");
+
+    // `embedding` は VECTOR 列（並べ替え不能。SQL-25 (a) と同じ判断）。
+    let vector_column = [ScalarOrderKey {
+        column: "embedding".to_string(),
+        descending: false,
+    }];
+    let err = bind_scan_via_with_order_by(&schema, &vector_column, 5)
+        .expect_err("VECTOR column should be rejected as unsortable");
+    assert_eq!(err.wire_code(), "22000", "err={err:?}");
 }
