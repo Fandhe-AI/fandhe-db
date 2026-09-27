@@ -164,6 +164,7 @@ pub(crate) mod hnsw_hybrid;
 pub(crate) mod join;
 pub mod lexer;
 pub mod mode;
+pub(crate) mod numeric_fn;
 pub mod params;
 pub mod parser;
 pub mod plan;

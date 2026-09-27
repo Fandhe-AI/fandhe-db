@@ -485,6 +485,7 @@ fn build_plan(
         projection: left_side_proj.to_projection(),
         where_predicates: left_where,
         limit: 1,
+        order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
     };
@@ -493,6 +494,7 @@ fn build_plan(
         projection: right_side_proj.to_projection(),
         where_predicates: right_where,
         limit: 1,
+        order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
     };

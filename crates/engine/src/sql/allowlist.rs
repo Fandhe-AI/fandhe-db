@@ -1051,6 +1051,26 @@ pub enum OrderByForm {
     UsingPlan,
 }
 
+/// 広域取得（`Statement::Scan`。SQL-15）に付与するスカラー列 `ORDER BY` の
+/// 1 キー分（Issue #915・SQL-25・TASK-209）。ベクトル順位付け形
+/// （[`OrderByForm::Distance`]／[`OrderByForm::FunctionCall`]）とは構文上
+/// 相互排他で、`OrderByForm` 自体へバリアントは追加しない（本リポの運用では
+/// 公開 enum への variant 追加が破壊的変更になる。`UsingPlan` 追加時と同じ判断）。
+/// [`ParsedScanShape`]／[`ValidatedScan`] 側にのみ載る。列名の意味論的解決・
+/// 比較規約の型ごとの割り当ては `sql::parser::bind_scan` の責務。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarOrderKey {
+    /// 並べ替えキーの列名（疑似列 `id` を含みうる。解決は束縛段）。
+    pub column: String,
+    /// 降順指定（`DESC`）。省略・`ASC` は昇順（`false`）。
+    pub descending: bool,
+}
+
+/// スカラー `ORDER BY` に指定できるキー数の上限（Issue #915 実装既定値。
+/// NOSQL-15〔#946・#947、対象外〕の同種上限と揃える）。超過は `54000`
+/// （[`SqlSurfaceError::payload_too_large`]）。
+pub const MAX_SCALAR_ORDER_KEYS: usize = 8;
+
 /// WHERE 句の許可形状。名前を照合する述語呼び出し形は、許可された名前
 /// （[`is_allowed_where_predicate_name`]）のみを通過させる。
 ///
@@ -1788,9 +1808,12 @@ pub struct ValidatedScan {
     /// [`ValidatedStatement::where_predicates`] と同一の許可形状を再利用する。
     pub(crate) where_predicates: Vec<WherePredicate>,
     /// `LIMIT` 句の値。可視かつ WHERE を満たす行を先頭から最大この件数だけ返す
-    /// （早期終了。順序保証はスナップショット内の物理走査順のみで、`ORDER BY`
-    /// 相当の意味的順序は持たない）。
+    /// （早期終了。`order_by` が空の場合、順序保証はスナップショット内の物理
+    /// 走査順のみで `ORDER BY` 相当の意味的順序を持たない）。
     pub(crate) limit: u32,
+    /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。空ならソート
+    /// なし（従来どおりの物理走査順。§1「広域取得」ドキュメント参照）。
+    pub(crate) order_by: Vec<ScalarOrderKey>,
     /// `OFFSET` 句の生値（既定 0。Issue #916・SQL-25 (b)・TASK-209）。可視かつ
     /// WHERE を満たす行のうち先頭からこの件数だけ読み飛ばしてから `limit` を
     /// 適用する（`sql::scan::execute_scan_with_budget`）。範囲検証は
@@ -1823,6 +1846,11 @@ impl ValidatedScan {
     /// が束縛時に行う）。
     pub fn limit(&self) -> u32 {
         self.limit
+    }
+
+    /// スカラー列 `ORDER BY` のキー列（Issue #915・SQL-25）。空ならソートなし。
+    pub fn order_by(&self) -> &[ScalarOrderKey] {
+        &self.order_by
     }
 
     /// `OFFSET` 句の値（構造検証済みの生値。既定 0。範囲検証は
@@ -3748,6 +3776,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 広域取得（`Statement::Scan`。SQL-15）へ付与するスカラー列
+    /// `ORDER BY <col> [ASC|DESC][, <col> [ASC|DESC]]*`（Issue #915・SQL-25・
+    /// TASK-209）。呼び出し元（[`parse_select_shape`]）は `ORDER` `BY` を
+    /// 消費済みで、直後のトークンがベクトル順位付け形（距離演算子・関数呼び
+    /// 出し）でないことを確認済みの前提で呼ぶ。`ASC`/`DESC` は予約語化せず、
+    /// [`Self::parse_aggregate_order_by`] と同じ文脈的（大文字小文字非区別）
+    /// 照合を各キーへ適用する（省略時は昇順）。1 キーの直後にベクトル順位付け
+    /// 形が続く混在形（例: `ORDER BY lang, embedding <=> '...'`）は §受入基準 3
+    /// の排他規定により `42601` で拒否する。キー数の上限は
+    /// [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`）。
+    fn parse_scalar_order_by(&mut self) -> Result<Vec<ScalarOrderKey>, SqlSurfaceError> {
+        let mut keys = Vec::new();
+        loop {
+            if keys.len() >= MAX_SCALAR_ORDER_KEYS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many scalar ORDER BY keys",
+                ));
+            }
+            let column = self.expect_ident()?;
+            if matches!(
+                self.peek(),
+                Some(Token::DistanceOp) | Some(Token::Punct('('))
+            ) {
+                return Err(SqlSurfaceError::unsupported(
+                    "ORDER BY cannot mix scalar columns with vector ranking expressions",
+                ));
+            }
+            let descending = if self.peek_ident_matches("DESC") {
+                self.advance();
+                true
+            } else if self.peek_ident_matches("ASC") {
+                self.advance();
+                false
+            } else {
+                false
+            };
+            keys.push(ScalarOrderKey { column, descending });
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
+    }
+
     /// 許可された ORDER BY 関数ごとに、引数の個数・位置・トークン種別を明示的に
     /// 解析する。`name` は [`is_allowed_order_by_function_name`] を通過済みの
     /// 前提で呼ばれる。呼び出し元の `expect_punct(')')` が閉じ括弧を消費するため、
@@ -5610,6 +5684,8 @@ struct ParsedScanShape {
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
     limit: u32,
+    /// スカラー列 `ORDER BY`（Issue #915・SQL-25）。空ならソートなし。
+    order_by: Vec<ScalarOrderKey>,
     offset: u32,
     /// ウィンドウ項目（SELECT リスト全体での出現位置つき）。空なら通常の広域取得。
     window_items: Vec<WindowSelectItem>,
@@ -6101,6 +6177,10 @@ fn parse_set_branch(
             projection,
             where_predicates,
             limit: crate::core::MAX_SEARCH_K as u32,
+            // Issue #915（SQL-25）: 集合演算の枝は上の構文検査
+            // （`Keyword::Order` を明示的に拒否）でスカラー ORDER BY も
+            // 受理しないため、常に空。
+            order_by: Vec::new(),
             offset: 0,
             // Issue #930（SQL-30・TASK-214）: 集合演算の枝は `parse_select_list`
             // （ウィンドウ非対応形）でのみ投影を解析するため、常に空
@@ -6116,6 +6196,7 @@ fn parse_set_branch(
                 view_columns.as_deref(),
                 &projection,
                 &where_predicates,
+                &[],
             )?;
             let projection = match (&projection, &view_columns) {
                 (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
@@ -6128,6 +6209,8 @@ fn parse_set_branch(
                 projection,
                 where_predicates: merged_where,
                 limit: crate::core::MAX_SEARCH_K as u32,
+                // 上と同じ理由（集合演算の枝は ORDER BY 非対応）。
+                order_by: Vec::new(),
                 offset: 0,
                 // 上と同じ理由（集合演算の枝はウィンドウ関数非対応）。
                 window_items: Vec::new(),
@@ -6369,15 +6452,16 @@ fn parse_select_shape(
             projection,
             where_predicates,
             limit,
+            order_by: Vec::new(),
             offset,
             window_items,
         }));
     }
 
-    // SQL-30・TASK-214: 残る経路は文全体のスカラー `ORDER BY` を伴う検索 SELECT
-    // （`docs/spec/04-behavior/sql-surface.md` SQL-25 の管轄。本 Issue のスコープ外
-    // ——TASK-209〔#915〕未マージのため §計画 2「対象外」）で、ウィンドウ項目とは
-    // 併用しない。
+    // SQL-30・TASK-214: 残る経路は文全体のスカラー `ORDER BY`（Issue #915・
+    // SQL-25・TASK-209）を伴う広域取得で、ウィンドウ項目とは併用しない
+    // （§計画 2「対象外」。ウィンドウ関数自身の順序付けは `OVER (... ORDER BY
+    // ...)` で個別に指定するため、文全体の `ORDER BY` と意味が重複する）。
     if !window_items.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "window functions cannot be combined with ORDER BY",
@@ -6386,6 +6470,56 @@ fn parse_select_shape(
 
     p.expect_keyword(Keyword::Order)?;
     p.expect_keyword(Keyword::By)?;
+
+    // Issue #915・SQL-25: `ORDER BY` 直後の先頭トークンがベクトル順位付け形
+    // （距離演算子形・関数呼び出し形。[`Parser::parse_order_by`] と同じ判定
+    // 基準——識別子の直後が距離演算子 `<=>` か `(`）でなければ、スカラー列の
+    // `ORDER BY` として広域取得（`ParsedSelect::Scan`）へ振り分ける。両者は
+    // 構文上相互排他（§受入基準 3）。
+    let is_vector_ranking = matches!(p.peek(), Some(Token::Ident(_)))
+        && matches!(
+            p.tokens.get(p.pos + 1),
+            Some(Token::DistanceOp) | Some(Token::Punct('('))
+        );
+
+    if !is_vector_ranking {
+        let order_by = p.parse_scalar_order_by()?;
+
+        p.expect_keyword(Keyword::Limit)?;
+        let limit_str = p.expect_number()?;
+        let limit: u32 = limit_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
+        })?;
+
+        // Issue #916・SQL-25 (b)・TASK-209: スカラー `ORDER BY` 付き広域取得も
+        // `LIMIT n` 直後の任意 `OFFSET m` を受理する（`ORDER BY` なし広域取得と
+        // 同じ許可リスト。docs/design/sql-offset-paging.md「ORDER BY なし
+        // OFFSET の意味論」節が申し送る #915 統合事項——ソート確定後に
+        // OFFSET を適用する契約は `sql::scan::execute_scan_with_budget` 側で
+        // 満たす）。
+        let offset = p.parse_optional_offset()?.unwrap_or(0);
+
+        // スカラー ORDER BY 付き広域取得は `LIMIT`／`OFFSET` 直後も文末専用
+        // （ベクトル順位付け専用の `USING MODE`・`HINT ORDER` はいずれも受理
+        // しない。上のベクトル順位付け経路と同じ「取得モード・評価順の余地を
+        // 持たない」契約——§受入基準 3）。
+        p.expect_end_of_statement()?;
+
+        return Ok(ParsedSelect::Scan(ParsedScanShape {
+            table_name,
+            projection,
+            where_predicates,
+            limit,
+            order_by,
+            offset,
+            // 直前のガード（`!window_items.is_empty()` は `42601`）により、
+            // この分岐に到達する時点で `window_items` は必ず空（ウィンドウ関数
+            // と本経路のスカラー ORDER BY は併用しない。SQL-30・TASK-214
+            // §計画 2「対象外」）。
+            window_items: Vec::new(),
+        }));
+    }
+
     let order_by = p.parse_order_by()?;
 
     p.expect_keyword(Keyword::Limit)?;
@@ -6709,12 +6843,17 @@ pub(crate) fn validate_sql_with_subquery_ctx(
 /// そのまま通る（第 2 の実行器を作らない設計）。`window_items` が参照する列
 /// （PARTITION BY／ORDER BY／集計引数）も、通常の投影・WHERE と同じく
 /// ビュー・CTE の公開列集合の範囲内であることを検査する。
+#[allow(clippy::too_many_arguments)]
 fn build_scan_from_resolved(
     table_name: String,
     resolved: super::view::Resolved,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
     limit: u32,
+    // Issue #915・SQL-25: CTE・ビュー経由の広域取得もスカラー ORDER BY を
+    // 持ちうる（`ParsedScanShape::order_by`）ため、キー列の可視性検査
+    // （`check_columns_within_view`）へそのまま橋渡しする。
+    order_by: Vec<ScalarOrderKey>,
     offset: u32,
     window_items: Vec<WindowSelectItem>,
 ) -> Result<ValidatedScan, SqlSurfaceError> {
@@ -6724,6 +6863,7 @@ fn build_scan_from_resolved(
             projection,
             where_predicates,
             limit,
+            order_by,
             offset,
             window_items,
         }),
@@ -6736,6 +6876,7 @@ fn build_scan_from_resolved(
                 view_columns.as_deref(),
                 &projection,
                 &where_predicates,
+                &order_by,
             )?;
             super::view::check_window_columns_within_view(view_columns.as_deref(), &window_items)?;
             let projection = if let (Projection::All, Some(cols)) = (&projection, &view_columns) {
@@ -6750,6 +6891,7 @@ fn build_scan_from_resolved(
                 projection,
                 where_predicates: merged,
                 limit,
+                order_by,
                 offset,
                 window_items,
             })
@@ -6945,10 +7087,15 @@ fn validate_sql_tokens_impl(
                     Some(cols) => Some(cols),
                     None => lookup.table_columns(base_table)?,
                 };
+                // `ParsedViewBody`（CTE 本文）は構文上 `ORDER BY` を持たない
+                // （`sql::allowlist::parse_view_body` のドキュメント参照）ため、
+                // 空スライスを渡す（主クエリ自身の ORDER BY 検査は
+                // `build_scan_from_resolved` 呼び出し側が別途行う）。
                 super::view::check_columns_within_view(
                     exposed.as_deref(),
                     &def.body.projection,
                     &def.body.where_predicates,
+                    &[],
                 )?;
             }
             let mut budget = super::cte::ResolveBudget::new();
@@ -6966,6 +7113,7 @@ fn validate_sql_tokens_impl(
                 shape.projection,
                 shape.where_predicates,
                 shape.limit,
+                shape.order_by,
                 shape.offset,
                 shape.window_items,
             )?))
@@ -7184,6 +7332,7 @@ fn validate_select_statement(
                 shape.projection,
                 shape.where_predicates,
                 shape.limit,
+                shape.order_by,
                 shape.offset,
                 shape.window_items,
             )?))

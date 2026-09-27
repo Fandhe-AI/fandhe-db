@@ -187,6 +187,17 @@ impl PolicyContext {
     pub fn is_owner(&self, row_tenant: &str) -> bool {
         row_tenant.as_bytes() == self.tenant_id.as_bytes()
     }
+
+    /// このコンテキストが他テナントの `Public` 行を可視とするか（Issue #915・
+    /// SQL-25）。`true`（既定の [`Self::new`] を含む多くのセッション）だと
+    /// `id` 順の並べ替えでも自テナントのパーティション走査だけでは可視行を
+    /// 網羅できない（`sql::scan` の経路 (A)／(B) の分岐に使う）。判定ロジック
+    /// 自体は増やさず、[`Self::is_visible`] が既に参照する `allowed.public`
+    /// を読み取り専用で公開するのみ（security.md P0: 判定パスを増やさない）。
+    #[inline]
+    pub(crate) fn allows_public(&self) -> bool {
+        self.allowed.public
+    }
 }
 
 #[cfg(test)]
