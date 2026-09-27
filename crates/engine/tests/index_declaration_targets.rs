@@ -172,9 +172,15 @@ fn scalar_declaration_has_no_effect_without_hnsw_opt_in() {
         "SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '[0,0,0,0,0,0,0,0]' LIMIT 5";
     core.execute_sql(&ctx("tenant-a"), query)
         .expect("query with lang filter");
+    // `ScalarIndexCache` は DISTANCE クエリ（`ORDER BY embedding <=> ...`）の
+    // SCALAR 段でのみ消費される（`sql::scan::execute_scan` は `WHERE` のみの
+    // クエリを別経路で処理しこのキャッシュを一切参照しない）。宣言（`lang`
+    // のみ）の非適用を `plain_scan_fallbacks` で固定するには、宣言外の
+    // `topic` 述語も DISTANCE クエリで観測しなければ検証にならない
+    // （`tests/index_declaration_targets.rs` レビュー指摘: PR #1124）。
     core.execute_sql(
         &ctx("tenant-a"),
-        "SELECT id FROM docs WHERE topic = 'alpha' LIMIT 5",
+        "SELECT id FROM docs WHERE topic = 'alpha' ORDER BY embedding <=> '[0,0,0,0,0,0,0,0]' LIMIT 5",
     )
     .expect("query with topic filter");
 
