@@ -2466,6 +2466,16 @@ fn try_scalar_index_aggregate(
 /// [`capture_scalar_index_snapshot`] による全行再走査（`is_capture_known_
 /// unbuildable` ゲート・`mark_capture_unbuildable` 記録を含む）へフォールバック
 /// する。
+///
+/// codex-review P2 指摘（Issue #1065・PR #1124）: 索引宣言（`resolve_scalar_
+/// index_target_in_txn`）の解決は `declared_index_targets_in_txn`
+/// （`IndexCatalogGateCache` を持たず、宣言数に比例するカタログ全件デコード
+/// を伴う）を呼ぶ。以前はこれをキャッシュ照会より先に行っていたため、
+/// 両キャッシュがともにヒットする通常の集計クエリでも毎回このデコードが
+/// 発生していた。`sql::exec::execute_statement_with_cache`（SELECT 経路）と
+/// 同じ方針に揃え、キャッシュヒット確認（下記の同一性ガード込み早期
+/// return）を先に行い、実際に構築（arena ヒット＋スカラーミスの部分構築、
+/// または両ミスの全走査採取）が必要になった場合にのみ宣言を解決する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_scalar_index_snapshot(
     read_txn: &redb::ReadTransaction,
@@ -2479,22 +2489,6 @@ pub(crate) fn ensure_scalar_index_snapshot(
     std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>,
     std::sync::Arc<crate::sql::scalar_index::ScalarIndex>,
 )> {
-    // 索引宣言（Issue #1065）を、このクエリが使っているのと同一の `read_txn`
-    // から解決する。カタログ読み取り失敗は「宣言なし→自動」へは倒さず即座に
-    // 構築不能（plain scan フォールバック）とする（`resolve_scalar_index_
-    // target_in_txn` ドキュメント参照）。
-    let target = match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
-        read_txn,
-        table,
-        scalar_access.declarations_enabled,
-    ) {
-        Ok(t) => t,
-        Err(()) => {
-            scalar_access.cache.record_build_failure();
-            return None;
-        }
-    };
-
     let arena_hit = arena_access
         .cache
         .lookup(arena_access.storage, read_txn, table, ctx);
@@ -2516,6 +2510,23 @@ pub(crate) fn ensure_scalar_index_snapshot(
             ));
         }
     }
+
+    // ここに到達するのは、これから構築（部分構築または全走査採取）が必要な
+    // 場合のみ。索引宣言（Issue #1065）を、このクエリが使っているのと同一の
+    // `read_txn` から解決する。カタログ読み取り失敗は「宣言なし→自動」へは
+    // 倒さず即座に構築不能（plain scan フォールバック）とする
+    // （`resolve_scalar_index_target_in_txn` ドキュメント参照）。
+    let target = match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+        read_txn,
+        table,
+        scalar_access.declarations_enabled,
+    ) {
+        Ok(t) => t,
+        Err(()) => {
+            scalar_access.cache.record_build_failure();
+            return None;
+        }
+    };
 
     if let Some(snapshot) = arena_hit {
         // Bugbot Medium 指摘: arena はヒット・スカラー索引はミス（または
