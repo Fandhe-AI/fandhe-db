@@ -579,9 +579,14 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 ```json
 [
   {"column": "lang", "op": "eq", "value": "ja"},
-  {"column": "count", "op": "gte", "value": 10}
+  {"column": "price", "op": "gte", "value": "10"}
 ]
 ```
+
+（`price` は `NUMERIC` 列を想定。`lt`／`le`／`lte`／`gt`／`ge`／`gte` は
+`DATE`・`TIMESTAMP`・`UUID`・`NUMERIC`・`BYTEA` 列のみ受理し、`INTEGER`／
+`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への範囲比較は `declare_range` が
+`0A000` で拒否する——後述「葉（leaf）」節参照）
 
 ```json
 [{"or": [
