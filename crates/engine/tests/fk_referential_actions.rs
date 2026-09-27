@@ -766,3 +766,88 @@ fn multiple_foreign_keys_to_the_same_parent_all_apply_before_validation() {
         Some(Cell::Null)
     );
 }
+
+// --- `id` 参照 FK と親側の PRIMARY KEY／UNIQUE 併存（codex-review・Cursor
+// Bugbot 指摘対応） -----------------------------------------------------------
+//
+// 参照元列を省略した `REFERENCES parents`（`PRIMARY KEY` 未宣言）は疑似列 `id`
+// へ解決される（D2）。親テーブルが `id` 以外の列に `UNIQUE`／`PRIMARY KEY` を
+// 別途宣言していると、`tenant.rs` の削除経路は「参照先になり得る」と判定して
+// 削除前の全列値（`removed_pre_images`）を積む。`id` 参照の `ON DELETE`
+// アクションはこの pre-image 付き経路（`collect_action_targets` の限定版）を
+// 通るため、`fk.parent_columns()`（疑似列 `id`）をライブスキーマの実列として
+// 検索すると内部エラーになっていた（修正前は `CASCADE`／`SET NULL` のいずれも
+// 適用前に失敗していた）。
+
+#[test]
+fn on_delete_cascade_for_id_reference_with_unrelated_parent_unique_column_succeeds() {
+    let (core, path) = new_core("fkact-id-ref-parent-unique-cascade");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE parents (code TEXT UNIQUE, name TEXT)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (parent_id BIGINT REFERENCES parents ON DELETE CASCADE, note TEXT)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code, name) VALUES (1, 'p-1', 'p1') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, parent_id) VALUES (10, 1) USING OPERATION_ID 'op-c'",
+    );
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'",
+    );
+    assert_eq!(row_count(&core, &alice, "parents"), 0);
+    assert_eq!(row_count(&core, &alice, "children"), 0);
+}
+
+#[test]
+fn on_delete_set_null_for_id_reference_with_unrelated_parent_unique_column_succeeds() {
+    let (core, path) = new_core("fkact-id-ref-parent-unique-setnull");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE parents (code TEXT UNIQUE, name TEXT)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (parent_id BIGINT REFERENCES parents ON DELETE SET NULL, note TEXT)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code, name) VALUES (1, 'p-1', 'p1') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, parent_id) VALUES (10, 1) USING OPERATION_ID 'op-c'",
+    );
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'",
+    );
+    assert_eq!(row_count(&core, &alice, "children"), 1);
+    assert_eq!(
+        select_cell(&core, &alice, "children", 10, "parent_id"),
+        Some(Cell::Null)
+    );
+}

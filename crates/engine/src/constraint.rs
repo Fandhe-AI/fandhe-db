@@ -1748,17 +1748,28 @@ fn collect_action_targets(
                 if child_rows.is_empty() {
                     return Ok(Vec::new());
                 }
-                let parent_indices: Vec<usize> = fk
-                    .parent_columns()
-                    .iter()
-                    .map(|name| {
-                        parent_schema
-                            .columns
-                            .iter()
-                            .position(|c| &c.name == name)
-                            .ok_or_else(|| internal("referenced column not found in parent schema"))
-                    })
-                    .collect::<Result<_, _>>()?;
+                // `id` 参照（`fk.references_parent_id()`）は `parent_columns()` が
+                // 疑似列 `id`（`parent_schema.columns` には存在しない物理キー）を
+                // 返すため、列参照 FK と同じ `position()` 検索を行うと常に失敗する
+                // （codex-review・Cursor Bugbot 指摘・Issue #1076）。`parent_indices`
+                // は下記の `old_key` 算出で列参照 FK（`else` 分岐）にのみ使うため、
+                // `id` 参照では検索自体を行わず空のままにする。
+                let parent_indices: Vec<usize> = if fk.references_parent_id() {
+                    Vec::new()
+                } else {
+                    fk.parent_columns()
+                        .iter()
+                        .map(|name| {
+                            parent_schema
+                                .columns
+                                .iter()
+                                .position(|c| &c.name == name)
+                                .ok_or_else(|| {
+                                    internal("referenced column not found in parent schema")
+                                })
+                        })
+                        .collect::<Result<_, _>>()?
+                };
                 // 列参照 FK は親テーブルを 1 回だけ走査し、存在するキーの集合を作る
                 // （`ColumnsUpdated` 分岐の点照会 `read_parent_row_values` と異なり、
                 // 削除された行はもう `id` で読み戻せないため、キーバイト列の集合との
@@ -2072,17 +2083,39 @@ fn apply_referential_action(
     is_delete: bool,
 ) -> Result<(PropagatedChange, Option<UpdatedKeyPreImages>), TenantWriteError> {
     if is_delete && matches!(action, ReferentialAction::Cascade) {
-        // `ON DELETE CASCADE`: 子行そのものを削除する。
+        // `ON DELETE CASCADE`: 子行そのものを削除する。孫段の再帰
+        // （`propagate_referential_actions`）が「今回の文で実際に削除された行」
+        // だけを対象にできるよう、削除前の全列値を pre-image として記録して
+        // `Some` で返す（codex-review 指摘・Issue #1076: ここで `None` を返すと
+        // 孫段の `collect_action_targets` は `Removed` 分岐の限定版
+        // （`pre_images` 使用）を選べず、フォールバックの全体スキャンで
+        // `INITIALLY DEFERRED` の一時的な合法孤立行まで連鎖対象にしてしまう
+        // ——`tenant.rs` の `remove` 呼び出し元が積む `removed_pre_images` と
+        // 同じ契約をこの CASCADE 経由の削除にも適用する）。
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
         let mut row_table = write_txn
             .open_table(crate::catalog::user_rows_table_def(&row_table_name))
             .map_err(crate::catalog::map_row_table_error)?;
+        let mut pre_images = UpdatedKeyPreImages::new();
         for (id, _) in affected {
-            row_table
-                .remove((tenant_id, *id))
-                .map_err(CatalogError::from)?;
+            let key = (tenant_id, *id);
+            let Some(guard) = row_table.get(&key).map_err(CatalogError::from)? else {
+                // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
+                continue;
+            };
+            let existing = crate::storage::decode_row_for_key(tenant_id, *id, guard.value())
+                .map_err(TenantWriteError::Storage)?;
+            // `guard`（`row_table` の不変借用）を、直後の可変借用（`remove`）と
+            // 衝突しないよう明示的に drop する（`existing` は既にデータを
+            // 複製済みのため、以降 `guard`／借用元バッファへは触れない）。
+            drop(guard);
+            let old_values =
+                crate::row_codec::decode_scalar_columns(child_schema, &existing.metadata)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            pre_images.record(*id, old_values);
+            row_table.remove(key).map_err(CatalogError::from)?;
         }
-        return Ok((PropagatedChange::Removed, None));
+        return Ok((PropagatedChange::Removed, Some(pre_images)));
     }
 
     // `SET NULL`／`SET DEFAULT`／`ON UPDATE CASCADE`: 子行の FK 列を書き換える
