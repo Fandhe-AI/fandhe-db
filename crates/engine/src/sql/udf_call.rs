@@ -2791,7 +2791,7 @@ pub(crate) fn eval_binary<'a>(
                 datetime_fn::date_add_days(d, n).map(ExprValue::Date)
             }
             (ExprValue::Date(d), ExprValue::Scalar(n)) if op == BinOp::Sub => {
-                datetime_fn::date_add_days(d, -n).map(ExprValue::Date)
+                datetime_fn::date_sub_days(d, n).map(ExprValue::Date)
             }
             (ExprValue::Scalar(n), ExprValue::Date(d)) if op == BinOp::Add => {
                 datetime_fn::date_add_days(d, n).map(ExprValue::Date)

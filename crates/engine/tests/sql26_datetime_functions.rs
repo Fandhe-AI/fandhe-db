@@ -693,3 +693,92 @@ fn date_part_rejects_bare_null_first_argument() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
 }
+
+// --- DATE 減算の i32::MIN 境界値（codex P1 指摘対応。PR #1120） -------------
+//
+// `DATE - n` を `date_add_days(d, -n)` として実装すると、`n == i32::MIN`
+// （`-2147483648`。それ自体は妥当な `i32` 値）の符号反転が `i32` の範囲を
+// オーバーフローし、妥当な `n` が「`i32` 範囲外」という誤った `22003` で
+// 拒否されていた。`date_sub_days` が符号反転前に `n` を検証する回帰を固定する。
+//
+// `sql::allowlist::Parser::parse_primary_expr` は一般の式位置で単項マイナスの
+// 数値リテラルを受理しない（`HAVING`／`INSERT` の値のみ特例で受理する構造的
+// 制約）ため、`n = i32::MIN` は `(0 - 2147483648)`（Scalar 同士の減算）として
+// 表現し、`DATE - Scalar` の右辺に渡す。
+
+#[test]
+fn date_subtraction_with_i32_min_operand_is_accepted_not_rejected_as_out_of_range() {
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    // `DATE_MIN_DAYS`（`0001-01-01`）を基準日にする: `n = i32::MIN` の減算
+    // 結果（`days - i32::MIN` = `days + 2147483648`）はこの基準日でなら
+    // ちょうど `i32` の範囲には収まるが `DATE` の受理範囲（`0001-01-01`〜
+    // `9999-12-31`）を大きく超えるため、修正後は「計算結果が範囲外」
+    // （`22008`）になる。旧実装（符号反転後に範囲検査）は `days` に関わらず
+    // 符号反転自体で `22003` になっていたため、`days` を変えても常に同じ
+    // （誤った）エラーコードだった。
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "0001-01-01", "2024-01-01 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let err = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE day - (0 - 2147483648) > day AND id = 1 LIMIT 10"
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.wire_code(),
+        "22008",
+        "a valid i32::MIN operand must not be rejected as operand-out-of-range (22003); \
+         the result is genuinely outside DATE's representable range"
+    );
+
+    // `n` が非整数か `i32` 範囲外の場合の通常の拒否（`22000`／`22003`）は
+    // 従来どおり機能する。
+    let err = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT id FROM {TABLE} WHERE day - 1.5 < day AND id = 1 LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+
+    let err = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT id FROM {TABLE} WHERE day - 3000000000 < day AND id = 1 LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22003");
+}
+
+#[test]
+fn date_subtraction_within_range_still_computes_correctly() {
+    // `date_sub_days` への切り替えが通常範囲の計算結果を変えないことを固定する
+    // （`SELECT` 頂点の非関数式は受理しない既存の構造的制約のため、`WHERE` の
+    // 等価比較で計算結果を検証する。`where_date_arithmetic_and_cross_type_
+    // comparison` と同じ流儀）。
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE day - 10 = DATE '2024-06-05' AND id = 1 LIMIT 10"
+            ),
+        )
+        .expect("DATE - n within range should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+}

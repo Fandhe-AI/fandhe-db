@@ -262,10 +262,11 @@ pub(crate) fn date_trunc(unit: DateTruncUnit, micros: i64) -> Result<i64, SqlSur
     Ok(result_micros)
 }
 
-/// `DATE + n`／`n + DATE`／`DATE - n`（`n` は日数のスカラー）。`n` が整数でない
-/// 場合は `22000`、`i32` 範囲外は `22003`（[`SqlSurfaceError::numeric_out_of_range`]）、
-/// 結果が `DATE` の受理範囲外は `22008` で拒否する（§2-2）。
-pub(crate) fn date_add_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
+/// `n` が整数値の `f64` であり `i32` の受理範囲内であることを検証し、
+/// 値を保存したまま `i32` へ変換する（`date_add_days`／`date_sub_days` の
+/// 共有前段。両者とも符号反転前にこの検証を行う契約 ― `date_sub_days` の
+/// ドキュメンテーションコメント参照）。
+fn validate_and_narrow_date_arithmetic_operand(n: f64) -> Result<i32, SqlSurfaceError> {
     if !n.is_finite() || n.fract() != 0.0 {
         return Err(SqlSurfaceError::invalid_input(
             "DATE arithmetic operand must be a whole number of days",
@@ -278,8 +279,43 @@ pub(crate) fn date_add_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
     }
     // 上の範囲検査により `n` は `i32` の範囲内の整数値であることが確定して
     // いるため `as i32` は値を保存する（丸め・切り捨ては発生しない）。
-    let n_i32 = n as i32;
+    Ok(n as i32)
+}
+
+/// `DATE + n`／`n + DATE`（`n` は日数のスカラー）。`n` が整数でない場合は
+/// `22000`、`i32` 範囲外は `22003`（[`SqlSurfaceError::numeric_out_of_range`]）、
+/// 結果が `DATE` の受理範囲外は `22008` で拒否する（§2-2）。
+pub(crate) fn date_add_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
+    let n_i32 = validate_and_narrow_date_arithmetic_operand(n)?;
     let result = days.checked_add(n_i32).ok_or_else(|| {
+        SqlSurfaceError::numeric_out_of_range(
+            "DATE arithmetic result overflows the day-count range",
+        )
+    })?;
+    if !crate::datetime::validate_date_days(result) {
+        return Err(SqlSurfaceError::datetime_field_overflow(
+            "DATE arithmetic result is out of the representable range",
+        ));
+    }
+    Ok(result)
+}
+
+/// `DATE - n`（`n` は日数のスカラー）。エラー分類は [`date_add_days`] と同じ
+/// （`22000`／`22003`／`22008`）。
+///
+/// Cursor Bugbot 指摘対応（PR #1120）: `n` を先に符号反転してから
+/// `date_add_days` へ委譲する実装だと、`n == i32::MIN`
+/// （`-2147483648`。これ自体は妥当な `i32` 値）の符号反転が `i32` の範囲を
+/// オーバーフローし（`-i32::MIN == 2147483648 > i32::MAX`）、妥当な `n` が
+/// 「`i32` 範囲外」という誤ったエラー（`22003`）で拒否されてしまっていた。
+/// `n` 自身は符号反転前に検証し、実際の減算は `i64` の広い範囲で行うことで
+/// この境界値を正しく扱う。
+pub(crate) fn date_sub_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
+    let n_i32 = validate_and_narrow_date_arithmetic_operand(n)?;
+    // `i32::MIN` を含むすべての `i32` 値は `i64` へ無損失に拡張できるため、
+    // ここでの減算は桁あふれしない。
+    let result_i64 = i64::from(days) - i64::from(n_i32);
+    let result = i32::try_from(result_i64).map_err(|_| {
         SqlSurfaceError::numeric_out_of_range(
             "DATE arithmetic result overflows the day-count range",
         )
@@ -414,6 +450,37 @@ mod tests {
         assert_eq!(
             date_add_days(base, 30.0).unwrap(),
             crate::datetime::parse_date("2024-01-31").unwrap()
+        );
+    }
+
+    /// codex 指摘対応（PR #1120）: `n == i32::MIN` の符号反転オーバーフローで
+    /// 妥当な `n` を誤って「範囲外」（`NumericOutOfRange`）扱いしないことを
+    /// 固定する（`date_sub_days` のドキュメンテーションコメント参照）。
+    #[test]
+    fn date_sub_days_handles_i32_min_operand_without_negation_overflow() {
+        // `DATE_MIN_DAYS`（`0001-01-01`）を基準日にすると、`n = i32::MIN` の
+        // 減算結果（`days - i32::MIN` = `days + 2147483648`）はちょうど `i32`
+        // の範囲には収まるが `DATE` の受理範囲を大きく超えるため
+        // `DatetimeFieldOverflow`（`22008`）になるべきで、`NumericOutOfRange`
+        // （`22003`、オペランド自体が無効という意味）になってはならない
+        // （旧実装は符号反転自体が `i32` をオーバーフローし `base` に関わらず
+        // 常に `NumericOutOfRange` になっていた）。
+        let base = crate::datetime::DATE_MIN_DAYS;
+        let err = date_sub_days(base, f64::from(i32::MIN)).unwrap_err();
+        assert!(matches!(err, SqlSurfaceError::DatetimeFieldOverflow { .. }));
+
+        let normal_base = crate::datetime::parse_date("2024-01-01").unwrap();
+        assert!(matches!(
+            date_sub_days(normal_base, 1.5).unwrap_err(),
+            SqlSurfaceError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            date_sub_days(normal_base, 3_000_000_000.0).unwrap_err(),
+            SqlSurfaceError::NumericOutOfRange { .. }
+        ));
+        assert_eq!(
+            date_sub_days(normal_base, 10.0).unwrap(),
+            crate::datetime::parse_date("2023-12-22").unwrap()
         );
     }
 }
