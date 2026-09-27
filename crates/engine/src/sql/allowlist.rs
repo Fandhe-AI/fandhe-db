@@ -70,7 +70,12 @@ use crate::catalog::MAX_PRIMARY_KEY_COLUMNS;
 /// 確保（DoS）」対応）。超過は行を `rows` へ追加する直前（書き込みトランザクション
 /// 開始のはるか手前・構造検証段階）に検出し、[`SqlSurfaceError::payload_too_large`]
 /// （`54000`）で fail-closed に拒否する（副作用ゼロ）。
-const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
+///
+/// `pub(crate)`（Issue #997）: `sql::parser::DmlLimits::default` が既定値として
+/// 参照する（起動時 CLI 未指定時に現行挙動＝本定数と同値を維持するため。値の
+/// 実際の判定は [`Parser::max_insert_rows`] フィールド経由——本定数は
+/// [`Parser::new`] の既定初期化と `DmlLimits::default` の 2 箇所からのみ参照する）。
+pub(crate) const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 
 /// `<col> IN (...)`（SQL-24。ポインタ: `docs/spec/05-tasks.md` TASK-208、
 /// `docs/spec/04-behavior/sql-surface.md` SQL-24）に指定できる要素数の上限。
@@ -2457,6 +2462,13 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// 複数行 `VALUES` が持てる行数の上限（[`Self::parse_insert`] が判定に使う）。
+    /// 既定値は [`MAX_INSERT_ROWS_PER_STATEMENT`]。[`Self::with_max_insert_rows`]
+    /// で差し替える呼び出し元（`validate_insert_tokens_with_limit`）以外は
+    /// すべて既定値のまま構文検証する（Issue #997。CLI 起動時設定値の到達点は
+    /// 単一の構文検証エントリポイントに限定し、他の `Parser::new` 呼び出しには
+    /// 影響を与えない）。
+    max_insert_rows: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -2468,7 +2480,15 @@ impl<'a> Parser<'a> {
             subquery_ctx: None,
             case_nesting: 0,
             allow_null_literal: false,
+            max_insert_rows: MAX_INSERT_ROWS_PER_STATEMENT,
         }
+    }
+
+    /// 複数行 `VALUES` の行数上限を CLI 設定値へ差し替える（Issue #997）。
+    /// [`validate_insert_tokens_with_limit`] のみが呼ぶ。
+    fn with_max_insert_rows(mut self, limit: usize) -> Self {
+        self.max_insert_rows = limit;
+        self
     }
 
     /// サブクエリを許可する文脈で構築する（Issue #927・TASK-213）。`depth` は
@@ -4492,9 +4512,11 @@ impl<'a> Parser<'a> {
     /// VALUES (<lit>[, <lit>]*)[, (<lit>[, <lit>]*)]*
     /// USING OPERATION_ID '<id>' [;]` を受理する（SQL-10・SQL-16、TASK-80・TASK-190）。
     /// 複数行 `VALUES` は行の繰り返し（`, (...)`）として受理し、行数は
-    /// [`MAX_INSERT_ROWS_PER_STATEMENT`] を超えない（超過は `54000`）。各行の
-    /// リテラル数は列数と一致する必要がある（不一致は行ごとに検出して拒否）。
-    /// RETURNING・可視性ラベル指定は引き続き構造的に受理しない。
+    /// [`Self::max_insert_rows`]（既定値 [`MAX_INSERT_ROWS_PER_STATEMENT`]。
+    /// Issue #997 で CLI 起動時設定値へ差し替え可能にした）を超えない
+    /// （超過は `54000`）。各行のリテラル数は列数と一致する必要がある
+    /// （不一致は行ごとに検出して拒否）。RETURNING・可視性ラベル指定は
+    /// 引き続き構造的に受理しない。
     fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
         self.expect_contextual_keyword("INSERT")?;
         self.expect_contextual_keyword("INTO")?;
@@ -4515,9 +4537,10 @@ impl<'a> Parser<'a> {
         let mut rows: Vec<Vec<InsertLiteral>> = vec![self.parse_insert_values_row(&columns)?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            if rows.len() >= MAX_INSERT_ROWS_PER_STATEMENT {
+            if rows.len() >= self.max_insert_rows {
+                let max_insert_rows = self.max_insert_rows;
                 return Err(SqlSurfaceError::payload_too_large(format!(
-                    "INSERT statement exceeds the allowed row count ({MAX_INSERT_ROWS_PER_STATEMENT})"
+                    "INSERT statement exceeds the allowed row count ({max_insert_rows})"
                 )));
             }
             rows.push(self.parse_insert_values_row(&columns)?);
@@ -8071,24 +8094,36 @@ pub fn validate_insert(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
-    validate_insert_tokens(&tokens, lookup, mode)
+    validate_insert_with_limit(sql, lookup, mode, MAX_INSERT_ROWS_PER_STATEMENT)
 }
 
-/// [`validate_insert`] の本体（Issue #485・単文 INSERT 経路の上位段改善）。
-/// トークン列を受け取ることで、呼び出し元
-/// （`core.rs::execute_sql_in_session`）が既に先頭トークン判定のために
-/// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
-/// （TASK-83 条件7・Issue #314 で `execute_validated_in_session` が SELECT 側に
-/// 行った「二重パース排除」の INSERT 側対応）。`validate_insert`（`sql: &str`
-/// を受け取る公開 API）は内部でトークナイズしてから本関数へ委譲するため、
-/// 挙動・エラー契約・検証順序はいずれも分割前と不変。
-pub(crate) fn validate_insert_tokens(
+/// [`validate_insert`] の行数上限差し替え版（Issue #997。CLI 起動時設定値
+/// `EngineCore::dml_limits.max_insert_rows_per_statement` を到達させる唯一の
+/// 公開エントリポイント）。`validate_insert` は本関数へ既定値
+/// [`MAX_INSERT_ROWS_PER_STATEMENT`] を渡すだけの薄い委譲であり、既存呼び出し元の
+/// シグネチャ・挙動は不変（pub API の破壊的変更を避ける設計判断）。
+pub fn validate_insert_with_limit(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+    max_insert_rows: usize,
+) -> Result<ValidatedInsert, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_insert_tokens_with_limit(&tokens, lookup, mode, max_insert_rows)
+}
+
+/// [`validate_insert_tokens`] の行数上限差し替え版（Issue #997）。
+/// `core.rs::EngineCore` の 3 つの INSERT 実行エントリポイント
+/// （`execute_insert_sql`・`parse_tokens` の INSERT 分岐・`execute_insert_sql_batch`）は
+/// いずれも本関数（または [`validate_insert_with_limit`]）を経由し、
+/// `self.dml_limits.max_insert_rows_per_statement` を渡す。
+pub(crate) fn validate_insert_tokens_with_limit(
     tokens: &[lexer::Token],
     lookup: &impl TableLookup,
     mode: LedgerMode,
+    max_insert_rows: usize,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
     let shape = p.parse_insert()?;
     p.expect_end_of_statement()?;
 

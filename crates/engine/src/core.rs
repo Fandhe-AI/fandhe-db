@@ -1075,6 +1075,12 @@ pub struct EngineCore {
     /// 明示トランザクション（SQL-31・TASK-221）の持続時間・文数の上限。差し替えは
     /// [`Self::with_transaction_limits`] のみ。
     transaction_limits: crate::sql::transaction::TransactionLimits,
+    /// 述語形 UPDATE/DELETE の 1 文あたり影響行数上限・複数行 `VALUES` の
+    /// 1 文あたり行数上限（Issue #997。オーナー判断 2026-09-27: プロセス全体を
+    /// 起動時 CLI フラグで設定可能にする。セッション・テナント単位は対象外）。
+    /// 差し替えは [`Self::with_dml_limits`] のみ。`crate::sql::parser::DmlLimits`
+    /// モジュールドキュメント参照。
+    dml_limits: crate::sql::parser::DmlLimits,
     /// `dictionary.rs` の辞書的情報源（TASK-109・PLAN-5）の世代整合キャッシュ。
     /// [`Self::dictionary_snapshot`] がこれを経由して再構築を再利用する（詳細は
     /// [`DictionaryCache`] のドキュメント参照）。
@@ -1565,6 +1571,7 @@ impl EngineCore {
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
+            dml_limits: crate::sql::parser::DmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
@@ -1728,6 +1735,18 @@ impl EngineCore {
         limits: crate::sql::transaction::TransactionLimits,
     ) -> Self {
         self.transaction_limits = limits;
+        self
+    }
+
+    /// 述語形 UPDATE/DELETE の 1 文あたり影響行数上限・複数行 `VALUES` の
+    /// 1 文あたり行数上限（[`crate::sql::parser::DmlLimits`]）を差し替えた
+    /// ビルダーを返す（[`Self::with_batch_limits`] と同じ流儀。未呼び出しなら
+    /// `DmlLimits::default()`＝既定値 1,000・現行挙動を維持）。Issue #997・
+    /// オーナー判断 2026-09-27: `wire-server` の起動時 CLI フラグ（プロセス全体・
+    /// 1 回限り）から本メソッドを経由して設定する契約で、セッション・テナント
+    /// 単位で差し替える経路は設けない。
+    pub fn with_dml_limits(mut self, limits: crate::sql::parser::DmlLimits) -> Self {
+        self.dml_limits = limits;
         self
     }
 
@@ -2587,9 +2606,13 @@ impl EngineCore {
         );
         if is_insert_statement {
             let lookup = InsertSchemaLookup::new(&self.storage);
-            let stmt =
-                crate::sql::allowlist::validate_insert_tokens(&tokens, &lookup, self.ledger_mode)
-                    .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            let stmt = crate::sql::allowlist::validate_insert_tokens_with_limit(
+                &tokens,
+                &lookup,
+                self.ledger_mode,
+                self.dml_limits.max_insert_rows_per_statement,
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Insert(stmt));
         }
 
@@ -5967,7 +5990,12 @@ impl EngineCore {
         // 束縛・実行本体は [`Self::execute_insert_form`] へ委譲する（`core.rs::
         // execute_sql_in_session` の INSERT 分岐と共有し二重実装を避けるため）。
         let lookup = InsertSchemaLookup::new(&self.storage);
-        let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+        let stmt = crate::sql::allowlist::validate_insert_with_limit(
+            sql,
+            &lookup,
+            self.ledger_mode,
+            self.dml_limits.max_insert_rows_per_statement,
+        )?;
         // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
         // （[`Self::execute_sql_in_session`]）専用。本エントリポイントは
         // `SqlOutcome` を持たず戻り値型が `InsertOutcome` 固定のため、
@@ -5983,8 +6011,11 @@ impl EngineCore {
     }
 
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の
-    /// INSERT 分岐が共有する束縛〜実行本体（Issue #485）。`validate_insert`／
-    /// `validate_insert_tokens` が返した `stmt` と、その検証時に使った
+    /// INSERT 分岐が共有する束縛〜実行本体（Issue #485）。
+    /// `sql::allowlist::validate_insert_with_limit`／
+    /// `validate_insert_tokens_with_limit`（Issue #997 で行数上限を設定可能に
+    /// した現行版。呼び出し元は `self.dml_limits.max_insert_rows_per_statement`
+    /// を渡す）が返した `stmt` と、その検証時に使った
     /// `lookup`（`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
     /// [`InsertSchemaLookup::take_schema`] でスキーマを再取得できればそれを
     /// 使い、できなければ（名前不一致・未保持の防御的経路）`get_table_schema`
@@ -6275,6 +6306,7 @@ impl EngineCore {
             self.ledger_mode,
             &schema,
             &content_hash_value,
+            self.dml_limits.max_affected_rows,
         )
     }
 
@@ -6483,6 +6515,7 @@ impl EngineCore {
             &schema,
             &content_hash_value,
             legacy_hashes,
+            self.dml_limits.max_affected_rows,
         )
     }
 
@@ -6596,7 +6629,12 @@ impl EngineCore {
             // 共有しない一時オブジェクトのため文をまたいだ取り違えは
             // 起こらない）。
             let lookup = InsertSchemaLookup::new(&self.storage);
-            let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+            let stmt = crate::sql::allowlist::validate_insert_with_limit(
+                sql,
+                &lookup,
+                self.ledger_mode,
+                self.dml_limits.max_insert_rows_per_statement,
+            )?;
             // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路専用
             // （`execute_insert_sql` と同じ理由）。本エントリポイントはファイル形
             // 専用のバッチ投入であり、`RETURNING` はいずれにせよファイル形では

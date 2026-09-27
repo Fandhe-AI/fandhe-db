@@ -214,6 +214,77 @@ fn multi_row_insert_exceeding_row_limit_is_rejected_with_54000_and_no_side_effec
 }
 
 // ---------------------------------------------------------------------
+// Issue #997: `--max-insert-rows`（`EngineCore::dml_limits.
+// max_insert_rows_per_statement`）による行数上限の起動時設定。
+// ---------------------------------------------------------------------
+
+/// 既定値（1,000）より低い値へ絞った構成では、既定値以下の行数でも構文段
+/// （`sql::allowlist::Parser::parse_insert`）で `54000`（副作用ゼロ）になる。
+/// `batch_limits.max_files_per_batch`（既定 64）はここでは変更しないため、
+/// 本テストが検出する拒否が `dml_limits`（本 Issue が新設した経路）由来であり
+/// `batch_limits`（既存の別上限。Issue #860）由来でないことを、行数を
+/// `batch_limits` の既定値未満（3 行）に保つことで切り分ける。
+#[test]
+fn multi_row_insert_respects_configured_lower_insert_row_limit() {
+    let path = unique_db_path("insert-multi-row-lower-dml-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_dml_limits(
+        engine::sql::parser::DmlLimits {
+            max_insert_rows_per_statement: 2,
+            ..engine::sql::parser::DmlLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-lower-insert-limit");
+    let err = core
+        .execute_insert_sql(&policy, &sql)
+        .expect_err("row count over the configured lower limit must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+
+    // 副作用ゼロ: 台帳未消費（同一 operation_id が上限内の行数で再送できる）。
+    let follow_up_sql = multi_row_sql(TABLE, &[1, 2], "op-lower-insert-limit");
+    let outcome = core
+        .execute_insert_sql(&policy, &follow_up_sql)
+        .expect("operation_id must be unused after the rejected over-limit statement");
+    assert_eq!(outcome.rows_affected, 2);
+}
+
+/// 既定値（1,000）より高い値へ引き上げた構成では、既定値超過の行数でも
+/// 1 文の複数行 `VALUES` として成功する（Issue #997 導入前は構文段の
+/// `MAX_INSERT_ROWS_PER_STATEMENT`＝1,000 で構造的に不可能だった）。
+/// `batch_limits.max_files_per_batch`（既定 64）も同時に引き上げないと
+/// Issue #860 の別上限で `54000` になる（`multi_row_insert_over_batch_limits_
+/// row_count_is_rejected_with_54000` が示す既存契約）ため、本テストは両方を
+/// 引き上げて `dml_limits` 側の引き上げが実際に効いていることを確認する。
+#[test]
+fn multi_row_insert_respects_configured_higher_insert_row_limit() {
+    let path = unique_db_path("insert-multi-row-higher-dml-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_dml_limits(engine::sql::parser::DmlLimits {
+            max_insert_rows_per_statement: 1_500,
+            ..engine::sql::parser::DmlLimits::default()
+        })
+        .with_batch_limits(engine::batch_limits::BatchLimits {
+            max_files_per_batch: 1_500,
+            ..engine::batch_limits::BatchLimits::default()
+        });
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let ids: Vec<u64> = (1..=1_200).collect();
+    let sql = multi_row_sql(TABLE, &ids, "op-higher-insert-limit");
+    let outcome = core
+        .execute_insert_sql(&policy, &sql)
+        .expect("row count within the configured higher limit must succeed");
+    assert_eq!(outcome.rows_affected, 1_200);
+}
+
+// ---------------------------------------------------------------------
 // 受け入れ条件③: USING OPERATION_ID 1 つ・台帳照合（RECOVER-11(a) 行順依存性を含む）
 // ---------------------------------------------------------------------
 

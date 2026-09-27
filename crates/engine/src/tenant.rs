@@ -62,7 +62,10 @@ const MAX_VISIBLE_ROWS: usize = 100_000;
 /// デコード・`PolicyContext::is_visible` 評価が実行され、計算量 DoS 経路になる
 /// （codex-review 指摘・PR #153）。総走査行数にも明示的な上限を設け、超過時は
 /// 部分結果を返さず [`TenantError::TooManyRowsScanned`] で fail-closed に拒否する。
-const MAX_SCANNED_ROWS: usize = 1_000_000;
+///
+/// `pub(crate)`（Issue #997）: `sql::parser::MAX_DML_ROW_LIMIT`（CLI で設定可能な
+/// DML 行数上限の上限値）が同じ定数を参照し、値のドリフトを防ぐ。
+pub(crate) const MAX_SCANNED_ROWS: usize = 1_000_000;
 
 /// [`visible_rows`]・[`verify_hits`] のエラー型。`Display`・`Debug`・
 /// `std::error::Error::source` のいずれにもテナント ID・行 id・テーブル名を含めず、

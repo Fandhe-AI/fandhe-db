@@ -50,6 +50,22 @@ fn new_core_with_table() -> (EngineCore, std::path::PathBuf) {
     )
 }
 
+/// [`new_core_with_table`] の `dml_limits`（Issue #997）差し替え版。CLI 起動時
+/// 設定値の到達先（`EngineCore::with_dml_limits`）を、production 経路
+/// （`execute_sql_in_session` の述語形 UPDATE/DELETE 分岐）から検証する。
+fn new_core_with_table_and_dml_limits(
+    name: &str,
+    limits: engine::sql::parser::DmlLimits,
+) -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path(name);
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_dml_limits(limits),
+        path,
+    )
+}
+
 fn ctx_for(tenant: &str, allow_private: bool) -> PolicyContext {
     if allow_private {
         PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -731,6 +747,170 @@ fn predicate_update_over_limit_is_rejected_with_no_side_effects() {
     )
     .expect_err("resend of an unrecorded operation_id must be the same over-limit rejection");
     assert_eq!(err_again.wire_code(), "54000");
+}
+
+/// Issue #997（オーナー判断 2026-09-27）: 起動時 CLI 設定値
+/// （`EngineCore::dml_limits.max_affected_rows`）を既定値（1,000）より低く
+/// 絞った場合、既定値では拒否されない少数行でも `54000`・副作用ゼロになる
+/// （[`predicate_delete_over_limit_is_rejected_with_no_side_effects`] と同じ
+/// 契約を、設定値を変えた構成で確認する）。
+#[test]
+fn predicate_delete_respects_configured_lower_affected_rows_limit() {
+    let (core, path) = new_core_with_table_and_dml_limits(
+        "sql-predicate-dml-exec-lower-limit",
+        engine::sql::parser::DmlLimits {
+            max_affected_rows: 2,
+            ..engine::sql::parser::DmlLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+
+    for id in 1..=3u64 {
+        insert_row(&core, &alice, TABLE, id, "ja", "b", &format!("lower-{id}"));
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 3);
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-lower-limit'"),
+    )
+    .expect_err("over the configured lower limit must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    // 副作用ゼロ: 行数不変・台帳未記録。
+    assert_eq!(count_star(&core, &alice, TABLE), 3);
+}
+
+/// Issue #997: 起動時 CLI 設定値を既定値（1,000）より高く引き上げた場合、
+/// 既定値では拒否される行数（1,000 件超）でも成功する
+/// （[`predicate_update_over_limit_is_rejected_with_no_side_effects`] が固定する
+/// 既定挙動の裏返しを、設定値を変えた構成で確認する）。
+#[test]
+fn predicate_update_respects_configured_higher_affected_rows_limit() {
+    let (core, path) = new_core_with_table_and_dml_limits(
+        "sql-predicate-dml-exec-higher-limit",
+        engine::sql::parser::DmlLimits {
+            max_affected_rows: 1_500,
+            ..engine::sql::parser::DmlLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+
+    let over_default = engine::sql::parser::MAX_DML_AFFECTED_ROWS + 200; // 1,200 件
+    for id in 1..=over_default {
+        insert_row(
+            &core,
+            &alice,
+            TABLE,
+            id as u64,
+            "ja",
+            "b",
+            &format!("higher-{id}"),
+        );
+    }
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'ja' USING OPERATION_ID 'op-higher-limit'"
+        ),
+    )
+    .expect("within the configured higher limit must succeed");
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, over_default as u64),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+}
+
+/// [`predicate_update_respects_configured_higher_affected_rows_limit`] の
+/// DELETE 側対照（UPDATE／DELETE 双方で引き上げ方向を確認する）。
+#[test]
+fn predicate_delete_respects_configured_higher_affected_rows_limit() {
+    let (core, path) = new_core_with_table_and_dml_limits(
+        "sql-predicate-dml-exec-higher-limit-delete",
+        engine::sql::parser::DmlLimits {
+            max_affected_rows: 1_500,
+            ..engine::sql::parser::DmlLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+
+    let over_default = engine::sql::parser::MAX_DML_AFFECTED_ROWS + 200; // 1,200 件
+    for id in 1..=over_default {
+        insert_row(
+            &core,
+            &alice,
+            TABLE,
+            id as u64,
+            "ja",
+            "b",
+            &format!("higher-del-{id}"),
+        );
+    }
+
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-higher-limit-del'"),
+    )
+    .expect("within the configured higher limit must succeed");
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, over_default as u64),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+}
+
+/// [`predicate_delete_respects_configured_lower_affected_rows_limit`] の
+/// UPDATE 側対照（UPDATE／DELETE 双方で引き下げ方向を確認する）。
+#[test]
+fn predicate_update_respects_configured_lower_affected_rows_limit() {
+    let (core, path) = new_core_with_table_and_dml_limits(
+        "sql-predicate-dml-exec-lower-limit-update",
+        engine::sql::parser::DmlLimits {
+            max_affected_rows: 2,
+            ..engine::sql::parser::DmlLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+
+    for id in 1..=3u64 {
+        insert_row(
+            &core,
+            &alice,
+            TABLE,
+            id,
+            "ja",
+            "b",
+            &format!("lower-upd-{id}"),
+        );
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 3);
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'ja' USING OPERATION_ID 'op-lower-limit-upd'"
+        ),
+    )
+    .expect_err("over the configured lower limit must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    // 副作用ゼロ: 行不変・台帳未記録。
+    let unchanged = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT COUNT(*) FROM {TABLE} WHERE lang = 'fr'"),
+        )
+        .expect("count(*) should succeed");
+    match &unchanged.rows[0].cells[0] {
+        Cell::Integer(v) => assert_eq!(*v, 0, "no row should have been updated to lang = 'fr'"),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
 }
 
 /// [`enumerate_dml_candidates`]（`UPDATE`／`DELETE` 両経路が共有する候補列挙本体。
