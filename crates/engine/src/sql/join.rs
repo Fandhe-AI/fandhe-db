@@ -479,8 +479,11 @@ fn build_plan(
         // （INNER に簡約する）」規則で再現する。この簡約が正しいのは述語が
         // strict（NULL に対して必ず偽）な場合に限るため、fail-closed に
         // 拒否する（現行の全 variant は strict なため到達しないが、将来
-        // `IS NULL` 等の非 strict な variant が増えた際の防御）。
-        if !is_null_rejecting(pred) {
+        // `IS NULL` 等の非 strict な variant が増えた際の防御）。この防御は
+        // NULL 補完（LEFT/RIGHT/FULL）を行う場合にのみ必要であり、INNER JOIN
+        // は非 strict な述語をプッシュダウンしても意味論上問題ないため対象外
+        // とする（レビュー指摘対応: INNER JOIN で不要な拒否をしない）。
+        if !matches!(validated.kind, JoinKind::Inner) && !is_null_rejecting(pred) {
             return Err(SqlSurfaceError::unsupported(
                 "JOIN WHERE predicate is not supported for LEFT/RIGHT/FULL OUTER JOIN reduction",
             ));

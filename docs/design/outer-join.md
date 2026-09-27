@@ -55,8 +55,10 @@ join_type := [INNER] JOIN | LEFT [OUTER] JOIN | RIGHT [OUTER] JOIN | FULL [OUTER
 全 `JoinWherePredicate` variant（`=`・`LIKE`・比較・bool 等価・bool 列）はいずれも strict
 なため、`sql::join::is_null_rejecting` は常に真を返す。この関数はワイルドカード無しの
 網羅的 `match` で実装し、将来 `IS NULL` 等の非 strict な variant を追加した際にコンパイル
-エラーで検出させる（簡約規則が黙って壊れるのを防ぐ。`build_plan` は non-strict な述語を
-検出したら簡約せず `42601` で拒否する fail-closed 分岐を持つが、現行は到達しない）。
+エラーで検出させる（簡約規則が黙って壊れるのを防ぐ。`build_plan` は `kind ∈ {Left, Right,
+Full}` の場合に限り、non-strict な述語を検出したら簡約せず `42601` で拒否する fail-closed
+分岐を持つが、現行は到達しない。この防御は NULL 補完を行う外部結合にのみ必要であり、
+`Inner` は簡約規則自体を使わないため対象外とする）。
 
 `preserve_left`・`preserve_right` は `sql::join::JoinPlan` に保持し、`Inner` は両方偽の
 ままで INNER JOIN と完全に同じ挙動になる。
