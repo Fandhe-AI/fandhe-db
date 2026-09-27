@@ -1,11 +1,13 @@
 //! 複数テーブル参照スコープの束縛基盤（SQL-28・RLS-10、TASK-212、Issue #924）。
 //!
-//! 責務境界: 許可リスト（[`crate::sql::allowlist`]）が引き続き単一テーブルの
-//! `FROM <ident>` のみを受理する現状は変えない。本モジュールは、後続タスク
-//! （Issue #925 以降。JOIN・複数 FROM の許可リスト開放と `EngineCore` への結線）が
-//! 載せる「束縛スコープ」だけを土台として提供する。呼び出し元は複数の
-//! `(TableRef, &TableSchema)` を集めて [`BindingScope::new`] へ渡し、修飾・非修飾の
-//! 列参照を [`BindingScope::resolve`] で解決する。
+//! 責務境界: 本モジュールは複数テーブル参照の「束縛スコープ」の土台を提供する。
+//! `INNER JOIN`（Issue #925。`sql::allowlist::parse_join_statement`・
+//! `sql::join::build_plan`）が本番経路で最初に結線した（`docs/design/
+//! inner-join.md` 参照）。呼び出し元は複数の `(TableRef, &TableSchema)` を
+//! 集めて [`BindingScope::new`] へ渡し、修飾・非修飾の列参照を
+//! [`BindingScope::resolve`] で解決する。単一テーブルの `SELECT`／広域取得
+//! （`sql::allowlist::validate_select_statement` 等）は引き続き本モジュールを
+//! 経由しない（責務を分けたまま）。
 //!
 //! 単一参照スコープでの非修飾列解決は、既存の単一テーブル束縛
 //! （`sql::parser` の列解決）と同じ添字を返す（`tests/multi_relation_binding.rs` の
@@ -268,8 +270,9 @@ impl<'a> BindingScope<'a> {
 /// 経路と同じ `0A000`（[`SqlSurfaceError::transaction_feature_not_supported`]）で
 /// fail-closed に拒否する。
 ///
-/// 本 Issue の時点では本番の実行経路から呼ばれない（EngineCore への結線は
-/// Issue #925 以降）。`pub` で公開し、結合テストから直接検証できるようにする。
+/// `core.rs::EngineCore::execute_in_active_txn` の `Statement::Join` アームから
+/// 呼ばれる（Issue #925）。`pub` で公開し、結合テストから直接検証できるように
+/// している。
 pub fn ensure_relations_not_written(
     txn: &crate::sql::transaction::SessionTransaction<'_>,
     relations: &[TableRef],

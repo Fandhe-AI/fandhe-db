@@ -6,8 +6,13 @@
 //! だけを保持するが、物理キーは `(tenant_id, id)`（TABLE-12）であり、1 つの
 //! `PolicyContext` が複数テナントの `Public` 行を見得るため `id` 単独では行を
 //! 一意に識別できない。本モジュールの [`RelationSnapshot`] は `(tenant_id, id)`
-//! を保持し、複数テーブルの結果を突き合わせる後続タスク（Issue #925 以降の
-//! JOIN 実装）が行を取り違えないようにする。
+//! を保持し、複数テーブルの結果を突き合わせる際に行を取り違えないようにする
+//! 基盤として用意した。ただし `INNER JOIN`（Issue #925。`sql::join`）は結合に
+//! 列の値そのものを必要とするため、`(tenant_id, id)` しか持たない本基盤を
+//! 使うと値取得のための 2 回目の点照会走査が必要になり、既存の広域取得経路
+//! （1 パスで RLS・WHERE・値取得を終える）より非効率になる。そのため
+//! `EngineCore` への結線は見送っている（`docs/design/inner-join.md`「基盤の
+//! 申し送り項目の扱い」節参照。キャッシュによる最適化は後続の検討事項）。
 //!
 //! 構築は本モジュール自身が担う（呼び出し元の既存走査へ相乗りする
 //! `VisibleSnapshotBuilder` とは異なり、複数テーブル対応の新規エントリ
@@ -192,7 +197,10 @@ impl MultiRelationSnapshot {
 }
 
 /// [`RelationSnapshot`] のテーブル単位世代整合キャッシュ（[`GenerationKeyedCache`]
-/// の具体化）。`EngineCore` への保持・結線は Issue #925 以降。
+/// の具体化）。`EngineCore` への保持・結線は、`INNER JOIN`（Issue #925）でも
+/// 見送っている（モジュール冒頭のドキュメント参照。理由: 結合には列の値が
+/// 必要でスナップショットだけでは完結しないため）。キャッシュによる最適化は
+/// 後続の検討事項のまま。
 pub type RelationSnapshotCache = GenerationKeyedCache<RelationSnapshot>;
 
 /// 複数テーブルの RLS 可視スナップショットを、同一 `read_txn`・同一 `ctx` から

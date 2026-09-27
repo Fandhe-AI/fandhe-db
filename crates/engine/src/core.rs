@@ -2358,6 +2358,42 @@ impl EngineCore {
                     }
                 }
             }
+            // Issue #925（SQL-28・RLS-10、TASK-212）: `INNER JOIN` は `SetOperation`
+            // と同じくセッション UDF レジストリを参照しうる束縛経路
+            // （`sql::parser::bind_scan`）を通るため、セッションを要する実行本体
+            // （`execute_validated_in_session`）へ委譲する。
+            stmt @ crate::sql::allowlist::Statement::Join(_) => {
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_validated_in_session(ctx, &mut session, stmt)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::CreateFunction { .. }
+                    | crate::sql::SqlOutcome::Explain(_)
+                    | crate::sql::SqlOutcome::Insert(_)
+                    | crate::sql::SqlOutcome::Truncate(_)
+                    | crate::sql::SqlOutcome::Delete(_)
+                    | crate::sql::SqlOutcome::Returning(_)
+                    | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::DropTable(_)
+                    | crate::sql::SqlOutcome::AlterTable(_)
+                    | crate::sql::SqlOutcome::CreateView(_)
+                    | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::CreateIndex(_)
+                    | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::Commit
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected non-Query outcome for a statement already classified as Join"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -3258,6 +3294,15 @@ impl EngineCore {
                 let table = v.table_name().to_string();
                 self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
+            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN は 2 relation を参照する
+            // ため、`read_only_in_active_txn`（単一テーブル版）ではなく
+            // `sql::relation::ensure_relations_not_written` で両辺が書き込み済み
+            // でないことを確認してから実行する（`docs/design/
+            // multi-relation-plan-foundation.md` の申し送り事項を消化する）。
+            ParsedSql::Statement(stmt @ Statement::Join(v)) => {
+                crate::sql::relation::ensure_relations_not_written(txn, &v.relations)?;
+                self.execute_validated_in_session(ctx, session, stmt.clone())
+            }
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
@@ -3646,6 +3691,17 @@ impl EngineCore {
                 )?;
                 Ok(Some(columns))
             }
+            // Issue #925（SQL-28・RLS-10、TASK-212）: 検索本体（両辺の行走査・
+            // ハッシュ結合）は実行せず、束縛結果の列（`sql::join::bind_join`）
+            // だけを返す（Describe は本体を実行しない契約。`Statement::SetOperation`
+            // アームと同じ方針）。
+            ParsedSql::Statement(Statement::Join(validated)) => {
+                let table_names = crate::sql::join::collect_join_tables(validated);
+                let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let columns =
+                    crate::sql::join::describe_columns(&schemas, validated, session.udfs())?;
+                Ok(Some(columns))
+            }
             ParsedSql::Statement(Statement::Select(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 if validated.using_plan().is_some() {
@@ -4023,6 +4079,23 @@ impl EngineCore {
                     &validated.tree,
                     session.udfs(),
                     validated.limit,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN も両辺を単一
+            // スナップショット上で評価する必要があるため、`Statement::SetOperation`
+            // と同じく `read_txn_with_schemas`（複数テーブル版）で両辺のスキーマを
+            // まとめて解決する。実行本体（束縛・型検証・ハッシュ結合・RLS 独立
+            // 適用）は `sql::join::execute` が担う（第 2 の実行器を作らない）。
+            crate::sql::allowlist::Statement::Join(validated) => {
+                let table_names = crate::sql::join::collect_join_tables(&validated);
+                let (read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let result = crate::sql::join::execute(
+                    &read_txn,
+                    ctx,
+                    &schemas,
+                    &validated,
+                    session.udfs(),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }

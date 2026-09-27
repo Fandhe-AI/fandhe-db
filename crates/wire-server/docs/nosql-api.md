@@ -761,10 +761,10 @@ Date: <IMF-fixdate>
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
-| `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（複数テーブル参照スコープの束縛基盤〔SQL-28・RLS-10、Issue #924〕は未結線。後述） |
+| `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕で SQL 表層からは到達可能になったが、NoSQL 表層の op 語彙に JOIN 相当が無いため。後述） |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
-| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算のいずれも SQL 表層専用。後述） |
+| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`FOREIGN KEY` の宣言は SQL 表層専用の `CREATE TABLE`。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
@@ -797,10 +797,11 @@ Date: <IMF-fixdate>
 Issue #900）が誘発する分類だが、NoSQL 表層の `op` 許可リストに DDL 相当が
 無いため実要求からは到達しない（`docs/design/sql-create-table.md`・
 `docs/design/sql-alter-table-add-column.md` 参照）。`AmbiguousColumn`（`42702`。
-SQL-28・RLS-10、Issue #924）は複数テーブル参照スコープの束縛基盤（`sql::relation`）
-が新設する分類だが、許可リストは本 Issue でも引き続き JOIN・複数 FROM を
-`42601` で拒否し、`EngineCore` への結線も行わないため実要求からは到達しない
-（`docs/design/multi-relation-plan-foundation.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql::relation`）が
+新設した分類で、`INNER JOIN`（Issue #925）により SQL 表層からは到達可能に
+なった（`docs/design/inner-join.md` 参照）。ただし NoSQL 表層の `op` 許可
+リストに JOIN 相当が無いため、実要求（HTTP API 経由）からは引き続き到達
+しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・

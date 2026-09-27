@@ -15,6 +15,7 @@ use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
+use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
     BinOp, Expr, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
     MAX_EXPR_NODES, MAX_UDF_PARAMS,
@@ -1410,6 +1411,84 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
     /// `match` はワイルドカードアームの追加が必要（`Scan` 追加時と同じ運用）。
     SetOperation(ValidatedSetOperation),
+    /// `INNER JOIN`（2 テーブル等価結合。Issue #925・SQL-28・RLS-10、TASK-212）。
+    /// 束縛・実行本体は `sql::join` が担う（`sql::set_op` と同じく第 2 の実行器を
+    /// 作らず、既存の広域取得経路〔`sql::scan::execute_scan_with_budget`〕を
+    /// 両辺で独立に通す設計。`docs/design/inner-join.md` 参照）。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
+    /// `match` はワイルドカードアームの追加が必要（`SetOperation` 追加時と同じ
+    /// 運用）。
+    Join(ValidatedJoin),
+}
+
+/// JOIN の投影対象列（SELECT リスト）。`*` は左→右の順で `id`＋全列を展開する
+/// （`sql::join::bind_join` の責務）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinProjection {
+    All,
+    Columns(Vec<ColumnRef>),
+}
+
+/// JOIN の `WHERE` 句が受理する 1 述語（Issue #925 §2.1。`OR`・括弧・
+/// `BETWEEN`・`IN`・式・列同士の比較はいずれも構文段で拒否するため対象に
+/// 含めない）。`sql::allowlist::WherePredicate` と同じ判定基準を列参照だけ
+/// [`ColumnRef`]（修飾子つき）に差し替えたもの——束縛時（`sql::join::bind_join`）に
+/// 修飾子で相手側の relation を確定し、`WherePredicate`（非修飾）へ変換して
+/// その側の [`ValidatedScan::where_predicates`] へプッシュダウンする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JoinWherePredicate {
+    Equality {
+        column: ColumnRef,
+        value: String,
+    },
+    Prefix {
+        column: ColumnRef,
+        pattern: String,
+    },
+    Compare {
+        column: ColumnRef,
+        op: CompareOp,
+        value: String,
+    },
+    BoolEquality {
+        column: ColumnRef,
+        value: bool,
+    },
+    BoolColumn {
+        column: ColumnRef,
+    },
+}
+
+/// JOIN の `ON` 条件数の上限（実装既定値。Issue #925 §2.2）。`Vec` へ積む前に
+/// 判定し、無制限確保を避ける（security.md「不安全な設計」対応）。超過は `54000`。
+pub(crate) const MAX_JOIN_CONDITIONS: usize = 8;
+
+/// JOIN の `WHERE` 句の conjunct（`AND` 結合された述語）数の上限。共有 WHERE
+/// パース（[`MAX_WHERE_LEAVES`]）・`ON` 句（[`MAX_JOIN_CONDITIONS`]）と同じ
+/// 判断（`Vec` へ積む前に検査し、長い `AND` チェーンでの無制限確保を避ける。
+/// coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」）。
+/// 超過は `54000`。
+pub(crate) const MAX_JOIN_WHERE_CONJUNCTS: usize = MAX_WHERE_LEAVES;
+
+/// 許可形状の構造判定を通過した `INNER JOIN` 文（Issue #925・SQL-28・RLS-10、
+/// TASK-212）。束縛（列解決・型検証・WHERE プッシュダウン）・実行（ハッシュ結合・
+/// RLS 独立適用・行数上限）は `sql::join` の責務（本モジュールは構造情報のみを
+/// 保証する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedJoin {
+    /// FROM に指定された 2 つのテーブル参照（カタログ存在確認・ビュー拒否済み。
+    /// 常に長さ 2）。
+    pub(crate) relations: Vec<TableRef>,
+    /// `ON` の等値結合条件（`AND` 結合順。常に 1 個以上、[`MAX_JOIN_CONDITIONS`]
+    /// 以下）。
+    pub(crate) on: Vec<(ColumnRef, ColumnRef)>,
+    pub(crate) projection: JoinProjection,
+    /// `WHERE` 句（省略可）の述語（`AND` 結合順。[`MAX_JOIN_WHERE_CONJUNCTS`]
+    /// 以下）。
+    pub(crate) where_conjuncts: Vec<JoinWherePredicate>,
+    pub(crate) limit: u32,
+    pub(crate) offset: u32,
 }
 
 /// 集合演算の演算子（SQL-29 (c)・TASK-213）。
@@ -5752,6 +5831,326 @@ fn starts_with_select_after_parens(tokens: &[Token]) -> bool {
     matches!(tokens.get(i), Some(Token::Keyword(Keyword::Select)))
 }
 
+/// `INNER JOIN`（Issue #925・SQL-28・RLS-10、TASK-212）の予約文脈語（別名として
+/// 使えない語。大小文字を区別しない）。既存の `FROM t USING PLAN(...)` の
+/// `USING` を別名と誤認しないための一覧でもある。
+const JOIN_RESERVED_ALIAS_WORDS: &[&str] = &[
+    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "CROSS", "NATURAL", "ON", "USING", "WHERE",
+    "LIMIT", "OFFSET", "AS",
+];
+
+fn is_join_reserved_word(w: &str) -> bool {
+    JOIN_RESERVED_ALIAS_WORDS
+        .iter()
+        .any(|r| w.eq_ignore_ascii_case(r))
+}
+
+/// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
+/// §2.2）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定より前に
+/// 呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
+/// (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|NATURAL)` の並びのときのみ真になる
+/// （外部結合キーワードも検出して `parse_join_statement` 側で `42601` に
+/// 分類させる——構文段の判定順序〔`42601` が `42P01` に先行する〕を保つため）。
+pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
+    if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth -= 1,
+            Token::Keyword(Keyword::From) if depth == 0 => {
+                return from_clause_starts_join(tokens, i + 1);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] JOIN...` の並びかどうかを
+/// 判定する（[`looks_like_join`] 参照）。
+fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
+    if !matches!(tokens.get(idx), Some(Token::Ident(_))) {
+        return false;
+    }
+    let mut i = idx + 1;
+    if matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("AS")) {
+        i += 1;
+        if !matches!(tokens.get(i), Some(Token::Ident(_))) {
+            return false;
+        }
+        i += 1;
+    } else if matches!(tokens.get(i), Some(Token::Ident(w)) if !is_join_reserved_word(w)) {
+        i += 1;
+    }
+    is_join_keyword_at(tokens, i)
+}
+
+fn is_join_keyword_at(tokens: &[Token], i: usize) -> bool {
+    match tokens.get(i) {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("JOIN") => true,
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INNER") => {
+            matches!(tokens.get(i + 1), Some(Token::Ident(w2)) if w2.eq_ignore_ascii_case("JOIN"))
+        }
+        Some(Token::Ident(w))
+            if w.eq_ignore_ascii_case("LEFT")
+                || w.eq_ignore_ascii_case("RIGHT")
+                || w.eq_ignore_ascii_case("FULL")
+                || w.eq_ignore_ascii_case("CROSS")
+                || w.eq_ignore_ascii_case("NATURAL") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// JOIN 文脈専用の `Parser` ヘルパー（Issue #925）。既存の `impl<'a> Parser<'a>`
+/// 本体とは別ブロックに分離し、JOIN 追加による差分を局所化する。
+impl<'a> Parser<'a> {
+    /// `rel := <table_ident> [[AS] <alias_ident>]`。別名は予約文脈語
+    /// （[`JOIN_RESERVED_ALIAS_WORDS`]）を大小無視で拒否する（`ON`・`WHERE` 等を
+    /// 別名として誤って消費しない）。
+    fn parse_join_relation(&mut self) -> Result<TableRef, SqlSurfaceError> {
+        let table = self.expect_ident()?;
+        crate::catalog::validate_identifier(&table)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            let name = self.expect_ident()?;
+            if is_join_reserved_word(&name) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "reserved word cannot be used as a JOIN alias: {name}"
+                )));
+            }
+            crate::catalog::validate_identifier(&name)
+                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid JOIN alias: {e}")))?;
+            Some(name)
+        } else if let Some(Token::Ident(name)) = self.peek() {
+            if is_join_reserved_word(name) {
+                None
+            } else {
+                let name = name.clone();
+                self.advance();
+                crate::catalog::validate_identifier(&name).map_err(|e| {
+                    SqlSurfaceError::unsupported(format!("invalid JOIN alias: {e}"))
+                })?;
+                Some(name)
+            }
+        } else {
+            None
+        };
+        Ok(match alias {
+            Some(a) => TableRef::with_alias(table, a),
+            None => TableRef::new(table),
+        })
+    }
+
+    /// `colref := <ident> | <qualifier>.<ident>`（`Token::QualifiedIdent`。
+    /// SQL-20・TASK-193 由来の字句を JOIN の列参照解決へ再利用する）。
+    fn parse_join_colref(&mut self) -> Result<ColumnRef, SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Ident(name)) => Ok(ColumnRef::unqualified(name.clone())),
+            Some(Token::QualifiedIdent { qualifier, name }) => {
+                Ok(ColumnRef::qualified(qualifier.clone(), name.clone()))
+            }
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "expected column reference, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// JOIN の SELECT リスト（`join_list := '*' | colref { ',' colref }`）。
+fn parse_join_projection(p: &mut Parser<'_>) -> Result<JoinProjection, SqlSurfaceError> {
+    if matches!(p.peek(), Some(Token::Punct('*'))) {
+        p.advance();
+        return Ok(JoinProjection::All);
+    }
+    let mut cols = vec![p.parse_join_colref()?];
+    while matches!(p.peek(), Some(Token::Punct(','))) {
+        p.advance();
+        cols.push(p.parse_join_colref()?);
+    }
+    Ok(JoinProjection::Columns(cols))
+}
+
+/// `ON` の等値結合条件（`cond := colref '=' colref { AND colref '=' colref }`）。
+fn parse_join_on_conditions(
+    p: &mut Parser<'_>,
+) -> Result<Vec<(ColumnRef, ColumnRef)>, SqlSurfaceError> {
+    let mut conditions = Vec::new();
+    loop {
+        let lhs = p.parse_join_colref()?;
+        p.expect_punct('=')?;
+        let rhs = p.parse_join_colref()?;
+        if conditions.len() >= MAX_JOIN_CONDITIONS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many JOIN ON conditions",
+            ));
+        }
+        conditions.push((lhs, rhs));
+        if matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
+            p.advance();
+            continue;
+        }
+        break;
+    }
+    Ok(conditions)
+}
+
+/// JOIN の `WHERE` 句（`conj := colref <op> <literal> { AND conj }`。`OR`・
+/// 括弧・`BETWEEN`・`IN`・式・列同士の比較はいずれもこの文法に一致しないため
+/// 構造的に `42601` へ落ちる。Issue #925 §2.1 の対象外事項）。
+fn parse_join_where_conjuncts(
+    p: &mut Parser<'_>,
+) -> Result<Vec<JoinWherePredicate>, SqlSurfaceError> {
+    let mut preds = Vec::new();
+    loop {
+        let column = p.parse_join_colref()?;
+        let pred = match p.peek() {
+            Some(Token::Punct('=')) => {
+                p.advance();
+                match p.peek().cloned() {
+                    Some(Token::StringLiteral(_)) => {
+                        let value = p.expect_string_literal()?;
+                        JoinWherePredicate::Equality { column, value }
+                    }
+                    Some(Token::Ident(w))
+                        if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false") =>
+                    {
+                        p.advance();
+                        JoinWherePredicate::BoolEquality {
+                            column,
+                            value: w.eq_ignore_ascii_case("true"),
+                        }
+                    }
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "unsupported JOIN WHERE literal, got {other:?}"
+                        )))
+                    }
+                }
+            }
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE") => {
+                p.advance();
+                let pattern = p.expect_string_literal()?;
+                JoinWherePredicate::Prefix { column, pattern }
+            }
+            Some(tok) if where_compare_op_token(tok).is_some() => {
+                // `is_some()` を確認済みの直後の再取得のため到達しない分岐は無い。
+                let op = where_compare_op_token(tok).ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "JOIN WHERE compare operator vanished after lookahead".to_string(),
+                })?;
+                p.advance();
+                let value = p.expect_string_literal()?;
+                JoinWherePredicate::Compare { column, op, value }
+            }
+            Some(Token::Keyword(Keyword::And)) | Some(Token::Keyword(Keyword::Limit)) | None => {
+                JoinWherePredicate::BoolColumn { column }
+            }
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OFFSET") => {
+                JoinWherePredicate::BoolColumn { column }
+            }
+            _ => {
+                return Err(SqlSurfaceError::unsupported(
+                    "unsupported JOIN WHERE predicate shape",
+                ))
+            }
+        };
+        if preds.len() >= MAX_JOIN_WHERE_CONJUNCTS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many JOIN WHERE conjuncts",
+            ));
+        }
+        preds.push(pred);
+        if matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
+            p.advance();
+            continue;
+        }
+        break;
+    }
+    Ok(preds)
+}
+
+/// `INNER JOIN`（2 テーブル等価結合。Issue #925・SQL-28・RLS-10、TASK-212）の
+/// 許可形状を先頭から再帰下降で判定する。[`looks_like_join`] が真を返した文に
+///対してのみ呼ばれる。構文の完全な解析（`42601`）→ 各テーブル参照のカタログ
+/// 存在確認・ビュー拒否（`42P01`・`42601`）の順で検証する（§2.5 のエラー優先
+/// 順位）。列解決・型検証・WHERE プッシュダウンは束縛段（`sql::join::bind_join`）
+/// の責務。
+fn parse_join_statement(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<ValidatedJoin, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_keyword(Keyword::Select)?;
+    let projection = parse_join_projection(&mut p)?;
+    p.expect_keyword(Keyword::From)?;
+    let left = p.parse_join_relation()?;
+
+    if p.peek_ident_matches("INNER") {
+        p.advance();
+        p.expect_ident_matching("JOIN")?;
+    } else if p.peek_ident_matches("JOIN") {
+        p.advance();
+    } else {
+        // `LEFT`／`RIGHT`／`FULL [OUTER]`／`CROSS`／`NATURAL` JOIN（外部結合・
+        // 直積）は本 Issue の対象外（#926 の管轄）。fail-closed に `42601`。
+        return Err(SqlSurfaceError::unsupported(
+            "only INNER JOIN (or bare JOIN) is supported",
+        ));
+    }
+
+    let right = p.parse_join_relation()?;
+    if left.exposed_name() == right.exposed_name() {
+        return Err(SqlSurfaceError::unsupported(
+            "duplicate table reference name in JOIN",
+        ));
+    }
+
+    p.expect_ident_matching("ON")?;
+    let on = parse_join_on_conditions(&mut p)?;
+
+    let where_conjuncts = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        parse_join_where_conjuncts(&mut p)?
+    } else {
+        Vec::new()
+    };
+
+    p.expect_keyword(Keyword::Limit)?;
+    let limit_str = p.expect_number()?;
+    let limit: u32 = limit_str
+        .parse()
+        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}")))?;
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
+    p.expect_end_of_statement()?;
+
+    let relations = vec![left, right];
+    for r in &relations {
+        match crate::sql::view::resolve_from(lookup, r.table())? {
+            crate::sql::view::Resolved::Table => {}
+            crate::sql::view::Resolved::View { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "JOIN does not support view references",
+                ));
+            }
+        }
+    }
+
+    Ok(ValidatedJoin {
+        relations,
+        on,
+        projection,
+        where_conjuncts,
+        limit,
+        offset,
+    })
+}
+
 /// 集合演算文かどうかをバックトラックせず先読みだけで判定する（Issue #929・
 /// SQL-29 (c)）。`validate_sql_tokens` の `is_aggregate_select`／
 /// `contains_group_by` による振り分けより前に呼ぶ（これらはトークン列全体を
@@ -6616,6 +7015,15 @@ fn validate_sql_tokens_impl(
     // 通常の SELECT・広域取得の受理形状には一切影響しない。`ExplainTarget` は
     // 集合演算を持たない（[`validate_select_statement`] のドキュメンテーション
     // コメント参照）ため、`EXPLAIN` 経路より前のこの位置で確定させる。
+    // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN の検出は集合演算・集計・
+    // `DISTINCT` の判定より前に行う（`looks_like_join` のドキュメンテーション
+    // コメント参照）。JOIN は集合演算の枝形状（`SetTree::Branch` は単一テーブル
+    // 広域取得に限定）に一致しないため、以降の `looks_like_set_operation` 判定
+    // には一切影響しない。
+    if looks_like_join(tokens) {
+        let validated = parse_join_statement(tokens, lookup)?;
+        return Ok(Statement::Join(validated));
+    }
     if looks_like_set_operation(tokens) {
         let validated = parse_set_operation(tokens, lookup)?;
         return Ok(Statement::SetOperation(validated));
@@ -6834,7 +7242,12 @@ fn validate_sql_tokens_impl(
                 // コメント参照。集合演算の検出・分岐は `validate_sql_tokens` が
                 // `validate_select_statement` を呼ぶより前に完結させる設計）。
                 // 網羅性のためのみここに列挙する防御的経路。
-                | Statement::SetOperation(_) => {
+                | Statement::SetOperation(_)
+                // Issue #925（SQL-28）: 同じ理由で `validate_select_statement` は
+                // JOIN（`Statement::Join`）も返さない（JOIN の検出・分岐は
+                // `looks_like_join` が `validate_select_statement` を呼ぶより前に
+                // 完結させる設計）。網羅性のためのみここに列挙する防御的経路。
+                | Statement::Join(_) => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "validate_select_statement returned a non-SELECT statement"
                             .to_string(),
@@ -7034,6 +7447,12 @@ pub fn validate_statement(
         // 受理しない（一律 `42601`）。
         Statement::SetOperation(_) => Err(SqlSurfaceError::unsupported(
             "set operation is not a search query statement (use a session-aware entry point)",
+        )),
+        // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN も `ValidatedStatement` を
+        // 持たないため、`SetOperation`・`Scan`・`Aggregate` と同じくこのエントリ
+        // ポイントでは受理しない（一律 `42601`）。
+        Statement::Join(_) => Err(SqlSurfaceError::unsupported(
+            "JOIN is not a search query statement (use a session-aware entry point)",
         )),
     }
 }
