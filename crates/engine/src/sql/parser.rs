@@ -1723,9 +1723,12 @@ impl BoundPredicateDelete {
     /// （NoSQL 表層 `delete` op〔#875・#876・NOSQL-12〕の入口。`BoundScan::new`
     /// と同じ契約。`expr_filters` のステップ列コンパイルは内部で行う）。
     /// `or_filters` は常に空（NoSQL 表層は `OR` 未対応。TASK-208・Issue #912）。
-    /// 影響行数上限は `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows`
-    /// （UPDATE と共有する唯一の上限 API。Issue #997 で統合）を実行結線側が
-    /// 直接参照するため、本 constructor は上限値を引数に取らない。
+    /// 影響行数上限は `check_dml_affected_rows_with_limit`（UPDATE と共有する
+    /// 唯一の上限 API）へ渡す値（`core.rs::EngineCore::dml_limits.
+    /// max_affected_rows`。起動時 CLI 設定値。Issue #997）を実行結線側が
+    /// 直接参照するため、本 constructor は上限値を引数に取らない（本 constructor
+    /// を経由して `execute_predicate_delete` へ到達する将来の呼び出し元があれば、
+    /// その経路も同じ process-wide 設定値を自動的に共有する）。
     pub fn new(
         table: String,
         metadata_filters: Vec<MetadataFilter>,
@@ -1781,10 +1784,11 @@ impl BoundPredicateDelete {
 /// API）。`WHERE` の意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT
 /// （[`bind_aggregate`]）・広域取得（[`bind_scan`]）と共有する
 /// （[`bind_where_predicates`]。第 2 の述語評価器を作らない）。影響行数上限は
-/// UPDATE と共有する唯一の上限 API（[`MAX_DML_AFFECTED_ROWS`]・
-/// [`check_dml_affected_rows`]。Issue #997 で統合）を実行結線
-/// （`sql/exec.rs::execute_predicate_delete`）が変更開始前・副作用ゼロの時点で
-/// 直接参照するため、本関数は上限値を運搬しない。
+/// UPDATE と共有する唯一の上限 API（[`check_dml_affected_rows_with_limit`]）へ
+/// 渡す値（`core.rs::EngineCore::dml_limits.max_affected_rows`。起動時 CLI
+/// 設定値。Issue #997）を実行結線（`sql/exec.rs::execute_predicate_delete`）が
+/// 呼び出し元から受け取り、変更開始前・副作用ゼロの時点で判定するため、本関数は
+/// 上限値を運搬しない。
 pub fn bind_predicate_delete(
     stmt: &ValidatedPredicateDelete,
     schema: &TableSchema,
@@ -2579,35 +2583,136 @@ fn bind_set_assignments(
 }
 
 /// 1 文の `UPDATE`／`DELETE`（述語形。SQL-19・SQL-20 系）が変更してよい行数の
-/// 上限（本リポの実装既定値であり、spec 由来の数値ではない。SQL-16・TASK-190 の
-/// `MAX_INSERT_ROWS_PER_STATEMENT` と同じ「1 文あたり」の桁に揃える）。束縛段階
-/// では対象行数が確定しないため、実行結線（`sql/exec.rs` の
+/// 上限判定 API（Issue #997・オーナー判断の改訂〔2026-09-27、前回のオーナー
+/// 判断を置き換え〕）。汎用 RDB（PostgreSQL 等）の挙動に合わせ、**既定では
+/// 上限を持たない**（`limit: None`）。`wire-server` 起動時 CLI フラグ
+/// （`--max-dml-affected-rows`）で明示指定した場合のみ、その値
+/// （`Some(NonZeroUsize)`）で判定する。旧オーナー判断（既定値 1,000 を常に
+/// 適用）に基づく `pub const MAX_DML_AFFECTED_ROWS`・
+/// `pub fn check_dml_affected_rows(count)`（`limit` 引数を取らない版）は、
+/// 「既定＝上限なし」を型で表せないため削除した（**BREAKING CHANGE**。
+/// `EngineCore::open()` 等・`--max-dml-affected-rows` 未指定の構成では、従来
+/// 1,000 件超過で拒否していた述語形 UPDATE／DELETE が成功するようになる）。
+/// 資源上限は本上限に代わって [`crate::tenant::MAX_SCANNED_ROWS`]（1 文あたり
+/// 総走査行数上限。`limit` の設定有無に関わらず常に適用）が引き続き担保する
+/// （`docs/design/predicate-dml-exec.md` §6 参照）。
+///
+/// 束縛段階では対象行数が確定しないため、実行結線（`sql/exec.rs` の
 /// `execute_predicate_update`／`execute_predicate_delete`）が変更を開始する前に
-/// [`check_dml_affected_rows`] を呼ぶ契約とする（構造検証・束縛のみを担う本
-/// モジュールは値を提供するのみで、判定自体はここでは行わない）。`count` は
-/// 対象行集合の全件列挙結果である必要はなく、広い述語（例: 全行に一致する
-/// `WHERE`）による無制限列挙を避けるため、呼び出し元は候補行を
-/// `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を打ち切ってその件数を渡して
-/// よい（早期終了。security.md「不安全な設計」＝未検証入力によるリソース増幅の
-/// 回避）。UPDATE／DELETE（述語形）共通の唯一の上限 API であり、以前 DELETE 側に
-/// 存在した別系統（`DEFAULT_MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`）は
-/// Issue #997 で本 API へ統合済み。
-pub const MAX_DML_AFFECTED_ROWS: usize = 1_000;
-
-/// `count`（対象行数。[`MAX_DML_AFFECTED_ROWS`] を超えたかどうかの判定にのみ
-/// 使うため、呼び出し元は `MAX_DML_AFFECTED_ROWS + 1` 件で打ち切った列挙結果を
-/// 渡してよい）が [`MAX_DML_AFFECTED_ROWS`] を超えないか検証する。超過は
-/// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail` には件数と上限のみを
-/// 含め、テナント・行内容には触れない（fail-closed。実行前・副作用ゼロの段階で
-/// 拒否する契約。呼び出し元は `execute_predicate_update`・`execute_predicate_delete`
-/// が変更開始前に呼ぶ）。
-pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError> {
-    if count > MAX_DML_AFFECTED_ROWS {
+/// [`check_dml_affected_rows_with_limit`] を呼ぶ契約とする（構造検証・束縛のみを
+/// 担う本モジュールは値を提供するのみで、判定自体はここでは行わない）。`count`
+/// は対象行集合の全件列挙結果である必要はなく、`limit` が `Some` の場合は
+/// 広い述語（例: 全行に一致する `WHERE`）による無制限列挙を避けるため、
+/// 呼び出し元は候補行を `limit + 1` 件に達した時点で列挙を打ち切ってその件数を
+/// 渡してよい（早期終了。security.md「不安全な設計」＝未検証入力による
+/// リソース増幅の回避。`limit` が `None` の場合はこの早期終了自体が行われず
+/// `MAX_SCANNED_ROWS` のみで頭打ちになる——`tenant::enumerate_dml_candidates`
+/// ドキュメント参照）。UPDATE／DELETE（述語形）共通の唯一の上限判定 API。
+///
+/// `count`（対象行数）が `limit`（`Some` のときのみ判定。`None` は常に
+/// 成功——資源上限は呼び出し元の `MAX_SCANNED_ROWS` 判定に委ねる）を超えない
+/// か検証する。超過は [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail`
+/// には件数と上限のみを含め、テナント・行内容には触れない（fail-closed。
+/// 実行前・副作用ゼロの段階で拒否する契約。呼び出し元は
+/// `execute_predicate_update`・`execute_predicate_delete` が変更開始前に呼ぶ）。
+pub fn check_dml_affected_rows_with_limit(
+    count: usize,
+    limit: Option<std::num::NonZeroUsize>,
+) -> Result<(), SqlSurfaceError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    if count > limit.get() {
         return Err(SqlSurfaceError::payload_too_large(format!(
-            "DML affected row count {count} exceeds limit {MAX_DML_AFFECTED_ROWS}"
+            "DML affected row count {count} exceeds limit {limit}"
         )));
     }
     Ok(())
+}
+
+/// [`DmlLimits`] を明示設定する場合に取れる範囲の下限（Issue #997・オーナー
+/// 判断 2026-09-27）。`0` は範囲外として拒否する（`NonZeroUsize` で型として
+/// 保証するため、本定数は主に `Display`／CLI エラーメッセージ向け）。
+pub const MIN_DML_ROW_LIMIT: usize = 1;
+
+/// [`DmlLimits`] を明示設定する場合に取れる範囲の上限（Issue #997・オーナー
+/// 判断 2026-09-27）。総走査行数上限 [`crate::tenant::MAX_SCANNED_ROWS`] と同値を
+/// 採用し、DML の 1 文あたり上限が走査上限を超えて無意味に大きくなることを防ぐ
+/// （値のドリフト防止のため定数を再利用し、独立したリテラルを持たない）。
+pub const MAX_DML_ROW_LIMIT: usize = crate::tenant::MAX_SCANNED_ROWS;
+
+/// [`validate_dml_row_limit`] が範囲外の値を検出した際のエラー。`Display` には
+/// 入力値と許容範囲のみを含める（テナント・行内容に触れない。fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmlRowLimitOutOfRange {
+    pub value: usize,
+}
+
+impl std::fmt::Display for DmlRowLimitOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "value {} is out of range {MIN_DML_ROW_LIMIT}..={MAX_DML_ROW_LIMIT}",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for DmlRowLimitOutOfRange {}
+
+/// `value` が [`MIN_DML_ROW_LIMIT`]`..=`[`MAX_DML_ROW_LIMIT`] の範囲内かを検証し、
+/// `NonZeroUsize` へ変換する（Issue #997）。`wire-server` の CLI フラグ解析
+/// （`--max-dml-affected-rows`・`--max-insert-rows`）が数値へパースした後に
+/// この関数を呼び、範囲外を起動時に fail-closed で拒否する契約——本関数は
+/// 文字列パース自体を担わない（untrusted な CLI 引数の数値パース自体は
+/// 呼び出し元の責務。coding-rust.md「untrusted 入力の扱い」対応で、範囲判定
+/// というドメイン知識だけを engine 側に集約する）。フラグ未指定（上限なし）を
+/// 表す `None` は本関数の対象外——呼び出し元がフラグ未指定を検出した時点で
+/// `DmlLimits` の該当フィールドへ直接 `None` を設定する。
+pub fn validate_dml_row_limit(
+    value: usize,
+) -> Result<std::num::NonZeroUsize, DmlRowLimitOutOfRange> {
+    if !(MIN_DML_ROW_LIMIT..=MAX_DML_ROW_LIMIT).contains(&value) {
+        return Err(DmlRowLimitOutOfRange { value });
+    }
+    // `value >= MIN_DML_ROW_LIMIT == 1` を上の範囲検査で確定済みのため
+    // `NonZeroUsize::new` は必ず `Some` になるが、`unwrap`/`expect`
+    // （coding-rust.md「受信データ経路では unwrap/expect 禁止」）を避けて
+    // fail-closed に倒す（原理的に到達しない分岐だが、将来の定数変更等で
+    // 前提が崩れた場合でもパースエラーとして拒否し、パニックさせない）。
+    std::num::NonZeroUsize::new(value).ok_or(DmlRowLimitOutOfRange { value })
+}
+
+/// プロセス全体の DML 行数上限 2 種（Issue #997。オーナー判断の改訂
+/// 〔2026-09-27〕）をまとめて保持する値の入れ物。`core.rs::EngineCore::
+/// with_dml_limits` が受け取り、`wire-server` の起動時 CLI フラグからのみ
+/// 設定する契約——セッション・テナント単位で差し替える経路は設けない
+/// （`crate::batch_limits::BatchLimits` と同じ「起動時に 1 回だけ設定する
+/// プロセス構成値」の設計方針）。
+///
+/// **各フィールドは `None`＝上限なし（既定）を表す**（汎用 RDB との整合を
+/// 理由とするオーナー判断。`docs/design/predicate-dml-exec.md` §6 参照）。
+/// `Some(NonZeroUsize)` は CLI フラグで明示指定した値（`1..=MAX_DML_ROW_LIMIT`。
+/// [`validate_dml_row_limit`] が範囲検証済み）。
+///
+/// - `max_affected_rows`: 述語形 UPDATE/DELETE の 1 文あたり影響行数上限
+///   （[`check_dml_affected_rows_with_limit`] へ渡す。`sql/exec.rs` の
+///   `execute_predicate_update`／`execute_predicate_delete` が参照する）。
+/// - `max_insert_rows_per_statement`: 複数行 `VALUES` の 1 文あたり行数上限
+///   （`sql::allowlist::Parser::parse_insert` が構文段で判定する。
+///   `validate_insert_with_limit`／`validate_insert_tokens_with_limit` 経由で
+///   到達する）。
+///
+/// いずれも既定値（[`Default`] 実装）は `None`（上限なし）で、
+/// `EngineCore::with_dml_limits` を呼ばない既存の構築経路（`EngineCore::open` 等）
+/// も同じ既定のまま不変。資源上限は [`crate::tenant::MAX_SCANNED_ROWS`]（総走査
+/// 行数上限。両フィールドの設定有無に関わらず常に適用）・SQL 文長上限
+/// （`sql::lexer` の入力長上限）・wire 1 メッセージ上限（`wire-server::limits`）・
+/// 一括投入上限（`crate::batch_limits::BatchLimits`）が引き続き担保する。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DmlLimits {
+    pub max_affected_rows: Option<std::num::NonZeroUsize>,
+    pub max_insert_rows_per_statement: Option<std::num::NonZeroUsize>,
 }
 
 /// 束縛済みの述語つき `UPDATE` 文（SQL-19、TASK-192・Issue #869。実行結線は
@@ -6637,19 +6742,64 @@ mod tests {
         );
     }
 
+    // --- Issue #997（オーナー判断の改訂 2026-09-27）: DmlLimits・
+    // check_dml_affected_rows_with_limit・validate_dml_row_limit
+    // （既定は上限なし＝`None`。CLI 明示指定時のみ `Some` で有効化） ---------
+
     #[test]
-    fn check_dml_affected_rows_accepts_up_to_limit_and_rejects_over_limit() {
-        assert!(check_dml_affected_rows(MAX_DML_AFFECTED_ROWS).is_ok());
-        let err = check_dml_affected_rows(MAX_DML_AFFECTED_ROWS + 1).unwrap_err();
+    fn check_dml_affected_rows_with_limit_none_always_accepts() {
+        // 既定（CLI 未指定）は上限なし。大きな件数でも常に成功する
+        // （資源上限は `tenant::MAX_SCANNED_ROWS` 側が別途担保する）。
+        assert!(check_dml_affected_rows_with_limit(0, None).is_ok());
+        assert!(check_dml_affected_rows_with_limit(1_000_000, None).is_ok());
+    }
+
+    #[test]
+    fn check_dml_affected_rows_with_limit_some_accepts_up_to_limit_and_rejects_over_limit() {
+        let limit = std::num::NonZeroUsize::new(5).expect("5 is nonzero");
+        assert!(check_dml_affected_rows_with_limit(5, Some(limit)).is_ok());
+        let err = check_dml_affected_rows_with_limit(6, Some(limit)).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
-    fn check_dml_affected_rows_accepts_zero_count() {
-        // Issue #997 で DELETE 側の別系統（`check_affected_row_count`）を統合した
-        // ことで失われた「`count == 0` は常に許容される」境界を、唯一の上限 API
-        // 側でも固定する（`count > MAX_DML_AFFECTED_ROWS` の厳密比較の確認）。
-        assert!(check_dml_affected_rows(0).is_ok());
+    fn check_dml_affected_rows_with_limit_some_accepts_zero_count() {
+        let limit = std::num::NonZeroUsize::new(5).expect("5 is nonzero");
+        assert!(check_dml_affected_rows_with_limit(0, Some(limit)).is_ok());
+    }
+
+    #[test]
+    fn dml_limits_default_is_unset_no_cap() {
+        // オーナー判断の改訂（2026-09-27）: 汎用 RDB との整合のため既定は
+        // 上限なし。旧既定値 1,000 は CLI 明示指定時のみ意味を持つ。
+        let limits = DmlLimits::default();
+        assert_eq!(limits.max_affected_rows, None);
+        assert_eq!(limits.max_insert_rows_per_statement, None);
+    }
+
+    #[test]
+    fn validate_dml_row_limit_accepts_boundary_values() {
+        assert_eq!(
+            validate_dml_row_limit(MIN_DML_ROW_LIMIT).map(std::num::NonZeroUsize::get),
+            Ok(MIN_DML_ROW_LIMIT)
+        );
+        assert_eq!(
+            validate_dml_row_limit(MAX_DML_ROW_LIMIT).map(std::num::NonZeroUsize::get),
+            Ok(MAX_DML_ROW_LIMIT)
+        );
+    }
+
+    #[test]
+    fn validate_dml_row_limit_rejects_zero_and_over_upper_bound() {
+        assert!(validate_dml_row_limit(0).is_err());
+        assert!(validate_dml_row_limit(MAX_DML_ROW_LIMIT + 1).is_err());
+    }
+
+    #[test]
+    fn max_dml_row_limit_matches_max_scanned_rows() {
+        // 上限は総走査行数上限（`tenant::MAX_SCANNED_ROWS`）と同値であること
+        // （オーナー判断 2026-09-27）を固定し、値のドリフトを検知する。
+        assert_eq!(MAX_DML_ROW_LIMIT, crate::tenant::MAX_SCANNED_ROWS);
     }
 
     // --- bind_insert_form: 形判別（TASK-120・INDEX-1, INDEX-2） -----------------

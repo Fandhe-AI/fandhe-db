@@ -11,7 +11,7 @@
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::recovery::required_op_id::LedgerMode;
 use engine::sql::allowlist::{validate_sql, validate_update_form};
-use engine::sql::parser::{bind_scan, bind_update_form, BoundUpdateForm, MAX_DML_AFFECTED_ROWS};
+use engine::sql::parser::{bind_scan, bind_update_form, BoundUpdateForm};
 use engine::sql::udf_call::UdfRegistry;
 use std::collections::HashSet;
 
@@ -145,12 +145,18 @@ fn where_clause_omission_is_rejected_before_reaching_bound_form() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// [`MAX_DML_AFFECTED_ROWS`]・[`engine::sql::parser::check_dml_affected_rows`]
-/// が公開 API として到達可能であることを固定する（実行結線〔Issue #871〕が
-/// 対象行集合確定後・変更開始前に呼ぶ契約。計画 §2.4）。
+/// [`engine::sql::parser::check_dml_affected_rows_with_limit`] が公開 API として
+/// 到達可能であることを固定する（実行結線〔Issue #871〕が対象行集合確定後・
+/// 変更開始前に呼ぶ契約。計画 §2.4）。Issue #997・オーナー判断の改訂
+/// （2026-09-27）で唯一の上限判定 API となった：`limit` が `None`（既定・
+/// 上限なし）なら常に成功、`Some(limit)`（CLI 明示指定時）なら超過を
+/// `54000` で拒否する。
 #[test]
-fn max_dml_affected_rows_and_checker_are_reachable() {
-    assert!(engine::sql::parser::check_dml_affected_rows(MAX_DML_AFFECTED_ROWS).is_ok());
-    let err = engine::sql::parser::check_dml_affected_rows(MAX_DML_AFFECTED_ROWS + 1).unwrap_err();
+fn check_dml_affected_rows_with_limit_is_reachable() {
+    assert!(engine::sql::parser::check_dml_affected_rows_with_limit(1_000_000, None).is_ok());
+    let limit = std::num::NonZeroUsize::new(1_000).expect("1_000 is nonzero");
+    assert!(engine::sql::parser::check_dml_affected_rows_with_limit(1_000, Some(limit)).is_ok());
+    let err =
+        engine::sql::parser::check_dml_affected_rows_with_limit(1_001, Some(limit)).unwrap_err();
     assert_eq!(err.wire_code(), "54000");
 }
