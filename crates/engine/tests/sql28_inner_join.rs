@@ -493,6 +493,25 @@ fn rejects_where_or_in_join() {
 }
 
 #[test]
+fn rejects_join_where_with_excessive_and_conjuncts() {
+    // untrusted 入力の長い `AND` チェーンでパース時に `where_conjuncts` を
+    // 無制限確保しない（共有 WHERE パースの `MAX_WHERE_LEAVES`・ON 句の
+    // `MAX_JOIN_CONDITIONS` と同じ判断。coding-rust.md「長さフィールドは
+    // 上限検証してからアロケーションに使う」）。
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let clause = (0..300)
+        .map(|_| "authors.name = 'alice'")
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id WHERE {clause} LIMIT 10"
+    );
+    assert_rejected(&core, "tenant-a", &sql, "54000");
+}
+
+#[test]
 fn rejects_where_column_to_column_comparison_in_join() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
@@ -585,6 +604,44 @@ fn rejects_join_key_type_mismatch_with_datatype_mismatch() {
         "tenant-a",
         "SELECT * FROM documents JOIN authors ON documents.title = authors.id LIMIT 10",
         "42804",
+    );
+}
+
+#[test]
+fn bind_error_takes_priority_over_limit_out_of_range() {
+    // docs/design/inner-join.md の順序契約: 両辺の束縛（`sql::parser::
+    // bind_scan_with_dummy_flags`。ここでは WHERE 述語の型検証）を完了させて
+    // から `LIMIT`／`OFFSET` の範囲検証を行う。束縛エラー・LIMIT エラーは
+    // いずれも `wire_code` 上は `22000`（`InvalidInput`）だが、束縛未完了の
+    // まま LIMIT を先に検証する実装では detail が LIMIT 側の文言になって
+    // しまう（Execute/Describe 双方で束縛側の文言を確認する）。
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    // `author_id`（`BigInt`）への範囲比較（`>`）は束縛段（`declarative_filter
+    // ::bind_impl`）でのみ「range comparison 非対応」として拒否される
+    // （`build_plan` の列解決は通過する）。LIMIT 0 と共存させ、束縛完了が
+    // LIMIT 検証より先であることを確認する。
+    let sql = "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id \
+               WHERE documents.author_id > '5' LIMIT 0";
+    let err = run_err(&core, "tenant-a", sql);
+    assert_eq!(err.wire_code(), "22000", "sql={sql:?} err={err:?}");
+    let detail = format!("{err:?}");
+    assert!(
+        detail.contains("range comparison"),
+        "expected the bind-time range-comparison error to take priority over the LIMIT range error, got {detail}"
+    );
+
+    let describe_session = SessionState::default();
+    let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+    let describe_err = core
+        .describe_parsed_in_session(&describe_session, &parsed)
+        .expect_err("describe must reject the same bind error as execute");
+    assert_eq!(describe_err.wire_code(), "22000", "err={describe_err:?}");
+    let describe_detail = format!("{describe_err:?}");
+    assert!(
+        describe_detail.contains("range comparison"),
+        "expected describe to report the same bind-time error, got {describe_detail}"
     );
 }
 

@@ -1464,6 +1464,13 @@ pub(crate) enum JoinWherePredicate {
 /// 判定し、無制限確保を避ける（security.md「不安全な設計」対応）。超過は `54000`。
 pub(crate) const MAX_JOIN_CONDITIONS: usize = 8;
 
+/// JOIN の `WHERE` 句の conjunct（`AND` 結合された述語）数の上限。共有 WHERE
+/// パース（[`MAX_WHERE_LEAVES`]）・`ON` 句（[`MAX_JOIN_CONDITIONS`]）と同じ
+/// 判断（`Vec` へ積む前に検査し、長い `AND` チェーンでの無制限確保を避ける。
+/// coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」）。
+/// 超過は `54000`。
+pub(crate) const MAX_JOIN_WHERE_CONJUNCTS: usize = MAX_WHERE_LEAVES;
+
 /// 許可形状の構造判定を通過した `INNER JOIN` 文（Issue #925・SQL-28・RLS-10、
 /// TASK-212）。束縛（列解決・型検証・WHERE プッシュダウン）・実行（ハッシュ結合・
 /// RLS 独立適用・行数上限）は `sql::join` の責務（本モジュールは構造情報のみを
@@ -1477,7 +1484,8 @@ pub struct ValidatedJoin {
     /// 以下）。
     pub(crate) on: Vec<(ColumnRef, ColumnRef)>,
     pub(crate) projection: JoinProjection,
-    /// `WHERE` 句（省略可）の述語（`AND` 結合順）。
+    /// `WHERE` 句（省略可）の述語（`AND` 結合順。[`MAX_JOIN_WHERE_CONJUNCTS`]
+    /// 以下）。
     pub(crate) where_conjuncts: Vec<JoinWherePredicate>,
     pub(crate) limit: u32,
     pub(crate) offset: u32,
@@ -6000,6 +6008,11 @@ fn parse_join_where_conjuncts(
                 ))
             }
         };
+        if preds.len() >= MAX_JOIN_WHERE_CONJUNCTS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many JOIN WHERE conjuncts",
+            ));
+        }
         preds.push(pred);
         if matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
             p.advance();

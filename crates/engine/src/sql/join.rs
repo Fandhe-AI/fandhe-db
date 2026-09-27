@@ -616,11 +616,6 @@ pub(crate) fn execute_with_limits(
     udfs: &UdfRegistry,
     limits: &JoinLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // §2.5: `LIMIT`／`OFFSET` の範囲検証（`22000`）は両辺の走査より前に行う
-    // （`sql::set_op::execute_with_budget` と同じ判断順序）。
-    let limit = crate::sql::parser::validate_search_limit(validated.limit)?;
-    let offset = crate::sql::parser::validate_search_offset(validated.offset)?;
-
     let plan = build_plan(schemas, validated)?;
 
     let (left_ref, right_ref) = match validated.relations.as_slice() {
@@ -642,6 +637,21 @@ pub(crate) fn execute_with_limits(
             detail: "schema missing for JOIN right relation".to_string(),
         })?;
 
+    // §2.4/§2.5: 両辺の束縛（列参照・WHERE 述語の型検証）を完了させてから
+    // `LIMIT`／`OFFSET` の範囲検証（`22000`）を行う（束縛エラー優先。
+    // docs/design/inner-join.md の順序契約。Describe（`describe_columns`）と
+    // 同じ判断順序に揃える）。走査（`execute_scan_with_budget`）自体は
+    // 束縛結果を使って後段で行う。
+    let mut left_bound =
+        crate::sql::parser::bind_scan_with_dummy_flags(&plan.left_scan, left_schema, udfs, &[])?;
+    left_bound.limit = limits.max_input_rows.saturating_add(1);
+    let mut right_bound =
+        crate::sql::parser::bind_scan_with_dummy_flags(&plan.right_scan, right_schema, udfs, &[])?;
+    right_bound.limit = limits.max_input_rows.saturating_add(1);
+
+    let limit = crate::sql::parser::validate_search_limit(validated.limit)?;
+    let offset = crate::sql::parser::validate_search_offset(validated.offset)?;
+
     let mut budget = JoinBudget::new(limits.budget_cap);
 
     // §2.4: 両辺の評価は既存の広域取得経路（`execute_scan_with_budget`）を通す
@@ -649,9 +659,6 @@ pub(crate) fn execute_with_limits(
     // 呼び出したセッションの `ctx`（`PolicyContext`）で両辺を独立に評価する
     // ため、他テナント行は中間結果・結合キー・カーディナリティ判定の
     // いずれにも現れない（RLS-10 相当）。
-    let mut left_bound =
-        crate::sql::parser::bind_scan_with_dummy_flags(&plan.left_scan, left_schema, udfs, &[])?;
-    left_bound.limit = limits.max_input_rows.saturating_add(1);
     let left_result = crate::sql::scan::execute_scan_with_budget(
         read_txn,
         ctx,
@@ -666,9 +673,6 @@ pub(crate) fn execute_with_limits(
     }
     budget.charge(result_bytes(left_result.columns.len(), &left_result.rows))?;
 
-    let mut right_bound =
-        crate::sql::parser::bind_scan_with_dummy_flags(&plan.right_scan, right_schema, udfs, &[])?;
-    right_bound.limit = limits.max_input_rows.saturating_add(1);
     let right_result = crate::sql::scan::execute_scan_with_budget(
         read_txn,
         ctx,
@@ -809,9 +813,6 @@ pub(crate) fn describe_columns(
     validated: &ValidatedJoin,
     udfs: &UdfRegistry,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
-    crate::sql::parser::validate_search_limit(validated.limit)?;
-    crate::sql::parser::validate_search_offset(validated.offset)?;
-
     let plan = build_plan(schemas, validated)?;
 
     let (left_ref, right_ref) = match validated.relations.as_slice() {
@@ -833,9 +834,14 @@ pub(crate) fn describe_columns(
             detail: "schema missing for JOIN right relation".to_string(),
         })?;
     // 走査せずに束縛だけ行い、WHERE リテラルの型検証を Execute と同じ判定
-    // 基準で確定させる（Describe は本体を実行しない契約）。
+    // 基準で確定させる（Describe は本体を実行しない契約）。§2.4/§2.5:
+    // 両辺の束縛完了を `LIMIT`／`OFFSET` 検証より前に行う（束縛エラー優先。
+    // docs/design/inner-join.md の順序契約。Execute と同じ判断順序）。
     crate::sql::parser::bind_scan_with_dummy_flags(&plan.left_scan, left_schema, udfs, &[])?;
     crate::sql::parser::bind_scan_with_dummy_flags(&plan.right_scan, right_schema, udfs, &[])?;
+
+    crate::sql::parser::validate_search_limit(validated.limit)?;
+    crate::sql::parser::validate_search_offset(validated.offset)?;
 
     Ok(plan
         .output
