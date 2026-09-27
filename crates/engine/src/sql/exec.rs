@@ -3599,7 +3599,10 @@ pub(crate) fn map_insert_write_error(e: crate::tenant::TenantWriteError) -> SqlS
 /// detail が `"insert rejected"`／`"insert failed"` になる既存の不整合は本 PR
 /// 時点でも未解消のまま残る（新規のリグレッションではない。是正は別 Issue の
 /// 担当）。
-fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlSurfaceError {
+pub(crate) fn map_write_error(
+    e: crate::tenant::TenantWriteError,
+    op: &'static str,
+) -> SqlSurfaceError {
     use crate::catalog::CatalogError;
     use crate::storage::StorageError;
     use crate::tenant::TenantWriteError;

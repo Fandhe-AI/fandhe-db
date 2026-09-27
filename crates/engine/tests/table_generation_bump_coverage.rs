@@ -135,7 +135,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1073（UNIQUE 制約の対象型拡張。`is_unique_constraint_allowed`・
     // `unique_key_tag`・型ごとの正準キー生成のドキュメンテーションコメント
     // 追加）で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4676）。
-    ("catalog.rs", 4713),
+    // Issue #1077（`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4713）。
+    ("catalog.rs", 4924),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -161,7 +163,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4217）。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4755）。
-    ("catalog.rs", 4792),
+    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
+    // で再度追随（旧: 4792）。
+    ("catalog.rs", 5003),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -179,7 +183,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4298）。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4836）。
-    ("catalog.rs", 4873),
+    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
+    // で再度追随（旧: 4873）。
+    ("catalog.rs", 5084),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -196,7 +202,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4331）。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4869）。
-    ("catalog.rs", 4906),
+    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
+    // で再度追随（旧: 4906）。
+    ("catalog.rs", 5117),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
@@ -208,8 +216,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // base（main）取り込みマージ（PR #1041 の `max_duration` 超過チェック追加）で
     // 行番号がさらに移動したための追随（旧: 248）。PR #1049 レビュー指摘対応
     // （`begin()` への世代カウンタ加算・`active_generation`／`cursor_id`
-    // アクセサ追加）でさらに移動（旧: 256）。
-    ("sql/transaction.rs", 293),
+    // アクセサ追加）でさらに移動（旧: 256）。COMMIT 時の遅延 `FOREIGN KEY` 検査
+    // （`constraint::enforce_deferred_foreign_keys_in_txn`。TABLE-17・TASK-205、
+    // Issue #1077）を commit の直前に追加したことでさらに移動（旧: 293）。この
+    // 検査自体は参照先の行ストアを読むだけで `user_rows/{table}` へ書き込まない。
+    ("sql/transaction.rs", 330),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を
@@ -226,7 +237,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // の追加）で行が移動したための追随（旧: 417）。
     // Issue #997（`MAX_SCANNED_ROWS` の `pub(crate)` 化に伴うドキュメント
     // コメント追記）で行が移動したための追随（旧: 425）。
-    ("tenant.rs", 428),
+    // Issue #1077（`WriteTarget` の `InTxn` 経路の doc コメント更新・
+    // `fk_check_mode` アクセサ追加）で行が移動したための追随（旧: 428）。
+    ("tenant.rs", 429),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
