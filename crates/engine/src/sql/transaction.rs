@@ -112,6 +112,18 @@ struct ActiveTxn<'e> {
     statements: u32,
     seen_operation_ids: HashSet<String>,
     written_tables: HashSet<String>,
+    /// このトランザクション内で書き込んだ `(tenant_id, table)` の組の集合
+    /// （TABLE-17・TASK-205、Issue #1077）。COMMIT 時の遅延 `FOREIGN KEY` 検査
+    /// （[`crate::constraint::enforce_deferred_foreign_keys_in_txn`]）が対象範囲を
+    /// 導出する唯一の情報源——`written_tables`（テーブル名のみ）と違い、書き込みは
+    /// 常にサーバー側導出テナントに紐づくため、ここでもテナントを明示的に持つ。
+    /// [`Self::written_tables`] と異なる集合を分けて持つ理由: 前者は「読み取りを
+    /// 拒否するテーブル名」の判定にしか使わず、テナントを持たないため COMMIT 時
+    /// 検査の走査範囲（テナント別の物理キー範囲）を復元できない。記録漏れは
+    /// 検査漏れ＝fail-open のバグになるため、書き込みのたびに
+    /// [`Self::mark_written`] を必ず呼ぶ契約とする（呼び出し元は `core.rs` の
+    /// INSERT／TRUNCATE の 2 箇所のみ）。
+    written_by_tenant: std::collections::BTreeSet<(String, String)>,
     has_writes: bool,
     session_at_begin: SessionState,
     /// `DECLARE`/`FETCH`/`CLOSE`（WIRE-15・TASK-218）が開いたカーソルの集合。
@@ -240,6 +252,7 @@ impl<'e> SessionTransaction<'e> {
                     statements: 0,
                     seen_operation_ids: HashSet::new(),
                     written_tables: HashSet::new(),
+                    written_by_tenant: std::collections::BTreeSet::new(),
                     has_writes: false,
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
@@ -264,6 +277,13 @@ impl<'e> SessionTransaction<'e> {
     ///
     /// - 持続時間の上限を超えている場合は確定させず、abort して `Failed` へ遷移し
     ///   `54000` を返す（文実行時の上限超過と同じ契約。PR #1041 レビュー指摘）。
+    /// - 書き込みがあれば、commit の**前**に `written_by_tenant`（このトランザクション
+    ///   内で書き込んだ `(tenant, table)` の集合）の各要素について、文単位検査から
+    ///   先送りしていた `INITIALLY DEFERRED` の `FOREIGN KEY` を検査する
+    ///   （[`crate::constraint::enforce_deferred_foreign_keys_in_txn`]。TABLE-17・
+    ///   TASK-205、Issue #1077）。違反すれば abort し、`session` を `BEGIN` 時点の
+    ///   状態へ復元してから `Idle` へ戻り `23503` を返す（PostgreSQL と同じく
+    ///   ロールバック扱い。commit 自体の失敗〔下記〕とは別の分岐として扱う）。
     /// - commit 自体が失敗した場合は、PostgreSQL と同じくロールバック扱いとし、
     ///   `session` を `BEGIN` 時点の状態へ復元してから `Idle` へ戻る。
     pub fn commit(&mut self, session: &mut SessionState) -> Result<(), SqlSurfaceError> {
@@ -278,6 +298,7 @@ impl<'e> SessionTransaction<'e> {
                     started_at,
                     has_writes,
                     session_at_begin,
+                    written_by_tenant,
                     ..
                 } = *active;
                 if started_at.elapsed() > self.limits.max_duration {
@@ -288,6 +309,22 @@ impl<'e> SessionTransaction<'e> {
                         expired: false,
                     };
                     return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
+                }
+                if has_writes {
+                    for (tenant_id, table) in &written_by_tenant {
+                        if let Err(e) = crate::constraint::enforce_deferred_foreign_keys_in_txn(
+                            &write_txn, tenant_id, table,
+                        ) {
+                            // 遅延 FK 違反（TABLE-17・TASK-205、Issue #1077）:
+                            // `write_txn` を drop（abort）し permit を解放したうえで
+                            // `BEGIN` 時点のセッション状態を復元し `Idle` へ戻る
+                            // （commit 自体の失敗と同じロールバック扱い）。
+                            drop(write_txn);
+                            self.state = TxnState::Idle;
+                            *session = session_at_begin;
+                            return Err(crate::sql::exec::map_write_error(e, "commit"));
+                        }
+                    }
                 }
                 let result = if has_writes {
                     crate::recovery::commit_boundary::commit(write_txn)
@@ -376,10 +413,17 @@ impl<'e> SessionTransaction<'e> {
         Ok(())
     }
 
-    /// 対象テーブルへの書き込みを記録する（読み取りの `written_tables` 判定用）。
-    pub(crate) fn mark_written(&mut self, table: &str) {
+    /// 対象テーブルへの書き込みを記録する（読み取りの `written_tables` 判定用に
+    /// 加え、`tenant_id` を伴う `written_by_tenant` へも記録する。TABLE-17・
+    /// TASK-205、Issue #1077。COMMIT 時の遅延 `FOREIGN KEY` 検査の走査範囲は
+    /// この記録だけから導出するため、呼び出し元（`core.rs` の INSERT・
+    /// TRUNCATE）は書き込みのたびに必ず呼ぶこと——省くと fail-open になる）。
+    pub(crate) fn mark_written(&mut self, tenant_id: &str, table: &str) {
         if let TxnState::Active(active) = &mut self.state {
             active.written_tables.insert(table.to_string());
+            active
+                .written_by_tenant
+                .insert((tenant_id.to_string(), table.to_string()));
             active.has_writes = true;
         }
     }
