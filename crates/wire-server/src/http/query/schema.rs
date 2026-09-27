@@ -590,7 +590,7 @@ pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "filter",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
         FieldSpec {
@@ -655,7 +655,7 @@ pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "filter",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
         FieldSpec {
@@ -709,7 +709,7 @@ pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "filter",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
         FieldSpec {
@@ -1714,10 +1714,20 @@ mod tests {
     }
 
     #[test]
-    fn nested_filter_item_reports_missing_required() {
+    fn filter_element_shape_is_deferred_to_filter_module() {
+        // Issue #945・NOSQL-14: `filter` 要素は「葉」（`column`／`op`／`value`）と
+        // 「グループ」（`or`）の 2 形を取りうるため、`SEARCH_SCHEMA`／
+        // `SCAN_SCHEMA`／`AGGREGATE_SCHEMA` はもはや要素の形を検査しない
+        // （`FieldType::Array(ElementType::Any)`）。形・語彙・上限の検査は
+        // `http::query::filter` モジュールへ集約した（二重実装しない）。
+        // `UPDATE_SCHEMA`／`DELETE_SCHEMA` は従来どおり `FILTER_ITEM_SCHEMA`
+        // （葉形のみ）で要素を検査する（#1062 の範囲。変更していない）。
         let v = obj(r#"{"op":"search","table":"docs","limit":1,"filter":[{"column":"a"}]}"#);
+        assert!(SEARCH_SCHEMA.validate(&v).is_ok());
+
+        let v = obj(r#"{"op":"update","table":"docs","set":{},"filter":[{"column":"a"}]}"#);
         assert_eq!(
-            SEARCH_SCHEMA.validate(&v).unwrap_err(),
+            UPDATE_SCHEMA.validate(&v).unwrap_err(),
             SchemaError::MissingRequired { key: "op" }
         );
     }
