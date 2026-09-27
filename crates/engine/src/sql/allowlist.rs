@@ -2237,13 +2237,16 @@ pub struct ParsedCheck {
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
-/// UNIQUE 制約の参照解決（TABLE-16・TASK-204、Issue #905）。表制約は宣言順に
-/// 関わらず任意位置の列を参照できるため、全列が出揃った後にまとめて行う。
-/// 未宣言列（`id` 疑似列を含む。`id` は元からテナント内一意の行識別子のため
-/// UNIQUE の対象にしない）・一意キー許可型
-/// （[`crate::catalog::ColumnType::is_primary_key_allowed`]。主キーと共有する
-/// 単一の許可リスト）外の列の参照は `42601`。同一列リストの制約重複等の残る
-/// 不変条件は `catalog::validate_schema` が再検証する。
+/// UNIQUE 制約の参照解決（TABLE-16・TASK-204、Issue #905・#1073）。表制約は
+/// 宣言順に関わらず任意位置の列を参照できるため、全列が出揃った後にまとめて
+/// 行う。未宣言列（`id` 疑似列を含む。`id` は元からテナント内一意の行識別子
+/// のため UNIQUE の対象にしない）・一意キー許可型
+/// （[`crate::catalog::ColumnType::is_unique_constraint_allowed`]。PK・FK が
+/// 共有する許可リストの上位集合）外の列の参照は `42601`。SQL 表層の
+/// `CREATE TABLE` は列型自体を TEXT・VECTOR・INTEGER・BIGINT にしか受理しない
+/// ため、この判定が可観測な挙動を変えるのは他の型を宣言できる経路（Rust API）
+/// 経由でスキーマを構築した場合に限る。同一列リストの制約重複等の残る不変条件は
+/// `catalog::validate_schema` が再検証する。
 fn finalize_unique_constraints(
     unique_constraints: Vec<Vec<String>>,
     columns: &[ColumnDef],
@@ -2255,7 +2258,7 @@ fn finalize_unique_constraints(
                     "UNIQUE constraint references unknown column: {name}"
                 ))
             })?;
-            if !column.ty.is_primary_key_allowed() {
+            if !column.ty.is_unique_constraint_allowed() {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "column {name} has a type that cannot be used in a UNIQUE constraint"
                 )));
