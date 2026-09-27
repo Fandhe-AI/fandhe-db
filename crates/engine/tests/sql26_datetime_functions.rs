@@ -502,3 +502,114 @@ fn date_part_is_deterministic_across_two_evaluations_of_the_same_row() {
         .expect("second projection should succeed");
     assert_eq!(first.rows[0].cells[0], second.rows[0].cells[0]);
 }
+
+// --- NULLIF over DATE/TIMESTAMP（Cursor Bugbot 指摘対応。PR #1120） ---------
+//
+// `=` 演算子は DATE/TIMESTAMP 同士の比較（DATE⋈TIMESTAMP は DATE 側を深夜
+// 0 時の TIMESTAMP へ暗黙昇格）を受理するが、束縛時に NULLIF 側だけ
+// Scalar/Text に限定されたままだと `NULLIF(a, b) ≡ CASE WHEN a = b THEN NULL
+// ELSE a END`（対象ビヘイビア: SQL-26）という PostgreSQL 互換契約が崩れる。
+// bind_nullif／eval_nullif に DATE/TIMESTAMP の分岐を追加した回帰を固定する。
+
+#[test]
+fn nullif_over_date_returns_null_when_equal_and_lhs_when_different() {
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let equal = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT NULLIF(day, DATE '2024-06-15') FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("NULLIF over equal DATE operands should be accepted");
+    assert_eq!(equal.rows[0].cells[0], Cell::Null);
+
+    let different = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT NULLIF(day, DATE '2024-01-01') FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("NULLIF over different DATE operands should be accepted");
+    let expected_day = engine::datetime::parse_date("2024-06-15").expect("valid DATE literal");
+    assert_eq!(different.rows[0].cells[0], Cell::Date(expected_day));
+}
+
+#[test]
+fn nullif_over_timestamp_returns_null_when_equal_and_lhs_when_different() {
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 10:30:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let equal = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT NULLIF(at, TIMESTAMP '2024-06-15 10:30:00') FROM {TABLE} WHERE id = 1 LIMIT 10"
+            ),
+        )
+        .expect("NULLIF over equal TIMESTAMP operands should be accepted");
+    assert_eq!(equal.rows[0].cells[0], Cell::Null);
+
+    let different = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT NULLIF(at, TIMESTAMP '2000-01-01 00:00:00') FROM {TABLE} WHERE id = 1 LIMIT 10"
+            ),
+        )
+        .expect("NULLIF over different TIMESTAMP operands should be accepted");
+    match different.rows[0].cells[0] {
+        Cell::Timestamp(_) => {}
+        ref other => panic!("expected Cell::Timestamp, got {other:?}"),
+    }
+}
+
+#[test]
+fn nullif_over_date_and_timestamp_promotes_date_side_like_equality_operator() {
+    // DATE⋈TIMESTAMP の暗黙昇格（`=` 演算子と同じ規則）。DATE 側が深夜 0 時の
+    // TIMESTAMP へ昇格されるため、`day`（深夜 0 時）と `at`（深夜 0 時）が
+    // 同一暦日なら NULL になる。
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT NULLIF(day, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .expect("NULLIF over DATE/TIMESTAMP mismatch types should promote DATE side");
+    assert_eq!(result.rows[0].cells[0], Cell::Null);
+}
+
+#[test]
+fn nullif_rejects_mismatched_date_and_scalar() {
+    let (core, _guard) = new_core();
+    let ctx = ctx_for("tenant-a");
+    core.execute_insert_sql(
+        &ctx,
+        &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),
+    )
+    .expect("insert should succeed");
+
+    let err = core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT NULLIF(day, 1) FROM {TABLE} WHERE id = 1 LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "42804");
+}

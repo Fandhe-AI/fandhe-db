@@ -1410,7 +1410,8 @@ fn bind_coalesce(
 }
 
 /// `NULLIF(<lhs>, <rhs>)` を束縛する（対象ビヘイビア: SQL-26）。両辺は既存の `=`
-/// 演算子と同じく `Scalar` 限定（`Vector`/`Bool` の等価比較は式層に存在しない）。
+/// 演算子と同じ型集合（`Scalar`／`Text`／`DATE`／`TIMESTAMP`）を受理する
+/// （`Vector`/`Bool` の等価比較は式層に存在しない）。
 fn bind_nullif(
     lhs: &Expr,
     rhs: &Expr,
@@ -1418,38 +1419,52 @@ fn bind_nullif(
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     // codex-review／Cursor Bugbot 指摘対応: この PR で `=` 演算子が
-    // `(Text, Text) => Bool` を新たに受理するようになった（`bind_binary`
-    // 参照）が、`NULLIF(a, b)` は `a = b` と等価な意味論（PostgreSQL
-    // 互換。`docs/spec/04-behavior/sql-surface.md` SQL-26 の
-    // 「PostgreSQL 互換」契約）を持つため、比較演算子と同じ型（`Scalar`
-    // または `Text`）の組を受理すべきだが、旧実装は `Scalar` に限定して
-    // いた。`unify_branch_type`（`CASE` の分岐型統一と共通）を使い、
-    // `Vector`／`Bool` を拒否しつつ `Scalar`／`Text` のいずれかで両辺の
-    // 型が一致することを要求する。
+    // `(Text, Text) => Bool`・`(Date/Timestamp, Date/Timestamp) => Bool`
+    // （`DATE`⋈`TIMESTAMP` は `DATE` 側を深夜 0 時の `TIMESTAMP` へ暗黙昇格）を
+    // 新たに受理するようになった（`bind_binary` 参照）が、`NULLIF(a, b)` は
+    // `a = b` と等価な意味論（PostgreSQL 互換。`docs/spec/04-behavior/
+    // sql-surface.md` SQL-26 の「PostgreSQL 互換」契約）を持つため、比較演算子と
+    // 同じ型の組を受理すべきである。`unify_branch_type` は完全一致の型統一
+    // （`CASE` の分岐型統一と共通）しか扱えないため、`DATE`⋈`TIMESTAMP` の
+    // 昇格は `bind_binary` の Eq 分岐と同じ規則をここで個別に適用する。
     bind_with_case_nesting(env, |env| {
         let (lhs_b, lhs_t) = bind_null_aware(lhs, env, node_budget)?;
         let (rhs_b, rhs_t) = bind_null_aware(rhs, env, node_budget)?;
         for t in [lhs_t, rhs_t].into_iter().flatten() {
-            if !matches!(t, ExprType::Scalar | ExprType::Text) {
+            if !matches!(
+                t,
+                ExprType::Scalar | ExprType::Text | ExprType::Date | ExprType::Timestamp
+            ) {
                 return Err(SqlSurfaceError::DatatypeMismatch {
-                    detail: "NULLIF arguments must be scalar or text".to_string(),
+                    detail: "NULLIF arguments must be scalar, text, date, or timestamp".to_string(),
                 });
             }
         }
-        let mut unified: Option<ExprType> = None;
-        unify_branch_type(
-            &mut unified,
-            lhs_t,
-            "NULLIF arguments must have the same type",
-        )?;
-        unify_branch_type(
-            &mut unified,
-            rhs_t,
-            "NULLIF arguments must have the same type",
-        )?;
-        let result_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
-            detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
-        })?;
+        let (lhs_b, rhs_b, result_ty) = match (lhs_t, rhs_t) {
+            (Some(ExprType::Date), Some(ExprType::Timestamp)) => {
+                (wrap_date_to_timestamp(lhs_b), rhs_b, ExprType::Timestamp)
+            }
+            (Some(ExprType::Timestamp), Some(ExprType::Date)) => {
+                (lhs_b, wrap_date_to_timestamp(rhs_b), ExprType::Timestamp)
+            }
+            _ => {
+                let mut unified: Option<ExprType> = None;
+                unify_branch_type(
+                    &mut unified,
+                    lhs_t,
+                    "NULLIF arguments must have the same type",
+                )?;
+                unify_branch_type(
+                    &mut unified,
+                    rhs_t,
+                    "NULLIF arguments must have the same type",
+                )?;
+                let ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+                    detail: "NULLIF(NULL, NULL) has no determinable type".to_string(),
+                })?;
+                (lhs_b, rhs_b, ty)
+            }
+        };
         Ok((
             BoundExpr::NullIf {
                 lhs: Box::new(lhs_b),
@@ -2335,10 +2350,12 @@ pub(crate) fn eval_with_scalars<'a>(
 /// lhs END` と等価な意味論。対象ビヘイビア: SQL-26）。再帰 `eval` の
 /// `BoundExpr::NullIf` 分岐と `sql::expr_program::ExprProgram::eval` の
 /// `ExprStep::NullIf` 分岐が共有する（Issue #353 と同じ「値ベース評価を 1 箇所に
-/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar`／`Text` の
-/// いずれか一方に限定・統一済みのため、非 `Null`・非 `Scalar`・非 `Text` の
-/// 組み合わせ（型が食い違う場合を含む）は束縛段の不変条件が崩れた場合の
-/// 保険として `Internal` に倒す。
+/// 保つ」方針）。束縛段（[`bind_nullif`]）が両辺を `Scalar`／`Text`／`Date`／
+/// `Timestamp` のいずれか一方に限定・統一済み（`DATE`⋈`TIMESTAMP` の混在は
+/// 束縛時に `DATE` 側を `TIMESTAMP` へ昇格済みのため、ここには来ない）のため、
+/// 非 `Null`・非 `Scalar`・非 `Text`・非 `Date`・非 `Timestamp` の組み合わせ
+/// （型が食い違う場合を含む）は束縛段の不変条件が崩れた場合の保険として
+/// `Internal` に倒す。
 pub(crate) fn eval_nullif<'a>(
     l: ExprValue<'a>,
     r: ExprValue<'a>,
@@ -2361,6 +2378,24 @@ pub(crate) fn eval_nullif<'a>(
                 Ok(ExprValue::Null)
             } else {
                 Ok(ExprValue::Text(a))
+            }
+        }
+        // Cursor Bugbot 指摘対応（PR #1120）: `=` 演算子が `DATE`／`TIMESTAMP`
+        // 同士の比較を受理するようになったことに合わせ、`NULLIF` も同じ組を
+        // 受理する（`bind_nullif` 参照。`DATE`⋈`TIMESTAMP` は束縛時に昇格済み
+        // のためここでは同種同士のみを扱う）。
+        (ExprValue::Date(a), ExprValue::Date(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Date(a))
+            }
+        }
+        (ExprValue::Timestamp(a), ExprValue::Timestamp(b)) => {
+            if a == b {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Timestamp(a))
             }
         }
         _ => Err(SqlSurfaceError::Internal {
