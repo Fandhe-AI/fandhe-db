@@ -21,20 +21,25 @@
 //! Issue #769 で SQL-14（`sql::group_by::execute_grouped_aggregate`）へ
 //! 写像する。
 //!
-//! `table`／`aggregates[].column`／`group_by[0]`／`having[].column`
+//! `table`／`aggregates[].column`／`group_by[]` 各要素／`having[].column`
 //! （`*` を除く）は [`super::ident::check_identifier`] で識別子形状を検査
 //! してから使う（SQL 表層の字句解析段階の拒否と同じ `42601` 分類。untrusted
 //! 文字列は echo しない）。`filter` 配列は [`super::filter::bind_filter`]
 //! （Issue #761・NOSQL-7）へ委譲する。
 //!
-//! `group_by`／`having` の応答コード確定（Issue #769）:
+//! `group_by`／`having` の応答コード確定（Issue #769・複数列 `group_by` は
+//! Issue #949・NOSQL-16 (b)・SQL-25 (d) で拡張）:
 //! - グループ数上限（`engine::sql::group_by::MAX_GROUPS`）・グループキー
 //!   累計バイト・TEXT 集計状態累計バイトの各予算超過 → `54000`
 //!   （[`engine::sql::allowlist::SqlSurfaceError::payload_too_large`] 経由）
 //! - `having` 述語数上限超過 → `54000`
 //!   （[`engine::sql::allowlist::check_having_predicate_count`]）
-//! - `group_by` 要素数 ≠ 1・`having` のみ（`group_by` なし）・語彙外
-//!   `op`／`fn`・非有限 `value`・識別子形状不正 → `42601`
+//! - `group_by` 列数が [`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`]
+//!   （8）を超過 → `54000`（[`allowlist::check_group_by_column_count`]。
+//!   `Vec` 確保より前に検査する）
+//! - `group_by` が空配列・非文字列要素・`having` のみ（`group_by` なし）・
+//!   語彙外 `op`／`fn`・非有限 `value`・識別子形状不正・`group_by` 内の
+//!   重複列名 → `42601`
 //! - `aggregates` が空リスト → `group_by`／`having` の有無・形状によらず
 //!   一律 `42601`（`having` の参照解決より必ず先に検査する。PR #824
 //!   codex-review 指摘。参照解決を先に走らせると `group_by` あり経路のみ
@@ -129,14 +134,16 @@ pub enum AggregateError {
     /// 検索 `SELECT` 専用で、集計 `SELECT` への適用を拒否する契約の写像。
     /// `42601`。Issue #765・NOSQL-10）。
     ExplainNotSupported,
-    /// `group_by`／`having` の形の逸脱（TASK-186・NOSQL-5）: `group_by`
-    /// 要素数が 1 でない、または `having`（空配列を含む）が `group_by` なしに
-    /// 単独で指定されている。黙って無視すると `GROUP BY` なしの単一行集計
+    /// `group_by`／`having` の形の逸脱（TASK-186・NOSQL-5。複数列 `group_by`
+    /// は Issue #949・NOSQL-16 (b) で拡張）: `group_by` が空配列・非文字列
+    /// 要素を含む、または `having`（空配列を含む）が `group_by` なしに単独で
+    /// 指定されている。黙って無視すると `GROUP BY` なしの単一行集計
     /// 〔TASK-166・SQL-13〕として fail-open に実行してしまうため拒否する。
-    /// `group_by` 配列形（複数列）の受理は本 Issue の対象外（NOSQL-16 (b)。
-    /// 別 Issue）。engine 側は `BoundAggregate::new_grouped_by_columns`・
-    /// `allowlist::check_group_by_column_count`（SQL-25 (d)）を公開済みのため、
-    /// 本モジュールはそれらへ写像するだけで拡張できる。
+    /// `group_by` は 1〜[`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`] 列の
+    /// 配列を受理し、`BoundAggregate::new_grouped_by_columns`（SQL-25 (d)）へ
+    /// 写像する（列数上限超過は `54000`・重複列名は engine 側で `42601`）。
+    /// `group_by` の裸の文字列形（配列でなく単一文字列）の受理は本 Issue の
+    /// 対象外（NOSQL-16 (b)・別 Issue）。
     GroupByShape,
     /// `having[].op` が [`parse_having_op`] の 5 記号（`=`／`<`／`<=`／`>`／
     /// `>=`）に完全一致しない。
@@ -199,9 +206,9 @@ impl ClassifiedError for AggregateError {
             AggregateError::Filter(err) => err.client_message(),
             AggregateError::Engine(err) => err.client_message(),
             AggregateError::ExplainNotSupported => EXPLAIN_NOT_SUPPORTED_MESSAGE.to_string(),
-            AggregateError::GroupByShape => {
-                "group_by must have exactly one element, and having requires group_by".to_string()
-            }
+            AggregateError::GroupByShape => "group_by must be a non-empty array of column names, \
+                 and having requires group_by"
+                .to_string(),
             AggregateError::UnsupportedHavingOperator => {
                 "unsupported having operator (only \"=\", \"<\", \"<=\", \">\", \">=\" are \
                  allowed)"
@@ -272,6 +279,11 @@ fn bind_item(
 /// [`AggregateTarget::Star`] とのみ一致し得る（`AggregateTarget::Column`
 /// はユーザーが `*` という列名を指定できないため——[`bind_item`] が
 /// `column == "*"` を常に `Star` へ写像する）。
+///
+/// `having[].{fn,column}` は必ず `aggregates` の項目（`fn`＋`column`）のみを
+/// 指し、`group_by` のキー列名とは別名前空間（`item_specs` に `group_by` は
+/// 含まれない）。そのため複数列 `group_by`（Issue #949）下でも `having` が
+/// キー列名と衝突して誤解決される経路は存在しない。
 fn resolve_having_item_index(
     item_specs: &[(engine::sql::allowlist::AggregateFunc, AggregateTarget)],
     func: engine::sql::allowlist::AggregateFunc,
@@ -340,9 +352,11 @@ fn bind_having_item(
 /// 束縛し、[`BoundAggregate`] を得る（TASK-186・NOSQL-4・NOSQL-5。SQL
 /// テキストを一切組み立てない）。`explain: true` の拒否は
 /// [`reject_explain`] を呼び出し元（[`execute`]）が先に行う契約
-/// のため、ここでは繰り返さない。`group_by`（要素数 1 限定）が指定されて
-/// いれば [`BoundAggregate::new_grouped`]（SQL-14）へ、指定されていなければ
-/// 従来どおり [`BoundAggregate::new`]（SQL-13）へ振り分ける（Issue #769）。
+/// のため、ここでは繰り返さない。`group_by`（1〜
+/// [`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`] 列の配列）が指定されて
+/// いれば [`BoundAggregate::new_grouped_by_columns`]（SQL-25 (d)。Issue #949
+/// で単一列 `new_grouped` から拡張）へ、指定されていなければ従来どおり
+/// [`BoundAggregate::new`]（SQL-13）へ振り分ける（Issue #769・#949）。
 pub fn bind(
     validated: &Validated<'_>,
     schema: &TableSchema,
@@ -389,7 +403,7 @@ pub fn bind(
     let group_by_json = validated.optional_array("group_by")?;
     let having_json = validated.optional_array("having")?;
 
-    let group_by_column = match group_by_json {
+    let group_by_columns: Option<Vec<&str>> = match group_by_json {
         None => {
             // `having` は `group_by` なしに単独で指定できない（黙って無視
             // すると単一行集計〔SQL-13〕として fail-open に実行してしまう）。
@@ -399,17 +413,31 @@ pub fn bind(
             None
         }
         Some(cols) => {
-            // `GROUP BY` は単一の裸識別子のみ受理する（SQL 表層の
-            // `Parser::parse_group_by_clause` と同じ構造的制約）。
-            let [engine::json::JsonValue::String(col)] = cols else {
+            // `group_by` は 1〜`MAX_GROUP_BY_COLUMNS` 列の列名配列を受理する
+            // （Issue #949・NOSQL-16 (b)・SQL-25 (d)。空配列は従来どおり
+            // `GroupByShape`）。
+            if cols.is_empty() {
                 return Err(AggregateError::GroupByShape);
-            };
-            ident::check_identifier(col)?;
-            Some(col.as_str())
+            }
+            // 列数上限は `Vec` 確保より前に検査する（`.claude/rules/
+            // security.md`「不安全な設計｜無制限リソース確保（DoS）」対応。
+            // `BoundAggregate::new_grouped_by_columns` も同じ検査を持つが、
+            // `Vec` を組み立てる前に打ち切るための多層防御）。
+            allowlist::check_group_by_column_count(cols.len()).map_err(AggregateError::Engine)?;
+
+            let mut columns: Vec<&str> = Vec::with_capacity(cols.len());
+            for col in cols {
+                let engine::json::JsonValue::String(name) = col else {
+                    return Err(AggregateError::GroupByShape);
+                };
+                ident::check_identifier(name)?;
+                columns.push(name.as_str());
+            }
+            Some(columns)
         }
     };
 
-    let Some(group_by_column) = group_by_column else {
+    let Some(group_by_columns) = group_by_columns else {
         let bound =
             BoundAggregate::new(schema.name.clone(), items, metadata_filters, expr_filters)?
                 .with_or_filters(or_filters);
@@ -427,12 +455,12 @@ pub fn bind(
         having.push(bind_having_item(item, &item_specs)?);
     }
 
-    let bound = BoundAggregate::new_grouped(
+    let bound = BoundAggregate::new_grouped_by_columns(
         schema.name.clone(),
         items,
         metadata_filters,
         expr_filters,
-        group_by_column,
+        &group_by_columns,
         having,
         schema,
     )?
@@ -533,6 +561,9 @@ mod tests {
             vec![
                 ColumnDef::new("embedding", ColumnType::Vector(4), false),
                 ColumnDef::new("lang", ColumnType::Text, false),
+                // 複数列 `group_by`（Issue #949）の単体テスト用の 2 本目の
+                // TEXT 列。既存テストは `lang` のみを参照するため影響しない。
+                ColumnDef::new("region", ColumnType::Text, true),
             ],
         )
     }
@@ -740,15 +771,105 @@ mod tests {
     }
 
     #[test]
-    fn bind_rejects_group_by_with_more_than_one_element() {
+    fn bind_rejects_duplicate_group_by_columns_with_42601() {
+        // Issue #949 で複数列 `group_by` を受理するようになったため、
+        // `["lang","lang"]` は要素数不正ではなく重複列名として拒否される
+        // （`BoundAggregate::new_grouped_by_columns` 側の検査。`42601` のまま）。
         validated_aggregate!(
             v,
             r#"{"op":"aggregate","table":"docs",
                "aggregates":[{"fn":"count","column":"*"}],
                "group_by":["lang","lang"]}"#
         );
-        let err = bind(&v, &schema(), &udfs()).expect_err("multi-column group_by must be rejected");
-        assert!(matches!(err, AggregateError::GroupByShape));
+        let err =
+            bind(&v, &schema(), &udfs()).expect_err("duplicate group_by columns must be rejected");
+        assert!(matches!(err, AggregateError::Engine(_)));
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_accepts_two_group_by_columns() {
+        validated_aggregate!(
+            v,
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"*"}],
+               "group_by":["lang","region"]}"#
+        );
+        let bound = bind(&v, &schema(), &udfs()).expect("two-column group_by should bind");
+        assert!(bound.has_group_by());
+    }
+
+    #[test]
+    fn bind_rejects_group_by_over_column_limit_with_54000() {
+        let columns: Vec<String> = (0..=engine::sql::allowlist::MAX_GROUP_BY_COLUMNS)
+            .map(|i| format!("\"c{i}\""))
+            .collect();
+        let json = format!(
+            r#"{{"op":"aggregate","table":"docs",
+               "aggregates":[{{"fn":"count","column":"*"}}],
+               "group_by":[{}]}}"#,
+            columns.join(",")
+        );
+        validated_aggregate!(v, &json);
+        let err = bind(&v, &schema(), &udfs()).expect_err("over-limit group_by must be rejected");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn bind_rejects_non_text_second_group_by_column_with_22000() {
+        for column in ["embedding", "id", "nope"] {
+            validated_aggregate!(
+                v,
+                &format!(
+                    r#"{{"op":"aggregate","table":"docs",
+                       "aggregates":[{{"fn":"count","column":"*"}}],
+                       "group_by":["lang","{column}"]}}"#
+                )
+            );
+            let err = bind(&v, &schema(), &udfs())
+                .expect_err("non-TEXT second group_by column must be rejected");
+            assert_eq!(err.wire_code(), "22000", "column={column}");
+        }
+    }
+
+    #[test]
+    fn bind_rejects_malformed_identifier_in_second_group_by_element() {
+        validated_aggregate!(
+            v,
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"*"}],
+               "group_by":["lang","do cs"]}"#
+        );
+        let err = bind(&v, &schema(), &udfs())
+            .expect_err("malformed second group_by identifier must be rejected");
+        assert!(matches!(err, AggregateError::InvalidIdentifier));
+        assert_eq!(err.wire_code(), "42601");
+        assert!(!err.client_message().contains("do cs"));
+    }
+
+    #[test]
+    fn bind_resolves_having_with_multiple_group_by_keys() {
+        validated_aggregate!(
+            v,
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"*"}],
+               "group_by":["lang","region"],
+               "having":[{"fn":"count","column":"*","op":">=","value":1}]}"#
+        );
+        let bound = bind(&v, &schema(), &udfs())
+            .expect("having should resolve under multi-column group_by");
+        assert!(bound.has_group_by());
+    }
+
+    #[test]
+    fn bind_rejects_empty_aggregates_with_multiple_group_by_columns_with_42601() {
+        validated_aggregate!(
+            v,
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[],
+               "group_by":["lang","region"]}"#
+        );
+        let err = bind(&v, &schema(), &udfs()).expect_err("aggregates:[] must be rejected");
         assert_eq!(err.wire_code(), "42601");
     }
 

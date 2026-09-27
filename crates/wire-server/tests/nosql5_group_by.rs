@@ -440,6 +440,10 @@ fn malformed_shapes_are_rejected_with_42601_without_executing() {
 
     let cases: [&[u8]; 9] = [
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":[]}"#,
+        // 複数列 `group_by`（Issue #949）で受理されるようになったため、この
+        // ケースが `42601` になる理由は「要素数 ≠ 1」ではなく「重複列名」
+        // （engine 側 `BoundAggregate::new_grouped_by_columns` の検査）。
+        // 複数列固有のケースは `nosql16_multi_group_by.rs` を参照。
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","lang"]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"having":[{"fn":"count","column":"*","op":">=","value":1}]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"having":[]}"#,

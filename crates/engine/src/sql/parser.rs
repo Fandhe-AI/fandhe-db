@@ -4491,11 +4491,12 @@ pub struct BoundScan {
     /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
     pub(crate) limit: usize,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。SQL テキスト経由の
-    /// [`bind_scan`]・[`bind_scan_with_dummy_flags`] のみが非空値を設定する。
-    /// [`Self::new`]（TASK-186・NOSQL-3 の直接構築入口）は常に空を設定する
-    /// （NoSQL 表層の `sort` 対応は NOSQL-15・別 Issue #946・#947 の対象外
-    /// スコープで、既存の公開 API 契約を変えない）。クレート外へは公開しない
-    /// （型 [`crate::sql::parser::BoundOrderKey`] 自体が `pub(crate)`）。
+    /// [`bind_scan`]・[`bind_scan_with_dummy_flags`]、または NoSQL 表層の直接構築
+    /// 経路（TASK-186・NOSQL-3）から [`Self::with_order_by`] を呼んだ場合に非空
+    /// 値が設定される。[`Self::new`] 自体は既存契約どおり常に空を設定する
+    /// （NoSQL `sort` 対応は NOSQL-15・Issue #946 で `with_order_by` builder 経由
+    /// にした——`Self::new` のシグネチャは変えない非破壊の判断）。クレート外へは
+    /// 公開しない（型 [`crate::sql::parser::BoundOrderKey`] 自体が `pub(crate)`）。
     pub(crate) order_by: Vec<BoundOrderKey>,
     /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。[`validate_search_offset`]。
     /// Issue #916・SQL-25 (b)・TASK-209）。既定は 0（no-op）で、[`Self::new`] 経由の
@@ -4649,8 +4650,9 @@ impl BoundScan {
             expr_filter_programs,
             or_filters: Vec::new(),
             limit,
-            // Issue #915・SQL-25: NoSQL 表層からの直接構築（NOSQL-3）は
-            // 対象外スコープ（NOSQL-15・別 Issue #946・#947）のため常に空。
+            // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
+            // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
+            // 続けて `with_order_by` を呼ぶ（builder 形。シグネチャは変えない）。
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
@@ -4669,6 +4671,34 @@ impl BoundScan {
     ) -> Self {
         self.or_filters = or_filters;
         self
+    }
+
+    /// スカラー列 `ORDER BY` を設定した [`Self`] を返す（Issue #946・NOSQL-15・
+    /// SQL-25 (a)・TASK-224。TASK-186・NOSQL-3 の直接構築経路〔`Self::new`〕から
+    /// NoSQL `scan` の `sort` 指定付き広域取得を組み立てるための builder。
+    /// [`Self::with_offset`] と同じ builder 形にし、`Self::new` のシグネチャは
+    /// 変えない——非破壊、かつ Issue #947（`OFFSET`）と独立にチェーンできる）。
+    ///
+    /// 処理は 2 段: (1) `keys.len()` が [`crate::sql::allowlist::
+    /// MAX_SCALAR_ORDER_KEYS`] を超えれば `SqlSurfaceError::payload_too_large`
+    /// （`54000`。件数検査を束縛より前に行う）、(2) [`bind_scalar_order_by`]
+    /// で `schema` と照合して束縛する（未知列・並べ替え不能な型はいずれも
+    /// `SqlSurfaceError::InvalidInput`〔`22000`〕。SQL テキスト経由の
+    /// [`bind_scan`] と同一の判定関数を共有し、二重実装しない）。空スライスは
+    /// 受理し `order_by` を空にするだけの no-op とする（空配列を拒否する判断は
+    /// 呼び出し元〔wire-server〕が行う）。
+    pub fn with_order_by(
+        mut self,
+        keys: &[crate::sql::allowlist::ScalarOrderKey],
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
+        if keys.len() > crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many scalar ORDER BY keys",
+            ));
+        }
+        self.order_by = bind_scalar_order_by(keys, schema)?;
+        Ok(self)
     }
 
     /// `offset` を設定した [`Self`] を返す（Issue #916・SQL-25 (b)・TASK-209。
