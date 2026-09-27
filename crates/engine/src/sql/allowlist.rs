@@ -3666,7 +3666,15 @@ impl<'a> Parser<'a> {
         // `Expr::Call` を組み立てる。カンマ形 `POSITION(a, b)` は PostgreSQL に
         // 存在しないため受理しない（構文拒否＝`42601`）。
         if name.eq_ignore_ascii_case("position") {
-            let needle = self.parse_value_expr(depth + 1)?;
+            // codex-review／Cursor Bugbot 指摘対応: 本分岐は `parse_value_expr` を
+            // 直接呼んでいたため、外側が `COALESCE`／`NULLIF`／`CASE` の THEN 等
+            // （`allow_null_literal == true`）の中でネストして呼ばれた場合に
+            // その文脈をそのまま引き継ぎ、`POSITION` 自身の `needle`／`haystack`
+            // で `NULL` リテラルを誤って受理してしまっていた（通常の関数呼び出し
+            // 引数は `allow_null_literal` を強制的に `false` へ戻す設計との
+            // 不整合）。`parse_value_expr_with_null_context` で明示的に `false`
+            // を指定し、他の通常引数と同じ扱いに揃える。
+            let needle = self.parse_value_expr_with_null_context(depth + 1, false)?;
             match self.peek() {
                 Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("in") => {
                     self.advance();
@@ -3677,7 +3685,7 @@ impl<'a> Parser<'a> {
                     )))
                 }
             }
-            let haystack = self.parse_value_expr(depth + 1)?;
+            let haystack = self.parse_value_expr_with_null_context(depth + 1, false)?;
             self.expect_punct(')')?;
             self.consume_expr_node()?;
             return Ok(Expr::Call {
@@ -3685,15 +3693,22 @@ impl<'a> Parser<'a> {
                 args: vec![haystack, needle],
             });
         }
+        // codex-review 指摘対応: `CONCAT` は NULL 引数を空文字として扱い常に
+        // 非 NULL を返す契約（`udf_call::bind_concat`・`apply_builtin` の
+        // `BuiltinFn::Concat2` 実装参照）だが、通常の関数呼び出し引数は
+        // `allow_null_literal` を強制的に `false` に戻すため、裸の `NULL`
+        // トークンは列参照として解析され `bind_concat` 側の
+        // `bind_null_aware` 対応（`Expr::Null` の受理）に到達できなかった。
+        // `CONCAT` の引数解析に限り `allow_null_literal` を `true` にする
+        // （他の通常関数は従来どおり `false` のまま。`NULL` 許可の対象を
+        // 安易に広げると他関数のエラーコード契約が変わるため、`CONCAT` に
+        // 限定するスコープにする）。
+        let allow_null_for_this_call = name.eq_ignore_ascii_case("concat");
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
-            // 通常の関数呼び出し（`COALESCE`／`NULLIF` 以外）の引数は
-            // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL`
-            // は常に列参照として解析する（外側が `COALESCE`／`NULLIF` の引数
-            // 中でネストして呼ばれた場合でも、この関数自身の引数については
-            // `allow_null_literal` を強制的に false へ戻す。
-            // [`Self::allow_null_literal`] 参照）。
-            args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
+            args.push(
+                self.parse_value_expr_with_null_context(depth + 1, allow_null_for_this_call)?,
+            );
             while matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 if args.len() >= MAX_CALL_ARGS {
@@ -3701,7 +3716,9 @@ impl<'a> Parser<'a> {
                         "too many call arguments",
                     ));
                 }
-                args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
+                args.push(
+                    self.parse_value_expr_with_null_context(depth + 1, allow_null_for_this_call)?,
+                );
             }
         }
         self.expect_punct(')')?;

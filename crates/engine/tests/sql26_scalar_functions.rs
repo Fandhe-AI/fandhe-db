@@ -602,3 +602,67 @@ fn case_when_comparing_null_text_column_takes_else_branch() {
     // id=3: label が NULL のため `label = 'Hello'` は UNKNOWN → ELSE 分岐。
     assert_eq!(cell_for(&result, 3, 1), Cell::Text("no".to_string()));
 }
+
+#[test]
+fn concat_with_null_literal_argument_via_sql_text_treats_null_as_empty_string() {
+    let path = unique_db_path("sql26-concat-null-sql-text");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // codex-review／Cursor Bugbot 指摘対応: `sql::udf_call::bind_concat` を
+    // `bind_null_aware` へ切り替えただけでは不十分だった。通常の関数呼び出し
+    // 引数の構文解析（`sql::allowlist::Parser::parse_call_expr`）は
+    // `allow_null_literal` を常に `false` へ戻すため、実際の SQL テキスト
+    // `CONCAT(NULL, ...)` の裸の `NULL` トークンは（`bind_concat` 側の
+    // 修正とは無関係に）列参照として解析され、束縛段で「unknown column:
+    // NULL」として拒否されていた（AST を直接組み立てる単体テストだけでは
+    // 検出できない不具合のクラス。本テストは実際の SQL テキストを経由して
+    // 固定する）。`CONCAT` の引数解析に限り `allow_null_literal` を `true`
+    // にする構文段の修正を追加した。
+    let result = core
+        .execute_sql(&ctx, "SELECT id, concat(NULL, label) FROM docs LIMIT 10")
+        .expect("CONCAT(NULL, label) must parse and bind successfully via SQL text");
+    assert_eq!(cell_for(&result, 1, 1), Cell::Text("Hello".to_string()));
+    assert_eq!(cell_for(&result, 2, 1), Cell::Text("world".to_string()));
+    // id=3: label も NULL だが CONCAT は NULL を空文字として扱うため、
+    // 両方 NULL でも結果は空文字（NULL ではない）。
+    assert_eq!(cell_for(&result, 3, 1), Cell::Text(String::new()));
+}
+
+#[test]
+fn position_argument_parsing_does_not_leak_null_literal_permission() {
+    let path = unique_db_path("sql26-position-null-leak");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    // codex-review／Cursor Bugbot 指摘対応: `POSITION` 専用構文の解析
+    // （`sql::allowlist::Parser::parse_call_expr` の `position` 分岐）が
+    // `parse_value_expr` を直接呼んでいたため、外側が `COALESCE` の中で
+    // ネストして呼ばれた場合に `allow_null_literal == true` の文脈を
+    // そのまま引き継ぎ、`POSITION` 自身の `needle`／`haystack` で `NULL`
+    // リテラルを誤って受理してしまっていた。通常の関数呼び出し引数
+    // （`LOWER(NULL)` 等）と同じエラーコードで拒否されることを固定する
+    // （具体的な wire_code の値をハードコードせず、通常関数と同一である
+    // ことだけを検証する）。
+    let baseline_err = core
+        .execute_sql(&ctx, "SELECT coalesce(lower(NULL), 'x') FROM docs LIMIT 10")
+        .expect_err("ordinary function call must reject bare NULL as an unknown column");
+
+    let position_err = core
+        .execute_sql(
+            &ctx,
+            "SELECT coalesce(position(NULL IN label), 0) FROM docs LIMIT 10",
+        )
+        .expect_err("POSITION must reject bare NULL the same way ordinary functions do");
+    assert_eq!(position_err.wire_code(), baseline_err.wire_code());
+
+    let position_haystack_err = core
+        .execute_sql(
+            &ctx,
+            "SELECT coalesce(position(label IN NULL), 0) FROM docs LIMIT 10",
+        )
+        .expect_err("POSITION haystack must reject bare NULL the same way ordinary functions do");
+    assert_eq!(position_haystack_err.wire_code(), baseline_err.wire_code());
+}
