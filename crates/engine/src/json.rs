@@ -675,6 +675,348 @@ fn write_canonical_number(n: &JsonNumber, out: &mut String) {
     }
 }
 
+/// JSON／JSONB 列を UNIQUE 制約の対象型として扱う際（TABLE-16・TASK-204、
+/// Issue #1073）の**値としての等価正規化**テキストを返す。[`write_canonical`]
+/// （`JSONB` 列格納時の正規化。パース時点の生リテラルを保持する）とは異なり、
+/// 数値をキー順・空白だけでなく**値そのもの**として正規化する（`1`・`1.0`・
+/// `1e0`・`10e-1` を同一に、`-0`・`0`・`-0.0`・`0e5` を同一のゼロに扱う。
+/// PostgreSQL の `jsonb` の数値等価に揃える設計判断）。この関数が返すテキストは
+/// 再パース可能な JSON 文字列であることを保証しない（等価性判定専用の内部
+/// キー用途に限定するため）。
+///
+/// [`crate::constraint::push_canonical_component`] が UNIQUE 制約・主キーの
+/// 正準キーバイト列を組み立てる唯一の呼び出し元（JSON／JSONB 型を一意キーの
+/// 対象として許可するのはこの Issue が初めてであり、`ColumnType::
+/// is_unique_constraint_allowed` 経由でのみ到達する）。将来 TABLE-14 の複合型
+/// 等価述語（`=`）を実装する際も、値としての等価判定はこの関数を再利用すべき
+/// 唯一の正準形とする（判断を二重に持たない）。
+///
+/// 格納済みの値が壊れている（`encode_scalar_columns` 側の検証を経由していない
+/// 内部矛盾）場合は [`JsonColumnError::Invalid`] を返す（encode 時に検証済み
+/// のため通常は到達しない。到達しても値を誤ってゼロ等へ縮退させず fail-closed
+/// に拒否する）。
+pub(crate) fn canonical_equality_text(s: &str) -> Result<String, JsonColumnError> {
+    if s.len() > MAX_JSON_FIELD_LEN {
+        return Err(JsonColumnError::TooLong);
+    }
+    let value = parse_json(s).map_err(|_| JsonColumnError::Invalid)?;
+    let mut out = String::new();
+    write_equality_canonical(&value, &mut out)?;
+    Ok(out)
+}
+
+/// [`canonical_equality_text`] が使う再帰シリアライザ（[`write_canonical`] と
+/// 構造は同じだが、数値の書き出しに [`write_equality_number`] を使う点のみ
+/// 異なる）。
+fn write_equality_canonical(v: &JsonValue, out: &mut String) -> Result<(), JsonColumnError> {
+    match v {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(true) => out.push_str("true"),
+        JsonValue::Bool(false) => out.push_str("false"),
+        JsonValue::Number(n) => write_equality_number(n, out)?,
+        JsonValue::String(s) => write_canonical_string(s, out),
+        JsonValue::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_equality_canonical(item, out)?;
+            }
+            out.push(']');
+        }
+        JsonValue::Object(map) => {
+            out.push('{');
+            for (i, (k, v)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_string(k, out);
+                out.push(':');
+                write_equality_canonical(v, out)?;
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+/// [`JsonNumber`] を値としての正規化テキスト（`[-]<仮数>e<指数>`。ゼロは常に
+/// 符号無しの `"0"`）へ書き出す（[`canonical_equality_text`] 専用）。
+fn write_equality_number(n: &JsonNumber, out: &mut String) -> Result<(), JsonColumnError> {
+    let (neg, mantissa, exp_neg, exponent) = normalize_json_number(n)?;
+    if mantissa == "0" {
+        // ゼロは符号・指数を問わず単一の表現に統一する（`-0`／`0.0`／`0e5` 等）。
+        out.push('0');
+        return Ok(());
+    }
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&mantissa);
+    out.push('e');
+    if exp_neg {
+        out.push('-');
+    }
+    out.push_str(&exponent);
+    Ok(())
+}
+
+/// `n` を「符号・仮数（先頭ゼロを含まず、ゼロでない限り末尾ゼロも含まない
+/// 10 進数字列）・指数の符号・指数（先頭ゼロを含まない 10 進数字列）」へ
+/// 分解する。整数 variant（`PosInt`／`NegInt`）はそのまま仮数として扱う
+/// （指数 0）。`Float` はパース時点の生リテラル文字列（[`decompose_number_text`]
+/// で構文要素へ分解）から、整数部・小数部を連結した数字列の先頭ゼロを除去し、
+/// 末尾ゼロを 1 桁除去するたびに指数へ `+1` する（値を保つ代数的に等価な変形。
+/// `1.50` と `1.5` が同一の `(仮数, 指数)` に正規化される）。指数の加算は
+/// 10 進文字列同士の符号付き加算（[`signed_decimal_add`]）で行う——リテラル
+/// 長の上限（64 バイト）により指数の桁数が `i128` の範囲を超えうるため
+/// （Issue #1073 D-d）。
+fn normalize_json_number(n: &JsonNumber) -> Result<(bool, String, bool, String), JsonColumnError> {
+    let (neg, int_digits, frac_digits, lit_exp_neg, lit_exp_digits): (
+        bool,
+        String,
+        String,
+        bool,
+        String,
+    ) = match n {
+        JsonNumber::PosInt(v) => (false, v.to_string(), String::new(), false, "0".to_string()),
+        JsonNumber::NegInt(v) => {
+            if *v == 0 {
+                // JSON の `-0` は値としてはゼロ（`as_f64` の符号ビット保持とは
+                // 別の関心事。ここは「値としての等価」のための正規化）。
+                (
+                    false,
+                    "0".to_string(),
+                    String::new(),
+                    false,
+                    "0".to_string(),
+                )
+            } else {
+                (
+                    true,
+                    v.unsigned_abs().to_string(),
+                    String::new(),
+                    false,
+                    "0".to_string(),
+                )
+            }
+        }
+        JsonNumber::Float { text, .. } => {
+            let (neg, int_d, frac_d, exp_neg, exp_d) =
+                decompose_number_text(text).ok_or(JsonColumnError::Invalid)?;
+            (
+                neg,
+                int_d.to_string(),
+                frac_d.to_string(),
+                exp_neg,
+                strip_leading_zeros(exp_d).to_string(),
+            )
+        }
+    };
+
+    let frac_len = frac_digits.len();
+    let mut digits = int_digits;
+    digits.push_str(&frac_digits);
+    let digits = strip_leading_zeros(&digits).to_string();
+    if digits == "0" {
+        return Ok((false, "0".to_string(), false, "0".to_string()));
+    }
+    let mantissa = digits.trim_end_matches('0');
+    let mantissa = if mantissa.is_empty() { "0" } else { mantissa };
+    let trailing_zeros = digits.len() - mantissa.len();
+    // 末尾ゼロ 1 個を落とすごとに指数を +1 する補正。`frac_len` 分は小数点の
+    // 桁移動として指数を -1 する（`push_canonical_component` の呼び出し元が
+    // 期待する「値として等価なら同一キー」という契約の核）。`trailing_zeros`・
+    // `frac_len` はいずれも [`MAX_JSON_FIELD_LEN`] に由来する数値リテラル
+    // テキストの長さ（`i64::MAX` に遠く及ばない）に収まるが、untrusted 入力
+    // 経由の値であるため `checked` 変換で明示的に扱う（coding-rust.md）。
+    let trailing_zeros_i64 = i64::try_from(trailing_zeros).map_err(|_| JsonColumnError::Invalid)?;
+    let frac_len_i64 = i64::try_from(frac_len).map_err(|_| JsonColumnError::Invalid)?;
+    let delta = trailing_zeros_i64
+        .checked_sub(frac_len_i64)
+        .ok_or(JsonColumnError::Invalid)?;
+    let (delta_neg, delta_digits) = if delta < 0 {
+        (true, delta.unsigned_abs().to_string())
+    } else {
+        (false, delta.to_string())
+    };
+    let (exp_neg, exp_digits) =
+        signed_decimal_add(lit_exp_neg, &lit_exp_digits, delta_neg, &delta_digits);
+    Ok((neg, mantissa.to_string(), exp_neg, exp_digits))
+}
+
+/// リテラル `text`（[`JsonNumber::Float`] が保持する RFC 8259 準拠の数値
+/// リテラル。文法は [`JsonParser::parse_number`] が既に検証済み）を
+/// `(負号, 整数部の数字列, 小数部の数字列, 指数の負号, 指数部の数字列)` へ
+/// 分解する。`parse_number` と同じ文法を再解析するだけの内部ヘルパーであり、
+/// 呼び出し元が保持する不変条件（構文検証済みのテキストのみ渡される）が破れて
+/// いた場合のみ `None` を返す（fail-closed。呼び出し元 [`normalize_json_number`]
+/// が `JsonColumnError::Invalid` へ変換する）。
+fn decompose_number_text(text: &str) -> Option<(bool, &str, &str, bool, &str)> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let neg = bytes.first() == Some(&b'-');
+    if neg {
+        i += 1;
+    }
+    let int_start = i;
+    while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+        i += 1;
+    }
+    let int_digits = text.get(int_start..i)?;
+    if int_digits.is_empty() {
+        return None;
+    }
+    let mut frac_digits = "";
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let frac_start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        frac_digits = text.get(frac_start..i)?;
+        if frac_digits.is_empty() {
+            return None;
+        }
+    }
+    let mut exp_neg = false;
+    let mut exp_digits = "";
+    if matches!(bytes.get(i), Some(b'e') | Some(b'E')) {
+        i += 1;
+        match bytes.get(i) {
+            Some(b'+') => i += 1,
+            Some(b'-') => {
+                exp_neg = true;
+                i += 1;
+            }
+            _ => {}
+        }
+        let exp_start = i;
+        while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+            i += 1;
+        }
+        exp_digits = text.get(exp_start..i)?;
+        if exp_digits.is_empty() {
+            return None;
+        }
+    }
+    if i != bytes.len() {
+        return None;
+    }
+    Some((neg, int_digits, frac_digits, exp_neg, exp_digits))
+}
+
+/// 先頭ゼロを除去した非負の 10 進数字列を返す（全桁ゼロなら `"0"` の 1 桁に
+/// 正規化する）。空文字列は呼び出し元の不変条件（整数部・指数部は文法上
+/// 非空）により渡らない前提だが、渡っても `"0"` として扱う（fail-closed に
+/// panic しない）。
+fn strip_leading_zeros(s: &str) -> &str {
+    let trimmed = s.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0"
+    } else {
+        trimmed
+    }
+}
+
+/// 2 個の非負 10 進数字列（[`strip_leading_zeros`] 済み）の大小を比較する
+/// （同じ桁数なら辞書式比較が数値比較と一致する）。
+fn digits_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match a.len().cmp(&b.len()) {
+        std::cmp::Ordering::Equal => a.cmp(b),
+        other => other,
+    }
+}
+
+/// 2 個の非負 10 進数字列を筆算加算する（`i128` を経由しない任意精度加算。
+/// 指数がリテラル長上限〔64 バイト〕由来で `i128` に収まらない場合に備える。
+/// Issue #1073 D-d）。
+fn digits_add(a: &str, b: &str) -> String {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut result: Vec<u8> = Vec::new();
+    let mut carry: u8 = 0;
+    let mut ai = a_bytes.len();
+    let mut bi = b_bytes.len();
+    while ai > 0 || bi > 0 || carry > 0 {
+        let da = if ai > 0 {
+            ai -= 1;
+            a_bytes.get(ai).copied().unwrap_or(b'0').wrapping_sub(b'0')
+        } else {
+            0
+        };
+        let db = if bi > 0 {
+            bi -= 1;
+            b_bytes.get(bi).copied().unwrap_or(b'0').wrapping_sub(b'0')
+        } else {
+            0
+        };
+        let sum = da + db + carry;
+        result.push(b'0' + (sum % 10));
+        carry = sum / 10;
+    }
+    result.reverse();
+    let s = String::from_utf8(result).unwrap_or_else(|_| "0".to_string());
+    strip_leading_zeros(&s).to_string()
+}
+
+/// `a - b`（`a >= b` を呼び出し元が保証する非負 10 進数字列同士の筆算減算。
+/// [`digits_add`] と対になる任意精度演算）。
+fn digits_sub(a: &str, b: &str) -> String {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut result: Vec<u8> = Vec::new();
+    let mut borrow: i16 = 0;
+    let mut ai = a_bytes.len();
+    let mut bi = b_bytes.len();
+    while ai > 0 {
+        ai -= 1;
+        let da = i16::from(a_bytes.get(ai).copied().unwrap_or(b'0').wrapping_sub(b'0'));
+        let db = if bi > 0 {
+            bi -= 1;
+            i16::from(b_bytes.get(bi).copied().unwrap_or(b'0').wrapping_sub(b'0'))
+        } else {
+            0
+        };
+        let mut diff = da - db - borrow;
+        if diff < 0 {
+            diff += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        result.push(b'0' + diff as u8);
+    }
+    result.reverse();
+    let s = String::from_utf8(result).unwrap_or_else(|_| "0".to_string());
+    strip_leading_zeros(&s).to_string()
+}
+
+/// 符号付き 10 進数（符号＋非負数字列で表現）同士の加算。同符号は数字列を
+/// 加算するだけ、異符号は絶対値の大小で減算対象を決める（結果ゼロは常に
+/// 符号無し）。[`normalize_json_number`] がリテラル指数と末尾ゼロ補正量を
+/// 合成する唯一の呼び出し元。
+fn signed_decimal_add(a_neg: bool, a: &str, b_neg: bool, b: &str) -> (bool, String) {
+    if a_neg == b_neg {
+        let sum = digits_add(a, b);
+        let neg = a_neg && sum != "0";
+        (neg, sum)
+    } else {
+        match digits_cmp(a, b) {
+            std::cmp::Ordering::Equal => (false, "0".to_string()),
+            std::cmp::Ordering::Greater => {
+                let diff = digits_sub(a, b);
+                (a_neg && diff != "0", diff)
+            }
+            std::cmp::Ordering::Less => {
+                let diff = digits_sub(b, a);
+                (b_neg && diff != "0", diff)
+            }
+        }
+    }
+}
+
 /// RFC 8259 準拠の最小エスケーパ（自作。wire-server の `error_body` エスケーパへは
 /// engine から依存できないため独立実装とする）。`"`・`\`・U+0000〜U+001F を
 /// エスケープし、それ以外（非 ASCII の生 UTF-8 を含む）はそのまま出力する。
@@ -1212,5 +1554,122 @@ mod tests {
         let path = JsonPath::new(vec![JsonPathStep::Key("z".to_string())]).unwrap();
         let result = extract_path_text(stored, &path).expect("valid stored JSON");
         assert_eq!(result, None);
+    }
+
+    // --- Issue #1073: `canonical_equality_text`（値としての等価正規化） -----
+
+    /// キー順・空白の揺れは値としての等価に影響しない
+    /// （`write_canonical` と同じ性質だが、数値も値として正規化する点が異なる）。
+    #[test]
+    fn canonical_equality_text_ignores_key_order_and_whitespace() {
+        let a = canonical_equality_text(r#"{"a":1,"b":2}"#).expect("valid JSON");
+        let b = canonical_equality_text(r#"{ "b": 2, "a": 1 }"#).expect("valid JSON");
+        assert_eq!(a, b);
+    }
+
+    /// エスケープ表現の揺れは値としての等価に影響しない。
+    #[test]
+    fn canonical_equality_text_ignores_string_escape_representation() {
+        let a = canonical_equality_text(r#""A""#).expect("valid JSON");
+        let b = canonical_equality_text("\"\\u0041\"").expect("valid JSON");
+        assert_eq!(a, b);
+    }
+
+    /// 数値表現の揺れ（整数・小数点・指数）は値として同一なら同じキーになる。
+    #[test]
+    fn canonical_equality_text_treats_equal_numeric_literals_as_identical() {
+        let equal_to_one = ["1", "1.0", "1e0", "1E0", "10e-1", "0.1e1"];
+        let expected = canonical_equality_text("1").expect("valid JSON");
+        for literal in equal_to_one {
+            let actual = canonical_equality_text(literal).expect("valid JSON");
+            assert_eq!(actual, expected, "literal={literal:?}");
+        }
+    }
+
+    /// `-0`／`0`／`-0.0`／`0e10` はいずれも単一のゼロ表現に正規化される。
+    #[test]
+    fn canonical_equality_text_treats_all_zero_representations_as_identical() {
+        let zeros = ["0", "-0", "0.0", "-0.0", "0e10", "-0e10", "0.0e-5"];
+        let expected = canonical_equality_text("0").expect("valid JSON");
+        for literal in zeros {
+            let actual = canonical_equality_text(literal).expect("valid JSON");
+            assert_eq!(actual, expected, "literal={literal:?}");
+        }
+    }
+
+    /// 異なる値（数値・文字列との型違い・配列要素順）は異なるキーになる。
+    #[test]
+    fn canonical_equality_text_distinguishes_different_values() {
+        let one = canonical_equality_text("1").expect("valid JSON");
+        let two = canonical_equality_text("2").expect("valid JSON");
+        assert_ne!(one, two);
+
+        let number = canonical_equality_text("1").expect("valid JSON");
+        let string = canonical_equality_text(r#""1""#).expect("valid JSON");
+        assert_ne!(number, string);
+
+        let ab = canonical_equality_text("[1,2]").expect("valid JSON");
+        let ba = canonical_equality_text("[2,1]").expect("valid JSON");
+        assert_ne!(ab, ba);
+    }
+
+    /// 入れ子オブジェクトのキー順の揺れも値としての等価に影響しない。
+    #[test]
+    fn canonical_equality_text_ignores_nested_object_key_order() {
+        let a = canonical_equality_text(r#"{"outer":{"a":1,"b":2}}"#).expect("valid JSON");
+        let b = canonical_equality_text(r#"{"outer":{"b":2,"a":1}}"#).expect("valid JSON");
+        assert_eq!(a, b);
+    }
+
+    /// リテラル長上限（64 バイト）に近い巨大な指数同士も、値として等価なら
+    /// 同一キーになり、指数が 1 だけずれたものは別のキーになる
+    /// （`i128` に収まらない指数を 10 進文字列の任意精度加算で扱う経路の検証。
+    /// Issue #1073 D-d）。
+    #[test]
+    fn canonical_equality_text_handles_exponents_beyond_i128_range() {
+        // `i128` の桁数上限（約 38 桁）を超える 40 桁の指数を、`u128` 等の数値
+        // 型を経由せず 10 進文字列だけで組み立てる（テスト自体が `i128`／
+        // `u128` の範囲に依存しないようにするため）。
+        let exp = "1".to_string() + &"0".repeat(39); // 10^39（40 桁）
+        let exp_minus_one = "9".repeat(39); // 10^39 - 1（39 桁の 9）
+        let exp_plus_one = "1".to_string() + &"0".repeat(38) + "1"; // 10^39 + 1
+
+        let a = format!("1e{exp}");
+        let a_canonical = canonical_equality_text(&a).expect("valid JSON");
+
+        // 同じ値を「仮数 10・指数を 1 減らす」形で表現する（値として等価）。
+        let b = format!("10e{exp_minus_one}");
+        let b_canonical = canonical_equality_text(&b).expect("valid JSON");
+        assert_eq!(a_canonical, b_canonical, "a={a:?} b={b:?}");
+
+        // 指数を 1 だけずらすと異なる値になる。
+        let c = format!("1e{exp_plus_one}");
+        let c_canonical = canonical_equality_text(&c).expect("valid JSON");
+        assert_ne!(a_canonical, c_canonical);
+    }
+
+    /// 非常に小さい指数（大きく負の指数）も同じ経路で正しく正規化される。
+    #[test]
+    fn canonical_equality_text_handles_large_negative_exponents() {
+        let a = canonical_equality_text("1e-30").expect("valid JSON");
+        let b = canonical_equality_text("10e-31").expect("valid JSON");
+        assert_eq!(a, b);
+        let c = canonical_equality_text("1e-29").expect("valid JSON");
+        assert_ne!(a, c);
+    }
+
+    /// 無効な JSON は `Invalid` として拒否される。
+    #[test]
+    fn canonical_equality_text_rejects_invalid_syntax() {
+        let err = canonical_equality_text("not json").unwrap_err();
+        assert_eq!(err, JsonColumnError::Invalid);
+    }
+
+    /// 上限超過は構文解析前に `TooLong` として拒否される。
+    #[test]
+    fn canonical_equality_text_checks_length_before_parsing() {
+        let oversized = format!("[{}", "1".repeat(MAX_JSON_FIELD_LEN));
+        let err = canonical_equality_text(&oversized).unwrap_err();
+        assert_eq!(err, JsonColumnError::TooLong);
     }
 }
