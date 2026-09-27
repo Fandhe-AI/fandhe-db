@@ -1149,6 +1149,15 @@ pub struct EngineCore {
     /// では `None` のまま（常に従来どおり全件 brute-force。詳細は
     /// `sql::hnsw_cache::HnswIndexCache` のドキュメント参照）。
     hnsw_state: Option<HnswEngineState>,
+    /// `catalog::hnsw_targeted_in_txn` のカタログ全件走査結果をストレージ全体
+    /// 世代単位で再利用するキャッシュ（codex-review P2 対応・Issue #1065
+    /// PR #1124）。`hnsw_state` の有無に関わらず常時構築する（`hnsw_targeted_in_txn`
+    /// 自身が `hnsw_available == false` を最初に見て素通しするため、未使用でも
+    /// 空のキャッシュを持つだけで副作用はない）。[`Self::explain_engine_for`]・
+    /// [`Self::search_with_snapshot`] が直接、`sql::exec` は
+    /// `sql::hnsw_cache::HnswCacheAccess::index_gate_cache` 経由で共有する。
+    /// 詳細は `catalog::IndexCatalogGateCache` のドキュメント参照。
+    index_catalog_gate_cache: crate::catalog::IndexCatalogGateCache,
 }
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
@@ -1598,6 +1607,7 @@ impl EngineCore {
             visible_bitmap_cache: crate::sql::visible_cache::VisibleBitmapCache::new(),
             search_engine_kind,
             hnsw_state,
+            index_catalog_gate_cache: crate::catalog::IndexCatalogGateCache::new(),
         }
     }
 
@@ -4169,6 +4179,7 @@ impl EngineCore {
                     storage: &self.storage,
                     cache: &s.cache,
                     provider: s.provider,
+                    index_gate_cache: &self.index_catalog_gate_cache,
                 }),
             // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
             // 詳細は `sql::scalar_index` のドキュメント参照）。
@@ -4747,7 +4758,12 @@ impl EngineCore {
         // fail-closed に `false`（brute-force 表示）へ倒す。
         let hnsw_enabled = self.hnsw_state.is_some()
             && match self.storage.db().begin_read() {
-                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(&read_txn, table, true),
+                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
+                    &read_txn,
+                    &self.index_catalog_gate_cache,
+                    table,
+                    true,
+                ),
                 Err(_) => false,
             };
         let ann_plan =
@@ -5908,7 +5924,12 @@ impl EngineCore {
         // 読み取り失敗は fail-closed に「対象外」（brute-force）へ倒す。
         let hnsw_targeted = self.hnsw_state.is_some()
             && match self.storage.db().begin_read() {
-                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(&read_txn, table, true),
+                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
+                    &read_txn,
+                    &self.index_catalog_gate_cache,
+                    table,
+                    true,
+                ),
                 Err(_) => false,
             };
         let result = match (hnsw_targeted, &self.hnsw_state) {
@@ -5917,6 +5938,7 @@ impl EngineCore {
                     storage: &self.storage,
                     cache: &state.cache,
                     provider: state.provider,
+                    index_gate_cache: &self.index_catalog_gate_cache,
                 };
                 snapshot.search_with_hnsw(
                     &self.storage,

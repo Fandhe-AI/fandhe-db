@@ -1090,11 +1090,16 @@ thread_local! {
 
 /// `sql::exec::execute_statement_with_cache` へ渡すキャッシュアクセス束
 /// （Issue #408）。`storage`・`cache` に加え、`effective_ef`／構築パラメータへ
-/// アクセスするための `provider`（`Copy`）を束ねる。
+/// アクセスするための `provider`（`Copy`）を束ねる。`index_gate_cache` は
+/// `catalog::hnsw_targeted_in_txn`（Issue #1065 適格性ゲート）のカタログ全件
+/// 走査結果をストレージ世代単位で共有するキャッシュ（`EngineCore::
+/// index_catalog_gate_cache` をそのまま貸し出す。`sql::exec` は `EngineCore`
+/// を持たないため、本構造体経由で受け取る。codex-review P2 対応・PR #1124）。
 pub(crate) struct HnswCacheAccess<'a> {
     pub(crate) storage: &'a Storage,
     pub(crate) cache: &'a HnswIndexCache,
     pub(crate) provider: HnswSearchProvider,
+    pub(crate) index_gate_cache: &'a crate::catalog::IndexCatalogGateCache,
 }
 
 /// [`search_or_fallback`]／[`search_subset_or_fallback`] の「索引・オーバーレイの
@@ -3180,10 +3185,12 @@ mod tests {
             regime: TraversalRegime::OneHop,
         });
 
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3260,10 +3267,12 @@ mod tests {
             mask_splits_graph: false,
             regime: TraversalRegime::OneHop,
         });
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         record_overlay_for(&access, table0, base0, overlay);
 
@@ -3415,10 +3424,12 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
 
         let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3498,10 +3509,12 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
 
         let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [0.5, 0.25, 0.1, 0.9];
@@ -3591,10 +3604,12 @@ mod tests {
         let cache = HnswIndexCache::new();
         let f16_params = crate::hnsw::ValidatedHnswParams::default()
             .with_resident_precision(crate::hnsw::ResidentPrecision::F16);
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(f16_params),
+            index_gate_cache: &gate_cache,
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -3721,10 +3736,12 @@ mod tests {
         let cache = HnswIndexCache::new();
         let i8_params = crate::hnsw::ValidatedHnswParams::default()
             .with_resident_precision(crate::hnsw::ResidentPrecision::I8);
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(i8_params),
+            index_gate_cache: &gate_cache,
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -3861,10 +3878,12 @@ mod tests {
         });
         assert!(overlay.approx_heap_bytes() > MAX_HNSW_CACHE_TOTAL_BYTES);
 
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         record_overlay_for(&access, "docs", &base, overlay);
 
@@ -3958,10 +3977,12 @@ mod tests {
         );
         let slot_ids: Vec<u64> = (0..docs_arena.len() as u64).collect();
 
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -4127,10 +4148,12 @@ mod tests {
             .expect("valid hnsw params")
             .with_full_scan_ratio(ratio)
             .expect("valid full_scan_ratio");
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(params),
+            index_gate_cache: &gate_cache,
         };
 
         // 5/20 = 0.25 < 0.6: 早期打ち切り分岐を踏むはずの部分集合アリーナ
@@ -4193,10 +4216,12 @@ mod tests {
         }
         let c = ctx("tenant-a");
         let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -4264,10 +4289,12 @@ mod tests {
         }
         let c = ctx("tenant-a");
         let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);

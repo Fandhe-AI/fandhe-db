@@ -664,8 +664,20 @@ pub(crate) fn execute_statement_with_cache(
     // ここで無効化すれば DISTANCE/hybrid の 4 boolean すべて・`HnswIndexCache`
     // 照会（適格性判定より後段）にも波及し、ゲート対象外のテーブルは
     // `HnswIndexCache` へ一切照会・構築されない（stale 使用の経路が無い）。
-    let hnsw_enabled =
-        crate::catalog::hnsw_targeted_in_txn(read_txn, &bound.table, hnsw_cache.is_some());
+    // カタログ全件走査結果は `hnsw_cache`（`Some` の場合のみ `HnswCacheAccess::
+    // index_gate_cache` 経由）を通じて `EngineCore::index_catalog_gate_cache`
+    // を共有し、クエリのたびに再走査しない（codex-review P2 対応・PR #1124）。
+    // `hnsw_cache` が `None`（起動時 opt-in なし）の場合は `hnsw_targeted_in_txn`
+    // 自身が `hnsw_available == false` で素通しするため、カタログには一切触れない。
+    let hnsw_enabled = match hnsw_cache.as_ref() {
+        Some(access) => crate::catalog::hnsw_targeted_in_txn(
+            read_txn,
+            access.index_gate_cache,
+            &bound.table,
+            true,
+        ),
+        None => false,
+    };
     let ann_plan =
         crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
             hnsw_enabled,

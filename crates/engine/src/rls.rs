@@ -2842,10 +2842,12 @@ mod tests {
         let params = ValidatedHnswParams::new(HnswParams::default()).expect("valid hnsw params");
         let hnsw_provider = HnswSearchProvider::new(params);
         let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: hnsw_provider,
+            index_gate_cache: &gate_cache,
         };
         let cpu = CpuScalarProvider;
 
