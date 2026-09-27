@@ -2454,9 +2454,8 @@ impl TableSchema {
     /// UPDATE・UPSERT の `DO UPDATE`）はこのメソッドを直接使う。これらの呼び出し元は
     /// `VECTOR` 列への SET があった場合のみ本メソッドを呼ぶガード（`vector_assigned`
     /// 等）で囲っているため、`VECTOR` 列を持たないテーブルでは通常到達しない。
-    /// 例外は `tenant::update_row_unchecked`（[`RowInput`] による行全体置換 UPDATE）で、
-    /// こちらは無条件に呼ぶため `VECTOR` 列なしテーブルでは常に拒否される
-    /// （Issue #995 のスコープは INSERT 系のみで、この経路の是正は対象外）。
+    /// 行全体を書き込む経路（`RowInput` による INSERT・行全体置換 UPDATE）は
+    /// [`Self::validate_row_embedding_dim`] を使う（TABLE-1・Issue #995・#1079）。
     pub fn validate_embedding_dim(&self, dim: usize) -> Result<()> {
         let expected = self
             .vector_dim()
@@ -2469,8 +2468,8 @@ impl TableSchema {
         Ok(())
     }
 
-    /// 行全体を書き込む経路（INSERT 系。TABLE-1・Issue #995）向けの embedding
-    /// 次元検証。
+    /// 行全体を書き込む経路（INSERT 系、および `RowInput` による行全体置換 UPDATE。
+    /// TABLE-1・Issue #995・#1079）向けの embedding 次元検証。
     ///
     /// `VECTOR` 列を持つスキーマでは [`Self::validate_embedding_dim`] へそのまま
     /// 委譲し、エラー分類・文言は完全に同一のまま変えない（Issue #995 受け入れ
@@ -7721,8 +7720,9 @@ mod tests {
         assert!(no_vector.validate_embedding_dim(384).is_err());
     }
 
-    // Issue #995: 行全体を書き込む経路（INSERT 系）向けの次元検証。`VECTOR` 列
-    // ありスキーマでは `validate_embedding_dim` と完全に同一の判定・文言になり
+    // Issue #995・#1079: 行全体を書き込む経路（INSERT 系、および `RowInput` に
+    // よる行全体置換 UPDATE）向けの次元検証。`VECTOR` 列ありスキーマでは
+    // `validate_embedding_dim` と完全に同一の判定・文言になり
     // （受け入れ基準「`VECTOR` 列を持つスキーマの次元検証・エラー分類は変わらない」）、
     // `VECTOR` 列なしスキーマでは dim 0 のみ受理する。
     #[test]
