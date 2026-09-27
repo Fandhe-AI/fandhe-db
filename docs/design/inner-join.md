@@ -10,7 +10,8 @@ Accepted・実装済み。
   （検討中）・`docs/spec/04-behavior/rls.md` RLS-10・`docs/spec/04-behavior/error-format.md`
   ERR-6（`42702`・`42804`）
 - 前提基盤: `docs/design/multi-relation-plan-foundation.md`（Issue #924・`sql::relation`）
-- 関連 Issue: #926（OUTER JOIN・対象外）・#931（JOIN 経路の RLS 境界の網羅検証・対象外）
+- 関連 Issue: #926（`docs/design/outer-join.md`・LEFT/RIGHT/FULL OUTER JOIN・実装済み）・
+  #931（JOIN 経路の RLS 境界の網羅検証・対象外）
 
 spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`）。以下は本リポの
 実装既定値・設計判断の記録。
@@ -36,7 +37,8 @@ conj        := colref <op> <literal>        -- op: = < <= > >= / LIKE '<pattern>
 
 relation は常にちょうど 2 個。以下はいずれも `42601`（fail-closed）:
 
-- `LEFT`／`RIGHT`／`FULL [OUTER]`／`CROSS`／`NATURAL` JOIN、`JOIN ... USING (...)`（#926 の管轄）
+- `CROSS`／`NATURAL` JOIN、`JOIN ... USING (...)`（`LEFT`／`RIGHT`／`FULL [OUTER]` は
+  Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - 非等価の `ON`、左右が同じ relation を指す `ON`
 - `ORDER BY`・`<=>`・`HYBRID`・`USING PLAN`・`USING MODE`・`HINT ORDER` との併用
 - 集計・`GROUP BY`・`DISTINCT`・ウィンドウ関数・式項目・`t.*`
@@ -55,9 +57,10 @@ OUTER CROSS NATURAL ON USING WHERE LIMIT OFFSET AS`）は大小文字を無視�
 JOIN の判定はトークン列の先読み（`sql::allowlist::looks_like_join`）で行う。括弧深さ 0 の
 最初の `FROM` の直後が `<ident> [[AS] <alias>] (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|
 NATURAL)` の並びのときだけ真になり、`validate_sql_tokens_impl` の集計・`DISTINCT`・
-集合演算の判定より前に呼んで `parse_join_statement` へ分岐する。外部結合キーワードも
-検出対象に含め、`parse_join_statement` 側で `42601` に分類させる（構文段の判定順序を
-`looks_like_join` 側の複雑な除外リストに分散させない）。
+集合演算の判定より前に呼んで `parse_join_statement` へ分岐する。`CROSS`・`NATURAL`・
+単独の `OUTER JOIN`（対象外事項）も検出対象に含め、`parse_join_statement` 側で `42601`
+に分類させる（構文段の判定順序を `looks_like_join` 側の複雑な除外リストに分散させない）。
+`LEFT`／`RIGHT`／`FULL [OUTER]` の受理は Issue #926（`docs/design/outer-join.md`）参照。
 
 `ON`・`WHERE` の列参照は既存の `sql::parser::Parser::parse_where` を token 置換で再利用
 せず、`sql::allowlist::ValidatedJoin`（`Vec<(ColumnRef, ColumnRef)>` の `on`・
@@ -70,8 +73,10 @@ WHERE は「AND のみ・列 vs リテラルの比較のみ」という制限さ
 事項）のため、専用の小さなパーサーの方が構造的に見通しが良い。束縛時
 （`sql::join::build_plan`）に `BindingScope::resolve` で相手側の relation を確定し、
 非修飾 `WherePredicate` へ変換してその側の `ValidatedScan::where_predicates` へ
-プッシュダウンする（プッシュダウンは INNER JOIN だから意味論的に正しい。外部結合
-〔#926〕ではそのまま再利用できない）。
+プッシュダウンする。保存側（外部結合の NULL 補完対象にならない側）へのプッシュダウンは
+INNER・外部結合いずれでも意味論的に正しく、そのまま再利用する。欠損側（外部結合の
+NULL 補完対象になりうる側）は追加の簡約規則が必要（Issue #926・`docs/design/
+outer-join.md`「WHERE の意味論」節参照）。
 
 ## 束縛（`sql::join::build_plan`）
 
@@ -183,7 +188,8 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
 
 ## 対象外（Issue は起票しない。申し送りのみ）
 
-- 外部結合（#926）。WHERE のプッシュダウン規則は INNER 専用で、外部結合には流用できない
+- `CROSS`／`NATURAL` JOIN・`JOIN ... USING (...)`（`LEFT`／`RIGHT`／`FULL [OUTER]` は
+  Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - 3 テーブル以上の連鎖 JOIN
 - 集計・`GROUP BY`・スカラー `ORDER BY`・ウィンドウ・`DISTINCT` と JOIN の組み合わせ
 - WHERE の `OR`・`BETWEEN`・`IN`・サブクエリ・列同士の比較

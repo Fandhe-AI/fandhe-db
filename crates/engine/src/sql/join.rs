@@ -1,5 +1,5 @@
-//! `INNER JOIN`（2 テーブル等価結合）の束縛・実行本体（SQL-28・RLS-10、
-//! TASK-212、Issue #925）。
+//! `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`（2 テーブル等価結合）の束縛・実行本体
+//! （SQL-28・RLS-10、TASK-212、Issue #925・#926）。
 //!
 //! 責務境界: `sql::allowlist::validate_sql_tokens` が構造検証した
 //! [`crate::sql::allowlist::ValidatedJoin`] を受け取り、`core.rs::EngineCore`
@@ -12,20 +12,24 @@
 //!   これにより RLS 暗黙適用・fail-closed のエラー契約を第 2 の実行器を作らずに
 //!   継承する（呼び出したセッション自身の [`crate::policy::PolicyContext`] で
 //!   両辺を独立に評価するため、他テナント行が中間結果・結合キー・カーディナリ
-//!   ティ判定のいずれにも現れない）。
+//!   ティ判定・NULL 補完のいずれにも現れない）。
 //! - 文全体（両辺の走査・ハッシュ表・出力行の生成）で 1 つの累計バイト予算
 //!   （[`JoinBudget`]）を共有する（`sql::set_op::SetOpBudget` と同じ理由。
 //!   security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
 //!
 //! アルゴリズム（ハッシュ結合。ビルド側・型クラス・上限・順序保証の詳細は
-//! `docs/design/inner-join.md` 参照）: 行数の少ない側をビルド側にし、結合キーの
-//! どれかが NULL の行はビルド・プローブいずれからも除外する。出力順序は
-//! `(左側走査位置, 右側走査位置)` の安定ソートで固定し、どちらの側をビルドに
-//! 選んでも同じ結果順になるようにする（`scripts/check_sort_determinism.sh`
-//! ゲート対応。`sort_unstable*` は使わない）。
+//! `docs/design/inner-join.md`・外部結合の NULL 補完・WHERE 簡約規則は
+//! `docs/design/outer-join.md` 参照）: 行数の少ない側をビルド側にし、結合キーの
+//! どれかが NULL の行はビルド・プローブいずれからも除外する。`LEFT`／`RIGHT`／
+//! `FULL` JOIN では該当側（保存側）の未一致行を NULL 補完して出力に含める
+//! （[`JoinPlan`] の `preserve_left`／`preserve_right`）。出力順序は
+//! `(左側走査位置, 右側走査位置)`（NULL 補完行は「無し」を「有り」より後に
+//! 並べる）の安定ソートで固定し、どちらの側をビルドに選んでも同じ結果順に
+//! なるようにする（`scripts/check_sort_determinism.sh` ゲート対応。
+//! `sort_unstable*` は使わない）。
 //!
-//! スコープ外（Issue #925 対象外事項。詳細は PR 本文参照）:
-//! - 外部結合（`LEFT`／`RIGHT`／`FULL`／`CROSS`／`NATURAL` JOIN。#926 の管轄）
+//! スコープ外（Issue #926 対象外事項。詳細は `docs/design/outer-join.md` 参照）:
+//! - `CROSS`／`NATURAL` JOIN、`JOIN ... USING (...)`
 //! - 3 テーブル以上の連鎖 JOIN
 //! - `RelationSnapshotCache`（TASK-212 基盤）による結合入力のキャッシュ
 
@@ -34,7 +38,8 @@ use std::collections::HashMap;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::policy::PolicyContext;
 use crate::sql::allowlist::{
-    JoinProjection, JoinWherePredicate, Projection, SqlSurfaceError, ValidatedJoin, WherePredicate,
+    JoinKind, JoinProjection, JoinWherePredicate, Projection, SqlSurfaceError, ValidatedJoin,
+    WherePredicate,
 };
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, TableRef};
@@ -258,6 +263,32 @@ struct JoinPlan {
     right_key_positions: Vec<usize>,
     key_classes: Vec<JoinKeyClass>,
     output: Vec<OutputColumn>,
+    /// 左側（保存側）の未一致行を NULL 補完して出力に含めるか（Issue #926
+    /// §2.3）。`LEFT`／`FULL` JOIN かつ右側（欠損側）に WHERE 述語が無い場合の
+    /// み真になる——欠損側に strict な述語（[`is_null_rejecting`]）があれば、
+    /// NULL 補完行は必ずその述語で落ちるため、`INNER` と同じ扱いに簡約する
+    /// （`docs/design/outer-join.md` の WHERE 簡約規則）。
+    preserve_left: bool,
+    /// 右側（保存側）の未一致行を NULL 補完して出力に含めるか。`RIGHT`／`FULL`
+    /// JOIN かつ左側（欠損側）に WHERE 述語が無い場合のみ真になる（上記の
+    /// 左右対称）。
+    preserve_right: bool,
+}
+
+/// 述語が `NULL` に対して常に偽（non-matching）になるか（strict）を判定する
+/// （Issue #926 §2.3。`docs/design/outer-join.md` の WHERE 簡約規則の前提）。
+/// 現行で受理する全 variant（`=`・`LIKE`・比較・bool 等価・bool 列）は
+/// いずれも strict なため常に `true` を返すが、ワイルドカード無しの網羅的
+/// `match` にすることで、将来 `IS NULL` 等の非 strict な variant を追加した際に
+/// コンパイルエラーで検出させる（簡約規則が黙って壊れるのを防ぐ）。
+fn is_null_rejecting(pred: &JoinWherePredicate) -> bool {
+    match pred {
+        JoinWherePredicate::Equality { .. }
+        | JoinWherePredicate::Prefix { .. }
+        | JoinWherePredicate::Compare { .. }
+        | JoinWherePredicate::BoolEquality { .. }
+        | JoinWherePredicate::BoolColumn { .. } => true,
+    }
 }
 
 fn join_where_column(pred: &JoinWherePredicate) -> &ColumnRef {
@@ -443,6 +474,20 @@ fn build_plan(
     let mut left_where: Vec<WherePredicate> = Vec::new();
     let mut right_where: Vec<WherePredicate> = Vec::new();
     for pred in &validated.where_conjuncts {
+        // Issue #926 §2.3: 外部結合の NULL 補完行は WHERE 述語より後に評価される
+        // PostgreSQL 意味論を、実装上は「欠損側に述語があれば NULL 補完しない
+        // （INNER に簡約する）」規則で再現する。この簡約が正しいのは述語が
+        // strict（NULL に対して必ず偽）な場合に限るため、fail-closed に
+        // 拒否する（現行の全 variant は strict なため到達しないが、将来
+        // `IS NULL` 等の非 strict な variant が増えた際の防御）。この防御は
+        // NULL 補完（LEFT/RIGHT/FULL）を行う場合にのみ必要であり、INNER JOIN
+        // は非 strict な述語をプッシュダウンしても意味論上問題ないため対象外
+        // とする（レビュー指摘対応: INNER JOIN で不要な拒否をしない）。
+        if !matches!(validated.kind, JoinKind::Inner) && !is_null_rejecting(pred) {
+            return Err(SqlSurfaceError::unsupported(
+                "JOIN WHERE predicate is not supported for LEFT/RIGHT/FULL OUTER JOIN reduction",
+            ));
+        }
         let column_ref = join_where_column(pred);
         let resolved = scope.resolve(column_ref)?;
         let (is_left, schema) = if resolved.relation() == 0 {
@@ -458,6 +503,13 @@ fn build_plan(
             right_where.push(converted);
         }
     }
+
+    // Issue #926 §2.3: 保存側の判定（上記コメント参照）。`Inner` は両方偽の
+    // ままで、既存の INNER JOIN 挙動と完全に一致する。
+    let preserve_left =
+        matches!(validated.kind, JoinKind::Left | JoinKind::Full) && right_where.is_empty();
+    let preserve_right =
+        matches!(validated.kind, JoinKind::Right | JoinKind::Full) && left_where.is_empty();
 
     let mut left_key_positions = Vec::with_capacity(on_keys.len());
     let mut right_key_positions = Vec::with_capacity(on_keys.len());
@@ -506,6 +558,8 @@ fn build_plan(
         right_key_positions,
         key_classes,
         output,
+        preserve_left,
+        preserve_right,
     })
 }
 
@@ -718,9 +772,25 @@ pub(crate) fn execute_with_limits(
         }
     }
 
-    // §2.4: カーディナリティ判定は出力を実体化する前に行う。判定に使うのは
-    // 可視行（両辺とも RLS・WHERE 適用済み）だけなので、他テナントの行数は
-    // 結果に影響しない。
+    // Issue #926 §2.4: 保存側だけ未一致フラグ配列を確保する（`preserve_*` が
+    // 偽の側は確保しない——INNER JOIN では両方偽のままで既存の挙動と完全に
+    // 一致する）。確保前に予算へ計上する（security.md「不安全な設計」対応）。
+    let mut matched_left: Vec<bool> = if plan.preserve_left {
+        budget.charge(left_result.rows.len())?;
+        vec![false; left_result.rows.len()]
+    } else {
+        Vec::new()
+    };
+    let mut matched_right: Vec<bool> = if plan.preserve_right {
+        budget.charge(right_result.rows.len())?;
+        vec![false; right_result.rows.len()]
+    } else {
+        Vec::new()
+    };
+
+    // §2.4: 一致ペア数の上限判定（ループ内の早期打ち切り）は出力を実体化する
+    // 前に行う。判定に使うのは可視行（両辺とも RLS・WHERE 適用済み）だけなので、
+    // 他テナントの行数は結果に影響しない。
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     for (probe_idx, row) in probe_rows.iter().enumerate() {
         let probe_idx_u32 = u32::try_from(probe_idx).map_err(|_| {
@@ -739,6 +809,12 @@ pub(crate) fn execute_with_limits(
                     (probe_idx_u32, build_idx)
                 };
                 pairs.push((left_idx, right_idx));
+                if let Some(m) = matched_left.get_mut(left_idx as usize) {
+                    *m = true;
+                }
+                if let Some(m) = matched_right.get_mut(right_idx as usize) {
+                    *m = true;
+                }
                 if pairs.len() > limits.max_output_rows {
                     return Err(SqlSurfaceError::payload_too_large(
                         "JOIN result exceeds the row limit",
@@ -748,14 +824,78 @@ pub(crate) fn execute_with_limits(
         }
     }
 
-    // 順序（決定的）: 左側走査順 → 右側走査順。`sort_by_key` は安定ソート
-    // （`scripts/check_sort_determinism.sh` ゲート対応。`sort_unstable*` は
-    // 使わない）。
-    pairs.sort_by_key(|&(l, r)| (l, r));
+    // Issue #926 §2.4: 保存側の未一致行（NULL 補完対象）を数える。`INNER` は
+    // 両方 0 のままで、以降の合計カーディナリティ判定・出力生成が既存の
+    // INNER JOIN 挙動と完全に一致する。
+    let unmatched_left = matched_left.iter().filter(|&&m| !m).count();
+    let unmatched_right = matched_right.iter().filter(|&&m| !m).count();
 
-    let start = offset.min(pairs.len());
-    let end = start.saturating_add(limit).min(pairs.len());
-    let sliced = pairs.get(start..end).unwrap_or(&[]);
+    // §2.4: 合計カーディナリティ（NULL 補完行を含む）を実体化する前に判定する。
+    // `LIMIT`／`OFFSET` の値には依存させない（PR #1105 の教訓に沿った単純な
+    // 規則）。判定に使うのは可視行だけなので、他テナントの行数は結果に影響
+    // しない。
+    let total_cardinality = pairs
+        .len()
+        .checked_add(unmatched_left)
+        .and_then(|t| t.checked_add(unmatched_right));
+    match total_cardinality {
+        Some(total) if total <= limits.max_output_rows => {}
+        _ => {
+            return Err(SqlSurfaceError::payload_too_large(
+                "JOIN result exceeds the row limit",
+            ));
+        }
+    }
+
+    // 出力前の中間表現（`Option` は NULL 補完を表す。`None` 側はどちらか一方
+    // のみで、両方 `None` の要素は作らない）。`pairs`（一致ペア）と要素数が
+    // 重複しうる `combined`（一致ペア＋ NULL 補完行）を別に確保するため、
+    // 確保前にこの容量分を共有バイト予算へ計上する（Issue #926 レビュー
+    // 指摘。`matched_left`／`matched_right` と同じく「確保前に charge」の
+    // 契約——security.md「不安全な設計」対応）。
+    let combined_capacity = pairs
+        .len()
+        .saturating_add(unmatched_left)
+        .saturating_add(unmatched_right);
+    budget.charge(
+        combined_capacity.saturating_mul(std::mem::size_of::<(Option<u32>, Option<u32>)>()),
+    )?;
+    let mut combined: Vec<(Option<u32>, Option<u32>)> = Vec::with_capacity(combined_capacity);
+    for &(l, r) in &pairs {
+        combined.push((Some(l), Some(r)));
+    }
+    if plan.preserve_left {
+        for (idx, &m) in matched_left.iter().enumerate() {
+            if !m {
+                let idx_u32 = u32::try_from(idx).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("JOIN left row count exceeds limit")
+                })?;
+                combined.push((Some(idx_u32), None));
+            }
+        }
+    }
+    if plan.preserve_right {
+        for (idx, &m) in matched_right.iter().enumerate() {
+            if !m {
+                let idx_u32 = u32::try_from(idx).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("JOIN right row count exceeds limit")
+                })?;
+                combined.push((None, Some(idx_u32)));
+            }
+        }
+    }
+
+    // 順序（決定的）: 左側走査順 → 右側走査順。左側が無い行（右のみの NULL
+    // 補完行）は「有り」より後ろへ、右側が無い行はその左位置の直後へ並ぶ
+    // （Issue #926 §2.4）。`sort_by_key` は安定ソート
+    // （`scripts/check_sort_determinism.sh` ゲート対応。`sort_unstable*` は
+    // 使わない）。`Inner`（`Option` が常に `Some`）ではこのキーは
+    // `(false, l, false, r)` に潰れ、既存の `(l, r)` ソートと同じ順序になる。
+    combined.sort_by_key(|&(l, r)| (l.is_none(), l.unwrap_or(0), r.is_none(), r.unwrap_or(0)));
+
+    let start = offset.min(combined.len());
+    let end = start.saturating_add(limit).min(combined.len());
+    let sliced = combined.get(start..end).unwrap_or(&[]);
 
     // 出力行 1 行あたりの構造体オーバーヘッド（`result_bytes` の
     // per_row_struct_bytes と同じ計算式）。行ごとの見積もりに使う。
@@ -767,20 +907,26 @@ pub(crate) fn execute_with_limits(
 
     let mut rows = Vec::with_capacity(sliced.len());
     for &(l, r) in sliced {
-        let left_row =
-            left_result
-                .rows
-                .get(l as usize)
-                .ok_or_else(|| SqlSurfaceError::Internal {
-                    detail: "JOIN left row index out of range".to_string(),
-                })?;
-        let right_row =
-            right_result
-                .rows
-                .get(r as usize)
-                .ok_or_else(|| SqlSurfaceError::Internal {
-                    detail: "JOIN right row index out of range".to_string(),
-                })?;
+        let left_row = l
+            .map(|idx| {
+                left_result
+                    .rows
+                    .get(idx as usize)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN left row index out of range".to_string(),
+                    })
+            })
+            .transpose()?;
+        let right_row = r
+            .map(|idx| {
+                right_result
+                    .rows
+                    .get(idx as usize)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN right row index out of range".to_string(),
+                    })
+            })
+            .transpose()?;
 
         // codex-review 指摘（PR #1110）: 大きなセルを持つ入力行が多数の出力行に
         // 一致すると、`.cloned()` で全行を複製してから予算照合すると `LIMIT`
@@ -788,34 +934,39 @@ pub(crate) fn execute_with_limits(
         // メモリを確保した後にしか `54000` を返せない（security.md「不安全な
         // 設計｜無制限リソース確保（DoS）」に抵触）。複製前に借用のまま
         // この 1 行の見積もりを算出し、残予算と照合してから複製する
-        // （超過時は複製・確保そのものを行わない fail-closed）。
+        // （超過時は複製・確保そのものを行わない fail-closed）。NULL 補完側
+        // （`left_row`／`right_row` が `None`）は 0 バイトとして扱う
+        // （Issue #926 §2.4）。
         let mut row_payload_bytes = 0usize;
         for out_col in &plan.output {
-            let cell = match out_col {
-                OutputColumn::Left(pos, _) => left_row.cells.get(*pos),
-                OutputColumn::Right(pos, _) => right_row.cells.get(*pos),
+            if let Some(cell) = resolve_output_cell(out_col, left_row, right_row)? {
+                row_payload_bytes = row_payload_bytes.saturating_add(cell_payload_bytes(cell));
             }
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "JOIN output column position out of range".to_string(),
-            })?;
-            row_payload_bytes = row_payload_bytes.saturating_add(cell_payload_bytes(cell));
         }
         budget.charge(per_row_struct_bytes.saturating_add(row_payload_bytes))?;
 
         let mut cells = Vec::with_capacity(plan.output.len());
         for out_col in &plan.output {
-            let cell = match out_col {
-                OutputColumn::Left(pos, _) => left_row.cells.get(*pos),
-                OutputColumn::Right(pos, _) => right_row.cells.get(*pos),
-            }
-            .cloned()
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "JOIN output column position out of range".to_string(),
-            })?;
+            let cell = resolve_output_cell(out_col, left_row, right_row)?
+                .cloned()
+                .unwrap_or(Cell::Null);
             cells.push(cell);
         }
+        // `ResultRow.id`: 左行があれば左の `id`、無ければ右の `id`
+        // （`docs/design/outer-join.md`。wire・HTTP のクエリ出力では `row.id`
+        // を使っていないため観測上の影響は無い）。
+        let id = match left_row {
+            Some(row) => row.id,
+            None => {
+                right_row
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN output row has neither a left nor a right side".to_string(),
+                    })?
+                    .id
+            }
+        };
         rows.push(ResultRow {
-            id: left_row.id,
+            id,
             score: 0.0,
             cells,
         });
@@ -830,6 +981,32 @@ pub(crate) fn execute_with_limits(
         .collect();
 
     Ok(QueryResult { columns, rows })
+}
+
+/// 出力列 1 個のセルを、NULL 補完（欠損側）を考慮して解決する（Issue #926
+/// §2.4）。欠損側（`left_row`／`right_row` が `None`）を参照する出力列は
+/// `Ok(None)`（呼び出し元が `Cell::Null` へ写像する）を返す。存在するはずの
+/// 側の列位置が見つからない場合は `build_plan` の内部不整合として拒否する
+/// （fail-closed）。
+fn resolve_output_cell<'a>(
+    out_col: &OutputColumn,
+    left_row: Option<&'a ResultRow>,
+    right_row: Option<&'a ResultRow>,
+) -> Result<Option<&'a Cell>, SqlSurfaceError> {
+    let (row, pos) = match out_col {
+        OutputColumn::Left(pos, _) => (left_row, *pos),
+        OutputColumn::Right(pos, _) => (right_row, *pos),
+    };
+    match row {
+        Some(row) => row
+            .cells
+            .get(pos)
+            .map(Some)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "JOIN output column position out of range".to_string(),
+            }),
+        None => Ok(None),
+    }
 }
 
 /// Describe（拡張クエリプロトコル）向けに、両辺の走査を一切行わず結果列
@@ -886,7 +1063,7 @@ mod tests {
     use crate::catalog::{ColumnDef, TableSchema};
     use crate::recovery::required_op_id::OperationId;
     use crate::row_codec::Value;
-    use crate::sql::allowlist::{Projection, ValidatedJoin};
+    use crate::sql::allowlist::{JoinKind, Projection, ValidatedJoin};
     use crate::sql::udf_call::UdfRegistry;
     use crate::storage::{Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
@@ -921,6 +1098,7 @@ mod tests {
     fn id_join(left: &str, right: &str) -> ValidatedJoin {
         ValidatedJoin {
             relations: vec![TableRef::new(left), TableRef::new(right)],
+            kind: JoinKind::Inner,
             on: vec![(
                 ColumnRef::qualified(left, "id"),
                 ColumnRef::qualified(right, "id"),
@@ -1087,6 +1265,7 @@ mod tests {
 
         let validated = ValidatedJoin {
             relations: vec![TableRef::new("l"), TableRef::new("r")],
+            kind: JoinKind::Inner,
             on: vec![(
                 ColumnRef::qualified("l", "tag"),
                 ColumnRef::qualified("r", "tag"),
@@ -1147,6 +1326,7 @@ mod tests {
                 TableRef::with_alias("a", "x"),
                 TableRef::with_alias("a", "y"),
             ],
+            kind: JoinKind::Inner,
             on: vec![(ColumnRef::unqualified("id"), ColumnRef::unqualified("id"))],
             projection: JoinProjection::All,
             where_conjuncts: Vec::new(),
@@ -1254,6 +1434,7 @@ mod tests {
 
         let validated = ValidatedJoin {
             relations: vec![TableRef::new("l"), TableRef::new("r")],
+            kind: JoinKind::Inner,
             on: vec![(
                 ColumnRef::qualified("l", "id"),
                 ColumnRef::qualified("r", "xx"),
@@ -1275,6 +1456,143 @@ mod tests {
             result.rows.len(),
             1,
             "join must match on the real id/xx column values, not the pseudo row key"
+        );
+    }
+
+    /// Issue #926 §2.3 の回帰: `is_null_rejecting` は現行の全 `JoinWherePredicate`
+    /// variant で真を返す（WHERE 簡約規則の前提）。将来 variant が増えた際は
+    /// 網羅的 `match` がコンパイルエラーで検出する（本テストの更新も必要）。
+    #[test]
+    fn is_null_rejecting_returns_true_for_all_current_variants() {
+        use crate::sql::allowlist::CompareOp;
+        let column = ColumnRef::unqualified("x");
+        let preds = [
+            JoinWherePredicate::Equality {
+                column: column.clone(),
+                value: "v".to_string(),
+            },
+            JoinWherePredicate::Prefix {
+                column: column.clone(),
+                pattern: "v".to_string(),
+            },
+            JoinWherePredicate::Compare {
+                column: column.clone(),
+                op: CompareOp::Gt,
+                value: "v".to_string(),
+            },
+            JoinWherePredicate::BoolEquality {
+                column: column.clone(),
+                value: true,
+            },
+            JoinWherePredicate::BoolColumn { column },
+        ];
+        for pred in &preds {
+            assert!(is_null_rejecting(pred), "pred={pred:?}");
+        }
+    }
+
+    /// Issue #926 §2.4 の回帰: LEFT JOIN では未一致の左行が NULL 補完行として
+    /// カーディナリティに加算されるため、一致ペア数だけなら収まる注入上限でも
+    /// 全体では超過して `54000` になる。
+    #[test]
+    fn unmatched_left_row_pushes_cardinality_over_the_injected_limit_for_left_join() {
+        let path = unique_db_path("outer-join-cardinality-overflow");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&schema("l")).expect("create l");
+        storage.create_table(&schema("r")).expect("create r");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        // id=0 は両側一致（1 ペア）。id=1 は左側のみ（NULL 補完で 1 行追加）。
+        insert_row(&storage, "l", &ctx, 0, "x");
+        insert_row(&storage, "l", &ctx, 1, "orphan");
+        insert_row(&storage, "r", &ctx, 0, "y");
+
+        let validated = ValidatedJoin {
+            kind: JoinKind::Left,
+            ..id_join("l", "r")
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("l".to_string(), schema("l"));
+        schemas.insert("r".to_string(), schema("r"));
+        let udfs = UdfRegistry::default();
+        let limits = JoinLimits {
+            max_output_rows: 1,
+            ..JoinLimits::default()
+        };
+
+        let err = execute_with_limits(&read_txn, &ctx, &schemas, &validated, &udfs, &limits)
+            .expect_err("1 matched pair + 1 NULL-padded row must exceed a limit of 1");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 上のちょうど対照: 同じデータを INNER JOIN で実行すると未一致の左行は
+    /// 出力に含まれないため、一致ペア数（1 件）が注入上限（1 件）に収まって
+    /// 成功する（回帰テストが常に失敗するだけの壊れた検証になっていない
+    /// ことの確認）。
+    #[test]
+    fn same_data_fits_under_the_injected_limit_for_inner_join() {
+        let path = unique_db_path("outer-join-cardinality-accept");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&schema("l")).expect("create l");
+        storage.create_table(&schema("r")).expect("create r");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        insert_row(&storage, "l", &ctx, 0, "x");
+        insert_row(&storage, "l", &ctx, 1, "orphan");
+        insert_row(&storage, "r", &ctx, 0, "y");
+
+        let validated = id_join("l", "r");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("l".to_string(), schema("l"));
+        schemas.insert("r".to_string(), schema("r"));
+        let udfs = UdfRegistry::default();
+        let limits = JoinLimits {
+            max_output_rows: 1,
+            ..JoinLimits::default()
+        };
+
+        let result = execute_with_limits(&read_txn, &ctx, &schemas, &validated, &udfs, &limits)
+            .expect("INNER JOIN cardinality (1 matched pair) must fit the limit of 1");
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    /// Issue #926 §2.3 の回帰: LEFT JOIN で欠損側（右）に WHERE 述語があると、
+    /// NULL 補完行は必ずその述語で落ちるため簡約して INNER と同じ結果になる
+    /// （`preserve_left` が偽になる）。
+    #[test]
+    fn left_join_with_predicate_on_missing_side_reduces_to_inner() {
+        let path = unique_db_path("outer-join-where-reduction");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&schema("l")).expect("create l");
+        storage.create_table(&schema("r")).expect("create r");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        insert_row(&storage, "l", &ctx, 0, "x");
+        insert_row(&storage, "l", &ctx, 1, "orphan");
+        insert_row(&storage, "r", &ctx, 0, "y");
+
+        let validated = ValidatedJoin {
+            kind: JoinKind::Left,
+            where_conjuncts: vec![JoinWherePredicate::Equality {
+                column: ColumnRef::qualified("r", "tag"),
+                value: "y".to_string(),
+            }],
+            ..id_join("l", "r")
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("l".to_string(), schema("l"));
+        schemas.insert("r".to_string(), schema("r"));
+        let udfs = UdfRegistry::default();
+
+        let result = execute(&read_txn, &ctx, &schemas, &validated, &udfs)
+            .expect("LEFT JOIN with a predicate on the missing side should succeed");
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "the unmatched left row must not be NULL-padded when the right side has a WHERE predicate"
         );
     }
 }
