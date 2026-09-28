@@ -105,9 +105,9 @@ v9 を知らない旧バイナリは「未知のフォーマットバージョ�
 | 書き込みゲートの待機上限超過 | `WriteLockTimeout` | `55P03` |
 | その他 | ― | `XX000` |
 
-補足: PostgreSQL が制約名衝突に使う `42710` の行が ERR-6 の表に無いため、本
-実装は `42P07` を流用した。`42710` の追加要否は spec リポ側の課題として申し
-送る（本実装では対処しない）。
+補足: 制約名衝突には ERR-6（`docs/spec/04-behavior/error-format.md`）の
+既存行 `42P07`（索引名衝突と同じ）を流用した。専用 SQLSTATE の要否は
+spec リポ側の課題として申し送る（本実装では対処しない）。
 
 HTTP 射影は新しい `ErrorClass` を追加していないため、`error_format.rs` と
 `crates/wire-server/tests/err4_http_projection.rs` は無変更で受入基準
@@ -187,9 +187,8 @@ commit せず破棄・副作用ゼロ）→ `encode_schema` → カタログへ�
 
 ## 申し送り（Issue は起票しない）
 
-- spec 側の課題: 制約名衝突に使う SQLSTATE（PostgreSQL は `42710`）が ERR-6
-  の表に無いため、本実装は `42P07` を流用した。spec リポでの追加要否の判断を
-  依頼する
+- spec 側の課題: 制約名衝突には ERR-6 の既存行 `42P07` を流用した。専用
+  SQLSTATE の追加要否について spec リポでの判断を依頼する
 - スコープ外として残すもの: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`・
   CHECK／PK／FK の ADD／DROP CONSTRAINT・`DROP CONSTRAINT IF EXISTS`／
   `CASCADE`・制約の一覧を取得する手段（`pg_constraint` 相当）・永続一意索引
