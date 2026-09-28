@@ -1075,13 +1075,15 @@ pub enum CatalogError {
     /// 参照先列の型が一致しない（ERR-6: `42830`）。`detail` はカタログ情報
     /// （列名・テーブル名）のみでテナントデータを含まない。
     InvalidForeignKey(String),
-    /// `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE` で指定した制約名が、
-    /// 同一テーブルの既存 UNIQUE 制約名・CHECK 制約名（テーブル単位で名前空間を
-    /// 共有する。設計 D1）のいずれかと衝突する（Issue #1067。ERR-6: `42P07`。
+    /// `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE` ／
+    /// `ADD [CONSTRAINT <name>] FOREIGN KEY` で指定した制約名が、同一テーブルの
+    /// 既存 UNIQUE・CHECK・FOREIGN KEY 制約名（テーブル単位で名前空間を共有する。
+    /// 設計 D1・F1）のいずれかと衝突する（Issue #1067・#1069。ERR-6: `42P07`。
     /// 索引名衝突〔`IndexAlreadyExists`〕と同じ SQLSTATE を流用する）。
     ConstraintAlreadyExists(String),
-    /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK
-    /// いずれの制約としても存在しない（Issue #1067。ERR-6: `42704`）。
+    /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK・
+    /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
+    /// ERR-6: `42704`）。
     ConstraintNotFound(String),
     /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が CHECK 制約を指す
     /// （CHECK の DROP は本 Issue のスコープ外。Issue #1067。ERR-6: `0A000`。
@@ -6169,8 +6171,9 @@ impl Storage {
     ///
     /// 判定順序（設計 D7。fail-closed）: (1) 明示名の識別子妥当性・列リストの
     /// 構造（空・重複・上限超過）は呼び出し元（構文段）が検証済みの前提 (2)
-    /// テーブル取得（`TableNotFound`） (3) 明示名の衝突（既存 UNIQUE・CHECK
-    /// 制約名との重複。`ConstraintAlreadyExists`） (4) 制約数上限
+    /// テーブル取得（`TableNotFound`） (3) 明示名の衝突（既存 UNIQUE・CHECK・
+    /// FOREIGN KEY 制約名との重複。設計 F1・Issue #1069。
+    /// `ConstraintAlreadyExists`） (4) 制約数上限
     /// （`ConstraintLimitExceeded`） (5) 名前確定後のスキーマとして
     /// [`validate_schema`]（未宣言列・対象外型・同一列リスト重複は
     /// `CatalogError::Invalid`） (6) 対象テーブルの**全行**（`Public`／
@@ -6204,12 +6207,16 @@ impl Storage {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             let new_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
 
-            // 明示名の衝突は既定名導出より前に判定する（同名の UNIQUE・CHECK が
-            // 既にあるテーブルへ、その名前を明示指定して追加しようとした場合を
-            // 確実に拒否するため）。
+            // 明示名の衝突は既定名導出より前に判定する（同名の UNIQUE・CHECK・
+            // FOREIGN KEY が既にあるテーブルへ、その名前を明示指定して追加
+            // しようとした場合を確実に拒否するため）。`FOREIGN KEY` 制約名も
+            // 同じテーブル単位の名前空間を共有する（設計 F1。TABLE-22・
+            // TASK-233、Issue #1069。`alter_table_add_foreign_key` の対称
+            // チェックと同じ判定）。
             if let Some(n) = name {
                 let collides = schema.unique_constraints.iter().any(|u| u.name() == n)
-                    || schema.checks.iter().any(|c| c.name == n);
+                    || schema.checks.iter().any(|c| c.name == n)
+                    || schema.foreign_keys.iter().any(|f| f.name() == n);
                 if collides {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
