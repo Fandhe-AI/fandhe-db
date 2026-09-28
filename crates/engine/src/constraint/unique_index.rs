@@ -515,9 +515,12 @@ where
         }
         new_entries.insert(id, entries);
     }
-    if written_keys.iter().all(HashMap::is_empty) {
-        return Ok(());
-    }
+    // 全書き込み対象行のキーが空（宣言済み一意キーが 1 個も NULL でない値を
+    // 持たない）場合でも早期 return しない——更新により一意キーが全て NULL に
+    // 変化した行は `new_entries` の該当行が空 Vec を持つが、その行が更新前に
+    // 保持していた索引エントリ（旧キー）は段 3 の逆引き差分削除でしか
+    // 後片付けされない。ここで早期 return すると段 3 に到達せず、stale な
+    // 正引き・逆引きエントリが索引に残り続ける（Codex レビュー指摘・PR #1123）。
 
     // 2. 各新エントリを索引に照会し、書き込み対象でない別行が同じキーを
     //    現に保持していないか確認する（stale なエントリは読み戻しで判別）。
@@ -726,5 +729,74 @@ mod tests {
         )
         .expect("final insert must succeed");
         ROW_TABLE_GET_COUNT.with(|c| c.get())
+    }
+
+    /// [`check_and_update`] は、書き込み対象行の一意キーが（更新により）
+    /// すべて NULL になった場合でも段 3（逆引き差分削除）まで到達し、旧
+    /// 索引エントリ（正引き・逆引きの両方）を後片付けする——`written_keys`
+    /// が空だからといって早期 return してはならない（Codex レビュー
+    /// 指摘・PR #1123）。後片付けが漏れると、参照先を失った正引きエントリが
+    /// 索引に残り続け、後続の別行が読み戻し（stale 判定）でしか同じ値を
+    /// 再利用できなくなる（索引照会だけで O(1) 相当に判定できるという
+    /// 本モジュールの設計目標が損なわれる）。
+    #[test]
+    fn update_that_nulls_out_the_only_key_removes_the_stale_reverse_entry() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema, UniqueConstraint};
+        use crate::policy::PolicyContext;
+        use crate::recovery::required_op_id::{LedgerMode, OperationId};
+        use crate::row_codec::Value;
+        use crate::storage::{Storage, Visibility};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("unique-index-null-update-cleanup");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("a", ColumnType::Text, true)])
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["a".to_string()])]);
+        storage.create_table(&schema).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant id");
+
+        crate::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[Value::Text("x".to_string())],
+            &OperationId::parse("op-1").expect("op id"),
+        )
+        .expect("seed insert must succeed");
+
+        let null_op_id = OperationId::parse("op-null").expect("op id");
+        let ledger_write = LedgerMode::Ledgered
+            .resolve(Some(&null_op_id))
+            .expect("ledger resolve");
+        crate::tenant::update_row_columns_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &[(0, Value::Null)],
+            ledger_write,
+            None,
+        )
+        .expect("update that nulls out the unique key must succeed");
+
+        // 索引テーブルを直接開いて、id=1 の逆引きエントリが残っていないことを
+        // 確認する（段 3 まで到達していれば `remove` 済みのはず）。
+        let index_table_name = crate::catalog::user_uniq_table_name("docs");
+        let write_txn = storage.begin_write_txn().expect("open txn for inspection");
+        let index_table = write_txn
+            .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+            .expect("open index table");
+        let rev_sub = reverse_subkey(1);
+        let leftover = index_table
+            .get(("tenant-a", rev_sub.as_slice()))
+            .expect("index table get")
+            .is_some();
+        assert!(
+            !leftover,
+            "reverse entry for id=1 must be cleaned up once its unique key became NULL"
+        );
     }
 }

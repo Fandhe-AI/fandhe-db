@@ -252,3 +252,48 @@ fn add_unique_constraint_invalidates_index_and_lazily_rebuilds_on_next_write() {
 
     assert_eq!(count_rows(&core, &alice), 2);
 }
+
+/// `UPSERT ... ON CONFLICT (a) DO UPDATE`（UNIQUE 列を対象にした ON CONFLICT。
+/// base（main）取り込みマージで統合された Issue #1074・#1134 の経路）が、
+/// 永続一意索引を正しく維持し続けることの回帰。`DO UPDATE` で id=1 の値が
+/// 'x' → 'y' に変わった後、'x' は別行へ再利用でき、'y' は既存行に対して
+/// 引き続き検査される（索引の後片付け漏れがあれば、いずれかが誤って判定
+/// される）。
+#[test]
+fn on_conflict_do_update_targeting_a_unique_column_keeps_the_index_consistent() {
+    let (core, path) = new_core("uniq-index-on-conflict-do-update");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-1'",
+    )
+    .expect("first insert");
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'y') \
+         ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a USING OPERATION_ID 'op-upsert'",
+    )
+    .expect("upsert that changes the unique column via DO UPDATE");
+
+    // 'x' は id=1 が手放したはずなので、別行が新たに使える。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (2, 'x') USING OPERATION_ID 'op-2'",
+    )
+    .expect("the value freed by the upsert's DO UPDATE must be reusable");
+
+    // 'y' は id=1 が現に保持しているので、別行からは引き続き衝突する。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (3, 'y') USING OPERATION_ID 'op-3'",
+    )
+    .expect_err("the value now held by id=1 via DO UPDATE must still be enforced");
+
+    assert_eq!(count_rows(&core, &alice), 2);
+}

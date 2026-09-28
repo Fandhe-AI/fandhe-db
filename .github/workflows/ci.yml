@@ -169,6 +169,27 @@ jobs:
         run: make crash-test-cross-table
 
   # --------------------------------------------------
+  # crash-test-unique-index（永続一意索引・クラッシュ耐性回帰テスト。
+  # Issue #1070・対象ビヘイビア TABLE-16）
+  # --------------------------------------------------
+  # プロセス外からの SIGKILL → 再起動 → 索引と行データの整合性検証を行う回帰テスト
+  # （scripts/crash_test_unique_index.sh）。crash-test-cross-table と同じ理由で
+  # 独立ジョブとして定義し、第三者 action（actions/checkout）は SHA 固定で参照する。
+  # private submodule（docs/spec）は取得しない。
+  crash-test-unique-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run crash-test-unique-index
+        run: make crash-test-unique-index
+
+  # --------------------------------------------------
   # core-api-check（コア API シグネチャ差分検知。TASK-125・対象ビヘイビア CORE-1）
   # --------------------------------------------------
   # プロトコル層（wire-server 等）の追加・変更がコア API（VectorCore/SearchProvider）の

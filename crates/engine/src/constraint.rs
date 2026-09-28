@@ -76,7 +76,7 @@ use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, ForeignKeyMatch, T
 use crate::row_codec::ScalarRef;
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// 一意キー 1 個分の NULL の扱い。
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -60,22 +60,44 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 `single_insert_read_cost_does_not_scale_with_existing_row_count`）に置く。このテスト
 は 1 行 INSERT が行ストアを読み戻す回数（`ROW_TABLE_GET_COUNT`。単体テスト限定の
 計測フック）を、既存行数が 100 件のテナントと 3,000 件のテナントで比較し、両者が
-同じ小さな定数に収まる（既存行数に依存して増えない）ことを確認する。共有 CI
-環境でのマイクロベンチマーク（`docs/design/benchmark-judgement-policy.md` 準拠の
-before/after 交互実行）は本 PR の時点では未実施——読み戻し回数という決定的な
-指標がテナント行数への非依存性を直接示すため、環境ノイズの影響を受けるベンチ
-より優先した。マイクロベンチマーク（`bench-unique-check` 相当）とクラッシュ整合
-確認ツールの追加は別途の作業として残す（本ファイル「既知の制約」節参照）。
+同じ小さな定数に収まる（既存行数に依存して増えない）ことを確認する。
+
+共有 CI 環境でのマイクロベンチマーク（`docs/design/benchmark-judgement-policy.md`
+準拠の before/after 交互実行）は追加しない判断とする——単なる先送りではなく、
+同 doc §5「環境別の証拠力」の表が明示するとおり、共有 QEMU 本環境（本開発環境の
+実測プロファイルも同 doc §6 参照）は「perf 動機の production 変更の採用
+（Accepted）」を **不可** と判定しており、この環境で得たマイクロベンチマークの
+数値は採否根拠にならず参考値にしかならない。一方、読み戻し回数という構造的指標は
+環境ノイズの影響を受けず「検査コストがテナントの保有行数に比例しない」という
+受け入れ条件を直接・決定的に示せるため、本 Issue の主要な証拠として同 doc の
+方針どおり構造テストを優先する。専有環境（`BENCH_DEDICATED_ENV=1`）でのマイクロ
+ベンチマーク（`bench-unique-check` 相当）は、確保自体がオーナー作業である
+専有環境を要するため、本ファイル「スコープ外・申し送り」節に残す。
 
 ## クラッシュ整合
 
 索引の更新は行の書き込み・台帳記録と同じ redb write トランザクション・同じ
 `commit_boundary::commit` の内側で行う（`constraint::enforce_unique_keys_in_txn`
 は行ストア・索引テーブルの両方を同一 write txn 上で開き、違反時は commit 前に
-`Err` を返して txn を破棄する）ため、原子性は構造的に保証される。専用のクラッシュ
-テストツール（`scripts/crash_test_cross_table.sh` と同じ構造の SIGKILL 方式）は
-本 PR の時点では未追加（既存の `crash_test.sh`・`crash_test_cross_table.sh` が
-検証する commit 境界の原子性契約を、本変更は変更していない）。
+`Err` を返して txn を破棄する）ため、原子性は構造的に保証される。
+
+専用のクラッシュテストツール `crates/engine/examples/crash_tool_unique_index.rs`
+（`scripts/crash_test_unique_index.sh`・Makefile `crash-test-unique-index`・CI
+`crash-test-unique-index` ジョブ）を追加した。既存の `crash_test_cross_table.sh`
+が使う `crash_tool_cross_table.rs` は `engine::txn::BatchWriteTxn`（`ROWS_TABLE`・
+`BATCH_LOG_TABLE` のみ）を直叩きする旧経路であり、SQL 表層が読み書きしない
+（`table_generation_bump_coverage.rs` の ALLOWLIST ドキュメント参照）ため UNIQUE
+制約・永続一意索引には一切触れない——本変更の crash-consistency 受け入れ条件には
+使えず、新規ツールが必要だった。新規ツールは `EngineCore::execute_insert_sql`
+（`constraint::enforce_unique_keys_in_txn` → `unique_index::check_and_update` を
+経由する production 経路）で `docs (code TEXT UNIQUE)` へ SIGKILL 耐性のある
+バッチ INSERT を行い、再起動後に (a) 行 id の 0 起点連続性・バッチ整合に加えて
+(b) 「正しさの不変条件」（生存行の各キー値は必ず正引きエントリを持つ）そのものを
+検証する——既存の全 `code` 値を新しい id で再挿入しようと試み、必ず `23505`
+（UNIQUE 制約違反）で拒否されることを確認する。索引エントリがクラッシュ後の
+復旧で 1 件でも欠落していれば、その値だけ誤って受理されてしまうため、この
+プローブは「クラッシュ後も索引と行データが整合する」という受け入れ条件を直接
+検証するオラクルになる。
 
 ## テスト
 
@@ -87,12 +109,20 @@ before/after 交互実行）は本 PR の時点では未実施——読み戻し
   キー再利用、TRUNCATE のテナント境界、`DROP TABLE` 後の索引非残留、
   `ALTER TABLE ... ADD UNIQUE` の遅延バックフィル。
 - 新規 `crates/engine/src/constraint/unique_index.rs` 内の単体テスト: エンコード
-  往復・破損値の拒否、行数非依存性の構造テスト（上記「性能改善の証拠」）。
+  往復・破損値の拒否、行数非依存性の構造テスト（上記「性能改善の証拠」）、
+  UPDATE で一意キー対象列がすべて NULL になった行の旧索引エントリ後片付け
+  （段 3 の逆引き差分削除が早期 return で迂回されないことの回帰。Codex レビュー
+  指摘・PR #1123）。
+- 新規 `crates/engine/examples/crash_tool_unique_index.rs` ＋
+  `scripts/crash_test_unique_index.sh`: 上記「クラッシュ整合」節の SIGKILL
+  耐性・索引の正しさの不変条件を検証する回帰テスト（Makefile
+  `crash-test-unique-index`・CI 同名ジョブ）。
 
 ## スコープ外・申し送り
 
-- マイクロベンチマーク（`bench-unique-check` 相当）・専用クラッシュテストツール
-  （`crash_test_unique_index.sh` 相当）・CI ジョブ配線の追加。
+- 専有環境（`BENCH_DEDICATED_ENV=1`）でのマイクロベンチマーク
+  （`bench-unique-check` 相当）。確保自体がオーナー作業のため引き継ぐ
+  （上記「性能改善の証拠」節参照）。
 - ダウングレード運用（旧バイナリでの書き込み）の検出・拒否機構。
 - 巨大キー（`TEXT`／`BYTEA`）に対する索引キー長の上限・ハッシュ化。
 - FOREIGN KEY 参照先側の照会の同索引への統合。
