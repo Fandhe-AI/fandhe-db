@@ -651,6 +651,18 @@ fn cascade_delete_does_not_cross_tenant_boundary_via_nosql() {
         1,
         "bob's tenant must be unaffected by alice's cascade delete"
     );
+
+    // alice の削除操作は `parents` の id=1 という値自体も指定しており、
+    // bob 側にも同じ値の行が存在する。親行についても bob 側が残存する
+    // ことまで確認し、値一致のみで検索し tenant_id フィルタを取り違える
+    // 経路が無いことを親・子の両方で担保する（codex レビュー指摘。PR #1157）。
+    let scan_parents = br#"{"op":"scan","table":"parents","limit":10}"#;
+    assert_eq!(scan_row_count(&query(&alice, scan_parents)), 0);
+    assert_eq!(
+        scan_row_count(&query(&bob, scan_parents)),
+        1,
+        "bob's tenant parent row must be unaffected by alice's cascade delete"
+    );
 }
 
 #[test]
