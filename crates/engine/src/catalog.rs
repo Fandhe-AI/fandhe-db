@@ -113,6 +113,55 @@ const INDEX_CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("
 /// 同じ既定値。無制限 `Vec`／走査コストを避ける。本リポの実装既定値）。
 const MAX_INDEX_COUNT: usize = MAX_LIST_TABLES;
 
+/// [`INDEX_CATALOG_TABLE`] の内容を変える commit だけで進む専用世代カウンタ
+/// （Issue #1154。固定キー 1 件で `u64` を 1 つ保持するだけの単一行テーブル）。
+/// [`IndexCatalogGateCache`] のキーをこのカウンタへ切り替えることで、索引宣言と
+/// 無関係な通常の行 DML（テーブル単位世代のみ進む）ではキャッシュを無効化しない
+/// ようにする。**不変条件**: [`INDEX_CATALOG_TABLE`] を書き込む経路
+/// （[`Storage::create_index`]・[`Storage::drop_index`]・
+/// [`retain_index_defs_in_txn`]）は必ず同一 write txn 内で
+/// [`bump_index_catalog_generation_in_txn`] を呼ぶこと。新たに
+/// [`INDEX_CATALOG_TABLE`] への書き込み経路を追加する場合も同様に呼び忘れない
+/// （呼び忘れは古い HNSW 宣言判定の再利用＝fail-open に直結する）。
+const INDEX_CATALOG_GENERATION_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("index_catalog_generation");
+
+/// [`INDEX_CATALOG_GENERATION_TABLE`] の唯一のキー（単一行テーブル）。
+const INDEX_CATALOG_GENERATION_KEY: &str = "generation";
+
+/// [`INDEX_CATALOG_GENERATION_TABLE`] を 1 つ進める（`write_txn.commit()` 前に、
+/// [`INDEX_CATALOG_TABLE`] への書き込みと同一 write txn 内で呼ぶ）。
+/// [`bump_table_generation_in_txn`] と同じ `checked_add` 方針でオーバーフローを
+/// 検出し、新規 variant を追加せず既存の [`CatalogError::TableGenerationCounterOverflow`]
+/// を流用する（`core_api.snapshot` の破壊的変更を避けるため）。
+fn bump_index_catalog_generation_in_txn(write_txn: &redb::WriteTransaction) -> Result<()> {
+    let mut gen_table = write_txn.open_table(INDEX_CATALOG_GENERATION_TABLE)?;
+    let current = gen_table
+        .get(INDEX_CATALOG_GENERATION_KEY)?
+        .map(|v| v.value())
+        .unwrap_or(0);
+    let next = current
+        .checked_add(1)
+        .ok_or(CatalogError::TableGenerationCounterOverflow)?;
+    gen_table.insert(INDEX_CATALOG_GENERATION_KEY, next)?;
+    Ok(())
+}
+
+/// [`bump_index_catalog_generation_in_txn`] の読み取り側。テーブルが未作成
+/// （索引カタログへまだ 1 度も書き込まれていない）場合は `0` を返す
+/// （[`table_generation_in_txn`]・`crate::storage::current_generation_in_txn`
+/// と同じ「未作成 = 世代 0」の方針）。
+pub(crate) fn index_catalog_generation_in_txn(read_txn: &redb::ReadTransaction) -> Result<u64> {
+    match read_txn.open_table(INDEX_CATALOG_GENERATION_TABLE) {
+        Ok(t) => Ok(t
+            .get(INDEX_CATALOG_GENERATION_KEY)?
+            .map(|v| v.value())
+            .unwrap_or(0)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 索引宣言 1 件が持てる列数の上限（[`MAX_COLUMN_COUNT`] と同値。本リポの実装
 /// 既定値）。
 const MAX_INDEX_DEF_COLUMNS: usize = MAX_COLUMN_COUNT;
@@ -426,22 +475,21 @@ fn hnsw_catalog_summary_in_txn(read_txn: &redb::ReadTransaction) -> Result<HnswC
 }
 
 /// [`hnsw_targeted_in_txn`] の索引カタログ全件走査結果（[`HnswCatalogSummary`]）を
-/// ストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
+/// 索引カタログ専用世代カウンタ（[`index_catalog_generation_in_txn`]。Issue #1154）
 /// 単位で再利用するキャッシュ（codex-review P2 対応・Issue #1065 PR #1124）。
 /// 宣言が [`MAX_INDEX_COUNT`]（最大 10,000 件）に達する構成では、キャッシュ
 /// 無しだと検索・`EXPLAIN` のたびに宣言数に比例するデコードが検索ホットパスへ
 /// 乗る。
 ///
-/// キー選定: 索引カタログを変更する経路（`Storage::create_index`・`drop_index`・
-/// `drop_table`・`alter_table_drop_column`）はいずれも
-/// `crate::recovery::commit_boundary::commit` を経由し、commit 前に必ず
-/// `crate::storage::prepare_generation_bump`（ストレージ全体の単一世代
-/// カウンタ）を通る。索引カタログはテーブル横断の単一 redb テーブルで、要約
-/// （HNSW 宣言テーブル集合・読み取り可否）はどのテーブルへの索引 DDL の commit
-/// でも変わり得るため、対象テーブルの世代（`bump_table_generation_in_txn`）では
-/// なく全 commit で進むストレージ全体世代をキーにする（取りこぼさない）。
-/// 通常の行 DML でも過剰に無効化されるが、キャッシュ不一致時のコストは
-/// キャッシュ導入前と同じフルスキャン 1 回に留まる（悪化しない）。
+/// キー選定: 索引カタログを変更する経路（[`Storage::create_index`]・
+/// [`Storage::drop_index`]・[`retain_index_defs_in_txn`]〔`drop_table`・
+/// `alter_table_drop_column` が呼ぶ〕）は、[`INDEX_CATALOG_TABLE`] への書き込みと
+/// 同一 write txn 内で必ず [`bump_index_catalog_generation_in_txn`] を呼ぶ
+/// （[`INDEX_CATALOG_GENERATION_TABLE`] の doc コメント参照）。以前はストレージ
+/// 全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）を
+/// キーにしていたため、索引宣言と無関係な通常の行 DML の commit でもキャッシュが
+/// 無効化されていた（Issue #1154）。専用カウンタへ切り替えたことで、索引カタログ
+/// 自体を変えない commit ではキャッシュが有効なまま残る。
 ///
 /// `EngineCore` が唯一のインスタンスを保持し、`core.rs`（Rust API 検索・
 /// `EXPLAIN`）・`sql::exec`（SQL 検索、`sql::hnsw_cache::HnswCacheAccess`
@@ -454,6 +502,11 @@ pub(crate) struct IndexCatalogGateCache {
     /// 常に安全側（厳密結果）だが、カタログ破損等の異常が運用上観測できるよう
     /// `scalar_index::ScalarIndexCache::build_failures` と同方針で計上する。
     gate_read_failures: std::sync::atomic::AtomicU64,
+    /// キャッシュがミスし [`hnsw_catalog_summary_in_txn`] で索引カタログを
+    /// 実走査した回数（Issue #1154。成功・失敗いずれも計上する）。行 DML を
+    /// 挟んでも走査が増えないことを結合テストで観測するための統計で、
+    /// テナント ID・行データ等の機微情報は含まない。
+    catalog_scans: std::sync::atomic::AtomicU64,
 }
 
 impl IndexCatalogGateCache {
@@ -461,6 +514,7 @@ impl IndexCatalogGateCache {
         Self {
             state: std::sync::Mutex::new(None),
             gate_read_failures: std::sync::atomic::AtomicU64::new(0),
+            catalog_scans: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -470,6 +524,9 @@ impl IndexCatalogGateCache {
         IndexCatalogGateCacheStats {
             gate_read_failures: self
                 .gate_read_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            catalog_scans: self
+                .catalog_scans
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -484,6 +541,8 @@ pub struct IndexCatalogGateCacheStats {
     /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗により brute-force へ
     /// fail-closed 縮退した回数。
     pub gate_read_failures: u64,
+    /// キャッシュがミスし索引カタログを実走査した回数（Issue #1154）。
+    pub catalog_scans: u64,
 }
 
 /// [`IndexCatalogGateCache`] を経由して [`HnswCatalogSummary`] を取得する。
@@ -497,8 +556,7 @@ fn cached_hnsw_catalog_summary_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
 ) -> Result<std::sync::Arc<HnswCatalogSummary>> {
-    let generation =
-        crate::storage::current_generation_in_txn(read_txn).map_err(convert_storage_error)?;
+    let generation = index_catalog_generation_in_txn(read_txn)?;
     if let Ok(guard) = gate_cache.state.lock() {
         if let Some((cached_generation, summary)) = guard.as_ref() {
             if *cached_generation == generation {
@@ -506,6 +564,9 @@ fn cached_hnsw_catalog_summary_in_txn(
             }
         }
     }
+    gate_cache
+        .catalog_scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let summary = std::sync::Arc::new(hnsw_catalog_summary_in_txn(read_txn)?);
     if let Ok(mut guard) = gate_cache.state.lock() {
         let should_store = match guard.as_ref() {
@@ -540,8 +601,9 @@ fn cached_hnsw_catalog_summary_in_txn(
 /// `sql::exec`（`AnnShapeInput.hnsw_enabled`）・`core.rs`（Rust API
 /// `search_with_snapshot`・`EXPLAIN` の `ann_plan:` 行）が同一のこの関数を
 /// 呼ぶことで、実行時判定と `EXPLAIN` 表示の乖離を作らない。走査結果は
-/// `gate_cache`（[`IndexCatalogGateCache`]）を経由してストレージ世代単位で
-/// 再利用する（codex-review P2 対応・PR #1124）。
+/// `gate_cache`（[`IndexCatalogGateCache`]）を経由して索引カタログ専用世代単位で
+/// 再利用する（codex-review P2 対応・PR #1124。Issue #1154 でストレージ全体
+/// 世代から専用世代へキーを切り替えた）。
 pub(crate) fn hnsw_targeted_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
@@ -579,33 +641,45 @@ fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> R
 
 /// [`INDEX_CATALOG_TABLE`] の全エントリのうち `keep` が `false` を返す宣言を同一
 /// write txn 内で削除する（[`delete_indexes_for_table_in_txn`]・
-/// [`delete_indexes_referencing_column_in_txn`] の共通本体）。索引カタログ未作成は
-/// 何もせず `Ok(())`。走査件数は [`MAX_INDEX_COUNT`] で打ち切る（fail-closed）。
+/// [`delete_indexes_referencing_column_in_txn`] の共通本体。呼び出し元は
+/// `Storage::drop_table`・`Storage::alter_table_drop_column`）。索引カタログ未作成は
+/// 何もせず `Ok(())`（[`bump_index_catalog_generation_in_txn`] も呼ばない。宣言が
+/// 1 件も無い状態からは何も変わらないため）。走査件数は [`MAX_INDEX_COUNT`] で
+/// 打ち切る（fail-closed）。実際に 1 件でも削除した場合は
+/// [`bump_index_catalog_generation_in_txn`] を進める（Issue #1154。
+/// [`IndexCatalogGateCache`] が `drop_table`・`alter_table_drop_column` による
+/// HNSW 宣言の消滅を取りこぼさないようにするため）。
 fn retain_index_defs_in_txn(
     write_txn: &redb::WriteTransaction,
     mut keep: impl FnMut(&IndexDef) -> bool,
 ) -> Result<()> {
-    let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-        Err(e) => return Err(e.into()),
+    let removed = {
+        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut to_remove = Vec::new();
+        for (scanned, entry) in index_table.iter()?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            let name = key.value().to_string();
+            let def = decode_index_def(&name, value.value())?;
+            if !keep(&def) {
+                to_remove.push(name);
+            }
+        }
+        for name in &to_remove {
+            index_table.remove(name.as_str())?;
+        }
+        !to_remove.is_empty()
     };
-    let mut to_remove = Vec::new();
-    for (scanned, entry) in index_table.iter()?.enumerate() {
-        if scanned >= MAX_INDEX_COUNT {
-            return Err(CatalogError::CorruptSchema(format!(
-                "index catalog exceeds {MAX_INDEX_COUNT} entries"
-            )));
-        }
-        let (key, value) = entry?;
-        let name = key.value().to_string();
-        let def = decode_index_def(&name, value.value())?;
-        if !keep(&def) {
-            to_remove.push(name);
-        }
-    }
-    for name in to_remove {
-        index_table.remove(name.as_str())?;
+    if removed {
+        bump_index_catalog_generation_in_txn(write_txn)?;
     }
     Ok(())
 }
@@ -6924,6 +6998,9 @@ impl Storage {
             index_table.insert(def.name.as_str(), encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
+        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
+        // `IndexCatalogGateCache` が古い HNSW 宣言判定を再利用しないようにする）。
+        bump_index_catalog_generation_in_txn(&write_txn)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -6965,6 +7042,9 @@ impl Storage {
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
         bump_table_generation_in_txn(&write_txn, &def.table)?;
+        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
+        // `Storage::create_index` と同じ）。
+        bump_index_catalog_generation_in_txn(&write_txn)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -8247,10 +8327,11 @@ mod tests {
                 .insert("idx_corrupt", &b"\xff\xfe"[..])
                 .expect("insert corrupt entry");
         }
-        // 本番の書き込み経路と同じくストレージ全体世代を進める（進めないと
-        // `IndexCatalogGateCache` が破損前の検証成功を同一世代として再利用する。
-        // 本番の索引カタログ変更経路はいずれも commit 前に世代を進める）。
-        crate::storage::prepare_generation_bump(&write_txn).expect("bump generation");
+        // 本番の索引カタログ書き込み経路（`create_index`・`drop_index`・
+        // `retain_index_defs_in_txn`）と同じく専用世代を進める（Issue #1154。
+        // 進めないと `IndexCatalogGateCache` が破損前の検証成功を同一世代として
+        // 再利用する）。
+        bump_index_catalog_generation_in_txn(&write_txn).expect("bump generation");
         write_txn.commit().expect("commit corrupt entry");
     }
 
@@ -8451,6 +8532,286 @@ mod tests {
             scope,
             true
         ));
+    }
+
+    /// 索引カタログを変更する 4 経路（`create_index`・`drop_index`・`drop_table`・
+    /// `alter_table_drop_column`）がそれぞれ [`index_catalog_generation_in_txn`]
+    /// を進めることを固定する（Issue #1154。取りこぼし防止の回帰テスト）。
+    #[test]
+    fn index_catalog_mutating_paths_bump_index_catalog_generation() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-generation-bump-paths");
+        let read_gen = || -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            index_catalog_generation_in_txn(&read_txn).expect("read index catalog generation")
+        };
+
+        let gen0 = read_gen();
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        let gen1 = read_gen();
+        assert!(
+            gen1 > gen0,
+            "create_index must bump index catalog generation"
+        );
+
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        let gen2 = read_gen();
+        assert!(gen2 > gen1, "drop_index must bump index catalog generation");
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_sibling", "sibling"))
+            .expect("create hnsw index on sibling");
+        let gen3 = read_gen();
+        assert!(
+            gen3 > gen2,
+            "create_index must bump index catalog generation for any table"
+        );
+
+        storage.drop_table("sibling").expect("drop sibling");
+        let gen4 = read_gen();
+        assert!(
+            gen4 > gen3,
+            "drop_table must bump index catalog generation when it removes a declaration"
+        );
+
+        // `alter_table_drop_column` で宣言列を含む索引宣言を消す（`USING hnsw` は
+        // 常に `VECTOR` 列を要求し、`VECTOR` 列自体は `ProtectedColumn` として
+        // drop を拒否されるため、ここではスカラー宣言列で確認する）。
+        storage
+            .create_index(&scalar_def("idx_lang_docs", "docs", &["lang"]))
+            .expect("create scalar index on docs.lang");
+        let gen5 = read_gen();
+        storage
+            .alter_table_drop_column("docs", "lang")
+            .expect("drop lang column");
+        let gen6 = read_gen();
+        assert!(
+            gen6 > gen5,
+            "alter_table_drop_column must bump index catalog generation when it removes a declaration"
+        );
+    }
+
+    /// 通常の行 DML（`insert_typed_row`）や索引と無関係な DDL（`create_table`・
+    /// `alter_table_add_column`）は索引カタログ専用世代を変えない（Issue #1154 の
+    /// 受け入れ条件 1）。ストレージ全体世代（`crate::storage::current_generation_in_txn`）
+    /// は commit のたびに進むことも併せて確認し、テストが自明に真とならないように
+    /// する。
+    #[test]
+    fn non_index_mutations_do_not_bump_index_catalog_generation() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-generation-row-dml");
+        let read_index_gen = || -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            index_catalog_generation_in_txn(&read_txn).expect("read index catalog generation")
+        };
+        let read_storage_gen = || -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            crate::storage::current_generation_in_txn(&read_txn).expect("read storage generation")
+        };
+
+        let index_gen0 = read_index_gen();
+        let storage_gen0 = read_storage_gen();
+
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                crate::storage::Visibility::Public,
+                &[
+                    crate::row_codec::Value::Vector(vec![1.0, 2.0]),
+                    crate::row_codec::Value::Text("ja".to_string()),
+                    crate::row_codec::Value::Null,
+                ],
+            )
+            .expect("insert typed row");
+        storage
+            .alter_table_add_column("sibling", ColumnDef::new("lang", ColumnType::Text, true))
+            .expect("alter table add column");
+        storage
+            .create_table(&TableSchema::new(
+                "unrelated",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create unrelated table");
+
+        assert_eq!(
+            read_index_gen(),
+            index_gen0,
+            "row DML and non-index DDL must not bump the index catalog generation"
+        );
+        assert!(
+            read_storage_gen() > storage_gen0,
+            "the storage-wide generation must still advance on every commit (sanity check)"
+        );
+    }
+
+    /// [`IndexCatalogGateCache`] が行 DML を跨いでヒットし続けること（Issue #1154
+    /// の受け入れ条件 1）。宣言ありのテーブルを 1 回判定した後、無関係な行を
+    /// INSERT しても再判定でカタログを再走査しない（`catalog_scans` が増えない）
+    /// ことを固定する。
+    #[test]
+    fn hnsw_targeted_in_txn_cache_survives_row_dml() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-cache-survives-row-dml");
+        let gate_cache = IndexCatalogGateCache::new();
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        assert_eq!(gate_cache.stats().catalog_scans, 1);
+
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                crate::storage::Visibility::Public,
+                &[
+                    crate::row_codec::Value::Vector(vec![1.0, 2.0]),
+                    crate::row_codec::Value::Text("ja".to_string()),
+                    crate::row_codec::Value::Null,
+                ],
+            )
+            .expect("insert typed row");
+
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        assert_eq!(
+            gate_cache.stats().catalog_scans,
+            1,
+            "a row DML commit must not invalidate the index catalog gate cache"
+        );
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+    }
+
+    /// 索引宣言を変えた直後は古い判定を使い回さないこと（Issue #1154 の受け入れ
+    /// 条件 2・TOCTOU/fail-closed の維持）。`create_index`・`drop_index`・
+    /// `drop_table`＋再作成・`alter_table_drop_column` のいずれも、直前に行 DML を
+    /// 挟んでいても取りこぼさず `catalog_scans` を増やして再判定することを固定
+    /// する。
+    #[test]
+    fn hnsw_targeted_in_txn_cache_does_not_reuse_stale_declaration_after_ddl() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-cache-stale-after-ddl");
+        let gate_cache = IndexCatalogGateCache::new();
+        let insert_row = |id: u64| {
+            storage
+                .insert_typed_row(
+                    "docs",
+                    id,
+                    "tenant-a",
+                    crate::storage::Visibility::Public,
+                    &[
+                        crate::row_codec::Value::Vector(vec![1.0, 2.0]),
+                        crate::row_codec::Value::Text("ja".to_string()),
+                        crate::row_codec::Value::Null,
+                    ],
+                )
+                .expect("insert typed row");
+        };
+
+        // 初回判定（宣言なし）でキャッシュを温める。
+        assert!(!targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        let mut scans = gate_cache.stats().catalog_scans;
+        assert_eq!(scans, 1);
+
+        insert_row(1);
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        assert!(
+            targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "create_index must not be masked by a stale cache entry"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        insert_row(2);
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        assert!(
+            !targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "drop_index must not be masked by a stale cache entry"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        // `drop_table` → 同名テーブル再作成でも古い判定（宣言なし）が残らないこと。
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs_2", "docs"))
+            .expect("re-create hnsw index");
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        storage.drop_table("docs").expect("drop docs");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                    ColumnDef::new("flag", ColumnType::Boolean, true),
+                ],
+            ))
+            .expect("re-create docs");
+        assert!(
+            !targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "drop_table must not leave a stale declared-hnsw judgement for the recreated table"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        // `alter_table_drop_column`（`retain_index_defs_in_txn` 経由。`USING hnsw`
+        // は常に `VECTOR` 列を要求し、`VECTOR` 列自体は `ProtectedColumn` として
+        // drop を拒否されるため HNSW 宣言列そのものは対象にできない。ここでは
+        // 同じコード経路をスカラー宣言で確認し、HNSW 宣言（`idx_hnsw_docs_3`）が
+        // 無関係な列 drop で誤って消えない＝キャッシュを不要に無効化しない
+        // ことも併せて固定する）。
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs_3", "docs"))
+            .expect("create hnsw index for drop-column case");
+        storage
+            .create_index(&scalar_def("idx_lang_docs_3", "docs", &["lang"]))
+            .expect("create scalar index on docs.lang");
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        insert_row(3);
+        storage
+            .alter_table_drop_column("docs", "lang")
+            .expect("drop lang column");
+        assert!(
+            targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "dropping an unrelated column must not invalidate the still-declared hnsw judgement"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
     }
 
     #[test]

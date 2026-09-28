@@ -166,7 +166,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // PR #1156 レビュー対応（Issue #1069。`alter_table_add_named_unique_constraint`
     // の明示名衝突検査に FOREIGN KEY 名を追加。ドキュメンテーションコメント
     // 拡充で `catalog.rs` 冒頭側に 7 行追加され、再度追随（旧: 6639）。
-    ("catalog.rs", 6646),
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6646）。
+    ("catalog.rs", 6720),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -208,7 +211,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 冒頭側にさらに行が追加され、再度追随（旧: 6668）。
     // PR #1156 レビュー対応（同上。`catalog.rs` 冒頭側に 7 行追加され、
     // 再度追随（旧: 6718）。
-    ("catalog.rs", 6725),
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6725）。
+    ("catalog.rs", 6799),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -242,7 +248,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 冒頭側にさらに行が追加され、再度追随（旧: 6749）。
     // PR #1156 レビュー対応（同上。`catalog.rs` 冒頭側に 7 行追加され、
     // 再度追随（旧: 6799）。
-    ("catalog.rs", 6806),
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6806）。
+    ("catalog.rs", 6880),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -281,7 +290,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 冒頭側にさらに行が追加され、再度追随（旧: 6782）。
     // PR #1156 レビュー対応（同上。`catalog.rs` 冒頭側に 7 行追加され、
     // 再度追随（旧: 6832）。
-    ("catalog.rs", 6839),
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6839）。
+    ("catalog.rs", 6913),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

@@ -381,16 +381,21 @@ Issue #1077（`MATCH FULL`・`DEFERRABLE`）は上記とは異なり非破壊的
 
 ## NoSQL（HTTP）表層
 
-`op` 語彙に DDL が無いため `42830` は実要求から到達しない。宣言済みテーブルへの
-`insert`／`update`／`delete` op は同じ単一検査点を通るため `23503`／409 は到達する
+NoSQL `create_table.constraints[kind=foreign_key].references.on_delete`／
+`on_update`（Issue #1148）は、SQL 表層と同じ固定語彙
+（`no_action`／`restrict`／`cascade`／`set_null`／`set_default`）から
+`ON DELETE`／`ON UPDATE` の固定トークン列へ写像し、同一の実行器
+（`validate_create_table_tokens`・`EngineCore::execute_parsed_in_session`）へ
+渡す（`crates/wire-server/src/http/query/ddl.rs::referential_action_tokens`）。
+そのため宣言時検査の `42830`・連鎖適用後の参照違反 `23503`／409・連鎖上限
+超過の `54000`／413 のいずれも NoSQL 表層の実要求から到達する
 （`crates/wire-server/docs/nosql-api.md`・`crates/wire-server/tests/
-err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）。
-NoSQL `create_table` の `foreign_key` 制約（`build_constraint_tokens`）は
-`ON DELETE`／`ON UPDATE` トークンを一切生成しないため、NoSQL 表層から宣言した
-`FOREIGN KEY` は常に `NO ACTION`（Issue #1076 のスコープ外。後続課題）。SQL 表層で
-参照アクションを宣言したテーブルに対する `delete`／`update` op は、宣言側と同じ
-単一検査点（`constraint` モジュール）を通るため連鎖が発火し、上限超過は `54000`／
-413 として到達する。
+nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
+`err4_f_foreign_key_violation_reachable_via_*`・
+`err4_f_invalid_foreign_key_reachable_via_nosql_create_table`・
+`err4_f_referential_action_limit_reachable_via_nosql_delete`）。SQL・NoSQL
+いずれの宣言面でも、連鎖適用は engine 側の単一検査点（`constraint` モジュール）
+だけが担う（第 2 の実行経路を作らない）。
 
 ## 対象外・後続候補
 
@@ -417,6 +422,8 @@ NoSQL `create_table` の `foreign_key` 制約（`build_constraint_tokens`）は
 - 明示トランザクション内の `UPDATE`／`DELETE`／`UPSERT`／複数行 `INSERT`
   （単一行 `INSERT`・`TRUNCATE` のみ対応。`docs/design/explicit-transaction.md`）。
   対応すれば `INITIALLY DEFERRED` の遅延検査の観測可能範囲が広がる
-- NoSQL 表層の DDL op での宣言
+- NoSQL `references` への `MATCH {SIMPLE|FULL}`・`[NOT] DEFERRABLE`・
+  `INITIALLY {DEFERRED|IMMEDIATE}` の露出（Issue #1148 のスコープ外。
+  `on_delete`／`on_update` の宣言自体は解消済み）
 - `UPDATE ... SET col = NULL`（SQL 表層に `NULL` リテラルの構文が無く、`MATCH FULL`
   を `UPDATE` 経由で NULL 混在にする経路は現状テスト不能）
