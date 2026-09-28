@@ -104,6 +104,11 @@ pub(crate) enum ExprStep {
     PushDateColumn(usize),
     /// [`ExprStep::PushDateColumn`] の `TIMESTAMP` 版。
     PushTimestampColumn(usize),
+    /// 行の数値列（INTEGER/BIGINT/REAL/DOUBLE）参照を push する（Issue #1075・
+    /// TABLE-16 ポインタ。`CHECK` 制約の式述語束縛でのみ生成される。
+    /// [`ExprStep::PushTextColumn`] と同じ「借用は行ループの外の引数から都度
+    /// 復元する」設計）。
+    PushNumericColumn(usize),
     /// 組み込み関数呼び出し。arity 分（[`udf_call::builtin_signature`]）を
     /// スタックから pop し、[`apply_builtin`] へ渡す。
     Builtin(BuiltinFn),
@@ -148,6 +153,7 @@ impl PartialEq for ExprStep {
             (ExprStep::ConstTimestamp(a), ExprStep::ConstTimestamp(b)) => a == b,
             (ExprStep::PushDateColumn(a), ExprStep::PushDateColumn(b)) => a == b,
             (ExprStep::PushTimestampColumn(a), ExprStep::PushTimestampColumn(b)) => a == b,
+            (ExprStep::PushNumericColumn(a), ExprStep::PushNumericColumn(b)) => a == b,
             (ExprStep::Builtin(a), ExprStep::Builtin(b)) => a == b,
             (ExprStep::Binary(a), ExprStep::Binary(b)) => a == b,
             // `Arc<dyn WasmUdfBackend>` は `dyn` 型のため構造的な `PartialEq` を
@@ -210,6 +216,10 @@ pub(crate) enum StackValue {
     DateColumnRef(usize),
     /// [`StackValue::DateColumnRef`] の `TIMESTAMP` 版。
     TimestampColumnRef(usize),
+    /// 現在評価中の行の数値列（INTEGER/BIGINT/REAL/DOUBLE）参照を表すマーカー
+    /// （Issue #1075・TABLE-16 ポインタ。[`StackValue::TextColumnRef`] と同じ
+    /// 「実体は行スカラービューから都度解決する」設計）。
+    NumericColumnRef(usize),
 }
 
 /// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
@@ -269,6 +279,14 @@ fn stack_to_expr_value<'a>(
                 detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
                     .to_string(),
             }),
+        },
+        StackValue::NumericColumnRef(index) => match row_scalars.get(index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "NUMERIC column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(v)) => udf_call::numeric_scalar_from_ref(v).map(ExprValue::Scalar),
         },
     }
 }
@@ -414,6 +432,9 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::Timestamp(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        // Issue #1075・TABLE-16 ポインタ: 数値列参照は行に依存するため畳み込まない
+        // （`IdRef` と同じ理由。CHECK の式述語束縛でのみ生成される）。
+        | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::WasmCall { .. }
@@ -487,6 +508,11 @@ fn compile_node(
         }
         BoundExpr::TimestampColumnRef { index } => {
             steps.push(ExprStep::PushTimestampColumn(*index));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::ColumnRef { index } => {
+            steps.push(ExprStep::PushNumericColumn(*index));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -760,7 +786,8 @@ impl ExprProgram {
                         Some(StackValue::Null) => true,
                         Some(StackValue::TextColumnRef(index))
                         | Some(StackValue::DateColumnRef(index))
-                        | Some(StackValue::TimestampColumnRef(index)) => {
+                        | Some(StackValue::TimestampColumnRef(index))
+                        | Some(StackValue::NumericColumnRef(index)) => {
                             match row_scalars.get(*index) {
                                 Some(Some(_)) => false,
                                 Some(None) => true,
@@ -824,6 +851,10 @@ impl ExprProgram {
                     scratch.push(StackValue::TimestampColumnRef(*index));
                     pc += 1;
                 }
+                ExprStep::PushNumericColumn(index) => {
+                    scratch.push(StackValue::NumericColumnRef(*index));
+                    pc += 1;
+                }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();
                     if scratch.len() < arity {
@@ -870,40 +901,44 @@ impl ExprProgram {
                 ExprStep::WasmCall { backend } => {
                     let scalar_val = scratch.pop().ok_or_else(stack_underflow)?;
                     let vector_val = scratch.pop().ok_or_else(stack_underflow)?;
+                    // Issue #1075・TABLE-16 ポインタ: `scalar_val` は数値列参照
+                    // （`StackValue::NumericColumnRef`）でもありうるようになった
+                    // （`CHECK` の式述語束縛が `ColumnRef` を `ExprType::Scalar`
+                    // として束縛するため、静的型検査は WASM UDF の scalar 引数
+                    // としても数値列参照を通す）。マーカーのままでは NULL 判定も
+                    // 値の取り出しもできないため、`stack_to_expr_value` で
+                    // 行スカラービューから実値へ解決してから判定する
+                    // （`vector_val` は WASM ABI 上 Vector 型としてしか束縛
+                    // されず列参照マーカーになりえないが、対称に同じ経路で
+                    // 解決する）。
+                    let vector_ev = stack_to_expr_value(vector_val, embedding, row_scalars)?;
+                    let scalar_ev = stack_to_expr_value(scalar_val, embedding, row_scalars)?;
                     // WASM UDF は RETURNS NULL ON NULL INPUT（対象ビヘイビア:
                     // SQL-26。Issue #921）。いずれかが NULL ならバックエンドを
                     // 呼ばず NULL を積む（`sql::udf_call::eval` の `WasmCall`
                     // 分岐と同じ契約）。
-                    let vector_is_null = matches!(&vector_val, StackValue::Null);
-                    let scalar_is_null = matches!(&scalar_val, StackValue::Null);
+                    let vector_is_null = matches!(vector_ev, ExprValue::Null);
+                    let scalar_is_null = matches!(scalar_ev, ExprValue::Null);
                     if vector_is_null || scalar_is_null {
                         scratch.push(StackValue::Null);
                     } else {
-                        let v = match vector_val {
-                            StackValue::VectorRef => Cow::Borrowed(embedding),
-                            StackValue::VectorOwned(v) => Cow::Owned(v),
-                            StackValue::Scalar(_)
-                            | StackValue::Bool(_)
-                            | StackValue::Null
-                            | StackValue::Text(_)
-                            | StackValue::TextColumnRef(_)
-                            | StackValue::Date(_)
-                            | StackValue::Timestamp(_)
-                            | StackValue::DateColumnRef(_)
-                            | StackValue::TimestampColumnRef(_) => return Err(type_mismatch()),
+                        let v = match vector_ev {
+                            ExprValue::Vector(v) => v,
+                            ExprValue::Scalar(_)
+                            | ExprValue::Bool(_)
+                            | ExprValue::Null
+                            | ExprValue::Text(_)
+                            | ExprValue::Date(_)
+                            | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
-                        let s = match scalar_val {
-                            StackValue::Scalar(s) => s,
-                            StackValue::Bool(_)
-                            | StackValue::VectorRef
-                            | StackValue::VectorOwned(_)
-                            | StackValue::Null
-                            | StackValue::Text(_)
-                            | StackValue::TextColumnRef(_)
-                            | StackValue::Date(_)
-                            | StackValue::Timestamp(_)
-                            | StackValue::DateColumnRef(_)
-                            | StackValue::TimestampColumnRef(_) => return Err(type_mismatch()),
+                        let s = match scalar_ev {
+                            ExprValue::Scalar(s) => s,
+                            ExprValue::Bool(_)
+                            | ExprValue::Vector(_)
+                            | ExprValue::Null
+                            | ExprValue::Text(_)
+                            | ExprValue::Date(_)
+                            | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
                         // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
                         // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
@@ -1420,5 +1455,58 @@ mod tests {
             .eval(1, &[], &[], &mut scratch)
             .unwrap_err();
         assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// [`BoundExpr::ColumnRef`]（Issue #1075・TABLE-16 ポインタ。`CHECK` 制約の
+    /// 式述語束縛でのみ生成される数値列参照）の差分テスト: コンパイル実行
+    /// （`ExprProgram::eval`）と再帰参照実装（`udf_call::eval_with_scalars`）が
+    /// 同じ結果を返すことを、`Some`（数値）／`Some(None)`（NULL）／算術との
+    /// 組み合わせで固定する。
+    #[test]
+    fn numeric_column_ref_matches_recursive_eval_with_scalars() {
+        use crate::row_codec::ScalarRef;
+
+        fn assert_matches_recursive_eval_with_scalars<'a>(
+            expr: &BoundExpr,
+            id: u64,
+            embedding: &'a [f32],
+            row_scalars: &'a [Option<ScalarRef<'a>>],
+        ) {
+            let program = ExprProgram::compile(expr);
+            let mut scratch = Vec::new();
+            let compiled = program.eval(id, embedding, row_scalars, &mut scratch);
+            let recursive = udf_call::eval_with_scalars(expr, id, embedding, row_scalars);
+            match (compiled, recursive) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "compiled/recursive eval diverged"),
+                (Err(_), Err(_)) => {}
+                (a, b) => panic!("compiled={a:?} recursive={b:?} diverged in Ok/Err"),
+            }
+        }
+
+        let column_ref = BoundExpr::ColumnRef { index: 0 };
+        assert_matches_recursive_eval_with_scalars(
+            &column_ref,
+            1,
+            &[],
+            &[Some(ScalarRef::Integer(5))],
+        );
+        assert_matches_recursive_eval_with_scalars(&column_ref, 1, &[], &[None]);
+        assert_matches_recursive_eval_with_scalars(
+            &column_ref,
+            1,
+            &[],
+            &[Some(ScalarRef::BigInt((1i64 << 53) + 1))],
+        );
+
+        // 算術との組み合わせ（`qty + 1 > 0` 相当）。NULL 列は `Binary` の評価
+        // ステップまで到達させ、比較全体が UNKNOWN（NULL）へ伝播することを
+        // 固定する。
+        let expr = bin(
+            BinOp::Gt,
+            bin(BinOp::Add, BoundExpr::ColumnRef { index: 0 }, num(1.0)),
+            num(0.0),
+        );
+        assert_matches_recursive_eval_with_scalars(&expr, 1, &[], &[Some(ScalarRef::Integer(-1))]);
+        assert_matches_recursive_eval_with_scalars(&expr, 1, &[], &[None]);
     }
 }

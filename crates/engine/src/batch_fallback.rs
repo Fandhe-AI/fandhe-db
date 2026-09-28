@@ -271,7 +271,10 @@ pub struct StderrFallbackObserver;
 
 impl FallbackObserver for StderrFallbackObserver {
     fn on_fallback(&self, event: FallbackEvent) {
-        eprintln!("{event}");
+        // 診断ログの書き込み失敗（読み手が閉じた後の `EPIPE` 等）はプロセスを
+        // 落とさない（RECOVER-8 の例外、Issue #1081。
+        // `docs/design/stderr-log-write-failure.md`）。
+        crate::log_stderr!("{event}");
     }
 }
 

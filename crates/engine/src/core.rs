@@ -3378,7 +3378,7 @@ impl EngineCore {
                             self.ledger_mode,
                             Some(&schema),
                         )?;
-                        txn.mark_written(&stmt.table_name);
+                        txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                         Ok(crate::sql::SqlOutcome::Insert(outcome))
                     }
                     // 複数行 `VALUES`・ファイル形・`ON CONFLICT`（UPSERT）は
@@ -3399,7 +3399,7 @@ impl EngineCore {
                     stmt,
                     self.ledger_mode,
                 )?;
-                txn.mark_written(&stmt.table_name);
+                txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
             ParsedSql::Statement(

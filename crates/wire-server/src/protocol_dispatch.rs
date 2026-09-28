@@ -96,7 +96,7 @@ pub(crate) fn reject_and_close<S: WireStream>(
 ) -> io::Result<()> {
     // 受信ペイロード・ユーザー名は出さず、分類名と型バイト（固定集合の1文字）のみ
     // ログに残す（P0: テナント情報・存在情報を漏らさない）。
-    eprintln!(
+    engine::log_stderr!(
         "wire-server: post-auth rejecting unsupported message ({})",
         describe_kind(kind)
     );
