@@ -158,13 +158,25 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // codex-review 指摘対応（PR #1147。v11 `fk:` 行フィールド数コメント訂正）で
     // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 5656）。Issue #1065
     // （索引宣言を ScalarIndex・HNSW 索引の構築対象へ反映。PR #1124）との
-    // base（main）取り込みマージで再度追随。Issue #1066（`EXPLAIN` の
-    // scalar_plan／ann_plan への使用索引名露出。`explain_index_names_in_txn`・
-    // `TableIndexDecls` 追加で `catalog.rs` 冒頭側に行が追加され、再度追随
-    // （旧: 5938）。Issue #1154（索引カタログ専用世代カウンタの追加）との
+    // base（main）取り込みマージで再度追随。
+    // Issue #1069（ALTER TABLE ADD/DROP CONSTRAINT FOREIGN KEY。`catalog.rs`
+    // 冒頭側に行が追加され、再度追随）で再度追随。Issue #1071（`FOREIGN KEY`
+    // 参照整合性検査の索引化）との base（main）取り込みマージ統合で
+    // `catalog.rs` 冒頭側にさらに行が追加され、再度追随（旧: 6589）。
+    // PR #1156 レビュー対応（Issue #1069。`alter_table_add_named_unique_constraint`
+    // の明示名衝突検査に FOREIGN KEY 名を追加。ドキュメンテーションコメント
+    // 拡充で `catalog.rs` 冒頭側に 7 行追加され、再度追随（旧: 6639）。
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
     // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
-    // 再度追随（旧: 6046）。
-    ("catalog.rs", 6120),
+    // 再度追随（旧: 6646）。
+    // PR #1156 レビュー対応（Issue #1069・#1071。codex P2 指摘・スレッド
+    // `PRRT_kwDOUAKASM6muWhg` への対応で `required_key_index_names_in_txn`
+    // のドキュメンテーションコメントを拡充し `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6720）。
+    // Issue #1066（`EXPLAIN` の scalar_plan／ann_plan への使用索引名
+    // 露出。PR #1155）との base（main）取り込みマージで `catalog.rs`
+    // 冒頭側に行が追加され、再度追随（旧: 6722）。
+    ("catalog.rs", 6780),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -199,11 +211,24 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
     // 変化）で再度追随（旧: 5735）。codex-review 指摘対応（同上）で再度追随
     // （旧: 5743）。Issue #1065（同上）との base（main）取り込みマージで
-    // 再度追随。Issue #1066（同上。`explain_index_names_in_txn` 追加）で
-    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 6017）。Issue #1154
-    // （同上）との base（main）取り込みマージで `catalog.rs` 冒頭側に行が
-    // 追加され、再度追随（旧: 6125）。
-    ("catalog.rs", 6199),
+    // 再度追随。
+    // Issue #1069（同上。`catalog.rs` 冒頭側に行が追加され、再度追随）で
+    // 再度追随。Issue #1071（同上。`Storage::drop_table` への `key_index`
+    // 削除呼び出し追加）との base（main）取り込みマージ統合で `catalog.rs`
+    // 冒頭側にさらに行が追加され、再度追随（旧: 6668）。
+    // PR #1156 レビュー対応（同上。`catalog.rs` 冒頭側に 7 行追加され、
+    // 再度追随（旧: 6718）。
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6725）。
+    // PR #1156 レビュー対応（Issue #1069・#1071。codex P2 指摘・スレッド
+    // `PRRT_kwDOUAKASM6muWhg` への対応で `required_key_index_names_in_txn`
+    // のドキュメンテーションコメントを拡充し `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6799）。
+    // Issue #1066（`EXPLAIN` の scalar_plan／ann_plan への使用索引名
+    // 露出。PR #1155）との base（main）取り込みマージで `catalog.rs`
+    // 冒頭側に行が追加され、再度追随（旧: 6801）。
+    ("catalog.rs", 6859),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -230,11 +255,24 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
     // 変化）で再度追随（旧: 5816）。codex-review 指摘対応（同上）で再度追随
     // （旧: 5824）。Issue #1065（同上）との base（main）取り込みマージで
-    // 再度追随。Issue #1066（同上。`explain_index_names_in_txn` 追加）で
-    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 6098）。Issue #1154
-    // （同上）との base（main）取り込みマージで `catalog.rs` 冒頭側に行が
-    // 追加され、再度追随（旧: 6206）。
-    ("catalog.rs", 6280),
+    // 再度追随。
+    // Issue #1069（同上。`catalog.rs` 冒頭側に行が追加され、再度追随）で
+    // 再度追随。Issue #1071（同上。`Storage::drop_table` への `key_index`
+    // 削除呼び出し追加）との base（main）取り込みマージ統合で `catalog.rs`
+    // 冒頭側にさらに行が追加され、再度追随（旧: 6749）。
+    // PR #1156 レビュー対応（同上。`catalog.rs` 冒頭側に 7 行追加され、
+    // 再度追随（旧: 6799）。
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6806）。
+    // PR #1156 レビュー対応（Issue #1069・#1071。codex P2 指摘・スレッド
+    // `PRRT_kwDOUAKASM6muWhg` への対応で `required_key_index_names_in_txn`
+    // のドキュメンテーションコメントを拡充し `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6880）。
+    // Issue #1066（`EXPLAIN` の scalar_plan／ann_plan への使用索引名
+    // 露出。PR #1155）との base（main）取り込みマージで `catalog.rs`
+    // 冒頭側に行が追加され、再度追随（旧: 6882）。
+    ("catalog.rs", 6940),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -266,11 +304,24 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
     // 変化）で再度追随（旧: 5849）。codex-review 指摘対応（同上）で再度追随
     // （旧: 5857）。Issue #1065（同上）との base（main）取り込みマージで
-    // 再度追随。Issue #1066（同上。`explain_index_names_in_txn` 追加）で
-    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 6131）。Issue #1154
-    // （同上）との base（main）取り込みマージで `catalog.rs` 冒頭側に行が
-    // 追加され、再度追随（旧: 6239）。
-    ("catalog.rs", 6313),
+    // 再度追随。
+    // Issue #1069（同上。`catalog.rs` 冒頭側に行が追加され、再度追随）で
+    // 再度追随。Issue #1071（同上。`Storage::drop_table` への `key_index`
+    // 削除呼び出し追加）との base（main）取り込みマージ統合で `catalog.rs`
+    // 冒頭側にさらに行が追加され、再度追随（旧: 6782）。
+    // PR #1156 レビュー対応（同上。`catalog.rs` 冒頭側に 7 行追加され、
+    // 再度追随（旧: 6832）。
+    // Issue #1154（索引カタログ専用世代カウンタの追加。PR #1159）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6839）。
+    // PR #1156 レビュー対応（Issue #1069・#1071。codex P2 指摘・スレッド
+    // `PRRT_kwDOUAKASM6muWhg` への対応で `required_key_index_names_in_txn`
+    // のドキュメンテーションコメントを拡充し `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6913）。
+    // Issue #1066（`EXPLAIN` の scalar_plan／ann_plan への使用索引名
+    // 露出。PR #1155）との base（main）取り込みマージで `catalog.rs`
+    // 冒頭側に行が追加され、再度追随（旧: 6915）。
+    ("catalog.rs", 6973),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

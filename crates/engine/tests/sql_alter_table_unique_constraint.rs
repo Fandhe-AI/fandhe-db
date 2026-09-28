@@ -304,6 +304,50 @@ fn add_unique_rejects_name_collision_with_existing_check() {
     assert_eq!(err.wire_code(), "42P07");
 }
 
+/// 明示名が既存の FOREIGN KEY 制約名と衝突すれば `42P07`（設計 F1。UNIQUE・
+/// CHECK・FOREIGN KEY はテーブル単位の名前空間を共有する。Cursor Bugbot 指摘・
+/// PR #1156: `alter_table_add_named_unique_constraint` の衝突検査が UNIQUE・
+/// CHECK のみを見ており FOREIGN KEY 名を占有名として扱っていなかったため、
+/// 衝突を検出できず後段の `validate_schema` で `Invalid`（`42601`）に丸められ
+/// 誤ったエラーコードが返っていた）。
+#[test]
+fn add_unique_rejects_name_collision_with_existing_foreign_key() {
+    let (core, path) = new_core("alter-unique-name-collision-fk");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE parents (name TEXT)",
+    )
+    .expect("create parents");
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE docs (a TEXT, parent_id BIGINT)",
+    )
+    .expect("create docs");
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) REFERENCES parents",
+    )
+    .expect("add foreign key");
+
+    let err = exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs ADD CONSTRAINT dup_name UNIQUE (a)",
+    )
+    .expect_err("name shared with a FOREIGN KEY constraint must be rejected");
+    assert_eq!(err.wire_code(), "42P07");
+}
+
 // --- DROP: エラー系 ----------------------------------------------------------
 
 /// 存在しない制約名の `DROP CONSTRAINT` は `42704`。

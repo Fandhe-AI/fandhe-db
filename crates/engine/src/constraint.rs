@@ -1622,6 +1622,72 @@ fn enforce_referencing_rows_by_scan_for_fk(
     verify_required_parent_keys(write_txn, table_name, schema, fk, tenant_id, required)
 }
 
+/// `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY`
+/// （[`crate::catalog::Storage::alter_table_add_foreign_key`]。TABLE-22・
+/// TASK-233、Issue #1069）が名前確定・参照先解決を終えた新しい FK 宣言 `fk`
+/// を、対象テーブルの write トランザクション内で既存行に対して検証する唯一の
+/// 実装。判定母集合はテナントごとに独立し（RLS-9・RLS-10 (c)）、あるテナントの
+/// 子行はそのテナントの親行だけで満たされることを要求する——他テナントの
+/// 孤児行があっても対象外（全テナント検証であり、可視性を問わない全行が対象）。
+/// 1 行でも違反があれば副作用ゼロで `Err(TenantWriteError::ForeignKeyViolation)`
+/// を返し、呼び出し元は write_txn を commit しない（fail-closed）。
+///
+/// `fk` は**更新後の子スキーマ `child_schema.foreign_keys` に実際に含まれる
+/// インスタンスそのもの**を渡すこと（[`enforce_referencing_rows_by_scan_for_fk`]
+/// は `foreign_key_specs(child_schema)` から `==`（名前を含む完全一致。
+/// `ForeignKeyDef` の `PartialEq` 導出）で対応する仕様を探すため、パース直後の
+/// 未解決・未命名インスタンスを渡すと「見つからない」内部エラーになる）。
+///
+/// テナント集合は子の行ストアを 1 回走査して求める（上限は設けない。設計
+/// `alter_table_add_unique_constraint` と同じトレードオフ——全テナントの全行
+/// 走査は DDL 級のコストとして許容する）。行ストア未作成（既存行 0 件）は
+/// 検査対象なしとして即座に成功する。
+pub(crate) fn verify_new_foreign_key_all_tenants_in_txn(
+    write_txn: &redb::WriteTransaction,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+) -> Result<(), TenantWriteError> {
+    let mut tenants: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    {
+        let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+        let row_table =
+            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+                Ok(t) => t,
+                // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => {
+                    return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                        e,
+                    )))
+                }
+            };
+        for entry in row_table.iter().map_err(CatalogError::from)? {
+            let (k, _v) = entry.map_err(CatalogError::from)?;
+            let (tenant, _id) = k.value();
+            tenants.insert(tenant.to_string());
+        }
+        // `row_table` のハンドルはこのブロックを抜けると解放される
+        // （`enforce_referencing_rows_by_scan_for_fk` が自己参照〔`parent_table
+        // == child_schema.name`〕で同じテーブルを開き直すため、`redb` の
+        // `TableAlreadyOpen` を避ける。モジュール doc・
+        // `verify_new_foreign_key_all_tenants_in_txn` の呼び出し元
+        // ドキュメント参照）。
+    }
+    for tenant_id in &tenants {
+        enforce_referencing_rows_by_scan_for_fk(
+            write_txn,
+            parent_table,
+            parent_schema,
+            child_schema,
+            fk,
+            tenant_id,
+        )?;
+    }
+    Ok(())
+}
+
 /// `table_name`（スキーマ `schema`）を親とする各 `FOREIGN KEY`（`id` 参照を除く。
 /// `id` 参照は索引を使わない物理キーの点照会のため対象外）について、参照先列
 /// （`fk.parent_columns()`）の索引をテナント `tenant_id` の**現在（まだ何も

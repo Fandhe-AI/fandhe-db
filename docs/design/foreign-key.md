@@ -23,14 +23,14 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | D2 | 参照先列の省略（`REFERENCES <t>`）は参照先の主キー、未宣言なら `id` へ解決し、解決済みの列名をカタログへ永続化する | PostgreSQL と同じ規約。解決結果を永続化することで、後から参照先が変わっても宣言の意味が変わらない |
 | D3 | 参照元列と参照先列の型は位置ごとに一致すること（型タグ＋パラメータ。ENUM は型名を含む）。`id` 参照の参照元列は `INTEGER`／`BIGINT`。不一致は `42830` | 参照先の照合を一意性検査と同じ型タグ付き正準キーで行うため、型が異なる組は常に違反になる（黙って常に失敗する宣言を受理しない） |
 | D4 | SQL 表層 `CREATE TABLE` の列型へ `INTEGER`／`BIGINT` を追加（`NOT NULL`／`DEFAULT <数値>`／`UNIQUE`／`PRIMARY KEY` も受理） | `id` を参照する参照元列を SQL で宣言するための最小限の前提整備 |
-| D5 | ~~参照動作は既定の `NO ACTION` のみ~~（Issue #1076 で改訂。D16〜参照）。`CONSTRAINT <name>` 前置は引き続き `42601`。`MATCH`（D13）・遅延属性（D14）は Issue #1077 で受理するようになった | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
+| D5 | ~~参照動作は既定の `NO ACTION` のみ~~（Issue #1076 で改訂。D16〜参照）。`MATCH`（D13）・遅延属性（D14）は Issue #1077 で受理するようになった。表制約 `CONSTRAINT <name> FOREIGN KEY (...)` 前置は Issue #1069 で受理するようになった（列制約 `<col> ... CONSTRAINT <n> REFERENCES` は引き続き `42601`。詳細は [alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md) F6 参照） | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
 | D6 | `MATCH SIMPLE`（既定）は NULL を含む値の組を検査しない。`MATCH FULL`（D13）は全 NULL の組のみ検査しない | PostgreSQL の既定 |
 | D7 | 検査は文単位・即時。台帳記録・行の書き込みの**後**、テーブル世代 bump・commit の**前**に同一 write トランザクション内で行う | 既存の制約検査（TABLE-16）と同じ位置。`operation_id` の再送判定（`23505`／`22023`）が本検査より優先される |
-| D8 | 自己参照を受理する。循環参照は `CREATE TABLE` の時点で参照先が存在する必要があり、`ALTER TABLE ... ADD FOREIGN KEY` を持たないため、自己参照以外の循環は構造的に作れない | 自己参照は参照元＝参照先のスキーマで解決・検査でき、特別な経路を要さない |
+| D8 | 自己参照を受理する。~~循環参照は `CREATE TABLE` の時点で参照先が存在する必要があり、`ALTER TABLE ... ADD FOREIGN KEY` を持たないため、自己参照以外の循環は構造的に作れない~~（Issue #1069 で `ALTER TABLE ... ADD FOREIGN KEY` を追加したため、自己参照以外の循環〔A↔B〕も後から作成できるようになった。循環した両テーブルの `DROP TABLE` はどちらも `2BP01` になり、先に `DROP CONSTRAINT` が必要。詳細は [alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md) F9 参照） | 自己参照は参照元＝参照先のスキーマで解決・検査でき、特別な経路を要さない |
 | D9 | 参照先名がビュー・索引名なら `42809`、存在しなければ `42P01`。作成対象名の重複（`42P07`）はそれらより先に判定する | テーブル・ビュー・索引は名前空間を共有する（`CREATE TABLE` の既存判定と同じ順序） |
 | D10 | 参照先テーブルの `DROP TABLE` は他テーブルから参照されていれば `2BP01`（データの有無を問わずカタログのみで判定）。自己参照は依存に数えない | TABLE-15 |
 | D11 | 参照元列の `DROP COLUMN` は `DependentObjectsStillExist` で拒否。参照先側の列は主キー・UNIQUE 構成列（既存の検査で拒否済み）か `id`（予約列）に限られる | 制約を黙って消す暗黙 cascade を作らない（`DROP COLUMN` の話。UNIQUE 制約自体の明示 `DROP CONSTRAINT` は Issue #1067 で追加済みで、参照されている UNIQUE の DROP は `2BP01` で拒否する。詳細は [alter-table-unique-constraint.md](./alter-table-unique-constraint.md) D7 参照） |
-| D12 | 宣言面は SQL 表層の `CREATE TABLE` のみ（`ALTER TABLE ... ADD COLUMN ... REFERENCES` は `42601`）。Rust API の `TableSchema::with_foreign_keys` は `pub(crate)` | 後付けの宣言は既存の全テナント行の検証を要し別設計になる |
+| D12 | 宣言面は SQL 表層の `CREATE TABLE` に加え、Issue #1069 で `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY` を追加した（既存行の全テナント検証を伴う。詳細は [alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md) F7 参照）。`ALTER TABLE ... ADD COLUMN ... REFERENCES` は引き続き `42601`。Rust API の `TableSchema::with_foreign_keys` は `pub(crate)`。新設 `Storage::alter_table_add_foreign_key` も `pub(crate)`（宣言面は SQL 表層のみ） | 後付けの宣言は既存の全テナント行の検証を要するため、別途 Issue #1069 で設計した |
 | D13 | `MATCH {SIMPLE\|FULL}`（既定 `SIMPLE`）を受理する。`MATCH FULL` は複合 FK で NULL と非 NULL が混在する組を違反にする（単一列は `SIMPLE` と同じ挙動）。`MATCH PARTIAL` は非対応のまま `42601` | PostgreSQL の 3 値のうち実装コストに見合う 2 値のみを対象にする |
 | D14 | `[NOT] DEFERRABLE`／`INITIALLY {DEFERRED\|IMMEDIATE}`（任意順・各グループ高々 1 回）を受理する。`INITIALLY DEFERRED` の宣言だけが、明示トランザクション中の文単位検査を COMMIT まで遅延できる。`SET CONSTRAINTS`（`DEFERRABLE INITIALLY IMMEDIATE` を実行時に遅延へ切り替える機能）は非対応のため、`DEFERRABLE`（`INITIALLY IMMEDIATE` 相当）は文単位検査のまま変わらない | `SET CONSTRAINTS` 抜きでも `INITIALLY DEFERRED` だけで自己参照・相互参照する初期データ投入のユースケースをカバーできる |
 | D15 | 遅延は「検査しない」ことを意味しない。autocommit（1 文＝1 トランザクション）は宣言に関わらず必ず文単位で検査する。省略できるのは明示トランザクション中の `INITIALLY DEFERRED` の文単位検査だけで、COMMIT 時にまとめて検査する（下記「COMMIT 時の遅延検査」節） | 「遅延」を「検査省略」と混同すると、autocommit や `SET CONSTRAINTS` 相当の切り替えが無い経路で fail-open になる |
@@ -69,8 +69,9 @@ CREATE TABLE <table> (
 <遅延属性> ::= [NOT] DEFERRABLE | INITIALLY (DEFERRED | IMMEDIATE)
 ```
 
-`SET NULL`／`SET DEFAULT` の列リスト形（`SET NULL (col, ...)`）・
-`CONSTRAINT <name>` 前置は未実装のまま `42601`（D16）。
+`SET NULL`／`SET DEFAULT` の列リスト形（`SET NULL (col, ...)`）は未実装のまま
+`42601`（D16）。表制約 `CONSTRAINT <name> FOREIGN KEY (...)` 前置は Issue #1069
+で受理するようになった（D5 参照）。
 
 - 列制約 `REFERENCES` は `PRIMARY KEY` の後ろ・`CHECK` の前に高々 1 個置ける。
 - 表制約は列リスト中の任意の位置に置ける（列数上限の判定対象外。`PRIMARY KEY`／
@@ -398,10 +399,10 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
 
 ## 対象外・後続候補
 
-- `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要。
-  着手時は `key_index::ensure_index_in_txn`／`drop_indexes_for_table_in_txn` を
-  流用できる）
-- 制約名（`CONSTRAINT <name> FOREIGN KEY`）
+- ~~`ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`・制約名
+  （`CONSTRAINT <name> FOREIGN KEY`）~~（Issue #1069 で実装済み。詳細は
+  [alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md)
+  参照）
 - `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`（列リスト形。Issue #1076）
 - `TRUNCATE ... CASCADE`（`TRUNCATE` 自体は参照アクションを発火させない。D18）
 - `RESTRICT` を `NO ACTION` と区別して永続化し即時検査すること（現状は両方とも
