@@ -51,38 +51,53 @@ write トランザクション内で、`encode_schema` の内部（＝ `validate
 の制約を組み立てるだけで、`validate_schema` は空名を拒否する（確定処理が
 漏れた経路は encode 時点で fail-closed に落ちる）。
 
-### D3. カタログ v9（名前付き UNIQUE の永続化）
+### D3. カタログ v10／v11（名前付き UNIQUE の永続化）
 
-v9 は v8 の上位集合（`cols:` → `pk:` → 6 フィールド列行 → `uniq:<n>`〔v9 は
+**互換性契約（Issue #1147・codex-review／Cursor Bugbot 指摘で判明）**: `v9` は
+既に Issue #1077（`FOREIGN KEY` の `MATCH`／遅延属性オプション）でリリース済み
+のフォーマットであり、main 上に既に `v9` バイト列を持つカタログが存在しうる。
+UNIQUE 制約名の永続化は `v9` の意味を再定義せず、未使用の `v10`／`v11` を新設
+して読み書きする（旧 `v9` バイト列〔無名の `U:` 行・`uniq:0` 許容・5 フィールド
+`fk:` 行〕は引き続き #1077 の意味のまま decode できる）。
+
+`v10` は v8 の上位集合（`cols:` → `pk:` → 6 フィールド列行 → `uniq:<n>`〔v10 は
 `n >= 1` 必須〕→ `n` 個の `U:<name>:<col>[,<col>]*` → `checks:<m>`〔0 件可〕→
-`fks:<k>`〔v9 に限り 0 件可〕）。
+`fks:<k>`〔v10 に限り 0 件可。`MATCH`・遅延属性を持たない既定オプション固定の
+3 フィールド `fk:` 行〕）。`FOREIGN KEY` が既定以外の `MATCH`・遅延属性を 1 件
+でも持つ場合は `v11`（v10 と同じ本体に、v9 と同じ 5 フィールド `fk:` 行〔`fks:<k>`
+は v11 に限り `k >= 1` 必須〕を組み合わせたフォーマット）で書く。
 
-**v9 で書くのは、少なくとも 1 つの UNIQUE 制約の実名が、D2 の導出（全 UNIQUE を
-名前未指定とみなして導出した名前）と一致しない場合だけ**（`encode_schema`）。
-それ以外は従来どおり v2〜v8 のバイト列のまま——名前指定なしの `CREATE
-TABLE`／ALTER ADD は導出と一致するため、既存のゴールデンテスト（v2〜v8 の
-固定バイト列アサーション）はすべて無変更で通る。名前の無い旧 v6〜v8 値は
+**v10／v11 で書くのは、少なくとも 1 つの UNIQUE 制約の実名が、D2 の導出（全
+UNIQUE を名前未指定とみなして導出した名前）と一致しない場合だけ**
+（`encode_schema`。FK オプションの有無で v10／v11 のどちらを使うかが決まる）。
+それ以外は従来どおり v2〜v9 のバイト列のまま——名前指定なしの `CREATE
+TABLE`／ALTER ADD は導出と一致するため、既存のゴールデンテスト（v2〜v9 の
+固定バイト列アサーション）はすべて無変更で通る。名前の無い旧 v6〜v9 値は
 decode 時に D2 で名前を導出する。明示名を付けた場合や、DROP で後続の制約の
-導出名がずれた場合のみ v9 で実名を保存し、名前が暗黙に変わることはない。
+導出名がずれた場合のみ v10／v11 で実名を保存し、名前が暗黙に変わることはない。
 
-v9 を知らない旧バイナリは「未知のフォーマットバージョン」として fail-closed
-に拒否する。
+v10／v11 を知らない旧バイナリは「未知のフォーマットバージョン」として
+fail-closed に拒否する。
 
-**v9 追加で更新した箇所**（全部必須。1 箇所でも漏れると fail-open になり得る）:
+**v10／v11 追加で更新した箇所**（全部必須。1 箇所でも漏れると fail-open に
+なり得る）:
 
-- `CATALOG_FORMAT_VERSION_V9` 定数
-- `encode_schema`（実名 vs 導出名の一致判定 → v9 分岐）
+- `CATALOG_FORMAT_VERSION_V10`・`CATALOG_FORMAT_VERSION_V11` 定数（`v9` は
+  #1077 の意味のまま変更しない）
+- `encode_schema`（実名 vs 導出名の一致判定 → v10／v11 分岐。FK オプション
+  有無で v10／v11 を選択）
 - `FormatVersion` と `decode_schema_body`（`pk:`・6 フィールド・`uniq:`〔名前
-  付き〕・`checks:`〔0 可〕・`fks:`〔0 可〕）
+  付き〕・`checks:`〔0 可〕・`fks:`〔v10 は 0 可・v11 は 1 以上必須〕）
 - `parse_unique_section`（`named: bool` 引数を追加し `Vec<(Option<String>,
   Vec<String>)>` を返す。名前の識別子検証・セクション内の名前重複拒否）
-- `parse_foreign_key_section`（`allow_empty: bool` 引数を追加。v9 のみ `k == 0`
-  を許容）
-- `catalog_value_references_enum_type`（軽量パーサー。バージョン表に v9 を
-  追加し `is_v9` を各分岐へ反映）
-- **`referencing_foreign_keys_in_txn`**（`v8_prefix` に加え **`v9_prefix` も
-  候補にする**。v9 を見落とすと、FK を持つテーブルが `DROP TABLE` の `2BP01`
-  判定と、参照先側の書き込み検査から消える fail-open になる）
+- `parse_foreign_key_section`（`allow_empty: bool` 引数を追加。v10 のみ
+  `k == 0` を許容）
+- `catalog_value_references_enum_type`（軽量パーサー。バージョン表に v10・v11
+  を追加し各分岐へ反映。v9 の扱いは変更しない）
+- **`referencing_foreign_keys_in_txn`**（`v8_prefix`・`v9_prefix` に加え
+  **`v10_prefix`・`v11_prefix` も候補にする**。見落とすと、FK を持つテーブルが
+  `DROP TABLE` の `2BP01` 判定と、参照先側の書き込み検査から消える fail-open
+  になる）
 
 ### D4. エラー契約（ERR-6 の既存行だけを使い、新しい wire_code は作らない）
 
@@ -179,9 +194,9 @@ commit せず破棄・副作用ゼロ）→ `encode_schema` → カタログへ�
   慣習名）・FK 依存（`2BP01`。参照されていない UNIQUE は削除できることも
   確認）・DDL 権限（存在オラクルにならないこと）・スコープ外構文の拒否・
   明示トランザクション内の `0A000`・世代 bump による即時反映
-- `crates/engine/src/catalog.rs` 単体テスト: v9 の往復（既存の v2〜v8
-  ゴールデンテストは無変更のまま全通過。`assign_unique_constraint_names`
-  適用後の比較で検証）
+- `crates/engine/src/catalog.rs` 単体テスト: v10・v11 の往復・旧 v9（#1077
+  の意味）の decode 回帰（既存の v2〜v9 ゴールデンテストは無変更のまま全通過。
+  `assign_unique_constraint_names` 適用後の比較で検証）
 - `crates/engine/tests/table17_foreign_key.rs`・`unique_constraint.rs`: 既存
   回帰がすべて無変更で通ることを確認済み
 
