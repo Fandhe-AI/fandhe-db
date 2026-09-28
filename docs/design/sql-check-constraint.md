@@ -92,18 +92,31 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   時にも拒否するため実際には到達しない。評価の途中で生じる非有限値
   （オーバーフロー）・0 除算（例: `CHECK (100 / qty > 1)` で `qty = 0`）は、
   既存の評価器契約どおり `Err` になり、`TenantWriteError::
-  CheckEvaluationFailed`（`XX000`、詳細はクライアントへ返さない）で書き込みを
-  拒否する（違反〔`23514`〕に丸めない・黙って通過もさせない）。
+  CheckEvaluationFailed`（詳細はクライアントへ返さない）で書き込みを拒否する
+  （違反〔`23514`〕に丸めない・黙って通過もさせない）。**オーナー判断
+  （2026-09-28・Issue #1075）**: `wire_code` は `XX000` 固定ではなく、通常の
+  式評価（`WHERE`／`SELECT` と共有する `sql::expr_program::ExprProgram`・
+  `sql::udf_call::apply_scalar_op`）と同じ分類で返す（0 除算・非有限値は
+  現行の `SqlSurfaceError::InvalidInput` すなわち `22000`）。旧実装は
+  `sql::check_constraint::CompiledChecks::enforce` が評価エラーの種別を
+  区別せず一律 `XX000` へ丸めていたため是正した（D4 参照）。PostgreSQL と
+  同様、CHECK 評価中のエラーは制約違反ではなく式評価エラーとして扱う。
 - **精度**: `BIGINT` の絶対値が `2^53` を超える値は `f64` で正確に表現できない
-  ため `XX000` で拒否する（`id`（`id_as_finite_scalar`）と同じ境界。黙って
-  丸めて誤った判定をしない）。`INTEGER`／`REAL` は `f64` で常に正確に表現
-  できる。
+  ため拒否する（`id`（`id_as_finite_scalar`）と同じ境界。黙って丸めて誤った
+  判定をしない）。これも上記オーナー判断により `wire_code` は通常の式評価と
+  同じ `22000`（`sql::udf_call::numeric_scalar_from_ref` の
+  `SqlSurfaceError::InvalidInput`）になる。`INTEGER`／`REAL` は `f64` で常に
+  正確に表現できる。
 - **既知の PostgreSQL との相違**（記録のみ）: 算術は `f64` で行うため `/` は
   整数の切り捨て除算にならない。`REAL` と小数リテラルの比較は `f32` を
   `f64` へ昇格した値で行う。単項マイナスがないため `CHECK (qty > -1)` は
   `42601` になり、`CHECK (qty > 0 - 1)` なら受理される。
-- **エラーコード**: 新しい variant も写像変更もない。SQL-26（`docs/spec/
-  04-behavior/sql-surface.md`）の `22012`/`22003` 化は対象外（後続課題）。
+- **エラーコード**: 新しい variant は追加していない（`SqlSurfaceError` を
+  `TenantWriteError::CheckEvaluationFailed` がそのまま透過するのみ）。SQL-26
+  （`docs/spec/04-behavior/sql-surface.md`）が別途改訂中の `22012` 新設
+  （0 除算専用コードへの分離）は、`WHERE`／`SELECT` を含む横断変更であり
+  本 PR のスコープ外（後続課題。現状の通常式評価が `22000` のままのため、
+  CHECK もそれに追随した）。
 
 ## D2. 永続化（カタログ v7）
 
@@ -193,8 +206,14 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 
 - `ErrorClass::CheckViolation`（`23514`。main〔#908 の索引 DDL を含む〕統合後の分類数 30 → 31）。
 - `TenantWriteError::CheckViolation { constraint }` → `23514`。
-  `TenantWriteError::CheckEvaluationFailed`（式評価自体の失敗。0 除算等） →
-  `XX000`（内部事象。値・詳細はクライアントへ渡さない）。
+  `TenantWriteError::CheckEvaluationFailed(SqlSurfaceError)`（式評価自体の
+  失敗。0 除算・`BIGINT` 精度超過等）→ **オーナー判断（2026-09-28・
+  Issue #1075）で是正**: 内側に保持する `SqlSurfaceError`（`CompiledChecks::
+  enforce` が `ExprProgram::eval` から受け取った値）をそのまま
+  `error_class()`／`wire_code()` へ委譲する。旧実装は variant がエラー種別を
+  保持せず一律 `XX000` へ丸めていた（値・詳細をクライアントへ渡さない契約
+  自体は維持。`SqlSurfaceError::client_message()` が `Internal` を固定文言
+  へ丸める既存の redaction 契約をそのまま使う）。
 - `SqlSurfaceError::CheckViolation { constraint }` → `23514`
   （`sql::exec::map_write_error`・ファイル形 INSERT 用の `map_incremental_error`
   に写像アームを追加）。
@@ -292,5 +311,7 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   UPDATE・述語つき UPDATE・ファイル形 INSERT・COPY FROM・明示トランザクション・
   Rust API の生 `RowInput` 経路で `23514`・副作用ゼロ・台帳再送成功・永続化
   再オープン・CHECK と UNIQUE の評価順・曖昧な列定義の拒否・数値列 CHECK の
-  宣言/永続化/再オープン後の継続検査・NULL 通過・0 除算の `XX000`・
-  `DROP COLUMN` 依存拒否・`WHERE` 側の既存拒否の非回帰を固定）。
+  宣言/永続化/再オープン後の継続検査・NULL 通過・0 除算（INSERT・UPDATE・
+  `ON CONFLICT DO UPDATE` の各経路で通常の式評価と同じ `22000`。オーナー
+  判断 2026-09-28・Issue #1075）・`DROP COLUMN` 依存拒否・`WHERE` 側の
+  既存拒否の非回帰を固定）。

@@ -346,7 +346,7 @@ pub(crate) fn handle_connection_with<S: WireStream, H: RequestHandler>(
         Err(_panic_payload) => {
             // panic payload（`Any`）はログ・応答のいずれにも出さない（内部詳細の
             // 非漏えい。P0）。固定文言の 1 行ログのみ残す。
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: http connection handler panicked; responding with a fixed internal error and closing"
             );
             let bytes = response::encode_error(
@@ -872,10 +872,11 @@ fn frame_error_bytes(err: &FrameError) -> Vec<u8> {
 /// bounds"`）であり、ワイヤへ送る `message` フィールドには使わない。
 /// [`frame_error_bytes`] が `FrameError::client_message()` の空文字を
 /// 汎用文言 `"invalid request"` へ縮退させているのと同じ契約に揃え、
-/// 実装内部の検証境界名を常にログ専用（`eprintln!`）に留めてクライアント
+/// 実装内部の検証境界名を常にログ専用（`engine::log_stderr!`。RECOVER-8 の
+/// 例外で書き込み失敗を無視する。Issue #1081）に留めてクライアント
 /// へは固定の汎用文言のみを返す。
 fn protocol_violation_bytes(reason: &str) -> Vec<u8> {
-    eprintln!("wire-server: http protocol violation: {reason}");
+    engine::log_stderr!("wire-server: http protocol violation: {reason}");
     response::encode_error(
         ErrorClass::ProtocolViolation,
         "invalid request",

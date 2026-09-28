@@ -129,9 +129,8 @@ fn default_build_rejects_fault_inject_flag_as_unknown_argument() {
 #[cfg(feature = "fault-injection")]
 mod armed {
     use super::TempFixtureDir;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{Read, Write};
     use std::process::{Child, Command, Stdio};
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -189,56 +188,6 @@ mod armed {
         format!(
             "INSERT INTO docs (id, embedding) VALUES ({id}, '[0.1,0.2,0.3]') USING OPERATION_ID '{op_id}'"
         )
-    }
-
-    /// 子プロセスの stderr を読み切り、`listening on <addr>` の行に到達する
-    /// までに観測した全行（トリム済み）と listen アドレスを返す
-    /// （`wire_search_engine_cli.rs::unset_and_default_token_produce_identical_wire_bytes`
-    /// の listen アドレス取得手順を、行の到達順序も検査できるよう拡張した形）。
-    fn wait_for_listening_addr_and_lines(
-        child: &mut Child,
-        timeout: Duration,
-    ) -> (std::net::SocketAddr, Vec<String>) {
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).unwrap_or(0);
-                if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let deadline = Instant::now() + timeout;
-        let mut lines = Vec::new();
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "did not observe listening address within {timeout:?}; lines so far: {lines:?}"
-                );
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    let trimmed = line.trim_end().to_string();
-                    if let Some(idx) = line.find("listening on ") {
-                        let addr_str = line[idx + "listening on ".len()..].trim();
-                        let addr: std::net::SocketAddr =
-                            addr_str.parse().expect("parse listen addr");
-                        lines.push(trimmed);
-                        return (addr, lines);
-                    }
-                    lines.push(trimmed);
-                }
-                Err(_) => panic!(
-                    "stderr channel closed before observing listening address; lines so far: {lines:?}"
-                ),
-            }
-        }
     }
 
     fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
@@ -454,7 +403,8 @@ mod armed {
             .spawn()
             .expect("spawn wire-server");
 
-        let (addr, lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+        let (addr, lines) =
+            common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
         assert!(
             !lines.iter().any(|l| l.contains("fault injection armed")),
             "unarmed process must not announce fault injection; lines={lines:?}"
@@ -482,7 +432,8 @@ mod armed {
         let db_path = fixture.db_path_str();
 
         let mut child = spawn_armed(&fixture);
-        let (addr, lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+        let (addr, lines) =
+            common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
         let armed_idx = lines
             .iter()
             .position(|l| l.contains("fault injection armed"))
@@ -533,7 +484,8 @@ mod armed {
         create_empty_docs_table(&fixture.db_path_str());
 
         let mut child = spawn_armed(&fixture);
-        let (addr, _lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+        let (addr, _lines) =
+            common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
 
         let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 

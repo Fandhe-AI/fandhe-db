@@ -6443,7 +6443,7 @@ impl EngineCore {
         }
     }
 
-    /// SQL 表層の単一 TRUNCATE 文実行エントリポイント（TASK-195、対象ビヘイビア:
+    /// SQL 表層の単一 TRUNCATE 文実行エントリポイント（TASK-193、対象ビヘイビア:
     /// SQL-22）。`execute_insert_sql` と同じ構造（`execute_sql`（TASK-75、SELECT
     /// 専用）とは独立した固有メソッド。`VectorCore` trait への昇格は行わない）。
     ///

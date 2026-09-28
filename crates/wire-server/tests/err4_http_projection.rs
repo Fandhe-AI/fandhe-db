@@ -164,6 +164,31 @@ fn new_core_with_foreign_key() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
+/// `CHECK` 制約付きテーブル（TABLE-16・TASK-204、Issue #906）を持つスローアウェイ
+/// `EngineCore`。NoSQL 表層の DDL 許可リストに `CHECK` 宣言は無い
+/// （`http::query::ddl::CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`）ため、
+/// `new_core_with_foreign_key` と同じ流儀で SQL 表層からテーブルを作る。
+/// 宣言済みテーブルへの NoSQL `insert` は engine の単一検査点
+/// （`constraint::enforce_row_constraints_in_txn`）を通るため、CHECK 違反
+/// （`23514`）・CHECK の式評価エラー（オーナー判断 2026-09-28・Issue #1075）の
+/// いずれも実要求から到達可能になる。
+fn new_core_with_check_constraint() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("err4-http-projection-check");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        "CREATE TABLE checked (qty INTEGER CHECK (100 / qty > 1))",
+    )
+    .expect("check fixture DDL must succeed");
+    (Arc::new(core), guard)
+}
+
 fn spawn(core: Arc<EngineCore>) -> SocketAddr {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core)
@@ -854,6 +879,38 @@ fn err4_f_foreign_key_violation_reachable_via_nosql_delete() {
         br#"{"op":"delete","table":"fk_parent","where":{"id":1},"operation_id":"err4-fk-delete"}"#;
     let resp = query_as_alice(addr, delete_parent);
     assert_projected(&resp, "23503");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16 ポインタ）:
+/// `CHECK` の式評価エラー（0 除算等）は NoSQL `insert` op からも `XX000`（500）
+/// ではなく通常の式評価と同じ `22000`（400）として到達可能であることを固定する
+/// （`engine::sql::check_constraint::CompiledChecks::enforce` →
+/// `TenantWriteError::CheckEvaluationFailed` → `EngineCore::
+/// execute_bound_insert_in_session` → `InsertError::Exec(SqlSurfaceError)` の
+/// 経路。値・テナントを含まない固定文言のまま）。
+#[test]
+fn err4_check_evaluation_failed_reachable_via_nosql_insert_projects_22000_not_xx000() {
+    let (core, _guard) = new_core_with_check_constraint();
+    let addr = spawn(core);
+
+    let body = br#"{"op":"insert","table":"checked","rows":[{"id":1,"qty":0}],"operation_id":"err4-check-eval-insert"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_projected(&resp, "22000");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// 同じフィクスチャで、通常の `CHECK` 違反（式評価は成功し `false` を返す
+/// ケース）は引き続き `23514`（409）のまま変わらないことを固定する（式評価
+/// エラーと制約違反を取り違えない回帰ガード）。
+#[test]
+fn err4_check_violation_reachable_via_nosql_insert_still_projects_23514() {
+    let (core, _guard) = new_core_with_check_constraint();
+    let addr = spawn(core);
+
+    let body = br#"{"op":"insert","table":"checked","rows":[{"id":1,"qty":-1}],"operation_id":"err4-check-violation-insert"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_projected(&resp, "23514");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 

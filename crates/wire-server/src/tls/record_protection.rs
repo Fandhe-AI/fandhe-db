@@ -575,6 +575,67 @@ impl Sealer {
         }
     }
 
+    /// `content` を現在の送信 seq で seal するが、[`RecordCipher::advance`]
+    /// を呼ばずシーケンス番号を消費しない（detached seal）。RECOVER-6
+    /// （緊急応答。Issue #1080）の panic フックが `TlsStream` 越しに
+    /// 緊急応答を送出するため、`tls::stream::TlsStream::
+    /// emergency_response_channel` がクエリ実行前に呼ぶ。
+    ///
+    /// # 不変条件（nonce 再利用の防止）
+    ///
+    /// 返した暗号文は、呼び出し時点でこの `Sealer` が次に使う seq と同じ
+    /// nonce を用いる。したがって「この暗号文」と「呼び出し後に
+    /// [`Sealer::seal`]／[`Sealer::seal_fragmented`] で送信される次の
+    /// 通常レコード」は同じ nonce を共有し、**両方が実際に送出されると
+    /// nonce 再利用（AES-GCM の機密性・完全性が崩れる）になる**。
+    /// 呼び出し元は、この暗号文を送出する経路（panic フック）と通常の
+    /// 送信経路が排他的であること（例: 呼び出しから送出判断までの区間で
+    /// `stream` を `&mut` 排他借用し、その区間の外側でしか通常送信が
+    /// 起きない・かつ両者が競合し得る箇所では必ず abort する）を担保する
+    /// 責務を負う。将来この区間の panic を捕捉して処理を継続する変更を
+    /// 入れると、この不変条件が壊れて nonce 再利用になる。
+    ///
+    /// `Application` epoch でのみ許可する（`Plaintext`／`Handshake` では
+    /// [`ProtectionError::SendContractViolation`]）。
+    pub fn seal_detached(
+        &self,
+        content_type: ContentType,
+        content: &[u8],
+    ) -> Result<Record, ProtectionError> {
+        let cipher = match &self.epoch {
+            Epoch::Application(cipher) => cipher,
+            Epoch::Plaintext | Epoch::Handshake(_) => {
+                return Err(ProtectionError::SendContractViolation);
+            }
+        };
+        match content_type {
+            ContentType::Handshake | ContentType::Alert | ContentType::ApplicationData => {}
+            ContentType::ChangeCipherSpec => {
+                return Err(ProtectionError::ForbiddenInnerType(
+                    ContentType::ChangeCipherSpec.as_u8(),
+                ));
+            }
+        }
+        let mut inner = build_inner_plaintext(content_type, content, 0)?;
+        let ciphertext_and_tag_len = inner
+            .len()
+            .checked_add(TAG_LEN)
+            .ok_or(ProtectionError::InnerOverflow)?;
+        let aad = seal_aad(ciphertext_and_tag_len)?;
+        let nonce = cipher.peek_nonce()?;
+        let sealed = cipher
+            .cipher
+            .seal(&nonce, &aad, &inner)
+            .map_err(ProtectionError::from)?;
+        zeroize(&mut inner);
+        // 意図的に advance() しない（doc の不変条件を参照）。
+        Ok(Record {
+            content_type: ContentType::ApplicationData,
+            legacy_version: record::LEGACY_RECORD_VERSION,
+            fragment: sealed,
+        })
+    }
+
     /// `payload` を [`MAX_INNER_PLAINTEXT_LEN`]（内側 content type 分を
     /// 差し引いた長さ）ごとに分割して seal する（`padding_len` は常に 0）。
     /// 挙動は [`record::fragment_plaintext`] と同じ規則に揃える。
@@ -1391,6 +1452,96 @@ mod tests {
                 Err(ProtectionError::UnexpectedOuterType)
             );
         }
+    }
+
+    // ---- seal_detached（RECOVER-6・Issue #1080） ----
+
+    #[test]
+    fn seal_detached_matches_seal_output_for_same_state() {
+        let keys = dummy_keys(49, 50);
+        let mut sealer = Sealer::new();
+        sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+
+        let detached = sealer
+            .seal_detached(ContentType::ApplicationData, b"emergency")
+            .expect("seal_detached");
+        let sealed = sealer
+            .seal(ContentType::ApplicationData, b"emergency", 0)
+            .expect("seal");
+        // 決定的 AEAD のため、同一状態からの出力は完全一致する。
+        assert_eq!(detached, sealed);
+    }
+
+    #[test]
+    fn seal_detached_does_not_advance_sequence_number() {
+        let keys = dummy_keys(51, 52);
+        let mut sealer = Sealer::new();
+        let mut opener = Opener::new();
+        sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+        opener.install_handshake_keys(&keys).expect("install");
+        opener
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+
+        let _detached = sealer
+            .seal_detached(ContentType::ApplicationData, b"emergency")
+            .expect("seal_detached");
+        // seq が消費されていなければ、続く通常 seal は seq=0 のままで、
+        // 受信側も seq=0 のまま復号に成功する（往復確認）。
+        let record = sealer
+            .seal(ContentType::ApplicationData, b"normal", 0)
+            .expect("seal after detached");
+        let inner = opener.open(&record).expect("open normal record");
+        assert_eq!(inner.content, b"normal");
+    }
+
+    #[test]
+    fn seal_detached_rejects_plaintext_and_handshake_epoch() {
+        let keys = dummy_keys(53, 54);
+        let mut sealer = Sealer::new();
+        assert_eq!(
+            sealer.seal_detached(ContentType::ApplicationData, b"x"),
+            Err(ProtectionError::SendContractViolation)
+        );
+        sealer.install_handshake_keys(&keys).expect("install");
+        assert_eq!(
+            sealer.seal_detached(ContentType::ApplicationData, b"x"),
+            Err(ProtectionError::SendContractViolation)
+        );
+    }
+
+    #[test]
+    fn seal_detached_rejects_oversized_content() {
+        let keys = dummy_keys(55, 56);
+        let mut sealer = Sealer::new();
+        sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+        let oversized = vec![7u8; MAX_INNER_PLAINTEXT_LEN];
+        assert_eq!(
+            sealer.seal_detached(ContentType::ApplicationData, &oversized),
+            Err(ProtectionError::InnerOverflow)
+        );
+    }
+
+    #[test]
+    fn seal_detached_reports_sequence_exhausted_without_panicking() {
+        let keys = dummy_keys(57, 58);
+        let cipher = RecordCipher::with_seq_for_test(&keys, MAX_RECORDS_PER_KEY);
+        let sealer = Sealer {
+            epoch: Epoch::Application(cipher),
+        };
+        assert_eq!(
+            sealer.seal_detached(ContentType::ApplicationData, b"x"),
+            Err(ProtectionError::SequenceExhausted)
+        );
     }
 
     // ---- Debug 秘匿 ----

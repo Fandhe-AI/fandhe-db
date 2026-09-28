@@ -56,10 +56,9 @@ mod common;
 #[path = "http_common/mod.rs"]
 mod http_common;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -89,52 +88,6 @@ fn create_empty_docs_table(db_path: &str) {
     let storage = Storage::open(db_path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
     drop(storage);
-}
-
-/// 子プロセスの stderr を読み切り、`listening on <addr>` の行に到達する
-/// までに観測した全行（トリム済み）と listen アドレスを返す
-/// （`wire_fault_injection_cli.rs::wait_for_listening_addr_and_lines` と同型）。
-fn wait_for_listening_addr_and_lines(
-    child: &mut Child,
-    timeout: Duration,
-) -> (SocketAddr, Vec<String>) {
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + timeout;
-    let mut lines = Vec::new();
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            panic!("did not observe listening address within {timeout:?}; lines so far: {lines:?}");
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) => {
-                let trimmed = line.trim_end().to_string();
-                if let Some(idx) = line.find("listening on ") {
-                    let addr_str = line[idx + "listening on ".len()..].trim();
-                    let addr: SocketAddr = addr_str.parse().expect("parse listen addr");
-                    lines.push(trimmed);
-                    return (addr, lines);
-                }
-                lines.push(trimmed);
-            }
-            Err(_) => panic!(
-                "stderr channel closed before observing listening address; lines so far: {lines:?}"
-            ),
-        }
-    }
 }
 
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
@@ -283,7 +236,8 @@ fn post_commit_panic_during_http_insert_aborts_instead_of_downgrading_to_500() {
         users_path.to_str().expect("utf-8 path"),
         db_path.to_str().expect("utf-8 path"),
     );
-    let (addr, lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+    let (addr, lines) =
+        common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
     assert!(
         lines.iter().any(|l| l.contains("fault injection armed")),
         "expected 'fault injection armed' line before 'listening on'; lines={lines:?}"
@@ -345,7 +299,8 @@ fn feature_build_without_flag_inserts_normally_over_http() {
         .spawn()
         .expect("spawn wire-server");
 
-    let (addr, lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+    let (addr, lines) =
+        common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
     assert!(
         !lines.iter().any(|l| l.contains("fault injection armed")),
         "unarmed process must not announce fault injection; lines={lines:?}"

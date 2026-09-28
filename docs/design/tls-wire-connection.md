@@ -74,16 +74,43 @@ bad_record_mac 終了に対応）で fatal alert を 1 回だけ best-effort 送
 扱い、メッセージ途中なら `FrameError::Truncated`（応答なし）となる。
 失敗状態のため、切断後に `close_notify` や ErrorResponse は送らない。
 
-### 緊急応答（RECOVER-6）との関係・既知の制約
+### 緊急応答（RECOVER-6）との関係（Issue #1080 で実装済み）
 
-`WireStream::emergency_channel` は `None` を返す。
-`engine::recovery::panic_hook::EmergencyResponseRegistration` は生の
-`TcpStream` へ平文の ErrorResponse を書く契約のため、TLS 接続でこれを
-呼ぶと平文バイト列が TLS レコードへ混入してしまう。TLS 接続での
-panic 発生時の緊急応答（RECOVER-6・観測性側）は「応答なしで切断」へ
-縮退する。安全性側の abort ガード（RECOVER-5）には影響しない。engine 側
-API（`TcpStream` 固定）を変更すれば解消できるが、本 Issue のスコープ外
-とし、後続 Issue の候補として申し送る（起票はユーザー承認後）。
+`WireStream::emergency_channel` は引き続き `None` を返す
+（`engine::recovery::panic_hook::EmergencyResponseRegistration` が生の
+`TcpStream` へバイト列をそのまま書く契約のため、この生複製を平文のまま
+使うと TLS レコードへ混入する）。緊急応答の登録自体は
+[`WireStream::emergency_response_channel`]（既定実装は平文
+`TcpStream` 用にビット同一、`TlsStream` はこれを上書き）が担う:
+
+- 登録時点で `TlsSession::seal_application_data_detached`
+  （`tls::record_protection::Sealer::seal_detached` へ委譲）を呼び、
+  現在の送信シーケンス番号を**消費せずに** 1 個の TLS レコードへ緊急応答
+  を暗号化する（detached seal）。panic フックは、直列化済みのこの暗号文
+  を生 `TcpStream` の複製へそのまま書くだけでよく、engine 側の
+  `EmergencyResponseRegistration` API（`Vec<u8>` ＋ `TcpStream`）は
+  変更していない。
+- **nonce 再利用の防止（不変条件）**: detached seal した緊急応答レコード
+  と、panic が起きなかった場合に続く次の通常応答レコードは同じ
+  nonce（同じ送信 seq）を使う。安全なのは「両者のうち高々一方しか実際
+  には送出されない」ことが保証されるためで、登録ブロックの間 `stream`
+  は `&mut` で排他借用され通常送信は構造的に起きない。緊急応答を書く
+  条件を満たした場合（commit-pending 世代が armed な
+  `ResponseBoundaryGuard` の世代と一致するとき）、その guard の `Drop`
+  が `should_abort` により必ず abort する（RECOVER-5。panic フックの
+  登録有無に依存しない安全弁）ため以後の通常送信も起きない。
+  `wire-server` バイナリではこれに加えて `engine::recovery::fail_fast`
+  （RECOVER-8）がプロセス全体の panic を網羅的に fail-fast させる。
+  この区間の panic を abort せず捕捉して処理を継続する変更を将来入れる
+  場合は、この不変条件が崩れて nonce 再利用になる点に注意する。
+- seal・直列化・`try_clone` のいずれかの失敗、既に `failed`（この接続が
+  破損済み）、`close_notify` 送出済みの各場合は `None`（登録しない＝
+  接続断のみへ縮退。fail-closed）。安全性側の abort ガード（RECOVER-5）
+  には影響しない。
+
+詳細は `crates/wire-server/src/tls/stream.rs`（`TlsStream` の
+`WireStream` 実装）・`crates/wire-server/src/tls/record_protection.rs`
+（`Sealer::seal_detached`）のドキュメンテーションコメントを参照。
 
 ## `negotiate_startup` の二段化
 
@@ -213,9 +240,11 @@ PKCS#8 DER/PEM 生成（`ed25519_pkcs8_der`／`ed25519_pkcs8_pem`。RFC 8032
 - HTTPS 表層は Issue #968 として実装済み（下記「HTTPS 表層（#968）」節参照）
 - 実クライアント（psql・openssl s_client 等）3 種での接続試験（#969）
 - channel binding（#970）
-- 緊急応答（RECOVER-6）の TLS 接続対応（engine 側 API の変更が必要。
-  上記「既知の制約」参照。NoSQL 表層の TLS 経路でも同じ制約が残る。
-  下記「HTTPS 表層（#968）」節参照）
+- 緊急応答（RECOVER-6）の TLS 接続対応は Issue #1080 として実装済み
+  （上記「緊急応答（RECOVER-6）との関係」節参照）。NoSQL・HTTPS 表層
+  （下記「HTTPS 表層（#968）」節）は元々 RECOVER-6 の登録経路
+  （`crate::simple_query::execute_with_emergency_registration`）自体を
+  使っていないため、この制約とは無関係のまま
 
 ## HTTPS 表層（#968）
 

@@ -798,10 +798,29 @@ impl CompiledChecks {
                             Ok(ExprValue::Null) => true,
                             Ok(_) => {
                                 // 束縛段（`bind_where_predicates`）が式述語の
-                                // 型を Bool に限定済みのため到達しない。
-                                return Err(TenantWriteError::CheckEvaluationFailed);
+                                // 型を Bool に限定済みのため到達しない。防御的に
+                                // `Internal`（`XX000`）として fail-closed に
+                                // 拒否する（通常の式評価と同じ分類に委譲する
+                                // 契約は保ったまま、型不変条件が崩れた場合は
+                                // 内部事象として扱う）。
+                                return Err(TenantWriteError::CheckEvaluationFailed(
+                                    SqlSurfaceError::Internal {
+                                        detail:
+                                            "CHECK predicate expression did not evaluate to Bool"
+                                                .to_string(),
+                                    },
+                                ));
                             }
-                            Err(_) => return Err(TenantWriteError::CheckEvaluationFailed),
+                            // オーナー判断（2026-09-28・Issue #1075、ERR-6・
+                            // SQL-26・TABLE-16 ポインタ）: 0 除算・`BIGINT` 精度
+                            // 超過等の式評価エラーを、通常の式評価（`WHERE`／
+                            // `SELECT` と共有する `ExprProgram`）と同じ
+                            // `SqlSurfaceError`（＝同じ `wire_code`）のまま
+                            // 呼び出し元へ透過させる（以前は `XX000` へ丸めて
+                            // いた）。PostgreSQL と同様、CHECK 評価中のエラーは
+                            // 制約違反（`23514`）ではなく式評価エラーとして
+                            // 返す。
+                            Err(e) => return Err(TenantWriteError::CheckEvaluationFailed(e)),
                         }
                     }
                 };
@@ -1219,8 +1238,11 @@ mod tests {
         assert_eq!(checks[0].predicate_sql, checks2[0].predicate_sql);
     }
 
-    /// `BIGINT` 列の値が `2^53` を超える場合、`f64` へ黙って丸めず `XX000`
-    /// （`CheckEvaluationFailed`）で fail-closed に拒否する（設計 D-2・D-4）。
+    /// `BIGINT` 列の値が `2^53` を超える場合、`f64` へ黙って丸めず
+    /// `CheckEvaluationFailed` で fail-closed に拒否する（設計 D-2・D-4）。
+    /// オーナー判断（2026-09-28・Issue #1075）: `wire_code` は `XX000` 固定では
+    /// なく、通常の式評価（`sql::udf_call::numeric_scalar_from_ref`）と同じ
+    /// `22000`（`SqlSurfaceError::InvalidInput`）になる。
     #[test]
     fn compiled_checks_enforce_bigint_value_exceeding_exact_range_fails_closed() {
         let v = parse_create_table("CREATE TABLE docs (n BIGINT CHECK (n > 0))");
@@ -1236,11 +1258,19 @@ mod tests {
         let err = compiled
             .enforce(&schema, 1, &[], &metadata)
             .expect_err("BIGINT exceeding 2^53 must fail closed");
-        assert!(matches!(err, TenantWriteError::CheckEvaluationFailed));
+        assert!(matches!(
+            err,
+            TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::InvalidInput { .. })
+        ));
+        assert_eq!(err.wire_code(), "22000");
     }
 
-    /// 0 除算は違反（`23514`）にも通過にも丸めず `XX000` で fail-closed に
-    /// 拒否する（設計 D-4）。
+    /// 0 除算は違反（`23514`）にも通過にも丸めず `CheckEvaluationFailed` で
+    /// fail-closed に拒否する（設計 D-4）。オーナー判断（2026-09-28・
+    /// Issue #1075）: `wire_code` は `XX000` 固定ではなく、通常の式評価
+    /// （`sql::udf_call::apply_scalar_op`）と同じ `22000`
+    /// （`SqlSurfaceError::InvalidInput`）になる（PostgreSQL と同様、CHECK
+    /// 評価中のエラーは制約違反ではなく式評価エラーとして返す）。
     #[test]
     fn compiled_checks_enforce_division_by_zero_fails_closed() {
         let v = parse_create_table("CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))");
@@ -1255,7 +1285,11 @@ mod tests {
         let err = compiled
             .enforce(&schema, 1, &[], &metadata)
             .expect_err("division by zero must fail closed");
-        assert!(matches!(err, TenantWriteError::CheckEvaluationFailed));
+        assert!(matches!(
+            err,
+            TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::InvalidInput { .. })
+        ));
+        assert_eq!(err.wire_code(), "22000");
     }
 
     /// `REAL`／`DOUBLE` 列比較（対象外事項: `CREATE TABLE` の SQL DDL からは
