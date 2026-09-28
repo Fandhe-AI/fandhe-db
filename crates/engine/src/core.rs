@@ -1394,7 +1394,8 @@ pub enum ParsedSql {
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
     /// Issue #900）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE
     /// (<col>[, ...])`／`DROP CONSTRAINT <name>`（TABLE-16・TASK-204、
-    /// Issue #1067）の 3 形状の和。DDL 実行権限ゲート
+    /// Issue #1067）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] CHECK (<述語>)`
+    /// （TABLE-16・TASK-204、Issue #1068）の 4 形状の和。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は
     /// [`DropTable`](Self::DropTable)／[`CreateTable`](Self::CreateTable) と
     /// 同じく `EngineCore::execute_parsed_in_session` が担い、
@@ -1403,10 +1404,14 @@ pub enum ParsedSql {
     /// ドキュメント参照）。
     ///
     /// **BREAKING CHANGE**（Issue #900・#1067）: 本 variant の追加、および中身の
-    /// `ValidatedAlterTableAddColumn` から `ValidatedAlterTable`（3 形状の和）への
+    /// `ValidatedAlterTableAddColumn` から `ValidatedAlterTable`（4 形状の和）への
     /// 変更により `ParsedSql` を網羅的にマッチする既存コード
     /// （`crate::core::EngineCore`）はすべて更新済み。クレート外で `ParsedSql` を
     /// 網羅的にマッチするコードがあれば追随が必要。
+    ///
+    /// **BREAKING CHANGE**（Issue #1068）: `ValidatedAlterTable::AddCheck` variant
+    /// の追加により、`ValidatedAlterTable` を網羅的にマッチするクレート外の
+    /// コードは追随が必要。
     AlterTable(crate::sql::allowlist::ValidatedAlterTable),
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の

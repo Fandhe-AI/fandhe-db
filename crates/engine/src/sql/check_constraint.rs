@@ -579,20 +579,6 @@ pub(crate) fn validate_and_build(
     used_names.extend(explicit_names.iter().map(|n| n.to_string()));
     let mut built = Vec::with_capacity(parsed.len());
     for check in parsed {
-        reject_forbidden_elements(&check.predicates)?;
-
-        let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-        let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
-            crate::sql::parser::bind_check_predicates(&check.predicates, schema, &mut node_budget)?;
-
-        let columns =
-            referenced_column_names(schema, &check.predicates, &metadata_filters, &expr_filters);
-        if columns.len() > crate::catalog::MAX_CHECK_REFERENCED_COLUMNS {
-            return Err(SqlSurfaceError::payload_too_large(
-                "CHECK constraint references too many columns",
-            ));
-        }
-
         let name = match &check.name {
             // 明示名は `used_names` へ登録済み（上の事前確定）。
             Some(explicit) => explicit.clone(),
@@ -603,32 +589,79 @@ pub(crate) fn validate_and_build(
                 resolved
             }
         };
-
-        let predicate_sql = render_predicates(&check.predicates);
-        if predicate_sql.len() > crate::catalog::MAX_CHECK_PREDICATE_SQL_LEN {
-            return Err(SqlSurfaceError::payload_too_large(
-                "CHECK constraint predicate exceeds the size limit",
-            ));
-        }
-        // 往復一致検証（設計 D2）: レンダリングしたテキストを再パースした結果が
-        // 元の述語列とビット一致することを確認する。キーワードと衝突する識別子等、
-        // 往復できない入力を永続化しない安全弁（通常は到達しない——`render_expr`/
-        // `render_predicate` は `sql::allowlist::Parser` が受理する文法のみを
-        // 生成するよう構築済み）。
-        let reparsed = crate::sql::allowlist::parse_check_predicate_text(&predicate_sql)?;
-        if reparsed != check.predicates {
-            return Err(SqlSurfaceError::unsupported(
-                "CHECK constraint predicate does not round-trip through normalization",
-            ));
-        }
-
-        built.push(CheckConstraint {
-            name,
-            columns,
-            predicate_sql,
-        });
+        built.push(build_check_constraint(schema, check, name)?);
     }
     Ok(built)
+}
+
+/// [`ParsedCheck`] 1 件分の意味論検証（禁止要素の検出 → `bind_check_predicates`
+/// による束縛・列の存在・型検査 → 参照列名の抽出・上限判定 → 正規化
+/// レンダリング・長さ上限・往復一致検証）を行い、永続化用の [`CheckConstraint`]
+/// を組み立てる（TABLE-16・TASK-204、Issue #906。制約名の確定〔明示 or
+/// 自動生成・衝突解決〕は呼び出し元の責務——[`validate_and_build`]（`CREATE
+/// TABLE`。宣言全体を通した明示名の重複検査つき）と、`catalog::Storage::
+/// alter_table_add_check_constraint`（`ALTER TABLE ADD CHECK`。Issue #1068。
+/// 単一 CHECK を対象に、確定済みスキーマの下で検証する）の 2 呼び出し元で
+/// 手順を共有する唯一の実装）。
+///
+/// `schema` は検証対象の CHECK 自身を含まない状態で渡すこと（TABLE-16 は他の
+/// `CHECK` を参照する `CHECK` を許可しない。[`validate_and_build`] のドキュメント
+/// 参照）。
+pub(crate) fn build_check_constraint(
+    schema: &TableSchema,
+    check: &ParsedCheck,
+    name: String,
+) -> Result<CheckConstraint, SqlSurfaceError> {
+    reject_forbidden_elements(&check.predicates)?;
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
+        crate::sql::parser::bind_check_predicates(&check.predicates, schema, &mut node_budget)?;
+
+    let columns =
+        referenced_column_names(schema, &check.predicates, &metadata_filters, &expr_filters);
+    if columns.len() > crate::catalog::MAX_CHECK_REFERENCED_COLUMNS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "CHECK constraint references too many columns",
+        ));
+    }
+
+    let predicate_sql = render_predicates(&check.predicates);
+    if predicate_sql.len() > crate::catalog::MAX_CHECK_PREDICATE_SQL_LEN {
+        return Err(SqlSurfaceError::payload_too_large(
+            "CHECK constraint predicate exceeds the size limit",
+        ));
+    }
+    // 往復一致検証（設計 D2）: レンダリングしたテキストを再パースした結果が
+    // 元の述語列とビット一致することを確認する。キーワードと衝突する識別子等、
+    // 往復できない入力を永続化しない安全弁（通常は到達しない——`render_expr`/
+    // `render_predicate` は `sql::allowlist::Parser` が受理する文法のみを
+    // 生成するよう構築済み）。
+    let reparsed = crate::sql::allowlist::parse_check_predicate_text(&predicate_sql)?;
+    if reparsed != check.predicates {
+        return Err(SqlSurfaceError::unsupported(
+            "CHECK constraint predicate does not round-trip through normalization",
+        ));
+    }
+
+    Ok(CheckConstraint {
+        name,
+        columns,
+        predicate_sql,
+    })
+}
+
+/// `ALTER TABLE ... ADD CHECK`（Issue #1068）が名前省略時の既定名を確定する
+/// ためのヘルパー。`CREATE TABLE` の表制約と同じ既定名アルゴリズム
+/// （[`default_check_name`]。列制約形は `ADD CHECK` に無いため常に表制約の
+/// 既定名 `<table>_check`）を使い、衝突解決（[`resolve_unique_name`]）に渡す
+/// `used` は呼び出し元が **UNIQUE 実名 ∪ 既存 CHECK 実名**の和集合を渡す契約
+/// とする（`CREATE TABLE` の `validate_and_build` は CHECK 名同士の衝突しか
+/// 見ないが、`ALTER TABLE ADD CHECK` は同じ名前空間を共有する既存 UNIQUE 名も
+/// 避ける必要がある。設計 D2）。
+pub(crate) fn default_alter_table_check_name(table: &str, used: &[String]) -> String {
+    let candidate = default_check_name(table, None);
+    resolve_unique_name(&candidate, used)
 }
 
 /// 書き込み文ごとに 1 回コンパイルする `CHECK` 制約群

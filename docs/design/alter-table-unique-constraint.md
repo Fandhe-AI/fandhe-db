@@ -118,7 +118,7 @@ fail-closed に拒否する。
 | テーブルあたり制約数の上限（`MAX_UNIQUE_CONSTRAINTS` = 32）を超過 | `ConstraintLimitExceeded` | `54000` |
 | 既存行に重複あり | `UniqueConstraintViolation`（既存） | `23505` |
 | DROP する名前が存在しない | `ConstraintNotFound` | `42704` |
-| DROP する名前が CHECK 制約 | `ConstraintDropNotSupported` | `0A000`（CHECK の削除はスコープ外） |
+| DROP する名前が CHECK 制約 | ― | 成功（Issue #1068 以降。UNIQUE・CHECK は同じ名前空間を共有し、DROP CONSTRAINT はどちらの実名も解決する。詳細は `docs/design/alter-table-check-constraint.md`） |
 | DROP する UNIQUE を FK が参照している | `DependentObjectsStillExist`（既存） | `2BP01` |
 | 書き込みゲートの待機上限超過 | `WriteLockTimeout` | `55P03` |
 | その他 | ― | `XX000` |
@@ -137,11 +137,15 @@ HTTP 射影は新しい `ErrorClass` を追加していないため、`error_for
    公開。構築は `new(columns)`（名前未確定）と `with_name(name, columns)` の
    2 経路
 2. `catalog::CatalogError` に `ConstraintAlreadyExists`・`ConstraintNotFound`・
-   `ConstraintDropNotSupported`・`ConstraintLimitExceeded` を追加（`#[non_exhaustive]`
-   は付与しない。`docs/design/error-enum-non-exhaustive-policy.md` の方針を継続）
+   `ConstraintLimitExceeded` を追加（`#[non_exhaustive]`
+   は付与しない。`docs/design/error-enum-non-exhaustive-policy.md` の方針を継続。
+   `ConstraintDropNotSupported` は本 Issue の時点では追加したが、Issue #1068
+   で CHECK の DROP に対応したため削除済み——`docs/design/
+   alter-table-check-constraint.md` 参照）
 3. `sql::allowlist::validate_alter_table`／`validate_alter_table_tokens` の
    戻り値を `ValidatedAlterTableAddColumn` から `ValidatedAlterTable`
-   （`AddColumn`／`AddUnique`／`DropConstraint` の 3 variant の enum）へ変更
+   （`AddColumn`／`AddUnique`／`DropConstraint` の 3 variant の enum。Issue
+   #1068 で `AddCheck` を追加し 4 variant）へ変更
 4. `core::ParsedSql::AlterTable` の中身を `ValidatedAlterTable` に変更
 5. `sql::ddl::AlterTableOutcome` を `{ table_name, action: AlterTableAction }`
    に変更（`AlterTableAction::{AddColumn, AddConstraint, DropConstraint}`）。
@@ -158,13 +162,14 @@ HTTP 射影は新しい `ErrorClass` を追加していないため、`error_for
 
 対象外（`42601` のまま）: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`
 （`CREATE TABLE` に明示制約名を持つ UNIQUE を書く構文は未対応）・
-`ADD CONSTRAINT ... CHECK/PRIMARY KEY/FOREIGN KEY`・
+`ADD CONSTRAINT ... PRIMARY KEY/FOREIGN KEY`・
 `DROP CONSTRAINT IF EXISTS`／`CASCADE`／`RESTRICT`・1 文に複数の ADD／DROP・
-`DROP COLUMN` の SQL 公開。CHECK 制約の DROP は `0A000`。同一列リストの
-UNIQUE 重複は従来どおり拒否（`42601`）。名前を調べる SQL の手段
-（`pg_constraint`／`information_schema`）は存在しない。自動生成名は (a) D2 の
-規則（本ドキュメント）と (b) ALTER ADD の成功応答（`AlterTableAction::
-AddConstraint`）で知る設計とする。
+`DROP COLUMN` の SQL 公開。同一列リストの UNIQUE 重複は従来どおり拒否
+（`42601`）。名前を調べる SQL の手段（`pg_constraint`／`information_schema`）
+は存在しない。自動生成名は (a) D2 の規則（本ドキュメント）と (b) ALTER ADD
+の成功応答（`AlterTableAction::AddConstraint`）で知る設計とする。
+`ADD CONSTRAINT ... CHECK` と CHECK 名の DROP は Issue #1068 で対応済み
+（`docs/design/alter-table-check-constraint.md` 参照）。
 
 ### D7. 判定順（決定的・fail-closed。データに依存するのは最後の `23505` だけ）
 
