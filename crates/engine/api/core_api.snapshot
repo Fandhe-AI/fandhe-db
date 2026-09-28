@@ -289,6 +289,10 @@ pub enum CatalogError {
     IndexKindMismatch(String),
     IndexLimitExceeded(String),
     InvalidForeignKey(String),
+    ConstraintAlreadyExists(String),
+    ConstraintNotFound(String),
+    ConstraintDropNotSupported(String),
+    ConstraintLimitExceeded(String),
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

@@ -237,7 +237,9 @@ O(JSON サイズ) の係数が乗る（既知の制約として記録するの�
 
 ## スコープ外・申し送り
 
-- SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名
+- SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名は
+  Issue #1067 で実装済み。詳細は
+  [alter-table-unique-constraint.md](./alter-table-unique-constraint.md) 参照
 - 永続一意索引（redb 二次テーブル）による O(log n) 判定（Issue #1070。
   `FOREIGN KEY` の参照先側索引〔`crates/engine/src/key_index.rs`、Issue #1071・
   `docs/design/foreign-key.md`〕は識別子（テーブル・エンコーディング・列
