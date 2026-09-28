@@ -621,15 +621,20 @@ fn cascade_delete_does_not_cross_tenant_boundary_via_nosql() {
     // bob（tenant-b）に同名テーブルを別途作る必要はなく、同じ `parents`／
     // `children` へ書き込んだ行が `tenant_id` で分離されることを見る。
 
-    // alice と bob で別々の `id`／`operation_id` を使う（テナントを跨いだ
-    // 一意性の前提を置かない）。
+    // alice と bob で同じ `id`／`parent_id` の値を使う（operation_id のみ
+    // テナントごとに変える）。テナントを跨いだ一意性の前提を置くためでは
+    // なく、逆に「値が一致していても tenant_id で分離される」ことを見る
+    // ため。ここで id／parent_id をテナントごとに変えてしまうと、連鎖削除が
+    // 値一致だけで検索し tenant_id フィルタを取り違えてテナント境界を
+    // 越えてしまう不具合があっても bob 側の値と一致せず検出できない
+    // （codex レビュー指摘。PR #1157）。
     let insert_parent_alice = br#"{"op":"insert","table":"parents","rows":[{"id":1,"name":"p1"}],"operation_id":"n13-tenant-parent-alice"}"#;
     assert_eq!(query(&alice, insert_parent_alice).status, 200);
-    let insert_parent_bob = br#"{"op":"insert","table":"parents","rows":[{"id":2,"name":"p1"}],"operation_id":"n13-tenant-parent-bob"}"#;
+    let insert_parent_bob = br#"{"op":"insert","table":"parents","rows":[{"id":1,"name":"p1"}],"operation_id":"n13-tenant-parent-bob"}"#;
     assert_eq!(query(&bob, insert_parent_bob).status, 200);
     let insert_child_alice = br#"{"op":"insert","table":"children","rows":[{"id":1,"parent_id":1,"note":"c1"}],"operation_id":"n13-tenant-child-alice"}"#;
     assert_eq!(query(&alice, insert_child_alice).status, 200);
-    let insert_child_bob = br#"{"op":"insert","table":"children","rows":[{"id":2,"parent_id":2,"note":"c1"}],"operation_id":"n13-tenant-child-bob"}"#;
+    let insert_child_bob = br#"{"op":"insert","table":"children","rows":[{"id":1,"parent_id":1,"note":"c1"}],"operation_id":"n13-tenant-child-bob"}"#;
     assert_eq!(query(&bob, insert_child_bob).status, 200);
 
     // alice（tenant-a）の親削除は alice 側の子だけを連鎖削除し、bob
