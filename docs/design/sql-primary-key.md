@@ -163,4 +163,7 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
   `insert_rows_into_table`・`insert_typed_row`。いずれも `#[cfg(test)]` 専用の
   テナント境界チェックなし経路）は主キー検査点を経由しない。これらはテナント
   境界チェック自体を持たない生の経路であり、production の書き込みはすべて
-  `tenant.rs` のガード付き入口（本検査点を経由済み）を通る。
+  `tenant.rs` のガード付き入口（本検査点を経由済み）を通る。Issue #1078 で、
+  これら 3 API 自身が主キー（UNIQUE・CHECK・FOREIGN KEY も同様）を宣言した
+  テーブルへの書き込みを fail-closed に拒否するガードを追加したため、検査点を
+  経由しなくてもテストがこれらの制約に違反する状態を作ることはできない。

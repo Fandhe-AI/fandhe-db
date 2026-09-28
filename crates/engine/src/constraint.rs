@@ -23,7 +23,11 @@
 //! 検査点を通り、redb の write トランザクションは自身が書いた未 commit の行を
 //! 読めるため、同一トランザクション内の先行文が書いた行も母集合に含まれる。
 //! `catalog.rs` の生書き込み API（`#[cfg(test)]` 限定・production では到達不能）は
-//! この検査点を経由しない（既知のギャップ。`docs/design/sql-primary-key.md` 参照）。
+//! この検査点を経由しない。ただし Issue #1078 で追加した
+//! `catalog::reject_constrained_table_for_raw_write` が、主キー・UNIQUE・CHECK・
+//! FOREIGN KEY のいずれかを宣言したテーブルへの書き込みをこれら 3 API 自身が
+//! fail-closed に拒否するため、検査点を経由しなくても制約違反状態を作れない
+//! （`docs/design/sql-primary-key.md`・`sql-check-constraint.md`・`foreign-key.md` 参照）。
 //!
 //! 主キーも UNIQUE 制約も宣言しないテーブル（大多数）は検査対象のキーが 0 個に
 //! なり、呼び出しは即座に成功する（コストゼロ）。
