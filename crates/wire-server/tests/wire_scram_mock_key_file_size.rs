@@ -14,11 +14,12 @@
 //! - R2: 上限以内の妥当なファイル（`SCRAM_MOCK_KEY_FILE_MIN_LEN` バイトの
 //!   ゼロ埋め）では引き続き `listening on` に到達すること（回帰確認）。
 
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[path = "common/mod.rs"]
+mod common;
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -69,35 +70,6 @@ impl Drop for TempFixtureDir {
 
 fn write_empty_user_store(path: &str) {
     std::fs::write(path, "").expect("write empty user store");
-}
-
-fn wait_for_listening(child: &mut Child) -> bool {
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("listening on") => return true,
-            Ok(_) => continue,
-            Err(_) => return false,
-        }
-    }
 }
 
 /// R1: `/dev/zero`（終端しない特殊ファイル）指定は listen 前に fail-closed
@@ -222,7 +194,7 @@ fn valid_sized_mock_key_file_still_starts_listening() {
         .spawn()
         .expect("spawn wire-server");
 
-    let listening = wait_for_listening(&mut child);
+    let listening = common::wait_for_listening(&mut child, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
 

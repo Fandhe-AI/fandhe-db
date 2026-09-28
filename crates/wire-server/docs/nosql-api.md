@@ -541,7 +541,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `op` | ○ | string | `"create_table"`／`"alter_table"`／`"drop_table"` |
 | `table` | ○ | string | |
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
-| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当） |
+| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` は `ON DELETE`／`ON UPDATE` 参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`。Issue #1076）を宣言する手段を持たず、常に `NO ACTION` になる（後続課題）。SQL 表層で参照アクションを宣言したテーブルへの `update`／`delete` op は宣言側と同じ単一検査点を通るため連鎖が発火し、連鎖の上限超過は `54000`（HTTP `413`）として到達する |
 | `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`） |
 | `drop_column`（`alter_table`） | △ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線のため常に `0A000` |
 

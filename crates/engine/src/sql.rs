@@ -247,7 +247,7 @@ pub use visible_cache::VisibleBitmapCacheStats;
 /// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
 /// 必要）。
 ///
-/// **TASK-195（SQL-22）で追加した破壊的変更（BREAKING CHANGE）**: `Truncate`
+/// **TASK-193（SQL-22）で追加した破壊的変更（BREAKING CHANGE）**: `Truncate`
 /// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
 /// 必要）。
 ///
@@ -286,7 +286,7 @@ pub enum SqlOutcome {
     /// [`crate::core::EngineCore::execute_insert_sql`]（TASK-80）に委譲しており、
     /// 本 variant はその [`exec::InsertOutcome`] をそのまま運ぶ薄いラッパー。
     Insert(exec::InsertOutcome),
-    /// `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（TASK-195・SQL-22）が
+    /// `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（TASK-193・SQL-22）が
     /// セッション経由の実行経路で成功したことを示す応答。検証・実行本体は
     /// [`crate::core::EngineCore::execute_truncate_sql`] に委譲しており、本
     /// variant はその [`exec::TruncateOutcome`] をそのまま運ぶ薄いラッパー

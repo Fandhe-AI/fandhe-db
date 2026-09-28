@@ -281,7 +281,7 @@ pub struct InsertOutcome {
     pub incremental: Option<crate::incremental::IndexOutcome>,
 }
 
-/// `EngineCore::execute_truncate_sql` の成功応答（SQL-22、TASK-195）。削除件数を
+/// `EngineCore::execute_truncate_sql` の成功応答（SQL-22、TASK-193）。削除件数を
 /// 一切返さない契約（SQL-22。自テナント件数であっても再送側が件数推定に使えない
 /// ようにする設計）を型で表現する固定タグのみの応答。フィールドを持たないが、
 /// 将来の拡張余地を残すため `#[non_exhaustive]` にする。
@@ -3367,7 +3367,7 @@ pub(crate) fn execute_insert_with_schema_in(
 }
 
 /// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`
-/// （SQL-22、TASK-195）の実行入口。`validated`（`sql::allowlist::validate_truncate`
+/// （SQL-22、TASK-193）の実行入口。`validated`（`sql::allowlist::validate_truncate`
 /// 済み構造）の `operation_id` を `ledger_mode` で台帳書き込み指示へ解決してから
 /// [`crate::tenant::truncate_table_unchecked`] へ委譲する（[`execute_insert`] と
 /// 同じ設計）。
@@ -3660,9 +3660,13 @@ pub(crate) fn map_write_error(
         TenantWriteError::CheckViolation { constraint } => {
             SqlSurfaceError::check_violation(constraint)
         }
-        TenantWriteError::CheckEvaluationFailed => SqlSurfaceError::Internal {
-            detail: "check constraint evaluation failed".to_string(),
-        },
+        // オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16
+        // ポインタ）: `XX000` へ丸めず、`CompiledChecks::enforce`（通常の式
+        // 評価と共有する `ExprProgram`）が返した `SqlSurfaceError` をそのまま
+        // 透過する。`inner` は既に `sql::allowlist::SqlSurfaceError` のため
+        // 変換不要（`tenant::TenantWriteError::CheckEvaluationFailed` のドキュ
+        // メント参照）。
+        TenantWriteError::CheckEvaluationFailed(inner) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
         // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
         // 取り違える。値・参照先の有無の理由を含まない固定文言。
@@ -3703,6 +3707,12 @@ pub(crate) fn map_write_error(
         // なってしまい、クライアントが同種の「上限超過」を判別できなくなる。
         TenantWriteError::TooManyRowsScanned => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
+        }
+        // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
+        // Issue #1076）の連鎖が深さ・行数の上限を超えた。`_` 節（`XX000`）へ丸めると
+        // クライアントが上限超過をサーバー内部事象と取り違える。
+        TenantWriteError::ReferentialActionLimitExceeded => {
+            SqlSurfaceError::payload_too_large("referential action limit exceeded")
         }
         // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
         // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
@@ -4376,11 +4386,11 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::CheckViolation { constraint }) => {
             SqlSurfaceError::check_violation(constraint)
         }
-        IncrementalError::Write(TenantWriteError::CheckEvaluationFailed) => {
-            SqlSurfaceError::Internal {
-                detail: "check constraint evaluation failed".to_string(),
-            }
-        }
+        // オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16
+        // ポインタ）: 行形 INSERT（[`map_write_error`]）と同じく、ファイル形
+        // INSERT でも通常の式評価と同じ `SqlSurfaceError` をそのまま透過する
+        // （`_` 節の `XX000` へ丸めない）。
+        IncrementalError::Write(TenantWriteError::CheckEvaluationFailed(inner)) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）: ファイル形
         // `INSERT` の置換（`replace_typed_rows_by_text_key`）で旧チャンク行を削除しようと
         // して参照先側の検査に違反した場合、または新規チャンク行の参照元列が参照元側の
@@ -4388,6 +4398,12 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // （`XX000`）へ丸めない。
         IncrementalError::Write(TenantWriteError::ForeignKeyViolation) => {
             SqlSurfaceError::ForeignKeyViolation
+        }
+        // 参照アクション（Issue #1076）の連鎖上限超過。行形 INSERT
+        // （[`map_write_error`]）と同じ `54000` へ写像し、`_` 節（`XX000`）へ
+        // 丸めない。
+        IncrementalError::Write(TenantWriteError::ReferentialActionLimitExceeded) => {
+            SqlSurfaceError::payload_too_large("referential action limit exceeded")
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

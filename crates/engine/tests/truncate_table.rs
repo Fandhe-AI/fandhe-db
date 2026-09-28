@@ -1,5 +1,5 @@
-//! `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（TASK-195、対象ビヘイビア:
-//! SQL-22）の結合テスト。ポインタ: `docs/spec/05-tasks.md` TASK-195・
+//! `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（TASK-193、対象ビヘイビア:
+//! SQL-22）の結合テスト。ポインタ: `docs/spec/05-tasks.md` TASK-193・
 //! `docs/spec/04-behavior/sql-surface.md` SQL-22。関連ポインタ: TABLE-4（テーブル
 //! 定義は残る DDL 非該当操作）・RLS-7（暗黙のテナント境界適用）・RLS-9（他テナント
 //! 存在情報の非漏えい）・RECOVER-1〜3・RECOVER-10（`operation_id` 必須化・台帳

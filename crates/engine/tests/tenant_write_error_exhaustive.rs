@@ -15,6 +15,7 @@
 //! 要求する形になっており、方針変更が静かに紛れ込むのを防ぐ。
 
 use engine::error_format::{ClassifiedError, ErrorClass};
+use engine::sql::allowlist::SqlSurfaceError;
 use engine::tenant::TenantWriteError;
 
 /// `TenantWriteError` の全 variant を `_` アームなしで分類し、期待される
@@ -43,8 +44,11 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
         TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
         TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
-        TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
+        // オーナー判断（2026-09-28・Issue #1075）: 内側の `SqlSurfaceError` の
+        // 分類（通常の式評価と同じ）へ委譲する。`XX000` 固定ではなくなった。
+        TenantWriteError::CheckEvaluationFailed(inner) => inner.error_class(),
         TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
+        TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
         TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
     }
 }
@@ -69,10 +73,18 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::TooManyRowsScanned,
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
+        TenantWriteError::ReferentialActionLimitExceeded,
         TenantWriteError::CheckViolation {
             constraint: "test_check".to_string(),
         },
-        TenantWriteError::CheckEvaluationFailed,
+        // 内側の `SqlSurfaceError` の分類（`InvalidInput`＝`22000`・`Internal`＝
+        // `XX000`）の両方で `error_class()` の委譲が正しく効くことを固定する。
+        TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::InvalidInput {
+            detail: "division by zero".to_string(),
+        }),
+        TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::Internal {
+            detail: "test".to_string(),
+        }),
         TenantWriteError::WriteLockTimeout,
     ];
     for case in &cases {
