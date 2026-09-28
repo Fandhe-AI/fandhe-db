@@ -6459,7 +6459,7 @@ impl Storage {
             // 親表それぞれの stale 索引（他の DROP で登録簿に残ったまま以後
             // 同期されなくなった索引）を、まだ新 FK を含まない現在のカタログ
             // から求めた「本当に必要な索引名」で刈り込む。
-            let required_child = required_parent_key_index_names_in_txn(&write_txn, table_name)?;
+            let required_child = required_key_index_names_in_txn(&write_txn, table_name)?;
             crate::key_index::prune_unneeded_indexes_in_txn(
                 &write_txn,
                 table_name,
@@ -6467,7 +6467,7 @@ impl Storage {
             )?;
             if parent_table_name != table_name {
                 let required_parent =
-                    required_parent_key_index_names_in_txn(&write_txn, &parent_table_name)?;
+                    required_key_index_names_in_txn(&write_txn, &parent_table_name)?;
                 crate::key_index::prune_unneeded_indexes_in_txn(
                     &write_txn,
                     &parent_table_name,
@@ -6593,16 +6593,18 @@ impl Storage {
         }
         // 索引衛生（P0・設計 §3.4）: カタログ書き換え後（＝索引の要否判定が
         // 「削除後」の状態を見る）に、影響を受けうる表の stale 索引を刈り込む。
-        // UNIQUE 削除は「この表を親とする索引」（他表の FK が UNIQUE 列を参照
-        // しうる）を、FOREIGN KEY 削除は「削除した FK の参照先（親）表を親と
-        // する索引」を対象にする（`key_index.rs` の索引は常に親テーブル基準で
-        // 構築される契約。`required_parent_key_index_names_in_txn` 参照）。
-        let required_self = required_parent_key_index_names_in_txn(&write_txn, table_name)?;
+        // `table_name` 自身の登録簿は「他表の FK がこの表を参照する索引」
+        // （UNIQUE 削除で他表の FK が UNIQUE 列を参照しうる）と「この表自身が
+        // 宣言する FOREIGN KEY の子側索引」の両方を含む（`required_key_index_
+        // names_in_txn` 参照。子側索引を見落とすと、今回削除した制約とは無関係な
+        // 他の FOREIGN KEY の子側索引まで巻き添えで削除する fail-open になる。
+        // Cursor codex P2 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6muWhg`）。
+        // FOREIGN KEY 削除時は削除した FK の参照先（親）表側も同様に対象にする。
+        let required_self = required_key_index_names_in_txn(&write_txn, table_name)?;
         crate::key_index::prune_unneeded_indexes_in_txn(&write_txn, table_name, &required_self)?;
         if let Some(parent_table) = &dropped_fk_parent_table {
             if parent_table != table_name {
-                let required_parent =
-                    required_parent_key_index_names_in_txn(&write_txn, parent_table)?;
+                let required_parent = required_key_index_names_in_txn(&write_txn, parent_table)?;
                 crate::key_index::prune_unneeded_indexes_in_txn(
                     &write_txn,
                     parent_table,
@@ -8196,33 +8198,63 @@ pub(crate) fn referencing_foreign_keys_in_txn(
     Ok(referencing)
 }
 
-/// テーブル `table` を親とする各 `FOREIGN KEY`（自己参照を含む。`id` 参照は
-/// 除く——`key_index.rs` は `id` 参照に索引を使わず物理キーの点照会で検査する
-/// ため対象外）の参照先列集合から、`table` が本当に持つべき永続キー索引名の
-/// 集合を求める（P0・Issue #1069。設計 §3.4「索引衛生」）。
+/// テーブル `table` の永続キー索引登録簿（`key_index.rs` の登録簿で
+/// `table` をキーに持つエントリ群）に本当に必要な索引名の集合を求める
+/// （P0・Issue #1069・#1071。設計 §3.4「索引衛生」）。`id` 参照は
+/// `key_index.rs` が索引を使わず物理キーの点照会で検査するため対象外。
 ///
-/// `key_index.rs` の索引は常に「参照先（親）テーブル・参照先列」を基準に
-/// 構築される（`constraint::prepare_referenced_key_indexes_in_txn`・
-/// `constraint::verify_required_parent_keys` がいずれも `ensure_index_in_txn` を
-/// `table = fk.parent_table()` で呼ぶ契約）ため、この関数は
-/// [`referencing_foreign_keys_in_txn`] が返す「`table` を参照する FK」だけを
-/// 見れば済む（`table` 自身の FK が持つ参照元列は索引の対象にならない）。
+/// `key_index.rs` の索引は 2 通りの構築契機を持ち、いずれも登録簿の
+/// `table` キーには「索引を物理的に持つテーブル自身」が入る:
+///
+/// - **親側索引**: `table` を参照する他テーブル（自己参照時は `table`
+///   自身）の `FOREIGN KEY` の参照先列（`fk.parent_columns()`）から
+///   構築する（`constraint::verify_required_parent_keys` 等が
+///   `ensure_index_in_txn` を `table = fk.parent_table()` で呼ぶ契約）。
+///   [`referencing_foreign_keys_in_txn`] が返す「`table` を参照する FK」
+///   から求める。
+/// - **子側索引**: `table` 自身が宣言する `FOREIGN KEY` の参照元列
+///   （`fk.columns()`。子テーブル自身の列）から構築する
+///   （`constraint::enforce_referencing_rows_in_txn` が `ensure_index_in_txn`
+///   を `table = child_schema.name`（＝ FK 宣言側自身）で呼ぶ契約。
+///   Cursor codex P2 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6muWhg`）。
+///   `table` の現在のカタログ（[`require_table_schema_write`]）の
+///   `foreign_keys` から求める。
+///
+/// 呼び出し元はこの集合の外にある登録簿エントリを
+/// [`crate::key_index::prune_unneeded_indexes_in_txn`] で刈り込む契約のため、
+/// 子側索引をこの集合へ含め忘れると、`table` が持つ**別の** `FOREIGN KEY`
+/// の子側索引を ADD/DROP CONSTRAINT の巻き添えで削除してしまう（修正前の
+/// 挙動。参照整合性の判定自体は `key_index::none_referenced_in_txn` が
+/// 未登録を検出して安全側の全行走査へフォールバックするため fail-open には
+/// ならないが、以後の親行削除・更新のたびにその FK が索引未登録と誤認されて
+/// 全行走査・索引再構築を繰り返し、Issue #1071 の索引化による計算量改善が
+/// 効かなくなる性能劣化になる）。
 ///
 /// [`Storage::alter_table_drop_constraint`]（UNIQUE・FOREIGN KEY いずれの削除
 /// でも、削除後のカタログに対して呼ぶ）・[`Storage::alter_table_add_foreign_key`]
 /// （新 FK の検証**前**に、まだ新 FK を含まない現在のカタログに対して呼ぶ）が
 /// 使う。呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと
-/// （[`referencing_foreign_keys_in_txn`] と同じ契約）。
-pub(crate) fn required_parent_key_index_names_in_txn(
+/// （[`referencing_foreign_keys_in_txn`]・[`require_table_schema_write`] と
+/// 同じ契約）。
+pub(crate) fn required_key_index_names_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<std::collections::BTreeSet<String>> {
     let referencing = referencing_foreign_keys_in_txn(write_txn, table)?;
-    Ok(referencing
+    let mut names: std::collections::BTreeSet<String> = referencing
         .iter()
         .filter(|(_, fk)| !fk.references_parent_id())
         .map(|(_, fk)| crate::key_index::index_name_for_columns(fk.parent_columns()))
-        .collect())
+        .collect();
+    let own_schema = require_table_schema_write(write_txn, table)?;
+    names.extend(
+        own_schema
+            .foreign_keys
+            .iter()
+            .filter(|fk| !fk.references_parent_id())
+            .map(|fk| crate::key_index::index_name_for_columns(fk.columns())),
+    );
+    Ok(names)
 }
 
 #[cfg(test)]

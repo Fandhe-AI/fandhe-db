@@ -582,7 +582,7 @@ pub(crate) fn drop_indexes_for_table_in_txn(
 /// `ensure_index_in_txn` が確実に backfill をやり直すようにする。
 ///
 /// `required_names` は呼び出し元が算出した「この時点で本当に必要な索引名」の
-/// 集合（`crate::catalog::required_parent_key_index_names_in_txn` 参照）。含まれない
+/// 集合（`crate::catalog::required_key_index_names_in_txn` 参照）。含まれない
 /// 名前は fwd／rev の実テーブルごと削除し、登録簿から全テナント分のエントリを
 /// 除去する（`drop_indexes_for_table_in_txn` の索引名単位版）。
 pub(crate) fn prune_unneeded_indexes_in_txn(
@@ -1758,5 +1758,159 @@ mod tests {
             "X is resupplied by C; B's reference must remain satisfied, got {result:?}"
         );
         write_txn.abort().expect("abort");
+    }
+
+    /// `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY` が、操作対象ではない
+    /// **別の** `FOREIGN KEY`（同じ子テーブルが持つ、別の親を参照する FK）の
+    /// 永続キー索引（子側・親側とも）を巻き添えで削除しないことを固定する
+    /// （P2・Issue #1069・#1071。Cursor codex 指摘・PR #1156 スレッド
+    /// `PRRT_kwDOUAKASM6muWhg`）。
+    ///
+    /// 修正前は `catalog::required_parent_key_index_names_in_txn`（現
+    /// `required_key_index_names_in_txn`）が「`table` を親とする FK」の
+    /// 親側索引名だけを求め、`table` 自身が宣言する FK の子側索引
+    /// （`constraint::enforce_referencing_rows_in_txn` が
+    /// `table = child_schema.name` で構築する索引）を見落としていた。
+    /// このため、`children` に 2 本目の FK を ADD（または既存 FK を DROP）
+    /// すると `key_index::prune_unneeded_indexes_in_txn` が 1 本目の FK
+    /// （fk1）の子側索引を「不要」と誤判定して削除し、以後 fk1 の親行変更が
+    /// 索引未登録と誤認されて全行走査へ縮退していた（fail-open ではなく
+    /// Issue #1071 索引化の計算量改善が効かなくなる性能劣化）。
+    #[test]
+    fn add_and_drop_sibling_foreign_key_preserve_other_fk_indexes() {
+        let (storage, _guard) = tmp_storage("key-index-sibling-fk-preserved");
+
+        // parents1（PK code）・parents2（PK code2）を親、children が両方を
+        // 参照する 2 本の列参照 FK を持つ構成（fk1 は先に ADD、fk2 は
+        // backfill 後に ADD／DROP して fk1 側の索引への影響を観測する）。
+        let parents1 = TableSchema::new(
+            "parents1",
+            vec![ColumnDef::new("code", ColumnType::Text, false)],
+        )
+        .with_primary_key(vec!["code".to_string()]);
+        let parents2 = TableSchema::new(
+            "parents2",
+            vec![ColumnDef::new("code2", ColumnType::Text, false)],
+        )
+        .with_primary_key(vec!["code2".to_string()]);
+        let children = TableSchema::new(
+            "children",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        );
+        storage.create_table(&parents1).expect("create parents1");
+        storage.create_table(&parents2).expect("create parents2");
+        storage.create_table(&children).expect("create children");
+
+        storage
+            .alter_table_add_foreign_key(
+                "children",
+                Some("fk1"),
+                ForeignKeyDef::new(
+                    vec!["a".to_string()],
+                    "parents1".to_string(),
+                    vec!["code".to_string()],
+                    ReferentialAction::NoAction,
+                    ReferentialAction::NoAction,
+                ),
+            )
+            .expect("add fk1");
+
+        // parents1 に 2 行（p1: children から参照される・junk: 参照されない）
+        // を入れ、children に p1 を参照する行を 1 件入れる。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents1",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("p1".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-p1").expect("op id"),
+        )
+        .expect("insert p1");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents1",
+            &ctx("tenant-a"),
+            2,
+            Visibility::Public,
+            &[Value::Text("junk".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-junk").expect("op id"),
+        )
+        .expect("insert junk");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "children",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("p1".to_string()), Value::Null],
+            &crate::recovery::required_op_id::OperationId::parse("op-c1").expect("op id"),
+        )
+        .expect("insert child referencing p1");
+
+        // 参照されていない junk を削除し、fk1 の子側索引（children/a）・
+        // 親側索引（parents1/code）をいずれもフォールバック経由で backfill・
+        // 登録させる（`enforce_referencing_rows_in_txn` の未登録分岐）。
+        crate::tenant::delete_row(
+            &storage,
+            "parents1",
+            &ctx("tenant-a"),
+            2,
+            &crate::recovery::required_op_id::OperationId::parse("op-del-junk").expect("op id"),
+        )
+        .expect("delete junk (unreferenced)");
+
+        let fk1_child_columns = vec!["a".to_string()];
+        let fk1_parent_columns = vec!["code".to_string()];
+        assert!(
+            index_has_entry(&storage, "children", &fk1_child_columns, "tenant-a").is_ok(),
+            "fk1's child-side index was not backfilled; test precondition broken"
+        );
+        assert!(
+            index_has_entry(&storage, "parents1", &fk1_parent_columns, "tenant-a").is_ok(),
+            "fk1's parent-side index was not backfilled; test precondition broken"
+        );
+
+        // 無関係な 2 本目の FK（fk2: children.b -> parents2.code2）を ADD する。
+        // 修正前はここで fk1 の子側索引が誤って削除された。
+        storage
+            .alter_table_add_foreign_key(
+                "children",
+                Some("fk2"),
+                ForeignKeyDef::new(
+                    vec!["b".to_string()],
+                    "parents2".to_string(),
+                    vec!["code2".to_string()],
+                    ReferentialAction::NoAction,
+                    ReferentialAction::NoAction,
+                ),
+            )
+            .expect("add fk2");
+
+        assert!(
+            index_has_entry(&storage, "children", &fk1_child_columns, "tenant-a").is_ok(),
+            "ADD CONSTRAINT fk2 must not prune the unrelated fk1's child-side index"
+        );
+        assert!(
+            index_has_entry(&storage, "parents1", &fk1_parent_columns, "tenant-a").is_ok(),
+            "ADD CONSTRAINT fk2 must not prune the unrelated fk1's parent-side index"
+        );
+
+        // fk2 を DROP しても fk1 の索引が残ること（DROP CONSTRAINT 側の対称回帰）。
+        storage
+            .alter_table_drop_constraint("children", "fk2")
+            .expect("drop fk2");
+
+        assert!(
+            index_has_entry(&storage, "children", &fk1_child_columns, "tenant-a").is_ok(),
+            "DROP CONSTRAINT fk2 must not prune the unrelated fk1's child-side index"
+        );
+        assert!(
+            index_has_entry(&storage, "parents1", &fk1_parent_columns, "tenant-a").is_ok(),
+            "DROP CONSTRAINT fk2 must not prune the unrelated fk1's parent-side index"
+        );
     }
 }
