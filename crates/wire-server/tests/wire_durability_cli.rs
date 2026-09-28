@@ -27,11 +27,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::policy::PolicyContext;
@@ -147,84 +146,6 @@ fn seed_single_row_db(db_path: &str) {
     drop(storage);
 }
 
-/// 子プロセスの stderr を専用スレッドで読み、`listening on` を待つ
-/// （`wire_search_engine_cli.rs::wait_for_listening` と同型）。
-fn wait_for_listening(child: &mut Child) -> bool {
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("listening on") => return true,
-            Ok(_) => continue,
-            Err(_) => return false,
-        }
-    }
-}
-
-/// 子プロセスの stderr を `listening on` に到達するまで全行集めて返す
-/// （`wire_fault_injection_cli.rs::wait_for_listening_addr_and_lines` と同じ
-/// 理由。R4 の起動ログ警告有無を判定するため、単一行だけでなく途中の全行を
-/// 保持する）。
-fn wait_for_listening_addr_and_lines(
-    child: &mut Child,
-    timeout: Duration,
-) -> (std::net::SocketAddr, Vec<String>) {
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + timeout;
-    let mut lines = Vec::new();
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            panic!("did not observe listening address within {timeout:?}; lines so far: {lines:?}");
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) => {
-                let trimmed = line.trim_end().to_string();
-                if let Some(idx) = line.find("listening on ") {
-                    let addr_str = line[idx + "listening on ".len()..].trim();
-                    let addr: std::net::SocketAddr = addr_str.parse().expect("parse listen addr");
-                    lines.push(trimmed);
-                    return (addr, lines);
-                }
-                lines.push(trimmed);
-            }
-            Err(_) => panic!(
-                "stderr channel closed before observing listening address; lines so far: {lines:?}"
-            ),
-        }
-    }
-}
-
 /// 認証後、簡易クエリ 1 文を送って `RowDescription`〜`ReadyForQuery` までの
 /// 生バイト列をそのまま返す（`wire_search_engine_cli.rs::
 /// run_c1_query_and_collect_bytes` と同型）。
@@ -288,7 +209,7 @@ fn both_tokens_start_listening() {
             .spawn()
             .expect("spawn wire-server");
 
-        let listening = wait_for_listening(&mut child);
+        let listening = common::wait_for_listening(&mut child, Duration::from_secs(10));
         let _ = child.kill();
         let _ = child.wait();
 
@@ -330,7 +251,8 @@ fn unset_and_immediate_token_produce_identical_wire_bytes() {
             .spawn()
             .expect("spawn wire-server");
 
-        let (addr, _lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+        let (addr, _lines) =
+            common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
         let bytes = run_c1_query_and_collect_bytes(addr);
 
         let _ = child.kill();
@@ -449,7 +371,8 @@ fn only_none_durability_emits_warning_line() {
             .spawn()
             .expect("spawn wire-server");
 
-        let (_addr, lines) = wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+        let (_addr, lines) =
+            common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
         let _ = child.kill();
         let _ = child.wait();
 
@@ -498,7 +421,7 @@ fn none_durability_with_hnsw_engine_starts_listening() {
         .spawn()
         .expect("spawn wire-server");
 
-    let listening = wait_for_listening(&mut child);
+    let listening = common::wait_for_listening(&mut child, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
 
