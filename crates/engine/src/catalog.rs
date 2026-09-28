@@ -40,9 +40,17 @@ use std::sync::Arc;
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+// `row_codec::{self, Value as RowCodecValue}` は `insert_typed_row`
+// （`#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが使う。
+#[cfg(test)]
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{parse_view_body, SqlSurfaceError, TableLookup};
-use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
+// `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
+// `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
+// 使う。
+use crate::storage::{Row as StorageRow, Storage, StorageError};
+#[cfg(test)]
+use crate::storage::{RowInput, Visibility};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
@@ -4764,6 +4772,34 @@ pub(crate) fn require_table_schema_write(
     decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
+/// `#[cfg(test)]` 限定の生書き込み API（`insert_row_into_table` /
+/// `insert_rows_into_table` / `insert_typed_row`。Issue #1078）の共通ガード。
+/// これら 3 API は [`crate::constraint::enforce_row_constraints_in_txn`]
+/// （TABLE-16・TABLE-17 の単一検査点）を経由せず redb へ直接書き込むため、主キー・
+/// UNIQUE・CHECK・FOREIGN KEY のいずれかを宣言したテーブルに対しては
+/// `CatalogError::Invalid` で fail-closed に拒否する（テストが意図せず制約違反状態を
+/// 作れてしまう経路を塞ぐ。制約付きテーブルへの投入は検査点を経由する
+/// `crate::tenant::insert_*` を使うこと）。
+///
+/// FOREIGN KEY の参照先（親テーブル）側について: 親テーブルが PK／UNIQUE で参照
+/// される場合は親テーブル自体が制約付きとして本ガードに拒否される。`id` 疑似列
+/// （制約なしの親でも参照可能。`docs/design/foreign-key.md` D1）で参照される場合でも、
+/// 生 API は `(tenant_id, id)` キーへの追加または同一キーの置換のみを行い既存の `id`
+/// を削除しないため、参照元行が参照先を失う（孤児化する）ことはない。
+#[cfg(test)]
+fn reject_constrained_table_for_raw_write(schema: &TableSchema) -> Result<()> {
+    if schema.primary_key().is_some()
+        || !schema.unique_constraints().is_empty()
+        || !schema.checks().is_empty()
+        || !schema.foreign_keys().is_empty()
+    {
+        return Err(CatalogError::Invalid(
+            "raw test-only write API does not support tables with declared constraints; use crate::tenant write APIs".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// read トランザクション内でカタログテーブルに `table_name` が定義済みかを確認する
 /// （TASK-146）。`get_row_from_table` / `scan_table_page` の共通前段処理。スキーマ本体は
 /// 呼び出し元が使わないため取得・デコードしない（[`require_table_schema_write`] と異なり
@@ -5779,12 +5815,17 @@ impl Storage {
     /// クレート外・テストからの新規行投入は [`crate::tenant::insert_row`]（テナント境界付き
     /// 書き込みガード。TASK-95・RECOVER-4）を経由すること。
     ///
-    /// `#[cfg_attr(not(test), allow(dead_code))]`: 現状の呼び出し元はすべて各モジュールの
-    /// `#[cfg(test)]` ユニットテスト（`arena.rs`・`core.rs`・`rls.rs`・本ファイルの
-    /// `tenant.rs`）のみのため、`cfg(test)` を含まない通常ビルド（wire-server が依存する
-    /// ビルド単位）では本メソッドが到達不能になり `dead_code` lint が発火する。これは
-    /// 上記の意図的な `pub(crate)` 制限の帰結であり黙殺してよい。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `#[cfg(test)]`: 現状の呼び出し元はすべて各モジュールの `#[cfg(test)]`
+    /// ユニットテスト（`arena.rs`・`core.rs`・`rls.rs`・本ファイルの `tenant.rs`）のみ
+    /// （Issue #1078。以前は `#[cfg_attr(not(test), allow(dead_code))]` で dead_code lint
+    /// を黙殺していたが、`#[cfg(test)]` によりテスト専用であることをコンパイル構成で
+    /// 保証する）。本メソッドは [`crate::constraint::enforce_row_constraints_in_txn`]
+    /// （TABLE-16・TABLE-17 の検査点）を経由しないため、
+    /// `reject_constrained_table_for_raw_write` が主キー・UNIQUE・CHECK・FOREIGN KEY
+    /// のいずれかを宣言したテーブルへの書き込みを fail-closed に拒否する（制約違反状態を
+    /// 意図せず作れてしまう経路を塞ぐ）。制約付きテーブルへの投入は
+    /// [`crate::tenant::insert_row`]（検査点経由）を使うこと。
+    #[cfg(test)]
     pub(crate) fn insert_row_into_table(
         &self,
         table_name: &str,
@@ -5795,6 +5836,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            reject_constrained_table_for_raw_write(&schema)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
@@ -5825,7 +5867,12 @@ impl Storage {
     /// （security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
     /// クレート外・テストからのバッチ投入は [`crate::tenant::insert_rows`]
     /// （`PolicyContext` 必須のガード付きバッチ API）を経由すること。
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// `#[cfg(test)]`（Issue #1078）: [`Self::insert_row_into_table`] と同じ理由でテスト専用に
+    /// 限定する。`reject_constrained_table_for_raw_write` による制約付きテーブルの
+    /// fail-closed 拒否は、空バッチ（`rows.is_empty()` の早期 return）より前に行う
+    /// （制約付きテーブルへの空バッチ投入だけを検査迂回の抜け道にしない）。
+    #[cfg(test)]
     pub(crate) fn insert_rows_into_table(
         &self,
         table_name: &str,
@@ -5835,6 +5882,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            reject_constrained_table_for_raw_write(&schema)?;
             if rows.is_empty() {
                 // 存在確認以外に何も変更しないため、commit（＝世代を進める）せず
                 // write txn を破棄する（`redb::WriteTransaction` は commit/abort の
@@ -5881,7 +5929,11 @@ impl Storage {
     /// と同じ理由でクレート外へは公開しない（`tenant_id` を引数で受け取る生の経路）。
     /// クレート外・テストからの型付き行投入は [`crate::tenant::insert_typed_row`]
     /// （`PolicyContext` から `tenant_id` を導出するガード付き API）を経由すること。
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// `#[cfg(test)]`（Issue #1078）: [`Self::insert_row_into_table`] と同じ理由でテスト
+    /// 専用に限定し、`reject_constrained_table_for_raw_write` で制約付きテーブルへの
+    /// 書き込みを fail-closed に拒否する。
+    #[cfg(test)]
     pub(crate) fn insert_typed_row(
         &self,
         table_name: &str,
@@ -5894,6 +5946,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            reject_constrained_table_for_raw_write(&schema)?;
             let vector_idx = schema.columns.iter().position(|c| c.ty.is_vector());
             // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま
             // 扱う（読み取り側の dim==0 モデルと整合）。列がある場合の「値が
@@ -10093,5 +10146,237 @@ mod tests {
         )
         .with_checks(vec![check("broken", &["kind"], "kind = = 'a'")]);
         assert!(schema_check_references_column(&broken, "body"));
+    }
+
+    // --- 生書き込み API（`#[cfg(test)]` 限定）の制約付きテーブル拒否
+    // （TABLE-16・TABLE-17、Issue #1078） -----------------------------------
+
+    /// 制約付きテーブルへの生書き込みを `reject_constrained_table_for_raw_write` が
+    /// 拒否した場合、行が書かれず（`RowNotFound` のまま）テーブル世代も進まないこと
+    /// を確認する共通アサーション。
+    fn assert_raw_write_rejected_without_side_effect(
+        storage: &Storage,
+        table_name: &str,
+        tenant_id: &str,
+        id: u64,
+        prev_generation: u64,
+    ) {
+        assert_eq!(
+            storage
+                .table_generation(table_name)
+                .expect("read generation"),
+            prev_generation,
+            "rejected raw write must not bump the table generation"
+        );
+        assert!(
+            matches!(
+                storage.get_row_from_table(table_name, tenant_id, id),
+                Err(CatalogError::RowNotFound(_))
+            ),
+            "rejected raw write must not persist the row"
+        );
+    }
+
+    /// (a) 主キー付きテーブルへの `insert_row_into_table` は拒否される。
+    #[test]
+    fn insert_row_into_table_rejects_primary_key_table() {
+        let path = unique_db_path("raw-write-guard-insert-row-pk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("k", ColumnType::Text, false),
+            ],
+        )
+        .with_primary_key(vec!["k".to_string()]);
+        storage.create_table(&schema).expect("create table");
+        let prev_generation = storage.table_generation("docs").expect("read generation");
+
+        let err = storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.1, 0.2],
+                    metadata: &[],
+                },
+            )
+            .expect_err("primary-key table must reject raw write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "docs",
+            "tenant-a",
+            1,
+            prev_generation,
+        );
+    }
+
+    /// (b) UNIQUE 制約付きテーブルへの `insert_rows_into_table` は非空・空バッチの
+    /// いずれも拒否される（`UniqueConstraint` は事後の `alter_table_add_unique_constraint`
+    /// で追加。既存行の走査で違反がないことを確認してから制約が付くため、制約が付いた
+    /// 後は生 API 経由の新規投入・空バッチ投入がいずれも拒否されることを確認する）。
+    #[test]
+    fn insert_rows_into_table_rejects_unique_constraint_table_including_empty_batch() {
+        let path = unique_db_path("raw-write-guard-insert-rows-unique");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("k", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        // 制約が付く前は生 API での投入に成功する（回帰: 無制約テーブルは従来どおり）。
+        // `alter_table_add_unique_constraint` は既存行を `k` 列としてスキーマ準拠デコード
+        // するため、ここではスキーマ準拠の metadata を作る `insert_typed_row`（この時点
+        // ではまだ無制約なので受理される）で投入する。
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.1, 0.2]),
+                    RowCodecValue::Text("k1".to_string()),
+                ],
+            )
+            .expect("unconstrained table must still accept raw write");
+        storage
+            .alter_table_add_unique_constraint("docs", &["k"])
+            .expect("add unique constraint");
+        let prev_generation = storage.table_generation("docs").expect("read generation");
+
+        let err = storage
+            .insert_rows_into_table(
+                "docs",
+                &[(
+                    2,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[0.3, 0.4],
+                        metadata: &[],
+                    },
+                )],
+            )
+            .expect_err("unique-constrained table must reject non-empty raw batch write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "docs",
+            "tenant-a",
+            2,
+            prev_generation,
+        );
+
+        // 空バッチも同じガードで拒否される（`rows.is_empty()` の早期 return より前に
+        // ガードを呼ぶ契約。制約付きテーブルへの空バッチだけが検査を迂回しない）。
+        let err = storage
+            .insert_rows_into_table("docs", &[])
+            .expect_err("unique-constrained table must reject empty raw batch write too");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_eq!(
+            storage.table_generation("docs").expect("read generation"),
+            prev_generation,
+            "rejected empty raw batch write must not bump the table generation"
+        );
+    }
+
+    /// (c) CHECK 制約付きテーブルへの `insert_typed_row` は拒否される。
+    #[test]
+    fn insert_typed_row_rejects_check_constraint_table() {
+        let path = unique_db_path("raw-write-guard-insert-typed-check");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+            ],
+        )
+        .with_checks(vec![check("docs_kind_check", &["kind"], "kind = 'a'")]);
+        storage.create_table(&schema).expect("create table");
+        let prev_generation = storage.table_generation("docs").expect("read generation");
+
+        let err = storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.1, 0.2]),
+                    RowCodecValue::Text("a".to_string()),
+                ],
+            )
+            .expect_err("check-constrained table must reject raw write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "docs",
+            "tenant-a",
+            1,
+            prev_generation,
+        );
+    }
+
+    /// (d) FOREIGN KEY を宣言した子テーブルへの生書き込みは拒否される
+    /// （参照元列側の検査。参照先の根拠は `reject_constrained_table_for_raw_write` の
+    /// ドキュメンテーションコメント参照）。
+    #[test]
+    fn insert_row_into_table_rejects_foreign_key_table() {
+        let path = unique_db_path("raw-write-guard-insert-row-fk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "parents",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create parents");
+        let child_schema = TableSchema::new(
+            "children",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("parent_id", ColumnType::BigInt, true),
+            ],
+        )
+        .with_foreign_keys(vec![fk(&["parent_id"], "parents", &["id"])]);
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+        let prev_generation = storage
+            .table_generation("children")
+            .expect("read generation");
+
+        let err = storage
+            .insert_row_into_table(
+                "children",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.1, 0.2],
+                    metadata: &[],
+                },
+            )
+            .expect_err("foreign-key table must reject raw write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "children",
+            "tenant-a",
+            1,
+            prev_generation,
+        );
     }
 }
