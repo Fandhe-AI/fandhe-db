@@ -153,6 +153,22 @@
 //! パリティが成立せず対象外。ヘッダを含む HTTP 応答全体のバイト同一性は
 //! 層 A（`nosql12_update_delete.rs::strip_date` 比較）の担当で、本ファイルは
 //! ステータス・本文までの一致に留める。
+//!
+//! ## パリティ総合検証（Issue #950）
+//!
+//! 上記 3 シナリオ（#779・#877）に加え、Phase 7（親 #944。#945〜#949・
+//! #1061〜#1063）の追加機能・insert・DDL 3 op を含む
+//! `wire_server::http::query::op::Op::ALL`（9 語彙）全体へ層 B 到達性を
+//! 持たせる。範囲比較・`IN`・`OR`・`sort`・`offset`・複数列 `group_by`は
+//! `PARITY_CASES` への追加（`run_sql_nosql_parity_scenario` を再利用）、
+//! 拒否ケース（`sort`／`offset` on `search`/`aggregate`・語彙外 `op`・RLS
+//! 述語名 `filter`）は `REJECTION_CASES`、insert・DDL 3 op・述語形
+//! `delete` は `run_phase7_write_parity_scenario` がそれぞれ担う。
+//! `parity_matrix_covers_every_nosql_op`（`#[ignore]` なし・常時
+//! `make ci`）が `Op::ALL` 全体の層 B 網羅を機械的に固定する。詳細な
+//! スコープ縮小の判断（述語形 DML の RLS-9 応答同一性・3 テナント横断は
+//! 対象外にした理由等）は `docs/design/three-client-e2e-harness.md`
+//! 「パリティ総合検証（Issue #950）」節に記録する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -225,20 +241,29 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     (path, guard)
 }
 
-/// `wire-server --surface nosql` を子プロセスとして起動し、stderr の
-/// `listening on` 行から実 bind ポートを取得する（`common::SpawnedServer` を
-/// 再利用。取得できなければ蓄積 stderr 行を添えて `panic!`）。
-fn spawn_nosql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer, u16) {
-    let mut server = common::SpawnedServer::spawn(&[
+/// `spawn_sql_server`／`spawn_nosql_server`／それぞれの `_with_ddl_allowed`
+/// 変種（Issue #950・DDL パリティ）が共有する起動ロジック。`extra_args` は
+/// `--ddl-allowed-users <users>` のような追加フラグ（無ければ空スライス）。
+fn spawn_server_with_args(
+    users_path: &str,
+    db_path: &str,
+    surface_nosql: bool,
+    extra_args: &[&str],
+) -> (common::SpawnedServer, u16) {
+    let mut args: Vec<&str> = vec![
         "--users",
         users_path,
         "--db",
         db_path,
         "--bind",
         "127.0.0.1:0",
-        "--surface",
-        "nosql",
-    ]);
+    ];
+    if surface_nosql {
+        args.push("--surface");
+        args.push("nosql");
+    }
+    args.extend_from_slice(extra_args);
+    let mut server = common::SpawnedServer::spawn(&args);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let addr_str = server.wait_for_listening(deadline);
@@ -247,8 +272,8 @@ fn spawn_nosql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer
         None => {
             let seen = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
             panic!(
-                "wire-server did not report a listening address within the deadline; \
-                 stderr so far: {seen:?}"
+                "wire-server (surface_nosql={surface_nosql}) did not report a listening \
+                 address within the deadline; stderr so far: {seen:?}"
             );
         }
     };
@@ -258,35 +283,48 @@ fn spawn_nosql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer
     (server, addr.port())
 }
 
+/// `wire-server --surface nosql` を子プロセスとして起動し、stderr の
+/// `listening on` 行から実 bind ポートを取得する（`common::SpawnedServer` を
+/// 再利用。取得できなければ蓄積 stderr 行を添えて `panic!`）。
+fn spawn_nosql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer, u16) {
+    spawn_server_with_args(users_path, db_path, true, &[])
+}
+
 /// `wire-server`（SQL 表層。`--surface` を渡さない既定分岐）を子プロセスとして
 /// 起動する（Issue #779。`spawn_nosql_server` と同型だが `--surface nosql` を
 /// 渡さない点のみが異なる）。
 fn spawn_sql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer, u16) {
-    let mut server = common::SpawnedServer::spawn(&[
-        "--users",
-        users_path,
-        "--db",
-        db_path,
-        "--bind",
-        "127.0.0.1:0",
-    ]);
+    spawn_server_with_args(users_path, db_path, false, &[])
+}
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let addr_str = server.wait_for_listening(deadline);
-    let addr_str = match addr_str {
-        Some(addr) => addr,
-        None => {
-            let seen = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
-            panic!(
-                "wire-server (SQL surface) did not report a listening address within the \
-                 deadline; stderr so far: {seen:?}"
-            );
-        }
-    };
-    let addr: std::net::SocketAddr = addr_str
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid listening address {addr_str:?}: {e}"));
-    (server, addr.port())
+/// `spawn_nosql_server` に `--ddl-allowed-users <ddl_users>` を追加した変種
+/// （Issue #950・DDL パリティ。`ddl_users` はカンマ区切りの username 列）。
+fn spawn_nosql_server_with_ddl_allowed(
+    users_path: &str,
+    db_path: &str,
+    ddl_users: &str,
+) -> (common::SpawnedServer, u16) {
+    spawn_server_with_args(
+        users_path,
+        db_path,
+        true,
+        &["--ddl-allowed-users", ddl_users],
+    )
+}
+
+/// `spawn_sql_server` に `--ddl-allowed-users <ddl_users>` を追加した変種
+/// （Issue #950・DDL パリティ）。
+fn spawn_sql_server_with_ddl_allowed(
+    users_path: &str,
+    db_path: &str,
+    ddl_users: &str,
+) -> (common::SpawnedServer, u16) {
+    spawn_server_with_args(
+        users_path,
+        db_path,
+        false,
+        &["--ddl-allowed-users", ddl_users],
+    )
 }
 
 /// SQL 経路パリティ（Issue #779）専用の一時 DB を用意する
@@ -302,6 +340,17 @@ fn spawn_sql_server(users_path: &str, db_path: &str) -> (common::SpawnedServer, 
 /// で検証する。**他テナント**の接続には両表層のどの応答にも現れないこと
 /// （tenant-c／carol はどちらも見えない）をパリティ検証の非漏えい証跡に
 /// 使う。
+/// `category`（`TEXT`）・`price`（`NUMERIC(10,2)`）は Issue #950（Phase 7
+/// パリティ総合検証）向けに追加した列——範囲比較（`gte`）・`IN`・`OR`・
+/// `sort`・`offset`・複数列 `group_by`（#945・#946・#947・#949）を NUMERIC
+/// 列・複数列で検証するための材料であり、既存 10 ケース（Issue #779）が
+/// 参照する列（`id`／`lang`／`embedding`）には影響しない（既存
+/// `expected_rows_*` は不変）。`price` は本ファイルのどのケースからも
+/// `columns`（投影）へは含めない——NoSQL `columns[].type` の期待値表
+/// （`run_sql_nosql_parity_scenario` 内 `expected_nosql_types`）が
+/// `id`／`embedding` 以外を一律 `"text"` とみなす簡易表のままのため、
+/// `NUMERIC` 列を投影すると型名の対称性チェックが誤って失敗する
+/// （`WHERE`／`filter` 条件としてのみ使う分には型名比較を経由しない）。
 fn seed_parity_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-http-e2e-parity-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -313,15 +362,59 @@ fn seed_parity_db() -> (PathBuf, temp_db::CleanupGuard) {
                 ColumnDef::new("embedding", ColumnType::Vector(2), false),
                 ColumnDef::new("lang", ColumnType::Text, false),
                 ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("category", ColumnType::Text, false),
+                ColumnDef::new(
+                    "price",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
             ],
         ))
         .expect("create table");
-    let public_rows: [(&str, u64, [f32; 2], &str, &str); 3] = [
-        ("tenant-a", 1, [1.0, 0.0], "ja", "vector database intro"),
-        ("tenant-b", 2, [0.0, 1.0], "en", "query planning notes"),
-        ("tenant-c", 3, [-1.0, 0.0], "ja", "unrelated topic"),
+    // clippy::type_complexity 対策のタプル型エイリアス（Issue #950 の
+    // `category`／`price` 列追加でタプルの要素数が増えたため）。
+    type PublicRowSpec = (
+        &'static str,
+        u64,
+        [f32; 2],
+        &'static str,
+        &'static str,
+        &'static str,
+        i128,
+    );
+    let public_rows: [PublicRowSpec; 3] = [
+        (
+            "tenant-a",
+            1,
+            [1.0, 0.0],
+            "ja",
+            "vector database intro",
+            "A",
+            350,
+        ),
+        (
+            "tenant-b",
+            2,
+            [0.0, 1.0],
+            "en",
+            "query planning notes",
+            "B",
+            725,
+        ),
+        (
+            "tenant-c",
+            3,
+            [-1.0, 0.0],
+            "ja",
+            "unrelated topic",
+            "A",
+            999,
+        ),
     ];
-    for (tenant, id, dir, lang, body) in public_rows {
+    for (tenant, id, dir, lang, body, category, price_unscaled) in public_rows {
         let ctx = PolicyContext::new(tenant).expect("valid tenant");
         engine::tenant::insert_typed_row(
             &storage,
@@ -333,17 +426,39 @@ fn seed_parity_db() -> (PathBuf, temp_db::CleanupGuard) {
                 Value::Vector(dir.to_vec()),
                 Value::Text(lang.to_string()),
                 Value::Text(body.to_string()),
+                Value::Text(category.to_string()),
+                Value::Numeric(
+                    engine::numeric::Decimal::from_parts(price_unscaled, 2).expect("valid decimal"),
+                ),
             ],
             &engine::recovery::required_op_id::OperationId::parse("test-op")
                 .expect("valid operation_id"),
         )
         .expect("insert public row");
     }
-    let private_rows: [(&str, u64, [f32; 2], &str); 2] = [
-        ("tenant-a", 11, [1.0, 0.0], "xx"),
-        ("tenant-b", 12, [0.0, 1.0], "ja"),
+    type PrivateRowSpec = (
+        &'static str,
+        u64,
+        [f32; 2],
+        &'static str,
+        &'static str,
+        i128,
+    );
+    // レビュー指摘（PR #1135・Codex P2・2 巡目）: `category` が "A"／"B" の
+    // 2 値のみだと `category IN ('A', 'B')` は可視行全件に一致し、`IN`
+    // フィルターを適用しない回帰でも固定オラクルに一致してしまい検証対象の
+    // 欠落を検知できない（`in-category` ケースの doc コメント参照）。
+    // alice 所有の Private 行（id=11）の `category` を集合外の値 `"Z"` に
+    // することで、`IN ('A', 'B')` は alice 視点で id=11 を除外しなければ
+    // ならなくなる（`in-category`／`sort-category-id`／
+    // `group-by-lang-category` の `expected_rows_alice` を本行の値に合わせて
+    // 更新済み）。bob・carol には id=11 が見えないため両者の期待値には影響
+    // しない。
+    let private_rows: [PrivateRowSpec; 2] = [
+        ("tenant-a", 11, [1.0, 0.0], "xx", "Z", 100),
+        ("tenant-b", 12, [0.0, 1.0], "ja", "B", 800),
     ];
-    for (tenant, id, dir, lang) in private_rows {
+    for (tenant, id, dir, lang, category, price_unscaled) in private_rows {
         let ctx =
             PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
@@ -357,6 +472,10 @@ fn seed_parity_db() -> (PathBuf, temp_db::CleanupGuard) {
                 Value::Vector(dir.to_vec()),
                 Value::Text(lang.to_string()),
                 Value::Text("private body".to_string()),
+                Value::Text(category.to_string()),
+                Value::Numeric(
+                    engine::numeric::Decimal::from_parts(price_unscaled, 2).expect("valid decimal"),
+                ),
             ],
             &engine::recovery::required_op_id::OperationId::parse("test-op-private")
                 .expect("valid operation_id"),
@@ -774,6 +893,125 @@ const PARITY_CASES: &[ParityCase] = &[
         expected_rows_bob: &[&["ja", "3"]],
         expected_rows_carol: &[&["ja", "2"]],
     },
+    // ここから Issue #950（Phase 7 パリティ総合検証）追加分。範囲比較・`IN`・
+    // `OR`（#945・NOSQL-14）・`sort`（#946・NOSQL-15）・`offset`（#947・
+    // NOSQL-15）・複数列 `group_by`（#949・NOSQL-16）を `seed_parity_db` の
+    // `category`／`price` 列で検証する。`ordered: false` にした集計ケース
+    // （range-or・multi-group-by）はエンジン内部の既定キー順を仮定せず、
+    // 多重集合一致のみを固定オラクルとして要求する（安全側の判断）。
+    ParityCase {
+        label: "range-price-gte",
+        sql: "SELECT id FROM docs WHERE price >= '7.00' LIMIT 10",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"column":"price","op":"gte","value":7}]}"#,
+        ordered: false,
+        expected_rows_alice: &[&["2"], &["3"]],
+        expected_rows_bob: &[&["2"], &["3"], &["12"]],
+        expected_rows_carol: &[&["2"], &["3"]],
+    },
+    // レビュー指摘（PR #1135・Cursor Bugbot・1 巡目）: `seed_parity_db` は
+    // category が "A"／"B" の 2 値のみのため、旧値 `IN ('A')`（要素 1 個）は
+    // `category = 'A'` と完全に同一の結果集合になり、IN を EQ にマップする
+    // 回帰や IN リストの先頭要素のみを見る実装でもオラクルに一致してしまい
+    // IN の複数要素セマンティクスを実際にはロックできていなかった。
+    // `IN ('A', 'B')` へ変更し、先頭要素のみを見る実装（'A' 一致のみ）では
+    // category='B' の行（id=2 と各テナント自身の private B 行）が欠落して
+    // オラクルに一致しなくなるようにした。
+    //
+    // レビュー指摘（PR #1135・Codex P2・2 巡目）: 1 巡目修正後も
+    // `seed_parity_db` の可視行が全て category "A"／"B" のいずれかだった
+    // ため、`IN ('A', 'B')` は alice/bob/carol いずれの視点でも可視行全件に
+    // 一致し、`IN` フィルターを一切適用しない回帰（全件返却）でもオラクルに
+    // 一致してしまっていた。alice 所有の Private 行（id=11）の `category` を
+    // 集合外の値 `"Z"` へ変更し（`seed_parity_db` 参照）、alice の期待行から
+    // id=11 を除外した。bob・carol には id=11 が見えないため両者の期待値は
+    // 不変。
+    ParityCase {
+        label: "in-category",
+        sql: "SELECT id FROM docs WHERE category IN ('A', 'B') LIMIT 10",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"column":"category","op":"in","value":["A","B"]}]}"#,
+        ordered: false,
+        expected_rows_alice: &[&["1"], &["2"], &["3"]],
+        expected_rows_bob: &[&["1"], &["2"], &["3"], &["12"]],
+        expected_rows_carol: &[&["1"], &["2"], &["3"]],
+    },
+    // レビュー指摘（PR #1135・Cursor Bugbot）: 旧値（`lang = 'en'`）は
+    // `seed_parity_db` 上で `id=2`（`lang=en`・`price=7.25`）にしか一致せず、
+    // `price >= 7` 単独の一致集合（id=2,3／bob のみ+id=12）へ完全に包含
+    // されていた。そのため「最後の分岐だけを残す」誤った OR 実装
+    // （左辺を無視する等）でも `price >= 7` 単独と同じ結果になり、オラクル
+    // に一致してしまい OR パリティを実質検証できていなかった。`lang = 'ja'`
+    // （`id=1`: `price=3.50 < 7` で `price` 条件を満たさない・全テナント
+    // 可視）へ変更し、`price >= 7` 単独では含まれない行を OR の左辺だけが
+    // 追加することで、両辺を実際に評価する OR 実装でなければ一致しない
+    // オラクルにした。
+    ParityCase {
+        label: "or-lang-or-price",
+        sql: "SELECT id FROM docs WHERE (lang = 'ja' OR price >= '7.00') LIMIT 10",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id"],"filter":[{"or":[{"column":"lang","op":"eq","value":"ja"},{"column":"price","op":"gte","value":7}]}]}"#,
+        ordered: false,
+        expected_rows_alice: &[&["1"], &["2"], &["3"]],
+        expected_rows_bob: &[&["1"], &["2"], &["3"], &["12"]],
+        expected_rows_carol: &[&["1"], &["2"], &["3"]],
+    },
+    ParityCase {
+        label: "sort-category-id",
+        sql: "SELECT id, category FROM docs ORDER BY category ASC, id ASC LIMIT 10",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"columns":["id","category"],"sort":[{"column":"category","dir":"asc"},{"column":"id","dir":"asc"}]}"#,
+        ordered: true,
+        // id=11 の category は `"Z"`（`seed_parity_db`・`in-category` の
+        // レビュー指摘対応コメント参照）のため ASC 順で "B" の後に並ぶ。
+        expected_rows_alice: &[&["1", "A"], &["3", "A"], &["2", "B"], &["11", "Z"]],
+        expected_rows_bob: &[&["1", "A"], &["3", "A"], &["2", "B"], &["12", "B"]],
+        expected_rows_carol: &[&["1", "A"], &["3", "A"], &["2", "B"]],
+    },
+    ParityCase {
+        label: "offset-sorted-id",
+        sql: "SELECT id FROM docs ORDER BY id ASC LIMIT 10 OFFSET 1",
+        json_body: r#"{"op":"scan","table":"docs","limit":10,"offset":1,"columns":["id"],"sort":[{"column":"id","dir":"asc"}]}"#,
+        ordered: true,
+        expected_rows_alice: &[&["2"], &["3"], &["11"]],
+        expected_rows_bob: &[&["2"], &["3"], &["12"]],
+        expected_rows_carol: &[&["2"], &["3"]],
+    },
+    ParityCase {
+        label: "group-by-lang-category",
+        sql: "SELECT lang, category, COUNT(*) FROM docs GROUP BY lang, category",
+        json_body: r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","category"]}"#,
+        ordered: false,
+        // id=11 の category は `"Z"`（`seed_parity_db`・`in-category` の
+        // レビュー指摘対応コメント参照）。
+        expected_rows_alice: &[&["en", "B", "1"], &["ja", "A", "2"], &["xx", "Z", "1"]],
+        expected_rows_bob: &[&["en", "B", "1"], &["ja", "A", "2"], &["ja", "B", "1"]],
+        expected_rows_carol: &[&["en", "B", "1"], &["ja", "A", "2"]],
+    },
+];
+
+/// Issue #950 §3.6「拒否ケース」: NoSQL 表層が意図的に受理しない形
+/// （`nosql-api.md`「対応の無いもの」節）を alice 1 テナントで固定する
+/// （`(label, json_body, expected_wire_code)`）。`search`／`aggregate` への
+/// `sort`／`offset`（#946・#947 の対象外化）・語彙外 `op`・`filter` への
+/// RLS 述語名指定（`.claude/rules/security.md` P0）を含む。
+const REJECTION_CASES: &[(&str, &str, &str)] = &[
+    (
+        "reject-sort-on-search",
+        r#"{"op":"search","table":"docs","vector":[1.0,0.0],"limit":3,"columns":["id"],"sort":[{"column":"id","dir":"asc"}]}"#,
+        "42601",
+    ),
+    (
+        "reject-offset-on-aggregate",
+        r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"offset":1}"#,
+        "42601",
+    ),
+    (
+        "reject-unknown-op",
+        r#"{"op":"begin","table":"docs"}"#,
+        "0A000",
+    ),
+    (
+        "reject-rls-predicate-filter",
+        r#"{"op":"scan","table":"docs","limit":10,"filter":[{"column":"visible","op":"eq","value":"x"}]}"#,
+        "42601",
+    ),
 ];
 
 /// curl 応答の本文上限（untrusted な外部プロセス出力を無制限に読み込まない
@@ -1600,6 +1838,42 @@ fn run_sql_nosql_parity_scenario(client: HttpClient) {
             ));
         }
 
+        // Issue #950 §3.6「拒否ケース」: SQL 表層には対応する形が無い（または
+        // 意味的に別構文になる）ため SQL↔NoSQL 比較の対象外とし、NoSQL 側の
+        // 固定 `wire_code` のみを alice 1 テナントで検証する（`nosql-api.md`
+        // 「対応の無いもの」節・#945〜#949 の受け入れ条件に列挙された
+        // 非対称。psql 側の受理確認は本ファイルのスコープ外——
+        // `docs/design/three-client-e2e-harness.md` の Issue #950 節に記録）。
+        if user == "alice" {
+            for (label, json_body, expected_wire_code) in REJECTION_CASES {
+                seq += 1;
+                let (status, body) = client.post(
+                    nosql_port,
+                    "/v1/query",
+                    Some(&token),
+                    json_body,
+                    &out_dir,
+                    seq,
+                );
+                assert_ne!(
+                    status, 200,
+                    "rejection case {label} unexpectedly succeeded: {body}"
+                );
+                assert_eq!(
+                    nosql_wire_code_of(&body),
+                    *expected_wire_code,
+                    "rejection case {label}: unexpected wire_code (body={body})"
+                );
+                for leaked in ["tenant-a", "tenant-b", "tenant-c", "11", "12"] {
+                    assert!(
+                        !body.contains(leaked),
+                        "rejection case {label}: response body leaks {leaked:?}: {body}"
+                    );
+                }
+                case_summaries.push(format!("{label}(rejected={expected_wire_code})"));
+            }
+        }
+
         seq += 1;
         let (close_status, close_body) = client.post(
             nosql_port,
@@ -2108,12 +2382,17 @@ fn affected_count_from_tag(tag: &str) -> u64 {
         .unwrap_or_else(|e| panic!("CommandComplete tag {tag:?} has no numeric suffix: {e}"))
 }
 
-/// NoSQL 応答本文から `updated`／`deleted` の影響行数を取り出す。
+/// NoSQL 応答本文から `updated`／`deleted`／`inserted`（Issue #950・insert
+/// パリティで追加）の影響行数を取り出す。
 fn affected_count_from_nosql_body(body: &str) -> u64 {
     let obj = json_object(body);
-    match obj.get("updated").or_else(|| obj.get("deleted")) {
+    match obj
+        .get("updated")
+        .or_else(|| obj.get("deleted"))
+        .or_else(|| obj.get("inserted"))
+    {
         Some(JsonValue::Number(JsonNumber::PosInt(n))) => *n,
-        other => panic!("expected updated/deleted field, got {other:?} (body={body:?})"),
+        other => panic!("expected updated/deleted/inserted field, got {other:?} (body={body:?})"),
     }
 }
 
@@ -2701,4 +2980,481 @@ fn urllib_matches_psql_on_update_delete_and_rls_boundary() {
 #[ignore = "requires psql and node (>= 18); run via `make e2e-three-client-http`"]
 fn fetch_matches_psql_on_update_delete_and_rls_boundary() {
     run_sql_nosql_dml_parity_scenario(HttpClient::Fetch);
+}
+
+// ---------------------------------------------------------------------
+// insert／DDL／述語形 DML パリティ（Issue #950 §3.3〜§3.5）
+// ---------------------------------------------------------------------
+
+/// テーブルを 1 つも持たない空 DB を用意する（Issue #950・DDL パリティの
+/// 起点。`seed_empty_docs_db` は `docs` テーブルを事前作成するため別関数と
+/// する）。
+fn seed_empty_db_no_table(label: &str) -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path(&format!("three-client-http-e2e-ddl-{label}"));
+    let guard = temp_db::CleanupGuard(path.clone());
+    // `Storage::open` だけで DB ファイルを生成させ、直後に drop して
+    // 単一ライター制約（redb）を子プロセス起動前に解放する
+    // （`seed_parity_db` 等の既存ヘルパーと同じ作法）。
+    let _storage = Storage::open(&path).expect("open storage");
+    (path, guard)
+}
+
+/// SQL 表層（生 wire）・NoSQL 表層（`client`）へ同一の insert／DDL／述語形
+/// `DELETE` 手順を順に適用し、影響行数・`wire_code`・最終状態が一致する
+/// ことを固定する（Issue #950 §3.3〜§3.5。curl／urllib／fetch の 3 テストが
+/// 共有）。`widgets` テーブル自体は `docs` の RLS 検証 seed とは無関係の
+/// 独立テーブルであり、DDL がカタログ操作としてテナント非依存であることを
+/// 前提に alice（`--ddl-allowed-users`）1 テナントで手順を組む。bob は
+/// 非許可ユーザーとして `drop_table` の権限拒否（`42501`）のみ確認する
+/// （テナント境界そのものは `run_sql_nosql_parity_scenario`／
+/// `run_sql_nosql_dml_parity_scenario` が担う）。
+///
+/// **スコープ縮小（Issue #950 実装時点の判断）**: 計画（§3.4）が求める
+/// RLS-9 応答同一性（他テナント行向け／未存在 id 向けの同一 `operation_id`
+/// 応答一致）の述語形版、および 3 テナント × 述語形 DML の全組み合わせは
+/// 本関数では扱わない——単一行 `id` 完全一致形の RLS-9 は
+/// `run_sql_nosql_dml_parity_scenario` が既に固定しており、述語形の
+/// パリティ・RLS 非漏えいは層 A（`nosql12_update_delete.rs` 述語形節）が
+/// 固定済みのため、本ファイルでは表層横断の insert／DDL 到達性確認に
+/// 絞った（`docs/design/three-client-e2e-harness.md` Issue #950 節に記録）。
+///
+/// [`run_phase7_write_parity_scenario`] が実際に送信する JSON 本文（宣言順。
+/// `create_table` → `drop_table`（bob 拒否）→ `insert` ×2 → `alter_table` →
+/// 述語形 `delete` → `scan` ×2）。`parity_matrix_covers_every_nosql_op` が
+/// この配列と `PARITY_CASES`／`DML_STEPS`／`BOB_STEP` の `json_body` から
+/// 実使用の `op` 値を収集して `Op::ALL` の**成功**パリティ網羅を固定する
+/// ため、関数内へ文字列リテラルを直書きせず本配列を参照させる（レビュー
+/// 指摘 Issue #950: ソース全文への `contains` 判定では実行対象のケース
+/// 定義から外れた文字列一致まで拾ってしまい網羅漏れを検知できないため、
+/// 実際に送信される値そのものを単一情報源にする）。`REJECTION_CASES` は
+/// この網羅集合に含めない（拒否ケースは成功パリティを検証しないため。
+/// PR #1135 レビュー指摘・[`parity_matrix_covers_every_nosql_op`] doc 参照）。
+///
+/// 各要素は `expect` で成功パリティ集計対象か否かを明示する（PR #1135・
+/// Codex P2 レビュー指摘）。`bob-drop-denied`（index 1）は bob による拒否
+/// （`42501`）にのみ使う body だが、同一 body で alice が後続で `drop_table`
+/// を成功させる呼び出し（`drop-table-success`）もあるため `Success` 扱いで
+/// 問題ない。`post-drop-scan`（index 7・`scan` limit 1）はテーブル削除後の
+/// `42P01` 拒否確認専用で成功呼び出しが存在しないため `RejectionOnly` とし、
+/// 網羅ガードの集計対象から除外する（`scan` 自体は index 6 の成功ケースで
+/// 別途網羅済み）。
+enum Phase7CaseExpectation {
+    /// このシナリオ内で実際に成功応答（200・`ok:true` 等）を得る呼び出しが
+    /// 存在する body。
+    Success,
+    /// このシナリオ内では拒否（非 200）呼び出しにしか使わない body。
+    RejectionOnly,
+}
+
+struct Phase7WriteCase {
+    json_body: &'static str,
+    expect: Phase7CaseExpectation,
+}
+
+const PHASE7_WRITE_CASES: &[Phase7WriteCase] = &[
+    Phase7WriteCase {
+        json_body: r#"{"op":"create_table","table":"widgets","columns":[{"name":"name","type":"text"},{"name":"qty","type":"integer"}]}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"drop_table","table":"widgets"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"insert","table":"widgets","rows":[{"id":1,"name":"gadget","qty":5}],"operation_id":"op-insert-1"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"insert","table":"widgets","rows":[{"id":2,"name":"sprocket","qty":9}],"operation_id":"op-insert-2"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"alter_table","table":"widgets","add_column":{"name":"note","type":"text"}}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"delete","table":"widgets","filter":[{"column":"name","op":"eq","value":"sprocket"}],"operation_id":"op-del-1"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"scan","table":"widgets","limit":100,"columns":["id","name","qty","note"]}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"scan","table":"widgets","limit":1}"#,
+        expect: Phase7CaseExpectation::RejectionOnly,
+    },
+];
+
+fn run_phase7_write_parity_scenario(client: HttpClient) {
+    let client_version = client.version();
+    let psql_version = psql_version();
+
+    let users_path = common::write_user_store_file(&[
+        ("alice", "tenant-a", "pw-alice"),
+        ("bob", "tenant-b", "pw-bob"),
+    ]);
+    let users_path_str = users_path.to_str().expect("utf-8 users path").to_string();
+
+    let out_dir = std::env::temp_dir().join(format!(
+        "wire-server-three-client-http-e2e-ddl-{}-out-{}-{}",
+        client.label(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&out_dir).expect("create client output dir");
+    let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
+    let mut seq: u32 = 0;
+
+    // --- Phase 1: DB-S を SQL 表層（`--ddl-allowed-users alice`）で駆動する。
+    let (db_s_path, _db_s_guard) = seed_empty_db_no_table("db-s");
+    let db_s_path_str = db_s_path.to_str().expect("utf-8 db path").to_string();
+    let (sql_server, sql_port) =
+        spawn_sql_server_with_ddl_allowed(&users_path_str, &db_s_path_str, "alice");
+
+    let create = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "CREATE TABLE widgets (name TEXT, qty INTEGER)",
+    );
+    assert_eq!(
+        create,
+        SqlDmlOutcome::Success {
+            tag: "CREATE TABLE".to_string()
+        },
+        "SQL create_table: {create:?}"
+    );
+
+    let bob_drop_attempt = run_sql_dml(sql_port, "bob", "pw-bob", "DROP TABLE widgets");
+    match &bob_drop_attempt {
+        SqlDmlOutcome::Error { sqlstate, .. } => assert_eq!(sqlstate, "42501"),
+        other => panic!("expected 42501 permission error, got {other:?}"),
+    }
+
+    let insert1 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "INSERT INTO widgets (id, name, qty) VALUES (1, 'gadget', 5) USING OPERATION_ID 'op-insert-1'",
+    );
+    match &insert1 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row insert success, got {other:?}"),
+    }
+    let insert2 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "INSERT INTO widgets (id, name, qty) VALUES (2, 'sprocket', 9) USING OPERATION_ID 'op-insert-2'",
+    );
+    match &insert2 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row insert success, got {other:?}"),
+    }
+
+    let alter = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "ALTER TABLE widgets ADD COLUMN note TEXT",
+    );
+    assert_eq!(
+        alter,
+        SqlDmlOutcome::Success {
+            tag: "ALTER TABLE".to_string()
+        },
+        "SQL alter_table: {alter:?}"
+    );
+
+    let predicate_delete = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "DELETE FROM widgets WHERE name = 'sprocket' USING OPERATION_ID 'op-del-1'",
+    );
+    match &predicate_delete {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row predicate delete success, got {other:?}"),
+    }
+
+    let (sql_header, sql_rows) = run_psql_with_header(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "SELECT id, name, qty, note FROM widgets LIMIT 100",
+    );
+    assert_eq!(sql_header, vec!["id", "name", "qty", "note"]);
+    assert_eq!(
+        sql_rows,
+        vec![vec![
+            "1".to_string(),
+            "gadget".to_string(),
+            "5".to_string(),
+            NULL_SENTINEL.to_string(),
+        ]],
+        "SQL read-back after predicate delete: {sql_rows:?}"
+    );
+
+    let drop = run_sql_dml(sql_port, "alice", "pw-alice", "DROP TABLE widgets");
+    assert_eq!(
+        drop,
+        SqlDmlOutcome::Success {
+            tag: "DROP TABLE".to_string()
+        },
+        "SQL drop_table: {drop:?}"
+    );
+
+    let post_drop = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "SELECT id FROM widgets LIMIT 1",
+    );
+    match &post_drop {
+        SqlDmlOutcome::Error { sqlstate, .. } => assert_eq!(sqlstate, "42P01"),
+        other => panic!("expected 42P01 undefined-table error, got {other:?}"),
+    }
+
+    let sql_seen = sql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !sql_seen.iter().any(|line| line.contains("surface nosql")),
+        "SQL surface must not print the nosql surface banner: {sql_seen:?}"
+    );
+    assert_dml_scenario_no_leak("sql_seen", &sql_seen.join("\n"), &[]);
+
+    // --- Phase 2: 同一手順を DB-N 上で NoSQL 表層（`client`）へ適用する。
+    let (db_n_path, _db_n_guard) = seed_empty_db_no_table("db-n");
+    let db_n_path_str = db_n_path.to_str().expect("utf-8 db path").to_string();
+    let (nosql_server, nosql_port) =
+        spawn_nosql_server_with_ddl_allowed(&users_path_str, &db_n_path_str, "alice");
+
+    let issue_session = |user: &str, pw: &str, seq: &mut u32| -> String {
+        *seq += 1;
+        let (status, body) = client.post(
+            nosql_port,
+            "/v1/session",
+            None,
+            &format!(r#"{{"user":"{user}","password":"{pw}"}}"#),
+            &out_dir,
+            *seq,
+        );
+        assert_eq!(status, 200, "session issue failed for {user}: {body}");
+        match json_object(&body).get("token") {
+            Some(JsonValue::String(s)) => s.clone(),
+            other => panic!("expected string token field, got {other:?}"),
+        }
+    };
+    let alice_token = issue_session("alice", "pw-alice", &mut seq);
+    assert_valid_session_token(&alice_token);
+    let bob_token = issue_session("bob", "pw-bob", &mut seq);
+    assert_valid_session_token(&bob_token);
+
+    let query = |token: &str, json_body: &str, seq: &mut u32| -> (u16, String) {
+        *seq += 1;
+        client.post(
+            nosql_port,
+            "/v1/query",
+            Some(token),
+            json_body,
+            &out_dir,
+            *seq,
+        )
+    };
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[0].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL create_table: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+
+    let (status, body) = query(&bob_token, PHASE7_WRITE_CASES[1].json_body, &mut seq);
+    assert_ne!(status, 200, "bob drop_table unexpectedly succeeded: {body}");
+    assert_eq!(nosql_wire_code_of(&body), "42501", "bob drop_table: {body}");
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[2].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL insert 1: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[3].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL insert 2: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[4].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL alter_table: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[5].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL predicate delete: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[6].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL read-back: {body}");
+    let result_obj = json_object(&body);
+    let rows_json = match result_obj.get("rows") {
+        Some(JsonValue::Array(rows)) => rows.clone(),
+        other => panic!("expected array rows field, got {other:?}"),
+    };
+    let nosql_rows: Vec<Vec<String>> = rows_json
+        .iter()
+        .map(|row| match row {
+            JsonValue::Array(cells) => cells
+                .iter()
+                .map(|c| json_cell_to_pg_text(c, NULL_SENTINEL))
+                .collect(),
+            other => panic!("expected array row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        nosql_rows,
+        vec![vec![
+            "1".to_string(),
+            "gadget".to_string(),
+            "5".to_string(),
+            NULL_SENTINEL.to_string(),
+        ]],
+        "NoSQL read-back after predicate delete: {nosql_rows:?}"
+    );
+    assert_eq!(
+        nosql_rows, sql_rows,
+        "read-back after predicate delete must match between SQL and NoSQL surfaces"
+    );
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[1].json_body, &mut seq);
+    assert_eq!(status, 200, "NoSQL drop_table: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+
+    let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[7].json_body, &mut seq);
+    assert_ne!(status, 200, "post-drop scan unexpectedly succeeded: {body}");
+    assert_eq!(nosql_wire_code_of(&body), "42P01", "post-drop scan: {body}");
+
+    let nosql_seen = nosql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        nosql_seen.iter().any(|line| line.contains("surface nosql")),
+        "expected nosql surface banner in stderr, got: {nosql_seen:?}"
+    );
+    let issued_tokens = [alice_token.as_str(), bob_token.as_str()];
+    assert_dml_scenario_no_leak("nosql_seen", &nosql_seen.join("\n"), &issued_tokens);
+
+    let record = format!(
+        "[e2e-record] ddl-parity/{label}: psql_version={psql_version:?} \
+         client_version={client_version:?} create_table=ok non_ddl_user_drop_denied=42501 \
+         insert=ok(2) alter_table=ok predicate_delete=ok(1) read_back_match=true \
+         drop_table=ok post_drop=42P01",
+        label = client.label(),
+    );
+    assert_dml_scenario_no_leak("record", &record, &issued_tokens);
+    eprintln!("{record}");
+}
+
+#[test]
+#[ignore = "requires psql and curl; run via `make e2e-three-client-http`"]
+fn curl_matches_psql_on_insert_ddl_and_predicate_delete() {
+    run_phase7_write_parity_scenario(HttpClient::Curl);
+}
+
+#[test]
+#[ignore = "requires psql and python3; run via `make e2e-three-client-http`"]
+fn urllib_matches_psql_on_insert_ddl_and_predicate_delete() {
+    run_phase7_write_parity_scenario(HttpClient::Urllib);
+}
+
+#[test]
+#[ignore = "requires psql and node (>= 18); run via `make e2e-three-client-http`"]
+fn fetch_matches_psql_on_insert_ddl_and_predicate_delete() {
+    run_phase7_write_parity_scenario(HttpClient::Fetch);
+}
+
+/// `json_body`（`r#"{"op":"<name>",...}"#` 形の静的文字列）から `op` フィールド
+/// の値を取り出す。[`PARITY_CASES`]・[`REJECTION_CASES`]・[`DML_STEPS`]・
+/// [`BOB_STEP`]・[`PHASE7_WRITE_CASES`] はいずれもこの形を前提にしており
+/// （本ファイルの各定義を参照）、値そのものは各ケース定義から取得するため
+/// untrusted 入力ではない。想定形から外れる場合は本ファイルの前提が崩れた
+/// ことを示すので `panic!` で即座に検知する（fail-closed）。
+/// [`parity_matrix_covers_every_nosql_op`] は成功パリティ網羅の判定に
+/// `REJECTION_CASES` をこの関数へ渡さない（同関数 doc 参照）が、`json_body`
+/// の形そのものは他ケース定義と共通のためここでは併記する。
+fn op_name_from_json_body(json_body: &str) -> &str {
+    let after_key = json_body
+        .split_once("\"op\":\"")
+        .unwrap_or_else(|| panic!("json_body has no \"op\" field: {json_body}"))
+        .1;
+    after_key
+        .split_once('"')
+        .unwrap_or_else(|| panic!("json_body has malformed \"op\" field: {json_body}"))
+        .0
+}
+
+/// 全 [`Op`] 語彙が本ファイル（Issue #950）の層 B **成功**パリティケースの
+/// いずれかで最低 1 回使われていることを機械的に固定する（`#[ignore]` を
+/// 付けない・`make ci` で常時実行。`.claude/rules/coding-rust.md`「テストの
+/// skip・ignore・アサーション弱体化で CI を通さない」の精神を、層 B
+/// カバレッジの陳腐化検知としても適用する）。
+///
+/// レビュー指摘（Issue #950・PR #1135）: 旧実装は本ファイルのソーステキスト
+/// 全体（`include_str!`）に対して `"op":"<name>"` の文字列出現を
+/// `str::contains` で判定していた。この方式ではコメント・実行されない
+/// コード・別目的の箇所に同じリテラルが残っているだけで通ってしまい、
+/// 該当する層 B ケースが削除・無効化されても検知できない。本実装では
+/// ソース全文の grep をやめ、[`PARITY_CASES`]・[`DML_STEPS`]・[`BOB_STEP`]・
+/// [`PHASE7_WRITE_CASES`]——各シナリオ関数が実際に反復・送信する**成功系**
+/// ケース定義の値そのもの——から [`op_name_from_json_body`] で `op` 値を
+/// 収集し、その集合に対して `Op::ALL` の網羅を判定する。ケース定義の削除・
+/// 改変は収集元の値ごと消えるため、コメント等への残存では回避できない。
+///
+/// レビュー指摘（PR #1135・Codex P2・1 巡目）: [`REJECTION_CASES`] の `op` は
+/// この網羅集合へ加えない。拒否ケースは意図的に非成功応答（`wire_code`）
+/// のみを固定する層であり、SQL/NoSQL 両表層でのパリティ（成功応答・
+/// 影響行数・最終状態の一致）を検証していない。成功ケースと拒否ケースの
+/// `op` 集合を合算すると、将来 `Op::ALL` へ追加された新語彙が拒否ケースにしか
+/// 現れない場合でも本ガードが通過してしまい、パリティ未検証のまま
+/// 見かけ上の網羅を偽装しうる（fail-closed 原則に反する）。そのため
+/// 拒否ケースの `op` 収集はこのガードから独立させ、`Op::ALL` の成功パリティ
+/// 網羅判定には使わない。
+///
+/// レビュー指摘（PR #1135・Codex P2・2 巡目）: 1 巡目の修正後も
+/// [`DML_STEPS`] の `DmlExpectation::Error` ケース（例: `e-no-opid`・
+/// `e-undefined-table`）と [`PHASE7_WRITE_CASES`] の bob 拒否専用 body
+/// （`post-drop-scan`）を無条件に集計しており、成功パリティを検証しない
+/// ケースまで「網羅済み」扱いにしていた。本実装では `DML_STEPS` は
+/// `DmlExpectation::Affected(_)`（成功。RLS 等で 0 行になる場合を含む）
+/// のみ、`PHASE7_WRITE_CASES` は [`Phase7CaseExpectation::Success`] の
+/// みを収集対象にし、`DmlExpectation::Error`／
+/// [`Phase7CaseExpectation::RejectionOnly`] は除外する。
+#[test]
+fn parity_matrix_covers_every_nosql_op() {
+    use std::collections::BTreeSet;
+    use wire_server::http::query::op::Op;
+
+    let mut exercised: BTreeSet<&str> = BTreeSet::new();
+    for case in PARITY_CASES {
+        exercised.insert(op_name_from_json_body(case.json_body));
+    }
+    for step in DML_STEPS {
+        if matches!(step.expect, DmlExpectation::Affected(_)) {
+            exercised.insert(op_name_from_json_body(step.json_body));
+        }
+    }
+    assert!(
+        matches!(BOB_STEP.expect, DmlExpectation::Affected(_)),
+        "BOB_STEP must be a success case (Affected) to count toward success parity coverage"
+    );
+    exercised.insert(op_name_from_json_body(BOB_STEP.json_body));
+    for case in PHASE7_WRITE_CASES {
+        if matches!(case.expect, Phase7CaseExpectation::Success) {
+            exercised.insert(op_name_from_json_body(case.json_body));
+        }
+    }
+
+    for op in Op::ALL {
+        let name = op.name();
+        assert!(
+            exercised.contains(name),
+            "Op::{name} is not exercised by any Issue #950 layer B success parity case \
+             definition (PARITY_CASES/DML_STEPS/BOB_STEP/PHASE7_WRITE_CASES); \
+             REJECTION_CASES alone does not count (rejection-only coverage does not verify \
+             SQL/NoSQL parity). Add a three_client_http_e2e.rs success case using it"
+        );
+    }
 }

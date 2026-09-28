@@ -17,9 +17,9 @@
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OnConflictAction, OrderByForm, Projection, ScalarOrderKey,
-    UpsertValue, ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement,
-    WherePredicate,
+    FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause, OrderByForm, Projection,
+    ScalarOrderKey, UpsertValue, ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete,
+    ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -1376,12 +1376,41 @@ pub(crate) fn bind_where_predicates(
         node_budget,
         dummy_equality_flags,
         &mut equality_ordinal,
+        crate::sql::udf_call::ColumnRefPolicy::IdAndVectorOnly,
     )
 }
 
-/// [`bind_where_predicates`] の再帰本体。トップレベルの述語列だけでなく、
-/// [`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも自分自身を
-/// 再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
+/// `CHECK` 制約の式述語束縛専用（Issue #1075・TABLE-16 ポインタ）。
+/// [`bind_where_predicates`] と同じ束縛経路（`bind_where_predicates_recursive`）
+/// を共有しつつ、`WherePredicate::Expression` の束縛だけを
+/// [`crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns`] へ切り替え、
+/// INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可する opt-in 拡張（`WHERE`／
+/// `SELECT`／Describe 系の挙動は一切変えない。汎用のレーン A は対象外）。
+/// `sql::check_constraint::CompiledChecks::compile`・`validate_and_build`・
+/// `recompute_referenced_columns` の 3 箇所から呼ばれる。
+pub(crate) fn bind_check_predicates(
+    where_predicates: &[WherePredicate],
+    schema: &TableSchema,
+    node_budget: &mut usize,
+) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    let empty_udfs = crate::sql::udf_call::UdfRegistry::default();
+    let mut equality_ordinal: usize = 0;
+    bind_where_predicates_recursive(
+        where_predicates,
+        schema,
+        &empty_udfs,
+        node_budget,
+        &[],
+        &mut equality_ordinal,
+        crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns,
+    )
+}
+
+/// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
+/// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
+/// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。`column_ref_policy` は
+/// `WherePredicate::Expression` の束縛（`udf_call::bind_expr_with_policy`）へ
+/// そのまま伝播する（Issue #1075・TABLE-16 ポインタ）。
 fn bind_where_predicates_recursive(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1389,6 +1418,7 @@ fn bind_where_predicates_recursive(
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
     equality_ordinal: &mut usize,
+    column_ref_policy: crate::sql::udf_call::ColumnRefPolicy,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
@@ -1404,7 +1434,13 @@ fn bind_where_predicates_recursive(
                 rls_predicate_present = true;
             }
             WherePredicate::Expression(expr) => {
-                let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                let (bound, ty) = crate::sql::udf_call::bind_expr_with_policy(
+                    expr,
+                    schema,
+                    udfs,
+                    node_budget,
+                    column_ref_policy,
+                )?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression must evaluate to a boolean (use a comparison)",
@@ -1428,6 +1464,7 @@ fn bind_where_predicates_recursive(
                             node_budget,
                             dummy_equality_flags,
                             equality_ordinal,
+                            column_ref_policy,
                         )?;
                     bound_branches.push(crate::sql::where_tree::BoundConjunction::new(
                         branch_metadata,
@@ -2942,6 +2979,22 @@ pub enum BoundConflictAction {
     DoUpdate(Vec<(usize, BoundUpsertValue)>),
 }
 
+/// 束縛済みの `ON CONFLICT` 対象（TABLE-16、Issue #1074。`sql::allowlist::
+/// OnConflictClause::target` をスキーマ照合して解決した形）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundConflictTarget {
+    /// `ON CONFLICT (id)`（本 Issue〔#1074〕導入前の唯一の受理形。挙動・応答は
+    /// 完全に不変）。
+    RowId,
+    /// `ON CONFLICT (<col>[, <col>]*)` が、宣言済み UNIQUE 制約のいずれか
+    /// （`schema.unique_constraints()`）の構成列**集合**と一致した場合の解決結果。
+    /// `Vec<usize>` は `schema.columns` に対する論理インデックスで、**解決した
+    /// 制約の宣言順**（対象リストに書いた順ではない。`(a,b)` と `(b,a)` は
+    /// 同じ制約に解決され、同じ並びになる——`content_hash::for_typed_upsert`
+    /// の再送判定・golden ハッシュがこの順序に依存する）。
+    Unique(Vec<usize>),
+}
+
 /// 束縛済みの UPSERT 文（SQL-20・TASK-193、Issue #872。実行結線は
 /// `sql::exec::execute_upsert`）。`rows` は [`bind_insert_row`] で個別に束縛
 /// 済みの行（行数に関わらず 1 件以上）で、`action` は全行が共有する衝突分岐
@@ -2950,6 +3003,8 @@ pub enum BoundConflictAction {
 pub struct BoundUpsert {
     pub table: String,
     pub rows: Vec<BoundInsert>,
+    /// 衝突判定の対象（TABLE-16、Issue #1074）。
+    pub target: BoundConflictTarget,
     pub action: BoundConflictAction,
     pub operation_id: Option<OperationId>,
 }
@@ -3013,13 +3068,13 @@ pub fn bind_insert_form(
     // `ON CONFLICT ...`（SQL-20・TASK-193、Issue #872）は判別規則より前に分岐
     // する（ファイル形との併用は明示的に `42601` で拒否し、行形との併用は
     // 行数に関わらず必ず `bind_upsert_form` を経由させる）。
-    if let Some(action) = &stmt.on_conflict {
+    if let Some(clause) = &stmt.on_conflict {
         if is_file_form_shape {
             return Err(SqlSurfaceError::unsupported(
                 "ON CONFLICT is not supported for file-form INSERT (path/body columns)",
             ));
         }
-        return bind_upsert_form(stmt, action, schema);
+        return bind_upsert_form(stmt, clause, schema);
     }
 
     if is_file_form_shape {
@@ -3049,20 +3104,88 @@ pub fn bind_insert_form(
     }
 }
 
+/// [`bind_upsert_form`] の対象列解決本体（TABLE-16、Issue #1074）。
+/// `sql::allowlist::OnConflictClause::target`（構文段階では検証していない
+/// 列名の並び）を `schema` と照合し、`(id)` 単独なら [`BoundConflictTarget::
+/// RowId`]（本 Issue 導入前と完全に同じ挙動）、それ以外は宣言済み UNIQUE
+/// 制約（`schema.unique_constraints()`。`schema.primary_key()` は対象外——
+/// PRIMARY KEY 宣言列を対象にすることは本 Issue のスコープ外・申し送り）の
+/// いずれかと**列名の集合**が一致する場合にのみ解決する（`(a,b)` と `(b,a)` は
+/// 同じ制約として解決され、`Unique` が返す列インデックスは対象リストに書いた
+/// 順ではなく**解決した制約の宣言順**になる。`content_hash::for_typed_upsert`
+/// の再送判定・golden ハッシュがこの順序に依存する）。
+///
+/// 次のいずれかに該当する入力はすべて `42601`
+/// （[`SqlSurfaceError::unsupported`]。固定文言）で拒否する:
+/// - `id` と他の列が混在する対象リスト
+/// - どの UNIQUE 制約の構成列集合とも一致しない（未知列・大小文字違い・
+///   PRIMARY KEY 宣言列を含む場合も、一致する UNIQUE 制約が無い以上ここに
+///   丸め込まれる）
+fn resolve_conflict_target(
+    target: &[String],
+    schema: &TableSchema,
+) -> Result<BoundConflictTarget, SqlSurfaceError> {
+    if target.len() == 1 && target[0] == "id" {
+        return Ok(BoundConflictTarget::RowId);
+    }
+    if target.iter().any(|c| c == "id") {
+        return Err(SqlSurfaceError::unsupported(
+            "ON CONFLICT target list must be exactly (id) or match a UNIQUE constraint's columns",
+        ));
+    }
+    let target_set: std::collections::BTreeSet<&str> =
+        target.iter().map(std::string::String::as_str).collect();
+    for constraint in schema.unique_constraints() {
+        let constraint_set: std::collections::BTreeSet<&str> = constraint
+            .columns()
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        if constraint_set != target_set {
+            continue;
+        }
+        let indices: Vec<usize> = constraint
+            .columns()
+            .iter()
+            .map(|name| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal: unique constraint column not found in live schema"
+                            .to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok(BoundConflictTarget::Unique(indices));
+    }
+    Err(SqlSurfaceError::unsupported(
+        "ON CONFLICT target list does not match any declared UNIQUE constraint",
+    ))
+}
+
 /// [`bind_insert_form`] が `stmt.on_conflict` を検出した場合の束縛本体
-/// （SQL-20・TASK-193、Issue #872）。行数に関わらず全行を [`bind_insert_row`]
-/// で個別に束縛してからバッチ内 `id` 重複を検出する（`tenant::insert_typed_
+/// （SQL-20・TASK-193、Issue #872。対象列を UNIQUE 制約列へ拡張:
+/// TABLE-16、Issue #1074）。行数に関わらず全行を [`bind_insert_row`] で
+/// 個別に束縛してからバッチ内 `id` 重複を検出する（`tenant::insert_typed_
 /// rows_unchecked` の `TenantWriteError::IdConflict`〔`23505`〕は UPSERT の
 /// 衝突分岐とは意味が異なり使えないため、束縛時点〔write トランザクション開始
 /// 前・決定的〕で `22000` として拒否する。2 行目を「1 行目への更新」と解釈
-/// しない）。最後に `DO UPDATE SET` の右辺（[`bind_upsert_assignments`]）を
-/// 束縛し、`EXCLUDED.<col>` が参照する列が `Null` かつ対象列が非 nullable の
-/// 組み合わせを行ごとに検出する（`docs/design/sql-upsert.md` 参照）。
+/// しない）。UNIQUE 対象（`BoundConflictTarget::Unique`）はさらに、バッチ内の
+/// 対象キー重複（NULL を含むキーは対象外。NULLS DISTINCT）も同じ理由・同じ
+/// `22000` で拒否する（`tenant::upsert_typed_rows_unchecked` 側の防御的二重
+/// 検査と同じ正準化 [`crate::constraint::unique_key_from_values`] を共有）。
+/// 最後に `DO UPDATE SET` の右辺（[`bind_upsert_assignments`]）を束縛し、
+/// `EXCLUDED.<col>` が参照する列が `Null` かつ対象列が非 nullable の組み合わせを
+/// 行ごとに検出する（`docs/design/sql-upsert.md` 参照）。
 fn bind_upsert_form(
     stmt: &ValidatedInsert,
-    action: &OnConflictAction,
+    clause: &OnConflictClause,
     schema: &TableSchema,
 ) -> Result<BoundInsertForm, SqlSurfaceError> {
+    let target = resolve_conflict_target(&clause.target, schema)?;
+    let action = &clause.action;
     let mut rows: Vec<BoundInsert> = Vec::new();
     rows.try_reserve_exact(stmt.rows.len()).map_err(|_| {
         SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
@@ -3087,6 +3210,25 @@ fn bind_upsert_form(
                 "duplicate id {} within the same UPSERT statement",
                 row.id
             )));
+        }
+    }
+
+    if let BoundConflictTarget::Unique(indices) = &target {
+        let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        seen_keys.try_reserve(rows.len()).map_err(|_| {
+            SqlSurfaceError::payload_too_large("failed to reserve UPSERT target key set")
+        })?;
+        for row in &rows {
+            let Some(key) = crate::constraint::unique_key_from_values(indices, &row.values)
+                .map_err(SqlSurfaceError::invalid_input)?
+            else {
+                continue;
+            };
+            if !seen_keys.insert(key) {
+                return Err(SqlSurfaceError::invalid_input(
+                    "duplicate ON CONFLICT target key within the same UPSERT statement",
+                ));
+            }
         }
     }
 
@@ -3144,6 +3286,7 @@ fn bind_upsert_form(
     Ok(BoundInsertForm::Upsert(BoundUpsert {
         table: stmt.table_name.clone(),
         rows,
+        target,
         action: bound_action,
         operation_id: stmt.operation_id.clone(),
     }))
@@ -7296,5 +7439,232 @@ mod tests {
             }
             other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
         }
+    }
+
+    // --- ON CONFLICT の UNIQUE 制約列への拡張（TABLE-16、Issue #1074） --------
+
+    /// UNIQUE 対象の束縛テスト共通スキーマ: `a TEXT UNIQUE`・`UNIQUE (b, c)`。
+    fn unique_target_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true),
+                ColumnDef::new("c", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::new(vec!["a".to_string()]),
+            crate::catalog::UniqueConstraint::new(vec!["b".to_string(), "c".to_string()]),
+        ])
+    }
+
+    fn bind_upsert_sql(
+        sql: &str,
+        schema: &TableSchema,
+    ) -> Result<BoundInsertForm, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_insert(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        bind_insert_form(&stmt, schema)
+    }
+
+    #[test]
+    fn bind_upsert_form_resolves_single_column_unique_target() {
+        let schema = unique_target_schema();
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (a) DO NOTHING \
+             USING OPERATION_ID 'op-unique-a'",
+            &schema,
+        )
+        .expect("single-column UNIQUE target should resolve");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![0]));
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_upsert_form_resolves_composite_unique_target_regardless_of_written_order() {
+        let schema = unique_target_schema();
+        for sql in [
+            "INSERT INTO documents (id, a, b, c) VALUES (1, 'z', 'x', 'y') ON CONFLICT (b, c) \
+             DO NOTHING USING OPERATION_ID 'op-unique-bc'",
+            "INSERT INTO documents (id, a, b, c) VALUES (1, 'z', 'x', 'y') ON CONFLICT (c, b) \
+             DO NOTHING USING OPERATION_ID 'op-unique-cb'",
+        ] {
+            let bound = bind_upsert_sql(sql, &schema)
+                .expect("composite UNIQUE target should resolve regardless of written order");
+            match bound {
+                // 解決した制約の宣言順（`b` → `c`。`unique_target_schema` 参照）
+                // で並ぶ。対象リストに書いた順（2 つ目のケースは `(c, b)`）には
+                // 依存しない。
+                BoundInsertForm::Upsert(upsert) => {
+                    assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![1, 2]));
+                }
+                other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_partial_composite_unique_target() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, b) VALUES (1, 'x') ON CONFLICT (b) DO NOTHING \
+             USING OPERATION_ID 'op-unique-partial'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_target_not_matching_any_unique_constraint() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'y') ON CONFLICT (a, b) \
+             DO NOTHING USING OPERATION_ID 'op-unique-mismatch'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_unknown_target_column() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (nope) DO NOTHING \
+             USING OPERATION_ID 'op-unique-unknown'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_id_mixed_with_other_target_columns() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (id, a) DO NOTHING \
+             USING OPERATION_ID 'op-unique-id-mixed'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_case_mismatched_target_column() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (A) DO NOTHING \
+             USING OPERATION_ID 'op-unique-case'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_primary_key_column_as_target() {
+        // PRIMARY KEY 宣言列を対象にすることは本 Issue（#1074）のスコープ外
+        // （§8 対象外・申し送り）。`schema.unique_constraints()` には含まれない
+        // ため、UNIQUE 制約と同じ経路には解決されず `42601` になる。
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("code", ColumnType::Text, false)],
+        )
+        .with_primary_key(vec!["code".to_string()]);
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_insert(
+            "INSERT INTO documents (id, code) VALUES (1, 'x') ON CONFLICT (code) DO NOTHING \
+             USING OPERATION_ID 'op-pk-target'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        let err = bind_insert_form(&stmt, &schema).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_duplicate_target_key_within_batch() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x'), (2, 'x') ON CONFLICT (a) \
+             DO NOTHING USING OPERATION_ID 'op-unique-batch-dup'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_upsert_form_allows_null_target_key_duplicates_within_batch() {
+        // NULL を含む対象キーは NULLS DISTINCT のため重複判定の対象外。`c` を
+        // 列リストから省略する（`nullable` かつ `DEFAULT` 無し。
+        // `fill_omitted_columns` が暗黙 `Value::Null` を補う）ことで NULL を
+        // 作る（SQL テキストの `INSERT ... VALUES` は明示 `NULL` リテラルの
+        // 構文を持たない。`InsertLiteral::Null` のドキュメンテーションコメント
+        // 参照）。
+        let schema = unique_target_schema();
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'p'), (2, 'y', 'p') \
+             ON CONFLICT (b, c) DO NOTHING USING OPERATION_ID 'op-unique-null-batch'",
+            &schema,
+        )
+        .expect("NULL target keys must not be treated as duplicates");
+        assert!(matches!(bound, BoundInsertForm::Upsert(_)));
+    }
+
+    /// `ON CONFLICT` 対象が `REAL`／`NUMERIC`／`JSON`／`ARRAY` 等の UNIQUE 制約列
+    /// （`ColumnType::is_unique_constraint_allowed` が `is_primary_key_allowed`
+    /// の上位集合として Issue #1073 で追加した型）でも解決できることを確認する
+    /// （回帰: base 取り込みマージで `constraint::unique_key_from_values` が
+    /// これらの型を「UNIQUE キーとして許可されない型」として誤って拒否する
+    /// 退行が入りかけたため、単一行の正常系で検出する）。
+    #[test]
+    fn bind_upsert_form_resolves_unique_target_on_types_beyond_primary_key_allowed() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("r", ColumnType::Real, true)],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "r".to_string()
+        ])]);
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, r) VALUES (1, 1.5) ON CONFLICT (r) DO NOTHING \
+             USING OPERATION_ID 'op-unique-real'",
+            &schema,
+        )
+        .expect("REAL UNIQUE target should resolve, not be rejected as a disallowed type");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![0]));
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+
+        // バッチ内の重複対象キー検出（`unique_key_from_values` 経由）も REAL で
+        // 機能することを確認する。
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, r) VALUES (1, 1.5), (2, 1.5) ON CONFLICT (r) \
+             DO NOTHING USING OPERATION_ID 'op-unique-real-dup'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 }

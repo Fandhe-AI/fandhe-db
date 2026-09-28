@@ -1941,9 +1941,23 @@ struct ParsedCreateTableColumn {
     /// 列定義の後ろに続く列制約 `[CONSTRAINT <name>] CHECK (...)`（0 個以上。
     /// TABLE-16・TASK-204、Issue #906）。
     checks: Vec<ParsedCheck>,
-    /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)]`（TABLE-17・TASK-205、
-    /// Issue #907）の参照先テーブル名と参照先列名（省略時は空）。
-    references: Option<(String, Vec<String>)>,
+    /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)] [MATCH ...] [ON ...]
+    /// [<遅延属性>]`（TABLE-17・TASK-205、Issue #907／#1077）の解析結果。
+    references: Option<ParsedReferences>,
+}
+
+/// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
+/// Issue #907／#1077）の解析結果。[`Parser::parse_references_clause`] が返す。
+struct ParsedReferences {
+    parent_table: String,
+    /// 参照先列名（省略時は空。[`crate::catalog::resolve_foreign_key_target`] が
+    /// 解決する）。
+    parent_columns: Vec<String>,
+    /// `MATCH` 句（未指定時は `Simple`）。
+    match_type: crate::catalog::ForeignKeyMatch,
+    /// `[NOT] DEFERRABLE`／`INITIALLY {DEFERRED|IMMEDIATE}` 句
+    /// （未指定時は `NotDeferrable`）。
+    deferrability: crate::catalog::ForeignKeyDeferrability,
 }
 
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
@@ -2015,6 +2029,19 @@ pub enum OnConflictAction {
     DoUpdate(Vec<(String, UpsertValue)>),
 }
 
+/// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`（SQL-20・
+/// TABLE-16、Issue #1074）。対象列リストは構文段階（本モジュール）では列名の
+/// 宣言順の並びとしてのみ受理し、スキーマ照合（`id` 疑似列か、UNIQUE 制約の
+/// 構成列集合と一致するか）は `sql::parser::bind_upsert_form` の責務とする
+/// （`ValidatedStatement` の一般契約と同じ「構造検証はここまで」の分担）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflictClause {
+    /// `ON CONFLICT (...)` に書かれた列名の宣言順（`push` 前に列数上限
+    /// [`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]・重複列名を検査済み）。
+    pub target: Vec<String>,
+    pub action: OnConflictAction,
+}
+
 /// 許可形状の構造判定を通過した INSERT 文（SQL-10・SQL-16、TASK-80・TASK-190）。
 /// `ValidatedStatement` と同様、本モジュールが保証するのはここまでの構造情報のみで、
 /// 列名・値の意味論的妥当性は検証しない（`sql::parser::bind_insert` の責務）。
@@ -2046,12 +2073,15 @@ pub struct ValidatedInsert {
     /// 句の直前にのみ置ける（[`Parser::parse_returning_clause`] 参照）。関数呼び出し
     /// 項目（[`Projection::Items`]）はここには到達しない（構造検証段で `42601`）。
     pub returning: Option<Projection>,
-    /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・TASK-193、
-    /// Issue #872）。句の省略は `None`（本 Issue 導入前と完全に同じ「行 `id`
-    /// 衝突は常に `23505`」の挙動）。複数行 `VALUES` と併用可能（全行が同じ
-    /// 衝突分岐を共有する）。ファイル形 INSERT との併用は
+    /// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`
+    /// （SQL-20・TASK-193、Issue #872。対象列を UNIQUE 制約列へ拡張:
+    /// TABLE-16、Issue #1074）。句の省略は `None`。対象列が `(id)` のみの
+    /// 場合は本 Issue（#1074）導入前と完全に同じ「行 `id` 衝突は常に
+    /// `23505`」の挙動になる（`sql::parser::bind_upsert_form` が
+    /// `BoundConflictTarget::RowId` へ解決する）。複数行 `VALUES` と併用可能
+    /// （全行が同じ衝突分岐を共有する）。ファイル形 INSERT との併用は
     /// `sql::parser::bind_insert_form` が `42601` で拒否する。
-    pub on_conflict: Option<OnConflictAction>,
+    pub on_conflict: Option<OnConflictClause>,
 }
 
 /// 許可形状の構造判定を通過した単一行・`id` 指定形 `DELETE` 文（SQL-18・
@@ -4609,40 +4639,58 @@ impl<'a> Parser<'a> {
     /// `ON CONFLICT (ID)` / `(Id)` は実在しない列名として `42601` になる
     /// （キーワードの大文字小文字非依存と矛盾しない、識別子側の既定契約
     /// どおりの挙動）。
-    fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictAction>, SqlSurfaceError> {
+    ///
+    /// 対象列リストは `id` に限らず任意の識別子の列（TABLE-16、Issue #1074）を
+    /// 構文段階で受理する。列数上限（[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）
+    /// 超過・列名の重複はここで `42601` として拒否するが、対象列が実在する
+    /// スキーマ列か・`id` 単独か・宣言済み UNIQUE 制約の構成列集合と一致するかの
+    /// 意味論的検証は本モジュールの管轄外（`sql::parser::bind_upsert_form`）。
+    /// `ON CONFLICT ON CONSTRAINT ...`・空の対象リスト（`ON CONFLICT ()`）は
+    /// 未対応のまま `42601`（対象外・申し送り: Issue #1074 §8）。
+    fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictClause>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("ON") {
             return Ok(None);
         }
         self.advance();
         self.expect_contextual_keyword("CONFLICT")?;
         self.expect_punct('(')?;
-        match self.advance() {
-            Some(Token::Ident(name)) if name == "id" => {}
-            other => {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "ON CONFLICT target list must be (id), got {other:?}"
-                )))
+        let mut target = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if target.len() >= crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many ON CONFLICT target columns",
+                ));
             }
+            let name = self.expect_ident()?;
+            if target.iter().any(|c: &String| c == &name) {
+                return Err(SqlSurfaceError::unsupported(
+                    "duplicate ON CONFLICT target column",
+                ));
+            }
+            target.push(name);
         }
         self.expect_punct(')')?;
         self.expect_contextual_keyword("DO")?;
-        if self.peek_contextual_keyword("NOTHING") {
+        let action = if self.peek_contextual_keyword("NOTHING") {
             self.advance();
-            return Ok(Some(OnConflictAction::DoNothing));
-        }
-        self.expect_contextual_keyword("UPDATE")?;
-        self.expect_contextual_keyword("SET")?;
-        let mut assignments = vec![self.parse_upsert_assignment()?];
-        while matches!(self.peek(), Some(Token::Punct(','))) {
-            self.advance();
-            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
-                return Err(SqlSurfaceError::unsupported(
-                    "too many ON CONFLICT DO UPDATE SET assignments",
-                ));
+            OnConflictAction::DoNothing
+        } else {
+            self.expect_contextual_keyword("UPDATE")?;
+            self.expect_contextual_keyword("SET")?;
+            let mut assignments = vec![self.parse_upsert_assignment()?];
+            while matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+                    return Err(SqlSurfaceError::unsupported(
+                        "too many ON CONFLICT DO UPDATE SET assignments",
+                    ));
+                }
+                assignments.push(self.parse_upsert_assignment()?);
             }
-            assignments.push(self.parse_upsert_assignment()?);
-        }
-        Ok(Some(OnConflictAction::DoUpdate(assignments)))
+            OnConflictAction::DoUpdate(assignments)
+        };
+        Ok(Some(OnConflictClause { target, action }))
     }
 
     /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = (EXCLUDED.<col> |
@@ -5101,17 +5149,20 @@ impl<'a> Parser<'a> {
                     }
                     unique_constraints.push(vec![parsed.column.name.clone()]);
                 }
-                if let Some((parent_table, parent_columns)) = parsed.references {
+                if let Some(refs) = parsed.references {
                     if foreign_keys.len() >= crate::catalog::MAX_FOREIGN_KEYS_PER_TABLE {
                         return Err(SqlSurfaceError::payload_too_large(
                             "too many FOREIGN KEY constraints in CREATE TABLE",
                         ));
                     }
-                    foreign_keys.push(crate::catalog::ForeignKeyDef::new(
-                        vec![parsed.column.name.clone()],
-                        parent_table,
-                        parent_columns,
-                    ));
+                    foreign_keys.push(
+                        crate::catalog::ForeignKeyDef::new(
+                            vec![parsed.column.name.clone()],
+                            refs.parent_table,
+                            refs.parent_columns,
+                        )
+                        .with_options(refs.match_type, refs.deferrability),
+                    );
                 }
                 columns.push(parsed.column);
             }
@@ -5426,19 +5477,31 @@ impl<'a> Parser<'a> {
         Ok(cols)
     }
 
-    /// `REFERENCES <table> [(<col>[, <col>]*)] [ON DELETE <act>] [ON UPDATE <act>]`
-    /// （TABLE-17・TASK-205、Issue #907）。列制約・表制約の双方から呼ばれる。
-    /// 参照先テーブルの存在・参照先列の一意性・型の照合はカタログ照会を要するため
-    /// 構造検証の対象外（`catalog::Storage::create_table` の write トランザクション内で
+    /// `REFERENCES <table> [(<col>[, <col>]*)] [MATCH {SIMPLE|FULL}]
+    /// [ON DELETE <act>] [ON UPDATE <act>] [<遅延属性>]`（TABLE-17・TASK-205、
+    /// Issue #907／#1077）。列制約・表制約の双方から呼ばれる。参照先テーブルの
+    /// 存在・参照先列の一意性・型の照合はカタログ照会を要するため構造検証の
+    /// 対象外（`catalog::Storage::create_table` の write トランザクション内で
     /// 判定する）。参照先列を省略した場合は空リストを返す（参照先の主キー、未宣言
     /// なら `id` へ解決される）。
     ///
     /// 参照動作は既定の `NO ACTION`（非遅延の文単位検査のため `RESTRICT` と同値）
     /// のみを実装するため、`ON DELETE`／`ON UPDATE` には `NO ACTION`／`RESTRICT` だけを
     /// 各 1 回まで受理し、`CASCADE`／`SET NULL`／`SET DEFAULT`・重複指定は `42601`。
-    /// `MATCH`・`DEFERRABLE`／`INITIALLY` 等は本メソッドが消費しないため、呼び出し元の
-    /// 後続判定（カンマ・閉じ括弧）が余剰トークンとして `42601` で拒否する。
-    fn parse_references_clause(&mut self) -> Result<(String, Vec<String>), SqlSurfaceError> {
+    ///
+    /// `MATCH {SIMPLE|FULL}` は列リストの直後・`ON` 句の前にのみ置ける
+    /// （PostgreSQL の句順序）。`MATCH PARTIAL`・重複指定・`ON` 句より後ろに
+    /// 置いた `MATCH` はこの位置で消費されず、呼び出し元の後続判定（カンマ・
+    /// 閉じ括弧）が余剰トークンとして `42601` で拒否する。
+    ///
+    /// 遅延属性 `{[NOT] DEFERRABLE | INITIALLY {DEFERRED|IMMEDIATE}}`（任意順・
+    /// 各グループ高々 1 回）は `ON` 句の後ろにのみ置ける。`NOT DEFERRABLE
+    /// INITIALLY DEFERRED`（矛盾）・各グループの重複は `42601`。`REFERENCES` 句の
+    /// 後ろで `NOT` を消費するのは次の識別子が `DEFERRABLE` のときだけで
+    /// （`NOT NULL` は列型キーワード直後で先に受理済みのため曖昧さはない）、
+    /// それ以外の `NOT ...` は消費せず呼び出し元の余剰トークン判定に委ねる。
+    /// `SET CONSTRAINTS`・PK/UNIQUE への `DEFERRABLE` は非対応のまま（`42601`）。
+    fn parse_references_clause(&mut self) -> Result<ParsedReferences, SqlSurfaceError> {
         self.expect_contextual_keyword("REFERENCES")?;
         let parent_table = self.expect_ident()?;
         crate::catalog::validate_identifier(&parent_table).map_err(|e| {
@@ -5449,14 +5512,40 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+        let match_type = if self.peek_ident_matches("MATCH") {
+            self.advance();
+            if self.peek_ident_matches("SIMPLE") {
+                self.advance();
+                crate::catalog::ForeignKeyMatch::Simple
+            } else if self.peek_ident_matches("FULL") {
+                self.advance();
+                crate::catalog::ForeignKeyMatch::Full
+            } else {
+                return Err(SqlSurfaceError::unsupported(
+                    "only MATCH SIMPLE or MATCH FULL is supported in FOREIGN KEY",
+                ));
+            }
+        } else {
+            crate::catalog::ForeignKeyMatch::Simple
+        };
         let mut seen_delete = false;
         let mut seen_update = false;
+        // `ON DELETE`／`ON UPDATE` に `RESTRICT` が指定されたか（Issue #1077
+        // レビュー指摘・PR #1137）。`RESTRICT` は SQL 標準上つねに即時検査
+        // （非遅延）の参照動作であり、`INITIALLY DEFERRED` と併用すると
+        // 「RESTRICT なのに COMMIT まで検査を遅延する」という契約違反になる
+        // （`constraint::FkCheckMode::includes` は現状 `deferrability` のみで
+        // 文単位検査の対象可否を決めており、参照動作〔`NO ACTION`／`RESTRICT`〕
+        // を保持していないため区別できない）。参照動作を保持して個別に即時検査
+        // する経路は追加しず、下の検査で宣言そのものを fail-closed に拒否する。
+        let mut on_delete_restrict = false;
+        let mut on_update_restrict = false;
         while self.peek_ident_matches("ON") {
             self.advance();
-            let seen = if self.peek_ident_matches("DELETE") {
-                &mut seen_delete
+            let (seen, restrict_flag) = if self.peek_ident_matches("DELETE") {
+                (&mut seen_delete, &mut on_delete_restrict)
             } else if self.peek_ident_matches("UPDATE") {
-                &mut seen_update
+                (&mut seen_update, &mut on_update_restrict)
             } else {
                 return Err(SqlSurfaceError::unsupported(
                     "expected DELETE or UPDATE after ON in FOREIGN KEY",
@@ -5474,13 +5563,98 @@ impl<'a> Parser<'a> {
                 self.advance();
             } else if self.peek_ident_matches("RESTRICT") {
                 self.advance();
+                *restrict_flag = true;
             } else {
                 return Err(SqlSurfaceError::unsupported(
                     "only NO ACTION or RESTRICT is supported as a FOREIGN KEY referential action",
                 ));
             }
         }
-        Ok((parent_table, parent_columns))
+        // 遅延属性（`[NOT] DEFERRABLE`・`INITIALLY {DEFERRED|IMMEDIATE}`。
+        // TABLE-17・TASK-205、Issue #1077）。`ON` 句の後ろに任意順・各グループ
+        // 高々 1 回で置ける。
+        let mut seen_deferrable_clause = false;
+        let mut seen_initially_clause = false;
+        let mut deferrable: Option<bool> = None;
+        let mut initially_deferred: Option<bool> = None;
+        loop {
+            if self.peek_ident_matches("DEFERRABLE") {
+                if seen_deferrable_clause {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate DEFERRABLE clause in FOREIGN KEY",
+                    ));
+                }
+                seen_deferrable_clause = true;
+                self.advance();
+                deferrable = Some(true);
+                continue;
+            }
+            // `NOT DEFERRABLE` の `NOT` は次の識別子が `DEFERRABLE` のときだけ
+            // 消費する（他の `NOT ...` は本メソッドの対象外として素通しする）。
+            if self.peek_ident_matches("NOT") && self.peek_ident_matches_at(1, "DEFERRABLE") {
+                if seen_deferrable_clause {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate DEFERRABLE clause in FOREIGN KEY",
+                    ));
+                }
+                seen_deferrable_clause = true;
+                self.advance();
+                self.advance();
+                deferrable = Some(false);
+                continue;
+            }
+            if self.peek_ident_matches("INITIALLY") {
+                if seen_initially_clause {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate INITIALLY clause in FOREIGN KEY",
+                    ));
+                }
+                seen_initially_clause = true;
+                self.advance();
+                if self.peek_ident_matches("DEFERRED") {
+                    self.advance();
+                    initially_deferred = Some(true);
+                } else if self.peek_ident_matches("IMMEDIATE") {
+                    self.advance();
+                    initially_deferred = Some(false);
+                } else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expected DEFERRED or IMMEDIATE after INITIALLY in FOREIGN KEY",
+                    ));
+                }
+                continue;
+            }
+            break;
+        }
+        if deferrable == Some(false) && initially_deferred == Some(true) {
+            return Err(SqlSurfaceError::unsupported(
+                "NOT DEFERRABLE cannot be combined with INITIALLY DEFERRED",
+            ));
+        }
+        let deferrability = if initially_deferred == Some(true) {
+            crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyDeferred
+        } else if deferrable == Some(true) {
+            crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyImmediate
+        } else {
+            crate::catalog::ForeignKeyDeferrability::NotDeferrable
+        };
+        // `RESTRICT`（即時検査が契約）と `INITIALLY DEFERRED`（COMMIT まで
+        // 検査を遅延）の併用を fail-closed に拒否する（Issue #1077 レビュー
+        // 指摘・PR #1137。上の `on_delete_restrict`／`on_update_restrict` 参照）。
+        if deferrability == crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyDeferred
+            && (on_delete_restrict || on_update_restrict)
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "ON DELETE RESTRICT / ON UPDATE RESTRICT cannot be combined with INITIALLY DEFERRED",
+            ));
+        }
+
+        Ok(ParsedReferences {
+            parent_table,
+            parent_columns,
+            match_type,
+            deferrability,
+        })
     }
 
     /// 表制約 `FOREIGN KEY (<col>[, <col>]*) REFERENCES ...`（TABLE-17・TASK-205、
@@ -5492,12 +5666,11 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("FOREIGN")?;
         self.expect_contextual_keyword("KEY")?;
         let columns = self.parse_foreign_key_column_list()?;
-        let (parent_table, parent_columns) = self.parse_references_clause()?;
-        Ok(crate::catalog::ForeignKeyDef::new(
-            columns,
-            parent_table,
-            parent_columns,
-        ))
+        let refs = self.parse_references_clause()?;
+        Ok(
+            crate::catalog::ForeignKeyDef::new(columns, refs.parent_table, refs.parent_columns)
+                .with_options(refs.match_type, refs.deferrability),
+        )
     }
 
     /// 表制約 `UNIQUE (<col>[, <col>]*)`（TABLE-16・TASK-204、Issue #905）の
@@ -7924,7 +8097,7 @@ struct ParsedInsertShape {
     rows: Vec<Vec<InsertLiteral>>,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
-    on_conflict: Option<OnConflictAction>,
+    on_conflict: Option<OnConflictClause>,
 }
 
 /// `DELETE` の `WHERE` 句の構造形状（Issue #870・SQL-19）。単一行・`id` 完全
@@ -10337,7 +10510,13 @@ mod tests {
             LedgerMode::Ledgered,
         )
         .expect("DO NOTHING should be accepted");
-        assert_eq!(stmt.on_conflict, Some(OnConflictAction::DoNothing));
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
     }
 
     #[test]
@@ -10353,16 +10532,19 @@ mod tests {
         .expect("DO UPDATE SET should be accepted");
         assert_eq!(
             stmt.on_conflict,
-            Some(OnConflictAction::DoUpdate(vec![
-                (
-                    "embedding".to_string(),
-                    UpsertValue::Excluded("embedding".to_string())
-                ),
-                (
-                    "lang".to_string(),
-                    UpsertValue::Literal(InsertLiteral::String("en".to_string()))
-                ),
-            ]))
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoUpdate(vec![
+                    (
+                        "embedding".to_string(),
+                        UpsertValue::Excluded("embedding".to_string())
+                    ),
+                    (
+                        "lang".to_string(),
+                        UpsertValue::Literal(InsertLiteral::String("en".to_string()))
+                    ),
+                ]),
+            })
         );
     }
 
@@ -10377,7 +10559,13 @@ mod tests {
         )
         .expect("multi-row VALUES with ON CONFLICT should be accepted");
         assert_eq!(stmt.rows.len(), 2);
-        assert_eq!(stmt.on_conflict, Some(OnConflictAction::DoNothing));
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
     }
 
     #[test]
@@ -10394,41 +10582,106 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upsert_non_id_target_column() {
+    fn accepts_upsert_non_id_target_column_at_syntax_level() {
+        // 構文段階（本モジュール）では `id` に限らず任意の列名を対象列として
+        // 受理する（TABLE-16、Issue #1074）。宣言済み UNIQUE 制約の構成列
+        // 集合と一致するかの意味論的検証は `sql::parser::bind_upsert_form` の
+        // 責務であり、`lang` に UNIQUE 制約が無いスキーマでは最終的に `42601`
+        // になることを `sql::parser` の結合テストで固定する
+        // （`rejects_upsert_target_not_matching_any_unique_constraint` 参照）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (lang) DO NOTHING \
              USING OPERATION_ID 'op-upsert-5'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("non-id target column should be accepted at the syntax level");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["lang".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
     }
 
     #[test]
-    fn rejects_upsert_target_column_with_mismatched_case() {
+    fn accepts_upsert_target_column_with_mismatched_case_at_syntax_level() {
         // `id` は列識別子であり、`ON`/`CONFLICT`/`DO` のような文脈的キーワード
         // ではない（大文字小文字保存・区別。`parse_on_conflict_clause` の
         // ドキュメンテーションコメント参照。cursor(Bugbot) 指摘
         // https://github.com/Fandhe-AI/vector-db/pull/990#discussion_r4075151521）。
+        // 構文段階では任意の識別子を対象列として受理するため（Issue #1074）、
+        // `(ID)`／`(Id)` もここでは受理される。大小文字違いが実在しない列名と
+        // して最終的に `42601` になることは bind 段（`sql::parser`）の結合
+        // テストで固定する（`rejects_upsert_target_column_with_mismatched_case`
+        // 参照）。
         let lookup = catalog_with(&["documents"]);
         for target in ["ID", "Id"] {
             let sql = format!(
                 "INSERT INTO documents (id) VALUES (1) ON CONFLICT ({target}) DO NOTHING \
                  USING OPERATION_ID 'op-upsert-case'"
             );
-            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601");
+            let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered)
+                .expect("case-mismatched target column should be accepted at the syntax level");
+            assert_eq!(
+                stmt.on_conflict,
+                Some(OnConflictClause {
+                    target: vec![target.to_string()],
+                    action: OnConflictAction::DoNothing,
+                })
+            );
         }
     }
 
     #[test]
-    fn rejects_upsert_multiple_target_columns() {
+    fn accepts_upsert_multiple_target_columns_at_syntax_level() {
+        // 複数対象列の構文自体は本モジュールで受理する（TABLE-16、Issue #1074）。
+        // `(id, lang)` が宣言済み UNIQUE 制約のいずれとも一致しない場合に
+        // 最終的に `42601` になることは bind 段の結合テストで固定する
+        // （`rejects_upsert_target_not_matching_any_unique_constraint` 参照）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (id, lang) DO NOTHING \
              USING OPERATION_ID 'op-upsert-6'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("multiple target columns should be accepted at the syntax level");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string(), "lang".to_string()],
+                action: OnConflictAction::DoNothing,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_upsert_target_column_count_over_limit() {
+        // 列数上限（[`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]）超過は
+        // 構文段階で `42601`（TABLE-16、Issue #1074）。
+        let lookup = catalog_with(&["documents"]);
+        let target_list = (0..=crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT ({target_list}) DO NOTHING \
+             USING OPERATION_ID 'op-upsert-too-many-targets'"
+        );
+        let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_upsert_duplicate_target_column() {
+        // 対象列名の重複は構文段階で `42601`（TABLE-16、Issue #1074）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (lang, lang) \
+             DO NOTHING USING OPERATION_ID 'op-upsert-dup-target'",
             &lookup,
             LedgerMode::Ledgered,
         )

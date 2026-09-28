@@ -532,7 +532,7 @@ pub fn verify(
     let password_matches = match argon2id::verify_phc(phc_to_check, password) {
         Ok(matches) => matches,
         Err(e) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: password verification could not run the KDF ({e:?}); treating as authentication failure"
             );
             false

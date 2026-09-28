@@ -1151,6 +1151,26 @@ impl TlsSession {
             .map_err(TlsSessionError::Protection)
     }
 
+    /// アプリケーションデータ 1 レコード分を、シーケンス番号を消費せずに
+    /// seal する（[`Sealer::seal_detached`] へ委譲）。RECOVER-6（緊急応答。
+    /// Issue #1080）用に `tls::stream::TlsStream::emergency_response_channel`
+    /// が呼ぶ。`&self` で完結し、状態を変更しない（`seal_application_data`
+    /// と異なりシーケンス番号・`poisoned` 系フラグのいずれも変更しない）。
+    ///
+    /// [`Sealer::seal_detached`] の doc に記す nonce 再利用の不変条件は
+    /// この関数にもそのまま適用される。呼び出し元がその不変条件を担保する。
+    pub fn seal_application_data_detached(
+        &self,
+        payload: &[u8],
+    ) -> Result<Record, TlsSessionError> {
+        if self.poisoned || self.sent_close_notify || self.received_close_notify {
+            return Err(TlsSessionError::Poisoned);
+        }
+        self.sealer
+            .seal_detached(ContentType::ApplicationData, payload)
+            .map_err(TlsSessionError::Protection)
+    }
+
     /// 受信した 1 レコードを open する。`close_notify` は
     /// [`AppEvent::CloseNotify`]、`user_canceled` は [`AppEvent::UserCanceled`]
     /// （受信は継続し、以後のアプリケーションデータは [`AppEvent::Ignored`]

@@ -565,17 +565,7 @@ fn finish_copy_from<S: WireStream>(
     };
 
     let outcome = {
-        let _emergency_registration =
-            crate::simple_query::emergency_response_bytes().and_then(|bytes| {
-                let clone = stream.emergency_channel()?;
-                Some(
-                    engine::recovery::panic_hook::EmergencyResponseRegistration::register(
-                        bytes.to_vec(),
-                        clone,
-                        crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
-                    ),
-                )
-            });
+        let _emergency_registration = crate::simple_query::register_emergency_response(stream);
         engine.commit_copy_in(ctx, batch)
     };
 

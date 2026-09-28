@@ -218,6 +218,13 @@
 //! ソフトブースト機構を一般化する（詳細は `scoring_boost.rs` モジュールドキュメント
 //! 参照）。SQL 表層への構文露出は対象外。
 
+// RECOVER-8（fail_fast）の例外は `recovery::stderr_log::write_line`／
+// `log_stderr!` に一本化する（Issue #1081）。通常ビルド・bin では `eprintln!`
+// の再混入を lint で防ぎ、`#[cfg(test)]` のテストコードと test_util は対象外
+// とする（`make lint` は `--all-targets` で動くため、テストの通常アサーション
+// 出力は妨げない）。
+#![cfg_attr(not(test), deny(clippy::print_stderr))]
+
 pub mod arena;
 pub mod batch_fallback;
 pub mod batch_limits;

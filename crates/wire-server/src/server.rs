@@ -215,7 +215,7 @@ fn accept_loop_inner(
         let stream = match conn {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("wire-server: accept error: {e}");
+                engine::log_stderr!("wire-server: accept error: {e}");
                 continue;
             }
         };
@@ -224,7 +224,7 @@ fn accept_loop_inner(
             // 上限超過: ハンドシェイクへ進ませず、スレッドを生成せずに `53300` を
             // 返してから即座にクローズする（WIRE-6）。ピアアドレス等の識別情報は
             // ログに出さない。
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: rejecting connection: too many connections (active={}, max={})",
                 limiter.active(),
                 limiter.max()
@@ -258,7 +258,9 @@ fn accept_loop_inner(
                         let _reject_permit = reject_permit;
                         limits::reject_too_many_connections(stream, max);
                     }) {
-                        eprintln!("wire-server: failed to spawn reject worker thread: {e}");
+                        engine::log_stderr!(
+                            "wire-server: failed to spawn reject worker thread: {e}"
+                        );
                     }
                 }
                 None => {
@@ -271,7 +273,7 @@ fn accept_loop_inner(
         };
 
         if let Err(e) = limits::apply_read_timeout(&stream, read_timeout) {
-            eprintln!("wire-server: failed to configure connection timeouts: {e}");
+            engine::log_stderr!("wire-server: failed to configure connection timeouts: {e}");
             // `permit` はここでスコープを抜けて解放される。
             continue;
         }
@@ -284,7 +286,7 @@ fn accept_loop_inner(
         // 発生しうる。失敗時は `apply_read_timeout` と同様に当該接続をスキップする
         // （fail-closed。ソケットオプション設定に失敗した接続を放置しない）。
         if let Err(e) = stream.set_nodelay(true) {
-            eprintln!("wire-server: failed to set TCP_NODELAY: {e}");
+            engine::log_stderr!("wire-server: failed to set TCP_NODELAY: {e}");
             // `permit` はここでスコープを抜けて解放される。
             continue;
         }
@@ -313,7 +315,7 @@ fn accept_loop_inner(
                 (None, None) => crate::handshake::handle_connection_bounded(stream, &store),
             };
             if let Err(e) = result {
-                eprintln!("wire-server: connection error: {e}");
+                engine::log_stderr!("wire-server: connection error: {e}");
             }
         });
     }

@@ -539,10 +539,11 @@ fn insert_rows_encode_error_takes_priority_over_operation_id_content_mismatch() 
 }
 
 // UPDATE: 既存行に対する embedding 次元不一致は、schema 取得直後の
-// `validate_embedding_dim` が台帳照合（`content_hash::for_update_encoded` の
+// `validate_row_embedding_dim`（VECTOR 列ありスキーマでは `validate_embedding_dim`
+// に委譲。Issue #1079）が台帳照合（`content_hash::for_update_encoded` の
 // 呼び出し）より前に位置しているため、同一 operation_id の内容不一致（22023）
-// よりも先に返る。Issue #397 の事前エンコードは `validate_embedding_dim` の後に
-// 置いており、この優先順位は変更前後で不変であることをピン留めする。
+// よりも先に返る。Issue #397 の事前エンコードは次元検証の後に置いており、この
+// 優先順位は変更前後で不変であることをピン留めする。
 #[test]
 fn update_row_embedding_dim_mismatch_takes_priority_over_operation_id_content_mismatch() {
     let path = unique_db_path("content-hash-update-dim-priority");
