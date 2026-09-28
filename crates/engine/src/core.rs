@@ -4936,7 +4936,13 @@ impl EngineCore {
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("failed to read table generation: {e}"),
             })?;
-        drop(post_check_txn);
+        // Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応: `post_check_txn`
+        // はここで drop せず [`Self::explain_engine_for`] へ渡すまで保持する。
+        // 世代照合済みの `post_check_schema` と同一スナップショットで索引宣言
+        // を読むことで、世代照合からここまでの間に新たな `DROP INDEX`／
+        // `CREATE INDEX` がコミットされても、束縛に使ったスキーマと異なる
+        // 世代の索引宣言を注記しない（[`Self::explain_engine_for`] の
+        // ドキュメンテーションコメント参照）。
         if current_generation != planning_generation {
             return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "table generation changed during EXPLAIN USING PLAN query \
@@ -4989,6 +4995,7 @@ impl EngineCore {
         // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出。Issue #1066
         // で使用索引名の組み立ても統合）へ委譲する。
         let (explain_engine, index_names) = self.explain_engine_for(
+            &post_check_txn,
             table,
             true,
             planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
@@ -5002,6 +5009,7 @@ impl EngineCore {
             explain_shape.scalar_plan(),
             scalar_filter_column_names.as_deref(),
         );
+        drop(post_check_txn);
         Ok(crate::sql::explain::build_explain_result_with_indexes(
             &planned,
             &explain_engine,
@@ -5037,9 +5045,22 @@ impl EngineCore {
     ///   場合のみ（被覆されない列が 1 つでもあれば実行時は
     ///   `FallbackNoIndex` で全走査に落ちるため索引使用を主張しない。
     ///   トークン自体の実行時整合は #1153 の管轄）
-    #[allow(clippy::too_many_arguments)] // Issue #1066 で `scalar_filter_columns` 追加により 8 引数。hnsw.rs と同じ方針で許容する。
+    ///
+    /// `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応）は
+    /// 呼び出し元が `bind`（束縛）に使ったスキーマと同一の `read_txn_with_
+    /// schema` 由来のスナップショットをそのまま渡す（新規に `begin_read()`
+    /// し直さない）。索引宣言をここで独自に新しい読み取りトランザクションから
+    /// 読むと、束縛時と索引宣言取得時の間に `DROP INDEX`／`CREATE INDEX`／
+    /// テーブル再作成がコミットされた場合、旧スキーマで束縛した述語に新しい
+    /// 索引宣言の名前が付き実際の実行計画と食い違う（[`Self::run_explain_
+    /// plan`] の世代照合は `post_check_txn` とは別の txn を開き直す実装だと
+    /// この窓を塞がない）。呼び出し元はいずれも `bind` 用に開いた
+    /// `read_txn` を保持し続け、ここへ同じ参照を渡すことで束縛・索引宣言
+    /// 読み取りを単一スナップショットへ統一する。
+    #[allow(clippy::too_many_arguments)] // Issue #1066 で `scalar_filter_columns`・`read_txn` 追加により 9 引数。hnsw.rs と同じ方針で許容する。
     fn explain_engine_for(
         &self,
+        read_txn: &redb::ReadTransaction,
         table: &str,
         is_hybrid: bool,
         is_precision: bool,
@@ -5063,27 +5084,25 @@ impl EngineCore {
         // 索引名の組み立てを追加した際に txn を無条件で開くよう誤って変更
         // すると、既定エンジンの EXPLAIN 毎に不要な索引カタログ全件走査
         // （最大 `MAX_INDEX_COUNT` 件のデコード）という新規 I/O 副作用を生む）。
-        // 読み取りに使う txn はこの表示専用に新規で開き（`EXPLAIN` は検索本体
-        // を実行しないため計画開始時の txn を引き回さない）、失敗時は
-        // fail-closed に `false`（brute-force 表示）・索引名なしへ倒す。
+        // 読み取りに使う txn は呼び出し元が `bind` に使った `read_txn`
+        // 引数（同一スナップショット。上記ドキュメンテーションコメント・
+        // Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応）をそのまま
+        // 使う（新規に `begin_read()` しない）。カタログ読み取り自体の失敗
+        // （走査上限超過・デコード失敗）は fail-closed に `false`
+        // （brute-force 表示）・索引名なしへ倒す。
         let (hnsw_enabled, index_decls) = if declarations_enabled {
-            match self.storage.db().begin_read() {
-                Ok(read_txn) => {
-                    let hnsw_enabled = crate::catalog::hnsw_targeted_in_txn(
-                        &read_txn,
-                        &self.index_catalog_gate_cache,
-                        table,
-                        self.hnsw_scope,
-                        true,
-                    );
-                    // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
-                    // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
-                    // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
-                    let decls = crate::catalog::explain_index_names_in_txn(&read_txn, table).ok();
-                    (hnsw_enabled, decls)
-                }
-                Err(_) => (false, None),
-            }
+            let hnsw_enabled = crate::catalog::hnsw_targeted_in_txn(
+                read_txn,
+                &self.index_catalog_gate_cache,
+                table,
+                self.hnsw_scope,
+                true,
+            );
+            // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
+            // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
+            // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
+            let decls = crate::catalog::explain_index_names_in_txn(read_txn, table).ok();
+            (hnsw_enabled, decls)
         } else {
             (false, None)
         };
@@ -5154,7 +5173,7 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedStatement,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_in_session(
             validated,
             &schema,
@@ -5162,7 +5181,7 @@ impl EngineCore {
             session.udfs(),
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
-            self.search_explain_from_bound(&schema, &bound),
+            self.search_explain_from_bound(&read_txn, &schema, &bound),
         ))
     }
 
@@ -5179,8 +5198,14 @@ impl EngineCore {
     /// `metadata_filters` の `column_index()` を索引名注記の被覆判定用の
     /// 列名へ写像するために使う（`bound.table()` と同一テーブルであることは
     /// 呼び出し元がいずれも `bind` 直後に呼ぶ契約により保証される）。
+    /// `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応）は
+    /// `schema` を取得したのと同一の `read_txn_with_schema` 由来のスナップ
+    /// ショットで、[`Self::explain_engine_for`] へそのまま渡し索引宣言も
+    /// 同一スナップショットから読む（束縛時スキーマと索引宣言取得時の間に
+    /// `DROP INDEX`／`CREATE INDEX` がコミットされて食い違う窓を作らない）。
     fn search_explain_from_bound(
         &self,
+        read_txn: &redb::ReadTransaction,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
     ) -> crate::sql::exec::QueryResult {
@@ -5209,6 +5234,7 @@ impl EngineCore {
         let scalar_filter_column_names =
             metadata_filter_column_names(schema, bound.metadata_filters());
         let (engine, index_names) = self.explain_engine_for(
+            read_txn,
             bound.table(),
             is_hybrid,
             is_precision,
@@ -5234,10 +5260,10 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedAggregate,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
         Ok(crate::sql::SqlOutcome::Explain(
-            self.aggregate_explain_from_bound(&schema, &bound),
+            self.aggregate_explain_from_bound(&read_txn, &schema, &bound),
         ))
     }
 
@@ -5254,16 +5280,19 @@ impl EngineCore {
     /// 自体の判定式は変えない。#1153 のスコープ）。`access_path` が
     /// `ScalarIndexCandidates`（索引経由の候補削減が使える形）のときに限り、
     /// `metadata_filters` の列がすべて対象テーブルのスカラー宣言で被覆されて
-    /// いるかを新規 read txn で判定する（ann は常に対象外——集計 EXPLAIN は
-    /// `ann_plan:` 行を出さない）。カタログ読み取り失敗・列名写像失敗は
-    /// fail-closed に名前なしへ倒す。ここで付ける名前も `search_explain_
-    /// from_bound` の `scalar_names` と同じく「宣言上の候補索引名」であり、
-    /// `ScalarIndex::resolve_candidates` の実行時縮退（選択度超過・候補取得
-    /// 不能）は意図的に反映しない（`scalar_index_names_for_columns` の
-    /// ドキュメンテーションコメント・`docs/design/
-    /// explain-search-engine-exposure.md`「決定 1」節参照）。
+    /// いるかを `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・
+    /// 3 巡目対応: `bind_aggregate` に使ったスキーマと同一の `read_txn_with_
+    /// schema` 由来スナップショット。新規に `begin_read()` し直さない）で
+    /// 判定する（ann は常に対象外——集計 EXPLAIN は `ann_plan:` 行を出さない）。
+    /// カタログ読み取り失敗・列名写像失敗は fail-closed に名前なしへ倒す。
+    /// ここで付ける名前も `search_explain_from_bound` の `scalar_names` と
+    /// 同じく「宣言上の候補索引名」であり、`ScalarIndex::resolve_candidates`
+    /// の実行時縮退（選択度超過・候補取得不能）は意図的に反映しない
+    /// （`scalar_index_names_for_columns` のドキュメンテーションコメント・
+    /// `docs/design/explain-search-engine-exposure.md`「決定 1」節参照）。
     fn aggregate_explain_from_bound(
         &self,
+        read_txn: &redb::ReadTransaction,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
     ) -> crate::sql::exec::QueryResult {
@@ -5275,18 +5304,15 @@ impl EngineCore {
         ) && self.hnsw_state.is_some()
         {
             match metadata_filter_column_names(schema, bound.metadata_filters()) {
-                Some(cols) if !cols.is_empty() => match self.storage.db().begin_read() {
-                    Ok(read_txn) => {
-                        match crate::catalog::explain_index_names_in_txn(&read_txn, bound.table()) {
-                            Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
-                                Vec::new(),
-                                scalar_index_names_for_columns(&decls.scalar, &cols),
-                            ),
-                            Err(_) => crate::sql::explain::ExplainIndexNames::default(),
-                        }
+                Some(cols) if !cols.is_empty() => {
+                    match crate::catalog::explain_index_names_in_txn(read_txn, bound.table()) {
+                        Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
+                            Vec::new(),
+                            scalar_index_names_for_columns(&decls.scalar, &cols),
+                        ),
+                        Err(_) => crate::sql::explain::ExplainIndexNames::default(),
                     }
-                    Err(_) => crate::sql::explain::ExplainIndexNames::default(),
-                },
+                }
                 _ => crate::sql::explain::ExplainIndexNames::default(),
             }
         } else {
@@ -5490,14 +5516,14 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound search plan targets a different table than requested",
             ));
         }
-        Ok(self.search_explain_from_bound(&schema, &bound))
+        Ok(self.search_explain_from_bound(&read_txn, &schema, &bound))
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）の
@@ -5558,14 +5584,14 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound aggregate plan targets a different table than requested",
             ));
         }
-        Ok(self.aggregate_explain_from_bound(&schema, &bound))
+        Ok(self.aggregate_explain_from_bound(&read_txn, &schema, &bound))
     }
 
     /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を

@@ -301,6 +301,17 @@ NoSQL 表層が独自の行・語彙を追加することはない。
 - `scalar_plan:` トークン自体を宣言除外・平均値長等の実行時ゲートへ
   合わせる変更は対象外のまま（別 Issue の管轄。本 Issue はトークンを
   変えずに索引名の注記を付けるだけ）
+- **索引名注記は束縛に使ったスキーマと同一スナップショットの索引宣言だけを
+  見る**（3 巡目 codex-review P1 指摘対応・Issue #1066 PR #1155）:
+  `run_search_explain`／`run_explain_plan`（`USING PLAN`）／
+  `run_relational_explain_aggregate` はいずれも `read_txn_with_schema` で
+  開いた読み取りトランザクションを保持し続け、`explain_engine_for`・
+  `aggregate_explain_from_bound` の索引宣言読み取り
+  （`catalog::explain_index_names_in_txn`）へその同じ参照を渡す（新規に
+  `begin_read()` し直さない）。これにより束縛時スキーマの取得と索引宣言の
+  読み取りが単一スナップショットに統一され、両者の間に `DROP INDEX`／
+  `CREATE INDEX`／テーブル再作成がコミットされても、旧スキーマで束縛した
+  述語に新しい宣言の `index=` が付いて実際の計画と食い違うことがない
 
 ## ポインタ
 
