@@ -33,10 +33,13 @@
 //! TTL 経過後に `28000` へ収束することを、固定 `sleep` ではなく
 //! `hang_guard` 上限のポーリングで確認する
 //! （`poll_until_token_rejected_with_28000`。codex-review P2 指摘）。
-//! 発行直後の即時有効性は同一トークンへの経過時間依存アサーションでは
-//! 確認せず、既存の long-TTL 対照リスナーへ分離している（login から
-//! 問い合わせまでの実経過時間が正の TTL を超過すると正しい実装でも
-//! 失敗しうる時間依存アサーションを避けるため。codex-review P2 指摘。
+//! 発行直後の即時有効性は、正の TTL を持つ同一トークン自身に対して
+//! `SessionStore::lookup_grant` を HTTP を経由せず直接呼び、`now` に login
+//! 呼び出し前に採取した `Instant`（単調時計での `issued_at` 以前の下界）を
+//! 渡すことで確認する（`is_alive` の経過時間計算が恒等的に `Duration::ZERO`
+//! になり、実経過時間に一切依存しない）。long-TTL 対照リスナーだけでは
+//! 別トークン・別 TTL 設定になり、正の TTL を誤って即時失効させる退行を
+//! 検出できないため、この直接呼び出しで補う（codex-review P2 指摘。
 //! PR #1150 review thread 参照）。
 
 #[path = "common/mod.rs"]
@@ -302,16 +305,37 @@ fn expired_token_on_query_rejects_with_28000() {
     // 正の TTL（同一トークン）: TTL 経過後に同じトークンが 28000 へ収束する
     // ことを固定 sleep ではなくポーリングで確認する（codex-review P2 指摘。
     // TTL=0 の退化ケースだけでは検出できない、TTL の単位換算・比較演算子
-    // 反転等の退行への保険）。発行直後の即時有効性は上記の long-TTL 対照
-    // リスナーで既に検証済みであり、ここでは重ねて確認しない
-    // （login からこのクエリ発行までの実経過時間が TTL=2 秒を超えると、
-    // 正しい実装でも 404 の代わりに 28000 を返し得るため、時間依存の
-    // 間欠失敗を再導入してしまう。codex-review P2 指摘。発行後の状態は
-    // ポーリングでのみ観測し、経過時間に対する即値アサーションを行わない）。
+    // 反転等の退行への保険）。
+    //
+    // 期限前の有効性は、上記 long-TTL 対照リスナー（別トークン・別 TTL 設定）
+    // だけでは代替できない: 「正の TTL を誤って即時失効させる」退行
+    // （TTL の単位換算・`is_alive` の比較演算子反転等）は TTL=3600s 側の
+    // `is_alive` 判定を通らず、TTL=2s 側だけで顕在化しうる（PR #1150 review
+    // thread・codex-review P2 指摘）。これを HTTP 経由のクエリ・`Instant::now()`
+    // への即値アサーションで確認すると、login から確認までの実経過時間が
+    // TTL=2 秒に対して非決定的になり Issue #1083 が排した負荷下の間欠失敗を
+    // 再導入する。そのため経過時間そのものに依存せず、`positive_ttl_sessions`
+    // （`SessionStore` は `Arc` 共有）へ直接 `lookup_grant` を呼び、`now` には
+    // login 呼び出し**前**に採取した `before_positive_ttl_login` を渡す。
+    // `Instant` は単調時計のため `before_positive_ttl_login <= issued_at` が
+    // 常に成立し、`is_alive` の `now.saturating_duration_since(issued_at)` は
+    // 恒等的に `Duration::ZERO`（`< 2s` で有効）になる。すなわちこの判定は
+    // 実経過時間に一切依存しない。有効なら該当エントリは消費されず残るため、
+    // 後続のポーリングにも影響しない。
     let positive_ttl_sessions = SessionStore::with_limits(4, Duration::from_secs(2));
+    let positive_ttl_observer = positive_ttl_sessions.clone();
     let positive_ttl_addr = spawn_router_listener(&users_path, positive_ttl_sessions);
+    let before_positive_ttl_login = Instant::now();
     let positive_ttl_token = login(positive_ttl_addr, "alice", "pw-alice");
     let positive_ttl_auth = format!("Bearer {positive_ttl_token}");
+    let parsed_positive_ttl_token =
+        SessionToken::parse(&positive_ttl_token).expect("login returns a well-formed token");
+    assert!(
+        positive_ttl_observer
+            .lookup_grant(&parsed_positive_ttl_token, before_positive_ttl_login)
+            .is_some(),
+        "a freshly issued positive-TTL token must be valid immediately after login"
+    );
     poll_until_token_rejected_with_28000(
         positive_ttl_addr,
         &positive_ttl_auth,
