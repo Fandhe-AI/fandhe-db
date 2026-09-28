@@ -369,6 +369,24 @@ pub(crate) fn sync_rows_in_txn(
                 }
             }
         }
+
+        // 同一バッチ内で「行 A がキー K を失い、行 B が新たに K を得る」
+        // （親キーの UPDATE による入れ替え・削除→同一値の再挿入等）場合、
+        // 上のループは行 A の処理時点で K を無条件に `delta.lost` へ積む。
+        // 全 id の同期が終わった時点の索引を読み直し、他行がまだ保持している
+        // キーは `lost` から取り除く（レビュー指摘: `sync_rows_in_txn` が
+        // 旧キー削除の都度 `lost` へ追加し、バッチ完了後の再確認をしていな
+        // かったため、参照先が実在するのに `ForeignKeyViolation` を誤って
+        // 返していた）。
+        if let Some(lost_for_name) = delta.lost.get_mut(name) {
+            let mut still_lost = BTreeSet::new();
+            for key in lost_for_name.iter() {
+                if !key_present(&fwd, tenant_id, key).map_err(TenantWriteError::from)? {
+                    still_lost.insert(key.clone());
+                }
+            }
+            *lost_for_name = still_lost;
+        }
     }
     Ok(delta)
 }
