@@ -3880,6 +3880,27 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 )))
             })?;
 
+        // `user_rows/{table}` を開く**前**に、このテーブルを参照先とする
+        // FOREIGN KEY（列参照。`id` 参照は索引を使わない）の永続キー索引を、
+        // テナント `ctx.tenant_id()` の現在（この文の削除・挿入より前）の状態
+        // から backfill・登録しておく（Issue #1071 レビュー指摘・cursor bugbot
+        // 指摘: この backfill が旧行の物理削除**後**に初めて走ると、削除された
+        // 旧行の旧キーが逆引き索引の pre-image に一度も現れず、直後の
+        // 参照先側検査〔`enforce_referencing_rows_in_txn`〕が「失われたキー
+        // なし」と誤判定し他の子行からの参照をすり抜ける。行ストアを開いた
+        // 後に呼ぶと `redb::TableError::TableAlreadyOpen`
+        // になる（`ensure_index_in_txn` も同じ行ストアを開くため。この関数の
+        // `mut row_table` は削除・挿入の完了までこのクロージャ内で生き続ける）。
+        // 削除対象が実際にあるかどうかはこの時点でまだ分からないが、
+        // 冪等（既に登録済みなら何もしない）なので無条件に呼んでよい。
+        // `constraint::prepare_referenced_key_indexes_in_txn` ドキュメント参照。
+        crate::constraint::prepare_referenced_key_indexes_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+        )?;
+
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))

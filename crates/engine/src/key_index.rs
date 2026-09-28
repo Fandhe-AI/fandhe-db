@@ -20,11 +20,20 @@
 //!   同期時に行の直前のキー値（pre-image）を求め、順引き側の旧エントリを
 //!   O(1) で特定するために使う。
 //!
-//! どのテーブルがどの索引を維持するかは `key_index_registry`
-//! （`(table, name) -> ()`）に記録する。未登録の索引は「まだ構築していない」
-//! ことを意味し、呼び出し元（`constraint.rs`）は全行走査へフォールバックした
-//! 上で [`ensure_index_in_txn`] を呼んで以後の文から索引経路に切り替える
-//! （初回のみテーブル全テナントを 1 回走査する。DDL 級の保守操作として扱う）。
+//! どのテーブルのどのテナントがどの索引を構築済みかは `key_index_registry`
+//! （`(table, name, tenant) -> ()`）に記録する。**登録はテナント単位**
+//! （Issue #1071 レビュー指摘 P0: `ensure_index_in_txn` が旧実装のまま
+//! `(table, name)` 単位で登録すると、初回構築した 1 テナントの backfill
+//! 走査が他の全テナントの索引済み状態まで確定させてしまい、以後その
+//! テナントは未構築のまま索引経路〔`Ok(Some(()))`〕を誤って通過し得る）。
+//! 未登録（そのテナントでは未構築）の索引は「まだ構築していない」ことを
+//! 意味し、呼び出し元（`constraint.rs`）は全行走査へフォールバックした上で
+//! [`ensure_index_in_txn`] を呼んで以後の文から索引経路に切り替える
+//! （テナントごとに初回のみ**そのテナントの行だけ**を 1 回走査する。DDL 級の
+//! 保守操作として扱う）。fwd／rev の実テーブルは `(table, name)` 単位で共有し
+//! （テナントは既にキーの第 1 成分のため、テーブル自体を分ける必要はない）、
+//! 複数テナントが同じ索引を順次 backfill しても互いの既存エントリを破壊しない
+//! （`redb::WriteTransaction::open_table` は get-or-create）。
 //!
 //! キー値の正準エンコードは一意性制約の検査点（`constraint::key_bytes`）と
 //! 共有する。`FOREIGN KEY` が `id` 疑似列を参照する場合も、子列（`INTEGER`／
@@ -41,10 +50,9 @@
 //! `constraint.rs` モジュールドキュメント参照）。他テナントの索引エントリには
 //! 一切触れない。
 //!
-//! 例外は [`ensure_index_in_txn`] による初回構築（backfill）で、全テナントの
-//! 行を 1 回だけ読む。結果（索引の中身）は照会経路がテナント範囲に閉じるため
-//! 応答へは一切影響せず、1 回限りのレイテンシだけが観測可能（
-//! `docs/design/foreign-key.md` 参照）。
+//! [`ensure_index_in_txn`] による初回構築（backfill）も**要求元テナントの行
+//! だけ**を読む（登録簿がテナント単位のため、他テナントの行数・破損状態には
+//! 一切触れない。`docs/design/foreign-key.md` 参照）。
 //!
 //! # 呼び出し契約
 //!
@@ -72,8 +80,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `catalog.rs::MAX_INDEX_COUNT` と同じ判断）。
 const MAX_KEY_INDEXES: usize = 4096;
 
-/// 索引登録簿: `(table, name) -> ()`。エントリの存在が「索引構築済み」を表す。
-const REGISTRY_TABLE: TableDefinition<(&str, &str), ()> =
+/// 索引登録簿: `(table, name, tenant) -> ()`。エントリの存在が「そのテナントで
+/// 索引構築済み」を表す（テナント単位。モジュール doc 参照）。
+const REGISTRY_TABLE: TableDefinition<(&str, &str, &str), ()> =
     TableDefinition::new("key_index_registry");
 
 type FwdTableDef<'a> = TableDefinition<'a, (&'static str, &'static [u8], u64), ()>;
@@ -234,41 +243,65 @@ impl KeyIndexDelta {
     }
 }
 
-/// `table` の登録簿に記録済みの索引名を列挙する（`table` に一致するものだけ）。
-/// 登録簿未作成なら空を返す。走査件数は [`MAX_KEY_INDEXES`] で打ち切る
-/// （fail-closed。`catalog.rs::retain_index_defs_in_txn` と同じ判断）。
-fn registered_names_for_table(
+/// `table` の登録簿に記録済みの `(索引名, テナント)` を列挙する（`table` に
+/// 一致するものだけ。全テナント分）。登録簿未作成なら空を返す。走査件数は
+/// [`MAX_KEY_INDEXES`] で打ち切る（fail-closed。
+/// `catalog.rs::retain_index_defs_in_txn` と同じ判断。テナント単位登録に
+/// なった分、同じ索引名でもテナント数だけエントリが増えるが、上限はテーブル
+/// 全体の総登録数のまま据え置く——無制限のテナント数 × 索引数を許すと登録簿
+/// 自体が無制限に肥大するため）。
+fn registry_entries_for_table(
     write_txn: &redb::WriteTransaction,
     table: &str,
-) -> Result<Vec<String>, CatalogError> {
+) -> Result<Vec<(String, String)>, CatalogError> {
     let reg = match write_txn.open_table(REGISTRY_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
-    let mut names = Vec::new();
-    for (scanned, entry) in reg.iter()?.enumerate() {
+    let start = std::ops::Bound::Included((table, "", ""));
+    let mut entries = Vec::new();
+    let mut iter = reg
+        .range::<(&str, &str, &str)>((start, std::ops::Bound::Unbounded))
+        .map_err(CatalogError::from)?;
+    for (scanned, entry) in (&mut iter).enumerate() {
         if scanned >= MAX_KEY_INDEXES {
             return Err(CatalogError::CorruptSchema(format!(
                 "key index registry exceeds {MAX_KEY_INDEXES} entries"
             )));
         }
         let (k, _v) = entry?;
-        let (entry_table, name) = k.value();
-        if entry_table == table {
-            names.push(name.to_string());
+        let (entry_table, name, tenant) = k.value();
+        if entry_table != table {
+            break;
         }
+        entries.push((name.to_string(), tenant.to_string()));
     }
-    Ok(names)
+    Ok(entries)
+}
+
+/// `table` の登録簿から、テナント `tenant` に一致するものだけの索引名を返す
+/// （[`sync_rows_in_txn`]／[`clear_tenant_in_txn`] が同期対象を絞るために使う）。
+fn registered_names_for_table(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    tenant: &str,
+) -> Result<Vec<String>, CatalogError> {
+    Ok(registry_entries_for_table(write_txn, table)?
+        .into_iter()
+        .filter(|(_, entry_tenant)| entry_tenant == tenant)
+        .map(|(name, _)| name)
+        .collect())
 }
 
 fn is_registered(
     write_txn: &redb::WriteTransaction,
     table: &str,
     name: &str,
+    tenant: &str,
 ) -> Result<bool, CatalogError> {
     match write_txn.open_table(REGISTRY_TABLE) {
-        Ok(t) => Ok(t.get((table, name))?.is_some()),
+        Ok(t) => Ok(t.get((table, name, tenant))?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
         Err(e) => Err(e.into()),
     }
@@ -300,7 +333,7 @@ pub(crate) fn sync_rows_in_txn(
     if ids.is_empty() || !table_may_need_index(schema) {
         return Ok(delta);
     }
-    let names = registered_names_for_table(write_txn, table)?;
+    let names = registered_names_for_table(write_txn, table, tenant_id)?;
     if names.is_empty() {
         return Ok(delta);
     }
@@ -404,7 +437,7 @@ pub(crate) fn clear_tenant_in_txn(
     tenant_id: &str,
 ) -> Result<KeyIndexDelta, TenantWriteError> {
     let mut delta = KeyIndexDelta::default();
-    let names = registered_names_for_table(write_txn, table)?;
+    let names = registered_names_for_table(write_txn, table, tenant_id)?;
     for name in &names {
         delta.registered.insert(name.clone());
         let rev_name = rev_table_name(table, name);
@@ -460,11 +493,14 @@ pub(crate) fn drop_indexes_for_table_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<(), CatalogError> {
-    let names = registered_names_for_table(write_txn, table)?;
-    if names.is_empty() {
+    // 登録簿はテナント単位（モジュール doc 参照）だが、fwd／rev の実テーブルは
+    // `(table, name)` で共有するため、削除は一意な索引名ごとに 1 回で足りる。
+    let entries = registry_entries_for_table(write_txn, table)?;
+    if entries.is_empty() {
         return Ok(());
     }
-    for name in &names {
+    let unique_names: BTreeSet<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+    for name in &unique_names {
         let fwd_name = fwd_table_name(table, name);
         let rev_name = rev_table_name(table, name);
         match write_txn.delete_table(fwd_table_def(&fwd_name)) {
@@ -477,17 +513,25 @@ pub(crate) fn drop_indexes_for_table_in_txn(
         }
     }
     let mut reg = write_txn.open_table(REGISTRY_TABLE)?;
-    for name in &names {
-        reg.remove((table, name.as_str()))?;
+    for (name, tenant) in &entries {
+        reg.remove((table, name.as_str(), tenant.as_str()))?;
     }
     Ok(())
 }
 
-/// `columns`（`schema` の生存列名）に対応する索引を、`table` の**全テナント**の
-/// 現在行から構築し登録簿へ登録する（未登録の索引をフォールバック走査で
-/// 判定した直後に呼ぶ「初回だけ全走査する」保守操作。DDL 級のコスト）。
-/// 既に登録済みなら何もしない（複数の `FOREIGN KEY` が同じ列集合を要求する
-/// 場合の冪等性）。
+/// `columns`（`schema` の生存列名）に対応する索引を、テナント `tenant_id` の
+/// 現在行から構築し、そのテナントに限り登録簿へ登録する（未登録の索引を
+/// フォールバック走査で判定した直後に呼ぶ「初回だけそのテナント分を走査する」
+/// 保守操作。DDL 級のコスト）。既に登録済みなら何もしない（複数の
+/// `FOREIGN KEY` が同じ列集合を要求する場合、同一テナントに対する冪等性）。
+///
+/// **テナント境界（Issue #1071 レビュー指摘 P0）**: 走査は
+/// `(tenant_id, 0)..=(tenant_id, u64::MAX)` の物理キー範囲に閉じ、他テナントの
+/// 行数・破損状態には一切触れない（`clear_tenant_in_txn` と同じ範囲指定）。
+/// fwd／rev の実テーブルは `(table, name)` で全テナント共有だが、この関数が
+/// 書き込むのは `tenant_id` のエントリだけであり、他テナントの既存エントリは
+/// 変更しない（`redb::WriteTransaction::open_table` は get-or-create のため、
+/// 複数テナントが順に backfill しても互いの索引を破壊しない）。
 ///
 /// 行ヘッダのテナントと物理キーのテナントの整合は
 /// [`crate::storage::verify_row_key_tenant`] で検証し、不整合な DB は
@@ -498,9 +542,10 @@ pub(crate) fn ensure_index_in_txn(
     table: &str,
     schema: &TableSchema,
     columns: &[String],
+    tenant_id: &str,
 ) -> Result<(), TenantWriteError> {
     let name = index_name_for_columns(columns);
-    if is_registered(write_txn, table, &name)? {
+    if is_registered(write_txn, table, &name, tenant_id)? {
         return Ok(());
     }
     let spec = resolve_key_spec(schema, columns)?;
@@ -513,9 +558,17 @@ pub(crate) fn ensure_index_in_txn(
         Ok(row_table) => {
             let mut fwd = open_kv_table(write_txn, fwd_table_def(&fwd_name))?;
             let mut rev = open_kv_table(write_txn, rev_table_def(&rev_name))?;
-            for entry in row_table.iter().map_err(CatalogError::from)? {
+            let start = std::ops::Bound::Included((tenant_id, 0u64));
+            let end = std::ops::Bound::Included((tenant_id, u64::MAX));
+            let mut iter = row_table
+                .range::<(&str, u64)>((start, end))
+                .map_err(CatalogError::from)?;
+            for entry in &mut iter {
                 let (k, v) = entry.map_err(CatalogError::from)?;
                 let (key_tenant, id) = k.value();
+                if key_tenant != tenant_id {
+                    break;
+                }
                 let buf = v.value();
                 let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
                     .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
@@ -543,7 +596,7 @@ pub(crate) fn ensure_index_in_txn(
         }
     }
     let mut reg = open_kv_table(write_txn, REGISTRY_TABLE)?;
-    reg.insert((table, name.as_str()), ())
+    reg.insert((table, name.as_str(), tenant_id), ())
         .map_err(CatalogError::from)?;
     Ok(())
 }
@@ -584,15 +637,40 @@ where
     }
 }
 
+/// `fwd_name` が `write_txn` の中に実在するかを、`redb::WriteTransaction`
+/// の `open_table` に頼らず明示的に確認する（Issue #1071 レビュー指摘 P0:
+/// `WriteTransaction::open_table` は get-or-create のため、レジストリに
+/// エントリがあるのに実テーブルが存在しない破損状態でも `TableDoesNotExist`
+/// を返さず黙って空テーブルを新規作成してしまい、[`key_present`]／
+/// [`any_entry_present`] が「エントリ 0 件 = 参照なし」と区別できず
+/// fail-open になる。`list_tables` によるテーブル名の存在確認だけがこの
+/// 状態を検出できる）。
+fn fwd_table_exists(
+    write_txn: &redb::WriteTransaction,
+    fwd_name: &str,
+) -> Result<bool, CatalogError> {
+    use redb::TableHandle;
+    let mut tables = write_txn.list_tables().map_err(CatalogError::from)?;
+    Ok(tables.any(|t| t.name() == fwd_name))
+}
+
+/// 登録済み（[`is_registered`] が `true`）の索引の順引きテーブルを読み取り用に
+/// 開く。登録簿にエントリがあるのに実テーブルが存在しなければ、
+/// `ensure_index_in_txn` が登録前に必ず作成する不変条件が破られた破損状態
+/// として `CorruptSchema` で fail-closed に拒否する（黙って空テーブルとして
+/// 扱うと「参照なし」の誤判定で `DELETE`／`TRUNCATE` を許してしまう）。
 fn open_fwd_readable<'a>(
     write_txn: &'a redb::WriteTransaction,
     fwd_name: &str,
-) -> Result<Option<FwdTable<'a>>, TenantWriteError> {
-    match write_txn.open_table(fwd_table_def(fwd_name)) {
-        Ok(t) => Ok(Some(t)),
-        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
-        Err(e) => Err(TenantWriteError::from(CatalogError::from(e))),
+) -> Result<FwdTable<'a>, TenantWriteError> {
+    if !fwd_table_exists(write_txn, fwd_name).map_err(TenantWriteError::from)? {
+        return Err(TenantWriteError::from(CatalogError::CorruptSchema(
+            format!("registered key index is missing its forward table {fwd_name:?}"),
+        )));
     }
+    write_txn
+        .open_table(fwd_table_def(fwd_name))
+        .map_err(|e| TenantWriteError::from(CatalogError::from(e)))
 }
 
 /// [`crate::constraint`] の参照元側検査（子行の INSERT／UPDATE）が呼ぶ。
@@ -609,17 +687,13 @@ pub(crate) fn all_keys_exist_in_txn(
     keys: &BTreeSet<Vec<u8>>,
 ) -> Result<Option<()>, TenantWriteError> {
     let name = index_name_for_columns(columns);
-    if !is_registered(write_txn, table, &name)? {
+    if !is_registered(write_txn, table, &name, tenant_id)? {
         return Ok(None);
     }
     let fwd_name = fwd_table_name(table, &name);
     let fwd = open_fwd_readable(write_txn, &fwd_name)?;
     for key in keys {
-        let present = match &fwd {
-            Some(t) => key_present(t, tenant_id, key)?,
-            None => false,
-        };
-        if !present {
+        if !key_present(&fwd, tenant_id, key)? {
             return Err(TenantWriteError::ForeignKeyViolation);
         }
     }
@@ -643,17 +717,13 @@ pub(crate) fn none_referenced_in_txn(
         return Ok(Some(()));
     }
     let name = index_name_for_columns(child_columns);
-    if !is_registered(write_txn, child_table, &name)? {
+    if !is_registered(write_txn, child_table, &name, tenant_id)? {
         return Ok(None);
     }
     let fwd_name = fwd_table_name(child_table, &name);
     let fwd = open_fwd_readable(write_txn, &fwd_name)?;
     for key in lost_keys {
-        let present = match &fwd {
-            Some(t) => key_present(t, tenant_id, key)?,
-            None => false,
-        };
-        if present {
+        if key_present(&fwd, tenant_id, key)? {
             return Err(TenantWriteError::ForeignKeyViolation);
         }
     }
@@ -672,14 +742,12 @@ pub(crate) fn none_referenced_for_tenant_in_txn(
     tenant_id: &str,
 ) -> Result<Option<()>, TenantWriteError> {
     let name = index_name_for_columns(child_columns);
-    if !is_registered(write_txn, child_table, &name)? {
+    if !is_registered(write_txn, child_table, &name, tenant_id)? {
         return Ok(None);
     }
     let fwd_name = fwd_table_name(child_table, &name);
-    let present = match open_fwd_readable(write_txn, &fwd_name)? {
-        Some(t) => any_entry_present(&t, tenant_id)?,
-        None => false,
-    };
+    let fwd = open_fwd_readable(write_txn, &fwd_name)?;
+    let present = any_entry_present(&fwd, tenant_id)?;
     if present {
         return Err(TenantWriteError::ForeignKeyViolation);
     }
@@ -739,10 +807,11 @@ mod tests {
         // 索引を先に構築（フォールバック経路を経由せず、直接 ensure を呼ぶ）。
         {
             let write_txn = storage.begin_write_txn().expect("begin write");
-            ensure_index_in_txn(&write_txn, "parents", &schema, &columns).expect("ensure index");
+            ensure_index_in_txn(&write_txn, "parents", &schema, &columns, "tenant-a")
+                .expect("ensure index");
             write_txn.commit_raw_for_test().expect("commit");
         }
-        assert!(index_has_entry(&storage, "parents", &columns, "tenant-a", b"").is_ok());
+        assert!(index_has_entry(&storage, "parents", &columns, "tenant-a").is_ok());
 
         // INSERT: id=1, code="a"
         crate::tenant::insert_typed_row(
@@ -788,7 +857,11 @@ mod tests {
     }
 
     /// 2 テナントが同じキー値を持っても索引上で衝突せず、片方の DELETE が
-    /// もう片方の索引項目を消さない（受入基準: テナント分離）。
+    /// もう片方の索引項目を消さない（受入基準: テナント分離）。索引の登録簿
+    /// もテナント単位であることを確認する（Issue #1071 レビュー指摘 P0:
+    /// `ensure_index_in_txn` が `tenant-a` の backfill を行っても `tenant-b`
+    /// は未登録のままであり、`tenant-b` 自身の backfill を経て初めて索引経路
+    /// に切り替わる）。
     #[test]
     fn tenant_isolation_in_index() {
         let (storage, _guard) = tmp_storage("key-index-tenant-isolation");
@@ -797,7 +870,8 @@ mod tests {
         let columns = vec!["code".to_string()];
         {
             let write_txn = storage.begin_write_txn().expect("begin write");
-            ensure_index_in_txn(&write_txn, "parents", &schema, &columns).expect("ensure index");
+            ensure_index_in_txn(&write_txn, "parents", &schema, &columns, "tenant-a")
+                .expect("ensure index for tenant-a");
             write_txn.commit_raw_for_test().expect("commit");
         }
 
@@ -814,6 +888,28 @@ mod tests {
             )
             .expect("insert must succeed for each tenant independently");
         }
+
+        // `tenant-b` はまだ backfill していないため、`tenant-a` の backfill の
+        // 副作用を受けず未登録のまま（フォールバックの合図 `Ok(None)`）。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let mut keys = BTreeSet::new();
+            keys.insert(encode_text_key("shared"));
+            let result = all_keys_exist_in_txn(&write_txn, "parents", &columns, "tenant-b", &keys)
+                .expect("query must not error");
+            assert!(
+                result.is_none(),
+                "tenant-a's backfill must not register the index for tenant-b"
+            );
+            write_txn.abort().expect("abort");
+        }
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            ensure_index_in_txn(&write_txn, "parents", &schema, &columns, "tenant-b")
+                .expect("ensure index for tenant-b");
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
         assert_key_present(&storage, "parents", &columns, "tenant-a", "shared", true);
         assert_key_present(&storage, "parents", &columns, "tenant-b", "shared", true);
 
@@ -856,7 +952,8 @@ mod tests {
         let result = all_keys_exist_in_txn(&write_txn, "parents", &columns, "tenant-a", &keys)
             .expect("query must not error");
         assert!(result.is_none(), "unregistered index must report None");
-        ensure_index_in_txn(&write_txn, "parents", &schema, &columns).expect("ensure index");
+        ensure_index_in_txn(&write_txn, "parents", &schema, &columns, "tenant-a")
+            .expect("ensure index");
         let result = all_keys_exist_in_txn(&write_txn, "parents", &columns, "tenant-a", &keys)
             .expect("query must not error");
         assert_eq!(result, Some(()));
@@ -876,14 +973,12 @@ mod tests {
         table: &str,
         columns: &[String],
         tenant: &str,
-        _key: &[u8],
     ) -> Result<(), ()> {
         let write_txn = storage.begin_write_txn().map_err(|_| ())?;
         let name = index_name_for_columns(columns);
-        let registered = is_registered(&write_txn, table, &name).map_err(|_| ())?;
+        let registered = is_registered(&write_txn, table, &name, tenant).map_err(|_| ())?;
         write_txn.abort().map_err(|_| ())?;
         if registered {
-            let _ = tenant;
             Ok(())
         } else {
             Err(())
@@ -985,5 +1080,265 @@ mod tests {
             "post-backfill foreign key check must not visit a number of rows \
              proportional to the tenant's row count"
         );
+    }
+
+    /// 登録簿にエントリがあるのに順引きテーブルが実在しない破損状態
+    /// （`ensure_index_in_txn` が両者を同一 write_txn で作成する不変条件が
+    /// 破られた状態）を人為的に作り、`CorruptSchema` で fail-closed に
+    /// 拒否されることを確認する（Issue #1071 レビュー指摘 P0:
+    /// `redb::WriteTransaction::open_table` は get-or-create のため、素朴な
+    /// 実装では黙って空テーブル扱いになり「参照なし」と誤判定して
+    /// `DELETE`／`TRUNCATE` を許してしまう）。
+    #[test]
+    fn missing_forward_table_for_registered_index_is_corrupt_schema() {
+        let (storage, _guard) = tmp_storage("key-index-corrupt-fwd");
+        let schema = parent_schema();
+        storage.create_table(&schema).expect("create table");
+        let columns = vec!["code".to_string()];
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            ensure_index_in_txn(&write_txn, "parents", &schema, &columns, "tenant-a")
+                .expect("ensure index");
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let name = index_name_for_columns(&columns);
+            let fwd_name = fwd_table_name("parents", &name);
+            write_txn
+                .delete_table(fwd_table_def(&fwd_name))
+                .expect("delete forward table (simulate corruption)");
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        let mut keys = BTreeSet::new();
+        keys.insert(encode_text_key("a"));
+        let result = all_keys_exist_in_txn(&write_txn, "parents", &columns, "tenant-a", &keys);
+        assert!(
+            matches!(
+                result,
+                Err(TenantWriteError::Catalog(CatalogError::CorruptSchema(_)))
+            ),
+            "registered-but-missing forward table must be fail-closed, got {result:?}"
+        );
+        let result = none_referenced_in_txn(&write_txn, "parents", &columns, "tenant-a", &keys);
+        assert!(
+            matches!(
+                result,
+                Err(TenantWriteError::Catalog(CatalogError::CorruptSchema(_)))
+            ),
+            "registered-but-missing forward table must be fail-closed, got {result:?}"
+        );
+        write_txn.abort().expect("abort");
+    }
+
+    fn self_ref_schema() -> TableSchema {
+        TableSchema::new(
+            "nodes",
+            vec![
+                ColumnDef::new("code", ColumnType::Text, false),
+                ColumnDef::new("parent_code", ColumnType::Text, true),
+            ],
+        )
+        .with_primary_key(vec!["code".to_string()])
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["parent_code".to_string()],
+            "nodes".to_string(),
+            vec!["code".to_string()],
+        )])
+    }
+
+    /// 自己参照 `FOREIGN KEY` を持つテーブルで、`code`（親列）索引がこの文で
+    /// 初めて構築される状況を人為的に再現し、`constraint::prepare_referenced_key_indexes_in_txn`
+    /// を旧行の物理削除**前**に呼んでおけば、削除された旧キーへの残存参照
+    /// （B が今も `parent_code="X"` を保持）を正しく検出できることを確認する
+    /// （cursor bugbot 指摘・Issue #1071 レビュー指摘: この事前 backfill を
+    /// 省くと、索引の初回構築が削除後の状態から行われ、削除された旧キーが
+    /// 逆引き索引の pre-image に一度も現れず検査をすり抜けていた）。
+    #[test]
+    fn self_ref_replace_detects_dangling_reference_when_index_first_built_this_statement() {
+        let (storage, _guard) = tmp_storage("key-index-self-ref-dangling");
+        let schema = self_ref_schema();
+        storage.create_table(&schema).expect("create table");
+
+        crate::tenant::insert_typed_row(
+            &storage,
+            "nodes",
+            &ctx("tenant-a"),
+            0,
+            Visibility::Public,
+            &[Value::Text("X".to_string()), Value::Null],
+            &crate::recovery::required_op_id::OperationId::parse("op-a").expect("op id"),
+        )
+        .expect("insert A");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "nodes",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("Y".to_string()), Value::Text("X".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-b").expect("op id"),
+        )
+        .expect("insert B referencing X");
+
+        // ここまでの通常 INSERT で `code`（親列）索引は B の子側 FK 検査
+        // （`verify_required_parent_keys`）経由で自然に backfill・登録済み
+        // （「別の文で既に登録済み」の通常ケースは Issue #1071 導入後も安全）。
+        // 登録簿・実テーブルを人為的に削除し、「このファイル形置換の文で
+        // 初めて backfill される」旧 DB・初回参照の状態を再現する。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let name = index_name_for_columns(&["code".to_string()]);
+            {
+                let mut reg = write_txn.open_table(REGISTRY_TABLE).expect("open registry");
+                reg.remove(("nodes", name.as_str(), "tenant-a"))
+                    .expect("remove registry entry");
+            }
+            let fwd_name = fwd_table_name("nodes", &name);
+            let rev_name = rev_table_name("nodes", &name);
+            write_txn
+                .delete_table(fwd_table_def(&fwd_name))
+                .expect("delete fwd");
+            write_txn
+                .delete_table(rev_table_def(&rev_name))
+                .expect("delete rev");
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        // `tenant::replace_typed_rows_by_text_key` と同じ検査シーケンス
+        // （prepare → 物理削除 → 参照先側検査）をこのテストモジュールから
+        // 直接構成する（`tenant.rs` の非公開ヘルパーへは届かないため）。A を
+        // 削除し、X を再供給しない（B は今も X を参照したまま）。
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        crate::constraint::prepare_referenced_key_indexes_in_txn(
+            &write_txn, "nodes", &schema, "tenant-a",
+        )
+        .expect("prepare");
+        {
+            let row_table_name = crate::catalog::user_rows_table_name("nodes");
+            let mut row_table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+                .expect("open row table");
+            row_table.remove(("tenant-a", 0u64)).expect("remove A");
+        }
+        let result = crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            "nodes",
+            &schema,
+            "tenant-a",
+            crate::constraint::ReferencedRowsChange::Removed { ids: &[0u64] },
+            crate::constraint::FkCheckMode::All,
+        );
+        assert!(
+            matches!(result, Err(TenantWriteError::ForeignKeyViolation)),
+            "B still references the removed key X; must be rejected, got {result:?}"
+        );
+        write_txn.abort().expect("abort");
+    }
+
+    /// 上のテストと同じ再現手順で、削除された X が**新規行で再供給される**
+    /// 場合は違反にならないことを確認する（P1 の「再供給時の誤検知」回帰と
+    /// 組み合わせて自己参照ケースを固定する）。
+    #[test]
+    fn self_ref_replace_allows_resupplied_key_when_index_first_built_this_statement() {
+        let (storage, _guard) = tmp_storage("key-index-self-ref-resupply");
+        let schema = self_ref_schema();
+        storage.create_table(&schema).expect("create table");
+
+        crate::tenant::insert_typed_row(
+            &storage,
+            "nodes",
+            &ctx("tenant-a"),
+            0,
+            Visibility::Public,
+            &[Value::Text("X".to_string()), Value::Null],
+            &crate::recovery::required_op_id::OperationId::parse("op-a").expect("op id"),
+        )
+        .expect("insert A");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "nodes",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("Y".to_string()), Value::Text("X".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-b").expect("op id"),
+        )
+        .expect("insert B referencing X");
+
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let name = index_name_for_columns(&["code".to_string()]);
+            {
+                let mut reg = write_txn.open_table(REGISTRY_TABLE).expect("open registry");
+                reg.remove(("nodes", name.as_str(), "tenant-a"))
+                    .expect("remove registry entry");
+            }
+            let fwd_name = fwd_table_name("nodes", &name);
+            let rev_name = rev_table_name("nodes", &name);
+            write_txn
+                .delete_table(fwd_table_def(&fwd_name))
+                .expect("delete fwd");
+            write_txn
+                .delete_table(rev_table_def(&rev_name))
+                .expect("delete rev");
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        // 今回は A（id=0）を削除した直後に、同じ write_txn 内で新規行
+        // C（id=2, code="X"）を挿入して X を再供給する。子側検査
+        // （`enforce_row_constraints_in_txn`）を先に走らせて索引へ再供給分を
+        // 同期してから、参照先側検査（削除分の同期）を走らせる——
+        // `tenant::replace_typed_rows_by_text_key` と同じ呼び出し順序。
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        crate::constraint::prepare_referenced_key_indexes_in_txn(
+            &write_txn, "nodes", &schema, "tenant-a",
+        )
+        .expect("prepare");
+        {
+            let row_table_name = crate::catalog::user_rows_table_name("nodes");
+            let mut row_table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+                .expect("open row table");
+            row_table.remove(("tenant-a", 0u64)).expect("remove A");
+            let row = crate::storage::RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[Value::Text("X".to_string()), Value::Null],
+                )
+                .expect("encode C"),
+            };
+            let encoded = crate::storage::encode_row(&row).expect("encode row C");
+            row_table
+                .insert(("tenant-a", 2u64), encoded.as_slice())
+                .expect("insert C resupplying X");
+        }
+        crate::constraint::enforce_row_constraints_in_txn(
+            &write_txn,
+            "nodes",
+            &schema,
+            "tenant-a",
+            &[2u64],
+            crate::constraint::FkCheckMode::All,
+        )
+        .expect("C's own FK check (parent_code=NULL) must pass");
+        let result = crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            "nodes",
+            &schema,
+            "tenant-a",
+            crate::constraint::ReferencedRowsChange::Removed { ids: &[0u64] },
+            crate::constraint::FkCheckMode::All,
+        );
+        assert!(
+            result.is_ok(),
+            "X is resupplied by C; B's reference must remain satisfied, got {result:?}"
+        );
+        write_txn.abort().expect("abort");
     }
 }

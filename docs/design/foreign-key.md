@@ -149,21 +149,39 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
 しない）。
 
 - 索引の形: `(テーブル, 索引名)` で識別する 2 本の redb テーブル（順引き
-  `(tenant, key, row_id) -> ()`・逆引き `(tenant, row_id) -> key`）。索引名は
-  対象列集合から一意に決まり、参照先側（親の被参照列）・参照元側（子の FK
-  列）が同じテーブル・同じ列集合を指す場合は 1 本に集約される（自己参照等）。
+  `(tenant, key, row_id) -> ()`・逆引き `(tenant, row_id) -> key`。テナントを
+  跨いで共有）。索引名は対象列集合から一意に決まり、参照先側（親の被参照列）・
+  参照元側（子の FK 列）が同じテーブル・同じ列集合を指す場合は 1 本に集約
+  される（自己参照等）。登録簿（`key_index_registry`）は**テナント単位**
+  `(table, name, tenant) -> ()`（Issue #1071 レビュー指摘 P0: テーブル単位の
+  登録だと 1 テナントの backfill が他の全テナントの索引済み状態まで確定させ
+  てしまい fail-open になり得るため）。
 - 維持点: `constraint::enforce_row_constraints_in_txn`（書き込み直後）が
   登録済み索引を同期する単一箇所（一意性・`CHECK` 検査と同じ検査点）。
   `DELETE`／`TRUNCATE` は `enforce_referencing_rows_in_txn` が自ら同期・
   消去する。
-- フォールバック: 索引が未登録（旧 DB・初回参照）の FK・テーブルの組み合わせ
-  に限り、索引導入前と同一の全行走査で判定し、成功後に索引を構築・登録して
-  以後の文から索引経路に切り替える。この構築（backfill）は該当テーブルの
-  **全テナント**を 1 回だけ読むが、結果は応答へ一切影響せず、1 回限りの
-  レイテンシだけが観測可能（テナント境界節参照）。
+- フォールバック: 索引がそのテナントで未登録（旧 DB・初回参照）の FK・
+  テーブルの組み合わせに限り、索引導入前と同一の全行走査で判定し、成功後に
+  索引を構築・登録して以後の文から索引経路に切り替える。この構築
+  （backfill）は**要求元テナントの行だけ**を 1 回読み、他テナントの行数・
+  破損状態には一切触れない（テナント境界節参照）。
 - 走査上限（`tenant::MAX_SCANNED_ROWS`）を継承しない理由は変わらない
   （フォールバック走査に限りテナントの保有行数に比例するため、上限を課すと
   索引未構築のテナントが書き込めなくなる fail-closed 過ぎる制約になる）。
+- 破損検知: 登録簿にエントリがあるのに順引きテーブルが実在しない状態
+  （`ensure_index_in_txn` が両者を同一 write_txn で作成する不変条件が破れた
+  破損 DB）は、`redb::WriteTransaction::open_table` が get-or-create で
+  `TableDoesNotExist` を返さないため `list_tables` によるテーブル名の明示
+  確認で検出し、`CorruptSchema` として fail-closed に拒否する（Issue #1071
+  レビュー指摘 P0。黙って空テーブル扱いすると「参照なし」の誤判定で
+  `DELETE`／`TRUNCATE` を許してしまう）。
+- 同一 write_txn 内で「このテーブルの既存行を削除してから新規行を挿入する」
+  呼び出し元（`tenant::replace_typed_rows_by_text_key` のファイル形置換等）は、
+  この削除より前に `constraint::prepare_referenced_key_indexes_in_txn` で
+  参照先列の索引を backfill しておく契約（cursor bugbot 指摘: 自己参照 FK で
+  この事前 backfill を省くと、索引の初回構築が削除後の状態から行われ、
+  削除された旧行の旧キーが逆引き索引の pre-image に一度も現れず、参照先側
+  検査の `lost` 差分に載らないまま検査をすり抜ける。同関数ドキュメント参照）。
 - 対象外: `enforce_referencing_rows_in_txn` が呼ぶ
   `catalog::referencing_foreign_keys_in_txn`（このテーブルを参照する FK の
   逆引き）はカタログの**テーブル数**に比例する走査のままで、行数には比例

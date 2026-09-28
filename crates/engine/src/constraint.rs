@@ -954,8 +954,9 @@ fn push_required_key(
 /// が登録済みなら索引照会だけで判定し、未登録なら
 /// [`verify_required_parent_keys_by_scan`]（索引導入前からの全行走査）へ
 /// フォールバックした上で [`crate::key_index::ensure_index_in_txn`] を呼び、
-/// 以後の文から索引経路に切り替える（初回のみ全テナントを 1 回走査する
-/// backfill。`key_index.rs` モジュールドキュメント参照）。
+/// 以後の文から索引経路に切り替える（テナントごとに初回のみ**そのテナント
+/// の行だけ**を 1 回走査する backfill。`key_index.rs` モジュールドキュメント
+/// 参照）。
 ///
 /// 照会・走査のキーはサーバー側導出テナント `tenant_id` の物理キー空間
 /// （`(tenant_id, 0)..=(tenant_id, u64::MAX)`。TABLE-12）に閉じ、他テナントの
@@ -1024,6 +1025,7 @@ fn verify_required_parent_keys(
                         parent_table,
                         parent_schema,
                         &columns,
+                        tenant_id,
                     )?;
                     Ok(())
                 }
@@ -1308,9 +1310,59 @@ fn enforce_referencing_rows_by_scan_for_fk(
 /// UNIQUE 制約の構成列に触れない場合は、参照先キーが変わり得ないためカタログの
 /// 逆引きすら行わない（主キー・UNIQUE を宣言しないテーブルの `UPDATE` はコスト
 /// ゼロ）。
+/// 単一 write_txn 内で「`table_name` の既存行を物理削除してから、新規行の
+/// 子側 FK 検査（[`enforce_row_constraints_in_txn`]）を経て、この関数（参照先
+/// 側検査）を呼ぶ」順序の呼び出し元（ファイル形置換〔`tenant.rs` の同一パス
+/// `INSERT` による旧行置換〕等）が、**旧行の物理削除より前**に呼ぶ
+/// （Issue #1071 レビュー指摘・cursor bugbot 指摘: 自己参照 `FOREIGN KEY` を
+/// 持つテーブルでこの呼び出しを省くと、`enforce_row_constraints_in_txn` 側の
+/// 子側 FK 検査が新規行に対して未登録の親列索引を
+/// [`crate::key_index::ensure_index_in_txn`] で初めて backfill する際、その
+/// 走査は既に旧行が物理削除された**後**の状態を見る。結果、削除された旧行の
+/// 旧キーは逆引き索引の pre-image に一度も現れず、直後の
+/// [`enforce_referencing_rows_in_txn`] が `sync_rows_in_txn` で計算する
+/// `lost` 差分にも載らない。索引が「登録済みだが lost は空」と誤って判定され、
+/// 他の子行がまだそのキーを参照していても検査自体がすり抜ける）。
+///
+/// `table_name`（スキーマ `schema`）を親とする各 `FOREIGN KEY`（`id` 参照を除く。
+/// `id` 参照は索引を使わない物理キーの点照会のため対象外）について、参照先列
+/// （`fk.parent_columns()`）の索引をテナント `tenant_id` の**現在（まだ何も
+/// 削除していない）状態**から前もって [`crate::key_index::ensure_index_in_txn`]
+/// で backfill・登録する。これにより直後の物理削除は登録済み索引への
+/// `sync_rows_in_txn` 呼び出しとして扱われ、削除行の旧キーが正しく逆引き
+/// 索引の pre-image として捉えられ `lost` に反映される。既に登録済みの索引は
+/// 同関数の冪等性によりコストゼロ。呼び出し元が旧行を削除しない（新規挿入
+/// のみ等）場合はこの呼び出し自体が不要（削除がなければすり抜けも起きない）。
+pub(crate) fn prepare_referenced_key_indexes_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+) -> Result<(), TenantWriteError> {
+    let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
+    for (_child_schema, fk) in &referencing {
+        if fk.references_parent_id() {
+            continue;
+        }
+        crate::key_index::ensure_index_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            fk.parent_columns(),
+            tenant_id,
+        )?;
+    }
+    Ok(())
+}
+
 /// `fk_mode` が `ImmediateOnly` のとき `INITIALLY DEFERRED` の FK は検査対象から
 /// 除く（COMMIT 時 [`enforce_deferred_foreign_keys_in_txn`] へ先送りする。
 /// TABLE-17・TASK-205、Issue #1077）。
+///
+/// [`prepare_referenced_key_indexes_in_txn`] を、同一 write_txn 内で先に
+/// `table_name` の行を物理削除してしまう呼び出し元（ファイル形置換等）は、
+/// その削除**より前**に呼ぶ契約（同関数ドキュメント参照。自己参照 FK での
+/// 索引初回構築タイミング起因の検査すり抜けを防ぐ）。
 pub(crate) fn enforce_referencing_rows_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -1460,6 +1512,7 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                     &child_schema.name,
                     child_schema,
                     &child_columns,
+                    tenant_id,
                 )?;
             }
         }
