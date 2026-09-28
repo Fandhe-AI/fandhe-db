@@ -2466,6 +2466,16 @@ fn try_scalar_index_aggregate(
 /// [`capture_scalar_index_snapshot`] による全行再走査（`is_capture_known_
 /// unbuildable` ゲート・`mark_capture_unbuildable` 記録を含む）へフォールバック
 /// する。
+///
+/// codex-review P2 指摘（Issue #1065・PR #1124）: 索引宣言（`resolve_scalar_
+/// index_target_in_txn`）の解決は `declared_index_targets_in_txn`
+/// （`IndexCatalogGateCache` を持たず、宣言数に比例するカタログ全件デコード
+/// を伴う）を呼ぶ。以前はこれをキャッシュ照会より先に行っていたため、
+/// 両キャッシュがともにヒットする通常の集計クエリでも毎回このデコードが
+/// 発生していた。`sql::exec::execute_statement_with_cache`（SELECT 経路）と
+/// 同じ方針に揃え、キャッシュヒット確認（下記の同一性ガード込み早期
+/// return）を先に行い、実際に構築（arena ヒット＋スカラーミスの部分構築、
+/// または両ミスの全走査採取）が必要になった場合にのみ宣言を解決する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_scalar_index_snapshot(
     read_txn: &redb::ReadTransaction,
@@ -2501,6 +2511,23 @@ pub(crate) fn ensure_scalar_index_snapshot(
         }
     }
 
+    // ここに到達するのは、これから構築（部分構築または全走査採取）が必要な
+    // 場合のみ。索引宣言（Issue #1065）を、このクエリが使っているのと同一の
+    // `read_txn` から解決する。カタログ読み取り失敗は「宣言なし→自動」へは
+    // 倒さず即座に構築不能（plain scan フォールバック）とする
+    // （`resolve_scalar_index_target_in_txn` ドキュメント参照）。
+    let target = match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+        read_txn,
+        table,
+        scalar_access.declarations_enabled,
+    ) {
+        Ok(t) => t,
+        Err(()) => {
+            scalar_access.cache.record_build_failure();
+            return None;
+        }
+    };
+
     if let Some(snapshot) = arena_hit {
         // Bugbot Medium 指摘: arena はヒット・スカラー索引はミス（または
         // 同一性ガード不一致）。`user_rows` を再走査せず、ヒット済み
@@ -2520,7 +2547,11 @@ pub(crate) fn ensure_scalar_index_snapshot(
         {
             return None;
         }
-        return match crate::sql::scalar_index::ScalarIndex::build(schema, &snapshot) {
+        return match crate::sql::scalar_index::ScalarIndex::build_targeted(
+            schema,
+            &snapshot,
+            target.as_target(),
+        ) {
             Ok(index) => scalar_access
                 .cache
                 .insert(scalar_access.storage, table, ctx, index)
@@ -2548,16 +2579,22 @@ pub(crate) fn ensure_scalar_index_snapshot(
     {
         return None;
     }
-    let (snapshot, index) =
-        match capture_scalar_index_snapshot(read_txn, ctx, schema, table, expected_dim) {
-            Some(pair) => pair,
-            None => {
-                scalar_access
-                    .cache
-                    .mark_capture_unbuildable(read_txn, table, ctx);
-                return None;
-            }
-        };
+    let (snapshot, index) = match capture_scalar_index_snapshot(
+        read_txn,
+        ctx,
+        schema,
+        table,
+        expected_dim,
+        target.as_target(),
+    ) {
+        Some(pair) => pair,
+        None => {
+            scalar_access
+                .cache
+                .mark_capture_unbuildable(read_txn, table, ctx);
+            return None;
+        }
+    };
     // `index` は挿入前の `snapshot` から構築済み（`try_scalar_index_aggregate`
     // と同じ理由で再構築不要。同関数のドキュメント参照）。
     let inserted_snapshot = arena_access
@@ -2715,6 +2752,7 @@ fn capture_scalar_index_snapshot(
     schema: &TableSchema,
     table: &str,
     expected_dim: u32,
+    target: crate::sql::scalar_index::ScalarIndexTarget<'_>,
 ) -> Option<(
     crate::sql::arena_cache::SqlArenaSnapshot,
     crate::sql::scalar_index::ScalarIndex,
@@ -2792,7 +2830,8 @@ fn capture_scalar_index_snapshot(
     let generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
     let snapshot =
         crate::sql::arena_cache::SqlArenaSnapshot::new(arena, metadata, ctx.clone(), generation);
-    let index = crate::sql::scalar_index::ScalarIndex::build(schema, &snapshot).ok()?;
+    let index =
+        crate::sql::scalar_index::ScalarIndex::build_targeted(schema, &snapshot, target).ok()?;
     Some((snapshot, index))
 }
 
@@ -3451,6 +3490,7 @@ mod tests {
                 Some(crate::sql::scalar_index::ScalarCacheAccess {
                     storage: &storage,
                     cache: &scalar_cache,
+                    declarations_enabled: false,
                 }),
             )
         };
@@ -3630,7 +3670,15 @@ mod tests {
         let expected_dim = schema.vector_dim().expect("vector dim");
 
         assert!(
-            capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim).is_none(),
+            capture_scalar_index_snapshot(
+                &read_txn,
+                &ctx,
+                &schema,
+                "docs",
+                expected_dim,
+                crate::sql::scalar_index::ScalarIndexTarget::Auto
+            )
+            .is_none(),
             "a generation containing a nullable-VECTOR NULL row must not be captured"
         );
     }
@@ -3653,9 +3701,15 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
         let expected_dim = schema.vector_dim().expect("vector dim");
 
-        let (snapshot, index) =
-            capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim)
-                .expect("capture should succeed when no row is NULL");
+        let (snapshot, index) = capture_scalar_index_snapshot(
+            &read_txn,
+            &ctx,
+            &schema,
+            "docs",
+            expected_dim,
+            crate::sql::scalar_index::ScalarIndexTarget::Auto,
+        )
+        .expect("capture should succeed when no row is NULL");
         assert_eq!(snapshot.arena().len(), 2);
         assert_eq!(index.row_count(), 2);
     }
@@ -3696,9 +3750,15 @@ mod tests {
             // arena キャッシュだけを温める（スカラー索引キャッシュへは意図的に
             // 登録しない。ミス状態を維持する）。
             let read_txn = storage.db().begin_read().expect("begin_read");
-            let (snapshot, _index) =
-                capture_scalar_index_snapshot(&read_txn, &ctx, &schema, "docs", expected_dim)
-                    .expect("initial capture should succeed");
+            let (snapshot, _index) = capture_scalar_index_snapshot(
+                &read_txn,
+                &ctx,
+                &schema,
+                "docs",
+                expected_dim,
+                crate::sql::scalar_index::ScalarIndexTarget::Auto,
+            )
+            .expect("initial capture should succeed");
             arena_cache.insert(&storage, "docs", &ctx, snapshot);
         }
 
@@ -3725,6 +3785,7 @@ mod tests {
         let scalar_access = crate::sql::scalar_index::ScalarCacheAccess {
             storage: &storage,
             cache: &scalar_cache,
+            declarations_enabled: false,
         };
         let read_txn = storage.db().begin_read().expect("begin_read");
         let resolved = ensure_scalar_index_snapshot(
@@ -3816,6 +3877,7 @@ mod tests {
         let scalar_access = crate::sql::scalar_index::ScalarCacheAccess {
             storage: &storage,
             cache: &scalar_cache,
+            declarations_enabled: false,
         };
 
         let failures_before = scalar_cache.stats().build_failures;

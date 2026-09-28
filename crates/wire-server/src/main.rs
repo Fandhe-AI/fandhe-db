@@ -134,6 +134,17 @@
 //! 起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
 //! `wire_server::dml_limits_opt::insert_rows_cap_warning`）。
 //!
+//! `--hnsw-scope`（Issue #1065・オーナー判断 2026-09-28）: HNSW opt-in
+//! （`--search-engine hnsw*`）時に HNSW 経路を使うテーブルの範囲を選ぶ
+//! （`all`＝全テーブル〔既定・既存挙動とビット同一〕／`declared`＝`CREATE
+//! INDEX ... USING hnsw` を宣言したテーブルのみ、未宣言テーブルは厳密）。
+//! 閉じた語彙のみを受理し、不正な値・値欠落・2 回目以降の重複指定はいずれも
+//! fail-closed で起動エラー。HNSW opt-in が無効な構成では値は参照されない
+//! （全テーブル厳密のまま。組合せエラーにもしない）。値の解決は
+//! `wire_server::hnsw_scope_opt::parse` に一本化し、
+//! `EngineCore::with_hnsw_scope` へ 1 回だけ注入する（`docs/design/
+//! index-declaration-effects.md` 参照）。
+//!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
 //! チェーン PEM）・`--tls-key`（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って
@@ -266,6 +277,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
+    let mut hnsw_scope_raw: Option<String> = None;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut ddl_allowed_users_raw: Option<String> = None;
@@ -454,6 +466,28 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 durability_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::hnsw_scope_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires one of {:?}",
+                        wire_server::hnsw_scope_opt::FLAG,
+                        wire_server::hnsw_scope_opt::TOKENS
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1065: 起動後に変更できない構成値のため、
+                // `--durability` と同じ理由で 2 回目以降の指定を fail-closed に
+                // 拒否する（last-wins にしない）。
+                if hnsw_scope_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::hnsw_scope_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                hnsw_scope_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG => {
@@ -740,6 +774,20 @@ fn run_server(args: &[String]) -> ExitCode {
             engine::log_stderr!(
                 "wire-server: invalid {}: {e}",
                 wire_server::durability_opt::FLAG
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1065: `--durability` と同じく bind・ユーザーストア読込より前に
+    // 決着させる（fail-closed）。未指定は `resolve_hnsw_scope(None)` が既定値
+    // （`HnswScope::All`＝全テーブル HNSW。既存挙動とビット同一）を返す。
+    let hnsw_scope = match resolve_hnsw_scope(hnsw_scope_raw.as_deref()) {
+        Ok(scope) => scope,
+        Err(e) => {
+            engine::log_stderr!(
+                "wire-server: invalid {}: {e}",
+                wire_server::hnsw_scope_opt::FLAG
             );
             return ExitCode::FAILURE;
         }
@@ -1138,6 +1186,10 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #1065: 未指定でも常に呼ぶ（既定 `HnswScope::All` は
+    // `with_hnsw_scope` を呼ばない構築とビット同一）。HNSW opt-in なしの構築
+    // では engine 側で参照されない。
+    core = core.with_hnsw_scope(hnsw_scope);
     let core = Arc::new(core);
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
@@ -1474,6 +1526,20 @@ fn resolve_durability(raw: Option<&str>) -> Result<engine::storage::WriteDurabil
     match raw {
         None => Ok(engine::storage::WriteDurability::default()),
         Some(raw) => wire_server::durability_opt::parse(raw),
+    }
+}
+
+/// `--hnsw-scope` の値（未指定は `None`）から
+/// [`engine::search_engine::HnswScope`] を解決する（Issue #1065）。純関数として
+/// 切り出し、`std::env::args()` を直接読まずに単体テストできるようにする
+/// （`resolve_durability` と同じ流儀）。`raw` が `None` は既定
+/// [`engine::search_engine::HnswScope::default`]（`All`）、
+/// [`wire_server::hnsw_scope_opt::TOKENS`] のいずれとも厳密一致しない場合は
+/// `Err`（fail-closed。既定へ黙って読み替えない）。
+fn resolve_hnsw_scope(raw: Option<&str>) -> Result<engine::search_engine::HnswScope, String> {
+    match raw {
+        None => Ok(engine::search_engine::HnswScope::default()),
+        Some(raw) => wire_server::hnsw_scope_opt::parse(raw),
     }
 }
 
@@ -2047,6 +2113,41 @@ mod tests {
     fn resolve_durability_rejects_case_variant() {
         // 厳密一致のみ受理（`durability_opt::parse` の契約）。
         expect_err(resolve_durability(Some("Immediate")));
+    }
+
+    // Issue #1065: `--hnsw-scope` の解決の単体テスト。子プロセス経由の外形的
+    // 検証（起動受理・拒否・重複指定・値欠落）は `tests/wire_hnsw_scope_cli.rs`
+    // が担う。
+
+    #[test]
+    fn resolve_hnsw_scope_none_is_all_default() {
+        assert_eq!(
+            resolve_hnsw_scope(None),
+            Ok(engine::search_engine::HnswScope::All)
+        );
+    }
+
+    #[test]
+    fn resolve_hnsw_scope_accepts_both_tokens() {
+        assert_eq!(
+            resolve_hnsw_scope(Some("all")),
+            Ok(engine::search_engine::HnswScope::All)
+        );
+        assert_eq!(
+            resolve_hnsw_scope(Some("declared")),
+            Ok(engine::search_engine::HnswScope::Declared)
+        );
+    }
+
+    #[test]
+    fn resolve_hnsw_scope_rejects_unknown_and_case_variant_fail_closed() {
+        for raw in ["tables", "Declared", "", "all "] {
+            let err = expect_err(resolve_hnsw_scope(Some(raw)));
+            assert!(
+                err.contains(wire_server::hnsw_scope_opt::FLAG),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     // Issue #967・#970: `--tls-cert`／`--tls-key`／`--tls-mode`／

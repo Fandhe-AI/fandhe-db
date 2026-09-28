@@ -227,10 +227,13 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
         let cache = HnswIndexCache::new();
         let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: hnsw_provider,
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -274,10 +277,13 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
         let cache = HnswIndexCache::new();
         let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: hnsw_provider,
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -322,10 +328,13 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
         let cache = HnswIndexCache::new();
         let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: hnsw_provider,
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -369,10 +378,13 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
         let cache = HnswIndexCache::new();
         let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: hnsw_provider,
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -417,10 +429,13 @@ mod tests {
         let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
         let cache = HnswIndexCache::new();
         let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
         let access = HnswCacheAccess {
             storage: &storage,
             cache: &cache,
             provider: hnsw_provider,
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
