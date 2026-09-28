@@ -40,7 +40,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
@@ -720,6 +720,81 @@ fn spawn_stderr_reader(
     })
 }
 
+/// [`StderrDrain`] の内部状態（Issue #1082）。listen 待ち受け中に読み取った
+/// 行の待ち行列 `pending` と、listen 到達後・タイムアウト後の診断行の
+/// 上限付き蓄積 `tail` を同一の `Mutex` で保護する。両者間の切り替え
+/// （[`StderrDrain::wait_for_listening`] が listen 行を見つけて以降を
+/// `tail` 経路へ切り替える操作）を読み取りスレッドと同じロック区間内で
+/// 行うため、切り替えを跨いで行を取りこぼす競合が起きない（旧実装は
+/// `mpsc::channel` の送信失敗〔受信側 drop〕で切り替えを検知していたため、
+/// listen 行受信直後に読み取りスレッドが次の行を送信済みでチャネル内に
+/// 残ると、その行はどちらの経路にも回収されず失われ得た。codex review
+/// 指摘）。
+struct StderrDrainState {
+    /// `Some` の間は listen 待ち受け中（未消費の行がここへ積まれる）。
+    /// listen 到達・タイムアウトのいずれかで `None` に切り替わり、以降の
+    /// 行は `tail` へ回る。
+    pending: Option<VecDeque<String>>,
+    tail: VecDeque<String>,
+    /// 読み取りスレッドが EOF（子プロセス終了）に達したら立てる。
+    /// `wait_for_listening` はこれを見て即座に待ち受けを打ち切る
+    /// （立てずに `condvar` の通知任せにすると、旧 `mpsc` 実装が
+    /// `rx.recv_timeout` の `Err(Disconnected)` で即時検知していた
+    /// 早期終了を、新実装ではタイムアウト満了まで検知できなくなる）。
+    eof: bool,
+}
+
+/// 上限付きで `tail` へ行を追加する（古い行から捨てる。呼び出し元が既に
+/// 保護用 `Mutex` を保持している場合に使う直接操作版。[`push_tail`] の
+/// `Mutex` 越し版とは呼び出し文脈が異なる）。
+fn push_tail_locked(tail: &mut VecDeque<String>, line: String) {
+    if tail.len() >= STDERR_TAIL_MAX_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(line.trim_end().to_string());
+}
+
+/// 子プロセスの stderr を EOF まで読み続け、[`StderrDrainState`] へ
+/// 振り分ける読み取りスレッド本体（Issue #1082）。`read_until` +
+/// `from_utf8_lossy` を使い、`spawn_stderr_reader` と同じ理由（非 UTF-8
+/// バイト列混入時にループを抜けて読み口を閉じるとパイプ経由で子プロセス
+/// 側を巻き込みかねない）でループを抜けない。
+fn spawn_gated_stderr_reader(
+    stderr: ChildStderr,
+    state: Arc<(Mutex<StderrDrainState>, Condvar)>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::new();
+        let (mutex, condvar) = &*state;
+        loop {
+            buf.clear();
+            let eof = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => true,
+                Ok(_) => false,
+            };
+            let mut inner = match mutex.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !eof {
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                match inner.pending.as_mut() {
+                    Some(pending) => pending.push_back(line),
+                    None => push_tail_locked(&mut inner.tail, line),
+                }
+            } else {
+                inner.eof = true;
+            }
+            drop(inner);
+            condvar.notify_one();
+            if eof {
+                break;
+            }
+        }
+    })
+}
+
 /// 子プロセス（`wire-server`）の stderr を EOF まで読み続ける読み取り
 /// ハンドル（Issue #1082）。[`drain_stderr`] で生成し、
 /// [`Self::wait_for_listening`] で listen 行を待ち受ける。待ち受け後も
@@ -732,55 +807,91 @@ fn spawn_stderr_reader(
 /// （[`wait_for_listening`]／[`wait_for_listening_addr_and_lines`]）経由で
 /// 使われるため、その利用形に合わせて join を必須にしない）。
 pub struct StderrDrain {
-    rx: Option<mpsc::Receiver<String>>,
-    tail: Arc<Mutex<VecDeque<String>>>,
+    state: Arc<(Mutex<StderrDrainState>, Condvar)>,
     _reader: std::thread::JoinHandle<()>,
 }
 
 impl StderrDrain {
     /// `wire-server: listening on <addr>` 行に到達するまで `timeout` 内で
     /// 待ち受け、到達アドレス（無ければ `None`）とそこまでに観測した全行
-    /// （トリム済み）を返す。呼び出し後は受信側チャネルを手放し、以降の行は
-    /// `tail` へ回る。
+    /// （トリム済み）を返す。到達・タイムアウトのいずれでも、読み取り
+    /// スレッドと同じロックを保持したまま以降の行を `tail` へ回すよう
+    /// 切り替える（`pending` に残っていた未消費行があれば `tail` へ移して
+    /// から切り替えるため、切り替えの前後どちらのタイミングで読み取り
+    /// スレッドが行を書き込んでいても取りこぼさない）。
     pub fn wait_for_listening(&mut self, timeout: Duration) -> (Option<SocketAddr>, Vec<String>) {
         let deadline = Instant::now() + timeout;
+        let (mutex, condvar) = &*self.state;
         let mut lines = Vec::new();
         let mut found = None;
-        if let Some(rx) = self.rx.take() {
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+        let mut guard = match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            while let Some(line) = guard.pending.as_mut().and_then(VecDeque::pop_front) {
+                let trimmed = line.trim_end().to_string();
+                let addr = trimmed.find("listening on ").and_then(|idx| {
+                    trimmed[idx + "listening on ".len()..]
+                        .trim()
+                        .parse::<SocketAddr>()
+                        .ok()
+                });
+                lines.push(trimmed);
+                if let Some(addr) = addr {
+                    found = Some(addr);
                     break;
                 }
-                match rx.recv_timeout(remaining) {
-                    Ok(line) => {
-                        let trimmed = line.trim_end().to_string();
-                        if let Some(idx) = trimmed.find("listening on ") {
-                            let addr_str = trimmed[idx + "listening on ".len()..].trim();
-                            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                                lines.push(trimmed);
-                                found = Some(addr);
-                                break;
-                            }
-                        }
-                        lines.push(trimmed);
-                    }
-                    Err(_) => break,
-                }
             }
-            // `rx` はここで drop され、以降の行は読み取りスレッド側で送信
-            // 失敗を検知して `tail` へ切り替わる。
+            if found.is_some() {
+                break;
+            }
+            // 読み取りスレッドが EOF に達していれば、これ以上行は来ない
+            // （旧 `mpsc` 実装が `rx.recv_timeout` の `Err(Disconnected)` で
+            // 即座に検知していた早期終了と同じ扱い。タイムアウト満了を
+            // 待たず打ち切る）。
+            if guard.eof {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next_guard, wait_result) = match condvar.wait_timeout(guard, remaining) {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard = next_guard;
+            let pending_empty = guard.pending.as_ref().is_none_or(VecDeque::is_empty);
+            if wait_result.timed_out() && pending_empty {
+                break;
+            }
         }
+        // ここに到達する時点で `pending` に行が残るのは listen 行到達直後
+        // （読み取りスレッドが同じロック区間の外で次の行を既に書き込んで
+        // いた場合）のみ。タイムアウト・EOF 到達の各パスは直前の内側
+        // ループで `pending` を空になるまで読み切っているため、ここでは
+        // 何も残らない。残っていればそれを `tail` へ移してから待ち受け
+        // モードを終了する（切り替えの前後どちらで読み取りスレッドが
+        // 書き込んでいても取りこぼさない）。
+        if let Some(mut pending) = guard.pending.take() {
+            while let Some(rest) = pending.pop_front() {
+                push_tail_locked(&mut guard.tail, rest);
+            }
+        }
+        drop(guard);
         (found, lines)
     }
 
     /// 診断用に、これまで `tail` へ蓄積された行のスナップショットを返す
     /// （Mutex が poison していても `into_inner` で読む）。
     pub fn tail_lines(&self) -> Vec<String> {
-        match self.tail.lock() {
-            Ok(guard) => guard.iter().cloned().collect(),
-            Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
-        }
+        let (mutex, _condvar) = &*self.state;
+        let guard = match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.tail.iter().cloned().collect()
     }
 }
 
@@ -788,12 +899,17 @@ impl StderrDrain {
 /// 読み続ける（呼び出し元はこの呼び出しで `child.stderr` の所有権を失う）。
 pub fn drain_stderr(child: &mut Child) -> StderrDrain {
     let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let reader = spawn_stderr_reader(stderr, tx, Some(Arc::clone(&tail)));
+    let state = Arc::new((
+        Mutex::new(StderrDrainState {
+            pending: Some(VecDeque::new()),
+            tail: VecDeque::new(),
+            eof: false,
+        }),
+        Condvar::new(),
+    ));
+    let reader = spawn_gated_stderr_reader(stderr, Arc::clone(&state));
     StderrDrain {
-        rx: Some(rx),
-        tail,
+        state,
         _reader: reader,
     }
 }
