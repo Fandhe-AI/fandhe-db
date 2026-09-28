@@ -28,13 +28,40 @@
 //! `UnexpectedEof` を返し、いずれもストリームを失敗状態に固定する
 //! （以後の `read`／`write` は常にエラー。fail-closed）。
 //!
-//! # 緊急応答（RECOVER-6）との関係
+//! # 緊急応答（RECOVER-6）との関係（Issue #1080）
 //!
 //! `WireStream::emergency_channel` は `None` を返す（平文の緊急応答
-//! バイト列が TLS レコードへ混入するのを防ぐため）。TLS 接続での
-//! panic 発生時の緊急応答（RECOVER-6）は「応答なしで切断」に縮退する
-//! （安全性側の abort ガード・RECOVER-5 は無関係に維持される）。詳細は
-//! `docs/design/tls-wire-connection.md` 参照。
+//! バイト列が生ソケットへ直接書かれて TLS レコードへ混入するのを防ぐ
+//! ため）。緊急応答の登録は [`WireStream::emergency_response_channel`]
+//! の上書き実装（[`TlsStream`] の [`WireStream`] 実装）が担う: 呼び出し
+//! 時点の [`TlsSession::seal_application_data_detached`]（[`super::
+//! record_protection::Sealer::seal_detached`] へ委譲。シーケンス番号を
+//! 消費しない「detached seal」）で緊急応答を 1 個の TLS レコードへ
+//! 暗号化し、直列化した暗号文を平文の代わりに [`WireStream::
+//! emergency_channel`]（`self.inner`。生 `TcpStream`）へ渡す。
+//!
+//! ## nonce 再利用の防止（不変条件）
+//!
+//! detached seal した緊急応答レコードと、panic が起きなかった場合の
+//! 次の通常応答レコードは同じ nonce（同じ送信 seq）を使う。安全なのは
+//! 「両者のうち高々一方しか実際には送出されない」ことが保証されるため:
+//! 登録ブロックの間 `stream` は `&mut` で排他借用されており通常送信は
+//! 起きない。緊急応答を書く条件を満たした場合（commit-pending 世代が、
+//! スタック上の armed な `ResponseBoundaryGuard` の世代と一致するとき）、
+//! その guard の `Drop` は `should_abort` により必ず `std::process::
+//! abort()` する（`engine::recovery::commit_boundary`・RECOVER-5。panic
+//! フックの外側で常に効く安全弁で、フックの登録有無に依存しない）ため、
+//! 以後の通常送信は起きない。`wire-server` バイナリではこれに加えて
+//! `engine::recovery::fail_fast`（RECOVER-8）がプロセス全体の panic を
+//! 網羅的に fail-fast させる。**将来この区間の panic を abort せず捕捉
+//! して処理を継続する変更を入れると、この不変条件が壊れて nonce 再利用
+//! になる**（[`super::record_protection::Sealer::seal_detached`] の
+//! doc も参照）。
+//!
+//! seal・直列化・`try_clone` のいずれかが失敗した場合、または `failed`
+//! （既にこの接続が破損済み）の場合は `None`（登録しない＝接続断のみへ
+//! 縮退。fail-closed）。詳細は `docs/design/tls-wire-connection.md`
+//! 「緊急応答（RECOVER-6）との関係」節。
 
 use std::io::{self, Read, Write};
 
@@ -319,9 +346,30 @@ impl<S: WireStream> WireStream for TlsStream<S> {
 
     fn emergency_channel(&self) -> Option<std::net::TcpStream> {
         // `engine::recovery::panic_hook::EmergencyResponseRegistration` は
-        // 生の `TcpStream` へ平文の ErrorResponse を書く契約のため、TLS
-        // 接続では登録自体を行わない（モジュールドキュメント参照）。
+        // 生の `TcpStream` へバイト列をそのまま書く契約のため、この生
+        // 複製を平文のまま登録に使うと TLS レコードへ混入する。登録は
+        // `emergency_response_channel`（下記の上書き）が暗号化してから
+        // 行うため、この経路は常に `None`（モジュールドキュメント参照）。
         None
+    }
+
+    fn emergency_response_channel(
+        &self,
+        response: &[u8],
+    ) -> Option<(Vec<u8>, std::net::TcpStream)> {
+        // fail-closed: 既に破損済みの接続へは登録しない（モジュール
+        // ドキュメント「緊急応答（RECOVER-6）との関係」節）。
+        if self.failed {
+            return None;
+        }
+        let record = self.session.seal_application_data_detached(response).ok()?;
+        let mut ciphertext = Vec::new();
+        record
+            .serialize_into(&mut ciphertext, RecordKind::Ciphertext)
+            .ok()?;
+        // `self.inner`（生 `TcpStream`）の既定実装（`TcpStream::
+        // try_clone`）を借りて、平文の代わりに暗号文を積んだ組を返す。
+        self.inner.emergency_response_channel(&ciphertext)
     }
 
     fn graceful_close(&mut self) {
@@ -766,6 +814,81 @@ mod tests {
         assert!(
             matches!(open_err, TlsSessionError::ReceivedFatalAlert(_)),
             "expected ReceivedFatalAlert, got {open_err:?}"
+        );
+    }
+
+    // ---- emergency_response_channel（RECOVER-6・Issue #1080） ----
+
+    /// 健全な application epoch の接続では、緊急応答（平文の
+    /// ErrorResponse バイト列）を暗号化済み TLS レコードとして登録できる。
+    /// 相手側の `Opener`（`client_session`）で正しく復号でき、元の平文と
+    /// 完全一致すること（`WireStream::emergency_channel` 経由で平文の
+    /// ままだった旧経路との違いの核心）。detached seal がシーケンス番号を
+    /// 消費しないことは `record_protection::tests::
+    /// seal_detached_does_not_advance_sequence_number` で固定済みのため、
+    /// ここでは統合経路（`TlsStream` を通した暗号文の組み立て・直列化）が
+    /// 正しく機能することを確認する。
+    #[test]
+    fn emergency_response_channel_produces_ciphertext_the_peer_can_decrypt() {
+        let (server_sock, mut client_sock) = loopback_pair();
+        let (server_session, mut client_session) = test_session_pair();
+        let server = TlsStream::new(server_sock, server_session);
+
+        let response = b"S=ERROR\0C=XX000\0D=state=may_be_committed\0\0".to_vec();
+        let (bytes, mut raw) = server
+            .emergency_response_channel(&response)
+            .expect("must register on a healthy application-epoch connection");
+        raw.write_all(&bytes)
+            .expect("write ciphertext via raw clone");
+
+        client_sock
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let record = record::read_record(&mut client_sock, RecordKind::Ciphertext)
+            .expect("read record")
+            .expect("record present");
+        let event = client_session
+            .open_record(&record)
+            .expect("open detached-sealed record");
+        assert_eq!(event, AppEvent::ApplicationData(response));
+    }
+
+    /// 既に破損状態（`failed`）の接続では登録しない（fail-closed。接続断
+    /// のみへ縮退）。
+    #[test]
+    fn emergency_response_channel_returns_none_when_already_failed() {
+        let (server_sock, client_sock) = loopback_pair();
+        drop(client_sock);
+        let (server_session, _client_session) = test_session_pair();
+        let mut server = TlsStream::new(server_sock, server_session);
+
+        let mut failed = false;
+        for _ in 0..64 {
+            if server.write_all(b"x").is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "expected write to eventually fail");
+        assert!(
+            server.emergency_response_channel(b"unused").is_none(),
+            "must not register on an already-failed connection"
+        );
+    }
+
+    /// `close_notify` を送出済み（送信方向が終了済み）の接続では、
+    /// [`TlsSession::seal_application_data_detached`] が `Poisoned` を返す
+    /// ため登録しない。
+    #[test]
+    fn emergency_response_channel_returns_none_after_close_notify() {
+        let (server_sock, _client_sock) = loopback_pair();
+        let (server_session, _client_session) = test_session_pair();
+        let mut server = TlsStream::new(server_sock, server_session);
+
+        server.graceful_close();
+        assert!(
+            server.emergency_response_channel(b"unused").is_none(),
+            "must not register after this connection has sent close_notify"
         );
     }
 }

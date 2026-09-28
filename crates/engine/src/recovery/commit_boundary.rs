@@ -146,7 +146,7 @@ impl Drop for ResponseBoundaryGuard {
             // 固定の英語文言のみを stderr へ出す。テナント ID・テーブル名・行データ・
             // operation_id を一切含めない（security.md P0「エラー・ログ経由で他テナントの
             // データ・存在情報を漏らさない」）。
-            eprintln!(
+            crate::log_stderr!(
                 "fatal: panic occurred after a write transaction committed successfully; \
                  aborting the process to avoid returning a false success response"
             );
@@ -210,7 +210,7 @@ impl Drop for PostCommitPanicGuard {
             // 固定の英語文言のみを stderr へ出す。テナント ID・テーブル名・行データ・
             // operation_id を一切含めない（security.md P0「エラー・ログ経由で他テナントの
             // データ・存在情報を漏らさない」）。
-            eprintln!(
+            crate::log_stderr!(
                 "fatal: panic occurred after a write transaction committed successfully; \
                  aborting the process to avoid returning a false success response"
             );
@@ -361,7 +361,7 @@ fn commit_and_finish_with<T>(
             // operation_id を一切含めない（security.md P0）。バックエンドのエラー詳細も
             // 出さない ―― durable かどうか不明な状態でエラー内容から情報が漏れることを
             // 避ける。
-            eprintln!(
+            crate::log_stderr!(
                 "fatal: the storage backend's commit call returned an error, but whether the \
                  write became durable before the error is indeterminate; aborting the process \
                  to avoid returning a possibly-incorrect success or failure response"
