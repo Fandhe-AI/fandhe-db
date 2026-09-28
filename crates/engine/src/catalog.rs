@@ -1370,9 +1370,15 @@ impl ColumnType {
     /// PK・FK は狭い方の [`Self::is_primary_key_allowed`] のみを使う）ごとの
     /// 固定タグ（TABLE-16・TASK-204、Issue #903・#1073）。
     /// [`Self::is_unique_constraint_allowed`] が `true` を返す型にのみ呼び出す
-    /// 契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。値は永続化
-    /// されない（`constraint.rs` の判定用スクラッチにのみ使う）ため、カタログの
-    /// `catalog_fields` タグとは独立に採番してよい。
+    /// 契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。
+    ///
+    /// Issue #1070（永続一意索引化）により、この値は `user_uniq/{table}`
+    /// テーブルの正引きキーの一部として**永続化される**（`constraint::
+    /// unique_index` 参照）。カタログの `catalog_fields` タグとは独立に採番
+    /// してよい点は変わらないが、値そのものはディスク形式の一部になったため、
+    /// 既存タグの意味を変更してはならない（変更すると索引の
+    /// フォーマットバージョンを上げ再構築を強制する必要がある）。新しい
+    /// 一意キー許可型を追加する際は、未使用の値を新規に採番すること。
     /// [`Self::unique_key_tag`] の `ColumnType::Array` に対応する値。
     /// [`crate::constraint::push_canonical_component`] は要素値（借用結果
     /// [`crate::row_codec::ArrayRef`]）だけを持ち、宣言時の `max_len` を含む
@@ -5529,6 +5535,35 @@ pub(crate) fn user_rows_table_def(row_table_name: &str) -> UserRowsTableDef<'_> 
     TableDefinition::new(row_table_name)
 }
 
+/// 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテーブル名を組み立てる。
+/// `user_rows/{table_name}`（[`user_rows_table_name`]）と同じ命名規則を共有し、
+/// `validate_identifier` を通った `table_name` は `/` を含まないため既存の
+/// 固定テーブル・行テーブル・他のユーザーテーブルの索引テーブルのいずれとも
+/// 衝突しない。呼び出し元は本関数を呼ぶ前に必ず `validate_identifier` を
+/// 通すこと（本関数自身は検証を行わない。[`user_rows_table_name`] と同じ契約）。
+///
+/// `PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブルではこのテーブルは
+/// 生成されない（`constraint::enforce_unique_keys_in_txn` が検査対象キーが
+/// 0 個の場合に即座に成功する既存の契約を維持する。索引テーブルは初回の
+/// 一意キー検査まで物理的に未作成）。
+pub(crate) fn user_uniq_table_name(table_name: &str) -> String {
+    format!("user_uniq/{table_name}")
+}
+
+/// 永続一意索引テーブルの物理キー型。第 1 要素はサーバー側導出テナント
+/// （`ctx.tenant_id()` 由来。RLS-9・TABLE-12 と同じ名前空間化）、第 2 要素は
+/// `constraint::unique_index` が組み立てる名前空間化済みサブキー（マーカー・
+/// 正引き・逆引きの 3 種）。値は名前空間ごとに異なるバイト列（`constraint::
+/// unique_index` の各エンコード関数のドキュメント参照）。
+pub(crate) type UniqueIndexTableDef<'a> =
+    TableDefinition<'a, (&'static str, &'static [u8]), &'static [u8]>;
+
+/// 永続一意索引テーブル定義を組み立てる（[`UniqueIndexTableDef`] の唯一の
+/// 生成点。[`user_rows_table_def`] と同じ集約方針）。
+pub(crate) fn user_uniq_table_def(index_table_name: &str) -> UniqueIndexTableDef<'_> {
+    TableDefinition::new(index_table_name)
+}
+
 /// 行テーブル `open_table` のエラー写像（[`UserRowsTableDef`] 専用）。
 ///
 /// 旧フォーマット（物理キーが `id` のみ）の DB を開くと `redb` は
@@ -5909,6 +5944,14 @@ impl Storage {
         // 行ストアを同一 txn 内で `open_table` すると `TableAlreadyOpen` になるため、
         // `delete_table` は既存ハンドルを介さず直接呼ぶ。
         write_txn.delete_table(user_rows_table_def(&user_rows_table_name(table_name)))?;
+        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）も行ストアと同一 txn・
+        // 同一 commit で削除する（存在しない場合は `delete_table` が `Ok(false)`
+        // を返すだけで、`PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブルでも
+        // エラーにならない）。放置すると同名テーブルを再作成した際に旧索引の
+        // マーカー・エントリが残り、新テーブルの行を旧テナントの索引と誤って
+        // 突き合わせてしまう（[`user_rows_table_def`] ドキュメントの「残留を
+        // 許すと～」と同種の事故）。
+        write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         // op_ledger も同一 txn・同一 commit で整合させる（上記ドキュメンテーション
         // コメント参照）。行ストア削除と異なりテーブル自体は残す（他テーブル分の
         // エントリが同居するため）。
@@ -6216,6 +6259,13 @@ impl Storage {
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
+        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）を無効化する。索引の
+        // マーカーは列宣言のシグネチャを保持しており本来は自動で不一致検出
+        // されるが、`ADD UNIQUE` の直後に索引テーブルごと削除しておくことで
+        // 二重の安全策とする（各テナントは次回の書き込み時に遅延再構築される。
+        // `row_table` の借用は上のブロックを抜けた時点で解放済みのため、
+        // 別テーブルである索引テーブルの削除はここで安全に行える）。
+        write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(confirmed_name)

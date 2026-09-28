@@ -6092,6 +6092,27 @@ impl EngineCore {
         crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id, ledger_write)
     }
 
+    /// `table` の永続一意索引（`user_uniq/{table}`）が「完全に構築済み」という
+    /// 不変条件を、**書き込みを一切行わずに**検証する（クラッシュ耐性検証専用の
+    /// 診断 API。Issue #1070・PR #1123 レビュー対応。`examples/crash_tool_unique_index.rs`
+    /// の `verify` から使う想定）。`insert_row`・`execute_insert_sql` 等の書き込み
+    /// 経路が持つ遅延バックフィル（`constraint` モジュールドキュメント参照）を
+    /// 経由しない——バックフィルは索引欠落を検出次第静かに再構築してしまうため、
+    /// クラッシュ後の索引欠落そのものを検出する用途には使えない
+    /// （[`crate::constraint::verify_unique_index_read_only`] 参照）。マーカー
+    /// 不在・不一致、または生存行のいずれかが正引きエントリを欠く場合は `Err` を
+    /// 返す。主キーも UNIQUE 制約も宣言しないテーブルは即座に成功する。
+    pub fn verify_unique_index_read_only(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        let snapshot = self.storage.begin_read()?;
+        let read_txn = snapshot.raw_txn();
+        let schema = crate::catalog::get_table_schema_in_txn(read_txn, table)?;
+        crate::constraint::verify_unique_index_read_only(read_txn, table, &schema, ctx.tenant_id())
+    }
+
     /// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア:
     /// RECOVER-2）。`crate::tenant::operation_recorded` への薄い委譲のみ。
     ///
