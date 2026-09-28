@@ -1,15 +1,16 @@
 # `FOREIGN KEY` 制約の設計判断
 
-Issue #907・対象ビヘイビア: TABLE-17（TASK-205）。関連ポインタ: TABLE-12
+Issue #907・対象ビヘイビア: TABLE-17（TASK-205）・TABLE-20（参照アクション）・
+TABLE-21（`MATCH`・遅延属性。いずれも TASK-232）。関連ポインタ: TABLE-12
 （物理キー `(tenant_id, id)`）・TABLE-15（`DROP TABLE` の依存オブジェクト検査）・
 TABLE-16（主キー・UNIQUE・単一検査点）・RLS-9・RLS-10 (c)（他テナントの存在情報の
 非漏えい・可視性を問わない判定母集合）・ERR-6（新設 `wire_code` と HTTP 射影）・
 SQL-31・TASK-221（明示トランザクション）。
 
 Issue #1077（`MATCH FULL`・`DEFERRABLE`）で D5・D6・「対象外・後続候補」を改訂し、
-D13〜D15・「COMMIT 時の遅延検査」節を追加した。この拡張は `docs/spec` の
-TABLE-17・TASK-205 が定める範囲を超える実装拡張であり、spec 側に対応する
-ビヘイビア ID は無い。
+D13〜D15・「COMMIT 時の遅延検査」節を追加した。対応ビヘイビア: TABLE-21（2026-09-28
+新設・spec 側判断記録は `04-behavior/records/phase8-constraint-index-followups-2026-09-28.md`
+ポインタ。本文は転記しない）。
 
 spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠）。本
 ドキュメントは本リポ側の実装判断・設計記録のみを扱う。
@@ -34,11 +35,12 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | D14 | `[NOT] DEFERRABLE`／`INITIALLY {DEFERRED\|IMMEDIATE}`（任意順・各グループ高々 1 回）を受理する。`INITIALLY DEFERRED` の宣言だけが、明示トランザクション中の文単位検査を COMMIT まで遅延できる。`SET CONSTRAINTS`（`DEFERRABLE INITIALLY IMMEDIATE` を実行時に遅延へ切り替える機能）は非対応のため、`DEFERRABLE`（`INITIALLY IMMEDIATE` 相当）は文単位検査のまま変わらない | `SET CONSTRAINTS` 抜きでも `INITIALLY DEFERRED` だけで自己参照・相互参照する初期データ投入のユースケースをカバーできる |
 | D15 | 遅延は「検査しない」ことを意味しない。autocommit（1 文＝1 トランザクション）は宣言に関わらず必ず文単位で検査する。省略できるのは明示トランザクション中の `INITIALLY DEFERRED` の文単位検査だけで、COMMIT 時にまとめて検査する（下記「COMMIT 時の遅延検査」節） | 「遅延」を「検査省略」と混同すると、autocommit や `SET CONSTRAINTS` 相当の切り替えが無い経路で fail-open になる |
 
-### 参照アクション（Issue #1076・TASK-205 拡張）
+### 参照アクション（Issue #1076・TASK-205 拡張・対応ビヘイビア TABLE-20）
 
-以下は `docs/spec/04-behavior/data-model.md` TABLE-17 の現在の記述範囲を超える、
-本リポ側の拡張として実装した（spec 側の記述更新はスコープ外としてユーザーへ
-別途報告する。spec 本文・記述内容は転記しない）。
+TABLE-17 が定めていた「`ON DELETE CASCADE`／`SET NULL` は `42601`」の拒否契約を、
+TABLE-20（2026-09-28 新設。spec 側判断記録は
+`04-behavior/records/phase8-constraint-index-followups-2026-09-28.md` ポインタ。
+本文は転記しない）の確定をもって受理形へ改訂する対応で実装した。
 
 | # | 決定 | 理由 |
 | --- | ---- | ---- |
@@ -49,7 +51,7 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | D20 | 連鎖の深さ・1 文あたりの対象行数に実装既定の上限（`constraint::MAX_REFERENTIAL_ACTION_DEPTH`＝16・`MAX_REFERENTIAL_ACTION_ROWS`＝10,000。spec 由来ではない）を設け、超過は `TenantWriteError::ReferentialActionLimitExceeded`（`54000`）で副作用ゼロに拒否する | 永続索引を持たないテナント範囲走査の再帰であり、無制限だと DoS になり得る（coding-rust.md「不安全な設計」） |
 | D21 | FK の重複判定は構造（`columns`・`parent_table`・`parent_columns`）のみで行い、アクション・`MATCH`・遅延属性の違いは無視する（`ForeignKeyDef::shares_reference_shape`） | 同じ列の組に矛盾するアクション・オプションを 2 つ宣言できる抜け穴を塞ぐ |
 | D22 | カタログ v8 の `fk:` 行は、参照アクション・`MATCH`・遅延属性のすべてが既定値の場合は従来の 3 フィールド形のままバイト列を変えず、いずれか 1 つでも既定値以外の場合のみ 7 フィールド形（D13・D14 の `MATCH`・遅延属性を含む。「永続化」節参照）でカタログ v9 として永続化する | 既存 v8 ゴールデンテスト・カタログ後方互換を保ちつつ、アクション・`MATCH`・遅延属性を単一のフォーマット拡張として素直に表現できる |
-| D23 | 同じ親の変更（`ON DELETE`／`ON UPDATE` 1 回分）に対する全 `FOREIGN KEY` の対象特定は、いずれの FK もまだアクションを適用していない子テーブルの状態から先にまとめて行う（Pass 1）。適用（Pass 2）は `referencing`（カタログ走査順＝概ね宣言順）ではなく、子テーブル名・参照元列・参照先テーブル・参照先列で決まる正準キーの昇順で行い、`CREATE TABLE` での FK 宣言順に一切依存しない。`CASCADE`（削除）は行そのものを消すため他アクションとどちらの順で交差しても最終状態は削除に収束するが（`SET NULL`／`SET DEFAULT` は削除済み行を素通りし、`CASCADE` は `id` で読み直すため既に書き換えられた行も削除できる）、同じ列に `SET NULL` と `SET DEFAULT` が競合する退化ケース（同じ子列を異なる `UNIQUE` 経由で参照する複数 FK）だけは適用順で最終値が変わり得るため、この正準キーで固定する（キーの大小関係自体に PostgreSQL 由来の意味はない）。PostgreSQL は参照整合性トリガーを行キューの順で逐次発火し、後続のトリガーは先行トリガーの効果を可視のまま参照するため、本実装（対象を確定してから適用する 2 パス方式）は PG よりこの種の交差に厳格という既知の差分がある | codex-review 指摘（PR #1138）: FK ごとに対象を収集し即座に適用すると、先に適用した FK の書き込みが後続 FK の対象特定に影響し、宣言順で最終結果が変わってしまう |
+| D23 | 同じ親の変更（`ON DELETE`／`ON UPDATE` 1 回分）に対する全 `FOREIGN KEY` の対象特定は、いずれの FK もまだアクションを適用していない子テーブルの状態から先にまとめて行う（Pass 1）。適用（Pass 2）は `referencing`（カタログ走査順＝概ね宣言順）ではなく、子テーブル名・参照元列・参照先テーブル・参照先列で決まる正準キーの昇順で行い、`CREATE TABLE` での FK 宣言順に一切依存しない。`CASCADE`（削除）は行そのものを消すため他アクションとどちらの順で交差しても最終状態は削除に収束するが（`SET NULL`／`SET DEFAULT` は削除済み行を素通りし、`CASCADE` は `id` で読み直すため既に書き換えられた行も削除できる）、同じ列に `SET NULL` と `SET DEFAULT` が競合する退化ケース（同じ子列を異なる `UNIQUE` 経由で参照する複数 FK）だけは適用順で最終値が変わり得るため、この正準キーで固定する——正準順で**後**に適用される FK（キーが辞書順で大きい方。`parent_columns` が異なる同一子テーブル・同一参照先列数の FK では概ね `parent_columns` の辞書順が支配的）の SET 結果が最終値として残る。キーの大小関係自体に PostgreSQL 由来の意味はない。PostgreSQL は参照整合性トリガーを行キューの順で逐次発火し、後続のトリガーは先行トリガーの効果を可視のまま参照するため、本実装（対象を確定してから適用する 2 パス方式）は PG よりこの種の交差に厳格という既知の差分がある | codex-review 指摘（PR #1138）: FK ごとに対象を収集し即座に適用すると、先に適用した FK の書き込みが後続 FK の対象特定に影響し、宣言順で最終結果が変わってしまう |
 
 ## 構文
 
