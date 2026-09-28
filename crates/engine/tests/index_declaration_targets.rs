@@ -357,8 +357,17 @@ struct Observed {
 /// `table` を SQL 表層・Rust API・`EXPLAIN` の 3 経路で 1 回ずつ問い合わせ、
 /// SQL 表層・Rust API がそれぞれ HNSW 経路を使った（`expect_hnsw == true`）／
 /// 使わなかった（`false`。`HnswIndexCache` へ一切照会しない）ことを確認して
-/// 観測結果を返す。
-fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: &str) -> Observed {
+/// 観測結果を返す。戻り値の 2 つ目は `ann_plan:` の生の行（索引名注記
+/// 〔Issue #1066〕を含む）。`Observed`（1 つ目）はトークン部分のみを持ち、
+/// 索引名注記の有無に関わらず経路・Top-k が不変であることの比較
+/// （`assert_eq!(a_declared, a_before)` 等）に使う。
+fn observe(
+    core: &EngineCore,
+    table: &str,
+    q: &[f32],
+    expect_hnsw: bool,
+    label: &str,
+) -> (Observed, String) {
     let sql_text = format!(
         "SELECT id FROM {table} ORDER BY embedding <=> '{}' LIMIT 5",
         vec_literal(q)
@@ -402,7 +411,7 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
             &format!("EXPLAIN {sql_text}"),
         )
         .unwrap_or_else(|e| panic!("{label}: explain on {table}: {e:?}"));
-    let ann_plan = match outcome {
+    let ann_plan_line = match outcome {
         SqlOutcome::Explain(result) => result
             .rows
             .iter()
@@ -413,6 +422,15 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
             .unwrap_or_else(|| panic!("{label}: explain must report an ann_plan: line")),
         other => panic!("{label}: expected SqlOutcome::Explain, got {other:?}"),
     };
+    // Issue #1066: `ann_plan:` 行は索引経路使用時 ` index=<name>[,<name>...]`
+    // を条件付きで追記する（安定契約。既存トークンの末尾への追記のみ）。
+    // トークン部分だけを切り出し、経路・Top-k 比較（`Observed`）には索引名
+    // 注記の有無を混ぜない。
+    let ann_plan = ann_plan_line
+        .split(" index=")
+        .next()
+        .expect("str::split always yields at least one segment")
+        .to_string();
     let expected_plan = if expect_hnsw {
         "ann_plan: hnsw_full_visible"
     } else {
@@ -422,7 +440,7 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
 
     assert_eq!(sql.rows.len(), 5);
     assert_eq!(api.len(), 5);
-    Observed { sql, api, ann_plan }
+    (Observed { sql, api, ann_plan }, ann_plan_line)
 }
 
 /// `--hnsw-scope all`（既定。`HnswScope::All`）: opt-in 時は全テーブル HNSW で、
@@ -432,6 +450,8 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
 /// ない」受け入れ条件。旧カタログ全体単位ゲートでは `table_a` への宣言で
 /// `table_b` が近似〔HNSW〕から厳密〔brute-force〕へ切り替わり Top-k が変わり
 /// 得た回帰の防止）。宣言した `table_a` 自身も宣言前と同じく HNSW のまま。
+/// `HnswScope::All` は適格性が宣言に依存しないため、宣言後も索引名注記は
+/// 付かない（Issue #1066 PR #1155・codex-review P1 指摘対応）。
 #[test]
 fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path() {
     let (core, _guard, vectors_a, vectors_b) =
@@ -440,8 +460,11 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
     assert_eq!(HnswScope::default(), HnswScope::All);
     let mut session = allowed_session();
 
-    let a_before = observe(&core, "table_a", &vectors_a[0], true, "before");
-    let b_before = observe(&core, "table_b", &vectors_b[0], true, "before");
+    let (a_before, a_before_line) = observe(&core, "table_a", &vectors_a[0], true, "before");
+    let (b_before, b_before_line) = observe(&core, "table_b", &vectors_b[0], true, "before");
+    // Issue #1066: 宣言前はどのテーブルにも索引名注記が無い。
+    assert!(!a_before_line.contains("index="), "{a_before_line}");
+    assert!(!b_before_line.contains("index="), "{b_before_line}");
 
     core.execute_sql_in_session(
         &ctx("tenant-a"),
@@ -449,8 +472,8 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
         "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
     )
     .expect("declare hnsw index on table_a only");
-    let a_declared = observe(&core, "table_a", &vectors_a[0], true, "declared");
-    let b_declared = observe(&core, "table_b", &vectors_b[0], true, "declared");
+    let (a_declared, a_declared_line) = observe(&core, "table_a", &vectors_a[0], true, "declared");
+    let (b_declared, b_declared_line) = observe(&core, "table_b", &vectors_b[0], true, "declared");
     assert_eq!(
         a_declared, a_before,
         "scope all: table_a results must not change"
@@ -459,17 +482,29 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
         b_declared, b_before,
         "scope all: a declaration on table_a must not change table_b results"
     );
+    // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
+    // `hnsw_targeted_in_txn` が宣言の有無を見ず常に適格とするため、宣言の
+    // 追加・削除は経路を一切変えない（上記アサーションのとおり）。索引名
+    // 注記は「実際に使われた索引」を示す契約であり、この scope では宣言が
+    // 経路選択に無関係なため、宣言済みの table_a にも索引名を付けない。
+    assert!(
+        !a_declared_line.contains("index="),
+        "scope all: a declared hnsw index must not be reported as used ({a_declared_line})"
+    );
+    assert!(
+        !b_declared_line.contains("index="),
+        "table_b must not report an index name for an undeclared table: {b_declared_line}"
+    );
 
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
         .expect("drop hnsw declaration");
-    assert_eq!(
-        observe(&core, "table_a", &vectors_a[0], true, "dropped"),
-        a_before
-    );
-    assert_eq!(
-        observe(&core, "table_b", &vectors_b[0], true, "dropped"),
-        b_before
-    );
+    let (a_dropped, a_dropped_line) = observe(&core, "table_a", &vectors_a[0], true, "dropped");
+    let (b_dropped, b_dropped_line) = observe(&core, "table_b", &vectors_b[0], true, "dropped");
+    assert_eq!(a_dropped, a_before);
+    assert_eq!(b_dropped, b_before);
+    // Issue #1066: `DROP INDEX` 後は索引名注記が消える。
+    assert!(!a_dropped_line.contains("index="), "{a_dropped_line}");
+    assert!(!b_dropped_line.contains("index="), "{b_dropped_line}");
 }
 
 /// `--hnsw-scope declared`（`HnswScope::Declared`）: `CREATE INDEX ... USING
@@ -485,8 +520,10 @@ fn scope_declared_uses_hnsw_only_on_declared_table_and_drop_returns_to_exact() {
     let mut session = allowed_session();
 
     // 宣言前: どのテーブルも厳密。
-    let a_before = observe(&core, "table_a", &vectors_a[0], false, "before");
-    let b_before = observe(&core, "table_b", &vectors_b[0], false, "before");
+    let (a_before, a_before_line) = observe(&core, "table_a", &vectors_a[0], false, "before");
+    let (b_before, b_before_line) = observe(&core, "table_b", &vectors_b[0], false, "before");
+    assert!(!a_before_line.contains("index="), "{a_before_line}");
+    assert!(!b_before_line.contains("index="), "{b_before_line}");
 
     core.execute_sql_in_session(
         &ctx("tenant-a"),
@@ -495,26 +532,35 @@ fn scope_declared_uses_hnsw_only_on_declared_table_and_drop_returns_to_exact() {
     )
     .expect("declare hnsw index on table_a only");
     // 宣言した `table_a` だけ HNSW（宣言テーブル自身の経路は変わる）。
-    observe(&core, "table_a", &vectors_a[0], true, "declared");
-    // 未宣言の `table_b` は厳密のままで、結果も宣言前と同一。
+    // Issue #1066: 宣言テーブルの `ann_plan:` には索引名が付く。
+    let (_, a_declared_line) = observe(&core, "table_a", &vectors_a[0], true, "declared");
     assert_eq!(
-        observe(&core, "table_b", &vectors_b[0], false, "declared"),
-        b_before,
+        a_declared_line, "ann_plan: hnsw_full_visible index=idx_vec_a",
+        "table_a must report its declared hnsw index name"
+    );
+    // 未宣言の `table_b` は厳密のままで、結果も宣言前と同一（索引名も付かない）。
+    let (b_declared, b_declared_line) = observe(&core, "table_b", &vectors_b[0], false, "declared");
+    assert_eq!(
+        b_declared, b_before,
         "scope declared: a declaration on table_a must not change table_b"
+    );
+    assert!(
+        !b_declared_line.contains("index="),
+        "table_b must not report an index name for an undeclared table: {b_declared_line}"
     );
 
     // `DROP INDEX` で `table_a` は厳密へ戻り、宣言前と同一の結果を返す。
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
         .expect("drop hnsw declaration");
+    let (a_dropped, a_dropped_line) = observe(&core, "table_a", &vectors_a[0], false, "dropped");
     assert_eq!(
-        observe(&core, "table_a", &vectors_a[0], false, "dropped"),
-        a_before,
+        a_dropped, a_before,
         "scope declared: drop index must return table_a to exact search"
     );
-    assert_eq!(
-        observe(&core, "table_b", &vectors_b[0], false, "dropped"),
-        b_before
-    );
+    assert!(!a_dropped_line.contains("index="), "{a_dropped_line}");
+    let (b_dropped, b_dropped_line) = observe(&core, "table_b", &vectors_b[0], false, "dropped");
+    assert_eq!(b_dropped, b_before);
+    assert!(!b_dropped_line.contains("index="), "{b_dropped_line}");
 }
 
 /// HNSW opt-in なし（既定エンジン）では `--hnsw-scope` は無関係で、
@@ -553,5 +599,93 @@ fn hnsw_scope_has_no_effect_without_hnsw_opt_in() {
         hnsw_consulted_count(&core),
         0,
         "without hnsw opt-in the scope must not enable hnsw"
+    );
+}
+
+/// `IndexCatalogGateCache`（Issue #1154）が索引カタログ専用世代をキーにし、
+/// 索引宣言と無関係な通常の行 DML（`INSERT`／`UPDATE`／`DELETE`）では無効化
+/// されないこと（受け入れ条件 1）と、`CREATE INDEX ... USING hnsw`／
+/// `DROP INDEX`（索引カタログを実際に変える commit）では取りこぼさず再判定
+/// すること（受け入れ条件 2）を、SQL 表層・Rust API・`EXPLAIN` の 3 経路を
+/// 通して固定する。`observe` 1 回につき 3 経路すべてが `hnsw_targeted_in_txn`
+/// を呼ぶが、同一世代内なら `EngineCore::index_catalog_gate_cache_stats` の
+/// `catalog_scans` は 1 回しか増えない（キャッシュ済み世代内の再利用）。
+#[test]
+fn hnsw_scope_declared_gate_cache_ignores_row_dml_but_tracks_index_ddl() {
+    let (core, _guard, vectors_a, _vectors_b) =
+        two_table_hnsw_core("index-decl-gate-cache-generation", HnswScope::Declared);
+    let mut session = allowed_session();
+
+    // 宣言なし: table_a は厳密のまま。3 経路（sql・rust api・explain）が同一
+    // 世代内で判定するため、走査は 1 回に収まる。
+    observe(&core, "table_a", &vectors_a[0], false, "before declaration");
+    let scans_after_first_observe = core.index_catalog_gate_cache_stats().catalog_scans;
+    assert_eq!(
+        scans_after_first_observe, 1,
+        "the first observation must scan the index catalog exactly once across all 3 surfaces"
+    );
+
+    // 索引宣言と無関係な行 DML（INSERT・UPDATE・DELETE）。索引カタログには
+    // 一切触れないため、専用世代は変わらないはず（受け入れ条件 1）。
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        &format!(
+            "INSERT INTO table_a (id, embedding, lang, topic) VALUES ({}, '{}', 'ja', 'alpha') USING OPERATION_ID 'gate-cache-insert'",
+            HNSW_ROWS,
+            vec_literal(&vectors_a[0]),
+        ),
+    )
+    .expect("insert row unrelated to index catalog");
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "UPDATE table_a SET lang = 'en' WHERE id = 0 USING OPERATION_ID 'gate-cache-update'",
+    )
+    .expect("update row unrelated to index catalog");
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        &format!(
+            "DELETE FROM table_a WHERE id = {HNSW_ROWS} USING OPERATION_ID 'gate-cache-delete'"
+        ),
+    )
+    .expect("delete row unrelated to index catalog");
+
+    observe(&core, "table_a", &vectors_a[0], false, "after row dml");
+    assert_eq!(
+        core.index_catalog_gate_cache_stats().catalog_scans,
+        scans_after_first_observe,
+        "row DML (INSERT/UPDATE/DELETE) must not invalidate the index catalog gate cache"
+    );
+
+    // `CREATE INDEX ... USING hnsw`（索引カタログを実際に変える）は取りこぼさず
+    // 再判定し、table_a は HNSW 経路へ切り替わる（受け入れ条件 2）。
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
+    )
+    .expect("declare hnsw index on table_a");
+    observe(&core, "table_a", &vectors_a[0], true, "declared");
+    let scans_after_declare = core.index_catalog_gate_cache_stats().catalog_scans;
+    assert!(
+        scans_after_declare > scans_after_first_observe,
+        "CREATE INDEX must invalidate the cached judgement and force a rescan"
+    );
+
+    // `DROP INDEX` も同様に取りこぼさず再判定し、table_a は厳密へ戻る。
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
+        .expect("drop hnsw declaration");
+    observe(&core, "table_a", &vectors_a[0], false, "dropped");
+    assert!(
+        core.index_catalog_gate_cache_stats().catalog_scans > scans_after_declare,
+        "DROP INDEX must invalidate the cached judgement and force a rescan"
+    );
+
+    assert_eq!(
+        core.index_catalog_gate_cache_stats().gate_read_failures,
+        0,
+        "no catalog read failure is expected in this fixture"
     );
 }

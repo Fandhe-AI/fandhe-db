@@ -3366,6 +3366,377 @@ fn fetch_matches_psql_on_insert_ddl_and_predicate_delete() {
     run_phase7_write_parity_scenario(HttpClient::Fetch);
 }
 
+// ---------------------------------------------------------------------
+// FOREIGN KEY 参照アクション（`ON DELETE`／`ON UPDATE`）の SQL/NoSQL
+// パリティ（Issue #1148・TABLE-17・TASK-205・NOSQL-13）
+// ---------------------------------------------------------------------
+
+/// SQL 表層（生 wire。alice に DDL 許可）・NoSQL 表層（`client`）それぞれで
+/// `parents`／`children`（`ON DELETE CASCADE ON UPDATE SET NULL` の
+/// `FOREIGN KEY` 宣言）を独立した DB へ作り、同型の DML（insert → update →
+/// delete）と拒否ケース（語彙外の参照アクション・宣言時に常に失敗する
+/// `NOT NULL` × `SET NULL`）を適用して、影響行数・`wire_code`・読み戻し行が
+/// 一致することを固定する（`run_phase7_write_parity_scenario` と同じ
+/// 2 db 構成。`seed_empty_db_no_table`・`spawn_{sql,nosql}_server_with_ddl_allowed`
+/// を再利用する）。
+fn run_fk_referential_action_parity_scenario(client: HttpClient) {
+    let client_version = client.version();
+    let psql_version = psql_version();
+
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let users_path_str = users_path.to_str().expect("utf-8 users path").to_string();
+
+    let out_dir = std::env::temp_dir().join(format!(
+        "wire-server-three-client-http-e2e-fk-{}-out-{}-{}",
+        client.label(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&out_dir).expect("create client output dir");
+    let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
+    let mut seq: u32 = 0;
+
+    // --- Phase 1: DB-S を SQL 表層（生 wire）で駆動する。
+    let (db_s_path, _db_s_guard) = seed_empty_db_no_table("fk-db-s");
+    let db_s_path_str = db_s_path.to_str().expect("utf-8 db path").to_string();
+    let (sql_server, sql_port) =
+        spawn_sql_server_with_ddl_allowed(&users_path_str, &db_s_path_str, "alice");
+
+    let create_parents = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "CREATE TABLE parents (code INTEGER, UNIQUE (code))",
+    );
+    assert_eq!(
+        create_parents,
+        SqlDmlOutcome::Success {
+            tag: "CREATE TABLE".to_string()
+        },
+        "SQL create parents: {create_parents:?}"
+    );
+    let create_children = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "CREATE TABLE children (parent_code INTEGER REFERENCES parents (code) \
+         ON DELETE CASCADE ON UPDATE SET NULL, tag TEXT)",
+    );
+    assert_eq!(
+        create_children,
+        SqlDmlOutcome::Success {
+            tag: "CREATE TABLE".to_string()
+        },
+        "SQL create children: {create_children:?}"
+    );
+
+    // 拒否ケース (1): 語彙外の参照アクションは `42601`（副作用ゼロ）。
+    let bogus_action = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "CREATE TABLE bogus (v INTEGER REFERENCES parents (code) ON DELETE BOGUS)",
+    );
+    match &bogus_action {
+        SqlDmlOutcome::Error { sqlstate, .. } => assert_eq!(sqlstate, "42601"),
+        other => panic!("expected 42601 syntax error, got {other:?}"),
+    }
+
+    // 拒否ケース (2): `NOT NULL` 列への `ON DELETE SET NULL` は宣言時検査で
+    // 常に失敗し `42830`。
+    let not_null_set_null = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "CREATE TABLE invalid_fk (v INTEGER NOT NULL REFERENCES parents (code) \
+         ON DELETE SET NULL)",
+    );
+    match &not_null_set_null {
+        SqlDmlOutcome::Error { sqlstate, .. } => assert_eq!(sqlstate, "42830"),
+        other => panic!("expected 42830 invalid foreign key error, got {other:?}"),
+    }
+
+    let insert_parent_1 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "INSERT INTO parents (id, code) VALUES (1, 100) USING OPERATION_ID 'op-p1'",
+    );
+    match &insert_parent_1 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row insert success, got {other:?}"),
+    }
+    let insert_parent_2 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "INSERT INTO parents (id, code) VALUES (2, 300) USING OPERATION_ID 'op-p2'",
+    );
+    match &insert_parent_2 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row insert success, got {other:?}"),
+    }
+    let insert_child_1 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "INSERT INTO children (id, parent_code, tag) VALUES (1, 100, 'c1') \
+         USING OPERATION_ID 'op-c1'",
+    );
+    match &insert_child_1 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row insert success, got {other:?}"),
+    }
+    let insert_child_2 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "INSERT INTO children (id, parent_code, tag) VALUES (2, 300, 'c2') \
+         USING OPERATION_ID 'op-c2'",
+    );
+    match &insert_child_2 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row insert success, got {other:?}"),
+    }
+
+    // `ON UPDATE SET NULL`: 親 1 の `code` 変更で子 1 の `parent_code` が
+    // `NULL` になる。
+    let update_parent_1 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "UPDATE parents SET code = 200 WHERE id = 1 USING OPERATION_ID 'op-u1'",
+    );
+    match &update_parent_1 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row update success, got {other:?}"),
+    }
+
+    // `ON DELETE CASCADE`: 親 2 の削除で子 2 が連鎖削除される。
+    let delete_parent_2 = run_sql_dml(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "DELETE FROM parents WHERE id = 2 USING OPERATION_ID 'op-d2'",
+    );
+    match &delete_parent_2 {
+        SqlDmlOutcome::Success { tag } => assert_eq!(affected_count_from_tag(tag), 1),
+        other => panic!("expected 1-row delete success, got {other:?}"),
+    }
+
+    let (sql_header, sql_rows) = run_psql_with_header(
+        sql_port,
+        "alice",
+        "pw-alice",
+        "SELECT id, parent_code, tag FROM children LIMIT 100",
+    );
+    assert_eq!(sql_header, vec!["id", "parent_code", "tag"]);
+    assert_eq!(
+        sql_rows,
+        vec![vec![
+            "1".to_string(),
+            NULL_SENTINEL.to_string(),
+            "c1".to_string(),
+        ]],
+        "SQL read-back after cascade delete + set null: {sql_rows:?}"
+    );
+
+    let sql_seen = sql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !sql_seen.iter().any(|line| line.contains("surface nosql")),
+        "SQL surface must not print the nosql surface banner: {sql_seen:?}"
+    );
+    assert_dml_scenario_no_leak("sql_seen", &sql_seen.join("\n"), &[]);
+
+    // --- Phase 2: 同一手順を DB-N 上で NoSQL 表層（`client`）へ適用する。
+    let (db_n_path, _db_n_guard) = seed_empty_db_no_table("fk-db-n");
+    let db_n_path_str = db_n_path.to_str().expect("utf-8 db path").to_string();
+    let (nosql_server, nosql_port) =
+        spawn_nosql_server_with_ddl_allowed(&users_path_str, &db_n_path_str, "alice");
+
+    let issue_session = |user: &str, pw: &str, seq: &mut u32| -> String {
+        *seq += 1;
+        let (status, body) = client.post(
+            nosql_port,
+            "/v1/session",
+            None,
+            &format!(r#"{{"user":"{user}","password":"{pw}"}}"#),
+            &out_dir,
+            *seq,
+        );
+        assert_eq!(status, 200, "session issue failed for {user}: {body}");
+        match json_object(&body).get("token") {
+            Some(JsonValue::String(s)) => s.clone(),
+            other => panic!("expected string token field, got {other:?}"),
+        }
+    };
+    let alice_token = issue_session("alice", "pw-alice", &mut seq);
+    assert_valid_session_token(&alice_token);
+
+    let query = |token: &str, json_body: &str, seq: &mut u32| -> (u16, String) {
+        *seq += 1;
+        client.post(
+            nosql_port,
+            "/v1/query",
+            Some(token),
+            json_body,
+            &out_dir,
+            *seq,
+        )
+    };
+
+    let create_parents_nosql = r#"{"op":"create_table","table":"parents","columns":[
+        {"name":"code","type":"integer"}
+    ],"constraints":[{"kind":"unique","columns":["code"]}]}"#;
+    let (status, body) = query(&alice_token, create_parents_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL create parents: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+
+    let create_children_nosql = r#"{"op":"create_table","table":"children","columns":[
+        {"name":"parent_code","type":"integer","nullable":true},
+        {"name":"tag","type":"text"}
+    ],"constraints":[
+        {"kind":"foreign_key","columns":["parent_code"],
+         "references":{"table":"parents","columns":["code"],
+         "on_delete":"cascade","on_update":"set_null"}}
+    ]}"#;
+    let (status, body) = query(&alice_token, create_children_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL create children: {body}");
+    assert_eq!(body.trim(), r#"{"ok":true}"#);
+
+    // 拒否ケース (1): 語彙外の参照アクションは `42601`（副作用ゼロ）。
+    let bogus_action_nosql = r#"{"op":"create_table","table":"bogus","columns":[
+        {"name":"v","type":"integer","nullable":true}
+    ],"constraints":[
+        {"kind":"foreign_key","columns":["v"],
+         "references":{"table":"parents","columns":["code"],"on_delete":"bogus"}}
+    ]}"#;
+    let (status, body) = query(&alice_token, bogus_action_nosql, &mut seq);
+    assert_ne!(status, 200, "bogus action unexpectedly succeeded: {body}");
+    assert_eq!(nosql_wire_code_of(&body), "42601", "bogus action: {body}");
+
+    // 拒否ケース (2): `NOT NULL` 列への `on_delete: set_null` は宣言時検査で
+    // 常に失敗し `42830`。
+    let not_null_set_null_nosql = r#"{"op":"create_table","table":"invalid_fk","columns":[
+        {"name":"v","type":"integer","nullable":false}
+    ],"constraints":[
+        {"kind":"foreign_key","columns":["v"],
+         "references":{"table":"parents","columns":["code"],"on_delete":"set_null"}}
+    ]}"#;
+    let (status, body) = query(&alice_token, not_null_set_null_nosql, &mut seq);
+    assert_ne!(
+        status, 200,
+        "not-null set_null unexpectedly succeeded: {body}"
+    );
+    assert_eq!(
+        nosql_wire_code_of(&body),
+        "42830",
+        "not-null set_null: {body}"
+    );
+
+    let insert_parent_1_nosql =
+        r#"{"op":"insert","table":"parents","rows":[{"id":1,"code":100}],"operation_id":"op-p1"}"#;
+    let (status, body) = query(&alice_token, insert_parent_1_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL insert parent 1: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+    let insert_parent_2_nosql =
+        r#"{"op":"insert","table":"parents","rows":[{"id":2,"code":300}],"operation_id":"op-p2"}"#;
+    let (status, body) = query(&alice_token, insert_parent_2_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL insert parent 2: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+    let insert_child_1_nosql = r#"{"op":"insert","table":"children","rows":[{"id":1,"parent_code":100,"tag":"c1"}],"operation_id":"op-c1"}"#;
+    let (status, body) = query(&alice_token, insert_child_1_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL insert child 1: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+    let insert_child_2_nosql = r#"{"op":"insert","table":"children","rows":[{"id":2,"parent_code":300,"tag":"c2"}],"operation_id":"op-c2"}"#;
+    let (status, body) = query(&alice_token, insert_child_2_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL insert child 2: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+
+    let update_parent_1_nosql = r#"{"op":"update","table":"parents","set":{"code":200},"where":{"id":1},"operation_id":"op-u1"}"#;
+    let (status, body) = query(&alice_token, update_parent_1_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL update parent 1: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+
+    let delete_parent_2_nosql =
+        r#"{"op":"delete","table":"parents","where":{"id":2},"operation_id":"op-d2"}"#;
+    let (status, body) = query(&alice_token, delete_parent_2_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL delete parent 2: {body}");
+    assert_eq!(affected_count_from_nosql_body(&body), 1);
+
+    let scan_children_nosql =
+        r#"{"op":"scan","table":"children","limit":100,"columns":["id","parent_code","tag"]}"#;
+    let (status, body) = query(&alice_token, scan_children_nosql, &mut seq);
+    assert_eq!(status, 200, "NoSQL read-back: {body}");
+    let result_obj = json_object(&body);
+    let rows_json = match result_obj.get("rows") {
+        Some(JsonValue::Array(rows)) => rows.clone(),
+        other => panic!("expected array rows field, got {other:?}"),
+    };
+    let nosql_rows: Vec<Vec<String>> = rows_json
+        .iter()
+        .map(|row| match row {
+            JsonValue::Array(cells) => cells
+                .iter()
+                .map(|c| json_cell_to_pg_text(c, NULL_SENTINEL))
+                .collect(),
+            other => panic!("expected array row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        nosql_rows,
+        vec![vec![
+            "1".to_string(),
+            NULL_SENTINEL.to_string(),
+            "c1".to_string(),
+        ]],
+        "NoSQL read-back after cascade delete + set null: {nosql_rows:?}"
+    );
+    assert_eq!(
+        nosql_rows, sql_rows,
+        "read-back after cascade delete + set null must match between SQL and NoSQL surfaces"
+    );
+
+    let nosql_seen = nosql_server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        nosql_seen.iter().any(|line| line.contains("surface nosql")),
+        "expected nosql surface banner in stderr, got: {nosql_seen:?}"
+    );
+    let issued_tokens = [alice_token.as_str()];
+    assert_dml_scenario_no_leak("nosql_seen", &nosql_seen.join("\n"), &issued_tokens);
+
+    let record = format!(
+        "[e2e-record] fk-referential-action-parity/{label}: psql_version={psql_version:?} \
+         client_version={client_version:?} create_parents=ok create_children=ok \
+         bogus_action=42601 not_null_set_null=42830 insert=ok(4) \
+         update_set_null=ok(1) cascade_delete=ok(1) read_back_match=true",
+        label = client.label(),
+    );
+    assert_dml_scenario_no_leak("record", &record, &issued_tokens);
+    eprintln!("{record}");
+}
+
+#[test]
+#[ignore = "requires psql and curl; run via `make e2e-three-client-http`"]
+fn curl_matches_psql_on_fk_referential_actions() {
+    run_fk_referential_action_parity_scenario(HttpClient::Curl);
+}
+
+#[test]
+#[ignore = "requires psql and python3; run via `make e2e-three-client-http`"]
+fn urllib_matches_psql_on_fk_referential_actions() {
+    run_fk_referential_action_parity_scenario(HttpClient::Urllib);
+}
+
+#[test]
+#[ignore = "requires psql and node (>= 18); run via `make e2e-three-client-http`"]
+fn fetch_matches_psql_on_fk_referential_actions() {
+    run_fk_referential_action_parity_scenario(HttpClient::Fetch);
+}
+
 /// `json_body`（`r#"{"op":"<name>",...}"#` 形の静的文字列）から `op` フィールド
 /// の値を取り出す。[`PARITY_CASES`]・[`REJECTION_CASES`]・[`DML_STEPS`]・
 /// [`BOB_STEP`]・[`PHASE7_WRITE_CASES`] はいずれもこの形を前提にしており

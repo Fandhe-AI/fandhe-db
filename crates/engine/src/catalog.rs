@@ -113,6 +113,55 @@ const INDEX_CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("
 /// 同じ既定値。無制限 `Vec`／走査コストを避ける。本リポの実装既定値）。
 const MAX_INDEX_COUNT: usize = MAX_LIST_TABLES;
 
+/// [`INDEX_CATALOG_TABLE`] の内容を変える commit だけで進む専用世代カウンタ
+/// （Issue #1154。固定キー 1 件で `u64` を 1 つ保持するだけの単一行テーブル）。
+/// [`IndexCatalogGateCache`] のキーをこのカウンタへ切り替えることで、索引宣言と
+/// 無関係な通常の行 DML（テーブル単位世代のみ進む）ではキャッシュを無効化しない
+/// ようにする。**不変条件**: [`INDEX_CATALOG_TABLE`] を書き込む経路
+/// （[`Storage::create_index`]・[`Storage::drop_index`]・
+/// [`retain_index_defs_in_txn`]）は必ず同一 write txn 内で
+/// [`bump_index_catalog_generation_in_txn`] を呼ぶこと。新たに
+/// [`INDEX_CATALOG_TABLE`] への書き込み経路を追加する場合も同様に呼び忘れない
+/// （呼び忘れは古い HNSW 宣言判定の再利用＝fail-open に直結する）。
+const INDEX_CATALOG_GENERATION_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("index_catalog_generation");
+
+/// [`INDEX_CATALOG_GENERATION_TABLE`] の唯一のキー（単一行テーブル）。
+const INDEX_CATALOG_GENERATION_KEY: &str = "generation";
+
+/// [`INDEX_CATALOG_GENERATION_TABLE`] を 1 つ進める（`write_txn.commit()` 前に、
+/// [`INDEX_CATALOG_TABLE`] への書き込みと同一 write txn 内で呼ぶ）。
+/// [`bump_table_generation_in_txn`] と同じ `checked_add` 方針でオーバーフローを
+/// 検出し、新規 variant を追加せず既存の [`CatalogError::TableGenerationCounterOverflow`]
+/// を流用する（`core_api.snapshot` の破壊的変更を避けるため）。
+fn bump_index_catalog_generation_in_txn(write_txn: &redb::WriteTransaction) -> Result<()> {
+    let mut gen_table = write_txn.open_table(INDEX_CATALOG_GENERATION_TABLE)?;
+    let current = gen_table
+        .get(INDEX_CATALOG_GENERATION_KEY)?
+        .map(|v| v.value())
+        .unwrap_or(0);
+    let next = current
+        .checked_add(1)
+        .ok_or(CatalogError::TableGenerationCounterOverflow)?;
+    gen_table.insert(INDEX_CATALOG_GENERATION_KEY, next)?;
+    Ok(())
+}
+
+/// [`bump_index_catalog_generation_in_txn`] の読み取り側。テーブルが未作成
+/// （索引カタログへまだ 1 度も書き込まれていない）場合は `0` を返す
+/// （[`table_generation_in_txn`]・`crate::storage::current_generation_in_txn`
+/// と同じ「未作成 = 世代 0」の方針）。
+pub(crate) fn index_catalog_generation_in_txn(read_txn: &redb::ReadTransaction) -> Result<u64> {
+    match read_txn.open_table(INDEX_CATALOG_GENERATION_TABLE) {
+        Ok(t) => Ok(t
+            .get(INDEX_CATALOG_GENERATION_KEY)?
+            .map(|v| v.value())
+            .unwrap_or(0)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 索引宣言 1 件が持てる列数の上限（[`MAX_COLUMN_COUNT`] と同値。本リポの実装
 /// 既定値）。
 const MAX_INDEX_DEF_COLUMNS: usize = MAX_COLUMN_COUNT;
@@ -388,6 +437,62 @@ pub(crate) fn declared_index_targets_in_txn(
     })
 }
 
+/// [`explain_index_names_in_txn`] の出力（Issue #1066・TASK-206・INDEX-7・
+/// SQL-6・SQL-27）。`sql::explain`（`core.rs` 経由）が `EXPLAIN` の
+/// `ann_plan:`／`scalar_plan:` 行へ使用索引名を注記するために読む、対象
+/// テーブルの索引宣言一覧。ここでは「対象テーブルに何が宣言されているか」
+/// のみを返し、実際にその索引を使うかどうかの判定（HNSW ゲート・スカラー
+/// 列被覆）は呼び出し元（`core.rs`）が行う。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TableIndexDecls {
+    /// 対象テーブルの `USING hnsw` 宣言の索引名（重複なし。宣言順は問わない）。
+    pub(crate) hnsw: Vec<String>,
+    /// 対象テーブルのスカラー宣言 `(索引名, 対象列)` の一覧。
+    pub(crate) scalar: Vec<(String, Vec<String>)>,
+}
+
+/// 対象テーブルの索引宣言を種別ごとに読み取る（Issue #1066）。クエリが使って
+/// いるのと同一の `read_txn`（`core.rs::EngineCore::explain_engine_for` が
+/// 開く txn。HNSW ゲート判定 [`hnsw_targeted_in_txn`] と同一スナップショット
+/// から読み、トークンと索引名注記の食い違いを作らない）から呼ぶ。カタログ
+/// 未作成（宣言 0 件）は空の `Ok`。走査件数が [`MAX_INDEX_COUNT`] を超える・
+/// 値のデコードに失敗する場合は `Err`（呼び出し元は「名前を出さない」へ
+/// fail-closed に倒す。`EXPLAIN` 自体は失敗させない）。`decode_index_def` は
+/// redb キー（索引名）自体を再検証しないため、ここで [`validate_identifier`]
+/// を通してから返す（未検証の文字列を `QUERY PLAN` 応答へ出さない）。
+pub(crate) fn explain_index_names_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+) -> Result<TableIndexDecls> {
+    let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(TableIndexDecls::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut decls = TableIndexDecls::default();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let name = key.value();
+        validate_identifier(name).map_err(|_| {
+            CatalogError::CorruptSchema(format!("invalid index identifier for index {name}"))
+        })?;
+        let def = decode_index_def(name, value.value())?;
+        if def.table != table {
+            continue;
+        }
+        match def.kind {
+            IndexKind::Hnsw => decls.hnsw.push(def.name),
+            IndexKind::Scalar => decls.scalar.push((def.name, def.columns)),
+        }
+    }
+    Ok(decls)
+}
+
 /// [`hnsw_targeted_in_txn`] が索引カタログ全件走査から要約する内容（Issue #1065・
 /// PR #1124）。`IndexKind::Hnsw` 宣言を持つテーブル名の集合だけを保持する
 /// （[`IndexCatalogGateCache`] が 1 世代あたり 1 回の走査で全テーブルの問い合わせを
@@ -426,22 +531,21 @@ fn hnsw_catalog_summary_in_txn(read_txn: &redb::ReadTransaction) -> Result<HnswC
 }
 
 /// [`hnsw_targeted_in_txn`] の索引カタログ全件走査結果（[`HnswCatalogSummary`]）を
-/// ストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
+/// 索引カタログ専用世代カウンタ（[`index_catalog_generation_in_txn`]。Issue #1154）
 /// 単位で再利用するキャッシュ（codex-review P2 対応・Issue #1065 PR #1124）。
 /// 宣言が [`MAX_INDEX_COUNT`]（最大 10,000 件）に達する構成では、キャッシュ
 /// 無しだと検索・`EXPLAIN` のたびに宣言数に比例するデコードが検索ホットパスへ
 /// 乗る。
 ///
-/// キー選定: 索引カタログを変更する経路（`Storage::create_index`・`drop_index`・
-/// `drop_table`・`alter_table_drop_column`）はいずれも
-/// `crate::recovery::commit_boundary::commit` を経由し、commit 前に必ず
-/// `crate::storage::prepare_generation_bump`（ストレージ全体の単一世代
-/// カウンタ）を通る。索引カタログはテーブル横断の単一 redb テーブルで、要約
-/// （HNSW 宣言テーブル集合・読み取り可否）はどのテーブルへの索引 DDL の commit
-/// でも変わり得るため、対象テーブルの世代（`bump_table_generation_in_txn`）では
-/// なく全 commit で進むストレージ全体世代をキーにする（取りこぼさない）。
-/// 通常の行 DML でも過剰に無効化されるが、キャッシュ不一致時のコストは
-/// キャッシュ導入前と同じフルスキャン 1 回に留まる（悪化しない）。
+/// キー選定: 索引カタログを変更する経路（[`Storage::create_index`]・
+/// [`Storage::drop_index`]・[`retain_index_defs_in_txn`]〔`drop_table`・
+/// `alter_table_drop_column` が呼ぶ〕）は、[`INDEX_CATALOG_TABLE`] への書き込みと
+/// 同一 write txn 内で必ず [`bump_index_catalog_generation_in_txn`] を呼ぶ
+/// （[`INDEX_CATALOG_GENERATION_TABLE`] の doc コメント参照）。以前はストレージ
+/// 全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）を
+/// キーにしていたため、索引宣言と無関係な通常の行 DML の commit でもキャッシュが
+/// 無効化されていた（Issue #1154）。専用カウンタへ切り替えたことで、索引カタログ
+/// 自体を変えない commit ではキャッシュが有効なまま残る。
 ///
 /// `EngineCore` が唯一のインスタンスを保持し、`core.rs`（Rust API 検索・
 /// `EXPLAIN`）・`sql::exec`（SQL 検索、`sql::hnsw_cache::HnswCacheAccess`
@@ -454,6 +558,11 @@ pub(crate) struct IndexCatalogGateCache {
     /// 常に安全側（厳密結果）だが、カタログ破損等の異常が運用上観測できるよう
     /// `scalar_index::ScalarIndexCache::build_failures` と同方針で計上する。
     gate_read_failures: std::sync::atomic::AtomicU64,
+    /// キャッシュがミスし [`hnsw_catalog_summary_in_txn`] で索引カタログを
+    /// 実走査した回数（Issue #1154。成功・失敗いずれも計上する）。行 DML を
+    /// 挟んでも走査が増えないことを結合テストで観測するための統計で、
+    /// テナント ID・行データ等の機微情報は含まない。
+    catalog_scans: std::sync::atomic::AtomicU64,
 }
 
 impl IndexCatalogGateCache {
@@ -461,6 +570,7 @@ impl IndexCatalogGateCache {
         Self {
             state: std::sync::Mutex::new(None),
             gate_read_failures: std::sync::atomic::AtomicU64::new(0),
+            catalog_scans: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -470,6 +580,9 @@ impl IndexCatalogGateCache {
         IndexCatalogGateCacheStats {
             gate_read_failures: self
                 .gate_read_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            catalog_scans: self
+                .catalog_scans
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -484,6 +597,8 @@ pub struct IndexCatalogGateCacheStats {
     /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗により brute-force へ
     /// fail-closed 縮退した回数。
     pub gate_read_failures: u64,
+    /// キャッシュがミスし索引カタログを実走査した回数（Issue #1154）。
+    pub catalog_scans: u64,
 }
 
 /// [`IndexCatalogGateCache`] を経由して [`HnswCatalogSummary`] を取得する。
@@ -497,8 +612,7 @@ fn cached_hnsw_catalog_summary_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
 ) -> Result<std::sync::Arc<HnswCatalogSummary>> {
-    let generation =
-        crate::storage::current_generation_in_txn(read_txn).map_err(convert_storage_error)?;
+    let generation = index_catalog_generation_in_txn(read_txn)?;
     if let Ok(guard) = gate_cache.state.lock() {
         if let Some((cached_generation, summary)) = guard.as_ref() {
             if *cached_generation == generation {
@@ -506,6 +620,9 @@ fn cached_hnsw_catalog_summary_in_txn(
             }
         }
     }
+    gate_cache
+        .catalog_scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let summary = std::sync::Arc::new(hnsw_catalog_summary_in_txn(read_txn)?);
     if let Ok(mut guard) = gate_cache.state.lock() {
         let should_store = match guard.as_ref() {
@@ -540,8 +657,9 @@ fn cached_hnsw_catalog_summary_in_txn(
 /// `sql::exec`（`AnnShapeInput.hnsw_enabled`）・`core.rs`（Rust API
 /// `search_with_snapshot`・`EXPLAIN` の `ann_plan:` 行）が同一のこの関数を
 /// 呼ぶことで、実行時判定と `EXPLAIN` 表示の乖離を作らない。走査結果は
-/// `gate_cache`（[`IndexCatalogGateCache`]）を経由してストレージ世代単位で
-/// 再利用する（codex-review P2 対応・PR #1124）。
+/// `gate_cache`（[`IndexCatalogGateCache`]）を経由して索引カタログ専用世代単位で
+/// 再利用する（codex-review P2 対応・PR #1124。Issue #1154 でストレージ全体
+/// 世代から専用世代へキーを切り替えた）。
 pub(crate) fn hnsw_targeted_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
@@ -579,33 +697,45 @@ fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> R
 
 /// [`INDEX_CATALOG_TABLE`] の全エントリのうち `keep` が `false` を返す宣言を同一
 /// write txn 内で削除する（[`delete_indexes_for_table_in_txn`]・
-/// [`delete_indexes_referencing_column_in_txn`] の共通本体）。索引カタログ未作成は
-/// 何もせず `Ok(())`。走査件数は [`MAX_INDEX_COUNT`] で打ち切る（fail-closed）。
+/// [`delete_indexes_referencing_column_in_txn`] の共通本体。呼び出し元は
+/// `Storage::drop_table`・`Storage::alter_table_drop_column`）。索引カタログ未作成は
+/// 何もせず `Ok(())`（[`bump_index_catalog_generation_in_txn`] も呼ばない。宣言が
+/// 1 件も無い状態からは何も変わらないため）。走査件数は [`MAX_INDEX_COUNT`] で
+/// 打ち切る（fail-closed）。実際に 1 件でも削除した場合は
+/// [`bump_index_catalog_generation_in_txn`] を進める（Issue #1154。
+/// [`IndexCatalogGateCache`] が `drop_table`・`alter_table_drop_column` による
+/// HNSW 宣言の消滅を取りこぼさないようにするため）。
 fn retain_index_defs_in_txn(
     write_txn: &redb::WriteTransaction,
     mut keep: impl FnMut(&IndexDef) -> bool,
 ) -> Result<()> {
-    let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-        Err(e) => return Err(e.into()),
+    let removed = {
+        let mut index_table = match write_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut to_remove = Vec::new();
+        for (scanned, entry) in index_table.iter()?.enumerate() {
+            if scanned >= MAX_INDEX_COUNT {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "index catalog exceeds {MAX_INDEX_COUNT} entries"
+                )));
+            }
+            let (key, value) = entry?;
+            let name = key.value().to_string();
+            let def = decode_index_def(&name, value.value())?;
+            if !keep(&def) {
+                to_remove.push(name);
+            }
+        }
+        for name in &to_remove {
+            index_table.remove(name.as_str())?;
+        }
+        !to_remove.is_empty()
     };
-    let mut to_remove = Vec::new();
-    for (scanned, entry) in index_table.iter()?.enumerate() {
-        if scanned >= MAX_INDEX_COUNT {
-            return Err(CatalogError::CorruptSchema(format!(
-                "index catalog exceeds {MAX_INDEX_COUNT} entries"
-            )));
-        }
-        let (key, value) = entry?;
-        let name = key.value().to_string();
-        let def = decode_index_def(&name, value.value())?;
-        if !keep(&def) {
-            to_remove.push(name);
-        }
-    }
-    for name in to_remove {
-        index_table.remove(name.as_str())?;
+    if removed {
+        bump_index_catalog_generation_in_txn(write_txn)?;
     }
     Ok(())
 }
@@ -780,6 +910,32 @@ const CATALOG_FORMAT_VERSION_V10: &str = "v10";
 /// 拒否する（前方互換は持たない）。
 const CATALOG_FORMAT_VERSION_V11: &str = "v11";
 
+/// カタログ v12（TABLE-22・TASK-233、Issue #1069。設計 F4）: v11 の上位集合。
+/// `FOREIGN KEY` の実名が設計 F2 の既定名導出と 1 件でも食い違う場合のみこの
+/// 版で書く（UNIQUE の実名の有無・FK オプションの有無は問わない。v12 は
+/// `uniq:`／`checks:` セクションを 0 件で許し、`fks:` セクションのみ `n >= 1`
+/// 必須〔この分岐に入るのは名前付き FK を持つ場合のみのため〕。`fk:` 行は
+/// `fk:<name>:<cols>:<parent>:<pcols>:<on_delete>:<on_update>:<match>:<deferral>`
+/// の 8 フィールド固定——v8〜v11 の後方互換 5/7 フィールド判別を持たない
+/// 書き込み専用の新形式（[`encode_foreign_key_section_v12`]・
+/// [`parse_foreign_key_section_v12`]）。v12 を知らない旧バイナリは「未知の
+/// フォーマットバージョン」として fail-closed に拒否する（前方互換は持たない）。
+const CATALOG_FORMAT_VERSION_V12: &str = "v12";
+
+/// `FOREIGN KEY` を持ちうるカタログフォーマット版の一覧（TABLE-17・TASK-205・
+/// TABLE-22・TASK-233、Issue #907・#1069）。[`referencing_foreign_keys_in_txn`]
+/// が候補行の絞り込みに使う唯一の情報源。**P0**: 新しい FK 保持版を追加する際は
+/// 必ずここへ追記すること——見落とすと参照先側の書き込み検査
+/// （`constraint::enforce_referencing_rows_in_txn`）と `DROP TABLE` の依存検査
+/// （`2BP01`）の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
+const FK_BEARING_FORMAT_VERSIONS: [&str; 5] = [
+    CATALOG_FORMAT_VERSION_V8,
+    CATALOG_FORMAT_VERSION_V9,
+    CATALOG_FORMAT_VERSION_V10,
+    CATALOG_FORMAT_VERSION_V11,
+    CATALOG_FORMAT_VERSION_V12,
+];
+
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
 /// 実装既定値）。デコード時、この値を超える宣言件数はアロケーション前に拒否する
 /// （.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
@@ -865,7 +1021,9 @@ const _: () = assert!(
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-const MAX_COLUMN_COUNT: usize = 256;
+/// `pub(crate)`: [`crate::sql::explain::ExplainShape`]（Issue #1066）が
+/// `metadata_filters` 参照列のビットセット長をこの値と同期させるため参照する。
+pub(crate) const MAX_COLUMN_COUNT: usize = 256;
 
 /// `PRIMARY KEY` に宣言できる列数の上限（TABLE-16・TASK-204、Issue #903）。
 /// PostgreSQL の索引キー列数慣習（32）に合わせた本リポの実装既定値。デコード時、
@@ -1049,19 +1207,26 @@ pub enum CatalogError {
     /// 参照先列の型が一致しない（ERR-6: `42830`）。`detail` はカタログ情報
     /// （列名・テーブル名）のみでテナントデータを含まない。
     InvalidForeignKey(String),
-    /// `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE` で指定した制約名が、
-    /// 同一テーブルの既存 UNIQUE 制約名・CHECK 制約名（テーブル単位で名前空間を
-    /// 共有する。設計 D1）のいずれかと衝突する（Issue #1067。ERR-6: `42P07`。
+    /// `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE` ／
+    /// `ADD [CONSTRAINT <name>] FOREIGN KEY` で指定した制約名が、同一テーブルの
+    /// 既存 UNIQUE・CHECK・FOREIGN KEY 制約名（テーブル単位で名前空間を共有する。
+    /// 設計 D1・F1）のいずれかと衝突する（Issue #1067・#1069。ERR-6: `42P07`。
     /// 索引名衝突〔`IndexAlreadyExists`〕と同じ SQLSTATE を流用する）。
     ConstraintAlreadyExists(String),
-    /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK
-    /// いずれの制約としても存在しない（Issue #1067。ERR-6: `42704`）。
+    /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK・
+    /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
+    /// ERR-6: `42704`）。
     ConstraintNotFound(String),
     /// テーブルあたりの制約数上限（[`MAX_UNIQUE_CONSTRAINTS`]／
     /// [`MAX_CHECK_CONSTRAINTS_PER_TABLE`] と同じ本リポの実装既定値）を超える
     /// `ALTER TABLE ... ADD UNIQUE`／`ADD CHECK`（Issue #1067・#1068。
     /// ERR-6: `54000`）。
     ConstraintLimitExceeded(String),
+    /// [`Storage::alter_table_add_foreign_key`]（TABLE-22・TASK-233、Issue #1069）
+    /// が、既存行の中に新しい `FOREIGN KEY` を満たさない参照元行を検出したため
+    /// 制約追加を拒否した。文言・variant 自体にテナント名・値・行を含めない
+    /// （security.md P0。`TenantWriteError::ForeignKeyViolation` と同じ秘匿方針）。
+    ForeignKeyViolation,
 }
 
 impl fmt::Display for CatalogError {
@@ -1137,6 +1302,12 @@ impl fmt::Display for CatalogError {
             CatalogError::ConstraintLimitExceeded(detail) => {
                 write!(f, "constraint limit exceeded: {detail}")
             }
+            CatalogError::ForeignKeyViolation => {
+                write!(
+                    f,
+                    "insert or update on table violates foreign key constraint"
+                )
+            }
         }
     }
 }
@@ -1173,7 +1344,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::InvalidForeignKey(_)
             | CatalogError::ConstraintAlreadyExists(_)
             | CatalogError::ConstraintNotFound(_)
-            | CatalogError::ConstraintLimitExceeded(_) => None,
+            | CatalogError::ConstraintLimitExceeded(_)
+            | CatalogError::ForeignKeyViolation => None,
         }
     }
 }
@@ -2547,6 +2719,13 @@ pub enum ReferentialAction {
 /// `parent_columns` は `sql::allowlist` が組み立てる中間表現でのみ現れる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeyDef {
+    /// 制約名（Issue #1069）。テーブル単位の名前空間を UNIQUE・CHECK 制約名と
+    /// 共有する（PRIMARY KEY は引き続き無名）。空文字列は「名前未確定」を表す
+    /// 一時状態で、[`assign_foreign_key_constraint_names`] が `encode_schema`／
+    /// `validate_schema` より前に確定する（TOCTOU 回避。`UniqueConstraint.name`
+    /// と同じ設計。設計 D2 系）。空名のまま `validate_schema` へ到達した場合は
+    /// fail-closed に拒否される（[`validate_foreign_keys`]）。
+    name: String,
     columns: Vec<String>,
     parent_table: String,
     parent_columns: Vec<String>,
@@ -2601,6 +2780,7 @@ impl ForeignKeyDef {
         on_update: ReferentialAction,
     ) -> Self {
         Self {
+            name: String::new(),
             columns,
             parent_table,
             parent_columns,
@@ -2609,6 +2789,22 @@ impl ForeignKeyDef {
             match_type: ForeignKeyMatch::Simple,
             deferrability: ForeignKeyDeferrability::NotDeferrable,
         }
+    }
+
+    /// `pub(crate)`: 名前確定済みの `ForeignKeyDef` を返すビルダー（Issue #1069）。
+    /// 構築元は [`assign_foreign_key_constraint_names`]（既定名の確定）・
+    /// `sql::allowlist`（明示 `CONSTRAINT <name> FOREIGN KEY` の構文）・
+    /// [`decode_schema_body`]（v12 カタログ値の復元。実名を永続化済み）・
+    /// [`resolve_foreign_key_target`]（参照先解決時に元の宣言の名前を引き継ぐ）
+    /// に限る。
+    pub(crate) fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// 制約名（確定済みのスキーマでは常に非空）。
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// [`Self::new`] に `MATCH`・遅延属性を明示指定したコピーを返すビルダー
@@ -3149,6 +3345,30 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             )));
         }
     }
+    // `FOREIGN KEY` 名も同じ名前空間に加わる（設計 F1。TABLE-22・TASK-233、
+    // Issue #1069）。FK 同士の重複は `validate_foreign_keys` が検査済みのため、
+    // ここでは UNIQUE・CHECK との衝突のみを追加検査する。
+    for fk in &schema.foreign_keys {
+        if fk.name.is_empty() {
+            continue;
+        }
+        if schema.checks.iter().any(|c| c.name == fk.name) {
+            return Err(CatalogError::Invalid(format!(
+                "constraint name {} is already used by a CHECK constraint on this table",
+                fk.name
+            )));
+        }
+        if schema
+            .unique_constraints
+            .iter()
+            .any(|u| u.name() == fk.name)
+        {
+            return Err(CatalogError::Invalid(format!(
+                "constraint name {} is already used by a UNIQUE constraint on this table",
+                fk.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3172,6 +3392,32 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
         )));
     }
     for (i, fk) in schema.foreign_keys.iter().enumerate() {
+        // 制約名（TABLE-22・TASK-233、Issue #1069。設計 F2）: `allow_unresolved`
+        // （`create_table` の write トランザクション前の事前検証専用）は
+        // `sql::allowlist` が組み立てる名前未確定（空名）の宣言を許容する。
+        // 永続化値・decode 結果・`encode_schema` の最終検証（`allow_unresolved
+        // == false`）では、`assign_foreign_key_constraint_names` が
+        // `validate_schema` より前に必ず確定するため、空名のまま到達した場合は
+        // fail-closed に拒否する（`UniqueConstraint` と同じ設計）。
+        if !allow_unresolved {
+            if fk.name.is_empty() {
+                return Err(CatalogError::Invalid(
+                    "foreign key constraint name is not resolved".to_string(),
+                ));
+            }
+            validate_identifier(&fk.name)?;
+            if schema
+                .foreign_keys
+                .iter()
+                .take(i)
+                .any(|other| other.name == fk.name)
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "duplicate foreign key constraint name: {}",
+                    fk.name
+                )));
+            }
+        }
         validate_identifier(&fk.parent_table)?;
         if fk.columns.is_empty() {
             return Err(CatalogError::Invalid(
@@ -3359,7 +3605,8 @@ fn resolve_foreign_key_target(
         fk.on_delete,
         fk.on_update,
     )
-    .with_options(fk.match_type(), fk.deferrability());
+    .with_options(fk.match_type(), fk.deferrability())
+    .with_name(fk.name.clone());
     if resolved.references_parent_id() {
         for name in &resolved.columns {
             if !matches!(child_type(name)?, ColumnType::Integer | ColumnType::BigInt) {
@@ -3548,6 +3795,15 @@ fn derive_unique_constraint_names(
 /// （TOCTOU 回避。FK の `parent_columns` 未解決中間表現と同じ流儀）。
 fn assign_unique_constraint_names(schema: TableSchema) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    // 明示 FK 名（TABLE-22・TASK-233、Issue #1069。設計 F1）を衝突回避の対象に
+    // 加える。`encode_schema` は UNIQUE 名を FK 名より先に確定するため、この
+    // 時点で見える FK 名は「まだ空文字列の既定名待ち」を除いた明示指定分のみ
+    // （空文字列は素通しになるだけで害はない）。
+    for fk in &schema.foreign_keys {
+        if !fk.name.is_empty() {
+            used.push(fk.name.clone());
+        }
+    }
     for uc in &schema.unique_constraints {
         if !uc.name.is_empty() {
             used.push(uc.name.clone());
@@ -3566,6 +3822,65 @@ fn assign_unique_constraint_names(schema: TableSchema) -> TableSchema {
         }
     }
     schema.with_unique_constraints(new_unique)
+}
+
+/// 名前未指定（宣言順）の `FOREIGN KEY` 制約群へ既定名を割り当てる（設計 F2。
+/// TABLE-22・TASK-233、Issue #1069）。テーブル名・宣言順の列リスト・使用済み
+/// 名集合のみで決まる純関数。候補名は `<table>_<col1>_<col2>..._fkey`
+/// （PostgreSQL 風）。衝突解決は [`resolve_constraint_name`]（フォールバック
+/// 接頭辞 `"fkey"`）に委譲する（[`derive_unique_constraint_names`] と同じ形）。
+fn derive_foreign_key_constraint_names(
+    table: &str,
+    columns_per_constraint: &[Vec<String>],
+    used: &[String],
+) -> Vec<String> {
+    let mut used: Vec<String> = used.to_vec();
+    let mut names = Vec::with_capacity(columns_per_constraint.len());
+    for cols in columns_per_constraint {
+        let candidate = format!("{table}_{}_fkey", cols.join("_"));
+        let name = resolve_constraint_name(&candidate, &used, "fkey");
+        used.push(name.clone());
+        names.push(name);
+    }
+    names
+}
+
+/// スキーマの `FOREIGN KEY` 制約のうち名前未確定（空名）に既定名を割り当てた
+/// 新しい `TableSchema` を返す（設計 F2。TABLE-22・TASK-233、Issue #1069。
+/// [`assign_unique_constraint_names`] と同じ設計）。すでに実名を持つ制約
+/// （明示 `CONSTRAINT <name> FOREIGN KEY` を伴う `CREATE TABLE`／
+/// `ALTER TABLE ADD`）はそのまま保持する。
+///
+/// 呼び出し元は `encode_schema`（内部の `validate_schema` より前。TOCTOU
+/// 回避）で `assign_unique_constraint_names` の**直後**に必ず呼ぶこと
+/// （`used` に確定済みの UNIQUE 名を含めるため。encode_schema ドキュメント
+/// 参照）。
+fn assign_foreign_key_constraint_names(schema: TableSchema) -> TableSchema {
+    let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    used.extend(
+        schema
+            .unique_constraints
+            .iter()
+            .map(|u| u.name().to_string()),
+    );
+    for fk in &schema.foreign_keys {
+        if !fk.name.is_empty() {
+            used.push(fk.name.clone());
+        }
+    }
+    let table = schema.name.clone();
+    let mut new_fks = Vec::with_capacity(schema.foreign_keys.len());
+    for fk in schema.foreign_keys.clone() {
+        if fk.name.is_empty() {
+            let candidate = format!("{table}_{}_fkey", fk.columns.join("_"));
+            let name = resolve_constraint_name(&candidate, &used, "fkey");
+            used.push(name.clone());
+            new_fks.push(fk.with_name(name));
+        } else {
+            new_fks.push(fk);
+        }
+    }
+    schema.with_foreign_keys(new_fks)
 }
 
 /// UNIQUE 制約（[`UniqueConstraint`]。TABLE-16・TASK-204、Issue #905。
@@ -4208,6 +4523,175 @@ fn parse_foreign_key_section<'a>(
     Ok(foreign_keys)
 }
 
+/// カタログ v12（[`CATALOG_FORMAT_VERSION_V12`]。設計 F4。TABLE-22・TASK-233、
+/// Issue #1069）の `FOREIGN KEY` セクションを追記する。名前付き FK を永続化
+/// するために新設する書き込み専用の実装で、v8〜v11 の 5/7 フィールド後方互換
+/// 判別を持つ [`encode_foreign_key_section`] とは独立させる（名前フィールドの
+/// 追加だけが差分のため、既存の後方互換ロジックを複雑化させない）。
+fn encode_foreign_key_section_v12(out: &mut String, foreign_keys: &[ForeignKeyDef]) -> Result<()> {
+    out.push_str(&format!("fks:{}\n", foreign_keys.len()));
+    for fk in foreign_keys {
+        validate_identifier(&fk.name)?;
+        validate_identifier(&fk.parent_table)?;
+        for name in fk.columns.iter().chain(&fk.parent_columns) {
+            validate_identifier(name)?;
+        }
+        out.push_str("fk:");
+        out.push_str(&fk.name);
+        out.push(':');
+        out.push_str(&fk.columns.join(","));
+        out.push(':');
+        out.push_str(&fk.parent_table);
+        out.push(':');
+        out.push_str(&fk.parent_columns.join(","));
+        out.push(':');
+        out.push_str(referential_action_token(fk.on_delete));
+        out.push(':');
+        out.push_str(referential_action_token(fk.on_update));
+        out.push(':');
+        out.push_str(match fk.match_type {
+            ForeignKeyMatch::Simple => "simple",
+            ForeignKeyMatch::Full => "full",
+        });
+        out.push(':');
+        out.push_str(match fk.deferrability {
+            ForeignKeyDeferrability::NotDeferrable => "immediate",
+            ForeignKeyDeferrability::DeferrableInitiallyImmediate => "deferrable",
+            ForeignKeyDeferrability::DeferrableInitiallyDeferred => "deferred",
+        });
+        out.push('\n');
+    }
+    Ok(())
+}
+
+/// [`encode_foreign_key_section_v12`] の逆変換（v12 専用。名前フィールドを
+/// 持つ 8 フィールド固定の `fk:` 行）。`decode_schema_body` と軽量パーサー
+/// [`catalog_value_references_enum_type`] の両方が使う。`count == 0` は形式の
+/// 一意性契約違反として拒否する（v12 を選ぶのは名前付き FK を持つ場合のみの
+/// ため）。
+fn parse_foreign_key_section_v12<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<Vec<ForeignKeyDef>, String> {
+    let fks_line = lines
+        .next()
+        .ok_or_else(|| "catalog value truncated: missing fks line".to_string())?;
+    let count_str = fks_line
+        .strip_prefix("fks:")
+        .ok_or_else(|| format!("malformed fks line: {fks_line:?}"))?;
+    let count: usize = count_str
+        .parse()
+        .map_err(|_| format!("malformed foreign key count: {count_str:?}"))?;
+    if count == 0 {
+        return Err("v12 catalog format requires at least one FOREIGN KEY constraint".to_string());
+    }
+    if count > MAX_FOREIGN_KEYS_PER_TABLE {
+        return Err(format!("too many FOREIGN KEY constraints: {count}"));
+    }
+    let mut foreign_keys = Vec::with_capacity(count);
+    let mut seen_names: Vec<String> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = lines
+            .next()
+            .ok_or_else(|| "catalog value truncated: missing fk line".to_string())?;
+        let body = line
+            .strip_prefix("fk:")
+            .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
+        let mut fields = body.split(':');
+        let (
+            Some(name),
+            Some(columns_field),
+            Some(parent_table),
+            Some(parent_columns_field),
+            Some(on_delete_field),
+            Some(on_update_field),
+            Some(match_field),
+            Some(deferral_field),
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
+        else {
+            return Err(format!("malformed foreign key line: {line:?}"));
+        };
+        if fields.next().is_some() {
+            return Err(format!("malformed foreign key line: {line:?}"));
+        }
+        validate_identifier(name).map_err(|_| format!("malformed foreign key line: {line:?}"))?;
+        if seen_names.iter().any(|n| n == name) {
+            return Err(format!("duplicate foreign key constraint name: {name:?}"));
+        }
+        seen_names.push(name.to_string());
+        let columns = parse_foreign_key_column_list(columns_field, line)?;
+        validate_identifier(parent_table)
+            .map_err(|_| format!("malformed foreign key line: {line:?}"))?;
+        let parent_columns = parse_foreign_key_column_list(parent_columns_field, line)?;
+        let has_duplicate = |names: &[String]| {
+            names
+                .iter()
+                .enumerate()
+                .any(|(i, n)| names.get(..i).is_some_and(|prev| prev.contains(n)))
+        };
+        if has_duplicate(&columns) || has_duplicate(&parent_columns) {
+            return Err(format!(
+                "foreign key references a column more than once: {line:?}"
+            ));
+        }
+        if columns.len() != parent_columns.len() {
+            return Err(format!("foreign key column count mismatch: {line:?}"));
+        }
+        let on_delete = parse_referential_action_token(on_delete_field)?;
+        let on_update = parse_referential_action_token(on_update_field)?;
+        let match_type = match match_field {
+            "simple" => ForeignKeyMatch::Simple,
+            "full" => ForeignKeyMatch::Full,
+            other => return Err(format!("malformed foreign key MATCH field: {other:?}")),
+        };
+        let deferrability = match deferral_field {
+            "immediate" => ForeignKeyDeferrability::NotDeferrable,
+            "deferrable" => ForeignKeyDeferrability::DeferrableInitiallyImmediate,
+            "deferred" => ForeignKeyDeferrability::DeferrableInitiallyDeferred,
+            other => {
+                return Err(format!(
+                    "malformed foreign key deferrability field: {other:?}"
+                ))
+            }
+        };
+        let fk = ForeignKeyDef::new(
+            columns,
+            parent_table.to_string(),
+            parent_columns,
+            on_delete,
+            on_update,
+        )
+        .with_options(match_type, deferrability)
+        .with_name(name.to_string());
+        if fk
+            .parent_columns
+            .iter()
+            .any(|c| c == FOREIGN_KEY_PARENT_ID_COLUMN)
+            && !fk.references_parent_id()
+        {
+            return Err(format!(
+                "the id column can only be referenced alone: {line:?}"
+            ));
+        }
+        if foreign_keys
+            .iter()
+            .any(|other: &ForeignKeyDef| other.shares_reference_shape(&fk))
+        {
+            return Err("duplicate foreign key declaration".to_string());
+        }
+        foreign_keys.push(fk);
+    }
+    Ok(foreign_keys)
+}
+
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
 /// フォーマットバージョン、2 行目に列数、以降 1 行 1 列（`name:type:dim:nullable`
 /// の 4 フィールドを `:` 区切り。識別子は `validate_identifier` により `:` を
@@ -4233,6 +4717,10 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     // 将来の呼び出し元が空名の `UniqueConstraint::new` を渡す場合も一貫して
     // 動く（冪等: 既に実名を持つ制約には作用しない）。
     let schema = assign_unique_constraint_names(schema.clone());
+    // `FOREIGN KEY` の名前未確定（空名）分を確定する（設計 F2・Issue #1069）。
+    // UNIQUE 名の確定より後に呼ぶ（`used` に確定済みの UNIQUE 名を含めるため。
+    // `assign_foreign_key_constraint_names` ドキュメント参照）。
+    let schema = assign_foreign_key_constraint_names(schema);
     let schema = &schema;
     validate_schema(schema)?;
     let has_default = schema.columns.iter().any(|c| c.default.is_some());
@@ -4272,8 +4760,84 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             || fk.match_type() != ForeignKeyMatch::Simple
             || fk.deferrability() != ForeignKeyDeferrability::NotDeferrable
     });
+    // v12 選択条件（設計 F4・Issue #1069）: 実名が既定名導出と 1 つでも食い違う
+    // `FOREIGN KEY` を持つスキーマのみ v12 で書く。名前を明示しない
+    // `CREATE TABLE`・`ALTER TABLE ADD FOREIGN KEY` は常に既定名と一致するため
+    // v8〜v11 のバイト列は変わらない（既存ゴールデンテスト不変）。
+    let has_named_fk = has_fk && {
+        let columns_per_constraint: Vec<Vec<String>> = schema
+            .foreign_keys
+            .iter()
+            .map(|f| f.columns().to_vec())
+            .collect();
+        let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+        used.extend(
+            schema
+                .unique_constraints
+                .iter()
+                .map(|u| u.name().to_string()),
+        );
+        let derived =
+            derive_foreign_key_constraint_names(&schema.name, &columns_per_constraint, &used);
+        schema
+            .foreign_keys
+            .iter()
+            .zip(derived.iter())
+            .any(|(fk, derived_name)| fk.name() != derived_name.as_str())
+    };
     let mut out = String::new();
-    if has_named_unique {
+    if has_named_fk {
+        // カタログ v12（設計 F4。TABLE-22・TASK-233、Issue #1069）: v11 の
+        // 上位集合で、`uniq:`／`checks:` セクションは 0 件を許し（この枝へ来る
+        // 判断材料は FK の実名のみで UNIQUE・CHECK の有無とは独立なため）、
+        // `fks:` セクションのみ名前付き 8 フィールドの `fk:` 行
+        // （[`encode_foreign_key_section_v12`]）で書く。
+        out.push_str(CATALOG_FORMAT_VERSION_V12);
+        out.push('\n');
+        out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
+        let pk_field = schema
+            .primary_key
+            .as_ref()
+            .map(|cols| cols.join(","))
+            .unwrap_or_default();
+        out.push_str(&format!("pk:{pk_field}\n"));
+        for slot in schema.physical_slots() {
+            match slot {
+                PhysicalSlot::Live(_, column) => {
+                    let (type_name, param_field) = column.ty.catalog_fields();
+                    out.push_str(&encode_column_line_v5(
+                        &column.name,
+                        type_name,
+                        &param_field,
+                        column.nullable,
+                        'L',
+                        column.default.as_ref(),
+                    )?);
+                }
+                PhysicalSlot::Dropped(dropped) => {
+                    let (type_name, param_field) = dropped.ty().catalog_fields();
+                    out.push_str(&encode_column_line_v5(
+                        dropped.name(),
+                        type_name,
+                        &param_field,
+                        true,
+                        'D',
+                        None,
+                    )?);
+                }
+            }
+        }
+        out.push_str(&format!("uniq:{}\n", schema.unique_constraints.len()));
+        for constraint in &schema.unique_constraints {
+            out.push_str("U:");
+            out.push_str(constraint.name());
+            out.push(':');
+            out.push_str(&constraint.columns().join(","));
+            out.push('\n');
+        }
+        encode_check_section(&mut out, &schema.checks)?;
+        encode_foreign_key_section_v12(&mut out, &schema.foreign_keys)?;
+    } else if has_named_unique {
         // カタログ v10／v11（TABLE-16/17・TASK-204/205、Issue #1067・#1077）:
         // v8 の上位集合で `uniq:` セクションの `U:` 行が `U:<name>:<cols>` の
         // 形になる。この枝に入るのは UNIQUE の実名を持つ場合のみ（`has_fk_options`
@@ -4591,6 +5155,7 @@ fn decode_schema_body(
         V9,
         V10,
         V11,
+        V12,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -4603,6 +5168,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V9 => FormatVersion::V9,
         CATALOG_FORMAT_VERSION_V10 => FormatVersion::V10,
         CATALOG_FORMAT_VERSION_V11 => FormatVersion::V11,
+        CATALOG_FORMAT_VERSION_V12 => FormatVersion::V12,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -4627,8 +5193,9 @@ fn decode_schema_body(
             | FormatVersion::V9
             | FormatVersion::V10
             | FormatVersion::V11
+            | FormatVersion::V12
     );
-    // `pk:` 行を持つのは v4〜v11（v4 は非空必須、v5〜v11 は空を「主キー
+    // `pk:` 行を持つのは v4〜v12（v4 は非空必須、v5〜v12 は空を「主キー
     // なし」として許容する）。
     let has_pk_line = matches!(
         format_version,
@@ -4640,6 +5207,7 @@ fn decode_schema_body(
             | FormatVersion::V9
             | FormatVersion::V10
             | FormatVersion::V11
+            | FormatVersion::V12
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -4878,6 +5446,13 @@ fn decode_schema_body(
             .into_iter()
             .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
             .collect(),
+        // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
+        // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
+        FormatVersion::V12 => parse_unique_section(&mut lines, true, true)
+            .map_err(CatalogError::Invalid)?
+            .into_iter()
+            .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
+            .collect(),
         _ => Vec::new(),
     };
     // v7 専用の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。構造は
@@ -4888,7 +5463,8 @@ fn decode_schema_body(
         | FormatVersion::V8
         | FormatVersion::V9
         | FormatVersion::V10
-        | FormatVersion::V11 => {
+        | FormatVersion::V11
+        | FormatVersion::V12 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -4914,6 +5490,9 @@ fn decode_schema_body(
         }
         FormatVersion::V11 => {
             parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::Invalid)?
+        }
+        FormatVersion::V12 => {
+            parse_foreign_key_section_v12(&mut lines).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
     };
@@ -4944,10 +5523,22 @@ fn decode_schema_body(
     // （設計 D2・Issue #1067）。v10／v11 はすでに実名を持つため素通しする
     // （`assign_unique_constraint_names` は空名の制約にのみ作用するため
     // 呼んでも安全だが、意図を明示するため分岐する）。
-    let schema = if matches!(format_version, FormatVersion::V10 | FormatVersion::V11) {
+    let schema = if matches!(
+        format_version,
+        FormatVersion::V10 | FormatVersion::V11 | FormatVersion::V12
+    ) {
         schema
     } else {
         assign_unique_constraint_names(schema)
+    };
+    // v8〜v11（名前の無い FOREIGN KEY）は decode 時に既定名を導出する（設計
+    // F3・Issue #1069）。v12 はすでに実名を持つため素通しする
+    // （`assign_foreign_key_constraint_names` は空名の制約にのみ作用するため
+    // 呼んでも安全だが、意図を明示するため分岐する）。
+    let schema = if format_version == FormatVersion::V12 {
+        schema
+    } else {
+        assign_foreign_key_constraint_names(schema)
     };
     // デコード結果を再度検証する（列数上限・列名重複・識別子・墓標の不変条件）。
     // 手書きの不正データがフィールドごとの検証をすり抜けても、スキーマ全体の
@@ -5744,8 +6335,9 @@ impl Storage {
     ///
     /// 判定順序（設計 D7。fail-closed）: (1) 明示名の識別子妥当性・列リストの
     /// 構造（空・重複・上限超過）は呼び出し元（構文段）が検証済みの前提 (2)
-    /// テーブル取得（`TableNotFound`） (3) 明示名の衝突（既存 UNIQUE・CHECK
-    /// 制約名との重複。`ConstraintAlreadyExists`） (4) 制約数上限
+    /// テーブル取得（`TableNotFound`） (3) 明示名の衝突（既存 UNIQUE・CHECK・
+    /// FOREIGN KEY 制約名との重複。設計 F1・Issue #1069。
+    /// `ConstraintAlreadyExists`） (4) 制約数上限
     /// （`ConstraintLimitExceeded`） (5) 名前確定後のスキーマとして
     /// [`validate_schema`]（未宣言列・対象外型・同一列リスト重複は
     /// `CatalogError::Invalid`） (6) 対象テーブルの**全行**（`Public`／
@@ -5779,12 +6371,16 @@ impl Storage {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             let new_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
 
-            // 明示名の衝突は既定名導出より前に判定する（同名の UNIQUE・CHECK が
-            // 既にあるテーブルへ、その名前を明示指定して追加しようとした場合を
-            // 確実に拒否するため）。
+            // 明示名の衝突は既定名導出より前に判定する（同名の UNIQUE・CHECK・
+            // FOREIGN KEY が既にあるテーブルへ、その名前を明示指定して追加
+            // しようとした場合を確実に拒否するため）。`FOREIGN KEY` 制約名も
+            // 同じテーブル単位の名前空間を共有する（設計 F1。TABLE-22・
+            // TASK-233、Issue #1069。`alter_table_add_foreign_key` の対称
+            // チェックと同じ判定）。
             if let Some(n) = name {
                 let collides = schema.unique_constraints.iter().any(|u| u.name() == n)
-                    || schema.checks.iter().any(|c| c.name == n);
+                    || schema.checks.iter().any(|c| c.name == n)
+                    || schema.foreign_keys.iter().any(|f| f.name() == n);
                 if collides {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
@@ -5863,7 +6459,11 @@ impl Storage {
     /// 要素・参照列抽出・正規化レンダリング・往復一致。スナップショットではなく
     /// in-txn のスキーマで検証することで、検証と追加の間に `DROP COLUMN` 等が
     /// 挟まる TOCTOU を防ぐ） (5) 名前確定（明示名、または省略時は設計 D2 の
-    /// 既定名——既存 UNIQUE 実名 ∪ 既存 CHECK 実名を避けて解決する）
+    /// 既定名——既存 UNIQUE 実名 ∪ 既存 CHECK 実名 ∪ 既存 FOREIGN KEY 実名を
+    /// 避けて解決する。FOREIGN KEY 名も同じテーブル単位の名前空間を共有する
+    /// ため〔設計 F1。TABLE-22・TASK-233、Issue #1069。`alter_table_add_
+    /// named_unique_constraint`／`alter_table_add_foreign_key` の対称
+    /// チェックと同じ判定〕）
     /// (6) 追加後スキーマの `validate_schema`（`encode_schema` 内）
     /// (7) **新しい CHECK 1 件だけ**をコンパイルして対象テーブルの既存行
     /// **全件**（全テナント・`Public`／`Private` を問わない。DDL はテナント
@@ -5893,12 +6493,15 @@ impl Storage {
 
             // 明示名の衝突は意味論検証・件数上限より前に判定する（UNIQUE の
             // `alter_table_add_named_unique_constraint` と同じ順序）。
+            // FOREIGN KEY 名も同じテーブル単位の名前空間を共有するため衝突
+            // 対象に含める（設計 F1。TABLE-22・TASK-233、Issue #1069）。
             if let Some(n) = &parsed.name {
                 let collides = schema
                     .unique_constraints
                     .iter()
                     .any(|u| u.name() == n.as_str())
-                    || schema.checks.iter().any(|c| &c.name == n);
+                    || schema.checks.iter().any(|c| &c.name == n)
+                    || schema.foreign_keys.iter().any(|f| f.name() == n.as_str());
                 if collides {
                     return Err(AlterCheckError::Catalog(
                         CatalogError::ConstraintAlreadyExists(n.clone()),
@@ -5922,6 +6525,11 @@ impl Storage {
                         .map(|u| u.name().to_string())
                         .collect();
                     used.extend(schema.checks.iter().map(|c| c.name.clone()));
+                    // FOREIGN KEY 名も同じ名前空間を共有するため既定名の衝突
+                    // 回避対象に含める（設計 F1。UNIQUE・FOREIGN KEY の既定名
+                    // 導出〔`assign_unique_constraint_names`／
+                    // `assign_foreign_key_constraint_names`〕と対称）。
+                    used.extend(schema.foreign_keys.iter().map(|f| f.name().to_string()));
                     crate::sql::check_constraint::default_alter_table_check_name(table_name, &used)
                 }
             };
@@ -5979,34 +6587,192 @@ impl Storage {
         Ok(confirmed_name)
     }
 
-    /// 既存テーブルの UNIQUE・CHECK 制約を名前で削除する（SQL-23・TASK-204、
-    /// Issue #1067。CHECK 対応は Issue #1068。`ALTER TABLE ... DROP CONSTRAINT
-    /// <name>`）。名前空間はテーブル単位で UNIQUE・CHECK が共有する（設計 D1・
-    /// D2）ため、まず UNIQUE を検索し、無ければ CHECK を検索する。
+    /// 既存テーブルへ（任意で名前付きの）`FOREIGN KEY` 制約を追加する
+    /// （TABLE-22・TASK-233、Issue #1069。SQL 表層
+    /// `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...`
+    /// の実行本体。`pub(crate)`: 宣言面は SQL 表層のみで、`ForeignKeyDef::new`・
+    /// `with_foreign_keys` が crate 内限定のため。設計 F11）。`name` が `None`
+    /// のときは設計 F2 の規則で既定名を確定する
+    /// （[`assign_foreign_key_constraint_names`]）。
     ///
-    /// 判定順序（設計 D5・D7。fail-closed）: (1) テーブル取得（`TableNotFound`）
-    /// (2) 名前の検索——UNIQUE になければ CHECK を確認し、どちらにも無ければ
-    /// `ConstraintNotFound` (3) **UNIQUE** の場合のみ、削除対象の列集合を他の
-    /// `FOREIGN KEY` 宣言（自己参照を含む。[`referencing_foreign_keys_in_txn`]）の
-    /// `parent_columns` の**集合**が覆っていれば `DependentObjectsStillExist`
-    /// （`2BP01`。主キーや他の UNIQUE が同じ集合を覆っていても救済せず拒否する）。
-    /// **CHECK** には FK 依存が無いため、この検査は行わない（Issue #1068 設計
-    /// D5） (4) カタログを書き換えて世代を bump する。
+    /// 判定順序（設計 F7。fail-closed）:
+    /// 1. 明示名の識別子妥当性・宣言の構造は呼び出し元（構文段）が検証済みの
+    ///    前提
+    /// 2. 対象テーブル（子）の取得（`TableNotFound`）
+    /// 3. 明示名の衝突（既存 UNIQUE・CHECK・FOREIGN KEY 制約名との重複。
+    ///    設計 F1。`ConstraintAlreadyExists`）
+    /// 4. FK 件数上限（`ConstraintLimitExceeded`）
+    /// 5. 参照先の解決（ビュー・索引なら `WrongObjectKind`、不在なら
+    ///    `TableNotFound`。自己参照は変更前の子スキーマ自身を親として解決する
+    ///    ——親の列・主キー・UNIQUE 制約は今回の FK 追加で変わらないため）・
+    ///    `resolve_foreign_key_target` の照合（`InvalidForeignKey`）
+    /// 6. 名前確定後の更新後スキーマとして `validate_schema`
+    /// 7. 索引衛生（子表・親表の stale 索引を検証**前**に捨てる。§3.4・
+    ///    P0。`key_index::prune_unneeded_indexes_in_txn`）
+    /// 8. 対象テーブルの**全テナント**の既存行を、各テナント内に閉じた判定で
+    ///    検証する（[`crate::constraint::verify_new_foreign_key_all_tenants_in_txn`]。
+    ///    1 行でも違反があれば `Err(CatalogError::ForeignKeyViolation)` で
+    ///    副作用ゼロに拒否する。RLS-9・RLS-10 (c)）
+    /// 9. カタログを書き換えて子テーブルの世代を bump する。
+    ///
+    /// 成功時は確定した制約名を返す（`alter_table_add_named_unique_constraint`
+    /// と同じ契約。SQL 表層の `AlterTableAction::AddConstraint` 応答に使う）。
+    pub(crate) fn alter_table_add_foreign_key(
+        &self,
+        table_name: &str,
+        name: Option<&str>,
+        foreign_key: ForeignKeyDef,
+    ) -> Result<String> {
+        validate_identifier(table_name)?;
+        if let Some(n) = name {
+            validate_identifier(n)?;
+        }
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let confirmed_name;
+        let parent_table_name;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+
+            if let Some(n) = name {
+                let collides = schema.unique_constraints.iter().any(|u| u.name() == n)
+                    || schema.checks.iter().any(|c| c.name == n)
+                    || schema.foreign_keys.iter().any(|f| f.name() == n);
+                if collides {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
+            }
+            if schema.foreign_keys.len() >= MAX_FOREIGN_KEYS_PER_TABLE {
+                return Err(CatalogError::ConstraintLimitExceeded(format!(
+                    "table {table_name} already has {MAX_FOREIGN_KEYS_PER_TABLE} foreign keys"
+                )));
+            }
+
+            let fk_declared = match name {
+                Some(n) => foreign_key.with_name(n.to_string()),
+                None => foreign_key,
+            };
+            parent_table_name = fk_declared.parent_table().to_string();
+
+            // 参照先の解決（[`resolve_foreign_keys_in_txn`] と同じ判定だが、
+            // 単一の新 FK に限定して適用する）。自己参照は変更前の `schema`
+            // 自身を親として解決してよい——`resolve_foreign_key_target` は親の
+            // 列・主キー・UNIQUE 制約しか参照せず、親の `foreign_keys` は
+            // 見ないため（今回追加する FK 自体が親の列定義に影響しない）。
+            let owned_parent;
+            let parent: &TableSchema = if parent_table_name == schema.name {
+                &schema
+            } else {
+                match write_txn.open_table(VIEWS_TABLE) {
+                    Ok(views_table) => {
+                        if views_table.get(parent_table_name.as_str())?.is_some() {
+                            return Err(CatalogError::WrongObjectKind(parent_table_name.clone()));
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(e) => return Err(CatalogError::from(e)),
+                }
+                if index_name_exists_in_txn(&write_txn, parent_table_name.as_str())? {
+                    return Err(CatalogError::WrongObjectKind(parent_table_name.clone()));
+                }
+                owned_parent = require_table_schema_write(&write_txn, &parent_table_name)?;
+                &owned_parent
+            };
+            let resolved = resolve_foreign_key_target(&schema, &fk_declared, parent)?;
+
+            let mut fks = schema.foreign_keys.clone();
+            fks.push(resolved);
+            let updated =
+                assign_foreign_key_constraint_names(schema.clone().with_foreign_keys(fks));
+            validate_schema(&updated)?;
+            let final_fk =
+                updated.foreign_keys.last().cloned().ok_or_else(|| {
+                    CatalogError::Invalid("foreign key was not appended".to_string())
+                })?;
+            confirmed_name = final_fk.name().to_string();
+
+            // 索引衛生（P0・設計 §3.4）: 検証に使う索引を信用する前に、子表・
+            // 親表それぞれの stale 索引（他の DROP で登録簿に残ったまま以後
+            // 同期されなくなった索引）を、まだ新 FK を含まない現在のカタログ
+            // から求めた「本当に必要な索引名」で刈り込む。
+            let required_child = required_key_index_names_in_txn(&write_txn, table_name)?;
+            crate::key_index::prune_unneeded_indexes_in_txn(
+                &write_txn,
+                table_name,
+                &required_child,
+            )?;
+            if parent_table_name != table_name {
+                let required_parent =
+                    required_key_index_names_in_txn(&write_txn, &parent_table_name)?;
+                crate::key_index::prune_unneeded_indexes_in_txn(
+                    &write_txn,
+                    &parent_table_name,
+                    &required_parent,
+                )?;
+            }
+
+            // 全テナントの既存行検証（RLS-9・RLS-10 (c)）。違反があれば副作用
+            // ゼロで拒否する（write_txn は commit しない）。
+            crate::constraint::verify_new_foreign_key_all_tenants_in_txn(
+                &write_txn,
+                &parent_table_name,
+                parent,
+                &updated,
+                &final_fk,
+            )
+            .map_err(|e| match e {
+                crate::tenant::TenantWriteError::ForeignKeyViolation => {
+                    CatalogError::ForeignKeyViolation
+                }
+                crate::tenant::TenantWriteError::Catalog(e) => e,
+                _ => CatalogError::Invalid(
+                    "foreign key verification failed unexpectedly".to_string(),
+                ),
+            })?;
+
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(confirmed_name)
+    }
+
+    /// 既存テーブルの UNIQUE・FOREIGN KEY・CHECK 制約を名前で削除する（SQL-23・
+    /// TASK-204・TABLE-22・TASK-233、Issue #1067・#1068・#1069。
+    /// `ALTER TABLE ... DROP CONSTRAINT <name>`）。名前空間はテーブル単位で
+    /// UNIQUE・CHECK・FOREIGN KEY が共有する（設計 D1・D2・F1）ため、
+    /// UNIQUE → FOREIGN KEY → CHECK の順（設計 F8 を拡張）で検索する。
+    ///
+    /// 判定順序（設計 D5・D7・F7・F8。fail-closed）: (1) テーブル取得
+    /// （`TableNotFound`） (2) 名前の検索——UNIQUE → FOREIGN KEY → CHECK の順。
+    /// どれにも無ければ `ConstraintNotFound` (3) **UNIQUE** 削除時のみ:
+    /// 削除対象の列集合を他の `FOREIGN KEY` 宣言（自己参照を含む。
+    /// [`referencing_foreign_keys_in_txn`]）の `parent_columns` の**集合**が
+    /// 覆っていれば `DependentObjectsStillExist`（`2BP01`。主キーや他の
+    /// UNIQUE が同じ集合を覆っていても救済せず拒否する）。**FOREIGN KEY**・
+    /// **CHECK** の削除は既存行・他制約への依存を持ち得ないためこの検査は
+    /// 行わない（Issue #1068 設計 D5・Issue #1069 設計 F8） (4) カタログを
+    /// 書き換える (5) 索引衛生（P0・設計 §3.4）: 削除後のカタログから求めた
+    /// 「本当に必要な索引名」で、子表（UNIQUE 削除時はこの表自身も対象。他表の
+    /// FK が参照しうるため）・FOREIGN KEY 削除時は親表の stale 索引を刈り込む
+    /// (6) 世代を bump する。
     pub fn alter_table_drop_constraint(&self, table_name: &str, name: &str) -> Result<()> {
         validate_identifier(table_name)?;
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let mut dropped_fk_parent_table: Option<String> = None;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
-            let target_index = schema
+            let unique_index = schema
                 .unique_constraints
                 .iter()
                 .position(|u| u.name() == name);
-            let updated = if let Some(target_index) = target_index {
-                // `.position()` の戻り値をそのまま添字アクセスせず `.get()` を
-                // 使う（coding-rust.md「受信データ経路では添字アクセス禁止」の
-                // 文言遵守。同一 Vec を同一トランザクション内で即座に参照する
-                // ため実際には常に Some だが、fail-closed の作法として明示的に
+            let updated = if let Some(target_index) = unique_index {
+                // `.position()` の戻り値をそのまま添字アクセスせず `.get()` を使う
+                // （coding-rust.md「受信データ経路では添字アクセス禁止」の文言
+                // 遵守。同一 Vec を同一トランザクション内で即座に参照するため
+                // 実際には常に Some だが、fail-closed の作法として明示的に
                 // 処理する）。
                 let target_columns: Vec<String> = schema
                     .unique_constraints
@@ -6019,8 +6785,8 @@ impl Storage {
                     .columns()
                     .to_vec();
 
-                // FK 依存検査（自己参照を含む）: `parent_columns` の集合が削除
-                // 対象の列集合と一致する宣言が 1 件でもあれば拒否する。
+                // FK 依存検査（自己参照を含む）: `parent_columns` の集合が削除対象の
+                // 列集合と一致する宣言が 1 件でもあれば拒否する。
                 let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
                 let target_set: std::collections::HashSet<&str> =
                     target_columns.iter().map(|s| s.as_str()).collect();
@@ -6035,7 +6801,22 @@ impl Storage {
                 let mut constraints = schema.unique_constraints.clone();
                 constraints.remove(target_index);
                 schema.clone().with_unique_constraints(constraints)
+            } else if let Some(fk_index) = schema.foreign_keys.iter().position(|f| f.name() == name)
+            {
+                // FOREIGN KEY の削除（設計 F8）: 既存行は変更しない。索引衛生は
+                // カタログ書き換え後にまとめて行う（下記）。
+                let fk = schema.foreign_keys.get(fk_index).ok_or_else(|| {
+                    CatalogError::CorruptSchema(format!(
+                        "foreign key index out of range for table {table_name}"
+                    ))
+                })?;
+                dropped_fk_parent_table = Some(fk.parent_table().to_string());
+                let mut fks = schema.foreign_keys.clone();
+                fks.remove(fk_index);
+                schema.clone().with_foreign_keys(fks)
             } else {
+                // CHECK の削除（Issue #1068 設計 D5）: UNIQUE・FOREIGN KEY と
+                // 異なり他制約からの依存を持ち得ないため依存検査は不要。
                 let check_index = schema.checks.iter().position(|c| c.name == name);
                 let Some(check_index) = check_index else {
                     return Err(CatalogError::ConstraintNotFound(name.to_string()));
@@ -6044,9 +6825,31 @@ impl Storage {
                 checks.remove(check_index);
                 schema.clone().with_checks(checks)
             };
+
             let encoded = encode_schema(&updated)?;
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        // 索引衛生（P0・設計 §3.4）: カタログ書き換え後（＝索引の要否判定が
+        // 「削除後」の状態を見る）に、影響を受けうる表の stale 索引を刈り込む。
+        // `table_name` 自身の登録簿は「他表の FK がこの表を参照する索引」
+        // （UNIQUE 削除で他表の FK が UNIQUE 列を参照しうる）と「この表自身が
+        // 宣言する FOREIGN KEY の子側索引」の両方を含む（`required_key_index_
+        // names_in_txn` 参照。子側索引を見落とすと、今回削除した制約とは無関係な
+        // 他の FOREIGN KEY の子側索引まで巻き添えで削除する fail-open になる。
+        // Cursor codex P2 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6muWhg`）。
+        // FOREIGN KEY 削除時は削除した FK の参照先（親）表側も同様に対象にする。
+        let required_self = required_key_index_names_in_txn(&write_txn, table_name)?;
+        crate::key_index::prune_unneeded_indexes_in_txn(&write_txn, table_name, &required_self)?;
+        if let Some(parent_table) = &dropped_fk_parent_table {
+            if parent_table != table_name {
+                let required_parent = required_key_index_names_in_txn(&write_txn, parent_table)?;
+                crate::key_index::prune_unneeded_indexes_in_txn(
+                    &write_txn,
+                    parent_table,
+                    &required_parent,
+                )?;
+            }
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
@@ -6436,6 +7239,9 @@ impl Storage {
             index_table.insert(def.name.as_str(), encoded.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, &def.table)?;
+        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
+        // `IndexCatalogGateCache` が古い HNSW 宣言判定を再利用しないようにする）。
+        bump_index_catalog_generation_in_txn(&write_txn)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -6477,6 +7283,9 @@ impl Storage {
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
         bump_table_generation_in_txn(&write_txn, &def.table)?;
+        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
+        // `Storage::create_index` と同じ）。
+        bump_index_catalog_generation_in_txn(&write_txn)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -6958,7 +7767,11 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // テーブル存在確認からは到達しない（網羅性のため `Internal` へ丸める）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::ConstraintNotFound(_)
-        | CatalogError::ConstraintLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::ConstraintLimitExceeded(_)
+        // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
+        // TASK-233、Issue #1069）はテーブル存在確認からは到達しない（網羅性の
+        // ため `Internal` へ丸める）。
+        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
         // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
@@ -7085,6 +7898,10 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // v11（Issue #1067・#1077 の統合）は v10 の上位集合で、`fks:` セクションの
         // `fk:` 行のみ 5 フィールドへ拡張する（下記で検証する）。
         CATALOG_FORMAT_VERSION_V11 => (true, true),
+        // v12（設計 F4・Issue #1069）は v11 の上位集合で、`uniq:`／`checks:`
+        // セクションが 0 件を許すようになり、`fks:` セクションの `fk:` 行が
+        // 名前付き 8 フィールドへ拡張する（下記で検証する）。
+        CATALOG_FORMAT_VERSION_V12 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -7099,7 +7916,9 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     let is_v9 = version_line == CATALOG_FORMAT_VERSION_V9;
     let is_v10 = version_line == CATALOG_FORMAT_VERSION_V10;
     let is_v11 = version_line == CATALOG_FORMAT_VERSION_V11;
-    let has_pk_line = is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11;
+    let is_v12 = version_line == CATALOG_FORMAT_VERSION_V12;
+    let has_pk_line =
+        is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -7288,6 +8107,10 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // カタログが本関数だけ「依存なし」に丸められ、ENUM 依存判定の
         // fail-closed 判定が `validate_schema` 側と食い違う）。
         parse_unique_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
+    } else if is_v12 {
+        // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
+        // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
+        parse_unique_section(&mut lines, true, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
@@ -7296,8 +8119,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     // 飛ばすと壊れたセクションを持つカタログが本関数だけ「依存なし」に丸め
     // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
     // 参照列の実在・制約名の一意性も下で検証する。
-    let checks: Vec<CheckConstraint> = if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 {
-        parse_check_section(&mut lines, is_v8 || is_v9 || is_v10 || is_v11)
+    let checks: Vec<CheckConstraint> = if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 {
+        parse_check_section(&mut lines, is_v8 || is_v9 || is_v10 || is_v11 || is_v12)
             .map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
@@ -7319,6 +8142,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         parse_foreign_key_section(&mut lines, true, false).map_err(CatalogError::CorruptSchema)?
     } else if is_v11 {
         parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
+    } else if is_v12 {
+        parse_foreign_key_section_v12(&mut lines).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
@@ -7432,6 +8257,38 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         }
     }
 
+    // `FOREIGN KEY` 名も UNIQUE・CHECK と同じ名前空間を共有する（設計 F1・
+    // Issue #1069）。v12 の `foreign_keys` は名前を持つため、ここで FK 同士・
+    // CHECK・UNIQUE との衝突も検査する（`validate_schema` と同じ fail-closed
+    // 判定を本関数でも徹底する。codex-review P2 指摘・PR #1147 と同じ理由）。
+    let mut fk_names_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for fk in &foreign_keys {
+        if fk.name().is_empty() {
+            continue;
+        }
+        if !fk_names_seen.insert(fk.name()) {
+            return Err(CatalogError::CorruptSchema(format!(
+                "duplicate foreign key constraint name: {:?}",
+                fk.name()
+            )));
+        }
+        if check_names.contains(fk.name()) {
+            return Err(CatalogError::CorruptSchema(format!(
+                "constraint name {:?} is already used by a CHECK constraint on this table",
+                fk.name()
+            )));
+        }
+        if unique_constraints
+            .iter()
+            .any(|(name, _)| name.as_deref() == Some(fk.name()))
+        {
+            return Err(CatalogError::CorruptSchema(format!(
+                "constraint name {:?} is already used by a UNIQUE constraint on this table",
+                fk.name()
+            )));
+        }
+    }
+
     Ok(found)
 }
 
@@ -7537,16 +8394,14 @@ pub(crate) fn referencing_foreign_keys_in_txn(
     write_txn: &redb::WriteTransaction,
     parent_table: &str,
 ) -> Result<Vec<(TableSchema, ForeignKeyDef)>> {
-    let v8_prefix = format!("{CATALOG_FORMAT_VERSION_V8}\n");
-    // v9（Issue #1077）も `FOREIGN KEY` 宣言（`fks:` セクション）を持ちうる
-    // 上位集合フォーマットのため、v8 の接頭辞だけを候補にすると v9 で書かれた
-    // FK 付きスキーマが `DROP TABLE` の `2BP01` 判定・参照先側の書き込み検査
-    // （`constraint::enforce_referencing_rows_in_txn`）の双方から見落とされる
-    // fail-open になる（advisor 指摘）。v10（Issue #1067）・v11（Issue #1067・
-    // #1077 の統合）も同じ理由で候補に加える。
-    let v9_prefix = format!("{CATALOG_FORMAT_VERSION_V9}\n");
-    let v10_prefix = format!("{CATALOG_FORMAT_VERSION_V10}\n");
-    let v11_prefix = format!("{CATALOG_FORMAT_VERSION_V11}\n");
+    // FK を持ちうる全版の接頭辞（[`FK_BEARING_FORMAT_VERSIONS`]）を候補にする。
+    // 新しい FK 保持版（v12 等）を追加した際にここを見落とすと、`DROP TABLE` の
+    // `2BP01` 判定・参照先側の書き込み検査（`constraint::enforce_referencing_rows_in_txn`）
+    // の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
+    let prefixes: Vec<Vec<u8>> = FK_BEARING_FORMAT_VERSIONS
+        .iter()
+        .map(|v| format!("{v}\n").into_bytes())
+        .collect();
     let candidates: Vec<(String, Vec<u8>)> = {
         let table = match write_txn.open_table(CATALOG_TABLE) {
             Ok(t) => t,
@@ -7556,11 +8411,7 @@ pub(crate) fn referencing_foreign_keys_in_txn(
         let mut candidates = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            if !value.value().starts_with(v8_prefix.as_bytes())
-                && !value.value().starts_with(v9_prefix.as_bytes())
-                && !value.value().starts_with(v10_prefix.as_bytes())
-                && !value.value().starts_with(v11_prefix.as_bytes())
-            {
+            if !prefixes.iter().any(|p| value.value().starts_with(p)) {
                 continue;
             }
             if candidates.len() >= MAX_LIST_TABLES {
@@ -7583,6 +8434,77 @@ pub(crate) fn referencing_foreign_keys_in_txn(
         }
     }
     Ok(referencing)
+}
+
+/// テーブル `table` の永続キー索引登録簿（`key_index.rs` の登録簿で
+/// `table` をキーに持つエントリ群）に本当に必要な索引名の集合を求める
+/// （P0・Issue #1069・#1071。設計 §3.4「索引衛生」）。
+///
+/// `key_index.rs` の索引は 2 通りの構築契機を持ち、いずれも登録簿の
+/// `table` キーには「索引を物理的に持つテーブル自身」が入る。**`id` 参照の
+/// 扱いが親側・子側で非対称**である点に注意（Cursor Bugbot Medium・codex P2
+/// 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6mu1xV`・`PRRT_kwDOUAKASM6mu2fh`。
+/// 下記 2 種の索引を混同して両方に同じ「`id` 参照は除外」フィルタを掛けると、
+/// 子側索引を誤って取りこぼす）:
+///
+/// - **親側索引**（`id` 参照は対象外）: `table` を参照する他テーブル
+///   （自己参照時は `table` 自身）の列参照 `FOREIGN KEY` の参照先列
+///   （`fk.parent_columns()`）から構築する（`constraint::verify_required_
+///   parent_keys` 等が `ensure_index_in_txn` を `table = fk.parent_table()`
+///   で呼ぶ契約）。`id` 参照 FK は物理キーの点照会（`parent_id_key_bytes`）
+///   で検査し、`table` 自身の索引を使わないため除外する。
+///   [`referencing_foreign_keys_in_txn`] が返す「`table` を参照する FK」
+///   から求める。
+/// - **子側索引**（`id` 参照も対象）: `table` 自身が宣言する `FOREIGN KEY`
+///   の参照元列（`fk.columns()`。子テーブル自身の列）から構築する
+///   （`constraint::enforce_referencing_rows_in_txn` が `ensure_index_in_txn`
+///   を `table = child_schema.name`（＝ FK 宣言側自身）で呼ぶ契約。**`id`
+///   参照 FK でも**構築する——親 `id` 行の削除時は
+///   `key_index::none_referenced_in_txn` が `parent_id_key_bytes` で
+///   エンコードした親 `id` 値を `table` 自身の参照元列索引と突き合わせる
+///   ため、子側だけは `id` 参照を除外してはならない）。`table` の現在の
+///   カタログ（[`require_table_schema_write`]）の `foreign_keys` から
+///   （`id` 参照を含めて）求める。
+///
+/// 呼び出し元はこの集合の外にある登録簿エントリを
+/// [`crate::key_index::prune_unneeded_indexes_in_txn`] で刈り込む契約のため、
+/// 子側索引（`id` 参照分を含む）をこの集合へ含め忘れると、`table` が持つ
+/// **別の** `FOREIGN KEY` の子側索引を ADD/DROP CONSTRAINT の巻き添えで
+/// 削除してしまう（修正前の挙動。参照整合性の判定自体は
+/// `key_index::none_referenced_in_txn` が未登録を検出して安全側の全行走査へ
+/// フォールバックするため fail-open にはならないが、以後の親行削除・更新の
+/// たびにその FK が索引未登録と誤認されて全行走査・索引再構築を繰り返し、
+/// Issue #1071 の索引化による計算量改善が効かなくなる性能劣化になる）。
+///
+/// [`Storage::alter_table_drop_constraint`]（UNIQUE・FOREIGN KEY いずれの削除
+/// でも、削除後のカタログに対して呼ぶ）・[`Storage::alter_table_add_foreign_key`]
+/// （新 FK の検証**前**に、まだ新 FK を含まない現在のカタログに対して呼ぶ）が
+/// 使う。呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと
+/// （[`referencing_foreign_keys_in_txn`]・[`require_table_schema_write`] と
+/// 同じ契約）。
+pub(crate) fn required_key_index_names_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    // 親側索引: `id` 参照 FK は `table` 自身の索引を使わないため除外する。
+    let referencing = referencing_foreign_keys_in_txn(write_txn, table)?;
+    let mut names: std::collections::BTreeSet<String> = referencing
+        .iter()
+        .filter(|(_, fk)| !fk.references_parent_id())
+        .map(|(_, fk)| crate::key_index::index_name_for_columns(fk.parent_columns()))
+        .collect();
+    // 子側索引: `id` 参照 FK も `table` 自身の参照元列索引を構築・使用する
+    // ため除外しない（`constraint::enforce_referencing_rows_in_txn` の
+    // `fk.references_parent_id()` 分岐が `none_referenced_in_txn` 経由で
+    // 同じ索引を照会する）。
+    let own_schema = require_table_schema_write(write_txn, table)?;
+    names.extend(
+        own_schema
+            .foreign_keys
+            .iter()
+            .map(|fk| crate::key_index::index_name_for_columns(fk.columns())),
+    );
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -7687,10 +8609,11 @@ mod tests {
                 .insert("idx_corrupt", &b"\xff\xfe"[..])
                 .expect("insert corrupt entry");
         }
-        // 本番の書き込み経路と同じくストレージ全体世代を進める（進めないと
-        // `IndexCatalogGateCache` が破損前の検証成功を同一世代として再利用する。
-        // 本番の索引カタログ変更経路はいずれも commit 前に世代を進める）。
-        crate::storage::prepare_generation_bump(&write_txn).expect("bump generation");
+        // 本番の索引カタログ書き込み経路（`create_index`・`drop_index`・
+        // `retain_index_defs_in_txn`）と同じく専用世代を進める（Issue #1154。
+        // 進めないと `IndexCatalogGateCache` が破損前の検証成功を同一世代として
+        // 再利用する）。
+        bump_index_catalog_generation_in_txn(&write_txn).expect("bump generation");
         write_txn.commit().expect("commit corrupt entry");
     }
 
@@ -7842,6 +8765,60 @@ mod tests {
         assert_eq!(gate_cache.stats().gate_read_failures, 2);
     }
 
+    /// [`explain_index_names_in_txn`] が空カタログで空の `Ok` を返すことを
+    /// 固定する（Issue #1066）。
+    #[test]
+    fn explain_index_names_in_txn_empty_catalog_returns_empty() {
+        let (storage, _guard) = index_fixture_storage("explain-index-names-empty");
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let decls = explain_index_names_in_txn(&read_txn, "docs").expect("read decls");
+        assert!(decls.hnsw.is_empty());
+        assert!(decls.scalar.is_empty());
+    }
+
+    /// [`explain_index_names_in_txn`] が種別ごとに振り分け、他テーブルの宣言を
+    /// 混ぜないことを固定する（Issue #1066）。
+    #[test]
+    fn explain_index_names_in_txn_splits_by_kind_and_table() {
+        let (storage, _guard) = index_fixture_storage("explain-index-names-split");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        storage
+            .create_index(&scalar_def("idx_lang", "docs", &["lang"]))
+            .expect("create scalar index");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_sibling", "sibling"))
+            .expect("create hnsw index on sibling");
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let decls = explain_index_names_in_txn(&read_txn, "docs").expect("read decls");
+        assert_eq!(decls.hnsw, vec!["idx_hnsw_docs".to_string()]);
+        assert_eq!(
+            decls.scalar,
+            vec![("idx_lang".to_string(), vec!["lang".to_string()])]
+        );
+
+        let sibling_decls = explain_index_names_in_txn(&read_txn, "sibling").expect("read decls");
+        assert_eq!(sibling_decls.hnsw, vec!["idx_hnsw_sibling".to_string()]);
+        assert!(sibling_decls.scalar.is_empty());
+    }
+
+    /// [`explain_index_names_in_txn`] がカタログ破損（デコード失敗）で `Err` を
+    /// 返すことを固定する（Issue #1066。呼び出し元 `core.rs` は「名前を出さない」
+    /// へ fail-closed に倒す）。
+    #[test]
+    fn explain_index_names_in_txn_fails_closed_on_corrupt_catalog_entry() {
+        let (storage, _guard) = index_fixture_storage("explain-index-names-corrupt");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        insert_corrupt_index_entry(&storage);
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(explain_index_names_in_txn(&read_txn, "docs").is_err());
+    }
+
     /// クエリが使っているのと同一の `read_txn`（スナップショット）を先に開いてから
     /// 別の書き込み（`CREATE INDEX`）が commit されても、その `read_txn` 経由の
     /// 判定は書き込み前のスナップショットのまま変わらないこと（TOCTOU 対策・
@@ -7891,6 +8868,286 @@ mod tests {
             scope,
             true
         ));
+    }
+
+    /// 索引カタログを変更する 4 経路（`create_index`・`drop_index`・`drop_table`・
+    /// `alter_table_drop_column`）がそれぞれ [`index_catalog_generation_in_txn`]
+    /// を進めることを固定する（Issue #1154。取りこぼし防止の回帰テスト）。
+    #[test]
+    fn index_catalog_mutating_paths_bump_index_catalog_generation() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-generation-bump-paths");
+        let read_gen = || -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            index_catalog_generation_in_txn(&read_txn).expect("read index catalog generation")
+        };
+
+        let gen0 = read_gen();
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        let gen1 = read_gen();
+        assert!(
+            gen1 > gen0,
+            "create_index must bump index catalog generation"
+        );
+
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        let gen2 = read_gen();
+        assert!(gen2 > gen1, "drop_index must bump index catalog generation");
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_sibling", "sibling"))
+            .expect("create hnsw index on sibling");
+        let gen3 = read_gen();
+        assert!(
+            gen3 > gen2,
+            "create_index must bump index catalog generation for any table"
+        );
+
+        storage.drop_table("sibling").expect("drop sibling");
+        let gen4 = read_gen();
+        assert!(
+            gen4 > gen3,
+            "drop_table must bump index catalog generation when it removes a declaration"
+        );
+
+        // `alter_table_drop_column` で宣言列を含む索引宣言を消す（`USING hnsw` は
+        // 常に `VECTOR` 列を要求し、`VECTOR` 列自体は `ProtectedColumn` として
+        // drop を拒否されるため、ここではスカラー宣言列で確認する）。
+        storage
+            .create_index(&scalar_def("idx_lang_docs", "docs", &["lang"]))
+            .expect("create scalar index on docs.lang");
+        let gen5 = read_gen();
+        storage
+            .alter_table_drop_column("docs", "lang")
+            .expect("drop lang column");
+        let gen6 = read_gen();
+        assert!(
+            gen6 > gen5,
+            "alter_table_drop_column must bump index catalog generation when it removes a declaration"
+        );
+    }
+
+    /// 通常の行 DML（`insert_typed_row`）や索引と無関係な DDL（`create_table`・
+    /// `alter_table_add_column`）は索引カタログ専用世代を変えない（Issue #1154 の
+    /// 受け入れ条件 1）。ストレージ全体世代（`crate::storage::current_generation_in_txn`）
+    /// は commit のたびに進むことも併せて確認し、テストが自明に真とならないように
+    /// する。
+    #[test]
+    fn non_index_mutations_do_not_bump_index_catalog_generation() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-generation-row-dml");
+        let read_index_gen = || -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            index_catalog_generation_in_txn(&read_txn).expect("read index catalog generation")
+        };
+        let read_storage_gen = || -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            crate::storage::current_generation_in_txn(&read_txn).expect("read storage generation")
+        };
+
+        let index_gen0 = read_index_gen();
+        let storage_gen0 = read_storage_gen();
+
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                crate::storage::Visibility::Public,
+                &[
+                    crate::row_codec::Value::Vector(vec![1.0, 2.0]),
+                    crate::row_codec::Value::Text("ja".to_string()),
+                    crate::row_codec::Value::Null,
+                ],
+            )
+            .expect("insert typed row");
+        storage
+            .alter_table_add_column("sibling", ColumnDef::new("lang", ColumnType::Text, true))
+            .expect("alter table add column");
+        storage
+            .create_table(&TableSchema::new(
+                "unrelated",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create unrelated table");
+
+        assert_eq!(
+            read_index_gen(),
+            index_gen0,
+            "row DML and non-index DDL must not bump the index catalog generation"
+        );
+        assert!(
+            read_storage_gen() > storage_gen0,
+            "the storage-wide generation must still advance on every commit (sanity check)"
+        );
+    }
+
+    /// [`IndexCatalogGateCache`] が行 DML を跨いでヒットし続けること（Issue #1154
+    /// の受け入れ条件 1）。宣言ありのテーブルを 1 回判定した後、無関係な行を
+    /// INSERT しても再判定でカタログを再走査しない（`catalog_scans` が増えない）
+    /// ことを固定する。
+    #[test]
+    fn hnsw_targeted_in_txn_cache_survives_row_dml() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-cache-survives-row-dml");
+        let gate_cache = IndexCatalogGateCache::new();
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        assert_eq!(gate_cache.stats().catalog_scans, 1);
+
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                crate::storage::Visibility::Public,
+                &[
+                    crate::row_codec::Value::Vector(vec![1.0, 2.0]),
+                    crate::row_codec::Value::Text("ja".to_string()),
+                    crate::row_codec::Value::Null,
+                ],
+            )
+            .expect("insert typed row");
+
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        assert_eq!(
+            gate_cache.stats().catalog_scans,
+            1,
+            "a row DML commit must not invalidate the index catalog gate cache"
+        );
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+    }
+
+    /// 索引宣言を変えた直後は古い判定を使い回さないこと（Issue #1154 の受け入れ
+    /// 条件 2・TOCTOU/fail-closed の維持）。`create_index`・`drop_index`・
+    /// `drop_table`＋再作成・`alter_table_drop_column` のいずれも、直前に行 DML を
+    /// 挟んでいても取りこぼさず `catalog_scans` を増やして再判定することを固定
+    /// する。
+    #[test]
+    fn hnsw_targeted_in_txn_cache_does_not_reuse_stale_declaration_after_ddl() {
+        let (storage, _guard) = index_fixture_storage("index-catalog-cache-stale-after-ddl");
+        let gate_cache = IndexCatalogGateCache::new();
+        let insert_row = |id: u64| {
+            storage
+                .insert_typed_row(
+                    "docs",
+                    id,
+                    "tenant-a",
+                    crate::storage::Visibility::Public,
+                    &[
+                        crate::row_codec::Value::Vector(vec![1.0, 2.0]),
+                        crate::row_codec::Value::Text("ja".to_string()),
+                        crate::row_codec::Value::Null,
+                    ],
+                )
+                .expect("insert typed row");
+        };
+
+        // 初回判定（宣言なし）でキャッシュを温める。
+        assert!(!targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        let mut scans = gate_cache.stats().catalog_scans;
+        assert_eq!(scans, 1);
+
+        insert_row(1);
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        assert!(
+            targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "create_index must not be masked by a stale cache entry"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        insert_row(2);
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        assert!(
+            !targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "drop_index must not be masked by a stale cache entry"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        // `drop_table` → 同名テーブル再作成でも古い判定（宣言なし）が残らないこと。
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs_2", "docs"))
+            .expect("re-create hnsw index");
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        storage.drop_table("docs").expect("drop docs");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                    ColumnDef::new("flag", ColumnType::Boolean, true),
+                ],
+            ))
+            .expect("re-create docs");
+        assert!(
+            !targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "drop_table must not leave a stale declared-hnsw judgement for the recreated table"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        // `alter_table_drop_column`（`retain_index_defs_in_txn` 経由。`USING hnsw`
+        // は常に `VECTOR` 列を要求し、`VECTOR` 列自体は `ProtectedColumn` として
+        // drop を拒否されるため HNSW 宣言列そのものは対象にできない。ここでは
+        // 同じコード経路をスカラー宣言で確認し、HNSW 宣言（`idx_hnsw_docs_3`）が
+        // 無関係な列 drop で誤って消えない＝キャッシュを不要に無効化しない
+        // ことも併せて固定する）。
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs_3", "docs"))
+            .expect("create hnsw index for drop-column case");
+        storage
+            .create_index(&scalar_def("idx_lang_docs_3", "docs", &["lang"]))
+            .expect("create scalar index on docs.lang");
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+
+        insert_row(3);
+        storage
+            .alter_table_drop_column("docs", "lang")
+            .expect("drop lang column");
+        assert!(
+            targeted_now(&storage, &gate_cache, "docs", HnswScope::Declared),
+            "dropping an unrelated column must not invalidate the still-declared hnsw judgement"
+        );
+        scans += 1;
+        assert_eq!(gate_cache.stats().catalog_scans, scans);
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
     }
 
     #[test]
@@ -9198,6 +10455,9 @@ mod tests {
             vec![ColumnDef::new("r", ColumnType::Real, true)],
         )
         .with_foreign_keys(vec![fk(&["r"], "parents", &["r"])]);
+        // 直接 `validate_schema` を呼ぶため、`encode_schema` が担う FK 名の
+        // 確定（設計 F2・Issue #1069）を自前で満たす（UNIQUE と同じ前提）。
+        let child = assign_foreign_key_constraint_names(child);
         assert!(matches!(
             validate_schema(&child),
             Err(CatalogError::InvalidForeignKey(_))
@@ -10661,9 +11921,11 @@ mod tests {
             "v8\ncols:2\npk:\nparent_id:bigint:-:1:L:-\ncode:text:-:1:L:-\nuniq:0\nchecks:0\n\
              fks:2\nfk:parent_id:parents:id\nfk:code:countries:code\n"
         );
+        // 名前未指定の FOREIGN KEY は decode 時に既定名を導出する（設計 F3・
+        // Issue #1069）。
         assert_eq!(
             decode_schema("children", &encoded).expect("decode"),
-            with_fk
+            assign_foreign_key_constraint_names(with_fk)
         );
 
         // 主キー・UNIQUE・CHECK・自己参照（主キーを参照）との共存。
@@ -10680,11 +11942,11 @@ mod tests {
         .with_foreign_keys(vec![fk(&["parent_k"], "nodes", &["k"])]);
         let encoded = encode_schema(&full).expect("encode");
         assert!(encoded.starts_with(b"v8\ncols:2\npk:k\n"));
-        // 名前未指定の UNIQUE 制約は decode 時に既定名を導出する（設計 D2・
-        // Issue #1067）。
+        // 名前未指定の UNIQUE・FOREIGN KEY 制約は decode 時に既定名を導出する
+        // （設計 D2・F3・Issue #1067・#1069）。
         assert_eq!(
             decode_schema("nodes", &encoded).expect("decode"),
-            assign_unique_constraint_names(full)
+            assign_foreign_key_constraint_names(assign_unique_constraint_names(full))
         );
 
         // 未解決（参照先列が空）の宣言は永続化しない。
@@ -10719,7 +11981,10 @@ mod tests {
             "v9\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
              fks:1\nfk:parent_id:parents:id:cascade:setnull:simple:immediate\n"
         );
-        assert_eq!(decode_schema("children", &encoded).expect("decode"), schema);
+        assert_eq!(
+            decode_schema("children", &encoded).expect("decode"),
+            assign_foreign_key_constraint_names(schema)
+        );
 
         // 両方 `NO ACTION` は 3 フィールド形のまま（バイト列不変）。
         let no_action = TableSchema::new(
@@ -10909,7 +12174,7 @@ mod tests {
         assert!(encoded.starts_with(b"v8\n"));
         assert_eq!(
             decode_schema("children", &encoded).expect("decode"),
-            all_default
+            assign_foreign_key_constraint_names(all_default)
         );
 
         // 1 件でも既定以外のオプションを持てば v9。
@@ -10933,7 +12198,7 @@ mod tests {
         );
         assert_eq!(
             decode_schema("children", &encoded).expect("decode"),
-            with_options
+            assign_foreign_key_constraint_names(with_options)
         );
     }
 
@@ -11260,7 +12525,10 @@ mod tests {
              U:custom_code_unique:code\nchecks:0\nfks:1\n\
              fk:parent_id:parents:id:noaction:noaction:full:deferred\n"
         );
-        assert_eq!(decode_schema("children", &encoded).expect("decode"), schema);
+        assert_eq!(
+            decode_schema("children", &encoded).expect("decode"),
+            assign_foreign_key_constraint_names(schema)
+        );
     }
 
     /// `CHECK` が参照する列の `DROP COLUMN`・型変更は `DependentObjectsStillExist`

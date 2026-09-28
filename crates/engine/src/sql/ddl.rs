@@ -173,7 +173,11 @@ pub(crate) fn execute_create_table(
         // 未確定名の `UniqueConstraint` を渡す）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::ConstraintNotFound(_)
-        | CatalogError::ConstraintLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::ConstraintLimitExceeded(_)
+        // `ForeignKeyViolation` は `Storage::alter_table_add_foreign_key`
+        // 専用（既存行の走査結果。TABLE-22・TASK-233、Issue #1069）で、
+        // `create_table`（新規テーブル・既存行なし）からは返らない（到達不能）。
+        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
@@ -443,12 +447,12 @@ pub(crate) fn execute_alter_table_add_check(
 }
 
 /// `ParsedSql::AlterTable`（[`crate::sql::allowlist::ValidatedAlterTable`]）の
-/// 唯一の実行入口（Issue #1067・#1068）。`core.rs::EngineCore::
+/// 唯一の実行入口（Issue #1067・#1068・#1069）。`core.rs::EngineCore::
 /// execute_parsed_in_session` から `require_ddl_permission` 通過後に呼ばれ、
-/// 4 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
-/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`）を対応する実行本体へ振り分ける
-/// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチはここと
-/// `core.rs` の管轄という既存の責務分担を維持する）。
+/// 5 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD [CONSTRAINT] FOREIGN KEY`）
+/// を対応する実行本体へ振り分ける（構文の許可リスト判定は `sql::allowlist` の
+/// 管轄、ディスパッチはここと `core.rs` の管轄という既存の責務分担を維持する）。
 pub(crate) fn execute_alter_table(
     storage: &Storage,
     validated: &crate::sql::allowlist::ValidatedAlterTable,
@@ -466,17 +470,69 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::DropConstraint(stmt) => {
             execute_alter_table_drop_constraint(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AddForeignKey(stmt) => {
+            execute_alter_table_add_foreign_key(storage, stmt)
+        }
     }
+}
+
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] FOREIGN KEY (<col>[, ...])
+/// REFERENCES ...` の実行本体（TABLE-22・TASK-233、Issue #1069）。呼び出し元
+/// （`core.rs`）は [`require_ddl_permission`] を必ず先に呼んでいる前提。
+///
+/// 判定順序（決定的。設計 F7）:
+/// 1. 対象テーブル（子）の存在確認（`execute_alter_table_add_column` と同じ
+///    `undefined_table_or_view` 判定。`42P01`／`42809`）
+/// 2. `catalog::Storage::alter_table_add_foreign_key`（単一 write トランザクション内で
+///    名前衝突・件数上限・参照先解決・既存行の参照整合性検証を判定。TOCTOU なし）
+///
+/// 参照先（親）テーブルの不在・種別不一致は `TableNotFound`／`WrongObjectKind`
+/// として返るが、これは**親テーブル名**についての判定であり、子テーブル名の
+/// 判定（上記 1.）とは別物であるため、`map_alter_constraint_error` はエラーが
+/// 運ぶ名前をそのまま使う（子表名で固定しない）。
+pub(crate) fn execute_alter_table_add_foreign_key(
+    storage: &Storage,
+    stmt: &crate::sql::allowlist::ValidatedAlterTableAddForeignKey,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    match storage.get_table_schema(&stmt.table_name) {
+        Ok(_) => {}
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view(storage, &stmt.table_name));
+        }
+        Err(other) => return Err(map_alter_constraint_error(other)),
+    }
+    let confirmed_name = storage
+        .alter_table_add_foreign_key(
+            &stmt.table_name,
+            stmt.constraint_name.as_deref(),
+            stmt.foreign_key.clone(),
+        )
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(name) if name == stmt.table_name => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            other => map_alter_constraint_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AddConstraint {
+            constraint_name: confirmed_name,
+        },
+    })
 }
 
 /// `Storage::alter_table_add_named_unique_constraint`／
 /// `Storage::alter_table_drop_constraint`／`Storage::alter_table_add_check_constraint`
-/// （の `AlterCheckError::Catalog` 内側）の [`CatalogError`] を SQL 表層の
-/// 契約へ写像する（設計 D4・Issue #1067・#1068）。ERR-6 の既存行のみを使い、新しい
-/// `wire_code` は追加しない——制約名衝突は索引名衝突と同じ `42P07`
-/// （[`SqlSurfaceError::DuplicateTable`] を流用）、未検出は `DROP INDEX` と同じ
-/// `42704`（[`SqlSurfaceError::UndefinedObject`]）。エラー文言にテナント・行
-/// 内容・redb 内部詳細は含めない（security.md P0）。
+/// （の `AlterCheckError::Catalog` 内側）／`Storage::alter_table_add_foreign_key`
+/// の [`CatalogError`] を SQL 表層の契約へ写像する（設計 D4・F5、Issue #1067・
+/// #1068・#1069）。ERR-6 の既存行のみを使い、新しい `wire_code` は追加しない——
+/// 制約名衝突は索引名衝突と同じ `42P07`（[`SqlSurfaceError::DuplicateTable`] を
+/// 流用）、未検出は `DROP INDEX` と同じ `42704`
+/// （[`SqlSurfaceError::UndefinedObject`]）、`FOREIGN KEY` の宣言不正は `42830`
+/// （[`SqlSurfaceError::invalid_foreign_key`]。`execute_create_table` と同じ
+/// 写像）、既存行違反は `23503`（[`SqlSurfaceError::ForeignKeyViolation`]。
+/// `TenantWriteError::ForeignKeyViolation` と同じ固定文言）。エラー文言に
+/// テナント・行内容・redb 内部詳細は含めない（security.md P0）。
 fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
@@ -491,6 +547,8 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::DependentObjectsStillExist { name }
         }
         CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
+        CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
+        CatalogError::ForeignKeyViolation => SqlSurfaceError::ForeignKeyViolation,
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
@@ -517,8 +575,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
-        | CatalogError::IndexLimitExceeded(_)
-        | CatalogError::InvalidForeignKey(_) => SqlSurfaceError::Internal {
+        | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
@@ -655,7 +712,11 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // 変種で、`alter_table_add_column` からは返らない（到達不能）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::ConstraintNotFound(_)
-        | CatalogError::ConstraintLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::ConstraintLimitExceeded(_)
+        // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
+        // TASK-233、Issue #1069）専用の変種で、`alter_table_add_column` からは
+        // 返らない（到達不能）。
+        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }

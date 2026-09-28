@@ -2245,6 +2245,7 @@ pub struct ValidatedCreateTable {
 fn finalize_foreign_keys(
     foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
     columns: &[ColumnDef],
+    checks: &[ParsedCheck],
 ) -> Result<Vec<crate::catalog::ForeignKeyDef>, SqlSurfaceError> {
     for fk in &foreign_keys {
         for name in fk.columns() {
@@ -2254,6 +2255,30 @@ fn finalize_foreign_keys(
                 )));
             }
         }
+    }
+    // `CREATE TABLE` 内の明示制約名重複（FK 同士・FK と CHECK。TABLE-22・
+    // TASK-233、Issue #1069。設計 F6）。UNIQUE・CHECK・FOREIGN KEY はテーブル
+    // 単位で名前空間を共有する（設計 F1）ため、CHECK の既存前例
+    // （`sql::check_constraint::validate_and_build`）と同じ `42601` に揃える。
+    // 既定名（空文字列）同士は互いに衝突判定の対象外
+    // （`assign_foreign_key_constraint_names` が最終的に確定する）。
+    let mut explicit_names: Vec<&str> = Vec::new();
+    for check in checks {
+        if let Some(n) = &check.name {
+            explicit_names.push(n.as_str());
+        }
+    }
+    for fk in &foreign_keys {
+        if fk.name().is_empty() {
+            continue;
+        }
+        if explicit_names.contains(&fk.name()) {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "duplicate constraint name: {}",
+                fk.name()
+            )));
+        }
+        explicit_names.push(fk.name());
     }
     Ok(foreign_keys)
 }
@@ -2413,11 +2438,11 @@ pub struct ValidatedAlterTableAddUnique {
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... DROP CONSTRAINT <name>` 文
-/// （Issue #1067）。対象名が UNIQUE・CHECK いずれの制約として存在するか、
-/// 存在するとしてどちらかの判定はカタログ照会を要するため構造検証段階では
-/// 行わない（実行段 `sql::ddl::execute_alter_table_drop_constraint` が担う）。
-/// Issue #1068 以降、CHECK 名を指定した DROP も成功するようになった
-/// （`catalog::Storage::alter_table_drop_constraint` のドキュメント参照）。
+/// （Issue #1067）。対象名が UNIQUE・CHECK・FOREIGN KEY いずれの制約として
+/// 存在するか、存在するとしてどれかの判定はカタログ照会を要するため構造検証
+/// 段階では行わない（実行段 `sql::ddl::execute_alter_table_drop_constraint` が
+/// 担う。Issue #1068 以降 CHECK 名を指定した DROP も成功するようになり、
+/// FK 名の解決は Issue #1069 で追加）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedAlterTableDropConstraint {
     pub table_name: String,
@@ -2437,24 +2462,43 @@ pub struct ValidatedAlterTableAddCheck {
     pub check: ParsedCheck,
 }
 
-/// `ALTER TABLE` の許可形状 4 種の和（Issue #1067・#1068）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>]
+/// FOREIGN KEY (<col>[, <col>]*) REFERENCES ...` 文（TABLE-22・TASK-233、
+/// Issue #1069）。参照先の名前解決・主キー／UNIQUE 制約との照合・型の照合・
+/// 既存行の参照整合性検証はカタログ照会を要するため構造検証段階では行わない
+/// （`ValidatedAlterTableAddUnique` と同じ設計。実行段
+/// `sql::ddl::execute_alter_table_add_foreign_key` が担う）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAddForeignKey {
+    pub table_name: String,
+    /// `CONSTRAINT <name>` 句を省略した場合 `None`（実行段が設計 F2 の既定名を
+    /// 確定する）。
+    pub constraint_name: Option<String>,
+    pub foreign_key: crate::catalog::ForeignKeyDef,
+}
+
+/// `ALTER TABLE` の許可形状 5 種の和（Issue #1067・#1068・#1069）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
 ///
-/// **BREAKING CHANGE**（Issue #1067）: `validate_alter_table`／
+/// **BREAKING CHANGE**（Issue #1067・#1069）: `validate_alter_table`／
 /// `validate_alter_table_tokens` の戻り値を `ValidatedAlterTableAddColumn` から
-/// 本 enum へ変更した。クレート外でこれらの関数を直接呼ぶコード・
-/// `ParsedSql::AlterTable` の中身を直接扱うコードは追随が必要。
+/// 本 enum へ変更した（#1067）。クレート外でこれらの関数を直接呼ぶコード・
+/// `ParsedSql::AlterTable` の中身を直接扱うコード（特に網羅 `match`）は追随が
+/// 必要。
 ///
-/// **BREAKING CHANGE**（Issue #1068）: `AddCheck` variant を追加した。本 enum を
-/// 網羅的に `match` するクレート外のコードは追随が必要。
+/// **BREAKING CHANGE**（Issue #1068）: `AddCheck` variant を追加した。
+///
+/// **BREAKING CHANGE**（Issue #1069）: `AddForeignKey` variant を追加した。
+/// いずれも本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
     AddUnique(ValidatedAlterTableAddUnique),
     AddCheck(ValidatedAlterTableAddCheck),
     DropConstraint(ValidatedAlterTableDropConstraint),
+    AddForeignKey(ValidatedAlterTableAddForeignKey),
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -5104,12 +5148,15 @@ impl<'a> Parser<'a> {
                 ));
             }
             // `ADD [CONSTRAINT <name>] UNIQUE (...)`（Issue #1067）・
-            // `ADD [CONSTRAINT <name>] CHECK (...)`（Issue #1068）。`CONSTRAINT`
-            // 句を省略した場合は実行段（`sql::ddl::execute_alter_table_add_unique`／
-            // `execute_alter_table_add_check`）が設計 D2 の既定名を確定する。他の
-            // 制約種別（`PRIMARY KEY`／`FOREIGN KEY`）を `CONSTRAINT` に後続させる
-            // 形・`NOT VALID` 付きの `CHECK` は設計 D6 によりスコープ外とし、
-            // `UNIQUE`／`CHECK` のいずれでもなければ `42601` で拒否する。
+            // `ADD [CONSTRAINT <name>] CHECK (...)`（Issue #1068）・
+            // `ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...`
+            // （TABLE-22・TASK-233、Issue #1069）。`CONSTRAINT` 句を省略した場合は
+            // 実行段（`sql::ddl::execute_alter_table_add_unique`／
+            // `execute_alter_table_add_check`／`execute_alter_table_add_foreign_key`）
+            // が設計 D2・F2 の既定名を確定する。`PRIMARY KEY` を `CONSTRAINT` に
+            // 後続させる形・`NOT VALID` 付きの `CHECK` は設計 D6 によりスコープ外
+            // とし、`UNIQUE`／`CHECK`／`FOREIGN KEY` のいずれでもなければ `42601`
+            // で拒否する。
             let constraint_name = if self.peek_contextual_keyword("CONSTRAINT") {
                 self.advance();
                 let name = self.expect_ident()?;
@@ -5120,12 +5167,12 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            // `CHECK` は `UNIQUE` と異なり `(` を直接後続させない（`CHECK (` の
-            // 前に述語ではなく制約種別キーワードが来る）ため、次のトークンで
-            // 判定する。`peek_check_clause_start` は列リスト内の `CONSTRAINT` も
-            // 拾ってしまうため使わず、ここでは `CHECK` 単体の直接判定に留める
-            // （`CONSTRAINT <name>` は既に消費済みで、続く語が `CHECK`／`UNIQUE`
-            // のどちらでもなければ `42601` になる）。
+            // `CHECK` は `UNIQUE`／`FOREIGN KEY` と異なり `(` を直接後続させない
+            // （`CHECK (` の前に述語ではなく制約種別キーワードが来る）ため、次の
+            // トークンで判定する。`peek_check_clause_start` は列リスト内の
+            // `CONSTRAINT` も拾ってしまうため使わず、ここでは `CHECK` 単体の
+            // 直接判定に留める（`CONSTRAINT <name>` は既に消費済みで、続く語が
+            // `CHECK`／`UNIQUE`／`FOREIGN` のいずれでもなければ `42601` になる）。
             if self.peek_ident_matches("CHECK") {
                 let predicates = self.parse_check_parenthesized_body()?;
                 return Ok(ParsedAlterTableShape::AddCheck {
@@ -5135,6 +5182,14 @@ impl<'a> Parser<'a> {
                         column: None,
                         predicates,
                     },
+                });
+            }
+            if self.peek_contextual_keyword("FOREIGN") {
+                let foreign_key = self.parse_foreign_key_table_constraint()?;
+                return Ok(ParsedAlterTableShape::AddForeignKey {
+                    table_name,
+                    constraint_name,
+                    foreign_key,
                 });
             }
             let columns = self.parse_unique_table_constraint()?;
@@ -5238,6 +5293,35 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 foreign_keys.push(self.parse_foreign_key_table_constraint()?);
+            } else if self.peek_ident_matches("CONSTRAINT")
+                && self.peek_ident_matches_at(2, "FOREIGN")
+                && self.peek_ident_matches_at(3, "KEY")
+            {
+                // 表制約 `CONSTRAINT <name> FOREIGN KEY (...) REFERENCES ...`
+                // （TABLE-22・TASK-233、Issue #1069。設計 F6）。`peek_check_clause_start`
+                // は素の `CONSTRAINT` トークンを常に CHECK 句の開始として扱うため
+                // （下記分岐）、`FOREIGN KEY` を後続させる形はこちらで先に判定する
+                // （曖昧さの排除。`peek_check_clause_start` ドキュメント参照）。
+                if foreign_keys.len() >= crate::catalog::MAX_FOREIGN_KEYS_PER_TABLE {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many FOREIGN KEY constraints in CREATE TABLE",
+                    ));
+                }
+                self.advance();
+                let name = self.expect_ident()?;
+                crate::catalog::validate_identifier(&name).map_err(|e| {
+                    SqlSurfaceError::unsupported(format!("invalid constraint name: {e}"))
+                })?;
+                if CREATE_TABLE_COLUMN_TYPE_KEYWORDS
+                    .iter()
+                    .any(|kw| name.eq_ignore_ascii_case(kw))
+                {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "constraint name {name:?} collides with a column type keyword"
+                    )));
+                }
+                let fk = self.parse_foreign_key_table_constraint()?.with_name(name);
+                foreign_keys.push(fk);
             } else if self.peek_check_clause_start() {
                 // 表制約 `[CONSTRAINT <name>] CHECK (...)`（TABLE-16・TASK-204、
                 // Issue #906）。列を追加しないため列数上限の判定対象外（位置
@@ -5320,7 +5404,7 @@ impl<'a> Parser<'a> {
 
         let primary_key = finalize_primary_key(primary_key, &mut columns)?;
         let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
-        let foreign_keys = finalize_foreign_keys(foreign_keys, &columns)?;
+        let foreign_keys = finalize_foreign_keys(foreign_keys, &columns, &checks)?;
 
         Ok(ValidatedCreateTable {
             table_name,
@@ -6530,6 +6614,11 @@ enum ParsedAlterTableShape {
     DropConstraint {
         table_name: String,
         constraint_name: String,
+    },
+    AddForeignKey {
+        table_name: String,
+        constraint_name: Option<String>,
+        foreign_key: crate::catalog::ForeignKeyDef,
     },
 }
 
@@ -8702,6 +8791,15 @@ pub fn validate_alter_table_tokens(
         } => ValidatedAlterTable::DropConstraint(ValidatedAlterTableDropConstraint {
             table_name,
             constraint_name,
+        }),
+        ParsedAlterTableShape::AddForeignKey {
+            table_name,
+            constraint_name,
+            foreign_key,
+        } => ValidatedAlterTable::AddForeignKey(ValidatedAlterTableAddForeignKey {
+            table_name,
+            constraint_name,
+            foreign_key,
         }),
     })
 }

@@ -269,6 +269,52 @@ fn add_check_rejects_explicit_name_collision_with_existing_check() {
     assert_eq!(err.wire_code(), "42P07");
 }
 
+/// 明示名が既存 FOREIGN KEY 制約名と衝突する場合も `42P07`（設計 F1。UNIQUE・
+/// CHECK・FOREIGN KEY はテーブル単位の名前空間を共有する。
+/// `sql_alter_table_foreign_key.rs::add_foreign_key_rejects_name_collision_with_existing_check`
+/// の対称チェック——逆方向（ADD CHECK が既存 FOREIGN KEY 名と衝突する経路）の
+/// 回帰が未整備だったため追加する。`catalog::Storage::
+/// alter_table_add_check_constraint` の明示名衝突判定・既定名の衝突回避の
+/// 両方が FOREIGN KEY 名を見落としていた欠落の回帰）。
+#[test]
+fn add_check_rejects_explicit_name_collision_with_existing_foreign_key() {
+    let (core, path) = new_core("alter-check-name-collision-fk");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE parents (name TEXT)",
+    )
+    .expect("create parents table");
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE children (parent_id BIGINT)",
+    )
+    .expect("create children table");
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE children ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) \
+         REFERENCES parents",
+    )
+    .expect("seed a FOREIGN KEY constraint");
+
+    let err = exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE children ADD CONSTRAINT dup_name CHECK (parent_id > 0)",
+    )
+    .expect_err("name shared with an existing FOREIGN KEY constraint must be rejected");
+    assert_eq!(err.wire_code(), "42P07");
+}
+
 /// 参照列が NULL の既存行は違反にしない（三値論理。設計 D6）。
 #[test]
 fn add_check_null_referenced_column_is_not_a_violation() {

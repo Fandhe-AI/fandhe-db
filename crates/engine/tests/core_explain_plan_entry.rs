@@ -352,6 +352,118 @@ fn explain_entry_reports_hnsw_params_and_does_not_touch_hnsw_index_cache() {
     assert_eq!(stats_after.builds, 0);
 }
 
+/// Issue #1153・TASK-206・INDEX-7: `USING PLAN` 経由の `EXPLAIN`（SQL テキスト・
+/// [`EngineCore::explain_bound_plan_in_session`] の両方）が、索引宣言
+/// （`CREATE INDEX`）による構築対象選択を `scalar_plan:` へ反映することを固定
+/// する。宣言列（`lang`）への述語は `index_equality` のまま、宣言外の列
+/// （`path`）への述語は `plain_scan` へ降格し、SQL テキスト経由と
+/// `explain_bound_plan_in_session` の行がビット単位で一致することも確認する。
+#[test]
+fn explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in() {
+    let path = unique_db_path("core-explain-plan-entry-declared");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    // 選択度による縮退（`CandidateResolution::FallbackSelectivity`。本 Issue の
+    // スコープ外——`sql::scalar_index` モジュールドキュメント参照）を誤って
+    // 誘発しないよう、`index_declaration_targets.rs` と同規模の行数を投入する。
+    for i in 1..=1100u64 {
+        let lang = if i % 3 == 0 { "ja" } else { "en" };
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx("tenant-a"),
+            i,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.1, 0.2, 0.3, 0.4]),
+                Value::Text(lang.to_string()),
+                Value::Text(format!("docs/{i}.md")),
+                Value::Text("alpha content in english".to_string()),
+            ],
+            &OperationId::parse(&format!("explain-plan-entry-decl-{i}")).expect("valid op id"),
+        )
+        .expect("insert row");
+    }
+
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind).with_query_planner(Box::new(
+        StubLlmClient {
+            response: EXPANSION_RESPONSE_NO_HINTS,
+        },
+    ));
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &tenant_ctx,
+        &mut session,
+        "CREATE INDEX idx_lang ON docs (lang)",
+    )
+    .expect("declare scalar index on lang only");
+
+    // 宣言列 `lang`: `index_equality` のまま（Issue #1066 PR #1155 との
+    // 統合: 被覆される宣言列への等価述語は使用索引名 `index=idx_lang` も
+    // 付く）。
+    let sql_outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE lang = 'ja' USING PLAN('find content') LIMIT 5",
+        )
+        .expect("EXPLAIN should succeed");
+    let sql_lines = explain_result_lines(sql_outcome);
+    assert!(sql_lines.contains(&"scalar_plan: index_equality index=idx_lang".to_string()));
+
+    let entry_result = core.explain_bound_plan_in_session(
+        &tenant_ctx,
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        |schema, _udfs| {
+            let filters =
+                declarative_filter::bind_all(&[DeclarativeFilter::equals("lang", "ja")], schema)?;
+            Ok(ExplainShape::from_filters(&filters, &[], &[]))
+        },
+    );
+    let entry_lines = explain_entry_lines(entry_result);
+    assert_eq!(
+        sql_lines, entry_lines,
+        "SQL EXPLAIN と explain_bound_plan_in_session が行単位で完全一致すること"
+    );
+
+    // 宣言外の `path`: `plain_scan` へ降格する。
+    let sql_outcome_path = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE path = 'docs/1.md' \
+             USING PLAN('find content') LIMIT 5",
+        )
+        .expect("EXPLAIN should succeed");
+    let sql_lines_path = explain_result_lines(sql_outcome_path);
+    assert!(sql_lines_path.contains(&"scalar_plan: plain_scan".to_string()));
+
+    let entry_result_path = core.explain_bound_plan_in_session(
+        &tenant_ctx,
+        &SessionState::default(),
+        TABLE,
+        "find content",
+        None,
+        |schema, _udfs| {
+            let filters = declarative_filter::bind_all(
+                &[DeclarativeFilter::equals("path", "docs/1.md")],
+                schema,
+            )?;
+            Ok(ExplainShape::from_filters(&filters, &[], &[]))
+        },
+    );
+    let entry_lines_path = explain_entry_lines(entry_result_path);
+    assert_eq!(sql_lines_path, entry_lines_path);
+}
+
 #[test]
 fn explain_entry_rejects_undefined_table_before_invoking_binder() {
     let path = unique_db_path("core-explain-plan-entry-undefined-table");

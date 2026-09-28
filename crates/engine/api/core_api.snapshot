@@ -292,6 +292,7 @@ pub enum CatalogError {
     ConstraintAlreadyExists(String),
     ConstraintNotFound(String),
     ConstraintLimitExceeded(String),
+    ForeignKeyViolation,
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

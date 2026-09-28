@@ -45,16 +45,22 @@ EXISTS`／`CASCADE`／`RESTRICT`・1 文に複数の `ADD`／`DROP`・`CHECK` �
 ### D2. 制約名（UNIQUE と揃える）
 
 名前空間はテーブル単位で UNIQUE と CHECK の実名を共有する（#1067 D1 と同じ）。
-PK・FK は名前を持たない。
+PK は名前を持たない。FOREIGN KEY は当初（本 Issue 実装時点）は名前を持たな
+かったが、Issue #1069（`ALTER TABLE ADD／DROP CONSTRAINT FOREIGN KEY`）で
+同じテーブル単位の名前空間へ合流した（設計 F1。#1069 との base（main）取り込み
+マージで `alter_table_add_check_constraint` の明示名衝突判定・既定名の衝突
+回避の両方を FOREIGN KEY 実名にも対称に広げた。
+`docs/design/alter-table-foreign-key-constraint.md` D2 参照）。
 
-- 明示名の衝突（既存 UNIQUE 名・CHECK 名）→ `CatalogError::ConstraintAlreadyExists`
-  → `42P07`（`ADD UNIQUE` と同じ）。`validate_schema` より前に判定する。
+- 明示名の衝突（既存 UNIQUE 名・CHECK 名・FOREIGN KEY 名）→
+  `CatalogError::ConstraintAlreadyExists` → `42P07`（`ADD UNIQUE`／
+  `ADD FOREIGN KEY` と同じ）。`validate_schema` より前に判定する。
 - 名前省略時の既定名: `CREATE TABLE` の表制約と同じ `<table>_check`
   （`sql::check_constraint::default_check_name(table, None)`）。衝突解決は
   `resolve_unique_name`（＝ `catalog::resolve_constraint_name`、接頭辞
-  `"check"`）を使い、使用済み集合は **UNIQUE ∪ CHECK の実名**（`CREATE TABLE`
-  の `validate_and_build` は CHECK 名のみを見るが、ALTER では既存 UNIQUE 名
-  も避ける必要がある）。
+  `"check"`）を使い、使用済み集合は **UNIQUE ∪ CHECK ∪ FOREIGN KEY の実名**
+  （`CREATE TABLE` の `validate_and_build` は CHECK 名のみを見るが、ALTER
+  では既存 UNIQUE 名・FOREIGN KEY 名も避ける必要がある）。
 - 件数上限: 既存 `MAX_CHECK_CONSTRAINTS_PER_TABLE`（32）を超える追加は
   `CatalogError::ConstraintLimitExceeded` → `54000`（UNIQUE と同じ）。
 - カタログフォーマットの変更は不要。CHECK 名は v7 以降の `check:<name>:...`
@@ -95,7 +101,7 @@ CheckEvaluationFailed(SqlSurfaceError)`（0 除算・`BIGINT` 精度超過等）
 | DDL 権限なし | `require_ddl_permission` | `42501`（カタログ照会より前） |
 | 明示トランザクション内 | 既存 catch-all | `0A000` |
 | テーブルが無い／ビュー・索引名 | `TableNotFound` 等 | `42P01`／`42809` |
-| 明示名の衝突（UNIQUE・CHECK と同名） | `ConstraintAlreadyExists` | `42P07` |
+| 明示名の衝突（UNIQUE・CHECK・FOREIGN KEY と同名） | `ConstraintAlreadyExists` | `42P07` |
 | CHECK 件数上限超過 | `ConstraintLimitExceeded` | `54000` |
 | 述語の意味論エラー（未知列・禁止要素〔`visible()`・UDF〕・参照列数／述語長上限・往復不一致） | `build_check_constraint` と同じ `SqlSurfaceError` | CREATE TABLE と同一（`42601`／`54000` 等） |
 | 既存行が述語を満たさない（FALSE） | `SqlSurfaceError::check_violation(<新制約名>)` | `23514`（HTTP 409） |
@@ -133,10 +139,17 @@ write txn の**外**（`get_table_schema` のスナップショット）で行�
 （TOCTOU 回避）。
 
 **DROP CONSTRAINT**: 構文 → `0A000`（txn 内）→ `42501` → 存在確認 →
-write txn 内で: UNIQUE 実名に一致 → 既存ロジック（FK 依存 `2BP01`）／CHECK
-実名に一致 → CHECK を除去（CHECK には FK 依存が無い）／どちらも無ければ
-`42704` → `encode_schema`（CHECK が 0 件になれば v7 未満の正規形へ戻る。
-UNIQUE の実名は D2 のとおり保持）→ 世代 bump → commit。
+write txn 内で: 名前の検索は **UNIQUE → FOREIGN KEY → CHECK** の順
+（Issue #1069 で FOREIGN KEY が名前空間に合流したため拡張。
+`docs/design/alter-table-foreign-key-constraint.md` F8 参照）。UNIQUE 実名に
+一致 → 既存ロジック（FK 依存 `2BP01`）／FOREIGN KEY 実名に一致 → FOREIGN
+KEY を除去（既存行を変更しないため依存検査は不要）／CHECK 実名に一致 →
+CHECK を除去（CHECK には FK 依存が無い）／いずれにも無ければ `42704` →
+`encode_schema`（CHECK が 0 件になれば v7 未満の正規形へ戻る。UNIQUE の実名は
+D2 のとおり保持）→ 索引衛生（削除後のカタログから求めた「本当に必要な索引名」
+で対象テーブル自身の stale 索引を刈り込み、FOREIGN KEY 削除時はその参照先
+〔親〕テーブルも対象にする。CHECK は索引を持たないため、CHECK 削除時のこの
+刈り込みは対象索引がなく実質的に no-op）→ 世代 bump → commit。
 
 ### D6. 既存行の走査（全テナント・全可視性）
 

@@ -99,10 +99,13 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   hnsw`／`DROP INDEX` と `index_catalog` をそのまま使う。
   [index-ddl-declaration.md](index-ddl-declaration.md)）。
 - 判定の入力は「対象テーブルに HNSW 宣言があるか」だけで、索引カタログ全件
-  走査の要約（HNSW 宣言テーブル集合）を `IndexCatalogGateCache` がストレージ
-  世代単位に再利用する。`all` では集合の中身を使わず、走査の成否（カタログを
-  読み取れるか）だけを使う。読み取れない場合はいずれの scope でも fail-closed に
-  brute-force へ倒す（次節）。
+  走査の要約（HNSW 宣言テーブル集合）を `IndexCatalogGateCache` が索引カタログ
+  専用世代単位に再利用する（Issue #1154。索引カタログを変える commit だけで
+  進む専用カウンタで、通常の行 DML では無効化されない。旧: ストレージ全体の
+  単一世代カウンタをキーにしており、行 DML の commit でも過剰に無効化されて
+  いた）。`all` では集合の中身を使わず、走査の成否（カタログを読み取れるか）
+  だけを使う。読み取れない場合はいずれの scope でも fail-closed に brute-force
+  へ倒す（次節）。
 - 旧実装（PR #1124 のレビュー前）は「カタログ全体に `IndexKind::Hnsw` 宣言が 1 件でも
   あれば、宣言のあるテーブルだけを HNSW にする」カタログ全体単位のゲートだった。
   これは `table_a` への宣言で未宣言の `table_b` を近似から厳密へ切り替え、
@@ -172,53 +175,93 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
 
 ## 対象外（申し送り）
 
-- **`EXPLAIN` の `scalar_plan:` は「索引が実際に使われる」ことを意味しない**:
-  `scalar_plan:`（`sql::scalar_plan::classify_scalar_plan`）は `WHERE`
-  述語の**形**（列型・演算子の組み合わせ）だけを見る束縛時の静的判定であり、
-  カタログ・スキーマ・行データを一切参照しない（`ScalarShapeInput` に
-  storage/schema を渡さない設計。§2 系の `ann_plan:` が
-  `catalog::hnsw_targeted_in_txn` で実行時ゲートと揃えているのとは対照的）。
-  このため `scalar_plan:` が索引適格と表示されても、実行時に対象列が
-  索引化されていなければ `ScalarIndex::resolve_candidates`
-  （`sql/scalar_index.rs`）は該当述語で `CandidateResolution::FallbackNoIndex`
-  を返し、**クエリ全体が全走査（plain scan）へフォールバックする**
-  （索引化した候補だけ通して残りを事後フィルタする、ではない）。これは
-  宣言で除外された列に限らず、平均値長ゲート（Issue #632）・`2^53` ゲート
-  （Issue #893）でも既に起きている既知の制約であり、宣言（本 Issue）は
-  `scalar_plan:` が反映しない実行時ビルドゲートの 3 件目にすぎない
-  （RLS・可視性・結果の正しさには影響しない。fail-closed に全走査へ倒れる
-  だけで誤った結果を返さない）。
-  `scalar_plan:`／`access_path:` を実行時ビルドゲート（宣言・平均値長・
-  `2^53`）まで反映させる修正は、`ann_plan:` と同じ「実行時判定・`EXPLAIN`
-  表示の単一情報源化」パターンを `search_explain_from_bound`・
-  `aggregate_explain_from_bound`（現状 `self` を使わない静的関数）・
-  `run_explain_plan` の 3 経路すべてに広げる設計変更（SQL／NoSQL 表層の
-  bit 同一性テストの更新を伴う）になるため、宣言のみを対象にした部分修正は
-  行わず別 Issue（#1153）の対象とする。
+- **`EXPLAIN` の `scalar_plan:` は宣言による対象外化を反映する（Issue #1153
+  で対応済み）**: `scalar_plan:`（`sql::scalar_plan::classify_scalar_plan`）
+  自体は引き続き `WHERE` 述語の**形**だけを見る束縛時の静的判定（カタログ非
+  依存）のままだが、`search_explain_from_bound`・`aggregate_explain_from_
+  bound`・`run_explain_plan`（`USING PLAN`）の 3 経路は、これに
+  `sql::scalar_index::scalar_plan_under_target`（純粋関数）を通し、クエリと
+  同一の `read_txn` から解決した索引宣言（`resolve_scalar_index_target_in_
+  txn`）で「宣言により対象外にした列への述語」を `plain_scan`（集計の
+  `access_path:` は `full_scan`／`scalar_index_group_enumeration` の判定）へ
+  補正する。`ann_plan:` が `catalog::hnsw_targeted_in_txn` で実行時ゲートと
+  揃えているのと同じ「実行時判定・`EXPLAIN` 表示の単一情報源化」パターン。
+  `id` 述語（`id_index` は宣言の有無によらず常に構築される）は対象外にしない。
+  固定は `crates/engine/tests/explain_scalar_plan_declarations.rs`・
+  `crates/engine/tests/core_explain_plan_entry.rs`
+  （`explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in`）参照
+  （TASK-206・INDEX-7・SQL-27・NOSQL-16・NOSQL-10 ポインタ）。
+  一方、以下は **データ依存**（EXPLAIN は索引構築・`lookup`・`prepare_*` の
+  副作用を持たない契約のため、行データを見ないと分からない）ため、Issue
+  #1153 の対象外のまま残る既知の限界:
+  - 平均値長ゲート（Issue #632）・`2^53` ゲート（Issue #893）による列単位の
+    実行時除外
+  - 選択度による縮退（`CandidateResolution::FallbackSelectivity`）
+
+  この 2 つはいずれも fail-closed に全走査（plain scan）へ倒れるだけで、
+  RLS・可視性・結果の正しさには影響しない。
+
+  `ScalarIndex::resolve_candidates` の早期打ち切り（交差候補が 0 件になった
+  時点で、以降の述語を評価せず打ち切る）はこの 2 つとは性質が異なり、全走査
+  への縮退ではない: 交差は述語を追加するほど結果が単調非増加になるため、
+  空集合との交差は以降の述語によらず必ず空集合になり、
+  `CandidateResolution::Use`（索引経路）のまま空の候補集合を返す。索引経路を
+  使い続けるだけで結果・RLS には影響しない。ただし早期打ち切りは
+  `metadata_filters` の列がすべて索引化されている（宣言による対象外化・
+  平均値長ゲート・`2^53` ゲートのいずれでも除外されていない）ことを候補
+  評価より前に静的検査した**後**にしか働かない
+  （`ScalarIndex::filter_column_is_indexed`。codex-review P1 対応・PR
+  #1158）: 旧実装はこの静的検査を欠き、先に評価した宣言列の交差が 0 件に
+  なると早期打ち切りが働いて宣言外列の述語を一度も評価しないまま索引経路
+  （`Use`）を返してしまい、`scalar_plan_under_target` の「宣言外列が 1 つ
+  でもあれば `plain_scan`」という値に依存しない静的判定と、述語の順序・
+  値によっては矛盾しうる状態だった（結果の正しさ自体には影響しない。
+  空の候補集合を返す索引経路と全走査はいずれも「一致 0 件」で同じ結果に
+  なるため）。静的検査を候補評価の前段に追加したことで、`EXPLAIN` と実行時
+  の経路選択は述語の順序・値によらず常に一致する。固定は
+  `crates/engine/tests/explain_scalar_plan_declarations.rs::
+  search_explain_matches_runtime_when_declared_column_predicate_yields_
+  empty_candidates`（宣言外列を含む複数述語を両順序で束縛し、`EXPLAIN` の
+  `plain_scan` 表示と実行時統計〔`index_scans`／`plain_scan_fallbacks`〕が
+  一致することを固定）参照。
+- **Issue #1066（`EXPLAIN` の使用索引名注記）との整合**: `EngineCore::
+  explain_engine_for` の `scalar_names_eligible` は「`scalar_plan` が
+  `PlainScan` 以外」を索引名（`index=<name>`）表示の前提条件に含む。Issue
+  #1153 が `scalar_plan_under_target` で宣言外列への述語を `PlainScan` へ
+  補正する結果、そのケースは `scalar_names_eligible` の時点で自動的に偽と
+  なり索引名も付かない（`uncovered_column_reports_no_index_name`・
+  `crates/engine/tests/explain_index_names.rs` で固定）。両 Issue は
+  「`scalar_plan:` トークン自体を宣言と一致させる」（#1153）・「一致した
+  トークンへさらに使用索引名を注記する」（#1066）という別レイヤーの責務で
+  独立しており、`scalar_plan_under_target` の出力を `explain_engine_for` へ
+  そのまま渡すだけで二重の判定ロジックを持たずに整合する。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
 - スカラー専用 opt-in の新設（上位スイッチは起動時 HNSW opt-in のみ）
-- **`IndexCatalogGateCache`（`catalog.rs`）はストレージ全体世代キーのため、
-  索引宣言と無関係な行 DML の commit でも次回参照時に再走査が起きる**
-  （codex-review P2 指摘・PR #1124）: `hnsw_targeted_in_txn` のカタログ全件
-  走査の結果キャッシュは `crate::storage::current_generation_in_txn`（ストレージ
-  全体の単一世代カウンタ）をキーにしている。これは索引カタログを変更する 4 経路
-  （`create_index`／`drop_index`／`drop_table`／`alter_table_drop_column`）
-  がいずれも commit 前に必ずこのカウンタを進める（取りこぼしなし）ことを
-  根拠に選んだキーだが、宣言と無関係な通常の行 DML でも同じカウンタが進む
-  ため、書き込みと検索が交互に発生する構成ではキャッシュがほぼ効かず、
-  キャッシュ導入前と同じフルスキャン 1 回分のコストが検索のたびに残る
-  （悪化はしない。`catalog.rs` の `IndexCatalogGateCache` ドキュメンテーション
-  コメント参照）。
-  是正する場合の設計方針: 上記 4 経路の commit 時にのみ進む専用の「索引
-  カタログ世代」カウンタを新設し、`hnsw_targeted_in_txn`・スカラー宣言解決の
-  両方をそのカウンタでキー付けする（通常の行 DML による過剰無効化を避ける）。
-  ただし新カウンタは commit_boundary 経由の全 4 経路で確実に進める必要があり
-  （1 経路でも取りこぼすと、`declared` で stale な HNSW 宣言テーブル集合を
-  再利用し、宣言済み・削除済みの経路切り替えを取りこぼす）、永続フォーマット
-  （新カウンタ未保持の既存 DB）との互換性も設計する必要があるため、本 Issue
-  では部分修正を行わず別 Issue（#1154。`perf` 分類）の対象とする。
+- **解消済み（Issue #1154）**: `IndexCatalogGateCache`（`catalog.rs`）は
+  当初ストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
+  をキーにしていたため、索引宣言と無関係な行 DML の commit でも次回参照時に
+  再走査が起きていた（codex-review P2 指摘・PR #1124）。Issue #1154 で、索引
+  カタログを変更する経路（`create_index`／`drop_index`／`retain_index_defs_in_txn`。
+  後者を `drop_table`・`alter_table_drop_column` が共有）だけで進む専用の
+  「索引カタログ世代」カウンタ（`catalog::index_catalog_generation_in_txn`）を
+  新設し、`hnsw_targeted_in_txn` のキャッシュキーをそちらへ切り替えた。これに
+  より、索引宣言と無関係な行 DML の commit ではキャッシュが無効化されなくなった
+  （行 DML を跨いでヒットし続けることを `crates/engine/tests/
+  index_declaration_targets.rs::hnsw_scope_declared_gate_cache_ignores_row_dml_but_tracks_index_ddl`
+  で固定）。**当初の申し送りとの相違点** 2 点: (1) スカラー宣言解決
+  （`declared_index_targets_in_txn`）は申し送りの想定に反しキャッシュ化しな
+  かった（`ScalarIndex` 構築時にしか呼ばれず、その構築自体が行 DML＝テーブル
+  世代で必ずやり直しになるため利得がほとんど無い）。(2) Rust API
+  `search_with_snapshot` の TOCTOU 再照合（判定〜検索本体呼び出し間の失効
+  検出）はストレージ全体世代のまま据え置いた。これは「索引カタログの変更に
+  限らず、対象テーブルへの任意の commit が判定直後に挟まった場合」を検出する
+  ための安全弁であり、専用世代へ緩めると対象テーブルの行 DML による失効検出を
+  落としてしまうため、性能改善の対象外とした（`core.rs::search_with_snapshot`
+  のコメント参照。緩める場合は別途の性能論点）。永続フォーマットとの互換性は
+  新カウンタ未保持の既存 DB でテーブル未作成＝世代 0 として扱うことで確保し、
+  マイグレーションは不要である。
 
 ## 影響を受ける既存 fixture
 
@@ -248,3 +291,16 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   連結形の fail-closed 拒否を固定。
 - `crates/engine/tests/sql_index_ddl.rs`: 既存の結果不変テストは無変更のまま
   green（opt-in なしでの回帰）。
+- Issue #1153（`EXPLAIN` の `scalar_plan:`／`access_path:` を実行時の索引
+  構築対象選択へ揃える）: `crates/engine/src/sql/scalar_index.rs` の単体テスト
+  （`scalar_plan_under_target_tests`）で純粋関数の分岐（`Auto`／`Declared`／
+  `Err`・`id` 述語の非降格・解決不能添字の fail-closed 降格）を固定。
+  `crates/engine/tests/explain_scalar_plan_declarations.rs`（新規）: 検索
+  `EXPLAIN`（宣言列・宣言外列・複合述語・`id` 述語・`DROP INDEX` 後の復帰）・
+  `EXPLAIN` 表示と実行時統計（`index_scans`／`plain_scan_fallbacks`）の一致・
+  集計 `EXPLAIN`（`GROUP BY` 列挙形のゲートを含む）・opt-in なしでの無変更を
+  結合テストで固定。`crates/engine/tests/core_explain_plan_entry.rs`
+  （`explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in`）:
+  `USING PLAN` 経由の `EXPLAIN`（SQL テキスト・
+  `EngineCore::explain_bound_plan_in_session` の両方）でも同じ反映が効き、
+  行がビット単位で一致することを固定。

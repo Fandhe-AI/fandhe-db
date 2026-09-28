@@ -30,6 +30,15 @@
 //! `docs/design/explain-search-engine-exposure.md` に露出する行・語彙・
 //! 露出しない値と理由をまとめる。
 //!
+//! Issue #1066（TASK-206・INDEX-7・SQL-6・SQL-27）: `ann_plan:`／`scalar_plan:`
+//! 行は、索引経路を使う場合に限り既存トークンの末尾へ `index=<name>[,<name>...]`
+//! （昇順・重複排除・`,` 区切り）を条件付きで追記する（安定契約。行の追加・
+//! 順序変更はしない）。付与条件・被覆判定は `core.rs::EngineCore::
+//! explain_engine_for` 系が持ち、本モジュールは [`ExplainIndexNames`]・
+//! [`append_index_suffix`] による整形のみを担う。索引名は
+//! `catalog::validate_identifier` を満たす（`,`・空白・改行を含み得ない）ため
+//! 区切り文字として安全に使える。
+//!
 //! TASK-186・NOSQL-10 の前提として Issue #730 で [`ExplainEngine`]・
 //! [`build_explain_result`] を公開 API へ昇格した（`BoundScan`／`BoundAggregate`
 //! と同じ「同作法」）。外部から [`PlannedQuery`] を得るには
@@ -112,6 +121,58 @@ impl ExplainEngine {
     }
 }
 
+/// `EXPLAIN` の `ann_plan:`／`scalar_plan:` 行へ注記する使用索引名（Issue #1066・
+/// TASK-206・INDEX-7・SQL-6・SQL-27）。呼び出し元 `core.rs::EngineCore` が
+/// カタログ宣言・HNSW ゲート判定・スカラー列被覆判定から組み立てる（判定
+/// ロジック自体はここに置かない。本型は整形専用のデータの入れ物）。
+/// [`Self::new`] で正規化（ソート・重複排除・識別子検証）するため、
+/// [`Self::ann`]／[`Self::scalar`] は常に昇順・重複なしの識別子列を返す。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExplainIndexNames {
+    pub(crate) ann: Vec<String>,
+    pub(crate) scalar: Vec<String>,
+}
+
+impl ExplainIndexNames {
+    /// `ann`／`scalar` それぞれを正規化して組み立てる。要素に
+    /// `catalog::validate_identifier` を満たさないものが 1 つでも含まれる側は、
+    /// 未検証の文字列を `QUERY PLAN` 応答へ出さないため fail-closed に空へ倒す
+    /// （呼び出し元がカタログから読んだ名前は [`crate::catalog::
+    /// explain_index_names_in_txn`] で検証済みのはずだが、多層防御として
+    /// ここでも検証する）。
+    pub fn new(ann: Vec<String>, scalar: Vec<String>) -> Self {
+        Self {
+            ann: normalize_index_names(ann),
+            scalar: normalize_index_names(scalar),
+        }
+    }
+
+    /// `ann_plan:` 行に注記する索引名（昇順・重複なし）。
+    pub fn ann(&self) -> &[String] {
+        &self.ann
+    }
+
+    /// `scalar_plan:` 行に注記する索引名（昇順・重複なし）。
+    pub fn scalar(&self) -> &[String] {
+        &self.scalar
+    }
+}
+
+/// [`ExplainIndexNames::new`] の正規化本体: 識別子として不正な要素が 1 つでも
+/// あれば全体を空にする（fail-closed）、そうでなければソート・重複排除する。
+fn normalize_index_names(mut names: Vec<String>) -> Vec<String> {
+    if names
+        .iter()
+        .any(|n| crate::catalog::validate_identifier(n).is_err())
+    {
+        return Vec::new();
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// [`crate::sql::using_plan::pre_check_bindable`]（`Statement::Explain`
 /// アーム・[`crate::core::EngineCore::explain_bound_plan_in_session`] が共有
 /// する私的ヘルパー `run_explain_plan` が LLM I/O より前に一度だけ呼ぶ binder
@@ -127,12 +188,122 @@ impl ExplainEngine {
 /// `filters_empty` が `true` になりうる（`sql::exec` の
 /// `bound.metadata_filters.is_empty() && bound.expr_filters.is_empty()` と
 /// 同じ定義）。
+/// [`MetadataFilter::column_index`] の集合（Issue #1153・TASK-206・INDEX-7）。
+/// [`ExplainShape`] が `USING PLAN` の束縛結果から `metadata_filters` の列を
+/// 覚えておくための非公開表現で、`run_explain_plan`（`core.rs`）が世代照合後の
+/// `post_check_txn` から解決した索引宣言（[`crate::sql::scalar_index::
+/// ScalarIndexTargetOwned`]）と突き合わせて `scalar_plan:` 表示を補正する
+/// （[`crate::sql::scalar_index::scalar_plan_under_target`]）ために使う。
+/// `Copy`（`ExplainShape` 自体が `Copy` の契約を保つため）な固定長ビット集合
+/// （`[u64; 4]` で 256 ビット）で表現し、無制限 `Vec` 確保を避ける
+/// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」）。
+/// 上限は [`crate::declarative_filter::MAX_METADATA_FILTERS`]
+/// （`catalog::MAX_COLUMN_COUNT` と同値・256）に揃える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FilterColumnSet {
+    bits: [u64; 4],
+    /// `column_index` が [`Self::CAPACITY`] 以上で表現できなかった要素が
+    /// 1 件でもあったか。`true` の場合、`sql::scalar_index::
+    /// scalar_plan_under_target` は「解決不能」として fail-closed に
+    /// `PlainScan` へ倒す（本モジュール冒頭「責務境界」の対象外入力を
+    /// 誤って索引適格と報告しないため）。
+    overflow: bool,
+}
+
+impl FilterColumnSet {
+    /// `catalog::MAX_COLUMN_COUNT`（256・`declarative_filter::MAX_METADATA_FILTERS`
+    /// と同値）に揃えたビット集合の容量。
+    const CAPACITY: usize = 256;
+
+    fn empty() -> Self {
+        Self {
+            bits: [0; 4],
+            overflow: false,
+        }
+    }
+
+    fn insert(&mut self, column_index: usize) {
+        let Some(word) = self.bits.get_mut(column_index / 64) else {
+            self.overflow = true;
+            return;
+        };
+        // `column_index % 64` は常に 0..64 の範囲（除数が 64 の剰余）。
+        *word |= 1u64 << (column_index % 64);
+    }
+
+    fn from_filters(filters: &[MetadataFilter]) -> Self {
+        let mut set = Self::empty();
+        for filter in filters {
+            set.insert(filter.column_index());
+        }
+        set
+    }
+
+    /// [`crate::sql::scalar_index::scalar_plan_under_target`] の
+    /// `metadata_filter_columns` 引数が要求する形（列添字。解決不能は
+    /// `None`）へ変換する。要素数はたかだか [`Self::CAPACITY`]（256）件で
+    /// 固定長のため無制限確保にはならない。[`Self::overflow`] が立っている
+    /// 場合は実際の列添字を復元できないため、単一の `None` を返し
+    /// `scalar_plan_under_target` に fail-closed な降格を促す。
+    fn resolved_column_indices(&self) -> Vec<Option<usize>> {
+        if self.overflow {
+            return vec![None];
+        }
+        let mut out = Vec::with_capacity(Self::CAPACITY);
+        for (word_index, word) in self.bits.iter().enumerate() {
+            let mut remaining = *word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as usize;
+                out.push(Some(word_index * 64 + bit));
+                remaining &= remaining - 1;
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExplainShape {
     filters_empty: bool,
     scalar_plan: ScalarPlan,
+    /// Issue #1066: `metadata_filters` が参照する列インデックス
+    /// （[`crate::declarative_filter::MetadataFilter::column_index`]。
+    /// 束縛時スキーマの `columns` 添字と同一空間）の集合を、[`Copy`] を保った
+    /// まま持つための固定長ビットセット（[`FILTER_COLS_WORDS`] 語）。
+    /// `scalar_plan:` の索引名注記（`core.rs::EngineCore::run_explain_plan`
+    /// が使う。被覆判定にのみ使い、`scalar_plan:` トークン自体の判定式は
+    /// 変えない）専用で、`ann_plan:` の判定には使わない。[`Self::
+    /// filter_columns`]（Issue #1066・索引名注記の列名解決用）と
+    /// [`Self::metadata_filter_columns`]（Issue #1153・`scalar_plan_under_
+    /// target` の列添字入力用）はそれぞれ別の消費者・別の失敗時セマンティクス
+    /// （前者は列挙＋別 overflow フラグ、後者は単一 `None` 要素での縮退）を
+    /// 持つため、同じ入力から独立に構築し両方を保持する（PR #1155・#1158 の
+    /// 並行実装をどちらも壊さないためのマージ方針）。
+    filter_cols: [u64; FILTER_COLS_WORDS],
+    /// 列インデックスが本ビットセットの表現範囲
+    /// （[`crate::catalog::MAX_COLUMN_COUNT`]）を超えた場合に立てる overflow
+    /// フラグ。テーブルの列数上限はカタログ側で常に検査されるため実運用では
+    /// 到達しないはずだが、多層防御として fail-closed に「索引名を出さない」
+    /// 側へ倒すためのシグナルを保持する。
+    filter_cols_overflow: bool,
+    /// Issue #1153・TASK-206・INDEX-7: [`crate::sql::scalar_index::
+    /// scalar_plan_under_target`] の `metadata_filter_columns` 引数を組み立てる
+    /// ための列添字集合（[`FilterColumnSet`]）。上記 `filter_cols` と同じ
+    /// `metadata_filters` から独立に構築する（両者の使い分けは [`Self::
+    /// filter_cols`] のドキュメント参照）。
+    filter_columns: FilterColumnSet,
 }
+
+/// [`ExplainShape::filter_cols`] の語数（`u64` × 4 = 256 列分）。
+/// [`crate::catalog::MAX_COLUMN_COUNT`] と同期させる（下記 `const _` で
+/// コンパイル時に強制する）。
+const FILTER_COLS_WORDS: usize = 4;
+
+const _: () = assert!(
+    FILTER_COLS_WORDS * 64 >= crate::catalog::MAX_COLUMN_COUNT,
+    "ExplainShape::filter_cols must have enough bits for catalog::MAX_COLUMN_COUNT columns"
+);
 
 impl ExplainShape {
     /// `metadata_filters`／`expr_filters`（`USING PLAN` の `WHERE` 束縛結果。
@@ -161,11 +332,23 @@ impl ExplainShape {
             expr_filters,
             or_filters,
         });
+        let mut filter_cols = [0u64; FILTER_COLS_WORDS];
+        let mut filter_cols_overflow = false;
+        for f in metadata_filters {
+            set_filter_col_bit(
+                &mut filter_cols,
+                &mut filter_cols_overflow,
+                f.column_index(),
+            );
+        }
         Self {
             filters_empty: metadata_filters.is_empty()
                 && expr_filters.is_empty()
                 && or_filters.is_empty(),
             scalar_plan,
+            filter_cols,
+            filter_cols_overflow,
+            filter_columns: FilterColumnSet::from_filters(metadata_filters),
         }
     }
 
@@ -175,10 +358,49 @@ impl ExplainShape {
         self.filters_empty
     }
 
+    /// [`crate::sql::scalar_index::scalar_plan_under_target`]（Issue #1153）の
+    /// `metadata_filter_columns` 引数を組み立てるための、`metadata_filters` の
+    /// 列添字集合（解決不能な添字は `None`）。呼び出し元 `core.rs::
+    /// EngineCore::run_explain_plan` 限定の非公開アクセサ（`ExplainShape` 自体は
+    /// 公開型だが、本フィールドは索引宣言反映の実装詳細でありクレート外へ
+    /// 公開 API として晒さない）。
+    pub(crate) fn metadata_filter_columns(&self) -> Vec<Option<usize>> {
+        self.filter_columns.resolved_column_indices()
+    }
+
     /// `scalar_plan:` 行（Issue #474）が要求する静的判定。
     pub fn scalar_plan(&self) -> ScalarPlan {
         self.scalar_plan
     }
+
+    /// Issue #1066: `metadata_filters` が参照した列インデックスの列挙
+    /// （`core.rs::EngineCore::run_explain_plan` が索引名注記の被覆判定に使う。
+    /// 添字は束縛時スキーマの `columns` と同一空間）。[`Self::
+    /// filter_columns_overflowed`] が `true` の場合、呼び出し元はこの列挙を
+    /// 使わず fail-closed に「索引名を出さない」へ倒すこと。
+    pub(crate) fn filter_columns(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..crate::catalog::MAX_COLUMN_COUNT)
+            .filter(move |&i| self.filter_cols[i / 64] & (1u64 << (i % 64)) != 0)
+    }
+
+    /// `metadata_filters` の列インデックスが [`Self::filter_cols`] の表現範囲
+    /// を超えたため、[`Self::filter_columns`] の列挙が不完全である可能性が
+    /// あることを示す（Issue #1066。多層防御。実運用ではカタログ側の列数
+    /// 上限検査により到達しないはず）。
+    pub(crate) fn filter_columns_overflowed(&self) -> bool {
+        self.filter_cols_overflow
+    }
+}
+
+/// [`ExplainShape::filter_cols`] へ列インデックス `idx` のビットを立てる。
+/// 範囲外（[`crate::catalog::MAX_COLUMN_COUNT`] 以上）は `overflow` を立てて
+/// 無視する（fail-closed。ビットセットの外側へ書き込まない）。
+fn set_filter_col_bit(cols: &mut [u64; FILTER_COLS_WORDS], overflow: &mut bool, idx: usize) {
+    if idx >= crate::catalog::MAX_COLUMN_COUNT {
+        *overflow = true;
+        return;
+    }
+    cols[idx / 64] |= 1u64 << (idx % 64);
 }
 
 /// [`ExplainEngine::kind`] を `engine:` 行の値（閉じた語彙・snake_case）へ変換する。
@@ -266,7 +488,12 @@ fn access_path_token(path: AccessPath) -> &'static str {
 /// [`build_explain_result`]〔`USING PLAN` 付き検索〕と Issue #922・SQL-27 の
 /// [`build_search_explain_result`]〔`USING PLAN` なし検索〕が共有する。
 /// 書式の発散を構造的に防ぐ）。
-fn push_engine_tail_rows(lines: &mut Vec<String>, mode: ResolvedMode, engine: &ExplainEngine) {
+fn push_engine_tail_rows(
+    lines: &mut Vec<String>,
+    mode: ResolvedMode,
+    engine: &ExplainEngine,
+    names: &ExplainIndexNames,
+) {
     lines.push(format!("mode: {}", mode.mode().as_str()));
     lines.push(format!("mode_source: {}", mode.source().as_str()));
     lines.push(format!("engine: {}", engine_token(engine.kind)));
@@ -296,11 +523,24 @@ fn push_engine_tail_rows(lines: &mut Vec<String>, mode: ResolvedMode, engine: &E
             params.sparse_visited_max()
         ));
     }
-    lines.push(format!("ann_plan: {}", ann_plan_token(engine.ann_plan)));
-    lines.push(format!(
-        "scalar_plan: {}",
-        scalar_plan_token(engine.scalar_plan)
-    ));
+    let mut ann_line = format!("ann_plan: {}", ann_plan_token(engine.ann_plan));
+    append_index_suffix(&mut ann_line, names.ann());
+    lines.push(ann_line);
+    let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(engine.scalar_plan));
+    append_index_suffix(&mut scalar_line, names.scalar());
+    lines.push(scalar_line);
+}
+
+/// `line` の末尾へ、索引経路を使う場合に限り ` index=<name>[,<name>...]`
+/// （昇順・重複排除・`,` 区切り）を条件付きで追記する（Issue #1066。`names`
+/// が空なら何もしない＝既存の行と完全に同一のまま。安定契約: 行の追加・
+/// 順序変更はしない、既存トークンの末尾への追記のみ）。
+fn append_index_suffix(line: &mut String, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    line.push_str(" index=");
+    line.push_str(&names.join(","));
 }
 
 /// `lines` の各要素を `QUERY PLAN` 単一列の 1 行（`id`/`score` は実在行を持た
@@ -333,6 +573,18 @@ fn lines_to_query_result(lines: Vec<String>) -> QueryResult {
 /// `mode` → `mode_source` → `engine` → （`engine: hnsw` のときのみ）
 /// `hnsw_params` → `ann_plan` → `scalar_plan`。
 pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> QueryResult {
+    build_explain_result_with_indexes(planned, engine, &ExplainIndexNames::default())
+}
+
+/// [`build_explain_result`] の使用索引名付き版（Issue #1066・TASK-206・
+/// INDEX-7・SQL-6・SQL-27）。`names` が [`ExplainIndexNames::default()`]
+/// （両側とも空）のときは [`build_explain_result`] とビット同一の出力になる
+/// （後方互換。宣言・opt-in がない既定エンジン時の出力は変わらない）。
+pub fn build_explain_result_with_indexes(
+    planned: &PlannedQuery,
+    engine: &ExplainEngine,
+    names: &ExplainIndexNames,
+) -> QueryResult {
     let expansion = planned.expansion();
     let resolved = planned.mode();
 
@@ -348,7 +600,7 @@ pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> Q
         "kind_hint: {}",
         expansion.kind_hint.as_deref().unwrap_or(NONE_LABEL)
     ));
-    push_engine_tail_rows(&mut lines, resolved, engine);
+    push_engine_tail_rows(&mut lines, resolved, engine, names);
 
     lines_to_query_result(lines)
 }
@@ -362,9 +614,10 @@ pub fn build_explain_result(planned: &PlannedQuery, engine: &ExplainEngine) -> Q
 pub(crate) fn build_search_explain_result(
     mode: ResolvedMode,
     engine: &ExplainEngine,
+    names: &ExplainIndexNames,
 ) -> QueryResult {
     let mut lines: Vec<String> = Vec::with_capacity(6);
-    push_engine_tail_rows(&mut lines, mode, engine);
+    push_engine_tail_rows(&mut lines, mode, engine, names);
     lines_to_query_result(lines)
 }
 
@@ -377,9 +630,12 @@ pub(crate) fn build_search_explain_result(
 pub(crate) fn build_relational_explain_result(
     scalar_plan: ScalarPlan,
     access_path: AccessPath,
+    names: &ExplainIndexNames,
 ) -> QueryResult {
+    let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(scalar_plan));
+    append_index_suffix(&mut scalar_line, names.scalar());
     let lines = vec![
-        format!("scalar_plan: {}", scalar_plan_token(scalar_plan)),
+        scalar_line,
         format!("access_path: {}", access_path_token(access_path)),
     ];
     lines_to_query_result(lines)
@@ -682,5 +938,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`ExplainIndexNames::new`] がソート・重複排除することを固定する
+    /// （Issue #1066）。
+    #[test]
+    fn explain_index_names_new_sorts_and_dedups() {
+        let names = ExplainIndexNames::new(
+            vec![
+                "idx_b".to_string(),
+                "idx_a".to_string(),
+                "idx_a".to_string(),
+            ],
+            vec!["idx_z".to_string()],
+        );
+        assert_eq!(names.ann(), &["idx_a".to_string(), "idx_b".to_string()]);
+        assert_eq!(names.scalar(), &["idx_z".to_string()]);
+    }
+
+    /// [`ExplainIndexNames::new`] が不正な識別子を含む側を空へ倒すことを固定
+    /// する（Issue #1066。未検証の文字列を `QUERY PLAN` 応答へ出さない
+    /// fail-closed 契約）。
+    #[test]
+    fn explain_index_names_new_rejects_invalid_identifier() {
+        let names = ExplainIndexNames::new(vec!["not,an,ident".to_string()], vec![]);
+        assert!(names.ann().is_empty());
+    }
+
+    /// [`build_explain_result_with_indexes`] が既定（`ExplainIndexNames::
+    /// default()`）で [`build_explain_result`] とビット同一であることを固定
+    /// する（Issue #1066・受け入れ条件 3）。
+    #[test]
+    fn build_explain_result_with_indexes_default_matches_build_explain_result() {
+        let planned = PlannedQuery::new(
+            QueryExpansion::default(),
+            ResolvedMode::new(SearchMode::Recall, ModeSource::Default),
+        );
+        let engine = default_engine();
+
+        let plain = build_explain_result(&planned, &engine);
+        let with_default_names =
+            build_explain_result_with_indexes(&planned, &engine, &ExplainIndexNames::default());
+
+        assert_eq!(plain.rows.len(), with_default_names.rows.len());
+        for (a, b) in plain.rows.iter().zip(with_default_names.rows.iter()) {
+            assert_eq!(a.cells, b.cells);
+        }
+    }
+
+    /// [`build_explain_result_with_indexes`] が索引名を `ann_plan:`／
+    /// `scalar_plan:` 行の末尾へ ` index=<name>[,<name>...]`（昇順）で追記し、
+    /// 他の行には影響しないことを固定する（Issue #1066）。
+    #[test]
+    fn build_explain_result_with_indexes_appends_index_suffix() {
+        let planned = PlannedQuery::new(
+            QueryExpansion::default(),
+            ResolvedMode::new(SearchMode::Recall, ModeSource::Default),
+        );
+        let engine = ExplainEngine {
+            kind: Some(SearchEngineKind::ParallelBruteForce),
+            ann_plan: AnnPlan::HnswFullVisible,
+            scalar_plan: ScalarPlan::IndexConjunction,
+        };
+        let names = ExplainIndexNames::new(
+            vec!["idx_vec".to_string()],
+            vec!["idx_kind".to_string(), "idx_a".to_string()],
+        );
+
+        let result = build_explain_result_with_indexes(&planned, &engine, &names);
+
+        let last = result.rows.len() - 1;
+        assert_eq!(
+            cell_text(&result, last),
+            "scalar_plan: index_conjunction index=idx_a,idx_kind"
+        );
+        assert_eq!(
+            cell_text(&result, last - 1),
+            "ann_plan: hnsw_full_visible index=idx_vec"
+        );
+    }
+
+    /// [`build_relational_explain_result`] が `scalar_plan:` 行にのみ索引名を
+    /// 注記し、`access_path:` 行には注記しないことを固定する（Issue #1066）。
+    #[test]
+    fn build_relational_explain_result_appends_index_suffix_to_scalar_plan_only() {
+        let names = ExplainIndexNames::new(vec![], vec!["idx_kind".to_string()]);
+        let result = build_relational_explain_result(
+            ScalarPlan::IndexEquality,
+            AccessPath::ScalarIndexCandidates,
+            &names,
+        );
+        assert_eq!(
+            cell_text(&result, 0),
+            "scalar_plan: index_equality index=idx_kind"
+        );
+        assert_eq!(
+            cell_text(&result, 1),
+            "access_path: scalar_index_candidates"
+        );
     }
 }

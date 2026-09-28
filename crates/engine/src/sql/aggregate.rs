@@ -424,14 +424,24 @@ pub(crate) fn select_decode_tier(
 /// 消費は一切行わない）。`arena_cache`／`scalar_cache`（キャッシュの構築可否・
 /// ヒット/ミスという実行時の縮退結果）はテナント存在情報に繋がるため入力に
 /// 含めない（`schema`・`bound` の構文的形状のみで決まる）。
+///
+/// `target`（Issue #1153・TASK-206・INDEX-7）: 索引宣言の構築対象選択
+/// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）の
+/// 結果。呼び出し元がクエリと同一の `read_txn` から解決して渡す。宣言で
+/// 対象外にした列への述語・カタログ読み取り失敗は
+/// [`crate::sql::scalar_index::scalar_plan_under_target`] で `PlainScan` へ
+/// 補正し、`ensure_scalar_index_snapshot` が実際に構築する索引（宣言列だけ）と
+/// 表示を一致させる。
 pub(crate) fn classify_aggregate_access(
     schema: &TableSchema,
     bound: &BoundAggregate,
+    target: &Result<crate::sql::scalar_index::ScalarIndexTargetOwned, ()>,
 ) -> (
     crate::sql::scalar_plan::ScalarPlan,
     crate::sql::explain::AccessPath,
 ) {
     use crate::sql::explain::AccessPath;
+    use crate::sql::scalar_index::scalar_plan_under_target;
     use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
 
     let has_vector = schema.vector_dim().is_some();
@@ -442,19 +452,30 @@ pub(crate) fn classify_aggregate_access(
         expr_filters: bound.expr_filters(),
         or_filters: bound.or_filters(),
     };
+    let metadata_filter_columns: Vec<Option<usize>> = bound
+        .metadata_filters()
+        .iter()
+        .map(|f| Some(f.column_index()))
+        .collect();
     // Issue #475 の「索引対応述語のみで構成される」判定と同一
     // （`execute_aggregate_with_cache`・`execute_grouped_aggregate` の
     // `candidate_walk`／索引経路ゲートと同じ呼び出し）。`VECTOR` 列を持たない
     // テーブルはこの索引の構築材料を持てないため `has_vector` で先にゲートする
     // （D5: 矛盾出力〔`scalar_plan: index_equality` と `access_path: full_scan`
-    // の同時出力〕を防ぐ）。
-    let index_candidate_eligible =
-        has_vector && classify_scalar_plan(&scalar_shape) != ScalarPlan::PlainScan;
-    let scalar_plan = if has_vector {
+    // の同時出力〕を防ぐ）。宣言による対象外化（Issue #1153）は
+    // `scalar_plan_under_target` で織り込む。
+    let scalar_plan_before_target = if has_vector {
         classify_scalar_plan(&scalar_shape)
     } else {
         ScalarPlan::PlainScan
     };
+    let scalar_plan = scalar_plan_under_target(
+        scalar_plan_before_target,
+        metadata_filter_columns.iter().copied(),
+        schema,
+        target,
+    );
+    let index_candidate_eligible = has_vector && scalar_plan != ScalarPlan::PlainScan;
 
     if bound.has_group_by() {
         // SQL-25 (d)・Issue #1099: `execute_grouped_aggregate` は複数列
@@ -468,9 +489,26 @@ pub(crate) fn classify_aggregate_access(
             .as_ref()
             .is_some_and(|g| g.column_indices.len() == 1);
         let text_min_max_blocks = crate::sql::group_by::has_text_min_max_aggregate(bound.items());
+        // Issue #1153: `ScalarIndexGroupEnumeration`（列挙形）は
+        // `ScalarIndex::column_groups(key_index)` を直接照会する。宣言で
+        // GROUP BY キー列を対象外にした場合、実行時は当該列が
+        // `columns[key_index] = None`（未索引）のため列挙形を使えず全走査へ
+        // 縮退する（`sql::group_by::execute_grouped_aggregate` 参照）。
+        // `target` が `Auto`（常に「含む」扱い）以外で、かつキー列が対象外
+        // なら、ここで `ScalarIndexGroupEnumeration` を選ばせない。
+        let group_key_targeted = single_key_group_by
+            && bound
+                .group_by
+                .as_ref()
+                .and_then(|g| g.column_indices.first())
+                .and_then(|&idx| schema.columns.get(idx))
+                .is_some_and(|column| match target {
+                    Err(()) => false,
+                    Ok(t) => t.includes(&column.name),
+                });
         let access_path = if !single_key_group_by {
             AccessPath::FullScan
-        } else if has_vector && where_less && !text_min_max_blocks {
+        } else if has_vector && where_less && !text_min_max_blocks && group_key_targeted {
             AccessPath::ScalarIndexGroupEnumeration
         } else if has_vector && !where_less && index_candidate_eligible {
             AccessPath::ScalarIndexCandidates
