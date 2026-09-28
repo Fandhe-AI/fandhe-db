@@ -139,8 +139,9 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   `FOREIGN KEY` の順）。書き込んだ各行を同一 write トランザクション内で読み戻し
   （UPSERT の `DO UPDATE`・`UPDATE` の SET 適用後の最終値。SET で触れない既存値も
   含む）、値の組が参照先に存在することを確かめる。`id` 参照は物理キーの点照会、
-  列参照は参照先のテナント範囲を走査し、必要な値の組がすべて見つかった時点で
-  打ち切る。
+  列参照は永続キー索引（`key_index.rs`、Issue #1071）が登録済みなら索引照会、
+  未登録なら参照先のテナント範囲を走査して判定した上で索引を構築する
+  （下記「計算量」節参照）。
 - 参照先側: `constraint::enforce_referencing_rows_in_txn`。削除・更新・`TRUNCATE`・
   置換の後に、このテーブルを参照先とする各宣言について、参照元の同一テナント
   全行の値の組が変更後の参照先にすべて存在することを確かめる（事後状態の検証）。
@@ -206,18 +207,65 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   `TableAlreadyOpen` 回避）。
 - `TRUNCATE` は連鎖を起こさない（D18）。
 
-### 計算量（既知の制約）
+### 計算量（Issue #1071 で索引化）
 
-永続索引は導入しない。参照先側の検査は参照元の同一テナントの行数に比例し、
-列参照の参照元側の検査は参照先の同一テナントの行数に比例する（一意性検査
-〔`docs/design/unique-constraint.md`〕と同じ位置づけ。永続索引化は将来の別課題。
-Issue #1071）。走査上限（`tenant::MAX_SCANNED_ROWS`）は一意性検査と同じ理由で
-継承しない（上限を超える行数を保有するテナントが一切書き込めなくなる
-fail-closed 過ぎる制約になるため）。`scan_child_fk_rows_for_keys` による対象
-特定（Pass 1）は、索引が無いため走査そのものは引き続き参照元の同一テナント
-全行数に比例する時間がかかるが、保持するメモリは一致した行数（高々
-`MAX_REFERENTIAL_ACTION_ROWS`）に有界化されている（無関係な行は一致判定の
-直後に捨てる）。
+`crates/engine/src/key_index.rs` の永続キー索引により、参照元側（列参照の
+存在確認）・参照先側（被参照確認）とも**テナントの保有行数に比例しない**
+判定へ切り替えた（`id` 参照は索引導入前から物理キーの点照会で行数に比例
+しない）。
+
+- 索引の形: `(テーブル, 索引名)` で識別する 2 本の redb テーブル（順引き
+  `(tenant, key, row_id) -> ()`・逆引き `(tenant, row_id) -> key`。テナントを
+  跨いで共有）。索引名は対象列集合から一意に決まり、参照先側（親の被参照列）・
+  参照元側（子の FK 列）が同じテーブル・同じ列集合を指す場合は 1 本に集約
+  される（自己参照等）。登録簿（`key_index_registry`）は**テナント単位**
+  `(table, name, tenant) -> ()`（Issue #1071 レビュー指摘 P0: テーブル単位の
+  登録だと 1 テナントの backfill が他の全テナントの索引済み状態まで確定させ
+  てしまい fail-open になり得るため）。
+- 維持点: `constraint::enforce_row_constraints_in_txn`（書き込み直後）が
+  登録済み索引を同期する単一箇所（一意性・`CHECK` 検査と同じ検査点）。
+  `DELETE`／`TRUNCATE` は `enforce_referencing_rows_in_txn` が自ら同期・
+  消去する。`ON DELETE CASCADE`（Issue #1076）による子行の物理削除は
+  `constraint::apply_referential_action` が直接行うため、削除した id を
+  同関数から `key_index::sync_rows_in_txn` へ渡して同期する（この同期を
+  怠ると、削除済み行の索引エントリが残留し、孫段の列参照 FK による
+  `NO ACTION` 事後検証が索引照会で「参照先はまだ存在する」と誤判定して
+  違反を見逃す）。
+- フォールバック: 索引がそのテナントで未登録（旧 DB・初回参照）の FK・
+  テーブルの組み合わせに限り、索引導入前と同一の全行走査で判定し、成功後に
+  索引を構築・登録して以後の文から索引経路に切り替える。この構築
+  （backfill）は**要求元テナントの行だけ**を 1 回読み、他テナントの行数・
+  破損状態には一切触れない（テナント境界節参照）。
+- 走査上限（`tenant::MAX_SCANNED_ROWS`）を継承しない理由は変わらない
+  （フォールバック走査に限りテナントの保有行数に比例するため、上限を課すと
+  索引未構築のテナントが書き込めなくなる fail-closed 過ぎる制約になる）。
+- 破損検知: 登録簿にエントリがあるのに順引きテーブルが実在しない状態
+  （`ensure_index_in_txn` が両者を同一 write_txn で作成する不変条件が破れた
+  破損 DB）は、`redb::WriteTransaction::open_table` が get-or-create で
+  `TableDoesNotExist` を返さないため `list_tables` によるテーブル名の明示
+  確認で検出し、`CorruptSchema` として fail-closed に拒否する（Issue #1071
+  レビュー指摘 P0。黙って空テーブル扱いすると「参照なし」の誤判定で
+  `DELETE`／`TRUNCATE` を許してしまう）。
+- 同一 write_txn 内で「このテーブルの既存行を削除してから新規行を挿入する」
+  呼び出し元（`tenant::replace_typed_rows_by_text_key` のファイル形置換等）は、
+  この削除より前に `constraint::prepare_referenced_key_indexes_in_txn` で
+  参照先列の索引を backfill しておく契約（cursor bugbot 指摘: 自己参照 FK で
+  この事前 backfill を省くと、索引の初回構築が削除後の状態から行われ、
+  削除された旧行の旧キーが逆引き索引の pre-image に一度も現れず、参照先側
+  検査の `lost` 差分に載らないまま検査をすり抜ける。同関数ドキュメント参照）。
+- 対象外: `enforce_referencing_rows_in_txn` が呼ぶ
+  `catalog::referencing_foreign_keys_in_txn`（このテーブルを参照する FK の
+  逆引き）はカタログの**テーブル数**に比例する走査のままで、行数には比例
+  しない（索引化は別課題。§対象外・後続候補参照）。
+- 参照アクションの連鎖（Issue #1076）は索引化のスコープ外: `propagate_
+  referential_actions`（対象特定〔Pass 1〕の `scan_child_fk_rows_for_keys`）は
+  索引を使わず、引き続き参照元の同一テナント全行数に比例する時間がかかる
+  走査で対象を特定する（保持するメモリは一致した行数〔高々
+  `MAX_REFERENTIAL_ACTION_ROWS`〕に有界化されている。無関係な行は一致判定の
+  直後に捨てる）。同様に、連鎖で変更した各テーブルの事後検証
+  （`verify_no_action_backstop_by_scan`）も、テーブルごとの索引差分を追跡
+  していないため索引導入前と同じ全行走査で行う（索引化は元の直接変更テーブル
+  の検査に限る。連鎖テーブルの索引化は後続課題）。
 
 ## テナント境界（RLS-9・RLS-10 (c)）
 
@@ -246,8 +294,10 @@ TRUNCATE の 2 呼び出し口）で記録する。`SessionTransaction::commit` 
 呼ぶ——`table` を子とする `INITIALLY DEFERRED` 宣言と、`table` を親とする他
 テーブルの `INITIALLY DEFERRED` 宣言（`referencing_foreign_keys_in_txn` 経由。
 v9 対応が前提）の両方について、COMMIT 直前の事後状態を全件検証する
-（`constraint::verify_child_rows_for_tenant` を `enforce_referencing_rows_in_txn`
-と共有し、ロジックを 2 か所で重複させない）。
+（`constraint::enforce_referencing_rows_by_scan_for_fk` を
+`enforce_referencing_rows_in_txn` の索引未登録時フォールバック経路と共有し、
+ロジックを 2 か所で重複させない。Issue #1071 の索引化スコープ外——事後状態の
+全件検証は差分ベースの索引同期に乗らないため全行走査のまま据え置く）。
 
 - 検査対象範囲は `written_by_tenant` だけから導出する（呼び出し元が渡す ctx には
   依存しない）。記録漏れ＝検査漏れ＝fail-open になるため、`mark_written` は
@@ -256,8 +306,10 @@ v9 対応が前提）の両方について、COMMIT 直前の事後状態を全�
   `Idle` へ戻り `23503` を返す（`session_at_begin` の復元は commit 自体の失敗と
   同じ分岐。COMMIT 後の `ReadyForQuery` は `'I'`）。持続時間上限超過（`54000`）の
   判定は遅延検査より前に行う（既存の順序を維持）。
-- 計算量: 子テーブル・親テーブルの当該テナント行数に比例し、COMMIT 中はライタを
-  保持し続ける（既存の検査と同じく走査上限は設けない。大きなテナントでは
+- 計算量: 子テーブルの当該テナント全行走査（事後状態の全件検証のため索引化
+  スコープ外。上記参照）に比例し、COMMIT 中はライタを保持し続ける（親側の
+  存在確認は `verify_required_parent_keys` 経由のため索引登録済みなら索引
+  照会で済む）。既存の検査と同じく走査上限は設けない（大きなテナントでは
   COMMIT が遅くなるトレードオフとして記録する）。同一トランザクションで複数文が
   同じ `(child, fk)` の組に触れても、`written_by_tenant` はテーブル単位の集合の
   ため検査は高々 1 回で済む——ただし親・子の双方が同一トランザクション内で
@@ -336,7 +388,9 @@ NoSQL `create_table` の `foreign_key` 制約（`build_constraint_tokens`）は
 
 ## 対象外・後続候補
 
-- `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要）
+- `ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`（既存行の全テナント検証が必要。
+  着手時は `key_index::ensure_index_in_txn`／`drop_indexes_for_table_in_txn` を
+  流用できる）
 - 制約名（`CONSTRAINT <name> FOREIGN KEY`）
 - `SET NULL (col, ...)`／`SET DEFAULT (col, ...)`（列リスト形。Issue #1076）
 - `TRUNCATE ... CASCADE`（`TRUNCATE` 自体は参照アクションを発火させない。D18）
@@ -346,7 +400,14 @@ NoSQL `create_table` の `foreign_key` 制約（`build_constraint_tokens`）は
   INITIALLY IMMEDIATE` を実行時に遅延へ切り替える機能。Issue #1077 のスコープ外）
 - `MATCH PARTIAL`（Issue #1077 のスコープ外。D13）
 - `PRIMARY KEY`／`UNIQUE` 制約への `DEFERRABLE`（Issue #1077 のスコープ外）
-- 参照先側・列参照の検査の索引化（現状はテナント範囲の線形走査）
+- `catalog::referencing_foreign_keys_in_txn`（テーブル数比例のカタログ走査）の
+  索引化（Issue #1071 の対象外。テーブル数は行数と異なり実運用上小さいため）
+- COMMIT 時の遅延検査（`enforce_deferred_foreign_keys_in_txn`。Issue #1077）の
+  索引化。事後状態の全件検証という性質上「失われたキー」の差分を持たず、
+  索引の増分同期が前提とする差分ベースの判定に乗らないため、索引導入前と
+  同じ全行走査のまま据え置く（Issue #1071 の対象外）
+- `#[cfg(test)]` の生書き込み API（`catalog.rs`）が索引・制約を迂回する点
+  （production では到達不能。Issue #1078）
 - 明示トランザクション内の `UPDATE`／`DELETE`／`UPSERT`／複数行 `INSERT`
   （単一行 `INSERT`・`TRUNCATE` のみ対応。`docs/design/explicit-transaction.md`）。
   対応すれば `INITIALLY DEFERRED` の遅延検査の観測可能範囲が広がる

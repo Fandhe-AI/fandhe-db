@@ -250,6 +250,7 @@ pub mod incremental;
 pub mod isa;
 pub mod json;
 pub mod kernel;
+pub(crate) mod key_index;
 pub mod numeric;
 pub mod parallel_search;
 pub mod policy;
