@@ -112,8 +112,9 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   `FOREIGN KEY` の順）。書き込んだ各行を同一 write トランザクション内で読み戻し
   （UPSERT の `DO UPDATE`・`UPDATE` の SET 適用後の最終値。SET で触れない既存値も
   含む）、値の組が参照先に存在することを確かめる。`id` 参照は物理キーの点照会、
-  列参照は参照先のテナント範囲を走査し、必要な値の組がすべて見つかった時点で
-  打ち切る。
+  列参照は永続キー索引（`key_index.rs`、Issue #1071）が登録済みなら索引照会、
+  未登録なら参照先のテナント範囲を走査して判定した上で索引を構築する
+  （下記「計算量」節参照）。
 - 参照先側: `constraint::enforce_referencing_rows_in_txn`。削除・更新・`TRUNCATE`・
   置換の後に、このテーブルを参照先とする各宣言について、参照元の同一テナント
   全行の値の組が変更後の参照先にすべて存在することを確かめる（事後状態の検証）。
@@ -195,8 +196,10 @@ TRUNCATE の 2 呼び出し口）で記録する。`SessionTransaction::commit` 
 呼ぶ——`table` を子とする `INITIALLY DEFERRED` 宣言と、`table` を親とする他
 テーブルの `INITIALLY DEFERRED` 宣言（`referencing_foreign_keys_in_txn` 経由。
 v9 対応が前提）の両方について、COMMIT 直前の事後状態を全件検証する
-（`constraint::verify_child_rows_for_tenant` を `enforce_referencing_rows_in_txn`
-と共有し、ロジックを 2 か所で重複させない）。
+（`constraint::enforce_referencing_rows_by_scan_for_fk` を
+`enforce_referencing_rows_in_txn` の索引未登録時フォールバック経路と共有し、
+ロジックを 2 か所で重複させない。Issue #1071 の索引化スコープ外——事後状態の
+全件検証は差分ベースの索引同期に乗らないため全行走査のまま据え置く）。
 
 - 検査対象範囲は `written_by_tenant` だけから導出する（呼び出し元が渡す ctx には
   依存しない）。記録漏れ＝検査漏れ＝fail-open になるため、`mark_written` は
@@ -205,8 +208,10 @@ v9 対応が前提）の両方について、COMMIT 直前の事後状態を全�
   `Idle` へ戻り `23503` を返す（`session_at_begin` の復元は commit 自体の失敗と
   同じ分岐。COMMIT 後の `ReadyForQuery` は `'I'`）。持続時間上限超過（`54000`）の
   判定は遅延検査より前に行う（既存の順序を維持）。
-- 計算量: 子テーブル・親テーブルの当該テナント行数に比例し、COMMIT 中はライタを
-  保持し続ける（既存の検査と同じく走査上限は設けない。大きなテナントでは
+- 計算量: 子テーブルの当該テナント全行走査（事後状態の全件検証のため索引化
+  スコープ外。上記参照）に比例し、COMMIT 中はライタを保持し続ける（親側の
+  存在確認は `verify_required_parent_keys` 経由のため索引登録済みなら索引
+  照会で済む）。既存の検査と同じく走査上限は設けない（大きなテナントでは
   COMMIT が遅くなるトレードオフとして記録する）。同一トランザクションで複数文が
   同じ `(child, fk)` の組に触れても、`written_by_tenant` はテーブル単位の集合の
   ため検査は高々 1 回で済む——ただし親・子の双方が同一トランザクション内で

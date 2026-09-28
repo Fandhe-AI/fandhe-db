@@ -1232,12 +1232,15 @@ fn single_referencing_column_type<'a>(
         .ok_or_else(|| internal("foreign key column not found in live schema columns"))
 }
 
-/// [`enforce_referencing_rows_in_txn`] の索引未登録時のフォールバック
-/// （永続キー索引導入〔Issue #1071〕前と同一のアルゴリズム）。参照元
-/// `child_schema` の**同一テナントの全行**（可視性を問わない。RLS-10 (c)）を
-/// 走査して `fk` が要求する値の組を集め、変更後の参照先 `table_name`
-/// （スキーマ `schema`）にすべて存在することを [`verify_required_parent_keys`]
-/// で確かめる。
+/// [`enforce_referencing_rows_in_txn`] の索引未登録時のフォールバックと、
+/// [`enforce_deferred_foreign_keys_in_txn`]（COMMIT 時の遅延検査。事後状態の
+/// 全件検証のため索引を使わず常にこの経路を通る）の両方が呼ぶ唯一の実装
+/// （永続キー索引導入〔Issue #1071〕前と同一のアルゴリズム。挙動を 2 か所で
+/// 重複させない）。参照元 `child_schema` の**同一テナントの全行**（可視性を
+/// 問わない。RLS-10 (c)）を走査して `fk` が要求する値の組を集め、変更後の
+/// 参照先 `table_name`（スキーマ `schema`）にすべて存在することを
+/// [`verify_required_parent_keys`] で確かめる（親側は同関数経由で索引登録
+/// 済みなら索引照会になる）。
 fn enforce_referencing_rows_by_scan_for_fk(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -1476,9 +1479,10 @@ pub(crate) fn enforce_referencing_rows_in_txn(
 ///
 /// **索引化スコープ外（Issue #1071）**: 事後状態の全件検証という性質上
 /// 「失われたキー」の差分を持たず、索引の増分同期（[`crate::key_index`]）が
-/// 前提とする差分ベースの判定に乗らないため、この経路は索引導入前と同じ
-/// 全行走査のまま据え置く（`docs/design/foreign-key.md` 参照。索引化は
-/// 後続課題）。
+/// 前提とする差分ベースの判定に乗らないため、子テーブル側の走査は索引導入前
+/// と同じ全行走査のまま据え置く（`docs/design/foreign-key.md` 参照。索引化は
+/// 後続課題）。親側の存在確認は [`verify_required_parent_keys`] 経由のため、
+/// 索引が登録済みなら索引照会になる。
 pub(crate) fn enforce_deferred_foreign_keys_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant_id: &str,
