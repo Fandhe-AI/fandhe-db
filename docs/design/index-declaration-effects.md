@@ -191,10 +191,17 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   `scalar_plan:`／`access_path:` を実行時ビルドゲート（宣言・平均値長・
   `2^53`）まで反映させる修正は、`ann_plan:` と同じ「実行時判定・`EXPLAIN`
   表示の単一情報源化」パターンを `search_explain_from_bound`・
-  `aggregate_explain_from_bound`（現状 `self` を使わない静的関数）・
-  `run_explain_plan` の 3 経路すべてに広げる設計変更（SQL／NoSQL 表層の
-  bit 同一性テストの更新を伴う）になるため、宣言のみを対象にした部分修正は
-  行わず別 Issue（#1153）の対象とする。
+  `aggregate_explain_from_bound`・`run_explain_plan` の 3 経路すべてに
+  広げる設計変更（SQL／NoSQL 表層の bit 同一性テストの更新を伴う）になる
+  ため、宣言のみを対象にした部分修正は行わず別 Issue（#1153）の対象と
+  する。Issue #1066 で索引経路使用時に `ann_plan:`／`scalar_plan:` 行へ
+  使用**索引名**の注記（`index=<name>`）を追加したが、これは上記のトークン
+  不一致そのものを解消するものではない——`scalar_plan:` のトークン判定式
+  （`classify_scalar_plan`）自体は変えておらず、名前が付いた場合でも
+  「索引が実際に使われる」ことを保証しない（本節の制約は変わらず有効。
+  `aggregate_explain_from_bound` は #1066 でカタログ読み取りを追加した
+  ため `&self` メソッドへ変更済み）。トークン自体の実行時整合は引き続き
+  #1153 の管轄。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）

@@ -357,8 +357,17 @@ struct Observed {
 /// `table` を SQL 表層・Rust API・`EXPLAIN` の 3 経路で 1 回ずつ問い合わせ、
 /// SQL 表層・Rust API がそれぞれ HNSW 経路を使った（`expect_hnsw == true`）／
 /// 使わなかった（`false`。`HnswIndexCache` へ一切照会しない）ことを確認して
-/// 観測結果を返す。
-fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: &str) -> Observed {
+/// 観測結果を返す。戻り値の 2 つ目は `ann_plan:` の生の行（索引名注記
+/// 〔Issue #1066〕を含む）。`Observed`（1 つ目）はトークン部分のみを持ち、
+/// 索引名注記の有無に関わらず経路・Top-k が不変であることの比較
+/// （`assert_eq!(a_declared, a_before)` 等）に使う。
+fn observe(
+    core: &EngineCore,
+    table: &str,
+    q: &[f32],
+    expect_hnsw: bool,
+    label: &str,
+) -> (Observed, String) {
     let sql_text = format!(
         "SELECT id FROM {table} ORDER BY embedding <=> '{}' LIMIT 5",
         vec_literal(q)
@@ -402,7 +411,7 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
             &format!("EXPLAIN {sql_text}"),
         )
         .unwrap_or_else(|e| panic!("{label}: explain on {table}: {e:?}"));
-    let ann_plan = match outcome {
+    let ann_plan_line = match outcome {
         SqlOutcome::Explain(result) => result
             .rows
             .iter()
@@ -413,6 +422,15 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
             .unwrap_or_else(|| panic!("{label}: explain must report an ann_plan: line")),
         other => panic!("{label}: expected SqlOutcome::Explain, got {other:?}"),
     };
+    // Issue #1066: `ann_plan:` 行は索引経路使用時 ` index=<name>[,<name>...]`
+    // を条件付きで追記する（安定契約。既存トークンの末尾への追記のみ）。
+    // トークン部分だけを切り出し、経路・Top-k 比較（`Observed`）には索引名
+    // 注記の有無を混ぜない。
+    let ann_plan = ann_plan_line
+        .split(" index=")
+        .next()
+        .expect("str::split always yields at least one segment")
+        .to_string();
     let expected_plan = if expect_hnsw {
         "ann_plan: hnsw_full_visible"
     } else {
@@ -422,7 +440,7 @@ fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: 
 
     assert_eq!(sql.rows.len(), 5);
     assert_eq!(api.len(), 5);
-    Observed { sql, api, ann_plan }
+    (Observed { sql, api, ann_plan }, ann_plan_line)
 }
 
 /// `--hnsw-scope all`（既定。`HnswScope::All`）: opt-in 時は全テーブル HNSW で、
@@ -440,8 +458,11 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
     assert_eq!(HnswScope::default(), HnswScope::All);
     let mut session = allowed_session();
 
-    let a_before = observe(&core, "table_a", &vectors_a[0], true, "before");
-    let b_before = observe(&core, "table_b", &vectors_b[0], true, "before");
+    let (a_before, a_before_line) = observe(&core, "table_a", &vectors_a[0], true, "before");
+    let (b_before, b_before_line) = observe(&core, "table_b", &vectors_b[0], true, "before");
+    // Issue #1066: 宣言前はどのテーブルにも索引名注記が無い。
+    assert!(!a_before_line.contains("index="), "{a_before_line}");
+    assert!(!b_before_line.contains("index="), "{b_before_line}");
 
     core.execute_sql_in_session(
         &ctx("tenant-a"),
@@ -449,8 +470,8 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
         "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
     )
     .expect("declare hnsw index on table_a only");
-    let a_declared = observe(&core, "table_a", &vectors_a[0], true, "declared");
-    let b_declared = observe(&core, "table_b", &vectors_b[0], true, "declared");
+    let (a_declared, a_declared_line) = observe(&core, "table_a", &vectors_a[0], true, "declared");
+    let (b_declared, b_declared_line) = observe(&core, "table_b", &vectors_b[0], true, "declared");
     assert_eq!(
         a_declared, a_before,
         "scope all: table_a results must not change"
@@ -459,17 +480,27 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
         b_declared, b_before,
         "scope all: a declaration on table_a must not change table_b results"
     );
+    // Issue #1066: `--hnsw-scope all` でも宣言したテーブルには索引名が付き
+    // （経路・Top-k 自体は上記アサーションのとおり不変）、未宣言の table_b
+    // には付かない。
+    assert_eq!(
+        a_declared_line, "ann_plan: hnsw_full_visible index=idx_vec_a",
+        "table_a must report its declared hnsw index name"
+    );
+    assert!(
+        !b_declared_line.contains("index="),
+        "table_b must not report an index name for an undeclared table: {b_declared_line}"
+    );
 
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
         .expect("drop hnsw declaration");
-    assert_eq!(
-        observe(&core, "table_a", &vectors_a[0], true, "dropped"),
-        a_before
-    );
-    assert_eq!(
-        observe(&core, "table_b", &vectors_b[0], true, "dropped"),
-        b_before
-    );
+    let (a_dropped, a_dropped_line) = observe(&core, "table_a", &vectors_a[0], true, "dropped");
+    let (b_dropped, b_dropped_line) = observe(&core, "table_b", &vectors_b[0], true, "dropped");
+    assert_eq!(a_dropped, a_before);
+    assert_eq!(b_dropped, b_before);
+    // Issue #1066: `DROP INDEX` 後は索引名注記が消える。
+    assert!(!a_dropped_line.contains("index="), "{a_dropped_line}");
+    assert!(!b_dropped_line.contains("index="), "{b_dropped_line}");
 }
 
 /// `--hnsw-scope declared`（`HnswScope::Declared`）: `CREATE INDEX ... USING
@@ -485,8 +516,10 @@ fn scope_declared_uses_hnsw_only_on_declared_table_and_drop_returns_to_exact() {
     let mut session = allowed_session();
 
     // 宣言前: どのテーブルも厳密。
-    let a_before = observe(&core, "table_a", &vectors_a[0], false, "before");
-    let b_before = observe(&core, "table_b", &vectors_b[0], false, "before");
+    let (a_before, a_before_line) = observe(&core, "table_a", &vectors_a[0], false, "before");
+    let (b_before, b_before_line) = observe(&core, "table_b", &vectors_b[0], false, "before");
+    assert!(!a_before_line.contains("index="), "{a_before_line}");
+    assert!(!b_before_line.contains("index="), "{b_before_line}");
 
     core.execute_sql_in_session(
         &ctx("tenant-a"),
@@ -495,26 +528,35 @@ fn scope_declared_uses_hnsw_only_on_declared_table_and_drop_returns_to_exact() {
     )
     .expect("declare hnsw index on table_a only");
     // 宣言した `table_a` だけ HNSW（宣言テーブル自身の経路は変わる）。
-    observe(&core, "table_a", &vectors_a[0], true, "declared");
-    // 未宣言の `table_b` は厳密のままで、結果も宣言前と同一。
+    // Issue #1066: 宣言テーブルの `ann_plan:` には索引名が付く。
+    let (_, a_declared_line) = observe(&core, "table_a", &vectors_a[0], true, "declared");
     assert_eq!(
-        observe(&core, "table_b", &vectors_b[0], false, "declared"),
-        b_before,
+        a_declared_line, "ann_plan: hnsw_full_visible index=idx_vec_a",
+        "table_a must report its declared hnsw index name"
+    );
+    // 未宣言の `table_b` は厳密のままで、結果も宣言前と同一（索引名も付かない）。
+    let (b_declared, b_declared_line) = observe(&core, "table_b", &vectors_b[0], false, "declared");
+    assert_eq!(
+        b_declared, b_before,
         "scope declared: a declaration on table_a must not change table_b"
+    );
+    assert!(
+        !b_declared_line.contains("index="),
+        "table_b must not report an index name for an undeclared table: {b_declared_line}"
     );
 
     // `DROP INDEX` で `table_a` は厳密へ戻り、宣言前と同一の結果を返す。
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
         .expect("drop hnsw declaration");
+    let (a_dropped, a_dropped_line) = observe(&core, "table_a", &vectors_a[0], false, "dropped");
     assert_eq!(
-        observe(&core, "table_a", &vectors_a[0], false, "dropped"),
-        a_before,
+        a_dropped, a_before,
         "scope declared: drop index must return table_a to exact search"
     );
-    assert_eq!(
-        observe(&core, "table_b", &vectors_b[0], false, "dropped"),
-        b_before
-    );
+    assert!(!a_dropped_line.contains("index="), "{a_dropped_line}");
+    let (b_dropped, b_dropped_line) = observe(&core, "table_b", &vectors_b[0], false, "dropped");
+    assert_eq!(b_dropped, b_before);
+    assert!(!b_dropped_line.contains("index="), "{b_dropped_line}");
 }
 
 /// HNSW opt-in なし（既定エンジン）では `--hnsw-scope` は無関係で、

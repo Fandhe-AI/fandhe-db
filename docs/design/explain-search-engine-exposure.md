@@ -240,6 +240,38 @@ bound-plan-session-entry.md` 追記節参照）を SQL `EXPLAIN` アームと共
 縮退・カーディナリティを出さない）は NoSQL 表層から見ても不変である。
 NoSQL 表層が独自の行・語彙を追加することはない。
 
+## 追記（Issue #1066: 使用索引名の露出）
+
+宣言済み索引（Issue #908・#1065・TASK-206・INDEX-7）が経路に載る場合、
+`ann_plan:`／`scalar_plan:` 行の末尾へ条件付きサフィックス
+`index=<name>[,<name>...]`（昇順ソート・重複排除・`,` 区切り。索引名は
+`catalog::validate_identifier` を満たすため区切り文字と衝突しない）を追記
+する。既存行の追加・順序変更はしない安定契約で、条件を満たさない場合は
+既存出力と完全に同一（既定エンジン・宣言なし時はビット同一のまま）。
+
+- **ann**: `ann_plan` が `hnsw_full_visible`／`hnsw_subset` のときだけ、
+  対象テーブルの `USING hnsw` 宣言すべて。`--hnsw-scope all`
+  （`HnswScope::All`）でも宣言があれば付ける（経路・Top-k は宣言の有無で
+  変わらないという #1065 の不変条件は保たれたまま、注記だけが増える）
+- **scalar**: 宣言の有効化スイッチ（起動時 HNSW opt-in）が有効・
+  `scalar_plan` が `plain_scan` 以外・`WHERE` の索引対応述語
+  （`metadata_filters`）が参照する列**すべて**がいずれかのスカラー宣言で
+  被覆されている場合のみ、被覆した宣言名（複数可）。1 列でも非被覆なら
+  実行時は自動索引へ縮退するため索引使用を主張しない。`id` 述語
+  （常設の暗黙索引で宣言索引ではない）は対象外
+- 集計 EXPLAIN では `access_path: scalar_index_candidates` のときだけ
+  `scalar_plan:` に名前が付く（`scalar_index_group_enumeration`・
+  `full_scan` には付けない）
+- テナント存在情報（行数・可視カーディナリティ・実行時縮退結果）は
+  従来どおり一切含めない。付与条件はクエリ形状・エンジン設定・カタログ
+  宣言（DDL 権限者のみが変更可能な全テナント共有メタデータ）だけで決まり、
+  行データ・`PolicyContext` に依存しないため、テナント間で出力は同一
+  （NoSQL 表層〔`explain_bound_search_in_session`／
+  `explain_bound_aggregate_in_session`〕も同じ判定を共有し行単位で一致）
+- `scalar_plan:` トークン自体を宣言除外・平均値長等の実行時ゲートへ
+  合わせる変更は対象外のまま（別 Issue の管轄。本 Issue はトークンを
+  変えずに索引名の注記を付けるだけ）
+
 ## ポインタ
 
 SQL-6・SQL-27・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・

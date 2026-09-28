@@ -35,7 +35,9 @@
 //!   `build_explain_result`・`ExplainEngine`・[`AnnPlan`]・[`ScalarPlan`]・
 //!   [`classify_ann_plan`]・[`classify_scalar_plan`] は TASK-186（NOSQL-10）の
 //!   前提として Issue #730 で公開 API へ昇格しており、engine クレート外からも
-//!   呼べる
+//!   呼べる。`ExplainIndexNames`・`build_explain_result_with_indexes`（Issue
+//!   #1066・TASK-206・INDEX-7）は `ann_plan:`／`scalar_plan:` 行への使用索引名
+//!   注記用に追加した公開 API（`build_explain_result` は非破壊のまま維持）
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）

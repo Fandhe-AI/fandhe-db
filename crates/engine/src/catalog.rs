@@ -388,6 +388,62 @@ pub(crate) fn declared_index_targets_in_txn(
     })
 }
 
+/// [`explain_index_names_in_txn`] の出力（Issue #1066・TASK-206・INDEX-7・
+/// SQL-6・SQL-27）。`sql::explain`（`core.rs` 経由）が `EXPLAIN` の
+/// `ann_plan:`／`scalar_plan:` 行へ使用索引名を注記するために読む、対象
+/// テーブルの索引宣言一覧。ここでは「対象テーブルに何が宣言されているか」
+/// のみを返し、実際にその索引を使うかどうかの判定（HNSW ゲート・スカラー
+/// 列被覆）は呼び出し元（`core.rs`）が行う。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TableIndexDecls {
+    /// 対象テーブルの `USING hnsw` 宣言の索引名（重複なし。宣言順は問わない）。
+    pub(crate) hnsw: Vec<String>,
+    /// 対象テーブルのスカラー宣言 `(索引名, 対象列)` の一覧。
+    pub(crate) scalar: Vec<(String, Vec<String>)>,
+}
+
+/// 対象テーブルの索引宣言を種別ごとに読み取る（Issue #1066）。クエリが使って
+/// いるのと同一の `read_txn`（`core.rs::EngineCore::explain_engine_for` が
+/// 開く txn。HNSW ゲート判定 [`hnsw_targeted_in_txn`] と同一スナップショット
+/// から読み、トークンと索引名注記の食い違いを作らない）から呼ぶ。カタログ
+/// 未作成（宣言 0 件）は空の `Ok`。走査件数が [`MAX_INDEX_COUNT`] を超える・
+/// 値のデコードに失敗する場合は `Err`（呼び出し元は「名前を出さない」へ
+/// fail-closed に倒す。`EXPLAIN` 自体は失敗させない）。`decode_index_def` は
+/// redb キー（索引名）自体を再検証しないため、ここで [`validate_identifier`]
+/// を通してから返す（未検証の文字列を `QUERY PLAN` 応答へ出さない）。
+pub(crate) fn explain_index_names_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+) -> Result<TableIndexDecls> {
+    let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(TableIndexDecls::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut decls = TableIndexDecls::default();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let name = key.value();
+        validate_identifier(name).map_err(|_| {
+            CatalogError::CorruptSchema(format!("invalid index identifier for index {name}"))
+        })?;
+        let def = decode_index_def(name, value.value())?;
+        if def.table != table {
+            continue;
+        }
+        match def.kind {
+            IndexKind::Hnsw => decls.hnsw.push(def.name),
+            IndexKind::Scalar => decls.scalar.push((def.name, def.columns)),
+        }
+    }
+    Ok(decls)
+}
+
 /// [`hnsw_targeted_in_txn`] が索引カタログ全件走査から要約する内容（Issue #1065・
 /// PR #1124）。`IndexKind::Hnsw` 宣言を持つテーブル名の集合だけを保持する
 /// （[`IndexCatalogGateCache`] が 1 世代あたり 1 回の走査で全テーブルの問い合わせを
@@ -865,7 +921,9 @@ const _: () = assert!(
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-const MAX_COLUMN_COUNT: usize = 256;
+/// `pub(crate)`: [`crate::sql::explain::ExplainShape`]（Issue #1066）が
+/// `metadata_filters` 参照列のビットセット長をこの値と同期させるため参照する。
+pub(crate) const MAX_COLUMN_COUNT: usize = 256;
 
 /// `PRIMARY KEY` に宣言できる列数の上限（TABLE-16・TASK-204、Issue #903）。
 /// PostgreSQL の索引キー列数慣習（32）に合わせた本リポの実装既定値。デコード時、
@@ -7621,6 +7679,60 @@ mod tests {
             HnswScope::All
         ));
         assert_eq!(gate_cache.stats().gate_read_failures, 2);
+    }
+
+    /// [`explain_index_names_in_txn`] が空カタログで空の `Ok` を返すことを
+    /// 固定する（Issue #1066）。
+    #[test]
+    fn explain_index_names_in_txn_empty_catalog_returns_empty() {
+        let (storage, _guard) = index_fixture_storage("explain-index-names-empty");
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let decls = explain_index_names_in_txn(&read_txn, "docs").expect("read decls");
+        assert!(decls.hnsw.is_empty());
+        assert!(decls.scalar.is_empty());
+    }
+
+    /// [`explain_index_names_in_txn`] が種別ごとに振り分け、他テーブルの宣言を
+    /// 混ぜないことを固定する（Issue #1066）。
+    #[test]
+    fn explain_index_names_in_txn_splits_by_kind_and_table() {
+        let (storage, _guard) = index_fixture_storage("explain-index-names-split");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        storage
+            .create_index(&scalar_def("idx_lang", "docs", &["lang"]))
+            .expect("create scalar index");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_sibling", "sibling"))
+            .expect("create hnsw index on sibling");
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let decls = explain_index_names_in_txn(&read_txn, "docs").expect("read decls");
+        assert_eq!(decls.hnsw, vec!["idx_hnsw_docs".to_string()]);
+        assert_eq!(
+            decls.scalar,
+            vec![("idx_lang".to_string(), vec!["lang".to_string()])]
+        );
+
+        let sibling_decls = explain_index_names_in_txn(&read_txn, "sibling").expect("read decls");
+        assert_eq!(sibling_decls.hnsw, vec!["idx_hnsw_sibling".to_string()]);
+        assert!(sibling_decls.scalar.is_empty());
+    }
+
+    /// [`explain_index_names_in_txn`] がカタログ破損（デコード失敗）で `Err` を
+    /// 返すことを固定する（Issue #1066。呼び出し元 `core.rs` は「名前を出さない」
+    /// へ fail-closed に倒す）。
+    #[test]
+    fn explain_index_names_in_txn_fails_closed_on_corrupt_catalog_entry() {
+        let (storage, _guard) = index_fixture_storage("explain-index-names-corrupt");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        insert_corrupt_index_entry(&storage);
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(explain_index_names_in_txn(&read_txn, "docs").is_err());
     }
 
     /// クエリが使っているのと同一の `read_txn`（スナップショット）を先に開いてから

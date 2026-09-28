@@ -1533,6 +1533,57 @@ impl crate::sql::allowlist::TableLookup for InsertSchemaLookup<'_> {
     }
 }
 
+/// `metadata_filters` が参照する列インデックス
+/// （[`crate::declarative_filter::MetadataFilter::column_index`]）を、束縛に
+/// 使った `schema` で列名へ写像する（Issue #1066）。`EXPLAIN` の
+/// `scalar_plan:` 行への使用索引名注記——`EngineCore::explain_engine_for` の
+/// 被覆判定——専用のヘルパーで、`sql::exec` の実行経路（索引消費の判定は
+/// `MetadataFilter` の値そのものを使い、列名へは写像しない）には影響しない。
+/// 添字が `schema.columns` の範囲外（構造上到達しないはずだが多層防御）の
+/// 列が 1 つでもあれば `None`（呼び出し元は索引名を出さない側へ fail-closed
+/// に倒す）。`metadata_filters` が空なら `Some(Vec::new())`（「フィルタなし」
+/// と「列名を確定できない」を区別する）。
+fn metadata_filter_column_names<'a>(
+    schema: &'a crate::catalog::TableSchema,
+    metadata_filters: &[crate::declarative_filter::MetadataFilter],
+) -> Option<Vec<&'a str>> {
+    let mut names = Vec::with_capacity(metadata_filters.len());
+    for f in metadata_filters {
+        let col = schema.columns.get(f.column_index())?;
+        names.push(col.name.as_str());
+    }
+    Some(names)
+}
+
+/// `column_names` の**全列**がいずれかのスカラー索引宣言（`(名前, 対象列)`。
+/// [`crate::catalog::TableIndexDecls::scalar`]）で被覆されている場合に限り、
+/// 被覆した宣言の名前（昇順・重複排除は呼び出し元 [`crate::sql::explain::
+/// ExplainIndexNames::new`] に委ねる）を返す（Issue #1066）。被覆されない列が
+/// 1 つでもあれば空 `Vec`（実行時は `FallbackNoIndex` で全走査に落ちるため
+/// 索引使用を主張しない）。`column_names` が空なら（`WHERE` に索引対応述語が
+/// 無い）空 `Vec`。
+fn scalar_index_names_for_columns(
+    scalar_decls: &[(String, Vec<String>)],
+    column_names: &[&str],
+) -> Vec<String> {
+    if column_names.is_empty() {
+        return Vec::new();
+    }
+    let all_covered = column_names.iter().all(|col| {
+        scalar_decls
+            .iter()
+            .any(|(_, cols)| cols.iter().any(|c| c == col))
+    });
+    if !all_covered {
+        return Vec::new();
+    }
+    scalar_decls
+        .iter()
+        .filter(|(_, cols)| column_names.iter().any(|col| cols.iter().any(|c| c == col)))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
@@ -4839,14 +4890,44 @@ impl EngineCore {
         dictionary_required_columns(&post_check_schema)
             .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
+        // Issue #1066: `scalar_plan:` 行へ使用索引名を注記するため、
+        // `explain_shape`（`bind` が構文段のみから確定させた形状。`WHERE`
+        // 束縛結果の一部）が記録した `metadata_filters` 参照列を、世代照合
+        // 済みの `post_check_schema`（`bind` 時と同一世代であることを上で
+        // 検証済み）で列名へ写像する。写像に失敗する列（overflow・
+        // インデックス範囲外）が 1 つでもあれば全体を `None` へ fail-closed に
+        // 倒す（未検証・不整合な列名を索引名注記の被覆判定に使わない）。
+        let scalar_filter_column_names: Option<Vec<&str>> =
+            if explain_shape.filter_columns_overflowed() {
+                None
+            } else {
+                let mut names = Vec::new();
+                let mut ok = true;
+                for idx in explain_shape.filter_columns() {
+                    match post_check_schema.columns.get(idx) {
+                        Some(col) => names.push(col.name.as_str()),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    Some(names)
+                } else {
+                    None
+                }
+            };
+
         // Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の入力を
         // 組み立てる。`EXPLAIN` は `USING PLAN` 専用（束縛結果は常に
         // `Ranking::Hybrid`）のため `is_hybrid` は常に `true`。`USING PLAN` は
         // `HINT ORDER` を受理しない（SQL-5・許可リスト層）ため評価順序は常に
         // 既定（`EvaluationOrder::DEFAULT`）であり、`scalar_prefilter` は
         // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
-        // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出）へ委譲する。
-        let explain_engine = self.explain_engine_for(
+        // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出。Issue #1066
+        // で使用索引名の組み立ても統合）へ委譲する。
+        let (explain_engine, index_names) = self.explain_engine_for(
             table,
             true,
             planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
@@ -4858,10 +4939,12 @@ impl EngineCore {
             // Issue #474: `bind` が構文段のみから確定させた静的判定（LLM
             // I/O・世代照合の影響を受けない。上記コメントと同じ理由）。
             explain_shape.scalar_plan(),
+            scalar_filter_column_names.as_deref(),
         );
-        Ok(crate::sql::explain::build_explain_result(
+        Ok(crate::sql::explain::build_explain_result_with_indexes(
             &planned,
             &explain_engine,
+            &index_names,
         ))
     }
 
@@ -4873,6 +4956,27 @@ impl EngineCore {
     /// 集約し、`hnsw_state` の `lookup`／`prepare_*`（索引構築・統計加算という
     /// 副作用を持つ）を一切呼ばず `is_some()` の有無だけを見る（検索本体を
     /// 実行しない契約はどちらの呼び出し元でも不変）。
+    /// 戻り値の [`crate::sql::explain::ExplainIndexNames`]（Issue #1066・
+    /// TASK-206・INDEX-7）は `ann_plan:`／`scalar_plan:` 行への使用索引名注記。
+    /// HNSW ゲート判定（[`crate::catalog::hnsw_targeted_in_txn`]）と索引宣言
+    /// 読み取り（[`crate::catalog::explain_index_names_in_txn`]）を同一の
+    /// `read_txn`（同一スナップショット）から行い、トークンと索引名の食い違い
+    /// を作らない。`scalar_filter_columns`（`None` は「列名を確定できない」
+    /// ——`ExplainShape` の overflow・写像失敗いずれか——ことを表し、fail-closed
+    /// にスカラー索引名を出さない）は `metadata_filters` が参照する列の名前
+    /// （呼び出し元が束縛時スキーマで解決済み）。付与条件（対象外は空 `Vec`
+    /// のまま）:
+    /// - ann: `ann_plan` が `HnswFullVisible`／`HnswSubset` のときのみ、対象
+    ///   テーブルの `USING hnsw` 宣言すべて（`--hnsw-scope all` でも宣言が
+    ///   あれば付ける。経路・Top-k は宣言の有無で変わらないため #1065 の
+    ///   不変条件は保たれる）
+    /// - scalar: 宣言の有効化スイッチ `self.hnsw_state.is_some()` が真・
+    ///   `scalar_plan` が `PlainScan` 以外・`scalar_filter_columns` が
+    ///   `Some` かつ非空・その全列がいずれかのスカラー宣言で被覆されている
+    ///   場合のみ（被覆されない列が 1 つでもあれば実行時は
+    ///   `FallbackNoIndex` で全走査に落ちるため索引使用を主張しない。
+    ///   トークン自体の実行時整合は #1153 の管轄）
+    #[allow(clippy::too_many_arguments)] // Issue #1066 で `scalar_filter_columns` 追加により 8 引数。hnsw.rs と同じ方針で許容する。
     fn explain_engine_for(
         &self,
         table: &str,
@@ -4881,25 +4985,47 @@ impl EngineCore {
         filters_empty: bool,
         scalar_prefilter: bool,
         scalar_plan: crate::sql::scalar_plan::ScalarPlan,
-    ) -> crate::sql::explain::ExplainEngine {
+        scalar_filter_columns: Option<&[&str]>,
+    ) -> (
+        crate::sql::explain::ExplainEngine,
+        crate::sql::explain::ExplainIndexNames,
+    ) {
+        let declarations_enabled = self.hnsw_state.is_some();
         // Issue #1065: `ann_plan:` 表示は実行時判定（`sql::exec` の
         // `hnsw_enabled`）と同じゲート（`catalog::hnsw_targeted_in_txn`）を
         // 通す（実行時判定と `EXPLAIN` 表示の乖離を作らない。`hnsw_state` の
         // `lookup`／`prepare_*` は呼ばない副作用なしの読み取り専用判定）。
+        // `declarations_enabled == false`（opt-in なしの既定エンジン）では
+        // `hnsw_enabled` は常に `false`・索引名も常に空になるため、旧実装
+        // （`self.hnsw_state.is_some() && match begin_read() {..}` の短絡評価）
+        // と同じくカタログに一切触れない（advisor 指摘対応・Issue #1066:
+        // 索引名の組み立てを追加した際に txn を無条件で開くよう誤って変更
+        // すると、既定エンジンの EXPLAIN 毎に不要な索引カタログ全件走査
+        // （最大 `MAX_INDEX_COUNT` 件のデコード）という新規 I/O 副作用を生む）。
         // 読み取りに使う txn はこの表示専用に新規で開き（`EXPLAIN` は検索本体
         // を実行しないため計画開始時の txn を引き回さない）、失敗時は
-        // fail-closed に `false`（brute-force 表示）へ倒す。
-        let hnsw_enabled = self.hnsw_state.is_some()
-            && match self.storage.db().begin_read() {
-                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
-                    &read_txn,
-                    &self.index_catalog_gate_cache,
-                    table,
-                    self.hnsw_scope,
-                    true,
-                ),
-                Err(_) => false,
-            };
+        // fail-closed に `false`（brute-force 表示）・索引名なしへ倒す。
+        let (hnsw_enabled, index_decls) = if declarations_enabled {
+            match self.storage.db().begin_read() {
+                Ok(read_txn) => {
+                    let hnsw_enabled = crate::catalog::hnsw_targeted_in_txn(
+                        &read_txn,
+                        &self.index_catalog_gate_cache,
+                        table,
+                        self.hnsw_scope,
+                        true,
+                    );
+                    // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
+                    // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
+                    // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
+                    let decls = crate::catalog::explain_index_names_in_txn(&read_txn, table).ok();
+                    (hnsw_enabled, decls)
+                }
+                Err(_) => (false, None),
+            }
+        } else {
+            (false, None)
+        };
         let ann_plan =
             crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
                 hnsw_enabled,
@@ -4909,7 +5035,33 @@ impl EngineCore {
                 filters_empty,
                 scalar_prefilter,
             });
-        crate::sql::explain::ExplainEngine::new(self.search_engine_kind(), ann_plan, scalar_plan)
+
+        let ann_names = match (&index_decls, ann_plan) {
+            (
+                Some(decls),
+                crate::sql::hnsw_cache::AnnPlan::HnswFullVisible
+                | crate::sql::hnsw_cache::AnnPlan::HnswSubset,
+            ) => decls.hnsw.clone(),
+            _ => Vec::new(),
+        };
+        let scalar_names = match (&index_decls, scalar_filter_columns) {
+            (Some(decls), Some(cols))
+                if declarations_enabled
+                    && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan) =>
+            {
+                scalar_index_names_for_columns(&decls.scalar, cols)
+            }
+            _ => Vec::new(),
+        };
+
+        (
+            crate::sql::explain::ExplainEngine::new(
+                self.search_engine_kind(),
+                ann_plan,
+                scalar_plan,
+            ),
+            crate::sql::explain::ExplainIndexNames::new(ann_names, scalar_names),
+        )
     }
 
     /// `EXPLAIN SELECT ...`（`USING PLAN` を伴わない検索 SELECT。`ORDER BY
@@ -4933,7 +5085,7 @@ impl EngineCore {
             session.udfs(),
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
-            self.search_explain_from_bound(&bound),
+            self.search_explain_from_bound(&schema, &bound),
         ))
     }
 
@@ -4945,9 +5097,14 @@ impl EngineCore {
     /// この私的ヘルパーを共有することで、同じ意味の要求が SQL 経由・NoSQL
     /// 経由のどちらでもビット同一の行を返す契約を構造として保証する
     /// （第 2 の実装を作らない設計）。検索本体（`hnsw_state` の
-    /// `lookup`／`prepare_*`・`SearchProvider::search`）は呼ばない。
+    /// `lookup`／`prepare_*`・`SearchProvider::search`）は呼ばない。`schema`
+    /// （Issue #1066）は `bound` を束縛したのと同一スキーマで、
+    /// `metadata_filters` の `column_index()` を索引名注記の被覆判定用の
+    /// 列名へ写像するために使う（`bound.table()` と同一テーブルであることは
+    /// 呼び出し元がいずれも `bind` 直後に呼ぶ契約により保証される）。
     fn search_explain_from_bound(
         &self,
+        schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
     ) -> crate::sql::exec::QueryResult {
         let is_hybrid = matches!(bound.ranking(), crate::sql::parser::Ranking::Hybrid { .. });
@@ -4968,15 +5125,22 @@ impl EngineCore {
                 or_filters: bound.or_filters(),
             },
         );
-        let engine = self.explain_engine_for(
+        // Issue #1066: `metadata_filters` が参照する列を同一 `schema` で
+        // 列名へ写像する（添字は `MetadataFilter::column_index` のドキュメント
+        // どおり `schema.columns` と同一空間）。写像に失敗する列があれば
+        // fail-closed に `None`（索引名なし）へ倒す。
+        let scalar_filter_column_names =
+            metadata_filter_column_names(schema, bound.metadata_filters());
+        let (engine, index_names) = self.explain_engine_for(
             bound.table(),
             is_hybrid,
             is_precision,
             filters_empty,
             scalar_prefilter,
             scalar_plan,
+            scalar_filter_column_names.as_deref(),
         );
-        crate::sql::explain::build_search_explain_result(bound.mode(), &engine)
+        crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
     }
 
     /// `EXPLAIN SELECT <集計>`（`GROUP BY`・`SELECT DISTINCT` の脱糖形いずれも。
@@ -4996,7 +5160,7 @@ impl EngineCore {
         let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
         Ok(crate::sql::SqlOutcome::Explain(
-            Self::aggregate_explain_from_bound(&schema, &bound),
+            self.aggregate_explain_from_bound(&schema, &bound),
         ))
     }
 
@@ -5006,16 +5170,47 @@ impl EngineCore {
     /// `EXPLAIN SELECT <集計>` テキスト経由）と
     /// [`Self::explain_bound_aggregate_in_session`]（NoSQL 表層の `aggregate`
     /// op の `explain: true`）の両方が共有する（第 2 の実装を作らない設計）。
-    /// `self` を使わない（`classify_aggregate_access` がテーブルスキーマと
-    /// 束縛結果だけから静的判定する純粋関数のため）静的メソッドとし、
-    /// 呼び出し元がどちらの経路でも同一の判定式を通ることを型で示す。
+    /// `classify_aggregate_access` 自体はテーブルスキーマと束縛結果だけから
+    /// 静的判定する純粋関数のままだが、Issue #1066 で `scalar_plan:` 行への
+    /// 使用索引名注記を追加したため、カタログ読み取り（`self.storage`）が
+    /// 必要になり `&self` メソッドへ変更した（`classify_aggregate_access`
+    /// 自体の判定式は変えない。#1153 のスコープ）。`access_path` が
+    /// `ScalarIndexCandidates`（索引経由の候補削減が使える形）のときに限り、
+    /// `metadata_filters` の列がすべて対象テーブルのスカラー宣言で被覆されて
+    /// いるかを新規 read txn で判定する（ann は常に対象外——集計 EXPLAIN は
+    /// `ann_plan:` 行を出さない）。カタログ読み取り失敗・列名写像失敗は
+    /// fail-closed に名前なしへ倒す。
     fn aggregate_explain_from_bound(
+        &self,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
     ) -> crate::sql::exec::QueryResult {
         let (scalar_plan, access_path) =
             crate::sql::aggregate::classify_aggregate_access(schema, bound);
-        crate::sql::explain::build_relational_explain_result(scalar_plan, access_path)
+        let index_names = if matches!(
+            access_path,
+            crate::sql::explain::AccessPath::ScalarIndexCandidates
+        ) && self.hnsw_state.is_some()
+        {
+            match metadata_filter_column_names(schema, bound.metadata_filters()) {
+                Some(cols) if !cols.is_empty() => match self.storage.db().begin_read() {
+                    Ok(read_txn) => {
+                        match crate::catalog::explain_index_names_in_txn(&read_txn, bound.table()) {
+                            Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
+                                Vec::new(),
+                                scalar_index_names_for_columns(&decls.scalar, &cols),
+                            ),
+                            Err(_) => crate::sql::explain::ExplainIndexNames::default(),
+                        }
+                    }
+                    Err(_) => crate::sql::explain::ExplainIndexNames::default(),
+                },
+                _ => crate::sql::explain::ExplainIndexNames::default(),
+            }
+        } else {
+            crate::sql::explain::ExplainIndexNames::default()
+        };
+        crate::sql::explain::build_relational_explain_result(scalar_plan, access_path, &index_names)
     }
 
     /// `EXPLAIN SELECT ... LIMIT n [OFFSET m]`（広域取得。ビュー展開後の形を
@@ -5047,6 +5242,7 @@ impl EngineCore {
         crate::sql::explain::build_relational_explain_result(
             crate::sql::scalar_plan::ScalarPlan::PlainScan,
             crate::sql::explain::AccessPath::FullScan,
+            &crate::sql::explain::ExplainIndexNames::default(),
         )
     }
 
@@ -5219,7 +5415,7 @@ impl EngineCore {
                 "bound search plan targets a different table than requested",
             ));
         }
-        Ok(self.search_explain_from_bound(&bound))
+        Ok(self.search_explain_from_bound(&schema, &bound))
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）の
@@ -5287,7 +5483,7 @@ impl EngineCore {
                 "bound aggregate plan targets a different table than requested",
             ));
         }
-        Ok(Self::aggregate_explain_from_bound(&schema, &bound))
+        Ok(self.aggregate_explain_from_bound(&schema, &bound))
     }
 
     /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を
