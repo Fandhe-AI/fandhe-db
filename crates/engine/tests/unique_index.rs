@@ -19,6 +19,7 @@ use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
 use engine::sql::mode::SessionState;
 use engine::storage::{RowInput, Storage, Visibility};
+use redb::{Database, ReadableDatabase, TableHandle};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -60,6 +61,21 @@ fn count_rows(core: &EngineCore, ctx: &PolicyContext) -> usize {
         .expect("scan should succeed")
         .rows
         .len()
+}
+
+/// 生 `redb::Database` を再オープンし、`user_uniq/{table}` テーブルが物理的に
+/// 存在するかを確認する（`persist3_on_disk_row_entry_layout_via_raw_redb`
+/// と同じ「`list_tables` で実際のテーブル集合を直接見る」流儀。呼び出し元は
+/// 先に `Storage`／`EngineCore` を drop してファイルロックを解放しておくこと）。
+fn unique_index_table_exists(path: &std::path::Path, table: &str) -> bool {
+    let db = Database::open(path).expect("reopen raw database for table existence check");
+    let read_txn = db.begin_read().expect("begin read txn");
+    let index_table_name = format!("user_uniq/{table}");
+    let found = read_txn
+        .list_tables()
+        .expect("list tables")
+        .any(|handle| handle.name() == index_table_name);
+    found
 }
 
 /// DELETE で削除した行の一意キー値は、別の commit された文で再利用できる
@@ -364,4 +380,87 @@ fn key_freed_by_updating_it_to_null_can_be_reused_by_a_later_committed_insert() 
     );
 
     assert_eq!(count_rows(&core, &alice), 2);
+}
+
+/// TRUNCATE は、索引がまだ一度も構築されていないテナント（UNIQUE 列を持つ
+/// テーブルへ一度も書き込んでいない）に対しても呼ばれるが、
+/// `user_uniq/{table}` を新規作成してはならない——「索引テーブルは初回の
+/// 一意キー検査（`ensure_tenant_index`）まで物理的に未作成」という契約
+/// （`unique_index.rs` モジュールドキュメント「索引テーブルの物理レイアウト」
+/// 参照）に反する空テーブルの永続化を防ぐ回帰（codex P2 指摘・PR #1123。
+/// `clear_tenant_in_txn` が `WriteTransaction::open_table` で存在確認して
+/// いたため、`open_table` 自体が存在しないテーブルを暗黙作成してしまって
+/// いた）。
+#[test]
+fn truncate_on_a_tenant_whose_index_was_never_built_does_not_create_the_index_table() {
+    let (core, path) = new_core("uniq-index-truncate-never-built");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+
+    // alice はこのテーブルへ一度も書き込んでいないため、
+    // `ensure_tenant_index` による索引の遅延バックフィルは一度も走っていない。
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "TRUNCATE TABLE docs USING OPERATION_ID 'op-truncate'",
+    )
+    .expect("truncate an already-empty table");
+    drop(core);
+
+    assert!(
+        !unique_index_table_exists(&path, "docs"),
+        "TRUNCATE on a tenant whose unique index was never built must not \
+         create an empty user_uniq/docs table"
+    );
+}
+
+/// DELETE も同様に、索引がまだ物理的に構築されていないテナントの既存行に
+/// 対して呼ばれうる（`ALTER TABLE ... ADD UNIQUE` は既存行の重複を直接
+/// 走査で検査するのみで、索引の実構築は次回書き込みまで遅延する。
+/// `add_unique_constraint_invalidates_index_and_lazily_rebuilds_on_next_write`
+/// と同じ状況）。この場合も `forget_rows_in_txn` が `user_uniq/{table}` を
+/// 新規作成してはならない（codex P2 指摘・PR #1123）。
+#[test]
+fn delete_on_a_tenant_whose_index_was_never_built_does_not_create_the_index_table() {
+    let (core, path) = new_core("uniq-index-delete-never-built");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT)")
+        .expect("create table without a UNIQUE constraint yet");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert before the constraint exists (no index is built for this write)");
+    drop(core);
+
+    // `alter_table_add_unique_constraint`（Rust API）は既存行の重複を直接
+    // 走査で検査するのみで、索引の実構築は行わない（次回書き込みまで遅延）。
+    let storage = Storage::open(&path).expect("reopen storage");
+    storage
+        .alter_table_add_unique_constraint("docs", &["a"])
+        .expect("add unique constraint (no existing duplicates)");
+    drop(storage);
+    assert!(
+        !unique_index_table_exists(&path, "docs"),
+        "adding the constraint itself must not create the index table"
+    );
+
+    let core = core_from_path(&path);
+    core.execute_delete_sql(
+        &alice,
+        "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-delete'",
+    )
+    .expect("delete the pre-existing row whose index was never built");
+    drop(core);
+
+    assert!(
+        !unique_index_table_exists(&path, "docs"),
+        "DELETE on a tenant whose unique index was never built must not \
+         create an empty user_uniq/docs table"
+    );
 }
