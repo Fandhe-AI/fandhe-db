@@ -1918,7 +1918,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
         // 切って再オープンする）。
         if !written_ids.is_empty() {
             drop(row_table);
-            crate::constraint::enforce_row_constraints_in_txn(
+            let delta = crate::constraint::enforce_row_constraints_in_txn(
                 &write_txn,
                 table,
                 &schema,
@@ -1926,22 +1926,31 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 &written_ids,
                 crate::constraint::FkCheckMode::All,
             )?;
-        }
-        // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
-        // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査する
-        // （更新した列が主キー・UNIQUE 制約の構成列を含む場合のみ実際に走査する）。
-        if updated > 0 {
-            if let UpsertAction::DoUpdate(assignments) = action {
-                let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
-                crate::constraint::enforce_referencing_rows_in_txn(
-                    &write_txn,
-                    table,
-                    &schema,
-                    ctx.tenant_id(),
-                    crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
-                    Some(&pre_images),
-                    crate::constraint::FkCheckMode::All,
-                )?;
+            // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
+            // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査
+            // する（更新した列が主キー・UNIQUE 制約の構成列を含む場合のみ
+            // 実際に検査する）。永続キー索引の差分（`delta`）は直前の
+            // `enforce_row_constraints_in_txn` が `written_ids`（今回の
+            // INSERT・UPDATE 双方を含む）に対して同期済みのものをそのまま
+            // 再利用する（`key_index.rs` モジュールドキュメント参照）。`pre_images`
+            // は ON UPDATE 参照アクション（Issue #1076）の連鎖起点。
+            if updated > 0 {
+                if let UpsertAction::DoUpdate(assignments) = action {
+                    let updated_columns: Vec<usize> =
+                        assignments.iter().map(|(idx, _)| *idx).collect();
+                    crate::constraint::enforce_referencing_rows_in_txn(
+                        &write_txn,
+                        table,
+                        &schema,
+                        ctx.tenant_id(),
+                        crate::constraint::ReferencedRowsChange::ColumnsUpdated {
+                            indices: &updated_columns,
+                            delta: &delta,
+                        },
+                        Some(&pre_images),
+                        crate::constraint::FkCheckMode::All,
+                    )?;
+                }
             }
         }
     }
@@ -2084,7 +2093,7 @@ pub(crate) fn update_row_unchecked(
     // ドキュメント参照）。
     {
         let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-        crate::constraint::enforce_row_constraints_in_txn(
+        let delta = crate::constraint::enforce_row_constraints_in_txn(
             &write_txn,
             table,
             &schema_for_pk,
@@ -2094,13 +2103,13 @@ pub(crate) fn update_row_unchecked(
         )?;
         // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
         // 参照先とする `FOREIGN KEY` の参照先側も検査する（TABLE-17・TASK-205、
-        // Issue #907）。
+        // Issue #907）。永続キー索引の差分は直前の同期をそのまま再利用する。
         crate::constraint::enforce_referencing_rows_in_txn(
             &write_txn,
             table,
             &schema_for_pk,
             ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::AllColumnsReplaced,
+            crate::constraint::ReferencedRowsChange::AllColumnsReplaced { delta: &delta },
             Some(&pre_images),
             crate::constraint::FkCheckMode::All,
         )?;
@@ -2889,7 +2898,7 @@ pub(crate) fn update_row_columns_unchecked(
         // 明示的に drop してから読み取りハンドルとして再度開く）。
         if rows_affected > 0 {
             drop(row_table);
-            crate::constraint::enforce_row_constraints_in_txn(
+            let delta = crate::constraint::enforce_row_constraints_in_txn(
                 &write_txn,
                 table,
                 &schema,
@@ -2898,14 +2907,18 @@ pub(crate) fn update_row_columns_unchecked(
                 crate::constraint::FkCheckMode::All,
             )?;
             // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
-            // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ走査）。
+            // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ
+            // 検査。永続キー索引の差分は直前の同期をそのまま再利用する）。
             let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
             crate::constraint::enforce_referencing_rows_in_txn(
                 &write_txn,
                 table,
                 &schema,
                 ctx.tenant_id(),
-                crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+                crate::constraint::ReferencedRowsChange::ColumnsUpdated {
+                    indices: &updated_columns,
+                    delta: &delta,
+                },
                 Some(&pre_images),
                 crate::constraint::FkCheckMode::All,
             )?;
@@ -3231,7 +3244,7 @@ fn delete_row_impl(
             table,
             &schema,
             ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed,
+            crate::constraint::ReferencedRowsChange::Removed { ids: &[id] },
             needs_fk_removed_pre_image.then_some(&removed_pre_images),
             crate::constraint::FkCheckMode::All,
         )?;
@@ -3330,7 +3343,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     )
 }
 
-/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-195）
+/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-193）
 /// の実体。テーブル定義（カタログ）は残したまま、セッションのテナントが所有する
 /// 全行（`Visibility` を問わない）を単一 write トランザクションで削除する
 /// （[`delete_row_unchecked`]・[`replace_typed_rows_by_text_key`] と並ぶ 3 つ目の
@@ -3659,7 +3672,9 @@ pub(crate) fn delete_rows_where_unchecked<E>(
             table,
             &schema,
             ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed,
+            crate::constraint::ReferencedRowsChange::Removed {
+                ids: &candidate_ids,
+            },
             needs_fk_removed_pre_image.then_some(&removed_pre_images),
             crate::constraint::FkCheckMode::All,
         )
@@ -3826,7 +3841,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
     // 一致行が 0 件（何も書き込んでいない）場合は呼ばない（`constraint.rs`
     // モジュールドキュメント参照）。
     if !candidate_ids.is_empty() {
-        crate::constraint::enforce_row_constraints_in_txn(
+        let delta = crate::constraint::enforce_row_constraints_in_txn(
             &write_txn,
             table,
             &schema,
@@ -3836,14 +3851,18 @@ pub(crate) fn update_rows_where_unchecked<E>(
         )
         .map_err(dml_write_err)?;
         // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
-        // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ走査）。
+        // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ検査。永続
+        // キー索引の差分は直前の同期をそのまま再利用する）。
         let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
         crate::constraint::enforce_referencing_rows_in_txn(
             &write_txn,
             table,
             &schema,
             ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+            crate::constraint::ReferencedRowsChange::ColumnsUpdated {
+                indices: &updated_columns,
+                delta: &delta,
+            },
             Some(&pre_images),
             crate::constraint::FkCheckMode::All,
         )
@@ -4012,6 +4031,11 @@ pub(crate) fn replace_typed_rows_by_text_key(
     // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
     // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
     // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
+    // 置換で実際に削除した旧行 id（クロージャ内の `to_remove` の写し）。
+    // `ReplaceOutcome`（公開 API）に id 一覧を持たせずに済ませるため、クロージャの
+    // 外側でこの `Vec` を用意し、クロージャ内から書き込む（Issue #1071: 参照先側
+    // FK 検査〔`ReferencedRowsChange::Removed`〕が索引の同期に必要とする）。
+    let mut removed_ids: Vec<u64> = Vec::new();
     let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
         let schema = require_table_schema_write(&write_txn, table)?;
         let vector_idx = schema
@@ -4032,6 +4056,27 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     "unknown key column: {key_column}"
                 )))
             })?;
+
+        // `user_rows/{table}` を開く**前**に、このテーブルを参照先とする
+        // FOREIGN KEY（列参照。`id` 参照は索引を使わない）の永続キー索引を、
+        // テナント `ctx.tenant_id()` の現在（この文の削除・挿入より前）の状態
+        // から backfill・登録しておく（Issue #1071 レビュー指摘・cursor bugbot
+        // 指摘: この backfill が旧行の物理削除**後**に初めて走ると、削除された
+        // 旧行の旧キーが逆引き索引の pre-image に一度も現れず、直後の
+        // 参照先側検査〔`enforce_referencing_rows_in_txn`〕が「失われたキー
+        // なし」と誤判定し他の子行からの参照をすり抜ける。行ストアを開いた
+        // 後に呼ぶと `redb::TableError::TableAlreadyOpen`
+        // になる（`ensure_index_in_txn` も同じ行ストアを開くため。この関数の
+        // `mut row_table` は削除・挿入の完了までこのクロージャ内で生き続ける）。
+        // 削除対象が実際にあるかどうかはこの時点でまだ分からないが、
+        // 冪等（既に登録済みなら何もしない）なので無条件に呼んでよい。
+        // `constraint::prepare_referenced_key_indexes_in_txn` ドキュメント参照。
+        crate::constraint::prepare_referenced_key_indexes_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+        )?;
 
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
@@ -4238,6 +4283,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
             })?;
         }
 
+        removed_ids = to_remove.clone();
         Ok(ReplaceOutcome {
             removed,
             inserted,
@@ -4285,7 +4331,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
             table,
             &schema_for_fk,
             ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed,
+            crate::constraint::ReferencedRowsChange::Removed { ids: &removed_ids },
             needs_fk_removed_pre_image.then_some(&removed_pre_images),
             crate::constraint::FkCheckMode::All,
         )?;

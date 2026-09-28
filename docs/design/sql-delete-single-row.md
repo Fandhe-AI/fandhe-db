@@ -17,7 +17,7 @@ DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'
 - `id` 疑似列の等価指定のみを受理する（`AND` 結合・`id` 以外の列に対する述語・
   `WHERE` 省略はいずれも許可リスト外・`42601`）。述語つき `DELETE`（SQL-19 系）は
   別 Issue の管轄で、本 Issue の対象外。
-- `INSERT`（TASK-80・SQL-10）・`TRUNCATE`（TASK-195・SQL-22）と同じ「文末専用句
+- `INSERT`（TASK-80・SQL-10）・`TRUNCATE`（TASK-193・SQL-22）と同じ「文末専用句
   `USING OPERATION_ID '<id>'`」規範を踏襲する。省略・明示 `NULL` はいずれも
   `LedgerMode::Ledgered`（既定）で `23502`。
 - `EXPLAIN DELETE ...` は許可形状に存在しないため、先頭トークンが `EXPLAIN` の場合は

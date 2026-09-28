@@ -487,7 +487,7 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Insert(outcome) => OutcomeResponse::Command {
             tag: format!("INSERT 0 {}", outcome.rows_affected),
         },
-        // TASK-195（SQL-22）: `TRUNCATE TABLE`（`exec::TruncateOutcome`。削除件数を
+        // TASK-193（SQL-22）: `TRUNCATE TABLE`（`exec::TruncateOutcome`。削除件数を
         // 一切返さない契約）の応答を pg 互換の `CommandComplete` タグ
         // `TRUNCATE TABLE`（件数を持たない固定タグ）へ整形する。
         SqlOutcome::Truncate(_) => OutcomeResponse::Command {

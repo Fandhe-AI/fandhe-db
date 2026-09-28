@@ -2357,7 +2357,7 @@ fn finalize_primary_key(
     Ok(Some(pk_cols))
 }
 
-/// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
+/// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-193）。テーブル定義
 /// （カタログ）は残したまま、セッションのテナントが所有する全行を削除する
 /// 書き込み系操作（DDL ではない）として扱う。
 ///
@@ -5007,7 +5007,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `TRUNCATE TABLE <table> USING OPERATION_ID '<id>' [;]` の単一テーブル形
-    /// のみを受理する（SQL-22、TASK-195）。複数テーブル指定・`CASCADE`／
+    /// のみを受理する（SQL-22、TASK-193）。複数テーブル指定・`CASCADE`／
     /// `RESTART IDENTITY` 等の PostgreSQL 拡張句は構造的に受理しない
     /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否する）。
     fn parse_truncate(&mut self) -> Result<ParsedTruncateShape, SqlSurfaceError> {
@@ -6449,7 +6449,7 @@ pub(crate) fn validate_drop_view_tokens(
 }
 
 /// 構文木（[`ValidatedTruncate`] の元）。カタログ存在確認前の中間結果
-/// （SQL-22、TASK-195）。
+/// （SQL-22、TASK-193）。
 struct ParsedTruncateShape {
     table_name: String,
     operation_id: Option<OperationId>,
@@ -8482,7 +8482,7 @@ pub(crate) fn validate_insert_tokens_with_limit(
 }
 
 /// TRUNCATE 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を
-/// 通じて対象テーブルがカタログに実在するかを確認する（SQL-22、TASK-195 の
+/// 通じて対象テーブルがカタログに実在するかを確認する（SQL-22、TASK-193 の
 /// 公開 API）。`validate_insert` と全く同じ設計（構造検証のみを担当し、意味論
 /// 検証・実行本体は呼び出し元 `sql::exec::execute_truncate` へ委譲する）。
 ///
@@ -11913,7 +11913,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // --- validate_truncate（SQL-22、TASK-195） ---------------------------------
+    // --- validate_truncate（SQL-22、TASK-193） ---------------------------------
 
     #[test]
     fn accepts_truncate_with_operation_id_clause() {

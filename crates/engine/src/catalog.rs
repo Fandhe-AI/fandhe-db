@@ -5178,6 +5178,11 @@ impl Storage {
         // 索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn・同一 commit で整合
         // させる（[`delete_indexes_for_table_in_txn`] 参照）。
         delete_indexes_for_table_in_txn(&write_txn, table_name)?;
+        // 永続キー索引（`key_index.rs`、Issue #1071）も同一 txn・同一 commit で
+        // 削除する。残置すると同名テーブルの再作成後に旧テナント・旧スキーマ
+        // 由来のキーが混入し、参照整合性検査が fail-open に誤判定しうる
+        // （`key_index::drop_indexes_for_table_in_txn` ドキュメント参照）。
+        crate::key_index::drop_indexes_for_table_in_txn(&write_txn, table_name)?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
