@@ -1422,6 +1422,13 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                     &lost_ids,
                 )?
             }
+        } else if !delta.is_registered(fk.parent_columns()) {
+            // 索引が未登録（旧 DB・初回参照）の場合、`lost_keys` の空集合は
+            // 「変化なし」ではなく「追跡対象外」を意味し得る。誤って
+            // 「検査不要」と判定すると fail-open になるため、`None` を返して
+            // 呼び出し元の全行走査フォールバックへ委ねる（Issue #1071 レビュー
+            // 指摘・docs/design/foreign-key.md 参照）。
+            None
         } else {
             let lost = delta.lost_keys(fk.parent_columns());
             if lost.is_empty() {
@@ -2003,5 +2010,89 @@ mod tests {
             .expect_err("identical array must conflict");
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
+    }
+
+    // --- Issue #1071 レビュー指摘: 列参照 FK の索引未登録フォールバック漏れ ---
+
+    /// 列参照 FK（`fk.references_parent_id()` が偽）の `Removed` 分岐は、
+    /// 参照先索引が未登録（索引導入前の既存データを想定）の場合に
+    /// `KeyIndexDelta::lost_keys` の空集合を「変化なし」と誤解釈し、
+    /// [`enforce_referencing_rows_by_scan_for_fk`] へのフォールバックを
+    /// 経由せず fail-open に「違反なし」と判定してしまっていた
+    /// （`docs/design/foreign-key.md` の索引化前フォールバック方針参照）。
+    ///
+    /// 子行を [`verify_required_parent_keys`]（FK 検査。索引を未登録なら
+    /// 構築する）を経由せず直接書き込むことで、索引導入前の既存データ
+    /// （子行はあるが `(children, ["parent_code"])` 索引は未登録）を再現し、
+    /// この状態で親行を削除しても違反として拒否されることを確認する。
+    #[test]
+    fn deleting_column_referenced_parent_with_unregistered_index_is_rejected() {
+        let (storage, _guard) = tmp_storage("constraint-fk-unregistered-index");
+        let parent_schema = TableSchema::new(
+            "parents",
+            vec![ColumnDef::new(
+                "code",
+                crate::catalog::ColumnType::Text,
+                false,
+            )],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "code".to_string()
+        ])]);
+        storage
+            .create_table(&parent_schema)
+            .expect("create parent table");
+
+        let child_schema = TableSchema::new(
+            "children",
+            vec![ColumnDef::new(
+                "parent_code",
+                crate::catalog::ColumnType::Text,
+                true,
+            )],
+        )
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["parent_code".to_string()],
+            "parents".to_string(),
+            vec!["code".to_string()],
+        )]);
+        storage
+            .create_table(&child_schema)
+            .expect("create child table");
+
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("a".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-parent").expect("op id"),
+        )
+        .expect("parent insert must succeed");
+
+        // FK 検査（`verify_required_parent_keys`）を経由しない直接書き込みで、
+        // 索引導入前の既存データ（子行はあるが索引は未登録）を再現する。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            put_raw_row(
+                &write_txn,
+                &child_schema,
+                "tenant-a",
+                1,
+                &[Value::Text("a".to_string())],
+            );
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        let err = crate::tenant::delete_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            1,
+            &crate::recovery::required_op_id::OperationId::parse("op-del").expect("op id"),
+        )
+        .expect_err("deleting a still-referenced parent row must be rejected");
+        assert!(matches!(err, TenantWriteError::ForeignKeyViolation));
     }
 }

@@ -221,6 +221,17 @@ impl KeyIndexDelta {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// `columns` に対応する索引が、この差分の計算時点で登録済みだったか。
+    ///
+    /// `lost_keys` が空集合を返すケースは「登録済みで実際に変化なし」と
+    /// 「未登録で追跡対象外」の両方があり得るため区別できない
+    /// （Issue #1071 レビュー指摘）。呼び出し元はこのフラグで未登録を
+    /// 判別し、未登録なら [`none_referenced_in_txn`] 等と同じ
+    /// フォールバック（全行走査 + 索引構築）へ回す。
+    pub(crate) fn is_registered(&self, columns: &[String]) -> bool {
+        self.registered.contains(&index_name_for_columns(columns))
+    }
 }
 
 /// `table` の登録簿に記録済みの索引名を列挙する（`table` に一致するものだけ）。
