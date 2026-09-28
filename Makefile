@@ -190,6 +190,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため crash-test-cross-table をスキップ"
 endif
 
+.PHONY: crash-test-unique-index
+crash-test-unique-index: ## 永続一意索引・クラッシュ耐性回帰テスト（Issue #1070・TABLE-16。scripts/crash_test_unique_index.sh を実行）
+ifdef HAS_CARGO
+	scripts/crash_test_unique_index.sh
+else
+	@echo "skip: Cargo.toml 未追加のため crash-test-unique-index をスキップ"
+endif
+
 .PHONY: core-api-check
 core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差分検知（TASK-125・CORE-1。cargo 不要のテキスト比較）
 	scripts/check_core_api.sh --self-test
@@ -267,7 +275,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
