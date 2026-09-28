@@ -118,11 +118,11 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
 - 索引の物理表現は引き続き `(table, PolicyContext)` 可視スナップショットから構築される
   （索引が他テナントの行を含むことはない）。索引宣言は `PolicyContext` を取らない
   全テナント共有の DDL であり、RLS の暗黙適用を一切変更しない。
-- 宣言の作成前後・削除後でテナントごとの述語付き取得・集計の結果が完全に
-  一致することを `crates/engine/tests/sql_index_ddl.rs` で固定している。検索結果に
-  ついても、既定エンジン（brute-force）下、またはスカラー宣言のみの場合は同様に
-  完全一致する。ただし `--search-engine hnsw*` opt-in 下での HNSW 宣言は対象テーブル
-  の Top-k を変え得る（後述「対象外（申し送り）」・
+- 宣言の作成前後・削除後でテナントごとの検索・述語付き取得・集計の結果が完全に
+  一致することを `crates/engine/tests/sql_index_ddl.rs` で固定している。
+  `--search-engine hnsw*` opt-in 下でも、HNSW 適格性ゲートはテーブル単位で宣言の
+  有無により検索経路を切り替えないため、HNSW 宣言の追加・削除は宣言したテーブル・
+  他テーブルのいずれの Top-k も変えない（`crates/engine/tests/index_declaration_targets.rs`・
   [index-declaration-effects.md](index-declaration-effects.md) を参照）。
 
 **索引宣言の構築対象への反映**（本ドキュメント初版で「対象外」としていた事項）は
@@ -132,17 +132,13 @@ Issue #1065 で実装済み。詳細・設計判断は
 ## 対象外（申し送り）
 
 1. **`EXPLAIN` への索引名露出**: `scalar_plan:`／`ann_plan:` 行への索引名（宣言名）
-   そのものの追記は対象外のまま（引き続き未実装）。ただし `ann_plan:` の**判定結果**
-   （HNSW／brute-force のいずれで実行されるか）は Issue #1065 で構築対象反映に組み込み
-   済みで、`catalog::hnsw_targeted_in_txn` を経由して宣言の有無を反映する
-   （[index-declaration-effects.md](index-declaration-effects.md) 参照）。そのため
-   HNSW 宣言（`CREATE INDEX ... USING hnsw`）の作成・削除は対象テーブル・他テーブルの
-   `ann_plan:` 表示を変え得る。一方 `scalar_plan:` は束縛時の静的判定のまま宣言の影響を
-   受けないため、宣言前後で `EXPLAIN` の出力が不変なのはスカラー宣言のみ（HNSW 宣言では
-   不変ではない）。HNSW 対象テーブルは近似（HNSW）と厳密（brute-force）が原理的に
-   一致しない Top-k を返し得る差異も伴う
-   （[index-declaration-effects.md](index-declaration-effects.md)「テナント境界・RLS
-   への影響」節参照）。
+   そのものの追記は対象外のまま（引き続き未実装）。`ann_plan:` の**判定結果**
+   （HNSW／brute-force のいずれで実行されるか）は Issue #1065 で実行時判定と同じ
+   `catalog::hnsw_targeted_in_txn` を経由するが、このゲートはテーブル単位で宣言の
+   有無により結果を変えない（索引カタログの読み取り失敗時のみ brute-force 表示へ
+   倒す）ため、HNSW 宣言（`CREATE INDEX ... USING hnsw`）の作成・削除で `ann_plan:`
+   表示は変わらない。`scalar_plan:` は束縛時の静的判定のまま宣言の影響を受けない
+   （[index-declaration-effects.md](index-declaration-effects.md) 参照）。
 2. **疎索引（BM25）の宣言**: Issue #908 本文は「ベクトル・スカラー・疎」の 3 種別を
    挙げるが、本実装は INDEX-7 のポインタに従いスカラー宣言と `USING hnsw` のみを
    受理し、`USING bm25` 等は `0A000` とする（疎索引は hybrid のたびに自動構築する

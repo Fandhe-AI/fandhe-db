@@ -4816,7 +4816,6 @@ impl EngineCore {
         // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
         // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出）へ委譲する。
         let explain_engine = self.explain_engine_for(
-            table,
             true,
             planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
             explain_shape.filters_empty(),
@@ -4844,7 +4843,6 @@ impl EngineCore {
     /// 実行しない契約はどちらの呼び出し元でも不変）。
     fn explain_engine_for(
         &self,
-        table: &str,
         is_hybrid: bool,
         is_precision: bool,
         filters_empty: bool,
@@ -4863,7 +4861,6 @@ impl EngineCore {
                 Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
                     &read_txn,
                     &self.index_catalog_gate_cache,
-                    table,
                     true,
                 ),
                 Err(_) => false,
@@ -4937,7 +4934,6 @@ impl EngineCore {
             },
         );
         let engine = self.explain_engine_for(
-            bound.table(),
             is_hybrid,
             is_precision,
             filters_empty,
@@ -6172,9 +6168,10 @@ impl EngineCore {
         // `tests/hnsw_cache.rs::rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback`
         // の docstring・`docs/design/hnsw-rls-cardinality-switch.md` 参照。
         // Issue #1065: 起動時 opt-in（`hnsw_state.is_some()`）に加え、索引宣言
-        // （`CREATE INDEX ... USING hnsw`）のカタログ全体単位の適格性ゲート
-        // （`catalog::hnsw_targeted_in_txn`。`sql::exec` の `hnsw_enabled` と
-        // 同一の判定）も満たす場合のみ HNSW 経路へ進む。この判定専用に新規の
+        // のテーブル単位の適格性ゲート（`catalog::hnsw_targeted_in_txn`。
+        // `sql::exec` の `hnsw_enabled` と同一の判定。他テーブルの宣言に影響
+        // されず、索引カタログを読み取れない場合のみ `false`）も満たす場合のみ
+        // HNSW 経路へ進む。この判定専用に新規の
         // read txn を開く（検索本体の `search_with_hnsw`／`search_with` は
         // 内部で別途 txn を開くため、ここでの読み取りは判定用の一時的なもの）。
         // 読み取り失敗は fail-closed に「対象外」（brute-force）へ倒す。
@@ -6190,7 +6187,6 @@ impl EngineCore {
                     let targeted = crate::catalog::hnsw_targeted_in_txn(
                         &read_txn,
                         &self.index_catalog_gate_cache,
-                        table,
                         true,
                     );
                     let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
@@ -6200,9 +6196,9 @@ impl EngineCore {
             }
         };
         // 上記ゲート用 read txn はここで既に閉じている。判定〜`search_with_hnsw`
-        // 呼び出しの間に別の書き込み（索引宣言を含む、テーブルを問わない任意の
-        // コミット）が挟まると、`hnsw_targeted` はもう最新のカタログ状態を反映せず、
-        // 古い判定 `true` のまま HNSW 経路（`search_with_hnsw` 内部の
+        // 呼び出しの間に別の書き込み（索引カタログの変更を含む、テーブルを問わない
+        // 任意のコミット）が挟まると、`hnsw_targeted` はもう最新のカタログ状態
+        // （読み取り可否）を反映せず、古い判定 `true` のまま HNSW 経路（`search_with_hnsw` 内部の
         // `sql::hnsw_cache::search_or_fallback`）へ進み得る（codex-review P1
         // 指摘・PR #1124）。`search_with_hnsw` 自身の世代照合（`built_generation`
         // との比較）はスナップショット構築時点からの失効しか検出せず、この判定〜

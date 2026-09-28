@@ -662,23 +662,21 @@ pub(crate) fn execute_statement_with_cache(
     // `AnnShapeInput` を組み立てて分類し、`is_hybrid` で 4 boolean へ振り分ける
     // だけに簡素化する。
     // Issue #1065: `hnsw_enabled` は起動時 opt-in（`hnsw_cache.is_some()`）に
-    // 加え、索引宣言（`CREATE INDEX ... USING hnsw`）によるカタログ全体単位の
-    // 適格性ゲート（`catalog::hnsw_targeted_in_txn`）も満たす必要がある。
-    // ここで無効化すれば DISTANCE/hybrid の 4 boolean すべて・`HnswIndexCache`
-    // 照会（適格性判定より後段）にも波及し、ゲート対象外のテーブルは
-    // `HnswIndexCache` へ一切照会・構築されない（stale 使用の経路が無い）。
-    // カタログ全件走査結果は `hnsw_cache`（`Some` の場合のみ `HnswCacheAccess::
-    // index_gate_cache` 経由）を通じて `EngineCore::index_catalog_gate_cache`
-    // を共有し、クエリのたびに再走査しない（codex-review P2 対応・PR #1124）。
-    // `hnsw_cache` が `None`（起動時 opt-in なし）の場合は `hnsw_targeted_in_txn`
-    // 自身が `hnsw_available == false` で素通しするため、カタログには一切触れない。
+    // 加え、索引宣言のテーブル単位の適格性ゲート（`catalog::hnsw_targeted_in_txn`）
+    // も満たす必要がある。ゲートは他テーブルの宣言に影響されず（宣言の有無で
+    // クエリ結果を変えない）、索引カタログを読み取れない場合にだけ fail-closed
+    // に `false`（厳密 brute-force）へ倒す。ここで無効化すれば DISTANCE/hybrid
+    // の 4 boolean すべて・`HnswIndexCache` 照会（適格性判定より後段）にも
+    // 波及し、ゲート対象外では `HnswIndexCache` へ一切照会・構築されない
+    // （stale 使用の経路が無い）。カタログ全件検証の結果は `hnsw_cache`
+    // （`Some` の場合のみ `HnswCacheAccess::index_gate_cache` 経由）を通じて
+    // `EngineCore::index_catalog_gate_cache` を共有し、クエリのたびに再走査
+    // しない（codex-review P2 対応・PR #1124）。`hnsw_cache` が `None`（起動時
+    // opt-in なし）の場合はカタログに一切触れない。
     let hnsw_enabled = match hnsw_cache.as_ref() {
-        Some(access) => crate::catalog::hnsw_targeted_in_txn(
-            read_txn,
-            access.index_gate_cache,
-            &bound.table,
-            true,
-        ),
+        Some(access) => {
+            crate::catalog::hnsw_targeted_in_txn(read_txn, access.index_gate_cache, true)
+        }
         None => false,
     };
     let ann_plan =

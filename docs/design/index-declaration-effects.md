@@ -33,7 +33,7 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
 | 起動構成 | 宣言あり | 宣言なし |
 | --- | --- | --- |
 | opt-in なし（既定エンジン・`with_provider`／`from_storage`） | 宣言は無視（現行挙動のまま） | 現行挙動 |
-| opt-in あり（`SearchEngineKind::Hnsw`） | 宣言が構築対象を**絞り込む** | 現行の自動挙動を維持 |
+| opt-in あり（`SearchEngineKind::Hnsw`） | スカラー宣言が構築対象を**絞り込む**（HNSW 宣言は経路を変えない） | 現行の自動挙動を維持 |
 
 上位スイッチは `EngineCore::hnsw_state.is_some()`（＝ `SearchEngineKind::Hnsw` で
 構築された場合のみ真）とする。今日の起動時索引 opt-in はこれだけのため、スカラー
@@ -67,38 +67,51 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
   `id` を宣言対象に含めるかで挙動を分けると複雑化するだけのため）。
 - 宣言なしのテーブルは現行の自動挙動（全対応列。`ScalarIndexTarget::Auto`）。
 
-## HNSW（カタログ全体単位）
+## HNSW（テーブル単位）
 
+- HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル単位**とし、
+  クエリ対象テーブルの経路は他テーブルの宣言に一切影響されない。Issue #1065 の
+  受け入れ条件「クエリ結果・RLS 境界が宣言の有無で変わらない（性能のみに影響）」
+  を満たすため。
 - テーブルは VECTOR 列を高々 1 本しか持てない（`catalog.rs` のスキーマ検証）ため、
-  「テーブル単位で宣言なし → 自動」は HNSW では常に真になり無効果（vacuous）に
-  なる。よって HNSW は「カタログ全体に `IndexKind::Hnsw` 宣言が 1 件でもあるか」
-  （`DeclaredIndexTargets::hnsw_anywhere`）を切替点とする
-  （`catalog::hnsw_targeted_in_txn`）:
-  - opt-in 有効かつ HNSW 宣言が 0 件: 全テーブルで現行どおり HNSW
-  - opt-in 有効かつ HNSW 宣言が 1 件以上: HNSW 経路を使うのは宣言のあるテーブル
-    のみ（他テーブルは厳密 brute-force）
+  opt-in 有効時は「宣言あり → HNSW」「宣言なし → 宣言導入前と同じ自動挙動
+  （HNSW）」となり、**HNSW 宣言は経路選択を変えない**。近似（HNSW）と厳密
+  （brute-force）の切り替えは Top-k を変え得るため、結果不変の受け入れ条件の下では
+  宣言に経路を切り替えさせる余地がない。HNSW 宣言は引き続きカタログへ永続化され
+  （`CREATE INDEX`／`DROP INDEX` の構文・検証・テーブル世代の前進は
+  [index-ddl-declaration.md](index-ddl-declaration.md) のまま）、将来「宣言必須」
+  へ引き締める場合（前節の破壊的変更）の土台になる。
+  - opt-in 有効: 索引カタログを読み取れる限り全テーブルで HNSW（宣言の有無・
+    他テーブルの宣言によらない）
   - opt-in なし: 常に brute-force
-- 他テーブルへ効く宣言でも当該他テーブルの世代は進まないが、ゲートを
-  **適格性判定（`HnswIndexCache` 照会より前）**に置くため、ゲート対象外の
-  テーブルの `HnswIndexCache` エントリは照会・構築されない（stale 使用の経路が
-  無い）。宣言削除で再び HNSW 経路に戻った際も、キャッシュは既存の世代照合＋
-  overlay の契約で正しさを保つ。
+- ゲートが宣言内容に依存しないため、判定はテーブル名を引数に取らない。索引
+  カタログの全件検証（走査上限・デコード）だけを行い、読み取れない場合は
+  fail-closed に brute-force へ倒す（次節）。
+- 旧実装（PR #1124 のレビュー前）は「カタログ全体に `IndexKind::Hnsw` 宣言が 1 件でも
+  あれば、宣言のあるテーブルだけを HNSW にする」カタログ全体単位のゲートだった。
+  これは `table_a` への宣言で未宣言の `table_b` を近似から厳密へ切り替え、
+  `table_b` の Top-k を変え得る（受け入れ条件違反）ため廃止した。
 - `sql::exec`（`AnnShapeInput.hnsw_enabled`）・`core.rs`（Rust API
   `search_with_snapshot`・`EXPLAIN` の `ann_plan:` 行）はいずれも
   `catalog::hnsw_targeted_in_txn` を呼ぶことで、実行時判定と `EXPLAIN` 表示の
   乖離を作らない。
+- Rust API（`search_with_snapshot`）は判定用 read txn を閉じてから検索本体を
+  呼ぶため、判定時に読んだストレージ世代を検索本体の直前に再照合し、その間に
+  何らかのコミットがあれば brute-force へ倒す（TOCTOU 再照合。fail-closed）。
 
 ## 宣言の読み取りと fail-closed
 
 - 宣言はクエリの `read_txn`（アリーナ・世代と同一スナップショット）から読む
-  （`catalog::declared_index_targets_in_txn`）。`Storage::list_indexes`
+  （スカラー: `catalog::declared_index_targets_in_txn`／HNSW ゲート:
+  `catalog::hnsw_targeted_in_txn` のカタログ全件検証）。`Storage::list_indexes`
   （独自に read txn を開く）はクエリ経路から呼ばない。
 - カタログ値のデコード失敗・走査上限（`MAX_INDEX_COUNT`）超過は「宣言なし→
   自動」へは倒さず、**索引を使わない側**（スカラー: 索引構築失敗扱い →
   plain scan／HNSW: brute-force）へ倒す。いずれも厳密（brute-force）結果に
   なるため誤った結果を返すことはなく、fail-soft かつ安全側（HNSW 側は通常の
-  近似経路と Top-k が異なり得るが、それは前項の近似/厳密切り替えと同じ性質の
-  差異であり本フォールバック固有の問題ではない）。
+  近似経路と Top-k が異なり得るが、宣言の有無ではなくカタログ破損という異常時に
+  限った縮退であり、`IndexCatalogGateCache` の `gate_read_failures` 統計で
+  観測できる）。
 - `EXPLAIN`（`core.rs::explain_engine_for`）はこの判定専用に新規の read txn を
   開く（検索本体を実行しない契約を保つため、計画開始時の txn を引き回さない）。
   読み取り失敗は `false`（brute-force 表示）へ倒す。
@@ -112,16 +125,14 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
 - RLS 境界（テナント間の可視性・非漏えい）は宣言の有無で変わらない。
   スカラー索引の宣言（列の絞り込み）も、索引経路と plain scan のどちらを
   通っても返す結果集合は同一であり厳密検索のまま変わらない。
-- 一方、HNSW はカタログ全体単位のゲート（§2.3）により、宣言の有無で
-  未宣言テーブルの探索方式が近似（HNSW）と厳密（brute-force）の間で切り替わる。
-  近似検索と厳密検索は原理的に一致しない Top-k を返し得るため、**HNSW 対象
-  テーブルの検索結果集合（Top-k の順序・メンバーシップ）は宣言の有無で
-  変わり得る**（RLS 境界・テナント間非漏えいは不変。影響は可視性ではなく
-  近似精度の面）。
-  `crates/engine/tests/index_declaration_targets.rs`・
+- HNSW もテーブル単位のゲート（前述「HNSW（テーブル単位）」）により、宣言の
+  有無で宣言したテーブル・他テーブルいずれの探索方式（近似／厳密）も切り替わら
+  ないため、検索結果集合（Top-k の順序・メンバーシップ）は宣言の有無で変わらない。
+  `crates/engine/tests/index_declaration_targets.rs::hnsw_declaration_on_one_table_does_not_change_other_table_results_or_path`
+  は `table_a` への HNSW 宣言の追加・削除の前後で `table_b` の経路（HNSW）と
+  Top-k（SQL 表層・Rust API とも）が一致することを、
   `crates/engine/tests/sql_index_ddl.rs::index_declarations_do_not_change_query_results_or_rls`
-  はテナント境界の非漏えいと、スカラー索引経路が結果集合を変えないことを固定
-  している（brute-force と HNSW の Top-k 差異そのものは対象外）。
+  はテナント境界の非漏えいと結果不変をそれぞれ固定している。
 
 ## 対象外（申し送り）
 
@@ -154,25 +165,26 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
 - スカラー専用 opt-in の新設（上位スイッチは起動時 HNSW opt-in のみ）
 - **`IndexCatalogGateCache`（`catalog.rs`）はストレージ全体世代キーのため、
   索引宣言と無関係な行 DML の commit でも次回参照時に再走査が起きる**
-  （codex-review P2 指摘・PR #1124）: `hnsw_targeted_in_txn` の走査結果
-  キャッシュは `crate::storage::current_generation_in_txn`（ストレージ全体の
-  単一世代カウンタ）をキーにしている。これは索引宣言を変更する 4 経路
+  （codex-review P2 指摘・PR #1124）: `hnsw_targeted_in_txn` のカタログ全件
+  検証の結果キャッシュは `crate::storage::current_generation_in_txn`（ストレージ
+  全体の単一世代カウンタ）をキーにしている。これは索引カタログを変更する 4 経路
   （`create_index`／`drop_index`／`drop_table`／`alter_table_drop_column`）
   がいずれも commit 前に必ずこのカウンタを進める（取りこぼしなし）ことを
   根拠に選んだキーだが、宣言と無関係な通常の行 DML でも同じカウンタが進む
   ため、書き込みと検索が交互に発生する構成ではキャッシュがほぼ効かず、
   キャッシュ導入前と同じフルスキャン 1 回分のコストが検索のたびに残る
   （悪化はしない。`catalog.rs` の `IndexCatalogGateCache` ドキュメンテーション
-  コメント参照）。是正する場合の設計方針: 上記 4 経路の commit 時にのみ
-  進む専用の「索引カタログ世代」カウンタを新設し、`hnsw_targeted_in_txn`・
-  スカラー宣言解決の両方をそのカウンタでキー付けする（ストレージ全体世代
-  ではなく専用カウンタを読むことで通常の行 DML による過剰無効化を避ける）。
+  コメント参照）。ゲートのテーブル単位化で判定は宣言内容に依存しなくなった
+  （キャッシュが守るのは索引カタログの読み取り可否だけ）ため、stale な
+  キャッシュが経路選択を誤らせる余地は旧カタログ全体単位ゲートより小さい。
+  是正する場合の設計方針: 上記 4 経路の commit 時にのみ進む専用の「索引
+  カタログ世代」カウンタを新設し、`hnsw_targeted_in_txn`・スカラー宣言解決の
+  両方をそのカウンタでキー付けする（通常の行 DML による過剰無効化を避ける）。
   ただし新カウンタは commit_boundary 経由の全 4 経路で確実に進める必要があり
-  （1 経路でも取りこぼすと TOCTOU 再照合と同種の fail-open ―
-  stale な `hnsw_anywhere=false` が未宣言テーブルを誤って HNSW 経路へ通す ―
-  を再導入する）、永続フォーマット（新カウンタ未保持の既存 DB）との
-  互換性も設計する必要があるため、宣言のみを対象にした部分修正は行わず
-  別 Issue（`perf` 分類）の対象とする。
+  （1 経路でも取りこぼすと、読み取れなくなった索引カタログに対して stale な
+  検証成功を再利用し、fail-closed の縮退を取りこぼす）、永続フォーマット（新カウンタ未保持の既存 DB）との
+  互換性も設計する必要があるため、本 Issue では部分修正を行わず別 Issue
+  （`perf` 分類）の対象とする。
 
 ## 影響を受ける既存 fixture
 
@@ -186,7 +198,11 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
 ## テスト
 
 - `crates/engine/tests/index_declaration_targets.rs`（新規）: opt-in なしでの
-  無効果・opt-in ありでのスカラー列絞り込み・カタログ全体単位の HNSW ゲート・
-  `DROP INDEX` によるゲート復帰・テナント境界の非漏えいを結合テストで固定。
+  無効果・opt-in ありでのスカラー列絞り込み・テーブル単位の HNSW ゲート（他
+  テーブルへの HNSW 宣言の追加・`DROP INDEX` の前後で未宣言テーブルの経路と
+  Top-k が不変）・テナント境界の非漏えいを結合テストで固定。
+- `crates/engine/src/catalog.rs` の単体テスト: `hnsw_targeted_in_txn` が他テーブル
+  の宣言で変わらないこと・カタログ破損時の fail-closed 縮退と
+  `gate_read_failures` 計上・`read_txn` スナップショット隔離（TOCTOU 前提）を固定。
 - `crates/engine/tests/sql_index_ddl.rs`: 既存の結果不変テストは無変更のまま
   green（opt-in なしでの回帰）。

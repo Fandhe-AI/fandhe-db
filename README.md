@@ -178,9 +178,11 @@ SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780
 ません（本 CLI の語彙は `default`／`hnsw`／`hnsw_f16`／`hnsw_i8` の 4 値に限定）。
 `--search-engine` は `CREATE INDEX`（索引宣言）の効果に対する上位スイッチでも
 あります（Issue #1065）。`hnsw`／`hnsw_f16`／`hnsw_i8` を指定した場合に限り、
-宣言がスカラー索引・HNSW 索引の構築対象を絞り込みます（宣言なしのテーブル・
-列は現行の自動挙動のまま）。`default`（未指定）では宣言の有無によらず挙動は
-変わりません。詳細は `docs/design/index-declaration-effects.md` 参照。
+スカラー索引の宣言がそのテーブルの索引構築対象の列を絞り込みます（宣言なしの
+テーブルは現行の自動挙動のまま）。HNSW 索引の宣言（`USING hnsw`）は検索経路を
+切り替えず、宣言したテーブル・他テーブルとも宣言前と同じく HNSW を使います
+（宣言の有無でクエリ結果は変わりません）。`default`（未指定）では宣言の有無に
+よらず挙動は変わりません。詳細は `docs/design/index-declaration-effects.md` 参照。
 
 `--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
 `--hnsw-sparse-visited-max`（Issue #657）はフィルタ付き ANN の探索パラメータ

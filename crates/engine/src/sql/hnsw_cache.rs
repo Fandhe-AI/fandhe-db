@@ -1091,8 +1091,8 @@ thread_local! {
 /// `sql::exec::execute_statement_with_cache` へ渡すキャッシュアクセス束
 /// （Issue #408）。`storage`・`cache` に加え、`effective_ef`／構築パラメータへ
 /// アクセスするための `provider`（`Copy`）を束ねる。`index_gate_cache` は
-/// `catalog::hnsw_targeted_in_txn`（Issue #1065 適格性ゲート）のカタログ全件
-/// 走査結果をストレージ世代単位で共有するキャッシュ（`EngineCore::
+/// `catalog::hnsw_targeted_in_txn`（Issue #1065 テーブル単位の適格性ゲート）の
+/// 索引カタログ全件検証の結果をストレージ世代単位で共有するキャッシュ（`EngineCore::
 /// index_catalog_gate_cache` をそのまま貸し出す。`sql::exec` は `EngineCore`
 /// を持たないため、本構造体経由で受け取る。codex-review P2 対応・PR #1124）。
 pub(crate) struct HnswCacheAccess<'a> {

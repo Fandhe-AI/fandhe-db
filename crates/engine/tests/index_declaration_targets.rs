@@ -12,20 +12,15 @@
 //! - opt-in ありでスカラー宣言（一部の列のみ）がある場合、宣言列への `WHERE`
 //!   は索引経路（`index_scans`）を使い、宣言外の列への `WHERE` は plain scan
 //!   （`plain_scan_fallbacks`）へ縮退すること
-//! - opt-in ありで HNSW 宣言がカタログの一部テーブルにのみある場合、宣言
-//!   テーブルは HNSW 経路（`builds`/`hits` 増加）を使い、宣言のない他テーブル
-//!   は厳密 brute-force のまま（HNSW 統計が増加しない）こと（§2.3 カタログ
-//!   全体単位のゲート）
-//! - `DROP INDEX`／`CREATE INDEX` によるテーブル世代の変化で、キャッシュ経路が
-//!   追随して切り替わること
-//! - いずれの構成でも RLS 境界（テナント間非漏えい）は変わらないこと。ただし
-//!   HNSW 宣言がある場合、未宣言テーブルは近似（HNSW）から厳密（brute-force）
-//!   へ切り替わるため、その Top-k 結果集合は宣言の有無で変わり得る（本テストは
-//!   経路の切り替わり自体を統計で固定し、Top-k の一致は主張しない。
-//!   `docs/design/index-declaration-effects.md`「テナント境界・RLS への影響」）
+//! - opt-in ありで HNSW 宣言がカタログの一部テーブル（`table_a`）にのみある
+//!   場合も、宣言のない他テーブル（`table_b`）の検索経路（HNSW）と Top-k 結果
+//!   （SQL 表層・Rust API とも）は宣言の追加・削除の前後で一切変わらないこと
+//!   （HNSW 適格性ゲートはテーブル単位。`docs/design/index-declaration-effects.md`
+//!   「HNSW（テーブル単位）」）
+//! - いずれの構成でも RLS 境界（テナント間非漏えい）は変わらないこと
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::core::EngineCore;
+use engine::core::{EngineCore, VectorCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
@@ -309,12 +304,33 @@ fn scalar_declaration_scopes_index_to_declared_columns_with_hnsw_opt_in() {
     );
 }
 
-/// opt-in ありで HNSW 宣言が一部テーブルのみにある場合、宣言テーブルは HNSW
-/// 経路（`builds`/`hits` 増加）を使い、宣言のない他テーブルは厳密
-/// brute-force のまま（HNSW 統計が増えない）ことを固定する（§2.3 カタログ
-/// 全体単位のゲート）。
+/// `HnswIndexCache` が照会された（＝HNSW 適格性ゲートを通過し HNSW 経路へ
+/// 進んだ）回数の合計（新規構築 `builds` と索引済み探索 `hits`）。ゲート
+/// 対象外（brute-force）ではどちらも増えない。
+fn hnsw_path_count(core: &EngineCore) -> u64 {
+    let stats = core.hnsw_index_cache_stats();
+    stats.builds + stats.hits
+}
+
+/// Rust API（`VectorCore::search`）の Top-k を比較可能な形へ写す。
+fn rust_api_top_k(core: &EngineCore, table: &str, query: &[f32]) -> Vec<(String, u64, u32)> {
+    core.search(&ctx("tenant-a"), table, query, 5)
+        .expect("rust api search")
+        .into_iter()
+        .map(|h| (h.tenant_id, h.id, h.score.to_bits()))
+        .collect()
+}
+
+/// opt-in ありで `table_a` にだけ HNSW 宣言を追加・削除しても、宣言のない
+/// `table_b` の検索経路（HNSW）と Top-k 結果（SQL 表層・Rust API とも）が
+/// 一切変わらないことを固定する（Issue #1065 の「クエリ結果が宣言の有無で
+/// 変わらない」受け入れ条件。旧カタログ全体単位ゲートでは `table_a` への
+/// 宣言で `table_b` が近似〔HNSW〕から厳密〔brute-force〕へ切り替わり Top-k が
+/// 変わり得た回帰の防止。`docs/design/index-declaration-effects.md`
+/// 「HNSW（テーブル単位）」）。宣言した `table_a` 自身も宣言前と同じく HNSW
+/// 経路のまま（HNSW 宣言は経路選択を変えない）。
 #[test]
-fn hnsw_declaration_gates_per_table_when_declared_anywhere_in_catalog() {
+fn hnsw_declaration_on_one_table_does_not_change_other_table_results_or_path() {
     let path = unique_db_path("index-decl-hnsw-per-table");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -333,6 +349,42 @@ fn hnsw_declaration_gates_per_table_when_declared_anywhere_in_catalog() {
         search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
     let core = EngineCore::from_storage_with_engine(storage, kind);
     let mut session = allowed_session();
+
+    let q_a = format!(
+        "SELECT id FROM table_a ORDER BY embedding <=> '{}' LIMIT 5",
+        vec_literal(&vectors_a[0])
+    );
+    let q_b = format!(
+        "SELECT id FROM table_b ORDER BY embedding <=> '{}' LIMIT 5",
+        vec_literal(&vectors_b[0])
+    );
+    // `table_b` を 1 回問い合わせ、SQL 表層の結果・Rust API の結果とともに
+    // HNSW 経路を通ったこと（`hnsw_path_count` の増加）を確認して返す。
+    let observe_b = |label: &str| {
+        let before = hnsw_path_count(&core);
+        let sql = core
+            .execute_sql(&ctx("tenant-a"), &q_b)
+            .unwrap_or_else(|e| panic!("sql distance query on table_b ({label}): {e:?}"));
+        let after_sql = hnsw_path_count(&core);
+        assert!(
+            after_sql > before,
+            "table_b (sql, {label}) must use the hnsw path: {:?}",
+            core.hnsw_index_cache_stats()
+        );
+        let api = rust_api_top_k(&core, "table_b", &vectors_b[0]);
+        assert!(
+            hnsw_path_count(&core) > after_sql,
+            "table_b (rust api, {label}) must use the hnsw path: {:?}",
+            core.hnsw_index_cache_stats()
+        );
+        (sql, api)
+    };
+
+    // 宣言前（カタログに宣言 0 件）: `table_b` は HNSW（宣言導入前の自動挙動）。
+    let (sql_before, api_before) = observe_b("before declaration");
+    assert_eq!(sql_before.rows.len(), 5);
+    assert_eq!(api_before.len(), 5);
+
     core.execute_sql_in_session(
         &ctx("tenant-a"),
         &mut session,
@@ -340,39 +392,31 @@ fn hnsw_declaration_gates_per_table_when_declared_anywhere_in_catalog() {
     )
     .expect("declare hnsw index on table_a only");
 
-    let q = format!(
-        "SELECT id FROM table_a ORDER BY embedding <=> '{}' LIMIT 5",
-        vec_literal(&vectors_a[0])
-    );
-    core.execute_sql(&ctx("tenant-a"), &q)
+    // 宣言した `table_a` 自身も HNSW 経路。
+    let before_a = hnsw_path_count(&core);
+    core.execute_sql(&ctx("tenant-a"), &q_a)
         .expect("distance query on declared table");
-    let stats_after_a = core.hnsw_index_cache_stats();
     assert!(
-        stats_after_a.builds > 0,
-        "declared table must use the hnsw path: {stats_after_a:?}"
+        hnsw_path_count(&core) > before_a,
+        "declared table must use the hnsw path: {:?}",
+        core.hnsw_index_cache_stats()
     );
 
-    let q_b = format!(
-        "SELECT id FROM table_b ORDER BY embedding <=> '{}' LIMIT 5",
-        vec_literal(&vectors_b[0])
-    );
-    core.execute_sql(&ctx("tenant-a"), &q_b)
-        .expect("distance query on undeclared table");
-    let stats_after_b = core.hnsw_index_cache_stats();
+    // `table_a` への宣言後も `table_b` の経路・結果は宣言前と同一。
+    let (sql_after, api_after) = observe_b("after declaration on table_a");
     assert_eq!(
-        stats_after_b.builds, stats_after_a.builds,
-        "undeclared table must not use the hnsw path once any hnsw declaration exists: {stats_after_b:?}"
+        sql_after, sql_before,
+        "declaring an index on table_a must not change table_b sql results"
+    );
+    assert_eq!(
+        api_after, api_before,
+        "declaring an index on table_a must not change table_b rust api results"
     );
 
-    // `DROP INDEX` で宣言を消すと、カタログ全体で HNSW 宣言が 0 件へ戻り
-    // 両テーブルとも現行どおり HNSW 経路（全テーブル自動）に戻る。
+    // `DROP INDEX` 後も同一。
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
         .expect("drop hnsw declaration");
-    core.execute_sql(&ctx("tenant-a"), &q_b)
-        .expect("distance query on table_b after dropping the only hnsw declaration");
-    let stats_after_drop = core.hnsw_index_cache_stats();
-    assert!(
-        stats_after_drop.builds > stats_after_b.builds,
-        "table_b must use the hnsw path again once no hnsw declaration remains: {stats_after_drop:?}"
-    );
+    let (sql_dropped, api_dropped) = observe_b("after dropping the declaration");
+    assert_eq!(sql_dropped, sql_before);
+    assert_eq!(api_dropped, api_before);
 }
