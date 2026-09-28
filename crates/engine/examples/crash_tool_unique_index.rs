@@ -271,12 +271,24 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
 
     // 永続一意索引の不変条件そのものを検証する（本ツール固有のオラクル）:
     // 生存する各行の `code` 値は正引きエントリを持たなければならない
-    // （`docs/design/unique-index.md`「正しさの不変条件」）。既存 id の総数と
-    // 衝突しない新しい id（`total_rows + id`）で同じ `code` 値の再挿入を試み、
-    // 必ず `23505`（UNIQUE 制約違反）で拒否されることを確認する。索引エントリが
-    // クラッシュ後の復旧で欠落していれば、その値だけ誤って受理されてしまう。
-    // 拒否された文は副作用を残さない（fail-closed。行・索引のいずれも書き換え
-    // られない）ため、`write` が再開する id 採番と衝突しない。
+    // （`docs/design/unique-index.md`「正しさの不変条件」）。
+    //
+    // 読み取り専用の事前検証（PR #1123 レビュー対応。Codex 指摘: 索引
+    // テーブル・マーカーが欠落していても、下の重複 INSERT プローブ自体が
+    // 書き込み経路の `ensure_tenant_index` を経由して索引を静かに再構築して
+    // しまうため、プローブは常に `23505` で拒否され欠落を見逃す）。プローブより
+    // 前に、マーカーと各行の正引きエントリを読み取るだけで検証し、書き込みは
+    // 一切行わない `verify_unique_index_read_only` を通す——ここで失敗すれば、
+    // クラッシュ後の索引復旧が壊れていることを、再構築に隠蔽されずに検出できる。
+    core.verify_unique_index_read_only(&ctx, "docs")
+        .map_err(|e| {
+            format!("read-only unique index verification failed before duplicate probes: {e}")
+        })?;
+    // 既存 id の総数と衝突しない新しい id（`total_rows + id`）で同じ `code` 値の
+    // 再挿入を試み、必ず `23505`（UNIQUE 制約違反）で拒否されることを確認する
+    // （上記の読み取り専用検証を通過済みの索引に対する、書き込み経路からの
+    // 二重確認）。拒否された文は副作用を残さない（fail-closed。行・索引の
+    // いずれも書き換えられない）ため、`write` が再開する id 採番と衝突しない。
     for &id in &ids {
         let probe_id = total_rows
             .checked_add(id)

@@ -466,6 +466,83 @@ where
     Ok(())
 }
 
+/// テナントの索引が「完全に構築済み」という不変条件を**読み取り専用**で検証する
+/// （クラッシュ耐性検証専用の診断 API。§モジュールドキュメント「正しさの不変
+/// 条件」参照。Issue #1070・PR #1123 レビュー対応）。[`ensure_tenant_index`] と
+/// 異なり、マーカー不在・不一致・正引きエントリ欠落を検出しても**絶対に
+/// 再構築・書き込みをしない**——`examples/crash_tool_unique_index.rs` の
+/// `verify` は重複 INSERT が `23505` で拒否されることを索引永続性の証拠として
+/// いたが、その INSERT プローブ自体が `enforce_unique_keys_in_txn` 経由で
+/// `ensure_tenant_index` を呼び、索引テーブル・マーカーの欠落を検出次第
+/// 静かに再構築してから判定してしまうため、クラッシュ後の索引欠落そのものを
+/// 検出できない（プローブは常に拒否される）。本関数はプローブより前に、
+/// マーカーと各生存行の正引きエントリの存在を読み取るだけで検証し、1 件でも
+/// 欠落・不一致があれば `Err` を返す。
+pub(super) fn verify_tenant_index_read_only<R, I>(
+    row_table: &R,
+    index_table: &I,
+    schema: &TableSchema,
+    specs: &[KeySpec],
+    mask: &[bool],
+    tenant_id: &str,
+) -> Result<(), TenantWriteError>
+where
+    R: ReadableTable<(&'static str, u64), &'static [u8]>,
+    I: ReadableTable<(&'static str, &'static [u8]), &'static [u8]>,
+{
+    let signature = schema_signature(schema, specs);
+    let marker_key = (tenant_id, MARKER_SUBKEY.as_slice());
+    let up_to_date = match index_table.get(marker_key).map_err(storage_error)? {
+        Some(guard) => {
+            let v = guard.value();
+            v.len() == 4 + signature.len()
+                && v.get(0..4) == Some(FORMAT_VERSION.to_be_bytes().as_slice())
+                && v.get(4..) == Some(signature.as_slice())
+        }
+        None => false,
+    };
+    if !up_to_date {
+        return Err(internal(
+            "unique index marker is missing or stale (read-only verification)",
+        ));
+    }
+
+    let start = std::ops::Bound::Included((tenant_id, 0u64));
+    let end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    let iter = row_table
+        .range::<(&str, u64)>((start, end))
+        .map_err(storage_error)?;
+    for entry in iter {
+        let (k, v) = entry.map_err(storage_error)?;
+        let (key_tenant, id) = k.value();
+        if key_tenant != tenant_id {
+            // 閉区間の構築上到達しないはずだが defense-in-depth で維持する
+            // （`ensure_tenant_index` と同じ判断）。
+            break;
+        }
+        let values = decode_key_columns(schema, mask, v.value())?;
+        for (ordinal, spec) in specs.iter().enumerate() {
+            let Some(canonical) = key_bytes(spec, &values).map_err(internal)? else {
+                continue;
+            };
+            let ordinal_u16 = u16::try_from(ordinal)
+                .map_err(|_| internal("unique key ordinal exceeds u16 range"))?;
+            let sub = forward_subkey(ordinal_u16, &canonical);
+            let owner = index_table
+                .get((tenant_id, sub.as_slice()))
+                .map_err(storage_error)?
+                .map(|guard| decode_row_id(guard.value()))
+                .transpose()?;
+            if owner != Some(id) {
+                return Err(internal(
+                    "unique index forward entry missing for a live row (read-only verification)",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`super::enforce_unique_keys_in_txn`] の実処理本体（[`ensure_tenant_index`]
 /// の後に呼ぶ）。`written_ids` が今回書き込んだ・上書きした行の一意キー値を
 /// 索引に反映しつつ、他の生存行との衝突を検出する。手順は本モジュールの

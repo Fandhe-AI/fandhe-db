@@ -312,6 +312,47 @@ pub(crate) fn forget_unique_index_rows_in_txn(
     unique_index::forget_rows_in_txn(write_txn, table_name, schema, tenant_id, ids)
 }
 
+/// クラッシュ耐性検証ツール（`examples/crash_tool_unique_index.rs`）専用の
+/// 読み取り専用診断 API（[`EngineCore::verify_unique_index_read_only`] から
+/// 呼ばれる。Issue #1070・PR #1123 レビュー対応）。テナントの永続一意索引が
+/// 「完全に構築済み」という不変条件（[`unique_index`] モジュールドキュメント
+/// 「正しさの不変条件」参照）を、[`enforce_unique_keys_in_txn`] と異なり
+/// **一切書き込まず**に検証する（[`unique_index::verify_tenant_index_read_only`]
+/// のドキュメント参照——書き込み経路の遅延バックフィルは索引欠落を静かに
+/// 再構築してしまうため、クラッシュ後の索引欠落そのものを検出する用途には
+/// 使えない）。マーカー不在・不一致、または生存行のいずれかが正引きエントリを
+/// 欠く場合は `Err` を返す。主キーも UNIQUE 制約も宣言しないテーブルは即座に
+/// 成功する。
+///
+/// [`EngineCore::verify_unique_index_read_only`]: crate::core::EngineCore::verify_unique_index_read_only
+pub(crate) fn verify_unique_index_read_only(
+    read_txn: &redb::ReadTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+) -> Result<(), TenantWriteError> {
+    if schema.primary_key().is_none() && schema.unique_constraints().is_empty() {
+        return Ok(());
+    }
+    let (specs, mask) = key_specs(schema)?;
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = read_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let index_table_name = crate::catalog::user_uniq_table_name(table_name);
+    let index_table = read_txn
+        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+    unique_index::verify_tenant_index_read_only(
+        &row_table,
+        &index_table,
+        schema,
+        &specs,
+        &mask,
+        tenant_id,
+    )
+}
+
 /// TRUNCATE（`tenant.rs::truncate_table_unchecked`）が、行ストアの `retain_in`
 /// 後・`row_table` を drop した後の同一 write トランザクション内から呼ぶ、
 /// テナント範囲の永続一意索引クリア窓口（[`unique_index::clear_tenant_in_txn`]
