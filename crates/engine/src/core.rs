@@ -1169,9 +1169,11 @@ pub struct EngineCore {
     /// では `None` のまま（常に従来どおり全件 brute-force。詳細は
     /// `sql::hnsw_cache::HnswIndexCache` のドキュメント参照）。
     hnsw_state: Option<HnswEngineState>,
-    /// `catalog::hnsw_targeted_in_txn` のカタログ全件走査結果をストレージ全体
+    /// `catalog::hnsw_targeted_in_txn` のカタログ全件走査結果を索引カタログ専用
     /// 世代単位で再利用するキャッシュ（codex-review P2 対応・Issue #1065
-    /// PR #1124）。`hnsw_state` の有無に関わらず常時構築する（`hnsw_targeted_in_txn`
+    /// PR #1124。Issue #1154 でキーをストレージ全体世代から専用世代へ切り替え、
+    /// 索引宣言と無関係な行 DML では無効化されないようにした）。`hnsw_state`
+    /// の有無に関わらず常時構築する（`hnsw_targeted_in_txn`
     /// 自身が `hnsw_available == false` を最初に見て素通しするため、未使用でも
     /// 空のキャッシュを持つだけで副作用はない）。[`Self::explain_engine_for`]・
     /// [`Self::search_with_snapshot`] が直接、`sql::exec` は
@@ -1898,10 +1900,11 @@ impl EngineCore {
     /// `catalog::IndexCatalogGateCache` の現在の統計を返す（codex-review Low
     /// 指摘対応・Issue #1065。テスト・運用観測用）。HNSW 適格性ゲート
     /// （`catalog::hnsw_targeted_in_txn`）がカタログ読み取り失敗で brute-force へ
-    /// fail-closed 縮退した回数（`gate_read_failures`）のみを持ち、テナント ID・
-    /// 行データ等の機微情報は含まない。`VectorCore` trait には載せない固有
-    /// メソッド（`core_api.snapshot` の対象外。`hnsw_index_cache_stats` と同じ
-    /// 方針）。
+    /// fail-closed 縮退した回数（`gate_read_failures`）と、キャッシュがミスし
+    /// 索引カタログを実走査した回数（`catalog_scans`。Issue #1154）のみを持ち、
+    /// テナント ID・行データ等の機微情報は含まない。`VectorCore` trait には
+    /// 載せない固有メソッド（`core_api.snapshot` の対象外。`hnsw_index_cache_stats`
+    /// と同じ方針）。
     pub fn index_catalog_gate_cache_stats(&self) -> crate::catalog::IndexCatalogGateCacheStats {
         self.index_catalog_gate_cache.stats()
     }
@@ -6644,6 +6647,15 @@ impl EngineCore {
         // コミットされていれば `hnsw_targeted` を強制的に `false` へ倒して
         // brute-force 側（`snapshot.search_with`）へ縮退させる（fail-closed。
         // 縮退先は既存の非 HNSW 経路そのままで、近似ではなく厳密な結果になる）。
+        // Issue #1154: `index_catalog_gate_cache` のキーは索引カタログ専用世代へ
+        // 切り替えたが、この再照合はあえてストレージ全体世代
+        // （`current_generation`）のまま据え置く。ここは「判定〜呼び出しの間に
+        // "何か 1 件でも" commit されたら縮退する」ための安全弁であり、索引
+        // カタログの変更だけを見る専用世代に緩めると、対象テーブルへの行 DML
+        // が判定直後に commit された場合の失効検出を落としてしまう（`gate_generation`
+        // は「索引カタログを読み取った瞬間の全体状態」のスナップショット照合を
+        // 担っており、`IndexCatalogGateCache` のキャッシュキー選定とは別の関心
+        // 事）。索引カタログ世代へ緩める性能改善自体は本 Issue の対象外。
         let hnsw_targeted = hnsw_targeted
             && gate_generation.is_some()
             && self.storage.current_generation().ok() == gate_generation;

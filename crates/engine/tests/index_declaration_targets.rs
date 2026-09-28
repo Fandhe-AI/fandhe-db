@@ -601,3 +601,91 @@ fn hnsw_scope_has_no_effect_without_hnsw_opt_in() {
         "without hnsw opt-in the scope must not enable hnsw"
     );
 }
+
+/// `IndexCatalogGateCache`（Issue #1154）が索引カタログ専用世代をキーにし、
+/// 索引宣言と無関係な通常の行 DML（`INSERT`／`UPDATE`／`DELETE`）では無効化
+/// されないこと（受け入れ条件 1）と、`CREATE INDEX ... USING hnsw`／
+/// `DROP INDEX`（索引カタログを実際に変える commit）では取りこぼさず再判定
+/// すること（受け入れ条件 2）を、SQL 表層・Rust API・`EXPLAIN` の 3 経路を
+/// 通して固定する。`observe` 1 回につき 3 経路すべてが `hnsw_targeted_in_txn`
+/// を呼ぶが、同一世代内なら `EngineCore::index_catalog_gate_cache_stats` の
+/// `catalog_scans` は 1 回しか増えない（キャッシュ済み世代内の再利用）。
+#[test]
+fn hnsw_scope_declared_gate_cache_ignores_row_dml_but_tracks_index_ddl() {
+    let (core, _guard, vectors_a, _vectors_b) =
+        two_table_hnsw_core("index-decl-gate-cache-generation", HnswScope::Declared);
+    let mut session = allowed_session();
+
+    // 宣言なし: table_a は厳密のまま。3 経路（sql・rust api・explain）が同一
+    // 世代内で判定するため、走査は 1 回に収まる。
+    observe(&core, "table_a", &vectors_a[0], false, "before declaration");
+    let scans_after_first_observe = core.index_catalog_gate_cache_stats().catalog_scans;
+    assert_eq!(
+        scans_after_first_observe, 1,
+        "the first observation must scan the index catalog exactly once across all 3 surfaces"
+    );
+
+    // 索引宣言と無関係な行 DML（INSERT・UPDATE・DELETE）。索引カタログには
+    // 一切触れないため、専用世代は変わらないはず（受け入れ条件 1）。
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        &format!(
+            "INSERT INTO table_a (id, embedding, lang, topic) VALUES ({}, '{}', 'ja', 'alpha') USING OPERATION_ID 'gate-cache-insert'",
+            HNSW_ROWS,
+            vec_literal(&vectors_a[0]),
+        ),
+    )
+    .expect("insert row unrelated to index catalog");
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "UPDATE table_a SET lang = 'en' WHERE id = 0 USING OPERATION_ID 'gate-cache-update'",
+    )
+    .expect("update row unrelated to index catalog");
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        &format!(
+            "DELETE FROM table_a WHERE id = {HNSW_ROWS} USING OPERATION_ID 'gate-cache-delete'"
+        ),
+    )
+    .expect("delete row unrelated to index catalog");
+
+    observe(&core, "table_a", &vectors_a[0], false, "after row dml");
+    assert_eq!(
+        core.index_catalog_gate_cache_stats().catalog_scans,
+        scans_after_first_observe,
+        "row DML (INSERT/UPDATE/DELETE) must not invalidate the index catalog gate cache"
+    );
+
+    // `CREATE INDEX ... USING hnsw`（索引カタログを実際に変える）は取りこぼさず
+    // 再判定し、table_a は HNSW 経路へ切り替わる（受け入れ条件 2）。
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
+    )
+    .expect("declare hnsw index on table_a");
+    observe(&core, "table_a", &vectors_a[0], true, "declared");
+    let scans_after_declare = core.index_catalog_gate_cache_stats().catalog_scans;
+    assert!(
+        scans_after_declare > scans_after_first_observe,
+        "CREATE INDEX must invalidate the cached judgement and force a rescan"
+    );
+
+    // `DROP INDEX` も同様に取りこぼさず再判定し、table_a は厳密へ戻る。
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
+        .expect("drop hnsw declaration");
+    observe(&core, "table_a", &vectors_a[0], false, "dropped");
+    assert!(
+        core.index_catalog_gate_cache_stats().catalog_scans > scans_after_declare,
+        "DROP INDEX must invalidate the cached judgement and force a rescan"
+    );
+
+    assert_eq!(
+        core.index_catalog_gate_cache_stats().gate_read_failures,
+        0,
+        "no catalog read failure is expected in this fixture"
+    );
+}
