@@ -1120,8 +1120,17 @@ impl UpdatedKeyPreImages {
 
     /// 更新前の id `id` の全列値 `values` を記録する（`tenant.rs` の書き込み
     /// 関数が既存行を上書きする直前に呼ぶ契約）。
+    ///
+    /// 同じ `id` を同一文内で複数回記録しようとした場合（Cursor Bugbot 指摘・
+    /// PR #1138）は最初の呼び出しだけを残す。複数行 `UPSERT` の `UNIQUE` 対象で
+    /// 複数の `VALUES` 行が同じ既存行に衝突すると、2 回目以降の呼び出しは
+    /// 「1 回目の更新が反映された後」の中間状態を渡す——`collect_action_targets`
+    /// の `ColumnsUpdated` 分岐はこの値を「文が始まる前」の旧キーとして使うため、
+    /// 後勝ちで上書きすると本来の旧キーを失い、対象の子行を取り違える（見失う・
+    /// 別のキーへ連鎖する）。最初の記録が唯一の真の文実行前スナップショットで
+    /// あるため、以降の呼び出しは無視する。
     pub(crate) fn record(&mut self, id: u64, values: Vec<crate::row_codec::Value>) {
-        self.old_values.insert(id, values);
+        self.old_values.entry(id).or_insert(values);
     }
 }
 
@@ -1666,15 +1675,21 @@ fn propagate_referential_actions(
     }
 
     // Pass 2（適用。codex-review 指摘・PR #1138）: `referencing`（カタログ走査順＝
-    // 概ね宣言順）ではなく、FK 自身の構造（参照元列・参照先テーブル・参照先列。
-    // `ForeignKeyDef::shares_reference_shape` が保証する一意な組）で決まる正準順に
-    // 並べ替えてから適用し、declaration 順に依存しない決定的な結果にする。
-    // `CASCADE`（削除）は行そのものを消すため、他アクションとどちらの順で交差
-    // しても最終状態は削除に収束する（`apply_referential_action` の `SET NULL`／
-    // `SET DEFAULT` 分岐は削除済み行を素通りし、`CASCADE` 側は `id` で読み直す
-    // ため既に書き換えられた行も問題なく削除できる）。同じ列に `SET NULL` と
-    // `SET DEFAULT` が競合する退化ケースだけは適用順で最終値が変わり得るため、
-    // 宣言順ではなく FK の構造キーで固定する。
+    // 概ね宣言順）ではなく、FK 自身の構造（参照元の子テーブル名・参照元列・
+    // 参照先テーブル・参照先列）で決まる正準順に並べ替えてから適用し、
+    // declaration 順に依存しない決定的な結果にする。`ForeignKeyDef::
+    // shares_reference_shape` は同一テーブル内での重複宣言だけを禁止するため
+    // （`referencing` は複数の異なる子テーブルにまたがりうる）、子テーブル名を
+    // キーの先頭に含めて全体で一意にする（異なる子テーブルの行ストアは互いに
+    // 独立に書き込むため、それら同士の適用順自体は結果に影響しないが、キーの
+    // 一意性そのものは保つ）。`CASCADE`（削除）は行そのものを消すため、他
+    // アクションとどちらの順で交差しても最終状態は削除に収束する
+    // （`apply_referential_action` の `SET NULL`／`SET DEFAULT` 分岐は削除済み
+    // 行を素通りし、`CASCADE` 側は `id` で読み直すため既に書き換えられた行も
+    // 問題なく削除できる）。同じ列に `SET NULL` と `SET DEFAULT` が競合する
+    // 退化ケースだけは適用順で最終値が変わり得るため、宣言順ではなく FK の
+    // 構造キーで固定する（キーの大小関係が結果を決めるだけで、それ自体に
+    // PostgreSQL 由来の意味はない）。
     pending_actions.sort_by(|a, b| {
         let key_of = |item: &(
             &TableSchema,
@@ -1683,6 +1698,7 @@ fn propagate_referential_actions(
             ActionTargets,
         )| {
             (
+                item.0.name.clone(),
                 item.1.columns().to_vec(),
                 item.1.parent_table().to_string(),
                 item.1.parent_columns().to_vec(),
@@ -1922,7 +1938,12 @@ fn collect_action_targets(
             // より広い（保守的だが `INITIALLY DEFERRED` では過剰連鎖になり得る）走査。
             // どのキーが目的か事前に絞れないため `wanted_keys` は渡さないが、
             // 行数上限は走査中に判定する（`scan_child_fk_rows_for_keys` ドキュメント
-            // 参照）。
+            // 参照）。**注意**: `wanted_keys = None` の場合、上限は「孤立している
+            // 子行の件数」ではなく「非 NULL キーを持つ子行の総数」で判定される
+            // （孤立判定〔`present_keys` との突合せ〕は走査後に行うため）。この
+            // 経路は現状到達しないため実害はないが、到達する呼び出し元を新設する
+            // 場合は、非孤立行が `MAX_REFERENTIAL_ACTION_ROWS` を超えるだけで
+            // 無関係に `54000` へ倒れうる点に注意すること。
             let child_rows = scan_child_fk_rows_for_keys(
                 write_txn,
                 child_schema,
@@ -3223,5 +3244,26 @@ mod tests {
         );
 
         write_txn.abort().expect("abort");
+    }
+
+    /// `UpdatedKeyPreImages::record` は同じ `id` への 2 回目以降の呼び出しを
+    /// 無視し、最初に記録した値（文実行前の真のスナップショット）を保持し続ける
+    /// （Cursor Bugbot 指摘・PR #1138）。呼び出し元（`tenant.rs`）は現状いずれも
+    /// 1 文につき同じ id を 1 回しか記録しない契約を守っている（複数行 `UPSERT`
+    /// の `UNIQUE` 対象は「同一文内で同じ対象キーを持つ複数の `VALUES` 行」を
+    /// `tenant::upsert_typed_rows` が事前に拒否するため、同じ既存行が同一文内で
+    /// 2 回書き換わる経路は現状到達しない）が、本関数自体の契約として単体でも
+    /// 固定しておく。
+    #[test]
+    fn updated_key_pre_images_record_keeps_the_first_value_for_the_same_id() {
+        let mut pre_images = UpdatedKeyPreImages::new();
+        pre_images.record(1, vec![Value::Text("original".to_string())]);
+        // 2 回目の呼び出し（中間状態を模す）は無視される。
+        pre_images.record(1, vec![Value::Text("intermediate".to_string())]);
+        assert_eq!(
+            pre_images.old_values.get(&1),
+            Some(&vec![Value::Text("original".to_string())]),
+            "2 回目以降の record は最初の値を上書きしてはならない"
+        );
     }
 }
