@@ -1289,6 +1289,58 @@ fn scan_child_fk_rows_for_keys(
     Ok(out)
 }
 
+/// `ids` に該当する子テーブル `child_schema` の行の**現在**の全列値を読み取る
+/// （Cursor Bugbot 指摘・PR #1138）。`propagate_referential_actions` の Pass 1
+/// （対象特定。このテーブルへの Pass 2 の書き込みをまだ一切行っていない時点）
+/// から呼ぶ契約。
+///
+/// 同じ子行を複数の `FOREIGN KEY` が対象にする場合（例: 一方が `ON DELETE
+/// SET NULL`・他方が `ON DELETE CASCADE`）、Pass 2 で先に適用された FK の
+/// 書き込みが後の FK の `apply_referential_action` が読む「現在の行」を
+/// 変えてしまう。`apply_referential_action` は実際の書き込み（read-merge-write）
+/// にはこの「現在の行」を正しく使う必要がある一方、孫段の連鎖対象特定
+/// （`collect_action_targets` の `wanted_keys`）が使う pre-image は「今回の文が
+/// 始まる前」の値でなければならない（先に適用された SET NULL／SET DEFAULT の
+/// 結果を pre-image に取り込むと、孫が参照する本来の旧キーが失われ、連鎖されず
+/// 残った孫行が事後検証の `NO ACTION` バックストップで `23503` になる）。この
+/// 関数を Pass 1 で 1 回呼んで結果を保持し、Pass 2 の各 `apply_referential_action`
+/// 呼び出しへ渡すことで、この 2 つの用途を安全に分離する。
+///
+/// 読み戻せない id（Pass 1 の時点で既に存在しない）は結果に含めない。
+fn snapshot_child_rows_before_pass2(
+    write_txn: &redb::WriteTransaction,
+    child_schema: &TableSchema,
+    tenant_id: &str,
+    ids: impl Iterator<Item = u64>,
+) -> Result<HashMap<u64, Vec<crate::row_codec::Value>>, TenantWriteError> {
+    let mut out = HashMap::new();
+    let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+    let row_table = match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(e) => {
+            return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                e,
+            )))
+        }
+    };
+    for id in ids {
+        let Some(guard) = row_table.get((tenant_id, id)).map_err(CatalogError::from)? else {
+            continue;
+        };
+        let existing = crate::storage::decode_row_for_key(tenant_id, id, guard.value())
+            .map_err(TenantWriteError::Storage)?;
+        // `guard`（`row_table` の不変借用）は `existing` がデータを複製済みの
+        // ため、明示的な drop は不要（このスコープ内で `row_table` への可変
+        // 借用を行わないため、借用チェッカ上も問題ない）。
+        let values = crate::row_codec::decode_scalar_columns(child_schema, &existing.metadata)
+            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+        out.insert(id, values);
+    }
+    Ok(out)
+}
+
 /// 再帰の内部で親から子へ渡す、所有版の変更表現（[`ReferencedRowsChange`] は
 /// 借用スライスを持つため再帰境界をまたげない。Issue #1076）。
 enum PropagatedChange {
@@ -1574,6 +1626,19 @@ pub(crate) fn enforce_deferred_foreign_keys_in_txn(
 /// [`apply_referential_action`] の入力で共有する（Issue #1076）。
 type ActionTargets = Vec<(u64, Option<Vec<crate::row_codec::Value>>)>;
 
+/// `propagate_referential_actions` の Pass 1（対象特定）が FK 1 個分について
+/// 確定した情報: `(子スキーマ, FK 宣言, アクション, 対象子行, Pass 1 時点の
+/// 行スナップショット)`。最後の要素は [`apply_referential_action`] が孫段への
+/// pre-image に使う（`snapshot_child_rows_before_pass2` 参照。Cursor Bugbot
+/// 指摘・PR #1138）。
+type PendingReferentialAction<'a> = (
+    &'a TableSchema,
+    &'a ForeignKeyDef,
+    ReferentialAction,
+    ActionTargets,
+    HashMap<u64, Vec<crate::row_codec::Value>>,
+);
+
 /// `table_name`（スキーマ `schema`）に加えた変更 `change` を起点に、参照アクション
 /// （`CASCADE`・`SET NULL`・`SET DEFAULT`。Issue #1076）を再帰的に子テーブルへ
 /// 適用する。`depth` は元の文を 0 段目とした連鎖の段数。適用した子テーブルは
@@ -1604,12 +1669,14 @@ fn propagate_referential_actions(
     // （`MAX_REFERENTIAL_ACTION_ROWS`）の判定もこの収集段階で行う——
     // `collect_action_targets` に残り枠を渡し、子テーブル走査中に上限超過を
     // 検出した時点で打ち切る（`scan_child_fk_rows_for_keys` ドキュメント参照）。
-    let mut pending_actions: Vec<(
-        &TableSchema,
-        &ForeignKeyDef,
-        ReferentialAction,
-        ActionTargets,
-    )> = Vec::new();
+    // 同じ理由で、対象行の Pass 2 適用前スナップショット（`apply_referential_action`
+    // が孫段への pre-image に使う値。`snapshot_child_rows_before_pass2` 参照）
+    // もこの Pass 1 の時点で確定する（Cursor Bugbot 指摘・PR #1138: 同じ子行を
+    // 複数の FK が対象にし、`SET NULL`／`SET DEFAULT` が `ON DELETE CASCADE` より
+    // 先に適用される場合、`CASCADE` 側が「現在の行」を再読取りして pre-image を
+    // 作ると `SET` 適用後の値を記録してしまい、孫段の連鎖対象特定が本来の旧キーを
+    // 見失う）。
+    let mut pending_actions: Vec<PendingReferentialAction<'_>> = Vec::new();
     for (child_schema, fk) in &referencing {
         let action = match &change {
             PropagatedChange::Removed => fk.on_delete(),
@@ -1664,7 +1731,14 @@ fn propagate_referential_actions(
         }
         state.rows_budget_used = new_budget;
 
-        pending_actions.push((child_schema, fk, action, affected));
+        let original_snapshot = snapshot_child_rows_before_pass2(
+            write_txn,
+            child_schema,
+            tenant_id,
+            affected.iter().map(|(id, _)| *id),
+        )?;
+
+        pending_actions.push((child_schema, fk, action, affected, original_snapshot));
     }
 
     let new_depth = depth
@@ -1691,12 +1765,7 @@ fn propagate_referential_actions(
     // 構造キーで固定する（キーの大小関係が結果を決めるだけで、それ自体に
     // PostgreSQL 由来の意味はない）。
     pending_actions.sort_by(|a, b| {
-        let key_of = |item: &(
-            &TableSchema,
-            &ForeignKeyDef,
-            ReferentialAction,
-            ActionTargets,
-        )| {
+        let key_of = |item: &PendingReferentialAction<'_>| {
             (
                 item.0.name.clone(),
                 item.1.columns().to_vec(),
@@ -1723,7 +1792,7 @@ fn propagate_referential_actions(
         Option<UpdatedKeyPreImages>,
         u32,
     )> = Vec::new();
-    for (child_schema, fk, action, affected) in pending_actions {
+    for (child_schema, fk, action, affected, original_snapshot) in pending_actions {
         let is_delete = matches!(change, PropagatedChange::Removed);
         let (child_change, child_pre_images) = apply_referential_action(
             write_txn,
@@ -1731,6 +1800,7 @@ fn propagate_referential_actions(
             fk,
             action,
             &affected,
+            &original_snapshot,
             tenant_id,
             is_delete,
         )?;
@@ -2213,13 +2283,33 @@ fn build_owned_key(
 /// 特定した子行 `affected`（`(id, ON UPDATE CASCADE の新キー値)`）へ参照アクション
 /// `action` を適用する（Issue #1076）。戻り値は子テーブルへの変更内容（さらに
 /// 再帰する [`propagate_referential_actions`] への入力）と、子自身が親となる
-/// 孫段の `ON UPDATE` 連鎖向けの pre-image（更新系アクションのみ）。
+/// 孫段の連鎖向けの pre-image。
+///
+/// `original_snapshot` は Pass 1（`snapshot_child_rows_before_pass2`）が確定した
+/// 「このテーブルへの Pass 2 の書き込みが始まる前」の各行の全列値。孫段への
+/// pre-image は必ずこのスナップショットから作る（Cursor Bugbot 指摘・PR #1138）。
+/// 同じ子行を複数の FK が対象にする場合、この関数の呼び出し時点で行を再読取り
+/// （`row_table.get`）した値は、正準順で先に適用された別 FK（例: `SET NULL`／
+/// `SET DEFAULT`）による書き換え後の中間状態でありうる。その中間状態を
+/// pre-image に使うと、`SET` で書き換わった列が孫段の連鎖対象特定
+/// （`collect_action_targets` の `wanted_keys`）の旧キーとして使えなくなり
+/// （`NULL`／`DEFAULT` 値は正しい参照先キーではない）、本来連鎖されるべき孫行が
+/// 対象から漏れて事後検証の `NO ACTION` バックストップで `23503` になる。
+/// 再読取りした「現在の行」自体は read-merge-write の書き込み対象としては
+/// 引き続き正しく使う（他 FK が既に書き換えた列を上書きで消さないため）。
+///
+/// 引数 7 個超は 1 回の適用に必要なコンテキスト（対象スキーマ・FK 宣言・
+/// 対象行・pre-image 用スナップショット）を素直に渡した結果であり、構造体へ
+/// まとめるほどの凝集性はない（呼び出しは [`propagate_referential_actions`] の
+/// 1 箇所のみ）。
+#[allow(clippy::too_many_arguments)]
 fn apply_referential_action(
     write_txn: &redb::WriteTransaction,
     child_schema: &TableSchema,
     fk: &ForeignKeyDef,
     action: ReferentialAction,
     affected: &ActionTargets,
+    original_snapshot: &HashMap<u64, Vec<crate::row_codec::Value>>,
     tenant_id: &str,
     is_delete: bool,
 ) -> Result<(PropagatedChange, Option<UpdatedKeyPreImages>), TenantWriteError> {
@@ -2240,20 +2330,23 @@ fn apply_referential_action(
         let mut pre_images = UpdatedKeyPreImages::new();
         for (id, _) in affected {
             let key = (tenant_id, *id);
-            let Some(guard) = row_table.get(&key).map_err(CatalogError::from)? else {
+            if row_table.get(&key).map_err(CatalogError::from)?.is_none() {
                 // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
                 continue;
+            }
+            // Pass 1 で確定したスナップショットを pre-image として使う（`関数
+            // ドキュメント`参照。ここで「現在の行」を再読取りすると、正準順で
+            // 先に適用された別 FK の `SET NULL`／`SET DEFAULT` による書き換え後の
+            // 値を記録してしまい、孫段の連鎖対象特定が本来の旧キーを見失う。
+            // Cursor Bugbot 指摘・PR #1138）。存在するのにスナップショットが
+            // 無いのは Pass 1／Pass 2 の対象集合不一致という内部矛盾であり、
+            // fail-closed に拒否する。
+            let Some(original_values) = original_snapshot.get(id) else {
+                return Err(internal(
+                    "referential action pre-image snapshot missing for a cascaded row",
+                ));
             };
-            let existing = crate::storage::decode_row_for_key(tenant_id, *id, guard.value())
-                .map_err(TenantWriteError::Storage)?;
-            // `guard`（`row_table` の不変借用）を、直後の可変借用（`remove`）と
-            // 衝突しないよう明示的に drop する（`existing` は既にデータを
-            // 複製済みのため、以降 `guard`／借用元バッファへは触れない）。
-            drop(guard);
-            let old_values =
-                crate::row_codec::decode_scalar_columns(child_schema, &existing.metadata)
-                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-            pre_images.record(*id, old_values);
+            pre_images.record(*id, original_values.clone());
             row_table.remove(key).map_err(CatalogError::from)?;
         }
         return Ok((PropagatedChange::Removed, Some(pre_images)));
@@ -2291,11 +2384,16 @@ fn apply_referential_action(
             // 衝突しないよう明示的に drop する（`existing` は既にデータを
             // 複製済みのため、以降 `guard`／借用元バッファへは触れない）。
             drop(guard);
-            // 孫段の ON UPDATE 連鎖のために、書き換える前の全列値を記録する。
-            let old_values =
-                crate::row_codec::decode_scalar_columns(child_schema, &existing.metadata)
-                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-            pre_images.record(*id, old_values);
+            // 孫段の連鎖のために、Pass 1 で確定したスナップショットを pre-image
+            // として記録する（`existing`＝「現在の行」ではない。関数ドキュメント
+            // 参照。`existing` は直後の read-merge-write にのみ使い、他 FK が
+            // 既にこの行へ適用した書き換えを正しく引き継ぐ）。
+            let Some(original_values) = original_snapshot.get(id) else {
+                return Err(internal(
+                    "referential action pre-image snapshot missing for an updated row",
+                ));
+            };
+            pre_images.record(*id, original_values.clone());
 
             let assignments: Vec<(usize, crate::row_codec::Value)> = match action {
                 ReferentialAction::SetNull => fk_indices

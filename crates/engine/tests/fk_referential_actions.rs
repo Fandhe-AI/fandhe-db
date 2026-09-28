@@ -1047,3 +1047,72 @@ fn referential_action_check_evaluation_error_uses_same_sqlstate_as_normal_write_
         Some(Cell::SignedInteger(1))
     );
 }
+
+// --- `SET NULL`／`SET DEFAULT` が `ON DELETE CASCADE` より先に適用される場合の
+// 孫段連鎖（Cursor Bugbot 指摘・PR #1138）----------------------------------------
+//
+// 子列 `x` が親の別々の `UNIQUE` 列（`alt_code`・`code`）をそれぞれ参照する
+// 2 つの `FOREIGN KEY`（一方 `ON DELETE SET NULL`・他方 `ON DELETE CASCADE`）を
+// 持ち、`x` 自身が孫テーブルから参照される `UNIQUE` キーでもある場合。正準順
+// （子テーブル名・参照元列が同じため参照先列の辞書順でタイブレーク。
+// `"alt_code" < "code"`）で `SET NULL` が先に適用されると、修正前は後続の
+// `CASCADE` が「現在の行」（`x` が既に `NULL` になった後）を再読取りして
+// pre-image を作っていた。`NULL` は正しい参照先キーではないため、孫段の連鎖
+// 対象特定（`collect_action_targets` の `wanted_keys`）が本来の旧キー（`x` の
+// 削除前の値）を見失い、連鎖されず残った孫行が事後検証の `NO ACTION`
+// バックストップで `23503` になっていた。
+#[test]
+fn set_null_applied_before_cascade_still_cascades_to_grandchildren() {
+    let (core, path) = new_core("fkact-set-then-cascade-grandchild");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE parents (code TEXT UNIQUE, alt_code TEXT UNIQUE)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (\
+         x TEXT UNIQUE, note TEXT, \
+         FOREIGN KEY (x) REFERENCES parents (alt_code) ON DELETE SET NULL, \
+         FOREIGN KEY (x) REFERENCES parents (code) ON DELETE CASCADE)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE grandchildren (\
+         child_x TEXT REFERENCES children (x) ON DELETE CASCADE, note TEXT)",
+    );
+    let alice = ctx("alice");
+    // `code`・`alt_code` を同じ値にし、この親行の削除が両方の FK にとって
+    // 「参照先が失われた」削除になるようにする。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code, alt_code) VALUES (1, 'shared', 'shared') \
+         USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, x, note) VALUES (10, 'shared', 'c1') \
+         USING OPERATION_ID 'op-c'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO grandchildren (id, child_x, note) VALUES (100, 'shared', 'g1') \
+         USING OPERATION_ID 'op-g'",
+    );
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'",
+    );
+    // `SET NULL`（`alt_code` 経由）が正準順で先に適用されても、`CASCADE`
+    // （`code` 経由）が最終的に子行を削除し、孫行も連鎖削除される。
+    assert_eq!(row_count(&core, &alice, "children"), 0);
+    assert_eq!(row_count(&core, &alice, "grandchildren"), 0);
+}
