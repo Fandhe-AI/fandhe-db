@@ -38,11 +38,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::policy::PolicyContext;
@@ -158,39 +157,6 @@ fn seed_single_row_db(db_path: &str) {
     drop(storage);
 }
 
-/// 子プロセスの stderr を専用スレッドで読み、`listening on` を待つ
-/// （`wire7_bind_guard.rs::loopback_bind_starts_listening` と同じ理由:
-/// `BufReader::read_line` はデッドラインを持たないブロッキング呼び出しの
-/// ため、`mpsc::Receiver::recv_timeout` で確実に打ち切れるようにする）。
-fn wait_for_listening(child: &mut Child) -> bool {
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("listening on") => return true,
-            Ok(_) => continue,
-            Err(_) => return false,
-        }
-    }
-}
-
 /// R1: 4 トークンすべてで起動が拒否されず `listening on` に到達すること。
 #[test]
 fn all_four_tokens_start_listening() {
@@ -216,7 +182,7 @@ fn all_four_tokens_start_listening() {
             .spawn()
             .expect("spawn wire-server");
 
-        let listening = wait_for_listening(&mut child);
+        let listening = common::wait_for_listening(&mut child, Duration::from_secs(10));
         let _ = child.kill();
         let _ = child.wait();
 
@@ -381,39 +347,14 @@ fn unset_and_default_token_produce_identical_wire_bytes() {
         // `listening on 127.0.0.1:<port>` から実際の bind アドレスを取得する
         // （`--bind 127.0.0.1:0` の ephemeral port 割り当て結果。
         // `docs/design/three-client-e2e-harness.md` と同じ取得手順）。
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).unwrap_or(0);
-                if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                    break;
-                }
-            }
+        // `common::drain_stderr` は listen 行到達後も stderr を EOF まで
+        // 読み続ける（Issue #1082）。診断情報（`args`・観測済み `lines`）は
+        // 呼び出し側でメッセージへ含める。
+        let mut drain = common::drain_stderr(&mut child);
+        let (addr, lines) = drain.wait_for_listening(Duration::from_secs(10));
+        let addr = addr.unwrap_or_else(|| {
+            panic!("did not observe listening address, args={args:?} lines={lines:?}")
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut addr: Option<std::net::SocketAddr> = None;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    if let Some(idx) = line.find("listening on ") {
-                        let addr_str = line[idx + "listening on ".len()..].trim();
-                        addr = addr_str.parse().ok();
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let addr =
-            addr.unwrap_or_else(|| panic!("did not observe listening address, args={args:?}"));
 
         let bytes = run_c1_query_and_collect_bytes(addr);
 
@@ -461,7 +402,7 @@ fn hnsw_tuning_flags_with_valid_values_start_listening() {
             .spawn()
             .expect("spawn wire-server");
 
-        let listening = wait_for_listening(&mut child);
+        let listening = common::wait_for_listening(&mut child, Duration::from_secs(10));
         let _ = child.kill();
         let _ = child.wait();
 
@@ -678,39 +619,14 @@ fn hnsw_token_alone_and_with_explicit_default_tuning_produce_identical_wire_byte
             .spawn()
             .expect("spawn wire-server");
 
-        let stderr = child.stderr.take().expect("piped stderr");
-        let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).unwrap_or(0);
-                if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                    break;
-                }
-            }
+        // `common::drain_stderr` は listen 行到達後も stderr を EOF まで
+        // 読み続ける（Issue #1082）。診断情報（`args`・観測済み `lines`）は
+        // 呼び出し側でメッセージへ含める。
+        let mut drain = common::drain_stderr(&mut child);
+        let (addr, lines) = drain.wait_for_listening(Duration::from_secs(10));
+        let addr = addr.unwrap_or_else(|| {
+            panic!("did not observe listening address, args={args:?} lines={lines:?}")
         });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut addr: Option<std::net::SocketAddr> = None;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    if let Some(idx) = line.find("listening on ") {
-                        let addr_str = line[idx + "listening on ".len()..].trim();
-                        addr = addr_str.parse().ok();
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let addr =
-            addr.unwrap_or_else(|| panic!("did not observe listening address, args={args:?}"));
 
         let bytes = run_c1_query_and_collect_bytes(addr);
 
