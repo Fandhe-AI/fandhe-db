@@ -201,12 +201,29 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   この 2 つはいずれも fail-closed に全走査（plain scan）へ倒れるだけで、
   RLS・可視性・結果の正しさには影響しない。
 
-  `ScalarIndex::resolve_candidates` の早期打ち切り（先に評価した宣言列・
-  `id` 述語の交差候補が 0 件になった時点で、以降の述語を評価せず打ち切る）
-  はこの 2 つとは性質が異なり、全走査への縮退ではない: 交差は述語を追加
-  するほど結果が単調非増加になるため、空集合との交差は以降の述語によらず
-  必ず空集合になり、`CandidateResolution::Use`（索引経路）のまま空の候補
-  集合を返す。索引経路を使い続けるだけで結果・RLS には影響しない。
+  `ScalarIndex::resolve_candidates` の早期打ち切り（交差候補が 0 件になった
+  時点で、以降の述語を評価せず打ち切る）はこの 2 つとは性質が異なり、全走査
+  への縮退ではない: 交差は述語を追加するほど結果が単調非増加になるため、
+  空集合との交差は以降の述語によらず必ず空集合になり、
+  `CandidateResolution::Use`（索引経路）のまま空の候補集合を返す。索引経路を
+  使い続けるだけで結果・RLS には影響しない。ただし早期打ち切りは
+  `metadata_filters` の列がすべて索引化されている（宣言による対象外化・
+  平均値長ゲート・`2^53` ゲートのいずれでも除外されていない）ことを候補
+  評価より前に静的検査した**後**にしか働かない
+  （`ScalarIndex::filter_column_is_indexed`。codex-review P1 対応・PR
+  #1158）: 旧実装はこの静的検査を欠き、先に評価した宣言列の交差が 0 件に
+  なると早期打ち切りが働いて宣言外列の述語を一度も評価しないまま索引経路
+  （`Use`）を返してしまい、`scalar_plan_under_target` の「宣言外列が 1 つ
+  でもあれば `plain_scan`」という値に依存しない静的判定と、述語の順序・
+  値によっては矛盾しうる状態だった（結果の正しさ自体には影響しない。
+  空の候補集合を返す索引経路と全走査はいずれも「一致 0 件」で同じ結果に
+  なるため）。静的検査を候補評価の前段に追加したことで、`EXPLAIN` と実行時
+  の経路選択は述語の順序・値によらず常に一致する。固定は
+  `crates/engine/tests/explain_scalar_plan_declarations.rs::
+  search_explain_matches_runtime_when_declared_column_predicate_yields_
+  empty_candidates`（宣言外列を含む複数述語を両順序で束縛し、`EXPLAIN` の
+  `plain_scan` 表示と実行時統計〔`index_scans`／`plain_scan_fallbacks`〕が
+  一致することを固定）参照。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）

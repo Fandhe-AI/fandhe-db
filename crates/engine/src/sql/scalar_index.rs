@@ -1397,6 +1397,32 @@ impl ScalarIndex {
         matches!(self.typed_columns.get(column_index), Some(Some(_)))
     }
 
+    /// `filter` の対象列が実際に索引化されている（宣言により対象外化されて
+    /// いない）かを、候補値を一切計算せず構造だけで判定する（`self.columns`／
+    /// `self.typed_columns` は `schema.columns` と同じ長さ・順序で、宣言に
+    /// より対象外にした列・索引未対応型の列はいずれも `None` になる契約。
+    /// codex-review P1 対応・PR #1158: 旧実装は [`Self::resolve_candidates`]
+    /// のループ内で `candidates_for`／`typed_compare_candidates` を呼んで
+    /// 初めて判定していたため、先に評価した宣言列の交差が空集合になると
+    /// 早期打ち切りで後続の宣言外列を一度も判定せず `CandidateResolution::
+    /// Use` を返してしまい、`EXPLAIN` の `scalar_plan_under_target`〔全列が
+    /// 宣言列に含まれるかを値に依存せず静的判定〕と矛盾していた。この
+    /// アクセサは値・交差結果に依存しないため、[`Self::resolve_candidates`]
+    /// が候補評価より前に全述語へ適用でき、`EXPLAIN` と同じ「宣言外列が
+    /// 1 つでもあれば索引経路を使わない」という静的判定に揃えられる）。
+    fn filter_column_is_indexed(&self, filter: &MetadataFilter) -> bool {
+        match filter.op() {
+            FilterOp::TypedCompare { .. } | FilterOp::Between { .. } => self
+                .typed_columns
+                .get(filter.column_index())
+                .is_some_and(Option::is_some),
+            _ => self
+                .columns
+                .get(filter.column_index())
+                .is_some_and(Option::is_some),
+        }
+    }
+
     /// [`MetadataFilter`] を評価し、一致スロットの**昇順** `Vec<u32>` を返す。
     /// 列が対応する索引を持たない・未知の列は `None`。一致 0 件（列は索引済み
     /// だが値が存在しない）は `Some(vec![])` を返す（`None` と区別する）。
@@ -1777,6 +1803,15 @@ impl ScalarIndex {
     /// 述語の種類（`Equals`／`StartsWith`／`TypedCompare`）ごとに参照する
     /// 索引（`self.columns`／`self.typed_columns`）を内部で切り替えるため、
     /// この関数側で型ごとに分岐する必要はない（Issue #893 production 接続）。
+    ///
+    /// `metadata_filters` の列がすべて索引化されている（宣言により対象外化
+    /// されていない）ことを、候補評価に入る前に [`Self::filter_column_is_
+    /// indexed`] で静的に検査する（codex-review P1 対応・PR #1158）。`id`
+    /// 述語は `id_index` が宣言の有無によらず常に構築されるためこの検査の
+    /// 対象にしない。この事前検査により、`EXPLAIN` の `scalar_plan_under_
+    /// target`（`metadata_filters` の列がすべて宣言列に含まれるかを値に
+    /// 依存せず静的判定する）と実行時の経路選択が、述語の順序・値・交差が
+    /// 空集合になるタイミングによらず常に一致する。
     pub(crate) fn resolve_candidates(
         &self,
         metadata_filters: &[MetadataFilter],
@@ -1785,6 +1820,17 @@ impl ScalarIndex {
         if metadata_filters.is_empty() && id_preds.is_empty() {
             // `classify_scalar_plan` が `PlainScan` 以外を返す限り到達しない
             // 呼び出し規約違反だが、防御的に fail-closed へ倒す。
+            return CandidateResolution::FallbackNoIndex;
+        }
+        if metadata_filters
+            .iter()
+            .any(|filter| !self.filter_column_is_indexed(filter))
+        {
+            // 宣言外列（または索引未対応型）の述語が 1 つでもあれば、以降の
+            // 候補評価（交差の早期打ち切りを含む）に入る前に fail-closed で
+            // 全走査へ倒す。値・述語順序に依存しない静的判定のため、後続の
+            // ループの早期打ち切り（交差が空集合になった時点で打ち切る
+            // 最適化）が宣言外列の判定を隠してしまうことがない。
             return CandidateResolution::FallbackNoIndex;
         }
         // 述語ごとの候補列を全件 `Vec<Vec<u32>>` に集めてから交差する実装は、

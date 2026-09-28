@@ -336,6 +336,70 @@ fn search_explain_matches_runtime_scalar_index_stats() {
     );
 }
 
+/// codex-review P1 対応・PR #1158: 宣言列（`lang`）への述語が先に評価されて
+/// 候補が空集合になっても、`EXPLAIN` と実行時の経路選択が一致し続けること
+/// を固定する。旧実装は `ScalarIndex::resolve_candidates` の交差が空集合に
+/// なった時点で以降の述語（宣言外列 `topic`）を評価せず索引経路
+/// （`CandidateResolution::Use`）を返してしまい、`scalar_plan_under_target`
+/// の値に依存しない静的判定（宣言外列が 1 つでもあれば `plain_scan`）と
+/// 実行時の経路（`index_scans` を消費）が食い違っていた（結果の正しさ
+/// 自体は両経路とも「一致 0 件」で同じ）。`lang = 'zz'`（存在しない値。
+/// `lang` は宣言列で候補が確実に 0 件になる）と `topic = 'alpha'`（宣言外
+/// 列）の連言を、述語の順序を入れ替えた 2 パターンで固定する。
+#[test]
+fn search_explain_matches_runtime_when_declared_column_predicate_yields_empty_candidates() {
+    let (core, _guard) = setup_hnsw_core();
+    let mut session = allowed_session();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_lang ON docs (lang)",
+    )
+    .expect("declare scalar index on lang only");
+
+    for query in [
+        "SELECT id FROM docs WHERE lang = 'zz' AND topic = 'alpha' \
+         ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5",
+        "SELECT id FROM docs WHERE topic = 'alpha' AND lang = 'zz' \
+         ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5",
+    ] {
+        assert_eq!(
+            scalar_plan_line(&explain_sql(
+                &core,
+                &mut session,
+                &format!("EXPLAIN {query}")
+            )),
+            "plain_scan",
+            "a predicate on any undeclared column downgrades the whole conjunction \
+             regardless of the declared column's value or predicate order: {query}"
+        );
+
+        // `EXPLAIN` は統計を消費しないため、実行経路の観測は通常の
+        // `execute_sql` で行う（本ファイル既存テストと同じ「2 回観測」流儀。
+        // 1 回目はキャッシュ未構築のため差分に含めない）。
+        core.execute_sql(&ctx("tenant-a"), query)
+            .unwrap_or_else(|e| panic!("warm {query:?} failed: {e:?}"));
+        let before = core.scalar_index_cache_stats();
+        let result = core
+            .execute_sql(&ctx("tenant-a"), query)
+            .unwrap_or_else(|e| panic!("observe {query:?} failed: {e:?}"));
+        let after = core.scalar_index_cache_stats();
+
+        assert_eq!(
+            after.index_scans, before.index_scans,
+            "must not stay on the index path once an undeclared column predicate is present: {query}"
+        );
+        assert!(
+            after.plain_scan_fallbacks > before.plain_scan_fallbacks,
+            "must fall back to plain scan, matching EXPLAIN's plain_scan verdict: {query}"
+        );
+        assert!(
+            result.rows.is_empty(),
+            "no row can match a nonexistent lang value regardless of the access path: {query}"
+        );
+    }
+}
+
 /// 受け入れ条件 2: HNSW opt-in なし（既定エンジン）では、宣言の有無に関わらず
 /// `scalar_plan:` の表示は従来どおり（ビット単位で不変）。
 #[test]
