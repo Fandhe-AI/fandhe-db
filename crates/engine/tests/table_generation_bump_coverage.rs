@@ -152,8 +152,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 既存の v9〔#1076／#1077 の FK オプション形式〕を UNIQUE 制約名の意味で
     // 再定義していた互換性破壊の修正。v9 の意味を維持したまま v10／v11 を
     // 新設し、本 PR の base（main）取り込みマージで両系統の版選択ロジックを
-    // 統合したことで `catalog.rs` 冒頭側の行数が変化）で再度追随。
-    ("catalog.rs", 5656),
+    // 統合したことで `catalog.rs` 冒頭側の行数が変化）で再度追随（旧: 5656）。
+    // codex-review 指摘対応（PR #1147。v11 `fk:` 行フィールド数コメント訂正）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随。
+    ("catalog.rs", 5664),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -186,8 +188,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5211）。
     // Issue #1067 レビュー対応（同上。`get()` 置換）で再度追随。
     // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
-    // 変化）で再度追随（旧: 5485）。
-    ("catalog.rs", 5735),
+    // 変化）で再度追随（旧: 5735）。codex-review 指摘対応（同上）で再度追随。
+    ("catalog.rs", 5743),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -212,8 +214,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5292）。
     // Issue #1067 レビュー対応（同上。`get()` 置換）で再度追随。
     // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
-    // 変化）で再度追随（旧: 5566）。
-    ("catalog.rs", 5816),
+    // 変化）で再度追随（旧: 5816）。codex-review 指摘対応（同上）で再度追随。
+    ("catalog.rs", 5824),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -241,8 +243,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5325）。
     // Issue #1067 レビュー対応（同上。`get()` 置換）で再度追随。
     // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
-    // 変化）で再度追随（旧: 5599）。
-    ("catalog.rs", 5849),
+    // 変化）で再度追随（旧: 5849）。codex-review 指摘対応（同上）で再度追随。
+    ("catalog.rs", 5857),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
