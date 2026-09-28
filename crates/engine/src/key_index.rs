@@ -264,20 +264,61 @@ fn registry_entries_for_table(
     let mut iter = reg
         .range::<(&str, &str, &str)>((start, std::ops::Bound::Unbounded))
         .map_err(CatalogError::from)?;
-    for (scanned, entry) in (&mut iter).enumerate() {
-        if scanned >= MAX_KEY_INDEXES {
-            return Err(CatalogError::CorruptSchema(format!(
-                "key index registry exceeds {MAX_KEY_INDEXES} entries"
-            )));
-        }
+    for entry in &mut iter {
         let (k, _v) = entry?;
         let (entry_table, name, tenant) = k.value();
         if entry_table != table {
             break;
         }
+        // 上限判定は「この `table` に実際に一致したエントリ数」のみを数える
+        // （codex-review P1 指摘: 以前は生のスキャン位置をそのまま数えていたため、
+        // `(table, name, tenant)` がテナント単位登録〔モジュール doc 参照〕で
+        // 1 テーブルあたり大量に積み上がる多テナント運用では、対象テーブル自身の
+        // 正当なエントリ数だけで上限に達し得た。`ensure_index_in_txn` が登録時に
+        // 同じ上限を先に強制する〔後述〕ため、この分岐は通常到達しない
+        // fail-closed な破損検出としてのみ残す）。
+        if entries.len() >= MAX_KEY_INDEXES {
+            return Err(CatalogError::CorruptSchema(format!(
+                "key index registry exceeds {MAX_KEY_INDEXES} entries for table {table:?}"
+            )));
+        }
         entries.push((name.to_string(), tenant.to_string()));
     }
     Ok(entries)
+}
+
+/// `table` の登録簿エントリ数が `threshold` 件以上かどうかを、`threshold` 件
+/// 目に達した時点で走査を打ち切って判定する（[`ensure_index_in_txn`] が
+/// 新規登録前に呼ぶ、上限到達の軽量チェック。`registry_entries_for_table` と
+/// 異なり全件を収集せず、上限到達を確認できた時点で `Ok(true)` を返す——
+/// 大量エントリを毎回全件収集するコストを避ける）。
+fn table_registry_len_at_least(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    threshold: usize,
+) -> Result<bool, CatalogError> {
+    let reg = match write_txn.open_table(REGISTRY_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let start = std::ops::Bound::Included((table, "", ""));
+    let mut count = 0usize;
+    let mut iter = reg
+        .range::<(&str, &str, &str)>((start, std::ops::Bound::Unbounded))
+        .map_err(CatalogError::from)?;
+    for entry in &mut iter {
+        let (k, _v) = entry?;
+        let (entry_table, _name, _tenant) = k.value();
+        if entry_table != table {
+            break;
+        }
+        count += 1;
+        if count >= threshold {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `table` の登録簿から、テナント `tenant` に一致するものだけの索引名を返す
@@ -358,8 +399,12 @@ pub(crate) fn sync_rows_in_txn(
 
         let fwd_name = fwd_table_name(table, name);
         let rev_name = rev_table_name(table, name);
-        let mut fwd = open_kv_table(write_txn, fwd_table_def(&fwd_name))?;
-        let mut rev = open_kv_table(write_txn, rev_table_def(&rev_name))?;
+        // `names` は登録簿から得た「登録済み」索引名のため、実テーブルの
+        // get-or-create（`open_kv_table`）ではなく fail-closed な存在確認つき
+        // オープンを使う（Cursor Bugbot 指摘。モジュール doc・
+        // `open_fwd_readable`／`open_rev_writable` 参照）。
+        let mut fwd = open_fwd_readable(write_txn, &fwd_name)?;
+        let mut rev = open_rev_writable(write_txn, &rev_name)?;
 
         for &id in ids {
             let old_key: Option<Vec<u8>> = rev
@@ -443,11 +488,11 @@ pub(crate) fn clear_tenant_in_txn(
         let rev_name = rev_table_name(table, name);
         let mut ids_and_keys: Vec<(u64, Vec<u8>)> = Vec::new();
         {
-            let mut rev = match write_txn.open_table(rev_table_def(&rev_name)) {
-                Ok(t) => t,
-                Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                Err(e) => return Err(TenantWriteError::from(CatalogError::from(e))),
-            };
+            // 登録済み索引の逆引きテーブルが無いのは破損状態であり、`continue`
+            // で黙って読み飛ばすと以後の順引き消去もスキップされ、削除される
+            // はずの索引エントリが残留する（Cursor Bugbot 指摘。`sync_rows_in_txn`
+            // と同じ fail-closed 判定に揃える）。
+            let mut rev = open_rev_writable(write_txn, &rev_name)?;
             let start = std::ops::Bound::Included((tenant_id, 0u64));
             let end = std::ops::Bound::Included((tenant_id, u64::MAX));
             let mut iter = rev
@@ -470,7 +515,7 @@ pub(crate) fn clear_tenant_in_txn(
             continue;
         }
         let fwd_name = fwd_table_name(table, name);
-        let mut fwd = open_kv_table(write_txn, fwd_table_def(&fwd_name))?;
+        let mut fwd = open_fwd_readable(write_txn, &fwd_name)?;
         for (id, key) in &ids_and_keys {
             fwd.remove((tenant_id, key.as_slice(), *id))
                 .map_err(CatalogError::from)?;
@@ -546,6 +591,20 @@ pub(crate) fn ensure_index_in_txn(
 ) -> Result<(), TenantWriteError> {
     let name = index_name_for_columns(columns);
     if is_registered(write_txn, table, &name, tenant_id)? {
+        return Ok(());
+    }
+    // 登録前に `table` の登録簿エントリ数が上限（[`MAX_KEY_INDEXES`]）に
+    // 達していないか確認する（codex-review P1 指摘）。達していれば backfill
+    // 自体を行わず未登録のまま返す——呼び出し元は未登録を「索引経路が使えない」
+    // 合図として全行走査フォールバックへ倒す契約のため、これは性能劣化のみで
+    // 参照整合性は変わらず保たれる（fail-closed。`docs/design/foreign-key.md`
+    // 参照）。上限超過をここで `Err` にすると、多テナント運用で正当に上限へ
+    // 達しただけの状況で以後の書き込み・`DROP TABLE` まで失敗させてしまう
+    // （テナント単位登録〔モジュール doc 参照〕のため、1 テーブルへの
+    // テナント数が多いほど登録簿エントリが積み上がる）。
+    if table_registry_len_at_least(write_txn, table, MAX_KEY_INDEXES)
+        .map_err(TenantWriteError::from)?
+    {
         return Ok(());
     }
     let spec = resolve_key_spec(schema, columns)?;
@@ -637,39 +696,66 @@ where
     }
 }
 
-/// `fwd_name` が `write_txn` の中に実在するかを、`redb::WriteTransaction`
-/// の `open_table` に頼らず明示的に確認する（Issue #1071 レビュー指摘 P0:
-/// `WriteTransaction::open_table` は get-or-create のため、レジストリに
-/// エントリがあるのに実テーブルが存在しない破損状態でも `TableDoesNotExist`
-/// を返さず黙って空テーブルを新規作成してしまい、[`key_present`]／
-/// [`any_entry_present`] が「エントリ 0 件 = 参照なし」と区別できず
-/// fail-open になる。`list_tables` によるテーブル名の存在確認だけがこの
-/// 状態を検出できる）。
-fn fwd_table_exists(
+/// `name` の redb テーブルが `write_txn` の中に実在するかを、
+/// `redb::WriteTransaction` の `open_table` に頼らず明示的に確認する
+/// （Issue #1071 レビュー指摘 P0: `WriteTransaction::open_table` は
+/// get-or-create のため、レジストリにエントリがあるのに実テーブルが存在
+/// しない破損状態でも `TableDoesNotExist` を返さず黙って空テーブルを新規
+/// 作成してしまい、[`key_present`]／[`any_entry_present`] が「エントリ 0 件 =
+/// 参照なし」と区別できず fail-open になる。`list_tables` によるテーブル名の
+/// 存在確認だけがこの状態を検出できる）。順引き・逆引きいずれのテーブル名にも
+/// 使う（`fwd_name`／`rev_name` は同じ redb テーブル名前空間を共有するため
+/// 判定方法は同一）。
+fn named_table_exists(
     write_txn: &redb::WriteTransaction,
-    fwd_name: &str,
+    name: &str,
 ) -> Result<bool, CatalogError> {
     use redb::TableHandle;
     let mut tables = write_txn.list_tables().map_err(CatalogError::from)?;
-    Ok(tables.any(|t| t.name() == fwd_name))
+    Ok(tables.any(|t| t.name() == name))
 }
 
-/// 登録済み（[`is_registered`] が `true`）の索引の順引きテーブルを読み取り用に
-/// 開く。登録簿にエントリがあるのに実テーブルが存在しなければ、
+/// 登録済み（[`is_registered`] が `true`）の索引の順引きテーブルを開く
+/// （読み取り専用の呼び出し元だけでなく、[`sync_rows_in_txn`]／
+/// [`clear_tenant_in_txn`] の書き込みからも共有する——`redb::Table` は
+/// 読み書き両方に使えるハンドルのため、戻り値の型は呼び出し元の用途を
+/// 制限しない）。登録簿にエントリがあるのに実テーブルが存在しなければ、
 /// `ensure_index_in_txn` が登録前に必ず作成する不変条件が破られた破損状態
 /// として `CorruptSchema` で fail-closed に拒否する（黙って空テーブルとして
-/// 扱うと「参照なし」の誤判定で `DELETE`／`TRUNCATE` を許してしまう）。
+/// 扱うと「参照なし」の誤判定で `DELETE`／`TRUNCATE` を許してしまう。
+/// Cursor Bugbot 指摘: 親の `DELETE`／`UPDATE` 経路〔`sync_rows_in_txn`〕が
+/// この判定を経ずに `open_table`〔get-or-create〕で開いていると、登録済み
+/// だが実テーブルが失われた索引で `lost` が常に空になり、
+/// `enforce_referencing_rows_in_txn` の子側検査が丸ごとすり抜ける）。
 fn open_fwd_readable<'a>(
     write_txn: &'a redb::WriteTransaction,
     fwd_name: &str,
 ) -> Result<FwdTable<'a>, TenantWriteError> {
-    if !fwd_table_exists(write_txn, fwd_name).map_err(TenantWriteError::from)? {
+    if !named_table_exists(write_txn, fwd_name).map_err(TenantWriteError::from)? {
         return Err(TenantWriteError::from(CatalogError::CorruptSchema(
             format!("registered key index is missing its forward table {fwd_name:?}"),
         )));
     }
     write_txn
         .open_table(fwd_table_def(fwd_name))
+        .map_err(|e| TenantWriteError::from(CatalogError::from(e)))
+}
+
+/// [`open_fwd_readable`] の逆引きテーブル版。同じ破損検出契約を
+/// [`sync_rows_in_txn`]／[`clear_tenant_in_txn`] の逆引き側の同期・消去にも
+/// 適用する（Cursor Bugbot 指摘。順引き側だけ fail-closed にしても、逆引き側が
+/// get-or-create のままでは同じクラスの fail-open が残る）。
+fn open_rev_writable<'a>(
+    write_txn: &'a redb::WriteTransaction,
+    rev_name: &str,
+) -> Result<redb::Table<'a, (&'static str, u64), &'static [u8]>, TenantWriteError> {
+    if !named_table_exists(write_txn, rev_name).map_err(TenantWriteError::from)? {
+        return Err(TenantWriteError::from(CatalogError::CorruptSchema(
+            format!("registered key index is missing its reverse table {rev_name:?}"),
+        )));
+    }
+    write_txn
+        .open_table(rev_table_def(rev_name))
         .map_err(|e| TenantWriteError::from(CatalogError::from(e)))
 }
 
@@ -927,6 +1013,75 @@ mod tests {
         assert_key_present(&storage, "parents", &columns, "tenant-b", "shared", true);
     }
 
+    /// codex-review P1 指摘: 登録簿はテナント単位（モジュール doc 参照）の
+    /// ため、1 テーブルに対して多数のテナントが同じ索引を登録すると
+    /// `(table, name, tenant)` エントリが積み上がる。`registry_entries_for_table`
+    /// の上限判定が「対象テーブルに実際に一致したエントリ数」ではなく生の
+    /// スキャン位置を数えていると、この正当な多テナント成長だけで上限
+    /// （[`MAX_KEY_INDEXES`]）に達し、以後そのテーブルへの通常の行更新・
+    /// `DROP TABLE` まで `CorruptSchema` で失敗させてしまう（可用性の
+    /// fail-closed 過剰）。本テストは、ちょうど上限件数まで登録済みの状態で
+    /// (1) 列挙（`registry_entries_for_table` 経由の [`sync_rows_in_txn`]）が
+    /// 引き続き成功すること、(2) 新規テナントへの `ensure_index_in_txn` は
+    /// エラーではなく「登録をスキップして未登録のまま返す」こと（フォール
+    /// バック経路が使われ続けるだけで、書き込み自体は失敗しない）を固定する。
+    #[test]
+    fn registry_at_capacity_skips_new_registration_without_failing_writes() {
+        let (storage, _guard) = tmp_storage("key-index-registry-capacity");
+        let schema = parent_schema();
+        storage.create_table(&schema).expect("create table");
+        let columns = vec!["code".to_string()];
+        let name = index_name_for_columns(&columns);
+
+        // ちょうど上限件数だけ、異なるテナントの登録済みエントリを直接
+        // 書き込む（実際に 4096 テナント分の backfill を行うコストを避ける。
+        // 登録簿の形だけを再現すれば十分——`registry_entries_for_table`／
+        // `table_registry_len_at_least` は登録簿のみを見る）。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let mut reg = write_txn.open_table(REGISTRY_TABLE).expect("open registry");
+            for i in 0..MAX_KEY_INDEXES {
+                let tenant = format!("tenant-{i}");
+                reg.insert(("parents", name.as_str(), tenant.as_str()), ())
+                    .expect("insert registry entry");
+            }
+            drop(reg);
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        // (1) 上限ちょうどの列挙は成功する（`sync_rows_in_txn` はコストゼロ
+        // 経路〔`ids` が空〕で `registry_entries_for_table` を経由しないため、
+        // ここでは列挙そのものを直接確認する）。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let entries = registry_entries_for_table(&write_txn, "parents")
+                .expect("enumeration at capacity must succeed");
+            assert_eq!(entries.len(), MAX_KEY_INDEXES);
+            write_txn.abort().expect("abort");
+        }
+
+        // (2) 新規テナントへの登録は、エラーではなく「登録をスキップ」する。
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        ensure_index_in_txn(&write_txn, "parents", &schema, &columns, "tenant-new")
+            .expect("ensure_index_in_txn must not fail when the table's registry is at capacity");
+        let registered = is_registered(&write_txn, "parents", &name, "tenant-new")
+            .expect("is_registered must not fail");
+        assert!(
+            !registered,
+            "registration must be skipped (not forced) once the per-table cap is reached"
+        );
+        // フォールバック経路（未登録）は引き続き機能し、書き込みは失敗しない。
+        let mut keys = BTreeSet::new();
+        keys.insert(encode_text_key("a"));
+        let result = all_keys_exist_in_txn(&write_txn, "parents", &columns, "tenant-new", &keys)
+            .expect("query must not error even when registration was skipped");
+        assert!(
+            result.is_none(),
+            "skipped registration must still report None (fallback), not a stale index"
+        );
+        write_txn.abort().expect("abort");
+    }
+
     /// 索引未登録の状態（旧 DB を模した状態）では `all_keys_exist_in_txn`／
     /// `none_referenced_in_txn` が `None`（フォールバックの合図）を返し、
     /// `ensure_index_in_txn` を挟むと以後は索引経路（`Some`）に切り替わる。
@@ -1084,6 +1239,101 @@ mod tests {
         );
     }
 
+    /// codex-review P2 指摘: 親行の `DELETE` が列参照 FK の未登録フォールバック
+    /// （`enforce_referencing_rows_in_txn` の `None` 分岐）を経由した場合、
+    /// 子側索引（`children`/`["parent_code"]`）だけを構築すると、親自身の
+    /// 参照先列索引（`parents`/`["code"]`）は未登録のまま残る。次回以降も
+    /// 同じ FK の判定は `delta.is_registered` が常に偽のため毎回この未登録
+    /// 分岐へ落ち続け、索引化（Issue #1071）による計算量改善が得られない。
+    /// 本テストは、フォールバックが成功した後に子側だけでなく親側の索引も
+    /// 登録されることを固定する。
+    #[test]
+    fn scan_fallback_on_parent_delete_also_registers_the_parents_own_index() {
+        let (storage, _guard) = tmp_storage("key-index-fallback-registers-parent-side");
+        let parent_schema = parent_schema();
+        let child_schema = child_schema();
+        storage
+            .create_table(&parent_schema)
+            .expect("create parents");
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+
+        // 2 件の親行を通常 API で挿入する（親行の挿入は子側索引・親側索引の
+        // いずれも触れないため、この時点でどちらも未登録のまま）。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("a".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-parent-a").expect("op id"),
+        )
+        .expect("parent a insert must succeed");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            2,
+            Visibility::Public,
+            &[Value::Text("b".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-parent-b").expect("op id"),
+        )
+        .expect("parent b insert must succeed");
+
+        // 子行は FK 検査（`verify_required_parent_keys`。挿入側の別経路で
+        // 親側索引を先に登録してしまう）を経由しない直接書き込みで、索引
+        // 導入前の既存データを再現する（`b` を参照。削除対象の `a` とは無関係）。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("children"),
+                ))
+                .expect("open children row table");
+            let metadata = crate::row_codec::encode_scalar_columns(
+                &child_schema,
+                &[Value::Text("b".to_string())],
+            )
+            .expect("encode scalar columns");
+            let row = crate::storage::RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &metadata,
+            };
+            let encoded = crate::storage::encode_row(&row).expect("encode row");
+            table
+                .insert(("tenant-a", 1u64), encoded.as_slice())
+                .expect("insert child row");
+            drop(table);
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        let columns = vec!["code".to_string()];
+        let child_columns = vec!["parent_code".to_string()];
+        index_has_entry(&storage, "parents", &columns, "tenant-a")
+            .expect_err("parents/code index must not be registered before the delete");
+
+        // `a`（id=1）を参照する子行は存在しないため、フォールバック走査は
+        // 違反なしで成功するはずである。
+        crate::tenant::delete_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            1,
+            &crate::recovery::required_op_id::OperationId::parse("op-del").expect("op id"),
+        )
+        .expect("deleting an unreferenced parent row must succeed via the scan fallback");
+
+        index_has_entry(&storage, "parents", &columns, "tenant-a")
+            .expect("parents/code index must be registered after the fallback delete succeeds");
+        index_has_entry(&storage, "children", &child_columns, "tenant-a").expect(
+            "children/parent_code index must also be registered (pre-existing fallback behavior)",
+        );
+    }
+
     /// 登録簿にエントリがあるのに順引きテーブルが実在しない破損状態
     /// （`ensure_index_in_txn` が両者を同一 write_txn で作成する不変条件が
     /// 破られた状態）を人為的に作り、`CorruptSchema` で fail-closed に
@@ -1132,6 +1382,109 @@ mod tests {
             ),
             "registered-but-missing forward table must be fail-closed, got {result:?}"
         );
+        write_txn.abort().expect("abort");
+    }
+
+    /// Cursor Bugbot 指摘: [`sync_rows_in_txn`]（親の `DELETE`／`UPDATE` 経路）が
+    /// 登録済み索引の順引き・逆引きテーブルを `open_table`（get-or-create）で
+    /// 開いていると、実テーブルが失われた破損状態でも黙って空テーブルを
+    /// 作り直してしまう。物理行は既に削除済みの時点でこの同期が走るため
+    /// （`tenant::delete_row_impl` の順序）、旧キーの pre-image は再作成された
+    /// 空の逆引きテーブルには存在せず `old_key == new_key == None` に帰着し、
+    /// `KeyIndexDelta::lost` へ何も積まれない。結果、`is_registered` は真の
+    /// ままなのに `lost_keys` が空集合になり「参照なし」と誤判定され、
+    /// 子行がまだ参照している親行の `DELETE` を許してしまう（fail-open）。
+    /// 本テストは、この破損状態での `DELETE` が `CorruptSchema` として
+    /// fail-closed に拒否され、子行が生き残ることを固定する
+    /// （[`open_fwd_readable`]／[`open_rev_writable`] を経由する現在の実装が
+    /// この退行を再導入していないことの回帰テスト）。
+    #[test]
+    fn sync_rejects_parent_delete_when_registered_forward_table_is_missing() {
+        let (storage, _guard) = tmp_storage("key-index-sync-corrupt-fwd");
+        let parent_schema = parent_schema();
+        let child_schema = child_schema();
+        storage
+            .create_table(&parent_schema)
+            .expect("create parents");
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("a".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-parent").expect("op id"),
+        )
+        .expect("parent insert must succeed");
+        // 子行の挿入が参照先側索引（`parents`/`["code"]`）を初回 backfill・
+        // 登録する（`verify_required_parent_keys` の未登録フォールバック）。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "children",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("a".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-child").expect("op id"),
+        )
+        .expect("child insert must succeed");
+
+        let columns = vec!["code".to_string()];
+        index_has_entry(&storage, "parents", &columns, "tenant-a")
+            .expect("parents/code index must be registered after the child insert");
+
+        // 破損を模す: 登録簿のエントリは残したまま、順引きテーブルだけを
+        // 削除する（`ensure_index_in_txn` が両テーブルを同時に作成する
+        // 不変条件が破れた状態）。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write");
+            let name = index_name_for_columns(&columns);
+            let fwd_name = fwd_table_name("parents", &name);
+            write_txn
+                .delete_table(fwd_table_def(&fwd_name))
+                .expect("delete forward table (simulate corruption)");
+            write_txn.commit_raw_for_test().expect("commit");
+        }
+
+        let err = crate::tenant::delete_row(
+            &storage,
+            "parents",
+            &ctx("tenant-a"),
+            1,
+            &crate::recovery::required_op_id::OperationId::parse("op-del").expect("op id"),
+        )
+        .expect_err(
+            "deleting a referenced parent row with a corrupted registered index \
+             must be rejected, not silently succeed",
+        );
+        assert!(
+            matches!(
+                err,
+                TenantWriteError::Catalog(CatalogError::CorruptSchema(_))
+            ),
+            "expected CorruptSchema (fail-closed), got {err:?}"
+        );
+
+        // fail-closed の結果、子行はまだ存在し参照整合性が保たれている
+        // （write_txn は commit されず、親行も削除されていない）。
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        let children_table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(
+                &crate::catalog::user_rows_table_name("children"),
+            ))
+            .expect("open children row table");
+        assert!(
+            children_table
+                .get(("tenant-a", 1u64))
+                .expect("read children")
+                .is_some(),
+            "child row must survive the rejected delete"
+        );
+        drop(children_table);
         write_txn.abort().expect("abort");
     }
 

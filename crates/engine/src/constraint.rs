@@ -1850,6 +1850,27 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                     &child_columns,
                     tenant_id,
                 )?;
+                // 列参照 FK でこの分岐へ来る主因は `table_name`（親）自身の
+                // 参照先列索引が未登録であること（`delta.is_registered` が
+                // 偽）。子側索引だけを構築すると、次回以降も同じ FK の親側判定は
+                // 毎回この未登録分岐へ落ち続け、`sync_rows_in_txn` が計算する
+                // `delta` が「登録済み」を報告できないまま全行走査を繰り返す
+                // ——索引化（Issue #1071）の計算量改善効果が得られない
+                // （codex-review P2 指摘）。親側の索引も同じテナントの現在状態
+                // から backfill・登録し、以後 `table_name` 自身への書き込みが
+                // 索引経路へ切り替わるようにする（`id` 参照は索引を使わない
+                // 物理キー点照会のため対象外。この分岐に `id` 参照が来るのは
+                // `TenantCleared` 経由のみで、その場合の判定はここではなく
+                // 上の `if fk.references_parent_id()` 分岐が別に処理する）。
+                if !fk.references_parent_id() {
+                    crate::key_index::ensure_index_in_txn(
+                        write_txn,
+                        table_name,
+                        schema,
+                        fk.parent_columns(),
+                        tenant_id,
+                    )?;
+                }
             }
         }
     }
