@@ -541,7 +541,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `op` | ○ | string | `"create_table"`／`"alter_table"`／`"drop_table"` |
 | `table` | ○ | string | |
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
-| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` は `ON DELETE`／`ON UPDATE` 参照アクション（`CASCADE`／`SET NULL`／`SET DEFAULT`。Issue #1076）を宣言する手段を持たず、常に `NO ACTION` になる（後続課題）。SQL 表層で参照アクションを宣言したテーブルへの `update`／`delete` op は宣言側と同じ単一検査点を通るため連鎖が発火し、連鎖の上限超過は `54000`（HTTP `413`）として到達する |
+| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
 | `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`） |
 | `drop_column`（`alter_table`） | △ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線のため常に `0A000` |
 
@@ -553,6 +553,19 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 {"op": "create_table", "table": "docs", "columns": [
   {"name": "embedding", "type": "vector", "dim": 3},
   {"name": "lang", "type": "text", "nullable": true}
+]}
+```
+
+要求例（`create_table`。`FOREIGN KEY` の参照アクション。Issue #1148）:
+
+```json
+{"op": "create_table", "table": "children", "columns": [
+  {"name": "parent_id", "type": "integer", "nullable": true},
+  {"name": "note", "type": "text"}
+], "constraints": [
+  {"kind": "foreign_key", "columns": ["parent_id"],
+   "references": {"table": "parents", "columns": ["id"],
+   "on_delete": "cascade", "on_update": "set_null"}}
 ]}
 ```
 
@@ -790,6 +803,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
 | `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
+| `FOREIGN KEY (parent_id) REFERENCES parents (id) ON DELETE CASCADE ON UPDATE SET NULL` | `constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148。同一実行器） |
 | `ALTER TABLE docs ADD COLUMN note TEXT` | `alter_table` + `add_column`（Issue #910。同一実行器） |
 | `DROP TABLE docs` | `drop_table`（Issue #910。同一実行器） |
 
@@ -810,6 +824,10 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - `ALTER TABLE ... DROP COLUMN`（SQL 表層が未結線。`alter_table.drop_column` は `0A000`）
 - `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
 - `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
+- `FOREIGN KEY` の `MATCH {SIMPLE|FULL}`／`[NOT] DEFERRABLE`／
+  `INITIALLY {DEFERRED|IMMEDIATE}` 句（NoSQL `references` に対応キーが無い。
+  Issue #1148 の対象外。列リスト形の `SET NULL (col, ...)`／
+  `SET DEFAULT (col, ...)` も同様に SQL 表層でも未実装）
 
 逆方向（NoSQL にあって SQL に対応形がないもの）は無い。
 
@@ -922,7 +940,7 @@ Date: <IMF-fixdate>
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
 | `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
-| `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`FOREIGN KEY` の宣言は SQL 表層専用の `CREATE TABLE`。後述） |
+| `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | `create_table.constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148）が宣言時に常に失敗する組み合わせ（`NOT NULL` 列への `set_null`・DEFAULT の無い `NOT NULL` 列への `set_default` 等） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -933,14 +951,14 @@ Date: <IMF-fixdate>
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送）、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
-| `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
+| `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過、`FOREIGN KEY` 参照アクション連鎖（`ON DELETE CASCADE` 等。宣言が SQL／NoSQL いずれでも。Issue #1148）の深さ・行数上限超過（副作用ゼロ） |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 16 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
-`42809`・`42703`・`42704`・`42830`・`42804`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 15 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
+`42809`・`42703`・`42704`・`42804`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -963,10 +981,13 @@ TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リ�
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・
 SQL-23・TASK-206、Issue #908）も SQL 表層専用の DDL で、`42P07`（名前衝突を
 共有）・`42703`・`42704` は同様に到達不能。`FOREIGN KEY`（TABLE-17・TASK-205、
-Issue #907）の宣言も SQL 表層専用の `CREATE TABLE` で行うため `42830` は到達
-しないが、宣言済みテーブルへの `insert`／`update`／`delete` op は engine 内の
-単一検査点を通るため `23503` は到達する（上表。`crates/wire-server/tests/
-err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）。
+Issue #907）は SQL 表層の `CREATE TABLE` に加え、NoSQL `create_table` からも
+参照アクション込みで宣言できる（Issue #1148）ため、宣言時検査の `42830`・
+連鎖適用後の `23503`・連鎖上限超過の `54000` のいずれも到達する（上表。
+`crates/wire-server/tests/nosql13_ddl.rs`・`crates/wire-server/tests/
+err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`・
+`err4_f_invalid_foreign_key_reachable_via_nosql_create_table`・
+`err4_f_referential_action_limit_reachable_via_nosql_delete`）。
 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`。SQL-29 (c)・
 RLS-10 (b)・TASK-213、Issue #929）も SQL 表層専用で、NoSQL `op` 許可リストに
 対応する語彙が無いため `42804` は到達しない。

@@ -62,6 +62,7 @@ use engine::storage::{Storage, Visibility};
 use http_common::{AfterWrite, HttpResponse};
 use wire_server::http::session::store::SessionStore;
 use wire_server::http::status::http_status;
+use wire_server::limits::ConnectionLimiter;
 
 const TABLE: &str = "docs";
 
@@ -192,6 +193,34 @@ fn new_core_with_check_constraint() -> (Arc<EngineCore>, temp_db::CleanupGuard) 
 fn spawn(core: Arc<EngineCore>) -> SocketAddr {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core)
+}
+
+/// [`spawn`] と同じ production 入口だが、`alice` に NoSQL DDL 実行権限
+/// （`--ddl-allowed-users` 相当）を付与する（`tests/nosql13_ddl.rs::spawn_with_store`
+/// と同じ流儀。Issue #1148）。`create_table` を実要求（HTTP）経由で誘発する
+/// テストが使う。
+fn spawn_with_ddl(core: Arc<EngineCore>) -> SocketAddr {
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let store = wire_server::auth::UserStore::load_from_file(&users_path).expect("valid store");
+    let store = store
+        .with_ddl_allowed_users(&["alice".to_string()])
+        .expect("alice is a known username");
+    let store = Arc::new(store);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
+    let router = wire_server::http::router::Router::with_engine(store, SessionStore::new(), core);
+
+    std::thread::spawn(move || {
+        wire_server::http::listener::accept_loop_with_router(
+            listener,
+            limiter,
+            wire_server::limits::READ_TIMEOUT,
+            router,
+        );
+    });
+
+    addr
 }
 
 fn login(addr: SocketAddr, user: &str, password: &str) -> String {
@@ -789,6 +818,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
     // `tests/nosql13_ddl.rs` の `create_table_duplicate_table_is_42p07`・
     // `alter_table_add_column_duplicate_column_is_42701`・
     // `all_three_ddl_ops_reject_with_42501_without_ddl_permission` が担う）。
+    // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）も Issue
+    // #1148 で `create_table.constraints[].references.on_delete`／`on_update`
+    // から実要求経由で到達可能になったため、本リストから外した（固定は
+    // `err4_f_invalid_foreign_key_reachable_via_nosql_create_table` が担う）。
     // `RowNotFound` は本 Issue の対象外のため引き続き到達不能のまま。
     for class in [
         ErrorClass::RowNotFound,
@@ -802,11 +835,6 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL は SQL 表層専用。
         ErrorClass::UndefinedObject,
         ErrorClass::UndefinedColumn,
-        // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は
-        // `FOREIGN KEY` 宣言（SQL 表層専用の `CREATE TABLE`）の分類で到達不能。
-        // `ForeignKeyViolation`（`23503`）は宣言済みテーブルへの書き込み op から
-        // 到達可能なため含めない（`err4_f_foreign_key_violation_reachable_via_*`）。
-        ErrorClass::InvalidForeignKey,
         // `DatatypeMismatch`（`42804`）は 2 つの発生源を共有する:
         // `CASE`/`COALESCE`/`NULLIF` の型不一致（SQL-26・Issue #921。NoSQL
         // 表層には式レーンの入口〔`plan`/`filter`〕にこれらの構文が無い）と、
@@ -880,6 +908,88 @@ fn err4_f_foreign_key_violation_reachable_via_nosql_delete() {
     let resp = query_as_alice(addr, delete_parent);
     assert_projected(&resp, "23503");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は Issue #1148
+/// で NoSQL `create_table.constraints[].references.on_delete`／`on_update` から
+/// 実要求経由で到達可能になった（`http::query::ddl::referential_action_tokens`
+/// の写像先で engine `validate_referential_action_declaration` が検査する）。
+/// `NOT NULL` 列への `on_delete: "set_null"` を固定する。応答にテナントを
+/// 含めない。
+#[test]
+fn err4_f_invalid_foreign_key_reachable_via_nosql_create_table() {
+    let (core, _guard) = new_core();
+    let addr = spawn_with_ddl(core);
+
+    let parent = br#"{"op":"create_table","table":"parents","columns":[
+        {"name":"code","type":"integer"}
+    ],"constraints":[{"kind":"unique","columns":["code"]}]}"#;
+    assert_eq!(query_as_alice(addr, parent).status, 200);
+
+    let child = br#"{"op":"create_table","table":"children","columns":[
+        {"name":"parent_code","type":"integer","nullable":false},
+        {"name":"note","type":"text"}
+    ],"constraints":[
+        {"kind":"foreign_key","columns":["parent_code"],
+         "references":{"table":"parents","columns":["code"],"on_delete":"set_null"}}
+    ]}"#;
+    let resp = query_as_alice(addr, child);
+    assert_projected(&resp, "42830");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// `54000`（`QueryCanceled` 相当の副作用ゼロ拒否。TABLE-17・TASK-205、
+/// Issue #1076）は Issue #1148 で NoSQL `create_table` 宣言の `ON DELETE
+/// CASCADE` 連鎖からも到達可能になった（連鎖の深さ上限超過は宣言面〔SQL／
+/// NoSQL〕に関わらず engine 単一検査点
+/// `constraint::propagate_referential_actions` が判定するため）。副作用ゼロ
+/// （連鎖予定だった行が一切削除されない）も併せて固定する。
+#[test]
+fn err4_f_referential_action_limit_reachable_via_nosql_delete() {
+    let (core, _guard) = new_core();
+    let addr = spawn_with_ddl(core);
+
+    let create = br#"{"op":"create_table","table":"nodes","columns":[
+        {"name":"parent_id","type":"integer","nullable":true},
+        {"name":"name","type":"text"}
+    ],"constraints":[
+        {"kind":"foreign_key","columns":["parent_id"],
+         "references":{"table":"nodes","columns":["id"],"on_delete":"cascade"}}
+    ]}"#;
+    assert_eq!(query_as_alice(addr, create).status, 200);
+
+    let root = br#"{"op":"insert","table":"nodes","rows":[{"id":1,"name":"root"}],"operation_id":"err4-fk-limit-root"}"#;
+    assert_eq!(query_as_alice(addr, root).status, 200);
+    // `MAX_REFERENTIAL_ACTION_DEPTH`（engine 既定値 16。
+    // `crates/engine/src/constraint.rs`）を超える深さ 19 の一本鎖を作る
+    // （root を含め 20 行）。
+    for id in 2..=20u64 {
+        let body = format!(
+            r#"{{"op":"insert","table":"nodes","rows":[{{"id":{id},"parent_id":{prev},"name":"n{id}"}}],"operation_id":"err4-fk-limit-{id}"}}"#,
+            prev = id - 1
+        );
+        assert_eq!(query_as_alice(addr, body.as_bytes()).status, 200);
+    }
+
+    let delete_root =
+        br#"{"op":"delete","table":"nodes","where":{"id":1},"operation_id":"err4-fk-limit-del"}"#;
+    let resp = query_as_alice(addr, delete_root);
+    assert_projected(&resp, "54000");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+
+    // 副作用ゼロ: 連鎖予定だった 20 行が全て残る。
+    let scan = br#"{"op":"scan","table":"nodes","limit":100}"#;
+    let scan_resp = query_as_alice(addr, scan);
+    assert_eq!(scan_resp.status, 200, "got: {scan_resp:?}");
+    let scan_text = String::from_utf8_lossy(&scan_resp.body);
+    let row_count = match engine::json::parse_json(&scan_text).expect("scan body must be json") {
+        engine::json::JsonValue::Object(mut top) => match top.remove("rows") {
+            Some(engine::json::JsonValue::Array(rows)) => rows.len(),
+            other => panic!("expected rows array, got {other:?}"),
+        },
+        other => panic!("expected json object body, got {other:?}"),
+    };
+    assert_eq!(row_count, 20, "zero side effects: all 20 rows must remain");
 }
 
 /// オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16 ポインタ）:
