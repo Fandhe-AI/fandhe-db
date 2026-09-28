@@ -284,6 +284,10 @@ err4_http_projection.rs` の `err4_f_foreign_key_violation_reachable_via_*`）�
 - `PRIMARY KEY`／`UNIQUE` 制約への `DEFERRABLE`（Issue #1077 のスコープ外）
 - `catalog::referencing_foreign_keys_in_txn`（テーブル数比例のカタログ走査）の
   索引化（Issue #1071 の対象外。テーブル数は行数と異なり実運用上小さいため）
+- COMMIT 時の遅延検査（`enforce_deferred_foreign_keys_in_txn`。Issue #1077）の
+  索引化。事後状態の全件検証という性質上「失われたキー」の差分を持たず、
+  索引の増分同期が前提とする差分ベースの判定に乗らないため、索引導入前と
+  同じ全行走査のまま据え置く（Issue #1071 の対象外）
 - `#[cfg(test)]` の生書き込み API（`catalog.rs`）が索引・制約を迂回する点
   （production では到達不能。Issue #1078）
 - 明示トランザクション内の `UPDATE`／`DELETE`／`UPSERT`／複数行 `INSERT`
