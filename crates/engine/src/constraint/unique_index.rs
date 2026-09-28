@@ -57,7 +57,7 @@
 use super::{decode_key_columns, key_bytes, KeySpec, NullPolicy};
 use crate::catalog::{CatalogError, TableSchema};
 use crate::tenant::TenantWriteError;
-use redb::ReadableTable;
+use redb::{ReadableTable, TableHandle};
 use std::collections::{HashMap, HashSet};
 
 /// 索引エントリの永続フォーマットバージョン。列宣言のシグネチャと合わせて
@@ -116,6 +116,26 @@ fn table_error(e: redb::TableError) -> TenantWriteError {
 
 fn storage_error(e: redb::StorageError) -> TenantWriteError {
     TenantWriteError::Catalog(CatalogError::from(e))
+}
+
+/// 索引テーブル `index_table_name` が write トランザクション内で物理的に
+/// 既に存在するかを、**作成を伴わずに**確認する（`clear_tenant_in_txn`・
+/// `forget_rows_in_txn` 共用。codex P2 指摘・PR #1123）。
+///
+/// `redb::WriteTransaction::open_table` は存在しないテーブルを暗黙に作成
+/// してしまう（`TableDoesNotExist` を返さない）ため、削除経路で開いて
+/// 存在確認する方式では索引未作成テナントに対する DELETE／TRUNCATE のたびに
+/// 空の `user_uniq/{table}` が永続化されてしまう。これは「索引テーブルは
+/// 初回の一意キー検査（[`ensure_tenant_index`]）まで物理的に未作成」という
+/// 契約（モジュールドキュメント「索引テーブルの物理レイアウト」参照）に
+/// 反する。`WriteTransaction::list_tables`（作成しない列挙 API）で既存
+/// テーブル名と突き合わせることで、作成せずに存在を判定する。
+fn index_table_exists(
+    write_txn: &redb::WriteTransaction,
+    index_table_name: &str,
+) -> Result<bool, TenantWriteError> {
+    let mut tables = write_txn.list_tables().map_err(storage_error)?;
+    Ok(tables.any(|handle| handle.name() == index_table_name))
 }
 
 /// [`super::key_specs`] が返す一意キー宣言（主キー・UNIQUE 制約の宣言順）から
@@ -266,13 +286,15 @@ fn clear_tenant_chunk(
 /// テナント `tenant_id` の索引エントリ（マーカー含む）をすべて削除する。
 /// [`crate::tenant::truncate_table_unchecked`]（TRUNCATE）から、行ストアの
 /// `retain_in` 後・`row_table` を drop した後の同一 write トランザクション
-/// 内で呼ぶ。`PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブルでは索引
-/// テーブルを開かず何もしない——`redb::WriteTransaction::open_table` は
-/// 存在しないテーブルを作成してしまうため、`TableDoesNotExist` を no-op
-/// 扱いする判定だけでは不十分で、宣言の有無を呼び出し前に見て素通りする
-/// 必要がある（PK/UNIQUE 未宣言テーブルへの TRUNCATE で空の索引テーブルが
-/// 永続化される副作用を防ぐ）。他テナントの範囲には一切触れない（範囲は
-/// `(tenant_id, ..)` に閉じる。RLS-9）。
+/// 内で呼ぶ。`PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブル、または
+/// 索引テーブルがまだ物理的に作成されていない（[`ensure_tenant_index`] に
+/// よる初回検査を経ていない）テナントでは索引テーブルを開かず何もしない
+/// ——`redb::WriteTransaction::open_table` は存在しないテーブルを作成して
+/// しまう（`TableDoesNotExist` を返さない）ため、[`index_table_exists`]
+/// （列挙のみで作成しない API）で先に存在を確認する（PK/UNIQUE 未宣言
+/// テーブル・索引未作成テナントへの TRUNCATE で空の索引テーブルが永続化
+/// される副作用を防ぐ。codex P2 指摘・PR #1123）。他テナントの範囲には
+/// 一切触れない（範囲は `(tenant_id, ..)` に閉じる。RLS-9）。
 pub(super) fn clear_tenant_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -283,12 +305,12 @@ pub(super) fn clear_tenant_in_txn(
         return Ok(());
     }
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
-    let mut index_table =
-        match write_txn.open_table(crate::catalog::user_uniq_table_def(&index_table_name)) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(e) => return Err(table_error(e)),
-        };
+    if !index_table_exists(write_txn, &index_table_name)? {
+        return Ok(());
+    }
+    let mut index_table = write_txn
+        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .map_err(table_error)?;
     while clear_tenant_chunk(&mut index_table, tenant_id)? {}
     Ok(())
 }
@@ -300,8 +322,11 @@ pub(super) fn clear_tenant_in_txn(
 /// 呼んでよい契約とする——本関数は索引テーブルのみを開き、行ストアには
 /// 一切触れない（`TableAlreadyOpen` を避けるための構造的な保証）。
 ///
-/// 索引テーブルが物理的に未作成、または `PRIMARY KEY`・`UNIQUE` のいずれも
-/// 宣言しないテーブルの場合は何もしない。
+/// 索引テーブルが物理的に未作成（[`index_table_exists`] で作成を伴わずに
+/// 確認する。codex P2 指摘・PR #1123——`open_table` で存在確認すると
+/// 索引未作成テナントへの DELETE のたびに空の索引テーブルが永続化されて
+/// しまう）、または `PRIMARY KEY`・`UNIQUE` のいずれも宣言しないテーブルの
+/// 場合は何もしない。
 pub(super) fn forget_rows_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
@@ -316,12 +341,12 @@ pub(super) fn forget_rows_in_txn(
         return Ok(());
     }
     let index_table_name = crate::catalog::user_uniq_table_name(table_name);
-    let mut index_table =
-        match write_txn.open_table(crate::catalog::user_uniq_table_def(&index_table_name)) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-            Err(e) => return Err(table_error(e)),
-        };
+    if !index_table_exists(write_txn, &index_table_name)? {
+        return Ok(());
+    }
+    let mut index_table = write_txn
+        .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+        .map_err(table_error)?;
     for &id in ids {
         let rev_sub = reverse_subkey(id);
         let old_entries = match index_table
