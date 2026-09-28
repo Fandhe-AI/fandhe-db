@@ -270,7 +270,7 @@ SET 対象でない列は借用 `&str` のまま `buf` へ書き込まれるた�
 ## `SqlOutcome::Update` の追加（BREAKING CHANGE）
 
 `sql::SqlOutcome` は `#[non_exhaustive]` でないため、`Update` variant の追加は
-破壊的変更として扱う（`Truncate` 追加時〔TASK-195〕と同じ扱い）。網羅 match の
+破壊的変更として扱う（`Truncate` 追加時〔TASK-193〕と同じ扱い）。網羅 match の
 更新箇所は `core.rs::execute_sql`（`Select`／`Aggregate`／`Scan` の 3 アーム）・
 `wire-server::simple_query`。
 

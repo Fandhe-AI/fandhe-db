@@ -260,9 +260,10 @@ fn wire5_post_auth_idle_is_closed_without_response_and_permit_released() {
         "authenticated session must be closed by the read timeout without any response"
     );
 
-    // 枠が解放されるまで少し待ってから、後続接続が受理されることを確認する。
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(limiter.active(), 0, "permit must be released after close");
+    // 枠の解放をポーリングで観測してから、後続接続が受理されることを
+    // 確認する（Issue #1083。ソケットのクローズより permit の drop が
+    // 遅れうるため、固定 `sleep` の待ち時間より遅延すると誤検知しうる）。
+    wait_for_active_exact(&limiter, 0, 1, Duration::from_secs(60));
 
     let mut next = TcpStream::connect(addr).expect("connect after permit release");
     assert_connection_accepted_and_idle(&mut next);
@@ -278,38 +279,22 @@ fn wire5_post_auth_idle_is_closed_without_response_and_permit_released() {
 #[test]
 fn wire6_over_limit_is_rejected_with_53300_in_accept_loop() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let (addr, limiter) = spawn_server(&users_path, 1, Duration::from_secs(5));
+    let (addr, limiter) = spawn_server(&users_path, 1, LIMIT_TEST_IDLE_TIMEOUT);
 
     let mut held = TcpStream::connect(addr).expect("connect first (holds the only slot)");
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(limiter.active(), 1);
+    wait_for_active_exact(&limiter, 1, 1, Duration::from_secs(60));
 
     let mut second = TcpStream::connect(addr).expect("connect second");
-    let mut header = [0u8; 1];
-    second.read_exact(&mut header).expect("read message type");
-    assert_eq!(header[0], b'E', "expected ErrorResponse");
-    let mut len_buf = [0u8; 4];
-    second.read_exact(&mut len_buf).expect("read length");
-    let len = i32::from_be_bytes(len_buf) as usize;
-    let mut body = vec![0u8; len - 4];
-    second.read_exact(&mut body).expect("read body");
-    let body_str = String::from_utf8_lossy(&body);
-    assert!(
-        body_str.contains(wire_server::limits::SQLSTATE_TOO_MANY_CONNECTIONS),
-        "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
-    );
-    let mut extra = [0u8; 1];
-    let n = second.read(&mut extra).unwrap_or(0);
-    assert_eq!(n, 0, "rejected connection must be closed");
+    read_rejection_blocking(&mut second, Duration::from_secs(60));
 
     // 保持中の 1 本目は影響を受けず認証を完了できる。
     complete_authentication(&mut held, "alice", "correct-horse");
 
     drop(held);
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(limiter.active(), 0, "permit must be released after close");
+    wait_for_active_exact(&limiter, 0, 1, Duration::from_secs(60));
 
     let mut third = TcpStream::connect(addr).expect("connect third after release");
+    wait_for_active_exact(&limiter, 1, 1, Duration::from_secs(60));
     assert_connection_accepted_and_idle(&mut third);
 }
 
@@ -318,7 +303,7 @@ fn wire6_over_limit_is_rejected_with_53300_in_accept_loop() {
 #[test]
 fn wire6_limit_applies_to_authenticated_and_unauthenticated_alike() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let (addr, _limiter) = spawn_server(&users_path, 1, Duration::from_secs(5));
+    let (addr, _limiter) = spawn_server(&users_path, 1, LIMIT_TEST_IDLE_TIMEOUT);
 
     let mut authenticated = TcpStream::connect(addr).expect("connect first");
     complete_authentication(&mut authenticated, "alice", "correct-horse");
@@ -334,13 +319,26 @@ fn wire6_limit_applies_to_authenticated_and_unauthenticated_alike() {
 
 /// max=4 で 16 クライアントを同時 connect すると、受理 4・`53300` 拒否 12 を
 /// ちょうど観測し、`limiter.active()` が 4 を超えないこと。
+///
+/// 分類はクライアントの短い read timeout による「受理か拒否か」の推測
+/// ではなく、サーバー側の決定そのもの（`limiter.active()` の遷移と
+/// `'E'` バイトの到達）をポーリングで観測して行う（Issue #1083）。
+/// 旧実装はクライアント 200ms read timeout の `WouldBlock` を「受理」と
+/// 見なしていたが、accept ループの応答書き込みが負荷下で 200ms を超えて
+/// 遅延すると、本来拒否される接続が `WouldBlock` を返し誤って「受理」に
+/// 分類され得た（accept ループは単一スレッドで listener を順に処理する
+/// ため、`active` の増加はその接続が実際に枠を取得したことのみを意味する。
+/// idle timeout を [`LIMIT_TEST_IDLE_TIMEOUT`] へ延長し、保持中の接続が
+/// テスト実行中に idle 期限で閉じて枠が空く経路も塞ぐ）。
 #[test]
 fn wire6_concurrent_burst_never_exceeds_max() {
     const MAX: usize = 4;
     const BURST: usize = 16;
+    let hang_guard = Duration::from_secs(60);
+    let poll_interval = Duration::from_millis(5);
 
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let (addr, limiter) = spawn_server(&users_path, MAX, Duration::from_secs(5));
+    let (addr, limiter) = spawn_server(&users_path, MAX, LIMIT_TEST_IDLE_TIMEOUT);
 
     let mut accepted = 0usize;
     let mut rejected = 0usize;
@@ -349,20 +347,45 @@ fn wire6_concurrent_burst_never_exceeds_max() {
     for _ in 0..BURST {
         let mut stream = TcpStream::connect(addr).expect("connect burst client");
         stream
-            .set_read_timeout(Some(Duration::from_millis(200)))
+            .set_read_timeout(Some(poll_interval))
             .expect("set probe timeout");
-        let mut header = [0u8; 1];
-        match stream.read(&mut header) {
-            // WouldBlock: 受理されて待機中（枠を取得できた）。
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                accepted += 1;
-                held.push(stream);
+
+        let deadline = std::time::Instant::now() + hang_guard;
+        loop {
+            let mut header = [0u8; 1];
+            match stream.read(&mut header) {
+                // 'E' が読めた: 上限超過で拒否された。
+                Ok(1) if header[0] == b'E' => {
+                    rejected += 1;
+                    break;
+                }
+                // この接続を数える前に active が 1 つ増えていれば、それは
+                // この接続自身が枠を取得したことを意味する（accept ループ
+                // は単一スレッドで順に処理するため、他の接続の増分と
+                // 取り違えない）。
+                Ok(1) => panic!("unexpected non-'E' byte from server: {:?}", header[0]),
+                Ok(0) => panic!(
+                    "connection closed with EOF before an ErrorResponse byte was read; \
+                     this would misclassify a rejection as neither accepted nor rejected"
+                ),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if limiter.active() == accepted + 1 {
+                        accepted += 1;
+                        held.push(stream);
+                        break;
+                    }
+                }
+                Err(e) => panic!("unexpected read error: {e:?}"),
+                #[allow(unreachable_patterns)]
+                Ok(_) => unreachable!("read into a 1-byte buffer cannot return more than 1"),
             }
-            // 'E' が読めた: 上限超過で拒否された。
-            Ok(1) if header[0] == b'E' => {
-                rejected += 1;
-            }
-            other => panic!("unexpected read outcome: {other:?}"),
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out classifying burst connection as accepted or rejected"
+            );
         }
     }
 
@@ -378,22 +401,34 @@ fn wire6_concurrent_burst_never_exceeds_max() {
     );
 }
 
-/// `limiter.active()` が `expected` に達するまでポーリングする。
+/// `limiter.active()` が `expected` にちょうど一致するまでポーリングする
+/// （Issue #1083。旧 `wait_for_active_permits` は `>=` による早期判定のため、
+/// 解放による減少（0 への遷移）を待つ用途に使えなかった）。
 ///
 /// accept ループは単一スレッドで listener を順に処理するため、`connect()`
-/// が返った時点では OS の backlog に滞留していて許可枠がまだ付与されて
-/// いないことがある。固定時間（例: 接続 1 本ごとに 50ms）を毎回スリープ
-/// して待つ方式は、本数に比例して累積待ち時間が伸び、共有 CI 環境の負荷
-/// 下では `READ_TIMEOUT`／アイドル期限に対して無視できない割合を占め
-/// うる（codex-review P2・Cursor Bugbot Medium 指摘）。ここでは短い間隔で
-/// 条件を再確認するポーリングに置き換え、実際に許可枠が付与された事実
-/// そのもので受理を確認する（読み取りタイムアウトの経過待ちに依存しない）。
-fn wait_for_active_permits(limiter: &ConnectionLimiter, expected: usize, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
+/// が返った時点では OS の backlog に滞留していて許可枠がまだ付与・解放
+/// されていないことがある。固定時間の `sleep` で待つ方式は、負荷下では
+/// 実際の遷移より早く／遅く終わり、`READ_TIMEOUT`／アイドル期限に対して
+/// 無視できない割合を占めうる（codex-review P2・Cursor Bugbot Medium
+/// 指摘、Issue #1083 継続）。ここでは短い間隔（2ms）で条件を再確認する
+/// ポーリングに置き換え、各回 `active <= max` の不変条件も検証しながら
+/// 許可枠が実際に `expected` へ遷移した事実そのもので合否を判定する
+/// （読み取りタイムアウトの経過待ちに依存しない）。`hang_guard` は
+/// ハング防止のためだけの上限で、合否の基準ではない。
+fn wait_for_active_exact(
+    limiter: &ConnectionLimiter,
+    expected: usize,
+    max: usize,
+    hang_guard: Duration,
+) {
+    let deadline = std::time::Instant::now() + hang_guard;
     loop {
         let active = limiter.active();
-        if active >= expected {
-            assert_eq!(active, expected, "active permits must not exceed expected");
+        assert!(
+            active <= max,
+            "active permits must never exceed max, got {active} (max {max})"
+        );
+        if active == expected {
             return;
         }
         assert!(
@@ -404,6 +439,61 @@ fn wait_for_active_permits(limiter: &ConnectionLimiter, expected: usize, timeout
     }
 }
 
+/// 上限超過で拒否された接続から `'E'`／`53300` を読み取り、続けて EOF になる
+/// ことを確認する（`wire6_over_limit_is_rejected_with_53300_in_accept_loop`・
+/// `wire6_production_max_connections_rejects_the_65th_connection` に重複して
+/// いた読み取りコードの共通化。Issue #1083）。クライアントの read timeout を
+/// `hang_guard` 相当まで長く取り、負荷下で accept ループの応答書き込みが
+/// 遅延してもタイムアウトで誤判定しないようにする。
+fn read_rejection_blocking(stream: &mut TcpStream, hang_guard: Duration) {
+    stream
+        .set_read_timeout(Some(hang_guard))
+        .expect("set client read timeout for rejection read");
+
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read message type");
+    assert_eq!(header[0], b'E', "expected ErrorResponse");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read length");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains(wire_server::limits::SQLSTATE_TOO_MANY_CONNECTIONS),
+        "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
+    );
+
+    // `read` の読み取りタイムアウト（`WouldBlock`／`TimedOut`）を `unwrap_or(0)`
+    // で EOF（`Ok(0)`）と同一視すると、拒否応答後にサーバーが接続を閉じない
+    // 回帰があってもタイムアウト経過後に「閉じられた」と誤判定してしまう
+    // （codex-review P2 指摘）。`Ok(0)` のみをクローズ成功として扱い、
+    // タイムアウトは明示的に失敗させる。
+    let mut trailing = [0u8; 1];
+    match stream.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(n) => panic!("rejected connection sent unexpected trailing byte(s), got {n}"),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            panic!(
+                "rejected connection was not closed within {hang_guard:?} after rejection response"
+            );
+        }
+        Err(e) => panic!("unexpected error reading trailing byte after rejection: {e}"),
+    }
+}
+
+/// WIRE-6 テスト専用の accept ループ idle timeout（Issue #1083）。負荷下では
+/// production の `READ_TIMEOUT`（30 秒）や旧テスト値（5 秒）でも、先頭に
+/// 保持している接続がテスト実行中に idle timeout で閉じられ枠が空いてしまう
+/// レースがあった。WIRE-6 は「枠の占有・拒否」を検証する観点であり
+/// `READ_TIMEOUT` そのもの（WIRE-5）の検証対象ではないため、このテスト用
+/// サーバーに限って大きく延長する。production の `crate::limits::READ_TIMEOUT`
+/// は変更しない。
+const LIMIT_TEST_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// production 定数 `MAX_CONNECTIONS`（64）そのもので accept ループを通し、
 /// 65 本目が `'E'`／`53300` で拒否されること（Issue #482。既存の
 /// `wire6_concurrent_burst_never_exceeds_max` はパラメータ化した小さい上限
@@ -411,14 +501,17 @@ fn wait_for_active_permits(limiter: &ConnectionLimiter, expected: usize, timeout
 /// 初めて固定する）。
 ///
 /// 64 本の接続受理確認は、接続 1 本ごとに固定待ち（50ms）を課す方式では
-/// なく `wait_for_active_permits` によるポーリングで行う（codex-review
+/// なく `wait_for_active_exact` によるポーリングで行う（codex-review
 /// P2・Cursor Bugbot Medium 指摘対応: 逐次固定待ちは累積で数秒かかり、
-/// 共有環境の遅延が重なるとアイドル期限 5 秒に対し先頭接続から閉じられ
-/// 得るため）。
+/// 共有環境の遅延が重なるとアイドル期限に対し先頭接続から閉じられ得る
+/// ため）。idle timeout も [`LIMIT_TEST_IDLE_TIMEOUT`] へ延長する
+/// （Issue #1083。旧値 5 秒は待機上限 5 秒と同じ長さで、負荷下では先頭の
+/// 保持接続が idle timeout で閉じ、64 本受理を待つ間に枠が空いて 65 本目
+/// が受理されてしまい得た）。
 #[test]
 fn wire6_production_max_connections_rejects_the_65th_connection() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let (addr, limiter) = spawn_server(&users_path, MAX_CONNECTIONS, Duration::from_secs(5));
+    let (addr, limiter) = spawn_server(&users_path, MAX_CONNECTIONS, LIMIT_TEST_IDLE_TIMEOUT);
 
     let mut held: Vec<TcpStream> = Vec::with_capacity(MAX_CONNECTIONS);
     for _ in 0..MAX_CONNECTIONS {
@@ -428,28 +521,15 @@ fn wire6_production_max_connections_rejects_the_65th_connection() {
     // 許可枠が実際に `MAX_CONNECTIONS` 本付与された事実そのものが受理の
     // 証拠であり（枠を超えて許可されることはない）、各接続を個別に
     // アイドル状態か読み取りタイムアウトで確認する必要はない。
-    wait_for_active_permits(&limiter, MAX_CONNECTIONS, Duration::from_secs(5));
+    wait_for_active_exact(
+        &limiter,
+        MAX_CONNECTIONS,
+        MAX_CONNECTIONS,
+        Duration::from_secs(60),
+    );
 
     let mut extra = TcpStream::connect(addr).expect("connect the 65th");
-    let mut header = [0u8; 1];
-    extra.read_exact(&mut header).expect("read message type");
-    assert_eq!(
-        header[0], b'E',
-        "expected ErrorResponse for the 65th connection"
-    );
-    let mut len_buf = [0u8; 4];
-    extra.read_exact(&mut len_buf).expect("read length");
-    let len = i32::from_be_bytes(len_buf) as usize;
-    let mut body = vec![0u8; len - 4];
-    extra.read_exact(&mut body).expect("read body");
-    let body_str = String::from_utf8_lossy(&body);
-    assert!(
-        body_str.contains(wire_server::limits::SQLSTATE_TOO_MANY_CONNECTIONS),
-        "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
-    );
-    let mut trailing = [0u8; 1];
-    let n = extra.read(&mut trailing).unwrap_or(0);
-    assert_eq!(n, 0, "the 65th connection must be closed after rejection");
+    read_rejection_blocking(&mut extra, Duration::from_secs(60));
 
     assert!(
         limiter.active() <= MAX_CONNECTIONS,

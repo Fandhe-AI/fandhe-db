@@ -7,11 +7,12 @@
 //! プロセスを非 0 終了させること・stderr に拒否理由を出力することを外形的に
 //! 確認する（ユーザーストアの内容には依存しないよう空ファイルで固定する）。
 
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[path = "common/mod.rs"]
+mod common;
 
 /// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための
 /// プロセス内単調カウンタ（`wire_auth.rs` と同一クラスの競合対策。Issue #172）。
@@ -70,6 +71,32 @@ impl Drop for TempUserStore {
     }
 }
 
+/// `common::write_user_store_file` 等、削除手段を返さないヘルパーが作る一時
+/// ディレクトリを `Drop` で確実に削除するための汎用ガード（review 指摘対応。
+/// `TempUserStore` は自前で生成したディレクトリのみを対象とするため、共有
+/// ヘルパー由来のディレクトリはこちらで管理する）。
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 子プロセスを `Drop` で kill/wait するガード（review 指摘対応）。
+/// `assert!`／`panic!` を含むテスト本体の途中で早期に巻き戻っても、関数末尾の
+/// 手動 kill/wait 呼び出しに依存せず後始末を保証する
+/// （`three_client_e2e.rs::ServerGuard` と同種の目的だが、本ファイルは
+/// stderr tail の失敗時診断出力までは必要としないため最小構成にする）。
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// 非ループバックアドレス（`0.0.0.0` / `[::]`）を指定すると、TLS 未構成
 /// （TASK-72/WIRE-9）のため起動が非 0 終了で拒否されること。
 #[test]
@@ -104,6 +131,12 @@ fn non_loopback_bind_exits_non_zero() {
 
 /// loopback アドレス（`127.0.0.1`）は起動拒否されず、accept ループへ進むこと
 /// （stderr に `listening on` が出力されるまで待って確認する）。
+///
+/// listen 待ち受けは `common::wait_for_listening`（Issue #1082）に委譲する。
+/// 同ヘルパーは listen 行到達後も子プロセスの stderr を EOF まで読み続ける
+/// ため、待ち受け後に受信側を破棄してもパイプの読み口が閉じない（旧実装は
+/// 待ち受け用チャネルの送信失敗でループを抜け読み口を閉じており、下記の
+/// 回帰テストが再現する「listen 後の診断行の欠落」を招きうる形だった）。
 #[test]
 fn loopback_bind_starts_listening() {
     let users_store = TempUserStore::new();
@@ -123,46 +156,7 @@ fn loopback_bind_starts_listening() {
         .spawn()
         .expect("spawn wire-server");
 
-    let stderr = child.stderr.take().expect("piped stderr");
-
-    // `BufReader::read_line` は子プロセスの stdout/stderr パイプに対する read
-    // タイムアウトを持たないブロッキング呼び出しであるため、デッドラインを
-    // ループの「間」でチェックするだけでは子プロセスが行を出力も終了もせず
-    // 停止した場合にハングしうる（TASK-70 review 指摘）。専用スレッドで
-    // 行読み取りを行い、`mpsc::Receiver::recv_timeout` で待つことで、
-    // 呼び出し元スレッドが `read_line` のブロッキングに巻き込まれず確実に
-    // デッドラインで打ち切れるようにする。
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut saw_listening = false;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("listening on") => {
-                saw_listening = true;
-                break;
-            }
-            Ok(_) => continue,
-            // 送信側スレッドが終了した（プロセスが早期終了・拒否された）場合、
-            // またはタイムアウトした場合はここで抜ける。
-            Err(_) => break,
-        }
-    }
+    let saw_listening = common::wait_for_listening(&mut child, Duration::from_secs(5));
 
     // 起動を確認できたら子プロセスを終了させ、ゾンビを残さないよう wait する。
     let _ = child.kill();
@@ -172,4 +166,113 @@ fn loopback_bind_starts_listening() {
         saw_listening,
         "loopback bind must not be rejected and must reach the listening state"
     );
+}
+
+/// 回帰テスト（Issue #1082。`common::drain_stderr`／`StderrDrain` が listen
+/// 行到達後も stderr を EOF まで読み続けることを固定する。
+/// `three_client_e2e.rs::
+/// server_guard_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server`
+/// と同じ手順を、本ファイルが担当する pg wire 表層の CLI 起動経路で確認する）:
+/// 未読データを残したまま接続を閉じて RST を送り、サーバー側に
+/// `connection error` を複数回ログさせたうえで、それが `tail` へ届くこと
+/// （非 vacuous 化）とサーバーが生存し続けていることを確認する。
+///
+/// #1081 以前は listen 待ち受け後に受信側チャネルを破棄するとパイプの読み口が
+/// 閉じ、以降にサーバーが stderr へ書くと `EPIPE` で `eprintln!` が panic し
+/// panic フック（TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT
+/// 終了しうる問題があった（`three_client_e2e.rs::ServerGuard` が先に是正
+/// 済み）。#1081 でサーバー側の診断ログが `engine::log_stderr!`（書き込み
+/// 失敗を無視する）へ置き換わったため、現在は読み口を閉じてもサーバー側は
+/// abort しないが、旧実装のまま（読み口を閉じたまま）だと listen 後の
+/// `connection error` 行が読み取れず本テストの `tail` が空のまま失敗する
+/// （手元でローカル読み取りループを旧実装へ戻して確認済み。コミットしない）。
+#[test]
+fn common_listen_helper_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server() {
+    const RESET_CONNECTIONS: usize = 3;
+
+    // `common::write_user_store_file` は生成した一時ディレクトリを削除する
+    // 手段を返り値に含めないため（他の大多数の呼び出し元と同じ前提）、ここでは
+    // 親ディレクトリを自前の `Drop` ガードで管理し、以降の `assert!`／`panic!`
+    // 経路でも確実に削除されるようにする（review 指摘: 回帰テストのクリーン
+    // アップ不備）。
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let _users_dir_guard = TempDirGuard(
+        users_path
+            .parent()
+            .expect("user store file has a parent dir")
+            .to_path_buf(),
+    );
+    let users_store = TempUserStore::new();
+    let db_path = users_store.db_path_str();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+        .args([
+            "--users",
+            users_path.to_str().expect("utf-8 path"),
+            "--db",
+            &db_path,
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wire-server");
+    // 以降の `expect`／`assert!`／`panic!` で早期 return（実質 panic）しても
+    // 子プロセスの kill/wait に確実に到達するよう `Drop` ガードへ委ねる
+    // （review 指摘: listen 待ち／接続エラー確認中に panic すると、関数末尾の
+    // `child.kill()`／`child.wait()` に到達せず子プロセスが残留しうる）。
+    let mut child = ChildGuard(child);
+
+    let mut drain = common::drain_stderr(&mut child.0);
+    let (addr, lines) = drain.wait_for_listening(Duration::from_secs(10));
+    let addr = addr
+        .unwrap_or_else(|| panic!("did not observe listening address; lines so far: {lines:?}"));
+
+    for _ in 0..RESET_CONNECTIONS {
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        common::send_startup_message(&mut stream, "alice", "docs");
+        // サーバーの認証要求が受信バッファに届いたことを `peek`（消費しない）
+        // で確かめてから読まずに閉じる（未読データを残した close は RST に
+        // なり、サーバー側の読み取りが ECONNRESET となって stderr へ 1 行
+        // ログされる。固定 sleep だと高負荷下で到着前に閉じ FIN になりうる
+        // ため待ち合わせる）。
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set_read_timeout");
+        let mut probe = [0u8; 1];
+        let peeked = stream
+            .peek(&mut probe)
+            .expect("peek authentication request");
+        assert!(peeked >= 1, "expected pending authentication request bytes");
+        drop(stream);
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let logged = drain
+            .tail_lines()
+            .iter()
+            .filter(|l| l.contains("connection error"))
+            .count();
+        if logged >= 2 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "expected at least 2 logged connection errors, got {logged}; tail={:?}",
+                drain.tail_lines()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        child.0.try_wait().expect("try_wait").is_none(),
+        "server must still be alive after logging connection errors"
+    );
+
+    // 子プロセスの kill/wait と一時ディレクトリの削除は `ChildGuard`／
+    // `TempDirGuard` の `Drop` に委ねる（このスコープを抜ける時点で、成功時
+    // ・panic 時のいずれでも実行される）。
 }

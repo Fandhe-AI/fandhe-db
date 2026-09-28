@@ -231,10 +231,12 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
     let sys = ctx("sys");
     ok(&core, &sys, "CREATE TABLE p (name TEXT)");
     for sql in [
-        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE CASCADE)",
-        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE SET NULL)",
-        "CREATE TABLE c (v BIGINT REFERENCES p ON UPDATE CASCADE)",
+        // 参照アクション（Issue #1076）の未実装形: 列リスト形の SET NULL／
+        // SET DEFAULT、`ON DELETE` の重複指定。
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE SET NULL (v))",
+        "CREATE TABLE c (v BIGINT REFERENCES p ON UPDATE SET DEFAULT (v))",
         "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE RESTRICT ON DELETE RESTRICT)",
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE CASCADE ON DELETE CASCADE)",
         // `MATCH PARTIAL` は非対応（TABLE-17・TASK-205、Issue #1077）。
         "CREATE TABLE c (v BIGINT REFERENCES p MATCH PARTIAL)",
         "CREATE TABLE c (v BIGINT REFERENCES p MATCH FULL MATCH FULL)",
@@ -257,6 +259,8 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
         "CREATE TABLE c (v BIGINT, FOREIGN KEY (id) REFERENCES p)",
         "CREATE TABLE c (v BIGINT, CONSTRAINT fk_v FOREIGN KEY (v) REFERENCES p)",
         "CREATE TABLE c (v BIGINT REFERENCES p, FOREIGN KEY (v) REFERENCES p)",
+        // 構造が同じでアクションだけが異なる重複宣言も拒否する（Issue #1076 A14）。
+        "CREATE TABLE c (v BIGINT REFERENCES p, FOREIGN KEY (v) REFERENCES p ON DELETE CASCADE)",
     ] {
         assert_eq!(err_code(&core, &sys, sql), "42601", "{sql}");
     }
@@ -688,6 +692,66 @@ fn updating_referenced_unique_key_is_rejected_but_non_key_columns_are_free() {
         &core,
         &alice,
         "UPDATE countries SET label = 'Nippon' WHERE id = 1 USING OPERATION_ID 'op-u5'",
+    );
+}
+
+/// レビュー指摘（Issue #1071 PR #1146・`key_index.rs::sync_rows_in_txn`）:
+/// 同一バッチ内で参照先キーを別行へ入れ替える（複数行の UPSERT で親キーを
+/// 交換する）と、旧実装は行ごとに旧キーを無条件で `KeyIndexDelta::lost` へ
+/// 積み、バッチ完了後に他行がまだそのキーを保持しているかを再確認していな
+/// かったため、最終状態でキーが実在するのに `ForeignKeyViolation`
+/// （`23503`）を誤って返していた。
+#[test]
+fn swapping_referenced_key_between_rows_in_one_statement_does_not_false_positive() {
+    let (core, path) = new_core("fk-key-swap");
+    let _guard = CleanupGuard(path);
+    create_pk_parent_and_child(&core);
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code, label) VALUES (1, 'JP', 'Japan'), (2, 'YY', 'Other') \
+         USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO cities (id, country, name) VALUES (1, 'JP', 'Tokyo') USING OPERATION_ID 'op-c'",
+    );
+    // 索引未登録のままだと参照先側検査は常に全行走査へフォールバックし、
+    // 索引化前と同じ結果になってバグを再現できない。参照されていない行の
+    // 'code' を変更する成功パスを 1 回通し、`ensure_index_in_txn` による
+    // 索引登録を先に済ませておく（Issue #1071 の索引経路へ切り替える契約）。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code, label) VALUES (3, 'AA', 'Unused') USING OPERATION_ID 'op-p2'",
+    );
+    ok(
+        &core,
+        &alice,
+        "UPDATE countries SET code = 'BB' WHERE id = 3 USING OPERATION_ID 'op-register'",
+    );
+    // 1 回の UPSERT で id=1 の 'JP' を 'XX' へ、id=2 の 'YY' を 'JP' へ同時に
+    // 入れ替える。バッチ完了時点では 'JP' は id=2 の行に引き継がれて実在する
+    // ため、cities の参照は壊れておらず違反ではない。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code) VALUES (1, 'XX'), (2, 'JP') \
+         ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code USING OPERATION_ID 'op-swap'",
+    );
+    // 索引が正しく更新されていること（'JP' は id=2 に付け替わり、'XX' は
+    // 誰も参照していない新規キーとして使える）を、その後の整合性検査の
+    // 挙動で確認する。'JP' を本当に誰も持たない状態にすると、今度は正しく
+    // 違反として拒否される。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "UPDATE countries SET code = 'ZZ' WHERE id = 2 USING OPERATION_ID 'op-remove-jp'"
+        ),
+        "23503"
     );
 }
 

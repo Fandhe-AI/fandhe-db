@@ -16,11 +16,13 @@
 //! `42501`）は `wire_create_table.rs` の担当（本ファイルは CLI 解析の外形
 //! 確認に徹する）。
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[path = "common/mod.rs"]
+mod common;
 
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -93,37 +95,6 @@ fn write_user_store_with_alice(path: &str) {
         .trim()
         .to_string();
     std::fs::write(path, format!("alice:tenant-a:{phc}\n")).expect("write user store");
-}
-
-/// 子プロセスの stderr を専用スレッドで読み、`listening on` を待つ
-/// （`wire_durability_cli.rs::wait_for_listening` と同型）。
-fn wait_for_listening(child: &mut Child) -> bool {
-    let stderr = child.stderr.take().expect("piped stderr");
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("listening on") => return true,
-            Ok(_) => continue,
-            Err(_) => return false,
-        }
-    }
 }
 
 /// 非 0 終了・stderr にフラグ名を含む拒否系（R1〜R3）を検証する共通ヘルパー。
@@ -212,7 +183,7 @@ fn ddl_allowed_users_accepts_known_user_and_reaches_listening() {
         .expect("spawn wire-server");
 
     assert!(
-        wait_for_listening(&mut child),
+        common::wait_for_listening(&mut child, Duration::from_secs(10)),
         "expected listening on with valid --ddl-allowed-users"
     );
     let _ = child.kill();

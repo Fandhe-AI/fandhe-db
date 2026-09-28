@@ -12,14 +12,35 @@
 //! 上記の in-process ヘルパーとは前提を共有しない（`#[path]` で include する
 //! 各ファイルはそれぞれ独立にコンパイルされるモジュールになるため、
 //! 同一ファイル内に共存させても他ファイルとのシンボル衝突は起きない）。
+//!
+//! 同節の [`drain_stderr`]／[`wait_for_listening`]／
+//! [`wait_for_listening_addr_and_lines`] は、子プロセス（`wire-server`）の
+//! stderr を listen 行到達後も EOF まで読み続ける共通ヘルパーであり
+//! （Issue #1082）、`tests/wire_fault_injection_cli.rs`・`wire7_bind_guard.rs`・
+//! `wire_durability_cli.rs`・`wire_search_engine_cli.rs`・
+//! `wire_ddl_permission_cli.rs`・`wire_scram_mock_key_file_size.rs`・
+//! `http_insert_response_boundary.rs` の 7 ファイルが個別に持っていた同型の
+//! ローカル実装（listen 行到達後に受信側を破棄すると読み取りスレッドが
+//! 送信失敗でループを抜け、パイプの読み口を閉じてしまう形）を集約したもの。
+//! `three_client_e2e.rs::ServerGuard` と同じ理由による是正（Issue #943／
+//! #1081 で先に是正済み）: #1081 以前は読み口を閉じたままサーバーが接続
+//! エラー等を stderr へ複数行書くと `EPIPE` で `eprintln!` が panic し、panic
+//! フック（TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT 終了して
+//! いた。#1081 でサーバー側の診断ログが `engine::log_stderr!`（書き込み失敗を
+//! 無視する）へ置き換わったため、読み口を閉じてもサーバー側は abort しなく
+//! なったが、読み口を閉じると listen 後の診断行（接続エラー等）が失われる
+//! ため、本節は引き続き EOF まで読み続けて診断行を tail へ保持する。
+//! `wire_search_engine_cli.rs` はかつて本集約の対象外として申し送られて
+//! いたが、Issue #1082 で対象に含めた。
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
@@ -573,8 +594,11 @@ pub fn read_ready_for_query_status(stream: &mut TcpStream) -> u8 {
 // 受理・拒否（fail-closed）・選択表層に応じたリスナー分岐を stderr の外形
 // 観測だけで検証する結合テストの土台。旧 `tests/wire_surface_cli.rs` に
 // 個別実装されていた同型ヘルパーをここへ集約する（PR #795 で本ファイルへの
-// 共通化が「対象外」として申し送られた分）。`tests/wire_search_engine_cli.rs`
-// は独自の同型ヘルパーを個別に持ったままで本集約の対象外（スコープ外）。
+// 共通化が「対象外」として申し送られた分）。stderr の EOF までの読み取り
+// （`StderrDrain`・`drain_stderr`・`wait_for_listening`・
+// `wait_for_listening_addr_and_lines`）は Issue #1082 で 7 ファイル分を
+// 本節へ集約した（`wire_search_engine_cli.rs` もこの集約に含む。旧版の本
+// コメントでは対象外としていたが、Issue #1082 で解消済み）。
 // ---------------------------------------------------------------------------
 
 /// 子プロセス用フィクスチャの一時ディレクトリ名が他テスト・他プロセスと
@@ -634,6 +658,290 @@ pub fn write_empty_user_store(path: &str) {
     std::fs::write(path, "").expect("write empty user store");
 }
 
+/// 診断用に保持する listen 後の stderr 行数の上限（無制限に溜めない。
+/// `three_client_e2e.rs::STDERR_TAIL_MAX_LINES` と同値）。
+const STDERR_TAIL_MAX_LINES: usize = 256;
+
+/// listen 後の stderr 行を上限付きで `tail` へ追加する（古い行から捨てる。
+/// `three_client_e2e.rs::push_tail` と同型）。
+fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
+    let mut guard = match tail.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.len() >= STDERR_TAIL_MAX_LINES {
+        guard.pop_front();
+    }
+    guard.push_back(line.trim_end().to_string());
+}
+
+/// 子プロセスの stderr を 1 行ずつ読み、送信側（`tx`）が生きている間は
+/// そちらへ転送し、送信失敗後（受信側が破棄された後）は `tail`（`Some` の
+/// 場合のみ）へ上限付きで蓄積し続ける。いずれの場合も EOF（子プロセス終了）
+/// まで読み取りを止めない。
+///
+/// `read_until` + `from_utf8_lossy` を使い、`BufRead::read_line` の
+/// `unwrap_or(0)` とは異なり非 UTF-8 バイト列が混じってもループを抜けない
+/// （Issue #1082。旧実装は送信失敗・非 UTF-8 のいずれでもループを抜けて
+/// パイプの読み口を閉じていた。読み口を閉じたまま以降にサーバーが stderr へ
+/// 書くと、#1081 以前は `EPIPE` で `eprintln!` が panic し panic フック
+/// 〔TASK-97・RECOVER-6／TASK-99・RECOVER-8〕経由で SIGABRT 終了しうる問題が
+/// あった。#1081 でサーバー側の診断ログが `engine::log_stderr!`〔書き込み
+/// 失敗を無視する〕へ置き換わったため、現在は読み口を閉じてもサーバー側は
+/// abort しないが、読み口を閉じると listen 後の診断行が失われる。EOF まで
+/// 読み続けることで診断行の欠落を防ぐ）。
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+    tx: mpsc::Sender<String>,
+    tail: Option<Arc<Mutex<VecDeque<String>>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut forwarding = true;
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            if forwarding {
+                if let Err(mpsc::SendError(unsent)) = tx.send(line) {
+                    forwarding = false;
+                    if let Some(tail) = &tail {
+                        push_tail(tail, unsent);
+                    }
+                }
+            } else if let Some(tail) = &tail {
+                push_tail(tail, line);
+            }
+        }
+    })
+}
+
+/// [`StderrDrain`] の内部状態（Issue #1082）。listen 待ち受け中に読み取った
+/// 行の待ち行列 `pending` と、listen 到達後・タイムアウト後の診断行の
+/// 上限付き蓄積 `tail` を同一の `Mutex` で保護する。両者間の切り替え
+/// （[`StderrDrain::wait_for_listening`] が listen 行を見つけて以降を
+/// `tail` 経路へ切り替える操作）を読み取りスレッドと同じロック区間内で
+/// 行うため、切り替えを跨いで行を取りこぼす競合が起きない（旧実装は
+/// `mpsc::channel` の送信失敗〔受信側 drop〕で切り替えを検知していたため、
+/// listen 行受信直後に読み取りスレッドが次の行を送信済みでチャネル内に
+/// 残ると、その行はどちらの経路にも回収されず失われ得た。codex review
+/// 指摘）。
+struct StderrDrainState {
+    /// `Some` の間は listen 待ち受け中（未消費の行がここへ積まれる）。
+    /// listen 到達・タイムアウトのいずれかで `None` に切り替わり、以降の
+    /// 行は `tail` へ回る。
+    pending: Option<VecDeque<String>>,
+    tail: VecDeque<String>,
+    /// 読み取りスレッドが EOF（子プロセス終了）に達したら立てる。
+    /// `wait_for_listening` はこれを見て即座に待ち受けを打ち切る
+    /// （立てずに `condvar` の通知任せにすると、旧 `mpsc` 実装が
+    /// `rx.recv_timeout` の `Err(Disconnected)` で即時検知していた
+    /// 早期終了を、新実装ではタイムアウト満了まで検知できなくなる）。
+    eof: bool,
+}
+
+/// 上限付きで `tail` へ行を追加する（古い行から捨てる。呼び出し元が既に
+/// 保護用 `Mutex` を保持している場合に使う直接操作版。[`push_tail`] の
+/// `Mutex` 越し版とは呼び出し文脈が異なる）。
+fn push_tail_locked(tail: &mut VecDeque<String>, line: String) {
+    if tail.len() >= STDERR_TAIL_MAX_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(line.trim_end().to_string());
+}
+
+/// 子プロセスの stderr を EOF まで読み続け、[`StderrDrainState`] へ
+/// 振り分ける読み取りスレッド本体（Issue #1082）。`read_until` +
+/// `from_utf8_lossy` を使い、`spawn_stderr_reader` と同じ理由（非 UTF-8
+/// バイト列混入時にループを抜けて読み口を閉じるとパイプ経由で子プロセス
+/// 側を巻き込みかねない）でループを抜けない。
+fn spawn_gated_stderr_reader(
+    stderr: ChildStderr,
+    state: Arc<(Mutex<StderrDrainState>, Condvar)>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::new();
+        let (mutex, condvar) = &*state;
+        loop {
+            buf.clear();
+            let eof = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => true,
+                Ok(_) => false,
+            };
+            let mut inner = match mutex.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !eof {
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                match inner.pending.as_mut() {
+                    Some(pending) => pending.push_back(line),
+                    None => push_tail_locked(&mut inner.tail, line),
+                }
+            } else {
+                inner.eof = true;
+            }
+            drop(inner);
+            condvar.notify_one();
+            if eof {
+                break;
+            }
+        }
+    })
+}
+
+/// 子プロセス（`wire-server`）の stderr を EOF まで読み続ける読み取り
+/// ハンドル（Issue #1082）。[`drain_stderr`] で生成し、
+/// [`Self::wait_for_listening`] で listen 行を待ち受ける。待ち受け後も
+/// 読み取りスレッドは止まらず、以降の行は `tail` へ回る（[`Self::tail_lines`]
+/// で後から参照できる）。`Drop` では読み取りスレッドを join しない
+/// （子プロセスが生存中に join するとブロックしうるため。子プロセスの
+/// kill でパイプが閉じれば読み取りスレッドは自然に終了する。
+/// `three_client_e2e.rs::ServerGuard` は kill 後に明示 join するが、本型は
+/// 生存確認・診断目的の直接利用〔回帰テスト〕を除き使い捨てのラッパー
+/// （[`wait_for_listening`]／[`wait_for_listening_addr_and_lines`]）経由で
+/// 使われるため、その利用形に合わせて join を必須にしない）。
+pub struct StderrDrain {
+    state: Arc<(Mutex<StderrDrainState>, Condvar)>,
+    _reader: std::thread::JoinHandle<()>,
+}
+
+impl StderrDrain {
+    /// `wire-server: listening on <addr>` 行に到達するまで `timeout` 内で
+    /// 待ち受け、到達アドレス（無ければ `None`）とそこまでに観測した全行
+    /// （トリム済み）を返す。到達・タイムアウトのいずれでも、読み取り
+    /// スレッドと同じロックを保持したまま以降の行を `tail` へ回すよう
+    /// 切り替える（`pending` に残っていた未消費行があれば `tail` へ移して
+    /// から切り替えるため、切り替えの前後どちらのタイミングで読み取り
+    /// スレッドが行を書き込んでいても取りこぼさない）。
+    pub fn wait_for_listening(&mut self, timeout: Duration) -> (Option<SocketAddr>, Vec<String>) {
+        let deadline = Instant::now() + timeout;
+        let (mutex, condvar) = &*self.state;
+        let mut lines = Vec::new();
+        let mut found = None;
+        let mut guard = match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            while let Some(line) = guard.pending.as_mut().and_then(VecDeque::pop_front) {
+                let trimmed = line.trim_end().to_string();
+                let addr = trimmed.find("listening on ").and_then(|idx| {
+                    trimmed[idx + "listening on ".len()..]
+                        .trim()
+                        .parse::<SocketAddr>()
+                        .ok()
+                });
+                lines.push(trimmed);
+                if let Some(addr) = addr {
+                    found = Some(addr);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            // 読み取りスレッドが EOF に達していれば、これ以上行は来ない
+            // （旧 `mpsc` 実装が `rx.recv_timeout` の `Err(Disconnected)` で
+            // 即座に検知していた早期終了と同じ扱い。タイムアウト満了を
+            // 待たず打ち切る）。
+            if guard.eof {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next_guard, wait_result) = match condvar.wait_timeout(guard, remaining) {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard = next_guard;
+            let pending_empty = guard.pending.as_ref().is_none_or(VecDeque::is_empty);
+            if wait_result.timed_out() && pending_empty {
+                break;
+            }
+        }
+        // ここに到達する時点で `pending` に行が残るのは listen 行到達直後
+        // （読み取りスレッドが同じロック区間の外で次の行を既に書き込んで
+        // いた場合）のみ。タイムアウト・EOF 到達の各パスは直前の内側
+        // ループで `pending` を空になるまで読み切っているため、ここでは
+        // 何も残らない。残っていればそれを `tail` へ移してから待ち受け
+        // モードを終了する（切り替えの前後どちらで読み取りスレッドが
+        // 書き込んでいても取りこぼさない）。
+        if let Some(mut pending) = guard.pending.take() {
+            while let Some(rest) = pending.pop_front() {
+                push_tail_locked(&mut guard.tail, rest);
+            }
+        }
+        drop(guard);
+        (found, lines)
+    }
+
+    /// 診断用に、これまで `tail` へ蓄積された行のスナップショットを返す
+    /// （Mutex が poison していても `into_inner` で読む）。
+    pub fn tail_lines(&self) -> Vec<String> {
+        let (mutex, _condvar) = &*self.state;
+        let guard = match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.tail.iter().cloned().collect()
+    }
+}
+
+/// [`StderrDrain`] を生成し、`child` の stderr を専用スレッドで EOF まで
+/// 読み続ける（呼び出し元はこの呼び出しで `child.stderr` の所有権を失う）。
+pub fn drain_stderr(child: &mut Child) -> StderrDrain {
+    let stderr = child.stderr.take().expect("piped stderr");
+    let state = Arc::new((
+        Mutex::new(StderrDrainState {
+            pending: Some(VecDeque::new()),
+            tail: VecDeque::new(),
+            eof: false,
+        }),
+        Condvar::new(),
+    ));
+    let reader = spawn_gated_stderr_reader(stderr, Arc::clone(&state));
+    StderrDrain {
+        state,
+        _reader: reader,
+    }
+}
+
+/// `wire-server` 子プロセスの stderr から `listening on` 行への到達可否
+/// だけを見る薄いラッパー（Issue #1082。7 件の CLI 系結合テストが個別に
+/// 持っていた同型のローカル関数を集約する）。到達すれば `true`、`timeout`
+/// または子プロセスの早期終了（パイプの EOF）では `false` を返す。
+pub fn wait_for_listening(child: &mut Child, timeout: Duration) -> bool {
+    let mut drain = drain_stderr(child);
+    let (addr, _lines) = drain.wait_for_listening(timeout);
+    addr.is_some()
+}
+
+/// `wire-server` 子プロセスの stderr から listen アドレスと、そこまでに
+/// 観測した全行（トリム済み）を返す薄いラッパー（Issue #1082）。到達
+/// しなければ、それまでに観測した行を含めて panic する（fail-closed。
+/// 曖昧な結果で処理を続けない）。
+pub fn wait_for_listening_addr_and_lines(
+    child: &mut Child,
+    timeout: Duration,
+) -> (SocketAddr, Vec<String>) {
+    let mut drain = drain_stderr(child);
+    let (addr, lines) = drain.wait_for_listening(timeout);
+    match addr {
+        Some(addr) => (addr, lines),
+        None => {
+            panic!("did not observe listening address within {timeout:?}; lines so far: {lines:?}")
+        }
+    }
+}
+
 /// 子プロセス（`wire-server`）を起動し、stderr の行読み取りスレッド・
 /// これまでに読んだ行の蓄積を束ねたハンドル。`Drop` で未 stop なら
 /// kill＋wait する（呼び出し元テストが途中で panic してもゾンビ・ポート
@@ -647,9 +955,13 @@ pub struct SpawnedServer {
 
 impl SpawnedServer {
     /// `wire-server` バイナリを `extra_args` 付きで起動する。stdout は
-    /// 捨て、stderr はパイプして専用スレッドで読み続ける
-    /// （`BufReader::read_line` はデッドラインを持たないブロッキング呼び出し
-    /// のため、呼び出し元は `recv_timeout` で確実に打ち切れるようにする）。
+    /// 捨て、stderr はパイプして専用スレッド（[`spawn_stderr_reader`]。
+    /// `tail` は使わず送信専用モードで動かす。呼び出し元は受信側チャネルを
+    /// 持ったまま `stop_and_drain` で kill→wait するため、送信失敗後に
+    /// 読み取りスレッドが読み捨てるだけの形で実害はない）で読み続ける
+    /// （`BufReader::read_line` 相当はデッドラインを持たないブロッキング
+    /// 呼び出しのため、呼び出し元は `recv_timeout` で確実に打ち切れる
+    /// ようにする）。
     pub fn spawn(extra_args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
             .args(extra_args)
@@ -660,17 +972,7 @@ impl SpawnedServer {
 
         let stderr = child.stderr.take().expect("piped stderr");
         let (tx, rx) = mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).unwrap_or(0);
-                if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
-                    break;
-                }
-            }
-        });
+        spawn_stderr_reader(stderr, tx, None);
 
         Self {
             child,

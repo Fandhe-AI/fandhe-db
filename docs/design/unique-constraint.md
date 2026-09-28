@@ -68,6 +68,9 @@ UNIQUE 制約を載せ替えた。
 への点照会に置き換え済みで、一意キーを宣言したテーブルへの書き込みコストは
 自テナントの保有行数に比例しない（1 行あたり O(k・log n)。k は宣言済み一意
 キー数）。設計・不変条件・後方互換は `docs/design/unique-index.md` 参照。
+`FOREIGN KEY` の参照先側索引（`crates/engine/src/key_index.rs`、Issue #1071・
+`docs/design/foreign-key.md`）は識別子（テーブル・エンコーディング・列リスト）が
+同型のため、この一意性索引の構造を流用している。
 
 ### D2. 明示トランザクション内の書き込み（SQL-31・TASK-221）
 

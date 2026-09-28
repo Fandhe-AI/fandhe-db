@@ -1281,6 +1281,19 @@ mod tests {
     /// 同水準（`tests/hnsw_search.rs::parallel_build_recall_at_10_matches_
     /// sequential_build_within_margin` と同じ `-0.02` マージン）であることを
     /// 確認する（レビュー指摘 P1-B）。
+    ///
+    /// クエリ集合は 1000 件（Issue #1083・計測条件の是正。`docs/design/
+    /// hnsw-parallel-build.md` の「決定性契約」のとおり `threads >= 2` の
+    /// 並列構築は挿入順が非決定的で、実スレッドスケジューリングにより
+    /// `observed` のグラフ形状が実行のたびに変わり得る。100 件では
+    /// クエリ標本のノイズにより Recall@10 の測定値自体が run ごとに
+    /// 数 % 揺れ、負荷下では稀に `-0.02` マージンを超えて間欠失敗して
+    /// いた（負荷再現・taskset 2 コア制限下 40 試行 × ef 2 種で失敗率
+    /// 約 1.6%、最大差分 0.04）。クエリを 1000 件に増やすと同条件・
+    /// 同試行回数で失敗 0・最大差分 0.0065 まで縮小した。マージン
+    /// `-0.02` 自体・`m`／`ef_construction` 等の構築パラメータは変更
+    /// していない——推定量のノイズを減らす計測条件の是正であり、閾値の
+    /// 弱体化ではない）。
     #[test]
     fn build_with_threads_observed_parallel_path_reports_consistent_worker_stats() {
         let dim = 16usize;
@@ -1329,7 +1342,7 @@ mod tests {
                     + profile.repair_reachability
         );
 
-        let queries = gen_queries(0x51DE_0007, dim, clusters, 100);
+        let queries = gen_queries(0x51DE_0007, dim, clusters, 1000);
         for ef in [64usize, 256] {
             let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
             let obs_recall = recall_at_10(&observed, &vectors, dim, rows, ef, &queries);
