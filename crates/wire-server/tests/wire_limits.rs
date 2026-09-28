@@ -464,9 +464,25 @@ fn read_rejection_blocking(stream: &mut TcpStream, hang_guard: Duration) {
         "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
     );
 
+    // `read` の読み取りタイムアウト（`WouldBlock`／`TimedOut`）を `unwrap_or(0)`
+    // で EOF（`Ok(0)`）と同一視すると、拒否応答後にサーバーが接続を閉じない
+    // 回帰があってもタイムアウト経過後に「閉じられた」と誤判定してしまう
+    // （codex-review P2 指摘）。`Ok(0)` のみをクローズ成功として扱い、
+    // タイムアウトは明示的に失敗させる。
     let mut trailing = [0u8; 1];
-    let n = stream.read(&mut trailing).unwrap_or(0);
-    assert_eq!(n, 0, "rejected connection must be closed after rejection");
+    match stream.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(n) => panic!("rejected connection sent unexpected trailing byte(s), got {n}"),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            panic!(
+                "rejected connection was not closed within {hang_guard:?} after rejection response"
+            );
+        }
+        Err(e) => panic!("unexpected error reading trailing byte after rejection: {e}"),
+    }
 }
 
 /// WIRE-6 テスト専用の accept ループ idle timeout（Issue #1083）。負荷下では

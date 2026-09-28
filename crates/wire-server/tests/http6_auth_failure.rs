@@ -24,10 +24,15 @@
 //! 既存実装をそのまま再利用し、本ファイル固有の要求組み立てのみ薄いラッパで
 //! 追加する。
 //!
-//! 期限切れの再現は時刻待ち（`sleep`）ではなく `SessionStore::with_limits`
+//! 期限切れの再現は時刻待ち（固定 `sleep`）ではなく `SessionStore::with_limits`
 //! に `Duration::ZERO` の TTL を渡し、`SessionStore::active_sessions` の
 //! 観測で決定的に確認する（Issue #1083。`store.rs` の `is_alive` は
 //! `elapsed < ttl` のため TTL=0 は発行直後から常に期限切れ判定になる）。
+//! これに加え、TTL=0 の退化ケースだけでは検出できない退行（TTL の単位換算・
+//! 比較演算子反転等）への保険として、正の TTL を持つ同一トークンが
+//! 発行直後は有効・TTL 経過後は `28000` へ収束することを、固定 `sleep`
+//! ではなく `hang_guard` 上限のポーリングで確認する
+//! （`poll_until_token_rejected_with_28000`。codex-review P2 指摘）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -109,6 +114,36 @@ fn timed_send(addr: std::net::SocketAddr, request: &[u8]) -> (HttpResponse, Dura
     let raw = send_raw(addr, request, AfterWrite::KeepOpen);
     let elapsed = start.elapsed();
     (parse_single_response(&raw), elapsed)
+}
+
+/// 正の TTL を持つ同一トークンが、TTL 経過後に `28000` へ収束するまで
+/// ポーリングする（codex-review P2 指摘。TTL=0 専用リスナーの検証だけでは
+/// 発行直後から常に期限切れとなる退化ケースしか固定できず、TTL の単位換算や
+/// `is_alive` の比較演算子反転など正の経過時間でのみ顕在化する退行を
+/// 検出できない。固定 `sleep` へは戻さず、`wire_limits.rs::wait_for_active_exact`
+/// と同方式で短間隔ポーリング＋ `hang_guard` 上限に倒し、Issue #1083 が排した
+/// 負荷下の間欠失敗を再導入しない）。
+fn poll_until_token_rejected_with_28000(
+    addr: std::net::SocketAddr,
+    auth: &str,
+    hang_guard: Duration,
+) {
+    let deadline = Instant::now() + hang_guard;
+    loop {
+        let request = query_request(Some(auth), &[], VALID_SCAN_BODY);
+        let resp = parse_single_response(&send_raw(addr, &request, AfterWrite::HalfClose));
+        if resp.status == 401 && wire_code_of(&resp) == "28000" {
+            assert_eq!(error_code_of(&resp), "AUTH_REQUIRED");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for positive-TTL token to expire (last status {}, wire_code {:?})",
+            resp.status,
+            wire_code_of(&resp)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// `Date` ヘッダを除いた応答生バイト列を返す（バイト同一性比較用。
@@ -258,6 +293,33 @@ fn expired_token_on_query_rejects_with_28000() {
     ));
     assert_eq!(fresh_resp.status, 404, "token must still be valid");
     assert_eq!(wire_code_of(&fresh_resp), "42P01");
+
+    // 正の TTL（同一トークン）: 発行直後は有効、TTL 経過後は同じトークンが
+    // 28000 へ収束することを固定 sleep ではなくポーリングで確認する
+    // （codex-review P2 指摘。TTL=0 の退化ケースだけでは検出できない
+    // 退行への保険。TTL は初回問い合わせが負荷下でも確実に間に合うよう
+    // 十分な余裕（2 秒）を取り、経過待ち自体は `hang_guard` を上限とした
+    // ポーリングで吸収する）。
+    let positive_ttl_sessions = SessionStore::with_limits(4, Duration::from_secs(2));
+    let positive_ttl_addr = spawn_router_listener(&users_path, positive_ttl_sessions);
+    let positive_ttl_token = login(positive_ttl_addr, "alice", "pw-alice");
+    let positive_ttl_auth = format!("Bearer {positive_ttl_token}");
+    let immediate_request = query_request(Some(&positive_ttl_auth), &[], VALID_SCAN_BODY);
+    let immediate_resp = parse_single_response(&send_raw(
+        positive_ttl_addr,
+        &immediate_request,
+        AfterWrite::HalfClose,
+    ));
+    assert_eq!(
+        immediate_resp.status, 404,
+        "token issued with a positive TTL must still be valid immediately after login"
+    );
+    assert_eq!(wire_code_of(&immediate_resp), "42P01");
+    poll_until_token_rejected_with_28000(
+        positive_ttl_addr,
+        &positive_ttl_auth,
+        Duration::from_secs(30),
+    );
 
     // 期限切れ（TTL=0）: `sessions` はサーバーへ渡すハンドル、`observer` は
     // `Clone` で内部状態を共有するテスト側の観測用ハンドル
