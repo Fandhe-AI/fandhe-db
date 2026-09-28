@@ -3330,7 +3330,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     )
 }
 
-/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-195）
+/// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`（SQL-22、TASK-193）
 /// の実体。テーブル定義（カタログ）は残したまま、セッションのテナントが所有する
 /// 全行（`Visibility` を問わない）を単一 write トランザクションで削除する
 /// （[`delete_row_unchecked`]・[`replace_typed_rows_by_text_key`] と並ぶ 3 つ目の

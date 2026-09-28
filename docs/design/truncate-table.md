@@ -1,6 +1,6 @@
 # `TRUNCATE TABLE` の設計判断
 
-Issue #874・対象ビヘイビア: SQL-22（TASK-195）。関連ポインタ: TABLE-4（テーブル定義は
+Issue #874・対象ビヘイビア: SQL-22（TASK-193）。関連ポインタ: TABLE-4（テーブル定義は
 残る）・RLS-7（RLS 暗黙適用）・RLS-9（他テナント存在情報の非漏えい）・
 RECOVER-1〜3・RECOVER-10（`operation_id` 必須化・台帳照合による再送判定）。
 
