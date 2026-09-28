@@ -915,3 +915,78 @@ fn predicate_delete_cascades_correctly_for_id_reference_when_parent_has_no_key()
         Some(Cell::Text("c3".to_string()))
     );
 }
+
+// --- 同一子列に競合する複数の参照アクションが作用する場合の宣言順非依存性
+// （codex-review 指摘・PR #1138）--------------------------------------------------
+//
+// 子列 `x` が親の別々の `UNIQUE` 列（`code`・`alt_code`）をそれぞれ参照する
+// 2 つの `FOREIGN KEY`（一方 `ON DELETE SET NULL`・他方 `ON DELETE CASCADE`）を
+// 持つ場合、親行の `code` と `alt_code` が同じ値であれば、その親行の削除は
+// 両方の FK にとって「参照先が失われた」削除になる。修正前は各 FK の対象を
+// 現在の子行から順に収集・即適用していたため、宣言順で先に処理された
+// `SET NULL` が子列 `x` を `NULL` に書き換えると、後から処理される `CASCADE`
+// の走査ではその子行が対象から消え、削除されずに残っていた（宣言順で結果が
+// 変わる不具合）。本テストは `SET NULL`／`CASCADE` の宣言順を入れ替えた 2 つの
+// テーブル組で同じ最終状態（子行は削除される）になることを固定する。
+fn create_competing_action_tables(core: &EngineCore, set_null_declared_first: bool) {
+    let sys = ctx("sys");
+    ok(
+        core,
+        &sys,
+        "CREATE TABLE parents (code TEXT UNIQUE, alt_code TEXT UNIQUE)",
+    );
+    let children_ddl = if set_null_declared_first {
+        "CREATE TABLE children (\
+         x TEXT, note TEXT, \
+         FOREIGN KEY (x) REFERENCES parents (code) ON DELETE SET NULL, \
+         FOREIGN KEY (x) REFERENCES parents (alt_code) ON DELETE CASCADE)"
+    } else {
+        "CREATE TABLE children (\
+         x TEXT, note TEXT, \
+         FOREIGN KEY (x) REFERENCES parents (alt_code) ON DELETE CASCADE, \
+         FOREIGN KEY (x) REFERENCES parents (code) ON DELETE SET NULL)"
+    };
+    ok(core, &sys, children_ddl);
+}
+
+#[test]
+fn same_child_column_competing_actions_are_order_independent_of_declaration() {
+    for set_null_declared_first in [true, false] {
+        let label = if set_null_declared_first {
+            "fkact-competing-set-null-first"
+        } else {
+            "fkact-competing-cascade-first"
+        };
+        let (core, path) = new_core(label);
+        let _guard = CleanupGuard(path);
+        create_competing_action_tables(&core, set_null_declared_first);
+        let alice = ctx("alice");
+        // `code`・`alt_code` を同じ値にし、この 1 行の削除が両方の FK にとって
+        // 「参照先が失われた」削除になるようにする。
+        ok(
+            &core,
+            &alice,
+            "INSERT INTO parents (id, code, alt_code) VALUES (1, 'shared', 'shared') \
+             USING OPERATION_ID 'op-p'",
+        );
+        ok(
+            &core,
+            &alice,
+            "INSERT INTO children (id, x, note) VALUES (10, 'shared', 'c1') \
+             USING OPERATION_ID 'op-c'",
+        );
+        ok(
+            &core,
+            &alice,
+            "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'",
+        );
+        // 宣言順に関わらず `CASCADE` が最終的に勝ち、子行は削除される
+        // （修正前は `set_null_declared_first == true` のケースで子行が
+        // `x = NULL` のまま残っていた）。
+        assert_eq!(
+            row_count(&core, &alice, "children"),
+            0,
+            "set_null_declared_first={set_null_declared_first}: 宣言順に関わらず CASCADE が勝ち子行は削除されるべき"
+        );
+    }
+}

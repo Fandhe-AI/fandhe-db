@@ -1158,7 +1158,7 @@ fn value_as_scalar_ref(value: &crate::row_codec::Value) -> Option<ScalarRef<'_>>
 /// 子テーブルの走査で集めた FK 参照元列の値ごとのキー（[`scan_child_fk_rows`]）。
 /// `id` 参照（[`ForeignKeyDef::references_parent_id`]）は物理キーの `id` 値、
 /// それ以外は一意性検査と同じ正準キーバイト列で持つ。
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ChildKey {
     Id(u64),
     Bytes(Vec<u8>),
@@ -1201,13 +1201,29 @@ fn child_key_from_values(
 /// 走査し、`fk` の参照元列の値（非 NULL）ごとに一致する子行 id を集める
 /// （Issue #1076。ON DELETE／ON UPDATE の対象特定・NO ACTION 事後検証のいずれの
 /// 母集合も同一テナント全行である契約〔A9〕に従う）。
-fn scan_child_fk_rows(
+///
+/// `wanted_keys` が `Some` の場合はその集合に含まれるキーの行だけを保持し、
+/// それ以外の行は一致判定の直後に捨てる（キーには追加しない）。`None` の場合は
+/// 全 distinct キーを保持する（`pre_images` を渡さないフォールバック専用。
+/// どのキーが目的か呼び出し元が特定できない場合にのみ使う）。
+///
+/// いずれの場合も、走査中に一致件数が `remaining_budget`（呼び出し元が算出する
+/// `MAX_REFERENTIAL_ACTION_ROWS` の残り枠）を超えた時点で走査を打ち切り
+/// `TenantWriteError::ReferentialActionLimitExceeded`（`54000`）を返す
+/// （codex-review 指摘・PR #1138: 収集完了を待たずに打ち切ることで、削除前
+/// キーと無関係に大きい子テーブルでも上限を超える分のメモリを確保しない）。
+fn scan_child_fk_rows_for_keys(
     write_txn: &redb::WriteTransaction,
     child_schema: &TableSchema,
     fk: &ForeignKeyDef,
     tenant_id: &str,
+    wanted_keys: Option<&HashSet<ChildKey>>,
+    remaining_budget: u32,
 ) -> Result<HashMap<ChildKey, Vec<u64>>, TenantWriteError> {
     let mut out: HashMap<ChildKey, Vec<u64>> = HashMap::new();
+    if wanted_keys.is_some_and(|w| w.is_empty()) {
+        return Ok(out);
+    }
     let mut indices = Vec::with_capacity(fk.columns().len());
     let mut mask = vec![false; child_schema.columns.len()];
     for name in fk.columns() {
@@ -1232,6 +1248,7 @@ fn scan_child_fk_rows(
             )))
         }
     };
+    let mut matched: u32 = 0;
     let range_start = std::ops::Bound::Included((tenant_id, 0u64));
     let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
     for entry in row_table
@@ -1244,9 +1261,21 @@ fn scan_child_fk_rows(
             break;
         }
         let values = decode_key_columns(child_schema, &mask, v.value())?;
-        if let Some(key) = child_key_from_values(fk, &indices, &values)? {
-            out.entry(key).or_default().push(id);
+        let Some(key) = child_key_from_values(fk, &indices, &values)? else {
+            continue;
+        };
+        if let Some(wanted) = wanted_keys {
+            if !wanted.contains(&key) {
+                continue;
+            }
         }
+        matched = matched
+            .checked_add(1)
+            .ok_or_else(|| internal("referential action row count overflow"))?;
+        if matched > remaining_budget {
+            return Err(TenantWriteError::ReferentialActionLimitExceeded);
+        }
+        out.entry(key).or_default().push(id);
     }
     Ok(out)
 }
@@ -1556,21 +1585,21 @@ fn propagate_referential_actions(
     state: &mut ActionState,
 ) -> Result<(), TenantWriteError> {
     let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table_name)?;
-    // 同一の子テーブルが同一の親テーブルを複数の `FOREIGN KEY` で参照する場合
-    // （`referencing` に同じ `child_schema.name` が複数回現れる）の対応
-    // （Issue #1076・codex-review 指摘）: `enforce_row_constraints_in_txn`
-    // （対象行の**全** FK を検査する）を FK ごとに即座に呼ぶと、この時点で
-    // まだアクションを適用していない同じ子テーブルの別 FK が旧値のまま検査され
-    // `23503` に誤って失敗する。子テーブル名 → (スキーマ, 検証対象 id) へ
-    // 蓄積し、このテーブルを参照する全 FK のアクション適用が終わってから
-    // まとめて 1 回ずつ検証する（子孫段への再帰も同様に、全 FK 適用後へ
-    // 遅延する）。
-    let mut pending_validation: HashMap<String, (TableSchema, Vec<u64>)> = HashMap::new();
-    let mut pending_recursions: Vec<(
-        TableSchema,
-        PropagatedChange,
-        Option<UpdatedKeyPreImages>,
-        u32,
+
+    // Pass 1（対象特定。codex-review 指摘・PR #1138）: このテーブルを参照する
+    // 全 FK の連鎖対象を、いずれの FK のアクションもまだ適用していない子テーブル
+    // の状態から確定する。同じ子列に複数の FK が作用する場合（例: 一方が
+    // `ON DELETE SET NULL`・他方が `ON DELETE CASCADE`）に、先に適用した FK の
+    // 書き込みが後続 FK の `collect_action_targets` の走査結果を変えてしまい、
+    // 宣言順（`referencing` の並び）で最終結果が変わるのを防ぐ。行数上限
+    // （`MAX_REFERENTIAL_ACTION_ROWS`）の判定もこの収集段階で行う——
+    // `collect_action_targets` に残り枠を渡し、子テーブル走査中に上限超過を
+    // 検出した時点で打ち切る（`scan_child_fk_rows_for_keys` ドキュメント参照）。
+    let mut pending_actions: Vec<(
+        &TableSchema,
+        &ForeignKeyDef,
+        ReferentialAction,
+        ActionTargets,
     )> = Vec::new();
     for (child_schema, fk) in &referencing {
         let action = match &change {
@@ -1598,6 +1627,7 @@ fn propagate_referential_actions(
             continue;
         }
 
+        let remaining_budget = MAX_REFERENTIAL_ACTION_ROWS.saturating_sub(state.rows_budget_used);
         let affected = collect_action_targets(
             write_txn,
             table_name,
@@ -1608,17 +1638,12 @@ fn propagate_referential_actions(
             &change,
             pre_images,
             action,
+            remaining_budget,
         )?;
         if affected.is_empty() {
             continue;
         }
 
-        let new_depth = depth
-            .checked_add(1)
-            .ok_or_else(|| internal("referential action depth overflow"))?;
-        if new_depth > MAX_REFERENTIAL_ACTION_DEPTH {
-            return Err(TenantWriteError::ReferentialActionLimitExceeded);
-        }
         let n = u32::try_from(affected.len())
             .map_err(|_| internal("referential action row count overflow"))?;
         let new_budget = state
@@ -1630,6 +1655,59 @@ fn propagate_referential_actions(
         }
         state.rows_budget_used = new_budget;
 
+        pending_actions.push((child_schema, fk, action, affected));
+    }
+
+    let new_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| internal("referential action depth overflow"))?;
+    if !pending_actions.is_empty() && new_depth > MAX_REFERENTIAL_ACTION_DEPTH {
+        return Err(TenantWriteError::ReferentialActionLimitExceeded);
+    }
+
+    // Pass 2（適用。codex-review 指摘・PR #1138）: `referencing`（カタログ走査順＝
+    // 概ね宣言順）ではなく、FK 自身の構造（参照元列・参照先テーブル・参照先列。
+    // `ForeignKeyDef::shares_reference_shape` が保証する一意な組）で決まる正準順に
+    // 並べ替えてから適用し、declaration 順に依存しない決定的な結果にする。
+    // `CASCADE`（削除）は行そのものを消すため、他アクションとどちらの順で交差
+    // しても最終状態は削除に収束する（`apply_referential_action` の `SET NULL`／
+    // `SET DEFAULT` 分岐は削除済み行を素通りし、`CASCADE` 側は `id` で読み直す
+    // ため既に書き換えられた行も問題なく削除できる）。同じ列に `SET NULL` と
+    // `SET DEFAULT` が競合する退化ケースだけは適用順で最終値が変わり得るため、
+    // 宣言順ではなく FK の構造キーで固定する。
+    pending_actions.sort_by(|a, b| {
+        let key_of = |item: &(
+            &TableSchema,
+            &ForeignKeyDef,
+            ReferentialAction,
+            ActionTargets,
+        )| {
+            (
+                item.1.columns().to_vec(),
+                item.1.parent_table().to_string(),
+                item.1.parent_columns().to_vec(),
+            )
+        };
+        key_of(a).cmp(&key_of(b))
+    });
+
+    // 同一の子テーブルが同一の親テーブルを複数の `FOREIGN KEY` で参照する場合
+    // （`referencing` に同じ `child_schema.name` が複数回現れる）の対応
+    // （Issue #1076・codex-review 指摘）: `enforce_row_constraints_in_txn`
+    // （対象行の**全** FK を検査する）を FK ごとに即座に呼ぶと、この時点で
+    // まだアクションを適用していない同じ子テーブルの別 FK が旧値のまま検査され
+    // `23503` に誤って失敗する。子テーブル名 → (スキーマ, 検証対象 id) へ
+    // 蓄積し、このテーブルを参照する全 FK のアクション適用が終わってから
+    // まとめて 1 回ずつ検証する（子孫段への再帰も同様に、全 FK 適用後へ
+    // 遅延する）。
+    let mut pending_validation: HashMap<String, (TableSchema, Vec<u64>)> = HashMap::new();
+    let mut pending_recursions: Vec<(
+        TableSchema,
+        PropagatedChange,
+        Option<UpdatedKeyPreImages>,
+        u32,
+    )> = Vec::new();
+    for (child_schema, fk, action, affected) in pending_actions {
         let is_delete = matches!(change, PropagatedChange::Removed);
         let (child_change, child_pre_images) = apply_referential_action(
             write_txn,
@@ -1713,9 +1791,10 @@ fn propagate_referential_actions(
 ///   のうち、現在（書き込み後）の親行の新キー値と異なるものを持つ子行。
 ///   `pre_images` が無ければ空を返す（呼び出し元が発火不要と判定済み）。
 ///
-/// 引数 7 個超は連鎖 1 段分の呼び出しコンテキスト（参照元・参照先スキーマ・
-/// FK 宣言・変更内容）を素直に渡した結果であり、構造体へまとめるほどの凝集性は
-/// ない（呼び出しは [`propagate_referential_actions`] の 1 箇所のみ）。
+/// 引数 8 個超は連鎖 1 段分の呼び出しコンテキスト（参照元・参照先スキーマ・
+/// FK 宣言・変更内容・行数上限の残り枠）を素直に渡した結果であり、構造体へ
+/// まとめるほどの凝集性はない（呼び出しは [`propagate_referential_actions`] の
+/// 1 箇所のみ）。
 #[allow(clippy::too_many_arguments)]
 fn collect_action_targets(
     write_txn: &redb::WriteTransaction,
@@ -1727,6 +1806,7 @@ fn collect_action_targets(
     change: &PropagatedChange,
     pre_images: Option<&UpdatedKeyPreImages>,
     action: ReferentialAction,
+    remaining_budget: u32,
 ) -> Result<ActionTargets, TenantWriteError> {
     match change {
         PropagatedChange::Removed => {
@@ -1742,10 +1822,6 @@ fn collect_action_targets(
                 // `remove` の戻り値（削除前の物理行）から復元した旧値を積んで渡す
                 // 契約（`UpdatedKeyPreImages` ドキュメント参照）。
                 if pre.old_values.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
-                if child_rows.is_empty() {
                     return Ok(Vec::new());
                 }
                 // `id` 参照（`fk.references_parent_id()`）は `parent_columns()` が
@@ -1785,7 +1861,13 @@ fn collect_action_targets(
                         tenant_id,
                     )?)
                 };
-                let mut out = Vec::new();
+                // 削除前キーのうち、現時点でもまだ失われたままのキー（`exists ==
+                // false`）だけを「対象になり得るキー」として先に確定する
+                // （codex-review 指摘・PR #1138: 子テーブルの走査〔次段〕を、
+                // このキー集合に一致する行だけへ絞り込むための下ごしらえ。
+                // 無関係な子行を一切 `scan_child_fk_rows_for_keys` の結果へ
+                // 含めない）。
+                let mut wanted_keys: HashSet<ChildKey> = HashSet::new();
                 let mut seen_keys: HashSet<ChildKey> = HashSet::new();
                 for (removed_id, old_values) in &pre.old_values {
                     let old_key = if fk.references_parent_id() {
@@ -1813,10 +1895,23 @@ fn collect_action_targets(
                         // いないため対象外（`ColumnsUpdated` 分岐と同じ最終状態判定）。
                         continue;
                     }
-                    if let Some(ids) = child_rows.get(&old_key) {
-                        for &id in ids {
-                            out.push((id, None));
-                        }
+                    wanted_keys.insert(old_key);
+                }
+                if wanted_keys.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let child_rows = scan_child_fk_rows_for_keys(
+                    write_txn,
+                    child_schema,
+                    fk,
+                    tenant_id,
+                    Some(&wanted_keys),
+                    remaining_budget,
+                )?;
+                let mut out = Vec::new();
+                for ids in child_rows.values() {
+                    for &id in ids {
+                        out.push((id, None));
                     }
                 }
                 return Ok(out);
@@ -1825,7 +1920,17 @@ fn collect_action_targets(
             // `tenant.rs` 側呼び出し元はすべて上記の限定版を使うため通常は
             // 到達しない）: 現在の親に存在しないキーを持つ子行全体を対象にする、
             // より広い（保守的だが `INITIALLY DEFERRED` では過剰連鎖になり得る）走査。
-            let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
+            // どのキーが目的か事前に絞れないため `wanted_keys` は渡さないが、
+            // 行数上限は走査中に判定する（`scan_child_fk_rows_for_keys` ドキュメント
+            // 参照）。
+            let child_rows = scan_child_fk_rows_for_keys(
+                write_txn,
+                child_schema,
+                fk,
+                tenant_id,
+                None,
+                remaining_budget,
+            )?;
             if child_rows.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1880,11 +1985,12 @@ fn collect_action_targets(
                         .ok_or_else(|| internal("referenced column not found in parent schema"))
                 })
                 .collect::<Result<_, _>>()?;
-            let child_rows = scan_child_fk_rows(write_txn, child_schema, fk, tenant_id)?;
-            if child_rows.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut out = Vec::new();
+            // 親行ごとに「旧キーが新キーと異なる（＝失われた）」場合の旧キーだけを
+            // 対象候補として先に確定する（codex-review 指摘・PR #1138）。親の
+            // 現在値の点照会（`read_parent_row_values`）は子テーブルの走査より
+            // 先に完結できるため、子スキャンをこの確定済みキー集合へ絞り込める。
+            let mut wanted: HashMap<ChildKey, Option<Vec<crate::row_codec::Value>>> =
+                HashMap::new();
             for (parent_id, old_values) in &pre.old_values {
                 let old_key = build_owned_key(old_values, &parent_indices, fk)?;
                 let Some(old_key) = old_key else { continue };
@@ -1902,9 +2008,6 @@ fn collect_action_targets(
                 if new_key.as_ref() == Some(&old_key) {
                     continue;
                 }
-                let Some(ids) = child_rows.get(&old_key) else {
-                    continue;
-                };
                 let new_key_values: Option<Vec<crate::row_codec::Value>> =
                     if matches!(action, ReferentialAction::Cascade) {
                         match &new_values {
@@ -1926,6 +2029,23 @@ fn collect_action_targets(
                     } else {
                         None
                     };
+                wanted.insert(old_key, new_key_values);
+            }
+            if wanted.is_empty() {
+                return Ok(Vec::new());
+            }
+            let wanted_keys: HashSet<ChildKey> = wanted.keys().cloned().collect();
+            let child_rows = scan_child_fk_rows_for_keys(
+                write_txn,
+                child_schema,
+                fk,
+                tenant_id,
+                Some(&wanted_keys),
+                remaining_budget,
+            )?;
+            let mut out = Vec::new();
+            for (key, ids) in &child_rows {
+                let new_key_values = wanted.get(key).cloned().flatten();
                 for &id in ids {
                     out.push((id, new_key_values.clone()));
                 }
@@ -2807,6 +2927,7 @@ mod tests {
             &PropagatedChange::Removed,
             Some(&pre_images),
             ReferentialAction::Cascade,
+            MAX_REFERENTIAL_ACTION_ROWS,
         )
         .expect("limited scan must succeed");
         let limited_ids: HashSet<u64> = limited.into_iter().map(|(id, _)| id).collect();
@@ -2830,6 +2951,7 @@ mod tests {
             &PropagatedChange::Removed,
             None,
             ReferentialAction::Cascade,
+            MAX_REFERENTIAL_ACTION_ROWS,
         )
         .expect("fallback scan must succeed");
         let fallback_ids: HashSet<u64> = fallback.into_iter().map(|(id, _)| id).collect();
@@ -3002,6 +3124,104 @@ mod tests {
 
         drop(children_table);
         drop(grandchildren_table);
+        write_txn.abort().expect("abort");
+    }
+
+    // --- `scan_child_fk_rows_for_keys` の行数上限判定（codex-review 指摘・
+    // PR #1138）------------------------------------------------------------------
+    //
+    // 修正前は子テーブルの全非 NULL 行を無条件に `HashMap` へ保持してから
+    // 呼び出し元（`propagate_referential_actions`）が `affected.len()` で上限
+    // （`MAX_REFERENTIAL_ACTION_ROWS`）を判定していた。この場合、削除前キーと
+    // 無関係な行を含め、一致した行を丸ごとメモリに確保してから拒否するため、
+    // 上限を大きく超える一致件数があるとメモリ確保コストが上限による抑制の
+    // 意味を失う。本テストは (1) 一致件数が残り枠を超えると走査を打ち切って
+    // `54000` 相当のエラーを返すこと、(2) 無関係なキーの行は一致件数にも
+    // 結果にも一切現れないこと、を固定する。
+    #[test]
+    fn scan_child_fk_rows_for_keys_rejects_once_matches_exceed_remaining_budget() {
+        let (storage, _guard) = tmp_storage("constraint-scan-child-fk-budget");
+        let child_schema = TableSchema::new(
+            "children",
+            vec![ColumnDef::new(
+                "parent_id",
+                crate::catalog::ColumnType::BigInt,
+                true,
+            )],
+        );
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+        let fk = ForeignKeyDef::new(
+            vec!["parent_id".to_string()],
+            "parents".to_string(),
+            vec![crate::catalog::FOREIGN_KEY_PARENT_ID_COLUMN.to_string()],
+            ReferentialAction::Cascade,
+            ReferentialAction::NoAction,
+        );
+
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        // wanted_keys に一致する行（parent_id=5）を 3 件。
+        for id in [10u64, 11, 12] {
+            put_raw_row(
+                &write_txn,
+                &child_schema,
+                "tenant-a",
+                id,
+                &[Value::BigInt(5)],
+            );
+        }
+        // wanted_keys と無関係な行（parent_id=6）を多数（一致件数にもエラー
+        // 判定にも影響しないことを確認する）。
+        for id in [20u64, 21, 22, 23, 24] {
+            put_raw_row(
+                &write_txn,
+                &child_schema,
+                "tenant-a",
+                id,
+                &[Value::BigInt(6)],
+            );
+        }
+        let wanted_keys: HashSet<ChildKey> = HashSet::from([ChildKey::Id(5)]);
+
+        // 残り枠が一致件数（3）未満だと打ち切って `ReferentialActionLimitExceeded`。
+        let err = scan_child_fk_rows_for_keys(
+            &write_txn,
+            &child_schema,
+            &fk,
+            "tenant-a",
+            Some(&wanted_keys),
+            2,
+        )
+        .expect_err("matches exceeding the remaining budget must be rejected");
+        assert!(matches!(
+            err,
+            TenantWriteError::ReferentialActionLimitExceeded
+        ));
+
+        // 残り枠が一致件数以上なら成功し、無関係な行（parent_id=6）は結果に
+        // 一切含まれない。
+        let ok = scan_child_fk_rows_for_keys(
+            &write_txn,
+            &child_schema,
+            &fk,
+            "tenant-a",
+            Some(&wanted_keys),
+            3,
+        )
+        .expect("matches within the remaining budget must succeed");
+        let mut matched_ids: Vec<u64> = ok
+            .get(&ChildKey::Id(5))
+            .expect("key 5 must be present")
+            .clone();
+        matched_ids.sort_unstable();
+        assert_eq!(matched_ids, vec![10, 11, 12]);
+        assert_eq!(
+            ok.len(),
+            1,
+            "無関係なキー（parent_id=6）は一致件数にも結果にも現れない"
+        );
+
         write_txn.abort().expect("abort");
     }
 }
