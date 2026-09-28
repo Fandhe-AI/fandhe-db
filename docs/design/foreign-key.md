@@ -225,7 +225,12 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
 - 維持点: `constraint::enforce_row_constraints_in_txn`（書き込み直後）が
   登録済み索引を同期する単一箇所（一意性・`CHECK` 検査と同じ検査点）。
   `DELETE`／`TRUNCATE` は `enforce_referencing_rows_in_txn` が自ら同期・
-  消去する。
+  消去する。`ON DELETE CASCADE`（Issue #1076）による子行の物理削除は
+  `constraint::apply_referential_action` が直接行うため、削除した id を
+  同関数から `key_index::sync_rows_in_txn` へ渡して同期する（この同期を
+  怠ると、削除済み行の索引エントリが残留し、孫段の列参照 FK による
+  `NO ACTION` 事後検証が索引照会で「参照先はまだ存在する」と誤判定して
+  違反を見逃す）。
 - フォールバック: 索引がそのテナントで未登録（旧 DB・初回参照）の FK・
   テーブルの組み合わせに限り、索引導入前と同一の全行走査で判定し、成功後に
   索引を構築・登録して以後の文から索引経路に切り替える。この構築
