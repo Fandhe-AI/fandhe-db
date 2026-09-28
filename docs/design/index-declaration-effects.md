@@ -152,8 +152,27 @@ Issue コメント（オーナー判断 2026-09-27）の要旨: 起動時 opt-in
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
 - スカラー専用 opt-in の新設（上位スイッチは起動時 HNSW opt-in のみ）
-- ホットパスの宣言読み取りコストを削る世代キー付き小キャッシュ（性能問題が
-  実測されれば別 Issue で判断する）
+- **`IndexCatalogGateCache`（`catalog.rs`）はストレージ全体世代キーのため、
+  索引宣言と無関係な行 DML の commit でも次回参照時に再走査が起きる**
+  （codex-review P2 指摘・PR #1124）: `hnsw_targeted_in_txn` の走査結果
+  キャッシュは `crate::storage::current_generation_in_txn`（ストレージ全体の
+  単一世代カウンタ）をキーにしている。これは索引宣言を変更する 4 経路
+  （`create_index`／`drop_index`／`drop_table`／`alter_table_drop_column`）
+  がいずれも commit 前に必ずこのカウンタを進める（取りこぼしなし）ことを
+  根拠に選んだキーだが、宣言と無関係な通常の行 DML でも同じカウンタが進む
+  ため、書き込みと検索が交互に発生する構成ではキャッシュがほぼ効かず、
+  キャッシュ導入前と同じフルスキャン 1 回分のコストが検索のたびに残る
+  （悪化はしない。`catalog.rs` の `IndexCatalogGateCache` ドキュメンテーション
+  コメント参照）。是正する場合の設計方針: 上記 4 経路の commit 時にのみ
+  進む専用の「索引カタログ世代」カウンタを新設し、`hnsw_targeted_in_txn`・
+  スカラー宣言解決の両方をそのカウンタでキー付けする（ストレージ全体世代
+  ではなく専用カウンタを読むことで通常の行 DML による過剰無効化を避ける）。
+  ただし新カウンタは commit_boundary 経由の全 4 経路で確実に進める必要があり
+  （1 経路でも取りこぼすと TOCTOU 再照合と同種の fail-open ―
+  stale な `hnsw_anywhere=false` が未宣言テーブルを誤って HNSW 経路へ通す ―
+  を再導入する）、永続フォーマット（新カウンタ未保持の既存 DB）との
+  互換性も設計する必要があるため、宣言のみを対象にした部分修正は行わず
+  別 Issue（`perf` 分類）の対象とする。
 
 ## 影響を受ける既存 fixture
 
