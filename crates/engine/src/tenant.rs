@@ -42,6 +42,13 @@ use crate::policy::PolicyContext;
 use crate::recovery::content_hash;
 use crate::recovery::ledger::{self, LedgerRecordError, LedgerWrite};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
+// `CheckEvaluationFailed` が運ぶ内側のエラー型（`sql::check_constraint::
+// CompiledChecks::enforce` が返す `ExprProgram::eval` の失敗を、通常の式評価
+// （WHERE／SELECT）と同じ分類・同じ安全な文言のまま呼び出し元へ透過させるために
+// 保持する。`constraint.rs`（本モジュールと同じ crate root 層）が既に
+// `sql::check_constraint::CompiledChecks` を呼んでいるため、この依存で新たな
+// レイヤ違反は生じない（オーナー判断 2026-09-28・Issue #1075 ポインタ）。
+use crate::sql::allowlist::SqlSurfaceError;
 use crate::storage::{
     decode_row_tenant_and_visibility, encode_row, Row, RowInput, Storage, StorageError,
 };
@@ -353,10 +360,19 @@ pub enum TenantWriteError {
     /// **後**・テーブル世代 bump／commit の**前**に返す（`write_txn` は commit
     /// されないため、行・台帳とも痕跡が残らない）。
     CheckViolation { constraint: String },
-    /// `CHECK` 制約の述語評価自体が失敗した（`vec_div` の 0 除算等、値依存で
-    /// 発生しうる）。違反（`CheckViolation`）に丸めず `XX000`（内部事象）として
-    /// 書き込みを拒否する（fail-closed。値・詳細はクライアントへ渡さない）。
-    CheckEvaluationFailed,
+    /// `CHECK` 制約の述語評価自体が失敗した（0 除算・`BIGINT` の精度超過等、
+    /// 値依存で発生しうる）。違反（[`TenantWriteError::CheckViolation`]）には
+    /// 丸めず fail-closed に書き込みを拒否する。PostgreSQL と同様、CHECK 評価中の
+    /// エラーは制約違反ではなく式評価エラーとして扱う（オーナー判断
+    /// 2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16 ポインタ）。以前は常に
+    /// `XX000`（内部事象）へ丸めていたが、`sql::check_constraint::CompiledChecks::
+    /// enforce` が式（`sql::expr_program::ExprProgram`。`WHERE`／`SELECT` と共有
+    /// する同一コンパイラ）を評価して得た [`SqlSurfaceError`] をそのまま保持し、
+    /// 通常の式評価と同じ `wire_code`（0 除算・非有限値は `22000`、`NUMERIC`
+    /// 関数の桁あふれは `22003` 等）で返す。カタログ改変・実装不整合による
+    /// 再束縛失敗（漂流）は本 variant ではなく引き続き
+    /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。
+    CheckEvaluationFailed(SqlSurfaceError),
     /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
     /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
     /// または参照先の削除・更新・TRUNCATE・置換で参照元の行が残る。一意性制約と
@@ -500,7 +516,13 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
-            TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
+            // 内側の `SqlSurfaceError`（`sql::allowlist`）が既に
+            // `ClassifiedError::error_class()` を実装済みのため、そこへ委譲する
+            // （通常の式評価と同じ分類。ERR-2 の SSOT を経由するため、CHECK 専用の
+            // 分類テーブルを別途持たない）。
+            TenantWriteError::CheckEvaluationFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
             TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
@@ -556,8 +578,12 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CheckViolation { constraint } => {
                 write!(f, "new row violates check constraint {constraint:?}")
             }
-            TenantWriteError::CheckEvaluationFailed => {
-                write!(f, "check constraint evaluation failed")
+            // 内側の `SqlSurfaceError::client_message()`（`Internal` は固定文言
+            // へ既に丸め済み）をそのまま転送する。通常の式評価が返す文言と
+            // 揃えるための委譲であり、`TenantWriteError` 側で新たな文言を
+            // 組み立てない。
+            TenantWriteError::CheckEvaluationFailed(inner) => {
+                write!(f, "{}", inner.client_message())
             }
             TenantWriteError::ForeignKeyViolation => {
                 write!(f, "foreign key constraint violation")
@@ -606,7 +632,9 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
-            TenantWriteError::CheckEvaluationFailed => f.write_str("CheckEvaluationFailed"),
+            TenantWriteError::CheckEvaluationFailed(_) => {
+                f.write_str("CheckEvaluationFailed(<redacted>)")
+            }
             TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
             TenantWriteError::ReferentialActionLimitExceeded => {
                 f.write_str("ReferentialActionLimitExceeded")

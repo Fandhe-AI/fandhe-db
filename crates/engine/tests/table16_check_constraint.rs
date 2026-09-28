@@ -1020,10 +1020,14 @@ fn single_row_update_violating_numeric_check_is_rejected() {
     );
 }
 
-/// 評価エラー（0 除算）は違反（`23514`）にも通過にも丸めず、`XX000` で
-/// fail-closed に拒否する（設計 D-4。行の値・id・テナントを含まない固定文言）。
+/// 評価エラー（0 除算）は違反（`23514`）にも通過にも丸めず、fail-closed に
+/// 拒否する（設計 D-4。行の値・id・テナントを含まない固定文言）。オーナー判断
+/// （2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16 ポインタ）: `wire_code`
+/// は `XX000` 固定ではなく、通常の式評価（`WHERE`／`SELECT` と共有する
+/// `sql::expr_program::ExprProgram`）と同じ `22000` になる。PostgreSQL と
+/// 同様、CHECK 評価中のエラーは制約違反ではなく式評価エラーとして返す。
 #[test]
-fn insert_triggering_division_by_zero_in_check_fails_closed_with_internal_error() {
+fn insert_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_expr_eval() {
     let (core, path) = new_core("check-integer-div-zero");
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
@@ -1041,10 +1045,86 @@ fn insert_triggering_division_by_zero_in_check_fails_closed_with_internal_error(
             "INSERT INTO docs (id, qty) VALUES (1, 0) USING OPERATION_ID 'op-1'",
         )
         .expect_err("division by zero during CHECK evaluation must fail closed");
-    assert_eq!(err.wire_code(), "XX000");
+    assert_eq!(err.wire_code(), "22000");
+    // 副作用ゼロ: 行は書き込まれない。
     assert_eq!(
         select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
         0
+    );
+}
+
+/// UPDATE が CHECK の式評価エラーを起こす経路（`enforce_row_constraints_in_txn`
+/// の共通検査点は INSERT と同一）でも、同じ `22000` を返し副作用ゼロを保つ
+/// ことを固定する（オーナー判断 2026-09-28・Issue #1075）。
+#[test]
+fn update_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_expr_eval() {
+    let (core, path) = new_core("check-integer-div-zero-update");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, qty) VALUES (1, 1) USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            "UPDATE docs SET qty = 0 WHERE id = 1 USING OPERATION_ID 'op-upd'",
+        )
+        .expect_err("division by zero during CHECK evaluation must fail closed");
+    assert_eq!(err.wire_code(), "22000");
+    // 副作用ゼロ: 更新前の値のまま残る。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs WHERE id = 1 LIMIT 100"),
+        1
+    );
+}
+
+/// `ON CONFLICT (id) DO UPDATE` が CHECK の式評価エラーを起こす経路
+/// （`tenant::upsert_typed_row` 経由でも同じ `enforce_row_constraints_in_txn`
+/// を通る）でも同じ `22000` を返し副作用ゼロを保つ（オーナー判断
+/// 2026-09-28・Issue #1075）。
+#[test]
+fn upsert_do_update_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_expr_eval()
+{
+    let (core, path) = new_core("check-integer-div-zero-upsert");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER CHECK (100 / qty > 1))",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, qty) VALUES (1, 1) USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed row");
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, qty) VALUES (1, 1) \
+             ON CONFLICT (id) DO UPDATE SET qty = 0 \
+             USING OPERATION_ID 'op-upsert'",
+        )
+        .expect_err("division by zero during CHECK evaluation must fail closed");
+    assert_eq!(err.wire_code(), "22000");
+    // 副作用ゼロ: 更新前の値のまま残る。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs WHERE id = 1 LIMIT 100"),
+        1
     );
 }
 

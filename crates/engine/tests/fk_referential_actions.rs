@@ -990,3 +990,60 @@ fn same_child_column_competing_actions_are_order_independent_of_declaration() {
         );
     }
 }
+
+// --- 参照アクション後の CHECK 再検証は通常の書き込み経路と同じ SQLSTATE を
+// 返す（PR #1145・オーナー判断 2026-09-28・Issue #1075 との整合）------------------
+//
+// `propagate_referential_actions` は書き換えた子行を
+// `constraint::enforce_row_constraints_in_txn`（`CHECK` → UNIQUE → FK 参照元側の
+// 順に検査する唯一の入口。TABLE-16・TASK-204）で再検証する。これは通常の
+// INSERT／UPDATE／UPSERT が使うのと**同一の**関数であり、`CHECK` 式評価中の
+// エラー（0 除算等）を `TenantWriteError::CheckEvaluationFailed`（`SqlSurfaceError`
+// を保持。PR #1145）として返す経路も共有する。本テストは `ON DELETE SET DEFAULT`
+// が書き換えた列に依存する `CHECK` が評価エラー（0 除算）になる場合、参照
+// アクション経由でも `23514`（制約違反）や `XX000` ではなく、通常の式評価と
+// 同じ `22000`（`SqlSurfaceError::InvalidInput`）が返ることを固定する。
+#[test]
+fn referential_action_check_evaluation_error_uses_same_sqlstate_as_normal_write_path() {
+    let (core, path) = new_core("fkact-check-eval-error-via-cascade");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE parents (code TEXT UNIQUE)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (\
+         divisor INTEGER DEFAULT 0 REFERENCES parents ON DELETE SET DEFAULT, \
+         CHECK (100 / divisor > 1))",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code) VALUES (1, 'p1') USING OPERATION_ID 'op-p'",
+    );
+    // `divisor = 1` は現時点の CHECK を満たす（100 / 1 > 1）。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, divisor) VALUES (10, 1) USING OPERATION_ID 'op-c'",
+    );
+    // 親の削除で `ON DELETE SET DEFAULT` が `divisor` を `DEFAULT`（0）へ
+    // 書き換え、再検証する `CHECK (100 / divisor > 1)` が 0 除算で評価エラーに
+    // なる。通常の式評価（`compiled_checks_enforce_division_by_zero_fails_closed`）
+    // と同じ `22000` になるべきで、`23514`（制約違反）や `XX000` にはならない。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'"
+        ),
+        "22000"
+    );
+    // fail-closed: 副作用ゼロ（親行も子行も変化しない）。
+    assert_eq!(row_count(&core, &alice, "parents"), 1);
+    assert_eq!(
+        select_cell(&core, &alice, "children", 10, "divisor"),
+        Some(Cell::SignedInteger(1))
+    );
+}

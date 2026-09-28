@@ -255,8 +255,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1076（`FOREIGN KEY` の参照アクション。`TenantWriteError::
     // ReferentialActionLimitExceeded` の追加）・Issue #1077（`WriteTarget` の
     // `InTxn` 経路の doc コメント更新・`fk_check_mode` アクセサ追加）の統合
-    // マージで行が移動したための追随（旧: 428）。
-    ("tenant.rs", 437),
+    // マージで行が移動したための追随（旧: 428）。オーナー判断（2026-09-28・
+    // Issue #1075）: `TenantWriteError::CheckEvaluationFailed` を
+    // `SqlSurfaceError` 保持型へ是正した PR #1145 の取り込みマージで
+    // import・ドキュメンテーションコメントが追加され再度追随（旧: 437）。
+    ("tenant.rs", 453),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
