@@ -231,10 +231,12 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
     let sys = ctx("sys");
     ok(&core, &sys, "CREATE TABLE p (name TEXT)");
     for sql in [
-        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE CASCADE)",
-        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE SET NULL)",
-        "CREATE TABLE c (v BIGINT REFERENCES p ON UPDATE CASCADE)",
+        // 参照アクション（Issue #1076）の未実装形: 列リスト形の SET NULL／
+        // SET DEFAULT、`ON DELETE` の重複指定。
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE SET NULL (v))",
+        "CREATE TABLE c (v BIGINT REFERENCES p ON UPDATE SET DEFAULT (v))",
         "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE RESTRICT ON DELETE RESTRICT)",
+        "CREATE TABLE c (v BIGINT REFERENCES p ON DELETE CASCADE ON DELETE CASCADE)",
         // `MATCH PARTIAL` は非対応（TABLE-17・TASK-205、Issue #1077）。
         "CREATE TABLE c (v BIGINT REFERENCES p MATCH PARTIAL)",
         "CREATE TABLE c (v BIGINT REFERENCES p MATCH FULL MATCH FULL)",
@@ -257,6 +259,8 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
         "CREATE TABLE c (v BIGINT, FOREIGN KEY (id) REFERENCES p)",
         "CREATE TABLE c (v BIGINT, CONSTRAINT fk_v FOREIGN KEY (v) REFERENCES p)",
         "CREATE TABLE c (v BIGINT REFERENCES p, FOREIGN KEY (v) REFERENCES p)",
+        // 構造が同じでアクションだけが異なる重複宣言も拒否する（Issue #1076 A14）。
+        "CREATE TABLE c (v BIGINT REFERENCES p, FOREIGN KEY (v) REFERENCES p ON DELETE CASCADE)",
     ] {
         assert_eq!(err_code(&core, &sys, sql), "42601", "{sql}");
     }
