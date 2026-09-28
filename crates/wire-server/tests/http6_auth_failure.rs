@@ -23,6 +23,11 @@
 //! `error_code_of`・`error_message_of`・`assert_message_does_not_echo`）の
 //! 既存実装をそのまま再利用し、本ファイル固有の要求組み立てのみ薄いラッパで
 //! 追加する。
+//!
+//! 期限切れの再現は時刻待ち（`sleep`）ではなく `SessionStore::with_limits`
+//! に `Duration::ZERO` の TTL を渡し、`SessionStore::active_sessions` の
+//! 観測で決定的に確認する（Issue #1083。`store.rs` の `is_alive` は
+//! `elapsed < ttl` のため TTL=0 は発行直後から常に期限切れ判定になる）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -235,27 +240,51 @@ fn malformed_bearer_variants_on_query_reject_with_28000() {
 #[test]
 fn expired_token_on_query_rejects_with_28000() {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let ttl = Duration::from_millis(250);
-    let addr = spawn_router_listener(&users_path, SessionStore::with_limits(4, ttl));
-    let token = login(addr, "alice", "pw-alice");
-    let auth = format!("Bearer {token}");
 
-    // TTL 内: ゲートへ到達し `scan` 実行結線後（TASK-186・NOSQL-3・
-    // Issue #766）はスローアウェイ `EngineCore` 上で 42P01／404
-    // （非 vacuous 証跡）。
-    let fresh_request = query_request(Some(&auth), &[], VALID_SCAN_BODY);
-    let fresh_resp = parse_single_response(&send_raw(addr, &fresh_request, AfterWrite::HalfClose));
+    // 対照（long TTL）: 同じ fixture でゲートへ到達できることを示す
+    // 非 vacuous な証跡。TTL の違いだけが下記の期限切れリスナーとの差分
+    // であることを、この 2 リスナー構成そのものが示す。
+    let long_ttl_addr = spawn_router_listener(
+        &users_path,
+        SessionStore::with_limits(4, Duration::from_secs(3600)),
+    );
+    let long_ttl_token = login(long_ttl_addr, "alice", "pw-alice");
+    let long_ttl_auth = format!("Bearer {long_ttl_token}");
+    let fresh_request = query_request(Some(&long_ttl_auth), &[], VALID_SCAN_BODY);
+    let fresh_resp = parse_single_response(&send_raw(
+        long_ttl_addr,
+        &fresh_request,
+        AfterWrite::HalfClose,
+    ));
     assert_eq!(fresh_resp.status, 404, "token must still be valid");
     assert_eq!(wire_code_of(&fresh_resp), "42P01");
 
-    // TTL 超過後: 同一トークンが 28000 へ収束する。
-    std::thread::sleep(ttl + Duration::from_millis(150));
+    // 期限切れ（TTL=0）: `sessions` はサーバーへ渡すハンドル、`observer` は
+    // `Clone` で内部状態を共有するテスト側の観測用ハンドル
+    // （`store.rs::SessionStore` は `Arc` 共有。時刻待ちをせず
+    // `active_sessions()` の遷移で発行・失効・回収を直接観測する）。
+    let sessions = SessionStore::with_limits(4, Duration::ZERO);
+    let observer = sessions.clone();
+    let addr = spawn_router_listener(&users_path, sessions);
+    let token = login(addr, "alice", "pw-alice");
+    assert_eq!(
+        observer.active_sessions(),
+        1,
+        "login must issue a session even with TTL=0"
+    );
+    let auth = format!("Bearer {token}");
+
     let expired_request = query_request(Some(&auth), &[], VALID_SCAN_BODY);
     let expired_resp =
         parse_single_response(&send_raw(addr, &expired_request, AfterWrite::HalfClose));
     assert_eq!(expired_resp.status, 401);
     assert_eq!(wire_code_of(&expired_resp), "28000");
     assert_eq!(error_code_of(&expired_resp), "AUTH_REQUIRED");
+    assert_eq!(
+        observer.active_sessions(),
+        0,
+        "lookup of the expired token must sweep it and release its slot"
+    );
 }
 
 #[test]
@@ -314,8 +343,13 @@ fn session_and_query_failures_map_to_distinct_wire_codes_28p01_vs_28000() {
 #[test]
 fn missing_malformed_expired_and_closed_responses_are_byte_identical_except_date() {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let ttl = Duration::from_millis(250);
-    let addr = spawn_router_listener(&users_path, SessionStore::with_limits(4, ttl));
+
+    // missing・malformed・closed は long TTL のリスナーで取得する（TTL は
+    // 無関係な経路のため干渉させない）。
+    let addr = spawn_router_listener(
+        &users_path,
+        SessionStore::with_limits(4, Duration::from_secs(3600)),
+    );
 
     let missing = send_raw(
         addr,
@@ -328,18 +362,6 @@ fn missing_malformed_expired_and_closed_responses_are_byte_identical_except_date
         addr,
         &query_request(
             Some(&format!("Bearer {}", unknown_token.encoded())),
-            &[],
-            VALID_SCAN_BODY,
-        ),
-        AfterWrite::HalfClose,
-    );
-
-    let expiring_token = login(addr, "alice", "pw-alice");
-    std::thread::sleep(ttl + Duration::from_millis(150));
-    let expired = send_raw(
-        addr,
-        &query_request(
-            Some(&format!("Bearer {expiring_token}")),
             &[],
             VALID_SCAN_BODY,
         ),
@@ -365,10 +387,37 @@ fn missing_malformed_expired_and_closed_responses_are_byte_identical_except_date
         AfterWrite::HalfClose,
     );
 
+    // expired は TTL=0 の別リスナーで取得する（`expired_token_on_query_rejects_with_28000`
+    // と同じ方式。時刻待ちをしない）。リスナーをまたいだ比較が成立することを
+    // 担保するため、この TTL=0 側でも missing を取得し long TTL 側の missing と
+    // バイト同一であることを追加で確認する。
+    let expired_addr =
+        spawn_router_listener(&users_path, SessionStore::with_limits(4, Duration::ZERO));
+    let expiring_token = login(expired_addr, "alice", "pw-alice");
+    let expired = send_raw(
+        expired_addr,
+        &query_request(
+            Some(&format!("Bearer {expiring_token}")),
+            &[],
+            VALID_SCAN_BODY,
+        ),
+        AfterWrite::HalfClose,
+    );
+    let missing_on_expired_listener = send_raw(
+        expired_addr,
+        &query_request(None, &[], VALID_SCAN_BODY),
+        AfterWrite::HalfClose,
+    );
+
     let baseline = strip_date(&missing);
     assert_eq!(baseline, strip_date(&malformed));
     assert_eq!(baseline, strip_date(&expired));
     assert_eq!(baseline, strip_date(&closed));
+    assert_eq!(
+        baseline,
+        strip_date(&missing_on_expired_listener),
+        "missing-bearer response must be byte identical across listeners with different TTLs"
+    );
 }
 
 // --- グループ C: HTTP-7 tenant_id 3 位置の 42601 と検査順序 -----------------
