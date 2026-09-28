@@ -62,7 +62,14 @@ use std::collections::{HashMap, HashSet};
 
 /// 索引エントリの永続フォーマットバージョン。列宣言のシグネチャと合わせて
 /// マーカーに書き込み、いずれかが変わった場合に自動再構築させる。
-const FORMAT_VERSION: u32 = 1;
+///
+/// 1 → 2: [`schema_signature`] へ構成列の列名を追加した際に明示的に bump した
+/// （codex P1 指摘・PR #1123）。`schema_signature` の変更自体でバイト列の長さ・
+/// 内容が変わるため version 据え置きでも自然に不一致になるはずだが、旧
+/// フォーマットのマーカーを取りこぼしなく fail-closed に無効化することを
+/// バイト列の偶然の一致に頼らず保証するため、フォーマット変更のたびに
+/// version も bump する運用とする。
+const FORMAT_VERSION: u32 = 2;
 
 // [`check_and_update`] が行ストアを読み戻した回数（単体テスト専用の計測
 // フック。Issue #1070 受け入れ条件 1「検査コストがテナントの保有行数に
@@ -140,8 +147,18 @@ fn index_table_exists(
 
 /// [`super::key_specs`] が返す一意キー宣言（主キー・UNIQUE 制約の宣言順）から
 /// マーカー値の一部となるシグネチャを組み立てる。列宣言の構成（キー数・
-/// NULL の扱い・構成列数・構成列の型タグ）が変わると異なるバイト列になり、
-/// [`ensure_tenant_index`] がマーカー不一致として自動的に再構築する。
+/// NULL の扱い・構成列数・構成列の**列名**（[`crate::catalog::validate_identifier`]
+/// でテーブル内一意性が保証される識別子）・構成列の型タグ）が変わると異なる
+/// バイト列になり、[`ensure_tenant_index`] がマーカー不一致として自動的に
+/// 再構築する。
+///
+/// 列名を含めるのは、型タグのみでは「同じ型の別列」への一意制約の付け替え
+/// （例: `UNIQUE (a)` → `UNIQUE (b)`、`a`・`b` が同じ列型）を区別できず、
+/// 旧列の正引きエントリを新しい制約列のものとして誤って流用してしまい、
+/// 新しい列での重複が検出できなくなる fail-open な穴があったため
+/// （codex P1 指摘・PR #1123）。列名の長さは [`crate::catalog::validate_identifier`]
+/// が課す上限（63 バイト）以下であることが保証されているため 1 バイトの
+/// 長さプレフィックスで足りる。
 fn schema_signature(schema: &TableSchema, specs: &[KeySpec]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(specs.len() as u32).to_be_bytes());
@@ -152,8 +169,15 @@ fn schema_signature(schema: &TableSchema, specs: &[KeySpec]) -> Vec<u8> {
         });
         out.extend_from_slice(&(spec.indices.len() as u32).to_be_bytes());
         for &idx in &spec.indices {
-            let tag = schema.columns.get(idx).map(|c| c.ty.unique_key_tag());
-            out.push(tag.unwrap_or(0));
+            let column = schema.columns.get(idx);
+            out.push(column.map(|c| c.ty.unique_key_tag()).unwrap_or(0));
+            let name_bytes = column.map(|c| c.name.as_bytes()).unwrap_or(&[]);
+            // `validate_identifier` が列名を 63 バイト以下に制限しているため
+            // u8 の長さプレフィックスで表現できる（超過はここでは起こり得ない
+            // 内部不変条件だが、念のため `u8::MAX` で飽和させ panic を避ける）。
+            let len = u8::try_from(name_bytes.len()).unwrap_or(u8::MAX);
+            out.push(len);
+            out.extend_from_slice(&name_bytes[..usize::from(len)]);
         }
     }
     out
@@ -899,6 +923,255 @@ mod tests {
         assert!(
             !leftover,
             "reverse entry for id=1 must be cleaned up once its unique key became NULL"
+        );
+    }
+
+    /// [`schema_signature`] は、同じ型・同じ制約数・同じ NULL ポリシーであっても
+    /// 参照する列が異なれば異なるバイト列を返さなければならない（codex P1
+    /// 指摘・PR #1123）。列名を含めない旧実装では、`UNIQUE (a)` から
+    /// `UNIQUE (b)`（`a`・`b` が同じ型）へ制約の対象列が変わっても signature が
+    /// 一致してしまい、[`ensure_tenant_index`] が「索引は構築済み」と誤判定して
+    /// 旧列（`a`）の正引きエントリを新しい制約列（`b`）のものとして流用し続け、
+    /// `b` の重複を検出できなくなる fail-open な穴があった。
+    #[test]
+    fn schema_signature_differs_for_same_type_different_columns() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema, UniqueConstraint};
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        );
+
+        let schema_unique_on_a = schema
+            .clone()
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["a".to_string()])]);
+        let schema_unique_on_b =
+            schema.with_unique_constraints(vec![UniqueConstraint::new(vec!["b".to_string()])]);
+
+        let (specs_a, _) = super::super::key_specs(&schema_unique_on_a).expect("key specs for a");
+        let (specs_b, _) = super::super::key_specs(&schema_unique_on_b).expect("key specs for b");
+
+        let sig_a = schema_signature(&schema_unique_on_a, &specs_a);
+        let sig_b = schema_signature(&schema_unique_on_b, &specs_b);
+        assert_ne!(
+            sig_a, sig_b,
+            "signatures for UNIQUE(a) and UNIQUE(b) must differ even though \
+             a and b share the same column type (same tag, same spec shape)"
+        );
+    }
+
+    /// 上記 `schema_signature` の差分が、実際の索引維持ロジック
+    /// （[`crate::constraint::enforce_unique_keys_in_txn`]）で観測可能な違いに
+    /// つながることを確認する end-to-end 回帰（codex P1 指摘・PR #1123）。
+    ///
+    /// 手順: `UNIQUE (a)` のテーブルで行 1（a='x', b='dup'）を通常の INSERT で
+    /// 挿入し、列 `a` を対象にした索引を正しく構築させる。その後、**同じ物理
+    /// テーブル・索引テーブルに対して**「制約の対象列が `a` → `b`（同じ TEXT
+    /// 型）へ変わった」状況を模した `TableSchema`（`schema_unique_on_b`）で
+    /// 行 2（a='y', b='dup'。列 `b` の値が行 1 と重複）を書き込む。
+    ///
+    /// 修正前は、`schema_unique_on_b` に対しても「索引は構築済み」と誤判定
+    /// され、列 `b` の値は一度も索引化されていないため重複が検出されず
+    /// INSERT が誤って成功してしまう。修正後は signature 不一致で自テナントの
+    /// 索引が `b` を対象に再構築され、行 1 の `b='dup'` が正しく索引化された
+    /// 結果、行 2 の重複が `TenantWriteError::UniqueViolation`（wire_code
+    /// 23505 に写像される）として拒否される。
+    #[test]
+    fn unique_constraint_column_swap_to_a_same_typed_column_is_detected_as_a_duplicate() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema, UniqueConstraint};
+        use crate::policy::PolicyContext;
+        use crate::recovery::required_op_id::OperationId;
+        use crate::row_codec::Value;
+        use crate::storage::{RowInput, Storage, Visibility};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("unique-index-schema-signature-column-swap");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let schema_unique_on_a = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![UniqueConstraint::new(vec!["a".to_string()])]);
+        storage
+            .create_table(&schema_unique_on_a)
+            .expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant id");
+
+        // 行 1: a='x'（現行制約の一意キー値）、b='dup'（この時点では制約対象外）。
+        // 通常の INSERT 経路を通すため、列 `a` を対象にした索引が正しく構築
+        // される。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[Value::Text("x".to_string()), Value::Text("dup".to_string())],
+            &OperationId::parse("op-1").expect("op id"),
+        )
+        .expect("seed insert must succeed and build the index for column a");
+
+        // 「UNIQUE 制約の対象列が a → b（同じ TEXT 型）へ変わった」状況を
+        // 模した仮のスキーマ（本 DB のカタログ自体は更新しない——`unique_index`
+        // モジュール単体の索引維持ロジックを検証する white-box テスト）。
+        let schema_unique_on_b = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![UniqueConstraint::new(vec!["b".to_string()])]);
+
+        // 行 2 を行ストアへ直接書き込む（a='y', b='dup'。列 b の値が行 1 と
+        // 重複）。カタログの `docs` は引き続き `schema_unique_on_a` を宣言した
+        // ままなので、通常の `insert_typed_row` は列 `a` の重複しか検査
+        // できない——この後 `schema_unique_on_b` を渡して
+        // `enforce_unique_keys_in_txn` を直接呼び、「列 b を対象にした検査」を
+        // 明示的に再現する。
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let row_table_name = crate::catalog::user_rows_table_name("docs");
+            let mut row_table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+                .expect("open row table");
+            let metadata = crate::row_codec::encode_scalar_columns(
+                &schema_unique_on_b,
+                &[Value::Text("y".to_string()), Value::Text("dup".to_string())],
+            )
+            .expect("encode row 2 columns");
+            let encoded = crate::storage::encode_row(&RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &metadata,
+            })
+            .expect("encode row 2 for raw insert");
+            row_table
+                .insert(("tenant-a", 2u64), encoded.as_slice())
+                .expect("insert row 2 raw");
+        }
+
+        let err = crate::constraint::enforce_unique_keys_in_txn(
+            &write_txn,
+            "docs",
+            &schema_unique_on_b,
+            "tenant-a",
+            &[2],
+        )
+        .expect_err(
+            "row 2's value in column b duplicates row 1's column-b value; this must be \
+             rejected once the index rebuilds for the new constraint column instead of \
+             reusing the stale column-a index (Codex P1 regression, PR #1123)",
+        );
+        assert!(
+            matches!(err, TenantWriteError::UniqueViolation),
+            "expected UniqueViolation (wire_code 23505), got {err:?}"
+        );
+        // 重複と判定されたため write_txn は commit せず破棄する（行 2 を
+        // 反映しない）。
+        drop(write_txn);
+    }
+
+    /// [`ensure_tenant_index`] は、既存マーカーの `format_version` が現行の
+    /// [`FORMAT_VERSION`] と異なれば、シグネチャのバイト列を精査するまでもなく
+    /// 「未構築」として扱い、テナントの索引を再構築しなければならない
+    /// （codex P1 指摘・PR #1123 のレビュー対応。列名を signature へ加えた
+    /// フォーマット変更自体に対して、偶然のバイト列一致に頼らず fail-closed に
+    /// 無効化することを保証する）。再構築後は、マーカーが現行の
+    /// `FORMAT_VERSION` で書き直されていることを直接確認する。
+    #[test]
+    fn ensure_tenant_index_rebuilds_when_marker_format_version_is_outdated() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema, UniqueConstraint};
+        use crate::policy::PolicyContext;
+        use crate::recovery::required_op_id::OperationId;
+        use crate::row_codec::Value;
+        use crate::storage::Storage;
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("unique-index-outdated-format-version");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("a", ColumnType::Text, true)])
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["a".to_string()])]);
+        storage.create_table(&schema).expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant id");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            crate::storage::Visibility::Public,
+            &[Value::Text("x".to_string())],
+            &OperationId::parse("op-1").expect("op id"),
+        )
+        .expect("seed insert must succeed");
+
+        // マーカーを「旧フォーマット版（format_version=1）」の値へ直接書き換える
+        // （signature 本体のバイト列は現行のものを流用しても構わない——
+        // version 自体の不一致だけで再構築されることを確認したいため）。
+        let index_table_name = crate::catalog::user_uniq_table_name("docs");
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write txn");
+            {
+                let mut index_table = write_txn
+                    .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+                    .expect("open index table");
+                let (specs, _) = super::super::key_specs(&schema).expect("key specs");
+                let signature = schema_signature(&schema, &specs);
+                let mut stale_marker = Vec::with_capacity(4 + signature.len());
+                stale_marker.extend_from_slice(&1u32.to_be_bytes()); // 旧 format_version
+                stale_marker.extend_from_slice(&signature);
+                index_table
+                    .insert(
+                        ("tenant-a", MARKER_SUBKEY.as_slice()),
+                        stale_marker.as_slice(),
+                    )
+                    .expect("overwrite marker with outdated format_version");
+            }
+            write_txn
+                .commit_raw_for_test()
+                .expect("commit stale marker");
+        }
+
+        // 重複しない新規行の INSERT（マーカーが「構築済み」と誤って信頼されて
+        // いても成功してしまうため、この呼び出し自体は再構築の有無を直接
+        // 証明しない。マーカーが実際に書き直されたかを別途確認する）。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            2,
+            crate::storage::Visibility::Public,
+            &[Value::Text("y".to_string())],
+            &OperationId::parse("op-2").expect("op id"),
+        )
+        .expect("a genuinely distinct value must still be accepted");
+
+        let write_txn = storage.begin_write_txn().expect("open txn for inspection");
+        let index_table = write_txn
+            .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+            .expect("open index table");
+        let marker = index_table
+            .get(("tenant-a", MARKER_SUBKEY.as_slice()))
+            .expect("marker get")
+            .expect("marker must exist after ensure_tenant_index ran");
+        assert_eq!(
+            marker.value().get(0..4),
+            Some(FORMAT_VERSION.to_be_bytes().as_slice()),
+            "the outdated format_version marker must have been rebuilt and rewritten \
+             with the current FORMAT_VERSION, not left as-is"
         );
     }
 }
