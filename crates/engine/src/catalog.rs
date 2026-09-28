@@ -10327,14 +10327,21 @@ mod tests {
     /// `decode_schema_with_resolver`／`validate_schema` が `CorruptSchema` として
     /// 拒否する壊れた v10 カタログ値でも「依存なし」に丸められてしまい、両者の
     /// fail-closed 判定が食い違う（codex-review P2 指摘・PR #1147）。
+    ///
+    /// 手組みの v10 カタログ値は 2 通り用意する（Cursor Bugbot 指摘・PR #1147）:
+    /// (1) `decode_schema` 側は ENUM 列を含めない（`no_enum_resolver` が
+    /// enum 型解決不可で先に `CorruptSchema` を返し、衝突検査に到達しないまま
+    /// テストが green になっていた）。(2) いずれも `fks:0` セクションを明示的に
+    /// 補う（v7 エンコードには `fks:` セクションが無く、`checks:` セクションを
+    /// そのまま流用すると v10／v11 が要求する `fks:` セクション欠落で構造検証が
+    /// 先に落ち、同じく衝突検査に到達しない）。衝突箇所のエラーメッセージ
+    /// （制約名・「CHECK constraint」の文言）も具体的にアサートし、無関係な
+    /// 理由で `CorruptSchema` になっていないことを確認する。
     #[test]
     fn catalog_value_references_enum_type_rejects_unique_name_colliding_with_check_name() {
         // CHECK セクションのバイト表現（述語の 16 進エンコード）は
-        // `encode_schema` に生成させ、そのまま手組みの v10 カタログへ流用する
+        // `encode_schema` に生成させ、そのまま手組みのカタログへ流用する
         // （述語エンコードの内部形式に依存しないため）。
-        // CHECK セクションの生成に列の型は影響しないため、`ColumnType::Enum` の
-        // 解決（`EnumTypeDef` 構築）を避け `Text`／`BigInt` で組み立てる
-        // （このテストの目的は述語の 16 進エンコードを流用することのみ）。
         let check_only = TableSchema::new(
             "docs",
             vec![
@@ -10349,27 +10356,53 @@ mod tests {
             .split_once("\nchecks:")
             .map(|(_, rest)| format!("checks:{rest}"))
             .expect("checks section present");
+        // `check_only` は FK を持たないため v7 で符号化され `fks:` セクションを
+        // 持たない。v10／v11 の `decode_schema_body` は `fks:` セクションを
+        // 必須で読むため、空の `fks:0` を手組みで補う（空 FK 列の
+        // `encode_foreign_key_section` が書く形と同一）。
+        let checks_and_fks_section = format!("{checks_section}fks:0\n");
 
-        let head = "v10\ncols:2\npk:\nmood_col:enum:mood:1:L:-\npid:bigint:-:1:L:-\n".to_string();
         // UNIQUE 制約名（`dup`）が CHECK 制約名（同じく `dup`）と衝突する、
-        // 手組みの壊れた v10 カタログ値。
-        let colliding = format!("{head}uniq:1\nU:dup:mood_col\n{checks_section}");
+        // 手組みの壊れた v10 カタログ値。`decode_schema`（テスト専用の
+        // `no_enum_resolver` 版）で検証するため ENUM 列は使わない
+        // （ENUM 列を含めると列デコード段階で `no_enum_resolver` が先に
+        // 拒否し、意図した衝突検査に到達しない）。
+        let plain_head =
+            "v10\ncols:2\npk:\nmood_col:text:-:1:L:-\npid:bigint:-:1:L:-\n".to_string();
+        let plain_colliding =
+            format!("{plain_head}uniq:1\nU:dup:mood_col\n{checks_and_fks_section}");
+        match decode_schema("docs", plain_colliding.as_bytes()) {
+            Err(CatalogError::CorruptSchema(msg)) => {
+                assert!(
+                    msg.contains("dup") && msg.contains("CHECK constraint"),
+                    "decode_schema must reject with the UNIQUE/CHECK name collision message, got {msg:?}"
+                );
+            }
+            other => panic!(
+                "decode_schema must reject a UNIQUE/CHECK constraint name collision: \
+                 {plain_colliding:?}, got {other:?}"
+            ),
+        }
 
-        assert!(
-            matches!(
-                decode_schema("docs", colliding.as_bytes()),
-                Err(CatalogError::CorruptSchema(_))
+        // `catalog_value_references_enum_type`（ENUM 依存判定の軽量パーサー）は
+        // 実際の enum 型解決を行わずテキスト走査のみで判定するため、ENUM 列
+        // （`mood_col:enum:mood`）を含む同型の v10 カタログ値でも同じ衝突検査に
+        // 到達することを確認する。
+        let enum_head =
+            "v10\ncols:2\npk:\nmood_col:enum:mood:1:L:-\npid:bigint:-:1:L:-\n".to_string();
+        let enum_colliding = format!("{enum_head}uniq:1\nU:dup:mood_col\n{checks_and_fks_section}");
+        match catalog_value_references_enum_type(enum_colliding.as_bytes(), "mood") {
+            Err(CatalogError::CorruptSchema(msg)) => {
+                assert!(
+                    msg.contains("dup") && msg.contains("CHECK constraint"),
+                    "enum dependency parser must reject with the collision message, got {msg:?}"
+                );
+            }
+            other => panic!(
+                "enum dependency parser must reject the same collision instead of \
+                 silently reporting \"no dependents\": {enum_colliding:?}, got {other:?}"
             ),
-            "decode_schema must reject a UNIQUE/CHECK constraint name collision: {colliding:?}"
-        );
-        assert!(
-            matches!(
-                catalog_value_references_enum_type(colliding.as_bytes(), "mood"),
-                Err(CatalogError::CorruptSchema(_))
-            ),
-            "enum dependency parser must reject the same collision instead of \
-             silently reporting \"no dependents\": {colliding:?}"
-        );
+        }
     }
 
     /// v10 の破損した名前付き UNIQUE セクション（`U:<name>:<cols>` 形式）を
