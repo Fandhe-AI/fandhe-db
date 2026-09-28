@@ -99,10 +99,13 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   hnsw`／`DROP INDEX` と `index_catalog` をそのまま使う。
   [index-ddl-declaration.md](index-ddl-declaration.md)）。
 - 判定の入力は「対象テーブルに HNSW 宣言があるか」だけで、索引カタログ全件
-  走査の要約（HNSW 宣言テーブル集合）を `IndexCatalogGateCache` がストレージ
-  世代単位に再利用する。`all` では集合の中身を使わず、走査の成否（カタログを
-  読み取れるか）だけを使う。読み取れない場合はいずれの scope でも fail-closed に
-  brute-force へ倒す（次節）。
+  走査の要約（HNSW 宣言テーブル集合）を `IndexCatalogGateCache` が索引カタログ
+  専用世代単位に再利用する（Issue #1154。索引カタログを変える commit だけで
+  進む専用カウンタで、通常の行 DML では無効化されない。旧: ストレージ全体の
+  単一世代カウンタをキーにしており、行 DML の commit でも過剰に無効化されて
+  いた）。`all` では集合の中身を使わず、走査の成否（カタログを読み取れるか）
+  だけを使う。読み取れない場合はいずれの scope でも fail-closed に brute-force
+  へ倒す（次節）。
 - 旧実装（PR #1124 のレビュー前）は「カタログ全体に `IndexKind::Hnsw` 宣言が 1 件でも
   あれば、宣言のあるテーブルだけを HNSW にする」カタログ全体単位のゲートだった。
   これは `table_a` への宣言で未宣言の `table_b` を近似から厳密へ切り替え、
@@ -199,26 +202,29 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
 - スカラー専用 opt-in の新設（上位スイッチは起動時 HNSW opt-in のみ）
-- **`IndexCatalogGateCache`（`catalog.rs`）はストレージ全体世代キーのため、
-  索引宣言と無関係な行 DML の commit でも次回参照時に再走査が起きる**
-  （codex-review P2 指摘・PR #1124）: `hnsw_targeted_in_txn` のカタログ全件
-  走査の結果キャッシュは `crate::storage::current_generation_in_txn`（ストレージ
-  全体の単一世代カウンタ）をキーにしている。これは索引カタログを変更する 4 経路
-  （`create_index`／`drop_index`／`drop_table`／`alter_table_drop_column`）
-  がいずれも commit 前に必ずこのカウンタを進める（取りこぼしなし）ことを
-  根拠に選んだキーだが、宣言と無関係な通常の行 DML でも同じカウンタが進む
-  ため、書き込みと検索が交互に発生する構成ではキャッシュがほぼ効かず、
-  キャッシュ導入前と同じフルスキャン 1 回分のコストが検索のたびに残る
-  （悪化はしない。`catalog.rs` の `IndexCatalogGateCache` ドキュメンテーション
-  コメント参照）。
-  是正する場合の設計方針: 上記 4 経路の commit 時にのみ進む専用の「索引
-  カタログ世代」カウンタを新設し、`hnsw_targeted_in_txn`・スカラー宣言解決の
-  両方をそのカウンタでキー付けする（通常の行 DML による過剰無効化を避ける）。
-  ただし新カウンタは commit_boundary 経由の全 4 経路で確実に進める必要があり
-  （1 経路でも取りこぼすと、`declared` で stale な HNSW 宣言テーブル集合を
-  再利用し、宣言済み・削除済みの経路切り替えを取りこぼす）、永続フォーマット
-  （新カウンタ未保持の既存 DB）との互換性も設計する必要があるため、本 Issue
-  では部分修正を行わず別 Issue（#1154。`perf` 分類）の対象とする。
+- **解消済み（Issue #1154）**: `IndexCatalogGateCache`（`catalog.rs`）は
+  当初ストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
+  をキーにしていたため、索引宣言と無関係な行 DML の commit でも次回参照時に
+  再走査が起きていた（codex-review P2 指摘・PR #1124）。Issue #1154 で、索引
+  カタログを変更する経路（`create_index`／`drop_index`／`retain_index_defs_in_txn`。
+  後者を `drop_table`・`alter_table_drop_column` が共有）だけで進む専用の
+  「索引カタログ世代」カウンタ（`catalog::index_catalog_generation_in_txn`）を
+  新設し、`hnsw_targeted_in_txn` のキャッシュキーをそちらへ切り替えた。これに
+  より、索引宣言と無関係な行 DML の commit ではキャッシュが無効化されなくなった
+  （行 DML を跨いでヒットし続けることを `crates/engine/tests/
+  index_declaration_targets.rs::hnsw_scope_declared_gate_cache_ignores_row_dml_but_tracks_index_ddl`
+  で固定）。**当初の申し送りとの相違点** 2 点: (1) スカラー宣言解決
+  （`declared_index_targets_in_txn`）は申し送りの想定に反しキャッシュ化しな
+  かった（`ScalarIndex` 構築時にしか呼ばれず、その構築自体が行 DML＝テーブル
+  世代で必ずやり直しになるため利得がほとんど無い）。(2) Rust API
+  `search_with_snapshot` の TOCTOU 再照合（判定〜検索本体呼び出し間の失効
+  検出）はストレージ全体世代のまま据え置いた。これは「索引カタログの変更に
+  限らず、対象テーブルへの任意の commit が判定直後に挟まった場合」を検出する
+  ための安全弁であり、専用世代へ緩めると対象テーブルの行 DML による失効検出を
+  落としてしまうため、性能改善の対象外とした（`core.rs::search_with_snapshot`
+  のコメント参照。緩める場合は別途の性能論点）。永続フォーマットとの互換性は
+  新カウンタ未保持の既存 DB でテーブル未作成＝世代 0 として扱うことで確保し、
+  マイグレーションは不要である。
 
 ## 影響を受ける既存 fixture
 
