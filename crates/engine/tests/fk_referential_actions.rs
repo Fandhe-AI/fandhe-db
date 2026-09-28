@@ -634,6 +634,73 @@ fn grandchild_no_action_rejects_the_whole_cascade_atomically() {
     assert_eq!(row_count(&core, &alice, "grandchildren"), 1);
 }
 
+/// Cursor Bugbot 指摘（永続キー索引・Issue #1071 との統合バグ）: `ON DELETE
+/// CASCADE`（`constraint::apply_referential_action`）が子行を物理削除する際、
+/// その子テーブル自身が持つ登録済み永続キー索引（孫段の列参照 FK が使う）を
+/// 同期しないと、削除済みの行の索引エントリが残留する。孫段は列参照 FK
+/// （`grandchildren.child_code REFERENCES children(code)`）で `NO ACTION`
+/// のため、この検査は登録済みなら索引照会（`verify_required_parent_keys` →
+/// `key_index::all_keys_exist_in_txn`）に切り替わる——`children`/`["code"]`
+/// 索引が未登録のまま（`grandchild_no_action_rejects_the_whole_cascade_atomically`
+/// と異なり）事前の子行挿入で**先に登録済みにしてから** `CASCADE` を発火させ、
+/// 残留エントリがあれば「参照先はまだ存在する」と誤判定して違反を見逃す
+/// （fail-open）ことを固定する。
+#[test]
+fn cascade_delete_syncs_key_index_so_a_stale_entry_does_not_mask_a_no_action_violation() {
+    let (core, path) = new_core("fkact-cascade-index-sync");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE parents (code TEXT PRIMARY KEY)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (code TEXT PRIMARY KEY, parent_code TEXT REFERENCES parents (code) ON DELETE CASCADE)",
+    );
+    // 孫段は既定の `NO ACTION`（列参照。`children.code` を参照する）。
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE grandchildren (child_code TEXT REFERENCES children (code))",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code) VALUES (1, 'p1') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, code, parent_code) VALUES (1, 'c1', 'p1') USING OPERATION_ID 'op-c'",
+    );
+    // この挿入が `verify_required_parent_keys` の未登録フォールバックを経由し、
+    // `children`/`["code"]` の永続キー索引を先に backfill・登録する。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO grandchildren (id, child_code) VALUES (1, 'c1') USING OPERATION_ID 'op-g'",
+    );
+
+    // 親の削除は `children` を CASCADE 削除するが、孫段は `NO ACTION` の
+    // ため、削除された `children.code = 'c1'` をまだ参照する孫行がある限り
+    // 文全体が `23503` で拒否されなければならない——`children`/`["code"]`
+    // 索引が事前に登録済みでも同じ結果になる（索引の同期漏れがあれば、この
+    // 事後検証だけが素通りして親の削除が成功してしまう）。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-del'"
+        ),
+        "23503"
+    );
+
+    // 副作用ゼロ: 連鎖で削除されるはずだった children も含め、全テーブルが不変。
+    assert_eq!(row_count(&core, &alice, "parents"), 1);
+    assert_eq!(row_count(&core, &alice, "children"), 1);
+    assert_eq!(row_count(&core, &alice, "grandchildren"), 1);
+}
+
 // --- テナント境界・TRUNCATE ------------------------------------------------------
 
 #[test]

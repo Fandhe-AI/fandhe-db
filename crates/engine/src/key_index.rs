@@ -62,7 +62,7 @@
 //! 値を読めるため、行は既に書き込み済みである前提）。削除・TRUNCATE には行の
 //! 書き込みが伴わないため、`constraint::enforce_referencing_rows_in_txn` が
 //! [`crate::constraint::ReferencedRowsChange::Removed`]／
-//! [`crate::constraint::ReferencedRowsChange::TenantCleared`] の場合に限り
+//! [`crate::constraint::ReferencedRowsChange::Truncated`] の場合に限り
 //! ここから直接 [`sync_rows_in_txn`]／[`clear_tenant_in_txn`] を呼ぶ。
 //! `ColumnsUpdated`／`AllColumnsReplaced` は `enforce_row_constraints_in_txn` が
 //! 既に計算した [`KeyIndexDelta`] を再利用する契約（同じ id を二重に同期すると
@@ -469,11 +469,11 @@ pub(crate) fn sync_rows_in_txn(
     Ok(delta)
 }
 
-/// `TRUNCATE`（[`crate::constraint::ReferencedRowsChange::TenantCleared`]）が
+/// `TRUNCATE`（[`crate::constraint::ReferencedRowsChange::Truncated`]）が
 /// 呼ぶ、テナント単位の索引消去。登録済みの各索引について、このテナントの
 /// 逆引きエントリをすべて削除し、対応する順引きエントリも削除する。戻り値の
 /// [`KeyIndexDelta`] は「このテナントでこの索引から失われたキー」の集合だが、
-/// `TenantCleared` の呼び出し元は個々のキーではなく「登録済みかどうか」だけを
+/// `Truncated` の呼び出し元は個々のキーではなく「登録済みかどうか」だけを
 /// 見て `any_entry_for_tenant_in_txn` によるテナント単位の存在確認へ倒す
 /// （個々のキー値は使わない。行数に比例しないテナント単位の判定で十分なため）。
 pub(crate) fn clear_tenant_in_txn(
@@ -816,7 +816,7 @@ pub(crate) fn none_referenced_in_txn(
     Ok(Some(()))
 }
 
-/// `TRUNCATE`（`TenantCleared`）用: `child_table` の `child_columns` 索引に、
+/// `TRUNCATE`（`Truncated`）用: `child_table` の `child_columns` 索引に、
 /// テナント `tenant_id` のエントリが 1 件でも残っていないかを確認する
 /// （個々のキー値は見ない粗い判定。TRUNCATE 後は参照先テナントの行が
 /// 0 件になるため、値を問わずエントリの有無だけで違反を判定できる）。

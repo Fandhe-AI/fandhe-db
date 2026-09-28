@@ -1860,7 +1860,7 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                 // から backfill・登録し、以後 `table_name` 自身への書き込みが
                 // 索引経路へ切り替わるようにする（`id` 参照は索引を使わない
                 // 物理キー点照会のため対象外。この分岐に `id` 参照が来るのは
-                // `TenantCleared` 経由のみで、その場合の判定はここではなく
+                // `Truncated` 経由のみで、その場合の判定はここではなく
                 // 上の `if fk.references_parent_id()` 分岐が別に処理する）。
                 if !fk.references_parent_id() {
                     crate::key_index::ensure_index_in_txn(
@@ -2688,30 +2688,58 @@ fn apply_referential_action(
         // ——`tenant.rs` の `remove` 呼び出し元が積む `removed_pre_images` と
         // 同じ契約をこの CASCADE 経由の削除にも適用する）。
         let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-        let mut row_table = write_txn
-            .open_table(crate::catalog::user_rows_table_def(&row_table_name))
-            .map_err(crate::catalog::map_row_table_error)?;
+        let mut deleted_ids: Vec<u64> = Vec::new();
         let mut pre_images = UpdatedKeyPreImages::new();
-        for (id, _) in affected {
-            let key = (tenant_id, *id);
-            if row_table.get(&key).map_err(CatalogError::from)?.is_none() {
-                // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
-                continue;
+        {
+            let mut row_table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+                .map_err(crate::catalog::map_row_table_error)?;
+            for (id, _) in affected {
+                let key = (tenant_id, *id);
+                if row_table.get(&key).map_err(CatalogError::from)?.is_none() {
+                    // 同一トランザクション内で既に削除された等（多段連鎖の交差）。
+                    continue;
+                }
+                // Pass 1 で確定したスナップショットを pre-image として使う（`関数
+                // ドキュメント`参照。ここで「現在の行」を再読取りすると、正準順で
+                // 先に適用された別 FK の `SET NULL`／`SET DEFAULT` による書き換え後の
+                // 値を記録してしまい、孫段の連鎖対象特定が本来の旧キーを見失う。
+                // Cursor Bugbot 指摘・PR #1138）。存在するのにスナップショットが
+                // 無いのは Pass 1／Pass 2 の対象集合不一致という内部矛盾であり、
+                // fail-closed に拒否する。
+                let Some(original_values) = original_snapshot.get(id) else {
+                    return Err(internal(
+                        "referential action pre-image snapshot missing for a cascaded row",
+                    ));
+                };
+                pre_images.record(*id, original_values.clone());
+                row_table.remove(key).map_err(CatalogError::from)?;
+                deleted_ids.push(*id);
             }
-            // Pass 1 で確定したスナップショットを pre-image として使う（`関数
-            // ドキュメント`参照。ここで「現在の行」を再読取りすると、正準順で
-            // 先に適用された別 FK の `SET NULL`／`SET DEFAULT` による書き換え後の
-            // 値を記録してしまい、孫段の連鎖対象特定が本来の旧キーを見失う。
-            // Cursor Bugbot 指摘・PR #1138）。存在するのにスナップショットが
-            // 無いのは Pass 1／Pass 2 の対象集合不一致という内部矛盾であり、
-            // fail-closed に拒否する。
-            let Some(original_values) = original_snapshot.get(id) else {
-                return Err(internal(
-                    "referential action pre-image snapshot missing for a cascaded row",
-                ));
-            };
-            pre_images.record(*id, original_values.clone());
-            row_table.remove(key).map_err(CatalogError::from)?;
+            // `row_table`（可変借用）をここで drop してから、直後の
+            // `sync_rows_in_txn` が同じ行ストアを開き直す（redb の
+            // `TableAlreadyOpen` を避けるための順序。`parent_schema_for`
+            // 呼び出し元と同じ契約）。
+        }
+        // 削除した行を `child_schema` 自身が持つ登録済み索引（このテーブルを
+        // さらに参照する孫段の FK が使う）から同期して外す（永続キー索引・
+        // Issue #1071）。これを省くと、`CASCADE` で物理削除された行の
+        // fwd／rev エントリが残留し、孫段の参照整合性検査（索引経路）が
+        // 削除済みのキーをまだ「存在する」と誤判定して DELETE を許してしまう
+        // （fail-open。通常の `DELETE`〔`tenant::delete_row_impl` 等〕は必ず
+        // `enforce_referencing_rows_in_txn` の `Removed` 分岐でこの同期を行うが、
+        // `CASCADE` 経由の削除はその検査点を経由せず本関数が直接物理削除する
+        // ため、ここで明示的に同期する契約に揃える）。戻り値の差分はこの
+        // 呼び出し元では使わない（親側の差分は別途 `enforce_referencing_rows_in_txn`
+        // が計算する）。
+        if !deleted_ids.is_empty() {
+            crate::key_index::sync_rows_in_txn(
+                write_txn,
+                &child_schema.name,
+                child_schema,
+                tenant_id,
+                &deleted_ids,
+            )?;
         }
         return Ok((PropagatedChange::Removed, Some(pre_images)));
     }
