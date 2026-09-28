@@ -1183,3 +1183,68 @@ fn set_null_applied_before_cascade_still_cascades_to_grandchildren() {
     assert_eq!(row_count(&core, &alice, "children"), 0);
     assert_eq!(row_count(&core, &alice, "grandchildren"), 0);
 }
+
+// `SET NULL`／`SET DEFAULT`／`ON UPDATE CASCADE`（read-merge-write で子行を
+// 書き換える経路。`constraint::apply_referential_action`）が、書き換えた
+// 子行の永続キー索引（Issue #1071）を同期しないまま孫段の `NO ACTION`
+// 事後検証（`enforce_referencing_rows_in_txn`）へ進むと、索引に旧キーが
+// 残留し「参照先はまだ存在する」と誤判定して本来 `23503` になるべき更新が
+// 素通りしてしまう（fail-open）懸念（PR #1146 codex-review 指摘）。
+// `propagate_referential_actions` は `ColumnsUpdated` な子行 id を
+// `pending_validation` へ蓄積し、全 FK 適用後に
+// `enforce_row_constraints_in_txn`（内部で `sync_rows_in_txn` を先頭に呼ぶ）
+// でまとめて検証する契約になっており、本テストはその契約が実際に索引の
+// 同期漏れを防いでいることを固定する。
+#[test]
+fn on_update_cascade_syncs_key_index_for_grandchild_no_action_check() {
+    let (core, path) = new_core("fkact-upd-cascade-index-sync");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE countries (code TEXT PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE cities (id_col INTEGER, country TEXT UNIQUE REFERENCES countries(code) ON UPDATE CASCADE)",
+    );
+    // 孫段は cities.country を参照する（既定の NO ACTION）。
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE districts (city_country TEXT REFERENCES cities(country))",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code) VALUES (1, 'JP') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO cities (id, id_col, country) VALUES (1, 1, 'JP') USING OPERATION_ID 'op-c'",
+    );
+    // この挿入が cities/["country"] の永続キー索引を backfill・登録する。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO districts (id, city_country) VALUES (1, 'JP') USING OPERATION_ID 'op-g'",
+    );
+
+    // countries.code の更新は cities.country へ CASCADE するが、districts が
+    // まだ旧値 'JP' を参照しているため、孫段 NO ACTION により全体が 23503 で
+    // 拒否されなければならない。索引の同期漏れがあれば素通りしてしまう。
+    let result = err_code(
+        &core,
+        &alice,
+        "UPDATE countries SET code = 'JPN' WHERE id = 1 USING OPERATION_ID 'op-u'",
+    );
+    assert_eq!(result, "23503");
+    assert_eq!(
+        select_cell(&core, &alice, "cities", 1, "country"),
+        Some(Cell::Text("JP".to_string()))
+    );
+}
