@@ -27,9 +27,14 @@ UNIQUE 制約（Issue #905）は `CREATE TABLE` と Rust API
 テーブル単位の名前空間とし、そのテーブルの UNIQUE 制約名と CHECK 制約名で共有
 する（`validate_schema` が UNIQUE∪CHECK の重複を検査する）。テーブル・ビュー・
 索引の relation 名前空間とは共有しない（UNIQUE は永続索引を作らない）。
-PRIMARY KEY・FOREIGN KEY は引き続き名前を持たない——`DROP CONSTRAINT
-<t>_pkey` のような指定は「存在しない」＝`42704` になる。名前の比較は既存の
-識別子と同じく厳密一致・`catalog::validate_identifier` で検証する。
+PRIMARY KEY は引き続き名前を持たない——`DROP CONSTRAINT <t>_pkey` のような
+指定は「存在しない」＝`42704` になる。名前の比較は既存の識別子と同じく
+厳密一致・`catalog::validate_identifier` で検証する。
+
+**Issue #1069 で FOREIGN KEY もこの名前空間に合流した**（UNIQUE・CHECK・
+FOREIGN KEY の 3 種で名前空間を共有する。詳細は
+[alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md)
+F1 参照）。
 
 ### D2. 既定名の導出（純関数）
 
@@ -158,10 +163,12 @@ HTTP 射影は新しい `ErrorClass` を追加していないため、`error_for
 
 対象外（`42601` のまま）: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`
 （`CREATE TABLE` に明示制約名を持つ UNIQUE を書く構文は未対応）・
-`ADD CONSTRAINT ... CHECK/PRIMARY KEY/FOREIGN KEY`・
-`DROP CONSTRAINT IF EXISTS`／`CASCADE`／`RESTRICT`・1 文に複数の ADD／DROP・
-`DROP COLUMN` の SQL 公開。CHECK 制約の DROP は `0A000`。同一列リストの
-UNIQUE 重複は従来どおり拒否（`42601`）。名前を調べる SQL の手段
+~~`ADD CONSTRAINT ... CHECK/PRIMARY KEY/FOREIGN KEY`~~（`FOREIGN KEY` は
+Issue #1069 で `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY` として
+受理するようになった。`CHECK`／`PRIMARY KEY` の `ADD CONSTRAINT` は引き続き
+対象外）・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／`RESTRICT`・1 文に複数の
+ADD／DROP・`DROP COLUMN` の SQL 公開。CHECK 制約の DROP は `0A000`。同一
+列リストの UNIQUE 重複は従来どおり拒否（`42601`）。名前を調べる SQL の手段
 （`pg_constraint`／`information_schema`）は存在しない。自動生成名は (a) D2 の
 規則（本ドキュメント）と (b) ALTER ADD の成功応答（`AlterTableAction::
 AddConstraint`）で知る設計とする。
@@ -177,11 +184,16 @@ commit せず破棄・副作用ゼロ）→ `encode_schema` → カタログへ�
 → commit。
 
 **DROP**: 構文検証 → `42501` → 存在確認 → write txn 内で: 名前の検索
-（UNIQUE にあれば削除対象。CHECK にあれば `0A000`。どちらにも無ければ
-`42704`）→ FK 依存の検査（`referencing_foreign_keys_in_txn`。自己参照を
-含む。`parent_columns` の**集合**が削除対象の列集合と一致するものが 1 件で
-もあれば `2BP01`。主キーや他の UNIQUE が同じ集合を覆っていても救済せず拒否
-する——fail-closed）→ `encode_schema` → 世代 bump → commit。
+（**Issue #1069 で UNIQUE → FOREIGN KEY → CHECK の順に拡張**。UNIQUE に
+あれば削除対象。無ければ FOREIGN KEY を確認、それも無ければ CHECK を確認
+して `0A000`、どれにも無ければ `42704`）→ UNIQUE 削除時のみ FK 依存の検査
+（`referencing_foreign_keys_in_txn`。自己参照を含む。`parent_columns` の
+**集合**が削除対象の列集合と一致するものが 1 件でもあれば `2BP01`。主キーや
+他の UNIQUE が同じ集合を覆っていても救済せず拒否する——fail-closed。
+FOREIGN KEY の削除は既存行を変更しないため依存検査は不要）→ `encode_schema`
+→ 索引衛生（Issue #1069。詳細は
+[alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md)
+参照）→ 世代 bump → commit。
 
 テナント境界について: DDL はテナント軸とは別の運用者レベルの権限で行う
 共有カタログ操作であり、既存の Rust API と同じく全テナントを走査する。

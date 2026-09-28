@@ -257,7 +257,6 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
         "CREATE TABLE c (v BIGINT REFERENCES p NOT NULL)",
         "CREATE TABLE c (v BIGINT, FOREIGN KEY (missing) REFERENCES p)",
         "CREATE TABLE c (v BIGINT, FOREIGN KEY (id) REFERENCES p)",
-        "CREATE TABLE c (v BIGINT, CONSTRAINT fk_v FOREIGN KEY (v) REFERENCES p)",
         "CREATE TABLE c (v BIGINT REFERENCES p, FOREIGN KEY (v) REFERENCES p)",
         // 構造が同じでアクションだけが異なる重複宣言も拒否する（Issue #1076 A14）。
         "CREATE TABLE c (v BIGINT REFERENCES p, FOREIGN KEY (v) REFERENCES p ON DELETE CASCADE)",
@@ -278,6 +277,39 @@ fn create_table_rejects_unsupported_foreign_key_shapes_with_42601() {
     assert_eq!(
         err_code(&core, &sys, "SET CONSTRAINTS ALL DEFERRED"),
         "42601"
+    );
+}
+
+/// `CREATE TABLE ... CONSTRAINT <name> FOREIGN KEY (...) REFERENCES ...`
+/// （表制約に明示制約名を付与する形）は TABLE-22・TASK-233（Issue #1069）で
+/// 受理されるようになった（従来 42601。設計 F6）。確定した制約名は
+/// `DROP CONSTRAINT` で削除できる。
+#[test]
+fn create_table_accepts_named_foreign_key_table_constraint() {
+    let (core, path) = new_core("fk-named-table-constraint");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (v BIGINT, CONSTRAINT fk_v FOREIGN KEY (v) REFERENCES p)",
+    );
+    // 参照整合性は通常どおり効く。
+    assert_eq!(
+        err_code(
+            &core,
+            &sys,
+            "INSERT INTO c (id, v) VALUES (1, 999) USING OPERATION_ID 'fk-named-1'"
+        ),
+        "23503"
+    );
+    ok(&core, &sys, "ALTER TABLE c DROP CONSTRAINT fk_v");
+    // 削除後は同じ行が参照整合性検査を経ずに挿入できる。
+    ok(
+        &core,
+        &sys,
+        "INSERT INTO c (id, v) VALUES (1, 999) USING OPERATION_ID 'fk-named-2'",
     );
 }
 

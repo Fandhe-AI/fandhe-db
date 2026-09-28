@@ -564,6 +564,65 @@ pub(crate) fn drop_indexes_for_table_in_txn(
     Ok(())
 }
 
+/// `table` の登録簿にある索引のうち、`required_names` に含まれないものを
+/// 全テナント分削除する（P0・Issue #1069。設計 §3.4「索引衛生」）。
+///
+/// # 背景（stale 索引による fail-open の防止）
+///
+/// [`sync_rows_in_txn`] は `table_may_need_index(schema)`（FK・主キー・UNIQUE の
+/// いずれか）が真の間しか登録済み索引を同期しない。子の唯一の FK を DROP する、
+/// または親の UNIQUE を DROP する（Issue #1069・#1147）と、登録簿に残った索引が
+/// 以後更新されなくなる。その状態で行が追加・削除された後に同じ列集合の FK・
+/// UNIQUE を再度 ADD すると、[`ensure_index_in_txn`] は「登録済み」と誤認して
+/// backfill をスキップし、索引はその空白期間の変更を反映しないまま参照整合性
+/// 検査に使われてしまう（fail-open）。この関数は、制約を外した直後（DROP）・
+/// 新しい制約を検証する直前（ADD。検証前の stale 状態を捨ててから検証する）に
+/// `catalog.rs` の呼び出し元（[`crate::catalog::Storage::alter_table_drop_constraint`]・
+/// [`crate::catalog::Storage::alter_table_add_foreign_key`]）が呼び、以後の
+/// `ensure_index_in_txn` が確実に backfill をやり直すようにする。
+///
+/// `required_names` は呼び出し元が算出した「この時点で本当に必要な索引名」の
+/// 集合（`crate::catalog::required_parent_key_index_names_in_txn` 参照）。含まれない
+/// 名前は fwd／rev の実テーブルごと削除し、登録簿から全テナント分のエントリを
+/// 除去する（`drop_indexes_for_table_in_txn` の索引名単位版）。
+pub(crate) fn prune_unneeded_indexes_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    required_names: &BTreeSet<String>,
+) -> Result<(), CatalogError> {
+    let entries = registry_entries_for_table(write_txn, table)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let stale_names: BTreeSet<&str> = entries
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !required_names.contains(*name))
+        .collect();
+    if stale_names.is_empty() {
+        return Ok(());
+    }
+    for name in &stale_names {
+        let fwd_name = fwd_table_name(table, name);
+        let rev_name = rev_table_name(table, name);
+        match write_txn.delete_table(fwd_table_def(&fwd_name)) {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match write_txn.delete_table(rev_table_def(&rev_name)) {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut reg = write_txn.open_table(REGISTRY_TABLE)?;
+    for (name, tenant) in &entries {
+        if stale_names.contains(name.as_str()) {
+            reg.remove((table, name.as_str(), tenant.as_str()))?;
+        }
+    }
+    Ok(())
+}
+
 /// `columns`（`schema` の生存列名）に対応する索引を、テナント `tenant_id` の
 /// 現在行から構築し、そのテナントに限り登録簿へ登録する（未登録の索引を
 /// フォールバック走査で判定した直後に呼ぶ「初回だけそのテナント分を走査する」
