@@ -2710,4 +2710,298 @@ mod tests {
         assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
+
+    // --- `collect_action_targets` の `Removed` 分岐: 限定版とフォールバックの
+    // 違い（codex-review 指摘・PR #1138）------------------------------------------
+    //
+    // `INITIALLY DEFERRED` な `FOREIGN KEY` は、あるトランザクション内の先行の文が
+    // 参照先行を削除した直後（後続の文でまだ解消されていない間）は、子行が一時的に
+    // 合法な孤立行になり得る。`pre_images` に「今回の呼び出しが対象にした削除」
+    // だけを積んで [`collect_action_targets`] に渡す限定版は、この無関係な孤立行を
+    // 連鎖対象に含めてはならない。`pre_images` を渡さないフォールバック（グローバル
+    // スキャン）はこの区別ができず、無関係な孤立行まで含めてしまう——これが
+    // 限定版を常に選べるようにする（`tenant.rs` の pre-image 記録）ことの理由。
+    // 本テストは両分岐を直接呼び分け、この違いを固定する。
+    #[test]
+    fn collect_action_targets_removed_branch_excludes_unrelated_pre_existing_orphan() {
+        let (storage, _guard) = tmp_storage("constraint-collect-targets-removed");
+        let parent_schema = TableSchema::new(
+            "parents",
+            vec![ColumnDef::new(
+                "name",
+                crate::catalog::ColumnType::Text,
+                true,
+            )],
+        );
+        let child_schema = TableSchema::new(
+            "children",
+            vec![ColumnDef::new(
+                "parent_id",
+                crate::catalog::ColumnType::BigInt,
+                true,
+            )],
+        );
+        storage
+            .create_table(&parent_schema)
+            .expect("create parents");
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+
+        // `id` 参照 FK（`REFERENCES parents` の参照先列省略と同じ表現。D2）。
+        let fk = ForeignKeyDef::new(
+            vec!["parent_id".to_string()],
+            "parents".to_string(),
+            vec![crate::catalog::FOREIGN_KEY_PARENT_ID_COLUMN.to_string()],
+            ReferentialAction::Cascade,
+            ReferentialAction::NoAction,
+        );
+
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        // 現存する親行（id=1）。今回の削除とは無関係で、その子行は絶対に触れない。
+        put_raw_row(
+            &write_txn,
+            &parent_schema,
+            "tenant-a",
+            1,
+            &[Value::Text("keep".to_string())],
+        );
+        // id=9 の親行は既に存在しない——`INITIALLY DEFERRED` の下で先行の文が
+        // 削除済みだが、この文より後の文で再投入される予定の一時的な合法孤立行を
+        // 子に持つ、と仮定する。今回の呼び出しの `pre_images` には積まない
+        // （＝この文が削除した行ではない）。
+        put_raw_row(
+            &write_txn,
+            &child_schema,
+            "tenant-a",
+            100,
+            &[Value::BigInt(9)],
+        );
+        // id=5 が「今回の文が実際に削除した親行」。その子行だけが連鎖対象になる。
+        put_raw_row(
+            &write_txn,
+            &child_schema,
+            "tenant-a",
+            101,
+            &[Value::BigInt(5)],
+        );
+        // 現存する親（id=1）を参照する子行。絶対に対象外。
+        put_raw_row(
+            &write_txn,
+            &child_schema,
+            "tenant-a",
+            102,
+            &[Value::BigInt(1)],
+        );
+
+        let mut pre_images = UpdatedKeyPreImages::new();
+        pre_images.record(5, vec![Value::Text("removed".to_string())]);
+
+        let limited = collect_action_targets(
+            &write_txn,
+            "parents",
+            &parent_schema,
+            &child_schema,
+            &fk,
+            "tenant-a",
+            &PropagatedChange::Removed,
+            Some(&pre_images),
+            ReferentialAction::Cascade,
+        )
+        .expect("limited scan must succeed");
+        let limited_ids: HashSet<u64> = limited.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            limited_ids,
+            HashSet::from([101]),
+            "限定版は今回削除された親（id=5）の子行だけを対象にし、\
+             無関係な既存孤立行（id=100・親 id=9）も現存する親の子行（id=102）も含めない"
+        );
+
+        // フォールバック（`pre_images` 無し）は「現在の親に存在しないキーを持つ
+        // 子行全体」を対象にするため、無関係な孤立行（id=100）まで含んでしまう
+        // ——これが限定版を優先しなければならない理由そのものを固定する。
+        let fallback = collect_action_targets(
+            &write_txn,
+            "parents",
+            &parent_schema,
+            &child_schema,
+            &fk,
+            "tenant-a",
+            &PropagatedChange::Removed,
+            None,
+            ReferentialAction::Cascade,
+        )
+        .expect("fallback scan must succeed");
+        let fallback_ids: HashSet<u64> = fallback.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            fallback_ids,
+            HashSet::from([100, 101]),
+            "フォールバックは無関係な既存孤立行（id=100）も連鎖対象に含めてしまう"
+        );
+
+        write_txn.abort().expect("abort");
+    }
+
+    /// [`collect_action_targets_removed_branch_excludes_unrelated_pre_existing_orphan`]
+    /// は `collect_action_targets` を直接呼び分けて分岐の違いを固定するが、
+    /// 実際の連鎖経路（`enforce_referencing_rows_in_txn` → `propagate_referential_actions`
+    /// → `apply_referential_action` の CASCADE 子行削除 → 孫段の
+    /// `collect_action_targets`）が実際に限定版を選べているかまでは検証しない。
+    /// 本テストは親→子→孫の 2 段連鎖を実際の入口から発火させ、孫テーブルの
+    /// 無関係な既存孤立行（`INITIALLY DEFERRED` が許す一時的な合法孤立行を想定。
+    /// 孫の FK を `DeferrableInitiallyDeferred` で宣言し `FkCheckMode::ImmediateOnly`
+    /// を渡すことで事後検証からも除外する）が、親削除の連鎖に巻き込まれず生き残る
+    /// ことを固定する（codex-review 指摘・PR #1138。`apply_referential_action` の
+    /// CASCADE 子行削除が pre-image を `None` で返していた退行では、孫段が
+    /// フォールバックの全走査に必ず落ち、この無関係な孤立行まで削除してしまう）。
+    #[test]
+    fn cascade_through_two_levels_does_not_touch_unrelated_pre_existing_grandchild_orphan() {
+        let (storage, _guard) = tmp_storage("constraint-cascade-chain-orphan");
+        let parent_schema = TableSchema::new(
+            "parents",
+            vec![ColumnDef::new(
+                "name",
+                crate::catalog::ColumnType::Text,
+                true,
+            )],
+        );
+        let child_schema = TableSchema::new(
+            "children",
+            vec![ColumnDef::new(
+                "parent_id",
+                crate::catalog::ColumnType::BigInt,
+                true,
+            )],
+        )
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["parent_id".to_string()],
+            "parents".to_string(),
+            vec![crate::catalog::FOREIGN_KEY_PARENT_ID_COLUMN.to_string()],
+            ReferentialAction::Cascade,
+            ReferentialAction::NoAction,
+        )]);
+        let grandchild_schema = TableSchema::new(
+            "grandchildren",
+            vec![ColumnDef::new(
+                "child_id",
+                crate::catalog::ColumnType::BigInt,
+                true,
+            )],
+        )
+        .with_foreign_keys(vec![ForeignKeyDef::new(
+            vec!["child_id".to_string()],
+            "children".to_string(),
+            vec![crate::catalog::FOREIGN_KEY_PARENT_ID_COLUMN.to_string()],
+            ReferentialAction::Cascade,
+            ReferentialAction::NoAction,
+        )
+        .with_options(
+            ForeignKeyMatch::Simple,
+            crate::catalog::ForeignKeyDeferrability::DeferrableInitiallyDeferred,
+        )]);
+        storage
+            .create_table(&parent_schema)
+            .expect("create parents");
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+        storage
+            .create_table(&grandchild_schema)
+            .expect("create grandchildren");
+
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        put_raw_row(
+            &write_txn,
+            &parent_schema,
+            "tenant-a",
+            1,
+            &[Value::Text("p1".to_string())],
+        );
+        put_raw_row(
+            &write_txn,
+            &child_schema,
+            "tenant-a",
+            10,
+            &[Value::BigInt(1)],
+        );
+        // 削除対象の子（id=10）にぶら下がる孫。連鎖で一緒に削除されるべき。
+        put_raw_row(
+            &write_txn,
+            &grandchild_schema,
+            "tenant-a",
+            100,
+            &[Value::BigInt(10)],
+        );
+        // 無関係な既存孤立行: 参照先の子（id=99）はそもそも存在しない
+        // （`INITIALLY DEFERRED` が許す、別の文が作った一時的な合法孤立行を想定）。
+        // 今回の親削除の連鎖には一切関係がなく、生き残らなければならない。
+        put_raw_row(
+            &write_txn,
+            &grandchild_schema,
+            "tenant-a",
+            101,
+            &[Value::BigInt(99)],
+        );
+
+        // `id=1` の親行を「今回の文が削除した」ことを模す（`tenant.rs` の削除
+        // 経路と同じ契約: 削除前の全列値を `pre_images` に積んでから物理行を消す）。
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("parents"),
+                ))
+                .expect("open parents row table");
+            table.remove(("tenant-a", 1u64)).expect("remove parent row");
+        }
+        let mut pre_images = UpdatedKeyPreImages::new();
+        pre_images.record(1, vec![Value::Text("p1".to_string())]);
+
+        enforce_referencing_rows_in_txn(
+            &write_txn,
+            "parents",
+            &parent_schema,
+            "tenant-a",
+            ReferencedRowsChange::Removed,
+            Some(&pre_images),
+            FkCheckMode::ImmediateOnly,
+        )
+        .expect("cascade through two levels must succeed");
+
+        let children_table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(
+                &crate::catalog::user_rows_table_name("children"),
+            ))
+            .expect("open children row table");
+        assert!(
+            children_table
+                .get(("tenant-a", 10u64))
+                .expect("read children")
+                .is_none(),
+            "親削除に連動して子行（id=10）は連鎖削除される"
+        );
+        let grandchildren_table = write_txn
+            .open_table(crate::catalog::user_rows_table_def(
+                &crate::catalog::user_rows_table_name("grandchildren"),
+            ))
+            .expect("open grandchildren row table");
+        assert!(
+            grandchildren_table
+                .get(("tenant-a", 100u64))
+                .expect("read grandchildren")
+                .is_none(),
+            "削除された子行（id=10）にぶら下がる孫行（id=100）は連鎖削除される"
+        );
+        assert!(
+            grandchildren_table
+                .get(("tenant-a", 101u64))
+                .expect("read grandchildren")
+                .is_some(),
+            "今回の連鎖と無関係な既存孤立行（id=101）はフォールバック走査に \
+             巻き込まれず生き残らなければならない"
+        );
+
+        drop(children_table);
+        drop(grandchildren_table);
+        write_txn.abort().expect("abort");
+    }
 }
