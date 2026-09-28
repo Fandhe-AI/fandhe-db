@@ -5261,8 +5261,20 @@ impl Storage {
                 }
                 return Err(CatalogError::ConstraintNotFound(name.to_string()));
             };
-            let target_columns: Vec<String> =
-                schema.unique_constraints[target_index].columns().to_vec();
+            // `.position()` の戻り値をそのまま添字アクセスせず `.get()` を使う
+            // （coding-rust.md「受信データ経路では添字アクセス禁止」の文言遵守。
+            // 同一 Vec を同一トランザクション内で即座に参照するため実際には
+            // 常に Some だが、fail-closed の作法として明示的に処理する）。
+            let target_columns: Vec<String> = schema
+                .unique_constraints
+                .get(target_index)
+                .ok_or_else(|| {
+                    CatalogError::CorruptSchema(format!(
+                        "unique constraint index out of range for table {table_name}"
+                    ))
+                })?
+                .columns()
+                .to_vec();
 
             // FK 依存検査（自己参照を含む）: `parent_columns` の集合が削除対象の
             // 列集合と一致する宣言が 1 件でもあれば拒否する。
