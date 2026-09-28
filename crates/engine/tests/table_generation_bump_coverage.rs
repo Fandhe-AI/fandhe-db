@@ -77,8 +77,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("storage.rs", 804),
     ("storage.rs", 835),
     ("recovery/panic_hook.rs", 404),
-    ("txn.rs", 191),
-    ("txn.rs", 362),
+    ("txn.rs", 201),
+    ("txn.rs", 372),
     // `Storage::create_enum_type`（TABLE-14・TASK-198、Issue #890）: 新規
     // ENUM 型の登録は [`ENUM_TYPES_TABLE`]（`catalog.rs`）のみを書き、
     // `CATALOG_TABLE`／`user_rows/{table_name}` のいずれにも触れない。新規
