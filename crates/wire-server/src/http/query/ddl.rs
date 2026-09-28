@@ -59,6 +59,10 @@
 //! - `DEFAULT` の数値は [`super::typed_json::number_literal_text`] を再利用
 //!   して正準テキスト化する（`parse_sql_prepared` の前例と同じ、独自の
 //!   float 変換を作らない）。
+//! - `references.on_delete`／`on_update`（Issue #1148・NOSQL-13）は
+//!   [`referential_action_tokens`] の固定語彙 `match` だけで扱い、JSON 文字列
+//!   値を `Token::Ident` へ直接流用しない。語彙外は
+//!   [`DdlError::InvalidRequest`] で拒否する。
 //! - エラー文言は固定英語文言のみとし、untrusted 値を echo しない
 //!   （`super::op::UnsupportedOp` と同じ方針）。
 
@@ -106,7 +110,8 @@ pub enum DdlError {
     InvalidIdentifier,
     /// 形状は妥当だが意味的に受理できない要求（未知の型名・`vector` 列への
     /// `nullable: true`／`dim` 欠落・`DEFAULT` に SQL で表現できない値
-    /// （`bool`／`null`／配列／オブジェクト）等）。
+    /// （`bool`／`null`／配列／オブジェクト）・`references.on_delete`／
+    /// `on_update` の語彙外の値〔Issue #1148〕等）。
     InvalidRequest,
     /// 未実装形（[`DROP_COLUMN_UNAVAILABLE_MESSAGE`]／
     /// [`CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`]）。
@@ -335,6 +340,37 @@ fn push_column_list(tokens: &mut Vec<Token>, columns: &[JsonValue]) -> Result<()
     Ok(())
 }
 
+/// `references.on_delete`／`on_update` の固定語彙を `ON DELETE`／`ON UPDATE`
+/// 句のトークン列（アクション部分のみ）へ写像する（Issue #1148・NOSQL-13。
+/// SQL 表層の `REFERENCES ... ON DELETE ...` と同一のカタログ表現・連鎖適用
+/// （`engine::constraint::propagate_referential_actions`）に合流させるための
+/// NoSQL 側入口）。
+///
+/// untrusted な JSON 文字列値をそのまま `Token::Ident` へ転用せず、固定語彙の
+/// `match` で固定のトークン列だけを積む（インジェクション防止。モジュール
+/// doc の「untrusted 入力の取り扱い」参照）。大文字小文字の揺れは正規化せず
+/// 完全一致のみ受理し、語彙外は [`DdlError::InvalidRequest`]（`42601`）で
+/// 拒否する。
+fn referential_action_tokens(raw: &str) -> Result<Vec<Token>, DdlError> {
+    match raw {
+        "no_action" => Ok(vec![
+            Token::Ident("NO".to_string()),
+            Token::Ident("ACTION".to_string()),
+        ]),
+        "restrict" => Ok(vec![Token::Ident("RESTRICT".to_string())]),
+        "cascade" => Ok(vec![Token::Ident("CASCADE".to_string())]),
+        "set_null" => Ok(vec![
+            Token::Ident("SET".to_string()),
+            Token::Ident("NULL".to_string()),
+        ]),
+        "set_default" => Ok(vec![
+            Token::Ident("SET".to_string()),
+            Token::Ident("DEFAULT".to_string()),
+        ]),
+        _ => Err(DdlError::InvalidRequest),
+    }
+}
+
 /// `create_table.constraints[*]` 1 件をトークン列へ写像する（`primary_key`／
 /// `unique`／`foreign_key` のみ。`check` は [`DdlError::FeatureNotSupported`]）。
 fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
@@ -379,6 +415,8 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
                 .map_err(DdlError::from)?;
             let parent_table = refs_v.required_str("table").map_err(DdlError::from)?;
             let parent_columns = refs_v.optional_array("columns").map_err(DdlError::from)?;
+            let on_delete = refs_v.optional_str("on_delete").map_err(DdlError::from)?;
+            let on_update = refs_v.optional_str("on_update").map_err(DdlError::from)?;
 
             let mut tokens = vec![
                 Token::Ident("FOREIGN".to_string()),
@@ -389,6 +427,20 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
             tokens.push(ident_token(parent_table)?);
             if let Some(parent_columns) = parent_columns {
                 push_column_list(&mut tokens, parent_columns)?;
+            }
+            // 生成順は `ON DELETE` → `ON UPDATE` に固定する（SQL パーサは
+            // 順不同で受理するが、NoSQL からの写像は決定的にする。Issue
+            // #1148）。省略時はトークンを生成せず、engine 既定の `NO ACTION`
+            // に委ねる（現行挙動と完全互換）。
+            if let Some(action) = on_delete {
+                tokens.push(Token::Ident("ON".to_string()));
+                tokens.push(Token::Ident("DELETE".to_string()));
+                tokens.extend(referential_action_tokens(action)?);
+            }
+            if let Some(action) = on_update {
+                tokens.push(Token::Ident("ON".to_string()));
+                tokens.push(Token::Ident("UPDATE".to_string()));
+                tokens.extend(referential_action_tokens(action)?);
             }
             Ok(tokens)
         }
@@ -937,6 +989,204 @@ mod tests {
                 Token::Punct(')'),
             ]
         );
+    }
+
+    // --- referential_action_tokens（Issue #1148・NOSQL-13） ----------------
+
+    #[test]
+    fn referential_action_tokens_maps_fixed_vocabulary() {
+        assert_eq!(
+            referential_action_tokens("no_action").expect("no_action must succeed"),
+            vec![
+                Token::Ident("NO".to_string()),
+                Token::Ident("ACTION".to_string())
+            ]
+        );
+        assert_eq!(
+            referential_action_tokens("restrict").expect("restrict must succeed"),
+            vec![Token::Ident("RESTRICT".to_string())]
+        );
+        assert_eq!(
+            referential_action_tokens("cascade").expect("cascade must succeed"),
+            vec![Token::Ident("CASCADE".to_string())]
+        );
+        assert_eq!(
+            referential_action_tokens("set_null").expect("set_null must succeed"),
+            vec![
+                Token::Ident("SET".to_string()),
+                Token::Ident("NULL".to_string())
+            ]
+        );
+        assert_eq!(
+            referential_action_tokens("set_default").expect("set_default must succeed"),
+            vec![
+                Token::Ident("SET".to_string()),
+                Token::Ident("DEFAULT".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn referential_action_tokens_rejects_out_of_vocabulary() {
+        for raw in ["bogus", "CASCADE", "set null", ""] {
+            let err = referential_action_tokens(raw)
+                .expect_err("out-of-vocabulary or non-exact-case value must be rejected");
+            assert!(matches!(err, DdlError::InvalidRequest));
+        }
+    }
+
+    #[test]
+    fn build_constraint_tokens_foreign_key_maps_referential_actions() {
+        let value = obj(r#"{"kind":"foreign_key","columns":["parent_id"],
+                "references":{"table":"parents","columns":["id"],
+                "on_delete":"cascade","on_update":"set_null"}}"#);
+        let tokens =
+            build_constraint_tokens(&value).expect("foreign_key with actions must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("FOREIGN".to_string()),
+                Token::Ident("KEY".to_string()),
+                Token::Punct('('),
+                Token::Ident("parent_id".to_string()),
+                Token::Punct(')'),
+                Token::Ident("REFERENCES".to_string()),
+                Token::Ident("parents".to_string()),
+                Token::Punct('('),
+                Token::Ident("id".to_string()),
+                Token::Punct(')'),
+                Token::Ident("ON".to_string()),
+                Token::Ident("DELETE".to_string()),
+                Token::Ident("CASCADE".to_string()),
+                Token::Ident("ON".to_string()),
+                Token::Ident("UPDATE".to_string()),
+                Token::Ident("SET".to_string()),
+                Token::Ident("NULL".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_constraint_tokens_foreign_key_rejects_out_of_vocabulary_action() {
+        for bad in [
+            r#"{"kind":"foreign_key","columns":["p"],
+                "references":{"table":"t","on_delete":"bogus"}}"#,
+            r#"{"kind":"foreign_key","columns":["p"],
+                "references":{"table":"t","on_delete":"CASCADE"}}"#,
+            r#"{"kind":"foreign_key","columns":["p"],
+                "references":{"table":"t","on_update":"set null"}}"#,
+        ] {
+            let value = obj(bad);
+            let err = build_constraint_tokens(&value)
+                .expect_err("out-of-vocabulary referential action must be rejected");
+            assert!(matches!(err, DdlError::InvalidRequest));
+        }
+    }
+
+    #[test]
+    fn build_constraint_tokens_foreign_key_rejects_non_string_action() {
+        for bad in [
+            r#"{"kind":"foreign_key","columns":["p"],
+                "references":{"table":"t","on_delete":1}}"#,
+            r#"{"kind":"foreign_key","columns":["p"],
+                "references":{"table":"t","on_delete":null}}"#,
+        ] {
+            let value = obj(bad);
+            let err = build_constraint_tokens(&value)
+                .expect_err("non-string referential action must be rejected");
+            assert!(matches!(err, DdlError::Shape(_)));
+        }
+    }
+
+    #[test]
+    fn build_constraint_tokens_foreign_key_referential_actions_match_sql_surface_parity() {
+        // NoSQL の `references.on_delete`／`on_update` から生成したトークン列を
+        // `validate_create_table_tokens` に通した結果が、同じ宣言を表す SQL
+        // テキストの結果と構造的に一致することを固定する（Issue #1148 の
+        // パリティ要件）。`restrict` は SQL 表層と同じく `no_action` と同一の
+        // 正規化結果になることも併せて確認する。
+        let vocab: &[(&str, &str)] = &[
+            ("no_action", "NO ACTION"),
+            ("restrict", "RESTRICT"),
+            ("cascade", "CASCADE"),
+            ("set_null", "SET NULL"),
+            ("set_default", "SET DEFAULT"),
+        ];
+        for (json_value, sql_action) in vocab {
+            let nosql_value = obj(&format!(
+                r#"{{"kind":"foreign_key","columns":["parent_id"],
+                    "references":{{"table":"parents","columns":["id"],
+                    "on_delete":"{json_value}","on_update":"{json_value}"}}}}"#,
+            ));
+            let nosql_tokens =
+                build_constraint_tokens(&nosql_value).expect("nosql mapping must succeed");
+            let mut full_tokens = vec![
+                Token::Ident("CREATE".to_string()),
+                Token::Ident("TABLE".to_string()),
+                Token::Ident("child".to_string()),
+                Token::Punct('('),
+                Token::Ident("parent_id".to_string()),
+                Token::Ident("BIGINT".to_string()),
+                Token::Punct(','),
+            ];
+            full_tokens.extend(nosql_tokens);
+            full_tokens.push(Token::Punct(')'));
+            let nosql_validated = validate_create_table_tokens(&full_tokens)
+                .expect("nosql-derived tokens must validate");
+
+            let sql_text = format!(
+                "CREATE TABLE child (parent_id BIGINT, FOREIGN KEY (parent_id) \
+                 REFERENCES parents (id) ON DELETE {sql_action} ON UPDATE {sql_action})"
+            );
+            let sql_tokens = tokenize(&sql_text).expect("sql fixture must tokenize");
+            let sql_validated = validate_create_table_tokens(&sql_tokens)
+                .expect("sql-derived tokens must validate");
+
+            assert_eq!(
+                nosql_validated, sql_validated,
+                "NoSQL and SQL surfaces must produce the same catalog representation for {json_value}"
+            );
+        }
+
+        // 省略時（`on_delete`／`on_update` を付けない）も、明示的な `no_action`
+        // と同じ結果になることを確認する（現行挙動との完全互換）。
+        let omitted = obj(r#"{"kind":"foreign_key","columns":["parent_id"],
+                "references":{"table":"parents","columns":["id"]}}"#);
+        let omitted_tokens = build_constraint_tokens(&omitted).expect("omitted case must succeed");
+        let mut full_tokens = vec![
+            Token::Ident("CREATE".to_string()),
+            Token::Ident("TABLE".to_string()),
+            Token::Ident("child".to_string()),
+            Token::Punct('('),
+            Token::Ident("parent_id".to_string()),
+            Token::Ident("BIGINT".to_string()),
+            Token::Punct(','),
+        ];
+        full_tokens.extend(omitted_tokens);
+        full_tokens.push(Token::Punct(')'));
+        let omitted_validated =
+            validate_create_table_tokens(&full_tokens).expect("omitted tokens must validate");
+
+        let explicit_no_action = obj(r#"{"kind":"foreign_key","columns":["parent_id"],
+                "references":{"table":"parents","columns":["id"],
+                "on_delete":"no_action","on_update":"no_action"}}"#);
+        let explicit_tokens =
+            build_constraint_tokens(&explicit_no_action).expect("explicit no_action must succeed");
+        let mut full_tokens = vec![
+            Token::Ident("CREATE".to_string()),
+            Token::Ident("TABLE".to_string()),
+            Token::Ident("child".to_string()),
+            Token::Punct('('),
+            Token::Ident("parent_id".to_string()),
+            Token::Ident("BIGINT".to_string()),
+            Token::Punct(','),
+        ];
+        full_tokens.extend(explicit_tokens);
+        full_tokens.push(Token::Punct(')'));
+        let explicit_validated =
+            validate_create_table_tokens(&full_tokens).expect("explicit tokens must validate");
+
+        assert_eq!(omitted_validated, explicit_validated);
     }
 
     #[test]
