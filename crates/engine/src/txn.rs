@@ -137,6 +137,16 @@ impl ReadSnapshot {
             .ok_or(StorageError::NotFound(id))?;
         decode_row_for_key(tenant_id, id, guard.value())
     }
+
+    /// 内部 `redb::ReadTransaction` への `pub(crate)` アクセサ（[`Storage::db`] と
+    /// 同じ「型そのものをリークさせない最小限の穴」方針）。`catalog`／
+    /// `constraint` モジュールが、本型の [`Self::get`] が扱わない `user_rows/{table}`・
+    /// `user_uniq/{table}` を読み取り専用で開くために使う（Issue #1070・PR #1123
+    /// レビュー対応: `EngineCore::verify_unique_index_read_only` の読み取り専用
+    /// 索引検証が、書き込み経路の遅延バックフィルを経由せずに済むようにする）。
+    pub(crate) fn raw_txn(&self) -> &redb::ReadTransaction {
+        &self.txn
+    }
 }
 
 /// [`Storage::begin_write`] が返す書き込みトランザクションハンドル（TABLE-3。バッチ
