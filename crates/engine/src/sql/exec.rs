@@ -281,7 +281,7 @@ pub struct InsertOutcome {
     pub incremental: Option<crate::incremental::IndexOutcome>,
 }
 
-/// `EngineCore::execute_truncate_sql` の成功応答（SQL-22、TASK-195）。削除件数を
+/// `EngineCore::execute_truncate_sql` の成功応答（SQL-22、TASK-193）。削除件数を
 /// 一切返さない契約（SQL-22。自テナント件数であっても再送側が件数推定に使えない
 /// ようにする設計）を型で表現する固定タグのみの応答。フィールドを持たないが、
 /// 将来の拡張余地を残すため `#[non_exhaustive]` にする。
@@ -3327,7 +3327,7 @@ pub(crate) fn execute_insert_with_schema_in(
 }
 
 /// SQL 表層 `TRUNCATE TABLE <table> USING OPERATION_ID '<id>'`
-/// （SQL-22、TASK-195）の実行入口。`validated`（`sql::allowlist::validate_truncate`
+/// （SQL-22、TASK-193）の実行入口。`validated`（`sql::allowlist::validate_truncate`
 /// 済み構造）の `operation_id` を `ledger_mode` で台帳書き込み指示へ解決してから
 /// [`crate::tenant::truncate_table_unchecked`] へ委譲する（[`execute_insert`] と
 /// 同じ設計）。
