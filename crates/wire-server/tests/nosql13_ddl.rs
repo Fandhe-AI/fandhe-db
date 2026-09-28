@@ -514,9 +514,10 @@ fn create_table_unknown_referential_action_is_42601() {
         ]}"#,
         // 同一キーの重複（`on_delete` を 2 回）。`engine::json::parse_json`
         // の重複キー拒否（`parse_json_rejects_duplicate_key_in_nested_object`
-        // で固定済み）がスキーマ検証より前に働くため `42601` になる
-        // （§3.2 の既知差分: SQL 表層は構文エラー時点で拒否するが分類は同じ
-        // `42601` で揃う）。
+        // で固定済み）が JSON 構文解析の時点で `referential_action_tokens`
+        // の語彙検証より先に働くため `42601` になる（既知の経路差分:
+        // wire 側の語彙検証には到達しないが、分類は SQL 表層の構文エラー
+        // と同じ `42601` で揃う）。
         r#"{"op":"create_table","table":"duplicate_key_action","columns":[
             {"name":"parent_id","type":"integer","nullable":true}
         ],"constraints":[
