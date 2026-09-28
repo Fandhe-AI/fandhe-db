@@ -173,9 +173,13 @@ FK」の `parent_columns()`〔`id` 参照を除く〕から求める——`key_i
   検証前にクリーンな状態へ揃える）
 
 `crates/engine/tests/sql_alter_table_foreign_key.rs` の
-`readding_foreign_key_after_drop_detects_rows_added_during_the_gap`（子側）・
 `readding_foreign_key_after_parent_unique_gap_detects_current_parent_rows`
-（親側）がこの P0 回帰を固定する。
+（`prune_unneeded_indexes_in_txn` を一時的に無効化するとこのテストが失敗する
+ことをミューテーションテストで確認済み）がこの P0 回帰を固定する。
+`readding_foreign_key_after_drop_detects_rows_added_during_the_gap` は `id`
+参照（`key_index.rs` を経由しない全行スキャン経路）を使うため索引の stale 化
+そのものは再現しないが、`ADD FOREIGN KEY` の既存行検証が常に現在の子テーブル
+状態を見ることを別途固定する。
 
 ### F9. 循環
 

@@ -15,6 +15,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::TransactionStatus;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -521,11 +522,13 @@ fn add_foreign_key_without_ddl_permission_is_42501_for_existing_and_missing_tabl
 
 // --- 索引衛生（P0。設計 §3.4） ----------------------------------------------
 
-/// 子側の stale 索引回帰（P0）: FK を DROP した後、索引が同期されなくなった
-/// 空白期間に子行を追加し、その後同じ列集合で FK を再 ADD すると、追加時の
-/// 全テナント走査が新しい違反行を正しく検出できる（`key_index::
-/// prune_unneeded_indexes_in_txn` を欠くと、stale な「登録済みだが空白期間の
-/// 変更を反映していない」索引を信用してしまい得る）。
+/// `ADD FOREIGN KEY` の既存行検証は、DROP されていた間に追加された行も含め
+/// 常に**現在**の子テーブルの状態を見る（`verify_new_foreign_key_all_tenants_in_txn`
+/// は子テーブルを毎回フルスキャンするため、`id` 参照は `key_index.rs` を一切
+/// 経由しない。この経路自体は永続キー索引を持たないため、本テストは索引の
+/// stale 化そのものを再現するものではない。索引の stale 化 P0 回帰は
+/// 下記 `readding_foreign_key_after_parent_unique_gap_detects_current_parent_rows`
+/// が固定する）。
 #[test]
 fn readding_foreign_key_after_drop_detects_rows_added_during_the_gap() {
     let (core, path) = new_core("alter-fk-index-hygiene-child");
@@ -622,6 +625,16 @@ fn readding_foreign_key_after_parent_unique_gap_detects_current_parent_rows() {
         &owner,
         "ALTER TABLE children ADD CONSTRAINT fk_u FOREIGN KEY (u) REFERENCES parents (u)",
     );
+    // 子行を 1 件挿入し、FK 検査経路で親（`parents`, `u`）の永続キー索引を
+    // 実際に backfill・登録させる（索引は初回の未登録照会でのみ構築される。
+    // ここで登録しないと、以後 DROP しても「刈り込む索引が無い」だけの
+    // 弱いテストになってしまう）。
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO children (id, u) VALUES (1, 'x') USING OPERATION_ID 'op-c1'",
+    );
     ok(
         &core,
         &mut session,
@@ -634,7 +647,9 @@ fn readding_foreign_key_after_parent_unique_gap_detects_current_parent_rows() {
         &owner,
         "ALTER TABLE parents DROP CONSTRAINT uq_u",
     );
-    // 親行 x を削除する（索引が同期されない空白期間の変更）。
+    // 親行 x を削除する（索引が同期されない空白期間の変更。`parents` は
+    // この時点で FK・PK・UNIQUE のいずれも持たないため
+    // `table_may_need_index` が偽になり、登録済み索引は同期されない）。
     ok(
         &core,
         &mut session,
@@ -647,15 +662,11 @@ fn readding_foreign_key_after_parent_unique_gap_detects_current_parent_rows() {
         &owner,
         "ALTER TABLE parents ADD CONSTRAINT uq_u UNIQUE (u)",
     );
-    // 子には x を参照する行が残った状態で FK を再追加すると、現在の親行
-    // （x は既に存在しない）で検証され 23503 になるはずだが、子行自体は
-    // まだ無いため先に子行を追加してから検証する。
-    ok(
-        &core,
-        &mut session,
-        &owner,
-        "INSERT INTO children (id, u) VALUES (1, 'x') USING OPERATION_ID 'op-c1'",
-    );
+    // 子には x を参照する行（id=1）が残っている。索引衛生
+    // （`key_index::prune_unneeded_indexes_in_txn`）が無ければ、DROP FK／
+    // DROP UNIQUE の間に登録簿へ残ったままの stale な索引（x を含む）を
+    // `all_keys_exist_in_txn` が信用してしまい、現在は存在しない x への
+    // 参照を誤って通してしまう（fail-open）。
     assert_eq!(
         err_code(
             &core,
@@ -721,4 +732,107 @@ fn out_of_scope_alter_table_foreign_key_forms_are_rejected_with_42601() {
     ] {
         assert_eq!(err_code(&core, &mut session, &owner, sql), "42601", "{sql}");
     }
+}
+
+/// 明示トランザクション内の `ALTER TABLE ... ADD FOREIGN KEY` は DDL を
+/// 拒否する既存の catch-all により `0A000` になり、トランザクションを失敗
+/// させる（SQL-31・TASK-221。`sql_alter_table_unique_constraint.rs` の同種
+/// テストと同じ判定）。
+#[test]
+fn add_foreign_key_inside_explicit_transaction_is_rejected_with_0a000() {
+    let (core, path) = new_core("alter-fk-explicit-txn");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE parents (name TEXT)",
+    );
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE children (parent_id BIGINT)",
+    );
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&owner, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &owner,
+            &mut session,
+            &mut txn,
+            "ALTER TABLE children ADD FOREIGN KEY (parent_id) REFERENCES parents",
+        )
+        .expect_err("ALTER TABLE ADD FOREIGN KEY inside an explicit transaction must be rejected");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+
+    core.execute_sql_in_txn(&owner, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+
+    // 制約が追加されていないことを、無関係な値の INSERT が成功することで確認する。
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO children (id, parent_id) VALUES (1, 999) USING OPERATION_ID 'op-c1'",
+    );
+}
+
+/// 設計 F3: v8〜v11 の無名 FK（`CREATE TABLE` 由来）は decode 時に既定名
+/// （`<table>_<col>_fkey`）を導出し、その名前で `DROP CONSTRAINT` できる
+/// （新規 `ALTER TABLE ADD` だけでなく既存 DB の FK も対象になることの確認）。
+#[test]
+fn drop_constraint_removes_legacy_unnamed_foreign_key_by_derived_name() {
+    let (core, path) = new_core("alter-fk-drop-legacy-derived-name");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE parents (name TEXT)",
+    );
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE children (v BIGINT REFERENCES parents)",
+    );
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO parents (id, name) VALUES (1, 'p1') USING OPERATION_ID 'op-p1'",
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &mut session,
+            &owner,
+            "INSERT INTO children (id, v) VALUES (1, 999) USING OPERATION_ID 'op-c1'"
+        ),
+        "23503"
+    );
+
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE children DROP CONSTRAINT children_v_fkey",
+    );
+
+    // 削除後は孤児行が受理される。
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO children (id, v) VALUES (1, 999) USING OPERATION_ID 'op-c1b'",
+    );
 }
