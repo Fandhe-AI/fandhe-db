@@ -4980,13 +4980,16 @@ impl EngineCore {
                 detail: format!("failed to read table generation: {e}"),
             })?;
         // Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応: `post_check_txn`
-        // はここで drop せず [`Self::explain_engine_for`] へ渡すまで保持する。
-        // 世代照合済みの `post_check_schema` と同一スナップショットで索引宣言
-        // を読むことで、世代照合からここまでの間に新たな `DROP INDEX`／
-        // `CREATE INDEX` がコミットされても、束縛に使ったスキーマと異なる
-        // 世代の索引宣言を注記しない（[`Self::explain_engine_for`] の
-        // ドキュメンテーションコメント参照）。
+        // はここで drop せず [`Self::explain_engine_for`] へ渡すまで保持する
+        // （Issue #1153 の `resolve_scalar_index_target_in_txn` 呼び出しも同じ
+        // `post_check_txn` を使い、その後 `drop` するのは `explain_engine_for`
+        // 呼び出し後まで遅らせる）。世代照合済みの `post_check_schema` と同一
+        // スナップショットで索引宣言を読むことで、世代照合からここまでの間に
+        // 新たな `DROP INDEX`／`CREATE INDEX` がコミットされても、束縛に
+        // 使ったスキーマと異なる世代の索引宣言を注記しない（[`Self::
+        // explain_engine_for`] のドキュメンテーションコメント参照）。
         if current_generation != planning_generation {
+            drop(post_check_txn);
             return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "table generation changed during EXPLAIN USING PLAN query \
                          expansion; rejecting stale plan"
@@ -4994,6 +4997,21 @@ impl EngineCore {
             }
             .into());
         }
+
+        // Issue #1153・TASK-206・INDEX-7: 索引宣言を、世代照合を通過した
+        // 直後の `post_check_txn`（世代一致＝`pre_check_schema` と同じ状態の
+        // カタログ）から解決する。`CREATE INDEX`／`DROP INDEX` は対象テーブルの
+        // 世代を進める（`catalog::create_index`／`drop_index`）ため、世代一致は
+        // 「この読み取りの宣言が `bind` 時点のスキーマと矛盾しない」ことを
+        // 保証する。`post_check_txn` はここでは drop しない（Issue #1066
+        // PR #1155 3 巡目対応で [`Self::explain_engine_for`] へも同じ
+        // スナップショットを渡す契約のため、そこまで生かし続ける。下記
+        // `explain_engine_for` 呼び出し直後にまとめて drop する）。
+        let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+            &post_check_txn,
+            table,
+            self.hnsw_state.is_some(),
+        );
 
         // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
         // `Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
@@ -5048,8 +5066,18 @@ impl EngineCore {
             )
             .scalar_prefilter,
             // Issue #474: `bind` が構文段のみから確定させた静的判定（LLM
-            // I/O・世代照合の影響を受けない。上記コメントと同じ理由）。
-            explain_shape.scalar_plan(),
+            // I/O・世代照合の影響を受けない。上記コメントと同じ理由）に、
+            // Issue #1153 で索引宣言による対象列の絞り込みを反映する
+            // （`scalar_plan_under_target` が `PlainScan` へ降格させた場合、
+            // 直後の `explain_engine_for` の `scalar_names_eligible` 判定
+            // 〔`scalar_plan != PlainScan`〕も連動して索引名注記を出さなく
+            // なる。Issue #1066 PR #1155 codex-review P2 対応と矛盾しない）。
+            crate::sql::scalar_index::scalar_plan_under_target(
+                explain_shape.scalar_plan(),
+                explain_shape.metadata_filter_columns(),
+                &post_check_schema,
+                &target,
+            ),
             scalar_filter_column_names.as_deref(),
         );
         drop(post_check_txn);
@@ -5283,6 +5311,13 @@ impl EngineCore {
     /// ショットで、[`Self::explain_engine_for`] へそのまま渡し索引宣言も
     /// 同一スナップショットから読む（束縛時スキーマと索引宣言取得時の間に
     /// `DROP INDEX`／`CREATE INDEX` がコミットされて食い違う窓を作らない）。
+    ///
+    /// 同じ `read_txn`／`schema`（Issue #1153・TASK-206・INDEX-7）から索引宣言
+    /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）も
+    /// 解決し、`scalar_plan:` 表示を実行時の索引構築対象選択と一致させる
+    /// （[`crate::sql::scalar_index::scalar_plan_under_target`]。宣言で対象外に
+    /// なった列への述語は `PlainScan` へ補正され、直後の `explain_engine_for`
+    /// の索引名注記も連動して出なくなる）。
     fn search_explain_from_bound(
         &self,
         read_txn: &redb::ReadTransaction,
@@ -5299,7 +5334,7 @@ impl EngineCore {
         let scalar_prefilter =
             crate::sql::plan::ExecutionPlan::from_evaluation_order(bound.evaluation_order())
                 .scalar_prefilter;
-        let scalar_plan = crate::sql::scalar_plan::classify_scalar_plan(
+        let scalar_plan_before_target = crate::sql::scalar_plan::classify_scalar_plan(
             &crate::sql::scalar_plan::ScalarShapeInput {
                 scalar_prefilter,
                 metadata_filters: bound.metadata_filters(),
@@ -5313,6 +5348,25 @@ impl EngineCore {
         // fail-closed に `None`（索引名なし）へ倒す。
         let scalar_filter_column_names =
             metadata_filter_column_names(schema, bound.metadata_filters());
+        // Issue #1153: `sql::exec` が索引構築対象選択に使うのと同じ単一
+        // 情報源から `target` を解決し、宣言で対象外にした列への述語を
+        // `scalar_plan_under_target` で `PlainScan` へ補正する。
+        let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+            read_txn,
+            bound.table(),
+            self.hnsw_state.is_some(),
+        );
+        let metadata_filter_columns: Vec<Option<usize>> = bound
+            .metadata_filters()
+            .iter()
+            .map(|f| Some(f.column_index()))
+            .collect();
+        let scalar_plan = crate::sql::scalar_index::scalar_plan_under_target(
+            scalar_plan_before_target,
+            metadata_filter_columns,
+            schema,
+            &target,
+        );
         let (engine, index_names) = self.explain_engine_for(
             read_txn,
             bound.table(),
@@ -5353,11 +5407,11 @@ impl EngineCore {
     /// `EXPLAIN SELECT <集計>` テキスト経由）と
     /// [`Self::explain_bound_aggregate_in_session`]（NoSQL 表層の `aggregate`
     /// op の `explain: true`）の両方が共有する（第 2 の実装を作らない設計）。
-    /// `classify_aggregate_access` 自体はテーブルスキーマと束縛結果だけから
-    /// 静的判定する純粋関数のままだが、Issue #1066 で `scalar_plan:` 行への
-    /// 使用索引名注記を追加したため、カタログ読み取り（`self.storage`）が
-    /// 必要になり `&self` メソッドへ変更した（`classify_aggregate_access`
-    /// 自体の判定式は変えない。#1153 のスコープ）。`access_path` が
+    /// `classify_aggregate_access` 自体はテーブルスキーマと束縛結果・
+    /// `target`（後述）だけから静的判定する純粋関数のままだが、Issue #1066 で
+    /// `scalar_plan:` 行への使用索引名注記を追加したため、カタログ読み取り
+    /// （`self.storage`）が必要になり `&self` メソッドへ変更した
+    /// （`classify_aggregate_access` 自体の判定式は変えない）。`access_path` が
     /// `ScalarIndexCandidates`（索引経由の候補削減が使える形）のときに限り、
     /// `metadata_filters` の列がすべて対象テーブルのスカラー宣言で被覆されて
     /// いるかを `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・
@@ -5370,14 +5424,36 @@ impl EngineCore {
     /// の実行時縮退（選択度超過・候補取得不能）は意図的に反映しない
     /// （`scalar_index_names_for_columns` のドキュメンテーションコメント・
     /// `docs/design/explain-search-engine-exposure.md`「決定 1」節参照）。
+    ///
+    /// `target`（Issue #1153・TASK-206・INDEX-7）: 呼び出し元が `bound` を
+    /// 束縛したのと同一のスナップショット（`read_txn`）から索引宣言
+    /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）を
+    /// 解決し、[`crate::sql::aggregate::classify_aggregate_access`] へ渡す
+    /// （`ensure_scalar_index_snapshot` が実際に構築する索引の対象選択と
+    /// 一致させるため。`self.hnsw_state.is_some()` を「起動時 opt-in」の
+    /// 上位スイッチとして使うのは `sql::exec`／`sql::aggregate` と同じ）。
+    /// `target` により `access_path` 自体が `PlainScan`／`FullScan` 側へ
+    /// 補正され得るため、直後の索引名注記の可否判定（`ScalarIndexCandidates`
+    /// か）は必ずこの補正後の `access_path` を見る。
     fn aggregate_explain_from_bound(
         &self,
         read_txn: &redb::ReadTransaction,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
     ) -> crate::sql::exec::QueryResult {
+        let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+            read_txn,
+            &schema.name,
+            self.hnsw_state.is_some(),
+        );
         let (scalar_plan, access_path) =
-            crate::sql::aggregate::classify_aggregate_access(schema, bound);
+            crate::sql::aggregate::classify_aggregate_access(schema, bound, &target);
+        // Issue #1066: `access_path`（上記 `target` 補正後の値）が
+        // `ScalarIndexCandidates` のときに限り、`metadata_filters` の列が
+        // すべて対象テーブルのスカラー宣言で被覆されているかを確認して索引名を
+        // 注記する。カタログ読み取り失敗・列名写像失敗は fail-closed に名前
+        // なしへ倒す（`Self::aggregate_explain_from_bound` のドキュメンテー
+        // ションコメント参照）。
         let index_names = if matches!(
             access_path,
             crate::sql::explain::AccessPath::ScalarIndexCandidates

@@ -188,6 +188,80 @@ fn normalize_index_names(mut names: Vec<String>) -> Vec<String> {
 /// `filters_empty` が `true` になりうる（`sql::exec` の
 /// `bound.metadata_filters.is_empty() && bound.expr_filters.is_empty()` と
 /// 同じ定義）。
+/// [`MetadataFilter::column_index`] の集合（Issue #1153・TASK-206・INDEX-7）。
+/// [`ExplainShape`] が `USING PLAN` の束縛結果から `metadata_filters` の列を
+/// 覚えておくための非公開表現で、`run_explain_plan`（`core.rs`）が世代照合後の
+/// `post_check_txn` から解決した索引宣言（[`crate::sql::scalar_index::
+/// ScalarIndexTargetOwned`]）と突き合わせて `scalar_plan:` 表示を補正する
+/// （[`crate::sql::scalar_index::scalar_plan_under_target`]）ために使う。
+/// `Copy`（`ExplainShape` 自体が `Copy` の契約を保つため）な固定長ビット集合
+/// （`[u64; 4]` で 256 ビット）で表現し、無制限 `Vec` 確保を避ける
+/// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」）。
+/// 上限は [`crate::declarative_filter::MAX_METADATA_FILTERS`]
+/// （`catalog::MAX_COLUMN_COUNT` と同値・256）に揃える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FilterColumnSet {
+    bits: [u64; 4],
+    /// `column_index` が [`Self::CAPACITY`] 以上で表現できなかった要素が
+    /// 1 件でもあったか。`true` の場合、`sql::scalar_index::
+    /// scalar_plan_under_target` は「解決不能」として fail-closed に
+    /// `PlainScan` へ倒す（本モジュール冒頭「責務境界」の対象外入力を
+    /// 誤って索引適格と報告しないため）。
+    overflow: bool,
+}
+
+impl FilterColumnSet {
+    /// `catalog::MAX_COLUMN_COUNT`（256・`declarative_filter::MAX_METADATA_FILTERS`
+    /// と同値）に揃えたビット集合の容量。
+    const CAPACITY: usize = 256;
+
+    fn empty() -> Self {
+        Self {
+            bits: [0; 4],
+            overflow: false,
+        }
+    }
+
+    fn insert(&mut self, column_index: usize) {
+        let Some(word) = self.bits.get_mut(column_index / 64) else {
+            self.overflow = true;
+            return;
+        };
+        // `column_index % 64` は常に 0..64 の範囲（除数が 64 の剰余）。
+        *word |= 1u64 << (column_index % 64);
+    }
+
+    fn from_filters(filters: &[MetadataFilter]) -> Self {
+        let mut set = Self::empty();
+        for filter in filters {
+            set.insert(filter.column_index());
+        }
+        set
+    }
+
+    /// [`crate::sql::scalar_index::scalar_plan_under_target`] の
+    /// `metadata_filter_columns` 引数が要求する形（列添字。解決不能は
+    /// `None`）へ変換する。要素数はたかだか [`Self::CAPACITY`]（256）件で
+    /// 固定長のため無制限確保にはならない。[`Self::overflow`] が立っている
+    /// 場合は実際の列添字を復元できないため、単一の `None` を返し
+    /// `scalar_plan_under_target` に fail-closed な降格を促す。
+    fn resolved_column_indices(&self) -> Vec<Option<usize>> {
+        if self.overflow {
+            return vec![None];
+        }
+        let mut out = Vec::with_capacity(Self::CAPACITY);
+        for (word_index, word) in self.bits.iter().enumerate() {
+            let mut remaining = *word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as usize;
+                out.push(Some(word_index * 64 + bit));
+                remaining &= remaining - 1;
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExplainShape {
@@ -199,7 +273,13 @@ pub struct ExplainShape {
     /// まま持つための固定長ビットセット（[`FILTER_COLS_WORDS`] 語）。
     /// `scalar_plan:` の索引名注記（`core.rs::EngineCore::run_explain_plan`
     /// が使う。被覆判定にのみ使い、`scalar_plan:` トークン自体の判定式は
-    /// 変えない）専用で、`ann_plan:` の判定には使わない。
+    /// 変えない）専用で、`ann_plan:` の判定には使わない。[`Self::
+    /// filter_columns`]（Issue #1066・索引名注記の列名解決用）と
+    /// [`Self::metadata_filter_columns`]（Issue #1153・`scalar_plan_under_
+    /// target` の列添字入力用）はそれぞれ別の消費者・別の失敗時セマンティクス
+    /// （前者は列挙＋別 overflow フラグ、後者は単一 `None` 要素での縮退）を
+    /// 持つため、同じ入力から独立に構築し両方を保持する（PR #1155・#1158 の
+    /// 並行実装をどちらも壊さないためのマージ方針）。
     filter_cols: [u64; FILTER_COLS_WORDS],
     /// 列インデックスが本ビットセットの表現範囲
     /// （[`crate::catalog::MAX_COLUMN_COUNT`]）を超えた場合に立てる overflow
@@ -207,6 +287,12 @@ pub struct ExplainShape {
     /// 到達しないはずだが、多層防御として fail-closed に「索引名を出さない」
     /// 側へ倒すためのシグナルを保持する。
     filter_cols_overflow: bool,
+    /// Issue #1153・TASK-206・INDEX-7: [`crate::sql::scalar_index::
+    /// scalar_plan_under_target`] の `metadata_filter_columns` 引数を組み立てる
+    /// ための列添字集合（[`FilterColumnSet`]）。上記 `filter_cols` と同じ
+    /// `metadata_filters` から独立に構築する（両者の使い分けは [`Self::
+    /// filter_cols`] のドキュメント参照）。
+    filter_columns: FilterColumnSet,
 }
 
 /// [`ExplainShape::filter_cols`] の語数（`u64` × 4 = 256 列分）。
@@ -262,6 +348,7 @@ impl ExplainShape {
             scalar_plan,
             filter_cols,
             filter_cols_overflow,
+            filter_columns: FilterColumnSet::from_filters(metadata_filters),
         }
     }
 
@@ -269,6 +356,16 @@ impl ExplainShape {
     /// が要求する形状情報。
     pub fn filters_empty(&self) -> bool {
         self.filters_empty
+    }
+
+    /// [`crate::sql::scalar_index::scalar_plan_under_target`]（Issue #1153）の
+    /// `metadata_filter_columns` 引数を組み立てるための、`metadata_filters` の
+    /// 列添字集合（解決不能な添字は `None`）。呼び出し元 `core.rs::
+    /// EngineCore::run_explain_plan` 限定の非公開アクセサ（`ExplainShape` 自体は
+    /// 公開型だが、本フィールドは索引宣言反映の実装詳細でありクレート外へ
+    /// 公開 API として晒さない）。
+    pub(crate) fn metadata_filter_columns(&self) -> Vec<Option<usize>> {
+        self.filter_columns.resolved_column_indices()
     }
 
     /// `scalar_plan:` 行（Issue #474）が要求する静的判定。
