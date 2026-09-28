@@ -48,6 +48,7 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         // 分類（通常の式評価と同じ）へ委譲する。`XX000` 固定ではなくなった。
         TenantWriteError::CheckEvaluationFailed(inner) => inner.error_class(),
         TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
+        TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
         TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
     }
 }
@@ -72,6 +73,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         TenantWriteError::TooManyRowsScanned,
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
+        TenantWriteError::ReferentialActionLimitExceeded,
         TenantWriteError::CheckViolation {
             constraint: "test_check".to_string(),
         },

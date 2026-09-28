@@ -757,7 +757,7 @@ pub(crate) fn none_referenced_for_tenant_in_txn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnDef, ColumnType, ForeignKeyDef, TableSchema};
+    use crate::catalog::{ColumnDef, ColumnType, ForeignKeyDef, ReferentialAction, TableSchema};
     use crate::policy::PolicyContext;
     use crate::recovery::ledger::LedgerWrite;
     use crate::row_codec::Value;
@@ -791,6 +791,8 @@ mod tests {
             vec!["parent_code".to_string()],
             "parents".to_string(),
             vec!["code".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
         )])
     }
 
@@ -1146,6 +1148,8 @@ mod tests {
             vec!["parent_code".to_string()],
             "nodes".to_string(),
             vec!["code".to_string()],
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
         )])
     }
 
@@ -1229,6 +1233,7 @@ mod tests {
             &schema,
             "tenant-a",
             crate::constraint::ReferencedRowsChange::Removed { ids: &[0u64] },
+            None,
             crate::constraint::FkCheckMode::All,
         );
         assert!(
@@ -1333,6 +1338,7 @@ mod tests {
             &schema,
             "tenant-a",
             crate::constraint::ReferencedRowsChange::Removed { ids: &[0u64] },
+            None,
             crate::constraint::FkCheckMode::All,
         );
         assert!(

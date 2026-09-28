@@ -470,12 +470,14 @@ const CATALOG_FORMAT_VERSION_V7: &str = "v7";
 /// （v2〜v8 は互いに排他な正規形）。
 const CATALOG_FORMAT_VERSION_V8: &str = "v8";
 
-/// カタログ v9（TABLE-17・TASK-205、Issue #1077）: `FOREIGN KEY` 制約のうち
-/// 1 件以上が既定以外の `MATCH`（`Full`）・遅延属性（`NotDeferrable` 以外）を
-/// 持つスキーマ専用のフォーマット。v8 の上位集合で、本体（`pk:` 行・6 フィールド
-/// 列行・`uniq:`／`checks:` セクション）は同一のまま、`fks:` セクションの `fk:` 行を
-/// `<col1,...>:<parent_table>:<pcol1,...>:<match>:<deferral>` の 5 フィールドに
-/// 拡張する（`match` は `simple`／`full`、`deferral` は `immediate`
+/// カタログ v9（TABLE-17・TASK-205、Issue #1076／#1077）: `FOREIGN KEY` 制約の
+/// うち 1 件以上が既定以外の参照アクション（`NO ACTION` 以外）・`MATCH`
+/// （`Full`）・遅延属性（`NotDeferrable` 以外）を持つスキーマ専用のフォーマット。
+/// v8 の上位集合で、本体（`pk:` 行・6 フィールド列行・`uniq:`／`checks:`
+/// セクション）は同一のまま、`fks:` セクションの `fk:` 行を
+/// `<col1,...>:<parent_table>:<pcol1,...>:<on_delete>:<on_update>:<match>:<deferral>`
+/// の 7 フィールドに拡張する（`on_delete`／`on_update` は `noaction`／`cascade`／
+/// `setnull`／`setdefault`、`match` は `simple`／`full`、`deferral` は `immediate`
 /// 〔`NotDeferrable`〕／`deferrable`〔`DeferrableInitiallyImmediate`〕／`deferred`
 /// 〔`DeferrableInitiallyDeferred`〕）。正規形の一意性を保つため、全 `FOREIGN KEY`
 /// が既定オプションのスキーマは v9 では書かず引き続き v8 のバイト列のまま
@@ -2121,11 +2123,32 @@ pub(crate) struct CheckConstraint {
     pub(crate) predicate_sql: String,
 }
 
-/// `FOREIGN KEY` 制約 1 件分の宣言（TABLE-17・TASK-205、Issue #907）。参照元
-/// （この宣言を保持する [`TableSchema`]）の列 `columns` の値の組が、参照先
-/// テーブル `parent_table` の列 `parent_columns` の値の組として**同一テナント内**に
-/// 存在することを要求する（`constraint` モジュールの単一検査点が判定する。
-/// 母集合はテナント所有の全行で、RLS 可視集合ではない。RLS-10 (c)）。
+/// `FOREIGN KEY` の参照アクション（Issue #1076・TABLE-17・TASK-205）。参照先の
+/// 行が削除・更新（キー変更）されたとき、参照元（このスキーマ側）の行へ何を
+/// 行うかを表す。`ON DELETE`・`ON UPDATE` それぞれ独立に宣言する
+/// （[`ForeignKeyDef::on_delete`]／[`ForeignKeyDef::on_update`]）。
+///
+/// 適用順序・上限・テナント境界は `crate::constraint` モジュールドキュメント
+/// 参照（連鎖の適用 → 変更対象テーブル全体の事後検証、の 2 段構え）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    /// 既定。参照先の変更は、文の最後に行う事後検証（`23503`）でのみ扱う
+    /// （`RESTRICT` 宣言もここへ正規化し、区別して永続化しない）。
+    NoAction,
+    /// 参照元の行を連鎖的に削除・更新する。
+    Cascade,
+    /// 参照元の FK 列をすべて `NULL` にする。
+    SetNull,
+    /// 参照元の FK 列をそれぞれの列 `DEFAULT`（無ければ `NULL`）にする。
+    SetDefault,
+}
+
+/// `FOREIGN KEY` 制約 1 件分の宣言（TABLE-17・TASK-205、Issue #907。参照
+/// アクションは Issue #1076）。参照元（この宣言を保持する [`TableSchema`]）の列
+/// `columns` の値の組が、参照先テーブル `parent_table` の列 `parent_columns` の
+/// 値の組として**同一テナント内**に存在することを要求する（`constraint` モジュール
+/// の単一検査点が判定する。母集合はテナント所有の全行で、RLS 可視集合ではない。
+/// RLS-10 (c)）。
 ///
 /// `parent_columns` は `columns` と位置で対応し（`columns[i]` ↔ `parent_columns[i]`）、
 /// カタログへ永続化される値では常に解決済み（非空）: 参照先の主キー・UNIQUE 制約の
@@ -2139,6 +2162,8 @@ pub struct ForeignKeyDef {
     columns: Vec<String>,
     parent_table: String,
     parent_columns: Vec<String>,
+    on_delete: ReferentialAction,
+    on_update: ReferentialAction,
     match_type: ForeignKeyMatch,
     deferrability: ForeignKeyDeferrability,
 }
@@ -2184,11 +2209,15 @@ impl ForeignKeyDef {
         columns: Vec<String>,
         parent_table: String,
         parent_columns: Vec<String>,
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
     ) -> Self {
         Self {
             columns,
             parent_table,
             parent_columns,
+            on_delete,
+            on_update,
             match_type: ForeignKeyMatch::Simple,
             deferrability: ForeignKeyDeferrability::NotDeferrable,
         }
@@ -2225,6 +2254,16 @@ impl ForeignKeyDef {
         &self.parent_columns
     }
 
+    /// `ON DELETE` の参照アクション（Issue #1076）。
+    pub fn on_delete(&self) -> ReferentialAction {
+        self.on_delete
+    }
+
+    /// `ON UPDATE` の参照アクション（Issue #1076）。
+    pub fn on_update(&self) -> ReferentialAction {
+        self.on_update
+    }
+
     /// `MATCH` 句（TABLE-17・TASK-205、Issue #1077）。
     pub fn match_type(&self) -> ForeignKeyMatch {
         self.match_type
@@ -2249,10 +2288,11 @@ impl ForeignKeyDef {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
     }
 
-    /// `MATCH`・遅延属性を無視した参照形状（参照元列・参照先テーブル・参照先列）の
-    /// 一致判定。重複宣言の検査（[`validate_foreign_keys`]・[`parse_foreign_key_section`]）が
-    /// 使う——オプション違いだけの同一 FK も重複として拒否する（fail-closed。
-    /// TABLE-17・TASK-205、Issue #1077）。
+    /// `MATCH`・遅延属性・参照アクションを無視した参照形状（参照元列・参照先
+    /// テーブル・参照先列）の一致判定。重複宣言の検査（[`validate_foreign_keys`]・
+    /// [`parse_foreign_key_section`]）が使う——同じ列の組についてオプション
+    /// （アクション・`MATCH`・遅延属性）違いだけの宣言も重複として拒否する
+    /// （fail-closed。TABLE-17・TASK-205、Issue #1076 A14／Issue #1077）。
     pub(crate) fn shares_reference_shape(&self, other: &Self) -> bool {
         self.columns == other.columns
             && self.parent_table == other.parent_table
@@ -2825,11 +2865,51 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 "duplicate foreign key declaration".to_string(),
             ));
         }
+        // 参照アクションの宣言時検査（Issue #1076 A8）。ALTER で FK 列の
+        // nullability・DEFAULT を後から変える経路が無い（DROP COLUMN は FK 構成列を
+        // 拒否する）ため、この検査は宣言後も恒久的に有効であり続ける。
+        validate_referential_action_declaration(schema, fk)?;
         // 自己参照は参照先の宣言がこのスキーマ自身にあるため、参照先の照合まで
         // 静的に検証できる（解決済みの宣言のみ。未解決は `create_table` の
         // write トランザクション内で解決・照合する）。
         if fk.parent_table == schema.name && !fk.parent_columns.is_empty() {
             resolve_foreign_key_target(schema, fk, schema)?;
+        }
+    }
+    Ok(())
+}
+
+/// `FOREIGN KEY` の参照アクション（Issue #1076 A8）が常に失敗する宣言を拒否する。
+/// (a) `SET NULL`（`ON DELETE`／`ON UPDATE` いずれか）で参照元列に `NOT NULL` の
+/// 列がある。(b) `SET DEFAULT` で参照元列に「`DEFAULT` が無く、かつ `NOT NULL`」の
+/// 列がある。参照元スキーマだけで判定できる（カタログ decode 時にも再検証する
+/// 多層防御）。参照先列の nullable が必要な (c) は [`resolve_foreign_key_target`]
+/// （参照先が確定する `CREATE TABLE` の write トランザクション内）が担う。
+fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKeyDef) -> Result<()> {
+    let uses_set_null = matches!(fk.on_delete, ReferentialAction::SetNull)
+        || matches!(fk.on_update, ReferentialAction::SetNull);
+    let uses_set_default = matches!(fk.on_delete, ReferentialAction::SetDefault)
+        || matches!(fk.on_update, ReferentialAction::SetDefault);
+    if !uses_set_null && !uses_set_default {
+        return Ok(());
+    }
+    for name in &fk.columns {
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| &c.name == name)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("foreign key references unknown column: {name}"))
+            })?;
+        if uses_set_null && !column.nullable {
+            return Err(CatalogError::InvalidForeignKey(format!(
+                "column {name} is NOT NULL and cannot use the SET NULL referential action"
+            )));
+        }
+        if uses_set_default && !column.nullable && column.default.is_none() {
+            return Err(CatalogError::InvalidForeignKey(format!(
+                "column {name} is NOT NULL without a DEFAULT and cannot use the SET DEFAULT referential action"
+            )));
         }
     }
     Ok(())
@@ -2872,8 +2952,14 @@ fn resolve_foreign_key_target(
                 CatalogError::Invalid(format!("foreign key references unknown column: {name}"))
             })
     };
-    let resolved = ForeignKeyDef::new(fk.columns.clone(), fk.parent_table.clone(), parent_columns)
-        .with_options(fk.match_type(), fk.deferrability());
+    let resolved = ForeignKeyDef::new(
+        fk.columns.clone(),
+        fk.parent_table.clone(),
+        parent_columns,
+        fk.on_delete,
+        fk.on_update,
+    )
+    .with_options(fk.match_type(), fk.deferrability());
     if resolved.references_parent_id() {
         for name in &resolved.columns {
             if !matches!(child_type(name)?, ColumnType::Integer | ColumnType::BigInt) {
@@ -2882,6 +2968,9 @@ fn resolve_foreign_key_target(
                 )));
             }
         }
+        // `id` 疑似列（物理キー）は常に非 NULL のため、`ON UPDATE CASCADE` の
+        // 参照先 nullable 検査（(c)）は不要（`id` 自体は更新されず、A7 により
+        // ON UPDATE アクションはそもそも発火しない）。
         return Ok(resolved);
     }
     let same_set = |key: &[String]| -> bool {
@@ -2918,6 +3007,29 @@ fn resolve_foreign_key_target(
             return Err(CatalogError::InvalidForeignKey(format!(
                 "foreign key column {child_name} and referenced column {parent_name} are of incompatible types"
             )));
+        }
+    }
+    // 参照アクションの宣言時検査（Issue #1076 A8 (c)）: `ON UPDATE CASCADE` は
+    // 参照先列の新しい値をそのまま参照元列へ書き込む。参照元列が `NOT NULL` なのに
+    // 参照先列が nullable（NULL にできる UNIQUE 列）だと、参照先が NULL へ更新
+    // された瞬間に必ず失敗する宣言になるため拒否する。
+    if matches!(resolved.on_update, ReferentialAction::Cascade) {
+        for (child_name, parent_name) in resolved.columns.iter().zip(&resolved.parent_columns) {
+            let child_nullable = child
+                .columns
+                .iter()
+                .find(|c| &c.name == child_name)
+                .is_some_and(|c| c.nullable);
+            let parent_nullable = parent
+                .columns
+                .iter()
+                .find(|c| &c.name == parent_name)
+                .is_some_and(|c| c.nullable);
+            if !child_nullable && parent_nullable {
+                return Err(CatalogError::InvalidForeignKey(format!(
+                    "column {child_name} is NOT NULL but referenced column {parent_name} is nullable, which is incompatible with ON UPDATE CASCADE"
+                )));
+            }
         }
     }
     Ok(resolved)
@@ -3290,8 +3402,9 @@ fn parse_check_section<'a>(
 /// 列名・テーブル名は `validate_identifier`（[`validate_schema`] 経由で検証済み）に
 /// より `:`／`,`／改行を含み得ないため、区切り文字と衝突しない。
 /// `include_options` は v9（[`CATALOG_FORMAT_VERSION_V9`]）選択時のみ `true` で、
-/// `fk:` 行を 5 フィールド（`MATCH`・遅延属性を含む）で書く。v8 は 3 フィールドの
-/// まま（既存のバイト列を変えない。TABLE-17・TASK-205、Issue #1077）。
+/// `fk:` 行を 7 フィールド（参照アクション・`MATCH`・遅延属性を含む）で書く。
+/// v8 は 3 フィールドのまま（既存のバイト列を変えない。TABLE-17・TASK-205、
+/// Issue #1076／#1077）。
 fn encode_foreign_key_section(
     out: &mut String,
     foreign_keys: &[ForeignKeyDef],
@@ -3309,7 +3422,18 @@ fn encode_foreign_key_section(
         out.push_str(&fk.parent_table);
         out.push(':');
         out.push_str(&fk.parent_columns.join(","));
+        // 参照アクション（Issue #1076）・`MATCH`／遅延属性（Issue #1077）は
+        // すべて既定値（`NO ACTION`／`NO ACTION`／`SIMPLE`／`NOT DEFERRABLE`）の
+        // 場合、v8 のバイト列を一切変えない 3 フィールド形のまま書く（既存
+        // ゴールデンテスト・カタログの後方互換を保つ）。いずれか 1 つでも
+        // 既定値以外の場合のみ 7 フィールド形（v9）に拡張する（正規形の一意性は
+        // decode 側（[`parse_foreign_key_section`]）が「7 フィールドで全既定値」を
+        // 拒否することで保つ）。
         if include_options {
+            out.push(':');
+            out.push_str(referential_action_token(fk.on_delete));
+            out.push(':');
+            out.push_str(referential_action_token(fk.on_update));
             out.push(':');
             out.push_str(match fk.match_type {
                 ForeignKeyMatch::Simple => "simple",
@@ -3325,6 +3449,32 @@ fn encode_foreign_key_section(
         out.push('\n');
     }
     Ok(())
+}
+
+/// [`ReferentialAction`] のカタログ v8 `fk:` 行トークン（閉じた語彙）。
+/// [`parse_referential_action_token`] と対を成す（往復を保証する多層防御。
+/// Issue #1076）。
+fn referential_action_token(action: ReferentialAction) -> &'static str {
+    match action {
+        ReferentialAction::NoAction => "noaction",
+        ReferentialAction::Cascade => "cascade",
+        ReferentialAction::SetNull => "setnull",
+        ReferentialAction::SetDefault => "setdefault",
+    }
+}
+
+/// [`referential_action_token`] の逆変換。語彙外のトークンは fail-closed に
+/// `Err` とする（decode 経路・軽量パーサーの双方が使う共有パーサー）。
+fn parse_referential_action_token(token: &str) -> std::result::Result<ReferentialAction, String> {
+    match token {
+        "noaction" => Ok(ReferentialAction::NoAction),
+        "cascade" => Ok(ReferentialAction::Cascade),
+        "setnull" => Ok(ReferentialAction::SetNull),
+        "setdefault" => Ok(ReferentialAction::SetDefault),
+        other => Err(format!(
+            "malformed foreign key referential action: {other:?}"
+        )),
+    }
 }
 
 /// カンマ区切りの識別子リスト（`fk:` 行の列リスト）を構造検証しつつ読み取る。
@@ -3357,11 +3507,15 @@ fn parse_foreign_key_column_list(
 ///
 /// 検証順序: `fks:` 行の存在・件数の数値形式・`1..=MAX_FOREIGN_KEYS_PER_TABLE`
 /// （0 件は「`FOREIGN KEY` を持たないスキーマは v2〜v7 で書く」形式の一意性契約に
-/// 反する）→ 各行の `fk:` 接頭辞・フィールド数（`has_options` なら 5、そうでなければ
-/// 3）→ 列リスト・テーブル名の識別子形状・`MATCH`／遅延属性トークン
-/// （TABLE-17・TASK-205、Issue #1077）。参照元列の実在・参照先との照合は呼び出し元の
-/// [`validate_schema`] が判定する。確保は宣言件数（上限検査済み）の範囲に限る。
-/// `has_options` はカタログ v9（[`CATALOG_FORMAT_VERSION_V9`]）選択時のみ `true`。
+/// 反する）→ 各行の `fk:` 接頭辞・フィールド数（`has_options` なら 7 または
+/// （後方互換の）5、そうでなければ 3）→ 列リスト・テーブル名の識別子形状・
+/// 参照アクション・`MATCH`／遅延属性トークン（TABLE-17・TASK-205、
+/// Issue #1076／#1077）。`has_options` の 5 フィールド形は Issue #1077 時点の
+/// v9（参照アクション追加前）が書いた既存カタログ値の読み取り専用互換パス
+/// （codex-review 指摘対応。`parse_foreign_key_section` 本体のコメント参照）。
+/// 参照元列の実在・参照先との照合は呼び出し元の [`validate_schema`] が判定する。
+/// 確保は宣言件数（上限検査済み）の範囲に限る。`has_options` はカタログ v9
+/// （[`CATALOG_FORMAT_VERSION_V9`]）選択時のみ `true`。
 fn parse_foreign_key_section<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     has_options: bool,
@@ -3397,18 +3551,57 @@ fn parse_foreign_key_section<'a>(
         else {
             return Err(format!("malformed foreign key line: {line:?}"));
         };
-        // `MATCH`／遅延属性フィールド（v9 のみ。TABLE-17・TASK-205、Issue #1077）。
-        // v8 は 3 フィールド固定のため、ここで余剰フィールドが無いことを検証する。
-        let (match_type, deferrability) = if has_options {
-            let match_field = fields
+        // 参照アクション・`MATCH`／遅延属性フィールド（v9 のみ。TABLE-17・
+        // TASK-205、Issue #1076／#1077）。v8 は 3 フィールド固定のため、ここで
+        // 余剰フィールドが無いことを検証する。
+        //
+        // v9 は `fk:` 行として 2 世代の形式を許容する（後方互換。Issue #1076・
+        // codex-review 指摘対応）: (a) 旧形式（Issue #1077 時点の 5 フィールド。
+        // `MATCH`／遅延属性のみで参照アクションは持たない）、(b) 新形式（本
+        // Issue #1076 が参照アクションを追加した 7 フィールド）。バージョン
+        // 文字列 `v9` を変えずに新形式へ拡張したため、旧形式のまま既に
+        // 永続化済みのカタログ値（本 Issue のマージ前に作成された、既定以外の
+        // `MATCH`／遅延属性を持つスキーマ）を新形式専用のパーサーで読むと
+        // 構造検証エラーで拒否してしまう（fail-closed だが可用性を損なう）。
+        // フィールド数で判別する: 5 番目のフィールドが有るかどうかで、新形式
+        // （`on_delete`・`on_update` を含む）か旧形式（`MATCH`／遅延属性のみ、
+        // 参照アクションは記録されておらず既定の `NoAction`）かが確定する。
+        // `encode_foreign_key_section` は常に新形式（7 フィールド）でのみ書く
+        // ため、旧形式は読み取り専用の互換パスであり正規形の一意性を損なわない。
+        let (on_delete, on_update, match_type, deferrability) = if has_options {
+            let field1 = fields
                 .next()
                 .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-            let deferral_field = fields
+            let field2 = fields
                 .next()
                 .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
-            if fields.next().is_some() {
-                return Err(format!("malformed foreign key line: {line:?}"));
-            }
+            let (on_delete, on_update, match_field, deferral_field) = match fields.next() {
+                Some(field3) => {
+                    // 新形式（7 フィールド）: field1/field2 が on_delete/on_update。
+                    let field4 = fields
+                        .next()
+                        .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
+                    if fields.next().is_some() {
+                        return Err(format!("malformed foreign key line: {line:?}"));
+                    }
+                    (
+                        parse_referential_action_token(field1)?,
+                        parse_referential_action_token(field2)?,
+                        field3,
+                        field4,
+                    )
+                }
+                None => {
+                    // 旧形式（5 フィールド。Issue #1077 時点の v9）: field1/field2 が
+                    // match/deferral。参照アクションは既定値へ補完する。
+                    (
+                        ReferentialAction::NoAction,
+                        ReferentialAction::NoAction,
+                        field1,
+                        field2,
+                    )
+                }
+            };
             let match_type = match match_field {
                 "simple" => ForeignKeyMatch::Simple,
                 "full" => ForeignKeyMatch::Full,
@@ -3424,12 +3617,14 @@ fn parse_foreign_key_section<'a>(
                     ))
                 }
             };
-            (match_type, deferrability)
+            (on_delete, on_update, match_type, deferrability)
         } else {
             if fields.next().is_some() {
                 return Err(format!("malformed foreign key line: {line:?}"));
             }
             (
+                ReferentialAction::NoAction,
+                ReferentialAction::NoAction,
                 ForeignKeyMatch::Simple,
                 ForeignKeyDeferrability::NotDeferrable,
             )
@@ -3454,8 +3649,14 @@ fn parse_foreign_key_section<'a>(
         if columns.len() != parent_columns.len() {
             return Err(format!("foreign key column count mismatch: {line:?}"));
         }
-        let fk = ForeignKeyDef::new(columns, parent_table.to_string(), parent_columns)
-            .with_options(match_type, deferrability);
+        let fk = ForeignKeyDef::new(
+            columns,
+            parent_table.to_string(),
+            parent_columns,
+            on_delete,
+            on_update,
+        )
+        .with_options(match_type, deferrability);
         if fk
             .parent_columns
             .iter()
@@ -3474,20 +3675,22 @@ fn parse_foreign_key_section<'a>(
         }
         foreign_keys.push(fk);
     }
-    // 正規形の一意性（TABLE-17・TASK-205、Issue #1077）: v9 選択の判断材料は
-    // 「既定以外の MATCH／遅延属性を持つ FK が 1 件以上ある」ことのみであり、
-    // 全 FK が既定オプションのスキーマは v8 のバイト列のまま書く契約
+    // 正規形の一意性（TABLE-17・TASK-205、Issue #1076／#1077）: v9 選択の判断材料は
+    // 「既定以外の参照アクション・MATCH・遅延属性を持つ FK が 1 件以上ある」ことの
+    // みであり、全 FK が既定オプションのスキーマは v8 のバイト列のまま書く契約
     // （`encode_schema` 参照）。この不変条件に反する v9 カタログ値
     // （全既定値なのに v9 で書かれた手書きデータ）を「依存なし」等へ丸めず
     // fail-closed に拒否する。
     if has_options
         && !foreign_keys.iter().any(|fk| {
-            fk.match_type() != ForeignKeyMatch::Simple
+            fk.on_delete() != ReferentialAction::NoAction
+                || fk.on_update() != ReferentialAction::NoAction
+                || fk.match_type() != ForeignKeyMatch::Simple
                 || fk.deferrability() != ForeignKeyDeferrability::NotDeferrable
         })
     {
         return Err(
-            "v9 catalog format requires at least one FOREIGN KEY constraint with a non-default MATCH or deferrability option"
+            "v9 catalog format requires at least one FOREIGN KEY constraint with a non-default referential action, MATCH, or deferrability option"
                 .to_string(),
         );
     }
@@ -3516,13 +3719,16 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     let has_unique = !schema.unique_constraints.is_empty();
     let has_check = !schema.checks.is_empty();
     let has_fk = !schema.foreign_keys.is_empty();
-    // v9 選択の判断材料（TABLE-17・TASK-205、Issue #1077）: 既定以外の `MATCH`
-    // （`Full`）・遅延属性（`NotDeferrable` 以外）を持つ `FOREIGN KEY` が
-    // 1 件でもあるか。全 FK が既定オプションのスキーマは（`has_fk` であっても）
+    // v9 選択の判断材料（TABLE-17・TASK-205、Issue #1076／#1077）: 既定以外の
+    // 参照アクション（`ON DELETE`／`ON UPDATE` が `NO ACTION` 以外）・`MATCH`
+    // （`Full`）・遅延属性（`NotDeferrable` 以外）のいずれかを持つ `FOREIGN KEY`
+    // が 1 件でもあるか。全 FK が既定オプションのスキーマは（`has_fk` であっても）
     // 引き続き v8 のバイト列のまま書く（正規形の一意性。既存ゴールデンテストへ
     // 影響しない）。
     let has_fk_options = schema.foreign_keys.iter().any(|fk| {
-        fk.match_type() != ForeignKeyMatch::Simple
+        fk.on_delete() != ReferentialAction::NoAction
+            || fk.on_update() != ReferentialAction::NoAction
+            || fk.match_type() != ForeignKeyMatch::Simple
             || fk.deferrability() != ForeignKeyDeferrability::NotDeferrable
     });
     let mut out = String::new();
@@ -3540,10 +3746,11 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // セクションを追記するだけの上位集合。
         // `FOREIGN KEY` を持つスキーマは v8（TABLE-17・TASK-205、Issue #907）。
         // v8 は v7 と同じ本体・`uniq:`／`checks:` セクション（いずれも 0 件可）の
-        // 後ろに `fks:` セクションを追記するだけの上位集合。既定以外の `MATCH`・
-        // 遅延属性を 1 件でも持つスキーマは v9（[`CATALOG_FORMAT_VERSION_V9`]。
-        // TABLE-17・TASK-205、Issue #1077）——`fks:` セクションの `fk:` 行のみ
-        // 5 フィールドへ拡張する上位集合。
+        // 後ろに `fks:` セクションを追記するだけの上位集合。既定以外の参照
+        // アクション・`MATCH`・遅延属性を 1 件でも持つスキーマは v9
+        // （[`CATALOG_FORMAT_VERSION_V9`]。TABLE-17・TASK-205、Issue #1076／
+        // #1077）——`fks:` セクションの `fk:` 行のみ 7 フィールドへ拡張する
+        // 上位集合。
         out.push_str(if has_fk_options {
             CATALOG_FORMAT_VERSION_V9
         } else if has_fk {
@@ -3797,8 +4004,9 @@ fn decode_schema_body(
     // v7（TABLE-16・TASK-204、Issue #906）は v6 の上位集合（`pk:` 行・6 フィールド
     // 列行・`uniq:` セクション〔0 件可〕の後ろに `checks:` セクション）。
     // v8（TABLE-17・TASK-205、Issue #907）は v7 の上位集合（`checks:` セクション
-    // 〔0 件可〕の後ろに `fks:` セクション）。v9（TABLE-17・TASK-205、Issue #1077）は
-    // v8 の上位集合（`fks:` セクションの `fk:` 行のみ 5 フィールドへ拡張）。
+    // 〔0 件可〕の後ろに `fks:` セクション）。v9（TABLE-17・TASK-205、
+    // Issue #1076／#1077）は v8 の上位集合（`fks:` セクションの `fk:` 行のみ
+    // 7 フィールドへ拡張）。
     let has_default_field = matches!(
         format_version,
         FormatVersion::V5
@@ -5824,8 +6032,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // v8（TABLE-17・TASK-205、Issue #907）は v7 の上位集合で、`checks:`
         // セクション（0 件可）の後ろに `fks:` セクションを持つ。
         CATALOG_FORMAT_VERSION_V8 => (true, true),
-        // v9（TABLE-17・TASK-205、Issue #1077）は v8 の上位集合で、`fks:`
-        // セクションの `fk:` 行のみ 5 フィールドへ拡張する（下記で検証する）。
+        // v9（TABLE-17・TASK-205、Issue #1076／#1077）は v8 の上位集合で、
+        // `fks:` セクションの `fk:` 行のみ 7 フィールドへ拡張する（下記で検証する）。
         CATALOG_FORMAT_VERSION_V9 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
@@ -9050,6 +9258,24 @@ mod tests {
             columns.iter().map(|c| c.to_string()).collect(),
             parent.to_string(),
             parent_columns.iter().map(|c| c.to_string()).collect(),
+            ReferentialAction::NoAction,
+            ReferentialAction::NoAction,
+        )
+    }
+
+    fn fk_with_actions(
+        columns: &[&str],
+        parent: &str,
+        parent_columns: &[&str],
+        on_delete: ReferentialAction,
+        on_update: ReferentialAction,
+    ) -> ForeignKeyDef {
+        ForeignKeyDef::new(
+            columns.iter().map(|c| c.to_string()).collect(),
+            parent.to_string(),
+            parent_columns.iter().map(|c| c.to_string()).collect(),
+            on_delete,
+            on_update,
         )
     }
 
@@ -9105,6 +9331,126 @@ mod tests {
         assert!(matches!(
             encode_schema(&unresolved),
             Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 参照アクション（Issue #1076）: `NO ACTION` だけの FK は v8 の 3 フィールド
+    /// 形のままバイト列が不変（既存ゴールデンテストとの互換）。どちらかが
+    /// `NO ACTION` 以外なら（`MATCH`・遅延属性の統合フォーマット。Issue #1077）
+    /// v9 の 7 フィールド形で永続化し、往復でビット同一に戻る。
+    #[test]
+    fn encode_decode_roundtrips_v8_with_referential_actions() {
+        let schema = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![fk_with_actions(
+            &["parent_id"],
+            "parents",
+            &["id"],
+            ReferentialAction::Cascade,
+            ReferentialAction::SetNull,
+        )]);
+        let encoded = encode_schema(&schema).expect("encode");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert_eq!(
+            text,
+            "v9\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:cascade:setnull:simple:immediate\n"
+        );
+        assert_eq!(decode_schema("children", &encoded).expect("decode"), schema);
+
+        // 両方 `NO ACTION` は 3 フィールド形のまま（バイト列不変）。
+        let no_action = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![fk(&["parent_id"], "parents", &["id"])]);
+        let encoded_no_action = encode_schema(&no_action).expect("encode");
+        assert_eq!(
+            std::str::from_utf8(&encoded_no_action).expect("utf8"),
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\nfks:1\nfk:parent_id:parents:id\n"
+        );
+
+        // v8 は 3 フィールド固定のため、5・7 フィールド形（オプション統合フォーマット。
+        // Issue #1077）は v8 のバージョン行では常に拒否する。全既定値の v9 は
+        // 別途 `decode_v9_rejects_corrupt_or_all_default_foreign_key_section` が
+        // 正規形の一意性違反として検証する。
+        let malformed = "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+                          fks:1\nfk:parent_id:parents:id:noaction:noaction\n";
+        assert!(decode_schema("children", malformed.as_bytes()).is_err());
+
+        // 語彙外トークン・不正フィールド数は fail-closed に拒否する。
+        for corrupt in [
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:bogus:noaction\n",
+            "v8\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:cascade\n",
+            "v9\ncols:1\npk:\nparent_id:bigint:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:1\nfk:parent_id:parents:id:cascade:setnull:simple:immediate:extra\n",
+        ] {
+            assert!(
+                decode_schema("children", corrupt.as_bytes()).is_err(),
+                "must reject {corrupt:?}"
+            );
+        }
+
+        // 構造は同じでアクションだけが異なる重複宣言は拒否する（A14）。
+        let dup_actions = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, true)],
+        )
+        .with_foreign_keys(vec![
+            fk(&["parent_id"], "parents", &["id"]),
+            fk_with_actions(
+                &["parent_id"],
+                "parents",
+                &["id"],
+                ReferentialAction::Cascade,
+                ReferentialAction::NoAction,
+            ),
+        ]);
+        assert!(matches!(
+            encode_schema(&dup_actions),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 参照アクション宣言時検査（Issue #1076 A8）: 常に失敗する宣言を拒否する。
+    #[test]
+    fn validate_foreign_keys_rejects_impossible_referential_action_declarations() {
+        // (a) SET NULL だが参照元列が NOT NULL。
+        let set_null_not_null = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, false)],
+        )
+        .with_foreign_keys(vec![fk_with_actions(
+            &["parent_id"],
+            "parents",
+            &["id"],
+            ReferentialAction::SetNull,
+            ReferentialAction::NoAction,
+        )]);
+        assert!(matches!(
+            encode_schema(&set_null_not_null),
+            Err(CatalogError::InvalidForeignKey(_))
+        ));
+
+        // (b) SET DEFAULT だが参照元列が NOT NULL かつ DEFAULT 無し。
+        let set_default_no_default = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("parent_id", ColumnType::BigInt, false)],
+        )
+        .with_foreign_keys(vec![fk_with_actions(
+            &["parent_id"],
+            "parents",
+            &["id"],
+            ReferentialAction::NoAction,
+            ReferentialAction::SetDefault,
+        )]);
+        assert!(matches!(
+            encode_schema(&set_default_no_default),
+            Err(CatalogError::InvalidForeignKey(_))
         ));
     }
 
@@ -9219,7 +9565,8 @@ mod tests {
         assert_eq!(
             text,
             "v9\ncols:2\npk:\nparent_id:bigint:-:1:L:-\ncode:text:-:1:L:-\nuniq:0\nchecks:0\n\
-             fks:2\nfk:parent_id:parents:id:full:deferred\nfk:code:countries:code:simple:deferrable\n"
+             fks:2\nfk:parent_id:parents:id:noaction:noaction:full:deferred\n\
+             fk:code:countries:code:noaction:noaction:simple:deferrable\n"
         );
         assert_eq!(
             decode_schema("children", &encoded).expect("decode"),
@@ -9227,16 +9574,43 @@ mod tests {
         );
     }
 
+    /// 後方互換: Issue #1076 が参照アクションを追加する前の v9（Issue #1077
+    /// 時点。`MATCH`／遅延属性のみの 5 フィールド `fk:` 行）で永続化済みの
+    /// カタログ値を、参照アクション追加後の本バイナリでも読み取れる
+    /// （codex-review 指摘対応: バージョン文字列 `v9` を変えずに 7 フィールドへ
+    /// 拡張したため、旧形式のまま既存 DB に残るカタログ値を新形式専用の
+    /// パーサーで読むと構造検証エラーで拒否してしまっていた）。参照アクションは
+    /// 記録されていないため `NoAction` へ既定値補完する。
+    #[test]
+    fn decode_v9_accepts_legacy_five_field_foreign_key_line() {
+        let legacy = "v9\ncols:2\npk:\nparent_id:bigint:-:1:L:-\ncode:text:-:1:L:-\n\
+                      uniq:0\nchecks:0\nfks:1\nfk:parent_id:parents:id:full:deferred\n";
+        let decoded = decode_schema("children", legacy.as_bytes()).expect("decode legacy v9");
+        let fk = decoded.foreign_keys().first().expect("one fk");
+        assert_eq!(fk.on_delete(), ReferentialAction::NoAction);
+        assert_eq!(fk.on_update(), ReferentialAction::NoAction);
+        assert_eq!(fk.match_type(), ForeignKeyMatch::Full);
+        assert_eq!(
+            fk.deferrability(),
+            ForeignKeyDeferrability::DeferrableInitiallyDeferred
+        );
+        // 再エンコードは常に新形式（7 フィールド）で書く（正規形の一意性を
+        // 損なわない。読み取り専用の互換パス）。
+        let reencoded = encode_schema(&decoded).expect("re-encode");
+        let text = std::str::from_utf8(&reencoded).expect("utf8");
+        assert!(text.contains("fk:parent_id:parents:id:noaction:noaction:full:deferred\n"));
+    }
+
     /// v9 の破損入力を fail-closed に拒否する（v8 と同じ共有パーサーを通す。
-    /// TABLE-17・TASK-205、Issue #1077）。全 FK が既定オプションの v9（正規形の
-    /// 一意性違反）・未知の `MATCH`／遅延属性トークン・フィールド数不正はいずれも
-    /// 拒否し、`DROP TYPE` の依存判定（`catalog_value_references_enum_type`）も
-    /// 同じ値を「依存なし」に丸めない。
+    /// TABLE-17・TASK-205、Issue #1076／#1077）。全 FK が既定オプションの v9
+    /// （正規形の一意性違反）・未知の参照アクション／`MATCH`／遅延属性トークン・
+    /// フィールド数不正はいずれも拒否し、`DROP TYPE` の依存判定
+    /// （`catalog_value_references_enum_type`）も同じ値を「依存なし」に丸めない。
     #[test]
     fn decode_v9_rejects_corrupt_or_all_default_foreign_key_section() {
         let head = "v9\ncols:2\npk:\nmood_col:enum:mood:1:L:-\npid:bigint:-:1:L:-\n\
                     uniq:0\nchecks:0\n";
-        let valid = format!("{head}fks:1\nfk:pid:parents:id:full:immediate\n");
+        let valid = format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction:full:immediate\n");
         assert!(catalog_value_references_enum_type(valid.as_bytes(), "mood").expect("valid v9"));
         let resolve = &mut |name: &str| -> Result<Arc<EnumTypeDef>> {
             Ok(Arc::new(EnumTypeDef {
@@ -9247,14 +9621,16 @@ mod tests {
         assert!(decode_schema_with_resolver("docs", valid.as_bytes(), resolve).is_ok());
         let corrupt_values = [
             // 全 FK が既定オプション（正規形は v8 のはず）。
-            format!("{head}fks:1\nfk:pid:parents:id:simple:immediate\n"),
-            // 未知の MATCH／遅延属性トークン。
-            format!("{head}fks:1\nfk:pid:parents:id:partial:immediate\n"),
-            format!("{head}fks:1\nfk:pid:parents:id:full:later\n"),
-            // フィールド数不正（v9 は 5 フィールド固定）。
+            format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction:simple:immediate\n"),
+            // 未知の参照アクション／MATCH／遅延属性トークン。
+            format!("{head}fks:1\nfk:pid:parents:id:bogus:noaction:full:immediate\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction:partial:immediate\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction:full:later\n"),
+            // フィールド数不正（v9 は 7 フィールド固定）。
             format!("{head}fks:1\nfk:pid:parents:id\n"),
-            format!("{head}fks:1\nfk:pid:parents:id:full\n"),
-            format!("{head}fks:1\nfk:pid:parents:id:full:immediate:extra\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction:full\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:noaction:noaction:full:immediate:extra\n"),
         ];
         for corrupt in &corrupt_values {
             assert!(
