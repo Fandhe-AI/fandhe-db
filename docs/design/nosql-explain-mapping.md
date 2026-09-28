@@ -24,7 +24,14 @@
   差し替えた（旧 `PreCheckShape` を撤去）。構築は `ExplainShape::from_filters
   (metadata_filters, expr_filters)` の 1 本のみ（`scalar_prefilter: true`
   固定。`USING PLAN` は `HINT ORDER` を受理しないため SCALAR 段は常に
-  DISTANCE 段より先に評価される契約に基づく）。
+  DISTANCE 段より先に評価される契約に基づく）。Issue #1153（TASK-206・
+  INDEX-7）で、`metadata_filters` の列添字を保持する非公開フィールド
+  （固定長ビット集合。`ExplainShape` 自体は非公開フィールドを持てるため
+  `#[non_exhaustive]` の公開 API・`from_filters`／`filters_empty`／
+  `scalar_plan` のシグネチャは不変）を追加した。`core.rs::run_explain_plan`
+  限定の `pub(crate)` アクセサ経由で、索引宣言（`CREATE INDEX`）による
+  `scalar_plan:` 対象外化の判定（`sql::scalar_index::
+  scalar_plan_under_target`）に使う。
 - `core.rs::EngineCore::run_explain_plan`（private）: 既存 `Statement::
   Explain` アームの本体（テーブル世代の事前記録 → 束縛検証（`bind`。`plan`
   欠落判定を含む。LLM I/O より前）→ `question`（`USING PLAN` 本文）の

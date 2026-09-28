@@ -172,29 +172,32 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
 
 ## 対象外（申し送り）
 
-- **`EXPLAIN` の `scalar_plan:` は「索引が実際に使われる」ことを意味しない**:
-  `scalar_plan:`（`sql::scalar_plan::classify_scalar_plan`）は `WHERE`
-  述語の**形**（列型・演算子の組み合わせ）だけを見る束縛時の静的判定であり、
-  カタログ・スキーマ・行データを一切参照しない（`ScalarShapeInput` に
-  storage/schema を渡さない設計。§2 系の `ann_plan:` が
-  `catalog::hnsw_targeted_in_txn` で実行時ゲートと揃えているのとは対照的）。
-  このため `scalar_plan:` が索引適格と表示されても、実行時に対象列が
-  索引化されていなければ `ScalarIndex::resolve_candidates`
-  （`sql/scalar_index.rs`）は該当述語で `CandidateResolution::FallbackNoIndex`
-  を返し、**クエリ全体が全走査（plain scan）へフォールバックする**
-  （索引化した候補だけ通して残りを事後フィルタする、ではない）。これは
-  宣言で除外された列に限らず、平均値長ゲート（Issue #632）・`2^53` ゲート
-  （Issue #893）でも既に起きている既知の制約であり、宣言（本 Issue）は
-  `scalar_plan:` が反映しない実行時ビルドゲートの 3 件目にすぎない
-  （RLS・可視性・結果の正しさには影響しない。fail-closed に全走査へ倒れる
-  だけで誤った結果を返さない）。
-  `scalar_plan:`／`access_path:` を実行時ビルドゲート（宣言・平均値長・
-  `2^53`）まで反映させる修正は、`ann_plan:` と同じ「実行時判定・`EXPLAIN`
-  表示の単一情報源化」パターンを `search_explain_from_bound`・
-  `aggregate_explain_from_bound`（現状 `self` を使わない静的関数）・
-  `run_explain_plan` の 3 経路すべてに広げる設計変更（SQL／NoSQL 表層の
-  bit 同一性テストの更新を伴う）になるため、宣言のみを対象にした部分修正は
-  行わず別 Issue（#1153）の対象とする。
+- **`EXPLAIN` の `scalar_plan:` は宣言による対象外化を反映する（Issue #1153
+  で対応済み）**: `scalar_plan:`（`sql::scalar_plan::classify_scalar_plan`）
+  自体は引き続き `WHERE` 述語の**形**だけを見る束縛時の静的判定（カタログ非
+  依存）のままだが、`search_explain_from_bound`・`aggregate_explain_from_
+  bound`・`run_explain_plan`（`USING PLAN`）の 3 経路は、これに
+  `sql::scalar_index::scalar_plan_under_target`（純粋関数）を通し、クエリと
+  同一の `read_txn` から解決した索引宣言（`resolve_scalar_index_target_in_
+  txn`）で「宣言により対象外にした列への述語」を `plain_scan`（集計の
+  `access_path:` は `full_scan`／`scalar_index_group_enumeration` の判定）へ
+  補正する。`ann_plan:` が `catalog::hnsw_targeted_in_txn` で実行時ゲートと
+  揃えているのと同じ「実行時判定・`EXPLAIN` 表示の単一情報源化」パターン。
+  `id` 述語（`id_index` は宣言の有無によらず常に構築される）は対象外にしない。
+  固定は `crates/engine/tests/explain_scalar_plan_declarations.rs`・
+  `crates/engine/tests/core_explain_plan_entry.rs`
+  （`explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in`）参照
+  （TASK-206・INDEX-7・SQL-27・NOSQL-16・NOSQL-10 ポインタ）。
+  一方、以下は **データ依存**（EXPLAIN は索引構築・`lookup`・`prepare_*` の
+  副作用を持たない契約のため、行データを見ないと分からない）ため、Issue
+  #1153 の対象外のまま残る既知の限界:
+  - 平均値長ゲート（Issue #632）・`2^53` ゲート（Issue #893）による列単位の
+    実行時除外
+  - 選択度による縮退（`CandidateResolution::FallbackSelectivity`）
+  - `ScalarIndex::resolve_candidates` の早期打ち切り（先に評価した宣言列の
+    候補が 0 件だと、後続の宣言外列を評価せず空の `Use` を返す場合がある）
+  これらはいずれも fail-closed に全走査（plain scan）へ倒れるだけで、RLS・
+  可視性・結果の正しさには影響しない。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
@@ -248,3 +251,16 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   連結形の fail-closed 拒否を固定。
 - `crates/engine/tests/sql_index_ddl.rs`: 既存の結果不変テストは無変更のまま
   green（opt-in なしでの回帰）。
+- Issue #1153（`EXPLAIN` の `scalar_plan:`／`access_path:` を実行時の索引
+  構築対象選択へ揃える）: `crates/engine/src/sql/scalar_index.rs` の単体テスト
+  （`scalar_plan_under_target_tests`）で純粋関数の分岐（`Auto`／`Declared`／
+  `Err`・`id` 述語の非降格・解決不能添字の fail-closed 降格）を固定。
+  `crates/engine/tests/explain_scalar_plan_declarations.rs`（新規）: 検索
+  `EXPLAIN`（宣言列・宣言外列・複合述語・`id` 述語・`DROP INDEX` 後の復帰）・
+  `EXPLAIN` 表示と実行時統計（`index_scans`／`plain_scan_fallbacks`）の一致・
+  集計 `EXPLAIN`（`GROUP BY` 列挙形のゲートを含む）・opt-in なしでの無変更を
+  結合テストで固定。`crates/engine/tests/core_explain_plan_entry.rs`
+  （`explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in`）:
+  `USING PLAN` 経由の `EXPLAIN`（SQL テキスト・
+  `EngineCore::explain_bound_plan_in_session` の両方）でも同じ反映が効き、
+  行がビット単位で一致することを固定。

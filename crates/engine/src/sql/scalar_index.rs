@@ -702,6 +702,13 @@ impl ScalarIndexTargetOwned {
             ScalarIndexTargetOwned::Declared(cols) => ScalarIndexTarget::Declared(cols),
         }
     }
+
+    /// [`ScalarIndexTarget::includes`] へ委譲する（所有権付きの値をそのまま
+    /// 保持する呼び出し元――`sql::explain`・`sql::aggregate` の EXPLAIN 経路
+    /// ――が借用へ変換せずに判定できるようにする）。
+    pub(crate) fn includes(&self, column_name: &str) -> bool {
+        self.as_target().includes(column_name)
+    }
 }
 
 /// `ScalarCacheAccess::declarations_enabled` と対象テーブルの索引宣言から
@@ -731,6 +738,66 @@ pub(crate) fn resolve_scalar_index_target_in_txn(
         }),
         Err(_) => Err(()),
     }
+}
+
+/// `sql::explain` の `scalar_plan:`（[`crate::sql::scalar_plan::
+/// classify_scalar_plan`]）・`access_path:`（[`crate::sql::aggregate::
+/// classify_aggregate_access`]）の各静的判定を、実行時の索引構築対象選択
+/// （[`resolve_scalar_index_target_in_txn`]・[`ScalarIndex::build_targeted`]）と
+/// 同じ結果へ補正する純粋関数（Issue #1153・TASK-206・INDEX-7・SQL-27・
+/// NOSQL-16・NOSQL-10）。`classify_scalar_plan` 自体は述語の形だけを見る
+/// カタログ非依存の判定のままとし（`sql::exec` が引き続き使う単一情報源。
+/// モジュールドキュメント参照）、本関数だけがカタログ由来の [`target`] を
+/// 追加入力として受け取り「実行時は索引を使わない」ケースを `PlainScan` へ
+/// 縮退させる。
+///
+/// - `plan == PlainScan`: 常に `PlainScan`（補正の必要なし）。
+/// - `target == Err(())`（カタログ読み取り失敗）: [`resolve_scalar_index_target_in_txn`]
+///   のドキュメントどおり「宣言なし→自動」へは倒さず、`sql::exec` が索引構築を
+///   断念し以降のクエリが plain scan へ縮退するのと同じ `PlainScan` を返す
+///   （fail-closed。`id` 述語のみの形〔`IndexIdRange`〕も含めて降格する—— 実行時は
+///   `ScalarIndex::build_targeted` 自体が呼ばれず `id_index` も含め一切構築
+///   されないため）。
+/// - `target == Ok(Auto)`: `plan` をそのまま返す（宣言なし・opt-in なしの
+///   従来挙動をビット単位で変えない。受け入れ条件 2）。
+/// - `target == Ok(Declared(cols))`: `metadata_filter_columns`（`plan` の元に
+///   なった `bound.metadata_filters` それぞれの列添字。解決できない添字は
+///   `None` で渡す）を `schema.columns` の列名へ変換し、1 件でも `cols` に
+///   含まれない・解決できない列があれば `PlainScan`。`id` 述語
+///   （`expr_filters` 由来。`metadata_filter_columns` には現れない）は
+///   `id_index` が宣言の有無によらず常に構築されるため降格の対象にしない
+///   （`IndexIdRange`・`IndexConjunction` に混ざっていても、`metadata_filters`
+///   側がすべて宣言列に含まれていれば据え置く）。
+pub(crate) fn scalar_plan_under_target(
+    plan: crate::sql::scalar_plan::ScalarPlan,
+    metadata_filter_columns: impl IntoIterator<Item = Option<usize>>,
+    schema: &TableSchema,
+    target: &Result<ScalarIndexTargetOwned, ()>,
+) -> crate::sql::scalar_plan::ScalarPlan {
+    use crate::sql::scalar_plan::ScalarPlan;
+
+    if plan == ScalarPlan::PlainScan {
+        return ScalarPlan::PlainScan;
+    }
+    let declared = match target {
+        Err(()) => return ScalarPlan::PlainScan,
+        Ok(ScalarIndexTargetOwned::Auto) => return plan,
+        Ok(owned @ ScalarIndexTargetOwned::Declared(_)) => owned,
+    };
+    for column_index in metadata_filter_columns {
+        let Some(column_index) = column_index else {
+            // 添字を解決できない（`ExplainShape` のビット集合が範囲外・
+            // 判定不能を表すフラグを立てた場合）: fail-closed に降格する。
+            return ScalarPlan::PlainScan;
+        };
+        let Some(column) = schema.columns.get(column_index) else {
+            return ScalarPlan::PlainScan;
+        };
+        if !declared.includes(&column.name) {
+            return ScalarPlan::PlainScan;
+        }
+    }
+    plan
 }
 
 impl ScalarIndex {
@@ -4702,5 +4769,107 @@ mod tests {
             vec![0u32],
             "num <= 1.505 は 1.50（slot 0）のみに一致"
         );
+    }
+
+    /// [`scalar_plan_under_target`]（Issue #1153）の単体テスト。`sql::explain`・
+    /// `sql::aggregate` から呼ばれる補正が、実行時の索引構築対象選択
+    /// （`resolve_scalar_index_target_in_txn`・`ScalarIndex::build_targeted`）と
+    /// 一致する結果を返すことを固定する。
+    mod scalar_plan_under_target_tests {
+        use super::*;
+        use crate::sql::scalar_plan::ScalarPlan;
+
+        // `kind`（列添字 1）・`path`（列添字 2）を持つ既存 `schema()` を流用する。
+
+        #[test]
+        fn auto_target_passes_plan_through_unchanged() {
+            let schema = schema();
+            let target = Ok(ScalarIndexTargetOwned::Auto);
+            for plan in [
+                ScalarPlan::IndexEquality,
+                ScalarPlan::IndexConjunction,
+                ScalarPlan::IndexIdRange,
+                ScalarPlan::PlainScan,
+            ] {
+                assert_eq!(
+                    scalar_plan_under_target(plan, [Some(1)], &schema, &target),
+                    plan,
+                    "Auto は既存挙動（受け入れ条件 2）をビット単位で変えない"
+                );
+            }
+        }
+
+        #[test]
+        fn declared_target_downgrades_excluded_column_to_plain_scan() {
+            let schema = schema();
+            // `kind`（添字 1）のみを宣言対象にする。述語は `path`（添字 2）。
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            assert_eq!(
+                scalar_plan_under_target(ScalarPlan::IndexEquality, [Some(2)], &schema, &target),
+                ScalarPlan::PlainScan,
+                "宣言で対象外にした列への述語は plain scan へ降格する"
+            );
+        }
+
+        #[test]
+        fn declared_target_keeps_plan_when_all_columns_included() {
+            let schema = schema();
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            assert_eq!(
+                scalar_plan_under_target(ScalarPlan::IndexEquality, [Some(1)], &schema, &target),
+                ScalarPlan::IndexEquality,
+                "全列が宣言内なら元の plan を維持する"
+            );
+        }
+
+        #[test]
+        fn catalog_read_failure_downgrades_to_plain_scan_even_for_id_range() {
+            let schema = schema();
+            let target: Result<ScalarIndexTargetOwned, ()> = Err(());
+            assert_eq!(
+                scalar_plan_under_target(ScalarPlan::IndexIdRange, [], &schema, &target),
+                ScalarPlan::PlainScan,
+                "カタログ読み取り失敗は id 述語のみの形も含め fail-closed に \
+                 plain scan へ倒す（`id_index` も含め構築されないため）"
+            );
+        }
+
+        #[test]
+        fn id_only_predicate_is_not_downgraded_under_declared() {
+            let schema = schema();
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            assert_eq!(
+                scalar_plan_under_target(ScalarPlan::IndexIdRange, [], &schema, &target),
+                ScalarPlan::IndexIdRange,
+                "id 述語のみ（metadata_filter_columns が空）は id_index が宣言の \
+                 有無によらず常に構築されるため降格しない"
+            );
+        }
+
+        #[test]
+        fn unresolvable_column_index_downgrades_to_plain_scan() {
+            let schema = schema();
+            let target = Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()]));
+            assert_eq!(
+                scalar_plan_under_target(ScalarPlan::IndexEquality, [None], &schema, &target),
+                ScalarPlan::PlainScan,
+                "解決不能な添字（ビット集合の範囲外）は fail-closed に降格する"
+            );
+        }
+
+        #[test]
+        fn plain_scan_input_is_always_plain_scan() {
+            let schema = schema();
+            for target in [
+                Ok(ScalarIndexTargetOwned::Auto),
+                Ok(ScalarIndexTargetOwned::Declared(vec!["kind".to_string()])),
+                Err(()),
+            ] {
+                assert_eq!(
+                    scalar_plan_under_target(ScalarPlan::PlainScan, [Some(1)], &schema, &target),
+                    ScalarPlan::PlainScan
+                );
+            }
+        }
     }
 }

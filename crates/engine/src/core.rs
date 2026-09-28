@@ -4824,8 +4824,8 @@ impl EngineCore {
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("failed to read table generation: {e}"),
             })?;
-        drop(post_check_txn);
         if current_generation != planning_generation {
+            drop(post_check_txn);
             return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "table generation changed during EXPLAIN USING PLAN query \
                          expansion; rejecting stale plan"
@@ -4833,6 +4833,19 @@ impl EngineCore {
             }
             .into());
         }
+
+        // Issue #1153・TASK-206・INDEX-7: 索引宣言を、世代照合を通過した
+        // 直後の `post_check_txn`（世代一致＝`pre_check_schema` と同じ状態の
+        // カタログ）から解決する。`CREATE INDEX`／`DROP INDEX` は対象テーブルの
+        // 世代を進める（`catalog::create_index`／`drop_index`）ため、世代一致は
+        // 「この読み取りの宣言が `bind` 時点のスキーマと矛盾しない」ことを
+        // 保証する。`drop(post_check_txn)` より前に解決すること。
+        let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+            &post_check_txn,
+            table,
+            self.hnsw_state.is_some(),
+        );
+        drop(post_check_txn);
 
         // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
         // `Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
@@ -4856,8 +4869,14 @@ impl EngineCore {
             )
             .scalar_prefilter,
             // Issue #474: `bind` が構文段のみから確定させた静的判定（LLM
-            // I/O・世代照合の影響を受けない。上記コメントと同じ理由）。
-            explain_shape.scalar_plan(),
+            // I/O・世代照合の影響を受けない。上記コメントと同じ理由）に、
+            // Issue #1153 で索引宣言による対象列の絞り込みを反映する。
+            crate::sql::scalar_index::scalar_plan_under_target(
+                explain_shape.scalar_plan(),
+                explain_shape.metadata_filter_columns(),
+                &post_check_schema,
+                &target,
+            ),
         );
         Ok(crate::sql::explain::build_explain_result(
             &planned,
@@ -4925,7 +4944,7 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedStatement,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_in_session(
             validated,
             &schema,
@@ -4933,7 +4952,7 @@ impl EngineCore {
             session.udfs(),
         )?;
         Ok(crate::sql::SqlOutcome::Explain(
-            self.search_explain_from_bound(&bound),
+            self.search_explain_from_bound(&read_txn, &schema, &bound),
         ))
     }
 
@@ -4946,8 +4965,17 @@ impl EngineCore {
     /// 経由のどちらでもビット同一の行を返す契約を構造として保証する
     /// （第 2 の実装を作らない設計）。検索本体（`hnsw_state` の
     /// `lookup`／`prepare_*`・`SearchProvider::search`）は呼ばない。
+    ///
+    /// `read_txn`／`schema`（Issue #1153・TASK-206・INDEX-7）: 呼び出し元が
+    /// `bound` を束縛したのと同一のスナップショット。索引宣言
+    /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）を
+    /// この `read_txn` から解決し、`scalar_plan:` 表示を実行時の索引構築対象
+    /// 選択と一致させる（[`crate::sql::scalar_index::
+    /// scalar_plan_under_target`]）。
     fn search_explain_from_bound(
         &self,
+        read_txn: &redb::ReadTransaction,
+        schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
     ) -> crate::sql::exec::QueryResult {
         let is_hybrid = matches!(bound.ranking(), crate::sql::parser::Ranking::Hybrid { .. });
@@ -4960,13 +4988,32 @@ impl EngineCore {
         let scalar_prefilter =
             crate::sql::plan::ExecutionPlan::from_evaluation_order(bound.evaluation_order())
                 .scalar_prefilter;
-        let scalar_plan = crate::sql::scalar_plan::classify_scalar_plan(
+        let scalar_plan_before_target = crate::sql::scalar_plan::classify_scalar_plan(
             &crate::sql::scalar_plan::ScalarShapeInput {
                 scalar_prefilter,
                 metadata_filters: bound.metadata_filters(),
                 expr_filters: bound.expr_filters(),
                 or_filters: bound.or_filters(),
             },
+        );
+        // Issue #1153: `sql::exec` が索引構築対象選択に使うのと同じ単一
+        // 情報源から `target` を解決し、宣言で対象外にした列への述語を
+        // `scalar_plan_under_target` で `PlainScan` へ補正する。
+        let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+            read_txn,
+            bound.table(),
+            self.hnsw_state.is_some(),
+        );
+        let metadata_filter_columns: Vec<Option<usize>> = bound
+            .metadata_filters()
+            .iter()
+            .map(|f| Some(f.column_index()))
+            .collect();
+        let scalar_plan = crate::sql::scalar_index::scalar_plan_under_target(
+            scalar_plan_before_target,
+            metadata_filter_columns,
+            schema,
+            &target,
         );
         let engine = self.explain_engine_for(
             bound.table(),
@@ -4993,10 +5040,10 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedAggregate,
         session: &crate::sql::mode::SessionState,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+        let (read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
         let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
         Ok(crate::sql::SqlOutcome::Explain(
-            Self::aggregate_explain_from_bound(&schema, &bound),
+            self.aggregate_explain_from_bound(&read_txn, &schema, &bound),
         ))
     }
 
@@ -5006,15 +5053,27 @@ impl EngineCore {
     /// `EXPLAIN SELECT <集計>` テキスト経由）と
     /// [`Self::explain_bound_aggregate_in_session`]（NoSQL 表層の `aggregate`
     /// op の `explain: true`）の両方が共有する（第 2 の実装を作らない設計）。
-    /// `self` を使わない（`classify_aggregate_access` がテーブルスキーマと
-    /// 束縛結果だけから静的判定する純粋関数のため）静的メソッドとし、
-    /// 呼び出し元がどちらの経路でも同一の判定式を通ることを型で示す。
+    ///
+    /// `read_txn`（Issue #1153・TASK-206・INDEX-7）: 呼び出し元が `bound` を
+    /// 束縛したのと同一のスナップショットから索引宣言
+    /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）を
+    /// 解決し、[`crate::sql::aggregate::classify_aggregate_access`] へ渡す
+    /// （`ensure_scalar_index_snapshot` が実際に構築する索引の対象選択と
+    /// 一致させるため。`self.hnsw_state.is_some()` を「起動時 opt-in」の
+    /// 上位スイッチとして使うのは `sql::exec`／`sql::aggregate` と同じ）。
     fn aggregate_explain_from_bound(
+        &self,
+        read_txn: &redb::ReadTransaction,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
     ) -> crate::sql::exec::QueryResult {
+        let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+            read_txn,
+            &schema.name,
+            self.hnsw_state.is_some(),
+        );
         let (scalar_plan, access_path) =
-            crate::sql::aggregate::classify_aggregate_access(schema, bound);
+            crate::sql::aggregate::classify_aggregate_access(schema, bound, &target);
         crate::sql::explain::build_relational_explain_result(scalar_plan, access_path)
     }
 
@@ -5212,14 +5271,14 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound search plan targets a different table than requested",
             ));
         }
-        Ok(self.search_explain_from_bound(&bound))
+        Ok(self.search_explain_from_bound(&read_txn, &schema, &bound))
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）の
@@ -5280,14 +5339,14 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
-        let (_read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "bound aggregate plan targets a different table than requested",
             ));
         }
-        Ok(Self::aggregate_explain_from_bound(&schema, &bound))
+        Ok(self.aggregate_explain_from_bound(&read_txn, &schema, &bound))
     }
 
     /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を
