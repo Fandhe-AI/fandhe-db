@@ -453,6 +453,43 @@ fn add_foreign_key_rejects_name_collision_with_existing_unique() {
     );
 }
 
+/// 明示制約名が既存の CHECK 制約名と衝突する場合も `42P07`（設計 F1。UNIQUE・
+/// CHECK・FOREIGN KEY はテーブル単位の名前空間を共有する。
+/// `add_foreign_key_rejects_name_collision_with_existing_unique` の CHECK 版。
+/// Cursor Bugbot 指摘・PR #1156 の対称チェック——UNIQUE 追加側の欠落は
+/// `sql_alter_table_unique_constraint.rs::add_unique_rejects_name_collision_with_existing_foreign_key`
+/// で回帰済みだが、逆方向（FK 追加が CHECK 名と衝突する経路）の回帰が
+/// 未整備だったため追加する）。
+#[test]
+fn add_foreign_key_rejects_name_collision_with_existing_check() {
+    let (core, path) = new_core("alter-fk-add-name-collision-check");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE parents (name TEXT)",
+    );
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE children (parent_id BIGINT, CONSTRAINT dup_name CHECK (parent_id > 0))",
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &mut session,
+            &owner,
+            "ALTER TABLE children ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) \
+             REFERENCES parents"
+        ),
+        "42P07"
+    );
+}
+
 /// 参照先が一意性を持たない列集合の場合は `42830`。
 #[test]
 fn add_foreign_key_rejects_non_unique_target_with_42830() {
