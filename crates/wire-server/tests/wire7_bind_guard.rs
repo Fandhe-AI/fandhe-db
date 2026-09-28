@@ -71,6 +71,32 @@ impl Drop for TempUserStore {
     }
 }
 
+/// `common::write_user_store_file` 等、削除手段を返さないヘルパーが作る一時
+/// ディレクトリを `Drop` で確実に削除するための汎用ガード（review 指摘対応。
+/// `TempUserStore` は自前で生成したディレクトリのみを対象とするため、共有
+/// ヘルパー由来のディレクトリはこちらで管理する）。
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 子プロセスを `Drop` で kill/wait するガード（review 指摘対応）。
+/// `assert!`／`panic!` を含むテスト本体の途中で早期に巻き戻っても、関数末尾の
+/// 手動 kill/wait 呼び出しに依存せず後始末を保証する
+/// （`three_client_e2e.rs::ServerGuard` と同種の目的だが、本ファイルは
+/// stderr tail の失敗時診断出力までは必要としないため最小構成にする）。
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// 非ループバックアドレス（`0.0.0.0` / `[::]`）を指定すると、TLS 未構成
 /// （TASK-72/WIRE-9）のため起動が非 0 終了で拒否されること。
 #[test]
@@ -164,11 +190,22 @@ fn loopback_bind_starts_listening() {
 fn common_listen_helper_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server() {
     const RESET_CONNECTIONS: usize = 3;
 
+    // `common::write_user_store_file` は生成した一時ディレクトリを削除する
+    // 手段を返り値に含めないため（他の大多数の呼び出し元と同じ前提）、ここでは
+    // 親ディレクトリを自前の `Drop` ガードで管理し、以降の `assert!`／`panic!`
+    // 経路でも確実に削除されるようにする（review 指摘: 回帰テストのクリーン
+    // アップ不備）。
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let _users_dir_guard = TempDirGuard(
+        users_path
+            .parent()
+            .expect("user store file has a parent dir")
+            .to_path_buf(),
+    );
     let users_store = TempUserStore::new();
     let db_path = users_store.db_path_str();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
         .args([
             "--users",
             users_path.to_str().expect("utf-8 path"),
@@ -181,8 +218,13 @@ fn common_listen_helper_keeps_draining_stderr_so_logged_connection_errors_do_not
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn wire-server");
+    // 以降の `expect`／`assert!`／`panic!` で早期 return（実質 panic）しても
+    // 子プロセスの kill/wait に確実に到達するよう `Drop` ガードへ委ねる
+    // （review 指摘: listen 待ち／接続エラー確認中に panic すると、関数末尾の
+    // `child.kill()`／`child.wait()` に到達せず子プロセスが残留しうる）。
+    let mut child = ChildGuard(child);
 
-    let mut drain = common::drain_stderr(&mut child);
+    let mut drain = common::drain_stderr(&mut child.0);
     let (addr, lines) = drain.wait_for_listening(Duration::from_secs(10));
     let addr = addr
         .unwrap_or_else(|| panic!("did not observe listening address; lines so far: {lines:?}"));
@@ -226,10 +268,11 @@ fn common_listen_helper_keeps_draining_stderr_so_logged_connection_errors_do_not
     }
 
     assert!(
-        child.try_wait().expect("try_wait").is_none(),
+        child.0.try_wait().expect("try_wait").is_none(),
         "server must still be alive after logging connection errors"
     );
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // 子プロセスの kill/wait と一時ディレクトリの削除は `ChildGuard`／
+    // `TempDirGuard` の `Drop` に委ねる（このスコープを抜ける時点で、成功時
+    // ・panic 時のいずれでも実行される）。
 }
