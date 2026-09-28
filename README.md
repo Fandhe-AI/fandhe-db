@@ -71,6 +71,7 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-full-scan-ratio <num>/<den>] \
   [--hnsw-acorn-max-visible-ratio <num>/<den>] \
   [--hnsw-sparse-visited-max <N>] \
+  [--hnsw-scope all|declared] \
   [--durability immediate|none] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--ddl-allowed-users <user1>[,<user2>...]] \
@@ -176,6 +177,29 @@ SQL 構文との対応表は `crates/wire-server/docs/nosql-api.md`（Issue #780
 `engine:`／`hnsw_params:` 行（Issue #411）で確認できます。ANN opt-in の性能
 評価ベンチ（`RecallEngine`）が使う `brute_force` トークンは本 CLI では受理し
 ません（本 CLI の語彙は `default`／`hnsw`／`hnsw_f16`／`hnsw_i8` の 4 値に限定）。
+`--search-engine` は `CREATE INDEX`（索引宣言）の効果に対する上位スイッチでも
+あります（Issue #1065）。`hnsw`／`hnsw_f16`／`hnsw_i8` を指定した場合に限り、
+スカラー索引の宣言がそのテーブルの索引構築対象の列を絞り込みます（宣言なしの
+テーブルは現行の自動挙動のまま）。HNSW 索引の宣言（`USING hnsw`）の効果は
+`--hnsw-scope` で選びます（下記）。`default`（未指定）では宣言の有無・
+`--hnsw-scope` の値によらず全テーブル厳密（brute-force）のまま挙動は変わり
+ません。詳細は `docs/design/index-declaration-effects.md` 参照。
+
+`--hnsw-scope`（Issue #1065）は HNSW opt-in（`--search-engine hnsw`／
+`hnsw_f16`／`hnsw_i8`）時に HNSW を使うテーブルの範囲を選ぶ CLI 引数です。
+
+| 値 | HNSW を使うテーブル | `USING hnsw` 宣言の効果 |
+| --- | --- | --- |
+| `all`（既定） | 全テーブル | カタログへ記録するのみ（経路・結果を変えない） |
+| `declared` | `CREATE INDEX ... USING hnsw` を宣言したテーブルのみ | 宣言テーブルを HNSW（近似）へ、`DROP INDEX` で厳密へ戻す |
+
+未指定（`all`）は宣言導入前の opt-in 挙動とビット同一です。いずれの値でも
+判定はテーブル単位で、あるテーブルへの宣言が他テーブルの経路・検索結果を
+変えることはありません（`declared` では宣言したテーブル自身の探索方式だけが
+近似／厳密の間で切り替わります）。索引カタログを読み取れない場合は索引を
+使わない側（厳密）へ倒します。HNSW opt-in が無効な構成では値は参照されず
+（組合せエラーにもしません）、`all`／`declared` 以外の値・値欠落・2 回目
+以降の重複指定はいずれも fail-closed で起動エラーとなります。
 
 `--hnsw-full-scan-ratio`／`--hnsw-acorn-max-visible-ratio`／
 `--hnsw-sparse-visited-max`（Issue #657）はフィルタ付き ANN の探索パラメータ

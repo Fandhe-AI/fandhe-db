@@ -661,9 +661,31 @@ pub(crate) fn execute_statement_with_cache(
     // 「Issue #408」「Issue #409」の適用条件そのものは不変）。ここでは
     // `AnnShapeInput` を組み立てて分類し、`is_hybrid` で 4 boolean へ振り分ける
     // だけに簡素化する。
+    // Issue #1065: `hnsw_enabled` は起動時 opt-in（`hnsw_cache.is_some()`）に
+    // 加え、テーブル単位の適格性ゲート（`catalog::hnsw_targeted_in_txn`。
+    // `HnswScope::All` は全テーブル・`Declared` は `USING hnsw` 宣言テーブルのみ）
+    // も満たす必要がある。ゲートは他テーブルの宣言に影響されず、索引カタログを
+    // 読み取れない場合は fail-closed に `false`（厳密 brute-force）へ倒す。ここで無効化すれば DISTANCE/hybrid
+    // の 4 boolean すべて・`HnswIndexCache` 照会（適格性判定より後段）にも
+    // 波及し、ゲート対象外では `HnswIndexCache` へ一切照会・構築されない
+    // （stale 使用の経路が無い）。カタログ全件検証の結果は `hnsw_cache`
+    // （`Some` の場合のみ `HnswCacheAccess::index_gate_cache` 経由）を通じて
+    // `EngineCore::index_catalog_gate_cache` を共有し、クエリのたびに再走査
+    // しない（codex-review P2 対応・PR #1124）。`hnsw_cache` が `None`（起動時
+    // opt-in なし）の場合はカタログに一切触れない。
+    let hnsw_enabled = match hnsw_cache.as_ref() {
+        Some(access) => crate::catalog::hnsw_targeted_in_txn(
+            read_txn,
+            access.index_gate_cache,
+            &bound.table,
+            access.hnsw_scope,
+            true,
+        ),
+        None => false,
+    };
     let ann_plan =
         crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
-            hnsw_enabled: hnsw_cache.is_some(),
+            hnsw_enabled,
             // Issue #411 追記（codex-review P1 指摘・PR #437）:
             // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
             // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
@@ -1645,16 +1667,36 @@ pub(crate) fn execute_statement_with_cache(
                     .is_some()
             });
             if !already_cached {
-                match crate::sql::scalar_index::ScalarIndex::build(schema, snapshot_for_scalar) {
-                    Ok(index) => {
-                        let _ = scalar_access.cache.insert(
-                            scalar_access.storage,
-                            &bound.table,
-                            ctx,
-                            index,
-                        );
+                // 索引宣言（Issue #1065）をこのクエリの `read_txn` から解決する。
+                // カタログ読み取り失敗は「宣言なし→自動」へは倒さず構築を
+                // 断念する（`resolve_scalar_index_target_in_txn` ドキュメント
+                // 参照。構築断念はこの派生キャッシュの fail-soft 契約の範囲内で、
+                // クエリ自体は plain scan へ縮退するだけで失敗しない）。
+                match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
+                    read_txn,
+                    &bound.table,
+                    scalar_access.declarations_enabled,
+                ) {
+                    Ok(target) => {
+                        match crate::sql::scalar_index::ScalarIndex::build_targeted(
+                            schema,
+                            snapshot_for_scalar,
+                            target.as_target(),
+                        ) {
+                            Ok(index) => {
+                                let _ = scalar_access.cache.insert(
+                                    scalar_access.storage,
+                                    &bound.table,
+                                    ctx,
+                                    index,
+                                );
+                            }
+                            Err(_) => {
+                                scalar_access.cache.record_build_failure();
+                            }
+                        }
                     }
-                    Err(_) => {
+                    Err(()) => {
                         scalar_access.cache.record_build_failure();
                     }
                 }

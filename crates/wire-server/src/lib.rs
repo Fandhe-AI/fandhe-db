@@ -50,6 +50,10 @@
 //!   （Issue #850。`engine::storage::WriteDurability` へ untrusted な CLI
 //!   文字列から到達する唯一の入口。非既定値選択時の起動ログ警告は
 //!   `main.rs::run_server` の責務）
+//! - [`hnsw_scope_opt`]: `--hnsw-scope` CLI 引数の閉じた語彙パーサ（Issue #1065。
+//!   `engine::search_engine::HnswScope` へ untrusted な CLI 文字列から到達する
+//!   唯一の入口。`EngineCore::with_hnsw_scope` への注入は `main.rs::run_server`
+//!   の責務）
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用
 //!   （契約値・実装は [`limits`] に委譲）
 //! - [`limits`]: 読み取りタイムアウト・共有接続数リミッター（TASK-69・WIRE-5, WIRE-6）
@@ -130,6 +134,7 @@ pub mod extended_query;
 pub mod fault_injection;
 pub mod framing;
 pub mod handshake;
+pub mod hnsw_scope_opt;
 pub mod http;
 pub mod limits;
 pub mod protocol_dispatch;
