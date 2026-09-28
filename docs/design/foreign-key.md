@@ -188,7 +188,14 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   テーブル・参照先列で決まる正準キーの昇順に並べ替えてから適用する（宣言順は
   一切参照しない）。`CASCADE`（`ON DELETE` は子行を削除、`ON UPDATE` は子の FK 列を
   新キー値へ書き換え）・`SET NULL`（FK 列を `NULL` に）・`SET DEFAULT`（FK 列を
-  それぞれの列 `DEFAULT`、無ければ `NULL` に）。同じ子テーブルへ複数 FK が action を
+  それぞれの列 `DEFAULT`、無ければ `NULL` に）。孫段への連鎖対象特定に使う
+  pre-image は必ず Pass 1 の時点のスナップショット（`snapshot_child_rows_
+  before_pass2`）から作り、Pass 2 で正準順が先の別 FK が既に書き換えた中間状態は
+  使わない（Cursor Bugbot 指摘・PR #1138: 同じ子行を複数の FK が対象にし
+  `SET NULL`／`SET DEFAULT` が `CASCADE` より先に適用される場合、中間状態を
+  pre-image にすると孫段が本来の旧キーを見失い `23503` になる）。書き込み自体
+  （read-merge-write のマージ元）は引き続き「現在の行」を使い、他 FK が既に
+  適用した書き換えを正しく引き継ぐ。同じ子テーブルへ複数 FK が action を
   適用していても、そのテーブルの全 FK 適用が終わってから
   `enforce_row_constraints_in_txn`（`CHECK` → UNIQUE → 子自身の FK 参照元側）で
   1 回だけ再検証し、テーブル世代も bump する（TABLE-16 の単一検査点を再利用）。
