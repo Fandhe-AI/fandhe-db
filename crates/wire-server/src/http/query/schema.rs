@@ -932,6 +932,22 @@ pub static DDL_REFERENCES_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Array(ElementType::String),
             nullable: false,
         },
+        // 参照アクション（Issue #1148・NOSQL-13）。語彙の意味検証
+        // （固定語彙外の拒否）は本スキーマではなく [`super::ddl`] が担う
+        // （`super::ddl::referential_action_tokens` 参照）。省略時は
+        // engine 既定の `NO ACTION` になる。
+        FieldSpec {
+            key: "on_delete",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "on_update",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
     ],
 };
 

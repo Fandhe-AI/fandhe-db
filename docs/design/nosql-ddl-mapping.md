@@ -59,6 +59,14 @@ validate_drop_table_tokens}`（`pub(crate)` → `pub` へ Issue #910 で公開�
   できないため `42601`。
 - **型名**: wire 側に閉じた対応表を置く（`create_table_type_tokens`・
   `build_add_column_type_tokens`）。表にない値は engine を呼ぶ前に `42601`。
+- **参照アクション**（`references.on_delete`／`on_update`。Issue #1148・
+  NOSQL-13）: 固定語彙（`no_action`／`restrict`／`cascade`／`set_null`／
+  `set_default`。小文字 snake_case・完全一致）から `ON DELETE`／`ON UPDATE`
+  の固定トークン列への `match` だけで写像する（`ddl.rs::
+  referential_action_tokens`）。JSON 文字列値を `Token::Ident` へ直接転用
+  しない点は識別子と同じ注入防止方針。省略時はトークンを生成せず engine
+  既定の `NO ACTION` に委ねる（現行挙動と完全互換）。語彙外・非文字列値は
+  `42601`。
 
 ## セッションへの DDL 実行権限の搬送
 
@@ -92,14 +100,18 @@ validate_drop_table_tokens}`（`pub(crate)` → `pub` へ Issue #910 で公開�
 permission_denial_is_byte_identical_regardless_of_table_existence` で固定）。
 
 その他の分類は SQL 表層と共有: `42P07`（重複テーブル）・`42P01`（未定義テーブル）・
-`42701`（列名重複）・`42601`（構文・意味検証）。
+`42701`（列名重複）・`42601`（構文・意味検証）・`42830`（参照アクションの
+宣言時検査失敗。Issue #1148）・`54000`（参照アクション連鎖の深さ・行数上限
+超過。副作用ゼロ。Issue #1148）・`23503`（連鎖適用後も含む参照整合性違反）。
 
 ## 検証
 
 - `crates/engine/tests/sql_ddl_tokens_public_api.rs`: トークン入口が SQL テキスト
   経由の `parse_sql` と同一の `ParsedSql` になることを固定。
 - `crates/wire-server/tests/nosql13_ddl.rs`: HTTP フレーミング越しの成功系・
-  権限拒否・エラー分類・SQL/NoSQL パリティを固定（20 件）。
+  権限拒否・エラー分類・SQL/NoSQL パリティを固定（27 件。うち 7 件は
+  Issue #1148 の参照アクション宣言・連鎖適用・宣言時検査・上限超過・
+  テナント境界）。
 - `crates/wire-server/src/http/query/ddl.rs`・`op.rs`・`schema.rs`・`gate.rs`・
   `http/session/{store,issue,middleware}.rs` の単体テスト。
 

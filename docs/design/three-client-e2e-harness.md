@@ -882,6 +882,24 @@ fail-closed で切断されるか」を検証する（新設ファイル
 （`tls_client.rs` 冒頭コメントと同じ方針）。共有モジュール化は本 Issue の
 対象外（別 Issue 候補）。
 
+## FOREIGN KEY 参照アクションの SQL/NoSQL パリティ（Issue #1148）
+
+`run_phase7_write_parity_scenario`（DDL パリティ）と同じ 2 db 構成
+（`seed_empty_db_no_table`・`spawn_{sql,nosql}_server_with_ddl_allowed`）で、
+`run_fk_referential_action_parity_scenario` を新設した。`ON DELETE
+CASCADE`・`ON UPDATE SET NULL` を宣言した `parents`／`children` を SQL 表層
+（生 wire）・NoSQL 表層（`client`）それぞれ独立の DB へ作り、同型の
+insert（4 行）→ update（`SET NULL` の連鎖）→ delete（`CASCADE` の連鎖）→
+読み戻しに加え、拒否ケース 2 種（語彙外の参照アクション＝`42601`・`NOT
+NULL` 列への `SET NULL`＝宣言時検査 `42830`）を適用し、影響行数・
+`wire_code`・読み戻し行集合が一致することを固定する。3 クライアント
+（curl／urllib／fetch）とも
+`[e2e-record] fk-referential-action-parity/<client>: ...` 行で green を
+確認済み（本開発環境）。`parity_matrix_covers_every_nosql_op` の網羅集合
+（`PARITY_CASES`／`DML_STEPS`／`BOB_STEP`／`PHASE7_WRITE_CASES`）には
+本シナリオの `create_table`／`insert`／`update`／`delete` は追加していない
+（いずれも既存ケースで既に網羅済みのため）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
