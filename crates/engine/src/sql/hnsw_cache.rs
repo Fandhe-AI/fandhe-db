@@ -1100,6 +1100,9 @@ pub(crate) struct HnswCacheAccess<'a> {
     pub(crate) cache: &'a HnswIndexCache,
     pub(crate) provider: HnswSearchProvider,
     pub(crate) index_gate_cache: &'a crate::catalog::IndexCatalogGateCache,
+    /// HNSW を使うテーブルの範囲（`EngineCore::with_hnsw_scope` の設定値。
+    /// `catalog::hnsw_targeted_in_txn` へそのまま渡す。Issue #1065）。
+    pub(crate) hnsw_scope: crate::search_engine::HnswScope,
 }
 
 /// [`search_or_fallback`]／[`search_subset_or_fallback`] の「索引・オーバーレイの
@@ -3191,6 +3194,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3273,6 +3277,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         record_overlay_for(&access, table0, base0, overlay);
 
@@ -3430,6 +3435,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -3515,6 +3521,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [0.5, 0.25, 0.1, 0.9];
@@ -3610,6 +3617,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(f16_params),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -3742,6 +3750,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(i8_params),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let ann_provider = crate::kernel::CpuScalarProvider;
         let default_provider = crate::kernel::CpuScalarProvider;
@@ -3884,6 +3893,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         record_overlay_for(&access, "docs", &base, overlay);
 
@@ -3983,6 +3993,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
@@ -4154,6 +4165,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(params),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
 
         // 5/20 = 0.25 < 0.6: 早期打ち切り分岐を踏むはずの部分集合アリーナ
@@ -4222,6 +4234,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);
@@ -4295,6 +4308,7 @@ mod tests {
             cache: &cache,
             provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().unwrap();
         let arena = build_arena(&read_txn, "docs", &c);

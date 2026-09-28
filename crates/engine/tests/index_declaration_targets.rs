@@ -12,11 +12,13 @@
 //! - opt-in ありでスカラー宣言（一部の列のみ）がある場合、宣言列への `WHERE`
 //!   は索引経路（`index_scans`）を使い、宣言外の列への `WHERE` は plain scan
 //!   （`plain_scan_fallbacks`）へ縮退すること
-//! - opt-in ありで HNSW 宣言がカタログの一部テーブル（`table_a`）にのみある
-//!   場合も、宣言のない他テーブル（`table_b`）の検索経路（HNSW）と Top-k 結果
-//!   （SQL 表層・Rust API とも）は宣言の追加・削除の前後で一切変わらないこと
-//!   （HNSW 適格性ゲートはテーブル単位。`docs/design/index-declaration-effects.md`
-//!   「HNSW（テーブル単位）」）
+//! - HNSW 適格性ゲートはテーブル単位（`docs/design/index-declaration-effects.md`
+//!   「HNSW（テーブル単位）」）: `HnswScope::All`（既定）では全テーブル HNSW で
+//!   宣言の追加・削除はどのテーブルの経路・Top-k も変えず、`HnswScope::Declared`
+//!   では `USING hnsw` を宣言したテーブルだけ HNSW・未宣言テーブルは厳密で
+//!   `DROP INDEX` で厳密へ戻ること。いずれも `table_a` への宣言は `table_b` の
+//!   経路・Top-k（SQL 表層・Rust API・`EXPLAIN` の `ann_plan:`）を変えないこと
+//! - HNSW opt-in なしでは `HnswScope` は無関係で全テーブル厳密のままであること
 //! - いずれの構成でも RLS 境界（テナント間非漏えい）は変わらないこと
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -25,8 +27,10 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
-use engine::search_engine;
+use engine::search_engine::{self, HnswScope};
+use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
+use engine::sql::SqlOutcome;
 use engine::storage::{RowInput, Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -304,35 +308,23 @@ fn scalar_declaration_scopes_index_to_declared_columns_with_hnsw_opt_in() {
     );
 }
 
-/// `HnswIndexCache` が照会された（＝HNSW 適格性ゲートを通過し HNSW 経路へ
-/// 進んだ）回数の合計（新規構築 `builds` と索引済み探索 `hits`）。ゲート
-/// 対象外（brute-force）ではどちらも増えない。
-fn hnsw_path_count(core: &EngineCore) -> u64 {
+/// `HnswIndexCache` へ照会した回数の合計（HNSW 適格性ゲートを通過して HNSW
+/// 経路へ進むと、新規構築・索引済み探索・世代更新後のオーバーレイ再計算
+/// 〔`misses` に計上〕のいずれかで必ず増える）。ゲート対象外（厳密
+/// brute-force）では一切増えない。
+fn hnsw_consulted_count(core: &EngineCore) -> u64 {
     let stats = core.hnsw_index_cache_stats();
-    stats.builds + stats.hits
+    stats.hits + stats.misses + stats.builds + stats.build_failures + stats.fallbacks
 }
 
-/// Rust API（`VectorCore::search`）の Top-k を比較可能な形へ写す。
-fn rust_api_top_k(core: &EngineCore, table: &str, query: &[f32]) -> Vec<(String, u64, u32)> {
-    core.search(&ctx("tenant-a"), table, query, 5)
-        .expect("rust api search")
-        .into_iter()
-        .map(|h| (h.tenant_id, h.id, h.score.to_bits()))
-        .collect()
-}
-
-/// opt-in ありで `table_a` にだけ HNSW 宣言を追加・削除しても、宣言のない
-/// `table_b` の検索経路（HNSW）と Top-k 結果（SQL 表層・Rust API とも）が
-/// 一切変わらないことを固定する（Issue #1065 の「クエリ結果が宣言の有無で
-/// 変わらない」受け入れ条件。旧カタログ全体単位ゲートでは `table_a` への
-/// 宣言で `table_b` が近似〔HNSW〕から厳密〔brute-force〕へ切り替わり Top-k が
-/// 変わり得た回帰の防止。`docs/design/index-declaration-effects.md`
-/// 「HNSW（テーブル単位）」）。宣言した `table_a` 自身も宣言前と同じく HNSW
-/// 経路のまま（HNSW 宣言は経路選択を変えない）。
-#[test]
-fn hnsw_declaration_on_one_table_does_not_change_other_table_results_or_path() {
-    let path = unique_db_path("index-decl-hnsw-per-table");
-    let _guard = CleanupGuard(path.clone());
+/// HNSW opt-in の `EngineCore` を `scope` で構築し、同じスキーマの `table_a`・
+/// `table_b`（いずれも `HNSW_ROWS` 行・宣言なし）を用意する。
+fn two_table_hnsw_core(
+    label: &str,
+    scope: HnswScope,
+) -> (EngineCore, CleanupGuard, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage
         .create_table(&schema_with_vector("table_a"))
@@ -344,46 +336,112 @@ fn hnsw_declaration_on_one_table_does_not_change_other_table_results_or_path() {
     let vectors_b = gen_vectors(4, DIM as usize, HNSW_ROWS);
     seed_rows(&storage, "table_a", "tenant-a", &vectors_a, "base");
     seed_rows(&storage, "table_b", "tenant-a", &vectors_b, "base");
-
     let kind =
         search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
-    let core = EngineCore::from_storage_with_engine(storage, kind);
-    let mut session = allowed_session();
+    let core = EngineCore::from_storage_with_engine(storage, kind).with_hnsw_scope(scope);
+    assert_eq!(core.hnsw_scope(), scope);
+    (core, guard, vectors_a, vectors_b)
+}
 
-    let q_a = format!(
-        "SELECT id FROM table_a ORDER BY embedding <=> '{}' LIMIT 5",
-        vec_literal(&vectors_a[0])
+/// `table` への DISTANCE 検索 1 回分の観測結果。
+#[derive(Debug, PartialEq)]
+struct Observed {
+    /// SQL 表層（`execute_sql`）の結果。
+    sql: engine::sql::exec::QueryResult,
+    /// Rust API（`VectorCore::search`）の Top-k（`(tenant, id, score bits)`）。
+    api: Vec<(String, u64, u32)>,
+    /// `EXPLAIN` の `ann_plan:` 行。
+    ann_plan: String,
+}
+
+/// `table` を SQL 表層・Rust API・`EXPLAIN` の 3 経路で 1 回ずつ問い合わせ、
+/// SQL 表層・Rust API がそれぞれ HNSW 経路を使った（`expect_hnsw == true`）／
+/// 使わなかった（`false`。`HnswIndexCache` へ一切照会しない）ことを確認して
+/// 観測結果を返す。
+fn observe(core: &EngineCore, table: &str, q: &[f32], expect_hnsw: bool, label: &str) -> Observed {
+    let sql_text = format!(
+        "SELECT id FROM {table} ORDER BY embedding <=> '{}' LIMIT 5",
+        vec_literal(q)
     );
-    let q_b = format!(
-        "SELECT id FROM table_b ORDER BY embedding <=> '{}' LIMIT 5",
-        vec_literal(&vectors_b[0])
-    );
-    // `table_b` を 1 回問い合わせ、SQL 表層の結果・Rust API の結果とともに
-    // HNSW 経路を通ったこと（`hnsw_path_count` の増加）を確認して返す。
-    let observe_b = |label: &str| {
-        let before = hnsw_path_count(&core);
-        let sql = core
-            .execute_sql(&ctx("tenant-a"), &q_b)
-            .unwrap_or_else(|e| panic!("sql distance query on table_b ({label}): {e:?}"));
-        let after_sql = hnsw_path_count(&core);
-        assert!(
-            after_sql > before,
-            "table_b (sql, {label}) must use the hnsw path: {:?}",
-            core.hnsw_index_cache_stats()
-        );
-        let api = rust_api_top_k(&core, "table_b", &vectors_b[0]);
-        assert!(
-            hnsw_path_count(&core) > after_sql,
-            "table_b (rust api, {label}) must use the hnsw path: {:?}",
-            core.hnsw_index_cache_stats()
-        );
-        (sql, api)
+    let check = |before_consulted: u64, surface: &str| {
+        let stats = core.hnsw_index_cache_stats();
+        if expect_hnsw {
+            assert!(
+                hnsw_consulted_count(core) > before_consulted,
+                "{label}: {table} ({surface}) must use the hnsw path: {stats:?}"
+            );
+        } else {
+            assert_eq!(
+                hnsw_consulted_count(core),
+                before_consulted,
+                "{label}: {table} ({surface}) must use exact brute-force: {stats:?}"
+            );
+        }
     };
 
-    // 宣言前（カタログに宣言 0 件）: `table_b` は HNSW（宣言導入前の自動挙動）。
-    let (sql_before, api_before) = observe_b("before declaration");
-    assert_eq!(sql_before.rows.len(), 5);
-    assert_eq!(api_before.len(), 5);
+    let c = hnsw_consulted_count(core);
+    let sql = core
+        .execute_sql(&ctx("tenant-a"), &sql_text)
+        .unwrap_or_else(|e| panic!("{label}: sql distance query on {table}: {e:?}"));
+    check(c, "sql");
+
+    let c = hnsw_consulted_count(core);
+    let api: Vec<(String, u64, u32)> = core
+        .search(&ctx("tenant-a"), table, q, 5)
+        .unwrap_or_else(|e| panic!("{label}: rust api search on {table}: {e:?}"))
+        .into_iter()
+        .map(|h| (h.tenant_id, h.id, h.score.to_bits()))
+        .collect();
+    check(c, "rust api");
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            &format!("EXPLAIN {sql_text}"),
+        )
+        .unwrap_or_else(|e| panic!("{label}: explain on {table}: {e:?}"));
+    let ann_plan = match outcome {
+        SqlOutcome::Explain(result) => result
+            .rows
+            .iter()
+            .find_map(|row| match row.cells.first() {
+                Some(Cell::Text(s)) if s.starts_with("ann_plan: ") => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{label}: explain must report an ann_plan: line")),
+        other => panic!("{label}: expected SqlOutcome::Explain, got {other:?}"),
+    };
+    let expected_plan = if expect_hnsw {
+        "ann_plan: hnsw_full_visible"
+    } else {
+        "ann_plan: plain_scan_engine"
+    };
+    assert_eq!(ann_plan, expected_plan, "{label}: explain for {table}");
+
+    assert_eq!(sql.rows.len(), 5);
+    assert_eq!(api.len(), 5);
+    Observed { sql, api, ann_plan }
+}
+
+/// `--hnsw-scope all`（既定。`HnswScope::All`）: opt-in 時は全テーブル HNSW で、
+/// `table_a` に HNSW 宣言を追加・削除しても、宣言のない `table_b` の検索経路
+/// （HNSW）と Top-k 結果（SQL 表層・Rust API・`EXPLAIN` の `ann_plan:`）が一切
+/// 変わらないことを固定する（Issue #1065 の「クエリ結果が宣言の有無で変わら
+/// ない」受け入れ条件。旧カタログ全体単位ゲートでは `table_a` への宣言で
+/// `table_b` が近似〔HNSW〕から厳密〔brute-force〕へ切り替わり Top-k が変わり
+/// 得た回帰の防止）。宣言した `table_a` 自身も宣言前と同じく HNSW のまま。
+#[test]
+fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path() {
+    let (core, _guard, vectors_a, vectors_b) =
+        two_table_hnsw_core("index-decl-hnsw-scope-all", HnswScope::All);
+    // `with_hnsw_scope` を呼ばない構築の既定値も `All`。
+    assert_eq!(HnswScope::default(), HnswScope::All);
+    let mut session = allowed_session();
+
+    let a_before = observe(&core, "table_a", &vectors_a[0], true, "before");
+    let b_before = observe(&core, "table_b", &vectors_b[0], true, "before");
 
     core.execute_sql_in_session(
         &ctx("tenant-a"),
@@ -391,32 +449,109 @@ fn hnsw_declaration_on_one_table_does_not_change_other_table_results_or_path() {
         "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
     )
     .expect("declare hnsw index on table_a only");
-
-    // 宣言した `table_a` 自身も HNSW 経路。
-    let before_a = hnsw_path_count(&core);
-    core.execute_sql(&ctx("tenant-a"), &q_a)
-        .expect("distance query on declared table");
-    assert!(
-        hnsw_path_count(&core) > before_a,
-        "declared table must use the hnsw path: {:?}",
-        core.hnsw_index_cache_stats()
-    );
-
-    // `table_a` への宣言後も `table_b` の経路・結果は宣言前と同一。
-    let (sql_after, api_after) = observe_b("after declaration on table_a");
+    let a_declared = observe(&core, "table_a", &vectors_a[0], true, "declared");
+    let b_declared = observe(&core, "table_b", &vectors_b[0], true, "declared");
     assert_eq!(
-        sql_after, sql_before,
-        "declaring an index on table_a must not change table_b sql results"
+        a_declared, a_before,
+        "scope all: table_a results must not change"
     );
     assert_eq!(
-        api_after, api_before,
-        "declaring an index on table_a must not change table_b rust api results"
+        b_declared, b_before,
+        "scope all: a declaration on table_a must not change table_b results"
     );
 
-    // `DROP INDEX` 後も同一。
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
         .expect("drop hnsw declaration");
-    let (sql_dropped, api_dropped) = observe_b("after dropping the declaration");
-    assert_eq!(sql_dropped, sql_before);
-    assert_eq!(api_dropped, api_before);
+    assert_eq!(
+        observe(&core, "table_a", &vectors_a[0], true, "dropped"),
+        a_before
+    );
+    assert_eq!(
+        observe(&core, "table_b", &vectors_b[0], true, "dropped"),
+        b_before
+    );
+}
+
+/// `--hnsw-scope declared`（`HnswScope::Declared`）: `CREATE INDEX ... USING
+/// hnsw` を宣言した `table_a` だけが HNSW 経路（SQL 表層・Rust API・`EXPLAIN`
+/// の `ann_plan:` とも）を使い、未宣言の `table_b` は宣言の前後を通じて厳密
+/// （brute-force）のまま経路・結果が一切変わらないこと、`DROP INDEX` で
+/// `table_a` が厳密へ戻り宣言前と同一の結果を返すことを固定する（Issue #1065・
+/// オーナー判断 2026-09-28。判定はテーブル単位）。
+#[test]
+fn scope_declared_uses_hnsw_only_on_declared_table_and_drop_returns_to_exact() {
+    let (core, _guard, vectors_a, vectors_b) =
+        two_table_hnsw_core("index-decl-hnsw-scope-declared", HnswScope::Declared);
+    let mut session = allowed_session();
+
+    // 宣言前: どのテーブルも厳密。
+    let a_before = observe(&core, "table_a", &vectors_a[0], false, "before");
+    let b_before = observe(&core, "table_b", &vectors_b[0], false, "before");
+
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
+    )
+    .expect("declare hnsw index on table_a only");
+    // 宣言した `table_a` だけ HNSW（宣言テーブル自身の経路は変わる）。
+    observe(&core, "table_a", &vectors_a[0], true, "declared");
+    // 未宣言の `table_b` は厳密のままで、結果も宣言前と同一。
+    assert_eq!(
+        observe(&core, "table_b", &vectors_b[0], false, "declared"),
+        b_before,
+        "scope declared: a declaration on table_a must not change table_b"
+    );
+
+    // `DROP INDEX` で `table_a` は厳密へ戻り、宣言前と同一の結果を返す。
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec_a")
+        .expect("drop hnsw declaration");
+    assert_eq!(
+        observe(&core, "table_a", &vectors_a[0], false, "dropped"),
+        a_before,
+        "scope declared: drop index must return table_a to exact search"
+    );
+    assert_eq!(
+        observe(&core, "table_b", &vectors_b[0], false, "dropped"),
+        b_before
+    );
+}
+
+/// HNSW opt-in なし（既定エンジン）では `--hnsw-scope` は無関係で、
+/// `HnswScope::Declared` を設定して `USING hnsw` を宣言しても全テーブル厳密の
+/// まま（`HnswIndexCache` を一切使わない）ことを固定する。
+#[test]
+fn hnsw_scope_has_no_effect_without_hnsw_opt_in() {
+    let path = unique_db_path("index-decl-hnsw-scope-no-optin");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector("table_a"))
+        .expect("create table_a");
+    let vectors_a = gen_vectors(5, DIM as usize, HNSW_ROWS);
+    seed_rows(&storage, "table_a", "tenant-a", &vectors_a, "base");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_hnsw_scope(HnswScope::Declared);
+    let mut session = allowed_session();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_vec_a ON table_a USING hnsw (embedding)",
+    )
+    .expect("declare hnsw index");
+    core.execute_sql(
+        &ctx("tenant-a"),
+        &format!(
+            "SELECT id FROM table_a ORDER BY embedding <=> '{}' LIMIT 5",
+            vec_literal(&vectors_a[0])
+        ),
+    )
+    .expect("distance query");
+    core.search(&ctx("tenant-a"), "table_a", &vectors_a[0], 5)
+        .expect("rust api search");
+    assert_eq!(
+        hnsw_consulted_count(&core),
+        0,
+        "without hnsw opt-in the scope must not enable hnsw"
+    );
 }

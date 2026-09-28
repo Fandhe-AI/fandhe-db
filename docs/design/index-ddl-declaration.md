@@ -120,9 +120,11 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
   全テナント共有の DDL であり、RLS の暗黙適用を一切変更しない。
 - 宣言の作成前後・削除後でテナントごとの検索・述語付き取得・集計の結果が完全に
   一致することを `crates/engine/tests/sql_index_ddl.rs` で固定している。
-  `--search-engine hnsw*` opt-in 下でも、HNSW 適格性ゲートはテーブル単位で宣言の
-  有無により検索経路を切り替えないため、HNSW 宣言の追加・削除は宣言したテーブル・
-  他テーブルのいずれの Top-k も変えない（`crates/engine/tests/index_declaration_targets.rs`・
+  `--search-engine hnsw*` opt-in 下でも、HNSW 適格性ゲートはテーブル単位のため
+  HNSW 宣言の追加・削除は他テーブルの Top-k を変えない。既定の `--hnsw-scope all`
+  では宣言したテーブル自身の Top-k も変えず、`--hnsw-scope declared` では宣言した
+  テーブル自身の探索方式だけが近似／厳密の間で切り替わる
+  （`crates/engine/tests/index_declaration_targets.rs`・
   [index-declaration-effects.md](index-declaration-effects.md) を参照）。
 
 **索引宣言の構築対象への反映**（本ドキュメント初版で「対象外」としていた事項）は
@@ -134,11 +136,13 @@ Issue #1065 で実装済み。詳細・設計判断は
 1. **`EXPLAIN` への索引名露出**: `scalar_plan:`／`ann_plan:` 行への索引名（宣言名）
    そのものの追記は対象外のまま（引き続き未実装）。`ann_plan:` の**判定結果**
    （HNSW／brute-force のいずれで実行されるか）は Issue #1065 で実行時判定と同じ
-   `catalog::hnsw_targeted_in_txn` を経由するが、このゲートはテーブル単位で宣言の
-   有無により結果を変えない（索引カタログの読み取り失敗時のみ brute-force 表示へ
-   倒す）ため、HNSW 宣言（`CREATE INDEX ... USING hnsw`）の作成・削除で `ann_plan:`
-   表示は変わらない。`scalar_plan:` は束縛時の静的判定のまま宣言の影響を受けない
-   （[index-declaration-effects.md](index-declaration-effects.md) 参照）。
+   `catalog::hnsw_targeted_in_txn` を経由する。このゲートはテーブル単位のため、
+   HNSW 宣言（`CREATE INDEX ... USING hnsw`）の作成・削除が他テーブルの `ann_plan:`
+   表示を変えることはなく、既定の `--hnsw-scope all` では宣言したテーブル自身の
+   表示も変わらない（`--hnsw-scope declared` では宣言したテーブル自身の表示だけが
+   `hnsw_*`／`plain_scan_engine` の間で切り替わる。索引カタログの読み取り失敗時は
+   brute-force 表示へ倒す）。`scalar_plan:` は束縛時の静的判定のまま宣言の影響を
+   受けない（[index-declaration-effects.md](index-declaration-effects.md) 参照）。
 2. **疎索引（BM25）の宣言**: Issue #908 本文は「ベクトル・スカラー・疎」の 3 種別を
    挙げるが、本実装は INDEX-7 のポインタに従いスカラー宣言と `USING hnsw` のみを
    受理し、`USING bm25` 等は `0A000` とする（疎索引は hybrid のたびに自動構築する

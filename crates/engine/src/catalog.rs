@@ -332,9 +332,9 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
 /// 呼び出し元（`sql::scalar_index::resolve_scalar_index_target_in_txn`）は
 /// ここから `ScalarIndex::build` の構築対象列を導出する。宣言は起動時 opt-in
 /// （`SearchEngineKind::Hnsw`）が有効な場合にのみ構築対象へ効く
-/// （`docs/design/index-declaration-effects.md`）。HNSW 宣言は経路選択に
-/// 影響しない（テーブル単位ゲート。[`hnsw_targeted_in_txn`] 参照）ため、
-/// ここには HNSW 宣言の有無を持たない。
+/// （`docs/design/index-declaration-effects.md`）。HNSW 宣言の判定は
+/// [`hnsw_targeted_in_txn`]（[`IndexCatalogGateCache`] 経由でカタログ全体の
+/// 要約を世代単位に再利用する）が担うため、ここには HNSW 宣言の有無を持たない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeclaredIndexTargets {
     /// 対象テーブルのスカラー宣言列（複数宣言の和集合・重複排除）。宣言が
@@ -388,17 +388,28 @@ pub(crate) fn declared_index_targets_in_txn(
     })
 }
 
-/// 索引カタログ全件が読み取り可能か（走査上限内かつ全エントリがデコード可能か）
-/// を検証する（[`hnsw_targeted_in_txn`] の fail-closed 判定本体。Issue #1065）。
-/// カタログ未作成（宣言 0 件）は `Ok`。走査件数が [`MAX_INDEX_COUNT`] を
-/// 超える・デコードに失敗する場合は `Err`（呼び出し元が brute-force へ倒す）。
-/// 宣言の内容（どのテーブルに何が宣言されているか）は判定に使わない。
-fn verify_index_catalog_readable_in_txn(read_txn: &redb::ReadTransaction) -> Result<()> {
+/// [`hnsw_targeted_in_txn`] が索引カタログ全件走査から要約する内容（Issue #1065・
+/// PR #1124）。`IndexKind::Hnsw` 宣言を持つテーブル名の集合だけを保持する
+/// （[`IndexCatalogGateCache`] が 1 世代あたり 1 回の走査で全テーブルの問い合わせを
+/// 賄えるようにするため）。`HnswScope::All` では集合の中身を使わず、走査が成功した
+/// こと（カタログが読み取り可能であること）だけを使う。
+#[derive(Debug, Default)]
+struct HnswCatalogSummary {
+    /// `IndexKind::Hnsw` 宣言を持つテーブル名の集合。
+    hnsw_tables: std::collections::HashSet<String>,
+}
+
+/// [`HnswCatalogSummary`] を索引カタログ全件走査で構築する（[`hnsw_targeted_in_txn`]
+/// の判定本体）。カタログ未作成（宣言 0 件）は空の `Ok`。走査件数が
+/// [`MAX_INDEX_COUNT`] を超える・デコードに失敗する場合は `Err`（呼び出し元が
+/// brute-force へ fail-closed に倒す）。
+fn hnsw_catalog_summary_in_txn(read_txn: &redb::ReadTransaction) -> Result<HnswCatalogSummary> {
     let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
         Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HnswCatalogSummary::default()),
         Err(e) => return Err(e.into()),
     };
+    let mut summary = HnswCatalogSummary::default();
     for (scanned, entry) in index_table.iter()?.enumerate() {
         if scanned >= MAX_INDEX_COUNT {
             return Err(CatalogError::CorruptSchema(format!(
@@ -406,13 +417,16 @@ fn verify_index_catalog_readable_in_txn(read_txn: &redb::ReadTransaction) -> Res
             )));
         }
         let (key, value) = entry?;
-        decode_index_def(key.value(), value.value())?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if matches!(def.kind, IndexKind::Hnsw) {
+            summary.hnsw_tables.insert(def.table);
+        }
     }
-    Ok(())
+    Ok(summary)
 }
 
-/// [`hnsw_targeted_in_txn`] のカタログ全件検証（[`verify_index_catalog_readable_in_txn`]）
-/// の成功をストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
+/// [`hnsw_targeted_in_txn`] の索引カタログ全件走査結果（[`HnswCatalogSummary`]）を
+/// ストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
 /// 単位で再利用するキャッシュ（codex-review P2 対応・Issue #1065 PR #1124）。
 /// 宣言が [`MAX_INDEX_COUNT`]（最大 10,000 件）に達する構成では、キャッシュ
 /// 無しだと検索・`EXPLAIN` のたびに宣言数に比例するデコードが検索ホットパスへ
@@ -422,24 +436,19 @@ fn verify_index_catalog_readable_in_txn(read_txn: &redb::ReadTransaction) -> Res
 /// `drop_table`・`alter_table_drop_column`）はいずれも
 /// `crate::recovery::commit_boundary::commit` を経由し、commit 前に必ず
 /// `crate::storage::prepare_generation_bump`（ストレージ全体の単一世代
-/// カウンタ）を通る。索引カタログはテーブル横断の単一 redb テーブルであり、
-/// 読み取り可否（上限超過・破損）はどのテーブルへの索引 DDL の commit でも
-/// 変わり得るため、対象テーブルの世代（`bump_table_generation_in_txn`）では
+/// カウンタ）を通る。索引カタログはテーブル横断の単一 redb テーブルで、要約
+/// （HNSW 宣言テーブル集合・読み取り可否）はどのテーブルへの索引 DDL の commit
+/// でも変わり得るため、対象テーブルの世代（`bump_table_generation_in_txn`）では
 /// なく全 commit で進むストレージ全体世代をキーにする（取りこぼさない）。
 /// 通常の行 DML でも過剰に無効化されるが、キャッシュ不一致時のコストは
 /// キャッシュ導入前と同じフルスキャン 1 回に留まる（悪化しない）。
-///
-/// 保持するのは「その世代でカタログ全件が読み取り可能だった」という事実
-/// （世代番号）だけで、宣言の内容は保持しない（HNSW ゲートはテーブル単位で
-/// 宣言内容に依存しない。[`hnsw_targeted_in_txn`] 参照）。
 ///
 /// `EngineCore` が唯一のインスタンスを保持し、`core.rs`（Rust API 検索・
 /// `EXPLAIN`）・`sql::exec`（SQL 検索、`sql::hnsw_cache::HnswCacheAccess`
 /// 経由）の全呼び出し元が共有する。
 pub(crate) struct IndexCatalogGateCache {
-    /// 全件検証に成功した最新のストレージ世代。
-    verified_generation: std::sync::Mutex<Option<u64>>,
-    /// [`hnsw_targeted_in_txn`] がカタログ全件検証（世代取得・走査上限超過・
+    state: std::sync::Mutex<Option<(u64, std::sync::Arc<HnswCatalogSummary>)>>,
+    /// [`hnsw_targeted_in_txn`] が索引カタログ全件走査（世代取得・走査上限超過・
     /// デコード失敗のいずれか）に失敗し `false`（brute-force へ fail-closed 縮退）
     /// を返した回数（codex-review Low 指摘対応・Issue #1065）。挙動自体は
     /// 常に安全側（厳密結果）だが、カタログ破損等の異常が運用上観測できるよう
@@ -450,7 +459,7 @@ pub(crate) struct IndexCatalogGateCache {
 impl IndexCatalogGateCache {
     pub(crate) fn new() -> Self {
         Self {
-            verified_generation: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(None),
             gate_read_failures: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -477,74 +486,77 @@ pub struct IndexCatalogGateCacheStats {
     pub gate_read_failures: u64,
 }
 
-/// [`IndexCatalogGateCache`] を経由して索引カタログ全件の読み取り可否を検証する。
+/// [`IndexCatalogGateCache`] を経由して [`HnswCatalogSummary`] を取得する。
 /// 世代の読み取りと本体の走査を同一の `read_txn`（クエリが使っているのと
 /// 同一スナップショット）から行う（キーと内容が別スナップショット由来になる
 /// TOCTOU を避ける）。`Err`（世代取得・カタログ走査いずれかの失敗）はキャッシュ
 /// へ書き込まず呼び出し元へそのまま返す（fail-closed の縮退を汚さない）。
 /// ロック毒化はキャッシュミス相当として扱う（`unwrap` しない）。新しい世代の
 /// 結果だけを保存し、遅延したミスがより新しいエントリを上書きしないようにする。
-fn cached_verify_index_catalog_readable_in_txn(
+fn cached_hnsw_catalog_summary_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
-) -> Result<()> {
+) -> Result<std::sync::Arc<HnswCatalogSummary>> {
     let generation =
         crate::storage::current_generation_in_txn(read_txn).map_err(convert_storage_error)?;
-    if let Ok(guard) = gate_cache.verified_generation.lock() {
-        if *guard == Some(generation) {
-            return Ok(());
+    if let Ok(guard) = gate_cache.state.lock() {
+        if let Some((cached_generation, summary)) = guard.as_ref() {
+            if *cached_generation == generation {
+                return Ok(summary.clone());
+            }
         }
     }
-    verify_index_catalog_readable_in_txn(read_txn)?;
-    if let Ok(mut guard) = gate_cache.verified_generation.lock() {
-        let should_store = match *guard {
-            Some(cached_generation) => generation > cached_generation,
+    let summary = std::sync::Arc::new(hnsw_catalog_summary_in_txn(read_txn)?);
+    if let Ok(mut guard) = gate_cache.state.lock() {
+        let should_store = match guard.as_ref() {
+            Some((cached_generation, _)) => generation > *cached_generation,
             None => true,
         };
         if should_store {
-            *guard = Some(generation);
+            *guard = Some((generation, summary.clone()));
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 /// HNSW opt-in（`SearchEngineKind::Hnsw`。呼び出し元が `hnsw_available` で
-/// 渡す）がクエリ対象テーブルで実際に有効かを判定する（Issue #1065・TASK-206・
-/// INDEX-7・`docs/design/index-declaration-effects.md`「HNSW（テーブル単位）」）。
-///
-/// ゲートはテーブル単位: 対象テーブルの経路は他テーブルの宣言に影響されない
-/// （クエリ結果が宣言の有無で
-/// 変わらないという Issue #1065 の受け入れ条件。旧実装のカタログ全体単位
-/// ゲートは、別テーブルへの HNSW 宣言で未宣言テーブルを近似〔HNSW〕から
-/// 厳密〔brute-force〕へ切り替え Top-k を変え得たため廃止した）。テーブルは
-/// VECTOR 列を高々 1 本しか持てないため、opt-in 有効時は「宣言あり → HNSW」
-/// 「宣言なし → 宣言導入前と同じ自動挙動（HNSW）」となり、HNSW 宣言は経路
-/// 選択を変えない（近似/厳密の切り替えは Top-k を変え得るため、結果不変の
-/// 受け入れ条件の下では宣言に経路を切り替えさせない）。よって宣言内容は
-/// 判定に使わず、引数にもテーブル名を取らない:
+/// 渡す）がクエリ対象テーブル `table` で実際に有効かを判定する（Issue #1065・
+/// TASK-206・INDEX-7・`docs/design/index-declaration-effects.md`「HNSW
+/// （テーブル単位）」）。判定はテーブル単位で、`table` 以外のテーブルの
+/// `USING hnsw` 宣言は結果に影響しない（他テーブルへの宣言で経路・Top-k が
+/// 変わらない）:
 ///
 /// - `hnsw_available == false`: 常に `false`（カタログに触れない）
-/// - 索引カタログ全件が読み取り可能: `true`
+/// - `scope == HnswScope::All`（既定）: 索引カタログを読み取れれば `true`
+///   （宣言の有無によらず全テーブル HNSW。宣言は記録のみで経路を変えない）
+/// - `scope == HnswScope::Declared`: `table` に `USING hnsw` 宣言があれば
+///   `true`、無ければ `false`（厳密 brute-force）
 /// - カタログ読み取り失敗（走査上限超過・デコード破損・世代取得失敗）:
-///   `false`（fail-closed。スカラー側の `resolve_scalar_index_target_in_txn`
-///   と同じく、宣言状態を確定できない場合は索引を使わない側＝厳密
-///   brute-force へ倒す）。失敗回数は [`IndexCatalogGateCacheStats`] に計上する。
+///   いずれの `scope` でも `false`（fail-closed。宣言状態を確定できない場合は
+///   索引を使わない側＝厳密 brute-force へ倒す。スカラー側の
+///   `resolve_scalar_index_target_in_txn` と同方針）。失敗回数は
+///   [`IndexCatalogGateCacheStats`] に計上する。
 ///
 /// `sql::exec`（`AnnShapeInput.hnsw_enabled`）・`core.rs`（Rust API
 /// `search_with_snapshot`・`EXPLAIN` の `ann_plan:` 行）が同一のこの関数を
-/// 呼ぶことで、実行時判定と `EXPLAIN` 表示の乖離を作らない。検証結果は
+/// 呼ぶことで、実行時判定と `EXPLAIN` 表示の乖離を作らない。走査結果は
 /// `gate_cache`（[`IndexCatalogGateCache`]）を経由してストレージ世代単位で
 /// 再利用する（codex-review P2 対応・PR #1124）。
 pub(crate) fn hnsw_targeted_in_txn(
     read_txn: &redb::ReadTransaction,
     gate_cache: &IndexCatalogGateCache,
+    table: &str,
+    scope: crate::search_engine::HnswScope,
     hnsw_available: bool,
 ) -> bool {
     if !hnsw_available {
         return false;
     }
-    match cached_verify_index_catalog_readable_in_txn(read_txn, gate_cache) {
-        Ok(()) => true,
+    match cached_hnsw_catalog_summary_in_txn(read_txn, gate_cache) {
+        Ok(summary) => match scope {
+            crate::search_engine::HnswScope::All => true,
+            crate::search_engine::HnswScope::Declared => summary.hnsw_tables.contains(table),
+        },
         Err(_) => {
             gate_cache
                 .gate_read_failures
@@ -6868,107 +6880,203 @@ mod tests {
         write_txn.commit().expect("commit corrupt entry");
     }
 
-    /// HNSW 適格性ゲート（`hnsw_targeted_in_txn`）がテーブル単位であり、
-    /// 他テーブルへの `USING hnsw` 宣言の追加・削除で結果が変わらないことを
+    use crate::search_engine::HnswScope;
+
+    /// `storage` の最新スナップショットで `hnsw_targeted_in_txn` を 1 回評価する
+    /// テスト補助（HNSW opt-in 有効〔`hnsw_available == true`〕前提）。
+    fn targeted_now(
+        storage: &Storage,
+        gate_cache: &IndexCatalogGateCache,
+        table: &str,
+        scope: HnswScope,
+    ) -> bool {
+        let read_txn = storage.db().begin_read().expect("begin read");
+        hnsw_targeted_in_txn(&read_txn, gate_cache, table, scope, true)
+    }
+
+    /// `HnswScope::All`（既定）の HNSW 適格性ゲートが、`USING hnsw` 宣言の追加・
+    /// 削除で判定を変えない（宣言テーブル・他テーブルとも常に `true`）ことを
     /// 固定する（Issue #1065 の結果不変の受け入れ条件。旧カタログ全体単位
-    /// ゲートでは `docs` への宣言で未宣言の `sibling` が `false`〔brute-force〕
-    /// へ切り替わっていた回帰の防止）。同一の [`IndexCatalogGateCache`] を
-    /// 複数世代で使い回しても、各世代で新たに検証した結果と一致することも
-    /// 併せて固定する（codex-review P2 対応のキャッシュ導入後の回帰確認）。
+    /// ゲートでは `docs` への宣言で未宣言の `sibling` が `false` へ切り替わって
+    /// いた回帰の防止）。同一の [`IndexCatalogGateCache`] を複数世代で使い回しても、
+    /// 新しいキャッシュで評価した結果と一致することも併せて固定する。
     #[test]
-    fn hnsw_targeted_in_txn_is_unaffected_by_other_table_declarations() {
-        let (storage, _guard) = index_fixture_storage("index-gate-cache-basic");
+    fn hnsw_targeted_in_txn_scope_all_is_unaffected_by_declarations() {
+        let (storage, _guard) = index_fixture_storage("index-gate-scope-all");
         let gate_cache = IndexCatalogGateCache::new();
-        let targeted = || -> bool {
-            let read_txn = storage.db().begin_read().expect("begin read");
-            hnsw_targeted_in_txn(&read_txn, &gate_cache, true)
-        };
-        let uncached = || -> bool {
-            let read_txn = storage.db().begin_read().expect("begin read");
-            hnsw_targeted_in_txn(&read_txn, &IndexCatalogGateCache::new(), true)
+        let check_all_true = |label: &str| {
+            for table in ["docs", "sibling"] {
+                assert!(
+                    targeted_now(&storage, &gate_cache, table, HnswScope::All),
+                    "{label}: {table} must stay on hnsw under scope all"
+                );
+                assert!(
+                    targeted_now(
+                        &storage,
+                        &IndexCatalogGateCache::new(),
+                        table,
+                        HnswScope::All
+                    ),
+                    "{label}: uncached result must match for {table}"
+                );
+            }
         };
 
-        // 宣言 0 件（カタログテーブル未作成）: HNSW 可（宣言導入前の挙動）。
-        assert!(targeted());
-        assert!(uncached());
-
-        // `docs` に HNSW 宣言を追加しても判定は変わらない（`sibling` を含む
-        // どのテーブルも宣言導入前と同じく HNSW 可のまま）。
+        check_all_true("no declarations");
         storage
             .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
             .expect("create hnsw index");
-        assert!(targeted());
-        assert!(uncached());
-
-        // `DROP INDEX` で宣言を消しても同じ。
+        check_all_true("after declaring docs");
         storage.drop_index("idx_hnsw_docs").expect("drop index");
-        assert!(targeted());
-        assert!(uncached());
+        check_all_true("after dropping the declaration");
 
-        // opt-in 無効ならカタログの状態によらず常に `false`。
+        // opt-in 無効ならカタログの状態・scope によらず常に `false`。
         let read_txn = storage.db().begin_read().expect("begin read");
-        assert!(!hnsw_targeted_in_txn(&read_txn, &gate_cache, false));
+        for scope in [HnswScope::All, HnswScope::Declared] {
+            assert!(!hnsw_targeted_in_txn(
+                &read_txn,
+                &gate_cache,
+                "docs",
+                scope,
+                false
+            ));
+        }
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+    }
+
+    /// `HnswScope::Declared` の HNSW 適格性ゲートが、`USING hnsw` を宣言した
+    /// テーブルだけ `true` にし、未宣言テーブルは `false`（厳密）のまま、
+    /// `DROP INDEX` で `false` へ戻ることを固定する（Issue #1065・オーナー判断
+    /// 2026-09-28）。`docs` への宣言が `sibling` の判定を変えないこと（テーブル
+    /// 単位）と、同一キャッシュを世代を跨いで使い回しても新しい世代の宣言を
+    /// 取りこぼさないことも併せて固定する。
+    #[test]
+    fn hnsw_targeted_in_txn_scope_declared_follows_only_own_table_declaration() {
+        let (storage, _guard) = index_fixture_storage("index-gate-scope-declared");
+        let gate_cache = IndexCatalogGateCache::new();
+        let t = |table: &str| targeted_now(&storage, &gate_cache, table, HnswScope::Declared);
+
+        assert!(!t("docs"));
+        assert!(!t("sibling"));
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        assert!(
+            t("docs"),
+            "declared table must use hnsw under scope declared"
+        );
+        assert!(
+            !t("sibling"),
+            "a declaration on docs must not affect sibling"
+        );
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_sibling", "sibling"))
+            .expect("create hnsw index on sibling");
+        assert!(t("docs"));
+        assert!(t("sibling"));
+
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        assert!(!t("docs"), "drop index must return docs to exact search");
+        assert!(
+            t("sibling"),
+            "dropping docs' declaration must not affect sibling"
+        );
         assert_eq!(gate_cache.stats().gate_read_failures, 0);
     }
 
     /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗（デコード失敗）で
-    /// fail-closed 縮退（`false`）し、その回数を [`IndexCatalogGateCache::stats`] の
-    /// `gate_read_failures` に計上することを固定する（codex-review Low 指摘対応・
-    /// Issue #1065）。テーブル単位化後も「宣言状態を確定できない場合は索引を
-    /// 使わない側へ倒す」fail-closed は維持する。
+    /// いずれの `scope` でも fail-closed 縮退（`false`）し、その回数を
+    /// [`IndexCatalogGateCache::stats`] の `gate_read_failures` に計上することを
+    /// 固定する（codex-review Low 指摘対応・Issue #1065）。
     #[test]
     fn hnsw_targeted_in_txn_records_gate_read_failure_on_corrupt_catalog_entry() {
         let (storage, _guard) = index_fixture_storage("index-gate-cache-read-failure");
         let gate_cache = IndexCatalogGateCache::new();
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
 
-        // 破損前に一度検証成功をキャッシュさせ、破損後の世代でキャッシュが
-        // 誤って再利用されない（新しい世代で再検証して失敗する）ことも確認する。
-        {
-            let read_txn = storage.db().begin_read().expect("begin read (pre)");
-            assert!(hnsw_targeted_in_txn(&read_txn, &gate_cache, true));
-        }
+        // 破損前に一度成功をキャッシュさせ、破損後の世代でキャッシュが誤って
+        // 再利用されない（新しい世代で再走査して失敗する）ことも確認する。
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
         insert_corrupt_index_entry(&storage);
 
         assert_eq!(gate_cache.stats().gate_read_failures, 0);
-        let read_txn = storage.db().begin_read().expect("begin read");
-        assert!(!hnsw_targeted_in_txn(&read_txn, &gate_cache, true));
+        assert!(!targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
         assert_eq!(gate_cache.stats().gate_read_failures, 1);
 
         // 縮退は fail-closed のたびに計上される（キャッシュへは書き込まれないため
-        // 毎回走査を再試行し、そのたびに失敗が増える）。
-        let read_txn2 = storage.db().begin_read().expect("begin read (2)");
-        assert!(!hnsw_targeted_in_txn(&read_txn2, &gate_cache, true));
+        // 毎回走査を再試行し、そのたびに失敗が増える）。`All` でも同様に縮退する。
+        assert!(!targeted_now(
+            &storage,
+            &gate_cache,
+            "sibling",
+            HnswScope::All
+        ));
         assert_eq!(gate_cache.stats().gate_read_failures, 2);
     }
 
     /// クエリが使っているのと同一の `read_txn`（スナップショット）を先に開いてから
-    /// 索引カタログへの書き込みが commit されても、その `read_txn` 経由の判定は
-    /// 書き込み前のスナップショットのまま変わらないこと（TOCTOU 対策・
+    /// 別の書き込み（`CREATE INDEX`）が commit されても、その `read_txn` 経由の
+    /// 判定は書き込み前のスナップショットのまま変わらないこと（TOCTOU 対策・
     /// fail-closed の前提）を固定する。`IndexCatalogGateCache` は世代をキーに
     /// するだけで、`read_txn` 自体のスナップショット隔離は `redb` の MVCC に
     /// 委ねる（本テストはその前提が本キャッシュ導入後も崩れていないことの
-    /// 回帰確認）。テーブル単位ゲートでは宣言の追加で判定が変わらないため、
-    /// 判定が変わる書き込みとして破損エントリの挿入を使う。
+    /// 回帰確認）。判定が変わる書き込みとして `HnswScope::Declared` での
+    /// `docs` への宣言を使う。
     #[test]
     fn hnsw_targeted_in_txn_cache_respects_read_txn_snapshot_taken_before_the_write() {
         let (storage, _guard) = index_fixture_storage("index-gate-cache-snapshot");
         let gate_cache = IndexCatalogGateCache::new();
+        let scope = HnswScope::Declared;
 
-        // クエリ開始時点の read_txn（破損エントリ挿入より前のスナップショット）。
+        // クエリ開始時点の read_txn（`docs` への HNSW 宣言より前のスナップショット）。
         let read_txn_before = storage.db().begin_read().expect("begin read (before)");
 
-        insert_corrupt_index_entry(&storage);
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
 
-        // 新しい read_txn（破損後）では fail-closed に `false` へ倒れる。
+        // 新しい read_txn（宣言後）では `docs` が `true`。
         let read_txn_after = storage.db().begin_read().expect("begin read (after)");
-        assert!(!hnsw_targeted_in_txn(&read_txn_after, &gate_cache, true));
+        assert!(hnsw_targeted_in_txn(
+            &read_txn_after,
+            &gate_cache,
+            "docs",
+            scope,
+            true
+        ));
 
-        // 旧スナップショットからは破損エントリが見えないため、依然 `true`
-        // （より新しい世代の失敗がキャッシュを汚さない）。
-        assert!(hnsw_targeted_in_txn(&read_txn_before, &gate_cache, true));
-        // 旧スナップショットの検証成功（古い世代）が、より新しい世代の
-        // 判定をキャッシュ経由で `true` へ誤って倒さない。
-        assert!(!hnsw_targeted_in_txn(&read_txn_after, &gate_cache, true));
+        // 旧スナップショットからは宣言が見えないため、依然 `false`（より新しい
+        // 世代のキャッシュ済み要約を古いスナップショットへ流用しない）。
+        assert!(!hnsw_targeted_in_txn(
+            &read_txn_before,
+            &gate_cache,
+            "docs",
+            scope,
+            true
+        ));
+        // 古い世代の要約が、より新しい世代の判定をキャッシュ経由で `false` へ
+        // 誤って倒さない。
+        assert!(hnsw_targeted_in_txn(
+            &read_txn_after,
+            &gate_cache,
+            "docs",
+            scope,
+            true
+        ));
     }
 
     #[test]

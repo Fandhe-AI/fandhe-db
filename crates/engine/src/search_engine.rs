@@ -198,6 +198,28 @@ pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
     }
 }
 
+/// HNSW opt-in（[`SearchEngineKind::Hnsw`]）時に HNSW 経路を使うテーブルの
+/// 範囲（Issue #1065・オーナー判断 2026-09-28。`docs/design/
+/// index-declaration-effects.md`「HNSW（テーブル単位）」）。
+///
+/// `crate::core::EngineCore::with_hnsw_scope` で設定し、`wire-server` の起動時
+/// CLI フラグ `--hnsw-scope`（プロセス全体・1 回限り）から到達する。HNSW
+/// opt-in が無効な構築（既定エンジン）では参照されず、全テーブル厳密
+/// （brute-force）のまま。判定本体は `crate::catalog::hnsw_targeted_in_txn`
+/// で、SQL 表層・Rust API・`EXPLAIN` の全経路がこれを共有する。いずれの値でも
+/// 判定はテーブル単位で、他テーブルの `USING hnsw` 宣言はクエリ対象テーブルの
+/// 経路・結果に影響しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HnswScope {
+    /// 全テーブルで HNSW を使う（既定。`USING hnsw` 宣言はカタログへ記録される
+    /// だけで経路を変えない）。宣言導入前の opt-in 挙動と同一。
+    #[default]
+    All,
+    /// `CREATE INDEX ... USING hnsw` を宣言したテーブルだけ HNSW を使い、
+    /// 未宣言テーブルは厳密（brute-force）。`DROP INDEX` で厳密へ戻る。
+    Declared,
+}
+
 /// 既定の検索エンジン種別（`ParallelBruteForce`）。[`EngineCore::open`]
 /// （`core.rs`）・[`default_engine`] が参照する唯一の既定値の源泉であり、
 /// 既定エンジンを固定するテストはこの関数の戻り値を検証する。

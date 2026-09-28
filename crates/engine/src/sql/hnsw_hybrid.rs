@@ -233,6 +233,7 @@ mod tests {
             cache: &cache,
             provider: hnsw_provider,
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -282,6 +283,7 @@ mod tests {
             cache: &cache,
             provider: hnsw_provider,
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -332,6 +334,7 @@ mod tests {
             cache: &cache,
             provider: hnsw_provider,
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -381,6 +384,7 @@ mod tests {
             cache: &cache,
             provider: hnsw_provider,
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);
@@ -431,6 +435,7 @@ mod tests {
             cache: &cache,
             provider: hnsw_provider,
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let read_txn = storage.db().begin_read().expect("begin read");
         let prepared = prepare_full_visible(&access, &read_txn, table, &c, &arena);

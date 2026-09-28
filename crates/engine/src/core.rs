@@ -1164,6 +1164,10 @@ pub struct EngineCore {
     /// `sql::hnsw_cache::HnswCacheAccess::index_gate_cache` 経由で共有する。
     /// 詳細は `catalog::IndexCatalogGateCache` のドキュメント参照。
     index_catalog_gate_cache: crate::catalog::IndexCatalogGateCache,
+    /// HNSW opt-in 時に HNSW 経路を使うテーブルの範囲（Issue #1065。既定
+    /// `HnswScope::All`＝全テーブル。[`Self::with_hnsw_scope`] でのみ差し替える）。
+    /// `hnsw_state` が `None`（opt-in なし）の構築では参照されない。
+    hnsw_scope: crate::search_engine::HnswScope,
 }
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
@@ -1683,6 +1687,7 @@ impl EngineCore {
             search_engine_kind,
             hnsw_state,
             index_catalog_gate_cache: crate::catalog::IndexCatalogGateCache::new(),
+            hnsw_scope: crate::search_engine::HnswScope::default(),
         }
     }
 
@@ -1862,6 +1867,26 @@ impl EngineCore {
     pub fn with_dml_limits(mut self, limits: crate::sql::parser::DmlLimits) -> Self {
         self.dml_limits = limits;
         self
+    }
+
+    /// HNSW opt-in 時に HNSW 経路を使うテーブルの範囲
+    /// （[`crate::search_engine::HnswScope`]）を差し替えたビルダーを返す
+    /// （[`Self::with_dml_limits`] と同じ流儀。未呼び出しなら `HnswScope::All`
+    /// ＝全テーブル HNSW・宣言導入前の挙動を維持）。Issue #1065・オーナー判断
+    /// 2026-09-28: `wire-server` の起動時 CLI フラグ `--hnsw-scope`（プロセス
+    /// 全体・1 回限り）から本メソッドを経由して設定する契約。SQL 表層・Rust API・
+    /// `EXPLAIN` の全経路が同じ値で `catalog::hnsw_targeted_in_txn` を呼ぶ。
+    /// HNSW opt-in なし（`hnsw_state` が `None`）の構築では効果を持たない
+    /// （全テーブル厳密のまま）。
+    pub fn with_hnsw_scope(mut self, scope: crate::search_engine::HnswScope) -> Self {
+        self.hnsw_scope = scope;
+        self
+    }
+
+    /// [`Self::with_hnsw_scope`] で設定した HNSW の適用範囲（未設定なら
+    /// `HnswScope::All`）。
+    pub fn hnsw_scope(&self) -> crate::search_engine::HnswScope {
+        self.hnsw_scope
     }
 
     /// 新規の [`crate::sql::transaction::SessionTransaction`]（`Idle`）を作る。
@@ -4282,6 +4307,7 @@ impl EngineCore {
                     cache: &s.cache,
                     provider: s.provider,
                     index_gate_cache: &self.index_catalog_gate_cache,
+                    hnsw_scope: self.hnsw_scope,
                 }),
             // Issue #473: スカラー列二次索引の gated 構築（応答には未使用。
             // 詳細は `sql::scalar_index` のドキュメント参照）。
@@ -4816,6 +4842,7 @@ impl EngineCore {
         // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
         // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出）へ委譲する。
         let explain_engine = self.explain_engine_for(
+            table,
             true,
             planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
             explain_shape.filters_empty(),
@@ -4843,6 +4870,7 @@ impl EngineCore {
     /// 実行しない契約はどちらの呼び出し元でも不変）。
     fn explain_engine_for(
         &self,
+        table: &str,
         is_hybrid: bool,
         is_precision: bool,
         filters_empty: bool,
@@ -4861,6 +4889,8 @@ impl EngineCore {
                 Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
                     &read_txn,
                     &self.index_catalog_gate_cache,
+                    table,
+                    self.hnsw_scope,
                     true,
                 ),
                 Err(_) => false,
@@ -4934,6 +4964,7 @@ impl EngineCore {
             },
         );
         let engine = self.explain_engine_for(
+            bound.table(),
             is_hybrid,
             is_precision,
             filters_empty,
@@ -6167,11 +6198,11 @@ impl EngineCore {
         // 契約変更の経緯（旧: Rust API は常にキャッシュを迂回していた）は
         // `tests/hnsw_cache.rs::rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback`
         // の docstring・`docs/design/hnsw-rls-cardinality-switch.md` 参照。
-        // Issue #1065: 起動時 opt-in（`hnsw_state.is_some()`）に加え、索引宣言
-        // のテーブル単位の適格性ゲート（`catalog::hnsw_targeted_in_txn`。
-        // `sql::exec` の `hnsw_enabled` と同一の判定。他テーブルの宣言に影響
-        // されず、索引カタログを読み取れない場合のみ `false`）も満たす場合のみ
-        // HNSW 経路へ進む。この判定専用に新規の
+        // Issue #1065: 起動時 opt-in（`hnsw_state.is_some()`）に加え、テーブル
+        // 単位の適格性ゲート（`catalog::hnsw_targeted_in_txn`。`sql::exec` の
+        // `hnsw_enabled` と同一の判定。`self.hnsw_scope` が `Declared` なら
+        // `USING hnsw` 宣言テーブルのみ。他テーブルの宣言に影響されず、索引
+        // カタログを読み取れない場合は `false`）も満たす場合のみ HNSW 経路へ進む。この判定専用に新規の
         // read txn を開く（検索本体の `search_with_hnsw`／`search_with` は
         // 内部で別途 txn を開くため、ここでの読み取りは判定用の一時的なもの）。
         // 読み取り失敗は fail-closed に「対象外」（brute-force）へ倒す。
@@ -6187,6 +6218,8 @@ impl EngineCore {
                     let targeted = crate::catalog::hnsw_targeted_in_txn(
                         &read_txn,
                         &self.index_catalog_gate_cache,
+                        table,
+                        self.hnsw_scope,
                         true,
                     );
                     let generation = crate::storage::current_generation_in_txn(&read_txn).ok();
@@ -6217,6 +6250,7 @@ impl EngineCore {
                     cache: &state.cache,
                     provider: state.provider,
                     index_gate_cache: &self.index_catalog_gate_cache,
+                    hnsw_scope: self.hnsw_scope,
                 };
                 snapshot.search_with_hnsw(
                     &self.storage,

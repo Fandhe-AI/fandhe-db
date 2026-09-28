@@ -2848,6 +2848,7 @@ mod tests {
             cache: &cache,
             provider: hnsw_provider,
             index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
         };
         let cpu = CpuScalarProvider;
 
