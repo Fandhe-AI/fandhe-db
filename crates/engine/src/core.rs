@@ -5078,10 +5078,13 @@ impl EngineCore {
     /// にスカラー索引名を出さない）は `metadata_filters` が参照する列の名前
     /// （呼び出し元が束縛時スキーマで解決済み）。付与条件（対象外は空 `Vec`
     /// のまま）:
-    /// - ann: `ann_plan` が `HnswFullVisible`／`HnswSubset` のときのみ、対象
-    ///   テーブルの `USING hnsw` 宣言すべて（`--hnsw-scope all` でも宣言が
-    ///   あれば付ける。経路・Top-k は宣言の有無で変わらないため #1065 の
-    ///   不変条件は保たれる）
+    /// - ann: `ann_plan` が `HnswFullVisible`／`HnswSubset` かつ
+    ///   `self.hnsw_scope == HnswScope::Declared` のときのみ、対象テーブルの
+    ///   `USING hnsw` 宣言すべて（`--hnsw-scope all` では適格性
+    ///   〔`catalog::hnsw_targeted_in_txn`〕が宣言の有無を見ず常に真になり、
+    ///   経路・Top-k が宣言の有無で変わらないのに `index=` 表示だけ変わる
+    ///   契約矛盾を避けるため、宣言があっても付けない。codex-review P1
+    ///   指摘対応・Issue #1066 PR #1155 2 巡目）
     /// - scalar: 宣言の有効化スイッチ `self.hnsw_state.is_some()` が真・
     ///   `scalar_plan` が `PlainScan` 以外・`scalar_filter_columns` が
     ///   `Some` かつ非空・その全列がいずれかのスカラー宣言で被覆されている
