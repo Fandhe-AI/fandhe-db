@@ -433,3 +433,176 @@ fn declarations_without_hnsw_opt_in_report_no_index_names() {
         "{lines:?}"
     );
 }
+
+/// codex-review P2 指摘対応（Issue #1066 PR #1155 4 巡目）: 索引名を最終的に
+/// 表示しない `EXPLAIN` 呼び出し（opt-in なし／`HnswScope::All` かつ述語なし）
+/// では、宣言があってもカタログ全件走査（`catalog::explain_index_names_in_txn`）
+/// を `EngineCore::read_explain_index_names_in_txn` 経由で一切行わないことを
+/// `explain_index_name_scan_stats` で固定する。出力自体が従来どおり索引名なし
+/// であることも併せて確認し、「走査を省略しても EXPLAIN 出力は変わらない」
+/// 受け入れ条件を担保する。
+#[test]
+fn explain_index_name_scan_is_skipped_when_no_names_would_be_shown() {
+    // opt-in なし: `declarations_enabled` が偽のため、宣言があってもカタログへ
+    // 一切触れない（`declarations_without_hnsw_opt_in_report_no_index_names` と
+    // 同じ構成に走査カウンタの固定を追加する）。
+    let (no_optin_core, _no_optin_guard) = default_core("explain-idx-scan-skip-no-optin", 50);
+    let mut no_optin_session = allowed_session();
+    no_optin_core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut no_optin_session,
+            "CREATE INDEX idx_kind ON docs (kind)",
+        )
+        .expect("declare idx_kind");
+    let before = no_optin_core.explain_index_name_scan_stats().scans;
+    let no_optin_sql =
+        "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
+    let no_optin_lines = explain_lines(
+        &no_optin_core,
+        "tenant-a",
+        &format!("EXPLAIN {no_optin_sql}"),
+    );
+    assert!(
+        !find_line(&no_optin_lines, "scalar_plan: ").contains("index="),
+        "{no_optin_lines:?}"
+    );
+    assert_eq!(
+        no_optin_core.explain_index_name_scan_stats().scans,
+        before,
+        "opt-in なしの EXPLAIN はカタログを走査してはならない"
+    );
+
+    // opt-in + `HnswScope::All`・述語なし: `ann_names_eligible` は scope が
+    // `All` のため偽、`scalar_names_eligible` は述語なし（`PlainScan`）のため
+    // 偽で、両方とも走査対象外（`hnsw_scope_all_never_reports_index_name` と
+    // 同じ構成）。
+    let (all_core, _all_guard) = hnsw_opt_in_core("explain-idx-scan-skip-all", HnswScope::All);
+    let mut all_session = allowed_session();
+    all_core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut all_session,
+            "CREATE INDEX idx_vec ON docs USING hnsw (embedding)",
+        )
+        .expect("declare hnsw index");
+    let before = all_core.explain_index_name_scan_stats().scans;
+    let no_predicate_sql = "SELECT id FROM docs ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
+    let all_lines = explain_lines(
+        &all_core,
+        "tenant-a",
+        &format!("EXPLAIN {no_predicate_sql}"),
+    );
+    assert!(
+        !find_line(&all_lines, "ann_plan: ").contains("index="),
+        "{all_lines:?}"
+    );
+    assert!(
+        !find_line(&all_lines, "scalar_plan: ").contains("index="),
+        "{all_lines:?}"
+    );
+    assert_eq!(
+        all_core.explain_index_name_scan_stats().scans,
+        before,
+        "HnswScope::All かつ述語なしの EXPLAIN はカタログを走査してはならない"
+    );
+}
+
+/// skip 側（[`explain_index_name_scan_is_skipped_when_no_names_would_be_shown`]）
+/// と対で、索引名を実際に表示する呼び出し（スカラー等価述語・`HnswScope::
+/// Declared` かつ述語なし）ではカタログ全件走査が 1 回発生することを固定する。
+/// 「走査が省略される条件・されない条件のどちらでも EXPLAIN 出力は従来どおり」
+/// という受け入れ条件を担保する。
+#[test]
+fn explain_index_name_scan_happens_when_names_would_be_shown() {
+    let (scalar_core, _scalar_guard) =
+        hnsw_opt_in_core("explain-idx-scan-nonskip-scalar", HnswScope::All);
+    let mut scalar_session = allowed_session();
+    scalar_core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut scalar_session,
+            "CREATE INDEX idx_kind ON docs (kind)",
+        )
+        .expect("declare idx_kind");
+    let before = scalar_core.explain_index_name_scan_stats().scans;
+    let scalar_sql =
+        "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
+    let scalar_lines = explain_lines(&scalar_core, "tenant-a", &format!("EXPLAIN {scalar_sql}"));
+    assert_eq!(
+        find_line(&scalar_lines, "scalar_plan: "),
+        "scalar_plan: index_equality index=idx_kind"
+    );
+    assert_eq!(
+        scalar_core.explain_index_name_scan_stats().scans,
+        before + 1,
+        "索引名を表示する EXPLAIN は必ずカタログを 1 回走査する"
+    );
+
+    let (declared_core, _declared_guard) =
+        hnsw_opt_in_core("explain-idx-scan-nonskip-hnsw", HnswScope::Declared);
+    let mut declared_session = allowed_session();
+    declared_core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut declared_session,
+            "CREATE INDEX idx_vec ON docs USING hnsw (embedding)",
+        )
+        .expect("declare hnsw index");
+    let before = declared_core.explain_index_name_scan_stats().scans;
+    let hnsw_sql = "SELECT id FROM docs ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
+    let hnsw_lines = explain_lines(&declared_core, "tenant-a", &format!("EXPLAIN {hnsw_sql}"));
+    assert_eq!(
+        find_line(&hnsw_lines, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_vec"
+    );
+    assert_eq!(
+        declared_core.explain_index_name_scan_stats().scans,
+        before + 1,
+        "HnswScope::Declared で索引名を表示する EXPLAIN は必ずカタログを 1 回走査する"
+    );
+}
+
+/// 集計 EXPLAIN（`aggregate_explain_from_bound`）も
+/// `EngineCore::read_explain_index_names_in_txn` を共有する経路のため、索引名を
+/// 表示しない `GROUP BY`（`access_path` が `ScalarIndexCandidates` 以外）では
+/// 走査を省略し、等価述語の `WHERE` で表示する場合のみ 1 回走査することを
+/// `aggregate_explain_reports_index_name_only_for_scalar_index_candidates` と
+/// 同じ構成で固定する。
+#[test]
+fn aggregate_explain_index_name_scan_matches_output_eligibility() {
+    let (core, _guard) = hnsw_opt_in_core("explain-idx-scan-aggregate", HnswScope::All);
+    let mut session = allowed_session();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_kind ON docs (kind)",
+    )
+    .expect("declare idx_kind");
+
+    let before = core.explain_index_name_scan_stats().scans;
+    let group_by_sql = "SELECT kind, COUNT(*) FROM docs GROUP BY kind";
+    let group_by_lines = explain_lines(&core, "tenant-a", &format!("EXPLAIN {group_by_sql}"));
+    assert!(
+        !find_line(&group_by_lines, "scalar_plan: ").contains("index="),
+        "{group_by_lines:?}"
+    );
+    assert_eq!(
+        core.explain_index_name_scan_stats().scans,
+        before,
+        "scalar_index_candidates 以外の集計 EXPLAIN はカタログを走査してはならない"
+    );
+
+    let before = core.explain_index_name_scan_stats().scans;
+    let count_sql = "SELECT COUNT(*) FROM docs WHERE kind = 'a'";
+    let count_lines = explain_lines(&core, "tenant-a", &format!("EXPLAIN {count_sql}"));
+    assert_eq!(
+        find_line(&count_lines, "scalar_plan: "),
+        "scalar_plan: index_equality index=idx_kind"
+    );
+    assert_eq!(
+        core.explain_index_name_scan_stats().scans,
+        before + 1,
+        "scalar_index_candidates の集計 EXPLAIN は必ずカタログを 1 回走査する"
+    );
+}

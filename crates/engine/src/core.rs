@@ -238,6 +238,20 @@ pub struct PrefilterCacheStats {
     pub entries: usize,
 }
 
+/// [`EngineCore::explain_index_name_scans`] の観測用統計（Issue #1066
+/// codex-review P2 指摘対応・PR #1155 4 巡目）。テナント ID・索引名等の機微
+/// 情報は一切含まない（カウンタのみ）。`VectorCore` trait には載せない固有 API
+/// （`EngineCore::explain_index_name_scan_stats`）としてのみ公開する
+/// （`core_api.snapshot` の対象外。`PrefilterCacheStats` と同じ方針）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExplainIndexNameScanStats {
+    /// `catalog::explain_index_names_in_txn` によるカタログ全件走査が
+    /// [`EngineCore::read_explain_index_names_in_txn`] 経由で実際に呼ばれた
+    /// 累計回数。索引名を最終的に表示しない `EXPLAIN` 呼び出しではこの値が
+    /// 増えないことを `tests/explain_index_names.rs` で固定する。
+    pub scans: u64,
+}
+
 /// [`PrefilterCache`] の 1 エントリ（TASK-169）。`table`・`ctx` の組がキャッシュキー
 /// （`PolicyContext` は `Hash` を実装しないため `HashMap` ではなく `Vec` 線形走査で
 /// 照合する。エントリ数は [`MAX_PREFILTER_CACHE_ENTRIES`] で小さく抑えるため走査コストは
@@ -1168,6 +1182,15 @@ pub struct EngineCore {
     /// `HnswScope::All`＝全テーブル。[`Self::with_hnsw_scope`] でのみ差し替える）。
     /// `hnsw_state` が `None`（opt-in なし）の構築では参照されない。
     hnsw_scope: crate::search_engine::HnswScope,
+    /// [`Self::read_explain_index_names_in_txn`]（`catalog::explain_index_names_
+    /// in_txn` の唯一の呼び出し経路。[`Self::explain_engine_for`]・
+    /// [`Self::aggregate_explain_from_bound`] の両方が経由する）が実際にカタログ
+    /// 全件走査を行った累計回数（Issue #1066 codex-review P2 指摘対応・
+    /// PR #1155 4 巡目）。索引名を最終的に表示しない呼び出し（述語なし・
+    /// `HnswScope::All`・`scalar_plan` が `PlainScan` 等）で走査が省略されて
+    /// いることをテストから観測できるようにするための observability 専用
+    /// カウンタで、検索結果・`EXPLAIN` 出力には影響しない。
+    explain_index_name_scans: std::sync::atomic::AtomicU64,
 }
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
@@ -1805,6 +1828,7 @@ impl EngineCore {
             hnsw_state,
             index_catalog_gate_cache: crate::catalog::IndexCatalogGateCache::new(),
             hnsw_scope: crate::search_engine::HnswScope::default(),
+            explain_index_name_scans: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1880,6 +1904,22 @@ impl EngineCore {
     /// 方針）。
     pub fn index_catalog_gate_cache_stats(&self) -> crate::catalog::IndexCatalogGateCacheStats {
         self.index_catalog_gate_cache.stats()
+    }
+
+    /// [`Self::explain_index_name_scans`] の現在の統計を返す（Issue #1066
+    /// codex-review P2 指摘対応・PR #1155 4 巡目。テスト・運用観測用）。索引名を
+    /// 最終的に表示しない `EXPLAIN` 呼び出しでカタログ全件走査
+    /// （`catalog::explain_index_names_in_txn`）が省略されていることを
+    /// `tests/explain_index_names.rs` から固定するために使う。テナント ID・
+    /// 索引名等の機微情報は含まない。`VectorCore` trait には載せない固有
+    /// メソッド（`core_api.snapshot` の対象外。`index_catalog_gate_cache_stats`
+    /// と同じ方針）。
+    pub fn explain_index_name_scan_stats(&self) -> ExplainIndexNameScanStats {
+        ExplainIndexNameScanStats {
+            scans: self
+                .explain_index_name_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
@@ -5057,6 +5097,26 @@ impl EngineCore {
     /// この窓を塞がない）。呼び出し元はいずれも `bind` 用に開いた
     /// `read_txn` を保持し続け、ここへ同じ参照を渡すことで束縛・索引宣言
     /// 読み取りを単一スナップショットへ統一する。
+    /// `catalog::explain_index_names_in_txn`（索引カタログ全件走査）を呼ぶ
+    /// 唯一の経路（Issue #1066 codex-review P2 指摘対応・PR #1155 4 巡目）。
+    /// [`Self::explain_engine_for`]・[`Self::aggregate_explain_from_bound`] の
+    /// 両方がこれを経由することで、`explain_index_name_scans` カウンタが
+    /// 「索引名注記のためのカタログ走査が実際に行われた回数」を漏れなく計上
+    /// する（呼び出し元は事前に索引名が最終的に表示されるかを判定し、表示
+    /// しない場合はこのメソッド自体を呼ばない契約——判定式は各呼び出し元の
+    /// ドキュメンテーションコメント参照）。カウンタは observability 専用で
+    /// あり、戻り値・fail-closed 挙動は `catalog::explain_index_names_in_txn`
+    /// をそのまま透過する。
+    fn read_explain_index_names_in_txn(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+    ) -> crate::catalog::Result<crate::catalog::TableIndexDecls> {
+        self.explain_index_name_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::catalog::explain_index_names_in_txn(read_txn, table)
+    }
+
     #[allow(clippy::too_many_arguments)] // Issue #1066 で `scalar_filter_columns`・`read_txn` 追加により 9 引数。hnsw.rs と同じ方針で許容する。
     fn explain_engine_for(
         &self,
@@ -5140,7 +5200,7 @@ impl EngineCore {
             // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
             // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
             // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
-            crate::catalog::explain_index_names_in_txn(read_txn, table).ok()
+            self.read_explain_index_names_in_txn(read_txn, table).ok()
         } else {
             None
         };
@@ -5319,7 +5379,7 @@ impl EngineCore {
         {
             match metadata_filter_column_names(schema, bound.metadata_filters()) {
                 Some(cols) if !cols.is_empty() => {
-                    match crate::catalog::explain_index_names_in_txn(read_txn, bound.table()) {
+                    match self.read_explain_index_names_in_txn(read_txn, bound.table()) {
                         Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
                             Vec::new(),
                             scalar_index_names_for_columns(&decls.scalar, &cols),
