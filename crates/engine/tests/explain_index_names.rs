@@ -318,10 +318,11 @@ fn hnsw_scope_declared_reports_and_clears_index_name() {
 /// codex-review P1 指摘対応（Issue #1066 PR #1155）: 述語列を複数の宣言が
 /// 重複して覆う場合、実行側 `declared_index_targets_in_txn` は宣言名を捨て
 /// 列の和集合から単一の `ScalarIndex` を構築するため、個別に使われる経路が
-/// 無い宣言まで `index=` に表示してはならない。最小の被覆集合（貪欲法。
-/// 被覆数が同数なら名前の昇順）へ縮退する。
+/// 無い宣言まで `index=` に表示してはならない。貪欲法（被覆数が同数なら
+/// 名前の昇順）で選んだ被覆集合へ縮退する（グローバルな最小性は保証しない。
+/// `docs/design/explain-search-engine-exposure.md`「Issue #1066」節参照）。
 #[test]
-fn scalar_overlapping_declarations_report_minimal_covering_index_name() {
+fn scalar_overlapping_declarations_report_greedy_covering_index_name() {
     let (core, _guard) = hnsw_opt_in_core("explain-idx-names-scalar-overlap", HnswScope::All);
     let mut session = allowed_session();
     core.execute_sql_in_session(

@@ -1557,11 +1557,23 @@ fn metadata_filter_column_names<'a>(
 
 /// `column_names` の**全列**がいずれかのスカラー索引宣言（`(名前, 対象列)`。
 /// [`crate::catalog::TableIndexDecls::scalar`]）で被覆されている場合に限り、
-/// 被覆した宣言の名前（昇順・重複排除は呼び出し元 [`crate::sql::explain::
-/// ExplainIndexNames::new`] に委ねる）を返す（Issue #1066）。被覆されない列が
-/// 1 つでもあれば空 `Vec`（実行時は `FallbackNoIndex` で全走査に落ちるため
-/// 索引使用を主張しない）。`column_names` が空なら（`WHERE` に索引対応述語が
-/// 無い）空 `Vec`。
+/// 被覆に用いる宣言の名前（貪欲法選択・グローバルな最小性は保証しない。
+/// 昇順・重複排除は呼び出し元 [`crate::sql::explain::ExplainIndexNames::new`]
+/// に委ねる）を返す（Issue #1066）。被覆されない列が 1 つでもあれば空 `Vec`。
+///
+/// **契約は「静的な宣言上の候補」であり「実行時に実際に使われた索引」の
+/// 保証ではない**（2 巡目 codex-review P1 指摘対応・Issue #1066 PR #1155）。
+/// 実行側 `sql::scalar_index::ScalarIndex::resolve_candidates` は候補
+/// スロット比率が閾値を超える場合（`CandidateResolution::FallbackSelectivity`）
+/// や候補取得不能な場合（`FallbackNoIndex`）に索引経由を諦め全走査へ縮退
+/// するが、この縮退は可視行数・カーディナリティに依存する実行時値であり、
+/// `EXPLAIN` はテーブル内容に一切依存しない静的判定のみを報告する既存契約
+/// （`docs/design/explain-search-engine-exposure.md`「決定 1」節）のため
+/// ここでは反映しない。反映するには `EXPLAIN` 自体が索引を構築し行データに
+/// 依存する選択度を観測する必要があり、実行の副作用禁止契約に反すると同時に
+/// テナントのカーディナリティを索引名の有無という副チャネルで漏らしうる
+/// （同 doc「露出しない値」節の「実行時縮退結果」と同区分）。詳細は同 doc
+/// 「Issue #1066」節参照。
 fn scalar_index_names_for_columns(
     scalar_decls: &[(String, Vec<String>)],
     column_names: &[&str],
@@ -1583,8 +1595,23 @@ fn scalar_index_names_for_columns(
     // 個別の実行経路は存在しない）。そのため「述語列と 1 列でも交差する宣言を
     // 全て返す」だけでは、同じ列を複数宣言が重複して覆う場合に実行側で個別に
     // 使われない宣言まで「使用索引名」として表示してしまう。ここでは表示を
-    // 「述語列を被覆するために必要な最小の宣言集合」と定義し直し、貪欲法
-    // （残り未被覆列を最も多く覆う宣言から、同数なら名前の昇順で）で選ぶ。
+    // 「述語列を被覆する宣言集合」へ縮退させ、貪欲法（残り未被覆列を最も多く
+    // 覆う宣言から、同数なら名前の昇順で）で選ぶ。
+    //
+    // 2 巡目 codex-review P1 指摘対応（Issue #1066 PR #1155）: 貪欲法は
+    // 「被覆に必要な宣言数が最小」であることを保証しない（反例: 列
+    // a..h、宣言 idx_a=(a,b,c,d)・idx_b=(a,b,e,f)・idx_c=(c,d,g,h) に対し
+    // 述語列が a..h 全列のとき、貪欲法は最初に idx_a（4 列被覆）を選び
+    // idx_a+idx_b+idx_c の 3 件を表示するが、idx_b+idx_c の 2 件でも
+    // a..h 全列を被覆できる）。真の最小被覆集合の算出は NP-hard な
+    // 厳密集合被覆問題であり、EXPLAIN はクエリ形状から決まる `WHERE` 述語列
+    // （攻撃者が調整可能な入力）を被覆元に使うため、厳密解を指数時間で
+    // 求める実装は非信頼入力に対する計算量 DoS 経路になり得る
+    // （`coding-rust.md`「untrusted 入力の扱い」）。そのためここでは貪欲法を
+    // 意図的に維持し、契約を「述語列を被覆するために必要な最小の宣言集合」
+    // ではなく「述語列を被覆する宣言集合（貪欲法による選択。グローバルな
+    // 最小性は保証しない）」と定義し直す（`docs/design/
+    // explain-search-engine-exposure.md`「Issue #1066」節に追記）。
     // 列被覆が重複しない既存ケース（単一列・列ごとに別宣言）では従来と同じ
     // 結果になる。
     let mut remaining: Vec<&str> = column_names.to_vec();
@@ -5085,6 +5112,15 @@ impl EngineCore {
             ) if self.hnsw_scope == crate::search_engine::HnswScope::Declared => decls.hnsw.clone(),
             _ => Vec::new(),
         };
+        // 2 巡目 codex-review P1 指摘対応（Issue #1066 PR #1155）: ここで付ける
+        // 名前は `scalar_plan` の静的分類（`ScalarPlan::PlainScan` 以外）と
+        // カタログ宣言による列被覆だけで決まる「宣言上の候補索引名」であり、
+        // 実行側 `ScalarIndex::resolve_candidates` が選択度超過・候補取得
+        // 不能で全走査へ縮退した場合でもそのまま付く（`scalar_index_names_
+        // for_columns` のドキュメンテーションコメント参照）。EXPLAIN は
+        // テーブル内容・行数に依存する実行時縮退を観測しない既存契約
+        // （`docs/design/explain-search-engine-exposure.md`「決定 1」節）を
+        // 優先し、意図的に静的判定のみを報告する。
         let scalar_names = match (&index_decls, scalar_filter_columns) {
             (Some(decls), Some(cols))
                 if declarations_enabled
@@ -5220,7 +5256,12 @@ impl EngineCore {
     /// `metadata_filters` の列がすべて対象テーブルのスカラー宣言で被覆されて
     /// いるかを新規 read txn で判定する（ann は常に対象外——集計 EXPLAIN は
     /// `ann_plan:` 行を出さない）。カタログ読み取り失敗・列名写像失敗は
-    /// fail-closed に名前なしへ倒す。
+    /// fail-closed に名前なしへ倒す。ここで付ける名前も `search_explain_
+    /// from_bound` の `scalar_names` と同じく「宣言上の候補索引名」であり、
+    /// `ScalarIndex::resolve_candidates` の実行時縮退（選択度超過・候補取得
+    /// 不能）は意図的に反映しない（`scalar_index_names_for_columns` の
+    /// ドキュメンテーションコメント・`docs/design/
+    /// explain-search-engine-exposure.md`「決定 1」節参照）。
     fn aggregate_explain_from_bound(
         &self,
         schema: &crate::catalog::TableSchema,
