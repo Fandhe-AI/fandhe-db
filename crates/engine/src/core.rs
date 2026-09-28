@@ -5090,21 +5090,16 @@ impl EngineCore {
         // 使う（新規に `begin_read()` しない）。カタログ読み取り自体の失敗
         // （走査上限超過・デコード失敗）は fail-closed に `false`
         // （brute-force 表示）・索引名なしへ倒す。
-        let (hnsw_enabled, index_decls) = if declarations_enabled {
-            let hnsw_enabled = crate::catalog::hnsw_targeted_in_txn(
+        let hnsw_enabled = if declarations_enabled {
+            crate::catalog::hnsw_targeted_in_txn(
                 read_txn,
                 &self.index_catalog_gate_cache,
                 table,
                 self.hnsw_scope,
                 true,
-            );
-            // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
-            // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
-            // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
-            let decls = crate::catalog::explain_index_names_in_txn(read_txn, table).ok();
-            (hnsw_enabled, decls)
+            )
         } else {
-            (false, None)
+            false
         };
         let ann_plan =
             crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
@@ -5123,12 +5118,34 @@ impl EngineCore {
         // 示す」契約との矛盾を生む。`HnswScope::Declared` はテーブル単位の
         // 適格性そのものが宣言の有無で決まる（catalog::hnsw_targeted_in_txn）
         // ため、この scope に限り宣言名を「使用索引名」として注記する。
-        let ann_names = match (&index_decls, ann_plan) {
-            (
-                Some(decls),
-                crate::sql::hnsw_cache::AnnPlan::HnswFullVisible
-                | crate::sql::hnsw_cache::AnnPlan::HnswSubset,
-            ) if self.hnsw_scope == crate::search_engine::HnswScope::Declared => decls.hnsw.clone(),
+        let ann_names_eligible = matches!(
+            ann_plan,
+            crate::sql::hnsw_cache::AnnPlan::HnswFullVisible
+                | crate::sql::hnsw_cache::AnnPlan::HnswSubset
+        ) && self.hnsw_scope == crate::search_engine::HnswScope::Declared;
+        // Issue #1066 codex-review P2 指摘対応: `scalar_plan` の静的分類・列
+        // 被覆の前提条件（下記 `scalar_names_eligible`）は `index_decls` を
+        // 読まなくても確定する。索引名を最終的に一切表示しない呼び出し
+        // （述語なし・`HnswScope::All`・`PlainScan` 等）でもカタログ全件走査
+        // （[`crate::catalog::explain_index_names_in_txn`]）を無条件に行うと、
+        // 既存の HNSW ゲート（[`crate::catalog::hnsw_targeted_in_txn`]。上記
+        // `index_catalog_gate_cache` による世代別キャッシュ対象）とは別の
+        // 未キャッシュな走査が `EXPLAIN` の呼び出しごとに発生してしまう。
+        // 両条件のいずれかが真の場合に限りカタログを読む（走査自体は
+        // キャッシュしないが、不要な呼び出しでは行わない）。
+        let scalar_names_eligible = declarations_enabled
+            && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan)
+            && scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
+        let index_decls = if declarations_enabled && (ann_names_eligible || scalar_names_eligible) {
+            // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
+            // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
+            // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
+            crate::catalog::explain_index_names_in_txn(read_txn, table).ok()
+        } else {
+            None
+        };
+        let ann_names = match &index_decls {
+            Some(decls) if ann_names_eligible => decls.hnsw.clone(),
             _ => Vec::new(),
         };
         // 2 巡目 codex-review P1 指摘対応（Issue #1066 PR #1155）: ここで付ける
@@ -5141,10 +5158,7 @@ impl EngineCore {
         // （`docs/design/explain-search-engine-exposure.md`「決定 1」節）を
         // 優先し、意図的に静的判定のみを報告する。
         let scalar_names = match (&index_decls, scalar_filter_columns) {
-            (Some(decls), Some(cols))
-                if declarations_enabled
-                    && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan) =>
-            {
+            (Some(decls), Some(cols)) if scalar_names_eligible => {
                 scalar_index_names_for_columns(&decls.scalar, cols)
             }
             _ => Vec::new(),
