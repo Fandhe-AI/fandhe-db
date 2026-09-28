@@ -28,6 +28,12 @@
 //! `Result::Err` は ERR-1 応答で処理継続、panic は経路・スレッドを問わず
 //! プロセスを終了させる ―― `commit_boundary`・`panic_hook` の狭い
 //! commit-pending 限定の abort とは異なり、プロセス全体への最終防衛線となる。
+//!
+//! [`stderr_log`] は `fail_fast`（RECOVER-8）の例外として、診断用 stderr
+//! 出力の書き込み失敗（読み手が閉じた後の `EPIPE` 等）を無視する
+//! （Issue #1081、判断の記録: `docs/design/stderr-log-write-failure.md`）。
+//! `fail_fast` 本体の abort 契約は変えない ―― 例外の範囲は診断ログの
+//! 書き込みそのものに限る。
 
 pub mod commit_boundary;
 pub(crate) mod content_hash;
@@ -35,3 +41,4 @@ pub mod fail_fast;
 pub mod ledger;
 pub mod panic_hook;
 pub mod required_op_id;
+pub mod stderr_log;

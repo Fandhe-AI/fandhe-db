@@ -36,8 +36,11 @@
 //! - UNIQUE 制約（`schema.unique_constraints()`）: NULLS DISTINCT。構成列の
 //!   いずれかが NULL の行はその制約の検査対象外とする（NULL 同士は衝突しない）。
 //!
-//! 等価判定は型タグ＋長さ前置の正準キーバイト列で行い、許可型は主キーと共有する
-//! 単一の許可リスト（`ColumnType::is_primary_key_allowed`）に限る。
+//! 等価判定は型タグ＋長さ前置の正準キーバイト列で行う。許可型は主キーが
+//! `ColumnType::is_primary_key_allowed`、UNIQUE 制約はその上位集合
+//! `ColumnType::is_unique_constraint_allowed`（Issue #1073 で REAL・
+//! DOUBLE PRECISION・NUMERIC・JSON／JSONB・配列型を追加）を使う——2 つの
+//! 許可リストを持つ理由は `ColumnType::is_primary_key_allowed` の doc 参照。
 //!
 //! # 実装方式（既知の制約）
 //!
@@ -64,7 +67,7 @@
 //! （TABLE-16・RLS-10 (c)）。違反時のエラー（`TenantWriteError::UniqueViolation`）
 //! はキー値・列名・行 id・テナント名を含まない固定文言。
 
-use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, TableSchema};
+use crate::catalog::{CatalogError, ColumnType, ForeignKeyDef, ForeignKeyMatch, TableSchema};
 use crate::row_codec::ScalarRef;
 use crate::tenant::TenantWriteError;
 use redb::ReadableTable;
@@ -130,21 +133,58 @@ fn key_specs(schema: &TableSchema) -> Result<(Vec<KeySpec>, Vec<bool>), CatalogE
     Ok((specs, mask))
 }
 
+/// COMMIT 時に検査すべき遅延 `FOREIGN KEY` の範囲（TABLE-17・TASK-205、
+/// Issue #1077）。autocommit（1 文＝1 トランザクション）は常に `All`——遅延指定
+/// （`DEFERRABLE`／`INITIALLY DEFERRED`）でも「検査しない」ことにはならず、
+/// 文単位で必ず検査する。明示トランザクション（SQL-31・TASK-221）中の
+/// `tenant::WriteTarget::InTxn` 経路（`insert_row_unchecked`・
+/// `insert_rows_unchecked`・`insert_typed_row_unchecked`・
+/// `truncate_table_unchecked` の 4 経路のみ）だけが `ImmediateOnly` を渡し、
+/// `INITIALLY DEFERRED` の FK を文単位検査から除外して COMMIT 時
+/// （[`enforce_deferred_foreign_keys_in_txn`]）へ先送りする。`fail-closed`:
+/// 先送りした FK は `sql::transaction::SessionTransaction::commit` が
+/// 必ず検査してから commit する契約（省き忘れは fail-open のバグ）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FkCheckMode {
+    All,
+    ImmediateOnly,
+}
+
+impl FkCheckMode {
+    /// `fk` をこのモードの下で文単位検査の対象に含めるか。
+    fn includes(self, fk: &ForeignKeyDef) -> bool {
+        match self {
+            FkCheckMode::All => true,
+            FkCheckMode::ImmediateOnly => !fk.is_initially_deferred(),
+        }
+    }
+}
+
 /// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
 /// （TABLE-16・TASK-204）。`CHECK` 制約（Issue #906）→ 一意性制約（主キー・
 /// UNIQUE）→ `FOREIGN KEY` の参照元側（TABLE-17・TASK-205、Issue #907。書いた行が
 /// 参照する値の組が参照先に存在するか）の順に検査する。`written_ids` の契約は [`enforce_unique_keys_in_txn`]
-/// と同じ。いずれの制約も宣言しないテーブルは即座に成功する。
+/// と同じ。いずれの制約も宣言しないテーブルは即座に成功する。`fk_mode` は
+/// `INITIALLY DEFERRED` の FK を文単位検査から除外するかどうか
+/// （[`FkCheckMode`] 参照。`CHECK`・一意性制約には遅延の概念がなく常時検査する）。
 pub(crate) fn enforce_row_constraints_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     written_ids: &[u64],
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_unique_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
-    enforce_foreign_keys_in_txn(write_txn, table_name, schema, tenant_id, written_ids)
+    enforce_foreign_keys_in_txn(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        written_ids,
+        fk_mode,
+    )
 }
 
 /// `CHECK` 制約（TABLE-16・TASK-204、Issue #906）の検査。`written_ids` の各行を
@@ -299,6 +339,80 @@ pub(crate) fn enforce_unique_keys_in_txn(
     Ok(())
 }
 
+/// `tenant::upsert_typed_rows_unchecked` の UNIQUE 対象 UPSERT（TABLE-16、
+/// Issue #1074）が、書き込み**前**に 1 回だけ呼ぶ既存行スキャン。対象テナント
+/// （`ctx.tenant_id()` 由来の物理キー範囲。[`enforce_unique_keys_in_txn`] と同じ
+/// `(tenant_id, 0)..=(tenant_id, u64::MAX)` の閉区間）が所有する**全行**
+/// （`Public`／`Private` を問わない。可視性フィルタ・二次索引・世代キャッシュの
+/// いずれも経由しない生の走査。RLS-9・RLS-10 (c)）を走査し、`indices`
+/// （UNIQUE 制約の構成列。解決した制約の宣言順）が示す一意キーの正準バイト列
+/// から行 `id` への対応を返す。NULL を含む行はキーを持たない（NULLS DISTINCT。
+/// [`key_bytes`] と同じ扱い）ため対象外。
+///
+/// キー構築は書き込み時の検査点 [`enforce_unique_keys_in_txn`] と同じ
+/// [`decode_key_columns`]／[`key_bytes`] を再利用する（第 2 の正準化を作らない。
+/// `unique_key_from_values`〔`Value` 行専用〕とバイト単位で一致する契約は
+/// 両者が同じ [`push_canonical_component`] を経由することで保証される）。
+///
+/// 1 つのキーに一致する既存行が 2 件以上ある場合は一意性の不変条件が破れて
+/// いる内部矛盾であり、黙って上書きせず [`TenantWriteError::Catalog`]
+/// （`CatalogError::Invalid`）で fail-closed に拒否する。
+pub(crate) fn scan_tenant_rows_by_unique_key<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    tenant_id: &str,
+    indices: &[usize],
+) -> Result<HashMap<Vec<u8>, u64>, TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let spec = KeySpec {
+        indices: indices.to_vec(),
+        null_policy: NullPolicy::Skip,
+    };
+    let mut mask = vec![false; schema.columns.len()];
+    for &idx in indices {
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+    }
+
+    let mut existing: HashMap<Vec<u8>, u64> = HashMap::new();
+    let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+    let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+    for entry in row_table
+        .range::<(&str, u64)>((range_start, range_end))
+        .map_err(crate::catalog::CatalogError::from)?
+    {
+        let (k, v) = entry.map_err(crate::catalog::CatalogError::from)?;
+        let (key_tenant, id) = k.value();
+        if key_tenant != tenant_id {
+            // 閉区間により理論上到達しないが、defense-in-depth として維持する
+            // （`enforce_unique_keys_in_txn` と同じ判断）。
+            break;
+        }
+        let buf = v.value();
+        let values = decode_key_columns(schema, &mask, buf)?;
+        let Some(key) = key_bytes(&spec, &values).map_err(internal)? else {
+            continue;
+        };
+        if let Some(existing_id) = existing.insert(key, id) {
+            if existing_id != id {
+                // 同一 UNIQUE キーを共有する既存行が 2 件以上見つかった場合は
+                // 一意性の不変条件が破れている内部矛盾であり（呼び出し元の
+                // incoming VALUES 同士の衝突ではない）、UniqueViolation
+                // （呼び出し元の衝突用 wire code）を誤って返すと非衝突の
+                // UPSERT まで巻き込んで失敗させてしまう。ドキュメント通り
+                // `internal` で fail-closed に拒否する。
+                return Err(internal(
+                    "duplicate existing rows share a UNIQUE key: catalog invariant violated",
+                ));
+            }
+        }
+    }
+    Ok(existing)
+}
+
 /// [`crate::catalog::Storage::alter_table_add_unique_constraint`]（Rust API。
 /// TABLE-16・TASK-204、Issue #905）が制約追加前に呼ぶ既存行の重複判定。
 /// `row_table`（対象テーブルの行ストア全体）を物理キー順に走査し、テナントごと
@@ -423,8 +537,24 @@ fn key_bytes(
 }
 
 /// [`key_bytes`] が使う 1 コンポーネント分のエンコード。型タグは
-/// [`ColumnType::is_primary_key_allowed`] が許可する型と 1 対 1 に対応する
-/// （新しい許可型を追加する際はここも同時に拡張する契約）。
+/// [`ColumnType::is_unique_constraint_allowed`] が許可する型と 1 対 1 に対応する
+/// （新しい許可型を追加する際はここも同時に拡張する契約。Issue #1073 で
+/// REAL・DOUBLE PRECISION・NUMERIC・JSON／JSONB・配列型を追加）。
+///
+/// # 型ごとの正規化（Issue #1073 D7。`docs/design/unique-constraint.md` D7 参照）
+///
+/// - REAL／DOUBLE PRECISION: [`crate::scalar_float::canonicalize_real`]／
+///   `canonicalize_double`（`-0.0` を `+0.0` へ正規化）した後のビットパターン。
+///   非有限値（NaN・±∞）は `Err`（`row_codec` の encode 側が非有限値を拒否する
+///   ため通常到達しないが、defense in depth として維持する）。
+/// - NUMERIC: 末尾ゼロを除去した `(unscaled, scale)` の正準形。`1.50` と `1.5`
+///   が同一キーになる（列内では `scale` が固定なので元々単射だが、複合キー・
+///   将来の型跨ぎ比較でも表現の揺れを吸収する）。
+/// - JSON／JSONB: [`crate::json::canonical_equality_text`]（値としての等価
+///   正規化テキスト。キー順・空白だけでなく数値も値として正規化する）。
+/// - 配列: `[要素タグ: u8][要素数: u32 BE][要素列の生ペイロード]`。
+///   [`crate::row_codec::ArrayRef::payload`] のエンコーダ決定性（要素順保持・
+///   flags 固定・代替表現なし）により、この組は値に対して単射になる。
 fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(), &'static str> {
     fn push_len_prefixed(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
         out.push(tag);
@@ -434,30 +564,30 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
 
     match value {
         ScalarRef::Text(s) => {
-            push_len_prefixed(out, ColumnType::Text.primary_key_tag(), s.as_bytes())
+            push_len_prefixed(out, ColumnType::Text.unique_key_tag(), s.as_bytes())
         }
         ScalarRef::Integer(i) => {
-            push_len_prefixed(out, ColumnType::Integer.primary_key_tag(), &i.to_be_bytes())
+            push_len_prefixed(out, ColumnType::Integer.unique_key_tag(), &i.to_be_bytes())
         }
         ScalarRef::BigInt(i) => {
-            push_len_prefixed(out, ColumnType::BigInt.primary_key_tag(), &i.to_be_bytes())
+            push_len_prefixed(out, ColumnType::BigInt.unique_key_tag(), &i.to_be_bytes())
         }
         ScalarRef::Bool(b) => push_len_prefixed(
             out,
-            ColumnType::Boolean.primary_key_tag(),
+            ColumnType::Boolean.unique_key_tag(),
             &[if b { 1u8 } else { 0u8 }],
         ),
         ScalarRef::Date(d) => {
-            push_len_prefixed(out, ColumnType::Date.primary_key_tag(), &d.to_be_bytes())
+            push_len_prefixed(out, ColumnType::Date.unique_key_tag(), &d.to_be_bytes())
         }
         ScalarRef::Timestamp(t) => push_len_prefixed(
             out,
-            ColumnType::Timestamp.primary_key_tag(),
+            ColumnType::Timestamp.unique_key_tag(),
             &t.to_be_bytes(),
         ),
-        ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.primary_key_tag(), b),
+        ScalarRef::Bytes(b) => push_len_prefixed(out, ColumnType::Bytea.unique_key_tag(), b),
         ScalarRef::Uuid(u) => {
-            push_len_prefixed(out, ColumnType::Uuid.primary_key_tag(), u.as_bytes())
+            push_len_prefixed(out, ColumnType::Uuid.unique_key_tag(), u.as_bytes())
         }
         ScalarRef::Enum(s) => push_len_prefixed(
             out,
@@ -467,18 +597,158 @@ fn push_canonical_component(out: &mut Vec<u8>, value: ScalarRef<'_>) -> Result<(
             9,
             s.as_bytes(),
         ),
-        ScalarRef::Real(_)
-        | ScalarRef::Double(_)
-        | ScalarRef::Array(_)
-        | ScalarRef::Json(_)
-        | ScalarRef::Numeric(_) => {
-            // `ColumnType::is_primary_key_allowed` が事前に拒否する型であり、
-            // `validate_schema` を通過したスキーマからは到達しないはずの内部
-            // 矛盾。値を黙って無視せず fail-closed に拒否する。
-            return Err("unique key column has a type that is not allowed as a unique key");
+        ScalarRef::Real(r) => {
+            let canonical = crate::scalar_float::canonicalize_real(r);
+            if !canonical.is_finite() {
+                // `row_codec` の encode 側が非有限値を既に拒否しているため
+                // 通常到達しない内部矛盾。値を黙って無視せず fail-closed に
+                // 拒否する（defense in depth）。
+                return Err("unique key REAL column has a non-finite value");
+            }
+            push_len_prefixed(
+                out,
+                ColumnType::Real.unique_key_tag(),
+                &canonical.to_bits().to_be_bytes(),
+            )
+        }
+        ScalarRef::Double(d) => {
+            let canonical = crate::scalar_float::canonicalize_double(d);
+            if !canonical.is_finite() {
+                return Err("unique key DOUBLE PRECISION column has a non-finite value");
+            }
+            push_len_prefixed(
+                out,
+                ColumnType::Double.unique_key_tag(),
+                &canonical.to_bits().to_be_bytes(),
+            )
+        }
+        ScalarRef::Numeric(d) => {
+            let (unscaled, scale) = canonical_numeric_parts(d);
+            let mut payload = Vec::with_capacity(17);
+            payload.extend_from_slice(&unscaled.to_be_bytes());
+            payload.push(scale);
+            push_len_prefixed(out, ColumnType::NUMERIC_UNIQUE_KEY_TAG, &payload)
+        }
+        ScalarRef::Json(s) => {
+            let canonical = crate::json::canonical_equality_text(s)
+                .map_err(|_| "unique key JSON column has an invalid stored value")?;
+            push_len_prefixed(out, ColumnType::Json.unique_key_tag(), canonical.as_bytes())
+        }
+        ScalarRef::Array(a) => {
+            let mut payload = Vec::new();
+            payload.push(array_elem_tag(a.elem()));
+            payload.extend_from_slice(&a.count().to_be_bytes());
+            payload.extend_from_slice(a.payload());
+            push_len_prefixed(out, ColumnType::ARRAY_UNIQUE_KEY_TAG, &payload)
         }
     }
     Ok(())
+}
+
+/// 束縛済み `VALUES`（`crate::row_codec::Value`。UPSERT の新規挿入予定値・
+/// UNIQUE 対象列の一致判定の両方で使う）から一意キーの正準バイト列を計算する
+/// （TABLE-16・Issue #1074。`sql::parser::bind_upsert_form` のバッチ内対象キー
+/// 重複検出、`tenant::upsert_typed_rows_unchecked` の UNIQUE 対象衝突判定が
+/// 本関数を共有する。既存行側の [`key_bytes`]／[`decode_key_columns`] と同じ
+/// 正準表現（型タグ＋長さ前置）を独立に再実装せず、[`push_canonical_component`]
+/// を再利用することでバイト単位の一致を構造的に保証する）。
+///
+/// `indices` は UNIQUE 制約の構成列（`schema.columns` に対する論理インデックス。
+/// `key_specs` が解決したものと同じ規約）。構成列のいずれかが `Value::Null`
+/// または列欠落の場合は `Ok(None)`（NULLS DISTINCT。本関数は UNIQUE 制約専用の
+/// 呼び出しを想定し、`NullPolicy::Reject`〔主キー〕は扱わない）。
+///
+/// `ColumnType::is_unique_constraint_allowed`（Issue #1073）が PK 許可型の
+/// 上位集合として REAL／DOUBLE PRECISION／NUMERIC／JSON／JSONB／ARRAY を
+/// UNIQUE 制約の構成列として許可するため、`resolve_conflict_target` が解決する
+/// `indices` はこれらの型の列も指しうる。本関数はそれらも
+/// [`push_canonical_component`] へ委譲することで、UNIQUE 制約が許可する型と
+/// `ON CONFLICT` 対象列として扱える型を一致させる。
+pub(crate) fn unique_key_from_values(
+    indices: &[usize],
+    values: &[crate::row_codec::Value],
+) -> Result<Option<Vec<u8>>, &'static str> {
+    use crate::row_codec::Value;
+    let mut out = Vec::new();
+    for &idx in indices {
+        let value = match values.get(idx) {
+            None | Some(Value::Null) => return Ok(None),
+            Some(v) => v,
+        };
+        // ARRAY 列（`Value::Array`）は `ScalarRef::Array` が要素列の生バイト列
+        // （`ArrayRef`）への借用を要求するため、一時バッファへ組み立ててから
+        // 借用する（`array_payload` は Array 分岐でのみ初期化され、`scalar` が
+        // それを借用している間だけこのループの 1 反復内で生存する）。
+        let array_payload: Vec<u8>;
+        let scalar = match value {
+            Value::Text(s) => ScalarRef::Text(s.as_str()),
+            Value::Integer(i) => ScalarRef::Integer(*i),
+            Value::BigInt(i) => ScalarRef::BigInt(*i),
+            Value::Bool(b) => ScalarRef::Bool(*b),
+            Value::Date(d) => ScalarRef::Date(*d),
+            Value::Timestamp(t) => ScalarRef::Timestamp(*t),
+            Value::Bytes(b) => ScalarRef::Bytes(b.as_slice()),
+            Value::Enum(s) => ScalarRef::Enum(s.as_str()),
+            Value::Uuid(u) => ScalarRef::Uuid(*u),
+            Value::Real(r) => ScalarRef::Real(*r),
+            Value::Double(d) => ScalarRef::Double(*d),
+            Value::Numeric(d) => ScalarRef::Numeric(*d),
+            Value::Json(s) => ScalarRef::Json(s.as_str()),
+            Value::Array(a) => {
+                let mut payload = Vec::new();
+                crate::row_codec::write_array_elements_payload(&mut payload, a)
+                    .map_err(|_| "unique key column has an array value that cannot be encoded")?;
+                array_payload = payload;
+                let count = u32::try_from(a.len())
+                    .map_err(|_| "unique key column has an array value that cannot be encoded")?;
+                ScalarRef::Array(crate::row_codec::ArrayRef::from_owned(
+                    a.elem(),
+                    count,
+                    &array_payload,
+                ))
+            }
+            Value::Null | Value::Vector(_) => {
+                // `ColumnType::is_unique_constraint_allowed` が事前に拒否する
+                // 型であり、UNIQUE 制約の構成列としては `validate_schema` を
+                // 通過したスキーマから到達しないはずの内部矛盾
+                // （`push_canonical_component` と同じ判断）。
+                return Err("unique key column has a type that is not allowed as a unique key");
+            }
+        };
+        push_canonical_component(&mut out, scalar)
+            .map_err(|_| "unique key column has a type that is not allowed as a unique key")?;
+    }
+    Ok(Some(out))
+}
+
+/// NUMERIC の正準 `(unscaled, scale)`: 末尾ゼロを除去した最簡表現（`1.50` と
+/// `1.5` を同一キーへ正規化する。Issue #1073 D7）。`scale == 0` に達したら
+/// それ以上は割らない。`checked_rem`／`checked_div` で整数演算を明示的に扱う
+/// （coding-rust.md）。
+fn canonical_numeric_parts(d: crate::numeric::Decimal) -> (i128, u8) {
+    let mut unscaled = d.unscaled();
+    let mut scale = d.scale();
+    while scale > 0 {
+        let Some(0) = unscaled.checked_rem(10) else {
+            break;
+        };
+        let Some(next) = unscaled.checked_div(10) else {
+            break;
+        };
+        unscaled = next;
+        scale -= 1;
+    }
+    (unscaled, scale)
+}
+
+/// 配列要素型の一意キー用固定タグ（配列列内部だけで使うスクラッチ値。
+/// [`crate::catalog::ArrayElemType`] のカタログ表現とは独立に採番してよい。
+/// `ColumnType::unique_key_tag` と同じ「非永続化のスクラッチタグ」方針）。
+fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
+    match elem {
+        crate::catalog::ArrayElemType::Text => 0,
+        crate::catalog::ArrayElemType::Bool => 1,
+    }
 }
 
 /// `FOREIGN KEY` 1 件分の参照元側の検査仕様（TABLE-17・TASK-205、Issue #907）。
@@ -545,9 +815,14 @@ fn foreign_key_specs(
 }
 
 /// 復元済みの参照元列の値から、参照先に存在しなければならない値の組を
-/// `required` へ積む。いずれかの構成列が NULL の組は検査対象外（MATCH SIMPLE。
-/// PostgreSQL の既定）。`id` 参照で負値（物理キー `id` は `u64`）は参照先が
+/// `required` へ積む。`id` 参照で負値（物理キー `id` は `u64`）は参照先が
 /// 存在し得ないため即座に違反とする。
+///
+/// `MATCH SIMPLE`（既定）はいずれかの構成列が NULL の組を検査対象外とする
+/// （PostgreSQL の既定）。`MATCH FULL`（TABLE-17・TASK-205、Issue #1077）は
+/// **すべて** NULL の組のみ検査対象外とし、NULL と非 NULL が混在する組は
+/// `Err(ForeignKeyViolation)` にする（単一列の FK は NULL が 0 個か全部＝1 個の
+/// いずれかしかあり得ないため `MATCH SIMPLE` と同じ挙動になる）。
 fn push_required_key(
     spec: &ForeignKeySpec<'_>,
     values: &[Option<ScalarRef<'_>>],
@@ -574,6 +849,16 @@ fn push_required_key(
             ids.insert(id);
         }
         RequiredParentKeys::Keys(keys) => {
+            if spec.fk.match_type() == ForeignKeyMatch::Full {
+                let null_count = spec
+                    .indices
+                    .iter()
+                    .filter(|&&idx| values.get(idx).and_then(|v| v.as_ref()).is_none())
+                    .count();
+                if null_count > 0 && null_count < spec.indices.len() {
+                    return Err(TenantWriteError::ForeignKeyViolation);
+                }
+            }
             let key_spec = KeySpec {
                 indices: spec.indices.clone(),
                 null_policy: NullPolicy::Skip,
@@ -709,18 +994,29 @@ fn parent_schema_for(
 /// 全行に存在することを確かめる。同一文・同一明示トランザクション内で先に書いた
 /// 参照先の行（自己参照で同じ文が書いた行を含む）も redb の write トランザクションが
 /// 自身の未 commit の書き込みを読めるため母集合に含まれる。`FOREIGN KEY` を宣言
-/// しないテーブルは即座に成功する。
+/// しないテーブルは即座に成功する。`fk_mode` が `ImmediateOnly` のとき
+/// `INITIALLY DEFERRED` の FK は検査対象から除く（COMMIT 時
+/// [`enforce_deferred_foreign_keys_in_txn`] へ先送りする。TABLE-17・TASK-205、
+/// Issue #1077）。
 fn enforce_foreign_keys_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     written_ids: &[u64],
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     if schema.foreign_keys().is_empty() || written_ids.is_empty() {
         return Ok(());
     }
     let (specs, mask) = foreign_key_specs(schema)?;
+    let specs: Vec<ForeignKeySpec<'_>> = specs
+        .into_iter()
+        .filter(|spec| fk_mode.includes(spec.fk))
+        .collect();
+    if specs.is_empty() {
+        return Ok(());
+    }
     let mut required: Vec<RequiredParentKeys> = specs
         .iter()
         .map(|spec| RequiredParentKeys::new(spec.fk))
@@ -791,12 +1087,16 @@ pub(crate) enum ReferencedRowsChange<'a> {
 /// 逆引きすら行わない（主キー・UNIQUE を宣言しないテーブルの `UPDATE` はコスト
 /// ゼロ）。計算量は参照元のテナント保有行数に比例する（一意性検査と同じく永続
 /// 索引は持たない。`docs/design/foreign-key.md` 参照）。
+/// `fk_mode` が `ImmediateOnly` のとき `INITIALLY DEFERRED` の FK は検査対象から
+/// 除く（COMMIT 時 [`enforce_deferred_foreign_keys_in_txn`] へ先送りする。
+/// TABLE-17・TASK-205、Issue #1077）。
 pub(crate) fn enforce_referencing_rows_in_txn(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
     schema: &TableSchema,
     tenant_id: &str,
     change: ReferencedRowsChange<'_>,
+    fk_mode: FkCheckMode,
 ) -> Result<(), TenantWriteError> {
     let is_key_column = |name: &str| -> bool {
         schema
@@ -838,43 +1138,121 @@ pub(crate) fn enforce_referencing_rows_in_txn(
                 continue;
             }
         }
-        // 参照元の同一テナント全行から、参照先に存在すべき値の組を集める。
-        let (specs, mask) = foreign_key_specs(child_schema)?;
-        let Some(spec) = specs.iter().find(|s| s.fk == fk) else {
-            return Err(internal(
-                "referencing foreign key not found in child schema",
-            ));
-        };
-        let mut required = RequiredParentKeys::new(fk);
-        {
-            let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
-            let row_table =
-                match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
-                    Ok(t) => t,
-                    // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
-                    Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                    Err(e) => {
-                        return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
-                            e,
-                        )))
-                    }
-                };
-            let range_start = std::ops::Bound::Included((tenant_id, 0u64));
-            let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
-            for entry in row_table
-                .range::<(&str, u64)>((range_start, range_end))
-                .map_err(CatalogError::from)?
-            {
-                let (k, v) = entry.map_err(CatalogError::from)?;
-                let (key_tenant, _id) = k.value();
-                if key_tenant != tenant_id {
-                    break;
-                }
-                let values = decode_key_columns(child_schema, &mask, v.value())?;
-                push_required_key(spec, &values, &mut required)?;
-            }
+        if !fk_mode.includes(fk) {
+            continue;
         }
-        verify_required_parent_keys(write_txn, table_name, schema, fk, tenant_id, required)?;
+        verify_child_rows_for_tenant(write_txn, child_schema, fk, table_name, schema, tenant_id)?;
+    }
+    Ok(())
+}
+
+/// 子テーブル `child_schema` の同一テナント全行から `fk` が要求する値の組を集め、
+/// 参照先 `parent_table`（スキーマ `parent_schema`）にすべて存在するか確かめる
+/// （TABLE-17・TASK-205、Issue #907／#1077）。[`enforce_referencing_rows_in_txn`]
+/// （事後状態の検証）と [`enforce_deferred_foreign_keys_in_txn`]（COMMIT 時の
+/// 遅延検査）が共有する唯一の実装（挙動を 2 か所で重複させない）。
+fn verify_child_rows_for_tenant(
+    write_txn: &redb::WriteTransaction,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyDef,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    tenant_id: &str,
+) -> Result<(), TenantWriteError> {
+    // 参照元の同一テナント全行から、参照先に存在すべき値の組を集める。
+    let (specs, mask) = foreign_key_specs(child_schema)?;
+    let Some(spec) = specs.iter().find(|s| s.fk == fk) else {
+        return Err(internal(
+            "referencing foreign key not found in child schema",
+        ));
+    };
+    let mut required = RequiredParentKeys::new(fk);
+    {
+        let row_table_name = crate::catalog::user_rows_table_name(&child_schema.name);
+        let row_table =
+            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+                Ok(t) => t,
+                // 参照元へまだ 1 行も挿入されていない（行ストア未作成）。
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => {
+                    return Err(TenantWriteError::from(crate::catalog::map_row_table_error(
+                        e,
+                    )))
+                }
+            };
+        let range_start = std::ops::Bound::Included((tenant_id, 0u64));
+        let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
+        for entry in row_table
+            .range::<(&str, u64)>((range_start, range_end))
+            .map_err(CatalogError::from)?
+        {
+            let (k, v) = entry.map_err(CatalogError::from)?;
+            let (key_tenant, _id) = k.value();
+            if key_tenant != tenant_id {
+                break;
+            }
+            let values = decode_key_columns(child_schema, &mask, v.value())?;
+            push_required_key(spec, &values, &mut required)?;
+        }
+        // `row_table` はここで drop してから `verify_required_parent_keys` が
+        // 参照先の行ストアを開く（自己参照で redb の `TableAlreadyOpen` を
+        // 避けるための順序。`parent_schema_for` 呼び出し元と同じ契約）。
+    }
+    verify_required_parent_keys(
+        write_txn,
+        parent_table,
+        parent_schema,
+        fk,
+        tenant_id,
+        required,
+    )
+}
+
+/// 明示トランザクション（SQL-31・TASK-221）の COMMIT 時に、文単位検査から
+/// 先送りしていた `INITIALLY DEFERRED` の `FOREIGN KEY` をまとめて検査する
+/// （TABLE-17・TASK-205、Issue #1077）。`sql::transaction::SessionTransaction::commit`
+/// が `written_by_tenant`（このトランザクション内で書き込んだ `(tenant, table)` の
+/// 集合）の各要素について呼ぶ——記録漏れは検査漏れ＝fail-open のバグになるため、
+/// 呼び出し元は書き込みのたびに必ず記録する契約（`sql::transaction::ActiveTxn`
+/// ドキュメント参照）。
+///
+/// 事後状態（COMMIT 直前の最終状態）の全件検証を行う: `table` 自身が親として
+/// 持つ `INITIALLY DEFERRED` の子（[`crate::catalog::referencing_foreign_keys_in_txn`]。
+/// v9 対応が前提——v8 のみの逆引きだと v9 の子が漏れて fail-open になる）と、
+/// `table` 自身が子として持つ `INITIALLY DEFERRED` の宣言の両方を、
+/// [`verify_child_rows_for_tenant`] で検証する（`enforce_referencing_rows_in_txn`
+/// と同じ実装を共有）。同一トランザクション内で複数文が同じ `(child, fk)` の
+/// 組に触れても検査は 1 回で済むよう、呼び出し元がテーブル単位で重複排除する。
+pub(crate) fn enforce_deferred_foreign_keys_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    let schema = crate::catalog::require_table_schema_write(write_txn, table)?;
+
+    // `table` を子とする宣言（このスキーマの `foreign_keys()`）。
+    for fk in schema.foreign_keys() {
+        if !fk.is_initially_deferred() {
+            continue;
+        }
+        let parent = parent_schema_for(write_txn, table, fk)?;
+        verify_child_rows_for_tenant(
+            write_txn,
+            &schema,
+            fk,
+            fk.parent_table(),
+            parent.as_ref().unwrap_or(&schema),
+            tenant_id,
+        )?;
+    }
+
+    // `table` を親とする他テーブル（自己参照は上のループで既に検査済み）の宣言。
+    let referencing = crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?;
+    for (child_schema, fk) in &referencing {
+        if !fk.is_initially_deferred() || child_schema.name == table {
+            continue;
+        }
+        verify_child_rows_for_tenant(write_txn, child_schema, fk, table, &schema, tenant_id)?;
     }
     Ok(())
 }
@@ -1216,6 +1594,147 @@ mod tests {
             assert!(table_has_duplicate_unique_key(&table, &schema, &columns)
                 .expect("scan must succeed"));
         }
+        write_txn.abort().expect("abort");
+    }
+
+    // --- Issue #1073: UNIQUE 制約の対象型拡張（REAL・DOUBLE PRECISION・
+    // NUMERIC・JSON／JSONB・配列型）の正準キー生成 -------------------------
+
+    /// REAL／DOUBLE PRECISION の `-0.0` は `+0.0` と同一の正準キーへ正規化される
+    /// （`push_canonical_component` が `scalar_float::canonicalize_*` を経由する）。
+    /// 非有限値（NaN）は `row_codec` の encode 側が既に拒否するため通常到達
+    /// しないが、defense in depth として本関数レベルでも `Err` を確認する。
+    #[test]
+    fn push_canonical_component_normalizes_real_and_double_negative_zero() {
+        let mut neg = Vec::new();
+        push_canonical_component(&mut neg, ScalarRef::Real(-0.0)).expect("finite");
+        let mut pos = Vec::new();
+        push_canonical_component(&mut pos, ScalarRef::Real(0.0)).expect("finite");
+        assert_eq!(neg, pos);
+
+        let mut neg_d = Vec::new();
+        push_canonical_component(&mut neg_d, ScalarRef::Double(-0.0)).expect("finite");
+        let mut pos_d = Vec::new();
+        push_canonical_component(&mut pos_d, ScalarRef::Double(0.0)).expect("finite");
+        assert_eq!(neg_d, pos_d);
+
+        let mut nan_out = Vec::new();
+        assert!(push_canonical_component(&mut nan_out, ScalarRef::Real(f32::NAN)).is_err());
+        let mut nan_out_d = Vec::new();
+        assert!(push_canonical_component(&mut nan_out_d, ScalarRef::Double(f64::NAN)).is_err());
+    }
+
+    /// NUMERIC は末尾ゼロを除去した最簡表現で同一キーになる（`1.50` と `1.5`）。
+    #[test]
+    fn push_canonical_component_normalizes_numeric_trailing_zeros() {
+        let a = crate::numeric::Decimal::from_parts(150, 2).expect("valid decimal"); // 1.50
+        let b = crate::numeric::Decimal::from_parts(15, 1).expect("valid decimal"); // 1.5
+        let mut out_a = Vec::new();
+        push_canonical_component(&mut out_a, ScalarRef::Numeric(a)).expect("ok");
+        let mut out_b = Vec::new();
+        push_canonical_component(&mut out_b, ScalarRef::Numeric(b)).expect("ok");
+        assert_eq!(out_a, out_b);
+
+        // 末尾ゼロを持たない異なる値は別キーになる。
+        let c = crate::numeric::Decimal::from_parts(151, 2).expect("valid decimal"); // 1.51
+        let mut out_c = Vec::new();
+        push_canonical_component(&mut out_c, ScalarRef::Numeric(c)).expect("ok");
+        assert_ne!(out_a, out_c);
+    }
+
+    fn extended_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("r", crate::catalog::ColumnType::Real, true),
+                ColumnDef::new(
+                    "n",
+                    crate::catalog::ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("j", crate::catalog::ColumnType::Json, true),
+                ColumnDef::new(
+                    "arr",
+                    crate::catalog::ColumnType::Array(
+                        crate::catalog::ArrayType::new(crate::catalog::ArrayElemType::Text, 8)
+                            .expect("valid array type"),
+                    ),
+                    true,
+                ),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::new(vec!["j".to_string()]),
+            crate::catalog::UniqueConstraint::new(vec!["arr".to_string()]),
+        ])
+    }
+
+    /// JSON 列は正準化前のテキスト表現（キー順・空白）が異なっても値として
+    /// 等価なら UNIQUE 制約に違反する（`json::canonical_equality_text` 経由。
+    /// Issue #1073）。
+    #[test]
+    fn unique_constraint_on_json_column_detects_value_equal_but_textually_different_rows() {
+        let (storage, _guard) = tmp_storage("constraint-unique-json");
+        let schema = extended_types_schema();
+        storage.create_table(&schema).expect("create table");
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        let row = |json: &str| {
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Json(json.to_string()),
+                Value::Null,
+            ]
+        };
+        put_raw_row(&write_txn, &schema, "tenant-a", 1, &row(r#"{"a":1,"b":2}"#));
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1])
+            .expect("first row must succeed");
+        // キー順・空白だけが異なるが値として等価な JSON テキスト。
+        put_raw_row(
+            &write_txn,
+            &schema,
+            "tenant-a",
+            2,
+            &row(r#"{ "b": 2, "a": 1 }"#),
+        );
+        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
+            .expect_err("value-equal JSON must conflict despite differing text");
+        assert!(matches!(err, TenantWriteError::UniqueViolation));
+        write_txn.abort().expect("abort");
+    }
+
+    /// 配列列の UNIQUE 制約は要素順を区別する（`{a,b}` と `{b,a}` は衝突しない）。
+    #[test]
+    fn unique_constraint_on_array_column_distinguishes_element_order() {
+        let (storage, _guard) = tmp_storage("constraint-unique-array");
+        let schema = extended_types_schema();
+        storage.create_table(&schema).expect("create table");
+        let write_txn = storage.begin_write_txn().expect("begin write");
+        let row = |items: &[&str]| {
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Array(crate::row_codec::ArrayValue::Text(
+                    items.iter().map(|s| s.to_string()).collect(),
+                )),
+            ]
+        };
+        put_raw_row(&write_txn, &schema, "tenant-a", 1, &row(&["a", "b"]));
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[1])
+            .expect("first row must succeed");
+        // 要素順が異なる配列は衝突しない。
+        put_raw_row(&write_txn, &schema, "tenant-a", 2, &row(&["b", "a"]));
+        enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[2])
+            .expect("different element order must not conflict");
+        // 完全一致は衝突する。
+        put_raw_row(&write_txn, &schema, "tenant-a", 3, &row(&["a", "b"]));
+        let err = enforce_unique_keys_in_txn(&write_txn, "docs", &schema, "tenant-a", &[3])
+            .expect_err("identical array must conflict");
+        assert!(matches!(err, TenantWriteError::UniqueViolation));
         write_txn.abort().expect("abort");
     }
 }

@@ -23,8 +23,10 @@ ON CONFLICT (id) DO UPDATE SET <col> = (EXCLUDED.<col> | <lit>)[, ...]
 USING OPERATION_ID '<id>'
 ```
 
-- 対象列リストは `(id)` のみを受理する（複数列・他列名・`ON CONSTRAINT` はいずれも
-  `42601`）。`UNIQUE` 制約を衝突対象にする拡張（TABLE-16）は対象外。
+- 対象列リストは `(id)`、または宣言済み `UNIQUE` 制約（単一列・複数列）の構成列
+  集合と一致する列名の並びを受理する（TABLE-16、Issue #1074。「ON CONFLICT 対象の
+  UNIQUE 制約列への拡張」節参照）。`ON CONSTRAINT` 形・PRIMARY KEY 宣言列・部分一意
+  制約はいずれも対象外のまま `42601`。
 - `ON CONFLICT` は複数行 `VALUES`（SQL-16、TASK-190）と併用でき、全行が同じ衝突分岐を
   共有する。
 - `ON CONFLICT` はファイル形 `INSERT`（`path`/`body` 列指定。TASK-120）とは併用できない
@@ -72,6 +74,44 @@ name }` を追加した（**BREAKING CHANGE**）。空白を挟まず「識別�
 - RLS-11（read-your-writes。TASK-195）導入後の認証セッション `PolicyContext` は
   自テナント `Private` 行を可視とするため、wire／HTTP 経由では「可視集合 ＝ 所有集合」
   となり実質一致する。
+
+## ON CONFLICT 対象の UNIQUE 制約列への拡張（TABLE-16、Issue #1074）
+
+PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突対象を UNIQUE 列に
+すること」を実装する。関連ポインタ: TABLE-16・RECOVER-10〜12。
+
+- **構文段階**（`sql::allowlist::parse_on_conflict_clause`）は対象列リストを `id` に
+  限らず任意の識別子の並びとして受理する（列数上限は UNIQUE 制約と同じ
+  `MAX_UNIQUE_CONSTRAINT_COLUMNS`（32）、重複列名は `42601`）。実在性・意味論的妥当性は
+  検証しない。
+- **束縛段階**（`sql::parser::resolve_conflict_target`）でスキーマと照合する:
+  対象が `(id)` のみなら `BoundConflictTarget::RowId`（本 Issue 導入前と完全に同じ
+  挙動）。それ以外は、対象列の**集合**が宣言済み `UNIQUE` 制約（`schema.
+  unique_constraints()`）のいずれかの構成列集合と一致する場合にのみ
+  `BoundConflictTarget::Unique(indices)` へ解決する。`indices` は**対象リストに
+  書いた順ではなく解決した制約の宣言順**になる（`(a,b)` と `(b,a)` は同じ制約として
+  同じ並びに解決される）。次はいずれも `42601`: `id` と他列の混在、未知列、大小文字
+  違い、`PRIMARY KEY` 宣言列（`schema.primary_key()` は対象に含めない）、どの
+  `UNIQUE` 制約とも一致しない列集合。
+- **衝突判定**（`tenant::upsert_typed_rows_unchecked`）: `UpsertTarget::Unique` は
+  書き込み**前**に対象テナントの既存行を 1 回だけ走査し（`constraint::
+  scan_tenant_rows_by_unique_key`。`enforce_unique_keys_in_txn` と同じ
+  `(tenant_id, 0)..=(tenant_id, u64::MAX)` の閉区間・可視性を問わない全行が母集合。
+  RLS-9・RLS-10 (c)）、対象キー→既存行 id の対応表を作る。各 `VALUES` 行はこの表と
+  照合し、一致すればその既存行 id に対して `DO NOTHING`／`DO UPDATE`（read-merge-
+  write は `(id)` 対象と共有）を行い、一致しなければ `VALUES` の `id` で新規挿入する
+  （同じ `id` を持つ既存行があれば通常どおり `23505`）。対象キーの正準化
+  （`constraint::unique_key_from_values`）は書き込み時検査点（`key_bytes`／
+  `decode_key_columns`）と同じ表現を共有し、NULL を含むキーは NULLS DISTINCT として
+  常に非衝突（新規挿入）。
+- **バッチ内対象キー重複**: `(id)` 対象のバッチ内 `id` 重複と同じ理由で、束縛時
+  （write トランザクション開始前・決定的）に `22000` で拒否する（NULL を含むキーは
+  対象外）。`tenant::upsert_typed_rows_unchecked` 側にも同じ判定の防御的二重検査を
+  持つ。
+- **ハッシュ（RECOVER-11(a)）**: `content_hash::for_typed_upsert` の action tag を
+  UNIQUE 対象では `2`／`3`（`(id)` 対象の `0`／`1` とは別）にずらし、続けて対象列数・
+  列名（解決した制約の宣言順）を連結する。`(id)` 対象のレイアウトはバイト単位で不変
+  （golden テスト `for_typed_upsert_row_id_layout_is_golden` で固定）。
 
 ## 判定順序
 
@@ -180,8 +220,10 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
 ## 対象外・申し送り
 
 - `RETURNING` 句（別 Issue の担当）。
-- `UNIQUE` 制約を衝突対象にする拡張（TABLE-16）・複数列／部分一意制約の
-  `ON CONFLICT`。
+- `UNIQUE` 制約を衝突対象にする拡張（TABLE-16）は Issue #1074 で実装済み
+  （「ON CONFLICT 対象の UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を
+  対象にすること・`ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の
+  `ON CONFLICT` は引き続き対象外（`42601`）。
 - `23505` の `code` ラベル分離（`DUPLICATE_OPERATION_ID` vs `UNIQUE_VIOLATION`。
   RECOVER-12・別 Issue）。
 - NoSQL 表層の UPSERT（`on_conflict` キーの規範化）。

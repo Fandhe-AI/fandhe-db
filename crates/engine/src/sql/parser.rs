@@ -17,9 +17,9 @@
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OnConflictAction, OrderByForm, Projection, ScalarOrderKey,
-    UpsertValue, ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement,
-    WherePredicate,
+    FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause, OrderByForm, Projection,
+    ScalarOrderKey, UpsertValue, ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete,
+    ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -1376,12 +1376,41 @@ pub(crate) fn bind_where_predicates(
         node_budget,
         dummy_equality_flags,
         &mut equality_ordinal,
+        crate::sql::udf_call::ColumnRefPolicy::IdAndVectorOnly,
     )
 }
 
-/// [`bind_where_predicates`] の再帰本体。トップレベルの述語列だけでなく、
-/// [`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも自分自身を
-/// 再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
+/// `CHECK` 制約の式述語束縛専用（Issue #1075・TABLE-16 ポインタ）。
+/// [`bind_where_predicates`] と同じ束縛経路（`bind_where_predicates_recursive`）
+/// を共有しつつ、`WherePredicate::Expression` の束縛だけを
+/// [`crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns`] へ切り替え、
+/// INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可する opt-in 拡張（`WHERE`／
+/// `SELECT`／Describe 系の挙動は一切変えない。汎用のレーン A は対象外）。
+/// `sql::check_constraint::CompiledChecks::compile`・`validate_and_build`・
+/// `recompute_referenced_columns` の 3 箇所から呼ばれる。
+pub(crate) fn bind_check_predicates(
+    where_predicates: &[WherePredicate],
+    schema: &TableSchema,
+    node_budget: &mut usize,
+) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    let empty_udfs = crate::sql::udf_call::UdfRegistry::default();
+    let mut equality_ordinal: usize = 0;
+    bind_where_predicates_recursive(
+        where_predicates,
+        schema,
+        &empty_udfs,
+        node_budget,
+        &[],
+        &mut equality_ordinal,
+        crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns,
+    )
+}
+
+/// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
+/// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
+/// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。`column_ref_policy` は
+/// `WherePredicate::Expression` の束縛（`udf_call::bind_expr_with_policy`）へ
+/// そのまま伝播する（Issue #1075・TABLE-16 ポインタ）。
 fn bind_where_predicates_recursive(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1389,6 +1418,7 @@ fn bind_where_predicates_recursive(
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
     equality_ordinal: &mut usize,
+    column_ref_policy: crate::sql::udf_call::ColumnRefPolicy,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
@@ -1404,7 +1434,13 @@ fn bind_where_predicates_recursive(
                 rls_predicate_present = true;
             }
             WherePredicate::Expression(expr) => {
-                let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                let (bound, ty) = crate::sql::udf_call::bind_expr_with_policy(
+                    expr,
+                    schema,
+                    udfs,
+                    node_budget,
+                    column_ref_policy,
+                )?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression must evaluate to a boolean (use a comparison)",
@@ -1428,6 +1464,7 @@ fn bind_where_predicates_recursive(
                             node_budget,
                             dummy_equality_flags,
                             equality_ordinal,
+                            column_ref_policy,
                         )?;
                     bound_branches.push(crate::sql::where_tree::BoundConjunction::new(
                         branch_metadata,
@@ -1723,9 +1760,12 @@ impl BoundPredicateDelete {
     /// （NoSQL 表層 `delete` op〔#875・#876・NOSQL-12〕の入口。`BoundScan::new`
     /// と同じ契約。`expr_filters` のステップ列コンパイルは内部で行う）。
     /// `or_filters` は常に空（NoSQL 表層は `OR` 未対応。TASK-208・Issue #912）。
-    /// 影響行数上限は `MAX_DML_AFFECTED_ROWS`／`check_dml_affected_rows`
-    /// （UPDATE と共有する唯一の上限 API。Issue #997 で統合）を実行結線側が
-    /// 直接参照するため、本 constructor は上限値を引数に取らない。
+    /// 影響行数上限は `check_dml_affected_rows_with_limit`（UPDATE と共有する
+    /// 唯一の上限 API）へ渡す値（`core.rs::EngineCore::dml_limits.
+    /// max_affected_rows`。起動時 CLI 設定値。Issue #997）を実行結線側が
+    /// 直接参照するため、本 constructor は上限値を引数に取らない（本 constructor
+    /// を経由して `execute_predicate_delete` へ到達する将来の呼び出し元があれば、
+    /// その経路も同じ process-wide 設定値を自動的に共有する）。
     pub fn new(
         table: String,
         metadata_filters: Vec<MetadataFilter>,
@@ -1781,10 +1821,11 @@ impl BoundPredicateDelete {
 /// API）。`WHERE` の意味論は検索 SELECT（[`bind_in_session`]）・集計 SELECT
 /// （[`bind_aggregate`]）・広域取得（[`bind_scan`]）と共有する
 /// （[`bind_where_predicates`]。第 2 の述語評価器を作らない）。影響行数上限は
-/// UPDATE と共有する唯一の上限 API（[`MAX_DML_AFFECTED_ROWS`]・
-/// [`check_dml_affected_rows`]。Issue #997 で統合）を実行結線
-/// （`sql/exec.rs::execute_predicate_delete`）が変更開始前・副作用ゼロの時点で
-/// 直接参照するため、本関数は上限値を運搬しない。
+/// UPDATE と共有する唯一の上限 API（[`check_dml_affected_rows_with_limit`]）へ
+/// 渡す値（`core.rs::EngineCore::dml_limits.max_affected_rows`。起動時 CLI
+/// 設定値。Issue #997）を実行結線（`sql/exec.rs::execute_predicate_delete`）が
+/// 呼び出し元から受け取り、変更開始前・副作用ゼロの時点で判定するため、本関数は
+/// 上限値を運搬しない。
 pub fn bind_predicate_delete(
     stmt: &ValidatedPredicateDelete,
     schema: &TableSchema,
@@ -2579,35 +2620,136 @@ fn bind_set_assignments(
 }
 
 /// 1 文の `UPDATE`／`DELETE`（述語形。SQL-19・SQL-20 系）が変更してよい行数の
-/// 上限（本リポの実装既定値であり、spec 由来の数値ではない。SQL-16・TASK-190 の
-/// `MAX_INSERT_ROWS_PER_STATEMENT` と同じ「1 文あたり」の桁に揃える）。束縛段階
-/// では対象行数が確定しないため、実行結線（`sql/exec.rs` の
+/// 上限判定 API（Issue #997・オーナー判断の改訂〔2026-09-27、前回のオーナー
+/// 判断を置き換え〕）。汎用 RDB（PostgreSQL 等）の挙動に合わせ、**既定では
+/// 上限を持たない**（`limit: None`）。`wire-server` 起動時 CLI フラグ
+/// （`--max-dml-affected-rows`）で明示指定した場合のみ、その値
+/// （`Some(NonZeroUsize)`）で判定する。旧オーナー判断（既定値 1,000 を常に
+/// 適用）に基づく `pub const MAX_DML_AFFECTED_ROWS`・
+/// `pub fn check_dml_affected_rows(count)`（`limit` 引数を取らない版）は、
+/// 「既定＝上限なし」を型で表せないため削除した（**BREAKING CHANGE**。
+/// `EngineCore::open()` 等・`--max-dml-affected-rows` 未指定の構成では、従来
+/// 1,000 件超過で拒否していた述語形 UPDATE／DELETE が成功するようになる）。
+/// 資源上限は本上限に代わって [`crate::tenant::MAX_SCANNED_ROWS`]（1 文あたり
+/// 総走査行数上限。`limit` の設定有無に関わらず常に適用）が引き続き担保する
+/// （`docs/design/predicate-dml-exec.md` §6 参照）。
+///
+/// 束縛段階では対象行数が確定しないため、実行結線（`sql/exec.rs` の
 /// `execute_predicate_update`／`execute_predicate_delete`）が変更を開始する前に
-/// [`check_dml_affected_rows`] を呼ぶ契約とする（構造検証・束縛のみを担う本
-/// モジュールは値を提供するのみで、判定自体はここでは行わない）。`count` は
-/// 対象行集合の全件列挙結果である必要はなく、広い述語（例: 全行に一致する
-/// `WHERE`）による無制限列挙を避けるため、呼び出し元は候補行を
-/// `MAX_DML_AFFECTED_ROWS + 1` 件に達した時点で列挙を打ち切ってその件数を渡して
-/// よい（早期終了。security.md「不安全な設計」＝未検証入力によるリソース増幅の
-/// 回避）。UPDATE／DELETE（述語形）共通の唯一の上限 API であり、以前 DELETE 側に
-/// 存在した別系統（`DEFAULT_MAX_DML_AFFECTED_ROWS`・`check_affected_row_count`）は
-/// Issue #997 で本 API へ統合済み。
-pub const MAX_DML_AFFECTED_ROWS: usize = 1_000;
-
-/// `count`（対象行数。[`MAX_DML_AFFECTED_ROWS`] を超えたかどうかの判定にのみ
-/// 使うため、呼び出し元は `MAX_DML_AFFECTED_ROWS + 1` 件で打ち切った列挙結果を
-/// 渡してよい）が [`MAX_DML_AFFECTED_ROWS`] を超えないか検証する。超過は
-/// [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail` には件数と上限のみを
-/// 含め、テナント・行内容には触れない（fail-closed。実行前・副作用ゼロの段階で
-/// 拒否する契約。呼び出し元は `execute_predicate_update`・`execute_predicate_delete`
-/// が変更開始前に呼ぶ）。
-pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError> {
-    if count > MAX_DML_AFFECTED_ROWS {
+/// [`check_dml_affected_rows_with_limit`] を呼ぶ契約とする（構造検証・束縛のみを
+/// 担う本モジュールは値を提供するのみで、判定自体はここでは行わない）。`count`
+/// は対象行集合の全件列挙結果である必要はなく、`limit` が `Some` の場合は
+/// 広い述語（例: 全行に一致する `WHERE`）による無制限列挙を避けるため、
+/// 呼び出し元は候補行を `limit + 1` 件に達した時点で列挙を打ち切ってその件数を
+/// 渡してよい（早期終了。security.md「不安全な設計」＝未検証入力による
+/// リソース増幅の回避。`limit` が `None` の場合はこの早期終了自体が行われず
+/// `MAX_SCANNED_ROWS` のみで頭打ちになる——`tenant::enumerate_dml_candidates`
+/// ドキュメント参照）。UPDATE／DELETE（述語形）共通の唯一の上限判定 API。
+///
+/// `count`（対象行数）が `limit`（`Some` のときのみ判定。`None` は常に
+/// 成功——資源上限は呼び出し元の `MAX_SCANNED_ROWS` 判定に委ねる）を超えない
+/// か検証する。超過は [`SqlSurfaceError::PayloadTooLarge`]（`54000`）。`detail`
+/// には件数と上限のみを含め、テナント・行内容には触れない（fail-closed。
+/// 実行前・副作用ゼロの段階で拒否する契約。呼び出し元は
+/// `execute_predicate_update`・`execute_predicate_delete` が変更開始前に呼ぶ）。
+pub fn check_dml_affected_rows_with_limit(
+    count: usize,
+    limit: Option<std::num::NonZeroUsize>,
+) -> Result<(), SqlSurfaceError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    if count > limit.get() {
         return Err(SqlSurfaceError::payload_too_large(format!(
-            "DML affected row count {count} exceeds limit {MAX_DML_AFFECTED_ROWS}"
+            "DML affected row count {count} exceeds limit {limit}"
         )));
     }
     Ok(())
+}
+
+/// [`DmlLimits`] を明示設定する場合に取れる範囲の下限（Issue #997・オーナー
+/// 判断 2026-09-27）。`0` は範囲外として拒否する（`NonZeroUsize` で型として
+/// 保証するため、本定数は主に `Display`／CLI エラーメッセージ向け）。
+pub const MIN_DML_ROW_LIMIT: usize = 1;
+
+/// [`DmlLimits`] を明示設定する場合に取れる範囲の上限（Issue #997・オーナー
+/// 判断 2026-09-27）。総走査行数上限 [`crate::tenant::MAX_SCANNED_ROWS`] と同値を
+/// 採用し、DML の 1 文あたり上限が走査上限を超えて無意味に大きくなることを防ぐ
+/// （値のドリフト防止のため定数を再利用し、独立したリテラルを持たない）。
+pub const MAX_DML_ROW_LIMIT: usize = crate::tenant::MAX_SCANNED_ROWS;
+
+/// [`validate_dml_row_limit`] が範囲外の値を検出した際のエラー。`Display` には
+/// 入力値と許容範囲のみを含める（テナント・行内容に触れない。fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmlRowLimitOutOfRange {
+    pub value: usize,
+}
+
+impl std::fmt::Display for DmlRowLimitOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "value {} is out of range {MIN_DML_ROW_LIMIT}..={MAX_DML_ROW_LIMIT}",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for DmlRowLimitOutOfRange {}
+
+/// `value` が [`MIN_DML_ROW_LIMIT`]`..=`[`MAX_DML_ROW_LIMIT`] の範囲内かを検証し、
+/// `NonZeroUsize` へ変換する（Issue #997）。`wire-server` の CLI フラグ解析
+/// （`--max-dml-affected-rows`・`--max-insert-rows`）が数値へパースした後に
+/// この関数を呼び、範囲外を起動時に fail-closed で拒否する契約——本関数は
+/// 文字列パース自体を担わない（untrusted な CLI 引数の数値パース自体は
+/// 呼び出し元の責務。coding-rust.md「untrusted 入力の扱い」対応で、範囲判定
+/// というドメイン知識だけを engine 側に集約する）。フラグ未指定（上限なし）を
+/// 表す `None` は本関数の対象外——呼び出し元がフラグ未指定を検出した時点で
+/// `DmlLimits` の該当フィールドへ直接 `None` を設定する。
+pub fn validate_dml_row_limit(
+    value: usize,
+) -> Result<std::num::NonZeroUsize, DmlRowLimitOutOfRange> {
+    if !(MIN_DML_ROW_LIMIT..=MAX_DML_ROW_LIMIT).contains(&value) {
+        return Err(DmlRowLimitOutOfRange { value });
+    }
+    // `value >= MIN_DML_ROW_LIMIT == 1` を上の範囲検査で確定済みのため
+    // `NonZeroUsize::new` は必ず `Some` になるが、`unwrap`/`expect`
+    // （coding-rust.md「受信データ経路では unwrap/expect 禁止」）を避けて
+    // fail-closed に倒す（原理的に到達しない分岐だが、将来の定数変更等で
+    // 前提が崩れた場合でもパースエラーとして拒否し、パニックさせない）。
+    std::num::NonZeroUsize::new(value).ok_or(DmlRowLimitOutOfRange { value })
+}
+
+/// プロセス全体の DML 行数上限 2 種（Issue #997。オーナー判断の改訂
+/// 〔2026-09-27〕）をまとめて保持する値の入れ物。`core.rs::EngineCore::
+/// with_dml_limits` が受け取り、`wire-server` の起動時 CLI フラグからのみ
+/// 設定する契約——セッション・テナント単位で差し替える経路は設けない
+/// （`crate::batch_limits::BatchLimits` と同じ「起動時に 1 回だけ設定する
+/// プロセス構成値」の設計方針）。
+///
+/// **各フィールドは `None`＝上限なし（既定）を表す**（汎用 RDB との整合を
+/// 理由とするオーナー判断。`docs/design/predicate-dml-exec.md` §6 参照）。
+/// `Some(NonZeroUsize)` は CLI フラグで明示指定した値（`1..=MAX_DML_ROW_LIMIT`。
+/// [`validate_dml_row_limit`] が範囲検証済み）。
+///
+/// - `max_affected_rows`: 述語形 UPDATE/DELETE の 1 文あたり影響行数上限
+///   （[`check_dml_affected_rows_with_limit`] へ渡す。`sql/exec.rs` の
+///   `execute_predicate_update`／`execute_predicate_delete` が参照する）。
+/// - `max_insert_rows_per_statement`: 複数行 `VALUES` の 1 文あたり行数上限
+///   （`sql::allowlist::Parser::parse_insert` が構文段で判定する。
+///   `validate_insert_with_limit`／`validate_insert_tokens_with_limit` 経由で
+///   到達する）。
+///
+/// いずれも既定値（[`Default`] 実装）は `None`（上限なし）で、
+/// `EngineCore::with_dml_limits` を呼ばない既存の構築経路（`EngineCore::open` 等）
+/// も同じ既定のまま不変。資源上限は [`crate::tenant::MAX_SCANNED_ROWS`]（総走査
+/// 行数上限。両フィールドの設定有無に関わらず常に適用）・SQL 文長上限
+/// （`sql::lexer` の入力長上限）・wire 1 メッセージ上限（`wire-server::limits`）・
+/// 一括投入上限（`crate::batch_limits::BatchLimits`）が引き続き担保する。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DmlLimits {
+    pub max_affected_rows: Option<std::num::NonZeroUsize>,
+    pub max_insert_rows_per_statement: Option<std::num::NonZeroUsize>,
 }
 
 /// 束縛済みの述語つき `UPDATE` 文（SQL-19、TASK-192・Issue #869。実行結線は
@@ -2742,40 +2884,54 @@ pub fn bind_update_form(
         ValidatedUpdateForm::Single(single) => {
             Ok(BoundUpdateForm::Single(bind_update(single, schema)?))
         }
-        ValidatedUpdateForm::Predicate(predicate) => {
-            let assignments = bind_set_assignments(&predicate.assignments, schema)?;
-
-            let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-            let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
-                bind_where_predicates(
-                    &predicate.where_predicates,
-                    schema,
-                    udfs,
-                    &mut node_budget,
-                    &[],
-                )?;
-
-            // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b`
-            // だけの述語（`metadata_filters`／`expr_filters` は両方空）が
-            // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
-            // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
-            // 回帰になるため、判定漏れとして修正する）。
-            if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
-                return Err(SqlSurfaceError::unsupported(
-                    "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
-                ));
-            }
-
-            Ok(BoundUpdateForm::Predicate(BoundPredicateUpdate::new(
-                predicate.table_name.clone(),
-                assignments,
-                metadata_filters,
-                expr_filters,
-                or_filters,
-                predicate.operation_id.clone(),
-            )))
-        }
+        ValidatedUpdateForm::Predicate(predicate) => Ok(BoundUpdateForm::Predicate(
+            bind_predicate_update(predicate, schema, udfs)?,
+        )),
     }
+}
+
+/// [`bind_update_form`] の `Predicate` 分岐が呼ぶ束縛本体（Issue #1062 で
+/// 抽出。SQL 表層の述語形 `UPDATE`（[`crate::sql::allowlist::
+/// ValidatedUpdateForm::Predicate`]）と、NoSQL 表層の `update` op `filter`
+/// （述語形。TASK-186・NOSQL-12）が [`crate::core::EngineCore::
+/// execute_bound_predicate_update_in_session`] 経由で共有する唯一の束縛経路
+/// （第 2 の実行器を作らない設計）。[`bind_predicate_delete`] と対になる。
+pub(crate) fn bind_predicate_update(
+    predicate: &crate::sql::allowlist::ValidatedPredicateUpdate,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundPredicateUpdate, SqlSurfaceError> {
+    let assignments = bind_set_assignments(&predicate.assignments, schema)?;
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
+        bind_where_predicates(
+            &predicate.where_predicates,
+            schema,
+            udfs,
+            &mut node_budget,
+            &[],
+        )?;
+
+    // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b`
+    // だけの述語（`metadata_filters`／`expr_filters` は両方空）が
+    // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
+    // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
+    // 回帰になるため、判定漏れとして修正する）。
+    if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
+        ));
+    }
+
+    Ok(BoundPredicateUpdate::new(
+        predicate.table_name.clone(),
+        assignments,
+        metadata_filters,
+        expr_filters,
+        or_filters,
+        predicate.operation_id.clone(),
+    ))
 }
 
 /// ファイル形 `INSERT` の束縛結果（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。
@@ -2823,6 +2979,22 @@ pub enum BoundConflictAction {
     DoUpdate(Vec<(usize, BoundUpsertValue)>),
 }
 
+/// 束縛済みの `ON CONFLICT` 対象（TABLE-16、Issue #1074。`sql::allowlist::
+/// OnConflictClause::target` をスキーマ照合して解決した形）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundConflictTarget {
+    /// `ON CONFLICT (id)`（本 Issue〔#1074〕導入前の唯一の受理形。挙動・応答は
+    /// 完全に不変）。
+    RowId,
+    /// `ON CONFLICT (<col>[, <col>]*)` が、宣言済み UNIQUE 制約のいずれか
+    /// （`schema.unique_constraints()`）の構成列**集合**と一致した場合の解決結果。
+    /// `Vec<usize>` は `schema.columns` に対する論理インデックスで、**解決した
+    /// 制約の宣言順**（対象リストに書いた順ではない。`(a,b)` と `(b,a)` は
+    /// 同じ制約に解決され、同じ並びになる——`content_hash::for_typed_upsert`
+    /// の再送判定・golden ハッシュがこの順序に依存する）。
+    Unique(Vec<usize>),
+}
+
 /// 束縛済みの UPSERT 文（SQL-20・TASK-193、Issue #872。実行結線は
 /// `sql::exec::execute_upsert`）。`rows` は [`bind_insert_row`] で個別に束縛
 /// 済みの行（行数に関わらず 1 件以上）で、`action` は全行が共有する衝突分岐
@@ -2831,6 +3003,8 @@ pub enum BoundConflictAction {
 pub struct BoundUpsert {
     pub table: String,
     pub rows: Vec<BoundInsert>,
+    /// 衝突判定の対象（TABLE-16、Issue #1074）。
+    pub target: BoundConflictTarget,
     pub action: BoundConflictAction,
     pub operation_id: Option<OperationId>,
 }
@@ -2894,13 +3068,13 @@ pub fn bind_insert_form(
     // `ON CONFLICT ...`（SQL-20・TASK-193、Issue #872）は判別規則より前に分岐
     // する（ファイル形との併用は明示的に `42601` で拒否し、行形との併用は
     // 行数に関わらず必ず `bind_upsert_form` を経由させる）。
-    if let Some(action) = &stmt.on_conflict {
+    if let Some(clause) = &stmt.on_conflict {
         if is_file_form_shape {
             return Err(SqlSurfaceError::unsupported(
                 "ON CONFLICT is not supported for file-form INSERT (path/body columns)",
             ));
         }
-        return bind_upsert_form(stmt, action, schema);
+        return bind_upsert_form(stmt, clause, schema);
     }
 
     if is_file_form_shape {
@@ -2930,20 +3104,88 @@ pub fn bind_insert_form(
     }
 }
 
+/// [`bind_upsert_form`] の対象列解決本体（TABLE-16、Issue #1074）。
+/// `sql::allowlist::OnConflictClause::target`（構文段階では検証していない
+/// 列名の並び）を `schema` と照合し、`(id)` 単独なら [`BoundConflictTarget::
+/// RowId`]（本 Issue 導入前と完全に同じ挙動）、それ以外は宣言済み UNIQUE
+/// 制約（`schema.unique_constraints()`。`schema.primary_key()` は対象外——
+/// PRIMARY KEY 宣言列を対象にすることは本 Issue のスコープ外・申し送り）の
+/// いずれかと**列名の集合**が一致する場合にのみ解決する（`(a,b)` と `(b,a)` は
+/// 同じ制約として解決され、`Unique` が返す列インデックスは対象リストに書いた
+/// 順ではなく**解決した制約の宣言順**になる。`content_hash::for_typed_upsert`
+/// の再送判定・golden ハッシュがこの順序に依存する）。
+///
+/// 次のいずれかに該当する入力はすべて `42601`
+/// （[`SqlSurfaceError::unsupported`]。固定文言）で拒否する:
+/// - `id` と他の列が混在する対象リスト
+/// - どの UNIQUE 制約の構成列集合とも一致しない（未知列・大小文字違い・
+///   PRIMARY KEY 宣言列を含む場合も、一致する UNIQUE 制約が無い以上ここに
+///   丸め込まれる）
+fn resolve_conflict_target(
+    target: &[String],
+    schema: &TableSchema,
+) -> Result<BoundConflictTarget, SqlSurfaceError> {
+    if target.len() == 1 && target[0] == "id" {
+        return Ok(BoundConflictTarget::RowId);
+    }
+    if target.iter().any(|c| c == "id") {
+        return Err(SqlSurfaceError::unsupported(
+            "ON CONFLICT target list must be exactly (id) or match a UNIQUE constraint's columns",
+        ));
+    }
+    let target_set: std::collections::BTreeSet<&str> =
+        target.iter().map(std::string::String::as_str).collect();
+    for constraint in schema.unique_constraints() {
+        let constraint_set: std::collections::BTreeSet<&str> = constraint
+            .columns()
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        if constraint_set != target_set {
+            continue;
+        }
+        let indices: Vec<usize> = constraint
+            .columns()
+            .iter()
+            .map(|name| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal: unique constraint column not found in live schema"
+                            .to_string(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok(BoundConflictTarget::Unique(indices));
+    }
+    Err(SqlSurfaceError::unsupported(
+        "ON CONFLICT target list does not match any declared UNIQUE constraint",
+    ))
+}
+
 /// [`bind_insert_form`] が `stmt.on_conflict` を検出した場合の束縛本体
-/// （SQL-20・TASK-193、Issue #872）。行数に関わらず全行を [`bind_insert_row`]
-/// で個別に束縛してからバッチ内 `id` 重複を検出する（`tenant::insert_typed_
+/// （SQL-20・TASK-193、Issue #872。対象列を UNIQUE 制約列へ拡張:
+/// TABLE-16、Issue #1074）。行数に関わらず全行を [`bind_insert_row`] で
+/// 個別に束縛してからバッチ内 `id` 重複を検出する（`tenant::insert_typed_
 /// rows_unchecked` の `TenantWriteError::IdConflict`〔`23505`〕は UPSERT の
 /// 衝突分岐とは意味が異なり使えないため、束縛時点〔write トランザクション開始
 /// 前・決定的〕で `22000` として拒否する。2 行目を「1 行目への更新」と解釈
-/// しない）。最後に `DO UPDATE SET` の右辺（[`bind_upsert_assignments`]）を
-/// 束縛し、`EXCLUDED.<col>` が参照する列が `Null` かつ対象列が非 nullable の
-/// 組み合わせを行ごとに検出する（`docs/design/sql-upsert.md` 参照）。
+/// しない）。UNIQUE 対象（`BoundConflictTarget::Unique`）はさらに、バッチ内の
+/// 対象キー重複（NULL を含むキーは対象外。NULLS DISTINCT）も同じ理由・同じ
+/// `22000` で拒否する（`tenant::upsert_typed_rows_unchecked` 側の防御的二重
+/// 検査と同じ正準化 [`crate::constraint::unique_key_from_values`] を共有）。
+/// 最後に `DO UPDATE SET` の右辺（[`bind_upsert_assignments`]）を束縛し、
+/// `EXCLUDED.<col>` が参照する列が `Null` かつ対象列が非 nullable の組み合わせを
+/// 行ごとに検出する（`docs/design/sql-upsert.md` 参照）。
 fn bind_upsert_form(
     stmt: &ValidatedInsert,
-    action: &OnConflictAction,
+    clause: &OnConflictClause,
     schema: &TableSchema,
 ) -> Result<BoundInsertForm, SqlSurfaceError> {
+    let target = resolve_conflict_target(&clause.target, schema)?;
+    let action = &clause.action;
     let mut rows: Vec<BoundInsert> = Vec::new();
     rows.try_reserve_exact(stmt.rows.len()).map_err(|_| {
         SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
@@ -2968,6 +3210,25 @@ fn bind_upsert_form(
                 "duplicate id {} within the same UPSERT statement",
                 row.id
             )));
+        }
+    }
+
+    if let BoundConflictTarget::Unique(indices) = &target {
+        let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        seen_keys.try_reserve(rows.len()).map_err(|_| {
+            SqlSurfaceError::payload_too_large("failed to reserve UPSERT target key set")
+        })?;
+        for row in &rows {
+            let Some(key) = crate::constraint::unique_key_from_values(indices, &row.values)
+                .map_err(SqlSurfaceError::invalid_input)?
+            else {
+                continue;
+            };
+            if !seen_keys.insert(key) {
+                return Err(SqlSurfaceError::invalid_input(
+                    "duplicate ON CONFLICT target key within the same UPSERT statement",
+                ));
+            }
         }
     }
 
@@ -3025,6 +3286,7 @@ fn bind_upsert_form(
     Ok(BoundInsertForm::Upsert(BoundUpsert {
         table: stmt.table_name.clone(),
         rows,
+        target,
         action: bound_action,
         operation_id: stmt.operation_id.clone(),
     }))
@@ -6517,19 +6779,64 @@ mod tests {
         );
     }
 
+    // --- Issue #997（オーナー判断の改訂 2026-09-27）: DmlLimits・
+    // check_dml_affected_rows_with_limit・validate_dml_row_limit
+    // （既定は上限なし＝`None`。CLI 明示指定時のみ `Some` で有効化） ---------
+
     #[test]
-    fn check_dml_affected_rows_accepts_up_to_limit_and_rejects_over_limit() {
-        assert!(check_dml_affected_rows(MAX_DML_AFFECTED_ROWS).is_ok());
-        let err = check_dml_affected_rows(MAX_DML_AFFECTED_ROWS + 1).unwrap_err();
+    fn check_dml_affected_rows_with_limit_none_always_accepts() {
+        // 既定（CLI 未指定）は上限なし。大きな件数でも常に成功する
+        // （資源上限は `tenant::MAX_SCANNED_ROWS` 側が別途担保する）。
+        assert!(check_dml_affected_rows_with_limit(0, None).is_ok());
+        assert!(check_dml_affected_rows_with_limit(1_000_000, None).is_ok());
+    }
+
+    #[test]
+    fn check_dml_affected_rows_with_limit_some_accepts_up_to_limit_and_rejects_over_limit() {
+        let limit = std::num::NonZeroUsize::new(5).expect("5 is nonzero");
+        assert!(check_dml_affected_rows_with_limit(5, Some(limit)).is_ok());
+        let err = check_dml_affected_rows_with_limit(6, Some(limit)).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
-    fn check_dml_affected_rows_accepts_zero_count() {
-        // Issue #997 で DELETE 側の別系統（`check_affected_row_count`）を統合した
-        // ことで失われた「`count == 0` は常に許容される」境界を、唯一の上限 API
-        // 側でも固定する（`count > MAX_DML_AFFECTED_ROWS` の厳密比較の確認）。
-        assert!(check_dml_affected_rows(0).is_ok());
+    fn check_dml_affected_rows_with_limit_some_accepts_zero_count() {
+        let limit = std::num::NonZeroUsize::new(5).expect("5 is nonzero");
+        assert!(check_dml_affected_rows_with_limit(0, Some(limit)).is_ok());
+    }
+
+    #[test]
+    fn dml_limits_default_is_unset_no_cap() {
+        // オーナー判断の改訂（2026-09-27）: 汎用 RDB との整合のため既定は
+        // 上限なし。旧既定値 1,000 は CLI 明示指定時のみ意味を持つ。
+        let limits = DmlLimits::default();
+        assert_eq!(limits.max_affected_rows, None);
+        assert_eq!(limits.max_insert_rows_per_statement, None);
+    }
+
+    #[test]
+    fn validate_dml_row_limit_accepts_boundary_values() {
+        assert_eq!(
+            validate_dml_row_limit(MIN_DML_ROW_LIMIT).map(std::num::NonZeroUsize::get),
+            Ok(MIN_DML_ROW_LIMIT)
+        );
+        assert_eq!(
+            validate_dml_row_limit(MAX_DML_ROW_LIMIT).map(std::num::NonZeroUsize::get),
+            Ok(MAX_DML_ROW_LIMIT)
+        );
+    }
+
+    #[test]
+    fn validate_dml_row_limit_rejects_zero_and_over_upper_bound() {
+        assert!(validate_dml_row_limit(0).is_err());
+        assert!(validate_dml_row_limit(MAX_DML_ROW_LIMIT + 1).is_err());
+    }
+
+    #[test]
+    fn max_dml_row_limit_matches_max_scanned_rows() {
+        // 上限は総走査行数上限（`tenant::MAX_SCANNED_ROWS`）と同値であること
+        // （オーナー判断 2026-09-27）を固定し、値のドリフトを検知する。
+        assert_eq!(MAX_DML_ROW_LIMIT, crate::tenant::MAX_SCANNED_ROWS);
     }
 
     // --- bind_insert_form: 形判別（TASK-120・INDEX-1, INDEX-2） -----------------
@@ -7132,5 +7439,232 @@ mod tests {
             }
             other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
         }
+    }
+
+    // --- ON CONFLICT の UNIQUE 制約列への拡張（TABLE-16、Issue #1074） --------
+
+    /// UNIQUE 対象の束縛テスト共通スキーマ: `a TEXT UNIQUE`・`UNIQUE (b, c)`。
+    fn unique_target_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true),
+                ColumnDef::new("c", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::new(vec!["a".to_string()]),
+            crate::catalog::UniqueConstraint::new(vec!["b".to_string(), "c".to_string()]),
+        ])
+    }
+
+    fn bind_upsert_sql(
+        sql: &str,
+        schema: &TableSchema,
+    ) -> Result<BoundInsertForm, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_insert(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        bind_insert_form(&stmt, schema)
+    }
+
+    #[test]
+    fn bind_upsert_form_resolves_single_column_unique_target() {
+        let schema = unique_target_schema();
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (a) DO NOTHING \
+             USING OPERATION_ID 'op-unique-a'",
+            &schema,
+        )
+        .expect("single-column UNIQUE target should resolve");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![0]));
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_upsert_form_resolves_composite_unique_target_regardless_of_written_order() {
+        let schema = unique_target_schema();
+        for sql in [
+            "INSERT INTO documents (id, a, b, c) VALUES (1, 'z', 'x', 'y') ON CONFLICT (b, c) \
+             DO NOTHING USING OPERATION_ID 'op-unique-bc'",
+            "INSERT INTO documents (id, a, b, c) VALUES (1, 'z', 'x', 'y') ON CONFLICT (c, b) \
+             DO NOTHING USING OPERATION_ID 'op-unique-cb'",
+        ] {
+            let bound = bind_upsert_sql(sql, &schema)
+                .expect("composite UNIQUE target should resolve regardless of written order");
+            match bound {
+                // 解決した制約の宣言順（`b` → `c`。`unique_target_schema` 参照）
+                // で並ぶ。対象リストに書いた順（2 つ目のケースは `(c, b)`）には
+                // 依存しない。
+                BoundInsertForm::Upsert(upsert) => {
+                    assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![1, 2]));
+                }
+                other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_partial_composite_unique_target() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, b) VALUES (1, 'x') ON CONFLICT (b) DO NOTHING \
+             USING OPERATION_ID 'op-unique-partial'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_target_not_matching_any_unique_constraint() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'y') ON CONFLICT (a, b) \
+             DO NOTHING USING OPERATION_ID 'op-unique-mismatch'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_unknown_target_column() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (nope) DO NOTHING \
+             USING OPERATION_ID 'op-unique-unknown'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_id_mixed_with_other_target_columns() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (id, a) DO NOTHING \
+             USING OPERATION_ID 'op-unique-id-mixed'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_case_mismatched_target_column() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x') ON CONFLICT (A) DO NOTHING \
+             USING OPERATION_ID 'op-unique-case'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_primary_key_column_as_target() {
+        // PRIMARY KEY 宣言列を対象にすることは本 Issue（#1074）のスコープ外
+        // （§8 対象外・申し送り）。`schema.unique_constraints()` には含まれない
+        // ため、UNIQUE 制約と同じ経路には解決されず `42601` になる。
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("code", ColumnType::Text, false)],
+        )
+        .with_primary_key(vec!["code".to_string()]);
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_insert(
+            "INSERT INTO documents (id, code) VALUES (1, 'x') ON CONFLICT (code) DO NOTHING \
+             USING OPERATION_ID 'op-pk-target'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
+        let err = bind_insert_form(&stmt, &schema).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_upsert_form_rejects_duplicate_target_key_within_batch() {
+        let schema = unique_target_schema();
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x'), (2, 'x') ON CONFLICT (a) \
+             DO NOTHING USING OPERATION_ID 'op-unique-batch-dup'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_upsert_form_allows_null_target_key_duplicates_within_batch() {
+        // NULL を含む対象キーは NULLS DISTINCT のため重複判定の対象外。`c` を
+        // 列リストから省略する（`nullable` かつ `DEFAULT` 無し。
+        // `fill_omitted_columns` が暗黙 `Value::Null` を補う）ことで NULL を
+        // 作る（SQL テキストの `INSERT ... VALUES` は明示 `NULL` リテラルの
+        // 構文を持たない。`InsertLiteral::Null` のドキュメンテーションコメント
+        // 参照）。
+        let schema = unique_target_schema();
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'p'), (2, 'y', 'p') \
+             ON CONFLICT (b, c) DO NOTHING USING OPERATION_ID 'op-unique-null-batch'",
+            &schema,
+        )
+        .expect("NULL target keys must not be treated as duplicates");
+        assert!(matches!(bound, BoundInsertForm::Upsert(_)));
+    }
+
+    /// `ON CONFLICT` 対象が `REAL`／`NUMERIC`／`JSON`／`ARRAY` 等の UNIQUE 制約列
+    /// （`ColumnType::is_unique_constraint_allowed` が `is_primary_key_allowed`
+    /// の上位集合として Issue #1073 で追加した型）でも解決できることを確認する
+    /// （回帰: base 取り込みマージで `constraint::unique_key_from_values` が
+    /// これらの型を「UNIQUE キーとして許可されない型」として誤って拒否する
+    /// 退行が入りかけたため、単一行の正常系で検出する）。
+    #[test]
+    fn bind_upsert_form_resolves_unique_target_on_types_beyond_primary_key_allowed() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("r", ColumnType::Real, true)],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "r".to_string()
+        ])]);
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, r) VALUES (1, 1.5) ON CONFLICT (r) DO NOTHING \
+             USING OPERATION_ID 'op-unique-real'",
+            &schema,
+        )
+        .expect("REAL UNIQUE target should resolve, not be rejected as a disallowed type");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![0]));
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+
+        // バッチ内の重複対象キー検出（`unique_key_from_values` 経由）も REAL で
+        // 機能することを確認する。
+        let err = bind_upsert_sql(
+            "INSERT INTO documents (id, r) VALUES (1, 1.5), (2, 1.5) ON CONFLICT (r) \
+             DO NOTHING USING OPERATION_ID 'op-unique-real-dup'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 }

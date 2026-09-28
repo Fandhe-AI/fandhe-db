@@ -257,6 +257,16 @@ pub enum BoundExpr {
     TimestampColumnRef {
         index: usize,
     },
+    /// nullable な数値列（INTEGER/BIGINT/REAL/DOUBLE）の参照（Issue #1075・
+    /// TABLE-16 ポインタ）。`index` は `TextColumnRef` と同じ論理列インデックス
+    /// 系列（`schema.columns` 添字）。汎用の式評価（`ColumnRefPolicy::
+    /// IdAndVectorOnly`）では束縛されず、`CHECK` 制約の式述語束縛
+    /// （`ColumnRefPolicy::AllowNumericColumns`。`sql::parser::
+    /// bind_check_predicates`）でのみ生成される opt-in 拡張（汎用のレーン A
+    /// ではない）。値の変換規則は `numeric_scalar_from_ref` 参照。
+    ColumnRef {
+        index: usize,
+    },
 }
 
 impl PartialEq for BoundExpr {
@@ -276,6 +286,7 @@ impl PartialEq for BoundExpr {
                 BoundExpr::TimestampColumnRef { index: a },
                 BoundExpr::TimestampColumnRef { index: b },
             ) => a == b,
+            (BoundExpr::ColumnRef { index: a }, BoundExpr::ColumnRef { index: b }) => a == b,
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
             (BoundExpr::Null, BoundExpr::Null) => true,
@@ -970,6 +981,21 @@ fn validate_closed_expr(
     }
 }
 
+/// 列参照を束縛時にどこまで許すか（Issue #1075・TABLE-16 ポインタ）。既定は
+/// [`ColumnRefPolicy::IdAndVectorOnly`] で、`WHERE`／`SELECT`／Describe 系の
+/// 汎用式評価（[`bind_expr`] 公開 API）はこれを使い続ける（挙動を変えない）。
+/// [`ColumnRefPolicy::AllowNumericColumns`] は `CHECK` 制約の式述語束縛
+/// （`sql::parser::bind_check_predicates`）専用の opt-in 拡張で、INTEGER/
+/// BIGINT/REAL/DOUBLE 列の式内参照のみを追加で許可する（TEXT/BOOLEAN/DATE/
+/// NUMERIC 等、他の列型はポリシーに関わらず従来どおり拒否する）。汎用の
+/// `WHERE`/`SELECT` へ数値列の式参照を広げるレーン A は別 Issue の対象（対象外
+/// 事項）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnRefPolicy {
+    IdAndVectorOnly,
+    AllowNumericColumns,
+}
+
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
 /// 展開中は `None` に切り替わりパラメータ参照だけを解決する）と、パラメータ名 →
 /// 既に束縛済みの実引数式（インライン展開用）の対応表。
@@ -983,6 +1009,9 @@ struct BindEnv<'a> {
     /// ネストと呼び出し先本体のネストが合算され、構文段の計測値（各文が個別に
     /// 見た字面上のネスト）をすり抜けうるため（[`enter_case_nesting`] 参照）。
     case_nesting: usize,
+    /// 列参照の許容範囲（Issue #1075・TABLE-16 ポインタ）。[`bind_expr`] は
+    /// 常に [`ColumnRefPolicy::IdAndVectorOnly`] を使う（挙動を変えない）。
+    column_ref_policy: ColumnRefPolicy,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -998,6 +1027,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::Timestamp(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Null => 1,
@@ -1040,6 +1070,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::Timestamp(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::VectorRef
         | BoundExpr::Null => 0,
@@ -1087,6 +1118,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::Timestamp(_)
         | BoundExpr::DateColumnRef { .. }
         | BoundExpr::TimestampColumnRef { .. }
+        | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::Null => false,
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
@@ -1113,7 +1145,8 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
     match expr {
         BoundExpr::TextColumnRef { index }
         | BoundExpr::DateColumnRef { index }
-        | BoundExpr::TimestampColumnRef { index } => visit(*index),
+        | BoundExpr::TimestampColumnRef { index }
+        | BoundExpr::ColumnRef { index } => visit(*index),
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::Date(_)
@@ -1169,7 +1202,8 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
     match expr {
         BoundExpr::TextColumnRef { index }
         | BoundExpr::DateColumnRef { index }
-        | BoundExpr::TimestampColumnRef { index } => {
+        | BoundExpr::TimestampColumnRef { index }
+        | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
             }
@@ -1245,11 +1279,33 @@ pub fn bind_expr(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    bind_expr_with_policy(
+        expr,
+        schema,
+        registry,
+        node_budget,
+        ColumnRefPolicy::IdAndVectorOnly,
+    )
+}
+
+/// [`bind_expr`] の列参照ポリシー付き版（`pub(crate)`。Issue #1075・TABLE-16
+/// ポインタ）。`sql::parser::bind_check_predicates` から
+/// [`ColumnRefPolicy::AllowNumericColumns`] で呼ばれる以外は [`bind_expr`]
+/// （常に [`ColumnRefPolicy::IdAndVectorOnly`]）を経由し、公開シグネチャ
+/// （`bind_expr`）は変えない。
+pub(crate) fn bind_expr_with_policy(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+    column_ref_policy: ColumnRefPolicy,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
+        column_ref_policy,
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -1588,20 +1644,30 @@ fn bind_expr_in(
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
                     ColumnType::Text => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
-                    // `INTEGER`／`BIGINT` 列の式参照対応は Issue #891 の担当。
-                    // 本 Issue（#881）では TEXT 列と同じ fail-closed 拒否に倒す。
+                    // `INTEGER`／`BIGINT` 列の式参照は、`CHECK` 制約の式述語束縛
+                    // （`ColumnRefPolicy::AllowNumericColumns`。Issue #1075・
+                    // TABLE-16 ポインタ）に限り解禁する。汎用の `WHERE`／`SELECT`
+                    // （`ColumnRefPolicy::IdAndVectorOnly`）は既存の拒否文言を
+                    // 一字一句そのまま維持する（回帰を防ぐ。レーン A は対象外）。
                     ColumnType::Integer | ColumnType::BigInt => {
-                        Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} cannot be used in an expression yet"
-                        )))
+                        if env.column_ref_policy == ColumnRefPolicy::AllowNumericColumns {
+                            Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar))
+                        } else {
+                            Err(SqlSurfaceError::invalid_input(format!(
+                                "column {name:?} cannot be used in an expression yet"
+                            )))
+                        }
                     }
-                    // F10（Issue #882 計画）: REAL/DOUBLE 列の式評価対応は #891 の
-                    // 担当。現時点では TEXT 列と同じ「式内で参照できない」拒否へ
-                    // 合流させる。
+                    // REAL/DOUBLE 列の式参照も同様に `CHECK` 専用ポリシーでのみ
+                    // 解禁する（上記 INTEGER/BIGINT と同じ理由）。
                     ColumnType::Real | ColumnType::Double => {
-                        Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} cannot be used in an expression (REAL/DOUBLE columns are not supported)"
-                        )))
+                        if env.column_ref_policy == ColumnRefPolicy::AllowNumericColumns {
+                            Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar))
+                        } else {
+                            Err(SqlSurfaceError::invalid_input(format!(
+                                "column {name:?} cannot be used in an expression (REAL/DOUBLE columns are not supported)"
+                            )))
+                        }
                     }
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
@@ -1877,6 +1943,9 @@ fn bind_call(
             // 後、呼び出し元の CASE/COALESCE/NULLIF と本体側のそれが合算される
             // ことを構造的に保証する。`enter_case_nesting` docs 参照）。
             case_nesting: env.case_nesting,
+            // `schema: None` のため列参照自体に到達しない（列参照は上の分岐で
+            // `Err` になる）が、フィールドは呼び出し元の値をそのまま引き継ぐ。
+            column_ref_policy: env.column_ref_policy,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -2173,6 +2242,54 @@ pub(crate) fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
     Ok(id as f64)
 }
 
+/// [`ScalarRef`] の数値 variant（`Integer`／`BigInt`／`Real`／`Double`）を
+/// `BoundExpr::ColumnRef` の評価値として `f64` へ変換する（Issue #1075・
+/// TABLE-16 ポインタ）。`id_as_finite_scalar` と同じ「`f64` で正確に表現できる
+/// 範囲か」の境界（`2^53`）を `BIGINT` にも適用し、黙って丸めない
+/// （fail-closed。security.md「不安全な設計」対応）。`Integer`／`Real` は
+/// `f64` の 52 bit 仮数部で常に正確に表現できるため境界検査は不要。
+/// `Real`／`Double` の非有限値（NaN/±∞）は `row_codec` が encode/decode の
+/// いずれでも拒否するため通常到達しないが、防御的に拒否する。数値以外の
+/// `ScalarRef` variant は束縛段の不変条件が崩れた場合の保険として `Internal`
+/// にする（型不一致。行の値・テナント情報を含めない固定文言）。
+pub(crate) fn numeric_scalar_from_ref(v: &ScalarRef<'_>) -> Result<f64, SqlSurfaceError> {
+    match v {
+        ScalarRef::Integer(i) => Ok(f64::from(*i)),
+        ScalarRef::Real(r) => {
+            let d = f64::from(*r);
+            if d.is_finite() {
+                Ok(d)
+            } else {
+                Err(SqlSurfaceError::invalid_input(
+                    "numeric column value is not finite",
+                ))
+            }
+        }
+        ScalarRef::Double(d) => {
+            if d.is_finite() {
+                Ok(*d)
+            } else {
+                Err(SqlSurfaceError::invalid_input(
+                    "numeric column value is not finite",
+                ))
+            }
+        }
+        ScalarRef::BigInt(b) => {
+            if b.unsigned_abs() > MAX_EXACT_F64_INT {
+                Err(SqlSurfaceError::invalid_input(
+                    "BIGINT column value exceeds the range that can be exactly represented",
+                ))
+            } else {
+                Ok(*b as f64)
+            }
+        }
+        _ => Err(SqlSurfaceError::Internal {
+            detail: "numeric column reference resolved to a non-numeric row scalar value"
+                .to_string(),
+        }),
+    }
+}
+
 pub fn eval<'a>(
     expr: &BoundExpr,
     id: u64,
@@ -2244,6 +2361,14 @@ pub(crate) fn eval_with_scalars<'a>(
                 detail: "TIMESTAMP column reference resolved to a non-TIMESTAMP row scalar value"
                     .to_string(),
             }),
+        },
+        BoundExpr::ColumnRef { index } => match row_scalars.get(*index) {
+            None => Err(SqlSurfaceError::Internal {
+                detail: "NUMERIC column reference is outside the decoded row scalar view"
+                    .to_string(),
+            }),
+            Some(None) => Ok(ExprValue::Null),
+            Some(Some(v)) => numeric_scalar_from_ref(v).map(ExprValue::Scalar),
         },
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::VectorRef => {
@@ -4155,5 +4280,135 @@ mod tests {
             whens,
             else_result: Box::new(else_result),
         }
+    }
+
+    fn schema_with_numeric_columns() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("qty", ColumnType::Integer, true),
+                ColumnDef::new("total", ColumnType::BigInt, true),
+                ColumnDef::new("ratio", ColumnType::Real, true),
+                ColumnDef::new("score", ColumnType::Double, true),
+            ],
+        )
+    }
+
+    /// 既定ポリシー（[`bind_expr`]、常に [`ColumnRefPolicy::IdAndVectorOnly`]）
+    /// では、INTEGER/BIGINT/REAL/DOUBLE 列の式内参照は Issue #1075 以前と
+    /// 一字一句同じ文言で拒否される（回帰を防ぐ。`WHERE`／`SELECT` の挙動は
+    /// 変えない）。
+    #[test]
+    fn bind_expr_still_rejects_numeric_columns_with_default_policy() {
+        let schema = schema_with_numeric_columns();
+        let registry = UdfRegistry::default();
+
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&ident("qty"), &schema, &registry, &mut budget)
+            .expect_err("INTEGER column must still be rejected by default");
+        assert_eq!(
+            err.to_string(),
+            "invalid input: column \"qty\" cannot be used in an expression yet"
+        );
+
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&ident("ratio"), &schema, &registry, &mut budget)
+            .expect_err("REAL column must still be rejected by default");
+        assert_eq!(
+            err.to_string(),
+            "invalid input: column \"ratio\" cannot be used in an expression (REAL/DOUBLE columns are not supported)"
+        );
+    }
+
+    /// [`ColumnRefPolicy::AllowNumericColumns`]（`CHECK` 制約束縛専用）は
+    /// INTEGER/BIGINT/REAL/DOUBLE 列を `BoundExpr::ColumnRef`（`ExprType::
+    /// Scalar`）として束縛する。
+    #[test]
+    fn bind_expr_with_policy_allows_numeric_columns_under_check_policy() {
+        let schema = schema_with_numeric_columns();
+        let registry = UdfRegistry::default();
+        for (name, index) in [("qty", 0), ("total", 1), ("ratio", 2), ("score", 3)] {
+            let mut budget = MAX_EXPR_NODES;
+            let (bound, ty) = bind_expr_with_policy(
+                &ident(name),
+                &schema,
+                &registry,
+                &mut budget,
+                ColumnRefPolicy::AllowNumericColumns,
+            )
+            .unwrap_or_else(|e| panic!("{name} must bind under AllowNumericColumns: {e:?}"));
+            assert_eq!(ty, ExprType::Scalar, "{name}");
+            assert_eq!(bound, BoundExpr::ColumnRef { index }, "{name}");
+        }
+    }
+
+    /// `AllowNumericColumns` でも数値列以外（TEXT を除く。TEXT は無条件に
+    /// 許可される既存仕様）は引き続き拒否される（BOOLEAN で固定する）。
+    #[test]
+    fn bind_expr_with_policy_still_rejects_non_numeric_columns() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("flag", ColumnType::Boolean, false)],
+        );
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr_with_policy(
+            &ident("flag"),
+            &schema,
+            &registry,
+            &mut budget,
+            ColumnRefPolicy::AllowNumericColumns,
+        )
+        .expect_err("BOOLEAN column must still be rejected under AllowNumericColumns");
+        assert!(err
+            .to_string()
+            .contains("BOOLEAN columns are not supported"));
+    }
+
+    /// [`eval_with_scalars`]（`BoundExpr::ColumnRef`）の値変換規則（設計 D-2）:
+    /// INTEGER/REAL は常に正確に表現でき、BIGINT は `2^53` 以下でのみ正確に
+    /// 表現できる。NULL は `ExprValue::Null` として伝播する（三値論理）。
+    #[test]
+    fn eval_with_scalars_numeric_column_ref_conversion_rules() {
+        let expr = BoundExpr::ColumnRef { index: 0 };
+
+        let scalars = [Some(ScalarRef::Integer(-7))];
+        assert_eq!(
+            eval_with_scalars(&expr, 1, &[], &scalars).unwrap(),
+            ExprValue::Scalar(-7.0)
+        );
+
+        let scalars = [Some(ScalarRef::Real(1.5))];
+        assert_eq!(
+            eval_with_scalars(&expr, 1, &[], &scalars).unwrap(),
+            ExprValue::Scalar(1.5)
+        );
+
+        let scalars = [Some(ScalarRef::Double(2.25))];
+        assert_eq!(
+            eval_with_scalars(&expr, 1, &[], &scalars).unwrap(),
+            ExprValue::Scalar(2.25)
+        );
+
+        let scalars = [Some(ScalarRef::BigInt(1i64 << 52))];
+        assert_eq!(
+            eval_with_scalars(&expr, 1, &[], &scalars).unwrap(),
+            ExprValue::Scalar((1i64 << 52) as f64)
+        );
+
+        let too_big = (1i64 << 53) + 1;
+        let scalars = [Some(ScalarRef::BigInt(too_big))];
+        assert!(eval_with_scalars(&expr, 1, &[], &scalars).is_err());
+
+        let scalars: [Option<ScalarRef<'_>>; 1] = [None];
+        assert_eq!(
+            eval_with_scalars(&expr, 1, &[], &scalars).unwrap(),
+            ExprValue::Null
+        );
+
+        // マスク外参照（呼び出し元の配線不備）は実 NULL と取り違えず
+        // `Internal` として fail-closed に拒否する。
+        let empty: [Option<ScalarRef<'_>>; 0] = [];
+        assert!(eval_with_scalars(&expr, 1, &[], &empty).is_err());
     }
 }

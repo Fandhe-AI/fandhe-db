@@ -1100,6 +1100,12 @@ pub struct EngineCore {
     /// 明示トランザクション（SQL-31・TASK-221）の持続時間・文数の上限。差し替えは
     /// [`Self::with_transaction_limits`] のみ。
     transaction_limits: crate::sql::transaction::TransactionLimits,
+    /// 述語形 UPDATE/DELETE の 1 文あたり影響行数上限・複数行 `VALUES` の
+    /// 1 文あたり行数上限（Issue #997。オーナー判断 2026-09-27: プロセス全体を
+    /// 起動時 CLI フラグで設定可能にする。セッション・テナント単位は対象外）。
+    /// 差し替えは [`Self::with_dml_limits`] のみ。`crate::sql::parser::DmlLimits`
+    /// モジュールドキュメント参照。
+    dml_limits: crate::sql::parser::DmlLimits,
     /// `dictionary.rs` の辞書的情報源（TASK-109・PLAN-5）の世代整合キャッシュ。
     /// [`Self::dictionary_snapshot`] がこれを経由して再構築を再利用する（詳細は
     /// [`DictionaryCache`] のドキュメント参照）。
@@ -1173,6 +1179,74 @@ struct HnswEngineState {
 /// `SqlSurfaceError::invalid_input`〔`22000`〕）ため、本関数は判定条件のみを
 /// 共有し、固定メッセージの `String` を返す（各呼び出し元が自分の契約へ変換する。
 /// codex-review P1 指摘対応、PR #266）。
+/// [`EngineCore::execute_bound_predicate_update_in_session`]・[`EngineCore::
+/// execute_bound_predicate_delete_in_session`]（TASK-186・NOSQL-12、
+/// Issue #1062）が `bind` closure の戻り値へ課す多層防御。NoSQL 表層の
+/// `filter` から構築される `WherePredicate` は
+/// `wire-server::http::query::filter::bind_filter_where_predicates` が
+/// `Equality`／`BoolEquality`／`Prefix` のみを生成する契約だが、`bind`
+/// closure 自体は engine の外（wire-server）にあるため、契約が壊れた
+/// 場合に備えてここでも fail-closed に拒否する。
+///
+/// - 空列（`WHERE` 句省略に相当）は全行対象の DML になりうるため `42601` で拒否する
+///   （SQL 表層の `WHERE` 句省略が構文段で拒否されることとのパリティ。
+///   `bind_predicate_delete` 自体には空列を拒否するガードが無いため、
+///   NoSQL 経路はこの関数が唯一の防御になる）。
+/// - `Equality`／`BoolEquality`／`Prefix` の 3 variant のみを明示的に許可し、
+///   それ以外（`PredicateCall`〔RLS 述語 `visible()`。NoSQL `filter` は列名として
+///   RLS 述語名を拒否するため生成されない契約〕・`Expression`〔wire 層は
+///   `Expr` を構築しない〕・`BoolColumn`・`Compare`・`InList`・`Between`・
+///   `IsNull`・`Not`（内側が許可 3 variant であっても `Not` 自体は許可語彙に
+///   無いため無条件で拒否する）・`Or`（PR #1118〔未マージ〕がマージされるまで
+///   NoSQL `filter` に OR 語彙が無い）・`InSubquery`／`Exists`〔NoSQL に
+///   サブクエリ構文が無い〕）はすべて `42601` で拒否する（codex-review P2
+///   指摘対応、PR #1121。`_ => {}` によるワイルドカード許可は将来 variant
+///   追加時に無言で穴を開けるため使わず、網羅的 `match` にする）。
+fn reject_unsupported_predicate_dml_forms(
+    predicates: &[crate::sql::allowlist::WherePredicate],
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::allowlist::WherePredicate;
+
+    if predicates.is_empty() {
+        return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+            "predicate-form update/delete requires at least one filter predicate",
+        ));
+    }
+    for predicate in predicates {
+        match predicate {
+            // 契約上 `bind` closure が生成してよい 3 variant のみ許可する
+            // （関数ドキュメント参照）。
+            WherePredicate::Equality { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::Prefix { .. } => {}
+            // 契約外の variant はすべて拒否する（codex-review P2 指摘対応、
+            // PR #1121）。`_ => {}` によるワイルドカード許可を排し、`WherePredicate`
+            // へ将来 variant が追加された際もコンパイルエラーで気付けるよう
+            // 網羅的に列挙する。`Not` は内側が許可 3 variant（`Equality`・
+            // `BoolEquality`・`Prefix`）であっても、契約が定める NoSQL 述語形
+            // DML の許可語彙（`Not` を含まない）に無いため、内側を再帰検査して
+            // 通す（誤って `Ok` を返す）のではなく `Not` 自体を無条件で拒否する
+            // （codex-review 指摘: `Not(Equality)` が再帰検査を通過していた欠陥）。
+            WherePredicate::PredicateCall { .. }
+            | WherePredicate::Expression(_)
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Not(_)
+            | WherePredicate::Or(_)
+            | WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. } => {
+                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "predicate form is not supported for NoSQL update/delete filter",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn dictionary_required_columns(
     schema: &crate::catalog::TableSchema,
 ) -> Result<(usize, usize), String> {
@@ -1595,6 +1669,7 @@ impl EngineCore {
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
+            dml_limits: crate::sql::parser::DmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
@@ -1758,6 +1833,18 @@ impl EngineCore {
         limits: crate::sql::transaction::TransactionLimits,
     ) -> Self {
         self.transaction_limits = limits;
+        self
+    }
+
+    /// 述語形 UPDATE/DELETE の 1 文あたり影響行数上限・複数行 `VALUES` の
+    /// 1 文あたり行数上限（[`crate::sql::parser::DmlLimits`]）を差し替えた
+    /// ビルダーを返す（[`Self::with_batch_limits`] と同じ流儀。未呼び出しなら
+    /// `DmlLimits::default()`＝既定値 1,000・現行挙動を維持）。Issue #997・
+    /// オーナー判断 2026-09-27: `wire-server` の起動時 CLI フラグ（プロセス全体・
+    /// 1 回限り）から本メソッドを経由して設定する契約で、セッション・テナント
+    /// 単位で差し替える経路は設けない。
+    pub fn with_dml_limits(mut self, limits: crate::sql::parser::DmlLimits) -> Self {
+        self.dml_limits = limits;
         self
     }
 
@@ -2617,9 +2704,13 @@ impl EngineCore {
         );
         if is_insert_statement {
             let lookup = InsertSchemaLookup::new(&self.storage);
-            let stmt =
-                crate::sql::allowlist::validate_insert_tokens(&tokens, &lookup, self.ledger_mode)
-                    .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            let stmt = crate::sql::allowlist::validate_insert_tokens_with_limit(
+                &tokens,
+                &lookup,
+                self.ledger_mode,
+                self.dml_limits.max_insert_rows_per_statement,
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Insert(stmt));
         }
 
@@ -3282,7 +3373,7 @@ impl EngineCore {
                             self.ledger_mode,
                             Some(&schema),
                         )?;
-                        txn.mark_written(&stmt.table_name);
+                        txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                         Ok(crate::sql::SqlOutcome::Insert(outcome))
                     }
                     // 複数行 `VALUES`・ファイル形・`ON CONFLICT`（UPSERT）は
@@ -3303,7 +3394,7 @@ impl EngineCore {
                     stmt,
                     self.ledger_mode,
                 )?;
-                txn.mark_written(&stmt.table_name);
+                txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
             ParsedSql::Statement(
@@ -5439,6 +5530,160 @@ impl EngineCore {
         crate::sql::exec::execute_delete(&self.storage, ctx, bound, self.ledger_mode)
     }
 
+    /// NoSQL 表層 `update` op の `filter`（述語形。TASK-186・NOSQL-12、
+    /// Issue #1062・対象ビヘイビア NOSQL-6・NOSQL-12・SQL-19・RECOVER-1／10／11）
+    /// を SQL 表層 `UPDATE ... WHERE <述語> USING OPERATION_ID`（SQL-19・
+    /// TASK-192）と**同一の実行本体**（[`Self::run_predicate_update`]）へ
+    /// 到達させるセッション対応の束縛済み入口（[`Self::
+    /// execute_bound_update_in_session`]（単一行形）と同型の closure 方式。
+    /// 第 2 の実行器を作らない設計）。
+    ///
+    /// 判定順序（fail-closed。呼び出し元 `wire-server::http::query::update`
+    /// は本メソッドへ到達する前に `table`／`set` の識別子検査・
+    /// `OperationId::parse`（`23502`）を済ませている前提）:
+    /// 1. `self.ledger_mode.resolve(operation_id)` による必須化ガード
+    ///    （`23502`。スキーマ取得より前）
+    /// 2. スキーマ取得（`42P01`）
+    /// 3. `bind` closure で SET 割当・`WHERE` 述語列を得る（呼び出し元は
+    ///    `wire-server::http::query::update::map_set_assignments` と
+    ///    `filter::bind_filter_where_predicates` を使う）
+    /// 4. `bind` が返した `WherePredicate` 列を検査する（`Equality`／
+    ///    `BoolEquality`／`Prefix` の 3 variant のみ許可し、空列を含む
+    ///    それ以外〔`PredicateCall`／`Expression`／`BoolColumn`／`Compare`／
+    ///    `InList`／`Between`／`IsNull`／`Not`／`Or`／`InSubquery`／`Exists`〕
+    ///    は `42601` で拒否。NoSQL `filter` 経由では構造上生成されない形への
+    ///    多層防御。[`reject_unsupported_predicate_dml_forms`] 参照）
+    /// 5. ガード済みの `operation_id`（`bind` closure の外で確定済みの
+    ///    引数そのもの）から [`crate::sql::allowlist::ValidatedPredicateUpdate`]
+    ///    を engine 内部で構築する（`pub(crate)` フィールドへの struct
+    ///    リテラルで構築するため公開コンストラクタは追加しない。
+    ///    `bound.operation_id` との一致検証（[`Self::
+    ///    execute_bound_update_in_session`] 判定 3 参照）は、本メソッド自身が
+    ///    `operation_id` から直接 [`crate::sql::allowlist::
+    ///    ValidatedPredicateUpdate::operation_id`] を組み立てるため不要
+    ///    ——`bind` closure は `operation_id` を運ばない契約にする）
+    /// 6. `read_txn` を drop してから共通本体（[`Self::run_predicate_update`]）
+    ///    へ渡す
+    ///
+    /// UDF レジストリは [`crate::sql::udf_call::UdfRegistry::default()`] を
+    /// 渡す（NoSQL 表層にはセッション UDF が無く、wire 層は `Expression` 述語を
+    /// 生成しないため——判定 4 が `Expression` を拒否することの前提でもある）。
+    pub fn execute_bound_predicate_update_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            (
+                Vec<(String, crate::sql::allowlist::InsertLiteral)>,
+                Vec<crate::sql::allowlist::WherePredicate>,
+            ),
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        // 判定 2・3: スキーマ取得 → 束縛（同一 read_txn 下）。
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (assignments, where_predicates) = bind(&schema)?;
+        // 判定 4: wire 表層が生成しない述語形への多層防御（空列を含む）。
+        reject_unsupported_predicate_dml_forms(&where_predicates)?;
+        drop(read_txn);
+
+        // 判定 5: engine 内部でのみ検証済み `ValidatedPredicateUpdate` を構築する
+        // （`pub(crate)` フィールドは同一クレート内の struct リテラルで構築可能。
+        // `#[non_exhaustive]` はクレート外からの構築のみを禁じる）。
+        let validated = crate::sql::allowlist::ValidatedPredicateUpdate {
+            table_name: table.to_string(),
+            assignments,
+            where_predicates,
+            operation_id: operation_id.cloned(),
+        };
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        // 判定 6: 実書き込み（`Self::run_predicate_update` 内部の独自 write トランザクション）。
+        self.run_predicate_update(ctx, &udfs, &validated, &schema)
+    }
+
+    /// NoSQL 表層 `delete` op の `filter`（述語形。TASK-186・NOSQL-12、
+    /// Issue #1062）を SQL 表層 `DELETE FROM ... WHERE <述語>
+    /// USING OPERATION_ID`（SQL-19・TASK-192）と**同一の実行本体**
+    /// （[`Self::run_predicate_delete`]）へ到達させるセッション対応の
+    /// 束縛済み入口。[`Self::execute_bound_predicate_update_in_session`] と
+    /// 同じ判定順序・設計（`bind` closure は `WHERE` 述語列のみを返す点のみ
+    /// 異なる。`DELETE` は `SET` を持たない）。
+    pub fn execute_bound_predicate_delete_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::allowlist::WherePredicate>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let where_predicates = bind(&schema)?;
+        reject_unsupported_predicate_dml_forms(&where_predicates)?;
+        drop(read_txn);
+
+        let validated = crate::sql::allowlist::ValidatedPredicateDelete {
+            table_name: table.to_string(),
+            where_predicates,
+            operation_id: operation_id.cloned(),
+        };
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        self.run_predicate_delete(ctx, &udfs, &validated, &schema)
+    }
+
+    /// `--max-insert-rows`（`self.dml_limits.max_insert_rows_per_statement`）を、
+    /// `stmt.rows.len()`（`ValidatedInsert` の行数。単一行形も `rows.len() == 1`
+    /// として同じ形を持つ）に対して**実行時にも**検査する（codex-review P1
+    /// 指摘・PR #1122）。
+    ///
+    /// 行数上限は本来 `sql::allowlist::Parser::parse_insert`（構文解析段）が
+    /// 判定する契約だが、`validate_insert`（`pub fn`。`max_insert_rows: None`
+    /// 固定で解析する）が返した `ValidatedInsert` を `ParsedSql::Insert` へ
+    /// 包んで [`Self::execute_parsed_in_session`]（`pub fn`）へ渡す経路では、
+    /// 解析時の上限判定を経由しない。設定済みの `EngineCore`（`--max-insert-
+    /// rows` 指定済み）に対してこの経路で上限超過の文を渡すと、構文解析段の
+    /// ゲートを迂回して素通りしてしまう（AGENTS.md の公開 API・エラー契約の
+    /// 相互運用性、および設定した上限の契約に反する）。本メソッドを
+    /// `execute_insert_form`・`execute_insert_returning_form` の冒頭
+    /// （スキーマ取得・書き込みトランザクション開始より前）で呼ぶことで、
+    /// 到達経路に関わらず設定済み上限を必ず適用する（超過は `54000`・
+    /// 副作用ゼロ。メッセージは構文解析段と同一形式に揃える）。
+    fn check_insert_row_count_limit(
+        &self,
+        row_count: usize,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let Some(max_insert_rows) = self.dml_limits.max_insert_rows_per_statement else {
+            return Ok(());
+        };
+        if row_count > max_insert_rows.get() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                format!("INSERT statement exceeds the allowed row count ({max_insert_rows})"),
+            ));
+        }
+        Ok(())
+    }
+
     /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
     /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
     /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも
@@ -6001,7 +6246,12 @@ impl EngineCore {
         // 束縛・実行本体は [`Self::execute_insert_form`] へ委譲する（`core.rs::
         // execute_sql_in_session` の INSERT 分岐と共有し二重実装を避けるため）。
         let lookup = InsertSchemaLookup::new(&self.storage);
-        let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+        let stmt = crate::sql::allowlist::validate_insert_with_limit(
+            sql,
+            &lookup,
+            self.ledger_mode,
+            self.dml_limits.max_insert_rows_per_statement,
+        )?;
         // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路
         // （[`Self::execute_sql_in_session`]）専用。本エントリポイントは
         // `SqlOutcome` を持たず戻り値型が `InsertOutcome` 固定のため、
@@ -6017,8 +6267,11 @@ impl EngineCore {
     }
 
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の
-    /// INSERT 分岐が共有する束縛〜実行本体（Issue #485）。`validate_insert`／
-    /// `validate_insert_tokens` が返した `stmt` と、その検証時に使った
+    /// INSERT 分岐が共有する束縛〜実行本体（Issue #485）。
+    /// `sql::allowlist::validate_insert_with_limit`／
+    /// `validate_insert_tokens_with_limit`（Issue #997 で行数上限を設定可能に
+    /// した現行版。呼び出し元は `self.dml_limits.max_insert_rows_per_statement`
+    /// を渡す）が返した `stmt` と、その検証時に使った
     /// `lookup`（`table_exists` 呼び出しでスキーマをキャッシュ済み）を受け取り、
     /// [`InsertSchemaLookup::take_schema`] でスキーマを再取得できればそれを
     /// 使い、できなければ（名前不一致・未保持の防御的経路）`get_table_schema`
@@ -6030,6 +6283,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.check_insert_row_count_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -6131,6 +6385,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.check_insert_row_count_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -6296,19 +6551,40 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
-        let bound = crate::sql::parser::bind_predicate_delete(stmt, &schema, session.udfs())?;
+        self.run_predicate_delete(ctx, session.udfs(), stmt, &schema)
+    }
+
+    /// [`Self::execute_predicate_delete_form`]（SQL 表層。SQL-19・TASK-192、
+    /// Issue #871）と [`Self::execute_bound_predicate_delete_in_session`]
+    /// （NoSQL 表層 `delete` op の `filter`。TASK-186・NOSQL-12、Issue #1062）が
+    /// スキーマ取得より後で共有する実行本体（第 2 の実行器を作らない設計。
+    /// CLAUDE.md「委譲方針」）。抽出前と挙動が完全に同一であることは既存の
+    /// engine テスト（`sql_predicate_dml_exec` 等）で回帰確認済み。
+    ///
+    /// `udfs` は呼び出し元が解決済みの UDF レジストリ（SQL 経路は
+    /// `session.udfs()`、NoSQL 経路はセッション UDF を持たないため
+    /// [`crate::sql::udf_call::UdfRegistry::default()`]）を渡す。
+    fn run_predicate_delete(
+        &self,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+        schema: &crate::catalog::TableSchema,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let bound = crate::sql::parser::bind_predicate_delete(stmt, schema, udfs)?;
         let content_hash_value = crate::recovery::content_hash::for_delete_where(
             stmt.table_name(),
             stmt.where_predicates(),
-            session.udfs(),
+            udfs,
         )?;
         crate::sql::exec::execute_predicate_delete(
             &self.storage,
             ctx,
             &bound,
             self.ledger_mode,
-            &schema,
+            schema,
             &content_hash_value,
+            self.dml_limits.max_affected_rows,
         )
     }
 
@@ -6456,26 +6732,47 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
-        let bound_form = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
-        let predicate = match bound_form {
-            crate::sql::parser::BoundUpdateForm::Single(bound) => {
-                return crate::sql::exec::execute_update_with_schema(
-                    &self.storage,
-                    ctx,
-                    &bound,
-                    self.ledger_mode,
-                    Some(&schema),
-                );
-            }
-            crate::sql::parser::BoundUpdateForm::Predicate(bound) => bound,
-        };
-
         let ValidatedUpdateForm::Predicate(validated) = stmt else {
-            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                detail: "internal: bound predicate UPDATE from a non-predicate statement"
-                    .to_string(),
-            });
+            // `Single` は `bind_update_form` へ渡す前にここで直接処理する
+            // （`Predicate` 分岐専用の `Self::run_predicate_update` へは
+            // 渡さない。抽出前と挙動を完全に同一に保つ）。
+            let bound = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
+            let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
+                return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "internal: bound single-row UPDATE from a predicate-form statement"
+                        .to_string(),
+                });
+            };
+            return crate::sql::exec::execute_update_with_schema(
+                &self.storage,
+                ctx,
+                &bound,
+                self.ledger_mode,
+                Some(&schema),
+            );
         };
+        self.run_predicate_update(ctx, session.udfs(), validated, &schema)
+    }
+
+    /// [`Self::execute_predicate_update_form`]（SQL 表層。SQL-19・TASK-192、
+    /// Issue #871）と [`Self::execute_bound_predicate_update_in_session`]
+    /// （NoSQL 表層 `update` op の `filter`。TASK-186・NOSQL-12、Issue #1062）が
+    /// スキーマ取得より後で共有する実行本体（[`Self::run_predicate_delete`]と
+    /// 対になる。第 2 の実行器を作らない設計）。抽出前と挙動が完全に同一で
+    /// あることは既存の engine テスト（`sql_predicate_dml_exec`・
+    /// `sql_update_delete_session_public_api` 等）で回帰確認済み。
+    ///
+    /// `udfs` は呼び出し元が解決済みの UDF レジストリ（[`Self::
+    /// run_predicate_delete`] と同じ契約）を渡す。
+    fn run_predicate_update(
+        &self,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
+        schema: &crate::catalog::TableSchema,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let predicate = crate::sql::parser::bind_predicate_update(validated, schema, udfs)?;
+
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = validated
             .assignments()
             .iter()
@@ -6485,8 +6782,8 @@ impl EngineCore {
             validated.table_name(),
             &assignment_refs,
             validated.where_predicates(),
-            session.udfs(),
-            &schema,
+            udfs,
+            schema,
         )?;
         // Issue #1061: VECTOR 列への SET 割当を含む場合のみ、正準化前
         // （タグ 1・生テキスト）のレイアウトでもハッシュを計算し
@@ -6498,12 +6795,12 @@ impl EngineCore {
         // 既存台帳エントリの互換性」参照）。
         let legacy_hash;
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] =
-            if crate::recovery::content_hash::needs_legacy_vector_hash(&assignment_refs, &schema) {
+            if crate::recovery::content_hash::needs_legacy_vector_hash(&assignment_refs, schema) {
                 legacy_hash = crate::recovery::content_hash::for_update_where_legacy_text_vector(
                     validated.table_name(),
                     &assignment_refs,
                     validated.where_predicates(),
-                    session.udfs(),
+                    udfs,
                 )?;
                 std::slice::from_ref(&legacy_hash)
             } else {
@@ -6514,9 +6811,10 @@ impl EngineCore {
             ctx,
             &predicate,
             self.ledger_mode,
-            &schema,
+            schema,
             &content_hash_value,
             legacy_hashes,
+            self.dml_limits.max_affected_rows,
         )
     }
 
@@ -6630,7 +6928,12 @@ impl EngineCore {
             // 共有しない一時オブジェクトのため文をまたいだ取り違えは
             // 起こらない）。
             let lookup = InsertSchemaLookup::new(&self.storage);
-            let stmt = crate::sql::allowlist::validate_insert(sql, &lookup, self.ledger_mode)?;
+            let stmt = crate::sql::allowlist::validate_insert_with_limit(
+                sql,
+                &lookup,
+                self.ledger_mode,
+                self.dml_limits.max_insert_rows_per_statement,
+            )?;
             // `RETURNING`（Issue #873・SQL-21）はセッション経由の実行経路専用
             // （`execute_insert_sql` と同じ理由）。本エントリポイントはファイル形
             // 専用のバッチ投入であり、`RETURNING` はいずれにせよファイル形では
@@ -9029,5 +9332,77 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("truncate of an unknown relation must fail"));
         assert_eq!(err.wire_code(), "42P01");
+    }
+
+    // codex-review P2 指摘対応（PR #1121）: `reject_unsupported_predicate_dml_forms`
+    // が契約外の `WherePredicate` variant（`Compare`／`BoolColumn`・`Not` に包んだ
+    // `Equality`）を `_ => {}` で通過させていた欠陥の回帰テスト。許可 3 variant
+    // （`Equality`／`BoolEquality`／`Prefix`）は受理し、それ以外はすべて
+    // `42601` で拒否することを確認する。
+    #[test]
+    fn reject_unsupported_predicate_dml_forms_allows_only_the_documented_three_variants() {
+        use crate::sql::allowlist::{CompareOp, WherePredicate};
+
+        let allowed = [
+            WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            },
+            WherePredicate::BoolEquality {
+                column: "flag".to_string(),
+                value: true,
+            },
+            WherePredicate::Prefix {
+                column: "path".to_string(),
+                pattern: "src/%".to_string(),
+            },
+        ];
+        for predicate in allowed {
+            assert!(
+                reject_unsupported_predicate_dml_forms(std::slice::from_ref(&predicate)).is_ok(),
+                "documented predicate form must be accepted: {predicate:?}"
+            );
+        }
+
+        let rejected = [
+            WherePredicate::BoolColumn {
+                column: "flag".to_string(),
+            },
+            WherePredicate::Compare {
+                column: "amount".to_string(),
+                op: CompareOp::Lt,
+                value: "1".to_string(),
+            },
+            WherePredicate::InList {
+                column: "lang".to_string(),
+                values: vec!["ja".to_string()],
+            },
+            WherePredicate::Between {
+                column: "amount".to_string(),
+                low: "1".to_string(),
+                high: "2".to_string(),
+            },
+            WherePredicate::IsNull {
+                column: "flag".to_string(),
+                negated: false,
+            },
+            // `Not(Equality)` は許可 3 variant の 1 つを包んでいても、
+            // 述語形 DML では `Not` 自体が語彙外（契約は `WherePredicate::Not`
+            // ドキュメント参照）であり、内側の検査を通過させて `Ok` を返して
+            // はならない（欠陥の再現ケース）。
+            WherePredicate::Not(Box::new(WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            })),
+        ];
+        for predicate in rejected {
+            let err = reject_unsupported_predicate_dml_forms(std::slice::from_ref(&predicate))
+                .expect_err("undocumented predicate form must be rejected");
+            assert_eq!(
+                err.wire_code(),
+                "42601",
+                "unexpected wire_code for {predicate:?}: {err:?}"
+            );
+        }
     }
 }

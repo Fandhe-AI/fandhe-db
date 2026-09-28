@@ -49,11 +49,10 @@ INSERT 系を揃える設計とした。
   `22000` 拒否するため、実行本体（`replace_typed_rows_by_text_key`）へは
   `VECTOR` 列なしテーブルの要求が到達しない。サーバー側 `Embedder` によるベクトル
   生成を前提とする設計であるため対象外とした。
-- **`tenant::update_row_unchecked`**（`RowInput` による行全体置換 UPDATE）: 単一行
-  UPDATE（列指定 SET 版。`update_row_columns_unchecked`）・述語つき UPDATE とは別の
-  経路で、`schema.validate_embedding_dim` を無条件に呼ぶ同型の制約を持つ。本 Issue
-  の受け入れ基準は INSERT 系に限られるため、この経路の是正はスコープ外とした
-  （追跡は Issue 起票の要否も含めユーザー判断待ち）。
+- **`tenant::update_row_unchecked`**（`RowInput` による行全体置換 UPDATE）: 本 Issue
+  の時点では `schema.validate_embedding_dim` を無条件に呼ぶ同型の制約を持ち
+  スコープ外としていたが、Issue #1079 で `validate_row_embedding_dim` への
+  置き換えにより解消済み。
 - **NoSQL 表層 `insert` op**（`wire-server::http::query::insert`）: engine 側の
   `tenant::insert_typed_row(s)_unchecked` をそのまま呼ぶため production コードの
   変更は不要。結合テストは `crates/wire-server/tests/nosql6_insert.rs` へ追加可能

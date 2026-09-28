@@ -476,18 +476,37 @@ const CATALOG_FORMAT_VERSION_V8: &str = "v8";
 /// `uniq:<n>` 行（v9 に限り `n >= 1` 必須）の後ろに `n` 個の
 /// `U:<name>:<col1,col2,...>` 行（`U:` 行の 2 番目のフィールドに制約名を持つ点が
 /// v6〜v8 と異なる唯一の差分）、続けて `checks:<m>` 行（0 件可）と `m` 個の
-/// `check:` 行、`fks:<k>` 行（**v9 に限り `k == 0` を許容する**。他のバージョンは
-/// `k >= 1` 必須）と `k` 個の `fk:` 行を追記する。
+/// `check:` 行、`fks:<k>` 行（**v9 に限り `k == 0` を許容する**。v8 は
+/// `k >= 1` 必須）と `k` 個の 3 フィールド `fk:` 行（`MATCH`・遅延属性を持たない
+/// 既定オプション固定）を追記する。
 ///
 /// v9 で書くのはスキーマが少なくとも 1 つの UNIQUE 制約を持ち、かつその実名が
 /// 「全 UNIQUE を名前未指定とみなして [`derive_unique_constraint_names`] で
-/// 導出した既定名」と 1 つでも一致しない場合だけとする（[`encode_schema`]）。
-/// 名前を指定せずに宣言された UNIQUE 制約は既定名と一致するため、`CREATE TABLE`・
-/// 名前省略の `ALTER TABLE ADD UNIQUE` はバイト列を変えず v6〜v8 のまま書かれる
-/// （既存ゴールデンテストに影響しない）。名前の無い旧 v6〜v8 値は decode 時に
-/// 既定名を導出する（[`assign_unique_constraint_names`]）。v9 を知らない旧
-/// バイナリは「未知のフォーマットバージョン」として fail-closed に拒否する。
+/// 導出した既定名」と 1 つでも一致せず（[`encode_schema`]）、かつ `FOREIGN KEY`
+/// が既定以外の `MATCH`・遅延属性を 1 件も持たない場合だけとする（後者を 1 件でも
+/// 持つ場合は [`CATALOG_FORMAT_VERSION_V10`] で書く）。名前を指定せずに宣言された
+/// UNIQUE 制約は既定名と一致するため、`CREATE TABLE`・名前省略の
+/// `ALTER TABLE ADD UNIQUE` はバイト列を変えず v6〜v8 のまま書かれる（既存
+/// ゴールデンテストに影響しない）。名前の無い旧 v6〜v8 値は decode 時に既定名を
+/// 導出する（[`assign_unique_constraint_names`]）。v9 を知らない旧バイナリは
+/// 「未知のフォーマットバージョン」として fail-closed に拒否する。
 const CATALOG_FORMAT_VERSION_V9: &str = "v9";
+
+/// カタログ v10（TABLE-16/17・TASK-204/205、Issue #1067・#1077 の統合）: v9 の
+/// 上位集合で、`FOREIGN KEY` のうち 1 件以上が既定以外の `MATCH`（`Full`）・
+/// 遅延属性（`NotDeferrable` 以外）を持つスキーマに使う。本体（`pk:` 行・
+/// 6 フィールド列行・名前付き `uniq:` セクション）は v9 と同一のまま、`fks:` の
+/// `fk:` 行のみ `<col1,...>:<parent_table>:<pcol1,...>:<match>:<deferral>` の
+/// 5 フィールドへ拡張する（`match` は `simple`／`full`、`deferral` は
+/// `immediate`〔`NotDeferrable`〕／`deferrable`〔`DeferrableInitiallyImmediate`〕／
+/// `deferred`〔`DeferrableInitiallyDeferred`〕）。`fks:<k>` は
+/// **v10 に限り `k >= 1` 必須**（既定オプションのみの FK しか無ければ v8／v9 の
+/// バイト列のまま変えない。正規形の一意性）。`uniq:<n>` は v9 と異なり
+/// `n == 0` を許容する（UNIQUE を 1 つも持たずとも `FOREIGN KEY` の拡張
+/// オプションだけを理由に v10 へ昇格しうるため）。v10 を知らない旧バイナリは
+/// 「未知のフォーマットバージョン」として fail-closed に拒否する（前方互換は
+/// 持たない）。
+const CATALOG_FORMAT_VERSION_V10: &str = "v10";
 
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
 /// 実装既定値）。デコード時、この値を超える宣言件数はアロケーション前に拒否する
@@ -985,18 +1004,19 @@ impl ColumnType {
         matches!(self, ColumnType::Vector(_))
     }
 
-    /// `PRIMARY KEY`（Issue #903）の構成列・UNIQUE 制約（Issue #905）の参照列
-    /// として宣言できる型かどうか（TABLE-16・TASK-204。両者で共有する単一の
-    /// 一意キー許可リストであり、第 2 の許可リストは作らない）。行バイト列上の
-    /// 値表現がバイト単位で一意に決まる型のみを許可する fail-closed な許可
-    /// リストであり、`constraint::enforce_unique_keys_in_txn`
-    /// が構築する正準キーバイト列の一意性が値の一意性と一致することの前提になる。
-    /// `VECTOR`（検索対象・等価比較の対象外）・`REAL`／`DOUBLE`（`-0.0` 正規化はある
-    /// ものの浮動小数の等価性は一般に不安定）・`NUMERIC`（スケール違いの表現差が
-    /// 未検証）・`JSON`／`JSONB`（正規化の有無で表現が割れる）・`ARRAY`（要素単位の
-    /// 順序等価性が未検証）は対象外とする。`sql::allowlist::validate_create_table_tokens`
-    /// が SQL 表層の構造検証段階でも同じ判定を行う（第 2 の許可リストを作らず、
-    /// ここへ委譲する）。
+    /// `PRIMARY KEY`（Issue #903）の構成列・`FOREIGN KEY`（Issue #907）の参照元列
+    /// として宣言できる型かどうか（TABLE-16・TASK-204。PK・FK が共有する許可
+    /// リスト。UNIQUE 制約は [`Self::is_unique_constraint_allowed`] という別の
+    /// 上位集合を持つ——理由は同メソッドの doc 参照）。行バイト列上の値表現が
+    /// バイト単位で一意に決まる型のみを許可する fail-closed な許可リストであり、
+    /// `constraint::enforce_unique_keys_in_txn` が構築する正準キーバイト列の
+    /// 一意性が値の一意性と一致することの前提になる。`VECTOR`（検索対象・
+    /// 等価比較の対象外）・`REAL`／`DOUBLE`／`NUMERIC`／`JSON`／`JSONB`／`ARRAY`
+    /// は対象外とする（Issue #1073 で UNIQUE のみへ拡張。PK・FK 側は据え置き。
+    /// `docs/design/foreign-key.md` D3「参照元は PK 許可型であること」が前提に
+    /// しているため、この共有リストを広げると FK・PK の対象型が意図せず広がる）。
+    /// `sql::allowlist::validate_create_table_tokens` が SQL 表層の構造検証段階
+    /// でも同じ判定を行う（第 2 の許可リストを作らず、ここへ委譲する）。
     pub(crate) fn is_primary_key_allowed(&self) -> bool {
         matches!(
             self,
@@ -1012,13 +1032,51 @@ impl ColumnType {
         )
     }
 
+    /// UNIQUE 制約（Issue #905・#1073）の参照列として宣言できる型かどうか
+    /// （TABLE-16・TASK-204）。[`Self::is_primary_key_allowed`] の上位集合
+    /// （PK 許可型はすべて UNIQUE でも許可する）で、REAL・DOUBLE PRECISION・
+    /// NUMERIC・JSON・JSONB・配列型を追加で許可する。PK・FK 側の許可リストは
+    /// 意図的に据え置く（`is_primary_key_allowed` の doc 参照）。正準キーの
+    /// 型ごとの正規化（`-0.0` 正規化・NUMERIC の末尾ゼロ除去・JSON の値として
+    /// の等価正規化・配列要素の生ペイロード連結）は
+    /// [`crate::constraint::push_canonical_component`] が担う
+    /// （`docs/design/unique-constraint.md` D7 参照）。`VECTOR`（検索対象・
+    /// 等価比較の対象外）は引き続き対象外。
+    pub(crate) fn is_unique_constraint_allowed(&self) -> bool {
+        self.is_primary_key_allowed()
+            || matches!(
+                self,
+                ColumnType::Real
+                    | ColumnType::Double
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Json
+                    | ColumnType::Jsonb
+                    | ColumnType::Array(_)
+            )
+    }
+
     /// [`crate::constraint::enforce_unique_keys_in_txn`] が正準キーバイト列を
-    /// 組み立てる際に使う、一意キー許可型ごとの固定タグ（TABLE-16・TASK-204、
-    /// Issue #903）。[`Self::is_primary_key_allowed`] が `true` を返す型にのみ
-    /// 呼び出す契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。値は
-    /// 永続化されない（`constraint.rs` の判定用スクラッチにのみ使う）ため、
-    /// カタログの `catalog_fields` タグとは独立に採番してよい。
-    pub(crate) fn primary_key_tag(&self) -> u8 {
+    /// 組み立てる際に使う、一意キー許可型（[`Self::is_unique_constraint_allowed`]。
+    /// PK・FK は狭い方の [`Self::is_primary_key_allowed`] のみを使う）ごとの
+    /// 固定タグ（TABLE-16・TASK-204、Issue #903・#1073）。
+    /// [`Self::is_unique_constraint_allowed`] が `true` を返す型にのみ呼び出す
+    /// 契約（呼び出し元は非許可型ではこのメソッドを呼ばない）。値は永続化
+    /// されない（`constraint.rs` の判定用スクラッチにのみ使う）ため、カタログの
+    /// `catalog_fields` タグとは独立に採番してよい。
+    /// [`Self::unique_key_tag`] の `ColumnType::Array` に対応する値。
+    /// [`crate::constraint::push_canonical_component`] は要素値（借用結果
+    /// [`crate::row_codec::ArrayRef`]）だけを持ち、宣言時の `max_len` を含む
+    /// 完全な `ArrayType` を構築できないため、単独の定数として公開する
+    /// （`unique_key_tag` の `match` 側の値と同一であることを機械的に保証する）。
+    pub(crate) const ARRAY_UNIQUE_KEY_TAG: u8 = 14;
+    /// [`Self::unique_key_tag`] の `ColumnType::Numeric` に対応する値。
+    /// [`crate::constraint::push_canonical_component`] は借用結果
+    /// [`crate::numeric::Decimal`] だけを持ち、宣言時の `precision`／`scale`
+    /// を含む `ColumnType::Numeric` を構築する必要がないため、[`Self::
+    /// ARRAY_UNIQUE_KEY_TAG`] と同じ理由で単独の定数として公開する。
+    pub(crate) const NUMERIC_UNIQUE_KEY_TAG: u8 = 12;
+
+    pub(crate) fn unique_key_tag(&self) -> u8 {
         match self {
             ColumnType::Text => 1,
             ColumnType::Integer => 2,
@@ -1029,14 +1087,13 @@ impl ColumnType {
             ColumnType::Bytea => 7,
             ColumnType::Uuid => 8,
             ColumnType::Enum(_) => 9,
-            ColumnType::Vector(_)
-            | ColumnType::Real
-            | ColumnType::Double
-            | ColumnType::Array(_)
-            | ColumnType::Json
-            | ColumnType::Jsonb
-            | ColumnType::Numeric { .. } => {
-                // 呼び出し元が `is_primary_key_allowed` の契約を破っている
+            ColumnType::Real => 10,
+            ColumnType::Double => 11,
+            ColumnType::Numeric { .. } => Self::NUMERIC_UNIQUE_KEY_TAG,
+            ColumnType::Json | ColumnType::Jsonb => 13,
+            ColumnType::Array(_) => Self::ARRAY_UNIQUE_KEY_TAG,
+            ColumnType::Vector(_) => {
+                // 呼び出し元が `is_unique_constraint_allowed` の契約を破っている
                 // （非許可型からタグを取得しようとした）。永続化しない内部
                 // スクラッチ用の値のため panic ではなく判別可能な番兵を返し、
                 // 呼び出し元（`constraint.rs`）が別途 fail-closed に拒否する。
@@ -2082,8 +2139,8 @@ impl<'a> Iterator for PhysicalSlots<'a> {
 /// 検査する。RLS 可視集合ではない）。列は宣言順を保持する。
 ///
 /// `columns()` が返す各列名は、この制約を保持する [`TableSchema`] の**生存列**
-/// （`schema.columns`）に存在し、かつ [`ColumnType::is_primary_key_allowed`]
-/// （主キーと共有する一意キー許可型の単一の許可リスト）を満たす型であることを
+/// （`schema.columns`）に存在し、かつ [`ColumnType::is_unique_constraint_allowed`]
+/// （PK・FK が共有する許可リストの上位集合。Issue #1073）を満たす型であることを
 /// [`validate_schema`] が保証する契約とする（構築時点では検証しない。
 /// [`ColumnDef::new`] と同じ「検証は呼び出し元が別途通す」設計）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2162,12 +2219,47 @@ pub struct ForeignKeyDef {
     columns: Vec<String>,
     parent_table: String,
     parent_columns: Vec<String>,
+    match_type: ForeignKeyMatch,
+    deferrability: ForeignKeyDeferrability,
+}
+
+/// `FOREIGN KEY` の `MATCH` 句（TABLE-17・TASK-205、Issue #1077）。既定は
+/// `Simple`。`constraint::push_required_key` が参照元側の NULL 混在判定に使う。
+///
+/// - `Simple`（PostgreSQL の既定）: 構成列のいずれかが NULL の組は検査対象外。
+/// - `Full`: 構成列がすべて NULL の組のみ検査対象外とし、NULL と非 NULL が
+///   混在する組は違反（`23503`）にする。単一列の `FOREIGN KEY` では `Simple`
+///   と同じ挙動になる（NULL は 0 個か全部＝1 個のいずれかしかあり得ないため）。
+///
+/// `MATCH PARTIAL` は非対応のまま（`sql::allowlist` が `42601` で拒否する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForeignKeyMatch {
+    Simple,
+    Full,
+}
+
+/// `FOREIGN KEY` の `[NOT] DEFERRABLE`／`INITIALLY {DEFERRED|IMMEDIATE}` 句
+/// （TABLE-17・TASK-205、Issue #1077）。既定は `NotDeferrable`（従来どおり文単位で
+/// 即時検査）。検査タイミングへの効き方は `constraint::FkCheckMode` 参照——
+/// `DeferrableInitiallyDeferred` の宣言だけが、明示トランザクション
+/// （`tenant::WriteTarget::InTxn`）中の文単位検査を COMMIT まで遅延できる
+/// （autocommit では区別なく文単位で検査する）。`SET CONSTRAINTS` は非対応
+/// （`DeferrableInitiallyImmediate` を実行時に遅延へ切り替える経路はない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForeignKeyDeferrability {
+    NotDeferrable,
+    DeferrableInitiallyImmediate,
+    DeferrableInitiallyDeferred,
 }
 
 impl ForeignKeyDef {
     /// `pub(crate)`: 構築元は `sql::allowlist`（`CREATE TABLE` の列制約・表制約）・
-    /// [`decode_schema_body`]（v8 カタログ値の復元）・参照先解決
+    /// [`decode_schema_body`]（v8／v9 カタログ値の復元）・参照先解決
     /// （[`resolve_foreign_key_target`]）に限る。検証は [`validate_schema`] が担う。
+    /// `MATCH`／遅延属性は既定値（`Simple`／`NotDeferrable`）になる
+    /// （[`Self::with_options`] で明示指定を上書きする）。
     pub(crate) fn new(
         columns: Vec<String>,
         parent_table: String,
@@ -2177,7 +2269,24 @@ impl ForeignKeyDef {
             columns,
             parent_table,
             parent_columns,
+            match_type: ForeignKeyMatch::Simple,
+            deferrability: ForeignKeyDeferrability::NotDeferrable,
         }
+    }
+
+    /// [`Self::new`] に `MATCH`・遅延属性を明示指定したコピーを返すビルダー
+    /// （TABLE-17・TASK-205、Issue #1077）。`sql::allowlist` の `REFERENCES` 句
+    /// 解析・[`decode_schema_body`]（v9 カタログ値の復元）・
+    /// [`resolve_foreign_key_target`]（参照先列の解決時にオプションを引き継ぐ）が
+    /// 呼ぶ。
+    pub(crate) fn with_options(
+        mut self,
+        match_type: ForeignKeyMatch,
+        deferrability: ForeignKeyDeferrability,
+    ) -> Self {
+        self.match_type = match_type;
+        self.deferrability = deferrability;
+        self
     }
 
     /// 参照元（このスキーマ側）の列名（宣言順）。
@@ -2196,9 +2305,38 @@ impl ForeignKeyDef {
         &self.parent_columns
     }
 
+    /// `MATCH` 句（TABLE-17・TASK-205、Issue #1077）。
+    pub fn match_type(&self) -> ForeignKeyMatch {
+        self.match_type
+    }
+
+    /// 遅延属性（TABLE-17・TASK-205、Issue #1077）。
+    pub fn deferrability(&self) -> ForeignKeyDeferrability {
+        self.deferrability
+    }
+
+    /// `INITIALLY DEFERRED` で宣言されているか（`constraint::FkCheckMode` が
+    /// 参照する。COMMIT まで検査を遅延できる唯一の区分）。
+    pub(crate) fn is_initially_deferred(&self) -> bool {
+        matches!(
+            self.deferrability,
+            ForeignKeyDeferrability::DeferrableInitiallyDeferred
+        )
+    }
+
     /// 参照先が `id` 疑似列（物理キー）であるか。
     pub(crate) fn references_parent_id(&self) -> bool {
         matches!(self.parent_columns.as_slice(), [only] if only == FOREIGN_KEY_PARENT_ID_COLUMN)
+    }
+
+    /// `MATCH`・遅延属性を無視した参照形状（参照元列・参照先テーブル・参照先列）の
+    /// 一致判定。重複宣言の検査（[`validate_foreign_keys`]・[`parse_foreign_key_section`]）が
+    /// 使う——オプション違いだけの同一 FK も重複として拒否する（fail-closed。
+    /// TABLE-17・TASK-205、Issue #1077）。
+    pub(crate) fn shares_reference_shape(&self, other: &Self) -> bool {
+        self.columns == other.columns
+            && self.parent_table == other.parent_table
+            && self.parent_columns == other.parent_columns
     }
 }
 
@@ -2396,9 +2534,8 @@ impl TableSchema {
     /// UPDATE・UPSERT の `DO UPDATE`）はこのメソッドを直接使う。これらの呼び出し元は
     /// `VECTOR` 列への SET があった場合のみ本メソッドを呼ぶガード（`vector_assigned`
     /// 等）で囲っているため、`VECTOR` 列を持たないテーブルでは通常到達しない。
-    /// 例外は `tenant::update_row_unchecked`（[`RowInput`] による行全体置換 UPDATE）で、
-    /// こちらは無条件に呼ぶため `VECTOR` 列なしテーブルでは常に拒否される
-    /// （Issue #995 のスコープは INSERT 系のみで、この経路の是正は対象外）。
+    /// 行全体を書き込む経路（`RowInput` による INSERT・行全体置換 UPDATE）は
+    /// [`Self::validate_row_embedding_dim`] を使う（TABLE-1・Issue #995・#1079）。
     pub fn validate_embedding_dim(&self, dim: usize) -> Result<()> {
         let expected = self
             .vector_dim()
@@ -2411,8 +2548,8 @@ impl TableSchema {
         Ok(())
     }
 
-    /// 行全体を書き込む経路（INSERT 系。TABLE-1・Issue #995）向けの embedding
-    /// 次元検証。
+    /// 行全体を書き込む経路（INSERT 系、および `RowInput` による行全体置換 UPDATE。
+    /// TABLE-1・Issue #995・#1079）向けの embedding 次元検証。
     ///
     /// `VECTOR` 列を持つスキーマでは [`Self::validate_embedding_dim`] へそのまま
     /// 委譲し、エラー分類・文言は完全に同一のまま変えない（Issue #995 受け入れ
@@ -2770,7 +2907,12 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
                 }
             }
         }
-        if schema.foreign_keys.iter().take(i).any(|other| other == fk) {
+        if schema
+            .foreign_keys
+            .iter()
+            .take(i)
+            .any(|other| other.shares_reference_shape(fk))
+        {
             return Err(CatalogError::Invalid(
                 "duplicate foreign key declaration".to_string(),
             ));
@@ -2822,7 +2964,8 @@ fn resolve_foreign_key_target(
                 CatalogError::Invalid(format!("foreign key references unknown column: {name}"))
             })
     };
-    let resolved = ForeignKeyDef::new(fk.columns.clone(), fk.parent_table.clone(), parent_columns);
+    let resolved = ForeignKeyDef::new(fk.columns.clone(), fk.parent_table.clone(), parent_columns)
+        .with_options(fk.match_type(), fk.deferrability());
     if resolved.references_parent_id() {
         for name in &resolved.columns {
             if !matches!(child_type(name)?, ColumnType::Integer | ColumnType::BigInt) {
@@ -3015,9 +3158,8 @@ fn assign_unique_constraint_names(schema: TableSchema) -> TableSchema {
 /// - 制約数が [`MAX_UNIQUE_CONSTRAINTS`] 以下
 /// - 各制約の名前が非空・識別子として妥当（[`validate_identifier`]）
 /// - 各制約が非空・[`MAX_UNIQUE_CONSTRAINT_COLUMNS`] 以下・制約内の列名重複なし
-/// - 各列名が**生存列**に存在し、[`ColumnType::is_primary_key_allowed`]
-///   （主キーと共有する単一の一意キー許可型リスト。第 2 の許可リストを
-///   作らない）を満たす型
+/// - 各列名が**生存列**に存在し、[`ColumnType::is_unique_constraint_allowed`]
+///   （PK・FK が共有する許可リストの上位集合。Issue #1073）を満たす型
 /// - 同一列リスト（宣言順そのままの比較）の制約が重複しない
 ///
 /// UNIQUE 制約名と CHECK 制約名の名前空間共有（テーブル単位）の検査は
@@ -3077,7 +3219,7 @@ fn validate_unique_constraints(schema: &TableSchema) -> Result<()> {
                         "unique constraint references unknown column: {name}"
                     ))
                 })?;
-            if !column.ty.is_primary_key_allowed() {
+            if !column.ty.is_unique_constraint_allowed() {
                 return Err(CatalogError::Invalid(format!(
                     "column {name} has a type that cannot be used in a unique constraint"
                 )));
@@ -3342,7 +3484,14 @@ fn parse_check_section<'a>(
 /// （[`encode_schema`] の v8 分岐が呼ぶ。TABLE-17・TASK-205、Issue #907）。
 /// 列名・テーブル名は `validate_identifier`（[`validate_schema`] 経由で検証済み）に
 /// より `:`／`,`／改行を含み得ないため、区切り文字と衝突しない。
-fn encode_foreign_key_section(out: &mut String, foreign_keys: &[ForeignKeyDef]) -> Result<()> {
+/// `include_options` は v9（[`CATALOG_FORMAT_VERSION_V9`]）選択時のみ `true` で、
+/// `fk:` 行を 5 フィールド（`MATCH`・遅延属性を含む）で書く。v8 は 3 フィールドの
+/// まま（既存のバイト列を変えない。TABLE-17・TASK-205、Issue #1077）。
+fn encode_foreign_key_section(
+    out: &mut String,
+    foreign_keys: &[ForeignKeyDef],
+    include_options: bool,
+) -> Result<()> {
     out.push_str(&format!("fks:{}\n", foreign_keys.len()));
     for fk in foreign_keys {
         validate_identifier(&fk.parent_table)?;
@@ -3355,6 +3504,19 @@ fn encode_foreign_key_section(out: &mut String, foreign_keys: &[ForeignKeyDef]) 
         out.push_str(&fk.parent_table);
         out.push(':');
         out.push_str(&fk.parent_columns.join(","));
+        if include_options {
+            out.push(':');
+            out.push_str(match fk.match_type {
+                ForeignKeyMatch::Simple => "simple",
+                ForeignKeyMatch::Full => "full",
+            });
+            out.push(':');
+            out.push_str(match fk.deferrability {
+                ForeignKeyDeferrability::NotDeferrable => "immediate",
+                ForeignKeyDeferrability::DeferrableInitiallyImmediate => "deferrable",
+                ForeignKeyDeferrability::DeferrableInitiallyDeferred => "deferred",
+            });
+        }
         out.push('\n');
     }
     Ok(())
@@ -3390,12 +3552,17 @@ fn parse_foreign_key_column_list(
 ///
 /// 検証順序: `fks:` 行の存在・件数の数値形式・`1..=MAX_FOREIGN_KEYS_PER_TABLE`
 /// （0 件は「`FOREIGN KEY` を持たないスキーマは v2〜v7 で書く」形式の一意性契約に
-/// 反する）→ 各行の `fk:` 接頭辞・フィールド数（3）→ 列リスト・テーブル名の識別子
-/// 形状。参照元列の実在・参照先との照合は呼び出し元の [`validate_schema`] が
-/// 判定する。確保は宣言件数（上限検査済み）の範囲に限る。
+/// 反する）→ 各行の `fk:` 接頭辞・フィールド数（`has_options` なら 5、そうでなければ
+/// 3）→ 列リスト・テーブル名の識別子形状・`MATCH`／遅延属性トークン
+/// （TABLE-17・TASK-205、Issue #1077）。参照元列の実在・参照先との照合は呼び出し元の
+/// [`validate_schema`] が判定する。確保は宣言件数（上限検査済み）の範囲に限る。
+/// `allow_empty` はカタログ v9（[`CATALOG_FORMAT_VERSION_V9`]。UNIQUE の実名の
+/// 有無で選ばれる形式。FK の有無とは独立）選択時のみ `true`。`has_options` は
+/// v10（[`CATALOG_FORMAT_VERSION_V10`]）選択時のみ `true`。
 fn parse_foreign_key_section<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     allow_empty: bool,
+    has_options: bool,
 ) -> std::result::Result<Vec<ForeignKeyDef>, String> {
     let fks_line = lines
         .next()
@@ -3407,10 +3574,12 @@ fn parse_foreign_key_section<'a>(
         .parse()
         .map_err(|_| format!("malformed foreign key count: {count_str:?}"))?;
     // `allow_empty` は v9（UNIQUE の実名の有無で選ばれる形式。FK の有無とは
-    // 独立。Issue #1067）のみ `true`。v8 の 0 件は形式の一意性契約違反として
+    // 独立。Issue #1067）のみ `true`。v8／v10 の 0 件は形式の一意性契約違反として
     // 拒否する。
     if count == 0 && !allow_empty {
-        return Err("v8 catalog format requires at least one FOREIGN KEY constraint".to_string());
+        return Err(
+            "v8/v10 catalog format requires at least one FOREIGN KEY constraint".to_string(),
+        );
     }
     if count > MAX_FOREIGN_KEYS_PER_TABLE {
         return Err(format!("too many FOREIGN KEY constraints: {count}"));
@@ -3424,10 +3593,47 @@ fn parse_foreign_key_section<'a>(
             .strip_prefix("fk:")
             .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
         let mut fields = body.split(':');
-        let (Some(columns_field), Some(parent_table), Some(parent_columns_field), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
+        let (Some(columns_field), Some(parent_table), Some(parent_columns_field)) =
+            (fields.next(), fields.next(), fields.next())
         else {
             return Err(format!("malformed foreign key line: {line:?}"));
+        };
+        // `MATCH`／遅延属性フィールド（v9 のみ。TABLE-17・TASK-205、Issue #1077）。
+        // v8 は 3 フィールド固定のため、ここで余剰フィールドが無いことを検証する。
+        let (match_type, deferrability) = if has_options {
+            let match_field = fields
+                .next()
+                .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
+            let deferral_field = fields
+                .next()
+                .ok_or_else(|| format!("malformed foreign key line: {line:?}"))?;
+            if fields.next().is_some() {
+                return Err(format!("malformed foreign key line: {line:?}"));
+            }
+            let match_type = match match_field {
+                "simple" => ForeignKeyMatch::Simple,
+                "full" => ForeignKeyMatch::Full,
+                other => return Err(format!("malformed foreign key MATCH field: {other:?}")),
+            };
+            let deferrability = match deferral_field {
+                "immediate" => ForeignKeyDeferrability::NotDeferrable,
+                "deferrable" => ForeignKeyDeferrability::DeferrableInitiallyImmediate,
+                "deferred" => ForeignKeyDeferrability::DeferrableInitiallyDeferred,
+                other => {
+                    return Err(format!(
+                        "malformed foreign key deferrability field: {other:?}"
+                    ))
+                }
+            };
+            (match_type, deferrability)
+        } else {
+            if fields.next().is_some() {
+                return Err(format!("malformed foreign key line: {line:?}"));
+            }
+            (
+                ForeignKeyMatch::Simple,
+                ForeignKeyDeferrability::NotDeferrable,
+            )
         };
         let columns = parse_foreign_key_column_list(columns_field, line)?;
         validate_identifier(parent_table)
@@ -3449,7 +3655,8 @@ fn parse_foreign_key_section<'a>(
         if columns.len() != parent_columns.len() {
             return Err(format!("foreign key column count mismatch: {line:?}"));
         }
-        let fk = ForeignKeyDef::new(columns, parent_table.to_string(), parent_columns);
+        let fk = ForeignKeyDef::new(columns, parent_table.to_string(), parent_columns)
+            .with_options(match_type, deferrability);
         if fk
             .parent_columns
             .iter()
@@ -3460,10 +3667,30 @@ fn parse_foreign_key_section<'a>(
                 "the id column can only be referenced alone: {line:?}"
             ));
         }
-        if foreign_keys.contains(&fk) {
+        if foreign_keys
+            .iter()
+            .any(|other: &ForeignKeyDef| other.shares_reference_shape(&fk))
+        {
             return Err("duplicate foreign key declaration".to_string());
         }
         foreign_keys.push(fk);
+    }
+    // 正規形の一意性（TABLE-17・TASK-205、Issue #1077）: v10 選択の判断材料は
+    // 「既定以外の MATCH／遅延属性を持つ FK が 1 件以上ある」ことのみであり、
+    // 全 FK が既定オプションのスキーマは v8／v9 のバイト列のまま書く契約
+    // （`encode_schema` 参照）。この不変条件に反する v10 カタログ値
+    // （全既定値なのに v10 で書かれた手書きデータ）を「依存なし」等へ丸めず
+    // fail-closed に拒否する。
+    if has_options
+        && !foreign_keys.iter().any(|fk| {
+            fk.match_type() != ForeignKeyMatch::Simple
+                || fk.deferrability() != ForeignKeyDeferrability::NotDeferrable
+        })
+    {
+        return Err(
+            "v10 catalog format requires at least one FOREIGN KEY constraint with a non-default MATCH or deferrability option"
+                .to_string(),
+        );
     }
     Ok(foreign_keys)
 }
@@ -3500,7 +3727,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     let has_check = !schema.checks.is_empty();
     let has_fk = !schema.foreign_keys.is_empty();
     // v9 選択条件（Issue #1067）: 実名が既定名導出と 1 つでも食い違う UNIQUE
-    // 制約を持つスキーマのみ v9 で書く。名前を明示しない `CREATE TABLE`・
+    // 制約を持つスキーマのみ v9（以上）で書く。名前を明示しない `CREATE TABLE`・
     // `ALTER TABLE ADD UNIQUE` は常に既定名と一致するため v6〜v8 のバイト列は
     // 変わらない（既存ゴールデンテスト不変）。
     let has_named_unique = has_unique && {
@@ -3518,12 +3745,30 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             .zip(derived.iter())
             .any(|(uc, derived_name)| uc.name() != derived_name.as_str())
     };
+    // v10 選択の判断材料（TABLE-17・TASK-205、Issue #1077）: 既定以外の `MATCH`
+    // （`Full`）・遅延属性（`NotDeferrable` 以外）を持つ `FOREIGN KEY` が
+    // 1 件でもあるか。全 FK が既定オプションのスキーマは（`has_fk` であっても）
+    // 引き続き v8／v9 のバイト列のまま書く（正規形の一意性。既存ゴールデン
+    // テストへ影響しない）。
+    let has_fk_options = schema.foreign_keys.iter().any(|fk| {
+        fk.match_type() != ForeignKeyMatch::Simple
+            || fk.deferrability() != ForeignKeyDeferrability::NotDeferrable
+    });
     let mut out = String::new();
-    if has_named_unique {
-        // カタログ v9（TABLE-16・TASK-204、Issue #1067）: v8 の上位集合。
-        // `uniq:` セクションの `U:` 行が `U:<name>:<cols>` の形になる点のみが
-        // v6〜v8 と異なる（`CATALOG_FORMAT_VERSION_V9` のドキュメント参照）。
-        out.push_str(CATALOG_FORMAT_VERSION_V9);
+    if has_named_unique || has_fk_options {
+        // カタログ v9／v10（TABLE-16/17・TASK-204/205、Issue #1067・#1077）:
+        // v8 の上位集合で `uniq:` セクションの `U:` 行が `U:<name>:<cols>` の
+        // 形になる（named-unique・fk-options のいずれかを理由にこの枝へ入れば
+        // 常に名前付きで書く。両者は独立な選択理由だが正規形はこの 1 系統に
+        // 統合する）。`FOREIGN KEY` が既定以外の `MATCH`・遅延属性を 1 件でも
+        // 持つ場合のみ v10（[`CATALOG_FORMAT_VERSION_V10`]。`fk:` 行を 5
+        // フィールドへ拡張）で書き、それ以外は v9 のまま
+        // （[`CATALOG_FORMAT_VERSION_V9`]）。
+        out.push_str(if has_fk_options {
+            CATALOG_FORMAT_VERSION_V10
+        } else {
+            CATALOG_FORMAT_VERSION_V9
+        });
         out.push('\n');
         out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
         let pk_field = schema
@@ -3567,7 +3812,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             out.push('\n');
         }
         encode_check_section(&mut out, &schema.checks)?;
-        encode_foreign_key_section(&mut out, &schema.foreign_keys)?;
+        encode_foreign_key_section(&mut out, &schema.foreign_keys, has_fk_options)?;
     } else if has_default || has_unique || has_check || has_fk {
         // UNIQUE 制約を持つスキーマは v6、それ以外で `DEFAULT` を持つスキーマは
         // v5 で書く（`PRIMARY KEY` の有無に関わらず）。v6 は v5 と同じ本体
@@ -3582,7 +3827,10 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // セクションを追記するだけの上位集合。
         // `FOREIGN KEY` を持つスキーマは v8（TABLE-17・TASK-205、Issue #907）。
         // v8 は v7 と同じ本体・`uniq:`／`checks:` セクション（いずれも 0 件可）の
-        // 後ろに `fks:` セクションを追記するだけの上位集合。
+        // 後ろに `fks:` セクションを追記するだけの上位集合。この枝は
+        // `!has_named_unique && !has_fk_options` の場合のみ到達するため
+        // （既定以外の `MATCH`・遅延属性を持つ場合は上の v9／v10 分岐で処理
+        // 済み）、ここでは常に既定オプション・3 フィールドの `fk:` 行になる。
         out.push_str(if has_fk {
             CATALOG_FORMAT_VERSION_V8
         } else if has_check {
@@ -3641,7 +3889,7 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             encode_check_section(&mut out, &schema.checks)?;
         }
         if has_fk {
-            encode_foreign_key_section(&mut out, &schema.foreign_keys)?;
+            encode_foreign_key_section(&mut out, &schema.foreign_keys, has_fk_options)?;
         }
     } else if let Some(pk_cols) = &schema.primary_key {
         // 主キーを宣言したが DEFAULT は持たないスキーマは（墓標の有無に
@@ -3814,6 +4062,7 @@ fn decode_schema_body(
         V7,
         V8,
         V9,
+        V10,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -3824,6 +4073,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V7 => FormatVersion::V7,
         CATALOG_FORMAT_VERSION_V8 => FormatVersion::V8,
         CATALOG_FORMAT_VERSION_V9 => FormatVersion::V9,
+        CATALOG_FORMAT_VERSION_V10 => FormatVersion::V10,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -3835,7 +4085,8 @@ fn decode_schema_body(
     // 列行・`uniq:` セクション〔0 件可〕の後ろに `checks:` セクション）。
     // v8（TABLE-17・TASK-205、Issue #907）は v7 の上位集合（`checks:` セクション
     // 〔0 件可〕の後ろに `fks:` セクション）。v9（Issue #1067）は v8 の上位集合
-    // （`U:` 行に制約名を持つ点のみ差分）。
+    // （`U:` 行に制約名を持つ点のみ差分）。v10（TABLE-17・TASK-205、Issue #1077）は
+    // v9 の上位集合（`fks:` セクションの `fk:` 行のみ 5 フィールドへ拡張）。
     let has_default_field = matches!(
         format_version,
         FormatVersion::V5
@@ -3843,8 +4094,9 @@ fn decode_schema_body(
             | FormatVersion::V7
             | FormatVersion::V8
             | FormatVersion::V9
+            | FormatVersion::V10
     );
-    // `pk:` 行を持つのは v4〜v9（v4 は非空必須、v5〜v9 は空を「主キー
+    // `pk:` 行を持つのは v4〜v10（v4 は非空必須、v5〜v10 は空を「主キー
     // なし」として許容する）。
     let has_pk_line = matches!(
         format_version,
@@ -3854,6 +4106,7 @@ fn decode_schema_body(
             | FormatVersion::V7
             | FormatVersion::V8
             | FormatVersion::V9
+            | FormatVersion::V10
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -4088,13 +4341,21 @@ fn decode_schema_body(
             .into_iter()
             .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
             .collect(),
+        // v10（Issue #1077）は `FOREIGN KEY` の `MATCH`／遅延属性オプションの
+        // 有無で選ばれる形式であり UNIQUE の有無とは独立なため、v9 と異なり
+        // `n == 0` を許容する（`allow_empty = true`）。
+        FormatVersion::V10 => parse_unique_section(&mut lines, true, true)
+            .map_err(CatalogError::Invalid)?
+            .into_iter()
+            .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
+            .collect(),
         _ => Vec::new(),
     };
     // v7 専用の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。構造は
     // 共有パーサー [`parse_check_section`] が検証し、参照列の実在・制約名の
     // 一意性は後続の `validate_schema` が担う。
     let checks: Vec<CheckConstraint> = match format_version {
-        FormatVersion::V7 | FormatVersion::V8 | FormatVersion::V9 => {
+        FormatVersion::V7 | FormatVersion::V8 | FormatVersion::V9 | FormatVersion::V10 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -4104,13 +4365,18 @@ fn decode_schema_body(
     // パーサー [`parse_foreign_key_section`] が検証し、参照元列の実在・自己参照の
     // 照合は後続の `validate_schema`（[`validate_foreign_keys`]）が担う。v9
     // （Issue #1067）は UNIQUE の実名の有無で選ばれる形式であり FK の有無とは
-    // 独立なため、`k == 0` を許容する（v8 は `k >= 1` 必須のまま変えない）。
+    // 独立なため、`k == 0` を許容する（v8 は `k >= 1` 必須のまま変えない）。v10
+    // （Issue #1077）は `MATCH`／遅延属性オプションを持つことが選択理由のため
+    // `k >= 1` 必須へ戻り、`fk:` 行を 5 フィールド（`has_options = true`）で読む。
     let foreign_keys: Vec<ForeignKeyDef> = match format_version {
         FormatVersion::V8 => {
-            parse_foreign_key_section(&mut lines, false).map_err(CatalogError::Invalid)?
+            parse_foreign_key_section(&mut lines, false, false).map_err(CatalogError::Invalid)?
         }
         FormatVersion::V9 => {
-            parse_foreign_key_section(&mut lines, true).map_err(CatalogError::Invalid)?
+            parse_foreign_key_section(&mut lines, true, false).map_err(CatalogError::Invalid)?
+        }
+        FormatVersion::V10 => {
+            parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
     };
@@ -4138,10 +4404,10 @@ fn decode_schema_body(
     .with_checks(checks)
     .with_foreign_keys(foreign_keys);
     // v6〜v8（名前の無い UNIQUE 制約）は decode 時に既定名を導出する
-    // （設計 D2・Issue #1067）。v9 はすでに実名を持つため素通しする
+    // （設計 D2・Issue #1067）。v9／v10 はすでに実名を持つため素通しする
     // （`assign_unique_constraint_names` は空名の制約にのみ作用するため
     // 呼んでも安全だが、意図を明示するため分岐する）。
-    let schema = if format_version == FormatVersion::V9 {
+    let schema = if matches!(format_version, FormatVersion::V9 | FormatVersion::V10) {
         schema
     } else {
         assign_unique_constraint_names(schema)
@@ -6033,6 +6299,9 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // v9（Issue #1067）は v8 の上位集合で、`U:` 行に制約名を持つ点のみが
         // 異なる。
         CATALOG_FORMAT_VERSION_V9 => (true, true),
+        // v10（TABLE-17・TASK-205、Issue #1077）は v9 の上位集合で、`fks:`
+        // セクションの `fk:` 行のみ 5 フィールドへ拡張する（下記で検証する）。
+        CATALOG_FORMAT_VERSION_V10 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -6045,7 +6314,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     let is_v7 = version_line == CATALOG_FORMAT_VERSION_V7;
     let is_v8 = version_line == CATALOG_FORMAT_VERSION_V8;
     let is_v9 = version_line == CATALOG_FORMAT_VERSION_V9;
-    let has_pk_line = is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9;
+    let is_v10 = version_line == CATALOG_FORMAT_VERSION_V10;
+    let has_pk_line = is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -6232,6 +6502,14 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             .into_iter()
             .map(|(_, cols)| cols)
             .collect()
+    } else if is_v10 {
+        // v10（Issue #1077）は UNIQUE の有無とは独立に選ばれる形式なので
+        // `n == 0` を許容する（`decode_schema_body` と同じ契約）。
+        parse_unique_section(&mut lines, true, true)
+            .map_err(CatalogError::CorruptSchema)?
+            .into_iter()
+            .map(|(_, cols)| cols)
+            .collect()
     } else {
         Vec::new()
     };
@@ -6240,19 +6518,26 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     // 飛ばすと壊れたセクションを持つカタログが本関数だけ「依存なし」に丸め
     // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
     // 参照列の実在・制約名の一意性も下で検証する。
-    let checks: Vec<CheckConstraint> = if is_v7 || is_v8 || is_v9 {
-        parse_check_section(&mut lines, is_v8 || is_v9).map_err(CatalogError::CorruptSchema)?
+    let checks: Vec<CheckConstraint> = if is_v7 || is_v8 || is_v9 || is_v10 {
+        parse_check_section(&mut lines, is_v8 || is_v9 || is_v10)
+            .map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
-    // v8 の `fks:` セクション（TABLE-17・TASK-205、Issue #907）。`FOREIGN KEY` は
-    // ENUM 型への新たな依存を作らないが、`checks:` と同じ理由（壊れたセクションを
-    // 本関数だけが「依存なし」に丸めない）で共有パーサーの構造検証を通し、参照元列の
-    // 実在も下で検証する。v9（Issue #1067）は FK 0 件を許容する。
+    // v8／v9／v10 の `fks:` セクション（TABLE-17・TASK-205、Issue #907／#1067／
+    // #1077）。`FOREIGN KEY` は ENUM 型への新たな依存を作らないが、`checks:` と
+    // 同じ理由（壊れたセクションを本関数だけが「依存なし」に丸めない）で共有
+    // パーサーの構造検証を通し、参照元列の実在も下で検証する。v9 は FK 0 件を
+    // 許容し（UNIQUE の実名の有無で選ばれる形式のため）、v10 は `MATCH`／
+    // 遅延属性オプションが選択理由のため `k >= 1` 必須・`has_options = true`
+    // （`fk:` 行 5 フィールド）で読む。全 FK が既定オプションの v10 カタログ値
+    // （正規形の一意性違反）も同じ共有パーサーが fail-closed に拒否する。
     let foreign_keys: Vec<ForeignKeyDef> = if is_v8 {
-        parse_foreign_key_section(&mut lines, false).map_err(CatalogError::CorruptSchema)?
+        parse_foreign_key_section(&mut lines, false, false).map_err(CatalogError::CorruptSchema)?
     } else if is_v9 {
-        parse_foreign_key_section(&mut lines, true).map_err(CatalogError::CorruptSchema)?
+        parse_foreign_key_section(&mut lines, true, false).map_err(CatalogError::CorruptSchema)?
+    } else if is_v10 {
+        parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
@@ -6437,11 +6722,18 @@ fn resolve_foreign_keys_in_txn(
 /// （TABLE-17・TASK-205、Issue #907）。`DROP TABLE` の依存検査（`2BP01`）と、
 /// 参照先側の書き込み後検査（`constraint::enforce_referencing_rows_in_txn`）が使う。
 ///
-/// `CATALOG_TABLE` を全走査するが、`FOREIGN KEY` を持つスキーマは必ず v8 で
-/// 永続化される（v2〜v8 は互いに排他な正規形）ため、値の 1 行目が v8 の
-/// エントリだけを decode する（大多数のテーブルは先頭バイトの比較のみで済む）。
-/// [`MAX_LIST_TABLES`] を超える v8 エントリは無制限 `Vec` 確保を避けて `Err`。
-/// 呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
+/// `CATALOG_TABLE` を全走査するが、`FOREIGN KEY` を持つスキーマは必ず v8・v9
+/// （TABLE-16・TASK-204、Issue #1067。UNIQUE の実名を持つ場合）・v10
+/// （TABLE-17・TASK-205、Issue #1077。既定以外の `MATCH`・遅延属性を 1 件でも
+/// 持つ場合）のいずれかで永続化される（v2〜v10 は互いに排他な正規形）ため、
+/// 値の 1 行目が v8・v9・v10 のいずれかのエントリだけを decode する（大多数の
+/// テーブルは先頭バイトの比較のみで済む）。**P0**: v9／v10 をここで見落とすと、
+/// それらの子テーブルに対して参照先側の検査
+/// （`constraint::enforce_referencing_rows_in_txn` 経由の DELETE／TRUNCATE／
+/// キー UPDATE）と `DROP TABLE` の依存検査（`2BP01`）が効かなくなる fail-open
+/// 経路になる（advisor 指摘・codex-review 指摘・Issue #1077）。
+/// [`MAX_LIST_TABLES`] を超える v8／v9／v10 エントリは無制限 `Vec` 確保を避けて
+/// `Err`。呼び出し元は `CATALOG_TABLE` のハンドルを保持していない状態で呼ぶこと。
 pub(crate) fn referencing_foreign_keys_in_txn(
     write_txn: &redb::WriteTransaction,
     parent_table: &str,
@@ -6451,8 +6743,10 @@ pub(crate) fn referencing_foreign_keys_in_txn(
     // 上位集合フォーマットのため、v8 の接頭辞だけを候補にすると v9 で書かれた
     // FK 付きスキーマが `DROP TABLE` の `2BP01` 判定・参照先側の書き込み検査
     // （`constraint::enforce_referencing_rows_in_txn`）の双方から見落とされる
-    // fail-open になる（advisor 指摘）。
+    // fail-open になる（advisor 指摘）。v10（Issue #1077）も同じ理由で候補に
+    // 加える。
     let v9_prefix = format!("{CATALOG_FORMAT_VERSION_V9}\n");
+    let v10_prefix = format!("{CATALOG_FORMAT_VERSION_V10}\n");
     let candidates: Vec<(String, Vec<u8>)> = {
         let table = match write_txn.open_table(CATALOG_TABLE) {
             Ok(t) => t,
@@ -6464,6 +6758,7 @@ pub(crate) fn referencing_foreign_keys_in_txn(
             let (key, value) = entry?;
             if !value.value().starts_with(v8_prefix.as_bytes())
                 && !value.value().starts_with(v9_prefix.as_bytes())
+                && !value.value().starts_with(v10_prefix.as_bytes())
             {
                 continue;
             }
@@ -7716,14 +8011,14 @@ mod tests {
                 vec![
                     ColumnDef::new("embedding", ColumnType::Vector(4), false),
                     ColumnDef::new("a", ColumnType::Text, true),
-                    ColumnDef::new("r", ColumnType::Real, true),
                 ],
             )
         };
         let cases: Vec<Vec<Vec<&str>>> = vec![
             vec![vec!["missing"]],
+            // `VECTOR` は UNIQUE 制約でも引き続き拒否される
+            // （`is_unique_constraint_allowed` は許可型を広げない。Issue #1073）。
             vec![vec!["embedding"]],
-            vec![vec!["r"]],
             vec![vec!["a", "a"]],
             vec![vec!["a"], vec!["a"]],
             vec![vec![]],
@@ -7747,6 +8042,135 @@ mod tests {
         assert!(matches!(
             validate_schema(&too_many),
             Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// UNIQUE 制約の対象型拡張（TABLE-16・TASK-204、Issue #1073）: REAL・
+    /// DOUBLE PRECISION・NUMERIC・JSON・JSONB・配列型のいずれも単一 UNIQUE 制約
+    /// の対象として受理する。`VECTOR` は引き続き拒否される
+    /// （直前の `validate_unique_constraints_rejects_invalid_declarations` 参照）。
+    #[test]
+    fn validate_unique_constraints_accepts_extended_types() {
+        let extended_types = [
+            ColumnType::Real,
+            ColumnType::Double,
+            ColumnType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            ColumnType::Json,
+            ColumnType::Jsonb,
+            ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).expect("valid array type")),
+            ColumnType::Array(ArrayType::new(ArrayElemType::Bool, 8).expect("valid array type")),
+        ];
+        for ty in extended_types {
+            let schema = TableSchema::new("docs", vec![ColumnDef::new("v", ty.clone(), true)])
+                .with_unique_constraints(vec![UniqueConstraint::new(vec!["v".to_string()])]);
+            // `validate_schema` は制約名が確定済み（既定名導出後）であることを
+            // 前提とする（`encode_schema`／`decode_schema_body` は
+            // `validate_schema` を呼ぶ前に必ず `assign_unique_constraint_names`
+            // を経由する。設計 D2・Issue #1067）。直接呼ぶこのテストでも同じ
+            // 前処理を経てから検証する。
+            let schema = assign_unique_constraint_names(schema);
+            assert!(
+                validate_schema(&schema).is_ok(),
+                "expected column type {ty:?} to be accepted in a UNIQUE constraint"
+            );
+        }
+    }
+
+    /// PRIMARY KEY・FOREIGN KEY の対象型は Issue #1073 で拡張しない
+    /// （`is_primary_key_allowed` は据え置き。`docs/design/foreign-key.md` D3 が
+    /// 前提にする「参照元は PK 許可型」を崩さないための固定回帰）。
+    #[test]
+    fn validate_primary_key_still_rejects_extended_unique_only_types() {
+        for ty in [
+            ColumnType::Real,
+            ColumnType::Double,
+            ColumnType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            ColumnType::Json,
+            ColumnType::Jsonb,
+            ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).expect("valid array type")),
+        ] {
+            let schema = TableSchema::new("docs", vec![ColumnDef::new("v", ty.clone(), false)])
+                .with_primary_key(vec!["v".to_string()]);
+            assert!(
+                matches!(validate_schema(&schema), Err(CatalogError::Invalid(_))),
+                "expected column type {ty:?} to still be rejected as a PRIMARY KEY column"
+            );
+        }
+    }
+
+    /// UNIQUE 制約の対象型拡張後も v6 カタログ値との往復が保たれる（新しい型を
+    /// 含む UNIQUE 宣言を持つスキーマの encode/decode 往復。Issue #1073）。
+    #[test]
+    fn encode_decode_roundtrip_preserves_extended_type_unique_constraints_v6() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("j", ColumnType::Json, true),
+                ColumnDef::new(
+                    "arr",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Text, 8).expect("valid array type"),
+                    ),
+                    true,
+                ),
+            ],
+        )
+        .with_unique_constraints(vec![
+            UniqueConstraint::new(vec!["r".to_string()]),
+            UniqueConstraint::new(vec!["n".to_string()]),
+            UniqueConstraint::new(vec!["j".to_string()]),
+            UniqueConstraint::new(vec!["arr".to_string()]),
+        ]);
+        let encoded = encode_schema(&schema).expect("encode should succeed");
+        let decoded = decode_schema("docs", &encoded).expect("decode should succeed");
+        // 名前を明示しない UNIQUE 制約は encode／decode のいずれでも既定名
+        // （`derive_unique_constraint_names`）を導出するため（設計 D2・
+        // Issue #1067）、比較対象の `schema` にも同じ既定名付与を適用してから
+        // 比較する（`UniqueConstraint` の等価性は名前も含むため）。
+        assert_eq!(decoded, assign_unique_constraint_names(schema));
+    }
+
+    /// FK の参照元列許可型は Issue #1073 の UNIQUE 拡張から独立して据え置かれる
+    /// （`docs/design/foreign-key.md` D3 の「参照元は PK 許可型」という前提を
+    /// 維持する固定回帰）。参照先が `UNIQUE(r REAL)` を宣言できても
+    /// （Issue #1073 で UNIQUE の対象へ追加）、REAL 列から `FOREIGN KEY` を
+    /// 宣言することはできない。
+    #[test]
+    fn validate_foreign_keys_still_rejects_real_referencing_column_after_unique_extension() {
+        let parent = TableSchema::new("parents", vec![ColumnDef::new("r", ColumnType::Real, true)])
+            .with_unique_constraints(vec![UniqueConstraint::new(vec!["r".to_string()])]);
+        // 直接 `validate_schema` を呼ぶため、`encode_schema`／
+        // `decode_schema_body` と同じ前提（制約名は検証前に確定済み）を
+        // 自前で満たす（設計 D2・Issue #1067）。
+        let parent = assign_unique_constraint_names(parent);
+        assert!(
+            validate_schema(&parent).is_ok(),
+            "parent schema with UNIQUE(r REAL) must validate (Issue #1073)"
+        );
+
+        let child = TableSchema::new(
+            "children",
+            vec![ColumnDef::new("r", ColumnType::Real, true)],
+        )
+        .with_foreign_keys(vec![fk(&["r"], "parents", &["r"])]);
+        assert!(matches!(
+            validate_schema(&child),
+            Err(CatalogError::InvalidForeignKey(_))
         ));
     }
 
@@ -7833,8 +8257,9 @@ mod tests {
         assert!(no_vector.validate_embedding_dim(384).is_err());
     }
 
-    // Issue #995: 行全体を書き込む経路（INSERT 系）向けの次元検証。`VECTOR` 列
-    // ありスキーマでは `validate_embedding_dim` と完全に同一の判定・文言になり
+    // Issue #995・#1079: 行全体を書き込む経路（INSERT 系、および `RowInput` に
+    // よる行全体置換 UPDATE）向けの次元検証。`VECTOR` 列ありスキーマでは
+    // `validate_embedding_dim` と完全に同一の判定・文言になり
     // （受け入れ基準「`VECTOR` 列を持つスキーマの次元検証・エラー分類は変わらない」）、
     // `VECTOR` 列なしスキーマでは dim 0 のみ受理する。
     #[test]
@@ -9284,6 +9709,106 @@ mod tests {
                     Err(CatalogError::CorruptSchema(_))
                 ),
                 "decode must reject {corrupt:?}"
+            );
+        }
+    }
+
+    /// 既定以外の `MATCH`・遅延属性を 1 件でも持つ FK は v10 で書かれ、往復で
+    /// ビット同一のスキーマへ戻る（TABLE-17・TASK-205、Issue #1077）。全 FK が
+    /// 既定オプションのスキーマは（`with_options` を明示的に既定値で呼んでも）
+    /// v8 のバイト列のまま変わらない（正規形の一意性）。
+    #[test]
+    fn encode_decode_roundtrips_v10_with_foreign_key_options() {
+        let plain = TableSchema::new(
+            "children",
+            vec![
+                ColumnDef::new("parent_id", ColumnType::BigInt, true),
+                ColumnDef::new("code", ColumnType::Text, true),
+            ],
+        );
+
+        // 全 FK が既定オプション（`Simple`／`NotDeferrable`）なら v8 のまま。
+        let all_default =
+            plain
+                .clone()
+                .with_foreign_keys(vec![fk(&["parent_id"], "parents", &["id"]).with_options(
+                    ForeignKeyMatch::Simple,
+                    ForeignKeyDeferrability::NotDeferrable,
+                )]);
+        let encoded = encode_schema(&all_default).expect("encode");
+        assert!(encoded.starts_with(b"v8\n"));
+        assert_eq!(
+            decode_schema("children", &encoded).expect("decode"),
+            all_default
+        );
+
+        // 1 件でも既定以外のオプションを持てば v10。
+        let with_options = plain.with_foreign_keys(vec![
+            fk(&["parent_id"], "parents", &["id"]).with_options(
+                ForeignKeyMatch::Full,
+                ForeignKeyDeferrability::DeferrableInitiallyDeferred,
+            ),
+            fk(&["code"], "countries", &["code"]).with_options(
+                ForeignKeyMatch::Simple,
+                ForeignKeyDeferrability::DeferrableInitiallyImmediate,
+            ),
+        ]);
+        let encoded = encode_schema(&with_options).expect("encode");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert_eq!(
+            text,
+            "v10\ncols:2\npk:\nparent_id:bigint:-:1:L:-\ncode:text:-:1:L:-\nuniq:0\nchecks:0\n\
+             fks:2\nfk:parent_id:parents:id:full:deferred\nfk:code:countries:code:simple:deferrable\n"
+        );
+        assert_eq!(
+            decode_schema("children", &encoded).expect("decode"),
+            with_options
+        );
+    }
+
+    /// v10 の破損入力を fail-closed に拒否する（v8 と同じ共有パーサーを通す。
+    /// TABLE-17・TASK-205、Issue #1077）。全 FK が既定オプションの v10（正規形の
+    /// 一意性違反）・未知の `MATCH`／遅延属性トークン・フィールド数不正はいずれも
+    /// 拒否し、`DROP TYPE` の依存判定（`catalog_value_references_enum_type`）も
+    /// 同じ値を「依存なし」に丸めない。
+    #[test]
+    fn decode_v10_rejects_corrupt_or_all_default_foreign_key_section() {
+        let head = "v10\ncols:2\npk:\nmood_col:enum:mood:1:L:-\npid:bigint:-:1:L:-\n\
+                    uniq:0\nchecks:0\n";
+        let valid = format!("{head}fks:1\nfk:pid:parents:id:full:immediate\n");
+        assert!(catalog_value_references_enum_type(valid.as_bytes(), "mood").expect("valid v10"));
+        let resolve = &mut |name: &str| -> Result<Arc<EnumTypeDef>> {
+            Ok(Arc::new(EnumTypeDef {
+                name: name.to_string(),
+                labels: vec!["x".to_string()],
+            }))
+        };
+        assert!(decode_schema_with_resolver("docs", valid.as_bytes(), resolve).is_ok());
+        let corrupt_values = [
+            // 全 FK が既定オプション（正規形は v8 のはず）。
+            format!("{head}fks:1\nfk:pid:parents:id:simple:immediate\n"),
+            // 未知の MATCH／遅延属性トークン。
+            format!("{head}fks:1\nfk:pid:parents:id:partial:immediate\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:full:later\n"),
+            // フィールド数不正（v10 は 5 フィールド固定）。
+            format!("{head}fks:1\nfk:pid:parents:id\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:full\n"),
+            format!("{head}fks:1\nfk:pid:parents:id:full:immediate:extra\n"),
+        ];
+        for corrupt in &corrupt_values {
+            assert!(
+                matches!(
+                    decode_schema_with_resolver("docs", corrupt.as_bytes(), resolve),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "decode must reject {corrupt:?}"
+            );
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type(corrupt.as_bytes(), "mood"),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "enum dependency parser must reject {corrupt:?}"
             );
         }
     }

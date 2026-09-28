@@ -356,6 +356,30 @@ fn run_statement<'e, S: WireStream>(
     }
 }
 
+/// 緊急応答（RECOVER-6）の登録本体。平文・TLS 双方の接続で共有する
+/// （[`execute_with_emergency_registration`]・`crate::copy::finish_copy_from`
+/// の双方から呼ぶ。Issue #1080 で TLS 接続向けに一本化した）。
+///
+/// `WireStream::emergency_response_channel` が返す組（送出形式済み
+/// バイト列＋書き込み先の生ソケット複製）をそのまま
+/// `engine::recovery::panic_hook::EmergencyResponseRegistration::register`
+/// へ渡す。TLS 接続では `emergency_response_channel`（[`crate::tls::stream::
+/// TlsStream`] の上書き実装）が緊急応答を TLS レコードとして暗号化済みの
+/// バイト列を返すため、この関数自身は送出形式を意識しない。
+pub(crate) fn register_emergency_response<S: WireStream + ?Sized>(
+    stream: &S,
+) -> Option<engine::recovery::panic_hook::EmergencyResponseRegistration> {
+    let response_bytes = cached_emergency_response_bytes()?;
+    let (bytes, clone) = stream.emergency_response_channel(response_bytes)?;
+    Some(
+        engine::recovery::panic_hook::EmergencyResponseRegistration::register(
+            bytes,
+            clone,
+            crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
+        ),
+    )
+}
+
 /// TASK-97（対象ビヘイビア: RECOVER-6・ERR-1、codex-review Medium 指摘対応・
 /// PR #90）の「登録ブロック」を関数として切り出したもの（Issue #934・#933 の
 /// Execute（拡張クエリプロトコル）が [`engine::core::EngineCore::
@@ -373,16 +397,7 @@ pub(crate) fn execute_with_emergency_registration<S: WireStream>(
     stream: &mut S,
     f: impl FnOnce() -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>,
 ) -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError> {
-    let _emergency_registration = cached_emergency_response_bytes().and_then(|response_bytes| {
-        let clone = stream.emergency_channel()?;
-        Some(
-            engine::recovery::panic_hook::EmergencyResponseRegistration::register(
-                response_bytes.clone(),
-                clone,
-                crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
-            ),
-        )
-    });
+    let _emergency_registration = register_emergency_response(stream);
     let outcome = f();
     // Issue #705（テスト専用・feature `fault-injection` 限定）: 直前行の
     // `outcome` を「登録ブロック」の終端（`_emergency_registration` が

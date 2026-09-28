@@ -102,14 +102,17 @@ fn resolve_tool(env_var: &str, default_name: &str) -> String {
 /// なる）ため、`wait_for_exit` で明示的に終了を待ち受けられるようにする。
 ///
 /// stderr は listen 行の取得後も子プロセスの終了まで読み続ける（Issue #943）。
-/// 以前は listen 行の取得後に受信側チャネルが破棄されると読み取りスレッドが
-/// 終了してパイプの読み口を閉じていたため、サーバーが接続エラー等を 2 行以上
-/// stderr へ書くと `EPIPE` で `eprintln!` が panic し、panic フック
-/// （TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT 終了していた
-/// （高負荷下で後続クライアントが "server closed the connection unexpectedly"
-/// となる偽陽性の原因）。listen 後の行は `stderr_tail` に直近
-/// [`STDERR_TAIL_MAX_LINES`] 行まで保持し、テストが panic した場合に限り
-/// `Drop` で終了状態とあわせて出力する（失敗時の診断用）。
+/// #1081 以前の挙動: 以前は listen 行の取得後に受信側チャネルが破棄されると
+/// 読み取りスレッドが終了してパイプの読み口を閉じていたため、サーバーが
+/// 接続エラー等を 2 行以上 stderr へ書くと `EPIPE` で `eprintln!` が panic し、
+/// panic フック（TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT
+/// 終了していた（高負荷下で後続クライアントが "server closed the connection
+/// unexpectedly" となる偽陽性の原因）。Issue #1081 でサーバー側の診断ログを
+/// `engine::log_stderr!`（書き込み失敗を無視する。RECOVER-8 の例外。ポインタ:
+/// `docs/design/stderr-log-write-failure.md`）へ置き換えたため、読み手が閉じても
+/// サーバー側では abort しなくなったが、本ハーネスは失敗時診断のため引き続き
+/// listen 後の行を [`STDERR_TAIL_MAX_LINES`] 行まで保持し、テストが panic した
+/// 場合に限り `Drop` で終了状態とあわせて出力する。
 struct ServerGuard {
     child: Child,
     port: u16,
@@ -278,10 +281,12 @@ fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
     guard.push_back(line.trim_end().to_string());
 }
 
-/// 回帰テスト（Issue #943）: [`spawn_wire_server`] が listen 行の取得後も
-/// 子プロセスの stderr を読み続けるため、サーバーが接続エラーを複数行ログへ
-/// 書いても `EPIPE` 起因の panic → fail-fast abort（TASK-99・RECOVER-8）で
-/// 落ちないことを固定する。未読データを残したまま接続を閉じて RST を送り、
+/// 回帰テスト（Issue #943。#1081 以前は `EPIPE` 起因の panic → fail-fast
+/// abort〔TASK-99・RECOVER-8〕がここで落ちる原因だった。Issue #1081 以降は
+/// サーバー側の診断ログが `engine::log_stderr!` で書き込み失敗を無視するため
+/// 読み手が閉じても abort しない）: [`spawn_wire_server`] が listen 行の
+/// 取得後も子プロセスの stderr を読み続け、サーバーが接続エラーを複数行ログへ
+/// 書いても落ちないことを固定する。未読データを残したまま接続を閉じて RST を送り、
 /// サーバー側に `connection error: Connection reset by peer` を複数回ログ
 /// させたうえで（`stderr_tail` に行が届いたことを確認し非 vacuous 化する）、
 /// サーバーが生存し新規接続へ認証要求を返すことを確認する。外部クライアントを

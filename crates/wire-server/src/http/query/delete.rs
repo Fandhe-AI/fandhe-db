@@ -1,19 +1,26 @@
 //! `POST /v1/query` の `delete` op を SQL 表層の
-//! `DELETE FROM ... WHERE id = <n> USING OPERATION_ID`（SQL-18）と**同一の
-//! 実行器**（`engine::sql::exec::execute_delete`）へ、SQL テキストを組み立てず
-//! に束縛済み計画で到達させるモジュール（Issue #876・TASK-186・対象
-//! ビヘイビア NOSQL-6・NOSQL-12。ポインタ: `docs/spec/05-tasks.md` TASK-178・
-//! TASK-186・`docs/spec/04-behavior/nosql-surface.md` NOSQL-6・NOSQL-12・
-//! `docs/spec/04-behavior/sql-surface.md` SQL-18）。
+//! `DELETE FROM ... WHERE id = <n> USING OPERATION_ID`（SQL-18）・述語形
+//! `DELETE FROM ... WHERE <述語> USING OPERATION_ID`（SQL-19・TASK-192）と
+//! **同一の実行器**（`engine::sql::exec::execute_delete`・
+//! `execute_predicate_delete`）へ、SQL テキストを組み立てずに束縛済み計画で
+//! 到達させるモジュール（Issue #876・#1062・TASK-186・対象ビヘイビア
+//! NOSQL-6・NOSQL-12。ポインタ: `docs/spec/05-tasks.md` TASK-178・TASK-186・
+//! TASK-192・`docs/spec/04-behavior/nosql-surface.md` NOSQL-6・NOSQL-12・
+//! `docs/spec/04-behavior/sql-surface.md` SQL-18・SQL-19）。
 //!
 //! 責務境界: [`super::schema::DELETE_SCHEMA`] が形を検証済みの JSON
 //! オブジェクトから `table`／`where`（または `filter`）／`operation_id` を
 //! 取り出し、[`super::dml_target::bind_target_form`]（`where`／`filter` の
 //! 排他判定。[`super::update`] と共有）で対象行を確定したうえで、
-//! [`execute`] が `engine::core::EngineCore::execute_bound_delete_in_session`
-//! （[`super::insert`]・[`super::update`] と同型のセッション対応エントリ）へ
-//! 委譲する。`DELETE` は `id` 疑似列以外の列を参照しないため、`update` の
-//! ような列型分岐は不要——`engine::sql::parser::BoundDelete` を直接構築する。
+//! [`execute`] が単一行形は
+//! `engine::core::EngineCore::execute_bound_delete_in_session`
+//! （[`super::insert`]・[`super::update`] と同型のセッション対応エントリ）、
+//! 述語形は `execute_bound_predicate_delete_in_session`（Issue #1062）へ
+//! 委譲する。単一行形は `id` 疑似列以外の列を参照しないため
+//! `engine::sql::parser::BoundDelete` を直接構築するが、述語形は
+//! [`super::filter::bind_filter_where_predicates`]（`WHERE` 述語列を SQL 表層
+//! と同一の `WherePredicate` へ写像する。`content_hash` 一致のため必須）を
+//! 経由する。いずれも第 2 の実行器は作らない。
 //!
 //! テナントは `principal`（唯一の入口）からのみ導出する（`security.md` P0）。
 //!
@@ -30,8 +37,9 @@
 //! はいずれも `deleted:0`・`200`（RLS-9。`execute_delete` のドキュメント
 //! 参照）。
 //!
-//! 対象外: `filter`（述語形）の実行結線（Issue #871 の担当）・
-//! `RETURNING`（Issue #873）。
+//! 対象外: `RETURNING`（Issue #873。NoSQL は公開しない）・`filter` の
+//! `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`
+//! （Issue #945。`filter.rs` と同じ `0A000`）。
 
 use std::fmt::Write as _;
 
@@ -47,6 +55,7 @@ use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
 use super::dml_target::{bind_target_form, DmlTargetError, TargetForm};
+use super::filter;
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
 
@@ -140,7 +149,7 @@ pub fn execute(
         .map_err(DeleteError::Shape)?;
     ident::check_identifier(table)?;
 
-    let TargetForm::RowId(id) = bind_target_form(validated)?;
+    let target = bind_target_form(validated)?;
 
     let operation_id_raw = validated
         .optional_str("operation_id")
@@ -148,13 +157,31 @@ pub fn execute(
         .unwrap_or("");
     let operation_id = OperationId::parse(operation_id_raw)?;
 
-    let bound = BoundDelete {
-        table: table.to_string(),
-        id,
-        operation_id: Some(operation_id.clone()),
+    let outcome: DeleteOutcome = match target {
+        TargetForm::RowId(id) => {
+            let bound = BoundDelete {
+                table: table.to_string(),
+                id,
+                operation_id: Some(operation_id.clone()),
+            };
+            core.execute_bound_delete_in_session(principal.policy_context(), &bound)?
+        }
+        // 述語形（`filter`。TASK-186・NOSQL-12、Issue #1062）: `WHERE` 述語列は
+        // `filter::bind_filter_where_predicates`（SQL 表層の述語形 `DELETE` が
+        // 使うのと同一の `WherePredicate` を生成する）で得る。実行本体
+        // （台帳照合・影響行数上限・RLS 適用）は `EngineCore::
+        // execute_bound_predicate_delete_in_session` に一任し、第 2 の実行器は
+        // 作らない。
+        TargetForm::Predicate(items) => core.execute_bound_predicate_delete_in_session(
+            principal.policy_context(),
+            table,
+            Some(&operation_id),
+            |schema| {
+                filter::bind_filter_where_predicates(items, schema)
+                    .map_err(filter::FilterError::into_sql_surface_error)
+            },
+        )?,
     };
-    let outcome: DeleteOutcome =
-        core.execute_bound_delete_in_session(principal.policy_context(), &bound)?;
 
     Ok(DeleteSuccess {
         deleted: outcome.rows_affected,

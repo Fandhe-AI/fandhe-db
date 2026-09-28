@@ -246,7 +246,7 @@ else
 endif
 
 .PHONY: e2e-three-client-http
-e2e-three-client-http: ## TASK-183（HTTP-13）NoSQL 表層（--surface nosql）の無改造 HTTP クライアント（curl／urllib／fetch）統合テスト（opt-in・`ci` には含めない。要 curl・python3・node（≥18）・psql（Issue #779 の SQL 経路パリティ・Issue #877 の UPDATE/DELETE DML パリティに使用。PSQL_BIN で上書き可）。CURL_BIN／PYTHON_BIN／NODE_BIN で上書き可。各テストが `[e2e-record]` 行を stderr へ出力（秘密情報非含有）。記録様式は docs/design/three-client-e2e-harness.md 参照）
+e2e-three-client-http: ## TASK-183（HTTP-13）NoSQL 表層（--surface nosql）の無改造 HTTP クライアント（curl／urllib／fetch）統合テスト（opt-in・`ci` には含めない。要 curl・python3・node（≥18）・psql（Issue #779 の SQL 経路パリティ・Issue #877 の UPDATE/DELETE DML パリティ・Issue #950 の Phase 7 パリティ総合検証〔範囲比較・IN・OR・sort・offset・複数列 group_by・insert・DDL 3 op〕に使用。PSQL_BIN で上書き可）。CURL_BIN／PYTHON_BIN／NODE_BIN で上書き可。各テストが `[e2e-record]` 行を stderr へ出力（秘密情報非含有）。記録様式は docs/design/three-client-e2e-harness.md 参照。Op::ALL 網羅ガード（parity_matrix_covers_every_nosql_op）は非 ignore で `make ci` から常時実行）
 ifdef HAS_CARGO
 	cargo test -p fandhe-vector-db-wire-server --test three_client_http_e2e -- --ignored --nocapture --test-threads=1
 else

@@ -108,6 +108,32 @@
 //! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
 //! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
+//! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
+//! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
+//! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
+//! を、プロセス全体に対して起動時に設定する opt-in 注入点（`--search-engine`／
+//! `--durability` と同型。セッション・テナント単位の設定は対象外）。**汎用
+//! RDB（PostgreSQL 等）の挙動に合わせ、未指定時は既定で上限なし**
+//! （`engine::sql::parser::DmlLimits::default`＝両フィールドとも `None`。
+//! BREAKING CHANGE: 旧実装既定値〔1,000〕を超える行数でも、本フラグを
+//! 指定しない限り成功する）。指定可能範囲は `1`〜`1,000,000`
+//! （`engine::sql::parser::MAX_DML_ROW_LIMIT`＝総走査行数上限と同値）。
+//! 範囲外・非数値・値欠落・2 回目以降の重複指定はいずれも fail-closed で
+//! 起動エラー。値の解決は `wire_server::dml_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_dml_limits` へ 1 回だけ注入する（`docs/design/
+//! predicate-dml-exec.md` §6 参照）。上限を指定しない場合でも、既存の
+//! SQL 文長上限・1 文あたり総走査行数上限（`MAX_SCANNED_ROWS`）は変更しない
+//! ため資源上限は引き続き機能する。複数行 `VALUES` は本上限に加えて独立した
+//! 別上限 `batch_limits.max_files_per_batch`（既定 64。Issue #860）も通るため、
+//! `--max-insert-rows` を明示指定した値・または未指定時の既定（上限なし）が
+//! 64 超であっても、環境変数 `VECTOR_DB_BATCH_MAX_FILES` を併せて引き上げない
+//! 限り複数行 `VALUES` は 64 行超で `54000` のまま（wire-server は
+//! `--max-insert-rows`／`--max-dml-affected-rows` 以外に `batch_limits` を
+//! 設定する CLI フラグを持たない。専用フラグの追加は Issue #997 のオーナー
+//! 承認範囲外）。`--max-insert-rows` を明示指定してこの上限を超える場合のみ
+//! 起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
+//! `wire_server::dml_limits_opt::insert_rows_cap_warning`）。
+//!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
 //! チェーン PEM）・`--tls-key`（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って
@@ -179,6 +205,12 @@
 //! [`wire_server::limits`] の契約値を [`wire_server::server::accept_loop_with_limiter`]／
 //! [`wire_server::server::accept_loop_with_tls_mode`] が適用する（TASK-69）。
 
+// RECOVER-8（fail_fast）の例外は engine 側 `recovery::stderr_log::write_line`／
+// `engine::log_stderr!` に一本化する（Issue #1081）。CLI 診断出力・起動ログを
+// 含め、通常ビルドでは `eprintln!` の再混入を lint で防ぐ（テストコードは
+// 対象外。`docs/design/stderr-log-write-failure.md` 参照）。
+#![cfg_attr(not(test), deny(clippy::print_stderr))]
+
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -234,6 +266,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut acorn_max_visible_ratio_raw: Option<String> = None;
     let mut sparse_visited_max_raw: Option<String> = None;
     let mut durability_raw: Option<String> = None;
+    let mut max_dml_affected_rows_raw: Option<String> = None;
+    let mut max_insert_rows_raw: Option<String> = None;
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
@@ -252,7 +286,7 @@ fn run_server(args: &[String]) -> ExitCode {
         match args[i].as_str() {
             "--users" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("wire-server: --users requires a path argument");
+                    engine::log_stderr!("wire-server: --users requires a path argument");
                     return ExitCode::FAILURE;
                 };
                 users_path = Some(PathBuf::from(v));
@@ -260,7 +294,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             "--db" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("wire-server: --db requires a path argument");
+                    engine::log_stderr!("wire-server: --db requires a path argument");
                     return ExitCode::FAILURE;
                 };
                 db_path = Some(PathBuf::from(v));
@@ -268,7 +302,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             "--bind" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("wire-server: --bind requires an address argument");
+                    engine::log_stderr!("wire-server: --bind requires an address argument");
                     return ExitCode::FAILURE;
                 };
                 bind_addr = v.clone();
@@ -276,7 +310,9 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             "--planner-endpoint" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("wire-server: --planner-endpoint requires a host:port argument");
+                    engine::log_stderr!(
+                        "wire-server: --planner-endpoint requires a host:port argument"
+                    );
                     return ExitCode::FAILURE;
                 };
                 planner_endpoint = Some(v.clone());
@@ -284,7 +320,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             "--planner-model" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("wire-server: --planner-model requires a name argument");
+                    engine::log_stderr!("wire-server: --planner-model requires a name argument");
                     return ExitCode::FAILURE;
                 };
                 planner_model = Some(v.clone());
@@ -292,7 +328,9 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             "--embedder-hashing-dim" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("wire-server: --embedder-hashing-dim requires a numeric argument");
+                    engine::log_stderr!(
+                        "wire-server: --embedder-hashing-dim requires a numeric argument"
+                    );
                     return ExitCode::FAILURE;
                 };
                 embedder_hashing_dim = Some(v.clone());
@@ -300,7 +338,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::surface::FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires one of {:?}",
                         wire_server::surface::FLAG,
                         wire_server::surface::TOKENS
@@ -311,7 +349,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // `--search-engine`（D6）と同じ理由で 2 回目以降の指定を
                 // fail-closed に拒否する（last-wins にしない）。
                 if surface_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::surface::FLAG
                     );
@@ -322,7 +360,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             "--search-engine" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: --search-engine requires one of {:?}",
                         wire_server::search_engine_opt::TOKENS
                     );
@@ -333,7 +371,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // 事故を防ぐ目的で 2 回目以降の指定を fail-closed に拒否する
                 // （他フラグの last-wins とは意図的に方針を変える）。
                 if search_engine_raw.is_some() {
-                    eprintln!("wire-server: --search-engine specified more than once");
+                    engine::log_stderr!("wire-server: --search-engine specified more than once");
                     return ExitCode::FAILURE;
                 }
                 search_engine_raw = Some(v.clone());
@@ -341,7 +379,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a <num>/<den> argument",
                         wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG
                     );
@@ -351,7 +389,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // と同じ理由で、起動後に変更できない構成値の 2 回目以降の
                 // 指定を fail-closed に拒否する（last-wins にしない）。
                 if full_scan_ratio_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::search_engine_opt::FULL_SCAN_RATIO_FLAG
                     );
@@ -362,14 +400,14 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a <num>/<den> argument",
                         wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG
                     );
                     return ExitCode::FAILURE;
                 };
                 if acorn_max_visible_ratio_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::search_engine_opt::ACORN_MAX_VISIBLE_RATIO_FLAG
                     );
@@ -380,14 +418,14 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a non-negative integer argument",
                         wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG
                     );
                     return ExitCode::FAILURE;
                 };
                 if sparse_visited_max_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::search_engine_opt::SPARSE_VISITED_MAX_FLAG
                     );
@@ -398,7 +436,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::durability_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires one of {:?}",
                         wire_server::durability_opt::FLAG,
                         wire_server::durability_opt::TOKENS
@@ -409,7 +447,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // `--search-engine`（D6）と同じ理由で 2 回目以降の指定を
                 // fail-closed に拒否する（last-wins にしない）。
                 if durability_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::durability_opt::FLAG
                     );
@@ -418,9 +456,50 @@ fn run_server(args: &[String]) -> ExitCode {
                 durability_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #997: 起動後に変更できない構成値のため、他の閉じた
+                // 語彙フラグ（`--search-engine` 等）と同じ理由で 2 回目以降の
+                // 指定を fail-closed に拒否する（last-wins にしない）。
+                if max_dml_affected_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::MAX_AFFECTED_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_dml_affected_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::MAX_INSERT_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::MAX_INSERT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #997: `--max-dml-affected-rows` と同じ理由で 2 回目
+                // 以降の指定を fail-closed に拒否する（last-wins にしない）。
+                if max_insert_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::MAX_INSERT_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_insert_rows_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::ddl_permission_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a comma-separated list of usernames",
                         wire_server::ddl_permission_opt::FLAG
                     );
@@ -430,7 +509,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // 語彙フラグ（`--search-engine` 等）と同じ理由で 2 回目以降の
                 // 指定を fail-closed に拒否する（last-wins にしない）。
                 if ddl_allowed_users_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::ddl_permission_opt::FLAG
                     );
@@ -441,7 +520,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::auth_method_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires one of {:?}",
                         wire_server::auth_method_opt::FLAG,
                         wire_server::auth_method_opt::TOKENS
@@ -452,7 +531,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // 語彙フラグ（`--search-engine` 等）と同じ理由で 2 回目以降の
                 // 指定を fail-closed に拒否する（last-wins にしない）。
                 if auth_method_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::auth_method_opt::FLAG
                     );
@@ -463,7 +542,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a path argument",
                         wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                     );
@@ -473,7 +552,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // 閉じた語彙フラグと同じ理由で 2 回目以降の指定を fail-closed
                 // に拒否する（last-wins にしない）。
                 if scram_mock_key_file_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                     );
@@ -484,7 +563,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::tls_opt::CERT_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a path argument",
                         wire_server::tls_opt::CERT_FLAG
                     );
@@ -495,7 +574,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // 同じ理由で 2 回目以降の指定を fail-closed に拒否する
                 // （last-wins にしない）。
                 if tls_cert_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::tls_opt::CERT_FLAG
                     );
@@ -506,14 +585,14 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::tls_opt::KEY_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires a path argument",
                         wire_server::tls_opt::KEY_FLAG
                     );
                     return ExitCode::FAILURE;
                 };
                 if tls_key_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::tls_opt::KEY_FLAG
                     );
@@ -524,7 +603,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::tls_opt::MODE_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires one of {:?}",
                         wire_server::tls_opt::MODE_FLAG,
                         wire_server::tls_opt::MODE_TOKENS
@@ -532,7 +611,7 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 if tls_mode_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::tls_opt::MODE_FLAG
                     );
@@ -543,7 +622,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
             wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires one of {:?}",
                         wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG,
                         wire_server::tls_opt::SCRAM_CHANNEL_BINDING_TOKENS
@@ -551,7 +630,7 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 if tls_scram_channel_binding_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG
                     );
@@ -566,7 +645,7 @@ fn run_server(args: &[String]) -> ExitCode {
             #[cfg(feature = "fault-injection")]
             wire_server::fault_injection::FLAG => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} requires one of [{:?}]",
                         wire_server::fault_injection::FLAG,
                         wire_server::fault_injection::POST_COMMIT_PANIC_TOKEN
@@ -576,7 +655,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 // 他の起動後変更不能な構成値（`--search-engine` 等）と同じ理由で
                 // last-wins にせず 2 回目以降の指定を fail-closed に拒否する。
                 if fault_inject_raw.is_some() {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: {} specified more than once",
                         wire_server::fault_injection::FLAG
                     );
@@ -586,7 +665,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 i += 2;
             }
             other => {
-                eprintln!("wire-server: unknown argument: {other}");
+                engine::log_stderr!("wire-server: unknown argument: {other}");
                 return ExitCode::FAILURE;
             }
         }
@@ -599,17 +678,21 @@ fn run_server(args: &[String]) -> ExitCode {
     let query_planner = match (planner_endpoint.as_deref(), planner_model.as_deref()) {
         (None, None) => None,
         (Some(_), None) => {
-            eprintln!("wire-server: --planner-endpoint requires --planner-model to also be set");
+            engine::log_stderr!(
+                "wire-server: --planner-endpoint requires --planner-model to also be set"
+            );
             return ExitCode::FAILURE;
         }
         (None, Some(_)) => {
-            eprintln!("wire-server: --planner-model requires --planner-endpoint to also be set");
+            engine::log_stderr!(
+                "wire-server: --planner-model requires --planner-endpoint to also be set"
+            );
             return ExitCode::FAILURE;
         }
         (Some(endpoint), Some(model)) => match build_query_planner(endpoint, model) {
             Ok(client) => Some(client),
             Err(e) => {
-                eprintln!("wire-server: invalid --planner-endpoint/--planner-model: {e}");
+                engine::log_stderr!("wire-server: invalid --planner-endpoint/--planner-model: {e}");
                 return ExitCode::FAILURE;
             }
         },
@@ -620,7 +703,7 @@ fn run_server(args: &[String]) -> ExitCode {
         Some(raw_dim) => match build_hashing_embedder(raw_dim) {
             Ok(embedder) => Some(embedder),
             Err(e) => {
-                eprintln!("wire-server: invalid --embedder-hashing-dim: {e}");
+                engine::log_stderr!("wire-server: invalid --embedder-hashing-dim: {e}");
                 return ExitCode::FAILURE;
             }
         },
@@ -640,7 +723,7 @@ fn run_server(args: &[String]) -> ExitCode {
         match resolve_search_engine(search_engine_raw.as_deref(), &hnsw_tuning_raw) {
             Ok(kind) => kind,
             Err(e) => {
-                eprintln!("wire-server: invalid search engine configuration: {e}");
+                engine::log_stderr!("wire-server: invalid search engine configuration: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -654,10 +737,26 @@ fn run_server(args: &[String]) -> ExitCode {
     let durability = match resolve_durability(durability_raw.as_deref()) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: invalid {}: {e}",
                 wire_server::durability_opt::FLAG
             );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #997: `--search-engine`／`--durability` と同じく bind・ユーザー
+    // ストア読込より前に決着させる（fail-closed。受理不能な構成のまま
+    // listen へ進む経路を作らない）。未指定は `dml_limits_opt::resolve` が
+    // 既定値（`engine::sql::parser::DmlLimits::default`＝現行挙動の 1,000）を
+    // 返す。
+    let dml_limits = match wire_server::dml_limits_opt::resolve(
+        max_dml_affected_rows_raw.as_deref(),
+        max_insert_rows_raw.as_deref(),
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid DML row limit configuration: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -672,7 +771,7 @@ fn run_server(args: &[String]) -> ExitCode {
         Some(raw) => match wire_server::fault_injection::parse(raw) {
             Ok(kind) => Some(kind),
             Err(e) => {
-                eprintln!(
+                engine::log_stderr!(
                     "wire-server: invalid {}: {e}",
                     wire_server::fault_injection::FLAG
                 );
@@ -687,7 +786,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let surface = match resolve_surface(surface_raw.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wire-server: invalid {}: {e}", wire_server::surface::FLAG);
+            engine::log_stderr!("wire-server: invalid {}: {e}", wire_server::surface::FLAG);
             return ExitCode::FAILURE;
         }
     };
@@ -700,7 +799,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let auth_method = match resolve_auth_method(auth_method_raw.as_deref()) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: invalid {}: {e}",
                 wire_server::auth_method_opt::FLAG
             );
@@ -715,7 +814,7 @@ fn run_server(args: &[String]) -> ExitCode {
     if auth_method == wire_server::auth::AuthMethod::ScramSha256
         && surface == wire_server::surface::Surface::Nosql
     {
-        eprintln!(
+        engine::log_stderr!(
             "wire-server: {} scram-sha-256 cannot be combined with {} nosql (NoSQL surface has no SASL flow; see HTTP-10)",
             wire_server::auth_method_opt::FLAG,
             wire_server::surface::FLAG
@@ -731,7 +830,7 @@ fn run_server(args: &[String]) -> ExitCode {
         scram_mock_key_file_raw.is_some(),
     ) {
         (true, false) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: {} <path> is required when {} scram-sha-256 is selected \
                  (fail-closed: a user-store-independent secret prevents the mock salt for \
                  unknown users from acting as a user-existence oracle across store updates)",
@@ -741,7 +840,7 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         (false, true) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: {} requires {} scram-sha-256",
                 wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
                 wire_server::auth_method_opt::FLAG
@@ -764,7 +863,7 @@ fn run_server(args: &[String]) -> ExitCode {
     ) {
         Ok(opt) => opt,
         Err(e) => {
-            eprintln!("wire-server: {e}");
+            engine::log_stderr!("wire-server: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -778,11 +877,13 @@ fn run_server(args: &[String]) -> ExitCode {
     // 拒否は変更しない。
 
     let Some(users_path) = users_path else {
-        eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
+        engine::log_stderr!(
+            "wire-server: --users <path> is required (fail-closed: no anonymous login)"
+        );
         return ExitCode::FAILURE;
     };
     let Some(db_path) = db_path else {
-        eprintln!(
+        engine::log_stderr!(
             "wire-server: --db <path> is required (fail-closed: no implicit anonymous/volatile database)"
         );
         return ExitCode::FAILURE;
@@ -825,14 +926,14 @@ fn run_server(args: &[String]) -> ExitCode {
                             &cfg,
                             *scram_channel_binding,
                         ) {
-                            eprintln!("wire-server: {e}");
+                            engine::log_stderr!("wire-server: {e}");
                             return ExitCode::FAILURE;
                         }
                     }
                     Some(cfg)
                 }
                 Err(e) => {
-                    eprintln!("wire-server: failed to load TLS configuration: {e}");
+                    engine::log_stderr!("wire-server: failed to load TLS configuration: {e}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -853,20 +954,20 @@ fn run_server(args: &[String]) -> ExitCode {
         // せず構造的に到達しないが、fail-closed に起動拒否へ倒す
         // （黙って `Cleartext` 等へ読み替えない）。
         Some(_) => {
-            eprintln!("wire-server: unsupported TLS mode");
+            engine::log_stderr!("wire-server: unsupported TLS mode");
             return ExitCode::FAILURE;
         }
     };
     let guarded = match GuardedBindAddrs::resolve(&bind_addr, transport_security) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("wire-server: {e}");
+            engine::log_stderr!("wire-server: {e}");
             // D1: `--tls-mode allow` を選んだ場合のみ、`require` へ切り替える
             // ことで非ループバック bind が受理されうる旨を補足する（`allow`
             // は平文接続を受理する以上、通信路保護の観点で `require` へ
             // 切り替えない限り非ループバックへは出せないため）。
             if transport_security == TransportSecurity::TlsOptional {
-                eprintln!(
+                engine::log_stderr!(
                     "wire-server: hint: {} allow accepts plaintext connections; use {} require \
                      for non-loopback binds (WIRE-9)",
                     wire_server::tls_opt::MODE_FLAG,
@@ -880,7 +981,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let store = match UserStore::load_from_file(&users_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wire-server: failed to load user store: {e}");
+            engine::log_stderr!("wire-server: failed to load user store: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -895,7 +996,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 場合はエントロピー不足として fail-closed に拒否する。
     let store = if auth_method == wire_server::auth::AuthMethod::ScramSha256 {
         let Some(mock_key_path) = scram_mock_key_file_raw.as_deref() else {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: {} <path> is required when {} scram-sha-256 is selected",
                 wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
                 wire_server::auth_method_opt::FLAG
@@ -910,7 +1011,7 @@ fn run_server(args: &[String]) -> ExitCode {
         // 読み込み自体も固定上限で打ち切る二重の防御とする。
         let mock_key_secret = match std::fs::metadata(mock_key_path) {
             Ok(meta) if !meta.is_file() => {
-                eprintln!(
+                engine::log_stderr!(
                     "wire-server: {} {mock_key_path:?} is not a regular file",
                     wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                 );
@@ -925,7 +1026,7 @@ fn run_server(args: &[String]) -> ExitCode {
                         .read_to_end(&mut buf)
                     {
                         Ok(_) if buf.len() > max_len => {
-                            eprintln!(
+                            engine::log_stderr!(
                                 "wire-server: {} {mock_key_path:?} exceeds the maximum allowed size ({max_len} bytes)",
                                 wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                             );
@@ -933,7 +1034,7 @@ fn run_server(args: &[String]) -> ExitCode {
                         }
                         Ok(_) => buf,
                         Err(e) => {
-                            eprintln!(
+                            engine::log_stderr!(
                                 "wire-server: failed to read {} {mock_key_path:?}: {e}",
                                 wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                             );
@@ -942,7 +1043,7 @@ fn run_server(args: &[String]) -> ExitCode {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: failed to read {} {mock_key_path:?}: {e}",
                         wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                     );
@@ -950,7 +1051,7 @@ fn run_server(args: &[String]) -> ExitCode {
                 }
             },
             Err(e) => {
-                eprintln!(
+                engine::log_stderr!(
                     "wire-server: failed to read {} {mock_key_path:?}: {e}",
                     wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG
                 );
@@ -958,7 +1059,7 @@ fn run_server(args: &[String]) -> ExitCode {
             }
         };
         if mock_key_secret.len() < wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_MIN_LEN {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: {} must contain at least {} bytes of secret material (got {})",
                 wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_FLAG,
                 wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_MIN_LEN,
@@ -969,7 +1070,7 @@ fn run_server(args: &[String]) -> ExitCode {
         match store.require_scram(&mock_key_secret) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("wire-server: {e}");
+                engine::log_stderr!("wire-server: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -987,7 +1088,7 @@ fn run_server(args: &[String]) -> ExitCode {
             let usernames = match wire_server::ddl_permission_opt::parse(raw) {
                 Ok(u) => u,
                 Err(e) => {
-                    eprintln!(
+                    engine::log_stderr!(
                         "wire-server: invalid {}: {e}",
                         wire_server::ddl_permission_opt::FLAG
                     );
@@ -997,7 +1098,7 @@ fn run_server(args: &[String]) -> ExitCode {
             match store.with_ddl_allowed_users(&usernames) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("wire-server: {e}");
+                    engine::log_stderr!("wire-server: {e}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -1017,7 +1118,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut core = match open_engine_core(&db_path, durability, search_engine_kind) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("wire-server: {e}");
+            engine::log_stderr!("wire-server: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1032,6 +1133,11 @@ fn run_server(args: &[String]) -> ExitCode {
     if let Some(query_planner) = query_planner {
         core = core.with_query_planner(query_planner);
     }
+    // Issue #997: 未指定でも常に呼ぶ（`dml_limits` は `dml_limits_opt::resolve`
+    // が既定値まで含めて解決済みのため、`embedder`／`query_planner` のような
+    // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
+    // 既存挙動とビット同一）。
+    core = core.with_dml_limits(dml_limits);
     let core = Arc::new(core);
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
@@ -1040,7 +1146,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let listener = match guarded.bind() {
         Ok(l) => l,
         Err(e) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: failed to bind {bind_addr} ({:?}): {e}",
                 guarded.addrs()
             );
@@ -1054,7 +1160,7 @@ fn run_server(args: &[String]) -> ExitCode {
     #[cfg(feature = "fault-injection")]
     if let Some(kind) = fault_kind {
         wire_server::fault_injection::arm(kind);
-        eprintln!("wire-server: fault injection armed: post-commit-panic (test only)");
+        engine::log_stderr!("wire-server: fault injection armed: post-commit-panic (test only)");
     }
 
     // Issue #850: 非既定 durability（`WriteDurability::None`）を選んだ場合に
@@ -1063,10 +1169,25 @@ fn run_server(args: &[String]) -> ExitCode {
     // ビット同一のまま保つ。`fault injection armed` → `listening on` の行順序
     // 依存ハーネスと同じ理由で、`listening on` より前・bind 成功後に置く）。
     if durability != engine::storage::WriteDurability::default() {
-        eprintln!(
+        engine::log_stderr!(
             "wire-server: WARNING: --durability {} selected; commit success responses do not guarantee data survives a process crash or power loss until a later durable commit (see docs/design/ingest-write-path.md, RECOVER-5/RECOVER-6)",
             wire_server::durability_opt::token_for(durability)
         );
+    }
+
+    // Issue #997（codex-review P1 指摘・PR #1122）: `--max-insert-rows` を
+    // `batch_limits.max_files_per_batch`（既定 64。wire-server は本 CLI から
+    // `EngineCore::with_batch_limits` を呼ばないため常に既定値）超に設定した
+    // 場合、複数行 `VALUES` は引き続き `max_files_per_batch` 側で `54000` に
+    // なり CLI の引き上げが黙って無効化される。`--durability none` の
+    // `WARNING` 行と同じ「安全上の含意を見落とさせない」設計判断でログへ
+    // 出す（エラーにはしない。`dml_limits_opt::insert_rows_cap_warning`
+    // ドキュメント参照）。
+    if let Some(warning) = wire_server::dml_limits_opt::insert_rows_cap_warning(
+        &dml_limits,
+        &engine::batch_limits::BatchLimits::default(),
+    ) {
+        engine::log_stderr!("wire-server: WARNING: {warning}");
     }
 
     // Issue #735（HTTP-1）: `nosql` 選択時のみ、選ばれた表層を示す 1 行を
@@ -1077,7 +1198,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // `listening on` の行順序に依存しているため、SQL 側の stderr をビット
     // 同一のまま保つ）。
     if surface == wire_server::surface::Surface::Nosql {
-        eprintln!(
+        engine::log_stderr!(
             "wire-server: surface nosql: HTTP/1.1 listener (30s read timeout, 64 max connections; POST /v1/session, POST /v1/session/close, and POST /v1/query (Bearer-gated) available; POST /v1/query op=search, op=scan, op=aggregate, and op=insert all execute against the engine; other paths and non-POST methods rejected with 08P01)"
         );
     }
@@ -1087,7 +1208,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // 既存 stderr をビット同一のまま保つ（`durability`／`surface nosql` の行と
     // 同じ方針。`listening on` より前・bind 成功後に置く）。
     if let Some((_, _, mode, scram_channel_binding)) = &tls_options {
-        eprintln!("wire-server: TLS enabled (mode={})", mode.token());
+        engine::log_stderr!("wire-server: TLS enabled (mode={})", mode.token());
         // Issue #970・#1088: `--tls-scram-channel-binding enable` を選んだ
         // 場合のみ注意を 1 行追加する（既定 `disable` では従来どおりこの行を
         // 出さず stderr をビット同一のまま保つ）。SQL 表層でこの行に到達して
@@ -1104,7 +1225,7 @@ fn run_server(args: &[String]) -> ExitCode {
             // 主張はしない）。実際の提示は `--auth-method scram-sha-256` の
             // 接続に限る（`--auth-method cleartext` では SASL 自体を送らない
             // ため PLUS は一切提示されない）。
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: SCRAM-SHA-256-PLUS advertisement enabled ({} enable); only takes \
                  effect for scram-sha-256 authentication (see docs/design/tls-channel-binding.md)",
                 wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG
@@ -1115,8 +1236,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
     // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
     match listener.local_addr() {
-        Ok(addr) => eprintln!("wire-server: listening on {addr}"),
-        Err(_) => eprintln!("wire-server: listening on {bind_addr}"),
+        Ok(addr) => engine::log_stderr!("wire-server: listening on {addr}"),
+        Err(_) => engine::log_stderr!("wire-server: listening on {bind_addr}"),
     }
 
     // Issue #735（HTTP-1）: 選択された表層のリスナーだけを 1 本起動する。
@@ -1501,7 +1622,7 @@ fn run_hash_password(args: &[String]) -> ExitCode {
         match arg.as_str() {
             "--with-scram-sha-256" => with_scram = true,
             other => {
-                eprintln!("wire-server: hash-password: unknown argument: {other}");
+                engine::log_stderr!("wire-server: hash-password: unknown argument: {other}");
                 return ExitCode::FAILURE;
             }
         }
@@ -1509,19 +1630,19 @@ fn run_hash_password(args: &[String]) -> ExitCode {
 
     let mut password = String::new();
     if let Err(e) = std::io::stdin().read_line(&mut password) {
-        eprintln!("wire-server: failed to read password from stdin: {e}");
+        engine::log_stderr!("wire-server: failed to read password from stdin: {e}");
         return ExitCode::FAILURE;
     }
     let password = password.trim_end_matches(['\n', '\r']);
     if password.is_empty() {
-        eprintln!("wire-server: empty password is not allowed");
+        engine::log_stderr!("wire-server: empty password is not allowed");
         return ExitCode::FAILURE;
     }
 
     let salt = match auth::generate_salt() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wire-server: failed to read salt from CSPRNG: {e}");
+            engine::log_stderr!("wire-server: failed to read salt from CSPRNG: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1529,7 +1650,7 @@ fn run_hash_password(args: &[String]) -> ExitCode {
     let phc = match auth::argon2id::encode_phc(password.as_bytes(), &salt, &auth::DEFAULT_PARAMS) {
         Ok(phc) => phc,
         Err(e) => {
-            eprintln!("wire-server: failed to compute password hash: {e}");
+            engine::log_stderr!("wire-server: failed to compute password hash: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1544,7 +1665,7 @@ fn run_hash_password(args: &[String]) -> ExitCode {
     let scram_salt = match auth::generate_salt() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wire-server: failed to read salt from CSPRNG: {e}");
+            engine::log_stderr!("wire-server: failed to read salt from CSPRNG: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1558,7 +1679,7 @@ fn run_hash_password(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!(
+            engine::log_stderr!(
                 "wire-server: failed to compute SCRAM verifier: {e:?} \
                  (password must contain only printable ASCII characters, 0x20-0x7e)"
             );

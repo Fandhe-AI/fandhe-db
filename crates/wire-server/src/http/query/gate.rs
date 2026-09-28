@@ -40,15 +40,16 @@
 //!    NOSQL-2・Issue #764）、
 //!    `(Op::Insert, Some(engine))` は [`super::insert::handle`]（Issue
 //!    #772・TASK-178・NOSQL-6）へ、`(Op::Update, Some(engine))` は
-//!    [`super::update::handle`]（Issue #876・TASK-186・NOSQL-6・NOSQL-12）
-//!    へ、`(Op::Delete, Some(engine))` は [`super::delete::handle`]（Issue
-//!    #876・TASK-186・NOSQL-6・NOSQL-12）へそれぞれ束縛・実行を委譲する。
-//!    `update`／`delete` は `where`（単一行 `id` 指定形）のみ実行し、
-//!    `filter`（述語形）は実行器未接続（Issue #871 の担当）のため
-//!    `0A000`／501 のまま拒否する（`super::dml_target::
-//!    DmlTargetError::PredicateFormUnavailable`）。`engine` 未接続時の
-//!    `Op::Scan`／`Op::Aggregate`／`Op::Insert`／`Op::Search`／`Op::Update`／
-//!    `Op::Delete` はすべて [`PLACEHOLDER_MESSAGE`] へ落ちる
+//!    [`super::update::handle`]（Issue #876・#1062・TASK-186・NOSQL-6・
+//!    NOSQL-12）へ、`(Op::Delete, Some(engine))` は
+//!    [`super::delete::handle`]（Issue #876・#1062・TASK-186・NOSQL-6・
+//!    NOSQL-12）へそれぞれ束縛・実行を委譲する。`update`／`delete` は
+//!    `where`（単一行 `id` 指定形）・`filter`（述語形。TASK-192・
+//!    Issue #1062 で実行結線済み）のいずれも実行する（`filter: []` の
+//!    空配列は `42601`。`super::dml_target::DmlTargetError::EmptyFilter`）。
+//!    `engine` 未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Insert`／
+//!    `Op::Search`／`Op::Update`／`Op::Delete` はすべて
+//!    [`PLACEHOLDER_MESSAGE`] へ落ちる
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -74,13 +75,9 @@ pub use crate::http::query::op::UNSUPPORTED_OP_MESSAGE;
 
 /// 検証を通過したが実行結線が未接続の要求に返す暫定応答の文言。
 /// `scan`・`aggregate`・`insert`・`search`（`explain: true` の `search` を
-/// 含む）・`update`・`delete`（`where` 形。Issue #876）は実行結線済み
-/// （Issue #766・#768・#772・#764・#765・#876）のため `Router::new` 経由
-/// （`engine` 未接続）の場合にのみこの応答へ落ちる。`update`／`delete` の
-/// `filter`（述語形）指定は `engine` 接続の有無によらず、実行器未接続
-/// （Issue #871 の担当）を理由に別途 `0A000`／501 を返す
-/// （`super::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE`。本定数とは
-/// 別の固定文言で、実行器なしで応答を偽装しないことを明示する）。
+/// 含む）・`update`・`delete`（`where` 形・`filter` 形の両方。Issue #876・
+/// #1062）は実行結線済み（Issue #766・#768・#772・#764・#765・#876・#1062）
+/// のため `Router::new` 経由（`engine` 未接続）の場合にのみこの応答へ落ちる。
 pub const PLACEHOLDER_MESSAGE: &str = "query execution not yet available";
 
 /// `POST /v1/query` を処理し応答バイト列を返す（認証済み要求のみ）。
@@ -155,12 +152,11 @@ pub fn handle(
         (Op::Search, Some(engine)) => {
             super::search::handle(engine, principal, &validated, now_wall)
         }
-        // `update`／`delete`（Issue #875・NOSQL-12）は Issue #876 で束縛・
-        // 実行結線済み。`where`（単一行 `id` 指定形）は実行し、`filter`
-        // （述語形）は各モジュール内部で `0A000`／501
-        // （`super::dml_target::DmlTargetError::PredicateFormUnavailable`）
-        // へ fail-closed に落とす（実行器〔Issue #871〕なしで成功を
-        // 偽装しない）。
+        // `update`／`delete`（Issue #875・NOSQL-12）は Issue #876（`where`。
+        // 単一行 `id` 指定形）・#1062（`filter`。述語形。TASK-192）で
+        // いずれも束縛・実行結線済み。`filter: []`（空配列）のみ各モジュール
+        // 内部（`super::dml_target::DmlTargetError::EmptyFilter`）で `42601`
+        // へ fail-closed に落とす。
         (Op::Update, Some(engine)) => update::handle(engine, principal, &validated, now_wall),
         (Op::Delete, Some(engine)) => delete::handle(engine, principal, &validated, now_wall),
         // `create_table`／`alter_table`／`drop_table`（Issue #910・NOSQL-13・
@@ -475,11 +471,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_update_and_delete_filter_form_reject_with_0a000_even_when_engine_is_connected() {
-        // `filter`（述語形）は実行器未接続（Issue #871 の担当）のため、
-        // `engine` 接続済みでも `0A000`／501 のまま拒否する（実行器なしで
-        // 成功を偽装しない。`super::dml_target::
-        // PREDICATE_FORM_UNAVAILABLE_MESSAGE`）。
+    fn empty_update_and_delete_filter_form_reject_with_42601_without_reaching_engine() {
+        // `filter: []`（空配列）は SQL 表層の `WHERE` 句省略とのパリティで
+        // `42601`（Issue #1062）。engine を一切呼ばないため、テーブル不存在
+        // （`42P01`）にはならない。
         let (core, _guard) = empty_core();
         let cases: [&[u8]; 2] = [
             br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[]}"#,
@@ -488,13 +483,29 @@ mod tests {
         for body in cases {
             let response = run_with_engine(&core, body, &[]);
             let text = String::from_utf8(response).expect("utf-8 response");
-            assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");
-            assert!(text.contains("0A000"), "got: {text}");
-            assert!(
-                text.contains(super::super::dml_target::PREDICATE_FORM_UNAVAILABLE_MESSAGE),
-                "got: {text}"
-            );
+            assert!(text.starts_with("HTTP/1.1 400 "), "got: {text}");
+            assert!(text.contains("42601"), "got: {text}");
             assert!(!text.contains("42P01"), "got: {text}");
+        }
+    }
+
+    #[test]
+    fn non_empty_update_and_delete_filter_form_reach_the_engine_and_report_undefined_table() {
+        // 述語形（`filter` 非空。TASK-186・NOSQL-12、Issue #1062 で実行結線
+        // 済み）は `engine` 接続済みであれば実行され、存在しないテーブルへの
+        // 要求は単一行形・`scan` と同じ `42P01`／404 になる（実行器へ到達した
+        // ことの非 vacuous な証跡）。
+        let (core, _guard) = empty_core();
+        let cases: [&[u8]; 2] = [
+            br#"{"op":"update","table":"docs","set":{"lang":"en"},"filter":[{"column":"lang","op":"eq","value":"ja"}],"operation_id":"gate-pred-update-1"}"#,
+            br#"{"op":"delete","table":"docs","filter":[{"column":"lang","op":"eq","value":"ja"}],"operation_id":"gate-pred-delete-1"}"#,
+        ];
+        for body in cases {
+            let response = run_with_engine(&core, body, &[]);
+            let text = String::from_utf8(response).expect("utf-8 response");
+            assert!(text.starts_with("HTTP/1.1 404 "), "got: {text}");
+            assert!(text.contains("42P01"), "got: {text}");
+            assert!(!text.contains(PLACEHOLDER_MESSAGE), "got: {text}");
         }
     }
 

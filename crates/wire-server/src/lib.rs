@@ -111,11 +111,18 @@
 //! TASK-73（対象ビヘイビア WIRE-1: 簡易クエリを engine SQL 表層へ接続）、
 //! TASK-153（対象ビヘイビア ERR-1: ErrorResponse 正式写像）。
 
+// RECOVER-8（fail_fast）の例外は engine 側 `recovery::stderr_log::write_line`／
+// `engine::log_stderr!` に一本化する（Issue #1081）。通常ビルド・bin では
+// `eprintln!` の再混入を lint で防ぎ、`#[cfg(test)]` のテストコードは対象外
+// とする（`docs/design/stderr-log-write-failure.md` 参照）。
+#![cfg_attr(not(test), deny(clippy::print_stderr))]
+
 pub mod auth;
 pub mod auth_method_opt;
 pub mod bind_guard;
 pub(crate) mod copy;
 pub mod ddl_permission_opt;
+pub mod dml_limits_opt;
 pub mod durability_opt;
 pub mod error_response;
 pub mod extended_query;
