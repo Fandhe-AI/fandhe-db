@@ -6747,26 +6747,24 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     // 構造を検証し（行数だけを読み飛ばすと、壊れた `uniq:` セクションを持つ
     // カタログが本関数だけ「依存なし」に丸められる）、参照列の実在は列行を
     // 読み終えた後に `pk:` 行と同じ手順で検証する。
-    let unique_constraints: Vec<Vec<String>> = if is_v6 || is_v7 || is_v8 || is_v9 {
+    let unique_constraints: ParsedUniqueConstraints = if is_v6 || is_v7 || is_v8 || is_v9 {
         // v9（Issue #1077）は `FOREIGN KEY` のオプションの有無で選ばれる形式で
         // あり UNIQUE の有無とは独立なため、v7／v8 と同じく `n == 0` を許容する
         // （`named = false`。v9 の意味は既にリリース済みであり UNIQUE の実名は
         // 持たない。Issue #1147）。
         parse_unique_section(&mut lines, is_v7 || is_v8 || is_v9, false)
             .map_err(CatalogError::CorruptSchema)?
-            .into_iter()
-            .map(|(_, cols)| cols)
-            .collect()
     } else if is_v10 || is_v11 {
         // v10（Issue #1067）・v11（Issue #1067・#1077 の統合）は `U:` 行に
-        // 制約名を持つ（`named = true`）。この軽量パーサーは ENUM 依存判定のみが
-        // 目的で名前自体は使わないが、名前の識別子形状・重複検証は共有パーサー
-        // 経由で徹底する（fail-closed を `decode_schema_body` と揃える）。
-        parse_unique_section(&mut lines, false, true)
-            .map_err(CatalogError::CorruptSchema)?
-            .into_iter()
-            .map(|(_, cols)| cols)
-            .collect()
+        // 制約名を持つ（`named = true`）。この軽量パーサーは ENUM 依存判定には
+        // 名前自体を使わないが、`validate_schema`（`decode_schema_body` 経由）が
+        // 課す「UNIQUE 名と CHECK 名はテーブル単位の名前空間を共有する」不変条件
+        // （設計 D1・Issue #1067）をここでも徹底するため名前を保持する
+        // （codex-review P2 指摘・PR #1147: 名前を捨てると、`decode_schema_body`／
+        // `validate_schema` が同名衝突として拒否するはずの壊れた v10／v11
+        // カタログが本関数だけ「依存なし」に丸められ、ENUM 依存判定の
+        // fail-closed 判定が `validate_schema` 側と食い違う）。
+        parse_unique_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
@@ -6853,7 +6851,7 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     // UNIQUE 制約の参照整合性（`validate_unique_constraints` の「生存列に
     // 存在する」契約と同じ）。構造（件数・重複）は `parse_unique_section` で
     // 検証済み。
-    for constraint in &unique_constraints {
+    for (_, constraint) in &unique_constraints {
         for name in constraint {
             if !seen_names.contains(name.as_str()) {
                 return Err(CatalogError::CorruptSchema(format!(
@@ -6877,6 +6875,23 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             if !seen_names.contains(name.as_str()) {
                 return Err(CatalogError::CorruptSchema(format!(
                     "CHECK constraint references unknown column: {name:?}"
+                )));
+            }
+        }
+    }
+
+    // UNIQUE 制約名と CHECK 制約名はテーブル単位の名前空間を共有する
+    // （`validate_schema` と同じ契約。設計 D1・Issue #1067）。v10／v11 の
+    // `unique_constraints` は名前を持つため、ここで CHECK 名との衝突も検査する
+    // （codex-review P2 指摘・PR #1147: この検査を欠くと、`decode_schema_body`／
+    // `validate_schema` が同名衝突として拒否するはずの壊れた v10／v11 カタログが
+    // 本関数だけ「依存なし」に丸められ、ENUM 依存判定の fail-closed 判定が
+    // `validate_schema` 側と食い違う）。
+    for (name, _) in &unique_constraints {
+        if let Some(name) = name {
+            if check_names.contains(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "constraint name {name:?} is already used by a CHECK constraint on this table"
                 )));
             }
         }
@@ -10290,6 +10305,58 @@ mod tests {
              U:custom_a_unique:a\nU:docs_b_key:b\nchecks:0\nfks:0\n"
         );
         assert_eq!(decode_schema("docs", &encoded).expect("decode"), named);
+    }
+
+    /// UNIQUE 制約名と CHECK 制約名はテーブル単位の名前空間を共有する
+    /// （`validate_schema` の契約。設計 D1・Issue #1067）。ENUM 依存判定の軽量
+    /// パーサー（[`catalog_value_references_enum_type`]）は v10／v11 で UNIQUE の
+    /// 制約名を読み取るだけで CHECK 名との衝突検査を行わないと、
+    /// `decode_schema_with_resolver`／`validate_schema` が `CorruptSchema` として
+    /// 拒否する壊れた v10 カタログ値でも「依存なし」に丸められてしまい、両者の
+    /// fail-closed 判定が食い違う（codex-review P2 指摘・PR #1147）。
+    #[test]
+    fn catalog_value_references_enum_type_rejects_unique_name_colliding_with_check_name() {
+        // CHECK セクションのバイト表現（述語の 16 進エンコード）は
+        // `encode_schema` に生成させ、そのまま手組みの v10 カタログへ流用する
+        // （述語エンコードの内部形式に依存しないため）。
+        // CHECK セクションの生成に列の型は影響しないため、`ColumnType::Enum` の
+        // 解決（`EnumTypeDef` 構築）を避け `Text`／`BigInt` で組み立てる
+        // （このテストの目的は述語の 16 進エンコードを流用することのみ）。
+        let check_only = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("mood_col", ColumnType::Text, true),
+                ColumnDef::new("pid", ColumnType::BigInt, true),
+            ],
+        )
+        .with_checks(vec![check("dup", &["pid"], "pid > 0")]);
+        let encoded = encode_schema(&check_only).expect("encode check-only schema");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        let checks_section = text
+            .split_once("\nchecks:")
+            .map(|(_, rest)| format!("checks:{rest}"))
+            .expect("checks section present");
+
+        let head = "v10\ncols:2\npk:\nmood_col:enum:mood:1:L:-\npid:bigint:-:1:L:-\n".to_string();
+        // UNIQUE 制約名（`dup`）が CHECK 制約名（同じく `dup`）と衝突する、
+        // 手組みの壊れた v10 カタログ値。
+        let colliding = format!("{head}uniq:1\nU:dup:mood_col\n{checks_section}");
+
+        assert!(
+            matches!(
+                decode_schema("docs", colliding.as_bytes()),
+                Err(CatalogError::CorruptSchema(_))
+            ),
+            "decode_schema must reject a UNIQUE/CHECK constraint name collision: {colliding:?}"
+        );
+        assert!(
+            matches!(
+                catalog_value_references_enum_type(colliding.as_bytes(), "mood"),
+                Err(CatalogError::CorruptSchema(_))
+            ),
+            "enum dependency parser must reject the same collision instead of \
+             silently reporting \"no dependents\": {colliding:?}"
+        );
     }
 
     /// v10 の破損した名前付き UNIQUE セクション（`U:<name>:<cols>` 形式）を
