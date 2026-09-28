@@ -8200,35 +8200,43 @@ pub(crate) fn referencing_foreign_keys_in_txn(
 
 /// テーブル `table` の永続キー索引登録簿（`key_index.rs` の登録簿で
 /// `table` をキーに持つエントリ群）に本当に必要な索引名の集合を求める
-/// （P0・Issue #1069・#1071。設計 §3.4「索引衛生」）。`id` 参照は
-/// `key_index.rs` が索引を使わず物理キーの点照会で検査するため対象外。
+/// （P0・Issue #1069・#1071。設計 §3.4「索引衛生」）。
 ///
 /// `key_index.rs` の索引は 2 通りの構築契機を持ち、いずれも登録簿の
-/// `table` キーには「索引を物理的に持つテーブル自身」が入る:
+/// `table` キーには「索引を物理的に持つテーブル自身」が入る。**`id` 参照の
+/// 扱いが親側・子側で非対称**である点に注意（Cursor Bugbot Medium・codex P2
+/// 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6mu1xV`・`PRRT_kwDOUAKASM6mu2fh`。
+/// 下記 2 種の索引を混同して両方に同じ「`id` 参照は除外」フィルタを掛けると、
+/// 子側索引を誤って取りこぼす）:
 ///
-/// - **親側索引**: `table` を参照する他テーブル（自己参照時は `table`
-///   自身）の `FOREIGN KEY` の参照先列（`fk.parent_columns()`）から
-///   構築する（`constraint::verify_required_parent_keys` 等が
-///   `ensure_index_in_txn` を `table = fk.parent_table()` で呼ぶ契約）。
+/// - **親側索引**（`id` 参照は対象外）: `table` を参照する他テーブル
+///   （自己参照時は `table` 自身）の列参照 `FOREIGN KEY` の参照先列
+///   （`fk.parent_columns()`）から構築する（`constraint::verify_required_
+///   parent_keys` 等が `ensure_index_in_txn` を `table = fk.parent_table()`
+///   で呼ぶ契約）。`id` 参照 FK は物理キーの点照会（`parent_id_key_bytes`）
+///   で検査し、`table` 自身の索引を使わないため除外する。
 ///   [`referencing_foreign_keys_in_txn`] が返す「`table` を参照する FK」
 ///   から求める。
-/// - **子側索引**: `table` 自身が宣言する `FOREIGN KEY` の参照元列
-///   （`fk.columns()`。子テーブル自身の列）から構築する
+/// - **子側索引**（`id` 参照も対象）: `table` 自身が宣言する `FOREIGN KEY`
+///   の参照元列（`fk.columns()`。子テーブル自身の列）から構築する
 ///   （`constraint::enforce_referencing_rows_in_txn` が `ensure_index_in_txn`
-///   を `table = child_schema.name`（＝ FK 宣言側自身）で呼ぶ契約。
-///   Cursor codex P2 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6muWhg`）。
-///   `table` の現在のカタログ（[`require_table_schema_write`]）の
-///   `foreign_keys` から求める。
+///   を `table = child_schema.name`（＝ FK 宣言側自身）で呼ぶ契約。**`id`
+///   参照 FK でも**構築する——親 `id` 行の削除時は
+///   `key_index::none_referenced_in_txn` が `parent_id_key_bytes` で
+///   エンコードした親 `id` 値を `table` 自身の参照元列索引と突き合わせる
+///   ため、子側だけは `id` 参照を除外してはならない）。`table` の現在の
+///   カタログ（[`require_table_schema_write`]）の `foreign_keys` から
+///   （`id` 参照を含めて）求める。
 ///
 /// 呼び出し元はこの集合の外にある登録簿エントリを
 /// [`crate::key_index::prune_unneeded_indexes_in_txn`] で刈り込む契約のため、
-/// 子側索引をこの集合へ含め忘れると、`table` が持つ**別の** `FOREIGN KEY`
-/// の子側索引を ADD/DROP CONSTRAINT の巻き添えで削除してしまう（修正前の
-/// 挙動。参照整合性の判定自体は `key_index::none_referenced_in_txn` が
-/// 未登録を検出して安全側の全行走査へフォールバックするため fail-open には
-/// ならないが、以後の親行削除・更新のたびにその FK が索引未登録と誤認されて
-/// 全行走査・索引再構築を繰り返し、Issue #1071 の索引化による計算量改善が
-/// 効かなくなる性能劣化になる）。
+/// 子側索引（`id` 参照分を含む）をこの集合へ含め忘れると、`table` が持つ
+/// **別の** `FOREIGN KEY` の子側索引を ADD/DROP CONSTRAINT の巻き添えで
+/// 削除してしまう（修正前の挙動。参照整合性の判定自体は
+/// `key_index::none_referenced_in_txn` が未登録を検出して安全側の全行走査へ
+/// フォールバックするため fail-open にはならないが、以後の親行削除・更新の
+/// たびにその FK が索引未登録と誤認されて全行走査・索引再構築を繰り返し、
+/// Issue #1071 の索引化による計算量改善が効かなくなる性能劣化になる）。
 ///
 /// [`Storage::alter_table_drop_constraint`]（UNIQUE・FOREIGN KEY いずれの削除
 /// でも、削除後のカタログに対して呼ぶ）・[`Storage::alter_table_add_foreign_key`]
@@ -8240,18 +8248,22 @@ pub(crate) fn required_key_index_names_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<std::collections::BTreeSet<String>> {
+    // 親側索引: `id` 参照 FK は `table` 自身の索引を使わないため除外する。
     let referencing = referencing_foreign_keys_in_txn(write_txn, table)?;
     let mut names: std::collections::BTreeSet<String> = referencing
         .iter()
         .filter(|(_, fk)| !fk.references_parent_id())
         .map(|(_, fk)| crate::key_index::index_name_for_columns(fk.parent_columns()))
         .collect();
+    // 子側索引: `id` 参照 FK も `table` 自身の参照元列索引を構築・使用する
+    // ため除外しない（`constraint::enforce_referencing_rows_in_txn` の
+    // `fk.references_parent_id()` 分岐が `none_referenced_in_txn` 経由で
+    // 同じ索引を照会する）。
     let own_schema = require_table_schema_write(write_txn, table)?;
     names.extend(
         own_schema
             .foreign_keys
             .iter()
-            .filter(|fk| !fk.references_parent_id())
             .map(|fk| crate::key_index::index_name_for_columns(fk.columns())),
     );
     Ok(names)

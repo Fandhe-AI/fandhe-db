@@ -1913,4 +1913,143 @@ mod tests {
             "DROP CONSTRAINT fk2 must not prune the unrelated fk1's parent-side index"
         );
     }
+
+    /// 上のテストの `id` 参照版（P2・Issue #1069・#1071。Cursor Bugbot Medium・
+    /// codex P2 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6mu1xV`・
+    /// `PRRT_kwDOUAKASM6mu2fh`）。
+    ///
+    /// `required_key_index_names_in_txn` の子側索引名の列挙が、親側と同じ
+    /// `!fk.references_parent_id()` フィルタを誤って流用していた
+    /// （親側索引は `id` 参照で不要だが、子側索引は `id` 参照 FK でも
+    /// `constraint::enforce_referencing_rows_in_txn` の `references_parent_id()`
+    /// 分岐が `key_index::none_referenced_in_txn` 経由で使うため必要）。この
+    /// ため、`id` 参照 FK（fk1）を持つ子テーブルへ無関係な列参照 FK（fk2）を
+    /// ADD／DROP すると、fk1 の子側索引が「`id` 参照だから不要」と誤判定され
+    /// 削除されていた。
+    #[test]
+    fn add_and_drop_sibling_foreign_key_preserve_id_referencing_fk_child_index() {
+        let (storage, _guard) = tmp_storage("key-index-sibling-fk-id-ref-preserved");
+
+        // parents1 は `id` 参照専用（主キー・UNIQUE 不要。物理キー `id` の
+        // 点照会で検査するため）。parents2 は fk2（列参照）の参照先。
+        let parents1 = TableSchema::new(
+            "parents1",
+            vec![ColumnDef::new("name", ColumnType::Text, true)],
+        );
+        let parents2 = TableSchema::new(
+            "parents2",
+            vec![ColumnDef::new("code2", ColumnType::Text, false)],
+        )
+        .with_primary_key(vec!["code2".to_string()]);
+        let children = TableSchema::new(
+            "children",
+            vec![
+                ColumnDef::new("a", ColumnType::BigInt, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        );
+        storage.create_table(&parents1).expect("create parents1");
+        storage.create_table(&parents2).expect("create parents2");
+        storage.create_table(&children).expect("create children");
+
+        // fk1: `id` 参照（`REFERENCES parents1` の省略形と同じ。parent_columns
+        // が疑似列 `id` 単独）。
+        storage
+            .alter_table_add_foreign_key(
+                "children",
+                Some("fk1"),
+                ForeignKeyDef::new(
+                    vec!["a".to_string()],
+                    "parents1".to_string(),
+                    vec!["id".to_string()],
+                    ReferentialAction::NoAction,
+                    ReferentialAction::NoAction,
+                ),
+            )
+            .expect("add fk1 (id reference)");
+
+        // parents1 に 2 行（id=1: children から参照される・id=2: junk・
+        // 参照されない）を入れ、children に id=1 を参照する行を 1 件入れる。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents1",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::Text("p1".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-p1").expect("op id"),
+        )
+        .expect("insert p1");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "parents1",
+            &ctx("tenant-a"),
+            2,
+            Visibility::Public,
+            &[Value::Text("junk".to_string())],
+            &crate::recovery::required_op_id::OperationId::parse("op-junk").expect("op id"),
+        )
+        .expect("insert junk");
+        crate::tenant::insert_typed_row(
+            &storage,
+            "children",
+            &ctx("tenant-a"),
+            1,
+            Visibility::Public,
+            &[Value::BigInt(1), Value::Null],
+            &crate::recovery::required_op_id::OperationId::parse("op-c1").expect("op id"),
+        )
+        .expect("insert child referencing parents1 id=1");
+
+        // 参照されていない junk（id=2）を削除し、fk1 の子側索引
+        // （children/a）をフォールバック経由で backfill・登録させる
+        // （`id` 参照は親側索引を持たないため、ここで構築されるのは子側
+        // 索引のみ）。
+        crate::tenant::delete_row(
+            &storage,
+            "parents1",
+            &ctx("tenant-a"),
+            2,
+            &crate::recovery::required_op_id::OperationId::parse("op-del-junk").expect("op id"),
+        )
+        .expect("delete junk (unreferenced)");
+
+        let fk1_child_columns = vec!["a".to_string()];
+        assert!(
+            index_has_entry(&storage, "children", &fk1_child_columns, "tenant-a").is_ok(),
+            "fk1's (id-referencing) child-side index was not backfilled; test precondition broken"
+        );
+
+        // 無関係な 2 本目の FK（fk2: children.b -> parents2.code2、列参照）を
+        // ADD する。修正前はここで fk1 の子側索引が誤って削除された
+        // （`references_parent_id()` を子側にも適用していたため）。
+        storage
+            .alter_table_add_foreign_key(
+                "children",
+                Some("fk2"),
+                ForeignKeyDef::new(
+                    vec!["b".to_string()],
+                    "parents2".to_string(),
+                    vec!["code2".to_string()],
+                    ReferentialAction::NoAction,
+                    ReferentialAction::NoAction,
+                ),
+            )
+            .expect("add fk2");
+
+        assert!(
+            index_has_entry(&storage, "children", &fk1_child_columns, "tenant-a").is_ok(),
+            "ADD CONSTRAINT fk2 must not prune the id-referencing fk1's child-side index"
+        );
+
+        // fk2 を DROP しても fk1 の索引が残ること（DROP CONSTRAINT 側の対称回帰）。
+        storage
+            .alter_table_drop_constraint("children", "fk2")
+            .expect("drop fk2");
+
+        assert!(
+            index_has_entry(&storage, "children", &fk1_child_columns, "tenant-a").is_ok(),
+            "DROP CONSTRAINT fk2 must not prune the id-referencing fk1's child-side index"
+        );
+    }
 }
