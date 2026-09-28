@@ -40,9 +40,17 @@ use std::sync::Arc;
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+// `row_codec::{self, Value as RowCodecValue}` は `insert_typed_row`
+// （`#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが使う。
+#[cfg(test)]
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{parse_view_body, SqlSurfaceError, TableLookup};
-use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
+// `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
+// `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
+// 使う。
+use crate::storage::{Row as StorageRow, Storage, StorageError};
+#[cfg(test)]
+use crate::storage::{RowInput, Visibility};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
@@ -318,6 +326,244 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
     )
+}
+
+/// [`declared_index_targets_in_txn`] の出力（Issue #1065・TASK-206・INDEX-7）。
+/// 呼び出し元（`sql::scalar_index::resolve_scalar_index_target_in_txn`）は
+/// ここから `ScalarIndex::build` の構築対象列を導出する。宣言は起動時 opt-in
+/// （`SearchEngineKind::Hnsw`）が有効な場合にのみ構築対象へ効く
+/// （`docs/design/index-declaration-effects.md`）。HNSW 宣言の判定は
+/// [`hnsw_targeted_in_txn`]（[`IndexCatalogGateCache`] 経由でカタログ全体の
+/// 要約を世代単位に再利用する）が担うため、ここには HNSW 宣言の有無を持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredIndexTargets {
+    /// 対象テーブルのスカラー宣言列（複数宣言の和集合・重複排除）。宣言が
+    /// 1 件も無ければ `None`（呼び出し元は `Auto` 〔現行の全列自動〕へ倒す）。
+    pub(crate) scalar_columns: Option<Vec<String>>,
+}
+
+/// 対象テーブルの索引宣言を、クエリが使っているのと同一の `read_txn`
+/// （アリーナ・世代と同一スナップショット）から 1 パスで要約する
+/// （Issue #1065）。`Storage::list_indexes` は独自に read txn を開くため
+/// クエリ経路からは呼ばない。カタログ未作成（宣言 0 件）は空の `Ok`。
+/// 走査件数が [`MAX_INDEX_COUNT`] を超える・値のデコードに失敗する場合は
+/// `Err` とし、呼び出し元は「宣言なし→自動」へは倒さず索引を使わない側
+/// （スカラー: 構築失敗→plain scan）へ fail-closed に倒す。
+pub(crate) fn declared_index_targets_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+) -> Result<DeclaredIndexTargets> {
+    let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Ok(DeclaredIndexTargets {
+                scalar_columns: None,
+            })
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut scalar_columns: Vec<String> = Vec::new();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if matches!(def.kind, IndexKind::Scalar) && def.table == table {
+            for col in def.columns {
+                if !scalar_columns.iter().any(|c| c == &col) {
+                    scalar_columns.push(col);
+                }
+            }
+        }
+    }
+    Ok(DeclaredIndexTargets {
+        scalar_columns: if scalar_columns.is_empty() {
+            None
+        } else {
+            Some(scalar_columns)
+        },
+    })
+}
+
+/// [`hnsw_targeted_in_txn`] が索引カタログ全件走査から要約する内容（Issue #1065・
+/// PR #1124）。`IndexKind::Hnsw` 宣言を持つテーブル名の集合だけを保持する
+/// （[`IndexCatalogGateCache`] が 1 世代あたり 1 回の走査で全テーブルの問い合わせを
+/// 賄えるようにするため）。`HnswScope::All` では集合の中身を使わず、走査が成功した
+/// こと（カタログが読み取り可能であること）だけを使う。
+#[derive(Debug, Default)]
+struct HnswCatalogSummary {
+    /// `IndexKind::Hnsw` 宣言を持つテーブル名の集合。
+    hnsw_tables: std::collections::HashSet<String>,
+}
+
+/// [`HnswCatalogSummary`] を索引カタログ全件走査で構築する（[`hnsw_targeted_in_txn`]
+/// の判定本体）。カタログ未作成（宣言 0 件）は空の `Ok`。走査件数が
+/// [`MAX_INDEX_COUNT`] を超える・デコードに失敗する場合は `Err`（呼び出し元が
+/// brute-force へ fail-closed に倒す）。
+fn hnsw_catalog_summary_in_txn(read_txn: &redb::ReadTransaction) -> Result<HnswCatalogSummary> {
+    let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HnswCatalogSummary::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut summary = HnswCatalogSummary::default();
+    for (scanned, entry) in index_table.iter()?.enumerate() {
+        if scanned >= MAX_INDEX_COUNT {
+            return Err(CatalogError::CorruptSchema(format!(
+                "index catalog exceeds {MAX_INDEX_COUNT} entries"
+            )));
+        }
+        let (key, value) = entry?;
+        let def = decode_index_def(key.value(), value.value())?;
+        if matches!(def.kind, IndexKind::Hnsw) {
+            summary.hnsw_tables.insert(def.table);
+        }
+    }
+    Ok(summary)
+}
+
+/// [`hnsw_targeted_in_txn`] の索引カタログ全件走査結果（[`HnswCatalogSummary`]）を
+/// ストレージ全体の単一世代カウンタ（`crate::storage::current_generation_in_txn`）
+/// 単位で再利用するキャッシュ（codex-review P2 対応・Issue #1065 PR #1124）。
+/// 宣言が [`MAX_INDEX_COUNT`]（最大 10,000 件）に達する構成では、キャッシュ
+/// 無しだと検索・`EXPLAIN` のたびに宣言数に比例するデコードが検索ホットパスへ
+/// 乗る。
+///
+/// キー選定: 索引カタログを変更する経路（`Storage::create_index`・`drop_index`・
+/// `drop_table`・`alter_table_drop_column`）はいずれも
+/// `crate::recovery::commit_boundary::commit` を経由し、commit 前に必ず
+/// `crate::storage::prepare_generation_bump`（ストレージ全体の単一世代
+/// カウンタ）を通る。索引カタログはテーブル横断の単一 redb テーブルで、要約
+/// （HNSW 宣言テーブル集合・読み取り可否）はどのテーブルへの索引 DDL の commit
+/// でも変わり得るため、対象テーブルの世代（`bump_table_generation_in_txn`）では
+/// なく全 commit で進むストレージ全体世代をキーにする（取りこぼさない）。
+/// 通常の行 DML でも過剰に無効化されるが、キャッシュ不一致時のコストは
+/// キャッシュ導入前と同じフルスキャン 1 回に留まる（悪化しない）。
+///
+/// `EngineCore` が唯一のインスタンスを保持し、`core.rs`（Rust API 検索・
+/// `EXPLAIN`）・`sql::exec`（SQL 検索、`sql::hnsw_cache::HnswCacheAccess`
+/// 経由）の全呼び出し元が共有する。
+pub(crate) struct IndexCatalogGateCache {
+    state: std::sync::Mutex<Option<(u64, std::sync::Arc<HnswCatalogSummary>)>>,
+    /// [`hnsw_targeted_in_txn`] が索引カタログ全件走査（世代取得・走査上限超過・
+    /// デコード失敗のいずれか）に失敗し `false`（brute-force へ fail-closed 縮退）
+    /// を返した回数（codex-review Low 指摘対応・Issue #1065）。挙動自体は
+    /// 常に安全側（厳密結果）だが、カタログ破損等の異常が運用上観測できるよう
+    /// `scalar_index::ScalarIndexCache::build_failures` と同方針で計上する。
+    gate_read_failures: std::sync::atomic::AtomicU64,
+}
+
+impl IndexCatalogGateCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(None),
+            gate_read_failures: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 現在の観測用統計を返す（`EngineCore::index_catalog_gate_cache_stats` の
+    /// 唯一の呼び出し元）。テナント ID・行データ等の機微情報は含まない。
+    pub(crate) fn stats(&self) -> IndexCatalogGateCacheStats {
+        IndexCatalogGateCacheStats {
+            gate_read_failures: self
+                .gate_read_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// [`IndexCatalogGateCache`] の現在の統計（codex-review Low 指摘対応・
+/// Issue #1065）。テスト・運用観測用であり、`VectorCore` trait には載せない
+/// 固有 API として `EngineCore::index_catalog_gate_cache_stats` からのみ公開する
+/// （`ScalarIndexCacheStats`・`HnswIndexCacheStats` と同方針）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexCatalogGateCacheStats {
+    /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗により brute-force へ
+    /// fail-closed 縮退した回数。
+    pub gate_read_failures: u64,
+}
+
+/// [`IndexCatalogGateCache`] を経由して [`HnswCatalogSummary`] を取得する。
+/// 世代の読み取りと本体の走査を同一の `read_txn`（クエリが使っているのと
+/// 同一スナップショット）から行う（キーと内容が別スナップショット由来になる
+/// TOCTOU を避ける）。`Err`（世代取得・カタログ走査いずれかの失敗）はキャッシュ
+/// へ書き込まず呼び出し元へそのまま返す（fail-closed の縮退を汚さない）。
+/// ロック毒化はキャッシュミス相当として扱う（`unwrap` しない）。新しい世代の
+/// 結果だけを保存し、遅延したミスがより新しいエントリを上書きしないようにする。
+fn cached_hnsw_catalog_summary_in_txn(
+    read_txn: &redb::ReadTransaction,
+    gate_cache: &IndexCatalogGateCache,
+) -> Result<std::sync::Arc<HnswCatalogSummary>> {
+    let generation =
+        crate::storage::current_generation_in_txn(read_txn).map_err(convert_storage_error)?;
+    if let Ok(guard) = gate_cache.state.lock() {
+        if let Some((cached_generation, summary)) = guard.as_ref() {
+            if *cached_generation == generation {
+                return Ok(summary.clone());
+            }
+        }
+    }
+    let summary = std::sync::Arc::new(hnsw_catalog_summary_in_txn(read_txn)?);
+    if let Ok(mut guard) = gate_cache.state.lock() {
+        let should_store = match guard.as_ref() {
+            Some((cached_generation, _)) => generation > *cached_generation,
+            None => true,
+        };
+        if should_store {
+            *guard = Some((generation, summary.clone()));
+        }
+    }
+    Ok(summary)
+}
+
+/// HNSW opt-in（`SearchEngineKind::Hnsw`。呼び出し元が `hnsw_available` で
+/// 渡す）がクエリ対象テーブル `table` で実際に有効かを判定する（Issue #1065・
+/// TASK-206・INDEX-7・`docs/design/index-declaration-effects.md`「HNSW
+/// （テーブル単位）」）。判定はテーブル単位で、`table` 以外のテーブルの
+/// `USING hnsw` 宣言は結果に影響しない（他テーブルへの宣言で経路・Top-k が
+/// 変わらない）:
+///
+/// - `hnsw_available == false`: 常に `false`（カタログに触れない）
+/// - `scope == HnswScope::All`（既定）: 索引カタログを読み取れれば `true`
+///   （宣言の有無によらず全テーブル HNSW。宣言は記録のみで経路を変えない）
+/// - `scope == HnswScope::Declared`: `table` に `USING hnsw` 宣言があれば
+///   `true`、無ければ `false`（厳密 brute-force）
+/// - カタログ読み取り失敗（走査上限超過・デコード破損・世代取得失敗）:
+///   いずれの `scope` でも `false`（fail-closed。宣言状態を確定できない場合は
+///   索引を使わない側＝厳密 brute-force へ倒す。スカラー側の
+///   `resolve_scalar_index_target_in_txn` と同方針）。失敗回数は
+///   [`IndexCatalogGateCacheStats`] に計上する。
+///
+/// `sql::exec`（`AnnShapeInput.hnsw_enabled`）・`core.rs`（Rust API
+/// `search_with_snapshot`・`EXPLAIN` の `ann_plan:` 行）が同一のこの関数を
+/// 呼ぶことで、実行時判定と `EXPLAIN` 表示の乖離を作らない。走査結果は
+/// `gate_cache`（[`IndexCatalogGateCache`]）を経由してストレージ世代単位で
+/// 再利用する（codex-review P2 対応・PR #1124）。
+pub(crate) fn hnsw_targeted_in_txn(
+    read_txn: &redb::ReadTransaction,
+    gate_cache: &IndexCatalogGateCache,
+    table: &str,
+    scope: crate::search_engine::HnswScope,
+    hnsw_available: bool,
+) -> bool {
+    if !hnsw_available {
+        return false;
+    }
+    match cached_hnsw_catalog_summary_in_txn(read_txn, gate_cache) {
+        Ok(summary) => match scope {
+            crate::search_engine::HnswScope::All => true,
+            crate::search_engine::HnswScope::Declared => summary.hnsw_tables.contains(table),
+        },
+        Err(_) => {
+            gate_cache
+                .gate_read_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+    }
 }
 
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
@@ -4931,6 +5177,34 @@ pub(crate) fn require_table_schema_write(
     decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
+/// `#[cfg(test)]` 限定の生書き込み API（`insert_row_into_table` /
+/// `insert_rows_into_table` / `insert_typed_row`。Issue #1078）の共通ガード。
+/// これら 3 API は [`crate::constraint::enforce_row_constraints_in_txn`]
+/// （TABLE-16・TABLE-17 の単一検査点）を経由せず redb へ直接書き込むため、主キー・
+/// UNIQUE・CHECK・FOREIGN KEY のいずれかを宣言したテーブルに対しては
+/// `CatalogError::Invalid` で fail-closed に拒否する（テストが意図せず制約違反状態を
+/// 作れてしまう経路を塞ぐ。制約付きテーブルへの投入は検査点を経由する
+/// `crate::tenant::insert_*` を使うこと）。
+///
+/// FOREIGN KEY の参照先（親テーブル）側について: 親テーブルが PK／UNIQUE で参照
+/// される場合は親テーブル自体が制約付きとして本ガードに拒否される。`id` 疑似列
+/// （制約なしの親でも参照可能。`docs/design/foreign-key.md` D1）で参照される場合でも、
+/// 生 API は `(tenant_id, id)` キーへの追加または同一キーの置換のみを行い既存の `id`
+/// を削除しないため、参照元行が参照先を失う（孤児化する）ことはない。
+#[cfg(test)]
+fn reject_constrained_table_for_raw_write(schema: &TableSchema) -> Result<()> {
+    if schema.primary_key().is_some()
+        || !schema.unique_constraints().is_empty()
+        || !schema.checks().is_empty()
+        || !schema.foreign_keys().is_empty()
+    {
+        return Err(CatalogError::Invalid(
+            "raw test-only write API does not support tables with declared constraints; use crate::tenant write APIs".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// read トランザクション内でカタログテーブルに `table_name` が定義済みかを確認する
 /// （TASK-146）。`get_row_from_table` / `scan_table_page` の共通前段処理。スキーマ本体は
 /// 呼び出し元が使わないため取得・デコードしない（[`require_table_schema_write`] と異なり
@@ -6081,12 +6355,17 @@ impl Storage {
     /// クレート外・テストからの新規行投入は [`crate::tenant::insert_row`]（テナント境界付き
     /// 書き込みガード。TASK-95・RECOVER-4）を経由すること。
     ///
-    /// `#[cfg_attr(not(test), allow(dead_code))]`: 現状の呼び出し元はすべて各モジュールの
-    /// `#[cfg(test)]` ユニットテスト（`arena.rs`・`core.rs`・`rls.rs`・本ファイルの
-    /// `tenant.rs`）のみのため、`cfg(test)` を含まない通常ビルド（wire-server が依存する
-    /// ビルド単位）では本メソッドが到達不能になり `dead_code` lint が発火する。これは
-    /// 上記の意図的な `pub(crate)` 制限の帰結であり黙殺してよい。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `#[cfg(test)]`: 現状の呼び出し元はすべて各モジュールの `#[cfg(test)]`
+    /// ユニットテスト（`arena.rs`・`core.rs`・`rls.rs`・本ファイルの `tenant.rs`）のみ
+    /// （Issue #1078。以前は `#[cfg_attr(not(test), allow(dead_code))]` で dead_code lint
+    /// を黙殺していたが、`#[cfg(test)]` によりテスト専用であることをコンパイル構成で
+    /// 保証する）。本メソッドは [`crate::constraint::enforce_row_constraints_in_txn`]
+    /// （TABLE-16・TABLE-17 の検査点）を経由しないため、
+    /// `reject_constrained_table_for_raw_write` が主キー・UNIQUE・CHECK・FOREIGN KEY
+    /// のいずれかを宣言したテーブルへの書き込みを fail-closed に拒否する（制約違反状態を
+    /// 意図せず作れてしまう経路を塞ぐ）。制約付きテーブルへの投入は
+    /// [`crate::tenant::insert_row`]（検査点経由）を使うこと。
+    #[cfg(test)]
     pub(crate) fn insert_row_into_table(
         &self,
         table_name: &str,
@@ -6097,6 +6376,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            reject_constrained_table_for_raw_write(&schema)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
@@ -6127,7 +6407,12 @@ impl Storage {
     /// （security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
     /// クレート外・テストからのバッチ投入は [`crate::tenant::insert_rows`]
     /// （`PolicyContext` 必須のガード付きバッチ API）を経由すること。
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// `#[cfg(test)]`（Issue #1078）: [`Self::insert_row_into_table`] と同じ理由でテスト専用に
+    /// 限定する。`reject_constrained_table_for_raw_write` による制約付きテーブルの
+    /// fail-closed 拒否は、空バッチ（`rows.is_empty()` の早期 return）より前に行う
+    /// （制約付きテーブルへの空バッチ投入だけを検査迂回の抜け道にしない）。
+    #[cfg(test)]
     pub(crate) fn insert_rows_into_table(
         &self,
         table_name: &str,
@@ -6137,6 +6422,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            reject_constrained_table_for_raw_write(&schema)?;
             if rows.is_empty() {
                 // 存在確認以外に何も変更しないため、commit（＝世代を進める）せず
                 // write txn を破棄する（`redb::WriteTransaction` は commit/abort の
@@ -6183,7 +6469,11 @@ impl Storage {
     /// と同じ理由でクレート外へは公開しない（`tenant_id` を引数で受け取る生の経路）。
     /// クレート外・テストからの型付き行投入は [`crate::tenant::insert_typed_row`]
     /// （`PolicyContext` から `tenant_id` を導出するガード付き API）を経由すること。
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// `#[cfg(test)]`（Issue #1078）: [`Self::insert_row_into_table`] と同じ理由でテスト
+    /// 専用に限定し、`reject_constrained_table_for_raw_write` で制約付きテーブルへの
+    /// 書き込みを fail-closed に拒否する。
+    #[cfg(test)]
     pub(crate) fn insert_typed_row(
         &self,
         table_name: &str,
@@ -6196,6 +6486,7 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            reject_constrained_table_for_raw_write(&schema)?;
             let vector_idx = schema.columns.iter().position(|c| c.ty.is_vector());
             // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま
             // 扱う（読み取り側の dim==0 モデルと整合）。列がある場合の「値が
@@ -7152,6 +7443,235 @@ mod tests {
             "drop_index must bump the target table generation"
         );
         assert_eq!(read_gen("sibling"), sibling0);
+    }
+
+    fn hnsw_def(name: &str, table: &str) -> IndexDef {
+        IndexDef::new(
+            name.to_string(),
+            table.to_string(),
+            IndexKind::Hnsw,
+            vec!["embedding".to_string()],
+        )
+    }
+
+    /// デコード不能な値を索引カタログへ直接挿入し、HNSW 適格性ゲートの
+    /// カタログ走査失敗を再現するテスト補助（Issue #1065。`decode_index_def`
+    /// の破損検出はテスト `index_def_round_trips_and_rejects_corruption` で
+    /// 別途固定済み）。
+    fn insert_corrupt_index_entry(storage: &Storage) {
+        let write_txn = storage.db().begin_write().expect("begin write");
+        {
+            let mut index_table = write_txn
+                .open_table(INDEX_CATALOG_TABLE)
+                .expect("open index catalog table");
+            index_table
+                .insert("idx_corrupt", &b"\xff\xfe"[..])
+                .expect("insert corrupt entry");
+        }
+        // 本番の書き込み経路と同じくストレージ全体世代を進める（進めないと
+        // `IndexCatalogGateCache` が破損前の検証成功を同一世代として再利用する。
+        // 本番の索引カタログ変更経路はいずれも commit 前に世代を進める）。
+        crate::storage::prepare_generation_bump(&write_txn).expect("bump generation");
+        write_txn.commit().expect("commit corrupt entry");
+    }
+
+    use crate::search_engine::HnswScope;
+
+    /// `storage` の最新スナップショットで `hnsw_targeted_in_txn` を 1 回評価する
+    /// テスト補助（HNSW opt-in 有効〔`hnsw_available == true`〕前提）。
+    fn targeted_now(
+        storage: &Storage,
+        gate_cache: &IndexCatalogGateCache,
+        table: &str,
+        scope: HnswScope,
+    ) -> bool {
+        let read_txn = storage.db().begin_read().expect("begin read");
+        hnsw_targeted_in_txn(&read_txn, gate_cache, table, scope, true)
+    }
+
+    /// `HnswScope::All`（既定）の HNSW 適格性ゲートが、`USING hnsw` 宣言の追加・
+    /// 削除で判定を変えない（宣言テーブル・他テーブルとも常に `true`）ことを
+    /// 固定する（Issue #1065 の結果不変の受け入れ条件。旧カタログ全体単位
+    /// ゲートでは `docs` への宣言で未宣言の `sibling` が `false` へ切り替わって
+    /// いた回帰の防止）。同一の [`IndexCatalogGateCache`] を複数世代で使い回しても、
+    /// 新しいキャッシュで評価した結果と一致することも併せて固定する。
+    #[test]
+    fn hnsw_targeted_in_txn_scope_all_is_unaffected_by_declarations() {
+        let (storage, _guard) = index_fixture_storage("index-gate-scope-all");
+        let gate_cache = IndexCatalogGateCache::new();
+        let check_all_true = |label: &str| {
+            for table in ["docs", "sibling"] {
+                assert!(
+                    targeted_now(&storage, &gate_cache, table, HnswScope::All),
+                    "{label}: {table} must stay on hnsw under scope all"
+                );
+                assert!(
+                    targeted_now(
+                        &storage,
+                        &IndexCatalogGateCache::new(),
+                        table,
+                        HnswScope::All
+                    ),
+                    "{label}: uncached result must match for {table}"
+                );
+            }
+        };
+
+        check_all_true("no declarations");
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        check_all_true("after declaring docs");
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        check_all_true("after dropping the declaration");
+
+        // opt-in 無効ならカタログの状態・scope によらず常に `false`。
+        let read_txn = storage.db().begin_read().expect("begin read");
+        for scope in [HnswScope::All, HnswScope::Declared] {
+            assert!(!hnsw_targeted_in_txn(
+                &read_txn,
+                &gate_cache,
+                "docs",
+                scope,
+                false
+            ));
+        }
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+    }
+
+    /// `HnswScope::Declared` の HNSW 適格性ゲートが、`USING hnsw` を宣言した
+    /// テーブルだけ `true` にし、未宣言テーブルは `false`（厳密）のまま、
+    /// `DROP INDEX` で `false` へ戻ることを固定する（Issue #1065・オーナー判断
+    /// 2026-09-28）。`docs` への宣言が `sibling` の判定を変えないこと（テーブル
+    /// 単位）と、同一キャッシュを世代を跨いで使い回しても新しい世代の宣言を
+    /// 取りこぼさないことも併せて固定する。
+    #[test]
+    fn hnsw_targeted_in_txn_scope_declared_follows_only_own_table_declaration() {
+        let (storage, _guard) = index_fixture_storage("index-gate-scope-declared");
+        let gate_cache = IndexCatalogGateCache::new();
+        let t = |table: &str| targeted_now(&storage, &gate_cache, table, HnswScope::Declared);
+
+        assert!(!t("docs"));
+        assert!(!t("sibling"));
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+        assert!(
+            t("docs"),
+            "declared table must use hnsw under scope declared"
+        );
+        assert!(
+            !t("sibling"),
+            "a declaration on docs must not affect sibling"
+        );
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_sibling", "sibling"))
+            .expect("create hnsw index on sibling");
+        assert!(t("docs"));
+        assert!(t("sibling"));
+
+        storage.drop_index("idx_hnsw_docs").expect("drop index");
+        assert!(!t("docs"), "drop index must return docs to exact search");
+        assert!(
+            t("sibling"),
+            "dropping docs' declaration must not affect sibling"
+        );
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+    }
+
+    /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗（デコード失敗）で
+    /// いずれの `scope` でも fail-closed 縮退（`false`）し、その回数を
+    /// [`IndexCatalogGateCache::stats`] の `gate_read_failures` に計上することを
+    /// 固定する（codex-review Low 指摘対応・Issue #1065）。
+    #[test]
+    fn hnsw_targeted_in_txn_records_gate_read_failure_on_corrupt_catalog_entry() {
+        let (storage, _guard) = index_fixture_storage("index-gate-cache-read-failure");
+        let gate_cache = IndexCatalogGateCache::new();
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+
+        // 破損前に一度成功をキャッシュさせ、破損後の世代でキャッシュが誤って
+        // 再利用されない（新しい世代で再走査して失敗する）ことも確認する。
+        assert!(targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        insert_corrupt_index_entry(&storage);
+
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+        assert!(!targeted_now(
+            &storage,
+            &gate_cache,
+            "docs",
+            HnswScope::Declared
+        ));
+        assert_eq!(gate_cache.stats().gate_read_failures, 1);
+
+        // 縮退は fail-closed のたびに計上される（キャッシュへは書き込まれないため
+        // 毎回走査を再試行し、そのたびに失敗が増える）。`All` でも同様に縮退する。
+        assert!(!targeted_now(
+            &storage,
+            &gate_cache,
+            "sibling",
+            HnswScope::All
+        ));
+        assert_eq!(gate_cache.stats().gate_read_failures, 2);
+    }
+
+    /// クエリが使っているのと同一の `read_txn`（スナップショット）を先に開いてから
+    /// 別の書き込み（`CREATE INDEX`）が commit されても、その `read_txn` 経由の
+    /// 判定は書き込み前のスナップショットのまま変わらないこと（TOCTOU 対策・
+    /// fail-closed の前提）を固定する。`IndexCatalogGateCache` は世代をキーに
+    /// するだけで、`read_txn` 自体のスナップショット隔離は `redb` の MVCC に
+    /// 委ねる（本テストはその前提が本キャッシュ導入後も崩れていないことの
+    /// 回帰確認）。判定が変わる書き込みとして `HnswScope::Declared` での
+    /// `docs` への宣言を使う。
+    #[test]
+    fn hnsw_targeted_in_txn_cache_respects_read_txn_snapshot_taken_before_the_write() {
+        let (storage, _guard) = index_fixture_storage("index-gate-cache-snapshot");
+        let gate_cache = IndexCatalogGateCache::new();
+        let scope = HnswScope::Declared;
+
+        // クエリ開始時点の read_txn（`docs` への HNSW 宣言より前のスナップショット）。
+        let read_txn_before = storage.db().begin_read().expect("begin read (before)");
+
+        storage
+            .create_index(&hnsw_def("idx_hnsw_docs", "docs"))
+            .expect("create hnsw index");
+
+        // 新しい read_txn（宣言後）では `docs` が `true`。
+        let read_txn_after = storage.db().begin_read().expect("begin read (after)");
+        assert!(hnsw_targeted_in_txn(
+            &read_txn_after,
+            &gate_cache,
+            "docs",
+            scope,
+            true
+        ));
+
+        // 旧スナップショットからは宣言が見えないため、依然 `false`（より新しい
+        // 世代のキャッシュ済み要約を古いスナップショットへ流用しない）。
+        assert!(!hnsw_targeted_in_txn(
+            &read_txn_before,
+            &gate_cache,
+            "docs",
+            scope,
+            true
+        ));
+        // 古い世代の要約が、より新しい世代の判定をキャッシュ経由で `false` へ
+        // 誤って倒さない。
+        assert!(hnsw_targeted_in_txn(
+            &read_txn_after,
+            &gate_cache,
+            "docs",
+            scope,
+            true
+        ));
     }
 
     #[test]
@@ -10608,5 +11128,237 @@ mod tests {
         )
         .with_checks(vec![check("broken", &["kind"], "kind = = 'a'")]);
         assert!(schema_check_references_column(&broken, "body"));
+    }
+
+    // --- 生書き込み API（`#[cfg(test)]` 限定）の制約付きテーブル拒否
+    // （TABLE-16・TABLE-17、Issue #1078） -----------------------------------
+
+    /// 制約付きテーブルへの生書き込みを `reject_constrained_table_for_raw_write` が
+    /// 拒否した場合、行が書かれず（`RowNotFound` のまま）テーブル世代も進まないこと
+    /// を確認する共通アサーション。
+    fn assert_raw_write_rejected_without_side_effect(
+        storage: &Storage,
+        table_name: &str,
+        tenant_id: &str,
+        id: u64,
+        prev_generation: u64,
+    ) {
+        assert_eq!(
+            storage
+                .table_generation(table_name)
+                .expect("read generation"),
+            prev_generation,
+            "rejected raw write must not bump the table generation"
+        );
+        assert!(
+            matches!(
+                storage.get_row_from_table(table_name, tenant_id, id),
+                Err(CatalogError::RowNotFound(_))
+            ),
+            "rejected raw write must not persist the row"
+        );
+    }
+
+    /// (a) 主キー付きテーブルへの `insert_row_into_table` は拒否される。
+    #[test]
+    fn insert_row_into_table_rejects_primary_key_table() {
+        let path = unique_db_path("raw-write-guard-insert-row-pk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("k", ColumnType::Text, false),
+            ],
+        )
+        .with_primary_key(vec!["k".to_string()]);
+        storage.create_table(&schema).expect("create table");
+        let prev_generation = storage.table_generation("docs").expect("read generation");
+
+        let err = storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.1, 0.2],
+                    metadata: &[],
+                },
+            )
+            .expect_err("primary-key table must reject raw write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "docs",
+            "tenant-a",
+            1,
+            prev_generation,
+        );
+    }
+
+    /// (b) UNIQUE 制約付きテーブルへの `insert_rows_into_table` は非空・空バッチの
+    /// いずれも拒否される（`UniqueConstraint` は事後の `alter_table_add_unique_constraint`
+    /// で追加。既存行の走査で違反がないことを確認してから制約が付くため、制約が付いた
+    /// 後は生 API 経由の新規投入・空バッチ投入がいずれも拒否されることを確認する）。
+    #[test]
+    fn insert_rows_into_table_rejects_unique_constraint_table_including_empty_batch() {
+        let path = unique_db_path("raw-write-guard-insert-rows-unique");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("k", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        // 制約が付く前は生 API での投入に成功する（回帰: 無制約テーブルは従来どおり）。
+        // `alter_table_add_unique_constraint` は既存行を `k` 列としてスキーマ準拠デコード
+        // するため、ここではスキーマ準拠の metadata を作る `insert_typed_row`（この時点
+        // ではまだ無制約なので受理される）で投入する。
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.1, 0.2]),
+                    RowCodecValue::Text("k1".to_string()),
+                ],
+            )
+            .expect("unconstrained table must still accept raw write");
+        storage
+            .alter_table_add_unique_constraint("docs", &["k"])
+            .expect("add unique constraint");
+        let prev_generation = storage.table_generation("docs").expect("read generation");
+
+        let err = storage
+            .insert_rows_into_table(
+                "docs",
+                &[(
+                    2,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[0.3, 0.4],
+                        metadata: &[],
+                    },
+                )],
+            )
+            .expect_err("unique-constrained table must reject non-empty raw batch write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "docs",
+            "tenant-a",
+            2,
+            prev_generation,
+        );
+
+        // 空バッチも同じガードで拒否される（`rows.is_empty()` の早期 return より前に
+        // ガードを呼ぶ契約。制約付きテーブルへの空バッチだけが検査を迂回しない）。
+        let err = storage
+            .insert_rows_into_table("docs", &[])
+            .expect_err("unique-constrained table must reject empty raw batch write too");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_eq!(
+            storage.table_generation("docs").expect("read generation"),
+            prev_generation,
+            "rejected empty raw batch write must not bump the table generation"
+        );
+    }
+
+    /// (c) CHECK 制約付きテーブルへの `insert_typed_row` は拒否される。
+    #[test]
+    fn insert_typed_row_rejects_check_constraint_table() {
+        let path = unique_db_path("raw-write-guard-insert-typed-check");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+            ],
+        )
+        .with_checks(vec![check("docs_kind_check", &["kind"], "kind = 'a'")]);
+        storage.create_table(&schema).expect("create table");
+        let prev_generation = storage.table_generation("docs").expect("read generation");
+
+        let err = storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.1, 0.2]),
+                    RowCodecValue::Text("a".to_string()),
+                ],
+            )
+            .expect_err("check-constrained table must reject raw write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "docs",
+            "tenant-a",
+            1,
+            prev_generation,
+        );
+    }
+
+    /// (d) FOREIGN KEY を宣言した子テーブルへの生書き込みは拒否される
+    /// （参照元列側の検査。参照先の根拠は `reject_constrained_table_for_raw_write` の
+    /// ドキュメンテーションコメント参照）。
+    #[test]
+    fn insert_row_into_table_rejects_foreign_key_table() {
+        let path = unique_db_path("raw-write-guard-insert-row-fk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "parents",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create parents");
+        let child_schema = TableSchema::new(
+            "children",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("parent_id", ColumnType::BigInt, true),
+            ],
+        )
+        .with_foreign_keys(vec![fk(&["parent_id"], "parents", &["id"])]);
+        storage
+            .create_table(&child_schema)
+            .expect("create children");
+        let prev_generation = storage
+            .table_generation("children")
+            .expect("read generation");
+
+        let err = storage
+            .insert_row_into_table(
+                "children",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.1, 0.2],
+                    metadata: &[],
+                },
+            )
+            .expect_err("foreign-key table must reject raw write");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert_raw_write_rejected_without_side_effect(
+            &storage,
+            "children",
+            "tenant-a",
+            1,
+            prev_generation,
+        );
     }
 }
