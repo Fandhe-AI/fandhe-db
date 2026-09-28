@@ -15,8 +15,10 @@
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
+use engine::row_codec::Value;
 use engine::sql::mode::SessionState;
-use engine::storage::Storage;
+use engine::storage::{RowInput, Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -294,6 +296,72 @@ fn on_conflict_do_update_targeting_a_unique_column_keeps_the_index_consistent() 
         "INSERT INTO docs (id, a) VALUES (3, 'y') USING OPERATION_ID 'op-3'",
     )
     .expect_err("the value now held by id=1 via DO UPDATE must still be enforced");
+
+    assert_eq!(count_rows(&core, &alice), 2);
+}
+
+/// UPDATE で一意キー列が全て NULL になった行は、NULLS DISTINCT により以後の
+/// 検査対象から外れるが、更新前に保持していた索引エントリ（旧キー）自体も
+/// 後片付けされなければならない（`check_and_update` が `written_keys`
+/// 〔新しい正引きキー集合〕の空チェックで早期 return すると、段 3 の
+/// 旧エントリ削除に到達せず stale な正引きエントリが残り続ける。Codex
+/// レビュー指摘・PR #1123）。stale なエントリが残っていると、後続の
+/// 別行 INSERT が旧キー値を使った時点で誤って `23505` を返す。
+///
+/// SQL の `UPDATE ... SET <col> = NULL` は許可リスト外（`NULL` リテラルは
+/// `CASE`／`COALESCE`／`NULLIF` の引数以外の式位置では受理しない）ため、
+/// 行全体置換 UPDATE（[`RowInput`] 経由。`update_row_without_vector_column.rs`
+/// と同じ流儀）で一意キー列を NULL にする。
+#[test]
+fn key_freed_by_updating_it_to_null_can_be_reused_by_a_later_committed_insert() {
+    let (core, path) = new_core("uniq-index-update-to-null-reuse");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-1'",
+    )
+    .expect("first insert");
+    drop(core);
+
+    // `docs` の実スキーマ（`CREATE TABLE` が確定した物理列レイアウト）をそのまま
+    // 読み出し、行全体置換 UPDATE のメタデータエンコードに使う（手書きスキーマとの
+    // 乖離リスクを避ける。`add_unique_constraint_invalidates_index_and_lazily_
+    // rebuilds_on_next_write` と同じ「一旦 core を drop して Storage を直接叩く」
+    // 流儀）。
+    let storage = Storage::open(&path).expect("reopen storage");
+    let schema = storage.get_table_schema("docs").expect("read back schema");
+    let null_metadata =
+        engine::row_codec::encode_scalar_columns(&schema, &[Value::Null]).expect("encode NULL");
+    engine::tenant::update_row(
+        &storage,
+        "docs",
+        &alice,
+        1,
+        &RowInput {
+            tenant_id: "alice",
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &null_metadata,
+        },
+        &OperationId::parse("op-update-null").expect("valid operation_id"),
+    )
+    .expect("update the unique column to NULL");
+    drop(storage);
+    let core = core_from_path(&path);
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (2, 'x') USING OPERATION_ID 'op-2'",
+    )
+    .expect(
+        "a value freed by updating the sole holder's unique column to NULL \
+         must be reusable (stale forward/reverse entries must not linger)",
+    );
 
     assert_eq!(count_rows(&core, &alice), 2);
 }
