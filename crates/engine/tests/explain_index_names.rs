@@ -240,10 +240,13 @@ fn id_predicate_is_excluded_from_index_name_reporting() {
     );
 }
 
-/// HNSW `--hnsw-scope all`: 宣言後は `ann_plan:` に索引名が付き、
-/// `DROP INDEX` 後は消える。
+/// HNSW `--hnsw-scope all`: `HnswScope::All` は `hnsw_targeted_in_txn` が
+/// 宣言の有無を見ず常に適格（`true`）とするため、宣言の追加・削除で実行経路
+/// は変わらない。索引名注記はその「実際に使われた索引」を示す契約と矛盾する
+/// ため、`All` では宣言の有無によらず `ann_plan:` に索引名を付けない
+/// （codex-review P1 指摘対応・Issue #1066 PR #1155）。
 #[test]
-fn hnsw_scope_all_reports_and_clears_index_name() {
+fn hnsw_scope_all_never_reports_index_name() {
     let (core, _guard) = hnsw_opt_in_core("explain-idx-names-hnsw-all", HnswScope::All);
     let mut session = allowed_session();
 
@@ -262,23 +265,88 @@ fn hnsw_scope_all_reports_and_clears_index_name() {
     .expect("declare hnsw index");
     let declared = explain_lines(&core, "tenant-a", &format!("EXPLAIN {sql}"));
     assert_eq!(
-        find_line(&declared, "ann_plan: "),
-        "ann_plan: hnsw_full_visible index=idx_vec"
+        declared, before,
+        "declaring an index under HnswScope::All must not change EXPLAIN output"
     );
 
-    // フィルタ付き（`hnsw_subset`）でも同様に名前が付く。
+    // フィルタ付き（`hnsw_subset`）でも同様に名前は付かない。
     let filtered_sql =
         "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
     let filtered = explain_lines(&core, "tenant-a", &format!("EXPLAIN {filtered_sql}"));
+    assert_eq!(find_line(&filtered, "ann_plan: "), "ann_plan: hnsw_subset");
+
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec")
+        .expect("drop hnsw declaration");
+    let dropped = explain_lines(&core, "tenant-a", &format!("EXPLAIN {sql}"));
+    assert_eq!(dropped, before, "drop index must restore the prior output");
+}
+
+/// HNSW `--hnsw-scope declared`: この scope では対象テーブルの HNSW 適格性
+/// そのものが宣言の有無で決まる（`catalog::hnsw_targeted_in_txn`）ため、
+/// 宣言名を「使用索引名」として注記してよい。宣言前は厳密（brute-force）の
+/// まま `index=` は付かず、宣言後に付き、`DROP INDEX` で再び消える。
+#[test]
+fn hnsw_scope_declared_reports_and_clears_index_name() {
+    let (core, _guard) = hnsw_opt_in_core("explain-idx-names-hnsw-declared", HnswScope::Declared);
+    let mut session = allowed_session();
+
+    let sql = "SELECT id FROM docs ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
+    let before = explain_lines(&core, "tenant-a", &format!("EXPLAIN {sql}"));
+    assert!(
+        !find_line(&before, "ann_plan: ").contains("index="),
+        "{before:?}"
+    );
+
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_vec ON docs USING hnsw (embedding)",
+    )
+    .expect("declare hnsw index");
+    let declared = explain_lines(&core, "tenant-a", &format!("EXPLAIN {sql}"));
     assert_eq!(
-        find_line(&filtered, "ann_plan: "),
-        "ann_plan: hnsw_subset index=idx_vec"
+        find_line(&declared, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_vec"
     );
 
     core.execute_sql_in_session(&ctx("tenant-a"), &mut session, "DROP INDEX idx_vec")
         .expect("drop hnsw declaration");
     let dropped = explain_lines(&core, "tenant-a", &format!("EXPLAIN {sql}"));
     assert_eq!(dropped, before, "drop index must restore the prior output");
+}
+
+/// codex-review P1 指摘対応（Issue #1066 PR #1155）: 述語列を複数の宣言が
+/// 重複して覆う場合、実行側 `declared_index_targets_in_txn` は宣言名を捨て
+/// 列の和集合から単一の `ScalarIndex` を構築するため、個別に使われる経路が
+/// 無い宣言まで `index=` に表示してはならない。最小の被覆集合（貪欲法。
+/// 被覆数が同数なら名前の昇順）へ縮退する。
+#[test]
+fn scalar_overlapping_declarations_report_minimal_covering_index_name() {
+    let (core, _guard) = hnsw_opt_in_core("explain-idx-names-scalar-overlap", HnswScope::All);
+    let mut session = allowed_session();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_kind_only ON docs (kind)",
+    )
+    .expect("declare idx_kind_only");
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_kind_topic ON docs (kind, topic)",
+    )
+    .expect("declare idx_kind_topic");
+
+    // `kind` だけの述語は両宣言が被覆するが、実行側が使う経路は 1 つの
+    // 合成索引であり、両方を「使用索引」として表示すると個別使用を偽装する。
+    // 貪欲法は被覆数が同数（ともに `kind` の 1 列）のとき名前の昇順で選ぶため
+    // `idx_kind_only` だけを表示する。
+    let sql = "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[0,0,0,0]' LIMIT 5";
+    let lines = explain_lines(&core, "tenant-a", &format!("EXPLAIN {sql}"));
+    assert_eq!(
+        find_line(&lines, "scalar_plan: "),
+        "scalar_plan: index_equality index=idx_kind_only"
+    );
 }
 
 /// 集計 EXPLAIN: `WHERE` が宣言列のみで構成される集計は

@@ -450,6 +450,8 @@ fn observe(
 /// ない」受け入れ条件。旧カタログ全体単位ゲートでは `table_a` への宣言で
 /// `table_b` が近似〔HNSW〕から厳密〔brute-force〕へ切り替わり Top-k が変わり
 /// 得た回帰の防止）。宣言した `table_a` 自身も宣言前と同じく HNSW のまま。
+/// `HnswScope::All` は適格性が宣言に依存しないため、宣言後も索引名注記は
+/// 付かない（Issue #1066 PR #1155・codex-review P1 指摘対応）。
 #[test]
 fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path() {
     let (core, _guard, vectors_a, vectors_b) =
@@ -480,12 +482,14 @@ fn scope_all_declaration_on_one_table_does_not_change_any_table_results_or_path(
         b_declared, b_before,
         "scope all: a declaration on table_a must not change table_b results"
     );
-    // Issue #1066: `--hnsw-scope all` でも宣言したテーブルには索引名が付き
-    // （経路・Top-k 自体は上記アサーションのとおり不変）、未宣言の table_b
-    // には付かない。
-    assert_eq!(
-        a_declared_line, "ann_plan: hnsw_full_visible index=idx_vec_a",
-        "table_a must report its declared hnsw index name"
+    // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
+    // `hnsw_targeted_in_txn` が宣言の有無を見ず常に適格とするため、宣言の
+    // 追加・削除は経路を一切変えない（上記アサーションのとおり）。索引名
+    // 注記は「実際に使われた索引」を示す契約であり、この scope では宣言が
+    // 経路選択に無関係なため、宣言済みの table_a にも索引名を付けない。
+    assert!(
+        !a_declared_line.contains("index="),
+        "scope all: a declared hnsw index must not be reported as used ({a_declared_line})"
     );
     assert!(
         !b_declared_line.contains("index="),

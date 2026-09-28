@@ -1577,11 +1577,45 @@ fn scalar_index_names_for_columns(
     if !all_covered {
         return Vec::new();
     }
-    scalar_decls
-        .iter()
-        .filter(|(_, cols)| column_names.iter().any(|col| cols.iter().any(|c| c == col)))
-        .map(|(name, _)| name.clone())
-        .collect()
+    // codex-review P1 指摘対応（Issue #1066 PR #1155）: 実行側
+    // `catalog::declared_index_targets_in_txn` は宣言名を捨て、対象テーブルの
+    // 全スカラー宣言の列を和集合した単一の `ScalarIndex` を構築する（宣言別に
+    // 個別の実行経路は存在しない）。そのため「述語列と 1 列でも交差する宣言を
+    // 全て返す」だけでは、同じ列を複数宣言が重複して覆う場合に実行側で個別に
+    // 使われない宣言まで「使用索引名」として表示してしまう。ここでは表示を
+    // 「述語列を被覆するために必要な最小の宣言集合」と定義し直し、貪欲法
+    // （残り未被覆列を最も多く覆う宣言から、同数なら名前の昇順で）で選ぶ。
+    // 列被覆が重複しない既存ケース（単一列・列ごとに別宣言）では従来と同じ
+    // 結果になる。
+    let mut remaining: Vec<&str> = column_names.to_vec();
+    remaining.sort_unstable();
+    remaining.dedup();
+    let mut chosen: Vec<String> = Vec::new();
+    while !remaining.is_empty() {
+        let Some((name, covers)) = scalar_decls
+            .iter()
+            .map(|(name, cols)| {
+                let covers: Vec<&str> = remaining
+                    .iter()
+                    .copied()
+                    .filter(|col| cols.iter().any(|c| c == col))
+                    .collect();
+                (name, covers)
+            })
+            .filter(|(_, covers)| !covers.is_empty())
+            .max_by(|(name_a, covers_a), (name_b, covers_b)| {
+                covers_a
+                    .len()
+                    .cmp(&covers_b.len())
+                    .then_with(|| name_b.cmp(name_a))
+            })
+        else {
+            break;
+        };
+        chosen.push(name.clone());
+        remaining.retain(|col| !covers.contains(col));
+    }
+    chosen
 }
 
 impl EngineCore {
@@ -5036,12 +5070,19 @@ impl EngineCore {
                 scalar_prefilter,
             });
 
+        // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
+        // `hnsw_targeted_in_txn` が宣言の有無を見ず常に `true` を返す（適格性が
+        // 宣言に依存しない）ため、宣言名を注記すると「宣言の追加・削除で実行
+        // 経路が変わらないのに使用索引名表示だけが変わる」という「使用索引を
+        // 示す」契約との矛盾を生む。`HnswScope::Declared` はテーブル単位の
+        // 適格性そのものが宣言の有無で決まる（catalog::hnsw_targeted_in_txn）
+        // ため、この scope に限り宣言名を「使用索引名」として注記する。
         let ann_names = match (&index_decls, ann_plan) {
             (
                 Some(decls),
                 crate::sql::hnsw_cache::AnnPlan::HnswFullVisible
                 | crate::sql::hnsw_cache::AnnPlan::HnswSubset,
-            ) => decls.hnsw.clone(),
+            ) if self.hnsw_scope == crate::search_engine::HnswScope::Declared => decls.hnsw.clone(),
             _ => Vec::new(),
         };
         let scalar_names = match (&index_decls, scalar_filter_columns) {

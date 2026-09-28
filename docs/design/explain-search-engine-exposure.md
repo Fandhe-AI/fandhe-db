@@ -249,16 +249,25 @@ NoSQL 表層が独自の行・語彙を追加することはない。
 する。既存行の追加・順序変更はしない安定契約で、条件を満たさない場合は
 既存出力と完全に同一（既定エンジン・宣言なし時はビット同一のまま）。
 
-- **ann**: `ann_plan` が `hnsw_full_visible`／`hnsw_subset` のときだけ、
-  対象テーブルの `USING hnsw` 宣言すべて。`--hnsw-scope all`
-  （`HnswScope::All`）でも宣言があれば付ける（経路・Top-k は宣言の有無で
-  変わらないという #1065 の不変条件は保たれたまま、注記だけが増える）
+- **ann**: `ann_plan` が `hnsw_full_visible`／`hnsw_subset` かつ
+  `--hnsw-scope declared`（`HnswScope::Declared`）のときだけ、対象テーブルの
+  `USING hnsw` 宣言すべて。`HnswScope::All` では宣言の有無が
+  `catalog::hnsw_targeted_in_txn` の適格性判定に一切影響しない（#1065 の
+  不変条件）ため、宣言があっても索引名は付けない（codex-review P1 指摘対応・
+  Issue #1066 PR #1155。「宣言の追加・削除だけで実行経路が変わらないのに
+  使用索引名表示が変わる」という「使用索引を示す」契約との矛盾を避けるため、
+  適格性そのものが宣言に依存する `Declared` scope に限定した）
 - **scalar**: 宣言の有効化スイッチ（起動時 HNSW opt-in）が有効・
   `scalar_plan` が `plain_scan` 以外・`WHERE` の索引対応述語
   （`metadata_filters`）が参照する列**すべて**がいずれかのスカラー宣言で
-  被覆されている場合のみ、被覆した宣言名（複数可）。1 列でも非被覆なら
-  実行時は自動索引へ縮退するため索引使用を主張しない。`id` 述語
-  （常設の暗黙索引で宣言索引ではない）は対象外
+  被覆されている場合のみ、被覆に必要な最小の宣言集合（複数可）。1 列でも
+  非被覆なら実行時は自動索引へ縮退するため索引使用を主張しない。`id` 述語
+  （常設の暗黙索引で宣言索引ではない）は対象外。実行側
+  `catalog::declared_index_targets_in_txn` は宣言名を捨て対象テーブルの
+  全スカラー宣言列を和集合した単一の索引を構築するため（宣言別の個別経路は
+  無い）、述語列を複数の宣言が重複して覆う場合は貪欲法で選んだ最小被覆集合
+  だけを表示し、個別使用経路の無い宣言まで表示しない（codex-review P1
+  指摘対応・Issue #1066 PR #1155）
 - 集計 EXPLAIN では `access_path: scalar_index_candidates` のときだけ
   `scalar_plan:` に名前が付く（`scalar_index_group_enumeration`・
   `full_scan` には付けない）
