@@ -99,7 +99,7 @@ v11 の上位集合。`uniq:`／`checks:` セクションは 0 件を許し（�
 | テーブルあたり FK 数の上限（`MAX_FOREIGN_KEYS_PER_TABLE`）を超過 | `ConstraintLimitExceeded` | `54000` |
 | **既存行が新しい FK を満たさない**（全テナント検証） | `ForeignKeyViolation`（新設） | `23503` |
 | DROP する名前が存在しない | `ConstraintNotFound` | `42704` |
-| DROP する名前が CHECK 制約 | `ConstraintDropNotSupported` | `0A000` |
+| DROP する名前が CHECK 制約 | ― | 成功（Issue #1068。従来の `ConstraintDropNotSupported`／`0A000` 拒否は撤廃） |
 | 書き込みゲートの待機上限超過 | `WriteLockTimeout` | `55P03` |
 | その他 | ― | `XX000` |
 
@@ -135,13 +135,15 @@ foreign key constraint` 相当）でテナント・値・行・表名を含ま�
 
 ### F8. 判定順（DROP。決定的・fail-closed）
 
-名前の検索は **UNIQUE → FOREIGN KEY → CHECK** の順（CHECK にあれば
-`ConstraintDropNotSupported`〔`0A000`〕、どれにも無ければ `ConstraintNotFound`
-〔`42704`〕）。UNIQUE の削除は Issue #1067 と同じ FK 依存検査
+名前の検索は **UNIQUE → FOREIGN KEY → CHECK** の順（どれにも無ければ
+`ConstraintNotFound`〔`42704`〕。CHECK 名を指定した DROP も Issue #1068 で
+削除対象として成功するようになった——従来の `ConstraintDropNotSupported`
+〔`0A000`〕拒否は撤廃済み。`docs/design/alter-table-check-constraint.md`
+参照）。UNIQUE の削除は Issue #1067 と同じ FK 依存検査
 （`referencing_foreign_keys_in_txn`。`parent_columns` の集合が削除対象の列
-集合と一致する宣言があれば `2BP01`）を維持する。FOREIGN KEY の削除は既存行を
-変更しない（依存検査は不要）。いずれの削除後も索引衛生（§ 索引衛生）を行い、
-世代を bump して commit する。
+集合と一致する宣言があれば `2BP01`）を維持する。FOREIGN KEY・CHECK の削除は
+既存行を変更しない（依存検査は不要）。いずれの削除後も索引衛生（§ 索引衛生）
+を行い、世代を bump して commit する。
 
 ### 索引衛生（P0。`key_index.rs` の stale 索引による fail-open の防止）
 

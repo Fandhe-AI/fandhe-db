@@ -228,8 +228,9 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 
 ## D5. DDL・ALTER との相互作用
 
-- スコープは `CREATE TABLE` のみ。`ALTER TABLE ADD/DROP CONSTRAINT` は
-  対象外（既存行の全テナント再検証が必要になるため別 Issue の担当）。
+- `CREATE TABLE` に加え、Issue #1068 で `ALTER TABLE ADD/DROP CONSTRAINT
+  CHECK` に対応した（既存行の全テナント再検証つき。詳細は
+  `docs/design/alter-table-check-constraint.md`）。
   `ALTER TABLE ADD COLUMN`（#900）で追加した列は既存の `CHECK` から参照
   されないため、既存制約の意味は変わらない。
 - `alter_table_add_column`／`alter_table_widen_numeric_precision`：
@@ -266,15 +267,15 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   AllowNumericColumns` による opt-in 拡張として対応済みだが、汎用の
   `WHERE`／`SELECT` への拡大は別 Issue の対象。
 - `CREATE TABLE` の列型へ `REAL`／`DOUBLE PRECISION` を追加すること
-  （現状 SQL から宣言できる数値型は `INTEGER`／`BIGINT` のみ。`CHECK` も
-  `CREATE TABLE` 限定〔`ALTER TABLE ADD CONSTRAINT CHECK` は別 Issue〕のため、
+  （現状 SQL から宣言できる数値型は `INTEGER`／`BIGINT` のみのため、
   `REAL`／`DOUBLE` の `CHECK` は SQL 表層からは現状到達できず単体テストで
   担保する）。
 - SQL-26 準拠のエラーコード（`22012`/`22003`）・単項マイナス・整数の
   切り捨て除算（数値列比較の評価規則。D1' 参照）。
 - `qty > '5'`（INTEGER 列に文字列リテラルの `Compare` 形）の受理。
-- `ALTER TABLE ADD/DROP CONSTRAINT`。
-- NoSQL 表層への DDL op（`create_table` 相当）。
+- `ALTER TABLE ADD/DROP CONSTRAINT CHECK` の `NOT VALID`／`VALIDATE
+  CONSTRAINT` 形（Issue #1068 のスコープ外。同 Issue の設計ドキュメント参照）。
+- NoSQL 表層への DDL op（`create_table` 相当。CHECK の ALTER も同様に対象外）。
 - `CHECK` 参照列への `ALTER COLUMN TYPE` の許可（現状は安全側で拒否）。
 - `catalog.rs` の生書き込み API（`#[cfg(test)]` 限定・production では到達不能）は
   検査点を経由しない。Issue #1078 で、これら 3 API 自身が `CHECK` を含む制約付き

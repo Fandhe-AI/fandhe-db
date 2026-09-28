@@ -1217,12 +1217,9 @@ pub enum CatalogError {
     /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
     /// ERR-6: `42704`）。
     ConstraintNotFound(String),
-    /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が CHECK 制約を指す
-    /// （CHECK の DROP は本 Issue のスコープ外。Issue #1067。ERR-6: `0A000`。
-    /// fail-closed に拒否し、暗黙の CHECK 削除を許さない）。
-    ConstraintDropNotSupported(String),
-    /// テーブルあたりの制約数上限（[`MAX_UNIQUE_CONSTRAINTS`] と同じ本リポの
-    /// 実装既定値）を超える `ALTER TABLE ... ADD UNIQUE`（Issue #1067。
+    /// テーブルあたりの制約数上限（[`MAX_UNIQUE_CONSTRAINTS`]／
+    /// [`MAX_CHECK_CONSTRAINTS_PER_TABLE`] と同じ本リポの実装既定値）を超える
+    /// `ALTER TABLE ... ADD UNIQUE`／`ADD CHECK`（Issue #1067・#1068。
     /// ERR-6: `54000`）。
     ConstraintLimitExceeded(String),
     /// [`Storage::alter_table_add_foreign_key`]（TABLE-22・TASK-233、Issue #1069）
@@ -1302,9 +1299,6 @@ impl fmt::Display for CatalogError {
             CatalogError::ConstraintNotFound(name) => {
                 write!(f, "constraint not found: {name}")
             }
-            CatalogError::ConstraintDropNotSupported(name) => {
-                write!(f, "dropping this constraint is not supported: {name}")
-            }
             CatalogError::ConstraintLimitExceeded(detail) => {
                 write!(f, "constraint limit exceeded: {detail}")
             }
@@ -1350,7 +1344,6 @@ impl std::error::Error for CatalogError {
             | CatalogError::InvalidForeignKey(_)
             | CatalogError::ConstraintAlreadyExists(_)
             | CatalogError::ConstraintNotFound(_)
-            | CatalogError::ConstraintDropNotSupported(_)
             | CatalogError::ConstraintLimitExceeded(_)
             | CatalogError::ForeignKeyViolation => None,
         }
@@ -1369,6 +1362,45 @@ where
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
+
+/// `Storage::alter_table_add_check_constraint`（TABLE-16・TASK-204、
+/// Issue #1068）専用の crate 内部合成エラー型。既存行の検証中に発生し得る
+/// `SqlSurfaceError`（0 除算等の CHECK 評価エラー・意味論検証エラー）を
+/// `CatalogError` へ混ぜ込むと catalog → sql の型依存・公開 API
+/// （`core_api.snapshot`）を不要に拡大するため分離する（設計 D3）。
+/// `sql::ddl::execute_alter_table_add_check` が唯一の呼び出し元で、`Sql` は
+/// そのまま `SqlSurfaceError` として透過し、`Catalog` は既存の
+/// `map_alter_constraint_error`（UNIQUE と共有）へ渡す。
+pub(crate) enum AlterCheckError {
+    Catalog(CatalogError),
+    Sql(SqlSurfaceError),
+}
+
+impl From<CatalogError> for AlterCheckError {
+    fn from(e: CatalogError) -> Self {
+        AlterCheckError::Catalog(e)
+    }
+}
+
+/// [`crate::tenant::TenantWriteError`]（`CompiledChecks::compile`／
+/// [`crate::constraint::validate_existing_rows_for_check`] が返す）を
+/// [`AlterCheckError`] へ写像する（Issue #1068 設計 D4）。`CheckViolation`
+/// （`23514`）・`CheckEvaluationFailed`（式評価エラーの透過）はいずれも
+/// `SqlSurfaceError` として運び、それ以外（`validate_existing_rows_for_check`
+/// 自身が既に `Catalog(CorruptSchema)` へ丸め済みのはずだが、`compile` 側の
+/// 直接呼び出し経路も含め fail-closed に網羅する）は `CorruptSchema`
+/// （`XX000`。詳細をクライアントへ渡さない）へ丸める。
+fn map_tenant_write_error_to_alter_check(e: crate::tenant::TenantWriteError) -> AlterCheckError {
+    use crate::tenant::TenantWriteError;
+    match e {
+        TenantWriteError::CheckViolation { constraint } => {
+            AlterCheckError::Sql(SqlSurfaceError::check_violation(constraint))
+        }
+        TenantWriteError::CheckEvaluationFailed(inner) => AlterCheckError::Sql(inner),
+        TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
+        other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+    }
+}
 
 /// 列のデータ型（閉じた集合）。デコード時に未知の型名を検出した場合は
 /// 既知の型へ黙殺フォールバックせず `CatalogError::Invalid` で拒否する（TABLE-6）。
@@ -6410,6 +6442,151 @@ impl Storage {
         Ok(confirmed_name)
     }
 
+    /// 既存テーブルへ（任意で名前付きの）CHECK 制約を追加する（TABLE-16・
+    /// TASK-204、Issue #1068）。SQL 表層 `ALTER TABLE ... ADD [CONSTRAINT <name>]
+    /// CHECK (<述語>)`（`sql::ddl::execute_alter_table_add_check`）の唯一の実装。
+    /// `pub(crate)`（CHECK は `CheckConstraint`／`with_checks`／
+    /// `sql::check_constraint::validate_and_build` がいずれも `pub(crate)` で、
+    /// `CREATE TABLE` にも公開 Rust API が無い既存方針に合わせる。任意の SQL
+    /// テキストを公開 API から差し込ませない）。
+    ///
+    /// 判定順序（設計 D5。fail-closed。データに依存するのは最後の既存行走査
+    /// のみ）: (1) テーブル取得（`TableNotFound`） (2) 明示名の衝突（既存
+    /// UNIQUE・CHECK 制約名との重複。`ConstraintAlreadyExists`） (3) CHECK
+    /// 件数上限（`ConstraintLimitExceeded`） (4) **write txn 内で取得した
+    /// スキーマ**に対する意味論検証
+    /// （[`crate::sql::check_constraint::build_check_constraint`]。束縛・禁止
+    /// 要素・参照列抽出・正規化レンダリング・往復一致。スナップショットではなく
+    /// in-txn のスキーマで検証することで、検証と追加の間に `DROP COLUMN` 等が
+    /// 挟まる TOCTOU を防ぐ） (5) 名前確定（明示名、または省略時は設計 D2 の
+    /// 既定名——既存 UNIQUE 実名 ∪ 既存 CHECK 実名 ∪ 既存 FOREIGN KEY 実名を
+    /// 避けて解決する。FOREIGN KEY 名も同じテーブル単位の名前空間を共有する
+    /// ため〔設計 F1。TABLE-22・TASK-233、Issue #1069。`alter_table_add_
+    /// named_unique_constraint`／`alter_table_add_foreign_key` の対称
+    /// チェックと同じ判定〕）
+    /// (6) 追加後スキーマの `validate_schema`（`encode_schema` 内）
+    /// (7) **新しい CHECK 1 件だけ**をコンパイルして対象テーブルの既存行
+    /// **全件**（全テナント・`Public`／`Private` を問わない。DDL はテナント
+    /// 横断の共有資源を変更する操作のため `PolicyContext` を取らない）を走査し
+    /// （[`crate::constraint::validate_existing_rows_for_check`]）、違反が
+    /// あれば `CheckViolation`（`23514`）、評価自体の失敗（0 除算等）は
+    /// `CheckEvaluationFailed` をそのまま透過する（オーナー判断 2026-09-28・
+    /// Issue #1075 と同じ契約）。(4)〜(7) いずれの拒否も write txn を commit
+    /// せず破棄するため、カタログ・世代・行のいずれにも痕跡を残さない。
+    ///
+    /// 成功時は確定した制約名を返す（呼び出し元が省略時の既定名を知る唯一の
+    /// 手段。`AddConstraint` 応答に使う。UNIQUE の
+    /// [`Self::alter_table_add_named_unique_constraint`] と同じ設計）。
+    pub(crate) fn alter_table_add_check_constraint(
+        &self,
+        table_name: &str,
+        parsed: &crate::sql::allowlist::ParsedCheck,
+    ) -> std::result::Result<String, AlterCheckError> {
+        validate_identifier(table_name)?;
+        if let Some(n) = &parsed.name {
+            validate_identifier(n)?;
+        }
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let confirmed_name;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+
+            // 明示名の衝突は意味論検証・件数上限より前に判定する（UNIQUE の
+            // `alter_table_add_named_unique_constraint` と同じ順序）。
+            // FOREIGN KEY 名も同じテーブル単位の名前空間を共有するため衝突
+            // 対象に含める（設計 F1。TABLE-22・TASK-233、Issue #1069）。
+            if let Some(n) = &parsed.name {
+                let collides = schema
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.name() == n.as_str())
+                    || schema.checks.iter().any(|c| &c.name == n)
+                    || schema.foreign_keys.iter().any(|f| f.name() == n.as_str());
+                if collides {
+                    return Err(AlterCheckError::Catalog(
+                        CatalogError::ConstraintAlreadyExists(n.clone()),
+                    ));
+                }
+            }
+            if schema.checks.len() >= MAX_CHECK_CONSTRAINTS_PER_TABLE {
+                return Err(AlterCheckError::Catalog(
+                    CatalogError::ConstraintLimitExceeded(format!(
+                        "table {table_name} already has {MAX_CHECK_CONSTRAINTS_PER_TABLE} CHECK constraints"
+                    )),
+                ));
+            }
+
+            let name = match &parsed.name {
+                Some(n) => n.clone(),
+                None => {
+                    let mut used: Vec<String> = schema
+                        .unique_constraints
+                        .iter()
+                        .map(|u| u.name().to_string())
+                        .collect();
+                    used.extend(schema.checks.iter().map(|c| c.name.clone()));
+                    // FOREIGN KEY 名も同じ名前空間を共有するため既定名の衝突
+                    // 回避対象に含める（設計 F1。UNIQUE・FOREIGN KEY の既定名
+                    // 導出〔`assign_unique_constraint_names`／
+                    // `assign_foreign_key_constraint_names`〕と対称）。
+                    used.extend(schema.foreign_keys.iter().map(|f| f.name().to_string()));
+                    crate::sql::check_constraint::default_alter_table_check_name(table_name, &used)
+                }
+            };
+
+            let built =
+                crate::sql::check_constraint::build_check_constraint(&schema, parsed, name.clone())
+                    .map_err(AlterCheckError::Sql)?;
+
+            let mut checks = schema.checks.clone();
+            checks.push(built.clone());
+            let updated = schema.clone().with_checks(checks);
+            validate_schema(&updated).map_err(AlterCheckError::Catalog)?;
+            confirmed_name = name;
+
+            let row_table_name = user_rows_table_name(table_name);
+            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                Ok(row_table) => {
+                    // 新しい CHECK 1 件だけをコンパイルして既存行を検査する
+                    // （既存 CHECK は変更しておらず再評価不要。違反時のエラーが
+                    // 新制約名を指すようにするため）。
+                    let single_check_schema = updated.clone().with_checks(vec![built]);
+                    let compiled =
+                        crate::sql::check_constraint::CompiledChecks::compile(&single_check_schema)
+                            .map_err(map_tenant_write_error_to_alter_check)?
+                            .ok_or_else(|| {
+                                AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                                    "newly built CHECK constraint failed to compile".to_string(),
+                                ))
+                            })?;
+                    crate::constraint::validate_existing_rows_for_check(
+                        &row_table,
+                        &single_check_schema,
+                        &compiled,
+                    )
+                    .map_err(map_tenant_write_error_to_alter_check)?;
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    // 初回挿入前で行ストアが物理的に未作成（既存行 0 件）。
+                }
+                Err(e) => return Err(AlterCheckError::Catalog(map_row_table_error(e))),
+            }
+
+            let encoded = encode_schema(&updated).map_err(AlterCheckError::Catalog)?;
+            let mut catalog_table = write_txn
+                .open_table(CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
+            catalog_table
+                .insert(table_name, encoded.as_slice())
+                .map_err(CatalogError::from)?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name).map_err(AlterCheckError::Catalog)?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(convert_storage_error)
+            .map_err(AlterCheckError::Catalog)?;
+        Ok(confirmed_name)
+    }
+
     /// 既存テーブルへ（任意で名前付きの）`FOREIGN KEY` 制約を追加する
     /// （TABLE-22・TASK-233、Issue #1069。SQL 表層
     /// `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...`
@@ -6561,25 +6738,24 @@ impl Storage {
         Ok(confirmed_name)
     }
 
-    /// 既存テーブルの UNIQUE・FOREIGN KEY 制約を名前で削除する（SQL-23・
-    /// TASK-204・TABLE-22・TASK-233、Issue #1067・#1069。
-    /// `ALTER TABLE ... DROP CONSTRAINT <name>`）。CHECK 制約名を指定した場合は
-    /// `ConstraintDropNotSupported`（`0A000`。CHECK の DROP はスコープ外。
-    /// 設計 D6）で拒否し、暗黙の CHECK 削除を許さない。
+    /// 既存テーブルの UNIQUE・FOREIGN KEY・CHECK 制約を名前で削除する（SQL-23・
+    /// TASK-204・TABLE-22・TASK-233、Issue #1067・#1068・#1069。
+    /// `ALTER TABLE ... DROP CONSTRAINT <name>`）。名前空間はテーブル単位で
+    /// UNIQUE・CHECK・FOREIGN KEY が共有する（設計 D1・D2・F1）ため、
+    /// UNIQUE → FOREIGN KEY → CHECK の順（設計 F8 を拡張）で検索する。
     ///
-    /// 判定順序（設計 D7・F8。fail-closed）: (1) テーブル取得（`TableNotFound`）
-    /// (2) 名前の検索——UNIQUE → FOREIGN KEY → CHECK の順（設計 F8）。CHECK に
-    /// あれば `ConstraintDropNotSupported`、どれにも無ければ `ConstraintNotFound`
-    /// (3) UNIQUE 削除時のみ: 削除対象の列集合を、他の `FOREIGN KEY` 宣言
-    /// （自己参照を含む。[`referencing_foreign_keys_in_txn`]）の
-    /// `parent_columns` の**集合**が覆っていれば `DependentObjectsStillExist`
-    /// （`2BP01`）。主キーや他の UNIQUE が同じ集合を覆っていても救済せず拒否
-    /// する（fail-closed。設計 D7）。FOREIGN KEY 削除は既存行を変更しないため
-    /// 依存検査は不要
-    /// (4) カタログを書き換える
-    /// (5) 索引衛生（P0・設計 §3.4）: 削除後のカタログから求めた「本当に
-    /// 必要な索引名」で、子表（UNIQUE 削除時はこの表自身も対象。他表の FK が
-    /// この表を参照しうるため）・FOREIGN KEY 削除時は親表の stale 索引を刈り込む
+    /// 判定順序（設計 D5・D7・F7・F8。fail-closed）: (1) テーブル取得
+    /// （`TableNotFound`） (2) 名前の検索——UNIQUE → FOREIGN KEY → CHECK の順。
+    /// どれにも無ければ `ConstraintNotFound` (3) **UNIQUE** 削除時のみ:
+    /// 削除対象の列集合を他の `FOREIGN KEY` 宣言（自己参照を含む。
+    /// [`referencing_foreign_keys_in_txn`]）の `parent_columns` の**集合**が
+    /// 覆っていれば `DependentObjectsStillExist`（`2BP01`。主キーや他の
+    /// UNIQUE が同じ集合を覆っていても救済せず拒否する）。**FOREIGN KEY**・
+    /// **CHECK** の削除は既存行・他制約への依存を持ち得ないためこの検査は
+    /// 行わない（Issue #1068 設計 D5・Issue #1069 設計 F8） (4) カタログを
+    /// 書き換える (5) 索引衛生（P0・設計 §3.4）: 削除後のカタログから求めた
+    /// 「本当に必要な索引名」で、子表（UNIQUE 削除時はこの表自身も対象。他表の
+    /// FK が参照しうるため）・FOREIGN KEY 削除時は親表の stale 索引を刈り込む
     /// (6) 世代を bump する。
     pub fn alter_table_drop_constraint(&self, table_name: &str, name: &str) -> Result<()> {
         validate_identifier(table_name)?;
@@ -6639,10 +6815,15 @@ impl Storage {
                 fks.remove(fk_index);
                 schema.clone().with_foreign_keys(fks)
             } else {
-                if schema.checks.iter().any(|c| c.name == name) {
-                    return Err(CatalogError::ConstraintDropNotSupported(name.to_string()));
-                }
-                return Err(CatalogError::ConstraintNotFound(name.to_string()));
+                // CHECK の削除（Issue #1068 設計 D5）: UNIQUE・FOREIGN KEY と
+                // 異なり他制約からの依存を持ち得ないため依存検査は不要。
+                let check_index = schema.checks.iter().position(|c| c.name == name);
+                let Some(check_index) = check_index else {
+                    return Err(CatalogError::ConstraintNotFound(name.to_string()));
+                };
+                let mut checks = schema.checks.clone();
+                checks.remove(check_index);
+                schema.clone().with_checks(checks)
             };
 
             let encoded = encode_schema(&updated)?;
@@ -7586,7 +7767,6 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // テーブル存在確認からは到達しない（網羅性のため `Internal` へ丸める）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::ConstraintNotFound(_)
-        | CatalogError::ConstraintDropNotSupported(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
         // TASK-233、Issue #1069）はテーブル存在確認からは到達しない（網羅性の

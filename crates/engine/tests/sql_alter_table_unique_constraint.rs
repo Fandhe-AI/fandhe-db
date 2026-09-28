@@ -369,10 +369,14 @@ fn drop_constraint_not_found_is_42704() {
     assert_eq!(err.wire_code(), "42704");
 }
 
-/// CHECK 制約名を指定した `DROP CONSTRAINT` は `0A000`（CHECK の DROP は
-/// スコープ外。設計 D6。暗黙の CHECK 削除を許さない）。
+/// CHECK 制約名を指定した `DROP CONSTRAINT` は Issue #1068 以降成功する
+/// （UNIQUE・CHECK はテーブル単位で名前空間を共有する。設計 D1・D5）。
+/// DROP 後は、その CHECK が拒否していた行の INSERT が即座に成功するように
+/// なる（同一セッション内で反映。世代 bump による即時反映は既存の
+/// `add_then_drop_constraint_take_effect_immediately_in_the_same_session`
+/// と同じ契約）。
 #[test]
-fn drop_constraint_naming_a_check_constraint_is_0a000() {
+fn drop_constraint_naming_a_check_constraint_succeeds() {
     let (core, path) = new_core("alter-unique-drop-check");
     let _guard = CleanupGuard(path);
     let owner = ctx("owner");
@@ -385,14 +389,42 @@ fn drop_constraint_naming_a_check_constraint_is_0a000() {
     )
     .expect("create table with CHECK");
 
+    // CHECK が有効な間は違反行の INSERT が拒否される。
+    let err = exec(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO docs (id, a) VALUES (1, 'y') USING OPERATION_ID 'op-1'",
+    )
+    .expect_err("violating row must be rejected while the CHECK is active");
+    assert_eq!(err.wire_code(), "23514");
+
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs DROP CONSTRAINT ck_a",
+    )
+    .expect("dropping a CHECK constraint by name must succeed");
+
+    // DROP 後は同じ行が成功する（世代 bump による即時反映）。
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO docs (id, a) VALUES (1, 'y') USING OPERATION_ID 'op-2'",
+    )
+    .expect("row must be accepted once the CHECK constraint is dropped");
+
+    // 削除済みの名前は以後 `42704`。
     let err = exec(
         &core,
         &mut session,
         &owner,
         "ALTER TABLE docs DROP CONSTRAINT ck_a",
     )
-    .expect_err("dropping a CHECK constraint by DROP CONSTRAINT must fail");
-    assert_eq!(err.wire_code(), "0A000");
+    .expect_err("dropping an already-dropped constraint name must fail");
+    assert_eq!(err.wire_code(), "42704");
 }
 
 /// 主キーの実装名（`<table>_pkey` 相当の慣習名）は UNIQUE・CHECK いずれにも
@@ -511,8 +543,10 @@ fn add_unique_without_ddl_permission_is_42501_for_existing_and_missing_table() {
     assert_eq!(err.wire_code(), "42501");
 }
 
-/// スコープ外の構文（設計 D6）は `42601` で拒否される: `CONSTRAINT ... CHECK`、
-/// `DROP CONSTRAINT IF EXISTS`。
+/// スコープ外の構文（設計 D6。Issue #1068 以降 `ADD CONSTRAINT ... CHECK`
+/// 自体は受理するようになったが、`NOT VALID` を付けた形は既存行の検証を
+/// 飛ばす経路であり黙って受理しない）は `42601` で拒否される:
+/// `CHECK (...) NOT VALID`、`DROP CONSTRAINT IF EXISTS`。
 #[test]
 fn out_of_scope_alter_table_forms_are_rejected_with_42601() {
     let (core, path) = new_core("alter-unique-out-of-scope-forms");
@@ -525,9 +559,9 @@ fn out_of_scope_alter_table_forms_are_rejected_with_42601() {
         &core,
         &mut session,
         &owner,
-        "ALTER TABLE docs ADD CONSTRAINT ck_a CHECK (a = 'x')",
+        "ALTER TABLE docs ADD CONSTRAINT ck_a CHECK (a = 'x') NOT VALID",
     )
-    .expect_err("ADD CONSTRAINT ... CHECK is out of scope for this Issue");
+    .expect_err("ADD CONSTRAINT ... CHECK ... NOT VALID is out of scope for this Issue");
     assert_eq!(err.wire_code(), "42601");
 
     exec(

@@ -2441,11 +2441,25 @@ pub struct ValidatedAlterTableAddUnique {
 /// （Issue #1067）。対象名が UNIQUE・CHECK・FOREIGN KEY いずれの制約として
 /// 存在するか、存在するとしてどれかの判定はカタログ照会を要するため構造検証
 /// 段階では行わない（実行段 `sql::ddl::execute_alter_table_drop_constraint` が
-/// 担う。FK 名の解決は Issue #1069 で追加）。
+/// 担う。Issue #1068 以降 CHECK 名を指定した DROP も成功するようになり、
+/// FK 名の解決は Issue #1069 で追加）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedAlterTableDropConstraint {
     pub table_name: String,
     pub constraint_name: String,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>]
+/// CHECK (<述語>)` 文（TABLE-16・TASK-204、Issue #1068）。`constraint_name` は
+/// `CONSTRAINT <name>` 句を省略した場合 `None`（実行段
+/// `sql::ddl::execute_alter_table_add_check` が設計 D2 の既定名を確定する。
+/// `CREATE TABLE` の表制約と同じ既定名アルゴリズム）。述語文法・意味論検証は
+/// `CREATE TABLE` の CHECK と同一（`sql::check_constraint::build_check_constraint`）。
+/// `ParsedCheck.column` は常に `None`（列制約形は `ADD CHECK` に無い）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAddCheck {
+    pub table_name: String,
+    pub check: ParsedCheck,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>]
@@ -2463,20 +2477,26 @@ pub struct ValidatedAlterTableAddForeignKey {
     pub foreign_key: crate::catalog::ForeignKeyDef,
 }
 
-/// `ALTER TABLE` の許可形状 4 種の和（Issue #1067・#1069）。`ParsedSql::AlterTable` が
+/// `ALTER TABLE` の許可形状 5 種の和（Issue #1067・#1068・#1069）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
 ///
 /// **BREAKING CHANGE**（Issue #1067・#1069）: `validate_alter_table`／
 /// `validate_alter_table_tokens` の戻り値を `ValidatedAlterTableAddColumn` から
-/// 本 enum へ変更し（#1067）、さらに `AddForeignKey` variant を追加した
-/// （#1069）。クレート外でこれらの関数を直接呼ぶコード・`ParsedSql::AlterTable`
-/// の中身を直接扱うコード（特に網羅 `match`）は追随が必要。
+/// 本 enum へ変更した（#1067）。クレート外でこれらの関数を直接呼ぶコード・
+/// `ParsedSql::AlterTable` の中身を直接扱うコード（特に網羅 `match`）は追随が
+/// 必要。
+///
+/// **BREAKING CHANGE**（Issue #1068）: `AddCheck` variant を追加した。
+///
+/// **BREAKING CHANGE**（Issue #1069）: `AddForeignKey` variant を追加した。
+/// いずれも本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
     AddUnique(ValidatedAlterTableAddUnique),
+    AddCheck(ValidatedAlterTableAddCheck),
     DropConstraint(ValidatedAlterTableDropConstraint),
     AddForeignKey(ValidatedAlterTableAddForeignKey),
 }
@@ -5073,11 +5093,13 @@ impl<'a> Parser<'a> {
     /// `ALTER TABLE <table> ADD COLUMN <column> <type> [;]`（TASK-202・SQL-23。
     /// Issue #900）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE
     /// (<col>[, ...])`（TABLE-16・TASK-204、Issue #1067）・
-    /// `ALTER TABLE <table> DROP CONSTRAINT <name>`（Issue #1067）の 3 形状のみを
+    /// `ALTER TABLE <table> ADD [CONSTRAINT <name>] CHECK (<述語>)`（TABLE-16・
+    /// TASK-204、Issue #1068）・`ALTER TABLE <table> DROP CONSTRAINT <name>`
+    /// （Issue #1067。CHECK 名も Issue #1068 以降は対象）の 4 形状のみを
     /// 受理する。`ALTER`／`TABLE`／`ADD`／`COLUMN`／`DROP`／`CONSTRAINT` は
     /// `lexer::Keyword` へ含めない設計方針（`lexer.rs` のモジュールドキュメント
     /// 参照）のため、いずれも `expect_contextual_keyword` で文脈的に照合する。
-    /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK`／
+    /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK ... NOT VALID`／
     /// `PRIMARY KEY`／`FOREIGN KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
     /// `RESTRICT`・`DROP COLUMN`／`ALTER COLUMN`・`USING OPERATION_ID` はいずれも
     /// 構造的に受理しない（設計 D6。`expect_end_of_statement` が余剰トークンとして
@@ -5126,13 +5148,15 @@ impl<'a> Parser<'a> {
                 ));
             }
             // `ADD [CONSTRAINT <name>] UNIQUE (...)`（Issue #1067）・
+            // `ADD [CONSTRAINT <name>] CHECK (...)`（Issue #1068）・
             // `ADD [CONSTRAINT <name>] FOREIGN KEY (...) REFERENCES ...`
             // （TABLE-22・TASK-233、Issue #1069）。`CONSTRAINT` 句を省略した場合は
             // 実行段（`sql::ddl::execute_alter_table_add_unique`／
-            // `execute_alter_table_add_foreign_key`）が既定名を確定する（設計
-            // D2・F2）。`CHECK`／`PRIMARY KEY` を `CONSTRAINT` に後続させる形は
-            // 設計 D6 によりスコープ外とし、`UNIQUE`／`FOREIGN KEY` 以外が続けば
-            // `42601` で拒否する。
+            // `execute_alter_table_add_check`／`execute_alter_table_add_foreign_key`）
+            // が設計 D2・F2 の既定名を確定する。`PRIMARY KEY` を `CONSTRAINT` に
+            // 後続させる形・`NOT VALID` 付きの `CHECK` は設計 D6 によりスコープ外
+            // とし、`UNIQUE`／`CHECK`／`FOREIGN KEY` のいずれでもなければ `42601`
+            // で拒否する。
             let constraint_name = if self.peek_contextual_keyword("CONSTRAINT") {
                 self.advance();
                 let name = self.expect_ident()?;
@@ -5143,6 +5167,23 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // `CHECK` は `UNIQUE`／`FOREIGN KEY` と異なり `(` を直接後続させない
+            // （`CHECK (` の前に述語ではなく制約種別キーワードが来る）ため、次の
+            // トークンで判定する。`peek_check_clause_start` は列リスト内の
+            // `CONSTRAINT` も拾ってしまうため使わず、ここでは `CHECK` 単体の
+            // 直接判定に留める（`CONSTRAINT <name>` は既に消費済みで、続く語が
+            // `CHECK`／`UNIQUE`／`FOREIGN` のいずれでもなければ `42601` になる）。
+            if self.peek_ident_matches("CHECK") {
+                let predicates = self.parse_check_parenthesized_body()?;
+                return Ok(ParsedAlterTableShape::AddCheck {
+                    table_name,
+                    check: ParsedCheck {
+                        name: constraint_name,
+                        column: None,
+                        predicates,
+                    },
+                });
+            }
             if self.peek_contextual_keyword("FOREIGN") {
                 let foreign_key = self.parse_foreign_key_table_constraint()?;
                 return Ok(ParsedAlterTableShape::AddForeignKey {
@@ -5425,6 +5466,18 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let predicates = self.parse_check_parenthesized_body()?;
+        Ok((name, predicates))
+    }
+
+    /// `CHECK ( <述語> )` の本体部分（`CHECK` キーワード・括弧・`OR` 拒否）を
+    /// 消費する（TABLE-16・TASK-204、Issue #906）。[`Self::parse_check_clause`]
+    /// （`CREATE TABLE`）と `ALTER TABLE ... ADD [CONSTRAINT <name>] CHECK (...)`
+    /// （TASK-204、Issue #1068）の両方が、制約名の解決（列型キーワードとの
+    /// 一致チェックの要否が異なる。[`Self::peek_check_clause_start`] 参照）を
+    /// 終えた後に共有して呼ぶ。述語文法は `CREATE TABLE` の CHECK と完全に同一
+    /// （設計 D1）。
+    fn parse_check_parenthesized_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         self.expect_ident_matching("CHECK")?;
         self.expect_punct('(')?;
         let predicates = self.parse_check_body()?;
@@ -5438,7 +5491,7 @@ impl<'a> Parser<'a> {
                 "OR is not supported inside a CHECK clause",
             ));
         }
-        Ok((name, predicates))
+        Ok(predicates)
     }
 
     /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')
@@ -6546,13 +6599,17 @@ struct ParsedAlterTableAddColumnShape {
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
-/// （Issue #1067）。[`Parser::parse_alter_table`] が返す 3 形状の和。
+/// （Issue #1067・#1068）。[`Parser::parse_alter_table`] が返す 4 形状の和。
 enum ParsedAlterTableShape {
     AddColumn(ParsedAlterTableAddColumnShape),
     AddUnique {
         table_name: String,
         constraint_name: Option<String>,
         columns: Vec<String>,
+    },
+    AddCheck {
+        table_name: String,
+        check: ParsedCheck,
     },
     DropConstraint {
         table_name: String,
@@ -8673,8 +8730,10 @@ pub(crate) fn validate_truncate_tokens(
     })
 }
 
-/// `ALTER TABLE ADD COLUMN` 文をトークン化し、許可リスト形式で構造検証する
-/// （TASK-202・SQL-23。Issue #900 の公開 API）。`validate_truncate` とは異なり
+/// `ALTER TABLE` 文（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT` の 4 形状）をトークン化し、
+/// 許可リスト形式で構造検証する（TASK-202・SQL-23。Issue #900 の公開 API）。
+/// `validate_truncate` とは異なり
 /// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
 /// ゲート（`sql::ddl::require_ddl_permission`）より先にテーブルの存在有無を
 /// 返すと、権限の無い主体に対する存在オラクルになるため（`ValidatedAlterTableAddColumn`
@@ -8696,9 +8755,9 @@ pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTable, SqlSurface
 /// 写像して渡す入口とする。
 ///
 /// **BREAKING CHANGE**（Issue #1067）: 戻り値を `ValidatedAlterTableAddColumn`
-/// から [`ValidatedAlterTable`]（3 形状の和）へ変更した。`ADD COLUMN` 専用だった
-/// 呼び出し元は `ValidatedAlterTable::AddColumn(_)` へパターンマッチする必要が
-/// ある。
+/// から [`ValidatedAlterTable`]（Issue #1068 時点で 4 形状の和）へ変更した。
+/// `ADD COLUMN` 専用だった呼び出し元は `ValidatedAlterTable::AddColumn(_)` へ
+/// パターンマッチする必要がある。
 pub fn validate_alter_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedAlterTable, SqlSurfaceError> {
@@ -8723,6 +8782,9 @@ pub fn validate_alter_table_tokens(
             constraint_name,
             columns,
         }),
+        ParsedAlterTableShape::AddCheck { table_name, check } => {
+            ValidatedAlterTable::AddCheck(ValidatedAlterTableAddCheck { table_name, check })
+        }
         ParsedAlterTableShape::DropConstraint {
             table_name,
             constraint_name,

@@ -595,6 +595,70 @@ where
     Ok(false)
 }
 
+/// `ALTER TABLE ... ADD CHECK`（TABLE-16・TASK-204、Issue #1068）が新しい CHECK
+/// 制約を追加する前に、対象テーブルの**既存行全件**（全テナント・`Public`／
+/// `Private` を問わない。DDL はテナント横断の共有資源〔カタログ〕を変更する
+/// 操作であり `PolicyContext` を取らない——[`table_has_duplicate_unique_key`]
+/// と同じ設計判断）が `compiled`（新しい CHECK 1 件だけをコンパイルしたもの。
+/// 呼び出し元 `catalog::Storage::alter_table_add_check_constraint` が
+/// `schema.clone().with_checks(vec![new_check])` から作る）を満たすことを
+/// 検証する。可視性で絞ったスナップショットは使わない（不可視行の違反を
+/// 見逃す fail-open になるため。security.md「アクセス制御の不備」対応）。
+///
+/// 違反行が 1 件でもあれば [`TenantWriteError::CheckViolation`]（`23514`）、
+/// 評価自体の失敗（0 除算等）は [`TenantWriteError::CheckEvaluationFailed`]を
+/// そのまま透過する（設計 D4。オーナー判断 2026-09-28・Issue #1075 と同じ
+/// 契約）。行のデコード失敗・ヘッダのテナント不整合は
+/// `TenantWriteError::Catalog(CatalogError::CorruptSchema)`（`XX000`。詳細は
+/// クライアントへ渡さない）に丸める——`CompiledChecks::enforce` 自身が返し得る
+/// `Catalog(Invalid(..))`（`scan_scalar_columns_masked` の構造検証失敗）も
+/// ここで `CorruptSchema` へ揃える（`CheckViolation`／`CheckEvaluationFailed`
+/// 以外はすべて `CorruptSchema` に写像する。呼び出し元は write トランザクション
+/// を commit せず破棄するため、いずれの拒否もカタログ・世代・行のいずれにも
+/// 痕跡を残さない）。
+pub(crate) fn validate_existing_rows_for_check<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    compiled: &crate::sql::check_constraint::CompiledChecks,
+) -> Result<(), TenantWriteError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let mut embedding: Vec<f32> = Vec::new();
+    for entry in row_table
+        .iter()
+        .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
+    {
+        let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+        let (key_tenant, id) = k.value();
+        let buf = v.value();
+        // 行ヘッダのテナントと物理キーのテナントの整合（TABLE-12）を確認して
+        // から値を読む（不整合な行を別テナントの行として数えない。
+        // `table_has_duplicate_unique_key` と同じ検査）。
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)
+                .map_err(|e| corrupt_check_scan(e.to_string()))?;
+        compiled
+            .enforce(schema, id, &embedding, metadata)
+            .map_err(|e| match e {
+                TenantWriteError::CheckViolation { .. }
+                | TenantWriteError::CheckEvaluationFailed(_) => e,
+                other => corrupt_check_scan(other.to_string()),
+            })?;
+    }
+    Ok(())
+}
+
+/// [`validate_existing_rows_for_check`] のデコード失敗・漂流時の写像を 1 か所に
+/// 集約する（D4: fail-closed に `XX000` へ丸め、詳細をクライアントへ渡さない）。
+fn corrupt_check_scan(detail: String) -> TenantWriteError {
+    TenantWriteError::Catalog(CatalogError::CorruptSchema(detail))
+}
+
 /// 内部矛盾（`validate_schema` を通過したスキーマからは到達しないはずの状態）を
 /// 表す固定文言を [`TenantWriteError`] へ包む。`key_index.rs` も同じ判断を
 /// 共有するため `pub(crate)`。
