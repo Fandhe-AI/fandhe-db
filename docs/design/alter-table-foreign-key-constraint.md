@@ -82,7 +82,7 @@ v11 の上位集合。`uniq:`／`checks:` セクションは 0 件を許し（�
   FK 名と UNIQUE・CHECK 名の衝突検査も追加）
 - **`referencing_foreign_keys_in_txn`**（`FK_BEARING_FORMAT_VERSIONS` から
   候補接頭辞を生成する。v12 を見落とすと、`DROP TABLE` の `2BP01` 判定・
-  参照先側の書き込み検査・`required_parent_key_index_names_in_txn` の
+  参照先側の書き込み検査・`required_key_index_names_in_txn`（§ 索引衛生）の
   いずれもが fail-open になる）
 
 ### F5. エラー契約（ERR-6 の既存行だけを使い、新しい wire_code は作らない）
@@ -156,16 +156,28 @@ foreign key constraint` 相当）でテナント・値・行・表名を含ま�
 これを防ぐため、`key_index::prune_unneeded_indexes_in_txn(write_txn, table,
 required_names)` を新設した。`table` の登録簿にある索引のうち
 `required_names` に含まれないものを、fwd／rev の実テーブルごと・全テナント分
-削除する。「本当に必要な索引名」は `catalog::required_parent_key_index_names_in_txn`
-（`referencing_foreign_keys_in_txn(write_txn, table)` が返す「`table` を参照する
-FK」の `parent_columns()`〔`id` 参照を除く〕から求める——`key_index.rs` の索引は
-常に「参照先（親）テーブル・参照先列」を基準に構築される契約のため、`table`
-自身の FK が持つ参照元列は対象にならない）で求める。
+削除する。「本当に必要な索引名」は `catalog::required_key_index_names_in_txn`
+が、`table` の登録簿が持ちうる 2 種類の索引を合わせて求める（Cursor Bugbot
+Medium・codex P2 指摘・PR #1156 スレッド `PRRT_kwDOUAKASM6muWhg`・
+`PRRT_kwDOUAKASM6mu1xV`・`PRRT_kwDOUAKASM6mu2fh`）:
+
+- **親側索引**（`id` 参照は除外）: `referencing_foreign_keys_in_txn(write_txn,
+  table)` が返す「`table` を参照する FK」の `parent_columns()` から求める。
+  `id` 参照 FK は `table` 自身の索引を使わず物理キーの点照会で検査するため
+  対象外。
+- **子側索引**（`id` 参照も含む）: `table` 自身が現在宣言する `FOREIGN KEY`
+  （`require_table_schema_write` で読む現在のカタログの `foreign_keys`）の
+  参照元列 `columns()` から求める。`constraint::enforce_referencing_rows_in_txn`
+  が `table = child_schema.name`（＝ FK 宣言側自身）で構築する索引で、`id`
+  参照 FK でも `key_index::none_referenced_in_txn` が `parent_id_key_bytes`
+  でエンコードした親 `id` 値をこの索引と突き合わせるため、`id` 参照だからと
+  いって対象から除外してはならない。
 
 呼び出し点:
 
 - **DROP CONSTRAINT FOREIGN KEY**: カタログ書き換え後（削除後の状態を見る
-  必要があるため）に、削除した FK の**参照先（親）表**を対象に刈り込む
+  必要があるため）に、**この表自身**（他の FK の子側索引を巻き添えで
+  削除しないため）と、削除した FK の**参照先（親）表**の両方を対象に刈り込む
 - **DROP CONSTRAINT UNIQUE**: カタログ書き換え後に、**この表自身**
   （他表の FK がこの表の UNIQUE 列を参照しうるため）を対象に刈り込む
 - **ADD FOREIGN KEY**: 検証**前**に、まだ新 FK を含まない現在のカタログから
@@ -179,7 +191,12 @@ FK」の `parent_columns()`〔`id` 参照を除く〕から求める——`key_i
 `readding_foreign_key_after_drop_detects_rows_added_during_the_gap` は `id`
 参照（`key_index.rs` を経由しない全行スキャン経路）を使うため索引の stale 化
 そのものは再現しないが、`ADD FOREIGN KEY` の既存行検証が常に現在の子テーブル
-状態を見ることを別途固定する。
+状態を見ることを別途固定する。`crates/engine/src/key_index.rs` の
+`tests::add_and_drop_sibling_foreign_key_preserve_other_fk_indexes`・
+`tests::add_and_drop_sibling_foreign_key_preserve_id_referencing_fk_child_index`
+（いずれもミューテーションテストで確認済み）は、2 本目の FK を ADD／DROP
+しても同じ子テーブルが持つ**別の** FK（列参照・`id` 参照それぞれ）の子側・
+親側索引が巻き添えで削除されないことを固定する。
 
 ### F9. 循環
 
@@ -233,6 +250,11 @@ Issue #1067（UNIQUE の ADD 時全テナント検証）と同じ判断で、上
   （UNIQUE との）・参照先エラー分類（`42P01`／`42830`）・DDL 権限
   （`42501`。存在オラクルにならないこと）・索引衛生の P0 回帰（子側・親側）・
   `CREATE TABLE` の FK・CHECK 名重複・スコープ外構文の拒否
+- `crates/engine/src/key_index.rs` 単体テスト:
+  `add_and_drop_sibling_foreign_key_preserve_other_fk_indexes`・
+  `add_and_drop_sibling_foreign_key_preserve_id_referencing_fk_child_index`
+  （無関係な FK の ADD／DROP が、同じ子テーブルが持つ別の FK の子側・親側
+  索引を巻き添え削除しないこと。`id` 参照・列参照の両方を固定）
 - `crates/engine/src/catalog.rs` 単体テスト: v12 の往復・v8〜v11 の decode 後
   既定名導出（`assign_foreign_key_constraint_names` 適用後の比較で検証。既存
   v8〜v11 のゴールデンバイト列アサーションは無変更のまま全通過）
