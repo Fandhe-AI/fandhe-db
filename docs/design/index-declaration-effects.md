@@ -224,6 +224,17 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   empty_candidates`（宣言外列を含む複数述語を両順序で束縛し、`EXPLAIN` の
   `plain_scan` 表示と実行時統計〔`index_scans`／`plain_scan_fallbacks`〕が
   一致することを固定）参照。
+- **Issue #1066（`EXPLAIN` の使用索引名注記）との整合**: `EngineCore::
+  explain_engine_for` の `scalar_names_eligible` は「`scalar_plan` が
+  `PlainScan` 以外」を索引名（`index=<name>`）表示の前提条件に含む。Issue
+  #1153 が `scalar_plan_under_target` で宣言外列への述語を `PlainScan` へ
+  補正する結果、そのケースは `scalar_names_eligible` の時点で自動的に偽と
+  なり索引名も付かない（`uncovered_column_reports_no_index_name`・
+  `crates/engine/tests/explain_index_names.rs` で固定）。両 Issue は
+  「`scalar_plan:` トークン自体を宣言と一致させる」（#1153）・「一致した
+  トークンへさらに使用索引名を注記する」（#1066）という別レイヤーの責務で
+  独立しており、`scalar_plan_under_target` の出力を `explain_engine_for` へ
+  そのまま渡すだけで二重の判定ロジックを持たずに整合する。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）

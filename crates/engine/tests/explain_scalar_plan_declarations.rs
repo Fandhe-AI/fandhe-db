@@ -209,7 +209,9 @@ fn search_explain_reflects_scalar_declaration_target() {
     );
     assert_eq!(
         scalar_plan_line(&lang_eq),
-        "index_equality",
+        // Issue #1066 PR #1155 との統合: 宣言で被覆された列への等価述語は
+        // 使用索引名（`index=idx_lang`）も付く。
+        "index_equality index=idx_lang",
         "declared column lang keeps its index-eligible token"
     );
 
@@ -257,7 +259,10 @@ fn search_explain_reflects_scalar_declaration_target() {
     );
     assert_eq!(
         scalar_plan_line(&lang_and_id),
-        "index_conjunction",
+        // Issue #1066 PR #1155 との統合: `id` 述語は `metadata_filters` に
+        // 現れないため索引名注記の被覆判定対象外だが、`lang` 側の宣言列は
+        // 被覆されるため `index=idx_lang` が付く。
+        "index_conjunction index=idx_lang",
         "declared column + id predicate stays index-eligible"
     );
 
@@ -311,7 +316,9 @@ fn search_explain_matches_runtime_scalar_index_stats() {
             &mut session,
             &format!("EXPLAIN {lang_query}")
         )),
-        "index_equality",
+        // Issue #1066 PR #1155 との統合: 被覆される宣言列への等価述語は
+        // 使用索引名（`index=idx_lang`）も付く。
+        "index_equality index=idx_lang",
         "EXPLAIN must agree with the runtime index-scan path for lang"
     );
 
@@ -458,7 +465,12 @@ fn aggregate_explain_reflects_scalar_declaration_target() {
         &mut session,
         "EXPLAIN SELECT COUNT(*) AS n FROM docs WHERE lang = 'ja'",
     );
-    assert_eq!(scalar_plan_line(&lang_count), "index_equality");
+    // Issue #1066 PR #1155 との統合: `access_path: scalar_index_candidates`
+    // の集計 EXPLAIN で被覆される宣言列への等価述語は使用索引名も付く。
+    assert_eq!(
+        scalar_plan_line(&lang_count),
+        "index_equality index=idx_lang"
+    );
     assert_eq!(access_path_line(&lang_count), "scalar_index_candidates");
 
     let group_by_topic = explain_sql(

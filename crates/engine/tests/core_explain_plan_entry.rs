@@ -403,7 +403,9 @@ fn explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in() {
     )
     .expect("declare scalar index on lang only");
 
-    // 宣言列 `lang`: `index_equality` のまま。
+    // 宣言列 `lang`: `index_equality` のまま（Issue #1066 PR #1155 との
+    // 統合: 被覆される宣言列への等価述語は使用索引名 `index=idx_lang` も
+    // 付く）。
     let sql_outcome = core
         .execute_sql_in_session(
             &tenant_ctx,
@@ -412,7 +414,7 @@ fn explain_entry_reflects_scalar_declaration_target_with_hnsw_opt_in() {
         )
         .expect("EXPLAIN should succeed");
     let sql_lines = explain_result_lines(sql_outcome);
-    assert!(sql_lines.contains(&"scalar_plan: index_equality".to_string()));
+    assert!(sql_lines.contains(&"scalar_plan: index_equality index=idx_lang".to_string()));
 
     let entry_result = core.explain_bound_plan_in_session(
         &tenant_ctx,
