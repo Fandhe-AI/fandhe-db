@@ -194,10 +194,16 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   - 平均値長ゲート（Issue #632）・`2^53` ゲート（Issue #893）による列単位の
     実行時除外
   - 選択度による縮退（`CandidateResolution::FallbackSelectivity`）
-  - `ScalarIndex::resolve_candidates` の早期打ち切り（先に評価した宣言列の
-    候補が 0 件だと、後続の宣言外列を評価せず空の `Use` を返す場合がある）
-  これらはいずれも fail-closed に全走査（plain scan）へ倒れるだけで、RLS・
-  可視性・結果の正しさには影響しない。
+
+  この 2 つはいずれも fail-closed に全走査（plain scan）へ倒れるだけで、
+  RLS・可視性・結果の正しさには影響しない。
+
+  `ScalarIndex::resolve_candidates` の早期打ち切り（先に評価した宣言列・
+  `id` 述語の交差候補が 0 件になった時点で、以降の述語を評価せず打ち切る）
+  はこの 2 つとは性質が異なり、全走査への縮退ではない: 交差は述語を追加
+  するほど結果が単調非増加になるため、空集合との交差は以降の述語によらず
+  必ず空集合になり、`CandidateResolution::Use`（索引経路）のまま空の候補
+  集合を返す。索引経路を使い続けるだけで結果・RLS には影響しない。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
