@@ -244,7 +244,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // コメント追記）で行が移動したための追随（旧: 425）。
     // Issue #1077（`WriteTarget` の `InTxn` 経路の doc コメント更新・
     // `fk_check_mode` アクセサ追加）で行が移動したための追随（旧: 428）。
-    ("tenant.rs", 429),
+    // オーナー判断（2026-09-28・Issue #1075）: `TenantWriteError::
+    // CheckEvaluationFailed` を `SqlSurfaceError` 保持型へ是正した際の import・
+    // ドキュメンテーションコメント追加で行が移動したための追随（旧: 429）。
+    ("tenant.rs", 445),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

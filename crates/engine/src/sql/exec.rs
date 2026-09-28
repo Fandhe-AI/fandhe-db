@@ -3620,9 +3620,13 @@ pub(crate) fn map_write_error(
         TenantWriteError::CheckViolation { constraint } => {
             SqlSurfaceError::check_violation(constraint)
         }
-        TenantWriteError::CheckEvaluationFailed => SqlSurfaceError::Internal {
-            detail: "check constraint evaluation failed".to_string(),
-        },
+        // オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16
+        // ポインタ）: `XX000` へ丸めず、`CompiledChecks::enforce`（通常の式
+        // 評価と共有する `ExprProgram`）が返した `SqlSurfaceError` をそのまま
+        // 透過する。`inner` は既に `sql::allowlist::SqlSurfaceError` のため
+        // 変換不要（`tenant::TenantWriteError::CheckEvaluationFailed` のドキュ
+        // メント参照）。
+        TenantWriteError::CheckEvaluationFailed(inner) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
         // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
         // 取り違える。値・参照先の有無の理由を含まない固定文言。
@@ -4336,11 +4340,11 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::CheckViolation { constraint }) => {
             SqlSurfaceError::check_violation(constraint)
         }
-        IncrementalError::Write(TenantWriteError::CheckEvaluationFailed) => {
-            SqlSurfaceError::Internal {
-                detail: "check constraint evaluation failed".to_string(),
-            }
-        }
+        // オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16
+        // ポインタ）: 行形 INSERT（[`map_write_error`]）と同じく、ファイル形
+        // INSERT でも通常の式評価と同じ `SqlSurfaceError` をそのまま透過する
+        // （`_` 節の `XX000` へ丸めない）。
+        IncrementalError::Write(TenantWriteError::CheckEvaluationFailed(inner)) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）: ファイル形
         // `INSERT` の置換（`replace_typed_rows_by_text_key`）で旧チャンク行を削除しようと
         // して参照先側の検査に違反した場合、または新規チャンク行の参照元列が参照元側の
