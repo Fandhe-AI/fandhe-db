@@ -9825,6 +9825,102 @@ mod tests {
         }
     }
 
+    /// カタログ v9（制約名付き UNIQUE。`U:<name>:<cols>` 形式。TABLE-16・
+    /// TASK-204、Issue #1067）の往復と正規形の一意性を検証する
+    /// （`encode_decode_roundtrips_v10_with_foreign_key_options` の UNIQUE 側
+    /// 対応。レビュー指摘: Issue #1067 PR 差し戻し）。既定名（
+    /// `derive_unique_constraint_names` が導出する名前）と一致する UNIQUE は
+    /// v6 のバイト列のまま変わらず（正規形の一意性）、既定名と異なる実名を
+    /// 1 つでも持てば v9 で書かれてビット同一のスキーマへ戻る。
+    #[test]
+    fn encode_decode_roundtrips_v9_with_named_unique_constraint() {
+        let plain = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, true),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        );
+
+        let default_named =
+            plain
+                .clone()
+                .with_unique_constraints(vec![UniqueConstraint::with_name(
+                    "docs_a_key".to_string(),
+                    vec!["a".to_string()],
+                )]);
+        let encoded = encode_schema(&default_named).expect("encode");
+        assert!(encoded.starts_with(b"v6\n"));
+        assert_eq!(
+            decode_schema("docs", &encoded).expect("decode"),
+            default_named
+        );
+
+        let named = plain.with_unique_constraints(vec![
+            UniqueConstraint::with_name("custom_a_unique".to_string(), vec!["a".to_string()]),
+            UniqueConstraint::with_name("docs_b_key".to_string(), vec!["b".to_string()]),
+        ]);
+        let encoded = encode_schema(&named).expect("encode");
+        let text = std::str::from_utf8(&encoded).expect("utf8");
+        assert_eq!(
+            text,
+            "v9\ncols:2\npk:\na:text:-:1:L:-\nb:text:-:1:L:-\nuniq:2\n\
+             U:custom_a_unique:a\nU:docs_b_key:b\nchecks:0\nfks:0\n"
+        );
+        assert_eq!(decode_schema("docs", &encoded).expect("decode"), named);
+    }
+
+    /// v9 の破損した名前付き UNIQUE セクション（`U:<name>:<cols>` 形式）を
+    /// fail-closed に拒否する（`decode_v10_rejects_corrupt_or_all_default_foreign_key_section`
+    /// の UNIQUE 側対応。TABLE-16・TASK-204、Issue #1067）。名前が空・識別子
+    /// 形状違反・重複、および名前フィールドを持たない旧 v6〜v8 形式の `U:` 行
+    /// （コロン区切りが 1 つ足りない）はいずれも拒否する。
+    ///
+    /// 注記: v10 は「全 FK が既定オプション」という非正規形を decode 側でも
+    /// 拒否するが、v9 は「全 UNIQUE が既定名」の非正規形を decode 側では
+    /// 拒否しない（`encode_schema` がその形を生成しないだけで、手組みの v9
+    /// 値の decode 自体は許容する。既存の設計上の非対称であり、本テストは
+    /// この既定挙動を変更しない）。
+    #[test]
+    fn decode_v9_rejects_corrupt_named_unique_section() {
+        let head = "v9\ncols:2\npk:\nmood_col:enum:mood:1:L:-\npid:bigint:-:1:L:-\n".to_string();
+        let valid = format!("{head}uniq:1\nU:custom_key:mood_col\nchecks:0\nfks:0\n");
+        assert!(catalog_value_references_enum_type(valid.as_bytes(), "mood").expect("valid v9"));
+        let resolve = &mut |name: &str| -> Result<Arc<EnumTypeDef>> {
+            Ok(Arc::new(EnumTypeDef {
+                name: name.to_string(),
+                labels: vec!["x".to_string()],
+            }))
+        };
+        assert!(decode_schema_with_resolver("docs", valid.as_bytes(), resolve).is_ok());
+        let corrupt_values = [
+            // 名前が空。
+            format!("{head}uniq:1\nU::mood_col\nchecks:0\nfks:0\n"),
+            // 名前が識別子として不正（数字始まり）。
+            format!("{head}uniq:1\nU:1bad:mood_col\nchecks:0\nfks:0\n"),
+            // 制約名の重複。
+            format!("{head}uniq:2\nU:dup:mood_col\nU:dup:pid\nchecks:0\nfks:0\n"),
+            // 名前フィールドを持たない旧 v6〜v8 形式の `U:` 行（コロン不足）。
+            format!("{head}uniq:1\nU:mood_col\nchecks:0\nfks:0\n"),
+        ];
+        for corrupt in &corrupt_values {
+            assert!(
+                matches!(
+                    decode_schema_with_resolver("docs", corrupt.as_bytes(), resolve),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "decode must reject {corrupt:?}"
+            );
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type(corrupt.as_bytes(), "mood"),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "enum dependency parser must reject {corrupt:?}"
+            );
+        }
+    }
+
     /// `CHECK` が参照する列の `DROP COLUMN`・型変更は `DependentObjectsStillExist`
     /// で拒否し、参照しない列の削除は従来どおり成功する（制約を黙って弱めない）。
     #[test]
