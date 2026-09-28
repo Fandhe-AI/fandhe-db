@@ -194,7 +194,7 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   `aggregate_explain_from_bound`（現状 `self` を使わない静的関数）・
   `run_explain_plan` の 3 経路すべてに広げる設計変更（SQL／NoSQL 表層の
   bit 同一性テストの更新を伴う）になるため、宣言のみを対象にした部分修正は
-  行わず別 Issue の対象とする。
+  行わず別 Issue（#1153）の対象とする。
 - 疎索引（BM25）の宣言、NoSQL 表層の索引 DDL（[index-ddl-declaration.md]
   (index-ddl-declaration.md) の申し送りのまま）
 - 宣言による強制索引化（既存のゲート・`MIN_INDEXED_ROWS` を無視する経路は作らない）
@@ -216,9 +216,9 @@ HNSW の適格性ゲート（`catalog::hnsw_targeted_in_txn`）は**テーブル
   両方をそのカウンタでキー付けする（通常の行 DML による過剰無効化を避ける）。
   ただし新カウンタは commit_boundary 経由の全 4 経路で確実に進める必要があり
   （1 経路でも取りこぼすと、`declared` で stale な HNSW 宣言テーブル集合を
-  再利用し、宣言済み・削除済みの経路切り替えを取りこぼす）、永続フォーマット（新カウンタ未保持の既存 DB）との
-  互換性も設計する必要があるため、本 Issue では部分修正を行わず別 Issue
-  （`perf` 分類）の対象とする。
+  再利用し、宣言済み・削除済みの経路切り替えを取りこぼす）、永続フォーマット
+  （新カウンタ未保持の既存 DB）との互換性も設計する必要があるため、本 Issue
+  では部分修正を行わず別 Issue（#1154。`perf` 分類）の対象とする。
 
 ## 影響を受ける既存 fixture
 
