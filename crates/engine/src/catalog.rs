@@ -519,8 +519,14 @@ const CATALOG_FORMAT_VERSION_V10: &str = "v10";
 /// `MATCH`（`Full`）・遅延属性（`NotDeferrable` 以外。Issue #1077）の両方を
 /// 1 つのスキーマが同時に持つ場合に使う。本体（`pk:` 行・6 フィールド列行・
 /// 名前付き `uniq:` セクション）は v10 と同一のまま、`fks:` の `fk:` 行のみ
-/// `<col1,...>:<parent_table>:<pcol1,...>:<match>:<deferral>` の 5 フィールドへ
-/// 拡張する（フィールドの意味は v9 と同じ）。`fks:<k>` は **v11 に限り `k >= 1`
+/// `<col1,...>:<parent_table>:<pcol1,...>:<on_delete>:<on_update>:<match>:<deferral>`
+/// の 7 フィールドへ拡張する（`encode_foreign_key_section` が実際に書く形。
+/// フィールドの意味は v9 の新形式と同じ）。5 フィールド
+/// （`<col1,...>:<parent_table>:<pcol1,...>:<match>:<deferral>`。参照アクション
+/// フィールドを持たない）は Issue #1077 時点で書かれた**旧** v9 バイト列を
+/// 読むための読み取り専用の後方互換形であり（`parse_foreign_key_section`
+/// 参照）、v11 の書き込み形式ではない（codex-review P2 指摘・PR #1147）。
+/// `fks:<k>` は **v11 に限り `k >= 1`
 /// 必須**（既定オプションのみの FK しか無ければ UNIQUE の実名だけを理由に
 /// v10 のバイト列のまま書く。正規形の一意性）。`uniq:<n>` は v10 と同じく
 /// `n >= 1` 必須（この分岐に入るのは UNIQUE の実名を持つ場合のみのため）。
@@ -3991,8 +3997,10 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         // 保つため、`has_named_unique` を伴わない `has_fk_options` は下の
         // フォールバック枝で従来どおり v9 のまま書く**。Issue #1147）。
         // `FOREIGN KEY` が既定以外の `MATCH`・遅延属性を 1 件でも持つ場合のみ
-        // v11（[`CATALOG_FORMAT_VERSION_V11`]。`fk:` 行を 5 フィールドへ拡張）で
-        // 書き、それ以外は v10 のまま（[`CATALOG_FORMAT_VERSION_V10`]）。
+        // v11（[`CATALOG_FORMAT_VERSION_V11`]。`fk:` 行を 7 フィールドへ拡張。
+        // 5 フィールド形は Issue #1077 時点の旧 v9 バイト列を読むための読み取り
+        // 専用の後方互換形であり、書き込みには使わない。codex-review P2 指摘・
+        // PR #1147）で書き、それ以外は v10 のまま（[`CATALOG_FORMAT_VERSION_V10`]）。
         out.push_str(if has_fk_options {
             CATALOG_FORMAT_VERSION_V11
         } else {
