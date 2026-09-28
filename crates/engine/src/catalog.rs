@@ -463,14 +463,42 @@ fn hnsw_catalog_summary_in_txn(read_txn: &redb::ReadTransaction) -> Result<HnswC
 /// 経由）の全呼び出し元が共有する。
 pub(crate) struct IndexCatalogGateCache {
     state: std::sync::Mutex<Option<(u64, std::sync::Arc<HnswCatalogSummary>)>>,
+    /// [`hnsw_targeted_in_txn`] がカタログ全件走査（世代取得・走査上限超過・
+    /// デコード失敗のいずれか）に失敗し `false`（brute-force へ fail-closed 縮退）
+    /// を返した回数（codex-review Low 指摘対応・Issue #1065）。挙動自体は
+    /// 常に安全側（厳密結果）だが、カタログ破損等の異常が運用上観測できるよう
+    /// `scalar_index::ScalarIndexCache::build_failures` と同方針で計上する。
+    gate_read_failures: std::sync::atomic::AtomicU64,
 }
 
 impl IndexCatalogGateCache {
     pub(crate) fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(None),
+            gate_read_failures: std::sync::atomic::AtomicU64::new(0),
         }
     }
+
+    /// 現在の観測用統計を返す（`EngineCore::index_catalog_gate_cache_stats` の
+    /// 唯一の呼び出し元）。テナント ID・行データ等の機微情報は含まない。
+    pub(crate) fn stats(&self) -> IndexCatalogGateCacheStats {
+        IndexCatalogGateCacheStats {
+            gate_read_failures: self
+                .gate_read_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// [`IndexCatalogGateCache`] の現在の統計（codex-review Low 指摘対応・
+/// Issue #1065）。テスト・運用観測用であり、`VectorCore` trait には載せない
+/// 固有 API として `EngineCore::index_catalog_gate_cache_stats` からのみ公開する
+/// （`ScalarIndexCacheStats`・`HnswIndexCacheStats` と同方針）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexCatalogGateCacheStats {
+    /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗により brute-force へ
+    /// fail-closed 縮退した回数。
+    pub gate_read_failures: u64,
 }
 
 /// [`IndexCatalogGateCache`] を経由して [`HnswCatalogSummary`] を取得する。
@@ -536,7 +564,12 @@ pub(crate) fn hnsw_targeted_in_txn(
     }
     match cached_hnsw_catalog_summary_in_txn(read_txn, gate_cache) {
         Ok(summary) => !summary.hnsw_anywhere || summary.hnsw_tables.contains(table),
-        Err(_) => false,
+        Err(_) => {
+            gate_cache
+                .gate_read_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
     }
 }
 
@@ -6608,6 +6641,49 @@ mod tests {
         storage.drop_index("idx_hnsw_docs").expect("drop index");
         assert!(targeted("docs"));
         assert!(targeted("sibling"));
+    }
+
+    /// [`hnsw_targeted_in_txn`] がカタログ読み取り失敗（デコード失敗）で
+    /// fail-closed 縮退（`false`）した回数を [`IndexCatalogGateCache::stats`] の
+    /// `gate_read_failures` に計上することを固定する（codex-review Low 指摘対応・
+    /// Issue #1065。挙動自体〔brute-force への縮退〕は既存動作のままで、観測用
+    /// カウンタのみを追加する）。
+    #[test]
+    fn hnsw_targeted_in_txn_records_gate_read_failure_on_corrupt_catalog_entry() {
+        let (storage, _guard) = index_fixture_storage("index-gate-cache-read-failure");
+        let gate_cache = IndexCatalogGateCache::new();
+
+        // 索引カタログテーブルへ直接、デコード不能な値を書き込み走査失敗を再現する
+        // （`decode_index_def` の破損検出はテスト
+        // `index_def_round_trips_and_rejects_corruption` で別途固定済み）。
+        {
+            let write_txn = storage.db().begin_write().expect("begin write");
+            {
+                let mut index_table = write_txn
+                    .open_table(INDEX_CATALOG_TABLE)
+                    .expect("open index catalog table");
+                index_table
+                    .insert("idx_corrupt", &b"\xff\xfe"[..])
+                    .expect("insert corrupt entry");
+            }
+            write_txn.commit().expect("commit corrupt entry");
+        }
+
+        assert_eq!(gate_cache.stats().gate_read_failures, 0);
+        let read_txn = storage.db().begin_read().expect("begin read");
+        assert!(!hnsw_targeted_in_txn(&read_txn, &gate_cache, "docs", true));
+        assert_eq!(gate_cache.stats().gate_read_failures, 1);
+
+        // 縮退は fail-closed のたびに計上される（キャッシュへは書き込まれないため
+        // 毎回走査を再試行し、そのたびに失敗が増える）。
+        let read_txn2 = storage.db().begin_read().expect("begin read (2)");
+        assert!(!hnsw_targeted_in_txn(
+            &read_txn2,
+            &gate_cache,
+            "sibling",
+            true
+        ));
+        assert_eq!(gate_cache.stats().gate_read_failures, 2);
     }
 
     /// クエリが使っているのと同一の `read_txn`（スナップショット）を先に開いてから

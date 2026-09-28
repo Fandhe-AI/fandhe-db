@@ -1749,6 +1749,17 @@ impl EngineCore {
             .unwrap_or_default()
     }
 
+    /// `catalog::IndexCatalogGateCache` の現在の統計を返す（codex-review Low
+    /// 指摘対応・Issue #1065。テスト・運用観測用）。HNSW 適格性ゲート
+    /// （`catalog::hnsw_targeted_in_txn`）がカタログ読み取り失敗で brute-force へ
+    /// fail-closed 縮退した回数（`gate_read_failures`）のみを持ち、テナント ID・
+    /// 行データ等の機微情報は含まない。`VectorCore` trait には載せない固有
+    /// メソッド（`core_api.snapshot` の対象外。`hnsw_index_cache_stats` と同じ
+    /// 方針）。
+    pub fn index_catalog_gate_cache_stats(&self) -> crate::catalog::IndexCatalogGateCacheStats {
+        self.index_catalog_gate_cache.stats()
+    }
+
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
     /// 差し替えたビルダーを返す（TASK-162・SEARCH-9）。所有権を消費するビルダー
     /// メソッドとし、`&mut self` セッターは公開しない（構築後に一部だけ差し替えて
