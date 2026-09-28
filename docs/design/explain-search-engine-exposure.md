@@ -240,6 +240,79 @@ bound-plan-session-entry.md` 追記節参照）を SQL `EXPLAIN` アームと共
 縮退・カーディナリティを出さない）は NoSQL 表層から見ても不変である。
 NoSQL 表層が独自の行・語彙を追加することはない。
 
+## 追記（Issue #1066: 使用索引名の露出）
+
+宣言済み索引（Issue #908・#1065・TASK-206・INDEX-7）が経路に載る場合、
+`ann_plan:`／`scalar_plan:` 行の末尾へ条件付きサフィックス
+`index=<name>[,<name>...]`（昇順ソート・重複排除・`,` 区切り。索引名は
+`catalog::validate_identifier` を満たすため区切り文字と衝突しない）を追記
+する。既存行の追加・順序変更はしない安定契約で、条件を満たさない場合は
+既存出力と完全に同一（既定エンジン・宣言なし時はビット同一のまま）。
+
+- **ann**: `ann_plan` が `hnsw_full_visible`／`hnsw_subset` かつ
+  `--hnsw-scope declared`（`HnswScope::Declared`）のときだけ、対象テーブルの
+  `USING hnsw` 宣言すべて。`HnswScope::All` では宣言の有無が
+  `catalog::hnsw_targeted_in_txn` の適格性判定に一切影響しない（#1065 の
+  不変条件）ため、宣言があっても索引名は付けない（codex-review P1 指摘対応・
+  Issue #1066 PR #1155。「宣言の追加・削除だけで実行経路が変わらないのに
+  使用索引名表示が変わる」という「使用索引を示す」契約との矛盾を避けるため、
+  適格性そのものが宣言に依存する `Declared` scope に限定した）
+- **scalar**: 宣言の有効化スイッチ（起動時 HNSW opt-in）が有効・
+  `scalar_plan` が `plain_scan` 以外・`WHERE` の索引対応述語
+  （`metadata_filters`）が参照する列**すべて**がいずれかのスカラー宣言で
+  被覆されている場合のみ、被覆に用いる宣言集合（複数可）。1 列でも
+  非被覆なら索引名は付けない。`id` 述語（常設の暗黙索引で宣言索引ではない）
+  は対象外。実行側 `catalog::declared_index_targets_in_txn` は宣言名を捨て
+  対象テーブルの全スカラー宣言列を和集合した単一の索引を構築するため（宣言別
+  の個別経路は無い）、述語列を複数の宣言が重複して覆う場合は貪欲法（残り
+  未被覆列を最も多く覆う宣言から、同数なら名前の昇順）で選んだ被覆集合
+  だけを表示し、個別使用経路の無い宣言まで表示しない（codex-review P1
+  指摘対応・Issue #1066 PR #1155）。**この被覆集合は貪欲法による選択であり、
+  被覆に必要な宣言数がグローバルに最小であることは保証しない**（2 巡目
+  codex-review P1 指摘対応・Issue #1066 PR #1155。反例: 列 a..h・宣言
+  idx_a=(a,b,c,d)／idx_b=(a,b,e,f)／idx_c=(c,d,g,h) に対し述語列が a..h
+  全列のとき、貪欲法は idx_a・idx_b・idx_c の 3 件を選ぶが idx_b＋idx_c の
+  2 件でも被覆できる）。真の最小集合被覆は NP-hard であり、被覆元の
+  `WHERE` 述語列はクライアントが調整可能な非信頼入力のため、厳密解を
+  指数時間で求める実装は計算量 DoS 経路になり得る（`coding-rust.md`
+  「untrusted 入力の扱い」）。そのため契約は「述語列を被覆するために必要な
+  最小の宣言集合」ではなく「述語列を被覆する宣言集合（貪欲法選択）」と
+  定義する
+- **付与条件は静的判定のみで、実行時の索引使用を保証しない**（2 巡目
+  codex-review P1 指摘対応・Issue #1066 PR #1155）: 上記 ann／scalar いずれの
+  `index=` も「宣言上の候補索引名」であり、実行側 `sql::scalar_index::
+  ScalarIndex::resolve_candidates` が選択度超過（`CandidateResolution::
+  FallbackSelectivity`）・候補取得不能（`FallbackNoIndex`）で全走査へ
+  縮退した場合も `index=` はそのまま付く。この縮退は可視行数・カーディナ
+  リティという行データ依存の実行時値によって決まるため、`EXPLAIN` が
+  これを観測するには索引の構築・照会という「決定 1」節で明示的に禁止した
+  実行副作用が必要になり、かつ縮退の有無自体がテナントのカーディナリティを
+  示す副チャネルになる（上記「露出しない値」節の「実行時縮退結果」と同区分）。
+  そのため `EXPLAIN` は意図的にこれを反映しない
+- 集計 EXPLAIN では `access_path: scalar_index_candidates` のときだけ
+  `scalar_plan:` に名前が付く（`scalar_index_group_enumeration`・
+  `full_scan` には付けない）
+- テナント存在情報（行数・可視カーディナリティ・実行時縮退結果）は
+  従来どおり一切含めない。付与条件はクエリ形状・エンジン設定・カタログ
+  宣言（DDL 権限者のみが変更可能な全テナント共有メタデータ）だけで決まり、
+  行データ・`PolicyContext` に依存しないため、テナント間で出力は同一
+  （NoSQL 表層〔`explain_bound_search_in_session`／
+  `explain_bound_aggregate_in_session`〕も同じ判定を共有し行単位で一致）
+- `scalar_plan:` トークン自体を宣言除外・平均値長等の実行時ゲートへ
+  合わせる変更は対象外のまま（別 Issue の管轄。本 Issue はトークンを
+  変えずに索引名の注記を付けるだけ）
+- **索引名注記は束縛に使ったスキーマと同一スナップショットの索引宣言だけを
+  見る**（3 巡目 codex-review P1 指摘対応・Issue #1066 PR #1155）:
+  `run_search_explain`／`run_explain_plan`（`USING PLAN`）／
+  `run_relational_explain_aggregate` はいずれも `read_txn_with_schema` で
+  開いた読み取りトランザクションを保持し続け、`explain_engine_for`・
+  `aggregate_explain_from_bound` の索引宣言読み取り
+  （`catalog::explain_index_names_in_txn`）へその同じ参照を渡す（新規に
+  `begin_read()` し直さない）。これにより束縛時スキーマの取得と索引宣言の
+  読み取りが単一スナップショットに統一され、両者の間に `DROP INDEX`／
+  `CREATE INDEX`／テーブル再作成がコミットされても、旧スキーマで束縛した
+  述語に新しい宣言の `index=` が付いて実際の計画と食い違うことがない
+
 ## ポインタ
 
 SQL-6・SQL-27・TASK-78・CORE-9・CORE-10・CORE-12・TASK-132・SEARCH-9・

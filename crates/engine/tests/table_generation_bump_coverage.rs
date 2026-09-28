@@ -141,26 +141,30 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1073（UNIQUE 制約の対象型拡張。`is_unique_constraint_allowed`・
     // `unique_key_tag`・型ごとの正準キー生成のドキュメンテーションコメント
     // 追加）で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4676）。
-    // Issue #1077（`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）で
-    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4713）。
-    // Issue #1078（`reject_constrained_table_for_raw_write` ガード追加）・
-    // Issue #1079（`validate_row_embedding_dim` 経路への doc コメント更新）で
-    // `catalog.rs` 冒頭側の行数が動き、再度追随（旧: 4924）。
-    // Issue #1070（永続一意索引化。`unique_index` モジュール追加）の base 取り込み
-    // マージで `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4923）。
-    // Issue #1076（`FOREIGN KEY` の参照アクション）・PR #1138 codex-review
-    // 指摘対応（カタログ v9 `fk:` 行の後方互換パーサー追加）と Issue #1071
-    // （`FOREIGN KEY` 参照整合性検査の索引化。`Storage::drop_table` への
-    // `key_index::drop_indexes_for_table_in_txn` 追加）を統合するマージで
-    // `catalog.rs` 冒頭側（`create_enum_type` より前）にさらに行が追加され、
-    // 再度追随（旧: 4973／5136／5172）。Issue #1067（`ALTER TABLE ADD／DROP
-    // CONSTRAINT UNIQUE` と制約名）・Issue #1147（同上。v9 互換性破壊の修正で
-    // v10／v11 を新設）・Issue #1065（索引宣言を ScalarIndex・HNSW 索引の
-    // 構築対象へ反映。PR #1124）の base（main）取り込みマージ統合で再度追随
-    // （旧: 5222）。
-    // Issue #1154（索引カタログ専用世代カウンタの追加）で `catalog.rs` 冒頭側に
-    // 行が追加され、再度追随（旧: 5988）。
-    ("catalog.rs", 6062),
+    // Issue #1076（`FOREIGN KEY` の参照アクション）・Issue #1077（`MATCH`・
+    // 遅延属性フィールド追加。カタログ v10 の新設）の統合マージで
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4713／4912）。
+    // PR #1138 codex-review 指摘対応（Issue #1076。カタログ v9 `fk:` 行の
+    // 5／7 フィールド後方互換パーサー追加）で `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 5099）。Issue #1079（同上。base 取り込みマージで
+    // `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5132）。
+    // Issue #1067 レビュー対応（`alter_table_drop_constraint` の添字アクセスを
+    // `get()` に置換）で `catalog.rs` 冒頭側に行が追加され、再度追随。
+    // Issue #1147（codex-review／Cursor Bugbot 指摘: 本 PR〔#1067〕が main
+    // 既存の v9〔#1076／#1077 の FK オプション形式〕を UNIQUE 制約名の意味で
+    // 再定義していた互換性破壊の修正。v9 の意味を維持したまま v10／v11 を
+    // 新設し、本 PR の base（main）取り込みマージで両系統の版選択ロジックを
+    // 統合したことで `catalog.rs` 冒頭側の行数が変化）で再度追随（旧: 5656）。
+    // codex-review 指摘対応（PR #1147。v11 `fk:` 行フィールド数コメント訂正）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 5656）。Issue #1065
+    // （索引宣言を ScalarIndex・HNSW 索引の構築対象へ反映。PR #1124）との
+    // base（main）取り込みマージで再度追随。Issue #1066（`EXPLAIN` の
+    // scalar_plan／ann_plan への使用索引名露出。`explain_index_names_in_txn`・
+    // `TableIndexDecls` 追加で `catalog.rs` 冒頭側に行が追加され、再度追随
+    // （旧: 5938）。Issue #1154（索引カタログ専用世代カウンタの追加）との
+    // base（main）取り込みマージで `catalog.rs` 冒頭側に行が追加され、
+    // 再度追随（旧: 6046）。
+    ("catalog.rs", 6120),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -186,19 +190,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4217）。Issue #1067（同上）で再度追随。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4755）。
-    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
-    // で再度追随（旧: 4792）。
-    // Issue #1078（同上。`reject_constrained_table_for_raw_write` ガード追加）・
-    // Issue #1079（同上。`catalog.rs` 冒頭側の行数が動き）再度追随（旧: 5003）。
-    // Issue #1070（永続一意索引化）の base 取り込みマージで再度追随（旧: 5002）。
-    // Issue #1076／PR #1138 codex-review 指摘対応（参照アクション・カタログ v9
-    // `fk:` 行の後方互換パーサー追加）と Issue #1071（同上。`Storage::drop_table`
-    // への `key_index` 削除呼び出し追加）を統合するマージでさらに追随
-    // （旧: 5052／5215／5251）。Issue #1067・Issue #1147・Issue #1065（同上）の
-    // base（main）取り込みマージ統合で再度追随（旧: 5301）。
-    // Issue #1154（同上）で `catalog.rs` 冒頭側に行が追加され、再度追随
-    // （旧: 6067）。
-    ("catalog.rs", 6141),
+    // Issue #1076／#1077（同上。参照アクション・`MATCH`・遅延属性フィールド
+    // 追加。カタログ v10 の新設の統合マージ）で再度追随（旧: 4792／4991）。
+    // PR #1138 codex-review 指摘対応（同上。カタログ v9 `fk:` 行の後方互換
+    // パーサー追加）で再度追随（旧: 5178）。Issue #1079（同上。base 取り込み
+    // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5211）。
+    // Issue #1067 レビュー対応（同上。`get()` 置換）で再度追随。
+    // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
+    // 変化）で再度追随（旧: 5735）。codex-review 指摘対応（同上）で再度追随
+    // （旧: 5743）。Issue #1065（同上）との base（main）取り込みマージで
+    // 再度追随。Issue #1066（同上。`explain_index_names_in_txn` 追加）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 6017）。Issue #1154
+    // （同上）との base（main）取り込みマージで `catalog.rs` 冒頭側に行が
+    // 追加され、再度追随（旧: 6125）。
+    ("catalog.rs", 6199),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -216,19 +221,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4298）。Issue #1067（同上）で再度追随。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4836）。
-    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
-    // で再度追随（旧: 4873）。
-    // Issue #1078（同上。`reject_constrained_table_for_raw_write` ガード追加）・
-    // Issue #1079（同上。`catalog.rs` 冒頭側の行数が動き）再度追随（旧: 5084）。
-    // Issue #1070（永続一意索引化）の base 取り込みマージで再度追随（旧: 5083）。
-    // Issue #1076／PR #1138 codex-review 指摘対応（参照アクション・カタログ v9
-    // `fk:` 行の後方互換パーサー追加）と Issue #1071（同上。`Storage::drop_table`
-    // への `key_index` 削除呼び出し追加）を統合するマージでさらに追随
-    // （旧: 5133／5296／5332）。Issue #1067・Issue #1147・Issue #1065（同上）の
-    // base（main）取り込みマージ統合で再度追随（旧: 5382）。
-    // Issue #1154（同上）で `catalog.rs` 冒頭側に行が追加され、再度追随
-    // （旧: 6148）。
-    ("catalog.rs", 6222),
+    // Issue #1076／#1077（同上。参照アクション・`MATCH`・遅延属性フィールド
+    // 追加。カタログ v10 の新設の統合マージ）で再度追随（旧: 4873／5072）。
+    // PR #1138 codex-review 指摘対応（同上。カタログ v9 `fk:` 行の後方互換
+    // パーサー追加）で再度追随（旧: 5259）。Issue #1079（同上。base 取り込み
+    // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5292）。
+    // Issue #1067 レビュー対応（同上。`get()` 置換）で再度追随。
+    // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
+    // 変化）で再度追随（旧: 5816）。codex-review 指摘対応（同上）で再度追随
+    // （旧: 5824）。Issue #1065（同上）との base（main）取り込みマージで
+    // 再度追随。Issue #1066（同上。`explain_index_names_in_txn` 追加）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 6098）。Issue #1154
+    // （同上）との base（main）取り込みマージで `catalog.rs` 冒頭側に行が
+    // 追加され、再度追随（旧: 6206）。
+    ("catalog.rs", 6280),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -251,14 +257,20 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1079（同上。`catalog.rs` 冒頭側の行数が動き）再度追随（旧: 5117）。
     // Issue #1070（永続一意索引化）の base 取り込みマージで再度追随（旧: 5116）。
     // Issue #1076（`FOREIGN KEY` の参照アクション。`ReferentialAction` 列挙・
-    // `fk:` 行フィールド追加）・PR #1138 codex-review 指摘対応（カタログ v9
-    // `fk:` 行の後方互換パーサー追加）と Issue #1071（同上。`Storage::drop_table`
-    // への `key_index` 削除呼び出し追加）を統合するマージでさらに追随
-    // （旧: 5166／5329／5365）。Issue #1067・Issue #1147・Issue #1065（同上）の
-    // base（main）取り込みマージ統合で再度追随（旧: 5415）。
-    // Issue #1154（同上）で `catalog.rs` 冒頭側に行が追加され、再度追随
-    // （旧: 6181）。
-    ("catalog.rs", 6255),
+    // `fk:` 行フィールド追加）・Issue #1077（`MATCH`・遅延属性フィールド追加。
+    // カタログ v10 の新設）の統合マージで再度追随（旧: 4906）。
+    // PR #1138 codex-review 指摘対応（同上。カタログ v9 `fk:` 行の後方互換
+    // パーサー追加）で再度追随（旧: 5292）。Issue #1079（同上。base 取り込み
+    // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5325）。
+    // Issue #1067 レビュー対応（同上。`get()` 置換）で再度追随。
+    // Issue #1147（同上。v9 互換性破壊の修正で `catalog.rs` 冒頭側の行数が
+    // 変化）で再度追随（旧: 5849）。codex-review 指摘対応（同上）で再度追随
+    // （旧: 5857）。Issue #1065（同上）との base（main）取り込みマージで
+    // 再度追随。Issue #1066（同上。`explain_index_names_in_txn` 追加）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 6131）。Issue #1154
+    // （同上）との base（main）取り込みマージで `catalog.rs` 冒頭側に行が
+    // 追加され、再度追随（旧: 6239）。
+    ("catalog.rs", 6313),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

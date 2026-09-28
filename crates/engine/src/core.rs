@@ -238,6 +238,20 @@ pub struct PrefilterCacheStats {
     pub entries: usize,
 }
 
+/// [`EngineCore::explain_index_name_scans`] の観測用統計（Issue #1066
+/// codex-review P2 指摘対応・PR #1155 4 巡目）。テナント ID・索引名等の機微
+/// 情報は一切含まない（カウンタのみ）。`VectorCore` trait には載せない固有 API
+/// （`EngineCore::explain_index_name_scan_stats`）としてのみ公開する
+/// （`core_api.snapshot` の対象外。`PrefilterCacheStats` と同じ方針）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExplainIndexNameScanStats {
+    /// `catalog::explain_index_names_in_txn` によるカタログ全件走査が
+    /// [`EngineCore::read_explain_index_names_in_txn`] 経由で実際に呼ばれた
+    /// 累計回数。索引名を最終的に表示しない `EXPLAIN` 呼び出しではこの値が
+    /// 増えないことを `tests/explain_index_names.rs` で固定する。
+    pub scans: u64,
+}
+
 /// [`PrefilterCache`] の 1 エントリ（TASK-169）。`table`・`ctx` の組がキャッシュキー
 /// （`PolicyContext` は `Hash` を実装しないため `HashMap` ではなく `Vec` 線形走査で
 /// 照合する。エントリ数は [`MAX_PREFILTER_CACHE_ENTRIES`] で小さく抑えるため走査コストは
@@ -1170,6 +1184,15 @@ pub struct EngineCore {
     /// `HnswScope::All`＝全テーブル。[`Self::with_hnsw_scope`] でのみ差し替える）。
     /// `hnsw_state` が `None`（opt-in なし）の構築では参照されない。
     hnsw_scope: crate::search_engine::HnswScope,
+    /// [`Self::read_explain_index_names_in_txn`]（`catalog::explain_index_names_
+    /// in_txn` の唯一の呼び出し経路。[`Self::explain_engine_for`]・
+    /// [`Self::aggregate_explain_from_bound`] の両方が経由する）が実際にカタログ
+    /// 全件走査を行った累計回数（Issue #1066 codex-review P2 指摘対応・
+    /// PR #1155 4 巡目）。索引名を最終的に表示しない呼び出し（述語なし・
+    /// `HnswScope::All`・`scalar_plan` が `PlainScan` 等）で走査が省略されて
+    /// いることをテストから観測できるようにするための observability 専用
+    /// カウンタで、検索結果・`EXPLAIN` 出力には影響しない。
+    explain_index_name_scans: std::sync::atomic::AtomicU64,
 }
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
@@ -1535,6 +1558,118 @@ impl crate::sql::allowlist::TableLookup for InsertSchemaLookup<'_> {
     }
 }
 
+/// `metadata_filters` が参照する列インデックス
+/// （[`crate::declarative_filter::MetadataFilter::column_index`]）を、束縛に
+/// 使った `schema` で列名へ写像する（Issue #1066）。`EXPLAIN` の
+/// `scalar_plan:` 行への使用索引名注記——`EngineCore::explain_engine_for` の
+/// 被覆判定——専用のヘルパーで、`sql::exec` の実行経路（索引消費の判定は
+/// `MetadataFilter` の値そのものを使い、列名へは写像しない）には影響しない。
+/// 添字が `schema.columns` の範囲外（構造上到達しないはずだが多層防御）の
+/// 列が 1 つでもあれば `None`（呼び出し元は索引名を出さない側へ fail-closed
+/// に倒す）。`metadata_filters` が空なら `Some(Vec::new())`（「フィルタなし」
+/// と「列名を確定できない」を区別する）。
+fn metadata_filter_column_names<'a>(
+    schema: &'a crate::catalog::TableSchema,
+    metadata_filters: &[crate::declarative_filter::MetadataFilter],
+) -> Option<Vec<&'a str>> {
+    let mut names = Vec::with_capacity(metadata_filters.len());
+    for f in metadata_filters {
+        let col = schema.columns.get(f.column_index())?;
+        names.push(col.name.as_str());
+    }
+    Some(names)
+}
+
+/// `column_names` の**全列**がいずれかのスカラー索引宣言（`(名前, 対象列)`。
+/// [`crate::catalog::TableIndexDecls::scalar`]）で被覆されている場合に限り、
+/// 被覆に用いる宣言の名前（貪欲法選択・グローバルな最小性は保証しない。
+/// 昇順・重複排除は呼び出し元 [`crate::sql::explain::ExplainIndexNames::new`]
+/// に委ねる）を返す（Issue #1066）。被覆されない列が 1 つでもあれば空 `Vec`。
+///
+/// **契約は「静的な宣言上の候補」であり「実行時に実際に使われた索引」の
+/// 保証ではない**（2 巡目 codex-review P1 指摘対応・Issue #1066 PR #1155）。
+/// 実行側 `sql::scalar_index::ScalarIndex::resolve_candidates` は候補
+/// スロット比率が閾値を超える場合（`CandidateResolution::FallbackSelectivity`）
+/// や候補取得不能な場合（`FallbackNoIndex`）に索引経由を諦め全走査へ縮退
+/// するが、この縮退は可視行数・カーディナリティに依存する実行時値であり、
+/// `EXPLAIN` はテーブル内容に一切依存しない静的判定のみを報告する既存契約
+/// （`docs/design/explain-search-engine-exposure.md`「決定 1」節）のため
+/// ここでは反映しない。反映するには `EXPLAIN` 自体が索引を構築し行データに
+/// 依存する選択度を観測する必要があり、実行の副作用禁止契約に反すると同時に
+/// テナントのカーディナリティを索引名の有無という副チャネルで漏らしうる
+/// （同 doc「露出しない値」節の「実行時縮退結果」と同区分）。詳細は同 doc
+/// 「Issue #1066」節参照。
+fn scalar_index_names_for_columns(
+    scalar_decls: &[(String, Vec<String>)],
+    column_names: &[&str],
+) -> Vec<String> {
+    if column_names.is_empty() {
+        return Vec::new();
+    }
+    let all_covered = column_names.iter().all(|col| {
+        scalar_decls
+            .iter()
+            .any(|(_, cols)| cols.iter().any(|c| c == col))
+    });
+    if !all_covered {
+        return Vec::new();
+    }
+    // codex-review P1 指摘対応（Issue #1066 PR #1155）: 実行側
+    // `catalog::declared_index_targets_in_txn` は宣言名を捨て、対象テーブルの
+    // 全スカラー宣言の列を和集合した単一の `ScalarIndex` を構築する（宣言別に
+    // 個別の実行経路は存在しない）。そのため「述語列と 1 列でも交差する宣言を
+    // 全て返す」だけでは、同じ列を複数宣言が重複して覆う場合に実行側で個別に
+    // 使われない宣言まで「使用索引名」として表示してしまう。ここでは表示を
+    // 「述語列を被覆する宣言集合」へ縮退させ、貪欲法（残り未被覆列を最も多く
+    // 覆う宣言から、同数なら名前の昇順で）で選ぶ。
+    //
+    // 2 巡目 codex-review P1 指摘対応（Issue #1066 PR #1155）: 貪欲法は
+    // 「被覆に必要な宣言数が最小」であることを保証しない（反例: 列
+    // a..h、宣言 idx_a=(a,b,c,d)・idx_b=(a,b,e,f)・idx_c=(c,d,g,h) に対し
+    // 述語列が a..h 全列のとき、貪欲法は最初に idx_a（4 列被覆）を選び
+    // idx_a+idx_b+idx_c の 3 件を表示するが、idx_b+idx_c の 2 件でも
+    // a..h 全列を被覆できる）。真の最小被覆集合の算出は NP-hard な
+    // 厳密集合被覆問題であり、EXPLAIN はクエリ形状から決まる `WHERE` 述語列
+    // （攻撃者が調整可能な入力）を被覆元に使うため、厳密解を指数時間で
+    // 求める実装は非信頼入力に対する計算量 DoS 経路になり得る
+    // （`coding-rust.md`「untrusted 入力の扱い」）。そのためここでは貪欲法を
+    // 意図的に維持し、契約を「述語列を被覆するために必要な最小の宣言集合」
+    // ではなく「述語列を被覆する宣言集合（貪欲法による選択。グローバルな
+    // 最小性は保証しない）」と定義し直す（`docs/design/
+    // explain-search-engine-exposure.md`「Issue #1066」節に追記）。
+    // 列被覆が重複しない既存ケース（単一列・列ごとに別宣言）では従来と同じ
+    // 結果になる。
+    let mut remaining: Vec<&str> = column_names.to_vec();
+    remaining.sort_unstable();
+    remaining.dedup();
+    let mut chosen: Vec<String> = Vec::new();
+    while !remaining.is_empty() {
+        let Some((name, covers)) = scalar_decls
+            .iter()
+            .map(|(name, cols)| {
+                let covers: Vec<&str> = remaining
+                    .iter()
+                    .copied()
+                    .filter(|col| cols.iter().any(|c| c == col))
+                    .collect();
+                (name, covers)
+            })
+            .filter(|(_, covers)| !covers.is_empty())
+            .max_by(|(name_a, covers_a), (name_b, covers_b)| {
+                covers_a
+                    .len()
+                    .cmp(&covers_b.len())
+                    .then_with(|| name_b.cmp(name_a))
+            })
+        else {
+            break;
+        };
+        chosen.push(name.clone());
+        remaining.retain(|col| !covers.contains(col));
+    }
+    chosen
+}
+
 impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
@@ -1695,6 +1830,7 @@ impl EngineCore {
             hnsw_state,
             index_catalog_gate_cache: crate::catalog::IndexCatalogGateCache::new(),
             hnsw_scope: crate::search_engine::HnswScope::default(),
+            explain_index_name_scans: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1771,6 +1907,22 @@ impl EngineCore {
     /// と同じ方針）。
     pub fn index_catalog_gate_cache_stats(&self) -> crate::catalog::IndexCatalogGateCacheStats {
         self.index_catalog_gate_cache.stats()
+    }
+
+    /// [`Self::explain_index_name_scans`] の現在の統計を返す（Issue #1066
+    /// codex-review P2 指摘対応・PR #1155 4 巡目。テスト・運用観測用）。索引名を
+    /// 最終的に表示しない `EXPLAIN` 呼び出しでカタログ全件走査
+    /// （`catalog::explain_index_names_in_txn`）が省略されていることを
+    /// `tests/explain_index_names.rs` から固定するために使う。テナント ID・
+    /// 索引名等の機微情報は含まない。`VectorCore` trait には載せない固有
+    /// メソッド（`core_api.snapshot` の対象外。`index_catalog_gate_cache_stats`
+    /// と同じ方針）。
+    pub fn explain_index_name_scan_stats(&self) -> ExplainIndexNameScanStats {
+        ExplainIndexNameScanStats {
+            scans: self
+                .explain_index_name_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
@@ -4827,6 +4979,15 @@ impl EngineCore {
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("failed to read table generation: {e}"),
             })?;
+        // Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応: `post_check_txn`
+        // はここで drop せず [`Self::explain_engine_for`] へ渡すまで保持する
+        // （Issue #1153 の `resolve_scalar_index_target_in_txn` 呼び出しも同じ
+        // `post_check_txn` を使い、その後 `drop` するのは `explain_engine_for`
+        // 呼び出し後まで遅らせる）。世代照合済みの `post_check_schema` と同一
+        // スナップショットで索引宣言を読むことで、世代照合からここまでの間に
+        // 新たな `DROP INDEX`／`CREATE INDEX` がコミットされても、束縛に
+        // 使ったスキーマと異なる世代の索引宣言を注記しない（[`Self::
+        // explain_engine_for`] のドキュメンテーションコメント参照）。
         if current_generation != planning_generation {
             drop(post_check_txn);
             return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -4842,18 +5003,49 @@ impl EngineCore {
         // カタログ）から解決する。`CREATE INDEX`／`DROP INDEX` は対象テーブルの
         // 世代を進める（`catalog::create_index`／`drop_index`）ため、世代一致は
         // 「この読み取りの宣言が `bind` 時点のスキーマと矛盾しない」ことを
-        // 保証する。`drop(post_check_txn)` より前に解決すること。
+        // 保証する。`post_check_txn` はここでは drop しない（Issue #1066
+        // PR #1155 3 巡目対応で [`Self::explain_engine_for`] へも同じ
+        // スナップショットを渡す契約のため、そこまで生かし続ける。下記
+        // `explain_engine_for` 呼び出し直後にまとめて drop する）。
         let target = crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
             &post_check_txn,
             table,
             self.hnsw_state.is_some(),
         );
-        drop(post_check_txn);
 
         // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する（多層防御。
         // `Statement::Select` アームの `USING PLAN` 経路と同じ理由）。
         dictionary_required_columns(&post_check_schema)
             .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+        // Issue #1066: `scalar_plan:` 行へ使用索引名を注記するため、
+        // `explain_shape`（`bind` が構文段のみから確定させた形状。`WHERE`
+        // 束縛結果の一部）が記録した `metadata_filters` 参照列を、世代照合
+        // 済みの `post_check_schema`（`bind` 時と同一世代であることを上で
+        // 検証済み）で列名へ写像する。写像に失敗する列（overflow・
+        // インデックス範囲外）が 1 つでもあれば全体を `None` へ fail-closed に
+        // 倒す（未検証・不整合な列名を索引名注記の被覆判定に使わない）。
+        let scalar_filter_column_names: Option<Vec<&str>> =
+            if explain_shape.filter_columns_overflowed() {
+                None
+            } else {
+                let mut names = Vec::new();
+                let mut ok = true;
+                for idx in explain_shape.filter_columns() {
+                    match post_check_schema.columns.get(idx) {
+                        Some(col) => names.push(col.name.as_str()),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    Some(names)
+                } else {
+                    None
+                }
+            };
 
         // Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の入力を
         // 組み立てる。`EXPLAIN` は `USING PLAN` 専用（束縛結果は常に
@@ -4861,8 +5053,10 @@ impl EngineCore {
         // `HINT ORDER` を受理しない（SQL-5・許可リスト層）ため評価順序は常に
         // 既定（`EvaluationOrder::DEFAULT`）であり、`scalar_prefilter` は
         // ここで固定的に導出できる。`explain_engine_for`（Issue #922・SQL-27
-        // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出）へ委譲する。
-        let explain_engine = self.explain_engine_for(
+        // で `USING PLAN` なし検索 EXPLAIN と共有するために抽出。Issue #1066
+        // で使用索引名の組み立ても統合）へ委譲する。
+        let (explain_engine, index_names) = self.explain_engine_for(
+            &post_check_txn,
             table,
             true,
             planned.mode().mode() == crate::sql::mode::SearchMode::Precision,
@@ -4873,17 +5067,24 @@ impl EngineCore {
             .scalar_prefilter,
             // Issue #474: `bind` が構文段のみから確定させた静的判定（LLM
             // I/O・世代照合の影響を受けない。上記コメントと同じ理由）に、
-            // Issue #1153 で索引宣言による対象列の絞り込みを反映する。
+            // Issue #1153 で索引宣言による対象列の絞り込みを反映する
+            // （`scalar_plan_under_target` が `PlainScan` へ降格させた場合、
+            // 直後の `explain_engine_for` の `scalar_names_eligible` 判定
+            // 〔`scalar_plan != PlainScan`〕も連動して索引名注記を出さなく
+            // なる。Issue #1066 PR #1155 codex-review P2 対応と矛盾しない）。
             crate::sql::scalar_index::scalar_plan_under_target(
                 explain_shape.scalar_plan(),
                 explain_shape.metadata_filter_columns(),
                 &post_check_schema,
                 &target,
             ),
+            scalar_filter_column_names.as_deref(),
         );
-        Ok(crate::sql::explain::build_explain_result(
+        drop(post_check_txn);
+        Ok(crate::sql::explain::build_explain_result_with_indexes(
             &planned,
             &explain_engine,
+            &index_names,
         ))
     }
 
@@ -4895,33 +5096,105 @@ impl EngineCore {
     /// 集約し、`hnsw_state` の `lookup`／`prepare_*`（索引構築・統計加算という
     /// 副作用を持つ）を一切呼ばず `is_some()` の有無だけを見る（検索本体を
     /// 実行しない契約はどちらの呼び出し元でも不変）。
+    /// 戻り値の [`crate::sql::explain::ExplainIndexNames`]（Issue #1066・
+    /// TASK-206・INDEX-7）は `ann_plan:`／`scalar_plan:` 行への使用索引名注記。
+    /// HNSW ゲート判定（[`crate::catalog::hnsw_targeted_in_txn`]）と索引宣言
+    /// 読み取り（[`crate::catalog::explain_index_names_in_txn`]）を同一の
+    /// `read_txn`（同一スナップショット）から行い、トークンと索引名の食い違い
+    /// を作らない。`scalar_filter_columns`（`None` は「列名を確定できない」
+    /// ——`ExplainShape` の overflow・写像失敗いずれか——ことを表し、fail-closed
+    /// にスカラー索引名を出さない）は `metadata_filters` が参照する列の名前
+    /// （呼び出し元が束縛時スキーマで解決済み）。付与条件（対象外は空 `Vec`
+    /// のまま）:
+    /// - ann: `ann_plan` が `HnswFullVisible`／`HnswSubset` かつ
+    ///   `self.hnsw_scope == HnswScope::Declared` のときのみ、対象テーブルの
+    ///   `USING hnsw` 宣言すべて（`--hnsw-scope all` では適格性
+    ///   〔`catalog::hnsw_targeted_in_txn`〕が宣言の有無を見ず常に真になり、
+    ///   経路・Top-k が宣言の有無で変わらないのに `index=` 表示だけ変わる
+    ///   契約矛盾を避けるため、宣言があっても付けない。codex-review P1
+    ///   指摘対応・Issue #1066 PR #1155 2 巡目）
+    /// - scalar: 宣言の有効化スイッチ `self.hnsw_state.is_some()` が真・
+    ///   `scalar_plan` が `PlainScan` 以外・`scalar_filter_columns` が
+    ///   `Some` かつ非空・その全列がいずれかのスカラー宣言で被覆されている
+    ///   場合のみ（被覆されない列が 1 つでもあれば実行時は
+    ///   `FallbackNoIndex` で全走査に落ちるため索引使用を主張しない。
+    ///   トークン自体の実行時整合は #1153 の管轄）
+    ///
+    /// `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応）は
+    /// 呼び出し元が `bind`（束縛）に使ったスキーマと同一の `read_txn_with_
+    /// schema` 由来のスナップショットをそのまま渡す（新規に `begin_read()`
+    /// し直さない）。索引宣言をここで独自に新しい読み取りトランザクションから
+    /// 読むと、束縛時と索引宣言取得時の間に `DROP INDEX`／`CREATE INDEX`／
+    /// テーブル再作成がコミットされた場合、旧スキーマで束縛した述語に新しい
+    /// 索引宣言の名前が付き実際の実行計画と食い違う（[`Self::run_explain_
+    /// plan`] の世代照合は `post_check_txn` とは別の txn を開き直す実装だと
+    /// この窓を塞がない）。呼び出し元はいずれも `bind` 用に開いた
+    /// `read_txn` を保持し続け、ここへ同じ参照を渡すことで束縛・索引宣言
+    /// 読み取りを単一スナップショットへ統一する。
+    /// `catalog::explain_index_names_in_txn`（索引カタログ全件走査）を呼ぶ
+    /// 唯一の経路（Issue #1066 codex-review P2 指摘対応・PR #1155 4 巡目）。
+    /// [`Self::explain_engine_for`]・[`Self::aggregate_explain_from_bound`] の
+    /// 両方がこれを経由することで、`explain_index_name_scans` カウンタが
+    /// 「索引名注記のためのカタログ走査が実際に行われた回数」を漏れなく計上
+    /// する（呼び出し元は事前に索引名が最終的に表示されるかを判定し、表示
+    /// しない場合はこのメソッド自体を呼ばない契約——判定式は各呼び出し元の
+    /// ドキュメンテーションコメント参照）。カウンタは observability 専用で
+    /// あり、戻り値・fail-closed 挙動は `catalog::explain_index_names_in_txn`
+    /// をそのまま透過する。
+    fn read_explain_index_names_in_txn(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+    ) -> crate::catalog::Result<crate::catalog::TableIndexDecls> {
+        self.explain_index_name_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::catalog::explain_index_names_in_txn(read_txn, table)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Issue #1066 で `scalar_filter_columns`・`read_txn` 追加により 9 引数。hnsw.rs と同じ方針で許容する。
     fn explain_engine_for(
         &self,
+        read_txn: &redb::ReadTransaction,
         table: &str,
         is_hybrid: bool,
         is_precision: bool,
         filters_empty: bool,
         scalar_prefilter: bool,
         scalar_plan: crate::sql::scalar_plan::ScalarPlan,
-    ) -> crate::sql::explain::ExplainEngine {
+        scalar_filter_columns: Option<&[&str]>,
+    ) -> (
+        crate::sql::explain::ExplainEngine,
+        crate::sql::explain::ExplainIndexNames,
+    ) {
+        let declarations_enabled = self.hnsw_state.is_some();
         // Issue #1065: `ann_plan:` 表示は実行時判定（`sql::exec` の
         // `hnsw_enabled`）と同じゲート（`catalog::hnsw_targeted_in_txn`）を
         // 通す（実行時判定と `EXPLAIN` 表示の乖離を作らない。`hnsw_state` の
         // `lookup`／`prepare_*` は呼ばない副作用なしの読み取り専用判定）。
-        // 読み取りに使う txn はこの表示専用に新規で開き（`EXPLAIN` は検索本体
-        // を実行しないため計画開始時の txn を引き回さない）、失敗時は
-        // fail-closed に `false`（brute-force 表示）へ倒す。
-        let hnsw_enabled = self.hnsw_state.is_some()
-            && match self.storage.db().begin_read() {
-                Ok(read_txn) => crate::catalog::hnsw_targeted_in_txn(
-                    &read_txn,
-                    &self.index_catalog_gate_cache,
-                    table,
-                    self.hnsw_scope,
-                    true,
-                ),
-                Err(_) => false,
-            };
+        // `declarations_enabled == false`（opt-in なしの既定エンジン）では
+        // `hnsw_enabled` は常に `false`・索引名も常に空になるため、旧実装
+        // （`self.hnsw_state.is_some() && match begin_read() {..}` の短絡評価）
+        // と同じくカタログに一切触れない（advisor 指摘対応・Issue #1066:
+        // 索引名の組み立てを追加した際に txn を無条件で開くよう誤って変更
+        // すると、既定エンジンの EXPLAIN 毎に不要な索引カタログ全件走査
+        // （最大 `MAX_INDEX_COUNT` 件のデコード）という新規 I/O 副作用を生む）。
+        // 読み取りに使う txn は呼び出し元が `bind` に使った `read_txn`
+        // 引数（同一スナップショット。上記ドキュメンテーションコメント・
+        // Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応）をそのまま
+        // 使う（新規に `begin_read()` しない）。カタログ読み取り自体の失敗
+        // （走査上限超過・デコード失敗）は fail-closed に `false`
+        // （brute-force 表示）・索引名なしへ倒す。
+        let hnsw_enabled = if declarations_enabled {
+            crate::catalog::hnsw_targeted_in_txn(
+                read_txn,
+                &self.index_catalog_gate_cache,
+                table,
+                self.hnsw_scope,
+                true,
+            )
+        } else {
+            false
+        };
         let ann_plan =
             crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
                 hnsw_enabled,
@@ -4931,7 +5204,68 @@ impl EngineCore {
                 filters_empty,
                 scalar_prefilter,
             });
-        crate::sql::explain::ExplainEngine::new(self.search_engine_kind(), ann_plan, scalar_plan)
+
+        // codex-review P1 指摘対応（Issue #1066 PR #1155）: `HnswScope::All` は
+        // `hnsw_targeted_in_txn` が宣言の有無を見ず常に `true` を返す（適格性が
+        // 宣言に依存しない）ため、宣言名を注記すると「宣言の追加・削除で実行
+        // 経路が変わらないのに使用索引名表示だけが変わる」という「使用索引を
+        // 示す」契約との矛盾を生む。`HnswScope::Declared` はテーブル単位の
+        // 適格性そのものが宣言の有無で決まる（catalog::hnsw_targeted_in_txn）
+        // ため、この scope に限り宣言名を「使用索引名」として注記する。
+        let ann_names_eligible = matches!(
+            ann_plan,
+            crate::sql::hnsw_cache::AnnPlan::HnswFullVisible
+                | crate::sql::hnsw_cache::AnnPlan::HnswSubset
+        ) && self.hnsw_scope == crate::search_engine::HnswScope::Declared;
+        // Issue #1066 codex-review P2 指摘対応: `scalar_plan` の静的分類・列
+        // 被覆の前提条件（下記 `scalar_names_eligible`）は `index_decls` を
+        // 読まなくても確定する。索引名を最終的に一切表示しない呼び出し
+        // （述語なし・`HnswScope::All`・`PlainScan` 等）でもカタログ全件走査
+        // （[`crate::catalog::explain_index_names_in_txn`]）を無条件に行うと、
+        // 既存の HNSW ゲート（[`crate::catalog::hnsw_targeted_in_txn`]。上記
+        // `index_catalog_gate_cache` による世代別キャッシュ対象）とは別の
+        // 未キャッシュな走査が `EXPLAIN` の呼び出しごとに発生してしまう。
+        // 両条件のいずれかが真の場合に限りカタログを読む（走査自体は
+        // キャッシュしないが、不要な呼び出しでは行わない）。
+        let scalar_names_eligible = declarations_enabled
+            && !matches!(scalar_plan, crate::sql::scalar_plan::ScalarPlan::PlainScan)
+            && scalar_filter_columns.is_some_and(|cols| !cols.is_empty());
+        let index_decls = if declarations_enabled && (ann_names_eligible || scalar_names_eligible) {
+            // Issue #1066: `Err`（走査上限超過・デコード失敗）は「名前を
+            // 出さない」へ fail-closed に倒す（`EXPLAIN` 自体は失敗させ
+            // ない。トークン〔`hnsw_enabled`〕は上記判定のまま変えない）。
+            self.read_explain_index_names_in_txn(read_txn, table).ok()
+        } else {
+            None
+        };
+        let ann_names = match &index_decls {
+            Some(decls) if ann_names_eligible => decls.hnsw.clone(),
+            _ => Vec::new(),
+        };
+        // 2 巡目 codex-review P1 指摘対応（Issue #1066 PR #1155）: ここで付ける
+        // 名前は `scalar_plan` の静的分類（`ScalarPlan::PlainScan` 以外）と
+        // カタログ宣言による列被覆だけで決まる「宣言上の候補索引名」であり、
+        // 実行側 `ScalarIndex::resolve_candidates` が選択度超過・候補取得
+        // 不能で全走査へ縮退した場合でもそのまま付く（`scalar_index_names_
+        // for_columns` のドキュメンテーションコメント参照）。EXPLAIN は
+        // テーブル内容・行数に依存する実行時縮退を観測しない既存契約
+        // （`docs/design/explain-search-engine-exposure.md`「決定 1」節）を
+        // 優先し、意図的に静的判定のみを報告する。
+        let scalar_names = match (&index_decls, scalar_filter_columns) {
+            (Some(decls), Some(cols)) if scalar_names_eligible => {
+                scalar_index_names_for_columns(&decls.scalar, cols)
+            }
+            _ => Vec::new(),
+        };
+
+        (
+            crate::sql::explain::ExplainEngine::new(
+                self.search_engine_kind(),
+                ann_plan,
+                scalar_plan,
+            ),
+            crate::sql::explain::ExplainIndexNames::new(ann_names, scalar_names),
+        )
     }
 
     /// `EXPLAIN SELECT ...`（`USING PLAN` を伴わない検索 SELECT。`ORDER BY
@@ -4967,14 +5301,23 @@ impl EngineCore {
     /// この私的ヘルパーを共有することで、同じ意味の要求が SQL 経由・NoSQL
     /// 経由のどちらでもビット同一の行を返す契約を構造として保証する
     /// （第 2 の実装を作らない設計）。検索本体（`hnsw_state` の
-    /// `lookup`／`prepare_*`・`SearchProvider::search`）は呼ばない。
+    /// `lookup`／`prepare_*`・`SearchProvider::search`）は呼ばない。`schema`
+    /// （Issue #1066）は `bound` を束縛したのと同一スキーマで、
+    /// `metadata_filters` の `column_index()` を索引名注記の被覆判定用の
+    /// 列名へ写像するために使う（`bound.table()` と同一テーブルであることは
+    /// 呼び出し元がいずれも `bind` 直後に呼ぶ契約により保証される）。
+    /// `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・3 巡目対応）は
+    /// `schema` を取得したのと同一の `read_txn_with_schema` 由来のスナップ
+    /// ショットで、[`Self::explain_engine_for`] へそのまま渡し索引宣言も
+    /// 同一スナップショットから読む（束縛時スキーマと索引宣言取得時の間に
+    /// `DROP INDEX`／`CREATE INDEX` がコミットされて食い違う窓を作らない）。
     ///
-    /// `read_txn`／`schema`（Issue #1153・TASK-206・INDEX-7）: 呼び出し元が
-    /// `bound` を束縛したのと同一のスナップショット。索引宣言
-    /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）を
-    /// この `read_txn` から解決し、`scalar_plan:` 表示を実行時の索引構築対象
-    /// 選択と一致させる（[`crate::sql::scalar_index::
-    /// scalar_plan_under_target`]）。
+    /// 同じ `read_txn`／`schema`（Issue #1153・TASK-206・INDEX-7）から索引宣言
+    /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）も
+    /// 解決し、`scalar_plan:` 表示を実行時の索引構築対象選択と一致させる
+    /// （[`crate::sql::scalar_index::scalar_plan_under_target`]。宣言で対象外に
+    /// なった列への述語は `PlainScan` へ補正され、直後の `explain_engine_for`
+    /// の索引名注記も連動して出なくなる）。
     fn search_explain_from_bound(
         &self,
         read_txn: &redb::ReadTransaction,
@@ -4999,6 +5342,12 @@ impl EngineCore {
                 or_filters: bound.or_filters(),
             },
         );
+        // Issue #1066: `metadata_filters` が参照する列を同一 `schema` で
+        // 列名へ写像する（添字は `MetadataFilter::column_index` のドキュメント
+        // どおり `schema.columns` と同一空間）。写像に失敗する列があれば
+        // fail-closed に `None`（索引名なし）へ倒す。
+        let scalar_filter_column_names =
+            metadata_filter_column_names(schema, bound.metadata_filters());
         // Issue #1153: `sql::exec` が索引構築対象選択に使うのと同じ単一
         // 情報源から `target` を解決し、宣言で対象外にした列への述語を
         // `scalar_plan_under_target` で `PlainScan` へ補正する。
@@ -5018,15 +5367,17 @@ impl EngineCore {
             schema,
             &target,
         );
-        let engine = self.explain_engine_for(
+        let (engine, index_names) = self.explain_engine_for(
+            read_txn,
             bound.table(),
             is_hybrid,
             is_precision,
             filters_empty,
             scalar_prefilter,
             scalar_plan,
+            scalar_filter_column_names.as_deref(),
         );
-        crate::sql::explain::build_search_explain_result(bound.mode(), &engine)
+        crate::sql::explain::build_search_explain_result(bound.mode(), &engine, &index_names)
     }
 
     /// `EXPLAIN SELECT <集計>`（`GROUP BY`・`SELECT DISTINCT` の脱糖形いずれも。
@@ -5056,14 +5407,34 @@ impl EngineCore {
     /// `EXPLAIN SELECT <集計>` テキスト経由）と
     /// [`Self::explain_bound_aggregate_in_session`]（NoSQL 表層の `aggregate`
     /// op の `explain: true`）の両方が共有する（第 2 の実装を作らない設計）。
+    /// `classify_aggregate_access` 自体はテーブルスキーマと束縛結果・
+    /// `target`（後述）だけから静的判定する純粋関数のままだが、Issue #1066 で
+    /// `scalar_plan:` 行への使用索引名注記を追加したため、カタログ読み取り
+    /// （`self.storage`）が必要になり `&self` メソッドへ変更した
+    /// （`classify_aggregate_access` 自体の判定式は変えない）。`access_path` が
+    /// `ScalarIndexCandidates`（索引経由の候補削減が使える形）のときに限り、
+    /// `metadata_filters` の列がすべて対象テーブルのスカラー宣言で被覆されて
+    /// いるかを `read_txn`（Issue #1066 PR #1155 codex-review P1 指摘・
+    /// 3 巡目対応: `bind_aggregate` に使ったスキーマと同一の `read_txn_with_
+    /// schema` 由来スナップショット。新規に `begin_read()` し直さない）で
+    /// 判定する（ann は常に対象外——集計 EXPLAIN は `ann_plan:` 行を出さない）。
+    /// カタログ読み取り失敗・列名写像失敗は fail-closed に名前なしへ倒す。
+    /// ここで付ける名前も `search_explain_from_bound` の `scalar_names` と
+    /// 同じく「宣言上の候補索引名」であり、`ScalarIndex::resolve_candidates`
+    /// の実行時縮退（選択度超過・候補取得不能）は意図的に反映しない
+    /// （`scalar_index_names_for_columns` のドキュメンテーションコメント・
+    /// `docs/design/explain-search-engine-exposure.md`「決定 1」節参照）。
     ///
-    /// `read_txn`（Issue #1153・TASK-206・INDEX-7）: 呼び出し元が `bound` を
-    /// 束縛したのと同一のスナップショットから索引宣言
+    /// `target`（Issue #1153・TASK-206・INDEX-7）: 呼び出し元が `bound` を
+    /// 束縛したのと同一のスナップショット（`read_txn`）から索引宣言
     /// （[`crate::sql::scalar_index::resolve_scalar_index_target_in_txn`]）を
     /// 解決し、[`crate::sql::aggregate::classify_aggregate_access`] へ渡す
     /// （`ensure_scalar_index_snapshot` が実際に構築する索引の対象選択と
     /// 一致させるため。`self.hnsw_state.is_some()` を「起動時 opt-in」の
     /// 上位スイッチとして使うのは `sql::exec`／`sql::aggregate` と同じ）。
+    /// `target` により `access_path` 自体が `PlainScan`／`FullScan` 側へ
+    /// 補正され得るため、直後の索引名注記の可否判定（`ScalarIndexCandidates`
+    /// か）は必ずこの補正後の `access_path` を見る。
     fn aggregate_explain_from_bound(
         &self,
         read_txn: &redb::ReadTransaction,
@@ -5077,7 +5448,33 @@ impl EngineCore {
         );
         let (scalar_plan, access_path) =
             crate::sql::aggregate::classify_aggregate_access(schema, bound, &target);
-        crate::sql::explain::build_relational_explain_result(scalar_plan, access_path)
+        // Issue #1066: `access_path`（上記 `target` 補正後の値）が
+        // `ScalarIndexCandidates` のときに限り、`metadata_filters` の列が
+        // すべて対象テーブルのスカラー宣言で被覆されているかを確認して索引名を
+        // 注記する。カタログ読み取り失敗・列名写像失敗は fail-closed に名前
+        // なしへ倒す（`Self::aggregate_explain_from_bound` のドキュメンテー
+        // ションコメント参照）。
+        let index_names = if matches!(
+            access_path,
+            crate::sql::explain::AccessPath::ScalarIndexCandidates
+        ) && self.hnsw_state.is_some()
+        {
+            match metadata_filter_column_names(schema, bound.metadata_filters()) {
+                Some(cols) if !cols.is_empty() => {
+                    match self.read_explain_index_names_in_txn(read_txn, bound.table()) {
+                        Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
+                            Vec::new(),
+                            scalar_index_names_for_columns(&decls.scalar, &cols),
+                        ),
+                        Err(_) => crate::sql::explain::ExplainIndexNames::default(),
+                    }
+                }
+                _ => crate::sql::explain::ExplainIndexNames::default(),
+            }
+        } else {
+            crate::sql::explain::ExplainIndexNames::default()
+        };
+        crate::sql::explain::build_relational_explain_result(scalar_plan, access_path, &index_names)
     }
 
     /// `EXPLAIN SELECT ... LIMIT n [OFFSET m]`（広域取得。ビュー展開後の形を
@@ -5109,6 +5506,7 @@ impl EngineCore {
         crate::sql::explain::build_relational_explain_result(
             crate::sql::scalar_plan::ScalarPlan::PlainScan,
             crate::sql::explain::AccessPath::FullScan,
+            &crate::sql::explain::ExplainIndexNames::default(),
         )
     }
 
