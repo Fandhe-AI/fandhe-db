@@ -135,14 +135,17 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1073（UNIQUE 制約の対象型拡張。`is_unique_constraint_allowed`・
     // `unique_key_tag`・型ごとの正準キー生成のドキュメンテーションコメント
     // 追加）で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4676）。
-    // Issue #1076（`FOREIGN KEY` の参照アクション）・Issue #1077（`MATCH`・
-    // 遅延属性フィールド追加）の統合マージで `catalog.rs` 冒頭側に行が追加され、
-    // 再度追随（旧: 4713／4912）。
-    // PR #1138 codex-review 指摘対応（Issue #1076。カタログ v9 `fk:` 行の
-    // 5／7 フィールド後方互換パーサー追加）で `catalog.rs` 冒頭側に行が追加され、
-    // 再度追随（旧: 5099）。Issue #1079（同上。base 取り込みマージで
-    // `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5132）。
-    ("catalog.rs", 5131),
+    // Issue #1077（`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）で
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 4713）。
+    // Issue #1079（`validate_row_embedding_dim` 経路への doc コメント更新）で
+    // `catalog.rs` 冒頭側の行数が 1 行減り、再度追随（旧: 4924）。
+    // Issue #1076（`FOREIGN KEY` の参照アクション）・PR #1138 codex-review
+    // 指摘対応（カタログ v9 `fk:` 行の後方互換パーサー追加）と Issue #1071
+    // （`FOREIGN KEY` 参照整合性検査の索引化。`Storage::drop_table` への
+    // `key_index::drop_indexes_for_table_in_txn` 追加）の統合マージで
+    // `catalog.rs` 冒頭側（`create_enum_type` より前）に行が追加され、
+    // 再度追随（旧: 4928）。
+    ("catalog.rs", 5136),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -168,12 +171,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4217）。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4755）。
-    // Issue #1076／#1077（同上。参照アクション・`MATCH`・遅延属性フィールド
-    // 追加の統合マージ）で再度追随（旧: 4792／4991）。
-    // PR #1138 codex-review 指摘対応（同上。カタログ v9 `fk:` 行の後方互換
-    // パーサー追加）で再度追随（旧: 5178）。Issue #1079（同上。base 取り込み
-    // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5211）。
-    ("catalog.rs", 5210),
+    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
+    // で再度追随（旧: 4792）。
+    // Issue #1079（同上。`catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5003）。
+    // Issue #1076／PR #1138 codex-review 指摘対応（参照アクション・カタログ v9
+    // `fk:` 行の後方互換パーサー追加）と Issue #1071（同上。`Storage::drop_table`
+    // への `key_index` 削除呼び出し追加）の統合マージで再度追随（旧: 5007）。
+    ("catalog.rs", 5215),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -191,12 +195,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4298）。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4836）。
-    // Issue #1076／#1077（同上。参照アクション・`MATCH`・遅延属性フィールド
-    // 追加の統合マージ）で再度追随（旧: 4873／5072）。
-    // PR #1138 codex-review 指摘対応（同上。カタログ v9 `fk:` 行の後方互換
-    // パーサー追加）で再度追随（旧: 5259）。Issue #1079（同上。base 取り込み
-    // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5292）。
-    ("catalog.rs", 5291),
+    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
+    // で再度追随（旧: 4873）。
+    // Issue #1079（同上。`catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5084）。
+    // Issue #1076／PR #1138 codex-review 指摘対応（参照アクション・カタログ v9
+    // `fk:` 行の後方互換パーサー追加）と Issue #1071（同上。`Storage::drop_table`
+    // への `key_index` 削除呼び出し追加）の統合マージで再度追随（旧: 5088）。
+    ("catalog.rs", 5296),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -213,13 +218,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #907（`FOREIGN KEY` 制約。`ForeignKeyDef`・カタログ v8 等）の追加で
     // 再度追随（旧: 4331）。
     // Issue #1073（同上。UNIQUE 制約の対象型拡張）で再度追随（旧: 4869）。
+    // Issue #1077（同上。`ForeignKeyDef` への `MATCH`・遅延属性フィールド追加）
+    // で再度追随（旧: 4906）。
+    // Issue #1079（同上。`catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5117）。
     // Issue #1076（`FOREIGN KEY` の参照アクション。`ReferentialAction` 列挙・
-    // `fk:` 行フィールド追加）・Issue #1077（`MATCH`・遅延属性フィールド追加）の
-    // 統合マージで再度追随（旧: 4906）。
-    // PR #1138 codex-review 指摘対応（同上。カタログ v9 `fk:` 行の後方互換
-    // パーサー追加）で再度追随（旧: 5292）。Issue #1079（同上。base 取り込み
-    // マージで `catalog.rs` 冒頭側の行数が 1 行減り）再度追随（旧: 5325）。
-    ("catalog.rs", 5324),
+    // `fk:` 行フィールド追加）・PR #1138 codex-review 指摘対応（カタログ v9
+    // `fk:` 行の後方互換パーサー追加）と Issue #1071（同上。`Storage::drop_table`
+    // への `key_index` 削除呼び出し追加）の統合マージで再度追随（旧: 5121）。
+    ("catalog.rs", 5329),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

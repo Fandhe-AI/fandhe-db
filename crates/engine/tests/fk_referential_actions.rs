@@ -634,6 +634,73 @@ fn grandchild_no_action_rejects_the_whole_cascade_atomically() {
     assert_eq!(row_count(&core, &alice, "grandchildren"), 1);
 }
 
+/// Cursor Bugbot 指摘（永続キー索引・Issue #1071 との統合バグ）: `ON DELETE
+/// CASCADE`（`constraint::apply_referential_action`）が子行を物理削除する際、
+/// その子テーブル自身が持つ登録済み永続キー索引（孫段の列参照 FK が使う）を
+/// 同期しないと、削除済みの行の索引エントリが残留する。孫段は列参照 FK
+/// （`grandchildren.child_code REFERENCES children(code)`）で `NO ACTION`
+/// のため、この検査は登録済みなら索引照会（`verify_required_parent_keys` →
+/// `key_index::all_keys_exist_in_txn`）に切り替わる——`children`/`["code"]`
+/// 索引が未登録のまま（`grandchild_no_action_rejects_the_whole_cascade_atomically`
+/// と異なり）事前の子行挿入で**先に登録済みにしてから** `CASCADE` を発火させ、
+/// 残留エントリがあれば「参照先はまだ存在する」と誤判定して違反を見逃す
+/// （fail-open）ことを固定する。
+#[test]
+fn cascade_delete_syncs_key_index_so_a_stale_entry_does_not_mask_a_no_action_violation() {
+    let (core, path) = new_core("fkact-cascade-index-sync");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE parents (code TEXT PRIMARY KEY)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (code TEXT PRIMARY KEY, parent_code TEXT REFERENCES parents (code) ON DELETE CASCADE)",
+    );
+    // 孫段は既定の `NO ACTION`（列参照。`children.code` を参照する）。
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE grandchildren (child_code TEXT REFERENCES children (code))",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, code) VALUES (1, 'p1') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO children (id, code, parent_code) VALUES (1, 'c1', 'p1') USING OPERATION_ID 'op-c'",
+    );
+    // この挿入が `verify_required_parent_keys` の未登録フォールバックを経由し、
+    // `children`/`["code"]` の永続キー索引を先に backfill・登録する。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO grandchildren (id, child_code) VALUES (1, 'c1') USING OPERATION_ID 'op-g'",
+    );
+
+    // 親の削除は `children` を CASCADE 削除するが、孫段は `NO ACTION` の
+    // ため、削除された `children.code = 'c1'` をまだ参照する孫行がある限り
+    // 文全体が `23503` で拒否されなければならない——`children`/`["code"]`
+    // 索引が事前に登録済みでも同じ結果になる（索引の同期漏れがあれば、この
+    // 事後検証だけが素通りして親の削除が成功してしまう）。
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-del'"
+        ),
+        "23503"
+    );
+
+    // 副作用ゼロ: 連鎖で削除されるはずだった children も含め、全テーブルが不変。
+    assert_eq!(row_count(&core, &alice, "parents"), 1);
+    assert_eq!(row_count(&core, &alice, "children"), 1);
+    assert_eq!(row_count(&core, &alice, "grandchildren"), 1);
+}
+
 // --- テナント境界・TRUNCATE ------------------------------------------------------
 
 #[test]
@@ -1115,4 +1182,69 @@ fn set_null_applied_before_cascade_still_cascades_to_grandchildren() {
     // （`code` 経由）が最終的に子行を削除し、孫行も連鎖削除される。
     assert_eq!(row_count(&core, &alice, "children"), 0);
     assert_eq!(row_count(&core, &alice, "grandchildren"), 0);
+}
+
+// `SET NULL`／`SET DEFAULT`／`ON UPDATE CASCADE`（read-merge-write で子行を
+// 書き換える経路。`constraint::apply_referential_action`）が、書き換えた
+// 子行の永続キー索引（Issue #1071）を同期しないまま孫段の `NO ACTION`
+// 事後検証（`enforce_referencing_rows_in_txn`）へ進むと、索引に旧キーが
+// 残留し「参照先はまだ存在する」と誤判定して本来 `23503` になるべき更新が
+// 素通りしてしまう（fail-open）懸念（PR #1146 codex-review 指摘）。
+// `propagate_referential_actions` は `ColumnsUpdated` な子行 id を
+// `pending_validation` へ蓄積し、全 FK 適用後に
+// `enforce_row_constraints_in_txn`（内部で `sync_rows_in_txn` を先頭に呼ぶ）
+// でまとめて検証する契約になっており、本テストはその契約が実際に索引の
+// 同期漏れを防いでいることを固定する。
+#[test]
+fn on_update_cascade_syncs_key_index_for_grandchild_no_action_check() {
+    let (core, path) = new_core("fkact-upd-cascade-index-sync");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE countries (code TEXT PRIMARY KEY)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE cities (id_col INTEGER, country TEXT UNIQUE REFERENCES countries(code) ON UPDATE CASCADE)",
+    );
+    // 孫段は cities.country を参照する（既定の NO ACTION）。
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE districts (city_country TEXT REFERENCES cities(country))",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO countries (id, code) VALUES (1, 'JP') USING OPERATION_ID 'op-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO cities (id, id_col, country) VALUES (1, 1, 'JP') USING OPERATION_ID 'op-c'",
+    );
+    // この挿入が cities/["country"] の永続キー索引を backfill・登録する。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO districts (id, city_country) VALUES (1, 'JP') USING OPERATION_ID 'op-g'",
+    );
+
+    // countries.code の更新は cities.country へ CASCADE するが、districts が
+    // まだ旧値 'JP' を参照しているため、孫段 NO ACTION により全体が 23503 で
+    // 拒否されなければならない。索引の同期漏れがあれば素通りしてしまう。
+    let result = err_code(
+        &core,
+        &alice,
+        "UPDATE countries SET code = 'JPN' WHERE id = 1 USING OPERATION_ID 'op-u'",
+    );
+    assert_eq!(result, "23503");
+    assert_eq!(
+        select_cell(&core, &alice, "cities", 1, "country"),
+        Some(Cell::Text("JP".to_string()))
+    );
 }

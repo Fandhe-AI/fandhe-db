@@ -238,7 +238,10 @@ O(JSON サイズ) の係数が乗る（既知の制約として記録するの�
 ## スコープ外・申し送り
 
 - SQL `ALTER TABLE ... ADD [CONSTRAINT] UNIQUE` / `DROP CONSTRAINT` と制約名
-- 永続一意索引（redb 二次テーブル）による O(log n) 判定
+- 永続一意索引（redb 二次テーブル）による O(log n) 判定（Issue #1070。
+  `FOREIGN KEY` の参照先側索引〔`crates/engine/src/key_index.rs`、Issue #1071・
+  `docs/design/foreign-key.md`〕は識別子（テーブル・エンコーディング・列
+  リスト）が同型のため、この一意性索引を流用できる）
 - `UPSERT` の `ON CONFLICT` 対象列への UNIQUE 列拡張は実装済み（TABLE-16、
   Issue #1074。設計判断は `docs/design/sql-upsert.md`「ON CONFLICT 対象の
   UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を対象にすることは
