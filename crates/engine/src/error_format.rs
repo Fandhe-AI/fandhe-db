@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 37;
+    count = 39;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -260,9 +260,18 @@ define_error_classes! {
     /// Issue #921。`CASE WHEN` の条件が Bool でない、各枝の型が食い違う、
     /// `NULLIF` の引数が非 Scalar）と、集合演算（`UNION`／`UNION ALL`／
     /// `INTERSECT`／`EXCEPT`。SQL-29 (c)・RLS-10 (b)・TASK-213。両辺で列数・
-    /// 列型が一致しない）の 2 つの発生源を共有する。
+    /// 列型が一致しない）に加え、式層の型不一致（`bind_binary`／`bind_call` の
+    /// 演算子・関数引数、WHERE／filter の非 bool。Issue #1186）を共有する。
     /// [`crate::sql::allowlist::SqlSurfaceError::DatatypeMismatch`] の写像。
     DatatypeMismatch => ("42804", "DATATYPE_MISMATCH"),
+    /// 未知関数の呼び出し・未実装の非決定的関数（`now()` 等）・`DATE`／`TIMESTAMP`
+    /// に対する `SUM`／`AVG`（`42883`。SQL-26・TABLE-13・ERR-6、Issue #1186）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedFunction`] の写像。
+    UndefinedFunction => ("42883", "UNDEFINED_FUNCTION"),
+    /// 組み込み関数名・予約名と同名の UDF 登録、同一セッション内の同名再定義
+    /// （`42723`。SQL-26・TABLE-13・ERR-6、Issue #1186）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateFunction`] の写像。
+    DuplicateFunction => ("42723", "DUPLICATE_FUNCTION"),
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10、
     /// Issue #924）で、非修飾列参照が複数の参照テーブルへ一致し一意に解決
     /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::

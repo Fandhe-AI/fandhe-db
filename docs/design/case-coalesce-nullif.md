@@ -42,8 +42,8 @@
   ＝`42804`）。`NULLIF` は両辺 Scalar 限定（既存の `=` が Scalar 同士しか
   比較できないため）。`CASE WHEN` の条件は許可リストが常に比較の
   `Expr::Binary` に限定するため実質的に到達しないが、束縛段でも Bool 型を
-  重ねて検査する（多層防御）。既存の `bind_binary`/`bind_call` の型不一致
-  （`22000`。SQL-9 の既存契約）は変えない。
+  重ねて検査する（多層防御）。`bind_binary`/`bind_call` の型不一致は
+  Issue #1186 で同じ `42804` へ統一した。
 
 ### 上限
 
@@ -92,10 +92,10 @@
   に論理演算ノードが無く、別 Issue（#913 等）に依存する。
 - スカラー列（INTEGER/REAL/NUMERIC/TEXT 等）の式参照（レーン A）: 現状
   `COALESCE` の実用性は `NULLIF`/`CASE` の出力に限られる。
-- SQL-26 が求める「組み込み関数名と同名の UDF 登録は `42723`」: 既存は
-  `22000` のまま（SQL-9 の既存契約を変えない）。
-- 既存の式層の型不一致（`bind_binary`/`bind_call` の `22000`）を `42804` へ
-  統一すること。
+- SQL-26 が求める「組み込み関数名と同名の UDF 登録は `42723`」: Issue #1186
+  で解消した。
+- 既存の式層の型不一致（`bind_binary`/`bind_call`）の `42804` 統一: Issue
+  #1186 で解消した。
 - `ORDER BY` 位置での `CASE` 等の式。
 - `VECTOR` 列が NULL の行を `VectorRef` で `ExprValue::Null` に写す意味論
   （既存の `dim == 0` ガードを維持）。

@@ -337,7 +337,12 @@ fn count_counts_non_null_datetime_rows_and_sum_is_rejected() {
     let err = core
         .execute_sql(&alice, &format!("SELECT SUM(day) FROM {TABLE}"))
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
+    // Issue #1186: `TIMESTAMP` への `AVG` も同じ `42883`。
+    let err = core
+        .execute_sql(&alice, &format!("SELECT AVG(at) FROM {TABLE}"))
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "42883");
 }
 
 /// `MIN`/`MAX(<DATE>/<TIMESTAMP>)` は Issue #892（D1・D7）で受理された

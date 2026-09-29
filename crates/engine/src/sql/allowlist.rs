@@ -574,13 +574,20 @@ pub enum SqlSurfaceError {
     /// 型不一致（ERR-6: `42804`）。2 つの発生源を共有する: (1) 式の型不一致
     /// （`CASE`/`COALESCE`/`NULLIF`。対象ビヘイビア: SQL-26、Issue #921）——
     /// `CASE WHEN` の条件が Bool でない、`CASE`/`COALESCE` の各枝の型が
-    /// 食い違う、`NULLIF` の引数が非 Scalar（既存の `bind_binary`／`bind_call`
-    /// の型不一致〔`22000`。SQL-9 の既存契約〕とは独立した分類）。(2) 集合演算
+    /// 食い違う、`NULLIF` の引数が非 Scalar（Issue #1186 で `bind_binary`／`bind_call`
+    /// の型不一致〔従来 `22000`〕も本分類へ統合した）。(2) 集合演算
     /// （`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`。SQL-29 (c)・RLS-10 (b)・
     /// TASK-213）の両辺で列数または列型が一致しない（[`crate::sql::set_op`]
     /// が束縛時に検証する）。`detail` には列番号・型名程度のみを含め、
     /// テーブル名・行の値は含めない（security.md P0）。
     DatatypeMismatch { detail: String },
+    /// 未知関数・未実装の非決定的関数・`DATE`／`TIMESTAMP` に対する `SUM`／`AVG`
+    /// （ERR-6: `42883`。SQL-26、Issue #1186）。`detail` には関数名・型名以外
+    /// （テナント・行の値）を含めない（security.md P0）。
+    UndefinedFunction { detail: String },
+    /// 組み込み／予約名と同名の UDF 登録・同一セッション内の再定義
+    /// （ERR-6: `42723`。SQL-26、Issue #1186）。`detail` には関数名以外を含めない。
+    DuplicateFunction { detail: String },
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
     /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
     /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
@@ -771,6 +778,22 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 式束縛（`sql::udf_call`）・集計入力解決（`sql::parser`）が
+    /// 未知関数等を報告する（SQL-26、Issue #1186）。
+    pub(crate) fn undefined_function(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::UndefinedFunction {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// `pub(crate)`: UDF 登録（`sql::udf_call`）が名前衝突を報告する（SQL-26、
+    /// Issue #1186）。
+    pub(crate) fn duplicate_function(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::DuplicateFunction {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
     /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
     /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
@@ -828,6 +851,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
             SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
+            SqlSurfaceError::UndefinedFunction { .. } => ErrorClass::UndefinedFunction,
+            SqlSurfaceError::DuplicateFunction { .. } => ErrorClass::DuplicateFunction,
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
         }
     }
@@ -972,6 +997,12 @@ impl std::fmt::Display for SqlSurfaceError {
             // 等）が `detail` に発生源固有の文脈（列番号・型名等）を含める。
             SqlSurfaceError::DatatypeMismatch { detail } => {
                 write!(f, "datatype mismatch: {detail}")
+            }
+            SqlSurfaceError::UndefinedFunction { detail } => {
+                write!(f, "undefined function: {detail}")
+            }
+            SqlSurfaceError::DuplicateFunction { detail } => {
+                write!(f, "duplicate function: {detail}")
             }
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")

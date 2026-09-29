@@ -473,7 +473,7 @@ pub enum BuiltinFn {
 /// `sql::check_constraint`（TABLE-16・TASK-204、Issue #906）が `CHECK` 述語中の
 /// `Expr::Call` を束縛より**前**に検査し、組み込み関数以外（セッション UDF・
 /// WASM UDF・未知関数）の呼び出しを `42601` として拒否するために使う
-/// （空の [`UdfRegistry`] で束縛すると「未知の関数」として `22000` へ丸まって
+/// （空の [`UdfRegistry`] で束縛すると「未知の関数」として `42883` へ丸まって
 /// しまい、CHECK の禁止要素として区別できないため）。`round` は arity で
 /// `Round1`／`Round2` へオーバーロード解決されるため [`builtin_from_name`] の
 /// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
@@ -732,12 +732,12 @@ pub fn define_function(
         .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
     let lower = name.to_ascii_lowercase();
     if is_reserved_function_name(name) {
-        return Err(SqlSurfaceError::invalid_input(format!(
+        return Err(SqlSurfaceError::duplicate_function(format!(
             "function name {name} collides with a built-in or reserved name"
         )));
     }
     if registry.is_name_taken(&lower) {
-        return Err(SqlSurfaceError::invalid_input(format!(
+        return Err(SqlSurfaceError::duplicate_function(format!(
             "function {name} is already defined in this session"
         )));
     }
@@ -822,12 +822,12 @@ pub fn define_wasm_function(
         .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
     let lower = name.to_ascii_lowercase();
     if is_reserved_function_name(name) {
-        return Err(SqlSurfaceError::invalid_input(format!(
+        return Err(SqlSurfaceError::duplicate_function(format!(
             "function name {name} collides with a built-in or reserved name"
         )));
     }
     if registry.is_name_taken(&lower) {
-        return Err(SqlSurfaceError::invalid_input(format!(
+        return Err(SqlSurfaceError::duplicate_function(format!(
             "function {name} is already defined in this session"
         )));
     }
@@ -943,8 +943,8 @@ fn validate_closed_expr(
                     )));
                 }
             } else {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "unknown function: {name}"
+                return Err(SqlSurfaceError::undefined_function(format!(
+                    "function {name} does not exist"
                 )));
             }
             for a in args {
@@ -1770,7 +1770,7 @@ fn bind_binary(
             (ExprType::Date, ExprType::Date) if op == BinOp::Sub => {
                 Ok((mk(op, l, r), ExprType::Scalar))
             }
-            _ => Err(SqlSurfaceError::invalid_input(
+            _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'+'/'-' require both operands to be scalar, or a DATE combined with a day-count scalar",
             )),
         },
@@ -1779,14 +1779,14 @@ fn bind_binary(
             (ExprType::Vector, ExprType::Scalar) | (ExprType::Scalar, ExprType::Vector) => {
                 Ok((mk(op, l, r), ExprType::Vector))
             }
-            _ => Err(SqlSurfaceError::invalid_input(
+            _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'*' requires scalar operands, or one vector and one scalar operand",
             )),
         },
         BinOp::Div => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Scalar)),
             (ExprType::Vector, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Vector)),
-            _ => Err(SqlSurfaceError::invalid_input(
+            _ => Err(SqlSurfaceError::datatype_mismatch(
                 "'/' requires scalar operands, or a vector divided by a scalar",
             )),
         },
@@ -1808,7 +1808,7 @@ fn bind_binary(
             (ExprType::Timestamp, ExprType::Date) => {
                 Ok((mk(op, l, wrap_date_to_timestamp(r)), ExprType::Bool))
             }
-            _ => Err(SqlSurfaceError::invalid_input(
+            _ => Err(SqlSurfaceError::datatype_mismatch(
                 "comparison operators require both operands to be scalar, both text, or both date/timestamp",
             )),
         },
@@ -1862,7 +1862,7 @@ fn bind_call(
         for (a, expected) in args.iter().zip(param_types.iter()) {
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
             if ty != *expected {
-                return Err(SqlSurfaceError::invalid_input(
+                return Err(SqlSurfaceError::datatype_mismatch(
                     "function round argument type mismatch",
                 ));
             }
@@ -1894,7 +1894,7 @@ fn bind_call(
         for (a, expected) in args.iter().zip(param_types.iter()) {
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
             if ty != *expected {
-                return Err(SqlSurfaceError::invalid_input(format!(
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
                     "function {name} argument type mismatch"
                 )));
             }
@@ -1964,7 +1964,7 @@ fn bind_call(
         for (a, expected) in args.iter().zip([ExprType::Vector, ExprType::Scalar].iter()) {
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
             if ty != *expected {
-                return Err(SqlSurfaceError::invalid_input(format!(
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
                     "function {name} argument type mismatch"
                 )));
             }
@@ -1980,8 +1980,8 @@ fn bind_call(
         ));
     }
 
-    Err(SqlSurfaceError::invalid_input(format!(
-        "unknown function: {name}"
+    Err(SqlSurfaceError::undefined_function(format!(
+        "function {name} does not exist"
     )))
 }
 
@@ -2017,7 +2017,7 @@ fn bind_concat(
         let (b, ty) = bind_null_aware(a, env, node_budget)?;
         if let Some(ty) = ty {
             if ty != ExprType::Text {
-                return Err(SqlSurfaceError::invalid_input(
+                return Err(SqlSurfaceError::datatype_mismatch(
                     "function concat arguments must be text",
                 ));
             }
@@ -2139,7 +2139,7 @@ fn bind_date_part_or_trunc(
             Some(name)
         }
         Some(_) => {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::datatype_mismatch(format!(
                 "function {lower_name} expects a text literal as its first argument"
             )));
         }
@@ -2150,7 +2150,7 @@ fn bind_date_part_or_trunc(
         Some(ExprType::Date) => wrap_date_to_timestamp(src_bound),
         None => src_bound,
         _ => {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::datatype_mismatch(format!(
                 "function {lower_name} expects a DATE or TIMESTAMP as its second argument"
             )))
         }
@@ -2207,7 +2207,7 @@ fn bind_substr(
     for (a, expected) in args.iter().zip(param_types.iter()) {
         let (b, ty) = bind_expr_in(a, env, node_budget)?;
         if ty != *expected {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::datatype_mismatch(format!(
                 "function {name} argument type mismatch"
             )));
         }
@@ -3297,7 +3297,7 @@ mod tests {
             &mut budget,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
     }
 
     #[test]
@@ -3322,7 +3322,7 @@ mod tests {
         let mut registry = UdfRegistry::default();
         define_function(&mut registry, "f", &["x".to_string()], &ident("x")).unwrap();
         let err = define_function(&mut registry, "f", &["x".to_string()], &ident("x")).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42723");
         assert_eq!(registry.len(), 1);
     }
 
@@ -3331,7 +3331,7 @@ mod tests {
         let mut registry = UdfRegistry::default();
         let err = define_function(&mut registry, "vec_norm", &["x".to_string()], &ident("x"))
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42723");
     }
 
     #[test]
@@ -3960,7 +3960,7 @@ mod tests {
         let mut registry = UdfRegistry::default();
         let err =
             define_function(&mut registry, "round", &["x".to_string()], &ident("x")).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42723");
     }
 
     #[test]
@@ -3991,12 +3991,12 @@ mod tests {
     }
 
     #[test]
-    fn calling_a_non_deterministic_function_is_rejected_with_22000() {
+    fn calling_a_non_deterministic_function_is_rejected_with_42883() {
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
         let err = bind_expr(&call("now", vec![]), &schema, &registry, &mut budget).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
     }
 
     // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------
@@ -4195,10 +4195,10 @@ mod tests {
         let mut registry = UdfRegistry::default();
         let err = define_function(&mut registry, "coalesce", &["x".to_string()], &ident("x"))
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42723");
         let err =
             define_function(&mut registry, "NULLIF", &["x".to_string()], &ident("x")).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42723");
     }
 
     #[test]
@@ -4211,7 +4211,7 @@ mod tests {
         let mut registry = UdfRegistry::default();
         let err =
             define_function(&mut registry, "case", &["x".to_string()], &ident("x")).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42723");
     }
 
     #[test]
