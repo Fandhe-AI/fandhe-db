@@ -2256,6 +2256,41 @@ fn views_depending_on_in_txn(
     Ok(dependents)
 }
 
+/// `table` を直接参照するビューのいずれかが、`remaining_columns`（削除対象列を
+/// 除いた基底テーブルの列集合＋予約列）に収まらない列を投影・述語で参照して
+/// いれば `true`（[`Storage::alter_table_drop_column`] の依存ビュー検査）。
+/// `sql::view::check_columns_within_view`（参照時の列スコープ検査と同一実装）を
+/// 流用し、失敗はすべて「依存あり」として fail-closed に倒す。`SELECT *` は
+/// 参照時に動的展開されるため依存とみなさない。
+fn views_reference_column_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    table: &str,
+    remaining_columns: &[String],
+) -> Result<bool> {
+    for entry in views_table.iter()? {
+        let (_key, value) = entry?;
+        let def = decode_view_def(value.value())?;
+        if def.base_relation != table {
+            continue;
+        }
+        let tokens = crate::sql::lexer::tokenize(&def.body_sql)
+            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+        let parsed = parse_view_body(&tokens)
+            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+        if crate::sql::view::check_columns_within_view(
+            Some(remaining_columns),
+            &parsed.projection,
+            &parsed.where_predicates,
+            &[],
+        )
+        .is_err()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
 /// （入れ子・多次元配列）を構造的に除外し、`VECTOR` 列との責務境界を型で保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6285,6 +6320,33 @@ impl Storage {
                 return Err(CatalogError::DependentObjectsStillExist(
                     column_name.to_string(),
                 ));
+            }
+            // このテーブルを直接参照するビュー（TABLE-18・SQL-23、Issue #909）の
+            // 投影・述語が削除対象列を参照していれば拒否する（`2BP01`。ビューを
+            // 黙って壊す暗黙 cascade を作らない）。同一 write txn 内で判定する
+            // （TOCTOU 回避）。SQL 表層・NoSQL 表層とも本メソッドを通るため
+            // 双方で防がれる。
+            match write_txn.open_table(VIEWS_TABLE) {
+                Ok(views_table) => {
+                    let remaining: Vec<String> = ["id", "tenant_id", "visibility"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .chain(
+                            schema
+                                .columns
+                                .iter()
+                                .filter(|c| c.name != column_name)
+                                .map(|c| c.name.clone()),
+                        )
+                        .collect();
+                    if views_reference_column_in_txn(&views_table, table_name, &remaining)? {
+                        return Err(CatalogError::DependentObjectsStillExist(
+                            column_name.to_string(),
+                        ));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(CatalogError::from(e)),
             }
             let physical_index = u16::try_from(physical_index).map_err(|_| {
                 CatalogError::Invalid("dropped column physical index overflow".to_string())
@@ -11467,6 +11529,46 @@ mod tests {
             storage.alter_table_drop_column("scalar_only", "body"),
             Err(CatalogError::Invalid(_))
         ));
+    }
+
+    /// ビューの投影・述語が参照する列の DROP COLUMN は `DependentObjectsStillExist`
+    /// （`2BP01`）で拒否し、参照されない列は削除できる（TABLE-18・TABLE-19、
+    /// Issue #1167 レビュー対応）。
+    #[test]
+    fn alter_table_drop_column_rejects_column_referenced_by_view() {
+        let path = unique_db_path("drop-column-view-dep");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("a", ColumnType::Text, true),
+                    ColumnDef::new("b", ColumnType::Text, true),
+                    ColumnDef::new("c", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .create_view("v", "docs", "SELECT a FROM docs WHERE b = 'x'")
+            .expect("create view");
+
+        for col in ["a", "b"] {
+            assert!(
+                matches!(
+                    storage.alter_table_drop_column("docs", col),
+                    Err(CatalogError::DependentObjectsStillExist(_))
+                ),
+                "column {col} referenced by view must be rejected"
+            );
+        }
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert!(schema.columns.iter().any(|c| c.name == "a"));
+        assert!(schema.columns.iter().any(|c| c.name == "b"));
+        storage
+            .alter_table_drop_column("docs", "c")
+            .expect("unreferenced column can be dropped");
     }
 
     /// 削除後に同名列を再追加すると独立した新しい物理スロットを得て、削除前の
