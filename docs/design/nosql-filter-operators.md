@@ -80,4 +80,3 @@ SQL 構文段と同一の `WherePredicate` AST を生成して `content_hash`（
 - wire の事前検査は JSON 上の葉を数え、engine の事後検査は展開後の葉を数える。JSON 上で 256 葉ちょうどのとき NoSQL だけ `54000` になりうる（拒否側に倒れる差分）。
 - TEXT 列の `between` は SQL 側と同じく `22000`。受け付けるなら engine（SQL-24）側が先。
 - 数値列の `in` は `22000` のまま。
-

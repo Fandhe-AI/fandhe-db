@@ -172,6 +172,11 @@ pub enum FilterError {
     /// （`0A000`。`udf_call::bind_expr` がこれらの列型の式内参照を現時点で
     /// 受理しないため対象外。Issue #891 へ申し送り）。
     NumericFilterNotSupported,
+    /// 述語形 `update`／`delete` の `eq`／`ne`（`not` で包んだ `eq` を含む）が
+    /// `ARRAY`／`JSON`／`JSONB` 列を指した（`0A000`）。これらの列値は
+    /// `WherePredicate::Equality` の SQL リテラル形へ写せないため、内部エラーへ
+    /// 落とさず明示的に拒否する（fail-closed）。
+    CompositeEqNotSupportedForPredicateDml,
     /// `value` の JSON 種別が対象列型と噛み合わない・wire 固有の符号化
     /// エラー（NOSQL-17。Issue #896。BYTEA の base64 decode を含む。
     /// [`super::typed_json::TypedJsonError`] を insert・update と共有する）。
@@ -206,7 +211,10 @@ impl ClassifiedError for FilterError {
             | FilterError::LeafCountExceeded
             | FilterError::InTooMany => ErrorClass::PayloadTooLarge,
             FilterError::Bind(err) => err.error_class(),
-            FilterError::NumericFilterNotSupported => ErrorClass::FeatureNotSupported,
+            FilterError::NumericFilterNotSupported
+            | FilterError::CompositeEqNotSupportedForPredicateDml => {
+                ErrorClass::FeatureNotSupported
+            }
             FilterError::Value(err) => err.error_class(),
         }
     }
@@ -250,6 +258,10 @@ impl ClassifiedError for FilterError {
             FilterError::Bind(err) => err.client_message(),
             FilterError::NumericFilterNotSupported => {
                 "eq/range filter on INTEGER/BIGINT/REAL/DOUBLE PRECISION columns is not supported yet"
+                    .to_string()
+            }
+            FilterError::CompositeEqNotSupportedForPredicateDml => {
+                "eq/ne filter on ARRAY/JSON/JSONB columns is not supported in update/delete"
                     .to_string()
             }
             FilterError::Value(err) => err.client_message(),
@@ -1363,6 +1375,17 @@ fn where_predicate_for_node(
             {
                 return Err(FilterError::NumericFilterNotSupported);
             }
+            if matches!(*op, "eq" | "ne")
+                && schema.columns.iter().any(|c| {
+                    c.name == *column
+                        && matches!(
+                            c.ty,
+                            ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb
+                        )
+                })
+            {
+                return Err(FilterError::CompositeEqNotSupportedForPredicateDml);
+            }
             let declared = declare_leaf(column, op, value, schema)?;
             for pred in &declared {
                 let DeclarativePredicate::Leaf(leaf) = pred else {
@@ -2005,6 +2028,24 @@ mod tests {
                 value: "1.5".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn eq_ne_on_array_column_is_rejected_in_predicate_dml() {
+        let schema = schema();
+        let cases = [
+            r#"[{"column":"tags","op":"eq","value":["a"]}]"#,
+            r#"[{"column":"tags","op":"ne","value":["a"]}]"#,
+            r#"[{"not":{"column":"tags","op":"eq","value":["a"]}}]"#,
+        ];
+        for src in cases {
+            let items = filter_items(src);
+            let err = bind_filter_where_predicates(&items, &schema).expect_err("reject");
+            assert!(
+                matches!(err, FilterError::CompositeEqNotSupportedForPredicateDml),
+                "{src}: {err:?}"
+            );
+        }
     }
 
     #[test]
