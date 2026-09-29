@@ -2566,6 +2566,18 @@ pub struct ValidatedAlterTableAddUnique {
     pub columns: Vec<String>,
 }
 
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ADD PRIMARY KEY (<col>[, <col>]*)`
+/// 文（TABLE-22 (a)(d)・TASK-233、Issue #1196）。PRIMARY KEY は無名（`CONSTRAINT <name>`
+/// 付きは構造段で `42601`）で、`id` を含む列リストも構造段で `42601`
+/// （`id` は暗黙の主キーで ALTER で再宣言する意味が無いため）。列の存在確認・型適格性・
+/// 既存行の一意性／NOT NULL 検証はカタログ・行の参照を要するため、DDL 権限ゲート通過後の
+/// 実行段（`sql::ddl::execute_alter_table_add_primary_key`）が担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAddPrimaryKey {
+    pub table_name: String,
+    pub columns: Vec<String>,
+}
+
 /// 許可形状の構造判定を通過した `ALTER TABLE ... DROP CONSTRAINT <name>` 文
 /// （Issue #1067）。対象名が UNIQUE・CHECK・FOREIGN KEY いずれの制約として
 /// 存在するか、存在するとしてどれかの判定はカタログ照会を要するため構造検証
@@ -2628,7 +2640,7 @@ pub struct ValidatedAlterTableAlterColumnType {
     pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
 }
 
-/// `ALTER TABLE` の許可形状 7 種の和（Issue #1067・#1068・#1069・#1167）。`ParsedSql::AlterTable` が
+/// `ALTER TABLE` の許可形状 8 種の和（Issue #1067・#1068・#1069・#1167・#1196）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -2646,6 +2658,9 @@ pub struct ValidatedAlterTableAlterColumnType {
 ///
 /// **BREAKING CHANGE**（Issue #1167）: `DropColumn`・`AlterColumnType` variant を
 /// 追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1196）: `AddPrimaryKey` variant を追加した。
+/// 本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
@@ -2655,6 +2670,7 @@ pub enum ValidatedAlterTable {
     AddForeignKey(ValidatedAlterTableAddForeignKey),
     DropColumn(ValidatedAlterTableDropColumn),
     AlterColumnType(ValidatedAlterTableAlterColumnType),
+    AddPrimaryKey(ValidatedAlterTableAddPrimaryKey),
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -5566,6 +5582,28 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // `PRIMARY KEY`（Issue #1196・TABLE-22 (a)(d)）。PK は無名のため
+            // `CONSTRAINT <name>` 付きは `42601`（`CREATE TABLE` の
+            // `CONSTRAINT <name> PRIMARY KEY` 拒否と同方針）。`id` は暗黙の主キーで
+            // 何も永続化しないため、`id` を含む列リストも `42601`（見せかけの成功を
+            // 作らない）。いずれもカタログを参照しない構造判定で存在オラクルにならない。
+            if self.peek_contextual_keyword("PRIMARY") {
+                if constraint_name.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "CONSTRAINT <name> is not supported for PRIMARY KEY",
+                    ));
+                }
+                let columns = self.parse_primary_key_table_constraint()?;
+                if columns.iter().any(|c| c.eq_ignore_ascii_case("id")) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "PRIMARY KEY on the implicit id column is not supported in ALTER TABLE",
+                    ));
+                }
+                return Ok(ParsedAlterTableShape::AddPrimaryKey {
+                    table_name,
+                    columns,
+                });
+            }
             // `CHECK` は `UNIQUE`／`FOREIGN KEY` と異なり `(` を直接後続させない
             // （`CHECK (` の前に述語ではなく制約種別キーワードが来る）ため、次の
             // トークンで判定する。`peek_check_clause_start` は列リスト内の
@@ -7170,7 +7208,7 @@ struct ParsedAlterTableAddColumnShape {
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
-/// （Issue #1067・#1068）。[`Parser::parse_alter_table`] が返す 4 形状の和。
+/// （Issue #1067・#1068）。[`Parser::parse_alter_table`] が返す 8 形状の和。
 enum ParsedAlterTableShape {
     AddColumn(ParsedAlterTableAddColumnShape),
     AddUnique {
@@ -7199,6 +7237,10 @@ enum ParsedAlterTableShape {
         table_name: String,
         column_name: String,
         column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    },
+    AddPrimaryKey {
+        table_name: String,
+        columns: Vec<String>,
     },
 }
 
@@ -9433,7 +9475,7 @@ fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurface
 
 /// `ALTER TABLE` 文（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
 /// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD FOREIGN KEY`／`DROP COLUMN`／
-/// `ALTER COLUMN TYPE` の 7 形状）をトークン化し、
+/// `ALTER COLUMN TYPE` の 8 形状）をトークン化し、
 /// 許可リスト形式で構造検証する（TASK-202・SQL-23。Issue #900 の公開 API）。
 /// `validate_truncate` とは異なり
 /// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
@@ -9511,6 +9553,13 @@ pub fn validate_alter_table_tokens(
         } => ValidatedAlterTable::DropColumn(ValidatedAlterTableDropColumn {
             table_name,
             column_name,
+        }),
+        ParsedAlterTableShape::AddPrimaryKey {
+            table_name,
+            columns,
+        } => ValidatedAlterTable::AddPrimaryKey(ValidatedAlterTableAddPrimaryKey {
+            table_name,
+            columns,
         }),
         ParsedAlterTableShape::AlterColumnType {
             table_name,
@@ -10066,6 +10115,31 @@ pub(crate) fn validate_update_form_tokens(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// `ALTER TABLE ... ADD PRIMARY KEY` の構文受理・拒否（Issue #1196・TABLE-22 (a)(d)）。
+    #[test]
+    fn alter_table_add_primary_key_syntax() {
+        match validate_alter_table("ALTER TABLE docs ADD PRIMARY KEY (a, b);") {
+            Ok(ValidatedAlterTable::AddPrimaryKey(pk)) => {
+                assert_eq!(pk.table_name, "docs");
+                assert_eq!(pk.columns, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for sql in [
+            "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (a)",
+            "ALTER TABLE docs ADD PRIMARY KEY (id)",
+            "ALTER TABLE docs ADD PRIMARY KEY (a, ID)",
+            "ALTER TABLE docs ADD PRIMARY KEY ()",
+            "ALTER TABLE docs ADD PRIMARY KEY a",
+        ] {
+            let err = validate_alter_table(sql).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let err = validate_alter_table("ALTER TABLE docs ADD PRIMARY KEY (a, a)")
+            .expect_err("duplicate column");
+        assert_eq!(err.wire_code(), "42701");
+    }
 
     /// storage 非依存の単体テスト用フェイク（`Storage` を必要としないための軽量抽象）。
     struct FakeCatalog {

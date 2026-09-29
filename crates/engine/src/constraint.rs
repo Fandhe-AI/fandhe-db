@@ -595,6 +595,66 @@ where
     Ok(false)
 }
 
+/// `ALTER TABLE ... ADD PRIMARY KEY`（TABLE-22 (d)、Issue #1196）が主キー追加前に
+/// 呼ぶ既存行の NULL 検査。`row_table`（対象テーブルの行ストア全体）を**全テナント・
+/// `Public`／`Private` を問わず**走査し、`columns` のいずれかが NULL の行が 1 件でも
+/// あれば最初に見つけた NULL 列名を返す（列名はスキーマ情報でありテナント・行・値を
+/// 含まない）。呼び出し元は `catalog::Storage::alter_table_add_primary_key`。
+///
+/// **契約**: `schema` は**変更前**のスキーマ（PK 構成列がまだ nullable のもの）を渡す。
+/// `row_codec::scan_scalar_columns_masked` は行バッファの末尾で途切れた列を nullable
+/// の場合に限り「欠落＝NULL」として許容する。`ADD COLUMN`（DEFAULT なし）より前に
+/// 書かれた行には当該列のバイトが無いため、先に `nullable=false` へ書き換えた
+/// スキーマで走査すると decode エラー（`XX000`）になり `23502` として検出できない。
+/// DEFAULT 付き列の欠落は既定値として読まれるため NULL ではない。
+/// 行ヘッダのテナントと物理キーの整合（TABLE-12）を確認し、不整合・decode 失敗は
+/// `CorruptSchema` へ丸めて fail-closed にする（詳細はクライアントへ渡さない）。
+pub(crate) fn table_first_null_in_columns<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    columns: &[String],
+) -> Result<Option<String>, CatalogError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let mut indices: Vec<(usize, &str)> = Vec::with_capacity(columns.len());
+    for name in columns {
+        let idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("primary key references unknown column: {name}"))
+            })?;
+        indices.push((idx, name.as_str()));
+    }
+    let mut mask = vec![false; schema.columns.len()];
+    for &(idx, _) in &indices {
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+    }
+    for entry in row_table.iter()? {
+        let (k, v) = entry?;
+        let (key_tenant, _id) = k.value();
+        let buf = v.value();
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        let (_dim, metadata) = crate::storage::decode_row_dim_and_metadata_borrowed(buf)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        let values = crate::row_codec::scan_scalar_columns_masked(schema, metadata, Some(&mask))
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        for &(idx, name) in &indices {
+            if values.get(idx).and_then(|v| v.as_ref()).is_none() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// `ALTER TABLE ... ADD CHECK`（TABLE-16・TASK-204、Issue #1068）が新しい CHECK
 /// 制約を追加する前に、対象テーブルの**既存行全件**（全テナント・`Public`／
 /// `Private` を問わない。DDL はテナント横断の共有資源〔カタログ〕を変更する
