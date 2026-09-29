@@ -475,18 +475,18 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// 現在保持している共有 `redb::WriteTransaction`（`Active` のときのみ
-    /// `Some`）。書き込み系の実行本体が [`crate::tenant::WriteTarget::InTxn`]
-    /// を構築するために使う。
     /// このトランザクションで内容が変わりうるテーブル名の集合（Issue #1179）。
     /// 文が直接書き込んだテーブル（`mark_written`）と、テーブル世代が確定済み
     /// スナップショットから変化したテーブル（参照アクションの連鎖で書き込まれた
     /// 子テーブルを含む）の和。読み取りの経路選択（未 commit 変更を読む必要が
     /// あるか）と COMMIT 時の遅延 FK 検査対象の決定に使う。`Active` 以外では空。
     /// 世代の読み取りに失敗した場合は fail-closed に `Err`（呼び出し元は文を
-    /// 失敗させる）。
+    /// 失敗させる）。書き込みが 1 件も無い間（`has_writes == false`）は世代の
+    /// 走査を省き空集合を返す（連鎖書き込みは直接の書き込みが起点のため
+    /// 取りこぼさない）。
     pub(crate) fn dirty_tables(&self) -> Result<HashSet<String>, SqlSurfaceError> {
         match &self.state {
+            TxnState::Active(active) if !active.has_writes => Ok(HashSet::new()),
             TxnState::Active(active) => {
                 collect_dirty_tables(active.storage, &active.write_txn, &active.written_tables)
             }
@@ -494,6 +494,9 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// 現在保持している共有 `redb::WriteTransaction`（`Active` のときのみ
+    /// `Some`）。書き込み系の実行本体が [`crate::tenant::WriteTarget::InTxn`]
+    /// を構築するために使う。
     pub(crate) fn write_txn(&self) -> Option<&redb::WriteTransaction> {
         match &self.state {
             TxnState::Active(active) => Some(&*active.write_txn),
@@ -613,10 +616,6 @@ impl<'e> SessionTransaction<'e> {
     }
 }
 
-/// [`crate::storage::StorageError::WriteLockTimeout`]／
-/// [`crate::storage::StorageError::WriteTxnHeldByCurrentSession`] を
-/// `SqlSurfaceError::LockNotAvailable`（`55P03`）へ写像する。それ以外は
-/// 内部事象として `XX000` に丸める（他テナントの情報を含まない）。
 /// [`SessionTransaction::dirty_tables`] の実体。`written` に、書き込みトランザクション
 /// 内の世代が `storage` の確定済み世代から変化したテーブルを加えて返す。
 fn collect_dirty_tables(
@@ -636,6 +635,10 @@ fn collect_dirty_tables(
     Ok(dirty)
 }
 
+/// [`crate::storage::StorageError::WriteLockTimeout`]／
+/// [`crate::storage::StorageError::WriteTxnHeldByCurrentSession`] を
+/// `SqlSurfaceError::LockNotAvailable`（`55P03`）へ写像する。それ以外は
+/// 内部事象として `XX000` に丸める（他テナントの情報を含まない）。
 fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
     match e {
         crate::storage::StorageError::WriteLockTimeout
