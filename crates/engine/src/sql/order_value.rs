@@ -234,6 +234,34 @@ pub(crate) fn scalar_key_ref_to_owned(
     })
 }
 
+/// 文全体のスカラー `ORDER BY` の行順序を決める単一の比較器（Issue #1189）。
+/// キーを順に比較し（NULL 位置・降順は [`compare_order_key`]）、全キー同点なら
+/// `id` 昇順 → `tenant_id` バイト順で確定する（§決定的な順序）。`sql::scan` の
+/// 経路 (B) の `HeapEntry::order` と、`sql::window` の出力順計算の両方がこの関数を
+/// 呼ぶため、ウィンドウ付き取得の行順と base scan の行順が構造上ずれない。
+pub(crate) fn compare_statement_order(
+    spec: &[BoundOrderKey],
+    a_keys: &[Option<OrderValue>],
+    a_id: u64,
+    a_tenant: &[u8],
+    b_keys: &[Option<OrderValue>],
+    b_id: u64,
+    b_tenant: &[u8],
+) -> Ordering {
+    for (idx, key) in spec.iter().enumerate() {
+        let a = a_keys.get(idx).and_then(|o| o.as_ref());
+        let b = b_keys.get(idx).and_then(|o| o.as_ref());
+        let ord = compare_order_key(a, b, key.descending);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    match a_id.cmp(&b_id) {
+        Ordering::Equal => a_tenant.cmp(b_tenant),
+        id_ord => id_ord,
+    }
+}
+
 /// [`ScalarKeyRef`] 1 件分と [`OrderValue`] 1 件分を「昇順が自然な順序」として
 /// 比較する（呼び出し元 [`compare_ref_key`] が ASC/DESC・NULL 位置を適用する
 /// 前段。[`compare_order_values`] の借用対応版・比較規約は完全に同一）。
