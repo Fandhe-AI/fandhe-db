@@ -21,14 +21,13 @@
 //! `handshake::post_auth_loop` が次に届く Sync（'S'）まで後続メッセージを
 //! 読み捨てる（'X' は通常どおり終了、COPY・FunctionCall・未知の型バイトは
 //! 破棄対象にせず fail-closed に切断する。詳細は `post_auth_loop` 参照）。
-//! Sync 到達時にフラグを解除し、全 portal（名前付き・無名を問わない）を
-//! 破棄してから `ReadyForQuery` を返し、同期を回復する（portal の寿命は
-//! 明示トランザクション〔`BEGIN`/`COMMIT`/`ROLLBACK`。SQL-31・TASK-221〕の
-//! 有無とは独立な軸であり、`Active` な明示トランザクション中でも各 Sync
-//! サイクルで portal は破棄される——PostgreSQL がトランザクション終了時に
-//! portal を閉じる契約〔PostgreSQL 34.4「Bind」〕とは異なり、本サーバーは
-//! Sync 境界そのものを portal 破棄の契機とする。名前付き prepared statement
-//! は PostgreSQL と同様に保持する）。
+//! Sync 到達時にフラグを解除し、`ReadyForQuery` を返して同期を回復する。
+//! portal は、`Idle`／`Failed` ではすべて破棄し、明示トランザクション
+//! 〔`BEGIN`/`COMMIT`/`ROLLBACK`。SQL-31・TASK-221〕中（`InTransaction`）は
+//! 同じトランザクション世代で Bind した名前付き portal のみ Sync を越えて
+//! 保持する（WIRE-11・Issue #1174。PostgreSQL の「名前付き portal はトランザ
+//! クション終了まで生存」に対応）。無名 portal は常に破棄する。名前付き
+//! prepared statement は PostgreSQL と同様に保持する。
 //!
 //! 一方、`read_length_prefixed_body` 自体が失敗した場合（メッセージの境界を
 //! 確定できない・宣言長が上限を超える等）は [`respond_error_and_close`] が
@@ -41,13 +40,16 @@
 //! ——後から statement が再 Parse されても portal の実行対象は変わらない）、
 //! Execute が実行・行送出（`max_rows` による分割送出。[`PortalState::
 //! Suspended`]）・完了（[`PortalState::Done`]。副作用は再実行しない）を管理
-//! する。名前付き・無名を問わず全 portal は Sync のたびに破棄される
-//! （portal の寿命は明示トランザクション〔SQL-31・TASK-221〕の有無とは
-//! 独立に Sync 境界で決まる契約。PostgreSQL のトランザクション終了時の
-//! portal 破棄契約とは異なる点はモジュール冒頭「エラー後の同期回復」節
-//! 参照。名前付き prepared statement は Sync を越えて
-//! 残る）。Close(Statement) はその statement から作られた portal もまとめて
-//! 閉じる。
+//! する。portal は Sync で破棄される（無名は常に、名前付きは `Idle`／
+//! `Failed` の場合）が、明示トランザクション中は同世代の名前付き portal が
+//! Sync を越えて残る（WIRE-11・Issue #1174）。Sync を越えた portal は
+//! `COMMIT`／`ROLLBACK`／abort／期限切れでトランザクションが終わった時点
+//! （次メッセージ処理の先頭。[`ExtendedQueryState::purge_expired_portals`]）
+//! で失効する。`Idle` 中に Bind し同一サイクルで `BEGIN` した portal は
+//! 保守側に倒して破棄する（PostgreSQL の暗黙ブロック昇格とは異なる）。
+//! 同一 Sync サイクル内の `COMMIT`／`ROLLBACK` 後の挙動は変えない。
+//! 名前付き prepared statement は Sync を越えて残る。Close(Statement) は
+//! その statement から作られた portal もまとめて閉じる。
 //!
 //! カーソル `FETCH`（WIRE-15・TASK-218）から作った portal は、Sync 境界とは
 //! 別に、実行成功時点で束縛した [`CursorBinding`]（トランザクション世代・
@@ -605,6 +607,16 @@ struct Portal {
     /// ため束縛先のカーソルが未確定）で、`FETCH` の初回実行が成功した直後
     /// （`execute_portal`）に一度だけ設定する。
     cursor_binding: Option<CursorBinding>,
+    /// Bind 時点の明示トランザクション世代（`SessionTransaction::
+    /// active_generation`。`Idle` 等では `None`）。Sync を越えて名前付き portal を
+    /// 保持するか（[`PortalStore::retain_named_for_generation`]）と、越えた後に
+    /// 所属トランザクションが終了したか（[`PortalStore::discard_retained_outside_generation`]）
+    /// の判定に使う（WIRE-11・SQL-31・TASK-221・Issue #1174）。
+    bound_txn_generation: Option<u64>,
+    /// Sync を実際に越えて保持された portal か。同一 Sync サイクル内の
+    /// `COMMIT`／`ROLLBACK` 後も `Done` portal の完了タグ再送を許す既存挙動を
+    /// 変えないため、失効パージの対象を「Sync を越えた portal」に限定する印。
+    survived_sync: bool,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -665,18 +677,39 @@ impl PortalStore {
         self.portals.remove("");
     }
 
-    /// Sync（'S'）が名前付き・無名を問わず全 portal を破棄する（[`handle_sync`]
-    /// が呼ぶ）。portal の寿命は明示トランザクション（`BEGIN`/`COMMIT`/
-    /// `ROLLBACK`。SQL-31・TASK-221）の有無とは独立に Sync 境界そのもので
-    /// 決まる契約とし、PostgreSQL の「トランザクション終了時に portal を
-    /// 閉じる」契約〔PostgreSQL 34.4「Bind」〕とは意図的に異なる（codex P1
-    /// 指摘・PR #1013。従来は
-    /// 無名 portal のみ破棄しており、名前付き portal が Sync を越えて次回
-    /// サイクルへ誤って持ち越されていた）。名前付き prepared statement
-    /// （[`PreparedStatementStore`]）はこの対象外——PostgreSQL 同様、
-    /// Close(Statement) または接続終了まで保持される。
+    /// 全 portal を破棄する（[`handle_sync`] が `Idle`／`Failed`・世代不明の
+    /// ときに呼ぶ fail-closed 側の経路。明示トランザクション中の Sync は
+    /// [`PortalStore::retain_named_for_generation`] が担当。WIRE-11・SQL-31・
+    /// TASK-221・Issue #1174）。名前付き prepared statement
+    /// （[`PreparedStatementStore`]）はこの対象外——Close(Statement) または
+    /// 接続終了まで保持される。
     fn clear_all(&mut self) {
         self.portals.clear();
+    }
+
+    /// 明示トランザクション中の Sync（[`handle_sync`] が `InTransaction` かつ
+    /// 世代 `generation` 確定時に呼ぶ）。無名 portal と、Bind 時点の世代が
+    /// `generation` と一致しない名前付き portal を破棄し、一致する名前付き
+    /// portal だけを Sync 越しに保持する（`survived_sync` を立てる。WIRE-11・
+    /// SQL-31・TASK-221・Issue #1174）。無名 portal は保持しない（fail-closed）。
+    fn retain_named_for_generation(&mut self, generation: u64) {
+        self.portals.retain(|name, p| {
+            let keep = !name.is_empty() && p.bound_txn_generation == Some(generation);
+            if keep {
+                p.survived_sync = true;
+            }
+            keep
+        });
+    }
+
+    /// Sync を越えて保持された portal のうち、所属トランザクション（Bind 時世代）
+    /// が `current`（現在の `active_generation`）と異なるものを破棄する
+    /// （`COMMIT`／`ROLLBACK`／abort／期限切れ後の失効。`handshake::post_auth_loop`
+    /// が各メッセージ処理の先頭で呼ぶ）。`survived_sync == false` の portal は
+    /// 同一 Sync サイクル内の既存挙動を保つため対象外。
+    fn discard_retained_outside_generation(&mut self, current: Option<u64>) {
+        self.portals
+            .retain(|_, p| !(p.survived_sync && p.bound_txn_generation != current));
     }
 
     /// Close(Statement) が対象 statement から作った portal をまとめて閉じる
@@ -747,6 +780,15 @@ impl ExtendedQueryState {
     pub(crate) fn discard_unnamed_for_simple_query(&mut self) {
         self.statements.remove("");
         self.portals.remove_anonymous();
+    }
+
+    /// Sync を越えて保持した名前付き portal のうち、所属トランザクションが
+    /// 終了したものを破棄する（`handshake::post_auth_loop` がループ先頭で
+    /// `release_if_expired`／`fail` の直後に呼ぶ。Bind・Describe・Execute・
+    /// 中断保持バイト集計のすべてに先行させるための単一入口）。
+    pub(crate) fn purge_expired_portals(&mut self, active_generation: Option<u64>) {
+        self.portals
+            .discard_retained_outside_generation(active_generation);
     }
 }
 
@@ -1367,6 +1409,8 @@ fn handle_bind_body(
         result_formats,
         state: PortalState::Ready,
         cursor_binding: None,
+        bound_txn_generation: txn.active_generation(),
+        survived_sync: false,
     };
 
     state
@@ -1947,11 +1991,13 @@ fn execute_portal<'e, S: WireStream>(
 
 /// Sync（'S'）を処理する。body は厳密に空（length=4）以外を fail-closed で
 /// 拒否する（フレーム違反であり回復しない。`'X'` と同じ扱い）。
-/// [`ExtendedQueryState::ignore_till_sync`] を解除し、名前付き・無名を問わず
-/// 全 portal を破棄したうえで `ReadyForQuery` を返す（モジュールドキュメント
+/// [`ExtendedQueryState::ignore_till_sync`] を解除し、portal を破棄したうえで
+/// （明示トランザクション中は同世代の名前付き portal のみ保持。Issue #1174）
+/// `ReadyForQuery` を返す（モジュールドキュメント
 /// 「エラー後の同期回復」節・「portal のライフサイクル」節参照。portal の
 /// 寿命が明示トランザクション〔SQL-31・TASK-221〕の有無とは独立に Sync
-/// 境界だけで決まる契約は [`PortalStore::clear_all`] 参照。codex P1 指摘・
+/// 境界とトランザクション世代で決まる契約は [`PortalStore::clear_all`]・
+/// [`PortalStore::retain_named_for_generation`] 参照。codex P1 指摘・
 /// PR #1013——名前付き prepared statement〔[`PreparedStatementStore`]〕は
 /// この対象外のまま Sync を越えて残る）。トランザクション状態機械
 /// （`SessionTransaction`）自体は本関数の対象外で、`handshake::
@@ -1961,6 +2007,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     stream: &mut S,
     state: &mut ExtendedQueryState,
     txn_status: engine::sql::transaction::TransactionStatus,
+    active_generation: Option<u64>,
 ) -> io::Result<LoopSignal> {
     let _body = match framing::read_length_prefixed_body(stream, 4, 4) {
         Ok(b) => b,
@@ -1973,7 +2020,16 @@ pub(crate) fn handle_sync<S: WireStream>(
     };
 
     state.ignore_till_sync = false;
-    state.portals.clear_all();
+    // WIRE-11・SQL-31・TASK-221・Issue #1174: 明示トランザクション中
+    // （`InTransaction` かつ世代確定）は、同世代で Bind した名前付き portal のみ
+    // Sync を越えて保持する。それ以外（`Idle`／`Failed`・世代不明）は従来どおり
+    // 全 portal を破棄する（fail-closed）。
+    match (txn_status, active_generation) {
+        (engine::sql::transaction::TransactionStatus::InTransaction, Some(generation)) => {
+            state.portals.retain_named_for_generation(generation);
+        }
+        _ => state.portals.clear_all(),
+    }
     // `txn_status` は `handshake::post_auth_loop` が接続単位で保持する
     // `SessionTransaction::status()` をそのまま渡す（WIRE-19・SQL-31・
     // TASK-221・PR #1041 レビュー指摘 P1: 以前は明示トランザクションの状態を
@@ -2458,6 +2514,8 @@ mod tests {
                         result_formats: Vec::new(),
                         state: PortalState::Ready,
                         cursor_binding: None,
+                        bound_txn_generation: None,
+                        survived_sync: false,
                     },
                 )
                 .expect("insert within limit succeeds");
@@ -2471,6 +2529,8 @@ mod tests {
                 result_formats: Vec::new(),
                 state: PortalState::Ready,
                 cursor_binding: None,
+                bound_txn_generation: None,
+                survived_sync: false,
             },
         );
         assert!(matches!(result, Err(PortalStoreError::TooManyPortals)));
@@ -2489,6 +2549,8 @@ mod tests {
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
                     cursor_binding: None,
+                    bound_txn_generation: None,
+                    survived_sync: false,
                 },
             )
             .expect("insert succeeds");
@@ -2502,6 +2564,8 @@ mod tests {
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
                     cursor_binding: None,
+                    bound_txn_generation: None,
+                    survived_sync: false,
                 },
             )
             .expect("insert succeeds");
@@ -2524,6 +2588,8 @@ mod tests {
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
                     cursor_binding: None,
+                    bound_txn_generation: None,
+                    survived_sync: false,
                 },
             )
             .expect("insert succeeds");
@@ -2537,6 +2603,8 @@ mod tests {
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
                     cursor_binding: None,
+                    bound_txn_generation: None,
+                    survived_sync: false,
                 },
             )
             .expect("insert succeeds");
@@ -2544,5 +2612,64 @@ mod tests {
         store.remove_all_for_statement("stmt1");
         assert!(store.get("p1").is_none());
         assert!(store.get("p2").is_some());
+    }
+
+    fn portal_bound_at(generation: Option<u64>, survived_sync: bool) -> Portal {
+        Portal {
+            source_statement: String::new(),
+            body: PortalBody::Empty,
+            columns: None,
+            result_formats: Vec::new(),
+            state: PortalState::Ready,
+            cursor_binding: None,
+            bound_txn_generation: generation,
+            survived_sync,
+        }
+    }
+
+    #[test]
+    fn portal_store_retain_named_for_generation_keeps_only_same_generation_named() {
+        let mut store = PortalStore::new();
+        for (name, generation) in [
+            ("", Some(7)),
+            ("same", Some(7)),
+            ("other", Some(6)),
+            ("none", None),
+        ] {
+            store
+                .insert(name.to_string(), portal_bound_at(generation, false))
+                .expect("insert succeeds");
+        }
+
+        store.retain_named_for_generation(7);
+        assert!(store.get("").is_none());
+        assert!(store.get("other").is_none());
+        assert!(store.get("none").is_none());
+        assert!(store.get("same").is_some_and(|p| p.survived_sync));
+    }
+
+    #[test]
+    fn portal_store_discard_retained_only_touches_survivors_of_other_generation() {
+        let mut store = PortalStore::new();
+        for (name, generation, survived) in [
+            ("fresh_other", Some(6), false),
+            ("kept_same", Some(7), true),
+            ("kept_stale", Some(6), true),
+            ("kept_none", None, true),
+        ] {
+            store
+                .insert(name.to_string(), portal_bound_at(generation, survived))
+                .expect("insert succeeds");
+        }
+
+        store.discard_retained_outside_generation(Some(7));
+        assert!(store.get("fresh_other").is_some());
+        assert!(store.get("kept_same").is_some());
+        assert!(store.get("kept_stale").is_none());
+        assert!(store.get("kept_none").is_none());
+
+        store.discard_retained_outside_generation(None);
+        assert!(store.get("kept_same").is_none());
+        assert!(store.get("fresh_other").is_some());
     }
 }

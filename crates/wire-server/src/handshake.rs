@@ -528,6 +528,9 @@ fn post_auth_loop<'e, S: WireStream>(
             if extended.ignore_till_sync {
                 txn.fail();
             }
+            // WIRE-11・Issue #1174: Sync を越えて保持された名前付き portal のうち
+            // 所属トランザクションが終わったものを、以降の処理に先立って破棄する。
+            extended.purge_expired_portals(txn.active_generation());
         }
 
         // SQL-31・TASK-221（PR #1041 レビュー指摘）: `Active` の間は、型バイトに
@@ -846,7 +849,13 @@ fn post_auth_loop<'e, S: WireStream>(
                         .as_ref()
                         .map(|t| t.status())
                         .unwrap_or(engine::sql::transaction::TransactionStatus::Idle);
-                    match crate::extended_query::handle_sync(stream, extended, txn_status)? {
+                    let active_generation = txn.as_ref().and_then(|t| t.active_generation());
+                    match crate::extended_query::handle_sync(
+                        stream,
+                        extended,
+                        txn_status,
+                        active_generation,
+                    )? {
                         crate::extended_query::LoopSignal::Continue => {}
                         crate::extended_query::LoopSignal::Closed => return Ok(()),
                     }
