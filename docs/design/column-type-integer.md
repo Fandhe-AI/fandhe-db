@@ -59,8 +59,8 @@
 `sql::parser::bind_integer_literal` で `INTEGER`／`BIGINT` の数値リテラルを
 束縛する。`str::parse::<i32>`／`<i64>` の overflow は
 `SqlSurfaceError::numeric_out_of_range`（`22003`）、それ以外の parse 失敗
-（小数・16 進数等）は `invalid_input`（`22000`）。文字列リテラルは `22000`
-（PG 互換の暗黙変換は行わない）。範囲検査はすべて束縛段（対象行探索・台帳
+（小数・16 進数等）と文字列リテラルは Issue #1187 で `22P02`
+（`InvalidTextRepresentation`）。PG 互換の暗黙変換は行わない。範囲検査はすべて束縛段（対象行探索・台帳
 記録・書き込みトランザクション開始より前）で行うため副作用ゼロで拒否できる。
 
 ### D5: 読み出し（投影）
@@ -126,7 +126,7 @@
 - `RowDescription` の型 OID 写像は `INTEGER`/`BIGINT` 分を実装済み（本節
   「D5」参照）。`BOOLEAN` 列の OID 写像は引き続き #895 の担当
 - NoSQL の JSON 束縛（JSON 数値 → 整数列）→ #896
-- `22P02`（形式不正）の新設 → TASK-227／#897（本 Issue では `22000` で暫定拒否）
+- `22P02`（形式不正）: Issue #1187 で解消（小数・16 進数・文字列リテラルの拒否を `22P02` へ変更。真偽値・ベクトルの種別不一致は `22000` のまま）
 - SQL の DDL（`CREATE TABLE` 文）→ Phase 3（SQL-23）
 
 ## Issue #896 追記

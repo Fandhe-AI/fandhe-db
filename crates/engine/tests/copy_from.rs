@@ -775,7 +775,7 @@ fn copy_from_stdin_text_format_binds_real_and_double_columns() {
 }
 
 /// `REAL` 列のオーバーフロー（`22003`）・`DOUBLE PRECISION` 列への文字列
-/// リテラル相当の不正値（`22000`）が INSERT と同じ `wire_code` 分類で
+/// リテラル相当の不正値（`22P02`）が INSERT と同じ `wire_code` 分類で
 /// 拒否されることを固定する。
 #[test]
 fn copy_from_stdin_rejects_out_of_range_real_and_malformed_double() {
@@ -800,7 +800,31 @@ fn copy_from_stdin_rejects_out_of_range_real_and_malformed_double() {
     );
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnot-a-number\n"])
         .expect_err("malformed DOUBLE PRECISION literal must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+/// 指数表記の REAL／DOUBLE 値は受理し、アンダーフロー・オーバーフローは `22003`
+/// のまま拒否する（Issue #1187。PostgreSQL と整合）。
+#[test]
+fn copy_from_stdin_accepts_exponent_notation_and_rejects_out_of_range_exponent() {
+    let (core, path) = open_engine_ext("copy-from-ext-exponent");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, score, weight) FROM STDIN USING OPERATION_ID 'ext-op-exp-1'"
+    );
+    run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\t1.5e3\t-2.5E-2\n"])
+        .expect("exponent notation must be accepted");
+
+    for (i, (score, weight)) in [("1e-50", "1"), ("1", "1e999")].iter().enumerate() {
+        let sql = format!(
+            "COPY {EXT_TABLE} (id, embedding, score, weight) FROM STDIN USING OPERATION_ID 'ext-op-exp-bad-{i}'"
+        );
+        let line = format!("{}\t[1.0,0.0]\t{score}\t{weight}\n", 10 + i);
+        let err = run_copy_from(&core, "acme", &sql, &[line.as_bytes()])
+            .expect_err("out-of-range exponent must be rejected");
+        assert_eq!(err.wire_code(), "22003");
+    }
 }
 
 #[test]
@@ -812,7 +836,7 @@ fn copy_from_stdin_rejects_invalid_boolean_word() {
         format!("COPY {EXT_TABLE} (id, embedding, flag) FROM STDIN USING OPERATION_ID 'ext-op-3'");
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tmaybe\n"])
         .expect_err("invalid boolean word must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]
@@ -836,7 +860,7 @@ fn copy_from_stdin_rejects_malformed_bytea_hex() {
         format!("COPY {EXT_TABLE} (id, embedding, blob) FROM STDIN USING OPERATION_ID 'ext-op-5'");
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnothex\n"])
         .expect_err("malformed bytea hex literal must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 // ---------------------------------------------------------------------

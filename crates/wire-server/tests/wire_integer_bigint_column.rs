@@ -108,9 +108,9 @@ fn wire_insert_with_out_of_range_integer_literal_returns_22003() {
     read_ready_for_query(&mut stream);
 }
 
-/// 小数リテラルを `INTEGER` 列へ渡した場合は `22000`。
+/// 小数リテラルを `INTEGER` 列へ渡した場合は `22P02`（Issue #1187）。
 #[test]
-fn wire_insert_with_non_integer_literal_returns_22000() {
+fn wire_insert_with_non_integer_literal_returns_22p02() {
     let (core, _guard) = new_core_with_integer_table();
     let mut stream = spawn_with_alice(core);
 
@@ -119,7 +119,7 @@ fn wire_insert_with_non_integer_literal_returns_22000() {
         "INSERT INTO docs (id, embedding, n, b) VALUES (1, '[0.1,0.2]', 1.5, 0) \
          USING OPERATION_ID 'op-1'",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "22P02");
     read_ready_for_query(&mut stream);
 }
 
@@ -260,4 +260,67 @@ fn nosql_insert_with_integer_literal_overflowing_u64_returns_22003() {
         "22003",
         "unexpected response: {resp:?}"
     );
+}
+/// NoSQL の INTEGER／BIGINT 列へ小数・指数表記の JSON 数値を渡すと、SQL 表層の
+/// 小数リテラルと同じ `22P02`（HTTP 400）で拒否される（Issue #1187・NOSQL-17。
+/// 判定点は engine の `bind_integer_literal` に一本化）。
+#[test]
+fn nosql_insert_with_fractional_or_exponent_number_for_integer_returns_22p02() {
+    let (core, _guard) = new_core_with_integer_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let http_addr = http_common::spawn_router_listener_with_engine(
+        &users_path,
+        SessionStore::new(),
+        core.clone(),
+    );
+    let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
+    let login_request = http_common::build_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", &login_body.len().to_string()),
+        ],
+        login_body,
+    );
+    let login_resp: HttpResponse = http_common::parse_single_response(&http_common::send_raw(
+        http_addr,
+        &login_request,
+        AfterWrite::HalfClose,
+    ));
+    assert_eq!(login_resp.status, 200, "login must succeed: {login_resp:?}");
+    let login_text = String::from_utf8_lossy(&login_resp.body).into_owned();
+    let token = match engine::json::parse_json(&login_text).expect("login body must be valid json")
+    {
+        engine::json::JsonValue::Object(mut obj) => match obj.remove("token") {
+            Some(engine::json::JsonValue::String(s)) => s,
+            other => panic!("expected string token field, got {other:?}"),
+        },
+        other => panic!("expected json object body, got {other:?}"),
+    };
+
+    for (i, (n, b)) in [("1.5", "1"), ("5", "1e3")].iter().enumerate() {
+        let insert_body = format!(
+            r#"{{"op":"insert","table":"docs","rows":[{{"id":1,"embedding":[0.1,0.2],"n":{n},"b":{b}}}],"operation_id":"op-frac-{i}"}}"#
+        );
+        let request = http_common::build_request(
+            "/v1/query",
+            &[
+                ("Authorization", &format!("Bearer {token}")),
+                ("Content-Type", "application/json"),
+                ("Content-Length", &insert_body.len().to_string()),
+            ],
+            insert_body.as_bytes(),
+        );
+        let resp = http_common::parse_single_response(&http_common::send_raw(
+            http_addr,
+            &request,
+            AfterWrite::HalfClose,
+        ));
+        assert_eq!(resp.status, 400, "case {i}: {resp:?}");
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "22P02",
+            "case {i}: unexpected response: {resp:?}"
+        );
+    }
 }
