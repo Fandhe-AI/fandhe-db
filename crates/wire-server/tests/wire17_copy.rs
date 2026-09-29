@@ -1048,3 +1048,76 @@ fn wire17_copy_as_non_first_statement_in_multi_statement_message_is_rejected_wit
     );
     read_ready_for_query(&mut stream);
 }
+/// Issue #1177（WIRE-17）: psql `\copy` が実際に送出する COPY 文の形状
+/// （キーワード間の二重空白・列リストの括弧内外の空白・小文字のまま渡る
+/// `using operation_id`／`with (format csv)`・`TO STDOUT` 直後の空白）を、
+/// psql 未導入の環境でも `make ci` で固定する層 A 回帰。実 psql 経由の往復は
+/// 層 B（`three_client_e2e.rs::psql_copy_round_trips_text_and_csv_and_respects_rls`）。
+#[test]
+fn wire17_copy_from_stdin_accepts_psql_backslash_copy_text_shape() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY  docs ( id, embedding, lang ) FROM STDIN using operation_id 'psql-shape-text'",
+    );
+    let ncols = read_copy_in_response(&mut stream);
+    assert_eq!(ncols, 3);
+    send_copy_data(&mut stream, b"1\t[0.5,0.25]\tja\n");
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// psql `\copy ... with (format csv)` の生成形状（[`wire17_copy_from_stdin_accepts_psql_backslash_copy_text_shape`] と同趣旨）。
+#[test]
+fn wire17_copy_from_stdin_accepts_psql_backslash_copy_csv_shape() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY  docs ( id, embedding, lang ) FROM STDIN with (format csv) using operation_id 'psql-shape-csv'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"1,\"[0.5,0.25]\",ja\n");
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// psql `\copy (SELECT ...) to` の生成形状（`( SELECT ... ) TO STDOUT ` の
+/// 括弧内空白・末尾空白）が text／csv の両形式で CopyOut へ入ること。
+#[test]
+fn wire17_copy_to_stdout_accepts_psql_backslash_copy_shapes() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.5,0.25]', 'ja') USING OPERATION_ID 'psql-shape-seed'",
+    );
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY  ( SELECT id, embedding, lang FROM docs LIMIT 100 ) TO STDOUT ",
+    );
+    assert_eq!(read_copy_out_response(&mut stream), 3);
+    assert_eq!(read_copy_data(&mut stream), b"1\t[0.5,0.25]\tja\n");
+    read_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY  ( SELECT id, lang FROM docs LIMIT 100 ) TO STDOUT with (format csv)",
+    );
+    assert_eq!(read_copy_out_response(&mut stream), 2);
+    assert_eq!(read_copy_data(&mut stream), b"1,ja\n");
+    read_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    read_ready_for_query(&mut stream);
+}

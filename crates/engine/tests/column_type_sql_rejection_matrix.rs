@@ -17,8 +17,8 @@
 //! - RLS-9: 拒否応答が他テナントの境界値行の有無で変わらない・他テナント行が
 //!   自テナントの scan／COUNT から見えない
 //!
-//! BYTEA・JSON 列の拒否分類（`22000`／`42601`）は TASK-227（`22P02` 新設）で
-//! 見直される可能性がある。本ファイルは現行の production 応答のみを固定する。
+//! 値の形式不正は `22P02`、日時の書式違反は `22007`（Issue #1187・ERR-6）。
+//! 本ファイルは現行の production 応答のみを固定する。
 
 use engine::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -151,12 +151,12 @@ fn cases() -> Vec<TypeCase> {
             expected_wire_code: "22003",
         },
         TypeCase {
-            // tests/boolean_column.rs（文字列リテラルは型不一致）と同じ分類。
+            // tests/boolean_column.rs（文字列リテラルは形式不正）と同じ分類。
             label: "boolean-string-literal",
             column: "c_boolean",
             invalid_literal: "'true'".to_string(),
             valid_literal: "true",
-            expected_wire_code: "22000",
+            expected_wire_code: "22P02",
         },
         TypeCase {
             // tests/datetime_column.rs（暦上不正・範囲外）と同じ分類。
@@ -196,7 +196,7 @@ fn cases() -> Vec<TypeCase> {
             column: "c_bytea",
             invalid_literal: "'\\xzz'".to_string(),
             valid_literal: "'\\xdead'",
-            expected_wire_code: "22000",
+            expected_wire_code: "22P02",
         },
         TypeCase {
             // tests/json_column.rs（構文不正）と同じ分類。
@@ -204,14 +204,14 @@ fn cases() -> Vec<TypeCase> {
             column: "c_json",
             invalid_literal: "'not json'".to_string(),
             valid_literal: "'{}'",
-            expected_wire_code: "42601",
+            expected_wire_code: "22P02",
         },
         TypeCase {
             label: "jsonb-syntax-error",
             column: "c_jsonb",
             invalid_literal: "'not json'".to_string(),
             valid_literal: "'{}'",
-            expected_wire_code: "42601",
+            expected_wire_code: "22P02",
         },
         TypeCase {
             // tests/enum_column.rs（語彙外ラベル）と同じ分類。
@@ -262,6 +262,38 @@ fn rejection_matrix_covers_all_scalar_columns_in_schema() {
         expected.is_empty(),
         "columns missing from case table: {expected:?}"
     );
+}
+
+/// 形式不正の追加ケース（Issue #1187）。1 列 1 ケースの網羅チェックとは別に、
+/// 同じ列型の書式違反・文法違反が `22P02`／`22007` で拒否され、副作用が無いことを固定する。
+#[test]
+fn format_violations_are_rejected_with_22p02_or_22007_and_no_side_effects() {
+    let extra: [(&str, &str, &str, &str); 5] = [
+        ("integer-malformed", "c_integer", "'x'", "22P02"),
+        ("numeric-malformed", "c_numeric", "'abc'", "22P02"),
+        ("date-malformed-format", "c_date", "'2024/01/01'", "22007"),
+        (
+            "timestamp-malformed-format",
+            "c_timestamp",
+            "'2024-01-02T03:04:05Z'",
+            "22007",
+        ),
+        ("array-malformed", "c_array_text", "'a,b'", "22P02"),
+    ];
+    for (label, column, literal, expected) in extra {
+        let (core, path) = new_core();
+        let _guard = CleanupGuard(path);
+        let alice = ctx_for("alice");
+        let err = core
+            .execute_sql_in_session(
+                &alice,
+                &mut SessionState::default(),
+                &insert_sql(1, column, literal, "op-format"),
+            )
+            .unwrap_err();
+        assert_eq!(err.wire_code(), expected, "case {label}");
+        assert_eq!(count_star(&core, &alice), 0, "case {label}: side effect");
+    }
 }
 
 #[test]

@@ -148,7 +148,7 @@ fn insert_rejects_malformed_hex_literal() {
                 &insert_sql(1, "ja", literal, 1),
             )
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "case: {label}");
+        assert_eq!(err.wire_code(), "22P02", "case: {label}");
     }
 }
 
@@ -218,14 +218,14 @@ fn where_equality_predicate_on_bytea_column_is_accepted() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
 
-    // 形式不正のリテラル（接頭辞なし）は `22000`。
+    // 形式不正のリテラル（接頭辞なし）は `22P02`。
     let err = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE blob = 'deadbeef' LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]

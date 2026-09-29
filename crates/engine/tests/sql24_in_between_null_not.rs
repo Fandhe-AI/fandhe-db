@@ -10,9 +10,10 @@
 //! 横断して固定する。テストファイル名は TASK-208 の共有名（`sql24_predicates.rs`）
 //! を避け、並列実装中の兄弟 Issue（#912・#914）とのファイル追加衝突を防ぐ。
 //!
-//! 対象外（別 Issue へ申し送り。§8 参照）: `id`／INTEGER 系列の `IN`/`BETWEEN`、
-//! `InTyped`／`IS NULL` の索引対応、`NOT (...)` の括弧グループ（#912）、`LIKE`
-//! の中間一致等の拡張（#914）。
+//! Issue #1184 で `NOT ( ... )` と数値リテラルの `IN`／`BETWEEN`（`id`・INTEGER 等）
+//! を受理対象へ移した（構文段で脱糖・De Morgan 押し下げ。三値論理・索引一致・RLS を
+//! 本ファイル後半で固定する）。対象外: `InTyped`／`IS NULL` の索引対応、
+//! `Or`／`Not` を含む述語の索引和集合。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -602,31 +603,328 @@ fn rls_boundary_holds_across_not_is_null_and_not_in() {
     }
 }
 
-// --- 対象外（fail-closed のまま拒否されることを固定） -------------------------
+// --- Issue #1184: NOT ( ... ) と数値リテラルの IN／BETWEEN ------------------
+
+/// `seed_five_rows` に、`tag`・`day`・`qty` がすべて NULL の `lang = 'ja'` 行（id 6）を
+/// 足す。三値論理の識別（`NOT (tag = 'a' OR lang = 'en')` が id 6 を含まないこと）用。
+fn seed_six_rows(core: &EngineCore, ctx: &PolicyContext) {
+    seed_five_rows(core, ctx);
+    insert_row(core, ctx, 6, "ja", None, None, None, "op", "op-6");
+}
+
+fn run_ids(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
+    let result = core
+        .execute_sql(ctx, sql)
+        .unwrap_or_else(|e| panic!("{sql:?} should succeed, got {e:?}"));
+    ids(&result
+        .rows
+        .iter()
+        .map(|r| r.cells.clone())
+        .collect::<Vec<_>>())
+}
 
 #[test]
-fn id_in_and_integer_between_remain_rejected_as_out_of_scope() {
+fn not_group_follows_three_valued_logic_and_never_includes_unknown_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_six_rows(&core, &alice);
+
+    // PostgreSQL 準拠（Kleene 三値論理）。id 6 は tag が NULL:
+    //   NOT (tag = 'a' OR lang = 'en') = NOT (UNKNOWN OR FALSE) = UNKNOWN -> 除外
+    // 二値の否定（UNKNOWN を false として反転）だと id 6 を含んでしまう。
+    assert_eq!(
+        select_ids(&core, &alice, "NOT (tag = 'a' OR lang = 'en')"),
+        vec![2, 3]
+    );
+    // NOT (tag = 'a' AND lang = 'ja'): id 4, 5 は FALSE AND FALSE -> 含む、id 6 は
+    // UNKNOWN AND TRUE = UNKNOWN -> 除外。
+    assert_eq!(
+        select_ids(&core, &alice, "NOT (tag = 'a' AND lang = 'ja')"),
+        vec![2, 3, 4, 5]
+    );
+    // NOT (tag IN ('a') OR day IS NULL): id 6 は UNKNOWN OR TRUE = TRUE -> 除外。
+    // id 5 も day が NULL で TRUE -> 除外。id 4 は UNKNOWN OR FALSE -> 除外。
+    assert_eq!(
+        select_ids(&core, &alice, "NOT (tag IN ('a') OR day IS NULL)"),
+        vec![2, 3]
+    );
+    // 二重否定は元の述語に戻る。
+    assert_eq!(
+        select_ids(&core, &alice, "NOT (NOT (tag = 'a' OR lang = 'en'))"),
+        vec![1, 4, 5]
+    );
+    assert_eq!(
+        select_ids(&core, &alice, "NOT (tag NOT IN ('a', 'c'))"),
+        vec![1, 3]
+    );
+    // 裸の `NOT <式比較>` と値式グループ。
+    assert_eq!(select_ids(&core, &alice, "NOT id > 3"), vec![1, 2, 3]);
+    assert_eq!(select_ids(&core, &alice, "NOT (id + 1) > 4"), vec![1, 2, 3]);
+    assert_eq!(
+        select_ids(&core, &alice, "NOT (id = 2)"),
+        vec![1, 3, 4, 5, 6]
+    );
+}
+
+#[test]
+fn numeric_in_and_between_on_id_and_integer_column() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_six_rows(&core, &alice);
+
+    for (clause, expected) in [
+        ("id IN (1, 3)", vec![1, 3]),
+        ("id IN (2)", vec![2]),
+        ("id NOT IN (1, 2)", vec![3, 4, 5, 6]),
+        ("id BETWEEN 2 AND 4", vec![2, 3, 4]),
+        ("id NOT BETWEEN 2 AND 4", vec![1, 5, 6]),
+        ("NOT (id BETWEEN 2 AND 4)", vec![1, 5, 6]),
+        ("id BETWEEN 4 AND 2", vec![]),
+        ("id BETWEEN 1.5 AND 3", vec![2, 3]),
+        ("id BETWEEN 2 AND 4 AND lang = 'ja'", vec![2, 3]),
+    ] {
+        assert_eq!(select_ids(&core, &alice, clause), expected, "{clause}");
+    }
+}
+
+#[test]
+fn new_forms_work_across_scan_aggregate_group_by_and_predicate_dml() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_six_rows(&core, &alice);
+
+    // 検索 SELECT（ORDER BY あり）
+    assert_eq!(
+        run_ids(
+            &core,
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE id IN (1, 3) \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            )
+        ),
+        vec![1, 3]
+    );
+    // COUNT(*) WHERE
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT COUNT(*) FROM {TABLE} WHERE NOT (tag = 'a' OR lang = 'en')"),
+        )
+        .expect("aggregate should accept NOT group");
+    match &result.rows[0].cells[0] {
+        Cell::Integer(v) => assert_eq!(*v, 2),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+    // GROUP BY ... WHERE
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT lang, COUNT(*) AS n FROM {TABLE} WHERE id BETWEEN 2 AND 5 \
+                 GROUP BY lang ORDER BY lang"
+            ),
+        )
+        .expect("GROUP BY should accept numeric BETWEEN");
+    assert_eq!(result.rows.len(), 2);
+
+    // 述語形 UPDATE／DELETE と同一 OPERATION_ID の再送（冪等）
+    let upd = format!(
+        "UPDATE {TABLE} SET lang = 'fr' WHERE id NOT IN (1, 2, 6) USING OPERATION_ID 'op-upd-1184'"
+    );
+    match core
+        .execute_sql_in_session(&alice, &mut SessionState::default(), &upd)
+        .expect("predicate UPDATE should accept numeric NOT IN")
+    {
+        SqlOutcome::Update(u) => assert_eq!(u.rows_affected, 3),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+    assert_eq!(select_ids(&core, &alice, "lang = 'fr'"), vec![3, 4, 5]);
+    match core
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "DELETE FROM {TABLE} WHERE NOT (lang = 'fr' OR id = 6) USING OPERATION_ID 'op-del-1184'"
+            ),
+        )
+        .expect("predicate DELETE should accept NOT group")
+    {
+        SqlOutcome::Delete(d) => assert_eq!(d.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(select_ids(&core, &alice, "id > 0"), vec![3, 4, 5, 6]);
+}
+
+#[test]
+fn distance_first_not_group_with_expr_does_not_fail_open() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_six_rows(&core, &alice);
+
+    // DISTANCE 先行（遅延評価）でも NOT グループが NULL 行を含めない。
+    let sql = format!(
+        "SELECT id FROM {TABLE} WHERE NOT (qty IS NOT NULL OR id > 100) \
+         ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10 \
+         HINT ORDER(DISTANCE, SCALAR, RLS)"
+    );
+    // qty IS NOT NULL は id 1..5 が TRUE。id 6 のみ (FALSE OR FALSE) の否定で TRUE。
+    assert_eq!(run_ids(&core, &alice, &sql), vec![6]);
+}
+
+#[test]
+fn new_forms_index_path_matches_plain_scan() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_six_rows(&core, &alice);
+
+    // 述語に `OR lang = 'never'` を足すと PlainScan に落ちる（結果は不変）。
+    for (clause, expected) in [
+        ("NOT (tag NOT IN ('a', 'c'))", vec![1, 3]),
+        (
+            "NOT (day NOT BETWEEN '2024-01-01' AND '2024-06-01')",
+            vec![1, 2, 3],
+        ),
+        ("id BETWEEN 2 AND 4", vec![2, 3, 4]),
+        ("NOT (id > 3)", vec![1, 2, 3]),
+        ("NOT (id BETWEEN 2 AND 4)", vec![1, 5, 6]),
+    ] {
+        let sql = format!(
+            "SELECT id FROM {TABLE} WHERE {clause} \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+        );
+        let cold = run_ids(&core, &alice, &sql);
+        let hot = run_ids(&core, &alice, &sql);
+        assert_eq!(cold, hot, "cold/hot: {clause}");
+        assert_eq!(hot, expected, "{clause}");
+        let plain_sql = format!(
+            "SELECT id FROM {TABLE} WHERE ({clause}) OR lang = 'never' \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+        );
+        assert_eq!(
+            run_ids(&core, &alice, &plain_sql),
+            expected,
+            "plain scan: {clause}"
+        );
+    }
+}
+
+#[test]
+fn rls_boundary_holds_across_not_group_and_numeric_in_between() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    seed_six_rows(&core, &alice);
+    seed_six_rows(&core, &bob);
+
+    for (clause, expected) in [
+        ("NOT (tag = 'a' OR lang = 'en')", vec![2, 3]),
+        ("id IN (1, 3)", vec![1, 3]),
+        ("id NOT IN (1, 2)", vec![3, 4, 5, 6]),
+        ("id BETWEEN 2 AND 4", vec![2, 3, 4]),
+    ] {
+        assert_eq!(
+            select_ids(&core, &alice, clause),
+            expected,
+            "alice: {clause}"
+        );
+        assert_eq!(select_ids(&core, &bob, clause), expected, "bob: {clause}");
+    }
+
+    // RLS 述語を否定越しに扱う形は fail-closed で拒否する。
+    for clause in ["NOT (visible())", "NOT (lang = 'ja' AND visible())"] {
+        let err = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT id FROM {TABLE} WHERE {clause} LIMIT 10"),
+            )
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601", "{clause}");
+    }
+}
+
+// --- 拒否のまま残す形（fail-closed） -----------------------------------------
+
+#[test]
+fn malformed_and_unsupported_forms_stay_rejected() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
     seed_five_rows(&core, &alice);
 
-    // `id IN (...)`（数値リテラル。レーン A 未実装）は式フォールバックへ回り、
-    // `IN` を式構文として解釈できないため `42601`。
-    let err = core
-        .execute_sql(
-            &alice,
-            &format!("SELECT id FROM {TABLE} WHERE id IN (1, 2) LIMIT 10"),
-        )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    for (clause, code) in [
+        ("id IN (1, 'a')", "42601"),
+        ("id IN (1, NULL)", "42601"),
+        ("id IN (-1)", "42601"),
+        ("id BETWEEN 1 AND '3'", "42601"),
+        ("NOT tag IN (SELECT lang FROM docs)", "0A000"),
+        ("NOT (EXISTS (SELECT id FROM docs))", "0A000"),
+    ] {
+        let err = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT id FROM {TABLE} WHERE {clause} LIMIT 10"),
+            )
+            .unwrap_err();
+        assert_eq!(err.wire_code(), code, "{clause}");
+    }
 
-    // INTEGER 列の `BETWEEN`（数値リテラル）も同様に `42601`。
+    // TEXT 列に数値リテラルを与えた場合は `col = n` と同じ分類で拒否される。
+    let code_of = |clause: &str| {
+        core.execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE {clause} LIMIT 10"),
+        )
+        .unwrap_err()
+        .wire_code()
+    };
+    assert_eq!(code_of("tag IN (1)"), code_of("tag = 1"));
+    // 数値列（qty）は `col = n` と受理・拒否が一致する（構文段は列型を知らず、
+    // 束縛段の判定に従う。fail-closed）。
+    let qty_code = |clause: &str| {
+        core.execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE {clause} LIMIT 10"),
+        )
+        .map(|_| "ok")
+        .unwrap_or_else(|e| e.wire_code())
+    };
+    assert_eq!(qty_code("qty IN (1)"), qty_code("qty = 1"));
+    assert_eq!(qty_code("qty BETWEEN 1 AND 3"), qty_code("qty >= 1"));
+    assert_eq!(qty_code("NOT (qty > 1)"), qty_code("qty <= 1"));
+}
+
+#[test]
+fn numeric_not_in_beyond_expr_budget_is_payload_too_large() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_five_rows(&core, &alice);
+
+    let list = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    // 上限ちょうどの IN は受理される。
+    assert_eq!(
+        select_ids(&core, &alice, &format!("id IN ({})", list(256))),
+        vec![1, 2, 3, 4, 5]
+            .into_iter()
+            .filter(|i| *i < 256)
+            .collect::<Vec<u64>>()
+    );
+    // NOT IN は比較数が倍になり式ノード予算を超える。
     let err = core
         .execute_sql(
             &alice,
-            &format!("SELECT id FROM {TABLE} WHERE qty BETWEEN 1 AND 3 LIMIT 10"),
+            &format!(
+                "SELECT id FROM {TABLE} WHERE id NOT IN ({}) LIMIT 10",
+                list(200)
+            ),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "54000");
 }

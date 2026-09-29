@@ -83,8 +83,8 @@
 //! - 未定義ステートメント名／portal 名への参照・名前付きステートメント／
 //!   portal の重複作成・Bind のパラメータ数不一致・format code の個数不正
 //!   → `08P01`（`ProtocolViolation`）
-//! - Bind のパラメータ format code が binary（1）を指定（`$n` 束縛が
-//!   WIRE-12・#935 未実装のため一律拒否）・結果 format code が非対応型の列を
+//! - Bind のパラメータ format code が binary（1）で対象スロットが text 系以外
+//!   （WIRE-12・#1171）・結果 format code が非対応型の列を
 //!   binary 指定（WIRE-14・[`result_encoder::column_binary_support`]）・
 //!   Describe(Portal) 対象の受理不能・実行結果列の不整合（いずれも `0A000`
 //!   の「未対応機能」区分を fail-closed なガードとして流用）
@@ -95,8 +95,9 @@
 //!   `54000`（`PayloadTooLarge`。[`crate::limits`] の各定数）
 //! - body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト
 //!   不正）→ `08P01`
-//! - パラメータ型宣言（`num_param_types > 0`）→ `0A000`（`$n` 束縛は WIRE-12・
-//!   #935 の担当。本 Issue は Parse 自体を拒否する）
+//! - パラメータ型宣言の件数が上限（`MAX_PARAMS`）超過 → `54000`。プレースホルダ数
+//!   超過 → `08P01`（WIRE-12・#1171。宣言 OID 自体は受理し値検証には使わない）
+//! - Bind のパラメータ format code の値不正（0/1 以外）・値数不一致 → `08P01`
 //! - SQL 検証失敗・実行時エラー → `engine::sql::allowlist::SqlSurfaceError::
 //!   error_class()`（簡易クエリと同一の分類）
 //!
@@ -108,16 +109,17 @@
 
 use std::io;
 
-use engine::core::{EngineCore, ParsedSql};
+use engine::core::{EngineCore, ParsedSql, PreparedSql};
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::recovery::commit_boundary::ResponseBoundaryGuard;
 use engine::sql::exec::ColumnMeta;
 use engine::sql::mode::SessionState;
+use engine::sql::params::{PreparedParamType, MAX_PARAMS};
 
 use crate::error_response;
 use crate::framing::{self, FrameError};
 use crate::limits::{
-    MAX_PORTALS_PER_SESSION, MAX_PREPARED_SQL_BYTES_PER_SESSION,
+    MAX_BOUND_PARAM_BYTES_PER_SESSION, MAX_PORTALS_PER_SESSION, MAX_PREPARED_SQL_BYTES_PER_SESSION,
     MAX_PREPARED_STATEMENTS_PER_SESSION, MAX_RESPONSE_BUFFER_BYTES, MAX_STATEMENT_NAME_LEN,
     MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION,
 };
@@ -235,12 +237,23 @@ struct ParseMessage {
     name: String,
     query: String,
     num_param_types: usize,
+    /// 宣言型 OID 列の生バイト（`num_param_types * 4` バイト。フレーム上限で
+    /// 有界）。件数上限（[`MAX_PARAMS`]）の判定を通過した後にだけ
+    /// [`decode_declared_oids`] で復号する（上限検証前にアロケーションしない）。
+    param_oid_bytes: Vec<u8>,
+}
+
+/// 宣言型 OID 列を復号する（呼び出し元が件数 <= [`MAX_PARAMS`] を確認済みで
+/// あること）。`as_chunks::<4>` で 4 バイト単位に分割するため添字アクセスを使わない（余りは無視）。
+fn decode_declared_oids(bytes: &[u8]) -> Vec<i32> {
+    let (chunks, _rest) = bytes.as_chunks::<4>();
+    chunks.iter().map(|c| i32::from_be_bytes(*c)).collect()
 }
 
 /// Parse（'P'）の body（PostgreSQL wire v3: 文字列名 cstr・クエリ文字列 cstr・
-/// パラメータ型 OID 件数 i16・OID 列 i32×件数）を復号する。OID 列自体の値は
-/// 読み捨てず件数分の存在のみ検証する（`$n` 束縛〔WIRE-12・#935〕未対応のため
-/// `num_param_types > 0` は呼び出し元が `0A000` で拒否する）。
+/// パラメータ型 OID 件数 i16・OID 列 i32×件数）を復号する。OID 列は件数分の
+/// 存在（長さ整合）のみ検証して生バイトのまま保持し、復号は呼び出し元が件数上限を
+/// 確認した後に行う（WIRE-12）。
 fn parse_parse_body(body: &[u8]) -> Result<ParseMessage, BodyError> {
     let mut pos = 0usize;
     let name = read_cstring(body, &mut pos)?;
@@ -261,6 +274,7 @@ fn parse_parse_body(body: &[u8]) -> Result<ParseMessage, BodyError> {
         name,
         query,
         num_param_types,
+        param_oid_bytes: remaining.to_vec(),
     })
 }
 
@@ -316,13 +330,13 @@ fn parse_close_body(body: &[u8]) -> Result<CloseMessage, BodyError> {
     Ok(CloseMessage { target, name })
 }
 
-/// 復号済みの Bind メッセージ。パラメータ値そのものは保持しない（`$n` 束縛は
-/// #935・WIRE-12 の担当。本 Issue は構造検証と件数一致確認のみ行う）。
+/// 復号済みの Bind メッセージ。`param_values` は `$1` から順の生バイト列
+/// （`None` は NULL）。総量は body（フレーム上限）で有界。
 struct BindMessage {
     portal_name: String,
     statement_name: String,
     param_format_codes: Vec<i16>,
-    num_params: usize,
+    param_values: Vec<Option<Vec<u8>>>,
     result_format_codes: Vec<i16>,
 }
 
@@ -348,10 +362,13 @@ fn parse_bind_body(body: &[u8]) -> Result<BindMessage, BodyError> {
         return Err(BodyError::NegativeCount);
     }
     let num_params = num_params_declared as usize;
+    // 各値は最低 4 バイト（長さ）を要するため、件数は body 長で有界。
+    let mut param_values: Vec<Option<Vec<u8>>> = Vec::new();
     for _ in 0..num_params {
         let len = read_i32(body, &mut pos)?;
         if len == -1 {
             // NULL: 値本体を持たない。
+            param_values.push(None);
         } else if len < 0 {
             return Err(BodyError::NegativeCount);
         } else {
@@ -359,9 +376,10 @@ fn parse_bind_body(body: &[u8]) -> Result<BindMessage, BodyError> {
             let end = pos
                 .checked_add(len)
                 .ok_or(BodyError::TrailingOrTruncatedBytes)?;
-            if end > body.len() {
-                return Err(BodyError::TrailingOrTruncatedBytes);
-            }
+            let value = body
+                .get(pos..end)
+                .ok_or(BodyError::TrailingOrTruncatedBytes)?;
+            param_values.push(Some(value.to_vec()));
             pos = end;
         }
     }
@@ -383,7 +401,7 @@ fn parse_bind_body(body: &[u8]) -> Result<BindMessage, BodyError> {
         portal_name,
         statement_name,
         param_format_codes,
-        num_params,
+        param_values,
         result_format_codes,
     })
 }
@@ -423,7 +441,30 @@ fn parse_execute_body(body: &[u8]) -> Result<ExecuteMessage, BodyError> {
 pub(crate) enum PreparedStatement {
     Empty,
     Parsed(ParsedSql),
+    /// `$n` を含む文（WIRE-12）。engine の [`PreparedSql`] テンプレートと、
+    /// `$n` ごとの公告 OID・バイナリ可否（[`ParamSlot`]）を保持する。Bind が
+    /// `engine.bind_prepared` で値を束縛して [`ParsedSql`] を得る。
+    Parameterized {
+        prepared: PreparedSql,
+        slots: Vec<ParamSlot>,
+    },
 }
+
+/// `$n` 1 個分の公告情報（Parse が確定し、Describe(S) の
+/// `ParameterDescription` と Bind のバイナリ受理判定が参照する）。
+/// 値の検証意味論には影響しない（値は常に engine のリテラル置換経路を通る）。
+pub(crate) struct ParamSlot {
+    /// `ParameterDescription` で公告する型 OID（宣言 OID が 0 以外ならその
+    /// echo、それ以外は推論 OID）。
+    oid: i32,
+    /// バイナリ形式の値を受理してよいか（text 系スロットのみ。バイト列は
+    /// UTF-8 の恒等表現としてそのまま engine へ渡す）。
+    binary: bool,
+}
+
+/// 宣言 OID のうち、text 系スロットへバイナリ（UTF-8 バイト恒等）を許す型。
+/// 0（未指定）・25（text）・1043（varchar）。
+const TEXT_LIKE_DECLARED_OIDS: [i32; 3] = [0, 25, 1043];
 
 /// 接続単位（`handshake` の接続ループが `SessionState` と並べて所有し、接続終了
 /// で破棄）の名前付き／無名ステートメント保持。無名（`""`）は
@@ -617,6 +658,11 @@ struct Portal {
     /// `COMMIT`／`ROLLBACK` 後も `Done` portal の完了タグ再送を許す既存挙動を
     /// 変えないため、失効パージの対象を「Sync を越えた portal」に限定する印。
     survived_sync: bool,
+    /// Bind が束縛した値のバイト合計（`$n` を含まない文は 0）。束縛済み
+    /// `ParsedSql` が値を保持するため、接続全体の合計を
+    /// [`MAX_BOUND_PARAM_BYTES_PER_SESSION`] で制限する（[`PortalStore::insert`]）。
+    /// portal ごとの値から都度合算するため、除去経路での減算漏れが起きない。
+    bound_bytes: usize,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -629,6 +675,7 @@ enum PortalStoreError {
     NameTooLong,
     DuplicateName,
     TooManyPortals,
+    BoundBytesExceeded,
 }
 
 impl PortalStore {
@@ -651,6 +698,16 @@ impl PortalStore {
             if named_count >= MAX_PORTALS_PER_SESSION {
                 return Err(PortalStoreError::TooManyPortals);
             }
+        }
+        // 束縛値バイトの接続全体上限（同名 portal の置換分は差し引く）。
+        let others = self
+            .portals
+            .iter()
+            .filter(|(n, _)| n.as_str() != name)
+            .fold(0usize, |acc, (_, p)| acc.saturating_add(p.bound_bytes));
+        match others.checked_add(portal.bound_bytes) {
+            Some(total) if total <= MAX_BOUND_PARAM_BYTES_PER_SESSION => {}
+            _ => return Err(PortalStoreError::BoundBytesExceeded),
         }
         self.portals.insert(name, portal);
         Ok(())
@@ -799,22 +856,25 @@ enum HandlerError {
     Sql(engine::sql::allowlist::SqlSurfaceError),
     Store(StoreError),
     PortalStore(PortalStoreError),
-    /// `$n` パラメータ型宣言（WIRE-12・#935 の担当。本 Issue では常に拒否）。
-    ParamTypesUnsupported,
+    /// Parse の宣言型件数が [`MAX_PARAMS`] を超える（`54000`。WIRE-12）。
+    TooManyParams,
+    /// Parse の宣言型件数が SQL 中のプレースホルダ数を超える（`08P01`。
+    /// PostgreSQL は受理するが、本実装は fail-closed に拒否する逸脱）。
+    DeclaredParamTypesExceedPlaceholders,
+    /// Bind のパラメータ format code が 0・1 以外（`08P01`）。
+    InvalidParamFormatCode,
     /// 対象が未定義のステートメント名。
     UnknownStatement,
     /// 対象が未定義の portal 名。
     UnknownPortal,
-    /// Bind のパラメータ数が対象ステートメントの要求数と一致しない
-    /// （`$n` 未対応のため現状の要求数は常に 0）。
+    /// Bind のパラメータ数が対象ステートメントの要求数（`$n` なしは 0、
+    /// `Parameterized` は最大の `$n` 番号）と一致しない。
     ParamCountMismatch,
     /// パラメータ format code の個数が 0・1・対象数のいずれでもない
     /// （結果 format code の同種エラーは [`HandlerError::BinaryFormat`] 経由）。
     FormatCodeCountMismatch,
-    /// パラメータ format code が binary（1）を指定している。`$n` 束縛は
-    /// WIRE-12・#935 の担当で現状 `num_params` は常に 0 のため、パラメータ側の
-    /// 実バイナリ対応は本 Issue の対象外のまま一律拒否する（結果側は
-    /// [`HandlerError::BinaryFormat`]・WIRE-14 が実対応する）。
+    /// パラメータ format code が binary（1）だが、対象スロットがバイナリ非対応
+    /// （text 系以外。WIRE-12・WIRE-14。結果側は [`HandlerError::BinaryFormat`]）。
     BinaryFormatUnsupported,
     /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
     /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
@@ -860,7 +920,9 @@ impl HandlerError {
                 ErrorClass::ProtocolViolation
             }
             HandlerError::PortalStore(_) => ErrorClass::PayloadTooLarge,
-            HandlerError::ParamTypesUnsupported => ErrorClass::FeatureNotSupported,
+            HandlerError::TooManyParams => ErrorClass::PayloadTooLarge,
+            HandlerError::DeclaredParamTypesExceedPlaceholders => ErrorClass::ProtocolViolation,
+            HandlerError::InvalidParamFormatCode => ErrorClass::ProtocolViolation,
             HandlerError::UnknownStatement => ErrorClass::ProtocolViolation,
             HandlerError::UnknownPortal => ErrorClass::ProtocolViolation,
             HandlerError::ParamCountMismatch => ErrorClass::ProtocolViolation,
@@ -905,9 +967,18 @@ impl HandlerError {
             HandlerError::PortalStore(PortalStoreError::TooManyPortals) => {
                 "too many portals on this connection".to_string()
             }
-            HandlerError::ParamTypesUnsupported => {
-                "parameter type declarations in Parse are not supported on this connection"
+            HandlerError::PortalStore(PortalStoreError::BoundBytesExceeded) => {
+                "bound parameter values exceed the per-connection limit".to_string()
+            }
+            HandlerError::TooManyParams => {
+                "too many parameter types declared in Parse".to_string()
+            }
+            HandlerError::DeclaredParamTypesExceedPlaceholders => {
+                "Parse declares more parameter types than the statement has placeholders"
                     .to_string()
+            }
+            HandlerError::InvalidParamFormatCode => {
+                "parameter format code must be 0 (text) or 1 (binary)".to_string()
             }
             HandlerError::UnknownStatement => "no such prepared statement".to_string(),
             HandlerError::UnknownPortal => "no such portal".to_string(),
@@ -918,7 +989,7 @@ impl HandlerError {
                 "format code count does not match the parameter or result count".to_string()
             }
             HandlerError::BinaryFormatUnsupported => {
-                "binary parameter format is not supported on this connection".to_string()
+                "binary parameter format is not supported for this parameter".to_string()
             }
             HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
                 "format code count does not match the parameter or result count".to_string()
@@ -1095,15 +1166,37 @@ fn handle_parse_body(
     {
         return Err(HandlerError::Sql(txn.take_failed_error()));
     }
-    if msg.num_param_types > 0 {
-        return Err(HandlerError::ParamTypesUnsupported);
+    // 宣言型件数の上限検証は OID 列の復号・アロケーションより前に行う。
+    if msg.num_param_types > usize::from(MAX_PARAMS) {
+        return Err(HandlerError::TooManyParams);
     }
 
     let statement = if msg.query.trim().is_empty() {
+        // 空文はプレースホルダ 0 個なので、型宣言が 1 個でもあれば過剰宣言
+        // （他の 0 プレースホルダ文と同じ契約・fail-closed）。
+        if msg.num_param_types > 0 {
+            return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
+        }
         PreparedStatement::Empty
     } else {
-        let parsed = engine.parse_sql(&msg.query).map_err(HandlerError::Sql)?;
-        PreparedStatement::Parsed(parsed)
+        let prepared = engine
+            .parse_sql_prepared(&msg.query)
+            .map_err(HandlerError::Sql)?;
+        match prepared.parsed_if_unparameterized() {
+            // `$n` を含まない文は従来どおり Parsed 経路のまま保持する
+            // （二重 parse なし・挙動不変）。宣言型があれば過剰宣言。
+            Some(parsed) => {
+                if msg.num_param_types > 0 {
+                    return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
+                }
+                PreparedStatement::Parsed(parsed.clone())
+            }
+            None => {
+                let declared = decode_declared_oids(&msg.param_oid_bytes);
+                let slots = build_param_slots(&prepared, &declared)?;
+                PreparedStatement::Parameterized { prepared, slots }
+            }
+        }
     };
 
     store
@@ -1111,12 +1204,51 @@ fn handle_parse_body(
         .map_err(HandlerError::Store)
 }
 
+/// `$n` ごとの公告 OID・バイナリ可否を組み立てる（WIRE-12）。宣言 OID は
+/// 値の検証には一切使わない（値は常にリテラル置換経路を通るため、宣言型で
+/// 検証を迂回できない）。0 以外はそのまま echo し、0・未宣言は推論値で補う。
+/// バイナリは、推論がバイナリ対応かつ宣言 OID が text 系（0・25・1043）の
+/// ときだけ許す。
+fn build_param_slots(
+    prepared: &PreparedSql,
+    declared: &[i32],
+) -> Result<Vec<ParamSlot>, HandlerError> {
+    let types = prepared.param_types();
+    if declared.len() > types.len() {
+        return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
+    }
+    let slots = types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let (inferred_oid, inferred_binary) = match ty {
+                PreparedParamType::Text => (result_encoder::WireType::Text.oid(), true),
+                PreparedParamType::VectorText => (result_encoder::WireType::Text.oid(), false),
+                PreparedParamType::Column(meta) => (
+                    result_encoder::column_wire_type(meta).oid(),
+                    result_encoder::column_binary_support(meta),
+                ),
+            };
+            let declared_oid = declared.get(i).copied().unwrap_or(0);
+            ParamSlot {
+                oid: if declared_oid != 0 {
+                    declared_oid
+                } else {
+                    inferred_oid
+                },
+                binary: inferred_binary && TEXT_LIKE_DECLARED_OIDS.contains(&declared_oid),
+            }
+        })
+        .collect();
+    Ok(slots)
+}
+
 // ---------------------------------------------------------------------------
 // Describe（'D'。statement・portal 両対象）
 // ---------------------------------------------------------------------------
 
 enum DescribeResult {
-    Statement(Option<Vec<ColumnMeta>>),
+    Statement(Option<Vec<ColumnMeta>>, Vec<i32>),
     /// portal 対象。`Bind` が確定した結果 format code（WIRE-14）を
     /// `RowDescription` の各列の format code フィールドへそのまま反映する
     /// （Execute の `DataRow` と同じ値を参照——Bind 時点で確定した形式を
@@ -1125,8 +1257,8 @@ enum DescribeResult {
 }
 
 /// Describe（'D'）を処理する（`engine` が接続済みの場合のみ呼ばれる）。
-/// statement 対象は `ParameterDescription`（常に 0 件。`$n` 束縛は #935 の
-/// 担当）と `RowDescription`（結果列なしは `NoData`）を返す。portal 対象は
+/// statement 対象は `ParameterDescription`（`$n` の公告 OID。WIRE-12。
+/// `$n` なしは 0 件）と `RowDescription`（結果列なしは `NoData`）を返す。portal 対象は
 /// `ParameterDescription` を返さず `RowDescription`／`NoData` のみ返す
 /// （PostgreSQL の規約）。
 pub(crate) fn handle_describe<S: WireStream>(
@@ -1151,8 +1283,8 @@ pub(crate) fn handle_describe<S: WireStream>(
     };
 
     match handle_describe_body(engine, session, txn, state, &body) {
-        Ok(DescribeResult::Statement(columns)) => {
-            write_describe_response(stream, true, columns)?;
+        Ok(DescribeResult::Statement(columns, param_oids)) => {
+            write_describe_response(stream, &param_oids, columns)?;
             Ok(LoopSignal::Continue)
         }
         Ok(DescribeResult::Portal(columns, formats)) => {
@@ -1168,19 +1300,17 @@ pub(crate) fn handle_describe<S: WireStream>(
 
 fn write_describe_response<S: WireStream>(
     stream: &mut S,
-    include_parameter_description: bool,
+    param_oids: &[i32],
     columns: Option<Vec<ColumnMeta>>,
 ) -> io::Result<()> {
-    if include_parameter_description {
-        stream.write_all(
-            &result_encoder::encode_parameter_description(&[]).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "failed to encode ParameterDescription",
-                )
-            })?,
-        )?;
-    }
+    stream.write_all(
+        &result_encoder::encode_parameter_description(param_oids).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to encode ParameterDescription",
+            )
+        })?,
+    )?;
     match columns {
         Some(columns) => {
             let row_description =
@@ -1242,8 +1372,17 @@ fn handle_describe_body(
                 .statements
                 .get(&msg.name)
                 .ok_or(HandlerError::UnknownStatement)?;
+            let mut param_oids: Vec<i32> = Vec::new();
             let columns = match statement {
                 PreparedStatement::Empty => None,
+                // WIRE-12: 値未確定のままダミー束縛済みの結果列を返し、
+                // `ParameterDescription` には Parse が確定した公告 OID を返す。
+                PreparedStatement::Parameterized { prepared, slots } => {
+                    param_oids = slots.iter().map(|s| s.oid).collect();
+                    engine
+                        .describe_prepared_in_session(session, prepared)
+                        .map_err(HandlerError::Sql)?
+                }
                 // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替え、
                 // `ParsedSql::Cursor(CursorStatement::Fetch { .. })` に限り
                 // `txn` が保持する開いているカーソルの列メタデータを返す
@@ -1253,7 +1392,7 @@ fn handle_describe_body(
                     .describe_parsed_in_txn(session, txn, parsed)
                     .map_err(HandlerError::Sql)?,
             };
-            Ok(DescribeResult::Statement(columns))
+            Ok(DescribeResult::Statement(columns, param_oids))
         }
         TargetKind::Portal => {
             let portal = state
@@ -1274,17 +1413,17 @@ fn handle_describe_body(
 
 /// Bind のパラメータ format code 列を検証する（PostgreSQL の規約: 件数は
 /// 0（すべて既定＝text）・1（すべてこの 1 個の値に従う）・対象数と同数の
-/// いずれかでなければならない）。`$n` 束縛は WIRE-12・#935 の担当で現状
-/// `num_params` は常に 0 のため、値は 0（text）のみ許可し 1（binary）は
-/// 一律拒否する（結果 format code は WIRE-14・[`result_encoder::
-/// ResultFormats::resolve`]／[`result_encoder::validate_binary_formats`] が
-/// 別途扱う。`docs/design/wire-extended-query-bind-execute-sync.md` 参照）。
+/// いずれかでなければならない）。各値は 0（text）・1（binary）のみ許可し、
+/// それ以外は `08P01`。binary のスロット別受理可否は呼び出し元が
+/// [`ParamSlot`] で判定する（結果 format code は WIRE-14・
+/// [`result_encoder::ResultFormats::resolve`]／[`result_encoder::
+/// validate_binary_formats`] が別途扱う）。
 fn validate_format_codes(codes: &[i16], target_count: usize) -> Result<(), HandlerError> {
     if !codes.is_empty() && codes.len() != 1 && codes.len() != target_count {
         return Err(HandlerError::FormatCodeCountMismatch);
     }
-    if codes.iter().any(|&c| c != 0) {
-        return Err(HandlerError::BinaryFormatUnsupported);
+    if codes.iter().any(|&c| c != 0 && c != 1) {
+        return Err(HandlerError::InvalidParamFormatCode);
     }
     Ok(())
 }
@@ -1357,23 +1496,54 @@ fn handle_bind_body(
         }
     }
 
-    validate_format_codes(&msg.param_format_codes, msg.num_params)?;
+    let num_params = msg.param_values.len();
+    validate_format_codes(&msg.param_format_codes, num_params)?;
 
     let statement = state
         .statements
         .get(&msg.statement_name)
         .ok_or(HandlerError::UnknownStatement)?;
 
-    // `$n` 束縛は #935（WIRE-12）の担当。現状ステートメントが要求する
-    // パラメータ数は常に 0（`parse_parse_body` が `num_param_types > 0` を
-    // Parse 時点で拒否するため）であり、Bind が送ってきた実パラメータ数も
-    // これと一致しなければならない。
-    if msg.num_params != 0 {
+    // Bind が送ってきた実パラメータ数は、ステートメントが要求する数
+    // （`$n` なしは 0、`Parameterized` は最大の `$n` 番号）と一致しなければ
+    // ならない（`08P01`）。
+    let required = match statement {
+        PreparedStatement::Parameterized { slots, .. } => slots.len(),
+        PreparedStatement::Empty | PreparedStatement::Parsed(_) => 0,
+    };
+    if num_params != required {
         return Err(HandlerError::ParamCountMismatch);
     }
 
+    let mut bound_bytes = 0usize;
     let (portal_body, columns) = match statement {
         PreparedStatement::Empty => (PortalBody::Empty, None),
+        PreparedStatement::Parameterized { prepared, slots } => {
+            // 値ごとの format を解決する（0 件は全 text・1 件は全値へ適用・
+            // n 件は個別。件数の整合は `validate_format_codes` が検証済み）。
+            // binary は text 系スロットのみ受理し、UTF-8 バイト恒等でそのまま
+            // engine へ渡す（それ以外は `0A000`）。
+            for (i, slot) in slots.iter().enumerate() {
+                let code = match msg.param_format_codes.as_slice() {
+                    [] => 0,
+                    [one] => *one,
+                    many => many.get(i).copied().unwrap_or(0),
+                };
+                if code == 1 && !slot.binary {
+                    return Err(HandlerError::BinaryFormatUnsupported);
+                }
+            }
+            // 同一 `$n` の出現ごとに値が複製されるため、受信量ではなく展開後の
+            // 実保持量で portal の保持量上限を判定する（PR #1217 レビュー指摘）。
+            bound_bytes = prepared.expanded_bound_bytes(&msg.param_values);
+            let bound = engine
+                .bind_prepared(prepared, &msg.param_values)
+                .map_err(HandlerError::Sql)?;
+            let columns = engine
+                .describe_parsed_in_txn(session, txn, &bound)
+                .map_err(HandlerError::Sql)?;
+            (PortalBody::Parsed(bound), columns)
+        }
         PreparedStatement::Parsed(parsed) => {
             let parsed = parsed.clone();
             // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
@@ -1411,6 +1581,7 @@ fn handle_bind_body(
         cursor_binding: None,
         bound_txn_generation: txn.active_generation(),
         survived_sync: false,
+        bound_bytes,
     };
 
     state
@@ -2307,7 +2478,7 @@ mod tests {
         assert_eq!(msg.portal_name, "");
         assert_eq!(msg.statement_name, "");
         assert!(msg.param_format_codes.is_empty());
-        assert_eq!(msg.num_params, 0);
+        assert!(msg.param_values.is_empty());
         assert!(msg.result_format_codes.is_empty());
     }
 
@@ -2324,7 +2495,7 @@ mod tests {
         body.extend_from_slice(&0i16.to_be_bytes());
 
         let msg = parse_bind_body(&body).expect("valid Bind body");
-        assert_eq!(msg.num_params, 2);
+        assert_eq!(msg.param_values, vec![None, Some(b"abc".to_vec())]);
     }
 
     #[test]
@@ -2389,10 +2560,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_format_codes_rejects_binary() {
+    fn validate_format_codes_accepts_binary_and_rejects_unknown_codes() {
+        // binary（1）のスロット別受理可否は Bind 本体が `ParamSlot` で判定する。
+        assert!(validate_format_codes(&[1], 1).is_ok());
         assert!(matches!(
-            validate_format_codes(&[1], 1),
-            Err(HandlerError::BinaryFormatUnsupported)
+            validate_format_codes(&[2], 1),
+            Err(HandlerError::InvalidParamFormatCode)
+        ));
+        assert!(matches!(
+            validate_format_codes(&[0, -1], 2),
+            Err(HandlerError::InvalidParamFormatCode)
         ));
     }
 
@@ -2500,6 +2677,65 @@ mod tests {
         store.remove("does-not-exist");
     }
 
+    fn portal_with_bound_bytes(bound_bytes: usize) -> Portal {
+        Portal {
+            source_statement: String::new(),
+            body: PortalBody::Empty,
+            columns: None,
+            result_formats: Vec::new(),
+            state: PortalState::Ready,
+            cursor_binding: None,
+            bound_txn_generation: None,
+            survived_sync: false,
+            bound_bytes,
+        }
+    }
+
+    #[test]
+    fn portal_store_enforces_bound_bytes_limit_and_replacement_credit() {
+        let mut store = PortalStore::new();
+        let half = MAX_BOUND_PARAM_BYTES_PER_SESSION / 2;
+        store
+            .insert("a".to_string(), portal_with_bound_bytes(half))
+            .expect("first fits");
+        store
+            .insert("b".to_string(), portal_with_bound_bytes(half))
+            .expect("second fills the limit exactly");
+        // 上限超過は拒否される。
+        assert!(matches!(
+            store.insert("c".to_string(), portal_with_bound_bytes(1)),
+            Err(PortalStoreError::BoundBytesExceeded)
+        ));
+        // 無名 portal は同名置換のため、既存の無名分を差し引いて判定する。
+        store
+            .insert(String::new(), portal_with_bound_bytes(0))
+            .expect("zero bytes fits at the limit");
+        assert!(matches!(
+            store.insert(String::new(), portal_with_bound_bytes(1)),
+            Err(PortalStoreError::BoundBytesExceeded)
+        ));
+        // 除去後は再び受理される。
+        store.remove("a");
+        store
+            .insert("c".to_string(), portal_with_bound_bytes(half))
+            .expect("credit returns after removal");
+        store.clear_all();
+        store
+            .insert(
+                "d".to_string(),
+                portal_with_bound_bytes(MAX_BOUND_PARAM_BYTES_PER_SESSION),
+            )
+            .expect("credit returns after clear_all");
+    }
+
+    #[test]
+    fn decode_declared_oids_reads_big_endian_pairs() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&25i32.to_be_bytes());
+        bytes.extend_from_slice(&1043i32.to_be_bytes());
+        assert_eq!(decode_declared_oids(&bytes), vec![25, 1043]);
+    }
+
     #[test]
     fn portal_store_rejects_too_many_named_portals() {
         let mut store = PortalStore::new();
@@ -2516,6 +2752,7 @@ mod tests {
                         cursor_binding: None,
                         bound_txn_generation: None,
                         survived_sync: false,
+                        bound_bytes: 0,
                     },
                 )
                 .expect("insert within limit succeeds");
@@ -2531,6 +2768,7 @@ mod tests {
                 cursor_binding: None,
                 bound_txn_generation: None,
                 survived_sync: false,
+                bound_bytes: 0,
             },
         );
         assert!(matches!(result, Err(PortalStoreError::TooManyPortals)));
@@ -2551,6 +2789,7 @@ mod tests {
                     cursor_binding: None,
                     bound_txn_generation: None,
                     survived_sync: false,
+                    bound_bytes: 0,
                 },
             )
             .expect("insert succeeds");
@@ -2566,6 +2805,7 @@ mod tests {
                     cursor_binding: None,
                     bound_txn_generation: None,
                     survived_sync: false,
+                    bound_bytes: 0,
                 },
             )
             .expect("insert succeeds");
@@ -2590,6 +2830,7 @@ mod tests {
                     cursor_binding: None,
                     bound_txn_generation: None,
                     survived_sync: false,
+                    bound_bytes: 0,
                 },
             )
             .expect("insert succeeds");
@@ -2605,6 +2846,7 @@ mod tests {
                     cursor_binding: None,
                     bound_txn_generation: None,
                     survived_sync: false,
+                    bound_bytes: 0,
                 },
             )
             .expect("insert succeeds");
@@ -2624,6 +2866,7 @@ mod tests {
             cursor_binding: None,
             bound_txn_generation: generation,
             survived_sync,
+            bound_bytes: 0,
         }
     }
 

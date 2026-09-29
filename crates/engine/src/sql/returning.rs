@@ -1,8 +1,9 @@
-//! `INSERT`／`DELETE`（単一行）の `RETURNING` 句（Issue #873・SQL-21）の投影・
+//! `INSERT`／`DELETE`／`UPDATE`／UPSERT の `RETURNING` 句（Issue #873・#1182・SQL-21）の投影・
 //! 行組み立てを担う。`RETURNING` が返す行は「その文が書き込んだ（削除前の）
 //! 値」そのものであり、`sql::scan`／`sql::exec` の SELECT 経路が行う
 //! redb 走査・RLS 述語評価は経由しない——呼び出し元（`sql::exec::
-//! execute_insert_returning`／`execute_delete_returning`）が既に確定させた
+//! execute_insert_returning`／`execute_delete_returning` ほか、各 DML の
+//! `*_returning` 実行入口）が既に確定させた
 //! `(id, values)` を、`SELECT` の投影束縛（`sql::parser::bind_projection`）と
 //! 同じ列解決規則（実カラム優先・疑似列 `id`）で `sql::exec::QueryResult` へ
 //! 写像するだけの薄い層とする（第 2 の投影実装を作らない）。

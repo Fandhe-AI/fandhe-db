@@ -196,6 +196,7 @@ pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod visible_cache;
+pub(crate) mod where_negation;
 pub(crate) mod where_tree;
 pub(crate) mod window;
 
@@ -301,9 +302,10 @@ pub enum SqlOutcome {
     /// variant はその [`exec::DeleteOutcome`] をそのまま運ぶ薄いラッパー
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
-    /// `RETURNING` 句（Issue #873・SQL-21）付きの `INSERT`／`DELETE` がセッション
-    /// 経由の実行経路で成功したことを示す応答。`INSERT`／`DELETE` 単独の
-    /// `Insert`／`Delete` variant とは別 variant として保持する
+    /// `RETURNING` 句（Issue #873・#1182・SQL-21）付きの `INSERT`（UPSERT を含む）／
+    /// `DELETE`（単一行・述語形）／`UPDATE`（単一行・述語形）がセッション
+    /// 経由の実行経路で成功したことを示す応答。`RETURNING` なしの
+    /// `Insert`／`Delete`／`Update` variant とは別 variant として保持する
     /// （`RowDescription` を伴う応答形が異なるため。`wire-server::simple_query`
     /// は `result` から `RowDescription`／`DataRow`* を、`command`・
     /// `rows_affected` から `CommandComplete` タグ〔`INSERT 0 <n>`／

@@ -1103,7 +1103,7 @@ mod tests {
         let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
         assert!(matches!(
             err,
-            InsertError::Set(TypedJsonError::InvalidBytea(_))
+            InsertError::Set(TypedJsonError::TypeMismatch(_))
         ));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -1116,10 +1116,10 @@ mod tests {
             ));
             let err = bind_rows(&items, "docs", None, &bytea_schema()).expect_err("must reject");
             assert!(
-                matches!(err, InsertError::Set(TypedJsonError::InvalidBytea(_))),
+                matches!(err, InsertError::Set(TypedJsonError::InvalidByteaText(_))),
                 "input: {bad}"
             );
-            assert_eq!(err.wire_code(), "42601", "input: {bad}");
+            assert_eq!(err.wire_code(), "22P02", "input: {bad}");
         }
     }
 
@@ -1174,13 +1174,11 @@ mod tests {
 
     #[test]
     fn bind_rows_rejects_float_for_integer_column() {
+        // 小数は engine の整数束縛が `22P02` で拒否する（Issue #1187）。
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0],"count":1.5}]"#);
         let err = bind_rows(&items, "docs", None, &typed_schema()).expect_err("must reject");
-        assert!(matches!(
-            err,
-            InsertError::Set(TypedJsonError::TypeMismatch(_))
-        ));
-        assert_eq!(err.wire_code(), "42601");
+        assert!(matches!(err, InsertError::Bind(_)));
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]

@@ -168,7 +168,7 @@ fn insert_rejects_malformed_or_non_rfc8259_json() {
                 &insert_sql(1, "ja", literal, "'{}'", 1),
             )
             .unwrap_err();
-        assert_eq!(err.wire_code(), "42601", "case: {label}");
+        assert_eq!(err.wire_code(), "22P02", "case: {label}");
     }
 }
 
@@ -194,7 +194,7 @@ fn insert_rejects_excess_nesting_depth() {
             &insert_sql(1, "ja", &literal, "'{}'", 1),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]

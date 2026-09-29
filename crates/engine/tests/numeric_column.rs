@@ -341,7 +341,7 @@ fn integer_part_overflow_is_rejected_with_no_side_effects() {
     assert_eq!(count_star(&core, &alice), 0);
 }
 
-// --- 受け入れ条件 5: 形式不正・型不一致は 22000 --------------------------------
+// --- 受け入れ条件 5: 形式不正・型不一致は 22P02（形式不正）・22000（型不一致） --------------------------------
 
 #[test]
 fn malformed_literals_are_rejected_as_invalid_input() {
@@ -356,7 +356,7 @@ fn malformed_literals_are_rejected_as_invalid_input() {
                 &insert_sql(1, "ja", bad, 1),
             )
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "literal {bad:?} should be 22000");
+        assert_eq!(err.wire_code(), "22P02", "literal {bad:?} should be 22P02");
     }
 }
 

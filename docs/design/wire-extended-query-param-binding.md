@@ -2,11 +2,33 @@
 
 ## ステータス
 
-Partially implemented（engine 側のみ。`crates/engine/src/` の Parse／Bind／
-Describe の値束縛機構は実装済み。wire 側（`crates/wire-server/`）の
-Bind／Execute／Sync（'B'／'E'／'S'）結線は #934（Bind／Execute／Sync／
-Close／Flush・`ExtendedQueryState`・`PortalStore`）が本 Issue 着手時点で
-`origin/main` 未マージだったため対象外のまま。#934 マージ後に別 PR で結線する）。
+Implemented（engine 側の値束縛機構は #935・#1012、wire 側の結線は Issue #1171）。
+wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)／Bind
+が `$n` を受理し、値は必ず engine の `bind_prepared` を通す（第 2 の実行器を
+作らない）。
+
+### wire 結線（Issue #1171）の決定事項
+
+- Parse: 宣言型件数は `MAX_PARAMS`（64）超過を OID 復号より前に `54000` で拒否する。
+  `$n` を含まない文は従来どおり `Parsed`（`PreparedSql::parsed_if_unparameterized`）
+  として保持し挙動不変。`$n` を含む文は `PreparedStatement::Parameterized` を保持する。
+- 宣言 OID は値の検証には一切使わない（値は常にリテラル置換経路を通る）。0 以外は
+  `ParameterDescription` へ echo し、0・未宣言は engine の型推論
+  （`PreparedSql::param_types`。`ORDER BY <vec> <=> $n` は text 公告だがバイナリ不可の
+  `VectorText`、`USING PLAN($n)`／`USING OPERATION_ID $n` は `Text`、`WHERE <列> = $n`
+  ・`INSERT` の行内 ordinal は当該列の型、未参照番号は `Text`）で補う。
+  pgjdbc が文字列に varchar（1043）を宣言する点を踏まえ、宣言 OID の不一致は拒否しない。
+- 宣言件数がプレースホルダ数を超える Parse は `08P01`（PostgreSQL は受理するが、
+  fail-closed な逸脱）。
+- Bind: 値数が要求数と異なれば `08P01`。パラメータ format code は 0・1 以外を `08P01`。
+  binary は text 系スロット（推論がバイナリ対応かつ宣言 OID が 0・25・1043）だけ
+  受理し、UTF-8 バイト恒等でそのまま `bind_prepared` へ渡す。それ以外のバイナリは `0A000`
+  （WIRE-14）。
+- 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は据え置き
+  `22000`。
+- 束縛済み `ParsedSql` は値を保持するため、portal が保持する束縛値バイトの接続単位合計を
+  `limits::MAX_BOUND_PARAM_BYTES_PER_SESSION`（4 MiB）で制限する（超過は `54000`。
+  portal ごとの値から都度合算するため除去経路での減算漏れが無い）。
 
 ## 背景
 

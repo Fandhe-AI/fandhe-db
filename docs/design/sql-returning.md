@@ -1,14 +1,12 @@
-# `INSERT`／`DELETE` の `RETURNING` 句（Issue #873・SQL-21・TASK-193）
+# `INSERT`／`UPDATE`／`DELETE`／UPSERT の `RETURNING` 句（Issue #873・#1182・SQL-21・TASK-193）
 
 ## 背景・スコープ
 
 書き込み文（DML）が「その文で実際に変更した行」を結果セットとして返せる
-ようにする。単一行・`id` 完全一致形 `DELETE`（SQL-18・TASK-191。実行結線
-済み）と行形 `INSERT`（単一行・複数行 `VALUES`。SQL-10・SQL-16）に
-`RETURNING <投影>` を追加した。述語つき `DELETE`（Issue #870・#871）・
-`UPDATE`（単一行・述語形とも。`UPDATE` 自体の実行結線は Issue #864・#865 で
-別途完了済みだが、`RETURNING` の実行結線は本 Issue の範囲外のまま）は
-下記「対象外」のとおり未着手（下記「対象外」参照）。
+ようにする。Issue #873 で行形 `INSERT`（単一行・複数行 `VALUES`。SQL-10・
+SQL-16）と単一行・`id` 完全一致形 `DELETE`（SQL-18・TASK-191）に、Issue #1182 で
+`UPDATE`（単一行・述語形。SQL-17・SQL-19）・述語形 `DELETE`（SQL-19）・UPSERT
+（`INSERT ... ON CONFLICT`。SQL-20）に `RETURNING <投影>` を実行結線した。
 
 ## 構文
 
@@ -19,13 +17,20 @@
 INSERT INTO <table> (<col>[, <col>]*) VALUES (<lit>[, <lit>]*)[, (...)]*
   [RETURNING <投影>] USING OPERATION_ID '<id>' [;]
 
-DELETE FROM <table> WHERE id = <n>
+DELETE FROM <table> WHERE <id 完全一致または述語>
+  [RETURNING <投影>] USING OPERATION_ID '<id>' [;]
+
+UPDATE <table> SET <col> = <lit>[, ...] WHERE <id 完全一致または述語>
+  [RETURNING <投影>] USING OPERATION_ID '<id>' [;]
+
+INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO UPDATE SET ...
   [RETURNING <投影>] USING OPERATION_ID '<id>' [;]
 ```
 
-`UPDATE`（単一行・id 指定）自体の実行結線は Issue #865（SQL-17・TASK-191）で
-別途完了しているが、`UPDATE ... RETURNING ...` の実行結線は本 Issue・#865
-いずれの対象でもなく未着手のまま（下記「対象外」参照）。
+`UPDATE ... WHERE id = <n> RETURNING ...` は `RETURNING` の有無に関わらず単一行形へ
+分類する（`sql::allowlist::Parser::parse_update_where` が `RETURNING` を終端として
+扱う。分類が `RETURNING` の有無で変わると内容照合ハッシュが変わり再送判定が
+崩れるため。`peek_single_row_delete_id` と同じ判定）。
 
 `<投影>` は `*` または裸の列名リスト（疑似列 `id` を含む。`SELECT` の
 `Projection::Columns`／`Projection::All` を再利用）。関数呼び出し項目
@@ -45,9 +50,12 @@ DELETE FROM <table> WHERE id = <n>
 | `... RETURNING vec_norm(embedding) USING OPERATION_ID '...'`（関数呼び出し項目） | `42601` |
 | `TRUNCATE TABLE <table> ... RETURNING *` | `42601`（`TRUNCATE` は対象外） |
 | ファイル形 `INSERT`（`path`/`body` 列指定）＋ `RETURNING` | `42601`（束縛段。サーバー側チャンク化行を返す応答形が未定義のため fail-closed） |
-| 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | `42601`（実行結線〔#871〕未着手のためチョークポイントで一律拒否） |
-| 単一行・述語形いずれの `UPDATE ... RETURNING ...` | `42601`（`UPDATE` 自体の実行結線〔#865〕は完了済みだが `RETURNING` 側の実行結線は本 Issue・#865 いずれの対象でもなく未着手のためチョークポイントで一律拒否） |
-| `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない） |
+| 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | 受理（Issue #1182。削除前の値を返す） |
+| 単一行・述語形いずれの `UPDATE ... RETURNING ...`（セッション経路） | 受理（Issue #1182。更新後の値を返す） |
+| `INSERT ... ON CONFLICT ... RETURNING ...` | 受理（Issue #1182。挿入行・`DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない） |
+| 未知列・式項目の `RETURNING`（全 DML） | 書き込み前に `22000`／`42601`（台帳は消費しない） |
+| `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`／`execute_update_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない。`RETURNING` を黙って落とす fail-open を避ける） |
+| 明示トランザクション内（`BEGIN ... COMMIT`）の `UPDATE`／`DELETE`／UPSERT（`RETURNING` の有無を問わず）・`RETURNING` 付き `INSERT` | `0A000`（従来どおり未対応。fail-closed） |
 
 ## 実行経路
 
@@ -68,7 +76,29 @@ DELETE FROM <table> WHERE id = <n>
   デコード失敗を起こした反省点。`tenant.rs` のコメント参照）。`metadata`
   バイト列は `row_codec::decode_scalar_columns` で `schema.columns` 順の
   `Value` 列へ変換し（`VECTOR` 列位置は契約により常に `Value::Null`）、
-  `VECTOR` 列位置だけを `Row::embedding` で明示的に差し替える。
+  `VECTOR` 列位置だけを `Row::embedding` で明示的に差し替える
+  （`tenant::captured_values_from_parts`。全 DML 経路で共有）。
+- `UPDATE`（単一行）: `core.rs::execute_update_returning_form` →
+  `sql::exec::execute_update_returning` → `tenant::
+  update_row_columns_capturing_unchecked`。書いた値（更新後）そのものを捕捉し、
+  制約検査の後・commit の前に投影する。不可視・不存在は捕捉も投影もせず
+  `UPDATE 0`・空結果（他テナント行と不存在 id の応答差を作らない。RLS-9・RLS-10）。
+- 述語形 `UPDATE`／`DELETE`: `execute_update_returning_form`／
+  `execute_predicate_delete_returning_form` →
+  `sql::exec::execute_predicate_update_returning`／`execute_predicate_delete_returning`
+  → `tenant::update_rows_where_capturing_unchecked`／
+  `delete_rows_where_capturing_unchecked`。行ごとにインラインで投影する
+  （全件をバッファしない）。返却順は候補列挙順（テナント内 `id` 昇順）。
+  述語評価は `sql::exec::run_where_predicate` を `RETURNING` の有無に関わらず共有し、
+  内容照合ハッシュは `EngineCore::prepare_predicate_update`／
+  `prepare_predicate_delete` の 1 箇所で `RETURNING` を入力に含めずに計算する。
+- UPSERT: `execute_insert_returning_form` の `Upsert` 腕 →
+  `sql::exec::execute_upsert_returning` → `tenant::
+  upsert_typed_rows_capturing_unchecked`。新規挿入行は挿入した値、`DO UPDATE` 行は
+  更新後の値を `VALUES` 記述順に返す。`DO NOTHING` で衝突した行は返さない。
+  INDEX-4 バッチ上限は `validate_upsert_batch_limits` で `RETURNING` なしと共有。
+- 投影コールバックは `sql::exec::returning_collector` が全経路で共有する
+  （RLS 再判定・文全体で累計する結果バイト予算・行バッファの `try_reserve`）。
 - `sql::returning` モジュールが投影（`column_meta`・`project_row`）を担う。
   `SELECT` の投影束縛規則（実カラム優先・疑似列 `id`）をそのまま再利用し、
   第 2 の投影実装を作らない。
@@ -110,7 +140,8 @@ insert_returning_rows_affected_is_independent_of_result_row_visibility` が
 
 | DML | タグ |
 | --- | ---- |
-| `INSERT` | `INSERT 0 <rows_affected>` |
+| `INSERT`（UPSERT を含む。`<n>` は挿入行数＋更新行数） | `INSERT 0 <rows_affected>` |
+| `UPDATE` | `UPDATE <rows_affected>` |
 | `DELETE` | `DELETE <rows_affected>` |
 
 ## 内容照合ハッシュ非依存
@@ -121,6 +152,9 @@ SQL テキストではなく符号化済み行・`id` から計算するため�
 「`RETURNING` あり → なし」の順（逆順も）に送ると 2 回目は `23505`
 （`crates/engine/tests/sql_returning.rs::
 insert_returning_content_hash_is_independent_of_returning_clause` が固定）。
+Issue #1182 で結線した単一行 `UPDATE`・述語形 `UPDATE`／`DELETE`・UPSERT も
+同様（`dml_returning_content_hash_is_independent_of_returning_clause` が
+「あり→なし」「なし→あり」の両順を固定）。
 
 ## 非セッション入口の拒否
 
@@ -140,20 +174,22 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 複製バイト量の累計へ確保前に検証する。行数は既存の 1 文あたり行数上限
 （`MAX_INSERT_ROWS_PER_STATEMENT`）・`batch_limits`（INDEX-4）で有界。
 
+## 投影と制約検査の優先順位（Issue #1182）
+
+述語形 `UPDATE`／`DELETE`・UPSERT の投影は行ごとにインラインで呼ぶため、
+投影由来のエラー（`54000` 結果容量超過・`XX000`）が制約違反（`23505`・`23503` 等）
+より先に報告されうる。いずれも write トランザクションの abort により行・台帳とも
+永続化されない（副作用ゼロ）ため、クライアントに見える差は返却コードのみ。
+単一行 `UPDATE` は制約検査の後に投影する（単一行 `DELETE` と同じ順序）。
+
 ## 対象外・申し送り
 
-- **UPDATE（単一行・述語形とも）の RETURNING 実行結線**: `UPDATE` 自体の
-  実行結線（#865。`sql::exec::execute_update`／`execute_update_with_schema`・
-  `core.rs::execute_update_sql`／`execute_update_form`）は完了済みだが、
-  `RETURNING` 側の結線は本 Issue・#865 いずれの対象でもなく未着手のため、
-  構文・束縛段は受理するがチョークポイントで常に `42601`。結線する際は、
-  `DELETE` の `capture` と同型の update-後の値捕捉を
-  `tenant::update_row_columns_unchecked` へ追加する。
-- **述語つき DELETE の RETURNING 実行結線**: #871（実行結線）・#868（複数行
-  変更の `operation_id` 内容照合ハッシュ仕様）の担当。正規化文から
-  `RETURNING` を除外する必要がある旨を申し送る。
-- **UPSERT（#872）との併用**: #872 側で `parse_insert` の `RETURNING`
-  位置を維持する必要がある。
-- **NoSQL 表層**: `op: insert`／`search`／`scan`／`aggregate` のいずれにも
-  `returning` キーは無い。spec 側の規範化待ち。
+- **明示トランザクション内の DML `RETURNING`**: `execute_in_active_txn` は
+  `UPDATE`／`DELETE`／UPSERT を従来どおり未対応（`0A000`）として拒否する。
+  トランザクション内の DML を追加する際（Issue #1179 系）は、`INSERT` 腕と同様に
+  `returning.is_none()` ガードを持たせ、`RETURNING` を黙って落とさないこと。
+- **ファイル形 `INSERT`**: 従来どおり `42601`（サーバー側チャンク化行を返す応答形が未定義）。
+- **NoSQL 表層**: `op: insert`／`update`／`delete`／`search`／`scan`／`aggregate` の
+  いずれにも `returning` キーは無い（`http/query/update.rs`・`delete.rs` は
+  `returning: None` 固定）。spec 側の規範化待ち。
 - **3 クライアント層 B の実測実行**: `make e2e-three-client` は運用者作業。
