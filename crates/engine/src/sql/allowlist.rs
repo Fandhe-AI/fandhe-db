@@ -22,6 +22,7 @@ use crate::sql::udf_call::{
     MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
+use crate::sql::where_negation::negate_conjunction;
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は
@@ -1170,8 +1171,10 @@ pub enum WherePredicate {
     /// （SQL-24。TASK-208 ポインタ）。構文段の不変条件として、内側が `Not`・
     /// `PredicateCall`・`Expression` になることはない（常に等価・前方一致・
     /// BOOLEAN 系・範囲比較・`InList`・`Between`・`IsNull` のいずれかの葉。
-    /// `NOT visible()`・`NOT <式述語>`・`NOT (` はいずれも構文段で `42601` に
-    /// 拒否し、この variant としては構築されない）。
+    /// `NOT visible()` は構文段で `42601` に拒否し、この variant としては構築されない）。
+    /// `NOT ( ... )` と裸の `NOT <式比較>` は Issue #1184 で受理対象になったが、
+    /// 否定は構文段で葉まで押し下げる（`sql::where_negation`。`Or`／AND 群や式述語の
+    /// 上に本 variant は残らない。式比較は演算子反転で表す）。
     Not(Box<WherePredicate>),
     /// `OR` で結ぶ分岐の集合（TASK-208・SQL-24、Issue #912）。各分岐は
     /// `Vec<WherePredicate>`（`AND` で結ぶ述語列。分岐の中にさらに `Or` を
@@ -2662,6 +2665,11 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
+    /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
+    /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
+    /// CHECK の受理範囲が黙って広がるのを防ぐ）。
+    in_check_body: bool,
     /// 複数行 `VALUES` が持てる行数の上限（[`Self::parse_insert`] が判定に使う）。
     /// 既定値は `None`＝上限なし（Issue #997・オーナー判断の改訂
     /// 〔2026-09-27、汎用 RDB との整合〕）。`Some(limit)` は `wire-server` の
@@ -2682,6 +2690,7 @@ impl<'a> Parser<'a> {
             subquery_ctx: None,
             case_nesting: 0,
             allow_null_literal: false,
+            in_check_body: false,
             max_insert_rows: None,
         }
     }
@@ -3472,6 +3481,51 @@ impl<'a> Parser<'a> {
         depth: usize,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        // 前置 `NOT ( <BOOLEAN グループ> )`（SQL-24・TASK-208、Issue #1184）。
+        // 連続する `NOT` の直後の `(` が真偽値グループ（対応する `)` の直後が
+        // 比較・算術演算子でない）のときだけここで処理し、否定は
+        // [`negate_conjunction`] で葉まで押し下げる（二値評価器の上に
+        // `Not` を残さない）。値式グループ（`NOT (id + 1) > 5`）は葉の経路へ流す。
+        // CHECK 本体（TABLE-16）では従来どおり葉の経路で `42601` にする。
+        if !self.in_check_body
+            && matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT"))
+        {
+            let mut not_count = 0usize;
+            while matches!(
+                self.tokens.get(self.pos.saturating_add(not_count)),
+                Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")
+            ) {
+                not_count += 1;
+            }
+            let open_idx = self.pos.saturating_add(not_count);
+            if matches!(self.tokens.get(open_idx), Some(Token::Punct('('))) {
+                let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+                    SqlSurfaceError::unsupported("unmatched parenthesis in WHERE clause")
+                })?;
+                let is_value_group = matches!(
+                    self.tokens.get(close_idx + 1),
+                    Some(token) if is_where_group_operator_token(token)
+                );
+                if !is_value_group {
+                    let next_depth = depth
+                        .checked_add(1)
+                        .filter(|d| *d <= MAX_WHERE_GROUP_DEPTH)
+                        .ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large(format!(
+                                "WHERE grouping nesting exceeds limit {MAX_WHERE_GROUP_DEPTH}"
+                            ))
+                        })?;
+                    self.pos = open_idx + 1; // `NOT`（複数可）と `(` を消費する
+                    let inner = self.parse_where_or(true, set_operators, next_depth, leaf_count)?;
+                    self.expect_punct(')')?;
+                    return if not_count % 2 == 1 {
+                        negate_conjunction(inner, &mut self.expr_node_budget)
+                    } else {
+                        Ok(inner)
+                    };
+                }
+            }
+        }
         if matches!(self.peek(), Some(Token::Punct('('))) {
             let close_idx = self.find_matching_close_paren(self.pos).ok_or_else(|| {
                 SqlSurfaceError::unsupported("unmatched parenthesis in WHERE clause")
@@ -3497,11 +3551,7 @@ impl<'a> Parser<'a> {
             // 値式グループ（`(id + 1) > 5` 等）。既存の式フォールバックへ委譲する
             // （`parse_primary_expr` が '(' expr ')' を再帰的に処理する）。
         }
-        Ok(vec![self.parse_where_leaf(
-            extra_close_paren,
-            set_operators,
-            leaf_count,
-        )?])
+        self.parse_where_leaf(extra_close_paren, set_operators, leaf_count)
     }
 
     /// `(` の位置（`open_idx`）に対応する `)` のトークン位置を探す。`get()` のみを
@@ -3539,81 +3589,90 @@ impl<'a> Parser<'a> {
         extra_close_paren: bool,
         set_operators: bool,
         leaf_count: &mut usize,
-    ) -> Result<WherePredicate, SqlSurfaceError> {
-        let predicate = if let Some(leaf) =
-            self.try_parse_structural_leaf(extra_close_paren, set_operators)?
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let predicates: Vec<WherePredicate> = if let Some(leaf) =
+            self.try_parse_numeric_list_leaf()?
         {
             leaf
+        } else if let Some(leaf) =
+            self.try_parse_structural_leaf(extra_close_paren, set_operators)?
+        {
+            vec![leaf]
         } else if matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")) {
             let mut negate_odd = false;
             while matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")) {
                 self.advance();
                 negate_odd = !negate_odd;
             }
-            // `NOT (` は括弧グループ（#912 の対象）であり、本 Issue の受理範囲外
-            // （fail-closed。構文段でこの位置に到達しない不変条件を保つ）。
-            if matches!(self.peek(), Some(Token::Punct('('))) {
+            // CHECK 本体（TABLE-16）では `NOT ( ... )`・裸の `NOT <式比較>`・数値の
+            // `IN`／`BETWEEN` を従来どおり `42601` にする（脱糖後の形が
+            // `check_constraint` の許可形と区別できないため。Issue #1184）。
+            if self.in_check_body && matches!(self.peek(), Some(Token::Punct('('))) {
                 return Err(SqlSurfaceError::unsupported(
                     "NOT ( ... ) grouping is not supported",
                 ));
             }
-            let inner = self.try_parse_structural_leaf(extra_close_paren, set_operators)?;
-            let inner = match inner {
-                Some(WherePredicate::PredicateCall { .. }) => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "NOT visible() is not supported",
-                    ));
+            if let Some(inner) = self.try_parse_numeric_list_leaf()? {
+                if negate_odd {
+                    negate_conjunction(inner, &mut self.expr_node_budget)?
+                } else {
+                    inner
                 }
-                // `NOT EXISTS (SELECT ...)`／`NOT <col> IN (SELECT ...)`
-                // （Cursor Bugbot Medium 指摘対応。Issue #927 の設計文書
-                // `docs/design/sql-subquery.md`「スコープ（当初計画との差分）」で
-                // `NOT IN`・`NOT EXISTS` は「非対応（文法自体が `NOT` を持たない）」
-                // と明記済み）。`try_parse_structural_leaf` が構造的に確定させた
-                // `Exists`／`InSubquery` を前置 `NOT` でそのまま包むと、束縛段
-                // （`sql::parser::declarative_leaf_to_filter`）が宣言的フィルタとして
-                // 扱えず `Internal` エラーになる（未解決サブクエリが束縛に到達した
-                // 場合の fail-closed 保険腕に落ちる）。`0A000`（`FeatureNotSupported`）
-                // で構文段のうちに明示的に拒否し、内部エラーへ落とさない。
-                Some(WherePredicate::Exists { .. }) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "NOT EXISTS (SELECT ...) is not supported".to_string(),
-                    });
+            } else if let Some(inner) =
+                self.try_parse_structural_leaf(extra_close_paren, set_operators)?
+            {
+                let inner = match inner {
+                    WherePredicate::PredicateCall { .. } => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "NOT visible() is not supported",
+                        ));
+                    }
+                    // `NOT EXISTS (SELECT ...)`／`NOT <col> IN (SELECT ...)`
+                    // （Cursor Bugbot Medium 指摘対応。Issue #927 の設計文書
+                    // `docs/design/sql-subquery.md`）。宣言的フィルタとして束縛
+                    // できず `Internal` に落ちるのを避け、`0A000` で構文段のうちに
+                    // 明示的に拒否する。
+                    WherePredicate::Exists { .. } => {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "NOT EXISTS (SELECT ...) is not supported".to_string(),
+                        });
+                    }
+                    WherePredicate::InSubquery { .. } => {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
+                        });
+                    }
+                    leaf => leaf,
+                };
+                // `inner` は後置 `NOT`（`NOT LIKE`／`NOT IN`／`NOT BETWEEN`）により
+                // 既に `WherePredicate::Not(..)` の場合がある。二重否定は畳んで
+                // 単一の `Not` へ正規化する（`Not(Not(x))` を作らない。
+                // 従来の AST・content hash を保つため従来形のまま残す）。
+                if negate_odd {
+                    match inner {
+                        WherePredicate::Not(x) => vec![*x],
+                        other => vec![WherePredicate::Not(Box::new(other))],
+                    }
+                } else {
+                    vec![inner]
                 }
-                Some(WherePredicate::InSubquery { .. }) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
-                    });
-                }
-                Some(leaf) => leaf,
-                None => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "NOT must be followed by a supported predicate (not an expression)",
-                    ));
-                }
-            };
-            // `inner` は後置 `NOT`（`NOT LIKE`／`NOT IN`／`NOT BETWEEN`）により
-            // 既に `WherePredicate::Not(..)` を返している場合がある。前置 `NOT`
-            // をそのまま重ねると `Not(Not(x))` になり（三値論理では `x` と等価
-            // だが評価コストが二重になる）、前置 `NOT` を偶数個重ねた時と同型の
-            // 冗長な入れ子が際限なく増える。二重否定を畳んで単一の `Not` へ
-            // 正規化する（codex-review 実機再現: `NOT lang NOT IN (...)`）。
-            if negate_odd {
-                match inner {
-                    WherePredicate::Not(x) => *x,
-                    other => WherePredicate::Not(Box::new(other)),
-                }
+            } else if self.in_check_body {
+                return Err(SqlSurfaceError::unsupported(
+                    "NOT must be followed by a supported predicate (not an expression)",
+                ));
             } else {
-                inner
+                // 裸の `NOT <式比較>`（`NOT id > 1`・`NOT (id + 1) > 5`）。頂点の比較を
+                // 反転して葉へ押し下げる。
+                let expr = self.parse_comparison_expr()?;
+                let pred = vec![WherePredicate::Expression(expr)];
+                if negate_odd {
+                    negate_conjunction(pred, &mut self.expr_node_budget)?
+                } else {
+                    pred
+                }
             }
         } else {
-            let lhs = self.parse_value_expr(0)?;
-            let op = self.expect_cmp_op()?;
-            let rhs = self.parse_value_expr(0)?;
-            WherePredicate::Expression(Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            })
+            vec![WherePredicate::Expression(self.parse_comparison_expr()?)]
         };
         *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("WHERE predicate leaf count overflow")
@@ -3623,7 +3682,152 @@ impl<'a> Parser<'a> {
                 "WHERE predicate leaf count exceeds limit {MAX_WHERE_LEAVES}"
             )));
         }
-        Ok(predicate)
+        Ok(predicates)
+    }
+
+    /// `<値式> <比較演算子> <値式>`（式述語。頂点は必ず比較の [`Expr::Binary`]）。
+    fn parse_comparison_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
+        let lhs = self.parse_value_expr(0)?;
+        let op = self.expect_cmp_op()?;
+        let rhs = self.parse_value_expr(0)?;
+        Ok(Expr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        })
+    }
+
+    /// 数値リテラルの `<col> [NOT] IN (n, ...)`／`<col> [NOT] BETWEEN a AND b` を
+    /// 検出し、`col = n`／`col >= a AND col <= b` の式述語へ脱糖する（SQL-24・
+    /// TASK-208、Issue #1184）。AST に新 variant を足さず、`col = n` が受理される
+    /// 列だけが束縛段で受理される（列型の判定は束縛段に任せ、構文段は schema を
+    /// 知らない。fail-closed）。`NOT` 付きは [`negate_conjunction`] で葉まで押し下げる。
+    /// 要素が数値でない・混在・`NULL`・`$n`・空・`BETWEEN SYMMETRIC` は `42601`、
+    /// 要素数上限は push の前に `54000`。生成する比較のノードは式ノード予算へ課金する。
+    /// 先頭が `<Ident> [NOT] IN ( <Number>` または `<Ident> [NOT] BETWEEN <Number>`
+    /// でなければ `Ok(None)`（位置不変）。CHECK 本体では常に `Ok(None)`。
+    fn try_parse_numeric_list_leaf(
+        &mut self,
+    ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
+        if self.in_check_body {
+            return Ok(None);
+        }
+        let Some(Token::Ident(col)) = self.peek().cloned() else {
+            return Ok(None);
+        };
+        let negated = matches!(
+            self.tokens.get(self.pos + 1),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")
+        );
+        let kw_idx = self.pos + if negated { 2 } else { 1 };
+        let is_in = matches!(
+            self.tokens.get(kw_idx),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN")
+        ) && matches!(self.tokens.get(kw_idx + 1), Some(Token::Punct('(')))
+            && matches!(self.tokens.get(kw_idx + 2), Some(Token::Number(_)));
+        let is_between = matches!(
+            self.tokens.get(kw_idx),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("BETWEEN")
+        ) && matches!(self.tokens.get(kw_idx + 1), Some(Token::Number(_)));
+        if !is_in && !is_between {
+            return Ok(None);
+        }
+        let preds = if is_in {
+            self.pos = kw_idx + 2; // `(` まで消費する
+            let mut values: Vec<String> = Vec::new();
+            loop {
+                match self.advance() {
+                    Some(Token::Number(n)) => {
+                        if values.len() >= MAX_IN_LIST_ITEMS {
+                            return Err(SqlSurfaceError::payload_too_large(format!(
+                                "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                            )));
+                        }
+                        values.push(n.clone());
+                    }
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "IN list elements must all be numeric literals, got {other:?}"
+                        )))
+                    }
+                }
+                match self.peek() {
+                    Some(Token::Punct(',')) => {
+                        self.advance();
+                    }
+                    Some(Token::Punct(')')) => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected ',' or ')' in IN list, got {other:?}"
+                        )))
+                    }
+                }
+            }
+            let mut branches = Vec::with_capacity(values.len());
+            for n in values {
+                branches.push(vec![self.numeric_comparison(&col, BinOp::Eq, n)?]);
+            }
+            if branches.len() == 1 {
+                branches.pop().unwrap_or_default()
+            } else {
+                vec![WherePredicate::Or(branches)]
+            }
+        } else {
+            self.pos = kw_idx + 1; // `BETWEEN` を消費する
+            let low = match self.advance() {
+                Some(Token::Number(n)) => n.clone(),
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "BETWEEN bounds must be numeric literals, got {other:?}"
+                    )))
+                }
+            };
+            match self.advance() {
+                Some(Token::Keyword(Keyword::And)) => {}
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "expected AND in BETWEEN, got {other:?}"
+                    )))
+                }
+            }
+            let high = match self.advance() {
+                Some(Token::Number(n)) => n.clone(),
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "BETWEEN bounds must be numeric literals, got {other:?}"
+                    )))
+                }
+            };
+            vec![
+                self.numeric_comparison(&col, BinOp::Ge, low)?,
+                self.numeric_comparison(&col, BinOp::Le, high)?,
+            ]
+        };
+        if negated {
+            Ok(Some(negate_conjunction(preds, &mut self.expr_node_budget)?))
+        } else {
+            Ok(Some(preds))
+        }
+    }
+
+    /// `<col> <op> <number>` の式述語を 1 つ組み立てる（3 ノードを予算へ課金）。
+    fn numeric_comparison(
+        &mut self,
+        col: &str,
+        op: BinOp,
+        number: String,
+    ) -> Result<WherePredicate, SqlSurfaceError> {
+        self.consume_expr_node()?;
+        self.consume_expr_node()?;
+        self.consume_expr_node()?;
+        Ok(WherePredicate::Expression(Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ident(col.to_string())),
+            rhs: Box::new(Expr::Number(number)),
+        }))
     }
 
     /// 構造的に確定できる `WHERE`／`CHECK` の葉を 1 つ試す。列名 `Ident` を先頭に
@@ -5592,7 +5796,11 @@ impl<'a> Parser<'a> {
     fn parse_check_parenthesized_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         self.expect_ident_matching("CHECK")?;
         self.expect_punct('(')?;
-        let predicates = self.parse_check_body()?;
+        let prev_in_check = self.in_check_body;
+        self.in_check_body = true;
+        let body = self.parse_check_body();
+        self.in_check_body = prev_in_check;
+        let predicates = body?;
         self.expect_punct(')')?;
         if where_predicates_contain_or(&predicates) {
             // TASK-208・SQL-24（Issue #912）の対象は読み取り文・書き込み文の
@@ -9803,29 +10011,203 @@ mod tests {
     }
 
     #[test]
-    fn rejects_not_visible_and_not_expression_and_not_paren() {
+    fn rejects_not_visible_and_negated_visible_groups() {
         for sql in [
             "SELECT * FROM documents WHERE NOT visible() ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT * FROM documents WHERE NOT id > 1 ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT * FROM documents WHERE NOT (lang = 'ja') ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE NOT (visible()) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE NOT (lang = 'ja' AND visible()) ORDER BY embedding <=> '[0.1]' LIMIT 5",
         ] {
             assert_eq!(where_err(sql).wire_code(), "42601", "{sql}");
         }
     }
 
+    fn id_cmp(op: BinOp, n: &str) -> WherePredicate {
+        WherePredicate::Expression(Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ident("id".to_string())),
+            rhs: Box::new(Expr::Number(n.to_string())),
+        })
+    }
+
+    fn where_of(cond: &str) -> Vec<WherePredicate> {
+        where_predicates_of(&format!(
+            "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        ))
+    }
+
+    /// Issue #1184: `NOT ( ... )` は De Morgan で葉まで押し下げられ、`Not` が
+    /// `Or`／AND 群の上に残らない（三値論理で fail-open にならない）。
     #[test]
-    fn rejects_in_list_empty_non_string_and_over_limit() {
+    fn not_group_is_pushed_down_to_leaves() {
+        let eq = |c: &str, v: &str| WherePredicate::Equality {
+            column: c.to_string(),
+            value: v.to_string(),
+        };
+        let not = |p: WherePredicate| WherePredicate::Not(Box::new(p));
+        assert_eq!(where_of("NOT (lang = 'ja')"), vec![not(eq("lang", "ja"))]);
+        assert_eq!(
+            where_of("NOT (lang = 'ja' AND tag = 'a')"),
+            vec![WherePredicate::Or(vec![
+                vec![not(eq("lang", "ja"))],
+                vec![not(eq("tag", "a"))]
+            ])]
+        );
+        assert_eq!(
+            where_of("NOT (lang = 'ja' OR tag = 'a')"),
+            vec![not(eq("lang", "ja")), not(eq("tag", "a"))]
+        );
+        // 二重否定は畳む。
+        assert_eq!(
+            where_of("NOT NOT (lang = 'ja' OR tag = 'a')"),
+            vec![WherePredicate::Or(vec![
+                vec![eq("lang", "ja")],
+                vec![eq("tag", "a")]
+            ])]
+        );
+        assert_eq!(
+            where_of("NOT (tag NOT IN ('a', 'c'))"),
+            vec![WherePredicate::InList {
+                column: "tag".to_string(),
+                values: vec!["a".to_string(), "c".to_string()],
+            }]
+        );
+        // 裸の `NOT <式比較>` と値式グループ。
+        assert_eq!(where_of("NOT id > 1"), vec![id_cmp(BinOp::Le, "1")]);
+        assert_eq!(where_of("NOT (id > 1)"), vec![id_cmp(BinOp::Le, "1")]);
+        assert_eq!(
+            where_of("NOT (id + 1) > 5"),
+            vec![WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Le,
+                lhs: Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("id".to_string())),
+                    rhs: Box::new(Expr::Number("1".to_string())),
+                }),
+                rhs: Box::new(Expr::Number("5".to_string())),
+            })]
+        );
+        assert_eq!(
+            where_of("NOT (id = 1)"),
+            vec![WherePredicate::Or(vec![
+                vec![id_cmp(BinOp::Lt, "1")],
+                vec![id_cmp(BinOp::Gt, "1")]
+            ])]
+        );
+    }
+
+    #[test]
+    fn numeric_in_and_between_are_desugared() {
+        assert_eq!(where_of("id IN (1)"), vec![id_cmp(BinOp::Eq, "1")]);
+        assert_eq!(
+            where_of("id IN (1, 2)"),
+            vec![WherePredicate::Or(vec![
+                vec![id_cmp(BinOp::Eq, "1")],
+                vec![id_cmp(BinOp::Eq, "2")]
+            ])]
+        );
+        assert_eq!(
+            where_of("id BETWEEN 1 AND 3"),
+            vec![id_cmp(BinOp::Ge, "1"), id_cmp(BinOp::Le, "3")]
+        );
+        assert_eq!(
+            where_of("id NOT BETWEEN 1 AND 3"),
+            vec![WherePredicate::Or(vec![
+                vec![id_cmp(BinOp::Lt, "1")],
+                vec![id_cmp(BinOp::Gt, "3")]
+            ])]
+        );
+        assert_eq!(
+            where_of("id NOT IN (1, 2)"),
+            vec![
+                WherePredicate::Or(vec![
+                    vec![id_cmp(BinOp::Lt, "1")],
+                    vec![id_cmp(BinOp::Gt, "1")]
+                ]),
+                WherePredicate::Or(vec![
+                    vec![id_cmp(BinOp::Lt, "2")],
+                    vec![id_cmp(BinOp::Gt, "2")]
+                ]),
+            ]
+        );
+        // BETWEEN の内側の AND は外側の AND と衝突しない。
+        assert_eq!(where_of("id BETWEEN 1 AND 3 AND lang = 'ja'").len(), 3);
+        // 前置 NOT は否定の否定になる。
+        assert_eq!(
+            where_of("NOT id NOT BETWEEN 1 AND 3"),
+            vec![id_cmp(BinOp::Ge, "1"), id_cmp(BinOp::Le, "3")]
+        );
+    }
+
+    #[test]
+    fn numeric_in_between_rejects_malformed_forms() {
+        for cond in [
+            "id IN (1, 'a')",
+            "id IN (1, NULL)",
+            "id IN (1, $1)",
+            "id IN (1,)",
+            "id IN (-1)",
+            "id BETWEEN 1 AND '3'",
+            "id BETWEEN 1 OR 3",
+            "id BETWEEN SYMMETRIC 1 AND 3",
+        ] {
+            let sql = format!(
+                "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            );
+            assert_eq!(where_err(&sql).wire_code(), "42601", "{cond}");
+        }
+    }
+
+    #[test]
+    fn numeric_in_list_limits_are_enforced_before_allocation() {
+        let many = (0..=MAX_IN_LIST_ITEMS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for cond in [format!("id IN ({many})"), format!("id NOT IN ({many})")] {
+            let sql = format!(
+                "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            );
+            assert_eq!(where_err(&sql).wire_code(), "54000");
+        }
+        // 上限ちょうどは受理する。
+        let max = (0..MAX_IN_LIST_ITEMS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(where_of(&format!("id IN ({max})")).len(), 1);
+        // NOT IN は比較数が倍になり式ノード予算を消費する（54000。panic しない）。
+        let heavy = (0..MAX_IN_LIST_ITEMS)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT * FROM documents WHERE id NOT IN ({heavy}) ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        assert_eq!(where_err(&sql).wire_code(), "54000");
+    }
+
+    /// CHECK 本体（TABLE-16）は新しい形を受理しない（従来どおり `42601`）。
+    #[test]
+    fn check_body_keeps_rejecting_new_forms() {
+        let lookup = catalog_with(&[]);
+        for cond in [
+            "NOT (id > 1)",
+            "NOT id > 1",
+            "id IN (1, 2)",
+            "id BETWEEN 1 AND 3",
+        ] {
+            let sql = format!("CREATE TABLE t (id_x TEXT, CHECK ({cond}))");
+            let err = validate_statement(&sql, &lookup)
+                .expect_err(&format!("{sql:?} should be rejected"));
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_in_list_empty_and_string_list_over_limit() {
         assert_eq!(
             where_err(
                 "SELECT * FROM documents WHERE lang IN () \
-                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
-            )
-            .wire_code(),
-            "42601"
-        );
-        assert_eq!(
-            where_err(
-                "SELECT * FROM documents WHERE lang IN (1) \
                  ORDER BY embedding <=> '[0.1]' LIMIT 5"
             )
             .wire_code(),
