@@ -65,7 +65,7 @@ TEXT／VECTOR／INTEGER／BIGINT 列のみ宣言できる（REAL/DOUBLE 列は R
 - `visible()`（`WherePredicate::PredicateCall`）: RLS 文脈に依存し、CHECK の
   参照可能範囲（テーブル列と `id` のみ）を破るため。
 - 組み込み関数以外の `Expr::Call`（セッション UDF・WASM UDF・未知関数）:
-  空の `UdfRegistry` で束縛すると「未知の関数」（`22000`）へ丸まってしまい
+  空の `UdfRegistry` で束縛すると「未知の関数」（`42883`）へ丸まってしまい
   CHECK の禁止要素として区別できないため、束縛より前に検出する
   （`sql::udf_call::is_builtin_function_name`）。
 

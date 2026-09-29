@@ -1458,7 +1458,7 @@ fn bind_where_predicates_recursive(
                     column_ref_policy,
                 )?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::datatype_mismatch(
                         "WHERE expression must evaluate to a boolean (use a comparison)",
                     ));
                 }
@@ -4373,7 +4373,7 @@ impl BoundAggregate {
 /// - `INTEGER`/`BIGINT`/`REAL`/`DOUBLE PRECISION`/`NUMERIC` 列 → すべての
 ///   集計関数を受理（[`AggregateInput::IntegerColumn`] 等）
 /// - `DATE`/`TIMESTAMP` 列 → `COUNT`・`MIN`/`MAX` を受理、`SUM`/`AVG` は
-///   型不整合（`22000`）
+///   `42883`（Issue #1186。式でも同じ）
 /// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
 ///   （非 NULL 行のみ数える）、それ以外は型不整合（`22000`）
 /// - 上記以外の識別子 → 未知の列（`22000`）
@@ -4435,16 +4435,16 @@ fn resolve_aggregate_input(
                         ColumnType::Date,
                         AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
                     ) => Ok(AggregateInput::DateColumn(index)),
-                    (ColumnType::Date, _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Date, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is DATE and cannot be used with SUM/AVG"
                     ))),
                     (
                         ColumnType::Timestamp,
                         AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
                     ) => Ok(AggregateInput::TimestampColumn(index)),
-                    (ColumnType::Timestamp, _) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"
-                    ))),
+                    (ColumnType::Timestamp, _) => Err(SqlSurfaceError::undefined_function(
+                        format!("column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"),
+                    )),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -4517,6 +4517,15 @@ fn resolve_aggregate_input(
                 // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` を
                 // 直接返す式（集計せず素通しする形）も、上記 TEXT と同じ理由で
                 // 集計引数としては対象外とする。
+                // Issue #1186: `SUM`／`AVG` に `DATE`／`TIMESTAMP` 式を渡す組み合わせ
+                // は列参照と同じく `42883`（undefined_function）で拒否する。
+                ExprType::Date | ExprType::Timestamp
+                    if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
+                {
+                    Err(SqlSurfaceError::undefined_function(
+                        "SUM/AVG cannot be applied to a DATE or TIMESTAMP expression",
+                    ))
+                }
                 ExprType::Vector
                 | ExprType::Bool
                 | ExprType::Text
