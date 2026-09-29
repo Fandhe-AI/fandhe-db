@@ -311,7 +311,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `table` | ○ | string | |
 | `aggregates` | ○ | object[]（`{"fn","column"}`。1〜32 要素） | `fn` は `count`／`sum`／`avg`／`min`／`max`（小文字完全一致）。`column` は列名、または `count` 専用の `"*"` |
 | `filter` | △ | object[] | |
-| `group_by` | △ | string[]（1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | `TEXT` 列限定 |
+| `group_by` | △ | string[]（1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | `TEXT`・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列（Issue #1183。数値キーは昇順・NULL 末尾・`-0.0` と `0.0` は同一グループ） |
 | `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
 | `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having` 付きでも受理）。`false`／省略時は通常実行 |
 
@@ -339,7 +339,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
   `fn`／`op` が語彙外・識別子形状不正 → `42601`
 - `group_by` 要素数が 8（`MAX_GROUP_BY_COLUMNS`）超過・グループ数上限
   （10,000）・グループキー累計バイト・`having` 述語数上限超過 → `54000`
-- `group_by` 列が `TEXT` 列でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
+- `group_by` 列が `TEXT`／数値列（INTEGER／BIGINT／REAL／DOUBLE）でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
   参照先が `aggregates` に存在しない／曖昧 → `22000`
 - `VECTOR` 列の集計: `count` は列の裸の列参照を受理し非 `NULL` 行数を数える
   （`resolve_aggregate_input` の `AggregateInput::VectorColumnPresence`）。
@@ -611,9 +611,10 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 ```
 
 （`price` は `NUMERIC` 列を想定。`lt`／`le`／`lte`／`gt`／`ge`／`gte` は
-`DATE`・`TIMESTAMP`・`UUID`・`NUMERIC`・`BYTEA` 列のみ受理し、`INTEGER`／
-`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への範囲比較は `declare_range` が
-`0A000` で拒否する——後述「葉（leaf）」節参照）
+`DATE`・`TIMESTAMP`・`UUID`・`NUMERIC`・`BYTEA`・`TEXT`（バイト順）列と、
+`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列（JSON 数値のみ。Issue #1183）
+を受理する。数値列・`TEXT` の範囲比較は式レーンで束縛され、同じ条件の SQL
+`WHERE` と結果集合が一致する——後述「葉（leaf）」節参照）
 
 ```json
 [{"or": [
@@ -653,10 +654,12 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   配列）のみ受理する。他の列型は engine 側の「IN 非対応列」判定（`22000`）へ
   委譲する
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
-  対象外（`0A000`）。`udf_call::bind_expr`（式レーン）がこれらの列型の式内
-  参照を現時点で受理しないため（別 Issue #891 の担当。Issue #945 の計画時点
-  では式レーンへ渡す想定だったが、実装時に engine 側の未対応を確認し対象外へ
-  縮小した）
+  JSON 数値のみ受理し（文字列・真偽値は型不一致）、式レーン
+  （`udf_call::bind_expr`）で束縛する（Issue #1183）。`BIGINT` の |値| が
+  2^53 を超える場合（JSON リテラル・格納値とも）は `22000`。`TEXT` の範囲比較も
+  式レーン（バイト順）で受理する。`in` は数値列では従来どおり `22000`。
+  述語形 `update`／`delete` の `filter` では数値列の `eq` を引き続き `0A000` で
+  拒否する
 - `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
 - `in` は列型に関わらず対応する場合のみ受理する（対象外の列型は `22000`）
 - 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は

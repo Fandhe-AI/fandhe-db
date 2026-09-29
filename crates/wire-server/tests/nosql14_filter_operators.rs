@@ -297,17 +297,20 @@ fn in_empty_and_over_limit_are_rejected_with_expected_wire_codes() {
 }
 
 #[test]
-fn range_on_text_column_is_22000_matching_sql() {
+fn range_on_text_column_binds_to_expression_lane_matching_sql() {
+    // Issue #1183: TEXT の範囲比較は式レーンで束縛され、SQL の `lang > 'a'` と
+    // 同じ形（式述語 1 件・メタデータフィルタ無し）になる。
     let items = parse_json(r#"[{"column":"lang","op":"gt","value":"a"}]"#).expect("valid JSON");
     let JsonValue::Array(items) = items else {
         panic!("expected array");
     };
-    let err = bind_filter(&items, &schema(), &udfs()).expect_err("must reject");
-    assert_eq!(ClassifiedError::wire_code(&err), "22000");
+    let bound = bind_filter(&items, &schema(), &udfs()).expect("must bind");
+    assert!(bound.metadata_filters().is_empty());
+    assert_eq!(bound.expr_filters().len(), 1);
 }
 
 #[test]
-fn eq_and_range_on_integer_column_are_feature_not_supported() {
+fn eq_and_range_on_integer_column_bind_to_expression_lane() {
     let schema_with_int = TableSchema::new(
         TABLE,
         vec![
@@ -321,9 +324,196 @@ fn eq_and_range_on_integer_column_are_feature_not_supported() {
         let JsonValue::Array(items) = items else {
             panic!("expected array");
         };
-        let err = bind_filter(&items, &schema_with_int, &udfs()).expect_err("must reject");
-        assert_eq!(ClassifiedError::wire_code(&err), "0A000");
+        let bound = bind_filter(&items, &schema_with_int, &udfs()).expect("must bind");
+        assert_eq!(bound.expr_filters().len(), 1, "{op}");
     }
+}
+
+type NumericRow = (
+    u64,
+    &'static str,
+    Option<i32>,
+    Option<i64>,
+    Option<f32>,
+    Option<f64>,
+);
+
+/// Issue #1183・NOSQL-14・NOSQL-17 ポインタ: 数値列・TEXT 範囲の `filter` が、
+/// 同じ条件の SQL `WHERE` と完全に同じ結果集合を返すこと（パリティ）、および
+/// 他テナントの行が結果に一切現れないこと（RLS 境界）を、実データの scan 実行で
+/// 固定する。
+#[test]
+fn numeric_and_text_range_filters_match_sql_and_respect_tenant_boundary() {
+    let path = temp_db::unique_db_path("nosql14-numeric-parity");
+    let _guard = temp_db::CleanupGuard(path.clone());
+
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(4), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+            ColumnDef::new("qty", ColumnType::Integer, true),
+            ColumnDef::new("total", ColumnType::BigInt, true),
+            ColumnDef::new("ratio", ColumnType::Real, true),
+            ColumnDef::new("score", ColumnType::Double, true),
+        ],
+    );
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema).expect("create table");
+    let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+        .expect("valid tenant-a ctx");
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant-b ctx");
+
+    // id 4 は数値列が NULL。id 100・101 は tenant-b（Private）で、いずれの
+    // 条件にも一致しうる値。
+    let rows_a: [NumericRow; 5] = [
+        (1, "alpha", Some(1), Some(10), Some(0.5), Some(-1.5)),
+        (2, "beta", Some(2), Some(20), Some(1.5), Some(0.0)),
+        (3, "gamma", Some(3), Some(-30), Some(2.5), Some(2.5)),
+        (4, "delta", None, None, None, None),
+        (5, "\u{3042}", Some(5), Some(50), Some(5.0), Some(5.0)),
+    ];
+    let rows_b: [NumericRow; 2] = [
+        (100, "alpha", Some(2), Some(20), Some(1.5), Some(0.0)),
+        (101, "zzz", Some(3), Some(30), Some(2.5), Some(2.5)),
+    ];
+    for (ctx, vis, rows) in [
+        (&ctx_a, Visibility::Public, rows_a.as_slice()),
+        (&ctx_b, Visibility::Private, rows_b.as_slice()),
+    ] {
+        for &(id, lang, qty, total, ratio, score) in rows {
+            let op = engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id");
+            engine::tenant::insert_typed_row(
+                &storage,
+                TABLE,
+                ctx,
+                id,
+                vis,
+                &[
+                    Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+                    Value::Text(lang.to_string()),
+                    qty.map_or(Value::Null, Value::Integer),
+                    total.map_or(Value::Null, Value::BigInt),
+                    ratio.map_or(Value::Null, Value::Real),
+                    score.map_or(Value::Null, Value::Double),
+                ],
+                &op,
+            )
+            .expect("insert row");
+        }
+    }
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let session = SessionState::default();
+
+    // (NoSQL filter JSON, 等価な SQL WHERE)
+    let cases: [(&str, &str); 16] = [
+        (r#"[{"column":"qty","op":"eq","value":2}]"#, "qty = 2"),
+        (r#"[{"column":"qty","op":"gt","value":1}]"#, "qty > 1"),
+        (r#"[{"column":"qty","op":"ge","value":3}]"#, "qty >= 3"),
+        (r#"[{"column":"qty","op":"lt","value":3}]"#, "qty < 3"),
+        (r#"[{"column":"qty","op":"lte","value":2}]"#, "qty <= 2"),
+        (r#"[{"column":"total","op":"lt","value":0}]"#, "total < 0"),
+        (
+            r#"[{"column":"total","op":"gte","value":20}]"#,
+            "total >= 20",
+        ),
+        (
+            r#"[{"column":"ratio","op":"gt","value":1.5}]"#,
+            "ratio > 1.5",
+        ),
+        (
+            r#"[{"column":"ratio","op":"eq","value":0.5}]"#,
+            "ratio = 0.5",
+        ),
+        (
+            r#"[{"column":"score","op":"lt","value":0.5}]"#,
+            "score < 0.5",
+        ),
+        (r#"[{"column":"score","op":"eq","value":0}]"#, "score = 0"),
+        (r#"[{"column":"lang","op":"lt","value":"b"}]"#, "lang < 'b'"),
+        (
+            r#"[{"column":"lang","op":"ge","value":"beta"}]"#,
+            "lang >= 'beta'",
+        ),
+        (
+            r#"[{"column":"lang","op":"gt","value":"a"},{"column":"qty","op":"lt","value":5}]"#,
+            "lang > 'a' AND qty < 5",
+        ),
+        (
+            r#"[{"or":[{"column":"qty","op":"eq","value":1},{"column":"lang","op":"gt","value":"g"}]}]"#,
+            "qty = 1 OR lang > 'g'",
+        ),
+        (r#"[{"column":"qty","op":"gt","value":100}]"#, "qty > 100"),
+    ];
+    let run_nosql = |filter_json: &str| {
+        let items = parse_json(filter_json).expect("valid JSON");
+        let JsonValue::Array(items) = items else {
+            panic!("expected array");
+        };
+        core.execute_bound_scan_in_session(&ctx_a, &session, TABLE, |schema, udfs| {
+            let bound_filters =
+                bind_filter(&items, schema, udfs).map_err(FilterError::into_sql_surface_error)?;
+            let (metadata_filters, expr_filters, or_filters) = bound_filters.into_parts();
+            Ok(BoundScan::new(
+                TABLE.to_string(),
+                vec![engine::sql::parser::ProjectedColumn::Id],
+                metadata_filters,
+                expr_filters,
+                100,
+            )
+            .with_or_filters(or_filters))
+        })
+        .unwrap_or_else(|e| panic!("nosql filter {filter_json} must execute: {e:?}"))
+    };
+    let run_sql = |where_clause: &str| {
+        core.execute_bound_scan_in_session(&ctx_a, &session, TABLE, |schema, udfs| {
+            let sql_validated = validate_sql(
+                &format!("SELECT id FROM docs WHERE {where_clause} LIMIT 100"),
+                &FixedTableLookupForRls,
+            )?;
+            let Statement::Scan(validated_scan) = sql_validated else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "expected Statement::Scan".to_string(),
+                });
+            };
+            bind_scan(&validated_scan, schema, udfs)
+        })
+        .unwrap_or_else(|e| panic!("sql {where_clause} must execute: {e:?}"))
+    };
+    let sorted_rows = |r: &engine::sql::exec::QueryResult| {
+        let mut v: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| format!("{:?}", row.cells))
+            .collect();
+        v.sort();
+        v
+    };
+    for (filter_json, where_clause) in cases {
+        let nosql = run_nosql(filter_json);
+        let sql = run_sql(where_clause);
+        assert_eq!(
+            sorted_rows(&nosql),
+            sorted_rows(&sql),
+            "NoSQL filter {filter_json} must match SQL WHERE {where_clause}"
+        );
+        // 他テナント（id 100・101）は決して現れない（RLS 境界）。
+        for row in &nosql.rows {
+            let cell = format!("{:?}", row.cells);
+            assert!(
+                !cell.contains("100") && !cell.contains("101"),
+                "tenant-b row leaked for {filter_json}: {cell}"
+            );
+        }
+    }
+
+    // 全件空で一致しているだけの空振りを防ぐ（tenant-a の qty > 1 は id 2・3・5）。
+    let result = run_nosql(r#"[{"column":"qty","op":"gt","value":1}]"#);
+    assert_eq!(result.rows.len(), 3);
 }
 
 /// RLS 境界（Issue #945 の受け入れ条件・security.md P0）: 全テナントの行に
