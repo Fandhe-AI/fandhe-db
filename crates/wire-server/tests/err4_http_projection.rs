@@ -277,7 +277,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 39] = [
+const EXPECTED_STATUS: [(&str, u16); 40] = [
     ("22000", 400),
     ("22012", 400),
     ("28P01", 401),
@@ -340,6 +340,9 @@ const EXPECTED_STATUS: [(&str, u16); 39] = [
     // （Issue #1186）。いずれも 400。
     ("42883", 400),
     ("42723", 400),
+    // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: ERR-6 の新設行。400
+    // （`42P07` の 409 とは揃えない）。
+    ("42710", 400),
     // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
     // 参照スコープでの非修飾列の曖昧解決。本 Issue では SQL 表層が JOIN・複数
     // FROM を受理しないため到達不能で、`err4_f_unreachable_classes_project_via_production_encoder`
@@ -412,7 +415,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 41);
+const _: () = assert!(ErrorClass::ALL.len() == 42);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -888,6 +891,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // 参照スコープの基盤導入のみで、許可リストは JOIN・複数 FROM を引き続き
         // `42601` で拒否するため NoSQL 表層からは到達不能。
         ErrorClass::AmbiguousColumn,
+        // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: `ALTER TABLE ... ADD
+        // CONSTRAINT` の CHECK・FOREIGN KEY の名前衝突。NoSQL の `alter_table` は
+        // `add_column`／`drop_column` だけで到達不能。
+        ErrorClass::DuplicateObject,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());

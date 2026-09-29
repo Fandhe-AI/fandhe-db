@@ -215,7 +215,7 @@ fn add_check_default_name_collision_avoids_both_unique_and_check_names() {
     }
 }
 
-/// 明示名が既存 UNIQUE 名と衝突する場合は `42P07`（逆方向: 明示名が既存 CHECK
+/// 明示名が既存 UNIQUE 名と衝突する場合は `42710`（逆方向: 明示名が既存 CHECK
 /// 名と衝突する場合は `sql_alter_table_unique_constraint.rs` の
 /// `add_unique_rejects_name_collision_with_existing_check` が既にカバー済み）。
 #[test]
@@ -240,10 +240,10 @@ fn add_check_rejects_explicit_name_collision_with_existing_unique() {
         "ALTER TABLE docs ADD CONSTRAINT uq_a CHECK (qty > 0)",
     )
     .expect_err("name shared with a UNIQUE constraint must be rejected");
-    assert_eq!(err.wire_code(), "42P07");
+    assert_eq!(err.wire_code(), "42710");
 }
 
-/// 明示名が既存 CHECK 名と衝突する場合も `42P07`（CHECK 同士）。
+/// 明示名が既存 CHECK 名と衝突する場合も `42710`（CHECK 同士）。
 #[test]
 fn add_check_rejects_explicit_name_collision_with_existing_check() {
     let (core, path) = new_core("alter-check-name-collision-check");
@@ -266,10 +266,10 @@ fn add_check_rejects_explicit_name_collision_with_existing_check() {
         "ALTER TABLE docs ADD CONSTRAINT qty_ck CHECK (qty < 1000)",
     )
     .expect_err("name shared with an existing CHECK constraint must be rejected");
-    assert_eq!(err.wire_code(), "42P07");
+    assert_eq!(err.wire_code(), "42710");
 }
 
-/// 明示名が既存 FOREIGN KEY 制約名と衝突する場合も `42P07`（設計 F1。UNIQUE・
+/// 明示名が既存 FOREIGN KEY 制約名と衝突する場合も `42710`（設計 F1。UNIQUE・
 /// CHECK・FOREIGN KEY はテーブル単位の名前空間を共有する。
 /// `sql_alter_table_foreign_key.rs::add_foreign_key_rejects_name_collision_with_existing_check`
 /// の対称チェック——逆方向（ADD CHECK が既存 FOREIGN KEY 名と衝突する経路）の
@@ -312,7 +312,7 @@ fn add_check_rejects_explicit_name_collision_with_existing_foreign_key() {
         "ALTER TABLE children ADD CONSTRAINT dup_name CHECK (parent_id > 0)",
     )
     .expect_err("name shared with an existing FOREIGN KEY constraint must be rejected");
-    assert_eq!(err.wire_code(), "42P07");
+    assert_eq!(err.wire_code(), "42710");
 }
 
 /// 参照列が NULL の既存行は違反にしない（三値論理。設計 D6）。
@@ -346,7 +346,7 @@ fn add_check_null_referenced_column_is_not_a_violation() {
 
 /// 別テナント・`Private` 可視性を含む既存行が新しい CHECK に違反する場合は
 /// `23514` で拒否され、副作用ゼロ（カタログ・世代・行のいずれも不変）を保つ:
-/// 同じ違反行の INSERT は以後も成功し、同名で再度 ADD しても `42P07` に
+/// 同じ違反行の INSERT は以後も成功し、同名で再度 ADD しても `42710` に
 /// ならず、ストレージ再オープン後も制約は存在しない。
 #[test]
 fn add_check_rejects_existing_cross_tenant_private_violation_with_no_side_effect() {
@@ -407,7 +407,7 @@ fn add_check_rejects_existing_cross_tenant_private_violation_with_no_side_effect
     )
     .expect("constraint must not have been persisted: violating INSERT still succeeds");
 
-    // 副作用ゼロ: 同名で再度 ADD しても `42P07`（衝突）にはならない
+    // 副作用ゼロ: 同名で再度 ADD しても `42710`（衝突）にはならない
     // （カタログに残っていない）。
     let err2 = exec(
         &core,

@@ -225,6 +225,7 @@ fail-closed。FOREIGN KEY・CHECK の削除は既存行を変更しないため�
 
 ## 申し送り（Issue は起票しない）
 
+（Issue #1195 追記: CHECK・FK 追加側は `42710` へ移行済み。UNIQUE は索引名との衝突の意味論により `42P07` を維持）
 - spec 側の課題: 制約名衝突には ERR-6 の既存行 `42P07` を流用した。専用
   SQLSTATE の追加要否について spec リポでの判断を依頼する
 - スコープ外として残すもの: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`・

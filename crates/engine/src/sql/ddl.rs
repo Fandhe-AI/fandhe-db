@@ -437,7 +437,8 @@ pub(crate) fn execute_alter_table_drop_constraint(
 ///    トランザクション内で名前衝突・件数上限・意味論検証・既存行の全件走査を
 ///    判定。TOCTOU なし）。`AlterCheckError::Sql` は評価エラー・意味論検証
 ///    エラーの `SqlSurfaceError` をそのまま透過し、`AlterCheckError::Catalog`
-///    は [`map_alter_constraint_error`] へ委譲する（UNIQUE と共有する契約）。
+///    は [`map_add_check_or_foreign_key_error`] へ委譲する（名前衝突のみ
+///    `42710`、他は UNIQUE と共有する [`map_alter_constraint_error`] の契約）。
 pub(crate) fn execute_alter_table_add_check(
     storage: &Storage,
     stmt: &ValidatedAlterTableAddCheck,
@@ -447,7 +448,7 @@ pub(crate) fn execute_alter_table_add_check(
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
-        Err(other) => return Err(map_alter_constraint_error(other)),
+        Err(other) => return Err(map_add_check_or_foreign_key_error(other)),
     }
     let confirmed_name = storage
         .alter_table_add_check_constraint(&stmt.table_name, &stmt.check)
@@ -455,7 +456,7 @@ pub(crate) fn execute_alter_table_add_check(
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
                 undefined_table_or_view(storage, &stmt.table_name)
             }
-            AlterCheckError::Catalog(other) => map_alter_constraint_error(other),
+            AlterCheckError::Catalog(other) => map_add_check_or_foreign_key_error(other),
             AlterCheckError::Sql(sql_err) => sql_err,
         })?;
     Ok(AlterTableOutcome {
@@ -526,7 +527,7 @@ pub(crate) fn execute_alter_table_add_foreign_key(
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
-        Err(other) => return Err(map_alter_constraint_error(other)),
+        Err(other) => return Err(map_add_check_or_foreign_key_error(other)),
     }
     let confirmed_name = storage
         .alter_table_add_foreign_key(
@@ -538,7 +539,7 @@ pub(crate) fn execute_alter_table_add_foreign_key(
             CatalogError::TableNotFound(name) if name == stmt.table_name => {
                 undefined_table_or_view(storage, &stmt.table_name)
             }
-            other => map_alter_constraint_error(other),
+            other => map_add_check_or_foreign_key_error(other),
         })?;
     Ok(AlterTableOutcome {
         table_name: stmt.table_name.clone(),
@@ -546,6 +547,17 @@ pub(crate) fn execute_alter_table_add_foreign_key(
             constraint_name: confirmed_name,
         },
     })
+}
+
+/// `ALTER TABLE ... ADD CONSTRAINT` の CHECK・FOREIGN KEY 経路専用の写像
+/// （TABLE-22・ERR-6、Issue #1195）。制約名衝突だけを `42710`
+/// （[`SqlSurfaceError::DuplicateObject`]）へ写像し、他の variant は
+/// [`map_alter_constraint_error`] へ委譲する（UNIQUE は `42P07` のまま）。
+fn map_add_check_or_foreign_key_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::duplicate_object(name),
+        other => map_alter_constraint_error(other),
+    }
 }
 
 /// `Storage::alter_table_add_named_unique_constraint`／
@@ -1325,5 +1337,29 @@ mod tests {
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// Issue #1195: 制約名衝突は UNIQUE・DROP 経路で `42P07`、CHECK・FK 経路で
+    /// `42710`。他の variant は両写像で同一。
+    #[test]
+    fn constraint_name_collision_maps_by_constraint_kind() {
+        let dup = || CatalogError::ConstraintAlreadyExists("c".to_string());
+        assert_eq!(map_alter_constraint_error(dup()).wire_code(), "42P07");
+        let err = map_add_check_or_foreign_key_error(dup());
+        assert!(matches!(err, SqlSurfaceError::DuplicateObject { .. }));
+        assert_eq!(err.wire_code(), "42710");
+        let others = || {
+            vec![
+                CatalogError::TableNotFound("t".to_string()),
+                CatalogError::ConstraintNotFound("c".to_string()),
+                CatalogError::ConstraintLimitExceeded("limit".to_string()),
+            ]
+        };
+        for (a, b) in others().into_iter().zip(others()) {
+            assert_eq!(
+                map_alter_constraint_error(a).wire_code(),
+                map_add_check_or_foreign_key_error(b).wire_code()
+            );
+        }
     }
 }
