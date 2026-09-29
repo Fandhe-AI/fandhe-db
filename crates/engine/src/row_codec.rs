@@ -208,12 +208,37 @@ pub enum Value {
     Uuid(Uuid),
 }
 
-/// 配列列 1 個分の値（Issue #888）。NULL 要素は本版では受理しない（D-A6。
-/// 列自体の NULL は [`Value::Null`] と区別する）。
+/// 配列列 1 個分の値（Issue #888・#1193）。各要素は `Option`（`None` が NULL 要素。
+/// TABLE-14）。列自体の NULL は [`Value::Null`] と区別する。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArrayValue {
-    Text(Vec<String>),
-    Bool(Vec<bool>),
+    Text(Vec<Option<String>>),
+    Bool(Vec<Option<bool>>),
+    Integer(Vec<Option<i32>>),
+    BigInt(Vec<Option<i64>>),
+    Real(Vec<Option<f32>>),
+    Double(Vec<Option<f64>>),
+    Date(Vec<Option<i32>>),
+    Timestamp(Vec<Option<i64>>),
+    Uuid(Vec<Option<Uuid>>),
+}
+
+/// `ArrayValue` の全 variant に同じ式を適用する内部マクロ（要素型が増えたときの
+/// 網羅漏れを 1 箇所に集約する）。
+macro_rules! array_dispatch {
+    ($value:expr, $items:ident => $body:expr) => {
+        match $value {
+            ArrayValue::Text($items) => $body,
+            ArrayValue::Bool($items) => $body,
+            ArrayValue::Integer($items) => $body,
+            ArrayValue::BigInt($items) => $body,
+            ArrayValue::Real($items) => $body,
+            ArrayValue::Double($items) => $body,
+            ArrayValue::Date($items) => $body,
+            ArrayValue::Timestamp($items) => $body,
+            ArrayValue::Uuid($items) => $body,
+        }
+    };
 }
 
 impl ArrayValue {
@@ -224,18 +249,94 @@ impl ArrayValue {
         match self {
             ArrayValue::Text(_) => ArrayElemType::Text,
             ArrayValue::Bool(_) => ArrayElemType::Bool,
+            ArrayValue::Integer(_) => ArrayElemType::Integer,
+            ArrayValue::BigInt(_) => ArrayElemType::BigInt,
+            ArrayValue::Real(_) => ArrayElemType::Real,
+            ArrayValue::Double(_) => ArrayElemType::Double,
+            ArrayValue::Date(_) => ArrayElemType::Date,
+            ArrayValue::Timestamp(_) => ArrayElemType::Timestamp,
+            ArrayValue::Uuid(_) => ArrayElemType::Uuid,
         }
     }
 
     /// 要素数（`pub(crate)`: 用途は [`Self::elem`] と同じ）。
     pub(crate) fn len(&self) -> usize {
+        array_dispatch!(self, v => v.len())
+    }
+
+    /// 1 個以上の NULL 要素を含むか（含むときだけフレーム flags が
+    /// [`ARRAY_FLAG_HAS_NULLS`] になる正準性の根拠）。
+    pub fn has_null(&self) -> bool {
+        array_dispatch!(self, v => v.iter().any(|e| e.is_none()))
+    }
+
+    /// 要素ごとの NULL フラグ（要素数は `max_len <= 1024` で上限済み）。
+    fn null_flags(&self) -> Vec<bool> {
+        array_dispatch!(self, v => v.iter().map(|e| e.is_none()).collect())
+    }
+
+    /// 複製・保持に要するヒープ量の概算（複製予算・結果サイズ見積もり用。
+    /// TEXT は本文長の合計に要素あたりの `Option<String>` 構造体分を加える。空文字列
+    /// を大量に含む配列で予算消費が 0 のまま管理領域が積み上がらないようにする
+    /// 保守的な見積もりで、`sql::returning`・`sql::cursor`・`sql::join`・`sql::set_op`
+    /// が共有する）。
+    pub(crate) fn approx_heap_bytes(&self) -> usize {
         match self {
-            ArrayValue::Text(v) => v.len(),
-            ArrayValue::Bool(v) => v.len(),
+            ArrayValue::Text(items) => {
+                let payload: usize = items.iter().flatten().map(|s| s.len()).sum();
+                payload.saturating_add(
+                    items
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Option<String>>()),
+                )
+            }
+            ArrayValue::Bool(v) => v.len().saturating_mul(std::mem::size_of::<Option<bool>>()),
+            ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
+            ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
+            ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
+            ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
+            ArrayValue::Date(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
+            ArrayValue::Timestamp(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
+            ArrayValue::Uuid(v) => v.len().saturating_mul(std::mem::size_of::<Option<Uuid>>()),
+        }
+    }
+
+    /// 集合演算の行キーなど、行バイトを介さない一意化用の正準表現
+    /// `(要素型序数, flags, 要素列ペイロード)`。ペイロードは行バイトと同じ
+    /// [`write_array_elements_payload`] の出力（NULL ビットマップを含む）で、値に
+    /// 対して単射になる。`sql::set_op` が第 3 のエンコードを作らず共有する。
+    pub(crate) fn canonical_parts(&self) -> Result<(u8, u8, Vec<u8>)> {
+        let ordinal = match self {
+            ArrayValue::Text(_) => 0,
+            ArrayValue::Bool(_) => 1,
+            ArrayValue::Integer(_) => 2,
+            ArrayValue::BigInt(_) => 3,
+            ArrayValue::Real(_) => 4,
+            ArrayValue::Double(_) => 5,
+            ArrayValue::Date(_) => 6,
+            ArrayValue::Timestamp(_) => 7,
+            ArrayValue::Uuid(_) => 8,
+        };
+        let mut payload = Vec::new();
+        write_array_elements_payload(&mut payload, self)?;
+        Ok((ordinal, self.frame_flags(), payload))
+    }
+
+    /// [`Self::canonical_parts`] のペイロード長（確保せずに算出する）。
+    pub(crate) fn canonical_payload_len(&self) -> Result<usize> {
+        Ok(array_elements_byte_len(self.elem(), self)? as usize)
+    }
+
+    /// エンコードされるフレーム flags（NULL 要素を含むときだけ
+    /// [`ARRAY_FLAG_HAS_NULLS`]）。
+    pub(crate) fn frame_flags(&self) -> u8 {
+        if self.has_null() {
+            ARRAY_FLAG_HAS_NULLS
+        } else {
+            ARRAY_FLAGS_NONE
         }
     }
 }
-
 /// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・REAL・
 /// DOUBLE PRECISION・BOOLEAN・ARRAY のいずれも返せるよう `Option<&str>` から
 /// 型付き化した（Issue #883・D-b、Issue #888。`INTEGER`／`BIGINT`（Issue #881
@@ -478,6 +579,9 @@ impl<'a> ScalarRef<'a> {
 pub struct ArrayRef<'a> {
     elem: ArrayElemType,
     count: u32,
+    /// フレーム flags（`0x00` または [`ARRAY_FLAG_HAS_NULLS`]）。`bytes` の先頭に
+    /// NULL ビットマップが付くかどうかを決める。
+    flags: u8,
     bytes: &'a [u8],
 }
 
@@ -488,6 +592,11 @@ impl<'a> ArrayRef<'a> {
 
     pub fn count(&self) -> u32 {
         self.count
+    }
+
+    /// フレーム flags（NULL 要素を含むとき `0x01`。Issue #1193）。
+    pub fn flags(&self) -> u8 {
+        self.flags
     }
 
     /// 要素列本文（フレームヘッダを含まない）のバイト長。呼び出し元が
@@ -501,7 +610,7 @@ impl<'a> ArrayRef<'a> {
 
     /// 借用結果を所有値へ複製する（[`decode_scalar_columns`] 等が使う）。
     pub fn to_value(&self) -> Result<ArrayValue> {
-        decode_array_elements(self.elem, self.bytes, self.count)
+        decode_array_elements(self.elem, self.bytes, self.count, self.flags)
     }
 
     /// 要素列本文（フレームヘッダを含まない。走査時点で構造・UTF-8・要素数上限を
@@ -527,8 +636,13 @@ impl<'a> ArrayRef<'a> {
     /// 借用。永続化された行から走査した結果とは異なり構造検証を経ていないが、
     /// `Value::Array` は列挿入時の束縛（`bind_insert_row`）で既にスキーマ検証
     /// 済みの値であるため、ここでの再検証は行わない契約とする。
-    pub(crate) fn from_owned(elem: ArrayElemType, count: u32, bytes: &'a [u8]) -> Self {
-        ArrayRef { elem, count, bytes }
+    pub(crate) fn from_owned(elem: ArrayElemType, count: u32, flags: u8, bytes: &'a [u8]) -> Self {
+        ArrayRef {
+            elem,
+            count,
+            flags,
+            bytes,
+        }
     }
 }
 
@@ -552,10 +666,15 @@ pub(crate) const SCALAR_DATE_ENTRY_LEN: u32 = 5;
 /// バイト数（presence(1) + 値(8, LE i64)。Issue #884）。
 pub(crate) const SCALAR_TIMESTAMP_ENTRY_LEN: u32 = 9;
 
-/// 配列列のフレーム flags バイト。本版は `0x00` 固定（NULL 要素非対応。D-A6）。
-/// 将来 NULL 要素ビットマップ等を追加する際の予約領域として、`0x00` 以外は
-/// decode 側で fail-closed に拒否する。
-const ARRAY_FLAGS_RESERVED: u8 = 0x00;
+/// 配列列のフレーム flags バイト（NULL 要素なし）。ペイロードは要素列のみ。
+const ARRAY_FLAGS_NONE: u8 = 0x00;
+
+/// 配列列のフレーム flags バイト（NULL 要素あり。Issue #1193・D-A3 拡張）。
+/// ペイロード先頭に `ceil(count/8)` バイトの NULL ビットマップ（LSB first・1 が
+/// NULL・余りビットは 0）が付き、その後ろに非 NULL 要素だけが並ぶ。NULL が 1 個も
+/// 無い配列には付けない（正準性: 値に対してバイト表現が一意になる）。`0x00`／
+/// `0x01` 以外は decode 側で fail-closed に拒否する。
+pub(crate) const ARRAY_FLAG_HAS_NULLS: u8 = 0x01;
 
 /// 配列要素 1 個の BOOL 値バイト表現（スカラー BOOLEAN 列と同じ規約を再利用）。
 const ARRAY_BOOL_FALSE_BYTE: u8 = BOOL_FALSE_BYTE;
@@ -566,38 +685,64 @@ const ARRAY_BOOL_TRUE_BYTE: u8 = BOOL_TRUE_BYTE;
 /// 上限と揃える。
 const MAX_ARRAY_PAYLOAD_LEN: u32 = MAX_TEXT_FIELD_LEN;
 
-/// 配列要素列（フレームヘッダを含まない本文）のバイト長を計算する。オーバー
-/// フロー時は `Err`（[`scalar_text_entry_len`] と同じ方針）。
+/// 固定長要素型の 1 要素あたりのバイト幅（`TEXT` は可変長なので `None`）。
+fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
+    match elem {
+        ArrayElemType::Text => None,
+        ArrayElemType::Bool => Some(1),
+        ArrayElemType::Integer | ArrayElemType::Real | ArrayElemType::Date => Some(4),
+        ArrayElemType::BigInt | ArrayElemType::Double | ArrayElemType::Timestamp => Some(8),
+        ArrayElemType::Uuid => Some(16),
+    }
+}
+
+/// 配列要素列（フレームヘッダを含まない本文。NULL ビットマップを含む）の
+/// バイト長を計算する。オーバーフロー時は `Err`（[`scalar_text_entry_len`] と
+/// 同じ方針）。
 fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u32> {
-    match (elem, value) {
-        (ArrayElemType::Text, ArrayValue::Text(items)) => {
-            let mut total: u32 = 0;
-            for item in items {
-                let item_len = u32::try_from(item.len()).map_err(|_| {
-                    RowCodecError::Invalid("array text element too long".to_string())
-                })?;
+    if value.elem() != elem {
+        return Err(RowCodecError::Invalid(
+            "array value element type does not match column element type".to_string(),
+        ));
+    }
+    let bitmap_len = if value.has_null() {
+        value.len().div_ceil(8)
+    } else {
+        0
+    };
+    let mut total: usize = bitmap_len;
+    match value {
+        ArrayValue::Text(items) => {
+            for item in items.iter().flatten() {
                 // 長さプレフィックス(4) + 本文。
-                let entry = 4u32.checked_add(item_len).ok_or_else(|| {
+                let entry = item.len().checked_add(4).ok_or_else(|| {
                     RowCodecError::Invalid("array element length overflow".to_string())
                 })?;
                 total = total.checked_add(entry).ok_or_else(|| {
                     RowCodecError::Invalid("array payload length overflow".to_string())
                 })?;
             }
-            Ok(total)
         }
-        (ArrayElemType::Bool, ArrayValue::Bool(items)) => u32::try_from(items.len())
-            .map_err(|_| RowCodecError::Invalid("array element count too large".to_string())),
-        (ArrayElemType::Text, ArrayValue::Bool(_)) | (ArrayElemType::Bool, ArrayValue::Text(_)) => {
-            Err(RowCodecError::Invalid(
-                "array value element type does not match column element type".to_string(),
-            ))
+        other => {
+            let width = array_fixed_width(elem).ok_or_else(|| {
+                RowCodecError::Invalid("array element type has no fixed width".to_string())
+            })?;
+            let present = array_dispatch!(other, v => v.iter().filter(|e| e.is_some()).count());
+            let body = present.checked_mul(width).ok_or_else(|| {
+                RowCodecError::Invalid("array payload length overflow".to_string())
+            })?;
+            total = total.checked_add(body).ok_or_else(|| {
+                RowCodecError::Invalid("array payload length overflow".to_string())
+            })?;
         }
     }
+    u32::try_from(total)
+        .map_err(|_| RowCodecError::Invalid("array payload length overflow".to_string()))
 }
 
 /// 配列列 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
-/// （presence(1) + flags(1) + 要素数(4) + ペイロード長(4) + 要素列）。事前検証
+/// （presence(1) + flags(1) + 要素数(4) + ペイロード長(4) + 要素列。NULL 要素が
+/// あればビットマップを含む）。事前検証
 /// （[`crate::tenant::validate_set_assignments`]）と実エンコードが同じ計算式を
 /// 共有するために公開する（[`scalar_text_entry_len`] と同じ理由）。
 pub(crate) fn scalar_array_entry_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u32> {
@@ -636,24 +781,38 @@ fn write_array_value(buf: &mut Vec<u8>, array_ty: ArrayType, value: &ArrayValue)
             "array payload length {payload_len} exceeds limit {MAX_ARRAY_PAYLOAD_LEN}"
         )));
     }
-    buf.push(ARRAY_FLAGS_RESERVED);
+    buf.push(value.frame_flags());
     buf.extend_from_slice(&count.to_le_bytes());
     buf.extend_from_slice(&payload_len.to_le_bytes());
     write_array_elements_payload(buf, value)
 }
 
-/// 配列要素列（フレームヘッダを含まない本文のみ）を `buf` へ書き込む
-/// （[`write_array_value`] の本体部分を切り出したもの。ヘッダ
-/// （`ARRAY_FLAGS_RESERVED`・`count`・`payload_len`）の書き込みは呼び出し元の
-/// 責務）。`pub(crate)`: [`crate::constraint::unique_key_from_values`] が
-/// UPSERT の `ON CONFLICT` 対象キー（TABLE-16・Issue #1074）として ARRAY 列の
-/// 束縛値から一意キー計算用のスクラッチ `ArrayRef`（[`ArrayRef::from_owned`]）を
-/// 組み立てる際、この要素書き込みロジックを独立に再実装せず共有するために
-/// `write_array_value` から公開する。
+/// 配列要素列（フレームヘッダを含まない本文のみ。NULL 要素があれば先頭に
+/// ビットマップ）を `buf` へ書き込む（[`write_array_value`] の本体部分を切り出した
+/// もの。ヘッダ（flags・`count`・`payload_len`）の書き込みは呼び出し元の責務。
+/// flags は [`ArrayValue::frame_flags`]）。`pub(crate)`:
+/// [`crate::constraint::unique_key_from_values`] が UPSERT の `ON CONFLICT`
+/// 対象キー（TABLE-16・Issue #1074）として ARRAY 列の束縛値から一意キー計算用の
+/// スクラッチ `ArrayRef`（[`ArrayRef::from_owned`]）を組み立てる際、この要素書き込み
+/// ロジックを独立に再実装せず共有するために公開する。REAL／DOUBLE は非有限値を
+/// 拒否し `-0.0` を正規化、DATE／TIMESTAMP は値域を検証する（永続化バイト列の
+/// 正準性を保つ多層防御）。
 pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue) -> Result<()> {
+    let nulls = value.null_flags();
+    if nulls.iter().any(|b| *b) {
+        let mut bitmap = vec![0u8; nulls.len().div_ceil(8)];
+        for (i, is_null) in nulls.iter().enumerate() {
+            if *is_null {
+                if let Some(byte) = bitmap.get_mut(i / 8) {
+                    *byte |= 1u8 << (i % 8);
+                }
+            }
+        }
+        buf.extend_from_slice(&bitmap);
+    }
     match value {
         ArrayValue::Text(items) => {
-            for item in items {
+            for item in items.iter().flatten() {
                 let item_bytes = item.as_bytes();
                 // array_elements_byte_len ですでに u32 化に成功しているため
                 // ここでの try_from は失敗しない想定だが、untrusted 経路の多層
@@ -666,12 +825,67 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
             }
         }
         ArrayValue::Bool(items) => {
-            for b in items {
+            for b in items.iter().flatten() {
                 buf.push(if *b {
                     ARRAY_BOOL_TRUE_BYTE
                 } else {
                     ARRAY_BOOL_FALSE_BYTE
                 });
+            }
+        }
+        ArrayValue::Integer(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::BigInt(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::Real(items) => {
+            for v in items.iter().flatten() {
+                if !v.is_finite() {
+                    return Err(RowCodecError::Invalid(
+                        "array REAL element must be finite".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&crate::scalar_float::canonicalize_real(*v).to_le_bytes());
+            }
+        }
+        ArrayValue::Double(items) => {
+            for v in items.iter().flatten() {
+                if !v.is_finite() {
+                    return Err(RowCodecError::Invalid(
+                        "array DOUBLE PRECISION element must be finite".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&crate::scalar_float::canonicalize_double(*v).to_le_bytes());
+            }
+        }
+        ArrayValue::Date(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_date_days(*v) {
+                    return Err(RowCodecError::Invalid(
+                        "array DATE element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::Timestamp(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_timestamp_micros(*v) {
+                    return Err(RowCodecError::Invalid(
+                        "array TIMESTAMP element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::Uuid(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(v.as_bytes());
             }
         }
     }
@@ -682,56 +896,147 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
 /// （presence タグは呼び出し元が別途積む）。[`merge_encode_scalar_columns`] の
 /// SET 対象でない列（既存値の再エンコード）が使う。`write_array_value` と違い
 /// `ArrayType` との突合は行わない（`existing` はすでに検証済みの borrow のため）。
+/// flags と NULL ビットマップ（`bytes` の先頭）はそのまま書き戻す。
 fn write_array_ref(buf: &mut Vec<u8>, array_ref: &ArrayRef) -> Result<()> {
     let payload_len = u32::try_from(array_ref.bytes.len())
         .map_err(|_| RowCodecError::Invalid("array payload length overflow".to_string()))?;
-    buf.push(ARRAY_FLAGS_RESERVED);
+    buf.push(array_ref.flags);
     buf.extend_from_slice(&array_ref.count.to_le_bytes());
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.extend_from_slice(array_ref.bytes);
     Ok(())
 }
 
+/// 固定長 `N` バイトの要素を読み出す（長さ不一致は `Err`。添字アクセスを使わない）。
+fn array_le_bytes<const N: usize>(chunk: &[u8]) -> Result<[u8; N]> {
+    chunk
+        .try_into()
+        .map_err(|_| RowCodecError::Invalid("array element has unexpected width".to_string()))
+}
+
+/// フレーム flags に従い NULL ビットマップを分離する。戻り値は要素ごとの NULL
+/// フラグ（長さ `count`）と、ビットマップを除いた要素列本文。非正準形
+/// （`0x01` なのに NULL ビットが 1 個も無い・余りビットが 1・未知 flags）は
+/// fail-closed に `Err`（等価判定・UNIQUE キーが依存する単射性を守る）。
+fn split_array_null_bitmap(bytes: &[u8], count: usize, flags: u8) -> Result<(Vec<bool>, &[u8])> {
+    if count > MAX_ARRAY_ELEMENTS as usize {
+        return Err(RowCodecError::Invalid(
+            "array element count exceeds limit".to_string(),
+        ));
+    }
+    match flags {
+        ARRAY_FLAGS_NONE => Ok((vec![false; count], bytes)),
+        ARRAY_FLAG_HAS_NULLS => {
+            let bitmap_len = count.div_ceil(8);
+            let bitmap = bytes.get(..bitmap_len).ok_or_else(|| {
+                RowCodecError::Invalid("array payload truncated at null bitmap".to_string())
+            })?;
+            let rest = bytes.get(bitmap_len..).ok_or_else(|| {
+                RowCodecError::Invalid("array payload truncated after null bitmap".to_string())
+            })?;
+            let mut nulls = Vec::with_capacity(count);
+            for i in 0..count {
+                let byte = bitmap.get(i / 8).copied().ok_or_else(|| {
+                    RowCodecError::Invalid("array null bitmap too short".to_string())
+                })?;
+                nulls.push((byte >> (i % 8)) & 1 == 1);
+            }
+            if !count.is_multiple_of(8) {
+                let last = bitmap.last().copied().unwrap_or(0);
+                if last >> (count % 8) != 0 {
+                    return Err(RowCodecError::Invalid(
+                        "array null bitmap has non-zero padding bits".to_string(),
+                    ));
+                }
+            }
+            if !nulls.iter().any(|b| *b) {
+                return Err(RowCodecError::Invalid(
+                    "array flags declare nulls but the bitmap has none".to_string(),
+                ));
+            }
+            Ok((nulls, rest))
+        }
+        other => Err(RowCodecError::Invalid(format!(
+            "unknown array flags byte: {other}"
+        ))),
+    }
+}
+
+/// 固定長要素の本文を `nulls` に従って展開する。本文長が「非 NULL 要素数 × 幅」
+/// とちょうど一致しない場合（不足・余剰いずれも）は `Err`。
+fn decode_fixed_array_elements<T>(
+    rest: &[u8],
+    nulls: &[bool],
+    width: usize,
+    mut convert: impl FnMut(&[u8]) -> Result<T>,
+) -> Result<Vec<Option<T>>> {
+    let present = nulls.iter().filter(|is_null| !**is_null).count();
+    let expected = present
+        .checked_mul(width)
+        .ok_or_else(|| RowCodecError::Invalid("array payload length overflow".to_string()))?;
+    if rest.len() != expected {
+        return Err(RowCodecError::Invalid(
+            "array payload length does not match declared element count".to_string(),
+        ));
+    }
+    let mut items: Vec<Option<T>> = Vec::new();
+    items
+        .try_reserve_exact(nulls.len())
+        .map_err(|_| RowCodecError::Invalid("failed to reserve array elements".to_string()))?;
+    let mut chunks = rest.chunks_exact(width);
+    for is_null in nulls {
+        if *is_null {
+            items.push(None);
+        } else {
+            let chunk = chunks.next().ok_or_else(|| {
+                RowCodecError::Invalid("array payload truncated at element".to_string())
+            })?;
+            items.push(Some(convert(chunk)?));
+        }
+    }
+    Ok(items)
+}
+
 /// 配列要素列（フレームヘッダを含まない本文）を、宣言された `count` 個の要素へ
 /// 構造検証しながらデコードする。要素列の実バイト長が `count` 個をちょうど消費
-/// しない場合（不足・余剰いずれも）は `Err`。TEXT 要素は UTF-8 を検証する。
+/// しない場合（不足・余剰いずれも）は `Err`。TEXT 要素は UTF-8、REAL／DOUBLE は
+/// 有限性、DATE／TIMESTAMP は値域を検証する。
 /// [`scan_scalar_columns_validated`]（構造検証のみ・結果を捨てる用途にも使う）と
 /// [`ArrayRef::to_value`]（値を複製して返す用途）の両方から呼ばれる。
-fn decode_array_elements(elem: ArrayElemType, bytes: &[u8], count: u32) -> Result<ArrayValue> {
-    let mut offset = 0usize;
+fn decode_array_elements(
+    elem: ArrayElemType,
+    bytes: &[u8],
+    count: u32,
+    flags: u8,
+) -> Result<ArrayValue> {
+    let (nulls, rest) = split_array_null_bitmap(bytes, count as usize, flags)?;
     match elem {
         ArrayElemType::Text => {
-            let mut items: Vec<String> = Vec::new();
-            items.try_reserve_exact(count as usize).map_err(|_| {
+            let mut offset = 0usize;
+            let mut items: Vec<Option<String>> = Vec::new();
+            items.try_reserve_exact(nulls.len()).map_err(|_| {
                 RowCodecError::Invalid("failed to reserve array text elements".to_string())
             })?;
-            for _ in 0..count {
-                let len_bytes = bytes
-                    .get(
-                        offset..offset.checked_add(4).ok_or_else(|| {
-                            RowCodecError::Invalid(
-                                "offset overflow before array text element length".to_string(),
-                            )
-                        })?,
-                    )
-                    .ok_or_else(|| {
-                        RowCodecError::Invalid(
-                            "array payload truncated at element length field".to_string(),
-                        )
-                    })?;
-                let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
-                    RowCodecError::Invalid("array element length field is not 4 bytes".to_string())
-                })?;
-                let item_len = u32::from_le_bytes(len_arr);
-                offset = offset.checked_add(4).ok_or_else(|| {
+            for is_null in &nulls {
+                if *is_null {
+                    items.push(None);
+                    continue;
+                }
+                let len_end = offset.checked_add(4).ok_or_else(|| {
                     RowCodecError::Invalid(
-                        "offset overflow after array text element length".to_string(),
+                        "offset overflow before array text element length".to_string(),
                     )
                 })?;
-                let item_end = offset.checked_add(item_len as usize).ok_or_else(|| {
+                let len_bytes = rest.get(offset..len_end).ok_or_else(|| {
+                    RowCodecError::Invalid(
+                        "array payload truncated at element length field".to_string(),
+                    )
+                })?;
+                let item_len = u32::from_le_bytes(array_le_bytes::<4>(len_bytes)?);
+                let item_end = len_end.checked_add(item_len as usize).ok_or_else(|| {
                     RowCodecError::Invalid("offset overflow after array text element".to_string())
                 })?;
-                let item_bytes = bytes.get(offset..item_end).ok_or_else(|| {
+                let item_bytes = rest.get(len_end..item_end).ok_or_else(|| {
                     RowCodecError::Invalid(
                         "array payload truncated at text element field".to_string(),
                     )
@@ -742,9 +1047,9 @@ fn decode_array_elements(elem: ArrayElemType, bytes: &[u8], count: u32) -> Resul
                     })?
                     .to_string();
                 offset = item_end;
-                items.push(item);
+                items.push(Some(item));
             }
-            if offset != bytes.len() {
+            if offset != rest.len() {
                 return Err(RowCodecError::Invalid(
                     "array payload has trailing bytes beyond declared elements".to_string(),
                 ));
@@ -752,29 +1057,67 @@ fn decode_array_elements(elem: ArrayElemType, bytes: &[u8], count: u32) -> Resul
             Ok(ArrayValue::Text(items))
         }
         ArrayElemType::Bool => {
-            if bytes.len() != count as usize {
+            decode_fixed_array_elements(rest, &nulls, 1, |c| match c.first().copied() {
+                Some(ARRAY_BOOL_FALSE_BYTE) => Ok(false),
+                Some(ARRAY_BOOL_TRUE_BYTE) => Ok(true),
+                other => Err(RowCodecError::Invalid(format!(
+                    "unknown array bool element byte: {other:?}"
+                ))),
+            })
+            .map(ArrayValue::Bool)
+        }
+        ArrayElemType::Integer => decode_fixed_array_elements(rest, &nulls, 4, |c| {
+            Ok(i32::from_le_bytes(array_le_bytes::<4>(c)?))
+        })
+        .map(ArrayValue::Integer),
+        ArrayElemType::BigInt => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            Ok(i64::from_le_bytes(array_le_bytes::<8>(c)?))
+        })
+        .map(ArrayValue::BigInt),
+        ArrayElemType::Real => decode_fixed_array_elements(rest, &nulls, 4, |c| {
+            let v = f32::from_le_bytes(array_le_bytes::<4>(c)?);
+            if !v.is_finite() {
                 return Err(RowCodecError::Invalid(
-                    "array payload length does not match declared bool element count".to_string(),
+                    "persisted array REAL element is not finite".to_string(),
                 ));
             }
-            let mut items: Vec<bool> = Vec::new();
-            items.try_reserve_exact(count as usize).map_err(|_| {
-                RowCodecError::Invalid("failed to reserve array bool elements".to_string())
-            })?;
-            for &byte in bytes {
-                let b = match byte {
-                    ARRAY_BOOL_FALSE_BYTE => false,
-                    ARRAY_BOOL_TRUE_BYTE => true,
-                    other => {
-                        return Err(RowCodecError::Invalid(format!(
-                            "unknown array bool element byte: {other}"
-                        )))
-                    }
-                };
-                items.push(b);
+            Ok(crate::scalar_float::canonicalize_real(v))
+        })
+        .map(ArrayValue::Real),
+        ArrayElemType::Double => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            let v = f64::from_le_bytes(array_le_bytes::<8>(c)?);
+            if !v.is_finite() {
+                return Err(RowCodecError::Invalid(
+                    "persisted array DOUBLE PRECISION element is not finite".to_string(),
+                ));
             }
-            Ok(ArrayValue::Bool(items))
-        }
+            Ok(crate::scalar_float::canonicalize_double(v))
+        })
+        .map(ArrayValue::Double),
+        ArrayElemType::Date => decode_fixed_array_elements(rest, &nulls, 4, |c| {
+            let v = i32::from_le_bytes(array_le_bytes::<4>(c)?);
+            if !crate::datetime::validate_date_days(v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array DATE element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::Date),
+        ArrayElemType::Timestamp => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            let v = i64::from_le_bytes(array_le_bytes::<8>(c)?);
+            if !crate::datetime::validate_timestamp_micros(v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array TIMESTAMP element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::Timestamp),
+        ArrayElemType::Uuid => decode_fixed_array_elements(rest, &nulls, 16, |c| {
+            Ok(Uuid::from_bytes(array_le_bytes::<16>(c)?))
+        })
+        .map(ArrayValue::Uuid),
     }
 }
 
@@ -790,7 +1133,7 @@ fn parse_array_frame<'a>(
     let flags = *buf.get(offset).ok_or_else(|| {
         RowCodecError::Invalid("row buffer truncated at array flags field".to_string())
     })?;
-    if flags != ARRAY_FLAGS_RESERVED {
+    if flags != ARRAY_FLAGS_NONE && flags != ARRAY_FLAG_HAS_NULLS {
         return Err(RowCodecError::Invalid(format!(
             "unknown array flags byte: {flags}"
         )));
@@ -855,22 +1198,22 @@ fn parse_array_frame<'a>(
         RowCodecError::Invalid("row buffer truncated at array payload field".to_string())
     })?;
 
-    // 構造・UTF-8・要素数の全検証をここで行う（未参照列でも弱めない。Issue #350 と
-    // 同じ方針）。検証済みの `payload_bytes` を `ArrayRef` へそのまま渡すため、
-    // 呼び出し元・`ArrayRef::to_value` の再デコードは同じ検証を再実行するだけで
-    // 追加のエラー分岐を要さない。
-    decode_array_elements(elem, payload_bytes, count)?;
+    // 構造・UTF-8・要素数・NULL ビットマップの全検証をここで行う（未参照列でも
+    // 弱めない。Issue #350 と同じ方針）。検証済みの `payload_bytes` を `ArrayRef`
+    // へそのまま渡すため、呼び出し元・`ArrayRef::to_value` の再デコードは同じ検証を
+    // 再実行するだけで追加のエラー分岐を要さない。
+    decode_array_elements(elem, payload_bytes, count, flags)?;
 
     Ok((
         ArrayRef {
             elem,
             count,
+            flags,
             bytes: payload_bytes,
         },
         payload_end,
     ))
 }
-
 /// NUMERIC 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
 /// （presence(1) + `unscaled`（`i128` LE 16 バイト）。TABLE-13〔検討中〕・
 /// TASK-197、Issue #885・D3）。scale は行に持たないため列型に依存しない
@@ -4573,11 +4916,11 @@ mod tests {
         let schema = array_schema();
         let values = vec![
             Value::Array(ArrayValue::Text(vec![
-                "a".to_string(),
-                "b b".to_string(),
-                String::new(),
+                Some("a".to_string()),
+                Some("b b".to_string()),
+                Some(String::new()),
             ])),
-            Value::Array(ArrayValue::Bool(vec![true, false, true])),
+            Value::Array(ArrayValue::Bool(vec![Some(true), Some(false), Some(true)])),
         ];
         let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
         let decoded = decode_row(&schema, &encoded).expect("decode");
@@ -4609,7 +4952,7 @@ mod tests {
     #[test]
     fn array_encode_rejects_element_count_exceeding_max_len() {
         let schema = array_schema();
-        let too_many = vec!["x".to_string(); 9]; // max_len = 8
+        let too_many = vec![Some("x".to_string()); 9]; // max_len = 8
         let values = vec![Value::Array(ArrayValue::Text(too_many)), Value::Null];
         let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
         assert!(matches!(result, Err(RowCodecError::Invalid(_))));
@@ -4619,7 +4962,7 @@ mod tests {
     fn array_encode_rejects_element_type_mismatch() {
         let schema = array_schema();
         let values = vec![
-            Value::Array(ArrayValue::Bool(vec![true])), // tags is Text
+            Value::Array(ArrayValue::Bool(vec![Some(true)])), // tags is Text
             Value::Null,
         ];
         let result = encode_row(&schema, "tenant-a", Visibility::Public, &values);
@@ -4646,7 +4989,7 @@ mod tests {
         let schema = array_schema();
         // 1 要素・長さ 1 の TEXT 要素バイトを不正 UTF-8 に差し替える。
         let values = vec![
-            Value::Array(ArrayValue::Text(vec!["a".to_string()])),
+            Value::Array(ArrayValue::Text(vec![Some("a".to_string())])),
             Value::Null,
         ];
         let mut encoded =
@@ -4664,7 +5007,7 @@ mod tests {
         let schema = array_schema();
         let values = vec![
             Value::Array(ArrayValue::Text(vec![])),
-            Value::Array(ArrayValue::Bool(vec![true])),
+            Value::Array(ArrayValue::Bool(vec![Some(true)])),
         ];
         let mut encoded =
             encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
@@ -4680,8 +5023,11 @@ mod tests {
     fn array_scalar_columns_scan_and_merge_roundtrip() {
         let schema = array_schema();
         let values = vec![
-            Value::Array(ArrayValue::Text(vec!["x".to_string(), "y".to_string()])),
-            Value::Array(ArrayValue::Bool(vec![true])),
+            Value::Array(ArrayValue::Text(vec![
+                Some("x".to_string()),
+                Some("y".to_string()),
+            ])),
+            Value::Array(ArrayValue::Bool(vec![Some(true)])),
         ];
         let encoded = encode_scalar_columns(&schema, &values).expect("encode scalar");
         let scanned = scan_scalar_columns(&schema, &encoded).expect("scan");
@@ -4692,7 +5038,7 @@ mod tests {
                 assert_eq!(array_ref.count(), 2);
                 assert_eq!(
                     array_ref.to_value().expect("to_value"),
-                    ArrayValue::Text(vec!["x".to_string(), "y".to_string()])
+                    ArrayValue::Text(vec![Some("x".to_string()), Some("y".to_string())])
                 );
             }
             _ => panic!("expected ScalarRef::Array for tags column"),
@@ -5131,7 +5477,10 @@ mod tests {
             Value::Real(1.5),
             Value::Uuid(Uuid::from_bytes([9u8; 16])),
             Value::Double(2.5),
-            Value::Array(ArrayValue::Text(vec!["x".to_string(), "y".to_string()])),
+            Value::Array(ArrayValue::Text(vec![
+                Some("x".to_string()),
+                Some("y".to_string()),
+            ])),
             Value::Bool(true),
             Value::Numeric(Decimal::from_parts(1234, 2).expect("decimal")),
             Value::Date(100),
