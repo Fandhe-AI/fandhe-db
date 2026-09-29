@@ -103,6 +103,13 @@ pub enum ArenaError {
     /// （`22000`）へ写像できるようにする。`arena.rs` は sql 表層の型に依存しないよう、
     /// メッセージは呼び出し元がテナント・行内容を含めずに構築した固定文言に限る。
     InvalidInput(String),
+    /// フックが 0 除算を理由に拒否した（Issue #1163）。`sql::exec::map_arena_error` が
+    /// `SqlSurfaceError::DivisionByZero`（`22012`）へ写像する。メッセージは固定文言。
+    DivisionByZero(String),
+    /// フックが算術あふれ（非有限値化）を理由に拒否した（Issue #1163）。
+    /// `sql::exec::map_arena_error` が `SqlSurfaceError::NumericOutOfRange`（`22003`）へ
+    /// 写像する。メッセージは固定文言。
+    NumericOutOfRange(String),
 }
 
 impl std::fmt::Display for ArenaError {
@@ -121,7 +128,11 @@ impl std::fmt::Display for ArenaError {
                 "embedding dim mismatch at row id={id}: expected={expected} found={found}"
             ),
             ArenaError::AllocationFailed(msg) => write!(f, "arena allocation failed: {msg}"),
-            ArenaError::InvalidInput(msg) => write!(f, "arena build rejected by hook: {msg}"),
+            ArenaError::InvalidInput(msg)
+            | ArenaError::DivisionByZero(msg)
+            | ArenaError::NumericOutOfRange(msg) => {
+                write!(f, "arena build rejected by hook: {msg}")
+            }
         }
     }
 }
@@ -135,7 +146,9 @@ impl std::error::Error for ArenaError {
             | ArenaError::CapacityExceeded
             | ArenaError::DimMismatch { .. }
             | ArenaError::AllocationFailed(_)
-            | ArenaError::InvalidInput(_) => None,
+            | ArenaError::InvalidInput(_)
+            | ArenaError::DivisionByZero(_)
+            | ArenaError::NumericOutOfRange(_) => None,
         }
     }
 }

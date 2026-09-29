@@ -368,7 +368,7 @@ pub enum TenantWriteError {
     /// `XX000`（内部事象）へ丸めていたが、`sql::check_constraint::CompiledChecks::
     /// enforce` が式（`sql::expr_program::ExprProgram`。`WHERE`／`SELECT` と共有
     /// する同一コンパイラ）を評価して得た [`SqlSurfaceError`] をそのまま保持し、
-    /// 通常の式評価と同じ `wire_code`（0 除算・非有限値は `22000`、`NUMERIC`
+    /// 通常の式評価と同じ `wire_code`（0 除算は `22012`、非有限値・`NUMERIC`
     /// 関数の桁あふれは `22003` 等）で返す。カタログ改変・実装不整合による
     /// 再束縛失敗（漂流）は本 variant ではなく引き続き
     /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。

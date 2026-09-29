@@ -96,8 +96,9 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   （違反〔`23514`〕に丸めない・黙って通過もさせない）。**オーナー判断
   （2026-09-28・Issue #1075）**: `wire_code` は `XX000` 固定ではなく、通常の
   式評価（`WHERE`／`SELECT` と共有する `sql::expr_program::ExprProgram`・
-  `sql::udf_call::apply_scalar_op`）と同じ分類で返す（0 除算・非有限値は
-  現行の `SqlSurfaceError::InvalidInput` すなわち `22000`）。旧実装は
+  `sql::udf_call::apply_scalar_op`）と同じ分類で返す（0 除算は
+  `SqlSurfaceError::DivisionByZero` すなわち `22012`、非有限値は
+  `SqlSurfaceError::NumericOutOfRange` すなわち `22003`。Issue #1163 で是正）。旧実装は
   `sql::check_constraint::CompiledChecks::enforce` が評価エラーの種別を
   区別せず一律 `XX000` へ丸めていたため是正した（D4 参照）。PostgreSQL と
   同様、CHECK 評価中のエラーは制約違反ではなく式評価エラーとして扱う。
@@ -111,12 +112,11 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   整数の切り捨て除算にならない。`REAL` と小数リテラルの比較は `f32` を
   `f64` へ昇格した値で行う。単項マイナスがないため `CHECK (qty > -1)` は
   `42601` になり、`CHECK (qty > 0 - 1)` なら受理される。
-- **エラーコード**: 新しい variant は追加していない（`SqlSurfaceError` を
-  `TenantWriteError::CheckEvaluationFailed` がそのまま透過するのみ）。SQL-26
-  （`docs/spec/04-behavior/sql-surface.md`）が別途改訂中の `22012` 新設
-  （0 除算専用コードへの分離）は、`WHERE`／`SELECT` を含む横断変更であり
-  本 PR のスコープ外（後続課題。現状の通常式評価が `22000` のままのため、
-  CHECK もそれに追随した）。
+- **エラーコード**: CHECK 用の新しい variant は追加していない（`SqlSurfaceError` を
+  `TenantWriteError::CheckEvaluationFailed` がそのまま透過するのみ）。当初は
+  通常式評価に追随して 0 除算も `22000` だったが、Issue #1163（SQL-26）で
+  式評価器側を `22012`（0 除算）・`22003`（数値あふれ）へ是正し、CHECK も
+  同じ評価器を共有するため自動的に追随した。
 
 ## D2. 永続化（カタログ v7）
 
@@ -270,7 +270,7 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   （現状 SQL から宣言できる数値型は `INTEGER`／`BIGINT` のみのため、
   `REAL`／`DOUBLE` の `CHECK` は SQL 表層からは現状到達できず単体テストで
   担保する）。
-- SQL-26 準拠のエラーコード（`22012`/`22003`）・単項マイナス・整数の
+- 単項マイナス・整数の
   切り捨て除算（数値列比較の評価規則。D1' 参照）。
 - `qty > '5'`（INTEGER 列に文字列リテラルの `Compare` 形）の受理。
 - `ALTER TABLE ADD/DROP CONSTRAINT CHECK` の `NOT VALID`／`VALIDATE
@@ -313,6 +313,6 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   Rust API の生 `RowInput` 経路で `23514`・副作用ゼロ・台帳再送成功・永続化
   再オープン・CHECK と UNIQUE の評価順・曖昧な列定義の拒否・数値列 CHECK の
   宣言/永続化/再オープン後の継続検査・NULL 通過・0 除算（INSERT・UPDATE・
-  `ON CONFLICT DO UPDATE` の各経路で通常の式評価と同じ `22000`。オーナー
-  判断 2026-09-28・Issue #1075）・`DROP COLUMN` 依存拒否・`WHERE` 側の
+  `ON CONFLICT DO UPDATE` の各経路で通常の式評価と同じ SQLSTATE。オーナー
+  判断 2026-09-28・Issue #1075。0 除算は Issue #1163 で `22012` へ是正）・`DROP COLUMN` 依存拒否・`WHERE` 側の
   既存拒否の非回帰を固定）。

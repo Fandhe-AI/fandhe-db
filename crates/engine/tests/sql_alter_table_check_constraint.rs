@@ -477,7 +477,7 @@ fn add_check_succeeds_after_fixing_the_violating_row() {
 /// 通常の式評価エラーと同じ `wire_code`（`22000`）で拒否し、副作用ゼロを保つ
 /// （オーナー判断 2026-09-28・Issue #1075 と同じ契約。設計 D4）。
 #[test]
-fn add_check_existing_row_evaluation_error_returns_22000_with_no_side_effect() {
+fn add_check_existing_row_evaluation_error_returns_22012_with_no_side_effect() {
     let (core, path) = new_core("alter-check-eval-error");
     let _guard = CleanupGuard(path.clone());
     let owner = ctx("owner");
@@ -498,7 +498,7 @@ fn add_check_existing_row_evaluation_error_returns_22000_with_no_side_effect() {
         "ALTER TABLE docs ADD CHECK (100 / qty > 1)",
     )
     .expect_err("division by zero during existing-row evaluation must fail closed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 
     drop(core);
     let storage = Storage::open(&path).expect("reopen storage");

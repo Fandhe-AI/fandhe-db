@@ -445,11 +445,17 @@ pub enum SqlSurfaceError {
     OperationIdContentMismatch,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
+    /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
     /// 黙って wrap・非有限値化せず fail-closed に拒否する（`.claude/rules/coding-rust.md`
     /// 「整数演算は checked_*/saturating_* を使う」対応）。`22003` は ERR-2
     /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
     /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
+    /// 式評価（スカラー `/`・ベクトル÷スカラー・`vec_div`・`mod`）の 0 除算
+    /// （`22012`、SQL-26・ERR-2、Issue #1163）。拒否側（fail-closed）は従来の
+    /// `22000` と同じで、SQLSTATE のみ汎用 RDB に揃える。detail は演算種別の
+    /// 固定文言に限り、行の値・テナント情報を含めない。
+    DivisionByZero { detail: String },
     /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
     /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
     /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
@@ -692,6 +698,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 式評価器（`sql::udf_call`・`sql::numeric_fn`）が 0 除算を
+    /// 報告するために使う（Issue #1163・SQL-26）。
+    pub(crate) fn division_by_zero(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::DivisionByZero {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13・TASK-197、
     /// Issue #884）が `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正を報告する
     /// ために使う。
@@ -783,6 +797,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
+            SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -855,6 +870,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::NumericOutOfRange { detail } => {
                 write!(f, "numeric value out of range: {detail}")
+            }
+            SqlSurfaceError::DivisionByZero { detail } => {
+                write!(f, "division by zero: {detail}")
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")

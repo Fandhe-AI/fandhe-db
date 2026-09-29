@@ -1303,9 +1303,9 @@ mod tests {
             .expect_err("division by zero must fail closed");
         assert!(matches!(
             err,
-            TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::InvalidInput { .. })
+            TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::DivisionByZero { .. })
         ));
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22012");
     }
 
     /// `REAL`／`DOUBLE` 列比較（対象外事項: `CREATE TABLE` の SQL DDL からは
