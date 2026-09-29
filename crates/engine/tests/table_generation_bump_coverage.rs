@@ -360,7 +360,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1075）: `TenantWriteError::CheckEvaluationFailed` を
     // `SqlSurfaceError` 保持型へ是正した PR #1145 の取り込みマージで
     // import・ドキュメンテーションコメントが追加され再度追随（旧: 437）。
-    ("tenant.rs", 453),
+    ("tenant.rs", 454),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
