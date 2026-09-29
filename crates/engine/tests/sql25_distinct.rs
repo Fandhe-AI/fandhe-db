@@ -602,8 +602,9 @@ fn select_distinct_merges_null_rows_into_a_single_trailing_row() {
     let result = core
         .execute_sql(&ctx, "SELECT DISTINCT lang FROM docs")
         .expect("SELECT DISTINCT should succeed");
-    // NULL は 1 行にまとめられ常に末尾（既存の GROUP BY 契約を継承。ASC/DESC を
-    // 問わず末尾に置かれる契約は `sql::group_by::order_with_nulls_last` 参照）。
+    // NULL は 1 行にまとめられ、`ORDER BY` を書かない既定順では末尾（既存の GROUP BY
+    // 契約を継承。明示した ORDER BY の NULL 位置は Issue #1185 で PostgreSQL 既定
+    // 〔ASC は末尾・DESC は先頭〕にそろえた。`sql::group_by::cmp_cells_pg_nulls` 参照）。
     assert_eq!(result.rows.len(), 3);
     assert_eq!(as_text(&result.rows[0].cells[0]).as_deref(), Some("en"));
     assert_eq!(as_text(&result.rows[1].cells[0]).as_deref(), Some("ja"));

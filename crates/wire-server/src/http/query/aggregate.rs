@@ -47,7 +47,8 @@
 //!   codex-review 指摘。参照解決を先に走らせると `group_by` あり経路のみ
 //!   `22000`（未知の HAVING 参照）へ落ち、`group_by` なし経路（`42601`）
 //!   と非対称になる）
-//! - `group_by` 列が `TEXT` 列でない・`having` が `MIN`/`MAX(<TEXT 列>)` を
+//! - `group_by` 列が並べ替え不能な型（`VECTOR` 等）・未知列（Issue #1185 で `TEXT`
+//!   限定を外した）・`having` が `MIN`/`MAX(<TEXT 列>)` を
 //!   参照・参照先が `aggregates` に存在しない／曖昧 → `22000`
 //!
 //! RLS: `PolicyContext` は呼び出し元が渡す
@@ -872,8 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn bind_rejects_non_text_second_group_by_column_with_22000() {
-        for column in ["embedding", "id", "nope"] {
+    fn bind_rejects_unorderable_second_group_by_column_with_22000() {
+        // Issue #1185・SQL-25 (d): 疑似列 `id` は受理側へ契約改訂（下のテスト参照）。
+        for column in ["embedding", "nope"] {
             validated_aggregate!(
                 v,
                 &format!(
@@ -883,9 +885,21 @@ mod tests {
                 )
             );
             let err = bind(&v, &schema(), &udfs())
-                .expect_err("non-TEXT second group_by column must be rejected");
+                .expect_err("unorderable second group_by column must be rejected");
             assert_eq!(err.wire_code(), "22000", "column={column}");
         }
+    }
+
+    #[test]
+    fn bind_accepts_id_as_second_group_by_column() {
+        validated_aggregate!(
+            v,
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"*"}],
+               "group_by":["lang","id"]}"#
+        );
+        let bound = bind(&v, &schema(), &udfs()).expect("id group_by key should bind");
+        assert!(bound.has_group_by());
     }
 
     #[test]
@@ -1013,8 +1027,8 @@ mod tests {
     }
 
     #[test]
-    fn bind_rejects_group_by_on_non_text_column_with_22000() {
-        for column in ["embedding", "id", "nope"] {
+    fn bind_rejects_group_by_on_unorderable_column_with_22000() {
+        for column in ["embedding", "nope"] {
             validated_aggregate!(
                 v,
                 &format!(
@@ -1024,7 +1038,7 @@ mod tests {
                 )
             );
             let err = bind(&v, &schema(), &udfs())
-                .expect_err("non-TEXT group_by column must be rejected");
+                .expect_err("unorderable group_by column must be rejected");
             assert_eq!(err.wire_code(), "22000", "column={column}");
         }
     }

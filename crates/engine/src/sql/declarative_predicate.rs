@@ -207,9 +207,9 @@ fn bind_one(
             let (bound, ty) = udf_call::bind_expr(expr, schema, udfs, node_budget)?;
             if ty != ExprType::Bool {
                 // SQL 表層 `sql::parser::bind_where_predicates` の
-                // `WherePredicate::Expression` 分岐と同じ分類（`22000`）に揃える
+                // `WherePredicate::Expression` 分岐と同じ分類（`42804`。Issue #1186）に揃える
                 // （第 2 の評価器を作らない方針。エラー分類も共有する）。
-                return Err(SqlSurfaceError::invalid_input(
+                return Err(SqlSurfaceError::datatype_mismatch(
                     "filter expression must evaluate to a boolean (use a comparison)",
                 ));
             }
@@ -312,7 +312,7 @@ mod tests {
         let preds = vec![DeclarativePredicate::Expr(Expr::Number("1".to_string()))];
         let err = bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default())
             .expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42804");
     }
 
     #[test]

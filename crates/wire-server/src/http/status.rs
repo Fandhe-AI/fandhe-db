@@ -108,6 +108,13 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 語彙に対応する経路が無く構造的に到達しないが、`ErrorClass` の
         // 網羅性のため他の 42xxx 系と同じ 400 とする。
         | ErrorClass::DatatypeMismatch
+        // `UndefinedFunction`（`42883`）・`DuplicateFunction`（`42723`）は ERR-6 の
+        // 新設行で 400（Issue #1186）。`42723` は NoSQL に `CREATE FUNCTION` の op が
+        // 無く到達しない。`42883` は `aggregate` op の `sum`／`avg` を DATE／
+        // TIMESTAMP 列に指定すると到達する。式層の型不一致（`42804`）は SQL 表層
+        // 専用で、NoSQL の filter レーンは `Leaf` しか組み立てないため到達しない。
+        | ErrorClass::UndefinedFunction
+        | ErrorClass::DuplicateFunction
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
         // 参照スコープでの非修飾列の曖昧解決。SQL 表層は `INNER JOIN`（Issue
         // #925）で到達可能になったが、NoSQL 表層は引き続き `op` 語彙に対応する
@@ -124,7 +131,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 39] = [
+    const EXPECTED: [(ErrorClass, u16); 41] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -163,6 +170,8 @@ mod tests {
         (ErrorClass::ForeignKeyViolation, 409),
         (ErrorClass::InvalidForeignKey, 400),
         (ErrorClass::DatatypeMismatch, 400),
+        (ErrorClass::UndefinedFunction, 400),
+        (ErrorClass::DuplicateFunction, 400),
         (ErrorClass::AmbiguousColumn, 400),
     ];
 
