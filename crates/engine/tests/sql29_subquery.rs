@@ -1160,13 +1160,29 @@ fn exists_subquery_over_extended_query_protocol_is_rejected() {
 
     let err = core
         .parse_sql_prepared(&format!(
-            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT id FROM {VISITS} LIMIT 1) AND lang = $1 LIMIT 100"
         ))
-        .expect_err("subquery over the extended query protocol must be rejected");
+        .expect_err("subquery with $n over the extended query protocol must be rejected");
     assert!(matches!(
         err,
         engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
     ));
+}
+
+/// PR #1217 レビュー指摘: `$n` を含まないサブクエリ文は従来の `parse_sql` と
+/// 同様に拡張クエリの Parse でも受理される（`param_count() == 0`）。
+#[test]
+fn unparameterized_subquery_over_extended_query_protocol_is_accepted() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    seed_docs(&core, &ctx_for("tenant-a"));
+
+    let prepared = core
+        .parse_sql_prepared(&format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
+        ))
+        .expect("unparameterized subquery must be accepted");
+    assert_eq!(prepared.param_count(), 0);
 }
 
 #[test]

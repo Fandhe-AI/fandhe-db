@@ -590,7 +590,7 @@ fn bind_copy_record(
                 // 文字列でしか届かないため `InsertLiteral::Number` として包み
                 // 直し、`InsertLiteral::String` 拒否（PG 互換の暗黙変換は
                 // 行わない設計判断）を経由させずに数値リテラル同等の検証
-                // （範囲外 `22003`・非整数形式 `22000`）を適用する。
+                // （範囲外 `22003`・非整数形式 `22P02`）を適用する。
                 ColumnType::Integer | ColumnType::BigInt => bind_integer_literal(
                     name,
                     column.ty.clone(),
@@ -627,7 +627,7 @@ fn parse_copy_boolean(raw: &str, column_name: &str) -> Result<bool, SqlSurfaceEr
     } else if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("f") {
         Ok(false)
     } else {
-        Err(SqlSurfaceError::invalid_input(format!(
+        Err(SqlSurfaceError::invalid_text_representation(format!(
             "column {column_name:?} expects a boolean value (t/f/true/false)"
         )))
     }

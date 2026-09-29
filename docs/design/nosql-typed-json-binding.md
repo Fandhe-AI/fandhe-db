@@ -18,10 +18,10 @@
 | 列型 | 受理する JSON | 型不一致 | 備考 |
 | --- | --- | --- | --- |
 | INTEGER / BIGINT | `PosInt`/`NegInt`（整数リテラル）。`u64`/`i64` に収まらない整数リテラル（`JsonNumber::Float` へフォールバックした、小数点・指数部を含まないもの）も整数リテラルとして扱う | `42601` | 小数・指数表記・非数値は拒否。範囲外（`u64`/`i64` を超える整数リテラルを含む）は `bind_insert`/`bind_update` が `22003` |
-| REAL / DOUBLE PRECISION | 数値 | `42601` | 範囲外は `22003`。指数表記は engine の閉じた文法により `22000`（既知の制約。SQL 表層と同じ） |
-| NUMERIC(p,s) | 数値、または数値文字列 | `42601` | 桁あふれは `22003`、形式不正は `22000` |
+| REAL / DOUBLE PRECISION | 数値 | `42601` | 範囲外は `22003`。指数表記は受理（Issue #1187） |
+| NUMERIC(p,s) | 数値、または数値文字列 | `42601` | 桁あふれは `22003`、形式不正は `22P02`（Issue #1187） |
 | BOOLEAN | 真偽値 | `42601` | |
-| DATE / TIMESTAMP | 文字列 | `42601` | 形式不正 `22000`、範囲外 `22008` |
+| DATE / TIMESTAMP | 文字列 | `42601` | 書式違反 `22007`、範囲外 `22008`（Issue #1187） |
 | UUID | 文字列 | `42601` | 形式不正 `22P02` |
 | ARRAY（text[] / boolean[]） | 配列 | `42601` | 要素種別不一致・入れ子・配列以外は `42601`。要素数超過は `54000`（テキスト組み立て前に検査）。JSON `null` 要素は unquoted `NULL` として出力し engine の `22000` に任せる |
 | BYTEA（既存） | 標準 base64 文字列 | `42601` | 長すぎは `54000`（既存契約） |
@@ -102,8 +102,8 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 ## 対象外・申し送り
 
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `filter` `eq`（式レーンの入口が無いため）→ Issue #945。
-- `22P02` への統一（形式エラーの分類統一）→ Issue #897（TASK-227）。
-- TIMESTAMP 応答の区切り文字（空白／`T`）・REAL/DOUBLE/NUMERIC の指数表記が `22000` になる点は、SQL 表層と同じ既知の制約のまま。
+- `22P02`／`22007` への統一（形式エラーの分類統一）: Issue #1187 で解消（INTEGER／BIGINT の小数、BYTEA の不正 base64 も `22P02`）。
+- TIMESTAMP 応答の区切り文字（空白／`T`）・NUMERIC の指数表記が `22P02` になる点は（REAL/DOUBLE の指数表記は Issue #1187 で受理）、SQL 表層と同じ既知の制約のまま。
 - `RowDescription` の OID 写像（`result_encoder.rs`）は Issue #895 の担当のまま変更していない。
 - nullable な `TEXT`／`ENUM` 列への `update` op の JSON `null` 受理拡大は PR #1038 レビュー指摘により見送り、Issue #896 以前の拒否契約を維持する形へ修正済み（上記「null の扱い」節）。
 - クロスサーフェス `23505`（再送同一性）テストは INTEGER/REAL/NUMERIC/ARRAY/DATE では未追加（TEXT/VECTOR のみ既存）。

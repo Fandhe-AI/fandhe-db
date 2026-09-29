@@ -155,8 +155,9 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - `0A000` のあと当該文だけを拒否して接続を維持する同期回復 →
   **#934 で実施済み**（既存の `respond_error_and_await_sync` 経路をそのまま
   使う）
-- パラメータのバイナリ復号（長さ上限検証と `08P01`）→ #935（`$n` 束縛自体が
-  未実装のため引き続き対象外）
+- パラメータのバイナリ復号 → Issue #1171 で text 系スロットのみ実装済み
+  （UTF-8 バイト恒等。それ以外のスロットは `0A000`）。text 以外の型
+  （int4・int8・float・bool・bytea・uuid）のバイナリ復号は後続（対象外のまま）
 - 型 OID 拡張（`BOOLEAN`／`REAL`／`DOUBLE PRECISION`／`DATE`／`TIMESTAMP`／
   `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
   （`docs/design/wire-type-oid-mapping.md` 参照）。`id`・これら新型・

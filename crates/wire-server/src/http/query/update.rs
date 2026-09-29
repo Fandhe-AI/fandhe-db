@@ -503,8 +503,8 @@ mod tests {
             "22000"
         );
         assert_eq!(
-            UpdateError::Set(TypedJsonError::InvalidBytea("x")).wire_code(),
-            "42601"
+            UpdateError::Set(TypedJsonError::InvalidByteaText("x")).wire_code(),
+            "22P02"
         );
         assert_eq!(
             UpdateError::Set(TypedJsonError::ByteaTooLarge).wire_code(),
@@ -544,7 +544,7 @@ mod tests {
         let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
         assert!(matches!(
             err,
-            UpdateError::Set(TypedJsonError::InvalidBytea(_))
+            UpdateError::Set(TypedJsonError::TypeMismatch(_))
         ));
         assert_eq!(err.wire_code(), "42601");
     }
@@ -555,9 +555,9 @@ mod tests {
         let err = map_set_assignments(&set, &bytea_schema()).expect_err("must reject");
         assert!(matches!(
             err,
-            UpdateError::Set(TypedJsonError::InvalidBytea(_))
+            UpdateError::Set(TypedJsonError::InvalidByteaText(_))
         ));
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     // --- JSON／JSONB 列（Issue #889）の null 分岐（PR #1014 レビュー指摘対応） ---
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn map_set_assignments_rejects_float_for_integer_column() {
+    fn map_set_assignments_passes_float_for_integer_column_to_engine_binding() {
         let schema = TableSchema::new(
             "docs",
             vec![
@@ -632,12 +632,12 @@ mod tests {
             ],
         );
         let set = set_map(r#"{"count":1.5}"#);
-        let err = map_set_assignments(&set, &schema).expect_err("must reject");
-        assert!(matches!(
-            err,
-            UpdateError::Set(TypedJsonError::TypeMismatch(_))
-        ));
-        assert_eq!(err.wire_code(), "42601");
+        // 小数の拒否（`22P02`）は engine の整数束縛が担う（Issue #1187）。
+        let bound = map_set_assignments(&set, &schema).expect("mapping passes through");
+        assert!(bound.contains(&(
+            "count".to_string(),
+            InsertLiteral::Number("1.5".to_string())
+        )));
     }
 
     fn open_core() -> (EngineCore, std::path::PathBuf) {

@@ -196,6 +196,7 @@ pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod visible_cache;
+pub(crate) mod where_negation;
 pub(crate) mod where_tree;
 pub(crate) mod window;
 

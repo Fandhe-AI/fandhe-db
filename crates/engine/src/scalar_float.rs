@@ -17,13 +17,13 @@
 //!   （最短往復桁・指数は `1e+06` 形式。Issue #1173・WIRE-13 のポインタ）に揃える
 //!   （[`format_real`]）。`f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析
 //!   する（二重丸め防止）。
-//! - SQL リテラルの文法（[`parse_real`]）は指数表記を受理しない（lexer が指数表記を
-//!   字句化しないため）。`COPY FROM` は [`format_real`] の出力（指数表記を含む）を
-//!   再投入できる必要があるため、指数表記を受理する [`parse_real_text`] を使う
-//!   （WIRE-17 の往復契約）。
+//! - `COPY FROM` は [`format_real`] の出力（指数表記を含む）を再投入できる必要が
+//!   あるため、閉じた文法で指数表記を受理する [`parse_real_text`] を使う
+//!   （WIRE-17 の往復契約。SQL リテラルの [`parse_real`] も #1187 で指数表記を受理）。
 //!
-//! 対象外（申し送り）: `DOUBLE PRECISION` 出力の PostgreSQL 形式化・SQL リテラルでの
-//! 指数表記の受理・文字列リテラルからの暗黙変換は後続 Issue の担当。
+//! 指数表記リテラル（`1.5e3`）は Issue #1187 で受理する（PostgreSQL と整合）。
+//! 対象外（申し送り）: `DOUBLE PRECISION` 出力の PostgreSQL 形式化・文字列リテラル
+//! からの暗黙変換は後続 Issue の担当。
 
 use std::cmp::Ordering;
 
@@ -31,21 +31,24 @@ use std::cmp::Ordering;
 /// `InvalidInput`、範囲外・アンダーフローは `NumericOutOfRange`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseFloatError {
-    /// 閉じた文法（`^-?[0-9]+(\.[0-9]+)?$`）に適合しない入力。
+    /// 閉じた文法（`^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$`）に適合しない入力
+    /// （SQL 表層では `22P02`）。
     Malformed,
     /// 非有限化（オーバーフロー）・非ゼロ入力のアンダーフロー。
     OutOfRange,
 }
 
-/// 受理する数値リテラルの文法（符号任意・整数部必須・小数部任意）。
-/// `from_str` がそのまま受理してしまう `inf`／`nan`／`infinity`／指数表記を
-/// 閉じるための自前検査（F7・Issue #882 計画）。
+/// 受理する数値リテラルの文法（符号任意・整数部必須・小数部任意・指数部任意。
+/// `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`）。`from_str` がそのまま受理してしまう
+/// `inf`／`nan`／`infinity` や `1.`・`.5` 等を閉じるための自前検査
+/// （F7・Issue #882 計画。指数表記の受理は Issue #1187 で追加）。
 fn is_well_formed_literal(input: &str) -> bool {
     let body = input.strip_prefix('-').unwrap_or(input);
-    if body.is_empty() {
+    let (mantissa, exponent) = split_exponent(body);
+    if mantissa.is_empty() {
         return false;
     }
-    let mut parts = body.splitn(2, '.');
+    let mut parts = mantissa.splitn(2, '.');
     let int_part = parts.next().unwrap_or("");
     if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
         return false;
@@ -55,15 +58,34 @@ fn is_well_formed_literal(input: &str) -> bool {
             return false;
         }
     }
-    true
+    match exponent {
+        None => true,
+        Some(exp) => {
+            let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
+/// `e`／`E` で仮数部と指数部へ分割する（指数部が無ければ `None`）。
+fn split_exponent(body: &str) -> (&str, Option<&str>) {
+    match body.find(['e', 'E']) {
+        Some(idx) => (
+            body.get(..idx).unwrap_or(""),
+            Some(body.get(idx + 1..).unwrap_or("")),
+        ),
+        None => (body, None),
+    }
 }
 
 /// 非ゼロの入力文字列が指す値が数学的に 0 かどうか（アンダーフロー検出用の
 /// 文字列側判定。パース後の値が 0.0 だけでは「元々 0 と書かれていた」のか
-/// 「アンダーフローした」のかを区別できないため、文字列上で全桁 0 かを見る）。
+/// 「アンダーフローした」のかを区別できないため、文字列上で仮数部の全桁が 0 かを
+/// 見る。指数部は値の大きさだけを変えるため判定対象外: `0e5` は 0）。
 fn literal_is_textually_zero(input: &str) -> bool {
     let body = input.strip_prefix('-').unwrap_or(input);
-    body.bytes().all(|b| b == b'.' || b == b'0')
+    let (mantissa, _) = split_exponent(body);
+    mantissa.bytes().all(|b| b == b'.' || b == b'0')
 }
 
 /// `REAL`（f32）リテラルを解析する。文法検証 → `f32::from_str` → 非有限・
@@ -346,8 +368,8 @@ mod tests {
     #[test]
     fn parse_rejects_non_finite_and_malformed_literals() {
         for bad in [
-            "NaN", "nan", "inf", "-inf", "infinity", "Infinity", "+1", "1.", ".5", "1e5", "1E5",
-            "0x1p3", "", "-", "1..5", "1.2.3",
+            "NaN", "nan", "inf", "-inf", "infinity", "Infinity", "+1", "1.", ".5", "1e", "e5",
+            "1e+", "1e-", "1.e3", ".5e1", "1e5.5", "0x1p3", "", "-", "1..5", "1.2.3",
         ] {
             assert_eq!(
                 parse_real(bad),
@@ -360,6 +382,24 @@ mod tests {
                 "expected Malformed for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_accepts_exponent_notation() {
+        assert_eq!(parse_real("1.5e3"), Ok(1500.0));
+        assert_eq!(parse_real("1E+2"), Ok(100.0));
+        assert_eq!(parse_double("-1.5e-3"), Ok(-0.0015));
+        // 仮数部が 0 なら指数部に関わらず 0（アンダーフロー扱いしない）。
+        assert_eq!(parse_real("0e5"), Ok(0.0));
+        assert_eq!(parse_double("0.0E-400"), Ok(0.0));
+    }
+
+    #[test]
+    fn parse_rejects_exponent_overflow_and_underflow() {
+        assert_eq!(parse_real("1e-50"), Err(ParseFloatError::OutOfRange));
+        assert_eq!(parse_real("1e999"), Err(ParseFloatError::OutOfRange));
+        assert_eq!(parse_double("1e999"), Err(ParseFloatError::OutOfRange));
+        assert_eq!(parse_double("1e-999"), Err(ParseFloatError::OutOfRange));
     }
 
     #[test]

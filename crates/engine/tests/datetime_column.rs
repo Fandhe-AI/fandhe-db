@@ -5,7 +5,7 @@
 //! `tests/boolean_column.rs`（TABLE-13・TASK-196）と同じ流儀（`unique_db_path`／
 //! `CleanupGuard`、実 `Storage`＋`CpuScalarProvider`、`EngineCore::execute_sql`／
 //! `execute_sql_in_session` を production 経路として検証）。往復（宣言→書き込み→
-//! 再オープン→読み出し）・リテラル受理範囲（`22000` 文法違反／`22008` 範囲外・
+//! 再オープン→読み出し）・リテラル受理範囲（`22007` 書式違反／`22008` 範囲外・
 //! 暦上不正）・COUNT／SUM 拒否・RLS 境界・UPDATE・content_hash 再送判定
 //! （`23505`／`22023`）・Rust API 直接投入の往復を固定する。`DATE`／`TIMESTAMP`
 //! の等価・範囲 WHERE 述語（TABLE-13・TASK-199、Issue #891・レーン B）は
@@ -162,10 +162,10 @@ fn datetime_columns_roundtrip_through_storage_reopen() {
     assert_eq!(cells, vec![Cell::Null, Cell::Null]);
 }
 
-// --- 受け入れ条件 3: リテラル受理範囲（文法違反=22000／範囲外・暦上不正=22008） ---
+// --- 受け入れ条件 3: リテラル受理範囲（書式違反=22007／範囲外・暦上不正=22008） ---
 
 #[test]
-fn insert_rejects_format_violations_as_22000() {
+fn insert_rejects_format_violations_as_22007() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -187,12 +187,12 @@ fn insert_rejects_format_violations_as_22000() {
         let err = core
             .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "case {day:?} should be 22000");
+        assert_eq!(err.wire_code(), "22007", "case {day:?} should be 22007");
     }
 }
 
 #[test]
-fn insert_rejects_timestamp_timezone_suffix_and_date_only_as_22000() {
+fn insert_rejects_timestamp_timezone_suffix_and_date_only_as_22007() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -213,7 +213,7 @@ fn insert_rejects_timestamp_timezone_suffix_and_date_only_as_22000() {
         let err = core
             .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "case {at:?} should be 22000");
+        assert_eq!(err.wire_code(), "22007", "case {at:?} should be 22007");
     }
 }
 
@@ -445,14 +445,14 @@ fn where_equality_and_range_on_datetime_column_is_accepted() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
 
-    // 文法違反のリテラルは `22000`。
+    // 文法違反のリテラルは `22007`。
     let err = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE day = 'not-a-date' LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22007");
 
     // TEXT 列との比較（型不一致）は `22000`。
     let err = core

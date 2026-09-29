@@ -159,7 +159,7 @@ Issue #891〜#896 の担当範囲は、本 Issue では振る舞いを追加せ�
 - `DecodeTier` の最適化 → #894
 - NoSQL JSON 束縛（`columns[].type` を含む）→ #896
 - 回帰の統合（`scalar_types_roundtrip.rs` への集約）→ #897
-- 文字列リテラルからの暗黙変換と `22P02` の新設
+- 文字列リテラルからの暗黙変換（`22P02` の新設と指数表記の受理は Issue #1187 で解消）
 - `ALTER COLUMN TYPE` による REAL→DOUBLE の拡大変換（TABLE-19・#901）
 
 ## SET 事前検証とテナント境界（codex-review 指摘・PR #1007）
