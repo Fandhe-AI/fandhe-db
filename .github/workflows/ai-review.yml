@@ -26,8 +26,9 @@ jobs:
   # 以下をすべて満たす場合にのみ該当接頭辞を出力する（1 つでも欠ければ空＝通常どおりレビュー）:
   # - head branch が同期 PR の接頭辞（chore/skills-update- / chore/submodule-update-）に一致
   # - 同一リポジトリ内のブランチで、PR 作成者が同期 PR の作成主体（SUBMODULE_PAT の所有者）
-  # - 変更ファイル（rename 元を含む）が接頭辞ごとの許可パスに限られる
-  #   （skills: `.agents/skills/**`・`skills-lock.json` / submodule: `docs/spec` の gitlink のみ）
+  # - 変更ファイル（rename 元を含む）が接頭辞ごとの許可パスに限られ、変更前後のファイル種別
+  #   （git tree の mode）も一致する（skills: `.agents/skills/**`・`skills-lock.json` の通常ファイル
+  #   のみ〔symlink・gitlink は不可〕/ submodule: `docs/spec` が変更前後とも gitlink の参照更新のみ）
   # - ファイル一覧取得の前後で PR の head SHA がイベント時点から変わっておらず、件数が一致する
   # 受容済み残留リスク: 同期 PR の作成主体が許可パス内を任意に変更した PR は skip される
   # （Fandhe-AI/actions の ai-review/README.md「skip-branch-prefixes の受容済み残留リスク」。
@@ -36,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     # ハングしたジョブの無期限実行を防ぐ
     timeout-minutes: 5
-    # PR の変更ファイル一覧の取得にのみ使う（読み取り専用）
+    # PR の変更ファイル一覧と tree の取得にのみ使う（読み取り専用）
     permissions:
       contents: read
       pull-requests: read
@@ -48,6 +49,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -81,19 +83,53 @@ jobs:
           pr_state() {
             gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '"\(.head.sha) \(.changed_files)"'
           }
+          # 変更前後の tree（mode と path）。truncated は判定不能のため失敗させる（fail-closed）
+          tree_modes() {
+            gh api "repos/${REPO}/git/trees/$1?recursive=1" \
+              --jq 'if .truncated then error("tree truncated") else .tree[] | "\(.mode) \(.path)" end'
+          }
+          mode_of() {
+            awk -v p="$2" '{ m = $1; sub(/^[^ ]+ /, ""); if ($0 == p) { print m; exit } }' <<< "$1"
+          }
           read -r sha_before count_before < <(pr_state)
+          # status・filename・previous_filename（rename 以外は空）を 1 行ずつ
           files=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --jq '.[] | .filename, (.previous_filename // empty)')
-          listed=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename' | wc -l)
+            --jq '.[] | [.status, .filename, (.previous_filename // "")] | @tsv')
+          base_modes=$(tree_modes "${BASE_SHA}")
+          head_modes=$(tree_modes "${HEAD_SHA}")
           read -r sha_after count_after < <(pr_state)
+          listed=$(printf '%s\n' "${files}" | grep -c . || true)
           if [ "${sha_before}" != "${HEAD_SHA}" ] || [ "${sha_after}" != "${HEAD_SHA}" ] \
             || [ "${count_before}" != "${count_after}" ] || [ "${listed}" -ne "${count_after}" ] \
-            || [ "${count_after}" -eq 0 ] || [ -z "${files}" ]; then
+            || [ "${count_after}" -eq 0 ]; then
             no_skip
           fi
-          while IFS= read -r f; do
+          while IFS=$'\t' read -r status f prev; do
             if ! [[ "${f}" =~ ${allow_re} ]]; then
               no_skip
+            fi
+            if [ -n "${prev}" ] && ! [[ "${prev}" =~ ${allow_re} ]]; then
+              no_skip
+            fi
+            base_mode=$(mode_of "${base_modes}" "${prev:-${f}}")
+            head_mode=$(mode_of "${head_modes}" "${f}")
+            if [ "${prefix}" = 'chore/submodule-update-' ]; then
+              # gitlink の参照更新のみ（追加・削除・種別変更は不可）
+              if [ "${status}" != modified ] || [ "${base_mode}" != 160000 ] \
+                || [ "${head_mode}" != 160000 ]; then
+                no_skip
+              fi
+            else
+              # 存在する側はすべて通常ファイル（symlink 120000・gitlink 160000 は不可）
+              for m in "${base_mode}" "${head_mode}"; do
+                case "${m}" in
+                  '' | 100644 | 100755) ;;
+                  *) no_skip ;;
+                esac
+              done
+              if [ -z "${base_mode}" ] && [ -z "${head_mode}" ]; then
+                no_skip
+              fi
             fi
           done <<< "${files}"
           echo "::notice::同期 PR の skip 条件を満たしたため AI レビューを skip します"
