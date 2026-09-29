@@ -484,6 +484,36 @@ pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
     }],
 };
 
+/// `create_table` の CHECK 述語の葉（`{column, op, value}`）のサブスキーマ
+/// （Issue #1199・NOSQL-13。[`super::ddl`] 専用）。`filter` 配列の形検証は
+/// `http::query::filter` へ集約済み（Issue #1197）のため、CHECK の葉だけが
+/// 本スキーマで形を検査する。
+pub static CHECK_LEAF_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "check_leaf",
+    fields: &[
+        FieldSpec {
+            key: "column",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "value",
+            presence: Presence::Required,
+            // 列型ごとの意味検証は [`super::ddl`] が担うため、形の検証段階では
+            // 文字列・数値・真偽値のいずれも受理する（`null` は不可）。
+            ty: FieldType::Scalar,
+            nullable: false,
+        },
+    ],
+};
+
 /// `aggregates` 配列要素のサブスキーマ（`aggregate` op）。
 pub static AGGREGATE_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
     name: "aggregate_item",
@@ -1016,12 +1046,12 @@ pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: false,
         },
-        // `kind == "check"` 専用。`FILTER_ITEM_SCHEMA` の葉形の配列（要素同士は
+        // `kind == "check"` 専用。`CHECK_LEAF_SCHEMA` 形の葉の配列（要素同士は
         // AND 結合）。
         FieldSpec {
             key: "predicate",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            ty: FieldType::Array(ElementType::Object(&CHECK_LEAF_SCHEMA)),
             nullable: false,
         },
     ],

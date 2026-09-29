@@ -888,7 +888,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - `aggregate` への `limit`（`GROUP BY ... LIMIT n` 相当。`sort`／`offset` は
   Issue #1198 で対応済みだが、`limit` 相当のキーは未対応）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
-- `GROUP BY` への `ORDER BY`／`LIMIT` の付与
+- `GROUP BY` への `LIMIT` の付与（`ORDER BY` は `aggregate` の `sort` で対応済み）
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
 - `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
 - `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
