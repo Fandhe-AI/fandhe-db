@@ -811,7 +811,7 @@ fn extended_functional_errors_while_failed_are_reported_as_in_failed_sql_transac
     expect_error_response_with_sqlstate(&mut stream, "25001");
     read_ready_for_query(&mut stream);
 
-    // Parse: パラメータ型 OID を 1 件指定（未対応機能の 0A000 より先に 25P02）。
+    // Parse: パラメータ型 OID を 1 件指定（過剰宣言の 08P01 より先に 25P02）。
     let mut typed_parse = parse_body("typed", "SELECT id FROM documents LIMIT 1", 1);
     typed_parse.extend_from_slice(&25i32.to_be_bytes());
     send_length_prefixed_message(&mut stream, b'P', &typed_parse);
@@ -848,9 +848,10 @@ fn extended_functional_errors_while_failed_are_reported_as_in_failed_sql_transac
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
     read_ready_for_query(&mut stream);
 
-    // 対照: トランザクション外では従来どおり機能検証のエラーが返る。
+    // 対照: トランザクション外では機能検証のエラーが返る（WIRE-12・#1171 以降、
+    // プレースホルダを持たない文への型宣言は過剰宣言として `08P01`）。
     send_length_prefixed_message(&mut stream, b'P', &typed_parse);
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    expect_error_response_with_sqlstate(&mut stream, "08P01");
     send_sync(&mut stream);
     assert_ready_for_query_status(&mut stream, b'I');
 

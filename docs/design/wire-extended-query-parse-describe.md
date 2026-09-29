@@ -27,7 +27,7 @@ P）・Bind／Execute／Sync／Close／Flush はすべて受理される。詳�
 | メッセージ | 挙動（#933 時点） |
 | --- | --- |
 | Parse（'P'） | SQL を簡易クエリと同一の許可リストで検証し、接続単位で保持する |
-| Describe（'D' 種別 S） | `ParameterDescription`（常に 0 件）＋ `RowDescription` または `NoData` |
+| Describe（'D' 種別 S） | `ParameterDescription`（`$n` の公告 OID。#1171 以降。`$n` なしは 0 件）＋ `RowDescription` または `NoData` |
 | Describe（'D' 種別 P） | portal は構築され得ないため `0A000` + 切断（WIRE-8 のまま。#934 で受理範囲に入った） |
 | Bind／Execute／Sync／Close／Flush | WIRE-8 のまま `0A000` + 切断（#934 で受理範囲に入った） |
 
@@ -109,7 +109,7 @@ engine の `ErrorClass`（閉じた 16 分類）にも spec にも、未定義�
 | Describe の対象が portal | `0A000`（`FeatureNotSupported`） |
 | 件数・名前長・保持バイト上限超過 | `54000`（`PayloadTooLarge`） |
 | body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト不正） | `08P01` |
-| パラメータ型宣言（`num_param_types > 0`） | `0A000`（`$n` は WIRE-12・#935） |
+| パラメータ型宣言（`num_param_types > 0`） | #1171 以降は受理（上限 64 超過は `54000`、プレースホルダ数超過は `08P01`。WIRE-12） |
 | SQL 検証失敗 | `SqlSurfaceError::error_class()`（簡易クエリと同一） |
 
 **申し送り（spec リポ側の課題）**: PostgreSQL の `26000`（undefined prepared
@@ -141,7 +141,7 @@ ERR-2／ERR-6 に無いため、WIRE-11 確定時に分類を定めるかは spe
   Parse／Describe も従来どおり拒否されることを固定。
 - `crates/wire-server/tests/wire11_parse_describe.rs`（新規）: engine 接続
   済み経路での Parse／Describe の受理・エラー系（許可リスト外 SQL・未存在
-  テーブル・パラメータ型宣言・重複名・未定義名・portal・上限超過・body
+  テーブル・重複名・未定義名・portal・上限超過・body
   構造不正）・テナント間の応答バイト一致・簡易クエリ挙動の不変性を固定。
 
 ## スコープ外・申し送り
@@ -149,8 +149,8 @@ ERR-2／ERR-6 に無いため、WIRE-11 確定時に分類を定めるかは spe
 - #934（実装済み）: Sync での同期回復・接続維持への置換、Bind／Execute
   （`execute_parsed_in_session` の再利用）、portal の Describe、Close／
   Flush、応答のバッファリング方針。
-- #935: `$n` と `ParameterDescription` の型 OID 推論（WIRE-12）、Parse の
-  パラメータ型宣言受理。
+- #935・#1171（実装済み）: `$n` と `ParameterDescription` の型 OID 推論（WIRE-12）、
+  Parse のパラメータ型宣言受理（`docs/design/wire-extended-query-param-binding.md`）。
 - 実クライアント（psql／psycopg 3／node pg）でのパラメータ付き拡張プロト
   コル実行検証は #935 以降（パラメータなしの層 B シナリオは #934 の任意
   範囲として `docs/design/wire-extended-query-bind-execute-sync.md` 参照）。
