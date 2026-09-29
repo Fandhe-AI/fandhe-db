@@ -32,11 +32,13 @@
 //!   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 文字列配列）。
 //!   他の列型は engine 側の「IN 非対応列」判定（`22000`）へ委譲する
 //! - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
-//!   **対象外**（`0A000`）。`udf_call::bind_expr` の列参照解決
-//!   （`crate::sql::udf_call` の `Ident` 分岐）が現時点でこれらの列型を式内で
-//!   受理しないため（別 Issue #891 の担当）。Issue #945 の計画時点ではこの
-//!   列型を式レーンへ渡す想定だったが、実装時に engine 側の未対応を確認し、
-//!   対象外へ縮小した（既存の `eq` と同じ挙動を範囲比較へも揃える）
+//!   JSON 数値のみを受理し、式レーン（[`DeclarativePredicate::Expr`]。SQL の
+//!   `WHERE qty > 1` と同じ `udf_call::bind_expr` 束縛）へ渡す（Issue #1183・
+//!   NOSQL-14・NOSQL-17 ポインタ）。SQL と同じ束縛経路のため結果集合が構造的に
+//!   一致する。`TEXT` 列の範囲比較も同じ式レーン（バイト順比較）へ渡す。
+//!   述語形 `update`／`delete` の `filter`（[`bind_filter_where_predicates`]）は
+//!   数値列の `eq` を従来どおり `0A000` で拒否する（DML の filter 語彙は意図的に
+//!   狭く保つ）
 //! - `VECTOR`／`ARRAY`／`JSON`／`JSONB` への `eq`／`prefix` は SQL 表層にも
 //!   レーンが無いため、従来どおり engine の「`TEXT` 列でない」判定（`22000`）へ
 //!   委譲する
@@ -87,7 +89,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::sql::allowlist::{is_allowed_where_predicate_name, SqlSurfaceError, WherePredicate};
 use engine::sql::declarative_predicate::{self, DeclarativePredicate};
-use engine::sql::udf_call::{self, MAX_EXPR_DEPTH};
+use engine::sql::udf_call::{self, BinOp, Expr, MAX_EXPR_DEPTH};
 
 use super::schema::SchemaError;
 use super::typed_json::{self, TypedJsonError};
@@ -592,10 +594,9 @@ fn declare_eq(
                 "eq filter value for a NUMERIC column must be a JSON number or numeric string",
             ))),
         },
-        // 式レーン（`udf_call::bind_expr`）がこれらの列型の式内参照を現時点で
-        // 受理しないため対象外（モジュール doc 参照。別 Issue #891）。
+        // Issue #1183: 数値 4 型は式レーンで束縛する（SQL の式述語と同じ経路）。
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
-            Err(FilterError::NumericFilterNotSupported)
+            numeric_expr_predicate(column, CompareOp::Eq, value, "eq")
         }
         // SQL 表層にも eq レーンが無い列型は、従来どおり engine 側の
         // 「`TEXT` 列でない」判定（`22000`）へ委譲する（legacy 互換）。
@@ -650,21 +651,67 @@ fn declare_range(
                 "range filter value for a NUMERIC column must be a JSON number or numeric string",
             ))),
         },
-        // 式レーンが現時点で受理しないため対象外（`declare_eq` と同じ理由）。
+        // Issue #1183: 数値 4 型は式レーンで束縛する（`declare_eq` と同じ）。
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
-            Err(FilterError::NumericFilterNotSupported)
+            numeric_expr_predicate(column, cmp, value, "range")
         }
-        // TEXT/ENUM/BOOLEAN/VECTOR/ARRAY/JSON/JSONB: 比較不能。engine 側の
-        // 「範囲比較非対応列」判定（`22000`）へ委譲する（SQL の `lang > 'x'` と
-        // 同じ結果になる）。
-        ColumnType::Text
-        | ColumnType::Enum(_)
+        // Issue #1183: TEXT の範囲比較は式レーン（TEXT×TEXT のバイト順比較。
+        // SQL の `lang < 'b'` の束縛結果と同一）へ渡す。
+        ColumnType::Text => match value {
+            JsonValue::String(s) => Ok(DeclarativePredicate::Expr(Expr::Binary {
+                op: bin_op_for(cmp),
+                lhs: Box::new(Expr::Ident(column.to_string())),
+                rhs: Box::new(Expr::String(s.clone())),
+            })),
+            _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+                "range filter value for a TEXT column must be a JSON string",
+            ))),
+        },
+        // ENUM/BOOLEAN/VECTOR/ARRAY/JSON/JSONB: 比較不能。engine 側の
+        // 「範囲比較非対応列」判定（`22000`）へ委譲する。
+        ColumnType::Enum(_)
         | ColumnType::Boolean
         | ColumnType::Vector(_)
         | ColumnType::Array(_)
         | ColumnType::Json
         | ColumnType::Jsonb => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::compare(
             column, cmp, "",
+        ))),
+    }
+}
+
+/// [`CompareOp`] を式レーンの比較演算子へ写す（Issue #1183）。
+fn bin_op_for(cmp: CompareOp) -> BinOp {
+    match cmp {
+        CompareOp::Eq => BinOp::Eq,
+        CompareOp::Lt => BinOp::Lt,
+        CompareOp::Le => BinOp::Le,
+        CompareOp::Gt => BinOp::Gt,
+        CompareOp::Ge => BinOp::Ge,
+    }
+}
+
+/// 数値列（INTEGER／BIGINT／REAL／DOUBLE）への比較を式述語へ写す（Issue #1183）。
+/// 値は JSON 数値のみ。数値は生テキスト（`f64` を経由しない）で `Expr::Number` へ
+/// 渡し、engine の `parse_number_literal`（有限性・2^53 の exactness 検査）で
+/// 検証させる（SQL 表層と同一の束縛経路。SQL テキストの組み立ては行わない）。
+fn numeric_expr_predicate(
+    column: &str,
+    cmp: CompareOp,
+    value: &JsonValue,
+    kind: &'static str,
+) -> Result<DeclarativePredicate, FilterError> {
+    match value {
+        JsonValue::Number(n) => Ok(DeclarativePredicate::Expr(Expr::Binary {
+            op: bin_op_for(cmp),
+            lhs: Box::new(Expr::Ident(column.to_string())),
+            rhs: Box::new(Expr::Number(typed_json::number_literal_text(n))),
+        })),
+        _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+            match kind {
+                "eq" => "eq filter value for a numeric column must be a JSON number",
+                _ => "range filter value for a numeric column must be a JSON number",
+            },
         ))),
     }
 }
@@ -940,6 +987,23 @@ pub fn bind_filter_where_predicates(
     let mapped = map_predicate_dml_items(items)?;
     let mut predicates = Vec::with_capacity(mapped.len());
     for (column, op, value) in mapped {
+        // Issue #1183: 述語形 DML の `filter` は数値列の `eq` を対象外に保つ
+        // （`declare_leaf` は数値列で式述語を返すため、ここで先に拒否して
+        // 「非 Leaf」の内部エラーへ落とさない）。
+        if op == "eq"
+            && schema.columns.iter().any(|c| {
+                c.name == column
+                    && matches!(
+                        c.ty,
+                        ColumnType::Integer
+                            | ColumnType::BigInt
+                            | ColumnType::Real
+                            | ColumnType::Double
+                    )
+            })
+        {
+            return Err(FilterError::NumericFilterNotSupported);
+        }
         let declared = declare_leaf(column, op, value, schema)?;
         let DeclarativePredicate::Leaf(leaf) = &declared else {
             // `declare_leaf` は `eq`／`prefix` に対して常に `Leaf` を返す
@@ -1326,30 +1390,55 @@ mod tests {
     }
 
     #[test]
-    fn range_on_text_column_delegates_to_engine_22000() {
-        let err = bind(r#"[{"column":"lang","op":"gt","value":"a"}]"#).expect_err("must reject");
+    fn range_on_text_column_maps_to_expression_lane() {
+        // Issue #1183: TEXT の範囲比較は式レーン（バイト順）へ写像される。
+        for op in ["lt", "le", "lte", "gt", "ge", "gte"] {
+            let bound = bind(&format!(r#"[{{"column":"lang","op":"{op}","value":"a"}}]"#))
+                .unwrap_or_else(|e| panic!("op {op} must bind: {e:?}"));
+            assert!(bound.metadata_filters().is_empty(), "{op}");
+            assert_eq!(bound.expr_filters().len(), 1, "{op}");
+        }
+    }
+
+    #[test]
+    fn range_on_text_column_rejects_non_string_value() {
+        let err = bind(r#"[{"column":"lang","op":"gt","value":1}]"#).expect_err("must reject");
+        assert!(matches!(err, FilterError::Value(_)));
+    }
+
+    #[test]
+    fn eq_and_range_on_numeric_columns_map_to_expression_lane() {
+        // Issue #1183: 数値列は式レーンへ写像される（SQL の式述語と同じ束縛）。
+        for op in ["eq", "lt", "le", "gt", "ge"] {
+            let bound = bind(&format!(r#"[{{"column":"count","op":"{op}","value":1}}]"#))
+                .unwrap_or_else(|e| panic!("op {op} must bind: {e:?}"));
+            assert!(bound.metadata_filters().is_empty(), "{op}");
+            assert_eq!(bound.expr_filters().len(), 1, "{op}");
+        }
+    }
+
+    #[test]
+    fn numeric_column_filter_rejects_non_number_value() {
+        for value in [r#""1""#, "true"] {
+            let err = bind(&format!(
+                r#"[{{"column":"count","op":"gt","value":{value}}}]"#
+            ))
+            .expect_err("must reject");
+            assert!(matches!(err, FilterError::Value(_)), "{value}");
+        }
+    }
+
+    #[test]
+    fn numeric_column_filter_rejects_negative_integer_beyond_exact_range() {
+        // 2^53 を超える負数は黙って丸めず `22000`（正の側と対称）。
+        let err = bind(r#"[{"column":"count","op":"gt","value":-9007199254740993}]"#)
+            .expect_err("must reject");
         assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
-    fn eq_on_integer_column_is_feature_not_supported() {
-        let err = bind(r#"[{"column":"count","op":"eq","value":1}]"#).expect_err("must reject");
-        assert!(matches!(err, FilterError::NumericFilterNotSupported));
-        assert_eq!(err.wire_code(), "0A000");
-    }
-
-    #[test]
-    fn range_on_integer_column_is_feature_not_supported() {
-        let err = bind(r#"[{"column":"count","op":"gt","value":1}]"#).expect_err("must reject");
-        assert!(matches!(err, FilterError::NumericFilterNotSupported));
-        assert_eq!(err.wire_code(), "0A000");
-    }
-
-    #[test]
-    fn eq_on_integer_column_stays_feature_not_supported_after_sql_surface_conversion() {
-        let err = bind(r#"[{"column":"count","op":"eq","value":1}]"#).expect_err("must reject");
-        let sql_err = err.into_sql_surface_error();
-        assert_eq!(sql_err.wire_code(), "0A000");
+    fn numeric_column_filter_accepts_negative_integer_within_exact_range() {
+        bind(r#"[{"column":"count","op":"gt","value":-9007199254740992}]"#).expect("bind ok");
     }
 
     #[test]

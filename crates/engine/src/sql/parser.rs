@@ -1392,16 +1392,14 @@ pub(crate) fn bind_where_predicates(
         node_budget,
         dummy_equality_flags,
         &mut equality_ordinal,
-        crate::sql::udf_call::ColumnRefPolicy::IdAndVectorOnly,
+        true,
     )
 }
 
 /// `CHECK` 制約の式述語束縛専用（Issue #1075・TABLE-16 ポインタ）。
 /// [`bind_where_predicates`] と同じ束縛経路（`bind_where_predicates_recursive`）
-/// を共有しつつ、`WherePredicate::Expression` の束縛だけを
-/// [`crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns`] へ切り替え、
-/// INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可する opt-in 拡張（`WHERE`／
-/// `SELECT`／Describe 系の挙動は一切変えない。汎用のレーン A は対象外）。
+/// を共有し、空の `UdfRegistry`（CHECK は UDF 呼び出しを持たない）で束縛する
+/// ラッパー（Issue #1183 で数値列の式参照は `WHERE` と共通化された）。
 /// `sql::check_constraint::CompiledChecks::compile`・`validate_and_build`・
 /// `recompute_referenced_columns` の 3 箇所から呼ばれる。
 pub(crate) fn bind_check_predicates(
@@ -1418,15 +1416,52 @@ pub(crate) fn bind_check_predicates(
         node_budget,
         &[],
         &mut equality_ordinal,
-        crate::sql::udf_call::ColumnRefPolicy::AllowNumericColumns,
+        false,
     )
+}
+
+/// TEXT 列への範囲比較（`Compare`、または `Not(Compare)`）を式レーンの
+/// `Expr::Binary` へ書き換える（Issue #1183。`bind_where_predicates_recursive` から
+/// 呼ばれる）。TEXT 列以外・未知列・その他の述語形は `None`（従来の宣言的経路へ
+/// 委ねる＝ENUM 等は従来どおり `22000`）。`NOT (a < b)` は演算子を反転した
+/// `a >= b` と三値論理でも同値（NULL は UNKNOWN のまま）。
+fn text_range_compare_as_expr(
+    predicate: &WherePredicate,
+    schema: &TableSchema,
+) -> Option<crate::sql::udf_call::Expr> {
+    use crate::sql::allowlist::CompareOp;
+    use crate::sql::udf_call::{BinOp, Expr};
+    let (column, op, value, negated) = match predicate {
+        WherePredicate::Compare { column, op, value } => (column, *op, value, false),
+        WherePredicate::Not(inner) => match inner.as_ref() {
+            WherePredicate::Compare { column, op, value } => (column, *op, value, true),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let is_text = schema
+        .columns
+        .iter()
+        .any(|c| &c.name == column && matches!(c.ty, ColumnType::Text));
+    if !is_text {
+        return None;
+    }
+    let bin = match (op, negated) {
+        (CompareOp::Lt, false) | (CompareOp::Ge, true) => BinOp::Lt,
+        (CompareOp::Le, false) | (CompareOp::Gt, true) => BinOp::Le,
+        (CompareOp::Gt, false) | (CompareOp::Le, true) => BinOp::Gt,
+        (CompareOp::Ge, false) | (CompareOp::Lt, true) => BinOp::Ge,
+    };
+    Some(Expr::Binary {
+        op: bin,
+        lhs: Box::new(Expr::Ident(column.clone())),
+        rhs: Box::new(Expr::String(value.clone())),
+    })
 }
 
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
-/// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。`column_ref_policy` は
-/// `WherePredicate::Expression` の束縛（`udf_call::bind_expr_with_policy`）へ
-/// そのまま伝播する（Issue #1075・TABLE-16 ポインタ）。
+/// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
 fn bind_where_predicates_recursive(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1434,7 +1469,7 @@ fn bind_where_predicates_recursive(
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
     equality_ordinal: &mut usize,
-    column_ref_policy: crate::sql::udf_call::ColumnRefPolicy,
+    allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
@@ -1442,6 +1477,23 @@ fn bind_where_predicates_recursive(
     let mut rls_predicate_present = false;
     let mut or_filters = Vec::new();
     for predicate in where_predicates {
+        // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: TEXT 列の範囲比較
+        // （`<col> < 'lit'`、およびその `NOT`）は宣言的経路（レーン B）に TEXT の
+        // 順序比較が無いため、AST（`WherePredicate`）を変えず束縛段で式レーンの
+        // `Expr::Binary`（TEXT×TEXT のバイト順比較）へ振り替える。二次索引は使わず
+        // 全走査へ縮退する（索引の有無で結果を変えない）。
+        //
+        // `CHECK` 文脈（`allow_text_range_rewrite == false`）では書き換えず従来どおり
+        // 宣言的経路へ渡して `22000` で拒否する（fail-closed。CHECK の TEXT 範囲比較は
+        // 永続化・再オープン時の再検証経路が未検証のため受理しない）。
+        if let Some(expr) = allow_text_range_rewrite
+            .then(|| text_range_compare_as_expr(predicate, schema))
+            .flatten()
+        {
+            let (bound, _ty) = crate::sql::udf_call::bind_expr(&expr, schema, udfs, node_budget)?;
+            expr_filters.push(bound);
+            continue;
+        }
         match predicate {
             WherePredicate::PredicateCall { .. } => {
                 // allowlist が許可する述語呼び出し形は `visible()` のみ
@@ -1450,13 +1502,7 @@ fn bind_where_predicates_recursive(
                 rls_predicate_present = true;
             }
             WherePredicate::Expression(expr) => {
-                let (bound, ty) = crate::sql::udf_call::bind_expr_with_policy(
-                    expr,
-                    schema,
-                    udfs,
-                    node_budget,
-                    column_ref_policy,
-                )?;
+                let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
                     return Err(SqlSurfaceError::datatype_mismatch(
                         "WHERE expression must evaluate to a boolean (use a comparison)",
@@ -1480,7 +1526,7 @@ fn bind_where_predicates_recursive(
                             node_budget,
                             dummy_equality_flags,
                             equality_ordinal,
-                            column_ref_policy,
+                            allow_text_range_rewrite,
                         )?;
                     bound_branches.push(crate::sql::where_tree::BoundConjunction::new(
                         branch_metadata,

@@ -115,6 +115,20 @@ Issue #880〜#890 で `INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／`BOOLEAN`／`DA
 `UPDATE`/`DELETE` のいずれも既存の `MetadataFilter` 経由の適用点をそのまま
 通るため、新しい評価経路を追加していない。
 
+## 後続対応（Issue #1183）
+
+レーン A のうち、`WHERE`・投影・`GROUP BY` での数値列（INTEGER/BIGINT/REAL/
+DOUBLE）の式参照・比較を Issue #1183（SQL-24・SQL-26・TABLE-13 ポインタ）で
+受理した。`BoundExpr::ColumnRef` の束縛を `CHECK` 専用ポリシーから全式束縛へ
+一般化し（`ColumnRefPolicy` を撤廃）、評価規則は #1075 の設計（算術は `f64`・
+NULL は strict 伝播・BIGINT の |値| > 2^53 は `22000`）をそのまま引き継ぐ。
+`TEXT` 列の範囲比較（`< <= > >=`）は束縛段で式レーンの TEXT×TEXT 比較（バイト順）へ
+振り替える（`WherePredicate` の AST は不変）。`GROUP BY` は数値キーを型付きキー
+として全走査経路で集計する（TEXT 辞書索引経路は単一 TEXT キー限定）。NoSQL の
+`filter` は同じ式レーンへ写像する。二次索引による数値列の候補削減・数値列と
+文字列リテラルの比較・TEXT の `BETWEEN`・照合順序は対象外。以下の「既知の制約」
+のうちレーン A に関する記述は Issue #1183 で解消済み。
+
 ## 既知の制約（本 Issue の範囲）
 
 - `NUMERIC` 列の裸の数値リテラル形（`price > 1.5`。引用符なし）は対象外。

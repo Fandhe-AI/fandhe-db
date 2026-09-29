@@ -318,14 +318,15 @@ fn type_mismatched_comparisons_are_rejected_at_bind_time() {
     let alice = ctx_for("alice");
     seed_two_rows(&core, &alice);
 
-    // TEXT 列との範囲比較（型不一致）。
+    // DATE 列と数値リテラルの比較（型不一致）。TEXT 列の範囲比較は
+    // Issue #1183 で受理されたため、型不一致の例には使わない。
     let err = core
         .execute_sql(
             &alice,
-            &format!("SELECT id FROM {TABLE} WHERE lang > '2024-01-01' LIMIT 10"),
+            &format!("SELECT id FROM {TABLE} WHERE day > 5 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 
     // DATE 列に UUID 形式のリテラルは形式違反として `22007`。
     let err = core
@@ -357,18 +358,17 @@ fn type_mismatched_comparisons_are_rejected_at_bind_time() {
     assert_eq!(err.wire_code(), "22P02");
 }
 
-// --- INTEGER/BIGINT/REAL/DOUBLE（レーン A。算術を持つ数値型）は WHERE の範囲
-// 比較・式参照の対象外のまま（別 Issue 申し送り） ------------------------------
+// --- INTEGER 列の比較・式参照（Issue #1183。SQL-24・SQL-26・TABLE-13 ポインタ） --
 
 #[test]
-fn integer_column_range_comparison_and_expression_reference_remain_rejected() {
+fn integer_column_comparison_and_expression_reference_are_accepted() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
     seed_two_rows(&core, &alice);
 
-    // `qty > '1'`（文字列リテラル形の範囲比較）は INTEGER 列を対象外とする
-    // ため `22000`（レーン B の対象は非数値型のみ）。
+    // `qty > '1'`（文字列リテラルとの比較）は PostgreSQL の暗黙型変換に当たるため
+    // 引き続き対象外（`22000`）。
     let err = core
         .execute_sql(
             &alice,
@@ -377,15 +377,80 @@ fn integer_column_range_comparison_and_expression_reference_remain_rejected() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
 
-    // 裸の数値リテラル形（`qty > 1`）は式評価経路へフォールバックし、
-    // INTEGER 列は式内でまだ参照できないため `22000`。
+    assert_eq!(select_ids(&core, &alice, "qty > 1"), vec![2]);
+    assert_eq!(select_ids(&core, &alice, "qty >= 1"), vec![1, 2]);
+    assert_eq!(select_ids(&core, &alice, "qty < 2"), vec![1]);
+    assert_eq!(select_ids(&core, &alice, "qty = 2"), vec![2]);
+    assert_eq!(select_ids(&core, &alice, "qty + 1 > 2"), vec![2]);
+    assert_eq!(
+        select_ids(&core, &alice, "qty = 1 OR qty = 2 AND lang = 'en'"),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn integer_column_expression_projection_and_aggregate_work() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id, COALESCE(qty * 2, 0) FROM {TABLE} WHERE qty >= 1 LIMIT 10"),
+        )
+        .expect("projection over an INTEGER column must succeed");
+    let cells: Vec<_> = result.rows.iter().map(|r| r.cells.clone()).collect();
+    assert_eq!(cells.len(), 2);
+    assert!(cells.iter().any(|c| c[1] == Cell::Float(4.0)));
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT SUM(qty * 2) FROM {TABLE}"))
+        .expect("SUM over an expression must succeed");
+    assert_eq!(result.rows[0].cells[0], Cell::Float(6.0));
+}
+
+#[test]
+fn integer_column_division_by_zero_is_22012() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
     let err = core
         .execute_sql(
             &alice,
-            &format!("SELECT id FROM {TABLE} WHERE qty > 1 LIMIT 10"),
+            &format!("SELECT id FROM {TABLE} WHERE qty / 0 > 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
+}
+
+// --- TEXT 列の範囲比較（Issue #1183。バイト順） ---------------------------------
+
+#[test]
+fn text_range_comparison_selects_expected_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_two_rows(&core, &alice);
+
+    // lang: 1 = 'ja', 2 = 'en'
+    assert_eq!(select_ids(&core, &alice, "lang < 'g'"), vec![2]);
+    assert_eq!(select_ids(&core, &alice, "lang <= 'en'"), vec![2]);
+    assert_eq!(select_ids(&core, &alice, "lang > 'en'"), vec![1]);
+    assert_eq!(select_ids(&core, &alice, "lang >= 'en'"), vec![1, 2]);
+    assert_eq!(select_ids(&core, &alice, "NOT lang < 'g'"), vec![1]);
+    assert_eq!(select_ids(&core, &alice, "NOT lang >= 'g'"), vec![2]);
+    assert_eq!(
+        select_ids(&core, &alice, "lang < 'g' OR lang > 'j'"),
+        vec![1, 2]
+    );
+    // 式レーン（`lower(lang)`）の比較と結果が一致する。
+    assert_eq!(
+        select_ids(&core, &alice, "lower(lang) < 'g'"),
+        select_ids(&core, &alice, "lang < 'g'")
+    );
 }
 
 // --- 広域取得 scan（`ORDER BY` を伴わない `SELECT ... WHERE ... LIMIT n`） -----

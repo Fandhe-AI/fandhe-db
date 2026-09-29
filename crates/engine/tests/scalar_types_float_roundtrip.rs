@@ -300,12 +300,10 @@ fn insert_rejects_string_literal_for_real_column_with_22p02() {
     assert_eq!(err.wire_code(), "22P02");
 }
 
-/// `WHERE score = 1` は fail-closed に拒否される（F10: REAL/DOUBLE は算術と
-/// 組み合わせる式評価経路〔レーン A〕の対象で、#891・TASK-199 が対応した
-/// 非数値型〔DATE/TIMESTAMP/NUMERIC/UUID/BYTEA〕の範囲外のまま。詳細は
-/// `docs/design/scalar-types-predicates.md` 参照）。
+/// `WHERE score = 1` は Issue #1183（SQL-24・SQL-26・TABLE-13 ポインタ）で受理される
+/// （旧契約は数値列の式内参照が未対応のため `22000` 拒否だった）。
 #[test]
-fn select_where_on_real_column_is_rejected() {
+fn select_where_on_real_column_is_accepted() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -321,13 +319,13 @@ fn select_where_on_real_column_is_rejected() {
     )
     .expect("INSERT should succeed");
 
-    let err = core
+    let result = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE score = 1 LIMIT 1"),
         )
-        .expect_err("WHERE on REAL column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+        .expect("WHERE on REAL column must be accepted (Issue #1183)");
+    assert_eq!(result.rows.len(), 1);
 }
 
 /// `SUM(score)` は Issue #892 で受理された（TABLE-13・SQL-13）。結果は

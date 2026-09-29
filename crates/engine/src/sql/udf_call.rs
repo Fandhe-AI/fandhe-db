@@ -80,10 +80,18 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
     // 素通りして下の `raw.parse::<f64>()` で無音に丸められる（Cursor Bugbot
     // 指摘・PR #1020）。末尾ドットを取り除いた残りが 1 桁以上の数字のみで
     // あれば、同じ整数として exactness 判定の対象に含める。
-    let integer_digits: Option<&str> = if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())
+    // Issue #1183: NoSQL の `filter`（JSON の `NegInt`）は負数の生テキスト
+    // （`-9007199254740993` 等）をそのまま渡すため、先頭の `-` を除いた絶対値にも
+    // 同じ exactness 判定を適用する（SQL 表層は単項マイナスが無く影響しない）。
+    let abs_raw = match raw.strip_prefix('-') {
+        Some(unsigned) if !unsigned.is_empty() => unsigned,
+        _ => raw,
+    };
+    let integer_digits: Option<&str> = if !abs_raw.is_empty()
+        && abs_raw.bytes().all(|b| b.is_ascii_digit())
     {
-        Some(raw)
-    } else if let Some(stripped) = raw.strip_suffix('.') {
+        Some(abs_raw)
+    } else if let Some(stripped) = abs_raw.strip_suffix('.') {
         (!stripped.is_empty() && stripped.bytes().all(|b| b.is_ascii_digit())).then_some(stripped)
     } else {
         None
@@ -102,6 +110,14 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
             ));
         }
     }
+    // 小数表記（`9007199254740993.0`）・指数表記（`9.007199254740993e15`）でも、値が
+    // 数学的に整数なら同じ exactness 判定を丸め変換の前に適用する（NoSQL `filter` が
+    // JSON の生数値を渡すため到達する。Issue #1183・codex-review P1）。
+    if integral_decimal_exceeds_exact_f64(abs_raw) {
+        return Err(SqlSurfaceError::invalid_input(
+            "integer literal exceeds the range that can be exactly represented",
+        ));
+    }
     let v: f64 = raw
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
@@ -111,6 +127,85 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
         ));
     }
     Ok(v)
+}
+
+/// 符号なしの 10 進表記（`d+[.d*][e[+-]d+]`）が数学的に整数値で、かつ `2^53` を超える
+/// か（`f64` で正確に表現できないか）を、`f64` への丸め変換を介さず判定する。
+/// 非整数値（小数部が 0 でない）・不正形式は `false`（後段の通常経路に任せる）。
+/// 整数の字面・末尾ドット形は [`parse_number_literal`] が別途検査済みだが、
+/// 本関数はそれらも同じ結果を返す。
+fn integral_decimal_exceeds_exact_f64(abs_raw: &str) -> bool {
+    let (mantissa, exp_part) = match abs_raw.find(['e', 'E']) {
+        Some(i) => (&abs_raw[..i], Some(&abs_raw[i + 1..])),
+        None => (abs_raw, None),
+    };
+    let exp: i64 = match exp_part {
+        None => 0,
+        Some(e) => match e.parse() {
+            Ok(v) => v,
+            // 符号付き 10 進数字列だが i64 に収まらない指数は表現範囲外として拒否側へ倒す
+            // （fail-closed）。それ以外の不正形式は後段の通常経路（malformed）に任せる。
+            Err(_) => {
+                let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+                return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            }
+        },
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return false;
+    }
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let digits: String = int_part.chars().chain(frac_part.chars()).collect();
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return false; // 0
+    }
+    let trimmed = trimmed.trim_end_matches('0');
+    let trailing_zeros = (digits.trim_start_matches('0').len() - trimmed.len()) as i64;
+    // 値 = trimmed × 10^exp10（trimmed は末尾 0 なし）。
+    // 指数は未信頼入力（NoSQL `filter` の JSON 数値）由来のため、加減算はすべて
+    // checked で行い、i64 に収まらない指数は表現範囲外として拒否側（`true`）へ倒す
+    // （panic・折り返しによる誤判定を作らない。fail-closed）。
+    let Some(exp10) = i64::try_from(frac_part.len())
+        .ok()
+        .and_then(|frac_len| exp.checked_sub(frac_len))
+        .and_then(|e| e.checked_add(trailing_zeros))
+    else {
+        return true;
+    };
+    if exp10 < 0 {
+        return false; // 小数部が 0 でない（非整数）。
+    }
+    let Some(total_digits) = i64::try_from(trimmed.len())
+        .ok()
+        .and_then(|len| len.checked_add(exp10))
+    else {
+        return true;
+    };
+    if total_digits > 20 {
+        return true; // `u64` 上限（20 桁）超は 2^53 を確実に超える。
+    }
+    let mut value: u128 = match trimmed.parse() {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    for _ in 0..exp10 {
+        value = match value.checked_mul(10) {
+            Some(v) => v,
+            None => return true,
+        };
+    }
+    value > u128::from(MAX_EXACT_F64_INT)
 }
 
 /// 式の二項演算子。
@@ -259,11 +354,8 @@ pub enum BoundExpr {
     },
     /// nullable な数値列（INTEGER/BIGINT/REAL/DOUBLE）の参照（Issue #1075・
     /// TABLE-16 ポインタ）。`index` は `TextColumnRef` と同じ論理列インデックス
-    /// 系列（`schema.columns` 添字）。汎用の式評価（`ColumnRefPolicy::
-    /// IdAndVectorOnly`）では束縛されず、`CHECK` 制約の式述語束縛
-    /// （`ColumnRefPolicy::AllowNumericColumns`。`sql::parser::
-    /// bind_check_predicates`）でのみ生成される opt-in 拡張（汎用のレーン A
-    /// ではない）。値の変換規則は `numeric_scalar_from_ref` 参照。
+    /// 系列（`schema.columns` 添字）。`WHERE`／投影／`CHECK` の
+    /// 式束縛（Issue #1183・SQL-24・SQL-26）で共通に生成される。値の変換規則は `numeric_scalar_from_ref` 参照。
     ColumnRef {
         index: usize,
     },
@@ -981,21 +1073,6 @@ fn validate_closed_expr(
     }
 }
 
-/// 列参照を束縛時にどこまで許すか（Issue #1075・TABLE-16 ポインタ）。既定は
-/// [`ColumnRefPolicy::IdAndVectorOnly`] で、`WHERE`／`SELECT`／Describe 系の
-/// 汎用式評価（[`bind_expr`] 公開 API）はこれを使い続ける（挙動を変えない）。
-/// [`ColumnRefPolicy::AllowNumericColumns`] は `CHECK` 制約の式述語束縛
-/// （`sql::parser::bind_check_predicates`）専用の opt-in 拡張で、INTEGER/
-/// BIGINT/REAL/DOUBLE 列の式内参照のみを追加で許可する（TEXT/BOOLEAN/DATE/
-/// NUMERIC 等、他の列型はポリシーに関わらず従来どおり拒否する）。汎用の
-/// `WHERE`/`SELECT` へ数値列の式参照を広げるレーン A は別 Issue の対象（対象外
-/// 事項）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColumnRefPolicy {
-    IdAndVectorOnly,
-    AllowNumericColumns,
-}
-
 /// 束縛環境: 列参照の解決元（`SELECT`/`WHERE` の式では `Some(schema)`、UDF 本体の
 /// 展開中は `None` に切り替わりパラメータ参照だけを解決する）と、パラメータ名 →
 /// 既に束縛済みの実引数式（インライン展開用）の対応表。
@@ -1009,9 +1086,6 @@ struct BindEnv<'a> {
     /// ネストと呼び出し先本体のネストが合算され、構文段の計測値（各文が個別に
     /// 見た字面上のネスト）をすり抜けうるため（[`enter_case_nesting`] 参照）。
     case_nesting: usize,
-    /// 列参照の許容範囲（Issue #1075・TABLE-16 ポインタ）。[`bind_expr`] は
-    /// 常に [`ColumnRefPolicy::IdAndVectorOnly`] を使う（挙動を変えない）。
-    column_ref_policy: ColumnRefPolicy,
 }
 
 /// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
@@ -1279,33 +1353,11 @@ pub fn bind_expr(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    bind_expr_with_policy(
-        expr,
-        schema,
-        registry,
-        node_budget,
-        ColumnRefPolicy::IdAndVectorOnly,
-    )
-}
-
-/// [`bind_expr`] の列参照ポリシー付き版（`pub(crate)`。Issue #1075・TABLE-16
-/// ポインタ）。`sql::parser::bind_check_predicates` から
-/// [`ColumnRefPolicy::AllowNumericColumns`] で呼ばれる以外は [`bind_expr`]
-/// （常に [`ColumnRefPolicy::IdAndVectorOnly`]）を経由し、公開シグネチャ
-/// （`bind_expr`）は変えない。
-pub(crate) fn bind_expr_with_policy(
-    expr: &Expr,
-    schema: &TableSchema,
-    registry: &UdfRegistry,
-    node_budget: &mut usize,
-    column_ref_policy: ColumnRefPolicy,
-) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
-        column_ref_policy,
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -1644,31 +1696,15 @@ fn bind_expr_in(
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
                     ColumnType::Text => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
-                    // `INTEGER`／`BIGINT` 列の式参照は、`CHECK` 制約の式述語束縛
-                    // （`ColumnRefPolicy::AllowNumericColumns`。Issue #1075・
-                    // TABLE-16 ポインタ）に限り解禁する。汎用の `WHERE`／`SELECT`
-                    // （`ColumnRefPolicy::IdAndVectorOnly`）は既存の拒否文言を
-                    // 一字一句そのまま維持する（回帰を防ぐ。レーン A は対象外）。
-                    ColumnType::Integer | ColumnType::BigInt => {
-                        if env.column_ref_policy == ColumnRefPolicy::AllowNumericColumns {
-                            Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar))
-                        } else {
-                            Err(SqlSurfaceError::invalid_input(format!(
-                                "column {name:?} cannot be used in an expression yet"
-                            )))
-                        }
-                    }
-                    // REAL/DOUBLE 列の式参照も同様に `CHECK` 専用ポリシーでのみ
-                    // 解禁する（上記 INTEGER/BIGINT と同じ理由）。
-                    ColumnType::Real | ColumnType::Double => {
-                        if env.column_ref_policy == ColumnRefPolicy::AllowNumericColumns {
-                            Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar))
-                        } else {
-                            Err(SqlSurfaceError::invalid_input(format!(
-                                "column {name:?} cannot be used in an expression (REAL/DOUBLE columns are not supported)"
-                            )))
-                        }
-                    }
+                    // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: 数値 4 型
+                    // （INTEGER／BIGINT／REAL／DOUBLE）の列参照を `WHERE`／投影／
+                    // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
+                    // 値は行スカラービュー（`row_scalars`）から解決し、評価時の
+                    // 精度超過（BIGINT の |v| > 2^53）は `22000` で fail-closed。
+                    ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double => Ok((BoundExpr::ColumnRef { index }, ExprType::Scalar)),
                     ColumnType::Boolean => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (BOOLEAN columns are not supported)"
                     ))),
@@ -1943,9 +1979,6 @@ fn bind_call(
             // 後、呼び出し元の CASE/COALESCE/NULLIF と本体側のそれが合算される
             // ことを構造的に保証する。`enter_case_nesting` docs 参照）。
             case_nesting: env.case_nesting,
-            // `schema: None` のため列参照自体に到達しない（列参照は上の分岐で
-            // `Err` になる）が、フィールドは呼び出し元の値をそのまま引き継ぐ。
-            column_ref_policy: env.column_ref_policy,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -3403,6 +3436,56 @@ mod tests {
         assert_eq!(value, 42.0);
     }
 
+    /// codex-review P1（Issue #1183）: 整数値を表す小数・指数表記も丸め変換の前に
+    /// exactness 判定を受ける（NoSQL `filter` が JSON の生数値を渡すため）。
+    #[test]
+    fn integral_decimal_and_exponent_forms_beyond_exact_range_are_rejected() {
+        for raw in [
+            "9007199254740993.0",
+            "-9007199254740993.0",
+            "9007199254740993.000",
+            "9.007199254740993e15",
+            "9007199254740993e0",
+            "90071992547409930e-1",
+            "1e30",
+            "0.9007199254740993e16",
+        ] {
+            let err = parse_number_literal(raw).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "{raw}");
+        }
+    }
+
+    /// 指数が i64 の端に達する未信頼入力でも panic せず `22000` で拒否する
+    /// （codex-review P1。checked 演算・fail-closed）。
+    #[test]
+    fn extreme_exponents_are_rejected_with_22000_without_panicking() {
+        for raw in [
+            "1.0e-9223372036854775808",
+            "10e9223372036854775807",
+            "1e9223372036854775807",
+            "1e99999999999999999999999",
+            "1e-99999999999999999999999",
+        ] {
+            let err = parse_number_literal(raw).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "{raw}");
+        }
+    }
+
+    #[test]
+    fn integral_decimal_and_exponent_forms_within_exact_range_still_parse() {
+        for (raw, want) in [
+            ("9007199254740992.0", 9007199254740992.0),
+            ("9.007199254740992e15", 9007199254740992.0),
+            ("1e3", 1000.0),
+            ("1.5", 1.5),
+            ("2.5e-1", 0.25),
+            ("0.0", 0.0),
+            ("100.000", 100.0),
+        ] {
+            assert_eq!(parse_number_literal(raw).expect(raw), want, "{raw}");
+        }
+    }
+
     #[test]
     fn id_beyond_f64_exact_range_is_rejected_not_silently_rounded() {
         // `id_as_finite_scalar` は評価時に大きな `id` を拒否するが、リテラル側も
@@ -4344,72 +4427,32 @@ mod tests {
         )
     }
 
-    /// 既定ポリシー（[`bind_expr`]、常に [`ColumnRefPolicy::IdAndVectorOnly`]）
-    /// では、INTEGER/BIGINT/REAL/DOUBLE 列の式内参照は Issue #1075 以前と
-    /// 一字一句同じ文言で拒否される（回帰を防ぐ。`WHERE`／`SELECT` の挙動は
-    /// 変えない）。
+    /// 数値 4 型の列参照は `BoundExpr::ColumnRef`（`ExprType::Scalar`）へ束縛される
+    /// （Issue #1183。`WHERE`／投影／`CHECK` で共通）。
     #[test]
-    fn bind_expr_still_rejects_numeric_columns_with_default_policy() {
-        let schema = schema_with_numeric_columns();
-        let registry = UdfRegistry::default();
-
-        let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr(&ident("qty"), &schema, &registry, &mut budget)
-            .expect_err("INTEGER column must still be rejected by default");
-        assert_eq!(
-            err.to_string(),
-            "invalid input: column \"qty\" cannot be used in an expression yet"
-        );
-
-        let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr(&ident("ratio"), &schema, &registry, &mut budget)
-            .expect_err("REAL column must still be rejected by default");
-        assert_eq!(
-            err.to_string(),
-            "invalid input: column \"ratio\" cannot be used in an expression (REAL/DOUBLE columns are not supported)"
-        );
-    }
-
-    /// [`ColumnRefPolicy::AllowNumericColumns`]（`CHECK` 制約束縛専用）は
-    /// INTEGER/BIGINT/REAL/DOUBLE 列を `BoundExpr::ColumnRef`（`ExprType::
-    /// Scalar`）として束縛する。
-    #[test]
-    fn bind_expr_with_policy_allows_numeric_columns_under_check_policy() {
+    fn bind_expr_binds_numeric_columns_as_column_ref() {
         let schema = schema_with_numeric_columns();
         let registry = UdfRegistry::default();
         for (name, index) in [("qty", 0), ("total", 1), ("ratio", 2), ("score", 3)] {
             let mut budget = MAX_EXPR_NODES;
-            let (bound, ty) = bind_expr_with_policy(
-                &ident(name),
-                &schema,
-                &registry,
-                &mut budget,
-                ColumnRefPolicy::AllowNumericColumns,
-            )
-            .unwrap_or_else(|e| panic!("{name} must bind under AllowNumericColumns: {e:?}"));
+            let (bound, ty) = bind_expr(&ident(name), &schema, &registry, &mut budget)
+                .unwrap_or_else(|e| panic!("{name} must bind: {e:?}"));
             assert_eq!(ty, ExprType::Scalar, "{name}");
             assert_eq!(bound, BoundExpr::ColumnRef { index }, "{name}");
         }
     }
 
-    /// `AllowNumericColumns` でも数値列以外（TEXT を除く。TEXT は無条件に
-    /// 許可される既存仕様）は引き続き拒否される（BOOLEAN で固定する）。
+    /// 数値列以外（BOOLEAN 等）の式内参照は引き続き拒否される。
     #[test]
-    fn bind_expr_with_policy_still_rejects_non_numeric_columns() {
+    fn bind_expr_still_rejects_non_numeric_columns() {
         let schema = TableSchema::new(
             "docs",
             vec![ColumnDef::new("flag", ColumnType::Boolean, false)],
         );
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
-        let err = bind_expr_with_policy(
-            &ident("flag"),
-            &schema,
-            &registry,
-            &mut budget,
-            ColumnRefPolicy::AllowNumericColumns,
-        )
-        .expect_err("BOOLEAN column must still be rejected under AllowNumericColumns");
+        let err = bind_expr(&ident("flag"), &schema, &registry, &mut budget)
+            .expect_err("BOOLEAN column must still be rejected");
         assert!(err
             .to_string()
             .contains("BOOLEAN columns are not supported"));
