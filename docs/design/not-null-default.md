@@ -171,11 +171,19 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 `NOT NULL`／`DEFAULT` を受理するようにした（詳細は
 `docs/design/sql-alter-table-add-column.md`）。
 
-`ALTER COLUMN ... TYPE`（Issue #901）で型が変わる列に既存の `DEFAULT` が
-付いていた場合の再検証は、本 Issue の時点では `DEFAULT` が到達可能な列型が
-`TEXT` のみであり `ALTER COLUMN TYPE` の対象拡張とは独立のため、
-`validate_schema`（型と `DEFAULT` の整合検証）が既存のデコード時再検証経路で
-そのまま効く。
+`DEFAULT` が到達可能な列型は、本 Issue の時点では `TEXT` のみだったが、現在は
+`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／`NUMERIC(p,s)`／`BOOLEAN` にも
+対応している（`CREATE TABLE`／`ALTER TABLE ADD COLUMN` とも列型ごとの束縛は
+`row_codec::column_default_scalar` に一本化）。
+
+`ALTER COLUMN ... TYPE`（Issue #901）で型が変わる列に既存の `DEFAULT` が付いて
+いた場合、`DEFAULT` は列定義に保持されたまま型だけが変わる。型変更後の
+`DEFAULT` は、カタログのデコード時再検証（`validate_schema` の型と `DEFAULT` の
+整合検証。`ColumnDefault::compatible_with`）が既存経路のまま効き、型と整合
+しない場合は fail-closed で拒否する。`NUMERIC` の精度拡大のように値を変えない
+変更では `DEFAULT` は整合したまま読める。読み出し時補完（`ADD COLUMN` 後の
+既存行）も同じ `default_scalar` を通すため、不正な `DEFAULT` は参照列の選択に
+よらず検出される。
 
 ## スコープ外・後続 Issue
 

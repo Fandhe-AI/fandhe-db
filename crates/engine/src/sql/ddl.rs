@@ -314,8 +314,9 @@ pub enum AlterTableAction {
 ///
 /// `NOT NULL`／`DEFAULT` を受け付ける（Issue #1169）。`DEFAULT` は列型との整合
 /// （[`add_column_default`]）・値の束縛（`22000`／`22003`）を検証してから渡し、
-/// 既存行は読み出し時に既定値として見える。`DEFAULT` なしの `NOT NULL` は行が
-/// あれば `23502`、空テーブルなら成功する（判定は `catalog` の write txn 内）。
+/// 既存行は読み出し時に既定値として見える。`DEFAULT` なしの `NOT NULL` は行の
+/// 有無によらず構造検証段階で一律 `42601` 拒否される（TABLE-16。`Storage` を直接呼ぶ
+/// Rust API は `CatalogError::Invalid`。行ストアを参照せず他テナントの行の存在を漏らさない）。
 /// `DEFAULT`・`NOT NULL` のいずれも無い列は従来どおり nullable（TABLE-5）。
 pub(crate) fn execute_alter_table_add_column(
     storage: &Storage,
