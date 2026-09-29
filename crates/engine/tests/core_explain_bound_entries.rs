@@ -94,7 +94,8 @@ fn entry_lines(result: Result<QueryResult, SqlSurfaceError>) -> Vec<String> {
     assert_eq!(
         result.columns[0],
         ColumnMeta::Computed {
-            name: "QUERY PLAN".to_string()
+            name: "QUERY PLAN".to_string(),
+            ty: Some(engine::catalog::ColumnType::Text),
         }
     );
     result

@@ -1937,14 +1937,7 @@ pub(crate) fn execute_grouped_aggregate(
     }
 
     // PROJECT 段: `bound.projection` の列順で `GroupKey`／集計結果を組み立てる。
-    let mut columns = Vec::with_capacity(bound.projection.len());
-    for col in &bound.projection {
-        let name = match col {
-            ProjectionColumn::GroupKey { name, .. } => name.clone(),
-            ProjectionColumn::Aggregate { name, .. } => name.clone(),
-        };
-        columns.push(ColumnMeta::Computed { name });
-    }
+    let columns: Vec<ColumnMeta> = crate::sql::aggregate::aggregate_projection_columns(bound);
 
     let mut rows = Vec::with_capacity(finished.len());
     for (key, cells) in finished {

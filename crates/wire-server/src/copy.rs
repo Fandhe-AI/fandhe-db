@@ -184,15 +184,17 @@ fn encode_copy_done() -> [u8; 5] {
 }
 
 /// `Cell` を COPY の値表現（text／CSV）へエンコードする。`result_encoder::
-/// cell_to_text`（通常の SELECT 応答と同じ値表現）を土台にすることで、
+/// cell_to_text_for_column`（通常の SELECT 応答と同じ値表現。列の公告型に応じた
+/// `REAL` の PostgreSQL 形式を含む。Issue #1173）を土台にすることで、
 /// `COPY (...) TO STDOUT` の出力を同じテーブルへ `COPY ... FROM STDIN` で
 /// 再投入した際に値が往復する（`sql::copy::decode_text_field`／
 /// `decode_csv_record` と対称なエスケープ規則）。
 fn cell_to_copy_value(
     format: CopyFormat,
+    meta: &ColumnMeta,
     cell: &Cell,
 ) -> Result<Option<String>, result_encoder::EncodeError> {
-    let text = result_encoder::cell_to_text(cell)?;
+    let text = result_encoder::cell_to_text_for_column(meta, cell)?;
     Ok(text.map(|t| match format {
         CopyFormat::Text => escape_copy_text(&t),
         CopyFormat::Csv => escape_copy_csv(&t),
@@ -240,13 +242,18 @@ fn escape_copy_csv(s: &str) -> String {
 /// `sql::allowlist::validate_copy` の `FORMAT` 以外のオプション拒否と対応）。
 fn encode_copy_data_row_into(
     format: CopyFormat,
+    columns: &[ColumnMeta],
     row: &ResultRow,
     out: &mut Vec<u8>,
 ) -> Result<(), result_encoder::EncodeError> {
+    // 列メタとセル数の不一致は内部不整合（fail-closed。何も書かずに拒否する）。
+    if columns.len() != row.cells.len() {
+        return Err(result_encoder::EncodeError);
+    }
     let start = out.len();
     let mut fields: Vec<Option<String>> = Vec::with_capacity(row.cells.len());
-    for cell in &row.cells {
-        match cell_to_copy_value(format, cell) {
+    for (meta, cell) in columns.iter().zip(&row.cells) {
+        match cell_to_copy_value(format, meta, cell) {
             Ok(v) => fields.push(v),
             Err(e) => {
                 out.truncate(start);
@@ -328,7 +335,7 @@ fn run_copy_to<S: WireStream>(
 
     for row in &result.rows {
         let start = buffer.frame_start();
-        if encode_copy_data_row_into(format, row, buffer.as_mut_vec()).is_err() {
+        if encode_copy_data_row_into(format, &result.columns, row, buffer.as_mut_vec()).is_err() {
             buffer.truncate_to(start);
             buffer.flush(stream)?;
             return respond_error_and_ready(
@@ -669,13 +676,6 @@ pub(crate) fn run<'e, S: WireStream>(
         Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }
 }
-
-/// [`ColumnMeta`] を参照する箇所が本モジュールに存在することを型検査するための
-/// マーカー（`result_encoder::cell_to_text` は `Cell` のみを取るため、
-/// `ColumnMeta` は `QueryResult::columns` 経由でのみ使う。未使用 import 警告を
-/// 避けるための明示的な no-op）。
-#[allow(dead_code)]
-fn _assert_column_meta_type(_c: &ColumnMeta) {}
 
 #[cfg(test)]
 mod tests {

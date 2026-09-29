@@ -148,7 +148,8 @@ fn case_select_item_matches_independent_oracle() {
     assert_eq!(
         result.columns[1],
         engine::sql::exec::ColumnMeta::Computed {
-            name: "c".to_string()
+            name: "c".to_string(),
+            ty: Some(engine::catalog::ColumnType::Double),
         }
     );
 
@@ -195,7 +196,7 @@ fn default_alias_for_case_coalesce_nullif_matches_postgresql_convention() {
         .columns
         .iter()
         .map(|c| match c {
-            engine::sql::exec::ColumnMeta::Computed { name } => name.clone(),
+            engine::sql::exec::ColumnMeta::Computed { name, .. } => name.clone(),
             other => panic!("expected Computed column, got {other:?}"),
         })
         .collect();

@@ -23,12 +23,17 @@
 //!
 //! `columns[].type` の型名は SQL 表層の `RowDescription`
 //! （[`crate::result_encoder::encode_row_description`]）が公告する PostgreSQL
-//! 型名と**同一の対応表**（[`crate::result_encoder::WireType`]）を共有する。
-//! これにより `VECTOR` 列・`Computed`（式項目）列は wire 側と同じく
-//! `"text"` として公告される一方、値そのものは wire の text フォーマットでは
-//! なく native JSON（配列・数値・真偽値）で返す——**型名は wire 側との
-//! 同一性を、値表現は JSON としてのロスレス性をそれぞれ優先する意図的な
-//! 非対称**であり、値表現を型名に合わせて文字列化する「修正」はしないこと。
+//! 型名と**同一の対応表**（[`crate::result_encoder::WireType`]）を共有する
+//! （`Id`・`Scalar`）。`VECTOR` 列は wire 側と同じく `"text"` として公告される
+//! 一方、値そのものは wire の text フォーマットではなく native JSON（配列・数値・
+//! 真偽値）で返す——**型名は wire 側との同一性を、値表現は JSON としての
+//! ロスレス性をそれぞれ優先する意図的な非対称**であり、値表現を型名に合わせて
+//! 文字列化する「修正」はしないこと。
+//!
+//! `Computed`（集計・式項目）列は、wire 側 `RowDescription` が Issue #1173 で
+//! 静的な結果型の OID（`COUNT` → `int8` など）を公告するのに対し、本表層は
+//! NOSQL-11 の契約に従い `"text"` 固定のまま据え置く（wire 側との**意図的な非対称**。
+//! 計算列の型名化は NOSQL-11／NOSQL-17 の spec 判断が必要なため別途扱う）。
 //!
 //! 値表現（`Cell` → JSON）:
 //! - `Cell::Null` → `null`
@@ -251,15 +256,15 @@ fn write_finite_f32(out: &mut String, f: f32) -> Result<(), ResponseEncodeError>
 /// コンパイルエラーで検出する。
 fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
     match meta {
-        // `id` 疑似列・式項目（`Computed`）は SQL wire 側（`column_wire_type`。
-        // Issue #895）と型名が一致する意図的な設計（`id` は他の集計等の
-        // `numeric` 系 API との一貫性、`Computed` は実行時の評価結果の型を
-        // 静的に持たないため）であり、ここでのみ SQL wire 側の対応表へ委譲
-        // することで二重管理を避ける（`Scalar` 腕は列型ごとに独立に決める。
-        // モジュール doc「独立の対応表」参照）。
-        ColumnMeta::Id | ColumnMeta::Computed { .. } => {
-            crate::result_encoder::column_wire_type(meta).pg_type_name()
-        }
+        // `id` 疑似列は SQL wire 側（`column_wire_type`。Issue #895）と型名が
+        // 一致する意図的な設計（他の集計等の `numeric` 系 API との一貫性）であり、
+        // ここでのみ SQL wire 側の対応表へ委譲することで二重管理を避ける
+        // （`Scalar` 腕は列型ごとに独立に決める。モジュール doc「独立の対応表」参照）。
+        ColumnMeta::Id => crate::result_encoder::column_wire_type(meta).pg_type_name(),
+        // 式項目・集計結果（`Computed`）は wire 側が Issue #1173 で型付き OID を
+        // 公告するようになっても、NOSQL-11 の契約に従い `"text"` 固定を維持する
+        // （wire 側との意図的な非対称。モジュール doc 参照）。
+        ColumnMeta::Computed { .. } => "text",
         ColumnMeta::Scalar { ty, .. } => match ty {
             ColumnType::Text => "text",
             ColumnType::Vector(_) => "vector",
@@ -367,6 +372,7 @@ pub fn encode_explain(result: &QueryResult) -> Result<String, ResponseEncodeErro
         || result.columns[0]
             != (ColumnMeta::Computed {
                 name: "QUERY PLAN".to_string(),
+                ty: Some(ColumnType::Text),
             })
     {
         return Err(ResponseEncodeError);
@@ -437,6 +443,7 @@ mod tests {
             },
             ColumnMeta::Computed {
                 name: "n".to_string(),
+                ty: Some(ColumnType::Double),
             },
         ]
     }
@@ -896,6 +903,7 @@ mod tests {
             let result = QueryResult {
                 columns: vec![ColumnMeta::Computed {
                     name: "n".to_string(),
+                    ty: Some(ColumnType::Double),
                 }],
                 rows: vec![row(vec![Cell::Float(f)])],
             };

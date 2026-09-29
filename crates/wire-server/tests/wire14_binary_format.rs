@@ -74,7 +74,7 @@ fn text_column_binary_request_sets_format_code_and_raw_bytes() {
         cells: vec![Cell::Text("ja".to_string())],
     };
     let mut data_row = Vec::new();
-    encode_data_row_into_with_formats(&row, &formats, &mut data_row).expect("data row");
+    encode_data_row_into_with_formats(&columns, &row, &formats, &mut data_row).expect("data row");
     // 'D' + length(4) + field_count(2) = idx 7 から cell length(4)。
     let cell_len = i32_at(&data_row, 7) as usize;
     assert_eq!(cell_len, 2);
@@ -196,6 +196,7 @@ fn enum_column_binary_request_is_rejected_as_feature_not_supported() {
 fn computed_column_binary_request_is_rejected_as_feature_not_supported() {
     let columns = vec![ColumnMeta::Computed {
         name: "expr".to_string(),
+        ty: None,
     }];
     let formats = ResultFormats::new(&[1])
         .resolve(columns.len())
@@ -258,6 +259,7 @@ fn no_binary_request_preserves_existing_text_output() {
         },
         ColumnMeta::Computed {
             name: "expr".to_string(),
+            ty: None,
         },
     ];
     let legacy_row_desc = encode_row_description(&columns).expect("legacy row description");
@@ -278,8 +280,9 @@ fn no_binary_request_preserves_existing_text_output() {
             Cell::Bool(true),
         ],
     };
-    let legacy_data_row = encode_data_row(&row).expect("legacy data row");
+    let legacy_data_row = encode_data_row(&columns, &row).expect("legacy data row");
     let mut via_formats_row = Vec::new();
-    encode_data_row_into_with_formats(&row, &formats, &mut via_formats_row).expect("data row");
+    encode_data_row_into_with_formats(&columns, &row, &formats, &mut via_formats_row)
+        .expect("data row");
     assert_eq!(legacy_data_row, via_formats_row);
 }

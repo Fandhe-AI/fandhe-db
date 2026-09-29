@@ -693,7 +693,8 @@ fn explain_still_reports_hnsw_subset_without_touching_new_counters() {
     assert_eq!(
         result.columns,
         vec![ColumnMeta::Computed {
-            name: "QUERY PLAN".to_string()
+            name: "QUERY PLAN".to_string(),
+            ty: Some(engine::catalog::ColumnType::Text),
         }]
     );
     let text: String = result

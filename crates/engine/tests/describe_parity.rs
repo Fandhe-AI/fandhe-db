@@ -161,6 +161,59 @@ fn describe_aggregate_with_group_by_matches_execute() {
     );
 }
 
+/// 型付き集計・式列（Issue #1173）でも Describe と実行の列メタが一致し、
+/// 結果型が入力型から決まること（COUNT→BigInt・MIN(TEXT)→Text・式列→Double・
+/// GROUP BY キー→Text）。
+#[test]
+fn describe_typed_aggregate_and_expression_columns_match_execute() {
+    let path = unique_db_path("describe-typed-agg");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    seed_row(&core, &ctx, 1, "op-seed-0101");
+    seed_row(&core, &ctx, 2, "op-seed-0102");
+
+    for sql in [
+        "SELECT COUNT(*), MIN(body), MAX(lang), SUM(id), AVG(id) FROM documents",
+        "SELECT lang, COUNT(*), MIN(body) FROM documents GROUP BY lang",
+        "SELECT id, vec_norm(embedding) AS n FROM documents LIMIT 5",
+    ] {
+        assert_describe_matches_execute(&core, &ctx, sql);
+    }
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT COUNT(*) AS c, MIN(body) AS b, SUM(id) AS s, AVG(id) AS a FROM documents",
+        )
+        .expect("aggregate should succeed");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected query outcome");
+    };
+    let tys: Vec<_> = result
+        .columns
+        .iter()
+        .map(|c| match c {
+            engine::sql::exec::ColumnMeta::Computed { ty, .. } => ty.clone(),
+            other => panic!("expected Computed, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        tys,
+        vec![
+            Some(ColumnType::BigInt),
+            Some(ColumnType::Text),
+            Some(ColumnType::Numeric {
+                precision: 20,
+                scale: 0
+            }),
+            Some(ColumnType::Double),
+        ]
+    );
+}
+
 /// `EXPLAIN` の実行本体（`run_explain_plan`）は辞書抽出用の `path` 列等、本
 /// ファイルの最小テーブルには無い前提を要求するため、実行結果との突き合わせは
 /// 行わず、`sql::explain::build_explain_result` が常に返す単一列
@@ -183,6 +236,7 @@ fn describe_explain_reports_fixed_query_plan_column() {
         described,
         Some(vec![engine::sql::exec::ColumnMeta::Computed {
             name: "QUERY PLAN".to_string(),
+            ty: Some(engine::catalog::ColumnType::Text),
         }])
     );
 }

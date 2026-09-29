@@ -74,18 +74,22 @@ presence(1) の後に固定長 LE ビット列（Real は 4 バイト、Double �
 
 ### F6: テキスト表現
 
-正準のテキスト表現は各型固有幅の `Display`（最短往復表記・指数表記なし）とし、
-`scalar_float::format_real`／`format_double` として提供する。`f32` は必ず
+`DOUBLE PRECISION` の正準テキスト表現は `f64` の `Display`（最短往復表記・指数表記
+なし）で、`scalar_float::format_double` として提供する。`f32` は必ず
 `f32::from_str` で直接解析する（`f64` を経由すると二重丸めになるため）。
-指数表記を出さないため、既存の字句解析器（`lex_number`）でそのまま再入力できる
-（PostgreSQL 既定出力・float4 の短縮表記・指数表記リテラルの受理は WIRE-13
-（#895）へ申し送り）。
 
-`Cell::Float` への投影は、REAL は f64 への無損失拡大（`f64::from(v: f32)`）、
-DOUBLE はそのまま。REAL の wire テキストは拡大後の f64 の最短表記（例:
-`0.1f32` は `"0.10000000149011612"`）になるが、`f32::from_str` で元のビットに
-戻るため往復は無損失（短くはない）。float4 用の整形（OID 700/701 の RowDescription
-含む）は #895 へ申し送る。
+`REAL` のテキスト表現は Issue #1173（WIRE-13 のポインタ）で PostgreSQL の float4
+出力形式に揃えた（`scalar_float::format_real`）。最短往復桁を使い、十進指数が
+`-4 <= e < 6` なら固定小数、それ以外は `d[.ddd]e±XX`（例: `0.1f32` は `0.1`、
+`1e6` は `1e+06`、`1234567` は `1.234567e+06`）。`Cell::Float` へは
+`f64::from(v: f32)` の無損失拡大で運び、wire-server は `float4` 列（`REAL`・
+`SUM(REAL)`）で f32 へ戻して整形する（f32 で表現できない値は fail-closed）。
+
+指数表記は SQL リテラルの字句解析器（`lex_number`）が受理しないため、SELECT で得た
+大きな／小さな `REAL` 値の文字列をそのまま SQL リテラルへ貼り戻すことはできない。
+一方 `COPY ... FROM STDIN` は `COPY TO` の出力を再投入する往復契約（WIRE-17）のため、
+指数表記を受理する `scalar_float::parse_real_text` を使う（SQL リテラルの
+`parse_real` は従来の閉じた文法のまま）。
 
 ### F7: リテラル文法
 
@@ -146,8 +150,9 @@ Issue #891〜#896 の担当範囲は、本 Issue では振る舞いを追加せ�
 
 以下は本 Issue では実装しない。
 
-- PostgreSQL 既定出力の再現（`1e+20` 形式、float4 の短縮表記）、指数表記
-  リテラルの受理、RowDescription OID 700/701 → #895
+- `DOUBLE PRECISION` 出力の PostgreSQL 形式化（`1e+20` 形式）、SQL リテラルでの
+  指数表記の受理（`REAL` の出力形式化・COPY FROM の指数表記受理は #1173 で対応済み。
+  RowDescription OID 700/701 は #895）
 - 新型の `WHERE` 述語・式評価 → #891
 - 集計 `SUM`/`AVG`/`MIN`/`MAX`/`COUNT` → #892
 - スカラー索引 → #893

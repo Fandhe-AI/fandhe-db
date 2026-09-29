@@ -1007,7 +1007,9 @@ pub(crate) fn execute_scan_with_budget(
                     ty: column.ty.clone(),
                 }
             }
-            ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
+            ProjectedColumn::Computed { name, ty, .. } => {
+                crate::sql::exec::computed_column_meta(name, *ty)
+            }
         });
     }
 
@@ -2464,6 +2466,7 @@ mod tests {
                         f: udf_call::BuiltinFn::VecNorm,
                         args: vec![udf_call::BoundExpr::VectorRef],
                     },
+                    ty: udf_call::ExprType::Scalar,
                 },
             ],
             metadata_filters: Vec::new(),
@@ -2676,6 +2679,7 @@ mod tests {
                 ProjectedColumn::Computed {
                     name: "n".to_string(),
                     expr,
+                    ty: udf_call::ExprType::Scalar,
                 },
             ],
             metadata_filters: Vec::new(),
@@ -2731,6 +2735,7 @@ mod tests {
                 ProjectedColumn::Computed {
                     name: "v".to_string(),
                     expr,
+                    ty: udf_call::ExprType::Vector,
                 },
             ],
             metadata_filters: Vec::new(),

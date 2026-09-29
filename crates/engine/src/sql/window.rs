@@ -1377,8 +1377,10 @@ fn build_result(
     }
     for item in bound.windows() {
         if let Some(slot) = final_columns.get_mut(item.position) {
+            // ウィンドウ関数の結果型は Issue #1173 の対象外（静的型なし＝text）。
             *slot = Some(ColumnMeta::Computed {
                 name: item.name.clone(),
+                ty: None,
             });
         }
     }

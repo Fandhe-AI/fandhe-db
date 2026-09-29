@@ -803,6 +803,36 @@ fn copy_from_stdin_rejects_out_of_range_real_and_malformed_double() {
     assert_eq!(err.wire_code(), "22P02");
 }
 
+/// `REAL` 列の不正トークンは、指数表記を受理する COPY 専用の束縛
+/// （Issue #1173）でも `DOUBLE PRECISION` と同じ `22P02` で拒否する
+/// （INSERT リテラルの `bind_real_literal` とエラー契約を揃える回帰）。
+#[test]
+fn copy_from_stdin_rejects_malformed_real_with_same_code_as_double() {
+    let (core, path) = open_engine_ext("copy-from-ext-bad-real-token");
+    let _guard = CleanupGuard(path);
+
+    for (i, bad) in ["not-a-number", "1e", "1e+", "e5", "--1", "inf"]
+        .iter()
+        .enumerate()
+    {
+        let sql = format!(
+            "COPY {EXT_TABLE} (id, embedding, score) FROM STDIN USING OPERATION_ID 'ext-op-real-bad-{i}'"
+        );
+        let line = format!("{}\t[1.0,0.0]\t{bad}\n", 20 + i);
+        let err = run_copy_from(&core, "acme", &sql, &[line.as_bytes()])
+            .expect_err("malformed REAL token must be rejected");
+        assert_eq!(err.wire_code(), "22P02", "REAL token {bad:?}");
+
+        let sql = format!(
+            "COPY {EXT_TABLE} (id, embedding, weight) FROM STDIN USING OPERATION_ID 'ext-op-dbl-bad-{i}'"
+        );
+        let line = format!("{}\t[1.0,0.0]\t{bad}\n", 40 + i);
+        let err = run_copy_from(&core, "acme", &sql, &[line.as_bytes()])
+            .expect_err("malformed DOUBLE token must be rejected");
+        assert_eq!(err.wire_code(), "22P02", "DOUBLE token {bad:?}");
+    }
+}
+
 /// 指数表記の REAL／DOUBLE 値は受理し、アンダーフロー・オーバーフローは `22003`
 /// のまま拒否する（Issue #1187。PostgreSQL と整合）。
 #[test]
