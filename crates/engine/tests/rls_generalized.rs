@@ -537,7 +537,7 @@ fn udf_reads_only_reach_visible_rows_across_tables_and_sessions() {
                         .expect_err("visible zero-vector row must trigger division by zero");
                     assert_eq!(
                         err.wire_code(),
-                        "22000",
+                        "22012",
                         "table={} tenant={tenant} id={}",
                         t.name,
                         canary.id

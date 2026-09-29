@@ -12,7 +12,8 @@
 //!   `Storage::open` の時間は両側とも計測から除外する（DB ファイルオープンのコストは
 //!   増分・全体再構築の両方に共通で、比較の本質と無関係なため）。
 //! - 共有 CI ランナーのノイズを吸収するため、ウォームアップ 1 回の後、増分・全体再構築を
-//!   各複数回計測し、外れ値に弱い平均ではなく中央値同士で比較する。
+//!   ラウンドごとに交互（ABAB）に複数回計測し、加算的ノイズに強い最小値同士で比較する
+//!   （Issue #1164。判定閾値は据え置き、負荷が片側だけに乗る計測順と推定量のみ改めた）。
 //! - 増分側の各ラウンドは、素の（ウォームアップ未適用の）ベースライン DB ファイルを
 //!   都度複製した上で計測する。1 つの DB に増分をラウンドをまたいで積み上げていくと、
 //!   計測時点の既存行数がラウンドごとに変化してしまい、全ラウンド固定の総行数で
@@ -67,8 +68,8 @@ const BASELINE_ROWS: u64 = 100_000;
 /// 判定閾値に対して現実的なマージンを持たせる）。
 const INCREMENTAL_ROWS: u64 = 400;
 
-/// ノイズ対策として、増分・全体再構築それぞれを複数回計測し中央値を取る回数。
-const MEASUREMENT_ROUNDS: usize = 3;
+/// ノイズ対策として、増分・全体再構築それぞれを複数回計測し最小値を取る回数。
+const MEASUREMENT_ROUNDS: usize = 5;
 
 /// 判定閾値の分母（増分書き込みは全体再構築の `1 / RATIO_THRESHOLD_DENOM` 以下の
 /// 時間で完了すること）。本テストの計測パラメータであり、アサーション弱体化は行わない
@@ -144,10 +145,12 @@ fn borrow_rows(rows: &[OwnedRow]) -> Vec<(u64, RowInput<'_>)> {
         .collect()
 }
 
-/// `values` の中央値を返す（`values` は非空であること、呼び出し側で保証する）。
-fn median(mut values: Vec<Duration>) -> Duration {
-    values.sort();
-    values[values.len() / 2]
+/// 計測値の代表値として最小値を返す（`values` は非空であること、呼び出し側で保証する）。
+/// 負荷ノイズ（CPU 競合・fsync 遅延）は加算的で、試行の過半が汚染されると中央値も
+/// 崩れる。最小値は「本来のコスト」の推定量であり、O(N) の退行は最小値も押し上げるため
+/// 検出力は落ちない（判定閾値は不変。Issue #1164）。
+fn robust_estimate(values: Vec<Duration>) -> Duration {
+    values.into_iter().min().unwrap_or(Duration::ZERO)
 }
 
 // 対象ビヘイビア: PERSIST-2（ポインタ: docs/spec/04-behavior/persistence.md、TASK-143）。
@@ -180,54 +183,55 @@ fn persist2_incremental_write_completes_within_ratio_threshold_of_full_rebuild()
             .expect("warmup incremental batch write");
     }
 
-    // 3. 増分書き込みの所要時間を複数回計測する。各ラウンドは素のベースライン DB
-    //    （行数 = BASELINE_ROWS で固定）を新規ファイルへ複製してから書き込むことで、
-    //    計測時点の既存行数を毎ラウンド BASELINE_ROWS に揃える。これにより増分後の
-    //    総行数（BASELINE_ROWS + INCREMENTAL_ROWS）が、4. の全体再構築側が毎ラウンド
-    //    書き込む総行数と一致し、比較条件がラウンドをまたいでずれない。
+    // 3. 増分書き込みと全体再構築を、ラウンドごとに交互（ABAB）に計測する。
+    //    増分側の各ラウンドは素のベースライン DB（行数 = BASELINE_ROWS で固定）を新規
+    //    ファイルへ複製してから書き込み、計測時点の既存行数を毎ラウンド揃える。これにより
+    //    増分後の総行数（BASELINE_ROWS + INCREMENTAL_ROWS）が全体再構築側の総行数と一致し、
+    //    比較条件がラウンドをまたいでずれない。全体再構築側は毎ラウンド同じ総行数を新規 DB へ
+    //    一括で書き込む。片側の全ラウンドを先に回すと一時的な負荷が片側だけに乗って
+    //    比が歪むため、交互にして負荷変動を両側へ均等に乗せる（Issue #1164）。
     let mut incremental_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
-    for round in 0..MEASUREMENT_ROUNDS as u64 {
-        let round_path = unique_db_path(&format!("incremental-round-{round}"));
-        let _round_cleanup = CleanupGuard(round_path.clone());
-        std::fs::copy(&baseline_path, &round_path).expect("copy pristine baseline for round");
-        let storage = Storage::open(&round_path).expect("open round storage");
-        let rows = make_rows(
-            BASELINE_ROWS,
-            INCREMENTAL_ROWS,
-            0x9e37_79b9u32.wrapping_add(round as u32),
-        );
-        let batch = borrow_rows(&rows);
-
-        let started = Instant::now();
-        storage
-            .put_batch(&batch)
-            .expect("incremental batch write (measured)");
-        incremental_durations.push(started.elapsed());
-    }
-
-    // 4. 全体再構築の所要時間を複数回計測する。毎回、増分後と同じ総行数
-    //    （BASELINE_ROWS + INCREMENTAL_ROWS）を新規 DB へ一括で書き込む。
     let mut full_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
     for round in 0..MEASUREMENT_ROUNDS as u64 {
-        let full_path = unique_db_path(&format!("full-rebuild-{round}"));
-        let _full_cleanup = CleanupGuard(full_path.clone());
-        let storage = Storage::open(&full_path).expect("open full-rebuild storage");
-        let rows = make_rows(
-            0,
-            BASELINE_ROWS + INCREMENTAL_ROWS,
-            0x1357_9bdfu32.wrapping_add(round as u32),
-        );
-        let batch = borrow_rows(&rows);
+        {
+            let round_path = unique_db_path(&format!("incremental-round-{round}"));
+            let _round_cleanup = CleanupGuard(round_path.clone());
+            std::fs::copy(&baseline_path, &round_path).expect("copy pristine baseline for round");
+            let storage = Storage::open(&round_path).expect("open round storage");
+            let rows = make_rows(
+                BASELINE_ROWS,
+                INCREMENTAL_ROWS,
+                0x9e37_79b9u32.wrapping_add(round as u32),
+            );
+            let batch = borrow_rows(&rows);
 
-        let started = Instant::now();
-        storage
-            .put_batch(&batch)
-            .expect("full rebuild batch write (measured)");
-        full_durations.push(started.elapsed());
+            let started = Instant::now();
+            storage
+                .put_batch(&batch)
+                .expect("incremental batch write (measured)");
+            incremental_durations.push(started.elapsed());
+        }
+        {
+            let full_path = unique_db_path(&format!("full-rebuild-{round}"));
+            let _full_cleanup = CleanupGuard(full_path.clone());
+            let storage = Storage::open(&full_path).expect("open full-rebuild storage");
+            let rows = make_rows(
+                0,
+                BASELINE_ROWS + INCREMENTAL_ROWS,
+                0x1357_9bdfu32.wrapping_add(round as u32),
+            );
+            let batch = borrow_rows(&rows);
+
+            let started = Instant::now();
+            storage
+                .put_batch(&batch)
+                .expect("full rebuild batch write (measured)");
+            full_durations.push(started.elapsed());
+        }
     }
 
-    let t_inc = median(incremental_durations);
-    let t_full = median(full_durations);
+    let t_inc = robust_estimate(incremental_durations);
+    let t_full = robust_estimate(full_durations);
     let ratio = t_inc.as_secs_f64() / t_full.as_secs_f64().max(f64::EPSILON);
 
     // プログラム出力文字列は英語規約（CI ログから経年変化を追跡できるようにする）。

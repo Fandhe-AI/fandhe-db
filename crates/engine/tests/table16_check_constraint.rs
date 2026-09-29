@@ -1045,7 +1045,7 @@ fn insert_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_e
             "INSERT INTO docs (id, qty) VALUES (1, 0) USING OPERATION_ID 'op-1'",
         )
         .expect_err("division by zero during CHECK evaluation must fail closed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
     // 副作用ゼロ: 行は書き込まれない。
     assert_eq!(
         select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
@@ -1081,7 +1081,7 @@ fn update_triggering_division_by_zero_in_check_returns_same_sqlstate_as_normal_e
             "UPDATE docs SET qty = 0 WHERE id = 1 USING OPERATION_ID 'op-upd'",
         )
         .expect_err("division by zero during CHECK evaluation must fail closed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
     // 副作用ゼロ: 更新前の値のまま残る。
     assert_eq!(
         select_count(&core, &alice, "SELECT id FROM docs WHERE id = 1 LIMIT 100"),
@@ -1120,7 +1120,7 @@ fn upsert_do_update_triggering_division_by_zero_in_check_returns_same_sqlstate_a
              USING OPERATION_ID 'op-upsert'",
         )
         .expect_err("division by zero during CHECK evaluation must fail closed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
     // 副作用ゼロ: 更新前の値のまま残る。
     assert_eq!(
         select_count(&core, &alice, "SELECT id FROM docs WHERE id = 1 LIMIT 100"),
