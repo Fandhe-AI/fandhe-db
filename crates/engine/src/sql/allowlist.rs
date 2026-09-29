@@ -7907,7 +7907,13 @@ fn is_limited_single_select(inner: &[Token]) -> bool {
                 return false;
             }
             Token::Keyword(Keyword::Limit | Keyword::Order) if depth == 0 => has_tail = true,
-            Token::Ident(name) if depth == 0 && name.eq_ignore_ascii_case("OFFSET") => {
+            // `OFFSET` は非予約語のため、列名・別名としての識別子 `offset` を paging 句と
+            // 誤認しないよう、直後が数値リテラルの場合（`OFFSET m`）のみ paging 句とみなす。
+            Token::Ident(name)
+                if depth == 0
+                    && name.eq_ignore_ascii_case("OFFSET")
+                    && matches!(inner.get(i + 1), Some(Token::Number(_))) =>
+            {
                 has_tail = true;
             }
             _ => {}
@@ -15344,6 +15350,21 @@ mod tests {
         assert!(looks_like_set_operation_of(
             "(SELECT a FROM t) UNION ALL ((SELECT b FROM u))"
         ));
+    }
+
+    /// Issue #1191 レビュー指摘: 非予約語 `offset` を列名・別名に持つ枝は paging 句付きと
+    /// 誤認せず、`OFFSET <数値>` のみを paging 句として扱う。
+    #[test]
+    fn offset_identifier_is_not_treated_as_paging_clause() {
+        let limited = |sql: &str| {
+            let tokens = lexer::tokenize(sql).expect("valid tokens");
+            is_limited_single_select(&tokens)
+        };
+        assert!(!limited("SELECT offset FROM t"));
+        assert!(!limited("SELECT a AS offset FROM t"));
+        assert!(!limited("SELECT a FROM t WHERE offset"));
+        assert!(limited("SELECT a FROM t LIMIT 3 OFFSET 2"));
+        assert!(limited("SELECT a FROM t OFFSET 2"));
     }
 
     // --- CASE／COALESCE／NULLIF 構文（対象ビヘイビア: SQL-26。Issue #921） -----
