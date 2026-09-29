@@ -355,9 +355,17 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
 /// 補助）。括弧の深さ 0 の位置で先頭の `COPY` の後に最初に現れる `TO` なら
 /// `ReadOnly`、それ以外（`FROM`・どちらも無い）は `Write`。
 /// `COPY (SELECT ... FROM t) TO STDOUT` の内側の `FROM` は深さ 1 なので無視する。
+/// `COPY` の直後がテーブル名（`(` 以外）の場合、その 1 トークンは方向語の候補から
+/// 除外する（引用符なしの `to` という名前のテーブルへの `COPY to FROM STDIN` を
+/// 読み取り専用と誤判定しない。誤判定は後続文失敗時の書き込み永続化を招くため、
+/// 曖昧な形は `Write` 側（fail-closed）に倒す）。
 fn classify_copy(tokens: &[Token]) -> StatementEffect {
     let mut depth: usize = 0;
-    for token in tokens.iter().skip(1) {
+    let skip = match tokens.get(1) {
+        Some(Token::Punct('(')) | None => 1,
+        Some(_) => 2,
+    };
+    for token in tokens.iter().skip(skip) {
         match token {
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => depth = depth.saturating_sub(1),
@@ -697,6 +705,19 @@ mod tests {
             StatementEffect::Write
         );
         assert_eq!(classify_statement("COPY t"), StatementEffect::Write);
+        // 引用符なし識別子 `to` をテーブル名に持つ COPY FROM は書き込み扱い。
+        assert_eq!(
+            classify_statement("COPY to FROM STDIN USING OPERATION_ID 'o1'"),
+            StatementEffect::Write
+        );
+        assert_eq!(
+            classify_statement("COPY to (id) FROM STDIN USING OPERATION_ID 'o1'"),
+            StatementEffect::Write
+        );
+        assert_eq!(
+            classify_statement("COPY to TO STDOUT"),
+            StatementEffect::ReadOnly
+        );
     }
 
     #[test]
