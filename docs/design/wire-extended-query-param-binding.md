@@ -222,4 +222,6 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
 - 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`UPDATE ... SET
   col = $n`・`ON CONFLICT ... SET`・hybrid 関数引数・`LIKE $n`）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
-  相当）は wire 側結線後にあわせて追加する。
+  相当）→ **Issue #1176 で実施済み**（`crates/wire-server/tests/
+  three_client_extended_e2e.rs`。`docs/design/three-client-e2e-harness.md`
+  「拡張クエリ・型復元・バイナリ受信」参照）。
