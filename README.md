@@ -74,6 +74,7 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--hnsw-scope all|declared] \
   [--durability immediate|none] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
+  [--batch-max-files <1-1000000>] \
   [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>] \
@@ -253,15 +254,23 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 （`MAX_SCANNED_ROWS`）は変更されないため、計算量 DoS に対する資源上限は
 引き続き機能します。複数行 `VALUES` は本フラグに加えて一括投入の別上限
 （`batch_limits.max_files_per_batch`。既定 64。Issue #860）も通るため、
-64 行を超える単一の複数行 `VALUES` を受理させるには環境変数
-`VECTOR_DB_BATCH_MAX_FILES`（`engine::batch_limits` モジュールドキュメント
-参照）も併せて引き上げる必要があります（`--max-insert-rows` 未指定・既定の
-上限なし構成でも同様です）。`wire-server` は `batch_limits` を設定する専用
-CLI フラグを持たないため（Issue #997 のオーナー承認範囲外）、
-`--max-insert-rows` を明示指定し、その値が `batch_limits.max_files_per_batch`
-（既定値または `VECTOR_DB_BATCH_MAX_FILES` で設定した値）を超える場合、
-起動ログへ `WARNING` 行が 1 行出ます（`--max-insert-rows` 未指定〔既定〕では
-出ません。詳細: `docs/design/predicate-dml-exec.md` §6）。
+64 行を超える単一の複数行 `VALUES` を受理させるには `--batch-max-files`
+（Issue #1166）または環境変数 `VECTOR_DB_BATCH_MAX_FILES` も併せて引き上げる
+必要があります（`--max-insert-rows` 未指定・既定の上限なし構成でも同様です）。
+`--max-insert-rows` を明示指定し、その値が複数行 `VALUES` の実効上限
+（`max_files_per_batch` と `max_batch_chunks`〔既定 4096。環境変数
+`VECTOR_DB_BATCH_MAX_CHUNKS`〕の小さい方）を超える場合、起動ログへ `WARNING`
+行が 1 行出ます（`--max-insert-rows` 未指定〔既定〕では出ません。詳細:
+`docs/design/predicate-dml-exec.md` §6）。
+
+`--batch-max-files <N>`（Issue #1166）は `batch_limits.max_files_per_batch`
+（SQL 複数行 `VALUES`・NoSQL `insert` の `rows[]`・ファイル形バッチ・
+`COPY FROM STDIN` が共有する 1 バッチ件数上限。既定 64）をプロセス全体に対して
+起動時に設定します。優先順位は **CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES`
+> 既定 64** です。指定可能範囲は `1`〜`1,000,000`。範囲外・非数値・値欠落・
+2 回目以降の重複指定は fail-closed で起動エラーです。環境変数側も同じ範囲
+検証を通り、範囲外（上限超過を含む）は既定 64 へ倒れます（従来は 0・非数値のみ
+既定へ倒れ、上限はありませんでした）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
