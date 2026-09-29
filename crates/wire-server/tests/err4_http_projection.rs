@@ -166,8 +166,8 @@ fn new_core_with_foreign_key() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
 }
 
 /// `CHECK` 制約付きテーブル（TABLE-16・TASK-204、Issue #906）を持つスローアウェイ
-/// `EngineCore`。NoSQL 表層の DDL 許可リストに `CHECK` 宣言は無い
-/// （`http::query::ddl::CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`）ため、
+/// `EngineCore`。NoSQL の `create_table` も CHECK を宣言できる（Issue #1199。
+/// 結合テストは `nosql13_ddl.rs`）が、本ファイルでは
 /// `new_core_with_foreign_key` と同じ流儀で SQL 表層からテーブルを作る。
 /// 宣言済みテーブルへの NoSQL `insert` は engine の単一検査点
 /// （`constraint::enforce_row_constraints_in_txn`）を通るため、CHECK 違反
