@@ -1130,6 +1130,11 @@ fn handle_parse_body(
     }
 
     let statement = if msg.query.trim().is_empty() {
+        // 空文はプレースホルダ 0 個なので、型宣言が 1 個でもあれば過剰宣言
+        // （他の 0 プレースホルダ文と同じ契約・fail-closed）。
+        if msg.num_param_types > 0 {
+            return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
+        }
         PreparedStatement::Empty
     } else {
         let prepared = engine

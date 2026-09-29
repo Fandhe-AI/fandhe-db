@@ -322,6 +322,28 @@ fn parse_with_declared_param_types_is_accepted_and_echoed() {
     assert_error_then_recovers(&mut stream, "08P01");
 }
 
+/// 空文の Parse でも、型宣言 1 個以上は過剰宣言として `08P01`（fail-closed）。
+/// 宣言 0 個は従来どおり成功する。
+#[test]
+fn parse_of_empty_query_with_declared_param_types_returns_08p01_and_recovers() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let mut body = parse_body("", "", 1);
+    body.extend_from_slice(&23i32.to_be_bytes());
+    send_length_prefixed_message(&mut stream, b'P', &body);
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("", "", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(
+        kind, b'1',
+        "expected ParseComplete for empty query without types"
+    );
+}
+
 /// 名前付きステートメントの重複 Parse は `08P01` で拒否され、Sync で同期回復する。
 #[test]
 fn duplicate_named_statement_returns_08p01_and_recovers() {
