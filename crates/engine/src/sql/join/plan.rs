@@ -839,19 +839,10 @@ fn build_plain_shape(
             }
         }
         JoinProjection::Columns(colrefs) => {
-            for colref in colrefs {
+            for (i, colref) in colrefs.iter().enumerate() {
                 let c = b.col(colref)?;
-                output.push(OutputColumn {
-                    rel: c.rel,
-                    pos: c.pos,
-                    meta: Binder::meta(&c),
-                });
-            }
-        }
-        JoinProjection::Aliased(items) => {
-            for (colref, alias) in items {
-                let c = b.col(colref)?;
-                let meta = Binder::meta_with_alias(Binder::meta(&c), alias.as_ref());
+                let alias = validated.column_aliases.get(i).and_then(Option::as_ref);
+                let meta = Binder::meta_with_alias(Binder::meta(&c), alias);
                 output.push(OutputColumn {
                     rel: c.rel,
                     pos: c.pos,
@@ -865,9 +856,10 @@ fn build_plain_shape(
         // 非修飾の ORDER BY 対象が SELECT リストの別名に一致するときは、PostgreSQL と
         // 同じく出力列（別名の指す列）を優先する。実在列の同名があっても別名側を採る。
         let target = match (&validated.projection, key.target.qualifier()) {
-            (JoinProjection::Aliased(items), None) => {
-                let mut hits = items
+            (JoinProjection::Columns(colrefs), None) if !validated.column_aliases.is_empty() => {
+                let mut hits = colrefs
                     .iter()
+                    .zip(validated.column_aliases.iter())
                     .filter(|(_, a)| a.as_deref() == Some(key.target.name()));
                 match (hits.next(), hits.next()) {
                     (Some(_), Some(_)) => {

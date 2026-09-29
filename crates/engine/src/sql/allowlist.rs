@@ -1578,9 +1578,6 @@ impl ValidatedBufferedView {
 pub enum JoinProjection {
     All,
     Columns(Vec<ColumnRef>),
-    /// `AS` 別名付きの列参照だけを並べた非集計形（集計項目・`GROUP BY`・`HAVING` なし）。
-    /// 別名は出力列名になる（Issue #1190）。
-    Aliased(Vec<(ColumnRef, Option<String>)>),
 }
 
 /// JOIN の `WHERE` 句が受理する 1 述語の葉（Issue #925 §2.1・Issue #1190）。
@@ -1732,6 +1729,10 @@ pub struct ValidatedJoin {
     /// 結合段（長さは `relations.len() - 1`。k 番目の段が relation k+1 を加える）。
     pub(crate) steps: Vec<JoinStep>,
     pub(crate) projection: JoinProjection,
+    /// 非集計形の `AS` 別名（`projection` が `Columns` のとき列と同じ並び。別名が 1 つも
+    /// 無ければ空）。公開列挙型 `JoinProjection` の variant を増やさないため
+    /// `pub(crate)` で別保持する（Issue #1190）。
+    pub(crate) column_aliases: Vec<Option<String>>,
     /// `WHERE` 句（省略可）の論理木。`Statement`／`ParsedSql` の列挙型サイズを
     /// 抑える（clippy `large_enum_variant` 対応）ため `Box` で保持する。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
@@ -7539,14 +7540,18 @@ const MAX_JOIN_SELECT_ITEMS: usize = 4096;
 /// JOIN の SELECT リスト（Issue #925・#1190）。`*`・列参照の並び（非集計形）、
 /// または集計項目（`COUNT(*)`・`F(colref)`）を 1 つ以上含む並び（集計形）を
 /// 判別する。戻り値の第 2 要素は「項目列をそのまま保持する必要がある」ときの
-/// 項目列（集計項目を含む）。別名だけの列は `JoinProjection::Aliased`、それ以外は
-/// `Columns` で、いずれも `None`。
-fn parse_join_select_list(
-    p: &mut Parser<'_>,
-) -> Result<(JoinProjection, Option<Vec<JoinSelectItem>>), SqlSurfaceError> {
+/// 項目列（集計項目を含む）。非集計形は `Columns` で、第 3 要素に `AS` 別名の並び
+/// （別名なしなら空）を返す。
+type JoinSelectList = (
+    JoinProjection,
+    Option<Vec<JoinSelectItem>>,
+    Vec<Option<String>>,
+);
+
+fn parse_join_select_list(p: &mut Parser<'_>) -> Result<JoinSelectList, SqlSurfaceError> {
     if matches!(p.peek(), Some(Token::Punct('*'))) {
         p.advance();
-        return Ok((JoinProjection::All, None));
+        return Ok((JoinProjection::All, None, Vec::new()));
     }
     let mut items: Vec<JoinSelectItem> = Vec::new();
     let mut has_aggregate = false;
@@ -7584,19 +7589,19 @@ fn parse_join_select_list(
                 "too many aggregate items",
             ));
         }
-        return Ok((JoinProjection::Columns(Vec::new()), Some(items)));
+        return Ok((JoinProjection::Columns(Vec::new()), Some(items), Vec::new()));
     }
     if any_alias {
         // 集計項目を持たない別名付き列は非集計形のまま保持する（`GROUP BY`／`HAVING` の
         // 有無は呼び出し側が判定する）。
-        let cols = items
+        let (cols, aliases): (Vec<ColumnRef>, Vec<Option<String>>) = items
             .into_iter()
             .filter_map(|it| match it {
                 JoinSelectItem::Key { column, alias } => Some((column, alias)),
                 JoinSelectItem::Aggregate { .. } => None,
             })
-            .collect();
-        return Ok((JoinProjection::Aliased(cols), None));
+            .unzip();
+        return Ok((JoinProjection::Columns(cols), None, aliases));
     }
     let cols = items
         .into_iter()
@@ -7605,7 +7610,7 @@ fn parse_join_select_list(
             JoinSelectItem::Aggregate { .. } => None,
         })
         .collect();
-    Ok((JoinProjection::Columns(cols), None))
+    Ok((JoinProjection::Columns(cols), None, Vec::new()))
 }
 
 /// `AS <alias>`（任意）。予約文脈語は別名にできない（`42601`）。
@@ -8022,7 +8027,7 @@ fn parse_join_statement(
 ) -> Result<ValidatedJoin, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_keyword(Keyword::Select)?;
-    let (projection, select_items) = parse_join_select_list(&mut p)?;
+    let (projection, select_items, column_aliases) = parse_join_select_list(&mut p)?;
     p.expect_keyword(Keyword::From)?;
     let first = p.parse_join_relation()?;
     let mut relations = vec![first];
@@ -8069,7 +8074,7 @@ fn parse_join_statement(
     let having = parse_join_having(&mut p)?;
 
     // 集計形かどうか: SELECT リストに集計項目がある、または `GROUP BY`／`HAVING` が
-    // ある。`AS` 付き列だけの並びは非集計形（`JoinProjection::Aliased`）のまま扱う。
+    // ある。`AS` 付き列だけの並びは非集計形（`column_aliases` 付き）のまま扱う。
     let has_group_by = !group_by.is_empty();
     let aggregate = match select_items {
         Some(items) => Some(Box::new(JoinAggregate {
@@ -8081,8 +8086,11 @@ fn parse_join_statement(
             // 集計項目を持たない `GROUP BY`（重複排除相当）。SELECT リストの列参照を
             // キー項目として保持する。
             let cols: Vec<(ColumnRef, Option<String>)> = match &projection {
-                JoinProjection::Columns(cols) => cols.iter().map(|c| (c.clone(), None)).collect(),
-                JoinProjection::Aliased(cols) => cols.clone(),
+                JoinProjection::Columns(cols) => cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.clone(), column_aliases.get(i).cloned().flatten()))
+                    .collect(),
                 JoinProjection::All => {
                     return Err(SqlSurfaceError::unsupported(
                         "SELECT * cannot be combined with GROUP BY in JOIN",
@@ -8150,6 +8158,7 @@ fn parse_join_statement(
         relations,
         steps,
         projection,
+        column_aliases,
         where_clause,
         order_by,
         aggregate,
@@ -15916,7 +15925,8 @@ mod tests {
         match stmt {
             Statement::Join(v) => {
                 assert!(v.aggregate.is_none());
-                assert!(matches!(v.projection, JoinProjection::Aliased(_)));
+                assert!(matches!(v.projection, JoinProjection::Columns(_)));
+                assert_eq!(v.column_aliases, vec![Some("x".to_string())]);
             }
             other => panic!("expected Join, got {other:?}"),
         }
