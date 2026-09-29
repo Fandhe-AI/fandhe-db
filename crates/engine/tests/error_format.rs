@@ -46,7 +46,7 @@ fn err2_all_classes_have_unique_wire_codes_except_shared() {
     // `NotNullViolation` が共有する。共有は許可された組のみで、それ以外の
     // `wire_code` は従来どおり分類ごとに一意でなければならない。
     let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
-    let expected_unique = ErrorClass::ALL.len() - 1; // 23502 の重複ぶんを 1 引く
+    let expected_unique = ErrorClass::ALL.len() - 2; // 23502・23505 の重複ぶんを 1 ずつ引く
     assert_eq!(
         codes.len(),
         expected_unique,
@@ -60,6 +60,18 @@ fn err2_all_classes_have_unique_wire_codes_except_shared() {
         sharing_23502,
         vec![ErrorClass::MissingOperationId, ErrorClass::NotNullViolation],
         "23502 を共有する分類は MissingOperationId・NotNullViolation の 2 つのみ"
+    );
+    let sharing_23505: Vec<ErrorClass> = ErrorClass::ALL
+        .into_iter()
+        .filter(|c| c.wire_code() == "23505")
+        .collect();
+    assert_eq!(
+        sharing_23505,
+        vec![
+            ErrorClass::UniqueViolation,
+            ErrorClass::DuplicateOperationId
+        ],
+        "23505 を共有する分類は UniqueViolation・DuplicateOperationId の 2 つのみ"
     );
 }
 
@@ -95,6 +107,12 @@ fn err2_wire_code_is_deterministic() {
             assert_eq!(
                 ErrorClass::from_wire_code(first),
                 Some(ErrorClass::MissingOperationId)
+            );
+        } else if first == "23505" {
+            // 宣言順で最初の分類（`UniqueViolation`）へ戻る（Issue #1180）。
+            assert_eq!(
+                ErrorClass::from_wire_code(first),
+                Some(ErrorClass::UniqueViolation)
             );
         } else {
             assert_eq!(ErrorClass::from_wire_code(first), Some(class));
@@ -230,6 +248,23 @@ fn err2_duplicate_operation_id_and_id_conflict_share_wire_code_but_not_message()
         TenantWriteError::IdConflict.client_message(),
         TenantWriteError::DuplicateOperationId.client_message()
     );
+    // `code` ラベルは異なる（Issue #1180・ERR-6。RECOVER-12 の判定根拠）。
+    assert_eq!(
+        ClassifiedError::error_class(&SqlSurfaceError::DuplicateOperationId).label(),
+        "DUPLICATE_OPERATION_ID"
+    );
+    assert_eq!(
+        ClassifiedError::error_class(&TenantWriteError::DuplicateOperationId).label(),
+        "DUPLICATE_OPERATION_ID"
+    );
+    for label in [
+        ClassifiedError::error_class(&SqlSurfaceError::IdConflict).label(),
+        ClassifiedError::error_class(&SqlSurfaceError::UniqueViolation).label(),
+        ClassifiedError::error_class(&TenantWriteError::IdConflict).label(),
+        ClassifiedError::error_class(&TenantWriteError::UniqueViolation).label(),
+    ] {
+        assert_eq!(label, "UNIQUE_VIOLATION");
+    }
 }
 
 // --- 分類境界（構文 vs 値 vs テーブル不在。決定的分類の確認） -------------------

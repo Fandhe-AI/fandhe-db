@@ -336,8 +336,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   上記「6. トランザクション内の読み取り」の残る既知の逸脱）。
 - 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
   brute-force）。
-- `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベルを wire 上で
-  区別すること → TASK-227（ERR-6 の横断事項）。
+- `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で
+  engine の `ErrorClass` と HTTP `code` に実装済み（ERR-6）。pg wire の `ErrorResponse` は
+  ERR-1 の既存形式（`S`/`C`/`M`）のままで、固定文言の違いで区別する。
 - 暗黙トランザクション（WIRE-16）による複数文の書き込み位置制約の撤廃は
   **Issue #1175 で実装済み（制約付き）**。`BEGIN` を含まないメッセージのうち書き込みが
   最後以外にある形は、メッセージ全体を 1 つの暗黙トランザクションで原子的に実行する

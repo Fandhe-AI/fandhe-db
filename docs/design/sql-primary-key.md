@@ -156,9 +156,8 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 - `ALTER TABLE ADD/DROP CONSTRAINT`・`ADD PRIMARY KEY`、`ON CONFLICT (<主キー列>)`、
   NoSQL 表層の DDL op。
 - `42703`（未知列）・`42P16`・`2BP01` の `ErrorClass` 追加と SQL 写像。
-- 台帳由来 `23505` のラベル `DUPLICATE_OPERATION_ID` 分離（別 Issue の管轄。現状
-  台帳由来の重複〔`DuplicateOperationId`〕も `ErrorClass::UniqueViolation` 経由で
-  HTTP 応答のラベルが `UNIQUE_VIOLATION` になる）。
+- 台帳由来 `23505` のラベル `DUPLICATE_OPERATION_ID` 分離は Issue #1180 で解消
+  （engine の `ErrorClass`・HTTP `code`。pg wire は ERR-1 の既存形式のまま）。
 - `catalog.rs` の `pub(crate)` 生書き込み API（`insert_row_into_table`・
   `insert_rows_into_table`・`insert_typed_row`。いずれも `#[cfg(test)]` 専用の
   テナント境界チェックなし経路）は主キー検査点を経由しない。これらはテナント

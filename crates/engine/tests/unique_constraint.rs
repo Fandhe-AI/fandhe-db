@@ -11,6 +11,7 @@
 
 use engine::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
@@ -298,6 +299,33 @@ fn ledger_duplicate_operation_id_takes_priority_over_unique_violation() {
         )
         .expect_err("identical resend must be classified as a ledger duplicate (23505)");
     assert_eq!(err.wire_code(), "23505");
+    // `wire_code` は行制約由来と共有するが、`code` は DUPLICATE_OPERATION_ID
+    // （Issue #1180・RECOVER-12・ERR-6。commit 済み確定の根拠は台帳由来のみ）。
+    assert_eq!(
+        ClassifiedError::error_class(&err),
+        ErrorClass::DuplicateOperationId
+    );
+    assert_eq!(
+        ClassifiedError::error_class(&err).label(),
+        "DUPLICATE_OPERATION_ID"
+    );
+
+    // 別 operation_id で値が衝突する場合は行制約由来（UNIQUE_VIOLATION）。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (2, 'x') USING OPERATION_ID 'op-2'",
+        )
+        .expect_err("value conflict with a new operation_id must be a row-constraint violation");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(
+        ClassifiedError::error_class(&err),
+        ErrorClass::UniqueViolation
+    );
+    assert_eq!(
+        ClassifiedError::error_class(&err).label(),
+        "UNIQUE_VIOLATION"
+    );
 }
 
 // --- UPDATE / UPSERT ----------------------------------------------------

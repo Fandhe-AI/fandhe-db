@@ -36,7 +36,7 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::Catalog(_) => ErrorClass::InternalError,
         TenantWriteError::Storage(_) => ErrorClass::InternalError,
         TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
-        TenantWriteError::DuplicateOperationId => ErrorClass::UniqueViolation,
+        TenantWriteError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
         TenantWriteError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
         TenantWriteError::ReturningProjectionFailed(_) => ErrorClass::InternalError,
         TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,

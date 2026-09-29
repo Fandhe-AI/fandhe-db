@@ -80,18 +80,18 @@ macro_rules! define_error_classes {
 /// ラベル（[`ErrorClass::label`]）でのみ区別する。本モジュール下部の
 /// `wire_codes_are_pairwise_distinct_except_shared_wire_codes`
 /// テストがこの集合に載っていない `wire_code` の重複だけを偶発的な乖離として
-/// 検出する（`23505`（`UniqueViolation`）のように単一分類が複数原因を束ねる
-/// 既存パターンとは異なり、`SHARED_WIRE_CODES` は「分類そのものが複数、
-/// `wire_code` のみ共有」のケース専用）。
+/// 検出する。共有は 2 組: `23502`（`MissingOperationId` / `NotNullViolation`）と
+/// `23505`（`UniqueViolation` / `DuplicateOperationId`。台帳由来の重複を行制約
+/// 由来と `code` ラベルで区別する。Issue #1180・RECOVER-12・ERR-6）。
 ///
 /// 本体は `#[cfg(test)]` の単体テストからのみ参照される（`pub(crate)` のため
 /// integration test crate からは到達できない）。通常ビルドでは未参照のため
 /// `dead_code` を明示的に許容する。
 #[allow(dead_code)]
-pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
+pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505"];
 
 define_error_classes! {
-    count = 40;
+    count = 41;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -109,7 +109,7 @@ define_error_classes! {
     /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
     /// の写像。SQL-23・TASK-202・TASK-203（Issue #899・#902）の DDL 実行権限
     /// 不足（[`crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege`]）も
-    /// 同分類へ写像する（`UniqueViolation` が複数原因を束ねているのと同じ運用）。
+    /// 同分類へ写像する（複数原因を 1 分類へ束ねる運用）。
     ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH"),
     /// 参照したテーブルがカタログ未存在（`42P01`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] の写像。
@@ -117,12 +117,20 @@ define_error_classes! {
     /// 指定した行が存在しない（`P0002`）。[`crate::tenant::TenantWriteError::NotFound`]
     /// の写像。
     RowNotFound => ("P0002", "ROW_NOT_FOUND"),
-    /// 一意制約の衝突（`23505`）。行キー `(tenant_id, id)` の衝突
+    /// 行制約由来の一意制約衝突（`23505`）。行キー `(tenant_id, id)` の衝突
     /// （[`crate::tenant::TenantWriteError::IdConflict`]・
-    /// [`crate::sql::allowlist::SqlSurfaceError::IdConflict`]）と、`operation_id` の
-    /// 重複（TASK-93 の台帳）が共通で属する分類。原因を限定した命名にすると
-    /// 別原因の衝突を誤った意味論で運ぶため、`23505` の意味そのもので命名する。
+    /// [`crate::sql::allowlist::SqlSurfaceError::IdConflict`]）と、PRIMARY KEY /
+    /// UNIQUE 制約の違反が属する。台帳由来の重複は
+    /// [`ErrorClass::DuplicateOperationId`] が受け持つ。commit 済みの根拠にはならない。
     UniqueViolation => ("23505", "UNIQUE_VIOLATION"),
+    /// 台帳照合で内容一致と判定された `operation_id` の再送（`23505`）。
+    /// [`crate::tenant::TenantWriteError::DuplicateOperationId`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateOperationId`] の写像。
+    /// `wire_code` は [`ErrorClass::UniqueViolation`] と共有し `code` ラベルでのみ
+    /// 区別する（ERR-6）。接続断からの回復（RECOVER-7・RECOVER-12）でクライアントが
+    /// commit 済みと確定できる根拠はこの分類だけである。内容不一致（`22023`・
+    /// [`ErrorClass::OperationIdContentMismatch`]）とは別。
+    DuplicateOperationId => ("23505", "DUPLICATE_OPERATION_ID"),
     /// `USING OPERATION_ID` 句の省略（`23502`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::MissingOperationId`]・
     /// [`crate::tenant::TenantWriteError::MissingOperationId`] の写像。
@@ -292,9 +300,10 @@ impl ErrorClass {
     /// `wire_code` からの逆引き。未知のコードは `None`（fail-closed。呼び出し元が
     /// 未知コードを既定分類へ丸めて誤った意味論を持たせることを防ぐ）。
     ///
-    /// [`SHARED_WIRE_CODES`] に載る `wire_code`（現状 `23502` のみ）は複数分類が
+    /// [`SHARED_WIRE_CODES`] に載る `wire_code`（`23502`・`23505`）は複数分類が
     /// 共有するため、本関数は [`ErrorClass::ALL`] の宣言順で最初に一致した分類
-    /// （`23502` の場合は [`ErrorClass::MissingOperationId`]）を返す。この関数は
+    /// （`23502` は [`ErrorClass::MissingOperationId`]、`23505` は
+    /// [`ErrorClass::UniqueViolation`]）を返す。この関数は
     /// HTTP ステータス射影の往復確認（同じ `wire_code` は同じステータスへ写像
     /// される）にのみ使われ、応答本文の `code` ラベルは各エラー型の
     /// `error_class()` が直接返す分類から得るため、共有コードの逆引きが

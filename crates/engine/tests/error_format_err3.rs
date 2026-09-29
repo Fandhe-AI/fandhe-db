@@ -108,6 +108,16 @@ fn err3_content_mismatch_wire_code_is_exclusive_to_its_own_class() {
         ErrorClass::UniqueViolation,
         "SqlSurfaceError::OperationIdContentMismatch は UniqueViolation へ誤写像してはならない"
     );
+    assert_ne!(
+        ClassifiedError::error_class(&sql_err),
+        ErrorClass::DuplicateOperationId,
+        "SqlSurfaceError::OperationIdContentMismatch は DuplicateOperationId（commit 済み確定の根拠）へ誤写像してはならない"
+    );
+    assert_ne!(
+        ClassifiedError::error_class(&TenantWriteError::OperationIdContentMismatch),
+        ErrorClass::DuplicateOperationId,
+        "TenantWriteError::OperationIdContentMismatch も DuplicateOperationId へ誤写像してはならない"
+    );
 }
 
 // --- (c) 重畳条件下の優先順位: 内容不一致の再送が、行 id 衝突（23505 の発生条件）も

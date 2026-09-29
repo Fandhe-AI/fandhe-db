@@ -297,7 +297,8 @@ pub enum TenantWriteError {
     /// 台帳（TASK-93）に記録済みの `operation_id` へ、**内容が一致する**書き込みが
     /// 再送された（TASK-101・対象ビヘイビア: RECOVER-10。TASK-94・RECOVER-3 の
     /// 重複拒否契約を包含する）。commit 済み確定の根拠として扱ってよく、`23505`
-    /// （`UniqueViolation` と同じ分類。error_format.rs のコメント参照）へ写像する。
+    /// （`wire_code` は `UniqueViolation` と共有し、分類は `ErrorClass::DuplicateOperationId`。
+    /// Issue #1180・ERR-6）へ写像する。
     /// 行キー衝突（[`TenantWriteError::IdConflict`]）とは別 variant にすることで、
     /// クライアントが「先行実行が commit 済み」（RECOVER-7 が使う判定）を行キー衝突と
     /// 取り違えない固定文言を返せるようにする。
@@ -349,7 +350,7 @@ pub enum TenantWriteError {
     /// （`constraint::enforce_unique_keys_in_txn`）。
     /// 行キー衝突（[`TenantWriteError::IdConflict`]。物理キー `(tenant_id, id)`
     /// の衝突）とは原因が異なる別 variant だが、`ErrorClass::UniqueViolation`
-    /// （`23505`）は共有する。`Display`／`Debug` はいずれもキー値・行 id・
+    /// （`23505`）は共有する（台帳由来は `ErrorClass::DuplicateOperationId`）。`Display`／`Debug` はいずれもキー値・行 id・
     /// テナント名・テーブル名を含まない固定文言（security.md P0「エラー・ログ
     /// 経由で他テナントのデータ・存在情報を漏らさない」）。
     UniqueViolation,
@@ -512,7 +513,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
             TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
-            TenantWriteError::DuplicateOperationId => ErrorClass::UniqueViolation,
+            TenantWriteError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
             TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
             TenantWriteError::Catalog(_)
             | TenantWriteError::Storage(_)

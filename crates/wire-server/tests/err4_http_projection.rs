@@ -352,13 +352,22 @@ const EXPECTED_STATUS: [(&str, u16); 39] = [
 /// とも一致・`code` ラベルが分類と一致・`message` が非空・トップレベル
 /// `error` オブジェクトに `data` キーが無いことを固定する。
 fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
+    let class = ErrorClass::from_wire_code(expected_wire_code)
+        .unwrap_or_else(|| panic!("wire_code {expected_wire_code:?} must be a known ErrorClass"));
+    assert_projected_as(resp, class);
+}
+
+/// [`assert_projected`] の分類指定版。`wire_code` を共有する分類（`23505` の
+/// `DuplicateOperationId` / `UniqueViolation` 等）は逆引きで一意に決まらないため、
+/// 期待分類から `wire_code` と `code` ラベルを直接照合する。
+fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
+    let expected_wire_code = expected_class.wire_code();
     let wire_code = http_common::wire_code_of(resp);
     assert_eq!(
         wire_code, expected_wire_code,
         "unexpected wire_code (resp={resp:?})"
     );
-    let class = ErrorClass::from_wire_code(&wire_code)
-        .unwrap_or_else(|| panic!("wire_code {wire_code:?} must be a known ErrorClass"));
+    let class = expected_class;
     assert_eq!(
         resp.status,
         http_status(class),
@@ -403,20 +412,26 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 40);
+const _: () = assert!(ErrorClass::ALL.len() == 41);
 
-/// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
+/// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
+/// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
 /// 「`wire_code` からの厳密往復」を免除する（`EXPECTED_STATUS` は wire_code
-/// 単位の一意テーブルのままで、共有側はどちらも同じステータス 400 のため
-/// テーブル自体は増やさない）。
-const SHARED_23502_CLASSES: [ErrorClass; 2] =
-    [ErrorClass::MissingOperationId, ErrorClass::NotNullViolation];
+/// 単位の一意テーブルのままで、共有側は同じステータスのためテーブル自体は
+/// 増やさない）。
+const SHARED_WIRE_CODE_CLASSES: [(ErrorClass, ErrorClass); 2] = [
+    (ErrorClass::NotNullViolation, ErrorClass::MissingOperationId),
+    (
+        ErrorClass::DuplicateOperationId,
+        ErrorClass::UniqueViolation,
+    ),
+];
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {
-    // `EXPECTED_STATUS` は一意な `wire_code` 単位の期待表。`23502` は 2 分類が
-    // 共有するため、一意な `wire_code` の数は `ErrorClass::ALL` より 1 小さい。
+    // `EXPECTED_STATUS` は一意な `wire_code` 単位の期待表。`23502`・`23505` は各 2 分類が
+    // 共有するため、一意な `wire_code` の数は `ErrorClass::ALL` より 2 小さい。
     let unique_wire_codes: std::collections::HashSet<&str> =
         ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
     assert_eq!(EXPECTED_STATUS.len(), unique_wire_codes.len());
@@ -433,10 +448,10 @@ fn err4_projection_table_is_closed_over_all_error_classes() {
         );
         let round_tripped = ErrorClass::from_wire_code(wire_code)
             .unwrap_or_else(|| panic!("{wire_code:?} must round-trip via from_wire_code"));
-        if SHARED_23502_CLASSES.contains(&class) {
-            // 共有 wire_code の逆引きは宣言順で最初の分類（MissingOperationId）
-            // へ固定的に戻る契約（`ErrorClass::from_wire_code` の doc 参照）。
-            assert_eq!(round_tripped, ErrorClass::MissingOperationId);
+        if let Some((_, first)) = SHARED_WIRE_CODE_CLASSES.iter().find(|(c, _)| *c == class) {
+            // 共有 wire_code の逆引きは宣言順で最初の分類へ固定的に戻る契約
+            // （`ErrorClass::from_wire_code` の doc 参照）。
+            assert_eq!(round_tripped, *first);
         } else {
             assert_eq!(round_tripped, class);
         }
@@ -691,9 +706,25 @@ fn err4_f_duplicate_operation_id_projects_23505_to_409() {
     let resp = query_as_alice(addr, body);
     assert_eq!(resp.status, 200, "first insert must succeed: {resp:?}");
 
-    // 同一 operation_id・同一内容での再送。
+    // 同一 operation_id・同一内容での再送（台帳由来。code は DUPLICATE_OPERATION_ID）。
     let resp = query_as_alice(addr, body);
-    assert_projected(&resp, "23505");
+    assert_projected_as(&resp, ErrorClass::DuplicateOperationId);
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+#[test]
+fn err4_f_row_id_conflict_projects_unique_violation_to_409() {
+    let (core, _guard) = new_core();
+    let addr = spawn(core);
+
+    let first = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"lang":"ja","path":"docs/1.md","body":"alpha content"}],"operation_id":"err4-op-f-row-a"}"#;
+    let resp = query_as_alice(addr, first);
+    assert_eq!(resp.status, 200, "first insert must succeed: {resp:?}");
+
+    // 同じ id・別 operation_id（行制約由来。code は UNIQUE_VIOLATION のまま）。
+    let second = br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2],"lang":"ja","path":"docs/1.md","body":"alpha content"}],"operation_id":"err4-op-f-row-b"}"#;
+    let resp = query_as_alice(addr, second);
+    assert_projected_as(&resp, ErrorClass::UniqueViolation);
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 

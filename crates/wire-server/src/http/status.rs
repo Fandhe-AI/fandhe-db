@@ -43,7 +43,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 「対象の状態と矛盾する」意味論のため、同じ 409 とする（ERR-6）。
         // `ForeignKeyViolation`（`23503`。TABLE-17・TASK-205、Issue #907）も同じ
         // 意味論（参照整合性と矛盾する書き込み）のため 409 とする（ERR-6）。
+        // `DuplicateOperationId`（`23505`。Issue #1180・ERR-6）は `UniqueViolation` と
+        // `wire_code` を共有し、`code` ラベルでのみ区別するため 409 のまま。
         ErrorClass::UniqueViolation
+        | ErrorClass::DuplicateOperationId
         | ErrorClass::DuplicateTable
         | ErrorClass::CheckViolation
         | ErrorClass::ForeignKeyViolation => 409,
@@ -128,7 +131,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 40] = [
+    const EXPECTED: [(ErrorClass, u16); 41] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -136,6 +139,7 @@ mod tests {
         (ErrorClass::TableNotFound, 404),
         (ErrorClass::RowNotFound, 404),
         (ErrorClass::UniqueViolation, 409),
+        (ErrorClass::DuplicateOperationId, 409),
         (ErrorClass::MissingOperationId, 400),
         (ErrorClass::PayloadTooLarge, 413),
         (ErrorClass::ConnectionLimitExceeded, 503),

@@ -135,9 +135,10 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
 
 本構文で `23505` が返るのは**台帳由来（`DuplicateOperationId`）のみ**。行制約由来
 （`TenantWriteError::IdConflict`）は上記の衝突判定スコープにより構造的に到達しない。
-両者は `SqlSurfaceError` の**variant**で区別する（`error_format.rs` は現状 `23505` の
-`code` ラベルを `DuplicateOperationId`／`IdConflict` で共有しており分離していない。
-ラベル分離は RECOVER-12・別 Issue の担当で本 Issue では変更しない）。
+両者は `SqlSurfaceError` の**variant**で区別する（`error_format.rs` は Issue #1180 で
+`23505` の `code` ラベルを分離済み。台帳由来は `ErrorClass::DuplicateOperationId`
+（`DUPLICATE_OPERATION_ID`）、行制約由来は `UniqueViolation`（`UNIQUE_VIOLATION`）。
+ERR-6・RECOVER-12・TASK-227）。
 
 `crates/engine/tests/sql_upsert.rs::same_tenant_conflict_never_returns_row_constraint_id_conflict`
 が、同一衝突が通常 `INSERT` では `23505`（行制約由来）、UPSERT（`DO NOTHING`）では
@@ -224,8 +225,8 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   （「ON CONFLICT 対象の UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を
   対象にすること・`ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の
   `ON CONFLICT` は引き続き対象外（`42601`）。
-- `23505` の `code` ラベル分離（`DUPLICATE_OPERATION_ID` vs `UNIQUE_VIOLATION`。
-  RECOVER-12・別 Issue）。
+- `23505` の `code` ラベル分離（`DUPLICATE_OPERATION_ID` vs `UNIQUE_VIOLATION`）は
+  Issue #1180 で実装済み。
 - NoSQL 表層の UPSERT（`on_conflict` キーの規範化）。
 - 3 クライアント統合ハーネス（層 B）への UPSERT ケース追加（層 A で契約を固定済み。
   層 B への追加は別 Issue の担当範囲）。
