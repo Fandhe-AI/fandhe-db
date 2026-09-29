@@ -378,7 +378,8 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
   まま。
 - （`WHERE` の等価・`IN`・`IS [NOT] NULL` は Issue #1193 で受理へ変更した。
   `docs/design/array-column-type.md`「Issue #1193 追記」参照。以下の残りは不変）
-  `WHERE` 述語・スカラー二次索引・UDF/式評価・hybrid 本文列・`USING PLAN`・
+  上記以外の `WHERE` 述語（範囲・`LIKE`・パス演算子等）・スカラー二次索引・
+  UDF/式評価・hybrid 本文列・`USING PLAN`・
   scoring_boost・バイナリ結果形式（WIRE-14）への `JSON`/`JSONB` 列の露出は
   すべて BYTEA と同じ既存拒否パターンを踏襲し `22000`／`0A000` で拒否する
   （二次索引は等価・前方一致・範囲いずれの述語も持たない型として索引対象外
