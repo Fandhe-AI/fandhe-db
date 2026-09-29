@@ -484,10 +484,12 @@ pub(crate) fn classify_aggregate_access(
         // 単一キー専用のため）。ここも同じ `key_count == 1` ゲートを掛けないと
         // 複数列 `GROUP BY` で `access_path: full_scan`（実行時の実態）と
         // 異なる索引経路を EXPLAIN が返す D5 矛盾出力になる。
+        // Issue #1185: 単一 `TEXT` キー以外（非 `TEXT` キー・疑似列 `id` を含む）も
+        // 全走査になるため、実行器と同じ判定関数を共有する。
         let single_key_group_by = bound
             .group_by
             .as_ref()
-            .is_some_and(|g| g.column_indices.len() == 1);
+            .is_some_and(|g| crate::sql::group_by::single_text_key_column(g).is_some());
         let text_min_max_blocks = crate::sql::group_by::has_text_min_max_aggregate(bound.items());
         // Issue #1153: `ScalarIndexGroupEnumeration`（列挙形）は
         // `ScalarIndex::column_groups(key_index)` を直接照会する。宣言で
@@ -500,8 +502,8 @@ pub(crate) fn classify_aggregate_access(
             && bound
                 .group_by
                 .as_ref()
-                .and_then(|g| g.column_indices.first())
-                .and_then(|&idx| schema.columns.get(idx))
+                .and_then(crate::sql::group_by::single_text_key_column)
+                .and_then(|idx| schema.columns.get(idx))
                 .is_some_and(|column| match target {
                     Err(()) => false,
                     Ok(t) => t.includes(&column.name),

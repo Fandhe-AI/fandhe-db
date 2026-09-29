@@ -6,12 +6,13 @@
 //! 上限判定・commit はすべて `engine::sql::copy`（`EngineCore::begin_copy`／
 //! `commit_copy_in`）へ委譲する（第 2 の書き込み経路を作らない設計）。
 //!
-//! 呼び出し文脈: `handshake::post_auth_loop` の 'Q' 分岐が、UTF-8 検証済みの
-//! クエリテキストへ `engine::sql::copy::is_copy_statement` を適用して真なら
-//! ここへ委譲する。本モジュールは COPY サブプロトコルの開始（CopyInResponse／
-//! CopyOutResponse）から終了（`CommandComplete`＋`ReadyForQuery`）までを
-//! 1 回の呼び出しで完結させる（`simple_query::execute_and_respond` と同じ
-//! 「1 回の呼び出しで応答を書き切る」契約）。
+//! 呼び出し文脈: `simple_query::run_copy_statement` が、分割済みの 1 文へ
+//! `engine::sql::copy::is_copy_statement` を適用して真なら（セッションが `Idle` の
+//! ときに）ここへ委譲する（Issue #1175: 複数文メッセージの 2 文目以降の COPY も
+//! 文単位で扱う）。本モジュールは COPY サブプロトコルの開始（CopyInResponse／
+//! CopyOutResponse）から終了（`CommandComplete`。`Finish::ReadyForQuery` のときは
+//! `ReadyForQuery` も）までを 1 回の呼び出しで完結させる
+//! （`simple_query::run_statement` と同じ「1 文の応答を書き切る」契約）。
 //!
 //! **PostgreSQL 本家との既知の相違点**（`docs/design/wire-copy-protocol.md`
 //! 参照）: protocol v3 の COPY は CopyDone（'c'）で終端を表現するため、
@@ -36,6 +37,7 @@ use engine::sql::mode::SessionState;
 
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
+use crate::simple_query::Finish;
 use crate::wire_stream::WireStream;
 
 /// [`FrameError`] を `io::Result` の失敗へ変換する。`Truncated`（相手が既に
@@ -298,7 +300,8 @@ fn run_copy_to<S: WireStream>(
     stream: &mut S,
     format: CopyFormat,
     result: &QueryResult,
-) -> io::Result<()> {
+    finish: Finish,
+) -> io::Result<CopyStep> {
     let response = match encode_copy_response(b'H', result.columns.len()) {
         Ok(b) => b,
         Err(()) => {
@@ -307,6 +310,7 @@ fn run_copy_to<S: WireStream>(
                 ErrorClass::InternalError,
                 "failed to encode CopyOutResponse",
             )
+            .map(|()| CopyStep::Failed)
         }
     };
 
@@ -328,7 +332,8 @@ fn run_copy_to<S: WireStream>(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode CopyData",
-            );
+            )
+            .map(|()| CopyStep::Failed);
         }
         if buffer.len() >= crate::limits::MAX_RESPONSE_BUFFER_BYTES {
             buffer.flush(stream)?;
@@ -340,13 +345,16 @@ fn run_copy_to<S: WireStream>(
     match result_encoder::encode_command_complete(&tag) {
         Ok(msg) => {
             buffer.push_frame(stream, &msg)?;
-            buffer.push_frame(
-                stream,
-                &result_encoder::encode_ready_for_query(
-                    engine::sql::transaction::TransactionStatus::Idle,
-                ),
-            )?;
-            buffer.flush(stream)
+            if finish == Finish::ReadyForQuery {
+                buffer.push_frame(
+                    stream,
+                    &result_encoder::encode_ready_for_query(
+                        engine::sql::transaction::TransactionStatus::Idle,
+                    ),
+                )?;
+            }
+            buffer.flush(stream)?;
+            Ok(CopyStep::Completed)
         }
         Err(_) => {
             buffer.flush(stream)?;
@@ -355,6 +363,7 @@ fn run_copy_to<S: WireStream>(
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
             )
+            .map(|()| CopyStep::Failed)
         }
     }
 }
@@ -382,7 +391,8 @@ fn run_copy_from<S: WireStream>(
     engine: &EngineCore,
     ctx: &PolicyContext,
     mut session: CopyInSession,
-) -> io::Result<crate::extended_query::LoopSignal> {
+    finish: Finish,
+) -> io::Result<CopyStep> {
     let response = match encode_copy_response(b'G', session.column_count()) {
         Ok(b) => b,
         Err(()) => {
@@ -391,7 +401,7 @@ fn run_copy_from<S: WireStream>(
                 ErrorClass::InternalError,
                 "failed to encode CopyInResponse",
             )
-            .map(|()| crate::extended_query::LoopSignal::Continue)
+            .map(|()| CopyStep::Failed)
         }
     };
     stream.write_all(&response)?;
@@ -403,7 +413,7 @@ fn run_copy_from<S: WireStream>(
     loop {
         let type_byte = match framing::read_typed_frame_header(stream) {
             Ok(Some(b)) => b,
-            Ok(None) => return Ok(crate::extended_query::LoopSignal::Closed),
+            Ok(None) => return Ok(CopyStep::Closed),
             Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
         };
         match type_byte {
@@ -446,8 +456,7 @@ fn run_copy_from<S: WireStream>(
             b'c' => {
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return finish_copy_from(stream, engine, ctx, session, errored)
-                    .map(|()| crate::extended_query::LoopSignal::Continue);
+                return finish_copy_from(stream, engine, ctx, session, errored, finish);
             }
             b'f' => {
                 let body = framing::read_length_prefixed_body(
@@ -489,7 +498,7 @@ fn run_copy_from<S: WireStream>(
                     ErrorClass::InvalidInput,
                     "COPY failed on the client side",
                 )
-                .map(|()| crate::extended_query::LoopSignal::Continue);
+                .map(|()| CopyStep::Failed);
             }
             b'H' | b'S' => {
                 // Flush('H')／Sync('S') は PostgreSQL wire v3 上 length=4
@@ -527,7 +536,7 @@ fn run_copy_from<S: WireStream>(
                 // 伝播する（上記関数ドキュメント参照）。
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return Ok(crate::extended_query::LoopSignal::Closed);
+                return Ok(CopyStep::Closed);
             }
             _ => {
                 let _ = framing::validate_typed_message_length_prefix(
@@ -561,14 +570,15 @@ fn finish_copy_from<S: WireStream>(
     ctx: &PolicyContext,
     session: CopyInSession,
     errored: Option<SqlSurfaceError>,
-) -> io::Result<()> {
+    finish: Finish,
+) -> io::Result<CopyStep> {
     if let Some(e) = errored {
-        return respond_sql_error(stream, &e);
+        return respond_sql_error(stream, &e).map(|()| CopyStep::Failed);
     }
 
     let batch = match session.finish() {
         Ok(b) => b,
-        Err(e) => return respond_sql_error(stream, &e),
+        Err(e) => return respond_sql_error(stream, &e).map(|()| CopyStep::Failed),
     };
 
     let outcome = {
@@ -584,52 +594,72 @@ fn finish_copy_from<S: WireStream>(
             )) {
                 Ok(msg) => {
                     stream.write_all(&msg)?;
-                    crate::handshake::write_ready_for_query_io(
-                        stream,
-                        engine::sql::transaction::TransactionStatus::Idle,
-                    )
+                    if finish == Finish::ReadyForQuery {
+                        crate::handshake::write_ready_for_query_io(
+                            stream,
+                            engine::sql::transaction::TransactionStatus::Idle,
+                        )?;
+                    }
+                    Ok(CopyStep::Completed)
                 }
                 Err(_) => respond_error_and_ready(
                     stream,
                     ErrorClass::InternalError,
                     "failed to encode command complete response",
-                ),
+                )
+                .map(|()| CopyStep::Failed),
             }
         }
-        Err(e) => respond_sql_error(stream, &e),
+        Err(e) => respond_sql_error(stream, &e).map(|()| CopyStep::Failed),
     }
 }
 
-/// `handshake::post_auth_loop` の 'Q' 分岐から、`engine::sql::copy::
-/// is_copy_statement(text)` が真の場合にのみ呼ばれる唯一の入口。
+/// COPY 1 文の実行結果（Issue #1175）。`simple_query::run_copy_statement` が、
+/// 複数文メッセージの続きの文へ進むか・打ち切るか・接続を閉じるかを判定するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyStep {
+    /// `CommandComplete "COPY n"`（と `finish` に応じた `ReadyForQuery`）を書き終えた。
+    Completed,
+    /// ErrorResponse＋`ReadyForQuery` を書き終えた。呼び出し元は以降の文を実行しない。
+    Failed,
+    /// Terminate（'X'）受信・早期 EOF。呼び出し元は接続ループを終了させる。
+    Closed,
+}
+
+/// `simple_query::run_copy_statement` から、`engine::sql::copy::
+/// is_copy_statement(stmt)` が真の 1 文について、セッションが `Idle` のときにだけ
+/// 呼ばれる唯一の入口（`handshake::post_auth_loop` の 'Q' 分岐は `simple_query::
+/// execute_and_respond` へ一本化した。Issue #1175）。
 /// `EngineCore::begin_copy` の構造検証・`operation_id` 必須化ガード・
 /// テーブル解決がここで失敗した場合は CopyIn／CopyOutResponse を一切送らずに
 /// 通常の ErrorResponse＋ReadyForQuery を返す（PostgreSQL 互換: CopyIn/Out
 /// サブプロトコルへ入ってしまってからの構文エラーは無い）。
 ///
-/// 戻り値は `handshake::post_auth_loop` の 'Q' 分岐が Parse／Describe
-/// （'P'／'D'）と同じ作法で判定する [`crate::extended_query::LoopSignal`]。
-/// `run_copy_from` が Terminate（'X'）受信を `Closed` として返してきた場合、
-/// 呼び出し元はここで新たに応答を送らずそのまま伝播し、接続ループを
-/// 終了させる（[`run_copy_from`] のドキュメント参照）。
+/// `finish` が [`Finish::Continue`] のときは、成功時の `CommandComplete "COPY n"` の
+/// 後に `ReadyForQuery` を送らず、複数文メッセージの次の文へ制御を返す
+/// （エラー経路は常に ErrorResponse＋`ReadyForQuery`）。
+///
+/// 戻り値 [`CopyStep::Closed`] は `run_copy_from` が Terminate（'X'）受信を
+/// 返してきた場合で、呼び出し元はそのまま伝播して接続ループを終了させる
+/// （[`run_copy_from`] のドキュメント参照）。
 pub(crate) fn run<S: WireStream>(
     stream: &mut S,
     engine: &EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
     sql: &str,
-) -> io::Result<crate::extended_query::LoopSignal> {
+    finish: Finish,
+) -> io::Result<CopyStep> {
     // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
     // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
     match engine.begin_copy(ctx, session, sql) {
-        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result)
-            .map(|()| crate::extended_query::LoopSignal::Continue),
-        Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, copy_session),
-        Err(e) => {
-            respond_sql_error(stream, &e).map(|()| crate::extended_query::LoopSignal::Continue)
+        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result, finish),
+        Ok(CopyPlan::From(copy_session)) => {
+            run_copy_from(stream, engine, ctx, copy_session, finish)
         }
+        Err(e) => respond_sql_error(stream, &e).map(|()| CopyStep::Failed),
     }
 }
 

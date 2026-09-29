@@ -537,8 +537,9 @@ fn execute_aggregate_dispatches_new_grouped_plan_without_caches() {
     assert_eq!(result.rows[1].cells[1], Cell::Integer(3));
 }
 
-/// `GROUP BY` 列が `TEXT` 列でない（`VECTOR`・疑似列 `id`・未知列）場合は
-/// `22000` で拒否する（SQL テキスト経由の `bind_group_by_clause` と同じ分類）。
+/// `GROUP BY` 列が並べ替え不能な型（`VECTOR`）・未知列の場合は `22000` で拒否する
+/// （SQL テキスト経由の `bind_group_by_clause` と同じ分類。Issue #1185・SQL-25 (d)
+/// で `TEXT` 限定を外したため、疑似列 `id` は受理側へ契約改訂した）。
 #[test]
 fn bound_aggregate_new_grouped_rejects_non_text_group_by_column() {
     let schema_val = schema();
@@ -547,7 +548,7 @@ fn bound_aggregate_new_grouped_rejects_non_text_group_by_column() {
             BoundAggregateItem::bind(AggregateFunc::Count, AggregateTarget::Star, &schema_val)
                 .expect("count(*) should bind"),
         ];
-    for column in ["embedding", "id", "nope"] {
+    for column in ["embedding", "nope"] {
         let err = BoundAggregate::new_grouped(
             TABLE.to_string(),
             items.clone(),
@@ -560,6 +561,17 @@ fn bound_aggregate_new_grouped_rejects_non_text_group_by_column() {
         .expect_err("non-TEXT group by column must be rejected");
         assert_eq!(err.wire_code(), "22000", "column={column}");
     }
+    // Issue #1185: 疑似列 `id` はグループキーとして受理される。
+    BoundAggregate::new_grouped(
+        TABLE.to_string(),
+        items,
+        Vec::new(),
+        Vec::new(),
+        "id",
+        Vec::new(),
+        &schema_val,
+    )
+    .expect("id pseudo-column group by key is accepted since Issue #1185");
 }
 
 /// `HAVING` が `MIN`/`MAX(<TEXT 列>)` を参照すると `22000`（`COUNT(<TEXT 列>)`

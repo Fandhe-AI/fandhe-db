@@ -474,7 +474,7 @@ fn udf_defined_in_one_session_is_not_visible_from_another_session() {
             "SELECT only_in_a(embedding) FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1",
         )
         .expect_err("session B must not see session A's UDF");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 #[test]
@@ -490,7 +490,7 @@ fn create_function_is_rejected_on_the_sessionless_entry_point() {
 // --- 拒否経路（wire_code の決定性） -------------------------------------------------
 
 #[test]
-fn unknown_function_call_is_rejected_with_22000() {
+fn unknown_function_call_is_rejected_with_42883() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -503,12 +503,12 @@ fn unknown_function_call_is_rejected_with_22000() {
         .execute_sql_in_session(&ctx, &mut session, sql)
         .expect_err("unknown function must be rejected deterministically")
         .wire_code();
-    assert_eq!(first, "22000");
+    assert_eq!(first, "42883");
     assert_eq!(first, second);
 }
 
 #[test]
-fn where_comparison_between_a_vector_and_a_scalar_is_rejected_with_22000() {
+fn where_comparison_between_a_vector_and_a_scalar_is_rejected_with_42804() {
     // `<expr> <cmp> <expr>` の両辺は `Scalar` でなければならない（束縛段の型検査）。
     // `embedding`（`Vector`）を直接比較に使うと `22000` で拒否される。
     let (core, _guard) = new_core_with_docs();
@@ -521,7 +521,7 @@ fn where_comparison_between_a_vector_and_a_scalar_is_rejected_with_22000() {
             "SELECT id FROM docs WHERE embedding > 2.0 ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
         .expect_err("comparing a vector to a scalar must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 }
 
 #[test]
@@ -543,7 +543,7 @@ fn where_clause_without_a_comparison_operator_is_a_syntax_error() {
 }
 
 #[test]
-fn text_column_reference_in_expression_is_rejected_with_22000() {
+fn text_column_reference_in_expression_is_rejected_with_42804() {
     let path = unique_db_path("text-col");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -566,7 +566,7 @@ fn text_column_reference_in_expression_is_rejected_with_22000() {
             "SELECT vec_norm(label) FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
         )
         .expect_err("TEXT column reference in an expression must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 }
 
 #[test]
@@ -662,7 +662,7 @@ fn constant_subexpression_error_still_fails_a_query_with_a_visible_row() {
 }
 
 #[test]
-fn redefining_a_function_in_the_same_session_is_rejected_with_22000() {
+fn redefining_a_function_in_the_same_session_is_rejected_with_42723() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -671,11 +671,11 @@ fn redefining_a_function_in_the_same_session_is_rejected_with_22000() {
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f(v) AS vec_norm(v)")
         .expect_err("redefinition in the same session must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 }
 
 #[test]
-fn function_body_referencing_an_undefined_name_is_rejected_with_22000() {
+fn function_body_referencing_an_undefined_name_is_rejected_with_42883() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -686,18 +686,18 @@ fn function_body_referencing_an_undefined_name_is_rejected_with_22000() {
             "CREATE FUNCTION f(v) AS undefined_name(v)",
         )
         .expect_err("undefined reference in function body must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 #[test]
-fn defining_a_function_named_after_a_builtin_is_rejected_with_22000() {
+fn defining_a_function_named_after_a_builtin_is_rejected_with_42723() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION vec_norm(v) AS v")
         .expect_err("a UDF name colliding with a built-in must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 }
 
 #[test]
@@ -785,4 +785,40 @@ fn chained_udf_parameter_doubling_is_rejected_before_expansion_blows_up() {
             "expansion of the chained UDF call must be rejected before it can blow up memory",
         );
     assert_eq!(err.wire_code(), "54000");
+}
+/// Issue #1186（対象ビヘイビア: SQL-26・ERR-6）: 非決定的関数 `now()` は受理せず、
+/// 未知関数と同じ `42883` で決定的に拒否する（2 回呼んでも同じコード）。
+#[test]
+fn non_deterministic_function_call_is_rejected_with_42883_deterministically() {
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    let sql = "SELECT now() FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1";
+    for _ in 0..2 {
+        let err = core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .expect_err("now() must be rejected");
+        assert_eq!(err.wire_code(), "42883");
+    }
+}
+
+/// Issue #1186: 組み込み関数名（`lower`）・予約名（`hybrid`）・集計関数名（`sum`）と
+/// 同名の UDF 登録は `42723`。拒否後も予約名でない UDF は登録できる。
+#[test]
+fn defining_a_udf_with_a_reserved_name_is_rejected_with_42723() {
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    for name in ["lower", "hybrid", "sum"] {
+        let err = core
+            .execute_sql_in_session(
+                &ctx,
+                &mut session,
+                &format!("CREATE FUNCTION {name}(x) AS x"),
+            )
+            .expect_err("reserved name must be rejected");
+        assert_eq!(err.wire_code(), "42723", "name={name}");
+    }
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION my_fn(x) AS x")
+        .expect("a non-reserved name must still be accepted");
 }

@@ -618,7 +618,7 @@ fn explain_rejects_unregistered_udf_call_before_invoking_query_planner() {
             "EXPLAIN SELECT no_such_udf(id) FROM docs USING PLAN('find content') LIMIT 10",
         )
         .expect_err("unregistered UDF call must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
     assert_eq!(
         planner.call_count(),
         0,

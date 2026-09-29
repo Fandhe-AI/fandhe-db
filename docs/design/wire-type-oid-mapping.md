@@ -68,7 +68,7 @@ variant 名・型名は既存 `Int4`/`Int8` に倣い PostgreSQL の `typname` �
 | `id` 列 | `numeric`（OID 1700, typlen -1）のまま | engine の行 ID は `u64` 全域（`u64::MAX` を含む）を有効値とし、符号付き 64bit の `int8`（OID 20）ではこれを表現できない（PR #210 レビュー指摘）。受入基準 3（既存の `id` 公告不変）とも整合する |
 | `VECTOR(N)`／`ARRAY`／`ENUM` | `text`（OID 25, typlen -1）のまま | 専用 OID を持たない実装既定値。値そのものはテキスト表現（`[v1,v2,...]`・`{a,b}`・ラベル文字列）のまま変わらない |
 | `ColumnMeta::Computed`（式・集計結果） | 本 Issue 時点では `text`（OID 25）のまま。**Issue #1173 で型付き OID へ更新済み**（下記「集計・式列の型」） | 静的な型情報を持たなかったため（当時） |
-| バイナリ形式（WIRE-14） | 新 variant はすべて `supports_binary` / `column_binary_support` が `false`（fail-closed） | バイナリ表現は spec 側で未策定。`encode_data_row_body` の Binary 腕は `Cell::Text` のみ結線済みで、例えば `REAL` は `Cell::Float(f64)` で運ばれるため float4 binary には型縮小が別途要る。対応拡大は WIRE-14・TASK-218 の後続として別途追跡する |
+| バイナリ形式（WIRE-14） | `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`BYTEA`／`UUID` は Issue #1172 でバイナリ対応（`docs/design/wire-binary-format.md`「Issue #1172 追記」参照）。`DATE`／`TIMESTAMP`／`JSON`／`JSONB`／`NUMERIC`／`id`／配列／`ENUM`／`VECTOR`／`Computed` は引き続き `supports_binary` / `column_binary_support` が `false`（fail-closed・`0A000`） | 対応拡大は WIRE-14・TASK-218・Issue #1172 で実施済み。float4 の縮小は無損失検査つき |
 | typmod | 全列 `-1` のまま | `NUMERIC(p,s)` の typmod 符号化は本 Issue で採用しない |
 | REAL のテキスト表現 | 本 Issue 時点では変更しない。**Issue #1173 で PostgreSQL の float4 出力形式へ更新済み**（`0.1` → `0.1`・`1e6` → `1e+06`） | 当時は `Cell::Float(f64::from(f32))` の `to_string()` により `0.1f32` が `0.10000000149011612` になっていた |
 

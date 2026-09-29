@@ -1481,7 +1481,7 @@ fn bind_where_predicates_recursive(
                     column_ref_policy,
                 )?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::datatype_mismatch(
                         "WHERE expression must evaluate to a boolean (use a comparison)",
                     ));
                 }
@@ -1865,6 +1865,10 @@ impl BoundPredicateDelete {
 /// 設定値。Issue #997）を実行結線（`sql/exec.rs::execute_predicate_delete`）が
 /// 呼び出し元から受け取り、変更開始前・副作用ゼロの時点で判定するため、本関数は
 /// 上限値を運搬しない。
+///
+/// `WHERE visible()` のみ（`metadata_filters`・`expr_filters`・`or_filters` が
+/// すべて空）は実質的な全行削除のため `42601` で拒否する（UPDATE と同契約。
+/// Issue #1181・SQL-19。全行削除は `TRUNCATE TABLE` の管轄）。
 pub fn bind_predicate_delete(
     stmt: &ValidatedPredicateDelete,
     schema: &TableSchema,
@@ -1874,6 +1878,17 @@ pub fn bind_predicate_delete(
 
     let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget, &[])?;
+
+    // Issue #1181・SQL-19: `WHERE visible()` のみ（全フィルタが空）は自テナント
+    // 全行削除と等価なため、UPDATE（`bind_update_form`）と同じ基準・同じ
+    // `42601` で拒否する。台帳照合・書き込みトランザクション開始より前の束縛段
+    // なので副作用ゼロ。`or_filters` を含めるのは `WHERE a OR b` を誤拒否しない
+    // ため（Issue #912）。
+    if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "predicate-form DELETE WHERE clause must contain at least one non-visible() predicate (unconditional DELETE is not supported; use TRUNCATE for whole-table operations)",
+        ));
+    }
 
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
@@ -4006,7 +4021,7 @@ impl BoundAggregateItem {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProjectionColumn {
     /// `GROUP BY` 列の値（`sql::group_by::GroupKey` の `key_index` 番目の成分から
-    /// 復元。`key_index` は [`BoundGroupBy::column_indices`] の添字）。
+    /// 復元。`key_index` は [`BoundGroupBy::keys`] の添字）。
     GroupKey { key_index: usize, name: String },
     /// `items[item_index]` の集計結果。
     Aggregate { item_index: usize, name: String },
@@ -4023,7 +4038,7 @@ pub(crate) struct BoundHaving {
 }
 
 /// `ORDER BY` 対象を束縛した形（TASK-167・SQL-14。SQL-25 (d) で `GroupKey` に
-/// キー番号〔[`BoundGroupBy::column_indices`] の添字〕を持たせた）。
+/// キー番号〔[`BoundGroupBy::keys`] の添字〕を持たせた）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum OrderTarget {
     GroupKey(usize),
@@ -4037,13 +4052,15 @@ pub(crate) struct BoundOrderBy {
 }
 
 /// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張）。
-/// `column_indices` は宣言順を保持した `schema.columns` の添字列（束縛段で全て
-/// `TEXT` 列であることを確認済み）。
+/// `keys` は宣言順を保持したグループキー列（Issue #1185・SQL-25 (d) で `TEXT` 限定を
+/// 外した。並べ替え可能な型〔[`resolve_order_kind`] が `Some` を返す型〕の列か
+/// 疑似列 `id`。`descending` は常に `false` で未使用）。`order_by` は宣言順の
+/// キー列（Issue #1185・SQL-25 (a)。空なら `ORDER BY` なし）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundGroupBy {
-    pub(crate) column_indices: Vec<usize>,
+    pub(crate) keys: Vec<BoundOrderKey>,
     pub(crate) having: Vec<BoundHaving>,
-    pub(crate) order_by: Option<BoundOrderBy>,
+    pub(crate) order_by: Vec<BoundOrderBy>,
     pub(crate) limit: Option<usize>,
     /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。Issue #916・SQL-25 (b)・
     /// TASK-209）。ソート済みグループ列に対し `truncate(limit)` の前に適用する
@@ -4052,6 +4069,21 @@ pub(crate) struct BoundGroupBy {
     /// 常に `0`。[`BoundAggregate::new_grouped`]（TASK-186・NOSQL-5）は本 Issue の
     /// 対象外のため `0` 固定（NoSQL 表層の offset 写像は #947・NOSQL-15 の管轄）。
     pub(crate) offset: usize,
+}
+
+impl BoundGroupBy {
+    /// キーのうち実カラムを指すものの `schema.columns` 添字列（疑似列 `id` は
+    /// 列添字を持たないため除く）。`ReferencedColumns::derive` のスカラー
+    /// マスク導出用。
+    pub(crate) fn column_indices(&self) -> Vec<usize> {
+        self.keys
+            .iter()
+            .filter_map(|k| match k.target {
+                BoundOrderTarget::Column(index) => Some(index),
+                BoundOrderTarget::Id => None,
+            })
+            .collect()
+    }
 }
 
 /// 束縛済みの集計 SELECT 文（TASK-166・SQL-13。TASK-167・SQL-14 で `group_by`・
@@ -4191,7 +4223,7 @@ impl BoundAggregate {
     /// クレート外から複数列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
     /// constructor（SQL-25 (d)。[`Self::new_grouped`] の複数キー版で、単一列
     /// 経路は本関数へ `&[group_by_column]` を渡すだけの委譲になった）。
-    /// SQL テキストを一切組み立てず、列名解決（[`resolve_group_by_column`]）・
+    /// SQL テキストを一切組み立てず、列名解決（[`resolve_group_by_key`]）・
     /// HAVING 対象の型検査（[`check_having_target_is_numeric`]）を SQL テキスト
     /// 経由の [`bind_group_by_clause`] と共有する。
     ///
@@ -4203,7 +4235,8 @@ impl BoundAggregate {
     /// （[`crate::sql::allowlist::check_group_by_column_count`] と同じ判定を
     /// `Vec` 確保より前に行う）、重複する列名は `42601`（SQL テキスト経由の
     /// `Parser::parse_group_by_clause` と同じ分類）、各列は `schema` 上の既存
-    /// `TEXT` 列名限定（未知列・`VECTOR` 列・疑似列 `id` はいずれも `22000`）。
+    /// 列名か疑似列 `id`（Issue #1185・SQL-25 (d) で `TEXT` 限定を外した。未知列・
+    /// 並べ替え不能な型〔`VECTOR` 等〕は `22000`）。
     /// `ORDER BY`／`LIMIT` 相当は本入口の対象外（`order_by: None`・`limit: None`
     /// 固定。NoSQL 表層のスキーマにこれらに相当するキーが存在しないため）。
     /// `projection` は `[GroupKey{0..k}] ++ items`（宣言順）の規範形に固定する
@@ -4241,9 +4274,9 @@ impl BoundAggregate {
             }
         }
 
-        let mut column_indices = Vec::with_capacity(group_by_columns.len());
+        let mut keys = Vec::with_capacity(group_by_columns.len());
         for column in group_by_columns {
-            column_indices.push(resolve_group_by_column(schema, column)?);
+            keys.push(resolve_group_by_key(schema, column)?);
         }
 
         let mut bound_having = Vec::with_capacity(having.len());
@@ -4292,9 +4325,9 @@ impl BoundAggregate {
             rls_predicate_present: false,
             projection,
             group_by: Some(BoundGroupBy {
-                column_indices,
+                keys,
                 having: bound_having,
-                order_by: None,
+                order_by: Vec::new(),
                 limit: None,
                 offset: 0,
             }),
@@ -4363,7 +4396,7 @@ impl BoundAggregate {
 /// - `INTEGER`/`BIGINT`/`REAL`/`DOUBLE PRECISION`/`NUMERIC` 列 → すべての
 ///   集計関数を受理（[`AggregateInput::IntegerColumn`] 等）
 /// - `DATE`/`TIMESTAMP` 列 → `COUNT`・`MIN`/`MAX` を受理、`SUM`/`AVG` は
-///   型不整合（`22000`）
+///   `42883`（Issue #1186。式でも同じ）
 /// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
 ///   （非 NULL 行のみ数える）、それ以外は型不整合（`22000`）
 /// - 上記以外の識別子 → 未知の列（`22000`）
@@ -4425,16 +4458,16 @@ fn resolve_aggregate_input(
                         ColumnType::Date,
                         AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
                     ) => Ok(AggregateInput::DateColumn(index)),
-                    (ColumnType::Date, _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Date, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is DATE and cannot be used with SUM/AVG"
                     ))),
                     (
                         ColumnType::Timestamp,
                         AggregateFunc::Count | AggregateFunc::Min | AggregateFunc::Max,
                     ) => Ok(AggregateInput::TimestampColumn(index)),
-                    (ColumnType::Timestamp, _) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"
-                    ))),
+                    (ColumnType::Timestamp, _) => Err(SqlSurfaceError::undefined_function(
+                        format!("column {name:?} is TIMESTAMP and cannot be used with SUM/AVG"),
+                    )),
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
@@ -4507,6 +4540,15 @@ fn resolve_aggregate_input(
                 // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` を
                 // 直接返す式（集計せず素通しする形）も、上記 TEXT と同じ理由で
                 // 集計引数としては対象外とする。
+                // Issue #1186: `SUM`／`AVG` に `DATE`／`TIMESTAMP` 式を渡す組み合わせ
+                // は列参照と同じく `42883`（undefined_function）で拒否する。
+                ExprType::Date | ExprType::Timestamp
+                    if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
+                {
+                    Err(SqlSurfaceError::undefined_function(
+                        "SUM/AVG cannot be applied to a DATE or TIMESTAMP expression",
+                    ))
+                }
                 ExprType::Vector
                 | ExprType::Bool
                 | ExprType::Text
@@ -5444,27 +5486,38 @@ pub(crate) fn bind_scan_with_dummy_flags(
     })
 }
 
-/// `GROUP BY` 列名を `schema` と照合し `TEXT` 列の添字へ解決する
-/// （TASK-167・SQL-14。`VECTOR`・疑似列 `id`・未知列はいずれも型不整合
-/// `22000`）。SQL テキスト経由の [`bind_group_by_clause`] と直接構築経由の
-/// [`BoundAggregate::new_grouped`]（TASK-186・NOSQL-5）が共有する単一実装
-/// （`id` によるグルーピングは対象外＝将来拡張候補）。
-fn resolve_group_by_column(schema: &TableSchema, column: &str) -> Result<usize, SqlSurfaceError> {
-    schema
-        .columns
-        .iter()
-        .position(|c| c.name == column)
-        .filter(|&idx| {
-            matches!(
-                schema.columns.get(idx).map(|c| c.ty.clone()),
-                Some(ColumnType::Text)
-            )
-        })
-        .ok_or_else(|| {
-            SqlSurfaceError::invalid_input(format!(
-                "GROUP BY column {column:?} must reference an existing TEXT column"
-            ))
-        })
+/// `GROUP BY` 列名を `schema` と照合しグループキー（[`BoundOrderKey`]）へ解決する
+/// （TASK-167・SQL-14。Issue #1185・SQL-25 (d) で `TEXT` 限定を外した）。
+/// 実カラムを疑似列 `id` より優先して照合し（[`bind_scalar_order_by`] と同じ規則）、
+/// 並べ替え不能な型（`VECTOR`・`ARRAY`・`BYTEA`・`JSON`／`JSONB`）と未知列は型不整合
+/// `22000` で拒否する。SQL テキスト経由の [`bind_group_by_clause`] と直接構築経由の
+/// [`BoundAggregate::new_grouped_by_columns`]（TASK-186・NOSQL-5）が共有する単一実装。
+fn resolve_group_by_key(
+    schema: &TableSchema,
+    column: &str,
+) -> Result<BoundOrderKey, SqlSurfaceError> {
+    let reject = || {
+        SqlSurfaceError::invalid_input(format!(
+            "GROUP BY column {column:?} must reference an existing orderable column"
+        ))
+    };
+    if let Some(index) = schema.columns.iter().position(|c| c.name == column) {
+        let def = schema.columns.get(index).ok_or_else(reject)?;
+        let kind = resolve_order_kind(&def.ty).ok_or_else(reject)?;
+        return Ok(BoundOrderKey {
+            target: BoundOrderTarget::Column(index),
+            kind,
+            descending: false,
+        });
+    }
+    if column == "id" {
+        return Ok(BoundOrderKey {
+            target: BoundOrderTarget::Id,
+            kind: OrderKind::Id,
+            descending: false,
+        });
+    }
+    Err(reject())
 }
 
 /// `HAVING` が数値比較できる集計結果を指しているかを検証する（TASK-167・
@@ -5522,14 +5575,13 @@ fn bind_group_by_clause(
     items: &[BoundAggregateItem],
     group_key_aliases: &[(usize, String)],
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
-    // GROUP BY 列は TEXT 列のみ許可する（VECTOR・疑似列 `id`・未知列はいずれも
-    // 型不整合として拒否。§計画 3.2。`id` によるグルーピングは本タスクの対象外
-    // ＝将来拡張候補）。SQL テキスト経由・直接構築経由（[`BoundAggregate::
-    // new_grouped_by_columns`]・TASK-186・NOSQL-5・SQL-25 (d)）が
-    // [`resolve_group_by_column`] を共有する。
-    let mut column_indices = Vec::with_capacity(clause.columns.len());
+    // GROUP BY 列は並べ替え可能な型の列か疑似列 `id` のみ許可する（VECTOR 等・
+    // 未知列は型不整合 `22000`。Issue #1185・SQL-25 (d)）。SQL テキスト経由・
+    // 直接構築経由（[`BoundAggregate::new_grouped_by_columns`]・TASK-186・
+    // NOSQL-5）が [`resolve_group_by_key`] を共有する。
+    let mut keys = Vec::with_capacity(clause.columns.len());
     for column in &clause.columns {
-        column_indices.push(resolve_group_by_column(schema, column)?);
+        keys.push(resolve_group_by_key(schema, column)?);
     }
 
     // HAVING/ORDER BY の対象名解決: いずれかの `GROUP BY` 列名そのもの、その
@@ -5582,7 +5634,7 @@ fn bind_group_by_clause(
                 )));
             }
         };
-        // HAVING が数値比較できる集計結果のみを許可する（[`resolve_group_by_column`]
+        // HAVING が数値比較できる集計結果のみを許可する（[`resolve_group_by_key`]
         // と同じく直接構築経由と共有する [`check_having_target_is_numeric`]）。
         let bound_item = items
             .get(item_index)
@@ -5597,13 +5649,14 @@ fn bind_group_by_clause(
         });
     }
 
-    let order_by = match &clause.order_by {
-        None => None,
-        Some(ob) => Some(BoundOrderBy {
+    // `clause.order_by` の長さは構文段が `MAX_SCALAR_ORDER_KEYS` 以下へ検査済み。
+    let mut order_by = Vec::with_capacity(clause.order_by.len());
+    for ob in &clause.order_by {
+        order_by.push(BoundOrderBy {
             target: resolve_target(&ob.target)?,
             descending: ob.descending,
-        }),
-    };
+        });
+    }
 
     let limit = match clause.limit {
         None => None,
@@ -5629,7 +5682,7 @@ fn bind_group_by_clause(
     let offset = validate_search_offset(clause.offset)?;
 
     Ok(BoundGroupBy {
-        column_indices,
+        keys,
         having,
         order_by,
         limit,
@@ -6428,13 +6481,30 @@ mod tests {
     }
 
     #[test]
-    fn bind_predicate_delete_accepts_visible_predicate_without_producing_a_filter() {
-        let bound = bind_predicate_delete_sql(
+    fn bind_predicate_delete_rejects_visible_only_where() {
+        let err = bind_predicate_delete_sql(
             "DELETE FROM documents WHERE visible() USING OPERATION_ID 'op-0001'",
         )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_predicate_delete_rejects_visible_twice() {
+        let err = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE visible() AND visible() USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_predicate_delete_accepts_visible_combined_with_predicate() {
+        let bound = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE visible() AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+        )
         .expect("bind_predicate_delete should succeed");
-        assert!(bound.metadata_filters.is_empty());
-        assert!(bound.expr_filters.is_empty());
+        assert_eq!(bound.metadata_filters.len(), 1);
     }
 
     #[test]

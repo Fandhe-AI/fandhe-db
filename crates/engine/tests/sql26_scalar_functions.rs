@@ -278,7 +278,7 @@ fn builtin_string_function_names_are_reserved_against_udf_definition() {
                 &format!("CREATE FUNCTION {name}(x) AS x"),
             )
             .expect_err(&format!("{name} should be reserved"));
-        assert_eq!(err.wire_code(), "22000", "unexpected wire_code for {name}");
+        assert_eq!(err.wire_code(), "42723", "unexpected wire_code for {name}");
     }
 }
 
@@ -294,13 +294,13 @@ fn type_mismatches_are_rejected_with_22000() {
     let err = core
         .execute_sql(&ctx, "SELECT upper(vec_norm(embedding)) FROM docs LIMIT 1")
         .expect_err("upper(Scalar) should be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 
     // 未知関数。
     let err = core
         .execute_sql(&ctx, "SELECT mystery_fn(label) FROM docs LIMIT 1")
         .expect_err("unknown function should be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 
     // SUBSTR の引数個数不一致（1 個のみ）。
     let err = core

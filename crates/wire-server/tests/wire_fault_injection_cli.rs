@@ -513,4 +513,52 @@ mod armed {
         let status = wait_for_exit(&mut child, Duration::from_secs(30));
         assert_aborted(status);
     }
+
+    /// Issue #1175: 暗黙トランザクション（`INSERT; INSERT`）では、途中の `INSERT` は
+    /// commit 前なので障害注入の対象にならず、最後の文の commit 成功の直後にだけ緊急応答
+    /// （`D`=`state=may_be_committed`）が 1 回送出されてプロセスが abort する。commit は
+    /// 成功しているため、再オープン後は両方の行が可視のまま。
+    #[test]
+    fn armed_post_commit_panic_fires_once_after_the_implicit_transaction_commit() {
+        let fixture = TempFixtureDir::new("armed-implicit");
+        write_user_store_with_alice(&fixture.users_path_str());
+        create_empty_docs_table(&fixture.db_path_str());
+        let db_path = fixture.db_path_str();
+
+        let mut child = spawn_armed(&fixture);
+        let (addr, _lines) =
+            common::wait_for_listening_addr_and_lines(&mut child, Duration::from_secs(10));
+
+        let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "{}; {}",
+                insert_sql(1, "fi-implicit-op-1"),
+                insert_sql(2, "fi-implicit-op-2")
+            ),
+        );
+        assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+        assert_emergency_response(&mut stream);
+
+        let status = wait_for_exit(&mut child, Duration::from_secs(30));
+        assert_aborted(status);
+
+        let storage = Storage::open(&db_path).expect("reopen storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let read_ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let result = core
+            .execute_sql(
+                &read_ctx,
+                "SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+            )
+            .expect("select should succeed");
+        assert_eq!(
+            result.rows.len(),
+            2,
+            "both rows of the committed implicit transaction must be visible"
+        );
+    }
 }

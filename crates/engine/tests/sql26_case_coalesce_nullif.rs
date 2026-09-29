@@ -450,7 +450,7 @@ fn defining_a_udf_named_coalesce_is_rejected() {
     let err = core
         .execute_sql_in_session(&ctx(), &mut session, "CREATE FUNCTION coalesce(x) AS x")
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 }
 
 // --- 既存 NULL 構文の非回帰 -----------------------------------------------------
