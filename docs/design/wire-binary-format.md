@@ -84,6 +84,8 @@ PostgreSQL の Bind 規則に従う。
 | --- | --- | --- |
 | `ColumnMeta::Id` | numeric（1700） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
 | `Scalar{ty: Text}` | text（25） | 対応（UTF-8 生バイト） |
+| `Scalar{ty: Integer／BigInt／Real／Double／Boolean／Bytea／Uuid}` | int4／int8／float4／float8／bool／bytea／uuid | 対応（Issue #1172。PostgreSQL の send 形式） |
+| `Scalar{ty: Numeric／Date／Timestamp／Json／Jsonb／Array／Enum}` | numeric／date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
 | `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
 | `ColumnMeta::Computed` | text（25） | **非対応 → `0A000`**（fail-closed。詳細は WIRE-14 参照） |
 
@@ -98,10 +100,9 @@ PostgreSQL の Bind 規則に従う。
 
 PostgreSQL の send 関数と同じレイアウトで 8 型のバイナリ表現を組み立てる
 純関数を用意した（`int4`／`int8`／`float4`／`float8`／`bool_`／`bytea`／
-`uuid`／`text`）。本 Issue 時点で `WireType` 側に実際に結線されるのは `text`
-のみで、他の型は Issue #895 で `WireType` へ OID 公告が追加された後も
-バイナリ表現へは未結線のまま（`column_binary_support`／`supports_binary`
-がいずれも `false` を返す。対応拡大は本 doc「申し送り」節）。golden バイト列
+`uuid`／`text`）。本 Issue 時点で `WireType` 側に結線されるのは `text` のみだったが、
+Issue #1172 で `int4`／`int8`／`float4`／`float8`／`bool`／`bytea`／`uuid` も
+結線した（「Issue #1172 追記」節）。golden バイト列
 の単体テストで PostgreSQL 規約との一致を固定した（例: `int4(1)` →
 `00 00 00 01`、`int8(-1)` → `ff` × 8、`float8(1.0)` → `3f f0 00 …`、
 `bool_(true)` → `01`）。
@@ -131,6 +132,30 @@ matches_legacy_encoder`）で固定している。シグネチャは
 を残さない）は据え置いた。長さはすべて `i32::try_from`／`checked_*` で
 計算し、`as` キャストは使わない。
 
+## Issue #1172 追記: 数値・真偽値・bytea・uuid 列のバイナリ結線
+
+- 対応: Issue #1172（WIRE-14・TASK-218。ポインタ: `docs/spec/04-behavior/wire-protocol.md`
+  WIRE-14）。テスト: `crates/wire-server/tests/wire14_binary_typed_columns.rs`
+- `Cell::SignedInteger`／`Cell::Float` は int4／int8・float4／float8 で共用のため、
+  列メタ（`ColumnMeta`）を受け取る `encode_data_row_into_with_columns` を新設し、
+  Execute（`extended_query.rs`）の 2 経路（送出分・中断保持分）を切り替えた。
+  既存の `encode_data_row_into_with_formats` はシグネチャ・意味とも不変
+  （`pub` API の破壊的変更を避けるため。列の型を知らないので binary は
+  `Cell::Text` のみ受理する）。
+- fail-closed: 型と `Cell` の不一致・`INTEGER` の i32 範囲外・無損失でない
+  float4 縮小・固定長型の長さが `typlen` と不一致の場合は `EncodeError`（`XX000`）で
+  text へ黙ってフォールバックしない。`bytea`／`text` の長さは `i32::try_from` で検証する。
+  失敗時に部分フレームを残さない契約は不変。
+- 非対応型（`NUMERIC`・`DATE`・`TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM`・
+  `VECTOR`・`id`・`Computed`）は従来どおり Bind で `0A000`（当該文のみ拒否・
+  接続維持）。
+- 長さ上限検証・`08P01` の範囲: バイナリ形式パラメータの復号は wire 側の
+  `$n` 束縛（#935・WIRE-12）が未結線のため本 Issue の対象外。本 Issue では
+  Bind 本文の不正な長さ・件数が `08P01` になり Sync で回復することを wire
+  テストで固定した。
+- 3 クライアント（psycopg `binary=True`・node pg `binary: true`）でのバイナリ
+  受信 e2e は引き続き対象外。
+
 ## セキュリティ（OWASP・AGENTS.md P0）
 
 - **インジェクション**: 形式コードは列挙型へ閉じた写像にし、SQL や文字列の
@@ -159,9 +184,9 @@ matches_legacy_encoder`）で固定している。シグネチャは
   未実装のため引き続き対象外）
 - 型 OID 拡張（`BOOLEAN`／`REAL`／`DOUBLE PRECISION`／`DATE`／`TIMESTAMP`／
   `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
-  （`docs/design/wire-type-oid-mapping.md` 参照）。`id`・これら新型・
-  集計列（`Computed`）のバイナリ対応拡大は spec 側で未策定のため引き続き
-  未実施
+  （`docs/design/wire-type-oid-mapping.md` 参照）。数値・真偽値・
+  bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`DATE`／`TIMESTAMP`／
+  `JSON`／`JSONB`・集計列（`Computed`）は引き続き非対応
 - 3 クライアントのバイナリ受信モードでの値一致（層 B）→ #934 完了後の
   別 Issue（本 doc の対象外のまま）
 - カーソル（WIRE-15）→ #937
