@@ -597,10 +597,11 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 （`column`／`op`／`value`）または「グループ」（`or`）のいずれかの形を取り、
 配列自体・グループ内の分岐はいずれも暗黙に `AND` 結合として扱う（Issue #945・
 NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefix` の 2 語彙・
-`AND` のみだった）。`update`／`delete` の述語形（Issue #1062）でも同じ配列
-表現を使うが、対応語彙は `eq`／`prefix` の 2 語彙・`AND` 結合のみに留まる
-（範囲比較・`IN`・`OR` グループへの拡張は Issue #1118 が明示的に対象外と
-した。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
+`AND` のみだった。Issue #1197 で `ne`・`between`・`like`・`is_null`／
+`not_null`・`not` グループを追加）。`update`／`delete` の述語形（Issue #1062）でも
+同じ配列表現を使うが、対応語彙は `eq`／`ne`／`prefix`／`like`／`between`／
+`is_null`／`not_null` と `not` グループ・`AND` 結合のみに留まる（範囲比較・`IN`・
+`OR` グループへの拡張は Issue #1118 が明示的に対象外とした。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
 台帳照合 `23505`／`22023`〕は各 op の節を参照）。
 
 ```json
@@ -623,12 +624,39 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 ]}]
 ```
 
+追加語彙の例（Issue #1197。SQL の `NOT`・`BETWEEN`・`LIKE`・`IS [NOT] NULL` と
+同じ結果集合を返す）:
+
+```json
+[
+  {"column": "lang", "op": "ne", "value": "ja"},
+  {"column": "created", "op": "between", "value": ["2024-01-01", "2024-12-31"]},
+  {"column": "path", "op": "like", "value": "%/docs/_%"},
+  {"column": "note", "op": "not_null"},
+  {"not": {"or": [
+    {"column": "lang", "op": "eq", "value": "en"},
+    {"column": "note", "op": "is_null"}
+  ]}}
+]
+```
+
 ### 葉（leaf）
 
-- `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値、または
-  `in` に限り配列）の 3 つの必須フィールドのみ
-- `op` は次の 9 語彙（完全一致。大文字小文字の読み替えなし）:
+- `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値、`in`／
+  `between` の配列、ARRAY／JSON 列への `eq`／`ne` の配列・オブジェクト）の 3 つの
+  フィールドのみ。`is_null`／`not_null` は `value` を**持たない**（`null` を含め
+  付いていれば `42601`）
+- `op` は次の 14 語彙（完全一致。大文字小文字の読み替えなし。`"op":"not"` は
+  語彙外で `42601`）:
   - `eq`（一致）・`prefix`（前方一致。従来どおり）
+  - `ne`（`NOT col = <値>` と同じ。値のレーンは `eq` と同じ。NULL 行は除外）
+  - `like`（`TEXT` 列。文字列のみ。`%`・`_`・`\` をワイルドカード・エスケープと
+    して解釈する。列型違反は `22000`、パターン長超過は `54000`）
+  - `between`（`[low, high]` の要素ちょうど 2 個のスカラー配列。違反は `42601`。
+    `DATE`／`TIMESTAMP`／`UUID`／`BYTEA`／`NUMERIC` と `INTEGER`／`BIGINT`／`REAL`／
+    `DOUBLE PRECISION`（JSON 数値のみ。`>= low AND <= high` の式レーン）。
+    `TEXT` 等は SQL の `BETWEEN` と同じく `22000`）
+  - `is_null`／`not_null`（`IS NULL`／`IS NOT NULL`。`VECTOR` 列は `22000`）
   - `lt`／`le`／`lte`／`gt`／`ge`／`gte`（範囲比較。`le`/`lte`・`ge`/`gte` は
     それぞれ完全一致の同義語として両方受理する——Issue の受け入れ条件と
     対象ビヘイビア NOSQL-14 とで表記が食い違うため安全側に倒した判断。
@@ -660,12 +688,24 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   （`udf_call::bind_expr`）で束縛する（Issue #1183）。`BIGINT` の |値| が
   2^53 を超える場合（JSON リテラル・格納値とも）は `22000`。`TEXT` の範囲比較も
   式レーン（バイト順）で受理する。`in` は数値列では従来どおり `22000`。
-  述語形 `update`／`delete` の `filter` では数値列の `eq` を引き続き `0A000` で
-  拒否する
+  述語形 `update`／`delete` の `filter` では数値列の `eq`／`ne`／`between` を
+  `0A000` で拒否する
 - `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
 - `in` は列型に関わらず対応する場合のみ受理する（対象外の列型は `22000`）
 - 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は
   `engine::declarative_filter` の既存契約をそのまま透過する
+
+### グループ（`not`）
+
+- `{"not": <要素>}` の形のみ許可する（キーは `not` 1 つ、値はオブジェクトで、
+  葉・`or` グループ・入れ子の `not` のいずれか）。違反は `42601`
+- 否定は**葉まで押し下げて**束縛する（De Morgan。`or` 群の上に否定を置くと
+  NULL 行が UNKNOWN から真へ反転する fail-open になるため）。結果は SQL の
+  `NOT ( ... )` と一致する。内側の葉の RLS 述語名検査も `not` を貫通する
+- ネスト深さは `or` と共有して数える（上限 32。超過は `54000`）
+- JSON 上の葉の数で事前検査するため、数値列の `between`／`ne`／`not eq` のように
+  展開で 1 葉が 2 葉になる場合、JSON 上で 256 葉ちょうどのとき engine の事後検査
+  だけが `54000` になりうる（拒否側に倒れる既知の差分）
 
 ### グループ（`or`）
 
@@ -687,14 +727,17 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 `AND` のみの既存回帰）・`crates/wire-server/tests/nosql14_filter_operators.rs`
 （範囲比較・`IN`・`OR`。Issue #945）。
 
-**`update`／`delete` の `filter`（述語形）における対応範囲**: 本節の語彙
-（範囲比較 6 語彙・`in`・`or` グループ）は `search`／`scan`／`aggregate`
-専用。`update`／`delete` の `filter` は `eq`／`prefix` の 2 語彙・`AND`
-結合のみに対応し、上記の拡張語彙・`or` を渡すと [`filter::
+**`update`／`delete` の `filter`（述語形）における対応範囲**: 範囲比較 6 語彙・
+`in`・`or` グループは `search`／`scan`／`aggregate` 専用。`update`／`delete` の
+`filter` は `eq`／`ne`／`prefix`／`like`／`between`／`is_null`／`not_null` と、
+それらを包む `not` グループ・`AND` 結合のみに対応し（Issue #1197。SQL の述語形
+`UPDATE`／`DELETE` と同一の構文形へ写像するため、SQL⇄NoSQL の台帳照合も成立
+する）、範囲比較・`in`・`or`（`not` の内側を含む）を渡すと [`filter::
 map_predicate_dml_items`](../src/http/query/filter.rs) が
-`FilterError::UnsupportedOperator`（`42601`）／形状不一致で拒否する
-（Issue #1118 が明示的に対象外とした範囲。上記「`update`」「`delete`」節
-参照）。
+`FilterError::UnsupportedOperatorForPredicateDml`（`42601`）で拒否する
+（Issue #1118 が明示的に対象外とした範囲。上記「`update`」「`delete`」節参照）。
+数値列（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`）への `eq`／`ne`／`between`
+は `0A000`。
 
 ## `explain`
 
@@ -821,9 +864,6 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - 定数のみの `SELECT`
 - `aggregate` への `offset`（`GROUP BY ... LIMIT n OFFSET m` 相当。NoSQL 側は
   `limit` 相当の受理形も engine 側の公開 offset setter も持たないため未対応）
-- `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
-  中間一致・後方一致・`_` を受理するが、NoSQL `filter` 側は未対応のまま。
-  NoSQL 側の対応は NOSQL-14 の担当）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `ORDER BY`／`LIMIT` の付与
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）

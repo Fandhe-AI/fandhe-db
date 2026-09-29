@@ -587,6 +587,22 @@ impl DeclarativeFilter {
         }
     }
 
+    /// 否定を畳み込んだ形で返す（Issue #1197。`sql::declarative_predicate::
+    /// negate_conjunction` が葉の否定に使う）。`Not(x)` は `x` へ戻し（二重否定の
+    /// 除去。[`FilterOp::Not`] の入れ子を作らない）、`IS NULL`／`IS NOT NULL` は
+    /// 互いへ反転する（この 2 つは UNKNOWN にならず厳密に同値。
+    /// `sql::where_negation` と同じ判断）。それ以外は [`Self::negate`] で包む。
+    pub(crate) fn negate_folded(self) -> Self {
+        let column = self.column;
+        let op = match self.op {
+            FilterOp::Not(inner) => *inner,
+            FilterOp::IsNull => FilterOp::IsNotNull,
+            FilterOp::IsNotNull => FilterOp::IsNull,
+            other => FilterOp::Not(Box::new(other)),
+        };
+        Self { column, op }
+    }
+
     /// `TEXT` 列に対する `LIKE` フィルタを宣言する（SQL-24／TASK-208、
     /// Issue #914）。`pattern` は生パターン（エスケープ解除前）で、
     /// [`Self::bind`] 時に [`parse_like_pattern`] で解析し、

@@ -54,3 +54,30 @@ Issue #945 の実装計画（Plan フェーズ）時点では、これらの数�
 - `update`／`delete` op の `filter`（述語形）への同拡張: #1062 の範囲（本 Issue は `search`／`scan`／`aggregate` の 3 op のみ）。
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較: 上記のとおり Issue #891（式レーンの列型拡張）待ち。
 - SQL-24 の性能受け入れ基準（`OR` 2 項・`IN` 8 要素での p95）: 本 Issue では測定しない（ベンチ系 Issue の範囲）。
+
+## Issue #1197 追記: `ne`・`between`・`like`・`is_null`／`not_null`・`not`
+
+対象ビヘイビア: NOSQL-14・SQL-24・TASK-223（ポインタ）。JSON の形は本実装の設計判断であり、spec の引用ではない。
+
+| 要素 | 形 | 束縛 |
+| --- | --- | --- |
+| `ne` | `{"column","op":"ne","value"}`（値のレーンは `eq` と同じ） | `eq` の束縛を `negate_conjunction` で否定 |
+| `between` | `value: [low, high]`（要素 2 個のスカラー。違反は `42601`） | DATE／TIMESTAMP／UUID／BYTEA／NUMERIC は宣言的 `between`。数値 4 型は `>= low` と `<= high` の式レーン 2 述語。TEXT 等は engine の `22000`（SQL と同じ） |
+| `like` | `value` は文字列のみ | `DeclarativeFilter::like`（`prefix` はリテラル前方一致のまま） |
+| `is_null`／`not_null` | `value` は付けられない（`null` も `42601`） | `is_null`／`is_not_null` |
+| `not` グループ | `{"not": <葉／or／not>}` | 葉まで否定を押し下げる |
+
+### 否定を葉まで押し下げる理由
+
+二値評価器（`sql::where_tree`）は UNKNOWN を false として扱う。`Or`／AND 群の上に否定を置くと、NULL を含む行で UNKNOWN が真へ反転して fail-open になる。そこで engine に `sql::declarative_predicate::negate_conjunction`（`sql::where_negation` の `DeclarativePredicate` 版。同じ否定表）を追加し、`DeclarativePredicate` に `Not` variant は足さない（variant 追加は BREAKING になるため）。葉の否定は `DeclarativeFilter::negate_folded`（二重否定の除去と `IS [NOT] NULL` の反転）を使う。分配はしないので展開は線形（`Eq` 式のみ 1 葉が 2 葉になる）。
+
+### 述語形 `update`／`delete`
+
+SQL 構文段と同一の `WherePredicate` AST を生成して `content_hash`（RECOVER-10）を揃える。`ne` は `Not(Equality)`、`like` は生パターンの `Prefix`、`between` は `Between`、`is_null`／`not_null` は `IsNull{negated}`、`not` は `Not(x)` を畳んで `x`、それ以外は `Not(p)`。`or`（`not` の内側を含む）・範囲比較・`in` は #1118 以来の対象外のまま `42601`。数値列の `eq`／`ne`／`between` は `0A000`。engine の `reject_unsupported_predicate_dml_forms` は `Equality`／`BoolEquality`／`Prefix`／`Between`／`IsNull` とそれらを直接包む `Not` のみ許可する（SQL の述語形より広くならない）。`UPDATE_SCHEMA`／`DELETE_SCHEMA` の `filter` は要素の形を検査せず（`FILTER_ITEM_SCHEMA` は削除）、形の検査は `http::query::filter` に集約した。
+
+### 既知の差分・申し送り
+
+- wire の事前検査は JSON 上の葉を数え、engine の事後検査は展開後の葉を数える。JSON 上で 256 葉ちょうどのとき NoSQL だけ `54000` になりうる（拒否側に倒れる差分）。
+- TEXT 列の `between` は SQL 側と同じく `22000`。受け付けるなら engine（SQL-24）側が先。
+- 数値列の `in` は `22000` のまま。
+
