@@ -1996,12 +1996,18 @@ pub(crate) fn bind_column_default(
             "column {:?} DEFAULT is out of range for its type",
             column.name
         ))),
-        Err(DefaultBindError::Malformed | DefaultBindError::Incompatible) => {
-            Err(SqlSurfaceError::invalid_input(format!(
-                "column {:?} DEFAULT is not compatible with its type",
+        // 文法不正は INSERT／UPDATE／COPY のリテラル束縛と同じく 22P02 へ写像する
+        // （Issue #1187）。値は保持せず列名のみをエラーへ含める。
+        Err(DefaultBindError::Malformed) => {
+            Err(SqlSurfaceError::invalid_text_representation(format!(
+                "column {:?} DEFAULT has an invalid input syntax for its type",
                 column.name
             )))
         }
+        Err(DefaultBindError::Incompatible) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {:?} DEFAULT is not compatible with its type",
+            column.name
+        ))),
     }
 }
 
@@ -7699,6 +7705,28 @@ mod tests {
             &schema,
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// Issue #1187: `bind_column_default` の文法不正は INSERT／UPDATE／COPY と同じ
+    /// `22P02`、値域外は `22003`、型の大分類不整合は従来どおり `22000`。
+    #[test]
+    fn bind_column_default_maps_malformed_to_22p02() {
+        let col = |ty| ColumnDef::new("n", ty, true);
+        let number = |s: &str| ColumnDefault::Number(s.to_string());
+
+        let err = bind_column_default(&col(ColumnType::Integer), &number("1.5"))
+            .expect_err("fractional default for INTEGER must be rejected");
+        assert_eq!(err.wire_code(), "22P02");
+        let err = bind_column_default(&col(ColumnType::Double), &number("1e"))
+            .expect_err("malformed float default must be rejected");
+        assert_eq!(err.wire_code(), "22P02");
+
+        let err = bind_column_default(&col(ColumnType::Integer), &number("99999999999"))
+            .expect_err("overflowing default must be rejected");
+        assert_eq!(err.wire_code(), "22003");
+        let err = bind_column_default(&col(ColumnType::Boolean), &number("1"))
+            .expect_err("incompatible default must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 }
