@@ -647,3 +647,54 @@ fn implicit_transaction_success_and_failure_both_report_idle() {
     assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 }
+
+/// 遅延 FK 検査違反で `COMMIT` が失敗した後の `ReadyForQuery` は `'I'`
+/// （トランザクション外）へ戻る（Issue #1201・TABLE-21・WIRE-19）。
+///
+/// 遅延違反の `COMMIT` は（PostgreSQL と同じく）トランザクション全体を
+/// ロールバック扱いで終わらせる。入れ子の `BEGIN` 等で `Failed`（`'E'`）に
+/// 留まる上のテスト群と対照的に、`ROLLBACK` を待たずに `Idle` へ戻るため、
+/// 続く `ROLLBACK` は `25P01`（トランザクション外）になる。DDL は
+/// `--ddl-allowed-users` の配線を避けるためサーバー起動前に engine へ直接発行する。
+#[test]
+fn deferred_foreign_key_violation_at_commit_returns_to_idle() {
+    let (core, _guard) = new_core_with_documents_table();
+    let mut ddl_session = engine::sql::mode::SessionState::default();
+    ddl_session.allow_ddl();
+    let sys = engine::policy::PolicyContext::new("sys").expect("valid tenant id");
+    for sql in [
+        "CREATE TABLE p (name TEXT)",
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    ] {
+        core.execute_sql_in_session(&sys, &mut ddl_session, sql)
+            .expect("ddl succeeds");
+    }
+    let mut stream = spawn_alice(core);
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    // 親が存在しない子行（遅延のため文時点では成功する）。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO c (id, parent_id) VALUES (1, 999) USING OPERATION_ID 'op-1201-c'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    send_simple_query(&mut stream, "COMMIT");
+    expect_error_response_with_sqlstate(&mut stream, "23503");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // トランザクション外の通常クエリが継続でき、違反行は残っていない。
+    send_simple_query(&mut stream, "SELECT id FROM c LIMIT 1");
+    let _ = read_row_description(&mut stream);
+    let _ = read_command_complete(&mut stream);
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // `Failed` ではなく `Idle` へ戻っている裏付け: `ROLLBACK` は `25P01`。
+    send_simple_query(&mut stream, "ROLLBACK");
+    expect_error_response_with_sqlstate(&mut stream, "25P01");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
