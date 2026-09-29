@@ -1836,7 +1836,9 @@ pub struct AggregateOrderBy {
 pub struct GroupByClause {
     pub(crate) columns: Vec<String>,
     pub(crate) having: Vec<HavingPredicate>,
-    pub(crate) order_by: Option<AggregateOrderBy>,
+    /// `ORDER BY` のキー列（宣言順。空なら `ORDER BY` なし。Issue #1185・SQL-25 (a)
+    /// で単一識別子から複数キーへ一般化。上限は [`MAX_SCALAR_ORDER_KEYS`]）。
+    pub(crate) order_by: Vec<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
     /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
     /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
@@ -3331,24 +3333,42 @@ impl<'a> Parser<'a> {
         Ok(predicates)
     }
 
-    /// 集計 `GROUP BY` の `ORDER BY <target> [ASC|DESC]`（TASK-167・SQL-14）。
-    /// `<target>` は `GROUP BY` 列名または SELECT リスト集計項目の実効名のいずれか
-    /// 1 つの識別子（意味論的な解決は束縛段）。`ASC`/`DESC` は予約語化せず文脈的に
-    /// 照合し、省略時は昇順として扱う。
-    fn parse_aggregate_order_by(&mut self) -> Result<AggregateOrderBy, SqlSurfaceError> {
+    /// 集計 `GROUP BY` の `ORDER BY <target> [ASC|DESC] (',' <target> [ASC|DESC])*`
+    /// （TASK-167・SQL-14。Issue #1185・SQL-25 (a) で複数キーへ一般化）。
+    /// 各 `<target>` は `GROUP BY` 列名（またはそのエイリアス）か SELECT リスト集計項目の
+    /// 実効名のいずれか 1 つの識別子（意味論的な解決は束縛段）。`ASC`/`DESC` は
+    /// 予約語化せず文脈的に照合し、省略時は昇順として扱う。式・位置番号・
+    /// `NULLS FIRST/LAST` は識別子でない／未知のトークンとして後続の構文検査で
+    /// `42601` に落ちる。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
+    /// 確保前検査）。
+    fn parse_aggregate_order_by(&mut self) -> Result<Vec<AggregateOrderBy>, SqlSurfaceError> {
         self.expect_keyword(Keyword::Order)?;
         self.expect_keyword(Keyword::By)?;
-        let target = self.expect_ident()?;
-        let descending = if self.peek_ident_matches("DESC") {
-            self.advance();
-            true
-        } else if self.peek_ident_matches("ASC") {
-            self.advance();
-            false
-        } else {
-            false
-        };
-        Ok(AggregateOrderBy { target, descending })
+        let mut keys = Vec::new();
+        loop {
+            if keys.len() >= MAX_SCALAR_ORDER_KEYS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many aggregate ORDER BY keys",
+                ));
+            }
+            let target = self.expect_ident()?;
+            let descending = if self.peek_ident_matches("DESC") {
+                self.advance();
+                true
+            } else if self.peek_ident_matches("ASC") {
+                self.advance();
+                false
+            } else {
+                false
+            };
+            keys.push(AggregateOrderBy { target, descending });
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
     }
 
     /// 集計 `GROUP BY` の `LIMIT <n>`（TASK-167・SQL-14）。構文段では `u32` として
@@ -7962,9 +7982,9 @@ fn parse_aggregate_shape(
             Vec::new()
         };
         let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
-            Some(p.parse_aggregate_order_by()?)
+            p.parse_aggregate_order_by()?
         } else {
-            None
+            Vec::new()
         };
         let (limit, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
             let limit = p.parse_aggregate_limit()?;
@@ -8007,33 +8027,54 @@ fn parse_aggregate_shape(
     })
 }
 
-/// `SELECT DISTINCT <column> [AS <alias>] FROM <table> [WHERE ...]
-/// [ORDER BY ...] [LIMIT ...]`（SQL-25 (c)・TASK-209）の許可形状。`GROUP BY`
-/// 実行器（[`ValidatedAggregate`]）へ直接脱糖する（SELECT リストに集計項目を
-/// 持たない `GroupKey` 単独の形。[`validate_sql_tokens`] がここで組み立てた
-/// `ParsedAggregateShape` を `parse_aggregate_shape` と同じ `Statement::
-/// Aggregate` へ写像するため、実行経路〔`bind_aggregate`・
-/// `execute_grouped_aggregate`〕は完全に共有される）。
+/// `SELECT DISTINCT <column> [AS <alias>] (',' <column> [AS <alias>])* FROM <table>
+/// [WHERE ...] [ORDER BY ...] [LIMIT ...]`（SQL-25 (c)・TASK-209。Issue #1185 で
+/// 複数列へ一般化）の許可形状。`GROUP BY` 実行器（[`ValidatedAggregate`]）へ直接
+/// 脱糖する（SELECT リストに集計項目を持たない `GroupKey` のみの形。
+/// [`validate_sql_tokens`] がここで組み立てた `ParsedAggregateShape` を
+/// `parse_aggregate_shape` と同じ `Statement::Aggregate` へ写像するため、実行経路
+/// 〔`bind_aggregate`・`execute_grouped_aggregate`〕は完全に共有される）。
 ///
-/// 対象は単一の裸列参照のみ（複数列・`*`・式は `42601`。列名一致の判定を
-/// 経ないため `GroupByClause::column` はここでの唯一の列名をそのまま使う）。
+/// 対象は裸列参照のカンマ区切り（`*`・式は `42601`）。同じ列を複数回書いた場合
+/// （`SELECT DISTINCT a, a`）は `GroupByClause::columns` では 1 列に畳み、SELECT
+/// リスト側の `GroupKey` 項目だけを列挙する（PostgreSQL は受理する形）。列数は
+/// 重複を含む SELECT 項目数で [`check_group_by_column_count`] により検査する
+/// （`54000`。重複列を並べても 8 列上限を超えられない）。
 /// `GROUP BY`・`HAVING`・`OFFSET`・ベクトル順位付け（`ORDER BY <=>`・`HYBRID`・
 /// `USING PLAN`・`USING MODE`・`HINT ORDER`）はいずれもこの構文自体が持たない
-/// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) 参照）。列の型が
-/// `TEXT` であることの検査は意味論層（`sql::parser::bind_group_by_clause`）が
-/// 担う（`VECTOR` 列・`TEXT` 以外のスカラー列はいずれも `22000`）。
+/// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) 参照）。列の型の検査は
+/// 意味論層（`sql::parser::bind_group_by_clause`）が担う（並べ替え不能な型
+/// `VECTOR` 等・未知列はいずれも `22000`）。
 fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
     p.expect_ident_matching("DISTINCT")?;
-    let column = p.expect_ident()?;
-    let alias = if p.peek_ident_matches("AS") {
-        p.advance();
-        Some(p.expect_ident()?)
-    } else {
-        None
-    };
+    let mut columns: Vec<String> = Vec::new();
+    let mut items: Vec<AggregateSelectItem> = Vec::new();
+    loop {
+        let column = p.expect_ident()?;
+        let alias = if p.peek_ident_matches("AS") {
+            p.advance();
+            Some(p.expect_ident()?)
+        } else {
+            None
+        };
+        if !columns.contains(&column) {
+            check_group_by_column_count(columns.len() + 1)?;
+            columns.push(column.clone());
+        }
+        // SELECT リスト項目数にも `GROUP BY` 列数と同じ上限（[`MAX_GROUP_BY_COLUMNS`]）
+        // を適用する。重複列（`SELECT DISTINCT a, a, ...`）は `columns` に畳まれるが、
+        // 設計文書の D8 は `SELECT DISTINCT` を最大 8 列と定めるため項目数で検査する。
+        check_group_by_column_count(items.len() + 1)?;
+        items.push(AggregateSelectItem::GroupKey { column, alias });
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            continue;
+        }
+        break;
+    }
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
 
@@ -8044,9 +8085,9 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         Vec::new()
     };
     let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
-        Some(p.parse_aggregate_order_by()?)
+        p.parse_aggregate_order_by()?
     } else {
-        None
+        Vec::new()
     };
     let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
         Some(p.parse_aggregate_limit()?)
@@ -8057,19 +8098,15 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
 
     Ok(ParsedAggregateShape {
         table_name,
-        items: vec![AggregateSelectItem::GroupKey {
-            column: column.clone(),
-            alias,
-        }],
+        items,
         where_predicates,
         group_by: Some(GroupByClause {
-            columns: vec![column],
+            columns,
             having: Vec::new(),
             order_by,
             limit,
             // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
-            // ため常に `0`（Issue #916・SQL-25 (b)・TASK-209 の `offset` 追加に
-            // 伴う base 取り込みでの構造体フィールド整合）。
+            // ため常に `0`。
             offset: 0,
         }),
     })
@@ -8607,8 +8644,8 @@ fn validate_select_statement(
     // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
     // （`GROUP BY` を含む形）より前に判定する（`SELECT DISTINCT lang, COUNT(*)
     // FROM t GROUP BY lang` のような両方に一致しうる入力は存在しない——
-    // `parse_distinct_shape` は単一の裸列参照のみを受理するため、集計項目や
-    // 複数列を伴う形は自然に `42601` へ落ちる）。
+    // `parse_distinct_shape` は裸列参照のカンマ区切り（Issue #1185 で複数列へ
+    // 一般化）のみを受理するため、集計項目を伴う形は自然に `42601` へ落ちる）。
     let is_distinct_select = is_distinct_modifier(tokens, 1);
 
     if is_distinct_select {
@@ -13261,7 +13298,8 @@ mod tests {
         assert_eq!(group_by.having.len(), 1);
         assert_eq!(group_by.having[0].item_name, "n");
         assert_eq!(group_by.having[0].literal, 1.0);
-        let order_by = group_by.order_by.as_ref().expect("ORDER BY must be parsed");
+        let order_by = group_by.order_by.first().expect("ORDER BY must be parsed");
+        assert_eq!(group_by.order_by.len(), 1);
         assert_eq!(order_by.target, "n");
         assert!(order_by.descending);
         assert_eq!(group_by.limit, Some(10));
@@ -13547,6 +13585,23 @@ mod tests {
         let lookup = catalog_with(&["documents"]);
         validate_sql("SELECT COUNT(distinct) FROM documents", &lookup)
             .expect("COUNT(distinct) (column named 'distinct') must remain accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_duplicate_columns_at_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let cols = ["lang"; MAX_GROUP_BY_COLUMNS].join(", ");
+        validate_sql(&format!("SELECT DISTINCT {cols} FROM documents"), &lookup)
+            .expect("SELECT DISTINCT with duplicates at item limit must be accepted");
+    }
+
+    #[test]
+    fn rejects_select_distinct_duplicate_columns_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let cols = ["lang"; MAX_GROUP_BY_COLUMNS + 1].join(", ");
+        let err = validate_sql(&format!("SELECT DISTINCT {cols} FROM documents"), &lookup)
+            .expect_err("SELECT DISTINCT item count over limit must be rejected");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

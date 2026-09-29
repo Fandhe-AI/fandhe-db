@@ -191,7 +191,7 @@
 //! 推測できないことを維持する（詳細は `sql.rs`・`sql/aggregate.rs` モジュール
 //! ドキュメント参照）。
 //!
-//! TASK-167（対象ビヘイビア: SQL-14）: `sql::group_by` が `GROUP BY <TEXT 列>` を
+//! TASK-167（対象ビヘイビア: SQL-14）: `sql::group_by` が `GROUP BY <列>`（Issue #1185 で `TEXT` 限定を外した）を
 //! 追加し、複数行の集計結果を返す（任意で `HAVING`・`ORDER BY`・`LIMIT` を伴う）。
 //! グループ数・グループキーの累計バイト数は上限で有界化し、超過は fail-closed に
 //! 拒否する。RLS 適用順序は TASK-166 の単一行経路と同一の規約を独立して踏襲し、

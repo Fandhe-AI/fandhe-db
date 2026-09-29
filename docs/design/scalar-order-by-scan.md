@@ -170,7 +170,7 @@ security.md P0）を保ったまま、次のいずれかで決定的な順序を
 ## スコープ外（本 Issue では対応しない）
 
 - 集計文（SQL-13／14）の複数キー `ORDER BY` と NULL 位置の PG 既定化
-  （`group_by.rs` は単一キー・NULL 常に末尾の既存規約のまま）
+  （**Issue #1185 で実施**: `docs/design/aggregate-order-by-and-scalar-group-keys.md`）
 - `DISTINCT`（#917）・複数列 `GROUP BY`（#918）
 - NoSQL 表層の `sort`（NOSQL-15・別 Issue #946・#947）
 - ランキング段の二次ソートキーとしての利用
