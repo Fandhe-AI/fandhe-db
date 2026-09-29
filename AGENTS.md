@@ -78,7 +78,15 @@ Fandhe-AI/actions の reusable workflow を `@latest` で呼び出す wrapper）
   **`Fandhe-AI/actions`（組織内の上流リポジトリ）への参照は例外で、可変タグ `@latest` を
   使う**（組織方針。`@latest` への統一・SHA pin の除去を指摘しない）。
   public リポジトリのため runner は GitHub ホステッドを既定とし、self-hosted の使用は
-  ai-review の codex / review ジョブ（組織承認済み例外）に限る
+  ai-review の codex / review ジョブ（組織承認済み例外）に限る。
+  **`ai-review.yml` の `skip-guard` ジョブが判定する同期 PR の AI レビュー skip も例外**とする
+  （オーナー判断 2026-09-29）。`update-external.yml` が生成する同期 PR は上流の取り込み
+  そのもので指摘を当該 PR では修正できないため。skip は接頭辞（`chore/skills-update-` /
+  `chore/submodule-update-`）・同一リポジトリ・同期 PR の作成主体・許可パスのみの変更を
+  すべて満たす場合に限り、guard の失敗時は通常どおりレビューする（fail-closed）。
+  作成主体が許可パス内を任意に変更した PR は skip される点を受容済み残留リスクとする
+  （Fandhe-AI/actions の `ai-review/README.md` 参照）。条件の緩和（接頭辞・作成主体・
+  許可パスの追加や判定の省略）は指摘する
 - **危険操作の混入（P1）**: `--no-verify`・force push・フック回避を促す/前提とする
   手順・スクリプトの追加
 
