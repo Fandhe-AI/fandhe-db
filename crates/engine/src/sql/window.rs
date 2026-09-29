@@ -240,7 +240,7 @@ struct MaterializedRow {
 /// `ORDER BY` 適用後の出力順（`materialized` への添字列）、`window_values` は
 /// ウィンドウ項目ごとの `materialized` と同じ添字で引ける値（Issue #1189）。
 struct EvaluatedWindows<'a> {
-    output_order: &'a [usize],
+    output_order: Option<&'a [usize]>,
     window_values: &'a [Vec<Cell>],
 }
 
@@ -322,7 +322,7 @@ fn execute_window_scan_with_caps(
         bound,
         &materialized,
         EvaluatedWindows {
-            output_order: &output_order,
+            output_order: output_order.as_deref(),
             window_values: &window_values,
         },
         max_result_bytes,
@@ -330,21 +330,29 @@ fn execute_window_scan_with_caps(
 }
 
 /// 文全体の `ORDER BY` を適用した出力順（`materialized` への添字列）を返す
-/// （Issue #1189・SQL-25・SQL-30）。`ORDER BY` なしは物理走査順の恒等順列。
+/// （Issue #1189・SQL-25・SQL-30）。`ORDER BY` なしは `None`（物理走査順の恒等。順列を確保しない）。
 /// ありの場合は base scan（`sql::scan`）と同一の比較器
 /// （[`compare_statement_order`]。キー → `id` → `tenant_id`）で安定ソートする。
 /// 経路 (A)（先頭キー `id` の早期打ち切り）は自テナント 1 つの範囲走査で `id` が
-/// テナント内一意なため、この順序と一致する。順列の確保は確保前に state 予算へ計上する。
+/// テナント内一意なため、この順序と一致する。順列とソート一時領域は確保前に state 予算へ計上する。
 fn compute_output_order(
     bound: &BoundScan,
     materialized: &[MaterializedRow],
     tenants: &[String],
     state_bytes: &mut usize,
     state_cap: usize,
-) -> Result<Vec<usize>, SqlSurfaceError> {
+) -> Result<Option<Vec<usize>>, SqlSurfaceError> {
+    // `ORDER BY` なしは物理走査順（添字そのもの）を使うため順列を確保しない
+    // （従来通っていた状態予算ぎりぎりの取得を新たに 54000 にしない。PR #1233 指摘）。
+    if bound.order_by.is_empty() {
+        return Ok(None);
+    }
+    // 順列本体に加え、安定ソート（`sort_by`）の一時領域は最大で要素数分（順列と
+    // 同サイズ）確保されうるため、上限を確保前に合わせて状態予算へ計上する。
     let bytes = materialized
         .len()
         .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|b| b.checked_mul(2))
         .ok_or_else(|| SqlSurfaceError::payload_too_large("window state size overflowed"))?;
     *state_bytes = try_accumulate_state_budget(*state_bytes, bytes, state_cap)?;
     let mut order: Vec<usize> = Vec::new();
@@ -352,9 +360,6 @@ fn compute_output_order(
         .try_reserve_exact(materialized.len())
         .map_err(|_| SqlSurfaceError::payload_too_large("window state allocation failed"))?;
     order.extend(0..materialized.len());
-    if bound.order_by.is_empty() {
-        return Ok(order);
-    }
     let tenant_bytes = |row: &MaterializedRow| -> &[u8] {
         tenants
             .get(row.tenant_idx as usize)
@@ -374,7 +379,7 @@ fn compute_output_order(
         ),
         _ => std::cmp::Ordering::Equal,
     });
-    Ok(order)
+    Ok(Some(order))
 }
 
 /// 対象テーブルを 1 回、`LIMIT` による早期終了なしで走査し、可視かつ `WHERE` を
@@ -1423,6 +1428,15 @@ fn observe_window_row(
     }
 }
 
+/// 出力位置 `pos` に対応する `materialized` の添字を返す。`order` が `None`
+/// （`ORDER BY` なし）なら物理走査順の恒等、`Some` なら順列経由で引く。
+fn resolve_output_index(order: Option<&[usize]>, pos: usize) -> Option<usize> {
+    match order {
+        None => Some(pos),
+        Some(o) => o.get(pos).copied(),
+    }
+}
+
 /// 投影段（§モジュールドキュメント参照）: ウィンドウ以外の投影・`LIMIT`／
 /// `OFFSET` は `windows` を空にした複製を [`crate::sql::scan::execute_scan`] へ
 /// 渡すことで既存の実行器をそのまま再利用し、その結果へウィンドウ列を
@@ -1476,7 +1490,10 @@ fn build_result(
             max_result_bytes,
         )?;
         for cells in window_values {
-            for &mat_idx in output_order.get(offset..output_end).unwrap_or(&[]) {
+            for pos in offset..output_end {
+                let Some(mat_idx) = resolve_output_index(output_order, pos) else {
+                    continue;
+                };
                 if let Some(Cell::Text(s)) = cells.get(mat_idx) {
                     window_bytes = try_accumulate_window_result_budget(
                         window_bytes,
@@ -1559,8 +1576,7 @@ fn build_result(
     // `ORDER BY` 適用後の順列。なしなら恒等）経由で引く。
     let mut output_pos = offset;
     for base_row in base_result.rows {
-        let materialized_idx = *output_order
-            .get(output_pos)
+        let materialized_idx = resolve_output_index(output_order, output_pos)
             .ok_or_else(|| window_bug("window scan row correlation index exceeded output order"))?;
         let mat_row = materialized.get(materialized_idx).ok_or_else(|| {
             window_bug("window scan row correlation index exceeded materialized rows")
@@ -1834,6 +1850,19 @@ mod budget_regression_tests {
             materialize_only_bytes.saturating_add(1_000_000),
         )
         .expect("cap with headroom for the evaluation stage should succeed");
+    }
+
+    /// PR #1233 指摘の回帰: `ORDER BY` なしでは順列を確保せず状態予算にも計上しない
+    /// （予算を使い切った状態でも成功し `None` を返す）。
+    #[test]
+    fn compute_output_order_without_order_by_allocates_nothing() {
+        let bound = bound_min_body_over();
+        assert!(bound.order_by.is_empty());
+        let mut state_bytes = 10usize;
+        let out = compute_output_order(&bound, &[], &[], &mut state_bytes, 10)
+            .expect("no ORDER BY must not touch the state budget");
+        assert!(out.is_none());
+        assert_eq!(state_bytes, 10);
     }
 
     /// `window_func_to_aggregate_func` が `AggregateFunc::Min` へ変換すること
