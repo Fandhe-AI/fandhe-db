@@ -360,3 +360,141 @@ fn max_insert_rows_over_batch_limits_default_emits_warning_unless_env_raised() {
         );
     }
 }
+
+/// `--batch-max-files`（Issue #1166）付きで起動し、`listening on` までの
+/// stderr 全行を返す。`env` は子プロセス単位で与える（テストプロセス自身の
+/// 環境は変えない）。`VECTOR_DB_BATCH_MAX_CHUNKS` は常に除去して既定に固定する。
+fn listening_lines_with(label: &str, extra_args: &[&str], env: &[(&str, &str)]) -> Vec<String> {
+    let fixture = TempFixtureDir::new(label);
+    let users_path = fixture.users_path_str();
+    write_empty_user_store(&users_path);
+    let db_path = fixture.db_path_str();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wire-server"));
+    cmd.args([
+        "--users",
+        &users_path,
+        "--db",
+        &db_path,
+        "--bind",
+        "127.0.0.1:0",
+    ])
+    .args(extra_args)
+    .env_remove("VECTOR_DB_BATCH_MAX_FILES")
+    .env_remove("VECTOR_DB_BATCH_MAX_CHUNKS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wire-server");
+    let lines = wait_for_listening_lines(&mut child);
+    let _ = child.kill();
+    let _ = child.wait();
+    lines
+}
+
+/// B1: 範囲内の `--batch-max-files` は起動を妨げない。
+#[test]
+fn batch_max_files_in_range_starts_listening() {
+    for (idx, v) in ["1", "1000000"].iter().enumerate() {
+        let lines = listening_lines_with(&format!("b1-{idx}"), &["--batch-max-files", v], &[]);
+        assert!(lines.iter().any(|l| l.contains("listening on")));
+    }
+}
+
+/// B2〜B4: 値欠落・重複・範囲外・非数値は非 0 終了で stderr にフラグ名を含む。
+#[test]
+fn batch_max_files_invalid_values_are_rejected() {
+    let fixture = TempFixtureDir::new("b2-b4");
+    let users_path = fixture.users_path_str();
+    write_empty_user_store(&users_path);
+    let db_path = fixture.db_path_str();
+
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (vec!["--batch-max-files"], "--batch-max-files"),
+        (
+            vec!["--batch-max-files", "5", "--batch-max-files", "6"],
+            "specified more than once",
+        ),
+        (vec!["--batch-max-files", "0"], "--batch-max-files"),
+        (vec!["--batch-max-files", "1000001"], "--batch-max-files"),
+        (vec!["--batch-max-files", "abc"], "--batch-max-files"),
+        (vec!["--batch-max-files", "+5"], "--batch-max-files"),
+        (vec!["--batch-max-files", " 5"], "--batch-max-files"),
+        (vec!["--batch-max-files", "5 "], "--batch-max-files"),
+    ];
+    for (extra_args, expected) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
+            .args([
+                "--users",
+                &users_path,
+                "--db",
+                &db_path,
+                "--bind",
+                "127.0.0.1:0",
+            ])
+            .args(&extra_args)
+            .output()
+            .expect("spawn wire-server");
+        assert!(
+            !output.status.success(),
+            "args={extra_args:?}: expected non-zero exit"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "args={extra_args:?}: expected stderr to mention {expected}, got: {stderr}"
+        );
+    }
+}
+
+/// B5: `--batch-max-files` で `--max-insert-rows` 以上へ引き上げれば WARNING なし。
+#[test]
+fn batch_max_files_flag_silences_insert_rows_warning() {
+    let lines = listening_lines_with(
+        "b5",
+        &["--max-insert-rows", "100", "--batch-max-files", "100"],
+        &[],
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("WARNING")),
+        "unexpected WARNING: {lines:?}"
+    );
+}
+
+/// B6: 優先順位は CLI 明示 > 環境変数。環境変数が 100 でも CLI の 10 が効き、
+/// WARNING は CLI 側の実効上限 10 を報告する。
+#[test]
+fn batch_max_files_flag_takes_precedence_over_env() {
+    let lines = listening_lines_with(
+        "b6",
+        &["--max-insert-rows", "50", "--batch-max-files", "10"],
+        &[("VECTOR_DB_BATCH_MAX_FILES", "100")],
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("WARNING")
+            && l.contains("--max-insert-rows")
+            && l.contains("capped at 10 rows")),
+        "expected WARNING reporting cap 10, got: {lines:?}"
+    );
+}
+
+/// B8: files 側が十分大きくても `max_batch_chunks`（既定 4096）が実効上限に
+/// なる場合、WARNING は chunks 側の上限と環境変数名を案内する。
+#[test]
+fn insert_rows_warning_reports_chunks_cap_when_effective() {
+    let lines = listening_lines_with(
+        "b8",
+        &["--max-insert-rows", "5000", "--batch-max-files", "10000"],
+        &[],
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("WARNING")
+            && l.contains("VECTOR_DB_BATCH_MAX_CHUNKS")
+            && l.contains("4096")),
+        "expected chunks-side WARNING, got: {lines:?}"
+    );
+}
