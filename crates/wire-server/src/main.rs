@@ -9,6 +9,7 @@
 //! [--planner-endpoint <host:port> --planner-model <name>]
 //! [--embedder-hashing-dim <N>]
 //! [--search-engine default|hnsw|hnsw_f16|hnsw_i8]
+//! [--batch-max-files <N>]
 //! [--hnsw-full-scan-ratio <num>/<den>]
 //! [--hnsw-acorn-max-visible-ratio <num>/<den>]
 //! [--hnsw-sparse-visited-max <N>]
@@ -126,13 +127,21 @@
 //! ため資源上限は引き続き機能する。複数行 `VALUES` は本上限に加えて独立した
 //! 別上限 `batch_limits.max_files_per_batch`（既定 64。Issue #860）も通るため、
 //! `--max-insert-rows` を明示指定した値・または未指定時の既定（上限なし）が
-//! 64 超であっても、環境変数 `VECTOR_DB_BATCH_MAX_FILES` を併せて引き上げない
-//! 限り複数行 `VALUES` は 64 行超で `54000` のまま（wire-server は
-//! `--max-insert-rows`／`--max-dml-affected-rows` 以外に `batch_limits` を
-//! 設定する CLI フラグを持たない。専用フラグの追加は Issue #997 のオーナー
-//! 承認範囲外）。`--max-insert-rows` を明示指定してこの上限を超える場合のみ
-//! 起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
+//! 64 超であっても、`--batch-max-files`（下記）または環境変数
+//! `VECTOR_DB_BATCH_MAX_FILES` を併せて引き上げない限り複数行 `VALUES` は
+//! 64 行超で `54000` のまま。`--max-insert-rows` を明示指定してこの実効上限
+//! を超える場合のみ起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
 //! `wire_server::dml_limits_opt::insert_rows_cap_warning`）。
+//!
+//! `--batch-max-files <N>`（Issue #1166）: `batch_limits.max_files_per_batch`
+//! （SQL 複数行 `VALUES`・NoSQL `insert rows[]`・ファイル形バッチ・COPY FROM が
+//! 共有する 1 バッチ件数上限）をプロセス全体に対して起動時に設定する。
+//! 優先順位は **CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64**。
+//! 指定可能範囲は `1`〜`1,000,000`
+//! （`engine::batch_limits::MAX_BATCH_MAX_FILES`）。範囲外・非数値・値欠落・
+//! 2 回目以降の重複指定は fail-closed で起動エラー。解決は
+//! `wire_server::dml_limits_opt::resolve_batch_limits` に一本化し、同じ値を
+//! `EngineCore::with_batch_limits` と `insert_rows_cap_warning` の両方へ渡す。
 //!
 //! `--hnsw-scope`（Issue #1065・オーナー判断 2026-09-28）: HNSW opt-in
 //! （`--search-engine hnsw*`）時に HNSW 経路を使うテーブルの範囲を選ぶ
@@ -280,6 +289,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut hnsw_scope_raw: Option<String> = None;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
+    let mut batch_max_files_raw: Option<String> = None;
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
@@ -529,6 +539,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_insert_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::BATCH_MAX_FILES_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::BATCH_MAX_FILES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1166: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if batch_max_files_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::BATCH_MAX_FILES_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                batch_max_files_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::ddl_permission_opt::FLAG => {
@@ -805,6 +835,22 @@ fn run_server(args: &[String]) -> ExitCode {
         Ok(limits) => limits,
         Err(e) => {
             engine::log_stderr!("wire-server: invalid DML row limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1166: `--batch-max-files` を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed）。`BatchLimits::default()` が環境変数
+    // `VECTOR_DB_BATCH_MAX_FILES`・既定を解決済みで、CLI 明示があれば上書きする
+    // （CLI > 環境変数 > 既定）。この値を `with_batch_limits` と警告判定の両方へ
+    // 渡し、engine の実効値と警告の判定値を一致させる。
+    let batch_limits = match wire_server::dml_limits_opt::resolve_batch_limits(
+        engine::batch_limits::BatchLimits::default(),
+        batch_max_files_raw.as_deref(),
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid batch limit configuration: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1186,6 +1232,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで
+    // 解決済みで、`EngineCore` の既定 `BatchLimits::default()` とビット同一）。
+    core = core.with_batch_limits(batch_limits);
     // Issue #1065: 未指定でも常に呼ぶ（既定 `HnswScope::All` は
     // `with_hnsw_scope` を呼ばない構築とビット同一）。HNSW opt-in なしの構築
     // では engine 側で参照されない。
@@ -1228,17 +1277,15 @@ fn run_server(args: &[String]) -> ExitCode {
     }
 
     // Issue #997（codex-review P1 指摘・PR #1122）: `--max-insert-rows` を
-    // `batch_limits.max_files_per_batch`（既定 64。wire-server は本 CLI から
-    // `EngineCore::with_batch_limits` を呼ばないため常に既定値）超に設定した
-    // 場合、複数行 `VALUES` は引き続き `max_files_per_batch` 側で `54000` に
-    // なり CLI の引き上げが黙って無効化される。`--durability none` の
+    // `batch_limits` の実効上限（`--batch-max-files`／環境変数／既定で解決済み。
+    // Issue #1166）超に設定した場合、複数行 `VALUES` は引き続き batch_limits
+    // 側で `54000` になり CLI の引き上げが黙って無効化される。`--durability none` の
     // `WARNING` 行と同じ「安全上の含意を見落とさせない」設計判断でログへ
     // 出す（エラーにはしない。`dml_limits_opt::insert_rows_cap_warning`
     // ドキュメント参照）。
-    if let Some(warning) = wire_server::dml_limits_opt::insert_rows_cap_warning(
-        &dml_limits,
-        &engine::batch_limits::BatchLimits::default(),
-    ) {
+    if let Some(warning) =
+        wire_server::dml_limits_opt::insert_rows_cap_warning(&dml_limits, &batch_limits)
+    {
         engine::log_stderr!("wire-server: WARNING: {warning}");
     }
 

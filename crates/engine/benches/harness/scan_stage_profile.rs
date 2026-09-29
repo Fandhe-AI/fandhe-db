@@ -294,7 +294,7 @@ pub fn matches_lang_filter(
 /// W1 段本体: `row_codec::scan_scalar_columns` の薄いラッパー（pub API を直接
 /// 呼ぶだけだが、呼び出し側の意図を明確にするため名前を用意する）。
 pub fn scan_scalar_columns<'a>(
-    schema: &engine::catalog::TableSchema,
+    schema: &'a engine::catalog::TableSchema,
     metadata: &'a [u8],
 ) -> Result<Vec<Option<row_codec::ScalarRef<'a>>>, ScanStageError> {
     row_codec::scan_scalar_columns(schema, metadata)

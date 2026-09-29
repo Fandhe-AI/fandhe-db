@@ -39,10 +39,11 @@
 //! 一切変更しない。
 
 use crate::catalog::{
-    AlterCheckError, CatalogError, ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema,
+    AlterCheckError, CatalogError, ColumnDef, ColumnDefault, ColumnType, IndexDef, IndexKind,
+    TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::sql::allowlist::{
-    SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
+    InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
     ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
     ValidatedCreateTable, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
@@ -311,8 +312,12 @@ pub enum AlterTableAction {
 ///    テーブルの存在・列数上限・列名重複を再確認。TOCTOU なし）。1. と 3. の間に
 ///    テーブルが削除された場合も 1. と同じ写像（`42P01`／`42809`）になる。
 ///
-/// 追加列は常に nullable として扱う（呼び出し元がこの契約を上書きする経路は
-/// 存在しない。TABLE-5）。
+/// `NOT NULL`／`DEFAULT` を受け付ける（Issue #1169）。`DEFAULT` は列型との整合
+/// （[`add_column_default`]）・値の束縛（`22000`／`22003`）を検証してから渡し、
+/// 既存行は読み出し時に既定値として見える。`DEFAULT` なしの `NOT NULL` は行の
+/// 有無によらず構造検証段階で一律 `42601` 拒否される（TABLE-16。`Storage` を直接呼ぶ
+/// Rust API は `CatalogError::Invalid`。行ストアを参照せず他テナントの行の存在を漏らさない）。
+/// `DEFAULT`・`NOT NULL` のいずれも無い列は従来どおり nullable（TABLE-5）。
 pub(crate) fn execute_alter_table_add_column(
     storage: &Storage,
     stmt: &ValidatedAlterTableAddColumn,
@@ -325,7 +330,17 @@ pub(crate) fn execute_alter_table_add_column(
         Err(other) => return Err(map_add_column_error(other)),
     }
     let ty = resolve_column_type(storage, &stmt.column_type)?;
-    let column = ColumnDef::new(stmt.column_name.clone(), ty, true);
+    let default = match &stmt.default {
+        None => None,
+        Some(literal) => Some(add_column_default(&stmt.column_name, &ty, literal)?),
+    };
+    let mut column = ColumnDef::new(stmt.column_name.clone(), ty, !stmt.not_null);
+    if let Some(default) = default {
+        // 束縛できない DEFAULT（範囲外・桁数超過等）は永続化前に SQLSTATE 付きで拒否する
+        // （既存行の読み出し時補完が常に失敗する状態をカタログへ残さない）。
+        crate::sql::parser::bind_column_default(&column, &default)?;
+        column = column.with_default(default);
+    }
     storage
         .alter_table_add_column(&stmt.table_name, column)
         .map_err(|e| match e {
@@ -785,6 +800,58 @@ fn resolve_column_type(
             Ok(ColumnType::Enum(def))
         }
     }
+}
+
+/// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
+/// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
+/// （日時・BYTEA・JSON・UUID・ENUM・配列等）は `0A000`、対応型でリテラル種別が
+/// 合わない場合は `42601`、長さ上限超過は `54000`。
+fn add_column_default(
+    column_name: &str,
+    ty: &ColumnType,
+    literal: &InsertLiteral,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    let kind = match ty {
+        ColumnType::Text => "text",
+        ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double
+        | ColumnType::Numeric { .. } => "numeric",
+        ColumnType::Boolean => "boolean",
+        _ => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: format!("column {column_name:?}: DEFAULT is not supported for this type"),
+            })
+        }
+    };
+    let mismatch = || {
+        SqlSurfaceError::unsupported(format!(
+            "column {column_name:?} DEFAULT expects a {kind} literal"
+        ))
+    };
+    match literal {
+        InsertLiteral::String(s) if kind == "text" => {
+            if s.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            Ok(ColumnDefault::Text(s.clone()))
+        }
+        InsertLiteral::Number(n) if kind == "numeric" => {
+            if n.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            Ok(ColumnDefault::Number(n.clone()))
+        }
+        InsertLiteral::Bool(b) if kind == "boolean" => Ok(ColumnDefault::Bool(*b)),
+        _ => Err(mismatch()),
+    }
+}
+
+fn default_too_long(column_name: &str) -> SqlSurfaceError {
+    SqlSurfaceError::payload_too_large(format!(
+        "column {column_name:?} DEFAULT literal exceeds length limit"
+    ))
 }
 
 /// `Storage::alter_table_add_column`（および ENUM 型名解決）の [`CatalogError`] を
