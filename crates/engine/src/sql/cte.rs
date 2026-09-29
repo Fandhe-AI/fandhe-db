@@ -141,6 +141,13 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
             view_predicates,
             view_columns,
         } => (base_table, view_predicates, view_columns),
+        // Issue #1192: 評価後射影形ビューは CTE から参照できない
+        // （外側の合成ができないため）。
+        Resolved::Buffered { .. } => {
+            return Err(SqlSurfaceError::unsupported(
+                "a view with an aggregate/LIMIT body cannot be used in a CTE",
+            ));
+        }
     };
 
     // `ParsedViewBody`（CTE 本文）は構文上 `ORDER BY` を持たない

@@ -48,6 +48,82 @@ fail-closed で落ちる——ビューの存在の有無に関わらず同一�
 情報漏えいにはならないが、PostgreSQL 的な「操作対象が違う」区別
 （`42809` 相当）ではない点は既知の簡略化として記録する。
 
+## Phase 2（Issue #1192）: 本文の受理形の拡大と集計からの参照
+
+対象ビヘイビア: TABLE-18（主対象）・SQL-13／SQL-14（集計・`GROUP BY`）・
+SQL-15（広域取得）・SQL-25（`ORDER BY`／`OFFSET`／`DISTINCT`）・SQL-28（JOIN）・
+RLS-10 (b)・ERR-6。spec 本文は転記しない。
+
+### 本文の 2 系統
+
+| 系統 | 本文 | 参照時の処理 |
+| ---- | ---- | ------------ |
+| 単純形（Phase 1。変更なし） | 単一 relation への射影＋単純述語（`LIMIT` なし） | 既存のインライン展開（`Resolved::View`） |
+| 評価後射影形（Buffered。新設） | 広域取得に `LIMIT`／`OFFSET`／スカラー `ORDER BY` が付いたもの、集計（`GROUP BY`／`HAVING`／`ORDER BY`／`LIMIT`／`SELECT DISTINCT`）、2 テーブル JOIN（`LIMIT` 必須） | 本文を 1 文として、**参照したセッション自身**の `PolicyContext`・同一スナップショットで既存の実行経路に通し、結果へ外側の列射影と `LIMIT`／`OFFSET` の切り出しだけを行う |
+
+- 判定は `sql::allowlist::classify_view_body`: まず単純形（`parse_view_body`）を
+  試し、失敗した場合のみ評価後射影形として、通常の SELECT と同じ
+  `validate_sql_tokens` を通して文の種別を確定させ、`check_buffered_body_shape`
+  で許可形状（`Scan`／`Aggregate`／`Join`）に絞る。第 2 のパーサー・実行器は
+  作らない。`CREATE VIEW` 時はカタログを照会しない構文専用 lookup
+  （`StructuralOnlyLookup`）を渡し、判定順序（構文 `42601` → DDL 権限 `42501` →
+  カタログ判定）を保つ。参照時は実カタログのラッパー（再帰ガード付き）を渡す。
+- 永続化する本文は、検証済みトークン列の正規化描画（`sql::lexer::render_tokens`）。
+  旧形式（Phase 1）で保存された単純形本文は無変更で再パースでき、カタログの
+  フォーマット変更・移行は不要。`ParsedViewBody`／`parse_view_body`／
+  `render_view_body` のシグネチャは変更していない（CTE と共有）。
+- 本文に書けないもの（`42601`）: ベクトル順位付け・`HYBRID`・`USING PLAN`・
+  `EXPLAIN`・CTE・集合演算・サブクエリ・ウィンドウ項目・式項目・式述語・
+  UDF 述語・集計引数の式（本文が参照セッションの UDF レジストリに依存しない
+  ようにする）。
+
+### 評価後射影形ビューを参照するクエリ
+
+外側クエリは `SELECT <* | 列名リスト> FROM <view> LIMIT n [OFFSET m]` のみ
+（`Statement::BufferedView`。破壊的変更: 公開 enum への variant 追加）。外側の
+`WHERE`／`ORDER BY`／集計／ウィンドウ項目・式項目は `42601`。列指定が本文の結果列に
+無ければ `22000`、本文に同名の結果列が複数あって一意に決まらなければ `42702`
+（PostgreSQL は作成時に拒否するが、本実装は参照時に拒否する差異）。後処理では
+ソートせず、本文が固定した順序をそのまま保つ。`EXPLAIN`・cursor の `DECLARE`・
+サブクエリの内側・CTE・集合演算の枝・JOIN の辺・`validate_statement` からの
+参照は `42601`。明示トランザクション内では他の読み取り文と同じく、未 commit の
+変更を読む経路で本文を評価する。拡張クエリの Describe は本文の列メタデータを
+導出して外側の射影だけを適用する（本文は実行しない）。
+
+### 連鎖・依存関係
+
+- 評価後射影形は連鎖の最外段の 1 段に限る（再帰の深さの上限）。評価後射影形本文が
+  別の評価後射影形ビューを指す、または単純形ビューが評価後射影形ビューを指す
+  `CREATE VIEW` は `42601`（`Storage::create_view` が write txn 内で判定）。
+  参照時も内側に現れた場合は `42601`（`BufferedBodyLookup` が再帰しない）。
+- 本文が読む**すべての** relation の存在を作成時に確認する（`42P01`。JOIN の右辺を
+  含む）。JOIN 本文の両辺はテーブルに限る（`42601`）。
+- `DROP TABLE`／`DROP VIEW` の依存検査は `base_relation` だけでなく本文が読む全
+  relation で判定する（JOIN 右辺の `DROP TABLE` は `2BP01`）。本文を再検証できない
+  ビューは fail-closed で「依存あり」とする。`ALTER TABLE DROP COLUMN` は、評価後射影形
+  ビューが対象テーブルを読んでいれば保守的に拒否し、無関係なテーブルのみを読む
+  ビューは妨げない。
+
+### 集計・`SELECT DISTINCT` からの単純形ビュー参照
+
+`validate_select_statement` の集計・DISTINCT 分岐は `lookup.table_exists` の代わりに
+`resolve_from` を使い、単純形ビューは基底テーブルへ書き換えてビュー由来の述語を
+先頭にマージする（`build_aggregate_from_resolved`。非破壊）。列スコープは
+`sql::view::check_aggregate_columns_within_view` で検査する（グループキー・集計
+引数の式木・`GROUP BY` 列・`ORDER BY` 対象・`WHERE` の `OR`／`NOT` を再帰。ビューが
+公開しない列を集計に使う filter oracle を塞ぐ）。評価後射影形ビューへの集計は
+`42601`。`EXPLAIN` の集計も同じ経路を通るため、単純形ビューへの
+`EXPLAIN SELECT COUNT(*) ...` を受け付けるようになった（広域取得の `EXPLAIN` が
+既にビュー展開を受け付けているのと整合）。
+
+### RLS-10 (b) の維持
+
+`ViewDef` は Phase 2 でも `tenant_id`／`PolicyContext`／作成者の情報を持たない。
+評価後射影形の本文は参照セッションの `ctx` で既存の実行経路が評価するため
+（JOIN は両辺に独立して適用）、作成者の可視性は構造的に引き継がれない。外側の
+後処理（`sql::view_buffered`）は `PolicyContext` を受け取らず、可視性判定に関与
+しない。3 テナント対照の結合テスト（`tests/table18_view.rs`）で固定した。
+
 ## 展開方式（検証段階での書き換え）
 
 `sql::allowlist::validate_sql_tokens` の `Statement::Scan` 分岐にある
@@ -133,11 +209,14 @@ body のリテラル値・破損理由の詳細をクライアントへ運ばな
 
 ## 対象外・申し送り
 
-- 集計形の body、LIMIT／`ORDER BY` 付きの body。
-- ビューを対象にした集計（`Statement::Aggregate`）・ベクトル検索
-  （`Statement::Select`）・`EXPLAIN`（上記「ビューを参照するクエリ」節参照。
-  ベクトル検索・`EXPLAIN` は仕様上も対象外、集計は実装時間の制約による
-  スコープ縮小）。
+- ~~集計形の body、LIMIT／`ORDER BY` 付きの body~~・~~ビューを対象にした集計~~
+  は Phase 2（Issue #1192）で対応済み（上記節参照）。ビューを対象にした
+  ベクトル検索（`Statement::Select`）は仕様上も対象外。
+- Phase 2 の申し送り: 評価後射影形ビューに対する外側の `WHERE`／`ORDER BY`／集計／
+  ウィンドウ関数（評価済みセルを評価する仕組みが必要）、評価後射影形の連鎖、本文での
+  CTE・集合演算・サブクエリ・ウィンドウ関数・式項目・UDF 述語、3 テーブル以上の
+  JOIN 本文と JOIN の辺のビュー、評価後射影形ビューへの cursor `DECLARE`／
+  `EXPLAIN`。
 - 許可名の述語呼び出し（`WherePredicate::PredicateCall`。空引数の呼び出し形
   で列参照を持たない）のビュー越し列スコープ検査。なお式項目
   （`SelectItem::Expr`）・式述語（`WherePredicate::Expression`）は
