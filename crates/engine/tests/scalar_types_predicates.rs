@@ -412,7 +412,7 @@ fn integer_column_expression_projection_and_aggregate_work() {
 }
 
 #[test]
-fn integer_column_division_by_zero_is_22000() {
+fn integer_column_division_by_zero_is_22012() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -423,7 +423,7 @@ fn integer_column_division_by_zero_is_22000() {
             &format!("SELECT id FROM {TABLE} WHERE qty / 0 > 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 }
 
 // --- TEXT 列の範囲比較（Issue #1183。バイト順） ---------------------------------
