@@ -989,7 +989,8 @@ const PARITY_CASES: &[ParityCase] = &[
 /// Issue #950 §3.6「拒否ケース」: NoSQL 表層が意図的に受理しない形
 /// （`nosql-api.md`「対応の無いもの」節）を alice 1 テナントで固定する
 /// （`(label, json_body, expected_wire_code)`）。`search`／`aggregate` への
-/// `sort`／`offset`（#946・#947 の対象外化）・語彙外 `op`・`filter` への
+/// `sort`／`offset`（`search` への付与、および `group_by` なし `aggregate` への
+/// `offset`。`group_by` あり `aggregate` は #1198 で受理）・語彙外 `op`・`filter` への
 /// RLS 述語名指定（`.claude/rules/security.md` P0）を含む。
 const REJECTION_CASES: &[(&str, &str, &str)] = &[
     (
@@ -998,7 +999,7 @@ const REJECTION_CASES: &[(&str, &str, &str)] = &[
         "42601",
     ),
     (
-        "reject-offset-on-aggregate",
+        "reject-offset-on-group-by-less-aggregate",
         r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"offset":1}"#,
         "42601",
     ),

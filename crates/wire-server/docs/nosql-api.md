@@ -230,7 +230,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - 未知テーブル → `42P01`
 - 未知列・`VECTOR` 列でない列への `ORDER BY` 相当・非有限ベクトル要素等 → `22000`
 
-`sort`（`scan` op のみが持つ、スカラー列の決定的な並べ替え指定。後述）は
+`sort`（`scan`・`aggregate` op が持つ、決定的な並べ替え指定。後述）は
 本スキーマに宣言していないため、指定すると未知キー `42601` になる（ベクトル
 順位付けとの相互排他。NOSQL-15・SQL-25 (a)・Issue #946）。
 
@@ -254,8 +254,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
-持たない）。`offset` も同じ理由で `search`／`aggregate` へ付与すると `42601`
-になる（Issue #947・NOSQL-15。`scan` op 専用）。
+持たない）。`offset` も同じ理由で `search` へ付与すると `42601` になる
+（Issue #947・NOSQL-15）。`aggregate` の `offset` は `group_by` 付きに限り別途
+受理する（[`aggregate`](#aggregate) 参照。Issue #1198）。
 
 要求例:
 
@@ -311,9 +312,11 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `table` | ○ | string | |
 | `aggregates` | ○ | object[]（`{"fn","column"}`。1〜32 要素） | `fn` は `count`／`sum`／`avg`／`min`／`max`（小文字完全一致）。`column` は列名、または `count` 専用の `"*"` |
 | `filter` | △ | object[] | |
-| `group_by` | △ | string[]（1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | `TEXT`・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列（Issue #1183。数値キーは昇順・NULL 末尾・`-0.0` と `0.0` は同一グループ） |
+| `group_by` | △ | string \| string[]（配列は 1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | 単一文字列形 `"lang"` は 1 要素配列 `["lang"]` と完全に同じ扱い（NOSQL-16 (b)。Issue #1198）。`TEXT`・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列（Issue #1183。数値キーは昇順・NULL 末尾・`-0.0` と `0.0` は同一グループ） |
 | `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
-| `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having` 付きでも受理）。`false`／省略時は通常実行 |
+| `sort` | △ | object[]（`{"column","dir"}`。非空、上限 8 要素） | `group_by` 必須。`column` は集計結果の出力列名（`group_by` 列名、または集計項目の既定エイリアス `count`／`sum`／`avg`／`min`／`max`）。`dir` は `"asc"`／`"desc"`（小文字完全一致）。同値はグループキー順。SQL の `GROUP BY ... ORDER BY` と同一結果（Issue #1198・NOSQL-15） |
+| `offset` | △ | number | `group_by` 必須。`0..=10000`。ソート後の結果から先頭 `offset` グループを読み飛ばす（RLS 適用後の可視グループのみが対象）。`sort` 省略時はグループキー昇順の上で適用（Issue #1198・NOSQL-15） |
+| `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having`／`sort`／`offset` 付きでも受理）。`false`／省略時は通常実行 |
 
 要求例（単一行集計）:
 
@@ -331,12 +334,29 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
  "having": [{"fn": "count", "column": "*", "op": ">=", "value": 2}]}
 ```
 
+要求例（単一文字列形 `group_by`＋`sort`＋`offset`）:
+
+```json
+{"op": "aggregate", "table": "docs",
+ "aggregates": [{"fn": "count", "column": "*"}],
+ "group_by": "lang",
+ "sort": [{"column": "count", "dir": "desc"}],
+ "offset": 1}
+```
+
 主な `wire_code`:
 
 - `aggregates` が空配列 → `group_by`／`having` の有無を問わず一律 `42601`
   （`having` の参照解決より必ず先に検査する）
-- `group_by` 要素数が 0・`having` のみ単独指定（`group_by` なし）・
-  `fn`／`op` が語彙外・識別子形状不正 → `42601`
+- `group_by` 要素数が 0・`group_by` なしの `having`／`sort`／`offset`
+  （`offset: 0` の明示を含む。SQL 表層に単一行集計への `ORDER BY`／`OFFSET` の
+  受理形がなく、黙って無視すると fail-open になるため）・
+  `fn`／`op` が語彙外・識別子形状不正（`group_by` の空文字列を含む）→ `42601`
+- `sort` が空配列・非オブジェクト要素・`column`／`dir` 欠落・`dir` が語彙外・
+  `column` が識別子形状不正（`"*"` を含む）→ `42601`。要素数が 8 超過 → `54000`
+  （HTTP `413`）。`column` が出力列名に存在しない・複数の出力列に一致
+  （例: `count(*)` と `count(lang)` を併記して `"count"` を指定）→ `22000`
+- `offset` が非整数・負値・`u32` 超過 → `42601`、`10001` 以上 → `22000`
 - `group_by` 要素数が 8（`MAX_GROUP_BY_COLUMNS`）超過・グループ数上限
   （10,000）・グループキー累計バイト・`having` 述語数上限超過 → `54000`
 - `group_by` 列が `TEXT`／数値列（INTEGER／BIGINT／REAL／DOUBLE）でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
@@ -346,9 +366,11 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
   `sum`／`avg`／`min`／`max` は同じ `VECTOR` 列参照を一律 `22000` で拒否
 - `sum` オーバーフロー → `22003`
 
-`sort` は本スキーマに宣言していないため未知キー `42601` になる（Issue #946 の
-スコープ外。engine の集計 `ORDER BY` を SQL-25 (a) 相当へ揃える先行作業が
-必要。[spec 側への申し送り候補](#spec-側への申し送り候補)参照）。
+`sort`／`offset` は engine の `BoundAggregate::with_group_order_by`／
+`with_group_offset`（SQL テキスト経由の `GROUP BY ... ORDER BY ... LIMIT ...
+OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器は持たない）へ写像する。
+`limit` 相当のキーは持たない（SQL の `OFFSET` 単独が受理されないため、`offset`
+のみの要求と SQL の一致は `LIMIT 10000 OFFSET m` で確認する）。
 
 ### `insert`
 
@@ -801,6 +823,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `SELECT id, lang FROM docs LIMIT 10 OFFSET 20`（広域取得 `OFFSET`。SQL-25 (b)） | `scan` + `offset`（Issue #947・NOSQL-15） |
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
+| `SELECT lang, COUNT(*) FROM docs GROUP BY lang ORDER BY count DESC LIMIT 10000 OFFSET 1`（SQL-25 (a)(b)） | `aggregate` + `group_by` + `sort` + `offset`（Issue #1198・NOSQL-15。`limit` 相当のキーは無く、`LIMIT` は SQL 側のグループ数上限と同値で対応） |
 | `EXPLAIN SELECT COUNT(*) FROM docs` | `aggregate` + `"explain":true`（Issue #948） |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
 | `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
@@ -819,8 +842,8 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - UDF 呼び出し・`CREATE FUNCTION`
 - `SET`（`search_mode` 等のセッション変数設定）
 - 定数のみの `SELECT`
-- `aggregate` への `offset`（`GROUP BY ... LIMIT n OFFSET m` 相当。NoSQL 側は
-  `limit` 相当の受理形も engine 側の公開 offset setter も持たないため未対応）
+- `aggregate` への `limit`（`GROUP BY ... LIMIT n` 相当。`sort`／`offset` は
+  Issue #1198 で対応済みだが、`limit` 相当のキーは未対応）
 - `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
   中間一致・後方一致・`_` を受理するが、NoSQL `filter` 側は未対応のまま。
   NoSQL 側の対応は NOSQL-14 の担当）
@@ -1082,7 +1105,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
   `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
-  `nosql4_5_aggregate_wire_parity.rs`
+  `nosql4_5_aggregate_wire_parity.rs`・`nosql16_multi_group_by.rs`・
+  `nosql15_aggregate_sort_offset.rs`（`sort`／`offset`・単一文字列形 `group_by`。
+  Issue #1198・NOSQL-15）
 - `explain`（`vector` 指定 `search`・`scan`・`aggregate` への対象拡大。
   Issue #948・NOSQL-16・SQL-27）: `nosql16_explain_targets.rs`
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
@@ -1116,8 +1141,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   （本リポの実装判断であり spec 側での明文化は未定）
 - 集計 `id` 列等の巨大整数（`u64`。2^53 超）を JSON number としてそのまま返す
   ことの是非（文字列化への変更は spec 側判断に委ねられている）
-- `aggregate` への `sort` は engine の集計 `ORDER BY` を SQL-25 (a) 相当へ揃える
-  先行作業が未着手のため対象外とした（Issue #946。現状は未知キー `42601` を
-  維持）
+- `aggregate` への `sort` は Issue #1198 で解消済み（`group_by` 必須・複数キー
+  〔上限 8〕対応。`group_by` なしの単一行集計への `sort`／`offset` は SQL 表層に
+  受理形がないため `42601` を維持しており、spec 側で扱いを明文化するかは
+  申し送り候補）
 - `sort[].dir` を必須・小文字完全一致（`"asc"`／`"desc"`）とした実装既定
   （Issue #946。`filter[].op`・`having[].op` と同じ厳格な語彙判断を踏襲）

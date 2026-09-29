@@ -608,11 +608,13 @@ fn offset_combined_with_explain_true_is_accepted_and_returns_scan_plan() {
     assert!(body_str.contains("full_scan"), "body={body_str}");
 }
 
-/// `search`／`aggregate` op への `offset` 付与は未知キーとして `42601` になる
-/// （`schema.rs::offset_is_unknown_key_for_search_and_aggregate` の HTTP 越し
-/// 再確認）。
+/// `search` op への `offset` 付与は未知キーとして `42601` になる
+/// （`schema.rs::offset_is_unknown_key_for_search` の HTTP 越し再確認）。
+/// `aggregate` op の `offset` は Issue #1198 で受理形ができたが、`group_by` なしの
+/// 単一行集計への `offset` は SQL 表層に受理形がないため `42601`（`group_by` あり
+/// の受理は `nosql15_aggregate_sort_offset.rs` が固定する）。
 #[test]
-fn offset_on_search_and_aggregate_ops_is_rejected_with_42601() {
+fn offset_on_search_and_group_by_less_aggregate_is_rejected_with_42601() {
     let (core, _guard) = new_core_with_tenant_a_rows(1);
     let addr = spawn(Arc::clone(&core));
 
