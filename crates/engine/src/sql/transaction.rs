@@ -133,7 +133,9 @@ struct ActiveTxn<'e> {
     /// （カーソルの寿命がトランザクションの寿命に一致する設計。
     /// `sql::cursor` モジュールドキュメント参照）。
     cursors: crate::sql::cursor::CursorRegistry,
-    _marker: std::marker::PhantomData<&'e ()>,
+    /// dirty テーブル判定（[`SessionTransaction::dirty_tables`]）が確定済み世代を
+    /// 読むための参照。`Active` の間だけ保持する（`begin` が渡す）。
+    storage: &'e crate::storage::Storage,
 }
 
 enum TxnState<'e> {
@@ -256,7 +258,7 @@ impl<'e> SessionTransaction<'e> {
                     has_writes: false,
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
-                    _marker: std::marker::PhantomData,
+                    storage,
                 }));
                 Ok(())
             }
@@ -299,6 +301,8 @@ impl<'e> SessionTransaction<'e> {
                     has_writes,
                     session_at_begin,
                     written_by_tenant,
+                    written_tables,
+                    storage,
                     ..
                 } = *active;
                 if started_at.elapsed() > self.limits.max_duration {
@@ -311,7 +315,32 @@ impl<'e> SessionTransaction<'e> {
                     return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
                 }
                 if has_writes {
-                    for (tenant_id, table) in &written_by_tenant {
+                    // 遅延 FK 検査の対象は「書き込んだテナント × dirty テーブル」の
+                    // 直積（Issue #1179）。`mark_written` が記録するのは文が直接
+                    // 対象にしたテーブルだけで、参照アクション（`CASCADE`・
+                    // `SET NULL`・`SET DEFAULT`）の連鎖で書き換わった子テーブルは
+                    // 含まれない。連鎖先は別の `INITIALLY DEFERRED` FK を持ちうる
+                    // ため、記録だけに頼ると COMMIT で違反を見逃す（fail-open）。
+                    // テーブル世代（書き換えた全経路が bump する契約）由来の
+                    // dirty 集合との和を取り、テナント集合は上位集合（fail-closed）
+                    // として全書き込みテナントを使う。
+                    let dirty = match collect_dirty_tables(storage, &write_txn, &written_tables) {
+                        Ok(dirty) => dirty,
+                        Err(_) => {
+                            drop(write_txn);
+                            self.state = TxnState::Idle;
+                            *session = session_at_begin;
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "internal error".to_string(),
+                            });
+                        }
+                    };
+                    let tenants: std::collections::BTreeSet<&String> =
+                        written_by_tenant.iter().map(|(tenant, _)| tenant).collect();
+                    let pairs = tenants
+                        .iter()
+                        .flat_map(|tenant| dirty.iter().map(move |table| (*tenant, table)));
+                    for (tenant_id, table) in pairs {
                         if let Err(e) = crate::constraint::enforce_deferred_foreign_keys_in_txn(
                             &write_txn, tenant_id, table,
                         ) {
@@ -428,11 +457,17 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// `table` が同一トランザクション内で既に書き込み済みかどうか（読み取り時の
-    /// `0A000` 判定に使う。§2.5 の既知の逸脱）。
+    /// `table` の内容が同一トランザクション内で変わっている（dirty）かどうか
+    /// （読み取り時の `0A000` 判定に使う。§2.5 の既知の逸脱）。文が直接書き込んだ
+    /// テーブルに加え、参照アクションの連鎖で書き換わった子テーブルも含む
+    /// （[`Self::dirty_tables`]。連鎖先を取りこぼすと、確定済みスナップショットの
+    /// 古い内容を黙って返してしまう）。dirty 集合の取得に失敗した場合は
+    /// fail-closed に「dirty」として扱う。
     pub(crate) fn table_already_written(&self, table: &str) -> bool {
         match &self.state {
-            TxnState::Active(active) => active.written_tables.contains(table),
+            TxnState::Active(_) => self
+                .dirty_tables()
+                .map_or(true, |dirty| dirty.contains(table)),
             _ => false,
         }
     }
@@ -440,6 +475,22 @@ impl<'e> SessionTransaction<'e> {
     /// 現在保持している共有 `redb::WriteTransaction`（`Active` のときのみ
     /// `Some`）。書き込み系の実行本体が [`crate::tenant::WriteTarget::InTxn`]
     /// を構築するために使う。
+    /// このトランザクションで内容が変わりうるテーブル名の集合（Issue #1179）。
+    /// 文が直接書き込んだテーブル（`mark_written`）と、テーブル世代が確定済み
+    /// スナップショットから変化したテーブル（参照アクションの連鎖で書き込まれた
+    /// 子テーブルを含む）の和。読み取りの経路選択（未 commit 変更を読む必要が
+    /// あるか）と COMMIT 時の遅延 FK 検査対象の決定に使う。`Active` 以外では空。
+    /// 世代の読み取りに失敗した場合は fail-closed に `Err`（呼び出し元は文を
+    /// 失敗させる）。
+    pub(crate) fn dirty_tables(&self) -> Result<HashSet<String>, SqlSurfaceError> {
+        match &self.state {
+            TxnState::Active(active) => {
+                collect_dirty_tables(active.storage, &active.write_txn, &active.written_tables)
+            }
+            _ => Ok(HashSet::new()),
+        }
+    }
+
     pub(crate) fn write_txn(&self) -> Option<&redb::WriteTransaction> {
         match &self.state {
             TxnState::Active(active) => Some(&*active.write_txn),
@@ -563,6 +614,25 @@ impl<'e> SessionTransaction<'e> {
 /// [`crate::storage::StorageError::WriteTxnHeldByCurrentSession`] を
 /// `SqlSurfaceError::LockNotAvailable`（`55P03`）へ写像する。それ以外は
 /// 内部事象として `XX000` に丸める（他テナントの情報を含まない）。
+/// [`SessionTransaction::dirty_tables`] の実体。`written` に、書き込みトランザクション
+/// 内の世代が `storage` の確定済み世代から変化したテーブルを加えて返す。
+fn collect_dirty_tables(
+    storage: &crate::storage::Storage,
+    write_txn: &redb::WriteTransaction,
+    written: &HashSet<String>,
+) -> Result<HashSet<String>, SqlSurfaceError> {
+    let internal = || SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    };
+    use redb::ReadableDatabase;
+    let committed = storage.db().begin_read().map_err(|_| internal())?;
+    let changed = crate::catalog::changed_table_generations_in_write_txn(write_txn, &committed)
+        .map_err(|_| internal())?;
+    let mut dirty = written.clone();
+    dirty.extend(changed);
+    Ok(dirty)
+}
+
 fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
     match e {
         crate::storage::StorageError::WriteLockTimeout

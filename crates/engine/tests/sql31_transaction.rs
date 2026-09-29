@@ -449,15 +449,17 @@ fn unsupported_statement_inside_transaction_is_rejected_with_feature_not_support
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    // 単一行 `DELETE` は明示トランザクション内では未対応（対象外）。
+    // DDL（`DROP TABLE` 等）は明示トランザクション内では未対応（対象外。
+    // `DELETE`・`UPDATE`・UPSERT・複数行 `INSERT` は Issue #1179 で対応済み。
+    // `sql31_txn_dml.rs` 参照）。
     let err = engine
         .execute_sql_in_txn(
             &caller,
             &mut session,
             &mut txn,
-            &format!("DELETE FROM {TABLE} WHERE id = 1 USING OPERATION_ID 'del-1'"),
+            &format!("DROP TABLE {TABLE}"),
         )
-        .expect_err("DELETE inside a transaction is not yet supported");
+        .expect_err("DDL inside a transaction is not supported");
     assert_eq!(err.wire_code(), "0A000");
     assert_eq!(txn.status(), TransactionStatus::Failed);
 }

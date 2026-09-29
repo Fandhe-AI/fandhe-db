@@ -8507,6 +8507,42 @@ pub(crate) fn required_key_index_names_in_txn(
     Ok(names)
 }
 
+/// 書き込みトランザクション `write_txn` 内で世代が確定済みスナップショット
+/// `committed`（同一 DB の新規 read トランザクション）から変化したテーブル名の
+/// 一覧を返す（明示トランザクション内の「dirty テーブル」判定。SQL-31・TASK-221、
+/// Issue #1179）。
+///
+/// 行を書き換えるすべての書き込み経路は commit 前に [`bump_table_generation_in_txn`]
+/// を呼ぶ契約（`tests/table_generation_bump_coverage.rs` が構造的に固定）で、
+/// 参照アクションの連鎖（`constraint::propagate_referential_actions`）で書き込まれた
+/// 子テーブルも同様に bump する。したがって本関数は、`SessionTransaction::mark_written`
+/// の記録漏れ（連鎖書き込み等）に依存せず「トランザクション中に変更されたテーブル」
+/// を過不足なく（bump 契約の範囲で）列挙できる。世代テーブル自体が未作成の場合
+/// （まだ 1 度も書き込まれていない）は書き込みトランザクション側でテーブルを
+/// **作らない**ため空を返す。
+pub(crate) fn changed_table_generations_in_write_txn(
+    write_txn: &redb::WriteTransaction,
+    committed: &redb::ReadTransaction,
+) -> Result<Vec<String>> {
+    use redb::TableHandle;
+    let exists = write_txn
+        .list_tables()?
+        .any(|handle| handle.name() == TABLE_GENERATION_TABLE.name());
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let gen_table = write_txn.open_table(TABLE_GENERATION_TABLE)?;
+    let mut changed = Vec::new();
+    for entry in gen_table.iter()? {
+        let (name, generation) = entry?;
+        let name = name.value();
+        if table_generation_in_txn(committed, name)? != generation.value() {
+            changed.push(name.to_string());
+        }
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

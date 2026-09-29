@@ -336,7 +336,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （`constraint::enforce_deferred_foreign_keys_in_txn`。TABLE-17・TASK-205、
     // Issue #1077）を commit の直前に追加したことでさらに移動（旧: 293）。この
     // 検査自体は参照先の行ストアを読むだけで `user_rows/{table}` へ書き込まない。
-    ("sql/transaction.rs", 330),
+    // Issue #1179: COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化から
+    // 検出）へ拡張したことでさらに移動した構造変更への追随（旧: 330）。
+    ("sql/transaction.rs", 359),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を
@@ -360,7 +362,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1075）: `TenantWriteError::CheckEvaluationFailed` を
     // `SqlSurfaceError` 保持型へ是正した PR #1145 の取り込みマージで
     // import・ドキュメンテーションコメントが追加され再度追随（旧: 437）。
-    ("tenant.rs", 453),
+    // Issue #1179: 全書き込み経路（INSERT・UPSERT・UPDATE・DELETE）が `with_txn` へ
+    // 集約され、`f` のクロージャ内で `bump_table_generation_in_txn` を呼んでから
+    // `TxnEffect::Wrote` を返す構造になった（回帰ではなく構造変更への追随。旧: 453）。
+    ("tenant.rs", 459),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

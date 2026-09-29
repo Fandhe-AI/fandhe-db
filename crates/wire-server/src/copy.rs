@@ -33,6 +33,7 @@ use engine::sql::allowlist::{CopyFormat, SqlSurfaceError};
 use engine::sql::copy::CopyInSession;
 use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::SessionTransaction;
 
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
@@ -125,20 +126,27 @@ fn enforce_discard_budget<S: WireStream>(
 /// post_auth_loop` は明示トランザクションが `Idle` の場合に限り本モジュール
 /// （`crate::copy::run`）へ委譲するため（SQL-31・TASK-221。`Active`／`Failed`
 /// 中の COPY は本モジュールへ到達する前に `0A000`／`25P02` で拒否される）。
+///
+/// 明示トランザクション中（Issue #1179）に COPY が失敗した場合は、PostgreSQL と同じく
+/// トランザクションを `Failed`（ReadyForQuery `'E'`）へ遷移させてから応答する
+/// （`txn.fail()` は `Active` 以外では何もしないため、トランザクション外の挙動は不変）。
 fn respond_error_and_ready<S: WireStream>(
     stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
+    txn.fail();
     crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(
-        stream,
-        engine::sql::transaction::TransactionStatus::Idle,
-    )
+    crate::handshake::write_ready_for_query_io(stream, txn.status())
 }
 
-fn respond_sql_error<S: WireStream>(stream: &mut S, e: &SqlSurfaceError) -> io::Result<()> {
-    respond_error_and_ready(stream, e.error_class(), &e.client_message())
+fn respond_sql_error<S: WireStream>(
+    stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
+    e: &SqlSurfaceError,
+) -> io::Result<()> {
+    respond_error_and_ready(stream, txn, e.error_class(), &e.client_message())
 }
 
 /// `CopyInResponse`（'G'）／`CopyOutResponse`（'H'）を組み立てる。いずれも
@@ -289,6 +297,7 @@ fn encode_copy_data_row_into(
 /// 前に確定しているため、この経路には到達しない）。
 fn run_copy_to<S: WireStream>(
     stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
     format: CopyFormat,
     result: &QueryResult,
 ) -> io::Result<()> {
@@ -297,6 +306,7 @@ fn run_copy_to<S: WireStream>(
         Err(()) => {
             return respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode CopyOutResponse",
             )
@@ -319,6 +329,7 @@ fn run_copy_to<S: WireStream>(
             buffer.flush(stream)?;
             return respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode CopyData",
             );
@@ -335,9 +346,7 @@ fn run_copy_to<S: WireStream>(
             buffer.push_frame(stream, &msg)?;
             buffer.push_frame(
                 stream,
-                &result_encoder::encode_ready_for_query(
-                    engine::sql::transaction::TransactionStatus::Idle,
-                ),
+                &result_encoder::encode_ready_for_query(txn.status()),
             )?;
             buffer.flush(stream)
         }
@@ -345,6 +354,7 @@ fn run_copy_to<S: WireStream>(
             buffer.flush(stream)?;
             respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
             )
@@ -370,10 +380,11 @@ fn run_copy_to<S: WireStream>(
 /// が通常のクエリループへ戻ってクライアントが実際にソケットを閉じるまで
 /// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
 /// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
-fn run_copy_from<S: WireStream>(
+fn run_copy_from<'e, S: WireStream>(
     stream: &mut S,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
+    txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
 ) -> io::Result<crate::extended_query::LoopSignal> {
     let response = match encode_copy_response(b'G', session.column_count()) {
@@ -381,6 +392,7 @@ fn run_copy_from<S: WireStream>(
         Err(()) => {
             return respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode CopyInResponse",
             )
@@ -439,7 +451,7 @@ fn run_copy_from<S: WireStream>(
             b'c' => {
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return finish_copy_from(stream, engine, ctx, session, errored)
+                return finish_copy_from(stream, engine, ctx, txn, session, errored)
                     .map(|()| crate::extended_query::LoopSignal::Continue);
             }
             b'f' => {
@@ -479,6 +491,7 @@ fn run_copy_from<S: WireStream>(
                 }
                 return respond_error_and_ready(
                     stream,
+                    txn,
                     ErrorClass::InvalidInput,
                     "COPY failed on the client side",
                 )
@@ -548,25 +561,26 @@ fn run_copy_from<S: WireStream>(
 /// `simple_query::execute_and_respond` と同じ設計（`ResponseBoundaryGuard` は
 /// 呼び出し元 [`run`] が関数全体を覆い、`EmergencyResponseRegistration` は
 /// commit 呼び出しだけをブロックスコープで覆う）。
-fn finish_copy_from<S: WireStream>(
+fn finish_copy_from<'e, S: WireStream>(
     stream: &mut S,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
+    txn: &mut SessionTransaction<'e>,
     session: CopyInSession,
     errored: Option<SqlSurfaceError>,
 ) -> io::Result<()> {
     if let Some(e) = errored {
-        return respond_sql_error(stream, &e);
+        return respond_sql_error(stream, txn, &e);
     }
 
     let batch = match session.finish() {
         Ok(b) => b,
-        Err(e) => return respond_sql_error(stream, &e),
+        Err(e) => return respond_sql_error(stream, txn, &e),
     };
 
     let outcome = {
         let _emergency_registration = crate::simple_query::register_emergency_response(stream);
-        engine.commit_copy_in(ctx, batch)
+        engine.commit_copy_in_txn(ctx, txn, batch)
     };
 
     match outcome {
@@ -577,19 +591,17 @@ fn finish_copy_from<S: WireStream>(
             )) {
                 Ok(msg) => {
                     stream.write_all(&msg)?;
-                    crate::handshake::write_ready_for_query_io(
-                        stream,
-                        engine::sql::transaction::TransactionStatus::Idle,
-                    )
+                    crate::handshake::write_ready_for_query_io(stream, txn.status())
                 }
                 Err(_) => respond_error_and_ready(
                     stream,
+                    txn,
                     ErrorClass::InternalError,
                     "failed to encode command complete response",
                 ),
             }
         }
-        Err(e) => respond_sql_error(stream, &e),
+        Err(e) => respond_sql_error(stream, txn, &e),
     }
 }
 
@@ -605,23 +617,24 @@ fn finish_copy_from<S: WireStream>(
 /// `run_copy_from` が Terminate（'X'）受信を `Closed` として返してきた場合、
 /// 呼び出し元はここで新たに応答を送らずそのまま伝播し、接続ループを
 /// 終了させる（[`run_copy_from`] のドキュメント参照）。
-pub(crate) fn run<S: WireStream>(
+pub(crate) fn run<'e, S: WireStream>(
     stream: &mut S,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
     sql: &str,
 ) -> io::Result<crate::extended_query::LoopSignal> {
     // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
     // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
-    match engine.begin_copy(ctx, session, sql) {
-        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result)
+    match engine.begin_copy_in_txn(ctx, session, txn, sql) {
+        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, txn, format, &result)
             .map(|()| crate::extended_query::LoopSignal::Continue),
-        Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, copy_session),
+        Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, txn, copy_session),
         Err(e) => {
-            respond_sql_error(stream, &e).map(|()| crate::extended_query::LoopSignal::Continue)
+            respond_sql_error(stream, txn, &e).map(|()| crate::extended_query::LoopSignal::Continue)
         }
     }
 }

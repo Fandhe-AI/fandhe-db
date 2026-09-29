@@ -979,7 +979,7 @@ mod tests {
         // のスコープ外）があるため、列指定 UPDATE を使う）。旧キーは索引から
         // 消え、新キーが現れる。
         crate::tenant::update_row_columns_unchecked(
-            &storage,
+            crate::tenant::WriteTarget::Autocommit(&storage),
             "parents",
             &ctx("tenant-a"),
             1,

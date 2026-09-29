@@ -3446,12 +3446,31 @@ pub fn execute_delete(
     bound: &crate::sql::parser::BoundDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
+    execute_delete_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+    )
+}
+
+/// [`execute_delete`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_delete`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_delete_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     match crate::tenant::delete_row_ledgered_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3502,6 +3521,29 @@ pub fn execute_delete_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    execute_delete_returning_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        returning,
+        schema,
+    )
+}
+
+/// [`execute_delete_returning`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_delete_returning`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_delete_returning_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
@@ -3533,7 +3575,7 @@ pub fn execute_delete_returning(
         };
 
     let (outcome, _captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3596,12 +3638,33 @@ pub(crate) fn execute_update_with_schema(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
+    execute_update_with_schema_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        expected_schema,
+    )
+}
+
+/// [`execute_update_with_schema`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_update_with_schema`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_update_with_schema_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     let rows_affected = crate::tenant::update_row_columns_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3774,8 +3837,13 @@ pub(crate) fn map_write_error(
 /// プロセス全体で起動時に 1 回だけ設定する契約——`execute_predicate_update` と
 /// 同じ上限判定 API [`crate::sql::parser::check_dml_affected_rows_with_limit`]
 /// を共有する）。
-pub(crate) fn execute_predicate_delete(
-    storage: &crate::storage::Storage,
+/// [`execute_predicate_delete`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_predicate_delete`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_predicate_delete_in(
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -3856,7 +3924,7 @@ pub(crate) fn execute_predicate_delete(
     // `max_affected_rows`（`EngineCore::dml_limits`）を渡す。
     let limit = max_affected_rows;
     match crate::tenant::delete_rows_where_unchecked(
-        storage,
+        target,
         bound.table(),
         ctx,
         ledger_write,
@@ -3895,9 +3963,14 @@ pub(crate) fn execute_predicate_delete(
 /// 関数であり（唯一の呼び出し元は上記 `EngineCore::execute_predicate_update_form`）、
 /// 各引数は意味の異なる独立した値のため構造体へまとめると可読性が下がる
 /// （`execute_statement_with_cache` と同じ判断）。
+/// [`execute_predicate_update`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_predicate_update`] と
+/// ビット同一の挙動を保つ。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_predicate_update(
-    storage: &crate::storage::Storage,
+pub(crate) fn execute_predicate_update_in(
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateUpdate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -3986,7 +4059,7 @@ pub(crate) fn execute_predicate_update(
     // 呼び出し元から渡された `max_affected_rows`（`EngineCore::dml_limits`）を渡す。
     let limit = max_affected_rows;
     match crate::tenant::update_rows_where_unchecked(
-        storage,
+        target,
         bound.table(),
         ctx,
         ledger_write,
@@ -4066,6 +4139,27 @@ pub(crate) fn execute_insert_batch_with_schema(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_batch_with_schema_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bounds,
+        ledger_mode,
+        expected_schema,
+    )
+}
+
+/// [`execute_insert_batch_with_schema`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_insert_batch_with_schema`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_insert_batch_with_schema_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::storage::Visibility;
 
     let Some(first) = bounds.first() else {
@@ -4074,7 +4168,7 @@ pub(crate) fn execute_insert_batch_with_schema(
         ));
     };
     if bounds.len() == 1 {
-        return execute_insert_with_schema(storage, ctx, first, ledger_mode, expected_schema);
+        return execute_insert_with_schema_in(target, ctx, first, ledger_mode, expected_schema);
     }
 
     let table = first.table.as_str();
@@ -4095,7 +4189,7 @@ pub(crate) fn execute_insert_batch_with_schema(
         bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
 
     crate::tenant::insert_typed_rows_unchecked(
-        storage,
+        target,
         table,
         ctx,
         Visibility::Private,
@@ -4136,6 +4230,29 @@ pub fn execute_insert_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    execute_insert_returning_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bounds,
+        ledger_mode,
+        returning,
+        schema,
+    )
+}
+
+/// [`execute_insert_returning`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_insert_returning`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_insert_returning_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
     // codex-review Low 指摘（PR #873）対応: `column_meta`・`project_row` は
     // いずれも `bounds`（呼び出し元が既に束縛済みの書き込み予定値）・
     // `projection`・`schema`・`ctx` のみに依存する純粋な計算（redb I/O を
@@ -4164,7 +4281,7 @@ pub fn execute_insert_returning(
     }
 
     let insert_outcome =
-        execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
+        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
 
     Ok(ReturningOutcome {
         command: crate::sql::returning::DmlCommand::Insert,
@@ -4205,6 +4322,27 @@ pub fn execute_insert_returning(
 /// 呼び出し元を参照）。
 pub fn execute_upsert(
     storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundUpsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    bound_schema: &crate::catalog::TableSchema,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_upsert_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        bound_schema,
+    )
+}
+
+/// [`execute_upsert`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_upsert`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_upsert_in(
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundUpsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -4257,7 +4395,7 @@ pub fn execute_upsert(
     };
 
     let outcome = crate::tenant::upsert_typed_rows_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         Visibility::Private,

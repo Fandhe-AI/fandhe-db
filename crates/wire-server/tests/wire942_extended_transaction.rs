@@ -74,8 +74,13 @@ fn assert_ready_for_query_status(stream: &mut std::net::TcpStream, expected: u8)
 
 fn parse_and_bind(stream: &mut std::net::TcpStream, statement: &str, portal: &str, sql: &str) {
     send_length_prefixed_message(stream, b'P', &parse_body(statement, sql, 0));
-    let (kind, _) = read_message(stream);
-    assert_eq!(kind, b'1', "expected ParseComplete");
+    let (kind, body) = read_message(stream);
+    assert_eq!(
+        kind,
+        b'1',
+        "expected ParseComplete for {sql}: {}",
+        String::from_utf8_lossy(&body)
+    );
     send_length_prefixed_message(stream, b'B', &bind_body(portal, statement));
     let (kind, _) = read_message(stream);
     assert_eq!(kind, b'2', "expected BindComplete");
@@ -195,6 +200,74 @@ fn begin_insert_rollback_over_extended_protocol_discards_the_row() {
         ),
         other => panic!("expected Query, got {other:?}"),
     }
+}
+
+/// 拡張クエリプロトコルの明示トランザクション内で `UPDATE`・`DELETE`・複数行
+/// `INSERT`・UPSERT が実行でき（Issue #1179）、`ROLLBACK` で全て破棄され、
+/// `COMMIT` で確定すること。
+#[test]
+fn update_delete_multi_row_insert_and_upsert_over_extended_protocol_commit_and_rollback() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, &insert_sql(70, "op-1179-seed"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    let statements = [
+        (
+            "INSERT INTO documents (id, embedding, body) VALUES (71, '[0.1,0.2,0.3]', 'a'), (72, '[0.1,0.2,0.3]', 'b') USING OPERATION_ID 'op-1179-multi'",
+            "INSERT 0 2",
+        ),
+        (
+            "INSERT INTO documents (id, embedding, body) VALUES (70, '[0.1,0.2,0.3]', 'up') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body USING OPERATION_ID 'op-1179-upsert'",
+            "INSERT 0 1",
+        ),
+        (
+            "UPDATE documents SET body = 'changed' WHERE id = 71 USING OPERATION_ID 'op-1179-update'",
+            "UPDATE 1",
+        ),
+        (
+            "DELETE FROM documents WHERE id = 72 USING OPERATION_ID 'op-1179-delete'",
+            "DELETE 1",
+        ),
+    ];
+
+    for (round, end) in [("ROLLBACK", "ROLLBACK"), ("COMMIT", "COMMIT")] {
+        let (bs, bp) = (format!("b{round}"), format!("pb{round}"));
+        parse_and_bind(&mut stream, &bs, &bp, "BEGIN");
+        assert_eq!(execute_and_read_command_complete(&mut stream, &bp), "BEGIN");
+        send_sync(&mut stream);
+        assert_ready_for_query_status(&mut stream, b'T');
+        for (i, (sql, expected_tag)) in statements.iter().enumerate() {
+            let stmt = format!("s{round}{i}");
+            let portal = format!("p{round}{i}");
+            parse_and_bind(&mut stream, &stmt, &portal, sql);
+            assert_eq!(
+                execute_and_read_command_complete(&mut stream, &portal),
+                *expected_tag
+            );
+            send_sync(&mut stream);
+            assert_ready_for_query_status(&mut stream, b'T');
+        }
+        let (es, ep) = (format!("e{round}"), format!("pe{round}"));
+        parse_and_bind(&mut stream, &es, &ep, end);
+        assert_eq!(execute_and_read_command_complete(&mut stream, &ep), end);
+        send_sync(&mut stream);
+        assert_ready_for_query_status(&mut stream, b'I');
+
+        if round == "ROLLBACK" {
+            // 全て破棄され、operation_id も再利用できる（次のラウンドで同じ ID を使う）。
+            assert_eq!(visible_rows_with_id(&core, 70), 1);
+            assert_eq!(visible_rows_with_id(&core, 71), 0);
+            assert_eq!(visible_rows_with_id(&core, 72), 0);
+        }
+    }
+    assert_eq!(visible_rows_with_id(&core, 70), 1);
+    assert_eq!(visible_rows_with_id(&core, 71), 1);
+    assert_eq!(visible_rows_with_id(&core, 72), 0);
 }
 
 /// engine API から `id` の行が可視かどうかを数える（wire 経由の結果件数 0 だけ
@@ -471,6 +544,64 @@ fn expired_transaction_releases_writer_while_client_is_silent() {
 
     assert_eq!(visible_rows_with_id(&core, 39), 0);
     assert_eq!(visible_rows_with_id(&core, 40), 1);
+}
+
+/// 明示トランザクション中の `COPY FROM STDIN`（Issue #1179）で、クライアントが
+/// CopyInResponse の後に何も送らない（あるいは少しずつ送り続ける）場合も、
+/// 持続時間の上限で接続を閉じ、共有書き込みトランザクションを破棄してライタを
+/// 解放すること（単一ライタを無期限に保持させない DoS 対策。フレーム受信期限
+/// `framing::FrameDeadlineGuard` が COPY サブプロトコルの受信にも及ぶ）。解放されて
+/// いなければ別接続の autocommit `INSERT` は書き込みゲートの待機上限で `55P03` になる。
+#[test]
+fn stalled_copy_inside_transaction_releases_writer_at_the_deadline() {
+    let path = temp_db::unique_db_path("wire1179-stalled-copy-in-transaction");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let max_duration = std::time::Duration::from_millis(300);
+    let storage = Storage::open(&path)
+        .expect("open storage")
+        .with_write_lock_wait(max_duration * 10);
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_transaction_limits(
+            engine::sql::transaction::TransactionLimits {
+                max_duration,
+                max_statements: 1_000,
+            },
+        ),
+    );
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "COPY documents (id, embedding, body) FROM STDIN USING OPERATION_ID 'op-1179-copy'",
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'G', "expected CopyInResponse");
+
+    // 以降は何も送らない。上限経過後に別接続の autocommit INSERT がライタを取得できる。
+    let started = std::time::Instant::now();
+    let mut other = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    send_simple_query(&mut other, &insert_sql(60, "op-1179-60"));
+    assert_eq!(read_command_complete(&mut other), "INSERT 0 1");
+    read_ready_for_query(&mut other);
+    assert!(
+        started.elapsed() < wire_server::limits::READ_TIMEOUT,
+        "the writer must be released at the transaction deadline, not at the read timeout"
+    );
+    assert_eq!(visible_rows_with_id(&core, 60), 1);
 }
 
 /// 持続時間の上限で `Failed` へ遷移した後は、実行を開始済みの portal

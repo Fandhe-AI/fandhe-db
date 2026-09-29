@@ -651,37 +651,23 @@ fn post_auth_loop<'e, S: WireStream>(
                         // 形状には含めない。見逃した場合は通常経路が `42601` で
                         // 拒否する fail-closed。モジュールドキュメント参照）。
                         if engine::sql::copy::is_copy_statement(text) {
-                            // SQL-31・TASK-221: 明示トランザクション中の COPY は
-                            // 未対応（`0A000`）。`crate::copy::run` へは委譲せず
-                            // トランザクションを Failed へ遷移させる
-                            // （`sql::transaction` モジュールドキュメント参照）。
-                            // `Failed` 中の COPY も autocommit として実行させず、
-                            // 他の文と同じく `25P02` で拒否する（`Idle` 以外は
-                            // `crate::copy::run` へ到達させない。PR #1041 レビュー
-                            // 指摘: `is_active()` のみの判定では `Failed` 中の
-                            // COPY が autocommit で永続化されていた）。
-                            match txn.status() {
-                                engine::sql::transaction::TransactionStatus::Idle => {}
-                                engine::sql::transaction::TransactionStatus::InTransaction => {
-                                    txn.fail();
-                                    write_error_response_io(
-                                        stream,
-                                        ErrorClass::FeatureNotSupported,
-                                        "COPY is not supported inside an explicit transaction",
-                                    )?;
-                                    write_ready_for_query_io(stream, txn.status())?;
-                                    continue;
-                                }
-                                engine::sql::transaction::TransactionStatus::Failed => {
-                                    let err = txn.take_failed_error();
-                                    write_error_response_io(
-                                        stream,
-                                        err.error_class(),
-                                        &err.client_message(),
-                                    )?;
-                                    write_ready_for_query_io(stream, txn.status())?;
-                                    continue;
-                                }
+                            // SQL-31・TASK-221・Issue #1179: 明示トランザクション中の COPY は
+                            // `crate::copy::run` へ委譲する（`COPY FROM STDIN` は共有
+                            // 書き込みトランザクションへの複数行 INSERT、`COPY ... TO STDOUT`
+                            // は読み取り。失敗時は `run` がトランザクションを `Failed` へ
+                            // 遷移させ ReadyForQuery `'E'` で応答する）。`Failed` 中の COPY は
+                            // autocommit として実行させず、他の文と同じく `25P02` で
+                            // 拒否する（PR #1041 レビュー指摘: `Failed` 中の COPY が
+                            // autocommit で永続化されていた）。
+                            if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
+                                let err = txn.take_failed_error();
+                                write_error_response_io(
+                                    stream,
+                                    err.error_class(),
+                                    &err.client_message(),
+                                )?;
+                                write_ready_for_query_io(stream, txn.status())?;
+                                continue;
                             }
                             // Issue #939 レビュー指摘（discussion_r4096720859）:
                             // COPY サブプロトコル中に Terminate（'X'）を受信した
@@ -691,7 +677,7 @@ fn post_auth_loop<'e, S: WireStream>(
                             // は既に切断済みのつもりで応答を待たなくなる一方
                             // サーバー側は接続スロットを保持し続けてしまう
                             // （`P`／`D` 分岐と同じ判定作法）。
-                            match crate::copy::run(stream, engine, ctx, session, text)? {
+                            match crate::copy::run(stream, engine, ctx, session, txn, text)? {
                                 crate::extended_query::LoopSignal::Continue => {}
                                 crate::extended_query::LoopSignal::Closed => return Ok(()),
                             }
