@@ -843,7 +843,7 @@ fn respond_rows_with_tag<S: WireStream>(
 
     for row in &result.rows {
         let start = buffer.frame_start();
-        match result_encoder::encode_data_row_into(row, buffer.as_mut_vec()) {
+        match result_encoder::encode_data_row_into(&result.columns, row, buffer.as_mut_vec()) {
             Ok(()) => {}
             Err(_) => {
                 // 失敗時は `encode_data_row_into` 自身が書きかけを巻き戻し
@@ -910,6 +910,19 @@ mod temp_db;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用: 行のセル数に合わせた列メタ（値の整形が列型に依存しない行のみ
+    /// 使うため全列 `TEXT`。Issue #1173 で `encode_data_row` が列メタを要求する）。
+    fn text_columns(row: &engine::sql::exec::ResultRow) -> Vec<engine::sql::exec::ColumnMeta> {
+        row.cells
+            .iter()
+            .enumerate()
+            .map(|(i, _)| engine::sql::exec::ColumnMeta::Scalar {
+                name: format!("c{i}"),
+                ty: engine::catalog::ColumnType::Text,
+            })
+            .collect()
+    }
     use engine::catalog::ColumnType;
     use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
     use std::net::{TcpListener, TcpStream};
@@ -960,7 +973,9 @@ mod tests {
 
         let mut expected = result_encoder::encode_row_description(&columns).expect("row desc");
         for row in &rows {
-            expected.extend_from_slice(&result_encoder::encode_data_row(row).expect("data row"));
+            expected.extend_from_slice(
+                &result_encoder::encode_data_row(&text_columns(row), row).expect("data row"),
+            );
         }
         expected.extend_from_slice(
             &result_encoder::encode_command_complete(&format!("SELECT {}", rows.len()))
@@ -1006,8 +1021,10 @@ mod tests {
 
         let mut expected_prefix =
             result_encoder::encode_row_description(&columns).expect("row desc");
-        expected_prefix
-            .extend_from_slice(&result_encoder::encode_data_row(&good_row).expect("data row"));
+        expected_prefix.extend_from_slice(
+            &result_encoder::encode_data_row(&text_columns(&good_row), &good_row)
+                .expect("data row"),
+        );
 
         let (mut server, mut client) = loopback_pair();
         let reader = std::thread::spawn(move || {

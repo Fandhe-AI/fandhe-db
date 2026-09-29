@@ -583,6 +583,10 @@ pub(crate) enum Accumulator {
     IdMax(Option<u64>),
     /// `SUM(<Scalar 式>)`。加算のたびに `is_finite()` を検査する。
     FloatSum(Option<f64>),
+    /// `SUM(<REAL 列>)`（Issue #1173）。PostgreSQL の `sum(real)` は `real` を返す
+    /// ため、累積は走査順（索引経路と全走査で異なりうる）による丸め差を避けて
+    /// `f64` で行い、`finish` で `f32` へ丸める（範囲超過は `22003`）。
+    RealSum(Option<f64>),
     FloatAvg {
         sum: Option<f64>,
         count: u64,
@@ -742,9 +746,8 @@ impl Accumulator {
             // Issue #892（D4）: `REAL`/`DOUBLE PRECISION` 列。`ScalarExpr` と
             // 同じ `f64` 累積アキュムレータを共有する（結果はどちらも
             // `Cell::Float`）。
-            (Sum, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
-                Accumulator::FloatSum(None)
-            }
+            (Sum, AggregateInput::RealColumn(_)) => Accumulator::RealSum(None),
+            (Sum, AggregateInput::DoubleColumn(_)) => Accumulator::FloatSum(None),
             (Avg, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
                 Accumulator::FloatAvg {
                     sum: None,
@@ -1428,6 +1431,16 @@ impl Accumulator {
                 *s = Some(next);
                 Ok(())
             }
+            Accumulator::RealSum(s) => {
+                let next = s.unwrap_or(0.0) + v;
+                if !next.is_finite() {
+                    return Err(SqlSurfaceError::numeric_out_of_range(
+                        "SUM overflowed to a non-finite value",
+                    ));
+                }
+                *s = Some(next);
+                Ok(())
+            }
             Accumulator::FloatAvg { sum, count } => {
                 let next = sum.unwrap_or(0.0) + v;
                 if !next.is_finite() {
@@ -1695,6 +1708,20 @@ impl Accumulator {
             Accumulator::IdMin(m) => m.map(Cell::Integer).unwrap_or(Cell::Null),
             Accumulator::IdMax(m) => m.map(Cell::Integer).unwrap_or(Cell::Null),
             Accumulator::FloatSum(s) => s.map(Cell::Float).unwrap_or(Cell::Null),
+            // Issue #1173: `f32` へ丸めてから `Cell::Float` へ拡張する（wire の
+            // float4 出力は丸め済み値を前提とする）。範囲超過は fail-closed。
+            Accumulator::RealSum(s) => match s {
+                None => Cell::Null,
+                Some(sum) => {
+                    let narrowed = sum as f32;
+                    if !narrowed.is_finite() {
+                        return Err(SqlSurfaceError::numeric_out_of_range(
+                            "SUM(REAL) exceeds REAL range",
+                        ));
+                    }
+                    Cell::Float(f64::from(narrowed))
+                }
+            },
             Accumulator::FloatAvg { sum, count } => match sum {
                 None => Cell::Null,
                 Some(s) => Cell::Float(s / count as f64),
@@ -2309,6 +2336,102 @@ pub(crate) fn execute_aggregate_with_cache(
     finish_aggregate_result(accumulators, bound)
 }
 
+/// 集計項目の結果列の静的型（Issue #1173。WIRE-13・TABLE-13 のポインタ）。
+///
+/// wire-server が型 OID を公告する根拠（[`ColumnMeta::Computed`] の `ty`）で、
+/// `Accumulator::finish` が返す `Cell` の型と 1 対 1 に対応する唯一の情報源。
+/// `Accumulator::new` が拒否する（到達しない）組み合わせは `None`（wire では text
+/// フォールバック）にする。
+pub(crate) fn aggregate_result_type(
+    func: AggregateFunc,
+    input: &AggregateInput,
+) -> Option<crate::catalog::ColumnType> {
+    use crate::catalog::ColumnType;
+    use AggregateFunc::{Avg, Count, Max, Min, Sum};
+    Some(match (func, input) {
+        (Count, _) => ColumnType::BigInt,
+        // `id` は u64 全域を取りうるため `ColumnMeta::Id` と同じく numeric で公告する。
+        (Sum | Min | Max, AggregateInput::IdU64) => ColumnType::Numeric {
+            precision: 20,
+            scale: 0,
+        },
+        (Avg, AggregateInput::IdU64) => ColumnType::Double,
+        (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
+            ColumnType::BigInt
+        }
+        (Avg, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
+            ColumnType::Double
+        }
+        (Min | Max, AggregateInput::IntegerColumn(_)) => ColumnType::Integer,
+        (Min | Max, AggregateInput::BigIntColumn(_)) => ColumnType::BigInt,
+        // `SUM(REAL)` は PostgreSQL と同じく real（`Accumulator::RealSum`）。
+        (Sum | Min | Max, AggregateInput::RealColumn(_)) => ColumnType::Real,
+        (Avg, AggregateInput::RealColumn(_)) => ColumnType::Double,
+        (Sum | Avg | Min | Max, AggregateInput::DoubleColumn(_)) => ColumnType::Double,
+        (Sum | Avg | Min | Max, AggregateInput::ScalarExpr { .. }) => ColumnType::Double,
+        (
+            Min | Max,
+            AggregateInput::NumericColumn {
+                precision, scale, ..
+            },
+        ) => ColumnType::Numeric {
+            precision: *precision,
+            scale: *scale,
+        },
+        (Sum, AggregateInput::NumericColumn { scale, .. }) => ColumnType::Numeric {
+            precision: crate::numeric::MAX_PRECISION,
+            scale: *scale,
+        },
+        (
+            Avg,
+            AggregateInput::NumericColumn {
+                precision, scale, ..
+            },
+        ) => ColumnType::Numeric {
+            precision: crate::numeric::MAX_PRECISION,
+            scale: numeric_avg_result_scale(*precision, *scale),
+        },
+        (Min | Max, AggregateInput::DateColumn(_)) => ColumnType::Date,
+        (Min | Max, AggregateInput::TimestampColumn(_)) => ColumnType::Timestamp,
+        (Min | Max, AggregateInput::TextColumn(_)) => ColumnType::Text,
+        _ => return None,
+    })
+}
+
+/// 集計（`GROUP BY` の有無を問わない）の出力列メタを `bound.projection` の列順で
+/// 組み立てる（Issue #1173）。実行経路（`finish_aggregate_result`・
+/// `sql::group_by` の PROJECT 段）と Describe（`sql::describe::aggregate_columns`）
+/// が共有し、両者の列メタが構造的に一致する。`GROUP BY` キー列は現状 `TEXT` のみ
+/// 受理するため `Text`（非 TEXT キーを受理する拡張〔#1185〕ではキー列の型から導出する）。
+pub(crate) fn aggregate_projection_columns(bound: &BoundAggregate) -> Vec<ColumnMeta> {
+    bound
+        .projection
+        .iter()
+        .map(|col| match col {
+            crate::sql::parser::ProjectionColumn::GroupKey { name, .. } => ColumnMeta::Computed {
+                name: name.clone(),
+                ty: Some(crate::catalog::ColumnType::Text),
+            },
+            crate::sql::parser::ProjectionColumn::Aggregate { item_index, name } => {
+                ColumnMeta::Computed {
+                    name: name.clone(),
+                    ty: bound
+                        .items
+                        .get(*item_index)
+                        .and_then(aggregate_item_result_type),
+                }
+            }
+        })
+        .collect()
+}
+
+/// 集計項目 1 つの結果型。`COUNT(DISTINCT ...)` も `COUNT` と同じ `BigInt`。
+fn aggregate_item_result_type(
+    item: &crate::sql::parser::BoundAggregateItem,
+) -> Option<crate::catalog::ColumnType> {
+    aggregate_result_type(item.func, &item.input)
+}
+
 /// 確定した [`Accumulator`] 群から単一行の [`QueryResult`] を組み立てる
 /// （キャッシュヒット経路・従来の走査経路の両方が共有する終端処理。Issue #478）。
 /// Issue #892: `Accumulator::finish` が `Result` を返すようになった
@@ -2318,14 +2441,14 @@ fn finish_aggregate_result(
     accumulators: Vec<Accumulator>,
     bound: &BoundAggregate,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let mut columns = Vec::with_capacity(bound.items.len());
     let mut cells = Vec::with_capacity(bound.items.len());
-    for (accumulator, item) in accumulators.into_iter().zip(&bound.items) {
-        columns.push(ColumnMeta::Computed {
-            name: item.name.clone(),
-        });
+    for accumulator in accumulators {
         cells.push(accumulator.finish()?);
     }
+    // 単一行集計では `projection` が `items` と 1 対 1（`GROUP BY` キー列なし）。
+    // 列メタは実行経路・Describe・GROUP BY 経路が共有する
+    // `aggregate_projection_columns` で組み立てる（Issue #1173）。
+    let columns = aggregate_projection_columns(bound);
 
     Ok(QueryResult {
         columns,
@@ -3322,6 +3445,69 @@ mod tests {
         acc.observe_float(f64::MAX).unwrap();
         let err = acc.observe_float(f64::MAX).unwrap_err();
         assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn real_sum_rounds_to_f32_and_rejects_real_overflow() {
+        // 0.1f32 + 0.2f32 を f64 で累積し、確定時に f32 へ丸める（PostgreSQL の
+        // `sum(real)` は real）。
+        let mut acc = Accumulator::RealSum(None);
+        acc.observe_float(f64::from(0.1f32)).unwrap();
+        acc.observe_float(f64::from(0.2f32)).unwrap();
+        let expected = (f64::from(0.1f32) + f64::from(0.2f32)) as f32;
+        assert_eq!(acc.finish().unwrap(), Cell::Float(f64::from(expected)));
+
+        // f32 範囲外（f64 では有限）の和は 22003。
+        let mut acc = Accumulator::RealSum(None);
+        acc.observe_float(f64::from(f32::MAX)).unwrap();
+        acc.observe_float(f64::from(f32::MAX)).unwrap();
+        assert_eq!(acc.finish().unwrap_err().wire_code(), "22003");
+
+        assert_eq!(Accumulator::RealSum(None).finish().unwrap(), Cell::Null);
+    }
+
+    #[test]
+    fn aggregate_result_type_follows_input_type() {
+        use crate::catalog::ColumnType;
+        let real = AggregateInput::RealColumn(0);
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Sum, &real),
+            Some(ColumnType::Real)
+        );
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Avg, &real),
+            Some(ColumnType::Double)
+        );
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Count, &AggregateInput::AllVisible),
+            Some(ColumnType::BigInt)
+        );
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Min, &AggregateInput::IntegerColumn(0)),
+            Some(ColumnType::Integer)
+        );
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Sum, &AggregateInput::IntegerColumn(0)),
+            Some(ColumnType::BigInt)
+        );
+        assert_eq!(
+            aggregate_result_type(AggregateFunc::Min, &AggregateInput::TextColumn(0)),
+            Some(ColumnType::Text)
+        );
+        assert_eq!(
+            aggregate_result_type(
+                AggregateFunc::Sum,
+                &AggregateInput::NumericColumn {
+                    index: 0,
+                    precision: 10,
+                    scale: 2
+                }
+            ),
+            Some(ColumnType::Numeric {
+                precision: 38,
+                scale: 2
+            })
+        );
     }
 
     #[test]

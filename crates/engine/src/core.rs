@@ -3974,6 +3974,7 @@ impl EngineCore {
             ParsedSql::Statement(Statement::Explain(_)) => {
                 Ok(Some(vec![crate::sql::exec::ColumnMeta::Computed {
                     name: crate::sql::explain::QUERY_PLAN_COLUMN.to_string(),
+                    ty: Some(crate::catalog::ColumnType::Text),
                 }]))
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
@@ -3984,9 +3985,7 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                 )?;
-                Ok(Some(crate::sql::describe::aggregate_columns(
-                    &bound.projection,
-                )))
+                Ok(Some(crate::sql::describe::aggregate_columns(&bound)))
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;

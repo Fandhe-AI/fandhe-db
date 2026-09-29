@@ -126,7 +126,8 @@ fn udf_call_in_result_column_matches_independent_oracle() {
     assert_eq!(
         result.columns[1],
         engine::sql::exec::ColumnMeta::Computed {
-            name: "score".to_string()
+            name: "score".to_string(),
+            ty: Some(engine::catalog::ColumnType::Double),
         }
     );
 
@@ -170,7 +171,8 @@ fn udf_alias_defaults_to_function_name_when_as_is_omitted() {
     assert_eq!(
         result.columns[0],
         engine::sql::exec::ColumnMeta::Computed {
-            name: "vec_norm".to_string()
+            name: "vec_norm".to_string(),
+            ty: Some(engine::catalog::ColumnType::Double),
         }
     );
     assert!((float_cell(&result.rows[0], 0) - 5.0).abs() < 1e-6);

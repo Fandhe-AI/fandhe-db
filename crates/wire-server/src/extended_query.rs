@@ -1713,6 +1713,7 @@ fn execute_portal<'e, S: WireStream>(
                         // モジュールドキュメント参照）。
                         let mut frame = Vec::new();
                         result_encoder::encode_data_row_into_with_formats(
+                            &result.columns,
                             row,
                             &result_formats,
                             &mut frame,
@@ -1741,6 +1742,7 @@ fn execute_portal<'e, S: WireStream>(
                     for row in result.rows.iter().take(take) {
                         let mut frame = Vec::new();
                         result_encoder::encode_data_row_into_with_formats(
+                            &result.columns,
                             row,
                             &result_formats,
                             &mut frame,

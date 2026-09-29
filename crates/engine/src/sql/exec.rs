@@ -239,6 +239,10 @@ pub enum Cell {
 ///
 /// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant を
 /// 追加した。
+///
+/// **Issue #1173 で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant に
+/// `ty: Option<ColumnType>` フィールドを追加した（集計結果・式列の静的な結果型。
+/// wire-server が型 OID を公告する根拠。WIRE-13・TABLE-13 のポインタ）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnMeta {
     Id,
@@ -246,11 +250,38 @@ pub enum ColumnMeta {
         name: String,
         ty: ColumnType,
     },
-    /// 式項目（TASK-79・SQL-9）。`ColumnType` を持たない（`Cell::Float`/`Cell::Bool`/
-    /// `Cell::Vector` のいずれになるかは実行時の評価結果の型による）。
+    /// 式項目（TASK-79・SQL-9）・集計結果列。`ty` は束縛時に確定する静的な結果型
+    /// （Issue #1173）。`Some(t)` の列は wire 上で `Scalar { ty: t }` と同じ型
+    /// OID で公告される。`None` は静的な型を持たない（ベクトル式など）ことを表し、
+    /// wire では `text` にフォールバックする。
     Computed {
         name: String,
+        ty: Option<ColumnType>,
     },
+}
+
+/// 束縛済み式の静的型から式列の [`ColumnMeta`] を作る（Issue #1173）。
+///
+/// 通常 SELECT 投影（`execute_statement`）・スキャン投影（`sql::scan`）・
+/// Describe（`sql::describe::projected_columns`）が共有する唯一の写像。式列の
+/// 実行時セルは `Cell::Float`（`Scalar`）・`Cell::Bool`・`Cell::Text`・
+/// `Cell::Date`・`Cell::Timestamp` になるため、それぞれ `DOUBLE PRECISION`・
+/// `BOOLEAN`・`TEXT`・`DATE`・`TIMESTAMP` として公告する。`Vector` 式は
+/// 静的な `ColumnType` を持たない（`VECTOR(N)` の次元が式から決まらない）ため
+/// `None`（wire では text フォールバック）にする。
+pub(crate) fn computed_column_meta(name: &str, ty: udf_call::ExprType) -> ColumnMeta {
+    let ty = match ty {
+        udf_call::ExprType::Scalar => Some(ColumnType::Double),
+        udf_call::ExprType::Bool => Some(ColumnType::Boolean),
+        udf_call::ExprType::Text => Some(ColumnType::Text),
+        udf_call::ExprType::Date => Some(ColumnType::Date),
+        udf_call::ExprType::Timestamp => Some(ColumnType::Timestamp),
+        udf_call::ExprType::Vector => None,
+    };
+    ColumnMeta::Computed {
+        name: name.to_string(),
+        ty,
+    }
 }
 
 /// 投影結果 1 行。
@@ -2418,7 +2449,7 @@ pub(crate) fn execute_statement_with_cache(
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
-            ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
+            ProjectedColumn::Computed { name, ty, .. } => computed_column_meta(name, *ty),
         })
         .collect();
 

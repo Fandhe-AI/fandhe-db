@@ -51,7 +51,8 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 
 | 列型 | `columns[].type` |
 | --- | --- |
-| `id`（疑似列）／式項目（`Computed`） | `"numeric"`／`"text"`（SQL wire と一致。`column_wire_type(meta).pg_type_name()` へ委譲し二重管理を避ける） |
+| `id`（疑似列） | `"numeric"`（SQL wire と一致。`column_wire_type(meta).pg_type_name()` へ委譲し二重管理を避ける） |
+| 式項目・集計結果（`Computed`） | `"text"` 固定（NOSQL-11。SQL wire の `RowDescription` は Issue #1173 で型付き OID を公告するが、本表層は意図的に据え置く） |
 | TEXT | `"text"` |
 | VECTOR | `"vector"`（旧: `"text"`） |
 | INTEGER | `"integer"`（旧: `"int4"` 相当だったが SQL wire は既に `pg_type_name()` で `"int4"` を返しており、NoSQL 側は本 Issue で独立の `"integer"` へ変更） |

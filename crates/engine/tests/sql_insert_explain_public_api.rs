@@ -276,7 +276,8 @@ fn explain_result_lines(outcome: SqlOutcome) -> Vec<String> {
             assert_eq!(
                 result.columns[0],
                 ColumnMeta::Computed {
-                    name: "QUERY PLAN".to_string()
+                    name: "QUERY PLAN".to_string(),
+                    ty: Some(engine::catalog::ColumnType::Text),
                 }
             );
             result
@@ -367,7 +368,8 @@ fn build_explain_result_is_reachable_and_matches_sql_explain_rows() {
     assert_eq!(
         external_result.columns[0],
         ColumnMeta::Computed {
-            name: "QUERY PLAN".to_string()
+            name: "QUERY PLAN".to_string(),
+            ty: Some(engine::catalog::ColumnType::Text),
         }
     );
     let external_lines: Vec<String> = external_result

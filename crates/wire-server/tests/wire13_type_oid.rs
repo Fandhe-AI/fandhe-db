@@ -29,8 +29,8 @@ use engine::uuid::parse_uuid_text;
 
 use common::*;
 
-/// 本テストが対象とする列（`id`・`Computed` は対象外〔受入基準 3・据え置き
-/// 判断。本モジュールドキュメント参照〕）。`(列名, 期待 OID, 期待 typlen)`。
+/// 本テストが対象とする列（集計・式列は Issue #1173 の `aggregate_and_expression_columns_*`
+/// が別途固定する）。`(列名, 期待 OID, 期待 typlen)`。
 /// `WireType` の `oid()`／`typlen()` とは独立に、このテスト側だけで表を
 /// 持つ（`result_encoder::WireType` は `pub(crate)` のため crate 外からは
 /// 参照できない――独立表との一致自体が「単一情報源を共有する」契約の
@@ -262,5 +262,113 @@ fn other_tenant_sees_same_row_description_but_zero_rows() {
 
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "SELECT 0", "other tenant must not see the Private row");
+    read_ready_for_query(&mut stream);
+}
+/// 集計・式列（Issue #1173・WIRE-13）の `RowDescription` OID を入力型に応じて
+/// 固定するための SQL。列の別名と `expected_aggregate_oids` が 1 対 1 対応する。
+const AGGREGATE_SQL: &str = "SELECT COUNT(*) AS c_all, SUM(n) AS s_n, SUM(b) AS s_b, \
+     AVG(n) AS a_n, MIN(n) AS m_n, MAX(b) AS x_b, SUM(r) AS s_r, MIN(r) AS m_r, \
+     AVG(r) AS a_r, SUM(d) AS s_d, SUM(price) AS s_p, AVG(price) AS a_p, \
+     MIN(day) AS m_day, MAX(ts) AS x_ts, SUM(id) AS s_id, AVG(id) AS a_id \
+     FROM typed_probe";
+
+fn expected_aggregate_oids() -> Vec<(&'static str, i32)> {
+    vec![
+        ("c_all", 20),
+        ("s_n", 20),
+        ("s_b", 20),
+        ("a_n", 701),
+        ("m_n", 23),
+        ("x_b", 20),
+        ("s_r", 700),
+        ("m_r", 700),
+        ("a_r", 701),
+        ("s_d", 701),
+        ("s_p", 1700),
+        ("a_p", 1700),
+        ("m_day", 1082),
+        ("x_ts", 1114),
+        ("s_id", 1700),
+        ("a_id", 701),
+    ]
+}
+
+#[test]
+fn aggregate_and_expression_columns_announce_typed_oids() {
+    let (core, _guard) = new_core_typed_probe();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, AGGREGATE_SQL);
+    let columns = read_row_description_with_oids(&mut stream);
+    let expected = expected_aggregate_oids();
+    assert_eq!(columns.len(), expected.len());
+    for ((name, oid), (expected_name, expected_oid)) in columns.iter().zip(expected.iter()) {
+        assert_eq!(name, expected_name);
+        assert_eq!(oid, expected_oid, "oid mismatch for column={name}");
+    }
+    let row = read_data_row(&mut stream);
+    // 値: 1 行のみ（tenant-a の Private 行）。`SUM(REAL)` は real で、`1.5` は
+    // f32 の最短往復表記で出る。
+    assert_eq!(row.first().cloned().flatten().as_deref(), Some("1"));
+    assert_eq!(row.get(6).cloned().flatten().as_deref(), Some("1.5"));
+    assert_eq!(row.get(8).cloned().flatten().as_deref(), Some("1.5"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    // 式列: `vec_norm`（スカラー式）→ float8、ベクトル式 → text（静的型なし）。
+    send_simple_query(
+        &mut stream,
+        "SELECT id, vec_norm(embedding) AS nrm, vec_div(embedding, 2.0) AS half \
+         FROM typed_probe LIMIT 10",
+    );
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(), 1700),
+            ("nrm".to_string(), 701),
+            ("half".to_string(), 25),
+        ]
+    );
+    let _row = read_data_row(&mut stream);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+}
+
+/// テナント境界の非退行（Issue #1173）: 他テナントの集計は型公告が同一のまま、
+/// 自テナントの `Private` 行を含まない結果（`COUNT` = 0・`SUM` = NULL）になる。
+#[test]
+fn other_tenant_aggregate_has_same_oids_but_sees_no_rows() {
+    let (core, _guard) = new_core_typed_probe();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    send_simple_query(&mut stream, AGGREGATE_SQL);
+    let columns = read_row_description_with_oids(&mut stream);
+    let expected = expected_aggregate_oids();
+    assert_eq!(columns.len(), expected.len());
+    for ((name, oid), (expected_name, expected_oid)) in columns.iter().zip(expected.iter()) {
+        assert_eq!(name, expected_name);
+        assert_eq!(oid, expected_oid, "oid mismatch for column={name}");
+    }
+    let row = read_data_row(&mut stream);
+    assert_eq!(row.first().cloned().flatten().as_deref(), Some("0"));
+    assert_eq!(
+        row.get(1).cloned().flatten(),
+        None,
+        "SUM over no rows is NULL"
+    );
+    assert_eq!(
+        row.get(6).cloned().flatten(),
+        None,
+        "SUM(REAL) over no rows is NULL"
+    );
+    let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
 }

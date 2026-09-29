@@ -1048,3 +1048,85 @@ fn wire17_copy_as_non_first_statement_in_multi_statement_message_is_rejected_wit
     );
     read_ready_for_query(&mut stream);
 }
+/// `REAL` 列の値が PostgreSQL の float4 出力形式（指数表記 `1e+06`・`1e-05` を
+/// 含む。Issue #1173・WIRE-13）で `COPY (...) TO STDOUT` へ出力され、その出力を
+/// そのまま `COPY ... FROM STDIN` へ再投入しても同じ値へ往復すること（WIRE-17 の
+/// 往復契約。SQL リテラルは指数表記を受理しないため、COPY FROM だけが指数表記を
+/// 受理する `scalar_float::parse_real_text` を使う）。
+#[test]
+fn wire17_copy_real_exponent_output_round_trips_through_copy_from_stdin() {
+    let path = temp_db::unique_db_path("wire17-copy-real");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "metrics",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("score", ColumnType::Real, false),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let mut stream = spawn_with_alice(core);
+
+    // 1e6 以上・1e-5 未満・通常値の 3 行を COPY FROM（指数表記入力を含む）で投入する。
+    send_simple_query(
+        &mut stream,
+        "COPY metrics (id, embedding, score) FROM STDIN USING OPERATION_ID 'copy-real-op-1'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(
+        &mut stream,
+        b"1\t[1.0,0.0]\t1e+06\n2\t[0.0,1.0]\t1e-05\n3\t[1.0,1.0]\t0.1\n",
+    );
+    send_copy_done(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 3");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY (SELECT id, score FROM metrics LIMIT 10) TO STDOUT",
+    );
+    let _ = read_copy_out_response(&mut stream);
+    let mut lines: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        let row = read_copy_data(&mut stream);
+        lines.push(
+            String::from_utf8(row)
+                .expect("utf8 copy output")
+                .trim_end_matches('\n')
+                .to_string(),
+        );
+    }
+    read_copy_done(&mut stream);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+    lines.sort();
+    assert_eq!(lines, vec!["1\t1e+06", "2\t1e-05", "3\t0.1"]);
+
+    // 出力をそのまま別 id で再投入しても同じテキストへ往復する。
+    send_simple_query(
+        &mut stream,
+        "COPY metrics (id, embedding, score) FROM STDIN USING OPERATION_ID 'copy-real-op-2'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"11\t[1.0,0.0]\t1e+06\n12\t[0.0,1.0]\t1e-05\n");
+    send_copy_done(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 2");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT score FROM metrics WHERE id = 11 LIMIT 1",
+    );
+    let _cols = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1e+06".to_string())]);
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+}

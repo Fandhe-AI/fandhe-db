@@ -233,6 +233,10 @@ fn row_description_oid_and_json_type_agree_for_computed_column() {
         panic!("columns must be an array");
     };
 
+    // Issue #1173: wire 側 `RowDescription` は式列（`vec_norm`）の静的な結果型
+    // （float8＝OID 701）を公告する一方、NoSQL 表層の JSON `columns[].type` は
+    // NOSQL-11 の契約に従い計算列を "text" に固定する（意図的な非対称）。
+    // `id` 列（numeric 1700）は従来どおり OID と JSON 型名が一致する。
     for (i, (name, oid)) in fields.iter().enumerate() {
         let engine::json::JsonValue::Object(col_obj) = &json_columns[i] else {
             panic!("column must be an object");
@@ -240,11 +244,16 @@ fn row_description_oid_and_json_type_agree_for_computed_column() {
         let engine::json::JsonValue::String(json_type) = &col_obj["type"] else {
             panic!("type must be a string");
         };
-        assert_eq!(
-            json_type,
-            expected_json_type_for_oid(*oid),
-            "column index={i} name={name}"
-        );
+        if name == "n" {
+            assert_eq!(*oid, 701, "computed column must announce float8");
+            assert_eq!(json_type, "text", "computed column JSON type is fixed");
+        } else {
+            assert_eq!(
+                json_type,
+                expected_json_type_for_oid(*oid),
+                "column index={i} name={name}"
+            );
+        }
     }
 
     // `row_count` は `rows.len()` と常に一致する。

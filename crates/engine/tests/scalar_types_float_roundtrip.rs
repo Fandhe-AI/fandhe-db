@@ -280,7 +280,8 @@ fn select_where_on_real_column_is_rejected() {
 }
 
 /// `SUM(score)` は Issue #892 で受理された（TABLE-13・SQL-13）。結果は
-/// `Cell::Float`（DOUBLE PRECISION 相当。本リポの実装既定値）。
+/// Issue #1173 以降 `REAL`（f32 へ丸めた `Cell::Float`。PostgreSQL の `sum(real)`
+/// と同じ）で、列メタも `Computed { ty: Some(Real) }` になる。
 #[test]
 fn sum_aggregate_on_real_column_succeeds_after_issue_892() {
     let (core, path) = new_core();
@@ -311,6 +312,13 @@ fn sum_aggregate_on_real_column_succeeds_after_issue_892() {
         .execute_sql(&alice, &format!("SELECT SUM(score) FROM {TABLE}"))
         .expect("SUM on REAL column must succeed after Issue #892");
     assert_eq!(result.rows[0].cells, vec![Cell::Float(3.5)]);
+    assert_eq!(
+        result.columns[0],
+        engine::sql::exec::ColumnMeta::Computed {
+            name: "sum".to_string(),
+            ty: Some(engine::catalog::ColumnType::Real),
+        }
+    );
 }
 
 /// `id = -1` の応答コードは REAL/DOUBLE 追加の前後で変わらない（既存契約の

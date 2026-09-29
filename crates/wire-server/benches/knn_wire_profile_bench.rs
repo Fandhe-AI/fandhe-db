@@ -461,8 +461,9 @@ fn main() {
                     .expect("encode row description for sample result");
             total += row_desc.len();
             for row in &sample_result.rows {
-                let data_row = wire_server::result_encoder::encode_data_row(row)
-                    .expect("encode data row for sample result");
+                let data_row =
+                    wire_server::result_encoder::encode_data_row(&sample_result.columns, row)
+                        .expect("encode data row for sample result");
                 total += data_row.len();
             }
             let command_complete = wire_server::result_encoder::encode_command_complete(&tag)

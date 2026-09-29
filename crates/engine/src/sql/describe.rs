@@ -13,7 +13,7 @@
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::ColumnMeta;
-use crate::sql::parser::{BoundScan, ProjectedColumn, ProjectionColumn};
+use crate::sql::parser::{BoundAggregate, BoundScan, ProjectedColumn};
 
 /// `SELECT`・広域取得（scan）が共有する `ProjectedColumn` 列から `ColumnMeta` を
 /// 導出する。`sql::exec::execute_statement_with_cache`・`sql::scan::execute_scan`
@@ -43,7 +43,9 @@ pub(crate) fn projected_columns(
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
-            ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
+            ProjectedColumn::Computed { name, ty, .. } => {
+                crate::sql::exec::computed_column_meta(name, *ty)
+            }
         })
         .collect()
 }
@@ -92,8 +94,10 @@ pub(crate) fn scan_columns(
     }
     for item in bound.windows() {
         if let Some(slot) = out.get_mut(item.position) {
+            // ウィンドウ関数の結果型は本 Issue（#1173）の対象外（静的型なし＝text）。
             *slot = Some(ColumnMeta::Computed {
                 name: item.name.clone(),
+                ty: None,
             });
         }
     }
@@ -107,21 +111,10 @@ pub(crate) fn scan_columns(
         .collect()
 }
 
-/// 集計（`GROUP BY` の有無を問わない）が持つ `ProjectionColumn` 列から
-/// `ColumnMeta` を導出する。`sql::aggregate::finish_aggregate_result`・
-/// `sql::group_by::execute_grouped_aggregate` の PROJECT 段と同一の写像
-/// （`GroupKey`・`Aggregate` のいずれも `ColumnMeta::Computed` になる既存の
-/// 非対称——`GROUP BY` 列は `TEXT` 型だが `ColumnMeta::Scalar` にはならない
-/// ——を変えずに踏襲する）。
-pub(crate) fn aggregate_columns(projection: &[ProjectionColumn]) -> Vec<ColumnMeta> {
-    projection
-        .iter()
-        .map(|col| {
-            let name = match col {
-                ProjectionColumn::GroupKey { name, .. } => name.clone(),
-                ProjectionColumn::Aggregate { name, .. } => name.clone(),
-            };
-            ColumnMeta::Computed { name }
-        })
-        .collect()
+/// 集計（`GROUP BY` の有無を問わない）の出力列から `ColumnMeta` を導出する。
+/// 実行経路（`sql::aggregate::finish_aggregate_result`・`sql::group_by` の
+/// PROJECT 段）と同一の写像（[`crate::sql::aggregate::aggregate_projection_columns`]）
+/// に委譲する。結果型は集計関数と入力型から静的に決まる（Issue #1173）。
+pub(crate) fn aggregate_columns(bound: &BoundAggregate) -> Vec<ColumnMeta> {
+    crate::sql::aggregate::aggregate_projection_columns(bound)
 }

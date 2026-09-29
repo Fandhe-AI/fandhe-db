@@ -5,9 +5,9 @@
 //! `wire_insert_operation_id.rs`・`wire1_simple_query.rs` と同じ流儀（生
 //! `TcpStream`・`common::*` ヘルパー）で、INSERT→SELECT の `DataRow` テキスト・
 //! `22003`（NumericOutOfRange）の `ErrorResponse` を wire フレーミング越しに
-//! 確認する。F8（Issue #882 計画）により REAL 列のテキスト表現は f64 への
-//! 無損失拡大後の最短往復表記になる点に注意（例: `1.5f32` → `"1.5"`、
-//! `0.1f32` → `"0.10000000149011612"`）。
+//! 確認する。REAL 列のテキスト表現は Issue #1173（WIRE-13）以降 PostgreSQL の
+//! float4 出力形式（最短往復桁。例: `0.1f32` → `"0.1"`、`1e6` → `"1e+06"`）で、
+//! DOUBLE PRECISION 列は f64 の最短往復表記のまま。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -50,9 +50,8 @@ fn spawn_with_alice(core: Arc<EngineCore>) -> std::net::TcpStream {
     authenticate_to_ready_for_query(addr, "alice", "pw-alice")
 }
 
-/// INSERT→SELECT の `DataRow` テキストが F6/F8 の正準表現で返ることを確認する
-/// （REAL は f64 への無損失拡大後の最短往復表記になるため、`1.5` は `"1.5"`
-/// のまま、`0.1` は桁数が増える）。
+/// INSERT→SELECT の `DataRow` テキストが正準表現で返ることを確認する
+/// （`1.5` は REAL・DOUBLE のどちらでも `"1.5"`）。
 #[test]
 fn wire_insert_select_roundtrips_real_and_double_as_text() {
     let (core, _guard) = new_core_with_metrics_table();
@@ -226,5 +225,64 @@ fn nosql_insert_accepts_real_column_value_and_round_trips() {
     let cells = read_data_row(&mut stream);
     assert_eq!(cells, vec![Some("1.5".to_string())]);
     let _ = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+}
+/// REAL 列の値・式・集計は PostgreSQL の float4 出力形式で返る（Issue #1173・
+/// WIRE-13）: `0.1` は `0.1`（f64 拡張の `0.10000000149011612` ではない）、
+/// `1000000` は `1e+06`。`SUM(REAL)` は real で、`0.1 + 0.2` は `0.3`
+/// （f32 へ丸めた結果）になる。DOUBLE PRECISION 列は従来の表記のまま。
+#[test]
+fn wire_real_text_follows_postgresql_float4_output() {
+    let (core, _guard) = new_core_with_metrics_table();
+    let mut stream = spawn_with_alice(core);
+
+    for (id, score, op) in [(1, "0.1", "wire-op-1"), (2, "0.2", "wire-op-2")] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO metrics (id, embedding, score, weight) \
+                 VALUES ({id}, '[0.1,0.2]', {score}, 0.1) USING OPERATION_ID '{op}'"
+            ),
+        );
+        read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO metrics (id, embedding, score) VALUES (3, '[0.1,0.2]', 1000000) \
+         USING OPERATION_ID 'wire-op-3'",
+    );
+    read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT score, weight FROM metrics WHERE id = 1 LIMIT 1",
+    );
+    read_row_description(&mut stream);
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("0.1".to_string()), Some("0.1".to_string())]
+    );
+    read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT score FROM metrics WHERE id = 3 LIMIT 1",
+    );
+    read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1e+06".to_string())]);
+    read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT SUM(score) AS s FROM metrics WHERE id < 3",
+    );
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(columns, vec![("s".to_string(), 700)]);
+    assert_eq!(read_data_row(&mut stream), vec![Some("0.3".to_string())]);
+    read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
 }

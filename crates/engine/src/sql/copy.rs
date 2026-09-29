@@ -27,7 +27,7 @@ use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, InsertLiteral, SqlSurfaceError};
 use crate::sql::parser::{
     bind_bytea_literal, bind_datetime_literal, bind_double_literal, bind_enum_literal,
-    bind_integer_literal, bind_json_literal, bind_numeric_literal, bind_real_literal,
+    bind_integer_literal, bind_json_literal, bind_numeric_literal, bind_real_copy_field,
     bind_uuid_literal, parse_array_literal, parse_vector_literal, BoundInsert,
 };
 
@@ -577,12 +577,13 @@ fn bind_copy_record(
                     *scale,
                 )?,
                 // `REAL`／`DOUBLE PRECISION`（Issue #882）も INSERT／UPDATE／
-                // UPSERT と同じ `bind_real_literal`／`bind_double_literal`
-                // （`scalar_float.rs` の閉じた文法。非有限化・非ゼロ
-                // アンダーフローは `22003`）を共有する（main マージ時点で
+                // UPSERT と同じエラー写像（`scalar_float.rs` の閉じた文法。非有限化・
+                // 非ゼロアンダーフローは `22003`）を共有する。`REAL` のみ、`COPY TO`
+                // の出力（指数表記を含む。Issue #1173）を往復できるよう指数表記を
+                // 受理する `bind_real_copy_field` を使う（main マージ時点で
                 // COPY 側の網羅 match が追随しておらずビルド不能だった分の
                 // 追加）。
-                ColumnType::Real => Value::Real(bind_real_literal(s)?),
+                ColumnType::Real => Value::Real(bind_real_copy_field(s)?),
                 ColumnType::Double => Value::Double(bind_double_literal(s)?),
                 // `INTEGER`／`BIGINT`（Issue #881）も INSERT／UPDATE／UPSERT と
                 // 同じ `bind_integer_literal` を共有する。COPY のフィールドは

@@ -277,7 +277,7 @@ fn window_alias_and_position_are_preserved_among_plain_columns() {
             ..
         }
     ));
-    assert!(matches!(result.columns[1], ColumnMeta::Computed { ref name } if name == "rn"));
+    assert!(matches!(result.columns[1], ColumnMeta::Computed { ref name, .. } if name == "rn"));
     assert!(matches!(
         result.columns[2],
         ColumnMeta::Scalar {

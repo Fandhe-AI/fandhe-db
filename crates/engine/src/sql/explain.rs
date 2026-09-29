@@ -560,6 +560,7 @@ fn lines_to_query_result(lines: Vec<String>) -> QueryResult {
     QueryResult {
         columns: vec![ColumnMeta::Computed {
             name: QUERY_PLAN_COLUMN.to_string(),
+            ty: Some(crate::catalog::ColumnType::Text),
         }],
         rows,
     }
@@ -684,7 +685,8 @@ mod tests {
         assert_eq!(
             result.columns[0],
             ColumnMeta::Computed {
-                name: QUERY_PLAN_COLUMN.to_string()
+                name: QUERY_PLAN_COLUMN.to_string(),
+                ty: Some(crate::catalog::ColumnType::Text),
             }
         );
         // 既存 6 行（不変・後方互換）+ Issue #411 の `engine`／`ann_plan` 2 行 +

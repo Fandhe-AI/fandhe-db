@@ -42,6 +42,9 @@ const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 /// `exec.rs` はその位置を投影する際 `storage::Row::embedding` を別途参照する）。
 /// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant を
 /// 追加した（宣言的 UDF・組み込み関数呼び出しを結果列位置で束縛した式）。
+///
+/// **Issue #1173 で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant に
+/// 束縛済み式の静的型 `ty` を追加した（結果列メタの型 OID の根拠）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectedColumn {
     Id,
@@ -53,6 +56,7 @@ pub enum ProjectedColumn {
     Computed {
         name: String,
         expr: crate::sql::udf_call::BoundExpr,
+        ty: crate::sql::udf_call::ExprType,
     },
 }
 
@@ -535,6 +539,21 @@ pub(crate) fn bind_integer_literal(
 /// アンダーフロー）は `22003`（`NumericOutOfRange`）へ写像する。
 pub(crate) fn bind_real_literal(raw: &str) -> Result<f32, SqlSurfaceError> {
     crate::scalar_float::parse_real(raw).map_err(|e| match e {
+        crate::scalar_float::ParseFloatError::Malformed => {
+            SqlSurfaceError::invalid_input(format!("malformed REAL literal: {raw:?}"))
+        }
+        crate::scalar_float::ParseFloatError::OutOfRange => {
+            SqlSurfaceError::numeric_out_of_range(format!("REAL literal out of range: {raw:?}"))
+        }
+    })
+}
+
+/// `COPY FROM` の `REAL` フィールド束縛（Issue #1173）。[`bind_real_literal`] と
+/// 同じエラー写像だが、`COPY TO` の出力（`scalar_float::format_real` の指数表記
+/// `1e+06` 形式を含む）を再投入できるよう [`crate::scalar_float::parse_real_text`]
+/// を使う（WIRE-17 の往復契約）。SQL リテラルは従来どおり指数表記を受理しない。
+pub(crate) fn bind_real_copy_field(raw: &str) -> Result<f32, SqlSurfaceError> {
+    crate::scalar_float::parse_real_text(raw).map_err(|e| match e {
         crate::scalar_float::ParseFloatError::Malformed => {
             SqlSurfaceError::invalid_input(format!("malformed REAL literal: {raw:?}"))
         }
@@ -1166,10 +1185,14 @@ pub fn bind_projection(
                         )));
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let (bound, _ty) =
+                        let (bound, ty) =
                             crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
                         let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
-                        cols.push(ProjectedColumn::Computed { name, expr: bound });
+                        cols.push(ProjectedColumn::Computed {
+                            name,
+                            expr: bound,
+                            ty,
+                        });
                     }
                 }
             }
@@ -3766,8 +3789,8 @@ pub(crate) enum AggregateInput {
     /// `REAL` 列の裸の列参照。`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のすべてで使う
     /// （Issue #892）。`f32` は `f64::from` で無損失に拡張し、既存の
     /// `Accumulator::FloatSum`/`FloatAvg`/`FloatMin`/`FloatMax`（`ScalarExpr`
-    /// と共有）へ観測する。結果はいずれも `Cell::Float`（DOUBLE PRECISION
-    /// 相当。本リポの実装既定値）。
+    /// と共有）へ観測する。`SUM` のみ専用の `Accumulator::RealSum`（結果は f32 へ
+    /// 丸めた `Cell::Float`。Issue #1173）で、`AVG` は DOUBLE PRECISION 相当。
     RealColumn(usize),
     /// `DOUBLE PRECISION` 列の裸の列参照。`RealColumn` と同じ受理範囲・
     /// 累積方式を共有する（`f64` をそのまま使う点のみが異なる）。

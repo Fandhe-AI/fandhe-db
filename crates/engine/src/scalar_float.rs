@@ -12,11 +12,18 @@
 //! - `-0.0` は `+0.0` へ正規化する（符号付きゼロは保持しない）。
 //! - 比較・ソートは [`cmp_real`]／[`cmp_double`] が唯一の情報源（`total_cmp` を
 //!   基準にしつつ `-0.0 == +0.0` を保つ）。`NULL` の並び位置は呼び出し側の責務。
-//! - テキスト表現は Rust の `Display`（指数表記を出さない最短往復表記）を正準とし、
-//!   `f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析する（二重丸め防止）。
+//! - `DOUBLE PRECISION` のテキスト表現は Rust の `Display`（指数表記を出さない
+//!   最短往復表記）を正準とする。`REAL` のテキスト表現は PostgreSQL の float4 出力
+//!   （最短往復桁・指数は `1e+06` 形式。Issue #1173・WIRE-13 のポインタ）に揃える
+//!   （[`format_real`]）。`f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析
+//!   する（二重丸め防止）。
+//! - SQL リテラルの文法（[`parse_real`]）は指数表記を受理しない（lexer が指数表記を
+//!   字句化しないため）。`COPY FROM` は [`format_real`] の出力（指数表記を含む）を
+//!   再投入できる必要があるため、指数表記を受理する [`parse_real_text`] を使う
+//!   （WIRE-17 の往復契約）。
 //!
-//! 対象外（申し送り）: PostgreSQL 既定出力の再現・指数表記リテラルの受理・
-//! 文字列リテラルからの暗黙変換は WIRE-13／後続 Issue の担当（Issue #882 計画 §7）。
+//! 対象外（申し送り）: `DOUBLE PRECISION` 出力の PostgreSQL 形式化・SQL リテラルでの
+//! 指数表記の受理・文字列リテラルからの暗黙変換は後続 Issue の担当。
 
 use std::cmp::Ordering;
 
@@ -108,9 +115,90 @@ pub fn canonicalize_double(value: f64) -> f64 {
     }
 }
 
-/// `REAL` 値の正準テキスト表現（指数表記を出さない `Display`。最短往復表記）。
+/// `REAL` 値のテキスト表現。PostgreSQL の float4 出力（`extra_float_digits` 既定）に
+/// 揃える（Issue #1173）。
+///
+/// wire-server の `DataRow`（`result_encoder`）と `COPY TO`（`sql::copy` の出力）が
+/// 呼び、`0.1f32` は `0.1`（f64 へ拡張した `0.10000000149011612` ではない）になる。
+/// 桁列は最短往復表記で、十進指数 `e` が `-4 <= e < 6` なら固定小数、それ以外は
+/// `d[.ddd]e±XX`（指数は符号付き 2 桁以上）で出す。特殊値は `NaN`／`Infinity`／
+/// `-Infinity`／`-0`（engine は非有限値を格納しないが防御的に扱う）。
 pub fn format_real(value: f32) -> String {
-    format!("{value}")
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0");
+    }
+    // `{:e}` は f32 の最短往復表記を `d[.ddd]e<exp>` で返す。
+    let sci = format!("{:e}", value.abs());
+    let (mantissa, exp_text) = match sci.split_once('e') {
+        Some(parts) => parts,
+        None => return format!("{sign}{sci}"),
+    };
+    let exp: i32 = exp_text.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    if (-4..6).contains(&exp) {
+        let body = if exp < 0 {
+            let zeros = usize::try_from(-exp - 1).unwrap_or(0);
+            format!("0.{}{}", "0".repeat(zeros), digits)
+        } else {
+            let int_len = usize::try_from(exp).unwrap_or(0) + 1;
+            if digits.len() <= int_len {
+                format!("{}{}", digits, "0".repeat(int_len - digits.len()))
+            } else {
+                let (int_part, frac_part) = digits.split_at(int_len);
+                format!("{int_part}.{frac_part}")
+            }
+        };
+        format!("{sign}{body}")
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let frac = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(".{rest}")
+        };
+        let exp_sign = if exp < 0 { '-' } else { '+' };
+        format!("{sign}{first}{frac}e{exp_sign}{:02}", exp.unsigned_abs())
+    }
+}
+
+/// [`format_real`] の出力（指数表記を含む）を受理する `REAL` 解析（Issue #1173）。
+///
+/// 文法は `^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$`。`COPY FROM`（`sql::copy`）が
+/// `COPY TO` の出力を再投入する往復契約（WIRE-17）のために使う。SQL リテラルの
+/// 束縛は引き続き指数表記を受理しない [`parse_real`] を使う。非有限化・非ゼロ入力の
+/// アンダーフローは `OutOfRange`、`inf`／`nan` などは `Malformed`、`-0` は正規化する。
+pub fn parse_real_text(input: &str) -> Result<f32, ParseFloatError> {
+    let (mantissa, exponent) = match input.find(['e', 'E']) {
+        Some(pos) => (
+            input.get(..pos).unwrap_or(""),
+            Some(input.get(pos + 1..).unwrap_or("")),
+        ),
+        None => (input, None),
+    };
+    if !is_well_formed_literal(mantissa) {
+        return Err(ParseFloatError::Malformed);
+    }
+    if let Some(exp) = exponent {
+        let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ParseFloatError::Malformed);
+        }
+    }
+    let value: f32 = input.parse().map_err(|_| ParseFloatError::Malformed)?;
+    if !value.is_finite() {
+        return Err(ParseFloatError::OutOfRange);
+    }
+    if value == 0.0 && !literal_is_textually_zero(mantissa) {
+        return Err(ParseFloatError::OutOfRange);
+    }
+    Ok(canonicalize_real(value))
 }
 
 /// `DOUBLE PRECISION` 値の正準テキスト表現。
@@ -164,11 +252,61 @@ mod tests {
         ];
         for &v in cases {
             let text = format_real(v);
-            let parsed = parse_real(&text).expect("roundtrip parse");
+            let parsed = parse_real_text(&text).expect("roundtrip parse");
             assert_eq!(
                 parsed.to_bits(),
                 canonicalize_real(v).to_bits(),
                 "roundtrip mismatch for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_real_matches_postgresql_float4_output() {
+        let cases: &[(f32, &str)] = &[
+            (0.1, "0.1"),
+            (1.5, "1.5"),
+            (100.0, "100"),
+            (123456.0, "123456"),
+            (1e6, "1e+06"),
+            (1234567.0, "1.234567e+06"),
+            (16777216.0, "1.6777216e+07"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (f32::MAX, "3.4028235e+38"),
+            (f32::MIN_POSITIVE, "1.1754944e-38"),
+            (1.0 / 3.0, "0.33333334"),
+            (-1.5, "-1.5"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (f32::NAN, "NaN"),
+            (f32::INFINITY, "Infinity"),
+            (f32::NEG_INFINITY, "-Infinity"),
+        ];
+        for &(v, expected) in cases {
+            assert_eq!(format_real(v), expected, "format_real({v:?})");
+        }
+    }
+
+    #[test]
+    fn parse_real_text_accepts_exponent_and_keeps_closed_grammar() {
+        assert_eq!(parse_real_text("1e+06"), Ok(1e6));
+        assert_eq!(parse_real_text("1.234567e+06"), Ok(1.234567e6));
+        assert_eq!(parse_real_text("1e-05"), Ok(1e-5));
+        assert_eq!(parse_real_text("3.4028235e+38"), Ok(f32::MAX));
+        assert_eq!(parse_real_text("0e+00"), Ok(0.0));
+        assert_eq!(parse_real_text("1E5"), Ok(1e5));
+        assert_eq!(parse_real_text("1.5"), Ok(1.5));
+        assert_eq!(parse_real_text("1e+39"), Err(ParseFloatError::OutOfRange));
+        assert_eq!(parse_real_text("1e-50"), Err(ParseFloatError::OutOfRange));
+        for bad in [
+            "1e", "e5", "1e+", "1e+x", "Infinity", "NaN", "inf", "", "-", "+1", "1.e5", ".5e1",
+            "0x1p3", "1e5.5",
+        ] {
+            assert_eq!(
+                parse_real_text(bad),
+                Err(ParseFloatError::Malformed),
+                "expected Malformed for {bad:?}"
             );
         }
     }
@@ -199,7 +337,7 @@ mod tests {
             }
             let v = canonicalize_real(v);
             let text = format_real(v);
-            let parsed = parse_real(&text).expect("sweep parse");
+            let parsed = parse_real_text(&text).expect("sweep parse");
             assert_eq!(parsed.to_bits(), v.to_bits());
             checked += 1;
         }
