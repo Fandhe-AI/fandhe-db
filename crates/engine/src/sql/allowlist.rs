@@ -8036,16 +8036,10 @@ fn parse_select_shape(
         }));
     }
 
-    // SQL-30・TASK-214: 残る経路は文全体のスカラー `ORDER BY`（Issue #915・
-    // SQL-25・TASK-209）を伴う広域取得で、ウィンドウ項目とは併用しない
-    // （§計画 2「対象外」。ウィンドウ関数自身の順序付けは `OVER (... ORDER BY
-    // ...)` で個別に指定するため、文全体の `ORDER BY` と意味が重複する）。
-    if !window_items.is_empty() {
-        return Err(SqlSurfaceError::unsupported(
-            "window functions cannot be combined with ORDER BY",
-        ));
-    }
-
+    // SQL-30・TASK-214: 残る経路は文全体の `ORDER BY` を伴う取得。スカラー列の
+    // `ORDER BY` はウィンドウ項目と併用できる（Issue #1189。ウィンドウ値は
+    // 全母集合で評価し、文全体の並べ替え・LIMIT/OFFSET は `sql::window` が
+    // 共有比較器で適用する）。ベクトル順位付け形との併用だけは下で 42601 にする。
     p.expect_keyword(Keyword::Order)?;
     p.expect_keyword(Keyword::By)?;
 
@@ -8059,6 +8053,12 @@ fn parse_select_shape(
             p.tokens.get(p.pos + 1),
             Some(Token::DistanceOp) | Some(Token::Punct('('))
         );
+
+    if is_vector_ranking && !window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions cannot be combined with vector ORDER BY",
+        ));
+    }
 
     if !is_vector_ranking {
         let order_by = p.parse_scalar_order_by()?;
@@ -8090,11 +8090,8 @@ fn parse_select_shape(
             limit,
             order_by,
             offset,
-            // 直前のガード（`!window_items.is_empty()` は `42601`）により、
-            // この分岐に到達する時点で `window_items` は必ず空（ウィンドウ関数
-            // と本経路のスカラー ORDER BY は併用しない。SQL-30・TASK-214
-            // §計画 2「対象外」）。
-            window_items: Vec::new(),
+            // Issue #1189: スカラー ORDER BY とウィンドウ項目は併用できる。
+            window_items,
         }));
     }
 
