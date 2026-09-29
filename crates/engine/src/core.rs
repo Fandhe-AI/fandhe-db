@@ -1437,6 +1437,11 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1068）: `ValidatedAlterTable::AddCheck` variant
     /// の追加により、`ValidatedAlterTable` を網羅的にマッチするクレート外の
     /// コードは追随が必要。
+    ///
+    /// **BREAKING CHANGE**（Issue #1167）: `ValidatedAlterTable::DropColumn`・
+    /// `AlterColumnType` variant（`DROP COLUMN`／`ALTER COLUMN ... TYPE`）を追加した。
+    /// 権限ゲート・Describe・明示トランザクション内 DDL の拒否は本 variant 単位で
+    /// 判定するため、新形状も既存形状と同じ扱いになる。
     AlterTable(crate::sql::allowlist::ValidatedAlterTable),
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
@@ -4241,7 +4246,7 @@ impl EngineCore {
                 // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
                 // 解決する（`sql::subquery` モジュールドキュメント参照）。
                 let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &schema,
@@ -4250,7 +4255,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     &mut subquery_budget,
-                    &mut subquery_in_leaf_budget,
+                    &mut subquery_in_value_budget,
                 )?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
@@ -4277,7 +4282,7 @@ impl EngineCore {
                 // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: `Statement::
                 // Aggregate` アームと同じ理由・同じ経路でサブクエリを解決する。
                 let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &schema,
@@ -4286,7 +4291,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     &mut subquery_budget,
-                    &mut subquery_in_leaf_budget,
+                    &mut subquery_in_value_budget,
                 )?;
                 let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;

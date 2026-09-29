@@ -39,11 +39,13 @@
 //! 一切変更しない。
 
 use crate::catalog::{
-    AlterCheckError, CatalogError, ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema,
+    AlterCheckError, CatalogError, ColumnDef, ColumnDefault, ColumnType, IndexDef, IndexKind,
+    TableSchema, MAX_COLUMN_DEFAULT_LEN,
 };
 use crate::sql::allowlist::{
-    SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
-    ValidatedAlterTableAddUnique, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
+    InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
+    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
+    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
     ValidatedCreateTable, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
     ValidatedDropView,
 };
@@ -286,6 +288,10 @@ pub enum AlterTableAction {
     /// `DROP CONSTRAINT <name>`（Issue #1067）。CHECK 名を指定した DROP も
     /// Issue #1068 以降は本 variant を返す（以前は `0A000` で拒否していた）。
     DropConstraint { constraint_name: String },
+    /// `DROP COLUMN <col>`（TABLE-19、Issue #1167）。**BREAKING CHANGE**: variant 追加。
+    DropColumn { column_name: String },
+    /// `ALTER COLUMN <col> TYPE <型>`（TABLE-19、Issue #1167）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnType { column_name: String },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -306,8 +312,12 @@ pub enum AlterTableAction {
 ///    テーブルの存在・列数上限・列名重複を再確認。TOCTOU なし）。1. と 3. の間に
 ///    テーブルが削除された場合も 1. と同じ写像（`42P01`／`42809`）になる。
 ///
-/// 追加列は常に nullable として扱う（呼び出し元がこの契約を上書きする経路は
-/// 存在しない。TABLE-5）。
+/// `NOT NULL`／`DEFAULT` を受け付ける（Issue #1169）。`DEFAULT` は列型との整合
+/// （[`add_column_default`]）・値の束縛（`22000`／`22003`）を検証してから渡し、
+/// 既存行は読み出し時に既定値として見える。`DEFAULT` なしの `NOT NULL` は行の
+/// 有無によらず構造検証段階で一律 `42601` 拒否される（TABLE-16。`Storage` を直接呼ぶ
+/// Rust API は `CatalogError::Invalid`。行ストアを参照せず他テナントの行の存在を漏らさない）。
+/// `DEFAULT`・`NOT NULL` のいずれも無い列は従来どおり nullable（TABLE-5）。
 pub(crate) fn execute_alter_table_add_column(
     storage: &Storage,
     stmt: &ValidatedAlterTableAddColumn,
@@ -320,7 +330,17 @@ pub(crate) fn execute_alter_table_add_column(
         Err(other) => return Err(map_add_column_error(other)),
     }
     let ty = resolve_column_type(storage, &stmt.column_type)?;
-    let column = ColumnDef::new(stmt.column_name.clone(), ty, true);
+    let default = match &stmt.default {
+        None => None,
+        Some(literal) => Some(add_column_default(&stmt.column_name, &ty, literal)?),
+    };
+    let mut column = ColumnDef::new(stmt.column_name.clone(), ty, !stmt.not_null);
+    if let Some(default) = default {
+        // 束縛できない DEFAULT（範囲外・桁数超過等）は永続化前に SQLSTATE 付きで拒否する
+        // （既存行の読み出し時補完が常に失敗する状態をカタログへ残さない）。
+        crate::sql::parser::bind_column_default(&column, &default)?;
+        column = column.with_default(default);
+    }
     storage
         .alter_table_add_column(&stmt.table_name, column)
         .map_err(|e| match e {
@@ -449,8 +469,9 @@ pub(crate) fn execute_alter_table_add_check(
 /// `ParsedSql::AlterTable`（[`crate::sql::allowlist::ValidatedAlterTable`]）の
 /// 唯一の実行入口（Issue #1067・#1068・#1069）。`core.rs::EngineCore::
 /// execute_parsed_in_session` から `require_ddl_permission` 通過後に呼ばれ、
-/// 5 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
-/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD [CONSTRAINT] FOREIGN KEY`）
+/// 7 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD [CONSTRAINT] FOREIGN KEY`／
+/// `DROP COLUMN`／`ALTER COLUMN TYPE`）
 /// を対応する実行本体へ振り分ける（構文の許可リスト判定は `sql::allowlist` の
 /// 管轄、ディスパッチはここと `core.rs` の管轄という既存の責務分担を維持する）。
 pub(crate) fn execute_alter_table(
@@ -472,6 +493,12 @@ pub(crate) fn execute_alter_table(
         }
         crate::sql::allowlist::ValidatedAlterTable::AddForeignKey(stmt) => {
             execute_alter_table_add_foreign_key(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::DropColumn(stmt) => {
+            execute_alter_table_drop_column(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnType(stmt) => {
+            execute_alter_table_alter_column_type(storage, stmt)
         }
     }
 }
@@ -581,6 +608,129 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `ALTER TABLE <table> DROP COLUMN <column>` の実行本体（TABLE-19・SQL-23、
+/// Issue #1167）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に
+/// 呼んでいる前提。判定順序: テーブル存在確認（`42P01`／`42809`）→
+/// `catalog::Storage::alter_table_drop_column`（単一 write txn 内。墓標方式の
+/// O(1) 削除・世代 bump 込み）。写像は [`map_drop_alter_column_error`]。
+pub(crate) fn execute_alter_table_drop_column(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableDropColumn,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_drop_column(&stmt.table_name, &stmt.column_name)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::DropColumn {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> TYPE <型>` の実行本体（TABLE-19・
+/// SQL-23、Issue #1167）。前提は [`execute_alter_table_drop_column`] と同じ。
+/// 判定順序: テーブル存在確認 → 目標型の解決（[`resolve_alter_target_type`]。
+/// 未登録 ENUM は `42601`）→ `catalog::Storage::alter_table_alter_column_type`
+/// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕）。
+pub(crate) fn execute_alter_table_alter_column_type(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnType,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    let target = resolve_alter_target_type(storage, &stmt.column_type)?;
+    storage
+        .alter_table_alter_column_type(&stmt.table_name, &stmt.column_name, &target)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnType {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// 対象テーブルの存在確認（不在なら `42P01`／`42809`）。読み出し失敗は
+/// [`map_drop_alter_column_error`] で fail-closed に写す。
+fn ensure_table_exists(storage: &Storage, table_name: &str) -> Result<(), SqlSurfaceError> {
+    match storage.get_table_schema(table_name) {
+        Ok(_) => Ok(()),
+        Err(CatalogError::TableNotFound(_)) => Err(undefined_table_or_view(storage, table_name)),
+        Err(other) => Err(map_drop_alter_column_error(other)),
+    }
+}
+
+/// `ALTER COLUMN TYPE` の目標型解決。[`resolve_column_type`] と異なり `VECTOR` を
+/// `0A000` にせず `ColumnType::Vector` へ写し、engine 側の互換性判定で
+/// `IncompatibleTypeChange`（`42804`）に落とす。それ以外は [`resolve_column_type`] に委譲。
+fn resolve_alter_target_type(
+    storage: &Storage,
+    ty: &SqlColumnTypeName,
+) -> Result<ColumnType, SqlSurfaceError> {
+    match ty {
+        SqlColumnTypeName::Vector(dim) => Ok(ColumnType::Vector(*dim)),
+        other => resolve_column_type(storage, other),
+    }
+}
+
+/// `DROP COLUMN`／`ALTER COLUMN TYPE` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （TABLE-19・ERR-6、Issue #1167）。`ProtectedColumn`（VECTOR 列・保護列）と
+/// `Invalid` は `42601`、依存オブジェクト（PK・UNIQUE・CHECK・FK）は `2BP01`、
+/// 非互換な型変更は `42804`。文言に含めるのは列名と型タグのみ（行値・テナント情報なし）。
+/// 全 variant を明示列挙しワイルドカード腕を置かない（fail-closed）。
+fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::ProtectedColumn(name) => {
+            SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
+        }
+        CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::IncompatibleTypeChange { column, from, to } => {
+            SqlSurfaceError::datatype_mismatch(format!(
+                "cannot change type of column {column:?} from {from} to {to}"
+            ))
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::Backend(_)
+        | CatalogError::CorruptSchema(_)
+        | CatalogError::TableAlreadyExists(_)
+        | CatalogError::ColumnAlreadyExists(_)
+        | CatalogError::RowNotFound(_)
+        | CatalogError::IncompatibleRowKeyFormat
+        | CatalogError::TableGenerationCounterOverflow
+        | CatalogError::TypeNotFound(_)
+        | CatalogError::TypeAlreadyExists(_)
+        | CatalogError::ViewNotFound(_)
+        | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::TooManyColumns { .. }
+        | CatalogError::IndexAlreadyExists(_)
+        | CatalogError::IndexNotFound(_)
+        | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexLimitExceeded(_)
+        | CatalogError::UniqueConstraintViolation
+        | CatalogError::InvalidForeignKey(_)
+        | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::ConstraintNotFound(_)
+        | CatalogError::ConstraintLimitExceeded(_)
+        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        },
+    }
+}
+
 /// テーブルとして存在しない `name` について、ビューまたは索引（TASK-206・
 /// INDEX-7、Issue #908。いずれもテーブルと relation 名前空間を共有する）として
 /// 存在すれば `WrongObjectType`（`42809`）、しなければ `UndefinedTable`（`42P01`）を
@@ -650,6 +800,58 @@ fn resolve_column_type(
             Ok(ColumnType::Enum(def))
         }
     }
+}
+
+/// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
+/// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
+/// （日時・BYTEA・JSON・UUID・ENUM・配列等）は `0A000`、対応型でリテラル種別が
+/// 合わない場合は `42601`、長さ上限超過は `54000`。
+fn add_column_default(
+    column_name: &str,
+    ty: &ColumnType,
+    literal: &InsertLiteral,
+) -> Result<ColumnDefault, SqlSurfaceError> {
+    let kind = match ty {
+        ColumnType::Text => "text",
+        ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double
+        | ColumnType::Numeric { .. } => "numeric",
+        ColumnType::Boolean => "boolean",
+        _ => {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: format!("column {column_name:?}: DEFAULT is not supported for this type"),
+            })
+        }
+    };
+    let mismatch = || {
+        SqlSurfaceError::unsupported(format!(
+            "column {column_name:?} DEFAULT expects a {kind} literal"
+        ))
+    };
+    match literal {
+        InsertLiteral::String(s) if kind == "text" => {
+            if s.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            Ok(ColumnDefault::Text(s.clone()))
+        }
+        InsertLiteral::Number(n) if kind == "numeric" => {
+            if n.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            Ok(ColumnDefault::Number(n.clone()))
+        }
+        InsertLiteral::Bool(b) if kind == "boolean" => Ok(ColumnDefault::Bool(*b)),
+        _ => Err(mismatch()),
+    }
+}
+
+fn default_too_long(column_name: &str) -> SqlSurfaceError {
+    SqlSurfaceError::payload_too_large(format!(
+        "column {column_name:?} DEFAULT literal exceeds length limit"
+    ))
 }
 
 /// `Storage::alter_table_add_column`（および ENUM 型名解決）の [`CatalogError`] を

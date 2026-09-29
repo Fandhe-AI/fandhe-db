@@ -28,6 +28,11 @@
 
 /// 一括投入 4 上限の設定値。既定値は [`Default`] 実装を参照。
 ///
+/// `max_files_per_batch` の優先順位は「wire-server の CLI `--batch-max-files`
+/// 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64」（Issue #1166）。
+/// 値は `1..=`[`MAX_BATCH_MAX_FILES`] に限定され、この範囲では
+/// `batch_raw_sql_len_budget` の飽和演算がオーバーフローしない。
+///
 /// **既定値の出典に関する注記**（spec-confidentiality.md 準拠）: ①③④の具体的な
 /// 上限数値は private spec（INDEX-4）の判断事項であり、本ソース（public リポ）に
 /// 数値そのものとして固定しない。[`Default`] は環境変数（下記）による注入を優先し、
@@ -65,10 +70,60 @@ fn env_usize_or(var_name: &str, fallback: usize) -> usize {
     }
 }
 
+/// `max_files_per_batch` の既定値（環境変数未設定・不正値時のフォールバック）。
+/// 既存リテラルの単一情報源（Issue #1166）。
+pub const DEFAULT_MAX_FILES_PER_BATCH: usize = 64;
+
+/// `max_files_per_batch` に設定できる上限。`--max-insert-rows` と範囲を揃える
+/// ため既存公開定数 [`crate::sql::parser::MAX_DML_ROW_LIMIT`] を再利用する
+/// （新たな定数値を導入しない）。`batch_raw_sql_len_budget` の予算が際限なく
+/// 大きくならないための DoS 上限でもある（Issue #1166）。
+pub const MAX_BATCH_MAX_FILES: usize = crate::sql::parser::MAX_DML_ROW_LIMIT;
+
+/// [`validate_max_files_per_batch`] の範囲外エラー。`Display` は値と範囲のみを含む。
+#[derive(Debug, PartialEq, Eq)]
+pub struct MaxFilesPerBatchOutOfRange {
+    value: usize,
+}
+
+impl std::fmt::Display for MaxFilesPerBatchOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "value {} is out of range 1..={MAX_BATCH_MAX_FILES}",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for MaxFilesPerBatchOutOfRange {}
+
+/// `max_files_per_batch` の設定値を `1..=`[`MAX_BATCH_MAX_FILES`] で検証する
+/// 単一情報源。wire-server の CLI フラグ `--batch-max-files` と環境変数
+/// `VECTOR_DB_BATCH_MAX_FILES` の両経路から使われる（優先順位は
+/// CLI 明示 > 環境変数 > 既定）。
+pub fn validate_max_files_per_batch(value: usize) -> Result<usize, MaxFilesPerBatchOutOfRange> {
+    if (1..=MAX_BATCH_MAX_FILES).contains(&value) {
+        Ok(value)
+    } else {
+        Err(MaxFilesPerBatchOutOfRange { value })
+    }
+}
+
+/// 環境変数値（文字列）から `max_files_per_batch` を解決する純関数。未設定・
+/// parse 失敗・範囲外（0・上限超過）はいずれも既定値へ fail-closed で倒す。
+fn parse_env_max_files(raw: Option<&str>) -> usize {
+    raw.and_then(|r| r.trim().parse::<usize>().ok())
+        .and_then(|v| validate_max_files_per_batch(v).ok())
+        .unwrap_or(DEFAULT_MAX_FILES_PER_BATCH)
+}
+
 impl Default for BatchLimits {
     fn default() -> Self {
         Self {
-            max_files_per_batch: env_usize_or("VECTOR_DB_BATCH_MAX_FILES", 64),
+            max_files_per_batch: parse_env_max_files(
+                std::env::var("VECTOR_DB_BATCH_MAX_FILES").ok().as_deref(),
+            ),
             max_file_body_bytes: crate::chunking::MAX_INPUT_BYTES,
             max_batch_total_bytes: env_usize_or(
                 "VECTOR_DB_BATCH_MAX_TOTAL_BYTES",
@@ -413,6 +468,39 @@ mod tests {
             max_batch_total_bytes: 30,
             max_batch_chunks: 5,
         }
+    }
+
+    #[test]
+    fn max_files_validation_bounds() {
+        assert!(validate_max_files_per_batch(0).is_err());
+        assert_eq!(validate_max_files_per_batch(1), Ok(1));
+        assert_eq!(
+            validate_max_files_per_batch(MAX_BATCH_MAX_FILES),
+            Ok(MAX_BATCH_MAX_FILES)
+        );
+        assert!(validate_max_files_per_batch(MAX_BATCH_MAX_FILES + 1).is_err());
+    }
+
+    #[test]
+    fn env_max_files_falls_back_when_invalid_or_out_of_range() {
+        assert_eq!(parse_env_max_files(None), DEFAULT_MAX_FILES_PER_BATCH);
+        assert_eq!(
+            parse_env_max_files(Some("abc")),
+            DEFAULT_MAX_FILES_PER_BATCH
+        );
+        assert_eq!(parse_env_max_files(Some("0")), DEFAULT_MAX_FILES_PER_BATCH);
+        assert_eq!(
+            parse_env_max_files(Some(&usize::MAX.to_string())),
+            DEFAULT_MAX_FILES_PER_BATCH
+        );
+        assert_eq!(parse_env_max_files(Some(" 100 ")), 100);
+    }
+
+    #[test]
+    fn budget_at_max_files_does_not_overflow() {
+        let l = BatchLimits::default();
+        let b = batch_raw_sql_len_budget(l.max_batch_total_bytes, MAX_BATCH_MAX_FILES);
+        assert!(b > 0);
     }
 
     #[test]

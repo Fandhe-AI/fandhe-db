@@ -165,23 +165,30 @@ NOT NULL 違反は新設の `ErrorClass::NotNullViolation`（`code` ラベル
 
 ## `ALTER TABLE ADD COLUMN` との不整合の解消
 
-`Storage::alter_table_add_column`（TABLE-5）は `nullable == false` を拒否する
-既存の契約に加え、`default.is_some()` も fail-closed で拒否するよう変更した。
-既存行へ読み出し時に `DEFAULT` を補完する仕組み（PostgreSQL の
-`ALTER TABLE ... ADD COLUMN ... DEFAULT ...` 相当）を実装していないため、
-`DEFAULT` 付き `ADD COLUMN` を受理すると「既存行は常に `NULL` で読める・
-新規行だけ既定値を持つ」という意味論の食い違いが生じるためである。
+`Storage::alter_table_add_column`（TABLE-5）は当初（Issue #904）、既存行へ読み出し時に
+`DEFAULT` を補完する仕組みが無いため `nullable == false` と `default.is_some()` を
+fail-closed で拒否していた。Issue #1169 で読み出し時補完（行は書き換えない）を実装し、
+`NOT NULL`／`DEFAULT` を受理するようにした（詳細は
+`docs/design/sql-alter-table-add-column.md`）。
 
-`ALTER COLUMN ... TYPE`（Issue #901）で型が変わる列に既存の `DEFAULT` が
-付いていた場合の再検証は、本 Issue の時点では `DEFAULT` が到達可能な列型が
-`TEXT` のみであり `ALTER COLUMN TYPE` の対象拡張とは独立のため、
-`validate_schema`（型と `DEFAULT` の整合検証）が既存のデコード時再検証経路で
-そのまま効く。
+`DEFAULT` が到達可能な列型は、本 Issue の時点では `TEXT` のみだったが、現在は
+`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／`NUMERIC(p,s)`／`BOOLEAN` にも
+対応している（`CREATE TABLE`／`ALTER TABLE ADD COLUMN` とも列型ごとの束縛は
+`row_codec::column_default_scalar` に一本化）。
+
+`ALTER COLUMN ... TYPE`（Issue #901）で型が変わる列に既存の `DEFAULT` が付いて
+いた場合、`DEFAULT` は列定義に保持されたまま型だけが変わる。型変更後の
+`DEFAULT` は、カタログのデコード時再検証（`validate_schema` の型と `DEFAULT` の
+整合検証。`ColumnDefault::compatible_with`）が既存経路のまま効き、型と整合
+しない場合は fail-closed で拒否する。`NUMERIC` の精度拡大のように値を変えない
+変更では `DEFAULT` は整合したまま読める。読み出し時補完（`ADD COLUMN` 後の
+既存行）も同じ `default_scalar` を通すため、不正な `DEFAULT` は参照列の選択に
+よらず検出される。
 
 ## スコープ外・後続 Issue
 
-- `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` の受理と、既存行への
-  読み出し時の `DEFAULT` 補完（TABLE-5・TABLE-16。上記「不整合の解消」節）。
+- （Issue #1169 で実装済み）`ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` の受理と、
+  既存行への読み出し時の `DEFAULT` 補完（TABLE-5・TABLE-16）。
 - `ALTER COLUMN SET/DROP DEFAULT`・`SET/DROP NOT NULL`。
 - SQL `VALUES` 内の `NULL` リテラルと `DEFAULT` キーワード（`INSERT INTO t
   (...) VALUES (DEFAULT, ...)` 形）。

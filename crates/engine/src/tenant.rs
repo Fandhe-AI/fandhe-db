@@ -369,7 +369,7 @@ pub enum TenantWriteError {
     /// `XX000`（内部事象）へ丸めていたが、`sql::check_constraint::CompiledChecks::
     /// enforce` が式（`sql::expr_program::ExprProgram`。`WHERE`／`SELECT` と共有
     /// する同一コンパイラ）を評価して得た [`SqlSurfaceError`] をそのまま保持し、
-    /// 通常の式評価と同じ `wire_code`（0 除算・非有限値は `22000`、`NUMERIC`
+    /// 通常の式評価と同じ `wire_code`（0 除算は `22012`、非有限値・`NUMERIC`
     /// 関数の桁あふれは `22003` 等）で返す。カタログ改変・実装不整合による
     /// 再束縛失敗（漂流）は本 variant ではなく引き続き
     /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。
@@ -4704,12 +4704,12 @@ mod tests {
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
         let rows = visible_rows(&storage, "docs", &visible_ctx).expect("visible rows");
+        let schema = file_schema("docs");
         let bodies: Vec<&str> = rows
             .iter()
             .map(|r| {
-                let scanned =
-                    crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
-                        .expect("scan scalar columns");
+                let scanned = crate::row_codec::scan_scalar_columns(&schema, &r.metadata)
+                    .expect("scan scalar columns");
                 scanned
                     .get(2)
                     .copied()

@@ -446,11 +446,17 @@ pub enum SqlSurfaceError {
     OperationIdContentMismatch,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
+    /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
     /// 黙って wrap・非有限値化せず fail-closed に拒否する（`.claude/rules/coding-rust.md`
     /// 「整数演算は checked_*/saturating_* を使う」対応）。`22003` は ERR-2
     /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
     /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
+    /// 式評価（スカラー `/`・ベクトル÷スカラー・`vec_div`・`mod`）の 0 除算
+    /// （`22012`、SQL-26・ERR-2、Issue #1163）。拒否側（fail-closed）は従来の
+    /// `22000` と同じで、SQLSTATE のみ汎用 RDB に揃える。detail は演算種別の
+    /// 固定文言に限り、行の値・テナント情報を含めない。
+    DivisionByZero { detail: String },
     /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
     /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
     /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
@@ -693,6 +699,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 式評価器（`sql::udf_call`・`sql::numeric_fn`）が 0 除算を
+    /// 報告するために使う（Issue #1163・SQL-26）。
+    pub(crate) fn division_by_zero(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::DivisionByZero {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13・TASK-197、
     /// Issue #884）が `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正を報告する
     /// ために使う。
@@ -785,6 +799,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
             SqlSurfaceError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
+            SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -857,6 +872,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::NumericOutOfRange { detail } => {
                 write!(f, "numeric value out of range: {detail}")
+            }
+            SqlSurfaceError::DivisionByZero { detail } => {
+                write!(f, "division by zero: {detail}")
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
@@ -2409,9 +2427,10 @@ pub struct ValidatedTruncate {
 /// とは異なり `operation_id` を保持しない。SQL-23 の DDL は台帳〔TASK-93〕の
 /// 対象外）。
 ///
-/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` のみ
-/// （`IF NOT EXISTS`・複数 `ADD`・列制約〔`NOT NULL`／`DEFAULT`／`PRIMARY KEY`
-/// 等〕・`DROP COLUMN`／`ALTER COLUMN`・`RETURNING`・`USING OPERATION_ID` の
+/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [NOT NULL]
+/// [DEFAULT <literal>] [;]`（列制約は順不同・各 1 回まで。Issue #1169）のみ
+/// （`IF NOT EXISTS`・複数 `ADD`・列制約 `UNIQUE`／`PRIMARY KEY`／`REFERENCES`／
+/// `CHECK`・`RETURNING`・`USING OPERATION_ID` の
 /// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
 /// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
 /// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
@@ -2423,6 +2442,13 @@ pub struct ValidatedAlterTableAddColumn {
     /// 型名の構文木。意味づけ（ENUM 型名の存在確認・`ColumnType` への変換）は
     /// `sql::ddl::execute_alter_table_add_column` の責務。
     pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    /// `NOT NULL` 句の有無（Issue #1169）。`DEFAULT` を伴わない `NOT NULL` は
+    /// 構造検証段階で `42601` 拒否済みのため、`true` なら `default` は常に `Some`。
+    pub not_null: bool,
+    /// `DEFAULT <literal>` のリテラル（Issue #1169）。列型との整合・値の束縛は
+    /// カタログ照会を要するため実行段（`sql::ddl::execute_alter_table_add_column`）
+    /// が行う。
+    pub default: Option<InsertLiteral>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE
@@ -2479,7 +2505,29 @@ pub struct ValidatedAlterTableAddForeignKey {
     pub foreign_key: crate::catalog::ForeignKeyDef,
 }
 
-/// `ALTER TABLE` の許可形状 5 種の和（Issue #1067・#1068・#1069）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> DROP COLUMN <column>` 文
+/// （TABLE-19・SQL-23、Issue #1167）。予約列名は構造検証段で `42601` に落とし済み。
+/// テーブル・列の存在確認と依存検査（PK・UNIQUE・CHECK・FK）は DDL 権限ゲート
+/// 通過後の実行段（`sql::ddl::execute_alter_table_drop_column`）が担う
+/// （権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableDropColumn {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> TYPE
+/// <型名>` 文（TABLE-19・SQL-23、Issue #1167）。型名の意味づけ（ENUM 型名の
+/// 存在確認・`ColumnType` への変換）と互換性判定は実行段
+/// （`sql::ddl::execute_alter_table_alter_column_type`）が担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnType {
+    pub table_name: String,
+    pub column_name: String,
+    pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+}
+
+/// `ALTER TABLE` の許可形状 7 種の和（Issue #1067・#1068・#1069・#1167）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -2494,6 +2542,9 @@ pub struct ValidatedAlterTableAddForeignKey {
 ///
 /// **BREAKING CHANGE**（Issue #1069）: `AddForeignKey` variant を追加した。
 /// いずれも本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1167）: `DropColumn`・`AlterColumnType` variant を
+/// 追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
@@ -2501,6 +2552,8 @@ pub enum ValidatedAlterTable {
     AddCheck(ValidatedAlterTableAddCheck),
     DropConstraint(ValidatedAlterTableDropConstraint),
     AddForeignKey(ValidatedAlterTableAddForeignKey),
+    DropColumn(ValidatedAlterTableDropColumn),
+    AlterColumnType(ValidatedAlterTableAlterColumnType),
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -5102,8 +5155,8 @@ impl<'a> Parser<'a> {
     /// `lexer::Keyword` へ含めない設計方針（`lexer.rs` のモジュールドキュメント
     /// 参照）のため、いずれも `expect_contextual_keyword` で文脈的に照合する。
     /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK ... NOT VALID`／
-    /// `PRIMARY KEY`／`FOREIGN KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
-    /// `RESTRICT`・`DROP COLUMN`／`ALTER COLUMN`・`USING OPERATION_ID` はいずれも
+    /// `PRIMARY KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
+    /// `RESTRICT`・`DROP COLUMN IF EXISTS`・`USING OPERATION_ID` はいずれも
     /// 構造的に受理しない（設計 D6。`expect_end_of_statement` が余剰トークンとして
     /// `42601` で拒否するか、`ADD`／`DROP` の直後に許可形状以外が続いた時点で
     /// `expect_contextual_keyword` が拒否する）。
@@ -5141,11 +5194,30 @@ impl<'a> Parser<'a> {
                     self.tokens,
                     &mut self.pos,
                 )?;
+                // 列制約（Issue #1169）。`UNIQUE` は追加列では受け付けない（`ALTER
+                // TABLE ADD UNIQUE` 形を使う）。`PRIMARY KEY`／`REFERENCES`／`CHECK`
+                // は後続の `expect_end_of_statement` が `42601` で拒否する。
+                let constraints = self.parse_column_constraints()?;
+                if constraints.unique {
+                    return Err(SqlSurfaceError::unsupported(
+                        "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
+                    ));
+                }
+                // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
+                // （TABLE-16）。カタログ・行を参照しない構造判定のため、存在オラクル・
+                // 他テナント行の有無の判別手段にならない。
+                if constraints.not_null && constraints.default.is_none() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "NOT NULL in ALTER TABLE ADD COLUMN requires a DEFAULT",
+                    ));
+                }
                 return Ok(ParsedAlterTableShape::AddColumn(
                     ParsedAlterTableAddColumnShape {
                         table_name,
                         column_name,
                         column_type,
+                        not_null: constraints.not_null,
+                        default: constraints.default,
                     },
                 ));
             }
@@ -5203,8 +5275,19 @@ impl<'a> Parser<'a> {
         }
         if self.peek_contextual_keyword("DROP") {
             self.advance();
-            // `DROP CONSTRAINT <name>` のみを受理する（`DROP CONSTRAINT IF EXISTS`／
-            // `CASCADE`／`RESTRICT`・`DROP COLUMN` は設計 D6 によりスコープ外。
+            // `DROP COLUMN <col>`（TABLE-19、Issue #1167）。`COLUMN` 省略形・
+            // `IF EXISTS`・`CASCADE`／`RESTRICT` は余剰トークンとして `42601`。
+            if self.peek_contextual_keyword("COLUMN") {
+                self.advance();
+                let column_name = self.expect_ident()?;
+                reject_reserved_alter_column_name(&column_name)?;
+                return Ok(ParsedAlterTableShape::DropColumn {
+                    table_name,
+                    column_name,
+                });
+            }
+            // `DROP CONSTRAINT <name>` を受理する（`DROP CONSTRAINT IF EXISTS`／
+            // `CASCADE`／`RESTRICT` は設計 D6 によりスコープ外。
             // `CONSTRAINT` 以外が続けば `42601`）。
             self.expect_contextual_keyword("CONSTRAINT")?;
             let constraint_name = self.expect_ident()?;
@@ -5214,6 +5297,22 @@ impl<'a> Parser<'a> {
             return Ok(ParsedAlterTableShape::DropConstraint {
                 table_name,
                 constraint_name,
+            });
+        }
+        // `ALTER COLUMN <col> TYPE <型名>`（TABLE-19、Issue #1167）。`SET DATA TYPE`・
+        // `USING`・`COLLATE` は `TYPE` 不一致／余剰トークンとして `42601`。
+        if self.peek_contextual_keyword("ALTER") {
+            self.advance();
+            self.expect_contextual_keyword("COLUMN")?;
+            let column_name = self.expect_ident()?;
+            reject_reserved_alter_column_name(&column_name)?;
+            self.expect_contextual_keyword("TYPE")?;
+            let column_type =
+                crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+            return Ok(ParsedAlterTableShape::AlterColumnType {
+                table_name,
+                column_name,
+                column_type,
             });
         }
         Err(SqlSurfaceError::unsupported("unsupported ALTER TABLE form"))
@@ -6598,6 +6697,8 @@ struct ParsedAlterTableAddColumnShape {
     table_name: String,
     column_name: String,
     column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    not_null: bool,
+    default: Option<InsertLiteral>,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
@@ -6621,6 +6722,15 @@ enum ParsedAlterTableShape {
         table_name: String,
         constraint_name: Option<String>,
         foreign_key: crate::catalog::ForeignKeyDef,
+    },
+    DropColumn {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnType {
+        table_name: String,
+        column_name: String,
+        column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
     },
 }
 
@@ -8732,8 +8842,28 @@ pub(crate) fn validate_truncate_tokens(
     })
 }
 
+/// `DROP COLUMN`／`ALTER COLUMN TYPE` の対象列名が予約列名（`id`／`tenant_id`／
+/// `visibility`／`check`／`constraint`。ASCII 大文字小文字無視）なら `42601`
+/// （Issue #1167）。`ADD COLUMN` と同じ判定で、カタログを照会しないため権限
+/// ゲートより前に置いても存在オラクルにならない。engine 側の保護列判定
+/// （`ProtectedColumn`）は大文字小文字を区別するため、表層で吸収する。
+fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurfaceError> {
+    if column_name.eq_ignore_ascii_case("id")
+        || column_name.eq_ignore_ascii_case("tenant_id")
+        || column_name.eq_ignore_ascii_case("visibility")
+        || column_name.eq_ignore_ascii_case("check")
+        || column_name.eq_ignore_ascii_case("constraint")
+    {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "column name {column_name:?} is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// `ALTER TABLE` 文（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
-/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT` の 4 形状）をトークン化し、
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD FOREIGN KEY`／`DROP COLUMN`／
+/// `ALTER COLUMN TYPE` の 7 形状）をトークン化し、
 /// 許可リスト形式で構造検証する（TASK-202・SQL-23。Issue #900 の公開 API）。
 /// `validate_truncate` とは異なり
 /// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
@@ -8773,6 +8903,8 @@ pub fn validate_alter_table_tokens(
                 table_name: shape.table_name,
                 column_name: shape.column_name,
                 column_type: shape.column_type,
+                not_null: shape.not_null,
+                default: shape.default,
             })
         }
         ParsedAlterTableShape::AddUnique {
@@ -8802,6 +8934,22 @@ pub fn validate_alter_table_tokens(
             table_name,
             constraint_name,
             foreign_key,
+        }),
+        ParsedAlterTableShape::DropColumn {
+            table_name,
+            column_name,
+        } => ValidatedAlterTable::DropColumn(ValidatedAlterTableDropColumn {
+            table_name,
+            column_name,
+        }),
+        ParsedAlterTableShape::AlterColumnType {
+            table_name,
+            column_name,
+            column_type,
+        } => ValidatedAlterTable::AlterColumnType(ValidatedAlterTableAlterColumnType {
+            table_name,
+            column_name,
+            column_type,
         }),
     })
 }

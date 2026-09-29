@@ -62,6 +62,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::UnsupportedSqlSyntax
         | ErrorClass::InvalidInput
         | ErrorClass::NumericOutOfRange
+        // Issue #1163・SQL-26: 0 除算（`22012`）も入力値起因の拒否（`22000`／`22003` と同類）。
+        | ErrorClass::DivisionByZero
         | ErrorClass::OperationIdContentMismatch
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
@@ -138,6 +140,7 @@ mod tests {
         (ErrorClass::ProtocolViolation, 400),
         (ErrorClass::InternalError, 500),
         (ErrorClass::NumericOutOfRange, 400),
+        (ErrorClass::DivisionByZero, 400),
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),

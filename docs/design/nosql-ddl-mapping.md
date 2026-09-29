@@ -83,9 +83,6 @@ validate_drop_table_tokens}`（`pub(crate)` → `pub` へ Issue #910 で公開�
 
 ## 未実装形（fail-closed。成功を偽装しない）
 
-- `alter_table.drop_column`: SQL 表層の許可リストが `ALTER TABLE ... DROP COLUMN`
-  を結線していない（`validate_alter_table_tokens` は `ADD COLUMN` のみ受理）ため、
-  常に `0A000`。SQL 表層側の結線が先に必要（後続 Issue）。
 - `create_table.constraints[].kind == "check"`: 述語の JSON 写像（`NOSQL-7` の
   filter 形との対応）が別論点のため、常に `0A000`。
 - `create_index`／`drop_index`／`create_view`／`drop_view`: NOSQL-13 の対象外の
@@ -117,6 +114,7 @@ permission_denial_is_byte_identical_regardless_of_table_existence` で固定）�
 
 ## スコープ外（後続 Issue の担当）
 
-- `alter_table.drop_column`・`ALTER COLUMN TYPE` 相当（SQL 表層側の結線が前提）。
+- `ALTER COLUMN TYPE` 相当の op 語彙（`alter_table.drop_column` は Issue #1167 で
+  SQL 表層と同じ入口へ結線済み）。
 - `create_table.constraints[].kind == "check"` の JSON 写像。
 - `create_index`／`drop_index`／`create_view`／`drop_view` の NoSQL 対応。
