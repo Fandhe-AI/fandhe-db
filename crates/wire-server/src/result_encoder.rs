@@ -748,19 +748,40 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
     }
 }
 
-/// 配列列（TABLE-14・TASK-198、Issue #888・D-A4）を PostgreSQL 配列テキスト形式
-/// （`{a,b}`）へ描画する。空配列は `{}`、`BOOLEAN` 要素は `t`/`f`。`TEXT` 要素の
-/// うち、空文字列・`,{}"\` や空白を含むもの・大小無視で `NULL` に一致するものは
-/// `"..."` で囲み `"`・`\` をバックスラッシュでエスケープする（`RowDescription`
-/// の OID は他の非 VECTOR スカラー列と同じ text（25）のまま変更しない。WIRE-13）。
+/// 配列列（TABLE-14・TASK-198、Issue #888・D-A4、Issue #1193）を PostgreSQL 配列
+/// テキスト形式（`{a,b}`）へ描画する。空配列は `{}`、NULL 要素は引用なしの `NULL`、
+/// `BOOLEAN` 要素は `t`/`f`、整数は 10 進、`REAL`／`DOUBLE PRECISION` は
+/// `engine::scalar_float` の整形（スカラー列と同じ表現）、`DATE`／`TIMESTAMP` は
+/// `engine::datetime` の ISO 整形（`TIMESTAMP` は空白を含むため引用する）、`UUID` は
+/// 正規テキスト。`TEXT` 要素のうち、空文字列・`,{}"\` や空白を含むもの・大小無視で
+/// `NULL` に一致するものは `"..."` で囲み `"`・`\` をバックスラッシュでエスケープする
+/// ため、文字列 `NULL` は NULL 要素と区別される（`RowDescription` の OID は他の
+/// 非 VECTOR スカラー列と同じ text（25）のまま変更しない。WIRE-13）。
 fn pg_array_text(array_value: &engine::row_codec::ArrayValue) -> String {
     use engine::row_codec::ArrayValue;
-    let elements: Vec<String> = match array_value {
-        ArrayValue::Text(items) => items.iter().map(|s| quote_pg_array_text_elem(s)).collect(),
-        ArrayValue::Bool(items) => items
+
+    fn render<T>(items: &[Option<T>], f: impl Fn(&T) -> String) -> Vec<String> {
+        items
             .iter()
-            .map(|b| if *b { "t".to_string() } else { "f".to_string() })
-            .collect(),
+            .map(|item| match item {
+                Some(v) => f(v),
+                None => "NULL".to_string(),
+            })
+            .collect()
+    }
+
+    let elements: Vec<String> = match array_value {
+        ArrayValue::Text(items) => render(items, |s| quote_pg_array_text_elem(s)),
+        ArrayValue::Bool(items) => render(items, |b| if *b { "t" } else { "f" }.to_string()),
+        ArrayValue::Integer(items) => render(items, |v| v.to_string()),
+        ArrayValue::BigInt(items) => render(items, |v| v.to_string()),
+        ArrayValue::Real(items) => render(items, |v| engine::scalar_float::format_real(*v)),
+        ArrayValue::Double(items) => render(items, |v| engine::scalar_float::format_double(*v)),
+        ArrayValue::Date(items) => render(items, |v| engine::datetime::format_date(*v)),
+        ArrayValue::Timestamp(items) => render(items, |v| {
+            quote_pg_array_text_elem(&engine::datetime::format_timestamp(*v))
+        }),
+        ArrayValue::Uuid(items) => render(items, |v| v.to_string()),
     };
     format!("{{{}}}", elements.join(","))
 }
@@ -1476,17 +1497,72 @@ mod tests {
             id: 1,
             score: 0.0,
             cells: vec![Cell::Array(ArrayValue::Text(vec![
-                "a".to_string(),
-                "b c".to_string(),
-                "".to_string(),
-                "d\"e".to_string(),
-                "NULL".to_string(),
+                Some("a".to_string()),
+                Some("b c".to_string()),
+                Some("".to_string()),
+                Some("d\"e".to_string()),
+                Some("NULL".to_string()),
+                None,
             ]))],
         };
         let msg = encode_data_row(&row).expect("encode");
         let cell_len = i32_at(&msg, 7) as usize;
         let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
-        assert_eq!(text, r#"{a,"b c","","d\"e","NULL"}"#);
+        // 文字列 `NULL` は引用され、NULL 要素（引用なし `NULL`）と区別される。
+        assert_eq!(text, r#"{a,"b c","","d\"e","NULL",NULL}"#);
+    }
+
+    /// Issue #1193: 新しい要素型と NULL 要素の text 表現。
+    #[test]
+    fn data_row_array_new_element_types_encode_with_null_elements() {
+        use engine::row_codec::ArrayValue;
+        let text_of = |value: ArrayValue| {
+            let row = ResultRow {
+                id: 1,
+                score: 0.0,
+                cells: vec![Cell::Array(value)],
+            };
+            let msg = encode_data_row(&row).expect("encode");
+            let cell_len = i32_at(&msg, 7) as usize;
+            std::str::from_utf8(slice_at(&msg, 11, cell_len))
+                .expect("utf8")
+                .to_string()
+        };
+        assert_eq!(
+            text_of(ArrayValue::Integer(vec![Some(1), None, Some(-3)])),
+            "{1,NULL,-3}"
+        );
+        assert_eq!(
+            text_of(ArrayValue::BigInt(vec![Some(9_007_199_254_740_993), None])),
+            "{9007199254740993,NULL}"
+        );
+        assert_eq!(
+            text_of(ArrayValue::Real(vec![Some(1.5), None])),
+            "{1.5,NULL}"
+        );
+        assert_eq!(
+            text_of(ArrayValue::Double(vec![Some(2.25), Some(0.1)])),
+            "{2.25,0.1}"
+        );
+        assert_eq!(
+            text_of(ArrayValue::Date(vec![Some(1), None])),
+            "{1970-01-02,NULL}"
+        );
+        assert_eq!(
+            text_of(ArrayValue::Timestamp(vec![Some(1_000_000), None])),
+            r#"{"1970-01-01 00:00:01",NULL}"#
+        );
+        assert_eq!(
+            text_of(ArrayValue::Uuid(vec![
+                Some(engine::uuid::Uuid::from_bytes([0x11; 16])),
+                None
+            ])),
+            "{11111111-1111-1111-1111-111111111111,NULL}"
+        );
+        assert_eq!(
+            text_of(ArrayValue::Bool(vec![None, Some(true)])),
+            "{NULL,t}"
+        );
     }
 
     #[test]
@@ -1495,7 +1571,7 @@ mod tests {
         let row = ResultRow {
             id: 1,
             score: 0.0,
-            cells: vec![Cell::Array(ArrayValue::Bool(vec![true, false]))],
+            cells: vec![Cell::Array(ArrayValue::Bool(vec![Some(true), Some(false)]))],
         };
         let msg = encode_data_row(&row).expect("encode");
         let cell_len = i32_at(&msg, 7) as usize;

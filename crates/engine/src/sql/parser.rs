@@ -660,9 +660,9 @@ pub(crate) fn bind_datetime_literal(
 /// (4) 要素型ごとに変換する（`BOOLEAN` は `t|f|true|false` を大小無視で受理）。
 /// (2)〜(4) の形式違反（入れ子の `{`、閉じていない引用、末尾カンマ、`BOOLEAN` の
 /// 不正語）はすべて [`SqlSurfaceError::InvalidTextRepresentation`]（`22P02`。
-/// Issue #1187）。NULL 要素（引用なしの
-/// `NULL`。大小無視）は D-A6 により本版では受理せず `InvalidInput`（機能未対応であり形式不正ではない）。引用つきの
-/// `"NULL"` は TEXT 要素の文字列 `NULL` として扱う。
+/// Issue #1187）。NULL 要素（引用なしの `NULL`。大小無視）は `None` として受理する
+/// （Issue #1193。D-A6 の置き換え）。引用つきの `"NULL"` は TEXT 要素の文字列
+/// `NULL` として扱い（TEXT 以外の要素型では通常の要素として型変換に回す）。
 pub fn parse_array_literal(
     literal: &str,
     array_ty: crate::catalog::ArrayType,
@@ -688,7 +688,7 @@ pub fn parse_array_literal(
     // 入力の扱い」: 受信データ経路では添字アクセスを禁止）。`Vec<char>` への
     // 事前 collect（リテラル長の最大 4 倍のスクラッチ確保）も避け、`inner` を
     // 1 パスで走査する。
-    let mut raw_elements: Vec<String> = Vec::new();
+    let mut raw_elements: Vec<Option<String>> = Vec::new();
     if !inner.trim().is_empty() {
         let mut chars = inner.chars().peekable();
         loop {
@@ -727,7 +727,7 @@ pub fn parse_array_literal(
                         "array literal has an unterminated quoted element",
                     ));
                 }
-                s
+                Some(s)
             } else {
                 // 引用なし要素: 次のカンマ（またはリテラル末尾）までを前後の
                 // 空白を除いて要素とする。入れ子の `{`/`}` は非対応。
@@ -745,17 +745,17 @@ pub fn parse_array_literal(
                     chars.next();
                 }
                 let trimmed_raw = raw.trim();
-                if trimmed_raw.eq_ignore_ascii_case("null") {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "array literal does not support NULL elements",
-                    ));
-                }
                 if trimmed_raw.is_empty() {
                     return Err(SqlSurfaceError::invalid_text_representation(
                         "array literal has an empty unquoted element (use \"\" for an empty string)",
                     ));
                 }
-                trimmed_raw.to_string()
+                // 引用なしの `NULL`（大小無視）は NULL 要素（Issue #1193）。
+                if trimmed_raw.eq_ignore_ascii_case("null") {
+                    None
+                } else {
+                    Some(trimmed_raw.to_string())
+                }
             };
 
             // 要素数上限は確保（`push`）の**前**に検査する（無制限な `Vec`
@@ -786,29 +786,110 @@ pub fn parse_array_literal(
         }
     }
 
-    match array_ty.elem() {
-        crate::catalog::ArrayElemType::Text => Ok(crate::row_codec::ArrayValue::Text(raw_elements)),
-        crate::catalog::ArrayElemType::Bool => {
-            let mut items: Vec<bool> = Vec::new();
-            items
-                .try_reserve_exact(raw_elements.len())
-                .map_err(|_| SqlSurfaceError::Internal {
-                    detail: "failed to reserve array literal elements".to_string(),
-                })?;
-            for raw in &raw_elements {
-                let b = if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("t") {
-                    true
-                } else if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("f") {
-                    false
-                } else {
-                    return Err(SqlSurfaceError::invalid_text_representation(format!(
-                        "array literal boolean element is not true/false: {raw:?}"
-                    )));
-                };
-                items.push(b);
-            }
-            Ok(crate::row_codec::ArrayValue::Bool(items))
+    convert_array_elements(array_ty.elem(), raw_elements)
+}
+
+/// 切り出し済みの配列要素（`None` は NULL 要素）を要素型へ変換する
+/// （[`parse_array_literal`] の後段）。数値・日時・UUID の各要素はスカラー列と同じ
+/// 束縛関数（[`bind_integer_literal`]・[`bind_real_literal`]・
+/// [`bind_double_literal`]・[`bind_datetime_literal`]・[`bind_uuid_literal`]）へ
+/// 委譲し、エラー分類（`22P02`／`22003`／`22007`／`22008`）を列と揃える
+/// （Issue #1193）。
+fn convert_array_elements(
+    elem: crate::catalog::ArrayElemType,
+    raw_elements: Vec<Option<String>>,
+) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    use crate::catalog::ArrayElemType as E;
+    use crate::row_codec::{ArrayValue, Value};
+
+    fn map_all<T>(
+        raw: &[Option<String>],
+        mut f: impl FnMut(&str) -> Result<T, SqlSurfaceError>,
+    ) -> Result<Vec<Option<T>>, SqlSurfaceError> {
+        let mut items: Vec<Option<T>> = Vec::new();
+        items
+            .try_reserve_exact(raw.len())
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "failed to reserve array literal elements".to_string(),
+            })?;
+        for r in raw {
+            items.push(match r {
+                None => None,
+                Some(text) => Some(f(text)?),
+            });
         }
+        Ok(items)
+    }
+
+    /// 数値要素を `InsertLiteral::Number` として列束縛へ流す。
+    fn bind_int(text: &str, ty: ColumnType) -> Result<Value, SqlSurfaceError> {
+        bind_integer_literal(
+            "array element",
+            ty,
+            &InsertLiteral::Number(text.to_string()),
+        )
+    }
+
+    const NAME: &str = "array element";
+    match elem {
+        E::Text => Ok(ArrayValue::Text(raw_elements)),
+        E::Bool => map_all(&raw_elements, |raw| {
+            if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("t") {
+                Ok(true)
+            } else if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("f") {
+                Ok(false)
+            } else {
+                Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "array literal boolean element is not true/false: {raw:?}"
+                )))
+            }
+        })
+        .map(ArrayValue::Bool),
+        E::Integer => map_all(&raw_elements, |raw| {
+            match bind_int(raw, ColumnType::Integer)? {
+                Value::Integer(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "integer array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Integer),
+        E::BigInt => map_all(&raw_elements, |raw| {
+            match bind_int(raw, ColumnType::BigInt)? {
+                Value::BigInt(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "bigint array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::BigInt),
+        E::Real => map_all(&raw_elements, bind_real_literal).map(ArrayValue::Real),
+        E::Double => map_all(&raw_elements, bind_double_literal).map(ArrayValue::Double),
+        E::Date => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Date, raw)? {
+                Value::Date(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "date array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Date),
+        E::Timestamp => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Timestamp, raw)? {
+                Value::Timestamp(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "timestamp array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Timestamp),
+        E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
+            Value::Uuid(v) => Ok(v),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "uuid array element bound to a different value type".to_string(),
+            }),
+        })
+        .map(ArrayValue::Uuid),
     }
 }
 
@@ -2423,7 +2504,7 @@ pub(crate) fn bind_json_literal(
 /// [`crate::json::JsonColumnError`] を SQL 表層の分類（`SqlSurfaceError`）へ写像する
 /// （Issue #889 D1）。`s` 自体（内容）はエラーメッセージへ含めない
 /// （security.md「テナント境界」: エラー経由の情報漏えい防止）。
-fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceError {
+pub(crate) fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceError {
     match e {
         crate::json::JsonColumnError::TooLong => {
             SqlSurfaceError::payload_too_large("JSON literal exceeds maximum length")
@@ -5926,9 +6007,9 @@ mod tests {
         assert_eq!(
             v,
             crate::row_codec::ArrayValue::Text(vec![
-                "a".to_string(),
-                "b".to_string(),
-                "c".to_string()
+                Some("a".to_string()),
+                Some("b".to_string()),
+                Some("c".to_string())
             ])
         );
     }
@@ -5940,10 +6021,10 @@ mod tests {
         assert_eq!(
             v,
             crate::row_codec::ArrayValue::Text(vec![
-                "a,b".to_string(),
-                "c\"d".to_string(),
-                "".to_string(),
-                "spaced".to_string(),
+                Some("a,b".to_string()),
+                Some("c\"d".to_string()),
+                Some("".to_string()),
+                Some("spaced".to_string()),
             ])
         );
     }
@@ -5953,16 +6034,92 @@ mod tests {
         let v = parse_array_literal(r#"{"NULL"}"#, text_array_ty(4)).expect("valid literal");
         assert_eq!(
             v,
-            crate::row_codec::ArrayValue::Text(vec!["NULL".to_string()])
+            crate::row_codec::ArrayValue::Text(vec![Some("NULL".to_string())])
         );
     }
 
     #[test]
-    fn parse_array_literal_rejects_unquoted_null_element() {
-        let err = parse_array_literal("{a,null,b}", text_array_ty(4)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
-        let err = parse_array_literal("{NULL}", text_array_ty(4)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+    fn parse_array_literal_accepts_unquoted_null_element() {
+        let v = parse_array_literal("{a,null,b}", text_array_ty(4)).expect("valid literal");
+        assert_eq!(
+            v,
+            crate::row_codec::ArrayValue::Text(vec![
+                Some("a".to_string()),
+                None,
+                Some("b".to_string())
+            ])
+        );
+        let v = parse_array_literal("{NULL}", text_array_ty(4)).expect("valid literal");
+        assert_eq!(v, crate::row_codec::ArrayValue::Text(vec![None]));
+    }
+
+    fn array_ty_of(elem: crate::catalog::ArrayElemType, max_len: u32) -> crate::catalog::ArrayType {
+        crate::catalog::ArrayType::new(elem, max_len).expect("array ty")
+    }
+
+    #[test]
+    fn parse_array_literal_converts_numeric_datetime_and_uuid_elements() {
+        use crate::catalog::ArrayElemType as E;
+        use crate::row_codec::ArrayValue as V;
+        assert_eq!(
+            parse_array_literal("{1,NULL,-3}", array_ty_of(E::Integer, 4)).expect("int"),
+            V::Integer(vec![Some(1), None, Some(-3)])
+        );
+        assert_eq!(
+            parse_array_literal(r#"{"9007199254740993"}"#, array_ty_of(E::BigInt, 4))
+                .expect("bigint"),
+            V::BigInt(vec![Some(9_007_199_254_740_993)])
+        );
+        assert_eq!(
+            parse_array_literal("{1.5,-0}", array_ty_of(E::Real, 4)).expect("real"),
+            V::Real(vec![Some(1.5), Some(0.0)])
+        );
+        assert_eq!(
+            parse_array_literal("{2.5}", array_ty_of(E::Double, 4)).expect("double"),
+            V::Double(vec![Some(2.5)])
+        );
+        assert_eq!(
+            parse_array_literal("{1970-01-02,NULL}", array_ty_of(E::Date, 4)).expect("date"),
+            V::Date(vec![Some(1), None])
+        );
+        assert_eq!(
+            parse_array_literal(r#"{"1970-01-01 00:00:01"}"#, array_ty_of(E::Timestamp, 4))
+                .expect("timestamp"),
+            V::Timestamp(vec![Some(1_000_000)])
+        );
+        assert!(matches!(
+            parse_array_literal(
+                "{00000000-0000-0000-0000-000000000001,NULL}",
+                array_ty_of(E::Uuid, 4)
+            )
+            .expect("uuid"),
+            V::Uuid(items) if items.len() == 2 && items[1].is_none()
+        ));
+        // TEXT 以外では引用つきの "NULL" も型変換に回り、形式違反になる。
+        assert_eq!(
+            parse_array_literal(r#"{"NULL"}"#, array_ty_of(E::Integer, 4))
+                .unwrap_err()
+                .wire_code(),
+            "22P02"
+        );
+    }
+
+    #[test]
+    fn parse_array_literal_element_errors_match_scalar_column_classes() {
+        use crate::catalog::ArrayElemType as E;
+        let code = |lit: &str, elem| {
+            parse_array_literal(lit, array_ty_of(elem, 4))
+                .unwrap_err()
+                .wire_code()
+        };
+        assert_eq!(code("{2147483648}", E::Integer), "22003");
+        assert_eq!(code("{1.5}", E::Integer), "22P02");
+        assert_eq!(code("{abc}", E::Double), "22P02");
+        assert_eq!(code("{1e999}", E::Real), "22003");
+        assert_eq!(code("{2023-02-30}", E::Date), "22008");
+        assert_eq!(code("{not-a-date}", E::Date), "22007");
+        assert_eq!(code("{zzz}", E::Uuid), "22P02");
+        assert_eq!(code("{1,2,3,4,5}", E::Integer), "54000");
     }
 
     #[test]
@@ -6018,7 +6175,12 @@ mod tests {
         let v = parse_array_literal("{t,F,true,FALSE}", bool_array_ty(8)).expect("valid literal");
         assert_eq!(
             v,
-            crate::row_codec::ArrayValue::Bool(vec![true, false, true, false])
+            crate::row_codec::ArrayValue::Bool(vec![
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false)
+            ])
         );
     }
 

@@ -96,42 +96,13 @@ fn try_clone_array_for_budget(
     budget: &mut usize,
     cap: usize,
 ) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
-    use crate::row_codec::ArrayValue;
-    match array_value {
-        ArrayValue::Text(items) => {
-            // 要素本文（文字列長の合計）に加え、`Vec<String>` の構造体分
-            // （`String` 1 個あたり `size_of::<String>()`）も計上する。本文長のみ
-            // では空文字列を大量に含む配列で予算消費がほぼ 0 のまま `String` の
-            // 管理領域（ヒープ確保）を無制限に積み上げられてしまう
-            // （`sql::exec::try_alloc_array_for_budget`・`sql::scan` と同方針。
-            // Issue #888 レビュー指摘・PR #1011）。
-            let payload_bytes: usize = items.iter().map(|s| s.len()).sum();
-            let approx = payload_bytes
-                .saturating_add(items.len().saturating_mul(std::mem::size_of::<String>()));
-            *budget = try_accumulate_budget(*budget, approx, cap)?;
-            let mut owned: Vec<String> = Vec::new();
-            owned
-                .try_reserve_exact(items.len())
-                .map_err(|e| SqlSurfaceError::Internal {
-                    detail: format!("failed to reserve RETURNING array field: {e}"),
-                })?;
-            for item in items {
-                owned.push(item.clone());
-            }
-            Ok(ArrayValue::Text(owned))
-        }
-        ArrayValue::Bool(items) => {
-            *budget = try_accumulate_budget(*budget, items.len(), cap)?;
-            let mut owned: Vec<bool> = Vec::new();
-            owned
-                .try_reserve_exact(items.len())
-                .map_err(|e| SqlSurfaceError::Internal {
-                    detail: format!("failed to reserve RETURNING array field: {e}"),
-                })?;
-            owned.extend_from_slice(items);
-            Ok(ArrayValue::Bool(owned))
-        }
-    }
+    // 要素本文に加え要素ごとの構造体分（`Option<String>` 等）も計上する。本文長のみ
+    // では空文字列を大量に含む配列で予算消費がほぼ 0 のまま管理領域を無制限に
+    // 積み上げられてしまう（`sql::exec::try_alloc_array_for_budget`・`sql::scan` と
+    // 同方針。Issue #888 レビュー指摘・PR #1011。Issue #1193 で全要素型へ拡張）。
+    // 予算検証を複製より前に行うので、確保量は `cap` で上限される。
+    *budget = try_accumulate_budget(*budget, array_value.approx_heap_bytes(), cap)?;
+    Ok(array_value.clone())
 }
 
 /// BYTEA セルの選択的複製（累計バイト量を確保前に検証。上記テキスト版と同方針。
@@ -303,7 +274,7 @@ mod tests {
 
         // 1,024 個の空文字列。本文バイト量は 0 だが、`size_of::<String>()`
         // （24 バイト程度）× 1,024 個分の構造体オーバーヘッドは無視できない。
-        let items: Vec<String> = std::iter::repeat_n(String::new(), 1024).collect();
+        let items: Vec<Option<String>> = std::iter::repeat_n(Some(String::new()), 1024).collect();
         let array_value = ArrayValue::Text(items);
         let expected_overhead = 1024usize.saturating_mul(std::mem::size_of::<String>());
 
@@ -322,7 +293,7 @@ mod tests {
         assert_eq!(budget, expected_overhead);
         match cloned {
             ArrayValue::Text(items) => assert_eq!(items.len(), 1024),
-            ArrayValue::Bool(_) => panic!("expected ArrayValue::Text"),
+            _ => panic!("expected ArrayValue::Text"),
         }
     }
 }

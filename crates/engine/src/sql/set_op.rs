@@ -113,10 +113,7 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
         // 目的では十分。実際の確保量を下回らない側に倒す）。
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
-        Cell::Array(arr) => match arr {
-            crate::row_codec::ArrayValue::Text(items) => items.iter().map(|s| s.len()).sum(),
-            crate::row_codec::ArrayValue::Bool(items) => items.len(),
-        },
+        Cell::Array(arr) => arr.approx_heap_bytes(),
         Cell::Null
         | Cell::Integer(_)
         | Cell::Float(_)
@@ -313,32 +310,20 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
             }
             Cell::Array(arr) => {
                 out.push(12);
-                match arr {
-                    crate::row_codec::ArrayValue::Text(items) => {
-                        out.push(0);
-                        let n = u32::try_from(items.len()).map_err(|_| {
-                            SqlSurfaceError::payload_too_large(
-                                "set operation row key exceeds length limit",
-                            )
+                // 行バイトと同じ正準ペイロード（NULL ビットマップを含む単射表現）を
+                // 長さ前置で積む。NULL 要素を含む配列は要素型序数へ 0x80 を立てる。
+                let (ordinal, flags, payload) =
+                    arr.canonical_parts()
+                        .map_err(|_| SqlSurfaceError::Internal {
+                            detail: "array cell could not be canonicalized for set operation"
+                                .to_string(),
                         })?;
-                        out.extend_from_slice(&n.to_be_bytes());
-                        for item in items {
-                            push_len_prefixed(&mut out, item.as_bytes())?;
-                        }
-                    }
-                    crate::row_codec::ArrayValue::Bool(items) => {
-                        out.push(1);
-                        let n = u32::try_from(items.len()).map_err(|_| {
-                            SqlSurfaceError::payload_too_large(
-                                "set operation row key exceeds length limit",
-                            )
-                        })?;
-                        out.extend_from_slice(&n.to_be_bytes());
-                        for b in items {
-                            out.push(u8::from(*b));
-                        }
-                    }
-                }
+                out.push(if flags == 0 { ordinal } else { ordinal | 0x80 });
+                let n = u32::try_from(arr.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("set operation row key exceeds length limit")
+                })?;
+                out.extend_from_slice(&n.to_be_bytes());
+                push_len_prefixed(&mut out, &payload)?;
             }
             // §2.2 の型検証（重複除去を伴う演算からの `VECTOR` 列排除）で本来
             // 到達しない。破損状態を防御的に拒否する（fail-closed。XX000）。
@@ -396,18 +381,15 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             // 型タグ 1 byte（12）＋要素種別タグ 1 byte（0／1）＋要素数 `u32`
             // （4 byte）＋各要素のペイロード。
             Cell::Array(arr) => {
-                let mut n = 1usize + 1usize + 4usize;
-                match arr {
-                    crate::row_codec::ArrayValue::Text(items) => {
-                        for item in items {
-                            n = n.saturating_add(len_prefixed_total_len(item.len())?);
-                        }
-                    }
-                    crate::row_codec::ArrayValue::Bool(items) => {
-                        n = n.saturating_add(items.len());
-                    }
-                }
-                n
+                let payload_len =
+                    arr.canonical_payload_len()
+                        .map_err(|_| SqlSurfaceError::Internal {
+                            detail: "array cell could not be sized for set operation".to_string(),
+                        })?;
+                1usize
+                    .saturating_add(1)
+                    .saturating_add(4)
+                    .saturating_add(len_prefixed_total_len(payload_len)?)
             }
             // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
             Cell::Vector(_) => {
@@ -1142,10 +1124,14 @@ mod tests {
                 Cell::Numeric(decimal),
                 Cell::Uuid(uuid),
                 Cell::Array(crate::row_codec::ArrayValue::Text(vec![
-                    "x".to_string(),
-                    "yz".to_string(),
+                    Some("x".to_string()),
+                    Some("yz".to_string()),
                 ])),
-                Cell::Array(crate::row_codec::ArrayValue::Bool(vec![true, false, true])),
+                Cell::Array(crate::row_codec::ArrayValue::Bool(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                ])),
             ],
         };
 

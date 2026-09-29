@@ -734,7 +734,7 @@ pub(crate) fn key_bytes(
 ///   正規化テキスト。キー順・空白だけでなく数値も値として正規化する）。
 /// - 配列: `[要素タグ: u8][要素数: u32 BE][要素列の生ペイロード]`。
 ///   [`crate::row_codec::ArrayRef::payload`] のエンコーダ決定性（要素順保持・
-///   flags 固定・代替表現なし）により、この組は値に対して単射になる。
+///   flags は NULL 要素の有無だけで決まる・代替表現なし）により、この組は値に対して単射になる。
 pub(crate) fn push_canonical_component(
     out: &mut Vec<u8>,
     value: ScalarRef<'_>,
@@ -819,7 +819,14 @@ pub(crate) fn push_canonical_component(
         }
         ScalarRef::Array(a) => {
             let mut payload = Vec::new();
-            payload.push(array_elem_tag(a.elem()));
+            // NULL 要素を含む配列は要素タグへ 0x80 を立て、NULL を含まない配列の
+            // キー（既存値。バイト列不変）と先頭バイトで区別する（Issue #1193）。
+            let null_mark = if a.flags() == 0 {
+                0
+            } else {
+                ARRAY_KEY_NULL_MARK
+            };
+            payload.push(array_elem_tag(a.elem()) | null_mark);
             payload.extend_from_slice(&a.count().to_be_bytes());
             payload.extend_from_slice(a.payload());
             push_len_prefixed(out, ColumnType::ARRAY_UNIQUE_KEY_TAG, &payload)
@@ -887,6 +894,7 @@ pub(crate) fn unique_key_from_values(
                 ScalarRef::Array(crate::row_codec::ArrayRef::from_owned(
                     a.elem(),
                     count,
+                    a.frame_flags(),
                     &array_payload,
                 ))
             }
@@ -931,8 +939,18 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
     match elem {
         crate::catalog::ArrayElemType::Text => 0,
         crate::catalog::ArrayElemType::Bool => 1,
+        crate::catalog::ArrayElemType::Integer => 2,
+        crate::catalog::ArrayElemType::BigInt => 3,
+        crate::catalog::ArrayElemType::Real => 4,
+        crate::catalog::ArrayElemType::Double => 5,
+        crate::catalog::ArrayElemType::Date => 6,
+        crate::catalog::ArrayElemType::Timestamp => 7,
+        crate::catalog::ArrayElemType::Uuid => 8,
     }
 }
+
+/// NULL 要素を含む配列の一意キー要素タグへ立てるマーカービット（Issue #1193）。
+const ARRAY_KEY_NULL_MARK: u8 = 0x80;
 
 /// `FOREIGN KEY` 1 件分の参照元側の検査仕様（TABLE-17・TASK-205、Issue #907）。
 struct ForeignKeySpec<'a> {
@@ -3484,7 +3502,7 @@ mod tests {
                 Value::Null,
                 Value::Null,
                 Value::Array(crate::row_codec::ArrayValue::Text(
-                    items.iter().map(|s| s.to_string()).collect(),
+                    items.iter().map(|s| Some(s.to_string())).collect(),
                 )),
             ]
         };
