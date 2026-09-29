@@ -2256,39 +2256,127 @@ fn views_depending_on_in_txn(
     Ok(dependents)
 }
 
-/// `table` を直接参照するビューのいずれかが、`remaining_columns`（削除対象列を
-/// 除いた基底テーブルの列集合＋予約列）に収まらない列を投影・述語で参照して
-/// いれば `true`（[`Storage::alter_table_drop_column`] の依存ビュー検査）。
+/// `table` を（直接または連鎖したビュー経由で）参照するビューのいずれかが、
+/// 削除後の列集合（`remaining_columns` ＝ 削除対象列を除いた基底テーブルの列＋
+/// 予約列）に収まらない列を投影・述語で参照していれば `true`
+/// （[`Storage::alter_table_drop_column`] の依存ビュー検査）。
 /// `sql::view::check_columns_within_view`（参照時の列スコープ検査と同一実装）を
-/// 流用し、失敗はすべて「依存あり」として fail-closed に倒す。`SELECT *` は
-/// 参照時に動的展開されるため依存とみなさない。
+/// 流用し、失敗はすべて「依存あり」として fail-closed に倒す。ビューの連鎖
+/// （`v2 AS SELECT note FROM v1`、`v1 AS SELECT * FROM t`）は、各ビューが公開する
+/// 列集合を削除後の状態で基底側から順に導出し（`SELECT *` は親の列集合、列指定は
+/// その列）、外側ビューの参照を内側の公開列に対して検査する。全ビューは同一
+/// write txn 内で読み込むため TOCTOU は生じない。
 fn views_reference_column_in_txn(
     views_table: &redb::Table<'_, &str, &[u8]>,
     table: &str,
     remaining_columns: &[String],
 ) -> Result<bool> {
+    let mut defs: std::collections::HashMap<String, ViewDef> = std::collections::HashMap::new();
     for entry in views_table.iter()? {
-        let (_key, value) = entry?;
-        let def = decode_view_def(value.value())?;
-        if def.base_relation != table {
-            continue;
+        let (key, value) = entry?;
+        if defs.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
         }
-        let tokens = crate::sql::lexer::tokenize(&def.body_sql)
-            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
-        let parsed = parse_view_body(&tokens)
-            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
-        if crate::sql::view::check_columns_within_view(
-            Some(remaining_columns),
-            &parsed.projection,
-            &parsed.where_predicates,
-            &[],
-        )
-        .is_err()
+        defs.insert(key.value().to_string(), decode_view_def(value.value())?);
+    }
+    // 各ビューの削除後公開列集合（None = テーブルへ到達しない無関係なビュー）。
+    let mut exposed: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    let names: Vec<String> = defs.keys().cloned().collect();
+    for name in names {
+        if exposed_columns_of_view(&defs, &mut exposed, &name, table, remaining_columns, 0)?
+            .is_broken()
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// [`exposed_columns_of_view`] の結果。
+enum ViewExposure {
+    /// テーブルへ到達しない（検査対象外）。
+    Unrelated,
+    /// 削除後もスコープ検査を通り、この列集合を公開する。
+    Columns(Vec<String>),
+    /// 削除対象列を参照しており壊れる。
+    Broken,
+}
+
+impl ViewExposure {
+    fn is_broken(&self) -> bool {
+        matches!(self, ViewExposure::Broken)
+    }
+}
+
+/// `name` ビューの削除後公開列集合を再帰的に導出する（メモ化・深さ上限付き。
+/// 循環・過大な連鎖は [`CatalogError::CorruptSchema`]）。
+fn exposed_columns_of_view(
+    defs: &std::collections::HashMap<String, ViewDef>,
+    memo: &mut std::collections::HashMap<String, Option<Vec<String>>>,
+    name: &str,
+    table: &str,
+    remaining_columns: &[String],
+    depth: usize,
+) -> Result<ViewExposure> {
+    if let Some(cached) = memo.get(name) {
+        return Ok(match cached {
+            Some(cols) => ViewExposure::Columns(cols.clone()),
+            None => ViewExposure::Unrelated,
+        });
+    }
+    if depth > MAX_VIEW_CHAIN_WALK {
+        return Err(CatalogError::CorruptSchema(
+            "view reference chain too long".to_string(),
+        ));
+    }
+    let Some(def) = defs.get(name) else {
+        return Ok(ViewExposure::Unrelated);
+    };
+    let parent_columns: Vec<String> = if def.base_relation == table {
+        remaining_columns.to_vec()
+    } else if defs.contains_key(&def.base_relation) {
+        match exposed_columns_of_view(
+            defs,
+            memo,
+            &def.base_relation,
+            table,
+            remaining_columns,
+            depth + 1,
+        )? {
+            ViewExposure::Columns(cols) => cols,
+            ViewExposure::Unrelated => {
+                memo.insert(name.to_string(), None);
+                return Ok(ViewExposure::Unrelated);
+            }
+            ViewExposure::Broken => return Ok(ViewExposure::Broken),
+        }
+    } else {
+        memo.insert(name.to_string(), None);
+        return Ok(ViewExposure::Unrelated);
+    };
+    let tokens = crate::sql::lexer::tokenize(&def.body_sql)
+        .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+    let parsed = parse_view_body(&tokens)
+        .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+    if crate::sql::view::check_columns_within_view(
+        Some(&parent_columns),
+        &parsed.projection,
+        &parsed.where_predicates,
+        &[],
+    )
+    .is_err()
+    {
+        return Ok(ViewExposure::Broken);
+    }
+    let cols = match &parsed.projection {
+        crate::sql::allowlist::Projection::Columns(cols) => cols.clone(),
+        _ => parent_columns,
+    };
+    memo.insert(name.to_string(), Some(cols.clone()));
+    Ok(ViewExposure::Columns(cols))
 }
 
 /// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`

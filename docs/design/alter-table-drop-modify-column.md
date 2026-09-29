@@ -219,7 +219,10 @@ SQL-23・ERR-6・NOSQL-13）。
   別論点のためスコープ外。
 - **既知の差分（記録のみ）**: `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION` は engine
   未実装のため `42804`。同一型への変更も `42804`。ビューが参照する列の DROP は
-  DDL 時点で `2BP01` にならず、参照時にエラーとなる（fail-closed）。
+  DDL 時点で `2BP01` で拒否する（同一 write txn 内で判定）。直接参照するビューに加え、
+  連鎖したビュー（`v1 AS SELECT * FROM t`・`v2 AS SELECT c FROM v1`）は各ビューの
+  公開列集合を削除後の状態で基底側から導出して検査し、外側ビューが参照する列が
+  消える DROP も拒否する。`SELECT *` は公開列集合の導出に使い、それ自体は依存とみなさない。
 
 ## スコープ外・後続 Issue
 

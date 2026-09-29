@@ -270,6 +270,39 @@ fn view_names_are_rejected_with_42809() {
     }
 }
 
+/// 連鎖したビュー（`v2 -> v1 -> docs`）が `SELECT *` 経由で参照する列の DROP は
+/// DDL 時点で `2BP01`（PR #1216 レビュー対応。直接参照ビューのみ検査していた欠落の回帰）。
+/// 無関係列の DROP は通り、その後は外側ビューの参照列が残る。
+#[test]
+fn chained_view_dependency_blocks_drop_column_with_2bp01() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    for sql in [
+        "CREATE VIEW v1 AS SELECT * FROM docs",
+        "CREATE VIEW v2 AS SELECT note FROM v1",
+    ] {
+        run(&core, &mut session, sql).expect(sql);
+    }
+    assert_eq!(
+        code_of(&core, &mut session, "ALTER TABLE docs DROP COLUMN note"),
+        "2BP01"
+    );
+    // 外側ビューが参照しない列は削除できる。
+    run(&core, &mut session, "ALTER TABLE docs DROP COLUMN qty").expect("drop qty");
+    // 内側が列指定・外側がその列を参照する 3 段連鎖でも拒否される。
+    for sql in [
+        "CREATE VIEW v3 AS SELECT amount FROM v1",
+        "CREATE VIEW v4 AS SELECT amount FROM v3",
+    ] {
+        run(&core, &mut session, sql).expect(sql);
+    }
+    assert_eq!(
+        code_of(&core, &mut session, "ALTER TABLE docs DROP COLUMN amount"),
+        "2BP01"
+    );
+}
+
 #[test]
 fn reserved_check_and_constraint_names_and_last_column_are_42601() {
     let (core, path) = new_core();
