@@ -543,7 +543,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
 | `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
 | `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`） |
-| `drop_column`（`alter_table`） | △ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線のため常に `0A000` |
+| `drop_column`（`alter_table`） | ○ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線（Issue #1167。エラー契約は SQL 表層と同一）。`add_column` と排他必須 |
 
 成功応答は 3 op 共通で `{"ok":true}`（行数・件数を返さない）。
 
@@ -821,7 +821,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
   NoSQL 側の対応は NOSQL-14 の担当）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `ORDER BY`／`LIMIT` の付与
-- `ALTER TABLE ... DROP COLUMN`（SQL 表層が未結線。`alter_table.drop_column` は `0A000`）
+- `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
 - `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
 - `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
 - `FOREIGN KEY` の `MATCH {SIMPLE|FULL}`／`[NOT] DEFERRABLE`／

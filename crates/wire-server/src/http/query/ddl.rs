@@ -36,12 +36,15 @@
 //! より前に判定するため。`ParsedSql::CreateTable` 等のドキュメント参照）が
 //! 返る——存在オラクルにならない。
 //!
+//! ## `alter_table.drop_column`（Issue #1167）
+//!
+//! SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口（トークン列 →
+//! `validate_alter_table_tokens` → `run_ddl`）へ結線する。権限判定・依存検査・
+//! エラー写像は engine 側に一本化され、NoSQL 側に第 2 の判定を持たない。
+//! `ALTER COLUMN TYPE` 相当の op は未提供（別論点）。
+//!
 //! ## 未実装形（fail-closed。成功を偽装しない）
 //!
-//! - `alter_table.drop_column`: SQL 表層の許可リストが `ALTER TABLE ...
-//!   DROP COLUMN` を結線していないため（`engine::sql::allowlist::
-//!   validate_alter_table_tokens` は `ADD COLUMN` のみを受理する）、常に
-//!   [`DROP_COLUMN_UNAVAILABLE_MESSAGE`]（`0A000`）を返す。
 //! - `create_table.constraints[].kind == "check"`: 述語の JSON 写像が別論点
 //!   のため、常に [`CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`]（`0A000`）を返す。
 //!
@@ -82,13 +85,8 @@ use crate::http::session::middleware::SessionPrincipal;
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{
     SchemaError, Validated, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA, DDL_CONSTRAINT_SCHEMA,
-    DDL_REFERENCES_SCHEMA,
+    DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
 };
-
-/// `alter_table.drop_column` の固定応答文言（SQL 表層が未結線。モジュール
-/// doc 参照）。untrusted な値を含まない。
-pub const DROP_COLUMN_UNAVAILABLE_MESSAGE: &str =
-    "ALTER TABLE DROP COLUMN is not available via the NoSQL surface yet";
 
 /// `create_table.constraints[].kind == "check"` の固定応答文言（述語の JSON
 /// 写像は別論点。モジュール doc 参照）。
@@ -113,8 +111,7 @@ pub enum DdlError {
     /// （`bool`／`null`／配列／オブジェクト）・`references.on_delete`／
     /// `on_update` の語彙外の値〔Issue #1148〕等）。
     InvalidRequest,
-    /// 未実装形（[`DROP_COLUMN_UNAVAILABLE_MESSAGE`]／
-    /// [`CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`]）。
+    /// 未実装形（[`CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`]）。
     FeatureNotSupported(&'static str),
     /// `engine::sql::allowlist::validate_*_tokens`／
     /// `EngineCore::execute_parsed_in_session` のエラー（DDL 実行権限不足
@@ -653,9 +650,26 @@ pub fn execute_alter_table(
 
     match (add_column, drop_column) {
         (Some(_), Some(_)) | (None, None) => Err(DdlError::InvalidRequest),
-        (None, Some(_)) => Err(DdlError::FeatureNotSupported(
-            DROP_COLUMN_UNAVAILABLE_MESSAGE,
-        )),
+        (None, Some(drop_column)) => {
+            // `add_column` と同じく `DDL_DROP_COLUMN_SCHEMA` で再度包んで型付き
+            // アクセサを使う（多層防御。トップレベル検証で既に再帰検証済み）。
+            let wrapped = JsonValue::Object(drop_column.clone());
+            let drop_v = DDL_DROP_COLUMN_SCHEMA
+                .validate(&wrapped)
+                .map_err(DdlError::from)?;
+            let column_name = drop_v.required_str("name").map_err(DdlError::from)?;
+            let column_name_token = ident_token(column_name)?;
+            let tokens = vec![
+                Token::Ident("ALTER".to_string()),
+                Token::Ident("TABLE".to_string()),
+                table_token,
+                Token::Ident("DROP".to_string()),
+                Token::Ident("COLUMN".to_string()),
+                column_name_token,
+            ];
+            let stmt = validate_alter_table_tokens(&tokens)?;
+            run_ddl(core, principal, ParsedSql::AlterTable(stmt))
+        }
         (Some(add_column), None) => {
             // ネストしたオブジェクトへ型付きアクセサ（`required_str`／
             // `optional_u32` 等）を使うため、`DDL_ADD_COLUMN_SCHEMA` で
