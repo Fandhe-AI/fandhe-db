@@ -1083,7 +1083,7 @@ fn cmp_integer_to_literal(n: u64, literal: f64) -> std::cmp::Ordering {
 /// [`cmp_integer_to_literal`] で精度損失なく比較する（`SUM(id)` 等 `2^53` を
 /// 超えうる値を無条件に `f64` へキャストしない）。`Cell::Float` は `total_cmp`
 /// 相当の通常比較（非有限値は [`Accumulator`] 側が既に拒否済みのため到達しない）。
-fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
+pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
     match cell {
         Cell::Integer(n) => {
             use std::cmp::Ordering;
@@ -1211,7 +1211,7 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
 /// グループキー成分の [`compare_order_key`] と同じ規約）。非 `NULL` 同士の大小は
 /// [`cmp_cell_values`]。戻り値は「昇順に安定ソートすると最終的な出力順になる」意味の
 /// `Ordering`（`Less` が先頭）。
-fn cmp_cells_pg_nulls(a: &Cell, b: &Cell, descending: bool) -> std::cmp::Ordering {
+pub(crate) fn cmp_cells_pg_nulls(a: &Cell, b: &Cell, descending: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (matches!(a, Cell::Null), matches!(b, Cell::Null)) {
         (true, true) => Ordering::Equal,

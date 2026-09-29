@@ -407,17 +407,21 @@ fn rejects_join_using_clause() {
     );
 }
 
+/// Issue #1190: 3 テーブル以上の連鎖 JOIN を受理する（旧 `rejects_three_table_join_chain`
+/// を反転）。詳細な意味論は `tests/sql28_multi_way_join.rs`。
 #[test]
-fn rejects_three_table_join_chain() {
+fn accepts_three_table_join_chain() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id JOIN authors AS a2 ON authors.id = a2.id LIMIT 10",
-        "42601",
     );
+    assert_eq!(result.rows.len(), 3);
+    // documents(4 列: id + 3) + authors(3 列) + a2(3 列)
+    assert_eq!(result.columns.len(), 10);
 }
 
 #[test]
@@ -485,17 +489,18 @@ fn rejects_order_by_combined_with_join() {
     );
 }
 
+/// Issue #1190: JOIN の WHERE で `OR` を受理する（旧 `rejects_where_or_in_join` を反転）。
 #[test]
-fn rejects_where_or_in_join() {
+fn accepts_where_or_in_join() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
-        "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id WHERE authors.name = 'alice' OR authors.name = 'bob' LIMIT 10",
-        "42601",
+        "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id WHERE authors.name = 'alice' OR authors.name = 'bob' LIMIT 10",
     );
+    assert_eq!(titles(&result), vec!["doc-a1", "doc-a2", "doc-b1"]);
 }
 
 #[test]
@@ -517,17 +522,19 @@ fn rejects_join_where_with_excessive_and_conjuncts() {
     assert_rejected(&core, "tenant-a", &sql, "54000");
 }
 
+/// Issue #1190: JOIN の WHERE で列同士の比較を受理する（旧
+/// `rejects_where_column_to_column_comparison_in_join` を反転）。
 #[test]
-fn rejects_where_column_to_column_comparison_in_join() {
+fn accepts_where_column_to_column_comparison_in_join() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id WHERE documents.title = authors.name LIMIT 10",
-        "42601",
     );
+    assert!(result.rows.is_empty(), "no title equals an author name");
 }
 
 #[test]

@@ -5583,7 +5583,7 @@ fn resolve_group_by_key(
 /// `DATE`/`TIMESTAMP` の `MIN`/`MAX`（`Cell::Date`/`Cell::Timestamp`）は
 /// 黙って `false` へ縮退させず、`TEXT` と同じく型不整合 `22000` で拒否する
 /// （`COUNT` はいずれの列型でも結果が `Cell::Integer` になるため対象外）。
-fn check_having_target_is_numeric(
+pub(crate) fn check_having_target_is_numeric(
     item: &BoundAggregateItem,
     target_name: &str,
 ) -> Result<(), SqlSurfaceError> {

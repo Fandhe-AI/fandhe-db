@@ -31,8 +31,10 @@ join_type := [INNER] JOIN | LEFT [OUTER] JOIN | RIGHT [OUTER] JOIN | FULL [OUTER
 `inner-join.md` の文法をこの `join_type` の拡張だけ差し替える。それ以外（`ON`・`WHERE`・
 `LIMIT`／`OFFSET`・別名・対象外事項）は INNER と共通。引き続き `42601`（fail-closed）:
 `OUTER JOIN` 単独（`LEFT`／`RIGHT`／`FULL` を伴わない形）、`CROSS`／`NATURAL` JOIN、
-`JOIN ... USING (...)`、非等価の `ON`、3 テーブル以上の連鎖、`ORDER BY` 等との併用、`$n`
-パラメータ、ビュー参照。
+`JOIN ... USING (...)`、非等価の `ON`、ベクトル順位付けとの併用、`$n` パラメータ、ビュー参照
+（3 テーブル以上の連鎖・スカラー `ORDER BY`・集計形・`OR`／`IN`／列同士の比較は Issue #1190 で
+受理対象になった。`multi-way-join.md` 参照。本書の 2 テーブルの WHERE 簡約規則は、そこでの
+一般規則〔strict な relation を NULL 補完しうる段の保存側フラグを落とす〕の特殊ケース）。
 
 構文検出（`sql::allowlist::looks_like_join`）は変更していない——`LEFT`／`RIGHT`／`FULL`
 はすでに Issue #925 時点で検出対象だったため（当時は `parse_join_statement` 側で一律
@@ -129,10 +131,11 @@ Full}` の場合に限り、non-strict な述語を検出したら簡約せず `
 
 ## 対象外（申し送りのみ。Issue は起票しない）
 
-- `CROSS` JOIN・`NATURAL` JOIN・`USING (...)`、3 テーブル以上の連鎖（外部結合を含む）
-- 外部結合と集計・`GROUP BY`・`ORDER BY`・ウィンドウ・`DISTINCT` の組み合わせ
-- WHERE の `IS NULL`／`OR`／`IN` など（`IS NULL` を導入する場合は `is_null_rejecting` と
-  簡約規則の再設計が必要）
+- `CROSS` JOIN・`NATURAL` JOIN・`USING (...)`
+- 外部結合とウィンドウ・`DISTINCT` の組み合わせ（3 テーブル以上の連鎖・集計・`GROUP BY`・
+  スカラー `ORDER BY`・WHERE の `OR`／`IN` は Issue #1190〔`multi-way-join.md`〕で受理対象に
+  なった）
+- WHERE の `IS NULL`／`NOT`（導入する場合は `is_null_rejecting` と簡約規則の再設計が必要）
 - ON 句の中に書くリテラル条件（`ON a.x = b.y AND b.z = 'v'`）
 - JOIN を含む VIEW・CTE・サブクエリ・`EXPLAIN`・カーソル・`COPY`・`$n`
 - JOIN 経路の RLS 境界の網羅検証（#931）
