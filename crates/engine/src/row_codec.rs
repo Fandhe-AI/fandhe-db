@@ -337,6 +337,7 @@ impl ArrayValue {
         }
     }
 }
+
 /// スカラー列走査（[`scan_scalar_columns`] 系）の借用結果。TEXT・REAL・
 /// DOUBLE PRECISION・BOOLEAN・ARRAY のいずれも返せるよう `Option<&str>` から
 /// 型付き化した（Issue #883・D-b、Issue #888。`INTEGER`／`BIGINT`（Issue #881
@@ -1214,6 +1215,7 @@ fn parse_array_frame<'a>(
         payload_end,
     ))
 }
+
 /// NUMERIC 値 1 個をスカラーペイロードへ書き込んだ場合のフレーム込みバイト数
 /// （presence(1) + `unscaled`（`i128` LE 16 バイト）。TABLE-13〔検討中〕・
 /// TASK-197、Issue #885・D3）。scale は行に持たないため列型に依存しない
