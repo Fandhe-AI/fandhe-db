@@ -344,11 +344,44 @@ fn predicate_delete_with_like_general_form_matches_count_and_resend_contract() {
     assert_eq!(err.wire_code(), "22023");
 }
 
-/// `WHERE visible()` のみの述語つき DELETE は自テナント全行を候補にする
-/// （#870 の決定を継承。歯止めは影響行数上限のみ。本テストは #870 の
-/// 決定を再決定しない）。
+/// fail-closed: `WHERE visible()` のみの述語つき DELETE は束縛段で拒否する
+/// （Issue #1181・SQL-19。UPDATE と同契約。副作用ゼロ）。
 #[test]
-fn predicate_delete_visible_only_matches_all_own_rows() {
+fn predicate_delete_visible_only_is_rejected_at_bind() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
+    insert_row(&core, &alice, TABLE, 2, "en", "b", "2");
+    insert_row(&core, &alice, TABLE, 3, "fr", "c", "3");
+
+    let err = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE visible() USING OPERATION_ID 'op-visible'"),
+    )
+    .expect_err("visible()-only predicate DELETE must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(count_star(&core, &alice, TABLE), 3);
+
+    // 副作用ゼロ: 台帳に記録されていないため、同一 operation_id の正当な再送が成功する。
+    let outcome = execute(
+        &core,
+        &alice,
+        &format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-visible'"),
+    )
+    .expect("operation_id must not have been consumed by the rejected statement");
+    match outcome {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 1),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 2);
+}
+
+/// `visible()` と他の述語の併用は受理し、述語に一致する行のみ削除する
+/// （Issue #1181。UPDATE と受理範囲を揃える）。
+#[test]
+fn predicate_delete_visible_combined_with_predicate_matches_only_predicate_rows() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
@@ -359,14 +392,16 @@ fn predicate_delete_visible_only_matches_all_own_rows() {
     let outcome = execute(
         &core,
         &alice,
-        &format!("DELETE FROM {TABLE} WHERE visible() USING OPERATION_ID 'op-visible'"),
+        &format!(
+            "DELETE FROM {TABLE} WHERE visible() AND lang = 'ja' USING OPERATION_ID 'op-visible-and'"
+        ),
     )
-    .expect("visible()-only predicate DELETE should succeed");
+    .expect("visible() combined with a predicate should succeed");
     match outcome {
-        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 3),
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 1),
         other => panic!("expected SqlOutcome::Delete, got {other:?}"),
     }
-    assert_eq!(count_star(&core, &alice, TABLE), 0);
+    assert_eq!(count_star(&core, &alice, TABLE), 2);
 }
 
 /// fail-closed: `operation_id` 欠落は `23502`（構造検証・束縛のいずれよりも

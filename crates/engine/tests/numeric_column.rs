@@ -689,7 +689,7 @@ fn count_numeric_counts_non_null_rows_only() {
 }
 
 #[test]
-fn sum_avg_min_max_where_expr_and_group_by_reject_numeric_column() {
+fn sum_avg_min_max_where_and_expr_reject_numeric_column() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -724,14 +724,13 @@ fn sum_avg_min_max_where_expr_and_group_by_reject_numeric_column() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
 
-    // GROUP BY キー列は TEXT 限定のため NUMERIC 列は拒否される。
-    let err = core
-        .execute_sql(
-            &alice,
-            &format!("SELECT price, COUNT(*) FROM {TABLE} GROUP BY price"),
-        )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    // Issue #1185・SQL-25 (d): NUMERIC 列の `GROUP BY` キーは受理側へ契約改訂した
+    // （結果は `tests/sql25_aggregate_order_by_scalar_keys.rs` で固定）。
+    core.execute_sql(
+        &alice,
+        &format!("SELECT price, COUNT(*) FROM {TABLE} GROUP BY price"),
+    )
+    .expect("NUMERIC GROUP BY key is accepted since Issue #1185");
 }
 
 /// `SUM`/`AVG`/`MIN`/`MAX(price)` は Issue #892（D5・D6）で受理された。

@@ -147,6 +147,67 @@ fn select_distinct_with_where_order_by_desc_and_limit_over_wire() {
     read_ready_for_query(&mut stream);
 }
 
+/// Issue #1185・SQL-25 (c)(d): 複数列・疑似列 `id`（非 TEXT）の `SELECT DISTINCT` が
+/// wire 越しに RowDescription（`Computed` 相当の text 列）・DataRow のテキスト表現で
+/// 返る。
+#[test]
+fn select_distinct_multi_column_and_id_key_over_wire() {
+    let (core, _guard) = new_core_aggregate_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT DISTINCT lang, id FROM docs ORDER BY id DESC LIMIT 2",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["lang", "id"]);
+    let first = read_data_row(&mut stream);
+    assert_eq!(first, vec![Some("xx".to_string()), Some("11".to_string())]);
+    let second = read_data_row(&mut stream);
+    assert_eq!(second, vec![Some("ja".to_string()), Some("3".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT DISTINCT id FROM docs");
+    let _columns = read_row_description(&mut stream);
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ids.push(read_data_row(&mut stream)[0].clone().expect("id"));
+    }
+    assert_eq!(ids, vec!["1", "2", "3", "11"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 4");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #1185・SQL-25 (a): 集計文の複数キー `ORDER BY`（集計値 DESC → グループキー
+/// ASC）が wire 越しにも契約どおりの順序で返る。
+#[test]
+fn aggregate_multi_key_order_by_over_wire() {
+    let (core, _guard) = new_core_aggregate_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY n DESC, lang ASC",
+    );
+    let _columns = read_row_description(&mut stream);
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let row = read_data_row(&mut stream);
+        got.push((row[0].clone().expect("lang"), row[1].clone().expect("n")));
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("ja".to_string(), "2".to_string()),
+            ("en".to_string(), "1".to_string()),
+            ("xx".to_string(), "1".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
 /// SQL-25 (c): `COUNT(DISTINCT lang)`／`COUNT(DISTINCT id)` が別名どおりの列名・
 /// オラクルどおりの値で返る。
 #[test]

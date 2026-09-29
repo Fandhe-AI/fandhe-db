@@ -439,7 +439,7 @@ fn group_count_over_max_groups_is_rejected_as_payload_too_large() {
 // --- 拒否経路: 型不整合・未受理形 --------------------------------------------------
 
 #[test]
-fn rejects_group_by_on_vector_column_and_id_pseudo_column() {
+fn rejects_group_by_on_vector_column_and_unknown_column() {
     let path = unique_db_path("group-by-type-reject");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -455,10 +455,11 @@ fn rejects_group_by_on_vector_column_and_id_pseudo_column() {
         .expect_err("GROUP BY on a VECTOR column must be rejected");
     assert_eq!(err.wire_code(), "22000");
 
-    let err = core
-        .execute_sql(&ctx, "SELECT id, COUNT(*) FROM docs GROUP BY id")
-        .expect_err("GROUP BY on the id pseudo-column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    // Issue #1185・SQL-25 (d) で契約改訂: 疑似列 `id` はグループキーとして受理される
+    // （テナント内で一意のため 1 行 1 グループ。結果は
+    // `tests/sql25_aggregate_order_by_scalar_keys.rs` で固定）。
+    core.execute_sql(&ctx, "SELECT id, COUNT(*) FROM docs GROUP BY id")
+        .expect("GROUP BY on the id pseudo-column is accepted since Issue #1185");
 
     let err = core
         .execute_sql(&ctx, "SELECT ghost, COUNT(*) FROM docs GROUP BY ghost")
@@ -878,13 +879,12 @@ fn text_min_max_index_path_key_order_transient_overflow_falls_back_to_plain_scan
     );
 }
 
-// `ORDER BY <GROUP BY 列> DESC` でも `NULL` グループは常に末尾（PR #230
-// codex-review P1 指摘対応: 以前は非 `NULL` 側との大小関係を含む `Ordering`
-// 全体を `.reverse()` していたため、`DESC` 指定時に `NULL` グループが先頭へ来て
-// `LIMIT` が本来先頭に来るべき非 `NULL` グループ（この場合 "cc"）を取りこぼして
-// いた）。
+// `ORDER BY <GROUP BY 列> DESC` の NULL グループは先頭（Issue #1185・SQL-25 (a) で
+// 契約改訂: 明示した ORDER BY の NULL 位置は PostgreSQL 既定〔ASC は末尾・DESC は
+// 先頭〕にそろえる。PR #230 では DESC でも末尾に固定していた）。`ORDER BY` を
+// 書かない既定順（キー昇順・NULL 末尾）は不変。
 #[test]
-fn group_by_desc_order_still_places_null_group_last_for_limit() {
+fn group_by_desc_order_places_null_group_first_for_limit() {
     let path = unique_db_path("group-by-desc-null-last");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -923,6 +923,8 @@ fn group_by_desc_order_still_places_null_group_last_for_limit() {
     }
 
     let core = new_core(storage);
+    // Issue #1185・SQL-25 (a) で契約改訂: 明示した `ORDER BY ... DESC` の NULL 位置は
+    // PostgreSQL 既定（DESC は NULL が先頭）。`LIMIT 1` は NULL グループを返す。
     let result = core
         .execute_sql(
             &ctx,
@@ -932,9 +934,29 @@ fn group_by_desc_order_still_places_null_group_last_for_limit() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         as_text(&result.rows[0].cells[0]),
-        Some("cc".to_string()),
-        "the largest non-NULL group must sort before the NULL group even under DESC"
+        None,
+        "the NULL group sorts first under an explicit DESC"
     );
+
+    // DESC LIMIT 2: NULL グループの次に最大の非 NULL グループ。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT note, COUNT(*) AS n FROM docs GROUP BY note ORDER BY note DESC LIMIT 2",
+        )
+        .expect("DESC LIMIT 2 should succeed");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(as_text(&result.rows[0].cells[0]), None);
+    assert_eq!(as_text(&result.rows[1].cells[0]), Some("cc".to_string()));
+
+    // ASC は NULL 末尾のまま（既定・明示とも）。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT note, COUNT(*) AS n FROM docs GROUP BY note ORDER BY note ASC LIMIT 1",
+        )
+        .expect("ASC LIMIT 1 should succeed");
+    assert_eq!(as_text(&result.rows[0].cells[0]), Some("aa".to_string()));
 }
 
 // `HAVING` は `SUM(id)` のように `2^53` を超えうる整数集計値を精度損失なく比較

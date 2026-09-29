@@ -148,8 +148,8 @@ fn wire_udf_call_use_in_where_clause_succeeds() {
     assert_eq!(ids, vec!["2".to_string()]);
 }
 
-/// 未定義 UDF 呼び出しは `22000`（束縛段の意味論エラー。`sql::udf_call` の
-/// 既存契約。`tests/sql_udf_call.rs::unknown_function_call_is_rejected_with_22000`
+/// 未定義 UDF 呼び出しは `42883`（束縛段の意味論エラー。`sql::udf_call` の
+/// 既存契約。`tests/sql_udf_call.rs::unknown_function_call_is_rejected_with_42883`
 /// の同型確認）で拒否され、接続は維持される。
 #[test]
 fn wire_udf_call_undefined_function_is_rejected_and_connection_survives() {
@@ -163,7 +163,7 @@ fn wire_udf_call_undefined_function_is_rejected_and_connection_survives() {
         "SELECT id, not_registered(embedding) FROM docs \
          ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
     read_ready_for_query(&mut stream);
 
     // エラー後も接続は維持され、続くクエリが正常応答すること。
@@ -180,9 +180,9 @@ fn wire_udf_call_undefined_function_is_rejected_and_connection_survives() {
     read_ready_for_query(&mut stream);
 }
 
-/// 不正な UDF 定義（本体が未定義の参照を含む）は `22000` で拒否され、レジストリは
+/// 不正な UDF 定義（本体が未定義の参照を含む）は `42883` で拒否され、レジストリは
 /// 変更されない（部分登録なし。
-/// `tests/sql_udf_call.rs::function_body_referencing_an_undefined_name_is_rejected_with_22000`
+/// `tests/sql_udf_call.rs::function_body_referencing_an_undefined_name_is_rejected_with_42883`
 /// の同型確認）。
 #[test]
 fn wire_udf_call_invalid_definition_is_rejected_without_partial_registration() {
@@ -195,21 +195,21 @@ fn wire_udf_call_invalid_definition_is_rejected_without_partial_registration() {
         &mut stream,
         "CREATE FUNCTION bad_fn(v) AS undefined_name(v)",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
     read_ready_for_query(&mut stream);
 
     // 部分登録されていないため、同名関数の呼び出しは未定義関数として同じ
-    // `22000` で拒否される。
+    // `42883` で拒否される。
     send_simple_query(
         &mut stream,
         "SELECT id, bad_fn(embedding) FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
     read_ready_for_query(&mut stream);
 }
 
 /// UDF 登録はセッション（接続）境界を越えて漏れない: 接続 1 で登録した関数を
-/// 接続 2 から呼び出すと未定義関数として `22000` で拒否される
+/// 接続 2 から呼び出すと未定義関数として `42883` で拒否される
 /// （`tests/sql_udf_call.rs::udf_defined_in_one_session_is_not_visible_from_another_session`
 /// の同型確認）。
 #[test]
@@ -233,6 +233,6 @@ fn wire_udf_call_registration_does_not_leak_across_connections() {
         "SELECT id, only_in_conn1(embedding) FROM docs \
          ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
     );
-    expect_error_response_with_sqlstate(&mut conn2, "22000");
+    expect_error_response_with_sqlstate(&mut conn2, "42883");
     read_ready_for_query(&mut conn2);
 }

@@ -424,7 +424,7 @@ fn set_search_mode_persists_when_the_whole_message_succeeds() {
 
 /// `CREATE FUNCTION` を含む複数文メッセージが途中で失敗した場合も同様に
 /// 巻き戻り、次のメッセージでその関数は未定義のまま（未定義関数呼び出しは
-/// `sql::udf_call` の束縛時検証により `22000`〔`InvalidInput`〕になる）。
+/// `sql::udf_call` の束縛時検証により `42883`〔`UndefinedFunction`〕になる）。
 #[test]
 fn create_function_is_rolled_back_when_a_later_statement_in_the_message_fails() {
     let (core, _guard) = new_core_three_tenant_docs();
@@ -442,7 +442,7 @@ fn create_function_is_rolled_back_when_a_later_statement_in_the_message_fails() 
         &mut stream,
         "SELECT id, double_it(2.0) AS doubled FROM docs LIMIT 1",
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
     read_ready_for_query(&mut stream);
 }
 

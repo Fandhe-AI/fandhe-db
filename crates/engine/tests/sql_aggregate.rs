@@ -651,7 +651,7 @@ fn sql13_aggregate_over_declared_udf_call() {
     let err = core
         .execute_sql(&ctx, "SELECT SUM(n(embedding)) FROM docs")
         .expect_err("undefined UDF must be rejected in a fresh session");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // --- VECTOR 列を持たないテーブルでも集計できる ------------------------------------

@@ -43,9 +43,10 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | `date_trunc(u, DATE\|TIMESTAMP)` | TIMESTAMP | 未知の unit: `22000`（束縛時）。結果が範囲外（1〜9 年の `decade` 切り捨て等）: `22008` |
 | `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `22000`。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
 | `DATE - DATE` | Scalar（日数） | なし（範囲内の差は必ず表現できる） |
-| `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `22000`（`INTERVAL` 型が無いため対象外） |
-| 型付きリテラルの文法違反 / 範囲外 | — | `22000` / `22008`（既存の Issue #884 D-1 と同じ写像） |
-| 引数の型不一致・arity 違反 | — | `22000` |
+| `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
+| 型付きリテラルの書式違反 / 範囲外 | — | `22007` / `22008`（Issue #1187。`datetime-column.md` と同じ写像） |
+| 引数の型不一致 | — | `42804`（Issue #1186） |
+| arity 違反 | — | `22000` |
 | NULL 入力 | NULL | すべて strict（いずれかの引数が NULL なら NULL） |
 
 ## 意味論（PostgreSQL 互換）
@@ -82,8 +83,10 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 
 `BuiltinFn::DatePart(DatePartField)` と `BuiltinFn::DateTrunc(DateTruncUnit)`
 のペイロードに field / unit を持たせ、束縛後の第 1 引数が
-`BoundExpr::Text` リテラルでなければ `22000` にする（`udf_call::
-bind_date_part_or_trunc`）。実行時の引数は `src` 1 個だけになり、行ごとに
+`BoundExpr::Text` リテラルでなければエラーにする（`udf_call::
+bind_date_part_or_trunc`）。第 1 引数がテキスト型でない場合は `42804`、
+テキスト型だがリテラルでない（列参照・式）場合は `22000` とする。
+実行時の引数は `src` 1 個だけになり、行ごとに
 文字列を解析しない。`date_part`／`date_trunc` は名前だけでは variant が
 決まらないため `builtin_from_name` には入れず、`is_variadic_or_overloaded_
 builtin_name` に追加する（`round` と同じ流儀）。
@@ -105,7 +108,7 @@ builtin_name` に追加する（`round` と同じ流儀）。
 ### NOW() と決定性
 
 現在時刻系（`now`・`current_timestamp`・`current_date`・`localtimestamp`
-等）は実装しない。呼び出しは未知の関数として `22000` になる。これらの
+等）は実装しない。呼び出しは未知の関数として `42883` になる（Issue #1186）。これらの
 名前は UDF 予約名にも**しない**（PR #1107 の codex 是正を維持。組み込み
 関数はすべて純粋関数で時計を読まないため、`now` という名前の UDF があっても
 決定性は崩れない）。

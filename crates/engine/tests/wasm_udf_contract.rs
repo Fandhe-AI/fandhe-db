@@ -469,7 +469,7 @@ fn wasm_udf_registration_does_not_leak_across_sessions() {
              ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1",
         )
         .expect_err("session_b must not see session_a's WASM UDF registration");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // --- 登録時の拒否経路 ----------------------------------------------------------------
@@ -481,7 +481,7 @@ fn registering_wasm_udf_with_builtin_name_is_rejected() {
     let err = session
         .register_wasm_udf("vec_norm", mock_backend(&call_count))
         .expect_err("collision with builtin name must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn registering_wasm_udf_with_name_used_by_declarative_udf_is_rejected() {
     let err = session
         .register_wasm_udf("shared_name", mock_backend(&call_count))
         .expect_err("collision with declarative UDF name must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn redefining_the_same_wasm_udf_name_is_rejected() {
     let err = session
         .register_wasm_udf("norm_scale_wasm", mock_backend(&call_count))
         .expect_err("redefinition must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 }
 
 #[test]
@@ -578,6 +578,6 @@ fn wasm_call_with_wrong_argument_type_is_rejected() {
              ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1",
         )
         .expect_err("argument type mismatch must be rejected at bind time");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
     assert_eq!(call_count.load(Ordering::SeqCst), 0);
 }
