@@ -315,6 +315,20 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   分類として追加し、production の応答エンコーダ経由で射影のみを固定する
   （NoSQL 表層の `op` 許可リストにトランザクション制御が無いため）。
 
+## 起源（Explicit／Implicit）ごとの遷移差分（Issue #1175）
+
+`ActiveTxn` は起源 `TxnOrigin`（`Explicit`／`Implicit`）を持つ。起源の違いは状態遷移
+だけで、文の実行ディスパッチ（`core.rs::execute_parsed_in_txn`）は区別しない。
+
+| 事象 | Explicit | Implicit |
+| ---- | -------- | -------- |
+| 開始 | `BEGIN`（`begin`） | メッセージ先頭で wire 層が `begin_implicit`（`Idle` からのみ。それ以外は `XX000`） |
+| 文のエラー・上限超過・`operation_id` 再利用（`fail`） | `Failed`（`ROLLBACK` 待ち） | `Idle`（write txn を abort・ライタ解放） |
+| 確定 | `COMMIT`（上限超過は `Failed` へ遷移し `54000`） | 最後の文の成功後に `commit_implicit`（上限超過・commit 失敗のどちらも `Idle`） |
+| 期限切れ（`release_if_expired`） | `Failed`（次の文で `54000`） | `Idle`（メッセージをまたがないため通常は到達しない） |
+| `BEGIN`／`COMMIT`／`ROLLBACK` が届いた場合 | 通常の遷移 | 不変条件違反として abort して `Idle`、`XX000` |
+| `ReadyForQuery` の状態バイト | `'T'`／`'E'` | メッセージ内の途中は送らず、終了時は常に `'I'` |
+
 ## 対象外・申し送り
 
 - 明示トランザクション内のファイル形 INSERT（埋め込み I/O。`0A000` のまま）と、
@@ -324,8 +338,13 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベルを wire 上で
   区別すること → TASK-227（ERR-6 の横断事項）。
-- 暗黙トランザクション（WIRE-16）による複数文の書き込み位置制約の完全撤廃
-  （`BEGIN` を含まないメッセージは引き続き「書き込みは最後の 1 文のみ」）。
+- 暗黙トランザクション（WIRE-16）による複数文の書き込み位置制約の撤廃は
+  **Issue #1175 で実装済み（制約付き）**。`BEGIN` を含まないメッセージのうち書き込みが
+  最後以外にある形は、メッセージ全体を 1 つの暗黙トランザクションで原子的に実行する
+  （詳細は [`wire-multi-statement.md`](./wire-multi-statement.md)「原子性」節）。
+  使える文は明示トランザクションと同じ許可リストで、`UPDATE`・`DELETE` 等は `0A000`
+  （#1179 で明示トランザクション側が広がれば自動的に広がる）。`BEGIN` より前の書き込みを
+  明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 先頭文が 0 行 DELETE の場合に RECOVER-12 の再送判定が成立しない制約

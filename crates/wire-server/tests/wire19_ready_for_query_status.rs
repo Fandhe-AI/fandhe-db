@@ -287,7 +287,8 @@ fn multi_statement_error_without_transaction_stays_idle() {
     // （`Write` ではない）に分類する非文（`statement_splitter` の単体テスト
     // `classify_statement("123")` 参照）。`SELEC ...`（未知の先頭トークン）は
     // 字句上 `Token::Ident(_)` の fail-closed 既定で `Write` 扱いになり、
-    // 複数文中の非末尾書き込みとして `0A000` へ倒れてしまうため使えない。
+    // 複数文中の非末尾書き込みとして暗黙トランザクション（Issue #1175）へ
+    // 振り分けられるため、この形（逐次実行）の確認には使えない。
     send_simple_query(&mut stream, "123; SELECT id FROM documents LIMIT 1");
     expect_error_response_with_sqlstate(&mut stream, "42601");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
@@ -604,5 +605,45 @@ fn extended_execute_time_error_outside_transaction_stays_idle_at_sync() {
     let _ = read_row_description(&mut stream);
     let _ = read_data_row(&mut stream);
     let _ = read_command_complete(&mut stream);
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// 暗黙トランザクション（Issue #1175）: 書き込みが最後以外にある複数文メッセージは、
+/// 成功して commit された場合も、途中でエラーになりロールバックされた場合も、最後の
+/// `ReadyForQuery` が `'I'`（`'T'`／`'E'` にならない）。
+#[test]
+fn implicit_transaction_success_and_failure_both_report_idle() {
+    let (core, _guard) = new_core_with_documents_table();
+    let mut stream = spawn_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        &format!(
+            "{}; {}",
+            insert_sql(1, "imp-ok-1"),
+            insert_sql(2, "imp-ok-2")
+        ),
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    send_simple_query(
+        &mut stream,
+        &format!(
+            "{}; SELECT id FROM no_such_table LIMIT 1",
+            insert_sql(3, "imp-ng-1")
+        ),
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    expect_error_response_with_sqlstate(&mut stream, "42P01");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // 失敗後も接続は `Failed`（`25P02`）にならず、次のメッセージを処理できる。
+    send_simple_query(&mut stream, "SELECT id FROM documents LIMIT 10");
+    let _ = read_row_description(&mut stream);
+    let _ = read_data_row(&mut stream);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 }

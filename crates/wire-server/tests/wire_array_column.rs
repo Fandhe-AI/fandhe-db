@@ -139,9 +139,9 @@ fn wire_array_literal_exceeding_max_len_is_rejected_with_54000() {
     read_ready_for_query(&mut stream);
 }
 
-/// NULL 要素（引用なし）・閉じていない引用は `22000`（`InvalidInput`）。
+/// NULL 要素（引用なし）は機能未対応の `22000`、閉じていない引用は形式不正の `22P02`。
 #[test]
-fn wire_array_literal_format_violations_are_rejected_with_22000() {
+fn wire_array_literal_format_violations_are_rejected_with_expected_codes() {
     let (core, _guard) = new_core_with_array_table();
     let addrs = spawn_with_users(core, &[("alice", "tenant-alice", "pw-alice")]);
     let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
@@ -157,7 +157,7 @@ fn wire_array_literal_format_violations_are_rejected_with_22000() {
         &mut stream,
         r#"INSERT INTO docs (id, embedding, tags) VALUES (2, '[0.1,0.2]', '{"a}') USING OPERATION_ID 'op-2'"#,
     );
-    expect_error_response_with_sqlstate(&mut stream, "22000");
+    expect_error_response_with_sqlstate(&mut stream, "22P02");
     read_ready_for_query(&mut stream);
 }
 

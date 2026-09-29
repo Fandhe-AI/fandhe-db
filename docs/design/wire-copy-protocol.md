@@ -165,16 +165,21 @@
    `read_length_prefixed_body(stream, 4, 4)` で検証し `08P01` として
    fail-closed に拒否する（CopyDone・Terminate に既に課していた形状検査を
    本 2 種類にも揃えた）。
-7. **複数文メッセージ（WIRE-16・TASK-219）との関係**: `COPY` は 1 つの
-   `'Q'` メッセージ中で単独文でなければならない（`handshake::
-   post_auth_loop` が `is_copy_statement` をメッセージ全文へ適用してから
-   分岐するため）。末尾セミコロン 1 個は単一文と同じく許容されるが、
-   `COPY ...; <他の文>` は `validate_copy` の `expect_end_of_statement` が
-   余剰トークンとして検出し `42601` で拒否し（CopyIn／CopyOut サブ
-   プロトコルへは入らない）、`<他の文>; COPY ...` はメッセージ全文が
-   `COPY` で始まらないため `sql::statement_splitter` の複数文経路へ流れ、
-   `COPY` が `validate_sql` の許可形状に無いことから 2 文目の実行時に
-   `42601` で打ち切られる。いずれの形でも接続はデシンクしない
+7. **複数文メッセージ（WIRE-16・TASK-219）との関係（Issue #1175 で文単位へ変更）**:
+   `COPY` の判定は文単位（`simple_query::run_copy_statement`。`handshake::
+   post_auth_loop` は `'Q'` をすべて `simple_query::execute_and_respond` へ委譲する）。
+   - `<読み取りの文>; COPY t FROM STDIN ...`（書き込みが最後の 1 文）→ 逐次実行され、
+     前の文の応答、CopyIn、`COPY n`、`ReadyForQuery`（PostgreSQL と一致）。
+   - `COPY (SELECT ...) TO STDOUT; <他の文>`（`TO` は読み取りに分類）→ CopyOut、
+     `COPY n`、続きの文の応答、`ReadyForQuery`（PostgreSQL と一致。`copy::run` は
+     `Finish` を受け取り、途中の COPY では `ReadyForQuery` を送らない）。
+   - `COPY t FROM STDIN ...; <他の文>`・`<書き込み>; COPY t FROM STDIN ...` →
+     書き込みが最後以外にあるためメッセージ全体が暗黙トランザクションになり、
+     トランザクション内の COPY は未対応（`0A000`）。CopyIn へは入らず、暗黙
+     トランザクションは全体をロールバックして `ReadyForQuery('I')`。**既知の相違**:
+     PostgreSQL は COPY を受理するが、後続文のエラー時に COPY を巻き戻せないため
+     原子性を優先して拒否する（従来は `42601`）。
+   いずれの形でも接続はデシンクしない
    （`crates/wire-server/tests/wire17_copy.rs` の複数文相互作用テスト参照）。
 
 ## 対象ファイル

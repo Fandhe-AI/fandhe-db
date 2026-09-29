@@ -43,9 +43,9 @@ pub enum TypedJsonError {
     /// 維持する（`docs/design/nosql-typed-json-binding.md`「TEXT/VECTOR の
     /// 22000 非対称」節参照。表層内の非対称はオーナー確認事項）。
     LegacyMismatch(&'static str),
-    /// `BYTEA` 列の値が base64 の JSON string でない、または不正な base64
-    /// （`42601`）。
-    InvalidBytea(&'static str),
+    /// `BYTEA` 列の値が base64 として不正（`22P02`。Issue #1187）。JSON string
+    /// 以外が渡された種別不一致は [`TypedJsonError::TypeMismatch`]（`42601`）。
+    InvalidByteaText(&'static str),
     /// `BYTEA` 列の base64 値が復号後 [`engine::bytea::MAX_BYTEA_FIELD_LEN`] を
     /// 超える（`54000`）。
     ByteaTooLarge,
@@ -65,7 +65,7 @@ impl ClassifiedError for TypedJsonError {
         match self {
             TypedJsonError::TypeMismatch(_) => ErrorClass::UnsupportedSqlSyntax,
             TypedJsonError::LegacyMismatch(_) => ErrorClass::InvalidInput,
-            TypedJsonError::InvalidBytea(_) => ErrorClass::UnsupportedSqlSyntax,
+            TypedJsonError::InvalidByteaText(_) => ErrorClass::InvalidTextRepresentation,
             TypedJsonError::ByteaTooLarge => ErrorClass::PayloadTooLarge,
             TypedJsonError::InvalidJson(_) => ErrorClass::UnsupportedSqlSyntax,
             TypedJsonError::JsonTooLarge => ErrorClass::PayloadTooLarge,
@@ -78,7 +78,7 @@ impl ClassifiedError for TypedJsonError {
         match self {
             TypedJsonError::TypeMismatch(detail) => detail.to_string(),
             TypedJsonError::LegacyMismatch(detail) => detail.to_string(),
-            TypedJsonError::InvalidBytea(detail) => detail.to_string(),
+            TypedJsonError::InvalidByteaText(detail) => detail.to_string(),
             TypedJsonError::ByteaTooLarge => "BYTEA value exceeds the length limit".to_string(),
             TypedJsonError::InvalidJson(detail) => detail.to_string(),
             TypedJsonError::JsonTooLarge => "JSON value exceeds the length limit".to_string(),
@@ -104,7 +104,7 @@ impl TypedJsonError {
                 SqlSurfaceError::InvalidTextRepresentation { detail }
             }
             ErrorClass::InvalidInput => SqlSurfaceError::InvalidInput { detail },
-            // `UnsupportedSqlSyntax`（`TypeMismatch`／`InvalidBytea`／
+            // `UnsupportedSqlSyntax`（`TypeMismatch`／
             // `InvalidJson`）以外の分類はここには到達しない
             // （[`TypedJsonError::error_class`] の網羅から明らか）が、
             // fail-closed に保つため既定は `UnsupportedSyntax` とする。
@@ -234,7 +234,7 @@ pub fn bytea_literal_text(s: &str) -> Result<String, TypedJsonError> {
     let decoded = super::base64_std::decode_base64_std(s, engine::bytea::MAX_BYTEA_FIELD_LEN)
         .map_err(|e| match e {
             super::base64_std::Base64StdError::TooLong => TypedJsonError::ByteaTooLarge,
-            _ => TypedJsonError::InvalidBytea("BYTEA column value must be valid base64"),
+            _ => TypedJsonError::InvalidByteaText("invalid input syntax for type bytea (base64)"),
         })?;
     Ok(engine::bytea::format_hex_text(&decoded))
 }
@@ -314,22 +314,15 @@ pub fn map_json_to_literal(
             JsonValue::Number(n @ (JsonNumber::PosInt(_) | JsonNumber::NegInt(_))) => {
                 Ok(InsertLiteral::Number(number_literal_text(n)))
             }
-            // `u64`／`i64` に収まらない整数リテラル（小数点・指数部を含まない）
-            // は `engine::json::parse_number` が `JsonNumber::Float` へ
-            // フォールバックする（RFC 8259 上は依然として整数リテラルであり
-            // 小数とは区別できる。json.rs 内のコメント参照）。ここで小数・
-            // 指数部として弾くと本来 `22003`（範囲外）であるべき値まで
-            // `42601`（型不一致）にしてしまうため、`text` に `.`／`e`／`E` が
-            // 無い場合はそのまま生テキストを engine の整数束縛
-            // （`bind_integer_literal`）へ委譲し、範囲判定はそちらに任せる。
-            JsonValue::Number(n @ JsonNumber::Float { text, .. })
-                if !text.contains(['.', 'e', 'E']) =>
-            {
+            // `u64`／`i64` に収まらない整数リテラル（小数点・指数部を含まない）は
+            // `engine::json::parse_number` が `JsonNumber::Float` へフォールバック
+            // する。小数・指数表記（`1.5`・`1e3`）を含め、Float はすべて生テキストの
+            // まま engine の整数束縛（`bind_integer_literal`）へ委譲する: 範囲外は
+            // `22003`、整数として解析できない小数・指数表記は `22P02`（Issue #1187・
+            // NOSQL-17）。判定点を engine に一本化し、SQL 表層と分類を揃える。
+            JsonValue::Number(n @ JsonNumber::Float { .. }) => {
                 Ok(InsertLiteral::Number(number_literal_text(n)))
             }
-            JsonValue::Number(JsonNumber::Float { .. }) => Err(TypedJsonError::TypeMismatch(
-                "INTEGER/BIGINT column value must be a JSON integer number",
-            )),
             _ => Err(TypedJsonError::TypeMismatch(
                 "INTEGER/BIGINT column value must be a JSON number",
             )),
@@ -404,7 +397,7 @@ pub fn map_json_to_literal(
         },
         ColumnType::Bytea => match raw {
             JsonValue::String(s) => Ok(InsertLiteral::String(bytea_literal_text(s)?)),
-            _ => Err(TypedJsonError::InvalidBytea(
+            _ => Err(TypedJsonError::TypeMismatch(
                 "BYTEA column value must be a base64 JSON string",
             )),
         },
@@ -440,10 +433,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_float_for_integer_column() {
-        let err = map_json_to_literal(&col(ColumnType::Integer), &num("1.5")).expect_err("reject");
-        assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
-        assert_eq!(err.wire_code(), "42601");
+    fn passes_float_for_integer_column_to_engine_binding() {
+        // 小数・指数表記の拒否（`22P02`）は engine の `bind_integer_literal` が担う
+        // （Issue #1187。判定点の一本化）。
+        for raw in ["1.5", "1e3"] {
+            let lit = map_json_to_literal(&col(ColumnType::Integer), &num(raw)).expect("ok");
+            assert_eq!(lit, InsertLiteral::Number(raw.to_string()));
+        }
     }
 
     #[test]
