@@ -1826,6 +1826,10 @@ impl BoundPredicateDelete {
 /// 設定値。Issue #997）を実行結線（`sql/exec.rs::execute_predicate_delete`）が
 /// 呼び出し元から受け取り、変更開始前・副作用ゼロの時点で判定するため、本関数は
 /// 上限値を運搬しない。
+///
+/// `WHERE visible()` のみ（`metadata_filters`・`expr_filters`・`or_filters` が
+/// すべて空）は実質的な全行削除のため `42601` で拒否する（UPDATE と同契約。
+/// Issue #1181・SQL-19。全行削除は `TRUNCATE TABLE` の管轄）。
 pub fn bind_predicate_delete(
     stmt: &ValidatedPredicateDelete,
     schema: &TableSchema,
@@ -1835,6 +1839,17 @@ pub fn bind_predicate_delete(
 
     let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget, &[])?;
+
+    // Issue #1181・SQL-19: `WHERE visible()` のみ（全フィルタが空）は自テナント
+    // 全行削除と等価なため、UPDATE（`bind_update_form`）と同じ基準・同じ
+    // `42601` で拒否する。台帳照合・書き込みトランザクション開始より前の束縛段
+    // なので副作用ゼロ。`or_filters` を含めるのは `WHERE a OR b` を誤拒否しない
+    // ため（Issue #912）。
+    if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "predicate-form DELETE WHERE clause must contain at least one non-visible() predicate (unconditional DELETE is not supported; use TRUNCATE for whole-table operations)",
+        ));
+    }
 
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
@@ -6369,13 +6384,30 @@ mod tests {
     }
 
     #[test]
-    fn bind_predicate_delete_accepts_visible_predicate_without_producing_a_filter() {
-        let bound = bind_predicate_delete_sql(
+    fn bind_predicate_delete_rejects_visible_only_where() {
+        let err = bind_predicate_delete_sql(
             "DELETE FROM documents WHERE visible() USING OPERATION_ID 'op-0001'",
         )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_predicate_delete_rejects_visible_twice() {
+        let err = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE visible() AND visible() USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn bind_predicate_delete_accepts_visible_combined_with_predicate() {
+        let bound = bind_predicate_delete_sql(
+            "DELETE FROM documents WHERE visible() AND lang = 'ja' USING OPERATION_ID 'op-0001'",
+        )
         .expect("bind_predicate_delete should succeed");
-        assert!(bound.metadata_filters.is_empty());
-        assert!(bound.expr_filters.is_empty());
+        assert_eq!(bound.metadata_filters.len(), 1);
     }
 
     #[test]

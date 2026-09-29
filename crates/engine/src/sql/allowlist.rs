@@ -11598,7 +11598,7 @@ mod tests {
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect("visible() predicate DELETE should be accepted (scan/aggregate と同じく受理のみ)");
+        .expect("visible() predicate DELETE is accepted structurally (bind stage rejects visible()-only with 42601)");
         assert!(matches!(stmt, DeleteStatement::Predicate(_)));
     }
 

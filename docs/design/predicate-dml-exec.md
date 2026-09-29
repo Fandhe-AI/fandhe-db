@@ -131,10 +131,9 @@ execute_scan` の走査ループと同一の意味論（`declarative_filter::mat
   一切依存しない）。超過時は `TenantWriteError::TooManyRowsScanned`
   （`54000`）で副作用ゼロ（`write_txn` を commit せず破棄）のまま終端する。
 
-`WHERE visible() のみ` の述語つき DELETE は #870 の既存決定（自テナント全行を候補
-にする。歯止めは影響行数上限のみ）をそのまま継承し、本 Issue で再決定していない
-（`docs/design/delete-predicate-form.md`「記録する判断」節参照）。述語つき UPDATE の
-`WHERE visible() のみ` は #869 の既存契約どおり束縛段で `42601` のまま。
+`WHERE visible() のみ` の述語つき DELETE は、Issue #1181 で UPDATE（#869 の既存
+契約）と同じく束縛段（`bind_predicate_delete`）で `42601` 拒否に統一した（全行削除は
+`TRUNCATE TABLE` の管轄。`docs/design/delete-predicate-form.md`「記録する判断」節参照）。
 
 ## 5. エラー優先順位
 
@@ -317,7 +316,7 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
 - `crates/engine/tests/sql_predicate_dml_exec.rs`: 候補列挙・応答件数の同値性
   （DELETE／UPDATE）・RLS 境界（他テナント行の非影響・非漏えい）・0 行一致の台帳
   記録と再送拒否・内容照合ハッシュ（述語順入替での `22023`）・`WHERE visible()`
-  のみの DELETE・`operation_id` 欠落・`execute_sql`（セッション無し）の既存拒否・
+  のみの DELETE の拒否（`42601`・副作用ゼロ）・`operation_id` 欠落・`execute_sql`（セッション無し）の既存拒否・
   既定（`--max-dml-affected-rows` 未指定＝上限なし）で旧既定値（1,000）超の
   一致でも成功すること（BREAKING CHANGE の外部観測。DELETE 側
   `predicate_delete_default_has_no_affected_rows_cap`・UPDATE 側
