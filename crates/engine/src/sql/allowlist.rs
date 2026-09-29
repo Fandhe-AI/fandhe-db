@@ -4133,7 +4133,7 @@ impl<'a> Parser<'a> {
                     match crate::datetime::parse_date(&literal) {
                         Ok(days) => Ok(Expr::DateLiteral(days)),
                         Err(DateTimeLiteralError::Format(detail)) => {
-                            Err(SqlSurfaceError::invalid_input(detail))
+                            Err(SqlSurfaceError::invalid_datetime_format(detail))
                         }
                         Err(DateTimeLiteralError::Overflow(detail)) => {
                             Err(SqlSurfaceError::datetime_field_overflow(detail))
@@ -4143,7 +4143,7 @@ impl<'a> Parser<'a> {
                     match crate::datetime::parse_timestamp(&literal) {
                         Ok(micros) => Ok(Expr::TimestampLiteral(micros)),
                         Err(DateTimeLiteralError::Format(detail)) => {
-                            Err(SqlSurfaceError::invalid_input(detail))
+                            Err(SqlSurfaceError::invalid_datetime_format(detail))
                         }
                         Err(DateTimeLiteralError::Overflow(detail)) => {
                             Err(SqlSurfaceError::datetime_field_overflow(detail))
