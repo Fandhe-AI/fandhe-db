@@ -174,7 +174,9 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 より結果が `PortalState::Suspended` として中断保持されうる（§6）。この
 中断保持分は wire-server 側が既にエンコード済みのフレームとして保持して
 おり、`CursorRegistry` の `Drop`（§1）とは寿命が独立している。名前付き
-portal は Sync（'S'）のたびにしか破棄されないため、同一 Sync サイクル
+portal は Sync（'S'）まで破棄されないため（明示トランザクション中は Sync 後も
+同世代の名前付き portal が保持され、トランザクション終了時に失効する。
+WIRE-11・Issue #1174。Sync 越し保持分もカーソル・世代の照合は同じ）、同一 Sync サイクル
 （`BEGIN` → `DECLARE` → `FETCH`（一部だけ Execute で中断保持）→ `CLOSE`／
 `COMMIT`／`ROLLBACK` → 再 Execute）の中では、修正前は中断保持分がカーソル・
 トランザクションの終了を一切確認せずにそのまま送出できてしまっていた
