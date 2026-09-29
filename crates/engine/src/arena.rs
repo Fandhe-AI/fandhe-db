@@ -593,7 +593,7 @@ impl SqlArenaCaptureBuilder {
 /// 避けるため）。呼び出し元が単一の `read_txn` 上でスキーマ取得・行走査を行う契約は
 /// 呼び出し元側の責務（本関数はスキーマ取得のみ行う）。
 pub(crate) fn validated_vector_dim_in_txn(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<u32> {
     let schema = catalog::get_table_schema_in_txn(read_txn, table_name)?;
@@ -833,7 +833,7 @@ impl VectorArena {
     /// （`Storage` から新規に `read_txn` を開く版）と異なり、本関数はトランザクションを
     /// 開始しない。
     pub(crate) fn build_filtered_with_rows_in_txn<F, G>(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
         predicate: F,
         on_visible_row: G,
@@ -859,7 +859,7 @@ impl VectorArena {
     /// 通過した行ごとに必ず 1 回呼ばれる（[`Self::build_filtered_with_rows_and_limits_in_txn_capturing`]
     /// のドキュメント参照）。
     pub(crate) fn build_filtered_with_rows_in_txn_capturing<F, G>(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
         predicate: F,
         on_visible_row: G,
@@ -1137,7 +1137,7 @@ impl VectorArena {
     /// （契約は「呼び出し元が bind に使ったスキーマと同一の `read_txn` を渡すこと」。
     /// `core.rs::EngineCore::execute_sql` のドキュメント参照）。
     fn build_filtered_with_rows_and_limits_in_txn<F, G>(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
         predicate: F,
         on_visible_row: G,
@@ -1173,7 +1173,7 @@ impl VectorArena {
     /// 発生しない。`rls_capture` が `Err` を返した場合はアリーナ構築全体を
     /// fail-closed に拒否する（`on_visible_row` と同じ契約）。
     fn build_filtered_with_rows_and_limits_in_txn_capturing<F, G>(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         table_name: &str,
         mut predicate: F,
         mut on_visible_row: G,

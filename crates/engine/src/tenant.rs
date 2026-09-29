@@ -417,11 +417,15 @@ fn convert_write_txn_err(e: StorageError) -> TenantWriteError {
 /// `Autocommit` として [`Storage::begin_write_txn`] 経由で新規トランザクションを
 /// 開いて 1 文ごとに commit する。
 ///
-/// 現時点で `InTxn` を受理するのは [`insert_row_unchecked`]・
-/// [`insert_rows_unchecked`]・[`insert_typed_row_unchecked`]・
-/// [`truncate_table_unchecked`] の 4 経路のみ（`docs/design/explicit-transaction.md`
-/// 参照。他の書き込み系 API は明示トランザクション内では `0A000` で拒否され、
-/// 本 enum に到達しない）。
+/// `InTxn` を受理するのは、行を書き換える全 `*_unchecked` 経路（単一行・複数行の
+/// `INSERT`・UPSERT・`UPDATE`〔単一行・述語形〕・`DELETE`〔単一行・述語形〕・
+/// `TRUNCATE`。Issue #1179）。例外は [`replace_typed_rows_by_text_key`]（ファイル形
+/// `INSERT`。埋め込み I/O を単一ライタの保持中に行うことになるため autocommit 専用の
+/// まま。明示トランザクション内では `core.rs` が `0A000` で拒否する）。
+///
+/// 連鎖適用（参照アクション）で書き換わる子テーブルも同じ `write_txn` へ書き込まれ、
+/// テーブル世代が bump される（`SessionTransaction::dirty_tables` が世代の変化から
+/// 検出する）。
 pub(crate) enum WriteTarget<'a> {
     Autocommit(&'a Storage),
     InTxn(&'a redb::WriteTransaction),
@@ -441,16 +445,19 @@ impl<'a> WriteTarget<'a> {
     /// グローバル世代が進み、世代で失効するキャッシュを無駄に捨ててしまうため
     /// （main の `insert_rows_unchecked` が空バッチで commit 前に早期 return
     /// していた挙動を保つ。PR #1041 レビュー指摘）。
-    fn with_txn<T>(
+    fn with_txn<T, Er: From<TenantWriteError>>(
         &self,
-        f: impl FnOnce(&redb::WriteTransaction) -> Result<(T, TxnEffect), TenantWriteError>,
-    ) -> Result<T, TenantWriteError> {
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<(T, TxnEffect), Er>,
+    ) -> Result<T, Er> {
         match self {
             WriteTarget::Autocommit(storage) => {
-                let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
+                let write_txn = storage
+                    .begin_write_txn()
+                    .map_err(|e| Er::from(convert_write_txn_err(e)))?;
                 let (value, effect) = f(&write_txn)?;
                 match effect {
-                    TxnEffect::Wrote => crate::recovery::commit_boundary::commit(write_txn)?,
+                    TxnEffect::Wrote => crate::recovery::commit_boundary::commit(write_txn)
+                        .map_err(|e| Er::from(TenantWriteError::from(e)))?,
                     // 何も書いていないため drop（abort）で閉じ、世代を進めない。
                     TxnEffect::NoOp => drop(write_txn),
                 }
@@ -464,7 +471,8 @@ impl<'a> WriteTarget<'a> {
     /// （`constraint::FkCheckMode`。TABLE-17・TASK-205、Issue #1077）。
     /// `Autocommit`（1 文＝1 トランザクション）は `INITIALLY DEFERRED` の
     /// 宣言でも必ず文単位で検査する（`All`）。`InTxn`（明示トランザクション。
-    /// 上記 4 経路のみ）は `INITIALLY DEFERRED` の FK を文単位検査から除外し
+    /// `replace_typed_rows_by_text_key` を除く全書き込み経路）は
+    /// `INITIALLY DEFERRED` の FK を文単位検査から除外し
     /// （`ImmediateOnly`）、COMMIT 時
     /// （`constraint::enforce_deferred_foreign_keys_in_txn`）へ先送りする。
     fn fk_check_mode(&self) -> crate::constraint::FkCheckMode {
@@ -1234,7 +1242,7 @@ pub(crate) fn insert_typed_row_unchecked(
 /// 詳細・不一致時の TOCTOU シナリオは [`insert_typed_row_unchecked`] の
 /// ドキュメント参照。
 pub(crate) fn insert_typed_rows_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     visibility: crate::storage::Visibility,
@@ -1261,127 +1269,127 @@ pub(crate) fn insert_typed_rows_unchecked(
         }
     }
 
-    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
-        if let Some(expected) = expected_schema {
-            if expected != &schema {
-                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table schema changed after the insert values were bound".to_string(),
-                )));
+    target.with_txn(|write_txn| {
+        {
+            let schema = require_table_schema_write(write_txn, table)?;
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "table schema changed after the insert values were bound".to_string(),
+                    )));
+                }
             }
-        }
-        // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
-        // （`insert_typed_row_unchecked` と同じ設計。読み取り側の dim==0 モデルと整合）。
-        let vector_idx = schema
-            .columns
-            .iter()
-            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
-
-        // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
-        // 事前に組み立てる（`for_typed_insert_batch` ドキュメント参照）。列名付き
-        // ペア列は行ごとに新規確保するため、[`content_hash::TypedInsertBatchRow`]
-        // （スライス版）ではなく `Vec` を保持する中間型を使う
-        // （`clippy::type_complexity` 回避のためのエイリアス）。
-        type HashRow<'a> = (
-            u64,
-            crate::storage::Visibility,
-            &'a [f32],
-            Vec<(&'a str, &'a crate::row_codec::Value)>,
-        );
-        let mut hash_rows: Vec<HashRow<'_>> = Vec::new();
-        hash_rows.try_reserve_exact(rows.len()).map_err(|_| {
-            TenantWriteError::Storage(StorageError::Codec(
-                "failed to reserve batch hash input".to_string(),
-            ))
-        })?;
-        for (id, values) in rows {
-            let embedding: &[f32] = match vector_idx {
-                Some(idx) => match values.get(idx) {
-                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                    _ => {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "VECTOR column value missing or not a Vector".to_string(),
-                        )))
-                    }
-                },
-                None => &[],
-            };
-            schema.validate_row_embedding_dim(embedding.len())?;
-            let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+            // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
+            // （`insert_typed_row_unchecked` と同じ設計。読み取り側の dim==0 モデルと整合）。
+            let vector_idx = schema
                 .columns
                 .iter()
-                .enumerate()
-                .filter(|(idx, column)| {
-                    Some(*idx) != vector_idx
-                        && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
-                })
-                .filter_map(|(idx, column)| {
-                    values.get(idx).map(|value| (column.name.as_str(), value))
-                })
-                .collect();
-            hash_rows.push((*id, visibility, embedding, named_columns));
-        }
-        let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
-            .iter()
-            .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
-            .collect();
-        let content_hash = content_hash::for_typed_insert_batch(&hash_input)?;
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-        )?;
+                .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
 
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-        for (id, values) in rows {
-            let embedding: &[f32] = match vector_idx {
-                Some(idx) => match values.get(idx) {
-                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                    _ => {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "VECTOR column value missing or not a Vector".to_string(),
-                        )))
-                    }
-                },
-                None => &[],
-            };
-            let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
-                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-            let row = RowInput {
-                tenant_id: ctx.tenant_id(),
-                visibility,
-                embedding,
-                metadata: &metadata,
-            };
-            let key = (ctx.tenant_id(), *id);
-            let encoded = encode_row(&row)?;
-            insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+            // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
+            // 事前に組み立てる（`for_typed_insert_batch` ドキュメント参照）。列名付き
+            // ペア列は行ごとに新規確保するため、[`content_hash::TypedInsertBatchRow`]
+            // （スライス版）ではなく `Vec` を保持する中間型を使う
+            // （`clippy::type_complexity` 回避のためのエイリアス）。
+            type HashRow<'a> = (
+                u64,
+                crate::storage::Visibility,
+                &'a [f32],
+                Vec<(&'a str, &'a crate::row_codec::Value)>,
+            );
+            let mut hash_rows: Vec<HashRow<'_>> = Vec::new();
+            hash_rows.try_reserve_exact(rows.len()).map_err(|_| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "failed to reserve batch hash input".to_string(),
+                ))
+            })?;
+            for (id, values) in rows {
+                let embedding: &[f32] = match vector_idx {
+                    Some(idx) => match values.get(idx) {
+                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                        _ => {
+                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                "VECTOR column value missing or not a Vector".to_string(),
+                            )))
+                        }
+                    },
+                    None => &[],
+                };
+                schema.validate_row_embedding_dim(embedding.len())?;
+                let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, column)| {
+                        Some(*idx) != vector_idx
+                            && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                    })
+                    .filter_map(|(idx, column)| {
+                        values.get(idx).map(|value| (column.name.as_str(), value))
+                    })
+                    .collect();
+                hash_rows.push((*id, visibility, embedding, named_columns));
+            }
+            let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
+                .iter()
+                .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                .collect();
+            let content_hash = content_hash::for_typed_insert_batch(&hash_input)?;
+            ledger::record_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                &content_hash,
+            )?;
+
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            for (id, values) in rows {
+                let embedding: &[f32] = match vector_idx {
+                    Some(idx) => match values.get(idx) {
+                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                        _ => {
+                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                "VECTOR column value missing or not a Vector".to_string(),
+                            )))
+                        }
+                    },
+                    None => &[],
+                };
+                let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                let row = RowInput {
+                    tenant_id: ctx.tenant_id(),
+                    visibility,
+                    embedding,
+                    metadata: &metadata,
+                };
+                let key = (ctx.tenant_id(), *id);
+                let encoded = encode_row(&row)?;
+                insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+            }
         }
-    }
-    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
-    // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
-    // ドキュメント参照）。
-    {
-        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
-        let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-        crate::constraint::enforce_row_constraints_in_txn(
-            &write_txn,
-            table,
-            &schema_for_pk,
-            ctx.tenant_id(),
-            &ids,
-            crate::constraint::FkCheckMode::All,
-        )?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
+        // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
+        // ドキュメント参照）。
+        {
+            let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+            let schema_for_pk = require_table_schema_write(write_txn, table)?;
+            crate::constraint::enforce_row_constraints_in_txn(
+                write_txn,
+                table,
+                &schema_for_pk,
+                ctx.tenant_id(),
+                &ids,
+                target.fk_check_mode(),
+            )?;
+        }
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok(((), TxnEffect::Wrote))
+    })
 }
 
 /// [`upsert_typed_rows_unchecked`] の `DO UPDATE SET` 右辺（SQL-20・TASK-193、
@@ -1469,7 +1477,7 @@ pub(crate) struct UpsertOutcome {
 /// `22000` で拒否）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upsert_typed_rows_unchecked(
-    storage: &Storage,
+    write_target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     insert_visibility: crate::storage::Visibility,
@@ -1480,7 +1488,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     upsert_typed_rows_impl(
-        storage,
+        write_target,
         table,
         ctx,
         insert_visibility,
@@ -1502,7 +1510,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
 /// execute_upsert_returning` の唯一の到達経路。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upsert_typed_rows_capturing_unchecked(
-    storage: &Storage,
+    write_target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     insert_visibility: crate::storage::Visibility,
@@ -1514,7 +1522,7 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
     upsert_typed_rows_impl(
-        storage,
+        write_target,
         table,
         ctx,
         insert_visibility,
@@ -1531,7 +1539,7 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
 /// 共有実体（`project: None` は前者とビット同一）。
 #[allow(clippy::too_many_arguments)]
 fn upsert_typed_rows_impl(
-    storage: &Storage,
+    write_target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     insert_visibility: crate::storage::Visibility,
@@ -1593,368 +1601,41 @@ fn upsert_typed_rows_impl(
         }
     }
 
-    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-    let mut inserted: u64 = 0;
-    let mut updated: u64 = 0;
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
-        if let Some(expected) = expected_schema {
-            if expected != &schema {
-                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table schema changed after the insert values were bound".to_string(),
-                )));
+    write_target.with_txn(|write_txn| {
+        let mut inserted: u64 = 0;
+        let mut updated: u64 = 0;
+        {
+            let schema = require_table_schema_write(write_txn, table)?;
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "table schema changed after the insert values were bound".to_string(),
+                    )));
+                }
             }
-        }
-        // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
-        // （`insert_typed_rows_unchecked` と同じ設計。読み取り側の dim==0 モデルと整合）。
-        let vector_idx = schema
-            .columns
-            .iter()
-            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
-
-        // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
-        // 事前に組み立てる（`insert_typed_rows_unchecked` と同じ構造。`content_hash::
-        // for_typed_upsert` ドキュメント参照）。
-        type HashRow<'a> = (
-            u64,
-            crate::storage::Visibility,
-            &'a [f32],
-            Vec<(&'a str, &'a crate::row_codec::Value)>,
-        );
-        let mut hash_rows: Vec<HashRow<'_>> = Vec::new();
-        hash_rows.try_reserve_exact(rows.len()).map_err(|_| {
-            TenantWriteError::Storage(StorageError::Codec(
-                "failed to reserve upsert batch hash input".to_string(),
-            ))
-        })?;
-        for (id, values) in rows {
-            let embedding: &[f32] = match vector_idx {
-                Some(idx) => match values.get(idx) {
-                    Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
-                    _ => {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "VECTOR column value missing or not a Vector".to_string(),
-                        )))
-                    }
-                },
-                None => &[],
-            };
-            schema.validate_row_embedding_dim(embedding.len())?;
-            let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+            // Issue #995: `VECTOR` 列を持たないスキーマでは embedding を空のまま扱う
+            // （`insert_typed_rows_unchecked` と同じ設計。読み取り側の dim==0 モデルと整合）。
+            let vector_idx = schema
                 .columns
                 .iter()
-                .enumerate()
-                .filter(|(idx, column)| {
-                    Some(*idx) != vector_idx
-                        && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
-                })
-                .filter_map(|(idx, column)| {
-                    values.get(idx).map(|value| (column.name.as_str(), value))
-                })
-                .collect();
-            hash_rows.push((*id, insert_visibility, embedding, named_columns));
-        }
-        let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
-            .iter()
-            .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
-            .collect();
+                .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)));
 
-        // `UpsertAction::DoUpdate` の右辺をハッシュ材料の最小表現へ変換する
-        // （宣言順を保持。`content_hash::UpsertHashAction::DoUpdate` が参照を
-        // 借用するため、`hash_assignments` は `match` の外側で寿命を確保する）。
-        let mut hash_assignments: Vec<(String, content_hash::UpsertAssignmentHashValue<'_>)> =
-            Vec::new();
-        if let UpsertAction::DoUpdate(assignments) = action {
-            hash_assignments
-                .try_reserve_exact(assignments.len())
-                .map_err(|_| {
-                    TenantWriteError::Storage(StorageError::Codec(
-                        "failed to reserve upsert hash assignments".to_string(),
-                    ))
-                })?;
-            for (col_idx, value) in assignments.iter() {
-                let col_name = schema
-                    .columns
-                    .get(*col_idx)
-                    .map(|c| c.name.as_str())
-                    .ok_or_else(|| {
-                        TenantWriteError::Catalog(CatalogError::Invalid(
-                            "unknown SET target column index".to_string(),
-                        ))
-                    })?;
-                let hash_value = match value {
-                    UpsertSetValue::Excluded(src_idx) => {
-                        let src_name = schema
-                            .columns
-                            .get(*src_idx)
-                            .map(|c| c.name.as_str())
-                            .ok_or_else(|| {
-                                TenantWriteError::Catalog(CatalogError::Invalid(
-                                    "unknown EXCLUDED source column index".to_string(),
-                                ))
-                            })?;
-                        content_hash::UpsertAssignmentHashValue::Excluded(src_name)
-                    }
-                    UpsertSetValue::Literal(v) => {
-                        content_hash::UpsertAssignmentHashValue::Literal(v)
-                    }
-                };
-                hash_assignments.push((col_name.to_string(), hash_value));
-            }
-        }
-        let hash_action = match action {
-            UpsertAction::DoNothing => content_hash::UpsertHashAction::DoNothing,
-            UpsertAction::DoUpdate(_) => {
-                content_hash::UpsertHashAction::DoUpdate(&hash_assignments)
-            }
-        };
-        // UNIQUE 対象の列名（解決した制約の宣言順。`target` の `indices` と同じ
-        // 並び）を `content_hash::for_typed_upsert` へ渡す（Issue #1074）。
-        let hash_target_columns: Vec<&str> = match target {
-            UpsertTarget::RowId => Vec::new(),
-            UpsertTarget::Unique(indices) => indices
-                .iter()
-                .map(|&idx| {
-                    schema
-                        .columns
-                        .get(idx)
-                        .map(|c| c.name.as_str())
-                        .ok_or_else(|| {
-                            TenantWriteError::Catalog(CatalogError::Invalid(
-                                "internal: ON CONFLICT target column index out of range"
-                                    .to_string(),
-                            ))
-                        })
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        let hash_target = match target {
-            UpsertTarget::RowId => content_hash::UpsertHashTarget::RowId,
-            UpsertTarget::Unique(_) => content_hash::UpsertHashTarget::Unique(&hash_target_columns),
-        };
-        let content_hash_value =
-            content_hash::for_typed_upsert(&hash_target, &hash_action, &hash_input)?;
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash_value,
-        )?;
-
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-
-        // UNIQUE 対象（Issue #1074）は書き込み**前**のスナップショットで対象
-        // テナントの既存行を 1 回だけ走査し、対象キー → 既存行 id の対応表を
-        // 作る（`docs/design/sql-upsert.md`「衝突判定スコープ」節。可視性を
-        // 問わない全行が母集合。`row_table` はまだ本文で 1 行も書き込んでいない
-        // ためこの時点のスキャンが「この文の書き込みより前」の状態と一致する）。
-        let unique_existing: Option<std::collections::HashMap<Vec<u8>, u64>> = match target {
-            UpsertTarget::RowId => None,
-            UpsertTarget::Unique(indices) => {
-                Some(crate::constraint::scan_tenant_rows_by_unique_key(
-                    &row_table,
-                    &schema,
-                    ctx.tenant_id(),
-                    indices,
-                )?)
-            }
-        };
-
-        // 主キー制約検査（下記ブロック終端）の対象 id。`DO NOTHING` で実際には
-        // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
-        // `constraint.rs` モジュールドキュメント参照）。
-        let mut written_ids: Vec<u64> = Vec::new();
-        // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
-        // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
-        // 積む（新規挿入行は「更新」ではないため対象外）。
-        let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
-        for (id, values) in rows {
-            // 衝突判定の対象行 id を対象ごとに決定する（Issue #1074）。`(id)`
-            // 対象は常に VALUES 自身の `id` で判定する（既存挙動、無変更）。
-            // UNIQUE 対象は上記の事前走査で一致した既存行の `id` を使う（対象
-            // キーに NULL を含む行・未一致はいずれも非衝突＝新規挿入分岐へ）。
-            let conflict_id: Option<u64> = match target {
-                UpsertTarget::RowId => Some(*id),
-                UpsertTarget::Unique(indices) => {
-                    crate::constraint::unique_key_from_values(indices, values)
-                        .map_err(|m| {
-                            TenantWriteError::Catalog(CatalogError::Invalid(m.to_string()))
-                        })?
-                        .and_then(|key| unique_existing.as_ref().and_then(|m| m.get(&key).copied()))
-                }
-            };
-            // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
-            // （`insert`）と衝突しないようにする（`update_row_unchecked` と
-            // 同じパターン）。所有権判定は `decode_row_for_key`（キー↔ヘッダ
-            // tenant 整合検査。TABLE-12）＋ `ctx.is_owner` の二重防御。
-            let existing_owned: Option<crate::storage::Row> = match conflict_id {
-                Some(cid) => match row_table
-                    .get(&(ctx.tenant_id(), cid))
-                    .map_err(CatalogError::from)?
-                {
-                    Some(guard) => {
-                        let row =
-                            crate::storage::decode_row_for_key(ctx.tenant_id(), cid, guard.value())
-                                .map_err(TenantWriteError::Storage)?;
-                        Some(row)
-                    }
-                    None => None,
-                },
-                None => None,
-            };
-            let owns_existing = existing_owned
-                .as_ref()
-                .map(|row| ctx.is_owner(row.tenant_id.as_str()))
-                .unwrap_or(false);
-
-            if owns_existing {
-                // `owns_existing` が真になり得るのは `conflict_id` が `Some`
-                // の場合のみ（`existing_owned` の構築規則）であり、以降の
-                // 分岐は常に `Some` の中身（衝突した既存行の id）を使う。
-                let write_id = match conflict_id {
-                    Some(cid) => cid,
-                    None => {
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "internal: owns_existing without a conflict id".to_string(),
-                        )));
-                    }
-                };
-                let key = (ctx.tenant_id(), write_id);
-                let existing = match existing_owned {
-                    Some(row) => row,
-                    None => {
-                        // `owns_existing` は `existing_owned.is_some()` の場合に
-                        // のみ真になり得ない（`unwrap_or(false)` の契約）ため
-                        // 到達しない。untrusted 経路の添字禁止（coding-rust.md）
-                        // に従い `unwrap` の代わりに fail-closed な内部エラーで
-                        // 閉じる。
-                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                            "internal: owns_existing without an existing row".to_string(),
-                        )));
-                    }
-                };
-                match action {
-                    UpsertAction::DoNothing => {
-                        // 変更なし（新規挿入もしない）。
-                    }
-                    UpsertAction::DoUpdate(assignments) => {
-                        // read-merge-write: 既存行のスカラー列を復元し、SET 対象
-                        // 列だけを新しい値で上書きする（宣言順を保持する必要は
-                        // ない——最終的な行内容は適用順に依存しない一意な値へ
-                        // 収束する。同一列への重複代入は `bind_upsert_assignments`
-                        // が束縛時に `22000` で拒否済み）。
-                        let mut merged_values =
-                            crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
-                                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                        // 書き換える前の全列値を ON UPDATE 連鎖の pre-image として
-                        // 積む（Issue #1076）。UNIQUE 対象の衝突では実際に書き換える
-                        // 既存行が VALUES 自身の `id`（`*id`）と異なり得るため、必ず
-                        // 衝突判定で確定した `write_id` をキーに記録する（`*id` で
-                        // 記録すると、連鎖側の `collect_action_targets` が入力 id で
-                        // 親行を読み直して新キーを取得できず、`ON UPDATE CASCADE` 等が
-                        // 発火せず参照元行が残留し `23503` で失敗する。codex/review・
-                        // cursor bugbot 指摘）。`id` 参照 FK は ON UPDATE で発火しない
-                        // （A7）ため、主キー・UNIQUE を宣言しないテーブルは複製コストを
-                        // 払わない（早期 return と同じ判定条件）。
-                        if schema.primary_key().is_some() || !schema.unique_constraints().is_empty()
-                        {
-                            pre_images.record(write_id, merged_values.clone());
-                        }
-                        let mut embedding_value: Vec<f32> = existing.embedding.clone();
-
-                        for (col_idx, value) in assignments.iter() {
-                            // `src_idx`／`col_idx` は束縛時点のスキーマ（`bind_upsert_assignments`）
-                            // が `schema.columns` に対して検証済みの位置インデックスであり、
-                            // `expected_schema` 照合（`Some` の場合。呼び出し元
-                            // `sql::exec::execute_upsert` ドキュメント参照）によって
-                            // 本 write トランザクション内の `schema` と一致することが
-                            // 保証されている。したがって範囲外・型不一致はいずれも
-                            // 到達しないはずの内部不変条件違反であり、値を黙って
-                            // `Null` へ差し替えたり SET を無視したりせず fail-closed に
-                            // 拒否する（cursor bugbot 指摘・PR #990。黙って無視すると
-                            // `updated` カウント・テーブル世代だけが進み、実際には
-                            // 適用されなかった SET が適用されたかのような不整合が
-                            // 生じる）。
-                            let new_value = match value {
-                                UpsertSetValue::Excluded(src_idx) => {
-                                    values.get(*src_idx).cloned().ok_or_else(|| {
-                                        CatalogError::Invalid(
-                                            "internal: EXCLUDED source column index out of range"
-                                                .to_string(),
-                                        )
-                                    })?
-                                }
-                                UpsertSetValue::Literal(v) => (*v).clone(),
-                            };
-                            if Some(*col_idx) == vector_idx {
-                                match new_value {
-                                    crate::row_codec::Value::Vector(v) => embedding_value = v,
-                                    _ => {
-                                        return Err(TenantWriteError::Catalog(
-                                            CatalogError::Invalid(
-                                                "VECTOR column SET value must be a vector"
-                                                    .to_string(),
-                                            ),
-                                        ))
-                                    }
-                                }
-                            } else {
-                                let slot = merged_values.get_mut(*col_idx).ok_or_else(|| {
-                                    CatalogError::Invalid(
-                                        "internal: SET target column index out of range"
-                                            .to_string(),
-                                    )
-                                })?;
-                                *slot = new_value;
-                            }
-                        }
-                        schema.validate_row_embedding_dim(embedding_value.len())?;
-                        let metadata =
-                            crate::row_codec::encode_scalar_columns(&schema, &merged_values)
-                                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                        let row = RowInput {
-                            tenant_id: ctx.tenant_id(),
-                            // 既存行の可視性を保持する（SET で触れない列と同じ
-                            // 扱い。新規挿入行のみ `insert_visibility` を使う）。
-                            visibility: existing.visibility,
-                            embedding: &embedding_value,
-                            metadata: &metadata,
-                        };
-                        let encoded = encode_row(&row)?;
-                        row_table
-                            .insert(key, encoded.as_slice())
-                            .map_err(CatalogError::from)?;
-                        // `RETURNING`（Issue #1182）: 更新後の値を投影する。
-                        if let Some(project) = project.as_mut() {
-                            let values =
-                                captured_values_from_parts(&schema, embedding_value, &metadata)?;
-                            project(&CapturedRow {
-                                id: write_id,
-                                tenant_id: ctx.tenant_id().to_string(),
-                                visibility: existing.visibility,
-                                values,
-                            })?;
-                        }
-                        updated = updated.checked_add(1).ok_or_else(|| {
-                            TenantWriteError::Storage(StorageError::Codec(
-                                "upsert updated row counter overflow".to_string(),
-                            ))
-                        })?;
-                        written_ids.push(write_id);
-                    }
-                }
-            } else {
-                // 非衝突（新規挿入）。VALUES 自身の `id` を書き込み先の物理キーに
-                // 使う（対象に関わらず不変。UNIQUE 対象で同じ `id` を持つ既存行が
-                // 既にあれば `insert_unique_row` が `IdConflict`〔`23505`〕で
-                // 拒否する——PostgreSQL の「arbiter でない制約の違反は吸収しない」
-                // 挙動と同じ）。既存 `insert_typed_rows_unchecked` と同じ組み立て
-                // （Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
-                let key = (ctx.tenant_id(), *id);
+            // ハッシュ材料（`(id, visibility, embedding, 列名付きペア列)`）を要求記載順で
+            // 事前に組み立てる（`insert_typed_rows_unchecked` と同じ構造。`content_hash::
+            // for_typed_upsert` ドキュメント参照）。
+            type HashRow<'a> = (
+                u64,
+                crate::storage::Visibility,
+                &'a [f32],
+                Vec<(&'a str, &'a crate::row_codec::Value)>,
+            );
+            let mut hash_rows: Vec<HashRow<'_>> = Vec::new();
+            hash_rows.try_reserve_exact(rows.len()).map_err(|_| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "failed to reserve upsert batch hash input".to_string(),
+                ))
+            })?;
+            for (id, values) in rows {
                 let embedding: &[f32] = match vector_idx {
                     Some(idx) => match values.get(idx) {
                         Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
@@ -1966,84 +1647,425 @@ fn upsert_typed_rows_impl(
                     },
                     None => &[],
                 };
-                let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
-                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                let row = RowInput {
-                    tenant_id: ctx.tenant_id(),
-                    visibility: insert_visibility,
-                    embedding,
-                    metadata: &metadata,
-                };
-                let encoded = encode_row(&row)?;
-                insert_unique_row(&mut row_table, key, encoded.as_slice())?;
-                // `RETURNING`（Issue #1182）: 挿入した値を投影する。
-                if let Some(project) = project.as_mut() {
-                    let values =
-                        captured_values_from_parts(&schema, embedding.to_vec(), &metadata)?;
-                    project(&CapturedRow {
-                        id: *id,
-                        tenant_id: ctx.tenant_id().to_string(),
-                        visibility: insert_visibility,
-                        values,
-                    })?;
-                }
-                inserted = inserted.checked_add(1).ok_or_else(|| {
-                    TenantWriteError::Storage(StorageError::Codec(
-                        "upsert inserted row counter overflow".to_string(),
-                    ))
-                })?;
-                written_ids.push(*id);
+                schema.validate_row_embedding_dim(embedding.len())?;
+                let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, column)| {
+                        Some(*idx) != vector_idx
+                            && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                    })
+                    .filter_map(|(idx, column)| {
+                        values.get(idx).map(|value| (column.name.as_str(), value))
+                    })
+                    .collect();
+                hash_rows.push((*id, insert_visibility, embedding, named_columns));
             }
-        }
-        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
-        // 検査。行ストアの `mut row_table` ハンドルはこのブロックを抜けた
-        // 時点で解放されるため、その直前（同一ブロック内の最後）で読み取り
-        // ハンドルとして再度開く（`insert_row_unchecked` と異なり、ここは
-        // `row_table` を drop する前にまだブロック内にいるため、别途スコープを
-        // 切って再オープンする）。
-        if !written_ids.is_empty() {
-            drop(row_table);
-            let delta = crate::constraint::enforce_row_constraints_in_txn(
-                &write_txn,
-                table,
-                &schema,
+            let hash_input: Vec<content_hash::TypedInsertBatchRow<'_>> = hash_rows
+                .iter()
+                .map(|(id, vis, emb, cols)| (*id, *vis, *emb, cols.as_slice()))
+                .collect();
+
+            // `UpsertAction::DoUpdate` の右辺をハッシュ材料の最小表現へ変換する
+            // （宣言順を保持。`content_hash::UpsertHashAction::DoUpdate` が参照を
+            // 借用するため、`hash_assignments` は `match` の外側で寿命を確保する）。
+            let mut hash_assignments: Vec<(String, content_hash::UpsertAssignmentHashValue<'_>)> =
+                Vec::new();
+            if let UpsertAction::DoUpdate(assignments) = action {
+                hash_assignments
+                    .try_reserve_exact(assignments.len())
+                    .map_err(|_| {
+                        TenantWriteError::Storage(StorageError::Codec(
+                            "failed to reserve upsert hash assignments".to_string(),
+                        ))
+                    })?;
+                for (col_idx, value) in assignments.iter() {
+                    let col_name = schema
+                        .columns
+                        .get(*col_idx)
+                        .map(|c| c.name.as_str())
+                        .ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "unknown SET target column index".to_string(),
+                            ))
+                        })?;
+                    let hash_value = match value {
+                        UpsertSetValue::Excluded(src_idx) => {
+                            let src_name = schema
+                                .columns
+                                .get(*src_idx)
+                                .map(|c| c.name.as_str())
+                                .ok_or_else(|| {
+                                    TenantWriteError::Catalog(CatalogError::Invalid(
+                                        "unknown EXCLUDED source column index".to_string(),
+                                    ))
+                                })?;
+                            content_hash::UpsertAssignmentHashValue::Excluded(src_name)
+                        }
+                        UpsertSetValue::Literal(v) => {
+                            content_hash::UpsertAssignmentHashValue::Literal(v)
+                        }
+                    };
+                    hash_assignments.push((col_name.to_string(), hash_value));
+                }
+            }
+            let hash_action = match action {
+                UpsertAction::DoNothing => content_hash::UpsertHashAction::DoNothing,
+                UpsertAction::DoUpdate(_) => {
+                    content_hash::UpsertHashAction::DoUpdate(&hash_assignments)
+                }
+            };
+            // UNIQUE 対象の列名（解決した制約の宣言順。`target` の `indices` と同じ
+            // 並び）を `content_hash::for_typed_upsert` へ渡す（Issue #1074）。
+            let hash_target_columns: Vec<&str> = match target {
+                UpsertTarget::RowId => Vec::new(),
+                UpsertTarget::Unique(indices) => indices
+                    .iter()
+                    .map(|&idx| {
+                        schema
+                            .columns
+                            .get(idx)
+                            .map(|c| c.name.as_str())
+                            .ok_or_else(|| {
+                                TenantWriteError::Catalog(CatalogError::Invalid(
+                                    "internal: ON CONFLICT target column index out of range"
+                                        .to_string(),
+                                ))
+                            })
+                    })
+                    .collect::<Result<_, _>>()?,
+            };
+            let hash_target = match target {
+                UpsertTarget::RowId => content_hash::UpsertHashTarget::RowId,
+                UpsertTarget::Unique(_) => {
+                    content_hash::UpsertHashTarget::Unique(&hash_target_columns)
+                }
+            };
+            let content_hash_value =
+                content_hash::for_typed_upsert(&hash_target, &hash_action, &hash_input)?;
+            ledger::record_in_txn(
+                write_txn,
                 ctx.tenant_id(),
-                &written_ids,
-                crate::constraint::FkCheckMode::All,
+                table,
+                ledger_write,
+                &content_hash_value,
             )?;
-            // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
-            // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査
-            // する（更新した列が主キー・UNIQUE 制約の構成列を含む場合のみ
-            // 実際に検査する）。永続キー索引の差分（`delta`）は直前の
-            // `enforce_row_constraints_in_txn` が `written_ids`（今回の
-            // INSERT・UPDATE 双方を含む）に対して同期済みのものをそのまま
-            // 再利用する（`key_index.rs` モジュールドキュメント参照）。`pre_images`
-            // は ON UPDATE 参照アクション（Issue #1076）の連鎖起点。
-            if updated > 0 {
-                if let UpsertAction::DoUpdate(assignments) = action {
-                    let updated_columns: Vec<usize> =
-                        assignments.iter().map(|(idx, _)| *idx).collect();
-                    crate::constraint::enforce_referencing_rows_in_txn(
-                        &write_txn,
-                        table,
+
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+
+            // UNIQUE 対象（Issue #1074）は書き込み**前**のスナップショットで対象
+            // テナントの既存行を 1 回だけ走査し、対象キー → 既存行 id の対応表を
+            // 作る（`docs/design/sql-upsert.md`「衝突判定スコープ」節。可視性を
+            // 問わない全行が母集合。`row_table` はまだ本文で 1 行も書き込んでいない
+            // ためこの時点のスキャンが「この文の書き込みより前」の状態と一致する）。
+            let unique_existing: Option<std::collections::HashMap<Vec<u8>, u64>> = match target {
+                UpsertTarget::RowId => None,
+                UpsertTarget::Unique(indices) => {
+                    Some(crate::constraint::scan_tenant_rows_by_unique_key(
+                        &row_table,
                         &schema,
                         ctx.tenant_id(),
-                        crate::constraint::ReferencedRowsChange::ColumnsUpdated {
-                            indices: &updated_columns,
-                            delta: &delta,
+                        indices,
+                    )?)
+                }
+            };
+
+            // 主キー制約検査（下記ブロック終端）の対象 id。`DO NOTHING` で実際には
+            // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
+            // `constraint.rs` モジュールドキュメント参照）。
+            let mut written_ids: Vec<u64> = Vec::new();
+            // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+            // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
+            // 積む（新規挿入行は「更新」ではないため対象外）。
+            let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
+            for (id, values) in rows {
+                // 衝突判定の対象行 id を対象ごとに決定する（Issue #1074）。`(id)`
+                // 対象は常に VALUES 自身の `id` で判定する（既存挙動、無変更）。
+                // UNIQUE 対象は上記の事前走査で一致した既存行の `id` を使う（対象
+                // キーに NULL を含む行・未一致はいずれも非衝突＝新規挿入分岐へ）。
+                let conflict_id: Option<u64> = match target {
+                    UpsertTarget::RowId => Some(*id),
+                    UpsertTarget::Unique(indices) => {
+                        crate::constraint::unique_key_from_values(indices, values)
+                            .map_err(|m| {
+                                TenantWriteError::Catalog(CatalogError::Invalid(m.to_string()))
+                            })?
+                            .and_then(|key| {
+                                unique_existing.as_ref().and_then(|m| m.get(&key).copied())
+                            })
+                    }
+                };
+                // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
+                // （`insert`）と衝突しないようにする（`update_row_unchecked` と
+                // 同じパターン）。所有権判定は `decode_row_for_key`（キー↔ヘッダ
+                // tenant 整合検査。TABLE-12）＋ `ctx.is_owner` の二重防御。
+                let existing_owned: Option<crate::storage::Row> = match conflict_id {
+                    Some(cid) => match row_table
+                        .get(&(ctx.tenant_id(), cid))
+                        .map_err(CatalogError::from)?
+                    {
+                        Some(guard) => {
+                            let row = crate::storage::decode_row_for_key(
+                                ctx.tenant_id(),
+                                cid,
+                                guard.value(),
+                            )
+                            .map_err(TenantWriteError::Storage)?;
+                            Some(row)
+                        }
+                        None => None,
+                    },
+                    None => None,
+                };
+                let owns_existing = existing_owned
+                    .as_ref()
+                    .map(|row| ctx.is_owner(row.tenant_id.as_str()))
+                    .unwrap_or(false);
+
+                if owns_existing {
+                    // `owns_existing` が真になり得るのは `conflict_id` が `Some`
+                    // の場合のみ（`existing_owned` の構築規則）であり、以降の
+                    // 分岐は常に `Some` の中身（衝突した既存行の id）を使う。
+                    let write_id = match conflict_id {
+                        Some(cid) => cid,
+                        None => {
+                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                "internal: owns_existing without a conflict id".to_string(),
+                            )));
+                        }
+                    };
+                    let key = (ctx.tenant_id(), write_id);
+                    let existing = match existing_owned {
+                        Some(row) => row,
+                        None => {
+                            // `owns_existing` は `existing_owned.is_some()` の場合に
+                            // のみ真になり得ない（`unwrap_or(false)` の契約）ため
+                            // 到達しない。untrusted 経路の添字禁止（coding-rust.md）
+                            // に従い `unwrap` の代わりに fail-closed な内部エラーで
+                            // 閉じる。
+                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                "internal: owns_existing without an existing row".to_string(),
+                            )));
+                        }
+                    };
+                    match action {
+                        UpsertAction::DoNothing => {
+                            // 変更なし（新規挿入もしない）。
+                        }
+                        UpsertAction::DoUpdate(assignments) => {
+                            // read-merge-write: 既存行のスカラー列を復元し、SET 対象
+                            // 列だけを新しい値で上書きする（宣言順を保持する必要は
+                            // ない——最終的な行内容は適用順に依存しない一意な値へ
+                            // 収束する。同一列への重複代入は `bind_upsert_assignments`
+                            // が束縛時に `22000` で拒否済み）。
+                            let mut merged_values = crate::row_codec::decode_scalar_columns(
+                                &schema,
+                                &existing.metadata,
+                            )
+                            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                            // 書き換える前の全列値を ON UPDATE 連鎖の pre-image として
+                            // 積む（Issue #1076）。UNIQUE 対象の衝突では実際に書き換える
+                            // 既存行が VALUES 自身の `id`（`*id`）と異なり得るため、必ず
+                            // 衝突判定で確定した `write_id` をキーに記録する（`*id` で
+                            // 記録すると、連鎖側の `collect_action_targets` が入力 id で
+                            // 親行を読み直して新キーを取得できず、`ON UPDATE CASCADE` 等が
+                            // 発火せず参照元行が残留し `23503` で失敗する。codex/review・
+                            // cursor bugbot 指摘）。`id` 参照 FK は ON UPDATE で発火しない
+                            // （A7）ため、主キー・UNIQUE を宣言しないテーブルは複製コストを
+                            // 払わない（早期 return と同じ判定条件）。
+                            if schema.primary_key().is_some()
+                                || !schema.unique_constraints().is_empty()
+                            {
+                                pre_images.record(write_id, merged_values.clone());
+                            }
+                            let mut embedding_value: Vec<f32> = existing.embedding.clone();
+
+                            for (col_idx, value) in assignments.iter() {
+                                // `src_idx`／`col_idx` は束縛時点のスキーマ（`bind_upsert_assignments`）
+                                // が `schema.columns` に対して検証済みの位置インデックスであり、
+                                // `expected_schema` 照合（`Some` の場合。呼び出し元
+                                // `sql::exec::execute_upsert` ドキュメント参照）によって
+                                // 本 write トランザクション内の `schema` と一致することが
+                                // 保証されている。したがって範囲外・型不一致はいずれも
+                                // 到達しないはずの内部不変条件違反であり、値を黙って
+                                // `Null` へ差し替えたり SET を無視したりせず fail-closed に
+                                // 拒否する（cursor bugbot 指摘・PR #990。黙って無視すると
+                                // `updated` カウント・テーブル世代だけが進み、実際には
+                                // 適用されなかった SET が適用されたかのような不整合が
+                                // 生じる）。
+                                let new_value = match value {
+                                    UpsertSetValue::Excluded(src_idx) => {
+                                        values.get(*src_idx).cloned().ok_or_else(|| {
+                                            CatalogError::Invalid(
+                                            "internal: EXCLUDED source column index out of range"
+                                                .to_string(),
+                                        )
+                                        })?
+                                    }
+                                    UpsertSetValue::Literal(v) => (*v).clone(),
+                                };
+                                if Some(*col_idx) == vector_idx {
+                                    match new_value {
+                                        crate::row_codec::Value::Vector(v) => embedding_value = v,
+                                        _ => {
+                                            return Err(TenantWriteError::Catalog(
+                                                CatalogError::Invalid(
+                                                    "VECTOR column SET value must be a vector"
+                                                        .to_string(),
+                                                ),
+                                            ))
+                                        }
+                                    }
+                                } else {
+                                    let slot =
+                                        merged_values.get_mut(*col_idx).ok_or_else(|| {
+                                            CatalogError::Invalid(
+                                                "internal: SET target column index out of range"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                    *slot = new_value;
+                                }
+                            }
+                            schema.validate_row_embedding_dim(embedding_value.len())?;
+                            let metadata =
+                                crate::row_codec::encode_scalar_columns(&schema, &merged_values)
+                                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                            let row = RowInput {
+                                tenant_id: ctx.tenant_id(),
+                                // 既存行の可視性を保持する（SET で触れない列と同じ
+                                // 扱い。新規挿入行のみ `insert_visibility` を使う）。
+                                visibility: existing.visibility,
+                                embedding: &embedding_value,
+                                metadata: &metadata,
+                            };
+                            let encoded = encode_row(&row)?;
+                            row_table
+                                .insert(key, encoded.as_slice())
+                                .map_err(CatalogError::from)?;
+                            // `RETURNING`（Issue #1182）: 更新後の値を投影する。
+                            if let Some(project) = project.as_mut() {
+                                let values = captured_values_from_parts(
+                                    &schema,
+                                    embedding_value,
+                                    &metadata,
+                                )?;
+                                project(&CapturedRow {
+                                    id: write_id,
+                                    tenant_id: ctx.tenant_id().to_string(),
+                                    visibility: existing.visibility,
+                                    values,
+                                })?;
+                            }
+                            updated = updated.checked_add(1).ok_or_else(|| {
+                                TenantWriteError::Storage(StorageError::Codec(
+                                    "upsert updated row counter overflow".to_string(),
+                                ))
+                            })?;
+                            written_ids.push(write_id);
+                        }
+                    }
+                } else {
+                    // 非衝突（新規挿入）。VALUES 自身の `id` を書き込み先の物理キーに
+                    // 使う（対象に関わらず不変。UNIQUE 対象で同じ `id` を持つ既存行が
+                    // 既にあれば `insert_unique_row` が `IdConflict`〔`23505`〕で
+                    // 拒否する——PostgreSQL の「arbiter でない制約の違反は吸収しない」
+                    // 挙動と同じ）。既存 `insert_typed_rows_unchecked` と同じ組み立て
+                    // （Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
+                    let key = (ctx.tenant_id(), *id);
+                    let embedding: &[f32] = match vector_idx {
+                        Some(idx) => match values.get(idx) {
+                            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                            _ => {
+                                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                    "VECTOR column value missing or not a Vector".to_string(),
+                                )))
+                            }
                         },
-                        Some(&pre_images),
-                        crate::constraint::FkCheckMode::All,
-                    )?;
+                        None => &[],
+                    };
+                    let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                    let row = RowInput {
+                        tenant_id: ctx.tenant_id(),
+                        visibility: insert_visibility,
+                        embedding,
+                        metadata: &metadata,
+                    };
+                    let encoded = encode_row(&row)?;
+                    insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+                    // `RETURNING`（Issue #1182）: 挿入した値を投影する。
+                    if let Some(project) = project.as_mut() {
+                        let values =
+                            captured_values_from_parts(&schema, embedding.to_vec(), &metadata)?;
+                        project(&CapturedRow {
+                            id: *id,
+                            tenant_id: ctx.tenant_id().to_string(),
+                            visibility: insert_visibility,
+                            values,
+                        })?;
+                    }
+                    inserted = inserted.checked_add(1).ok_or_else(|| {
+                        TenantWriteError::Storage(StorageError::Codec(
+                            "upsert inserted row counter overflow".to_string(),
+                        ))
+                    })?;
+                    written_ids.push(*id);
+                }
+            }
+            // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
+            // 検査。行ストアの `mut row_table` ハンドルはこのブロックを抜けた
+            // 時点で解放されるため、その直前（同一ブロック内の最後）で読み取り
+            // ハンドルとして再度開く（`insert_row_unchecked` と異なり、ここは
+            // `row_table` を drop する前にまだブロック内にいるため、别途スコープを
+            // 切って再オープンする）。
+            if !written_ids.is_empty() {
+                drop(row_table);
+                let delta = crate::constraint::enforce_row_constraints_in_txn(
+                    write_txn,
+                    table,
+                    &schema,
+                    ctx.tenant_id(),
+                    &written_ids,
+                    write_target.fk_check_mode(),
+                )?;
+                // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
+                // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査
+                // する（更新した列が主キー・UNIQUE 制約の構成列を含む場合のみ
+                // 実際に検査する）。永続キー索引の差分（`delta`）は直前の
+                // `enforce_row_constraints_in_txn` が `written_ids`（今回の
+                // INSERT・UPDATE 双方を含む）に対して同期済みのものをそのまま
+                // 再利用する（`key_index.rs` モジュールドキュメント参照）。`pre_images`
+                // は ON UPDATE 参照アクション（Issue #1076）の連鎖起点。
+                if updated > 0 {
+                    if let UpsertAction::DoUpdate(assignments) = action {
+                        let updated_columns: Vec<usize> =
+                            assignments.iter().map(|(idx, _)| *idx).collect();
+                        crate::constraint::enforce_referencing_rows_in_txn(
+                            write_txn,
+                            table,
+                            &schema,
+                            ctx.tenant_id(),
+                            crate::constraint::ReferencedRowsChange::ColumnsUpdated {
+                                indices: &updated_columns,
+                                delta: &delta,
+                            },
+                            Some(&pre_images),
+                            write_target.fk_check_mode(),
+                        )?;
+                    }
                 }
             }
         }
-    }
-    if inserted > 0 || updated > 0 {
-        crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    }
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(UpsertOutcome { inserted, updated })
+        if inserted > 0 || updated > 0 {
+            crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        }
+        Ok((UpsertOutcome { inserted, updated }, TxnEffect::Wrote))
+    })
 }
 
 /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -2072,7 +2094,14 @@ pub fn update_row(
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
     let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
-    update_row_unchecked(storage, table, ctx, id, row, ledger_write)
+    update_row_unchecked(
+        WriteTarget::Autocommit(storage),
+        table,
+        ctx,
+        id,
+        row,
+        ledger_write,
+    )
 }
 
 /// [`update_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
@@ -2089,7 +2118,7 @@ pub fn update_row(
 /// drop（abort）される既存契約でそのまま保たれる（台帳照合が先でも、後続で
 /// `NotFound` を返せば同じ txn 内の台帳挿入も一緒に破棄される）。
 pub(crate) fn update_row_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -2100,108 +2129,112 @@ pub(crate) fn update_row_unchecked(
     if !ctx.is_owner(row.tenant_id) {
         return Err(TenantWriteError::Forbidden);
     }
-    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-    // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
-    // 全列置換は参照先キーを変え得るため、既存行の全列値を書き換える前に捕捉する。
-    let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
-        schema.validate_row_embedding_dim(row.embedding.len())?;
-        // エンコードは 1 回のみ（Issue #397）: `for_update` が内部で `encode_row` し、
-        // 書き込み側で同じ行をもう一度 `encode_row` していた二重実行を排除する。
-        // ここでの `encode_row` は変更前も `owns_existing` 判定より前（台帳ハッシュ
-        // 計算の内部）で無条件に走っていたため、この位置へ移してもエラー優先順位
-        // （`encode_row` のエラー → 台帳の内容照合 → `NotFound`）は変わらない。
-        let encoded = encode_row(row)?;
-        let content_hash = content_hash::for_update_encoded(id, &encoded)?;
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-        )?;
+    target.with_txn(|write_txn| {
+        // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+        // 全列置換は参照先キーを変え得るため、既存行の全列値を書き換える前に捕捉する。
+        let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
+        {
+            let schema = require_table_schema_write(write_txn, table)?;
+            schema.validate_row_embedding_dim(row.embedding.len())?;
+            // エンコードは 1 回のみ（Issue #397）: `for_update` が内部で `encode_row` し、
+            // 書き込み側で同じ行をもう一度 `encode_row` していた二重実行を排除する。
+            // ここでの `encode_row` は変更前も `owns_existing` 判定より前（台帳ハッシュ
+            // 計算の内部）で無条件に走っていたため、この位置へ移してもエラー優先順位
+            // （`encode_row` のエラー → 台帳の内容照合 → `NotFound`）は変わらない。
+            let encoded = encode_row(row)?;
+            let content_hash = content_hash::for_update_encoded(id, &encoded)?;
+            ledger::record_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                &content_hash,
+            )?;
 
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-        // 物理キーの名前空間化（TABLE-12）により、他テナントの行はそもそも別キーで
-        // 到達不能（構造的な遮断）。既存行の所有者照合は `is_owner` の単一照合パスに
-        // 残し、二重防御とする（旧フォーマット行の混在等でヘッダのテナントが
-        // キーと食い違う場合も fail-closed 側に倒れる）。
-        // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用（`insert`）と
-        // 衝突しないようにする。
-        let key = (ctx.tenant_id(), id);
-        let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
-            Some(guard) => {
-                let (existing_tenant, _existing_visibility) =
-                    decode_row_tenant_and_visibility(guard.value())?;
-                if ctx.is_owner(existing_tenant) {
-                    // 上書きする前の全列値を ON UPDATE 連鎖の pre-image として
-                    // 積む（Issue #1076）。所有者判定が確定した後にのみフル
-                    // デコードを試みる（`update_row_columns_unchecked` と同じ
-                    // 「不可視・不存在は内容に触れない」設計）。デコード失敗
-                    // （テスト専用の生 API 等が投入した非正規メタデータ）は
-                    // 全列置換自体の成否には影響させず、この行を pre-image 無し
-                    // として扱う（ON UPDATE アクションは発火しないが、事後検証
-                    // 〔NO ACTION 相当〕は変わらず有効なため fail-open にはならない）。
-                    // `id` 参照 FK は ON UPDATE で発火しない（A7）ため、主キー・
-                    // UNIQUE を宣言しないテーブルはこのデコードを一切行わない。
-                    if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
-                        if let Ok(existing) =
-                            crate::storage::decode_row_for_key(ctx.tenant_id(), id, guard.value())
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            // 物理キーの名前空間化（TABLE-12）により、他テナントの行はそもそも別キーで
+            // 到達不能（構造的な遮断）。既存行の所有者照合は `is_owner` の単一照合パスに
+            // 残し、二重防御とする（旧フォーマット行の混在等でヘッダのテナントが
+            // キーと食い違う場合も fail-closed 側に倒れる）。
+            // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用（`insert`）と
+            // 衝突しないようにする。
+            let key = (ctx.tenant_id(), id);
+            let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
+                Some(guard) => {
+                    let (existing_tenant, _existing_visibility) =
+                        decode_row_tenant_and_visibility(guard.value())?;
+                    if ctx.is_owner(existing_tenant) {
+                        // 上書きする前の全列値を ON UPDATE 連鎖の pre-image として
+                        // 積む（Issue #1076）。所有者判定が確定した後にのみフル
+                        // デコードを試みる（`update_row_columns_unchecked` と同じ
+                        // 「不可視・不存在は内容に触れない」設計）。デコード失敗
+                        // （テスト専用の生 API 等が投入した非正規メタデータ）は
+                        // 全列置換自体の成否には影響させず、この行を pre-image 無し
+                        // として扱う（ON UPDATE アクションは発火しないが、事後検証
+                        // 〔NO ACTION 相当〕は変わらず有効なため fail-open にはならない）。
+                        // `id` 参照 FK は ON UPDATE で発火しない（A7）ため、主キー・
+                        // UNIQUE を宣言しないテーブルはこのデコードを一切行わない。
+                        if schema.primary_key().is_some() || !schema.unique_constraints().is_empty()
                         {
-                            if let Ok(old_values) =
-                                crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
-                            {
-                                pre_images.record(id, old_values);
+                            if let Ok(existing) = crate::storage::decode_row_for_key(
+                                ctx.tenant_id(),
+                                id,
+                                guard.value(),
+                            ) {
+                                if let Ok(old_values) = crate::row_codec::decode_scalar_columns(
+                                    &schema,
+                                    &existing.metadata,
+                                ) {
+                                    pre_images.record(id, old_values);
+                                }
                             }
                         }
+                        true
+                    } else {
+                        false
                     }
-                    true
-                } else {
-                    false
                 }
+                None => false,
+            };
+            if !owns_existing {
+                return Err(TenantWriteError::NotFound);
             }
-            None => false,
-        };
-        if !owns_existing {
-            return Err(TenantWriteError::NotFound);
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(CatalogError::from)?;
         }
-        row_table
-            .insert(key, encoded.as_slice())
-            .map_err(CatalogError::from)?;
-    }
-    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
-    // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
-    // ドキュメント参照）。
-    {
-        let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-        let delta = crate::constraint::enforce_row_constraints_in_txn(
-            &write_txn,
-            table,
-            &schema_for_pk,
-            ctx.tenant_id(),
-            &[id],
-            crate::constraint::FkCheckMode::All,
-        )?;
-        // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
-        // 参照先とする `FOREIGN KEY` の参照先側も検査する（TABLE-17・TASK-205、
-        // Issue #907）。永続キー索引の差分は直前の同期をそのまま再利用する。
-        crate::constraint::enforce_referencing_rows_in_txn(
-            &write_txn,
-            table,
-            &schema_for_pk,
-            ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::AllColumnsReplaced { delta: &delta },
-            Some(&pre_images),
-            crate::constraint::FkCheckMode::All,
-        )?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(())
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
+        // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
+        // ドキュメント参照）。
+        {
+            let schema_for_pk = require_table_schema_write(write_txn, table)?;
+            let delta = crate::constraint::enforce_row_constraints_in_txn(
+                write_txn,
+                table,
+                &schema_for_pk,
+                ctx.tenant_id(),
+                &[id],
+                target.fk_check_mode(),
+            )?;
+            // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
+            // 参照先とする `FOREIGN KEY` の参照先側も検査する（TABLE-17・TASK-205、
+            // Issue #907）。永続キー索引の差分は直前の同期をそのまま再利用する。
+            crate::constraint::enforce_referencing_rows_in_txn(
+                write_txn,
+                table,
+                &schema_for_pk,
+                ctx.tenant_id(),
+                crate::constraint::ReferencedRowsChange::AllColumnsReplaced { delta: &delta },
+                Some(&pre_images),
+                target.fk_check_mode(),
+            )?;
+        }
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok(((), TxnEffect::Wrote))
+    })
 }
 
 /// SQL `UPDATE <table> SET <col> = <lit>[, ...] WHERE id = <n>`（SQL-17・TASK-191。
@@ -2747,7 +2780,7 @@ pub(crate) fn merge_row_for_update(
 }
 
 pub(crate) fn update_row_columns_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -2756,7 +2789,7 @@ pub(crate) fn update_row_columns_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<usize, TenantWriteError> {
     update_row_columns_capturing_unchecked(
-        storage,
+        target,
         table,
         ctx,
         id,
@@ -2780,7 +2813,7 @@ pub(crate) fn update_row_columns_unchecked(
 /// execute_update_returning` の唯一の到達経路。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_row_columns_capturing_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -2790,277 +2823,277 @@ pub(crate) fn update_row_columns_capturing_unchecked(
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<usize, TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-    let rows_affected: usize;
-    let mut captured_row: Option<CapturedRow> = None;
-    {
-        let schema = require_table_schema_write(&write_txn, table)?;
-        if let Some(expected) = expected_schema {
-            if expected != &schema {
-                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table schema changed after the update assignments were bound".to_string(),
-                )));
-            }
-        }
-
-        // `assignments` の列 index をスキーマ幅・型で再検証する（untrusted 経路の
-        // 添字アクセス回避。coding-rust.md「受信データ経路では unwrap/expect/[]
-        // を禁止」）。`bind_update` は束縛時点のスキーマで検証済みだが、write
-        // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
-        // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
-        // `expected_schema` 比較と多層防御）。検証本体は [`validate_set_assignments`]
-        // （述語形 [`update_rows_where_unchecked`] と共有。codex-review P1 指摘・
-        // PR #993 系・Issue #871）。
-        validate_set_assignments(&schema, assignments)?;
-
-        // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
-        // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
-        // 境界・型は上記 `validate_set_assignments` で検証済みのため、ここでの
-        // `get()` は理論上失敗しないが、添字アクセスを避けるため引き続き
-        // `ok_or_else` で明示的に処理する（coding-rust.md）。
-        let mut named_columns: Vec<(usize, &str, &crate::row_codec::Value)> =
-            Vec::with_capacity(assignments.len());
-        for (idx, value) in assignments {
-            let column = schema.columns.get(*idx).ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "SET column index out of range for the current table schema".to_string(),
-                ))
-            })?;
-            named_columns.push((*idx, column.name.as_str(), value));
-        }
-        // 台帳の内容照合ハッシュ（`content_hash::for_update_columns`）へ渡す前に
-        // スキーマの列 index（宣言順）で安定ソートする（Issue #876 レビュー指摘。
-        // `named_columns` はここまで `assignments`（SET 句の宣言順）の順序で
-        // 構築されており、SQL 表層の `UPDATE ... SET col1=.., col2=..` はクライアント
-        // が書いた宣言順をそのまま保持する一方、NoSQL 表層（`wire-server::http::
-        // query::update::map_set_assignments`）は JSON `set` オブジェクトを
-        // `engine::json` の `BTreeMap` でパースするためキーが常にアルファベット順へ
-        // 正規化される。ハッシュが宣言順に依存したままだと、SQL 表層が非アルファ
-        // ベット順で書いた `UPDATE` と同一内容の NoSQL `update`（常にアルファベット
-        // 順）を同一 `operation_id` で再送した場合に、本来は同一内容の再送（`23505`・
-        // TASK-101・RECOVER-10 の契約）であるべきところが内容不一致（`22023`）へ
-        // 誤判定される。列の並び順は書き込み対象・SET 意味論に一切影響しない
-        // （`assignments` は index 基準で適用済み）ため、ハッシュ入力のみをスキーマ
-        // 列順へ正規化することで SQL・NoSQL 双方の入力順序に依存しない決定的な
-        // ハッシュにする（`for_typed_insert` がスキーマ列順を渡す既存契約と同じ
-        // 考え方）。
-        //
-        // 互換性（PR #992 レビュー指摘）: この正規化の変更前は `named_columns` を
-        // 宣言順のままハッシュ計算へ渡していた（旧 `for_update_columns` 呼び出し
-        // 契約。SQL 表層のみが到達可能で NoSQL `update` は未接続だった）ため、
-        // 既に台帳へ記録済みのエントリは宣言順ハッシュを保持している場合がある。
-        // 正規化後のコードがそれをそのまま「内容不一致」（`22023`）へ倒すと、
-        // アップグレード前に記録済みの `operation_id` を同一 SQL で再送しただけの
-        // 正当な操作が誤って拒否されてしまう（AGENTS.md「公開 API・エラー契約の
-        // 互換性」）。宣言順のまま（ソート前）のビューを `legacy_hash` として
-        // 保持しておき、`ledger::record_in_txn_accepting` が正準ハッシュ
-        // （スキーマ列順）に加えてこの宣言順ハッシュとも照合することで、
-        // アップグレード前に記録されたエントリへの同一 SQL 再送も
-        // `Duplicate`（`23505`）と判定できるようにする。新規記録・以降の照合には
-        // 常に正準ハッシュ（スキーマ列順）のみを使う（keep-first 契約は変えない）。
-        let declared_order_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
-            .iter()
-            .map(|(_, name, value)| (*name, *value))
-            .collect();
-        named_columns.sort_by_key(|(idx, _, _)| *idx);
-        let named_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
-            .into_iter()
-            .map(|(_, name, value)| (name, value))
-            .collect();
-        // SET 値の形状検証（上記ループ内の次元・TEXT 長上限）は、対象行の存在・
-        // RLS 可視性を一切参照せずスキーマのみから判定できる。存在しない／
-        // 他テナント所有／不可視な行に対する UPDATE は本来 `rows_affected: 0` の
-        // 成功として区別なく扱う契約（RLS-9・RLS-10）だが、もし形状検証を
-        // 対象行 lookup の**後**（`Some(row) => { ... }` 分岐内）でのみ行うと、
-        // 同一の不正な SET 値でも「対象行が存在する場合は `22000` エラー」
-        // 「対象行が存在しない／不可視な場合は `UPDATE 0` 成功」という応答の
-        // 分岐が生じ、エラー有無そのものが行の存在を漏らす識別子となってしまう
-        // （codex-review／Cursor Bugbot 指摘・PR #989。security.md「テナント境界」）。
-        // 上記ループで対象行探索より前に検証を終えることで、対象の有無に関わらず
-        // 常に同一の拒否（またはいずれも合格）になる fail-closed 契約を保つ。
-
-        // 台帳照合（TASK-101・RECOVER-10）を所有権判定より**前**に行う
-        // （`update_row_unchecked` と同じ順序契約。同ドキュメント参照）。単一列
-        // SET は宣言順・スキーマ列順が一致するため `legacy_hash` は常に
-        // `content_hash` と等しくなるが、`record_in_txn_accepting` 呼び出し自体は
-        // 統一して行い分岐を増やさない。
-        let content_hash = content_hash::for_update_columns(id, &named_columns)?;
-        let legacy_hash = content_hash::for_update_columns(id, &declared_order_columns)?;
-        ledger::record_in_txn_accepting(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-            &[legacy_hash],
-        )?;
-
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-        // `AccessGuard` の借用はこのブロック内に閉じ込め、後続の可変借用
-        // （`insert`）と衝突しないようにする（`update_row_unchecked` と同じ設計）。
-        let key = (ctx.tenant_id(), id);
-        // ヘッダのみを検証してから可視性を判定する（codex-review P0 再々指摘・
-        // PR #989・`crates/engine/src/tenant.rs:1696`）: フル本体デコード
-        // （`decode_row_for_key`。embedding・metadata を含む）を `is_visible`
-        // 判定より**前**に無条件実行すると、不可視な既存行の embedding・
-        // metadata が破損している場合のデコード失敗（`XX000`）が「不存在
-        // （`UPDATE 0`）」と区別できてしまい、可視性の狭いセッションへ
-        // 「不可視な行が存在し、かつ壊れている」ことを漏らす（security.md
-        // 「テナント境界（RLS 相当）の弱体化」）。`decode_row_tenant_and_
-        // visibility`（tenant_id・visibility の固定長フィールドのみを読む
-        // ヘッダ専用デコード。embedding dim・metadata 長には依存しないため
-        // 可視性判定そのものが内容依存にならない）で `is_owner && is_visible`
-        // を先に確定し、それを満たす行だけをフル本体デコードの対象にする。
-        // TABLE-12 の名前空間キー（`key = (ctx.tenant_id(), id)`）により
-        // ヘッダの `tenant_id` は常に `ctx.tenant_id()` と一致する（他テナント
-        // の行はこのキーでは物理的に取得できない）ため、他テナント行の混入は
-        // 構造的に起こらない。
-        let visible_row: Option<Row> = match row_table.get(&key).map_err(CatalogError::from)? {
-            Some(guard) => {
-                let raw = guard.value();
-                match crate::storage::decode_row_tenant_and_visibility(raw) {
-                    Ok((tenant_id, visibility))
-                        if ctx.is_owner(tenant_id) && ctx.is_visible(tenant_id, visibility) =>
-                    {
-                        // ヘッダで所有・可視と確認済みの行のみ、フル本体
-                        // （embedding・metadata）をデコードする。対象は既に
-                        // 「存在し、かつ可視」と確定しているため、ここでの
-                        // デコード失敗（ストレージ破損等）を `XX000` として
-                        // 伝播しても、不存在の id との応答差にはならない。
-                        Some(crate::storage::decode_row_for_key(
-                            ctx.tenant_id(),
-                            id,
-                            raw,
-                        )?)
-                    }
-                    // ヘッダのデコード自体が失敗した場合（フォーマット不整合等）、
-                    // または所有・可視のいずれかを満たさない場合は区別せず
-                    // 「不可視」として扱う（本体には一切触れない）。
-                    _ => None,
+    target.with_txn(|write_txn| {
+        let rows_affected: usize;
+        let mut captured_row: Option<CapturedRow> = None;
+        {
+            let schema = require_table_schema_write(write_txn, table)?;
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "table schema changed after the update assignments were bound".to_string(),
+                    )));
                 }
             }
-            None => None,
-        };
 
-        // 判断 D 再改訂（codex-review P0 指摘・PR #989 再々指摘）: 内容依存の
-        // 処理（`scan_scalar_columns`・`merge_encode_scalar_columns`。
-        // `MAX_SCALAR_PAYLOAD_LEN` 超過判定・格納済みデータのデコード失敗を
-        // 含む）は `is_owner && is_visible`（実際に書き込む対象）を満たす
-        // 行に対してのみ実行する。`update_row_unchecked`・
-        // `delete_row_unchecked` と同じ「所有・可視でない対象は探索直後に
-        // 打ち切り、内容には一切触れない」設計に揃える。
-        //
-        // 内容依存の超過判定を対象行の有無に関わらず静的に決定することは、
-        // `MAX_TEXT_FIELD_LEN` と `MAX_SCALAR_PAYLOAD_LEN` が同値である
-        // 現行の列長上限設計では 2 列以上の `TEXT` 列を持つ任意のスキーマで
-        // 事実上すべての部分更新を拒否する退化した契約になってしまうため
-        // 採用しない。代わりに、不可視・不存在のいずれも「内容に一切触れず
-        // `UPDATE 0`」で統一し、可視な既存行だけがマージ・再エンコード
-        // （超過判定・デコード失敗を含む）の対象になる契約とする。これにより
-        // 「可視な大きな既存行は `22000`、同じ SET 値を不可視な既存行へ送って
-        // も不存在と同じ `UPDATE 0`」となり、可視・不可視の応答差は解消される
-        // 一方、「不可視な既存行」と「不存在な行」はいずれも `UPDATE 0`・
-        // 内容無参照で完全に同一になる。詳細は
-        // `docs/design/update-single-row.md`「判断 D」参照。
-        // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
-        let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
-        rows_affected = match visible_row {
-            Some(row) => {
-                // read-merge-write 本体は述語つき UPDATE
-                // （`update_rows_where_unchecked`）と共有する [`merge_row_for_update`]
-                // へ委譲済み（Issue #996。エラー分類・借用版デコードによる
-                // ピーク確保回避などの設計判断は同関数のドキュメント参照）。
-                //
-                // クライアントは `visibility` を SET 対象にできない
-                // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
-                // 既存値をそのまま維持する。
-                let visibility = row.visibility;
-                // 書き換える前の全列値を pre-image として積む（`row` は直後の
-                // `merge_row_for_update` へ move するため先に読む）。デコード失敗は
-                // ここでは無視する（本来のデコードエラー分類は直後の
-                // `merge_row_for_update` が引き続き担い、`CorruptSchema` へ正しく
-                // 写像される。pre-image はベストエフォートで、無くても ON UPDATE
-                // アクションが発火しないだけで事後検証は変わらず有効）。`id` 参照
-                // FK は ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を宣言
-                // しないテーブルはこのデコードを一切行わない。
-                if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
-                    if let Ok(old_values) =
-                        crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
-                    {
-                        pre_images.record(id, old_values);
+            // `assignments` の列 index をスキーマ幅・型で再検証する（untrusted 経路の
+            // 添字アクセス回避。coding-rust.md「受信データ経路では unwrap/expect/[]
+            // を禁止」）。`bind_update` は束縛時点のスキーマで検証済みだが、write
+            // トランザクション内で再取得したスキーマと不一致がありうる場合に備え、
+            // `get()` で境界外アクセスを構造的に防ぐ（`insert_typed_row_unchecked` の
+            // `expected_schema` 比較と多層防御）。検証本体は [`validate_set_assignments`]
+            // （述語形 [`update_rows_where_unchecked`] と共有。codex-review P1 指摘・
+            // PR #993 系・Issue #871）。
+            validate_set_assignments(&schema, assignments)?;
+
+            // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
+            // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
+            // 境界・型は上記 `validate_set_assignments` で検証済みのため、ここでの
+            // `get()` は理論上失敗しないが、添字アクセスを避けるため引き続き
+            // `ok_or_else` で明示的に処理する（coding-rust.md）。
+            let mut named_columns: Vec<(usize, &str, &crate::row_codec::Value)> =
+                Vec::with_capacity(assignments.len());
+            for (idx, value) in assignments {
+                let column = schema.columns.get(*idx).ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "SET column index out of range for the current table schema".to_string(),
+                    ))
+                })?;
+                named_columns.push((*idx, column.name.as_str(), value));
+            }
+            // 台帳の内容照合ハッシュ（`content_hash::for_update_columns`）へ渡す前に
+            // スキーマの列 index（宣言順）で安定ソートする（Issue #876 レビュー指摘。
+            // `named_columns` はここまで `assignments`（SET 句の宣言順）の順序で
+            // 構築されており、SQL 表層の `UPDATE ... SET col1=.., col2=..` はクライアント
+            // が書いた宣言順をそのまま保持する一方、NoSQL 表層（`wire-server::http::
+            // query::update::map_set_assignments`）は JSON `set` オブジェクトを
+            // `engine::json` の `BTreeMap` でパースするためキーが常にアルファベット順へ
+            // 正規化される。ハッシュが宣言順に依存したままだと、SQL 表層が非アルファ
+            // ベット順で書いた `UPDATE` と同一内容の NoSQL `update`（常にアルファベット
+            // 順）を同一 `operation_id` で再送した場合に、本来は同一内容の再送（`23505`・
+            // TASK-101・RECOVER-10 の契約）であるべきところが内容不一致（`22023`）へ
+            // 誤判定される。列の並び順は書き込み対象・SET 意味論に一切影響しない
+            // （`assignments` は index 基準で適用済み）ため、ハッシュ入力のみをスキーマ
+            // 列順へ正規化することで SQL・NoSQL 双方の入力順序に依存しない決定的な
+            // ハッシュにする（`for_typed_insert` がスキーマ列順を渡す既存契約と同じ
+            // 考え方）。
+            //
+            // 互換性（PR #992 レビュー指摘）: この正規化の変更前は `named_columns` を
+            // 宣言順のままハッシュ計算へ渡していた（旧 `for_update_columns` 呼び出し
+            // 契約。SQL 表層のみが到達可能で NoSQL `update` は未接続だった）ため、
+            // 既に台帳へ記録済みのエントリは宣言順ハッシュを保持している場合がある。
+            // 正規化後のコードがそれをそのまま「内容不一致」（`22023`）へ倒すと、
+            // アップグレード前に記録済みの `operation_id` を同一 SQL で再送しただけの
+            // 正当な操作が誤って拒否されてしまう（AGENTS.md「公開 API・エラー契約の
+            // 互換性」）。宣言順のまま（ソート前）のビューを `legacy_hash` として
+            // 保持しておき、`ledger::record_in_txn_accepting` が正準ハッシュ
+            // （スキーマ列順）に加えてこの宣言順ハッシュとも照合することで、
+            // アップグレード前に記録されたエントリへの同一 SQL 再送も
+            // `Duplicate`（`23505`）と判定できるようにする。新規記録・以降の照合には
+            // 常に正準ハッシュ（スキーマ列順）のみを使う（keep-first 契約は変えない）。
+            let declared_order_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
+                .iter()
+                .map(|(_, name, value)| (*name, *value))
+                .collect();
+            named_columns.sort_by_key(|(idx, _, _)| *idx);
+            let named_columns: Vec<(&str, &crate::row_codec::Value)> = named_columns
+                .into_iter()
+                .map(|(_, name, value)| (name, value))
+                .collect();
+            // SET 値の形状検証（上記ループ内の次元・TEXT 長上限）は、対象行の存在・
+            // RLS 可視性を一切参照せずスキーマのみから判定できる。存在しない／
+            // 他テナント所有／不可視な行に対する UPDATE は本来 `rows_affected: 0` の
+            // 成功として区別なく扱う契約（RLS-9・RLS-10）だが、もし形状検証を
+            // 対象行 lookup の**後**（`Some(row) => { ... }` 分岐内）でのみ行うと、
+            // 同一の不正な SET 値でも「対象行が存在する場合は `22000` エラー」
+            // 「対象行が存在しない／不可視な場合は `UPDATE 0` 成功」という応答の
+            // 分岐が生じ、エラー有無そのものが行の存在を漏らす識別子となってしまう
+            // （codex-review／Cursor Bugbot 指摘・PR #989。security.md「テナント境界」）。
+            // 上記ループで対象行探索より前に検証を終えることで、対象の有無に関わらず
+            // 常に同一の拒否（またはいずれも合格）になる fail-closed 契約を保つ。
+
+            // 台帳照合（TASK-101・RECOVER-10）を所有権判定より**前**に行う
+            // （`update_row_unchecked` と同じ順序契約。同ドキュメント参照）。単一列
+            // SET は宣言順・スキーマ列順が一致するため `legacy_hash` は常に
+            // `content_hash` と等しくなるが、`record_in_txn_accepting` 呼び出し自体は
+            // 統一して行い分岐を増やさない。
+            let content_hash = content_hash::for_update_columns(id, &named_columns)?;
+            let legacy_hash = content_hash::for_update_columns(id, &declared_order_columns)?;
+            ledger::record_in_txn_accepting(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                &content_hash,
+                &[legacy_hash],
+            )?;
+
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            // `AccessGuard` の借用はこのブロック内に閉じ込め、後続の可変借用
+            // （`insert`）と衝突しないようにする（`update_row_unchecked` と同じ設計）。
+            let key = (ctx.tenant_id(), id);
+            // ヘッダのみを検証してから可視性を判定する（codex-review P0 再々指摘・
+            // PR #989・`crates/engine/src/tenant.rs:1696`）: フル本体デコード
+            // （`decode_row_for_key`。embedding・metadata を含む）を `is_visible`
+            // 判定より**前**に無条件実行すると、不可視な既存行の embedding・
+            // metadata が破損している場合のデコード失敗（`XX000`）が「不存在
+            // （`UPDATE 0`）」と区別できてしまい、可視性の狭いセッションへ
+            // 「不可視な行が存在し、かつ壊れている」ことを漏らす（security.md
+            // 「テナント境界（RLS 相当）の弱体化」）。`decode_row_tenant_and_
+            // visibility`（tenant_id・visibility の固定長フィールドのみを読む
+            // ヘッダ専用デコード。embedding dim・metadata 長には依存しないため
+            // 可視性判定そのものが内容依存にならない）で `is_owner && is_visible`
+            // を先に確定し、それを満たす行だけをフル本体デコードの対象にする。
+            // TABLE-12 の名前空間キー（`key = (ctx.tenant_id(), id)`）により
+            // ヘッダの `tenant_id` は常に `ctx.tenant_id()` と一致する（他テナント
+            // の行はこのキーでは物理的に取得できない）ため、他テナント行の混入は
+            // 構造的に起こらない。
+            let visible_row: Option<Row> = match row_table.get(&key).map_err(CatalogError::from)? {
+                Some(guard) => {
+                    let raw = guard.value();
+                    match crate::storage::decode_row_tenant_and_visibility(raw) {
+                        Ok((tenant_id, visibility))
+                            if ctx.is_owner(tenant_id) && ctx.is_visible(tenant_id, visibility) =>
+                        {
+                            // ヘッダで所有・可視と確認済みの行のみ、フル本体
+                            // （embedding・metadata）をデコードする。対象は既に
+                            // 「存在し、かつ可視」と確定しているため、ここでの
+                            // デコード失敗（ストレージ破損等）を `XX000` として
+                            // 伝播しても、不存在の id との応答差にはならない。
+                            Some(crate::storage::decode_row_for_key(
+                                ctx.tenant_id(),
+                                id,
+                                raw,
+                            )?)
+                        }
+                        // ヘッダのデコード自体が失敗した場合（フォーマット不整合等）、
+                        // または所有・可視のいずれかを満たさない場合は区別せず
+                        // 「不可視」として扱う（本体には一切触れない）。
+                        _ => None,
                     }
                 }
-                let (embedding, metadata) = merge_row_for_update(&schema, row, assignments)?;
-                let row_input = RowInput {
-                    tenant_id: ctx.tenant_id(),
-                    visibility,
-                    embedding: &embedding,
-                    metadata: &metadata,
-                };
-                let encoded = encode_row(&row_input)?;
-                row_table
-                    .insert(key, encoded.as_slice())
-                    .map_err(CatalogError::from)?;
-                // `RETURNING`（Issue #1182）: 書いた値（更新後）そのものを捕捉する。
-                if project.is_some() {
-                    captured_row = Some(CapturedRow {
-                        id,
-                        tenant_id: ctx.tenant_id().to_string(),
+                None => None,
+            };
+
+            // 判断 D 再改訂（codex-review P0 指摘・PR #989 再々指摘）: 内容依存の
+            // 処理（`scan_scalar_columns`・`merge_encode_scalar_columns`。
+            // `MAX_SCALAR_PAYLOAD_LEN` 超過判定・格納済みデータのデコード失敗を
+            // 含む）は `is_owner && is_visible`（実際に書き込む対象）を満たす
+            // 行に対してのみ実行する。`update_row_unchecked`・
+            // `delete_row_unchecked` と同じ「所有・可視でない対象は探索直後に
+            // 打ち切り、内容には一切触れない」設計に揃える。
+            //
+            // 内容依存の超過判定を対象行の有無に関わらず静的に決定することは、
+            // `MAX_TEXT_FIELD_LEN` と `MAX_SCALAR_PAYLOAD_LEN` が同値である
+            // 現行の列長上限設計では 2 列以上の `TEXT` 列を持つ任意のスキーマで
+            // 事実上すべての部分更新を拒否する退化した契約になってしまうため
+            // 採用しない。代わりに、不可視・不存在のいずれも「内容に一切触れず
+            // `UPDATE 0`」で統一し、可視な既存行だけがマージ・再エンコード
+            // （超過判定・デコード失敗を含む）の対象になる契約とする。これにより
+            // 「可視な大きな既存行は `22000`、同じ SET 値を不可視な既存行へ送って
+            // も不存在と同じ `UPDATE 0`」となり、可視・不可視の応答差は解消される
+            // 一方、「不可視な既存行」と「不存在な行」はいずれも `UPDATE 0`・
+            // 内容無参照で完全に同一になる。詳細は
+            // `docs/design/update-single-row.md`「判断 D」参照。
+            // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+            let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
+            rows_affected = match visible_row {
+                Some(row) => {
+                    // read-merge-write 本体は述語つき UPDATE
+                    // （`update_rows_where_unchecked`）と共有する [`merge_row_for_update`]
+                    // へ委譲済み（Issue #996。エラー分類・借用版デコードによる
+                    // ピーク確保回避などの設計判断は同関数のドキュメント参照）。
+                    //
+                    // クライアントは `visibility` を SET 対象にできない
+                    // （`sql::parser::bind_update` が `42601` で拒否済み。判断 D）。
+                    // 既存値をそのまま維持する。
+                    let visibility = row.visibility;
+                    // 書き換える前の全列値を pre-image として積む（`row` は直後の
+                    // `merge_row_for_update` へ move するため先に読む）。デコード失敗は
+                    // ここでは無視する（本来のデコードエラー分類は直後の
+                    // `merge_row_for_update` が引き続き担い、`CorruptSchema` へ正しく
+                    // 写像される。pre-image はベストエフォートで、無くても ON UPDATE
+                    // アクションが発火しないだけで事後検証は変わらず有効）。`id` 参照
+                    // FK は ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を宣言
+                    // しないテーブルはこのデコードを一切行わない。
+                    if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
+                        if let Ok(old_values) =
+                            crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                        {
+                            pre_images.record(id, old_values);
+                        }
+                    }
+                    let (embedding, metadata) = merge_row_for_update(&schema, row, assignments)?;
+                    let row_input = RowInput {
+                        tenant_id: ctx.tenant_id(),
                         visibility,
-                        values: captured_values_from_parts(&schema, embedding, &metadata)?,
-                    });
+                        embedding: &embedding,
+                        metadata: &metadata,
+                    };
+                    let encoded = encode_row(&row_input)?;
+                    row_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(CatalogError::from)?;
+                    // `RETURNING`（Issue #1182）: 書いた値（更新後）そのものを捕捉する。
+                    if project.is_some() {
+                        captured_row = Some(CapturedRow {
+                            id,
+                            tenant_id: ctx.tenant_id().to_string(),
+                            visibility,
+                            values: captured_values_from_parts(&schema, embedding, &metadata)?,
+                        });
+                    }
+                    1
                 }
-                1
+                // 対象行が不存在、またはヘッダ検査の時点で所有・可視のいずれかを
+                // 満たさない（ヘッダのデコード失敗を含む）場合は区別せず
+                // `UPDATE 0`（内容には一切触れない。RLS-9・RLS-10）。
+                None => 0,
+            };
+            // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
+            // 検査。実際に書き込んだ場合（`rows_affected == 1`）のみ検査する
+            // （`UPDATE 0` は行に一切触れていないため対象外。`row_table` の `mut`
+            // ハンドルはこのブロックを抜けた時点で解放されるため、それより前に
+            // 明示的に drop してから読み取りハンドルとして再度開く）。
+            if rows_affected > 0 {
+                drop(row_table);
+                let delta = crate::constraint::enforce_row_constraints_in_txn(
+                    write_txn,
+                    table,
+                    &schema,
+                    ctx.tenant_id(),
+                    &[id],
+                    target.fk_check_mode(),
+                )?;
+                // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
+                // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ
+                // 検査。永続キー索引の差分は直前の同期をそのまま再利用する）。
+                let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+                crate::constraint::enforce_referencing_rows_in_txn(
+                    write_txn,
+                    table,
+                    &schema,
+                    ctx.tenant_id(),
+                    crate::constraint::ReferencedRowsChange::ColumnsUpdated {
+                        indices: &updated_columns,
+                        delta: &delta,
+                    },
+                    Some(&pre_images),
+                    target.fk_check_mode(),
+                )?;
             }
-            // 対象行が不存在、またはヘッダ検査の時点で所有・可視のいずれかを
-            // 満たさない（ヘッダのデコード失敗を含む）場合は区別せず
-            // `UPDATE 0`（内容には一切触れない。RLS-9・RLS-10）。
-            None => 0,
-        };
-        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
-        // 検査。実際に書き込んだ場合（`rows_affected == 1`）のみ検査する
-        // （`UPDATE 0` は行に一切触れていないため対象外。`row_table` の `mut`
-        // ハンドルはこのブロックを抜けた時点で解放されるため、それより前に
-        // 明示的に drop してから読み取りハンドルとして再度開く）。
-        if rows_affected > 0 {
-            drop(row_table);
-            let delta = crate::constraint::enforce_row_constraints_in_txn(
-                &write_txn,
-                table,
-                &schema,
-                ctx.tenant_id(),
-                &[id],
-                crate::constraint::FkCheckMode::All,
-            )?;
-            // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
-            // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ
-            // 検査。永続キー索引の差分は直前の同期をそのまま再利用する）。
-            let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
-            crate::constraint::enforce_referencing_rows_in_txn(
-                &write_txn,
-                table,
-                &schema,
-                ctx.tenant_id(),
-                crate::constraint::ReferencedRowsChange::ColumnsUpdated {
-                    indices: &updated_columns,
-                    delta: &delta,
-                },
-                Some(&pre_images),
-                crate::constraint::FkCheckMode::All,
-            )?;
         }
-    }
-    // `RETURNING` の投影は制約検査の後・commit の前（[`delete_row_impl`] の
-    // `project` と同じ commit 成功境界。`Err` は `write_txn` の abort）。
-    if let (Some(project), Some(captured)) = (project.as_mut(), captured_row.as_ref()) {
-        project(captured)?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(rows_affected)
+        // `RETURNING` の投影は制約検査の後・commit の前（[`delete_row_impl`] の
+        // `project` と同じ commit 成功境界。`Err` は `write_txn` の abort）。
+        if let (Some(project), Some(captured)) = (project.as_mut(), captured_row.as_ref()) {
+            project(captured)?;
+        }
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok((rows_affected, TxnEffect::Wrote))
+    })
 }
 
 /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -3117,7 +3150,7 @@ pub(crate) fn delete_row_unchecked(
     ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     match delete_row_impl(
-        storage,
+        WriteTarget::Autocommit(storage),
         table,
         ctx,
         id,
@@ -3266,7 +3299,7 @@ struct DeleteCapture<'a> {
 /// トランザクション内・commit 前に実行する必要がある。`None`（既存呼び出し元）
 /// では一切呼ばずビット同一の挙動を保つ。
 fn delete_row_impl(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -3275,173 +3308,190 @@ fn delete_row_impl(
     mut capture: Option<DeleteCapture<'_>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-    let mut captured_row: Option<CapturedRow> = None;
-    // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
-    // `FOREIGN KEY` の参照先キー（主キー・UNIQUE 構成列、または `id` 参照 FK の
-    // 疑似列 `id`）を持ちうる場合のみ、`remove` の直前に読み取った旧値を積む
-    // ——`collect_action_targets` の `Removed` 分岐がこれを使い、「今回削除で
-    // 実際に失われたキー」のみを CASCADE 対象へ限定する（`present_keys` を
-    // 全走査してその時点で親に無いキー全体を対象にすると、`INITIALLY DEFERRED`
-    // の `FOREIGN KEY` が同一トランザクション内で許す一時的な合法孤立行まで
-    // 誤って連鎖削除してしまう。codex-review 指摘）。
-    //
-    // 判定条件は「主キー・UNIQUE を宣言する」だけでは不十分（codex-review
-    // 指摘・PR #1138）: `id` 参照 FK（`REFERENCES parent` で参照先列を省略した
-    // 宣言。D2）は物理キー `id` を参照先にでき、これは親テーブルが主キー・
-    // UNIQUE を一切宣言していなくても成立する。この場合を見落とすと
-    // `needs_fk_removed_pre_image` が偽になり、上記の限定版を使えず全走査
-    // フォールバックへ落ちて、無関係な親行の DELETE が同一トランザクション内の
-    // 一時的な孤立行まで連鎖削除しうる。そのため「自テーブルに主キー・UNIQUE が
-    // ある」に加え、「他テーブルが自テーブルを `id` 参照 FK で参照している」も
-    // 条件に含める（`referencing_foreign_keys_in_txn` でカタログを走査し、
-    // `fk.references_parent_id()` を持つものが 1 件でもあれば真）。ON UPDATE 側の
-    // `pre_images.record` は `id` 参照 FK が ON UPDATE で発火しない（A7）ため
-    // この考慮が不要——判定条件が異なる。
-    let needs_fk_removed_pre_image;
-    let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
-    let (owns_existing, schema) = {
-        // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
-        // `insert_row`/`update_row` と同じ前段を通す。
-        let schema = require_table_schema_write(&write_txn, table)?;
-        needs_fk_removed_pre_image = schema.primary_key().is_some()
-            || !schema.unique_constraints().is_empty()
-            || crate::catalog::referencing_foreign_keys_in_txn(&write_txn, table)?
-                .iter()
-                .any(|(_, fk)| fk.references_parent_id());
-        if let Some(expected) = capture.as_ref() {
-            if expected.schema != &schema {
-                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table schema changed after the delete was bound".to_string(),
-                )));
-            }
-        }
-        // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
-        // ドキュメント参照）。
-        let content_hash = content_hash::for_delete(id);
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-        )?;
-
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
-        // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
-        let key = (ctx.tenant_id(), id);
-        let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
-            Some(guard) => {
-                let (existing_tenant, _existing_visibility) =
-                    decode_row_tenant_and_visibility(guard.value())?;
-                let owns = ctx.is_owner(existing_tenant);
-                if owns && (capture.is_some() || needs_fk_removed_pre_image) {
-                    // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
-                    // （削除後では対象バイト列が失われるため）。物理行フォーマット
-                    // は `storage.rs::decode_row`（`ROW_FORMAT_VERSION`。tenant_id・
-                    // visibility・embedding・不透明な `metadata` バイト列を持つ）で
-                    // あり、`row_codec::decode_row`（別バージョン・別フォーマット。
-                    // 本モジュールの通常の書き込み経路では使われない）ではない。
-                    // `metadata` は `row_codec::decode_scalar_columns` で
-                    // `schema.columns` 順の `Value` 列へ変換する（`VECTOR` 列の位置は
-                    // 常に `Value::Null` を返す契約——`sql::scan` の同じ規約参照）
-                    // ため、`VECTOR` 列位置だけは `Row::embedding` を明示的に
-                    // 差し替える（`dim == 0`／embedding 空は列が NULL である
-                    // 既存契約のため差し替えない）。`StorageError`／`RowCodecError`
-                    // は「既に永続化された行のデコード失敗」＝クライアント入力の
-                    // 不正ではなくサーバー内部事象として扱う（codex-review P1・
-                    // Bugbot 指摘・PR #991: 汎用の `Storage`/`Catalog(Invalid)` を
-                    // 共用すると `map_insert_write_error` が `22000`（クライアント
-                    // 入力不正）へ丸めてしまうため、専用 variant
-                    // `CapturedRowDecodeFailed` で `XX000` に固定する）。
-                    let row = crate::storage::decode_row(id, guard.value()).map_err(|e| {
-                        TenantWriteError::CapturedRowDecodeFailed(format!(
-                            "captured row decode failed: {e}"
-                        ))
-                    })?;
-                    let values = captured_values_from_parts(&schema, row.embedding, &row.metadata)?;
-                    if needs_fk_removed_pre_image {
-                        removed_pre_images.record(id, values.clone());
-                    }
-                    if capture.is_some() {
-                        captured_row = Some(CapturedRow {
-                            id,
-                            tenant_id: row.tenant_id,
-                            visibility: row.visibility,
-                            values,
-                        });
-                    }
+    target.with_txn(|write_txn| {
+        let mut captured_row: Option<CapturedRow> = None;
+        // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
+        // `FOREIGN KEY` の参照先キー（主キー・UNIQUE 構成列、または `id` 参照 FK の
+        // 疑似列 `id`）を持ちうる場合のみ、`remove` の直前に読み取った旧値を積む
+        // ——`collect_action_targets` の `Removed` 分岐がこれを使い、「今回削除で
+        // 実際に失われたキー」のみを CASCADE 対象へ限定する（`present_keys` を
+        // 全走査してその時点で親に無いキー全体を対象にすると、`INITIALLY DEFERRED`
+        // の `FOREIGN KEY` が同一トランザクション内で許す一時的な合法孤立行まで
+        // 誤って連鎖削除してしまう。codex-review 指摘）。
+        //
+        // 判定条件は「主キー・UNIQUE を宣言する」だけでは不十分（codex-review
+        // 指摘・PR #1138）: `id` 参照 FK（`REFERENCES parent` で参照先列を省略した
+        // 宣言。D2）は物理キー `id` を参照先にでき、これは親テーブルが主キー・
+        // UNIQUE を一切宣言していなくても成立する。この場合を見落とすと
+        // `needs_fk_removed_pre_image` が偽になり、上記の限定版を使えず全走査
+        // フォールバックへ落ちて、無関係な親行の DELETE が同一トランザクション内の
+        // 一時的な孤立行まで連鎖削除しうる。そのため「自テーブルに主キー・UNIQUE が
+        // ある」に加え、「他テーブルが自テーブルを `id` 参照 FK で参照している」も
+        // 条件に含める（`referencing_foreign_keys_in_txn` でカタログを走査し、
+        // `fk.references_parent_id()` を持つものが 1 件でもあれば真）。ON UPDATE 側の
+        // `pre_images.record` は `id` 参照 FK が ON UPDATE で発火しない（A7）ため
+        // この考慮が不要——判定条件が異なる。
+        let needs_fk_removed_pre_image;
+        let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
+        let (owns_existing, schema) = {
+            // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
+            // `insert_row`/`update_row` と同じ前段を通す。
+            let schema = require_table_schema_write(write_txn, table)?;
+            needs_fk_removed_pre_image = schema.primary_key().is_some()
+                || !schema.unique_constraints().is_empty()
+                || crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?
+                    .iter()
+                    .any(|(_, fk)| fk.references_parent_id());
+            if let Some(expected) = capture.as_ref() {
+                if expected.schema != &schema {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "table schema changed after the delete was bound".to_string(),
+                    )));
                 }
-                owns
             }
-            None => false,
+            // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
+            // ドキュメント参照）。
+            let content_hash = content_hash::for_delete(id);
+            ledger::record_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                &content_hash,
+            )?;
+
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
+            let key = (ctx.tenant_id(), id);
+            let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
+                Some(guard) => {
+                    let (existing_tenant, _existing_visibility) =
+                        decode_row_tenant_and_visibility(guard.value())?;
+                    let owns = ctx.is_owner(existing_tenant);
+                    if owns && (capture.is_some() || needs_fk_removed_pre_image) {
+                        // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
+                        // （削除後では対象バイト列が失われるため）。物理行フォーマット
+                        // は `storage.rs::decode_row`（`ROW_FORMAT_VERSION`。tenant_id・
+                        // visibility・embedding・不透明な `metadata` バイト列を持つ）で
+                        // あり、`row_codec::decode_row`（別バージョン・別フォーマット。
+                        // 本モジュールの通常の書き込み経路では使われない）ではない。
+                        // `metadata` は `row_codec::decode_scalar_columns` で
+                        // `schema.columns` 順の `Value` 列へ変換する（`VECTOR` 列の位置は
+                        // 常に `Value::Null` を返す契約——`sql::scan` の同じ規約参照）
+                        // ため、`VECTOR` 列位置だけは `Row::embedding` を明示的に
+                        // 差し替える（`dim == 0`／embedding 空は列が NULL である
+                        // 既存契約のため差し替えない）。`StorageError`／`RowCodecError`
+                        // は「既に永続化された行のデコード失敗」＝クライアント入力の
+                        // 不正ではなくサーバー内部事象として扱う（codex-review P1・
+                        // Bugbot 指摘・PR #991: 汎用の `Storage`/`Catalog(Invalid)` を
+                        // 共用すると `map_insert_write_error` が `22000`（クライアント
+                        // 入力不正）へ丸めてしまうため、専用 variant
+                        // `CapturedRowDecodeFailed` で `XX000` に固定する）。
+                        let row = crate::storage::decode_row(id, guard.value()).map_err(|e| {
+                            TenantWriteError::CapturedRowDecodeFailed(format!(
+                                "captured row decode failed: {e}"
+                            ))
+                        })?;
+                        let mut values =
+                            crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                                .map_err(|e| {
+                                    TenantWriteError::CapturedRowDecodeFailed(format!(
+                                        "captured row decode failed: {e}"
+                                    ))
+                                })?;
+                        if !row.embedding.is_empty() {
+                            if let Some(vec_idx) = schema
+                                .columns
+                                .iter()
+                                .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+                            {
+                                if let Some(slot) = values.get_mut(vec_idx) {
+                                    *slot = crate::row_codec::Value::Vector(row.embedding);
+                                }
+                            }
+                        }
+                        if needs_fk_removed_pre_image {
+                            removed_pre_images.record(id, values.clone());
+                        }
+                        if capture.is_some() {
+                            captured_row = Some(CapturedRow {
+                                id,
+                                tenant_id: row.tenant_id,
+                                visibility: row.visibility,
+                                values,
+                            });
+                        }
+                    }
+                    owns
+                }
+                None => false,
+            };
+            if owns_existing {
+                row_table.remove(&key).map_err(CatalogError::from)?;
+            } else if not_found_ledger == DeleteNotFoundLedger::Discard {
+                // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
+                // commit されず破棄されるため、副作用として残らない
+                // （[`delete_row_unchecked`] のドキュメント参照）。
+                return Err(TenantWriteError::NotFound);
+            }
+            (owns_existing, schema)
         };
+        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。行を実際に
+        // 削除した場合のみ行う（`row_table` の可変ハンドルは上のブロック終端で
+        // 既に解放済みのため、索引テーブルのみを別途開いても衝突しない）。
         if owns_existing {
-            row_table.remove(&key).map_err(CatalogError::from)?;
-        } else if not_found_ledger == DeleteNotFoundLedger::Discard {
-            // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
-            // commit されず破棄されるため、副作用として残らない
-            // （[`delete_row_unchecked`] のドキュメント参照）。
-            return Err(TenantWriteError::NotFound);
+            crate::constraint::forget_unique_index_rows_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                std::slice::from_ref(&id),
+            )?;
         }
-        (owns_existing, schema)
-    };
-    // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。行を実際に
-    // 削除した場合のみ行う（`row_table` の可変ハンドルは上のブロック終端で
-    // 既に解放済みのため、索引テーブルのみを別途開いても衝突しない）。
-    if owns_existing {
-        crate::constraint::forget_unique_index_rows_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-            std::slice::from_ref(&id),
-        )?;
-    }
-    // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
-    // 参照先側の検査。行を実際に削除した場合のみ行う——対象行が不存在・他テナント
-    // 所有（いずれも区別しない `NotFound`）の場合は何も変化していないため走査
-    // 自体を行わず、他テナントの行の有無で処理経路が分岐しない（RLS-9・RLS-10）。
-    if owns_existing {
-        crate::constraint::enforce_referencing_rows_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed { ids: &[id] },
-            needs_fk_removed_pre_image.then_some(&removed_pre_images),
-            crate::constraint::FkCheckMode::All,
-        )?;
-    }
-    // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
-    // 既に解放された後に呼ぶ（`delete_row_impl` ドキュメントの `project` 節参照）。
-    // `captured_row` が `Some` になるのは `owns_existing && capture.is_some()` の
-    // 場合のみ（上記ブロック参照）であり、`project` が `Some` でも対象行を実際に
-    // 削除できなかった場合（`NotFound`）は呼ばない——`RETURNING` は削除できた行
-    // のみを返す契約（[`crate::sql::exec::execute_delete_returning`] ドキュメント
-    // 参照）。
-    if let (Some(project), Some(captured)) = (
-        capture.as_mut().and_then(|c| c.project.as_mut()),
-        captured_row.as_ref(),
-    ) {
-        project(captured)?;
-    }
-    if owns_existing {
-        crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    }
-    // `Record` モードで `owns_existing == false` の場合もここへ到達し commit
-    // する（台帳の tentative 追記のみを確定させる。テーブル世代は進行させない
-    // ため既存のキャッシュ失効契約に影響しない）。
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    let outcome = if owns_existing {
-        DeleteRowOutcome::Deleted
-    } else {
-        DeleteRowOutcome::NotFound
-    };
-    Ok((outcome, captured_row))
+        // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
+        // 参照先側の検査。行を実際に削除した場合のみ行う——対象行が不存在・他テナント
+        // 所有（いずれも区別しない `NotFound`）の場合は何も変化していないため走査
+        // 自体を行わず、他テナントの行の有無で処理経路が分岐しない（RLS-9・RLS-10）。
+        if owns_existing {
+            crate::constraint::enforce_referencing_rows_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                crate::constraint::ReferencedRowsChange::Removed { ids: &[id] },
+                needs_fk_removed_pre_image.then_some(&removed_pre_images),
+                target.fk_check_mode(),
+            )?;
+        }
+        // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
+        // 既に解放された後に呼ぶ（`delete_row_impl` ドキュメントの `project` 節参照）。
+        // `captured_row` が `Some` になるのは `owns_existing && capture.is_some()` の
+        // 場合のみ（上記ブロック参照）であり、`project` が `Some` でも対象行を実際に
+        // 削除できなかった場合（`NotFound`）は呼ばない——`RETURNING` は削除できた行
+        // のみを返す契約（[`crate::sql::exec::execute_delete_returning`] ドキュメント
+        // 参照）。
+        if let (Some(project), Some(captured)) = (
+            capture.as_mut().and_then(|c| c.project.as_mut()),
+            captured_row.as_ref(),
+        ) {
+            project(captured)?;
+        }
+        if owns_existing {
+            crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        }
+        // `Record` モードで `owns_existing == false` の場合もここへ到達し commit
+        // する（台帳の tentative 追記のみを確定させる。テーブル世代は進行させない
+        // ため既存のキャッシュ失効契約に影響しない）。
+        let outcome = if owns_existing {
+            DeleteRowOutcome::Deleted
+        } else {
+            DeleteRowOutcome::NotFound
+        };
+        Ok(((outcome, captured_row), TxnEffect::Wrote))
+    })
 }
 
 /// SQL 表層 `DELETE FROM <table> WHERE id = <n> USING OPERATION_ID '<id>'`
@@ -3472,13 +3522,13 @@ fn delete_row_impl(
 /// `NotFound` は台帳を commit しない）とは意図的に別関数とし、その呼び出し元
 /// （`delete_row`・`EngineCore::delete_row`）の挙動は変更しない。
 pub(crate) fn delete_row_ledgered_unchecked(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
     ledger_write: LedgerWrite<'_>,
 ) -> Result<DeleteRowOutcome, TenantWriteError> {
-    delete_row_ledgered_capturing_unchecked(storage, table, ctx, id, ledger_write, None, None)
+    delete_row_ledgered_capturing_unchecked(target, table, ctx, id, ledger_write, None, None)
         .map(|(outcome, _)| outcome)
 }
 
@@ -3491,7 +3541,7 @@ pub(crate) fn delete_row_ledgered_unchecked(
 /// execute_delete_returning` の唯一の到達経路。`capture: None`・`project: None`
 /// を渡すと [`delete_row_ledgered_unchecked`] とビット同一。
 pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
@@ -3500,7 +3550,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
     project: Option<&'a mut ReturningProjectFn<'a>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     delete_row_impl(
-        storage,
+        target,
         table,
         ctx,
         id,
@@ -3568,6 +3618,14 @@ pub(crate) enum PredicateDmlOutcome {
 pub(crate) enum PredicateDmlError<E> {
     Write(TenantWriteError),
     Predicate(E),
+}
+
+/// [`WriteTarget::with_txn`] がロック待ち・commit 失敗を述語形 DML のエラー型へ
+/// 載せるための変換（`Write` 側へ包むだけ）。
+impl<E> From<TenantWriteError> for PredicateDmlError<E> {
+    fn from(e: TenantWriteError) -> Self {
+        PredicateDmlError::Write(e)
+    }
 }
 
 fn dml_write_err<E>(e: impl Into<TenantWriteError>) -> PredicateDmlError<E> {
@@ -3739,7 +3797,7 @@ fn enumerate_dml_candidates<E>(
 /// 7. `commit_boundary::commit`。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_rows_where_unchecked<E>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
@@ -3750,7 +3808,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     delete_rows_where_impl(
-        storage,
+        target,
         table,
         ctx,
         ledger_write,
@@ -3774,7 +3832,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
 /// 到達経路。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_rows_where_capturing_unchecked<E>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
@@ -3786,7 +3844,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     delete_rows_where_impl(
-        storage,
+        target,
         table,
         ctx,
         ledger_write,
@@ -3803,7 +3861,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
 /// 共有実体（`project: None` は前者とビット同一）。
 #[allow(clippy::too_many_arguments)]
 fn delete_rows_where_impl<E>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
@@ -3815,132 +3873,137 @@ fn delete_rows_where_impl<E>(
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
-    let write_txn = storage
-        .begin_write_txn()
-        .map_err(|e| dml_write_err(convert_write_txn_err(e)))?;
-
-    let (candidate_ids, schema) = {
-        let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
-        if let Some(expected) = expected_schema {
-            if expected != &schema {
-                return Err(dml_write_err(CatalogError::Invalid(
-                    "table schema changed after the statement was bound".to_string(),
-                )));
+    target.with_txn(|write_txn| {
+        let (candidate_ids, schema) = {
+            let schema = require_table_schema_write(write_txn, table).map_err(dml_write_err)?;
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
+                    return Err(dml_write_err(CatalogError::Invalid(
+                        "table schema changed after the statement was bound".to_string(),
+                    )));
+                }
             }
+
+            ledger::record_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                content_hash_value,
+            )
+            .map_err(dml_write_err)?;
+
+            let row_table_name = user_rows_table_name(table);
+            let row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+            let candidate_ids =
+                enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+            (candidate_ids, schema)
+        };
+
+        if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
+            // `write_txn` をここで drop する（commit しない）。台帳の tentative
+            // 追記・行変更のいずれも痕跡が残らない（ADR §6「4.」）。
+            return Ok((
+                PredicateDmlOutcome::LimitExceeded {
+                    count: candidate_ids.len(),
+                },
+                TxnEffect::NoOp,
+            ));
         }
 
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            content_hash_value,
-        )
-        .map_err(dml_write_err)?;
-
-        let row_table_name = user_rows_table_name(table);
-        let row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-        let candidate_ids =
-            enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
-        (candidate_ids, schema)
-    };
-
-    if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
-        // `write_txn` をここで drop する（commit しない）。台帳の tentative
-        // 追記・行変更のいずれも痕跡が残らない（ADR §6「4.」）。
-        return Ok(PredicateDmlOutcome::LimitExceeded {
-            count: candidate_ids.len(),
-        });
-    }
-
-    // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`
-    // と同じ判定条件・同じ理由（`removed_pre_images` のドキュメント参照。
-    // `id` 参照 FK を考慮する PR #1138 の修正を含む）で `remove` の戻り値
-    // （削除前の物理行）から旧値を復元して積む。
-    let needs_fk_removed_pre_image = schema.primary_key().is_some()
-        || !schema.unique_constraints().is_empty()
-        || crate::catalog::referencing_foreign_keys_in_txn(&write_txn, table)
-            .map_err(dml_write_err)?
-            .iter()
-            .any(|(_, fk)| fk.references_parent_id());
-    let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
-    {
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-        for id in &candidate_ids {
-            let key = (ctx.tenant_id(), *id);
-            let removed_guard = row_table
-                .remove(&key)
-                .map_err(|e| dml_write_err(CatalogError::from(e)))?;
-            if needs_fk_removed_pre_image || project.is_some() {
-                if let Some(guard) = removed_guard {
-                    let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
-                        dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
-                            "removed row decode failed: {e}"
-                        )))
-                    })?;
-                    let values = captured_values_from_parts(&schema, row.embedding, &row.metadata)
-                        .map_err(dml_write_err)?;
-                    if needs_fk_removed_pre_image {
-                        removed_pre_images.record(*id, values.clone());
-                    }
-                    // `RETURNING`（Issue #1182）: 削除前の値。`remove` 済みだが
-                    // `write_txn` 未 commit のため、`Err` は abort で行ごと巻き戻る。
-                    if let Some(project) = project.as_mut() {
-                        project(&CapturedRow {
-                            id: *id,
-                            tenant_id: row.tenant_id,
-                            visibility: row.visibility,
-                            values,
-                        })
-                        .map_err(dml_write_err)?;
+        // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`
+        // と同じ判定条件・同じ理由（`removed_pre_images` のドキュメント参照。
+        // `id` 参照 FK を考慮する PR #1138 の修正を含む）で `remove` の戻り値
+        // （削除前の物理行）から旧値を復元して積む。
+        let needs_fk_removed_pre_image = schema.primary_key().is_some()
+            || !schema.unique_constraints().is_empty()
+            || crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)
+                .map_err(dml_write_err)?
+                .iter()
+                .any(|(_, fk)| fk.references_parent_id());
+        let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
+        {
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+            for id in &candidate_ids {
+                let key = (ctx.tenant_id(), *id);
+                let removed_guard = row_table
+                    .remove(&key)
+                    .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+                if needs_fk_removed_pre_image || project.is_some() {
+                    if let Some(guard) = removed_guard {
+                        let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
+                            dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
+                                "removed row decode failed: {e}"
+                            )))
+                        })?;
+                        let values =
+                            captured_values_from_parts(&schema, row.embedding, &row.metadata)
+                                .map_err(dml_write_err)?;
+                        if needs_fk_removed_pre_image {
+                            removed_pre_images.record(*id, values.clone());
+                        }
+                        // `RETURNING`（Issue #1182）: 削除前の値。`remove` 済みだが
+                        // `write_txn` 未 commit のため、`Err` は abort で行ごと巻き戻る。
+                        if let Some(project) = project.as_mut() {
+                            project(&CapturedRow {
+                                id: *id,
+                                tenant_id: row.tenant_id,
+                                visibility: row.visibility,
+                                values,
+                            })
+                            .map_err(dml_write_err)?;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。
-    // `row_table`（`mut`）の可変ハンドルは上のブロック終端で既に解放済み。
-    if !candidate_ids.is_empty() {
-        crate::constraint::forget_unique_index_rows_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-            &candidate_ids,
-        )
-        .map_err(dml_write_err)?;
-    }
+        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。
+        // `row_table`（`mut`）の可変ハンドルは上のブロック終端で既に解放済み。
+        if !candidate_ids.is_empty() {
+            crate::constraint::forget_unique_index_rows_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                &candidate_ids,
+            )
+            .map_err(dml_write_err)?;
+        }
 
-    // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
-    // 参照先側の検査（行を 1 件以上削除した場合のみ。候補は自テナント所有の行に
-    // 限られる）。
-    if !candidate_ids.is_empty() {
-        crate::constraint::enforce_referencing_rows_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed {
-                ids: &candidate_ids,
-            },
-            needs_fk_removed_pre_image.then_some(&removed_pre_images),
-            crate::constraint::FkCheckMode::All,
-        )
-        .map_err(dml_write_err)?;
-    }
+        // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
+        // 参照先側の検査（行を 1 件以上削除した場合のみ。候補は自テナント所有の行に
+        // 限られる）。
+        if !candidate_ids.is_empty() {
+            crate::constraint::enforce_referencing_rows_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                crate::constraint::ReferencedRowsChange::Removed {
+                    ids: &candidate_ids,
+                },
+                needs_fk_removed_pre_image.then_some(&removed_pre_images),
+                target.fk_check_mode(),
+            )
+            .map_err(dml_write_err)?;
+        }
 
-    let rows_affected = candidate_ids.len();
-    if rows_affected > 0 {
-        crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
-    }
-    crate::recovery::commit_boundary::commit(write_txn).map_err(dml_write_err)?;
-    Ok(PredicateDmlOutcome::Applied { rows_affected })
+        let rows_affected = candidate_ids.len();
+        if rows_affected > 0 {
+            crate::catalog::bump_table_generation_in_txn(write_txn, table)
+                .map_err(dml_write_err)?;
+        }
+        Ok((
+            PredicateDmlOutcome::Applied { rows_affected },
+            TxnEffect::Wrote,
+        ))
+    })
 }
 
 /// 述語つき `UPDATE <table> SET ... WHERE ... USING OPERATION_ID '<id>'`
@@ -3957,7 +4020,7 @@ fn delete_rows_where_impl<E>(
 /// ため表層からは到達しない）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_rows_where_unchecked<E>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
@@ -3979,7 +4042,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     update_rows_where_impl(
-        storage,
+        target,
         table,
         ctx,
         ledger_write,
@@ -4001,7 +4064,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
 /// execute_predicate_update_returning` の唯一の到達経路。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_rows_where_capturing_unchecked<E>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
@@ -4015,7 +4078,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
     project: &mut ReturningProjectFn<'_>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     update_rows_where_impl(
-        storage,
+        target,
         table,
         ctx,
         ledger_write,
@@ -4034,7 +4097,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
 /// 共有実体（`project: None` は前者とビット同一）。
 #[allow(clippy::too_many_arguments)]
 fn update_rows_where_impl<E>(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     table: &str,
     ctx: &PolicyContext,
     ledger_write: LedgerWrite<'_>,
@@ -4048,168 +4111,172 @@ fn update_rows_where_impl<E>(
     mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
-    let write_txn = storage
-        .begin_write_txn()
-        .map_err(|e| dml_write_err(convert_write_txn_err(e)))?;
-
-    let (candidate_ids, schema) = {
-        let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
-        if let Some(expected) = expected_schema {
-            if expected != &schema {
-                return Err(dml_write_err(CatalogError::Invalid(
-                    "table schema changed after the statement was bound".to_string(),
-                )));
-            }
-        }
-
-        // SET 値をスキーマに対して検証する（[`validate_set_assignments`] を単一行
-        // [`update_row_columns_unchecked`] と共有）。候補行列挙・台帳記録より
-        // **前**に行うことで、一致行が 0 件の場合でも不正な SET 値（`MAX_TEXT_
-        // FIELD_LEN` 超過・累計 payload 上限超過・`VECTOR` 次元不一致・列型不一致
-        // 等）は必ず拒否され、台帳へ記録される前に `write_txn` を破棄できる
-        // （codex-review P1 指摘・PR #993 系・Issue #871: この検証が候補行の
-        // 適用ループ内にしか無いと、一致行 0 件のまま台帳記録・`UPDATE 0` 成功が
-        // 通ってしまい、同じ `operation_id` が正当な後続再送に使えなくなる）。
-        validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
-
-        ledger::record_in_txn_accepting(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            content_hash_value,
-            legacy_hashes,
-        )
-        .map_err(dml_write_err)?;
-
-        let row_table_name = user_rows_table_name(table);
-        let row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-        let candidate_ids =
-            enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
-        (candidate_ids, schema)
-    };
-
-    if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
-        return Ok(PredicateDmlOutcome::LimitExceeded {
-            count: candidate_ids.len(),
-        });
-    }
-
-    // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
-    let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
-    {
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-        for id in &candidate_ids {
-            let key = (ctx.tenant_id(), *id);
-            let existing = match row_table
-                .get(&key)
-                .map_err(|e| dml_write_err(CatalogError::from(e)))?
-            {
-                Some(guard) => {
-                    crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
-                        .map_err(dml_write_err)?
-                }
-                None => {
-                    // 列挙後・適用前の並行削除（同一トランザクション内で候補行は
-                    // 列挙時に読み取り済みのため、redb の単一ライター制約下では
-                    // 通常到達しないが、fail-closed に内部エラーとして拒否する
-                    // （`unwrap`/添字禁止・coding-rust.md）。
+    target.with_txn(|write_txn| {
+        let (candidate_ids, schema) = {
+            let schema = require_table_schema_write(write_txn, table).map_err(dml_write_err)?;
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
                     return Err(dml_write_err(CatalogError::Invalid(
-                        "internal: candidate row disappeared before apply".to_string(),
+                        "table schema changed after the statement was bound".to_string(),
                     )));
                 }
-            };
-            let visibility = existing.visibility;
-            // 書き換える前の全列値を pre-image として積む（`existing` は直後の
-            // `merge_row_for_update` へ move するため先に読む）。デコード失敗は
-            // ここでは無視する（本来のデコードエラー分類は直後の
-            // `merge_row_for_update` が引き続き担う。pre-image はベストエフォート）。
-            // `id` 参照 FK は ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を
-            // 宣言しないテーブルはこのデコードを一切行わない。
-            if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
-                if let Ok(old_values) =
-                    crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+            }
+
+            // SET 値をスキーマに対して検証する（[`validate_set_assignments`] を単一行
+            // [`update_row_columns_unchecked`] と共有）。候補行列挙・台帳記録より
+            // **前**に行うことで、一致行が 0 件の場合でも不正な SET 値（`MAX_TEXT_
+            // FIELD_LEN` 超過・累計 payload 上限超過・`VECTOR` 次元不一致・列型不一致
+            // 等）は必ず拒否され、台帳へ記録される前に `write_txn` を破棄できる
+            // （codex-review P1 指摘・PR #993 系・Issue #871: この検証が候補行の
+            // 適用ループ内にしか無いと、一致行 0 件のまま台帳記録・`UPDATE 0` 成功が
+            // 通ってしまい、同じ `operation_id` が正当な後続再送に使えなくなる）。
+            validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+
+            ledger::record_in_txn_accepting(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                content_hash_value,
+                legacy_hashes,
+            )
+            .map_err(dml_write_err)?;
+
+            let row_table_name = user_rows_table_name(table);
+            let row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+            let candidate_ids =
+                enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+            (candidate_ids, schema)
+        };
+
+        if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
+            return Ok((
+                PredicateDmlOutcome::LimitExceeded {
+                    count: candidate_ids.len(),
+                },
+                TxnEffect::NoOp,
+            ));
+        }
+
+        // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
+        let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
+        {
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+            for id in &candidate_ids {
+                let key = (ctx.tenant_id(), *id);
+                let existing = match row_table
+                    .get(&key)
+                    .map_err(|e| dml_write_err(CatalogError::from(e)))?
                 {
-                    pre_images.record(*id, old_values);
+                    Some(guard) => {
+                        crate::storage::decode_row_for_key(ctx.tenant_id(), *id, guard.value())
+                            .map_err(dml_write_err)?
+                    }
+                    None => {
+                        // 列挙後・適用前の並行削除（同一トランザクション内で候補行は
+                        // 列挙時に読み取り済みのため、redb の単一ライター制約下では
+                        // 通常到達しないが、fail-closed に内部エラーとして拒否する
+                        // （`unwrap`/添字禁止・coding-rust.md）。
+                        return Err(dml_write_err(CatalogError::Invalid(
+                            "internal: candidate row disappeared before apply".to_string(),
+                        )));
+                    }
+                };
+                let visibility = existing.visibility;
+                // 書き換える前の全列値を pre-image として積む（`existing` は直後の
+                // `merge_row_for_update` へ move するため先に読む）。デコード失敗は
+                // ここでは無視する（本来のデコードエラー分類は直後の
+                // `merge_row_for_update` が引き続き担う。pre-image はベストエフォート）。
+                // `id` 参照 FK は ON UPDATE で発火しない（A7）ため、主キー・UNIQUE を
+                // 宣言しないテーブルはこのデコードを一切行わない。
+                if schema.primary_key().is_some() || !schema.unique_constraints().is_empty() {
+                    if let Ok(old_values) =
+                        crate::row_codec::decode_scalar_columns(&schema, &existing.metadata)
+                    {
+                        pre_images.record(*id, old_values);
+                    }
+                }
+
+                // read-merge-write 本体は単一行 UPDATE
+                // （`update_row_columns_unchecked`）と共有する
+                // [`merge_row_for_update`] へ委譲済み（Issue #996。エラー分類・
+                // 借用版デコードによるピーク確保回避・SET 列重複時の意味論
+                // （先勝ち）などの設計判断は同関数のドキュメント参照）。
+                let (embedding_value, metadata) =
+                    merge_row_for_update(&schema, existing, assignments).map_err(dml_write_err)?;
+                let row = RowInput {
+                    tenant_id: ctx.tenant_id(),
+                    // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
+                    visibility,
+                    embedding: &embedding_value,
+                    metadata: &metadata,
+                };
+                let encoded = encode_row(&row).map_err(dml_write_err)?;
+                row_table
+                    .insert(key, encoded.as_slice())
+                    .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+                // `RETURNING`（Issue #1182）: 書いた値（更新後）を行ごとに投影する。
+                if let Some(project) = project.as_mut() {
+                    let values = captured_values_from_parts(&schema, embedding_value, &metadata)
+                        .map_err(dml_write_err)?;
+                    project(&CapturedRow {
+                        id: *id,
+                        tenant_id: ctx.tenant_id().to_string(),
+                        visibility,
+                        values,
+                    })
+                    .map_err(dml_write_err)?;
                 }
             }
-
-            // read-merge-write 本体は単一行 UPDATE
-            // （`update_row_columns_unchecked`）と共有する
-            // [`merge_row_for_update`] へ委譲済み（Issue #996。エラー分類・
-            // 借用版デコードによるピーク確保回避・SET 列重複時の意味論
-            // （先勝ち）などの設計判断は同関数のドキュメント参照）。
-            let (embedding_value, metadata) =
-                merge_row_for_update(&schema, existing, assignments).map_err(dml_write_err)?;
-            let row = RowInput {
-                tenant_id: ctx.tenant_id(),
-                // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
-                visibility,
-                embedding: &embedding_value,
-                metadata: &metadata,
-            };
-            let encoded = encode_row(&row).map_err(dml_write_err)?;
-            row_table
-                .insert(key, encoded.as_slice())
-                .map_err(|e| dml_write_err(CatalogError::from(e)))?;
-            // `RETURNING`（Issue #1182）: 書いた値（更新後）を行ごとに投影する。
-            if let Some(project) = project.as_mut() {
-                let values = captured_values_from_parts(&schema, embedding_value, &metadata)
-                    .map_err(dml_write_err)?;
-                project(&CapturedRow {
-                    id: *id,
-                    tenant_id: ctx.tenant_id().to_string(),
-                    visibility,
-                    values,
-                })
-                .map_err(dml_write_err)?;
-            }
         }
-    }
 
-    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査。
-    // 一致行が 0 件（何も書き込んでいない）場合は呼ばない（`constraint.rs`
-    // モジュールドキュメント参照）。
-    if !candidate_ids.is_empty() {
-        let delta = crate::constraint::enforce_row_constraints_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-            &candidate_ids,
-            crate::constraint::FkCheckMode::All,
-        )
-        .map_err(dml_write_err)?;
-        // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
-        // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ検査。永続
-        // キー索引の差分は直前の同期をそのまま再利用する）。
-        let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
-        crate::constraint::enforce_referencing_rows_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::ColumnsUpdated {
-                indices: &updated_columns,
-                delta: &delta,
-            },
-            Some(&pre_images),
-            crate::constraint::FkCheckMode::All,
-        )
-        .map_err(dml_write_err)?;
-    }
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査。
+        // 一致行が 0 件（何も書き込んでいない）場合は呼ばない（`constraint.rs`
+        // モジュールドキュメント参照）。
+        if !candidate_ids.is_empty() {
+            let delta = crate::constraint::enforce_row_constraints_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                &candidate_ids,
+                target.fk_check_mode(),
+            )
+            .map_err(dml_write_err)?;
+            // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
+            // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ検査。永続
+            // キー索引の差分は直前の同期をそのまま再利用する）。
+            let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+            crate::constraint::enforce_referencing_rows_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                crate::constraint::ReferencedRowsChange::ColumnsUpdated {
+                    indices: &updated_columns,
+                    delta: &delta,
+                },
+                Some(&pre_images),
+                target.fk_check_mode(),
+            )
+            .map_err(dml_write_err)?;
+        }
 
-    let rows_affected = candidate_ids.len();
-    if rows_affected > 0 {
-        crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
-    }
-    crate::recovery::commit_boundary::commit(write_txn).map_err(dml_write_err)?;
-    Ok(PredicateDmlOutcome::Applied { rows_affected })
+        let rows_affected = candidate_ids.len();
+        if rows_affected > 0 {
+            crate::catalog::bump_table_generation_in_txn(write_txn, table)
+                .map_err(dml_write_err)?;
+        }
+        Ok((
+            PredicateDmlOutcome::Applied { rows_affected },
+            TxnEffect::Wrote,
+        ))
+    })
 }
 
 pub(crate) fn truncate_table_unchecked(
@@ -5381,7 +5448,7 @@ mod tests {
         let update_columns_op = op("bump-update-row-columns");
         let ledger_write = LedgerWrite::Record(&update_columns_op);
         update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             // id=3 は `insert_typed_row`（`encode_scalar_columns` 経由の正規
@@ -5394,11 +5461,11 @@ mod tests {
             ledger_write,
             None,
         )
-        .expect("update_row_columns_unchecked (1 row)");
+        .expect("update_row_columns_unchecked (WriteTarget::Autocommit(1 row))");
         let next = read_gen("docs");
         assert!(
             next > prev,
-            "update_row_columns_unchecked (1 row) must bump docs' generation"
+            "update_row_columns_unchecked (WriteTarget::Autocommit(1 row)) must bump docs' generation"
         );
         prev = next;
         assert_eq!(read_gen("sibling"), sibling_gen);
@@ -5408,7 +5475,7 @@ mod tests {
         let update_columns_zero_op = op("bump-update-row-columns-zero");
         let ledger_write_zero = LedgerWrite::Record(&update_columns_zero_op);
         let rows_affected = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             999,
@@ -5416,12 +5483,12 @@ mod tests {
             ledger_write_zero,
             None,
         )
-        .expect("update_row_columns_unchecked (0 rows)");
+        .expect("update_row_columns_unchecked (WriteTarget::Autocommit(0 rows))");
         assert_eq!(rows_affected, 0);
         let next = read_gen("docs");
         assert!(
             next > prev,
-            "update_row_columns_unchecked (0 rows) must still bump docs' generation"
+            "update_row_columns_unchecked (WriteTarget::Autocommit(0 rows)) must still bump docs' generation"
         );
         prev = next;
         assert_eq!(read_gen("sibling"), sibling_gen);
@@ -5561,7 +5628,7 @@ mod tests {
         // ケース (a): 対象行が存在する（id=1）。
         let op_existing = OperationId::parse("op-maxlen-existing").expect("valid operation_id");
         let err_existing = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             1,
@@ -5574,7 +5641,7 @@ mod tests {
         // ケース (b): 対象行が存在しない（id=999）。
         let op_missing = OperationId::parse("op-maxlen-missing").expect("valid operation_id");
         let err_missing = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             999,
@@ -5679,7 +5746,7 @@ mod tests {
         let op_existing =
             OperationId::parse("op-real-double-cap-existing").expect("valid operation_id");
         let err_existing = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             1,
@@ -5697,7 +5764,7 @@ mod tests {
         let op_missing =
             OperationId::parse("op-real-double-cap-missing").expect("valid operation_id");
         let err_missing = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             999,
@@ -5752,7 +5819,7 @@ mod tests {
         let op_id =
             OperationId::parse("op-pred-maxlen-zero-candidates").expect("valid operation_id");
         let err = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             LedgerWrite::Record(&op_id),
@@ -5782,7 +5849,7 @@ mod tests {
         // `OperationIdContentMismatch` になるはず）。
         let ok_assignments = [(2, crate::row_codec::Value::Text("ok".to_string()))];
         let outcome = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             LedgerWrite::Record(&op_id),
@@ -5847,7 +5914,7 @@ mod tests {
         let op_id = OperationId::parse("op-pred-corrupt").expect("valid operation_id");
 
         let err = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             LedgerWrite::Record(&op_id),
@@ -5953,7 +6020,7 @@ mod tests {
         let op_id = OperationId::parse("op-pred-no-vector-column").expect("valid operation_id");
 
         let outcome = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "notes",
             &ctx,
             LedgerWrite::Record(&op_id),
@@ -6169,7 +6236,7 @@ mod tests {
                 OperationId::parse(&format!("op-byte-identical-{id}")).expect("valid operation_id");
 
             let outcome = update_rows_where_unchecked(
-                &storage,
+                WriteTarget::Autocommit(&storage),
                 "docs",
                 &ctx,
                 LedgerWrite::Record(&op_id),
@@ -6281,7 +6348,7 @@ mod tests {
             (1, crate::row_codec::Value::Text("note2.txt".to_string())),
         ];
         let err = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             1,
@@ -6306,7 +6373,7 @@ mod tests {
             (1, crate::row_codec::Value::Text("note2.txt".to_string())),
         ];
         let err_mismatch = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             1,
@@ -6403,7 +6470,7 @@ mod tests {
         let match_target =
             |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == 1) };
         let err = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             LedgerWrite::Record(&legacy_op),
@@ -6455,7 +6522,7 @@ mod tests {
         let match_target2 =
             |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == 1) };
         let err_mismatch = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &a,
             LedgerWrite::Record(&legacy_op),
@@ -6530,7 +6597,7 @@ mod tests {
                 .expect("valid tenant");
         let op_visible = OperationId::parse("op-overflow-visible").expect("valid operation_id");
         let err_visible = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx_visible,
             1,
@@ -6558,7 +6625,7 @@ mod tests {
         let ctx_invisible = PolicyContext::new("tenant-a").expect("valid tenant");
         let op_invisible = OperationId::parse("op-overflow-invisible").expect("valid operation_id");
         let rows_affected_invisible = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx_invisible,
             1,
@@ -6654,7 +6721,7 @@ mod tests {
         let op_visible =
             OperationId::parse("op-real-presence-parity-visible").expect("valid operation_id");
         let err_visible = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx_visible,
             1,
@@ -6682,7 +6749,7 @@ mod tests {
         let op_invisible =
             OperationId::parse("op-real-presence-parity-invisible").expect("valid operation_id");
         let rows_affected_invisible = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx_invisible,
             1,
@@ -6704,7 +6771,7 @@ mod tests {
         let op_missing =
             OperationId::parse("op-real-presence-parity-missing").expect("valid operation_id");
         let rows_affected_missing = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx_visible,
             999,
@@ -6775,7 +6842,7 @@ mod tests {
         let matches_seeded_id =
             |c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(c.id == 1) };
         let err = update_rows_where_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             LedgerWrite::Record(&op),
@@ -6898,7 +6965,7 @@ mod tests {
         let op_invisible =
             OperationId::parse("op-corrupt-invisible-body").expect("valid operation_id");
         let rows_affected = update_row_columns_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx_invisible,
             1,
@@ -7108,7 +7175,7 @@ mod tests {
             .resolve(Some(&op_id))
             .expect("resolve ledger write");
         insert_typed_rows_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "typed_docs",
             &ctx,
             Visibility::Public,
@@ -7277,7 +7344,7 @@ mod tests {
             ))
         };
         let result = delete_row_ledgered_capturing_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             1,
@@ -7309,7 +7376,7 @@ mod tests {
             .resolve(Some(&delete_op_id))
             .expect("resolve ledger write");
         let retry = delete_row_ledgered_capturing_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             1,
@@ -7381,7 +7448,7 @@ mod tests {
         let rows: [(u64, &[crate::row_codec::Value]); 1] = [(1, &seed_values)];
 
         let result = upsert_typed_rows_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             Visibility::Private,
@@ -7463,7 +7530,7 @@ mod tests {
         let ledger = || LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
         let mut project = failing_project;
         let result = delete_rows_where_capturing_unchecked::<()>(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             ledger(),
@@ -7489,7 +7556,7 @@ mod tests {
         );
 
         let retry = delete_rows_where_unchecked::<()>(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             ledger(),
@@ -7521,7 +7588,7 @@ mod tests {
         let assignments = [(0usize, crate::row_codec::Value::Vector(vec![5.0, 5.0]))];
         let mut project = failing_project;
         let result = update_rows_where_capturing_unchecked::<()>(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             ledger(),
@@ -7547,7 +7614,7 @@ mod tests {
         );
 
         let retry = update_rows_where_unchecked::<()>(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             ledger(),
@@ -7580,7 +7647,7 @@ mod tests {
         let assignments = [(0usize, crate::row_codec::Value::Vector(vec![5.0, 5.0]))];
         let mut project = failing_project;
         let result = update_row_columns_capturing_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             1,
@@ -7595,8 +7662,15 @@ mod tests {
         ));
         assert_eq!(embedding_of(&storage, &ctx, 1), Some(vec![1.0, 0.0]));
 
-        let retry =
-            update_row_columns_unchecked(&storage, "docs", &ctx, 1, &assignments, ledger(), None);
+        let retry = update_row_columns_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx,
+            1,
+            &assignments,
+            ledger(),
+            None,
+        );
         assert!(
             matches!(retry, Ok(1)),
             "台帳が巻き戻っていること: {retry:?}"
@@ -7620,7 +7694,7 @@ mod tests {
             Ok(())
         };
         let result = update_row_columns_capturing_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             42,
@@ -7652,7 +7726,7 @@ mod tests {
         let ledger = || LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
         let mut project = failing_project;
         let result = upsert_typed_rows_capturing_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             Visibility::Private,
@@ -7669,7 +7743,7 @@ mod tests {
         ));
         assert!(embedding_of(&storage, &ctx_all, 2).is_none());
         let retry = upsert_typed_rows_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             Visibility::Private,
@@ -7695,7 +7769,7 @@ mod tests {
         let ledger2 = || LedgerMode::Ledgered.resolve(Some(&op2)).expect("resolve");
         let mut project = failing_project;
         let result = upsert_typed_rows_capturing_unchecked(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             Visibility::Private,

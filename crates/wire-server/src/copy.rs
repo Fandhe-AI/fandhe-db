@@ -34,6 +34,7 @@ use engine::sql::allowlist::{CopyFormat, SqlSurfaceError};
 use engine::sql::copy::CopyInSession;
 use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::SessionTransaction;
 
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
@@ -123,24 +124,31 @@ fn enforce_discard_budget<S: WireStream>(
 /// ErrorResponse を書いてから ReadyForQuery を書く
 /// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
-/// `ReadyForQuery` の状態バイトは常に `Idle` を渡す ―― `handshake::
-/// post_auth_loop` は明示トランザクションが `Idle` の場合に限り本モジュール
-/// （`crate::copy::run`）へ委譲するため（SQL-31・TASK-221。`Active`／`Failed`
-/// 中の COPY は本モジュールへ到達する前に `0A000`／`25P02` で拒否される）。
+/// `ReadyForQuery` の状態バイトは接続の明示トランザクション状態（`txn.status()`）から
+/// 導出する（SQL-31・TASK-221、Issue #1179。`handshake::post_auth_loop` は `Idle`・
+/// `Active` のとき本モジュール〔`crate::copy::run`〕へ委譲し、`Failed` 中の COPY は
+/// 本モジュールへ到達する前に `25P02` で拒否する）。
+///
+/// 明示トランザクション中に COPY が失敗した場合は、PostgreSQL と同じく
+/// トランザクションを `Failed`（ReadyForQuery `'E'`）へ遷移させてから応答する
+/// （`txn.fail()` は `Active` 以外では何もしないため、トランザクション外の挙動は不変）。
 fn respond_error_and_ready<S: WireStream>(
     stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
+    txn.fail();
     crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(
-        stream,
-        engine::sql::transaction::TransactionStatus::Idle,
-    )
+    crate::handshake::write_ready_for_query_io(stream, txn.status())
 }
 
-fn respond_sql_error<S: WireStream>(stream: &mut S, e: &SqlSurfaceError) -> io::Result<()> {
-    respond_error_and_ready(stream, e.error_class(), &e.client_message())
+fn respond_sql_error<S: WireStream>(
+    stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
+    e: &SqlSurfaceError,
+) -> io::Result<()> {
+    respond_error_and_ready(stream, txn, e.error_class(), &e.client_message())
 }
 
 /// `CopyInResponse`（'G'）／`CopyOutResponse`（'H'）を組み立てる。いずれも
@@ -298,6 +306,7 @@ fn encode_copy_data_row_into(
 /// 前に確定しているため、この経路には到達しない）。
 fn run_copy_to<S: WireStream>(
     stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
     format: CopyFormat,
     result: &QueryResult,
     finish: Finish,
@@ -307,6 +316,7 @@ fn run_copy_to<S: WireStream>(
         Err(()) => {
             return respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode CopyOutResponse",
             )
@@ -330,6 +340,7 @@ fn run_copy_to<S: WireStream>(
             buffer.flush(stream)?;
             return respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode CopyData",
             )
@@ -348,9 +359,7 @@ fn run_copy_to<S: WireStream>(
             if finish == Finish::ReadyForQuery {
                 buffer.push_frame(
                     stream,
-                    &result_encoder::encode_ready_for_query(
-                        engine::sql::transaction::TransactionStatus::Idle,
-                    ),
+                    &result_encoder::encode_ready_for_query(txn.status()),
                 )?;
             }
             buffer.flush(stream)?;
@@ -360,6 +369,7 @@ fn run_copy_to<S: WireStream>(
             buffer.flush(stream)?;
             respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
             )
@@ -386,10 +396,11 @@ fn run_copy_to<S: WireStream>(
 /// が通常のクエリループへ戻ってクライアントが実際にソケットを閉じるまで
 /// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
 /// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
-fn run_copy_from<S: WireStream>(
+fn run_copy_from<'e, S: WireStream>(
     stream: &mut S,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
+    txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
     finish: Finish,
 ) -> io::Result<CopyStep> {
@@ -398,6 +409,7 @@ fn run_copy_from<S: WireStream>(
         Err(()) => {
             return respond_error_and_ready(
                 stream,
+                txn,
                 ErrorClass::InternalError,
                 "failed to encode CopyInResponse",
             )
@@ -456,7 +468,7 @@ fn run_copy_from<S: WireStream>(
             b'c' => {
                 framing::read_length_prefixed_body(stream, 4, 4)
                     .map_err(|e| respond_frame_error_and_terminate(stream, e))?;
-                return finish_copy_from(stream, engine, ctx, session, errored, finish);
+                return finish_copy_from(stream, engine, ctx, txn, session, errored, finish);
             }
             b'f' => {
                 let body = framing::read_length_prefixed_body(
@@ -495,6 +507,7 @@ fn run_copy_from<S: WireStream>(
                 }
                 return respond_error_and_ready(
                     stream,
+                    txn,
                     ErrorClass::InvalidInput,
                     "COPY failed on the client side",
                 )
@@ -564,26 +577,27 @@ fn run_copy_from<S: WireStream>(
 /// `simple_query::execute_and_respond` と同じ設計（`ResponseBoundaryGuard` は
 /// 呼び出し元 [`run`] が関数全体を覆い、`EmergencyResponseRegistration` は
 /// commit 呼び出しだけをブロックスコープで覆う）。
-fn finish_copy_from<S: WireStream>(
+fn finish_copy_from<'e, S: WireStream>(
     stream: &mut S,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
+    txn: &mut SessionTransaction<'e>,
     session: CopyInSession,
     errored: Option<SqlSurfaceError>,
     finish: Finish,
 ) -> io::Result<CopyStep> {
     if let Some(e) = errored {
-        return respond_sql_error(stream, &e).map(|()| CopyStep::Failed);
+        return respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed);
     }
 
     let batch = match session.finish() {
         Ok(b) => b,
-        Err(e) => return respond_sql_error(stream, &e).map(|()| CopyStep::Failed),
+        Err(e) => return respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     };
 
     let outcome = {
         let _emergency_registration = crate::simple_query::register_emergency_response(stream);
-        engine.commit_copy_in(ctx, batch)
+        engine.commit_copy_in_txn(ctx, txn, batch)
     };
 
     match outcome {
@@ -595,22 +609,20 @@ fn finish_copy_from<S: WireStream>(
                 Ok(msg) => {
                     stream.write_all(&msg)?;
                     if finish == Finish::ReadyForQuery {
-                        crate::handshake::write_ready_for_query_io(
-                            stream,
-                            engine::sql::transaction::TransactionStatus::Idle,
-                        )?;
+                        crate::handshake::write_ready_for_query_io(stream, txn.status())?;
                     }
                     Ok(CopyStep::Completed)
                 }
                 Err(_) => respond_error_and_ready(
                     stream,
+                    txn,
                     ErrorClass::InternalError,
                     "failed to encode command complete response",
                 )
                 .map(|()| CopyStep::Failed),
             }
         }
-        Err(e) => respond_sql_error(stream, &e).map(|()| CopyStep::Failed),
+        Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }
 }
 
@@ -627,8 +639,9 @@ pub(crate) enum CopyStep {
 }
 
 /// `simple_query::run_copy_statement` から、`engine::sql::copy::
-/// is_copy_statement(stmt)` が真の 1 文について、セッションが `Idle` のときにだけ
-/// 呼ばれる唯一の入口（`handshake::post_auth_loop` の 'Q' 分岐は `simple_query::
+/// is_copy_statement(stmt)` が真の 1 文について、セッションが `Idle` または明示
+/// トランザクション中（Issue #1179。暗黙トランザクション中・`Failed` 中は呼ばれない）
+/// に呼ばれる唯一の入口（`handshake::post_auth_loop` の 'Q' 分岐は `simple_query::
 /// execute_and_respond` へ一本化した。Issue #1175）。
 /// `EngineCore::begin_copy` の構造検証・`operation_id` 必須化ガード・
 /// テーブル解決がここで失敗した場合は CopyIn／CopyOutResponse を一切送らずに
@@ -642,11 +655,12 @@ pub(crate) enum CopyStep {
 /// 戻り値 [`CopyStep::Closed`] は `run_copy_from` が Terminate（'X'）受信を
 /// 返してきた場合で、呼び出し元はそのまま伝播して接続ループを終了させる
 /// （[`run_copy_from`] のドキュメント参照）。
-pub(crate) fn run<S: WireStream>(
+pub(crate) fn run<'e, S: WireStream>(
     stream: &mut S,
-    engine: &EngineCore,
+    engine: &'e EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
     sql: &str,
     finish: Finish,
 ) -> io::Result<CopyStep> {
@@ -654,12 +668,12 @@ pub(crate) fn run<S: WireStream>(
     // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
-    match engine.begin_copy(ctx, session, sql) {
-        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result, finish),
+    match engine.begin_copy_in_txn(ctx, session, txn, sql) {
+        Ok(CopyPlan::To(format, result)) => run_copy_to(stream, txn, format, &result, finish),
         Ok(CopyPlan::From(copy_session)) => {
-            run_copy_from(stream, engine, ctx, copy_session, finish)
+            run_copy_from(stream, engine, ctx, txn, copy_session, finish)
         }
-        Err(e) => respond_sql_error(stream, &e).map(|()| CopyStep::Failed),
+        Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }
 }
 

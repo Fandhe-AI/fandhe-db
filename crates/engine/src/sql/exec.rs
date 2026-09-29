@@ -611,7 +611,7 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
 /// 6 引数のまま）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_statement_with_cache(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     provider: &dyn SearchProvider,
     ctx: &PolicyContext,
     schema: &TableSchema,
@@ -622,6 +622,15 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
+    // Issue #1179）ではテーブル世代キーのキャッシュ群を一切使わない（未 commit の
+    // 内容から作ったエントリを共有しない。`storage::read_source` モジュールドキュメント
+    // 「キャッシュの構造的ゲート」参照）。
+    let (sparse_cache, arena_cache, hnsw_cache, scalar_cache) = if read_txn.snapshot().is_some() {
+        (sparse_cache, arena_cache, hnsw_cache, scalar_cache)
+    } else {
+        (None, None, None, None)
+    };
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
     // 切り出してあり、本関数は適用位置（DISTANCE 段＋事後 SCALAR フィルタの後・
@@ -711,13 +720,18 @@ pub(crate) fn execute_statement_with_cache(
     // しない（codex-review P2 対応・PR #1124）。`hnsw_cache` が `None`（起動時
     // opt-in なし）の場合はカタログに一切触れない。
     let hnsw_enabled = match hnsw_cache.as_ref() {
-        Some(access) => crate::catalog::hnsw_targeted_in_txn(
-            read_txn,
-            access.index_gate_cache,
-            &bound.table,
-            access.hnsw_scope,
-            true,
-        ),
+        Some(access) => match read_txn.snapshot() {
+            Some(snapshot) => crate::catalog::hnsw_targeted_in_txn(
+                snapshot,
+                access.index_gate_cache,
+                &bound.table,
+                access.hnsw_scope,
+                true,
+            ),
+            // 書き込みトランザクション由来では `hnsw_cache` 自体が `None` に落ちて
+            // いるため到達しない。万一到達しても fail-closed（厳密 brute-force）。
+            None => false,
+        },
         None => false,
     };
     let ann_plan =
@@ -762,11 +776,13 @@ pub(crate) fn execute_statement_with_cache(
     // `sparse_cache_eligible` と実際の分岐を一致させる。
     let cached_sparse_index: Option<Arc<SparseIndex>> = if is_hybrid && filters_empty {
         match (sparse_cache.as_ref(), text_column_index) {
-            (Some(access), Some(idx)) => {
-                access
-                    .cache
-                    .lookup(access.storage, read_txn, &bound.table, ctx, idx)
-            }
+            (Some(access), Some(idx)) => access.cache.lookup(
+                access.storage,
+                crate::storage::read_source::require_snapshot(read_txn)?,
+                &bound.table,
+                ctx,
+                idx,
+            ),
             _ => None,
         }
     } else {
@@ -906,7 +922,11 @@ pub(crate) fn execute_statement_with_cache(
     // Top-k 確定後（`ScalarSource::Deferred`）へ安全に遅らせられる
     // （hybrid の Top-k スロット番号はアリーナ＝スナップショットのスロット
     // 番号そのものであり、`DeferredScalars::Snapshot` の添字と一致する）。
-    let defer_projection = !bound.has_where_filters()
+    // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
+    // Issue #1179）では投影の遅延（確定済みスナップショットの再オープン）を使わず、
+    // 候補構築時に投影列を保持する既存の eager 経路へ倒す。
+    let defer_projection = read_txn.snapshot().is_some()
+        && !bound.has_where_filters()
         && (!is_hybrid || skip_sparse_accumulation)
         && !needed_column_indices.is_empty();
 
@@ -1332,7 +1352,12 @@ pub(crate) fn execute_statement_with_cache(
         Some(access) => {
             let sql_cache = access.cache;
             let storage = access.storage;
-            if let Some(snapshot) = sql_cache.lookup(storage, read_txn, &bound.table, ctx) {
+            if let Some(snapshot) = sql_cache.lookup(
+                storage,
+                crate::storage::read_source::require_snapshot(read_txn)?,
+                &bound.table,
+                ctx,
+            ) {
                 if cache_fast_path_eligible {
                     // 高速経路: SCALAR 段が恒等写像なので `on_visible_row` を
                     // 一切呼ばず（呼んでも常に `Ok(true)` を返すだけで副作用が
@@ -1422,7 +1447,7 @@ pub(crate) fn execute_statement_with_cache(
                         if let Some(scalar_access) = scalar_cache.as_ref() {
                             let looked_up = scalar_access.cache.lookup(
                                 scalar_access.storage,
-                                read_txn,
+                                crate::storage::read_source::require_snapshot(read_txn)?,
                                 &bound.table,
                                 ctx,
                             );
@@ -1697,12 +1722,18 @@ pub(crate) fn execute_statement_with_cache(
             // 呼んでいれば（`scalar_index_lookup_hit`）その結果を再利用し、
             // `lookup` の重複呼び出しによる `hits`/`misses` 統計の二重計上を
             // 避ける（呼んでいなければ通常どおり照会する）。
-            let already_cached = scalar_index_lookup_hit.unwrap_or_else(|| {
-                scalar_access
+            let already_cached = match scalar_index_lookup_hit {
+                Some(hit) => hit,
+                None => scalar_access
                     .cache
-                    .lookup(scalar_access.storage, read_txn, &bound.table, ctx)
-                    .is_some()
-            });
+                    .lookup(
+                        scalar_access.storage,
+                        crate::storage::read_source::require_snapshot(read_txn)?,
+                        &bound.table,
+                        ctx,
+                    )
+                    .is_some(),
+            };
             if !already_cached {
                 // 索引宣言（Issue #1065）をこのクエリの `read_txn` から解決する。
                 // カタログ読み取り失敗は「宣言なし→自動」へは倒さず構築を
@@ -1710,7 +1741,7 @@ pub(crate) fn execute_statement_with_cache(
                 // 参照。構築断念はこの派生キャッシュの fail-soft 契約の範囲内で、
                 // クエリ自体は plain scan へ縮退するだけで失敗しない）。
                 match crate::sql::scalar_index::resolve_scalar_index_target_in_txn(
-                    read_txn,
+                    crate::storage::read_source::require_snapshot(read_txn)?,
                     &bound.table,
                     scalar_access.declarations_enabled,
                 ) {
@@ -1843,7 +1874,7 @@ pub(crate) fn execute_statement_with_cache(
                     match hnsw_cache.as_ref() {
                         Some(access) => crate::sql::hnsw_cache::search_or_fallback(
                             access,
-                            read_txn,
+                            crate::storage::read_source::require_snapshot(read_txn)?,
                             &bound.table,
                             ctx,
                             arena,
@@ -1884,7 +1915,7 @@ pub(crate) fn execute_statement_with_cache(
                         (Some(access), Some(kept), Some(snapshot)) => {
                             match crate::sql::hnsw_cache::prepare_subset_from_slots(
                                 access,
-                                read_txn,
+                                crate::storage::read_source::require_snapshot(read_txn)?,
                                 &bound.table,
                                 ctx,
                                 snapshot.arena(),
@@ -1965,7 +1996,7 @@ pub(crate) fn execute_statement_with_cache(
                         _ => match hnsw_cache.as_ref() {
                             Some(access) => crate::sql::hnsw_cache::search_subset_or_fallback(
                                 access,
-                                read_txn,
+                                crate::storage::read_source::require_snapshot(read_txn)?,
                                 &bound.table,
                                 ctx,
                                 arena,
@@ -2052,31 +2083,37 @@ pub(crate) fn execute_statement_with_cache(
                 // ドキュメント参照）。`hybrid.rs`・`SearchProvider` trait は無変更。
                 let hnsw_dense_provider: Option<crate::sql::hnsw_hybrid::HnswDenseProvider<'_>> =
                     if hnsw_hybrid_full_visible_eligible {
-                        hnsw_cache.as_ref().map(|access| {
-                            let prepared = crate::sql::hnsw_cache::prepare_full_visible(
-                                access,
-                                read_txn,
-                                &bound.table,
-                                ctx,
-                                arena,
-                            );
-                            crate::sql::hnsw_hybrid::HnswDenseProvider::new(
-                                access, arena, &slot_ids, provider, prepared,
-                            )
-                        })
+                        match hnsw_cache.as_ref() {
+                            Some(access) => {
+                                let prepared = crate::sql::hnsw_cache::prepare_full_visible(
+                                    access,
+                                    crate::storage::read_source::require_snapshot(read_txn)?,
+                                    &bound.table,
+                                    ctx,
+                                    arena,
+                                );
+                                Some(crate::sql::hnsw_hybrid::HnswDenseProvider::new(
+                                    access, arena, &slot_ids, provider, prepared,
+                                ))
+                            }
+                            None => None,
+                        }
                     } else if hnsw_hybrid_subset_eligible {
-                        hnsw_cache.as_ref().map(|access| {
-                            let prepared = crate::sql::hnsw_cache::prepare_subset(
-                                access,
-                                read_txn,
-                                &bound.table,
-                                ctx,
-                                arena,
-                            );
-                            crate::sql::hnsw_hybrid::HnswDenseProvider::new(
-                                access, arena, &slot_ids, provider, prepared,
-                            )
-                        })
+                        match hnsw_cache.as_ref() {
+                            Some(access) => {
+                                let prepared = crate::sql::hnsw_cache::prepare_subset(
+                                    access,
+                                    crate::storage::read_source::require_snapshot(read_txn)?,
+                                    &bound.table,
+                                    ctx,
+                                    arena,
+                                );
+                                Some(crate::sql::hnsw_hybrid::HnswDenseProvider::new(
+                                    access, arena, &slot_ids, provider, prepared,
+                                ))
+                            }
+                            None => None,
+                        }
                     } else {
                         None
                     };
@@ -2417,7 +2454,7 @@ pub(crate) fn execute_statement_with_cache(
                 ScalarSource::Deferred(DeferredScalars::Snapshot(snapshot.metadata()))
             }
             None => ScalarSource::Deferred(DeferredScalars::Redb {
-                read_txn,
+                read_txn: crate::storage::read_source::require_snapshot(read_txn)?,
                 row_table_name: crate::catalog::user_rows_table_name(&bound.table),
             }),
         }
@@ -2472,7 +2509,7 @@ pub(crate) fn execute_statement_with_cache(
 /// 従来どおりの新規構築のみの経路として動作する）。crate 内部のキャッシュ経路
 /// （`core.rs`）は [`execute_statement_with_cache`] を直接呼ぶ。
 pub fn execute_statement(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     provider: &dyn SearchProvider,
     ctx: &PolicyContext,
     schema: &TableSchema,
@@ -3483,12 +3520,31 @@ pub fn execute_delete(
     bound: &crate::sql::parser::BoundDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
+    execute_delete_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+    )
+}
+
+/// [`execute_delete`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_delete`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_delete_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     match crate::tenant::delete_row_ledgered_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3582,6 +3638,29 @@ pub fn execute_delete_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    execute_delete_returning_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        returning,
+        schema,
+    )
+}
+
+/// [`execute_delete_returning`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_delete_returning`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_delete_returning_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
@@ -3595,7 +3674,7 @@ pub fn execute_delete_returning(
     let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
 
     let (outcome, _captured) = crate::tenant::delete_row_ledgered_capturing_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3654,12 +3733,33 @@ pub(crate) fn execute_update_with_schema(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
+    execute_update_with_schema_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        expected_schema,
+    )
+}
+
+/// [`execute_update_with_schema`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_update_with_schema`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_update_with_schema_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     let rows_affected = crate::tenant::update_row_columns_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3692,6 +3792,26 @@ pub fn execute_update_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    execute_update_returning_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        returning,
+        schema,
+    )
+}
+
+/// [`execute_update_returning`] の本体（明示トランザクション対応版。Issue #1179・#1182）。
+/// `target` が `InTxn` の場合の commit 責務は [`execute_update_with_schema_in`] と同じ。
+pub(crate) fn execute_update_returning_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
@@ -3702,7 +3822,7 @@ pub fn execute_update_returning(
     let mut budget = 0usize;
     let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
     let rows_affected = crate::tenant::update_row_columns_capturing_unchecked(
-        storage,
+        target,
         &bound.table,
         ctx,
         bound.id,
@@ -3879,8 +3999,13 @@ pub(crate) fn map_write_error(
 /// プロセス全体で起動時に 1 回だけ設定する契約——`execute_predicate_update` と
 /// 同じ上限判定 API [`crate::sql::parser::check_dml_affected_rows_with_limit`]
 /// を共有する）。
-pub(crate) fn execute_predicate_delete(
-    storage: &crate::storage::Storage,
+/// [`execute_predicate_delete`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_predicate_delete`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_predicate_delete_in(
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -3889,7 +4014,7 @@ pub(crate) fn execute_predicate_delete(
     max_affected_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_delete_inner(
-        storage,
+        target,
         ctx,
         bound,
         ledger_mode,
@@ -3910,7 +4035,7 @@ pub(crate) fn execute_predicate_delete(
 /// セッション経路（`execute_predicate_delete_returning_form`）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_predicate_delete_returning(
-    storage: &crate::storage::Storage,
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -3924,7 +4049,7 @@ pub(crate) fn execute_predicate_delete_returning(
     let mut budget = 0usize;
     let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
     let rows_affected = execute_predicate_delete_inner(
-        storage,
+        target,
         ctx,
         bound,
         ledger_mode,
@@ -4028,7 +4153,7 @@ fn run_where_predicate<R>(
 /// 削除した行数を返す。
 #[allow(clippy::too_many_arguments)]
 fn execute_predicate_delete_inner(
-    storage: &crate::storage::Storage,
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -4052,7 +4177,7 @@ fn execute_predicate_delete_inner(
         bound.or_filters(),
         |needs_embedding, predicate| match project {
             None => crate::tenant::delete_rows_where_unchecked(
-                storage,
+                target,
                 bound.table(),
                 ctx,
                 ledger_write,
@@ -4063,7 +4188,7 @@ fn execute_predicate_delete_inner(
                 predicate,
             ),
             Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
-                storage,
+                target,
                 bound.table(),
                 ctx,
                 ledger_write,
@@ -4106,9 +4231,14 @@ fn execute_predicate_delete_inner(
 /// 関数であり（唯一の呼び出し元は上記 `EngineCore::execute_predicate_update_form`）、
 /// 各引数は意味の異なる独立した値のため構造体へまとめると可読性が下がる
 /// （`execute_statement_with_cache` と同じ判断）。
+/// [`execute_predicate_update`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_predicate_update`] と
+/// ビット同一の挙動を保つ。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_predicate_update(
-    storage: &crate::storage::Storage,
+pub(crate) fn execute_predicate_update_in(
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateUpdate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -4125,7 +4255,7 @@ pub(crate) fn execute_predicate_update(
     max_affected_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_update_inner(
-        storage,
+        target,
         ctx,
         bound,
         ledger_mode,
@@ -4143,7 +4273,7 @@ pub(crate) fn execute_predicate_update(
 /// [`execute_predicate_delete_returning`] と同一。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_predicate_update_returning(
-    storage: &crate::storage::Storage,
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateUpdate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -4158,7 +4288,7 @@ pub(crate) fn execute_predicate_update_returning(
     let mut budget = 0usize;
     let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
     let rows_affected = execute_predicate_update_inner(
-        storage,
+        target,
         ctx,
         bound,
         ledger_mode,
@@ -4180,7 +4310,7 @@ pub(crate) fn execute_predicate_update_returning(
 /// 実体（[`execute_predicate_delete_inner`] と同型）。実際に更新した行数を返す。
 #[allow(clippy::too_many_arguments)]
 fn execute_predicate_update_inner(
-    storage: &crate::storage::Storage,
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundPredicateUpdate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -4205,7 +4335,7 @@ fn execute_predicate_update_inner(
         bound.or_filters(),
         |needs_embedding, predicate| match project {
             None => crate::tenant::update_rows_where_unchecked(
-                storage,
+                target,
                 bound.table(),
                 ctx,
                 ledger_write,
@@ -4218,7 +4348,7 @@ fn execute_predicate_update_inner(
                 predicate,
             ),
             Some(project) => crate::tenant::update_rows_where_capturing_unchecked(
-                storage,
+                target,
                 bound.table(),
                 ctx,
                 ledger_write,
@@ -4302,6 +4432,27 @@ pub(crate) fn execute_insert_batch_with_schema(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_batch_with_schema_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bounds,
+        ledger_mode,
+        expected_schema,
+    )
+}
+
+/// [`execute_insert_batch_with_schema`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_insert_batch_with_schema`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_insert_batch_with_schema_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::storage::Visibility;
 
     let Some(first) = bounds.first() else {
@@ -4310,7 +4461,7 @@ pub(crate) fn execute_insert_batch_with_schema(
         ));
     };
     if bounds.len() == 1 {
-        return execute_insert_with_schema(storage, ctx, first, ledger_mode, expected_schema);
+        return execute_insert_with_schema_in(target, ctx, first, ledger_mode, expected_schema);
     }
 
     let table = first.table.as_str();
@@ -4331,7 +4482,7 @@ pub(crate) fn execute_insert_batch_with_schema(
         bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
 
     crate::tenant::insert_typed_rows_unchecked(
-        storage,
+        target,
         table,
         ctx,
         Visibility::Private,
@@ -4372,6 +4523,29 @@ pub fn execute_insert_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    execute_insert_returning_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bounds,
+        ledger_mode,
+        returning,
+        schema,
+    )
+}
+
+/// [`execute_insert_returning`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_insert_returning`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_insert_returning_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
     // codex-review Low 指摘（PR #873）対応: `column_meta`・`project_row` は
     // いずれも `bounds`（呼び出し元が既に束縛済みの書き込み予定値）・
     // `projection`・`schema`・`ctx` のみに依存する純粋な計算（redb I/O を
@@ -4400,7 +4574,7 @@ pub fn execute_insert_returning(
     }
 
     let insert_outcome =
-        execute_insert_batch_with_schema(storage, ctx, bounds, ledger_mode, Some(schema))?;
+        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
 
     Ok(ReturningOutcome {
         command: crate::sql::returning::DmlCommand::Insert,
@@ -4446,7 +4620,28 @@ pub fn execute_upsert(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     bound_schema: &crate::catalog::TableSchema,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
-    let rows_affected = execute_upsert_inner(storage, ctx, bound, ledger_mode, bound_schema, None)?;
+    execute_upsert_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        bound_schema,
+    )
+}
+
+/// [`execute_upsert`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
+/// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
+/// 保持する共有 `redb::WriteTransaction` へ書き込み、commit は行わない
+/// （`COMMIT`／`ROLLBACK` 文が一括で行う）。`Autocommit` は [`execute_upsert`] と
+/// ビット同一の挙動を保つ。
+pub(crate) fn execute_upsert_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &BoundUpsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    bound_schema: &crate::catalog::TableSchema,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    let rows_affected = execute_upsert_inner(target, ctx, bound, ledger_mode, bound_schema, None)?;
     Ok(InsertOutcome {
         rows_affected,
         incremental: None,
@@ -4468,12 +4663,32 @@ pub fn execute_upsert_returning(
     returning: &[crate::sql::parser::ProjectedColumn],
     bound_schema: &crate::catalog::TableSchema,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
+    execute_upsert_returning_in(
+        crate::tenant::WriteTarget::Autocommit(storage),
+        ctx,
+        bound,
+        ledger_mode,
+        returning,
+        bound_schema,
+    )
+}
+
+/// [`execute_upsert_returning`] の本体（明示トランザクション対応版。Issue #1179・#1182）。
+/// `target` が `InTxn` の場合の commit 責務は [`execute_upsert_in`] と同じ。
+pub(crate) fn execute_upsert_returning_in(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &BoundUpsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    returning: &[crate::sql::parser::ProjectedColumn],
+    bound_schema: &crate::catalog::TableSchema,
+) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, bound_schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
     let mut budget = 0usize;
     let mut project = returning_collector(ctx, returning, &mut budget, &mut rows);
     let rows_affected = execute_upsert_inner(
-        storage,
+        target,
         ctx,
         bound,
         ledger_mode,
@@ -4492,7 +4707,7 @@ pub fn execute_upsert_returning(
 /// `Some` なら `tenant::upsert_typed_rows_capturing_unchecked` を呼ぶ。
 /// 挿入した行数＋更新した行数（`INSERT 0 <n>` の `n`）を返す。
 fn execute_upsert_inner(
-    storage: &crate::storage::Storage,
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     bound: &BoundUpsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
@@ -4547,7 +4762,7 @@ fn execute_upsert_inner(
 
     let outcome = match project {
         None => crate::tenant::upsert_typed_rows_unchecked(
-            storage,
+            target,
             &bound.table,
             ctx,
             Visibility::Private,
@@ -4558,7 +4773,7 @@ fn execute_upsert_inner(
             Some(bound_schema),
         ),
         Some(project) => crate::tenant::upsert_typed_rows_capturing_unchecked(
-            storage,
+            target,
             &bound.table,
             ctx,
             Visibility::Private,

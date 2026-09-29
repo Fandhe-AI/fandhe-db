@@ -23,11 +23,14 @@
 //! クライアントが `ROLLBACK` を発行できないため、エラー・上限超過では `Failed` ではなく
 //! `Idle` へ戻り、メッセージをまたがない。
 //!
-//! 読み取りの既知の逸脱（SQL-31 の完全な意味論からの意図的な縮退）: 本実装は
-//! 「同一トランザクション内で自分がまだ書き込んでいないテーブル」の読み取りのみ
-//! 通常経路で許可し、既に書き込んだテーブルへの読み取りは `0A000` で拒否する
-//! （自トランザクションの未 commit 変更の可視化は対象外）。`written_tables` が
-//! この判定に使う集合。詳細は `docs/design/explicit-transaction.md` 参照。
+//! 読み取り（Issue #1179）: 自トランザクションが未 commit の変更を持たない間は
+//! BEGIN 時点の確定済みスナップショットで従来どおり読む（キャッシュ利用可）。変更を
+//! 持つ間（[`SessionTransaction::dirty_tables`] が非空）は、共有書き込み
+//! トランザクションを読み取り源（`storage::read_source::ReadSource`）にして同じ
+//! 実行本体で読み、未 commit の変更を反映する（テーブル世代キーのキャッシュは使わない）。
+//! 残る既知の逸脱は、LLM I/O と世代の再照合を伴う `USING PLAN` の検索 SELECT・
+//! `EXPLAIN` で、対象テーブルが dirty のとき `0A000` で拒否する（黙って古い結果を
+//! 返さない）。詳細は `docs/design/explicit-transaction.md` 参照。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -154,7 +157,9 @@ struct ActiveTxn<'e> {
     /// （カーソルの寿命がトランザクションの寿命に一致する設計。
     /// `sql::cursor` モジュールドキュメント参照）。
     cursors: crate::sql::cursor::CursorRegistry,
-    _marker: std::marker::PhantomData<&'e ()>,
+    /// dirty テーブル判定（[`SessionTransaction::dirty_tables`]）が確定済み世代を
+    /// 読むための参照。`Active` の間だけ保持する（`begin` が渡す）。
+    storage: &'e crate::storage::Storage,
 }
 
 enum TxnState<'e> {
@@ -292,6 +297,8 @@ impl<'e> SessionTransaction<'e> {
                     has_writes,
                     session_at_begin,
                     written_by_tenant,
+                    written_tables,
+                    storage,
                     ..
                 } = *active;
                 if started_at.elapsed() > self.limits.max_duration {
@@ -300,9 +307,11 @@ impl<'e> SessionTransaction<'e> {
                     return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
                 }
                 commit_active(
+                    storage,
                     write_txn,
                     has_writes,
                     &written_by_tenant,
+                    &written_tables,
                     session_at_begin,
                     session,
                 )
@@ -378,7 +387,7 @@ impl<'e> SessionTransaction<'e> {
                     has_writes: false,
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
-                    _marker: std::marker::PhantomData,
+                    storage,
                 }));
                 Ok(())
             }
@@ -424,6 +433,8 @@ impl<'e> SessionTransaction<'e> {
                     has_writes,
                     session_at_begin,
                     written_by_tenant,
+                    written_tables,
+                    storage,
                     ..
                 } = *active;
                 if started_at.elapsed() > self.limits.max_duration {
@@ -437,9 +448,11 @@ impl<'e> SessionTransaction<'e> {
                 }
                 // 状態は冒頭の `mem::replace` で既に `Idle`。成否によらず `Idle`。
                 commit_active(
+                    storage,
                     write_txn,
                     has_writes,
                     &written_by_tenant,
+                    &written_tables,
                     session_at_begin,
                     session,
                 )
@@ -533,12 +546,37 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// `table` が同一トランザクション内で既に書き込み済みかどうか（読み取り時の
-    /// `0A000` 判定に使う。§2.5 の既知の逸脱）。
+    /// `table` の内容が同一トランザクション内で変わっている（dirty）かどうか
+    /// （読み取り時の `0A000` 判定に使う。§2.5 の既知の逸脱）。文が直接書き込んだ
+    /// テーブルに加え、参照アクションの連鎖で書き換わった子テーブルも含む
+    /// （[`Self::dirty_tables`]。連鎖先を取りこぼすと、確定済みスナップショットの
+    /// 古い内容を黙って返してしまう）。dirty 集合の取得に失敗した場合は
+    /// fail-closed に「dirty」として扱う。
     pub(crate) fn table_already_written(&self, table: &str) -> bool {
         match &self.state {
-            TxnState::Active(active) => active.written_tables.contains(table),
+            TxnState::Active(_) => self
+                .dirty_tables()
+                .map_or(true, |dirty| dirty.contains(table)),
             _ => false,
+        }
+    }
+
+    /// このトランザクションで内容が変わりうるテーブル名の集合（Issue #1179）。
+    /// 文が直接書き込んだテーブル（`mark_written`）と、テーブル世代が確定済み
+    /// スナップショットから変化したテーブル（参照アクションの連鎖で書き込まれた
+    /// 子テーブルを含む）の和。読み取りの経路選択（未 commit 変更を読む必要が
+    /// あるか）と COMMIT 時の遅延 FK 検査対象の決定に使う。`Active` 以外では空。
+    /// 世代の読み取りに失敗した場合は fail-closed に `Err`（呼び出し元は文を
+    /// 失敗させる）。書き込みが 1 件も無い間（`has_writes == false`）は世代の
+    /// 走査を省き空集合を返す（連鎖書き込みは直接の書き込みが起点のため
+    /// 取りこぼさない）。
+    pub(crate) fn dirty_tables(&self) -> Result<HashSet<String>, SqlSurfaceError> {
+        match &self.state {
+            TxnState::Active(active) if !active.has_writes => Ok(HashSet::new()),
+            TxnState::Active(active) => {
+                collect_dirty_tables(active.storage, &active.write_txn, &active.written_tables)
+            }
+            _ => Ok(HashSet::new()),
         }
     }
 
@@ -675,6 +713,25 @@ impl<'e> SessionTransaction<'e> {
     }
 }
 
+/// [`SessionTransaction::dirty_tables`] の実体。`written` に、書き込みトランザクション
+/// 内の世代が `storage` の確定済み世代から変化したテーブルを加えて返す。
+fn collect_dirty_tables(
+    storage: &crate::storage::Storage,
+    write_txn: &redb::WriteTransaction,
+    written: &HashSet<String>,
+) -> Result<HashSet<String>, SqlSurfaceError> {
+    let internal = || SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    };
+    use redb::ReadableDatabase;
+    let committed = storage.db().begin_read().map_err(|_| internal())?;
+    let changed = crate::catalog::changed_table_generations_in_write_txn(write_txn, &committed)
+        .map_err(|_| internal())?;
+    let mut dirty = written.clone();
+    dirty.extend(changed);
+    Ok(dirty)
+}
+
 /// 内部エラー（`XX000`）。他テナントの情報を含まない固定文言。
 fn internal_error() -> SqlSurfaceError {
     SqlSurfaceError::Internal {
@@ -691,14 +748,36 @@ fn internal_error() -> SqlSurfaceError {
 /// `session` を開始時点へ復元し `23503` を返す。commit 自体の失敗も同様にロールバック
 /// 扱いで `XX000`。呼び出し元は事前に `state` を `Idle` にしてあること。
 fn commit_active(
+    storage: &crate::storage::Storage,
     write_txn: crate::storage::GatedWriteTxn,
     has_writes: bool,
     written_by_tenant: &std::collections::BTreeSet<(String, String)>,
+    written_tables: &HashSet<String>,
     session_at_begin: SessionState,
     session: &mut SessionState,
 ) -> Result<(), SqlSurfaceError> {
     if has_writes {
-        for (tenant_id, table) in written_by_tenant {
+        // 遅延 FK 検査の対象は「書き込んだテナント × dirty テーブル」の直積
+        // （Issue #1179）。`mark_written` が記録するのは文が直接対象にしたテーブル
+        // だけで、参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`）の連鎖で
+        // 書き換わった子テーブルは含まれない。連鎖先は別の `INITIALLY DEFERRED` FK
+        // を持ちうるため、記録だけに頼ると COMMIT で違反を見逃す（fail-open）。
+        // テーブル世代（書き換えた全経路が bump する契約）由来の dirty 集合との和を
+        // 取り、テナント集合は上位集合（fail-closed）として全書き込みテナントを使う。
+        let dirty = match collect_dirty_tables(storage, &write_txn, written_tables) {
+            Ok(dirty) => dirty,
+            Err(_) => {
+                drop(write_txn);
+                *session = session_at_begin;
+                return Err(internal_error());
+            }
+        };
+        let tenants: std::collections::BTreeSet<&String> =
+            written_by_tenant.iter().map(|(tenant, _)| tenant).collect();
+        let pairs = tenants
+            .iter()
+            .flat_map(|tenant| dirty.iter().map(move |table| (*tenant, table)));
+        for (tenant_id, table) in pairs {
             if let Err(e) = crate::constraint::enforce_deferred_foreign_keys_in_txn(
                 &write_txn, tenant_id, table,
             ) {

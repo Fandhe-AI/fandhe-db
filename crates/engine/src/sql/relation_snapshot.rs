@@ -74,7 +74,7 @@ impl RelationSnapshot {
     /// `54000`（[`SqlSurfaceError::payload_too_large`]）で拒否する（キャッシュ
     /// 登録見送りではなく拒否側に倒す）。
     fn build(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         table: &TableSchema,
         ctx: &PolicyContext,
         built_table_generation: u64,
@@ -229,11 +229,20 @@ pub type RelationSnapshotCache = GenerationKeyedCache<RelationSnapshot>;
 /// `execute_aggregate`（`sql::aggregate`。`Storage` を要求しない公開 API の
 /// 既存流儀）と同じ形になる。
 pub fn resolve_relation_snapshots(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     relations: &[(TableRef, &TableSchema)],
     cache: Option<(&crate::storage::Storage, &RelationSnapshotCache)>,
 ) -> Result<MultiRelationSnapshot, SqlSurfaceError> {
+    // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
+    // Issue #1179）ではテーブル世代キーのキャッシュを一切使わない（未 commit の
+    // 内容から作ったエントリを共有しない。`storage::read_source` モジュールドキュメント
+    // 「キャッシュの構造的ゲート」参照）。
+    let cache = if read_txn.snapshot().is_some() {
+        cache
+    } else {
+        None
+    };
     if relations.is_empty() {
         return Err(SqlSurfaceError::payload_too_large(
             "at least one table reference is required",
@@ -280,7 +289,12 @@ pub fn resolve_relation_snapshots(
             .map_err(catalog_internal)?;
 
         let snapshot = if let Some((storage, cache)) = cache {
-            if let Some(hit) = cache.lookup(storage, read_txn, ctx, &single_key) {
+            if let Some(hit) = cache.lookup(
+                storage,
+                crate::storage::read_source::require_snapshot(read_txn)?,
+                ctx,
+                &single_key,
+            ) {
                 hit
             } else {
                 let built = RelationSnapshot::build(read_txn, schema, ctx, built_generation)?;

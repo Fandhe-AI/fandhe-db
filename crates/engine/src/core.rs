@@ -1468,6 +1468,44 @@ pub enum ParsedSql {
     DropIndex(crate::sql::allowlist::ValidatedDropIndex),
 }
 
+/// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
+/// トランザクション。[`crate::storage::read_source::ReadSource`]）から `table_name` の
+/// スキーマを取得する（[`EngineCore::read_txn_with_schema`] とエラー分類を共有する
+/// 単一の写像。Issue #1179）。
+fn table_schema_in(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+) -> Result<crate::catalog::TableSchema, crate::sql::allowlist::SqlSurfaceError> {
+    crate::catalog::get_table_schema_in_txn(read_txn, table_name).map_err(|e| match e {
+        CatalogError::TableNotFound(name) => {
+            crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+        }
+        // `CatalogError::Invalid`（識別子形式不正）は `catalog::table_lookup_error`
+        // （`impl TableLookup for Storage` と共有する単一の写像本体）へ委譲し、
+        // SQL 表層と同じ `42601`（unsupported syntax）へ分類する（Issue #728 PR #788
+        // レビュー指摘）。`Invalid` 以外（内部破損系）は `Internal` に丸め込まれる。
+        other => crate::catalog::table_lookup_error(other),
+    })
+}
+
+/// [`table_schema_in`] の複数テーブル版（重複名は 1 回だけ解決する）。
+fn table_schemas_in(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_names: &[String],
+) -> Result<
+    std::collections::HashMap<String, crate::catalog::TableSchema>,
+    crate::sql::allowlist::SqlSurfaceError,
+> {
+    let mut schemas = std::collections::HashMap::with_capacity(table_names.len());
+    for name in table_names {
+        if schemas.contains_key(name) {
+            continue;
+        }
+        schemas.insert(name.clone(), table_schema_in(read_txn, name)?);
+    }
+    Ok(schemas)
+}
+
 /// `parsed` が保持する `operation_id`（`USING OPERATION_ID '<id>'`。書き込み系
 /// 文のみ保持しうる）。[`EngineCore::execute_parsed_in_txn`] が同一トランザクション
 /// 内での再利用検査（[`crate::sql::transaction::SessionTransaction::
@@ -1478,6 +1516,18 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
     match parsed {
         ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::Truncate(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
+        ParsedSql::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
+            v.operation_id.as_ref().map(|id| id.as_str())
+        }
+        ParsedSql::Delete(crate::sql::allowlist::DeleteStatement::Predicate(v)) => {
+            v.operation_id().map(|id| id.as_str())
+        }
+        ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Single(v)) => {
+            v.operation_id.as_ref().map(|id| id.as_str())
+        }
+        ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
+            v.operation_id().map(|id| id.as_str())
+        }
         _ => None,
     }
 }
@@ -2806,33 +2856,25 @@ impl EngineCore {
         (redb::ReadTransaction, crate::catalog::TableSchema),
         crate::sql::allowlist::SqlSurfaceError,
     > {
-        let read_txn = self.storage.db().begin_read().map_err(|e| {
+        let read_txn = self.begin_read_txn()?;
+        let schema = table_schema_in(&read_txn, table_name)?;
+        Ok((read_txn, schema))
+    }
+
+    /// 確定済みスナップショットの read トランザクションを開始する
+    /// （[`Self::read_txn_with_schema`]・[`Self::read_txn_with_schemas`]・
+    /// [`Self::execute_validated_in_session`] の読み取りアームが共有する入口）。
+    fn begin_read_txn(
+        &self,
+    ) -> Result<redb::ReadTransaction, crate::sql::allowlist::SqlSurfaceError> {
+        self.storage.db().begin_read().map_err(|e| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!(
                     "failed to begin read transaction: {}",
                     StorageError::from(e)
                 ),
             }
-        })?;
-        let schema = crate::catalog::get_table_schema_in_txn(&read_txn, table_name).map_err(
-            |e| match e {
-                CatalogError::TableNotFound(name) => {
-                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                }
-                // `CatalogError::Invalid`（識別子形式不正）は `catalog::table_lookup_error`
-                // （`impl TableLookup for Storage` と共有する単一の写像本体）へ委譲し、
-                // SQL 表層（`validate_sql` の `TableLookup::table_exists` 経由）と同じ
-                // `42601`（unsupported syntax）へ分類する。ここで独自に `Internal`
-                // （`XX000`）へ丸め込むと、[`Self::execute_bound_scan_in_session`]・
-                // [`Self::execute_bound_aggregate_in_session`] のドキュメンテーション
-                // コメントが謳う「SQL 経路と同一のエラー分類・露出範囲」契約が、
-                // 不正なテーブル名に対してだけ破られてしまう（Issue #728 PR #788
-                // レビュー指摘）。`Invalid` 以外（`Backend`／`CorruptSchema` 等の内部
-                // 破損系）は `table_lookup_error` 内で引き続き `Internal` に丸め込まれる。
-                other => crate::catalog::table_lookup_error(other),
-            },
-        )?;
-        Ok((read_txn, schema))
+        })
     }
 
     /// [`Self::read_txn_with_schema`] の複数テーブル版（SQL-29 (c)・RLS-10 (b)・
@@ -2851,28 +2893,8 @@ impl EngineCore {
         ),
         crate::sql::allowlist::SqlSurfaceError,
     > {
-        let read_txn = self.storage.db().begin_read().map_err(|e| {
-            crate::sql::allowlist::SqlSurfaceError::Internal {
-                detail: format!(
-                    "failed to begin read transaction: {}",
-                    StorageError::from(e)
-                ),
-            }
-        })?;
-        let mut schemas = std::collections::HashMap::with_capacity(table_names.len());
-        for name in table_names {
-            if schemas.contains_key(name) {
-                continue;
-            }
-            let schema =
-                crate::catalog::get_table_schema_in_txn(&read_txn, name).map_err(|e| match e {
-                    CatalogError::TableNotFound(name) => {
-                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                    }
-                    other => crate::catalog::table_lookup_error(other),
-                })?;
-            schemas.insert(name.clone(), schema);
-        }
+        let read_txn = self.begin_read_txn()?;
+        let schemas = table_schemas_in(&read_txn, table_names)?;
         Ok((read_txn, schemas))
     }
 
@@ -3431,10 +3453,20 @@ impl EngineCore {
                 // 検証直後に `42601` で拒否する。`Self` モジュールドキュメント
                 // 参照）。
                 if stmt.returning.is_some() {
-                    let outcome = self.execute_insert_returning_form(ctx, stmt, &lookup)?;
+                    let outcome = self.execute_insert_returning_form(
+                        crate::tenant::WriteTarget::Autocommit(&self.storage),
+                        ctx,
+                        stmt,
+                        &lookup,
+                    )?;
                     return Ok(crate::sql::SqlOutcome::Returning(outcome));
                 }
-                let outcome = self.execute_insert_form(ctx, stmt, &lookup)?;
+                let outcome = self.execute_insert_form(
+                    crate::tenant::WriteTarget::Autocommit(&self.storage),
+                    ctx,
+                    stmt,
+                    &lookup,
+                )?;
                 Ok(crate::sql::SqlOutcome::Insert(outcome))
             }
             ParsedSql::Truncate(stmt) => {
@@ -3452,19 +3484,36 @@ impl EngineCore {
                 // 従来どおり `execute_predicate_delete_form`（Issue #871）。
                 crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
                     if v.returning.is_some() {
-                        let outcome = self.execute_delete_returning_form(ctx, v)?;
+                        let outcome = self.execute_delete_returning_form(
+                            crate::tenant::WriteTarget::Autocommit(&self.storage),
+                            ctx,
+                            v,
+                        )?;
                         return Ok(crate::sql::SqlOutcome::Returning(outcome));
                     }
-                    let outcome = self.execute_delete_form(ctx, v)?;
+                    let outcome = self.execute_delete_form(
+                        crate::tenant::WriteTarget::Autocommit(&self.storage),
+                        ctx,
+                        v,
+                    )?;
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => {
                     if v.returning().is_some() {
-                        let outcome =
-                            self.execute_predicate_delete_returning_form(ctx, session, v)?;
+                        let outcome = self.execute_predicate_delete_returning_form(
+                            crate::tenant::WriteTarget::Autocommit(&self.storage),
+                            ctx,
+                            session,
+                            v,
+                        )?;
                         return Ok(crate::sql::SqlOutcome::Returning(outcome));
                     }
-                    let outcome = self.execute_predicate_delete_form(ctx, session, v)?;
+                    let outcome = self.execute_predicate_delete_form(
+                        crate::tenant::WriteTarget::Autocommit(&self.storage),
+                        ctx,
+                        session,
+                        v,
+                    )?;
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
             },
@@ -3479,10 +3528,20 @@ impl EngineCore {
                     }
                 };
                 if has_returning {
-                    let outcome = self.execute_update_returning_form(ctx, session, stmt)?;
+                    let outcome = self.execute_update_returning_form(
+                        crate::tenant::WriteTarget::Autocommit(&self.storage),
+                        ctx,
+                        session,
+                        stmt,
+                    )?;
                     return Ok(crate::sql::SqlOutcome::Returning(outcome));
                 }
-                let outcome = self.execute_predicate_update_form(ctx, session, stmt)?;
+                let outcome = self.execute_predicate_update_form(
+                    crate::tenant::WriteTarget::Autocommit(&self.storage),
+                    ctx,
+                    session,
+                    stmt,
+                )?;
                 Ok(crate::sql::SqlOutcome::Update(outcome))
             }
             // SQL-23・TASK-203（Issue #902）: DDL 実行権限ゲート
@@ -3720,48 +3779,97 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
 
-        // 注意（Issue #1182）: 本メソッドは `UPDATE`／`DELETE`／UPSERT を `_` 腕で
-        // 未対応（`0A000`）として拒否しており、`RETURNING` 付き文も同様に拒否される
-        // （fail-closed）。明示トランザクション内の DML を追加する際は、`INSERT` 腕の
-        // `returning.is_none()` ガードと同様に、`RETURNING` を黙って落とさない
-        // 分岐（未対応拒否、または結果セット返却の実装）を必ず持たせること。
+        // 注意（Issue #1182）: 明示トランザクション内の `RETURNING` は `INSERT`（単一行・
+        // 複数行）と単一行 `DELETE` のみ対応。`UPDATE`・述語形 `DELETE`・UPSERT の
+        // `RETURNING` は未対応として `0A000` で拒否する（fail-closed）。DML 腕を追加・
+        // 変更する際も `RETURNING` を黙って落とさない分岐を必ず持たせること。
         match parsed {
-            ParsedSql::Insert(stmt) if stmt.returning.is_none() => {
-                let schema =
-                    self.storage
-                        .get_table_schema(&stmt.table_name)
-                        .map_err(|e| match e {
-                            CatalogError::TableNotFound(name) => {
-                                SqlSurfaceError::UndefinedTable { name }
-                            }
-                            _ => SqlSurfaceError::Internal {
-                                detail: "failed to load table schema".to_string(),
-                            },
-                        })?;
-                let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
-                match bound {
-                    crate::sql::parser::BoundInsertForm::Row(bound) => {
-                        let write_txn =
-                            txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "internal error".to_string(),
-                            })?;
-                        let outcome = crate::sql::exec::execute_insert_with_schema_in(
-                            crate::tenant::WriteTarget::InTxn(write_txn),
-                            ctx,
-                            &bound,
-                            self.ledger_mode,
-                            Some(&schema),
-                        )?;
-                        txn.mark_written(ctx.tenant_id(), &stmt.table_name);
-                        Ok(crate::sql::SqlOutcome::Insert(outcome))
+            // Issue #1179: 単一行・複数行 `VALUES`・`ON CONFLICT`（UPSERT）を
+            // 受理する（`RETURNING` は単一行・複数行のみ。UPSERT との併用は
+            // フォーム側が `42601`、ファイル形は `0A000`）。autocommit と同じ
+            // フォーム関数（INDEX-4 上限・束縛・台帳順序を共有。第 2 の書き込み
+            // 経路を作らない）へ `InTxn` を渡す。
+            ParsedSql::Insert(stmt) => {
+                let lookup = InsertSchemaLookup::new(&self.storage);
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                let outcome = if stmt.returning.is_some() {
+                    crate::sql::SqlOutcome::Returning(
+                        self.execute_insert_returning_form(target, ctx, stmt, &lookup)?,
+                    )
+                } else {
+                    crate::sql::SqlOutcome::Insert(
+                        self.execute_insert_form(target, ctx, stmt, &lookup)?,
+                    )
+                };
+                txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                Ok(outcome)
+            }
+            ParsedSql::Delete(stmt) => {
+                // 述語形 `DELETE ... RETURNING`（Issue #1182）は明示トランザクション内では
+                // 未対応（fail-closed。書き込みトランザクションを開く前に拒否し、
+                // `RETURNING` を黙って落とさない）。単一行形の `RETURNING` は対応済み。
+                if let crate::sql::allowlist::DeleteStatement::Predicate(v) = stmt {
+                    if v.returning().is_some() {
+                        return Err(SqlSurfaceError::transaction_feature_not_supported(
+                            "RETURNING on predicate DELETE is not supported inside an explicit transaction",
+                        ));
                     }
-                    // 複数行 `VALUES`・ファイル形・`ON CONFLICT`（UPSERT）は
-                    // 明示トランザクション内では未対応（対象外。
-                    // `docs/design/explicit-transaction.md` 参照）。
-                    _ => Err(SqlSurfaceError::transaction_feature_not_supported(
-                        "this INSERT form is not supported inside an explicit transaction",
-                    )),
                 }
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                let (outcome, table) = match stmt {
+                    crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
+                        let outcome = if v.returning.is_some() {
+                            crate::sql::SqlOutcome::Returning(
+                                self.execute_delete_returning_form(target, ctx, v)?,
+                            )
+                        } else {
+                            crate::sql::SqlOutcome::Delete(
+                                self.execute_delete_form(target, ctx, v)?,
+                            )
+                        };
+                        (outcome, v.table_name.as_str())
+                    }
+                    crate::sql::allowlist::DeleteStatement::Predicate(v) => (
+                        crate::sql::SqlOutcome::Delete(
+                            self.execute_predicate_delete_form(target, ctx, session, v)?,
+                        ),
+                        v.table_name(),
+                    ),
+                };
+                txn.mark_written(ctx.tenant_id(), table);
+                Ok(outcome)
+            }
+            ParsedSql::Update(stmt) => {
+                // `UPDATE ... RETURNING`（Issue #1182）は明示トランザクション内では未対応
+                // （fail-closed。書き込みトランザクションを開く前に拒否する）。
+                let has_returning = match stmt {
+                    crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.returning.is_some(),
+                    crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => {
+                        v.returning().is_some()
+                    }
+                };
+                if has_returning {
+                    return Err(SqlSurfaceError::transaction_feature_not_supported(
+                        "RETURNING on UPDATE is not supported inside an explicit transaction",
+                    ));
+                }
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                let outcome = self.execute_predicate_update_form(target, ctx, session, stmt)?;
+                let table = match stmt {
+                    crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.table_name.as_str(),
+                    crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => v.table_name(),
+                };
+                txn.mark_written(ctx.tenant_id(), table);
+                Ok(crate::sql::SqlOutcome::Update(outcome))
             }
             ParsedSql::Truncate(stmt) => {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
@@ -3800,8 +3908,22 @@ impl EngineCore {
             // でないことを確認してから実行する（`docs/design/
             // multi-relation-plan-foundation.md` の申し送り事項を消化する）。
             ParsedSql::Statement(stmt @ Statement::Join(v)) => {
-                crate::sql::relation::ensure_relations_not_written(txn, &v.relations)?;
-                self.execute_validated_in_session(ctx, session, stmt.clone())
+                // `table` は `USING PLAN`／`EXPLAIN` の dirty 判定にしか使われず、JOIN は
+                // 常に読み取り経路（未 commit 変更の反映）へ入るため参考値（先頭のリレーション）。
+                let table = v
+                    .relations
+                    .first()
+                    .map(|r| r.table().to_string())
+                    .unwrap_or_default();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
+            }
+            // Issue #1179: 集合演算も他の読み取り文と同じ経路で読む（未 commit の
+            // 変更があれば書き込みトランザクションを読み取り源にする）。
+            ParsedSql::Statement(stmt @ Statement::SetOperation(v)) => {
+                let mut tables = Vec::new();
+                crate::sql::set_op::collect_branch_tables(&v.tree, &mut tables);
+                let table = tables.first().cloned().unwrap_or_default();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
@@ -3852,18 +3974,19 @@ impl EngineCore {
     /// 保持している分を差し引いた残容量を生成予算にすることで、`declare` の
     /// 合計上限判定より前に「既存保持量＋新規結果」が上限を超えて確保される
     /// ことを防ぐ（PR #1049 レビュー指摘 codex P1 対応）。
-    fn execute_cursor_inner_query(
+    fn execute_cursor_inner_query<R: crate::storage::read_source::ReadSource>(
         &self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
         inner: &crate::sql::allowlist::Statement,
         max_result_bytes: usize,
+        read_txn: &R,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         if let crate::sql::allowlist::Statement::Scan(validated) = inner {
-            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let schema = table_schema_in(read_txn, &validated.table_name)?;
             let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
             let result = crate::sql::scan::execute_scan_with_budget(
-                &read_txn,
+                read_txn,
                 ctx,
                 &schema,
                 &bound,
@@ -3872,13 +3995,13 @@ impl EngineCore {
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         if let crate::sql::allowlist::Statement::Aggregate(validated) = inner {
-            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let schema = table_schema_in(read_txn, &validated.table_name)?;
             let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
             let result =
-                self.run_aggregate_plan(&read_txn, ctx, &schema, &bound, max_result_bytes)?;
+                self.run_aggregate_plan(read_txn, ctx, &schema, &bound, max_result_bytes)?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
-        self.execute_validated_in_session(ctx, session, inner.clone())
+        self.execute_read_statement(ctx, session, inner.clone(), read_txn)
     }
 
     /// [`Self::execute_in_active_txn`] の `ParsedSql::Cursor` 分岐本体
@@ -3913,13 +4036,8 @@ impl EngineCore {
                 // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
                 // セッション自身の `ctx` で暗黙適用する）が適用される。
                 // `table` はビュー展開後の基底テーブル名。
-                let (inner, table) =
+                let (inner, _table) =
                     crate::sql::cursor::validate_declare_inner(query, &self.storage)?;
-                if txn.table_already_written(&table) {
-                    return Err(SqlSurfaceError::transaction_feature_not_supported(
-                        "reading a table already written in the same transaction is not supported",
-                    ));
-                }
                 let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -3928,8 +4046,31 @@ impl EngineCore {
                 // する（PR #1049 レビュー指摘 codex P1 対応。
                 // `execute_cursor_inner_query` のドキュメント参照）。
                 let remaining_bytes = registry.remaining_bytes();
-                let outcome =
-                    self.execute_cursor_inner_query(ctx, session, &inner, remaining_bytes)?;
+                // 自トランザクションが未 commit の変更を持つ間（dirty テーブルあり）は
+                // 共有書き込みトランザクションを読み取り源にして内側 SELECT を実行し、
+                // 未 commit の変更を反映する（Issue #1179。キャッシュは使われない）。
+                // 変更がなければ従来どおり確定済みスナップショットで実行する。
+                let outcome = if txn.dirty_tables()?.is_empty() {
+                    let read_txn = self.begin_read_txn()?;
+                    self.execute_cursor_inner_query(
+                        ctx,
+                        session,
+                        &inner,
+                        remaining_bytes,
+                        &read_txn,
+                    )?
+                } else {
+                    let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?;
+                    self.execute_cursor_inner_query(
+                        ctx,
+                        session,
+                        &inner,
+                        remaining_bytes,
+                        write_txn,
+                    )?
+                };
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／
@@ -3971,11 +4112,23 @@ impl EngineCore {
     }
 
     /// 明示トランザクション内の読み取り系文（`Active` のときのみ呼ばれる）。
-    /// 同一トランザクション内で既に書き込み済みのテーブルへの読み取りは
-    /// `0A000` で拒否する（自トランザクションの未 commit 変更の可視化は対象外。
-    /// `sql::transaction` モジュールドキュメント「読み取りの既知の逸脱」参照）。
-    /// それ以外は BEGIN 時点のスナップショットに対する通常の読み取り経路
-    /// （[`Self::execute_validated_in_session`]）へそのまま委譲する。
+    ///
+    /// 自トランザクションが未 commit の変更を持たない（dirty テーブルなし）間は、
+    /// BEGIN 時点の確定済みスナップショットに対する通常の読み取り経路
+    /// （[`Self::execute_validated_in_session`]。キャッシュ利用可。単一ライタにより
+    /// スナップショットは BEGIN 時点と一致する）へ委譲する。変更を持つ間は、
+    /// 共有書き込みトランザクションを読み取り源（[`crate::storage::read_source::ReadSource`]）
+    /// にして同じ実行本体（[`Self::execute_read_statement`]。RLS・束縛・実行は
+    /// autocommit と共通）を呼び、自トランザクションの未 commit の変更を反映する
+    /// （キャッシュは使われない brute-force 経路。Issue #1179）。dirty は文が直接
+    /// 書き込んだテーブルに加え、参照アクションの連鎖で書き換わった子テーブルを含む
+    /// （[`crate::sql::transaction::SessionTransaction::dirty_tables`]）。サブクエリ・
+    /// JOIN・集合演算が別テーブルの未 commit 変更を読む場合も、文全体が同じ読み取り源
+    /// を使うため反映される。
+    ///
+    /// 例外: `USING PLAN` を伴う検索 SELECT と `EXPLAIN` は LLM I/O・テーブル世代の
+    /// 再照合を伴い確定済みスナップショットに依存するため、対象テーブル（`table`）が
+    /// dirty のときは `0A000` で拒否する（黙って古い結果を返さない。既知の逸脱）。
     fn read_only_in_active_txn<'e>(
         &'e self,
         ctx: &PolicyContext,
@@ -3984,14 +4137,40 @@ impl EngineCore {
         table: &str,
         stmt: crate::sql::allowlist::Statement,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        if txn.table_already_written(table) {
-            return Err(
-                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                    "reading a table already written in the same transaction is not supported",
-                ),
-            );
+        use crate::sql::allowlist::Statement;
+
+        let dirty = txn.dirty_tables()?;
+        if dirty.is_empty() {
+            return self.execute_validated_in_session(ctx, session, stmt);
         }
-        self.execute_validated_in_session(ctx, session, stmt)
+        let is_using_plan_select =
+            matches!(&stmt, Statement::Select(v) if v.using_plan().is_some());
+        match stmt {
+            Statement::Select(_)
+            | Statement::Aggregate(_)
+            | Statement::Scan(_)
+            | Statement::SetOperation(_)
+            | Statement::Join(_)
+                if !is_using_plan_select =>
+            {
+                let write_txn = txn.write_txn().ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }
+                })?;
+                self.execute_read_statement(ctx, session, stmt, write_txn)
+            }
+            other => {
+                if dirty.contains(table) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                            "this read of a table already written in the same transaction is not supported",
+                        ),
+                    );
+                }
+                self.execute_validated_in_session(ctx, session, other)
+            }
+        }
     }
 
     /// Describe（拡張クエリプロトコルの 'D' 種別 S。Issue #933・TASK-71・
@@ -4408,15 +4587,13 @@ impl EngineCore {
                     )?;
                     Ok(crate::sql::SqlOutcome::Query(result))
                 } else {
-                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                    let bound = crate::sql::parser::bind_in_session(
-                        &validated,
-                        &schema,
-                        session.search_mode(),
-                        session.udfs(),
-                    )?;
-                    let result = self.run_select_plan(&read_txn, ctx, &schema, &bound)?;
-                    Ok(crate::sql::SqlOutcome::Query(result))
+                    let read_txn = self.begin_read_txn()?;
+                    self.execute_read_statement(
+                        ctx,
+                        session,
+                        crate::sql::allowlist::Statement::Select(validated),
+                        &read_txn,
+                    )
                 }
             }
             // TASK-166（SQL-13）: 集計 SELECT はスキーマ取得（`bind_aggregate` 用）・
@@ -4428,35 +4605,14 @@ impl EngineCore {
             // [`Self::run_aggregate_plan`] を共有する（TASK-186・NOSQL-4・NOSQL-5:
             // [`Self::execute_bound_aggregate_in_session`] が同じ実行本体を束縛済み
             // 計画向けに再利用する）。
-            crate::sql::allowlist::Statement::Aggregate(mut validated) => {
-                let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
-                // （`bind_aggregate`）の前に WHERE 中のサブクエリ
-                // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
-                // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
-                // 解決する（`sql::subquery` モジュールドキュメント参照）。
-                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
-                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
-                    validated.where_predicates,
-                    &schema,
-                    &read_txn,
+            crate::sql::allowlist::Statement::Aggregate(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
                     ctx,
-                    &self.storage,
-                    session.udfs(),
-                    &mut subquery_budget,
-                    &mut subquery_in_value_budget,
-                )?;
-                let bound =
-                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
-                let result = self.run_aggregate_plan(
+                    session,
+                    crate::sql::allowlist::Statement::Aggregate(validated),
                     &read_txn,
-                    ctx,
-                    &schema,
-                    &bound,
-                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
-                )?;
-                Ok(crate::sql::SqlOutcome::Query(result))
+                )
             }
             // Issue #454: 広域取得（ソートなしのフィルタ取得）は `Statement::Aggregate`
             // アームと同じく、スキーマ取得（`bind_scan` 用）・行走査
@@ -4467,25 +4623,14 @@ impl EngineCore {
             // [`Self::read_txn_with_schema`] を、実行本体は [`Self::run_scan_plan`]
             // を共有する（TASK-186・NOSQL-3: [`Self::execute_bound_scan_in_session`]
             // が同じ実行本体を束縛済み計画向けに再利用する）。
-            crate::sql::allowlist::Statement::Scan(mut validated) => {
-                let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: `Statement::
-                // Aggregate` アームと同じ理由・同じ経路でサブクエリを解決する。
-                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
-                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
-                    validated.where_predicates,
-                    &schema,
-                    &read_txn,
+            crate::sql::allowlist::Statement::Scan(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
                     ctx,
-                    &self.storage,
-                    session.udfs(),
-                    &mut subquery_budget,
-                    &mut subquery_in_value_budget,
-                )?;
-                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
-                let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
-                Ok(crate::sql::SqlOutcome::Query(result))
+                    session,
+                    crate::sql::allowlist::Statement::Scan(validated),
+                    &read_txn,
+                )
             }
             // TASK-78（SQL-6）・Issue #922（SQL-27）: `EXPLAIN` は対象文（検索・
             // 集計・広域取得のいずれも）の本体（ハイブリッド実行・行走査・
@@ -4591,11 +4736,116 @@ impl EngineCore {
             // 適用）は `sql::set_op::execute` が担う（第 2 の実行器を作らない
             // 方針は `Statement::Scan` と同じ）。
             crate::sql::allowlist::Statement::SetOperation(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
+                    ctx,
+                    session,
+                    crate::sql::allowlist::Statement::SetOperation(validated),
+                    &read_txn,
+                )
+            }
+            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN も両辺を単一
+            // スナップショット上で評価する必要があるため、`Statement::SetOperation`
+            // と同じく `read_txn_with_schemas`（複数テーブル版）で両辺のスキーマを
+            // まとめて解決する。実行本体（束縛・型検証・ハッシュ結合・RLS 独立
+            // 適用）は `sql::join::execute` が担う（第 2 の実行器を作らない）。
+            crate::sql::allowlist::Statement::Join(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
+                    ctx,
+                    session,
+                    crate::sql::allowlist::Statement::Join(validated),
+                    &read_txn,
+                )
+            }
+        }
+    }
+
+    /// `Statement::Select`（`USING PLAN` なし）・`Aggregate`・`Scan`・`SetOperation`・
+    /// `Join` の実行本体（読み取り源 `read_txn` を引数に取る。Issue #1179）。
+    ///
+    /// [`Self::execute_validated_in_session`]（autocommit。確定済みスナップショットを
+    /// 開いて渡す。従来と同一の挙動）と、明示トランザクション内で自トランザクションの
+    /// 未 commit 変更を読む経路（[`Self::execute_in_active_txn`]。共有書き込み
+    /// トランザクションを渡す。キャッシュは `read_txn.snapshot()` が `None` のため
+    /// 使われない）が共有する（第 2 の実行器を作らない）。スキーマ取得・サブクエリ解決・
+    /// 実行はすべて同一の `read_txn` 上で行う（単一スナップショット契約）。
+    fn execute_read_statement<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+        read_txn: &R,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        match stmt {
+            crate::sql::allowlist::Statement::Select(validated) => {
+                let schema = table_schema_in(read_txn, &validated.table_name)?;
+                let bound = crate::sql::parser::bind_in_session(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    session.udfs(),
+                )?;
+                let result = self.run_select_plan(read_txn, ctx, &schema, &bound)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            crate::sql::allowlist::Statement::Aggregate(mut validated) => {
+                let schema = table_schema_in(read_txn, &validated.table_name)?;
+                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
+                // （`bind_aggregate`）の前に WHERE 中のサブクエリ
+                // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
+                // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
+                // 解決する（`sql::subquery` モジュールドキュメント参照）。
+                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
+                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+                    validated.where_predicates,
+                    &schema,
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_value_budget,
+                )?;
+                let bound =
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                let result = self.run_aggregate_plan(
+                    read_txn,
+                    ctx,
+                    &schema,
+                    &bound,
+                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            crate::sql::allowlist::Statement::Scan(mut validated) => {
+                let schema = table_schema_in(read_txn, &validated.table_name)?;
+                // `Statement::Aggregate` と同じ理由・同じ経路でサブクエリを解決する。
+                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
+                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+                    validated.where_predicates,
+                    &schema,
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_value_budget,
+                )?;
+                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
+                let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // 集合演算・JOIN は複数枝／両辺を単一スナップショット上で評価する必要が
+            // あるため、全テーブルのスキーマをまとめて解決する（Issue #929・#925）。
+            crate::sql::allowlist::Statement::SetOperation(validated) => {
                 let mut table_names = Vec::new();
                 crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
-                let (read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let schemas = table_schemas_in(read_txn, &table_names)?;
                 let result = crate::sql::set_op::execute(
-                    &read_txn,
+                    read_txn,
                     ctx,
                     &schemas,
                     &validated.tree,
@@ -4604,23 +4854,16 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
-            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN も両辺を単一
-            // スナップショット上で評価する必要があるため、`Statement::SetOperation`
-            // と同じく `read_txn_with_schemas`（複数テーブル版）で両辺のスキーマを
-            // まとめて解決する。実行本体（束縛・型検証・ハッシュ結合・RLS 独立
-            // 適用）は `sql::join::execute` が担う（第 2 の実行器を作らない）。
             crate::sql::allowlist::Statement::Join(validated) => {
                 let table_names = crate::sql::join::collect_join_tables(&validated);
-                let (read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
-                let result = crate::sql::join::execute(
-                    &read_txn,
-                    ctx,
-                    &schemas,
-                    &validated,
-                    session.udfs(),
-                )?;
+                let schemas = table_schemas_in(read_txn, &table_names)?;
+                let result =
+                    crate::sql::join::execute(read_txn, ctx, &schemas, &validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
         }
     }
 
@@ -4636,7 +4879,7 @@ impl EngineCore {
     /// 最適化・ANN opt-in・precision fail-closed 契約（SEARCH-9）を受ける。
     fn run_select_plan(
         &self,
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
@@ -4979,7 +5222,7 @@ impl EngineCore {
     /// モジュールドキュメント参照）。
     fn run_scan_plan(
         &self,
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundScan,
@@ -5006,7 +5249,7 @@ impl EngineCore {
     /// （[`crate::sql::scan::execute_scan_with_budget`] と同じ設計判断）。
     fn run_aggregate_plan(
         &self,
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
@@ -6017,6 +6260,37 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.execute_bound_insert_with_target(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            table,
+            row_count,
+            operation_id,
+            bind,
+        )
+    }
+
+    /// [`Self::execute_bound_insert_in_session`] の本体（書き込み先を `target` で
+    /// 選べる版。Issue #1179）。`InTxn` は明示トランザクション内の `COPY FROM STDIN`
+    /// （[`Self::commit_copy_in_txn`]）が共有 `redb::WriteTransaction` へ書き込む
+    /// ために使い、`Autocommit` は従来の 1 文 1 commit と同一。
+    fn execute_bound_insert_with_target<F>(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        table: &str,
+        row_count: usize,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        bind: F,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::parser::BoundInsert>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -6075,8 +6349,8 @@ impl EngineCore {
         // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
         // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
         // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
-        crate::sql::exec::execute_insert_batch_with_schema(
-            &self.storage,
+        crate::sql::exec::execute_insert_batch_with_schema_in(
+            target,
             ctx,
             &bounds,
             self.ledger_mode,
@@ -6106,6 +6380,16 @@ impl EngineCore {
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        self.begin_copy_validated(ctx, session, stmt)
+    }
+
+    /// [`Self::begin_copy`] の検証済み文を受け取る本体（[`Self::begin_copy_in_txn`] と共有）。
+    fn begin_copy_validated(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::CopyStatement,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
@@ -6127,6 +6411,69 @@ impl EngineCore {
         }
     }
 
+    /// [`Self::begin_copy`] の明示トランザクション対応版（Issue #1179）。`wire-server` の
+    /// `COPY` 入口（`copy::run`）が接続の [`crate::sql::transaction::SessionTransaction`]
+    /// とともに呼ぶ。
+    ///
+    /// - `Idle`: [`Self::begin_copy`] と同一。
+    /// - `Failed`: 実行せず `25P02` 相当のエラーを返す。
+    /// - `InTransaction`: `COPY FROM STDIN` は受け入れ開始のみ（書き込みは
+    ///   [`Self::commit_copy_in_txn`] が行う）。`COPY (...) TO STDOUT` は他の読み取り文と
+    ///   同じく、自トランザクションが未 commit の変更を持つ間は共有書き込み
+    ///   トランザクションを読み取り源にして走査し、未 commit の変更を反映する。
+    ///   失敗時はトランザクションを `Failed` へ遷移させる。
+    pub fn begin_copy_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::transaction::TransactionStatus;
+        match txn.status() {
+            TransactionStatus::Idle => self.begin_copy(ctx, session, sql),
+            TransactionStatus::Failed => Err(txn.take_failed_error()),
+            TransactionStatus::InTransaction => {
+                let result = self.begin_copy_active(ctx, session, txn, sql);
+                if result.is_err() {
+                    txn.fail();
+                }
+                result
+            }
+        }
+    }
+
+    fn begin_copy_active<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
+        if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
+            // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
+            // 超過時は `Failed` へ遷移して拒否する）。`COPY FROM` は
+            // [`Self::commit_copy_in_txn`] が同じ検査を行う。
+            txn.check_and_register_statement(None)?;
+            // 自トランザクションが未 commit の変更を持つ間は、共有書き込み
+            // トランザクションを読み取り源にして走査する（他の読み取り文と同じ
+            // 方針。[`Self::read_only_in_active_txn`] 参照）。
+            if !txn.dirty_tables()?.is_empty() {
+                let write_txn = txn.write_txn().ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }
+                })?;
+                let schema = table_schema_in(write_txn, v.inner.table_name())?;
+                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs())?;
+                let result = self.run_scan_plan(write_txn, ctx, &schema, &bound)?;
+                return Ok(CopyPlan::To(v.format, result));
+            }
+        }
+        self.begin_copy_validated(ctx, session, stmt)
+    }
+
     /// [`Self::begin_copy`] が返した `CopyPlan::From` セッションへ、CopyDone
     /// 到達後に確定したバッチを渡し、SQL-16 の複数行 `INSERT` と同一の実行器
     /// （[`Self::execute_bound_insert_in_session`]）へ委譲して commit する
@@ -6141,6 +6488,67 @@ impl EngineCore {
         ctx: &PolicyContext,
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.commit_copy_in_with_target(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            batch,
+        )
+    }
+
+    /// [`Self::commit_copy_in`] の明示トランザクション対応版（Issue #1179）。
+    /// `wire-server` の `COPY FROM STDIN` 完了処理（`copy::finish_copy_from`）が、
+    /// 接続の [`crate::sql::transaction::SessionTransaction`] とともに呼ぶ。
+    ///
+    /// - `Idle`: 従来どおり autocommit で 1 文 1 commit（[`Self::commit_copy_in`] と同一）。
+    /// - `InTransaction`: 他の書き込み文と同じ順序（文数・持続時間・`operation_id`
+    ///   再利用の検査、共有 `write_txn` への複数行 INSERT、`mark_written`）で実行する。
+    ///   失敗時はトランザクションを `Failed` へ遷移させる（commit は `COMMIT` 文のみ）。
+    /// - `Failed`: 実行せず `25P02` 相当のエラーを返す。
+    pub fn commit_copy_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        batch: crate::sql::copy::CopyInBatch,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::transaction::TransactionStatus;
+        match txn.status() {
+            TransactionStatus::Idle => self.commit_copy_in(ctx, batch),
+            TransactionStatus::Failed => Err(txn.take_failed_error()),
+            TransactionStatus::InTransaction => {
+                txn.check_and_register_statement(
+                    batch.operation_id.as_ref().map(|id| id.as_str()),
+                )?;
+                let table = batch.table.clone();
+                let result = match txn.write_txn() {
+                    Some(write_txn) => self.commit_copy_in_with_target(
+                        crate::tenant::WriteTarget::InTxn(write_txn),
+                        ctx,
+                        batch,
+                    ),
+                    None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                };
+                match result {
+                    Ok(outcome) => {
+                        txn.mark_written(ctx.tenant_id(), &table);
+                        Ok(outcome)
+                    }
+                    Err(e) => {
+                        txn.fail();
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit_copy_in_with_target(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        batch: crate::sql::copy::CopyInBatch,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let crate::sql::copy::CopyInBatch {
             table,
             row_count,
@@ -6148,7 +6556,8 @@ impl EngineCore {
             bounds,
             schema: bound_schema,
         } = batch;
-        self.execute_bound_insert_in_session(
+        self.execute_bound_insert_with_target(
+            target,
             ctx,
             &table,
             row_count,
@@ -6341,7 +6750,13 @@ impl EngineCore {
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         // 判定 6: 実書き込み（`Self::run_predicate_update` 内部の独自 write トランザクション）。
-        self.run_predicate_update(ctx, &udfs, &validated, &schema)
+        self.run_predicate_update(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &udfs,
+            &validated,
+            &schema,
+        )
     }
 
     /// NoSQL 表層 `delete` op の `filter`（述語形。TASK-186・NOSQL-12、
@@ -6382,7 +6797,13 @@ impl EngineCore {
             returning: None,
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
-        self.run_predicate_delete(ctx, &udfs, &validated, &schema)
+        self.run_predicate_delete(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &udfs,
+            &validated,
+            &schema,
+        )
     }
 
     /// `--max-insert-rows`（`self.dml_limits.max_insert_rows_per_statement`）を、
@@ -6737,7 +7158,14 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
         let ledger_write = self.ledger_mode.resolve(operation_id)?;
-        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row, ledger_write)
+        crate::tenant::update_row_unchecked(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            table,
+            ctx,
+            id,
+            row,
+            ledger_write,
+        )
     }
 
     /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -7073,7 +7501,12 @@ impl EngineCore {
                 "RETURNING requires the session-aware entry point",
             ));
         }
-        self.execute_insert_form(ctx, &stmt, &lookup)
+        self.execute_insert_form(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &stmt,
+            &lookup,
+        )
     }
 
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の
@@ -7089,6 +7522,7 @@ impl EngineCore {
     /// エラー写像・`wire_code` は本 Issue 導入前と完全に一致する。
     fn execute_insert_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
@@ -7116,7 +7550,13 @@ impl EngineCore {
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
-                crate::sql::exec::execute_insert(&self.storage, ctx, &bound, self.ledger_mode)
+                crate::sql::exec::execute_insert_with_schema_in(
+                    target,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    None,
+                )
             }
             // 複数行 `VALUES`（SQL-16、TASK-190）。NoSQL 表層の `rows[]`
             // （NOSQL-6・TASK-178・`Self::execute_bound_insert_in_session`）と同じ
@@ -7135,8 +7575,8 @@ impl EngineCore {
             // （`self.batch_limits`）である点に注意。
             crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
                 self.validate_insert_row_batch_limits(&bounds)?;
-                crate::sql::exec::execute_insert_batch_with_schema(
-                    &self.storage,
+                crate::sql::exec::execute_insert_batch_with_schema_in(
+                    target,
                     ctx,
                     &bounds,
                     self.ledger_mode,
@@ -7144,6 +7584,16 @@ impl EngineCore {
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
+                // ファイル形は埋め込み I/O を単一ライタ保持中に行うことになるため、
+                // 明示トランザクション（`InTxn`）内では受理しない（Issue #1179。
+                // `execute_in_active_txn` が事前に拒否するが、本層でも fail-closed）。
+                if matches!(target, crate::tenant::WriteTarget::InTxn(_)) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                            "file-form INSERT is not supported inside an explicit transaction",
+                        ),
+                    );
+                }
                 crate::sql::exec::execute_file_insert(
                     &self.storage,
                     ctx,
@@ -7160,13 +7610,7 @@ impl EngineCore {
             // にも揃える）。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
                 self.validate_upsert_batch_limits(&bound.rows)?;
-                crate::sql::exec::execute_upsert(
-                    &self.storage,
-                    ctx,
-                    &bound,
-                    self.ledger_mode,
-                    &schema,
-                )
+                crate::sql::exec::execute_upsert_in(target, ctx, &bound, self.ledger_mode, &schema)
             }
         }
     }
@@ -7182,6 +7626,7 @@ impl EngineCore {
     /// 済みの前提（`is_none()` は `Internal` として拒否）。
     fn execute_insert_returning_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
@@ -7208,8 +7653,8 @@ impl EngineCore {
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
-                crate::sql::exec::execute_insert_returning(
-                    &self.storage,
+                crate::sql::exec::execute_insert_returning_in(
+                    target,
                     ctx,
                     std::slice::from_ref(&bound),
                     self.ledger_mode,
@@ -7219,8 +7664,8 @@ impl EngineCore {
             }
             crate::sql::parser::BoundInsertForm::RowBatch(bounds) => {
                 self.validate_insert_row_batch_limits(&bounds)?;
-                crate::sql::exec::execute_insert_returning(
-                    &self.storage,
+                crate::sql::exec::execute_insert_returning_in(
+                    target,
                     ctx,
                     &bounds,
                     self.ledger_mode,
@@ -7239,9 +7684,17 @@ impl EngineCore {
             // [`crate::sql::exec::execute_upsert_returning`] へ委譲する。挿入行・
             // `DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
+                // 明示トランザクション内の UPSERT `RETURNING` は未対応（fail-closed）。
+                if matches!(target, crate::tenant::WriteTarget::InTxn(_)) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                            "RETURNING on UPSERT is not supported inside an explicit transaction",
+                        ),
+                    );
+                }
                 self.validate_upsert_batch_limits(&bound.rows)?;
-                crate::sql::exec::execute_upsert_returning(
-                    &self.storage,
+                crate::sql::exec::execute_upsert_returning_in(
+                    target,
                     ctx,
                     &bound,
                     self.ledger_mode,
@@ -7325,7 +7778,11 @@ impl EngineCore {
                 "RETURNING requires the session-aware entry point",
             ));
         }
-        self.execute_delete_form(ctx, &stmt)
+        self.execute_delete_form(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &stmt,
+        )
     }
 
     /// [`Self::execute_delete_sql`]・[`Self::execute_sql_in_session`] の
@@ -7336,11 +7793,12 @@ impl EngineCore {
     /// `sql::exec::execute_delete` の薄い委譲になる。
     fn execute_delete_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let bound = crate::sql::parser::bind_delete(stmt)?;
-        crate::sql::exec::execute_delete(&self.storage, ctx, &bound, self.ledger_mode)
+        crate::sql::exec::execute_delete_in(target, ctx, &bound, self.ledger_mode)
     }
 
     /// [`Self::execute_sql_in_session`] の `DELETE`（述語形。SQL-19・TASK-192、
@@ -7360,6 +7818,7 @@ impl EngineCore {
     /// `23505`／`22023`・上限超過 `54000`）の順で失敗しうる。
     fn execute_predicate_delete_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
@@ -7375,7 +7834,7 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
-        self.run_predicate_delete(ctx, session.udfs(), stmt, &schema)
+        self.run_predicate_delete(target, ctx, session.udfs(), stmt, &schema)
     }
 
     /// [`Self::execute_predicate_delete_form`]（SQL 表層。SQL-19・TASK-192、
@@ -7390,14 +7849,15 @@ impl EngineCore {
     /// [`crate::sql::udf_call::UdfRegistry::default()`]）を渡す。
     fn run_predicate_delete(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         udfs: &crate::sql::udf_call::UdfRegistry,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let (bound, content_hash_value) = Self::prepare_predicate_delete(stmt, schema, udfs)?;
-        crate::sql::exec::execute_predicate_delete(
-            &self.storage,
+        crate::sql::exec::execute_predicate_delete_in(
+            target,
             ctx,
             &bound,
             self.ledger_mode,
@@ -7457,6 +7917,7 @@ impl EngineCore {
     /// 呼び出し元が `Some` を確認済みの前提（`None` は `Internal`）。
     fn execute_predicate_delete_returning_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
@@ -7472,7 +7933,7 @@ impl EngineCore {
         let (bound, content_hash_value) =
             Self::prepare_predicate_delete(stmt, &schema, session.udfs())?;
         crate::sql::exec::execute_predicate_delete_returning(
-            &self.storage,
+            target,
             ctx,
             &bound,
             self.ledger_mode,
@@ -7491,6 +7952,7 @@ impl EngineCore {
     /// あることを検証済みの前提（`is_none()` は `Internal` として拒否）。
     fn execute_delete_returning_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedDelete,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
@@ -7510,8 +7972,8 @@ impl EngineCore {
                 detail: "execute_delete_returning_form called without RETURNING".to_string(),
             })?;
         let bound = crate::sql::parser::bind_delete(stmt)?;
-        crate::sql::exec::execute_delete_returning(
-            &self.storage,
+        crate::sql::exec::execute_delete_returning_in(
+            target,
             ctx,
             &bound,
             self.ledger_mode,
@@ -7549,7 +8011,12 @@ impl EngineCore {
         // ことで、1 文あたりのスキーマ取得を 1 回へ減らす。
         let lookup = InsertSchemaLookup::new(&self.storage);
         let stmt = crate::sql::allowlist::validate_update(sql, &lookup, self.ledger_mode)?;
-        self.execute_update_form(ctx, &stmt, &lookup)
+        self.execute_update_form(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            &stmt,
+            &lookup,
+        )
     }
 
     /// [`Self::execute_update_sql`] の単一行 UPDATE 分岐が使う束縛〜実行本体
@@ -7567,6 +8034,7 @@ impl EngineCore {
     /// （`crate::sql::exec::execute_update_with_schema` を直接呼ぶ）。
     fn execute_update_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedUpdate,
         lookup: &InsertSchemaLookup<'_>,
@@ -7586,8 +8054,8 @@ impl EngineCore {
                 })?,
         };
         let bound = crate::sql::parser::bind_update(stmt, &schema)?;
-        crate::sql::exec::execute_update_with_schema(
-            &self.storage,
+        crate::sql::exec::execute_update_with_schema_in(
+            target,
             ctx,
             &bound,
             self.ledger_mode,
@@ -7610,6 +8078,7 @@ impl EngineCore {
     /// で実行する。
     fn execute_predicate_update_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
@@ -7642,15 +8111,15 @@ impl EngineCore {
                         .to_string(),
                 });
             };
-            return crate::sql::exec::execute_update_with_schema(
-                &self.storage,
+            return crate::sql::exec::execute_update_with_schema_in(
+                target,
                 ctx,
                 &bound,
                 self.ledger_mode,
                 Some(&schema),
             );
         };
-        self.run_predicate_update(ctx, session.udfs(), validated, &schema)
+        self.run_predicate_update(target, ctx, session.udfs(), validated, &schema)
     }
 
     /// 述語形 `UPDATE` の束縛と内容照合ハッシュ計算（RECOVER-11）。戻り値の
@@ -7717,6 +8186,7 @@ impl EngineCore {
     /// `Some` を確認済みの前提（`None` は `Internal`）。
     fn execute_update_returning_form(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
@@ -7743,8 +8213,8 @@ impl EngineCore {
                             .to_string(),
                     });
                 };
-                crate::sql::exec::execute_update_returning(
-                    &self.storage,
+                crate::sql::exec::execute_update_returning_in(
+                    target,
                     ctx,
                     &bound,
                     self.ledger_mode,
@@ -7756,7 +8226,7 @@ impl EngineCore {
                 let (bound, content_hash_value, legacy_hashes) =
                     Self::prepare_predicate_update(validated, &schema, session.udfs())?;
                 crate::sql::exec::execute_predicate_update_returning(
-                    &self.storage,
+                    target,
                     ctx,
                     &bound,
                     self.ledger_mode,
@@ -7782,6 +8252,7 @@ impl EngineCore {
     /// run_predicate_delete`] と同じ契約）を渡す。
     fn run_predicate_update(
         &self,
+        target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         udfs: &crate::sql::udf_call::UdfRegistry,
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
@@ -7790,8 +8261,8 @@ impl EngineCore {
         let (predicate, content_hash_value, legacy_hash) =
             Self::prepare_predicate_update(validated, schema, udfs)?;
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();
-        crate::sql::exec::execute_predicate_update(
-            &self.storage,
+        crate::sql::exec::execute_predicate_update_in(
+            target,
             ctx,
             &predicate,
             self.ledger_mode,

@@ -294,12 +294,41 @@ fn multi_statement_error_without_transaction_stays_idle() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 }
 
-/// `Active`（`InTransaction`）中の `COPY ... FROM STDIN` は未対応機能
-/// （`0A000`）として `Failed` へ遷移し `'E'` になる（`CopyInResponse` へは
-/// 進まない。`handshake.rs` の `post_auth_loop` 内分岐）。続く `ROLLBACK` で
-/// `'I'` へ戻る。
+/// CopyInResponse（'G'）を読み捨てる（型バイト・長さ・本文）。
+fn read_copy_in_response(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut header = [0u8; 1];
+    stream
+        .read_exact(&mut header)
+        .expect("read CopyInResponse type");
+    assert_eq!(header[0], b'G', "expected CopyInResponse");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+}
+
+fn send_copy_data(stream: &mut std::net::TcpStream, row: &[u8]) {
+    use std::io::Write;
+    let mut frame = vec![b'd'];
+    frame.extend_from_slice(&((row.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(row);
+    stream.write_all(&frame).expect("send CopyData");
+}
+
+fn send_copy_done(stream: &mut std::net::TcpStream) {
+    use std::io::Write;
+    let mut done = vec![b'c'];
+    done.extend_from_slice(&4i32.to_be_bytes());
+    stream.write_all(&done).expect("send CopyDone");
+}
+
+/// `Active`（`InTransaction`）中の `COPY ... FROM STDIN` は共有書き込み
+/// トランザクションへ書き込み（Issue #1179）、完了後の `ReadyForQuery` は `'T'` の
+/// まま。`COMMIT` で確定し、別の文から見える。
 #[test]
-fn copy_inside_active_transaction_fails_transaction_with_e_status() {
+fn copy_inside_active_transaction_keeps_t_status_and_commits() {
     let (core, _guard) = new_core_with_documents_table();
     let mut stream = spawn_alice(core);
 
@@ -311,7 +340,125 @@ fn copy_inside_active_transaction_fails_transaction_with_e_status() {
         &mut stream,
         "COPY documents (id, embedding, body) FROM STDIN USING OPERATION_ID 'op-943-copy'",
     );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"20\t[0.1,0.2,0.3]\tcopied\n");
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    send_simple_query(&mut stream, "SELECT id FROM documents LIMIT 10");
+    let _ = read_row_description(&mut stream);
+    let _ = read_data_row(&mut stream);
+    let _ = read_command_complete(&mut stream);
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// 明示トランザクション中の `COPY (...) TO STDOUT` は自トランザクションの未 commit の
+/// 変更を返し（Issue #1179）、完了後の `ReadyForQuery` は `'T'` のまま。別接続からは
+/// 未 commit の行が見えない。
+#[test]
+fn copy_to_stdout_inside_active_transaction_returns_uncommitted_rows() {
+    use std::io::Read;
+    let (core, _guard) = new_core_with_documents_table();
+    let mut stream = spawn_alice(Arc::clone(&core));
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    send_simple_query(&mut stream, &insert_sql(7, "op-1179-copy-to"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    send_simple_query(
+        &mut stream,
+        "COPY (SELECT id FROM documents LIMIT 100) TO STDOUT",
+    );
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let mut header = [0u8; 1];
+        stream.read_exact(&mut header).expect("read type");
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len - 4];
+        stream.read_exact(&mut body).expect("read body");
+        match header[0] {
+            b'H' => {}
+            b'd' => rows.push(body),
+            b'c' => break,
+            other => panic!("unexpected message {other}"),
+        }
+    }
+    assert_eq!(rows, vec![b"7\n".to_vec()]);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    // 別接続からは未 commit の行が見えない。
+    let mut other = spawn_alice(Arc::clone(&core));
+    send_simple_query(&mut other, "SELECT id FROM documents LIMIT 10");
+    let _ = read_row_description(&mut other);
+    let _ = read_command_complete(&mut other);
+    assert_eq!(read_ready_for_query_status(&mut other), b'I');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// `Active` 中の COPY を `ROLLBACK` すると書き込みは破棄され、`Active` 中の COPY を
+/// クライアントが `CopyFail` で中断した場合は `Failed`（`'E'`）へ遷移する。
+#[test]
+fn copy_fail_inside_active_transaction_fails_transaction_with_e_status() {
+    use std::io::Write;
+    let (core, _guard) = new_core_with_documents_table();
+    let mut stream = spawn_alice(core);
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    send_simple_query(
+        &mut stream,
+        "COPY documents (id, embedding, body) FROM STDIN USING OPERATION_ID 'op-943-copy-fail'",
+    );
+    read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"20\t[0.1,0.2,0.3]\tcopied\n");
+    let msg = b"abort\0";
+    let mut frame = vec![b'f'];
+    frame.extend_from_slice(&((msg.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(msg);
+    stream.write_all(&frame).expect("send CopyFail");
+    expect_error_response_with_sqlstate(&mut stream, "22000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// `Active` 中の COPY 中に行データが不正な場合（デコード失敗）も `Failed` へ遷移する。
+#[test]
+fn copy_decode_error_inside_active_transaction_fails_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    let mut stream = spawn_alice(core);
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    send_simple_query(
+        &mut stream,
+        "COPY documents (id, embedding, body) FROM STDIN USING OPERATION_ID 'op-943-copy-bad'",
+    );
+    read_copy_in_response(&mut stream);
+    // embedding 次元が宣言（3）と不一致。
+    send_copy_data(&mut stream, b"20\t[0.1,0.2]\tcopied\n");
+    send_copy_done(&mut stream);
+    expect_error_response_with_sqlstate(&mut stream, "22000");
     assert_eq!(read_ready_for_query_status(&mut stream), b'E');
 
     send_simple_query(&mut stream, "ROLLBACK");

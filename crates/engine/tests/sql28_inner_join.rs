@@ -800,8 +800,13 @@ fn join_read_succeeds_inside_explicit_transaction() {
     assert_eq!(expect_query(outcome).rows.len(), 3);
 }
 
+/// 自トランザクションが書き込んだテーブルを JOIN しても、未 commit の変更が結果に
+/// 反映される（Issue #1179。書き込みトランザクションを読み取り源にする）。孤児
+/// 文書 `doc-orphan`（`author_id = 999`）は、トランザクション内で `authors` に
+/// 追加した 999 番の行と結合され 4 行になる。別セッション（autocommit）からは
+/// 未 commit の行が見えず、結合されないまま 3 行のまま。
 #[test]
-fn join_read_after_writing_one_of_its_tables_is_rejected() {
+fn join_read_after_writing_one_of_its_tables_sees_the_uncommitted_row() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
@@ -818,15 +823,25 @@ fn join_read_after_writing_one_of_its_tables_is_rejected() {
     )
     .expect("insert into authors");
 
-    let err = core
-        .execute_sql_in_txn(
-            &caller,
-            &mut session,
-            &mut txn,
-            "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
-        )
-        .expect_err("reading a table already written in the same transaction must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
+    let join_sql = "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10";
+    let outcome = core
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, join_sql)
+        .expect("join over a written table must see the uncommitted row");
+    assert_eq!(expect_query(outcome).rows.len(), 4);
+
+    // 別セッションからは未 commit の行が見えない。
+    // （書き込みゲートは autocommit の読み取りを妨げない。）
+    let other = core
+        .execute_sql_in_session(&caller, &mut SessionState::default(), join_sql)
+        .expect("autocommit join from another session");
+    assert_eq!(expect_query(other).rows.len(), 3);
+
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    let after = core
+        .execute_sql_in_session(&caller, &mut SessionState::default(), join_sql)
+        .expect("autocommit join after rollback");
+    assert_eq!(expect_query(after).rows.len(), 3);
 }
 
 // ---------- Describe ----------

@@ -20,6 +20,14 @@
 - 対象: `COPY <table> (<cols>) FROM STDIN [WITH] [(FORMAT text|csv)]
   USING OPERATION_ID '<id>'`、`COPY (<SELECT>) TO STDOUT [[WITH]
   (FORMAT text|csv)]`。いずれも簡易クエリプロトコル（'Q'）経由のみ。
+- 明示トランザクション中の COPY（Issue #1179）: `Idle`・`Active` のとき `copy::run` へ
+  委譲する。`COPY FROM STDIN` は `EngineCore::commit_copy_in_txn` で共有書き込み
+  トランザクションへ書き込み（commit は `COMMIT` 文のみ）、`COPY (...) TO STDOUT` は
+  未 commit の変更を反映する。COPY 中のエラー（CopyFail・デコード失敗・上限超過）は
+  トランザクションを `Failed`（ReadyForQuery `'E'`）へ遷移させ、成功時の状態バイトは
+  `txn.status()` から導出する。`Failed` 中の COPY は `25P02`。受信期限は
+  ハンドシェイク層のフレーム受信期限が及び、期限超過で接続を閉じてライタを解放する
+  （詳細は `docs/design/explicit-transaction.md`「wire-server への結線」）。
 - 対象外（起票済み・別 Issue／別タスクへ申し送り）:
   - 拡張クエリプロトコル（TASK-216）経由の COPY・Sync までの同期回復。
   - `HEADER`／`DELIMITER`／`NULL`／`QUOTE` などの COPY オプション、binary

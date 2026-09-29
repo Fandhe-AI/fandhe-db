@@ -208,9 +208,9 @@ fn key_specs(schema: &TableSchema) -> Result<(Vec<KeySpec>, Vec<bool>), CatalogE
 /// Issue #1077）。autocommit（1 文＝1 トランザクション）は常に `All`——遅延指定
 /// （`DEFERRABLE`／`INITIALLY DEFERRED`）でも「検査しない」ことにはならず、
 /// 文単位で必ず検査する。明示トランザクション（SQL-31・TASK-221）中の
-/// `tenant::WriteTarget::InTxn` 経路（`insert_row_unchecked`・
-/// `insert_rows_unchecked`・`insert_typed_row_unchecked`・
-/// `truncate_table_unchecked` の 4 経路のみ）だけが `ImmediateOnly` を渡し、
+/// `tenant::WriteTarget::InTxn` 経路（`WriteTarget::fk_check_mode()` が導出する。
+/// Issue #1179 で全書き込み経路〔INSERT・UPSERT・UPDATE・DELETE・TRUNCATE〕が
+/// `WriteTarget` を受け取る形になった）だけが `ImmediateOnly` を渡し、
 /// `INITIALLY DEFERRED` の FK を文単位検査から除外して COMMIT 時
 /// （[`enforce_deferred_foreign_keys_in_txn`]）へ先送りする。`fail-closed`:
 /// 先送りした FK は `sql::transaction::SessionTransaction::commit` が
