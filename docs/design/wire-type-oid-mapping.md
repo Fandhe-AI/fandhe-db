@@ -98,9 +98,11 @@ format_type` 呼び出しをサーバーへ要求するため本サーバー（`
 - `id`（`numeric`）のバイナリ対応拡大 → spec 側で未策定のため引き続き未実施
 - `Computed`（集計・式列）への型情報付与とそれに伴う OID 公告 → Issue #1173 で
   対応済み（下記「集計・式列の型」）
-- 層 B（psycopg・node pg の opt-in 型 OID 観測スクリプト拡張・
-  `three_client_e2e.rs` への `#[ignore]` テスト追加）→ 本 Issue の時点では
-  未実施。`crates/wire-server/tests/wire13_type_oid.rs`（層 A・実 wire 経路）
+- 層 B（3 クライアントでの型復元）→ **Issue #1176 で実施済み**
+  （`three_client_extended_e2e.rs`。ドライバ側のネイティブ型で値を受け取れる
+  ことを確認。型 OID の網羅的観測は引き続き層 A の担当）。以下は本 Issue 時点の記録:
+  psycopg・node pg の opt-in 型 OID 観測スクリプト拡張・
+  `three_client_e2e.rs` への `#[ignore]` テスト追加は未実施。`crates/wire-server/tests/wire13_type_oid.rs`（層 A・実 wire 経路）
   が RowDescription バイト列・値の不変・RLS 境界を機械検証しており、
   `DataRow` のテキスト表現自体が不変（ドライバのパース経路には影響しない）
   ことから、層 B 追加は独立の後続タスクとして扱う

@@ -934,6 +934,43 @@ NULL` 列への `SET NULL`＝宣言時検査 `42830`）を適用し、影響行�
 実行結果（本開発環境）: psql・psycopg・node `pg`（scratchpad へ一時導入し
 `NODE_PATH` で参照。リポへは持ち込まない）の 3 クライアントとも green。
 
+## 拡張クエリ・型復元・バイナリ受信の 3 クライアント検証（Issue #1176・WIRE-11・WIRE-13・WIRE-14）
+
+`three_client_extended_e2e.rs`（新規）と専用スクリプト `three_client/
+psycopg_extended.py`・`pg_extended.js` を追加した。簡易クエリ経路を固定する既存の
+`psycopg_client.py`・`pg_client.js` は変更していない。層 A（`wire11_*`・
+`wire12_param_binding.rs`・`wire13_type_oid.rs`・`wire14_*`）が規則の確定オラクル、
+本ファイルは同じ挙動が無改造クライアントで観測できることの代表確認を担う。
+
+- **駆動方法**: psql は stdin へ `<SQL> \bind '<p>'... \g`（0 個なら `\bind \g`。
+  `-c` はメタコマンドと混在できないため）。psycopg は `RawCursor`（`$n` を
+  そのまま書けるため 3 クライアントで SQL 定数を共有）、パラメータ無しは
+  `prepare=True`。node pg は values 付き、パラメータ無しは `queryMode: 'extended'`。
+- **C1〜C4・INSERT**: C1〜C3 は `$n` 版、C4 は `hybrid_rrf` 引数が `$n` の受理位置外
+  のためパラメータ 0 個の拡張プロトコルで送る（関数引数の `$n` は `42601` を負のケース
+  で固定）。INSERT は `VALUES (<id>, $1, $2, $3) USING OPERATION_ID $4` で、
+  読み戻しは挿入者の新規接続の `$n` SELECT。他テナントの同 SELECT に現れないことで
+  RLS を非 vacuous に確認する。
+- **型復元**: `typed_items` の共通行 A を 3 クライアントで読み、psycopg
+  （int／float／bool／bytes／UUID）・node pg（number／string／boolean／Buffer。
+  int8 が string なのは pg-types の既定）のネイティブ型を確認。psql は
+  PostgreSQL 正準テキスト表現（`t`／`f`・`\x..`）で確認する（`\gdesc` は
+  `pg_catalog` 依存で使えないため型 OID の網羅は層 A）。`id` は numeric（OID 1700）
+  のため psycopg `Decimal`／node pg `string`。
+- **バイナリ受信**: psycopg・node pg でバイナリ結果がテキスト結果と完全一致することを
+  確認（テキスト結果は独立オラクル照合済み）。psql は該当モードが無く対象外。
+  node pg はバイナリ DataRow を UTF-8 文字列として読むため 0x80 以上のバイトを含む値が
+  壊れる。共通行 A は全送信バイト `< 0x80` の値に限定し、この制約と REAL／DOUBLE 値の
+  f32 厳密表現を常時実行の `node_binary_fixture_bytes_are_utf8_safe` で機械検証する。
+  負数・高位バイトの行 B は psycopg のみで検証する。node の bytea／uuid は公開 API
+  `pg.types.setTypeParser` で parser を登録する（ドライバ無改造）。
+- **負のケース**: 受理位置外 `$n` → `42601`、numeric（`id`）を含むバイナリ要求 →
+  `0A000`、非 text スロットのバイナリパラメータ（psycopg の Python `int`）→ `0A000`、
+  Private 行の他テナント非可視、`' OR '1'='1` 束縛が不透明リテラルのまま 0 行。
+
+実行結果（本開発環境）: psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0 で
+`--ignored` 5 件 green、非 ignore の fixture ガード 1 件 green。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
