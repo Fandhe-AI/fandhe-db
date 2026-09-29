@@ -784,12 +784,70 @@ fn alter_table_add_column_duplicate_column_is_42701() {
 }
 
 #[test]
-fn alter_table_drop_column_is_0a000() {
+fn alter_table_drop_column_succeeds_and_column_disappears() {
     let (core, _guard) = new_core_with_docs_table();
     let session = ddl_session(core);
-    let body = br#"{"op":"alter_table","table":"docs","drop_column":{"name":"embedding"}}"#;
-    let resp = query(&session, body);
-    assert_eq!(http_common::wire_code_of(&resp), "0A000", "got: {resp:?}");
+    let add = br#"{"op":"alter_table","table":"docs","add_column":{"name":"note","type":"text"}}"#;
+    assert_eq!(query(&session, add).status, 200);
+    let drop = br#"{"op":"alter_table","table":"docs","drop_column":{"name":"note"}}"#;
+    let resp = query(&session, drop);
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    // 削除後は同名で再 ADD できる（墓標方式でも生存列としては存在しない）。
+    assert_eq!(query(&session, add).status, 200);
+    // 2 回目の DROP 後に存在しない列を DROP すると 42703。
+    assert_eq!(query(&session, drop).status, 200);
+    let resp = query(&session, drop);
+    assert_eq!(http_common::wire_code_of(&resp), "42703", "got: {resp:?}");
+}
+
+/// SQL 表層と同一のエラー契約（Issue #1167）。VECTOR 列・予約列は `42601`、
+/// 存在しないテーブルは `42P01`。
+#[test]
+fn alter_table_drop_column_error_contract_matches_sql_surface() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = ddl_session(core);
+    for (body, code) in [
+        (
+            r#"{"op":"alter_table","table":"docs","drop_column":{"name":"embedding"}}"#,
+            "42601",
+        ),
+        (
+            r#"{"op":"alter_table","table":"docs","drop_column":{"name":"id"}}"#,
+            "42601",
+        ),
+        (
+            r#"{"op":"alter_table","table":"docs","drop_column":{"name":"tenant_id"}}"#,
+            "42601",
+        ),
+        (
+            r#"{"op":"alter_table","table":"docs","drop_column":{"name":"missing"}}"#,
+            "42703",
+        ),
+        (
+            r#"{"op":"alter_table","table":"nope","drop_column":{"name":"a"}}"#,
+            "42P01",
+        ),
+    ] {
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            code,
+            "body={body} got: {resp:?}"
+        );
+    }
+}
+
+#[test]
+fn alter_table_drop_column_without_ddl_permission_is_42501() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = non_ddl_session(core);
+    for table in ["docs", "nope"] {
+        let body = format!(
+            r#"{{"op":"alter_table","table":"{table}","drop_column":{{"name":"embedding"}}}}"#
+        );
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(http_common::wire_code_of(&resp), "42501", "got: {resp:?}");
+    }
 }
 
 #[test]

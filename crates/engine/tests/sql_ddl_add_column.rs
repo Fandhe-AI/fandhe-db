@@ -459,10 +459,17 @@ fn malformed_syntax_variants_are_rejected_with_42601() {
         format!("ALTER TABLE {TABLE} ADD note TEXT"),
         format!("ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS note TEXT"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT, ADD COLUMN note2 TEXT"),
-        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT NOT NULL"),
-        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 'x'"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT UNIQUE"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT PRIMARY KEY"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT NULL"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT NOT NULL NOT NULL"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 'a' DEFAULT 'b'"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 1"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note INTEGER DEFAULT 'x'"),
+        format!("ALTER TABLE {TABLE} ADD COLUMN note BOOLEAN DEFAULT 1"),
+        // `DROP COLUMN embedding` は VECTOR 列保護（Issue #1167 以降）で 42601。
+        // `ALTER COLUMN ... TYPE` の契約は `sql_ddl_drop_alter_column.rs` が担う。
         format!("ALTER TABLE {TABLE} DROP COLUMN embedding"),
-        format!("ALTER TABLE {TABLE} ALTER COLUMN embedding TYPE TEXT"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT USING OPERATION_ID 'op-1'"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT RETURNING id"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(0,0)"),
@@ -736,4 +743,242 @@ fn describe_alter_table_returns_no_result_columns() {
         .describe_parsed_in_session(&session, &parsed)
         .expect("describe should succeed");
     assert!(described.is_none());
+}
+// --- NOT NULL／DEFAULT（Issue #1169。ポインタ: TABLE-5・TABLE-16・SQL-23） --------
+
+fn one_cell(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Cell {
+    let result = core.execute_sql(ctx, sql).expect("select should succeed");
+    assert_eq!(result.rows.len(), 1, "{sql}");
+    result.rows[0].cells[0].clone()
+}
+
+fn add_column(core: &EngineCore, decl: &str) -> Result<SqlOutcome, SqlSurfaceError> {
+    let mut session = ddl_session();
+    alter_table(
+        core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN {decl}"),
+    )
+}
+
+#[test]
+fn default_fills_existing_rows_across_read_paths() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    add_column(&core, "note TEXT DEFAULT 'hi'").expect("ADD COLUMN DEFAULT");
+
+    let knn = format!("SELECT note FROM {TABLE} ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
+    assert!(matches!(one_cell(&core, &owner, &knn), Cell::Text(ref t) if t == "hi"));
+    let hit = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE note = 'hi' LIMIT 10"),
+        )
+        .expect("where");
+    assert_eq!(hit.rows.len(), 1);
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT COUNT(note) FROM {TABLE}")),
+        Cell::Integer(1)
+    ));
+}
+
+#[test]
+fn not_null_default_fills_existing_rows_and_new_rows_use_default_on_omission() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    add_column(&core, "n INTEGER NOT NULL DEFAULT 7").expect("ADD COLUMN NOT NULL DEFAULT");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT n FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::SignedInteger(7)
+    ));
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting n");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, n) VALUES (3, '[0.3,0.4]', 9) USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit n");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT n FROM {TABLE} WHERE id = 2 LIMIT 1")
+        ),
+        Cell::SignedInteger(7)
+    ));
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT n FROM {TABLE} WHERE id = 3 LIMIT 1")
+        ),
+        Cell::SignedInteger(9)
+    ));
+}
+
+#[test]
+fn default_values_are_correct_for_each_supported_type() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    for decl in [
+        "b BOOLEAN NOT NULL DEFAULT true",
+        "big BIGINT DEFAULT -5",
+        "r REAL DEFAULT 1.5",
+        "d DOUBLE PRECISION DEFAULT 2.5",
+        "num NUMERIC(5,2) NOT NULL DEFAULT 3.14",
+    ] {
+        add_column(&core, decl).unwrap_or_else(|e| panic!("{decl}: {e}"));
+    }
+    let q = |col: &str| {
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        )
+    };
+    assert!(matches!(q("b"), Cell::Bool(true)));
+    assert!(matches!(q("big"), Cell::SignedInteger(-5)));
+    assert!(matches!(q("r"), Cell::Float(v) if (v - 1.5).abs() < 1e-9));
+    assert!(matches!(q("d"), Cell::Float(v) if (v - 2.5).abs() < 1e-9));
+    let num = format!("{:?}", q("num"));
+    assert!(
+        num.contains("3.14") || num.contains("314"),
+        "unexpected NUMERIC cell: {num}"
+    );
+}
+
+/// `DEFAULT` を欠く `NOT NULL` の追加は、行の有無（自テナント・他テナント・空）に
+/// かかわらず同一の `42601` で拒否される（TABLE-16）。他テナントの行の存在が DDL の
+/// 成否から判別できないこと（テナント境界 P0）と、副作用ゼロを固定する。
+#[test]
+fn not_null_without_default_is_rejected_uniformly_regardless_of_rows() {
+    // 空テーブル
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "note TEXT NOT NULL").expect_err("empty: rejected");
+    assert_eq!(empty_err.wire_code(), "42601");
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "note"));
+
+    // 他テナントの行だけがある場合
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "note TEXT NOT NULL").expect_err("other tenant: rejected");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "note"));
+
+    // 自テナントの行もある場合
+    insert_row(&core, &ctx("owner"), 2, 2);
+    let own_err = add_column(&core, "note TEXT NOT NULL").expect_err("own rows: rejected");
+    assert_eq!(own_err.wire_code(), "42601");
+    assert!(!column_exists(&core, &ctx("owner"), TABLE, "note"));
+
+    // 応答は行の有無で区別できない（同一の文言）。
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert_eq!(empty_err.to_string(), own_err.to_string());
+}
+
+#[test]
+fn default_type_check_errors() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    for (decl, code) in [
+        ("a INTEGER DEFAULT 99999999999", "22003"),
+        ("b NUMERIC(3,1) DEFAULT 123.45", "22003"),
+        ("c DATE DEFAULT '2020-01-01'", "0A000"),
+        (
+            "d UUID DEFAULT '00000000-0000-0000-0000-000000000000'",
+            "0A000",
+        ),
+        ("e TEXT DEFAULT 1", "42601"),
+        ("f BOOLEAN DEFAULT 'x'", "42601"),
+    ] {
+        let err = add_column(&core, decl).expect_err(decl);
+        assert_eq!(err.wire_code(), code, "{decl}: {err:?}");
+        let name = decl.split(' ').next().unwrap_or("");
+        assert!(!column_exists(&core, &ctx("owner"), TABLE, name), "{decl}");
+    }
+}
+
+#[test]
+fn default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "note TEXT NOT NULL DEFAULT 'kept'").expect("ADD COLUMN");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT note FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Text(ref t) if t == "kept"
+    ));
+}
+
+#[test]
+fn update_of_old_row_keeps_default() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "tag TEXT DEFAULT 'd'").expect("ADD COLUMN tag");
+    add_column(&core, "extra TEXT").expect("ADD COLUMN extra");
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!("UPDATE {TABLE} SET extra = 'e' WHERE id = 1 USING OPERATION_ID 'op-u1'"),
+    )
+    .expect("update old row");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT tag FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Text(ref t) if t == "d"
+    ));
+}
+
+#[test]
+fn default_add_column_requires_ddl_permission_before_anything_else() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let err = core
+        .execute_sql_in_session(
+            &ctx("owner"),
+            &mut SessionState::default(),
+            &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT NOT NULL DEFAULT 'x'"),
+        )
+        .expect_err("no DDL privilege");
+    assert_eq!(err.wire_code(), "42501");
 }
