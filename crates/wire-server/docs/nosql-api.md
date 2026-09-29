@@ -646,9 +646,11 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   範囲は engine 側で検証）／`BYTEA`（base64 の JSON string。`42601`／`54000`。
   復号後 4 MiB 超で `54000`）／`NUMERIC`（数値または数値文字列。`42601`）
 - `lt`／`le`／`lte`／`gt`／`ge`／`gte` は `DATE`・`TIMESTAMP`・`UUID`（文字列）・
-  `NUMERIC`（数値または数値文字列）・`BYTEA`（base64 の JSON string）のみ受理
-  する。`TEXT`／`ENUM`／`BOOLEAN`／`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列は
-  engine 側の「範囲比較非対応列」判定（`22000`）へ委譲する
+  `NUMERIC`（数値または数値文字列）・`BYTEA`（base64 の JSON string）・`TEXT`
+  （文字列。バイト順の式レーン比較。Issue #1183）・`INTEGER`／`BIGINT`／`REAL`／
+  `DOUBLE PRECISION`（JSON 数値。下記）を受理する。`ENUM`／`BOOLEAN`／`VECTOR`／
+  `ARRAY`／`JSON`／`JSONB` 列は engine 側の「範囲比較非対応列」判定（`22000`）へ
+  委譲する
 - `in` は `TEXT`／`ENUM`（文字列配列）・`DATE`／`TIMESTAMP`／`UUID`（文字列配列）・
   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 の JSON string の
   配列）のみ受理する。他の列型は engine 側の「IN 非対応列」判定（`22000`）へ
