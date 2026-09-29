@@ -101,6 +101,55 @@ fn keyword_from_str(s: &str) -> Option<Keyword> {
     }
 }
 
+/// 検証済みトークン列を、再トークン化で元と同一のトークン列に戻る正規化 SQL
+/// テキストへ描画する（TABLE-18・Issue #1192）。`CREATE VIEW` の本文のうち、
+/// 集計・`LIMIT`・`ORDER BY`・JOIN を含む形は AST から再描画すると `f64` の
+/// 丸めや述語形状の取りこぼしが起きうるため、許可リスト構造検証を通過した
+/// トークン列そのものを描画して永続化する（`sql::allowlist::
+/// validate_create_view_tokens` が呼ぶ。参照時は `sql::view::resolve_from` が
+/// 同じ字句解析・許可リストを再度通す）。
+///
+/// 規則: トークンを半角スペース 1 つで連結する（隣接する `-` が `--` コメントに、
+/// `<` と `=` が `<=` に化けるのを防ぐ）。`Keyword` は大文字、`StringLiteral` は
+/// `'` の二重化で囲む。`Token::Param` は DDL では Parse 時点で拒否済みのため
+/// `None`（fail-closed）。
+pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
+    let mut out = String::new();
+    for (i, t) in tokens.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match t {
+            Token::Keyword(k) => out.push_str(match k {
+                Keyword::Select => "SELECT",
+                Keyword::From => "FROM",
+                Keyword::Where => "WHERE",
+                Keyword::And => "AND",
+                Keyword::Order => "ORDER",
+                Keyword::By => "BY",
+                Keyword::Limit => "LIMIT",
+            }),
+            Token::Ident(s) | Token::Number(s) => out.push_str(s),
+            Token::StringLiteral(s) => {
+                out.push('\'');
+                out.push_str(&s.replace('\'', "''"));
+                out.push('\'');
+            }
+            Token::Punct(c) => out.push(*c),
+            Token::DistanceOp => out.push_str("<=>"),
+            Token::Le => out.push_str("<="),
+            Token::Ge => out.push_str(">="),
+            Token::QualifiedIdent { qualifier, name } => {
+                out.push_str(qualifier);
+                out.push('.');
+                out.push_str(name);
+            }
+            Token::Param(_) => return None,
+        }
+    }
+    Some(out)
+}
+
 /// 字句解析エラー。位置情報はデバッグ用途に限り、応答メッセージへは
 /// `allowlist` 側が長さを切り詰めて含める（security.md「情報漏えい」対応）。
 #[derive(Debug, Clone)]
@@ -557,6 +606,31 @@ fn lex_word(input: &str, start: usize) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    /// TABLE-18・Issue #1192: 描画 → 再トークン化で同一トークン列に戻る。
+    #[test]
+    fn render_tokens_round_trips() {
+        let cases = [
+            "SELECT lang, COUNT(*), SUM(n) FROM docs WHERE a = 'it''s' GROUP BY lang HAVING COUNT(*) >= 1.5 ORDER BY lang DESC LIMIT 10 OFFSET 5",
+            "select * from a inner join b on a.id = b.doc_id where a.x < 3 and b.y <= 4 limit 7",
+            "SELECT x FROM t WHERE n > - 1 AND m = - - 2 LIMIT 3",
+            "SELECT x FROM t WHERE v <=> '[1,2]' LIMIT 3",
+            "SELECT x FROM t WHERE a < = 1 LIMIT 3",
+            "SELECT x FROM t WHERE a = '' LIMIT 3",
+        ];
+        for sql in cases {
+            let tokens = tokenize(sql).expect("tokenize");
+            let rendered = render_tokens(&tokens).expect("render");
+            let again = tokenize(&rendered).expect("re-tokenize");
+            assert_eq!(tokens, again, "round trip failed for {sql}");
+            assert!(!rendered.contains("--"));
+        }
+    }
+
+    #[test]
+    fn render_tokens_rejects_param() {
+        assert!(render_tokens(&[Token::Param(1)]).is_none());
+    }
+
     use super::*;
 
     #[test]
