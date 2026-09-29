@@ -303,6 +303,31 @@ impl<'a, 'b> Binder<'a, 'b> {
             _ => ColumnMeta::Id,
         }
     }
+
+    /// 別名付き投影・GROUP BY キーの出力メタデータ。`Scalar` は名前を別名へ置換し、
+    /// 疑似列 `id`（`ColumnMeta::Id` は名前を持てない）は numeric 静的型の
+    /// `Computed` に載せ替えて指定名を公告する（wire 上の型 OID は `Id` と同じ numeric。
+    /// 集計結果 `MIN(id)` 等の写像と同じ。Issue #1190 PR #1234 指摘）。
+    fn meta_with_alias(base: ColumnMeta, alias: Option<&String>) -> ColumnMeta {
+        let Some(a) = alias else { return base };
+        match base {
+            ColumnMeta::Scalar { ty, .. } => ColumnMeta::Scalar {
+                name: a.clone(),
+                ty,
+            },
+            ColumnMeta::Id => ColumnMeta::Computed {
+                name: a.clone(),
+                ty: Some(ColumnType::Numeric {
+                    precision: 20,
+                    scale: 0,
+                }),
+            },
+            ColumnMeta::Computed { ty, .. } => ColumnMeta::Computed {
+                name: a.clone(),
+                ty,
+            },
+        }
+    }
 }
 
 /// [`JoinWherePredicate`] の葉が参照する列参照。
@@ -826,10 +851,7 @@ fn build_plain_shape(
         JoinProjection::Aliased(items) => {
             for (colref, alias) in items {
                 let c = b.col(colref)?;
-                let mut meta = Binder::meta(&c);
-                if let (Some(a), ColumnMeta::Scalar { name, .. }) = (alias, &mut meta) {
-                    *name = a.clone();
-                }
+                let meta = Binder::meta_with_alias(Binder::meta(&c), alias.as_ref());
                 output.push(OutputColumn {
                     rel: c.rel,
                     pos: c.pos,
@@ -840,7 +862,27 @@ fn build_plain_shape(
     }
     let mut order: Vec<PlainOrder> = Vec::with_capacity(validated.order_by.len());
     for key in &validated.order_by {
-        let c = b.col(&key.target)?;
+        // 非修飾の ORDER BY 対象が SELECT リストの別名に一致するときは、PostgreSQL と
+        // 同じく出力列（別名の指す列）を優先する。実在列の同名があっても別名側を採る。
+        let target = match (&validated.projection, key.target.qualifier()) {
+            (JoinProjection::Aliased(items), None) => {
+                let mut hits = items
+                    .iter()
+                    .filter(|(_, a)| a.as_deref() == Some(key.target.name()));
+                match (hits.next(), hits.next()) {
+                    (Some(_), Some(_)) => {
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "ORDER BY target {:?} is ambiguous",
+                            key.target.name()
+                        )))
+                    }
+                    (Some((colref, _)), None) => colref,
+                    _ => &key.target,
+                }
+            }
+            _ => &key.target,
+        };
+        let c = b.col(target)?;
         let class = cmp_class(c.ty.as_ref()).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("unsupported ORDER BY column type: {}", c.name))
         })?;
@@ -901,13 +943,12 @@ fn build_aggregate_shape(
                             "JOIN SELECT column must appear in GROUP BY or inside an aggregate",
                         )
                     })?;
-                let mut meta = keys
-                    .get(idx)
-                    .map(|k| k.meta.clone())
-                    .unwrap_or(ColumnMeta::Id);
-                if let (Some(a), ColumnMeta::Scalar { name, .. }) = (alias, &mut meta) {
-                    *name = a.clone();
-                }
+                let meta = Binder::meta_with_alias(
+                    keys.get(idx)
+                        .map(|k| k.meta.clone())
+                        .unwrap_or(ColumnMeta::Id),
+                    alias.as_ref(),
+                );
                 if let Some(slot) = key_aliases.get_mut(idx) {
                     *slot = alias.clone();
                 }

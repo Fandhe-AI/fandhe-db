@@ -273,6 +273,70 @@ fn table_aliases_and_as_keyword_are_accepted() {
     assert_eq!(result.rows.len(), 3);
 }
 
+/// 出力列名（`ColumnMeta` の名前）を取り出す。
+fn col_name(m: &engine::sql::exec::ColumnMeta) -> String {
+    use engine::sql::exec::ColumnMeta;
+    match m {
+        ColumnMeta::Id => "id".to_string(),
+        ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name.clone(),
+    }
+}
+
+#[test]
+fn id_pseudo_column_alias_is_reflected_in_output_names() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT d.id AS x, a.id AS y FROM documents AS d JOIN authors a ON d.author_id = a.id LIMIT 10",
+    );
+    let names: Vec<String> = result.columns.iter().map(col_name).collect();
+    assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
+
+    let grouped = run(
+        &core,
+        "tenant-a",
+        "SELECT a.id AS key FROM documents AS d JOIN authors a ON d.author_id = a.id GROUP BY a.id",
+    );
+    let names: Vec<String> = grouped.columns.iter().map(col_name).collect();
+    assert_eq!(names, vec!["key".to_string()]);
+}
+
+#[test]
+fn order_by_resolves_select_list_alias() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let asc = run(
+        &core,
+        "tenant-a",
+        "SELECT d.title AS t FROM documents AS d JOIN authors a ON d.author_id = a.id ORDER BY t LIMIT 10",
+    );
+    let desc = run(
+        &core,
+        "tenant-a",
+        "SELECT d.title AS t FROM documents AS d JOIN authors a ON d.author_id = a.id ORDER BY t DESC LIMIT 10",
+    );
+    assert_eq!(asc.rows.len(), 3);
+    let mut rev = desc.rows.clone();
+    rev.reverse();
+    assert_eq!(asc.rows, rev);
+
+    // 別名 `title` が別テーブルの実在列 `name` を指すとき、出力列（別名）側で並べる。
+    let by_alias = run(
+        &core,
+        "tenant-a",
+        "SELECT a.name AS title FROM documents AS d JOIN authors a ON d.author_id = a.id ORDER BY title LIMIT 10",
+    );
+    let mut sorted = by_alias.rows.clone();
+    sorted.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(by_alias.rows, sorted);
+}
+
 #[test]
 fn star_projection_expands_left_then_right_with_id_columns() {
     let (storage, path) = seeded_basic();
