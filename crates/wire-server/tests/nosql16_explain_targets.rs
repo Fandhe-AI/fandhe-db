@@ -775,3 +775,40 @@ fn explain_reaches_the_explain_arm_on_a_freshly_spawned_router() {
         assert_eq!(http_common::wire_code_of(&resp), "42P01", "body={body:?}");
     }
 }
+// ---------------------------------------------------------------------
+// scan + sort（Issue #1189）: SQL のスカラー ORDER BY 付き EXPLAIN と行一致
+// ---------------------------------------------------------------------
+
+#[test]
+fn scan_explain_with_sort_matches_sql_explain_rows() {
+    let (core, _guard) = new_core();
+    let ctx_a = ctx_for("tenant-a");
+    let (addr, token) = spawn_alice_session(Arc::clone(&core));
+
+    let cases: [(&str, &[u8]); 3] = [
+        (
+            "SELECT id FROM docs ORDER BY lang DESC LIMIT 5",
+            br#"{"op":"scan","table":"docs","limit":5,"sort":[{"column":"lang","dir":"desc"}],"explain":true}"#,
+        ),
+        (
+            "SELECT id FROM docs ORDER BY lang DESC LIMIT 5 OFFSET 1",
+            br#"{"op":"scan","table":"docs","limit":5,"offset":1,"sort":[{"column":"lang","dir":"desc"}],"explain":true}"#,
+        ),
+        (
+            "SELECT id FROM docs WHERE lang = 'ja' ORDER BY path LIMIT 5",
+            br#"{"op":"scan","table":"docs","limit":5,"filter":[{"column":"lang","op":"eq","value":"ja"}],"sort":[{"column":"path","dir":"asc"}],"explain":true}"#,
+        ),
+    ];
+    for (sql, body) in cases {
+        let expected = sql_explain_lines(&core, &ctx_a, &format!("EXPLAIN {sql}"));
+        let resp = query(addr, &token, body);
+        assert_eq!(parse_explain_lines(&resp), expected, "sql={sql}");
+        assert_eq!(
+            expected,
+            vec![
+                "scalar_plan: plain_scan".to_string(),
+                "access_path: full_scan".to_string(),
+            ]
+        );
+    }
+}

@@ -729,3 +729,53 @@ fn explain_still_rejects_non_select_targets() {
         assert_eq!(err.wire_code(), "42601", "mismatch for {sql}");
     }
 }
+
+#[test]
+fn scalar_order_by_scan_explain_is_identical_across_tenants_and_does_not_execute() {
+    // Issue #1189・SQL-25・RLS-10: スカラー ORDER BY 付き広域取得の EXPLAIN は静的な
+    // 固定出力で、可視行数の異なるテナント間でバイト一致する（存在情報を漏らさない）。
+    let path = unique_db_path("sql27-scalar-order-by-explain");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector("docs"))
+        .expect("create table");
+    for id in 1..=5u64 {
+        insert_row(
+            &storage,
+            "docs",
+            "tenant-a",
+            id,
+            vec![1.0, 0.0, 0.0, 0.0],
+            "ja",
+            Visibility::Private,
+        );
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    let sql = "EXPLAIN SELECT id FROM docs ORDER BY lang DESC LIMIT 3 OFFSET 1";
+    let mut session = SessionState::default();
+    let with_rows = explain_lines(
+        core.execute_sql_in_session(&ctx("tenant-a"), &mut session, sql)
+            .expect("EXPLAIN over scalar ORDER BY scan must succeed"),
+    );
+    let mut session = SessionState::default();
+    let without_rows = explain_lines(
+        core.execute_sql_in_session(&ctx("tenant-b"), &mut session, sql)
+            .expect("EXPLAIN over scalar ORDER BY scan must succeed"),
+    );
+    assert_eq!(with_rows, without_rows);
+    assert_eq!(
+        with_rows,
+        vec!["scalar_plan: plain_scan", "access_path: full_scan"]
+    );
+
+    // 本体を実行していない: EXPLAIN 後も行はそのまま読める。
+    let after = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs ORDER BY lang LIMIT 10",
+        )
+        .expect("scan after EXPLAIN");
+    assert_eq!(after.rows.len(), 5);
+}

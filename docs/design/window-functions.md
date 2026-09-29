@@ -33,7 +33,9 @@
 | `COUNT(*)`・`COUNT(<列>)`・`SUM`/`AVG`/`MIN`/`MAX(<列>)`（引数は裸の列名・`id`・`*`〔`COUNT` のみ〕に限定） | 受理 |
 | `OVER ( [PARTITION BY <列>[, ...]] [ORDER BY <列> [ASC\|DESC][, ...]] )`（空 `OVER ()` も可） | 受理（列数は各 8 個まで） |
 | ウィンドウ項目と通常列の混在（位置を保持） | 受理 |
-| 文全体のスカラー `ORDER BY`・ベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
+| 文全体のスカラー `ORDER BY [ASC\|DESC][, ...]`（`LIMIT`／`OFFSET` 付き。Issue #1189） | 受理（ウィンドウ値は全母集合で評価し、並べ替え・`LIMIT`／`OFFSET` は出力行にのみ効く） |
+| 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
+| 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
@@ -61,6 +63,9 @@
    適用順序（ヘッダのみで可視性判定 → TABLE-12 のキー/ヘッダ tenant 整合検査 →
    必要範囲のみのデコード → SCALAR 段〔`WHERE`〕→ 可視性の再適用）は
    `sql::scan`／`sql::aggregate` の走査ループと同一の規約を踏襲する。
+   文全体のスカラー `ORDER BY` がある場合（Issue #1189）は、行ごとに
+   並べ替えキー値と tenant 識別子（intern 表への添字）も保持し、いずれも state
+   予算へ確保前に計上する。キー列はデコード段のマスクへ含める。
 2. **投影段**: ウィンドウ項目ごとに独立してパーティション分割（正準バイト列
    キーによる `HashMap`）・安定ソート（ORDER BY キー → `id` 昇順 → 走査順
    `seq` 昇順のタイブレーク。`sort_by` のみを使い `sort_unstable*` は使わない
@@ -118,7 +123,8 @@
 
 ## 対象外（本 Issue の外。利用者への影響が出た時点で別途判断し、必要なら Issue を起票する）
 
-- スカラー `ORDER BY`（TASK-209・#915・PR #1096）とウィンドウの併用
+- ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
+- `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
 - フレーム指定・`NULLS FIRST/LAST`・名前付きウィンドウ・`FILTER (...)`・
   関数内 `DISTINCT`・複合式の引数
@@ -126,3 +132,18 @@
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
 - NoSQL（HTTP JSON）表層（`BoundScan::new` は常に `windows` を空にするため
   挙動は変わらない）
+
+## 文全体のスカラー ORDER BY との行対応（Issue #1189）
+
+- ウィンドウ値の評価後に、materialize 済み行の出力順（`materialized` への添字の
+  順列）を、`sql::order_value::compare_statement_order`（キー → `id` 昇順 →
+  `tenant_id` バイト順）による安定ソートで求める。この比較器は base scan
+  （`sql::scan` の経路 (B)）の `HeapEntry::order` と同一の関数で、行順が構造上
+  ずれない。
+- base scan は `windows` を空にした複製に `order_by`・`limit`・`offset` を保ったまま
+  委譲する。n 番目の出力行は `materialized[output_order[offset + n]]` に対応し、
+  `id` の一致検査は防御として残す。他テナントの Public 行と `id` が衝突しても、
+  対応付けは `id` ではなく順列の添字で行う。
+- 経路 (A)（先頭キーが `id` で他テナントの Public 行を見ない ctx）は自テナント 1 つの
+  範囲走査で、`id` がテナント内で一意なためタイブレークが起きず、上の順序と一致する。
+- 順列・キー値・intern 表は `MAX_WINDOW_STATE_BYTES` の予算に計上する。
