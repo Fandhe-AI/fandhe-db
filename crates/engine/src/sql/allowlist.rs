@@ -7988,22 +7988,24 @@ fn looks_like_aggregate_select(tokens: &[Token]) -> bool {
             || contains_group_by)
 }
 
-/// 集計形の枝をカタログ存在確認して [`SetTree::AggregateBranch`] へ組み立てる。
-/// ビューへの集計は通常の集計 SELECT と同じく対象外（存在しないテーブルとして `42P01`）。
+/// 集計形の枝を [`SetTree::AggregateBranch`] へ組み立てる。FROM は通常の集計 SELECT と
+/// 同じく [`super::view::resolve_from`]（テーブル・ビューの存在確認を兼ねる）と
+/// [`build_aggregate_from_resolved`] を通し、単純形ビューは基底テーブルへ畳み込む
+/// （Issue #1191）。評価後射影形ビューへの集計は `42601`、存在しなければ `42P01`。
 fn build_set_aggregate_branch(
     shape: ParsedAggregateShape,
     lookup: &impl TableLookup,
 ) -> Result<SetTree, SqlSurfaceError> {
-    if !lookup.table_exists(&shape.table_name)? {
-        return Err(SqlSurfaceError::undefined_table(shape.table_name));
-    }
+    let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+    let aggregate = build_aggregate_from_resolved(
+        shape.table_name,
+        resolved,
+        shape.items,
+        shape.where_predicates,
+        shape.group_by,
+    )?;
     Ok(SetTree::AggregateBranch(Box::new(SetAggregateBranch(
-        ValidatedAggregate {
-            table_name: shape.table_name,
-            items: shape.items,
-            where_predicates: shape.where_predicates,
-            group_by: shape.group_by,
-        },
+        aggregate,
     ))))
 }
 

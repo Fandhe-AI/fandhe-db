@@ -931,6 +931,46 @@ fn branch_from_view_matches_base_table_equivalent() {
     assert_eq!(via_view_sorted, via_base_sorted);
 }
 
+#[test]
+fn aggregate_branch_from_simple_view_folds_to_base_table() {
+    use engine::sql::exec::Cell;
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let mut ddl_session = SessionState::default();
+    ddl_session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut ddl_session,
+        "CREATE VIEW docs_view AS SELECT lang FROM docs",
+    )
+    .expect("create view should succeed");
+
+    // 集計形の枝でも単純形ビューは基底テーブルへ畳み込まれる（Issue #1191。
+    // 通常の集計 SELECT と同じ `resolve_from` 経路）。
+    let via_view = run(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM docs_view UNION ALL SELECT COUNT(*) FROM other_docs",
+    );
+    let via_base = run(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM docs UNION ALL SELECT COUNT(*) FROM other_docs",
+    );
+    assert_eq!(cells_of(&via_view), cells_of(&via_base));
+    assert_eq!(cells_of(&via_view)[0], vec![Cell::Integer(3)]);
+
+    // 存在しない relation は従来どおり 42P01。
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM no_such_rel UNION ALL SELECT COUNT(*) FROM docs",
+    );
+    assert_eq!(err.wire_code(), "42P01");
+}
+
 // ---------- Describe（拡張クエリプロトコル） ----------
 
 #[test]
