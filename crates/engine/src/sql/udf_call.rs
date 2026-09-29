@@ -110,6 +110,14 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
             ));
         }
     }
+    // 小数表記（`9007199254740993.0`）・指数表記（`9.007199254740993e15`）でも、値が
+    // 数学的に整数なら同じ exactness 判定を丸め変換の前に適用する（NoSQL `filter` が
+    // JSON の生数値を渡すため到達する。Issue #1183・codex-review P1）。
+    if integral_decimal_exceeds_exact_f64(abs_raw) {
+        return Err(SqlSurfaceError::invalid_input(
+            "integer literal exceeds the range that can be exactly represented",
+        ));
+    }
     let v: f64 = raw
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
@@ -119,6 +127,66 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
         ));
     }
     Ok(v)
+}
+
+/// 符号なしの 10 進表記（`d+[.d*][e[+-]d+]`）が数学的に整数値で、かつ `2^53` を超える
+/// か（`f64` で正確に表現できないか）を、`f64` への丸め変換を介さず判定する。
+/// 非整数値（小数部が 0 でない）・不正形式は `false`（後段の通常経路に任せる）。
+/// 整数の字面・末尾ドット形は [`parse_number_literal`] が別途検査済みだが、
+/// 本関数はそれらも同じ結果を返す。
+fn integral_decimal_exceeds_exact_f64(abs_raw: &str) -> bool {
+    let (mantissa, exp_part) = match abs_raw.find(['e', 'E']) {
+        Some(i) => (&abs_raw[..i], Some(&abs_raw[i + 1..])),
+        None => (abs_raw, None),
+    };
+    let exp: i64 = match exp_part {
+        None => 0,
+        Some(e) => match e.parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        },
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return false;
+    }
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let digits: String = int_part.chars().chain(frac_part.chars()).collect();
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return false; // 0
+    }
+    let trimmed = trimmed.trim_end_matches('0');
+    let trailing_zeros = (digits.trim_start_matches('0').len() - trimmed.len()) as i64;
+    // 値 = trimmed × 10^exp10（trimmed は末尾 0 なし）。
+    let exp10 = exp - frac_part.len() as i64 + trailing_zeros;
+    if exp10 < 0 {
+        return false; // 小数部が 0 でない（非整数）。
+    }
+    let total_digits = trimmed.len() as i64 + exp10;
+    if total_digits > 20 {
+        return true; // `u64` 上限（20 桁）超は 2^53 を確実に超える。
+    }
+    let mut value: u128 = match trimmed.parse() {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    for _ in 0..exp10 {
+        value = match value.checked_mul(10) {
+            Some(v) => v,
+            None => return true,
+        };
+    }
+    value > u128::from(MAX_EXACT_F64_INT)
 }
 
 /// 式の二項演算子。
@@ -3347,6 +3415,40 @@ mod tests {
         // 引き続き受理される（拒否対象は exactness を失う場合のみ）。
         let value = parse_number_literal("42.").expect("should parse");
         assert_eq!(value, 42.0);
+    }
+
+    /// codex-review P1（Issue #1183）: 整数値を表す小数・指数表記も丸め変換の前に
+    /// exactness 判定を受ける（NoSQL `filter` が JSON の生数値を渡すため）。
+    #[test]
+    fn integral_decimal_and_exponent_forms_beyond_exact_range_are_rejected() {
+        for raw in [
+            "9007199254740993.0",
+            "-9007199254740993.0",
+            "9007199254740993.000",
+            "9.007199254740993e15",
+            "9007199254740993e0",
+            "90071992547409930e-1",
+            "1e30",
+            "0.9007199254740993e16",
+        ] {
+            let err = parse_number_literal(raw).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "{raw}");
+        }
+    }
+
+    #[test]
+    fn integral_decimal_and_exponent_forms_within_exact_range_still_parse() {
+        for (raw, want) in [
+            ("9007199254740992.0", 9007199254740992.0),
+            ("9.007199254740992e15", 9007199254740992.0),
+            ("1e3", 1000.0),
+            ("1.5", 1.5),
+            ("2.5e-1", 0.25),
+            ("0.0", 0.0),
+            ("100.000", 100.0),
+        ] {
+            assert_eq!(parse_number_literal(raw).expect(raw), want, "{raw}");
+        }
     }
 
     #[test]
