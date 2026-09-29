@@ -135,9 +135,10 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
 
 本構文で `23505` が返るのは**台帳由来（`DuplicateOperationId`）のみ**。行制約由来
 （`TenantWriteError::IdConflict`）は上記の衝突判定スコープにより構造的に到達しない。
-両者は `SqlSurfaceError` の**variant**で区別する（`error_format.rs` は現状 `23505` の
-`code` ラベルを `DuplicateOperationId`／`IdConflict` で共有しており分離していない。
-ラベル分離は後続の Issue #1180 で実装済み。台帳由来は `DUPLICATE_OPERATION_ID`）。
+両者は `SqlSurfaceError` の**variant**で区別する（`error_format.rs` は Issue #1180 で
+`23505` の `code` ラベルを分離済み。台帳由来は `ErrorClass::DuplicateOperationId`
+（`DUPLICATE_OPERATION_ID`）、行制約由来は `UniqueViolation`（`UNIQUE_VIOLATION`）。
+ERR-6・RECOVER-12・TASK-227）。
 
 `crates/engine/tests/sql_upsert.rs::same_tenant_conflict_never_returns_row_constraint_id_conflict`
 が、同一衝突が通常 `INSERT` では `23505`（行制約由来）、UPSERT（`DO NOTHING`）では

@@ -228,4 +228,4 @@ Issue #1066（レビュー指摘対応・PR #1155・codex P2）: `EngineCore::ex
 - `ErrorClass::DuplicateOperationId`（`23505`／`DUPLICATE_OPERATION_ID`）を追加し、`TenantWriteError::DuplicateOperationId`・`SqlSurfaceError::DuplicateOperationId` を写像（ERR-6・RECOVER-12・TASK-227）。行 id 衝突・PRIMARY KEY／UNIQUE 違反は `UNIQUE_VIOLATION` のまま。`SHARED_WIRE_CODES` に `23505` を追加（`from_wire_code` は `UniqueViolation` を返す）。HTTP は 409 のまま、応答 `code` のみ変わる。
 - 台帳照合が行制約検査より先に走る順序は既存実装のまま（`unique_constraint.rs`・`table16_primary_key.rs` で固定）。新しい `BEGIN` での再送による成否確定は `sql31_transaction.rs`（commit 済み・未 commit・行制約由来）で固定。
 - pg wire の `ErrorResponse` は ERR-1 の既存形式（`S`/`C`/`M`）のままで `code` ラベルは運ばない（対象外）。SQL 表層では固定文言の違いで区別する。
-- 依存追加なし・`unsafe` なし・破壊的変更なし（`ErrorClass` への variant 追加と HTTP `code` の観測値変更のみ）。
+- 依存追加なし・`unsafe` なし。**公開 enum `ErrorClass` への variant 追加は、下流の網羅的 `match` をコンパイル不能にする API 互換性上の変更**であり（ERR-6・RECOVER-12・TASK-227 の定義変更に対応）、HTTP 応答 `code` の観測値も台帳由来の `23505` で `DUPLICATE_OPERATION_ID` へ変わる。本リポは workspace 内部利用が前提で下流クレートが無く Issue タイトルも `!` 無しのため semver 上の破壊的変更マーカーは付けないが、外部で網羅 `match` している利用者は `DuplicateOperationId` 分岐の追加が必要。
