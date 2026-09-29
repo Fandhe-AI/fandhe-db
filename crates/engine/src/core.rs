@@ -6226,6 +6226,10 @@ impl EngineCore {
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
+            // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
+            // 超過時は `Failed` へ遷移して拒否する）。`COPY FROM` は
+            // [`Self::commit_copy_in_txn`] が同じ検査を行う。
+            txn.check_and_register_statement(None)?;
             // 自トランザクションが未 commit の変更を持つ間は、共有書き込み
             // トランザクションを読み取り源にして走査する（他の読み取り文と同じ
             // 方針。[`Self::read_only_in_active_txn`] 参照）。

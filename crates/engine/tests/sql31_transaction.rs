@@ -503,6 +503,34 @@ fn statement_count_limit_fails_the_transaction() {
     assert_eq!(txn.status(), TransactionStatus::Failed);
 }
 
+/// 明示トランザクション内の `COPY (...) TO STDOUT` も通常文と同じ文数上限に計上され、
+/// 超過時は `54000` で `Failed` へ遷移する（Issue #1179 レビュー指摘）。
+#[test]
+fn copy_to_counts_toward_statement_limit_and_fails_the_transaction() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let engine = engine.with_transaction_limits(TransactionLimits {
+        max_duration: std::time::Duration::from_secs(20),
+        max_statements: 1,
+    });
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    let sql = format!("COPY (SELECT id FROM {TABLE} LIMIT 10) TO STDOUT");
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .begin_copy_in_txn(&caller, &session, &mut txn, &sql)
+        .expect("first COPY TO is within the limit");
+    let err = engine
+        .begin_copy_in_txn(&caller, &session, &mut txn, &sql)
+        .expect_err("second COPY TO exceeds max_statements");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+}
+
 fn visible_row_count(engine: &EngineCore, caller: &PolicyContext) -> usize {
     let outcome = engine
         .execute_sql_in_session(
