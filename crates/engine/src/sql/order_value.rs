@@ -149,6 +149,14 @@ pub(crate) fn extract_order_value_ref<'a>(
     let index = match key.target {
         BoundOrderTarget::Id => return Ok(Some(ScalarKeyRef::Id(id))),
         BoundOrderTarget::Column(index) => index,
+        // 式キー（Issue #1188）は列参照ではなく行ごとの式評価の結果が値になる。呼び出し元
+        // （`sql::scan`）が [`expr_value_to_order_value`] で先に値化するため、ここへ到達
+        // するのは配線不備のみ（fail-closed）。
+        BoundOrderTarget::Expr(_) => {
+            return Err(scan_bug(
+                "expression order key reached the column extractor",
+            ))
+        }
     };
     let value = match scanned.get(index) {
         Some(Some(v)) => v,
@@ -319,5 +327,36 @@ pub(crate) fn order_value_to_cell(
             .map(|label| Cell::Text(label.clone()))
             .ok_or_else(|| scan_bug("group key ENUM ordinal out of range")),
         _ => Err(scan_bug("group key value/column type mismatch")),
+    }
+}
+
+/// 式キーの評価結果（[`crate::sql::udf_call::ExprValue`]）を、束縛段が静的型から決めた比較規約
+/// `kind` の所有 [`OrderValue`] へ写像する（Issue #1188・SQL-26。広域取得の式 `ORDER BY` と
+/// 集計文の式 `ORDER BY` が共有する唯一の写像）。`Null` は `None`（NULL 位置規約は比較器が適用）。
+/// 値と `kind` の組が食い違う場合は束縛の不変条件違反として `Internal`（`XX000`）で fail-closed。
+pub(crate) fn expr_value_to_order_value(
+    value: &crate::sql::udf_call::ExprValue<'_>,
+    kind: OrderKind,
+) -> Result<Option<OrderValue>, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprValue;
+    match (value, kind) {
+        (ExprValue::Null, _) => Ok(None),
+        (ExprValue::Scalar(v), OrderKind::Float) => Ok(Some(OrderValue::Float(*v))),
+        (ExprValue::Text(t), OrderKind::Bytes) => {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(t.len())
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve order key text field: {e}"),
+                })?;
+            owned.extend_from_slice(t.as_bytes());
+            Ok(Some(OrderValue::Bytes(owned)))
+        }
+        (ExprValue::Bool(b), OrderKind::Bool) => Ok(Some(OrderValue::Bool(*b))),
+        (ExprValue::Date(d), OrderKind::SignedInt) => {
+            Ok(Some(OrderValue::SignedInt(i64::from(*d))))
+        }
+        (ExprValue::Timestamp(t), OrderKind::SignedInt) => Ok(Some(OrderValue::SignedInt(*t))),
+        _ => Err(scan_bug("expression order key value/kind mismatch")),
     }
 }

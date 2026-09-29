@@ -1144,6 +1144,17 @@ pub struct ScalarOrderKey {
     pub descending: bool,
 }
 
+/// 広域取得の `ORDER BY` の 1 キー分（Issue #1188・SQL-26）。列名キーに加え、式キー
+/// （関数呼び出し・`CASE`・`COALESCE`・`NULLIF`・`EXTRACT`）を表す crate 内専用型。
+/// 公開型 [`ScalarOrderKey`] のフィールドを変えずに式キーを運ぶために別 enum とした。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScanOrderKey {
+    /// 列名（疑似列 `id` を含みうる）キー。
+    Column(ScalarOrderKey),
+    /// 式キー。意味論（未知関数・型不整合・列参照の解決）は束縛段が判定する。
+    Expr { expr: Expr, descending: bool },
+}
+
 /// スカラー `ORDER BY` に指定できるキー数の上限（Issue #915 実装既定値）。
 /// NoSQL `scan` の `sort` 配列要素数上限（NOSQL-15・Issue #946）にも同じ値を
 /// 採用する（`crate::sql::parser::BoundScan::with_order_by` が超過時に同一の
@@ -1857,8 +1868,26 @@ pub struct HavingPredicate {
 /// `sql::parser::bind_aggregate`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregateOrderBy {
+    /// 識別子キーの参照名。式キー（`expr` が `Some`）のときは空文字（未使用）。
     pub(crate) target: String,
     pub(crate) descending: bool,
+    /// 式キー（Issue #1188・SQL-26。関数呼び出し・`CASE`・`COALESCE`・`NULLIF`・
+    /// `EXTRACT`）。`Some` のとき `target` は使わない。式内の識別子は `GROUP BY` 列名・
+    /// そのエイリアス・集計項目の実効名を参照し、束縛段
+    /// （`sql::parser::bind_group_by_clause`）が解決する。
+    pub(crate) expr: Option<Expr>,
+}
+
+/// `HAVING` の式述語 1 つ（Issue #1188・SQL-26）。`<lhs> <cmp> <rhs>` で、少なくとも一方の
+/// 辺が関数呼び出し・`CASE`・`COALESCE`・`NULLIF`（`EXTRACT` 含む）を含む。従来形
+/// （[`HavingPredicate`]。`<ident> <cmp> [-]<number>`）はそのまま残し、本型は従来形で
+/// 表せない述語だけを保持する。式内の識別子は `GROUP BY` 列名・そのエイリアス・集計項目の
+/// 実効名を参照し、束縛段が解決する（集計関数呼び出しの直接記述は構文段で `42601`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HavingExprPredicate {
+    pub(crate) lhs: Expr,
+    pub(crate) op: BinOp,
+    pub(crate) rhs: Expr,
 }
 
 /// `GROUP BY <column> (',' <column>)* [HAVING ...] [ORDER BY ...] [LIMIT ...]`
@@ -1869,6 +1898,8 @@ pub struct AggregateOrderBy {
 pub struct GroupByClause {
     pub(crate) columns: Vec<String>,
     pub(crate) having: Vec<HavingPredicate>,
+    /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
+    pub(crate) having_exprs: Vec<HavingExprPredicate>,
     /// `ORDER BY` のキー列（宣言順。空なら `ORDER BY` なし。Issue #1185・SQL-25 (a)
     /// で単一識別子から複数キーへ一般化。上限は [`MAX_SCALAR_ORDER_KEYS`]）。
     pub(crate) order_by: Vec<AggregateOrderBy>,
@@ -1956,6 +1987,12 @@ pub struct ValidatedScan {
     /// 保持し、実行時（`sql::window::execute_window_scan`）が
     /// [`WindowSelectItem::position`] で元の並び順へ合流する。
     pub(crate) window_items: Vec<WindowSelectItem>,
+    /// 式キーを含む `ORDER BY`（Issue #1188・SQL-26。関数呼び出し・`CASE`・`COALESCE`・
+    /// `NULLIF`・`EXTRACT` をキーにできる）。**式キーを 1 つでも含む文に限り**全キーを
+    /// 出現順に保持し（このとき [`Self::order_by`] は空）、列名キーのみの文では空
+    /// （従来どおり `order_by` が正本）。公開型 [`ScalarOrderKey`] を壊さないための
+    /// crate 内専用の拡張で、束縛（`sql::parser::bind_scan`）が正本として読む。
+    pub(crate) order_keys: Vec<ScanOrderKey>,
 }
 
 impl ValidatedScan {
@@ -1981,6 +2018,8 @@ impl ValidatedScan {
     }
 
     /// スカラー列 `ORDER BY` のキー列（Issue #915・SQL-25）。空ならソートなし。
+    /// 式キーを含む `ORDER BY`（Issue #1188）では常に空（式キーは公開型で表現できない
+    /// ため crate 内の `order_keys` に保持する。式キーの有無は [`Self::has_expression_order_by`]）。
     pub fn order_by(&self) -> &[ScalarOrderKey] {
         &self.order_by
     }
@@ -1989,6 +2028,12 @@ impl ValidatedScan {
     /// `sql::parser::validate_search_offset` が束縛時に行う）。
     pub fn offset(&self) -> u32 {
         self.offset
+    }
+
+    /// `ORDER BY` が式キー（関数呼び出し・`CASE` 等。Issue #1188）を含むか。`true` の
+    /// とき [`Self::order_by`] は空で、キーの正本は crate 内の `order_keys`。
+    pub fn has_expression_order_by(&self) -> bool {
+        !self.order_keys.is_empty()
     }
 }
 
@@ -2986,6 +3031,7 @@ impl<'a> Parser<'a> {
             let starts_case =
                 name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
             let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+            let is_extract_syntax = starts_call && name.eq_ignore_ascii_case("extract");
             if starts_case || starts_call {
                 let expr = if starts_case {
                     self.parse_value_expr(0)?
@@ -2996,6 +3042,12 @@ impl<'a> Parser<'a> {
                 let alias = if self.peek_ident_matches("AS") {
                     self.advance();
                     Some(self.expect_ident()?)
+                } else if is_extract_syntax
+                    && matches!(&expr, Expr::Call { name, .. } if name == "date_part")
+                {
+                    // Issue #1188: EXTRACT 構文は `date_part` へ脱糖されるが、PostgreSQL 互換の
+                    // 既定列名は `extract`（明示の `date_part(...)` は `date_part` のまま）。
+                    Some("extract".to_string())
                 } else {
                     None
                 };
@@ -3332,38 +3384,88 @@ impl<'a> Parser<'a> {
     /// 数値リテラル限定（文字列リテラル・両辺集計・括弧・`OR` はいずれも許可リスト
     /// 外）。条件数は [`MAX_AGGREGATE_ITEMS`] で頭打ちにする（`54000`。無制限
     /// `Vec` 確保を避ける方針を HAVING 条件にも適用）。
-    fn parse_having(&mut self) -> Result<Vec<HavingPredicate>, SqlSurfaceError> {
+    fn parse_having(
+        &mut self,
+    ) -> Result<(Vec<HavingPredicate>, Vec<HavingExprPredicate>), SqlSurfaceError> {
         self.expect_contextual_keyword("HAVING")?;
         let mut predicates = Vec::new();
+        let mut expr_predicates = Vec::new();
         loop {
-            if predicates.len() >= MAX_AGGREGATE_ITEMS {
+            if predicates.len() + expr_predicates.len() >= MAX_AGGREGATE_ITEMS {
                 return Err(SqlSurfaceError::payload_too_large(
                     "too many HAVING predicates",
                 ));
             }
-            let item_name = self.expect_ident()?;
-            let op = self.expect_cmp_op()?;
-            let negative = matches!(self.peek(), Some(Token::Punct('-')));
-            if negative {
-                self.advance();
+            // Issue #1188・SQL-26: 従来形 `<ident> <cmp> [-]<number>`（整数を精度を落とさず
+            // 比較する既存契約）を先に試し、述語の直後が境界（`AND`／`ORDER`／`LIMIT`／
+            // `OFFSET`／文末）でなければ巻き戻して式形として解析し直す。
+            let start = self.pos;
+            if let Some(pred) = self.try_parse_legacy_having_predicate()? {
+                predicates.push(pred);
+            } else {
+                self.pos = start;
+                let lhs = self.parse_value_expr(0)?;
+                let op = self.expect_cmp_op()?;
+                let rhs = self.parse_value_expr(0)?;
+                // 関数・`CASE` 系を含まない述語（`HAVING lang = 'ja'`・`HAVING n + 1 > 3`）は
+                // 従来どおり許可リスト外（`42601`）。
+                if !expr_contains_scalar_function(&lhs) && !expr_contains_scalar_function(&rhs) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "HAVING predicate must be '<aggregate name> <cmp> <number>' or contain a scalar function/CASE expression",
+                    ));
+                }
+                expr_predicates.push(HavingExprPredicate { lhs, op, rhs });
             }
-            let raw = self.expect_number()?;
-            let mut literal = crate::sql::udf_call::parse_number_literal(&raw)?;
-            if negative {
-                literal = -literal;
-            }
-            predicates.push(HavingPredicate {
-                item_name,
-                op,
-                literal,
-            });
             if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
                 self.advance();
                 continue;
             }
             break;
         }
-        Ok(predicates)
+        Ok((predicates, expr_predicates))
+    }
+
+    /// 従来形の `HAVING` 述語 `<ident> <cmp> ['-'] <number>` を 1 つ試行解析する
+    /// （Issue #1188）。形が合わない・直後が境界でない場合は `Ok(None)`（呼び出し元が
+    /// `pos` を巻き戻して式形を解析する）。数値リテラル自体の不正（範囲外等）は
+    /// 従来どおりエラーを返す。
+    fn try_parse_legacy_having_predicate(
+        &mut self,
+    ) -> Result<Option<HavingPredicate>, SqlSurfaceError> {
+        let Some(Token::Ident(item_name)) = self.peek().cloned() else {
+            return Ok(None);
+        };
+        self.advance();
+        let Ok(op) = self.expect_cmp_op() else {
+            return Ok(None);
+        };
+        let negative = matches!(self.peek(), Some(Token::Punct('-')));
+        if negative {
+            self.advance();
+        }
+        let Some(Token::Number(raw)) = self.peek().cloned() else {
+            return Ok(None);
+        };
+        self.advance();
+        let at_boundary = match self.peek() {
+            None
+            | Some(Token::Keyword(Keyword::And | Keyword::Order | Keyword::Limit))
+            | Some(Token::Punct(';')) => true,
+            Some(Token::Ident(name)) => name.eq_ignore_ascii_case("OFFSET"),
+            _ => false,
+        };
+        if !at_boundary {
+            return Ok(None);
+        }
+        let mut literal = crate::sql::udf_call::parse_number_literal(&raw)?;
+        if negative {
+            literal = -literal;
+        }
+        Ok(Some(HavingPredicate {
+            item_name,
+            op,
+            literal,
+        }))
     }
 
     /// 集計 `GROUP BY` の `ORDER BY <target> [ASC|DESC] (',' <target> [ASC|DESC])*`
@@ -3374,7 +3476,10 @@ impl<'a> Parser<'a> {
     /// `NULLS FIRST/LAST` は識別子でない／未知のトークンとして後続の構文検査で
     /// `42601` に落ちる。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
     /// 確保前検査）。
-    fn parse_aggregate_order_by(&mut self) -> Result<Vec<AggregateOrderBy>, SqlSurfaceError> {
+    fn parse_aggregate_order_by(
+        &mut self,
+        allow_expr: bool,
+    ) -> Result<Vec<AggregateOrderBy>, SqlSurfaceError> {
         self.expect_keyword(Keyword::Order)?;
         self.expect_keyword(Keyword::By)?;
         let mut keys = Vec::new();
@@ -3384,7 +3489,14 @@ impl<'a> Parser<'a> {
                     "too many aggregate ORDER BY keys",
                 ));
             }
-            let target = self.expect_ident()?;
+            // Issue #1188・SQL-26: `GROUP BY` 集計（`allow_expr`）に限り、キー先頭が
+            // `CASE WHEN` または `ident '('` なら式キー。`SELECT DISTINCT ... ORDER BY` は
+            // 式キー非対応（従来どおり識別子のみ）。
+            let (target, expr) = if allow_expr && self.order_key_starts_expression() {
+                (String::new(), Some(self.parse_value_expr(0)?))
+            } else {
+                (self.expect_ident()?, None)
+            };
             let descending = if self.peek_ident_matches("DESC") {
                 self.advance();
                 true
@@ -3394,7 +3506,11 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            keys.push(AggregateOrderBy { target, descending });
+            keys.push(AggregateOrderBy {
+                target,
+                descending,
+                expr,
+            });
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 continue;
@@ -4629,6 +4745,36 @@ impl<'a> Parser<'a> {
                 args: vec![haystack, needle],
             });
         }
+        // Issue #1188・SQL-26: `EXTRACT(field FROM src)` は `date_part('field', src)` の
+        // SQL 標準構文糖。`(` の直後が「識別子または文字列リテラル」かつその次が
+        // `FROM` のときだけ専用形として解析し、AST 上で `date_part` 呼び出しへ脱糖する
+        // （束縛・評価・field 検証〔未知 field は `22000`〕は既存の `date_part` 経路を共有し、
+        // CHECK・ビューの render→再パース往復でも `date_part(...)` として再解析できる）。
+        // 先読みに一致しない `extract(...)` は従来どおり通常の関数呼び出し（UDF 名）として
+        // 扱い、`extract` を予約名にはしない。
+        if name.eq_ignore_ascii_case("extract")
+            && matches!(
+                self.tokens.get(self.pos),
+                Some(Token::Ident(_) | Token::StringLiteral(_))
+            )
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Keyword(Keyword::From))
+            )
+        {
+            let field = match self.advance() {
+                Some(Token::Ident(f) | Token::StringLiteral(f)) => f.clone(),
+                _ => return Err(SqlSurfaceError::unsupported("expected EXTRACT field")),
+            };
+            self.advance(); // FROM
+            let src = self.parse_value_expr_with_null_context(depth + 1, true)?;
+            self.expect_punct(')')?;
+            self.consume_expr_node()?;
+            return Ok(Expr::Call {
+                name: "date_part".to_string(),
+                args: vec![Expr::String(field), src],
+            });
+        }
         // codex 指摘対応（PR #1120）: `date_part`／`date_trunc` は
         // `docs/design/datetime-scalar-functions.md` の契約上「NULL 入力は
         // すべて strict（いずれかの引数が NULL なら NULL）」であり、これは
@@ -4730,7 +4876,7 @@ impl<'a> Parser<'a> {
     /// 形が続く混在形（例: `ORDER BY lang, embedding <=> '...'`）は §受入基準 3
     /// の排他規定により `42601` で拒否する。キー数の上限は
     /// [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`）。
-    fn parse_scalar_order_by(&mut self) -> Result<Vec<ScalarOrderKey>, SqlSurfaceError> {
+    fn parse_scalar_order_by(&mut self) -> Result<Vec<ScanOrderKey>, SqlSurfaceError> {
         let mut keys = Vec::new();
         loop {
             if keys.len() >= MAX_SCALAR_ORDER_KEYS {
@@ -4738,7 +4884,17 @@ impl<'a> Parser<'a> {
                     "too many scalar ORDER BY keys",
                 ));
             }
-            let column = self.expect_ident()?;
+            // Issue #1188・SQL-26: キー先頭が `CASE WHEN` または `ident '('`（順位付け
+            // 関数 `HYBRID`／`HYBRID_RRF` を除く。それらは呼び出し元の
+            // `parse_select_shape` がベクトル順位付け経路へ振り分け済み）なら式キー。
+            // `COALESCE`／`NULLIF`／`EXTRACT` も `ident '('` に含まれる。
+            // 算術で始まるキー・括弧始まり・位置指定は従来どおり構文拒否（`42601`）。
+            let starts_expr = self.order_key_starts_expression();
+            let column_or_expr = if starts_expr {
+                Err(self.parse_value_expr(0)?)
+            } else {
+                Ok(self.expect_ident()?)
+            };
             if matches!(
                 self.peek(),
                 Some(Token::DistanceOp) | Some(Token::Punct('('))
@@ -4756,7 +4912,10 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            keys.push(ScalarOrderKey { column, descending });
+            keys.push(match column_or_expr {
+                Ok(column) => ScanOrderKey::Column(ScalarOrderKey { column, descending }),
+                Err(expr) => ScanOrderKey::Expr { expr, descending },
+            });
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 continue;
@@ -4764,6 +4923,21 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(keys)
+    }
+
+    /// 現在位置が広域取得 `ORDER BY` の式キー（Issue #1188）の先頭かを 1〜2 トークンの
+    /// 先読みだけで判定する（`CASE` は次が `WHEN` のときのみ。列名 `case` の後方互換）。
+    fn order_key_starts_expression(&self) -> bool {
+        match self.peek() {
+            Some(Token::Ident(name)) => {
+                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
+                    return true;
+                }
+                matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+                    && !is_allowed_order_by_function_name(name)
+            }
+            _ => false,
+        }
     }
 
     /// 許可された ORDER BY 関数ごとに、引数の個数・位置・トークン種別を明示的に
@@ -7047,6 +7221,9 @@ struct ParsedScanShape {
     offset: u32,
     /// ウィンドウ項目（SELECT リスト全体での出現位置つき）。空なら通常の広域取得。
     window_items: Vec<WindowSelectItem>,
+    /// 式キーを含む `ORDER BY`（Issue #1188）。式キーを含む場合のみ全キーを保持し、
+    /// このとき `order_by` は空。
+    order_keys: Vec<ScanOrderKey>,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -7576,6 +7753,7 @@ fn parse_set_branch(
             // （ウィンドウ非対応形）でのみ投影を解析するため、常に空
             // （ウィンドウ関数を含む枝は非対応。Issue #929 のスコープ外事項）。
             window_items: Vec::new(),
+            order_keys: Vec::new(),
         },
         super::view::Resolved::View {
             base_table,
@@ -7604,6 +7782,7 @@ fn parse_set_branch(
                 offset: 0,
                 // 上と同じ理由（集合演算の枝はウィンドウ関数非対応）。
                 window_items: Vec::new(),
+                order_keys: Vec::new(),
             }
         }
     };
@@ -7845,6 +8024,7 @@ fn parse_select_shape(
             order_by: Vec::new(),
             offset,
             window_items,
+            order_keys: Vec::new(),
         }));
     }
 
@@ -7866,14 +8046,22 @@ fn parse_select_shape(
     // 基準——識別子の直後が距離演算子 `<=>` か `(`）でなければ、スカラー列の
     // `ORDER BY` として広域取得（`ParsedSelect::Scan`）へ振り分ける。両者は
     // 構文上相互排他（§受入基準 3）。
-    let is_vector_ranking = matches!(p.peek(), Some(Token::Ident(_)))
-        && matches!(
-            p.tokens.get(p.pos + 1),
-            Some(Token::DistanceOp) | Some(Token::Punct('('))
-        );
+    //
+    // Issue #1188・SQL-26: 「識別子の直後が `(`」のうち順位付け関数（`HYBRID`／
+    // `HYBRID_RRF`）以外はスカラー関数呼び出しの式キー（`ORDER BY lower(lang)`）として
+    // スカラー経路へ回す。未知の関数名は束縛段が拒否する。
+    let is_vector_ranking = match p.peek() {
+        Some(Token::Ident(name)) => match p.tokens.get(p.pos + 1) {
+            Some(Token::DistanceOp) => true,
+            Some(Token::Punct('(')) => is_allowed_order_by_function_name(name),
+            _ => false,
+        },
+        _ => false,
+    };
 
     if !is_vector_ranking {
-        let order_by = p.parse_scalar_order_by()?;
+        let scan_keys = p.parse_scalar_order_by()?;
+        let (order_by, order_keys) = split_scan_order_keys(scan_keys);
 
         p.expect_keyword(Keyword::Limit)?;
         let limit_str = p.expect_number()?;
@@ -7907,6 +8095,7 @@ fn parse_select_shape(
             // と本経路のスカラー ORDER BY は併用しない。SQL-30・TASK-214
             // §計画 2「対象外」）。
             window_items: Vec::new(),
+            order_keys,
         }));
     }
 
@@ -7933,6 +8122,41 @@ fn parse_select_shape(
         evaluation_order,
         using_plan: None,
     }))
+}
+
+/// 式木が関数呼び出し・`CASE`・`COALESCE`・`NULLIF` のいずれかを含むか（Issue #1188。
+/// `HAVING` の式述語を「従来形では書けない形」に限定する判定。`EXTRACT` は構文段で
+/// `date_part` 呼び出しへ脱糖済みのため `Call` に含まれる）。
+fn expr_contains_scalar_function(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => true,
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
+        }
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Ident(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_) => false,
+    }
+}
+
+/// 広域取得 `ORDER BY` のキー列を `(列名のみの従来表現, 式キーを含む場合の全キー)` へ
+/// 振り分ける（Issue #1188）。式キーを含まなければ従来の `order_by` だけを埋めて既存契約を
+/// 完全に維持し、含む場合は全キーを出現順のまま `order_keys` へ保持して `order_by` は空にする。
+fn split_scan_order_keys(keys: Vec<ScanOrderKey>) -> (Vec<ScalarOrderKey>, Vec<ScanOrderKey>) {
+    if keys.iter().any(|k| matches!(k, ScanOrderKey::Expr { .. })) {
+        return (Vec::new(), keys);
+    }
+    let columns = keys
+        .into_iter()
+        .filter_map(|k| match k {
+            ScanOrderKey::Column(c) => Some(c),
+            ScanOrderKey::Expr { .. } => None,
+        })
+        .collect();
+    (columns, Vec::new())
 }
 
 /// 構文木（[`ValidatedAggregate`] の元）。カタログ存在確認前の中間結果
@@ -8008,14 +8232,14 @@ fn parse_aggregate_shape(
                 }
             }
         }
-        let having = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
+        let (having, having_exprs) = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
         {
             p.parse_having()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
-            p.parse_aggregate_order_by()?
+            p.parse_aggregate_order_by(true)?
         } else {
             Vec::new()
         };
@@ -8032,6 +8256,7 @@ fn parse_aggregate_shape(
         Some(GroupByClause {
             columns,
             having,
+            having_exprs,
             order_by,
             limit,
             offset,
@@ -8118,7 +8343,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         Vec::new()
     };
     let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
-        p.parse_aggregate_order_by()?
+        p.parse_aggregate_order_by(false)?
     } else {
         Vec::new()
     };
@@ -8136,6 +8361,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         group_by: Some(GroupByClause {
             columns,
             having: Vec::new(),
+            having_exprs: Vec::new(),
             order_by,
             limit,
             // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
@@ -8263,6 +8489,8 @@ fn build_scan_from_resolved(
     order_by: Vec<ScalarOrderKey>,
     offset: u32,
     window_items: Vec<WindowSelectItem>,
+    // Issue #1188: 式キーを含む `ORDER BY`（含まなければ空）。
+    order_keys: Vec<ScanOrderKey>,
 ) -> Result<ValidatedScan, SqlSurfaceError> {
     match resolved {
         super::view::Resolved::Table => Ok(ValidatedScan {
@@ -8273,6 +8501,7 @@ fn build_scan_from_resolved(
             order_by,
             offset,
             window_items,
+            order_keys,
         }),
         super::view::Resolved::View {
             base_table,
@@ -8286,6 +8515,9 @@ fn build_scan_from_resolved(
                 &order_by,
             )?;
             super::view::check_window_columns_within_view(view_columns.as_deref(), &window_items)?;
+            // Issue #1188: 式キーが参照する列もビューの公開列に限定する（非公開列を
+            // `ORDER BY` の式経由で並べ替えの oracle にさせない）。
+            super::view::check_order_exprs_within_view(view_columns.as_deref(), &order_keys)?;
             let projection = if let (Projection::All, Some(cols)) = (&projection, &view_columns) {
                 Projection::Columns(cols.clone())
             } else {
@@ -8301,6 +8533,7 @@ fn build_scan_from_resolved(
                 order_by,
                 offset,
                 window_items,
+                order_keys,
             })
         }
     }
@@ -8523,6 +8756,7 @@ fn validate_sql_tokens_impl(
                 shape.order_by,
                 shape.offset,
                 shape.window_items,
+                shape.order_keys,
             )?))
         }
         _ if is_set_statement => {
@@ -8742,6 +8976,7 @@ fn validate_select_statement(
                 shape.order_by,
                 shape.offset,
                 shape.window_items,
+                shape.order_keys,
             )?))
         }
     }
@@ -13855,6 +14090,136 @@ mod tests {
         match validate_sql(sql, lookup).expect("expected the scan shape to be accepted") {
             Statement::Scan(scan) => scan,
             other => panic!("expected Statement::Scan, got {other:?}"),
+        }
+    }
+
+    // --- Issue #1188・SQL-26: EXTRACT と ORDER BY／HAVING の式位置 ---------------
+
+    #[test]
+    fn extract_is_desugared_to_date_part_with_extract_default_alias() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "SELECT EXTRACT(year FROM at), extract('month' FROM at) AS m FROM documents LIMIT 5",
+            &lookup,
+        );
+        let Projection::Items(items) = scan.projection() else {
+            panic!("expected expression items");
+        };
+        let expected_call = |field: &str| Expr::Call {
+            name: "date_part".to_string(),
+            args: vec![
+                Expr::String(field.to_string()),
+                Expr::Ident("at".to_string()),
+            ],
+        };
+        assert_eq!(
+            items,
+            &vec![
+                SelectItem::Expr {
+                    expr: expected_call("year"),
+                    alias: Some("extract".to_string()),
+                },
+                SelectItem::Expr {
+                    expr: expected_call("month"),
+                    alias: Some("m".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_without_from_is_an_ordinary_call_or_a_syntax_error() {
+        let lookup = catalog_with(&["documents"]);
+        // `extract(x)` は先読みに一致しないため通常の関数呼び出しとして解析される。
+        let scan = expect_scan("SELECT extract(at) FROM documents LIMIT 5", &lookup);
+        let Projection::Items(items) = scan.projection() else {
+            panic!("expected expression items");
+        };
+        assert!(matches!(
+            items.first(),
+            Some(SelectItem::Expr { expr: Expr::Call { name, .. }, .. }) if name == "extract"
+        ));
+        for sql in [
+            "SELECT EXTRACT(year FROM) FROM documents LIMIT 5",
+            "SELECT EXTRACT(year FROM at extra) FROM documents LIMIT 5",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    #[test]
+    fn scan_order_by_accepts_expression_keys_and_keeps_column_only_shape() {
+        let lookup = catalog_with(&["documents"]);
+        // 式キーを含む: 全キーが `order_keys` に出現順で入り、`order_by`（公開型）は空。
+        let scan = expect_scan(
+            "SELECT id FROM documents ORDER BY lang, lower(title) DESC, CASE WHEN n > 1 THEN 0 ELSE 1 END LIMIT 5",
+            &lookup,
+        );
+        assert!(scan.has_expression_order_by());
+        assert!(scan.order_by().is_empty());
+        assert_eq!(scan.order_keys.len(), 3);
+        assert!(matches!(&scan.order_keys[0], ScanOrderKey::Column(k) if k.column == "lang"));
+        assert!(matches!(
+            &scan.order_keys[1],
+            ScanOrderKey::Expr { descending: true, expr: Expr::Call { name, .. } } if name == "lower"
+        ));
+        assert!(matches!(
+            &scan.order_keys[2],
+            ScanOrderKey::Expr {
+                descending: false,
+                expr: Expr::Case { .. }
+            }
+        ));
+        // 列キーのみ: 従来どおり `order_by` が正本で `order_keys` は空。
+        let plain = expect_scan(
+            "SELECT id FROM documents ORDER BY lang DESC LIMIT 5",
+            &lookup,
+        );
+        assert!(!plain.has_expression_order_by());
+        assert_eq!(plain.order_by().len(), 1);
+    }
+
+    #[test]
+    fn scan_order_by_expression_still_rejects_mixed_ranking_and_positional_keys() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents ORDER BY lower(title), embedding <=> '[0.1]' LIMIT 5",
+            "SELECT id FROM documents ORDER BY lower(title) <=> '[0.1]' LIMIT 5",
+            "SELECT id FROM documents ORDER BY lang, hybrid(embedding, 'q') LIMIT 5",
+            "SELECT id FROM documents ORDER BY count(*) LIMIT 5",
+            "SELECT id FROM documents ORDER BY 1 LIMIT 5",
+            "SELECT id FROM documents ORDER BY lower(title) LIMIT 5 USING MODE 'x'",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    #[test]
+    fn having_keeps_legacy_form_and_accepts_expression_predicates() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang \
+             HAVING c > 1 AND lower(lang) = 'ja' AND abs(c - 3) < 2 ORDER BY CASE WHEN c > 2 THEN 0 ELSE 1 END, lang",
+            &lookup,
+        );
+        let clause = agg.group_by().expect("GROUP BY clause");
+        assert_eq!(clause.having.len(), 1);
+        assert_eq!(clause.having[0].item_name, "c");
+        assert_eq!(clause.having_exprs.len(), 2);
+        assert_eq!(clause.order_by.len(), 2);
+        assert!(clause.order_by[0].expr.is_some());
+        assert!(clause.order_by[1].expr.is_none());
+        // 関数・CASE を含まない従来形外の述語・集計関数の直接記述は従来どおり拒否。
+        for sql in [
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING lang = 'ja'",
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING c + 1 > 2",
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING count(*) > 1",
+            "SELECT DISTINCT lang FROM documents ORDER BY lower(lang)",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
         }
     }
 

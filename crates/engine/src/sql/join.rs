@@ -540,6 +540,7 @@ fn build_plan(
         order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
+        order_keys: Vec::new(),
     };
     let right_scan = crate::sql::allowlist::ValidatedScan {
         table_name: right_ref.table().to_string(),
@@ -549,6 +550,7 @@ fn build_plan(
         order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
+        order_keys: Vec::new(),
     };
 
     Ok(JoinPlan {

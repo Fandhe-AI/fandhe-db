@@ -69,6 +69,24 @@ use redb::ReadableDatabase;
 /// 共有するため `pub(crate)`（二重定義しない）。
 pub(crate) const MAX_SEARCH_K: usize = 10_000;
 
+/// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
+/// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
+/// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
+fn first_top_level_from_index(tokens: &[crate::sql::lexer::Token]) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            crate::sql::lexer::Token::Punct('(') => depth = depth.saturating_add(1),
+            crate::sql::lexer::Token::Punct(')') => depth = depth.saturating_sub(1),
+            crate::sql::lexer::Token::Keyword(crate::sql::lexer::Keyword::From) if depth == 0 => {
+                return Some(i)
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// `k` の範囲検証（`k == 0` または [`MAX_SEARCH_K`] 超過を拒否）。`core.rs::EngineCore::search`
 /// と `rls.rs::PrefilterIndex::search` が同一の上限判定を共有するためのヘルパー
 /// （二重管理を防ぐ）。呼び出し元はエラー型ごとに `Err(k)` を自分の variant へ写像する。
@@ -3286,7 +3304,7 @@ impl EngineCore {
         dummy_parsed: &ParsedSql,
     ) -> Vec<crate::sql::params::PreparedParamType> {
         use crate::sql::exec::ColumnMeta;
-        use crate::sql::lexer::{Keyword, Token};
+        use crate::sql::lexer::Token;
         use crate::sql::params::{ParamPosition, PreparedParamType};
 
         // WHERE 等価位置の列を引くテーブル名（トークン列から。INSERT は
@@ -3296,13 +3314,12 @@ impl EngineCore {
                 Some(Token::Ident(name)) => Some(name.clone()),
                 _ => None,
             },
-            _ => tokens
-                .iter()
-                .position(|t| matches!(t, Token::Keyword(Keyword::From)))
-                .and_then(|i| match tokens.get(i + 1) {
-                    Some(Token::Ident(name)) => Some(name.clone()),
-                    _ => None,
-                }),
+            // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
+            // 引く `FROM` は括弧深さ 0 の最初のものに限る。
+            _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
+                Some(Token::Ident(name)) => Some(name.clone()),
+                _ => None,
+            }),
         };
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             if column == "id" {

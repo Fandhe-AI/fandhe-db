@@ -17,8 +17,8 @@
 //! 可視性が参照者へ引き継がれることは構造的に起こらない。
 
 use super::allowlist::{
-    parse_view_body, AggregateArg, Projection, ScalarOrderKey, SelectItem, SqlSurfaceError,
-    TableLookup, WherePredicate, WindowSelectItem,
+    parse_view_body, AggregateArg, Projection, ScalarOrderKey, ScanOrderKey, SelectItem,
+    SqlSurfaceError, TableLookup, WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -228,6 +228,31 @@ pub(crate) fn check_columns_within_view(
             return Err(SqlSurfaceError::InvalidInput {
                 detail: format!("unknown column: {}", key.column),
             });
+        }
+    }
+    Ok(())
+}
+
+/// 式キーを含む広域取得 `ORDER BY`（Issue #1188）の列参照が、ビューの公開列集合に収まる
+/// ことを検査する。列名キーは疑似列 `id` を含め [`check_columns_within_view`] と同じ規則
+/// （公開列のみ）、式キーは [`expr_columns_within`] で式木内の全列参照を検査する。
+pub(crate) fn check_order_exprs_within_view(
+    view_columns: Option<&[String]>,
+    order_keys: &[ScanOrderKey],
+) -> Result<(), SqlSurfaceError> {
+    let Some(columns) = view_columns else {
+        return Ok(());
+    };
+    for key in order_keys {
+        match key {
+            ScanOrderKey::Column(k) => {
+                if !columns.iter().any(|vc| vc == &k.column) {
+                    return Err(SqlSurfaceError::InvalidInput {
+                        detail: format!("unknown column: {}", k.column),
+                    });
+                }
+            }
+            ScanOrderKey::Expr { expr, .. } => expr_columns_within(columns, expr)?,
         }
     }
     Ok(())
