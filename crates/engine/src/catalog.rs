@@ -2256,6 +2256,152 @@ fn views_depending_on_in_txn(
     Ok(dependents)
 }
 
+/// `table` を（直接または連鎖したビュー経由で）参照するビューのいずれかが、
+/// 削除後の列集合（`remaining_columns` ＝ 削除対象列を除いた基底テーブルの列＋
+/// 予約列）に収まらない列を投影・述語で参照していれば `true`
+/// （[`Storage::alter_table_drop_column`] の依存ビュー検査）。
+/// `sql::view::check_columns_within_view`（参照時の列スコープ検査と同一実装）を
+/// 流用し、失敗はすべて「依存あり」として fail-closed に倒す。ビューの連鎖
+/// （`v2 AS SELECT note FROM v1`、`v1 AS SELECT * FROM t`）は、各ビューが公開する
+/// 列集合を削除後の状態で基底側から順に導出し（`SELECT *` は親の列集合、列指定は
+/// その列）、外側ビューの参照を内側の公開列に対して検査する。全ビューは同一
+/// write txn 内で読み込むため TOCTOU は生じない。
+fn views_reference_column_in_txn(
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    table: &str,
+    remaining_columns: &[String],
+) -> Result<bool> {
+    let mut defs: std::collections::HashMap<String, ViewDef> = std::collections::HashMap::new();
+    for entry in views_table.iter()? {
+        let (key, value) = entry?;
+        if defs.len() >= MAX_VIEWS {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many views".to_string(),
+            ));
+        }
+        defs.insert(key.value().to_string(), decode_view_def(value.value())?);
+    }
+    // 各ビューの削除後公開列集合（None = テーブルへ到達しない無関係なビュー）。
+    let mut exposed: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    let names: Vec<String> = defs.keys().cloned().collect();
+    for name in names {
+        if exposed_columns_of_view(&defs, &mut exposed, &name, table, remaining_columns)?
+            .is_broken()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// [`exposed_columns_of_view`] の結果。
+enum ViewExposure {
+    /// テーブルへ到達しない（検査対象外）。
+    Unrelated,
+    /// 削除後もスコープ検査を通り、この列集合を公開する。
+    Columns(Vec<String>),
+    /// 削除対象列を参照しており壊れる。
+    Broken,
+}
+
+impl ViewExposure {
+    fn is_broken(&self) -> bool {
+        matches!(self, ViewExposure::Broken)
+    }
+}
+
+/// `name` ビューの削除後公開列集合を導出する（メモ化付き反復。再帰しないため
+/// 循環したビューカタログでもスタックを消費しない）。基底連鎖を `visited` 集合付きで
+/// 辿り、循環・過大な連鎖は [`CatalogError::CorruptSchema`]（兄弟の
+/// [`resolve_reference_depth_in_txn`] と同じ fail-closed 方針）。
+fn exposed_columns_of_view(
+    defs: &std::collections::HashMap<String, ViewDef>,
+    memo: &mut std::collections::HashMap<String, Option<Vec<String>>>,
+    name: &str,
+    table: &str,
+    remaining_columns: &[String],
+) -> Result<ViewExposure> {
+    fn from_memo(cached: &Option<Vec<String>>) -> ViewExposure {
+        match cached {
+            Some(cols) => ViewExposure::Columns(cols.clone()),
+            None => ViewExposure::Unrelated,
+        }
+    }
+    // 1. 基底方向へ辿り、未確定のビュー名を chain へ積む（先頭が `name`）。
+    let mut chain: Vec<&str> = Vec::new();
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut cur: &str = name;
+    let mut parent: ViewExposure;
+    loop {
+        if let Some(cached) = memo.get(cur) {
+            parent = from_memo(cached);
+            break;
+        }
+        let Some(def) = defs.get(cur) else {
+            parent = ViewExposure::Unrelated;
+            break;
+        };
+        if !visited.insert(cur) {
+            return Err(CatalogError::CorruptSchema(
+                "view reference cycle detected".to_string(),
+            ));
+        }
+        if visited.len() > MAX_VIEW_CHAIN_WALK {
+            return Err(CatalogError::CorruptSchema(
+                "view reference chain too long".to_string(),
+            ));
+        }
+        chain.push(cur);
+        if def.base_relation == table {
+            parent = ViewExposure::Columns(remaining_columns.to_vec());
+            break;
+        }
+        if defs.contains_key(&def.base_relation) {
+            cur = def.base_relation.as_str();
+        } else {
+            parent = ViewExposure::Unrelated;
+            break;
+        }
+    }
+    // 2. 基底に近い側から順に、各ビューの削除後公開列集合を確定する。
+    for view in chain.into_iter().rev() {
+        let parent_columns = match parent {
+            ViewExposure::Columns(cols) => cols,
+            ViewExposure::Unrelated => {
+                memo.insert(view.to_string(), None);
+                parent = ViewExposure::Unrelated;
+                continue;
+            }
+            ViewExposure::Broken => return Ok(ViewExposure::Broken),
+        };
+        let Some(def) = defs.get(view) else {
+            return Ok(ViewExposure::Unrelated);
+        };
+        let tokens = crate::sql::lexer::tokenize(&def.body_sql)
+            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+        let parsed = parse_view_body(&tokens)
+            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+        if crate::sql::view::check_columns_within_view(
+            Some(&parent_columns),
+            &parsed.projection,
+            &parsed.where_predicates,
+            &[],
+        )
+        .is_err()
+        {
+            return Ok(ViewExposure::Broken);
+        }
+        let cols = match &parsed.projection {
+            crate::sql::allowlist::Projection::Columns(cols) => cols.clone(),
+            _ => parent_columns,
+        };
+        memo.insert(view.to_string(), Some(cols.clone()));
+        parent = ViewExposure::Columns(cols);
+    }
+    Ok(parent)
+}
+
 /// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
 /// （入れ子・多次元配列）を構造的に除外し、`VECTOR` 列との責務境界を型で保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2501,14 +2647,19 @@ fn hex_nibble(b: u8) -> Result<u8> {
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
-    /// `ALTER TABLE ADD COLUMN` で追加された列は暗黙 nullable とする（TABLE-5）。
-    /// 実際の行デコード時の NULL 解決は行エンコーダー（TASK-86）の責務であり、
-    /// 本モジュールはこのフラグを保持・往復させるのみ。
+    /// `ALTER TABLE ADD COLUMN` で `NOT NULL`／`DEFAULT` なしに追加された列は
+    /// nullable で、既存行は NULL として読める（TABLE-5）。`NOT NULL` かつ `DEFAULT`
+    /// 付きで追加された列の既存行は既定値として読める（Issue #1169）。実際の行
+    /// デコード時の解決は行エンコーダー（`row_codec`）の責務であり、本モジュールは
+    /// このフラグを保持・往復させるのみ。
     pub nullable: bool,
     /// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）。`INSERT` で
     /// この列が省略された場合に補われる値。明示的な `NULL` には適用しない
     /// （TABLE-16。`sql::parser::bind_literal_for_column`／
-    /// `fill_omitted_columns` が唯一の適用点）。
+    /// `fill_omitted_columns` が唯一の適用点）。`ALTER TABLE ADD COLUMN` 後の既存行
+    /// の読み出し時補完（`row_codec::scan_scalar_columns_validated`）にも同じ値を
+    /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
+    /// 補完専用の値の分離が必要）が不変条件。
     pub default: Option<ColumnDefault>,
 }
 
@@ -6135,26 +6286,36 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
-    /// 既存テーブルへ列を末尾追記する（TABLE-5）。追加列は暗黙 nullable として
-    /// 保持され、既存行のバイト列には一切触れない（`ROWS_TABLE` 非アクセス）。
-    /// `column.nullable == false` は fail-closed に拒否する
-    /// （security.md「不安全な設計」）。対象テーブル不存在・列名重複も `Err`。
+    /// 既存テーブルへ列を末尾追記する（TABLE-5）。既存行のバイト列には一切触れない
+    /// （`ROWS_TABLE` 非アクセス）。追加列の既存行に対する値は読み出し時に補う
+    /// （PostgreSQL の fast default 相当。`row_codec::scan_scalar_columns_validated`）。
+    ///
+    /// - `DEFAULT` 付き: 既存行は既定値として読める（`nullable` の別を問わない）。
+    ///   束縛できない `DEFAULT` は永続化前に `Invalid` で拒否する（既存行の読み出しが
+    ///   常に失敗する自己 DoS を防ぐ。SQL 表層を経由しない Rust API でも同じ）
+    /// - `DEFAULT` なしの `NOT NULL`: 行の有無にかかわらず一律に
+    ///   [`CatalogError::Invalid`] で拒否する（TABLE-16。行ストアは参照しない）。
+    ///   行の有無で成否を変えると、DDL 主体が他テナントの行の存在を判別できて
+    ///   しまう（テナント境界 P0）ため、判定を行データに依存させない
+    /// - 列の `DEFAULT` は作成後に変わらない前提（`ALTER COLUMN SET DEFAULT` は
+    ///   存在しない）。将来導入する場合は補完専用の値を分離する必要がある
+    ///
+    /// 対象テーブル不存在・列名重複も `Err`。
     pub fn alter_table_add_column(&self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         validate_identifier(table_name)?;
         validate_column(&column)?;
-        if !column.nullable {
+        if crate::row_codec::column_default_scalar(&column).is_err() {
             return Err(CatalogError::Invalid(
-                "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
+                "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
             ));
         }
-        // `DEFAULT` を伴う ADD COLUMN は未対応（TABLE-16・TASK-204、Issue #904
-        // D7）。既存行に対する読み出し時の DEFAULT 補完（PostgreSQL の
-        // `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` 相当）を実装していない
-        // ため、受理すると既存行が常に NULL で読める一方、新規行だけ既定値を
-        // 持つという意味論の食い違いが生じる。fail-closed に拒否する。
-        if column.default.is_some() {
+        // `DEFAULT` を欠く `NOT NULL` 列は、既存行に補える値がないため行の有無に
+        // 関係なく拒否する（fail-closed）。行ストア（全テナント）を調べて成否を
+        // 変えると、他テナントの行の存在が DDL 主体へ漏れる（テナント境界 P0）。
+        // 判定はカタログ・行に依存しないためここ（txn 開始前）で行う。
+        if !column.nullable && column.default.is_none() {
             return Err(CatalogError::Invalid(
-                "column added via ALTER TABLE ADD COLUMN must not declare a DEFAULT".to_string(),
+                "NOT NULL column added via ALTER TABLE ADD COLUMN requires a DEFAULT".to_string(),
             ));
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
@@ -6285,6 +6446,33 @@ impl Storage {
                 return Err(CatalogError::DependentObjectsStillExist(
                     column_name.to_string(),
                 ));
+            }
+            // このテーブルを直接参照するビュー（TABLE-18・SQL-23、Issue #909）の
+            // 投影・述語が削除対象列を参照していれば拒否する（`2BP01`。ビューを
+            // 黙って壊す暗黙 cascade を作らない）。同一 write txn 内で判定する
+            // （TOCTOU 回避）。SQL 表層・NoSQL 表層とも本メソッドを通るため
+            // 双方で防がれる。
+            match write_txn.open_table(VIEWS_TABLE) {
+                Ok(views_table) => {
+                    let remaining: Vec<String> = ["id", "tenant_id", "visibility"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .chain(
+                            schema
+                                .columns
+                                .iter()
+                                .filter(|c| c.name != column_name)
+                                .map(|c| c.name.clone()),
+                        )
+                        .collect();
+                    if views_reference_column_in_txn(&views_table, table_name, &remaining)? {
+                        return Err(CatalogError::DependentObjectsStillExist(
+                            column_name.to_string(),
+                        ));
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(CatalogError::from(e)),
             }
             let physical_index = u16::try_from(physical_index).map_err(|_| {
                 CatalogError::Invalid("dropped column physical index overflow".to_string())
@@ -6879,6 +7067,86 @@ impl Storage {
         column_name: &str,
         new_precision: u8,
     ) -> Result<()> {
+        self.alter_column_type_with(table_name, column_name, |current| {
+            let (old_precision, old_scale) = match current {
+                ColumnType::Numeric { precision, scale } => (*precision, *scale),
+                other => {
+                    return Err(CatalogError::IncompatibleTypeChange {
+                        column: column_name.to_string(),
+                        from: other.catalog_fields().0.to_string(),
+                        to: format!("numeric,{new_precision}"),
+                    })
+                }
+            };
+            if new_precision <= old_precision {
+                return Err(CatalogError::IncompatibleTypeChange {
+                    column: column_name.to_string(),
+                    from: format!("numeric,{old_precision},{old_scale}"),
+                    to: format!("numeric,{new_precision},{old_scale}"),
+                });
+            }
+            // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
+            // scale <= precision）を検証してから確定する。
+            validate_numeric_precision_scale(new_precision, old_scale)?;
+            Ok(ColumnType::Numeric {
+                precision: new_precision,
+                scale: old_scale,
+            })
+        })
+    }
+
+    /// `ALTER TABLE ... ALTER COLUMN <column> TYPE <target>`（TABLE-19・SQL-23、
+    /// Issue #1167）の実行本体。SQL 表層（`sql::ddl::execute_alter_table_alter_column_type`）
+    /// が呼ぶ。受理するのは `NUMERIC(p0, s)` → `NUMERIC(p1, s)`（`p1 > p0`・同一 scale）
+    /// のみで、それ以外（VECTOR 次元変更・同一型・縮小・scale 変更・異種型・
+    /// 行の書き換えを伴う拡大変換）はすべて `IncompatibleTypeChange`。
+    ///
+    /// [`Self::alter_table_widen_numeric_precision`] と異なり目標の scale を受け取り、
+    /// 判定を単一 write txn 内で完結させる（表層が事前に読んだ scale と書込時点の
+    /// scale がずれる TOCTOU を作らない。DROP して同名で ADD し直された列に
+    /// 誤って確定しない）。`NUMERIC` の範囲不正は型不一致判定より先に `Invalid`。
+    pub(crate) fn alter_table_alter_column_type(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        target: &ColumnType,
+    ) -> Result<()> {
+        if let ColumnType::Numeric { precision, scale } = target {
+            validate_numeric_precision_scale(*precision, *scale)?;
+        }
+        self.alter_column_type_with(table_name, column_name, |current| match (current, target) {
+            (
+                ColumnType::Numeric {
+                    precision: p0,
+                    scale: s0,
+                },
+                ColumnType::Numeric {
+                    precision: p1,
+                    scale: s1,
+                },
+            ) if s0 == s1 && p1 > p0 => Ok(target.clone()),
+            (from, to) => {
+                let (from_tag, from_param) = from.catalog_fields();
+                let (to_tag, to_param) = to.catalog_fields();
+                Err(CatalogError::IncompatibleTypeChange {
+                    column: column_name.to_string(),
+                    from: format!("{from_tag},{from_param}"),
+                    to: format!("{to_tag},{to_param}"),
+                })
+            }
+        })
+    }
+
+    /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
+    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → 書き戻し →
+    /// 世代 bump → commit を行う（commit の直前行に必ず bump を置く。
+    /// `table_generation_bump_coverage`）。拒否時は commit せず副作用ゼロ。
+    fn alter_column_type_with(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        decide: impl FnOnce(&ColumnType) -> Result<ColumnType>,
+    ) -> Result<()> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
@@ -6908,30 +7176,7 @@ impl Storage {
                 .iter_mut()
                 .find(|c| c.name == column_name)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            let (old_precision, old_scale) = match column.ty {
-                ColumnType::Numeric { precision, scale } => (precision, scale),
-                ref other => {
-                    return Err(CatalogError::IncompatibleTypeChange {
-                        column: column_name.to_string(),
-                        from: other.catalog_fields().0.to_string(),
-                        to: format!("numeric,{new_precision}"),
-                    })
-                }
-            };
-            if new_precision <= old_precision {
-                return Err(CatalogError::IncompatibleTypeChange {
-                    column: column_name.to_string(),
-                    from: format!("numeric,{old_precision},{old_scale}"),
-                    to: format!("numeric,{new_precision},{old_scale}"),
-                });
-            }
-            // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
-            // scale <= precision）を検証してから確定する。
-            validate_numeric_precision_scale(new_precision, old_scale)?;
-            column.ty = ColumnType::Numeric {
-                precision: new_precision,
-                scale: old_scale,
-            };
+            column.ty = decide(&column.ty)?;
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
@@ -8515,6 +8760,27 @@ mod tests {
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
+    /// 循環したビューカタログ（a -> b -> a）でも `exposed_columns_of_view` が
+    /// スタックを使い果たさず `CorruptSchema` を返すこと（反復＋visited 集合）。
+    #[test]
+    fn exposed_columns_of_view_rejects_cycle_without_recursion() {
+        let mut defs = std::collections::HashMap::new();
+        for (name, base) in [("va", "vb"), ("vb", "va")] {
+            defs.insert(
+                name.to_string(),
+                ViewDef {
+                    base_relation: base.to_string(),
+                    body_sql: format!("SELECT * FROM {base}"),
+                },
+            );
+        }
+        let mut memo = std::collections::HashMap::new();
+        let err = exposed_columns_of_view(&defs, &mut memo, "va", "t", &["c".to_string()])
+            .err()
+            .expect("cycle must be rejected");
+        assert!(matches!(err, CatalogError::CorruptSchema(_)));
+    }
+
     // --- 索引宣言（TASK-206・INDEX-7、Issue #908） --------------------------
 
     fn index_fixture_storage(label: &str) -> (Storage, CleanupGuard) {
@@ -9530,6 +9796,57 @@ mod tests {
         assert!(matches!(
             encode_schema(&schema),
             Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// `alter_table_alter_column_type`（Issue #1167）は判定を単一 write txn 内で行うため、
+    /// DROP して scale の異なる同名列を ADD し直した後でも、目標との scale 不一致を
+    /// `IncompatibleTypeChange` で拒否し、誤って確定しない。
+    #[test]
+    fn alter_column_type_judges_against_current_scale_after_readd() {
+        let path = unique_db_path("alter-type-readd");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let numeric = |precision, scale| ColumnType::Numeric { precision, scale };
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("amt", numeric(5, 2), true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
+            .expect("widen with same scale");
+        storage
+            .alter_table_drop_column("docs", "amt")
+            .expect("drop");
+        storage
+            .alter_table_add_column("docs", ColumnDef::new("amt", numeric(5, 3), true))
+            .expect("re-add with other scale");
+        let err = storage
+            .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
+            .expect_err("scale mismatch must be rejected");
+        assert!(matches!(err, CatalogError::IncompatibleTypeChange { .. }));
+        // 範囲不正は互換性判定より先に Invalid。
+        let err = storage
+            .alter_table_alter_column_type("docs", "amt", &numeric(5, 6))
+            .expect_err("invalid numeric must be rejected");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        // 予約名・存在しない列・VECTOR 次元変更。
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "id", &ColumnType::Text),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "nope", &ColumnType::Text),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "embedding", &ColumnType::Vector(3)),
+            Err(CatalogError::IncompatibleTypeChange { .. })
         ));
     }
 
@@ -11359,6 +11676,91 @@ mod tests {
             storage.alter_table_drop_column("scalar_only", "body"),
             Err(CatalogError::Invalid(_))
         ));
+    }
+
+    /// ビューの投影・述語が参照する列の DROP COLUMN は `DependentObjectsStillExist`
+    /// （`2BP01`）で拒否し、参照されない列は削除できる（TABLE-18・TABLE-19、
+    /// Issue #1167 レビュー対応）。
+    #[test]
+    fn alter_table_drop_column_rejects_column_referenced_by_view() {
+        let path = unique_db_path("drop-column-view-dep");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("a", ColumnType::Text, true),
+                    ColumnDef::new("b", ColumnType::Text, true),
+                    ColumnDef::new("c", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .create_view("v", "docs", "SELECT a FROM docs WHERE b = 'x'")
+            .expect("create view");
+
+        for col in ["a", "b"] {
+            assert!(
+                matches!(
+                    storage.alter_table_drop_column("docs", col),
+                    Err(CatalogError::DependentObjectsStillExist(_))
+                ),
+                "column {col} referenced by view must be rejected"
+            );
+        }
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert!(schema.columns.iter().any(|c| c.name == "a"));
+        assert!(schema.columns.iter().any(|c| c.name == "b"));
+        storage
+            .alter_table_drop_column("docs", "c")
+            .expect("unreferenced column can be dropped");
+    }
+
+    /// ビュー数がちょうど [`MAX_VIEWS`] 件（`create_view` が許可する上限）でも、
+    /// DROP COLUMN の依存ビュー走査は `ViewLimitExceeded` にならず、上限超過
+    /// （`MAX_VIEWS + 1` 件の破損カタログ）のみ fail-closed に拒否する
+    /// （Issue #1167 レビュー指摘の境界回帰テスト）。
+    #[test]
+    fn views_reference_column_scan_accepts_exactly_max_views() {
+        let path = unique_db_path("drop-column-view-limit-boundary");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let remaining = vec!["a".to_string()];
+        let def = ViewDef {
+            base_relation: "docs".to_string(),
+            body_sql: "SELECT a FROM docs".to_string(),
+        };
+        let encoded = encode_view_def(&def).expect("encode view def");
+
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut views = write_txn.open_table(VIEWS_TABLE).expect("open views");
+            for i in 0..MAX_VIEWS {
+                views
+                    .insert(format!("v{i}").as_str(), encoded.as_slice())
+                    .expect("insert view");
+            }
+            assert!(
+                matches!(
+                    views_reference_column_in_txn(&views, "docs", &remaining),
+                    Ok(false)
+                ),
+                "exactly MAX_VIEWS views must be scanned without ViewLimitExceeded"
+            );
+            views
+                .insert("v_over", encoded.as_slice())
+                .expect("insert over-limit view");
+            assert!(
+                matches!(
+                    views_reference_column_in_txn(&views, "docs", &remaining),
+                    Err(CatalogError::ViewLimitExceeded(_))
+                ),
+                "more than MAX_VIEWS views must be rejected fail-closed"
+            );
+        }
+        write_txn.abort().expect("abort");
     }
 
     /// 削除後に同名列を再追加すると独立した新しい物理スロットを得て、削除前の

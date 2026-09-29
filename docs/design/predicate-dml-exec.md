@@ -248,13 +248,13 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   複数行 `VALUES` で受理させるテストでは両方を引き上げる必要がある
   （`crates/engine/tests/insert_multi_row.rs::
   multi_row_insert_respects_configured_higher_insert_row_limit`・
-  `multi_row_insert_default_has_no_row_count_cap` 参照）。`wire-server` は
-  `batch_limits` を設定する専用 CLI フラグを持たず（Issue #997 のオーナー
-  承認範囲＝対象 2 つに `max_files_per_batch` は含まれないため追加しない）、
-  `BatchLimits::default()` が読む環境変数 `VECTOR_DB_BATCH_MAX_FILES`
-  （`engine::batch_limits` モジュールドキュメント参照）が既存の引き上げ経路と
-  なる。`--max-insert-rows` を明示指定し、その値が `max_files_per_batch`
-  （既定値または `VECTOR_DB_BATCH_MAX_FILES` で設定した値）を超える場合、CLI
+  `multi_row_insert_default_has_no_row_count_cap` 参照）。`max_files_per_batch`
+  は Issue #1166 で CLI フラグ `--batch-max-files`（範囲 `1..=1,000,000`。優先
+  順位は CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64）からも設定
+  できる。複数行 `VALUES` は `max_batch_chunks`（既定 4096。環境変数
+  `VECTOR_DB_BATCH_MAX_CHUNKS`）の判定も受けるため、実効行数上限は
+  `min(max_files_per_batch, max_batch_chunks)` になる。`--max-insert-rows` を
+  明示指定し、その値がこの実効上限を超える場合、CLI
   の引き上げが黙って無効化される事故を防ぐため、`wire_server::dml_limits_opt::
   insert_rows_cap_warning` が起動ログへ `WARNING` 行を出す（`--durability
   none` の `WARNING` と同じ「非既定値を明示選択したときだけ警告する」設計
