@@ -7802,7 +7802,8 @@ fn parse_aggregate_shape(
 /// 対象は裸列参照のカンマ区切り（`*`・式は `42601`）。同じ列を複数回書いた場合
 /// （`SELECT DISTINCT a, a`）は `GroupByClause::columns` では 1 列に畳み、SELECT
 /// リスト側の `GroupKey` 項目だけを列挙する（PostgreSQL は受理する形）。列数は
-/// [`check_group_by_column_count`] で `push` 前に検査する（`54000`）。
+/// 重複を含む SELECT 項目数で [`check_group_by_column_count`] により検査する
+/// （`54000`。重複列を並べても 8 列上限を超えられない）。
 /// `GROUP BY`・`HAVING`・`OFFSET`・ベクトル順位付け（`ORDER BY <=>`・`HYBRID`・
 /// `USING PLAN`・`USING MODE`・`HINT ORDER`）はいずれもこの構文自体が持たない
 /// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) 参照）。列の型の検査は
@@ -7827,9 +7828,10 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             check_group_by_column_count(columns.len() + 1)?;
             columns.push(column.clone());
         }
-        // SELECT リスト項目数の上限（`GROUP BY` 側の列数上限と独立に、
-        // 同一列の重複記述でも無制限に伸びないよう頭打ちにする）。
-        check_aggregate_item_count(items.len() + 1)?;
+        // SELECT リスト項目数にも `GROUP BY` 列数と同じ上限（[`MAX_GROUP_BY_COLUMNS`]）
+        // を適用する。重複列（`SELECT DISTINCT a, a, ...`）は `columns` に畳まれるが、
+        // 設計文書の D8 は `SELECT DISTINCT` を最大 8 列と定めるため項目数で検査する。
+        check_group_by_column_count(items.len() + 1)?;
         items.push(AggregateSelectItem::GroupKey { column, alias });
         if matches!(p.peek(), Some(Token::Punct(','))) {
             p.advance();
@@ -13118,6 +13120,23 @@ mod tests {
         let lookup = catalog_with(&["documents"]);
         validate_sql("SELECT COUNT(distinct) FROM documents", &lookup)
             .expect("COUNT(distinct) (column named 'distinct') must remain accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_duplicate_columns_at_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let cols = ["lang"; MAX_GROUP_BY_COLUMNS].join(", ");
+        validate_sql(&format!("SELECT DISTINCT {cols} FROM documents"), &lookup)
+            .expect("SELECT DISTINCT with duplicates at item limit must be accepted");
+    }
+
+    #[test]
+    fn rejects_select_distinct_duplicate_columns_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let cols = ["lang"; MAX_GROUP_BY_COLUMNS + 1].join(", ");
+        let err = validate_sql(&format!("SELECT DISTINCT {cols} FROM documents"), &lookup)
+            .expect_err("SELECT DISTINCT item count over limit must be rejected");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
