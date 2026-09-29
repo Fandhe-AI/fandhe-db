@@ -1376,6 +1376,7 @@ pub(crate) fn bind_where_predicates(
         node_budget,
         dummy_equality_flags,
         &mut equality_ordinal,
+        true,
     )
 }
 
@@ -1399,6 +1400,7 @@ pub(crate) fn bind_check_predicates(
         node_budget,
         &[],
         &mut equality_ordinal,
+        false,
     )
 }
 
@@ -1451,6 +1453,7 @@ fn bind_where_predicates_recursive(
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
     equality_ordinal: &mut usize,
+    allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
@@ -1463,7 +1466,14 @@ fn bind_where_predicates_recursive(
         // 順序比較が無いため、AST（`WherePredicate`）を変えず束縛段で式レーンの
         // `Expr::Binary`（TEXT×TEXT のバイト順比較）へ振り替える。二次索引は使わず
         // 全走査へ縮退する（索引の有無で結果を変えない）。
-        if let Some(expr) = text_range_compare_as_expr(predicate, schema) {
+        //
+        // `CHECK` 文脈（`allow_text_range_rewrite == false`）では書き換えず従来どおり
+        // 宣言的経路へ渡して `22000` で拒否する（fail-closed。CHECK の TEXT 範囲比較は
+        // 永続化・再オープン時の再検証経路が未検証のため受理しない）。
+        if let Some(expr) = allow_text_range_rewrite
+            .then(|| text_range_compare_as_expr(predicate, schema))
+            .flatten()
+        {
             let (bound, _ty) = crate::sql::udf_call::bind_expr(&expr, schema, udfs, node_budget)?;
             expr_filters.push(bound);
             continue;
@@ -1500,6 +1510,7 @@ fn bind_where_predicates_recursive(
                             node_budget,
                             dummy_equality_flags,
                             equality_ordinal,
+                            allow_text_range_rewrite,
                         )?;
                     bound_branches.push(crate::sql::where_tree::BoundConjunction::new(
                         branch_metadata,

@@ -347,3 +347,31 @@ fn text_range_uses_byte_order_and_null_never_matches() {
     assert_eq!(ids("lang > 'a'"), vec![3]);
     assert_eq!(ids("lang >= 'a'"), vec![2, 3]);
 }
+
+/// CHECK 文脈の TEXT 範囲比較は WHERE 側の書き換え（Issue #1183）の対象外で、従来どおり
+/// `22000` で拒否される（fail-closed。永続化・再オープン時の再検証経路が未検証のため）。
+/// 同じ条件の WHERE は受理される。
+#[test]
+fn check_constraint_text_range_compare_is_rejected_while_where_is_accepted() {
+    let (core, path) = seed(&[(1, "b", None, None, None, None)], &[]);
+    let _guard = CleanupGuard(path);
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+
+    let err = core
+        .execute_sql_in_session(
+            &ctx_a(),
+            &mut session,
+            "CREATE TABLE chk (lang TEXT CHECK (lang > 'a'))",
+        )
+        .expect_err("TEXT range compare in CHECK must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+
+    // WHERE 側は従来どおり受理される。
+    let rows = cells(
+        &core,
+        &ctx_a(),
+        &format!("SELECT id FROM {TABLE} WHERE lang > 'a' LIMIT 10"),
+    );
+    assert_eq!(rows.len(), 1);
+}
