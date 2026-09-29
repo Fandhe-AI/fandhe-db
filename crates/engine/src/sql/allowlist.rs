@@ -2417,7 +2417,7 @@ pub struct ValidatedTruncate {
 ///
 /// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` のみ
 /// （`IF NOT EXISTS`・複数 `ADD`・列制約〔`NOT NULL`／`DEFAULT`／`PRIMARY KEY`
-/// 等〕・`DROP COLUMN`／`ALTER COLUMN`・`RETURNING`・`USING OPERATION_ID` の
+/// 等〕・`RETURNING`・`USING OPERATION_ID` の
 /// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
 /// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
 /// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
@@ -2485,7 +2485,29 @@ pub struct ValidatedAlterTableAddForeignKey {
     pub foreign_key: crate::catalog::ForeignKeyDef,
 }
 
-/// `ALTER TABLE` の許可形状 5 種の和（Issue #1067・#1068・#1069）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> DROP COLUMN <column>` 文
+/// （TABLE-19・SQL-23、Issue #1167）。予約列名は構造検証段で `42601` に落とし済み。
+/// テーブル・列の存在確認と依存検査（PK・UNIQUE・CHECK・FK）は DDL 権限ゲート
+/// 通過後の実行段（`sql::ddl::execute_alter_table_drop_column`）が担う
+/// （権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableDropColumn {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> TYPE
+/// <型名>` 文（TABLE-19・SQL-23、Issue #1167）。型名の意味づけ（ENUM 型名の
+/// 存在確認・`ColumnType` への変換）と互換性判定は実行段
+/// （`sql::ddl::execute_alter_table_alter_column_type`）が担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnType {
+    pub table_name: String,
+    pub column_name: String,
+    pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+}
+
+/// `ALTER TABLE` の許可形状 7 種の和（Issue #1067・#1068・#1069・#1167）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -2500,6 +2522,9 @@ pub struct ValidatedAlterTableAddForeignKey {
 ///
 /// **BREAKING CHANGE**（Issue #1069）: `AddForeignKey` variant を追加した。
 /// いずれも本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1167）: `DropColumn`・`AlterColumnType` variant を
+/// 追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
@@ -2507,6 +2532,8 @@ pub enum ValidatedAlterTable {
     AddCheck(ValidatedAlterTableAddCheck),
     DropConstraint(ValidatedAlterTableDropConstraint),
     AddForeignKey(ValidatedAlterTableAddForeignKey),
+    DropColumn(ValidatedAlterTableDropColumn),
+    AlterColumnType(ValidatedAlterTableAlterColumnType),
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -5113,8 +5140,8 @@ impl<'a> Parser<'a> {
     /// `lexer::Keyword` へ含めない設計方針（`lexer.rs` のモジュールドキュメント
     /// 参照）のため、いずれも `expect_contextual_keyword` で文脈的に照合する。
     /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK ... NOT VALID`／
-    /// `PRIMARY KEY`／`FOREIGN KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
-    /// `RESTRICT`・`DROP COLUMN`／`ALTER COLUMN`・`USING OPERATION_ID` はいずれも
+    /// `PRIMARY KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
+    /// `RESTRICT`・`DROP COLUMN IF EXISTS`・`USING OPERATION_ID` はいずれも
     /// 構造的に受理しない（設計 D6。`expect_end_of_statement` が余剰トークンとして
     /// `42601` で拒否するか、`ADD`／`DROP` の直後に許可形状以外が続いた時点で
     /// `expect_contextual_keyword` が拒否する）。
@@ -5214,8 +5241,19 @@ impl<'a> Parser<'a> {
         }
         if self.peek_contextual_keyword("DROP") {
             self.advance();
-            // `DROP CONSTRAINT <name>` のみを受理する（`DROP CONSTRAINT IF EXISTS`／
-            // `CASCADE`／`RESTRICT`・`DROP COLUMN` は設計 D6 によりスコープ外。
+            // `DROP COLUMN <col>`（TABLE-19、Issue #1167）。`COLUMN` 省略形・
+            // `IF EXISTS`・`CASCADE`／`RESTRICT` は余剰トークンとして `42601`。
+            if self.peek_contextual_keyword("COLUMN") {
+                self.advance();
+                let column_name = self.expect_ident()?;
+                reject_reserved_alter_column_name(&column_name)?;
+                return Ok(ParsedAlterTableShape::DropColumn {
+                    table_name,
+                    column_name,
+                });
+            }
+            // `DROP CONSTRAINT <name>` を受理する（`DROP CONSTRAINT IF EXISTS`／
+            // `CASCADE`／`RESTRICT` は設計 D6 によりスコープ外。
             // `CONSTRAINT` 以外が続けば `42601`）。
             self.expect_contextual_keyword("CONSTRAINT")?;
             let constraint_name = self.expect_ident()?;
@@ -5225,6 +5263,22 @@ impl<'a> Parser<'a> {
             return Ok(ParsedAlterTableShape::DropConstraint {
                 table_name,
                 constraint_name,
+            });
+        }
+        // `ALTER COLUMN <col> TYPE <型名>`（TABLE-19、Issue #1167）。`SET DATA TYPE`・
+        // `USING`・`COLLATE` は `TYPE` 不一致／余剰トークンとして `42601`。
+        if self.peek_contextual_keyword("ALTER") {
+            self.advance();
+            self.expect_contextual_keyword("COLUMN")?;
+            let column_name = self.expect_ident()?;
+            reject_reserved_alter_column_name(&column_name)?;
+            self.expect_contextual_keyword("TYPE")?;
+            let column_type =
+                crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+            return Ok(ParsedAlterTableShape::AlterColumnType {
+                table_name,
+                column_name,
+                column_type,
             });
         }
         Err(SqlSurfaceError::unsupported("unsupported ALTER TABLE form"))
@@ -6632,6 +6686,15 @@ enum ParsedAlterTableShape {
         table_name: String,
         constraint_name: Option<String>,
         foreign_key: crate::catalog::ForeignKeyDef,
+    },
+    DropColumn {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnType {
+        table_name: String,
+        column_name: String,
+        column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
     },
 }
 
@@ -8734,8 +8797,28 @@ pub(crate) fn validate_truncate_tokens(
     })
 }
 
+/// `DROP COLUMN`／`ALTER COLUMN TYPE` の対象列名が予約列名（`id`／`tenant_id`／
+/// `visibility`／`check`／`constraint`。ASCII 大文字小文字無視）なら `42601`
+/// （Issue #1167）。`ADD COLUMN` と同じ判定で、カタログを照会しないため権限
+/// ゲートより前に置いても存在オラクルにならない。engine 側の保護列判定
+/// （`ProtectedColumn`）は大文字小文字を区別するため、表層で吸収する。
+fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurfaceError> {
+    if column_name.eq_ignore_ascii_case("id")
+        || column_name.eq_ignore_ascii_case("tenant_id")
+        || column_name.eq_ignore_ascii_case("visibility")
+        || column_name.eq_ignore_ascii_case("check")
+        || column_name.eq_ignore_ascii_case("constraint")
+    {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "column name {column_name:?} is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// `ALTER TABLE` 文（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
-/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT` の 4 形状）をトークン化し、
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD FOREIGN KEY`／`DROP COLUMN`／
+/// `ALTER COLUMN TYPE` の 7 形状）をトークン化し、
 /// 許可リスト形式で構造検証する（TASK-202・SQL-23。Issue #900 の公開 API）。
 /// `validate_truncate` とは異なり
 /// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
@@ -8804,6 +8887,22 @@ pub fn validate_alter_table_tokens(
             table_name,
             constraint_name,
             foreign_key,
+        }),
+        ParsedAlterTableShape::DropColumn {
+            table_name,
+            column_name,
+        } => ValidatedAlterTable::DropColumn(ValidatedAlterTableDropColumn {
+            table_name,
+            column_name,
+        }),
+        ParsedAlterTableShape::AlterColumnType {
+            table_name,
+            column_name,
+            column_type,
+        } => ValidatedAlterTable::AlterColumnType(ValidatedAlterTableAlterColumnType {
+            table_name,
+            column_name,
+            column_type,
         }),
     })
 }
