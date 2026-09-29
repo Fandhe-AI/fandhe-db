@@ -365,7 +365,7 @@ fn parse_sql_prepared_rejects_parameter_number_over_max() {
     assert_eq!(err.wire_code(), "54000");
 }
 
-// --- 値検証（`22000`） -------------------------------------------------------
+// --- 値検証（NULL は `22000`・形式不正は `22P02`） -------------------------------------------------------
 
 #[test]
 fn bind_prepared_rejects_null_value() {
@@ -394,7 +394,8 @@ fn bind_prepared_rejects_non_utf8_value() {
     let err = core
         .bind_prepared(&prepared, &[Some(vec![0xff, 0xfe])])
         .expect_err("non-UTF-8 bind value must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    // WIRE-12: 値の形式不正は 22P02。
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]
@@ -905,4 +906,89 @@ fn public_bind_and_describe_reject_invalid_enum_label_without_dollar_param() {
         core.describe_parsed_in_session(&session, &parsed)
             .expect("describe must accept a valid enum label");
     }
+}
+
+// --- 型推論・0 パラメータ文アクセサ（Issue #1171・WIRE-12） ----------------------
+
+#[test]
+fn param_types_are_inferred_per_position() {
+    use engine::sql::exec::ColumnMeta;
+    use engine::sql::params::PreparedParamType;
+
+    let path = unique_db_path("prepared-param-types");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+
+    let types = |sql: &str| {
+        core.parse_sql_prepared(sql)
+            .expect("parse_sql_prepared should succeed")
+            .param_types()
+            .to_vec()
+    };
+    assert_eq!(
+        types("SELECT id FROM documents ORDER BY embedding <=> $1 LIMIT 3"),
+        vec![PreparedParamType::VectorText]
+    );
+    assert_eq!(
+        types("SELECT id FROM documents WHERE body = $1 LIMIT 10"),
+        vec![PreparedParamType::Column(ColumnMeta::Scalar {
+            name: "body".to_string(),
+            ty: ColumnType::Text,
+        })]
+    );
+    assert_eq!(
+        types("SELECT id FROM documents WHERE id = $1 LIMIT 10"),
+        vec![PreparedParamType::Column(ColumnMeta::Id)]
+    );
+    // INSERT の行内 ordinal は明示列リストの列へ解決される。
+    assert_eq!(
+        types(
+            "INSERT INTO documents (id, embedding, body, lang) VALUES (9, $1, $2, 'x') USING OPERATION_ID $3"
+        ),
+        vec![
+            PreparedParamType::Column(ColumnMeta::Scalar {
+                name: "embedding".to_string(),
+                ty: ColumnType::Vector(3),
+            }),
+            PreparedParamType::Column(ColumnMeta::Scalar {
+                name: "body".to_string(),
+                ty: ColumnType::Text,
+            }),
+            PreparedParamType::Text,
+        ]
+    );
+    // 未参照の番号は Text。
+    assert_eq!(
+        types("SELECT id FROM documents WHERE lang = $2 LIMIT 10"),
+        vec![
+            PreparedParamType::Text,
+            PreparedParamType::Column(ColumnMeta::Scalar {
+                name: "lang".to_string(),
+                ty: ColumnType::Text,
+            })
+        ]
+    );
+}
+
+#[test]
+fn parsed_if_unparameterized_matches_parse_sql_only_without_params() {
+    let path = unique_db_path("prepared-unparameterized-accessor");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+
+    let sql = "SELECT id FROM documents WHERE lang = 'en' LIMIT 5";
+    let prepared = core
+        .parse_sql_prepared(sql)
+        .expect("parse_sql_prepared should succeed");
+    let expected = core.parse_sql(sql).expect("parse_sql should succeed");
+    assert_eq!(prepared.param_count(), 0);
+    assert_eq!(
+        format!("{:?}", prepared.parsed_if_unparameterized()),
+        format!("{:?}", Some(&expected))
+    );
+
+    let with_param = core
+        .parse_sql_prepared("SELECT id FROM documents WHERE lang = $1 LIMIT 5")
+        .expect("parse_sql_prepared should succeed");
+    assert!(with_param.parsed_if_unparameterized().is_none());
 }

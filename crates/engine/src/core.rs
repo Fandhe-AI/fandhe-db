@@ -1509,9 +1509,27 @@ pub struct PreparedSql {
     /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
     /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
     where_equality_dummy_flags: Vec<bool>,
+    /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
+    /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
+    param_types: Vec<crate::sql::params::PreparedParamType>,
 }
 
 impl PreparedSql {
+    /// `$n` ごとの型公告（`param_count()` と同じ長さ。番号 1 始まりの `n` が
+    /// `n - 1` 番目）。wire-server の `ParameterDescription` の OID・バイナリ
+    /// 受理可否の判定にだけ使う（値の検証意味論には影響しない。WIRE-12）。
+    pub fn param_types(&self) -> &[crate::sql::params::PreparedParamType] {
+        &self.param_types
+    }
+
+    /// `param_count() == 0`（`$n` を含まない文）のときに限り、構造検証済みの
+    /// [`ParsedSql`] を返す。`$n` が無い文では `substitute_dummy` が恒等変換の
+    /// ため、これは [`EngineCore::parse_sql`] の結果と構造的に同一である
+    /// （wire-server が 0 パラメータ文を従来の Parsed 経路のまま保持するため）。
+    pub fn parsed_if_unparameterized(&self) -> Option<&ParsedSql> {
+        (self.param_count == 0).then_some(&self.dummy_parsed)
+    }
+
     /// 文が要求するパラメータ数（`$n` の最大番号。1 始まり。`$n` を含まない
     /// 文は 0）。[`EngineCore::bind_prepared`] に渡す `values` の個数と一致する
     /// 必要がある。
@@ -3175,18 +3193,106 @@ impl EngineCore {
             crate::sql::params::where_equality_literal_is_param(&tokens);
         let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
         let dummy_parsed = self.parse_tokens(dummy_tokens)?;
+        let param_types = self.infer_param_types(&tokens, param_count, &dummy_parsed);
         Ok(PreparedSql {
             tokens,
             param_count,
             dummy_parsed,
             order_by_distance_literal_is_param,
             where_equality_dummy_flags,
+            param_types,
         })
     }
 
+    /// `$n` ごとの型公告を導出する（WIRE-12。[`Self::parse_sql_prepared`] 専用）。
+    /// カタログ（スキーマ）だけを参照し行には触れない。スキーマを引けない場合
+    /// （ビュー・解決不能な表記等）は常に `Text` へ倒す（公告のみの問題で、
+    /// 値の検証には影響しない）。同じ番号が複数位置に現れて食い違う場合は、
+    /// 1 つでもベクトル位置があれば `VectorText`（バイナリ不可側へ倒す）、
+    /// それ以外は `Text`。
+    fn infer_param_types(
+        &self,
+        tokens: &[crate::sql::lexer::Token],
+        param_count: u16,
+        dummy_parsed: &ParsedSql,
+    ) -> Vec<crate::sql::params::PreparedParamType> {
+        use crate::sql::exec::ColumnMeta;
+        use crate::sql::lexer::{Keyword, Token};
+        use crate::sql::params::{ParamPosition, PreparedParamType};
+
+        // WHERE 等価位置の列を引くテーブル名（トークン列から。INSERT は
+        // 検証済みの `table_name` を使う）。
+        let where_table: Option<String> = match tokens.first() {
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
+                Some(Token::Ident(name)) => Some(name.clone()),
+                _ => None,
+            },
+            _ => tokens
+                .iter()
+                .position(|t| matches!(t, Token::Keyword(Keyword::From)))
+                .and_then(|i| match tokens.get(i + 1) {
+                    Some(Token::Ident(name)) => Some(name.clone()),
+                    _ => None,
+                }),
+        };
+        let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
+            if column.eq_ignore_ascii_case("id") {
+                return Some(PreparedParamType::Column(ColumnMeta::Id));
+            }
+            let schema = self.storage.get_table_schema(table).ok()?;
+            let def = schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(column))?;
+            Some(PreparedParamType::Column(ColumnMeta::Scalar {
+                name: def.name.clone(),
+                ty: def.ty.clone(),
+            }))
+        };
+
+        crate::sql::params::infer_param_positions(tokens, param_count)
+            .into_iter()
+            .map(|positions| {
+                let mut resolved: Vec<PreparedParamType> = Vec::new();
+                for pos in &positions {
+                    let ty = match pos {
+                        ParamPosition::Vector => PreparedParamType::VectorText,
+                        ParamPosition::Text => PreparedParamType::Text,
+                        ParamPosition::WhereColumn(col) => where_table
+                            .as_deref()
+                            .and_then(|t| column_type(t, col))
+                            .unwrap_or(PreparedParamType::Text),
+                        ParamPosition::InsertValue(k) => match dummy_parsed {
+                            ParsedSql::Insert(ins) => ins
+                                .columns
+                                .get(*k)
+                                .and_then(|col| column_type(&ins.table_name, col))
+                                .unwrap_or(PreparedParamType::Text),
+                            _ => PreparedParamType::Text,
+                        },
+                    };
+                    resolved.push(ty);
+                }
+                match resolved.split_first() {
+                    None => PreparedParamType::Text,
+                    Some((first, rest)) => {
+                        if rest.iter().all(|t| t == first) {
+                            first.clone()
+                        } else if resolved.contains(&PreparedParamType::VectorText) {
+                            PreparedParamType::VectorText
+                        } else {
+                            PreparedParamType::Text
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
-    /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（テキスト形式。
-    /// バイナリ形式パラメータは wire 層が `0A000` で拒否済みの前提）を束縛し、
+    /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（バイト列。
+    /// text 系スロットのバイナリ形式は UTF-8 バイト恒等でそのまま渡され、それ以外
+    /// のバイナリ形式は wire 層が `0A000` で拒否済みの前提）を束縛し、
     /// [`Self::parse_sql`] が SQL テキストから直接返すのと**完全に同一**の
     /// [`ParsedSql`] を返す（第 2 の実行器を作らない設計。実行・Describe は
     /// 以降すべて既存の [`Self::execute_parsed_in_session`]／
