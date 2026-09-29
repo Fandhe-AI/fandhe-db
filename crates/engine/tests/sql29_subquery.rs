@@ -503,26 +503,129 @@ fn in_subquery_unsupported_type_column_with_null_only_inner_result_is_rejected()
     ));
 }
 
-// --- 上限（`IN` 展開の葉数） --------------------------------------------------
+// --- 上限（`IN` の distinct 値数） ---------------------------------------------
 
-// PR #1103 codex-review P1 指摘の回帰テスト（3 スレッド目）: 内側の各行を
-// `WherePredicate::Equality` 葉へ展開して `Or` に束ねる件数は、構文解析段の
-// `MAX_WHERE_LEAVES`（通常の `WHERE` 述語の葉数上限）とは独立の経路で
-// 生成されるため、内側最大可視行数×内側実行回数上限の組合せだけでは通常の
-// `WHERE` 述語数上限より大きい評価コストを 1 文から発生させられた
-// （DoS。`docs/design/sql-subquery.md` 参照）。
-// `sql::subquery::MAX_SUBQUERY_IN_LEAVES` で頭打ちにされることを固定する。
+// Issue #1165: `IN (SELECT ...)` は distinct 値を 256 件以下のチャンクごとの
+// `InList`（既存評価器の集合照合）へ書き換えるため、旧方式の 256 葉上限を
+// 超える distinct 値でも成功し、独立オラクルと一致する。
+// PR #1103 codex-review P1 指摘（DoS）の趣旨は、文全体で共有する distinct 値
+// 予算 `sql::subquery::MAX_SUBQUERY_IN_VALUES`（10,000）で維持する。
 #[test]
-fn in_subquery_expansion_leaf_count_exceeds_limit_is_rejected() {
+fn in_subquery_distinct_values_beyond_legacy_leaf_limit_match_oracle() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    // 旧上限（256）を大きく超え、チャンク境界（256×n）をまたぐ 1,000 件。
+    let distinct_count = 1_000u64;
+    for i in 0..distinct_count {
+        insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
+    }
+    // 一致する doc（lang0・lang255・lang256・lang999）と一致しない doc。
+    let hit = ["lang0", "lang255", "lang256", "lang999"];
+    let miss = ["lang1000", "other", "en"];
+    let mut expected = Vec::new();
+    for (i, lang) in hit.iter().chain(miss.iter()).enumerate() {
+        let id = (i + 1) as u64;
+        insert_doc(&core, &ctx, id, lang);
+        if i < hit.len() {
+            expected.push(id);
+        }
+    }
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {distinct_count}) LIMIT 100"
+        ),
+    );
+    assert_eq!(ids, expected);
+}
+
+// 単一の `IN` サブクエリは内側可視行数上限（`MAX_SEARCH_K` = 10,000）まで
+// distinct 値を取り込める（約 40 チャンク＝`Or` 分岐）。Scan・Aggregate の
+// 両実行アーム（`core.rs` の予算初期化 2 箇所）で独立オラクルと一致する。
+#[test]
+fn in_subquery_single_site_at_inner_row_limit_matches_oracle_scan_and_aggregate() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let distinct_count = 10_000u64;
+    for i in 0..distinct_count {
+        insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
+    }
+    insert_doc(&core, &ctx, 1, "lang0");
+    insert_doc(&core, &ctx, 2, "lang5000");
+    insert_doc(&core, &ctx, 3, "lang9999");
+    insert_doc(&core, &ctx, 4, "lang10000");
+    insert_doc(&core, &ctx, 5, "en");
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {distinct_count}) LIMIT 100"
+        ),
+    );
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT COUNT(*) FROM {DOCS} WHERE lang IN \
+                 (SELECT lang FROM {ALLOWED_LANGS} LIMIT {distinct_count})"
+            ),
+        )
+        .expect("aggregate with large IN subquery should succeed");
+    let count = result
+        .rows
+        .first()
+        .and_then(|r| r.cells.first())
+        .map(|c| format!("{c:?}"))
+        .expect("count cell");
+    assert!(count.contains('3'), "COUNT(*) must be 3, got {count}");
+}
+
+// 内側の distinct 値がちょうど旧上限（256）の前後（256・257 件）でも一致する。
+#[test]
+fn in_subquery_distinct_values_around_chunk_boundary_match_oracle() {
+    for distinct_count in [256u64, 257u64] {
+        let (core, path) = new_core();
+        let _guard = CleanupGuard(path);
+        let ctx = ctx_for("tenant-a");
+        for i in 0..distinct_count {
+            insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
+        }
+        let last = format!("lang{}", distinct_count - 1);
+        insert_doc(&core, &ctx, 1, &last);
+        insert_doc(&core, &ctx, 2, "absent");
+
+        let ids = select_ids(
+            &core,
+            &ctx,
+            &format!(
+                "SELECT id FROM {DOCS} WHERE lang IN \
+                 (SELECT lang FROM {ALLOWED_LANGS} LIMIT {distinct_count}) LIMIT 100"
+            ),
+        );
+        assert_eq!(ids, vec![1], "distinct_count={distinct_count}");
+    }
+}
+
+// 文全体で共有する distinct 値予算（`MAX_SUBQUERY_IN_VALUES` = 10,000）を
+// 複数の `IN` サイトの合計が超えた場合は `54000`（上限超過の拒否契約の維持）。
+#[test]
+fn in_subquery_distinct_values_exceeding_statement_budget_is_rejected() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     insert_doc(&core, &ctx, 1, "en");
-    // `sql::subquery::MAX_SUBQUERY_IN_LEAVES`（256）を超える件数の異なる
-    // `lang` 値を用意し、`IN` の展開がそれをすべて葉へ変換しようとした時点で
-    // 資源上限エラーになることを確認する。
-    let leaf_count = 300u64;
-    for i in 0..leaf_count {
+    // 各 IN サイトが 5,001 件の distinct 値を取り込み、合計 10,002 > 10,000。
+    let per_site = 5_001u64;
+    for i in 0..per_site {
         insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
     }
 
@@ -531,7 +634,8 @@ fn in_subquery_expansion_leaf_count_exceeds_limit_is_rejected() {
         &ctx,
         &format!(
             "SELECT id FROM {DOCS} WHERE lang IN \
-             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {leaf_count}) LIMIT 100"
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {per_site}) OR lang IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {per_site}) LIMIT 100"
         ),
     );
     assert!(matches!(
@@ -541,24 +645,15 @@ fn in_subquery_expansion_leaf_count_exceeds_limit_is_rejected() {
 }
 
 // Cursor Bugbot 指摘（Medium）の回帰テスト: `IN` は集合所属の判定であり、
-// 同じ値の内側行が何件あっても展開後の述語は 1 個で足りる。以前は内側の
-// 行ごとに無条件で葉を積み葉予算（`MAX_SUBQUERY_IN_LEAVES` = 256）を
-// 消費していたため、同一ラベルを大量に持つ参照テーブルを `IN` の内側に
-// 指定するだけで、実質的な distinct 値が 1 個しかなくても資源上限
-// エラー（54000）になり得た（多数の重複値 × `LIMIT` 256 超で誤失敗）。
-// 同一値 1,000 件でも成功し、distinct 値 257 件（256 を 1 件超過）でのみ
-// 資源上限エラーになることを固定する。
-
+// 同じ値の内側行が何件あっても distinct 値予算を消費するのは 1 件分だけ
+// （重複除去は予算消費より前）。同一値 1,000 件でも成功する。
 #[test]
-fn in_subquery_duplicate_values_do_not_exhaust_leaf_budget() {
+fn in_subquery_duplicate_values_do_not_exhaust_value_budget() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
     insert_allowed_lang(&core, &ctx, 0, "ja");
-    // `sql::subquery::MAX_SUBQUERY_IN_LEAVES`（256）を大幅に超える件数の
-    // 同一値（"ja"）を用意する。重複排除が働かなければ、以前の実装では
-    // 257 件目で資源上限エラーになっていた。
     for i in 1..1_000u64 {
         insert_allowed_lang(&core, &ctx, i, "ja");
     }
@@ -572,36 +667,6 @@ fn in_subquery_duplicate_values_do_not_exhaust_leaf_budget() {
         ),
     );
     assert_eq!(ids, vec![1]);
-}
-
-#[test]
-fn in_subquery_distinct_values_exceeding_limit_is_rejected() {
-    let (core, path) = new_core();
-    let _guard = CleanupGuard(path);
-    let ctx = ctx_for("tenant-a");
-    insert_doc(&core, &ctx, 1, "en");
-    // `sql::subquery::MAX_SUBQUERY_IN_LEAVES`（256）をちょうど 1 件超える
-    // distinct 値（257 件）を用意する。重複排除後の distinct 数自体が
-    // 上限を超えるため、資源上限エラーになることを確認する（重複排除の
-    // 有無に関わらず拒否されるべきケース。上の
-    // `in_subquery_duplicate_values_do_not_exhaust_leaf_budget` と対比）。
-    let distinct_count = 257u64;
-    for i in 0..distinct_count {
-        insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
-    }
-
-    let err = expect_error_code(
-        &core,
-        &ctx,
-        &format!(
-            "SELECT id FROM {DOCS} WHERE lang IN \
-             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {distinct_count}) LIMIT 100"
-        ),
-    );
-    assert!(matches!(
-        err,
-        engine::sql::allowlist::SqlSurfaceError::PayloadTooLarge { .. }
-    ));
 }
 
 // PR #1103 追加 codex-review P1 指摘の回帰テスト: 対象列が ENUM の場合、

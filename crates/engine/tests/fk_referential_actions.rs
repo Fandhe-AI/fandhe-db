@@ -1105,7 +1105,7 @@ fn referential_action_check_evaluation_error_uses_same_sqlstate_as_normal_write_
             &alice,
             "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'"
         ),
-        "22000"
+        "22012"
     );
     // fail-closed: 副作用ゼロ（親行も子行も変化しない）。
     assert_eq!(row_count(&core, &alice, "parents"), 1);

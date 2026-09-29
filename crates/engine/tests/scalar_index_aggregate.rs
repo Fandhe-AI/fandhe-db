@@ -211,7 +211,7 @@ fn where_conjunction_cold_hot_equivalence() {
 // --- 契約 3: 残余述語・選択度超過は索引を使わず結果・エラー契約とも不変 ----
 
 #[test]
-fn residual_expression_error_still_fails_closed_with_22000() {
+fn residual_expression_error_still_fails_closed_with_22012() {
     let path = unique_db_path("scalar-index-aggregate-residual-error");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -224,7 +224,7 @@ fn residual_expression_error_still_fails_closed_with_22000() {
     let err = core
         .execute_sql(&ctx("tenant-a"), sql)
         .expect_err("division-by-zero predicate must fail closed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 }
 
 #[test]

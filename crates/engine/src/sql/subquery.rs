@@ -33,14 +33,18 @@
 //! - 内側の可視行数は [`crate::core::MAX_SEARCH_K`] を超えたら `54000`
 //!   （内側の `LIMIT` 自体の範囲検証は `bind_scan` の既存契約に委ねた上での
 //!   追加の防御的上限）。
-//! - `IN (SELECT ...)` が内側の各行を `WherePredicate::Equality`／
-//!   `BoolEquality` 葉へ展開して `Or` に束ねる件数は、構文解析段の
-//!   `MAX_WHERE_LEAVES`（通常の `WHERE` 述語 1 個を 1 葉と数える）とは独立の
-//!   経路で生成されるため、[`MAX_SUBQUERY_IN_LEAVES`]（文全体で共有する
-//!   `&mut usize` 予算）で総生成数を頭打ちにする（PR #1103 codex-review P1
-//!   指摘対応。内側最大可視行数 [`crate::core::MAX_SEARCH_K`] ×
-//!   [`MAX_SUBQUERY_EXECUTIONS`] の組合せだけでは、既存の `WHERE` 述語数上限
-//!   より 2 桁以上大きい評価コストを 1 文から発生させられた）。
+//! - `IN (SELECT ...)` は内側の distinct 値（TEXT／ENUM 対象）を
+//!   [`crate::declarative_filter::MAX_IN_LIST_ITEMS`] 件以下のチャンクへ分け、
+//!   チャンクごとの `WherePredicate::InList`（既存評価器の集合照合＝ソート済み
+//!   `Vec` の二分探索）を `Or` に束ねる。取り込める distinct 値の総数は
+//!   [`MAX_SUBQUERY_IN_VALUES`]（文全体で共有する `&mut usize` 予算）で頭打ちに
+//!   し、distinct 化の後・チャンク（`InList`）構築の前に一括で検査する。収集 Vec
+//!   は内側結果行数 ≤ `MAX_SEARCH_K` で有界（Issue #1165。旧方式は
+//!   値ごとの `Equality` 葉を 256 個までしか許さず、評価も葉数に比例した。
+//!   PR #1103 codex-review P1 指摘対応の趣旨〔サブクエリ経由の展開が通常の
+//!   `WHERE` 句より大きな評価コストを発生させない〕は、評価コストを分岐数
+//!   ×二分探索へ有界化することで維持する）。BOOLEAN 対象は distinct が高々 2
+//!   のため従来どおり `BoolEquality` の `Or` とする。
 //! - `EXISTS (SELECT ...)` は可視行が 1 件以上存在するかどうかしか使わない
 //!   ため、[`InnerScanIntent::ExistenceOnly`] で内側を実質 `LIMIT 1`・投影
 //!   不要へ差し替えて評価する（`WHERE`・RLS の適用は変更しない＝可視性判定
@@ -80,13 +84,18 @@ use crate::policy::PolicyContext;
 pub(crate) const MAX_SUBQUERY_EXECUTIONS: usize = 16;
 
 /// 1 文（トップレベル実行 1 回。ネストしたサブクエリを含む）あたりに
-/// `IN (SELECT ...)` の展開で生成できる `WherePredicate` 葉（`Equality`／
-/// `BoolEquality`）の総数（実装既定値。PR #1103 codex-review P1 指摘対応）。
-/// 通常の `WHERE` 述語の葉数上限
-/// （`crate::declarative_filter::MAX_METADATA_FILTERS`）と同じ規模に揃える
-/// ことで、サブクエリ経由の展開が通常の `WHERE` 句より大きな評価コストを
-/// 発生させないようにする。
-pub(crate) const MAX_SUBQUERY_IN_LEAVES: usize = crate::declarative_filter::MAX_METADATA_FILTERS;
+/// `IN (SELECT ...)` の集合照合へ取り込める distinct 値の総数（実装既定値。
+/// Issue #1165・SQL-29・TASK-213。PR #1103 codex-review P1 指摘対応で導入した
+/// 旧「葉数」予算〔256〕の見直し）。
+///
+/// 値は [`crate::declarative_filter::MAX_IN_LIST_ITEMS`] 件ずつのチャンクへ
+/// 分割し、各チャンクを既存の `InList`（束縛時にソート・重複除去済みの
+/// `FilterOp::InText`、評価は二分探索）へ束縛するため、1 行あたりの評価コストは
+/// 「分岐数 × O(log 256)」で、旧方式（distinct 値ごとの `Equality` 葉を線形に
+/// 走査）の O(値数) より小さい。内側 1 回の可視行数は既に
+/// [`crate::core::MAX_SEARCH_K`] で頭打ちのため、単一の `IN` サブクエリは
+/// この上限に到達しない（複数の `IN` の distinct 合計のみが上限に効く）。
+pub(crate) const MAX_SUBQUERY_IN_VALUES: usize = crate::core::MAX_SEARCH_K;
 
 /// `where_predicates`（トップレベルの述語列。`WherePredicate::Or` の分岐も
 /// 再帰的に辿る）に含まれる `InSubquery`／`Exists` をすべて解決し、具体的な
@@ -103,8 +112,8 @@ pub(crate) const MAX_SUBQUERY_IN_LEAVES: usize = crate::declarative_filter::MAX_
 ///
 /// `budget` は呼び出し階層全体（ネストしたサブクエリを含む）で共有する残り
 /// 実行回数。呼び出し元は [`MAX_SUBQUERY_EXECUTIONS`] で初期化する。
-/// `in_leaf_budget` も同様に呼び出し階層全体で共有する、`IN` 展開で生成
-/// できる残り葉数。呼び出し元は [`MAX_SUBQUERY_IN_LEAVES`] で初期化する。
+/// `in_value_budget` も同様に呼び出し階層全体で共有する、`IN` 展開で生成
+/// できる残り distinct 値数。呼び出し元は [`MAX_SUBQUERY_IN_VALUES`] で初期化する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_where_predicates(
     predicates: Vec<WherePredicate>,
@@ -114,7 +123,7 @@ pub(crate) fn resolve_where_predicates(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
     budget: &mut usize,
-    in_leaf_budget: &mut usize,
+    in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, crate::sql::allowlist::SqlSurfaceError> {
     let mut out = Vec::with_capacity(predicates.len());
     for predicate in predicates {
@@ -130,7 +139,7 @@ pub(crate) fn resolve_where_predicates(
                         lookup,
                         udfs,
                         budget,
-                        in_leaf_budget,
+                        in_value_budget,
                     )?);
                 }
                 out.push(WherePredicate::Or(resolved_branches));
@@ -150,7 +159,7 @@ pub(crate) fn resolve_where_predicates(
                     lookup,
                     udfs,
                     budget,
-                    in_leaf_budget,
+                    in_value_budget,
                 )?;
                 out.push(resolved);
             }
@@ -166,7 +175,7 @@ pub(crate) fn resolve_where_predicates(
                     lookup,
                     udfs,
                     budget,
-                    in_leaf_budget,
+                    in_value_budget,
                 )?;
                 if !exists {
                     // 常に偽: 分岐 0 個の `Or` は `where_tree::BoundOrGroup::matches`
@@ -228,7 +237,7 @@ fn execute_inner_scan(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
     budget: &mut usize,
-    in_leaf_budget: &mut usize,
+    in_value_budget: &mut usize,
 ) -> Result<super::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
     use crate::sql::allowlist::SqlSurfaceError;
 
@@ -312,7 +321,7 @@ fn execute_inner_scan(
         lookup,
         udfs,
         budget,
-        in_leaf_budget,
+        in_value_budget,
     )?;
 
     if intent == InnerScanIntent::ExistenceOnly {
@@ -447,47 +456,20 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
     }
 }
 
-/// [`resolve_in_subquery`] が展開済みの葉と重複判定するための正規化キー
-/// （Cursor Bugbot 指摘対応。`IN` は集合所属であり、同じ値の行が何件
-/// 内側にあっても展開後の述語は 1 個で足りる）。`cell_to_equality_predicate`
-/// が返しうるのは `Equality`（`TEXT`／`ENUM` 列。ラベル文字列をキーにする）・
-/// `BoolEquality`（`BOOLEAN` 列。真偽値をキーにする）のいずれかのみ
-/// （[`inner_value_family`] が事前にこの 2 種類だけを許可する）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum InSubqueryDedupKey {
-    Text(String),
-    Bool(bool),
-}
-
 /// `<column> IN (SELECT ...)` を解決する。内側は投影列がちょうど 1 列である
 /// ことを要求し（`22000`）、[`validate_in_target_column`] で対象列
 /// `column`（外側スキーマ）を検証した上で、内側の投影列の値族
 /// （[`inner_value_family`]）が対象列の値族（[`outer_value_family`]）と
 /// 一致することを検証する（内側の結果行数・値に一切依存しない静的な検証。
-/// PR #1103 追加 codex-review P1 指摘対応: `TEXT`↔`TEXT`・`ENUM`↔`TEXT`・
-/// `BOOLEAN`↔`BOOLEAN` 等、既存の等価述語の型規則と同じ組合せのみを展開
-/// 対象にし、それ以外は `22000` で拒否する）。適合を確認した上で、各行の
-/// セルを [`cell_to_equality_predicate`] で `<column> = <値>` 相当の葉へ
-/// 変換し `WherePredicate::Or` として束ねる（0 行なら空の `Or` ＝常に偽）。
+/// PR #1103 追加 codex-review P1 指摘対応）。適合を確認した上で、
+/// TEXT／ENUM 対象は distinct 値を集めて [`build_in_set_predicate`] の
+/// チャンク化 `InList` の `Or` へ、BOOLEAN 対象は `BoolEquality` の `Or` へ
+/// 書き換える（0 行・NULL のみなら空の `Or` ＝常に偽）。
 ///
-/// `IN` は集合所属の判定であり同じ値の重複は結果に影響しないため、
-/// [`InSubqueryDedupKey`] で正規化した値ごとに高々 1 個の葉だけを生成する
-/// （Cursor Bugbot 指摘対応: 以前は内側の行ごとに無条件で葉を積み・葉予算を
-/// 消費していたため、同一ラベルを大量に持つ参照テーブル〔例: 同じラベルが
-/// 257 件〕を `IN` の内側に指定するだけで、実質的な distinct 値が 1 個しか
-/// なくても [`MAX_SUBQUERY_IN_LEAVES`] を使い切って `54000` になり得た）。
-/// 重複排除の集合は「予算内で採用した distinct 値」だけを保持するため
-/// （`in_leaf_budget` を消費した値のみ `seen` へ追加する）、集合自体のサイズは
-/// [`MAX_SUBQUERY_IN_LEAVES`] で自然に有界となる（別途上限を設けない）。
-/// NULL（`cell_to_equality_predicate` が `None` を返す）・語彙外 ENUM ラベル
-/// の除外は重複排除より前に行い、これらは重複排除・葉予算のいずれも
-/// 消費しない（既存の扱いを維持）。
-///
-/// `in_leaf_budget` は文全体で共有する残り葉数予算（[`MAX_SUBQUERY_IN_LEAVES`]
-/// 参照）。distinct 値ごとに 1 消費し、枯渇したら `54000` で拒否する
-/// （PR #1103 codex-review P1 指摘対応: 内側最大可視行数×内側実行回数上限の
-/// 組合せだけでは、通常の `WHERE` 述語数上限より大きな評価コストを 1 文から
-/// 発生させられた）。
+/// NULL・語彙外 ENUM ラベルの除外は重複除去より前に行い、いずれも予算を
+/// 消費しない。`in_value_budget` は文全体で共有する残り distinct 値予算
+/// （[`MAX_SUBQUERY_IN_VALUES`] 参照）で、枯渇したら `54000` で拒否する
+/// （Issue #1165・SQL-29・TASK-213）。
 #[allow(clippy::too_many_arguments)]
 fn resolve_in_subquery(
     column: &str,
@@ -499,7 +481,7 @@ fn resolve_in_subquery(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
     budget: &mut usize,
-    in_leaf_budget: &mut usize,
+    in_value_budget: &mut usize,
 ) -> Result<WherePredicate, crate::sql::allowlist::SqlSurfaceError> {
     use crate::sql::allowlist::SqlSurfaceError;
 
@@ -512,7 +494,7 @@ fn resolve_in_subquery(
         lookup,
         udfs,
         budget,
-        in_leaf_budget,
+        in_value_budget,
     )?;
     if result.columns.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
@@ -544,57 +526,110 @@ fn resolve_in_subquery(
         }
     }
 
-    let mut branches = Vec::with_capacity(result.rows.len());
-    let mut seen: std::collections::HashSet<InSubqueryDedupKey> = std::collections::HashSet::new();
-    for row in &result.rows {
-        let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
-            detail: "subquery row missing projected cell".to_string(),
-        })?;
-        let Some(leaf) = cell_to_equality_predicate(column, cell)? else {
-            // NULL セルは照合から除く（`WherePredicate::InSubquery` ドキュメント・
-            // NULL の意味論参照）。
-            continue;
-        };
-        // 対象列が ENUM の場合、内側の値が語彙外のラベルなら「その値には
-        // 一致しない（fail-closed に文全体を落とさない）」として展開対象
-        // から除外する（PR #1103 追加 codex-review P1 指摘対応）。除外せず
-        // `Equality` 葉として残すと、後段の
-        // `declarative_filter::DeclarativeFilter::bind` が語彙外ラベルを
-        // `22000` で拒否し、外側 ENUM の語彙にない値が内側に 1 件でも
-        // 混じるだけで `IN` 全体（照合不一致になるべき箇所）が失敗して
-        // しまう。語彙外の値は葉予算（`in_leaf_budget`）も消費しない。
-        if let (ColumnType::Enum(def), WherePredicate::Equality { value, .. }) = (target_ty, &leaf)
-        {
-            if !def.contains(value) {
-                continue;
+    match outer_family {
+        SubqueryValueFamily::Text => {
+            // NULL・語彙外 ENUM ラベルは照合から除き、予算も消費しない。
+            let mut values: Vec<String> = Vec::new();
+            for row in &result.rows {
+                let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "subquery row missing projected cell".to_string(),
+                })?;
+                let value = match cell_to_equality_predicate(column, cell)? {
+                    // NULL セルは照合から除く（`WherePredicate::InSubquery`
+                    // ドキュメント・NULL の意味論参照）。
+                    None => continue,
+                    Some(WherePredicate::Equality { value, .. }) => value,
+                    Some(_) => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail:
+                                "cell_to_equality_predicate returned an unexpected predicate variant"
+                                    .to_string(),
+                        });
+                    }
+                };
+                // 対象列が ENUM の場合、語彙外ラベルは「その値には一致しない」
+                // として除外する（除外しないと後段の束縛が 22P02 で文全体を
+                // 落とす。PR #1103 追加 codex-review P1 指摘対応）。
+                if let ColumnType::Enum(def) = target_ty {
+                    if !def.contains(&value) {
+                        continue;
+                    }
+                }
+                values.push(value);
             }
+            // 重複除去（IN は集合所属であり重複は結果に影響しない。Cursor
+            // Bugbot 指摘対応）。予算は distinct 値単位で消費する。
+            values.sort_unstable();
+            values.dedup();
+            *in_value_budget = in_value_budget.checked_sub(values.len()).ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(format!(
+                    "subquery IN distinct value count exceeds limit {MAX_SUBQUERY_IN_VALUES}"
+                ))
+            })?;
+            Ok(build_in_set_predicate(column, values))
         }
-        // 重複排除（Cursor Bugbot 指摘対応。[`InSubqueryDedupKey`] ドキュメント
-        // 参照）。同じ正規化値が既に採用済みなら、葉予算を消費せず展開対象
-        // からも除外する（`IN` は集合所属であり同じ値の 2 個目以降の葉は
-        // 冗長）。`inner_value_family` の事前検証により、ここへ到達する
-        // `leaf` は必ず `Equality`／`BoolEquality` のいずれかである。
-        let dedup_key = match &leaf {
-            WherePredicate::Equality { value, .. } => InSubqueryDedupKey::Text(value.clone()),
-            WherePredicate::BoolEquality { value, .. } => InSubqueryDedupKey::Bool(*value),
-            _ => {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "cell_to_equality_predicate returned an unexpected predicate variant"
-                        .to_string(),
-                });
+        SubqueryValueFamily::Boolean => {
+            // distinct は高々 2（true／false）。
+            let mut seen: std::collections::HashSet<bool> = std::collections::HashSet::new();
+            let mut branches = Vec::with_capacity(2);
+            for row in &result.rows {
+                let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "subquery row missing projected cell".to_string(),
+                })?;
+                match cell_to_equality_predicate(column, cell)? {
+                    None => continue,
+                    Some(leaf @ WherePredicate::BoolEquality { value, .. }) => {
+                        if !seen.insert(value) {
+                            continue;
+                        }
+                        *in_value_budget = in_value_budget.checked_sub(1).ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large(format!(
+                                "subquery IN distinct value count exceeds limit \
+                                 {MAX_SUBQUERY_IN_VALUES}"
+                            ))
+                        })?;
+                        branches.push(vec![leaf]);
+                    }
+                    Some(_) => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail:
+                                "cell_to_equality_predicate returned an unexpected predicate variant"
+                                    .to_string(),
+                        });
+                    }
+                }
             }
-        };
-        if !seen.insert(dedup_key) {
-            continue;
+            Ok(WherePredicate::Or(branches))
         }
-        *in_leaf_budget = in_leaf_budget.checked_sub(1).ok_or_else(|| {
-            SqlSurfaceError::payload_too_large(format!(
-                "subquery IN expansion leaf count exceeds limit {MAX_SUBQUERY_IN_LEAVES}"
-            ))
-        })?;
-        branches.push(vec![leaf]);
     }
-    Ok(WherePredicate::Or(branches))
+}
+
+/// ソート・重複除去済みの distinct 値 `values`（TEXT／ENUM 対象列 `column`）を、
+/// [`crate::declarative_filter::MAX_IN_LIST_ITEMS`] 件以下のチャンクごとの
+/// `WherePredicate::InList` を分岐とする `Or` へ変換する（Issue #1165）。
+///
+/// 各チャンクは既存経路（`sql::parser::declarative_leaf_to_filter` →
+/// `DeclarativeFilter::in_list` → `FilterOp::InText`）でソート済み集合の二分
+/// 探索へ束縛されるため、第 2 の評価器は作らない。`bind` 側の
+/// `MAX_IN_LIST_ITEMS` 検査（NoSQL 表層と共有する事前防御点）はチャンク幅で
+/// 満たすので緩めない。常に `Or` で包む（1 チャンクでも）ことで、計画形状
+/// （`scalar_plan` は `Or` を含む文を `PlainScan` に固定する）を内側データ量へ
+/// 依存させない。0 件は分岐 0 個の `Or`（常に偽・`has_where_filters()` は真）。
+fn build_in_set_predicate(column: &str, values: Vec<String>) -> WherePredicate {
+    let chunk_size = crate::declarative_filter::MAX_IN_LIST_ITEMS;
+    let mut branches = Vec::with_capacity(values.len().div_ceil(chunk_size));
+    let mut iter = values.into_iter();
+    loop {
+        let chunk: Vec<String> = iter.by_ref().take(chunk_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        branches.push(vec![WherePredicate::InList {
+            column: column.to_string(),
+            values: chunk,
+        }]);
+    }
+    WherePredicate::Or(branches)
 }
 
 /// `EXISTS (SELECT ...)` を解決し、可視行が 1 件以上存在するかどうかを返す。
@@ -610,7 +645,7 @@ fn resolve_exists_subquery(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
     budget: &mut usize,
-    in_leaf_budget: &mut usize,
+    in_value_budget: &mut usize,
 ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
     let result = execute_inner_scan(
         inner_tokens,
@@ -621,7 +656,7 @@ fn resolve_exists_subquery(
         lookup,
         udfs,
         budget,
-        in_leaf_budget,
+        in_value_budget,
     )?;
     Ok(!result.rows.is_empty())
 }
@@ -751,7 +786,7 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
         let udfs = UdfRegistry::default();
         let mut budget = MAX_SUBQUERY_EXECUTIONS;
-        let mut in_leaf_budget = MAX_SUBQUERY_IN_LEAVES;
+        let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
         let inner_tokens =
             super::super::lexer::tokenize("SELECT * FROM docs LIMIT 500").expect("tokenize");
 
@@ -764,7 +799,7 @@ mod tests {
             &storage,
             &udfs,
             &mut budget,
-            &mut in_leaf_budget,
+            &mut in_value_budget,
         )
         .expect("existence-only scan should succeed");
 
@@ -803,7 +838,7 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
         let udfs = UdfRegistry::default();
         let mut budget = MAX_SUBQUERY_EXECUTIONS;
-        let mut in_leaf_budget = MAX_SUBQUERY_IN_LEAVES;
+        let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
         let inner_tokens = super::super::lexer::tokenize("SELECT embedding FROM docs LIMIT 500")
             .expect("tokenize");
 
@@ -816,7 +851,7 @@ mod tests {
             &storage,
             &udfs,
             &mut budget,
-            &mut in_leaf_budget,
+            &mut in_value_budget,
         )
         .expect("values scan should succeed");
 
@@ -830,5 +865,40 @@ mod tests {
             5,
             "all 5 visible rows must be returned (LIMIT 500 > 5)"
         );
+    }
+
+    /// Issue #1165: [`build_in_set_predicate`] のチャンク化（0 件は空の `Or`、
+    /// 256 件以下は 1 分岐、超過分は次の分岐へ。全要素が欠落・重複なく保たれる。
+    /// distinct 値予算〔`MAX_SUBQUERY_IN_VALUES`〕の消費・超過拒否は
+    /// `tests/sql29_subquery.rs`・`tests/rls10_relational_paths.rs` が固定する）。
+    #[test]
+    fn build_in_set_predicate_chunks_by_max_in_list_items() {
+        let max = crate::declarative_filter::MAX_IN_LIST_ITEMS;
+        for (n, expected_branches) in [
+            (0usize, 0usize),
+            (1, 1),
+            (max, 1),
+            (max + 1, 2),
+            (2 * max, 2),
+            (2 * max + 1, 3),
+        ] {
+            let values: Vec<String> = (0..n).map(|i| format!("v{i:05}")).collect();
+            let WherePredicate::Or(branches) = build_in_set_predicate("lang", values.clone())
+            else {
+                panic!("must be Or");
+            };
+            assert_eq!(branches.len(), expected_branches, "n={n}");
+            let mut merged = Vec::new();
+            for branch in branches {
+                assert_eq!(branch.len(), 1);
+                let WherePredicate::InList { column, values } = &branch[0] else {
+                    panic!("branch must be InList");
+                };
+                assert_eq!(column, "lang");
+                assert!(values.len() <= max && !values.is_empty());
+                merged.extend(values.iter().cloned());
+            }
+            assert_eq!(merged, values, "n={n}");
+        }
     }
 }

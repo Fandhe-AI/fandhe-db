@@ -76,10 +76,17 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 解決結果は既存の `WherePredicate` へ書き換える（新しい評価器を
 `sql::where_tree` に追加しない）:
 
-- `IN`: 内側の各行のセルを `<column> = <値>` 相当の葉（`Equality`／
-  `BoolEquality`）へ変換し、`WherePredicate::Or(branches)` として束ねる
-  （0 行なら `Or(vec![])` ＝ `where_tree::BoundOrGroup::matches` が必ず
-  `false` を返す。TASK-208 で確立済みの意味論をそのまま利用）。
+- `IN`（TEXT／ENUM 対象列）: 内側の非 NULL・語彙内の値をソート・重複除去し、
+  `declarative_filter::MAX_IN_LIST_ITEMS`（256）件以下のチャンクごとの
+  `WherePredicate::InList` を分岐とする `Or` へ束ねる（Issue #1165）。各チャンクは
+  既存経路（`DeclarativeFilter::in_list` → `FilterOp::InText`）でソート済み集合の
+  二分探索に束縛される＝集合照合（第 2 の評価器なし）。1 チャンクでも必ず `Or` で
+  包み、0 件は `Or(vec![])`（`where_tree::BoundOrGroup::matches` が必ず `false`
+  を返す。TASK-208 で確立済みの意味論）。`Or` を含む文は
+  `scalar_plan::classify_scalar_plan` が一律 `PlainScan` にするため、計画形状は
+  内側データ量に依存せず `scalar_index_prune` にも影響しない。
+- `IN`（BOOLEAN 対象列）: distinct は高々 2 のため従来どおり `BoolEquality` 葉の
+  `Or`。
 - `EXISTS`: 真なら述語自体を追加しない（制約を課さない）、偽なら
   `Or(vec![])`（常に偽）。
 
@@ -96,18 +103,28 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
   カウンタで検査。ネスト深さと組み合わせて評価コストを有界にする）。
 - 内側の可視結果行数: `core::MAX_SEARCH_K`（10,000）超過は `54000`
   （内側 `LIMIT` の範囲検証とは独立の追加防御）。
-- `IN (SELECT ...)` の展開葉数: `sql::subquery::MAX_SUBQUERY_IN_LEAVES`
-  （`declarative_filter::MAX_METADATA_FILTERS` と同じ 256。文全体で共有する
-  `&mut usize` 予算で検査し、超過は `54000`。内側可視行数×実行回数上限の
-  組合せだけでは通常の `WHERE` 述語数上限より大きい評価コストを 1 文から
-  発生させられたため、PR #1103 codex-review 指摘対応で追加した）。この予算は
-  内側の**行**単位ではなく正規化した**distinct 値**単位で消費する
-  （`IN` は集合所属の判定であり、同じ値の重複行は展開後 1 個の述語で足りる。
-  Cursor Bugbot 指摘対応: 以前は行ごとに無条件で葉を積み予算を消費していた
-  ため、同一ラベルを大量に持つ参照テーブルを内側に指定するだけで、
-  distinct 値が 1 個でも `LIMIT` 256 超で誤って `54000` になり得た。NULL・
-  語彙外 ENUM ラベルの除外は重複排除より前に行い、いずれも予算を消費しない
-  既存の扱いを維持する）。
+- `IN (SELECT ...)` の distinct 値数: `sql::subquery::MAX_SUBQUERY_IN_VALUES`
+  （`core::MAX_SEARCH_K` と同じ 10,000。Issue #1165 で旧 256 葉上限〔PR #1103
+  codex-review 指摘対応で導入〕から集合照合方式へ見直して引き上げ。文全体で共有する
+  `&mut usize` 予算で検査し、超過は `54000`。distinct 化の後・チャンク構築の**前**に
+  distinct 値数を `checked_sub` で一括消費する）。予算は内側の**行**単位ではなく
+  **distinct 値**単位で消費する（重複行は 1 件分。NULL・語彙外 ENUM ラベルは
+  重複除去より前に除外し予算を消費しない。Cursor Bugbot 指摘対応の維持）。
+  内側 1 回の可視行数は既に 10,000 で頭打ちのため、単一の `IN` サブクエリは実質
+  上限なしで、複数の `IN` の distinct 合計のみが上限に効く。
+  - 1 行あたり評価コスト: 分岐数（≤ ⌈10,000/256⌉ = 40 ＋ `IN` サイト数 ≤ 実行回数
+    上限 16）× 二分探索（≤ 8 比較）≒ 最悪 450 比較。旧方式は最悪 256 比較で、
+    同じ 10,000 値を旧方式で許すと 10,000 比較/行になる。集合サイズに対し
+    線形以下（分岐数は N/256 に比例、各分岐は対数）。
+  - 束縛時コスト: チャンクごとのソート O(k log k)・合計 O(N log N)。メモリは
+    distinct 値 1 コピー（内側 `execute_scan` の結果〔各 ≤ `MAX_SCAN_RESULT_BYTES`、
+    実行 ≤ 16 回〕以下）。
+  - 実行回数上限（16）・内側可視行数上限（10,000）との組合せ: 最悪でも文全体の
+    distinct 合計は 10,000 で有界（実行 16 回 × 10,000 行でも予算が先に尽きる）。
+  - 不採用案: (1) 単一集合述語の新 `WherePredicate` variant（O(log N) 化できるが
+    `pub enum` の網羅 match が多数あり BREAKING CHANGE になるため見送り）。
+    (2) `bind_impl` の `MAX_IN_LIST_ITEMS` 検査の緩和・迂回（公開 API・NoSQL 表層と
+    共有する事前防御点を弱めるため不可。チャンク幅で満たす）。
 - `IN (SELECT ...)` の対象列（外側スキーマ）の存在・型検証は、内側の結果
   行数（0 行・NULL のみを含む）に関わらず必ず行う（PR #1103 codex-review
   指摘対応: 以前は変換後の葉が実際に束縛される時点でしか検証されず、内側が
@@ -236,5 +253,6 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 - 拡張クエリプロトコル経由のサブクエリ・Describe 対応
 - `NOT IN`・`NOT EXISTS`（#913 の `NOT` 対応に依存）
 - ランキング付き検索 SELECT（外側）でのサブクエリ対応
-- サブクエリ述語に対するスカラー二次索引の最適化（現状は `PlainScan` 相当のまま）
+- サブクエリ述語に対するスカラー二次索引の最適化（現状は `PlainScan` 相当のまま。
+  チャンク化 `InList` への `IndexInList` 適用による候補削減も同様に対象外）
 - 性能の実測（受け入れ基準未設定）

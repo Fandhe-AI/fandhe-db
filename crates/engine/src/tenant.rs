@@ -368,7 +368,7 @@ pub enum TenantWriteError {
     /// `XX000`（内部事象）へ丸めていたが、`sql::check_constraint::CompiledChecks::
     /// enforce` が式（`sql::expr_program::ExprProgram`。`WHERE`／`SELECT` と共有
     /// する同一コンパイラ）を評価して得た [`SqlSurfaceError`] をそのまま保持し、
-    /// 通常の式評価と同じ `wire_code`（0 除算・非有限値は `22000`、`NUMERIC`
+    /// 通常の式評価と同じ `wire_code`（0 除算は `22012`、非有限値・`NUMERIC`
     /// 関数の桁あふれは `22003` 等）で返す。カタログ改変・実装不整合による
     /// 再束縛失敗（漂流）は本 variant ではなく引き続き
     /// [`TenantWriteError::Catalog`]（`CorruptSchema`。`XX000`）が担う。
@@ -1479,6 +1479,69 @@ pub(crate) fn upsert_typed_rows_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<UpsertOutcome, TenantWriteError> {
+    upsert_typed_rows_impl(
+        storage,
+        table,
+        ctx,
+        insert_visibility,
+        rows,
+        target,
+        action,
+        ledger_write,
+        expected_schema,
+        None,
+    )
+}
+
+/// [`upsert_typed_rows_unchecked`] の `RETURNING` 版（Issue #1182・SQL-21）。
+/// `project` は変更した各行を `VALUES` の記述順に 1 回ずつ呼ぶ——新規挿入行は
+/// 挿入した値、`DO UPDATE` 行は更新後の値（いずれも書いた値そのもの）。
+/// `DO NOTHING` で衝突し何も変えなかった行では呼ばない（PostgreSQL と同じ）。
+/// 契約（commit 成功境界・制約検査との優先順位）は
+/// [`delete_rows_where_capturing_unchecked`] と同一。`sql::exec::
+/// execute_upsert_returning` の唯一の到達経路。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_typed_rows_capturing_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    insert_visibility: crate::storage::Visibility,
+    rows: &[(u64, &[crate::row_codec::Value])],
+    target: &UpsertTarget<'_>,
+    action: &UpsertAction<'_>,
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    project: &mut ReturningProjectFn<'_>,
+) -> Result<UpsertOutcome, TenantWriteError> {
+    upsert_typed_rows_impl(
+        storage,
+        table,
+        ctx,
+        insert_visibility,
+        rows,
+        target,
+        action,
+        ledger_write,
+        expected_schema,
+        Some(project),
+    )
+}
+
+/// [`upsert_typed_rows_unchecked`]・[`upsert_typed_rows_capturing_unchecked`] の
+/// 共有実体（`project: None` は前者とビット同一）。
+#[allow(clippy::too_many_arguments)]
+fn upsert_typed_rows_impl(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    insert_visibility: crate::storage::Visibility,
+    rows: &[(u64, &[crate::row_codec::Value])],
+    target: &UpsertTarget<'_>,
+    action: &UpsertAction<'_>,
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+) -> Result<UpsertOutcome, TenantWriteError> {
     validate_identifier(table)?;
     if rows.is_empty() {
         return Ok(UpsertOutcome::default());
@@ -1865,6 +1928,17 @@ pub(crate) fn upsert_typed_rows_unchecked(
                         row_table
                             .insert(key, encoded.as_slice())
                             .map_err(CatalogError::from)?;
+                        // `RETURNING`（Issue #1182）: 更新後の値を投影する。
+                        if let Some(project) = project.as_mut() {
+                            let values =
+                                captured_values_from_parts(&schema, embedding_value, &metadata)?;
+                            project(&CapturedRow {
+                                id: write_id,
+                                tenant_id: ctx.tenant_id().to_string(),
+                                visibility: existing.visibility,
+                                values,
+                            })?;
+                        }
                         updated = updated.checked_add(1).ok_or_else(|| {
                             TenantWriteError::Storage(StorageError::Codec(
                                 "upsert updated row counter overflow".to_string(),
@@ -1902,6 +1976,17 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 };
                 let encoded = encode_row(&row)?;
                 insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+                // `RETURNING`（Issue #1182）: 挿入した値を投影する。
+                if let Some(project) = project.as_mut() {
+                    let values =
+                        captured_values_from_parts(&schema, embedding.to_vec(), &metadata)?;
+                    project(&CapturedRow {
+                        id: *id,
+                        tenant_id: ctx.tenant_id().to_string(),
+                        visibility: insert_visibility,
+                        values,
+                    })?;
+                }
                 inserted = inserted.checked_add(1).ok_or_else(|| {
                     TenantWriteError::Storage(StorageError::Codec(
                         "upsert inserted row counter overflow".to_string(),
@@ -2670,9 +2755,44 @@ pub(crate) fn update_row_columns_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<usize, TenantWriteError> {
+    update_row_columns_capturing_unchecked(
+        storage,
+        table,
+        ctx,
+        id,
+        assignments,
+        ledger_write,
+        expected_schema,
+        None,
+    )
+}
+
+/// [`update_row_columns_unchecked`] の `RETURNING` 版（Issue #1182・SQL-21）。
+/// `project` が `Some` かつ対象行を実際に更新した場合のみ、**更新後**の行内容を
+/// [`CapturedRow`] として組み立て、制約検査（`enforce_row_constraints_in_txn`・
+/// `enforce_referencing_rows_in_txn`）の後・`bump_table_generation_in_txn`／
+/// commit の**前**に 1 回だけ `project` へ渡す（[`delete_row_impl`] の `project`
+/// と同じ commit 成功境界の契約。`Err` は `write_txn` の abort となり行変更・
+/// 台帳追記とも永続化されない）。不可視・不存在（`UPDATE 0`）では捕捉も
+/// `project` 呼び出しも行わない（内容無参照の契約〔判断 D〕を維持し、他テナント
+/// 行と不存在 id の応答差を作らない。RLS-9・RLS-10）。`project: None` は
+/// [`update_row_columns_unchecked`] とビット同一。`sql::exec::
+/// execute_update_returning` の唯一の到達経路。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_row_columns_capturing_unchecked(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+) -> Result<usize, TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let rows_affected: usize;
+    let mut captured_row: Option<CapturedRow> = None;
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         if let Some(expected) = expected_schema {
@@ -2884,6 +3004,15 @@ pub(crate) fn update_row_columns_unchecked(
                 row_table
                     .insert(key, encoded.as_slice())
                     .map_err(CatalogError::from)?;
+                // `RETURNING`（Issue #1182）: 書いた値（更新後）そのものを捕捉する。
+                if project.is_some() {
+                    captured_row = Some(CapturedRow {
+                        id,
+                        tenant_id: ctx.tenant_id().to_string(),
+                        visibility,
+                        values: captured_values_from_parts(&schema, embedding, &metadata)?,
+                    });
+                }
                 1
             }
             // 対象行が不存在、またはヘッダ検査の時点で所有・可視のいずれかを
@@ -2923,6 +3052,11 @@ pub(crate) fn update_row_columns_unchecked(
                 crate::constraint::FkCheckMode::All,
             )?;
         }
+    }
+    // `RETURNING` の投影は制約検査の後・commit の前（[`delete_row_impl`] の
+    // `project` と同じ commit 成功境界。`Err` は `write_txn` の abort）。
+    if let (Some(project), Some(captured)) = (project.as_mut(), captured_row.as_ref()) {
+        project(captured)?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
@@ -3021,9 +3155,11 @@ enum DeleteNotFoundLedger {
     Record,
 }
 
-/// `RETURNING` 句（Issue #873・SQL-21）向けに、削除**前**の行内容を捕捉した
-/// 結果（`delete_row_impl` の `capture` が `Some` かつ対象行を実際に削除した
-/// 場合のみ `Some`）。`sql::exec::execute_delete_returning` がこれを RLS 再判定
+/// `RETURNING` 句（Issue #873・#1182・SQL-21）向けに捕捉した行内容。`DELETE` は
+/// 削除**前**の値、`UPDATE`・UPSERT は書き込んだ（更新後・挿入した）値を持つ
+/// （`delete_row_impl` の `capture` が `Some` かつ対象行を実際に削除した場合、
+/// または各 `*_capturing_unchecked` の `project` へ渡す行として組み立てる）。
+/// `sql::exec::returning_collector` がこれを RLS 再判定
 /// （`PolicyContext::is_visible`）・投影へ渡す。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CapturedRow {
@@ -3031,6 +3167,42 @@ pub(crate) struct CapturedRow {
     pub tenant_id: String,
     pub visibility: crate::storage::Visibility,
     pub values: Vec<crate::row_codec::Value>,
+}
+
+/// 物理行の構成要素（`embedding`・不透明な `metadata` バイト列）から、
+/// `schema.columns` 順の `Value` 列を組み立てる（Issue #873・#1182。`RETURNING`
+/// 用の捕捉値・`FOREIGN KEY` の旧値〔pre-image〕の共通実体）。
+///
+/// `VECTOR` 列の位置は `row_codec::decode_scalar_columns` が常に `Value::Null` を
+/// 返す契約のため、`embedding` が空でない場合のみ明示的に `Value::Vector` へ
+/// 差し替える（空は列が NULL である既存契約）。デコード失敗は「既に永続化された
+/// 行、または今書いた行のデコード失敗」＝クライアント入力の不正ではなくサーバー
+/// 内部事象のため、専用 variant [`TenantWriteError::CapturedRowDecodeFailed`]
+/// （`XX000`）へ写像する（`22000` へ丸めない。codex-review P1・PR #991）。
+///
+/// 呼び出し元: [`delete_row_impl`]・[`delete_rows_where_impl`]・
+/// [`update_row_columns_capturing_unchecked`]・[`update_rows_where_impl`]・
+/// [`upsert_typed_rows_impl`]。
+fn captured_values_from_parts(
+    schema: &crate::catalog::TableSchema,
+    embedding: Vec<f32>,
+    metadata: &[u8],
+) -> Result<Vec<crate::row_codec::Value>, TenantWriteError> {
+    let mut values = crate::row_codec::decode_scalar_columns(schema, metadata).map_err(|e| {
+        TenantWriteError::CapturedRowDecodeFailed(format!("captured row decode failed: {e}"))
+    })?;
+    if !embedding.is_empty() {
+        if let Some(vec_idx) = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+        {
+            if let Some(slot) = values.get_mut(vec_idx) {
+                *slot = crate::row_codec::Value::Vector(embedding);
+            }
+        }
+    }
+    Ok(values)
 }
 
 /// [`delete_row_unchecked`]・[`delete_row_ledgered_unchecked`] が共有する実体。
@@ -3043,7 +3215,8 @@ pub(crate) struct CapturedRow {
 /// 参照）。
 ///
 /// [`DeleteCapture::project`] の関数型（clippy::type_complexity 対応で型別名化）。
-type ReturningProjectFn<'a> = dyn FnMut(&CapturedRow) -> Result<(), TenantWriteError> + 'a;
+pub(crate) type ReturningProjectFn<'a> =
+    dyn FnMut(&CapturedRow) -> Result<(), TenantWriteError> + 'a;
 
 /// `delete_row_impl` の `capture` 引数（Issue #991・clippy::too_many_arguments
 /// 対応で `capture`・`project` の 2 引数を 1 引数へ集約。両者は常に一緒に使う
@@ -3189,25 +3362,7 @@ fn delete_row_impl(
                             "captured row decode failed: {e}"
                         ))
                     })?;
-                    let mut values =
-                        crate::row_codec::decode_scalar_columns(&schema, &row.metadata).map_err(
-                            |e| {
-                                TenantWriteError::CapturedRowDecodeFailed(format!(
-                                    "captured row decode failed: {e}"
-                                ))
-                            },
-                        )?;
-                    if !row.embedding.is_empty() {
-                        if let Some(vec_idx) = schema
-                            .columns
-                            .iter()
-                            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
-                        {
-                            if let Some(slot) = values.get_mut(vec_idx) {
-                                *slot = crate::row_codec::Value::Vector(row.embedding);
-                            }
-                        }
-                    }
+                    let values = captured_values_from_parts(&schema, row.embedding, &row.metadata)?;
                     if needs_fk_removed_pre_image {
                         removed_pre_images.record(id, values.clone());
                     }
@@ -3592,7 +3747,72 @@ pub(crate) fn delete_rows_where_unchecked<E>(
     expected_schema: Option<&crate::catalog::TableSchema>,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    delete_rows_where_impl(
+        storage,
+        table,
+        ctx,
+        ledger_write,
+        content_hash_value,
+        expected_schema,
+        needs_embedding,
+        limit,
+        predicate,
+        None,
+    )
+}
+
+/// [`delete_rows_where_unchecked`] の `RETURNING` 版（Issue #1182・SQL-21）。
+/// `project` は削除**前**の各行（[`CapturedRow`]）を、`remove` が返した旧値から
+/// 組み立てて行ごとに 1 回呼ぶ（[`delete_row_impl`] の `project` と同じ commit
+/// 成功境界の契約——呼び出しは write トランザクション内・commit 前で、`Err` は
+/// abort）。呼び出し順は候補列挙順（テナント内 `id` 昇順）。制約検査より前に
+/// 呼ぶため、投影由来のエラーが制約違反より先に報告されうる（いずれも副作用
+/// ゼロ。`docs/design/sql-returning.md` 参照）。`LimitExceeded` の早期 return
+/// 経路では呼ばない。`sql::exec::execute_predicate_delete_returning` の唯一の
+/// 到達経路。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_rows_where_capturing_unchecked<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
+    predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+    project: &mut ReturningProjectFn<'_>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    delete_rows_where_impl(
+        storage,
+        table,
+        ctx,
+        ledger_write,
+        content_hash_value,
+        expected_schema,
+        needs_embedding,
+        limit,
+        predicate,
+        Some(project),
+    )
+}
+
+/// [`delete_rows_where_unchecked`]・[`delete_rows_where_capturing_unchecked`] の
+/// 共有実体（`project: None` は前者とビット同一）。
+#[allow(clippy::too_many_arguments)]
+fn delete_rows_where_impl<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
     let write_txn = storage
@@ -3656,20 +3876,29 @@ pub(crate) fn delete_rows_where_unchecked<E>(
             let removed_guard = row_table
                 .remove(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
-            if needs_fk_removed_pre_image {
+            if needs_fk_removed_pre_image || project.is_some() {
                 if let Some(guard) = removed_guard {
                     let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
                         dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
                             "removed row decode failed: {e}"
                         )))
                     })?;
-                    let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
-                        .map_err(|e| {
-                            dml_write_err(TenantWriteError::CapturedRowDecodeFailed(format!(
-                                "removed row decode failed: {e}"
-                            )))
-                        })?;
-                    removed_pre_images.record(*id, values);
+                    let values = captured_values_from_parts(&schema, row.embedding, &row.metadata)
+                        .map_err(dml_write_err)?;
+                    if needs_fk_removed_pre_image {
+                        removed_pre_images.record(*id, values.clone());
+                    }
+                    // `RETURNING`（Issue #1182）: 削除前の値。`remove` 済みだが
+                    // `write_txn` 未 commit のため、`Err` は abort で行ごと巻き戻る。
+                    if let Some(project) = project.as_mut() {
+                        project(&CapturedRow {
+                            id: *id,
+                            tenant_id: row.tenant_id,
+                            visibility: row.visibility,
+                            values,
+                        })
+                        .map_err(dml_write_err)?;
+                    }
                 }
             }
         }
@@ -3747,7 +3976,76 @@ pub(crate) fn update_rows_where_unchecked<E>(
     assignments: &[(usize, crate::row_codec::Value)],
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
+    predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    update_rows_where_impl(
+        storage,
+        table,
+        ctx,
+        ledger_write,
+        content_hash_value,
+        legacy_hashes,
+        expected_schema,
+        assignments,
+        needs_embedding,
+        limit,
+        predicate,
+        None,
+    )
+}
+
+/// [`update_rows_where_unchecked`] の `RETURNING` 版（Issue #1182・SQL-21）。
+/// `project` は**更新後**の各行（[`CapturedRow`]。書いた値そのもの）を行ごとに
+/// 1 回呼ぶ。契約（commit 成功境界・呼び出し順・制約検査との優先順位）は
+/// [`delete_rows_where_capturing_unchecked`] と同一。`sql::exec::
+/// execute_predicate_update_returning` の唯一の到達経路。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_rows_where_capturing_unchecked<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    legacy_hashes: &[content_hash::ContentHash],
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    assignments: &[(usize, crate::row_codec::Value)],
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
+    predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+    project: &mut ReturningProjectFn<'_>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    update_rows_where_impl(
+        storage,
+        table,
+        ctx,
+        ledger_write,
+        content_hash_value,
+        legacy_hashes,
+        expected_schema,
+        assignments,
+        needs_embedding,
+        limit,
+        predicate,
+        Some(project),
+    )
+}
+
+/// [`update_rows_where_unchecked`]・[`update_rows_where_capturing_unchecked`] の
+/// 共有実体（`project: None` は前者とビット同一）。
+#[allow(clippy::too_many_arguments)]
+fn update_rows_where_impl<E>(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    legacy_hashes: &[content_hash::ContentHash],
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    assignments: &[(usize, crate::row_codec::Value)],
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
     let write_txn = storage
@@ -3859,6 +4157,18 @@ pub(crate) fn update_rows_where_unchecked<E>(
             row_table
                 .insert(key, encoded.as_slice())
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+            // `RETURNING`（Issue #1182）: 書いた値（更新後）を行ごとに投影する。
+            if let Some(project) = project.as_mut() {
+                let values = captured_values_from_parts(&schema, embedding_value, &metadata)
+                    .map_err(dml_write_err)?;
+                project(&CapturedRow {
+                    id: *id,
+                    tenant_id: ctx.tenant_id().to_string(),
+                    visibility,
+                    values,
+                })
+                .map_err(dml_write_err)?;
+            }
         }
     }
 
@@ -4703,12 +5013,12 @@ mod tests {
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
         let rows = visible_rows(&storage, "docs", &visible_ctx).expect("visible rows");
+        let schema = file_schema("docs");
         let bodies: Vec<&str> = rows
             .iter()
             .map(|r| {
-                let scanned =
-                    crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
-                        .expect("scan scalar columns");
+                let scanned = crate::row_codec::scan_scalar_columns(&schema, &r.metadata)
+                    .expect("scan scalar columns");
                 scanned
                     .get(2)
                     .copied()
@@ -7098,5 +7408,308 @@ mod tests {
             vec![1.0, 0.0],
             "拒否された SET が既存 embedding を書き換えてはならない"
         );
+    }
+    // ---- Issue #1182: UPDATE・述語形 DELETE・UPSERT の `RETURNING` 投影コールバック ----
+    //
+    // いずれも `project` が `Err` を返した場合に、行変更・台帳追記の**どちらも**
+    // commit されない（`write_txn` の abort）ことを固定する
+    // （`delete_row_impl_aborts_commit_when_project_callback_fails` の各新経路版）。
+    // 台帳が巻き戻ったことは、同一 `operation_id`・同一内容を `project` なしで再送
+    // すると `DuplicateOperationId` ではなく通常の成功になることで確認する。
+
+    fn seed_docs_row(storage: &Storage, ctx: &PolicyContext) {
+        let op = OperationId::parse("test-op-seed-1182").expect("valid operation_id");
+        insert_row(
+            storage,
+            "docs",
+            ctx,
+            1,
+            &RowInput {
+                tenant_id: ctx.tenant_id(),
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+            &op,
+        )
+        .expect("seed row");
+    }
+
+    fn failing_project(_: &CapturedRow) -> Result<(), TenantWriteError> {
+        Err(TenantWriteError::ReturningProjectionFailed(
+            "forced failure for test".to_string(),
+        ))
+    }
+
+    fn embedding_of(storage: &Storage, ctx: &PolicyContext, id: u64) -> Option<Vec<f32>> {
+        visible_rows(storage, "docs", ctx)
+            .expect("visible_rows")
+            .into_iter()
+            .find(|r| r.id == id)
+            .map(|r| r.embedding)
+    }
+
+    #[test]
+    fn delete_rows_where_capturing_aborts_commit_when_project_callback_fails() {
+        let path = unique_db_path("delete-where-project-abort");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        seed_docs_row(&storage, &ctx);
+
+        let op = OperationId::parse("test-op-del-where").expect("valid operation_id");
+        let hash = content_hash::for_delete(1);
+        let ledger = || LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
+        let mut project = failing_project;
+        let result = delete_rows_where_capturing_unchecked::<()>(
+            &storage,
+            "docs",
+            &ctx,
+            ledger(),
+            &hash,
+            None,
+            false,
+            None,
+            |_c| Ok(true),
+            &mut project,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(PredicateDmlError::Write(
+                    TenantWriteError::ReturningProjectionFailed(_)
+                ))
+            ),
+            "project の Err はそのまま伝播するべき"
+        );
+        assert!(
+            embedding_of(&storage, &ctx, 1).is_some(),
+            "project 失敗時、行は削除されてはならない"
+        );
+
+        let retry = delete_rows_where_unchecked::<()>(
+            &storage,
+            "docs",
+            &ctx,
+            ledger(),
+            &hash,
+            None,
+            false,
+            None,
+            |_c| Ok(true),
+        );
+        assert!(
+            matches!(retry, Ok(PredicateDmlOutcome::Applied { rows_affected: 1 })),
+            "abort された操作の operation_id は台帳に残ってはならない"
+        );
+        assert!(embedding_of(&storage, &ctx, 1).is_none());
+    }
+
+    #[test]
+    fn update_rows_where_capturing_aborts_commit_when_project_callback_fails() {
+        let path = unique_db_path("update-where-project-abort");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        seed_docs_row(&storage, &ctx);
+
+        let op = OperationId::parse("test-op-upd-where").expect("valid operation_id");
+        let hash = content_hash::for_delete(1);
+        let ledger = || LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
+        let assignments = [(0usize, crate::row_codec::Value::Vector(vec![5.0, 5.0]))];
+        let mut project = failing_project;
+        let result = update_rows_where_capturing_unchecked::<()>(
+            &storage,
+            "docs",
+            &ctx,
+            ledger(),
+            &hash,
+            &[],
+            None,
+            &assignments,
+            false,
+            None,
+            |_c| Ok(true),
+            &mut project,
+        );
+        assert!(matches!(
+            result,
+            Err(PredicateDmlError::Write(
+                TenantWriteError::ReturningProjectionFailed(_)
+            ))
+        ));
+        assert_eq!(
+            embedding_of(&storage, &ctx, 1),
+            Some(vec![1.0, 0.0]),
+            "project 失敗時、行は更新されてはならない"
+        );
+
+        let retry = update_rows_where_unchecked::<()>(
+            &storage,
+            "docs",
+            &ctx,
+            ledger(),
+            &hash,
+            &[],
+            None,
+            &assignments,
+            false,
+            None,
+            |_c| Ok(true),
+        );
+        assert!(matches!(
+            retry,
+            Ok(PredicateDmlOutcome::Applied { rows_affected: 1 })
+        ));
+        assert_eq!(embedding_of(&storage, &ctx, 1), Some(vec![5.0, 5.0]));
+    }
+
+    #[test]
+    fn update_row_columns_capturing_aborts_commit_when_project_callback_fails() {
+        let path = unique_db_path("update-single-project-abort");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        seed_docs_row(&storage, &ctx);
+
+        let op = OperationId::parse("test-op-upd-single").expect("valid operation_id");
+        let ledger = || LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
+        let assignments = [(0usize, crate::row_codec::Value::Vector(vec![5.0, 5.0]))];
+        let mut project = failing_project;
+        let result = update_row_columns_capturing_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &assignments,
+            ledger(),
+            None,
+            Some(&mut project),
+        );
+        assert!(matches!(
+            result,
+            Err(TenantWriteError::ReturningProjectionFailed(_))
+        ));
+        assert_eq!(embedding_of(&storage, &ctx, 1), Some(vec![1.0, 0.0]));
+
+        let retry =
+            update_row_columns_unchecked(&storage, "docs", &ctx, 1, &assignments, ledger(), None);
+        assert!(
+            matches!(retry, Ok(1)),
+            "台帳が巻き戻っていること: {retry:?}"
+        );
+        assert_eq!(embedding_of(&storage, &ctx, 1), Some(vec![5.0, 5.0]));
+    }
+
+    #[test]
+    fn update_row_columns_capturing_does_not_call_project_for_missing_row() {
+        let path = unique_db_path("update-single-project-notfound");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let op = OperationId::parse("test-op-upd-missing").expect("valid operation_id");
+        let assignments = [(0usize, crate::row_codec::Value::Vector(vec![5.0, 5.0]))];
+        let mut calls = 0usize;
+        let mut project = |_: &CapturedRow| -> Result<(), TenantWriteError> {
+            calls += 1;
+            Ok(())
+        };
+        let result = update_row_columns_capturing_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            42,
+            &assignments,
+            LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+            None,
+            Some(&mut project),
+        );
+        assert!(matches!(result, Ok(0)));
+        assert_eq!(calls, 0, "不存在 id では project を呼ばない（内容無参照）");
+    }
+
+    #[test]
+    fn upsert_typed_rows_capturing_aborts_commit_when_project_callback_fails() {
+        let path = unique_db_path("upsert-project-abort");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_all =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        seed_docs_row(&storage, &ctx);
+
+        // 新規挿入行（id=2）: project 失敗で行が残らない。
+        let insert_values = [crate::row_codec::Value::Vector(vec![9.0, 9.0])];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(2, &insert_values)];
+        let op = OperationId::parse("test-op-upsert-ins").expect("valid operation_id");
+        let ledger = || LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
+        let mut project = failing_project;
+        let result = upsert_typed_rows_capturing_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoNothing,
+            ledger(),
+            None,
+            &mut project,
+        );
+        assert!(matches!(
+            result,
+            Err(TenantWriteError::ReturningProjectionFailed(_))
+        ));
+        assert!(embedding_of(&storage, &ctx_all, 2).is_none());
+        let retry = upsert_typed_rows_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoNothing,
+            ledger(),
+            None,
+        );
+        assert_eq!(
+            retry.expect("台帳が巻き戻っていること"),
+            UpsertOutcome {
+                inserted: 1,
+                updated: 0
+            }
+        );
+
+        // `DO UPDATE` 行（id=1）: project 失敗で既存行が更新されない。
+        let update_values = [crate::row_codec::Value::Vector(vec![7.0, 7.0])];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(1, &update_values)];
+        let assignments = [(0usize, UpsertSetValue::Excluded(0))];
+        let op2 = OperationId::parse("test-op-upsert-upd").expect("valid operation_id");
+        let ledger2 = || LedgerMode::Ledgered.resolve(Some(&op2)).expect("resolve");
+        let mut project = failing_project;
+        let result = upsert_typed_rows_capturing_unchecked(
+            &storage,
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(&assignments),
+            ledger2(),
+            None,
+            &mut project,
+        );
+        assert!(matches!(
+            result,
+            Err(TenantWriteError::ReturningProjectionFailed(_))
+        ));
+        assert_eq!(embedding_of(&storage, &ctx_all, 1), Some(vec![1.0, 0.0]));
     }
 }

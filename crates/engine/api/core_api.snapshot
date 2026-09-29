@@ -305,4 +305,6 @@ pub enum ArenaError {
     DimMismatch { id: u64, expected: u32, found: u32 },
     AllocationFailed(String),
     InvalidInput(String),
+    DivisionByZero(String),
+    NumericOutOfRange(String),
 }

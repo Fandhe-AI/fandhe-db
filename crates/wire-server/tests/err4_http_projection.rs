@@ -277,8 +277,9 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 35] = [
+const EXPECTED_STATUS: [(&str, u16); 36] = [
     ("22000", 400),
+    ("22012", 400),
     ("28P01", 401),
     ("28000", 401),
     ("42501", 403),
@@ -397,7 +398,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 36);
+const _: () = assert!(ErrorClass::ALL.len() == 37);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -532,7 +533,7 @@ fn err4_c_unsupported_op_projects_0a000_to_501() {
     assert_projected(&resp, "0A000");
 }
 
-// --- (d) 構造は受理されたが値不正 → 22000／22003／22023 ---------------------
+// --- (d) 構造は受理されたが値不正 → 22000／22003／22012／22023 ---------------------
 
 #[test]
 fn err4_d_invalid_value_projects_22000_to_400() {
@@ -994,19 +995,19 @@ fn err4_f_referential_action_limit_reachable_via_nosql_delete() {
 
 /// オーナー判断（2026-09-28・Issue #1075、ERR-6・SQL-26・TABLE-16 ポインタ）:
 /// `CHECK` の式評価エラー（0 除算等）は NoSQL `insert` op からも `XX000`（500）
-/// ではなく通常の式評価と同じ `22000`（400）として到達可能であることを固定する
+/// ではなく通常の式評価と同じ `22012`（0 除算・400。Issue #1163）として到達可能であることを固定する
 /// （`engine::sql::check_constraint::CompiledChecks::enforce` →
 /// `TenantWriteError::CheckEvaluationFailed` → `EngineCore::
 /// execute_bound_insert_in_session` → `InsertError::Exec(SqlSurfaceError)` の
 /// 経路。値・テナントを含まない固定文言のまま）。
 #[test]
-fn err4_check_evaluation_failed_reachable_via_nosql_insert_projects_22000_not_xx000() {
+fn err4_check_evaluation_failed_reachable_via_nosql_insert_projects_22012_not_xx000() {
     let (core, _guard) = new_core_with_check_constraint();
     let addr = spawn(core);
 
     let body = br#"{"op":"insert","table":"checked","rows":[{"id":1,"qty":0}],"operation_id":"err4-check-eval-insert"}"#;
     let resp = query_as_alice(addr, body);
-    assert_projected(&resp, "22000");
+    assert_projected(&resp, "22012");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 

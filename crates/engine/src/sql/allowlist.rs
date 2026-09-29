@@ -445,11 +445,17 @@ pub enum SqlSurfaceError {
     OperationIdContentMismatch,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
+    /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
     /// 黙って wrap・非有限値化せず fail-closed に拒否する（`.claude/rules/coding-rust.md`
     /// 「整数演算は checked_*/saturating_* を使う」対応）。`22003` は ERR-2
     /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
     /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
+    /// 式評価（スカラー `/`・ベクトル÷スカラー・`vec_div`・`mod`）の 0 除算
+    /// （`22012`、SQL-26・ERR-2、Issue #1163）。拒否側（fail-closed）は従来の
+    /// `22000` と同じで、SQLSTATE のみ汎用 RDB に揃える。detail は演算種別の
+    /// 固定文言に限り、行の値・テナント情報を含めない。
+    DivisionByZero { detail: String },
     /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
     /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
     /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
@@ -692,6 +698,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 式評価器（`sql::udf_call`・`sql::numeric_fn`）が 0 除算を
+    /// 報告するために使う（Issue #1163・SQL-26）。
+    pub(crate) fn division_by_zero(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::DivisionByZero {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13・TASK-197、
     /// Issue #884）が `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正を報告する
     /// ために使う。
@@ -783,6 +797,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
+            SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -855,6 +870,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::NumericOutOfRange { detail } => {
                 write!(f, "numeric value out of range: {detail}")
+            }
+            SqlSurfaceError::DivisionByZero { detail } => {
+                write!(f, "division by zero: {detail}")
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
@@ -2114,8 +2132,8 @@ pub struct ValidatedDelete {
     pub operation_id: Option<OperationId>,
     /// `RETURNING` 句（Issue #873・SQL-21）。単一行・`id` 完全一致形は実行結線
     /// 済み（[`crate::sql::exec::execute_delete_returning`]）のため受理する。
-    /// 述語形（[`ValidatedPredicateDelete`]）はフィールドを持たず、構造検証段
-    /// （`validate_delete_statement_tokens` の `Predicate` 腕）で常に `42601`。
+    /// 述語形（[`ValidatedPredicateDelete::returning`]）も Issue #1182 で
+    /// 実行結線済み（`sql::exec::execute_predicate_delete_returning`）。
     pub returning: Option<Projection>,
 }
 
@@ -2144,6 +2162,9 @@ pub struct ValidatedPredicateDelete {
     /// は `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
     /// 開始前に `23502` で拒否するため、この構成では常に `Some`。
     pub(crate) operation_id: Option<OperationId>,
+    /// `RETURNING` 句（Issue #1182・SQL-21）。削除前の値を返す
+    /// （`sql::exec::execute_predicate_delete_returning`）。
+    pub(crate) returning: Option<Projection>,
 }
 
 impl ValidatedPredicateDelete {
@@ -2163,6 +2184,11 @@ impl ValidatedPredicateDelete {
     /// 文末専用句で搬送された、検証済みの `operation_id`。
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
+    }
+
+    /// `RETURNING` 句の投影（Issue #1182）。省略時は `None`。
+    pub fn returning(&self) -> Option<&Projection> {
+        self.returning.as_ref()
     }
 }
 
@@ -2407,9 +2433,10 @@ pub struct ValidatedTruncate {
 /// とは異なり `operation_id` を保持しない。SQL-23 の DDL は台帳〔TASK-93〕の
 /// 対象外）。
 ///
-/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` のみ
-/// （`IF NOT EXISTS`・複数 `ADD`・列制約〔`NOT NULL`／`DEFAULT`／`PRIMARY KEY`
-/// 等〕・`DROP COLUMN`／`ALTER COLUMN`・`RETURNING`・`USING OPERATION_ID` の
+/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [NOT NULL]
+/// [DEFAULT <literal>] [;]`（列制約は順不同・各 1 回まで。Issue #1169）のみ
+/// （`IF NOT EXISTS`・複数 `ADD`・列制約 `UNIQUE`／`PRIMARY KEY`／`REFERENCES`／
+/// `CHECK`・`RETURNING`・`USING OPERATION_ID` の
 /// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
 /// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
 /// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
@@ -2421,6 +2448,13 @@ pub struct ValidatedAlterTableAddColumn {
     /// 型名の構文木。意味づけ（ENUM 型名の存在確認・`ColumnType` への変換）は
     /// `sql::ddl::execute_alter_table_add_column` の責務。
     pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    /// `NOT NULL` 句の有無（Issue #1169）。`DEFAULT` を伴わない `NOT NULL` は
+    /// 構造検証段階で `42601` 拒否済みのため、`true` なら `default` は常に `Some`。
+    pub not_null: bool,
+    /// `DEFAULT <literal>` のリテラル（Issue #1169）。列型との整合・値の束縛は
+    /// カタログ照会を要するため実行段（`sql::ddl::execute_alter_table_add_column`）
+    /// が行う。
+    pub default: Option<InsertLiteral>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE
@@ -2477,7 +2511,29 @@ pub struct ValidatedAlterTableAddForeignKey {
     pub foreign_key: crate::catalog::ForeignKeyDef,
 }
 
-/// `ALTER TABLE` の許可形状 5 種の和（Issue #1067・#1068・#1069）。`ParsedSql::AlterTable` が
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> DROP COLUMN <column>` 文
+/// （TABLE-19・SQL-23、Issue #1167）。予約列名は構造検証段で `42601` に落とし済み。
+/// テーブル・列の存在確認と依存検査（PK・UNIQUE・CHECK・FK）は DDL 権限ゲート
+/// 通過後の実行段（`sql::ddl::execute_alter_table_drop_column`）が担う
+/// （権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableDropColumn {
+    pub table_name: String,
+    pub column_name: String,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> TYPE
+/// <型名>` 文（TABLE-19・SQL-23、Issue #1167）。型名の意味づけ（ENUM 型名の
+/// 存在確認・`ColumnType` への変換）と互換性判定は実行段
+/// （`sql::ddl::execute_alter_table_alter_column_type`）が担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnType {
+    pub table_name: String,
+    pub column_name: String,
+    pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+}
+
+/// `ALTER TABLE` の許可形状 7 種の和（Issue #1067・#1068・#1069・#1167）。`ParsedSql::AlterTable` が
 /// 保持する型で、`sql::ddl::execute_alter_table` が対応する実行本体へ振り分ける
 /// （構文の許可リスト判定は `sql::allowlist` の管轄、ディスパッチは `sql::ddl`・
 /// `core.rs` の管轄という既存の責務分担を維持する）。
@@ -2492,6 +2548,9 @@ pub struct ValidatedAlterTableAddForeignKey {
 ///
 /// **BREAKING CHANGE**（Issue #1069）: `AddForeignKey` variant を追加した。
 /// いずれも本 enum を網羅的に `match` するクレート外のコードは追随が必要。
+///
+/// **BREAKING CHANGE**（Issue #1167）: `DropColumn`・`AlterColumnType` variant を
+/// 追加した。本 enum を網羅的に `match` するクレート外のコードは追随が必要。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidatedAlterTable {
     AddColumn(ValidatedAlterTableAddColumn),
@@ -2499,6 +2558,8 @@ pub enum ValidatedAlterTable {
     AddCheck(ValidatedAlterTableAddCheck),
     DropConstraint(ValidatedAlterTableDropConstraint),
     AddForeignKey(ValidatedAlterTableAddForeignKey),
+    DropColumn(ValidatedAlterTableDropColumn),
+    AlterColumnType(ValidatedAlterTableAlterColumnType),
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -2507,9 +2568,9 @@ pub enum ValidatedAlterTable {
 ///
 /// 受理する形は `UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE id = <n>
 /// USING OPERATION_ID '<id>' [;]` の単一行・id 指定形のみ（述語形 WHERE・複数テーブル・
-/// サブクエリは許可リスト外。`RETURNING` は構造上受理できるが実行結線（#865）
-/// が未着手のため `validate_update_tokens`／`validate_update_form_tokens` が
-/// 一律 `42601` 拒否する〔Issue #873・SQL-21〕。実行結線・可視性判定は #865 の担当）。
+/// サブクエリは許可リスト外。`RETURNING` はセッション経路
+/// （`validate_update_form_tokens`）でのみ受理し、非セッション入口
+/// `validate_update_tokens` は `42601` 拒否する〔Issue #873・#1182・SQL-21〕）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedUpdate {
     /// UPDATE に指定され、カタログ存在確認を通過したテーブル名。
@@ -2525,11 +2586,11 @@ pub struct ValidatedUpdate {
     /// `23502` で拒否するため、この構成では常に `Some` になる。
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
-    /// `RETURNING` 句（Issue #873・SQL-21）。`UPDATE` は実行結線（#865）が
-    /// 未着手のため、`validate_update_tokens`／`validate_update_form_tokens` が
-    /// `Some` を構造検証段で常に `42601` 拒否する（黙って保持し将来の実行器が
-    /// 無視する fail-open を防ぐチョークポイント）。この型が構築される時点では
-    /// 常に `None`。
+    /// `RETURNING` 句（Issue #873・#1182・SQL-21）。セッション経路
+    /// （`validate_update_form_tokens`）では `Some` を保持し実行結線される。
+    /// 非セッション入口 `validate_update_tokens` は `Some` を構造検証段で
+    /// `42601` 拒否する（黙って落とす fail-open を防ぐ）ため、その経路で
+    /// 構築された値は常に `None`。
     pub returning: Option<Projection>,
 }
 
@@ -4926,9 +4987,9 @@ impl<'a> Parser<'a> {
     /// 句は [`Self::parse_update_where`] が単一行・id 指定形（SQL-17、
     /// TASK-191）と述語形（SQL-19、TASK-192）を振り分ける（[`UpdateWhereForm`]
     /// のドキュメント参照）。`RETURNING`（Issue #873・SQL-21）は構造として
-    /// 受理するが、`UPDATE` の実行結線（#865）が未着手のため呼び出し元
-    /// （[`validate_update_tokens`]・[`validate_update_form_tokens`]）が
-    /// 一律 `42601` で拒否する単一のチョークポイントを持つ。振り分け後の
+    /// 受理する。非セッション入口 [`validate_update_tokens`] は `42601` 拒否し、
+    /// セッション入口 [`validate_update_form_tokens`] は実行結線へ渡す
+    /// （Issue #1182）。振り分け後の
     /// 受理判定（id 指定形以外は許可しない等）も同じ呼び出し元の責務とし、
     /// 本メソッドは構造パースのみを行う。複数テーブル・サブクエリは本メソッド
     /// が生成できる文法にそもそも存在しないため構造的に受理しない（個別の
@@ -4954,9 +5015,8 @@ impl<'a> Parser<'a> {
         let where_form = self.parse_update_where()?;
 
         // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
-        // 構造パースのみ行い、実行結線（#865）未着手のため常に `42601` で
-        // 拒否する判定は呼び出し元（`validate_update_tokens`／
-        // `validate_update_form_tokens`）のチョークポイントに委ねる。
+        // 構造パースのみ行い、受理／拒否の判定は呼び出し元
+        // （`validate_update_tokens`／`validate_update_form_tokens`）に委ねる。
         let returning = self.parse_returning_clause()?;
 
         // 文末専用句の構造パースのみをここで行う（INSERT と同じ順序契約。
@@ -4978,7 +5038,9 @@ impl<'a> Parser<'a> {
     ///
     /// 判定は決定的: 直後の 3 トークンが `Ident("id")`・`Punct('=')`・
     /// `Token::Number` で、かつその次のトークンが文末（`None`）・`Punct(';')`・
-    /// 文脈的キーワード `USING` のいずれかである場合に限り [`UpdateWhereForm::Id`]
+    /// 文脈的キーワード `USING`／`RETURNING`〔Issue #1182。`RETURNING` の有無で
+    /// 単一行形／述語形の分類が変わると内容照合ハッシュが変わるため、
+    /// `peek_single_row_delete_id` と同じく終端として扱う〕のいずれかである場合に限り [`UpdateWhereForm::Id`]
     /// （単一行・id 指定形）とし、それ以外はすべて位置を巻き戻して
     /// [`Self::parse_where`]（`SELECT`・集計 `SELECT`・広域取得 `SELECT` と同一の
     /// 許可述語列表現）で [`UpdateWhereForm::Predicates`] を構築する。`id = 'x'`
@@ -4997,7 +5059,11 @@ impl<'a> Parser<'a> {
         let has_terminator = matches!(
             self.tokens.get(self.pos + 3),
             None | Some(Token::Punct(';'))
-        ) || matches!(self.tokens.get(self.pos + 3), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("USING"));
+        ) || matches!(
+            self.tokens.get(self.pos + 3),
+            Some(Token::Ident(w))
+                if w.eq_ignore_ascii_case("USING") || w.eq_ignore_ascii_case("RETURNING")
+        );
 
         if is_id_simple_prefix && has_terminator {
             self.advance(); // "id"
@@ -5100,8 +5166,8 @@ impl<'a> Parser<'a> {
     /// `lexer::Keyword` へ含めない設計方針（`lexer.rs` のモジュールドキュメント
     /// 参照）のため、いずれも `expect_contextual_keyword` で文脈的に照合する。
     /// `IF NOT EXISTS`・複数 `ADD`／`DROP`・`ADD CONSTRAINT ... CHECK ... NOT VALID`／
-    /// `PRIMARY KEY`／`FOREIGN KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
-    /// `RESTRICT`・`DROP COLUMN`／`ALTER COLUMN`・`USING OPERATION_ID` はいずれも
+    /// `PRIMARY KEY`・`DROP CONSTRAINT IF EXISTS`／`CASCADE`／
+    /// `RESTRICT`・`DROP COLUMN IF EXISTS`・`USING OPERATION_ID` はいずれも
     /// 構造的に受理しない（設計 D6。`expect_end_of_statement` が余剰トークンとして
     /// `42601` で拒否するか、`ADD`／`DROP` の直後に許可形状以外が続いた時点で
     /// `expect_contextual_keyword` が拒否する）。
@@ -5139,11 +5205,30 @@ impl<'a> Parser<'a> {
                     self.tokens,
                     &mut self.pos,
                 )?;
+                // 列制約（Issue #1169）。`UNIQUE` は追加列では受け付けない（`ALTER
+                // TABLE ADD UNIQUE` 形を使う）。`PRIMARY KEY`／`REFERENCES`／`CHECK`
+                // は後続の `expect_end_of_statement` が `42601` で拒否する。
+                let constraints = self.parse_column_constraints()?;
+                if constraints.unique {
+                    return Err(SqlSurfaceError::unsupported(
+                        "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
+                    ));
+                }
+                // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
+                // （TABLE-16）。カタログ・行を参照しない構造判定のため、存在オラクル・
+                // 他テナント行の有無の判別手段にならない。
+                if constraints.not_null && constraints.default.is_none() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "NOT NULL in ALTER TABLE ADD COLUMN requires a DEFAULT",
+                    ));
+                }
                 return Ok(ParsedAlterTableShape::AddColumn(
                     ParsedAlterTableAddColumnShape {
                         table_name,
                         column_name,
                         column_type,
+                        not_null: constraints.not_null,
+                        default: constraints.default,
                     },
                 ));
             }
@@ -5201,8 +5286,19 @@ impl<'a> Parser<'a> {
         }
         if self.peek_contextual_keyword("DROP") {
             self.advance();
-            // `DROP CONSTRAINT <name>` のみを受理する（`DROP CONSTRAINT IF EXISTS`／
-            // `CASCADE`／`RESTRICT`・`DROP COLUMN` は設計 D6 によりスコープ外。
+            // `DROP COLUMN <col>`（TABLE-19、Issue #1167）。`COLUMN` 省略形・
+            // `IF EXISTS`・`CASCADE`／`RESTRICT` は余剰トークンとして `42601`。
+            if self.peek_contextual_keyword("COLUMN") {
+                self.advance();
+                let column_name = self.expect_ident()?;
+                reject_reserved_alter_column_name(&column_name)?;
+                return Ok(ParsedAlterTableShape::DropColumn {
+                    table_name,
+                    column_name,
+                });
+            }
+            // `DROP CONSTRAINT <name>` を受理する（`DROP CONSTRAINT IF EXISTS`／
+            // `CASCADE`／`RESTRICT` は設計 D6 によりスコープ外。
             // `CONSTRAINT` 以外が続けば `42601`）。
             self.expect_contextual_keyword("CONSTRAINT")?;
             let constraint_name = self.expect_ident()?;
@@ -5212,6 +5308,22 @@ impl<'a> Parser<'a> {
             return Ok(ParsedAlterTableShape::DropConstraint {
                 table_name,
                 constraint_name,
+            });
+        }
+        // `ALTER COLUMN <col> TYPE <型名>`（TABLE-19、Issue #1167）。`SET DATA TYPE`・
+        // `USING`・`COLLATE` は `TYPE` 不一致／余剰トークンとして `42601`。
+        if self.peek_contextual_keyword("ALTER") {
+            self.advance();
+            self.expect_contextual_keyword("COLUMN")?;
+            let column_name = self.expect_ident()?;
+            reject_reserved_alter_column_name(&column_name)?;
+            self.expect_contextual_keyword("TYPE")?;
+            let column_type =
+                crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+            return Ok(ParsedAlterTableShape::AlterColumnType {
+                table_name,
+                column_name,
+                column_type,
             });
         }
         Err(SqlSurfaceError::unsupported("unsupported ALTER TABLE form"))
@@ -6596,6 +6708,8 @@ struct ParsedAlterTableAddColumnShape {
     table_name: String,
     column_name: String,
     column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    not_null: bool,
+    default: Option<InsertLiteral>,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
@@ -6619,6 +6733,15 @@ enum ParsedAlterTableShape {
         table_name: String,
         constraint_name: Option<String>,
         foreign_key: crate::catalog::ForeignKeyDef,
+    },
+    DropColumn {
+        table_name: String,
+        column_name: String,
+    },
+    AlterColumnType {
+        table_name: String,
+        column_name: String,
+        column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
     },
 }
 
@@ -8535,20 +8658,11 @@ pub(crate) fn validate_delete_statement_tokens(
             returning: shape.returning,
         }),
         ParsedDeleteWhere::Predicates(where_predicates) => {
-            // 述語形 DELETE の実行結線（#871）は未着手のため、`RETURNING` を
-            // 黙って保持し将来の実行器が無視する fail-open を防ぐ単一の
-            // チョークポイント（Issue #873・SQL-21）。単一行形（上の腕）は
-            // 実行結線済み（`sql::exec::execute_delete_returning`）のため
-            // 受理する。
-            if shape.returning.is_some() {
-                return Err(SqlSurfaceError::unsupported(
-                    "RETURNING is not supported for predicate-form DELETE",
-                ));
-            }
             DeleteStatement::Predicate(ValidatedPredicateDelete {
                 table_name: shape.table_name,
                 where_predicates,
                 operation_id: shape.operation_id,
+                returning: shape.returning,
             })
         }
     })
@@ -8730,8 +8844,28 @@ pub(crate) fn validate_truncate_tokens(
     })
 }
 
+/// `DROP COLUMN`／`ALTER COLUMN TYPE` の対象列名が予約列名（`id`／`tenant_id`／
+/// `visibility`／`check`／`constraint`。ASCII 大文字小文字無視）なら `42601`
+/// （Issue #1167）。`ADD COLUMN` と同じ判定で、カタログを照会しないため権限
+/// ゲートより前に置いても存在オラクルにならない。engine 側の保護列判定
+/// （`ProtectedColumn`）は大文字小文字を区別するため、表層で吸収する。
+fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurfaceError> {
+    if column_name.eq_ignore_ascii_case("id")
+        || column_name.eq_ignore_ascii_case("tenant_id")
+        || column_name.eq_ignore_ascii_case("visibility")
+        || column_name.eq_ignore_ascii_case("check")
+        || column_name.eq_ignore_ascii_case("constraint")
+    {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "column name {column_name:?} is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// `ALTER TABLE` 文（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
-/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT` の 4 形状）をトークン化し、
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD FOREIGN KEY`／`DROP COLUMN`／
+/// `ALTER COLUMN TYPE` の 7 形状）をトークン化し、
 /// 許可リスト形式で構造検証する（TASK-202・SQL-23。Issue #900 の公開 API）。
 /// `validate_truncate` とは異なり
 /// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
@@ -8771,6 +8905,8 @@ pub fn validate_alter_table_tokens(
                 table_name: shape.table_name,
                 column_name: shape.column_name,
                 column_type: shape.column_type,
+                not_null: shape.not_null,
+                default: shape.default,
             })
         }
         ParsedAlterTableShape::AddUnique {
@@ -8800,6 +8936,22 @@ pub fn validate_alter_table_tokens(
             table_name,
             constraint_name,
             foreign_key,
+        }),
+        ParsedAlterTableShape::DropColumn {
+            table_name,
+            column_name,
+        } => ValidatedAlterTable::DropColumn(ValidatedAlterTableDropColumn {
+            table_name,
+            column_name,
+        }),
+        ParsedAlterTableShape::AlterColumnType {
+            table_name,
+            column_name,
+            column_type,
+        } => ValidatedAlterTable::AlterColumnType(ValidatedAlterTableAlterColumnType {
+            table_name,
+            column_name,
+            column_type,
         }),
     })
 }
@@ -9158,6 +9310,9 @@ pub struct ValidatedPredicateUpdate {
     /// 文末専用句で搬送された、検証済みの `operation_id`。契約は
     /// [`ValidatedUpdate::operation_id`] と同一。
     pub(crate) operation_id: Option<OperationId>,
+    /// `RETURNING` 句（Issue #1182・SQL-21）。実行結線済み（セッション経路の
+    /// `sql::exec::execute_predicate_update_returning`）。
+    pub(crate) returning: Option<Projection>,
 }
 
 impl ValidatedPredicateUpdate {
@@ -9179,6 +9334,11 @@ impl ValidatedPredicateUpdate {
     /// 文末専用句で搬送された、検証済みの `operation_id`。
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
+    }
+
+    /// `RETURNING` 句の投影（Issue #1182）。省略時は `None`。
+    pub fn returning(&self) -> Option<&Projection> {
+        self.returning.as_ref()
     }
 }
 
@@ -9229,17 +9389,15 @@ pub(crate) fn validate_update_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
-    // `RETURNING`（Issue #873・SQL-21）: `UPDATE` の実行結線（#865）は未着手
-    // のため、構造検証段で常に `42601` 拒否する単一のチョークポイント（黙って
-    // 保持し将来の実行器が無視する fail-open を防ぐ）。述語形 WHERE の判定
-    // よりも前に置く——`parse_update_where` は `RETURNING` を終端として
-    // 特別扱いしないため、`WHERE id = 1 RETURNING ...` は構造上
-    // `UpdateWhereForm::Predicates` へ分類されうるが、`RETURNING` の拒否は
-    // WHERE 形状に関わらず常に同じ「単一のチョークポイント」で行う
-    // （`validate_update_form_tokens` と同じ判定順序に揃える）。
+    // `RETURNING`（Issue #873・SQL-21・Issue #1182）: 本入口は非セッション経路
+    // （`EngineCore::execute_update_sql` 等）の id 形専用 API であり、結果セットを
+    // 返す `RETURNING` はセッション経路（`validate_update_form`）でのみ実行結線
+    // されている。呼び出し元が `RETURNING` を黙って落とす fail-open を避けるため、
+    // 構造検証段（`mode.require`・カタログ照会・書き込み開始より前＝台帳を消費
+    // しない）で常に `42601` 拒否する。
     if shape.returning.is_some() {
         return Err(SqlSurfaceError::unsupported(
-            "RETURNING is not supported for UPDATE",
+            "RETURNING requires the session-aware UPDATE entry point",
         ));
     }
 
@@ -9270,8 +9428,7 @@ pub(crate) fn validate_update_tokens(
         id_literal,
         operation_id: shape.operation_id,
         // 直前のガードで `shape.returning.is_some()` は既に `42601` で
-        // 拒否済みのため、ここへ到達する時点で常に `None`
-        // （`validate_update_form_tokens` の同型ガードと表記を揃える）。
+        // 拒否済みのため、ここへ到達する時点で常に `None`。
         returning: None,
     })
 }
@@ -9310,15 +9467,6 @@ pub(crate) fn validate_update_form_tokens(
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
-    // `RETURNING`（Issue #873・SQL-21）: `validate_update_tokens` と同じ
-    // チョークポイント。`UPDATE` は単一行・述語形いずれも実行結線（#865）が
-    // 未着手のため、`WHERE` 形状の判定より前に一律拒否する。
-    if shape.returning.is_some() {
-        return Err(SqlSurfaceError::unsupported(
-            "RETURNING is not supported for UPDATE",
-        ));
-    }
-
     mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
@@ -9332,7 +9480,7 @@ pub(crate) fn validate_update_form_tokens(
             assignments: shape.assignments,
             id_literal,
             operation_id: shape.operation_id,
-            returning: None,
+            returning: shape.returning,
         }),
         UpdateWhereForm::Predicates(where_predicates) => {
             ValidatedUpdateForm::Predicate(ValidatedPredicateUpdate {
@@ -9340,6 +9488,7 @@ pub(crate) fn validate_update_form_tokens(
                 assignments: shape.assignments,
                 where_predicates,
                 operation_id: shape.operation_id,
+                returning: shape.returning,
             })
         }
     })
@@ -10785,39 +10934,105 @@ mod tests {
     }
 
     #[test]
-    fn rejects_predicate_delete_with_returning_clause() {
+    fn accepts_predicate_delete_with_returning_clause() {
+        // Issue #1182・SQL-21: 述語形 DELETE の RETURNING は実行結線済みのため受理する。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_delete_statement(
+        let stmt = validate_delete_statement(
             "DELETE FROM documents WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect_err("predicate-form DELETE RETURNING must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("predicate-form DELETE RETURNING should be accepted");
+        match stmt {
+            DeleteStatement::Predicate(inner) => {
+                assert_eq!(
+                    inner.returning(),
+                    Some(&Projection::Columns(vec!["id".to_string()]))
+                );
+            }
+            other => panic!("expected DeleteStatement::Predicate, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rejects_update_single_row_with_returning_clause() {
+    fn predicate_delete_without_returning_has_none() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("predicate-form DELETE should be accepted");
+        match stmt {
+            DeleteStatement::Predicate(inner) => assert_eq!(inner.returning(), None),
+            other => panic!("expected DeleteStatement::Predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_update_single_row_with_returning_on_non_session_entry() {
+        // Issue #1182・D2: 非セッション入口 `validate_update` は RETURNING を黙って
+        // 落とす fail-open を避けるため構造検証段で `42601` 拒否する。
         let lookup = catalog_with(&["documents"]);
         let err = validate_update(
             "UPDATE documents SET lang = 'en' WHERE id = 1 RETURNING id USING OPERATION_ID 'op-0001'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect_err("single-row UPDATE RETURNING must be rejected (execution not wired, #865)");
+        .expect_err("non-session UPDATE entry must reject RETURNING");
         assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
-    fn rejects_update_predicate_form_with_returning_clause() {
+    fn update_form_single_row_with_returning_is_classified_as_single() {
+        // Issue #1182・D1: `WHERE id = <n> RETURNING` は `RETURNING` の有無に関わらず
+        // 単一行形へ分類する（内容照合ハッシュが `RETURNING` の有無で変わらないため）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_update_form(
+        let form = validate_update_form(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 RETURNING * USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("single-row UPDATE RETURNING should be accepted by the session entry");
+        match form {
+            ValidatedUpdateForm::Single(inner) => {
+                assert_eq!(inner.returning, Some(Projection::All));
+            }
+            other => panic!("expected ValidatedUpdateForm::Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_form_id_and_extra_predicate_with_returning_stays_predicate_form() {
+        // D1 で単一行形を広げすぎないことの固定（`id = 1 AND ...` は述語形のまま）。
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
+            "UPDATE documents SET lang = 'en' WHERE id = 1 AND lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("predicate-form UPDATE RETURNING should be accepted");
+        assert!(matches!(form, ValidatedUpdateForm::Predicate(_)));
+    }
+
+    #[test]
+    fn accepts_update_predicate_form_with_returning_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let form = validate_update_form(
             "UPDATE documents SET lang = 'en' WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect_err("predicate-form UPDATE RETURNING must be rejected (execution not wired, #865)");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("predicate-form UPDATE RETURNING should be accepted");
+        match form {
+            ValidatedUpdateForm::Predicate(inner) => {
+                assert_eq!(
+                    inner.returning(),
+                    Some(&Projection::Columns(vec!["id".to_string()]))
+                );
+            }
+            other => panic!("expected ValidatedUpdateForm::Predicate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11714,14 +11929,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_statement_with_returning_suffix() {
+    fn rejects_delete_statement_with_returning_after_using_clause() {
+        // `RETURNING` は `USING OPERATION_ID` の直前にのみ置ける（後置は余剰トークン）。
         let lookup = catalog_with(&["documents"]);
         let err = validate_delete_statement(
-            "DELETE FROM documents WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-0001'",
+            "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op-0001' RETURNING id",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect_err("RETURNING suffix is out of the allowed shape");
+        .expect_err("RETURNING after USING is out of the allowed shape");
         assert_eq!(err.wire_code(), "42601");
     }
 
