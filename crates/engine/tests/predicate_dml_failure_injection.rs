@@ -106,7 +106,7 @@ fn predicate_delete_expression_error_mid_enumeration_leaves_no_side_effects() {
         ),
     )
     .expect_err("division by zero mid-enumeration must reject the whole statement");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 
     // (1) 副作用ゼロ: 全行が変更前のまま（id=1 も削除されていない）。
     assert_eq!(count_star(&core, &alice), before);
@@ -123,7 +123,7 @@ fn predicate_delete_expression_error_mid_enumeration_leaves_no_side_effects() {
         ),
     )
     .expect_err("resend of an unrecorded operation_id must be the same rejection, not 23505/22023");
-    assert_eq!(err_again.wire_code(), "22000");
+    assert_eq!(err_again.wire_code(), "22012");
 
     // 同一 operation_id を意味論的に正しい文で使い回せる（台帳が一切
     // 消費されていない証拠）。
@@ -172,7 +172,7 @@ fn predicate_update_expression_error_mid_enumeration_leaves_no_side_effects() {
         ),
     )
     .expect_err("division by zero mid-enumeration must reject the whole statement");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 
     // id=1 の SET も適用されていない（全行不変）。
     let result = core

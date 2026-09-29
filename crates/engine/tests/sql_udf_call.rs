@@ -284,7 +284,7 @@ fn dividing_by_a_zero_norm_vector_is_fail_closed_when_distance_runs_first() {
              ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1 HINT ORDER(DISTANCE, SCALAR, RLS)",
         )
         .expect_err("division by a zero norm must be fail-closed via the post-filter path too");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 }
 
 #[test]
@@ -568,7 +568,7 @@ fn text_column_reference_in_expression_is_rejected_with_22000() {
 }
 
 #[test]
-fn dividing_by_a_zero_norm_vector_is_fail_closed_with_22000() {
+fn dividing_by_a_zero_norm_vector_is_fail_closed_with_22012() {
     let path = unique_db_path("div-zero");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -602,7 +602,7 @@ fn dividing_by_a_zero_norm_vector_is_fail_closed_with_22000() {
              ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
         )
         .expect_err("division by a zero norm must be fail-closed, not silently zeroed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 }
 
 /// Issue #353（式評価のステップ列コンパイル化）: `WHERE` 式述語が定数のみから
@@ -656,7 +656,7 @@ fn constant_subexpression_error_still_fails_a_query_with_a_visible_row() {
              ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
         .expect_err("a constant 0-division in WHERE must be fail-closed once a row is evaluated");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 }
 
 #[test]

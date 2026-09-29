@@ -273,7 +273,7 @@ fn round_second_argument_beyond_i32_range_is_rejected_with_22003() {
 }
 
 #[test]
-fn sqrt_of_negative_and_mod_by_zero_are_rejected_with_22000() {
+fn sqrt_of_negative_is_22000_and_mod_by_zero_is_22012() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -294,7 +294,7 @@ fn sqrt_of_negative_and_mod_by_zero_are_rejected_with_22000() {
             "SELECT mod(1, 0) FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
         .expect_err("mod(1, 0) must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
 }
 
 #[test]

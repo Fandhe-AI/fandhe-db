@@ -451,7 +451,7 @@ fn low_selectivity_predicate_falls_back_to_plain_scan_but_result_still_matches()
 // --- 契約 4: エラー契約（残余述語ありは索引不使用のまま従来どおり fail-closed） --
 
 #[test]
-fn division_by_zero_in_residual_expr_still_fails_closed_with_22000() {
+fn division_by_zero_in_residual_expr_still_fails_closed_with_22012() {
     let path = unique_db_path("scalar-index-prune-error-contract");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -468,7 +468,27 @@ fn division_by_zero_in_residual_expr_still_fails_closed_with_22000() {
     let err = core
         .execute_sql(&ctx("tenant-a"), sql)
         .expect_err("division by zero must still be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22012");
+}
+
+/// Issue #1163・SQL-26: 残余式述語（arena フック経由の `WHERE` 評価）の算術あふれが
+/// `XX000` へ化けず `22003` で往復すること（`expr_eval_error_to_arena`／
+/// `map_arena_error` の回帰ガード）。
+#[test]
+fn arithmetic_overflow_in_residual_expr_fails_closed_with_22003() {
+    let path = unique_db_path("scalar-index-prune-overflow-contract");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_ten_rows(&storage, "tenant-a");
+    let core = new_core(storage);
+
+    let sql = "SELECT id FROM docs WHERE kind = 'a' AND (power(10, 300) * power(10, 300)) > 0 \
+               ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
+    let err = core
+        .execute_sql(&ctx("tenant-a"), sql)
+        .expect_err("arithmetic overflow must be rejected");
+    assert_eq!(err.wire_code(), "22003");
 }
 
 // --- 契約 5: RLS ------------------------------------------------------------
