@@ -35,4 +35,11 @@ jobs:
       pull-requests: write
     with:
       provider: codex
+      # update-external.yml が生成する日次同期 PR は上流の取り込みそのもので、
+      # AI の指摘があってもこの PR では直せない（修正先は取り込み元の上流リポジトリ）。
+      # 判定はブランチ名の接頭辞のみで行うため、push できる主体は該当接頭辞の
+      # ブランチで gate を回避できる（受容済み残留リスク。Fandhe-AI/actions の
+      # ai-review/README.md 参照。第三者の write コラボレーターを迎える場合は外す）。
+      # skip 時の review / post_feedback は skipped となり required check を満たす。
+      skip-branch-prefixes: chore/skills-update-,chore/submodule-update-
       post-feedback-runner: ubuntu-latest
