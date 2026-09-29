@@ -402,8 +402,8 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
   応答は「不在時」と同一——TABLE-12・RLS-9）
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
-  `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
-  `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
+  `rows.len()` を INDEX-4 の件数上限相当として判定。起動時 CLI
+  `--batch-max-files`〔優先〕または環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
 - 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
   各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
   積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
