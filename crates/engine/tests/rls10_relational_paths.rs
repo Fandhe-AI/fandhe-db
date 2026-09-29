@@ -997,16 +997,20 @@ mod data_dependent_canaries {
         .expect("insert canary lang");
     }
 
-    /// `MAX_SUBQUERY_IN_LEAVES`（`crate::declarative_filter::MAX_METADATA_FILTERS`
-    /// に一致。公開済み数値基準、spec-confidentiality 許可済み事項）超過は
-    /// `54000`。他テナントの Private 行だけで内側 IN サブクエリの葉数がこの
-    /// 上限を超えても、閲覧テナントには影響しない（内側 SELECT は RLS を経て
-    /// から葉数へ数えられるため）。
+    /// `MAX_SUBQUERY_IN_VALUES`（`crate::core::MAX_SEARCH_K` = 10,000。公開済み
+    /// 数値基準、spec-confidentiality 許可済み事項）超過は `54000`。他テナントの
+    /// Private 行だけで内側 IN サブクエリの distinct 値数がこの上限を超えても、
+    /// 閲覧テナントには影響しない（内側 SELECT は RLS を経てから値数へ数えられる
+    /// ため。Issue #1165 で旧 256 葉上限から引き上げ）。
     #[test]
-    fn subquery_in_leaf_budget_is_invariant_to_other_tenant_flood() {
-        const OVERFLOW_COUNT: u64 = 300;
+    fn subquery_in_value_budget_is_invariant_to_other_tenant_flood() {
+        const OVERFLOW_COUNT: u64 = 5_001;
+        // 2 つの IN サイトの distinct 値合計（2 × 5,001）が文全体の予算
+        // 10,000 を超える形。
         let sql = format!(
-            "SELECT id FROM {CANARY_DOCS} WHERE lang IN (SELECT lang FROM {CANARY_LANGS} LIMIT 1000) LIMIT 5"
+            "SELECT id FROM {CANARY_DOCS} WHERE lang IN \
+             (SELECT lang FROM {CANARY_LANGS} LIMIT 5001) OR lang IN \
+             (SELECT lang FROM {CANARY_LANGS} LIMIT 5001) LIMIT 5"
         );
 
         // baseline: tenant-a は 1 件の可視 langs 行のみ持つ。
@@ -1024,8 +1028,8 @@ mod data_dependent_canaries {
         let core_baseline = new_core(storage_baseline);
         let result_baseline = run(&core_baseline, TENANT_A, true, &sql);
 
-        // flooded: tenant-b が同じテーブルへ 300 件の相異なる Private lang 値を
-        // 追加する（tenant-a からは不可視）。
+        // flooded: tenant-b が同じテーブルへ 5,001 件の相異なる Private lang 値を
+        // 追加する（tenant-a からは不可視）。件数は 1 サイトの上限 5,001 と同じ。
         let path_flooded = unique_db_path("rls10-canary-leaf-flooded");
         let _guard_flooded = CleanupGuard(path_flooded.clone());
         let storage_flooded = Storage::open(&path_flooded).expect("open storage");
@@ -1051,11 +1055,11 @@ mod data_dependent_canaries {
 
         assert_eq!(
             result_baseline, result_flooded,
-            "tenant-a's IN-subquery result must be invariant to tenant-b's invisible leaf flood"
+            "tenant-a's IN-subquery result must be invariant to tenant-b's invisible value flood"
         );
 
-        // 陽性対照: 同じ 300 件を tenant-a 自身の可視行として投入すると、実際に
-        // `54000`（leaf budget 超過）へ落ちる。
+        // 陽性対照: 同じ 5,001 件を tenant-a 自身の可視行として投入すると、実際に
+        // `54000`（value budget 超過）へ落ちる。
         let path_positive = unique_db_path("rls10-canary-leaf-positive");
         let _guard_positive = CleanupGuard(path_positive.clone());
         let storage_positive = Storage::open(&path_positive).expect("open storage");
@@ -1079,7 +1083,7 @@ mod data_dependent_canaries {
         let mut session = SessionState::default();
         let err = core_positive
             .execute_sql_in_session(&ctx_for(TENANT_A, true), &mut session, &sql)
-            .expect_err("own-tenant leaf overflow must be rejected (positive control)");
+            .expect_err("own-tenant value overflow must be rejected (positive control)");
         assert_eq!(err.wire_code(), "54000", "positive control err={err:?}");
     }
 

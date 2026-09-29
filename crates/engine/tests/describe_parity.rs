@@ -420,3 +420,46 @@ fn describe_select_rejects_invalid_vector_literal_before_execute() {
         .expect_err("describe must reject a malformed vector literal, not defer to execute");
     assert_eq!(err.wire_code(), "22000");
 }
+/// Issue #1182・SQL-21: `UPDATE`（単一行・述語形）・述語形 `DELETE`・UPSERT の
+/// `RETURNING` も、Describe の列と Execute の列が一致する（列メタは書き込み前に
+/// 確定する純粋計算で、Describe は本体を実行しない）。
+#[test]
+fn describe_update_delete_upsert_returning_matches_execute() {
+    let path = unique_db_path("describe-dml-returning");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    seed_row(&core, &ctx, 1, "op-seed-1182-1");
+    seed_row(&core, &ctx, 2, "op-seed-1182-2");
+
+    for sql in [
+        "UPDATE documents SET body = 'x' WHERE id = 1 RETURNING id, body USING OPERATION_ID 'op-desc-upd-1'",
+        "UPDATE documents SET body = 'y' WHERE lang = 'en' RETURNING * USING OPERATION_ID 'op-desc-upd-2'",
+        "INSERT INTO documents (id, embedding, body, lang) VALUES (3, '[0.1,0.2,0.3]', 'z', 'en') ON CONFLICT (id) DO NOTHING RETURNING id, lang USING OPERATION_ID 'op-desc-ups-1'",
+        "DELETE FROM documents WHERE lang = 'en' RETURNING id, body USING OPERATION_ID 'op-desc-del-1'",
+    ] {
+        assert_describe_matches_execute(&core, &ctx, sql);
+    }
+}
+
+/// `RETURNING` なしの `UPDATE`・述語形 `DELETE`・UPSERT の Describe は結果列を持たない。
+#[test]
+fn describe_update_delete_upsert_without_returning_reports_no_columns() {
+    let path = unique_db_path("describe-dml-no-returning");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+
+    for sql in [
+        "UPDATE documents SET body = 'x' WHERE id = 1 USING OPERATION_ID 'op-desc-none-1'",
+        "UPDATE documents SET body = 'x' WHERE lang = 'en' USING OPERATION_ID 'op-desc-none-2'",
+        "DELETE FROM documents WHERE lang = 'en' USING OPERATION_ID 'op-desc-none-3'",
+        "INSERT INTO documents (id, embedding, body, lang) VALUES (3, '[0.1,0.2,0.3]', 'z', 'en') ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-desc-none-4'",
+    ] {
+        let parsed = core.parse_sql(sql).expect("parse should succeed");
+        let described = core
+            .describe_parsed_in_session(&session, &parsed)
+            .expect("describe should succeed");
+        assert_eq!(described, None, "{sql} must report no columns");
+    }
+}

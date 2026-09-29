@@ -395,16 +395,14 @@ fn default_literal_exceeding_length_limit_is_rejected() {
     assert_eq!(err.wire_code(), "54000");
 }
 
-// --- ALTER TABLE ADD COLUMN は DEFAULT を拒否する -------------------------
+// --- ALTER TABLE ADD COLUMN は DEFAULT を受け付ける（Issue #1169） -----------
 
 #[test]
-fn alter_table_add_column_rejects_a_column_with_default() {
-    // 既存行への読み出し時の DEFAULT 補完（PostgreSQL の
-    // `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` 相当）は未実装のため、
-    // `ALTER TABLE ADD COLUMN` は `DEFAULT` 付き列を fail-closed に拒否する
-    // （`catalog::Storage::alter_table_add_column`。SQL 表層に `ADD COLUMN`
-    // 構文は無いため Rust API を直接呼ぶ）。
-    let path = unique_db_path("not-null-default-alter-add-column-rejects-default");
+fn alter_table_add_column_accepts_default_and_rejects_unbindable_default() {
+    // `DEFAULT` 付きの ADD COLUMN は受理する（既存行は読み出し時に既定値で補う）。
+    // SQL 表層を経由しない Rust API でも、束縛できない DEFAULT はカタログへ
+    // 永続化する前に拒否する（`catalog::Storage::alter_table_add_column`）。
+    let path = unique_db_path("not-null-default-alter-add-column-default");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage
@@ -414,13 +412,21 @@ fn alter_table_add_column_rejects_a_column_with_default() {
         ))
         .expect("create table");
 
-    let err = storage
+    storage
         .alter_table_add_column(
             "docs",
             ColumnDef::new("lang", ColumnType::Text, true)
                 .with_default(engine::catalog::ColumnDefault::Text("ja".to_string())),
         )
-        .expect_err("ADD COLUMN with DEFAULT must be rejected");
+        .expect("ADD COLUMN with DEFAULT must be accepted");
+
+    let err = storage
+        .alter_table_add_column(
+            "docs",
+            ColumnDef::new("n", ColumnType::Integer, true)
+                .with_default(engine::catalog::ColumnDefault::Number("abc".to_string())),
+        )
+        .expect_err("unbindable DEFAULT must be rejected");
     assert!(
         matches!(err, engine::catalog::CatalogError::Invalid(ref msg) if msg.contains("DEFAULT")),
         "expected CatalogError::Invalid mentioning DEFAULT, got {err:?}"

@@ -905,9 +905,9 @@ pub fn bind_column_projection(
     )
 }
 
-/// `RETURNING` 句（Issue #873・SQL-21）の投影束縛。`INSERT`／`DELETE`（単一行）が
-/// 実行結線済みのため、`sql::allowlist::ValidatedInsert::returning`／
-/// `sql::allowlist::ValidatedDelete::returning` の `Option<Projection>` を
+/// `RETURNING` 句（Issue #873・#1182・SQL-21）の投影束縛。`INSERT`（UPSERT を含む）・
+/// `DELETE`（単一行・述語形）・`UPDATE`（単一行・述語形）の全形が実行結線済みのため、
+/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を
 /// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
 /// 投影実装を作らない）。UDF レジストリを持たないため `Projection::Items`
 /// （関数呼び出し項目）は多層防御として `42601` で拒否する——`sql::allowlist::
@@ -1982,48 +1982,33 @@ pub(crate) fn bind_column_default(
     column: &ColumnDef,
     default: &ColumnDefault,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
-    let literal = match default {
-        ColumnDefault::Text(s) => InsertLiteral::String(s.clone()),
-        ColumnDefault::Number(s) => InsertLiteral::Number(s.clone()),
-        ColumnDefault::Bool(b) => InsertLiteral::Bool(*b),
-    };
-    let incompatible = || {
-        SqlSurfaceError::invalid_input(format!(
-            "column {:?} DEFAULT is not compatible with its type",
+    use crate::row_codec::{DefaultBindError, ScalarRef, Value};
+    // 変換本体は `row_codec::column_default_scalar`（既存行の読み出し時補完と
+    // 共有する唯一の実装。Issue #1169）。ここでは SQLSTATE への写像のみ行う。
+    match crate::row_codec::default_scalar(&column.ty, default) {
+        Ok(scalar) => match scalar {
+            ScalarRef::Text(s) => Ok(Value::Text(s.to_string())),
+            ScalarRef::Integer(v) => Ok(Value::Integer(v)),
+            ScalarRef::BigInt(v) => Ok(Value::BigInt(v)),
+            ScalarRef::Real(v) => Ok(Value::Real(v)),
+            ScalarRef::Double(v) => Ok(Value::Double(v)),
+            ScalarRef::Numeric(d) => Ok(Value::Numeric(d)),
+            ScalarRef::Bool(b) => Ok(Value::Bool(b)),
+            _ => Err(SqlSurfaceError::invalid_input(format!(
+                "column {:?} DEFAULT is not compatible with its type",
+                column.name
+            ))),
+        },
+        Err(DefaultBindError::OutOfRange) => Err(SqlSurfaceError::numeric_out_of_range(format!(
+            "column {:?} DEFAULT is out of range for its type",
             column.name
-        ))
-    };
-    match &column.ty {
-        ColumnType::Text => match &literal {
-            InsertLiteral::String(s) => Ok(crate::row_codec::Value::Text(s.clone())),
-            _ => Err(incompatible()),
-        },
-        ColumnType::Integer | ColumnType::BigInt => {
-            bind_integer_literal(&column.name, column.ty.clone(), &literal)
+        ))),
+        Err(DefaultBindError::Malformed | DefaultBindError::Incompatible) => {
+            Err(SqlSurfaceError::invalid_input(format!(
+                "column {:?} DEFAULT is not compatible with its type",
+                column.name
+            )))
         }
-        ColumnType::Real => match &literal {
-            InsertLiteral::Number(n) => Ok(crate::row_codec::Value::Real(bind_real_literal(n)?)),
-            _ => Err(incompatible()),
-        },
-        ColumnType::Double => match &literal {
-            InsertLiteral::Number(n) => {
-                Ok(crate::row_codec::Value::Double(bind_double_literal(n)?))
-            }
-            _ => Err(incompatible()),
-        },
-        ColumnType::Boolean => match &literal {
-            InsertLiteral::Bool(b) => Ok(crate::row_codec::Value::Bool(*b)),
-            _ => Err(incompatible()),
-        },
-        ColumnType::Numeric { precision, scale } => {
-            bind_numeric_literal(&literal, &column.name, *precision, *scale)
-        }
-        // `VECTOR` は `DEFAULT` 自体が構文段階（`sql::allowlist::
-        // parse_create_table_column`）で拒否されるため到達しない。他の型
-        // （配列・日時・ENUM 等）は `catalog::ColumnDefault::compatible_with`
-        // が `false` を返しカタログに永続化できないため同様に到達しない。
-        // 到達した場合も fail-closed に拒否する。
-        _ => Err(incompatible()),
     }
 }
 
@@ -6435,6 +6420,7 @@ mod tests {
             table_name: "documents".to_string(),
             where_predicates,
             operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
         };
         let err = bind_predicate_delete(
             &stmt,
