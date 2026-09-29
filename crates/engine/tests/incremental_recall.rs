@@ -142,7 +142,6 @@
 //! 動作確認であり、柱 3 単体の検出力を主張する根拠ではない。柱 3 の実際の検出対象は
 //! 上記のとおり「経路固有」の退行に限られ、一括投入経路自身の再処理型退行の検出は
 //! 柱 4 が担う）。
-
 //!
 //! **計測設計の頑健化（Issue #1164）**: 時間判定（柱 2・3 と各負例）は、比較する 2 系統を
 //! ラウンドごとに交互（ABAB）に計測し、両系統へ同じ推定量（[`robust_estimate`]＝最小値）
@@ -506,47 +505,45 @@ fn measure_single_file_insert_round(
 /// 存在しない、単一ファイル経路固有の退行に限られる（経路共通の退行の検出は
 /// `t_full` に依存しない柱 1・2 が担う）。
 fn measure_full_rebuild_batch_round(round: usize) -> Duration {
-    {
-        let full_path = unique_db_path(&format!("recall-full-rebuild-batch-{round}"));
-        let _full_cleanup = CleanupGuard(full_path.clone());
-        let storage = Storage::open(&full_path).expect("open storage");
-        storage
-            .create_table(&documents_schema())
-            .expect("create table");
-        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-            .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
-            .with_incremental_config(small_chunk_config())
-            .with_batch_limits(BatchLimits {
-                max_files_per_batch: BASELINE_FILES + 1,
-                ..BatchLimits::default()
-            });
-        let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        let sqls: Vec<String> = (0..=BASELINE_FILES)
-            .map(|i| {
-                insert_file_sql(
-                    "documents",
-                    &format!("corpus/full-batch-{round}-{i:04}.txt"),
-                    &generic_body(i),
-                    &format!("op-full-batch-{round}-{i:04}"),
-                )
-            })
-            .collect();
-        let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
-        let outcomes = core
-            .execute_insert_sql_batch(&write_ctx, &sql_refs)
-            .expect("full rebuild batch insert should succeed");
+    let full_path = unique_db_path(&format!("recall-full-rebuild-batch-{round}"));
+    let _full_cleanup = CleanupGuard(full_path.clone());
+    let storage = Storage::open(&full_path).expect("open storage");
+    storage
+        .create_table(&documents_schema())
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_files_per_batch: BASELINE_FILES + 1,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sqls: Vec<String> = (0..=BASELINE_FILES)
+        .map(|i| {
+            insert_file_sql(
+                "documents",
+                &format!("corpus/full-batch-{round}-{i:04}.txt"),
+                &generic_body(i),
+                &format!("op-full-batch-{round}-{i:04}"),
+            )
+        })
+        .collect();
+    let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+    let outcomes = core
+        .execute_insert_sql_batch(&write_ctx, &sql_refs)
+        .expect("full rebuild batch insert should succeed");
 
-        let mut total = Duration::ZERO;
-        for outcome in outcomes {
-            let incremental = outcome
-                .incremental
-                .expect("file-form insert sets incremental");
-            total = total
-                .checked_add(timing_total(incremental.timing))
-                .expect("full rebuild duration sum must not overflow");
-        }
-        total
+    let mut total = Duration::ZERO;
+    for outcome in outcomes {
+        let incremental = outcome
+            .incremental
+            .expect("file-form insert sets incremental");
+        total = total
+            .checked_add(timing_total(incremental.timing))
+            .expect("full rebuild duration sum must not overflow");
     }
+    total
 }
 
 /// `index_file_batch`（`execute_insert_sql_batch` が呼ぶ一括投入経路本体）自身に対する、
