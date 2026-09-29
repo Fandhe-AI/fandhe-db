@@ -162,9 +162,6 @@ pub(crate) fn execute_create_table(
         // 専用（既存行の走査結果）で、`create_table`（新規テーブル・既存行なし）
         // からは返らない（到達不能）。
         | CatalogError::UniqueConstraintViolation
-        // `NotNullViolation` は `ALTER TABLE ADD COLUMN`（Issue #1169）専用で、
-        // `create_table` からは返らない（到達不能）。
-        | CatalogError::NotNullViolation { .. }
         // 索引宣言（TASK-206・INDEX-7、Issue #908）専用の変種で、
         // `Storage::create_table` からは返らない（到達不能）。索引名との衝突は
         // `TableAlreadyExists` として返る。
@@ -601,8 +598,6 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::TooManyColumns { .. }
-        // `ALTER TABLE ADD COLUMN`（Issue #1169）専用で、制約 DDL からは返らない。
-        | CatalogError::NotNullViolation { .. }
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
@@ -729,10 +724,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
-        | CatalogError::ForeignKeyViolation
-        // `NotNullViolation` は `ALTER TABLE ADD COLUMN`（Issue #1169）専用で、
-        // DROP COLUMN／ALTER COLUMN TYPE からは到達しない（到達したら内部不整合）。
-        | CatalogError::NotNullViolation { .. } => SqlSurfaceError::Internal {
+        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
@@ -875,9 +867,6 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TooManyColumns { count } => {
             SqlSurfaceError::payload_too_large(format!("too many columns: {count}"))
         }
-        // `DEFAULT` なしの `NOT NULL` 列を行のあるテーブルへ追加（Issue #1169）。
-        // PostgreSQL と同じ `23502`。列名のみを含め行数・テナントは露出しない。
-        CatalogError::NotNullViolation { column } => SqlSurfaceError::not_null_violation(column),
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
         CatalogError::TypeNotFound(name) => SqlSurfaceError::UnsupportedSyntax {
             detail: format!("unknown type name: {name}"),

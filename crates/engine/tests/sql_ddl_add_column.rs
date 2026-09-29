@@ -871,37 +871,33 @@ fn default_values_are_correct_for_each_supported_type() {
     );
 }
 
+/// `DEFAULT` を欠く `NOT NULL` の追加は、行の有無（自テナント・他テナント・空）に
+/// かかわらず同一の `42601` で拒否される（TABLE-16）。他テナントの行の存在が DDL の
+/// 成否から判別できないこと（テナント境界 P0）と、副作用ゼロを固定する。
 #[test]
-fn not_null_without_default_on_non_empty_table_is_rejected_with_23502_and_has_no_side_effect() {
+fn not_null_without_default_is_rejected_uniformly_regardless_of_rows() {
+    // 空テーブル
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
-    // 他テナントの行だけが存在する場合も拒否される（DDL はテナント非依存）。
-    insert_row(&core, &ctx("bob"), 1, 1);
-
-    let err = add_column(&core, "note TEXT NOT NULL").expect_err("must be rejected");
-    assert_eq!(err.wire_code(), "23502");
+    let empty_err = add_column(&core, "note TEXT NOT NULL").expect_err("empty: rejected");
+    assert_eq!(empty_err.wire_code(), "42601");
     assert!(!column_exists(&core, &ctx("bob"), TABLE, "note"));
-}
 
-#[test]
-fn not_null_without_default_on_empty_table_succeeds_and_enforces_on_insert() {
-    let (core, path) = new_core_with_table();
-    let _guard = CleanupGuard(path);
-    let owner = ctx("owner");
+    // 他テナントの行だけがある場合
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "note TEXT NOT NULL").expect_err("other tenant: rejected");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "note"));
 
-    add_column(&core, "note TEXT NOT NULL").expect("empty table accepts NOT NULL");
-    assert!(column_exists(&core, &owner, TABLE, "note"));
+    // 自テナントの行もある場合
+    insert_row(&core, &ctx("owner"), 2, 2);
+    let own_err = add_column(&core, "note TEXT NOT NULL").expect_err("own rows: rejected");
+    assert_eq!(own_err.wire_code(), "42601");
+    assert!(!column_exists(&core, &ctx("owner"), TABLE, "note"));
 
-    let err = core
-        .execute_sql_in_session(
-            &owner,
-            &mut SessionState::default(),
-            &format!(
-                "INSERT INTO {TABLE} (id, embedding) VALUES (1, '[0.3,0.4]') USING OPERATION_ID 'op-1'"
-            ),
-        )
-        .expect_err("omitted NOT NULL column without DEFAULT");
-    assert_eq!(err.wire_code(), "23502");
+    // 応答は行の有無で区別できない（同一の文言）。
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert_eq!(empty_err.to_string(), own_err.to_string());
 }
 
 #[test]

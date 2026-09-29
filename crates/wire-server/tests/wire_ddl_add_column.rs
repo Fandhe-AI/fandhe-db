@@ -123,7 +123,6 @@ fn wire_add_column_with_not_null_and_default_receives_command_complete() {
     for sql in [
         "ALTER TABLE docs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ja'",
         "ALTER TABLE docs ADD COLUMN n INTEGER DEFAULT 3",
-        "ALTER TABLE docs ADD COLUMN req TEXT NOT NULL",
     ] {
         send_simple_query(&mut stream, sql);
         let tag = read_command_complete(&mut stream);

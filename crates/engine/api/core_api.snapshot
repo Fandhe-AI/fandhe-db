@@ -284,7 +284,6 @@ pub enum CatalogError {
     },
     TooManyColumns { count: usize },
     UniqueConstraintViolation,
-    NotNullViolation { column: String },
     IndexAlreadyExists(String),
     IndexNotFound(String),
     IndexKindMismatch(String),

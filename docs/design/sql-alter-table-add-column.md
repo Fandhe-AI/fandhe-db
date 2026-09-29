@@ -27,9 +27,11 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   `INSERT` の列省略補完と同じ `row_codec::column_default_scalar` を通す。列の `DEFAULT` は
   作成後に変わらないことが前提で、`ALTER COLUMN SET DEFAULT` を導入する場合は補完専用の値の
   分離が必要。
-- `DEFAULT` なしの `NOT NULL` は、同じ write txn 内で行ストアの空判定を行い、行が 1 件でも
-  あれば `23502`（`CatalogError::NotNullViolation`）、空なら成功する（TOCTOU 防止。全テナントが
-  母集合で、応答には列名のみを含める）。
+- `DEFAULT` なしの `NOT NULL` は、行の有無（自テナント・他テナント・空）にかかわらず構造検証段階で
+  一律 `42601` 拒否する（TABLE-16。カタログ・行ストアを参照しない）。行の有無で成否を変えると、
+  DDL 主体が他テナントの行の存在を判別できてしまう（テナント境界 P0）ため、判定を行データに
+  依存させない。Rust API（`Storage::alter_table_add_column`）も同じ条件を `CatalogError::Invalid` で
+  拒否する。
 - `DEFAULT` の判定順序（決定的）: テーブル存在（`42P01`／`42809`）→ 型名解決（VECTOR `0A000`）→
   DEFAULT 非対応型（`0A000`）→ リテラル種別不一致（`42601`）・長さ超過（`54000`）→ 値の束縛
   （範囲外 `22003`・不正 `22000`）→ カタログ更新。

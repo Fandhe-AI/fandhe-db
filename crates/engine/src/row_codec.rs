@@ -3072,13 +3072,16 @@ fn scan_scalar_columns_validated<'a>(
                 // 読み出し時に既定値を補い（行は書き換えない）、なければ nullable
                 // のみ NULL として許容する。墓標は `default == None` のため従来どおり。
                 if let Some(default) = column.default {
+                    // マスク外でも DEFAULT の妥当性は検証する（参照列の選択で
+                    // カタログ破損の検出結果が変わらないようにする。fail-closed）。
+                    // 出力の保持だけを `wanted` で省略する。
+                    let value = default_scalar(column.ty, default).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} has an invalid DEFAULT for its type",
+                            column.name
+                        ))
+                    })?;
                     if wanted {
-                        let value = default_scalar(column.ty, default).map_err(|_| {
-                            RowCodecError::Invalid(format!(
-                                "column {:?} has an invalid DEFAULT for its type",
-                                column.name
-                            ))
-                        })?;
                         sink(col_index, Some(value))?;
                     } else {
                         sink(col_index, None)?;
@@ -5386,6 +5389,21 @@ mod tests {
                 .with_default(ColumnDefault::Number("abc".to_string()))]);
         assert!(matches!(
             scan_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn unbindable_default_is_rejected_even_when_masked_out() {
+        // マスク外（読まない列）の不正 DEFAULT も検出する。参照列の選択で
+        // カタログ破損の検出結果が変わらないこと（fail-closed）を固定する。
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![ColumnDef::new("z", ColumnType::Integer, true)
+                .with_default(ColumnDefault::Number("abc".to_string()))]);
+        let mask = vec![true, false];
+        assert_eq!(mask.len(), schema.columns.len());
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
             Err(RowCodecError::Invalid(_))
         ));
     }

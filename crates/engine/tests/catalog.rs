@@ -277,10 +277,10 @@ fn table5_alter_table_add_column_preserves_existing_row_bytes() {
 }
 
 #[test]
-fn table5_alter_table_add_column_accepts_not_null_on_empty_user_table() {
-    // `DEFAULT` なしの `NOT NULL` は行のないテーブルでは受理する（Issue #1169。
-    // 行あり時の `NotNullViolation` は `tests/sql_ddl_add_column.rs` で SQL 経由に固定）。
-    let path = unique_db_path("table5-not-null-empty");
+fn table5_alter_table_add_column_rejects_not_null_without_default_regardless_of_rows() {
+    // `DEFAULT` なしの `NOT NULL` は行の有無にかかわらず一律 `Invalid` で拒否する
+    // （TABLE-16。行の有無で成否が変わると他テナントの行の存在が漏れるため）。
+    let path = unique_db_path("table5-not-null-uniform");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
@@ -288,16 +288,12 @@ fn table5_alter_table_add_column_accepts_not_null_on_empty_user_table() {
         .create_table(&embedding_schema("docs", 8))
         .expect("create_table");
 
-    storage
+    let err = storage
         .alter_table_add_column("docs", ColumnDef::new("tag", ColumnType::Text, false))
-        .expect("NOT NULL without DEFAULT is accepted on an empty table");
+        .expect_err("NOT NULL without DEFAULT must be rejected");
+    assert!(matches!(err, CatalogError::Invalid(_)), "got {err:?}");
     let schema = storage.get_table_schema("docs").expect("get_table_schema");
-    let added = schema
-        .columns
-        .iter()
-        .find(|c| c.name == "tag")
-        .expect("column added");
-    assert!(!added.nullable);
+    assert!(schema.columns.iter().all(|c| c.name != "tag"));
 }
 
 #[test]

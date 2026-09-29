@@ -2422,8 +2422,8 @@ pub struct ValidatedAlterTableAddColumn {
     /// 型名の構文木。意味づけ（ENUM 型名の存在確認・`ColumnType` への変換）は
     /// `sql::ddl::execute_alter_table_add_column` の責務。
     pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
-    /// `NOT NULL` 句の有無（Issue #1169）。`DEFAULT` を伴わない場合の行あり
-    /// テーブルへの追加拒否（`23502`）は実行段がカタログ（write txn）内で判定する。
+    /// `NOT NULL` 句の有無（Issue #1169）。`DEFAULT` を伴わない `NOT NULL` は
+    /// 構造検証段階で `42601` 拒否済みのため、`true` なら `default` は常に `Some`。
     pub not_null: bool,
     /// `DEFAULT <literal>` のリテラル（Issue #1169）。列型との整合・値の束縛は
     /// カタログ照会を要するため実行段（`sql::ddl::execute_alter_table_add_column`）
@@ -5181,6 +5181,14 @@ impl<'a> Parser<'a> {
                 if constraints.unique {
                     return Err(SqlSurfaceError::unsupported(
                         "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
+                    ));
+                }
+                // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
+                // （TABLE-16）。カタログ・行を参照しない構造判定のため、存在オラクル・
+                // 他テナント行の有無の判別手段にならない。
+                if constraints.not_null && constraints.default.is_none() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "NOT NULL in ALTER TABLE ADD COLUMN requires a DEFAULT",
                     ));
                 }
                 return Ok(ParsedAlterTableShape::AddColumn(
