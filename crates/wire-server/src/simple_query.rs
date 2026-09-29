@@ -17,25 +17,28 @@
 //! エラーになった場合はそこで打ち切り、ErrorResponse＋`ReadyForQuery` を返して
 //! 残りの文は実行しない。
 //!
-//! 明示 `BEGIN`（SQL-31・RECOVER-12）を持つ複数文トランザクション機構は
-//! 未実装のため、書き込み系文（`INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`。
-//! `engine::sql::statement_splitter::StatementEffect::Write`）は複数文
-//! メッセージの最後の 1 文にのみ許可する（`check_write_placement`。違反は
-//! `0A000` で 1 文も実行せずに拒否）。この制約下では、先行文がエラーになれば
-//! 書き込み文はまだ実行されておらず、最後の書き込み文自身がエラーになれば
-//! その文の redb トランザクションが単独で原子的に失敗するため、追加の
-//! 分散トランザクション機構なしに WIRE-16 の原子性要件が構造的に成立する
-//! （詳細・緩和条件は `docs/design/wire-multi-statement.md` 参照）。
+//! 実行方式は `engine::sql::statement_splitter::plan_multi_statement` が選ぶ
+//! （Issue #1175）。書き込み系文（`INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`。
+//! `StatementEffect::Write`）が最後の 1 文だけ、または `BEGIN`／`COMMIT`／
+//! `ROLLBACK` を含むメッセージ・トランザクション中のセッションは文ごとに順次実行し
+//! （[`run_sequential_statements`]。従来どおり `check_write_placement` が書き込み位置を
+//! 検査し、違反は `0A000`）、書き込みが最後以外にあるメッセージはメッセージ全体を
+//! 1 つの暗黙トランザクションで原子的に実行する（[`run_implicit_transaction`]。
+//! 途中でエラーになれば先行する書き込みも残らず、接続は `ReadyForQuery('I')` のまま）。
+//! 詳細・既知の逸脱は `docs/design/wire-multi-statement.md` 参照。
 //! 途中でエラーになった場合はセッション状態（`SET`／`CREATE FUNCTION` 等）も
 //! メッセージ受信前の値へ巻き戻す（`SessionState` の `clone` を保持し、
-//! 失敗時に復元する）。ただしメッセージ内で明示トランザクションの境界
+//! 失敗時に復元する）。ただし順次実行でメッセージ内の明示トランザクションの境界
 //! （`BEGIN`/`COMMIT`/`ROLLBACK`）を跨いだ場合、巻き戻し先はその境界の時点の
 //! 状態へ更新する（SQL-31・TASK-221。`MessageSnapshot` 参照）。
+//!
+//! `COPY`（WIRE-17）は文単位で [`run_copy_statement`] が扱い、複数文メッセージの
+//! 2 文目以降の `COPY` も CopyIn／CopyOut サブプロトコルへ入る（Issue #1175）。
 //!
 //! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
 //! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
 //! へ委譲し `SqlOutcome::Insert` を返す。`crates/engine/src/core.rs` 参照）。
-//! `INSERT`／単一行 `DELETE` に `RETURNING` 句を付けた場合は `SqlOutcome::
+//! `INSERT`／`DELETE`／`UPDATE`／UPSERT に `RETURNING` 句を付けた場合は `SqlOutcome::
 //! Returning` を返し、`respond_rows_with_tag` が `RowDescription`／`DataRow`*
 //! に続けて `rows_affected`（`result.rows.len()` とは独立）由来の
 //! `CommandComplete` タグを送出する（Issue #873・SQL-21）。
@@ -61,6 +64,7 @@ use engine::sql::mode::SessionState;
 use engine::sql::transaction::SessionTransaction;
 use engine::sql::SqlOutcome;
 
+use crate::extended_query::LoopSignal;
 use crate::result_encoder;
 use crate::wire_stream::WireStream;
 
@@ -90,7 +94,7 @@ fn respond_error_and_ready<S: WireStream>(
 /// エラー応答（`respond_error_and_ready`）は `finish` に関係なく常に
 /// `ReadyForQuery` を送る（途中エラーで打ち切るため、その時点で確定する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Finish {
+pub(crate) enum Finish {
     ReadyForQuery,
     Continue,
 }
@@ -118,6 +122,12 @@ enum StatementStatus {
 /// SQL テキストを無加工のまま [`run_statement`] へ渡す ―― これにより単一文の
 /// 既存挙動（応答バイト列・エラーコード・メッセージ）は構造的に不変のまま保たれる。
 ///
+/// `COPY`（WIRE-17）は文単位で [`run_copy_statement`] へ振り分ける（Issue #1175）。
+/// 複数文メッセージの 2 文目以降の `COPY` も、PostgreSQL と同じく CopyIn／CopyOut
+/// サブプロトコルへ入り、続きの文を処理する。戻り値 [`LoopSignal::Closed`] は COPY 中に
+/// Terminate を受信した場合で、呼び出し元（`handshake::post_auth_loop`）は接続ループを
+/// 終了させる。
+///
 /// SQL 本文・テナント ID はログへ出さない（security.md P0）。
 pub(crate) fn execute_and_respond<'e, S: WireStream>(
     stream: &mut S,
@@ -126,7 +136,7 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
     session: &mut SessionState,
     txn: &mut SessionTransaction<'e>,
     sql: &str,
-) -> io::Result<()> {
+) -> io::Result<LoopSignal> {
     // commit 成功から本関数が応答を書き終える（`ReadyForQuery` 送出含む）までの
     // 区間全体を覆う RAII ガード（RECOVER-5 (3)・codex-review P1・PR #246 指摘対応）。
     // 区間内で engine 側の書き込み系 commit が成功すると
@@ -137,8 +147,9 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
     // thread-per-connection モデルのため、スレッドローカルでの受け渡しが成立する。
     // `engine::recovery::commit_boundary` モジュールドキュメント参照）。
     // WIRE-16: 複数文メッセージでも本ガードは `'Q'` 本文 1 通全体を覆ったまま
-    // 変更しない（1 メッセージにつき commit は高々 1 回――書き込み文を最後の
-    // 1 文に限る制約〔モジュールドキュメント「原子性」節〕により保証される）。
+    // 変更しない（1 メッセージにつき commit は高々 1 回――`Sequential` では書き込みを
+    // 最後の 1 文に限る制約、暗黙トランザクションでは最後の文の成功後の
+    // `commit_implicit` 1 回だけ〔モジュールドキュメント「原子性」節〕により保証される）。
     // 注意: `_response_boundary` を `let _ = ...`（無名束縛）に書き換えると即座に
     // drop され、この保護区間全体が無効化される（`ResponseBoundaryGuard` は
     // `#[must_use]`。関数末尾まで生存させるため必ずこの名前付き束縛のまま保つ）。
@@ -146,7 +157,8 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
 
     if sql.trim().is_empty() {
         write_all(stream, &result_encoder::encode_empty_query_response())?;
-        return crate::handshake::write_ready_for_query_io(stream, txn.status());
+        crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+        return Ok(LoopSignal::Continue);
     }
 
     match engine::sql::statement_splitter::split_statements(sql) {
@@ -154,68 +166,271 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
             // 分割・位置検証のエラーも、明示トランザクション中なら `Failed` へ
             // 遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘: `Active` の
             // まま残すと後続の `COMMIT` が先行する書き込みを永続化してしまう）。
-            respond_splitter_error(stream, txn, &e)
+            respond_splitter_error(stream, txn, &e)?;
+            Ok(LoopSignal::Continue)
         }
-        Ok(engine::sql::statement_splitter::SplitOutcome::Single) => run_statement(
-            stream,
-            engine,
-            ctx,
-            session,
-            txn,
-            sql,
-            Finish::ReadyForQuery,
-        )
-        .map(|_| ()),
+        Ok(engine::sql::statement_splitter::SplitOutcome::Single) => {
+            if engine::sql::copy::is_copy_statement(sql) {
+                return run_copy_statement(
+                    stream,
+                    engine,
+                    ctx,
+                    session,
+                    txn,
+                    sql,
+                    Finish::ReadyForQuery,
+                )
+                .map(copy_step_to_signal);
+            }
+            run_statement(
+                stream,
+                engine,
+                ctx,
+                session,
+                txn,
+                sql,
+                Finish::ReadyForQuery,
+            )
+            .map(|_| LoopSignal::Continue)
+        }
         Ok(engine::sql::statement_splitter::SplitOutcome::Empty) => {
             write_all(stream, &result_encoder::encode_empty_query_response())?;
-            crate::handshake::write_ready_for_query_io(stream, txn.status())
+            crate::handshake::write_ready_for_query_io(stream, txn.status())?;
+            Ok(LoopSignal::Continue)
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Statements(stmts)) => {
-            // 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`）は、本メッセージ
-            // 受信前から明示トランザクション中（`txn.is_active()`）でない限り
-            // 最後の 1 文に限る（モジュールドキュメント「原子性」節。SQL-31・
-            // TASK-221 で `BEGIN` を含むメッセージのルールへ拡張済み）。違反時は
-            // 1 文も実行せず `0A000` で拒否する。
-            if let Err(e) =
-                engine::sql::statement_splitter::check_write_placement(&stmts, txn.is_active())
-            {
-                return respond_splitter_error(stream, txn, &e);
-            }
-            // 途中の文がエラーになった場合に巻き戻すためのスナップショット
-            // （`SET`／`CREATE FUNCTION` の暗黙ロールバック）。単一文経路
-            // （`Single`）はこの clone を行わないため、既存の単一文レイテンシ・
-            // コストは不変。トランザクション状態自体（`txn`）は巻き戻さない ――
-            // `BEGIN` 済みのトランザクションは、途中の文がエラーになれば `Failed`
-            // へ遷移したまま残り、次の `ROLLBACK` で閉じる契約
-            // （`sql::transaction` モジュールドキュメント参照）。巻き戻し先は
-            // メッセージ内の直近のトランザクション境界へ更新する
-            // （[`MessageSnapshot`] 参照。PR #1041 レビュー指摘）。
-            let mut snapshot = MessageSnapshot::new(session);
-            let last_index = stmts.len().saturating_sub(1);
-            for (i, stmt) in stmts.iter().enumerate() {
-                let finish = if i == last_index {
-                    Finish::ReadyForQuery
-                } else {
-                    Finish::Continue
-                };
-                let before = txn.status();
-                match run_statement(stream, engine, ctx, session, txn, stmt, finish)? {
-                    StatementStatus::Completed => {
-                        snapshot.after_completed(before, txn.status(), session);
-                    }
-                    StatementStatus::Failed => {
-                        // ErrorResponse＋ReadyForQuery は run_statement 内で
-                        // 送出済み。残りの文は実行せず、セッション状態を復元する。
-                        snapshot.restore_after_failure(before, txn.status(), session);
-                        return Ok(());
-                    }
+            // セッションが `Idle` でない（明示トランザクション中・`Failed`）場合は
+            // 暗黙トランザクションにせず既存の逐次実行へ倒す（`Failed` では個々の文が
+            // `25P02` を返す）。
+            let session_in_txn = txn.status() != engine::sql::transaction::TransactionStatus::Idle;
+            match engine::sql::statement_splitter::plan_multi_statement(&stmts, session_in_txn) {
+                Err(e) => {
+                    respond_splitter_error(stream, txn, &e)?;
+                    Ok(LoopSignal::Continue)
+                }
+                Ok(engine::sql::statement_splitter::MultiStatementPlan::Sequential) => {
+                    run_sequential_statements(stream, engine, ctx, session, txn, &stmts)
+                }
+                Ok(engine::sql::statement_splitter::MultiStatementPlan::ImplicitTransaction) => {
+                    run_implicit_transaction(stream, engine, ctx, session, txn, &stmts)
                 }
             }
-            Ok(())
         }
     }
 }
 
+/// [`crate::copy::CopyStep`] を接続ループへの合図へ写像する（`Closed` のみ接続終了）。
+fn copy_step_to_signal(step: crate::copy::CopyStep) -> LoopSignal {
+    match step {
+        crate::copy::CopyStep::Closed => LoopSignal::Closed,
+        crate::copy::CopyStep::Completed | crate::copy::CopyStep::Failed => LoopSignal::Continue,
+    }
+}
+
+/// 複数文メッセージを 1 文ずつ順次実行する（[`engine::sql::statement_splitter::
+/// MultiStatementPlan::Sequential`]。文ごとの autocommit、または `BEGIN` を含む
+/// メッセージ・トランザクション中のセッション）。途中の文がエラーになったらそこで
+/// 打ち切り、セッション状態を直近のトランザクション境界へ巻き戻す
+/// （[`MessageSnapshot`]）。
+fn run_sequential_statements<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    stmts: &[&str],
+) -> io::Result<LoopSignal> {
+    // 途中の文がエラーになった場合に巻き戻すためのスナップショット
+    // （`SET`／`CREATE FUNCTION` の暗黙ロールバック）。単一文経路
+    // （`Single`）はこの clone を行わないため、既存の単一文レイテンシ・
+    // コストは不変。トランザクション状態自体（`txn`）は巻き戻さない ――
+    // `BEGIN` 済みのトランザクションは、途中の文がエラーになれば `Failed`
+    // へ遷移したまま残り、次の `ROLLBACK` で閉じる契約
+    // （`sql::transaction` モジュールドキュメント参照）。巻き戻し先は
+    // メッセージ内の直近のトランザクション境界へ更新する
+    // （[`MessageSnapshot`] 参照。PR #1041 レビュー指摘）。
+    let mut snapshot = MessageSnapshot::new(session);
+    let last_index = stmts.len().saturating_sub(1);
+    for (i, stmt) in stmts.iter().enumerate() {
+        let finish = if i == last_index {
+            Finish::ReadyForQuery
+        } else {
+            Finish::Continue
+        };
+        let before = txn.status();
+        let status = if engine::sql::copy::is_copy_statement(stmt) {
+            match run_copy_statement(stream, engine, ctx, session, txn, stmt, finish)? {
+                crate::copy::CopyStep::Completed => StatementStatus::Completed,
+                crate::copy::CopyStep::Failed => StatementStatus::Failed,
+                crate::copy::CopyStep::Closed => return Ok(LoopSignal::Closed),
+            }
+        } else {
+            run_statement(stream, engine, ctx, session, txn, stmt, finish)?
+        };
+        match status {
+            StatementStatus::Completed => {
+                snapshot.after_completed(before, txn.status(), session);
+            }
+            StatementStatus::Failed => {
+                // ErrorResponse＋ReadyForQuery は run_statement 内で
+                // 送出済み。残りの文は実行せず、セッション状態を復元する。
+                snapshot.restore_after_failure(before, txn.status(), session);
+                return Ok(LoopSignal::Continue);
+            }
+        }
+    }
+    Ok(LoopSignal::Continue)
+}
+
+/// `BEGIN` を含まず、トランザクション外の書き込みが最後以外にある複数文メッセージを、
+/// 1 つの暗黙トランザクションで原子的に実行する（Issue #1175・WIRE-16・SQL-31・
+/// RECOVER-12。[`engine::sql::statement_splitter::MultiStatementPlan::
+/// ImplicitTransaction`]）。
+///
+/// 開始点はメッセージの先頭（最初の書き込みの直前ではない）。メッセージ全体が 1 つの
+/// トランザクションになり、`SET`・カーソル・読み取りの意味が一様になる代わりに、
+/// 先頭の読み取りの間も単一ライタのゲートを保持する（保持時間は `max_duration` と
+/// 文数上限 16 で有界）。commit は最後の文の応答を書く**前**に 1 回だけ行う
+/// （[`run_statement_as`] の [`StatementRole::ImplicitFinal`]）。
+///
+/// 失敗経路はすべて `Idle`（write txn を abort し、ライタを解放）に収束する:
+/// 途中エラーは `SessionTransaction::fail` が暗黙トランザクションを `Idle` へ戻し、
+/// エラー応答は `ReadyForQuery('I')` と一緒に送られる。セッション状態
+/// （`SET`／`CREATE FUNCTION`）はメッセージ受信前のスナップショットへ**無条件に**
+/// 復元する（[`MessageSnapshot`] は `Active` → `Idle` の遷移で復元を省くため使わない）。
+/// どの return 経路でも、戻る直前に暗黙トランザクションが残っていれば abort する。
+fn run_implicit_transaction<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    stmts: &[&str],
+) -> io::Result<LoopSignal> {
+    let snapshot = session.clone();
+    if let Err(e) = engine.begin_implicit_transaction(txn, session) {
+        // ライタゲートの待機上限超過（`55P03`）等。1 文も実行しない。
+        respond_error_and_ready(stream, e.error_class(), &e.client_message(), txn.status())?;
+        return Ok(LoopSignal::Continue);
+    }
+    let result = run_implicit_statements(stream, engine, ctx, session, txn, stmts, &snapshot);
+    // 後処理の一元化: 暗黙トランザクションを残したまま次のメッセージへ進まない
+    // （成功時は `commit_implicit` が、失敗時は `fail` が既に `Idle` へ戻している。
+    // `io::Error` による中断や想定外の経路の最後の砦）。
+    txn.abort_implicit();
+    result
+}
+
+/// [`run_implicit_transaction`] の本体（文の逐次実行と失敗時のセッション復元）。
+fn run_implicit_statements<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    stmts: &[&str],
+    snapshot: &SessionState,
+) -> io::Result<LoopSignal> {
+    let last_index = stmts.len().saturating_sub(1);
+    for (i, stmt) in stmts.iter().enumerate() {
+        let is_last = i == last_index;
+        if engine::sql::copy::is_copy_statement(stmt) {
+            // トランザクション内の COPY は未対応（`0A000`）。`run_copy_statement` が
+            // 暗黙トランザクションを `Idle` へ戻し、`ReadyForQuery('I')` を送る。
+            // 原子性を優先し、CopyIn へは入らずメッセージ全体をロールバックする。
+            let step = run_copy_statement(
+                stream,
+                engine,
+                ctx,
+                session,
+                txn,
+                stmt,
+                Finish::ReadyForQuery,
+            )?;
+            *session = snapshot.clone();
+            return Ok(copy_step_to_signal(step));
+        }
+        let (finish, role) = if is_last {
+            (Finish::ReadyForQuery, StatementRole::ImplicitFinal)
+        } else {
+            (Finish::Continue, StatementRole::ImplicitIntermediate)
+        };
+        match run_statement_as(stream, engine, ctx, session, txn, stmt, finish, role)? {
+            StatementStatus::Completed => {
+                if !is_last && !txn.is_implicit_active() {
+                    // 想定外: 途中の文の後に暗黙トランザクションが失われている。
+                    // 後続の書き込みが autocommit で実行されないよう、ここで打ち切る
+                    // （fail-closed）。
+                    respond_error_and_ready(
+                        stream,
+                        ErrorClass::InternalError,
+                        "internal error",
+                        txn.status(),
+                    )?;
+                    *session = snapshot.clone();
+                    return Ok(LoopSignal::Continue);
+                }
+            }
+            StatementStatus::Failed => {
+                // ErrorResponse＋ReadyForQuery('I') は送出済み。先行する書き込みは
+                // `fail` が破棄している。セッション状態をメッセージ受信前へ戻す。
+                *session = snapshot.clone();
+                return Ok(LoopSignal::Continue);
+            }
+        }
+    }
+    Ok(LoopSignal::Continue)
+}
+
+/// 分割済みの `COPY` 1 文を実行する（Issue #1175。従来は `handshake::post_auth_loop` が
+/// メッセージ全文を覗いて `crate::copy::run` へ分岐していたが、複数文メッセージの
+/// 2 文目以降の `COPY` を扱うため文単位へ移した）。
+///
+/// セッションの状態に応じて分岐する（SQL-31・TASK-221。PR #1041 レビュー指摘:
+/// `Failed` 中の COPY も autocommit として実行させない）:
+/// - `Idle`: [`crate::copy::run`] へ委譲する。
+/// - `InTransaction`: トランザクション内の COPY は未対応。`fail()` の後に `0A000`。
+///   暗黙トランザクションでは `fail()` が `Idle` へ戻すので `ReadyForQuery('I')`。
+/// - `Failed`: 他の文と同じく `25P02`（期限切れ未報告なら `54000`）で拒否する。
+fn run_copy_statement<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    stmt: &str,
+    finish: Finish,
+) -> io::Result<crate::copy::CopyStep> {
+    use engine::sql::transaction::TransactionStatus;
+    match txn.status() {
+        TransactionStatus::Idle => crate::copy::run(stream, engine, ctx, session, stmt, finish),
+        TransactionStatus::InTransaction => {
+            let message = if txn.is_implicit_active() {
+                "COPY is not supported inside a transaction block"
+            } else {
+                "COPY is not supported inside an explicit transaction"
+            };
+            txn.fail();
+            respond_error_and_ready(
+                stream,
+                ErrorClass::FeatureNotSupported,
+                message,
+                txn.status(),
+            )?;
+            Ok(crate::copy::CopyStep::Failed)
+        }
+        TransactionStatus::Failed => {
+            let err = txn.take_failed_error();
+            respond_error_and_ready(
+                stream,
+                err.error_class(),
+                &err.client_message(),
+                txn.status(),
+            )?;
+            Ok(crate::copy::CopyStep::Failed)
+        }
+    }
+}
 /// 複数文メッセージ（WIRE-16）の途中エラー時に巻き戻すセッション状態の
 /// スナップショット（SQL-31・TASK-221。PR #1041 レビュー指摘）。
 ///
@@ -331,9 +546,61 @@ fn run_statement<'e, S: WireStream>(
     stmt_sql: &str,
     finish: Finish,
 ) -> io::Result<StatementStatus> {
-    let outcome = execute_with_emergency_registration(stream, || {
-        engine.execute_sql_in_txn(ctx, session, txn, stmt_sql)
-    });
+    run_statement_as(
+        stream,
+        engine,
+        ctx,
+        session,
+        txn,
+        stmt_sql,
+        finish,
+        StatementRole::Standalone,
+    )
+}
+
+/// 文が暗黙トランザクション（Issue #1175）の中でどの位置にあるか。commit を行う
+/// 区間と緊急応答の登録区間を一致させるために [`run_statement_as`] が使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementRole {
+    /// 暗黙トランザクション外の文（単一文・逐次実行の各文）。
+    Standalone,
+    /// 暗黙トランザクションの最後以外の文。commit は起きないので、緊急応答の登録・
+    /// 障害注入点は不要（commit 前の panic では緊急応答は送られない）。
+    ImplicitIntermediate,
+    /// 暗黙トランザクションの最後の文。文の実行に続けて `commit_implicit` を
+    /// **緊急応答の登録区間の内側**で行う。これにより RECOVER-6（commit 後の panic
+    /// への緊急応答）が commit 点を覆い、「1 メッセージにつき commit は高々 1 回」も
+    /// 保たれる（`_response_boundary` は変えない）。commit に失敗した場合は
+    /// `CommandComplete` を送らず ErrorResponse＋`ReadyForQuery('I')` を返す
+    /// （commit を最後の応答より前に行う PostgreSQL と同じ順序）。
+    ImplicitFinal,
+}
+
+/// [`run_statement`] の本体（[`StatementRole`] で暗黙トランザクション内の位置を指定する）。
+#[allow(clippy::too_many_arguments)]
+fn run_statement_as<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    stmt_sql: &str,
+    finish: Finish,
+    role: StatementRole,
+) -> io::Result<StatementStatus> {
+    let outcome = match role {
+        StatementRole::Standalone => execute_with_emergency_registration(stream, || {
+            engine.execute_sql_in_txn(ctx, session, txn, stmt_sql)
+        }),
+        StatementRole::ImplicitIntermediate => {
+            engine.execute_sql_in_txn(ctx, session, txn, stmt_sql)
+        }
+        StatementRole::ImplicitFinal => execute_with_emergency_registration(stream, || {
+            let outcome = engine.execute_sql_in_txn(ctx, session, txn, stmt_sql)?;
+            txn.commit_implicit(session)?;
+            Ok(outcome)
+        }),
+    };
 
     match outcome {
         Ok(outcome) => match map_outcome(outcome) {

@@ -47,14 +47,14 @@
 //!
 //! バイナリ形式（format code 1・WIRE-14・TASK-218・Issue #936）: 列ごとに
 //! テキスト／バイナリを要求できる（PostgreSQL の Bind 規則。[`ResultFormats`]）。
-//! 対応型は `WireType::Text`（UTF-8 生バイト）のみで、`Id`（`numeric`）・
+//! 対応型は `TEXT`（UTF-8 生バイト）と、Issue #1172 で追加した `INTEGER`・
+//! `BIGINT`・`REAL`・`DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`（PostgreSQL の
+//! send 形式。結線は [`encode_data_row_into_with_columns`]）で、`Id`（`numeric`）・
 //! `Vector`（text 表現だが値はベクトル）・`Computed`（実行時型で静的に決まらない）
 //! はいずれもバイナリ非対応として事前検査（[`validate_binary_formats`]）で
 //! `0A000` に拒否する（spec の WIRE-14 が定める対応範囲。`VECTOR` 列の独自
-//! バイナリ表現は定義しない）。8 型のレイアウト関数（[`binary`]）は
-//! `WireType` 側の対応拡大（Issue #895 で OID 公告は実施済み。バイナリ表現
-//! の対応拡大は WIRE-14・TASK-218 の後続として別途追跡する）に備えた部品と
-//! して先行提供するが、本モジュールが実際に結線するのは `Text` のみ。
+//! バイナリ表現は定義しない）。`NUMERIC`・`DATE`・
+//! `TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM` も `0A000` のまま。
 //!
 //! Bind の結果形式コードから本 API への結線は
 //! [`crate::extended_query::handle_bind`]（[`ResultFormats::resolve`]／
@@ -200,8 +200,8 @@ pub fn validate_binary_formats(
 
 /// PostgreSQL の send 関数と同じレイアウトで型ごとのバイナリ表現を組み立てる
 /// 純関数群（WIRE-14）。本 Issue で `WireType` 側に結線されるのは `text`
-/// （[`text`]）のみで、他の型は `WireType`／`Cell` 拡張（#895・NOSQL-13
-/// ポインタ）が使う部品として先行提供する。
+/// （[`text`]）に加え、数値・真偽値・bytea・uuid（Issue #1172）を
+/// [`super::encode_data_row_into_with_columns`] が結線する。
 pub mod binary {
     /// `int4` のバイナリ表現（4 バイト・ビッグエンディアン 2 の補数）。
     pub fn int4(v: i32) -> [u8; 4] {
@@ -437,21 +437,19 @@ impl WireType {
             // あるため、型そのものの対応可否とは別に列種別で判定する
             // （[`column_binary_support`] 参照）。
             WireType::Text => true,
-            // `INTEGER`／`BIGINT`（Issue #881・#903）はバイナリ表現を spec 側で
-            // 未策定のため fail-closed で非対応とする。
-            WireType::Int4 | WireType::Int8 => false,
-            // WIRE-13・TASK-200・Issue #895 で OID 公告を追加した型はいずれも
-            // バイナリ表現が spec 側で未策定のため fail-closed で非対応とする
-            // （対応拡大は WIRE-14・TASK-218 の後続として別途追跡）。
-            WireType::Bool
+            // 数値・真偽値・bytea・uuid は PostgreSQL の send 形式（ネット
+            // ワークバイトオーダー）でバイナリ対応する（WIRE-14・TASK-218・
+            // Issue #1172）。DataRow への結線は `encode_binary_cell`。
+            WireType::Int4
+            | WireType::Int8
+            | WireType::Bool
             | WireType::Float4
             | WireType::Float8
-            | WireType::Date
-            | WireType::Timestamp
             | WireType::Bytea
-            | WireType::Uuid
-            | WireType::Json
-            | WireType::Jsonb => false,
+            | WireType::Uuid => true,
+            // `DATE`／`TIMESTAMP`／`JSON`／`JSONB` は WIRE-14 の非対応型のまま
+            // fail-closed で `0A000` に拒否する。
+            WireType::Date | WireType::Timestamp | WireType::Json | WireType::Jsonb => false,
         }
     }
 }
@@ -479,39 +477,20 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Vector(_),
             ..
         } => false,
-        // `INTEGER`／`BIGINT`（Issue #881・#903）は `WireType::Int4`／`Int8` を
-        // 公告するが、バイナリ表現は spec 側で未策定のため fail-closed で
-        // 非対応とする（`WireType::supports_binary` と判定を揃える）。
+        // 数値・真偽値・bytea・uuid 列は公告する `WireType` の対応可否へ委譲する
+        // （WIRE-14・TASK-218・Issue #1172）。値の実体（`Cell`）との整合は
+        // `encode_binary_cell` が検査する。
         ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Integer | engine::catalog::ColumnType::BigInt,
+            ty:
+                engine::catalog::ColumnType::Integer
+                | engine::catalog::ColumnType::BigInt
+                | engine::catalog::ColumnType::Boolean
+                | engine::catalog::ColumnType::Real
+                | engine::catalog::ColumnType::Double
+                | engine::catalog::ColumnType::Bytea
+                | engine::catalog::ColumnType::Uuid,
             ..
-        } => false,
-        // `BOOLEAN` 列（TABLE-13・TASK-196・Issue #883）は WIRE-13・TASK-200・
-        // Issue #895 で `WireType::Bool`（OID 16）を公告するようになったが、
-        // バイナリ表現は spec 側で未策定のまま（`column_wire_type` の公告
-        // 変更とバイナリ対応可否は独立の判断）。fail-closed で非対応とする
-        // （対応拡大は WIRE-14・TASK-218 の後続）。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Boolean,
-            ..
-        } => false,
-        // `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196・Issue #882）は
-        // Issue #895 で `WireType::Float4`／`Float8` を公告するが、値の実体は
-        // `Cell::Float` の生成テキスト表現でありバイナリ（IEEE 754 ビット列）
-        // とは意味論が異なるため、他の後発型と同様に fail-closed で非対応
-        // とする。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Real | engine::catalog::ColumnType::Double,
-            ..
-        } => false,
-        // `BYTEA` 列（Issue #886）は Issue #895 で `WireType::Bytea`
-        // （OID 17）を公告するが、値の実体は生バイト列の hex テキスト表現
-        // （`Cell::Bytes`）でありバイナリ表現は spec 側で未策定のため
-        // fail-closed で非対応とする。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Bytea,
-            ..
-        } => false,
+        } => column_wire_type(meta).supports_binary(),
         // `ENUM` 列（TABLE-14・TASK-198、Issue #890）は Issue #895 の据え置き
         // 判断により専用 OID を持たず `WireType::Text` を公告する。値は
         // `Cell::Text`（TEXT と同一表示形）に写像されるが、`ColumnMeta::Scalar`
@@ -552,13 +531,6 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
         // spec 側で未策定のため fail-closed で非対応とする。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Date | engine::catalog::ColumnType::Timestamp,
-            ..
-        } => false,
-        // `UUID` 列（TABLE-13〔検討中〕・TASK-197、Issue #887）は Issue #895 で
-        // `WireType::Uuid`（OID 2950）を公告するが、バイナリ表現は spec 側で
-        // 未策定のため fail-closed で非対応とする（U10）。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Uuid,
             ..
         } => false,
         // 実行時型（式・集計結果）が静的に決まらないため fail-closed で
@@ -806,7 +778,7 @@ fn quote_pg_array_text_elem(s: &str) -> String {
 /// 直接解決する [`encode_data_row_body`] を共有する形へ変更した
 /// （codex-review 指摘・PR #998）。
 pub fn encode_data_row_into(row: &ResultRow, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-    encode_data_row_body(row, out, |_| FormatCode::Text)
+    encode_data_row_body(row, out, |_| ColumnEncoding::Text)
 }
 
 /// `DataRow`（'D'）を列ごとの [`FormatCode`] を反映して `out` の末尾へ追記する
@@ -818,6 +790,8 @@ pub fn encode_data_row_into(row: &ResultRow, out: &mut Vec<u8>) -> Result<(), En
 /// [`Null`](Cell::Null) セルは形式コードにかかわらず長さ `-1` を書く
 /// （PostgreSQL の規約）。テキスト列のバイナリ表現は [`cell_to_text`] と
 /// 同じ UTF-8 バイトをそのまま長さ付きで書く（[`binary::text`]）。
+/// 列の型を知らないため、バイナリで受け付けるのは `Cell::Text` のみ
+/// （他型の列は [`encode_data_row_into_with_columns`] を使う。Issue #1172）。
 ///
 /// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**
 /// （[`encode_data_row_into`] と同じ契約。部分フレームを絶対に残さない）。
@@ -832,24 +806,122 @@ pub fn encode_data_row_into_with_formats(
     // `formats` は呼び出し元内部で長さ一致を確認済みだが、添字アクセス
     // （`[]`）は使わず `get` で明示的に処理する（coding-rust 規約）。
     encode_data_row_body(row, out, |i| {
-        formats.get(i).copied().unwrap_or(FormatCode::Text)
+        match formats.get(i).copied().unwrap_or(FormatCode::Text) {
+            FormatCode::Text => ColumnEncoding::Text,
+            FormatCode::Binary => ColumnEncoding::Binary(None),
+        }
     })
 }
 
-/// [`encode_data_row_into`]／[`encode_data_row_into_with_formats`] が共有する
-/// フレーム組み立て本体。`format_at(i)` は `row.cells` の列インデックス `i`
-/// に対する形式コードを返す（全列テキストの呼び出し元は割り当てなしの
-/// 定数クロージャを渡せる）。
+/// 列ごとの符号化方式（[`encode_data_row_body`] の内部表現）。
+/// `Binary(None)` は列の型を知らない旧 API 用で `Cell::Text` だけを受け付ける。
+#[derive(Clone, Copy)]
+enum ColumnEncoding {
+    Text,
+    Binary(Option<WireType>),
+}
+
+/// `DataRow`（'D'）を列ごとの [`FormatCode`] と列メタ（[`ColumnMeta`]）を反映して
+/// `out` の末尾へ追記する（WIRE-14・TASK-218・Issue #1172）。
+///
+/// wire-server の Execute（[`crate::extended_query`]）から呼ばれ、`INTEGER`／
+/// `BIGINT`／`REAL`／`DOUBLE PRECISION`／`BOOLEAN`／`BYTEA`／`UUID`／`TEXT` の
+/// バイナリ形式を PostgreSQL の send 形式で書く。`Cell` だけでは int4／int8・
+/// float4／float8 を区別できないため列メタから型を解決する。
+/// `columns`・`formats`・`row.cells` の長さが食い違う場合は `EncodeError`。
+/// 型と `Cell` の不一致は text へフォールバックせず `EncodeError`（fail-closed）。
+///
+/// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**。
+pub fn encode_data_row_into_with_columns(
+    row: &ResultRow,
+    columns: &[ColumnMeta],
+    formats: &[FormatCode],
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    if row.cells.len() != formats.len() || row.cells.len() != columns.len() {
+        return Err(EncodeError);
+    }
+    encode_data_row_body(row, out, |i| {
+        match formats.get(i).copied().unwrap_or(FormatCode::Text) {
+            FormatCode::Text => ColumnEncoding::Text,
+            FormatCode::Binary => ColumnEncoding::Binary(columns.get(i).map(column_wire_type)),
+        }
+    })
+}
+
+/// `bytes` を長さ付き（int4 長）で `out` へ追記する。
+fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), EncodeError> {
+    let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// 固定長型のバイナリ値を長さ付きで追記する。長さが `WireType::typlen()` と
+/// 一致しない場合は内部不整合として `EncodeError`。
+fn push_fixed(out: &mut Vec<u8>, wire_type: WireType, bytes: &[u8]) -> Result<(), EncodeError> {
+    if i16::try_from(bytes.len()).ok() != Some(wire_type.typlen()) {
+        return Err(EncodeError);
+    }
+    push_len_prefixed(out, bytes)
+}
+
+/// 非 NULL セル 1 個をバイナリ形式で `out` へ追記する（WIRE-14・Issue #1172）。
+/// `wire_type` は列が公告する型。`None`（旧 API）は `Cell::Text` のみ受理する。
+/// 型と `Cell` の不一致・範囲外・無損失でない float4 縮小は `EncodeError`
+/// （text へ黙って落とさない）。
+fn encode_binary_cell(
+    wire_type: Option<WireType>,
+    cell: &Cell,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let wire_type = match wire_type {
+        Some(t) => t,
+        None => {
+            return match cell {
+                Cell::Text(s) => push_len_prefixed(out, binary::text(s)),
+                _ => Err(EncodeError),
+            };
+        }
+    };
+    match (wire_type, cell) {
+        (WireType::Text, Cell::Text(s)) => push_len_prefixed(out, binary::text(s)),
+        (WireType::Int4, Cell::SignedInteger(v)) => {
+            let v = i32::try_from(*v).map_err(|_| EncodeError)?;
+            push_fixed(out, wire_type, &binary::int4(v))
+        }
+        (WireType::Int8, Cell::SignedInteger(v)) => push_fixed(out, wire_type, &binary::int8(*v)),
+        (WireType::Float4, Cell::Float(v)) => {
+            let narrowed = if v.is_nan() { f32::NAN } else { *v as f32 };
+            // NaN 以外は f64 へ戻して一致する（無損失）場合のみ受理する。
+            if !v.is_nan() && f64::from(narrowed) != *v {
+                return Err(EncodeError);
+            }
+            push_fixed(out, wire_type, &binary::float4(narrowed))
+        }
+        (WireType::Float8, Cell::Float(v)) => push_fixed(out, wire_type, &binary::float8(*v)),
+        (WireType::Bool, Cell::Bool(b)) => push_fixed(out, wire_type, &binary::bool_(*b)),
+        (WireType::Bytea, Cell::Bytes(b)) => push_len_prefixed(out, binary::bytea(b)),
+        (WireType::Uuid, Cell::Uuid(u)) => push_fixed(out, wire_type, &binary::uuid(*u.as_bytes())),
+        // 型と Cell の不一致、および非対応型（事前検査
+        // `validate_binary_formats` で拒否済みの多層防御）は fail-closed。
+        _ => Err(EncodeError),
+    }
+}
+
+/// [`encode_data_row_into`]／[`encode_data_row_into_with_formats`]／
+/// [`encode_data_row_into_with_columns`] が共有するフレーム組み立て本体。
+/// `encoding_at(i)` は列インデックス `i` の符号化方式を返す。
 ///
 /// **失敗時は `out` を呼び出し前の長さへ必ず `truncate` してから返す**
 /// （部分フレームを絶対に残さない）。
 fn encode_data_row_body<F>(
     row: &ResultRow,
     out: &mut Vec<u8>,
-    format_at: F,
+    encoding_at: F,
 ) -> Result<(), EncodeError>
 where
-    F: Fn(usize) -> FormatCode,
+    F: Fn(usize) -> ColumnEncoding,
 {
     let start = out.len();
     let field_count = match i16::try_from(row.cells.len()) {
@@ -867,45 +939,14 @@ where
         let body_start = out.len();
         out.extend_from_slice(&field_count.to_be_bytes());
         for (i, cell) in row.cells.iter().enumerate() {
-            match format_at(i) {
-                FormatCode::Text => match cell_to_text(cell)? {
+            match encoding_at(i) {
+                ColumnEncoding::Text => match cell_to_text(cell)? {
                     None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-                    Some(text) => {
-                        let bytes = text.as_bytes();
-                        let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
-                        out.extend_from_slice(&len.to_be_bytes());
-                        out.extend_from_slice(bytes);
-                    }
+                    Some(text) => push_len_prefixed(out, text.as_bytes())?,
                 },
-                FormatCode::Binary => match cell {
+                ColumnEncoding::Binary(wire_type) => match cell {
                     Cell::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
-                    // `validate_binary_formats` が事前検査を通した経路のみが
-                    // ここへ到達する契約であり、バイナリ対応列は
-                    // `Cell::Text`（`WireType::Text` かつ `ColumnMeta::Scalar
-                    // {ty: Text}`）に限られる（`column_binary_support`
-                    // 参照）。それ以外の `Cell` variant が来た場合は
-                    // 呼び出し元の契約違反として fail-closed に拒否する
-                    // （黙って text/他表現へフォールバックしない）。
-                    Cell::Text(s) => {
-                        let bytes = binary::text(s);
-                        let len = i32::try_from(bytes.len()).map_err(|_| EncodeError)?;
-                        out.extend_from_slice(&len.to_be_bytes());
-                        out.extend_from_slice(bytes);
-                    }
-                    Cell::Integer(_)
-                    | Cell::SignedInteger(_)
-                    | Cell::Vector(_)
-                    | Cell::Float(_)
-                    | Cell::Bool(_)
-                    | Cell::Date(_)
-                    | Cell::Timestamp(_)
-                    | Cell::Array(_)
-                    | Cell::Bytes(_)
-                    | Cell::Json(_)
-                    | Cell::Numeric(_)
-                    | Cell::Uuid(_) => {
-                        return Err(EncodeError);
-                    }
+                    other => encode_binary_cell(wire_type, other, out)?,
                 },
             }
         }
@@ -927,7 +968,6 @@ where
         }
     }
 }
-
 /// `DataRow`（'D'）を 1 行ぶん新規 `Vec<u8>` として組み立てる。
 /// [`encode_data_row_into`] を呼ぶ薄いラッパーで、既存呼び出し元・テストとの
 /// 互換のため残す（生成バイト列は完全に同一）。
@@ -1744,25 +1784,34 @@ mod tests {
         assert!(!column_binary_support(&ColumnMeta::Computed {
             name: "expr".to_string(),
         }));
-        // UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887・U10）は
-        // `WireType::Uuid`（OID 2950）を公告するがバイナリは非対応のまま。
-        assert!(!column_binary_support(&ColumnMeta::Scalar {
-            name: "external_id".to_string(),
-            ty: engine::catalog::ColumnType::Uuid,
-        }));
-        // WIRE-13・TASK-200・Issue #895 で専用 OID を公告するようになった
-        // 型は、いずれもバイナリ表現が spec 側で未策定のため fail-closed で
-        // 非対応のまま（`WireType::supports_binary`／`column_binary_support`
-        // の判定を一致させる回帰保護）。
+        // 数値・真偽値・bytea・uuid は対応（WIRE-14・Issue #1172）。
         for ty in [
+            engine::catalog::ColumnType::Integer,
+            engine::catalog::ColumnType::BigInt,
             engine::catalog::ColumnType::Boolean,
             engine::catalog::ColumnType::Real,
             engine::catalog::ColumnType::Double,
+            engine::catalog::ColumnType::Bytea,
+            engine::catalog::ColumnType::Uuid,
+        ] {
+            assert!(
+                column_binary_support(&ColumnMeta::Scalar {
+                    name: "col".to_string(),
+                    ty: ty.clone(),
+                }),
+                "{ty:?} は binary 対応"
+            );
+        }
+        // 非対応のまま（`0A000`）: 日時・JSON・NUMERIC（配列・ENUM は wire 結合テストで固定）。
+        for ty in [
             engine::catalog::ColumnType::Date,
             engine::catalog::ColumnType::Timestamp,
-            engine::catalog::ColumnType::Bytea,
             engine::catalog::ColumnType::Json,
             engine::catalog::ColumnType::Jsonb,
+            engine::catalog::ColumnType::Numeric {
+                precision: 5,
+                scale: 2,
+            },
         ] {
             assert!(
                 !column_binary_support(&ColumnMeta::Scalar {
@@ -1779,8 +1828,8 @@ mod tests {
     #[test]
     fn new_scalar_type_binary_request_is_rejected_as_feature_not_supported() {
         let columns = vec![ColumnMeta::Scalar {
-            name: "flag".to_string(),
-            ty: engine::catalog::ColumnType::Boolean,
+            name: "d".to_string(),
+            ty: engine::catalog::ColumnType::Date,
         }];
         let formats = ResultFormats::new(&[1])
             .resolve(columns.len())
@@ -2092,6 +2141,196 @@ mod tests {
             let typlen = i16_at(&msg, cursor);
             assert_eq!(typlen, *expected_typlen, "column={name}");
             cursor += 2 + 4 + 2; // typlen + typmod + format
+        }
+    }
+
+    // --- 列メタ付き DataRow エンコード（WIRE-14・Issue #1172）---
+
+    fn scalar(ty: engine::catalog::ColumnType) -> ColumnMeta {
+        ColumnMeta::Scalar {
+            name: "c".to_string(),
+            ty,
+        }
+    }
+
+    fn one_cell_binary(
+        ty: engine::catalog::ColumnType,
+        cell: Cell,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![cell],
+        };
+        let mut out = Vec::new();
+        encode_data_row_into_with_columns(&row, &[scalar(ty)], &[FormatCode::Binary], &mut out)?;
+        // 'D' + len(4) + field_count(2) の後ろ（長さ付きセル）を返す。
+        Ok(out.get(7..).unwrap_or_default().to_vec())
+    }
+
+    fn with_len(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as i32).to_be_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn binary_typed_cells_golden_bytes() {
+        use engine::catalog::ColumnType as T;
+        assert_eq!(
+            one_cell_binary(T::Integer, Cell::SignedInteger(-1)).unwrap(),
+            with_len(&[0xff; 4])
+        );
+        assert_eq!(
+            one_cell_binary(T::BigInt, Cell::SignedInteger(i64::MIN)).unwrap(),
+            with_len(&i64::MIN.to_be_bytes())
+        );
+        assert_eq!(
+            one_cell_binary(T::Real, Cell::Float(f64::from(0.1f32))).unwrap(),
+            with_len(&0.1f32.to_bits().to_be_bytes())
+        );
+        assert_eq!(
+            one_cell_binary(T::Double, Cell::Float(1.0)).unwrap(),
+            with_len(&1.0f64.to_bits().to_be_bytes())
+        );
+        assert_eq!(
+            one_cell_binary(T::Boolean, Cell::Bool(true)).unwrap(),
+            with_len(&[1])
+        );
+        assert_eq!(
+            one_cell_binary(T::Boolean, Cell::Bool(false)).unwrap(),
+            with_len(&[0])
+        );
+        assert_eq!(
+            one_cell_binary(T::Bytea, Cell::Bytes(Vec::new())).unwrap(),
+            with_len(&[])
+        );
+        assert_eq!(
+            one_cell_binary(T::Bytea, Cell::Bytes(vec![0, 1, 0xff])).unwrap(),
+            with_len(&[0, 1, 0xff])
+        );
+        let u = engine::uuid::Uuid::from_bytes([7u8; 16]);
+        assert_eq!(
+            one_cell_binary(T::Uuid, Cell::Uuid(u)).unwrap(),
+            with_len(&[7u8; 16])
+        );
+    }
+
+    #[test]
+    fn binary_typed_null_is_minus_one_for_every_type() {
+        use engine::catalog::ColumnType as T;
+        for ty in [
+            T::Integer,
+            T::BigInt,
+            T::Real,
+            T::Double,
+            T::Boolean,
+            T::Bytea,
+            T::Uuid,
+        ] {
+            assert_eq!(
+                one_cell_binary(ty, Cell::Null).unwrap(),
+                (-1i32).to_be_bytes().to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn binary_typed_failures_are_fail_closed_and_leave_out_untouched() {
+        use engine::catalog::ColumnType as T;
+        let cases = [
+            (T::Integer, Cell::SignedInteger(i64::from(i32::MAX) + 1)),
+            (T::Real, Cell::Float(0.1f64)),
+            (T::Integer, Cell::Text("1".to_string())),
+            (T::Bytea, Cell::Text("x".to_string())),
+            (T::Uuid, Cell::Bool(true)),
+            (T::Date, Cell::Integer(1)),
+        ];
+        for (ty, cell) in cases {
+            let row = ResultRow {
+                id: 1,
+                score: 0.0,
+                cells: vec![cell],
+            };
+            let mut out = b"KEEP".to_vec();
+            let r = encode_data_row_into_with_columns(
+                &row,
+                &[scalar(ty.clone())],
+                &[FormatCode::Binary],
+                &mut out,
+            );
+            assert!(r.is_err(), "{ty:?}");
+            assert_eq!(out, b"KEEP");
+        }
+    }
+
+    #[test]
+    fn binary_typed_mixed_formats_apply_per_column() {
+        use engine::catalog::ColumnType as T;
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::SignedInteger(5), Cell::SignedInteger(5)],
+        };
+        let mut out = Vec::new();
+        encode_data_row_into_with_columns(
+            &row,
+            &[scalar(T::Integer), scalar(T::Integer)],
+            &[FormatCode::Text, FormatCode::Binary],
+            &mut out,
+        )
+        .unwrap();
+        let mut expected = with_len(b"5");
+        expected.extend(with_len(&5i32.to_be_bytes()));
+        assert_eq!(out.get(7..).unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn with_columns_all_text_matches_legacy_encoder() {
+        use engine::catalog::ColumnType as T;
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::SignedInteger(-3), Cell::Bool(true), Cell::Null],
+        };
+        let cols = [scalar(T::Integer), scalar(T::Boolean), scalar(T::Bytea)];
+        let mut a = Vec::new();
+        encode_data_row_into_with_columns(&row, &cols, &[FormatCode::Text; 3], &mut a).unwrap();
+        assert_eq!(a, encode_data_row(&row).unwrap());
+    }
+
+    #[test]
+    fn with_columns_length_mismatch_is_error() {
+        use engine::catalog::ColumnType as T;
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Bool(true)],
+        };
+        let mut out = Vec::new();
+        assert!(
+            encode_data_row_into_with_columns(&row, &[], &[FormatCode::Binary], &mut out).is_err()
+        );
+        assert!(
+            encode_data_row_into_with_columns(&row, &[scalar(T::Boolean)], &[], &mut out).is_err()
+        );
+    }
+
+    #[test]
+    fn wire_type_supports_binary_matrix() {
+        for t in WireType::ALL {
+            let expected = matches!(
+                t,
+                WireType::Text
+                    | WireType::Int4
+                    | WireType::Int8
+                    | WireType::Bool
+                    | WireType::Float4
+                    | WireType::Float8
+                    | WireType::Bytea
+                    | WireType::Uuid
+            );
+            assert_eq!(t.supports_binary(), expected, "{t:?}");
         }
     }
 }

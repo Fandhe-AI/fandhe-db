@@ -16,6 +16,13 @@
 //! `ROLLBACK`・接続断（`SessionTransaction` の drop）で行・台帳とも一括して
 //! 消える。
 //!
+//! 暗黙トランザクション（Issue #1175・WIRE-16）: `BEGIN` を含まない複数文メッセージの
+//! うち書き込みが最後以外にある形は、wire 層が [`SessionTransaction::begin_implicit`] で
+//! メッセージ全体を 1 つのトランザクションにして原子的に実行する。起源（`TxnOrigin`）が
+//! `Implicit` の `Active` は明示トランザクションと同じ許可リストで文を実行するが、
+//! クライアントが `ROLLBACK` を発行できないため、エラー・上限超過では `Failed` ではなく
+//! `Idle` へ戻り、メッセージをまたがない。
+//!
 //! 読み取りの既知の逸脱（SQL-31 の完全な意味論からの意図的な縮退）: 本実装は
 //! 「同一トランザクション内で自分がまだ書き込んでいないテーブル」の読み取りのみ
 //! 通常経路で許可し、既に書き込んだテーブルへの読み取りは `0A000` で拒否する
@@ -103,10 +110,24 @@ pub enum TransactionStatus {
     Failed,
 }
 
-/// 明示トランザクション中に開いている共有書き込みトランザクションと、その
+/// `Active` なトランザクションの起源（Issue #1175）。`Explicit` はクライアントの
+/// `BEGIN` で始まり、エラーで `Failed` へ遷移して `ROLLBACK` を待つ。`Implicit` は
+/// `BEGIN` を含まない複数文メッセージを原子的に実行するために wire 層が
+/// [`SessionTransaction::begin_implicit`] で開始するもので、メッセージの中で必ず
+/// 終了する（成功なら [`SessionTransaction::commit_implicit`]、エラーなら
+/// [`SessionTransaction::fail`] 等が `Idle` へ戻す）。クライアントが発行していない
+/// `ROLLBACK` を待つ `Failed` に接続が固まることは無い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxnOrigin {
+    Explicit,
+    Implicit,
+}
+
+/// トランザクション中に開いている共有書き込みトランザクションと、その
 /// 付随状態。`write_txn`（[`crate::storage::GatedWriteTxn`]）は書き込みゲートの
 /// permit を内包し、drop 時は abort してから permit を解放する。
 struct ActiveTxn<'e> {
+    origin: TxnOrigin,
     write_txn: crate::storage::GatedWriteTxn,
     started_at: Instant,
     statements: u32,
@@ -223,6 +244,106 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
     ) -> Result<(), SqlSurfaceError> {
+        // 暗黙トランザクションはメッセージ内で完結する。明示 `BEGIN` が届くのは
+        // 呼び出し側の不変条件違反（制御文を含むメッセージは暗黙にならない）なので、
+        // 暗黙の `Active` は abort して `Idle` へ戻し、内部エラーで拒否する。
+        if self.abort_if_implicit() {
+            return Err(internal_error());
+        }
+        self.begin_with_origin(storage, session, TxnOrigin::Explicit)
+    }
+
+    /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
+    /// メッセージのうち、トランザクション外の書き込みが最後以外にある形を
+    /// 原子的に実行するため、wire 層がメッセージの先頭で 1 回だけ呼ぶ
+    /// （`EngineCore::begin_implicit_transaction` 経由）。
+    ///
+    /// `Idle` からだけ遷移できる。それ以外の状態は呼び出し側の不変条件違反
+    /// （`Failed` のセッションは暗黙にせず個々の文で `25P02` を返す設計）なので
+    /// `Internal`（`XX000`）で拒否し、状態は変えない。書き込みゲートの待機上限を
+    /// 超えたら `55P03`。
+    pub fn begin_implicit(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        if !matches!(self.state, TxnState::Idle) {
+            return Err(internal_error());
+        }
+        self.begin_with_origin(storage, session, TxnOrigin::Implicit)
+    }
+
+    /// 暗黙トランザクションの commit（Issue #1175）。最後の文の実行に成功した
+    /// 直後に wire 層が呼ぶ。書き込みがあれば遅延 `FOREIGN KEY` の検査と
+    /// [`crate::recovery::commit_boundary::commit`]（point of no return）を行い、
+    /// 無ければ drop（abort）する。
+    ///
+    /// 成功・失敗のどちらでも `Idle` へ戻る（明示版の [`Self::commit`] は上限超過で
+    /// `Failed` へ遷移するが、暗黙版はクライアントが `ROLLBACK` を発行できないため
+    /// 遷移しない）。持続時間の上限超過は `54000`、commit・遅延制約違反の失敗は
+    /// [`Self::commit`] と同じエラーで、いずれも `session` を開始時点へ復元する。
+    /// 暗黙の `Active` 以外で呼ばれた場合は `Internal`（状態は変えない）。
+    pub fn commit_implicit(&mut self, session: &mut SessionState) -> Result<(), SqlSurfaceError> {
+        match std::mem::replace(&mut self.state, TxnState::Idle) {
+            TxnState::Active(active) if active.origin == TxnOrigin::Implicit => {
+                let ActiveTxn {
+                    write_txn,
+                    started_at,
+                    has_writes,
+                    session_at_begin,
+                    written_by_tenant,
+                    ..
+                } = *active;
+                if started_at.elapsed() > self.limits.max_duration {
+                    drop(write_txn);
+                    *session = session_at_begin;
+                    return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
+                }
+                commit_active(
+                    write_txn,
+                    has_writes,
+                    &written_by_tenant,
+                    session_at_begin,
+                    session,
+                )
+            }
+            other => {
+                self.state = other;
+                Err(internal_error())
+            }
+        }
+    }
+
+    /// 暗黙トランザクションを破棄して `Idle` へ戻す（Issue #1175）。wire 層が
+    /// 暗黙トランザクションを実行し終えた全経路の最後に呼ぶ後始末で、暗黙の
+    /// `Active` 以外では何もしない（冪等。明示トランザクションには触れない）。
+    pub fn abort_implicit(&mut self) {
+        self.abort_if_implicit();
+    }
+
+    /// 暗黙トランザクションの `Active` なら true（Issue #1175）。wire 層が、各文の
+    /// 実行後にトランザクションがまだ暗黙のまま生きているか（後続の書き込みが
+    /// autocommit で実行されないか）を確認するために使う。
+    pub fn is_implicit_active(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if a.origin == TxnOrigin::Implicit)
+    }
+
+    /// 暗黙の `Active` なら write txn を abort して `Idle` へ戻し true を返す。
+    fn abort_if_implicit(&mut self) -> bool {
+        if !self.is_implicit_active() {
+            return false;
+        }
+        // `write_txn` は drop（abort）され、内包する permit はその後に解放される。
+        self.state = TxnState::Idle;
+        true
+    }
+
+    fn begin_with_origin(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        origin: TxnOrigin,
+    ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
                 let write_txn = storage
@@ -247,6 +368,7 @@ impl<'e> SessionTransaction<'e> {
                 };
                 self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
+                    origin,
                     write_txn,
                     started_at: Instant::now(),
                     statements: 0,
@@ -287,6 +409,9 @@ impl<'e> SessionTransaction<'e> {
     /// - commit 自体が失敗した場合は、PostgreSQL と同じくロールバック扱いとし、
     ///   `session` を `BEGIN` 時点の状態へ復元してから `Idle` へ戻る。
     pub fn commit(&mut self, session: &mut SessionState) -> Result<(), SqlSurfaceError> {
+        if self.abort_if_implicit() {
+            return Err(internal_error());
+        }
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::Idle => {
                 self.state = TxnState::Idle;
@@ -310,37 +435,14 @@ impl<'e> SessionTransaction<'e> {
                     };
                     return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
                 }
-                if has_writes {
-                    for (tenant_id, table) in &written_by_tenant {
-                        if let Err(e) = crate::constraint::enforce_deferred_foreign_keys_in_txn(
-                            &write_txn, tenant_id, table,
-                        ) {
-                            // 遅延 FK 違反（TABLE-17・TASK-205、Issue #1077）:
-                            // `write_txn` を drop（abort）し permit を解放したうえで
-                            // `BEGIN` 時点のセッション状態を復元し `Idle` へ戻る
-                            // （commit 自体の失敗と同じロールバック扱い）。
-                            drop(write_txn);
-                            self.state = TxnState::Idle;
-                            *session = session_at_begin;
-                            return Err(crate::sql::exec::map_write_error(e, "commit"));
-                        }
-                    }
-                }
-                let result = if has_writes {
-                    crate::recovery::commit_boundary::commit(write_txn)
-                } else {
-                    drop(write_txn);
-                    Ok(())
-                };
-                self.state = TxnState::Idle;
-                result.map_err(|_| {
-                    // commit 失敗はロールバック扱い（`write_txn` は消費済みで、
-                    // permit も解放されている）。
-                    *session = session_at_begin;
-                    SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    }
-                })
+                // 状態は冒頭の `mem::replace` で既に `Idle`。成否によらず `Idle`。
+                commit_active(
+                    write_txn,
+                    has_writes,
+                    &written_by_tenant,
+                    session_at_begin,
+                    session,
+                )
             }
             TxnState::Failed {
                 session_at_begin,
@@ -363,6 +465,9 @@ impl<'e> SessionTransaction<'e> {
     /// `SessionState`（`SET search_mode`・`CREATE FUNCTION` 等）を復元する。
     /// `Idle` からの `ROLLBACK` は `25P01`。
     pub fn rollback(&mut self, session: &mut SessionState) -> Result<(), SqlSurfaceError> {
+        if self.abort_if_implicit() {
+            return Err(internal_error());
+        }
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::Idle => {
                 self.state = TxnState::Idle;
@@ -492,6 +597,12 @@ impl<'e> SessionTransaction<'e> {
         if !matches!(self.state, TxnState::Active(_)) {
             return;
         }
+        // 暗黙トランザクション（Issue #1175）は `Failed` を経由せず `Idle` へ戻す
+        // （クライアントが `ROLLBACK` を発行できないため）。セッション状態の復元は
+        // wire 層がメッセージ開始時のスナップショットで行う。
+        if self.abort_if_implicit() {
+            return;
+        }
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
             // `write_txn` は drop（abort）され、`permit` はその後に解放される。
             self.state = TxnState::Failed {
@@ -514,6 +625,11 @@ impl<'e> SessionTransaction<'e> {
         };
         if !expired {
             return false;
+        }
+        // 暗黙トランザクションはメッセージをまたがないため通常は到達しない。
+        // 防御として abort して `Idle` へ戻す（`Failed` にはしない）。
+        if self.abort_if_implicit() {
+            return true;
         }
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
             self.state = TxnState::Failed {
@@ -557,6 +673,55 @@ impl<'e> SessionTransaction<'e> {
             _ => None,
         }
     }
+}
+
+/// 内部エラー（`XX000`）。他テナントの情報を含まない固定文言。
+fn internal_error() -> SqlSurfaceError {
+    SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    }
+}
+
+/// `Active` から取り出した共有書き込みトランザクションを確定する共通本体
+/// （明示 [`SessionTransaction::commit`]・暗黙 [`SessionTransaction::commit_implicit`]
+/// が共有する。遅延制約検査と commit の順序・ロールバック扱いの契約を 1 箇所に保つ）。
+///
+/// 書き込みがあれば、commit の**前**に `written_by_tenant` の各要素について遅延
+/// `FOREIGN KEY` を検査し（TABLE-17・TASK-205、Issue #1077）、違反すれば abort して
+/// `session` を開始時点へ復元し `23503` を返す。commit 自体の失敗も同様にロールバック
+/// 扱いで `XX000`。呼び出し元は事前に `state` を `Idle` にしてあること。
+fn commit_active(
+    write_txn: crate::storage::GatedWriteTxn,
+    has_writes: bool,
+    written_by_tenant: &std::collections::BTreeSet<(String, String)>,
+    session_at_begin: SessionState,
+    session: &mut SessionState,
+) -> Result<(), SqlSurfaceError> {
+    if has_writes {
+        for (tenant_id, table) in written_by_tenant {
+            if let Err(e) = crate::constraint::enforce_deferred_foreign_keys_in_txn(
+                &write_txn, tenant_id, table,
+            ) {
+                // `write_txn` を drop（abort）し permit を解放したうえで開始時点の
+                // セッション状態を復元する（commit 自体の失敗と同じロールバック扱い）。
+                drop(write_txn);
+                *session = session_at_begin;
+                return Err(crate::sql::exec::map_write_error(e, "commit"));
+            }
+        }
+    }
+    let result = if has_writes {
+        crate::recovery::commit_boundary::commit(write_txn)
+    } else {
+        drop(write_txn);
+        Ok(())
+    };
+    result.map_err(|_| {
+        // commit 失敗はロールバック扱い（`write_txn` は消費済みで、permit も
+        // 解放されている）。
+        *session = session_at_begin;
+        internal_error()
+    })
 }
 
 /// [`crate::storage::StorageError::WriteLockTimeout`]／

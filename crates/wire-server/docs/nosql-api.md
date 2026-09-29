@@ -382,10 +382,10 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
   NoSQL 表層固有の制約のため）
 - 列型ごとの JSON 表現（Issue #896・NOSQL-17。`docs/design/
   nosql-typed-json-binding.md` 参照）: `INTEGER`／`BIGINT` は JSON 整数
-  （小数・非数値は `42601`。範囲外は `22003`）、`REAL`／`DOUBLE PRECISION`
-  は JSON 数値（範囲外は `22003`）、`NUMERIC` は JSON 数値または数値文字列
+  （小数・指数表記は `22P02`、非数値は `42601`。範囲外は `22003`）、`REAL`／`DOUBLE PRECISION`
+  は JSON 数値（指数表記を受理。範囲外は `22003`）、`NUMERIC` は JSON 数値または数値文字列
   （桁あふれは `22003`）、`BOOLEAN` は JSON 真偽値、`DATE`／`TIMESTAMP`／
-  `UUID` は JSON 文字列（形式不正はそれぞれ `22000`／`22000`／`22P02`）、
+  `UUID` は JSON 文字列（書式違反は `22007`、範囲外・暦上不正は `22008`、`UUID` の形式不正は `22P02`）、
   `TEXT[]`／`BOOLEAN[]` は JSON 配列（要素種別不一致は `42601`、要素数
   超過は `54000`）。`TEXT`／`VECTOR`（旧来型）の型不一致のみ引き続き
   `22000` を維持する（新型は `42601`。表層内の非対称は既知の制約）
@@ -921,17 +921,18 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-22 分類が共有する）。
+25 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
 | `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ |
+| `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
-| `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
+| `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | 値の形式不正: ENUM 列の語彙外ラベル・INTEGER／BIGINT 列への小数／指数表記・BYTEA の不正 base64・NUMERIC／配列／JSON 列の形式不正（`insert`／`update`／`filter`。Issue #1187） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
 | `23502` | `NOT_NULL_VIOLATION` | 400 | Bad Request | `NOT NULL` 列（TABLE-16・TASK-204）への `insert`／`update` での省略・明示 `null` |
 | `25000` | `INVALID_TRANSACTION_STATE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（明示トランザクション制御が op 語彙に無い。後述） |
@@ -944,9 +945,11 @@ Date: <IMF-fixdate>
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕で SQL 表層からは到達可能になったが、NoSQL 表層の op 語彙に JOIN 相当が無いため。後述） |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
-| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕のいずれも SQL 表層専用。後述） |
+| `42723` | `DUPLICATE_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION` は SQL 表層専用。後述） |
+| `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕・式層の演算子／関数引数の型不一致〔Issue #1186〕のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | `create_table.constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148）が宣言時に常に失敗する組み合わせ（`NOT NULL` 列への `set_null`・DEFAULT の無い `NOT NULL` 列への `set_default` 等） |
+| `42883` | `UNDEFINED_FUNCTION` | 400 | Bad Request | `aggregate` の `sum`／`avg` を `DATE`／`TIMESTAMP` 列に指定した場合（SQL-26、Issue #1186。未知関数・非決定的関数の呼び出しは SQL 表層専用で到達しない） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -963,8 +966,8 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 15 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
-`42809`・`42703`・`42704`・`42804`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 16 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
+`42809`・`42703`・`42704`・`42804`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -981,7 +984,9 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 新設した分類で、`INNER JOIN`（Issue #925）により SQL 表層からは到達可能に
 なった（`docs/design/inner-join.md` 参照）。ただし NoSQL 表層の `op` 許可
 リストに JOIN 相当が無いため、実要求（HTTP API 経由）からは引き続き到達
-しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+しない。`DuplicateFunction`（`42723`。SQL-26、Issue #1186）は
+`CREATE FUNCTION`／WASM UDF 登録の名前衝突で、NoSQL `op` 許可リストに関数
+登録が無いため到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・

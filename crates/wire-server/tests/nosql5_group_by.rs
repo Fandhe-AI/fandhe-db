@@ -475,9 +475,10 @@ fn type_mismatches_are_rejected_with_22000() {
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
-    let cases: [&[u8]; 5] = [
+    // Issue #1185・SQL-25 (d): 疑似列 `id` は `group_by` キーとして受理側へ契約改訂した
+    // （SQL テキスト経由と同じ写像。`id_group_by_is_accepted_since_issue_1185` 参照）。
+    let cases: [&[u8]; 4] = [
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["embedding"]}"#,
-        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["id"]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["nope"]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"},{"fn":"min","column":"lang"}],"group_by":["lang"],"having":[{"fn":"min","column":"lang","op":">=","value":1}]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang"],"having":[{"fn":"sum","column":"id","op":">=","value":1}]}"#,
@@ -491,6 +492,16 @@ fn type_mismatches_are_rejected_with_22000() {
             String::from_utf8_lossy(body)
         );
     }
+}
+
+#[test]
+fn id_group_by_is_accepted_since_issue_1185() {
+    let (core, _guard) = new_core();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["id"]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
 }
 
 #[test]

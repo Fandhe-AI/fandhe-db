@@ -900,6 +900,40 @@ NULL` 列への `SET NULL`＝宣言時検査 `42830`）を適用し、影響行�
 本シナリオの `create_table`／`insert`／`update`／`delete` は追加していない
 （いずれも既存ケースで既に網羅済みのため）。
 
+## SCRAM・COPY・複数行 INSERT の 3 クライアント検証（Issue #1177・WIRE-17・WIRE-18・SQL-16）
+
+`three_client_e2e.rs` に次を追加した。クライアント用スクリプト
+（`tests/three_client/*.py|js`）は変更していない（無改造接続の証跡）。
+
+- **SCRAM-SHA-256（WIRE-18）**: 4 フィールド形式の users ファイルと
+  `--scram-mock-key-file`（テスト専用ダミー秘密）で `--auth-method
+  scram-sha-256` のサーバーを起動し、3 テナント × 3 クライアントで C1 が
+  オラクルと一致すること、誤りパスワードが 3 クライアントで拒否されること、
+  未知ユーザーの拒否文言が誤りパスワードと（ユーザー名を除き）同一であること、
+  psql の `PGREQUIREAUTH=scram-sha-256` で接続でき `password` では拒否される
+  こと（libpq が実際に SCRAM をネゴシエートした証跡）を確認する。非空性は
+  常時実行テスト（`#[ignore]` なし）が AuthenticationSASL の機構一覧
+  （`SCRAM-SHA-256` を含み TLS なしでは `-PLUS` を含まない）で担保する。
+  SCRAM-SHA-256-PLUS（TLS・チャネルバインディング）は対象外
+  （`wire_scram_plus_psql_interop.rs`・`tls-channel-binding.md` が担当）。
+- **psql `\copy`（WIRE-17）**: text・csv の FROM、TO、別 DB への再投入と
+  再 TO の多重集合一致、他テナントからの非可視（RLS）、`operation_id` 無しの
+  `23502` 拒否を確認する。psql は `\copy` を `COPY  docs ( id, ... ) FROM
+  STDIN <残りの入力そのまま>` のように再構成して送るため（二重空白・括弧内の
+  空白・小文字のオプション語）、その形状を層 A（`wire17_copy.rs`）にも固定した。
+  比較は `f32` の `Display` による表現差を避けるため、embedding を `f32` へ
+  パースして行う。実測: psql 18 が生成する形は production の許可リストが
+  そのまま受理した（許可リストの変更なし）。
+- **複数行 INSERT と NoSQL `rows[]`（SQL-16）**: 同一の 3 行を、NoSQL
+  `rows[]`（1 回）と 3 クライアントの複数行 `INSERT ... VALUES` へ投入し、
+  読み戻し行集合が固定オラクルと相互に一致すること、bob からは見えないこと
+  （書き込みは Private 固定）を確認する。NoSQL の HTTP 呼び出しは、
+  `http_common` が `temp_db` を二重宣言し `clippy::duplicate_mod` となるため、
+  ファイル内の最小の生 HTTP/1.1 ヘルパー（受信上限付き）で行う。
+
+実行結果（本開発環境）: psql・psycopg・node `pg`（scratchpad へ一時導入し
+`NODE_PATH` で参照。リポへは持ち込まない）の 3 クライアントとも green。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
@@ -926,6 +960,9 @@ NULL` 列への `SET NULL`＝宣言時検査 `42830`）を適用し、影響行�
   行を含む」前提へ更新された（Issue #974・PR #980）。詳細は前述
   「Issue #878: wire セッションの可視性非対称と DML の相互作用
   （判断記録）」節参照。
+- Issue #1177: `three_client_e2e.rs` に SCRAM・psql `\copy`・複数行 INSERT の
+  層 B と常時実行の SASL 広告テストを、`wire17_copy.rs` に psql `\copy` 生成
+  形状の層 A 固定テストを追加した（production コードの変更なし）。
 
 ## スコープ外
 
@@ -954,7 +991,7 @@ NULL` 列への `SET NULL`＝宣言時検査 `42830`）を適用し、影響行�
   期待する項目）: engine に `EXPLAIN` 自体が未実装のため対象外（SQL-6 の
   確定化で扱う）
 - 拡張クエリプロトコル経由の `USING MODE $n`: WIRE-11（Issue #933）で
-  Parse／Describe は受理する経路へ切り替わったが、`$n` パラメータ束縛
-  （WIRE-12・#935）・Bind／Execute（#934）は引き続き未実装（Bind 以降は
-  WIRE-8 のまま `0A000` + 切断）のため、MVP は簡易クエリの `42601` 拒否
-  のみを検証する
+  Parse／Describe は受理する経路へ切り替わり、その後 Bind／Execute（#934）・
+  `$n` パラメータ束縛（WIRE-12・#1171）も実装された。ただし `USING MODE $n` は
+  `$n` の受理位置外のため引き続き `42601` で拒否され、MVP は簡易クエリの
+  `42601` 拒否のみを検証する（層 B での `$n` 検証は後続）

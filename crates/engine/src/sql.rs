@@ -53,7 +53,7 @@
 //!   への到達は現状 SQL テキスト経由の [`allowlist::validate_sql`] のみで、
 //!   `BoundScan::new` 相当の SQL テキスト非経由の直接構築 `BoundAggregate::new`
 //!   は対象外のまま）
-//! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
+//! - [`group_by`][]: `GROUP BY <列>`（Issue #1185 で `TEXT` 限定を外した）集計の複数行実行（TASK-167・SQL-14）。
 //!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
 //!   `ORDER BY`・`LIMIT` を担う
 //! - [`sparse_cache`][]: `exec` の hybrid 実行が参照する `SparseIndex`（BM25 語彙・
@@ -178,6 +178,7 @@ pub(crate) mod join;
 pub mod lexer;
 pub mod mode;
 pub(crate) mod numeric_fn;
+pub(crate) mod order_value;
 pub mod params;
 pub mod parser;
 pub mod plan;
@@ -196,6 +197,7 @@ pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod visible_cache;
+pub(crate) mod where_negation;
 pub(crate) mod where_tree;
 pub(crate) mod window;
 
@@ -301,9 +303,10 @@ pub enum SqlOutcome {
     /// variant はその [`exec::DeleteOutcome`] をそのまま運ぶ薄いラッパー
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
-    /// `RETURNING` 句（Issue #873・SQL-21）付きの `INSERT`／`DELETE` がセッション
-    /// 経由の実行経路で成功したことを示す応答。`INSERT`／`DELETE` 単独の
-    /// `Insert`／`Delete` variant とは別 variant として保持する
+    /// `RETURNING` 句（Issue #873・#1182・SQL-21）付きの `INSERT`（UPSERT を含む）／
+    /// `DELETE`（単一行・述語形）／`UPDATE`（単一行・述語形）がセッション
+    /// 経由の実行経路で成功したことを示す応答。`RETURNING` なしの
+    /// `Insert`／`Delete`／`Update` variant とは別 variant として保持する
     /// （`RowDescription` を伴う応答形が異なるため。`wire-server::simple_query`
     /// は `result` から `RowDescription`／`DataRow`* を、`command`・
     /// `rows_affected` から `CommandComplete` タグ〔`INSERT 0 <n>`／

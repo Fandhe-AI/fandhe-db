@@ -253,16 +253,17 @@ fn nosql_update_set_base64_matches_sql_read_back() {
 }
 
 #[test]
-fn nosql_insert_rejects_non_string_and_malformed_base64_with_42601() {
+fn nosql_insert_rejects_non_string_with_42601_and_malformed_base64_with_22p02() {
     let (core, _guard) = new_core();
     let (both, _sql) = spawn_both(core);
 
-    for (label, blob_json) in [
-        ("number", "123"),
-        ("array", "[1,2,3]"),
-        ("boolean", "true"),
-        ("malformed base64 (bad padding)", "\"3q2+7w=a\""),
-        ("malformed base64 (alphabet)", "\"!!!!\""),
+    for (label, blob_json, expected) in [
+        ("number", "123", "42601"),
+        ("array", "[1,2,3]", "42601"),
+        ("boolean", "true", "42601"),
+        // 不正な base64 は形式不正として `22P02`（Issue #1187）。
+        ("malformed base64 (bad padding)", "\"3q2+7w=a\"", "22P02"),
+        ("malformed base64 (alphabet)", "\"!!!!\"", "22P02"),
     ] {
         let body = format!(
             r#"{{"op":"insert","table":"docs","rows":[{{"id":1,"embedding":[0.1,0.2,0.3],"blob":{blob_json}}}],"operation_id":"op-reject-{label}"}}"#
@@ -270,7 +271,7 @@ fn nosql_insert_rejects_non_string_and_malformed_base64_with_42601() {
         let resp = query(&both, body.as_bytes());
         assert_eq!(
             http_common::wire_code_of(&resp),
-            "42601",
+            expected,
             "case: {label}, resp: {resp:?}"
         );
     }

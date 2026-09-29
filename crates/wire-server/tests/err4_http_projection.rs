@@ -277,7 +277,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 36] = [
+const EXPECTED_STATUS: [(&str, u16); 39] = [
     ("22000", 400),
     ("22012", 400),
     ("28P01", 401),
@@ -297,6 +297,7 @@ const EXPECTED_STATUS: [(&str, u16); 36] = [
     ("22003", 400),
     ("22023", 400),
     ("22008", 400),
+    ("22007", 400),
     ("22P02", 400),
     ("55P03", 503),
     ("25000", 400),
@@ -335,6 +336,10 @@ const EXPECTED_STATUS: [(&str, u16); 36] = [
     // 両辺の列数・列型不一致（SQL-29 (c)・TASK-213、Issue #929）。いずれも
     // SQL 表層専用の分類で 400。
     ("42804", 400),
+    // `UndefinedFunction`（`42883`）・`DuplicateFunction`（`42723`）: ERR-6 の新設行
+    // （Issue #1186）。いずれも 400。
+    ("42883", 400),
+    ("42723", 400),
     // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
     // 参照スコープでの非修飾列の曖昧解決。本 Issue では SQL 表層が JOIN・複数
     // FROM を受理しないため到達不能で、`err4_f_unreachable_classes_project_via_production_encoder`
@@ -398,7 +403,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 37);
+const _: () = assert!(ErrorClass::ALL.len() == 40);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -843,6 +848,11 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // RLS-10 (b)・TASK-213、Issue #929。NoSQL 表層は集合演算に非対応で
         // `op` 語彙に存在しない）。いずれも到達不能。
         ErrorClass::DatatypeMismatch,
+        // `DuplicateFunction`（`42723`。SQL-26、Issue #1186）: UDF 登録の名前衝突。
+        // NoSQL 表層の `op` 語彙に `CREATE FUNCTION` が無いため到達不能。
+        // （`UndefinedFunction`〔`42883`〕は `aggregate` op から到達可能。固定は
+        // `err4_f_sum_on_date_column_projects_42883_to_400` が担う）
+        ErrorClass::DuplicateFunction,
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
         // 参照スコープの基盤導入のみで、許可リストは JOIN・複数 FROM を引き続き
         // `42601` で拒否するため NoSQL 表層からは到達不能。
@@ -853,6 +863,30 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
     }
+}
+
+/// `UndefinedFunction`（`42883`。SQL-26、Issue #1186）は NoSQL 表層の実要求から
+/// 到達可能: `aggregate` op の `sum` を DATE 列に指定すると集計入力の解決で拒否される。
+/// 応答にテナントを含めない。
+#[test]
+fn err4_f_sum_on_date_column_projects_42883_to_400() {
+    let (core, _guard) = new_core();
+    let addr = spawn_with_ddl(core);
+
+    let create = br#"{"op":"create_table","table":"events","columns":[
+        {"name":"embedding","type":"vector","dim":2}
+    ]}"#;
+    assert_eq!(query_as_alice(addr, create).status, 200);
+    // `create_table` の列型語彙に DATE は無いため `alter_table.add_column` で加える。
+    let add =
+        br#"{"op":"alter_table","table":"events","add_column":{"name":"happened","type":"date"}}"#;
+    assert_eq!(query_as_alice(addr, add).status, 200);
+
+    let agg =
+        br#"{"op":"aggregate","table":"events","aggregates":[{"fn":"sum","column":"happened"}]}"#;
+    let resp = query_as_alice(addr, agg);
+    assert_projected(&resp, "42883");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 
 /// `ForeignKeyViolation`（`23503`。TABLE-17・TASK-205、Issue #907）は NoSQL 表層の

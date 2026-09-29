@@ -137,7 +137,7 @@ fn group_by_integer_key_sorts_ascending_with_null_last_and_hides_other_tenants()
 }
 
 #[test]
-fn group_by_order_by_key_desc_keeps_null_last() {
+fn group_by_order_by_key_desc_puts_null_first() {
     let (core, path) = seed(&rows_a(), &rows_b());
     let _guard = CleanupGuard(path);
     let out = cells(
@@ -147,10 +147,11 @@ fn group_by_order_by_key_desc_keeps_null_last() {
     );
     assert_eq!(
         out,
+        // 降順は PostgreSQL と同じく NULL が先頭（Issue #1185・SQL-25 (d) の契約）。
         vec![
+            vec![Cell::Null, Cell::Integer(2)],
             vec![Cell::SignedInteger(3), Cell::Integer(1)],
             vec![Cell::SignedInteger(1), Cell::Integer(2)],
-            vec![Cell::Null, Cell::Integer(2)],
         ]
     );
 }
@@ -249,7 +250,8 @@ fn group_by_numeric_key_is_stable_across_repeated_runs_with_index_cache() {
 fn group_by_rejects_unsupported_key_types_with_22000() {
     let (core, path) = seed(&rows_a(), &rows_b());
     let _guard = CleanupGuard(path);
-    for key in ["embedding", "id", "nope"] {
+    // 疑似列 `id` は Issue #1185 で `GROUP BY` キーとして受理される。
+    for key in ["embedding", "nope"] {
         let err = core
             .execute_sql(
                 &ctx_a(),

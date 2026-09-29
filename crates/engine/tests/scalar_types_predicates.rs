@@ -309,7 +309,7 @@ fn null_rows_never_match_typed_compare_predicates() {
     }
 }
 
-// --- 型不一致・リテラル形式違反は束縛時に 22000/22P02/22000 で拒否 -------------
+// --- 型不一致・リテラル形式違反は束縛時に 22000/22007/22P02/22P02 で拒否 -------------
 
 #[test]
 fn type_mismatched_comparisons_are_rejected_at_bind_time() {
@@ -326,9 +326,9 @@ fn type_mismatched_comparisons_are_rejected_at_bind_time() {
             &format!("SELECT id FROM {TABLE} WHERE day > 5 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 
-    // DATE 列に UUID 形式のリテラルは形式違反として `22000`。
+    // DATE 列に UUID 形式のリテラルは形式違反として `22007`。
     let err = core
         .execute_sql(
             &alice,
@@ -337,7 +337,7 @@ fn type_mismatched_comparisons_are_rejected_at_bind_time() {
             ),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22007");
 
     // UUID 列に形式違反のリテラルは `22P02`。
     let err = core
@@ -348,14 +348,14 @@ fn type_mismatched_comparisons_are_rejected_at_bind_time() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22P02");
 
-    // BYTEA 列に接頭辞なしのリテラルは `22000`。
+    // BYTEA 列に接頭辞なしのリテラルは `22P02`。
     let err = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE blob > 'deadbeef' LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 // --- INTEGER 列の比較・式参照（Issue #1183。SQL-24・SQL-26・TABLE-13 ポインタ） --

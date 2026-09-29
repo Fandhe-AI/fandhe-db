@@ -474,13 +474,15 @@ fn malformed_multi_column_group_by_shapes_are_rejected_with_42601_without_execut
 }
 
 #[test]
-fn non_text_second_group_by_column_is_rejected_with_22000() {
+fn unorderable_or_unknown_second_group_by_column_is_rejected_with_22000() {
+    // Issue #1185・SQL-25 (d) で契約改訂: `TEXT` 限定を外したため、拒否されるのは
+    // 並べ替え不能な型（`VECTOR`）と未知列だけ（疑似列 `id` は受理側。下の
+    // `id_second_group_by_column_is_accepted_and_matches_sql` 参照）。
     let (core, _guard) = new_core();
     let addr = spawn(Arc::clone(&core));
 
-    let cases: [&[u8]; 3] = [
+    let cases: [&[u8]; 2] = [
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","embedding"]}"#,
-        br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","id"]}"#,
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","nope"]}"#,
     ];
     for body in cases {
@@ -492,6 +494,24 @@ fn non_text_second_group_by_column_is_rejected_with_22000() {
             String::from_utf8_lossy(body)
         );
     }
+}
+
+#[test]
+fn id_second_group_by_column_is_accepted_and_matches_sql() {
+    // NOSQL-16 (b) は SQL-25 (d) の写像のためパリティとして受理する
+    // （Issue #1185）。SQL テキスト経由の結果とバイト一致する。
+    let (core, _guard) = new_core();
+    let addr = spawn(Arc::clone(&core));
+
+    let body = br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"count","column":"*"}],"group_by":["lang","id"]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        "SELECT lang, id, COUNT(*) FROM docs GROUP BY lang, id",
+    );
+    assert_eq!(body_utf8(&resp), oracle);
 }
 
 #[test]

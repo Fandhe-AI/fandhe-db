@@ -5,7 +5,7 @@
 //! `tests/boolean_column.rs`（TABLE-13・TASK-196）と同じ流儀（`unique_db_path`／
 //! `CleanupGuard`、実 `Storage`＋`CpuScalarProvider`、`EngineCore::execute_sql`／
 //! `execute_sql_in_session` を production 経路として検証）。往復（宣言→書き込み→
-//! 再オープン→読み出し）・リテラル受理範囲（`22000` 文法違反／`22008` 範囲外・
+//! 再オープン→読み出し）・リテラル受理範囲（`22007` 書式違反／`22008` 範囲外・
 //! 暦上不正）・COUNT／SUM 拒否・RLS 境界・UPDATE・content_hash 再送判定
 //! （`23505`／`22023`）・Rust API 直接投入の往復を固定する。`DATE`／`TIMESTAMP`
 //! の等価・範囲 WHERE 述語（TABLE-13・TASK-199、Issue #891・レーン B）は
@@ -162,10 +162,10 @@ fn datetime_columns_roundtrip_through_storage_reopen() {
     assert_eq!(cells, vec![Cell::Null, Cell::Null]);
 }
 
-// --- 受け入れ条件 3: リテラル受理範囲（文法違反=22000／範囲外・暦上不正=22008） ---
+// --- 受け入れ条件 3: リテラル受理範囲（書式違反=22007／範囲外・暦上不正=22008） ---
 
 #[test]
-fn insert_rejects_format_violations_as_22000() {
+fn insert_rejects_format_violations_as_22007() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -187,12 +187,12 @@ fn insert_rejects_format_violations_as_22000() {
         let err = core
             .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "case {day:?} should be 22000");
+        assert_eq!(err.wire_code(), "22007", "case {day:?} should be 22007");
     }
 }
 
 #[test]
-fn insert_rejects_timestamp_timezone_suffix_and_date_only_as_22000() {
+fn insert_rejects_timestamp_timezone_suffix_and_date_only_as_22007() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -213,7 +213,7 @@ fn insert_rejects_timestamp_timezone_suffix_and_date_only_as_22000() {
         let err = core
             .execute_sql_in_session(&alice, &mut SessionState::default(), &sql)
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "case {at:?} should be 22000");
+        assert_eq!(err.wire_code(), "22007", "case {at:?} should be 22007");
     }
 }
 
@@ -337,7 +337,12 @@ fn count_counts_non_null_datetime_rows_and_sum_is_rejected() {
     let err = core
         .execute_sql(&alice, &format!("SELECT SUM(day) FROM {TABLE}"))
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
+    // Issue #1186: `TIMESTAMP` への `AVG` も同じ `42883`。
+    let err = core
+        .execute_sql(&alice, &format!("SELECT AVG(at) FROM {TABLE}"))
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "42883");
 }
 
 /// `MIN`/`MAX(<DATE>/<TIMESTAMP>)` は Issue #892（D1・D7）で受理された
@@ -445,16 +450,16 @@ fn where_equality_and_range_on_datetime_column_is_accepted() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
 
-    // 文法違反のリテラルは `22000`。
+    // 文法違反のリテラルは `22007`。
     let err = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE day = 'not-a-date' LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22007");
 
-    // DATE 列と数値リテラルの比較（型不一致）は `22000`。
+    // DATE 列と数値リテラルの比較（型不一致）は `42804`。
     // （TEXT 列の範囲比較は Issue #1183 で受理されたため、型不一致の例には使わない）
     let err = core
         .execute_sql(
@@ -462,7 +467,7 @@ fn where_equality_and_range_on_datetime_column_is_accepted() {
             &format!("SELECT id FROM {TABLE} WHERE day > 5 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 }
 
 // --- RLS 境界: 他テナントの日時値行は見えない ---------------------------------

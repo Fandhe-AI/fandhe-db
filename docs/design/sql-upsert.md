@@ -219,7 +219,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
 
 ## 対象外・申し送り
 
-- `RETURNING` 句（別 Issue の担当）。
+- `RETURNING` 句は Issue #1182 で結線済み（`docs/design/sql-returning.md` 参照）。
 - `UNIQUE` 制約を衝突対象にする拡張（TABLE-16）は Issue #1074 で実装済み
   （「ON CONFLICT 対象の UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を
   対象にすること・`ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の

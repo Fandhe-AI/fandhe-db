@@ -399,7 +399,11 @@ fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexE
 /// 消費済みなら小数部が空でも `.` を消費する）も 1 トークンとして受理するよう拡張した。
 /// 2 個目以降の `.`（`1..2`）は本関数が最初の `.` を消費した時点で走査を止めるため
 /// 対象外のまま（残った `.` は新たな数値トークンの開始、または「未対応文字」として
-/// `tokenize` のメインループが扱う）。指数表記は非対応。
+/// `tokenize` のメインループが扱う）。
+/// Issue #1187 で指数部（`e`／`E`・任意の符号・1 桁以上の数字）も同じ数値トークンとして
+/// 読むよう拡張した（`REAL`／`DOUBLE PRECISION` 列の `1.5e3` 受理と揃える）。
+/// 指数部に数字が無い `1e`／`1e+` は指数部を消費せず、残った `e` を後続トークンとして
+/// 扱わせる（数値の直後に識別子が続く形は構文エラーになり PostgreSQL の拒否と一致する）。
 fn lex_number(input: &str, start: usize) -> (String, usize) {
     let Some(rest) = input.get(start..) else {
         return (String::new(), start);
@@ -433,6 +437,31 @@ fn lex_number(input: &str, start: usize) -> (String, usize) {
                     break;
                 }
             }
+        }
+    }
+    // 指数部: `e`／`E` + 任意の `+`／`-` + 1 桁以上の数字が揃った場合のみ消費する
+    // （仮読みで確定させ、揃わない場合は `end` を進めない）。整数部・小数部が共に空
+    // （`e5` 等）はメインループが識別子として扱うためここには来ない。
+    if end > 0 && matches!(chars.peek(), Some(&(_, 'e' | 'E'))) {
+        let mut probe = chars.clone();
+        let mut exp_len = 'e'.len_utf8();
+        probe.next();
+        if let Some(&(_, sign @ ('+' | '-'))) = probe.peek() {
+            exp_len += sign.len_utf8();
+            probe.next();
+        }
+        let mut digits = 0usize;
+        while let Some(&(_, c)) = probe.peek() {
+            if c.is_ascii_digit() {
+                exp_len += c.len_utf8();
+                digits += 1;
+                probe.next();
+            } else {
+                break;
+            }
+        }
+        if digits > 0 {
+            end += exp_len;
         }
     }
     let word = rest.get(..end).unwrap_or_default().to_string();
@@ -934,5 +963,35 @@ mod tests {
         // 閉じられない文字列リテラル中に非 ASCII 文字を混在させる形で検証する）。
         let input = "'\u{e9}\u{e9}";
         assert!(tokenize(input).is_err());
+    }
+
+    #[test]
+    fn tokenize_reads_exponent_as_part_of_number() {
+        // Issue #1187: 指数部（e/E・任意の符号・数字）を同じ数値トークンとして読む。
+        for lit in ["1.5e3", "1E3", "2e-2", "3.e+4", ".5e1", "10e0"] {
+            let tokens = tokenize(lit).expect("tokenize should succeed");
+            assert_eq!(tokens, vec![Token::Number(lit.to_string())], "{lit}");
+        }
+        let tokens = tokenize("1.5e3, 2").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Number("1.5e3".to_string()),
+                Token::Punct(','),
+                Token::Number("2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_does_not_consume_incomplete_exponent() {
+        // 指数部に数字が無い `1e`／`1e+` は指数部を消費せず、`e` は識別子として残る
+        // （後段のパーサが構文エラーとして拒否する）。
+        let tokens = tokenize("1e").expect("tokenize should succeed");
+        assert_eq!(tokens.first(), Some(&Token::Number("1".to_string())));
+        assert_eq!(tokens.len(), 2);
+        let tokens = tokenize("1e+").expect("tokenize should succeed");
+        assert_eq!(tokens.first(), Some(&Token::Number("1".to_string())));
+        assert!(tokens.len() >= 2);
     }
 }

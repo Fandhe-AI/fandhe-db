@@ -111,6 +111,57 @@ fn insert_select_roundtrips_real_and_double_values() {
     assert_eq!(as_float(&cells[1]), 2.25);
 }
 
+/// 指数表記リテラル（`1.5e3`・`2E-2`）が字句解析から列束縛まで通る
+/// （Issue #1187。`scalar_float::parse_real`／`parse_double` の受理文法と揃える）。
+#[test]
+fn insert_accepts_exponent_notation_literals() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let mut session = SessionState::default();
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, score, weight) \
+             VALUES (1, '[0.1,0.2]', 1.5e3, 2E-2) USING OPERATION_ID 'op-1'"
+        ),
+    )
+    .expect("INSERT with exponent literals should succeed");
+
+    let cells = select_row(&core, &alice, 1);
+    assert_eq!(as_float(&cells[0]), 1500.0);
+    assert_eq!(as_float(&cells[1]), 0.02);
+
+    // 式（WHERE の算術比較）でも指数表記が 1 トークンとして読まれる。
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE id + 1e0 = 2 LIMIT 1"),
+        )
+        .expect("exponent literal in WHERE expression should succeed");
+    assert_eq!(result.rows.len(), 1);
+}
+
+/// 指数部に数字が無い `1e` は構文エラーで拒否される（PostgreSQL と同様）。
+#[test]
+fn insert_rejects_exponent_without_digits() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let mut session = SessionState::default();
+
+    let sql = format!(
+        "INSERT INTO {TABLE} (id, embedding, score) VALUES (1, '[0.1,0.2]', 1e) \
+         USING OPERATION_ID 'op-1'"
+    );
+    let err = core
+        .execute_sql_in_session(&alice, &mut session, &sql)
+        .expect_err("exponent without digits must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
 /// 負値・境界値（`-0.0` の正規化を含む）の往復。
 #[test]
 fn insert_select_roundtrips_negative_and_boundary_values() {
@@ -230,10 +281,10 @@ fn insert_rejects_out_of_range_real_literal_with_22003() {
         .expect("retry with the same operation_id should succeed after the rejected attempt");
 }
 
-/// 文字列リテラルは既存の型不一致と同じ `22000`（InvalidInput）で拒否する
+/// 文字列リテラルは形式不正として `22P02`（InvalidTextRepresentation。Issue #1187）で拒否する
 /// （F7: 文字列からの暗黙変換はしない）。
 #[test]
-fn insert_rejects_string_literal_for_real_column_with_22000() {
+fn insert_rejects_string_literal_for_real_column_with_22p02() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -246,7 +297,7 @@ fn insert_rejects_string_literal_for_real_column_with_22000() {
     let err = core
         .execute_sql_in_session(&alice, &mut session, &sql)
         .expect_err("string literal for REAL column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 /// `WHERE score = 1` は Issue #1183（SQL-24・SQL-26・TABLE-13 ポインタ）で受理される

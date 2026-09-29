@@ -66,10 +66,9 @@
 //!   バイナリ形式（format code 1）の結果エンコーディング（WIRE-14・
 //!   TASK-218・Issue #936。`ResultFormats::resolve`・
 //!   `validate_binary_formats`・`encode_row_description_with_formats`・
-//!   `encode_data_row_into_with_formats`）も本モジュールが提供するが、
-//!   拡張クエリプロトコルの Bind／Describe（#933・#934）が未実装のため
-//!   wire 経由でバイナリ形式を要求する経路は本 crate にまだ無い（Phase A。
-//!   結線は #934 の担当）
+//!   `encode_data_row_into_with_formats`・`encode_data_row_into_with_columns`）も
+//!   本モジュールが提供する。Bind の結果 format code は #934 で結線済みで、
+//!   数値・真偽値・bytea・uuid 列のバイナリ符号化は Issue #1172 で追加した
 //! - [`error_response`][]: `engine::error_format::ErrorClass` → `ErrorResponse`
 //!   （'E'）バイト列への横断写像（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）
 //! - `response_buffer`（crate 内限定）: 簡易クエリ応答の `DataRow` 群を上限付き

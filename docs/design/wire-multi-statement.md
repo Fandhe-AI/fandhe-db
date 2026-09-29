@@ -4,8 +4,8 @@
 - 対応: Issue #938
 - ポインタ: `docs/spec/04-behavior/wire-protocol.md` WIRE-16・`docs/spec/05-tasks.md` TASK-219
 - 関連ポインタ: WIRE-4（1 メッセージ長上限）・SQL-8（許可リスト構造検証・単一文契約）・
-  SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`・未実装）・RECOVER-12（複数文単位トランザクション・
-  未実装）・ERR-1／ERR-2（`wire_code` 契約）
+  SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`。Issue #942 で実装済み）・RECOVER-12（複数文単位トランザクション・
+  Issue #942・#1175 で実装済み）・ERR-1／ERR-2（`wire_code` 契約）
 
 ## 背景・目的
 
@@ -25,17 +25,24 @@ wire 層（`crates/wire-server/src/simple_query.rs`）は SQL の字句知識を
 
 ### 分割規則
 
-- 文字列リテラル（`'...'`。`''` エスケープを含む）の中にある `;` は分割点に
-  しない。
-- リテラル外で `--`・`/* */`（SQL コメント）・`"`（二重引用符識別子）・
-  未終端の文字列リテラルを検出した場合は分割せず元テキスト全体を
-  そのまま渡す（`SplitOutcome::Single`）。これらは `lexer::tokenize` が
-  常に拒否する構文であるため、分割せずに渡しても既存と同一の `42601` に
-  収束する。単体テスト（`statement_splitter.rs::tests::
-  comments_double_quotes_and_unterminated_literals_are_single_and_lexer_agrees`）
-  で分割器の拒否規則と lexer の拒否規則が連動していることを機械的に固定した。
-  この設計により「コメントや未終端引用符で区切りを隠し、後続の文を密輸する」
-  経路を構造的に塞いでいる。
+- 字句走査は 5 状態（通常／`'...'`〔`''` エスケープ〕／`"..."`〔`""` エスケープ〕／
+  `--` から `\n` または `\r` まで／`/* ... */`〔PostgreSQL と同じく入れ子を数える〕）。
+  通常状態の `;` だけを区切りとし、コメント・引用の内部の `;` は区切りにしない
+  （Issue #1175。従来はコメント・二重引用符を見つけると分割せず全文を `Single` に
+  していた）。入れ子を数えないと `/* a /* b */ ; INSERT ... */` の `INSERT` が
+  分割されて実行される（区切りの密輸）ため、深さを飽和演算で数える。
+- 各断片は加工せず（コメントを除去せず）engine へ渡す。コメント・二重引用符識別子を
+  含む断片は単一文のときと同じく `lexer::tokenize` が `42601` で拒否する
+  （lexer の受理範囲は広げない）。コメントだけの断片（`SELECT 1; -- done`）も
+  空文とはみなさず `42601` になる（PostgreSQL との既知の相違）。
+- **PostgreSQL と分割結果が食い違いうる構文では分割しない**（fail-closed）。
+  未終端の `'...'`・`"..."`・`/* */`、通常状態の `$`（ドル引用）、E 文字列の接頭辞
+  （`E'`／`e'`）を検出した場合は `SplitOutcome::Single` を返し、全文を engine へ
+  そのまま渡す（lexer が拒否して `42601`、1 文も実行されない）。
+  単体テスト（`statement_splitter.rs::tests` の
+  `unterminated_constructs_and_ambiguous_syntax_fall_back_to_single`・
+  `nested_block_comments_do_not_smuggle_a_statement` 等）と wire 結合テスト
+  （`wire16_implicit_transaction.rs`）で固定した。
 - 非空文（前後空白 trim 後）の上限は `MAX_STATEMENTS_PER_QUERY = 16`
   （実装既定値）。超過は `54000`（`PayloadTooLarge`）で 1 文も実行しない。
 - 空文（`;;`・先頭の `;`・末尾の余剰 `;`・空白のみの区間）は無視する。
@@ -80,22 +87,59 @@ wire 層（`crates/wire-server/src/simple_query.rs`）は SQL の字句知識を
 トランザクション状態によらず必ず最後の文でのみ許可する（1 メッセージにつき
 commit は高々 1 回という既存の不変条件を維持するため）。
 
-## 原子性（暗黙トランザクション）の扱い
+## 原子性（暗黙トランザクション。Issue #1175）
 
-「書き込みは最後の 1 文のみ」という制約の下では、追加の分散トランザクション
-機構なしに WIRE-16 の原子性要件が構造的に成立する。
+`statement_splitter::plan_multi_statement(stmts, session_in_txn)` が、複数文
+メッセージの実行方式を選ぶ。
 
-- 先行文（すべて読み取り専用・セッション局所）がエラーになった場合、書き込み
-  文はまだ実行されていない。
-- 最後の書き込み文自身がエラーになった場合は、その文の redb トランザクション
-  が単独で原子的に失敗する（既存の単一文書き込み経路と同一の commit 境界）。
-- 書き込み文の後ろに文はない。
+| 条件 | 方式 | 挙動 |
+| ---- | ---- | ---- |
+| セッションが `Idle` でない（明示トランザクション中・`Failed`）、またはメッセージに `BEGIN`／`COMMIT`／`ROLLBACK` を含む | `Sequential` | 上記の `check_write_placement` をそのまま適用（従来と同一） |
+| 書き込みが最後の 1 文だけ、または書き込みなし | `Sequential` | 文ごとの autocommit（従来と同一） |
+| 上記以外（`Write` が最後以外にある） | `ImplicitTransaction` | メッセージ全体を 1 つの暗黙トランザクションで実行 |
 
-この制約はまた、`_response_boundary`（RECOVER-5 (3)）・緊急応答登録
-（RECOVER-6・`crate::recovery::panic_hook`）の「1 メッセージにつき commit は
-高々 1 回」という前提を保つ副次的な理由でもある。書き込みが最後の 1 文に
-限られることで、複数文メッセージでも commit 成功境界を跨いだ panic の扱いは
-既存の単一文契約と同一のまま拡張できる。
+- **既存経路を包み直さない**: `Active` の間は許可リスト内の文しか実行できないため、
+  今動いているメッセージ（`SELECT ...; UPDATE ...` 等）を暗黙トランザクションで
+  包むと `0A000` に後退する。`Sequential` が受理する形は必ず `Sequential` のまま残す。
+- **暗黙トランザクションの開始点はメッセージの先頭**（最初の書き込みの直前ではない）。
+  メッセージ全体が 1 つのトランザクションになり、`SET`・カーソル・読み取りの意味が
+  一様になる代わりに、先頭の読み取りの間も単一ライタのゲートを保持する。保持時間は
+  `max_duration`（20 秒）と文数上限 16 で有界。
+- **状態機械**（`sql::transaction`）: `SessionTransaction::begin_implicit`（`Idle` から
+  のみ）→ 各文を通常の `execute_sql_in_txn` で実行 → 最後の文の成功後に
+  `commit_implicit`（遅延 `FOREIGN KEY` 検査・commit を 1 回）。エラー・上限超過・
+  `operation_id` 再利用（`25000`）は `Failed` ではなく `Idle`（write txn を abort し
+  ライタを解放）へ戻る。クライアントが `ROLLBACK` を発行できないため、`'E'` で固まらない。
+  行・`operation_id` 台帳とも同一の write txn なので、ロールバックで一括して消える。
+- **commit は最後の文の応答を書く前に、緊急応答登録の内側で 1 回だけ**行う
+  （`run_statement_as` の `StatementRole::ImplicitFinal`）。これで RECOVER-6（commit
+  後の panic への緊急応答）が commit 点を覆い、`_response_boundary` は変えずに
+  「1 メッセージにつき commit は高々 1 回」が保たれる。commit に失敗した場合は
+  `CommandComplete` を送らず ErrorResponse＋`ReadyForQuery('I')`。commit 後の応答
+  エンコード失敗は「書き込みは確定したが応答はエラー」（既存の autocommit 単一文と
+  同じ契約）。
+- **今の時点で原子的に実行できる複数書き込みは、単一行 `INSERT`（`RETURNING` なし）と
+  `TRUNCATE` の組み合わせに限られる**（明示トランザクションと同じ許可リスト）。
+  `UPDATE`・`DELETE`・UPSERT・複数行 `INSERT`・DDL・`RETURNING` は `0A000` で暗黙
+  トランザクション全体をロールバックする（fail-closed。#1179 で許可リストが広がれば
+  自動的に広がる）。
+- **既知の逸脱**: 書き込み済みテーブルの読み取りは `0A000`（明示トランザクションと
+  同じ。例: `INSERT INTO t ...; SELECT ... FROM t` は INSERT の応答の後に `0A000`
+  となり全体をロールバック）。
+- **fail-closed の不変条件**: `classify_statement` は未知の先頭語を `Write` とみなす。
+  そのため `ImplicitTransaction` へ振り分けられ、`Active` の許可リストに一致しなければ
+  `0A000` になる。未知の書き込み構文が autocommit で素通りする経路は生まれない。
+  各文の後に暗黙トランザクションが `Active` のままかも確認する（後続の書き込みが
+  autocommit で実行されないよう、失われていたら `XX000` で打ち切る）。
+- **セッション状態**（`SET`／`CREATE FUNCTION`）は、失敗時にメッセージ受信前の
+  スナップショットへ無条件に復元する（`MessageSnapshot` は `Active` → `Idle` の遷移で
+  復元を省くため暗黙モードでは使わず、専用の `run_implicit_transaction` が担う）。
+- 途中の文の緊急応答登録・障害注入点は、commit が起きないため設けない
+  （`StatementRole::ImplicitIntermediate`）。
+
+`Sequential`（`BEGIN` を含むメッセージ・書き込みが最後だけのメッセージ）では従来どおり、
+先行文がエラーになれば書き込み文はまだ実行されておらず、最後の書き込み文自身が
+エラーになればその文の redb トランザクションが単独で原子的に失敗する。
 
 ### セッション状態の巻き戻し
 
@@ -107,14 +151,15 @@ commit は高々 1 回という既存の不変条件を維持するため）。
 復元する。単一文経路（`SplitOutcome::Single`）はこの clone を行わないため、
 既存の単一文レイテンシ・アロケーションコストは不変。
 
-### 制約を緩める条件（Issue #942 で緩和済み）
+### 制約を緩める条件（Issue #942・#1175 で緩和済み）
 
 SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 トランザクション機構の一部）は Issue #942 で実装済みとなり、`BEGIN` を含む
 メッセージ内では「書き込みは最後の 1 文のみ」の制約を外した（上記
-「文種別分類」節参照）。`BEGIN` を含まないメッセージでは引き続き従来の制約
-（書き込みを含む複数文の原子性を安全側〔受理範囲を狭める〕に倒して保証する）
-を維持する。
+「文種別分類」節参照）。Issue #1175 で `BEGIN` を含まないメッセージも、書き込みが
+最後以外にある形は暗黙トランザクションで原子的に実行する（上記「原子性」節）。
+制御文を含むメッセージでの `check_write_placement`（`WriteNotLast`。`0A000`）は
+従来どおり。
 
 ## 応答順序
 
@@ -157,12 +202,29 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
   対象外であり、HTTP への射影変更もない。
 - 3 クライアント e2e（`three_client_e2e.rs` 等）への追加は opt-in の任意
   追加に留め、本 Issue では必須にしない。
-- `COPY`（WIRE-17・TASK-220・Issue #939）: `COPY` は 1 つの `'Q'` メッセージ
-  中で単独文でなければならない（`handshake::post_auth_loop` が `COPY` の
-  覗き見判定をメッセージ全文へ適用してから本モジュールの複数文経路か
-  `crate::copy::run` かへ分岐するため）。混在時の詳細な fail-closed 挙動は
-  `docs/design/wire-copy-protocol.md`「エラー処理・PostgreSQL 本家との
-  相違点」6. 参照。
+- 暗黙トランザクション内での `UPDATE`・`DELETE`・UPSERT・複数行／ファイル形 `INSERT`・
+  `RETURNING`・DDL・COPY、および書き込み済みテーブルの読み取り（#1179 の成果を
+  自動的に引き継ぐ）。`BEGIN` より前の書き込みを明示ブロックへ昇格させる PostgreSQL の
+  意味論（`INSERT; BEGIN; ...`）、lexer でのコメント・二重引用符識別子・ドル引用・
+  E 文字列の受理、拡張クエリプロトコルでの暗黙トランザクション（Sync 単位）も対象外。
+
+## COPY の文単位化（Issue #1175）
+
+`COPY`（WIRE-17・TASK-220・Issue #939）は、従来は `handshake::post_auth_loop` が
+メッセージ全文へ覗き見判定を適用して `crate::copy::run` へ分岐していたため、複数文
+メッセージの 2 文目以降の `COPY` は `42601` だった。Issue #1175 で判定を文単位へ移し、
+`simple_query::run_copy_statement`（状態検査＋`crate::copy::run`）が担う。
+
+- `SELECT ...; COPY t FROM STDIN ...` → SELECT の応答、CopyIn、`COPY n`、`ReadyForQuery`
+  （PostgreSQL と一致）。`COPY (SELECT ...) TO STDOUT; SELECT 1` → CopyOut、`COPY n`、
+  SELECT の応答、`ReadyForQuery`（PostgreSQL と一致）。`copy::run` は `Finish` を受け取り、
+  途中の COPY では `CommandComplete` の後に `ReadyForQuery` を送らない。
+- `classify_statement` は括弧の深さ 0 で最初に現れる `TO` なら `ReadOnly`、`FROM`・
+  どちらも無い場合は `Write`（fail-closed）に分類する。
+- **既知の相違**: `COPY t FROM STDIN ...; SELECT 1`・`INSERT ...; COPY t FROM STDIN` は
+  暗黙トランザクションになり、トランザクション内の COPY は未対応のため `0A000`
+  （CopyIn に入らず、`ReadyForQuery('I')`。全体をロールバック）。後続文のエラー時に
+  COPY を巻き戻せないため原子性を優先して拒否する（従来は `42601`）。
 
 ## 挙動変化の明記（受理範囲の拡大）
 
@@ -177,6 +239,17 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 契約を緩めるものではない（各文は独立に既存の許可リスト検証・RLS 暗黙適用を
 通る）。
 
+Issue #1175 による変化:
+
+- 受理側へ変わるもの: 書き込みが最後以外にある複数文のうち、単一行 `INSERT`・
+  `TRUNCATE` の組み合わせ（従来 `0A000`）。コメント・二重引用符識別子を含むメッセージの
+  分割（断片ごとの `42601`。従来はメッセージ全体で `42601`）。2 文目以降の `COPY`。
+- エラーコードの位置・種別が変わるもの: 書き込みが最後以外にある複数文のうち暗黙
+  トランザクションで対応できない形は、従来「1 文も実行せず `0A000`」だったが、
+  対応できない文の位置で `0A000`（それ以前の文の応答は届き、全体をロールバックする）。
+  通常状態に `$` を含むメッセージは分割されず全文が `42601`（従来は断片ごとに実行を
+  試みた）。`COPY ...; 他の文`（COPY が書き込みの場合）は `42601` から `0A000`。
+
 ## 検証
 
 - `crates/engine/src/sql/statement_splitter.rs`（単体テスト）: 分割規則・
@@ -184,6 +257,11 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 - `crates/wire-server/tests/wire16_multi_statement.rs`（層 A 結合テスト）:
   応答順序・エラー時の打ち切り・セッション状態の巻き戻し・RLS 不変
   （RLS-9/10 の応答同一性を含む）・単一文の既存挙動の不変性。
+- `crates/wire-server/tests/wire16_implicit_transaction.rs`・
+  `crates/engine/tests/wire16_implicit_txn.rs`: 暗黙トランザクションの原子的な commit・
+  途中エラーでの全体ロールバック（行・`operation_id` 台帳・セッション状態）・
+  `ReadyForQuery('I')`・RLS・区切りの密輸防止。`wire_fault_injection_cli.rs` は
+  暗黙トランザクションの commit 後 panic の緊急応答が 1 回だけ送られること。
 - 回帰: `crates/engine/tests/rls_implicit.rs`（engine API の単一文 `42601`
   契約）・既存 wire 結合テスト一式（`wire1_simple_query.rs` 等）・
   `wire_fault_injection_cli.rs`（commit 後 panic の緊急応答経路が文単位の

@@ -259,7 +259,7 @@ fn scan_over_declared_udf_call_evaluates_computed_column() {
     let err = core
         .execute_sql(&ctx, "SELECT n(embedding) FROM docs LIMIT 10")
         .expect_err("undefined UDF must be rejected in a fresh session");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // `VECTOR` 列が未設定（NULL）の既存行に対する `Cell::Null` 投影は、低レベル

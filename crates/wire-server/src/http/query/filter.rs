@@ -236,7 +236,7 @@ impl FilterError {
             ErrorClass::InvalidInput => SqlSurfaceError::InvalidInput { detail },
             ErrorClass::FeatureNotSupported => SqlSurfaceError::FeatureNotSupported { detail },
             // `UnsupportedOperator`／`RlsPredicateNotAllowed`／`GroupShape`／
-            // `InEmpty`／`TypeMismatch`／`InvalidBytea` はいずれもここに到達する。
+            // `InEmpty`／`TypeMismatch` はいずれもここに到達する。
             _ => SqlSurfaceError::UnsupportedSyntax { detail },
         }
     }
@@ -573,7 +573,7 @@ fn declare_eq(
                     hex,
                 )))
             }
-            _ => Err(FilterError::Value(TypedJsonError::InvalidBytea(
+            _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
                 "eq filter value for a BYTEA column must be a base64 JSON string",
             ))),
         },
@@ -630,7 +630,7 @@ fn declare_range(
                     column, cmp, hex,
                 )))
             }
-            _ => Err(FilterError::Value(TypedJsonError::InvalidBytea(
+            _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
                 "range filter value for a BYTEA column must be a base64 JSON string",
             ))),
         },
@@ -760,7 +760,7 @@ fn declare_in(
                         values.push(typed_json::bytea_literal_text(s).map_err(FilterError::Value)?)
                     }
                     _ => {
-                        return Err(FilterError::Value(TypedJsonError::InvalidBytea(
+                        return Err(FilterError::Value(TypedJsonError::TypeMismatch(
                             "in filter value for a BYTEA column must be an array of base64 JSON strings",
                         )))
                     }

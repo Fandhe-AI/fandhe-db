@@ -967,7 +967,7 @@ fn bind_typed_compare_literal(
 fn numeric_literal_error(column: &str, e: crate::numeric::NumericError) -> SqlSurfaceError {
     match e {
         crate::numeric::NumericError::Malformed(detail) => {
-            SqlSurfaceError::invalid_input(format!("column {column:?}: {detail}"))
+            SqlSurfaceError::invalid_text_representation(format!("column {column:?}: {detail}"))
         }
         crate::numeric::NumericError::OutOfRange => SqlSurfaceError::numeric_out_of_range(format!(
             "column {column:?} numeric comparison literal out of range"
@@ -1711,7 +1711,7 @@ mod tests {
                 .bind(&schema)
                 .unwrap_err()
                 .wire_code(),
-            "22000"
+            "22007"
         );
         assert_eq!(
             DeclarativeFilter::compare("ext_id", CompareOp::Eq, "not-a-uuid")
@@ -1725,7 +1725,7 @@ mod tests {
                 .bind(&schema)
                 .unwrap_err()
                 .wire_code(),
-            "22000"
+            "22P02"
         );
     }
 
@@ -1757,7 +1757,7 @@ mod tests {
             } else {
                 let err = result.unwrap_err();
                 assert!(
-                    err.wire_code() == "22000" || err.wire_code() == "22P02",
+                    ["22000", "22P02", "22007"].contains(&err.wire_code()),
                     "column {column:?}: unexpected wire_code {:?}",
                     err.wire_code()
                 );

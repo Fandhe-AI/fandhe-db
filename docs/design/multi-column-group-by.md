@@ -64,4 +64,6 @@ fail-closed に倒す）。既存の `MAX_GROUPS`（10,000 グループ）・
   `group_by` の裸の文字列形〔単一文字列。配列でない形〕の受理は Issue #949
   でも対象外のまま）
 - 複数列 `GROUP BY` での索引候補走査形（`resolve_candidates`）の利用（D3）
-- `TEXT` 以外の列（整数・日時等）をグループキーにすること
+- `TEXT` 以外の列（整数・日時等）をグループキーにすること: **Issue #1185 で実施**
+  （`docs/design/aggregate-order-by-and-scalar-group-keys.md`。`BoundGroupBy.column_indices`
+  は `keys` へ、`GroupKey` の成分は型付きの `Option<OrderValue>` へ一般化した）

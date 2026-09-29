@@ -356,14 +356,14 @@ fn datetime_arithmetic_and_field_errors_have_deterministic_wire_codes() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22008");
 
-    // `DATE '2024/01/01'`（区切り文字違反）は `22000`。
+    // `DATE '2024/01/01'`（区切り文字違反）は `22007`。
     let err = core
         .execute_sql(
             &ctx,
             &format!("SELECT id FROM {TABLE} WHERE day = DATE '2024/01/01' AND id = 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22007");
 
     // 現在時刻系は未実装のため未知の関数として `22000`。
     let err = core
@@ -372,7 +372,7 @@ fn datetime_arithmetic_and_field_errors_have_deterministic_wire_codes() {
             &format!("SELECT now() FROM {TABLE} WHERE id = 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 /// 可視行が 0 件（他テナントの行しか無い）状態では、定数式の評価エラーが
@@ -454,11 +454,11 @@ fn udf_body_can_call_date_part_and_reserved_names_are_rejected() {
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION date_part(a, b) AS a")
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION date_trunc(a, b) AS a")
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42723");
 
     // 非決定的関数名 `now` は引き続き UDF として登録・呼び出せる（PR #1107 の
     // codex 是正を維持。組み込み関数はすべて純粋関数のため決定性は崩れない）。
@@ -731,7 +731,7 @@ fn date_part_rejects_non_literal_first_argument_when_not_null() {
             &format!("SELECT date_part(1, at) FROM {TABLE} WHERE id = 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 }
 
 // --- DATE 減算の i32::MIN 境界値（codex P1 指摘対応。PR #1120） -------------

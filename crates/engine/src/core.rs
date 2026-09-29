@@ -1374,7 +1374,8 @@ pub enum ParsedSql {
     Truncate(crate::sql::allowlist::ValidatedTruncate),
     /// `DELETE`（単一行・`id` 完全一致形／述語形。SQL-18・SQL-19）。
     Delete(crate::sql::allowlist::DeleteStatement),
-    /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19）。
+    /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19。`RETURNING` は
+    /// セッション経路のみ。SQL-21）。
     Update(crate::sql::allowlist::ValidatedUpdateForm),
     /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。トランザクション文脈を
     /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
@@ -1514,9 +1515,46 @@ pub struct PreparedSql {
     /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
     /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
     where_equality_dummy_flags: Vec<bool>,
+    /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
+    /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
+    param_types: Vec<crate::sql::params::PreparedParamType>,
 }
 
 impl PreparedSql {
+    /// `$n` ごとの型公告（`param_count()` と同じ長さ。番号 1 始まりの `n` が
+    /// `n - 1` 番目）。wire-server の `ParameterDescription` の OID・バイナリ
+    /// 受理可否の判定にだけ使う（値の検証意味論には影響しない。WIRE-12）。
+    pub fn param_types(&self) -> &[crate::sql::params::PreparedParamType] {
+        &self.param_types
+    }
+
+    /// `param_count() == 0`（`$n` を含まない文）のときに限り、構造検証済みの
+    /// [`ParsedSql`] を返す。`$n` が無い文では `substitute_dummy` が恒等変換の
+    /// ため、これは [`EngineCore::parse_sql`] の結果と構造的に同一である
+    /// （wire-server が 0 パラメータ文を従来の Parsed 経路のまま保持するため）。
+    pub fn parsed_if_unparameterized(&self) -> Option<&ParsedSql> {
+        (self.param_count == 0).then_some(&self.dummy_parsed)
+    }
+
+    /// Bind 後に portal が実際に保持する束縛値の総バイト数（同一 `$n` の出現
+    /// ごとに値が複製されるため、参照回数を掛けた展開後の量。未参照の値は
+    /// 保持されないため数えない）。wire-server が接続単位の保持量上限
+    /// （`MAX_BOUND_PARAM_BYTES_PER_SESSION`）を束縛後の実量で判定するために
+    /// 使う。`None`（NULL）は 0 として数える（別途 `bind_prepared` が拒否する）。
+    pub fn expanded_bound_bytes(&self, values: &[Option<Vec<u8>>]) -> usize {
+        self.tokens.iter().fold(0usize, |acc, t| match t {
+            crate::sql::lexer::Token::Param(n) => {
+                let len = usize::from(*n)
+                    .checked_sub(1)
+                    .and_then(|i| values.get(i))
+                    .and_then(|v| v.as_ref())
+                    .map_or(0, Vec::len);
+                acc.saturating_add(len)
+            }
+            _ => acc,
+        })
+    }
+
     /// 文が要求するパラメータ数（`$n` の最大番号。1 始まり。`$n` を含まない
     /// 文は 0）。[`EngineCore::bind_prepared`] に渡す `values` の個数と一致する
     /// 必要がある。
@@ -2065,6 +2103,24 @@ impl EngineCore {
     /// 渡す想定（SQL-31・TASK-221）。
     pub fn new_session_transaction(&self) -> crate::sql::transaction::SessionTransaction<'_> {
         crate::sql::transaction::SessionTransaction::new(self.transaction_limits)
+    }
+
+    /// `BEGIN` を含まない複数文メッセージを原子的に実行するための暗黙トランザクションを
+    /// 開始する（Issue #1175・WIRE-16。[`crate::sql::statement_splitter::
+    /// plan_multi_statement`] が `ImplicitTransaction` を返したときに、
+    /// `wire-server` がメッセージの先頭で 1 回だけ呼ぶ）。
+    ///
+    /// `wire-server` は `Storage` を持たないため、書き込みゲートの取得を伴う開始を
+    /// この入口へ集約する。`txn` が `Idle` でなければ `XX000`、ゲート待機上限超過は
+    /// `55P03`（[`crate::sql::transaction::SessionTransaction::begin_implicit`]）。
+    /// 以降の文は通常どおり [`Self::execute_sql_in_txn`] へ渡し、最後の文の成功後に
+    /// `SessionTransaction::commit_implicit` で確定する。
+    pub fn begin_implicit_transaction<'e>(
+        &'e self,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        txn.begin_implicit(&self.storage, session)
     }
 
     /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
@@ -3167,7 +3223,11 @@ impl EngineCore {
         // ダミー置換・束縛より前にここで検出して一律 `42601` で拒否する
         // （fail-closed。簡易クエリプロトコル〔`Self::parse_sql`〕はこの
         // 経路を通らないため影響しない）。
-        if Self::contains_subquery_syntax(&tokens) {
+        // `$n` を含まない文はダミー置換が恒等でフラグ配列も全 `false` のため
+        // ずれが生じない。従来の `parse_sql` で受理されていた文を拡張クエリ
+        // から実行できなくならないよう、拒否は `$n` を含む文に限定する
+        // （PR #1217 レビュー指摘）。
+        if param_count > 0 && Self::contains_subquery_syntax(&tokens) {
             return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "subquery is not supported over the extended query protocol (Parse/Bind)",
             ));
@@ -3180,18 +3240,103 @@ impl EngineCore {
             crate::sql::params::where_equality_literal_is_param(&tokens);
         let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
         let dummy_parsed = self.parse_tokens(dummy_tokens)?;
+        let param_types = self.infer_param_types(&tokens, param_count, &dummy_parsed);
         Ok(PreparedSql {
             tokens,
             param_count,
             dummy_parsed,
             order_by_distance_literal_is_param,
             where_equality_dummy_flags,
+            param_types,
         })
     }
 
+    /// `$n` ごとの型公告を導出する（WIRE-12。[`Self::parse_sql_prepared`] 専用）。
+    /// カタログ（スキーマ）だけを参照し行には触れない。スキーマを引けない場合
+    /// （ビュー・解決不能な表記等）は常に `Text` へ倒す（公告のみの問題で、
+    /// 値の検証には影響しない）。同じ番号が複数位置に現れて食い違う場合は、
+    /// 1 つでもベクトル位置があれば `VectorText`（バイナリ不可側へ倒す）、
+    /// それ以外は `Text`。
+    fn infer_param_types(
+        &self,
+        tokens: &[crate::sql::lexer::Token],
+        param_count: u16,
+        dummy_parsed: &ParsedSql,
+    ) -> Vec<crate::sql::params::PreparedParamType> {
+        use crate::sql::exec::ColumnMeta;
+        use crate::sql::lexer::{Keyword, Token};
+        use crate::sql::params::{ParamPosition, PreparedParamType};
+
+        // WHERE 等価位置の列を引くテーブル名（トークン列から。INSERT は
+        // 検証済みの `table_name` を使う）。
+        let where_table: Option<String> = match tokens.first() {
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
+                Some(Token::Ident(name)) => Some(name.clone()),
+                _ => None,
+            },
+            _ => tokens
+                .iter()
+                .position(|t| matches!(t, Token::Keyword(Keyword::From)))
+                .and_then(|i| match tokens.get(i + 1) {
+                    Some(Token::Ident(name)) => Some(name.clone()),
+                    _ => None,
+                }),
+        };
+        let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
+            if column == "id" {
+                return Some(PreparedParamType::Column(ColumnMeta::Id));
+            }
+            let schema = self.storage.get_table_schema(table).ok()?;
+            let def = schema.columns.iter().find(|c| c.name == column)?;
+            Some(PreparedParamType::Column(ColumnMeta::Scalar {
+                name: def.name.clone(),
+                ty: def.ty.clone(),
+            }))
+        };
+
+        crate::sql::params::infer_param_positions(tokens, param_count)
+            .into_iter()
+            .map(|positions| {
+                let mut resolved: Vec<PreparedParamType> = Vec::new();
+                for pos in &positions {
+                    let ty = match pos {
+                        ParamPosition::Vector => PreparedParamType::VectorText,
+                        ParamPosition::Text => PreparedParamType::Text,
+                        ParamPosition::WhereColumn(col) => where_table
+                            .as_deref()
+                            .and_then(|t| column_type(t, col))
+                            .unwrap_or(PreparedParamType::Text),
+                        ParamPosition::InsertValue(k) => match dummy_parsed {
+                            ParsedSql::Insert(ins) => ins
+                                .columns
+                                .get(*k)
+                                .and_then(|col| column_type(&ins.table_name, col))
+                                .unwrap_or(PreparedParamType::Text),
+                            _ => PreparedParamType::Text,
+                        },
+                    };
+                    resolved.push(ty);
+                }
+                match resolved.split_first() {
+                    None => PreparedParamType::Text,
+                    Some((first, rest)) => {
+                        if rest.iter().all(|t| t == first) {
+                            first.clone()
+                        } else if resolved.contains(&PreparedParamType::VectorText) {
+                            PreparedParamType::VectorText
+                        } else {
+                            PreparedParamType::Text
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
-    /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（テキスト形式。
-    /// バイナリ形式パラメータは wire 層が `0A000` で拒否済みの前提）を束縛し、
+    /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（バイト列。
+    /// text 系スロットのバイナリ形式は UTF-8 バイト恒等でそのまま渡され、それ以外
+    /// のバイナリ形式は wire 層が `0A000` で拒否済みの前提）を束縛し、
     /// [`Self::parse_sql`] が SQL テキストから直接返すのと**完全に同一**の
     /// [`ParsedSql`] を返す（第 2 の実行器を作らない設計。実行・Describe は
     /// 以降すべて既存の [`Self::execute_parsed_in_session`]／
@@ -3301,10 +3446,10 @@ impl EngineCore {
                 // `RETURNING`（Issue #873・SQL-21）を保持しうるためここで
                 // 分岐する（`execute_delete_sql` は検証直後に `42601` で拒否
                 // する非セッション経路。`Self` モジュールドキュメント参照）。
-                // 述語形（[`crate::sql::allowlist::ValidatedPredicateDelete`]）
-                // は構造検証段（`validate_delete_statement_tokens`）で
-                // `RETURNING` 併用を既に `42601` 拒否済みのため常に
-                // `execute_predicate_delete_form` へ委譲する（Issue #871）。
+                // 述語形（[`crate::sql::allowlist::ValidatedPredicateDelete`]）も
+                // Issue #1182 で `RETURNING` を保持しうるため同じく分岐する
+                // （`execute_predicate_delete_returning_form`）。`RETURNING` なしは
+                // 従来どおり `execute_predicate_delete_form`（Issue #871）。
                 crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
                     if v.returning.is_some() {
                         let outcome = self.execute_delete_returning_form(ctx, v)?;
@@ -3314,11 +3459,29 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => {
+                    if v.returning().is_some() {
+                        let outcome =
+                            self.execute_predicate_delete_returning_form(ctx, session, v)?;
+                        return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                    }
                     let outcome = self.execute_predicate_delete_form(ctx, session, v)?;
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
             },
             ParsedSql::Update(stmt) => {
+                // `RETURNING`（Issue #1182・SQL-21）は単一行・述語形いずれも
+                // セッション経路（本分岐）でのみ実行結線する（非セッション入口
+                // `execute_update_sql` は `validate_update` が `42601` 拒否する）。
+                let has_returning = match stmt {
+                    crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.returning.is_some(),
+                    crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => {
+                        v.returning().is_some()
+                    }
+                };
+                if has_returning {
+                    let outcome = self.execute_update_returning_form(ctx, session, stmt)?;
+                    return Ok(crate::sql::SqlOutcome::Returning(outcome));
+                }
                 let outcome = self.execute_predicate_update_form(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::Update(outcome))
             }
@@ -3557,6 +3720,11 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
 
+        // 注意（Issue #1182）: 本メソッドは `UPDATE`／`DELETE`／UPSERT を `_` 腕で
+        // 未対応（`0A000`）として拒否しており、`RETURNING` 付き文も同様に拒否される
+        // （fail-closed）。明示トランザクション内の DML を追加する際は、`INSERT` 腕の
+        // `returning.is_none()` ガードと同様に、`RETURNING` を黙って落とさない
+        // 分岐（未対応拒否、または結果セット返却の実装）を必ず持たせること。
         match parsed {
             ParsedSql::Insert(stmt) if stmt.returning.is_none() => {
                 let schema =
@@ -3960,16 +4128,39 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
-            // 述語形 `DELETE ... WHERE` は構造検証段で `RETURNING` 併用を常に
-            // `42601` 拒否済みのため（`ValidatedPredicateDelete` は `returning`
-            // フィールド自体を持たない）、結果列は常に持たない。
-            ParsedSql::Delete(DeleteStatement::Predicate(_)) => Ok(None),
-            // `UPDATE` は `RETURNING` の実行結線が未着手のため、構造検証段
-            // （`validate_update_form_tokens`）が単一行・述語形のいずれでも
-            // `RETURNING` 併用を常に `42601` 拒否する（`ValidatedUpdate::
-            // returning` ドキュメント参照）。結果列は常に持たない。
-            ParsedSql::Update(ValidatedUpdateForm::Single(_))
-            | ParsedSql::Update(ValidatedUpdateForm::Predicate(_)) => Ok(None),
+            // 述語形 `DELETE ... WHERE`・`UPDATE`（単一行・述語形）も Issue #1182
+            // で `RETURNING` を実行結線済みのため、`INSERT`・単一行 `DELETE` と
+            // 同じ規則で結果列を返す（`RETURNING` なしは `None`）。
+            ParsedSql::Delete(DeleteStatement::Predicate(v)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                match crate::sql::parser::bind_returning(v.returning(), &schema)? {
+                    Some(projection) => Ok(Some(crate::sql::returning::column_meta(
+                        &projection,
+                        &schema,
+                    )?)),
+                    None => Ok(None),
+                }
+            }
+            ParsedSql::Update(ValidatedUpdateForm::Single(v)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
+                match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {
+                    Some(projection) => Ok(Some(crate::sql::returning::column_meta(
+                        &projection,
+                        &schema,
+                    )?)),
+                    None => Ok(None),
+                }
+            }
+            ParsedSql::Update(ValidatedUpdateForm::Predicate(v)) => {
+                let (_read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
+                match crate::sql::parser::bind_returning(v.returning(), &schema)? {
+                    Some(projection) => Ok(Some(crate::sql::returning::column_meta(
+                        &projection,
+                        &schema,
+                    )?)),
+                    None => Ok(None),
+                }
+            }
             ParsedSql::Statement(Statement::SetSearchMode { .. }) => Ok(None),
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
             // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
@@ -6147,6 +6338,7 @@ impl EngineCore {
             assignments,
             where_predicates,
             operation_id: operation_id.cloned(),
+            returning: None,
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         // 判定 6: 実書き込み（`Self::run_predicate_update` 内部の独自 write トランザクション）。
@@ -6188,6 +6380,7 @@ impl EngineCore {
             table_name: table.to_string(),
             where_predicates,
             operation_id: operation_id.cloned(),
+            returning: None,
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         self.run_predicate_delete(ctx, &udfs, &validated, &schema)
@@ -6967,16 +7160,7 @@ impl EngineCore {
             // チャンク総量）を適用する（SQL/NoSQL 機能パリティの方針を UPSERT
             // にも揃える）。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
-                if bound.rows.len() > self.batch_limits.max_files_per_batch {
-                    return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                        crate::batch_limits::BatchLimitsError::TooManyFiles {
-                            count: bound.rows.len(),
-                            max: self.batch_limits.max_files_per_batch,
-                        }
-                        .to_string(),
-                    ));
-                }
-                self.validate_insert_batch_byte_and_chunk_limits(&bound.rows)?;
+                self.validate_upsert_batch_limits(&bound.rows)?;
                 crate::sql::exec::execute_upsert(
                     &self.storage,
                     ctx,
@@ -7051,19 +7235,42 @@ impl EngineCore {
                 ))
             }
             // `RETURNING`（Issue #873・SQL-21）と `ON CONFLICT`（Issue #872・
-            // SQL-20）の併用は実行結線未着手（`docs/design/sql-returning.md`
-            // 「UPSERT（#872）との併用」節・`docs/design/sql-upsert.md`「対象外・
-            // 申し送り」節。RETURNING の文法上の位置＝`USING OPERATION_ID` の
-            // 直前という契約〔許可リスト段〕は維持しつつ、実行本体
-            // `sql::exec::execute_upsert` は `stmt.returning` を一切参照しない
-            // ため、ここで結線せず fail-closed に拒否する。第 2 の投影実装を
-            // 作らない設計判断はそのまま維持する）。
-            crate::sql::parser::BoundInsertForm::Upsert(_) => {
-                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                    "RETURNING is not supported for INSERT ... ON CONFLICT ...",
-                ))
+            // SQL-20）の併用（Issue #1182 で実行結線）。`Upsert` 腕と同じ
+            // INDEX-4 上限（[`Self::validate_upsert_batch_limits`]）を適用したうえで
+            // [`crate::sql::exec::execute_upsert_returning`] へ委譲する。挿入行・
+            // `DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。
+            crate::sql::parser::BoundInsertForm::Upsert(bound) => {
+                self.validate_upsert_batch_limits(&bound.rows)?;
+                crate::sql::exec::execute_upsert_returning(
+                    &self.storage,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    &returning,
+                    &schema,
+                )
             }
         }
+    }
+
+    /// UPSERT（`INSERT ... ON CONFLICT`）の INDEX-4 バッチ上限検査
+    /// （①行数・②③④バイト量・チャンク総量。`RowBatch` と同じ SQL/NoSQL パリティ
+    /// 方針）。[`Self::execute_insert_form`] と
+    /// [`Self::execute_insert_returning_form`] の `Upsert` 腕が共有する。
+    fn validate_upsert_batch_limits(
+        &self,
+        rows: &[crate::sql::parser::BoundInsert],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if rows.len() > self.batch_limits.max_files_per_batch {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                crate::batch_limits::BatchLimitsError::TooManyFiles {
+                    count: rows.len(),
+                    max: self.batch_limits.max_files_per_batch,
+                }
+                .to_string(),
+            ));
+        }
+        self.validate_insert_batch_byte_and_chunk_limits(rows)
     }
 
     /// SQL 表層の単一 TRUNCATE 文実行エントリポイント（TASK-193、対象ビヘイビア:
@@ -7189,12 +7396,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let bound = crate::sql::parser::bind_predicate_delete(stmt, schema, udfs)?;
-        let content_hash_value = crate::recovery::content_hash::for_delete_where(
-            stmt.table_name(),
-            stmt.where_predicates(),
-            udfs,
-        )?;
+        let (bound, content_hash_value) = Self::prepare_predicate_delete(stmt, schema, udfs)?;
         crate::sql::exec::execute_predicate_delete(
             &self.storage,
             ctx,
@@ -7203,6 +7405,82 @@ impl EngineCore {
             schema,
             &content_hash_value,
             self.dml_limits.max_affected_rows,
+        )
+    }
+
+    /// 述語形 `DELETE` の束縛と内容照合ハッシュ計算（RECOVER-11）。`RETURNING` の
+    /// 有無に関わらず**同一の入力**（`stmt.where_predicates()` のみ）からハッシュを
+    /// 計算するため、[`Self::run_predicate_delete`] と
+    /// [`Self::execute_predicate_delete_returning_form`] が共有する（`RETURNING`
+    /// の有無で再送判定が変わらない契約〔Issue #1182〕をコード上でも 1 箇所に固定）。
+    fn prepare_predicate_delete(
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+        schema: &crate::catalog::TableSchema,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+    ) -> Result<
+        (
+            crate::sql::parser::BoundPredicateDelete,
+            crate::recovery::content_hash::ContentHash,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let bound = crate::sql::parser::bind_predicate_delete(stmt, schema, udfs)?;
+        let content_hash_value = crate::recovery::content_hash::for_delete_where(
+            stmt.table_name(),
+            stmt.where_predicates(),
+            udfs,
+        )?;
+        Ok((bound, content_hash_value))
+    }
+
+    /// 対象テーブルのスキーマを取得する（`RETURNING` 付き DML の各実行本体が
+    /// 共有。`TableNotFound` は `42P01`、それ以外は詳細を含まない固定文言の
+    /// `XX000`）。
+    fn load_table_schema_for_dml(
+        &self,
+        table: &str,
+    ) -> Result<crate::catalog::TableSchema, crate::sql::allowlist::SqlSurfaceError> {
+        self.storage.get_table_schema(table).map_err(|e| match e {
+            CatalogError::TableNotFound(name) => {
+                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+            }
+            _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "failed to load table schema".to_string(),
+            },
+        })
+    }
+
+    /// [`Self::execute_sql_in_session`] の `RETURNING` 付き述語形 `DELETE`
+    /// （Issue #1182・SQL-21）分岐が呼ぶ実行本体。[`Self::
+    /// execute_predicate_delete_form`] と同じ手順（スキーマ取得 → 束縛 → 内容照合
+    /// ハッシュ計算 → 実行）に `RETURNING` の投影束縛（書き込み前。未知列は
+    /// `22000`・式項目は `42601`）を加える。削除前の値を返す。`stmt.returning()` は
+    /// 呼び出し元が `Some` を確認済みの前提（`None` は `Internal`）。
+    fn execute_predicate_delete_returning_form(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+        let returning =
+            crate::sql::parser::bind_returning(stmt.returning(), &schema)?.ok_or_else(|| {
+                crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "execute_predicate_delete_returning_form called without RETURNING"
+                        .to_string(),
+                }
+            })?;
+        let (bound, content_hash_value) =
+            Self::prepare_predicate_delete(stmt, &schema, session.udfs())?;
+        crate::sql::exec::execute_predicate_delete_returning(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            &schema,
+            &content_hash_value,
+            self.dml_limits.max_affected_rows,
+            &returning,
         )
     }
 
@@ -7252,6 +7530,10 @@ impl EngineCore {
     /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
     /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
     /// RECOVER-1）→ [`Self::execute_update_form`]（束縛・実行本体）の順に呼ぶ。
+    ///
+    /// `RETURNING` 付き文は本エントリポイントでは `42601` で拒否する
+    /// （`validate_update` が構造検証段で拒否。`RETURNING` はセッション経路
+    /// [`Self::execute_sql_in_session`] 専用。Issue #1182）。
     ///
     /// このエントリポイントは単一行・`id` 完全一致形専用のまま残す
     /// （`sql::allowlist::validate_update`・[`crate::sql::allowlist::ValidatedUpdate`]
@@ -7372,23 +7654,24 @@ impl EngineCore {
         self.run_predicate_update(ctx, session.udfs(), validated, &schema)
     }
 
-    /// [`Self::execute_predicate_update_form`]（SQL 表層。SQL-19・TASK-192、
-    /// Issue #871）と [`Self::execute_bound_predicate_update_in_session`]
-    /// （NoSQL 表層 `update` op の `filter`。TASK-186・NOSQL-12、Issue #1062）が
-    /// スキーマ取得より後で共有する実行本体（[`Self::run_predicate_delete`]と
-    /// 対になる。第 2 の実行器を作らない設計）。抽出前と挙動が完全に同一で
-    /// あることは既存の engine テスト（`sql_predicate_dml_exec`・
-    /// `sql_update_delete_session_public_api` 等）で回帰確認済み。
-    ///
-    /// `udfs` は呼び出し元が解決済みの UDF レジストリ（[`Self::
-    /// run_predicate_delete`] と同じ契約）を渡す。
-    fn run_predicate_update(
-        &self,
-        ctx: &PolicyContext,
-        udfs: &crate::sql::udf_call::UdfRegistry,
+    /// 述語形 `UPDATE` の束縛と内容照合ハッシュ計算（RECOVER-11）。戻り値の
+    /// 第 3 要素は Issue #1061 の互換用 `legacy_hashes`（不要なら空）。`RETURNING`
+    /// の有無に関わらず**同一の入力**（SET 割当・`WHERE` 述語のみ）から計算する
+    /// ため、[`Self::run_predicate_update`] と [`Self::execute_update_returning_form`]
+    /// が共有する（`RETURNING` の有無で再送判定が変わらない契約〔Issue #1182〕を
+    /// コード上でも 1 箇所に固定）。
+    fn prepare_predicate_update(
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
-    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        udfs: &crate::sql::udf_call::UdfRegistry,
+    ) -> Result<
+        (
+            crate::sql::parser::BoundPredicateUpdate,
+            crate::recovery::content_hash::ContentHash,
+            Vec<crate::recovery::content_hash::ContentHash>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
         let predicate = crate::sql::parser::bind_predicate_update(validated, schema, udfs)?;
 
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = validated
@@ -7411,19 +7694,103 @@ impl EngineCore {
         // `23505`／`22023` の判定は弱まらない。`docs/design/
         // nosql-update-delete-mapping.md`「述語形 VECTOR 割当の表現統一と
         // 既存台帳エントリの互換性」参照）。
-        let legacy_hash;
-        let legacy_hashes: &[crate::recovery::content_hash::ContentHash] =
+        let legacy_hash: Vec<crate::recovery::content_hash::ContentHash> =
             if crate::recovery::content_hash::needs_legacy_vector_hash(&assignment_refs, schema) {
-                legacy_hash = crate::recovery::content_hash::for_update_where_legacy_text_vector(
-                    validated.table_name(),
-                    &assignment_refs,
-                    validated.where_predicates(),
-                    udfs,
-                )?;
-                std::slice::from_ref(&legacy_hash)
+                vec![
+                    crate::recovery::content_hash::for_update_where_legacy_text_vector(
+                        validated.table_name(),
+                        &assignment_refs,
+                        validated.where_predicates(),
+                        udfs,
+                    )?,
+                ]
             } else {
-                &[]
+                Vec::new()
             };
+        Ok((predicate, content_hash_value, legacy_hash))
+    }
+
+    /// [`Self::execute_sql_in_session`] の `RETURNING` 付き `UPDATE`
+    /// （Issue #1182・SQL-21。単一行 `id` 指定形・述語形の双方）分岐が呼ぶ実行
+    /// 本体。[`Self::execute_predicate_update_form`] と同じ手順（スキーマ取得 →
+    /// 束縛 → （述語形のみ）内容照合ハッシュ計算 → 実行）に `RETURNING` の投影束縛
+    /// （書き込み前）を加える。更新後の値を返す。`returning` は呼び出し元が
+    /// `Some` を確認済みの前提（`None` は `Internal`）。
+    fn execute_update_returning_form(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::ValidatedUpdateForm;
+
+        let (table_name, projection) = match stmt {
+            ValidatedUpdateForm::Single(v) => (v.table_name.as_str(), v.returning.as_ref()),
+            ValidatedUpdateForm::Predicate(v) => (v.table_name(), v.returning()),
+        };
+        let schema = self.load_table_schema_for_dml(table_name)?;
+        let returning =
+            crate::sql::parser::bind_returning(projection, &schema)?.ok_or_else(|| {
+                crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "execute_update_returning_form called without RETURNING".to_string(),
+                }
+            })?;
+        match stmt {
+            ValidatedUpdateForm::Single(_) => {
+                let bound = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
+                let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal: bound predicate-form UPDATE from a single-row statement"
+                            .to_string(),
+                    });
+                };
+                crate::sql::exec::execute_update_returning(
+                    &self.storage,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    &returning,
+                    &schema,
+                )
+            }
+            ValidatedUpdateForm::Predicate(validated) => {
+                let (bound, content_hash_value, legacy_hashes) =
+                    Self::prepare_predicate_update(validated, &schema, session.udfs())?;
+                crate::sql::exec::execute_predicate_update_returning(
+                    &self.storage,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    &schema,
+                    &content_hash_value,
+                    &legacy_hashes,
+                    self.dml_limits.max_affected_rows,
+                    &returning,
+                )
+            }
+        }
+    }
+
+    /// [`Self::execute_predicate_update_form`]（SQL 表層。SQL-19・TASK-192、
+    /// Issue #871）と [`Self::execute_bound_predicate_update_in_session`]
+    /// （NoSQL 表層 `update` op の `filter`。TASK-186・NOSQL-12、Issue #1062）が
+    /// スキーマ取得より後で共有する実行本体（[`Self::run_predicate_delete`]と
+    /// 対になる。第 2 の実行器を作らない設計）。抽出前と挙動が完全に同一で
+    /// あることは既存の engine テスト（`sql_predicate_dml_exec`・
+    /// `sql_update_delete_session_public_api` 等）で回帰確認済み。
+    ///
+    /// `udfs` は呼び出し元が解決済みの UDF レジストリ（[`Self::
+    /// run_predicate_delete`] と同じ契約）を渡す。
+    fn run_predicate_update(
+        &self,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
+        schema: &crate::catalog::TableSchema,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let (predicate, content_hash_value, legacy_hash) =
+            Self::prepare_predicate_update(validated, schema, udfs)?;
+        let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();
         crate::sql::exec::execute_predicate_update(
             &self.storage,
             ctx,

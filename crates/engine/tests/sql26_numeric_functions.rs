@@ -298,7 +298,7 @@ fn sqrt_of_negative_is_22000_and_mod_by_zero_is_22012() {
 }
 
 #[test]
-fn argument_type_mismatch_is_rejected_with_22000() {
+fn argument_type_mismatch_is_rejected_with_42804() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -309,7 +309,7 @@ fn argument_type_mismatch_is_rejected_with_22000() {
             "SELECT abs(embedding) FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
         .expect_err("abs(embedding) (Vector argument) must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn calling_a_non_deterministic_function_is_rejected() {
             "SELECT now() FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
         .expect_err("now() must be rejected (non-deterministic function)");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // --- 予約名の衝突 --------------------------------------------------------------------
@@ -346,7 +346,7 @@ fn defining_a_udf_named_after_a_numeric_builtin_is_rejected() {
             .expect_err(&format!(
                 "CREATE FUNCTION {name} must be rejected as reserved"
             ));
-        assert_eq!(err.wire_code(), "22000", "function name {name}");
+        assert_eq!(err.wire_code(), "42723", "function name {name}");
     }
 }
 

@@ -166,7 +166,7 @@ Sync バッチ内で後続のメッセージが失敗しても、先に commit �
 | 未定義 statement／portal への参照・名前付き statement／portal の重複作成・`Failed` 状態の portal への再 Execute | `08P01`（`ProtocolViolation`） |
 | Bind のパラメータ数不一致・format code 個数不正 | `08P01` |
 | 結果 format code の個数不正・値不正（0/1 以外） | `08P01`（`ResultFormats::resolve`） |
-| Bind のパラメータ format code が binary 指定（`$n` 束縛未実装のため一律拒否）・結果 format code が非対応型の列を binary 指定（WIRE-14。`id`／`VECTOR`／`Computed`。TABLE-13・Issue #886 の `BOOLEAN`／`BYTEA` も同様） | `0A000`（`FeatureNotSupported`） |
+| Bind のパラメータ format code が binary 指定で対象スロットが text 系以外（WIRE-12・#1171）・結果 format code が非対応型の列を binary 指定（WIRE-14。`id`／`VECTOR`／`Computed`。TABLE-13・Issue #886 の `BOOLEAN`／`BYTEA` も同様） | `0A000`（`FeatureNotSupported`） |
 | Execute の結果列不整合（cached plan must not change result type 相当） | `0A000` |
 | 件数・名前長・保持バイト上限超過 | `54000`（`PayloadTooLarge`） |
 | body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト不正） | `08P01` |
@@ -257,12 +257,10 @@ panic すると緊急応答〔TASK-97・RECOVER-6〕が発火しない fail-open
 
 ## スコープ外・申し送り
 
-- `$n` の束縛と `ParameterDescription` の型 OID 推論（#935・WIRE-12）。
-  現状パラメータ数は常に 0（Parse が `num_param_types > 0` を拒否するため）
-  であり、Bind の実パラメータ数も 0 でなければ `08P01`。
-- パラメータ側の binary 入力（Bind が受け取る `$n` 値そのもののバイナリ
-  表現）。`$n` 束縛自体が WIRE-12・#935 未実装のため対象外のまま
-  （パラメータ format code は 0 以外を一律 `0A000` で拒否し続ける）。
+- （実装済み: Issue #1171）`$n` の束縛と `ParameterDescription` の型 OID 推論
+  （WIRE-12）。Bind の値数は文の要求数と一致しなければ `08P01`。パラメータ側の
+  binary は text 系スロットのみ受理し（UTF-8 バイト恒等）、それ以外は `0A000`
+  （詳細は `docs/design/wire-extended-query-param-binding.md`）。
 - 暗黙トランザクションブロック（Sync までの複数 Execute を 1 トランザクショ
   ンにまとめる挙動。#942・RECOVER-12・SQL-31）。
 - CancelRequest。
