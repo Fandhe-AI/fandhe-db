@@ -2505,6 +2505,20 @@ fn exposed_columns_of_view(
 pub enum ArrayElemType {
     Text,
     Bool,
+    /// `INTEGER`（Issue #1193）。行内表現は 4 バイト LE。
+    Integer,
+    /// `BIGINT`（Issue #1193）。行内表現は 8 バイト LE。
+    BigInt,
+    /// `REAL`（Issue #1193）。`-0.0` 正規化済みの 4 バイト LE。
+    Real,
+    /// `DOUBLE PRECISION`（Issue #1193）。`-0.0` 正規化済みの 8 バイト LE。
+    Double,
+    /// `DATE`（Issue #1193）。1970-01-01 起点の日数（4 バイト LE）。
+    Date,
+    /// `TIMESTAMP`（Issue #1193）。1970-01-01 起点のマイクロ秒（8 バイト LE）。
+    Timestamp,
+    /// `UUID`（Issue #1193）。16 バイト生値。
+    Uuid,
 }
 
 impl ArrayElemType {
@@ -2513,6 +2527,13 @@ impl ArrayElemType {
         match self {
             ArrayElemType::Text => "text",
             ArrayElemType::Bool => "boolean",
+            ArrayElemType::Integer => "integer",
+            ArrayElemType::BigInt => "bigint",
+            ArrayElemType::Real => "real",
+            ArrayElemType::Double => "double",
+            ArrayElemType::Date => "date",
+            ArrayElemType::Timestamp => "timestamp",
+            ArrayElemType::Uuid => "uuid",
         }
     }
 
@@ -2522,6 +2543,13 @@ impl ArrayElemType {
         match tag {
             "text" => Ok(ArrayElemType::Text),
             "boolean" => Ok(ArrayElemType::Bool),
+            "integer" => Ok(ArrayElemType::Integer),
+            "bigint" => Ok(ArrayElemType::BigInt),
+            "real" => Ok(ArrayElemType::Real),
+            "double" => Ok(ArrayElemType::Double),
+            "date" => Ok(ArrayElemType::Date),
+            "timestamp" => Ok(ArrayElemType::Timestamp),
+            "uuid" => Ok(ArrayElemType::Uuid),
             other => Err(CatalogError::Invalid(format!(
                 "unsupported array element type: {other:?}"
             ))),
@@ -10087,6 +10115,54 @@ mod tests {
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
         ));
+    }
+
+    /// Issue #1193: 要素型タグは既存のスカラー型タグと同じ綴りで往復し、既存の
+    /// `text`／`boolean` のカタログ表現は不変。`numeric`・`bytea`・`enum`・`json`・
+    /// `vector`・`array` など未対応タグは fail-closed に拒否する。
+    #[test]
+    fn array_element_type_tags_roundtrip_and_unsupported_tags_are_rejected() {
+        for (elem, tag) in [
+            (ArrayElemType::Text, "text"),
+            (ArrayElemType::Bool, "boolean"),
+            (ArrayElemType::Integer, "integer"),
+            (ArrayElemType::BigInt, "bigint"),
+            (ArrayElemType::Real, "real"),
+            (ArrayElemType::Double, "double"),
+            (ArrayElemType::Date, "date"),
+            (ArrayElemType::Timestamp, "timestamp"),
+            (ArrayElemType::Uuid, "uuid"),
+        ] {
+            assert_eq!(elem.catalog_tag(), tag);
+            assert_eq!(ArrayElemType::from_catalog_tag(tag).expect("tag"), elem);
+            let schema = TableSchema::new(
+                "t",
+                vec![ColumnDef::new(
+                    "v",
+                    ColumnType::Array(ArrayType::new(elem, 8).expect("array ty")),
+                    true,
+                )],
+            );
+            let bytes = encode_schema(&schema).expect("encode");
+            assert!(
+                String::from_utf8_lossy(&bytes).contains(&format!("v:array:{tag},8:")),
+                "catalog line must use the element tag {tag}"
+            );
+            let decoded = decode_schema("t", &bytes).expect("decode");
+            assert_eq!(decoded.columns, schema.columns);
+        }
+        for tag in [
+            "numeric", "bytea", "enum", "json", "jsonb", "vector", "array", "int",
+        ] {
+            let bytes = format!("v2\ncols:1\ntags:array:{tag},4:0\n").into_bytes();
+            assert!(
+                matches!(
+                    decode_schema("t", &bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "element tag {tag} must be rejected"
+            );
+        }
     }
 
     #[test]

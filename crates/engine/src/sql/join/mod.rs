@@ -133,10 +133,7 @@ pub(super) fn cell_payload_bytes(cell: &Cell) -> usize {
         Cell::Json(s) => s.len(),
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
-        Cell::Array(arr) => match arr {
-            crate::row_codec::ArrayValue::Text(items) => items.iter().map(|s| s.len()).sum(),
-            crate::row_codec::ArrayValue::Bool(items) => items.len(),
-        },
+        Cell::Array(arr) => arr.approx_heap_bytes(),
         Cell::Null
         | Cell::Integer(_)
         | Cell::Float(_)

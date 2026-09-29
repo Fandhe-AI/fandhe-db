@@ -318,7 +318,8 @@ fn extract_leaf_fields(
             v @ (JsonValue::String(_)
             | JsonValue::Number(_)
             | JsonValue::Bool(_)
-            | JsonValue::Array(_)),
+            | JsonValue::Array(_)
+            | JsonValue::Object(_)),
         ) => v,
         Some(_) => {
             return Err(FilterError::Shape(SchemaError::TypeMismatch {
@@ -367,7 +368,10 @@ fn validate_leaf_value_shape(op: &str, value: &JsonValue) -> Result<(), FilterEr
             }
         }
         Ok(())
-    } else if matches!(value, JsonValue::Array(_)) {
+    } else if matches!(value, JsonValue::Array(_) | JsonValue::Object(_)) && op != "eq" {
+        // 配列・オブジェクトの値は `eq` だけが受け付ける（配列列・JSON 列の等価。
+        // Issue #1193）。列型ごとの適否は `declare_eq` が判定する（他の列型は
+        // `TypeMismatch`）。`in` の各要素・他の演算子では従来どおり形状違反。
         Err(FilterError::Shape(SchemaError::TypeMismatch {
             key: "value",
         }))
@@ -527,6 +531,18 @@ fn declare_eq(
     ty: &ColumnType,
     value: &JsonValue,
 ) -> Result<DeclarativePredicate, FilterError> {
+    // 配列・オブジェクトの値は配列列・JSON 列だけが受け付ける（Issue #1193）。
+    // それ以外の列型では従来どおり値の形状違反（`42601`）とする。
+    if matches!(value, JsonValue::Array(_) | JsonValue::Object(_))
+        && !matches!(
+            ty,
+            ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb
+        )
+    {
+        return Err(FilterError::Shape(SchemaError::TypeMismatch {
+            key: "value",
+        }));
+    }
     match ty {
         ColumnType::Text => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
@@ -600,9 +616,37 @@ fn declare_eq(
         }
         // SQL 表層にも eq レーンが無い列型は、従来どおり engine 側の
         // 「`TEXT` 列でない」判定（`22000`）へ委譲する（legacy 互換）。
-        ColumnType::Vector(_) | ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb => Ok(
-            DeclarativePredicate::Leaf(DeclarativeFilter::equals(column, "")),
-        ),
+        ColumnType::Vector(_) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
+            column, "",
+        ))),
+        // 配列列の等価（Issue #1193・NOSQL-17）。JSON 配列を SQL 表層と同じ配列
+        // リテラルテキストへ直列化し（`typed_json::array_literal_text`。要素数上限は
+        // テキスト組み立て前に検査）、engine の配列等価述語へ委譲する。
+        ColumnType::Array(array_ty) => match value {
+            JsonValue::Array(items) => {
+                let text =
+                    typed_json::array_literal_text(items, *array_ty).map_err(FilterError::Value)?;
+                Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
+                    column, text,
+                )))
+            }
+            _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+                "eq filter value for an ARRAY column must be a JSON array",
+            ))),
+        },
+        // JSON／JSONB 列の等価（Issue #1193・NOSQL-17）。オブジェクト／配列を正規化
+        // テキストへ写像し、engine の値等価（UNIQUE 制約と共通の正規形）へ委譲する。
+        ColumnType::Json | ColumnType::Jsonb => match value {
+            JsonValue::Object(_) | JsonValue::Array(_) => {
+                let text = typed_json::json_literal_text(value).map_err(FilterError::Value)?;
+                Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
+                    column, text,
+                )))
+            }
+            _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
+                "eq filter value for a JSON column must be a JSON object or array",
+            ))),
+        },
     }
 }
 
@@ -787,18 +831,23 @@ fn declare_in(
                 column, values,
             )))
         }
-        // INTEGER 系・BOOLEAN・VECTOR・ARRAY・JSON・JSONB は engine 側の
-        // 「IN 非対応列」判定（`22000`）へ委譲する（SQL の `col IN ('..')` を
-        // 数値・真偽列へ書いた場合と同じ結果になる）。
+        // 配列列・JSON 列の `in` は対象外（要素が配列・オブジェクトになるため、
+        // 要素形状の検証〔`validate_leaf_value_shape`〕を緩める設計判断が別途要る）。
+        // 曖昧に受理せず明示的な型不一致（`42601`）で拒否する（Issue #1193）。
+        ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb => {
+            Err(FilterError::Value(TypedJsonError::TypeMismatch(
+                "in filter is not supported for ARRAY/JSON columns (use eq)",
+            )))
+        }
+        // INTEGER 系・BOOLEAN・VECTOR は engine 側の「IN 非対応列」判定
+        // （`22000`）へ委譲する（SQL の `col IN ('..')` を数値・真偽列へ書いた場合と
+        // 同じ結果になる）。
         ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Boolean
-        | ColumnType::Vector(_)
-        | ColumnType::Array(_)
-        | ColumnType::Json
-        | ColumnType::Jsonb => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::in_list(
+        | ColumnType::Vector(_) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::in_list(
             column,
             Vec::new(),
         ))),
@@ -1053,6 +1102,15 @@ mod tests {
                     true,
                 ),
                 ColumnDef::new("count", ColumnType::Integer, true),
+                ColumnDef::new(
+                    "tags",
+                    ColumnType::Array(
+                        engine::catalog::ArrayType::new(engine::catalog::ArrayElemType::Text, 4)
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+                ColumnDef::new("doc", ColumnType::Jsonb, true),
             ],
         )
     }
@@ -1322,6 +1380,57 @@ mod tests {
         let err = bind(r#"[{"column":"lang","op":"eq","value":["ja"]}]"#).expect_err("must reject");
         assert!(matches!(err, FilterError::Shape(_)));
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// Issue #1193: 配列列・JSON 列の `eq` は受理される（NOSQL-17）。
+    #[test]
+    fn eq_on_array_and_json_columns_is_accepted() {
+        let bound = bind(r#"[{"column":"tags","op":"eq","value":["a",null,"b c"]}]"#)
+            .expect("array eq binds");
+        assert_eq!(bound.metadata_filters().len(), 1);
+        let bound = bind(r#"[{"column":"doc","op":"eq","value":{"b":1,"a":[1,2]}}]"#)
+            .expect("json object eq binds");
+        assert_eq!(bound.metadata_filters().len(), 1);
+        let bound =
+            bind(r#"[{"column":"doc","op":"eq","value":[1,2]}]"#).expect("json array eq binds");
+        assert_eq!(bound.metadata_filters().len(), 1);
+    }
+
+    #[test]
+    fn eq_on_array_and_json_columns_rejects_wrong_value_shapes() {
+        // 配列列に配列以外・要素型違い・上限超過。
+        for json in [
+            r#"[{"column":"tags","op":"eq","value":"a"}]"#,
+            r#"[{"column":"tags","op":"eq","value":[1]}]"#,
+            r#"[{"column":"tags","op":"eq","value":["a","b","c","d","e"]}]"#,
+            r#"[{"column":"doc","op":"eq","value":"x"}]"#,
+            r#"[{"column":"doc","op":"eq","value":1}]"#,
+        ] {
+            let err = bind(json).expect_err("must reject");
+            assert_eq!(
+                err.wire_code(),
+                if json.contains("\"d\",\"e\"") {
+                    "54000"
+                } else {
+                    "42601"
+                },
+                "{json}"
+            );
+        }
+        // 配列・オブジェクトの値は他の列型では従来どおり形状違反（42601）。
+        let err = bind(r#"[{"column":"count","op":"eq","value":{"a":1}}]"#).expect_err("reject");
+        assert!(matches!(err, FilterError::Shape(_)));
+        // 範囲・prefix・in の値には配列・オブジェクトを許さない。
+        let err = bind(r#"[{"column":"doc","op":"prefix","value":{"a":1}}]"#).expect_err("reject");
+        assert!(matches!(err, FilterError::Shape(_)));
+        // 配列列・JSON 列の in は明示的に拒否する。
+        for json in [
+            r#"[{"column":"tags","op":"in","value":["{a}"]}]"#,
+            r#"[{"column":"doc","op":"in","value":["{}"]}]"#,
+        ] {
+            let err = bind(json).expect_err("in must be rejected");
+            assert_eq!(err.wire_code(), "42601", "{json}");
+        }
     }
 
     #[test]

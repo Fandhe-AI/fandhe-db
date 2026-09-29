@@ -6,8 +6,10 @@
 //! `tests/boolean_column.rs` と同じ流儀（`unique_db_path`／`CleanupGuard`、実
 //! `Storage`＋`CpuScalarProvider`、`EngineCore::execute_sql`／
 //! `execute_sql_in_session` を production 経路として検証）。配列列の往復・
-//! リテラル受理・要素数上限・NULL 要素非対応・RLS 境界・検索経路
-//! （KNN・`EXPLAIN`）への非影響・集計（`COUNT` のみ）を固定する。
+//! リテラル受理・要素数上限・RLS 境界・検索経路（KNN・`EXPLAIN`）への非影響・
+//! 集計（`COUNT` のみ）を固定する。Issue #1193 で要素型の拡大（INTEGER／BIGINT／
+//! REAL／DOUBLE／DATE／TIMESTAMP／UUID）・NULL 要素・配列列の等価述語（`=`／`IN`／
+//! `IS [NOT] NULL`）を追加した（NOSQL-17・WIRE-13）。
 
 use engine::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -136,14 +138,14 @@ fn array_column_roundtrips_through_storage_reopen() {
             assert_eq!(
                 *tags,
                 engine::row_codec::ArrayValue::Text(vec![
-                    "a".to_string(),
-                    "b b".to_string(),
-                    "".to_string()
+                    Some("a".to_string()),
+                    Some("b b".to_string()),
+                    Some("".to_string())
                 ])
             );
             assert_eq!(
                 *flags,
-                engine::row_codec::ArrayValue::Bool(vec![true, false])
+                engine::row_codec::ArrayValue::Bool(vec![Some(true), Some(false)])
             );
         }
         other => panic!("expected Cell::Array pair for id=1, got {other:?}"),
@@ -186,25 +188,47 @@ fn insert_rejects_element_count_exceeding_column_max_len() {
 }
 
 #[test]
-fn insert_rejects_null_element_and_malformed_literal() {
+fn insert_accepts_null_element_and_rejects_malformed_literal() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
 
-    let err = core
-        .execute_sql_in_session(
+    // 引用なしの NULL は NULL 要素として受理される（Issue #1193）。
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(1, "ja", "{a,null,b}", "{t,NULL}", 1),
+    )
+    .expect("NULL element must be accepted");
+    let result = core
+        .execute_sql(
             &alice,
-            &mut SessionState::default(),
-            &insert_sql(1, "ja", "{a,null,b}", "{}", 1),
+            &format!("SELECT tags, flags FROM {TABLE} WHERE id = 1 LIMIT 1"),
         )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+        .expect("select");
+    match (&result.rows[0].cells[0], &result.rows[0].cells[1]) {
+        (Cell::Array(tags), Cell::Array(flags)) => {
+            assert_eq!(
+                *tags,
+                engine::row_codec::ArrayValue::Text(vec![
+                    Some("a".to_string()),
+                    None,
+                    Some("b".to_string())
+                ])
+            );
+            assert_eq!(
+                *flags,
+                engine::row_codec::ArrayValue::Bool(vec![Some(true), None])
+            );
+        }
+        other => panic!("expected Cell::Array pair, got {other:?}"),
+    }
 
     let err = core
         .execute_sql_in_session(
             &alice,
             &mut SessionState::default(),
-            &insert_sql(1, "ja", "a,b,c", "{}", 1),
+            &insert_sql(2, "ja", "a,b,c", "{}", 2),
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22P02");
@@ -253,7 +277,7 @@ fn update_set_replaces_array_column_value() {
     match &result.rows[0].cells[0] {
         Cell::Array(v) => assert_eq!(
             *v,
-            engine::row_codec::ArrayValue::Text(vec!["x".to_string(), "y".to_string()])
+            engine::row_codec::ArrayValue::Text(vec![Some("x".to_string()), Some("y".to_string())])
         ),
         other => panic!("expected Cell::Array, got {other:?}"),
     }
@@ -349,19 +373,368 @@ fn vector_search_is_bit_identical_with_and_without_array_column() {
 // --- WHERE 述語・集計の対象範囲（D-A8） ---------------------------------------
 
 #[test]
-fn where_referencing_array_column_is_rejected() {
+fn where_array_column_rejects_unsupported_predicates_and_malformed_literals() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
+    // 右辺が配列リテラルの形式でなければ書き込みと同じ分類（22P02）で拒否する。
     let err = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE tags = 'x' LIMIT 10"),
         )
         .unwrap_err();
-    // 型不一致として拒否される（TEXT 前提の等価述語は ARRAY 列に対して
-    // fail-closed に拒否する。D-A8）。
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
+    // 範囲比較・LIKE・BETWEEN は配列列に対して従来どおり 22000。
+    for predicate in [
+        "tags LIKE 'x%'",
+        "tags > '{a}'",
+        "tags BETWEEN '{a}' AND '{b}'",
+    ] {
+        let err = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT id FROM {TABLE} WHERE {predicate} LIMIT 10"),
+            )
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000", "predicate: {predicate}");
+    }
+}
+
+fn select_ids(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
+    let mut ids: Vec<u64> = core
+        .execute_sql(ctx, sql)
+        .unwrap_or_else(|e| panic!("query failed: {sql}: {e:?}"))
+        .rows
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn seed_equality_rows(core: &EngineCore, ctx: &PolicyContext) {
+    for (id, tags) in [
+        (1u64, Some("{a,b}")),
+        (2, Some("{}")),
+        (3, None),
+        (4, Some("{a,NULL}")),
+        (5, Some("{a,NULL}")),
+        (6, Some("{NULL,a}")),
+        (7, Some("{\"NULL\"}")),
+    ] {
+        let sql = match tags {
+            Some(t) => format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, tags) \
+                 VALUES ({id}, '[0.1,0.2]', 'ja', '{t}') USING OPERATION_ID 'eq-{id}'"
+            ),
+            None => format!(
+                "INSERT INTO {TABLE} (id, embedding, lang) \
+                 VALUES ({id}, '[0.1,0.2]', 'ja') USING OPERATION_ID 'eq-{id}'"
+            ),
+        };
+        core.execute_sql_in_session(ctx, &mut SessionState::default(), &sql)
+            .expect("seed insert");
+    }
+}
+
+#[test]
+fn where_array_equality_in_and_is_null_are_three_valued() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_equality_rows(&core, &alice);
+    let q = |predicate: &str| {
+        select_ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE {predicate} LIMIT 100"),
+        )
+    };
+    assert_eq!(q("tags = '{a,b}'"), vec![1]);
+    assert_eq!(q("tags = '{ a , b }'"), vec![1]);
+    assert_eq!(q("tags = '{}'"), vec![2]);
+    // NULL 要素どうしは等しい（PostgreSQL の array_eq と同じ）。位置が違えば別値。
+    assert_eq!(q("tags = '{a,NULL}'"), vec![4, 5]);
+    assert_eq!(q("tags = '{NULL,a}'"), vec![6]);
+    // 引用つきの "NULL" は文字列 NULL（NULL 要素とは別値）。
+    assert_eq!(q("tags = '{\"NULL\"}'"), vec![7]);
+    assert_eq!(q("tags IN ('{a,b}','{}','{x}')"), vec![1, 2]);
+    assert_eq!(q("tags IS NULL"), vec![3]);
+    assert_eq!(q("tags IS NOT NULL"), vec![1, 2, 4, 5, 6, 7]);
+    // 三値論理: 列 NULL の行（id=3）は NOT でも一致しない。
+    assert_eq!(q("NOT tags = '{a,b}'"), vec![2, 4, 5, 6, 7]);
+    assert_eq!(q("tags NOT IN ('{a,b}','{}')"), vec![4, 5, 6, 7]);
+    // 索引対応述語との複合でも再評価される（PlainScan へ倒れる）。
+    assert_eq!(q("lang = 'ja' AND tags = '{a,b}'"), vec![1]);
+    assert_eq!(q("lang = 'zz' AND tags = '{a,b}'"), Vec::<u64>::new());
+    assert_eq!(q("tags = '{a,b}' OR tags IS NULL"), vec![1, 3]);
+}
+
+#[test]
+fn array_equality_survives_reopen_and_update() {
+    let path = unique_db_path("array-eq-reopen");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx_for("alice");
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema()).expect("create table");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        seed_equality_rows(&core, &alice);
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "UPDATE {TABLE} SET tags = '{{z,NULL}}' WHERE id = 1 USING OPERATION_ID 'upd-z'"
+            ),
+        )
+        .expect("update");
+    }
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert_eq!(
+        select_ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE tags = '{{z,NULL}}' LIMIT 100")
+        ),
+        vec![1]
+    );
+    assert_eq!(
+        select_ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE tags = '{{a,b}}' LIMIT 100")
+        ),
+        Vec::<u64>::new()
+    );
+}
+
+#[test]
+fn array_equality_does_not_cross_tenants() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    seed_equality_rows(&core, &alice);
+    let sql = format!("SELECT id FROM {TABLE} WHERE tags = '{{a,b}}' LIMIT 100");
+    assert_eq!(select_ids(&core, &alice, &sql), vec![1]);
+    assert!(select_ids(&core, &bob, &sql).is_empty());
+    let count = core
+        .execute_sql(
+            &bob,
+            &format!("SELECT COUNT(*) FROM {TABLE} WHERE tags = '{{a,b}}'"),
+        )
+        .expect("bob count");
+    match &count.rows[0].cells[0] {
+        Cell::Integer(0) => {}
+        other => panic!("expected 0, got {other:?}"),
+    }
+}
+
+/// DISTANCE 先行（`HINT ORDER(DISTANCE, SCALAR, RLS)`）で OR 群に式述語と配列等価が
+/// 混在する場合、遅延評価が本物の配列値で判定すること（Issue #1193。空プレースホルダで
+/// 評価すると全行が誤って一致・不一致になる fail-open の回帰）。
+#[test]
+fn distance_first_or_group_with_expr_and_array_equality_uses_real_array_values() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    seed_equality_rows(&core, &alice);
+    let q = |predicate: &str| {
+        select_ids(
+            &core,
+            &alice,
+            &format!(
+                "SELECT id FROM {TABLE} WHERE (1 / (id - 1000)) > 1000000 OR {predicate} \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 100 \
+                 HINT ORDER(DISTANCE, SCALAR, RLS)"
+            ),
+        )
+    };
+    assert_eq!(q("tags = '{a,b}'"), vec![1]);
+    assert_eq!(q("tags = '{a,NULL}'"), vec![4, 5]);
+    assert_eq!(q("tags IS NULL"), vec![3]);
+    assert_eq!(q("tags IN ('{}','{NULL,a}')"), vec![2, 6]);
+}
+
+// --- Issue #1193: 要素型の拡大 -----------------------------------------------
+
+const TYPED_TABLE: &str = "typed_docs";
+
+fn typed_schema() -> TableSchema {
+    let arr = |elem| ColumnType::Array(ArrayType::new(elem, 4).expect("array ty"));
+    TableSchema::new(
+        TYPED_TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("ints", arr(ArrayElemType::Integer), true),
+            ColumnDef::new("bigs", arr(ArrayElemType::BigInt), true),
+            ColumnDef::new("reals", arr(ArrayElemType::Real), true),
+            ColumnDef::new("dbls", arr(ArrayElemType::Double), true),
+            ColumnDef::new("days", arr(ArrayElemType::Date), true),
+            ColumnDef::new("stamps", arr(ArrayElemType::Timestamp), true),
+            ColumnDef::new("uuids", arr(ArrayElemType::Uuid), true),
+        ],
+    )
+}
+
+fn typed_core(name: &str) -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path(name);
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&typed_schema()).expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+const TYPED_ROW: &str = "INSERT INTO typed_docs \
+    (id, embedding, ints, bigs, reals, dbls, days, stamps, uuids) VALUES \
+    (1, '[0.1,0.2]', '{1,NULL,-3}', '{9007199254740993,NULL}', '{1.5,-0,NULL}', '{2.25,NULL}', \
+     '{1970-01-02,NULL}', '{\"1970-01-01 00:00:01\",NULL}', \
+     '{00000000-0000-0000-0000-000000000001,NULL}') USING OPERATION_ID 'typed-1'";
+
+#[test]
+fn new_element_types_roundtrip_with_null_elements_and_match_by_equality() {
+    use engine::row_codec::ArrayValue as V;
+    let path = unique_db_path("array-typed-roundtrip");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx_for("alice");
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&typed_schema()).expect("create table");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        core.execute_sql_in_session(&alice, &mut SessionState::default(), TYPED_ROW)
+            .expect("typed insert");
+    }
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let result = core
+        .execute_sql(
+            &alice,
+            "SELECT ints, bigs, reals, dbls, days, stamps, uuids FROM typed_docs WHERE id = 1 LIMIT 1",
+        )
+        .expect("select");
+    let cells: Vec<&Cell> = result.rows[0].cells.iter().collect();
+    let array = |i: usize| match cells[i] {
+        Cell::Array(v) => v.clone(),
+        other => panic!("expected array at {i}, got {other:?}"),
+    };
+    assert_eq!(array(0), V::Integer(vec![Some(1), None, Some(-3)]));
+    assert_eq!(array(1), V::BigInt(vec![Some(9_007_199_254_740_993), None]));
+    assert_eq!(array(2), V::Real(vec![Some(1.5), Some(0.0), None]));
+    assert_eq!(array(3), V::Double(vec![Some(2.25), None]));
+    assert_eq!(array(4), V::Date(vec![Some(1), None]));
+    assert_eq!(array(5), V::Timestamp(vec![Some(1_000_000), None]));
+    assert!(matches!(array(6), V::Uuid(items) if items.len() == 2 && items[1].is_none()));
+
+    let q = |predicate: &str| {
+        select_ids(
+            &core,
+            &alice,
+            &format!("SELECT id FROM {TYPED_TABLE} WHERE {predicate} LIMIT 10"),
+        )
+    };
+    assert_eq!(q("ints = '{1,NULL,-3}'"), vec![1]);
+    assert_eq!(q("ints = '{1,-3}'"), Vec::<u64>::new());
+    assert_eq!(q("bigs = '{9007199254740993,NULL}'"), vec![1]);
+    // -0 は +0 へ正規化されるので等価。
+    assert_eq!(q("reals = '{1.5,0,NULL}'"), vec![1]);
+    assert_eq!(q("dbls = '{2.25,NULL}'"), vec![1]);
+    assert_eq!(q("days = '{1970-01-02,NULL}'"), vec![1]);
+    assert_eq!(q("stamps = '{\"1970-01-01 00:00:01\",NULL}'"), vec![1]);
+    assert_eq!(
+        q("uuids = '{00000000-0000-0000-0000-000000000001,NULL}'"),
+        vec![1]
+    );
+    assert_eq!(q("ints IN ('{2}','{1,NULL,-3}')"), vec![1]);
+    assert_eq!(q("ints IS NOT NULL AND stamps IS NOT NULL"), vec![1]);
+}
+
+#[test]
+fn new_element_type_literal_errors_use_scalar_column_classes() {
+    let (core, path) = typed_core("array-typed-errors");
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let attempt = |column: &str, literal: &str| {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO {TYPED_TABLE} (id, embedding, {column}) \
+                 VALUES (9, '[0.1,0.2]', '{literal}') USING OPERATION_ID 'err-{column}'"
+            ),
+        )
+        .unwrap_err()
+        .wire_code()
+    };
+    assert_eq!(attempt("ints", "{2147483648}"), "22003");
+    assert_eq!(attempt("ints", "{1.5}"), "22P02");
+    assert_eq!(attempt("days", "{2023-02-30}"), "22008");
+    assert_eq!(attempt("days", "{nope}"), "22007");
+    assert_eq!(attempt("uuids", "{zzz}"), "22P02");
+    assert_eq!(attempt("ints", "{1,2,3,4,5}"), "54000");
+    // WHERE の右辺も同じ分類。
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TYPED_TABLE} WHERE ints = '{{2147483648}}' LIMIT 1"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22003");
+}
+
+#[test]
+fn new_element_type_rows_are_isolated_by_tenant() {
+    let (core, path) = typed_core("array-typed-rls");
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    core.execute_sql_in_session(&alice, &mut SessionState::default(), TYPED_ROW)
+        .expect("typed insert");
+    let sql = format!("SELECT id FROM {TYPED_TABLE} WHERE ints = '{{1,NULL,-3}}' LIMIT 10");
+    assert_eq!(select_ids(&core, &alice, &sql), vec![1]);
+    assert!(select_ids(&core, &bob, &sql).is_empty());
+}
+
+#[test]
+fn null_containing_array_unique_keys_do_not_collide() {
+    let path = unique_db_path("array-unique-null");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx_for("alice");
+    let storage = Storage::open(&path).expect("open storage");
+    let schema = TableSchema::new(
+        "uniq",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new(
+                "tags",
+                ColumnType::Array(ArrayType::new(ArrayElemType::Text, 4).expect("array ty")),
+                true,
+            ),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    storage
+        .alter_table_add_unique_constraint("uniq", &["tags"])
+        .expect("add UNIQUE constraint on tags");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let insert = |id: u64, tags: &str| {
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO uniq (id, embedding, tags) VALUES ({id}, '[0.1,0.2]', '{tags}') \
+                 USING OPERATION_ID 'u-{id}'"
+            ),
+        )
+    };
+    insert(1, "{a,NULL}").expect("first");
+    insert(2, "{NULL,a}").expect("NULL position differs");
+    insert(3, "{a}").expect("no NULL element");
+    insert(4, "{a,\"NULL\"}").expect("string NULL differs from NULL element");
+    assert_eq!(insert(5, "{a,NULL}").unwrap_err().wire_code(), "23505");
 }
 
 #[test]

@@ -110,6 +110,7 @@ NULL 要素（D-A6）: 引用なしの `NULL`（大小無視）は `22000` で�
 
 ### D-A6: NULL 要素
 
+（Issue #1193 で置き換え済み。NULL 要素を受理する。末尾の「Issue #1193 追記」参照）
 NULL 要素は受理しない。理由: (1) 等価述語（対象外だが将来追加時）の三値論理を
 避ける、(2) エンコードを単純にできる、(3) flags バイトを予約済みのため
 将来フォーマット版を上げずに緩和できる。列そのものの NULL（presence
@@ -130,7 +131,8 @@ GPU 経路は Array 列を一切読まない（masked 走査で不要列とし�
 
 ### D-A8: 述語・集計・その他の表層
 
-- WHERE で Array 列を参照した場合（等価・`IS NULL` を含む）は既存の型不一致
+- （Issue #1193 で置き換え済み。等価・`IN`・`IS [NOT] NULL` は受理する。末尾の「Issue #1193 追記」参照）
+  WHERE で Array 列を参照した場合（等価・`IS NULL` を含む）は既存の型不一致
   エラーで fail-closed に拒否（対象外・申し送り）。要素・パス演算子
   （`tags[1]`・`@>`・`->`）は字句解析の時点で `42601`。
 - 集計: `COUNT(<Array 列>)`（非 NULL 行数）のみ受理
@@ -180,3 +182,44 @@ GPU 経路は Array 列を一切読まない（masked 走査で不要列とし�
 ## Issue #896 追記
 
 NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。
+
+## Issue #1193 追記: 要素型の拡大・NULL 要素・複合型の等価述語と `IS NULL`
+
+TABLE-14・NOSQL-17・WIRE-13 ポインタ（関連: TABLE-16 の UNIQUE 正準キー、SQL-24 の `IN`／`IS NULL`）。D-A1・D-A3・D-A6・D-A8・D-A9 の一部を次のとおり置き換える。破壊的変更（`row_codec::ArrayValue` の形・22000 拒否から受理への緩和）を含むため `feat(engine)!` として扱う。
+
+### 要素型の拡大（D-A1 の置き換え）
+
+`ArrayElemType` に `Integer`・`BigInt`・`Real`・`Double`・`Date`・`Timestamp`・`Uuid` を追加した。カタログ v2 の要素タグはスカラー型タグと同じ綴り（`integer`・`bigint`・`real`・`double`・`date`・`timestamp`・`uuid`）で、既存の `text`・`boolean` の表現は不変。`numeric`・`bytea`・`enum`・`json`・`vector`・`array` は従来どおりカタログ読み込みで拒否する。値型 `ArrayValue` は要素を `Option<T>`（`None` が NULL 要素）に持つ variant を要素型ごとに持つ。SQL 表層のリテラルは要素をスカラー列と同じ束縛関数（`bind_integer_literal`・`bind_real_literal`・`bind_double_literal`・`bind_datetime_literal`・`bind_uuid_literal`）へ委譲するため、エラー分類（`22P02`・`22003`・`22007`・`22008`）は列と一致する。
+
+### 行バイトの NULL ビットマップ（D-A3 の拡張・D-A6 の置き換え）
+
+flags は `0x00`（従来どおり）または `0x01`（NULL 要素あり）。`0x01` のときペイロード先頭に `ceil(count/8)` バイトのビットマップ（LSB first・1 が NULL・余りビットは 0）が付き、その後ろに非 NULL 要素だけが並ぶ。`0x01` は NULL が 1 個以上あるときだけ使う。decode 側は非正準形（`0x01` なのに NULL ビットが無い・余りビットが 1・未知の flags・ペイロード長の不一致・非有限の浮動小数・範囲外の日時）を拒否する（等価判定と UNIQUE キーがこの単射性に依存するため）。NULL を含まない TEXT／BOOLEAN 配列の行バイト・カタログ表現は #888 から 1 バイトも変わらない（`column_type_codec_roundtrip.rs` の golden で固定）。固定長要素は INTEGER・DATE が 4 バイト LE、BIGINT・TIMESTAMP が 8 バイト LE、REAL・DOUBLE は `-0.0` 正規化後のビット列、UUID は 16 バイト。
+
+### 等価述語と `IS NULL`（D-A8 の置き換え）
+
+配列列に対する `=`・`IN`（`NOT` 含む）・`IS [NOT] NULL` を受理する。右辺は `'{...}'` の文字列リテラルで、INSERT と同じ `parse_array_literal` で列の配列型に束縛してから、行と同じ正準エンコードのバイト一致で比較する（`FilterOp::ArrayEquals`／`InArray`）。NULL 要素どうしは等しい（PostgreSQL の `array_eq` と同じ）。列自体が NULL の行・型不一致は UNKNOWN（`NOT` 越しでも一致しない）。右辺が配列リテラルとして不正なら書き込みと同じ分類（`22P02`／`54000`）で拒否する。二次索引は対応せず、`sql::scalar_plan::classify_scalar_plan` の事前ゲートで常に `PlainScan` へ倒す（複合述語が索引被覆済みと誤判定される fail-open を防ぐ）。範囲比較・`LIKE`・`BETWEEN`・要素・パス演算子は従来どおり拒否。
+
+DISTANCE 先行の再評価経路（`sql::exec` の `candidate_value_to_scalar_ref`）は、従来 `Value::Array` を内容を読まれない空プレースホルダで表していた。等価述語が内容を読むため、行ごとに正準ペイロードを再エンコードして本物の `ArrayRef` を再構成する形へ置き換えた（プレースホルダのままでは OR 群の中の配列等価が誤判定される）。
+
+### UNIQUE キーと content_hash（D-A9 の拡張）
+
+- UNIQUE 正準キー（`constraint.rs`）: 要素タグの既存値（Text=0・Bool=1）は不変、新しい要素型に 2〜8 を割り当てる。NULL 要素を含む配列は要素タグに `0x80` を立て、NULL を含まない配列のキーと先頭バイトで区別する（NULL の位置が違えば別キー）。
+- content_hash（タグ 10）: NULL を含まない TEXT／BOOLEAN 配列のバイト列は不変。新しい要素型は要素型タグ 2〜8。NULL を含む配列は要素型タグに `0x80` を立て、要素ごとに presence バイトを積む（`{NULL}`・`{}`・`{"NULL"}`・`{1,NULL}`・`{1}` が互いに衝突しない）。
+- 集合演算の行キー（`sql::set_op`）は行バイトと同じ正準ペイロードを共有する（第 3 のエンコードを作らない）。
+
+### wire・NoSQL
+
+- SQL wire（`result_encoder::pg_array_text`）: NULL 要素は引用なしの `NULL`、文字列 `NULL` は引用して区別する。整数は 10 進、REAL／DOUBLE は `scalar_float::format_*`、DATE／TIMESTAMP は `datetime::format_*`（TIMESTAMP は空白を含むので引用）、UUID は正規テキスト。型公告 OID は text（25）のまま（WIRE-13）。
+- NoSQL: `insert`／`update` の配列束縛（`typed_json::array_literal_text`）が新しい要素型と JSON `null` 要素を受け付ける（数値は生テキスト、日時・UUID は引用付き文字列。範囲・形式判定は engine が SQL 表層と同じ分類で行う）。応答の JSON 描画は NULL 要素を `null`、`columns[].type` は `integer[]`・`bigint[]`・`real[]`・`double precision[]`・`date[]`・`timestamp[]`・`uuid[]`。`filter` の `eq` は配列列（JSON 配列）・JSON／JSONB 列（JSON オブジェクト／配列）に対応する。`in` は配列列・JSON 列に対して明示的な `42601` で拒否する。
+
+### JSON／JSONB 列の等価述語
+
+`WHERE` の `=`・`IN`・`IS [NOT] NULL` を JSON・JSONB の両方で受理する（`FilterOp::JsonEquals`／`InJson`）。値としての等価は UNIQUE 制約と共通の `json::canonical_equality_text`（キー順・空白・数値表記 `1`／`1.0`／`1e0` の違いを吸収）を右辺と行の両側へ適用して比較する。右辺リテラルの長さ上限・構文・深さ・要素数は INSERT と同じ検証で、失敗は `22P02`／`54000`。PostgreSQL の `json` 型には `=` 演算子が無いが、本リポは JSON（非 B）も JSONB と同じ値等価で受理する（意図した差異）。破損した格納値の正規化失敗は UNKNOWN（fail-closed）。パス演算子（`->`）は従来どおり `42601`。
+
+### 対象外（申し送り。Issue 起票はユーザー承認後）
+
+- 要素型 `NUMERIC(p,s)`・`BYTEA`・`ENUM`・`JSON`（カタログ param 文法の拡張と配列テキストの引用規則の設計が要る）
+- SQL `CREATE TABLE`／`ALTER TABLE` での `<型>[]` 宣言（lexer の拡張。#899 系）
+- `ARRAY[...]` コンストラクタ、要素・パス演算子（`[]`・`@>`・`->`）による述語
+- NoSQL `filter` の `in` を配列列・JSON 列に使うこと
+- 配列列・JSON 列の二次索引化

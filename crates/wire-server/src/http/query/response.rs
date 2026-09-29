@@ -162,32 +162,7 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push(']');
             Ok(())
         }
-        Cell::Array(array_value) => {
-            use engine::row_codec::ArrayValue;
-            out.push('[');
-            match array_value {
-                ArrayValue::Text(items) => {
-                    for (i, s) in items.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        out.push('"');
-                        escape_json_string_into(out, s);
-                        out.push('"');
-                    }
-                }
-                ArrayValue::Bool(items) => {
-                    for (i, b) in items.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        out.push_str(if *b { "true" } else { "false" });
-                    }
-                }
-            }
-            out.push(']');
-            Ok(())
-        }
+        Cell::Array(array_value) => write_array(out, array_value),
         Cell::Bytes(bytes) => {
             // `BYTEA` の JSON 表現は標準 base64（RFC 4648 §4・パディングあり。
             // B7・Issue #886）。base64 のアルファベットは JSON エスケープ不要。
@@ -225,6 +200,82 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             Ok(())
         }
     }
+}
+
+/// 配列セルの JSON 表現（Issue #888・#1193）。NULL 要素は `null`。整数は JSON number
+/// （`BIGINT` は安全整数を超えたら文字列。`Cell::SignedInteger` と同じ規則）、
+/// `REAL`／`DOUBLE PRECISION` は有限値のみ JSON number（非有限は fail-closed に `Err`）、
+/// `DATE`／`TIMESTAMP`／`UUID` は文字列、`BOOLEAN` は真偽値。
+fn write_array(
+    out: &mut String,
+    array_value: &engine::row_codec::ArrayValue,
+) -> Result<(), ResponseEncodeError> {
+    use engine::row_codec::ArrayValue;
+
+    fn each<T>(
+        out: &mut String,
+        items: &[Option<T>],
+        mut f: impl FnMut(&mut String, &T) -> Result<(), ResponseEncodeError>,
+    ) -> Result<(), ResponseEncodeError> {
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            match item {
+                None => out.push_str("null"),
+                Some(v) => f(out, v)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn quoted(out: &mut String, text: &str) {
+        out.push('"');
+        escape_json_string_into(out, text);
+        out.push('"');
+    }
+
+    out.push('[');
+    match array_value {
+        ArrayValue::Text(items) => each(out, items, |out, s| {
+            quoted(out, s);
+            Ok(())
+        })?,
+        ArrayValue::Bool(items) => each(out, items, |out, b| {
+            out.push_str(if *b { "true" } else { "false" });
+            Ok(())
+        })?,
+        ArrayValue::Integer(items) => each(out, items, |out, v| {
+            let _ = write!(out, "{v}");
+            Ok(())
+        })?,
+        ArrayValue::BigInt(items) => each(out, items, |out, v| {
+            if v.unsigned_abs() > MAX_SAFE_INTEGER.unsigned_abs() {
+                out.push('"');
+                let _ = write!(out, "{v}");
+                out.push('"');
+            } else {
+                let _ = write!(out, "{v}");
+            }
+            Ok(())
+        })?,
+        ArrayValue::Real(items) => each(out, items, |out, v| write_finite_f32(out, *v))?,
+        ArrayValue::Double(items) => each(out, items, |out, v| write_finite_f64(out, *v))?,
+        ArrayValue::Date(items) => each(out, items, |out, v| {
+            quoted(out, &engine::datetime::format_date(*v));
+            Ok(())
+        })?,
+        ArrayValue::Timestamp(items) => each(out, items, |out, v| {
+            quoted(out, &engine::datetime::format_timestamp(*v));
+            Ok(())
+        })?,
+        ArrayValue::Uuid(items) => each(out, items, |out, v| {
+            quoted(out, &v.to_string());
+            Ok(())
+        })?,
+    }
+    out.push(']');
+    Ok(())
 }
 
 /// 有限 `f64` を JSON number として書く。非有限（NaN／±∞）は fail-closed に
@@ -286,6 +337,13 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Array(array_ty) => match array_ty.elem() {
                 engine::catalog::ArrayElemType::Text => "text[]",
                 engine::catalog::ArrayElemType::Bool => "boolean[]",
+                engine::catalog::ArrayElemType::Integer => "integer[]",
+                engine::catalog::ArrayElemType::BigInt => "bigint[]",
+                engine::catalog::ArrayElemType::Real => "real[]",
+                engine::catalog::ArrayElemType::Double => "double precision[]",
+                engine::catalog::ArrayElemType::Date => "date[]",
+                engine::catalog::ArrayElemType::Timestamp => "timestamp[]",
+                engine::catalog::ArrayElemType::Uuid => "uuid[]",
             },
         },
     }
@@ -712,6 +770,98 @@ mod tests {
             };
             assert_eq!(actual_type, expected_nosql_type_name, "column={name}");
         }
+    }
+
+    /// Issue #1193: 配列セルのネイティブ JSON 表現（NULL 要素は `null`・新しい要素型・
+    /// `columns[].type` の型名）。
+    #[test]
+    fn array_cells_render_native_json_with_null_elements_and_element_type_names() {
+        use engine::catalog::{ArrayElemType, ArrayType};
+        use engine::row_codec::ArrayValue as V;
+        let uuid = engine::uuid::Uuid::from_bytes([0x11; 16]);
+        let cases: Vec<(ArrayElemType, &str, V, &str)> = vec![
+            (
+                ArrayElemType::Text,
+                "text[]",
+                V::Text(vec![Some("a\"b".to_string()), None]),
+                r#"["a\"b",null]"#,
+            ),
+            (
+                ArrayElemType::Bool,
+                "boolean[]",
+                V::Bool(vec![None, Some(true)]),
+                "[null,true]",
+            ),
+            (
+                ArrayElemType::Integer,
+                "integer[]",
+                V::Integer(vec![Some(1), None, Some(-3)]),
+                "[1,null,-3]",
+            ),
+            (
+                ArrayElemType::BigInt,
+                "bigint[]",
+                V::BigInt(vec![Some(7), Some(9_007_199_254_740_993)]),
+                r#"[7,"9007199254740993"]"#,
+            ),
+            (
+                ArrayElemType::Real,
+                "real[]",
+                V::Real(vec![Some(1.5), None]),
+                "[1.5,null]",
+            ),
+            (
+                ArrayElemType::Double,
+                "double precision[]",
+                V::Double(vec![Some(2.25)]),
+                "[2.25]",
+            ),
+            (
+                ArrayElemType::Date,
+                "date[]",
+                V::Date(vec![Some(1), None]),
+                r#"["1970-01-02",null]"#,
+            ),
+            (
+                ArrayElemType::Timestamp,
+                "timestamp[]",
+                V::Timestamp(vec![Some(1_000_000)]),
+                r#"["1970-01-01 00:00:01"]"#,
+            ),
+            (
+                ArrayElemType::Uuid,
+                "uuid[]",
+                V::Uuid(vec![Some(uuid), None]),
+                r#"["11111111-1111-1111-1111-111111111111",null]"#,
+            ),
+        ];
+        for (elem, type_name, value, expected_cell) in cases {
+            let result = QueryResult {
+                columns: vec![ColumnMeta::Scalar {
+                    name: "v".to_string(),
+                    ty: ColumnType::Array(ArrayType::new(elem, 4).expect("array ty")),
+                }],
+                rows: vec![row(vec![Cell::Array(value)])],
+            };
+            let body = encode(&result).expect("encode");
+            assert!(
+                body.contains(&format!(r#""type":"{type_name}""#)),
+                "type name {type_name} in {body}"
+            );
+            assert!(
+                body.contains(&format!(r#""rows":[[{expected_cell}]]"#)),
+                "cell {expected_cell} in {body}"
+            );
+        }
+        // 非有限の REAL／DOUBLE 要素は fail-closed（JSON で表現できない）。
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "v".to_string(),
+                ty: ColumnType::Array(ArrayType::new(ArrayElemType::Double, 4).expect("array ty")),
+            }],
+            rows: vec![row(vec![Cell::Array(V::Double(vec![Some(f64::NAN)]))])],
+        };
+        assert!(encode(&result).is_err());
     }
 
     #[test]
