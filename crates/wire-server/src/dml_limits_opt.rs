@@ -136,16 +136,22 @@ pub fn insert_rows_cap_warning(
     if limit.get() <= effective {
         return None;
     }
-    let remedy = if files_cap <= chunks_cap {
-        format!(
-            "batch_limits.max_files_per_batch; set {BATCH_MAX_FILES_FLAG} (or the \
-             VECTOR_DB_BATCH_MAX_FILES environment variable) to raise it"
-        )
-    } else {
-        "batch_limits.max_batch_chunks; set the VECTOR_DB_BATCH_MAX_CHUNKS \
-         environment variable to raise it"
-            .to_string()
-    };
+    // 指定行数を下回る上限はすべて列挙する（片方だけ案内すると、案内どおり
+    // 引き上げても他方の上限で VALUES が頭打ちのままになるため。codex-review P2）。
+    let mut remedies = Vec::new();
+    if files_cap < limit.get() {
+        remedies.push(format!(
+            "batch_limits.max_files_per_batch ({files_cap}; set {BATCH_MAX_FILES_FLAG} \
+             or the VECTOR_DB_BATCH_MAX_FILES environment variable to raise it)"
+        ));
+    }
+    if chunks_cap < limit.get() {
+        remedies.push(format!(
+            "batch_limits.max_batch_chunks ({chunks_cap}; set the VECTOR_DB_BATCH_MAX_CHUNKS \
+             environment variable to raise it)"
+        ));
+    }
+    let remedy = remedies.join(" and ");
     Some(format!(
         "{MAX_INSERT_ROWS_FLAG} is set to {limit} but multi-row VALUES statements are still \
          capped at {effective} rows by {remedy}"
@@ -263,6 +269,32 @@ mod tests {
         };
         let warning = insert_rows_cap_warning(&limits, &batch_limits).expect("warning expected");
         assert!(warning.contains("4096"), "unexpected: {warning}");
+        assert!(
+            warning.contains("VECTOR_DB_BATCH_MAX_CHUNKS"),
+            "unexpected: {warning}"
+        );
+    }
+
+    #[test]
+    fn insert_rows_cap_warning_names_both_caps_when_both_are_below_limit() {
+        let limits = DmlLimits {
+            max_affected_rows: None,
+            max_insert_rows_per_statement: Some(NonZeroUsize::new(100_000).unwrap()),
+        };
+        let batch_limits = engine::batch_limits::BatchLimits {
+            max_files_per_batch: 54000,
+            max_batch_chunks: 4096,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        let warning = insert_rows_cap_warning(&limits, &batch_limits).expect("warning expected");
+        assert!(
+            warning.contains("capped at 4096 rows"),
+            "unexpected: {warning}"
+        );
+        assert!(
+            warning.contains("VECTOR_DB_BATCH_MAX_FILES"),
+            "unexpected: {warning}"
+        );
         assert!(
             warning.contains("VECTOR_DB_BATCH_MAX_CHUNKS"),
             "unexpected: {warning}"
