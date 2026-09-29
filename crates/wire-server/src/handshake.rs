@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::wire_stream::WireStream;
-use engine::error_format::{ClassifiedError, ErrorClass};
+use engine::error_format::ErrorClass;
 
 use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
 use crate::framing::{self, FrameError};
@@ -643,62 +643,22 @@ fn post_auth_loop<'e, S: WireStream>(
                 // 同じ fail-closed 分岐（`0A000`）へ倒す。
                 match (engine, txn.as_mut()) {
                     (Some(engine), Some(txn)) => {
-                        // Issue #939（WIRE-17・TASK-220）: `COPY ... FROM STDIN`／
-                        // `COPY (...) TO STDOUT` は簡易クエリの通常の 1 往復応答
-                        // ではなく CopyIn／CopyOut サブプロトコルを要するため、
-                        // `is_copy_statement` の安価な覗き見だけで
-                        // `crate::copy::run` へ委譲する（`validate_sql` の許可
-                        // 形状には含めない。見逃した場合は通常経路が `42601` で
-                        // 拒否する fail-closed。モジュールドキュメント参照）。
-                        if engine::sql::copy::is_copy_statement(text) {
-                            // SQL-31・TASK-221: 明示トランザクション中の COPY は
-                            // 未対応（`0A000`）。`crate::copy::run` へは委譲せず
-                            // トランザクションを Failed へ遷移させる
-                            // （`sql::transaction` モジュールドキュメント参照）。
-                            // `Failed` 中の COPY も autocommit として実行させず、
-                            // 他の文と同じく `25P02` で拒否する（`Idle` 以外は
-                            // `crate::copy::run` へ到達させない。PR #1041 レビュー
-                            // 指摘: `is_active()` のみの判定では `Failed` 中の
-                            // COPY が autocommit で永続化されていた）。
-                            match txn.status() {
-                                engine::sql::transaction::TransactionStatus::Idle => {}
-                                engine::sql::transaction::TransactionStatus::InTransaction => {
-                                    txn.fail();
-                                    write_error_response_io(
-                                        stream,
-                                        ErrorClass::FeatureNotSupported,
-                                        "COPY is not supported inside an explicit transaction",
-                                    )?;
-                                    write_ready_for_query_io(stream, txn.status())?;
-                                    continue;
-                                }
-                                engine::sql::transaction::TransactionStatus::Failed => {
-                                    let err = txn.take_failed_error();
-                                    write_error_response_io(
-                                        stream,
-                                        err.error_class(),
-                                        &err.client_message(),
-                                    )?;
-                                    write_ready_for_query_io(stream, txn.status())?;
-                                    continue;
-                                }
-                            }
-                            // Issue #939 レビュー指摘（discussion_r4096720859）:
-                            // COPY サブプロトコル中に Terminate（'X'）を受信した
-                            // 場合、`crate::copy::run` はそれを消費するだけで
-                            // なく `LoopSignal::Closed` を返す。ここで判定せず
-                            // 単に `?` で捨てて通常ループへ戻すと、クライアント
-                            // は既に切断済みのつもりで応答を待たなくなる一方
-                            // サーバー側は接続スロットを保持し続けてしまう
-                            // （`P`／`D` 分岐と同じ判定作法）。
-                            match crate::copy::run(stream, engine, ctx, session, text)? {
-                                crate::extended_query::LoopSignal::Continue => {}
-                                crate::extended_query::LoopSignal::Closed => return Ok(()),
-                            }
-                        } else {
-                            crate::simple_query::execute_and_respond(
-                                stream, engine, ctx, session, txn, text,
-                            )?;
+                        // Issue #1175: `COPY`（WIRE-17）を含むすべての 'Q' 本文を
+                        // `execute_and_respond` へ委譲する。COPY の判定・状態検査・
+                        // サブプロトコルは文単位で `simple_query::run_copy_statement`
+                        // が担う（複数文メッセージの 2 文目以降の COPY を扱うため、
+                        // 従来のメッセージ全文の覗き見はここから移した）。
+                        // Issue #939 レビュー指摘（discussion_r4096720859）: COPY
+                        // サブプロトコル中に Terminate（'X'）を受信した場合は
+                        // `LoopSignal::Closed` が返る。ここで判定せず捨てると、
+                        // クライアントは切断済みのつもりで応答を待たなくなる一方
+                        // サーバー側は接続スロットを保持し続けてしまう
+                        // （`P`／`D` 分岐と同じ判定作法）。
+                        match crate::simple_query::execute_and_respond(
+                            stream, engine, ctx, session, txn, text,
+                        )? {
+                            crate::extended_query::LoopSignal::Continue => {}
+                            crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }
                     }
                     _ => {

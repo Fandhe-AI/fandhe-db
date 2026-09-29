@@ -10,26 +10,37 @@
 //!
 //! # 分割規則
 //!
-//! [`lexer::tokenize`][crate::sql::lexer::tokenize] が拒否する構文（SQL コメント
-//! `--`・`/* */`、二重引用符識別子、未終端の文字列リテラル）をリテラル外で
-//! 検出した場合は分割せず [`SplitOutcome::Single`] を返し、元テキストをそのまま
-//! 呼び出し元へ渡す。これにより「コメントや未終端引用符で区切りを隠し、
-//! 後続の文を密輸する」経路を構造的に塞ぐ（分割器の拒否規則と lexer の拒否規則の
-//! 連動を単体テストで固定する）。文字列リテラル（`'...'`。`''` エスケープを含む）
-//! 内の `;` は区切りとみなさない。
+//! 通常状態の `;` だけを区切りとする字句走査で分割する。走査は次の 5 状態を持つ:
+//! 通常／`'...'`（`''` エスケープ）／`"..."`（`""` エスケープ）／`--` から改行
+//! （`\n` または `\r`）まで／`/* ... */`（PostgreSQL と同じく入れ子を数える）。
+//! コメント・引用の内部にある `;` は区切りとみなさない。各断片は加工せず（コメントも
+//! 除去せず）そのまま engine へ渡すため、コメントや二重引用符識別子を含む断片は
+//! 単一文のときと同じく lexer が `42601` で拒否する（WIRE-16 の「文ごとに独立して
+//! 許可リストを検証し、複数文であることを理由に受理範囲を変えない」に従う）。
+//!
+//! **PostgreSQL と分割結果が食い違いうる構文では分割しない**（fail-closed）。
+//! 未終端の `'...'`・`"..."`・`/* */`、通常状態の `$`（ドル引用）、E 文字列の接頭辞
+//! （`E'`／`e'`）を検出した場合は [`SplitOutcome::Single`] を返し、全文を engine へ
+//! そのまま渡す（lexer が `42601` で拒否し、1 文も実行されない）。これにより
+//! 「区切りの解釈差を突いて後続の文を密輸する」経路を構造的に塞ぐ。
 //!
 //! # 原子性（暗黙トランザクション）の扱い
 //!
-//! 明示 `BEGIN`／複数文単位のトランザクション機構（SQL-31・RECOVER-12）が
-//! 未実装の現状では、書き込み系文（[`StatementEffect::Write`]）を含む複数文
-//! メッセージのうち「書き込みが最後の 1 文に限られる」形のみを受理する。
-//! この制約下では、先行文がエラーになれば書き込み文はまだ実行されておらず、
-//! 最後の書き込み文自身がエラーになればその文の redb トランザクションが
-//! 単独で原子的に失敗するため、追加の分散トランザクション機構なしに WIRE-16 の
-//! 原子性要件が構造的に成立する。書き込みが最後以外にある場合は
-//! [`MultiStatementError::WriteNotLast`]（`0A000`）で 1 文も実行せずに拒否する。
-//! SQL-31・RECOVER-12 実装後にこの制約を緩める判断は別途行う
-//! （`docs/design/wire-multi-statement.md` 参照）。
+//! [`plan_multi_statement`] が、メッセージの実行方式を選ぶ。
+//!
+//! - セッションが既にトランザクション中（`Active`／`Failed`）、またはメッセージが
+//!   `BEGIN`／`COMMIT`／`ROLLBACK` を含む場合は [`MultiStatementPlan::Sequential`]
+//!   （既存の [`check_write_placement`] を適用し、トランザクション外の書き込みは
+//!   最後の 1 文に限る）。
+//! - 書き込みが最後の 1 文だけ、または書き込みが無い場合も `Sequential`
+//!   （文ごとの autocommit。従来と同一）。
+//! - それ以外（書き込みが最後以外の位置にある）は
+//!   [`MultiStatementPlan::ImplicitTransaction`]。メッセージ全体を 1 つの暗黙
+//!   トランザクション（`sql::transaction::SessionTransaction::begin_implicit`）で
+//!   実行し、途中でエラーになれば先行する書き込みも残さない（WIRE-16・SQL-31・
+//!   RECOVER-12）。暗黙トランザクション内で使える文は明示トランザクションと同じ
+//!   許可リストであり、対応外の文は `0A000` でトランザクション全体をロールバックする
+//!   （`docs/design/wire-multi-statement.md` 参照）。
 
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::sql::lexer::{tokenize, Keyword, Token};
@@ -52,7 +63,7 @@ pub enum SplitOutcome<'a> {
     /// EmptyQueryResponse を返す。
     Empty,
     /// 非空文が 2 個以上、または `Single` の条件を満たさない 1 個（先頭に `;` が
-    /// ある等）。各要素は `;` を含まず前後の空白を trim 済み。
+    /// ある等）。各要素は通常状態の `;`（区切り）を含まず前後の空白を trim 済み。
     Statements(Vec<&'a str>),
 }
 
@@ -62,7 +73,10 @@ pub enum MultiStatementError {
     /// 非空文の数が [`MAX_STATEMENTS_PER_QUERY`] を超過した（`54000`）。
     TooManyStatements,
     /// 書き込み系文（[`StatementEffect::Write`]）が最後の文以外の位置にある
-    /// （`0A000`）。本モジュールのドキュメント「原子性」節参照。
+    /// （`0A000`）。[`check_write_placement`] が返す。制御文を含まないメッセージでは
+    /// [`plan_multi_statement`] が暗黙トランザクションへ振り分けるため、
+    /// 呼び出し元へ届くのは制御文（`BEGIN`／`COMMIT`／`ROLLBACK`）を含む場合のみ。
+    /// 本モジュールのドキュメント「原子性」節参照。
     WriteNotLast,
 }
 
@@ -80,8 +94,9 @@ impl ClassifiedError for MultiStatementError {
                 format!("too many statements in one query message (max {MAX_STATEMENTS_PER_QUERY})")
             }
             MultiStatementError::WriteNotLast => {
-                "write statements (INSERT/UPDATE/DELETE/TRUNCATE) are only supported \
-                 as the last statement in a multi-statement query"
+                "write statements (INSERT/UPDATE/DELETE/TRUNCATE) outside a transaction \
+                 are only supported as the last statement in a multi-statement query \
+                 that contains transaction control statements"
                     .to_string()
             }
         }
@@ -113,16 +128,18 @@ pub enum StatementEffect {
     TransactionControl(crate::sql::transaction::TxnControl),
 }
 
-/// SQL テキストをセミコロン区切りの文へ分割する。文字列リテラルの中にある `;`
-/// では分割せず、lexer が拒否する構文（コメント・二重引用符識別子・未終端
-/// リテラル）を検出した場合は分割せず [`SplitOutcome::Single`] を返す
-/// （モジュールドキュメント参照）。
+/// SQL テキストをセミコロン区切りの文へ分割する。コメント・引用（`'...'`・
+/// `"..."`）の内部にある `;` では分割せず、PostgreSQL と分割結果が食い違いうる
+/// 構文（未終端の引用・コメント、`$`、E 文字列）を検出した場合は分割せず
+/// [`SplitOutcome::Single`] を返す（モジュールドキュメント参照）。
 ///
-/// untrusted 入力経路のため `char_indices` と `str::get` のみを使い、
+/// untrusted 入力経路のため `get()` と `saturating_*` のみを使い、
 /// `unwrap`/`expect`/添字アクセスは使わない（`.claude/rules/coding-rust.md`）。
+/// 区切り・引用符・コメント記号はすべて ASCII のため、バイト単位の走査でも UTF-8 の
+/// 文字境界を壊さない（`str::get` が境界でなければ `None` を返す防御も併用する）。
 pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementError> {
-    let mut in_literal = false;
-    let mut chars = input.char_indices().peekable();
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
     // 1 パスで非空文を直接切り出す（`;` の位置をいったん `Vec<usize>` へ
     // 集めてから 2 パス目で切り出す方式は、`;;;;...` のような入力で
     // 「区切りだけの無制限 `Vec` 確保」に相当し untrusted 入力経路の防御的
@@ -133,56 +150,32 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
     let mut semicolon_count: usize = 0;
     let mut start = 0usize;
 
-    while let Some(&(offset, c)) = chars.peek() {
-        if in_literal {
-            if c == '\'' {
-                // `''` はエスケープ（リテラル継続）。`lexer::lex_string_literal`
-                // と同じ規則。
-                let mut lookahead = chars.clone();
-                lookahead.next();
-                if matches!(lookahead.peek(), Some(&(_, '\''))) {
-                    lookahead.next();
-                    chars = lookahead;
-                    continue;
-                }
-                in_literal = false;
-                chars.next();
-                continue;
+    while let Some(&b) = bytes.get(i) {
+        let next = bytes.get(i.saturating_add(1)).copied();
+        match b {
+            b'\'' | b'"' => match skip_quoted(bytes, i, b) {
+                Some(end) => i = end,
+                // 未終端の引用。lexer が同一入力を必ず拒否するため分割せず全文を渡す。
+                None => return Ok(SplitOutcome::Single),
+            },
+            b'-' if next == Some(b'-') => {
+                i = skip_line_comment(bytes, i);
             }
-            chars.next();
-            continue;
-        }
-
-        match c {
-            '\'' => {
-                in_literal = true;
-                chars.next();
-            }
-            '"' => {
-                // 二重引用符識別子は lexer が無条件で拒否する構文。分割せず
-                // 元テキスト全体を engine へ渡し、同一の `42601` を返させる。
+            b'/' if next == Some(b'*') => match skip_block_comment(bytes, i) {
+                Some(end) => i = end,
+                None => return Ok(SplitOutcome::Single),
+            },
+            // ドル引用（`$tag$...$tag$`）は PostgreSQL と分割結果が食い違いうる
+            // うえ、`tokenize` も `$` を拒否する。分割せず全文を渡す。
+            b'$' => return Ok(SplitOutcome::Single),
+            // E 文字列（`E'...'`）はバックスラッシュエスケープの解釈が異なり、
+            // 引用の終端位置が PostgreSQL と食い違いうる。識別子の途中の `e`
+            // （`name'..'` 等）は接頭辞ではないので除外する。
+            b'E' | b'e' if next == Some(b'\'') && !is_ident_continue_before(bytes, i) => {
                 return Ok(SplitOutcome::Single);
             }
-            '-' => {
-                let mut lookahead = chars.clone();
-                lookahead.next();
-                if matches!(lookahead.peek(), Some(&(_, '-'))) {
-                    // SQL コメント。コメント内の `;` を区切りとみなさないため
-                    // 分割せず元テキストを渡す。
-                    return Ok(SplitOutcome::Single);
-                }
-                chars.next();
-            }
-            '/' => {
-                let mut lookahead = chars.clone();
-                lookahead.next();
-                if matches!(lookahead.peek(), Some(&(_, '*'))) {
-                    return Ok(SplitOutcome::Single);
-                }
-                chars.next();
-            }
-            ';' => {
-                let piece = input.get(start..offset).unwrap_or("").trim();
+            b';' => {
+                let piece = input.get(start..i).unwrap_or("").trim();
                 if !piece.is_empty() {
                     statements.push(piece);
                     if statements.len() > MAX_STATEMENTS_PER_QUERY {
@@ -190,20 +183,12 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
                     }
                 }
                 semicolon_count = semicolon_count.saturating_add(1);
-                // `;` は ASCII 1 バイトなので `offset + 1` は必ず次の文字境界。
-                start = offset.saturating_add(1);
-                chars.next();
+                // `;` は ASCII 1 バイトなので `i + 1` は必ず次の文字境界。
+                i = i.saturating_add(1);
+                start = i;
             }
-            _ => {
-                chars.next();
-            }
+            _ => i = i.saturating_add(1),
         }
-    }
-
-    if in_literal {
-        // 未終端の文字列リテラル。`lexer::tokenize` が同一入力を必ず拒否するため
-        // 分割せず元テキストを渡す（同一の `42601` に収束させる）。
-        return Ok(SplitOutcome::Single);
     }
 
     let tail = input.get(start..).unwrap_or("");
@@ -233,6 +218,68 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
     }
 }
 
+/// `bytes[open]` が開き引用符 `quote`（`'` または `"`）であるときに、閉じ引用符の
+/// 直後の位置を返す（連続 2 個の引用符はエスケープとして継続する。
+/// `lexer::lex_string_literal` と同じ規則）。未終端なら `None`。
+fn skip_quoted(bytes: &[u8], open: usize, quote: u8) -> Option<usize> {
+    let mut j = open.saturating_add(1);
+    loop {
+        let c = *bytes.get(j)?;
+        if c == quote {
+            if bytes.get(j.saturating_add(1)) == Some(&quote) {
+                j = j.saturating_add(2);
+                continue;
+            }
+            return Some(j.saturating_add(1));
+        }
+        j = j.saturating_add(1);
+    }
+}
+
+/// `--` で始まる行コメントの終端（`\n`／`\r` の位置。無ければ入力末尾）を返す。
+fn skip_line_comment(bytes: &[u8], open: usize) -> usize {
+    let mut j = open.saturating_add(2);
+    while let Some(&c) = bytes.get(j) {
+        if c == b'\n' || c == b'\r' {
+            break;
+        }
+        j = j.saturating_add(1);
+    }
+    j
+}
+
+/// `/*` で始まるブロックコメントの終端の直後の位置を返す。PostgreSQL と同じく
+/// 入れ子を数える（数えないと `/* a /* b */ ; INSERT ... */` の `INSERT` が分割
+/// されて実行されてしまう）。深さは `usize` の飽和演算で数え、追加の確保はしない。
+/// 未終端なら `None`。
+fn skip_block_comment(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut j = open.saturating_add(2);
+    let mut depth: usize = 1;
+    loop {
+        let c = *bytes.get(j)?;
+        let n = bytes.get(j.saturating_add(1)).copied();
+        if c == b'/' && n == Some(b'*') {
+            depth = depth.saturating_add(1);
+            j = j.saturating_add(2);
+        } else if c == b'*' && n == Some(b'/') {
+            depth = depth.saturating_sub(1);
+            j = j.saturating_add(2);
+            if depth == 0 {
+                return Some(j);
+            }
+        } else {
+            j = j.saturating_add(1);
+        }
+    }
+}
+
+/// `bytes[at]` の直前のバイトが識別子の構成文字（英数字・`_`・非 ASCII）か。
+fn is_ident_continue_before(bytes: &[u8], at: usize) -> bool {
+    match at.checked_sub(1).and_then(|p| bytes.get(p)) {
+        Some(&c) => c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80,
+        None => false,
+    }
+}
 /// 1 文の先頭トークンから [`StatementEffect`] を判定する。判定語彙は
 /// `core.rs::execute_sql_in_session` の先頭トークン覗き見分岐（`INSERT`／
 /// `TRUNCATE`／`DELETE`／`UPDATE`／`DROP`）と `sql::allowlist::validate_sql` が
@@ -290,12 +337,79 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
             // 追加された場合を含む）は fail-closed に書き込み扱いとする。
             _ => StatementEffect::Write,
         },
+        // Issue #1175: `COPY ... TO STDOUT` は読み取り専用（commit を伴わない）、
+        // `COPY ... FROM STDIN` は書き込み。カタログを引けないため、括弧の深さ 0 で
+        // 最初に現れる `FROM`／`TO` で判定し、どちらも見つからなければ書き込み扱い
+        // （fail-closed）にする。
+        Token::Ident(name) if name.eq_ignore_ascii_case("COPY") => classify_copy(&tokens),
         Token::Ident(_) => StatementEffect::Write,
         // `Select` 以外の `Keyword`（`From`/`Where`/`And`/`Order`/`By`/`Limit`）・
         // `Number`・`Punct`・`StringLiteral`・比較/距離演算子・`QualifiedIdent` は
         // いずれも `Token::Ident` を要求する書き込み分岐に到達できない先頭トークン
         // 形であり、必ず `validate_sql` の許可リスト外（`42601`）へ落ちる。
         _ => StatementEffect::Rejected,
+    }
+}
+
+/// `COPY` 文のトークン列を [`StatementEffect`] へ分類する（[`classify_statement`] の
+/// 補助）。括弧の深さ 0 の位置で先頭の `COPY` の後に最初に現れる `TO` なら
+/// `ReadOnly`、それ以外（`FROM`・どちらも無い）は `Write`。
+/// `COPY (SELECT ... FROM t) TO STDOUT` の内側の `FROM` は深さ 1 なので無視する。
+fn classify_copy(tokens: &[Token]) -> StatementEffect {
+    let mut depth: usize = 0;
+    for token in tokens.iter().skip(1) {
+        match token {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(Keyword::From) if depth == 0 => return StatementEffect::Write,
+            Token::Ident(word) if depth == 0 && word.eq_ignore_ascii_case("TO") => {
+                return StatementEffect::ReadOnly
+            }
+            _ => {}
+        }
+    }
+    StatementEffect::Write
+}
+
+/// 複数文メッセージの実行方式（[`plan_multi_statement`] の結果。Issue #1175・
+/// WIRE-16）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiStatementPlan {
+    /// 文ごとに順次実行する（既存方式。トランザクション外の書き込みは最後の 1 文のみ）。
+    Sequential,
+    /// メッセージ全体を 1 つの暗黙トランザクションで実行し、最後の文の成功後に
+    /// 1 回だけ commit する。途中のエラーは全体のロールバックになる。
+    ImplicitTransaction,
+}
+
+/// 複数文メッセージの実行方式を決める。`session_in_txn` は本メッセージの先頭文
+/// 実行前にセッションが `Idle` でない（`Active` または `Failed`）ことを表す。
+///
+/// 既存経路を暗黙トランザクションで包み直さない: `Active` では許可リストに載った
+/// 文しか実行できず、今動いているメッセージ（例: `SELECT ...; UPDATE ...`）が
+/// `0A000` へ後退してしまうため、[`check_write_placement`] が受理する形は
+/// 必ず `Sequential` に残す。`ImplicitTransaction` になるのは、制御文を含まず、
+/// トランザクション外で書き込みが最後以外にある場合だけ。未知の先頭語は
+/// [`StatementEffect::Write`] なので、この分岐へ振り分けられたうえで `Active` の
+/// 許可リストにより拒否される（autocommit で素通りする経路は生まれない）。
+pub fn plan_multi_statement(
+    stmts: &[&str],
+    session_in_txn: bool,
+) -> Result<MultiStatementPlan, MultiStatementError> {
+    let has_control = stmts.iter().any(|s| {
+        matches!(
+            classify_statement(s),
+            StatementEffect::TransactionControl(_)
+        )
+    });
+    if session_in_txn || has_control {
+        check_write_placement(stmts, session_in_txn)?;
+        return Ok(MultiStatementPlan::Sequential);
+    }
+    match check_write_placement(stmts, false) {
+        Ok(()) => Ok(MultiStatementPlan::Sequential),
+        Err(MultiStatementError::WriteNotLast) => Ok(MultiStatementPlan::ImplicitTransaction),
+        Err(other) => Err(other),
     }
 }
 
@@ -434,12 +548,46 @@ mod tests {
     }
 
     #[test]
-    fn comments_double_quotes_and_unterminated_literals_are_single_and_lexer_agrees() {
+    fn comments_and_double_quotes_are_split_lexically_and_each_piece_is_rejected_by_lexer() {
+        // コメント・二重引用符内の `;` は区切りにならず、外側の `;` では分割される。
+        // 断片は加工されないため、lexer は各断片を単一文のときと同じく拒否する。
+        let cases: [(&str, Vec<&str>); 5] = [
+            (
+                "SELECT 1 -- comment; SELECT 2\n; SELECT 3",
+                vec!["SELECT 1 -- comment; SELECT 2", "SELECT 3"],
+            ),
+            (
+                "SELECT 1 /* comment; */; SELECT 2",
+                vec!["SELECT 1 /* comment; */", "SELECT 2"],
+            ),
+            (
+                "SELECT \"a;b\" FROM t; SELECT 2",
+                vec!["SELECT \"a;b\" FROM t", "SELECT 2"],
+            ),
+            (
+                "SELECT \"a\"\"; b\" FROM t; SELECT 2",
+                vec!["SELECT \"a\"\"; b\" FROM t", "SELECT 2"],
+            ),
+            ("SELECT 1; -- done", vec!["SELECT 1", "-- done"]),
+        ];
+        for (input, expected) in cases {
+            let pieces = statements(split_statements(input).expect("split"));
+            assert_eq!(pieces, expected, "input: {input}");
+            let rejected = pieces.iter().filter(|p| tokenize(p).is_err()).count();
+            assert!(rejected >= 1, "lexer must reject a piece of: {input}");
+        }
+    }
+
+    #[test]
+    fn unterminated_constructs_and_ambiguous_syntax_fall_back_to_single() {
         let inputs = [
-            "SELECT 1 -- comment; SELECT 2",
-            "SELECT 1 /* comment */; SELECT 2",
-            "SELECT \"col\" FROM t; SELECT 2",
             "SELECT 'unterminated; SELECT 2",
+            "SELECT \"unterminated; SELECT 2",
+            "SELECT 1 /* unterminated; SELECT 2",
+            "SELECT 1; /* a /* b */ ; SELECT 2",
+            "SELECT $1; SELECT 2",
+            "SELECT $$a;b$$; SELECT 2",
+            "SELECT E'a\\';b'; SELECT 2",
         ];
         for input in inputs {
             assert_eq!(
@@ -449,6 +597,106 @@ mod tests {
             );
             assert!(tokenize(input).is_err(), "lexer must also reject: {input}");
         }
+    }
+
+    #[test]
+    fn nested_block_comments_do_not_smuggle_a_statement() {
+        // 入れ子を数えないと内側の `*/` でコメントが閉じ、`; INSERT ...` が
+        // 独立した文として切り出されてしまう。
+        let input = "SELECT 1; /* a /* b */ ; INSERT INTO t VALUES (1) */ ; SELECT 2";
+        let pieces = statements(split_statements(input).expect("split"));
+        assert_eq!(
+            pieces,
+            vec![
+                "SELECT 1",
+                "/* a /* b */ ; INSERT INTO t VALUES (1) */",
+                "SELECT 2"
+            ]
+        );
+        assert!(tokenize(pieces[1]).is_err());
+    }
+
+    #[test]
+    fn line_comment_ends_at_carriage_return_or_line_feed() {
+        let pieces = statements(split_statements("SELECT 1 -- c\r; SELECT 2").expect("split"));
+        assert_eq!(pieces, vec!["SELECT 1 -- c", "SELECT 2"]);
+        // `;` が行コメント内にあれば区切りにならない（改行まで続く）。
+        assert_eq!(
+            split_statements("SELECT 1 -- c; SELECT 2").expect("split"),
+            SplitOutcome::Single
+        );
+    }
+
+    #[test]
+    fn e_in_identifier_is_not_an_e_string_prefix() {
+        let pieces = statements(
+            split_statements("SELECT 1 WHERE name = 'x'; SELECT 2 WHERE role = 'y'")
+                .expect("split"),
+        );
+        assert_eq!(pieces.len(), 2);
+    }
+
+    #[test]
+    fn plan_multi_statement_selects_sequential_or_implicit_transaction() {
+        let ins = "INSERT INTO t (id) VALUES (1) USING OPERATION_ID 'o1'";
+        let ins2 = "INSERT INTO t (id) VALUES (2) USING OPERATION_ID 'o2'";
+        // 書き込みが最後だけ・書き込みなしは従来どおり Sequential。
+        assert_eq!(
+            plan_multi_statement(&["SELECT 1", ins], false),
+            Ok(MultiStatementPlan::Sequential)
+        );
+        assert_eq!(
+            plan_multi_statement(&["SELECT 1", "SELECT 2"], false),
+            Ok(MultiStatementPlan::Sequential)
+        );
+        // 書き込みが最後以外なら暗黙トランザクション。
+        assert_eq!(
+            plan_multi_statement(&[ins, ins2], false),
+            Ok(MultiStatementPlan::ImplicitTransaction)
+        );
+        assert_eq!(
+            plan_multi_statement(&[ins, "SELECT 1"], false),
+            Ok(MultiStatementPlan::ImplicitTransaction)
+        );
+        // 未知の先頭語は Write 扱いなので暗黙トランザクションへ振り分けられる。
+        assert_eq!(
+            plan_multi_statement(&["VACUUM t", "SELECT 1"], false),
+            Ok(MultiStatementPlan::ImplicitTransaction)
+        );
+        // セッションがトランザクション中、または制御文を含むなら既存の配置検査。
+        assert_eq!(
+            plan_multi_statement(&[ins, ins2], true),
+            Ok(MultiStatementPlan::Sequential)
+        );
+        assert_eq!(
+            plan_multi_statement(&["BEGIN", ins, ins2, "COMMIT"], false),
+            Ok(MultiStatementPlan::Sequential)
+        );
+        assert_eq!(
+            plan_multi_statement(&[ins, "BEGIN", ins2], false),
+            Err(MultiStatementError::WriteNotLast)
+        );
+        assert_eq!(
+            plan_multi_statement(&["BEGIN", "COMMIT", "SELECT 1"], false),
+            Err(MultiStatementError::WriteNotLast)
+        );
+    }
+
+    #[test]
+    fn classify_copy_distinguishes_to_and_from() {
+        assert_eq!(
+            classify_statement("COPY (SELECT id FROM t) TO STDOUT"),
+            StatementEffect::ReadOnly
+        );
+        assert_eq!(
+            classify_statement("copy (select 1) to stdout with (format csv)"),
+            StatementEffect::ReadOnly
+        );
+        assert_eq!(
+            classify_statement("COPY t (id) FROM STDIN USING OPERATION_ID 'o1'"),
+            StatementEffect::Write
+        );
+        assert_eq!(classify_statement("COPY t"), StatementEffect::Write);
     }
 
     #[test]

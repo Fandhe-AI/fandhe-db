@@ -2062,6 +2062,24 @@ impl EngineCore {
         crate::sql::transaction::SessionTransaction::new(self.transaction_limits)
     }
 
+    /// `BEGIN` を含まない複数文メッセージを原子的に実行するための暗黙トランザクションを
+    /// 開始する（Issue #1175・WIRE-16。[`crate::sql::statement_splitter::
+    /// plan_multi_statement`] が `ImplicitTransaction` を返したときに、
+    /// `wire-server` がメッセージの先頭で 1 回だけ呼ぶ）。
+    ///
+    /// `wire-server` は `Storage` を持たないため、書き込みゲートの取得を伴う開始を
+    /// この入口へ集約する。`txn` が `Idle` でなければ `XX000`、ゲート待機上限超過は
+    /// `55P03`（[`crate::sql::transaction::SessionTransaction::begin_implicit`]）。
+    /// 以降の文は通常どおり [`Self::execute_sql_in_txn`] へ渡し、最後の文の成功後に
+    /// `SessionTransaction::commit_implicit` で確定する。
+    pub fn begin_implicit_transaction<'e>(
+        &'e self,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        txn.begin_implicit(&self.storage, session)
+    }
+
     /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
     /// （[`crate::dictionary::DictionaryConfig`]）を差し替えたビルダーを返す
     /// （[`Self::with_precision_policy`] と同じ流儀。未呼び出しなら
