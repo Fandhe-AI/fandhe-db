@@ -1486,9 +1486,9 @@ fn handle_bind_body(
                     return Err(HandlerError::BinaryFormatUnsupported);
                 }
             }
-            for v in msg.param_values.iter().flatten() {
-                bound_bytes = bound_bytes.saturating_add(v.len());
-            }
+            // 同一 `$n` の出現ごとに値が複製されるため、受信量ではなく展開後の
+            // 実保持量で portal の保持量上限を判定する（PR #1217 レビュー指摘）。
+            bound_bytes = prepared.expanded_bound_bytes(&msg.param_values);
             let bound = engine
                 .bind_prepared(prepared, &msg.param_values)
                 .map_err(HandlerError::Sql)?;

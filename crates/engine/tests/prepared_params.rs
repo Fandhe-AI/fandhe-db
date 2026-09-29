@@ -88,6 +88,20 @@ fn bind_prepared_where_equality_matches_literal_form() {
     assert_eq!(bound, literal);
 }
 
+/// PR #1217 レビュー指摘: portal の保持量は同一 `$n` の出現回数を掛けた
+/// 展開後の量で数える。
+#[test]
+fn expanded_bound_bytes_counts_each_placeholder_occurrence() {
+    let path = unique_db_path("prepared-expanded-bytes");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM documents WHERE lang = $1 AND body = $1 LIMIT 5")
+        .expect("parse_sql_prepared should succeed");
+    assert_eq!(prepared.expanded_bound_bytes(&[some("abcd")]), 8);
+}
+
 #[test]
 fn bind_prepared_vector_distance_matches_literal_form() {
     let path = unique_db_path("prepared-vector-distance-parity");

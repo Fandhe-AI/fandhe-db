@@ -1530,6 +1530,25 @@ impl PreparedSql {
         (self.param_count == 0).then_some(&self.dummy_parsed)
     }
 
+    /// Bind 後に portal が実際に保持する束縛値の総バイト数（同一 `$n` の出現
+    /// ごとに値が複製されるため、参照回数を掛けた展開後の量。未参照の値は
+    /// 保持されないため数えない）。wire-server が接続単位の保持量上限
+    /// （`MAX_BOUND_PARAM_BYTES_PER_SESSION`）を束縛後の実量で判定するために
+    /// 使う。`None`（NULL）は 0 として数える（別途 `bind_prepared` が拒否する）。
+    pub fn expanded_bound_bytes(&self, values: &[Option<Vec<u8>>]) -> usize {
+        self.tokens.iter().fold(0usize, |acc, t| match t {
+            crate::sql::lexer::Token::Param(n) => {
+                let len = usize::from(*n)
+                    .checked_sub(1)
+                    .and_then(|i| values.get(i))
+                    .and_then(|v| v.as_ref())
+                    .map_or(0, Vec::len);
+                acc.saturating_add(len)
+            }
+            _ => acc,
+        })
+    }
+
     /// 文が要求するパラメータ数（`$n` の最大番号。1 始まり。`$n` を含まない
     /// 文は 0）。[`EngineCore::bind_prepared`] に渡す `values` の個数と一致する
     /// 必要がある。
@@ -3180,7 +3199,11 @@ impl EngineCore {
         // ダミー置換・束縛より前にここで検出して一律 `42601` で拒否する
         // （fail-closed。簡易クエリプロトコル〔`Self::parse_sql`〕はこの
         // 経路を通らないため影響しない）。
-        if Self::contains_subquery_syntax(&tokens) {
+        // `$n` を含まない文はダミー置換が恒等でフラグ配列も全 `false` のため
+        // ずれが生じない。従来の `parse_sql` で受理されていた文を拡張クエリ
+        // から実行できなくならないよう、拒否は `$n` を含む文に限定する
+        // （PR #1217 レビュー指摘）。
+        if param_count > 0 && Self::contains_subquery_syntax(&tokens) {
             return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "subquery is not supported over the extended query protocol (Parse/Bind)",
             ));
@@ -3236,14 +3259,11 @@ impl EngineCore {
                 }),
         };
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
-            if column.eq_ignore_ascii_case("id") {
+            if column == "id" {
                 return Some(PreparedParamType::Column(ColumnMeta::Id));
             }
             let schema = self.storage.get_table_schema(table).ok()?;
-            let def = schema
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(column))?;
+            let def = schema.columns.iter().find(|c| c.name == column)?;
             Some(PreparedParamType::Column(ColumnMeta::Scalar {
                 name: def.name.clone(),
                 ty: def.ty.clone(),
