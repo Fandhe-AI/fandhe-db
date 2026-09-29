@@ -1,5 +1,5 @@
 //! SQL 型名の許可リスト構造解析（TASK-202・SQL-23。Issue #900。
-//! `ALTER TABLE ADD COLUMN` が唯一の呼び出し元）。
+//! `ALTER TABLE ADD COLUMN`・`ALTER COLUMN TYPE`（Issue #1167）が呼び出し元）。
 //!
 //! `sql::allowlist::Parser` の内部状態（`tokens`／`pos`）には触れず、トークン
 //! スライスと読み取り位置（`&mut usize`）だけを引数に取る独立実装とする。

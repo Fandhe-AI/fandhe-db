@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 36;
+    count = 37;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -154,8 +154,8 @@ define_error_classes! {
     /// [`crate::tenant::TenantWriteError::Catalog`]／`Storage` の写像。
     InternalError => ("XX000", "INTERNAL_ERROR"),
     /// 数値演算が表現範囲を超過（`22003`）。
-    /// [`crate::sql::allowlist::SqlSurfaceError::NumericOutOfRange`]（SQL-13 の集計関数）
-    /// の写像。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NumericOutOfRange`]（SQL-13 の集計関数、
+    /// および SQL-26 のスカラー／ベクトル算術式評価のあふれ。Issue #1163）の写像。
     NumericOutOfRange => ("22003", "NUMERIC_OUT_OF_RANGE"),
     /// 台帳（TASK-93）に記録済みの `operation_id` へ、内容が異なる書き込みが再送された
     /// （`22023`）。TASK-101（RECOVER-10）が追加。ハッシュ一致の証明が取れない場合は
@@ -268,6 +268,9 @@ define_error_classes! {
     /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::
     /// AmbiguousColumn`] の写像。
     AmbiguousColumn => ("42702", "AMBIGUOUS_COLUMN"),
+    /// 式評価の 0 除算（`22012`、Issue #1163・SQL-26・ERR-2）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DivisionByZero`] の写像。
+    DivisionByZero => ("22012", "DIVISION_BY_ZERO"),
 }
 
 impl ErrorClass {

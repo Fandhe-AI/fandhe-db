@@ -3,8 +3,8 @@
 - **Issue**: #901（対象ビヘイビア: `docs/spec/04-behavior/data-model.md`
   TABLE-19・TABLE-5・TABLE-7。タスク: `docs/spec/05-tasks.md` TASK-203。
   ポインタのみ・本文非転記）
-- **ステータス**: engine 層（Rust API）実装済み。SQL 表層への構文結線は対象外
-  （「SQL 表層結線」節参照）
+- **ステータス**: engine 層（Rust API）実装済み。SQL 表層への構文結線は
+  Issue #1167 で実施（「SQL 表層結線（Issue #1167）」節参照）
 
 ## 背景・目的
 
@@ -194,11 +194,40 @@ variant 追加）・NoSQL 表層（`op` 許可リスト追加）のいずれへ�
 SQL 表層への結線は、TASK-202 の DDL 許可リスト・権限ゲートが取り込まれた
 後続の別 Issue で行う。
 
+## SQL 表層結線（Issue #1167）
+
+上記「SQL 表層結線」節で後続扱いだった結線を実施した（ポインタ: TABLE-19・
+SQL-23・ERR-6・NOSQL-13）。
+
+- **構文（許可リスト）**: `ALTER TABLE <t> DROP COLUMN <c>`・
+  `ALTER TABLE <t> ALTER COLUMN <c> TYPE <型名>` のみ。`COLUMN` 省略・
+  `IF EXISTS`・`ONLY`・`CASCADE`／`RESTRICT`・`SET DATA TYPE`・`USING`・
+  `COLLATE`・複数アクション・`RETURNING`・`USING OPERATION_ID` はいずれも `42601`。
+  予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`。大文字小文字
+  無視）は構造検証段で `42601`（カタログ非照会のため存在オラクルにならない）。
+- **判定順序**: 構文検証 → DDL 権限ゲート（`42501`）→ テーブル存在確認
+  （`42P01`／`42809`）→（ALTER TYPE のみ）目標型解決 → engine の単一 write txn。
+- **エラー写像**: 列なし `42703`／VECTOR 列・保護列・最後の 1 列・NUMERIC 範囲不正・
+  未登録 ENUM `42601`／PK・UNIQUE・CHECK・FK 参照列 `2BP01`／非互換な型変更
+  `42804`／ロック待機超過 `55P03`。新しい `wire_code`・`ErrorClass` は追加しない。
+- **ALTER TYPE の engine 側**: `Storage::alter_table_alter_column_type`（crate 内部）が
+  目標の precision/scale を受け取り、単一 write txn 内で判定する（表層で事前に読んだ
+  scale との TOCTOU を作らない）。受理は NUMERIC の precision 拡大（同一 scale）のみ。
+  既存 `alter_table_widen_numeric_precision` は同じ共通本体へ委譲し挙動不変。
+- **NoSQL**: `alter_table.drop_column` を同じ入口へ結線（`0A000` の仮実装と
+  `DROP_COLUMN_UNAVAILABLE_MESSAGE` を削除）。ALTER COLUMN TYPE 相当の op 語彙は
+  別論点のためスコープ外。
+- **既知の差分（記録のみ）**: `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION` は engine
+  未実装のため `42804`。同一型への変更も `42804`。ビューが参照する列の DROP は
+  DDL 時点で `2BP01` で拒否する（同一 write txn 内で判定）。直接参照するビューに加え、
+  連鎖したビュー（`v1 AS SELECT * FROM t`・`v2 AS SELECT c FROM v1`）は各ビューの
+  公開列集合を削除後の状態で基底側から導出して検査し、外側ビューが参照する列が
+  消える DROP も拒否する。`SELECT *` は公開列集合の導出に使い、それ自体は依存とみなさない。
+
 ## スコープ外・後続 Issue
 
 - `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION`（行の書き換えを伴う拡大変換）
-- `ALTER TABLE ... DROP COLUMN`／`ALTER COLUMN ... TYPE` の SQL 表層・NoSQL
-  表層への構文結線（TASK-202 取り込み後）
+- NoSQL 表層の `ALTER COLUMN ... TYPE` 相当
 - `DROP TABLE`（#902）・VIEW/FK/INDEX の依存検査（2BP01・#907〜#909）・
   明示トランザクション内の DDL（#942 系）
 
