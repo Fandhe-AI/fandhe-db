@@ -886,9 +886,9 @@ pub fn bind_column_projection(
     )
 }
 
-/// `RETURNING` 句（Issue #873・SQL-21）の投影束縛。`INSERT`／`DELETE`（単一行）が
-/// 実行結線済みのため、`sql::allowlist::ValidatedInsert::returning`／
-/// `sql::allowlist::ValidatedDelete::returning` の `Option<Projection>` を
+/// `RETURNING` 句（Issue #873・#1182・SQL-21）の投影束縛。`INSERT`（UPSERT を含む）・
+/// `DELETE`（単一行・述語形）・`UPDATE`（単一行・述語形）の全形が実行結線済みのため、
+/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を
 /// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
 /// 投影実装を作らない）。UDF レジストリを持たないため `Projection::Items`
 /// （関数呼び出し項目）は多層防御として `42601` で拒否する——`sql::allowlist::
@@ -6412,6 +6412,7 @@ mod tests {
             table_name: "documents".to_string(),
             where_predicates,
             operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
         };
         let err = bind_predicate_delete(
             &stmt,
