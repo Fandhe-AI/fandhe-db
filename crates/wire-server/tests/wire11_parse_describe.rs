@@ -265,7 +265,7 @@ fn simple_query_response_is_unchanged_when_interleaved_with_parse_and_describe()
     stream.shutdown(Shutdown::Write).ok();
 }
 
-/// 許可リスト外の SQL（`$1` を含む文）は Parse 時点で `42601` を返し、Sync で
+/// 許可リスト外の SQL（受理位置外の `$1`。`LIMIT $1`。WIRE-12）は Parse 時点で `42601` を返し、Sync で
 /// 同期回復する（Issue #934。モジュールドキュメント参照）。
 #[test]
 fn parse_of_disallowed_sql_returns_42601_and_recovers() {
@@ -274,7 +274,7 @@ fn parse_of_disallowed_sql_returns_42601_and_recovers() {
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    let body = parse_body("", "SELECT id FROM documents WHERE id = $1", 0);
+    let body = parse_body("", "SELECT id FROM documents LIMIT $1", 0);
     send_length_prefixed_message(&mut stream, b'P', &body);
     assert_error_then_recovers(&mut stream, "42601");
 }
@@ -292,19 +292,56 @@ fn parse_of_undefined_table_returns_42p01_and_recovers() {
     assert_error_then_recovers(&mut stream, "42P01");
 }
 
-/// パラメータ型宣言（`num_param_types > 0`）は `0A000` で拒否され、Sync で
-/// 同期回復する（`$n` 束縛は WIRE-12・#935 の担当）。
+/// パラメータ型宣言（`num_param_types > 0`）は受理され、宣言 OID は
+/// Describe(S) の `ParameterDescription` へそのまま echo される（WIRE-12）。
+/// プレースホルダ数を超える宣言は `08P01` で拒否され、Sync で同期回復する。
 #[test]
-fn parse_with_declared_param_types_returns_0a000_and_recovers() {
+fn parse_with_declared_param_types_is_accepted_and_echoed() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    let mut body = parse_body("", "SELECT id FROM documents LIMIT 1", 1);
-    body.extend_from_slice(&23i32.to_be_bytes()); // int4 OID（値自体は読み捨てられる）
+    let mut body = parse_body("s1", "SELECT id FROM documents WHERE body = $1 LIMIT 10", 1);
+    body.extend_from_slice(&23i32.to_be_bytes()); // int4 OID
     send_length_prefixed_message(&mut stream, b'P', &body);
-    assert_error_then_recovers(&mut stream, "0A000");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1', "expected ParseComplete");
+
+    send_length_prefixed_message(&mut stream, b'D', &describe_body(b'S', "s1"));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b't', "expected ParameterDescription");
+    assert_eq!(body, [0, 1, 0, 0, 0, 23]);
+    let (kind, _) = read_message(&mut stream); // RowDescription
+    assert_eq!(kind, b'T');
+
+    // プレースホルダを持たない文への型宣言は過剰宣言（fail-closed）。
+    let mut body = parse_body("", "SELECT id FROM documents LIMIT 1", 1);
+    body.extend_from_slice(&23i32.to_be_bytes());
+    send_length_prefixed_message(&mut stream, b'P', &body);
+    assert_error_then_recovers(&mut stream, "08P01");
+}
+
+/// 空文の Parse でも、型宣言 1 個以上は過剰宣言として `08P01`（fail-closed）。
+/// 宣言 0 個は従来どおり成功する。
+#[test]
+fn parse_of_empty_query_with_declared_param_types_returns_08p01_and_recovers() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let mut body = parse_body("", "", 1);
+    body.extend_from_slice(&23i32.to_be_bytes());
+    send_length_prefixed_message(&mut stream, b'P', &body);
+    assert_error_then_recovers(&mut stream, "08P01");
+
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("", "", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(
+        kind, b'1',
+        "expected ParseComplete for empty query without types"
+    );
 }
 
 /// 名前付きステートメントの重複 Parse は `08P01` で拒否され、Sync で同期回復する。

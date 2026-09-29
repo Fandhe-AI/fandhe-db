@@ -1,5 +1,5 @@
-//! `INSERT`／`DELETE`（単一行）の `RETURNING` 句（Issue #873・SQL-21）の結合
-//! テスト。ポインタ: `docs/spec/05-tasks.md` TASK-193・
+//! `INSERT`／`DELETE`／`UPDATE`／UPSERT の `RETURNING` 句（Issue #873・#1182・
+//! SQL-21）の結合テスト。ポインタ: `docs/spec/05-tasks.md` TASK-193・
 //! `docs/spec/04-behavior/sql-surface.md` SQL-21。関連ポインタ: SQL-10・
 //! SQL-18・RLS-7・RLS-9・RLS-10・RECOVER-1〜3・RECOVER-10。
 //!
@@ -253,34 +253,6 @@ fn insert_returning_file_form_is_rejected_and_writes_no_rows() {
         .expect_err("file-form INSERT RETURNING must be rejected");
     assert_eq!(err.wire_code(), "42601");
     assert_eq!(count_star(&core, &alice, "docs"), 0);
-}
-
-/// `RETURNING`（Issue #873・SQL-21）と `ON CONFLICT`（Issue #872・SQL-20）の
-/// 併用は実行結線未着手のため `42601` で拒否し、書き込みを一切行わない
-/// （main ブランチとの merge で両機能が合流した際の統合確認。
-/// `core.rs::execute_insert_returning_form` の `BoundInsertForm::Upsert` 分岐
-/// 参照）。許可リスト段では受理される構文（`RETURNING` の位置は `USING
-/// OPERATION_ID` の直前という契約を `ON CONFLICT` 追加後も維持しているため）
-/// だが、束縛後のチョークポイントで一律拒否する。
-#[test]
-fn insert_returning_with_on_conflict_is_rejected_and_writes_no_rows() {
-    let (core, path) = new_core_with_table();
-    let _guard = CleanupGuard(path);
-    let alice = ctx_for("alice", true);
-    let mut session = SessionState::default();
-
-    let err = core
-        .execute_sql_in_session(
-            &alice,
-            &mut session,
-            "INSERT INTO documents (id, embedding, lang, body) \
-             VALUES (1, '[1.0,0.0]', 'en', 'hello') \
-             ON CONFLICT (id) DO NOTHING \
-             RETURNING * USING OPERATION_ID 'op-upsert-returning'",
-        )
-        .expect_err("INSERT ... ON CONFLICT ... RETURNING must be rejected");
-    assert_eq!(err.wire_code(), "42601");
-    assert_eq!(count_star(&core, &alice, TABLE), 0);
 }
 
 /// 非セッション入口（`execute_insert_sql`）は `RETURNING` 付き文を検証直後・
@@ -540,4 +512,617 @@ fn insert_returning_multi_row_over_batch_limits_row_count_is_rejected_with_54000
 
     // 行は一切書き込まれていない（副作用ゼロ）。
     assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+// ---------------------------------------------------------------------
+// UPDATE・述語形 DELETE・UPSERT の RETURNING（Issue #1182・SQL-21）
+// ---------------------------------------------------------------------
+
+/// 非 `RETURNING` の `INSERT` で 1 行を投入する（シード用。常に `Private`）。
+fn seed(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, body: &str, op: &str) {
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             ({id}, '[0.1,0.2]', '{lang}', '{body}') USING OPERATION_ID '{op}'"
+        ),
+    )
+    .expect("seed insert");
+}
+
+fn run(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    sql: &str,
+) -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError> {
+    core.execute_sql_in_session(ctx, session, sql)
+}
+
+fn ids(outcome: &engine::sql::exec::ReturningOutcome) -> Vec<u64> {
+    outcome.result.rows.iter().map(|r| r.id).collect()
+}
+
+/// 単一行 `UPDATE ... RETURNING *` は更新**後**の値を返し、直後の `SELECT` の
+/// 読み戻し（列メタ・`Cell::Vector` を含む）と完全一致する。SET していない列は
+/// 既存値を保持する。
+#[test]
+fn update_returning_single_row_returns_post_update_values() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "hello", "op-seed-1");
+
+    let outcome = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING * \
+                 USING OPERATION_ID 'op-update-returning'"
+            ),
+        )
+        .expect("UPDATE RETURNING should succeed"),
+    );
+
+    assert_eq!(outcome.command, DmlCommand::Update);
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.result.rows.len(), 1);
+    let select = core
+        .execute_sql(&alice, &format!("SELECT * FROM {TABLE} LIMIT 10"))
+        .expect("select readback");
+    assert_eq!(select.rows.len(), 1);
+    assert_eq!(outcome.result.columns, select.columns);
+    assert_eq!(outcome.result.rows[0].cells, select.rows[0].cells);
+    assert!(outcome.result.rows[0]
+        .cells
+        .contains(&Cell::Text("en".to_string())));
+    assert!(outcome.result.rows[0]
+        .cells
+        .contains(&Cell::Text("hello".to_string())));
+}
+
+/// 単一行 `UPDATE ... RETURNING` の対象が他テナント所有・不存在のいずれでも、
+/// 応答（列・行・件数）は完全に一致し区別できない（RLS-9・RLS-10）。
+#[test]
+fn update_returning_single_row_notfound_is_identical_for_other_tenant_and_nonexistent_id() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    let mut session = SessionState::default();
+    seed(&core, &bob, 7, "ja", "bob body", "op-seed-bob");
+
+    let other = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE id = 7 RETURNING * USING OPERATION_ID 'op-u-other'"
+            ),
+        )
+        .expect("0-row no-op"),
+    );
+    let missing = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE id = 999 RETURNING * USING OPERATION_ID 'op-u-missing'"
+            ),
+        )
+        .expect("0-row no-op"),
+    );
+    assert_eq!(other.rows_affected, 0);
+    assert!(other.result.rows.is_empty());
+    assert_eq!(other.result, missing.result);
+    assert_eq!(other.rows_affected, missing.rows_affected);
+    assert_eq!(other.command, missing.command);
+
+    // bob の行は無傷。
+    let bob_rows = core
+        .execute_sql(&bob, &format!("SELECT lang FROM {TABLE} LIMIT 10"))
+        .expect("bob select");
+    assert_eq!(bob_rows.rows[0].cells, vec![Cell::Text("ja".to_string())]);
+}
+
+/// 述語形 `UPDATE ... RETURNING` は一致した全行の更新後の値を `id` 昇順で返す。
+#[test]
+fn update_returning_predicate_form_returns_all_matched_rows_post_update() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "a", "op-s1");
+    seed(&core, &alice, 3, "ja", "c", "op-s3");
+    seed(&core, &alice, 2, "en", "b", "op-s2");
+
+    let outcome = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'x' WHERE lang = 'ja' RETURNING id, body \
+                 USING OPERATION_ID 'op-upd-pred'"
+            ),
+        )
+        .expect("predicate UPDATE RETURNING"),
+    );
+    assert_eq!(outcome.command, DmlCommand::Update);
+    assert_eq!(outcome.rows_affected, 2);
+    assert_eq!(ids(&outcome), vec![1, 3]);
+    for row in &outcome.result.rows {
+        assert_eq!(
+            row.cells,
+            vec![Cell::Integer(row.id), Cell::Text("x".to_string())]
+        );
+    }
+    // 一致しなかった行は変化していない。
+    let en = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT body FROM {TABLE} WHERE lang = 'en' LIMIT 10"),
+        )
+        .expect("select en");
+    assert_eq!(en.rows[0].cells, vec![Cell::Text("b".to_string())]);
+}
+
+/// 述語形 `DELETE ... RETURNING` は削除**前**の値を返し、行は実際に削除される。
+#[test]
+fn delete_returning_predicate_form_returns_pre_delete_values_and_removes_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "a", "op-s1");
+    seed(&core, &alice, 2, "en", "b", "op-s2");
+    seed(&core, &alice, 3, "ja", "c", "op-s3");
+
+    let outcome = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING id, lang, body \
+                 USING OPERATION_ID 'op-del-pred'"
+            ),
+        )
+        .expect("predicate DELETE RETURNING"),
+    );
+    assert_eq!(outcome.command, DmlCommand::Delete);
+    assert_eq!(outcome.rows_affected, 2);
+    assert_eq!(ids(&outcome), vec![1, 3]);
+    assert_eq!(
+        outcome.result.rows[0].cells,
+        vec![
+            Cell::Integer(1),
+            Cell::Text("ja".to_string()),
+            Cell::Text("a".to_string())
+        ]
+    );
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+}
+
+/// 述語形 `UPDATE`／`DELETE ... RETURNING` は他テナントの一致行を返さず、変更もしない。
+#[test]
+fn predicate_dml_returning_never_returns_or_modifies_other_tenant_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "alice", "op-sa");
+    seed(&core, &bob, 1, "ja", "bob", "op-sb1");
+    seed(&core, &bob, 2, "ja", "bob2", "op-sb2");
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'changed' WHERE lang = 'ja' RETURNING * \
+                 USING OPERATION_ID 'op-a-upd'"
+            ),
+        )
+        .expect("alice update"),
+    );
+    assert_eq!(upd.rows_affected, 1);
+    assert_eq!(ids(&upd), vec![1]);
+
+    let del = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-a-del'"
+            ),
+        )
+        .expect("alice delete"),
+    );
+    assert_eq!(del.rows_affected, 1);
+    assert_eq!(ids(&del), vec![1]);
+    assert!(del
+        .result
+        .rows
+        .iter()
+        .all(|r| !r.cells.contains(&Cell::Text("bob".to_string()))));
+
+    // bob の 2 行は無傷（内容も変化していない）。
+    assert_eq!(count_star(&core, &bob, TABLE), 2);
+    let bob_bodies = core
+        .execute_sql(&bob, &format!("SELECT body FROM {TABLE} LIMIT 10"))
+        .expect("bob select");
+    assert!(bob_bodies
+        .rows
+        .iter()
+        .all(|r| r.cells != vec![Cell::Text("changed".to_string())]));
+}
+
+/// UPSERT `DO NOTHING ... RETURNING` は新規挿入した行のみ返し、衝突して何も
+/// 変えなかった行は返さない。`rows_affected` は挿入行数。
+#[test]
+fn upsert_returning_do_nothing_returns_only_inserted_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "existing", "op-seed");
+
+    let outcome = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[1.0,0.0]', 'en', 'dup'), (2, '[0.3,0.4]', 'ja', 'new') \
+                 ON CONFLICT (id) DO NOTHING RETURNING id, body \
+                 USING OPERATION_ID 'op-upsert-nothing'"
+            ),
+        )
+        .expect("UPSERT DO NOTHING RETURNING"),
+    );
+    assert_eq!(outcome.command, DmlCommand::Insert);
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(ids(&outcome), vec![2]);
+    assert_eq!(
+        outcome.result.rows[0].cells,
+        vec![Cell::Integer(2), Cell::Text("new".to_string())]
+    );
+    // 既存行は変化していない。
+    let existing = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT body FROM {TABLE} WHERE lang = 'ja' LIMIT 10"),
+        )
+        .expect("select");
+    assert!(existing
+        .rows
+        .iter()
+        .any(|r| r.cells == vec![Cell::Text("existing".to_string())]));
+}
+
+/// UPSERT `DO UPDATE ... RETURNING` は更新した行の更新後の値と新規挿入行の値を
+/// `VALUES` 記述順に返し、`rows_affected == inserted + updated`。
+#[test]
+fn upsert_returning_do_update_returns_post_update_and_inserted_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "old", "op-seed");
+
+    let outcome = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (2, '[0.3,0.4]', 'ja', 'new'), (1, '[1.0,0.0]', 'en', 'upd') \
+                 ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body \
+                 RETURNING id, lang, body USING OPERATION_ID 'op-upsert-update'"
+            ),
+        )
+        .expect("UPSERT DO UPDATE RETURNING"),
+    );
+    assert_eq!(outcome.rows_affected, 2);
+    assert_eq!(ids(&outcome), vec![2, 1]);
+    assert_eq!(
+        outcome.result.rows[0].cells,
+        vec![
+            Cell::Integer(2),
+            Cell::Text("ja".to_string()),
+            Cell::Text("new".to_string())
+        ]
+    );
+    // 更新行は SET した body のみ変わり、lang は既存値（ja）を保持する。
+    assert_eq!(
+        outcome.result.rows[1].cells,
+        vec![
+            Cell::Integer(1),
+            Cell::Text("ja".to_string()),
+            Cell::Text("upd".to_string())
+        ]
+    );
+}
+
+/// `rows_affected` は結果行の可視性と独立: Public のみ可視の `PolicyContext` でも
+/// 述語形 `UPDATE`／`DELETE`・UPSERT は実際に変更した件数を返し、Private 行は
+/// 結果から除外される（`rows.len() < rows_affected`）。
+#[test]
+fn dml_returning_rows_affected_is_independent_of_result_row_visibility() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_private = ctx_for("alice", true);
+    let alice_public_only = ctx_for("alice", false);
+    let mut session = SessionState::default();
+    seed(&core, &alice_private, 1, "ja", "a", "op-s1");
+    seed(&core, &alice_private, 2, "ja", "b", "op-s2");
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice_public_only,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'x' WHERE lang = 'ja' RETURNING * \
+                 USING OPERATION_ID 'op-vis-upd'"
+            ),
+        )
+        .expect("predicate UPDATE"),
+    );
+    assert_eq!(upd.rows_affected, 2);
+    assert!(upd.result.rows.is_empty());
+
+    let ups = expect_returning(
+        run(
+            &core,
+            &alice_public_only,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (3, '[0.1,0.2]', 'ja', 'c') ON CONFLICT (id) DO NOTHING RETURNING * \
+                 USING OPERATION_ID 'op-vis-ups'"
+            ),
+        )
+        .expect("UPSERT"),
+    );
+    assert_eq!(ups.rows_affected, 1);
+    assert!(ups.result.rows.is_empty());
+
+    let del = expect_returning(
+        run(
+            &core,
+            &alice_public_only,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-vis-del'"
+            ),
+        )
+        .expect("predicate DELETE"),
+    );
+    assert_eq!(del.rows_affected, 3);
+    assert!(del.result.rows.is_empty());
+    assert_eq!(count_star(&core, &alice_private, TABLE), 0);
+}
+
+/// 内容照合ハッシュ（RECOVER-10・RECOVER-11）は `RETURNING` の有無に依存しない:
+/// 同一 `operation_id`・同一内容で「あり→なし」「なし→あり」のどちらの順でも
+/// 2 回目は `23505`。単一行 UPDATE・述語形 UPDATE・述語形 DELETE・UPSERT の全経路。
+#[test]
+fn dml_returning_content_hash_is_independent_of_returning_clause() {
+    let upsert = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES (5, '[0.1,0.2]', 'ja', 'u') \
+         ON CONFLICT (id) DO NOTHING"
+    );
+    let stmts: [(&str, String, String); 4] = [
+        (
+            "single-row UPDATE",
+            format!("UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING * USING OPERATION_ID 'op-h'"),
+            format!("UPDATE {TABLE} SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-h'"),
+        ),
+        (
+            "predicate UPDATE",
+            format!("UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-h'"),
+            format!("UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-h'"),
+        ),
+        (
+            "predicate DELETE",
+            format!("DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-h'"),
+            format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-h'"),
+        ),
+        (
+            "UPSERT",
+            format!("{upsert} RETURNING * USING OPERATION_ID 'op-h'"),
+            format!("{upsert} USING OPERATION_ID 'op-h'"),
+        ),
+    ];
+    for (label, with_returning, without_returning) in stmts {
+        for (first, second) in [
+            (&with_returning, &without_returning),
+            (&without_returning, &with_returning),
+        ] {
+            let (core, path) = new_core_with_table();
+            let _guard = CleanupGuard(path);
+            let alice = ctx_for("alice", true);
+            let mut session = SessionState::default();
+            seed(&core, &alice, 1, "ja", "a", "op-seed");
+            run(&core, &alice, &mut session, first)
+                .unwrap_or_else(|e| panic!("{label}: first statement should succeed: {e:?}"));
+            let err = run(&core, &alice, &mut session, second)
+                .expect_err("resend must be detected as a duplicate");
+            assert_eq!(err.wire_code(), "23505", "{label}");
+        }
+    }
+}
+
+/// 非セッション入口（`execute_update_sql`）は `RETURNING` 付き `UPDATE` を書き込み前に
+/// `42601` で拒否し、台帳を消費しない（同一 `operation_id` をセッション経由・
+/// `RETURNING` なしで使うと成功する）。
+#[test]
+fn update_returning_is_rejected_on_nonsession_entry_without_consuming_the_ledger() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    seed(&core, &alice, 1, "ja", "hello", "op-seed");
+
+    let err = core
+        .execute_update_sql(
+            &alice,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING * \
+                 USING OPERATION_ID 'op-nonsession-upd'"
+            ),
+        )
+        .expect_err("RETURNING must be rejected on the session-less UPDATE entry point");
+    assert_eq!(err.wire_code(), "42601");
+
+    let mut session = SessionState::default();
+    let outcome = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-nonsession-upd'"
+        ),
+    )
+    .expect("same operation_id must still be usable (ledger was not consumed)");
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 1),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+}
+
+/// 述語形 `UPDATE`／`DELETE ... RETURNING` が影響行数上限（`54000`）を超えた場合も、
+/// 行・台帳とも副作用ゼロ（同一 `operation_id` を上限内の文で再利用できる）。
+#[test]
+fn predicate_dml_returning_over_affected_row_limit_is_rejected_with_54000_and_changes_nothing() {
+    let path = unique_db_path("sql-returning-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_dml_limits(
+        engine::sql::parser::DmlLimits {
+            max_affected_rows: Some(std::num::NonZeroUsize::new(2).expect("2 is nonzero")),
+            ..engine::sql::parser::DmlLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    for id in 1..=3u64 {
+        seed(&core, &alice, id, "ja", "b", &format!("op-seed-{id}"));
+    }
+
+    let err = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "UPDATE {TABLE} SET body = 'x' WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-lim'"
+        ),
+    )
+    .expect_err("over-limit UPDATE RETURNING must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    let err = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!("DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-lim'"),
+    )
+    .expect_err("over-limit DELETE RETURNING must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(count_star(&core, &alice, TABLE), 3);
+
+    // 台帳は消費されていない: 同一 operation_id を上限内の文で使える。
+    let outcome = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!("DELETE FROM {TABLE} WHERE id = 1 RETURNING id USING OPERATION_ID 'op-lim'"),
+    )
+    .expect("operation_id must be reusable after a rejected over-limit statement");
+    assert_eq!(expect_returning(outcome).rows_affected, 1);
+}
+
+/// 未知列の `RETURNING` は書き込み前に拒否され、行・台帳とも変化しない。
+#[test]
+fn dml_returning_unknown_column_is_rejected_before_write() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "hello", "op-seed");
+
+    for sql in [
+        format!("UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING nope USING OPERATION_ID 'op-bad'"),
+        format!("UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' RETURNING nope USING OPERATION_ID 'op-bad'"),
+        format!("DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING nope USING OPERATION_ID 'op-bad'"),
+        format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES (9, '[0.1,0.2]', 'ja', 'x') \
+             ON CONFLICT (id) DO NOTHING RETURNING nope USING OPERATION_ID 'op-bad'"
+        ),
+    ] {
+        let err = run(&core, &alice, &mut session, &sql)
+            .expect_err("unknown RETURNING column must be rejected");
+        assert_eq!(err.wire_code(), "22000", "{sql}");
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+    let readback = core
+        .execute_sql(&alice, &format!("SELECT lang FROM {TABLE} LIMIT 10"))
+        .expect("select");
+    assert_eq!(readback.rows[0].cells, vec![Cell::Text("ja".to_string())]);
+    // 台帳未消費。
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!("UPDATE {TABLE} SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-bad'"),
+    )
+    .expect("operation_id must still be usable");
+}
+
+/// 明示トランザクション内の DML `RETURNING`（UPDATE／DELETE／UPSERT）は従来どおり
+/// 未対応として拒否される（fail-closed の維持。Issue #1182 のスコープ外）。
+#[test]
+fn dml_returning_inside_explicit_transaction_is_still_rejected() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    seed(&core, &alice, 1, "ja", "hello", "op-seed");
+
+    for sql in [
+        format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING * USING OPERATION_ID 'op-tx'"
+        ),
+        format!("DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-tx'"),
+        format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES (9, '[0.1,0.2]', 'ja', 'x') \
+             ON CONFLICT (id) DO NOTHING RETURNING * USING OPERATION_ID 'op-tx'"
+        ),
+    ] {
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let err = core
+            .execute_sql_in_txn(&alice, &mut session, &mut txn, &sql)
+            .expect_err("RETURNING DML inside a transaction must be rejected");
+        assert_eq!(err.wire_code(), "0A000", "{sql}");
+        let _ = core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK");
+    }
+    let readback = core
+        .execute_sql(&alice, &format!("SELECT lang FROM {TABLE} LIMIT 10"))
+        .expect("select");
+    assert_eq!(readback.rows.len(), 1);
+    assert_eq!(readback.rows[0].cells, vec![Cell::Text("ja".to_string())]);
 }

@@ -230,6 +230,41 @@ pub fn where_equality_literal_is_param(tokens: &[Token]) -> Vec<bool> {
     flags
 }
 
+/// パターン 5（`INSERT ... VALUES`）の受理範囲 `(VALUES の位置, 節末の位置)` を
+/// 返す。INSERT 文でない・`VALUES` が無い場合は `None`。`VALUES` キーワード
+/// （文脈識別子。大文字小文字を無視して最初の出現のみを見る——本許可形状は
+/// `VALUES` 節を 1 つしか持たない）の直後から、`ON`／`USING` のいずれかが現れる
+/// 直前まで。[`validate_param_positions`]（許可位置判定）と
+/// [`infer_param_positions`]（型推論）の双方が本関数を参照し、境界判定が
+/// ずれる余地をなくす。
+fn values_region_bounds(tokens: &[Token]) -> Option<(usize, usize)> {
+    if !ident_eq_ignore_case(tokens.first(), "INSERT") {
+        return None;
+    }
+    let start = tokens.iter().position(|t| match t {
+        Token::Ident(name) => name.eq_ignore_ascii_case("VALUES"),
+        _ => false,
+    })?;
+    let end = tokens
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(idx, t)| match t {
+            Token::Ident(name)
+                if VALUES_CLAUSE_BOUNDARY_IDENTS
+                    .iter()
+                    .any(|b| name.eq_ignore_ascii_case(b))
+                    // 列名としての出現（直後が比較演算子）は境界とみなさない。
+                    && !is_comparison_operator(tokens.get(idx + 1)) =>
+            {
+                Some(idx)
+            }
+            _ => None,
+        })
+        .unwrap_or(tokens.len());
+    Some((start, end))
+}
+
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
 /// 文が要求するパラメータ数（最大の `$n` 番号。1 始まり。`$n` が 1 つも
 /// 無ければ 0）を返す。
@@ -288,38 +323,12 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
-    let is_insert_statement = ident_eq_ignore_case(tokens.first(), "INSERT");
-
-    // パターン 5（INSERT VALUES）の受理範囲: `VALUES` キーワード（文脈識別子。
-    // 大文字小文字を無視して最初の出現のみを見る——本許可形状は `VALUES` 節を
-    // 1 つしか持たない）の直後から、`ON`／`USING` のいずれかが現れる直前まで。
-    let values_region = if is_insert_statement {
-        tokens.iter().position(|t| match t {
-            Token::Ident(name) => name.eq_ignore_ascii_case("VALUES"),
-            _ => false,
-        })
-    } else {
-        None
+    // パターン 5（INSERT VALUES）の受理範囲は [`values_region_bounds`] が単一
+    // 情報源として判定する（型推論 [`infer_param_positions`] と共有する）。
+    let (values_region, values_region_end) = match values_region_bounds(tokens) {
+        Some((start, end)) => (Some(start), Some(end)),
+        None => (None, None),
     };
-    let values_region_end = values_region.map(|start| {
-        tokens
-            .iter()
-            .enumerate()
-            .skip(start + 1)
-            .find_map(|(idx, t)| match t {
-                Token::Ident(name)
-                    if VALUES_CLAUSE_BOUNDARY_IDENTS
-                        .iter()
-                        .any(|b| name.eq_ignore_ascii_case(b))
-                        // 列名としての出現（直後が比較演算子）は境界とみなさない。
-                        && !is_comparison_operator(tokens.get(idx + 1)) =>
-                {
-                    Some(idx)
-                }
-                _ => None,
-            })
-            .unwrap_or(tokens.len())
-    });
 
     // パターン 4（WHERE 等価）の受理範囲は [`where_region`] が単一情報源として
     // 判定する（[`where_equality_literal_is_param`] も同じ境界判定を再利用し、
@@ -391,6 +400,96 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     }
 
     Ok(max_index)
+}
+
+/// `$n` の出現位置の種別（型推論の入力。[`infer_param_positions`] が返す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParamPosition {
+    /// `ORDER BY <vec列> <=> $n`（ベクトルリテラル位置）。
+    Vector,
+    /// `USING PLAN($n)`・`USING OPERATION_ID $n`（列に紐づかない文字列位置）。
+    Text,
+    /// `WHERE <列> = $n` の列名。
+    WhereColumn(String),
+    /// `INSERT ... VALUES` の行内 ordinal（0 始まり。列リストの添字に対応）。
+    InsertValue(usize),
+}
+
+/// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
+/// 判定に使う。値の検証意味論には一切影響しない——値は常に
+/// [`Token::StringLiteral`] 置換経路を通る）。
+/// [`crate::core::PreparedSql::param_types`] が返す（WIRE-12）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreparedParamType {
+    /// text（OID 25）として公告し、バイナリ形式も可（UTF-8 バイト恒等）。
+    Text,
+    /// text（OID 25）として公告するが、値の実体がベクトルのため
+    /// バイナリ形式は不可（WIRE-14）。[`Self::Text`] とは統合しない。
+    VectorText,
+    /// スカラー列（`id` 含む）の型。wire 側が列の公告 OID・バイナリ可否を
+    /// 既存の結果列と同じ規則で導出する。
+    Column(crate::sql::exec::ColumnMeta),
+}
+
+/// `$n` ごとの出現位置種別を、トークン列上の位置から求める（番号 1 始まりの
+/// `n` に対し戻り値の `n - 1` 番目。未参照の番号は空 `Vec`）。
+/// 許可位置判定は [`validate_param_positions`] が先に済ませている前提で、
+/// 本関数は種別の分類だけを行う（判定境界は [`where_region`]・
+/// [`values_region_bounds`] を共有）。
+pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<Vec<ParamPosition>> {
+    let mut out: Vec<Vec<ParamPosition>> = vec![Vec::new(); usize::from(param_count)];
+    let where_bounds = where_region(tokens);
+    let values_bounds = values_region_bounds(tokens);
+    for (i, token) in tokens.iter().enumerate() {
+        let Token::Param(n) = token else { continue };
+        let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
+            continue;
+        };
+        let prev1 = i.checked_sub(1).and_then(|j| tokens.get(j));
+        let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
+        let next1 = tokens.get(i + 1);
+        if matches!(prev1, Some(Token::DistanceOp)) {
+            slot.push(ParamPosition::Vector);
+            continue;
+        }
+        if let Some((start, end)) = values_bounds {
+            if i > start
+                && i < end
+                && matches!(prev1, Some(Token::Punct('(')) | Some(Token::Punct(',')))
+                && matches!(next1, Some(Token::Punct(')')) | Some(Token::Punct(',')))
+            {
+                // 行内 ordinal: 直前の `(` までの、括弧・角括弧の深さ 0 の `,` の数。
+                let mut depth: i32 = 0;
+                let mut commas: usize = 0;
+                for t in tokens.get(start + 1..i).unwrap_or(&[]).iter().rev() {
+                    match t {
+                        Token::Punct(')') | Token::Punct(']') => depth += 1,
+                        Token::Punct('(') | Token::Punct('[') => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        Token::Punct(',') if depth == 0 => commas += 1,
+                        _ => {}
+                    }
+                }
+                slot.push(ParamPosition::InsertValue(commas));
+                continue;
+            }
+        }
+        if let Some((start, end)) = where_bounds {
+            if i > start && i < end && matches!(prev1, Some(Token::Punct('='))) {
+                if let Some(Token::Ident(col)) = prev2 {
+                    slot.push(ParamPosition::WhereColumn(col.clone()));
+                    continue;
+                }
+            }
+        }
+        // `USING PLAN($n)`・`USING OPERATION_ID $n`（および解釈不能な位置）。
+        slot.push(ParamPosition::Text);
+    }
+    out
 }
 
 /// `tokens`（`$n` 置換前の元トークン列）に `ORDER BY <vec列> <=> $n`
@@ -485,7 +584,8 @@ pub fn substitute_values(
 /// - `NULL`（`values` の要素が `None`）は本バージョンのスコープ外として
 ///   [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する（未参照の
 ///   位置も含め、渡された全値に対して検証する）。
-/// - 非 UTF-8・NUL 文字混入も同じ `22000`。
+/// - 非 UTF-8・NUL 文字混入は [`SqlSurfaceError::invalid_text_representation`]
+///   （`22P02`。WIRE-12。値の形式不正）。
 /// - 置換後総バイト数超過は [`SqlSurfaceError::payload_too_large`]（`54000`）。
 pub fn decode_bind_values(
     tokens: &[Token],
@@ -497,10 +597,11 @@ pub fn decode_bind_values(
         let bytes = raw.as_ref().ok_or_else(|| {
             SqlSurfaceError::invalid_input("NULL parameter values are not supported".to_string())
         })?;
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| SqlSurfaceError::invalid_input("parameter value is not valid UTF-8"))?;
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            SqlSurfaceError::invalid_text_representation("parameter value is not valid UTF-8")
+        })?;
         if text.contains('\0') {
-            return Err(SqlSurfaceError::invalid_input(
+            return Err(SqlSurfaceError::invalid_text_representation(
                 "parameter value must not contain a NUL byte",
             ));
         }
@@ -579,6 +680,57 @@ mod tests {
     fn positions(sql: &str) -> Result<u16, SqlSurfaceError> {
         let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
         validate_param_positions(&tokens)
+    }
+
+    fn positions_of(sql: &str) -> Vec<Vec<ParamPosition>> {
+        let tokens = tokenize_with_params(sql).expect("tokenize should succeed");
+        let n = validate_param_positions(&tokens).expect("positions should validate");
+        infer_param_positions(&tokens, n)
+    }
+
+    #[test]
+    fn infer_positions_classifies_each_supported_form() {
+        assert_eq!(
+            positions_of("SELECT * FROM t ORDER BY embedding <=> $1 LIMIT 3"),
+            vec![vec![ParamPosition::Vector]]
+        );
+        assert_eq!(
+            positions_of("SELECT * FROM t WHERE lang = $1"),
+            vec![vec![ParamPosition::WhereColumn("lang".to_string())]]
+        );
+        assert_eq!(
+            positions_of("SELECT * FROM t LIMIT 1 USING PLAN($1)"),
+            vec![vec![ParamPosition::Text]]
+        );
+        assert_eq!(
+            positions_of("INSERT INTO t (id, body, lang) VALUES (1, $1, $2) USING OPERATION_ID $3"),
+            vec![
+                vec![ParamPosition::InsertValue(1)],
+                vec![ParamPosition::InsertValue(2)],
+                vec![ParamPosition::Text],
+            ]
+        );
+    }
+
+    #[test]
+    fn infer_positions_handles_multi_row_insert_and_unreferenced_numbers() {
+        assert_eq!(
+            positions_of("INSERT INTO t (a, b) VALUES ($1, 'x'), ('y', $2) USING OPERATION_ID 'o'"),
+            vec![
+                vec![ParamPosition::InsertValue(0)],
+                vec![ParamPosition::InsertValue(1)],
+            ]
+        );
+        assert_eq!(
+            positions_of("SELECT * FROM t WHERE a = $2 AND b = $2"),
+            vec![
+                vec![],
+                vec![
+                    ParamPosition::WhereColumn("a".to_string()),
+                    ParamPosition::WhereColumn("b".to_string())
+                ]
+            ]
+        );
     }
 
     #[test]
@@ -980,14 +1132,14 @@ mod tests {
     fn decode_bind_values_rejects_non_utf8() {
         let tokens = tokenize_with_params("WHERE lang = $1").expect("tokenize should succeed");
         let err = decode_bind_values(&tokens, &[Some(vec![0xff, 0xfe])]).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]
     fn decode_bind_values_rejects_embedded_nul() {
         let tokens = tokenize_with_params("WHERE lang = $1").expect("tokenize should succeed");
         let err = decode_bind_values(&tokens, &[Some(b"a\0b".to_vec())]).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]

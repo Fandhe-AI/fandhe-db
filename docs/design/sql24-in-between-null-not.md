@@ -150,16 +150,44 @@ flatten()` で NULL と同一視すると、`IsNull` が誤って真になる（
   `x` と評価結果は等価）。畳み込み処理を追加し、単一の `Not`（または前置
   `NOT` が偶数個なら畳んで消える）へ正規化した。
 
+## Issue #1184: `NOT ( ... )` と数値リテラルの `IN`／`BETWEEN`
+
+ポインタ: SQL-24・TASK-208（本文は転記しない）。
+
+- **AST は増やさない**: `WherePredicate` に variant を足さず、既存の `Not`・`Or`・
+  `Expression` だけで表す（公開 enum の破壊的変更を避ける）。束縛段・実行経路・
+  content hash（RECOVER-11）は既存処理にそのまま乗る。
+- **否定は構文段で葉まで押し下げる**（`sql::where_negation::negate_conjunction`）。
+  `where_tree` の二値評価器は UNKNOWN を false として扱うため、`Or`／AND 群の上に
+  `Not` を置くと NULL 行が真に反転して fail-open になる。De Morgan は Kleene 三値論理
+  でも厳密に成立するので、否定は葉（既存の `Not(leaf)` または演算子反転）にだけ残る。
+  `Expression(a = b)` は `BinOp` に `<>` が無いため `a < b OR a > b` に展開する。
+- **`visible()` は否定できない**: `NOT (a AND visible())` は `42601`（RLS-7 の保証を
+  否定側でも維持）。`NOT EXISTS`／`NOT IN (SELECT)` は従来どおり `0A000`。
+- **数値リテラルの `IN`／`BETWEEN` は脱糖**: `col IN (n..)` は `col = n` の `OR`、
+  `col BETWEEN a AND b` は `col >= a AND col <= b`。列型の判定は束縛段に任せ、
+  `col = n` が受理される列だけが受理される（構文段は schema を知らない）。
+  混在リスト・`NULL`・`$n`・単項マイナス・`BETWEEN SYMMETRIC`・空リストは `42601`。
+- **上限**: 要素数は push 前に `MAX_IN_LIST_ITEMS` で検査（`54000`）。脱糖・否定で
+  増えるノードは式ノード予算（`MAX_EXPR_NODES`）へ課金する。`NOT IN` は比較が 2 倍に
+  なるため、要素数が約 170 を超えると `54000` になる。
+- **CHECK 本体（TABLE-16）・ビュー本体・JOIN の WHERE は対象外のまま**: 脱糖後の形が
+  CHECK の許可形と区別できないため、`Parser::in_check_body` で従来どおり `42601` にする。
+  ビュー本体は `Expression`／`Or`／`Not` を拒否する既存契約のまま（`NOT (NOT x = 'v')`
+  は `Equality` に畳まれて受理されるが意味は同値で無害）。
+- **content hash の正規化**: `NOT (a AND b)` と `NOT a OR NOT b`、`id IN (1,2)` と
+  `id = 1 OR id = 2` は同じ AST（同じハッシュ）になる。`NOT NOT x ≡ x` と同じ意図した正規化。
+- **索引**: `classify_scalar_plan` は変更しない。`NOT (tag NOT IN ..)`・`id BETWEEN ..`・
+  `NOT (id > n)` などは既存の分類に入り、`Or` を含む形（`id IN (..)`・`NOT (id BETWEEN ..)`）は
+  `PlainScan`（結果は索引経路と一致することをテストで固定）。
+- 対象外: `Or`／`Not` を含む述語の索引和集合、`BinOp::Ne` の追加（公開 enum の変更を伴う）、
+  `$n` を要素にした `IN`、NoSQL の `filter`（#1197）。
+
 ## 対象外・申し送り
 
 - CHECK 制約での新しい形の対応（`enforce` の三値化）
-- `id`・INTEGER 系列の `IN`/`BETWEEN`（レーン A。`docs/design/
-  scalar-types-predicates.md` 参照）
 - `InTyped`と `IsNull`/`IsNotNull` の索引対応
 - SQL-24 の性能基準（`IN` 8 要素・`OR` 2 項の p95）の実測（bench 側の受け入れ
   項目）
 - NoSQL の `filter` への写像（TASK-223）
-- `NOT (...)`（括弧グループを前置 `NOT` で包む形）。`OR` 自体（括弧グループを
-  含む）は Issue #912（TASK-208）で対応済み（codex-review 指摘対応:
-  当初この節を書いた時点では #912 が並行未マージだったための古い記述を修正）
 - `LIKE` の中間一致等の拡張（#914）

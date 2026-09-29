@@ -168,7 +168,7 @@ fn insert_rejects_string_or_number_literal_for_boolean_column() {
             &insert_sql(1, "ja", "'true'", 1),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 
     let err = core
         .execute_sql_in_session(

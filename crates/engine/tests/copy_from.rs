@@ -775,7 +775,7 @@ fn copy_from_stdin_text_format_binds_real_and_double_columns() {
 }
 
 /// `REAL` 列のオーバーフロー（`22003`）・`DOUBLE PRECISION` 列への文字列
-/// リテラル相当の不正値（`22000`）が INSERT と同じ `wire_code` 分類で
+/// リテラル相当の不正値（`22P02`）が INSERT と同じ `wire_code` 分類で
 /// 拒否されることを固定する。
 #[test]
 fn copy_from_stdin_rejects_out_of_range_real_and_malformed_double() {
@@ -800,7 +800,31 @@ fn copy_from_stdin_rejects_out_of_range_real_and_malformed_double() {
     );
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnot-a-number\n"])
         .expect_err("malformed DOUBLE PRECISION literal must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+/// 指数表記の REAL／DOUBLE 値は受理し、アンダーフロー・オーバーフローは `22003`
+/// のまま拒否する（Issue #1187。PostgreSQL と整合）。
+#[test]
+fn copy_from_stdin_accepts_exponent_notation_and_rejects_out_of_range_exponent() {
+    let (core, path) = open_engine_ext("copy-from-ext-exponent");
+    let _guard = CleanupGuard(path);
+
+    let sql = format!(
+        "COPY {EXT_TABLE} (id, embedding, score, weight) FROM STDIN USING OPERATION_ID 'ext-op-exp-1'"
+    );
+    run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\t1.5e3\t-2.5E-2\n"])
+        .expect("exponent notation must be accepted");
+
+    for (i, (score, weight)) in [("1e-50", "1"), ("1", "1e999")].iter().enumerate() {
+        let sql = format!(
+            "COPY {EXT_TABLE} (id, embedding, score, weight) FROM STDIN USING OPERATION_ID 'ext-op-exp-bad-{i}'"
+        );
+        let line = format!("{}\t[1.0,0.0]\t{score}\t{weight}\n", 10 + i);
+        let err = run_copy_from(&core, "acme", &sql, &[line.as_bytes()])
+            .expect_err("out-of-range exponent must be rejected");
+        assert_eq!(err.wire_code(), "22003");
+    }
 }
 
 #[test]
@@ -812,7 +836,7 @@ fn copy_from_stdin_rejects_invalid_boolean_word() {
         format!("COPY {EXT_TABLE} (id, embedding, flag) FROM STDIN USING OPERATION_ID 'ext-op-3'");
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tmaybe\n"])
         .expect_err("invalid boolean word must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]
@@ -836,7 +860,7 @@ fn copy_from_stdin_rejects_malformed_bytea_hex() {
         format!("COPY {EXT_TABLE} (id, embedding, blob) FROM STDIN USING OPERATION_ID 'ext-op-5'");
     let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tnothex\n"])
         .expect_err("malformed bytea hex literal must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 // ---------------------------------------------------------------------
@@ -886,4 +910,129 @@ fn copy_to_stdout_projects_boolean_array_bytea_enum_columns() {
             Cell::Text("happy".to_string()),
         ]
     );
+}
+// ---------------------------------------------------------------------
+// Issue #1178・INDEX-4 ②（1 行あたり本文サイズ）・④（生成チャンク数）の境界。
+// ①③ は上のテストが固定済み。②④ が CopyDone（`finish`）を待たず `feed` 中に
+// 拒否され、副作用が残らないことを固定する。`BatchLimits` は環境変数
+// （`VECTOR_DB_BATCH_MAX_*`）由来の既定値の揺らぎを避けるため 4 項目すべて明示する。
+// ---------------------------------------------------------------------
+
+/// 上限を明示注入した `EngineCore` を作る。
+fn open_engine_with_limits(
+    name: &str,
+    limits: engine::batch_limits::BatchLimits,
+) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path(name);
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core =
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(limits);
+    (core, guard)
+}
+
+/// 1 行の判定対象量は `VECTOR(2)` の 8 バイト + `lang` の長さ
+/// （`id` 疑似列と NULL の `note` は 0）。
+const ROW_BODY_LIMIT: usize = 18;
+
+fn body_limit_limits() -> engine::batch_limits::BatchLimits {
+    engine::batch_limits::BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: ROW_BODY_LIMIT,
+        max_batch_total_bytes: 1024 * 1024,
+        max_batch_chunks: 64,
+    }
+}
+
+fn chunk_limit_limits() -> engine::batch_limits::BatchLimits {
+    // ④ < ① にして ① が先に発火しないようにする。
+    engine::batch_limits::BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: 1024 * 1024,
+        max_batch_total_bytes: 1024 * 1024,
+        max_batch_chunks: 2,
+    }
+}
+
+fn copy_sql(op: &str) -> String {
+    format!("COPY {TABLE} (id, embedding, lang) FROM STDIN USING OPERATION_ID '{op}'")
+}
+
+#[test]
+fn copy_from_stdin_rejects_row_over_body_size_limit_before_copy_done() {
+    let (core, _guard) = open_engine_with_limits("copy-from-body-over", body_limit_limits());
+    let plan = core
+        .begin_copy(
+            &ctx("acme"),
+            &SessionState::default(),
+            &copy_sql("copy-op-1178-a"),
+        )
+        .expect("begin_copy");
+    let mut session = match plan {
+        CopyPlan::From(s) => s,
+        CopyPlan::To(..) => panic!("expected FROM plan"),
+    };
+    // 3 行目の `lang` が 11 バイト（判定対象量 19 > 18）。
+    let err = session
+        .feed(b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\televenbytes\n")
+        .expect_err("row body over limit must be rejected before CopyDone");
+    assert_eq!(err.wire_code(), "54000");
+    assert!(
+        err.to_string().contains("body size"),
+        "unexpected message: {err}"
+    );
+    assert!(read_back_ids(&core, "acme").is_empty());
+}
+
+#[test]
+fn copy_from_stdin_row_body_at_limit_is_accepted() {
+    let (core, _guard) = open_engine_with_limits("copy-from-body-at", body_limit_limits());
+    // `lang` が 10 バイト（判定対象量 18 = 上限ちょうど）。
+    run_copy_from(
+        &core,
+        "acme",
+        &copy_sql("copy-op-1178-b"),
+        &[b"1\t[1.0,0.0]\ttenbytes10\n"],
+    )
+    .expect("row exactly at body limit must be accepted");
+    assert_eq!(read_back_ids(&core, "acme"), vec![1]);
+}
+
+#[test]
+fn copy_from_stdin_rejects_batch_over_chunk_limit_before_copy_done() {
+    let (core, _guard) = open_engine_with_limits("copy-from-chunk-over", chunk_limit_limits());
+    let plan = core
+        .begin_copy(
+            &ctx("acme"),
+            &SessionState::default(),
+            &copy_sql("copy-op-1178-c"),
+        )
+        .expect("begin_copy");
+    let mut session = match plan {
+        CopyPlan::From(s) => s,
+        CopyPlan::To(..) => panic!("expected FROM plan"),
+    };
+    let err = session
+        .feed(b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\tja\n")
+        .expect_err("chunk count over limit must be rejected before CopyDone");
+    assert_eq!(err.wire_code(), "54000");
+    assert!(
+        err.to_string().contains("batch chunk count"),
+        "unexpected message: {err}"
+    );
+    assert!(read_back_ids(&core, "acme").is_empty());
+}
+
+#[test]
+fn copy_from_stdin_rows_at_chunk_limit_are_accepted() {
+    let (core, _guard) = open_engine_with_limits("copy-from-chunk-at", chunk_limit_limits());
+    run_copy_from(
+        &core,
+        "acme",
+        &copy_sql("copy-op-1178-d"),
+        &[b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n"],
+    )
+    .expect("rows exactly at chunk limit must be accepted");
+    assert_eq!(read_back_ids(&core, "acme"), vec![1, 2]);
 }

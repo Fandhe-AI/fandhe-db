@@ -377,6 +377,13 @@ pub const MAX_STATEMENT_NAME_LEN: usize = 63;
 /// （本リポの実装既定値）。
 pub const MAX_PREPARED_SQL_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
 
+/// 接続単位で portal が保持する Bind 束縛値の累計バイト数上限（WIRE-12・
+/// Issue #1171）。束縛済み SQL は値を最大 1 MiB（`lexer::MAX_INPUT_LEN`）まで
+/// 保持し、portal は最大 [`MAX_PORTALS_PER_SESSION`] 個あるため、個々の
+/// 上限とは独立に接続単位の総量へ歯止めをかける（本リポの実装既定値。
+/// [`MAX_PREPARED_SQL_BYTES_PER_SESSION`] と同水準）。
+pub const MAX_BOUND_PARAM_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
+
 /// 接続単位で保持する名前付き portal 数の上限（Issue #934・TASK-71・WIRE-11。
 /// 拡張クエリプロトコルの Bind）。[`MAX_PREPARED_STATEMENTS_PER_SESSION`] と
 /// 同じ設計（無名 `""` は件数にカウントせず黙って置換する）。本リポの実装
