@@ -435,8 +435,8 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
 列ごとに語彙をインラインで持つ方式では型削除（`DROP TYPE`）を表現できない
 ため、名前付き型を新設テーブル `enum_types`（キー: 型名、値: バージョン付き
 blob）へ登録する方式を採用した。DDL は SQL-23（`CREATE TYPE ... AS ENUM`）
-が未実装のため Rust API 専用（`Storage::{create,get,alter_enum_type_add_value,
-drop}_enum_type`）。
+は Issue #1194 で SQL 表層へ結線した（`docs/design/enum-type-ddl.md`）。Rust API
+は `Storage::{create,get,alter_enum_type_add_value,drop}_enum_type`。
 
 制約: ラベル数 1〜256（`MAX_ENUM_LABELS`）・ラベル長 1〜63 バイト
 （`MAX_ENUM_LABEL_LEN`）・制御文字禁止・重複禁止・宣言順保持。型名は識別子
@@ -498,9 +498,8 @@ Rust API から直接渡された `Value::Enum` もここで拒否する）、(3
 ### D5: DROP TYPE
 
 依存列（当該型を参照する `ColumnType::Enum` 列）が 1 つでも残っていれば
-`CatalogError::DependentObjectsStillExist` で拒否する。SQL-23 結線時は
-`2BP01` へ写像する想定だが、本 variant は Rust API 専用で wire への送出
-経路を持たないため `ErrorClass` には追加しない。
+`CatalogError::DependentObjectsStillExist` で拒否する。SQL 表層の
+`DROP TYPE` は Issue #1194 で `2BP01` へ写像する（`ErrorClass` への追加は不要）。
 
 ### D6: エラーコード `22P02` の新設
 

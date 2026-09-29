@@ -46,8 +46,8 @@ use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
     ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
-    ValidatedDropView,
+    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
+    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::SqlColumnTypeName;
 use crate::sql::mode::SessionState;
@@ -1095,9 +1095,113 @@ fn map_drop_index_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `CREATE TYPE ... AS ENUM`（TABLE-14・SQL-23・TASK-198、Issue #1194）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTypeOutcome {}
+
+/// `DROP TYPE`（TABLE-14・SQL-23・TASK-198、Issue #1194）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTypeOutcome {}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
+/// （Issue #1194）。`Storage::create_enum_type`（単一 write txn 内で名前検証・
+/// 重複判定・件数上限を行う）へ委譲する。ENUM 型は全テナント共有カタログのため
+/// `PolicyContext` は取らない。
+pub(crate) fn execute_create_type(
+    storage: &Storage,
+    validated: &ValidatedCreateType,
+) -> Result<CreateTypeOutcome, SqlSurfaceError> {
+    storage
+        .create_enum_type(validated.name(), validated.labels().to_vec())
+        .map_err(map_create_type_error)?;
+    Ok(CreateTypeOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
+/// （Issue #1194）。`Storage::drop_enum_type`（同一 write txn 内で依存列を判定し、
+/// 残っていれば `DependentObjectsStillExist`）へ委譲する。
+pub(crate) fn execute_drop_type(
+    storage: &Storage,
+    validated: &ValidatedDropType,
+) -> Result<DropTypeOutcome, SqlSurfaceError> {
+    storage
+        .drop_enum_type(validated.name())
+        .map_err(map_drop_type_error)?;
+    Ok(DropTypeOutcome {})
+}
+
+/// `Storage::create_enum_type` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （型名重複は ERR-6 に専用行が無いため `42P07`。定義不正・型数上限は `42601`）。
+/// エラー文言にはラベル・テナント・redb 内部詳細を含めない（security.md P0）。
+fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "CREATE TYPE failed".to_string(),
+        },
+    }
+}
+
+/// `Storage::drop_enum_type` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （型不在 `42704`、依存列が残っている場合 `2BP01`）。文言に含めるのは削除対象の
+/// 型名のみで、依存テーブル名は含めない。
+fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedObject { name },
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed type reference in DROP TYPE")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "DROP TYPE failed".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 型 DDL のエラー写像（Issue #1194）。
+    #[test]
+    fn type_ddl_error_mapping() {
+        let code = |e: SqlSurfaceError| e.wire_code();
+        assert_eq!(
+            code(map_create_type_error(CatalogError::TypeAlreadyExists(
+                "t".into()
+            ))),
+            "42P07"
+        );
+        assert_eq!(
+            code(map_create_type_error(CatalogError::Invalid("x".into()))),
+            "42601"
+        );
+        assert_eq!(
+            code(map_create_type_error(CatalogError::WriteLockTimeout)),
+            "55P03"
+        );
+        assert_eq!(
+            code(map_drop_type_error(CatalogError::TypeNotFound("t".into()))),
+            "42704"
+        );
+        assert_eq!(
+            code(map_drop_type_error(
+                CatalogError::DependentObjectsStillExist("t".into())
+            )),
+            "2BP01"
+        );
+        assert_eq!(
+            code(map_drop_type_error(CatalogError::CorruptSchema("x".into()))),
+            "XX000"
+        );
+    }
 
     /// 書き込みゲートの待機上限超過は `ALTER TABLE ADD COLUMN` でも `55P03`
     /// （SQL-31・TASK-221。他の DDL 入口と同じ契約。Issue #900）。
