@@ -389,7 +389,7 @@ fn non_integer_literal_forms_are_rejected_with_22000() {
 /// （`SUM` 等）の直接参照は Issue #892 で受理されたため、この契約からは
 /// 除外する（[`sum_of_integer_column_succeeds_after_issue_892`] 参照）。
 #[test]
-fn integer_column_reference_in_where_group_by_and_expr_is_rejected_with_22000() {
+fn integer_column_reference_in_where_and_expr_is_rejected_with_22000() {
     let path = unique_db_path("column-type-integer-unsupported-refs");
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -405,10 +405,11 @@ fn integer_column_reference_in_where_group_by_and_expr_is_rejected_with_22000() 
         .unwrap_err();
     assert_eq!(where_err.wire_code(), "22000");
 
-    let group_by_err = core
-        .execute_sql(&ctx, &format!("SELECT n, COUNT(*) FROM {TABLE} GROUP BY n"))
-        .unwrap_err();
-    assert_eq!(group_by_err.wire_code(), "22000");
+    // Issue #1185・SQL-25 (d): 非 TEXT 列の `GROUP BY` キーは受理側へ契約改訂した
+    // （結果は `tests/sql25_aggregate_order_by_scalar_keys.rs` で固定）。ここでは
+    // 拒否されないことだけを確認する。
+    core.execute_sql(&ctx, &format!("SELECT n, COUNT(*) FROM {TABLE} GROUP BY n"))
+        .expect("INTEGER GROUP BY key is accepted since Issue #1185");
 
     // 式評価: 組み込み関数呼び出し（`vec_div(embedding, n)`）の引数として
     // `INTEGER` 列を参照すると、`sql::udf_call::bind_expr_in` の列参照束縛が

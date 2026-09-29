@@ -53,7 +53,7 @@
 //!   への到達は現状 SQL テキスト経由の [`allowlist::validate_sql`] のみで、
 //!   `BoundScan::new` 相当の SQL テキスト非経由の直接構築 `BoundAggregate::new`
 //!   は対象外のまま）
-//! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
+//! - [`group_by`][]: `GROUP BY <列>`（Issue #1185 で `TEXT` 限定を外した）集計の複数行実行（TASK-167・SQL-14）。
 //!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
 //!   `ORDER BY`・`LIMIT` を担う
 //! - [`sparse_cache`][]: `exec` の hybrid 実行が参照する `SparseIndex`（BM25 語彙・
@@ -178,6 +178,7 @@ pub(crate) mod join;
 pub mod lexer;
 pub mod mode;
 pub(crate) mod numeric_fn;
+pub(crate) mod order_value;
 pub mod params;
 pub mod parser;
 pub mod plan;

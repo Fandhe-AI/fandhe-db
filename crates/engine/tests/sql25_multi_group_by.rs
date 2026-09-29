@@ -309,22 +309,24 @@ fn multi_column_group_by_order_by_second_key_desc_with_limit() {
         .iter()
         .map(|row| as_text(&row.cells[1]))
         .collect();
-    // NULL は DESC でも末尾のまま。
+    // Issue #1185・SQL-25 (a) で契約改訂: 明示した `ORDER BY ... DESC` の NULL 位置は
+    // PostgreSQL 既定（DESC は NULL が先頭）にそろえる。NULL の後に非 NULL が続き、
+    // 非 NULL は降順になる。
     let mut last_non_null: Option<String> = None;
-    let mut seen_null = false;
+    let mut seen_non_null = false;
     for kind in &kinds {
         match kind {
             Some(k) => {
-                assert!(
-                    !seen_null,
-                    "non-NULL kind must not appear after a NULL kind in DESC order"
-                );
+                seen_non_null = true;
                 if let Some(prev) = &last_non_null {
                     assert!(prev >= k, "kind must be descending: {prev} then {k}");
                 }
                 last_non_null = Some(k.clone());
             }
-            None => seen_null = true,
+            None => assert!(
+                !seen_non_null,
+                "NULL kind must precede every non-NULL kind in DESC order"
+            ),
         }
     }
 }
