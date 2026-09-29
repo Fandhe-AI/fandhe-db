@@ -336,7 +336,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （`constraint::enforce_deferred_foreign_keys_in_txn`。TABLE-17・TASK-205、
     // Issue #1077）を commit の直前に追加したことでさらに移動（旧: 293）。この
     // 検査自体は参照先の行ストアを読むだけで `user_rows/{table}` へ書き込まない。
-    ("sql/transaction.rs", 330),
+    // Issue #1175（暗黙トランザクション）で `commit` 本体を共通関数 `commit_active` へ
+    // 抽出したことでさらに移動（旧: 330）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 714),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を

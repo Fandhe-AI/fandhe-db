@@ -983,12 +983,11 @@ fn wire17_copy_from_stdin_with_trailing_semicolon_is_accepted() {
     read_ready_for_query(&mut stream);
 }
 
-/// (2) `COPY ... FROM STDIN ...; SELECT 1` は `is_copy_statement` が真になり
-/// `crate::copy::run` へ委譲されるが、`validate_copy` の
-/// `expect_end_of_statement` が `; SELECT 1` を余剰トークンとして検出し
-/// `42601` で拒否する（`CopyInResponse` は一度も送出されない＝CopyIn
-/// サブプロトコルへ入らない）。エラー後も接続はデシンクせず、後続の通常
-/// クエリを正しく処理できることを確認する。
+/// (2) `COPY ... FROM STDIN ...; SELECT 1`（Issue #1175）: COPY が書き込みで最後以外に
+/// あるため、メッセージ全体が暗黙トランザクションになる。トランザクション内の COPY は
+/// 未対応（`0A000`）なので CopyIn サブプロトコルへは入らず（`CopyInResponse` は
+/// 一度も送出されない）、`ReadyForQuery` は `'I'`。エラー後も接続はデシンクせず、
+/// 後続の通常クエリを正しく処理できる。
 #[test]
 fn wire17_copy_from_stdin_followed_by_another_statement_is_rejected_without_entering_copy_in() {
     let (core, _guard) = new_core_with_docs_table();
@@ -998,8 +997,8 @@ fn wire17_copy_from_stdin_followed_by_another_statement_is_rejected_without_ente
         &mut stream,
         "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'trailing-stmt'; SELECT 1",
     );
-    expect_error_response_with_sqlstate(&mut stream, "42601");
-    read_ready_for_query(&mut stream);
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
     // デシンクしていなければ後続クエリは通常どおり処理される。
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
@@ -1012,16 +1011,12 @@ fn wire17_copy_from_stdin_followed_by_another_statement_is_rejected_without_ente
     read_ready_for_query(&mut stream);
 }
 
-/// (3) `SELECT 1; COPY ... FROM STDIN ...` はメッセージ全文が `COPY` で
-/// 始まらないため `is_copy_statement` が偽になり、
-/// `simple_query::execute_and_respond` の複数文経路
-/// （`statement_splitter::split_statements`）へ流れる。1 文目の `SELECT 1` は
-/// 通常どおり応答されるが、2 文目の `COPY ...` は `sql::allowlist::
-/// validate_sql` の許可形状に含まれないため `42601` で打ち切られる
-/// （CopyIn サブプロトコルへは一切入らない）。エラー後も接続はデシンクしない
-/// ことを確認する。
+/// (3) `SELECT ...; COPY ... FROM STDIN ...`（Issue #1175）: 書き込みは最後の 1 文だけ
+/// なので従来どおり逐次実行され、2 文目の `COPY` は PostgreSQL と同じく CopyIn
+/// サブプロトコルへ入って完了する（従来は `42601`）。1 文目の応答は通常どおり届き、
+/// `ReadyForQuery` は最後にちょうど 1 回。
 #[test]
-fn wire17_copy_as_non_first_statement_in_multi_statement_message_is_rejected_with_42601() {
+fn wire17_copy_from_stdin_as_last_statement_of_multi_statement_message_runs_copy_in() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice(core);
 
@@ -1029,23 +1024,73 @@ fn wire17_copy_as_non_first_statement_in_multi_statement_message_is_rejected_wit
         &mut stream,
         "SELECT id FROM docs LIMIT 1; COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'non-first'",
     );
-    // 1 文目（`SELECT id FROM docs LIMIT 1`）は通常どおり応答される
-    // （`docs` は空テーブルのため 0 行）。
     let _cols = read_row_description(&mut stream);
-    let tag1 = read_command_complete(&mut stream);
-    assert_eq!(tag1, "SELECT 0");
-    // 2 文目（`COPY ...`）が `42601` で打ち切られ、`ReadyForQuery` が続く。
-    expect_error_response_with_sqlstate(&mut stream, "42601");
-    read_ready_for_query(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    let ncols = read_copy_in_response(&mut stream);
+    assert_eq!(ncols, 3);
+    send_copy_data(&mut stream, b"7\t[1.0,0.0]\tja\n");
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    // デシンクしていなければ後続クエリは通常どおり処理される。
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
     let _cols = read_row_description(&mut stream);
-    let tag = read_command_complete(&mut stream);
-    assert_eq!(
-        tag, "SELECT 0",
-        "rejected COPY must not have inserted any row"
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("7"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// (4) `COPY (SELECT ...) TO STDOUT; SELECT 1`（Issue #1175）: `COPY ... TO` は読み取り
+/// なので逐次実行され、CopyOut の応答の後に続きの文の応答が届く。`ReadyForQuery` は
+/// 最後の文の後に 1 回だけ。
+#[test]
+fn wire17_copy_to_stdout_followed_by_select_responds_in_order() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[1.0,0.0]', 'ja') USING OPERATION_ID 'to-then-select'",
     );
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY (SELECT id FROM docs LIMIT 100) TO STDOUT; SELECT id FROM docs LIMIT 1",
+    );
+    let ncols = read_copy_out_response(&mut stream);
+    assert_eq!(ncols, 1);
+    assert_eq!(read_copy_data(&mut stream), b"1\n");
+    read_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    let _cols = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("1"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// (5) `INSERT ...; COPY ... FROM STDIN`（Issue #1175）: 暗黙トランザクション内の COPY は
+/// 未対応（`0A000`）。先行する INSERT の応答は届くが、INSERT もロールバックされる。
+#[test]
+fn wire17_insert_then_copy_from_stdin_is_rejected_and_rolled_back() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[1.0,0.0]', 'ja') USING OPERATION_ID 'ins-then-copy'; \
+         COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-after-insert'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _cols = read_row_description(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
     read_ready_for_query(&mut stream);
 }
 /// Issue #1177（WIRE-17）: psql `\copy` が実際に送出する COPY 文の形状
