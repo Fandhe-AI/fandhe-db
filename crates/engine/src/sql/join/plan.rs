@@ -823,6 +823,20 @@ fn build_plain_shape(
                 });
             }
         }
+        JoinProjection::Aliased(items) => {
+            for (colref, alias) in items {
+                let c = b.col(colref)?;
+                let mut meta = Binder::meta(&c);
+                if let (Some(a), ColumnMeta::Scalar { name, .. }) = (alias, &mut meta) {
+                    *name = a.clone();
+                }
+                output.push(OutputColumn {
+                    rel: c.rel,
+                    pos: c.pos,
+                    meta,
+                });
+            }
+        }
     }
     let mut order: Vec<PlainOrder> = Vec::with_capacity(validated.order_by.len());
     for key in &validated.order_by {

@@ -222,8 +222,18 @@ fn join_step(
         }
     }
 
-    let unmatched_acc = matched_acc.iter().filter(|&&m| !m).count();
-    let unmatched_new = matched_new.iter().filter(|&&m| !m).count();
+    // 未一致行は保存側（preserve_*）だけ数える。非保存側は NULL 補完行を出さないため、
+    // 総数へ加算すると 0 一致の INNER JOIN が誤って上限超過になる。
+    let unmatched_acc = if step.preserve_acc {
+        matched_acc.iter().filter(|&&m| !m).count()
+    } else {
+        0
+    };
+    let unmatched_new = if step.preserve_new {
+        matched_new.iter().filter(|&&m| !m).count()
+    } else {
+        0
+    };
 
     // 合計カーディナリティ（NULL 補完行を含む）を実体化する前に判定する。
     let total = pairs

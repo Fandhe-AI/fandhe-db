@@ -196,6 +196,7 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
 （3 テーブル以上の連鎖・集計・`GROUP BY`・スカラー `ORDER BY`・WHERE の `OR`／`IN`／列同士の
 比較は Issue #1190 で受理対象になった。`docs/design/multi-way-join.md` 参照。本書の `where_conjuncts`・
 `parse_join_where_conjuncts` は同 Issue で `where_clause`〔論理木〕・`parse_join_where` に置き換わった）
+
 - JOIN を含む VIEW・CTE・集合演算の枝・サブクエリ・`EXPLAIN`・カーソル・`COPY`
 - `$n` パラメータ付きの JOIN（`where_equality_literal_is_param` は `Ident '='` の形しか
   数えず、2 つの側へ分かれるプッシュダウンでのフラグ対応付けが保証できないため）

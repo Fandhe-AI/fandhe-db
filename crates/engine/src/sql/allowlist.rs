@@ -1536,6 +1536,9 @@ pub enum Statement {
 pub enum JoinProjection {
     All,
     Columns(Vec<ColumnRef>),
+    /// `AS` 別名付きの列参照だけを並べた非集計形（集計項目・`GROUP BY`・`HAVING` なし）。
+    /// 別名は出力列名になる（Issue #1190）。
+    Aliased(Vec<(ColumnRef, Option<String>)>),
 }
 
 /// JOIN の `WHERE` 句が受理する 1 述語の葉（Issue #925 §2.1・Issue #1190）。
@@ -7351,7 +7354,8 @@ impl<'a> Parser<'a> {
 /// JOIN の SELECT リスト（Issue #925・#1190）。`*`・列参照の並び（非集計形）、
 /// または集計項目（`COUNT(*)`・`F(colref)`）を 1 つ以上含む並び（集計形）を
 /// 判別する。戻り値の第 2 要素は「項目列をそのまま保持する必要がある」ときの
-/// 項目列（集計項目を含む、または `AS` 付きの列がある）。それ以外は `None`。
+/// 項目列（集計項目を含む）。別名だけの列は `JoinProjection::Aliased`、それ以外は
+/// `Columns` で、いずれも `None`。
 fn parse_join_select_list(
     p: &mut Parser<'_>,
 ) -> Result<(JoinProjection, Option<Vec<JoinSelectItem>>), SqlSurfaceError> {
@@ -7387,8 +7391,20 @@ fn parse_join_select_list(
         }
         break;
     }
-    if has_aggregate || any_alias {
+    if has_aggregate {
         return Ok((JoinProjection::Columns(Vec::new()), Some(items)));
+    }
+    if any_alias {
+        // 集計項目を持たない別名付き列は非集計形のまま保持する（`GROUP BY`／`HAVING` の
+        // 有無は呼び出し側が判定する）。
+        let cols = items
+            .into_iter()
+            .filter_map(|it| match it {
+                JoinSelectItem::Key { column, alias } => Some((column, alias)),
+                JoinSelectItem::Aggregate { .. } => None,
+            })
+            .collect();
+        return Ok((JoinProjection::Aliased(cols), None));
     }
     let cols = items
         .into_iter()
@@ -7860,8 +7876,8 @@ fn parse_join_statement(
     let group_by = parse_join_group_by(&mut p)?;
     let having = parse_join_having(&mut p)?;
 
-    // 集計形かどうか: SELECT リストに集計項目がある、`AS` 付き列がある、または
-    // `GROUP BY`／`HAVING` がある。
+    // 集計形かどうか: SELECT リストに集計項目がある、または `GROUP BY`／`HAVING` が
+    // ある。`AS` 付き列だけの並びは非集計形（`JoinProjection::Aliased`）のまま扱う。
     let has_group_by = !group_by.is_empty();
     let aggregate = match select_items {
         Some(items) => Some(Box::new(JoinAggregate {
@@ -7872,8 +7888,9 @@ fn parse_join_statement(
         None if has_group_by || !having.is_empty() => {
             // 集計項目を持たない `GROUP BY`（重複排除相当）。SELECT リストの列参照を
             // キー項目として保持する。
-            let cols = match &projection {
-                JoinProjection::Columns(cols) => cols.clone(),
+            let cols: Vec<(ColumnRef, Option<String>)> = match &projection {
+                JoinProjection::Columns(cols) => cols.iter().map(|c| (c.clone(), None)).collect(),
+                JoinProjection::Aliased(cols) => cols.clone(),
                 JoinProjection::All => {
                     return Err(SqlSurfaceError::unsupported(
                         "SELECT * cannot be combined with GROUP BY in JOIN",
@@ -7882,10 +7899,7 @@ fn parse_join_statement(
             };
             let items = cols
                 .into_iter()
-                .map(|column| JoinSelectItem::Key {
-                    column,
-                    alias: None,
-                })
+                .map(|(column, alias)| JoinSelectItem::Key { column, alias })
                 .collect();
             Some(Box::new(JoinAggregate {
                 items,
@@ -15601,6 +15615,24 @@ mod tests {
                 assert_eq!(**rhs, Expr::Null);
             }
             other => panic!("expected SelectItem::Expr(NullIf), got {other:?}"),
+        }
+    }
+
+    /// Issue #1190: 別名だけを持つ非集計形の JOIN 投影は集計形へ倒さず受理する。
+    #[test]
+    fn join_alias_only_select_list_is_plain_projection() {
+        let lookup = catalog_with(&["a", "b"]);
+        let stmt = validate_sql(
+            "SELECT a.x AS x FROM a JOIN b ON a.id = b.id LIMIT 1",
+            &lookup,
+        )
+        .expect("alias-only JOIN select list should be accepted");
+        match stmt {
+            Statement::Join(v) => {
+                assert!(v.aggregate.is_none());
+                assert!(matches!(v.projection, JoinProjection::Aliased(_)));
+            }
+            other => panic!("expected Join, got {other:?}"),
         }
     }
 
