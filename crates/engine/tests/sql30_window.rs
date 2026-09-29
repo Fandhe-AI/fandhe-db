@@ -863,22 +863,227 @@ fn rejects_group_by_combined_with_window() {
     );
 }
 
+/// ORDER BY なしの同一文から `(id, ウィンドウ値)` を作るオラクル（Issue #1189）。
+fn window_oracle(core: &EngineCore, ctx: &PolicyContext, window_sql: &str) -> Vec<(u64, u64)> {
+    let result = expect_query(core.execute_sql(ctx, window_sql));
+    result
+        .rows
+        .iter()
+        .map(|r| (cell_int(&r.cells[0]), cell_int(&r.cells[1])))
+        .collect()
+}
+
 #[test]
-fn rejects_order_by_combined_with_window() {
-    let path = unique_db_path("window-reject-order-by");
+fn accepts_scalar_order_by_with_window_and_matches_oracle() {
+    // Issue #1189・SQL-25・SQL-30: 文全体のスカラー ORDER BY をウィンドウ関数と
+    // 併用できる。ウィンドウ値は全母集合で決まり、ORDER BY は出力順だけを決める。
+    let path = unique_db_path("window-scalar-order-by");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
     let ctx = ctx_for("tenant-a");
     seed_basic(&storage, &ctx);
     let core = new_core(storage);
 
-    // 非 window の検索 SELECT は VECTOR 列を要求するため、ここでは構文段で
-    // ウィンドウ項目＋通常の ORDER BY 併用が `42601` になることのみを固定する
-    // （テーブルに VECTOR 列が無くても構文検証はテーブル存在確認の前に走る）。
+    let oracle: std::collections::HashMap<u64, u64> = window_oracle(
+        &core,
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score, id) AS rn FROM docs LIMIT 100",
+    )
+    .into_iter()
+    .collect();
+
+    let ordered = expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score, id) AS rn FROM docs ORDER BY score DESC LIMIT 100",
+    ));
+    let ids: Vec<u64> = ordered.rows.iter().map(|r| cell_int(&r.cells[0])).collect();
+    assert_eq!(ids, vec![2, 3, 5, 6, 1, 4]);
+    for row in &ordered.rows {
+        let id = cell_int(&row.cells[0]);
+        assert_eq!(
+            cell_int(&row.cells[1]),
+            oracle[&id],
+            "window value of id {id}"
+        );
+    }
+
+    // LIMIT/OFFSET はソート後の順序に対して適用され、ウィンドウ値は不変。
+    let page = expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score, id) AS rn FROM docs ORDER BY score DESC LIMIT 2 OFFSET 1",
+    ));
+    let ids: Vec<u64> = page.rows.iter().map(|r| cell_int(&r.cells[0])).collect();
+    assert_eq!(ids, vec![3, 5]);
+    for row in &page.rows {
+        let id = cell_int(&row.cells[0]);
+        assert_eq!(cell_int(&row.cells[1]), oracle[&id]);
+    }
+
+    // 複数キー・DESC の混在、SUM ウィンドウ併用。
+    let multi = expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, SUM(score) OVER (PARTITION BY lang) AS s FROM docs ORDER BY lang DESC, id DESC LIMIT 100",
+    ));
+    let ids: Vec<u64> = multi.rows.iter().map(|r| cell_int(&r.cells[0])).collect();
+    assert_eq!(ids, vec![3, 2, 1, 6, 5, 4]);
+    for row in &multi.rows {
+        let id = cell_int(&row.cells[0]);
+        let expected = if id <= 3 { 50 } else { 35 };
+        assert_eq!(cell_signed(&row.cells[1]), expected);
+    }
+
+    // ORDER BY id（先頭キー id）でも同じ結果になる。
+    let by_id = expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score, id) AS rn FROM docs ORDER BY id DESC LIMIT 100",
+    ));
+    let ids: Vec<u64> = by_id.rows.iter().map(|r| cell_int(&r.cells[0])).collect();
+    assert_eq!(ids, vec![6, 5, 4, 3, 2, 1]);
+    for row in &by_id.rows {
+        let id = cell_int(&row.cells[0]);
+        assert_eq!(cell_int(&row.cells[1]), oracle[&id]);
+    }
+}
+
+#[test]
+fn scalar_order_by_key_column_not_in_projection_is_decoded() {
+    // ORDER BY のキー列が投影・ウィンドウのどちらにも現れなくても、
+    // デコード段のマスクに含まれて正しく並ぶ（NULL 扱いにならない）。
+    let path = unique_db_path("window-order-by-hidden-key");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_basic(&storage, &ctx);
+    let core = new_core(storage);
+
+    let result = expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER () AS rn FROM docs ORDER BY score, id LIMIT 100",
+    ));
+    let ids: Vec<u64> = result.rows.iter().map(|r| cell_int(&r.cells[0])).collect();
+    assert_eq!(ids, vec![4, 1, 5, 6, 2, 3]);
+}
+
+#[test]
+fn scalar_order_by_with_window_keeps_row_and_value_pairing_when_ids_collide() {
+    // 2 テナントが同じ id・同じキー値の Public 行を持つ場合、比較器のタイブレーク
+    // （id → tenant_id）により行順とウィンドウ値の対応が決定的に保たれる。
+    let path = unique_db_path("window-order-by-tenant-tie");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx_a = ctx_for("tenant-a");
+    let ctx_b = ctx_for("tenant-b");
+    insert_row(&storage, &ctx_a, 1, "ja", 50);
+    insert_row(&storage, &ctx_b, 1, "ja", 50);
+    insert_row(&storage, &ctx_a, 2, "ja", 10);
+    let core = new_core(storage);
+
+    // rn はウィンドウ側の物理走査順タイブレーク（tenant-a の行が先）で決まる。
+    // 行順は score 降順 → id 昇順 → tenant バイト順で、同点の 2 行は rn 1, 2。
+    for _ in 0..3 {
+        let result = expect_query(core.execute_sql(
+            &ctx_a,
+            "SELECT id, score, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM docs ORDER BY score DESC LIMIT 10",
+        ));
+        let got: Vec<(u64, i64, u64)> = result
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    cell_int(&r.cells[0]),
+                    cell_signed(&r.cells[1]),
+                    cell_int(&r.cells[2]),
+                )
+            })
+            .collect();
+        assert_eq!(got, vec![(1, 50, 1), (1, 50, 2), (2, 10, 3)]);
+    }
+}
+
+#[test]
+fn scalar_order_by_with_window_is_invariant_to_other_tenants_private_rows() {
+    let ctx_a = ctx_for("tenant-a");
+    let ctx_b = ctx_for("tenant-b");
+    let sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY score) AS rn FROM docs ORDER BY score DESC LIMIT 10";
+
+    let path1 = unique_db_path("window-order-by-rls-a-only");
+    let _guard1 = CleanupGuard(path1.clone());
+    let storage1 = open_storage(&path1);
+    seed_basic(&storage1, &ctx_a);
+    let core1 = new_core(storage1);
+    let a_only = window_oracle(&core1, &ctx_a, sql);
+
+    let path2 = unique_db_path("window-order-by-rls-a-and-b");
+    let _guard2 = CleanupGuard(path2.clone());
+    let storage2 = open_storage(&path2);
+    seed_basic(&storage2, &ctx_a);
+    for id in 1..=30u64 {
+        insert_row_with_visibility(
+            &storage2,
+            &ctx_b,
+            id,
+            "ja",
+            (id % 9) as i32,
+            Visibility::Private,
+        );
+    }
+    let core2 = new_core(storage2);
+    let a_and_b = window_oracle(&core2, &ctx_a, sql);
+
+    assert_eq!(a_only.len(), 6);
+    assert_eq!(a_only, a_and_b);
+}
+
+#[test]
+fn scalar_order_by_with_window_rejects_unsupported_combinations() {
+    let path = unique_db_path("window-order-by-reject");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_basic(&storage, &ctx);
+    let core = new_core(storage);
+
+    // ベクトル順位付けとの併用。
     expect_rejected(
         &core,
         &ctx,
-        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score LIMIT 10",
+        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY embedding <=> [1.0, 2.0] LIMIT 10",
+        "42601",
+    );
+    // ウィンドウ別名による文全体の ORDER BY。
+    expect_rejected(
+        &core,
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER () AS rn FROM docs ORDER BY rn LIMIT 10",
+        "42601",
+    );
+    // NULLS LAST は未対応。
+    expect_rejected(
+        &core,
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score NULLS LAST LIMIT 10",
+        "42601",
+    );
+    // 未知列。
+    expect_rejected(
+        &core,
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY nope LIMIT 10",
+        "22000",
+    );
+    // キー 9 個。
+    expect_rejected(
+        &core,
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score, score, score, score, score, score, score, score, score LIMIT 10",
+        "54000",
+    );
+    // EXPLAIN とウィンドウの併用は ORDER BY 付きでも 42601 のまま。
+    expect_rejected(
+        &core,
+        &ctx,
+        "EXPLAIN SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score LIMIT 10",
         "42601",
     );
 }

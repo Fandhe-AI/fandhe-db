@@ -539,23 +539,88 @@ fn unsupported_order_by_forms_are_rejected_with_42601() {
     expect_sqlstate(&core, &ctx, "SELECT id FROM docs ORDER BY lang", "42601");
 }
 
-/// `EXPLAIN` はスカラー ORDER BY 付き広域取得も前置として受理しない
-/// （既存の「`USING PLAN` を伴う検索 SELECT のみ」契約の維持）。
+/// `EXPLAIN` はスカラー ORDER BY 付き広域取得を受理する（Issue #1189。本体は
+/// 実行せず、固定の 2 行〔`scalar_plan`・`access_path`〕を返す）。セッションなしの
+/// 入口（`execute_sql`）は従来どおり `EXPLAIN` 全般を 42601 で拒否する。
 #[test]
-fn explain_rejects_scalar_order_by_scan() {
-    let path = unique_db_path("order-reject-explain");
+fn explain_accepts_scalar_order_by_scan_in_session() {
+    let path = unique_db_path("order-explain-accept");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
     storage.create_table(&schema()).expect("create table");
     let ctx = ctx_for("tenant-a");
+    insert_row(&storage, &ctx, 1, Visibility::Public, Some("a"), Some(1));
     let core = new_core(storage);
 
+    let expected = vec![
+        "scalar_plan: plain_scan".to_string(),
+        "access_path: full_scan".to_string(),
+    ];
+    for sql in [
+        "EXPLAIN SELECT id FROM docs ORDER BY lang LIMIT 5",
+        "EXPLAIN SELECT id FROM docs ORDER BY lang DESC, id LIMIT 5 OFFSET 2",
+        "EXPLAIN SELECT id FROM docs WHERE score = 1 ORDER BY score LIMIT 5",
+        "EXPLAIN SELECT id FROM docs ORDER BY id LIMIT 5",
+    ] {
+        let mut session = engine::sql::mode::SessionState::default();
+        let outcome = core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must be accepted: {e:?}"));
+        match outcome {
+            engine::sql::SqlOutcome::Explain(result) => {
+                let lines: Vec<String> = result
+                    .rows
+                    .iter()
+                    .map(|r| match &r.cells[0] {
+                        engine::sql::exec::Cell::Text(t) => t.clone(),
+                        other => panic!("expected Cell::Text, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(lines, expected, "sql={sql}");
+            }
+            other => panic!("expected Explain for {sql}, got {other:?}"),
+        }
+    }
+
+    // セッションなしの入口は EXPLAIN を受け付けない（入口の契約）。
     expect_sqlstate(
         &core,
         &ctx,
         "EXPLAIN SELECT id FROM docs ORDER BY lang LIMIT 5",
         "42601",
     );
+}
+
+/// `EXPLAIN` の有無で検証エラーの `wire_code` が変わらない（Issue #1189）。
+#[test]
+fn explain_error_codes_match_non_explain() {
+    let path = unique_db_path("order-explain-error-parity");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx = ctx_for("tenant-a");
+    let core = new_core(storage);
+
+    for (body, code) in [
+        ("SELECT id FROM docs ORDER BY nope LIMIT 5", "22000"),
+        ("SELECT id FROM docs ORDER BY embedding LIMIT 5", "22000"),
+        (
+            "SELECT id FROM docs ORDER BY score, score, score, score, score, score, score, score, score LIMIT 5",
+            "54000",
+        ),
+        ("SELECT id FROM docs ORDER BY lang NULLS LAST LIMIT 5", "42601"),
+        ("SELECT id FROM missing ORDER BY lang LIMIT 5", "42P01"),
+    ] {
+        let plain = core
+            .execute_sql(&ctx, body)
+            .expect_err(&format!("{body} must be rejected"));
+        assert_eq!(plain.wire_code(), code, "plain sql={body}");
+        let mut session = engine::sql::mode::SessionState::default();
+        let explained = core
+            .execute_sql_in_session(&ctx, &mut session, &format!("EXPLAIN {body}"))
+            .expect_err(&format!("EXPLAIN {body} must be rejected"));
+        assert_eq!(explained.wire_code(), code, "explain sql={body}");
+    }
 }
 
 /// 未知列・`VECTOR` 列は `22000`。

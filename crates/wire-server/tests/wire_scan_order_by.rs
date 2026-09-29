@@ -140,3 +140,23 @@ fn unknown_order_by_column_rejects_with_22000() {
     expect_error_response_with_sqlstate(&mut stream, "22000");
     read_ready_for_query(&mut stream);
 }
+/// Issue #1189: スカラー `ORDER BY` 付き広域取得の `EXPLAIN` は本体を実行せず
+/// `QUERY PLAN` 2 行を返す。
+#[test]
+fn explain_scalar_order_by_scan_returns_plan_rows_over_wire() {
+    let (core, _guard) = new_core_scan_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN SELECT id FROM docs ORDER BY lang LIMIT 5",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN"]);
+    let first = read_data_row(&mut stream);
+    let second = read_data_row(&mut stream);
+    assert_eq!(first[0].as_deref(), Some("scalar_plan: plain_scan"));
+    assert_eq!(second[0].as_deref(), Some("access_path: full_scan"));
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+}
