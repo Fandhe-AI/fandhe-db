@@ -2425,9 +2425,10 @@ pub struct ValidatedTruncate {
 /// とは異なり `operation_id` を保持しない。SQL-23 の DDL は台帳〔TASK-93〕の
 /// 対象外）。
 ///
-/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` のみ
-/// （`IF NOT EXISTS`・複数 `ADD`・列制約〔`NOT NULL`／`DEFAULT`／`PRIMARY KEY`
-/// 等〕・`RETURNING`・`USING OPERATION_ID` の
+/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [NOT NULL]
+/// [DEFAULT <literal>] [;]`（列制約は順不同・各 1 回まで。Issue #1169）のみ
+/// （`IF NOT EXISTS`・複数 `ADD`・列制約 `UNIQUE`／`PRIMARY KEY`／`REFERENCES`／
+/// `CHECK`・`RETURNING`・`USING OPERATION_ID` の
 /// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
 /// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
 /// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
@@ -2439,6 +2440,13 @@ pub struct ValidatedAlterTableAddColumn {
     /// 型名の構文木。意味づけ（ENUM 型名の存在確認・`ColumnType` への変換）は
     /// `sql::ddl::execute_alter_table_add_column` の責務。
     pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    /// `NOT NULL` 句の有無（Issue #1169）。`DEFAULT` を伴わない `NOT NULL` は
+    /// 構造検証段階で `42601` 拒否済みのため、`true` なら `default` は常に `Some`。
+    pub not_null: bool,
+    /// `DEFAULT <literal>` のリテラル（Issue #1169）。列型との整合・値の束縛は
+    /// カタログ照会を要するため実行段（`sql::ddl::execute_alter_table_add_column`）
+    /// が行う。
+    pub default: Option<InsertLiteral>,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE
@@ -5184,11 +5192,30 @@ impl<'a> Parser<'a> {
                     self.tokens,
                     &mut self.pos,
                 )?;
+                // 列制約（Issue #1169）。`UNIQUE` は追加列では受け付けない（`ALTER
+                // TABLE ADD UNIQUE` 形を使う）。`PRIMARY KEY`／`REFERENCES`／`CHECK`
+                // は後続の `expect_end_of_statement` が `42601` で拒否する。
+                let constraints = self.parse_column_constraints()?;
+                if constraints.unique {
+                    return Err(SqlSurfaceError::unsupported(
+                        "UNIQUE is not supported in ALTER TABLE ADD COLUMN",
+                    ));
+                }
+                // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
+                // （TABLE-16）。カタログ・行を参照しない構造判定のため、存在オラクル・
+                // 他テナント行の有無の判別手段にならない。
+                if constraints.not_null && constraints.default.is_none() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "NOT NULL in ALTER TABLE ADD COLUMN requires a DEFAULT",
+                    ));
+                }
                 return Ok(ParsedAlterTableShape::AddColumn(
                     ParsedAlterTableAddColumnShape {
                         table_name,
                         column_name,
                         column_type,
+                        not_null: constraints.not_null,
+                        default: constraints.default,
                     },
                 ));
             }
@@ -6668,6 +6695,8 @@ struct ParsedAlterTableAddColumnShape {
     table_name: String,
     column_name: String,
     column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+    not_null: bool,
+    default: Option<InsertLiteral>,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
@@ -8872,6 +8901,8 @@ pub fn validate_alter_table_tokens(
                 table_name: shape.table_name,
                 column_name: shape.column_name,
                 column_type: shape.column_type,
+                not_null: shape.not_null,
+                default: shape.default,
             })
         }
         ParsedAlterTableShape::AddUnique {

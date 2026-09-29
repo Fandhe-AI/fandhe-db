@@ -224,10 +224,10 @@ fn table5_alter_table_add_column_preserves_existing_row_bytes() {
 }
 
 #[test]
-fn table5_alter_table_add_column_rejects_not_nullable() {
-    // 追加列は nullable であることを要求し、`nullable: false` は fail-closed に
-    // 拒否する（TABLE-5）。
-    let path = unique_db_path("table5-reject-not-nullable");
+fn table5_alter_table_add_column_rejects_not_null_without_default_regardless_of_rows() {
+    // `DEFAULT` なしの `NOT NULL` は行の有無にかかわらず一律 `Invalid` で拒否する
+    // （TABLE-16。行の有無で成否が変わると他テナントの行の存在が漏れるため）。
+    let path = unique_db_path("table5-not-null-uniform");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
@@ -235,16 +235,58 @@ fn table5_alter_table_add_column_rejects_not_nullable() {
         .create_table(&embedding_schema("docs", 8))
         .expect("create_table");
 
-    let result =
-        storage.alter_table_add_column("docs", ColumnDef::new("tag", ColumnType::Text, false));
+    let err = storage
+        .alter_table_add_column("docs", ColumnDef::new("tag", ColumnType::Text, false))
+        .expect_err("NOT NULL without DEFAULT must be rejected");
+    assert!(matches!(err, CatalogError::Invalid(_)), "got {err:?}");
+    let schema = storage.get_table_schema("docs").expect("get_table_schema");
+    assert!(schema.columns.iter().all(|c| c.name != "tag"));
+}
+
+#[test]
+fn table5_alter_table_add_column_rejects_unbindable_default() {
+    // 束縛できない DEFAULT はカタログへ永続化しない（既存行の読み出しが常に
+    // 失敗する状態を作らない。Issue #1169）。
+    let path = unique_db_path("table5-unbindable-default");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&embedding_schema("docs", 8))
+        .expect("create_table");
+
+    let bad = ColumnDef::new("n", ColumnType::Integer, true)
+        .with_default(engine::catalog::ColumnDefault::Number("abc".to_string()));
+    let result = storage.alter_table_add_column("docs", bad);
     assert!(
         matches!(result, Err(CatalogError::Invalid(_))),
-        "expected Err for nullable=false, got {result:?}"
+        "expected Invalid, got {result:?}"
     );
-
-    // 拒否されたので列は増えていないこと。
     let schema = storage.get_table_schema("docs").expect("get_table_schema");
-    assert!(!schema.columns.iter().any(|c| c.name == "tag"));
+    assert!(!schema.columns.iter().any(|c| c.name == "n"));
+}
+
+#[test]
+fn table5_alter_table_add_column_with_default_preserves_existing_row_bytes() {
+    // DEFAULT 付きでも既存行のバイト列は書き換えない（読み出し時補完。Issue #1169）。
+    let path = unique_db_path("table5-default-rows-preserved");
+    let _guard = CleanupGuard(path.clone());
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        seed_rows(&storage, 200);
+        storage
+            .create_table(&embedding_schema("docs", 8))
+            .expect("create_table");
+    }
+    let before = read_raw_rows(&path);
+    {
+        let storage = Storage::open(&path).expect("reopen storage");
+        let col = ColumnDef::new("tag", ColumnType::Text, false)
+            .with_default(engine::catalog::ColumnDefault::Text("x".to_string()));
+        storage
+            .alter_table_add_column("docs", col)
+            .expect("alter_table_add_column with DEFAULT");
+    }
+    assert_eq!(before, read_raw_rows(&path));
 }
 
 #[test]

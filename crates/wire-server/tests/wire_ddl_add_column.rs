@@ -114,6 +114,23 @@ fn wire_ddl_principal_can_alter_table_and_receives_command_complete() {
     read_ready_for_query(&mut stream);
 }
 
+/// `NOT NULL`／`DEFAULT` 付きの ADD COLUMN は受理される（Issue #1169）。
+#[test]
+fn wire_add_column_with_not_null_and_default_receives_command_complete() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for sql in [
+        "ALTER TABLE docs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ja'",
+        "ALTER TABLE docs ADD COLUMN n INTEGER DEFAULT 3",
+    ] {
+        send_simple_query(&mut stream, sql);
+        let tag = read_command_complete(&mut stream);
+        assert_eq!(tag, "ALTER TABLE", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+}
+
 #[test]
 fn wire_added_column_is_selectable_over_the_same_wire_session() {
     let (core, _guard) = new_core_with_docs_table();
@@ -211,7 +228,11 @@ fn wire_malformed_syntax_is_rejected_with_42601() {
     for sql in [
         "ALTER TABLE docs ADD note TEXT",
         "ALTER TABLE docs ADD COLUMN IF NOT EXISTS note TEXT",
-        "ALTER TABLE docs ADD COLUMN note TEXT NOT NULL",
+        // 列制約のうち `UNIQUE`／`DEFAULT NULL`／リテラル種別不一致は引き続き拒否する
+        // （`NOT NULL`／`DEFAULT <literal>` は Issue #1169 で受理）。
+        "ALTER TABLE docs ADD COLUMN note TEXT UNIQUE",
+        "ALTER TABLE docs ADD COLUMN note TEXT DEFAULT NULL",
+        "ALTER TABLE docs ADD COLUMN note TEXT DEFAULT 1",
         // `DROP COLUMN embedding` は VECTOR 列保護（Issue #1167 以降）で 42601。
         "ALTER TABLE docs DROP COLUMN embedding",
         "ALTER TABLE docs ADD COLUMN note TEXT USING OPERATION_ID 'op-1'",
