@@ -38,7 +38,8 @@
 //!   チャンクごとの `WherePredicate::InList`（既存評価器の集合照合＝ソート済み
 //!   `Vec` の二分探索）を `Or` に束ねる。取り込める distinct 値の総数は
 //!   [`MAX_SUBQUERY_IN_VALUES`]（文全体で共有する `&mut usize` 予算）で頭打ちに
-//!   し、distinct 化の後・チャンク（`InList`）構築の前に一括で検査する（収集 Vec は内側結果行数 ≤ `MAX_SEARCH_K` で有界）（Issue #1165。旧方式は
+//!   し、distinct 化の後・チャンク（`InList`）構築の前に一括で検査する。収集 Vec
+//!   は内側結果行数 ≤ `MAX_SEARCH_K` で有界（Issue #1165。旧方式は
 //!   値ごとの `Equality` 葉を 256 個までしか許さず、評価も葉数に比例した。
 //!   PR #1103 codex-review P1 指摘対応の趣旨〔サブクエリ経由の展開が通常の
 //!   `WHERE` 句より大きな評価コストを発生させない〕は、評価コストを分岐数
@@ -90,7 +91,7 @@ pub(crate) const MAX_SUBQUERY_EXECUTIONS: usize = 16;
 /// 値は [`crate::declarative_filter::MAX_IN_LIST_ITEMS`] 件ずつのチャンクへ
 /// 分割し、各チャンクを既存の `InList`（束縛時にソート・重複除去済みの
 /// `FilterOp::InText`、評価は二分探索）へ束縛するため、1 行あたりの評価コストは
-/// 「分岐数 ×  O(log 256)」で、旧方式（distinct 値ごとの `Equality` 葉を線形に
+/// 「分岐数 × O(log 256)」で、旧方式（distinct 値ごとの `Equality` 葉を線形に
 /// 走査）の O(値数) より小さい。内側 1 回の可視行数は既に
 /// [`crate::core::MAX_SEARCH_K`] で頭打ちのため、単一の `IN` サブクエリは
 /// この上限に到達しない（複数の `IN` の distinct 合計のみが上限に効く）。
@@ -112,7 +113,7 @@ pub(crate) const MAX_SUBQUERY_IN_VALUES: usize = crate::core::MAX_SEARCH_K;
 /// `budget` は呼び出し階層全体（ネストしたサブクエリを含む）で共有する残り
 /// 実行回数。呼び出し元は [`MAX_SUBQUERY_EXECUTIONS`] で初期化する。
 /// `in_value_budget` も同様に呼び出し階層全体で共有する、`IN` 展開で生成
-/// できる残り葉数。呼び出し元は [`MAX_SUBQUERY_IN_VALUES`] で初期化する。
+/// できる残り distinct 値数。呼び出し元は [`MAX_SUBQUERY_IN_VALUES`] で初期化する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_where_predicates(
     predicates: Vec<WherePredicate>,
