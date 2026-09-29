@@ -284,19 +284,121 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         // 衝突しない単射なハッシュ入力にする。
         Value::Array(array_value) => {
             b.push_u8(10);
+            // NULL 要素を含む配列（Issue #1193）は要素型タグへ 0x80 を立て、要素ごとに
+            // presence バイトを積む。NULL を含まない配列は従来と同一のバイト列
+            // （要素型タグ 0・1 の TEXT／BOOLEAN は不変）で、`{NULL}` と `{}`・
+            // `{NULL}` と `{"NULL"}` が衝突しない単射性を保つ。
+            let has_null = array_value.has_null();
+            let mark: u8 = if has_null { 0x80 } else { 0 };
             match array_value {
                 crate::row_codec::ArrayValue::Text(items) => {
-                    b.push_u8(0); // 要素型タグ: TEXT
+                    b.push_u8(mark); // 要素型タグ: TEXT
                     b.push_u64(items.len() as u64);
                     for item in items {
-                        b.push_bytes(item.as_bytes())?;
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_bytes(item.as_bytes())?;
+                        }
                     }
                 }
                 crate::row_codec::ArrayValue::Bool(items) => {
-                    b.push_u8(1); // 要素型タグ: BOOLEAN
+                    b.push_u8(1 | mark); // 要素型タグ: BOOLEAN
                     b.push_u64(items.len() as u64);
                     for item in items {
-                        b.push_u8(u8::from(*item));
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u8(u8::from(*item));
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Integer(items) => {
+                    b.push_u8(2 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(i64::from(*item) as u64);
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::BigInt(items) => {
+                    b.push_u8(3 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(*item as u64);
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Real(items) => {
+                    b.push_u8(4 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(u64::from(
+                                crate::scalar_float::canonicalize_real(*item).to_bits(),
+                            ));
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Double(items) => {
+                    b.push_u8(5 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(crate::scalar_float::canonicalize_double(*item).to_bits());
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Date(items) => {
+                    b.push_u8(6 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(i64::from(*item) as u64);
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Timestamp(items) => {
+                    b.push_u8(7 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(*item as u64);
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Uuid(items) => {
+                    b.push_u8(8 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_bytes(item.as_bytes())?;
+                        }
                     }
                 }
             }
@@ -1854,10 +1956,12 @@ mod tests {
     #[test]
     fn for_typed_insert_array_value_is_injective_and_deterministic() {
         let embedding = [1.0_f32, 2.0, 3.0];
-        let one_elem = Value::Array(crate::row_codec::ArrayValue::Text(vec!["ab".to_string()]));
+        let one_elem = Value::Array(crate::row_codec::ArrayValue::Text(vec![Some(
+            "ab".to_string(),
+        )]));
         let two_elems = Value::Array(crate::row_codec::ArrayValue::Text(vec![
-            "a".to_string(),
-            "b".to_string(),
+            Some("a".to_string()),
+            Some("b".to_string()),
         ]));
         let cols_one: [(&str, &Value); 1] = [("tags", &one_elem)];
         let cols_two: [(&str, &Value); 1] = [("tags", &two_elems)];
@@ -1874,10 +1978,49 @@ mod tests {
         assert_eq!(h_one, h_one_again);
 
         // 要素型が異なれば（同じ見た目の値でも）別ハッシュになること。
-        let bool_elems = Value::Array(crate::row_codec::ArrayValue::Bool(vec![true, false]));
+        let bool_elems = Value::Array(crate::row_codec::ArrayValue::Bool(vec![
+            Some(true),
+            Some(false),
+        ]));
         let cols_bool: [(&str, &Value); 1] = [("tags", &bool_elems)];
         let h_bool = for_typed_insert(7, Visibility::Public, &embedding, &cols_bool).expect("hash");
         assert_ne!(h_two, h_bool);
+    }
+
+    /// Issue #1193: NULL 要素を含む配列のハッシュ入力が単射であること
+    /// （`{NULL}`／`{}`／`{"NULL"}`／`{1,NULL}`／`{1}` が互いに衝突しない）。
+    #[test]
+    fn for_typed_insert_array_with_null_elements_is_injective() {
+        use crate::row_codec::ArrayValue as A;
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let hash = |v: A| {
+            let value = Value::Array(v);
+            let cols: [(&str, &Value); 1] = [("tags", &value)];
+            for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash")
+        };
+        let hashes = [
+            hash(A::Text(vec![None])),
+            hash(A::Text(vec![])),
+            hash(A::Text(vec![Some("NULL".to_string())])),
+            hash(A::Text(vec![Some(String::new())])),
+            hash(A::Text(vec![Some("a".to_string()), None])),
+            hash(A::Text(vec![None, Some("a".to_string())])),
+            hash(A::Integer(vec![Some(1), None])),
+            hash(A::Integer(vec![Some(1)])),
+            hash(A::Integer(vec![None])),
+            hash(A::BigInt(vec![Some(1), None])),
+            hash(A::Uuid(vec![None])),
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in hashes.iter().skip(i + 1) {
+                assert_ne!(a, b, "array hash inputs must not collide");
+            }
+        }
+        // 同一内容は同一ハッシュ（決定性）。
+        assert_eq!(
+            hash(A::Integer(vec![Some(1), None])),
+            hash(A::Integer(vec![Some(1), None]))
+        );
     }
 
     // Issue #771: `for_typed_insert_batch` は要求記載順を入力に含めるため、

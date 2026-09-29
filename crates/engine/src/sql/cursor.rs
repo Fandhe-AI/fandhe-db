@@ -297,12 +297,7 @@ fn estimate_cell_bytes(cell: &Cell) -> usize {
 }
 
 fn estimate_array_bytes(arr: &crate::row_codec::ArrayValue) -> usize {
-    match arr {
-        crate::row_codec::ArrayValue::Text(v) => v.iter().fold(8usize, |acc, s| {
-            acc.saturating_add(s.len()).saturating_add(8)
-        }),
-        crate::row_codec::ArrayValue::Bool(v) => v.len().saturating_add(8),
-    }
+    arr.approx_heap_bytes().saturating_add(8)
 }
 
 fn estimate_result_bytes(result: &QueryResult) -> usize {

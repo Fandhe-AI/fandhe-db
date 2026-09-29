@@ -113,6 +113,18 @@ pub enum FilterOp {
         low: TypedLiteral,
         high: TypedLiteral,
     },
+    /// 配列列の等価条件（TABLE-14・Issue #1193）。右辺リテラルは `bind` 時に列の
+    /// [`crate::catalog::ArrayType`] で解析済み（NULL 要素どうしは等しい。
+    /// PostgreSQL の `array_eq` と同じ）。二次索引は対応せず PlainScan へ縮退する。
+    ArrayEquals(ArrayKey),
+    /// 配列列の `IN`（Issue #1193）。要素数は [`MAX_IN_LIST_ITEMS`] で上限済み。
+    InArray(Vec<ArrayKey>),
+    /// `JSON`／`JSONB` 列の等価条件（TABLE-14・Issue #1193）。値は
+    /// [`crate::json::canonical_equality_text`]（UNIQUE 制約と共通の値等価正規形）。
+    /// 行側も評価時に同じ関数で正規化して比較する。
+    JsonEquals(String),
+    /// `JSON`／`JSONB` 列の `IN`（Issue #1193）。
+    InJson(Vec<String>),
     /// `<col> IS NULL`。
     IsNull,
     /// `<col> IS NOT NULL`。
@@ -138,6 +150,65 @@ pub enum FilterOp {
     /// （`bind_all`/`bind_all_for_describe` は常にこの variant を解決済みに
     /// 変換する）。
     LikeUnbound(String),
+}
+
+/// 配列等価述語の束縛済み右辺（Issue #1193）。行バイトと同じ正準エンコード
+/// （[`crate::row_codec::ArrayValue`] の `canonical_parts`）を保持し、行側の
+/// [`crate::row_codec::ArrayRef`]（要素型・要素数・flags・ペイロード）とバイト
+/// 単位で比較する。正準エンコードは値に対して単射（NULL ビットマップ・`-0.0`
+/// 正規化を含む）のため、バイト一致が値の等価と一致する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayKey {
+    elem: crate::catalog::ArrayElemType,
+    count: u32,
+    flags: u8,
+    bytes: Vec<u8>,
+}
+
+impl ArrayKey {
+    /// 束縛済み配列値から正準キーを作る。
+    fn from_value(value: &crate::row_codec::ArrayValue) -> Result<Self, SqlSurfaceError> {
+        let internal = |_| SqlSurfaceError::Internal {
+            detail: "array literal could not be canonicalized".to_string(),
+        };
+        let (_, flags, bytes) = value.canonical_parts().map_err(internal)?;
+        let count = u32::try_from(value.len()).map_err(|_| SqlSurfaceError::Internal {
+            detail: "array literal element count overflow".to_string(),
+        })?;
+        Ok(Self {
+            elem: value.elem(),
+            count,
+            flags,
+            bytes,
+        })
+    }
+
+    /// Prepared Describe（`$n` 由来のダミー値）用の空プレースホルダ。評価には
+    /// 到達しない契約。
+    fn placeholder(elem: crate::catalog::ArrayElemType) -> Self {
+        Self {
+            elem,
+            count: 0,
+            flags: 0,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn matches(&self, actual: &crate::row_codec::ArrayRef<'_>) -> bool {
+        actual.elem() == self.elem
+            && actual.count() == self.count
+            && actual.flags() == self.flags
+            && actual.payload() == self.bytes.as_slice()
+    }
+}
+
+/// `JSON`／`JSONB` 列の格納値を等価正規形へ変換して `expected` と比較する
+/// （正規化に失敗する壊れた格納値は UNKNOWN。fail-closed）。
+fn json_canonical_of(value: ScalarRef<'_>) -> Option<String> {
+    match value {
+        ScalarRef::Json(s) => crate::json::canonical_equality_text(s).ok(),
+        _ => None,
+    }
 }
 
 impl FilterOp {
@@ -194,6 +265,23 @@ impl FilterOp {
             FilterOp::Between { low, high } => {
                 let v = value?;
                 typed_between_eval(low, high, v)
+            }
+            // 配列・JSON 列の等価（Issue #1193）。型不一致・破損値は UNKNOWN。
+            FilterOp::ArrayEquals(key) => match value? {
+                ScalarRef::Array(a) => Some(key.matches(&a)),
+                _ => None,
+            },
+            FilterOp::InArray(keys) => match value? {
+                ScalarRef::Array(a) => Some(keys.iter().any(|k| k.matches(&a))),
+                _ => None,
+            },
+            FilterOp::JsonEquals(expected) => {
+                let canonical = json_canonical_of(value?)?;
+                Some(canonical == *expected)
+            }
+            FilterOp::InJson(expected) => {
+                let canonical = json_canonical_of(value?)?;
+                Some(expected.contains(&canonical))
             }
             FilterOp::IsNull => Some(value.is_none()),
             FilterOp::IsNotNull => Some(value.is_some()),
@@ -565,6 +653,26 @@ fn bind_filter_op(
 ) -> Result<FilterOp, SqlSurfaceError> {
     Ok(match op {
         FilterOp::Equals(value) => {
+            // 配列・JSON／JSONB 列の等価（TABLE-14・Issue #1193）。リテラルは
+            // 列型の入力文法で解析し、Describe 縮退時（`$n` 由来のダミー）は
+            // 解析せずプレースホルダを返す。
+            match ty {
+                ColumnType::Array(array_ty) => {
+                    return Ok(if skip_enum_label_validation {
+                        FilterOp::ArrayEquals(ArrayKey::placeholder(array_ty.elem()))
+                    } else {
+                        FilterOp::ArrayEquals(bind_array_key(value, *array_ty)?)
+                    });
+                }
+                ColumnType::Json | ColumnType::Jsonb => {
+                    return Ok(if skip_enum_label_validation {
+                        FilterOp::JsonEquals(String::new())
+                    } else {
+                        FilterOp::JsonEquals(bind_json_key(value)?)
+                    });
+                }
+                _ => {}
+            }
             // ENUM 列は TEXT と同じ等価述語を受理する（Issue #890 D7。
             // PostgreSQL の enum 入力と同様、語彙外のラベルは書き込み時と
             // 同じ `22P02` で拒否する。二次索引〔`sql::scalar_index`〕は
@@ -699,6 +807,10 @@ fn bind_filter_op(
         FilterOp::TypedCompare { .. }
         | FilterOp::InText(_)
         | FilterOp::InTyped(_)
+        | FilterOp::ArrayEquals(_)
+        | FilterOp::InArray(_)
+        | FilterOp::JsonEquals(_)
+        | FilterOp::InJson(_)
         | FilterOp::Between { .. }
         | FilterOp::Like(_) => {
             // `DeclarativeFilter` の公開コンストラクタはいずれも未束縛の
@@ -791,6 +903,29 @@ fn bind_filter_op(
                     }
                     FilterOp::InTyped(bound)
                 }
+                // 配列・JSON／JSONB 列の `IN`（Issue #1193）。要素数は上で検査済み。
+                ColumnType::Array(array_ty) => {
+                    let mut bound = Vec::with_capacity(values.len());
+                    for v in values {
+                        bound.push(if skip_enum_label_validation {
+                            ArrayKey::placeholder(array_ty.elem())
+                        } else {
+                            bind_array_key(v, *array_ty)?
+                        });
+                    }
+                    FilterOp::InArray(bound)
+                }
+                ColumnType::Json | ColumnType::Jsonb => {
+                    let mut bound = Vec::with_capacity(values.len());
+                    for v in values {
+                        bound.push(if skip_enum_label_validation {
+                            String::new()
+                        } else {
+                            bind_json_key(v)?
+                        });
+                    }
+                    FilterOp::InJson(bound)
+                }
                 _ => return Err(unsupported_compare_column(column_name)),
             }
         }
@@ -871,6 +1006,26 @@ fn bind_filter_op(
             skip_enum_label_validation,
         )?)),
     })
+}
+
+/// 配列等価・`IN` の右辺リテラルを列の配列型で解析して正準キーへ変換する
+/// （Issue #1193）。解析は INSERT と同じ [`crate::sql::parser::parse_array_literal`]
+/// を共有し、長さ上限・形式違反・要素型ごとのエラー分類（`54000`／`22P02`／
+/// `22003`／`22007`／`22008`）を書き込み経路と揃える。
+fn bind_array_key(
+    literal: &str,
+    array_ty: crate::catalog::ArrayType,
+) -> Result<ArrayKey, SqlSurfaceError> {
+    let value = crate::sql::parser::parse_array_literal(literal, array_ty)?;
+    ArrayKey::from_value(&value)
+}
+
+/// JSON／JSONB 等価・`IN` の右辺リテラルを値等価の正規形へ変換する
+/// （Issue #1193）。長さ上限・構文・深さ・要素数は
+/// [`crate::json::canonical_equality_text`]（UNIQUE 制約と共通）が検証する。
+fn bind_json_key(literal: &str) -> Result<String, SqlSurfaceError> {
+    crate::json::canonical_equality_text(literal)
+        .map_err(|e| crate::sql::parser::json_column_error(e, literal))
 }
 
 /// 範囲比較（[`FilterOp::Compare`]）を受理しない列型へ束縛しようとした場合の
@@ -1863,13 +2018,10 @@ mod tests {
         assert_eq!(err.wire_code(), "22000");
     }
 
-    /// `ColumnType::Array` を持つスキーマ（TABLE-14・TASK-198、Issue #888）。
-    /// PR #1108 codex-review 指摘対応（P1: DISTANCE 先行時の OR 式評価の遅延化）
-    /// で `sql::exec::candidate_value_to_scalar_ref` が `Value::Array` を
-    /// `ScalarRef::Bytes(&[])`（内容を読まれないプレースホルダ）へ写す設計の
-    /// 前提となる、`IsNull`/`IsNotNull` 以外は ARRAY 列に束縛できないという
-    /// 不変条件をこのテストで固定する（この不変条件が崩れると、あの変換は
-    /// 誤った結果を静かに返すようになる）。
+    /// `ColumnType::Array`・`Json` を持つスキーマ（TABLE-14・TASK-198、Issue #888・
+    /// #1193）。配列・JSON 列は `IS [NOT] NULL` に加えて等価・`IN` も束縛でき、
+    /// `sql::exec::candidate_value_to_scalar_ref` は本物の `ArrayRef` を再構成して
+    /// 評価に渡す（Issue #1193。空プレースホルダ前提は撤去済み）。
     fn array_schema() -> TableSchema {
         TableSchema::new(
             "docs",
@@ -1883,14 +2035,13 @@ mod tests {
                     ),
                     true,
                 ),
+                ColumnDef::new("doc", ColumnType::Jsonb, true),
             ],
         )
     }
 
     #[test]
     fn is_null_and_is_not_null_accept_array_column() {
-        // `sql::exec::candidate_value_to_scalar_ref` の `Value::Array` プレース
-        // ホルダ設計が安全である前提（IsNull/IsNotNull は ARRAY 列へ束縛できる）。
         assert!(DeclarativeFilter::is_null("tags")
             .bind(&array_schema())
             .is_ok());
@@ -1900,56 +2051,115 @@ mod tests {
     }
 
     #[test]
-    fn non_is_null_filters_reject_array_column() {
-        // `sql::exec::candidate_value_to_scalar_ref` の `Value::Array` プレース
-        // ホルダ（`ScalarRef::Bytes(&[])`）は内容を読まれない前提で安全と
-        // している。この前提は、ARRAY 列が `IsNull`/`IsNotNull` 以外の
-        // フィルタへ束縛できないことに依存する。ここで崩れていないことを固定する
-        // （崩れた場合、あのプレースホルダはこれらのフィルタから誤って
-        // 「空バイト列」として読まれてしまう）。
+    fn array_column_accepts_equals_and_in_but_rejects_other_predicates() {
         let schema = array_schema();
+        assert!(DeclarativeFilter::equals("tags", "{a,NULL}")
+            .bind(&schema)
+            .is_ok());
+        assert!(
+            DeclarativeFilter::in_list("tags", vec!["{a}".to_string(), "{}".to_string()])
+                .bind(&schema)
+                .is_ok()
+        );
+        // 形式違反は書き込みと同じ分類（22P02）。
         assert_eq!(
-            DeclarativeFilter::equals("tags", "x")
+            DeclarativeFilter::equals("tags", "a,b")
                 .bind(&schema)
                 .unwrap_err()
                 .wire_code(),
-            "22000"
+            "22P02"
         );
+        for filter in [
+            DeclarativeFilter::starts_with("tags", "x"),
+            DeclarativeFilter::like("tags", "%x%"),
+            DeclarativeFilter::between("tags", "a", "b"),
+            DeclarativeFilter::compare("tags", CompareOp::Gt, "x"),
+        ] {
+            assert_eq!(filter.bind(&schema).unwrap_err().wire_code(), "22000");
+        }
+    }
+
+    fn array_ref_of(value: &crate::row_codec::ArrayValue) -> (Vec<u8>, u32, u8) {
+        let mut payload = Vec::new();
+        crate::row_codec::write_array_elements_payload(&mut payload, value).expect("payload");
+        (payload, value.len() as u32, value.frame_flags())
+    }
+
+    #[test]
+    fn array_equals_is_three_valued_and_null_elements_compare_equal() {
+        use crate::row_codec::{ArrayRef, ArrayValue};
+        let schema = array_schema();
+        let filter = DeclarativeFilter::equals("tags", "{a,NULL}")
+            .bind(&schema)
+            .expect("bind");
+        let same = ArrayValue::Text(vec![Some("a".to_string()), None]);
+        let other = ArrayValue::Text(vec![Some("a".to_string()), Some("NULL".to_string())]);
+        let (p1, c1, f1) = array_ref_of(&same);
+        let (p2, c2, f2) = array_ref_of(&other);
+        let elem = crate::catalog::ArrayElemType::Text;
+        assert!(filter.matches(Some(ScalarRef::Array(ArrayRef::from_owned(
+            elem, c1, f1, &p1
+        )))));
+        assert!(!filter.matches(Some(ScalarRef::Array(ArrayRef::from_owned(
+            elem, c2, f2, &p2
+        )))));
+        // 列 NULL・型不一致は UNKNOWN（`NOT` 越しでも真にならない）。
+        let negated = DeclarativeFilter::equals("tags", "{a,NULL}")
+            .negate()
+            .bind(&schema)
+            .expect("bind");
+        assert!(!filter.matches(None));
+        assert!(!negated.matches(None));
+        assert!(!negated.matches(Some(ScalarRef::Bytes(&[]))));
+        // 空のプレースホルダ（旧 `Bytes(&[])`）は等価述語を満たさない。
+        assert!(!filter.matches(Some(ScalarRef::Bytes(&[]))));
+    }
+
+    /// Prepared Describe（`$n` 由来のダミー値）では、配列・JSON 列の等価・`IN` は
+    /// 右辺を解析せずプレースホルダへ縮退し、束縛に成功する（実値扱いなら不正）。
+    #[test]
+    fn array_and_json_describe_dummy_skip_accepts_placeholder_without_parsing() {
+        let schema = array_schema();
+        for column in ["tags", "doc"] {
+            let filters = [DeclarativeFilter::equals(column, "0")];
+            let bound = bind_all_for_describe(&filters, &schema, &[true])
+                .unwrap_or_else(|e| panic!("describe dummy skip for {column:?} failed: {e:?}"));
+            assert_eq!(bound.len(), 1);
+            // 実値扱い: `"0"` は配列リテラルとして不正（JSON としては有効な数値）。
+            let real = bind_all_for_describe(&filters, &schema, &[false]);
+            if column == "tags" {
+                assert_eq!(real.unwrap_err().wire_code(), "22P02");
+            } else {
+                assert!(real.is_ok());
+            }
+            let in_filters = [DeclarativeFilter::in_list(column, vec!["0".to_string()])];
+            assert!(bind_all_for_describe(&in_filters, &schema, &[true]).is_ok());
+        }
+    }
+
+    #[test]
+    fn json_equals_uses_value_equality_normal_form() {
+        let schema = array_schema();
+        let filter = DeclarativeFilter::equals("doc", r#"{"b": 1.0, "a": [1, 2]}"#)
+            .bind(&schema)
+            .expect("bind");
+        assert!(filter.matches(Some(ScalarRef::Json(r#"{"a":[1,2],"b":1}"#))));
+        assert!(!filter.matches(Some(ScalarRef::Json(r#"{"a":[1,2],"b":2}"#))));
+        assert!(!filter.matches(None));
         assert_eq!(
-            DeclarativeFilter::starts_with("tags", "x")
+            DeclarativeFilter::equals("doc", "{not json")
                 .bind(&schema)
                 .unwrap_err()
                 .wire_code(),
-            "22000"
+            "22P02"
         );
-        assert_eq!(
-            DeclarativeFilter::like("tags", "%x%")
+        let in_filter =
+            DeclarativeFilter::in_list("doc", vec!["1".to_string(), r#""x""#.to_string()])
                 .bind(&schema)
-                .unwrap_err()
-                .wire_code(),
-            "22000"
-        );
-        assert_eq!(
-            DeclarativeFilter::in_list("tags", vec!["x".to_string()])
-                .bind(&schema)
-                .unwrap_err()
-                .wire_code(),
-            "22000"
-        );
-        assert_eq!(
-            DeclarativeFilter::between("tags", "a", "b")
-                .bind(&schema)
-                .unwrap_err()
-                .wire_code(),
-            "22000"
-        );
-        assert_eq!(
-            DeclarativeFilter::compare("tags", CompareOp::Gt, "x")
-                .bind(&schema)
-                .unwrap_err()
-                .wire_code(),
-            "22000"
-        );
+                .expect("bind");
+        assert!(in_filter.matches(Some(ScalarRef::Json("1.0"))));
+        assert!(in_filter.matches(Some(ScalarRef::Json(r#""x""#))));
+        assert!(!in_filter.matches(Some(ScalarRef::Json("2"))));
     }
 
     #[test]

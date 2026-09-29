@@ -10797,7 +10797,9 @@ mod tests {
             max_batch_chunks: 1_000_000,
         };
 
-        let empty_strings: Vec<String> = std::iter::repeat_with(String::new).take(1024).collect();
+        let empty_strings: Vec<Option<String>> = std::iter::repeat_with(|| Some(String::new()))
+            .take(1024)
+            .collect();
         let bound = crate::sql::parser::BoundInsert {
             table: "docs".to_string(),
             id: 1,

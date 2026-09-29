@@ -460,15 +460,16 @@ fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
 ///
 /// `Value::Integer`／`BigInt` は主要な `codex-review` 指摘の対象（`IS NULL` の
 /// fail-open）で、実値をそのまま `Some(ScalarRef::Integer/BigInt)` へ写す
-/// （`None` へ丸めない）。`Value::Array` は `ArrayRef`（`row_codec` 内部限定の
-/// 非公開フィールドを持つ借用型）を本モジュールから再構成できないため、
-/// `bind_filter_op`（`declarative_filter.rs`）が `ARRAY` 列に対して
-/// `IsNull`／`IsNotNull`（`Some`／`None` の判別のみで内容を読まない）以外の
-/// フィルタを束縛時に一切許可しない不変条件に頼り、内容を読まれない
-/// プレースホルダ（`ScalarRef::Bytes(&[])`）で「非 NULL」を表す。`Value::Vector`
-/// は `scan_scalar_columns` が常に `None` を返す列（実体は `arena` 経由）のため
-/// 到達しない契約だが、防御的に `None` へ倒す。
-fn candidate_value_to_scalar_ref(value: &Value) -> Option<ScalarRef<'_>> {
+/// （`None` へ丸めない）。`Value::Array` は正準ペイロード（`array_payload_scratch`
+/// が行ごとに組み立てたスクラッチ）への借用から本物の `ArrayRef` を再構成する
+/// （Issue #1193: 配列等価述語〔`FilterOp::ArrayEquals`／`InArray`〕が内容を読むため、
+/// 空プレースホルダで「非 NULL」だけを表す従来方式は fail-open になる）。
+/// `Value::Vector` は `scan_scalar_columns` が常に `None` を返す列（実体は
+/// `arena` 経由）のため到達しない契約だが、防御的に `None` へ倒す。
+fn candidate_value_to_scalar_ref<'a>(
+    value: &'a Value,
+    array_payload: Option<&'a [u8]>,
+) -> Option<ScalarRef<'a>> {
     match value {
         Value::Null | Value::Vector(_) => None,
         Value::Text(t) => Some(ScalarRef::Text(t.as_str())),
@@ -484,10 +485,56 @@ fn candidate_value_to_scalar_ref(value: &Value) -> Option<ScalarRef<'_>> {
         Value::Enum(label) => Some(ScalarRef::Enum(label.as_str())),
         Value::Numeric(d) => Some(ScalarRef::Numeric(*d)),
         Value::Uuid(u) => Some(ScalarRef::Uuid(*u)),
-        // 上記ドキュメント参照: `ARRAY` 列は `IsNull`/`IsNotNull` 以外の
-        // フィルタを束縛できないため、内容を読まれない前提でプレースホルダを返す。
-        Value::Array(_) => Some(ScalarRef::Bytes(&[])),
+        Value::Array(a) => {
+            // スクラッチが無い場合は `None`（NULL 扱い）ではなく、配列述語が UNKNOWN と
+            // する型不一致の `Bytes(&[])` を返す（fail-closed）。
+            let Some(payload) = array_payload else {
+                return Some(ScalarRef::Bytes(&[]));
+            };
+            let Ok(count) = u32::try_from(a.len()) else {
+                return Some(ScalarRef::Bytes(&[]));
+            };
+            Some(ScalarRef::Array(row_codec::ArrayRef::from_owned(
+                a.elem(),
+                count,
+                a.frame_flags(),
+                payload,
+            )))
+        }
     }
+}
+
+/// 候補行の `Value::Array` を [`candidate_value_to_scalar_ref`] が借用する正準
+/// ペイロードへエンコードしたスクラッチ（列位置ごとに `Some`／`None`）。行ごとに
+/// 高々 1 列あたり `MAX_ARRAY_PAYLOAD_LEN` バイト（Top-k 行のみが対象）。
+fn array_payload_scratch(values: &[Value]) -> Result<Vec<Option<Vec<u8>>>, SqlSurfaceError> {
+    values
+        .iter()
+        .map(|v| match v {
+            Value::Array(a) => {
+                let mut payload = Vec::new();
+                row_codec::write_array_elements_payload(&mut payload, a)
+                    .map(|()| Some(payload))
+                    .map_err(|_| SqlSurfaceError::Internal {
+                        detail: "candidate array column could not be re-encoded".to_string(),
+                    })
+            }
+            _ => Ok(None),
+        })
+        .collect()
+}
+
+/// 候補行の値列を `ScalarRef` ビューへ変換する（`scratch` は
+/// [`array_payload_scratch`] の戻り値で、`values` と同じ添字を持つ）。
+fn candidate_scalar_view<'a>(
+    values: &'a [Value],
+    scratch: &'a [Option<Vec<u8>>],
+) -> Vec<Option<ScalarRef<'a>>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| candidate_value_to_scalar_ref(v, scratch.get(i).and_then(|p| p.as_deref())))
+        .collect()
 }
 
 fn map_kernel_error(_e: KernelError) -> SqlSurfaceError {
@@ -2285,8 +2332,9 @@ pub(crate) fn execute_statement_with_cache(
                 let Some(columns) = candidate_columns.get(slot) else {
                     continue;
                 };
+                let array_scratch = array_payload_scratch(columns)?;
                 let scanned_view: Vec<Option<ScalarRef<'_>>> =
-                    columns.iter().map(candidate_value_to_scalar_ref).collect();
+                    candidate_scalar_view(columns, &array_scratch);
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
                 };
@@ -2570,6 +2618,13 @@ enum RowScalars<'a> {
 }
 
 impl RowScalars<'_> {
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            RowScalars::Borrowed(values) => values,
+            RowScalars::Owned(values) => values.as_slice(),
+        }
+    }
+
     fn get(&self, index: usize) -> Option<&Value> {
         match self {
             RowScalars::Borrowed(values) => values.get(index),
@@ -2883,9 +2938,13 @@ fn project_rows(
         // `decoded` の型差（`Value` 由来）を吸収したビューへ変換する。
         // `candidate_value_to_scalar_ref` を共有することで、`TEXT` に加えて
         // `DATE`／`TIMESTAMP` 列参照もこの遅延投影経路で正しく解決できる。
-        let row_scalars: Vec<Option<ScalarRef<'_>>> = (0..schema.columns.len())
-            .map(|idx| decoded.get(idx).and_then(candidate_value_to_scalar_ref))
-            .collect();
+        let row_array_scratch = array_payload_scratch(decoded.as_slice())?;
+        let row_scalars: Vec<Option<ScalarRef<'_>>> = {
+            let view = candidate_scalar_view(decoded.as_slice(), &row_array_scratch);
+            (0..schema.columns.len())
+                .map(|idx| view.get(idx).copied().flatten())
+                .collect()
+        };
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
             match col {
@@ -4991,7 +5050,9 @@ mod tests {
         // 1 要素だが本文は 10,000 バイト。`count * size_of::<String>()`
         // （24 バイト程度）だけでは検出できない大きさにする。
         let big_text = "x".repeat(10_000);
-        let values = vec![Value::Array(row_codec::ArrayValue::Text(vec![big_text]))];
+        let values = vec![Value::Array(row_codec::ArrayValue::Text(vec![Some(
+            big_text,
+        )]))];
         let encoded = row_codec::encode_scalar_columns(&schema, &values).expect("encode scalar");
         let scanned = row_codec::scan_scalar_columns(&schema, &encoded).expect("scan");
         let array_ref = match scanned[0] {
