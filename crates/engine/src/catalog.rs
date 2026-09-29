@@ -11703,6 +11703,51 @@ mod tests {
             .expect("unreferenced column can be dropped");
     }
 
+    /// ビュー数がちょうど [`MAX_VIEWS`] 件（`create_view` が許可する上限）でも、
+    /// DROP COLUMN の依存ビュー走査は `ViewLimitExceeded` にならず、上限超過
+    /// （`MAX_VIEWS + 1` 件の破損カタログ）のみ fail-closed に拒否する
+    /// （Issue #1167 レビュー指摘の境界回帰テスト）。
+    #[test]
+    fn views_reference_column_scan_accepts_exactly_max_views() {
+        let path = unique_db_path("drop-column-view-limit-boundary");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let remaining = vec!["a".to_string()];
+        let def = ViewDef {
+            base_relation: "docs".to_string(),
+            body_sql: "SELECT a FROM docs".to_string(),
+        };
+        let encoded = encode_view_def(&def).expect("encode view def");
+
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut views = write_txn.open_table(VIEWS_TABLE).expect("open views");
+            for i in 0..MAX_VIEWS {
+                views
+                    .insert(format!("v{i}").as_str(), encoded.as_slice())
+                    .expect("insert view");
+            }
+            assert!(
+                matches!(
+                    views_reference_column_in_txn(&views, "docs", &remaining),
+                    Ok(false)
+                ),
+                "exactly MAX_VIEWS views must be scanned without ViewLimitExceeded"
+            );
+            views
+                .insert("v_over", encoded.as_slice())
+                .expect("insert over-limit view");
+            assert!(
+                matches!(
+                    views_reference_column_in_txn(&views, "docs", &remaining),
+                    Err(CatalogError::ViewLimitExceeded(_))
+                ),
+                "more than MAX_VIEWS views must be rejected fail-closed"
+            );
+        }
+        write_txn.abort().expect("abort");
+    }
+
     /// 削除後に同名列を再追加すると独立した新しい物理スロットを得て、削除前の
     /// 行の値は復活しない（TABLE-19 D1）。削除後に書き込む行の墓標位置には
     /// 常に NULL が書かれる（`row_codec::encode_scalar_columns`）ことも併せて
