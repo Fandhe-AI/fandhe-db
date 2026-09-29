@@ -1516,7 +1516,7 @@ fn handle_bind_body(
 
     // 結果 format code の解決・事前検査（WIRE-14）。列ごとの
     // `FormatCode`（`Text`／`Binary`）へ解決したうえで、binary 指定列が
-    // すべて対応型（`TEXT`）であることを `RowDescription` 送出前に確定する
+    // すべて対応型（TEXT・数値・真偽値・bytea・uuid）であることを `RowDescription` 送出前に確定する
     // （`result_encoder` モジュールドキュメント参照）。結果列なしの
     // statement（`columns` が `None`。`expected_cols == 0`）では
     // `validate_binary_formats` を呼ばない——列が 0 なので形式指定は常に
@@ -1883,8 +1883,9 @@ fn execute_portal<'e, S: WireStream>(
                         // のみを意味する（`XX000` 相当。`result_encoder`
                         // モジュールドキュメント参照）。
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_formats(
+                        result_encoder::encode_data_row_into_with_columns(
                             row,
+                            &result.columns,
                             &result_formats,
                             &mut frame,
                         )
@@ -1911,8 +1912,9 @@ fn execute_portal<'e, S: WireStream>(
                     );
                     for row in result.rows.iter().take(take) {
                         let mut frame = Vec::new();
-                        result_encoder::encode_data_row_into_with_formats(
+                        result_encoder::encode_data_row_into_with_columns(
                             row,
+                            &result.columns,
                             &result_formats,
                             &mut frame,
                         )
