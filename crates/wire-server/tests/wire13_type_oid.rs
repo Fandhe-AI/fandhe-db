@@ -132,7 +132,10 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             Value::Json("{\"a\":1}".to_string()),
             Value::Json("{\"a\":1}".to_string()),
             Value::Numeric(Decimal::from_parts(12345, 2).expect("valid decimal")),
-            Value::Array(ArrayValue::Text(vec!["a".to_string(), "b".to_string()])),
+            Value::Array(ArrayValue::Text(vec![
+                Some("a".to_string()),
+                Some("b".to_string()),
+            ])),
             Value::Enum("happy".to_string()),
         ],
         &op_id,

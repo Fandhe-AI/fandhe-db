@@ -78,6 +78,13 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
     match elem {
         ArrayElemType::Text => "text",
         ArrayElemType::Bool => "bool",
+        ArrayElemType::Integer => "integer",
+        ArrayElemType::BigInt => "bigint",
+        ArrayElemType::Real => "real",
+        ArrayElemType::Double => "double",
+        ArrayElemType::Date => "date",
+        ArrayElemType::Timestamp => "timestamp",
+        ArrayElemType::Uuid => "uuid",
     }
 }
 
@@ -184,8 +191,11 @@ fn representative_scalar_values() -> Vec<Value> {
         Value::Bool(true),
         Value::Date(0),
         Value::Timestamp(0),
-        Value::Array(ArrayValue::Text(vec!["a".to_string(), "b".to_string()])),
-        Value::Array(ArrayValue::Bool(vec![true, false])),
+        Value::Array(ArrayValue::Text(vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+        ])),
+        Value::Array(ArrayValue::Bool(vec![Some(true), Some(false)])),
         Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
         Value::Json(" {\"b\": 2, \"a\": 1} ".trim().to_string()),
         Value::Json("{\"a\":1,\"b\":2}".to_string()),
@@ -222,11 +232,34 @@ fn all_column_type_variants_are_covered_by_case_table() {
         "ケース表が ColumnType の全 variant を網羅していない"
     );
     // ArrayElemType も同様に両 variant を網羅していることを確認する。
-    let array_labels: BTreeSet<&'static str> = [ArrayElemType::Text, ArrayElemType::Bool]
-        .iter()
-        .map(array_elem_label)
-        .collect();
-    assert_eq!(array_labels, BTreeSet::from(["text", "bool"]));
+    let array_labels: BTreeSet<&'static str> = [
+        ArrayElemType::Text,
+        ArrayElemType::Bool,
+        ArrayElemType::Integer,
+        ArrayElemType::BigInt,
+        ArrayElemType::Real,
+        ArrayElemType::Double,
+        ArrayElemType::Date,
+        ArrayElemType::Timestamp,
+        ArrayElemType::Uuid,
+    ]
+    .iter()
+    .map(array_elem_label)
+    .collect();
+    assert_eq!(
+        array_labels,
+        BTreeSet::from([
+            "text",
+            "bool",
+            "integer",
+            "bigint",
+            "real",
+            "double",
+            "date",
+            "timestamp",
+            "uuid"
+        ])
+    );
 }
 
 #[test]
@@ -453,7 +486,9 @@ fn array_text_roundtrips_empty_and_max_len() {
         ArrayType::new(ArrayElemType::Text, MAX_ARRAY_ELEMENTS).expect("array ty"),
     );
     roundtrip_single(ty.clone(), Value::Array(ArrayValue::Text(Vec::new())));
-    let full: Vec<String> = (0..MAX_ARRAY_ELEMENTS).map(|i| format!("v{i}")).collect();
+    let full: Vec<Option<String>> = (0..MAX_ARRAY_ELEMENTS)
+        .map(|i| Some(format!("v{i}")))
+        .collect();
     roundtrip_single(ty, Value::Array(ArrayValue::Text(full)));
 }
 
@@ -463,7 +498,7 @@ fn array_bool_roundtrips_empty_and_max_len() {
         ArrayType::new(ArrayElemType::Bool, MAX_ARRAY_ELEMENTS).expect("array ty"),
     );
     roundtrip_single(ty.clone(), Value::Array(ArrayValue::Bool(Vec::new())));
-    let full: Vec<bool> = (0..MAX_ARRAY_ELEMENTS).map(|i| i % 2 == 0).collect();
+    let full: Vec<Option<bool>> = (0..MAX_ARRAY_ELEMENTS).map(|i| Some(i % 2 == 0)).collect();
     roundtrip_single(ty, Value::Array(ArrayValue::Bool(full)));
 }
 
@@ -788,7 +823,9 @@ fn encode_row_rejects_array_over_max_len_and_elem_type_mismatch() {
         ArrayType::new(ArrayElemType::Text, MAX_ARRAY_ELEMENTS).expect("array ty"),
     );
     let schema = single_col_schema(ty);
-    let over: Vec<String> = (0..=MAX_ARRAY_ELEMENTS).map(|i| format!("v{i}")).collect();
+    let over: Vec<Option<String>> = (0..=MAX_ARRAY_ELEMENTS)
+        .map(|i| Some(format!("v{i}")))
+        .collect();
     let result = encode_row(
         &schema,
         "tenant-a",
@@ -802,7 +839,7 @@ fn encode_row_rejects_array_over_max_len_and_elem_type_mismatch() {
         &schema,
         "tenant-a",
         Visibility::Public,
-        &[Value::Array(ArrayValue::Bool(vec![true]))],
+        &[Value::Array(ArrayValue::Bool(vec![Some(true)]))],
     );
     assert!(matches!(result, Err(RowCodecError::Invalid(_))));
 }
@@ -1091,7 +1128,7 @@ fn decode_row_rejects_array_element_count_exceeding_limit() {
         &schema,
         "tenant-a",
         Visibility::Public,
-        &[Value::Array(ArrayValue::Bool(vec![true]))],
+        &[Value::Array(ArrayValue::Bool(vec![Some(true)]))],
     )
     .expect("encode single-element array");
     let value_offset = 3 + "tenant-a".len() + 1;
@@ -1210,4 +1247,238 @@ fn date_and_timestamp_sweep_within_valid_range_roundtrips_bit_exact() {
 #[test]
 fn enum_labels_fixture_is_well_within_max_enum_labels() {
     assert!(enum_labels().len() < MAX_ENUM_LABELS);
+}
+
+// --- Issue #1193: 配列の要素型拡大・NULL 要素 ----------------------------
+
+fn array_schema_of(elem: ArrayElemType) -> ColumnType {
+    ColumnType::Array(ArrayType::new(elem, 16).expect("array ty"))
+}
+
+#[test]
+fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
+    let u1 = Uuid::from_bytes([0x11; 16]);
+    let u2 = Uuid::from_bytes([0xee; 16]);
+    let cases: Vec<(ArrayElemType, ArrayValue)> = vec![
+        (
+            ArrayElemType::Integer,
+            ArrayValue::Integer(vec![Some(i32::MIN), None, Some(0), Some(i32::MAX)]),
+        ),
+        (
+            ArrayElemType::BigInt,
+            ArrayValue::BigInt(vec![None, Some(i64::MIN), Some(i64::MAX)]),
+        ),
+        (
+            ArrayElemType::Real,
+            ArrayValue::Real(vec![Some(1.5), None, Some(-2.25)]),
+        ),
+        (
+            ArrayElemType::Double,
+            ArrayValue::Double(vec![Some(-0.5), Some(1e300), None]),
+        ),
+        (
+            ArrayElemType::Date,
+            ArrayValue::Date(vec![Some(DATE_MIN_DAYS), None, Some(DATE_MAX_DAYS)]),
+        ),
+        (
+            ArrayElemType::Timestamp,
+            ArrayValue::Timestamp(vec![
+                Some(TIMESTAMP_MIN_MICROS),
+                None,
+                Some(TIMESTAMP_MAX_MICROS),
+            ]),
+        ),
+        (
+            ArrayElemType::Uuid,
+            ArrayValue::Uuid(vec![Some(u1), None, Some(u2)]),
+        ),
+        (
+            ArrayElemType::Text,
+            ArrayValue::Text(vec![
+                None,
+                Some("NULL".to_string()),
+                Some(String::new()),
+                None,
+            ]),
+        ),
+        (
+            ArrayElemType::Bool,
+            ArrayValue::Bool(vec![Some(true), None, Some(false)]),
+        ),
+    ];
+    for (elem, value) in cases {
+        // NULL 要素あり・NULL 要素なし・空配列・全要素 NULL のいずれも往復する。
+        roundtrip_single(array_schema_of(elem), Value::Array(value.clone()));
+        let empty = match &value {
+            ArrayValue::Text(_) => ArrayValue::Text(vec![]),
+            ArrayValue::Bool(_) => ArrayValue::Bool(vec![]),
+            ArrayValue::Integer(_) => ArrayValue::Integer(vec![]),
+            ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
+            ArrayValue::Real(_) => ArrayValue::Real(vec![]),
+            ArrayValue::Double(_) => ArrayValue::Double(vec![]),
+            ArrayValue::Date(_) => ArrayValue::Date(vec![]),
+            ArrayValue::Timestamp(_) => ArrayValue::Timestamp(vec![]),
+            ArrayValue::Uuid(_) => ArrayValue::Uuid(vec![]),
+        };
+        roundtrip_single(array_schema_of(elem), Value::Array(empty));
+    }
+    roundtrip_single(
+        array_schema_of(ArrayElemType::Integer),
+        Value::Array(ArrayValue::Integer(vec![None, None, None])),
+    );
+    // 列自体の NULL と、全要素 NULL の配列・空配列は互いに区別される。
+    let schema = TableSchema::new(
+        "docs",
+        vec![ColumnDef::new(
+            "v",
+            array_schema_of(ArrayElemType::Integer),
+            true,
+        )],
+    );
+    let enc = |v: Value| encode_row(&schema, "tenant-a", Visibility::Public, &[v]).expect("encode");
+    let null_col = enc(Value::Null);
+    let all_null = enc(Value::Array(ArrayValue::Integer(vec![None])));
+    let empty = enc(Value::Array(ArrayValue::Integer(vec![])));
+    assert_ne!(null_col, all_null);
+    assert_ne!(all_null, empty);
+    assert_ne!(null_col, empty);
+}
+
+#[test]
+fn array_existing_text_and_bool_bytes_are_unchanged_without_null_elements() {
+    // NULL 要素を含まない TEXT／BOOLEAN 配列の行バイト（flags=0x00・要素数 u32 LE・
+    // ペイロード長 u32 LE・要素列）は #888 から不変（永続形式の互換性）。
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Text));
+    let encoded = encode_row(
+        &schema,
+        "t",
+        Visibility::Public,
+        &[Value::Array(ArrayValue::Text(vec![
+            Some("a".to_string()),
+            Some("bc".to_string()),
+        ]))],
+    )
+    .expect("encode");
+    let tail: Vec<u8> = vec![
+        0x01, // presence
+        0x00, // flags
+        2,
+        0,
+        0,
+        0, // count
+        5 + 6,
+        0,
+        0,
+        0, // payload length
+        1,
+        0,
+        0,
+        0,
+        b'a',
+        2,
+        0,
+        0,
+        0,
+        b'b',
+        b'c',
+    ];
+    assert!(
+        encoded.ends_with(&tail),
+        "TEXT array row bytes changed: {encoded:?}"
+    );
+
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Bool));
+    let encoded = encode_row(
+        &schema,
+        "t",
+        Visibility::Public,
+        &[Value::Array(ArrayValue::Bool(vec![
+            Some(true),
+            Some(false),
+        ]))],
+    )
+    .expect("encode");
+    let tail: Vec<u8> = vec![0x01, 0x00, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0];
+    assert!(encoded.ends_with(&tail), "BOOL array row bytes changed");
+}
+
+#[test]
+fn array_null_bitmap_layout_is_lsb_first_and_canonical() {
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Integer));
+    let encoded = encode_row(
+        &schema,
+        "t",
+        Visibility::Public,
+        &[Value::Array(ArrayValue::Integer(vec![
+            Some(7),
+            None,
+            Some(9),
+        ]))],
+    )
+    .expect("encode");
+    // flags=0x01・count=3・payload = bitmap(1 バイト: 0b010) + 非 NULL 要素 2 個(4B×2)。
+    let tail: Vec<u8> = vec![
+        0x01,
+        0x01,
+        3,
+        0,
+        0,
+        0,
+        9,
+        0,
+        0,
+        0,
+        0b0000_0010,
+        7,
+        0,
+        0,
+        0,
+        9,
+        0,
+        0,
+        0,
+    ];
+    assert!(encoded.ends_with(&tail), "null bitmap layout: {encoded:?}");
+
+    // 非正準形（flags=0x01 なのにビットが全部 0）は decode で拒否される。
+    let mut bad = encoded.clone();
+    let bitmap_index = bad.len() - 9;
+    bad[bitmap_index] = 0;
+    assert!(matches!(
+        decode_row(&schema, &bad),
+        Err(RowCodecError::Invalid(_))
+    ));
+    // 余りビット（count=3 の上位 5 ビット）が 1 の場合も拒否される。
+    let mut bad = encoded.clone();
+    bad[bitmap_index] = 0b1000_0010;
+    assert!(matches!(
+        decode_row(&schema, &bad),
+        Err(RowCodecError::Invalid(_))
+    ));
+}
+
+#[test]
+fn array_encode_rejects_out_of_range_and_non_finite_elements() {
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Date));
+    assert!(matches!(
+        encode_row(
+            &schema,
+            "t",
+            Visibility::Public,
+            &[Value::Array(ArrayValue::Date(vec![Some(
+                DATE_MAX_DAYS + 1
+            )]))],
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Real));
+    assert!(matches!(
+        encode_row(
+            &schema,
+            "t",
+            Visibility::Public,
+            &[Value::Array(ArrayValue::Real(vec![Some(f32::NAN)]))],
+        ),
+        Err(RowCodecError::Invalid(_))
+    ));
 }

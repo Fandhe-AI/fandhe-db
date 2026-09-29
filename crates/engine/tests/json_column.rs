@@ -7,7 +7,9 @@
 //! `CleanupGuard`、実 `Storage`＋`CpuScalarProvider`、`EngineCore::execute_sql`／
 //! `execute_sql_in_session` を production 経路として検証）。`JSON` 列は入力
 //! テキスト保持・`JSONB` 列は正規化を固定し、不正 JSON・数値/真偽値リテラル・
-//! `WHERE`／集計／式評価への拒否経路・RLS 境界・`operation_id` 再送判定
+//! `WHERE` の等価・`IN`・`IS [NOT] NULL`（Issue #1193。値としての等価は UNIQUE 制約と
+//! 共通の `canonical_equality_text`）・集計／式評価への拒否経路・RLS 境界・
+//! `operation_id` 再送判定
 //! （`JSON` は非正規空白により内容不一致 `22023` になりうる非対称を含む）を
 //! 固定する。
 
@@ -310,25 +312,122 @@ fn insert_rejects_number_or_boolean_literal_for_json_column() {
 
 // --- 受け入れ条件 5: WHERE 述語・集計・式評価・パス演算子への露出は拒否 -------
 
+fn select_ids(core: &EngineCore, ctx: &PolicyContext, predicate: &str) -> Vec<u64> {
+    let sql = format!("SELECT id FROM {TABLE} WHERE {predicate} LIMIT 100");
+    let mut ids: Vec<u64> = core
+        .execute_sql(ctx, &sql)
+        .unwrap_or_else(|e| panic!("query failed: {sql}: {e:?}"))
+        .rows
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn seed_json_rows(core: &EngineCore, ctx: &PolicyContext) {
+    // (id, doc, docb)。id=4 は doc・docb とも NULL。
+    let rows: [(u64, Option<&str>, Option<&str>); 4] = [
+        (
+            1,
+            Some(r#"'{"b": 1, "a": [1, 2]}'"#),
+            Some(r#"'{"b":1,"a":[1,2]}'"#),
+        ),
+        (2, Some("'[]'"), Some("'{}'")),
+        (3, Some(r#"'{"n": 1.0}'"#), Some(r#"'{"n":1e0}'"#)),
+        (4, None, None),
+    ];
+    for (id, doc, docb) in rows {
+        let sql = match (doc, docb) {
+            (Some(d), Some(b)) => insert_sql(id, "ja", d, b, id),
+            _ => format!(
+                "INSERT INTO {TABLE} (id, embedding, lang) VALUES ({id}, '[0.1,0.2]', 'ja') \
+                 USING OPERATION_ID 'seed-{id}-{id}'"
+            ),
+        };
+        core.execute_sql_in_session(ctx, &mut SessionState::default(), &sql)
+            .expect("seed insert");
+    }
+}
+
 #[test]
-fn where_predicate_on_json_column_is_rejected() {
+fn where_equality_in_and_is_null_on_json_columns_use_value_equality() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
-    core.execute_sql_in_session(
-        &alice,
-        &mut SessionState::default(),
-        &insert_sql(1, "ja", "'{}'", "'{}'", 1),
-    )
-    .expect("insert should succeed");
+    seed_json_rows(&core, &alice);
 
-    let err = core
-        .execute_sql(
+    // 空白・キー順・数値表記（1／1.0／1e0）の違いは同値。JSON・JSONB のどちらでも。
+    assert_eq!(
+        select_ids(&core, &alice, r#"doc = '{"a":[1,2],"b":1.0}'"#),
+        vec![1]
+    );
+    assert_eq!(
+        select_ids(&core, &alice, r#"docb = '{ "a" : [1, 2], "b": 1 }'"#),
+        vec![1]
+    );
+    assert_eq!(select_ids(&core, &alice, r#"doc = '{"n":1}'"#), vec![3]);
+    assert_eq!(select_ids(&core, &alice, r#"docb = '{"n":1.00}'"#), vec![3]);
+    assert_eq!(select_ids(&core, &alice, "doc = '[]'"), vec![2]);
+    assert_eq!(select_ids(&core, &alice, "docb = '{}'"), vec![2]);
+    assert_eq!(
+        select_ids(&core, &alice, r#"docb = '{"a":[2,1],"b":1}'"#),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        select_ids(&core, &alice, "doc IN ('[]', '{\"n\":1}')"),
+        vec![2, 3]
+    );
+    assert_eq!(select_ids(&core, &alice, "docb IN ('{}', '[]')"), vec![2]);
+    assert_eq!(select_ids(&core, &alice, "doc IS NULL"), vec![4]);
+    assert_eq!(select_ids(&core, &alice, "docb IS NOT NULL"), vec![1, 2, 3]);
+    // 三値論理: NULL 列は NOT でも一致しない。
+    assert_eq!(select_ids(&core, &alice, "NOT doc = '[]'"), vec![1, 3]);
+    // 索引対応述語との複合でも再評価される。
+    assert_eq!(
+        select_ids(&core, &alice, "lang = 'ja' AND doc = '[]'"),
+        vec![2]
+    );
+    assert_eq!(
+        select_ids(&core, &alice, "lang = 'zz' AND doc = '[]'"),
+        Vec::<u64>::new()
+    );
+}
+
+#[test]
+fn where_json_literal_errors_use_json_column_classes() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let attempt = |predicate: &str| {
+        core.execute_sql(
             &alice,
-            &format!("SELECT id FROM {TABLE} WHERE doc = '{{}}' LIMIT 10"),
+            &format!("SELECT id FROM {TABLE} WHERE {predicate} LIMIT 10"),
         )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+        .unwrap_err()
+        .wire_code()
+    };
+    assert_eq!(attempt("doc = '{not json'"), "22P02");
+    // 重複キー・深さ超過も INSERT と同じ検証。
+    assert_eq!(attempt(r#"docb = '{"a":1,"a":2}'"#), "22P02");
+    let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
+    assert_eq!(attempt(&format!("doc = '{deep}'")), "22P02");
+    // 範囲比較・LIKE・BETWEEN は JSON 列に対して従来どおり 22000。
+    assert_eq!(attempt("doc LIKE 'x%'"), "22000");
+    assert_eq!(attempt("doc > '{}'"), "22000");
+    assert_eq!(attempt("doc BETWEEN '{}' AND '[]'"), "22000");
+}
+
+#[test]
+fn where_json_equality_does_not_cross_tenants() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+    seed_json_rows(&core, &alice);
+    assert_eq!(select_ids(&core, &alice, "doc = '[]'"), vec![2]);
+    assert!(select_ids(&core, &bob, "doc = '[]'").is_empty());
+    assert!(select_ids(&core, &bob, "doc IS NOT NULL").is_empty());
 }
 
 #[test]

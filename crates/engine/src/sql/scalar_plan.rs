@@ -210,6 +210,14 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
                 | crate::declarative_filter::FilterOp::IsNull
                 | crate::declarative_filter::FilterOp::IsNotNull
                 | crate::declarative_filter::FilterOp::InTyped(_)
+                // 配列・JSON 列の等価／`IN`（Issue #1193）も索引未対応。事前ゲートに
+                // 含めないと `lang = 'ja' AND tags = '{a}'` のような複合述語が
+                // `IndexConjunction` に分類され、`mask_trusted_defer` が再評価を
+                // 省略して誤った一致を返す（fail-open）。
+                | crate::declarative_filter::FilterOp::ArrayEquals(_)
+                | crate::declarative_filter::FilterOp::InArray(_)
+                | crate::declarative_filter::FilterOp::JsonEquals(_)
+                | crate::declarative_filter::FilterOp::InJson(_)
         )
     }) {
         return ScalarPlan::PlainScan;
@@ -283,6 +291,10 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
             | crate::declarative_filter::FilterOp::IsNull
             | crate::declarative_filter::FilterOp::IsNotNull
             | crate::declarative_filter::FilterOp::InTyped(_)
+            | crate::declarative_filter::FilterOp::ArrayEquals(_)
+            | crate::declarative_filter::FilterOp::InArray(_)
+            | crate::declarative_filter::FilterOp::JsonEquals(_)
+            | crate::declarative_filter::FilterOp::InJson(_)
             | crate::declarative_filter::FilterOp::Like(_)
             | crate::declarative_filter::FilterOp::LikeUnbound(_) => ScalarPlan::PlainScan,
         }
@@ -671,6 +683,59 @@ mod tests {
             or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    /// Issue #1193: 配列・JSON／JSONB 列の等価／`IN` は索引未対応。TEXT 列の
+    /// 索引対応述語と混在しても `IndexConjunction` へ進まず `PlainScan` になる
+    /// （`mask_trusted_defer` が再評価を省略して誤った一致を返す fail-open の防止）。
+    #[test]
+    fn plain_scan_when_array_or_json_predicate_mixed_with_indexable_equality() {
+        use crate::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new(
+                    "tags",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Text, 4).expect("array ty")),
+                    true,
+                ),
+                ColumnDef::new("doc", ColumnType::Jsonb, true),
+            ],
+        );
+        let bind = |filter: DeclarativeFilter| {
+            crate::declarative_filter::bind_all(&[filter], &schema)
+                .expect("bind")
+                .into_iter()
+                .next()
+                .expect("one filter")
+        };
+        let text_eq = bind(DeclarativeFilter::equals("lang", "ja"));
+        let predicates = [
+            DeclarativeFilter::equals("tags", "{a,NULL}"),
+            DeclarativeFilter::in_list("tags", vec!["{a}".to_string()]),
+            DeclarativeFilter::equals("doc", "{\"a\":1}"),
+            DeclarativeFilter::in_list("doc", vec!["[]".to_string()]),
+        ];
+        for predicate in predicates {
+            let filters = vec![text_eq.clone(), bind(predicate)];
+            let input = ScalarShapeInput {
+                scalar_prefilter: true,
+                metadata_filters: &filters,
+                expr_filters: &[],
+                or_filters: &[],
+            };
+            assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+            // 単独でも索引を使わない。
+            let alone = vec![filters[1].clone()];
+            let input = ScalarShapeInput {
+                scalar_prefilter: true,
+                metadata_filters: &alone,
+                expr_filters: &[],
+                or_filters: &[],
+            };
+            assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+        }
     }
 
     /// Issue #891・TASK-199（production 結線）・Issue #893（二次索引接続）:
