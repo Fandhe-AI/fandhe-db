@@ -223,9 +223,19 @@ fn disallowed_view_body_forms_are_rejected_and_not_persisted() {
     let mut session = allowed_session();
 
     let forms = [
-        "CREATE VIEW v AS SELECT * FROM docs LIMIT 10",
+        // Issue #1192 以降も、ベクトル順位付け・USING PLAN・CTE・集合演算・
+        // サブクエリ・ウィンドウ項目・式項目・UDF 述語・集計の式引数は本文に
+        // 書けない（`LIMIT`・集計・スカラー `ORDER BY`・JOIN は受理側へ移った）。
         "CREATE VIEW v AS SELECT * FROM docs ORDER BY embedding <=> '[0,0]' LIMIT 10",
-        "CREATE VIEW v AS SELECT COUNT(*) FROM docs",
+        "CREATE VIEW v AS SELECT * FROM docs USING PLAN('q') LIMIT 10",
+        "CREATE VIEW v AS WITH x AS (SELECT * FROM docs) SELECT * FROM x LIMIT 10",
+        "CREATE VIEW v AS SELECT id FROM docs LIMIT 5 UNION SELECT id FROM docs LIMIT 5",
+        "CREATE VIEW v AS SELECT id FROM docs WHERE id IN (SELECT id FROM docs LIMIT 3) LIMIT 5",
+        "CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER (ORDER BY lang) FROM docs LIMIT 5",
+        "CREATE VIEW v AS SELECT lower(body) FROM docs LIMIT 5",
+        "CREATE VIEW v AS SELECT id FROM docs WHERE lower(lang) = 'ja' LIMIT 5",
+        "CREATE VIEW v AS SELECT SUM(id + 1) FROM docs",
+        "CREATE VIEW v AS EXPLAIN SELECT * FROM docs LIMIT 5",
         "CREATE OR REPLACE VIEW v AS SELECT * FROM docs",
         "CREATE VIEW IF NOT EXISTS v AS SELECT * FROM docs",
         "CREATE VIEW v (a, b) AS SELECT * FROM docs",
@@ -829,4 +839,543 @@ fn view_persists_across_reopen() {
             .expect("view must survive reopen");
         assert!(!result.rows.is_empty());
     }
+}
+// =============================================================================
+// Issue #1192: ビュー本文の受理形拡大（集計・LIMIT・ORDER BY・JOIN）と、
+// 集計クエリからのビュー参照
+// =============================================================================
+
+use engine::sql::exec::Cell;
+
+const NOTES: &str = "notes";
+
+fn notes_schema() -> TableSchema {
+    TableSchema::new(
+        NOTES,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("title", ColumnType::Text, false),
+            ColumnDef::new("doc_id", ColumnType::BigInt, false),
+        ],
+    )
+}
+
+fn insert_note(
+    storage: &Storage,
+    tenant_ctx: &PolicyContext,
+    id: u64,
+    title: &str,
+    doc_id: i64,
+    visibility: Visibility,
+) {
+    engine::tenant::insert_typed_row(
+        storage,
+        NOTES,
+        tenant_ctx,
+        id,
+        visibility,
+        &[
+            Value::Vector(vec![id as f32, 0.0]),
+            Value::Text(title.to_string()),
+            Value::BigInt(doc_id),
+        ],
+        &op_id(&format!("note-{id}")),
+    )
+    .expect("insert note");
+}
+
+/// `docs`（`seed_base_fixture`）と `notes` を投入する。notes は docs.id へ
+/// 貼る: 100 = alice public → doc 1、101 = alice private → doc 5（bob の公開行）、
+/// 102 = bob public → doc 5、103 = carol public → doc 7。
+fn seed_join_fixture(storage: &Storage) {
+    storage.create_table(&notes_schema()).expect("create notes");
+    insert_note(storage, &ctx("alice"), 100, "a-pub", 1, Visibility::Public);
+    insert_note(
+        storage,
+        &ctx("alice"),
+        101,
+        "a-priv",
+        5,
+        Visibility::Private,
+    );
+    insert_note(storage, &ctx("bob"), 102, "b-pub", 5, Visibility::Public);
+    insert_note(storage, &ctx("carol"), 103, "c-pub", 7, Visibility::Public);
+}
+
+fn cells(result: &QueryResult) -> Vec<Vec<Cell>> {
+    result.rows.iter().map(|r| r.cells.clone()).collect()
+}
+
+fn open_core(name: &str, join: bool) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path(name);
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    seed_base_fixture(&storage);
+    if join {
+        seed_join_fixture(&storage);
+    }
+    (new_core(storage), guard)
+}
+
+const TENANTS: [&str; 3] = ["alice", "bob", "carol"];
+
+/// 集計・DISTINCT の FROM が単純形ビューでも、述語を手でマージした直接クエリと
+/// 参照セッションの ctx の下で結果が一致する（3 テナント対照。RLS-10 (b)）。
+#[test]
+fn aggregate_over_simple_view_matches_direct_query() {
+    let (core, _g) = open_core("view-agg-simple", false);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW ja_docs AS SELECT id, lang, body FROM docs WHERE lang = 'ja'",
+    )
+    .expect("create view");
+
+    let pairs = [
+        (
+            "SELECT COUNT(*) FROM ja_docs",
+            "SELECT COUNT(*) FROM docs WHERE lang = 'ja'",
+        ),
+        (
+            "SELECT lang, COUNT(*) AS n FROM ja_docs GROUP BY lang ORDER BY lang LIMIT 10",
+            "SELECT lang, COUNT(*) AS n FROM docs WHERE lang = 'ja' GROUP BY lang ORDER BY lang LIMIT 10",
+        ),
+        (
+            "SELECT COUNT(body) FROM ja_docs WHERE body LIKE '%public%'",
+            "SELECT COUNT(body) FROM docs WHERE lang = 'ja' AND body LIKE '%public%'",
+        ),
+        (
+            "SELECT DISTINCT lang FROM ja_docs",
+            "SELECT DISTINCT lang FROM docs WHERE lang = 'ja'",
+        ),
+    ];
+    for tenant in TENANTS {
+        for (via_view, direct) in pairs {
+            let a = scan(&core, tenant, via_view).expect(via_view);
+            let b = scan(&core, tenant, direct).expect(direct);
+            assert_eq!(cells(&a), cells(&b), "tenant={tenant} sql={via_view}");
+            assert!(!a.rows.is_empty());
+        }
+    }
+    // 参照者ごとに件数が異なる（作成者 alice の可視性が引き継がれない）。
+    let alice = scan(&core, "alice", "SELECT COUNT(*) FROM ja_docs").expect("alice");
+    let carol = scan(&core, "carol", "SELECT COUNT(*) FROM ja_docs").expect("carol");
+    assert_ne!(cells(&alice), cells(&carol));
+}
+
+/// 集計クエリでも、ビューが公開しない列を集計キー・引数・フィルタ・並べ替えへ
+/// 使えない（filter oracle の遮断。`22000`）。
+#[test]
+fn aggregate_over_view_rejects_hidden_columns() {
+    let (core, _g) = open_core("view-agg-hidden", false);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW v AS SELECT id, lang FROM docs",
+    )
+    .expect("create view");
+    for sql in [
+        "SELECT COUNT(body) FROM v",
+        "SELECT body, COUNT(*) FROM v GROUP BY body",
+        "SELECT COUNT(*) FROM v WHERE body = 'x'",
+        "SELECT COUNT(*) FROM v WHERE lang = 'ja' OR body = 'x'",
+        "SELECT lang, COUNT(*) FROM v GROUP BY lang ORDER BY body LIMIT 5",
+        "SELECT DISTINCT body FROM v",
+    ] {
+        let err = scan(&core, "alice", sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "22000", "sql={sql}");
+    }
+    // 公開列のみなら通る。
+    scan(&core, "alice", "SELECT lang, COUNT(*) FROM v GROUP BY lang").expect("visible columns");
+}
+
+/// 評価後射影形ビュー（LIMIT／ORDER BY／集計／DISTINCT）の参照結果が、本文を
+/// 直接実行した結果へ外側の射影・OFFSET・LIMIT を適用したものと一致する。
+#[test]
+fn buffered_view_bodies_match_direct_execution() {
+    let (core, _g) = open_core("view-buffered-forms", false);
+    let mut session = allowed_session();
+    let bodies = [
+        (
+            "top_ja",
+            "SELECT id, lang, body FROM docs WHERE lang = 'ja' ORDER BY id DESC LIMIT 3",
+        ),
+        (
+            "lang_counts",
+            "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n >= 1 ORDER BY lang LIMIT 10",
+        ),
+        ("langs", "SELECT DISTINCT lang FROM docs ORDER BY lang"),
+        ("total", "SELECT COUNT(*) AS n FROM docs"),
+    ];
+    for (name, body) in bodies {
+        create_view(
+            &core,
+            &mut session,
+            &format!("CREATE VIEW {name} AS {body}"),
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
+    }
+    for tenant in TENANTS {
+        for (name, body) in bodies {
+            let direct = scan(&core, tenant, body).expect(body);
+            // 全列・OFFSET なし
+            let all = scan(&core, tenant, &format!("SELECT * FROM {name} LIMIT 100")).expect(name);
+            assert_eq!(cells(&all), cells(&direct), "tenant={tenant} view={name}");
+            assert_eq!(all.columns, direct.columns);
+            // 外側 LIMIT が本文より小さい
+            let one = scan(&core, tenant, &format!("SELECT * FROM {name} LIMIT 1")).expect(name);
+            assert_eq!(
+                cells(&one),
+                cells(&direct)[..direct.rows.len().min(1)].to_vec()
+            );
+            // OFFSET
+            let off = scan(
+                &core,
+                tenant,
+                &format!("SELECT * FROM {name} LIMIT 100 OFFSET 1"),
+            )
+            .expect(name);
+            assert_eq!(
+                cells(&off),
+                cells(&direct).into_iter().skip(1).collect::<Vec<_>>()
+            );
+            // OFFSET が行数を超える
+            let none = scan(
+                &core,
+                tenant,
+                &format!("SELECT * FROM {name} LIMIT 5 OFFSET 500"),
+            )
+            .expect(name);
+            assert!(none.rows.is_empty());
+        }
+        // 列射影
+        let proj = scan(&core, tenant, "SELECT n FROM lang_counts LIMIT 100").expect("proj");
+        let full = scan(&core, tenant, "SELECT * FROM lang_counts LIMIT 100").expect("full");
+        let expected: Vec<Vec<Cell>> = cells(&full)
+            .into_iter()
+            .map(|r| vec![r[1].clone()])
+            .collect();
+        assert_eq!(cells(&proj), expected);
+    }
+    // ORDER BY／LIMIT 本文は参照者ごとの可視行だけから決まる（他テナント行は
+    // 作成者・参照者いずれの ctx でも混入しない）。
+    let bob = scan(&core, "bob", "SELECT id FROM top_ja LIMIT 100").expect("bob");
+    let carol = scan(&core, "carol", "SELECT id FROM top_ja LIMIT 100").expect("carol");
+    assert!(!result_ids(&carol).contains(&4));
+    assert!(!result_ids(&carol).contains(&6));
+    assert!(!result_ids(&bob).contains(&4));
+    // 集計本文の件数も参照者の可視行のみから計算される。
+    let total_bob = scan(&core, "bob", "SELECT n FROM total LIMIT 1").expect("bob total");
+    let total_carol = scan(&core, "carol", "SELECT n FROM total LIMIT 1").expect("carol total");
+    assert_ne!(cells(&total_bob), cells(&total_carol));
+}
+
+/// JOIN 本文（INNER／LEFT）。両辺に参照者の RLS が独立に効き、他テナント行が
+/// 結合結果・NULL 補完・件数に現れない（RLS-10 (b)）。
+#[test]
+fn buffered_join_view_applies_referencing_session_rls_on_both_sides() {
+    let (core, _g) = open_core("view-buffered-join", true);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW doc_notes AS SELECT docs.id, notes.title FROM docs INNER JOIN notes ON docs.id = notes.doc_id LIMIT 100",
+    )
+    .expect("create inner join view");
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW doc_notes_left AS SELECT docs.id, notes.title FROM docs LEFT JOIN notes ON docs.id = notes.doc_id LIMIT 100",
+    )
+    .expect("create left join view");
+    let inner_body = "SELECT docs.id, notes.title FROM docs INNER JOIN notes ON docs.id = notes.doc_id LIMIT 100";
+    let left_body =
+        "SELECT docs.id, notes.title FROM docs LEFT JOIN notes ON docs.id = notes.doc_id LIMIT 100";
+    for tenant in TENANTS {
+        let v = scan(&core, tenant, "SELECT * FROM doc_notes LIMIT 100").expect("inner view");
+        let d = scan(&core, tenant, inner_body).expect("inner direct");
+        assert_eq!(cells(&v), cells(&d), "tenant={tenant} inner");
+        let v = scan(&core, tenant, "SELECT * FROM doc_notes_left LIMIT 100").expect("left view");
+        let d = scan(&core, tenant, left_body).expect("left direct");
+        assert_eq!(cells(&v), cells(&d), "tenant={tenant} left");
+    }
+    let alice = scan(&core, "alice", "SELECT * FROM doc_notes LIMIT 100").expect("alice");
+    assert!(!alice.rows.is_empty(), "fixture must produce joined rows");
+    // carol は alice の private ノート（a-priv）を結合結果に見ない。
+    let carol = scan(&core, "carol", "SELECT title FROM doc_notes LIMIT 100").expect("carol");
+    for row in &carol.rows {
+        assert_ne!(row.cells[0], Cell::Text("a-priv".to_string()));
+    }
+    // `SELECT *` の JOIN 本文は id 列が重複するため、名前指定の射影は 42702。
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW star_join AS SELECT * FROM docs INNER JOIN notes ON docs.id = notes.doc_id LIMIT 100",
+    )
+    .expect("create star join view");
+    let err = scan(&core, "alice", "SELECT id FROM star_join LIMIT 5").expect_err("ambiguous");
+    assert_eq!(err.wire_code(), "42702");
+    scan(&core, "alice", "SELECT * FROM star_join LIMIT 5").expect("star is fine");
+}
+
+/// 評価後射影形ビューに対する外側クエリの禁止形と、連鎖・作成時の拒否。
+#[test]
+fn buffered_view_rejects_unsupported_outer_forms_and_chaining() {
+    let (core, _g) = open_core("view-buffered-reject", true);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW top_ja AS SELECT id, lang, body FROM docs WHERE lang = 'ja' ORDER BY id DESC LIMIT 3",
+    )
+    .expect("create");
+    for sql in [
+        "SELECT * FROM top_ja WHERE lang = 'ja' LIMIT 5",
+        "SELECT * FROM top_ja ORDER BY id LIMIT 5",
+        "SELECT COUNT(*) FROM top_ja",
+        "SELECT DISTINCT lang FROM top_ja",
+        "SELECT lang, COUNT(*) FROM top_ja GROUP BY lang",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY lang) FROM top_ja LIMIT 5",
+        "EXPLAIN SELECT * FROM top_ja LIMIT 5",
+        "SELECT id FROM docs WHERE id IN (SELECT id FROM top_ja LIMIT 5) LIMIT 5",
+        "WITH x AS (SELECT * FROM top_ja) SELECT * FROM x LIMIT 5",
+        "SELECT * FROM top_ja INNER JOIN docs ON top_ja.id = docs.id LIMIT 5",
+    ] {
+        let err = scan(&core, "alice", sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "42601", "sql={sql}");
+    }
+    let err = scan(&core, "alice", "SELECT nope FROM top_ja LIMIT 5").expect_err("unknown col");
+    assert_eq!(err.wire_code(), "22000");
+    let err = scan(&core, "alice", "SELECT * FROM top_ja LIMIT 0").expect_err("limit 0");
+    assert_eq!(err.wire_code(), "22000");
+
+    // 連鎖: 評価後射影形 → 評価後射影形、単純形 → 評価後射影形、いずれも作成不可。
+    for sql in [
+        "CREATE VIEW v2 AS SELECT * FROM top_ja LIMIT 5",
+        "CREATE VIEW v3 AS SELECT id FROM top_ja",
+        "CREATE VIEW v4 AS SELECT COUNT(*) AS n FROM top_ja",
+    ] {
+        let err = create_view(&core, &mut session, sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "42601", "sql={sql}");
+    }
+    let err = scan(&core, "alice", "SELECT * FROM v2 LIMIT 5").expect_err("not persisted");
+    assert_eq!(err.wire_code(), "42P01");
+
+    // 単純形ビューを源にする評価後射影形は作成できる。
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW ja_docs AS SELECT id, lang FROM docs WHERE lang = 'ja'",
+    )
+    .expect("simple view");
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW ja_count AS SELECT COUNT(*) AS n FROM ja_docs",
+    )
+    .expect("buffered over simple");
+    let via = scan(&core, "alice", "SELECT n FROM ja_count LIMIT 1").expect("read");
+    let direct = scan(
+        &core,
+        "alice",
+        "SELECT COUNT(*) FROM docs WHERE lang = 'ja'",
+    )
+    .expect("d");
+    assert_eq!(cells(&via), cells(&direct));
+    // 存在しない relation を指す本文は 42P01、JOIN 内のビューは 42601。
+    let err = create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW bad AS SELECT COUNT(*) AS n FROM missing_table",
+    )
+    .expect_err("missing");
+    assert_eq!(err.wire_code(), "42P01");
+    let err = create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW bad AS SELECT docs.id FROM docs INNER JOIN ja_docs ON docs.id = ja_docs.id LIMIT 5",
+    )
+    .expect_err("join over a view");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// 依存関係の検査: JOIN 右辺の DROP TABLE は 2BP01、DROP VIEW は成功。
+/// 参照テーブルの DROP COLUMN は保守的に拒否され、無関係なテーブルは影響しない。
+#[test]
+fn buffered_view_dependency_checks() {
+    let (core, _g) = open_core("view-buffered-deps", true);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW doc_notes AS SELECT docs.id, notes.title FROM docs INNER JOIN notes ON docs.id = notes.doc_id LIMIT 100",
+    )
+    .expect("create");
+    let err = create_view(&core, &mut session, "DROP TABLE notes").expect_err("dependent");
+    assert_eq!(err.wire_code(), "2BP01");
+    let err = create_view(&core, &mut session, "DROP TABLE docs").expect_err("dependent");
+    assert_eq!(err.wire_code(), "2BP01");
+    // 参照テーブルの列削除は保守的に拒否される。
+    let err = create_view(&core, &mut session, "ALTER TABLE notes DROP COLUMN title")
+        .expect_err("conservative");
+    assert_eq!(err.wire_code(), "2BP01");
+    drop_view(&core, &mut session, "DROP VIEW doc_notes").expect("drop view");
+    create_view(&core, &mut session, "DROP TABLE notes").expect("drop table after view is gone");
+
+    // 無関係なテーブルを読む評価後射影形ビューは DROP COLUMN を妨げない。
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW cnt AS SELECT COUNT(*) AS n FROM docs",
+    )
+    .expect("create cnt");
+    create_view(
+        &core,
+        &mut session,
+        "CREATE TABLE other (title TEXT, extra TEXT)",
+    )
+    .expect("create other");
+    create_view(&core, &mut session, "ALTER TABLE other DROP COLUMN extra")
+        .expect("unrelated buffered view must not block DROP COLUMN");
+}
+
+/// 64 KiB を超える本文は 54000（永続化されない）。
+#[test]
+fn buffered_view_body_size_limit() {
+    let (core, _g) = open_core("view-buffered-size", false);
+    let mut session = allowed_session();
+    let big = "x".repeat(70 * 1024);
+    let err = create_view(
+        &core,
+        &mut session,
+        &format!("CREATE VIEW big AS SELECT id FROM docs WHERE lang = '{big}' LIMIT 5"),
+    )
+    .expect_err("too large");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// 評価後射影形ビュー（文字列リテラルに `'` を含む本文）が再オープン後も
+/// 参照できる（正規化描画 → 再パースの往復）。
+#[test]
+fn buffered_view_persists_across_reopen() {
+    let path = unique_db_path("view-buffered-persist");
+    let _guard = CleanupGuard(path.clone());
+    let expected;
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema()).expect("create table");
+        seed_base_fixture(&storage);
+        let core = new_core(storage);
+        let mut session = allowed_session();
+        create_view(
+            &core,
+            &mut session,
+            "CREATE VIEW v AS SELECT lang, COUNT(*) AS n FROM docs WHERE body = 'it''s' OR lang = 'ja' GROUP BY lang LIMIT 10;",
+        )
+        .expect("create view");
+        expected = cells(&scan(&core, "alice", "SELECT * FROM v LIMIT 10").expect("read"));
+    }
+    {
+        let storage = Storage::open(&path).expect("reopen storage");
+        let core = new_core(storage);
+        let result = scan(&core, "alice", "SELECT * FROM v LIMIT 10").expect("after reopen");
+        assert_eq!(cells(&result), expected);
+    }
+}
+
+/// 明示トランザクション内の参照と、拡張クエリの Describe（本文は実行しない）。
+#[test]
+fn buffered_view_in_transaction_and_describe() {
+    let (core, _g) = open_core("view-buffered-txn", false);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW lang_counts AS SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY lang LIMIT 10",
+    )
+    .expect("create");
+
+    let caller = ctx("alice");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let outcome = core
+        .execute_sql_in_txn(
+            &caller,
+            &mut s,
+            &mut txn,
+            "SELECT n FROM lang_counts LIMIT 5",
+        )
+        .expect("read in txn");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected Query");
+    };
+    assert!(!result.rows.is_empty());
+    core.execute_sql_in_txn(&caller, &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+
+    // Describe: 列メタデータは実行結果と一致する。
+    let parsed = core
+        .parse_sql("SELECT n, lang FROM lang_counts LIMIT 5")
+        .expect("parse");
+    let described = core
+        .describe_parsed_in_session(&s, &parsed)
+        .expect("describe")
+        .expect("has columns");
+    let executed = scan(&core, "alice", "SELECT n, lang FROM lang_counts LIMIT 5").expect("exec");
+    assert_eq!(described, executed.columns);
+}
+
+/// カーソルの DECLARE は評価後射影形ビューを対象にできない（42601）。
+#[test]
+fn cursor_declare_over_buffered_view_is_rejected() {
+    let (core, _g) = open_core("view-buffered-cursor", false);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW top_ja AS SELECT id FROM docs ORDER BY id LIMIT 3",
+    )
+    .expect("create");
+    let caller = ctx("alice");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &caller,
+            &mut s,
+            &mut txn,
+            "DECLARE c CURSOR FOR SELECT * FROM top_ja LIMIT 5",
+        )
+        .expect_err("declare over buffered view");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// 評価後射影形ビューが単純形ビュー経由で対象テーブルへ到達する場合も、
+/// `DROP COLUMN` は保守的に拒否される（`2BP01`）。
+#[test]
+fn buffered_view_over_simple_view_blocks_drop_column_transitively() {
+    let (core, _g) = open_core("view-buffered-transitive", false);
+    let mut session = allowed_session();
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW all_docs AS SELECT id, body FROM docs",
+    )
+    .expect("simple view");
+    create_view(
+        &core,
+        &mut session,
+        "CREATE VIEW cb AS SELECT COUNT(body) AS n FROM all_docs",
+    )
+    .expect("buffered over simple");
+    let err = create_view(&core, &mut session, "ALTER TABLE docs DROP COLUMN body")
+        .expect_err("transitive dependency must block DROP COLUMN");
+    assert_eq!(err.wire_code(), "2BP01");
 }

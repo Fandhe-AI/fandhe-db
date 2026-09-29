@@ -1528,6 +1528,48 @@ pub enum Statement {
     /// `match` はワイルドカードアームの追加が必要（`SetOperation` 追加時と同じ
     /// 運用）。
     Join(ValidatedJoin),
+    /// 評価後射影形ビュー（本文に `LIMIT`・`ORDER BY`・集計・JOIN を含む
+    /// `CREATE VIEW`。TABLE-18・Issue #1192）への参照
+    /// `SELECT <*|列名リスト> FROM <view> LIMIT n [OFFSET m]`。本文は参照した
+    /// セッション自身の `PolicyContext` で既存の実行経路により評価され、結果に
+    /// 対してのみ外側の列射影・切り出しを行う（`sql::view_buffered`）。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
+    /// `match` はワイルドカードアームの追加が必要（`Join` 追加時と同じ運用）。
+    BufferedView(ValidatedBufferedView),
+}
+
+/// 評価後射影形ビュー参照（[`Statement::BufferedView`]。Issue #1192）。
+/// フィールドは `pub(crate)`（クレート外からの直読み・直書き不可）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedBufferedView {
+    /// 参照されたビュー名。
+    pub(crate) view_name: String,
+    /// 参照時に再検証済みの本文（`Scan`／`Aggregate`／`Join` のいずれか）。
+    pub(crate) body: Box<Statement>,
+    /// 外側の射影（`Projection::All` または `Projection::Columns` のみ）。
+    pub(crate) projection: Projection,
+    /// 外側 `LIMIT`（範囲検証済み）。
+    pub(crate) limit: u32,
+    /// 外側 `OFFSET`（範囲検証済み。既定 0）。
+    pub(crate) offset: u32,
+}
+
+impl ValidatedBufferedView {
+    /// 参照されたビュー名。
+    pub fn view_name(&self) -> &str {
+        &self.view_name
+    }
+
+    /// 外側 `LIMIT`。
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// 外側 `OFFSET`。
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
 }
 
 /// JOIN の投影対象列（SELECT リスト）。`*` は左→右の順で `id`＋全列を展開する
@@ -6478,16 +6520,16 @@ impl<'a> Parser<'a> {
     /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
     /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
-    fn parse_create_view(&mut self) -> Result<(String, ParsedViewBody), SqlSurfaceError> {
+    fn parse_create_view(&mut self) -> Result<(String, &'a [Token]), SqlSurfaceError> {
         self.expect_ident_matching("CREATE")?;
         self.expect_ident_matching("VIEW")?;
         let name = self.expect_ident()?;
         self.expect_ident_matching("AS")?;
-        let body = parse_view_body(self.remaining())?;
-        // `parse_view_body` が本文トークン列（`self.remaining()`）の終端まで
-        // 消費し尽くしたことを既に検証済みのため（`expect_end_of_statement`
-        // 呼び出し）、この Parser 側で追加のトークンを消費する必要はない。
-        Ok((name, body))
+        // 本文の構造検証（単純形／評価後射影形の判定。Issue #1192）は呼び出し元
+        // （[`validate_create_view_tokens`]）が [`classify_view_body`] で行う。
+        // 本文が末尾まで消費し尽くされたことの検証も同関数群が担うため、この
+        // Parser 側で追加のトークンを消費する必要はない。
+        Ok((name, self.remaining()))
     }
 
     /// `DROP VIEW <name> [;]`（TABLE-18・SQL-23・TASK-205、Issue #909）。
@@ -6650,6 +6692,126 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
     })
 }
 
+/// `CREATE VIEW` 本文の分類結果（TABLE-18・Issue #1192）。
+pub(crate) enum ViewBodyKind {
+    /// 単一 relation への射影＋単純述語（既存形。参照時はインライン展開）。
+    Simple(ParsedViewBody),
+    /// 集計・`LIMIT`・`ORDER BY`・JOIN を含む本文（参照時は評価後に射影）。
+    /// `Scan`／`Aggregate`／`Join` のいずれか。
+    Buffered(Box<Statement>),
+}
+
+/// カタログを照会しない構文専用の [`TableLookup`]（Issue #1192）。`CREATE VIEW`
+/// 本文の構造検証を、既存の SELECT・集計・JOIN パーサーの再利用のみで行うために
+/// 使う（DDL の判定順序「構文 `42601` → DDL 権限 `42501` → カタログ判定」を
+/// 保つ。実在確認は `catalog::Storage::create_view` が write txn 内で行う）。
+pub(crate) struct StructuralOnlyLookup;
+
+impl TableLookup for StructuralOnlyLookup {
+    fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+        Ok(true)
+    }
+}
+
+/// 末尾の `;` を取り除いたトークン列（本文の正規化描画で `;` を永続化しない）。
+pub(crate) fn strip_trailing_semicolons(tokens: &[Token]) -> &[Token] {
+    let mut end = tokens.len();
+    while end > 0 && matches!(tokens.get(end - 1), Some(Token::Punct(';'))) {
+        end -= 1;
+    }
+    tokens.get(..end).unwrap_or(tokens)
+}
+
+/// `CREATE VIEW` 本文（トークン列）を分類する（TABLE-18・Issue #1192）。
+/// まず既存の単純形（[`parse_view_body`]）を試し、失敗した場合のみ評価後射影形
+/// として、通常の SELECT と同じ [`validate_sql_tokens`]（`lookup` 越し）で構造を
+/// 確定させ、[`check_buffered_body_shape`] で許可形状を絞る。`CREATE VIEW`
+/// 時は [`StructuralOnlyLookup`]、参照時は実カタログのラッパーを渡す（同一実装で
+/// 再検証する。第 2 のパーサーを作らない）。単純形として不正で、かつ評価後射影形
+/// としても不正な場合は評価後射影形側のエラー（`42601` 等）を返す。
+pub(crate) fn classify_view_body(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<ViewBodyKind, SqlSurfaceError> {
+    if let Ok(simple) = parse_view_body(tokens) {
+        return Ok(ViewBodyKind::Simple(simple));
+    }
+    // 先頭が `SELECT` でない本文（`WITH`（CTE）・`EXPLAIN`・`SET` 等）は、
+    // `validate_sql_tokens` が `Scan` を返しうるため（CTE の主クエリ）ここで
+    // 明示的に拒否する。
+    if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+        return Err(SqlSurfaceError::unsupported(
+            "view body must be a plain SELECT statement",
+        ));
+    }
+    let stmt = validate_sql_tokens(strip_trailing_semicolons(tokens), lookup)?;
+    check_buffered_body_shape(&stmt)?;
+    Ok(ViewBodyKind::Buffered(Box::new(stmt)))
+}
+
+/// 評価後射影形の本文として許可する形状かを検査する（Issue #1192。`CREATE VIEW`
+/// 時・参照時の双方から呼ばれる唯一の実装）。許可は `Scan`（ウィンドウ項目・式項目
+/// なし）・`Aggregate`・`Join` のみ。ベクトル順位付け（`Select`）・`EXPLAIN`・
+/// 集合演算・`SET`・`CREATE FUNCTION` は `42601`。本文が参照セッションの UDF
+/// レジストリに依存しないよう、式項目・式述語・UDF 述語・集計引数の式も `42601`
+/// にする（単純形本文と同じ扱い）。
+pub(crate) fn check_buffered_body_shape(stmt: &Statement) -> Result<(), SqlSurfaceError> {
+    fn unsupported() -> SqlSurfaceError {
+        SqlSurfaceError::unsupported("view body form is not supported")
+    }
+    fn check_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
+        match pred {
+            WherePredicate::PredicateCall { .. }
+            | WherePredicate::Expression(_)
+            | WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. } => Err(unsupported()),
+            WherePredicate::Not(inner) => check_pred(inner),
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    for leaf in branch {
+                        check_pred(leaf)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    match stmt {
+        Statement::Scan(v) => {
+            if !v.window_items.is_empty() || matches!(v.projection, Projection::Items(_)) {
+                return Err(unsupported());
+            }
+            v.where_predicates.iter().try_for_each(check_pred)
+        }
+        Statement::Aggregate(v) => {
+            for item in &v.items {
+                if let AggregateSelectItem::Aggregate(agg) = item {
+                    if let AggregateArg::Expr(e) = &agg.arg {
+                        if !matches!(e, Expr::Ident(_)) {
+                            return Err(unsupported());
+                        }
+                    }
+                }
+            }
+            v.where_predicates.iter().try_for_each(check_pred)
+        }
+        Statement::Join(_) => Ok(()),
+        _ => Err(unsupported()),
+    }
+}
+
+/// 評価後射影形本文が読む relation 名の一覧（先頭が `FROM` の最初の relation。
+/// `catalog::ViewDef::base_relation` になる）。JOIN は両辺（重複除去）。
+pub(crate) fn buffered_body_relations(stmt: &Statement) -> Vec<String> {
+    match stmt {
+        Statement::Scan(v) => vec![v.table_name.clone()],
+        Statement::Aggregate(v) => vec![v.table_name.clone()],
+        Statement::Join(v) => super::join::collect_join_tables(v),
+        _ => Vec::new(),
+    }
+}
+
 /// [`ParsedViewBody`] を再パース可能な正規化 SQL テキストへ描画する
 /// （TABLE-18・SQL-23・TASK-205、Issue #909）。「描画 → 再トークン化 →
 /// [`parse_view_body`]」が元と等価な AST を復元することを
@@ -6786,8 +6948,27 @@ pub(crate) fn validate_create_view_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateView, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
-    let (name, body) = p.parse_create_view()?;
-    let body_sql = render_view_body(&body);
+    let (name, body_tokens) = p.parse_create_view()?;
+    // 判定順序（構文 `42601` → 本文サイズ `54000`）を保つため、本文の構造検証は
+    // カタログを照会しない [`StructuralOnlyLookup`] で行う。
+    let (base_relation, body_sql) = match classify_view_body(body_tokens, &StructuralOnlyLookup)? {
+        ViewBodyKind::Simple(body) => {
+            let sql = render_view_body(&body);
+            (body.table_name, sql)
+        }
+        ViewBodyKind::Buffered(stmt) => {
+            let relations = buffered_body_relations(&stmt);
+            let base = relations
+                .into_iter()
+                .next()
+                .ok_or_else(|| SqlSurfaceError::unsupported("view body has no source relation"))?;
+            // 検証済みトークン列そのものを正規化描画して永続化する
+            // （AST からの再描画による丸め・形状取りこぼしを避ける）。
+            let sql = super::lexer::render_tokens(strip_trailing_semicolons(body_tokens))
+                .ok_or_else(|| SqlSurfaceError::unsupported("view body is not supported"))?;
+            (base, sql)
+        }
+    };
     if body_sql.len() > crate::catalog::MAX_VIEW_BODY_BYTES {
         return Err(SqlSurfaceError::payload_too_large(
             "view body exceeds the allowed size",
@@ -6795,7 +6976,7 @@ pub(crate) fn validate_create_view_tokens(
     }
     Ok(ValidatedCreateView {
         name,
-        base_relation: body.table_name,
+        base_relation,
         body_sql,
     })
 }
@@ -7457,7 +7638,8 @@ fn parse_join_statement(
     for r in &relations {
         match crate::sql::view::resolve_from(lookup, r.table())? {
             crate::sql::view::Resolved::Table => {}
-            crate::sql::view::Resolved::View { .. } => {
+            crate::sql::view::Resolved::View { .. }
+            | crate::sql::view::Resolved::Buffered { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "JOIN does not support view references",
                 ));
@@ -7605,6 +7787,12 @@ fn parse_set_branch(
                 // 上と同じ理由（集合演算の枝はウィンドウ関数非対応）。
                 window_items: Vec::new(),
             }
+        }
+        // Issue #1192: 評価後射影形ビューは集合演算の枝として参照できない。
+        super::view::Resolved::Buffered { .. } => {
+            return Err(SqlSurfaceError::unsupported(
+                "a view with an aggregate/LIMIT body cannot be used in a set operation",
+            ));
         }
     };
     Ok(SetTree::Branch(Box::new(validated_scan)))
@@ -8303,6 +8491,59 @@ fn build_scan_from_resolved(
                 window_items,
             })
         }
+        // 評価後射影形ビュー（Issue #1192）は CTE・集合演算の枝など、広域取得の
+        // 畳み込み（インライン展開）を前提とする文脈では参照できない。トップ
+        // レベルの参照は `validate_select_statement` が本関数へ到達する前に
+        // [`Statement::BufferedView`] として分岐する。
+        super::view::Resolved::Buffered { .. } => Err(SqlSurfaceError::unsupported(
+            "a view with an aggregate/LIMIT body cannot be referenced here",
+        )),
+    }
+}
+
+/// 集計・`SELECT DISTINCT` の FROM を [`super::view::Resolved`] から
+/// [`ValidatedAggregate`] へ組み立てる（Issue #1192。[`build_scan_from_resolved`]
+/// の集計版）。単純形ビュー経由は基底テーブル名へ書き換え、ビュー由来の述語を
+/// 先頭に置いてクエリ自身の述語をマージする。ビューの公開列に収まらない列参照は
+/// `22000`（[`super::view::check_aggregate_columns_within_view`]）。評価後射影形
+/// ビューへの集計は `42601`。
+fn build_aggregate_from_resolved(
+    table_name: String,
+    resolved: super::view::Resolved,
+    items: Vec<AggregateSelectItem>,
+    where_predicates: Vec<WherePredicate>,
+    group_by: Option<GroupByClause>,
+) -> Result<ValidatedAggregate, SqlSurfaceError> {
+    match resolved {
+        super::view::Resolved::Table => Ok(ValidatedAggregate {
+            table_name,
+            items,
+            where_predicates,
+            group_by,
+        }),
+        super::view::Resolved::View {
+            base_table,
+            view_predicates,
+            view_columns,
+        } => {
+            super::view::check_aggregate_columns_within_view(
+                view_columns.as_deref(),
+                &items,
+                group_by.as_ref(),
+                &where_predicates,
+            )?;
+            let mut merged = view_predicates;
+            merged.extend(where_predicates);
+            Ok(ValidatedAggregate {
+                table_name: base_table,
+                items,
+                where_predicates: merged,
+                group_by,
+            })
+        }
+        super::view::Resolved::Buffered { .. } => Err(SqlSurfaceError::unsupported(
+            "aggregate over a view with an aggregate/LIMIT body is not supported",
+        )),
     }
 }
 
@@ -8489,6 +8730,12 @@ fn validate_sql_tokens_impl(
                         view_columns,
                         ..
                     } => (base_table.as_str(), view_columns.clone()),
+                    // Issue #1192: 評価後射影形ビューは CTE の本文として参照できない。
+                    super::view::Resolved::Buffered { .. } => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "a view with an aggregate/LIMIT body cannot be used in a CTE",
+                        ));
+                    }
                 };
                 let exposed = match view_columns {
                     Some(cols) => Some(cols),
@@ -8570,6 +8817,13 @@ fn validate_sql_tokens_impl(
                     ));
                 }
                 Statement::Scan(v) => ExplainTarget::Scan(v),
+                // Issue #1192: 評価後射影形ビューへの参照は `EXPLAIN` の対象に
+                // しない（本文の実行を伴わない静的分類の記述が存在しない）。
+                Statement::BufferedView(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for a view with an aggregate/LIMIT body",
+                    ));
+                }
                 // `validate_select_statement` は `SELECT` 先頭のトークン列に
                 // 対して常に `Select`／`Aggregate`／`Scan` のいずれかを返す
                 // （関数ドキュメント参照）。到達は同関数の契約違反時のみの
@@ -8683,29 +8937,27 @@ fn validate_select_statement(
 
     if is_distinct_select {
         let shape = parse_distinct_shape(tokens)?;
-        let exists = lookup.table_exists(&shape.table_name)?;
-        if !exists {
-            return Err(SqlSurfaceError::undefined_table(shape.table_name));
-        }
-        return Ok(Statement::Aggregate(ValidatedAggregate {
-            table_name: shape.table_name,
-            items: shape.items,
-            where_predicates: shape.where_predicates,
-            group_by: shape.group_by,
-        }));
+        // Issue #1192: FROM がビューなら単純形は基底テーブルへ書き換える
+        // （`resolve_from` がテーブル・ビューの存在確認を兼ねる）。
+        let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+        return Ok(Statement::Aggregate(build_aggregate_from_resolved(
+            shape.table_name,
+            resolved,
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?));
     }
     if is_aggregate_select {
         let shape = parse_aggregate_shape(tokens, subquery_ctx)?;
-        let exists = lookup.table_exists(&shape.table_name)?;
-        if !exists {
-            return Err(SqlSurfaceError::undefined_table(shape.table_name));
-        }
-        return Ok(Statement::Aggregate(ValidatedAggregate {
-            table_name: shape.table_name,
-            items: shape.items,
-            where_predicates: shape.where_predicates,
-            group_by: shape.group_by,
-        }));
+        let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+        return Ok(Statement::Aggregate(build_aggregate_from_resolved(
+            shape.table_name,
+            resolved,
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?));
     }
     match parse_select_shape(tokens, subquery_ctx)? {
         ParsedSelect::Search(shape) => {
@@ -8733,6 +8985,29 @@ fn validate_select_statement(
         // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
         ParsedSelect::Scan(shape) => {
             let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+            // Issue #1192: 評価後射影形ビューへの参照は本文実行＋外側射影の
+            // 別 variant へ分岐する（外側は `SELECT <*|列> FROM <view>
+            // LIMIT n [OFFSET m]` のみ）。
+            if let super::view::Resolved::Buffered { view_name, body } = resolved {
+                if !shape.where_predicates.is_empty()
+                    || !shape.order_by.is_empty()
+                    || !shape.window_items.is_empty()
+                    || matches!(shape.projection, Projection::Items(_))
+                {
+                    return Err(SqlSurfaceError::unsupported(
+                        "a view with an aggregate/LIMIT body supports only SELECT <* | columns> FROM <view> LIMIT n [OFFSET m]",
+                    ));
+                }
+                super::parser::validate_search_limit(shape.limit)?;
+                super::parser::validate_search_offset(shape.offset)?;
+                return Ok(Statement::BufferedView(ValidatedBufferedView {
+                    view_name,
+                    body,
+                    projection: shape.projection,
+                    limit: shape.limit,
+                    offset: shape.offset,
+                }));
+            }
             Ok(Statement::Scan(build_scan_from_resolved(
                 shape.table_name,
                 resolved,
@@ -8795,6 +9070,9 @@ pub fn validate_statement(
         // ポイントでは受理しない（一律 `42601`）。
         Statement::Join(_) => Err(SqlSurfaceError::unsupported(
             "JOIN is not a search query statement (use a session-aware entry point)",
+        )),
+        Statement::BufferedView(_) => Err(SqlSurfaceError::unsupported(
+            "view read is not a search query statement (use a session-aware entry point)",
         )),
     }
 }

@@ -2796,7 +2796,11 @@ impl EngineCore {
             // と同じくセッション UDF レジストリを参照しうる束縛経路
             // （`sql::parser::bind_scan`）を通るため、セッションを要する実行本体
             // （`execute_validated_in_session`）へ委譲する。
-            stmt @ crate::sql::allowlist::Statement::Join(_) => {
+            // Issue #1192（TABLE-18）: 評価後射影形ビューへの参照も本文（`Scan`／
+            // `Aggregate`／`Join`）がセッション UDF レジストリを参照しうる束縛
+            // 経路を通るため、同じくセッションを要する実行本体へ委譲する。
+            stmt @ (crate::sql::allowlist::Statement::Join(_)
+            | crate::sql::allowlist::Statement::BufferedView(_)) => {
                 let mut session = crate::sql::mode::SessionState::default();
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
@@ -3917,6 +3921,15 @@ impl EngineCore {
                     .unwrap_or_default();
                 self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
+            // Issue #1192: 評価後射影形ビューも他の読み取り文と同じ経路で読む
+            // （本文が読む全テーブルの未 commit 変更が反映される）。
+            ParsedSql::Statement(stmt @ Statement::BufferedView(v)) => {
+                let table = crate::sql::allowlist::buffered_body_relations(&v.body)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
+            }
             // Issue #1179: 集合演算も他の読み取り文と同じ経路で読む（未 commit の
             // 変更があれば書き込みトランザクションを読み取り源にする）。
             ParsedSql::Statement(stmt @ Statement::SetOperation(v)) => {
@@ -4151,6 +4164,7 @@ impl EngineCore {
             | Statement::Scan(_)
             | Statement::SetOperation(_)
             | Statement::Join(_)
+            | Statement::BufferedView(_)
                 if !is_using_plan_select =>
             {
                 let write_txn = txn.write_txn().ok_or_else(|| {
@@ -4402,6 +4416,31 @@ impl EngineCore {
                 let columns =
                     crate::sql::join::describe_columns(&schemas, validated, session.udfs())?;
                 Ok(Some(columns))
+            }
+            // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
+            // （本文は実行せずに）導出し、外側の射影だけを適用する。
+            ParsedSql::Statement(Statement::BufferedView(validated)) => {
+                let body_parsed = ParsedSql::Statement((*validated.body).clone());
+                // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
+                // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
+                let body_columns = self.describe_parsed_in_session_impl(
+                    session,
+                    &body_parsed,
+                    skip_vector_literal_validation,
+                    &[],
+                )?;
+                match body_columns {
+                    Some(cols) => {
+                        let (_, metas) = crate::sql::view_buffered::resolve_projection(
+                            &cols,
+                            &validated.projection,
+                        )?;
+                        Ok(Some(metas))
+                    }
+                    None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                }
             }
             ParsedSql::Statement(Statement::Select(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
@@ -4758,6 +4797,18 @@ impl EngineCore {
                     &read_txn,
                 )
             }
+            // Issue #1192（TABLE-18）: 評価後射影形ビューは本文を同一スナップ
+            // ショット上で実行してから外側の射影を適用する
+            // （[`Self::execute_read_statement`] の同名アーム参照）。
+            crate::sql::allowlist::Statement::BufferedView(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
+                    ctx,
+                    session,
+                    crate::sql::allowlist::Statement::BufferedView(validated),
+                    &read_txn,
+                )
+            }
         }
     }
 
@@ -4860,6 +4911,35 @@ impl EngineCore {
                 let result =
                     crate::sql::join::execute(read_txn, ctx, &schemas, &validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // Issue #1192（TABLE-18・RLS-10 (b)）: 評価後射影形ビュー。本文
+            // （`Scan`／`Aggregate`／`Join`。参照時に再検証済み）を、参照した
+            // セッション自身の `ctx`・同一の `read_txn`（単一スナップショット）で
+            // 既存の実行経路により評価し、結果へ外側の列射影と `LIMIT`／`OFFSET`
+            // だけを適用する。作成者の可視性は引き継がれない（`ctx` は参照者の
+            // もの）。第 2 の実行器は作らない。
+            crate::sql::allowlist::Statement::BufferedView(validated) => {
+                let crate::sql::allowlist::ValidatedBufferedView {
+                    body,
+                    projection,
+                    limit,
+                    offset,
+                    ..
+                } = validated;
+                match self.execute_read_statement(ctx, session, *body, read_txn)? {
+                    crate::sql::SqlOutcome::Query(result) => {
+                        let sliced = crate::sql::view_buffered::project_and_slice(
+                            result,
+                            &projection,
+                            limit,
+                            offset,
+                        )?;
+                        Ok(crate::sql::SqlOutcome::Query(sliced))
+                    }
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                }
             }
             _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),

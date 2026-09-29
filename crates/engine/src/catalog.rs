@@ -44,7 +44,10 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 // （`#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが使う。
 #[cfg(test)]
 use crate::row_codec::{self, Value as RowCodecValue};
-use crate::sql::allowlist::{parse_view_body, SqlSurfaceError, TableLookup};
+use crate::sql::allowlist::{
+    buffered_body_relations, classify_view_body, parse_view_body, SqlSurfaceError,
+    StructuralOnlyLookup, TableLookup, ViewBodyKind,
+};
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
 // `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
 // 使う。
@@ -2173,21 +2176,69 @@ fn decode_view_def_body(bytes: &[u8]) -> Result<ViewDef> {
 /// （`sql::view::check_columns_within_view`）が「`body_sql` の投影は
 /// `base_relation` に対して検証済み」という前提の上に成り立たなくなる
 /// （テナント境界そのものは崩さないが、ビューが宣言する列公開契約が破れる）。
-fn validate_view_body_matches_base_relation(body_sql: &str, base_relation: &str) -> Result<()> {
-    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| {
-        CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
-    })?;
-    let parsed = parse_view_body(&tokens).map_err(|_| {
-        CatalogError::Invalid(
-            "view body does not match the allowed view definition shape".to_string(),
-        )
-    })?;
-    if parsed.table_name != base_relation {
+fn validate_view_body_matches_base_relation(
+    body_sql: &str,
+    base_relation: &str,
+) -> Result<ViewBodyShape> {
+    let shape = view_body_shape(body_sql)?;
+    if shape.relations.first().map(String::as_str) != Some(base_relation) {
         return Err(CatalogError::Invalid(
             "view body FROM target does not match base_relation".to_string(),
         ));
     }
-    Ok(())
+    Ok(shape)
+}
+
+/// 格納・作成対象のビュー本文の形状（TABLE-18・Issue #1192）。本文を
+/// `sql::allowlist::classify_view_body`（構文専用の lookup）で再検証して得る。
+/// `relations` は本文が読む relation 名（先頭が `base_relation`。JOIN は両辺）、
+/// `buffered` は評価後射影形（集計・`LIMIT`・`ORDER BY`・JOIN を含む本文）か、
+/// `join` は JOIN 本文か。
+struct ViewBodyShape {
+    relations: Vec<String>,
+    buffered: bool,
+    join: bool,
+}
+
+/// [`ViewBodyShape`] を本文から導出する。字句・構造検証に失敗した本文は
+/// `CatalogError::Invalid`。
+fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
+    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| {
+        CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
+    })?;
+    let kind = classify_view_body(&tokens, &StructuralOnlyLookup).map_err(|_| {
+        CatalogError::Invalid(
+            "view body does not match the allowed view definition shape".to_string(),
+        )
+    })?;
+    Ok(match kind {
+        ViewBodyKind::Simple(parsed) => ViewBodyShape {
+            relations: vec![parsed.table_name],
+            buffered: false,
+            join: false,
+        },
+        ViewBodyKind::Buffered(stmt) => ViewBodyShape {
+            relations: buffered_body_relations(&stmt),
+            buffered: true,
+            join: matches!(*stmt, crate::sql::allowlist::Statement::Join(_)),
+        },
+    })
+}
+
+/// `name` が評価後射影形（[`ViewBodyShape::buffered`]）のビューなら `true`
+/// （テーブル・未登録は `false`）。格納本文の再検証失敗はカタログ破損として
+/// `CorruptSchema`。
+fn view_is_buffered_in_txn(views_table: &redb::Table<'_, &str, &[u8]>, name: &str) -> Result<bool> {
+    match views_table.get(name)? {
+        None => Ok(false),
+        Some(guard) => {
+            let def = decode_view_def(guard.value())?;
+            let shape = view_body_shape(&def.body_sql).map_err(|_| {
+                CatalogError::CorruptSchema("stored view body is invalid".to_string())
+            })?;
+            Ok(shape.buffered)
+        }
+    }
 }
 
 /// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
@@ -2251,6 +2302,16 @@ fn views_depending_on_in_txn(
         let def = decode_view_def(value.value())?;
         if def.base_relation == target {
             dependents.push(key.value().to_string());
+            continue;
+        }
+        // Issue #1192: 評価後射影形本文（JOIN 右辺など）は `base_relation` 以外の
+        // relation も読む。再検証に失敗した本文は fail-closed で「依存あり」とする。
+        let depends = match view_body_shape(&def.body_sql) {
+            Ok(shape) => shape.relations.iter().any(|r| r == target),
+            Err(_) => true,
+        };
+        if depends {
+            dependents.push(key.value().to_string());
         }
     }
     Ok(dependents)
@@ -2272,14 +2333,50 @@ fn views_reference_column_in_txn(
     remaining_columns: &[String],
 ) -> Result<bool> {
     let mut defs: std::collections::HashMap<String, ViewDef> = std::collections::HashMap::new();
+    // 評価後射影形ビューが読む relation 名（連鎖の到達判定は単純形ビューが出揃った後）。
+    let mut buffered_relations: Vec<String> = Vec::new();
     for entry in views_table.iter()? {
         let (key, value) = entry?;
-        if defs.len() >= MAX_VIEWS {
+        if defs.len().saturating_add(buffered_relations.len()) >= MAX_VIEWS {
             return Err(CatalogError::ViewLimitExceeded(
                 "too many views".to_string(),
             ));
         }
-        defs.insert(key.value().to_string(), decode_view_def(value.value())?);
+        let def = decode_view_def(value.value())?;
+        // Issue #1192: 評価後射影形本文（集計・JOIN 等）の列参照は単純形の列
+        // スコープ検査では追えないため、対象テーブルを読んでいれば保守的に
+        // 「依存あり」とする（fail-closed）。無関係なテーブルのみを読む本文は
+        // 対象外。再検証できない本文も「依存あり」。評価後射影形ビューは他の
+        // ビューの参照先にならないため、以降の連鎖走査（`defs`）には含めない。
+        match view_body_shape(&def.body_sql) {
+            Ok(shape) if shape.buffered => {
+                buffered_relations.extend(shape.relations);
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => return Ok(true),
+        }
+        defs.insert(key.value().to_string(), def);
+    }
+    // 評価後射影形ビューが（直接、または単純形ビューの連鎖経由で）対象テーブルへ
+    // 到達するなら保守的に「依存あり」。連鎖走査は循環・過大な連鎖でも
+    // `MAX_VIEW_CHAIN_WALK` で打ち切り、fail-closed で「依存あり」とする。
+    for rel in &buffered_relations {
+        let mut cur: &str = rel;
+        let mut steps = 0usize;
+        loop {
+            if cur == table {
+                return Ok(true);
+            }
+            steps += 1;
+            if steps > MAX_VIEW_CHAIN_WALK {
+                return Ok(true);
+            }
+            match defs.get(cur) {
+                Some(d) => cur = d.base_relation.as_str(),
+                None => break,
+            }
+        }
     }
     // 各ビューの削除後公開列集合（None = テーブルへ到達しない無関係なビュー）。
     let mut exposed: std::collections::HashMap<String, Option<Vec<String>>> =
@@ -7355,7 +7452,7 @@ impl Storage {
                 "view body too large".to_string(),
             ));
         }
-        validate_view_body_matches_base_relation(body_sql, base_relation)?;
+        let shape = validate_view_body_matches_base_relation(body_sql, base_relation)?;
         let encoded = encode_view_def(&ViewDef {
             base_relation: base_relation.to_string(),
             body_sql: body_sql.to_string(),
@@ -7374,8 +7471,30 @@ impl Storage {
             if index_name_exists_in_txn(&write_txn, name)? {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
-            let depth =
-                resolve_reference_depth_in_txn(&catalog_table, &views_table, base_relation)?;
+            // 本文が読む全 relation の存在確認（不存在は `TableNotFound`。JOIN の
+            // 右辺を含む）と、連鎖の最大深さの算出。
+            let mut depth = 0u32;
+            for rel in &shape.relations {
+                let d = resolve_reference_depth_in_txn(&catalog_table, &views_table, rel)?;
+                depth = depth.max(d);
+            }
+            // Issue #1192: 評価後射影形ビューは連鎖の最外段の 1 段に限る
+            // （再帰の深さを 1 段に抑える）。評価後射影形本文は別の評価後射影形
+            // ビューを、単純形ビューは評価後射影形ビューを参照できない。JOIN 本文の
+            // 両辺はテーブルに限る（参照時に JOIN 内のビュー参照は拒否されるため、
+            // 作成できても参照できない定義を作らない）。
+            for rel in &shape.relations {
+                if view_is_buffered_in_txn(&views_table, rel)? {
+                    return Err(CatalogError::Invalid(
+                        "a view cannot reference a view with an aggregate/LIMIT body".to_string(),
+                    ));
+                }
+                if shape.join && catalog_table.get(rel.as_str())?.is_none() {
+                    return Err(CatalogError::Invalid(
+                        "JOIN in a view body cannot reference a view".to_string(),
+                    ));
+                }
+            }
             // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
             // `depth`（参照先の深さ）+ 1。
             let new_depth = depth.checked_add(1).ok_or_else(|| {

@@ -196,6 +196,7 @@ pub(crate) mod subquery;
 pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
+pub(crate) mod view_buffered;
 pub(crate) mod visible_cache;
 pub(crate) mod where_negation;
 pub(crate) mod where_tree;
