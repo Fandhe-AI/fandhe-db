@@ -183,3 +183,52 @@ fn wire17_copy_chunk_limit_error_discards_subsequent_copy_data() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_no_rows_and_connection_alive(&mut stream);
 }
+
+/// 超過検出が CopyDone より前（CopyData 受信中）に起きることを固定する。
+///
+/// 実装は超過を `errored` に保持して以後の CopyData を discard 予算
+/// （`limits::COPY_DISCARD_MAX_MESSAGES`）で読み捨て、54000 の ErrorResponse は
+/// CopyDone 後にしか返さない。CopyDone を送らずに予算を超える件数の CopyData を
+/// 送り、discard 予算超過（`08P01`）で終端することを観測する。検出が CopyDone 時点
+/// まで遅れる退行があれば、後続 CopyData は取り込み経路（feed）へ流れ予算を消費
+/// しないため、このテストは 54000 の ErrorResponse も来ず失敗する。
+fn assert_detected_before_copy_done(limits: BatchLimits, op: &str, over_limit_rows: &[u8]) {
+    let (core, _guard) = new_core(limits);
+    let mut stream = connect(core);
+    start_copy(&mut stream, op);
+    send_copy_data(&mut stream, over_limit_rows);
+    // 予算超過の判定は件数が `MAX_MESSAGES` を超えた 1 件で発火する。サーバーが
+    // 未読データを残したまま切断して RST で応答を失わないよう、ちょうどその件数だけ送る。
+    for _ in 0..=wire_server::limits::COPY_DISCARD_MAX_MESSAGES {
+        send_copy_data(&mut stream, b"x");
+    }
+    let (ty, body) = read_message(&mut stream);
+    assert_eq!(ty, b'E', "expected ErrorResponse");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        text.contains("08P01") && text.contains("COPY discard budget exceeded"),
+        "expected discard budget error before CopyDone, got: {text:?}"
+    );
+    assert!(
+        !text.contains("54000"),
+        "limit error must wait for CopyDone: {text:?}"
+    );
+}
+
+#[test]
+fn wire17_copy_row_body_over_limit_is_detected_before_copy_done() {
+    assert_detected_before_copy_done(
+        body_limits(),
+        "wire-1178-body-early",
+        b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\televenbytes\n",
+    );
+}
+
+#[test]
+fn wire17_copy_rows_over_chunk_limit_are_detected_before_copy_done() {
+    assert_detected_before_copy_done(
+        chunk_limits(),
+        "wire-1178-chunk-early",
+        b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\tja\n",
+    );
+}
