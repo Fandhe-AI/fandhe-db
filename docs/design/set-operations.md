@@ -55,6 +55,8 @@ set_expr  := set_term { (UNION [ALL] | EXCEPT) set_term }      -- 左結合
 set_term  := primary { INTERSECT primary }                     -- 左結合・UNION/EXCEPT より高優先
 primary   := branch | '(' set_expr ')'                         -- 括弧の入れ子深さは 4 まで（実装既定値）
 branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
+           | <集計形の枝>                                        -- Issue #1191
+           | '(' <単一 SELECT> ORDER BY ... LIMIT n [OFFSET m] ')'  -- Issue #1191（括弧付きのみ）
 ```
 
 優先順位は PostgreSQL と同じ: `INTERSECT` は `UNION`／`EXCEPT` より強く結合
@@ -62,11 +64,23 @@ branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
 `EXCEPT` の 4 種のみを受理し、`INTERSECT ALL`／`EXCEPT ALL`／`UNION DISTINCT`／
 `EXCEPT DISTINCT` 等は `42601`。
 
+Issue #1191 で次を受理する:
+
+- 集計形の枝（先頭が集計関数名＋`(`、または `GROUP BY` を含む）。括弧なしの枝は
+  `HAVING` まで。結果列の静的型（Issue #1173）で型整合を検証する（`COUNT` は BIGINT。
+  静的型を持たない列は `42804`）。集計結果の行キーは `Integer`／`SignedInteger` を
+  正準化して同値判定する。
+- 括弧付き単一 `SELECT` 枝の枝内 `ORDER BY`（スカラー列）・`LIMIT`・`OFFSET`
+  （`LimitedBranch`。明示 `LIMIT` により切り詰め、`54000` にしない。集計の括弧付き枝は
+  `GROUP BY` 句の `ORDER BY`／`LIMIT`）。
+- 落とし穴: 括弧なしの末尾 `ORDER BY`／`LIMIT` は PostgreSQL では**集合演算全体**に
+  掛かる。最後の枝の句と解釈すると結果が異なるため、全体に対する `ORDER BY` は `42601`
+  のまま（末尾 `LIMIT n` は従来どおり全体 `LIMIT`）。
+
 以下はいずれも枝の中では `42601`:
 
-- 集計形の枝（先頭が集計関数名＋`(`、または `GROUP BY` を含む）
-- 枝内の `ORDER BY`・`<=>`（ベクトル順位付け）・`USING PLAN`・`USING MODE`・
-  `HINT ORDER`・`DISTINCT`・`OFFSET`
+- 枝内の `<=>`（ベクトル順位付け）・`USING PLAN`・`USING MODE`・`HINT ORDER`・
+  `DISTINCT`、括弧なしの枝内 `ORDER BY`・`OFFSET`
 - 式項目（`Computed` 投影。宣言的 UDF・組み込み関数呼び出し）: 束縛時に型を
   確定できないため fail-closed で拒否する
 
@@ -137,9 +151,9 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 
 ## スコープ外（Issue #929 の対象外事項）
 
-- 集計・`DISTINCT`・`ORDER BY`・`OFFSET`・ベクトル順位付けを含む枝、集合演算
-  の結果に対する `ORDER BY`
-- `INTERSECT ALL`／`EXCEPT ALL`、括弧内の `LIMIT`
+- `DISTINCT`・ベクトル順位付けを含む枝、集合演算の結果全体に対する `ORDER BY`
+  （集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）
+- `INTERSECT ALL`／`EXCEPT ALL`
 - `DECLARE CURSOR`・`COPY TO`・`EXPLAIN` での集合演算、明示トランザクション
   内での実行（いずれも既存の既定経路で `42601`／`0A000` に自然に落ちる）
 - NoSQL（HTTP）表層での集合演算（spec 上も非対応）

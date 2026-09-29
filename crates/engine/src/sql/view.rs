@@ -541,6 +541,7 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         // 外側クエリが参照する実在の列（ビューの公開列範囲チェック対象）。
         // `EXISTS (...)` は外側の列を参照しないため対象外。
         WherePredicate::InSubquery { column, .. } => Some(column),
+        WherePredicate::ScalarSubqueryCompare { column, .. } => Some(column),
         WherePredicate::Exists { .. } => None,
     }
 }

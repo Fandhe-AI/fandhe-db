@@ -1470,7 +1470,8 @@ fn declarative_leaf_to_filter(
         | WherePredicate::Expression(_)
         | WherePredicate::Or(_)
         | WherePredicate::InSubquery { .. }
-        | WherePredicate::Exists { .. } => Err(SqlSurfaceError::Internal {
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -1653,7 +1654,24 @@ fn bind_where_predicates_recursive(
             // 経由せずここへ到達しうるため、未解決のまま束縛に届いた場合は
             // 一律 `42601` で拒否する（fail-closed。構文段の
             // `Parser::require_subquery_depth` と二重にゲートする）。
-            WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+            WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "subquery is not supported for this statement shape",
+                ));
+            }
+            // `NOT IN (SELECT ...)`／`NOT EXISTS (SELECT ...)`（Issue #1191）も
+            // 解決を経由しないまま届いたら同じく拒否する（`declarative_leaf_to_filter`
+            // へ渡して `Internal` にしない。fail-closed）。
+            WherePredicate::Not(inner)
+                if matches!(
+                    inner.as_ref(),
+                    WherePredicate::InSubquery { .. }
+                        | WherePredicate::Exists { .. }
+                        | WherePredicate::ScalarSubqueryCompare { .. }
+                ) =>
+            {
                 return Err(SqlSurfaceError::unsupported(
                     "subquery is not supported for this statement shape",
                 ));
@@ -5406,7 +5424,7 @@ fn bind_window_item(
 /// すべて `out` へ集める（SQL-30・TASK-214。WHERE がウィンドウ別名を参照する形の
 /// 拒否判定でのみ使う）。`Or` の分岐へ再帰する（`sql::view::
 /// check_predicate_columns_within` と同じ理由: 非公開の判定漏れを防ぐ）。
-fn collect_where_predicate_idents(
+pub(crate) fn collect_where_predicate_idents(
     predicates: &[WherePredicate],
     out: &mut std::collections::HashSet<String>,
 ) {
@@ -5441,6 +5459,9 @@ fn collect_where_predicate_idents(
             // 自分の FROM テーブルのスキーマのみで束縛される。
             // `sql::subquery` モジュールドキュメント参照）。
             WherePredicate::Exists { .. } => {}
+            WherePredicate::ScalarSubqueryCompare { column, .. } => {
+                out.insert(column.clone());
+            }
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。
@@ -5458,7 +5479,7 @@ fn collect_where_predicate_idents(
 
 /// [`Expr::Ident`] をすべて再帰的に集める（[`collect_where_predicate_idents`] の
 /// 式項目向け実装。`sql::view::expr_columns_within` と同じ走査規則）。
-fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
         // Issue #919・SQL-26: 文字列リテラルは列識別子を参照しない。
         Expr::Number(_) | Expr::String(_) => {}

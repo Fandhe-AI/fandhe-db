@@ -28,10 +28,16 @@ WITH <name> AS (SELECT <* | 列名リスト> FROM <table | view | cte> [WHERE <�
   （`Token::Punct(';')`）も明示的に拒否する。`parse_view_body` が使う
   `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、CTE の
   括弧内トークン列に対しては呼び出し前に別途検査する。
-- 主クエリは広域取得（SQL-15。`ParsedSelect::Scan`）のみを受理する。順位付き
-  （`ORDER BY`／`USING PLAN`）・集計は明示的なメッセージで `42601` に拒否し、
-  `WITH` 句を剥がして後段へ流すことは絶対にしない（同名の実テーブルを黙って
-  読む危険があるため）。
+- 主クエリは広域取得（SQL-15。`ParsedSelect::Scan`。スカラー `ORDER BY`・`OFFSET`
+  を含む）と、Issue #1191 で追加した集計 SELECT（`GROUP BY`／`HAVING`／`ORDER BY`／
+  `SELECT DISTINCT` の脱糖形を含む）を受理する。集計主クエリは `build_scan_from_resolved`
+  の兄弟 `build_aggregate_from_resolved` で `ValidatedAggregate` へ畳み込み（CTE の
+  `WHERE` は主クエリの `WHERE` の前へ合成）、集計引数・グループキー・`GROUP BY` 列・
+  `WHERE` は CTE の公開列集合に収まることを `sql::view::check_aggregate_columns_within_view`
+  で検査する（範囲外は `22000`）。`HAVING`・集計 `ORDER BY` は SELECT リストの出力名を
+  指すため列検査の対象外。順位付き（`ORDER BY <ベクトル>`／`USING PLAN`）は明示的な
+  メッセージで `42601` に拒否し、`WITH` 句を剥がして後段へ流すことは絶対にしない
+  （同名の実テーブルを黙って読む危険があるため）。
 - `WITH RECURSIVE`・列名リスト `<name>(a, b)`・`AS MATERIALIZED`／
   `AS NOT MATERIALIZED`・CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
   ...)` 等。body が `SELECT` 以外は受理しない）はいずれも `42601`。
@@ -98,8 +104,10 @@ CTE は実体化しない（インライン展開のみ）。主クエリ（`Par
 
 - CTE と JOIN の併用、サブクエリ、集合演算（別 Issue の対象）。JOIN 構文
   そのものが許可リスト外のため、現状は `42601` で構造的に拒否される。
-- 順位付き（`ORDER BY <=>`／`USING PLAN`）・集計・`EXPLAIN` の主クエリで
-  CTE を参照すること（VIEW と同じスコープ縮小）。
+- 順位付き（`ORDER BY <=>`／`USING PLAN`）・`EXPLAIN` の主クエリで
+  CTE を参照すること（VIEW と同じスコープ縮小。集計は Issue #1191 で対応済み。
+  ベクトル順位付き主クエリはキャッシュ・precision 契約への影響が未検証のため
+  fail-closed で `42601` を維持した）。
 - 拡張クエリプロトコルで `WITH` 文に `$n` を束縛すること。`sql::params::
   validate_param_positions` の等価述語判定（パターン 4）はトークン列上の
   位置だけで許可位置を判定するが、CTE を含む文では CTE の `WHERE` 述語が
