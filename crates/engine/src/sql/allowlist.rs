@@ -7532,6 +7532,10 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// JOIN の SELECT リスト項目数の構文段上限（無制限確保の防止用）。集計形は別途
+/// [`MAX_AGGREGATE_ITEMS`] で頭打ちにし、非集計形は従来の受理範囲を維持する。
+const MAX_JOIN_SELECT_ITEMS: usize = 4096;
+
 /// JOIN の SELECT リスト（Issue #925・#1190）。`*`・列参照の並び（非集計形）、
 /// または集計項目（`COUNT(*)`・`F(colref)`）を 1 つ以上含む並び（集計形）を
 /// 判別する。戻り値の第 2 要素は「項目列をそのまま保持する必要がある」ときの
@@ -7548,7 +7552,7 @@ fn parse_join_select_list(
     let mut has_aggregate = false;
     let mut any_alias = false;
     loop {
-        if items.len() >= MAX_AGGREGATE_ITEMS {
+        if items.len() >= MAX_JOIN_SELECT_ITEMS {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many JOIN SELECT items",
             ));
@@ -7573,6 +7577,13 @@ fn parse_join_select_list(
         break;
     }
     if has_aggregate {
+        // 集計形のみ `MAX_AGGREGATE_ITEMS` で頭打ちにする（非集計の投影は従来どおり
+        // 受理範囲を維持する）。
+        if items.len() > MAX_AGGREGATE_ITEMS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many aggregate items",
+            ));
+        }
         return Ok((JoinProjection::Columns(Vec::new()), Some(items)));
     }
     if any_alias {

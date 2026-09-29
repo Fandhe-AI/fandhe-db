@@ -926,7 +926,7 @@ fn build_aggregate_shape(
     let mut out: Vec<AggOut> = Vec::with_capacity(agg.items.len());
     let mut metas: Vec<ColumnMeta> = Vec::with_capacity(agg.items.len());
     // 出力名（キー別名・集計項目名）→ 出力の索引。ORDER BY／HAVING の名前解決に使う。
-    let mut key_aliases: Vec<Option<String>> = vec![None; keys.len()];
+    let mut key_aliases: Vec<(usize, String)> = Vec::new();
     let mut item_names: Vec<String> = Vec::new();
     let star_schema = *b.schemas.first().ok_or_else(|| SqlSurfaceError::Internal {
         detail: "JOIN has no relations".to_string(),
@@ -949,9 +949,8 @@ fn build_aggregate_shape(
                         .unwrap_or(ColumnMeta::Id),
                     alias.as_ref(),
                 );
-                if let Some(slot) = key_aliases.get_mut(idx) {
-                    *slot = alias.clone();
-                }
+                // 出力名は別名、無ければ列名（PostgreSQL と同じく ORDER BY の出力名照合に使う）。
+                key_aliases.push((idx, alias.clone().unwrap_or_else(|| c.name.clone())));
                 out.push(AggOut::Key(idx));
                 metas.push(meta);
             }
@@ -1027,49 +1026,60 @@ fn build_aggregate_shape(
     let mut order: Vec<AggOrder> = Vec::with_capacity(validated.order_by.len());
     for key in &validated.order_by {
         let target = &key.target;
-        let key_idx: Option<usize> = match b.scope.resolve(target) {
-            Ok(r) => {
-                let name = slot_name(
-                    r.slot(),
-                    b.schemas.get(r.relation()).copied().ok_or_else(|| {
-                        SqlSurfaceError::Internal {
-                            detail: "JOIN relation index out of range".to_string(),
-                        }
-                    })?,
-                )?;
-                key_cols
-                    .iter()
-                    .position(|k| k.rel == r.relation() && k.name == name)
+        // 非修飾名は、非集計 JOIN 経路と同じく SELECT の出力名（キー別名・集計項目名）を
+        // 実在列より優先する。一致が無い場合と修飾名は列参照として解決し、束縛エラー
+        // （未知の修飾子 42P01・曖昧な列 42702 等）は握りつぶさず伝播する。
+        let alias_keys: Vec<usize> = if target.qualifier().is_none() {
+            let mut v: Vec<usize> = Vec::new();
+            for (k, a) in &key_aliases {
+                if a == target.name() && !v.contains(k) {
+                    v.push(*k);
+                }
             }
-            Err(_) => None,
-        };
-        let alias_key: Option<usize> = if target.qualifier().is_none() {
-            key_aliases
-                .iter()
-                .position(|a| a.as_deref() == Some(target.name()))
+            v
         } else {
-            None
+            Vec::new()
         };
-        let key_match = key_idx.or(alias_key);
         let item_match: Option<usize> = if target.qualifier().is_none() {
             item_names.iter().position(|n| n == target.name())
         } else {
             None
         };
-        let resolved = match (key_match, item_match) {
-            (Some(_), Some(_)) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "ORDER BY target {:?} is ambiguous",
-                    target.name()
-                )))
+        let ambiguous = || {
+            SqlSurfaceError::invalid_input(format!(
+                "ORDER BY target {:?} is ambiguous",
+                target.name()
+            ))
+        };
+        let resolved = if alias_keys.is_empty() && item_match.is_none() {
+            let r = b.scope.resolve(target)?;
+            let name = slot_name(
+                r.slot(),
+                b.schemas
+                    .get(r.relation())
+                    .copied()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN relation index out of range".to_string(),
+                    })?,
+            )?;
+            match key_cols
+                .iter()
+                .position(|k| k.rel == r.relation() && k.name == name)
+            {
+                Some(k) => AggOrderTarget::Key(k),
+                None => {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "ORDER BY target {:?} is not a GROUP BY column or aggregate item",
+                        target.name()
+                    )))
+                }
             }
-            (Some(k), None) => AggOrderTarget::Key(k),
-            (None, Some(i)) => AggOrderTarget::Item(i),
-            (None, None) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "ORDER BY target {:?} is not a GROUP BY column or aggregate item",
-                    target.name()
-                )))
+        } else {
+            match (alias_keys.as_slice(), item_match) {
+                ([_, _, ..], _) | ([_], Some(_)) => return Err(ambiguous()),
+                ([k], None) => AggOrderTarget::Key(*k),
+                (_, Some(i)) => AggOrderTarget::Item(i),
+                ([], None) => return Err(ambiguous()),
             }
         };
         order.push(AggOrder {

@@ -898,6 +898,56 @@ fn aggregate_type_and_name_errors_use_the_single_table_classification() {
     );
 }
 
+#[test]
+fn aggregate_order_by_resolves_every_alias_of_a_group_key_and_propagates_bind_errors() {
+    let (storage, path) = seeded();
+    let _g = CleanupGuard(path);
+    let core = new_core(storage);
+    let base = "FROM dept LEFT JOIN emp ON emp.dept_id = dept.id";
+    // 同一 GROUP BY 列を複数の別名で SELECT しても、どちらの別名でも ORDER BY できる。
+    for target in ["a", "b", "dept.dname"] {
+        assert_eq!(
+            q(
+                &core,
+                &format!(
+                    "SELECT dept.dname AS a, dept.dname AS b, COUNT(*) AS n {base} \
+                     GROUP BY dept.dname ORDER BY {target}"
+                )
+            ),
+            vec!["eng|eng|2", "hr|hr|1", "ops|ops|1"],
+            "target={target}"
+        );
+    }
+    // 未知の修飾子は 42P01、曖昧な非修飾列は 42702 のまま伝播する。
+    assert_rejected(
+        &core,
+        &format!("SELECT dept.dname, COUNT(*) AS n {base} GROUP BY dept.dname ORDER BY zz.dname"),
+        "42P01",
+    );
+    assert_rejected(
+        &core,
+        &format!("SELECT dept.dname, COUNT(*) AS n {base} GROUP BY dept.dname ORDER BY id"),
+        "42702",
+    );
+}
+
+#[test]
+fn non_aggregate_join_projection_is_not_limited_by_the_aggregate_item_cap() {
+    let (storage, path) = seeded();
+    let _g = CleanupGuard(path);
+    let core = new_core(storage);
+    let n = engine::sql::allowlist::MAX_AGGREGATE_ITEMS + 8;
+    let cols = std::iter::repeat_n("emp.ename", n)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = run(
+        &core,
+        "tenant-a",
+        &format!("SELECT {cols} FROM dept JOIN emp ON emp.dept_id = dept.id LIMIT 10"),
+    );
+    assert_eq!(result.columns.len(), n);
+}
+
 // ---------- 上限 ----------
 
 #[test]
