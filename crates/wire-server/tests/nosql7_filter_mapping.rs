@@ -122,9 +122,9 @@ fn search_scan_aggregate_share_identical_binding_for_same_filter_array() {
 fn negation_and_unknown_operators_are_rejected_as_unsupported_syntax() {
     // Issue #945・NOSQL-14 で `gt`（範囲比較）は受理語彙へ移った。本テストは
     // 「語彙外 `op` はすべて拒否する」契約を、範囲比較・`in`・`or`（グループ
-    // キーであり `op` 値ではない）以外の代表例で固定する（詳細な語彙網羅は
+    // キーであり `op` 値ではない）・`between`（Issue #1197 で受理語彙へ移った）以外の代表例で固定する（詳細な語彙網羅は
     // `filter.rs` の単体テスト）。
-    for op in ["not", "neq", "between", "OR"] {
+    for op in ["not", "neq", "BETWEEN", "OR"] {
         let text = format!(
             r#"{{"op":"search","table":"docs","vector":[0.1],"limit":10,"filter":[{{"column":"lang","op":"{op}","value":"ja"}}]}}"#
         );
