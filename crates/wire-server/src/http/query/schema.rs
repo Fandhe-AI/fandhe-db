@@ -484,34 +484,6 @@ pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
     }],
 };
 
-/// `filter` 配列要素のサブスキーマ（`search`／`scan`／`aggregate` 共通）。
-pub static FILTER_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
-    name: "filter_item",
-    fields: &[
-        FieldSpec {
-            key: "column",
-            presence: Presence::Required,
-            ty: FieldType::String,
-            nullable: false,
-        },
-        FieldSpec {
-            key: "op",
-            presence: Presence::Required,
-            ty: FieldType::String,
-            nullable: false,
-        },
-        FieldSpec {
-            key: "value",
-            presence: Presence::Required,
-            // Issue #896（NOSQL-17）: 列型ごとの `eq`／`prefix` レーンを
-            // `filter.rs::bind_filter` が判定するため、形の検証段階では
-            // 文字列・数値・真偽値のいずれも受理する（`null` は不可）。
-            ty: FieldType::Scalar,
-            nullable: false,
-        },
-    ],
-};
-
 /// `aggregates` 配列要素のサブスキーマ（`aggregate` op）。
 pub static AGGREGATE_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
     name: "aggregate_item",
@@ -870,7 +842,9 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "filter",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            // 述語形 DML の要素の形（葉・`not` グループ・値なしの `is_null` 等）は
+            // `http::query::filter` へ集約している（Issue #1197。二重実装しない）。
+            ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
         FieldSpec {
@@ -910,7 +884,9 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "filter",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            // 述語形 DML の要素の形（葉・`not` グループ・値なしの `is_null` 等）は
+            // `http::query::filter` へ集約している（Issue #1197。二重実装しない）。
+            ty: FieldType::Array(ElementType::Any),
             nullable: false,
         },
         FieldSpec {
@@ -960,8 +936,8 @@ pub static DDL_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
             presence: Presence::Optional,
             // 文字列・数値・真偽値のいずれも型としては受理し、`bool`／`null`
             // 相当（SQL の CREATE TABLE で表現できない DEFAULT）の拒否は
-            // [`super::ddl`] の意味検証が担う（`FILTER_ITEM_SCHEMA.value` と
-            // 同じ設計）。
+            // [`super::ddl`] の意味検証が担う（`filter` の `value` と
+            // 同じく、形の検証段階では型を絞らない設計）。
             ty: FieldType::Scalar,
             nullable: false,
         },
@@ -1810,16 +1786,14 @@ mod tests {
         // `SCAN_SCHEMA`／`AGGREGATE_SCHEMA` はもはや要素の形を検査しない
         // （`FieldType::Array(ElementType::Any)`）。形・語彙・上限の検査は
         // `http::query::filter` モジュールへ集約した（二重実装しない）。
-        // `UPDATE_SCHEMA`／`DELETE_SCHEMA` は従来どおり `FILTER_ITEM_SCHEMA`
-        // （葉形のみ）で要素を検査する（#1062 の範囲。変更していない）。
+        // `UPDATE_SCHEMA`／`DELETE_SCHEMA` も Issue #1197 で同様に要素の形を
+        // 検査しなくなった（`not` グループ・値なしの `is_null` 等を表現できない
+        // ため。述語形 DML の形検査は `filter::bind_filter_where_predicates`）。
         let v = obj(r#"{"op":"search","table":"docs","limit":1,"filter":[{"column":"a"}]}"#);
         assert!(SEARCH_SCHEMA.validate(&v).is_ok());
 
         let v = obj(r#"{"op":"update","table":"docs","set":{},"filter":[{"column":"a"}]}"#);
-        assert_eq!(
-            UPDATE_SCHEMA.validate(&v).unwrap_err(),
-            SchemaError::MissingRequired { key: "op" }
-        );
+        assert!(UPDATE_SCHEMA.validate(&v).is_ok());
     }
 
     #[test]
