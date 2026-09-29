@@ -121,3 +121,51 @@ fn window_combined_with_group_by_is_rejected_over_wire() {
     expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 }
+/// Issue #1189: 文全体のスカラー `ORDER BY` とウィンドウ関数の併用が wire 越しに
+/// 行順（`score` 降順）とウィンドウ値の対応を保って返る。
+#[test]
+fn window_with_scalar_order_by_returns_sorted_rows_over_wire() {
+    let (core, _guard) = new_core_window_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score) AS rn FROM docs ORDER BY score DESC LIMIT 10",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["id", "rn"]);
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for _ in 0..3 {
+        let row = read_data_row(&mut stream);
+        rows.push((
+            row[0].clone().expect("id must not be NULL"),
+            row[1].clone().expect("rn must not be NULL"),
+        ));
+    }
+    // score 降順: id=2(20), id=1(10), id=3(5)。rn はパーティション内の昇順順位。
+    assert_eq!(
+        rows,
+        vec![
+            ("2".to_string(), "2".to_string()),
+            ("1".to_string(), "1".to_string()),
+            ("3".to_string(), "1".to_string()),
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #1189: ウィンドウ別名による文全体の `ORDER BY` は `42601`。
+#[test]
+fn order_by_window_alias_is_rejected_over_wire() {
+    let (core, _guard) = new_core_window_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, ROW_NUMBER() OVER () AS rn FROM docs ORDER BY rn LIMIT 10",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}

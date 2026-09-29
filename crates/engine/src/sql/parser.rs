@@ -5502,6 +5502,19 @@ pub(crate) fn bind_scan_with_dummy_flags(
                 .unwrap_or_else(|| item.func.default_alias());
             window_aliases.insert(alias);
         }
+        // Issue #1189: 文全体の ORDER BY がウィンドウ別名を参照する形も同じ理由
+        // （ウィンドウ値は base scan の並べ替えより後に確定する）で 42601。
+        // 実在列・疑似列 `id` が同名なら列参照として解釈する。
+        for key in stmt.order_by() {
+            if window_aliases.contains(key.column.as_str())
+                && key.column != "id"
+                && !schema.columns.iter().any(|c| c.name == key.column)
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "ORDER BY cannot reference a window function alias",
+                ));
+            }
+        }
         let mut where_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
         collect_where_predicate_idents(stmt.where_predicates(), &mut where_idents);
         for ident in &where_idents {
