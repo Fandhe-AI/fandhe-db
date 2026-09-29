@@ -153,8 +153,10 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 - NOT NULL 違反の `23502` 統一・`DEFAULT`（Issue #904 で実装済み）、`UNIQUE`
   （Issue #905 で実装済み）、`CHECK`（Issue #906 で実装済み）、`FOREIGN KEY`（Issue #907 で実装済み。
   `docs/design/foreign-key.md`）。
-- `ALTER TABLE ADD/DROP CONSTRAINT`・`ADD PRIMARY KEY`、`ON CONFLICT (<主キー列>)`、
-  NoSQL 表層の DDL op。
+- `ALTER TABLE ADD/DROP CONSTRAINT`（UNIQUE・CHECK・FOREIGN KEY は実装済み）、
+  `ADD PRIMARY KEY`／主キーの `DROP CONSTRAINT` は Issue #1196 で実装済み
+  （`docs/design/alter-table-primary-key.md`）。`ON CONFLICT (<主キー列>)`、
+  NoSQL 表層の DDL op は未対応。
 - `42703`（未知列）・`42P16`・`2BP01` の `ErrorClass` 追加と SQL 写像。
 - 台帳由来 `23505` のラベル `DUPLICATE_OPERATION_ID` 分離は Issue #1180 で解消
   （engine の `ErrorClass`・HTTP `code`。pg wire は ERR-1 の既存形式のまま）。
