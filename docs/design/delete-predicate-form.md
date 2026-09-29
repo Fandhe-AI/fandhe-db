@@ -70,7 +70,7 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 | `WHERE path LIKE 'src/%'` | 述語形 | `DeleteStatement::Predicate`（`Prefix`） |
 | `WHERE id > 5` | 述語形 | `DeleteStatement::Predicate`（`Expression`） |
 | `WHERE id = 1 AND lang = 'ja'` | 述語形 | `DeleteStatement::Predicate`（宣言順 2 件） |
-| `WHERE visible()` | 述語形 | `DeleteStatement::Predicate`（`PredicateCall`。受理して無視。下記参照） |
+| `WHERE visible()` | 述語形 | `DeleteStatement::Predicate`（`PredicateCall`。構造段は受理、束縛段 `bind_predicate_delete` で単独形は `42601`。Issue #1181） |
 | `WHERE` 省略 | — | `42601`（全行削除の意図は `TRUNCATE TABLE` の管轄） |
 | `... HINT ORDER(...)` / `ORDER BY ...` / `LIMIT ...` / `USING MODE ...` | — | `42601`（許可形状外の余剰トークン） |
 | `... RETURNING ...`（述語形） | — | `42601`（構造上は受理するが、実行結線〔#871〕が未着手のため `validate_delete_statement_tokens` の `Predicate` 腕が単一のチョークポイントで拒否する。単一行形は実行結線済みのため受理する——Issue #873・SQL-21・`docs/design/sql-returning.md` 参照） |
@@ -85,7 +85,9 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
   `42601` と、実行結線（#871）が導入する影響行数上限の 2 点で構成する。
 - **`visible()`**: `bind_where_predicates` は `rls_predicate_present` フラグを
   立てるのみで、フィルタとしては何も生成しない（scan／aggregate と同じ挙動）。
-  述語に `visible()` を含めても RLS 暗黙適用を解除・緩和できない。
+  述語に `visible()` を含めても RLS 暗黙適用を解除・緩和できない。`visible()`
+  のみ（他フィルタが全て空）の DELETE は全行削除と等価なため、束縛段で UPDATE と
+  同じ `42601` で拒否する（他述語との併用は受理。Issue #1181）。
 - **`id` 実列を持つテーブル**: 単一行形の先読みは疑似列 `id` として扱う（SQL-18
   と同じ）。述語形の式内 `id` は `bind_expr` が実列を優先する既存契約に従う
   （`sql::udf_call::bind_expr` の列名解決の既存挙動。本 Issue で変更しない）。
