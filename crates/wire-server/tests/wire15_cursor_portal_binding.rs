@@ -515,3 +515,55 @@ fn fetch_response_overflow_fails_transaction_instead_of_skipping_rows() {
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
     read_ready_for_query(&mut stream);
 }
+
+// --- Sync を越えて保持された FETCH portal（WIRE-11・Issue #1174） ---
+
+/// 明示トランザクション中は、中断保持中の `FETCH` portal が Sync を越えて
+/// 保持され、世代・カーソル識別子が一致する限り残りの行で再開できる。
+#[test]
+fn suspended_fetch_portal_resumes_across_sync_inside_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 3);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    declare_and_suspend_fetch_portal(&mut stream, 3);
+    send_sync(&mut stream);
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+    assert_eq!(body.last().copied(), Some(b'T'));
+
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pf", 0));
+    for _ in 0..2 {
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b'D', "expected remaining DataRow after Sync");
+    }
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "expected CommandComplete");
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+}
+
+/// Sync を越えた `FETCH` portal でも、Sync 後に `CLOSE c` を挟めば従来どおり
+/// `34000` で拒否され、行は送出されない（世代・識別子の照合を維持）。
+#[test]
+fn fetch_portal_kept_across_sync_is_rejected_after_cursor_close() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    declare_and_suspend_fetch_portal(&mut stream, 5);
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    send_simple_query(&mut stream, "CLOSE c");
+    assert_eq!(read_command_complete(&mut stream), "CLOSE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    assert_resume_rejected_without_leaking_rows(&mut stream);
+}

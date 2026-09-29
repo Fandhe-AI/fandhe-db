@@ -29,7 +29,7 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
 | Bind（'B'） | 対象 statement を `describe_parsed_in_session` で確定し portal を保持する。結果 format code を [`result_encoder::ResultFormats::resolve`]／[`validate_binary_formats`] で列ごとに解決・事前検査する（WIRE-14）。パラメータ数不一致・format code 個数不正は `08P01`、パラメータ側の binary 指定・結果側の非対応型指定は `0A000` |
 | Describe（'D' 種別 P） | portal の `RowDescription`／`NoData`（`ParameterDescription` は返さない） |
 | Execute（'E'） | portal を実行し、`max_rows` に応じて分割送出する（`PortalSuspended`／`CommandComplete`） |
-| Sync（'S'） | エラー後の同期回復モードを解除し、名前付き・無名を問わず全 portal を破棄して `ReadyForQuery` を返す（PR #1013 レビュー指摘・codex P1。本サーバーには明示トランザクションが無く各 Sync サイクルが暗黙トランザクションに相当する） |
+| Sync（'S'） | エラー後の同期回復モードを解除し、`ReadyForQuery` を返す。portal は `Idle`／`Failed` では全破棄、明示トランザクション中（`InTransaction`）は同世代で Bind した名前付き portal のみ保持し無名は破棄する（PR #1013 codex P1・Issue #1174） |
 | Close（'C'） | statement／portal を解放（未存在名も成功）。statement の Close は派生 portal も閉じる |
 | Flush（'H'） | 出力を flush するのみ（`ReadyForQuery` は送らない） |
 
@@ -55,8 +55,8 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   経路があると、長さフィールド欠落・不正長・余剰 body を持つ malformed
   Terminate が「エラー後」という条件だけで正規の Terminate として受理されて
   しまう）。
-- Sync 到達で `ignore_till_sync` を解除し、名前付き・無名を問わず全 portal
-  を破棄してから `ReadyForQuery`（状態バイトは `SessionTransaction::status()`
+- Sync 到達で `ignore_till_sync` を解除し、portal を整理してから
+  `ReadyForQuery`（状態バイトは `SessionTransaction::status()`
   から `'I'`／`'T'`／`'E'` へ写像。WIRE-19・#943・PR #1041 レビュー指摘対応で
   結線済み）を返す。
 
@@ -115,13 +115,16 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   PR #1013 レビュー指摘・P0）。分割送出時の `CommandComplete` の件数は
   「portal 全体の累計送出行数」（PostgreSQL の `PortalRun` と同じ契約。
   PR #1013 レビュー指摘・P1: 直近 Execute の件数だけでは過小になる）。
-- Sync は名前付き・無名を問わず全 portal を破棄する（PR #1013 レビュー
-  指摘・codex P1。本サーバーには明示トランザクション〔`BEGIN`/`COMMIT`〕が
-  無く各 Sync サイクルが暗黙トランザクションに相当するため、PostgreSQL の
-  「トランザクション終了時に portal を閉じる」契約〔PostgreSQL 34.4
-  「Bind」〕を Sync 境界へ適用する。名前付き prepared statement
-  〔`PreparedStatementStore`〕は Sync を越えて残る——PostgreSQL と同じ
-  挙動）。
+- Sync は、`Idle`／`Failed` では名前付き・無名を問わず全 portal を破棄する
+  （PR #1013 レビュー指摘・codex P1）。明示トランザクション中は、同じ
+  トランザクション世代で Bind した名前付き portal だけを Sync を越えて保持し
+  （WIRE-11・Issue #1174。JDBC 等の `max_rows` 分割取得の継続に必要）、無名
+  portal は破棄する。保持した portal は `COMMIT`／`ROLLBACK`／abort／期限切れ
+  でトランザクションが終わった時点（次メッセージ処理の先頭）で失効する。
+  `Idle` 中に Bind し同一サイクルで `BEGIN` した portal は保守側に倒して
+  破棄する（PostgreSQL の暗黙ブロック昇格とは異なる）。同一 Sync サイクル内
+  での `COMMIT` 後の挙動（`Done` portal の完了タグ再送）は変えない。名前付き
+  prepared statement〔`PreparedStatementStore`〕は Sync を越えて残る。
 
 ## Execute と応答整形の共有（第 2 の実行器を作らない）
 
