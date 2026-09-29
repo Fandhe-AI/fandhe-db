@@ -4246,7 +4246,7 @@ impl EngineCore {
                 // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
                 // 解決する（`sql::subquery` モジュールドキュメント参照）。
                 let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &schema,
@@ -4255,7 +4255,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     &mut subquery_budget,
-                    &mut subquery_in_leaf_budget,
+                    &mut subquery_in_value_budget,
                 )?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
@@ -4282,7 +4282,7 @@ impl EngineCore {
                 // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: `Statement::
                 // Aggregate` アームと同じ理由・同じ経路でサブクエリを解決する。
                 let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &schema,
@@ -4291,7 +4291,7 @@ impl EngineCore {
                     &self.storage,
                     session.udfs(),
                     &mut subquery_budget,
-                    &mut subquery_in_leaf_budget,
+                    &mut subquery_in_value_budget,
                 )?;
                 let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
