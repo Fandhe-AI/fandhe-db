@@ -1462,6 +1462,44 @@ pub enum ParsedSql {
     DropIndex(crate::sql::allowlist::ValidatedDropIndex),
 }
 
+/// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
+/// トランザクション。[`crate::storage::read_source::ReadSource`]）から `table_name` の
+/// スキーマを取得する（[`EngineCore::read_txn_with_schema`] とエラー分類を共有する
+/// 単一の写像。Issue #1179）。
+fn table_schema_in(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+) -> Result<crate::catalog::TableSchema, crate::sql::allowlist::SqlSurfaceError> {
+    crate::catalog::get_table_schema_in_txn(read_txn, table_name).map_err(|e| match e {
+        CatalogError::TableNotFound(name) => {
+            crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+        }
+        // `CatalogError::Invalid`（識別子形式不正）は `catalog::table_lookup_error`
+        // （`impl TableLookup for Storage` と共有する単一の写像本体）へ委譲し、
+        // SQL 表層と同じ `42601`（unsupported syntax）へ分類する（Issue #728 PR #788
+        // レビュー指摘）。`Invalid` 以外（内部破損系）は `Internal` に丸め込まれる。
+        other => crate::catalog::table_lookup_error(other),
+    })
+}
+
+/// [`table_schema_in`] の複数テーブル版（重複名は 1 回だけ解決する）。
+fn table_schemas_in(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_names: &[String],
+) -> Result<
+    std::collections::HashMap<String, crate::catalog::TableSchema>,
+    crate::sql::allowlist::SqlSurfaceError,
+> {
+    let mut schemas = std::collections::HashMap::with_capacity(table_names.len());
+    for name in table_names {
+        if schemas.contains_key(name) {
+            continue;
+        }
+        schemas.insert(name.clone(), table_schema_in(read_txn, name)?);
+    }
+    Ok(schemas)
+}
+
 /// `parsed` が保持する `operation_id`（`USING OPERATION_ID '<id>'`。書き込み系
 /// 文のみ保持しうる）。[`EngineCore::execute_parsed_in_txn`] が同一トランザクション
 /// 内での再利用検査（[`crate::sql::transaction::SessionTransaction::
@@ -2757,33 +2795,25 @@ impl EngineCore {
         (redb::ReadTransaction, crate::catalog::TableSchema),
         crate::sql::allowlist::SqlSurfaceError,
     > {
-        let read_txn = self.storage.db().begin_read().map_err(|e| {
+        let read_txn = self.begin_read_txn()?;
+        let schema = table_schema_in(&read_txn, table_name)?;
+        Ok((read_txn, schema))
+    }
+
+    /// 確定済みスナップショットの read トランザクションを開始する
+    /// （[`Self::read_txn_with_schema`]・[`Self::read_txn_with_schemas`]・
+    /// [`Self::execute_validated_in_session`] の読み取りアームが共有する入口）。
+    fn begin_read_txn(
+        &self,
+    ) -> Result<redb::ReadTransaction, crate::sql::allowlist::SqlSurfaceError> {
+        self.storage.db().begin_read().map_err(|e| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!(
                     "failed to begin read transaction: {}",
                     StorageError::from(e)
                 ),
             }
-        })?;
-        let schema = crate::catalog::get_table_schema_in_txn(&read_txn, table_name).map_err(
-            |e| match e {
-                CatalogError::TableNotFound(name) => {
-                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                }
-                // `CatalogError::Invalid`（識別子形式不正）は `catalog::table_lookup_error`
-                // （`impl TableLookup for Storage` と共有する単一の写像本体）へ委譲し、
-                // SQL 表層（`validate_sql` の `TableLookup::table_exists` 経由）と同じ
-                // `42601`（unsupported syntax）へ分類する。ここで独自に `Internal`
-                // （`XX000`）へ丸め込むと、[`Self::execute_bound_scan_in_session`]・
-                // [`Self::execute_bound_aggregate_in_session`] のドキュメンテーション
-                // コメントが謳う「SQL 経路と同一のエラー分類・露出範囲」契約が、
-                // 不正なテーブル名に対してだけ破られてしまう（Issue #728 PR #788
-                // レビュー指摘）。`Invalid` 以外（`Backend`／`CorruptSchema` 等の内部
-                // 破損系）は `table_lookup_error` 内で引き続き `Internal` に丸め込まれる。
-                other => crate::catalog::table_lookup_error(other),
-            },
-        )?;
-        Ok((read_txn, schema))
+        })
     }
 
     /// [`Self::read_txn_with_schema`] の複数テーブル版（SQL-29 (c)・RLS-10 (b)・
@@ -2802,28 +2832,8 @@ impl EngineCore {
         ),
         crate::sql::allowlist::SqlSurfaceError,
     > {
-        let read_txn = self.storage.db().begin_read().map_err(|e| {
-            crate::sql::allowlist::SqlSurfaceError::Internal {
-                detail: format!(
-                    "failed to begin read transaction: {}",
-                    StorageError::from(e)
-                ),
-            }
-        })?;
-        let mut schemas = std::collections::HashMap::with_capacity(table_names.len());
-        for name in table_names {
-            if schemas.contains_key(name) {
-                continue;
-            }
-            let schema =
-                crate::catalog::get_table_schema_in_txn(&read_txn, name).map_err(|e| match e {
-                    CatalogError::TableNotFound(name) => {
-                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                    }
-                    other => crate::catalog::table_lookup_error(other),
-                })?;
-            schemas.insert(name.clone(), schema);
-        }
+        let read_txn = self.begin_read_txn()?;
+        let schemas = table_schemas_in(&read_txn, table_names)?;
         Ok((read_txn, schemas))
     }
 
@@ -3694,8 +3704,22 @@ impl EngineCore {
             // でないことを確認してから実行する（`docs/design/
             // multi-relation-plan-foundation.md` の申し送り事項を消化する）。
             ParsedSql::Statement(stmt @ Statement::Join(v)) => {
-                crate::sql::relation::ensure_relations_not_written(txn, &v.relations)?;
-                self.execute_validated_in_session(ctx, session, stmt.clone())
+                // `table` は `USING PLAN`／`EXPLAIN` の dirty 判定にしか使われず、JOIN は
+                // 常に読み取り経路（未 commit 変更の反映）へ入るため参考値（先頭のリレーション）。
+                let table = v
+                    .relations
+                    .first()
+                    .map(|r| r.table().to_string())
+                    .unwrap_or_default();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
+            }
+            // Issue #1179: 集合演算も他の読み取り文と同じ経路で読む（未 commit の
+            // 変更があれば書き込みトランザクションを読み取り源にする）。
+            ParsedSql::Statement(stmt @ Statement::SetOperation(v)) => {
+                let mut tables = Vec::new();
+                crate::sql::set_op::collect_branch_tables(&v.tree, &mut tables);
+                let table = tables.first().cloned().unwrap_or_default();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
@@ -3746,18 +3770,19 @@ impl EngineCore {
     /// 保持している分を差し引いた残容量を生成予算にすることで、`declare` の
     /// 合計上限判定より前に「既存保持量＋新規結果」が上限を超えて確保される
     /// ことを防ぐ（PR #1049 レビュー指摘 codex P1 対応）。
-    fn execute_cursor_inner_query(
+    fn execute_cursor_inner_query<R: crate::storage::read_source::ReadSource>(
         &self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
         inner: &crate::sql::allowlist::Statement,
         max_result_bytes: usize,
+        read_txn: &R,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         if let crate::sql::allowlist::Statement::Scan(validated) = inner {
-            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let schema = table_schema_in(read_txn, &validated.table_name)?;
             let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
             let result = crate::sql::scan::execute_scan_with_budget(
-                &read_txn,
+                read_txn,
                 ctx,
                 &schema,
                 &bound,
@@ -3766,13 +3791,13 @@ impl EngineCore {
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         if let crate::sql::allowlist::Statement::Aggregate(validated) = inner {
-            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let schema = table_schema_in(read_txn, &validated.table_name)?;
             let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
             let result =
-                self.run_aggregate_plan(&read_txn, ctx, &schema, &bound, max_result_bytes)?;
+                self.run_aggregate_plan(read_txn, ctx, &schema, &bound, max_result_bytes)?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
-        self.execute_validated_in_session(ctx, session, inner.clone())
+        self.execute_read_statement(ctx, session, inner.clone(), read_txn)
     }
 
     /// [`Self::execute_in_active_txn`] の `ParsedSql::Cursor` 分岐本体
@@ -3807,13 +3832,8 @@ impl EngineCore {
                 // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
                 // セッション自身の `ctx` で暗黙適用する）が適用される。
                 // `table` はビュー展開後の基底テーブル名。
-                let (inner, table) =
+                let (inner, _table) =
                     crate::sql::cursor::validate_declare_inner(query, &self.storage)?;
-                if txn.table_already_written(&table) {
-                    return Err(SqlSurfaceError::transaction_feature_not_supported(
-                        "reading a table already written in the same transaction is not supported",
-                    ));
-                }
                 let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -3822,8 +3842,31 @@ impl EngineCore {
                 // する（PR #1049 レビュー指摘 codex P1 対応。
                 // `execute_cursor_inner_query` のドキュメント参照）。
                 let remaining_bytes = registry.remaining_bytes();
-                let outcome =
-                    self.execute_cursor_inner_query(ctx, session, &inner, remaining_bytes)?;
+                // 自トランザクションが未 commit の変更を持つ間（dirty テーブルあり）は
+                // 共有書き込みトランザクションを読み取り源にして内側 SELECT を実行し、
+                // 未 commit の変更を反映する（Issue #1179。キャッシュは使われない）。
+                // 変更がなければ従来どおり確定済みスナップショットで実行する。
+                let outcome = if txn.dirty_tables()?.is_empty() {
+                    let read_txn = self.begin_read_txn()?;
+                    self.execute_cursor_inner_query(
+                        ctx,
+                        session,
+                        &inner,
+                        remaining_bytes,
+                        &read_txn,
+                    )?
+                } else {
+                    let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?;
+                    self.execute_cursor_inner_query(
+                        ctx,
+                        session,
+                        &inner,
+                        remaining_bytes,
+                        write_txn,
+                    )?
+                };
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
                     // `inner` は構造検証段で `Statement::Aggregate`／
@@ -3865,11 +3908,23 @@ impl EngineCore {
     }
 
     /// 明示トランザクション内の読み取り系文（`Active` のときのみ呼ばれる）。
-    /// 同一トランザクション内で既に書き込み済みのテーブルへの読み取りは
-    /// `0A000` で拒否する（自トランザクションの未 commit 変更の可視化は対象外。
-    /// `sql::transaction` モジュールドキュメント「読み取りの既知の逸脱」参照）。
-    /// それ以外は BEGIN 時点のスナップショットに対する通常の読み取り経路
-    /// （[`Self::execute_validated_in_session`]）へそのまま委譲する。
+    ///
+    /// 自トランザクションが未 commit の変更を持たない（dirty テーブルなし）間は、
+    /// BEGIN 時点の確定済みスナップショットに対する通常の読み取り経路
+    /// （[`Self::execute_validated_in_session`]。キャッシュ利用可。単一ライタにより
+    /// スナップショットは BEGIN 時点と一致する）へ委譲する。変更を持つ間は、
+    /// 共有書き込みトランザクションを読み取り源（[`crate::storage::read_source::ReadSource`]）
+    /// にして同じ実行本体（[`Self::execute_read_statement`]。RLS・束縛・実行は
+    /// autocommit と共通）を呼び、自トランザクションの未 commit の変更を反映する
+    /// （キャッシュは使われない brute-force 経路。Issue #1179）。dirty は文が直接
+    /// 書き込んだテーブルに加え、参照アクションの連鎖で書き換わった子テーブルを含む
+    /// （[`crate::sql::transaction::SessionTransaction::dirty_tables`]）。サブクエリ・
+    /// JOIN・集合演算が別テーブルの未 commit 変更を読む場合も、文全体が同じ読み取り源
+    /// を使うため反映される。
+    ///
+    /// 例外: `USING PLAN` を伴う検索 SELECT と `EXPLAIN` は LLM I/O・テーブル世代の
+    /// 再照合を伴い確定済みスナップショットに依存するため、対象テーブル（`table`）が
+    /// dirty のときは `0A000` で拒否する（黙って古い結果を返さない。既知の逸脱）。
     fn read_only_in_active_txn<'e>(
         &'e self,
         ctx: &PolicyContext,
@@ -3878,14 +3933,40 @@ impl EngineCore {
         table: &str,
         stmt: crate::sql::allowlist::Statement,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        if txn.table_already_written(table) {
-            return Err(
-                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                    "reading a table already written in the same transaction is not supported",
-                ),
-            );
+        use crate::sql::allowlist::Statement;
+
+        let dirty = txn.dirty_tables()?;
+        if dirty.is_empty() {
+            return self.execute_validated_in_session(ctx, session, stmt);
         }
-        self.execute_validated_in_session(ctx, session, stmt)
+        let is_using_plan_select =
+            matches!(&stmt, Statement::Select(v) if v.using_plan().is_some());
+        match stmt {
+            Statement::Select(_)
+            | Statement::Aggregate(_)
+            | Statement::Scan(_)
+            | Statement::SetOperation(_)
+            | Statement::Join(_)
+                if !is_using_plan_select =>
+            {
+                let write_txn = txn.write_txn().ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }
+                })?;
+                self.execute_read_statement(ctx, session, stmt, write_txn)
+            }
+            other => {
+                if dirty.contains(table) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                            "this read of a table already written in the same transaction is not supported",
+                        ),
+                    );
+                }
+                self.execute_validated_in_session(ctx, session, other)
+            }
+        }
     }
 
     /// Describe（拡張クエリプロトコルの 'D' 種別 S。Issue #933・TASK-71・
@@ -4280,15 +4361,13 @@ impl EngineCore {
                     )?;
                     Ok(crate::sql::SqlOutcome::Query(result))
                 } else {
-                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                    let bound = crate::sql::parser::bind_in_session(
-                        &validated,
-                        &schema,
-                        session.search_mode(),
-                        session.udfs(),
-                    )?;
-                    let result = self.run_select_plan(&read_txn, ctx, &schema, &bound)?;
-                    Ok(crate::sql::SqlOutcome::Query(result))
+                    let read_txn = self.begin_read_txn()?;
+                    self.execute_read_statement(
+                        ctx,
+                        session,
+                        crate::sql::allowlist::Statement::Select(validated),
+                        &read_txn,
+                    )
                 }
             }
             // TASK-166（SQL-13）: 集計 SELECT はスキーマ取得（`bind_aggregate` 用）・
@@ -4300,35 +4379,14 @@ impl EngineCore {
             // [`Self::run_aggregate_plan`] を共有する（TASK-186・NOSQL-4・NOSQL-5:
             // [`Self::execute_bound_aggregate_in_session`] が同じ実行本体を束縛済み
             // 計画向けに再利用する）。
-            crate::sql::allowlist::Statement::Aggregate(mut validated) => {
-                let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
-                // （`bind_aggregate`）の前に WHERE 中のサブクエリ
-                // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
-                // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
-                // 解決する（`sql::subquery` モジュールドキュメント参照）。
-                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
-                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
-                    validated.where_predicates,
-                    &schema,
-                    &read_txn,
+            crate::sql::allowlist::Statement::Aggregate(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
                     ctx,
-                    &self.storage,
-                    session.udfs(),
-                    &mut subquery_budget,
-                    &mut subquery_in_leaf_budget,
-                )?;
-                let bound =
-                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
-                let result = self.run_aggregate_plan(
+                    session,
+                    crate::sql::allowlist::Statement::Aggregate(validated),
                     &read_txn,
-                    ctx,
-                    &schema,
-                    &bound,
-                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
-                )?;
-                Ok(crate::sql::SqlOutcome::Query(result))
+                )
             }
             // Issue #454: 広域取得（ソートなしのフィルタ取得）は `Statement::Aggregate`
             // アームと同じく、スキーマ取得（`bind_scan` 用）・行走査
@@ -4339,25 +4397,14 @@ impl EngineCore {
             // [`Self::read_txn_with_schema`] を、実行本体は [`Self::run_scan_plan`]
             // を共有する（TASK-186・NOSQL-3: [`Self::execute_bound_scan_in_session`]
             // が同じ実行本体を束縛済み計画向けに再利用する）。
-            crate::sql::allowlist::Statement::Scan(mut validated) => {
-                let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
-                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: `Statement::
-                // Aggregate` アームと同じ理由・同じ経路でサブクエリを解決する。
-                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
-                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
-                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
-                    validated.where_predicates,
-                    &schema,
-                    &read_txn,
+            crate::sql::allowlist::Statement::Scan(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
                     ctx,
-                    &self.storage,
-                    session.udfs(),
-                    &mut subquery_budget,
-                    &mut subquery_in_leaf_budget,
-                )?;
-                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
-                let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
-                Ok(crate::sql::SqlOutcome::Query(result))
+                    session,
+                    crate::sql::allowlist::Statement::Scan(validated),
+                    &read_txn,
+                )
             }
             // TASK-78（SQL-6）・Issue #922（SQL-27）: `EXPLAIN` は対象文（検索・
             // 集計・広域取得のいずれも）の本体（ハイブリッド実行・行走査・
@@ -4463,11 +4510,116 @@ impl EngineCore {
             // 適用）は `sql::set_op::execute` が担う（第 2 の実行器を作らない
             // 方針は `Statement::Scan` と同じ）。
             crate::sql::allowlist::Statement::SetOperation(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
+                    ctx,
+                    session,
+                    crate::sql::allowlist::Statement::SetOperation(validated),
+                    &read_txn,
+                )
+            }
+            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN も両辺を単一
+            // スナップショット上で評価する必要があるため、`Statement::SetOperation`
+            // と同じく `read_txn_with_schemas`（複数テーブル版）で両辺のスキーマを
+            // まとめて解決する。実行本体（束縛・型検証・ハッシュ結合・RLS 独立
+            // 適用）は `sql::join::execute` が担う（第 2 の実行器を作らない）。
+            crate::sql::allowlist::Statement::Join(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
+                    ctx,
+                    session,
+                    crate::sql::allowlist::Statement::Join(validated),
+                    &read_txn,
+                )
+            }
+        }
+    }
+
+    /// `Statement::Select`（`USING PLAN` なし）・`Aggregate`・`Scan`・`SetOperation`・
+    /// `Join` の実行本体（読み取り源 `read_txn` を引数に取る。Issue #1179）。
+    ///
+    /// [`Self::execute_validated_in_session`]（autocommit。確定済みスナップショットを
+    /// 開いて渡す。従来と同一の挙動）と、明示トランザクション内で自トランザクションの
+    /// 未 commit 変更を読む経路（[`Self::execute_in_active_txn`]。共有書き込み
+    /// トランザクションを渡す。キャッシュは `read_txn.snapshot()` が `None` のため
+    /// 使われない）が共有する（第 2 の実行器を作らない）。スキーマ取得・サブクエリ解決・
+    /// 実行はすべて同一の `read_txn` 上で行う（単一スナップショット契約）。
+    fn execute_read_statement<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+        read_txn: &R,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        match stmt {
+            crate::sql::allowlist::Statement::Select(validated) => {
+                let schema = table_schema_in(read_txn, &validated.table_name)?;
+                let bound = crate::sql::parser::bind_in_session(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                    session.udfs(),
+                )?;
+                let result = self.run_select_plan(read_txn, ctx, &schema, &bound)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            crate::sql::allowlist::Statement::Aggregate(mut validated) => {
+                let schema = table_schema_in(read_txn, &validated.table_name)?;
+                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
+                // （`bind_aggregate`）の前に WHERE 中のサブクエリ
+                // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
+                // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
+                // 解決する（`sql::subquery` モジュールドキュメント参照）。
+                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+                    validated.where_predicates,
+                    &schema,
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_leaf_budget,
+                )?;
+                let bound =
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                let result = self.run_aggregate_plan(
+                    read_txn,
+                    ctx,
+                    &schema,
+                    &bound,
+                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            crate::sql::allowlist::Statement::Scan(mut validated) => {
+                let schema = table_schema_in(read_txn, &validated.table_name)?;
+                // `Statement::Aggregate` と同じ理由・同じ経路でサブクエリを解決する。
+                let mut subquery_budget = crate::sql::subquery::MAX_SUBQUERY_EXECUTIONS;
+                let mut subquery_in_leaf_budget = crate::sql::subquery::MAX_SUBQUERY_IN_LEAVES;
+                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+                    validated.where_predicates,
+                    &schema,
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_leaf_budget,
+                )?;
+                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
+                let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // 集合演算・JOIN は複数枝／両辺を単一スナップショット上で評価する必要が
+            // あるため、全テーブルのスキーマをまとめて解決する（Issue #929・#925）。
+            crate::sql::allowlist::Statement::SetOperation(validated) => {
                 let mut table_names = Vec::new();
                 crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
-                let (read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let schemas = table_schemas_in(read_txn, &table_names)?;
                 let result = crate::sql::set_op::execute(
-                    &read_txn,
+                    read_txn,
                     ctx,
                     &schemas,
                     &validated.tree,
@@ -4476,23 +4628,16 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
-            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN も両辺を単一
-            // スナップショット上で評価する必要があるため、`Statement::SetOperation`
-            // と同じく `read_txn_with_schemas`（複数テーブル版）で両辺のスキーマを
-            // まとめて解決する。実行本体（束縛・型検証・ハッシュ結合・RLS 独立
-            // 適用）は `sql::join::execute` が担う（第 2 の実行器を作らない）。
             crate::sql::allowlist::Statement::Join(validated) => {
                 let table_names = crate::sql::join::collect_join_tables(&validated);
-                let (read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
-                let result = crate::sql::join::execute(
-                    &read_txn,
-                    ctx,
-                    &schemas,
-                    &validated,
-                    session.udfs(),
-                )?;
+                let schemas = table_schemas_in(read_txn, &table_names)?;
+                let result =
+                    crate::sql::join::execute(read_txn, ctx, &schemas, &validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
         }
     }
 
@@ -4508,7 +4653,7 @@ impl EngineCore {
     /// 最適化・ANN opt-in・precision fail-closed 契約（SEARCH-9）を受ける。
     fn run_select_plan(
         &self,
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundStatement,
@@ -4851,7 +4996,7 @@ impl EngineCore {
     /// モジュールドキュメント参照）。
     fn run_scan_plan(
         &self,
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundScan,
@@ -4878,7 +5023,7 @@ impl EngineCore {
     /// （[`crate::sql::scan::execute_scan_with_budget`] と同じ設計判断）。
     fn run_aggregate_plan(
         &self,
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
@@ -6048,10 +6193,9 @@ impl EngineCore {
     /// - `Failed`: 実行せず `25P02` 相当のエラーを返す。
     /// - `InTransaction`: `COPY FROM STDIN` は受け入れ開始のみ（書き込みは
     ///   [`Self::commit_copy_in_txn`] が行う）。`COPY (...) TO STDOUT` は他の読み取り文と
-    ///   同じく自トランザクションの dirty テーブルを読むときは未 commit の変更を見せる
-    ///   経路が必要になるため、現時点では dirty テーブルなら `0A000`（確定済み
-    ///   スナップショットの古い内容を黙って返さない）。失敗時はトランザクションを
-    ///   `Failed` へ遷移させる。
+    ///   同じく、自トランザクションが未 commit の変更を持つ間は共有書き込み
+    ///   トランザクションを読み取り源にして走査し、未 commit の変更を反映する。
+    ///   失敗時はトランザクションを `Failed` へ遷移させる。
     pub fn begin_copy_in_txn<'e>(
         &'e self,
         ctx: &PolicyContext,
@@ -6082,12 +6226,19 @@ impl EngineCore {
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         let stmt = crate::sql::allowlist::validate_copy(sql, &self.storage, self.ledger_mode)?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
-            if txn.table_already_written(v.inner.table_name()) {
-                return Err(
-                    crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                        "reading a table already written in the same transaction is not supported",
-                    ),
-                );
+            // 自トランザクションが未 commit の変更を持つ間は、共有書き込み
+            // トランザクションを読み取り源にして走査する（他の読み取り文と同じ
+            // 方針。[`Self::read_only_in_active_txn`] 参照）。
+            if !txn.dirty_tables()?.is_empty() {
+                let write_txn = txn.write_txn().ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }
+                })?;
+                let schema = table_schema_in(write_txn, v.inner.table_name())?;
+                let bound = crate::sql::parser::bind_scan(&v.inner, &schema, session.udfs())?;
+                let result = self.run_scan_plan(write_txn, ctx, &schema, &bound)?;
+                return Ok(CopyPlan::To(v.format, result));
             }
         }
         self.begin_copy_validated(ctx, session, stmt)

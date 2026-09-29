@@ -1225,7 +1225,7 @@ pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggre
 /// → `WHERE` → 可視性再検査）を独立して踏襲する（責務分離のためモジュールを分けた
 /// ことによる意図的な複製。変更する際は両モジュールの規約を揃えること）。
 pub(crate) fn execute_grouped_aggregate(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
@@ -1370,7 +1370,7 @@ pub(crate) fn execute_grouped_aggregate(
             scalar_access.cache.record_aggregate_plain_scan_fallback();
         } else if where_less || candidate_walk {
             match crate::sql::aggregate::ensure_scalar_index_snapshot(
-                read_txn,
+                crate::storage::read_source::require_snapshot(read_txn)?,
                 ctx,
                 schema,
                 &bound.table,

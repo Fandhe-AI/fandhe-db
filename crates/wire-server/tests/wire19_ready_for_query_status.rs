@@ -356,6 +356,58 @@ fn copy_inside_active_transaction_keeps_t_status_and_commits() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 }
 
+/// 明示トランザクション中の `COPY (...) TO STDOUT` は自トランザクションの未 commit の
+/// 変更を返し（Issue #1179）、完了後の `ReadyForQuery` は `'T'` のまま。別接続からは
+/// 未 commit の行が見えない。
+#[test]
+fn copy_to_stdout_inside_active_transaction_returns_uncommitted_rows() {
+    use std::io::Read;
+    let (core, _guard) = new_core_with_documents_table();
+    let mut stream = spawn_alice(Arc::clone(&core));
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    send_simple_query(&mut stream, &insert_sql(7, "op-1179-copy-to"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    send_simple_query(
+        &mut stream,
+        "COPY (SELECT id FROM documents LIMIT 100) TO STDOUT",
+    );
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let mut header = [0u8; 1];
+        stream.read_exact(&mut header).expect("read type");
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len - 4];
+        stream.read_exact(&mut body).expect("read body");
+        match header[0] {
+            b'H' => {}
+            b'd' => rows.push(body),
+            b'c' => break,
+            other => panic!("unexpected message {other}"),
+        }
+    }
+    assert_eq!(rows, vec![b"7\n".to_vec()]);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    // 別接続からは未 commit の行が見えない。
+    let mut other = spawn_alice(Arc::clone(&core));
+    send_simple_query(&mut other, "SELECT id FROM documents LIMIT 10");
+    let _ = read_row_description(&mut other);
+    let _ = read_command_complete(&mut other);
+    assert_eq!(read_ready_for_query_status(&mut other), b'I');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
 /// `Active` 中の COPY を `ROLLBACK` すると書き込みは破棄され、`Active` 中の COPY を
 /// クライアントが `CopyFail` で中断した場合は `Failed`（`'E'`）へ遷移する。
 #[test]

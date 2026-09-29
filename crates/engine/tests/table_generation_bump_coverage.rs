@@ -74,8 +74,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #942（SQL-31・TASK-221。`writer_gate` choke point 追加）で
     // `Storage::put`/`Storage::put_batch` の行番号がさらに移動したための追随
     // （旧: 652／683）。
-    ("storage.rs", 804),
-    ("storage.rs", 835),
+    // Issue #1179（`storage::read_source` モジュール宣言の追加）で行番号が移動したための追随（旧: 804／835）。
+    ("storage.rs", 805),
+    ("storage.rs", 836),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),
@@ -175,7 +176,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 衝突判定・既定名の衝突回避が FOREIGN KEY 実名を見落としていた欠落の
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
-    ("catalog.rs", 6961),
+    // Issue #1179（`ReadSource` 対応のシグネチャ変更）で行番号が移動したための
+    // 追随（旧: 6961／7040／7121／7154）。
+    ("catalog.rs", 6964),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -227,7 +230,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 衝突判定・既定名の衝突回避が FOREIGN KEY 実名を見落としていた欠落の
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
-    ("catalog.rs", 7040),
+    ("catalog.rs", 7043),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -271,7 +274,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 衝突判定・既定名の衝突回避が FOREIGN KEY 実名を見落としていた欠落の
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
-    ("catalog.rs", 7121),
+    ("catalog.rs", 7124),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -320,7 +323,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 衝突判定・既定名の衝突回避が FOREIGN KEY 実名を見落としていた欠落の
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
-    ("catalog.rs", 7154),
+    ("catalog.rs", 7157),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
@@ -338,7 +341,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 検査自体は参照先の行ストアを読むだけで `user_rows/{table}` へ書き込まない。
     // Issue #1179: COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化から
     // 検出）へ拡張したことでさらに移動した構造変更への追随（旧: 330）。
-    ("sql/transaction.rs", 359),
+    ("sql/transaction.rs", 362),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を

@@ -326,14 +326,13 @@ fn cursors_are_closed_automatically_on_commit_and_rollback() {
     assert_eq!(err.wire_code(), "34000");
 }
 
-/// スナップショットの一貫性（INSENSITIVE）: `DECLARE` は `written_tables` へ
-/// 追加しないため、`DECLARE` の**後**に同じテーブルへ書き込むこと自体は妨げ
-/// ない（本実装の意味論では、この書き込みは既に確定済みのカーソルの内容には
-/// 影響しない）。一方、既に書き込み済みのテーブルに対する `DECLARE` は
-/// `sql::transaction` の既知の逸脱（「読み取りの既知の逸脱」節）により `0A000`
-/// で拒否される。
+/// スナップショットの一貫性（INSENSITIVE）: `DECLARE` の**後**に同じテーブルへ
+/// 書き込むこと自体は妨げず、その書き込みは確定済みのカーソルの内容には影響しない。
+/// 既に書き込み済みのテーブルに対する `DECLARE` は、自トランザクションの未 commit の
+/// 変更を反映した内容で確定する（Issue #1179。書き込みトランザクションを読み取り源に
+/// する）。
 #[test]
-fn declare_and_write_to_the_same_table_in_one_transaction_is_rejected() {
+fn declare_and_write_to_the_same_table_in_one_transaction() {
     let (engine, path) = new_core();
     let _cleanup = CleanupGuard(path);
     let caller = ctx("tenant-a");
@@ -341,8 +340,6 @@ fn declare_and_write_to_the_same_table_in_one_transaction_is_rejected() {
     let mut session = SessionState::default();
     let mut txn = engine.new_session_transaction();
 
-    // `DECLARE` 自体は書き込みではないため `written_tables` へは入らない
-    // （同じトランザクションでの後続の INSERT は通常どおり成功する）。
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
@@ -358,12 +355,20 @@ fn declare_and_write_to_the_same_table_in_one_transaction_is_rejected() {
             &insert_sql(100, "ja", "op-w1"),
         )
         .expect("insert after DECLARE must still succeed (DECLARE is not a write)");
+    // DECLARE 時点で確定したカーソルの内容（1 行）は、後続の書き込みの影響を受けない。
+    let outcome = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 10 FROM c")
+        .expect("fetch");
+    let SqlOutcome::Fetch(result) = outcome else {
+        panic!("expected Fetch outcome");
+    };
+    assert_eq!(result.rows.len(), 1);
 
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
 
-    // 先に書き込んでから DECLARE すると 0A000（`written_tables` 判定）。
+    // 先に書き込んでから DECLARE すると、未 commit の行を含む内容になる。
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin 2");
@@ -375,10 +380,19 @@ fn declare_and_write_to_the_same_table_in_one_transaction_is_rejected() {
             &insert_sql(101, "ja", "op-w2"),
         )
         .expect("insert before declare");
-    let err = engine
+    engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, &declare_sql)
-        .expect_err("DECLARE against an already-written table must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
+        .expect("DECLARE against an already-written table sees the uncommitted row");
+    let outcome = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 10 FROM c")
+        .expect("fetch 2");
+    let SqlOutcome::Fetch(result) = outcome else {
+        panic!("expected Fetch outcome");
+    };
+    assert_eq!(result.rows.len(), 2);
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback 2");
 }
 
 /// ベクトル順位付けの検索 `SELECT`（`ORDER BY <=>`）は `DECLARE` の内側として
@@ -688,11 +702,10 @@ fn declare_over_view_outside_transaction_is_still_25p01() {
     assert_eq!(err.wire_code(), "25P01");
 }
 
-/// 同一トランザクション内で基底テーブルへ書き込んだ後は、ビュー越しの
-/// `DECLARE` も `0A000`（`written_tables` 判定がビュー名ではなく展開後の
-/// 基底テーブル名で行われること）。
+/// 同一トランザクション内で基底テーブルへ書き込んだ後は、ビュー越しの `DECLARE` も
+/// 展開後の基底テーブルの未 commit の変更を反映する（Issue #1179）。
 #[test]
-fn declare_over_view_after_writing_its_base_table_is_rejected() {
+fn declare_over_view_after_writing_its_base_table_sees_the_uncommitted_row() {
     let (engine, path) = new_view_core();
     let _cleanup = CleanupGuard(path);
 
@@ -702,6 +715,23 @@ fn declare_over_view_after_writing_its_base_table_is_rejected() {
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
+    let before = {
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "DECLARE v0 CURSOR FOR SELECT id FROM ja_docs LIMIT 10",
+            )
+            .expect("declare before the write");
+        let SqlOutcome::Fetch(result) = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 10 FROM v0")
+            .expect("fetch before")
+        else {
+            panic!("expected Fetch outcome");
+        };
+        result.rows.len()
+    };
     engine
         .execute_sql_in_txn(
             &caller,
@@ -710,15 +740,21 @@ fn declare_over_view_after_writing_its_base_table_is_rejected() {
             &insert_sql(100, "ja", "view-w1"),
         )
         .expect("insert into base table");
-    let err = engine
+    engine
         .execute_sql_in_txn(
             &caller,
             &mut session,
             &mut txn,
             "DECLARE v CURSOR FOR SELECT id FROM ja_docs LIMIT 10",
         )
-        .expect_err("DECLARE over a view whose base table was written must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
+        .expect("DECLARE over a view whose base table was written sees the uncommitted row");
+    let SqlOutcome::Fetch(result) = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 10 FROM v")
+        .expect("fetch after")
+    else {
+        panic!("expected Fetch outcome");
+    };
+    assert_eq!(result.rows.len(), before + 1);
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");

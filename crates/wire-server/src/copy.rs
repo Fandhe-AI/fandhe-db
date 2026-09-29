@@ -122,12 +122,12 @@ fn enforce_discard_budget<S: WireStream>(
 /// ErrorResponse を書いてから ReadyForQuery を書く
 /// （`simple_query::respond_error_and_ready` と同じ契約。COPY サブプロトコル
 /// のエラーも接続を維持する簡易クエリの一部であり、切断はしない）。
-/// `ReadyForQuery` の状態バイトは常に `Idle` を渡す ―― `handshake::
-/// post_auth_loop` は明示トランザクションが `Idle` の場合に限り本モジュール
-/// （`crate::copy::run`）へ委譲するため（SQL-31・TASK-221。`Active`／`Failed`
-/// 中の COPY は本モジュールへ到達する前に `0A000`／`25P02` で拒否される）。
+/// `ReadyForQuery` の状態バイトは接続の明示トランザクション状態（`txn.status()`）から
+/// 導出する（SQL-31・TASK-221、Issue #1179。`handshake::post_auth_loop` は `Idle`・
+/// `Active` のとき本モジュール〔`crate::copy::run`〕へ委譲し、`Failed` 中の COPY は
+/// 本モジュールへ到達する前に `25P02` で拒否する）。
 ///
-/// 明示トランザクション中（Issue #1179）に COPY が失敗した場合は、PostgreSQL と同じく
+/// 明示トランザクション中に COPY が失敗した場合は、PostgreSQL と同じく
 /// トランザクションを `Failed`（ReadyForQuery `'E'`）へ遷移させてから応答する
 /// （`txn.fail()` は `Active` 以外では何もしないため、トランザクション外の挙動は不変）。
 fn respond_error_and_ready<S: WireStream>(

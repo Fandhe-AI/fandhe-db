@@ -1783,7 +1783,7 @@ impl ColumnType {
 /// [`ENUM_TYPES_TABLE`] を read トランザクションから引く（[`decode_schema_with_resolver`]
 /// のリゾルバ実装。[`get_table_schema_in_txn`] から使う）。
 fn get_enum_type_in_read_txn(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     name: &str,
 ) -> Result<Arc<EnumTypeDef>> {
     let table = match read_txn.open_table(ENUM_TYPES_TABLE) {
@@ -5867,7 +5867,10 @@ fn reject_constrained_table_for_raw_write(schema: &TableSchema) -> Result<()> {
 /// （TASK-146）。`get_row_from_table` / `scan_table_page` の共通前段処理。スキーマ本体は
 /// 呼び出し元が使わないため取得・デコードしない（[`require_table_schema_write`] と異なり
 /// 存在確認のみ）。判定方針は同様に fail-closed。
-fn require_table_exists_read(read_txn: &redb::ReadTransaction, table_name: &str) -> Result<()> {
+fn require_table_exists_read(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    table_name: &str,
+) -> Result<()> {
     let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -5931,7 +5934,7 @@ pub(crate) fn bump_table_generation_in_txn(
 /// 書き込まれていない）場合は `0` を返す（`crate::storage::current_generation_in_txn`
 /// と同じ「未作成 = 世代 0」の方針）。
 pub(crate) fn table_generation_in_txn(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<u64> {
     match read_txn.open_table(TABLE_GENERATION_TABLE) {
@@ -7787,7 +7790,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
 /// テーブルスコープ行テーブル（[`user_rows_table_name`]）のオープンを同一
 /// スナップショットで行えるようにする（TOCTOU 対策）。
 pub(crate) fn get_table_schema_in_txn(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     table_name: &str,
 ) -> Result<TableSchema> {
     // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
@@ -7812,7 +7815,9 @@ pub(crate) fn get_table_schema_in_txn(
 }
 
 /// [`Storage::list_tables`] が共有するトランザクションスコープの実装本体。
-fn list_tables_in_txn(read_txn: &redb::ReadTransaction) -> Result<Vec<String>> {
+fn list_tables_in_txn(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+) -> Result<Vec<String>> {
     let table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),

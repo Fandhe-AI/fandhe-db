@@ -16,11 +16,14 @@
 //! `ROLLBACK`・接続断（`SessionTransaction` の drop）で行・台帳とも一括して
 //! 消える。
 //!
-//! 読み取りの既知の逸脱（SQL-31 の完全な意味論からの意図的な縮退）: 本実装は
-//! 「同一トランザクション内で自分がまだ書き込んでいないテーブル」の読み取りのみ
-//! 通常経路で許可し、既に書き込んだテーブルへの読み取りは `0A000` で拒否する
-//! （自トランザクションの未 commit 変更の可視化は対象外）。`written_tables` が
-//! この判定に使う集合。詳細は `docs/design/explicit-transaction.md` 参照。
+//! 読み取り（Issue #1179）: 自トランザクションが未 commit の変更を持たない間は
+//! BEGIN 時点の確定済みスナップショットで従来どおり読む（キャッシュ利用可）。変更を
+//! 持つ間（[`SessionTransaction::dirty_tables`] が非空）は、共有書き込み
+//! トランザクションを読み取り源（`storage::read_source::ReadSource`）にして同じ
+//! 実行本体で読み、未 commit の変更を反映する（テーブル世代キーのキャッシュは使わない）。
+//! 残る既知の逸脱は、LLM I/O と世代の再照合を伴う `USING PLAN` の検索 SELECT・
+//! `EXPLAIN` で、対象テーブルが dirty のとき `0A000` で拒否する（黙って古い結果を
+//! 返さない）。詳細は `docs/design/explicit-transaction.md` 参照。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};

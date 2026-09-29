@@ -1840,7 +1840,7 @@ pub(crate) fn storage_internal(e: impl Into<StorageError>) -> SqlSurfaceError {
 /// `Statement::Aggregate` アーム）は引き続き [`execute_aggregate_with_cache`] を
 /// 直接呼ぶ。
 pub fn execute_aggregate(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
@@ -1878,7 +1878,7 @@ pub fn execute_aggregate(
 /// （詳細・スコープ判断は `docs/design/visible-bitmap-cache.md` 参照）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_aggregate_with_cache(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
@@ -1902,6 +1902,15 @@ pub(crate) fn execute_aggregate_with_cache(
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
+    // Issue #1179）ではテーブル世代キーのキャッシュを一切使わない（未 commit の
+    // 内容から作ったエントリを共有しない。`storage::read_source` モジュールドキュメント
+    // 「キャッシュの構造的ゲート」参照）。
+    let (visible_cache, arena_cache, scalar_cache) = if read_txn.snapshot().is_some() {
+        (visible_cache, arena_cache, scalar_cache)
+    } else {
+        (None, None, None)
+    };
     // TASK-167（SQL-14）: `GROUP BY` ありは複数行結果を返すため
     // `sql::group_by::execute_grouped_aggregate` へ分岐する（グループ表の有界化・
     // `HAVING`/`ORDER BY`/`LIMIT` はそちらの責務）。`GROUP BY` なしは以下の
@@ -1980,7 +1989,7 @@ pub(crate) fn execute_aggregate_with_cache(
             != crate::sql::scalar_plan::ScalarPlan::PlainScan
         {
             if let Some(result) = try_scalar_index_aggregate(
-                read_txn,
+                crate::storage::read_source::require_snapshot(read_txn)?,
                 ctx,
                 schema,
                 bound,
@@ -2002,9 +2011,9 @@ pub(crate) fn execute_aggregate_with_cache(
     // （`AllVisible`/`IdU64`）は `ScalarExpr` を持たないため未使用のまま渡す。
     if tier == DecodeTier::Fast {
         if let Some(access) = &visible_cache {
-            if let Some(snapshot) = access
-                .cache
-                .lookup(access.storage, read_txn, &bound.table, ctx)
+            if let Some(snapshot) = read_txn
+                .snapshot()
+                .and_then(|snap| access.cache.lookup(access.storage, snap, &bound.table, ctx))
             {
                 let mut expr_scratch: Vec<StackValue> = Vec::new();
                 let empty_vector = RowVector {
@@ -2785,7 +2794,7 @@ pub(crate) fn observe_candidate_slots(
 /// 断念する（soft-fail。呼び出し元は `None` を受け取り、この集計クエリ自体は
 /// 従来の全走査へフォールバックするだけで失敗しない）。
 fn capture_scalar_index_snapshot(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     table: &str,

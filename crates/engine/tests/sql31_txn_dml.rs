@@ -443,3 +443,242 @@ fn file_form_insert_stays_unsupported_inside_transaction() {
     assert_eq!(code, "0A000");
     assert_eq!(tx.status(), TransactionStatus::Failed);
 }
+// --- 未 commit 変更の読み取り（read-your-writes） ---------------------------------
+
+fn rows_of(outcome: SqlOutcome) -> Vec<Vec<String>> {
+    match outcome {
+        SqlOutcome::Query(result) => result
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| format!("{c:?}")).collect())
+            .collect(),
+        other => panic!("expected Query outcome, got {other:?}"),
+    }
+}
+
+fn tx_rows(tx: &mut Tx<'_>, sql: &str) -> Vec<Vec<String>> {
+    rows_of(tx.ok(sql))
+}
+
+fn auto_rows(core: &EngineCore, tenant: &str, sql: &str) -> Vec<Vec<String>> {
+    let mut session = SessionState::default();
+    rows_of(
+        core.execute_sql_in_session(&ctx(tenant), &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}")),
+    )
+}
+
+fn count_of(n: i64) -> Vec<Vec<String>> {
+    vec![vec![format!("Integer({n})")]]
+}
+
+#[test]
+fn scan_and_aggregate_reads_reflect_insert_update_delete_inside_transaction() {
+    let (core, path) = new_core("txn-read-scan-agg");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    tx.ok(
+        "INSERT INTO docs (id, n, tag) VALUES (4, 40, 'a'), (5, 50, 'e') USING OPERATION_ID 'i1'",
+    );
+    tx.ok("UPDATE docs SET tag = 'z' WHERE id = 2 USING OPERATION_ID 'u1'");
+    tx.ok("DELETE FROM docs WHERE id = 3 USING OPERATION_ID 'd1'");
+
+    // Scan
+    let a_rows = tx_rows(&mut tx, "SELECT id FROM docs WHERE tag = 'a' LIMIT 100");
+    assert_eq!(a_rows.len(), 2, "ids 1 and 4 carry tag 'a'");
+    let z_rows = tx_rows(&mut tx, "SELECT id FROM docs WHERE tag = 'z' LIMIT 100");
+    assert_eq!(z_rows.len(), 1, "the UPDATE is visible");
+    assert!(tx_rows(&mut tx, "SELECT id FROM docs WHERE tag = 'c' LIMIT 100").is_empty());
+    // Aggregate（1,2,4,5 の 4 行）
+    assert_eq!(tx_rows(&mut tx, "SELECT COUNT(*) FROM docs"), count_of(4));
+    // GROUP BY
+    let groups = tx_rows(&mut tx, "SELECT tag, COUNT(*) FROM docs GROUP BY tag");
+    assert_eq!(groups.len(), 3, "tags a, z, e remain: {groups:?}");
+
+    // 別セッションからは変更前のまま（3 行）。
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT COUNT(*) FROM docs"),
+        count_of(3)
+    );
+
+    tx.ok("ROLLBACK");
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT COUNT(*) FROM docs"),
+        count_of(3)
+    );
+}
+
+#[test]
+fn join_subquery_set_operation_and_cursor_reads_see_uncommitted_rows() {
+    let (core, path) = new_core("txn-read-join-sub");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    tx.ok(
+        "INSERT INTO docs (id, n, tag) VALUES (4, 40, 'a'), (5, 50, 'e') USING OPERATION_ID 'i1'",
+    );
+
+    // 自己 JOIN（同一テーブルを 2 回開く。`TableAlreadyOpen` を起こさない）。
+    let joined = tx_rows(
+        &mut tx,
+        "SELECT d1.id FROM docs AS d1 JOIN docs AS d2 ON d1.id = d2.id LIMIT 100",
+    );
+    assert_eq!(joined.len(), 5);
+    // 同一テーブルへの `IN (SELECT ...)`。
+    let in_sub = tx_rows(
+        &mut tx,
+        "SELECT id FROM docs WHERE tag IN (SELECT tag FROM docs WHERE id = 4 LIMIT 10) LIMIT 100",
+    );
+    assert_eq!(in_sub.len(), 2, "ids 1 and 4 share tag 'a'");
+    // ウィンドウ関数。
+    let windowed = tx_rows(
+        &mut tx,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY tag ORDER BY id) FROM docs LIMIT 100",
+    );
+    assert_eq!(windowed.len(), 5);
+    // 集合演算。
+    let union = tx_rows(
+        &mut tx,
+        "SELECT tag FROM docs UNION ALL SELECT tag FROM docs",
+    );
+    assert_eq!(union.len(), 10);
+    // カーソル。
+    tx.ok("DECLARE c CURSOR FOR SELECT id FROM docs LIMIT 100");
+    match tx.ok("FETCH 100 FROM c") {
+        SqlOutcome::Fetch(result) => assert_eq!(result.rows.len(), 5),
+        other => panic!("expected Fetch, got {other:?}"),
+    }
+    tx.ok("ROLLBACK");
+}
+
+#[test]
+fn cascade_written_child_is_readable_and_reflects_the_cascade() {
+    let (core, path) = new_core("txn-read-cascade");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (a BIGINT REFERENCES p ON DELETE CASCADE)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO p (id, name) VALUES (1, 'p1') USING OPERATION_ID 'seed-p'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c (id, a) VALUES (1, 1), (2, 1) USING OPERATION_ID 'seed-c'",
+    );
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    tx.ok("DELETE FROM p WHERE id = 1 USING OPERATION_ID 'dp'");
+    // 子テーブルは文が直接書き込んだテーブルではないが、連鎖で消えた内容が見える。
+    assert!(tx_rows(&mut tx, "SELECT id FROM c LIMIT 100").is_empty());
+    tx.ok("ROLLBACK");
+    assert_eq!(ids(&core, &alice, "c").len(), 2);
+}
+
+/// ROLLBACK したトランザクションの未 commit 行から作ったキャッシュエントリが、後で
+/// 世代が再利用されても確定済みデータとして返らないこと（P0。キャッシュは確定済み
+/// スナップショットに対してのみ使う）。ベクトル検索・集計・Scan それぞれで確認する。
+#[test]
+fn rolled_back_rows_never_leak_through_caches_after_generation_reuse() {
+    let (core, path) = new_core("txn-read-cache");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE vdocs (embedding VECTOR(2), tag TEXT)",
+    );
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO vdocs (id, embedding, tag) VALUES (1, '[1.0, 0.0]', 'a'), (2, '[0.9, 0.1]', 'b') \
+         USING OPERATION_ID 'seed'",
+    );
+    let search = "SELECT id FROM vdocs ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10";
+    let count = "SELECT COUNT(*) FROM vdocs";
+    let scan = "SELECT id FROM vdocs WHERE tag = 'x' LIMIT 100";
+    // キャッシュを温める（確定済みスナップショットでのみ利用される）。
+    assert_eq!(auto_rows(&core, "alice", search).len(), 2);
+    assert_eq!(auto_rows(&core, "alice", count), count_of(2));
+    assert!(auto_rows(&core, "alice", scan).is_empty());
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    tx.ok(
+        "INSERT INTO vdocs (id, embedding, tag) VALUES (3, '[1.0, 0.0]', 'x'), (4, '[1.0, 0.01]', 'x') \
+         USING OPERATION_ID 'txn-ins'",
+    );
+    assert_eq!(tx_rows(&mut tx, search).len(), 4);
+    assert_eq!(tx_rows(&mut tx, count), count_of(4));
+    assert_eq!(tx_rows(&mut tx, scan).len(), 2);
+    tx.ok("ROLLBACK");
+
+    // 世代が再利用されうる別の書き込み（autocommit）の後も、ROLLBACK した行は現れない。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO vdocs (id, embedding, tag) VALUES (5, '[0.0, 1.0]', 'y') USING OPERATION_ID 'after'",
+    );
+    assert_eq!(auto_rows(&core, "alice", search).len(), 3);
+    assert_eq!(auto_rows(&core, "alice", count), count_of(3));
+    assert!(auto_rows(&core, "alice", scan).is_empty());
+}
+
+/// 書き込みトランザクションを読み取り源にしても、RLS（可視性・テナント境界）は同じ実行本体で
+/// 適用される。他テナントの行・自テナントの `Private` 行（`Public` のみの文脈）は見えない。
+#[test]
+fn reads_inside_transaction_apply_rls_like_the_snapshot_path() {
+    let (core, path) = new_core("txn-read-rls");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "bob");
+
+    // alice のトランザクション: 自分の行を書き込んで読む。bob の行は見えない。
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    tx.ok("INSERT INTO docs (id, n, tag) VALUES (1, 1, 'mine') USING OPERATION_ID 'i1'");
+    assert_eq!(tx_rows(&mut tx, "SELECT id FROM docs LIMIT 100").len(), 1);
+    assert_eq!(tx_rows(&mut tx, "SELECT COUNT(*) FROM docs"), count_of(1));
+    tx.ok("ROLLBACK");
+
+    // `Public` のみの文脈は、INSERT が `Private` で書いた自テナントの行も見えない。
+    let public_only = PolicyContext::new("alice").expect("valid tenant");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&public_only, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &public_only,
+        &mut session,
+        &mut txn,
+        "INSERT INTO docs (id, n, tag) VALUES (1, 1, 'hidden') USING OPERATION_ID 'i2'",
+    )
+    .expect("insert");
+    let outcome = core
+        .execute_sql_in_txn(
+            &public_only,
+            &mut session,
+            &mut txn,
+            "SELECT id FROM docs LIMIT 100",
+        )
+        .expect("select");
+    assert!(rows_of(outcome).is_empty());
+    core.execute_sql_in_txn(&public_only, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}

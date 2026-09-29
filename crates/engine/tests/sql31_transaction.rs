@@ -97,8 +97,12 @@ fn begin_insert_insert_commit_makes_both_rows_visible() {
     }
 }
 
+/// 同一トランザクション内で書き込んだテーブルの読み取りは、自トランザクションの未 commit
+/// 変更を反映する（Issue #1179。読み取りは書き込みトランザクションを読み取り源にする）。
+/// 別セッション（autocommit）からは見えない。`USING PLAN` を伴う検索 SELECT は
+/// 対象テーブルが dirty の間は従来どおり `0A000`（既知の逸脱）。
 #[test]
-fn reading_a_table_already_written_in_the_same_transaction_is_rejected() {
+fn reading_a_table_written_in_the_same_transaction_sees_the_uncommitted_row() {
     let (engine, path) = new_core();
     let _cleanup = CleanupGuard(path);
     let caller = ctx("tenant-a");
@@ -112,21 +116,35 @@ fn reading_a_table_already_written_in_the_same_transaction_is_rejected() {
         .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1, "op-1"))
         .expect("insert");
 
-    // 同一トランザクション内で既に書き込んだテーブルへの読み取りは、自分の
-    // 未 commit 変更が黙って見えない・古い値が黙って返る、のいずれでもなく
-    // fail-closed に `0A000` で拒否する（§2.5 の既知の逸脱。読み取りは
-    // 「未書き込みテーブルのみ許可」）。
+    let select_sql = format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10");
+    let outcome = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &select_sql)
+        .expect("read of a table written in this txn sees the uncommitted row");
+    match outcome {
+        SqlOutcome::Query(result) => assert_eq!(result.rows.len(), 1),
+        other => panic!("expected Query, got {other:?}"),
+    }
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+
+    // 別セッションからは未 commit の行が見えない。
+    let other = engine
+        .execute_sql_in_session(&caller, &mut SessionState::default(), &select_sql)
+        .expect("autocommit select from another session");
+    match other {
+        SqlOutcome::Query(result) => assert_eq!(result.rows.len(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+
+    // `USING PLAN` は dirty テーブルに対して `0A000`（既知の逸脱）。
     let err = engine
         .execute_sql_in_txn(
             &caller,
             &mut session,
             &mut txn,
-            &format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10"),
+            &format!("SELECT id FROM {TABLE} USING PLAN('anything') LIMIT 10"),
         )
-        .expect_err("read of a table already written in this txn is rejected");
+        .expect_err("USING PLAN over a dirty table is not supported");
     assert_eq!(err.wire_code(), "0A000");
-    // 文実行中のエラーはトランザクション全体を Failed へ遷移させる
-    // （部分書き込みを残さない fail-closed 契約）。
     assert_eq!(txn.status(), TransactionStatus::Failed);
 
     assert_eq!(
@@ -137,11 +155,7 @@ fn reading_a_table_already_written_in_the_same_transaction_is_rejected() {
     );
 
     let outcome = engine
-        .execute_sql_in_session(
-            &caller,
-            &mut SessionState::default(),
-            &format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10"),
-        )
+        .execute_sql_in_session(&caller, &mut SessionState::default(), &select_sql)
         .expect("select after rollback");
     match outcome {
         SqlOutcome::Query(result) => assert_eq!(result.rows.len(), 0),

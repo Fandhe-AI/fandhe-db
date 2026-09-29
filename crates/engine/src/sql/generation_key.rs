@@ -56,7 +56,7 @@ impl TableGenerationKey {
     /// 読めなければ `Err` で fail-closed に諦める）。テーブル名は昇順ソート・
     /// 重複除去する。参照数の上限（[`MAX_TABLE_REFS`]）は `Vec` 確保前に検証する。
     pub fn capture(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         ctx: PolicyContext,
         tables: &[&str],
     ) -> crate::catalog::Result<Self> {

@@ -631,7 +631,7 @@ fn predicted_heap_entry_bytes(refs: &[Option<ScalarKeyRef<'_>>], tenant_id_len: 
 /// 既定の結果バイト予算（[`MAX_SCAN_RESULT_BYTES`]）で
 /// [`execute_scan_with_budget`] へ委譲する薄いラッパー。
 pub fn execute_scan(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
@@ -1184,7 +1184,7 @@ fn leading_key_is_id(bound: &BoundScan) -> bool {
 }
 
 pub(crate) fn execute_scan_with_budget(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
