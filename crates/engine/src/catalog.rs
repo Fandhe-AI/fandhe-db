@@ -6879,6 +6879,86 @@ impl Storage {
         column_name: &str,
         new_precision: u8,
     ) -> Result<()> {
+        self.alter_column_type_with(table_name, column_name, |current| {
+            let (old_precision, old_scale) = match current {
+                ColumnType::Numeric { precision, scale } => (*precision, *scale),
+                other => {
+                    return Err(CatalogError::IncompatibleTypeChange {
+                        column: column_name.to_string(),
+                        from: other.catalog_fields().0.to_string(),
+                        to: format!("numeric,{new_precision}"),
+                    })
+                }
+            };
+            if new_precision <= old_precision {
+                return Err(CatalogError::IncompatibleTypeChange {
+                    column: column_name.to_string(),
+                    from: format!("numeric,{old_precision},{old_scale}"),
+                    to: format!("numeric,{new_precision},{old_scale}"),
+                });
+            }
+            // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
+            // scale <= precision）を検証してから確定する。
+            validate_numeric_precision_scale(new_precision, old_scale)?;
+            Ok(ColumnType::Numeric {
+                precision: new_precision,
+                scale: old_scale,
+            })
+        })
+    }
+
+    /// `ALTER TABLE ... ALTER COLUMN <column> TYPE <target>`（TABLE-19・SQL-23、
+    /// Issue #1167）の実行本体。SQL 表層（`sql::ddl::execute_alter_table_alter_column_type`）
+    /// が呼ぶ。受理するのは `NUMERIC(p0, s)` → `NUMERIC(p1, s)`（`p1 > p0`・同一 scale）
+    /// のみで、それ以外（VECTOR 次元変更・同一型・縮小・scale 変更・異種型・
+    /// 行の書き換えを伴う拡大変換）はすべて `IncompatibleTypeChange`。
+    ///
+    /// [`Self::alter_table_widen_numeric_precision`] と異なり目標の scale を受け取り、
+    /// 判定を単一 write txn 内で完結させる（表層が事前に読んだ scale と書込時点の
+    /// scale がずれる TOCTOU を作らない。DROP して同名で ADD し直された列に
+    /// 誤って確定しない）。`NUMERIC` の範囲不正は型不一致判定より先に `Invalid`。
+    pub(crate) fn alter_table_alter_column_type(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        target: &ColumnType,
+    ) -> Result<()> {
+        if let ColumnType::Numeric { precision, scale } = target {
+            validate_numeric_precision_scale(*precision, *scale)?;
+        }
+        self.alter_column_type_with(table_name, column_name, |current| match (current, target) {
+            (
+                ColumnType::Numeric {
+                    precision: p0,
+                    scale: s0,
+                },
+                ColumnType::Numeric {
+                    precision: p1,
+                    scale: s1,
+                },
+            ) if s0 == s1 && p1 > p0 => Ok(target.clone()),
+            (from, to) => {
+                let (from_tag, from_param) = from.catalog_fields();
+                let (to_tag, to_param) = to.catalog_fields();
+                Err(CatalogError::IncompatibleTypeChange {
+                    column: column_name.to_string(),
+                    from: format!("{from_tag},{from_param}"),
+                    to: format!("{to_tag},{to_param}"),
+                })
+            }
+        })
+    }
+
+    /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
+    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → 書き戻し →
+    /// 世代 bump → commit を行う（commit の直前行に必ず bump を置く。
+    /// `table_generation_bump_coverage`）。拒否時は commit せず副作用ゼロ。
+    fn alter_column_type_with(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        decide: impl FnOnce(&ColumnType) -> Result<ColumnType>,
+    ) -> Result<()> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
@@ -6908,30 +6988,7 @@ impl Storage {
                 .iter_mut()
                 .find(|c| c.name == column_name)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            let (old_precision, old_scale) = match column.ty {
-                ColumnType::Numeric { precision, scale } => (precision, scale),
-                ref other => {
-                    return Err(CatalogError::IncompatibleTypeChange {
-                        column: column_name.to_string(),
-                        from: other.catalog_fields().0.to_string(),
-                        to: format!("numeric,{new_precision}"),
-                    })
-                }
-            };
-            if new_precision <= old_precision {
-                return Err(CatalogError::IncompatibleTypeChange {
-                    column: column_name.to_string(),
-                    from: format!("numeric,{old_precision},{old_scale}"),
-                    to: format!("numeric,{new_precision},{old_scale}"),
-                });
-            }
-            // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
-            // scale <= precision）を検証してから確定する。
-            validate_numeric_precision_scale(new_precision, old_scale)?;
-            column.ty = ColumnType::Numeric {
-                precision: new_precision,
-                scale: old_scale,
-            };
+            column.ty = decide(&column.ty)?;
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
@@ -9530,6 +9587,57 @@ mod tests {
         assert!(matches!(
             encode_schema(&schema),
             Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// `alter_table_alter_column_type`（Issue #1167）は判定を単一 write txn 内で行うため、
+    /// DROP して scale の異なる同名列を ADD し直した後でも、目標との scale 不一致を
+    /// `IncompatibleTypeChange` で拒否し、誤って確定しない。
+    #[test]
+    fn alter_column_type_judges_against_current_scale_after_readd() {
+        let path = unique_db_path("alter-type-readd");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let numeric = |precision, scale| ColumnType::Numeric { precision, scale };
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("amt", numeric(5, 2), true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
+            .expect("widen with same scale");
+        storage
+            .alter_table_drop_column("docs", "amt")
+            .expect("drop");
+        storage
+            .alter_table_add_column("docs", ColumnDef::new("amt", numeric(5, 3), true))
+            .expect("re-add with other scale");
+        let err = storage
+            .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
+            .expect_err("scale mismatch must be rejected");
+        assert!(matches!(err, CatalogError::IncompatibleTypeChange { .. }));
+        // 範囲不正は互換性判定より先に Invalid。
+        let err = storage
+            .alter_table_alter_column_type("docs", "amt", &numeric(5, 6))
+            .expect_err("invalid numeric must be rejected");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        // 予約名・存在しない列・VECTOR 次元変更。
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "id", &ColumnType::Text),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "nope", &ColumnType::Text),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_alter_column_type("docs", "embedding", &ColumnType::Vector(3)),
+            Err(CatalogError::IncompatibleTypeChange { .. })
         ));
     }
 
