@@ -54,6 +54,20 @@
 //! `--fault-inject` は 1 プロセスにつき 1 回しか発火しない take-once 契約
 //! （Issue #705）のため、クライアントごとに独立したサーバー・DB を起動する。
 //!
+//! Issue #1177（WIRE-18・WIRE-17・SQL-16）: SCRAM-SHA-256 認証・psql `\copy`
+//! 往復・複数行 `INSERT` と NoSQL `rows[]` の行集合パリティを無改造クライアント
+//! 経由で追加検証する。生バイトの層 A（`tests/wire_scram_auth.rs`・
+//! `tests/wire17_copy.rs`・`tests/nosql6_insert.rs`）が主たる回帰保護で、本節の
+//! テストは同じ契約が実クライアントでも成り立つことの確認に限る。
+//! SCRAM は `--surface nosql` と併用できない（起動時 fail-closed。本 Issue で
+//! 緩めない）ため、NoSQL 側は cleartext で起動し、応答受信後に SIGKILL して
+//! 同じ DB を SQL 表層で開き直す。SCRAM 接続が cleartext へ黙って落ちていない
+//! ことは、外部ツール非依存の常時テスト
+//! `scram_mode_binary_advertises_sasl_scram_sha_256_without_plus` で担保する。
+//! psql `\copy` が実際に送出する文形状は `wire17_copy.rs` の
+//! `wire17_copy_*_psql_backslash_copy_*` が層 A で固定する。
+//! ADR: `docs/design/three-client-e2e-harness.md`「Issue #1177」節。
+//!
 //! WIRE-19（Issue #943）: 明示トランザクションの `ReadyForQuery` 状態バイト
 //! （`'I'`/`'T'`/`'E'`。production の中核は Issue #942・PR #1041 で実装済み）
 //! が無改造クライアント自身の API から観測できることを
@@ -69,7 +83,7 @@ mod common;
 mod temp_db;
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -1778,5 +1792,697 @@ fn three_clients_receive_emergency_response_detail_after_post_commit_panic() {
             case.id,
             result.rows,
         );
+    }
+}
+// -----------------------------------------------------------------------
+// Issue #1177: SCRAM-SHA-256（WIRE-18）・psql `\copy`（WIRE-17）・複数行
+// INSERT と NoSQL `rows[]`（SQL-16）の 3 クライアント層 B 検証。
+// -----------------------------------------------------------------------
+
+/// SCRAM モード用 users ファイル（alice/bob/carol）を書く。各レコードは
+/// `user:tenant:argon2id-phc:scram-verifier` の 4 フィールド
+/// （`UserStore::require_scram` が 4 番目を必須とする）。パスワードは
+/// `write_users_file` と同じテスト専用ダミー値、SCRAM salt は固定値。
+fn write_scram_users_file(path: &Path) {
+    use wire_server::auth::{argon2id, scram};
+    let scram_salt = [7u8; scram::SALT_LEN];
+    let mut content = String::new();
+    for (user, tenant, pw) in [
+        ("alice", "tenant-a", "pw-alice"),
+        ("bob", "tenant-b", "pw-bob"),
+        ("carol", "tenant-c", "pw-carol"),
+    ] {
+        let phc = argon2id::encode_phc(
+            b"unused-in-scram-mode",
+            b"0123456789abcdef",
+            &argon2id::RECOMMENDED_PARAMS,
+        )
+        .expect("valid phc encoding");
+        let verifier =
+            scram::generate_verifier(pw.as_bytes(), &scram_salt, scram::SCRAM_ITERATIONS)
+                .expect("valid scram verifier");
+        content.push_str(&format!(
+            "{user}:{tenant}:{phc}:{}\n",
+            verifier.to_verifier_string()
+        ));
+    }
+    std::fs::write(path, content).expect("write scram users file");
+}
+
+/// `--scram-mock-key-file` 用のテスト専用ダミー秘密（最小長 32 バイト以上・
+/// 上限 1 MiB 以下。実秘密ではない）を書く。
+fn write_scram_mock_key_file(path: &Path) {
+    std::fs::write(path, [0x5au8; 64]).expect("write scram mock key file");
+}
+
+/// SCRAM モード起動用の追加 CLI 引数（`main.rs` は `--scram-mock-key-file`
+/// 無しの `scram-sha-256` を fail-closed で拒否する）。
+fn scram_server_args(mock_key_path: &Path) -> Vec<String> {
+    vec![
+        "--auth-method".into(),
+        "scram-sha-256".into(),
+        "--scram-mock-key-file".into(),
+        mock_key_path.to_str().expect("utf-8 path").into(),
+    ]
+}
+
+/// 起動直後の最初の認証要求を読み、AuthenticationSASL（`R`・コード 10）の
+/// 機構名一覧を返す（`wire_scram_auth.rs::read_authentication_sasl_mechanisms`
+/// と同型。受信値は `get()` で扱い添字アクセスしない）。
+fn read_sasl_mechanisms(stream: &mut std::net::TcpStream) -> Vec<String> {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read message type");
+    assert_eq!(
+        header.first().copied(),
+        Some(b'R'),
+        "expected Authentication*"
+    );
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read length");
+    let len = usize::try_from(i32::from_be_bytes(len_buf)).expect("non-negative length");
+    assert!(
+        (8..=4096).contains(&len),
+        "unexpected auth message length {len}"
+    );
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+    let code_bytes: [u8; 4] = body
+        .get(..4)
+        .and_then(|b| b.try_into().ok())
+        .expect("auth code");
+    assert_eq!(
+        i32::from_be_bytes(code_bytes),
+        10,
+        "AuthenticationSASL code must be 10"
+    );
+    body.get(4..)
+        .expect("mechanism list")
+        .split(|&b| b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 層 B の SCRAM 接続が cleartext へ黙って落ちていないこと（非空性）を、
+/// 外部ツール非依存で常時（`make ci`）担保する（WIRE-18）。TLS なしでは
+/// `SCRAM-SHA-256` のみを広告し `-PLUS` は広告しない。
+#[test]
+fn scram_mode_binary_advertises_sasl_scram_sha_256_without_plus() {
+    let dir = temp_db::TempDir::new("three-client-e2e-scram-advert");
+    let users_path = dir.path().join("users.txt");
+    let key_path = dir.path().join("mock.key");
+    write_scram_users_file(&users_path);
+    write_scram_mock_key_file(&key_path);
+    let db_path = temp_db::unique_db_path("three-client-e2e-scram-advert-db");
+    let _db_guard = temp_db::CleanupGuard(db_path.clone());
+
+    let server = spawn_wire_server(&users_path, &db_path, &scram_server_args(&key_path));
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    common::send_startup_message(&mut stream, "alice", "irrelevant-db-name");
+    let mechanisms = read_sasl_mechanisms(&mut stream);
+    assert!(
+        mechanisms.iter().any(|m| m == "SCRAM-SHA-256"),
+        "SCRAM-SHA-256 must be advertised: {mechanisms:?}"
+    );
+    assert!(
+        !mechanisms.iter().any(|m| m == "SCRAM-SHA-256-PLUS"),
+        "-PLUS must not be advertised without TLS: {mechanisms:?}"
+    );
+}
+
+/// psql を環境変数付きで実行し `(成功か, stderr)` を返す（`PGREQUIREAUTH`
+/// による認証方式の強制検証用）。
+fn run_psql_with_env(
+    port: u16,
+    user: &str,
+    password: &str,
+    env: &[(&str, &str)],
+    sql: &str,
+) -> (bool, String) {
+    let psql = resolve_tool("PSQL_BIN", "psql");
+    let mut cmd = Command::new(&psql);
+    cmd.env("PGPASSWORD", password)
+        .args(["-h", "127.0.0.1", "-p", &port.to_string(), "-U", user])
+        .args(["-d", "irrelevant-db-name", "-X", "-w", "-At", "-c", sql]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// 3 クライアントが SCRAM-SHA-256 モードのサーバーへ無改造（スクリプト
+/// 改修なし）で接続でき、C1 の結果がオラクルと一致すること・誤りパスワード／
+/// 未知ユーザーが拒否され存在判別の手掛かりが無いことを検証する（WIRE-18）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_connect_with_scram_sha_256_and_reject_wrong_password() {
+    let (db_path, _db_guard) = seed_three_tenant_db();
+    let dir = temp_db::TempDir::new("three-client-e2e-scram-users");
+    let users_path = dir.path().join("users.txt");
+    let key_path = dir.path().join("mock.key");
+    write_scram_users_file(&users_path);
+    write_scram_mock_key_file(&key_path);
+
+    let server = spawn_wire_server(&users_path, &db_path, &scram_server_args(&key_path));
+    let port = server.port;
+    let expected: Vec<String> = ["1", "2", "3"].into_iter().map(str::to_string).collect();
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    for (user, pw) in [
+        ("alice", "pw-alice"),
+        ("bob", "pw-bob"),
+        ("carol", "pw-carol"),
+    ] {
+        assert_eq!(
+            sorted(run_psql(port, user, pw, C1_SQL)),
+            expected,
+            "psql (SCRAM) C1 for {user}"
+        );
+        assert_eq!(
+            sorted(run_psycopg(port, user, pw, C1_SQL)),
+            expected,
+            "psycopg (SCRAM) C1 for {user}"
+        );
+        assert_eq!(
+            sorted(run_pg(port, user, pw, C1_SQL)),
+            expected,
+            "pg (SCRAM) C1 for {user}"
+        );
+    }
+
+    // 誤りパスワードの拒否（3 クライアント）。
+    run_psql_wrong_password(port, "alice");
+    let is_auth_failure = |stderr: &str| {
+        stderr.contains("password authentication failed") || stderr.contains("28P01")
+    };
+    let out = spawn_psycopg_client(port, "alice", "definitely-not-the-password", &[], C1_SQL);
+    assert!(!out.status.success(), "psycopg must fail on wrong password");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        is_auth_failure(&err),
+        "psycopg wrong-password stderr: {err}"
+    );
+    let out = spawn_pg_client(port, "alice", "definitely-not-the-password", &[], C1_SQL);
+    assert!(!out.status.success(), "pg must fail on wrong password");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(is_auth_failure(&err), "pg wrong-password stderr: {err}");
+
+    // 未知ユーザーは誤りパスワードと同じ文言（ユーザー名部分を除く）で拒否され、
+    // ユーザーの存在判別の手掛かりにならない。
+    let (ok_known, err_known) =
+        run_psql_with_env(port, "alice", "definitely-not-the-password", &[], C1_SQL);
+    let (ok_unknown, err_unknown) =
+        run_psql_with_env(port, "mallory", "definitely-not-the-password", &[], C1_SQL);
+    assert!(!ok_known && !ok_unknown, "both must be rejected");
+    assert_eq!(
+        err_known.replace("alice", "<user>"),
+        err_unknown.replace("mallory", "<user>"),
+        "unknown user must be indistinguishable from wrong password"
+    );
+
+    // libpq が SCRAM を実際にネゴシエートしたこと（cleartext 落ちでないこと）。
+    let (ok, err) = run_psql_with_env(
+        port,
+        "alice",
+        "pw-alice",
+        &[("PGREQUIREAUTH", "scram-sha-256")],
+        C1_SQL,
+    );
+    assert!(ok, "require_auth=scram-sha-256 must connect: {err}");
+    let (ok, _err) = run_psql_with_env(
+        port,
+        "alice",
+        "pw-alice",
+        &[("PGREQUIREAUTH", "password")],
+        C1_SQL,
+    );
+    assert!(
+        !ok,
+        "require_auth=password must be refused by libpq under SCRAM"
+    );
+}
+
+// ---- psql `\copy`（WIRE-17）-------------------------------------------
+
+/// psql（無改造）で `commands`（`\copy ...` 等）を 1 つずつ `-c` で実行し、
+/// `(成功か, stdout, stderr)` を返す。`-q` を付けないため COPY の完了タグが
+/// stdout に出る。`VERBOSITY=verbose` で SQLSTATE を stderr へ出させる。
+fn run_psql_copy(
+    port: u16,
+    user: &str,
+    password: &str,
+    commands: &[String],
+) -> (bool, String, String) {
+    let psql = resolve_tool("PSQL_BIN", "psql");
+    let mut cmd = Command::new(&psql);
+    cmd.env("PGPASSWORD", password).args([
+        "-h",
+        "127.0.0.1",
+        "-p",
+        &port.to_string(),
+        "-U",
+        user,
+        "-d",
+        "irrelevant-db-name",
+        "-X",
+        "-w",
+        "-At",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-v",
+        "VERBOSITY=verbose",
+    ]);
+    for c in commands {
+        cmd.arg("-c").arg(c);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// COPY 往復の比較用に正規化した 1 行（`id`・`embedding`・`lang`・`body`）。
+#[derive(Debug, Clone, PartialEq)]
+struct CopyRow {
+    id: u64,
+    embedding: Vec<f32>,
+    lang: String,
+    body: String,
+}
+
+/// CSV の 1 行を `"` 引用を解決して分割する（テスト fixture が出す範囲の
+/// 最小実装。`""` は `"`）。
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, in_quotes) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            ('"', _) => in_quotes = !in_quotes,
+            (',', false) => fields.push(std::mem::take(&mut cur)),
+            (other, _) => cur.push(other),
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
+/// COPY TO の出力ファイル内容を `CopyRow` の id 昇順列へ正規化する。
+/// embedding は `[a,b]` を `f32` へパースして比較する（`f32` の `Display`
+/// による表現差を吸収）。
+fn parse_copy_output(text: &str, csv: bool) -> Vec<CopyRow> {
+    let mut rows: Vec<CopyRow> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let f: Vec<String> = if csv {
+                split_csv_line(line)
+            } else {
+                line.split('\t').map(str::to_string).collect()
+            };
+            assert_eq!(f.len(), 4, "expected 4 fields in {line:?}");
+            let embedding = f[1]
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|x| x.trim().parse::<f32>().expect("f32"))
+                .collect();
+            CopyRow {
+                id: f[0].parse().expect("id"),
+                embedding,
+                lang: f[2].clone(),
+                body: f[3].clone(),
+            }
+        })
+        .collect();
+    rows.sort_by_key(|r| r.id);
+    rows
+}
+
+/// 空の `docs`（`embedding VECTOR(2)`・`lang`・`body`）だけを持つ一時 DB。
+fn seed_empty_docs_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-copy-empty");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    (path, guard)
+}
+
+/// psql `\copy` の FROM（text・csv）→ TO → 別 DB へ再投入 → TO の往復と、
+/// 他テナントからの非可視・`operation_id` 必須の拒否（WIRE-17）を検証する。
+#[test]
+#[ignore = "requires psql; run via `make e2e-three-client`"]
+fn psql_copy_round_trips_text_and_csv_and_respects_rls() {
+    let (db_path, _db_guard) = seed_three_tenant_db();
+    let users_dir = temp_db::TempDir::new("three-client-e2e-copy-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let files = temp_db::TempDir::new("three-client-e2e-copy-files");
+    let fp = |name: &str| -> String {
+        let s = files
+            .path()
+            .join(name)
+            .to_str()
+            .expect("utf-8 path")
+            .to_string();
+        assert!(!s.contains('\''), "path must not contain a single quote");
+        s
+    };
+
+    let tsv_in = fp("in.tsv");
+    let csv_in = fp("in.csv");
+    std::fs::write(
+        &tsv_in,
+        "101\t[0.5,0.25]\tja\tcopy text one\n102\t[0.25,0.5]\ten\tcopy text two\n103\t[-0.5,0.75]\tja\tcopy text three\n",
+    )
+    .expect("write tsv");
+    std::fs::write(
+        &csv_in,
+        "111,\"[0.5,0.125]\",ja,copy csv one\n112,\"[0.125,0.5]\",en,copy csv two\n113,\"[-0.5,0.375]\",ja,copy csv three\n",
+    )
+    .expect("write csv");
+
+    let server = spawn_wire_server(&users_path, &db_path, &[]);
+    let port = server.port;
+
+    // 3 行ずつ（既定上限 64 行・0 行拒否を避ける）。
+    let (ok, out, err) = run_psql_copy(
+        port,
+        "alice",
+        "pw-alice",
+        &[
+            format!("\\copy docs (id, embedding, lang, body) from '{tsv_in}' using operation_id 'copy-1177-text'"),
+            format!("\\copy docs (id, embedding, lang, body) from '{csv_in}' with (format csv) using operation_id 'copy-1177-csv'"),
+        ],
+    );
+    assert!(ok, "psql \\copy FROM failed: stderr={err}");
+    assert_eq!(
+        out.lines().filter(|l| *l == "COPY 3").count(),
+        2,
+        "expected two COPY 3 tags, stdout={out}"
+    );
+
+    let mk = |id: u64, e: [f32; 2], lang: &str, body: &str| CopyRow {
+        id,
+        embedding: e.to_vec(),
+        lang: lang.into(),
+        body: body.into(),
+    };
+    let mut expected = vec![
+        mk(1, [1.0, 0.0], "ja", "vector database intro"),
+        mk(2, [0.0, 1.0], "en", "query planning notes"),
+        mk(3, [-1.0, 0.0], "ja", "unrelated topic"),
+        mk(101, [0.5, 0.25], "ja", "copy text one"),
+        mk(102, [0.25, 0.5], "en", "copy text two"),
+        mk(103, [-0.5, 0.75], "ja", "copy text three"),
+        mk(111, [0.5, 0.125], "ja", "copy csv one"),
+        mk(112, [0.125, 0.5], "en", "copy csv two"),
+        mk(113, [-0.5, 0.375], "ja", "copy csv three"),
+    ];
+    expected.sort_by_key(|r| r.id);
+
+    let sel = "SELECT id, embedding, lang, body FROM docs LIMIT 100";
+    let out_a = fp("out_a.tsv");
+    let out_csv = fp("out_a.csv");
+    let (ok, _out, err) = run_psql_copy(
+        port,
+        "alice",
+        "pw-alice",
+        &[
+            format!("\\copy ({sel}) to '{out_a}'"),
+            format!("\\copy ({sel}) to '{out_csv}' with (format csv)"),
+        ],
+    );
+    assert!(ok, "psql \\copy TO failed: stderr={err}");
+    let text_a = std::fs::read_to_string(&out_a).expect("read out_a");
+    let csv_a = std::fs::read_to_string(&out_csv).expect("read out_csv");
+    let rows_a = parse_copy_output(&text_a, false);
+    assert_eq!(rows_a, expected, "text COPY TO must match the oracle");
+    assert_eq!(
+        parse_copy_output(&csv_a, true),
+        expected,
+        "csv COPY TO must match the oracle"
+    );
+
+    // RLS: 他テナントには alice の Private 行が見えない（Public 3 行のみ）。
+    for (user, pw, tag) in [("bob", "pw-bob", "b"), ("carol", "pw-carol", "c")] {
+        let out_other = fp(&format!("out_{tag}.tsv"));
+        let (ok, _o, err) = run_psql_copy(
+            port,
+            user,
+            pw,
+            &[format!(
+                "\\copy (SELECT id FROM docs LIMIT 100) to '{out_other}'"
+            )],
+        );
+        assert!(ok, "psql \\copy TO for {user} failed: {err}");
+        let mut ids: Vec<u64> = std::fs::read_to_string(&out_other)
+            .expect("read other out")
+            .lines()
+            .map(|l| l.trim().parse().expect("id"))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3], "{user} must see only Public rows");
+    }
+
+    // `operation_id` 無しの FROM は開始前に 23502 で拒否される。
+    let (ok, _o, err) = run_psql_copy(
+        port,
+        "alice",
+        "pw-alice",
+        &[format!(
+            "\\copy docs (id, embedding, lang, body) from '{tsv_in}'"
+        )],
+    );
+    assert!(!ok, "\\copy without operation_id must fail");
+    assert!(err.contains("23502"), "expected 23502, stderr={err}");
+    drop(server);
+
+    // 別 DB（空）へ出力を再投入し、再度 TO して多重集合が一致する。
+    let (db2_path, _db2_guard) = seed_empty_docs_db();
+    let server2 = spawn_wire_server(&users_path, &db2_path, &[]);
+    let (ok, out, err) = run_psql_copy(
+        server2.port,
+        "alice",
+        "pw-alice",
+        &[format!(
+            "\\copy docs (id, embedding, lang, body) from '{out_a}' using operation_id 'copy-1177-rt'"
+        )],
+    );
+    assert!(ok, "re-ingest failed: stderr={err}");
+    assert!(out.contains("COPY 9"), "expected COPY 9, stdout={out}");
+    let out_b = fp("out_b.tsv");
+    let (ok, _o, err) = run_psql_copy(
+        server2.port,
+        "alice",
+        "pw-alice",
+        &[format!("\\copy ({sel}) to '{out_b}'")],
+    );
+    assert!(ok, "second TO failed: stderr={err}");
+    let rows_b = parse_copy_output(&std::fs::read_to_string(&out_b).expect("read out_b"), false);
+    assert_eq!(rows_b, rows_a, "TO -> FROM -> TO must round-trip");
+}
+
+// ---- 複数行 INSERT と NoSQL `rows[]`（SQL-16）--------------------------
+
+/// `POST` を生 HTTP/1.1 で送り `(status, body)` を返す。受信は総量上限
+/// （2 MiB）付きで EOF（`Connection: close`）まで読む。`http_common` は
+/// `temp_db` を二重宣言し `clippy::duplicate_mod` になるため include しない。
+fn http_post(port: u16, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
+    const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect http");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(t) = token {
+        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes()).expect("send http request");
+    let mut raw = Vec::new();
+    // 読み取りエラー（タイムアウト等）は受信済み分で判定させず即失敗にする。
+    stream
+        .take(MAX_RESPONSE)
+        .read_to_end(&mut raw)
+        .expect("read http response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, resp_body) = text.split_once("\r\n\r\n").expect("http header terminator");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("http status");
+    (status, resp_body.to_string())
+}
+
+/// 固定の複数行 R（3 行）。SQL（`VALUES`）と NoSQL（`rows[]`）の双方へ
+/// 同じ内容を投入するための単一の定義。
+const MR_ROWS: [(u64, &str, &str, &str); 3] = [
+    (201, "[0.5,0.25]", "ja", "mr one"),
+    (202, "[0.25,0.5]", "en", "mr two"),
+    (203, "[-0.5,0.75]", "ja", "mr three"),
+];
+
+fn mr_sql_insert(op: &str) -> String {
+    let values: Vec<String> = MR_ROWS
+        .iter()
+        .map(|(id, e, lang, body)| format!("({id}, '{e}', '{lang}', '{body}')"))
+        .collect();
+    format!(
+        "INSERT INTO docs (id, embedding, lang, body) VALUES {} USING OPERATION_ID '{op}'",
+        values.join(", ")
+    )
+}
+
+fn mr_nosql_body(op: &str) -> String {
+    let rows: Vec<String> = MR_ROWS
+        .iter()
+        .map(|(id, e, lang, body)| {
+            format!(r#"{{"id":{id},"embedding":{e},"lang":"{lang}","body":"{body}"}}"#)
+        })
+        .collect();
+    format!(
+        r#"{{"op":"insert","table":"docs","rows":[{}],"operation_id":"{op}"}}"#,
+        rows.join(",")
+    )
+}
+
+/// 期待する読み戻し（`id|lang|body` の昇順）。`with_r` が真なら R を含む。
+fn mr_expected(with_r: bool) -> Vec<String> {
+    let mut v = vec![
+        "1|ja|vector database intro".to_string(),
+        "2|en|query planning notes".to_string(),
+        "3|ja|unrelated topic".to_string(),
+    ];
+    if with_r {
+        v.extend(
+            MR_ROWS
+                .iter()
+                .map(|(id, _, lang, body)| format!("{id}|{lang}|{body}")),
+        );
+    }
+    v.sort();
+    v
+}
+
+const MR_READBACK: &str = "SELECT id, lang, body FROM docs LIMIT 100";
+
+fn sorted_lines(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// 3 クライアントそれぞれの複数行 `INSERT ... VALUES (...), (...)` の結果が、
+/// NoSQL `rows[]` で同じ内容を投入した結果と行集合として一致すること、
+/// 書き込みが他テナントから見えないこと（RLS）を検証する（SQL-16）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_multi_row_insert_matches_nosql_rows_insert() {
+    let users_dir = temp_db::TempDir::new("three-client-e2e-multirow-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    // NoSQL 側: SCRAM は `--surface nosql` と併用できない（起動時 fail-closed）
+    // ため cleartext で起動する。応答受信後に SIGKILL（drop）して同じ DB を
+    // SQL 表層で開き直す（redb は単一ライター）。
+    let (db_n, _g_n) = seed_three_tenant_db();
+    let nosql = spawn_wire_server(&users_path, &db_n, &["--surface".into(), "nosql".into()]);
+    let (status, body) = http_post(
+        nosql.port,
+        "/v1/session",
+        None,
+        r#"{"user":"alice","password":"pw-alice"}"#,
+    );
+    assert_eq!(status, 200, "login failed: {body}");
+    let token = match engine::json::parse_json(&body).expect("login json") {
+        engine::json::JsonValue::Object(mut o) => match o.remove("token") {
+            Some(engine::json::JsonValue::String(s)) => s,
+            other => panic!("expected token string, got {other:?}"),
+        },
+        other => panic!("expected object, got {other:?}"),
+    };
+    let (status, body) = http_post(
+        nosql.port,
+        "/v1/query",
+        Some(&token),
+        &mr_nosql_body("mr-1177-nosql"),
+    );
+    assert_eq!(status, 200, "nosql insert failed: {body}");
+    assert!(
+        body.contains("\"inserted\":3"),
+        "expected inserted=3: {body}"
+    );
+    drop(nosql);
+
+    let sql_n = spawn_wire_server(&users_path, &db_n, &[]);
+    let n_alice = sorted_lines(run_psql(sql_n.port, "alice", "pw-alice", MR_READBACK));
+    let n_bob = sorted_lines(run_psql(sql_n.port, "bob", "pw-bob", MR_READBACK));
+    drop(sql_n);
+    assert_eq!(n_alice, mr_expected(true), "NoSQL rows[] alice readback");
+    assert_eq!(
+        n_bob,
+        mr_expected(false),
+        "NoSQL rows[] must be invisible to bob"
+    );
+
+    type Runner = fn(u16, &str, &str, &[&str], &str) -> Vec<String>;
+    let clients: [(&str, Runner); 3] = [
+        ("psql", run_psql_session),
+        ("psycopg", run_psycopg_session),
+        ("pg", run_pg_session),
+    ];
+    for (name, run) in clients {
+        let (db_s, _g_s) = seed_three_tenant_db();
+        let server = spawn_wire_server(&users_path, &db_s, &[]);
+        let port = server.port;
+        let insert = mr_sql_insert(&format!("mr-1177-{name}"));
+        // 同一接続の読み戻し（read-your-writes）。
+        let s_alice = sorted_lines(run(port, "alice", "pw-alice", &[&insert], MR_READBACK));
+        assert_eq!(s_alice, mr_expected(true), "{name}: alice readback");
+        assert_eq!(s_alice, n_alice, "{name}: must equal NoSQL rows[] result");
+        // 他テナントの新規接続には見えない。
+        let s_bob = sorted_lines(run(port, "bob", "pw-bob", &[], MR_READBACK));
+        assert_eq!(
+            s_bob,
+            mr_expected(false),
+            "{name}: bob must not see alice's rows"
+        );
+        assert_eq!(s_bob, n_bob, "{name}: bob view must equal NoSQL bob view");
     }
 }
