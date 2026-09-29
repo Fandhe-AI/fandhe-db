@@ -142,6 +142,13 @@
 //! 動作確認であり、柱 3 単体の検出力を主張する根拠ではない。柱 3 の実際の検出対象は
 //! 上記のとおり「経路固有」の退行に限られ、一括投入経路自身の再処理型退行の検出は
 //! 柱 4 が担う）。
+//!
+//! **計測設計の頑健化（Issue #1164）**: 時間判定（柱 2・3 と各負例）は、比較する 2 系統を
+//! ラウンドごとに交互（ABAB）に計測し、両系統へ同じ推定量（[`robust_estimate`]＝最小値）
+//! を適用する。負例にも正例と同じウォームアップ・ラウンド数・推定量を適用する（従来は
+//! 単発・逐次計測で、一過性の負荷が片側の小さな合計値に直撃して間欠失敗した）。判定閾値
+//! （[`SCALING_SLACK`]・[`RATIO_THRESHOLD_DENOM`]）と判定述語は据え置きで、アサーションの
+//! 弱体化ではない（O(N) 退行は最小値も押し上げる）。実測値はソースへ記載しない。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -310,10 +317,12 @@ fn body_text_cells(result: &engine::sql::exec::QueryResult) -> Vec<String> {
         .collect()
 }
 
-/// `values` の中央値を返す（`values` は非空であること、呼び出し側で保証する）。
-fn median(mut values: Vec<Duration>) -> Duration {
-    values.sort();
-    values[values.len() / 2]
+/// 計測値の代表値として最小値を返す（`values` は非空であること、呼び出し側で保証する）。
+/// 負荷ノイズ（CPU 競合・fsync 遅延）は加算的で、試行の過半が汚染されると中央値も崩れる。
+/// 最小値は「本来のコスト」の推定量であり、O(N) の退行は最小値も押し上げるため検出力は
+/// 落ちない（判定閾値は不変。正例・負例の双方に同じ推定量を適用する。Issue #1164）。
+fn robust_estimate(values: Vec<Duration>) -> Duration {
+    values.into_iter().min().unwrap_or(Duration::ZERO)
 }
 
 /// `IndexTiming` の各段階（チャンク化・埋め込み・書き込み）の合計を返す
@@ -426,66 +435,63 @@ fn build_baseline(label: &str, n_files: usize) -> (PathBuf, CleanupGuard) {
     (baseline_path, guard)
 }
 
+/// 既存ファイル数 `n_files` のコーパス（`baseline_path`）に対する増分挿入計測の
+/// ウォームアップ（ファイルシステムキャッシュ等の初回コストの除外。柱 2・柱 3 共通）。
+/// 複製先で行い、`baseline_path` 自体は変更しない。`round_label` は一時ファイル名・
+/// `operation_id` の名前空間化にのみ使う。
+fn warm_up_single_file_insert(baseline_path: &Path, n_files: usize, round_label: &str) {
+    let warmup_path = unique_db_path(&format!("recall-{round_label}-warmup"));
+    let _warmup_cleanup = CleanupGuard(warmup_path.clone());
+    std::fs::copy(baseline_path, &warmup_path).expect("copy baseline for warmup");
+    let core = open_core_on_existing_table(&warmup_path);
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sql = insert_file_sql(
+        "documents",
+        &format!("corpus/{round_label}-warmup-new.txt"),
+        &generic_body(n_files),
+        &format!("op-{round_label}-warmup-new"),
+    );
+    core.execute_insert_sql(&write_ctx, &sql)
+        .expect("warmup incremental insert should succeed");
+}
+
 /// 既存ファイル数 `n_files` のコーパス（`baseline_path`）に対し、1 ファイルを増分
-/// 挿入する所要時間を `rounds` 回計測し、中央値を返す（柱 2・柱 3 共通）。
+/// 挿入する所要時間を 1 ラウンド分計測する（柱 2・柱 3 共通）。
 ///
-/// 各ラウンドは素のベースライン DB（既存ファイル数固定）を新規ファイルへ複製してから
-/// 計測することで、計測時点の既存コーパス規模を毎ラウンド揃える（前のラウンドの増分
-/// 挿入で規模が変わらないようにする）。ウォームアップ（ファイルシステムキャッシュ等の
-/// 初回コストの除外）も同様に複製先で行い、`baseline_path` 自体は変更しない。
-/// `round_label` は一時ファイル名・`operation_id` の名前空間化にのみ使う。
-fn measure_single_file_insert(
+/// 素のベースライン DB（既存ファイル数固定）を新規ファイルへ複製してから計測することで、
+/// 計測時点の既存コーパス規模を毎ラウンド揃える（前のラウンドの増分挿入で規模が変わらない
+/// ようにする）。呼び出し側は比較対象側とラウンドごとに交互（ABAB）に呼び、負荷変動が
+/// 片側だけに乗らないようにする（Issue #1164）。
+fn measure_single_file_insert_round(
     baseline_path: &Path,
     n_files: usize,
-    rounds: usize,
+    round: usize,
     round_label: &str,
 ) -> Duration {
-    // ウォームアップ。
-    {
-        let warmup_path = unique_db_path(&format!("recall-{round_label}-warmup"));
-        let _warmup_cleanup = CleanupGuard(warmup_path.clone());
-        std::fs::copy(baseline_path, &warmup_path).expect("copy baseline for warmup");
-        let core = open_core_on_existing_table(&warmup_path);
-        let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        let sql = insert_file_sql(
-            "documents",
-            &format!("corpus/{round_label}-warmup-new.txt"),
-            &generic_body(n_files),
-            &format!("op-{round_label}-warmup-new"),
-        );
-        core.execute_insert_sql(&write_ctx, &sql)
-            .expect("warmup incremental insert should succeed");
-    }
-
-    // 増分挿入（1 ファイル）の所要時間を複数回計測する。
-    let mut durations = Vec::with_capacity(rounds);
-    for round in 0..rounds {
-        let round_path = unique_db_path(&format!("recall-{round_label}-round-{round}"));
-        let _round_cleanup = CleanupGuard(round_path.clone());
-        std::fs::copy(baseline_path, &round_path).expect("copy pristine baseline for round");
-        let core = open_core_on_existing_table(&round_path);
-        let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        let sql = insert_file_sql(
-            "documents",
-            &format!("corpus/{round_label}-incremental-round-{round}.txt"),
-            &generic_body(n_files + round),
-            &format!("op-{round_label}-incremental-round-{round}"),
-        );
-        let outcome = core
-            .execute_insert_sql(&write_ctx, &sql)
-            .expect("incremental file insert (measured) should succeed");
-        let incremental = outcome
-            .incremental
-            .expect("file-form insert sets incremental");
-        durations.push(timing_total(incremental.timing));
-    }
-
-    median(durations)
+    let round_path = unique_db_path(&format!("recall-{round_label}-round-{round}"));
+    let _round_cleanup = CleanupGuard(round_path.clone());
+    std::fs::copy(baseline_path, &round_path).expect("copy pristine baseline for round");
+    let core = open_core_on_existing_table(&round_path);
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sql = insert_file_sql(
+        "documents",
+        &format!("corpus/{round_label}-incremental-round-{round}.txt"),
+        &generic_body(n_files + round),
+        &format!("op-{round_label}-incremental-round-{round}"),
+    );
+    let outcome = core
+        .execute_insert_sql(&write_ctx, &sql)
+        .expect("incremental file insert (measured) should succeed");
+    let incremental = outcome
+        .incremental
+        .expect("file-form insert sets incremental");
+    timing_total(incremental.timing)
 }
 
 /// `BASELINE_FILES + 1` 件を空 DB から 1 バッチとして
 /// `EngineCore::execute_insert_sql_batch`（TASK-122・INDEX-4 の一括投入 API）で構築する
-/// 「全体再構築」の総所要時間を `MEASUREMENT_ROUNDS` 回計測し、中央値を返す（柱 3）。
+/// 「全体再構築」の総所要時間を 1 ラウンド分計測する（柱 3。呼び出し側が増分挿入側と
+/// 交互に呼ぶ。Issue #1164）。
 ///
 /// Issue #281 見直し前は増分経路（`execute_insert_sql`）そのものを `BASELINE_FILES + 1`
 /// 回呼ぶ逐次投入だったため、増分経路自体の退行が `t_inc`・`t_full` 双方に同時に乗り
@@ -498,51 +504,46 @@ fn measure_single_file_insert(
 /// 本関数が実際に検出できるのは `index_file` にのみ存在し `index_file_batch` には
 /// 存在しない、単一ファイル経路固有の退行に限られる（経路共通の退行の検出は
 /// `t_full` に依存しない柱 1・2 が担う）。
-fn measure_full_rebuild_batch() -> Duration {
-    let mut durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
-    for round in 0..MEASUREMENT_ROUNDS {
-        let full_path = unique_db_path(&format!("recall-full-rebuild-batch-{round}"));
-        let _full_cleanup = CleanupGuard(full_path.clone());
-        let storage = Storage::open(&full_path).expect("open storage");
-        storage
-            .create_table(&documents_schema())
-            .expect("create table");
-        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-            .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
-            .with_incremental_config(small_chunk_config())
-            .with_batch_limits(BatchLimits {
-                max_files_per_batch: BASELINE_FILES + 1,
-                ..BatchLimits::default()
-            });
-        let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        let sqls: Vec<String> = (0..=BASELINE_FILES)
-            .map(|i| {
-                insert_file_sql(
-                    "documents",
-                    &format!("corpus/full-batch-{round}-{i:04}.txt"),
-                    &generic_body(i),
-                    &format!("op-full-batch-{round}-{i:04}"),
-                )
-            })
-            .collect();
-        let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
-        let outcomes = core
-            .execute_insert_sql_batch(&write_ctx, &sql_refs)
-            .expect("full rebuild batch insert should succeed");
+fn measure_full_rebuild_batch_round(round: usize) -> Duration {
+    let full_path = unique_db_path(&format!("recall-full-rebuild-batch-{round}"));
+    let _full_cleanup = CleanupGuard(full_path.clone());
+    let storage = Storage::open(&full_path).expect("open storage");
+    storage
+        .create_table(&documents_schema())
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_files_per_batch: BASELINE_FILES + 1,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sqls: Vec<String> = (0..=BASELINE_FILES)
+        .map(|i| {
+            insert_file_sql(
+                "documents",
+                &format!("corpus/full-batch-{round}-{i:04}.txt"),
+                &generic_body(i),
+                &format!("op-full-batch-{round}-{i:04}"),
+            )
+        })
+        .collect();
+    let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+    let outcomes = core
+        .execute_insert_sql_batch(&write_ctx, &sql_refs)
+        .expect("full rebuild batch insert should succeed");
 
-        let mut total = Duration::ZERO;
-        for outcome in outcomes {
-            let incremental = outcome
-                .incremental
-                .expect("file-form insert sets incremental");
-            total = total
-                .checked_add(timing_total(incremental.timing))
-                .expect("full rebuild duration sum must not overflow");
-        }
-        durations.push(total);
+    let mut total = Duration::ZERO;
+    for outcome in outcomes {
+        let incremental = outcome
+            .incremental
+            .expect("file-form insert sets incremental");
+        total = total
+            .checked_add(timing_total(incremental.timing))
+            .expect("full rebuild duration sum must not overflow");
     }
-
-    median(durations)
+    total
 }
 
 /// `index_file_batch`（`execute_insert_sql_batch` が呼ぶ一括投入経路本体）自身に対する、
@@ -693,8 +694,13 @@ fn measure_simulated_batch_full_reprocess_counts(n_files: usize, label: &str) ->
 /// 返ることを確認する）。`label` は `baseline_path` を構築した [`build_baseline`] と
 /// 同じものを渡し、既存ファイルのパスが一致する（＝再投入が新規挿入ではなく置換に
 /// なる）ようにする。
-fn measure_simulated_full_reprocess(baseline_path: &Path, n_files: usize, label: &str) -> Duration {
-    let round_path = unique_db_path(&format!("recall-{label}-reprocess"));
+fn measure_simulated_full_reprocess(
+    baseline_path: &Path,
+    n_files: usize,
+    label: &str,
+    round: usize,
+) -> Duration {
+    let round_path = unique_db_path(&format!("recall-{label}-reprocess-{round}"));
     let _round_cleanup = CleanupGuard(round_path.clone());
     std::fs::copy(baseline_path, &round_path).expect("copy baseline for simulated reprocess");
     let core = open_core_on_existing_table(&round_path);
@@ -706,7 +712,7 @@ fn measure_simulated_full_reprocess(baseline_path: &Path, n_files: usize, label:
             "documents",
             &format!("corpus/{label}-{i:04}.txt"),
             &generic_body(i),
-            &format!("op-{label}-reprocess-{i:04}"),
+            &format!("op-{label}-reprocess-{round}-{i:04}"),
         );
         let outcome = core
             .execute_insert_sql(&write_ctx, &sql)
@@ -723,7 +729,7 @@ fn measure_simulated_full_reprocess(baseline_path: &Path, n_files: usize, label:
         "documents",
         &format!("corpus/{label}-reprocess-new-file.txt"),
         &generic_body(n_files),
-        &format!("op-{label}-reprocess-new"),
+        &format!("op-{label}-reprocess-new-{round}"),
     );
     let outcome = core
         .execute_insert_sql(&write_ctx, &new_file_sql)
@@ -804,13 +810,20 @@ fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild(
     let _timing_guard = acquire_timing_lock();
 
     let (baseline_path, _baseline_cleanup) = build_baseline("incremental", BASELINE_FILES);
-    let t_inc = measure_single_file_insert(
-        &baseline_path,
-        BASELINE_FILES,
-        MEASUREMENT_ROUNDS,
-        "incremental",
-    );
-    let t_full = measure_full_rebuild_batch();
+    warm_up_single_file_insert(&baseline_path, BASELINE_FILES, "incremental");
+    let mut inc_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    let mut full_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    for round in 0..MEASUREMENT_ROUNDS {
+        inc_durations.push(measure_single_file_insert_round(
+            &baseline_path,
+            BASELINE_FILES,
+            round,
+            "incremental",
+        ));
+        full_durations.push(measure_full_rebuild_batch_round(round));
+    }
+    let t_inc = robust_estimate(inc_durations);
+    let t_full = robust_estimate(full_durations);
 
     let ratio = t_inc.as_secs_f64() / t_full.as_secs_f64().max(f64::EPSILON);
 
@@ -984,18 +997,26 @@ fn index1_single_file_insert_time_does_not_scale_with_corpus_size() {
     let (small_baseline, _small_cleanup) = build_baseline("scale-small", CORPUS_FILES_SMALL);
     let (large_baseline, _large_cleanup) = build_baseline("scale-large", CORPUS_FILES_LARGE);
 
-    let t_small = measure_single_file_insert(
-        &small_baseline,
-        CORPUS_FILES_SMALL,
-        MEASUREMENT_ROUNDS,
-        "scale-small",
-    );
-    let t_large = measure_single_file_insert(
-        &large_baseline,
-        CORPUS_FILES_LARGE,
-        MEASUREMENT_ROUNDS,
-        "scale-large",
-    );
+    warm_up_single_file_insert(&small_baseline, CORPUS_FILES_SMALL, "scale-small");
+    warm_up_single_file_insert(&large_baseline, CORPUS_FILES_LARGE, "scale-large");
+    let mut small_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    let mut large_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    for round in 0..MEASUREMENT_ROUNDS {
+        small_durations.push(measure_single_file_insert_round(
+            &small_baseline,
+            CORPUS_FILES_SMALL,
+            round,
+            "scale-small",
+        ));
+        large_durations.push(measure_single_file_insert_round(
+            &large_baseline,
+            CORPUS_FILES_LARGE,
+            round,
+            "scale-large",
+        ));
+    }
+    let t_small = robust_estimate(small_durations);
+    let t_large = robust_estimate(large_durations);
 
     let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(f64::EPSILON);
     println!(
@@ -1023,10 +1044,40 @@ fn index1_judgements_reject_simulated_full_reprocess_regression() {
     // `within_scaling_slack` が `false` を返すこと。
     let (small_baseline, _small_cleanup) = build_baseline("reject-scale-small", CORPUS_FILES_SMALL);
     let (large_baseline, _large_cleanup) = build_baseline("reject-scale-large", CORPUS_FILES_LARGE);
-    let t_regressed_small =
-        measure_simulated_full_reprocess(&small_baseline, CORPUS_FILES_SMALL, "reject-scale-small");
-    let t_regressed_large =
-        measure_simulated_full_reprocess(&large_baseline, CORPUS_FILES_LARGE, "reject-scale-large");
+    // 正例（柱 2）と同じ計測設計（ウォームアップ・ラウンドごとの交互計測・最小値推定）を
+    // 適用する。単発・逐次計測では、分母（小規模側）の小さな合計値に一過性の負荷が
+    // 直撃して比が閾値を割る間欠失敗があった（Issue #1164）。ウォームアップ用に
+    // 使い捨て 1 ラウンド（round = MEASUREMENT_ROUNDS）を計測前に回す。
+    let _ = measure_simulated_full_reprocess(
+        &small_baseline,
+        CORPUS_FILES_SMALL,
+        "reject-scale-small",
+        MEASUREMENT_ROUNDS,
+    );
+    let _ = measure_simulated_full_reprocess(
+        &large_baseline,
+        CORPUS_FILES_LARGE,
+        "reject-scale-large",
+        MEASUREMENT_ROUNDS,
+    );
+    let mut regressed_small = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    let mut regressed_large = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    for round in 0..MEASUREMENT_ROUNDS {
+        regressed_small.push(measure_simulated_full_reprocess(
+            &small_baseline,
+            CORPUS_FILES_SMALL,
+            "reject-scale-small",
+            round,
+        ));
+        regressed_large.push(measure_simulated_full_reprocess(
+            &large_baseline,
+            CORPUS_FILES_LARGE,
+            "reject-scale-large",
+            round,
+        ));
+    }
+    let t_regressed_small = robust_estimate(regressed_small);
+    let t_regressed_large = robust_estimate(regressed_large);
     let scale_ratio =
         t_regressed_large.as_secs_f64() / t_regressed_small.as_secs_f64().max(f64::EPSILON);
     println!(
@@ -1045,9 +1096,25 @@ fn index1_judgements_reject_simulated_full_reprocess_regression() {
     // モデル 1 回分は、`t_full`（`BASELINE_FILES + 1` 件の一括再構築）と同程度の
     // 重さであり、`within_ratio_threshold` が `false` を返すこと。
     let (ratio_baseline, _ratio_cleanup) = build_baseline("reject-ratio", BASELINE_FILES);
-    let t_regressed_ratio =
-        measure_simulated_full_reprocess(&ratio_baseline, BASELINE_FILES, "reject-ratio");
-    let t_full = measure_full_rebuild_batch();
+    let _ = measure_simulated_full_reprocess(
+        &ratio_baseline,
+        BASELINE_FILES,
+        "reject-ratio",
+        MEASUREMENT_ROUNDS,
+    );
+    let mut regressed_ratio = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    let mut full_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+    for round in 0..MEASUREMENT_ROUNDS {
+        regressed_ratio.push(measure_simulated_full_reprocess(
+            &ratio_baseline,
+            BASELINE_FILES,
+            "reject-ratio",
+            round,
+        ));
+        full_durations.push(measure_full_rebuild_batch_round(round));
+    }
+    let t_regressed_ratio = robust_estimate(regressed_ratio);
+    let t_full = robust_estimate(full_durations);
     let full_ratio = t_regressed_ratio.as_secs_f64() / t_full.as_secs_f64().max(f64::EPSILON);
     println!(
         "index1 negative control (ratio): t_regressed_ratio={t_regressed_ratio:?} \
