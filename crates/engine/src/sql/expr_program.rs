@@ -672,8 +672,8 @@ impl ExprProgram {
     /// エラー契約は再帰 `eval`（[`crate::sql::udf_call::eval`]）と同一:
     /// スタック underflow・型不一致は `SqlSurfaceError::Internal`（固定文言。
     /// 束縛段の不変条件が崩れた場合の保険であり、束縛済み式に対しては
-    /// 通常発生しない）、0 除算・非有限値・確保失敗はそれぞれ既存の
-    /// `22000`／`54000` 写像を共有する（[`apply_builtin`]・
+    /// 通常発生しない）、0 除算（`22012`）・非有限値（`22003`）・確保失敗（`54000`）は
+    /// 既存の写像を共有する（[`apply_builtin`]・
     /// [`crate::sql::udf_call::eval_binary`] 経由）。
     ///
     /// `scratch` は行に依存しない借用のない値表現（[`StackValue`]）を積む
@@ -1056,9 +1056,10 @@ mod tests {
             program.steps.last(),
             Some(ExprStep::Binary(BinOp::Div))
         ));
-        // 実行時（行が評価された時点）でのみ 22000 相当のエラーになる。
+        // 実行時（行が評価された時点）でのみ 22012（0 除算）のエラーになる。
         let mut scratch = Vec::new();
-        assert!(program.eval(1, &[], &[], &mut scratch).is_err());
+        let err = program.eval(1, &[], &[], &mut scratch).unwrap_err();
+        assert_eq!(err.wire_code(), "22012");
     }
 
     #[test]

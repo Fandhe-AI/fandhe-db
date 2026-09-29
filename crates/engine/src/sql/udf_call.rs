@@ -2622,7 +2622,7 @@ pub(crate) fn apply_builtin<'a>(
             let v = take_vector_arg(args, 0)?;
             let s = take_scalar_arg(args, 1)?;
             if s == 0.0 {
-                return Err(SqlSurfaceError::invalid_input("vec_div: division by zero"));
+                return Err(SqlSurfaceError::division_by_zero("vec_div"));
             }
             // `vec_div` は成分ごとに新しい値を作る（借用元をそのまま流用できない）
             // ため、ここでは Issue #352 の限定どおり `try_reserve_exact` による
@@ -2634,16 +2634,16 @@ pub(crate) fn apply_builtin<'a>(
             for x in v.iter() {
                 let r = (*x as f64) / s;
                 if !r.is_finite() {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::numeric_out_of_range(
                         "vec_div: result is not finite",
                     ));
                 }
                 // f64 では有限でも `f32` へキャストした結果が `f32::MAX` を超えて
-                // Infinity 化しうる。「非有限値は 22000 で fail-closed」の契約を
+                // Infinity 化しうる。「非有限値は 22003 で fail-closed」の契約を
                 // キャスト後の値にも適用し、結果へ Infinity を流出させない。
                 let r32 = r as f32;
                 if !r32.is_finite() {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::numeric_out_of_range(
                         "vec_div: result is not finite",
                     ));
                 }
@@ -2895,7 +2895,7 @@ pub(crate) fn finite_scalar<'a>(v: f64, fn_name: &str) -> Result<ExprValue<'a>, 
 /// `BoundExpr::Binary` 分岐と `sql::expr_program::ExprProgram::eval` の
 /// `ExprStep::Binary` 分岐が共有する（Issue #353）。定数畳み込み
 /// （`expr_program::try_fold_scalar`）もここを経由することで、畳み込み結果と
-/// 実行時評価が同一の fail-closed 契約（0 除算・非有限値の `22000`）を持つ。
+/// 実行時評価が同一の fail-closed 契約（0 除算は `22012`、非有限値は `22003`）を持つ。
 pub(crate) fn eval_binary<'a>(
     op: BinOp,
     l: ExprValue<'a>,
@@ -3018,7 +3018,7 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
         BinOp::Mul => a * b,
         BinOp::Div => {
             if b == 0.0 {
-                return Err(SqlSurfaceError::invalid_input("division by zero"));
+                return Err(SqlSurfaceError::division_by_zero("/"));
             }
             a / b
         }
@@ -3029,7 +3029,7 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
         }
     };
     if !v.is_finite() {
-        return Err(SqlSurfaceError::invalid_input(
+        return Err(SqlSurfaceError::numeric_out_of_range(
             "arithmetic result is not finite",
         ));
     }
@@ -3042,7 +3042,7 @@ fn apply_vector_scalar_op<'a>(
     s: f64,
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     if op == BinOp::Div && s == 0.0 {
-        return Err(SqlSurfaceError::invalid_input("division by zero"));
+        return Err(SqlSurfaceError::division_by_zero("/"));
     }
     let mut out: Vec<f32> = Vec::new();
     out.try_reserve_exact(v.len()).map_err(|_| {
@@ -3059,7 +3059,7 @@ fn apply_vector_scalar_op<'a>(
             }
         };
         if !r.is_finite() {
-            return Err(SqlSurfaceError::invalid_input(
+            return Err(SqlSurfaceError::numeric_out_of_range(
                 "arithmetic result is not finite",
             ));
         }
@@ -3068,7 +3068,7 @@ fn apply_vector_scalar_op<'a>(
         // （`vec_div` 側の同種修正と同方針）。
         let r32 = r as f32;
         if !r32.is_finite() {
-            return Err(SqlSurfaceError::invalid_input(
+            return Err(SqlSurfaceError::numeric_out_of_range(
                 "arithmetic result is not finite",
             ));
         }
@@ -3232,7 +3232,57 @@ mod tests {
         let (bound, _) =
             bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
         let err = eval(&bound, 1, &[0.0, 0.0, 0.0]).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22012");
+    }
+
+    // Issue #1163・SQL-26: スカラー／ベクトル演算の 0 除算は 22012、あふれは 22003。
+    #[test]
+    fn scalar_and_vector_division_by_zero_are_22012_and_overflow_is_22003() {
+        assert_eq!(
+            apply_scalar_op(BinOp::Div, 1.0, 0.0)
+                .unwrap_err()
+                .wire_code(),
+            "22012"
+        );
+        assert_eq!(
+            apply_scalar_op(BinOp::Mul, f64::MAX, 2.0)
+                .unwrap_err()
+                .wire_code(),
+            "22003"
+        );
+        assert_eq!(
+            apply_scalar_op(BinOp::Add, f64::MAX, f64::MAX)
+                .unwrap_err()
+                .wire_code(),
+            "22003"
+        );
+        assert_eq!(
+            apply_vector_scalar_op(BinOp::Div, &[1.0], 0.0)
+                .err()
+                .unwrap()
+                .wire_code(),
+            "22012"
+        );
+        // f64 では有限だが f32 キャスト後に Infinity 化する。
+        assert_eq!(
+            apply_vector_scalar_op(BinOp::Mul, &[1.0], 1e300)
+                .err()
+                .unwrap()
+                .wire_code(),
+            "22003"
+        );
+    }
+
+    #[test]
+    fn vec_div_by_zero_is_22012() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = call("vec_div", vec![ident("embedding"), num("0")]);
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        let err = eval(&bound, 1, &[1.0, 0.0, 0.0]).unwrap_err();
+        assert_eq!(err.wire_code(), "22012");
     }
 
     #[test]
@@ -3408,7 +3458,7 @@ mod tests {
             bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
         let embedding = [1.0f32, 0.0, 0.0];
         let err = eval(&bound, 1, &embedding).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22003");
     }
 
     #[test]

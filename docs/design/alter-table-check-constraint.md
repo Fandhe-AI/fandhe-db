@@ -105,7 +105,7 @@ CheckEvaluationFailed(SqlSurfaceError)`（0 除算・`BIGINT` 精度超過等）
 | CHECK 件数上限超過 | `ConstraintLimitExceeded` | `54000` |
 | 述語の意味論エラー（未知列・禁止要素〔`visible()`・UDF〕・参照列数／述語長上限・往復不一致） | `build_check_constraint` と同じ `SqlSurfaceError` | CREATE TABLE と同一（`42601`／`54000` 等） |
 | 既存行が述語を満たさない（FALSE） | `SqlSurfaceError::check_violation(<新制約名>)` | `23514`（HTTP 409） |
-| 既存行の評価自体が失敗（0 除算等） | `CheckEvaluationFailed(e)` の `e` を透過 | 通常の式評価と同じ（例: `22000`） |
+| 既存行の評価自体が失敗（0 除算等） | `CheckEvaluationFailed(e)` の `e` を透過 | 通常の式評価と同じ（例: 0 除算は `22012`） |
 | 既存行のデコード失敗・再束縛失敗・ヘッダのテナント不整合 | `CatalogError::CorruptSchema` | `XX000`（詳細はクライアントへ出さない） |
 | DROP 対象名が存在しない | `ConstraintNotFound` | `42704` |
 | DROP 対象が UNIQUE で FK が参照 | 既存 `DependentObjectsStillExist` | `2BP01` |
@@ -219,7 +219,7 @@ TOCTOU は無い（行数に比例するコストは UNIQUE の ADD と同じ扱
 - `crates/engine/tests/sql_alter_table_check_constraint.rs`: SQL 経由の
   ADD（既定名・明示名・既定名の UNIQUE／CHECK 名衝突回避）・既存行の違反
   拒否（副作用ゼロ・クロステナント・`Private` 可視性を含む）・既存行の
-  評価エラー透過（`22000`）・修正後の再 ADD 成功・件数上限・DROP（成功・
+  評価エラー透過（0 除算は `22012`）・修正後の再 ADD 成功・件数上限・DROP（成功・
   往復・UNIQUE 実名保持回帰・DROP 後の DROP COLUMN 許可）・DDL 権限・
   明示トランザクション内の `0A000`・スコープ外構文の拒否・永続化
 - `crates/engine/tests/sql_alter_table_unique_constraint.rs`: 既存の
