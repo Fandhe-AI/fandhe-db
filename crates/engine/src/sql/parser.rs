@@ -464,8 +464,8 @@ fn bind_vector_literal_values(
 /// 揃える。Issue #1187）で拒否する。範囲外
 /// （`i32::MIN..=i32::MAX`／`i64::MIN..=i64::MAX`）は `22003`
 /// （[`SqlSurfaceError::numeric_out_of_range`]）、小数点・16 進数等の非整数形式は
-/// `22P02` で拒否する（NoSQL の小数と同じ分類。NOSQL-17）。エラーメッセージには列名のみを含め、リテラル本文は含めない
-/// （長大な数字列の反射防止）。
+/// `22P02` で拒否する（NoSQL の小数と同じ分類。NOSQL-17）。エラーメッセージには
+/// 列名のみを含め、リテラル本文は含めない（長大な数字列の反射防止）。
 pub(crate) fn bind_integer_literal(
     name: &str,
     ty: ColumnType,
@@ -3406,11 +3406,11 @@ fn bind_upsert_assignments(
                         crate::row_codec::Value::Bool(*b)
                     }
                     (ColumnType::Boolean, InsertLiteral::String(_)) => {
-                return Err(SqlSurfaceError::invalid_text_representation(format!(
-                    "invalid input syntax for type boolean, column {name:?}"
-                )));
-            }
-            (ColumnType::Boolean, InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "invalid input syntax for type boolean, column {name:?}"
+                        )));
+                    }
+                    (ColumnType::Boolean, InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
@@ -3422,11 +3422,11 @@ fn bind_upsert_assignments(
                         crate::row_codec::Value::Real(bind_real_literal(n)?)
                     }
                     (ColumnType::Real, InsertLiteral::String(_)) => {
-                return Err(SqlSurfaceError::invalid_text_representation(format!(
-                    "invalid input syntax for type real, column {name:?}"
-                )));
-            }
-            (ColumnType::Real, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "invalid input syntax for type real, column {name:?}"
+                        )));
+                    }
+                    (ColumnType::Real, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a REAL literal, got a non-numeric literal"
                         )))
@@ -3435,11 +3435,11 @@ fn bind_upsert_assignments(
                         crate::row_codec::Value::Double(bind_double_literal(n)?)
                     }
                     (ColumnType::Double, InsertLiteral::String(_)) => {
-                return Err(SqlSurfaceError::invalid_text_representation(format!(
-                    "invalid input syntax for type double precision, column {name:?}"
-                )));
-            }
-            (ColumnType::Double, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "invalid input syntax for type double precision, column {name:?}"
+                        )));
+                    }
+                    (ColumnType::Double, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                         )))
