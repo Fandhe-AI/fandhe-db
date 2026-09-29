@@ -143,7 +143,12 @@ fn integral_decimal_exceeds_exact_f64(abs_raw: &str) -> bool {
         None => 0,
         Some(e) => match e.parse() {
             Ok(v) => v,
-            Err(_) => return false,
+            // 符号付き 10 進数字列だが i64 に収まらない指数は表現範囲外として拒否側へ倒す
+            // （fail-closed）。それ以外の不正形式は後段の通常経路（malformed）に任せる。
+            Err(_) => {
+                let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+                return !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            }
         },
     };
     let (int_part, frac_part) = match mantissa.split_once('.') {
@@ -168,11 +173,25 @@ fn integral_decimal_exceeds_exact_f64(abs_raw: &str) -> bool {
     let trimmed = trimmed.trim_end_matches('0');
     let trailing_zeros = (digits.trim_start_matches('0').len() - trimmed.len()) as i64;
     // 値 = trimmed × 10^exp10（trimmed は末尾 0 なし）。
-    let exp10 = exp - frac_part.len() as i64 + trailing_zeros;
+    // 指数は未信頼入力（NoSQL `filter` の JSON 数値）由来のため、加減算はすべて
+    // checked で行い、i64 に収まらない指数は表現範囲外として拒否側（`true`）へ倒す
+    // （panic・折り返しによる誤判定を作らない。fail-closed）。
+    let Some(exp10) = i64::try_from(frac_part.len())
+        .ok()
+        .and_then(|frac_len| exp.checked_sub(frac_len))
+        .and_then(|e| e.checked_add(trailing_zeros))
+    else {
+        return true;
+    };
     if exp10 < 0 {
         return false; // 小数部が 0 でない（非整数）。
     }
-    let total_digits = trimmed.len() as i64 + exp10;
+    let Some(total_digits) = i64::try_from(trimmed.len())
+        .ok()
+        .and_then(|len| len.checked_add(exp10))
+    else {
+        return true;
+    };
     if total_digits > 20 {
         return true; // `u64` 上限（20 桁）超は 2^53 を確実に超える。
     }
@@ -3430,6 +3449,22 @@ mod tests {
             "90071992547409930e-1",
             "1e30",
             "0.9007199254740993e16",
+        ] {
+            let err = parse_number_literal(raw).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "{raw}");
+        }
+    }
+
+    /// 指数が i64 の端に達する未信頼入力でも panic せず `22000` で拒否する
+    /// （codex-review P1。checked 演算・fail-closed）。
+    #[test]
+    fn extreme_exponents_are_rejected_with_22000_without_panicking() {
+        for raw in [
+            "1.0e-9223372036854775808",
+            "10e9223372036854775807",
+            "1e9223372036854775807",
+            "1e99999999999999999999999",
+            "1e-99999999999999999999999",
         ] {
             let err = parse_number_literal(raw).unwrap_err();
             assert_eq!(err.wire_code(), "22000", "{raw}");
