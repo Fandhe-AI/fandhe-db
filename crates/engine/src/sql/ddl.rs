@@ -179,7 +179,8 @@ pub(crate) fn execute_create_table(
         // `ForeignKeyViolation` は `Storage::alter_table_add_foreign_key`
         // 専用（既存行の走査結果。TABLE-22・TASK-233、Issue #1069）で、
         // `create_table`（新規テーブル・既存行なし）からは返らない（到達不能）。
-        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
+        | CatalogError::ForeignKeyViolation
+        | CatalogError::NotNullConstraintViolation(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
@@ -395,6 +396,34 @@ pub(crate) fn execute_alter_table_add_unique(
     })
 }
 
+/// `ALTER TABLE <table> ADD PRIMARY KEY (<col>[, ...])` の実行本体（TABLE-22 (a)(d)・
+/// TASK-233、Issue #1196）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を
+/// 必ず先に呼んでいる前提（権限の無い主体への存在オラクル化を防ぐ）。
+///
+/// 判定順序（決定的）: テーブル存在確認（`42P01`／`42809`）→
+/// `catalog::Storage::alter_table_add_primary_key`（単一 write txn 内で PK 宣言済み・
+/// 擬似名衝突・スキーマ検証・全テナント既存行の NULL／重複検査を判定。TOCTOU なし）。
+/// 応答の制約名は導出擬似名 `<table>_pkey`（カタログには永続化しない）。
+pub(crate) fn execute_alter_table_add_primary_key(
+    storage: &Storage,
+    stmt: &crate::sql::allowlist::ValidatedAlterTableAddPrimaryKey,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    let columns: Vec<&str> = stmt.columns.iter().map(|c| c.as_str()).collect();
+    let confirmed_name = storage
+        .alter_table_add_primary_key(&stmt.table_name, &columns)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_alter_constraint_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AddConstraint {
+            constraint_name: confirmed_name,
+        },
+    })
+}
+
 /// `ALTER TABLE <table> DROP CONSTRAINT <name>` の実行本体（Issue #1067）。
 /// 呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に呼んでいる
 /// 前提。判定順序は [`execute_alter_table_add_unique`] と同じ
@@ -500,6 +529,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnType(stmt) => {
             execute_alter_table_alter_column_type(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AddPrimaryKey(stmt) => {
+            execute_alter_table_add_primary_key(storage, stmt)
+        }
     }
 }
 
@@ -576,6 +608,11 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::UniqueConstraintViolation => SqlSurfaceError::UniqueViolation,
         CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
         CatalogError::ForeignKeyViolation => SqlSurfaceError::ForeignKeyViolation,
+        // 既存行に主キー構成列の NULL がある（`ADD PRIMARY KEY`。TABLE-22 (d)、
+        // Issue #1196）。文言に含めるのは列名（スキーマ情報）のみ。
+        CatalogError::NotNullConstraintViolation(column) => {
+            SqlSurfaceError::not_null_violation(column)
+        }
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
@@ -725,7 +762,8 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
-        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
+        | CatalogError::ForeignKeyViolation
+        | CatalogError::NotNullConstraintViolation(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
@@ -918,7 +956,8 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
         // TASK-233、Issue #1069）専用の変種で、`alter_table_add_column` からは
         // 返らない（到達不能）。
-        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
+        | CatalogError::ForeignKeyViolation
+        | CatalogError::NotNullConstraintViolation(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
