@@ -35,7 +35,7 @@
 //! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
 //! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
 //! へ委譲し `SqlOutcome::Insert` を返す。`crates/engine/src/core.rs` 参照）。
-//! `INSERT`／単一行 `DELETE` に `RETURNING` 句を付けた場合は `SqlOutcome::
+//! `INSERT`／`DELETE`／`UPDATE`／UPSERT に `RETURNING` 句を付けた場合は `SqlOutcome::
 //! Returning` を返し、`respond_rows_with_tag` が `RowDescription`／`DataRow`*
 //! に続けて `rows_affected`（`result.rows.len()` とは独立）由来の
 //! `CommandComplete` タグを送出する（Issue #873・SQL-21）。
