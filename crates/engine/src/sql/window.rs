@@ -227,7 +227,7 @@ struct MaterializedRow {
 /// 本体は常に [`MAX_WINDOW_STATE_BYTES`] を状態予算の上限として渡す
 /// （[`execute_window_scan_with_caps`] 参照）。
 pub(crate) fn execute_window_scan(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
@@ -248,7 +248,7 @@ pub(crate) fn execute_window_scan(
 /// なっていることを、実データを大量投入せず小さい cap で単体テストできるように
 /// するため（PR #930 レビュー指摘 3）。
 fn execute_window_scan_with_caps(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
@@ -295,7 +295,7 @@ fn execute_window_scan_with_caps(
 /// （materialize 段だけでなく評価段の確保も同一の [`MAX_WINDOW_STATE_BYTES`]
 /// 予算で有界にする。レビュー指摘 3）。
 fn materialize_rows(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
@@ -1286,7 +1286,7 @@ fn observe_window_row(
 /// `id` を持つと後勝ちで値が上書きされ、順位・集計値が誤った行に付く欠陥が
 /// あった）。`id` の一致は defense-in-depth として引き続き検証する。
 fn build_result(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,

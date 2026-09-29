@@ -388,8 +388,9 @@ fn run_implicit_statements<'e, S: WireStream>(
 ///
 /// セッションの状態に応じて分岐する（SQL-31・TASK-221。PR #1041 レビュー指摘:
 /// `Failed` 中の COPY も autocommit として実行させない）:
-/// - `Idle`: [`crate::copy::run`] へ委譲する。
-/// - `InTransaction`: トランザクション内の COPY は未対応。`fail()` の後に `0A000`。
+/// - `Idle`・明示トランザクション中の `InTransaction`（Issue #1179）:
+///   [`crate::copy::run`] へ委譲する。
+/// - 暗黙トランザクション中の `InTransaction`: 未対応。`fail()` の後に `0A000`。
 ///   暗黙トランザクションでは `fail()` が `Idle` へ戻すので `ReadyForQuery('I')`。
 /// - `Failed`: 他の文と同じく `25P02`（期限切れ未報告なら `54000`）で拒否する。
 fn run_copy_statement<'e, S: WireStream>(
@@ -403,18 +404,23 @@ fn run_copy_statement<'e, S: WireStream>(
 ) -> io::Result<crate::copy::CopyStep> {
     use engine::sql::transaction::TransactionStatus;
     match txn.status() {
-        TransactionStatus::Idle => crate::copy::run(stream, engine, ctx, session, stmt, finish),
+        TransactionStatus::Idle => {
+            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish)
+        }
+        // 明示トランザクション中の COPY は共有書き込みトランザクションへ委譲する
+        // （Issue #1179。`COPY FROM STDIN` は複数行 INSERT、`COPY ... TO STDOUT` は
+        // 読み取り。失敗時は `copy::run` がトランザクションを `Failed` へ遷移させる）。
+        TransactionStatus::InTransaction if !txn.is_implicit_active() => {
+            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish)
+        }
+        // 暗黙トランザクション（Issue #1175）中の COPY は未対応（原子性を優先し、
+        // CopyIn へは入らずメッセージ全体をロールバックする）。
         TransactionStatus::InTransaction => {
-            let message = if txn.is_implicit_active() {
-                "COPY is not supported inside a transaction block"
-            } else {
-                "COPY is not supported inside an explicit transaction"
-            };
             txn.fail();
             respond_error_and_ready(
                 stream,
                 ErrorClass::FeatureNotSupported,
-                message,
+                "COPY is not supported inside a transaction block",
                 txn.status(),
             )?;
             Ok(crate::copy::CopyStep::Failed)

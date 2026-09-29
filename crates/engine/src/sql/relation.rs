@@ -270,9 +270,10 @@ impl<'a> BindingScope<'a> {
 /// 経路と同じ `0A000`（[`SqlSurfaceError::transaction_feature_not_supported`]）で
 /// fail-closed に拒否する。
 ///
-/// `core.rs::EngineCore::execute_in_active_txn` の `Statement::Join` アームから
-/// 呼ばれる（Issue #925）。`pub` で公開し、結合テストから直接検証できるように
-/// している。
+/// Issue #925 で `core.rs::EngineCore::execute_in_active_txn` の `Statement::Join`
+/// アームが呼んでいた検査。Issue #1179 で自トランザクションの未 commit 変更を読む
+/// 経路（`EngineCore::read_only_in_active_txn`）へ置き換わったため、実行経路からは
+/// 呼ばれない。`pub` の公開 API 互換のため残している。
 pub fn ensure_relations_not_written(
     txn: &crate::sql::transaction::SessionTransaction<'_>,
     relations: &[TableRef],
