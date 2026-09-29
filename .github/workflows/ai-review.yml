@@ -20,10 +20,129 @@ permissions:
   contents: read
 
 jobs:
+  # update-external.yml が生成する同期 PR に限り AI レビューを skip してよいかを判定する前段ジョブ。
+  # 同期 PR は上流の取り込みそのもので、AI の指摘があってもこの PR では直せない（修正先は
+  # 取り込み元の上流リポジトリ）。ブランチ名だけで skip すると任意の変更で gate を回避できるため、
+  # 以下をすべて満たす場合にのみ該当接頭辞を出力する（1 つでも欠ければ空＝通常どおりレビュー）:
+  # - head branch が同期 PR の接頭辞（chore/skills-update- / chore/submodule-update-）に一致
+  # - 同一リポジトリ内のブランチで、PR 作成者が同期 PR の作成主体（SUBMODULE_PAT の所有者）
+  # - 変更ファイル（rename 元を含む）が接頭辞ごとの許可パスに限られ、変更前後のファイル種別
+  #   （git tree の mode）も一致する（skills: `.agents/skills/**`・`skills-lock.json` の通常ファイル
+  #   のみ〔symlink・gitlink は不可〕/ submodule: `docs/spec` が変更前後とも gitlink の参照更新のみ）
+  # - ファイル一覧取得の前後で PR の head SHA がイベント時点から変わっておらず、件数が一致する
+  # 受容済み残留リスク: 同期 PR の作成主体が許可パス内を任意に変更した PR は skip される
+  # （Fandhe-AI/actions の ai-review/README.md「skip-branch-prefixes の受容済み残留リスク」。
+  # 第三者の write コラボレーターを迎える・作成主体が変わる場合は見直す）。
+  skip-guard:
+    runs-on: ubuntu-latest
+    # ハングしたジョブの無期限実行を防ぐ
+    timeout-minutes: 5
+    # PR の変更ファイル一覧と tree の取得にのみ使う（読み取り専用）
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      skip-prefixes: ${{ steps.check.outputs.skip-prefixes }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          TRUSTED_AUTHOR: aLiz-Nancy
+        run: |
+          set -euo pipefail
+          # 値は untrusted として扱い、workflow command 行へ展開しない
+          no_skip() {
+            echo "::notice::同期 PR の skip 条件を満たさないため AI レビューを実行します"
+            echo "skip-prefixes=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+          case "${HEAD_REF}" in
+            chore/skills-update-*)
+              prefix='chore/skills-update-'
+              allow_re='^(\.agents/skills/.+|skills-lock\.json)$'
+              ;;
+            chore/submodule-update-*)
+              prefix='chore/submodule-update-'
+              allow_re='^docs/spec$'
+              ;;
+            *)
+              echo "skip-prefixes=" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+          esac
+          if [ "${HEAD_REPO}" != "${REPO}" ] || [ "${AUTHOR}" != "${TRUSTED_AUTHOR}" ]; then
+            no_skip
+          fi
+          pr_state() {
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '"\(.head.sha) \(.changed_files)"'
+          }
+          # 変更前後の tree（mode と path）。truncated は判定不能のため失敗させる（fail-closed）
+          tree_modes() {
+            gh api "repos/${REPO}/git/trees/$1?recursive=1" \
+              --jq 'if .truncated then error("tree truncated") else .tree[] | "\(.mode) \(.path)" end'
+          }
+          mode_of() {
+            awk -v p="$2" '{ m = $1; sub(/^[^ ]+ /, ""); if ($0 == p) { print m; exit } }' <<< "$1"
+          }
+          read -r sha_before count_before < <(pr_state)
+          # status・filename・previous_filename（rename 以外は空）を 1 行ずつ
+          files=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '.[] | [.status, .filename, (.previous_filename // "")] | @tsv')
+          base_modes=$(tree_modes "${BASE_SHA}")
+          head_modes=$(tree_modes "${HEAD_SHA}")
+          read -r sha_after count_after < <(pr_state)
+          listed=$(printf '%s\n' "${files}" | grep -c . || true)
+          if [ "${sha_before}" != "${HEAD_SHA}" ] || [ "${sha_after}" != "${HEAD_SHA}" ] \
+            || [ "${count_before}" != "${count_after}" ] || [ "${listed}" -ne "${count_after}" ] \
+            || [ "${count_after}" -eq 0 ]; then
+            no_skip
+          fi
+          while IFS=$'\t' read -r status f prev; do
+            if ! [[ "${f}" =~ ${allow_re} ]]; then
+              no_skip
+            fi
+            if [ -n "${prev}" ] && ! [[ "${prev}" =~ ${allow_re} ]]; then
+              no_skip
+            fi
+            base_mode=$(mode_of "${base_modes}" "${prev:-${f}}")
+            head_mode=$(mode_of "${head_modes}" "${f}")
+            if [ "${prefix}" = 'chore/submodule-update-' ]; then
+              # gitlink の参照更新のみ（追加・削除・種別変更は不可）
+              if [ "${status}" != modified ] || [ "${base_mode}" != 160000 ] \
+                || [ "${head_mode}" != 160000 ]; then
+                no_skip
+              fi
+            else
+              # 存在する側はすべて通常ファイル（symlink 120000・gitlink 160000 は不可）
+              for m in "${base_mode}" "${head_mode}"; do
+                case "${m}" in
+                  '' | 100644 | 100755) ;;
+                  *) no_skip ;;
+                esac
+              done
+              if [ -z "${base_mode}" ] && [ -z "${head_mode}" ]; then
+                no_skip
+              fi
+            fi
+          done <<< "${files}"
+          echo "::notice::同期 PR の skip 条件を満たしたため AI レビューを skip します"
+          echo "skip-prefixes=${prefix}" >> "${GITHUB_OUTPUT}"
+
   # ジョブ ID が check 名の先頭になる（codex / preflight・codex / review・codex / post_feedback）。
-  # ruleset の required status checks はこの 3 つを登録する（preflight の失敗時は後続が
+  # ruleset の required status checks はこの 3 つと skip-guard を登録する（preflight の失敗時は後続が
   # skipped になり、skipped は required check を満たすため preflight も必ず required にする）
   codex:
+    # skip-guard が失敗しても（出力が空になり）通常どおりレビューする fail-closed。
+    # needs の失敗で本ジョブごと skipped になると required check を満たしてしまうため !cancelled() で実行する
+    needs: skip-guard
+    if: ${{ !cancelled() }}
     # review ジョブは runner 既定値（provider と同名の用途ラベル codex = self-hosted の codex 専用
     # runner）を使う。fork PR では reusable workflow 側が fail-closed で実行を拒否するため、
     # untrusted コードが self-hosted runner 上で実行されることはない。
@@ -35,4 +154,7 @@ jobs:
       pull-requests: write
     with:
       provider: codex
+      # skip-guard が条件を満たした同期 PR の接頭辞だけを渡す（それ以外は空＝全 PR をレビュー）。
+      # skip 時の review / post_feedback は skipped となり required check を満たす。
+      skip-branch-prefixes: ${{ needs.skip-guard.outputs.skip-prefixes }}
       post-feedback-runner: ubuntu-latest
