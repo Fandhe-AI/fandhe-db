@@ -43,7 +43,7 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | `date_trunc(u, DATE\|TIMESTAMP)` | TIMESTAMP | 未知の unit: `22000`（束縛時）。結果が範囲外（1〜9 年の `decade` 切り捨て等）: `22008` |
 | `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `22000`。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
 | `DATE - DATE` | Scalar（日数） | なし（範囲内の差は必ず表現できる） |
-| `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `22000`（`INTERVAL` 型が無いため対象外） |
+| `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
 | 型付きリテラルの文法違反 / 範囲外 | — | `22000` / `22008`（既存の Issue #884 D-1 と同じ写像） |
 | 引数の型不一致 | — | `42804`（Issue #1186） |
 | arity 違反 | — | `22000` |
@@ -83,8 +83,9 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 
 `BuiltinFn::DatePart(DatePartField)` と `BuiltinFn::DateTrunc(DateTruncUnit)`
 のペイロードに field / unit を持たせ、束縛後の第 1 引数が
-`BoundExpr::Text` リテラルでなければ `22000` にする（`udf_call::
-bind_date_part_or_trunc`）。実行時の引数は `src` 1 個だけになり、行ごとに
+`BoundExpr::Text` リテラルでなければエラーにする（`udf_call::
+bind_date_part_or_trunc`）。第 1 引数がテキスト型でない場合は `42804`、
+テキスト型だがリテラルでない（列参照・式）場合は `22000` とする。実行時の引数は `src` 1 個だけになり、行ごとに
 文字列を解析しない。`date_part`／`date_trunc` は名前だけでは variant が
 決まらないため `builtin_from_name` には入れず、`is_variadic_or_overloaded_
 builtin_name` に追加する（`round` と同じ流儀）。
