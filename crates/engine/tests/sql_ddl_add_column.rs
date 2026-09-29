@@ -467,8 +467,9 @@ fn malformed_syntax_variants_are_rejected_with_42601() {
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 1"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note INTEGER DEFAULT 'x'"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note BOOLEAN DEFAULT 1"),
+        // `DROP COLUMN embedding` は VECTOR 列保護（Issue #1167 以降）で 42601。
+        // `ALTER COLUMN ... TYPE` の契約は `sql_ddl_drop_alter_column.rs` が担う。
         format!("ALTER TABLE {TABLE} DROP COLUMN embedding"),
-        format!("ALTER TABLE {TABLE} ALTER COLUMN embedding TYPE TEXT"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT USING OPERATION_ID 'op-1'"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT RETURNING id"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note NUMERIC(0,0)"),

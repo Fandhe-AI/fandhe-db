@@ -234,6 +234,7 @@ fn wire_malformed_syntax_is_rejected_with_42601() {
         "ALTER TABLE docs ADD COLUMN note TEXT UNIQUE",
         "ALTER TABLE docs ADD COLUMN note TEXT DEFAULT NULL",
         "ALTER TABLE docs ADD COLUMN note TEXT DEFAULT 1",
+        // `DROP COLUMN embedding` は VECTOR 列保護（Issue #1167 以降）で 42601。
         "ALTER TABLE docs DROP COLUMN embedding",
         "ALTER TABLE docs ADD COLUMN note TEXT USING OPERATION_ID 'op-1'",
         // 予約列名（疑似列・RLS 内部列）は構造検証段階で拒否する。

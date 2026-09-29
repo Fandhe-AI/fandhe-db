@@ -44,7 +44,8 @@ use crate::catalog::{
 };
 use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
-    ValidatedAlterTableAddUnique, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
+    ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
+    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
     ValidatedCreateTable, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
     ValidatedDropView,
 };
@@ -290,6 +291,10 @@ pub enum AlterTableAction {
     /// `DROP CONSTRAINT <name>`（Issue #1067）。CHECK 名を指定した DROP も
     /// Issue #1068 以降は本 variant を返す（以前は `0A000` で拒否していた）。
     DropConstraint { constraint_name: String },
+    /// `DROP COLUMN <col>`（TABLE-19、Issue #1167）。**BREAKING CHANGE**: variant 追加。
+    DropColumn { column_name: String },
+    /// `ALTER COLUMN <col> TYPE <型>`（TABLE-19、Issue #1167）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnType { column_name: String },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -466,8 +471,9 @@ pub(crate) fn execute_alter_table_add_check(
 /// `ParsedSql::AlterTable`（[`crate::sql::allowlist::ValidatedAlterTable`]）の
 /// 唯一の実行入口（Issue #1067・#1068・#1069）。`core.rs::EngineCore::
 /// execute_parsed_in_session` から `require_ddl_permission` 通過後に呼ばれ、
-/// 5 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
-/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD [CONSTRAINT] FOREIGN KEY`）
+/// 7 つの許可形状（`ADD COLUMN`／`ADD [CONSTRAINT] UNIQUE`／
+/// `ADD [CONSTRAINT] CHECK`／`DROP CONSTRAINT`／`ADD [CONSTRAINT] FOREIGN KEY`／
+/// `DROP COLUMN`／`ALTER COLUMN TYPE`）
 /// を対応する実行本体へ振り分ける（構文の許可リスト判定は `sql::allowlist` の
 /// 管轄、ディスパッチはここと `core.rs` の管轄という既存の責務分担を維持する）。
 pub(crate) fn execute_alter_table(
@@ -489,6 +495,12 @@ pub(crate) fn execute_alter_table(
         }
         crate::sql::allowlist::ValidatedAlterTable::AddForeignKey(stmt) => {
             execute_alter_table_add_foreign_key(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::DropColumn(stmt) => {
+            execute_alter_table_drop_column(storage, stmt)
+        }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnType(stmt) => {
+            execute_alter_table_alter_column_type(storage, stmt)
         }
     }
 }
@@ -595,6 +607,132 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
         | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        },
+    }
+}
+
+/// `ALTER TABLE <table> DROP COLUMN <column>` の実行本体（TABLE-19・SQL-23、
+/// Issue #1167）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に
+/// 呼んでいる前提。判定順序: テーブル存在確認（`42P01`／`42809`）→
+/// `catalog::Storage::alter_table_drop_column`（単一 write txn 内。墓標方式の
+/// O(1) 削除・世代 bump 込み）。写像は [`map_drop_alter_column_error`]。
+pub(crate) fn execute_alter_table_drop_column(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableDropColumn,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_drop_column(&stmt.table_name, &stmt.column_name)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::DropColumn {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> TYPE <型>` の実行本体（TABLE-19・
+/// SQL-23、Issue #1167）。前提は [`execute_alter_table_drop_column`] と同じ。
+/// 判定順序: テーブル存在確認 → 目標型の解決（[`resolve_alter_target_type`]。
+/// 未登録 ENUM は `42601`）→ `catalog::Storage::alter_table_alter_column_type`
+/// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕）。
+pub(crate) fn execute_alter_table_alter_column_type(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnType,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    let target = resolve_alter_target_type(storage, &stmt.column_type)?;
+    storage
+        .alter_table_alter_column_type(&stmt.table_name, &stmt.column_name, &target)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnType {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// 対象テーブルの存在確認（不在なら `42P01`／`42809`）。読み出し失敗は
+/// [`map_drop_alter_column_error`] で fail-closed に写す。
+fn ensure_table_exists(storage: &Storage, table_name: &str) -> Result<(), SqlSurfaceError> {
+    match storage.get_table_schema(table_name) {
+        Ok(_) => Ok(()),
+        Err(CatalogError::TableNotFound(_)) => Err(undefined_table_or_view(storage, table_name)),
+        Err(other) => Err(map_drop_alter_column_error(other)),
+    }
+}
+
+/// `ALTER COLUMN TYPE` の目標型解決。[`resolve_column_type`] と異なり `VECTOR` を
+/// `0A000` にせず `ColumnType::Vector` へ写し、engine 側の互換性判定で
+/// `IncompatibleTypeChange`（`42804`）に落とす。それ以外は [`resolve_column_type`] に委譲。
+fn resolve_alter_target_type(
+    storage: &Storage,
+    ty: &SqlColumnTypeName,
+) -> Result<ColumnType, SqlSurfaceError> {
+    match ty {
+        SqlColumnTypeName::Vector(dim) => Ok(ColumnType::Vector(*dim)),
+        other => resolve_column_type(storage, other),
+    }
+}
+
+/// `DROP COLUMN`／`ALTER COLUMN TYPE` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （TABLE-19・ERR-6、Issue #1167）。`ProtectedColumn`（VECTOR 列・保護列）と
+/// `Invalid` は `42601`、依存オブジェクト（PK・UNIQUE・CHECK・FK）は `2BP01`、
+/// 非互換な型変更は `42804`。文言に含めるのは列名と型タグのみ（行値・テナント情報なし）。
+/// 全 variant を明示列挙しワイルドカード腕を置かない（fail-closed）。
+fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::ProtectedColumn(name) => {
+            SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
+        }
+        CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::IncompatibleTypeChange { column, from, to } => {
+            SqlSurfaceError::datatype_mismatch(format!(
+                "cannot change type of column {column:?} from {from} to {to}"
+            ))
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::Backend(_)
+        | CatalogError::CorruptSchema(_)
+        | CatalogError::TableAlreadyExists(_)
+        | CatalogError::ColumnAlreadyExists(_)
+        | CatalogError::RowNotFound(_)
+        | CatalogError::IncompatibleRowKeyFormat
+        | CatalogError::TableGenerationCounterOverflow
+        | CatalogError::TypeNotFound(_)
+        | CatalogError::TypeAlreadyExists(_)
+        | CatalogError::ViewNotFound(_)
+        | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewLimitExceeded(_)
+        | CatalogError::TooManyColumns { .. }
+        | CatalogError::IndexAlreadyExists(_)
+        | CatalogError::IndexNotFound(_)
+        | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexLimitExceeded(_)
+        | CatalogError::UniqueConstraintViolation
+        | CatalogError::InvalidForeignKey(_)
+        | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::ConstraintNotFound(_)
+        | CatalogError::ConstraintLimitExceeded(_)
+        | CatalogError::ForeignKeyViolation
+        // `NotNullViolation` は `ALTER TABLE ADD COLUMN`（Issue #1169）専用で、
+        // DROP COLUMN／ALTER COLUMN TYPE からは到達しない（到達したら内部不整合）。
+        | CatalogError::NotNullViolation { .. } => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
