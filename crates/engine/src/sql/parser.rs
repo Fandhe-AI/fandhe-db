@@ -556,13 +556,15 @@ pub(crate) fn bind_real_literal(raw: &str) -> Result<f32, SqlSurfaceError> {
 }
 
 /// `COPY FROM` の `REAL` フィールド束縛（Issue #1173）。[`bind_real_literal`] と
-/// 同じエラー写像だが、`COPY TO` の出力（`scalar_float::format_real` の指数表記
+/// 同じエラー写像（`Malformed` は `22P02`）だが、`COPY TO` の出力（`scalar_float::format_real` の指数表記
 /// `1e+06` 形式を含む）を再投入できるよう [`crate::scalar_float::parse_real_text`]
 /// を使う（WIRE-17 の往復契約）。
 pub(crate) fn bind_real_copy_field(raw: &str) -> Result<f32, SqlSurfaceError> {
     crate::scalar_float::parse_real_text(raw).map_err(|e| match e {
         crate::scalar_float::ParseFloatError::Malformed => {
-            SqlSurfaceError::invalid_input(format!("malformed REAL literal: {raw:?}"))
+            SqlSurfaceError::invalid_text_representation(format!(
+                "invalid input syntax for type real: {raw:?}"
+            ))
         }
         crate::scalar_float::ParseFloatError::OutOfRange => {
             SqlSurfaceError::numeric_out_of_range(format!("REAL literal out of range: {raw:?}"))
