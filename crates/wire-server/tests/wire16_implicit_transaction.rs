@@ -159,7 +159,8 @@ fn error_mid_message_rolls_back_everything_and_connection_stays_idle() {
     assert_eq!(read_ready_for_query_status(&mut alice), b'I');
 }
 
-/// 暗黙トランザクション内で対応できない文（`UPDATE`）は `0A000`。先行する書き込みは
+/// 暗黙トランザクション内で対応できない文（`UPDATE ... RETURNING`。Issue #1182・#1179 で
+/// 明示トランザクション内の `UPDATE` 自体は対応済み）は `0A000`。先行する書き込みは
 /// 残らず、接続は `'I'`。
 #[test]
 fn unsupported_statement_in_implicit_transaction_rolls_back_with_0a000() {
@@ -169,7 +170,7 @@ fn unsupported_statement_in_implicit_transaction_rolls_back_with_0a000() {
     send_simple_query(
         &mut alice,
         &format!(
-            "{}; UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'imp-u'",
+            "{}; UPDATE docs SET lang = 'en' WHERE id = 1 RETURNING id USING OPERATION_ID 'imp-u'",
             insert_sql(61, "imp-1")
         ),
     );
@@ -279,7 +280,14 @@ fn implicit_transaction_respects_tenant_boundaries() {
     assert_eq!(visible_ids(&mut bob), vec!["1", "2", "3"]);
 
     // 同じ形のメッセージが失敗した場合、両テナントは同一の ErrorResponse を受け取る。
-    let failing = |op: &str| format!("{}; SELECT id FROM docs LIMIT 1", insert_sql(70, op));
+    // 対応外の文（`UPDATE ... RETURNING`）で失敗する形を使う（トランザクション内の SELECT は
+    // Issue #1179 で自トランザクションの未 commit 変更を読めるようになったため失敗しない）。
+    let failing = |op: &str| {
+        format!(
+            "{}; UPDATE docs SET lang = 'en' WHERE id = 1 RETURNING id USING OPERATION_ID 'x-{op}'",
+            insert_sql(70, op)
+        )
+    };
     let mut responses = Vec::new();
     for (stream, op) in [(&mut alice, "imp-f-a"), (&mut bob, "imp-f-b")] {
         send_simple_query(stream, &failing(op));

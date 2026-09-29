@@ -66,38 +66,54 @@
 と `WriteTarget::with_txn`（`f: impl FnOnce(&WriteTransaction) -> Result<(T, TxnEffect), E>`
 を受け取り、`Autocommit` は `begin_write_txn` → `f` → `commit`（`f` が
 `TxnEffect::NoOp` を返したときは commit せず abort）、`InTxn` は `f` の結果を
-そのまま返す）を導入した。対象は次の 4 関数のみ:
+そのまま返す。`E` は `TenantWriteError` から変換できる型なら何でもよく、述語形
+DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では次の 4 関数のみを
+対象にし、Issue #1179 で行を書き換える全書き込み関数へ拡大した:
 
 - `insert_row_unchecked`（Rust API の行形 INSERT）
 - `insert_rows_unchecked`（同・バッチ）
-- `insert_typed_row_unchecked`（SQL 表層の単一行 typed INSERT。
-  `sql::exec::execute_insert_with_schema_in` 経由）
-- `truncate_table_unchecked`（`TRUNCATE TABLE`。
-  `sql::exec::execute_truncate_in` 経由）
+- `insert_typed_row_unchecked`（SQL 表層の単一行 typed INSERT）
+- `truncate_table_unchecked`（`TRUNCATE TABLE`）
+- （Issue #1179）`insert_typed_rows_unchecked`（複数行 `VALUES`・COPY）・
+  `upsert_typed_rows_unchecked`（`ON CONFLICT`）・`update_row_unchecked`・
+  `update_row_columns_unchecked`（単一行 `UPDATE`）・`delete_row_impl`
+  （単一行 `DELETE`。`RETURNING` を含む）・`delete_rows_where_unchecked`・
+  `update_rows_where_unchecked`（述語形 `DELETE`／`UPDATE`）
 
-**スコープの意図的な縮小**: 複数行 `VALUES`・ファイル形 INSERT・`UPSERT`・
-`UPDATE`（単一行・述語形）・`DELETE`（単一行・述語形）・COPY は本 Issue の
-明示トランザクション対応に含めない（`0A000` で拒否）。これらは既存の autocommit
-専用書き込み関数（`insert_typed_rows_unchecked`・`upsert_typed_rows_unchecked`・
-`update_row_unchecked`・`update_row_columns_unchecked`・`delete_row_impl`・
-`delete_rows_where_unchecked`・`update_rows_where_unchecked`）を `WriteTarget`
-対応へ分割していない。理由は実装コストと検証範囲を Issue #942 の予算内に
-収めるためであり、対応拡大は別 Issue の対象とする。
+`sql::exec` は各実行関数の `_in` 版（`WriteTarget` を受け取る本体）を持ち、既存の
+関数は `Autocommit` を渡す薄いラッパーとして挙動を変えない。`core.rs` の
+`execute_in_active_txn` が `Insert`（単一行・複数行・UPSERT。`RETURNING` は単一行・
+複数行のみ）・`Delete`・`Update` を受理し、成功後に `mark_written` する。
+`parsed_operation_id` は `Delete`・`Update` の `operation_id` も返し、同一
+トランザクション内での再利用（`25000`）は全 DML に効く。
+
+**明示トランザクション内で拒否（`0A000`）を維持するもの**: ファイル形 `INSERT`
+（`replace_typed_rows_by_text_key`。埋め込み I/O を単一ライタの保持中に行うことに
+なるため autocommit 専用のまま）、DDL、`USING PLAN` を伴う検索 SELECT・`EXPLAIN`
+のうち対象テーブルが dirty のもの（「6. トランザクション内の読み取り」参照）。
+
+**commit 後の副作用の監査（Issue #1179）**: 上記の書き込み関数と呼び出し元
+（`sql::exec`・`core.rs`）に、`commit_boundary::commit` の後で共有インメモリ状態
+（キャッシュの差分更新・索引・統計）を変更するコードは無い（キャッシュはテーブル世代
+キーで失効する方式）。したがって `InTxn` でも本当の COMMIT より前に走ってしまう
+副作用は無い。
 
 **空バッチ**: `insert_rows_unchecked` の空バッチ（`rows.is_empty()`）は、main と
 同じく commit せずに `write_txn` を abort する（`TxnEffect::NoOp`）。当初の実装は
 空の `write_txn` を `commit_boundary::commit` で commit していたため、グローバル
 世代が進み、世代で失効するキャッシュを無駄に捨てていた（PR #1041 レビュー指摘）。
-他の 3 関数は常に書き込む（`truncate_table_unchecked` は 0 行でも台帳記録と
-テーブル世代の進行を行う既存契約）ため `TxnEffect::Wrote` を返す。
+他の関数は基本的に常に書き込む（`truncate_table_unchecked` は 0 行でも台帳記録と
+テーブル世代の進行を行う既存契約）ため `TxnEffect::Wrote` を返す（述語形 DML の
+件数上限超過は `TxnEffect::NoOp` で、呼び出し元が `54000` を返し `Failed` へ遷移する）。
 
 ### 4. 状態機械（`crates/engine/src/sql/transaction.rs`）
 
 `SessionTransaction<'e>`（`enum TxnState<'e> { Idle, Active(Box<ActiveTxn<'e>>),
 Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 `write_txn: GatedWriteTxn`（permit を内包）・`started_at`・
-`statements`・`seen_operation_ids`・`written_tables`・`has_writes`・
-`session_at_begin` を保持する。
+`statements`・`seen_operation_ids`・`written_tables`・`written_by_tenant`・`has_writes`・
+`session_at_begin` と、dirty テーブル判定（確定済みの世代の読み取り）に使う
+`&'e Storage` を保持する。
 
 - **`BEGIN`**: `Idle` → `Active`（`Storage::begin_explicit_write_txn` 経由）。
   `Active` 中の再 `BEGIN` は `25001`（`ActiveSqlTransaction`）で `Failed` へ
@@ -163,22 +179,47 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   （`Storage::DEFAULT_WRITE_LOCK_WAIT`。既存 `READ_TIMEOUT` と同じ値）。
   超過時は `55P03`。
 
-### 6. トランザクション内の読み取り（既知の逸脱）
+### 6. トランザクション内の読み取り（未 commit 変更の反映。Issue #1179）
 
-読み取り経路（`sql::exec::execute_statement`・`scan::execute_scan`・
-`aggregate::execute_aggregate`、各キャッシュ）は具体型の `&redb::ReadTransaction`
-に深く依存しており、「自トランザクションの未 commit 変更を読む」機能を完全に
-実装するのは本 Issue の予算を超えると判断した。
+読み取りの入力源を `storage::read_source::ReadSource`（確定済みスナップショットの
+`redb::ReadTransaction` と、明示トランザクションが保持する共有
+`redb::WriteTransaction` の双方を実装）へ抽象化し、`sql::scan`・`aggregate`・
+`group_by`・`window`・`subquery`・`set_op`・`join`・`relation_snapshot`・`exec`・
+`arena`・`catalog` の読み取り本体を同じコードで動かす。`EngineCore::read_only_in_active_txn`
+が次のとおり経路を選ぶ。
 
-**採用案（fail-closed）**: トランザクション内で**まだ書き込んでいないテーブル**
-を読む文（`SELECT`／`Aggregate`／`Scan`／`EXPLAIN`）は、従来の経路（BEGIN 時点
-のスナップショットと厳密に一致する。単一ライタにより保証される）で実行する。
-**同じトランザクションで既に書き込んだテーブル**（`written_tables`）を読む文は
-`0A000` を返し `Failed` へ遷移する（黙って古い結果を返すことはしない）。
-書き込みの結果を読み戻したい場合は `RETURNING` を使う（本 Issue のスコープ外。
-書き込み系文自体が明示トランザクション内で `RETURNING` を受理していない）。
+- 自トランザクションが未 commit の変更を持たない（`SessionTransaction::dirty_tables`
+  が空）間: 従来どおり BEGIN 時点の確定済みスナップショットで読む（キャッシュ利用可。
+  単一ライタにより BEGIN 時点と厳密に一致する）。
+- 変更を持つ間: 共有書き込みトランザクションを読み取り源にして、autocommit と同じ
+  実行本体（`EngineCore::execute_read_statement`。スキーマ取得・サブクエリ解決・
+  RLS 適用・実行）を呼ぶ。対象は `Select`（`USING PLAN` なし）・`Aggregate`・`Scan`
+  （ウィンドウ関数を含む）・`SetOperation`・`Join`・`DECLARE` の内側 SELECT・
+  `COPY (...) TO STDOUT`。サブクエリ・JOIN・集合演算が別テーブルの未 commit 変更を
+  読む場合も、文全体が同じ読み取り源を使うため反映される。RLS の判定ロジックには
+  手を入れない（読み取り源だけが変わる）。
+- **dirty テーブル**は、文が直接書き込んだテーブル（`mark_written`）と、書き込み
+  トランザクション内のテーブル世代が確定済みの世代から変化したテーブルの和。
+  行を書き換える全経路は commit 前に `bump_table_generation_in_txn` を呼ぶ契約
+  （`tests/table_generation_bump_coverage.rs` が構造的に固定）で、参照アクションの
+  連鎖で書き込まれた子テーブルも bump するため、`mark_written` の記録漏れに依存しない。
+  取得に失敗した場合は fail-closed に dirty として扱う。
 
-これは SQL-31 の要件からの**既知の逸脱**である。
+**キャッシュの構造的ゲート（P0）**: テーブル世代キーのキャッシュ（`arena_cache`・
+`hnsw_cache`・`sparse_cache`・`visible_cache`・`scalar_index`・`relation_snapshot`）は
+具体型 `&redb::ReadTransaction` のまま残し、`ReadSource::snapshot()` が `Some`
+（確定済みスナップショット）のときだけ使える構造にした。書き込みトランザクションでは
+`None` を返し、読み取り本体はキャッシュなしの brute-force 経路へ落ちる（ベクトル検索の
+投影遅延も使わない）。理由: ROLLBACK したトランザクションのテーブル世代は次に commit
+される別の書き込みで再利用されるため、未 commit の行から作ったキャッシュエントリが
+確定済みデータとして別セッション（別テナントを含む）へ返る恐れがある。
+`WriteTransaction` を読み取り源にするときは、存在しないテーブルを `open_table` が作成
+してしまう副作用を避けるため、`list_tables` で存在を確認してから開く。
+
+**残る既知の逸脱**: LLM I/O とテーブル世代の再照合を伴う `USING PLAN` の検索 SELECT と
+`EXPLAIN` は、対象テーブルが dirty のとき `0A000` を返し `Failed` へ遷移する（黙って
+古い結果を返さない）。書き込み後の読み取りはキャッシュ・HNSW を使わない brute-force に
+なる（性能上のトレードオフ。テーブル単位のキャッシュ再利用は後続課題）。
 
 ## `#943` との分担
 
@@ -210,10 +251,18 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - `statement_splitter::check_write_placement(stmts, initially_in_txn)` が
   `TransactionControl` 遷移を模擬し、`BEGIN` を含む複数文メッセージでは書き込み
   文の位置制約を緩和する（詳細は `wire-multi-statement.md` 参照）。
-- 明示トランザクション中の `COPY` は `0A000` で拒否し、トランザクションを
-  `Failed` へ遷移させる（`crate::copy::run` へは委譲しない）。`Failed` 中の
-  `COPY` も autocommit として実行せず `25P02` で拒否する（`Idle` のときだけ
-  `crate::copy::run` へ委譲する。PR #1041 レビュー指摘）。
+- 明示トランザクション中の `COPY`（Issue #1179）は `crate::copy::run` へ委譲する。
+  `COPY FROM STDIN` は `EngineCore::commit_copy_in_txn`（`check_and_register_statement`
+  → 共有 `write_txn` への複数行 INSERT → `mark_written`。既存の `commit_copy_in` と
+  実行本体を共有）、`COPY (...) TO STDOUT` は `EngineCore::begin_copy_in_txn`（未 commit
+  変更を反映）を呼ぶ。COPY 中のあらゆるエラー（CopyFail・デコード失敗・上限超過・
+  実行エラー）はトランザクションを `Failed`（ReadyForQuery `'E'`）へ遷移させ、成功時の
+  ReadyForQuery は `txn.status()` から導出する。`Failed` 中の `COPY` は autocommit として
+  実行せず `25P02` で拒否する（PR #1041 レビュー指摘）。受信期限（DoS 対策）は
+  ハンドシェイク層のフレーム受信期限（`framing::FrameDeadlineGuard`。`Active` の間は
+  `min(残り持続時間, 読み取りタイムアウト)`）が COPY サブプロトコルの受信にも及び、
+  期限超過で接続を閉じて `SessionTransaction` の drop でライタを解放する（CopyData を
+  少しずつ送り続けても単一ライタを無期限に保持できない）。
 
 ## エラー時の遷移と `Failed` 中の拒否（入口別の網羅表）
 
@@ -228,7 +277,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 | 簡易クエリ: 各文（`EngineCore::execute_sql_in_txn`） | 字句・構文・許可リスト検証のエラーは `fail()`、上限超過・`operation_id` 再利用・実行エラーは `execute_parsed_in_txn` が `fail()` | parse より前に先頭トークンで判定し、`ROLLBACK` 以外は `25P02` |
 | 簡易クエリ: `BEGIN` | 入れ子は `25001` で `fail()` | `25P02` |
 | 簡易クエリ: `COMMIT` | 期限切れは abort して `Failed`・`54000`。commit 失敗はロールバック扱いで `Idle` | `25P02` |
-| 簡易クエリ: `COPY`（`handshake::post_auth_loop`） | `0A000` で `fail()` | `25P02`（`crate::copy::run` へ委譲しない） |
+| 簡易クエリ: `COPY`（`handshake::post_auth_loop`） | 実行エラー・CopyFail は `copy::run` が `fail()`（Issue #1179。正常終了は `'T'` のまま） | `25P02`（`crate::copy::run` へ委譲しない） |
 | 簡易クエリ: 空文字列 | 対象外（エラーにならない） | EmptyQueryResponse（副作用なし） |
 | 簡易クエリ: 応答のエンコード失敗（`RowDescription`・`DataRow`・`CommandComplete`） | 文の実行後でも `txn.fail()` | — |
 | 拡張: Parse | エラー応答は `respond_error_and_await_sync` を通り、`post_auth_loop` が `ignore_till_sync` を見て `fail()` | `ROLLBACK`・空文字列以外は、本体の構造検証（`08P01`）の後、パラメータ型 OID 指定の検査（`0A000`）・parse より前に `25P02` |
@@ -245,8 +294,18 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - `crates/engine/tests/sql31_transaction.rs`: BEGIN/INSERT/INSERT/COMMIT の
   可視性・ROLLBACK の完全巻き戻し・入れ子 BEGIN の `25001`・トランザクション外
   COMMIT/ROLLBACK の `25P01`・同一トランザクション内 `operation_id` 再利用の
-  `25000`・対応外文の `0A000`・文数上限の `54000`・TRUNCATE と INSERT の原子的
+  `25000`・対応外文（DDL）の `0A000`・文数上限の `54000`・TRUNCATE と INSERT の原子的
   commit・接続断相当（drop）での完全ロールバックを固定。
+- `crates/engine/tests/sql31_txn_dml.rs`（Issue #1179）: 複数行 INSERT・UPSERT・
+  UPDATE・DELETE（RETURNING を含む）の COMMIT／ROLLBACK／drop、全 DML への
+  `operation_id` 再利用検査、遅延 FK の COMMIT 時検査（連鎖で書き換わったテーブルの
+  下位の遅延 FK を含む）、未 commit 変更の読み取り（Scan・Aggregate・GROUP BY・JOIN・
+  自己 JOIN・サブクエリ・集合演算・カーソル）、キャッシュ汚染の回帰（ROLLBACK 後に
+  世代が再利用されても未 commit 行が現れない）、RLS を固定。
+- `crates/wire-server/tests/wire19_ready_for_query_status.rs`・
+  `wire942_extended_transaction.rs`（Issue #1179）: トランザクション内 COPY の
+  ReadyForQuery 状態・拡張クエリ経路の UPDATE／DELETE／UPSERT・停滞した COPY の
+  受信期限を固定。
 - `crates/wire-server/tests/`: 既存の複数文・COPY・エラー射影テストが
   `check_write_placement` のシグネチャ変更・`SqlOutcome` の新 variant 追加後も
   無変更のまま green（回帰なし）。
@@ -272,10 +331,11 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 ## 対象外・申し送り
 
-- トランザクション内での自トランザクションの未 commit 変更の可視化
-  （上記「既知の逸脱」）。
-- 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・COPY の
-  明示トランザクション対応（現状 `0A000`）。
+- 明示トランザクション内のファイル形 INSERT（埋め込み I/O。`0A000` のまま）と、
+  dirty テーブルに対する `USING PLAN` の検索 SELECT・`EXPLAIN`（`0A000` のまま。
+  上記「6. トランザクション内の読み取り」の残る既知の逸脱）。
+- 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
+  brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベルを wire 上で
   区別すること → TASK-227（ERR-6 の横断事項）。
 - 暗黙トランザクション（WIRE-16）による複数文の書き込み位置制約の撤廃は
