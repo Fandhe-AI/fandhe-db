@@ -356,14 +356,14 @@ fn datetime_arithmetic_and_field_errors_have_deterministic_wire_codes() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22008");
 
-    // `DATE '2024/01/01'`（区切り文字違反）は `22000`。
+    // `DATE '2024/01/01'`（区切り文字違反）は `22007`。
     let err = core
         .execute_sql(
             &ctx,
             &format!("SELECT id FROM {TABLE} WHERE day = DATE '2024/01/01' AND id = 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22007");
 
     // 現在時刻系は未実装のため未知の関数として `22000`。
     let err = core

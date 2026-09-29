@@ -450,11 +450,11 @@ fn sync_recovers_from_a_variety_of_errors_and_connection_keeps_working() {
     let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
     let mut stream = tcp_connect(addr);
 
-    // 許可リスト外 SQL の Parse。
+    // 許可リスト外 SQL の Parse（`LIMIT $n` は受理位置外。WIRE-12）。
     send_length_prefixed_message(
         &mut stream,
         b'P',
-        &parse_body("", "SELECT id FROM documents WHERE id = $1", 0),
+        &parse_body("", "SELECT id FROM documents LIMIT $1", 0),
     );
     assert_error_then_recovers(&mut stream, "42601");
 
@@ -528,7 +528,7 @@ fn queries_sent_before_sync_after_an_error_are_discarded() {
     send_length_prefixed_message(
         &mut stream,
         b'P',
-        &parse_body("", "SELECT id FROM documents WHERE id = $1", 0),
+        &parse_body("", "SELECT id FROM documents LIMIT $1", 0),
     );
     assert_error_response(&mut stream, "42601");
 
@@ -1138,7 +1138,7 @@ fn malformed_terminate_during_ignore_till_sync_is_rejected_not_silently_closed()
     send_length_prefixed_message(
         &mut stream,
         b'P',
-        &parse_body("", "SELECT id FROM documents WHERE id = $1", 0),
+        &parse_body("", "SELECT id FROM documents LIMIT $1", 0),
     );
     assert_error_response(&mut stream, "42601");
 
@@ -1191,7 +1191,7 @@ fn truncated_body_during_ignore_till_sync_discard_closes_the_connection() {
     send_length_prefixed_message(
         &mut stream,
         b'P',
-        &parse_body("", "SELECT id FROM documents WHERE id = $1", 0),
+        &parse_body("", "SELECT id FROM documents LIMIT $1", 0),
     );
     assert_error_response(&mut stream, "42601");
 

@@ -48,9 +48,20 @@ fn peek_message_type(stream: &mut std::net::TcpStream) -> u8 {
 /// `docs` テーブル（`embedding VECTOR(3)` + `lang TEXT`）を持つ `EngineCore` を
 /// 新設し、決定的な小規模コーパスを `tenant-a` に投入する。
 fn new_core_with_rows() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    new_core_with_rows_and_write_lock_wait(None)
+}
+
+/// [`new_core_with_rows`] の書き込みゲート待機上限指定版（Issue #1178。他接続の
+/// 書き込みが `55P03` へ倒れるまでの時間を短縮し、テストを決定的にする）。
+fn new_core_with_rows_and_write_lock_wait(
+    wait: Option<std::time::Duration>,
+) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire15-cursor");
     let guard = temp_db::CleanupGuard(path.clone());
-    let storage = Storage::open(&path).expect("open storage");
+    let mut storage = Storage::open(&path).expect("open storage");
+    if let Some(wait) = wait {
+        storage = storage.with_write_lock_wait(wait);
+    }
     storage
         .create_table(&TableSchema::new(
             TABLE,
@@ -260,4 +271,212 @@ fn wire15_cursor_names_do_not_leak_across_tenants() {
     send_simple_query(&mut bob, "ROLLBACK");
     assert_eq!(read_command_complete(&mut bob), "ROLLBACK");
     read_ready_for_query(&mut bob);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1178: FETCH 件数の範囲境界（`MAX_SEARCH_K` = 10 000）と、他セッションの
+// 書き込みに対する行集合の不変（TABLE-3）。
+// ---------------------------------------------------------------------------
+
+fn simple_ok(stream: &mut std::net::TcpStream, sql: &str, expected_tag: &str) {
+    send_simple_query(stream, sql);
+    assert_eq!(read_command_complete(stream), expected_tag);
+    read_ready_for_query(stream);
+}
+
+/// `BEGIN` → `DECLARE c`（全行対象）まで進める。
+fn begin_and_declare(stream: &mut std::net::TcpStream) {
+    simple_ok(stream, "BEGIN", "BEGIN");
+    simple_ok(
+        stream,
+        "DECLARE c CURSOR FOR SELECT id FROM docs LIMIT 100",
+        "DECLARE CURSOR",
+    );
+}
+
+/// `FETCH` の 1 ページ分の行を読み、`(行, タグ)` を返す（`RowDescription` から
+/// `CommandComplete`、`ReadyForQuery` まで消費する）。
+fn read_fetch_page(stream: &mut std::net::TcpStream) -> (Vec<String>, String) {
+    let _ = read_row_description(stream);
+    let mut ids = Vec::new();
+    while peek_message_type(stream) == b'D' {
+        let row = read_data_row(stream);
+        ids.push(row[0].clone().expect("id is not null"));
+    }
+    let tag = read_command_complete(stream);
+    let status = read_ready_for_query_status(stream);
+    assert_eq!(status, b'T', "transaction must remain Active after FETCH");
+    (ids, tag)
+}
+
+/// `FETCH n` が範囲外（`22000`）で失敗し、先に行が送られないこと、および
+/// トランザクションが `Failed`（`'E'`）へ遷移することを確認して `ROLLBACK` する。
+fn assert_fetch_rejected_with_22000(fetch_sql: &str) {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare(&mut stream);
+
+    send_simple_query(&mut stream, fetch_sql);
+    // RowDescription／DataRow が先に届かず、最初のメッセージが ErrorResponse。
+    assert_eq!(peek_message_type(&mut stream), b'E');
+    expect_error_response_with_sqlstate(&mut stream, "22000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// 上限ちょうど（10 000）は受理され、10 001 は `22000`。公開 API の
+/// `validate_search_limit` を定数ずれのオラクルとして併用する。
+#[test]
+fn wire15_fetch_count_boundary_matches_max_search_k() {
+    assert!(engine::sql::parser::validate_search_limit(10_000).is_ok());
+    let err = engine::sql::parser::validate_search_limit(10_001).expect_err("over limit");
+    assert_eq!(err.wire_code(), "22000");
+
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare(&mut stream);
+
+    send_simple_query(&mut stream, "FETCH 10000 FROM c");
+    let (ids, tag) = read_fetch_page(&mut stream);
+    assert_eq!(ids.len(), 5);
+    assert_eq!(tag, "FETCH 5");
+
+    simple_ok(&mut stream, "COMMIT", "COMMIT");
+}
+
+#[test]
+fn wire15_fetch_count_over_max_search_k_is_22000_and_fails_transaction() {
+    assert_fetch_rejected_with_22000("FETCH 10001 FROM c");
+}
+
+/// `u32` の最大値でも範囲検証（`22000`）に到達する。
+#[test]
+fn wire15_fetch_count_u32_max_is_22000() {
+    assert_fetch_rejected_with_22000("FETCH 4294967295 FROM c");
+}
+
+/// `u32` を超える値の分類は `SELECT ... LIMIT` と同一（SQL-15 との一致）。
+/// 具体的な SQLSTATE は固定せず、両者が一致することだけを固定する。
+#[test]
+fn wire15_fetch_count_beyond_u32_matches_select_limit_parity() {
+    fn sqlstate_of_error(stream: &mut std::net::TcpStream) -> String {
+        let (ty, body) = read_message(stream);
+        assert_eq!(ty, b'E', "expected ErrorResponse");
+        // ErrorResponse は `<field type byte><cstring>` の列。`C` が SQLSTATE。
+        let mut rest: &[u8] = &body;
+        while let Some((&field, tail)) = rest.split_first() {
+            if field == 0 {
+                break;
+            }
+            let end = tail.iter().position(|&b| b == 0).expect("nul-terminated");
+            let (value, next) = tail.split_at(end);
+            if field == b'C' {
+                return String::from_utf8_lossy(value).into_owned();
+            }
+            rest = &next[1..];
+        }
+        panic!("SQLSTATE field missing");
+    }
+
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 4294967296");
+    let select_code = sqlstate_of_error(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    begin_and_declare(&mut stream);
+    send_simple_query(&mut stream, "FETCH 4294967296 FROM c");
+    let fetch_code = sqlstate_of_error(&mut stream);
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+
+    assert_eq!(fetch_code, select_code);
+}
+
+/// 拡張クエリの Parse 時点でも同じ範囲検証が働く（カーソル不要）。
+#[test]
+fn wire15_fetch_count_over_max_search_k_via_extended_parse_is_22000() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("", "FETCH 10001 FROM c", 0));
+    expect_error_response_with_sqlstate(&mut stream, "22000");
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (ty, _) = read_message(&mut stream);
+    assert_eq!(ty, b'Z', "ReadyForQuery expected after Sync");
+}
+
+fn insert_row_sql(id: u64, op: &str) -> String {
+    format!(
+        "INSERT INTO docs (id, embedding, lang) VALUES ({id}, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID '{op}'"
+    )
+}
+
+/// 他セッション（同一テナント・別テナントとも）の書き込みは、明示トランザクションが
+/// 単一ライタの permit を保持している間は `55P03` になり、カーソルの行集合は
+/// 変わらない。`COMMIT` 後の新しいスナップショットで初めて書き込みが見える。
+#[test]
+fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
+    let (core, _guard) =
+        new_core_with_rows_and_write_lock_wait(Some(std::time::Duration::from_millis(300)));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("alice2", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare(&mut a);
+    send_simple_query(&mut a, "FETCH 2 FROM c");
+    let (mut seen, tag) = read_fetch_page(&mut a);
+    assert_eq!(tag, "FETCH 2");
+
+    // 同一テナント・別テナントの他接続の書き込みはライタ待機上限で `55P03`。
+    let mut b = authenticate_to_ready_for_query(addr, "alice2", "correct-horse");
+    let mut c = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    for (stream, id, op) in [(&mut b, 99u64, "op-1178-b"), (&mut c, 98u64, "op-1178-c")] {
+        send_simple_query(stream, &insert_row_sql(id, op));
+        let (ty, body) = read_message(stream);
+        assert_eq!(ty, b'E');
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("55P03"), "expected 55P03, got: {text:?}");
+        // 他テナント ID・行 ID を応答へ含めない。
+        assert!(!text.contains("tenant-"), "tenant id leaked: {text:?}");
+        assert!(!text.contains(&id.to_string()), "row id leaked: {text:?}");
+        read_ready_for_query(stream);
+    }
+
+    // 残りのカーソル行は元の集合の残りだけ（他セッションの行を含まない）。
+    send_simple_query(&mut a, "FETCH 100 FROM c");
+    let (rest, tag) = read_fetch_page(&mut a);
+    assert_eq!(tag, "FETCH 3");
+    seen.extend(rest);
+    seen.sort();
+    assert_eq!(seen, vec!["1", "2", "3", "4", "5"]);
+
+    simple_ok(&mut a, "COMMIT", "COMMIT");
+
+    // ライタ解放後は他接続の書き込みが通る。
+    simple_ok(&mut b, &insert_row_sql(99, "op-1178-b2"), "INSERT 0 1");
+
+    // 新しい明示トランザクションのスナップショットでは commit 済みの行が見える。
+    begin_and_declare(&mut a);
+    send_simple_query(&mut a, "FETCH 100 FROM c");
+    let (mut all, tag) = read_fetch_page(&mut a);
+    assert_eq!(tag, "FETCH 6");
+    all.sort();
+    assert_eq!(all, vec!["1", "2", "3", "4", "5", "99"]);
+    simple_ok(&mut a, "COMMIT", "COMMIT");
 }

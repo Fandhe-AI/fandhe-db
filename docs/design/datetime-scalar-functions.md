@@ -44,7 +44,7 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `22000`。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
 | `DATE - DATE` | Scalar（日数） | なし（範囲内の差は必ず表現できる） |
 | `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
-| 型付きリテラルの文法違反 / 範囲外 | — | `22000` / `22008`（既存の Issue #884 D-1 と同じ写像） |
+| 型付きリテラルの書式違反 / 範囲外 | — | `22007` / `22008`（Issue #1187。`datetime-column.md` と同じ写像） |
 | 引数の型不一致 | — | `42804`（Issue #1186） |
 | arity 違反 | — | `22000` |
 | NULL 入力 | NULL | すべて strict（いずれかの引数が NULL なら NULL） |
@@ -85,7 +85,8 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 のペイロードに field / unit を持たせ、束縛後の第 1 引数が
 `BoundExpr::Text` リテラルでなければエラーにする（`udf_call::
 bind_date_part_or_trunc`）。第 1 引数がテキスト型でない場合は `42804`、
-テキスト型だがリテラルでない（列参照・式）場合は `22000` とする。実行時の引数は `src` 1 個だけになり、行ごとに
+テキスト型だがリテラルでない（列参照・式）場合は `22000` とする。
+実行時の引数は `src` 1 個だけになり、行ごとに
 文字列を解析しない。`date_part`／`date_trunc` は名前だけでは variant が
 決まらないため `builtin_from_name` には入れず、`is_variadic_or_overloaded_
 builtin_name` に追加する（`round` と同じ流儀）。

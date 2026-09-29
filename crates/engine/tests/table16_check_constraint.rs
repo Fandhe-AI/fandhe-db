@@ -139,6 +139,34 @@ fn create_table_rejects_check_calling_visible() {
     assert_eq!(err.wire_code(), "42601");
 }
 
+/// Issue #1184: WHERE で受理する `NOT ( ... )`・数値の `IN`／`BETWEEN` は、CHECK 本体
+/// （TABLE-16）では従来どおり `42601` のまま（脱糖後の形が CHECK の許可形と区別
+/// できず、受理範囲が黙って広がるのを防ぐ）。
+#[test]
+fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
+    let (core, path) = new_core("check-1184-forms");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+
+    for cond in [
+        "NOT (kind = 'a')",
+        "NOT (n > 1)",
+        "NOT n > 1",
+        "n IN (1, 2)",
+        "n BETWEEN 1 AND 3",
+    ] {
+        let err = core
+            .execute_sql_in_session(
+                &alice,
+                &mut session,
+                &format!("CREATE TABLE docs (kind TEXT, n INTEGER, CHECK ({cond}))"),
+            )
+            .expect_err("new WHERE-only forms must be rejected in CHECK");
+        assert_eq!(err.wire_code(), "42601", "{cond}");
+    }
+}
+
 // --- 単一行 INSERT --------------------------------------------------------
 
 #[test]

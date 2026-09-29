@@ -566,7 +566,7 @@ pub const MAX_JSON_FIELD_LEN: usize = (crate::row_codec::MAX_SCALAR_PAYLOAD_LEN
 
 /// [`validate_json_column_text`]／[`canonicalize_jsonb_text`] の失敗を表す分類済み
 /// エラー（Issue #889 D1）。private spec（TABLE-14・TASK-198）の受理規則違反は
-/// 新規 `wire_code` を追加せず既存分類（`42601`／`54000`）へ写像する。
+/// 既存分類（`22P02`〔Issue #1187 で `42601` から変更〕／`54000`）へ写像する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonColumnError {
     /// [`MAX_JSON_FIELD_LEN`] 超過（`parse_json` を呼ぶ**前**にバイト長で判定する）。
@@ -579,7 +579,7 @@ impl ClassifiedError for JsonColumnError {
     fn error_class(&self) -> ErrorClass {
         match self {
             JsonColumnError::TooLong => ErrorClass::PayloadTooLarge,
-            JsonColumnError::Invalid => ErrorClass::UnsupportedSqlSyntax,
+            JsonColumnError::Invalid => ErrorClass::InvalidTextRepresentation,
         }
     }
 
@@ -1393,7 +1393,7 @@ mod tests {
     fn validate_json_column_text_rejects_invalid_syntax() {
         let err = validate_json_column_text("not json").unwrap_err();
         assert_eq!(err, JsonColumnError::Invalid);
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     // 総バイト長の判定が `parse_json` を呼ぶ**前**に行われることを固定する

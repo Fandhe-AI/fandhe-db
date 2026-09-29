@@ -303,10 +303,9 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   Issue #873）の有無で `execute_delete_returning_form`（PR #991 導入）／
   `execute_delete_form`（既存）へ分岐し、`Predicate` 腕は常に
   `execute_predicate_delete_form`（本 Issue）へ委譲する。述語形 DELETE／UPDATE
-  と `RETURNING` の組合せは、構造検証段（`sql::allowlist::
-  validate_delete_statement_tokens`／`validate_update_form_tokens`）が
-  `RETURNING` 併用を `42601` で拒否するため、実行結線側では到達しない
-  （PR #991 が導入した契約をそのまま維持）。
+  と `RETURNING` の組合せは Issue #1182 で結線済み（`execute_predicate_delete_returning_form`／
+  `execute_update_returning_form`。`docs/design/sql-returning.md` 参照）。
+  `RETURNING` の有無に関わらず内容照合ハッシュの入力は同一（`prepare_predicate_*`）。
 - `crates/wire-server/tests/wire_error_response.rs::err1_update_returns_42601_fields`
   の入力へ `USING OPERATION_ID` を付与した（`validate_update_form_tokens` が
   `operation_id` 必須化ガードを構造検証の直後に行うため、欠落時は `42601` ではなく

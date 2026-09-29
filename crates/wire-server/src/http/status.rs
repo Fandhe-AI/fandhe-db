@@ -64,6 +64,7 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::OperationIdContentMismatch
         | ErrorClass::MissingOperationId
         | ErrorClass::DatetimeFieldOverflow
+        | ErrorClass::InvalidDatetimeFormat
         | ErrorClass::InvalidTextRepresentation
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
@@ -127,7 +128,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 39] = [
+    const EXPECTED: [(ErrorClass, u16); 40] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -146,6 +147,7 @@ mod tests {
         (ErrorClass::DivisionByZero, 400),
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
+        (ErrorClass::InvalidDatetimeFormat, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::InvalidTransactionState, 400),

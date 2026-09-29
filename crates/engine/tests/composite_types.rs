@@ -207,7 +207,7 @@ fn insert_rejects_null_element_and_malformed_literal() {
             &insert_sql(1, "ja", "a,b,c", "{}", 1),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn insert_rejects_invalid_bool_word_for_bool_array_column() {
             &insert_sql(1, "ja", "{}", "{t,maybe}", 1),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 // --- UPDATE SET / UPSERT ------------------------------------------------------

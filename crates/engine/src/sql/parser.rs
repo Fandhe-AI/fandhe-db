@@ -308,7 +308,7 @@ use crate::sql::mode::{self, SearchMode};
 /// [`InsertLiteral::String`] の両方を受理。TABLE-13〔検討中〕・TASK-197、
 /// Issue #885・D5）を [`crate::row_codec::Value::Numeric`] へ束縛する。
 /// `crate::numeric::parse_for_column` の [`crate::numeric::NumericError`] を
-/// `wire_code` へ写像する（`Malformed` → `22000`・`OutOfRange` →
+/// `wire_code` へ写像する（`Malformed` → `22P02`・`OutOfRange` →
 /// `22003`）。`InsertLiteral::Bool` は型不一致として `22000` で拒否する。
 /// INSERT（`bind_insert_row`）・UPDATE（`bind_set_assignments`）・UPSERT
 /// （`bind_upsert_assignments`）・COPY（`sql::copy::bind_copy_record`。Issue
@@ -351,7 +351,7 @@ pub(crate) fn bind_numeric_literal(
     match crate::numeric::parse_for_column(text, precision, scale) {
         Ok(d) => Ok(crate::row_codec::Value::Numeric(d)),
         Err(crate::numeric::NumericError::Malformed(detail)) => Err(
-            SqlSurfaceError::invalid_input(format!("column {name:?}: {detail}")),
+            SqlSurfaceError::invalid_text_representation(format!("column {name:?}: {detail}")),
         ),
         Err(crate::numeric::NumericError::OutOfRange) => {
             Err(SqlSurfaceError::numeric_out_of_range(format!(
@@ -460,11 +460,12 @@ fn bind_vector_literal_values(
 /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）向けの数値リテラル
 /// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
 /// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
-/// `22000`（PG 互換の暗黙変換は行わない設計判断）で拒否する。範囲外
+/// `22P02`（PG 互換の暗黙変換は行わない設計判断。分類のみ PostgreSQL の入力関数に
+/// 揃える。Issue #1187）で拒否する。範囲外
 /// （`i32::MIN..=i32::MAX`／`i64::MIN..=i64::MAX`）は `22003`
 /// （[`SqlSurfaceError::numeric_out_of_range`]）、小数点・16 進数等の非整数形式は
-/// `22000` で拒否する。エラーメッセージには列名のみを含め、リテラル本文は含めない
-/// （長大な数字列の反射防止）。
+/// `22P02` で拒否する（NoSQL の小数と同じ分類。NOSQL-17）。エラーメッセージには
+/// 列名のみを含め、リテラル本文は含めない（長大な数字列の反射防止）。
 pub(crate) fn bind_integer_literal(
     name: &str,
     ty: ColumnType,
@@ -472,10 +473,14 @@ pub(crate) fn bind_integer_literal(
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     let raw = match literal {
         InsertLiteral::Number(s) => s,
-        InsertLiteral::String(_)
-        | InsertLiteral::Bool(_)
-        | InsertLiteral::Null
-        | InsertLiteral::Vector(_) => {
+        InsertLiteral::String(_) => {
+            // 文字列リテラルは型の入力文法に合わない形式不正として `22P02`。
+            // 本文は反射させない。
+            return Err(SqlSurfaceError::invalid_text_representation(format!(
+                "invalid input syntax for integer column {name:?}"
+            )));
+        }
+        InsertLiteral::Bool(_) | InsertLiteral::Null | InsertLiteral::Vector(_) => {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "column {name:?} expects an integer literal, got a non-integer literal"
             )))
@@ -490,8 +495,8 @@ pub(crate) fn bind_integer_literal(
                         "value out of range for INTEGER column {name:?}"
                     )))
                 }
-                _ => Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects an integer literal"
+                _ => Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for integer column {name:?}"
                 ))),
             },
         },
@@ -503,8 +508,8 @@ pub(crate) fn bind_integer_literal(
                         "value out of range for BIGINT column {name:?}"
                     )))
                 }
-                _ => Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} expects an integer literal"
+                _ => Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for integer column {name:?}"
                 ))),
             },
         },
@@ -530,13 +535,15 @@ pub(crate) fn bind_integer_literal(
 /// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のリテラル束縛を 1 箇所へ
 /// 集約するヘルパー（F7・Issue #882 計画）。`raw`（`InsertLiteral::Number` の
 /// 生テキスト。負号は `expect_literal` が既に前置済み）を
-/// [`crate::scalar_float`] の閉じた文法で解析し、`Malformed` は `22000`
-/// （既存の型不一致と同じ `InvalidInput`）、`OutOfRange`（非有限化・非ゼロ
+/// [`crate::scalar_float`] の閉じた文法で解析し、`Malformed` は `22P02`
+/// （`InvalidTextRepresentation`。Issue #1187）、`OutOfRange`（非有限化・非ゼロ
 /// アンダーフロー）は `22003`（`NumericOutOfRange`）へ写像する。
 pub(crate) fn bind_real_literal(raw: &str) -> Result<f32, SqlSurfaceError> {
     crate::scalar_float::parse_real(raw).map_err(|e| match e {
         crate::scalar_float::ParseFloatError::Malformed => {
-            SqlSurfaceError::invalid_input(format!("malformed REAL literal: {raw:?}"))
+            SqlSurfaceError::invalid_text_representation(format!(
+                "invalid input syntax for type real: {raw:?}"
+            ))
         }
         crate::scalar_float::ParseFloatError::OutOfRange => {
             SqlSurfaceError::numeric_out_of_range(format!("REAL literal out of range: {raw:?}"))
@@ -548,7 +555,9 @@ pub(crate) fn bind_real_literal(raw: &str) -> Result<f32, SqlSurfaceError> {
 pub(crate) fn bind_double_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
     crate::scalar_float::parse_double(raw).map_err(|e| match e {
         crate::scalar_float::ParseFloatError::Malformed => {
-            SqlSurfaceError::invalid_input(format!("malformed DOUBLE PRECISION literal: {raw:?}"))
+            SqlSurfaceError::invalid_text_representation(format!(
+                "invalid input syntax for type double precision: {raw:?}"
+            ))
         }
         crate::scalar_float::ParseFloatError::OutOfRange => SqlSurfaceError::numeric_out_of_range(
             format!("DOUBLE PRECISION literal out of range: {raw:?}"),
@@ -559,8 +568,8 @@ pub(crate) fn bind_double_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
 /// `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）向けの文字列リテラル
 /// 束縛。INSERT／UPDATE SET／UPSERT の 3 経路（[`bind_insert_row`]・
 /// [`bind_set_assignments`]・[`bind_upsert_assignments`]）が共有する単一情報源。
-/// 文法違反（[`crate::datetime::DateTimeLiteralError::Format`]）は既存の
-/// `InvalidInput`（`22000`）へ、範囲外・暦上不正
+/// 書式違反（[`crate::datetime::DateTimeLiteralError::Format`]）は
+/// [`SqlSurfaceError::InvalidDatetimeFormat`]（`22007`。Issue #1187）へ、範囲外・暦上不正
 /// （[`crate::datetime::DateTimeLiteralError::Overflow`]）は
 /// [`SqlSurfaceError::DatetimeFieldOverflow`]（`22008`）へ写像する（D-1。
 /// `docs/design/datetime-column.md` 参照）。
@@ -572,9 +581,11 @@ pub(crate) fn bind_datetime_literal(
     match ty {
         ColumnType::Date => match crate::datetime::parse_date(literal) {
             Ok(days) => Ok(crate::row_codec::Value::Date(days)),
-            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => Err(
-                SqlSurfaceError::invalid_input(format!("column {column_name:?}: {detail}")),
-            ),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => {
+                Err(SqlSurfaceError::invalid_datetime_format(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
             Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
                 Err(SqlSurfaceError::datetime_field_overflow(format!(
                     "column {column_name:?}: {detail}"
@@ -583,9 +594,11 @@ pub(crate) fn bind_datetime_literal(
         },
         ColumnType::Timestamp => match crate::datetime::parse_timestamp(literal) {
             Ok(micros) => Ok(crate::row_codec::Value::Timestamp(micros)),
-            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => Err(
-                SqlSurfaceError::invalid_input(format!("column {column_name:?}: {detail}")),
-            ),
+            Err(crate::datetime::DateTimeLiteralError::Format(detail)) => {
+                Err(SqlSurfaceError::invalid_datetime_format(format!(
+                    "column {column_name:?}: {detail}"
+                )))
+            }
             Err(crate::datetime::DateTimeLiteralError::Overflow(detail)) => {
                 Err(SqlSurfaceError::datetime_field_overflow(format!(
                     "column {column_name:?}: {detail}"
@@ -625,8 +638,9 @@ pub(crate) fn bind_datetime_literal(
 /// `array_ty.max_len()` を超えた時点で打ち切る（超過は `PayloadTooLarge`）。
 /// (4) 要素型ごとに変換する（`BOOLEAN` は `t|f|true|false` を大小無視で受理）。
 /// (2)〜(4) の形式違反（入れ子の `{`、閉じていない引用、末尾カンマ、`BOOLEAN` の
-/// 不正語）はすべて [`SqlSurfaceError::InvalidInput`]。NULL 要素（引用なしの
-/// `NULL`。大小無視）は D-A6 により本版では受理せず `InvalidInput`。引用つきの
+/// 不正語）はすべて [`SqlSurfaceError::InvalidTextRepresentation`]（`22P02`。
+/// Issue #1187）。NULL 要素（引用なしの
+/// `NULL`。大小無視）は D-A6 により本版では受理せず `InvalidInput`（機能未対応であり形式不正ではない）。引用つきの
 /// `"NULL"` は TEXT 要素の文字列 `NULL` として扱う。
 pub fn parse_array_literal(
     literal: &str,
@@ -644,7 +658,9 @@ pub fn parse_array_literal(
         .strip_prefix('{')
         .and_then(|s| s.strip_suffix('}'))
         .ok_or_else(|| {
-            SqlSurfaceError::invalid_input("array literal must be of the form {v1,v2,...}")
+            SqlSurfaceError::invalid_text_representation(
+                "array literal must be of the form {v1,v2,...}",
+            )
         })?;
 
     // `[]` 添字ではなく `Peekable<Chars>` を使う（coding-rust.md「untrusted
@@ -660,7 +676,7 @@ pub fn parse_array_literal(
                 chars.next();
             }
             let Some(&first) = chars.peek() else {
-                return Err(SqlSurfaceError::invalid_input(
+                return Err(SqlSurfaceError::invalid_text_representation(
                     "array literal has a trailing comma or is empty after a comma",
                 ));
             };
@@ -673,7 +689,7 @@ pub fn parse_array_literal(
                 while let Some(c) = chars.next() {
                     if c == '\\' {
                         let escaped = chars.next().ok_or_else(|| {
-                            SqlSurfaceError::invalid_input(
+                            SqlSurfaceError::invalid_text_representation(
                                 "array literal has an unterminated escape sequence",
                             )
                         })?;
@@ -686,7 +702,7 @@ pub fn parse_array_literal(
                     }
                 }
                 if !closed {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::invalid_text_representation(
                         "array literal has an unterminated quoted element",
                     ));
                 }
@@ -700,7 +716,7 @@ pub fn parse_array_literal(
                         break;
                     }
                     if c == '{' || c == '}' {
-                        return Err(SqlSurfaceError::invalid_input(
+                        return Err(SqlSurfaceError::invalid_text_representation(
                             "array literal must not contain nested braces",
                         ));
                     }
@@ -714,7 +730,7 @@ pub fn parse_array_literal(
                     ));
                 }
                 if trimmed_raw.is_empty() {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::invalid_text_representation(
                         "array literal has an empty unquoted element (use \"\" for an empty string)",
                     ));
                 }
@@ -741,7 +757,7 @@ pub fn parse_array_literal(
                     chars.next();
                 }
                 Some(_) => {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::invalid_text_representation(
                         "array literal element is not properly delimited by a comma",
                     ))
                 }
@@ -764,7 +780,7 @@ pub fn parse_array_literal(
                 } else if raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("f") {
                     false
                 } else {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::invalid_text_representation(format!(
                         "array literal boolean element is not true/false: {raw:?}"
                     )));
                 };
@@ -886,9 +902,9 @@ pub fn bind_column_projection(
     )
 }
 
-/// `RETURNING` 句（Issue #873・SQL-21）の投影束縛。`INSERT`／`DELETE`（単一行）が
-/// 実行結線済みのため、`sql::allowlist::ValidatedInsert::returning`／
-/// `sql::allowlist::ValidatedDelete::returning` の `Option<Projection>` を
+/// `RETURNING` 句（Issue #873・#1182・SQL-21）の投影束縛。`INSERT`（UPSERT を含む）・
+/// `DELETE`（単一行・述語形）・`UPDATE`（単一行・述語形）の全形が実行結線済みのため、
+/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を
 /// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
 /// 投影実装を作らない）。UDF レジストリを持たないため `Projection::Items`
 /// （関数呼び出し項目）は多層防御として `42601` で拒否する——`sql::allowlist::
@@ -1980,12 +1996,18 @@ pub(crate) fn bind_column_default(
             "column {:?} DEFAULT is out of range for its type",
             column.name
         ))),
-        Err(DefaultBindError::Malformed | DefaultBindError::Incompatible) => {
-            Err(SqlSurfaceError::invalid_input(format!(
-                "column {:?} DEFAULT is not compatible with its type",
+        // 文法不正は INSERT／UPDATE／COPY のリテラル束縛と同じく 22P02 へ写像する
+        // （Issue #1187）。値は保持せず列名のみをエラーへ含める。
+        Err(DefaultBindError::Malformed) => {
+            Err(SqlSurfaceError::invalid_text_representation(format!(
+                "column {:?} DEFAULT has an invalid input syntax for its type",
                 column.name
             )))
         }
+        Err(DefaultBindError::Incompatible) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {:?} DEFAULT is not compatible with its type",
+            column.name
+        ))),
     }
 }
 
@@ -2076,10 +2098,12 @@ fn bind_insert_row(
                 )))
             }
             (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
-            (
-                ColumnType::Boolean,
-                InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Vector(_),
-            ) => {
+            (ColumnType::Boolean, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for type boolean, column {name:?}"
+                )));
+            }
+            (ColumnType::Boolean, InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
@@ -2096,10 +2120,12 @@ fn bind_insert_row(
             (ColumnType::Real, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Real(bind_real_literal(n)?)
             }
-            (
-                ColumnType::Real,
-                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
-            ) => {
+            (ColumnType::Real, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for type real, column {name:?}"
+                )));
+            }
+            (ColumnType::Real, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a REAL literal, got a non-numeric literal"
                 )))
@@ -2107,10 +2133,12 @@ fn bind_insert_row(
             (ColumnType::Double, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Double(bind_double_literal(n)?)
             }
-            (
-                ColumnType::Double,
-                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
-            ) => {
+            (ColumnType::Double, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for type double precision, column {name:?}"
+                )));
+            }
+            (ColumnType::Double, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                 )))
@@ -2224,7 +2252,8 @@ fn bind_insert_row(
 /// [`crate::row_codec::Value::Bytes`] へ束縛する共通ヘルパー。INSERT・UPDATE・
 /// UPSERT の 4 束縛箇所が同じ検証・エラー分類を共有する。
 ///
-/// - 形式不正（接頭辞なし・奇数桁・非 16 進）は `22000`（[`SqlSurfaceError::invalid_input`]）。
+/// - 形式不正（接頭辞なし・奇数桁・非 16 進）は `22P02`
+///   （[`SqlSurfaceError::invalid_text_representation`]。Issue #1187）。
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
 pub(crate) fn bind_bytea_literal(
     s: &str,
@@ -2235,7 +2264,7 @@ pub(crate) fn bind_bytea_literal(
         Err(crate::bytea::ByteaTextError::TooLong) => Err(SqlSurfaceError::payload_too_large(
             format!("column {column_name:?} bytea literal exceeds length limit"),
         )),
-        Err(_) => Err(SqlSurfaceError::invalid_input(format!(
+        Err(_) => Err(SqlSurfaceError::invalid_text_representation(format!(
             "column {column_name:?} expects a valid bytea hex literal (\\x...)"
         ))),
     }
@@ -2248,8 +2277,9 @@ pub(crate) fn bind_bytea_literal(
 /// JSON も有効な JSON として受理。`'null'` は JSON の `null` であり SQL `NULL`
 /// とは別物）。`JSON` 列は検証のみ（入力テキスト保持）、`JSONB` 列は正規化する。
 ///
-/// - 構文不正・深さ/要素数超過は `42601`（[`SqlSurfaceError::UnsupportedSyntax`]。
-///   NOSQL-8 と同一分類）。
+/// - 構文不正・深さ/要素数超過は `22P02`
+///   （[`SqlSurfaceError::invalid_text_representation`]。Issue #1187）。NoSQL 要求本文の
+///   JSON 構文不正（`42601`。NOSQL-8）とは別経路。
 /// - 長さ超過は `54000`（[`SqlSurfaceError::payload_too_large`]）。
 pub(crate) fn bind_json_literal(
     s: &str,
@@ -2295,7 +2325,7 @@ fn json_column_error(e: crate::json::JsonColumnError, _s: &str) -> SqlSurfaceErr
             SqlSurfaceError::payload_too_large("JSON literal exceeds maximum length")
         }
         crate::json::JsonColumnError::Invalid => {
-            SqlSurfaceError::unsupported("invalid JSON literal")
+            SqlSurfaceError::invalid_text_representation("invalid input syntax for type json")
         }
     }
 }
@@ -2479,10 +2509,12 @@ fn bind_set_assignments(
                 )))
             }
             (ColumnType::Boolean, InsertLiteral::Bool(b)) => crate::row_codec::Value::Bool(*b),
-            (
-                ColumnType::Boolean,
-                InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Vector(_),
-            ) => {
+            (ColumnType::Boolean, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for type boolean, column {name:?}"
+                )));
+            }
+            (ColumnType::Boolean, InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
@@ -2497,10 +2529,12 @@ fn bind_set_assignments(
             (ColumnType::Real, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Real(bind_real_literal(n)?)
             }
-            (
-                ColumnType::Real,
-                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
-            ) => {
+            (ColumnType::Real, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for type real, column {name:?}"
+                )));
+            }
+            (ColumnType::Real, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a REAL literal, got a non-numeric literal"
                 )))
@@ -2508,10 +2542,12 @@ fn bind_set_assignments(
             (ColumnType::Double, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Double(bind_double_literal(n)?)
             }
-            (
-                ColumnType::Double,
-                InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
-            ) => {
+            (ColumnType::Double, InsertLiteral::String(_)) => {
+                return Err(SqlSurfaceError::invalid_text_representation(format!(
+                    "invalid input syntax for type double precision, column {name:?}"
+                )));
+            }
+            (ColumnType::Double, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                 )))
@@ -3375,7 +3411,12 @@ fn bind_upsert_assignments(
                     (ColumnType::Boolean, InsertLiteral::Bool(b)) => {
                         crate::row_codec::Value::Bool(*b)
                     }
-                    (ColumnType::Boolean, InsertLiteral::String(_) | InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Boolean, InsertLiteral::String(_)) => {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "invalid input syntax for type boolean, column {name:?}"
+                        )));
+                    }
+                    (ColumnType::Boolean, InsertLiteral::Number(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
@@ -3386,7 +3427,12 @@ fn bind_upsert_assignments(
                     (ColumnType::Real, InsertLiteral::Number(n)) => {
                         crate::row_codec::Value::Real(bind_real_literal(n)?)
                     }
-                    (ColumnType::Real, InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Real, InsertLiteral::String(_)) => {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "invalid input syntax for type real, column {name:?}"
+                        )));
+                    }
+                    (ColumnType::Real, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a REAL literal, got a non-numeric literal"
                         )))
@@ -3394,7 +3440,12 @@ fn bind_upsert_assignments(
                     (ColumnType::Double, InsertLiteral::Number(n)) => {
                         crate::row_codec::Value::Double(bind_double_literal(n)?)
                     }
-                    (ColumnType::Double, InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Double, InsertLiteral::String(_)) => {
+                        return Err(SqlSurfaceError::invalid_text_representation(format!(
+                            "invalid input syntax for type double precision, column {name:?}"
+                        )));
+                    }
+                    (ColumnType::Double, InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a DOUBLE PRECISION literal, got a non-numeric literal"
                         )))
@@ -5771,32 +5822,32 @@ mod tests {
             parse_array_literal("a,b,c", text_array_ty(4))
                 .unwrap_err()
                 .wire_code(),
-            "22000"
+            "22P02"
         );
         assert_eq!(
             parse_array_literal("{a,b,c", text_array_ty(4))
                 .unwrap_err()
                 .wire_code(),
-            "22000"
+            "22P02"
         );
     }
 
     #[test]
     fn parse_array_literal_rejects_unterminated_quote() {
         let err = parse_array_literal(r#"{"a}"#, text_array_ty(4)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]
     fn parse_array_literal_rejects_trailing_comma() {
         let err = parse_array_literal("{a,b,}", text_array_ty(4)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]
     fn parse_array_literal_rejects_nested_braces() {
         let err = parse_array_literal("{a,{b,c}}", text_array_ty(4)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]
@@ -5825,7 +5876,7 @@ mod tests {
     #[test]
     fn parse_array_literal_rejects_invalid_bool_word() {
         let err = parse_array_literal("{t,maybe}", bool_array_ty(8)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     // --- bind: C1（純粋 Top-k） --------------------------------------------------
@@ -6406,6 +6457,7 @@ mod tests {
             table_name: "documents".to_string(),
             where_predicates,
             operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
         };
         let err = bind_predicate_delete(
             &stmt,
@@ -7663,6 +7715,28 @@ mod tests {
             &schema,
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// Issue #1187: `bind_column_default` の文法不正は INSERT／UPDATE／COPY と同じ
+    /// `22P02`、値域外は `22003`、型の大分類不整合は従来どおり `22000`。
+    #[test]
+    fn bind_column_default_maps_malformed_to_22p02() {
+        let col = |ty| ColumnDef::new("n", ty, true);
+        let number = |s: &str| ColumnDefault::Number(s.to_string());
+
+        let err = bind_column_default(&col(ColumnType::Integer), &number("1.5"))
+            .expect_err("fractional default for INTEGER must be rejected");
+        assert_eq!(err.wire_code(), "22P02");
+        let err = bind_column_default(&col(ColumnType::Double), &number("1e"))
+            .expect_err("malformed float default must be rejected");
+        assert_eq!(err.wire_code(), "22P02");
+
+        let err = bind_column_default(&col(ColumnType::Integer), &number("99999999999"))
+            .expect_err("overflowing default must be rejected");
+        assert_eq!(err.wire_code(), "22003");
+        let err = bind_column_default(&col(ColumnType::Boolean), &number("1"))
+            .expect_err("incompatible default must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 }

@@ -363,7 +363,7 @@ fn non_integer_literal_forms_are_rejected_with_22000() {
             ),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
     assert_eq!(count_rows(&core, &ctx), 0);
 
     // 文字列リテラル。
@@ -377,7 +377,7 @@ fn non_integer_literal_forms_are_rejected_with_22000() {
             ),
         )
         .unwrap_err();
-    assert_eq!(err2.wire_code(), "22000");
+    assert_eq!(err2.wire_code(), "22P02");
     assert_eq!(count_rows(&core, &ctx), 0);
 }
 
