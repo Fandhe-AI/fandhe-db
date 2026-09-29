@@ -103,15 +103,18 @@ fn error_mid_message_rolls_back_rows_and_ledger() {
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1, "op-1"))
         .expect("insert 1");
-    // 対応外の文（UPDATE）で失敗する。暗黙トランザクションは Failed を経由せず Idle へ戻る。
+    // 対応外の文（トランザクション内の `UPDATE ... RETURNING`。Issue #1182・#1179）で失敗する。
+    // 暗黙トランザクションは Failed を経由せず Idle へ戻る。
     engine
         .execute_sql_in_txn(
             &caller,
             &mut session,
             &mut txn,
-            &format!("UPDATE {TABLE} SET embedding = '[0.0, 1.0]' WHERE id = 1 USING OPERATION_ID 'op-x'"),
+            &format!(
+                "UPDATE {TABLE} SET embedding = '[0.0, 1.0]' WHERE id = 1 RETURNING id USING OPERATION_ID 'op-x'"
+            ),
         )
-        .expect_err("UPDATE is not supported inside a transaction");
+        .expect_err("UPDATE RETURNING is not supported inside a transaction");
     assert_eq!(txn.status(), TransactionStatus::Idle);
     assert!(!txn.is_implicit_active());
     assert_eq!(count_rows(&engine, &caller), 0);

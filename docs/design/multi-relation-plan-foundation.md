@@ -46,7 +46,7 @@ spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`
 
 | モジュール | 役割 |
 | --- | --- |
-| `sql::relation`（`pub mod`） | 束縛スコープ: `TableRef`・`ColumnRef`・`ColumnSlot`・`ResolvedColumn`・`BindingScope`・`MAX_TABLE_REFS`、明示トランザクションの書き込み済みテーブル検査ヘルパー `ensure_relations_not_written` |
+| `sql::relation`（`pub mod`） | 束縛スコープ: `TableRef`・`ColumnRef`・`ColumnSlot`・`ResolvedColumn`・`BindingScope`・`MAX_TABLE_REFS`、明示トランザクションの書き込み済みテーブル検査ヘルパー `ensure_relations_not_written`（Issue #1179 で実行経路からは呼ばれなくなった。JOIN も未 commit 変更を読む経路へ移行済みで、公開 API 互換のため残置） |
 | `sql::generation_key`（`pub mod`） | 複数テーブル世代整合キー `TableGenerationKey`、汎用の fail-closed 世代整合キャッシュ `GenerationKeyedCache<V>`（`ApproxHeapBytes` trait を実装する値型を保持） |
 | `sql::relation_snapshot`（`pub mod`） | テーブル単位の RLS 可視スナップショット `RelationSnapshot`、複数テーブル束 `MultiRelationSnapshot`、`RelationSnapshotCache`、`resolve_relation_snapshots` |
 

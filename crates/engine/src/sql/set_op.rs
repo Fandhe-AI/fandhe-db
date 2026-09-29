@@ -400,7 +400,7 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
 /// （[`SetOpBudget`]）の残り予算を枝の実行に渡し（枝単体でも残り予算を超えられ
 /// ない）、実行結果のバイト量を消費として計上する。
 fn eval_branch(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
     validated: &ValidatedScan,
@@ -482,7 +482,7 @@ fn validate_tree_types(
 /// いるため、ここでは繰り返さない（PR #1105 レビュー指摘対応。二重実装を避け、
 /// 走査前検証の判定基準を単一化する）。
 fn eval_tree(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
@@ -585,7 +585,7 @@ fn eval_tree(
 /// 呼び出し元が単一の `read_txn`（同一スナップショット）上で解決済みのものを
 /// 渡す（`EngineCore::read_txn_with_schemas`）。
 pub(crate) fn execute(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
@@ -609,7 +609,7 @@ pub(crate) fn execute(
 /// 小さい上限を注入できる回帰テスト（本モジュール内の `tests`）専用に分離して
 /// いる（`sql::scan::execute_scan`／`execute_scan_with_budget` と同じ設計判断）。
 pub(crate) fn execute_with_budget(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,

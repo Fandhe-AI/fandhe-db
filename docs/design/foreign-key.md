@@ -162,11 +162,11 @@ TABLE-16 と同じ単一検査点に置く（表層ごとに検査を持たな�
   全 NULL なら検査対象外、全非 NULL なら `MATCH SIMPLE` と同じ照合を行う。
 - `INITIALLY DEFERRED` の FK（D14・D15）は `constraint::FkCheckMode`
   （`All`／`ImmediateOnly`）で文単位検査から除外できる。`ImmediateOnly` を
-  渡してよいのは `tenant::WriteTarget::InTxn` を受理する 4 経路
-  （`insert_row_unchecked`・`insert_rows_unchecked`・`insert_typed_row_unchecked`・
-  `truncate_table_unchecked`。`WriteTarget::fk_check_mode()` が導出する）のみで、
-  それ以外の呼び出し元（UPDATE／DELETE／UPSERT／複数行 INSERT 等、いずれも
-  autocommit 専用）はすべて `FkCheckMode::All` を明示する。詳細は下記
+  渡してよいのは `tenant::WriteTarget::InTxn` 経由の書き込み（`WriteTarget::
+  fk_check_mode()` が導出する。Issue #1179 で INSERT・複数行 INSERT・UPSERT・
+  UPDATE・DELETE・TRUNCATE の全書き込み関数が `WriteTarget` を受け取る形になった。
+  ファイル形 INSERT の `replace_typed_rows_by_text_key` のみ autocommit 専用で
+  `FkCheckMode::All` を明示する）だけで、`Autocommit` は常に `All`。詳細は下記
   「COMMIT 時の遅延検査」参照。
 
 ### 参照アクションの適用（Issue #1076）
@@ -300,8 +300,15 @@ v9 対応が前提）の両方について、COMMIT 直前の事後状態を全�
 ロジックを 2 か所で重複させない。Issue #1071 の索引化スコープ外——事後状態の
 全件検証は差分ベースの索引同期に乗らないため全行走査のまま据え置く）。
 
-- 検査対象範囲は `written_by_tenant` だけから導出する（呼び出し元が渡す ctx には
-  依存しない）。記録漏れ＝検査漏れ＝fail-open になるため、`mark_written` は
+- 検査対象範囲は「`written_by_tenant` に現れるテナント × dirty テーブル」の直積
+  （呼び出し元が渡す ctx には依存しない。テナント集合は上位集合＝fail-closed）。
+  dirty テーブルは `mark_written` で記録した集合と、テーブル世代が確定済みの世代から
+  変化したテーブル（`SessionTransaction::dirty_tables`）の和にする（Issue #1179）。
+  参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`）の連鎖で書き換わった子
+  テーブルは文が直接対象にしたテーブルではなく `mark_written` されないが、その子を
+  親とする別の `INITIALLY DEFERRED` FK は文単位検査から外れているため、記録だけに
+  頼ると COMMIT で違反を見逃す（fail-open）。世代は行を書き換える全経路が bump する
+  契約で、連鎖先も bump するため、記録漏れに依存せず検査対象に入る。`mark_written` は
   シグネチャに `tenant_id` を要求し、呼び出し漏れをコンパイル時に検出する。
 - 違反時は `write_txn` を drop（abort）し、`SessionState` を `BEGIN` 時点へ復元して
   `Idle` へ戻り `23503` を返す（`session_at_begin` の復元は commit 自体の失敗と
@@ -419,9 +426,6 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
   同じ全行走査のまま据え置く（Issue #1071 の対象外）
 - `#[cfg(test)]` の生書き込み API（`catalog.rs`）が索引・制約を迂回する点
   （production では到達不能。Issue #1078）
-- 明示トランザクション内の `UPDATE`／`DELETE`／`UPSERT`／複数行 `INSERT`
-  （単一行 `INSERT`・`TRUNCATE` のみ対応。`docs/design/explicit-transaction.md`）。
-  対応すれば `INITIALLY DEFERRED` の遅延検査の観測可能範囲が広がる
 - NoSQL `references` への `MATCH {SIMPLE|FULL}`・`[NOT] DEFERRABLE`・
   `INITIALLY {DEFERRED|IMMEDIATE}` の露出（Issue #1148 のスコープ外。
   `on_delete`／`on_update` の宣言自体は解消済み）

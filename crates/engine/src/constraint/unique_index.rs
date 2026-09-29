@@ -898,7 +898,7 @@ mod tests {
             .resolve(Some(&null_op_id))
             .expect("ledger resolve");
         crate::tenant::update_row_columns_unchecked(
-            &storage,
+            crate::tenant::WriteTarget::Autocommit(&storage),
             "docs",
             &ctx,
             1,

@@ -644,7 +644,7 @@ fn encode_key(
 /// 呼ばれる）。`schemas` は呼び出し元が単一の `read_txn`（同一スナップショット）
 /// 上で解決済みのものを渡す（`EngineCore::read_txn_with_schemas`）。
 pub(crate) fn execute(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schemas: &HashMap<String, TableSchema>,
     validated: &ValidatedJoin,
@@ -663,7 +663,7 @@ pub(crate) fn execute(
 /// [`execute`] の本体。`limits` はテスト専用に上限を差し替えられるようにした
 /// もの（[`JoinLimits`]。`sql::scan::execute_scan_with_budget` と同じ設計）。
 pub(crate) fn execute_with_limits(
-    read_txn: &redb::ReadTransaction,
+    read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schemas: &HashMap<String, TableSchema>,
     validated: &ValidatedJoin,

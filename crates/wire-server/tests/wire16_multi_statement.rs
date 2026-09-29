@@ -282,9 +282,10 @@ fn read_then_write_is_accepted() {
 }
 
 /// 書き込みが最後以外にある組み合わせは暗黙トランザクションで原子的に実行される
-/// （Issue #1175）。書き込みだけで完結する形は commit され、暗黙トランザクション内で
-/// 対応できない文（書き込み済みテーブルの読み取り・`UPDATE`／`DELETE`）は `0A000` で
-/// メッセージ全体をロールバックする。いずれの場合も `ReadyForQuery` は `'I'`。
+/// （Issue #1175）。書き込みだけで完結する形は commit され、直後の読み取りは自トランザクションの
+/// 未 commit 変更を反映する（Issue #1179）。暗黙トランザクション内で対応できない文
+/// （`UPDATE ... RETURNING`）は `0A000` でメッセージ全体をロールバックする。
+/// いずれの場合も `ReadyForQuery` は `'I'`。
 #[test]
 fn write_not_last_runs_in_an_implicit_transaction_and_rolls_back_on_unsupported_statements() {
     let (core, _guard) = new_core_three_tenant_docs();
@@ -302,47 +303,42 @@ fn write_not_last_runs_in_an_implicit_transaction_and_rolls_back_on_unsupported_
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    // (2) INSERT; 同じテーブルの SELECT は INSERT の応答の後に 0A000（書き込み済み
-    //     テーブルの読み取りは未対応）となり、INSERT もロールバックされる。
+    // (2) INSERT; 同じテーブルの SELECT は自トランザクションの未 commit 行を読め、
+    //     メッセージ全体が commit される。
     send_simple_query(
         &mut stream,
         "INSERT INTO docs (id, embedding, lang) VALUES (50, '[0.1,0.2,0.3]', 'ja') \
-         USING OPERATION_ID 'wl-1'; SELECT id FROM docs LIMIT 1",
+         USING OPERATION_ID 'wl-1'; SELECT id FROM docs WHERE id = 50 LIMIT 1",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream)[0].as_deref(), Some("50"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // (3) INSERT; UPDATE ... RETURNING は暗黙トランザクション内では未対応。INSERT の応答の後に
+    //     0A000 となり、INSERT はロールバックされる。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (53, '[0.1,0.2,0.3]', 'ja') \
+         USING OPERATION_ID 'wl-5'; \
+         UPDATE docs SET lang = 'en' WHERE id = 1 RETURNING id USING OPERATION_ID 'wl-6'",
     );
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     expect_error_response_with_sqlstate(&mut stream, "0A000");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    // (3) TRUNCATE; SELECT も同様に 0A000。TRUNCATE はロールバックされる。
-    send_simple_query(
-        &mut stream,
-        "TRUNCATE TABLE docs USING OPERATION_ID 'wl-4'; SELECT id FROM docs LIMIT 1",
-    );
-    assert_eq!(read_command_complete(&mut stream), "TRUNCATE TABLE");
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
-    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
-
-    // (4) UPDATE; DELETE は暗黙トランザクション内では未対応。最初の文で 0A000 になり
-    //     何も応答されない。
-    send_simple_query(
-        &mut stream,
-        "UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'wl-5'; \
-         DELETE FROM docs WHERE id = 2 USING OPERATION_ID 'wl-6'",
-    );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
-    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
-
-    // commit されたのは (1) の 2 行だけ。(2)〜(4) の副作用は残っていない
-    // （id=50 なし・TRUNCATE されていない・元の lang のまま）。
+    // commit されたのは (1)(2) の 3 行だけ。(3) の副作用は残っていない
+    // （id=53 なし・元の lang のまま）。
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
     let _columns = read_row_description(&mut stream);
     let mut ids = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         ids.push(read_data_row(&mut stream)[0].clone().expect("id"));
     }
     ids.sort();
-    assert_eq!(ids, vec!["1", "2", "3", "51", "52"]);
-    assert_eq!(read_command_complete(&mut stream), "SELECT 5");
+    assert_eq!(ids, vec!["1", "2", "3", "50", "51", "52"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 6");
     read_ready_for_query(&mut stream);
 
     send_simple_query(&mut stream, "SELECT lang FROM docs WHERE id = 1 LIMIT 1");
