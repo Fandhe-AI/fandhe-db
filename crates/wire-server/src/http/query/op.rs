@@ -26,8 +26,8 @@
 //! [`super::ddl`] が SQL 表層の DDL と**同一の実行器**
 //! （`engine::core::EngineCore::execute_parsed_in_session`）へ、JSON を
 //! トークン列へ写像したうえで到達させる（第 2 の DDL 実行器・第 2 の権限
-//! 判定を作らない設計）。`alter_table` は `add_column` のみ実行し、
-//! `drop_column`（SQL 表層が未結線）・`create_table` の `check` 制約は
+//! 判定を作らない設計）。`alter_table` は `add_column`／`drop_column`
+//! （Issue #1167）を実行し、`create_table` の `check` 制約は
 //! `0A000` のまま据え置く（`super::ddl` モジュール doc 参照）。
 //!
 //! [`super::schema::schema_for`] はこのモジュールの表引き（[`Op::schema`]）
@@ -52,7 +52,7 @@ pub enum Op {
     /// `CREATE TABLE`（NOSQL-13・TASK-207、Issue #910）。[`super::ddl`] が
     /// 実行を担う。
     CreateTable,
-    /// `ALTER TABLE ... ADD COLUMN`（`drop_column` は `0A000`。NOSQL-13・
+    /// `ALTER TABLE ... ADD COLUMN`／`DROP COLUMN`（NOSQL-13・
     /// TASK-207、Issue #910）。
     AlterTable,
     /// `DROP TABLE`（NOSQL-13・TASK-207、Issue #910）。

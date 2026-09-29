@@ -1061,8 +1061,8 @@ pub static DDL_ADD_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
 };
 
 /// `alter_table.drop_column` のサブスキーマ（NOSQL-13・TASK-207、Issue #910）。
-/// SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線（[`super::ddl`]
-/// モジュール doc 参照）のため、本スキーマを通過しても常に `0A000` を返す。
+/// SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線される
+/// （Issue #1167。[`super::ddl`] モジュール doc 参照）。
 pub static DDL_DROP_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
     name: "ddl_drop_column",
     fields: &[FieldSpec {
