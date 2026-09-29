@@ -192,5 +192,5 @@ NOT NULL 違反は新設の `ErrorClass::NotNullViolation`（`code` ラベル
   の `row_codec` 由来の分類を維持）と、Rust API での `DEFAULT` 適用（Rust
   API は列挙位置指定の `Value` を直接受け取るため「省略」の概念が無く、
   `DEFAULT` は適用しない）。
-- `23505` の `UNIQUE_VIOLATION`／`DUPLICATE_OPERATION_ID` ラベル分離
-  （ERR-6。本 Issue の `SHARED_WIRE_CODES` の仕組みを再利用できる）。
+- `23505` の `UNIQUE_VIOLATION`／`DUPLICATE_OPERATION_ID` ラベル分離は Issue #1180 で
+  実装済み（ERR-6。`SHARED_WIRE_CODES` の仕組みを再利用）。

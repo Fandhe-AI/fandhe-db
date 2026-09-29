@@ -262,8 +262,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   （上記「既知の逸脱」）。
 - 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・COPY の
   明示トランザクション対応（現状 `0A000`）。
-- `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベルを wire 上で
-  区別すること → TASK-227（ERR-6 の横断事項）。
+- `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で
+  engine の `ErrorClass` と HTTP `code` に実装済み（ERR-6）。pg wire の `ErrorResponse` は
+  ERR-1 の既存形式（`S`/`C`/`M`）のままで、固定文言の違いで区別する。
 - 暗黙トランザクション（WIRE-16）による複数文の書き込み位置制約の完全撤廃
   （`BEGIN` を含まないメッセージは引き続き「書き込みは最後の 1 文のみ」）。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。

@@ -3278,7 +3278,8 @@ pub fn project_id_only_rows(
 ///   ならない）
 ///
 /// `23505` は行キー `(tenant_id, id)` の衝突と `operation_id` の重複という 2 つの
-/// 別原因を共有する（`error_format.rs::ErrorClass::UniqueViolation` 参照）。
+/// 別原因を共有し、`code` ラベルで区別する（`error_format.rs` の
+/// `ErrorClass::UniqueViolation`・`ErrorClass::DuplicateOperationId` 参照）。
 /// 内容不一致検出（同一 `operation_id`・異なる内容）は TASK-101、対象ビヘイビア:
 /// RECOVER-10 の管轄で未提供。
 ///

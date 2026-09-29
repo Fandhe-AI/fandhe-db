@@ -197,11 +197,10 @@ violation`。値・列名・行 id・テナントを含めない）をそのま�
 `ErrorClass::UniqueViolation`（`23505`／`UNIQUE_VIOLATION`）へ写像する。HTTP
 （NoSQL 表層）も既存の `ErrorClass::UniqueViolation → 409` 写像を再利用する。
 
-台帳由来の重複（`DuplicateOperationId`）・行キー衝突（`IdConflict`）とは Rust の
-型レベルでは区別できるが、`wire_code`／HTTP `code` レベルではいずれも
-`23505`／`UNIQUE_VIOLATION` のまま（PostgreSQL 自身も行制約・値制約いずれの一意性
-違反も同一 SQLSTATE `23505` で返す。`ErrorClass` の 1 wire_code=1 label の
-不変条件〔`wire_codes_are_pairwise_distinct`〕とも整合する）。
+台帳由来の重複（`DuplicateOperationId`）は Issue #1180 で
+`ErrorClass::DuplicateOperationId`（`23505`／`DUPLICATE_OPERATION_ID`）へ分離した
+（`wire_code` は `SHARED_WIRE_CODES` で共有）。行キー衝突（`IdConflict`）・UNIQUE 違反は
+`23505`／`UNIQUE_VIOLATION` のまま。
 
 `CatalogError::UniqueConstraintViolation`（公開 enum への variant 追加。BREAKING
 CHANGE）は `alter_table_add_unique_constraint` 専用で、SQL 表層からは到達しない。

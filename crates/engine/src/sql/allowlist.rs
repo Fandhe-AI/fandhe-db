@@ -432,7 +432,8 @@ pub enum SqlSurfaceError {
     IdConflict,
     /// `operation_id` 台帳（TASK-93）に記録済みの `operation_id` へ、**内容が一致する**
     /// 書き込みが再送された（TASK-101・対象ビヘイビア: RECOVER-10。
-    /// [`crate::tenant::TenantWriteError::DuplicateOperationId`] の写像。ERR-2: `23505`）。
+    /// [`crate::tenant::TenantWriteError::DuplicateOperationId`] の写像。ERR-2: `23505`、
+    /// `code` は `DUPLICATE_OPERATION_ID`。Issue #1180・ERR-6）。
     /// 行キー衝突（[`SqlSurfaceError::IdConflict`]）とは別の固定文言を返し、クライアント
     /// が両者を取り違えないようにする。
     DuplicateOperationId,
@@ -769,8 +770,9 @@ impl SqlSurfaceError {
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
 /// variant → `ErrorClass` の対応は既存 `wire_code()` の返値と 1:1 で一致させ、
-/// 委譲化で応答コードを変えない（`IdConflict` は行 `id` 衝突であり、原因を問わない
-/// 一意制約違反の分類 [`ErrorClass::UniqueViolation`]（`23505`）へ写像する）。
+/// 委譲化で応答コードを変えない（`IdConflict` は行 `id` 衝突であり、行制約由来の
+/// 分類 [`ErrorClass::UniqueViolation`]（`23505`）へ写像する。台帳由来の
+/// `DuplicateOperationId` は `wire_code` を共有する [`ErrorClass::DuplicateOperationId`]）。
 impl ClassifiedError for SqlSurfaceError {
     fn error_class(&self) -> ErrorClass {
         match self {
@@ -781,7 +783,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
-            SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
+            SqlSurfaceError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,

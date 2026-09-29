@@ -397,9 +397,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
   `DEFAULT` の有無に関わらず、nullable なら `NULL`・非 nullable なら
   `23502`（`NOT_NULL_VIOLATION`。旧 `22000` から契約変更）
 - 未知キー・次元不一致・型不一致は `22000`（新型の型不一致は `42601`。上記参照）
-- 同一 `operation_id` の再送: 内容が一致すれば `23505`、不一致なら `22023`
+- 同一 `operation_id` の再送: 内容が一致すれば `23505`（`code`=`DUPLICATE_OPERATION_ID`）、不一致なら `22023`
   （台帳照合。TASK-101・RECOVER-10 の再送判定を透過する）
-- 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
+- 同一テナント内の `id` 重複は `23505`（`code`=`UNIQUE_VIOLATION`。他テナントの同 `id` とは衝突せず、
   応答は「不在時」と同一——TABLE-12・RLS-9）
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
   `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
@@ -440,7 +440,7 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `set` | ○ | object（任意キー・非空） | 列名をキーに持つ部分更新。`id`／`tenant_id`／`visibility` は `42601`。`TEXT` 列は JSON 文字列、`VECTOR` 列は数値配列（**文字列形のベクトルリテラルは受理しない**）のみ受理。他の列型は `insert` と同じ JSON 表現（Issue #896・NOSQL-17。上記参照）。`null` は列型を問わず nullable 判定込みで `bind_update` へ委譲する（非 nullable 列への `null` は `22000`）。型不一致・未知列・次元不一致は `22000`（新型の型不一致は `42601`） |
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層の字句解析・束縛とのパリティ。詳細は design doc 参照）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
-| `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`・不一致 `22023`（SQL 表層と共有） |
+| `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
 
 成功応答: `{"updated":<n>,"operation_id":"<echo>"}`。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `updated:0`・
@@ -491,7 +491,7 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `table` | ○ | string | |
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層とのパリティ）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
-| `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により `23505`（内容一致。`DELETE` は行の有無に関わらず同一内容） |
+| `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
 
 成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `deleted:0`・
@@ -948,7 +948,8 @@ Date: <IMF-fixdate>
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `23503` | `FOREIGN_KEY_VIOLATION` | 409 | Conflict | `FOREIGN KEY`（TABLE-17・TASK-205）を宣言したテーブルへの `insert`／`update` で参照先の値が同一テナント内に無い、または参照先の `update`／`delete` で参照元の行が残る |
-| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送）、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`） |
+| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`）。行制約由来のため commit 済みの根拠にならない |
+| `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過、`FOREIGN KEY` 参照アクション連鎖（`ON DELETE CASCADE` 等。宣言が SQL／NoSQL いずれでも。Issue #1148）の深さ・行数上限超過（副作用ゼロ） |

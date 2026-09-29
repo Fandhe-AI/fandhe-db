@@ -12,6 +12,7 @@
 
 use engine::core::EngineCore;
 use engine::embedding::HashingEmbedder;
+use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
@@ -120,6 +121,25 @@ fn create_table_accepts_id_only_primary_key_as_a_no_op() {
         )
         .expect_err("duplicate id must be rejected");
     assert_eq!(err.wire_code(), "23505");
+    // 別 operation_id での id 衝突は行制約由来（Issue #1180・ERR-6）。
+    assert_eq!(
+        ClassifiedError::error_class(&err),
+        ErrorClass::UniqueViolation
+    );
+
+    // 同一 operation_id・同一内容の再送は台帳照合が PK 検査より先に走り、
+    // 台帳由来の DUPLICATE_OPERATION_ID になる（RECOVER-12 の判定根拠）。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, embedding, body) VALUES (1, '[0.1,0.2,0.3,0.4]', 'a') USING OPERATION_ID 'op-1'",
+        )
+        .expect_err("identical resend must be a ledger duplicate");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(
+        ClassifiedError::error_class(&err),
+        ErrorClass::DuplicateOperationId
+    );
 }
 
 // --- 拒否系（構造検証段階。42601／42701／54000） -------------------------

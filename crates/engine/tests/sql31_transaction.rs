@@ -10,6 +10,7 @@
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::{SearchMode, SessionState};
@@ -770,4 +771,145 @@ fn execute_sql_in_session_rejects_transaction_control_statements_with_unsupporte
              を返すべき（0A000 への退行を検出する）"
         );
     }
+}
+
+// --- 接続断からの回復（RECOVER-12・ERR-6。Issue #1180） ------------------------
+//
+// クライアントは応答を失った明示トランザクションを、新しい `BEGIN` の中で先頭文から
+// 同じ `operation_id` で再送して成否を確定する。台帳由来の `23505`
+// （`DUPLICATE_OPERATION_ID`）だけが commit 済みの根拠になり、行制約由来の
+// `23505`（`UNIQUE_VIOLATION`）は根拠にならない。
+
+/// 応答を失った 2 文のトランザクションを COMMIT まで完了させる。
+fn commit_two_inserts(engine: &EngineCore, caller: &PolicyContext) {
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in [
+        "BEGIN".to_string(),
+        insert_sql(1, "op-a"),
+        insert_sql(2, "op-b"),
+        "COMMIT".to_string(),
+    ] {
+        engine
+            .execute_sql_in_txn(caller, &mut session, &mut txn, &sql)
+            .expect("statement");
+    }
+}
+
+#[test]
+fn recovery_resend_in_new_begin_after_commit_is_ledger_duplicate() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    commit_two_inserts(&engine, &caller);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1, "op-a"))
+        .expect_err("resend of a committed first statement must be a ledger duplicate");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(
+        ClassifiedError::error_class(&err),
+        ErrorClass::DuplicateOperationId
+    );
+    assert_eq!(
+        ClassifiedError::error_class(&err).label(),
+        "DUPLICATE_OPERATION_ID"
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert_eq!(
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback"),
+        SqlOutcome::Rollback
+    );
+    assert_eq!(visible_row_count(&engine, &caller), 2);
+}
+
+#[test]
+fn recovery_resend_after_lost_uncommitted_transaction_applies_exactly_once() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    {
+        let mut txn = engine.new_session_transaction();
+        for sql in [
+            "BEGIN".to_string(),
+            insert_sql(1, "op-a"),
+            insert_sql(2, "op-b"),
+        ] {
+            engine
+                .execute_sql_in_txn(&caller, &mut session, &mut txn, &sql)
+                .expect("statement");
+        }
+        // COMMIT せずに drop（接続断）。
+    }
+
+    let mut txn = engine.new_session_transaction();
+    for sql in [
+        "BEGIN".to_string(),
+        insert_sql(1, "op-a"),
+        insert_sql(2, "op-b"),
+        "COMMIT".to_string(),
+    ] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, &sql)
+            .expect("resend must succeed because nothing was committed");
+    }
+    assert_eq!(visible_row_count(&engine, &caller), 2);
+    // 台帳には各 operation_id が 1 回ずつ記録されている（二重適用なし）。
+    for (id, op) in [(1, "op-a"), (2, "op-b")] {
+        let err = engine
+            .execute_sql_in_session(&caller, &mut session, &insert_sql(id, op))
+            .expect_err("already recorded");
+        assert_eq!(
+            ClassifiedError::error_class(&err),
+            ErrorClass::DuplicateOperationId
+        );
+    }
+    assert_eq!(visible_row_count(&engine, &caller), 2);
+}
+
+#[test]
+fn recovery_row_constraint_conflict_is_not_a_commit_proof() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    // 別の operation_id が同じ行 id を先に確定させている。
+    engine
+        .execute_sql_in_session(&caller, &mut session, &insert_sql(1, "op-x"))
+        .expect("autocommit insert");
+
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1, "op-a"))
+        .expect_err("row id conflict");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(
+        ClassifiedError::error_class(&err),
+        ErrorClass::UniqueViolation
+    );
+    assert_eq!(
+        ClassifiedError::error_class(&err).label(),
+        "UNIQUE_VIOLATION"
+    );
+    assert_eq!(
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback"),
+        SqlOutcome::Rollback
+    );
+    // op-a は台帳に残っていない（別 id なら成功する）。
+    engine
+        .execute_sql_in_session(&caller, &mut session, &insert_sql(3, "op-a"))
+        .expect("op-a was rolled back and must be reusable");
 }
