@@ -17,8 +17,22 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   `Keyword` へ含めない」設計方針を踏襲）。`Token::Ident` のまま字句解析し、
   `sql::allowlist::Parser::parse_alter_table_add_column` が文脈的に大文字小文字を
   無視して照合する。
-- 追加列は常に nullable として扱う（TABLE-5）。`NOT NULL`・`DEFAULT`・`PRIMARY KEY`・
-  `UNIQUE`・`CHECK`・`REFERENCES` 等の列制約は構文として受理しない（`42601`）。
+- 列制約は `NOT NULL`・`DEFAULT <literal>` のみを順不同・各 1 回まで受理する（Issue #1169。
+  `CREATE TABLE` と同じ `parse_column_constraints` を共有）。`UNIQUE`・`PRIMARY KEY`・
+  `CHECK`・`REFERENCES`・`DEFAULT NULL` は構文として受理しない（`42601`）。制約を持たない
+  追加列は従来どおり nullable（TABLE-5）。
+- 既存行は書き換えない（TABLE-5。O(1)・既存行のバイト列不変）。`DEFAULT` 付きで追加した列は、
+  行バッファ末尾で欠落している既存行を読み出し時に既定値で補う
+  （`row_codec::scan_scalar_columns_validated`。PostgreSQL の fast default 相当）。補完値は
+  `INSERT` の列省略補完と同じ `row_codec::column_default_scalar` を通す。列の `DEFAULT` は
+  作成後に変わらないことが前提で、`ALTER COLUMN SET DEFAULT` を導入する場合は補完専用の値の
+  分離が必要。
+- `DEFAULT` なしの `NOT NULL` は、同じ write txn 内で行ストアの空判定を行い、行が 1 件でも
+  あれば `23502`（`CatalogError::NotNullViolation`）、空なら成功する（TOCTOU 防止。全テナントが
+  母集合で、応答には列名のみを含める）。
+- `DEFAULT` の判定順序（決定的）: テーブル存在（`42P01`／`42809`）→ 型名解決（VECTOR `0A000`）→
+  DEFAULT 非対応型（`0A000`）→ リテラル種別不一致（`42601`）・長さ超過（`54000`）→ 値の束縛
+  （範囲外 `22003`・不正 `22000`）→ カタログ更新。
 - 予約列名（`id`・`tenant_id`・`visibility`。ASCII の大文字小文字を無視）は
   `CREATE TABLE`（Issue #899）の列定義と同じく構造検証段階で `42601` 拒否する
   （`sql::parser` が疑似列・RLS 内部列として扱う名前を DDL で隠蔽させない）。
@@ -187,7 +201,7 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 
 - `CREATE TABLE`: #899（実装済み。DDL 権限ゲートを共有）
 - `DROP COLUMN`・`ALTER COLUMN TYPE` の SQL 表層構文: #901（Rust API のみ実装済み）
-- `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #904
+- `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #1169 で実装済み
 - 制約（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` 等）: #903・#905〜#907
 - NoSQL 表層の DDL op: #910
 - 配列型の DDL 表記: #899 へ申し送り

@@ -1375,6 +1375,33 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
         let presence = match buf.get(offset) {
             Some(&b) => b,
             None => {
+                // 欠落列は `DEFAULT` があれば既定値で補う（`scan_scalar_columns_validated`
+                // と同じ規則。Issue #1169）。
+                if column.default.is_some() {
+                    let scalar = column_default_scalar(column).map_err(|_| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} has an invalid DEFAULT for its type",
+                            column.name
+                        ))
+                    })?;
+                    let value = match scalar {
+                        Some(ScalarRef::Text(t)) => Value::Text(t.to_string()),
+                        Some(ScalarRef::Integer(v)) => Value::Integer(v),
+                        Some(ScalarRef::BigInt(v)) => Value::BigInt(v),
+                        Some(ScalarRef::Real(v)) => Value::Real(v),
+                        Some(ScalarRef::Double(v)) => Value::Double(v),
+                        Some(ScalarRef::Numeric(d)) => Value::Numeric(d),
+                        Some(ScalarRef::Bool(b)) => Value::Bool(b),
+                        _ => {
+                            return Err(RowCodecError::Invalid(format!(
+                                "column {:?} has an invalid DEFAULT for its type",
+                                column.name
+                            )))
+                        }
+                    };
+                    values.push(value);
+                    continue;
+                }
                 if column.nullable {
                     values.push(Value::Null);
                     continue;
@@ -2826,7 +2853,7 @@ pub(crate) fn merge_encode_scalar_columns(
 /// （`sql::exec.rs` の `on_visible_row` 参照。累計・行単位の確保量上限はそちらが
 /// アロケーション前に検証する）。
 pub fn scan_scalar_columns<'a>(
-    schema: &TableSchema,
+    schema: &'a TableSchema,
     buf: &'a [u8],
 ) -> Result<Vec<Option<ScalarRef<'a>>>> {
     scan_scalar_columns_masked(schema, buf, None)
@@ -2844,7 +2871,7 @@ pub fn scan_scalar_columns<'a>(
 /// `mask.len() != schema.columns.len()` は fail-closed に `Err` とし、呼び出し元の
 /// 列インデックス計算の誤りを黙って無視しない。
 pub fn scan_scalar_columns_masked<'a>(
-    schema: &TableSchema,
+    schema: &'a TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
 ) -> Result<Vec<Option<ScalarRef<'a>>>> {
@@ -2889,6 +2916,9 @@ struct ScalarSlotView<'a> {
     name: &'a str,
     ty: &'a ColumnType,
     nullable: bool,
+    /// 生存列の `DEFAULT`。バッファ末尾で欠落した列（`ALTER TABLE ADD COLUMN`
+    /// 後の既存行）を読み出し時に補う値の出どころ（Issue #1169）。墓標は常に `None`。
+    default: Option<&'a crate::catalog::ColumnDefault>,
 }
 
 impl<'a> From<&'a crate::catalog::ColumnDef> for ScalarSlotView<'a> {
@@ -2897,6 +2927,7 @@ impl<'a> From<&'a crate::catalog::ColumnDef> for ScalarSlotView<'a> {
             name: c.name.as_str(),
             ty: &c.ty,
             nullable: c.nullable,
+            default: c.default.as_ref(),
         }
     }
 }
@@ -2910,7 +2941,85 @@ impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
             // （削除前は non-nullable でも、削除後の新規行は当該位置を常に
             // NULL として書くため。TABLE-19 D1）。
             nullable: true,
+            default: None,
         }
+    }
+}
+
+/// [`column_default_scalar`] の失敗種別。SQL 表層の SQLSTATE 写像
+/// （`sql::parser::bind_column_default`）とカタログ層の事前検証
+/// （`catalog::Storage::alter_table_add_column`）が共有する。値・列名は保持しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultBindError {
+    /// 列型とリテラル種別が合わない（大分類の不整合・DEFAULT 非対応型）。
+    Incompatible,
+    /// リテラルの文法が不正（`Malformed` 詳細は保持しない）。
+    Malformed,
+    /// 列型の値域外（`INTEGER` オーバーフロー・`NUMERIC` 桁数超過等）。
+    OutOfRange,
+}
+
+/// 列の `DEFAULT` を型付きスカラー値へ変換する唯一の実装（Issue #1169）。
+/// `INSERT` の列省略補完（`sql::parser::bind_column_default` 経由）と、
+/// `ALTER TABLE ADD COLUMN` 後の既存行の読み出し時補完
+/// （[`scan_scalar_columns_validated`]）が同じ関数を通り、値の食い違いを構造的に
+/// 排除する。`Text` は `column` を借用しゼロコピー。`default == None` は `Ok(None)`。
+/// 列の `DEFAULT` は作成後に変わらない（`ALTER COLUMN SET DEFAULT` は存在しない）
+/// ことが読み出し時補完の前提で、将来導入する場合は補完専用の値を分離する必要がある。
+pub(crate) fn column_default_scalar(
+    column: &crate::catalog::ColumnDef,
+) -> std::result::Result<Option<ScalarRef<'_>>, DefaultBindError> {
+    match &column.default {
+        None => Ok(None),
+        Some(default) => default_scalar(&column.ty, default).map(Some),
+    }
+}
+
+/// [`column_default_scalar`] の本体（型と既定値を直接受ける版）。
+pub(crate) fn default_scalar<'a>(
+    ty: &ColumnType,
+    default: &'a crate::catalog::ColumnDefault,
+) -> std::result::Result<ScalarRef<'a>, DefaultBindError> {
+    use crate::catalog::ColumnDefault;
+    fn int_err(e: &std::num::ParseIntError) -> DefaultBindError {
+        match e.kind() {
+            std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                DefaultBindError::OutOfRange
+            }
+            _ => DefaultBindError::Malformed,
+        }
+    }
+    fn float_err(e: crate::scalar_float::ParseFloatError) -> DefaultBindError {
+        match e {
+            crate::scalar_float::ParseFloatError::Malformed => DefaultBindError::Malformed,
+            crate::scalar_float::ParseFloatError::OutOfRange => DefaultBindError::OutOfRange,
+        }
+    }
+    match (default, ty) {
+        (ColumnDefault::Text(s), ColumnType::Text) => Ok(ScalarRef::Text(s.as_str())),
+        (ColumnDefault::Number(n), ColumnType::Integer) => n
+            .parse::<i32>()
+            .map(ScalarRef::Integer)
+            .map_err(|e| int_err(&e)),
+        (ColumnDefault::Number(n), ColumnType::BigInt) => n
+            .parse::<i64>()
+            .map(ScalarRef::BigInt)
+            .map_err(|e| int_err(&e)),
+        (ColumnDefault::Number(n), ColumnType::Real) => crate::scalar_float::parse_real(n)
+            .map(ScalarRef::Real)
+            .map_err(float_err),
+        (ColumnDefault::Number(n), ColumnType::Double) => crate::scalar_float::parse_double(n)
+            .map(ScalarRef::Double)
+            .map_err(float_err),
+        (ColumnDefault::Number(n), ColumnType::Numeric { precision, scale }) => {
+            match crate::numeric::parse_for_column(n, *precision, *scale) {
+                Ok(d) => Ok(ScalarRef::Numeric(d)),
+                Err(crate::numeric::NumericError::Malformed(_)) => Err(DefaultBindError::Malformed),
+                Err(crate::numeric::NumericError::OutOfRange) => Err(DefaultBindError::OutOfRange),
+            }
+        }
+        (ColumnDefault::Bool(b), ColumnType::Boolean) => Ok(ScalarRef::Bool(*b)),
+        _ => Err(DefaultBindError::Incompatible),
     }
 }
 
@@ -2928,7 +3037,7 @@ impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
 /// 墓標自体は論理列を持たないため `sink` には `col_index = None` で渡され、
 /// 呼び出し元は出力へ積まない（構造検証のみ行い読み捨てる）。
 fn scan_scalar_columns_validated<'a>(
-    schema: &TableSchema,
+    schema: &'a TableSchema,
     buf: &'a [u8],
     mask: Option<&[bool]>,
     mut sink: impl FnMut(Option<usize>, Option<ScalarRef<'a>>) -> Result<()>,
@@ -2958,6 +3067,24 @@ fn scan_scalar_columns_validated<'a>(
         let presence = match buf.get(offset) {
             Some(&b) => b,
             None => {
+                // バッファ末尾で欠落した列（`ALTER TABLE ADD COLUMN` 後の既存行。
+                // TABLE-5・TABLE-16、Issue #1169）。生存列で `DEFAULT` があれば
+                // 読み出し時に既定値を補い（行は書き換えない）、なければ nullable
+                // のみ NULL として許容する。墓標は `default == None` のため従来どおり。
+                if let Some(default) = column.default {
+                    if wanted {
+                        let value = default_scalar(column.ty, default).map_err(|_| {
+                            RowCodecError::Invalid(format!(
+                                "column {:?} has an invalid DEFAULT for its type",
+                                column.name
+                            ))
+                        })?;
+                        sink(col_index, Some(value))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                    continue;
+                }
                 if column.nullable {
                     sink(col_index, None)?;
                     continue;
@@ -5172,5 +5299,155 @@ mod tests {
             validate_scalar_columns(&schema, &buf),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    // --- ADD COLUMN 後の既存行の DEFAULT 読み出し時補完（Issue #1169） ---------
+
+    use crate::catalog::ColumnDefault;
+
+    /// 旧スキーマ（`a TEXT NOT NULL`）で書いた行と、`extra` を末尾追加した新スキーマ。
+    fn old_row_and_extended_schema(extra: Vec<ColumnDef>) -> (Vec<u8>, TableSchema) {
+        let old = TableSchema::new("t", vec![ColumnDef::new("a", ColumnType::Text, false)]);
+        let buf = encode_scalar_columns(&old, &[Value::Text("x".to_string())]).expect("encode");
+        let mut columns = old.columns.clone();
+        columns.extend(extra);
+        (buf, TableSchema::new("t", columns))
+    }
+
+    fn default_cols() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef::new("t", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("dt".to_string())),
+            ColumnDef::new("i", ColumnType::Integer, false)
+                .with_default(ColumnDefault::Number("7".to_string())),
+            ColumnDef::new("b", ColumnType::BigInt, true)
+                .with_default(ColumnDefault::Number("-9".to_string())),
+            ColumnDef::new("r", ColumnType::Real, true)
+                .with_default(ColumnDefault::Number("1.5".to_string())),
+            ColumnDef::new("d", ColumnType::Double, true)
+                .with_default(ColumnDefault::Number("2.5".to_string())),
+            ColumnDef::new(
+                "n",
+                ColumnType::Numeric {
+                    precision: 5,
+                    scale: 2,
+                },
+                false,
+            )
+            .with_default(ColumnDefault::Number("3.14".to_string())),
+            ColumnDef::new("f", ColumnType::Boolean, false).with_default(ColumnDefault::Bool(true)),
+        ]
+    }
+
+    #[test]
+    fn missing_trailing_columns_with_default_read_as_default_in_scan_and_decode() {
+        let (buf, schema) = old_row_and_extended_schema(default_cols());
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], Some(ScalarRef::Text("dt")));
+        assert_eq!(scanned[2], Some(ScalarRef::Integer(7)));
+        assert_eq!(scanned[3], Some(ScalarRef::BigInt(-9)));
+        assert_eq!(scanned[4], Some(ScalarRef::Real(1.5)));
+        assert_eq!(scanned[5], Some(ScalarRef::Double(2.5)));
+        assert!(matches!(scanned[6], Some(ScalarRef::Numeric(_))));
+        assert_eq!(scanned[7], Some(ScalarRef::Bool(true)));
+
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode");
+        assert_eq!(decoded[1], Value::Text("dt".to_string()));
+        assert_eq!(decoded[2], Value::Integer(7));
+        assert_eq!(decoded[7], Value::Bool(true));
+        validate_scalar_columns(&schema, &buf).expect("validate");
+    }
+
+    #[test]
+    fn masked_scan_returns_none_for_unwanted_default_column() {
+        let (buf, schema) = old_row_and_extended_schema(default_cols());
+        let mut mask = vec![false; schema.columns.len()];
+        mask[2] = true;
+        let scanned = scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan");
+        assert_eq!(scanned[1], None);
+        assert_eq!(scanned[2], Some(ScalarRef::Integer(7)));
+    }
+
+    #[test]
+    fn missing_non_nullable_column_without_default_is_still_rejected() {
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![ColumnDef::new("z", ColumnType::Text, false)]);
+        assert!(matches!(
+            scan_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn missing_column_with_unbindable_default_is_rejected_fail_closed() {
+        // カタログ破損相当（束縛できない DEFAULT）は NULL へ黙って落とさず拒否する。
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![ColumnDef::new("z", ColumnType::Integer, true)
+                .with_default(ColumnDefault::Number("abc".to_string()))]);
+        assert!(matches!(
+            scan_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_null_is_not_replaced_by_default() {
+        let old = TableSchema::new(
+            "t",
+            vec![ColumnDef::new("a", ColumnType::Text, true)
+                .with_default(ColumnDefault::Text("dflt".to_string()))],
+        );
+        let buf = encode_scalar_columns(&old, &[Value::Null]).expect("encode");
+        let scanned = scan_scalar_columns(&old, &buf).expect("scan");
+        assert_eq!(scanned[0], None);
+    }
+
+    #[test]
+    fn update_of_old_row_materializes_default() {
+        let (buf, schema) = old_row_and_extended_schema(default_cols());
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        let new_a = Value::Text("y".to_string());
+        let merged = merge_encode_scalar_columns(&schema, &scanned, &[(0, &new_a)]).expect("merge");
+        let decoded = decode_scalar_columns(&schema, &merged).expect("decode");
+        assert_eq!(decoded[0], Value::Text("y".to_string()));
+        assert_eq!(decoded[1], Value::Text("dt".to_string()));
+        assert_eq!(decoded[2], Value::Integer(7));
+        // 物理化後は末尾欠落ではなく明示値としてバッファに載っている。
+        assert!(merged.len() > buf.len());
+    }
+
+    #[test]
+    fn v1_decode_row_fills_default_for_missing_columns() {
+        let old = TableSchema::new("t", vec![ColumnDef::new("a", ColumnType::Text, false)]);
+        let buf = encode_row(
+            &old,
+            "tenant-a",
+            Visibility::Public,
+            &[Value::Text("x".to_string())],
+        )
+        .expect("encode");
+        let mut columns = old.columns.clone();
+        columns.push(
+            ColumnDef::new("i", ColumnType::Integer, false)
+                .with_default(ColumnDefault::Number("7".to_string())),
+        );
+        let schema = TableSchema::new("t", columns);
+        let decoded = decode_row(&schema, &buf).expect("decode");
+        assert_eq!(decoded.values[1], Value::Integer(7));
+    }
+
+    #[test]
+    fn nullable_column_without_default_before_default_column_stays_null() {
+        // DEFAULT なしの nullable 列は NULL のまま、後続の DEFAULT 列だけに既定値が
+        // 補われる（列ごとに独立して判定される）。
+        let (buf, schema) = old_row_and_extended_schema(vec![
+            ColumnDef::new("mid", ColumnType::Text, true),
+            ColumnDef::new("i", ColumnType::Integer, false)
+                .with_default(ColumnDefault::Number("7".to_string())),
+        ]);
+        // buf は `a` のみ。`mid` は nullable 欠落 → NULL、`i` は既定値。
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], None);
+        assert_eq!(scanned[2], Some(ScalarRef::Integer(7)));
     }
 }

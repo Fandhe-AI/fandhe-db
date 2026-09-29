@@ -4703,12 +4703,12 @@ mod tests {
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
         let rows = visible_rows(&storage, "docs", &visible_ctx).expect("visible rows");
+        let schema = file_schema("docs");
         let bodies: Vec<&str> = rows
             .iter()
             .map(|r| {
-                let scanned =
-                    crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
-                        .expect("scan scalar columns");
+                let scanned = crate::row_codec::scan_scalar_columns(&schema, &r.metadata)
+                    .expect("scan scalar columns");
                 scanned
                     .get(2)
                     .copied()

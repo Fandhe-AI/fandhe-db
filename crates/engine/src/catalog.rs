@@ -1187,6 +1187,12 @@ pub enum CatalogError {
     /// 含めない（security.md P0。`TenantWriteError::UniqueViolation` と同じ
     /// 秘匿方針）。
     UniqueConstraintViolation,
+    /// `ALTER TABLE ADD COLUMN` で `DEFAULT` を伴わない `NOT NULL` 列を、行を持つ
+    /// テーブルへ追加しようとした（Issue #1169・TABLE-5／TABLE-16 のポインタ。
+    /// `sql::ddl::map_add_column_error` が `23502` へ写像する）。既存行に補える値
+    /// がないため拒否する。variant・文言には列名のみを含め、行数・テナント名・値は
+    /// 含めない（security.md P0）。
+    NotNullViolation { column: String },
     /// `CREATE INDEX` で指定した索引名が、既存の索引・テーブル・ビューの名前と
     /// 衝突する（TASK-206・INDEX-7、Issue #908。索引名はテーブル・ビューと同じ
     /// relation 名前空間を共有する。PostgreSQL と同じ設計。ERR-6: `42P07`）。
@@ -1249,6 +1255,9 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::UniqueConstraintViolation => {
                 write!(f, "duplicate key value violates unique constraint")
+            }
+            CatalogError::NotNullViolation { column } => {
+                write!(f, "column {column:?} contains null values")
             }
             CatalogError::TypeNotFound(name) => write!(f, "type not found: {name}"),
             CatalogError::TypeAlreadyExists(name) => write!(f, "type already exists: {name}"),
@@ -1335,6 +1344,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
             | CatalogError::UniqueConstraintViolation
+            | CatalogError::NotNullViolation { .. }
             | CatalogError::WriteLockTimeout
             | CatalogError::TooManyColumns { .. }
             | CatalogError::IndexAlreadyExists(_)
@@ -2501,14 +2511,19 @@ fn hex_nibble(b: u8) -> Result<u8> {
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
-    /// `ALTER TABLE ADD COLUMN` で追加された列は暗黙 nullable とする（TABLE-5）。
-    /// 実際の行デコード時の NULL 解決は行エンコーダー（TASK-86）の責務であり、
-    /// 本モジュールはこのフラグを保持・往復させるのみ。
+    /// `ALTER TABLE ADD COLUMN` で `NOT NULL`／`DEFAULT` なしに追加された列は
+    /// nullable で、既存行は NULL として読める（TABLE-5）。`NOT NULL` かつ `DEFAULT`
+    /// 付きで追加された列の既存行は既定値として読める（Issue #1169）。実際の行
+    /// デコード時の解決は行エンコーダー（`row_codec`）の責務であり、本モジュールは
+    /// このフラグを保持・往復させるのみ。
     pub nullable: bool,
     /// `DEFAULT <literal>` 句（TABLE-16・TASK-204、Issue #904）。`INSERT` で
     /// この列が省略された場合に補われる値。明示的な `NULL` には適用しない
     /// （TABLE-16。`sql::parser::bind_literal_for_column`／
-    /// `fill_omitted_columns` が唯一の適用点）。
+    /// `fill_omitted_columns` が唯一の適用点）。`ALTER TABLE ADD COLUMN` 後の既存行
+    /// の読み出し時補完（`row_codec::scan_scalar_columns_validated`）にも同じ値を
+    /// 使うため、作成後に変わらないこと（`ALTER COLUMN SET DEFAULT` を導入する場合は
+    /// 補完専用の値の分離が必要）が不変条件。
     pub default: Option<ColumnDefault>,
 }
 
@@ -6135,26 +6150,27 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
-    /// 既存テーブルへ列を末尾追記する（TABLE-5）。追加列は暗黙 nullable として
-    /// 保持され、既存行のバイト列には一切触れない（`ROWS_TABLE` 非アクセス）。
-    /// `column.nullable == false` は fail-closed に拒否する
-    /// （security.md「不安全な設計」）。対象テーブル不存在・列名重複も `Err`。
+    /// 既存テーブルへ列を末尾追記する（TABLE-5）。既存行のバイト列には一切触れない
+    /// （`ROWS_TABLE` 非アクセス）。追加列の既存行に対する値は読み出し時に補う
+    /// （PostgreSQL の fast default 相当。`row_codec::scan_scalar_columns_validated`）。
+    ///
+    /// - `DEFAULT` 付き: 既存行は既定値として読める（`nullable` の別を問わない）。
+    ///   束縛できない `DEFAULT` は永続化前に `Invalid` で拒否する（既存行の読み出しが
+    ///   常に失敗する自己 DoS を防ぐ。SQL 表層を経由しない Rust API でも同じ）
+    /// - `DEFAULT` なしの `NOT NULL`: 同じ write txn 内で行ストアの空判定を行い、
+    ///   行があれば [`CatalogError::NotNullViolation`]（副作用ゼロ）。空なら成功する。
+    ///   判定と追加を同一 txn に置くのは TOCTOU で NOT NULL 列を持たない行が残る
+    ///   のを防ぐため。全テナントが母集合（DDL はテーブル単位の共有資源操作）
+    /// - 列の `DEFAULT` は作成後に変わらない前提（`ALTER COLUMN SET DEFAULT` は
+    ///   存在しない）。将来導入する場合は補完専用の値を分離する必要がある
+    ///
+    /// 対象テーブル不存在・列名重複も `Err`。
     pub fn alter_table_add_column(&self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         validate_identifier(table_name)?;
         validate_column(&column)?;
-        if !column.nullable {
+        if crate::row_codec::column_default_scalar(&column).is_err() {
             return Err(CatalogError::Invalid(
-                "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
-            ));
-        }
-        // `DEFAULT` を伴う ADD COLUMN は未対応（TABLE-16・TASK-204、Issue #904
-        // D7）。既存行に対する読み出し時の DEFAULT 補完（PostgreSQL の
-        // `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` 相当）を実装していない
-        // ため、受理すると既存行が常に NULL で読める一方、新規行だけ既定値を
-        // 持つという意味論の食い違いが生じる。fail-closed に拒否する。
-        if column.default.is_some() {
-            return Err(CatalogError::Invalid(
-                "column added via ALTER TABLE ADD COLUMN must not declare a DEFAULT".to_string(),
+                "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
             ));
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
@@ -6187,6 +6203,24 @@ impl Storage {
                 return Err(CatalogError::TooManyColumns {
                     count: schema.physical_slot_count().saturating_add(1),
                 });
+            }
+            // `DEFAULT` なしの `NOT NULL` は、行が 1 件でもあれば既存行に補う値が
+            // なく拒否する（同一 txn 内の先頭 1 件のみの存在判定で O(1)）。
+            if !column.nullable && column.default.is_none() {
+                let row_table_name = user_rows_table_name(table_name);
+                match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                    Ok(row_table) => {
+                        if row_table.iter()?.next().is_some() {
+                            return Err(CatalogError::NotNullViolation {
+                                column: column.name.clone(),
+                            });
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {
+                        // 行ストアが物理的に未作成（既存行 0 件）。
+                    }
+                    Err(e) => return Err(map_row_table_error(e)),
+                }
             }
             schema.columns.push(column);
             let encoded = encode_schema(&schema)?;
@@ -7752,6 +7786,9 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::UniqueConstraintViolation
+        // `NotNullViolation` は `ALTER TABLE ADD COLUMN`（Issue #1169）専用で、
+        // テーブル存在確認からは到達しない（網羅性のため `Internal` へ丸める）。
+        | CatalogError::NotNullViolation { .. }
         | CatalogError::TooManyColumns { .. }
         // 索引宣言（TASK-206・INDEX-7、Issue #908）の variant は
         // `Storage::create_index`／`drop_index` 専用で、テーブル存在確認からは
