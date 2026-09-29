@@ -17,8 +17,9 @@
 //! 可視性が参照者へ引き継がれることは構造的に起こらない。
 
 use super::allowlist::{
-    parse_view_body, AggregateArg, AggregateSelectItem, GroupByClause, Projection, ScalarOrderKey,
-    SelectItem, SqlSurfaceError, TableLookup, WherePredicate, WindowSelectItem,
+    classify_view_body, parse_view_body, AggregateArg, AggregateSelectItem, GroupByClause,
+    Projection, ScalarOrderKey, SelectItem, SqlSurfaceError, Statement, TableLookup, ViewBodyKind,
+    WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -38,6 +39,17 @@ pub(crate) enum Resolved {
         /// （連鎖の各段の投影を内側から積み上げた結果。`None` は連鎖のどの
         /// 段も列を絞り込んでいない——全段が `SELECT *`——ことを意味する）。
         view_columns: Option<Vec<String>>,
+    },
+    /// 評価後射影形ビュー（Issue #1192。`LIMIT`・`ORDER BY`・集計・JOIN を含む
+    /// 本文）。インライン展開できない（外側の `WHERE` を合成すると `LIMIT`／集計の
+    /// 意味が変わる）ため、本文をそのまま 1 文として実行し、結果に対して外側の
+    /// 列射影・`LIMIT`／`OFFSET` を適用する（`sql::view_buffered`）。連鎖の
+    /// 最外段（クエリが直接参照した名前）に限る。
+    Buffered {
+        /// クエリが参照したビュー名。
+        view_name: String,
+        /// 参照時に再検証済みの本文（`Scan`／`Aggregate`／`Join` のいずれか）。
+        body: Box<Statement>,
     },
 }
 
@@ -77,7 +89,26 @@ pub(crate) fn resolve_from(
                 base_relation,
                 body_sql,
             }) => {
-                let parsed = reparse_stored_body(&body_sql)?;
+                let parsed = match reparse_stored_body(&body_sql) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        // 単純形として再パースできない本文は評価後射影形
+                        // （Issue #1192）。最外段のみ許可し、連鎖の内側に
+                        // 現れた場合は 42601 で拒否する（再帰の深さを 1 段に
+                        // 限定し、外側 `WHERE` の合成できない本文を単純形の
+                        // 畳み込みへ混入させない）。
+                        let body = reparse_buffered_body(lookup, &body_sql)?;
+                        if !chain.is_empty() {
+                            return Err(SqlSurfaceError::unsupported(
+                                "a view over an aggregate/LIMIT view is not supported",
+                            ));
+                        }
+                        return Ok(Resolved::Buffered {
+                            view_name: name.to_string(),
+                            body: Box::new(body),
+                        });
+                    }
+                };
                 depth = depth.checked_add(1).ok_or_else(corrupt_view_error_fn)?;
                 if depth > MAX_VIEW_NESTING_DEPTH {
                     return Err(SqlSurfaceError::payload_too_large(
@@ -147,6 +178,63 @@ fn reparse_stored_body(
 ) -> Result<super::allowlist::ParsedViewBody, SqlSurfaceError> {
     let tokens = super::lexer::tokenize(body_sql).map_err(|_| corrupt_view_error())?;
     parse_view_body(&tokens).map_err(|_| corrupt_view_error())
+}
+
+/// 単純形として再パースできなかった格納本文を評価後射影形（Issue #1192）として
+/// 再検証する。第 2 のパーサーは作らず、`CREATE VIEW` 時と同じ
+/// [`classify_view_body`] の経路（許可リスト構造検証＋本文形状検査）を、
+/// 参照時の実カタログ（[`BufferedBodyLookup`] 越し）で通す。本文の FROM が
+/// 別の評価後射影形ビューを指す場合は `42601`、それ以外の失敗（破損・
+/// 非互換な形状）は固定文言の `XX000` へ丸める（本文のリテラルを含めない）。
+fn reparse_buffered_body(
+    lookup: &impl TableLookup,
+    body_sql: &str,
+) -> Result<Statement, SqlSurfaceError> {
+    let tokens = super::lexer::tokenize(body_sql).map_err(|_| corrupt_view_error())?;
+    let guarded = BufferedBodyLookup {
+        inner: lookup,
+        rejected_nested: std::cell::Cell::new(false),
+    };
+    match classify_view_body(&tokens, &guarded) {
+        Ok(ViewBodyKind::Buffered(stmt)) => Ok(*stmt),
+        Ok(ViewBodyKind::Simple(_)) => Err(corrupt_view_error()),
+        Err(e) if guarded.rejected_nested.get() => Err(e),
+        Err(_) => Err(corrupt_view_error()),
+    }
+}
+
+/// 評価後射影形の本文を参照時に再検証する際の [`TableLookup`] ラッパー
+/// （Issue #1192）。`view_definition` が返す定義が評価後射影形（単純形として
+/// 再パースできない本文）であれば `42601` を返し、評価後射影形ビューの
+/// 入れ子（再帰）を構造的に 1 段へ限定する。カタログ破損で循環があっても
+/// 無限再帰にならない。
+struct BufferedBodyLookup<'a> {
+    inner: &'a dyn TableLookup,
+    /// ネスト拒否で `42601` を返したことの目印（破損由来のエラーと区別する）。
+    rejected_nested: std::cell::Cell<bool>,
+}
+
+impl TableLookup for BufferedBodyLookup<'_> {
+    fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        self.inner.table_exists(name)
+    }
+
+    fn view_definition(&self, name: &str) -> Result<Option<ViewDef>, SqlSurfaceError> {
+        let def = self.inner.view_definition(name)?;
+        if let Some(d) = &def {
+            if reparse_stored_body(&d.body_sql).is_err() {
+                self.rejected_nested.set(true);
+                return Err(SqlSurfaceError::unsupported(
+                    "a view over an aggregate/LIMIT view is not supported",
+                ));
+            }
+        }
+        Ok(def)
+    }
+
+    fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        self.inner.table_columns(name)
+    }
 }
 
 fn corrupt_view_error() -> SqlSurfaceError {
@@ -233,12 +321,16 @@ pub(crate) fn check_columns_within_view(
     Ok(())
 }
 
-/// 集計 SELECT（Issue #1191・SQL-29 (b)。CTE の集計主クエリ）の列参照が、参照先が
-/// 公開する列集合（`view_columns`）に収まっているかを検査する
-/// （[`check_columns_within_view`] の集計版）。対象は集計項目の引数式・グループキー・
-/// `GROUP BY` 列・`WHERE`。`HAVING`・集計 `ORDER BY` の対象は SELECT リストの出力名
-/// （別名）または `GROUP BY` 列であり、表の列参照ではないため対象外（`COUNT(*)` は
-/// 列参照を持たない）。範囲外は `InvalidInput`（`22000`。既存の未知の列と同じ分類）。
+/// 集計 SELECT（`SELECT DISTINCT` の脱糖形を含む）が参照する列が、参照先ビューの
+/// 公開列集合（`view_columns`）に収まっているかを検査する（Issue #1192・TABLE-18・
+/// RLS-10 (b)。[`check_columns_within_view`] の集計向け実装）。グループキー・
+/// 集計引数（式木は [`expr_columns_within`] で再帰検査）・`GROUP BY` 列・
+/// `WHERE`（[`check_predicate_columns_within`]。`OR`／`NOT` も再帰）を検査する。
+/// これらを検査しないと、ビューが公開しない列を集計キー・引数・フィルタに使って
+/// 値を推測できてしまう（filter oracle。security.md「アクセス制御の不備」）。
+/// `ORDER BY` の対象は SELECT リスト項目の実効名（別名または既定名）か、公開列の
+/// いずれかに限る。`HAVING` は項目名への参照のため対象外。
+/// `view_columns` が `None`（どの段も列を絞り込んでいない）なら検査不要。
 pub(crate) fn check_aggregate_columns_within_view(
     view_columns: Option<&[String]>,
     items: &[AggregateSelectItem],
@@ -251,24 +343,38 @@ pub(crate) fn check_aggregate_columns_within_view(
     let unknown = |c: &str| SqlSurfaceError::InvalidInput {
         detail: format!("unknown column: {c}"),
     };
+    let mut effective_names: Vec<String> = Vec::new();
     for item in items {
         match item {
+            AggregateSelectItem::GroupKey { column, alias } => {
+                if !columns.iter().any(|vc| vc == column) {
+                    return Err(unknown(column));
+                }
+                effective_names.push(alias.clone().unwrap_or_else(|| column.clone()));
+            }
             AggregateSelectItem::Aggregate(agg) => {
                 if let AggregateArg::Expr(expr) = &agg.arg {
                     expr_columns_within(columns, expr)?;
                 }
-            }
-            AggregateSelectItem::GroupKey { column, .. } => {
-                if !columns.iter().any(|vc| vc == column) {
-                    return Err(unknown(column));
-                }
+                effective_names.push(
+                    agg.alias
+                        .clone()
+                        .unwrap_or_else(|| agg.func.default_alias().to_string()),
+                );
             }
         }
     }
-    if let Some(group_by) = group_by {
-        for c in &group_by.columns {
+    if let Some(gb) = group_by {
+        for c in &gb.columns {
             if !columns.iter().any(|vc| vc == c) {
                 return Err(unknown(c));
+            }
+        }
+        for key in &gb.order_by {
+            let known = effective_names.iter().any(|n| n == &key.target)
+                || columns.iter().any(|vc| vc == &key.target);
+            if !known {
+                return Err(unknown(&key.target));
             }
         }
     }
@@ -466,6 +572,102 @@ mod tests {
         )
         .expect_err("NOT-wrapped reference to a hidden column must be rejected");
         assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+    }
+
+    /// 固定のビュー定義群を返すテスト用 lookup（テーブルは `docs` のみ）。
+    struct MapLookup(Vec<(&'static str, ViewDef)>);
+
+    impl TableLookup for MapLookup {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(name == "docs")
+        }
+
+        fn view_definition(&self, name: &str) -> Result<Option<ViewDef>, SqlSurfaceError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, d)| d.clone()))
+        }
+    }
+
+    fn def(base: &str, body: &str) -> ViewDef {
+        ViewDef {
+            base_relation: base.to_string(),
+            body_sql: body.to_string(),
+        }
+    }
+
+    /// Issue #1192: 評価後射影形の本文を参照すると `Resolved::Buffered` になる。
+    #[test]
+    fn resolves_buffered_view_body() {
+        let lookup = MapLookup(vec![(
+            "v",
+            def("docs", "SELECT COUNT ( * ) AS n FROM docs"),
+        )]);
+        match resolve_from(&lookup, "v") {
+            Ok(Resolved::Buffered { body, .. }) => {
+                assert!(matches!(*body, Statement::Aggregate(_)));
+            }
+            other => panic!("expected Buffered, got ok={}", other.is_ok()),
+        }
+    }
+
+    /// 破損した本文は本文のリテラルを含まない固定文言の `XX000` になる。
+    #[test]
+    fn corrupt_buffered_body_is_internal_error_without_literals() {
+        let lookup = MapLookup(vec![(
+            "v",
+            def("docs", "SELECT secret_literal FROM ( docs ) 'leak-me'"),
+        )]);
+        let err = resolve_from(&lookup, "v").err().expect("must fail");
+        assert_eq!(err.wire_code(), "XX000");
+        assert!(!format!("{err:?}").contains("leak-me"));
+    }
+
+    /// 連鎖の内側・評価後射影形本文の FROM が評価後射影形ビューなら `42601`
+    /// （破損カタログで循環していても無限再帰にならない）。
+    #[test]
+    fn nested_buffered_view_is_rejected() {
+        let lookup = MapLookup(vec![
+            ("inner_b", def("docs", "SELECT id FROM docs LIMIT 3")),
+            ("outer_b", def("inner_b", "SELECT id FROM inner_b LIMIT 2")),
+            ("outer_s", def("inner_b", "SELECT id FROM inner_b")),
+            ("loop_b", def("loop_b", "SELECT id FROM loop_b LIMIT 2")),
+        ]);
+        for name in ["outer_b", "outer_s", "loop_b"] {
+            let err = resolve_from(&lookup, name).err().expect(name);
+            assert_eq!(err.wire_code(), "42601", "name={name}");
+        }
+    }
+
+    /// 集計の列スコープ検査は `OR`／`NOT`／式を越えて非公開列を拒否する。
+    #[test]
+    fn aggregate_column_scope_rejects_hidden_columns() {
+        let tokens = lexer::tokenize(
+            "SELECT lang, SUM(n) AS s FROM docs WHERE NOT hidden = 'x' GROUP BY lang ORDER BY s LIMIT 5",
+        )
+        .expect("tokenize");
+        let stmt = crate::sql::allowlist::validate_sql_tokens(
+            &tokens,
+            &crate::sql::allowlist::StructuralOnlyLookup,
+        )
+        .expect("validate");
+        let Statement::Aggregate(agg) = stmt else {
+            panic!("expected aggregate");
+        };
+        let cols = vec!["lang".to_string(), "n".to_string()];
+        let err = check_aggregate_columns_within_view(
+            Some(&cols),
+            agg.items(),
+            agg.group_by(),
+            agg.where_predicates(),
+        )
+        .expect_err("hidden column through NOT");
+        assert!(matches!(err, SqlSurfaceError::InvalidInput { .. }));
+        // 公開列のみ（`s` は SELECT リスト項目名）なら通る。
+        check_aggregate_columns_within_view(Some(&cols), agg.items(), agg.group_by(), &[])
+            .expect("visible columns and item alias");
     }
 
     /// render_view_body → 再トークン化 → parse_view_body が元と等価な AST を
