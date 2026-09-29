@@ -244,7 +244,7 @@ impl FilterError {
 
 /// `column` が RLS 述語呼び出し形の許可名（現状 `visible`）に一致するかを、
 /// 末尾の `()` の有無を問わず大文字小文字非区別で判定する。
-fn is_rls_predicate_column(column: &str) -> bool {
+pub(super) fn is_rls_predicate_column(column: &str) -> bool {
     let name = column.strip_suffix("()").unwrap_or(column);
     is_allowed_where_predicate_name(name)
 }
@@ -882,7 +882,7 @@ pub fn bind_filter(
 /// `WHERE <col> LIKE '<pattern>%'`〔`engine::sql::allowlist::
 /// WherePredicate::Prefix`〕と同一の `content_hash` 入力を再現する必要が
 /// あるため、`raw` に含まれるメタ文字を無害化してから `%` を付与する）。
-fn like_escape(raw: &str) -> String {
+pub(super) fn like_escape(raw: &str) -> String {
     let mut escaped = String::with_capacity(raw.len());
     for c in raw.chars() {
         if c == '\\' || c == '%' || c == '_' {

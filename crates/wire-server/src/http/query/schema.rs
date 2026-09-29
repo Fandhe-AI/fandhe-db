@@ -979,6 +979,22 @@ pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Object(&DDL_REFERENCES_SCHEMA),
             nullable: false,
         },
+        // `kind == "check"` 専用（Issue #1199・NOSQL-13・TABLE-16）。制約名。
+        // 型のみ宣言し、`kind` との整合は [`super::ddl`] が判定する。
+        FieldSpec {
+            key: "name",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        // `kind == "check"` 専用。`FILTER_ITEM_SCHEMA` の葉形の配列（要素同士は
+        // AND 結合）。
+        FieldSpec {
+            key: "predicate",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            nullable: false,
+        },
     ],
 };
 
