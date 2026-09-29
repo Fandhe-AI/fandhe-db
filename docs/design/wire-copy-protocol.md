@@ -157,7 +157,7 @@
    （空バッチ拒否）とする。PostgreSQL の `COPY 0`（成功）とは異なる。
 5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
    COPY は `54000` になる。契約どおりの挙動だが、既知の運用上の制約
-   （環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）として記録する。
+   （起動時 CLI `--batch-max-files`〔優先〕または環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）として記録する。
 6. **Flush（'H'）／Sync（'S'）の受理形状**: PostgreSQL wire v3 上この 2 種類は
    length=4（body 厳密に空）以外の形状を持たない。COPY サブプロトコル中に
    届いた場合は本文なしの no-op として無視するが、本文付き（宣言長が

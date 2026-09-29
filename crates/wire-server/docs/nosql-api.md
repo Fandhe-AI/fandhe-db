@@ -402,8 +402,8 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
   応答は「不在時」と同一——TABLE-12・RLS-9）
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
-  `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
-  `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
+  `rows.len()` を INDEX-4 の件数上限相当として判定。起動時 CLI
+  `--batch-max-files`〔優先〕または環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
 - 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
   各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
   積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
@@ -916,14 +916,15 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-16 分類が共有する）。
+22 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
-| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー |
+| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
+| `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |

@@ -671,7 +671,7 @@ pub(crate) fn internal(message: &'static str) -> TenantWriteError {
 /// ため `pub(crate)`（呼び出し回数はテスト専用カウンタ [`test_counters`] で
 /// 数え、索引経路がテナントの行数に比例しないことの受入基準に使う）。
 pub(crate) fn decode_key_columns<'a>(
-    schema: &TableSchema,
+    schema: &'a TableSchema,
     mask: &[bool],
     buf: &'a [u8],
 ) -> Result<Vec<Option<ScalarRef<'a>>>, TenantWriteError> {
