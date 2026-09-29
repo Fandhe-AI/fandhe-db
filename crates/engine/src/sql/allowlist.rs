@@ -1220,6 +1220,9 @@ pub enum WherePredicate {
     /// `PredicateCall`・`Expression` になることはない（常に等価・前方一致・
     /// BOOLEAN 系・範囲比較・`InList`・`Between`・`IsNull` のいずれかの葉。
     /// `NOT visible()` は構文段で `42601` に拒否し、この variant としては構築されない）。
+    /// 例外として `NOT IN (SELECT ...)`／`NOT EXISTS (SELECT ...)` は
+    /// `Not(InSubquery)`／`Not(Exists)` として構築される（Issue #1191。解決段
+    /// `sql::subquery` が NULL 規則込みで否定形を評価し、束縛前に消える）。
     /// `NOT ( ... )` と裸の `NOT <式比較>` は Issue #1184 で受理対象になったが、
     /// 否定は構文段で葉まで押し下げる（`sql::where_negation`。`Or`／AND 群や式述語の
     /// 上に本 variant は残らない。式比較は演算子反転で表す）。
@@ -1250,7 +1253,7 @@ pub enum WherePredicate {
     /// SELECT の WHERE。`sql::allowlist::validate_sql_tokens` のトップレベル
     /// 呼び出しのみが設定する）のみで、CHECK 本体・`CREATE VIEW` 本体・述語形
     /// `UPDATE`/`DELETE`・カーソル・`COPY`・`EXPLAIN` からは構文解析段で `42601`
-    /// になる。`NOT IN` は対象外（`42601`。#913 の `NOT` 対応後の課題）。
+    /// になる。`NOT IN` は `Not(InSubquery)` で表す（Issue #1191）。
     ///
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
@@ -1263,7 +1266,7 @@ pub enum WherePredicate {
     /// 契約は [`WherePredicate::InSubquery`] と同じ（`sql::subquery` が束縛前に
     /// 解決する）。`EXISTS` は [`Keyword`] へ追加せず、`LIKE`・`OR` と同じ
     /// 「`Token::Ident` をパーサー位置でのみ文脈照合」方式にする（`exists` という
-    /// 列名を壊さない）。`NOT EXISTS` は対象外（`42601`。同上）。
+    /// 列名を壊さない）。`NOT EXISTS` は `Not(Exists)` で表す（Issue #1191）。
     ///
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
@@ -1271,6 +1274,46 @@ pub enum WherePredicate {
         inner_tokens: Vec<Token>,
         depth: usize,
     },
+    /// `<列> <比較演算子> (SELECT ...)`（WHERE 値位置のスカラーサブクエリ。
+    /// Issue #1191・SQL-29 (a)・TASK-213）。内側の生トークン列のみを保持し、
+    /// 構文段では評価しない（意味論・解決契約は [`WherePredicate::InSubquery`] と
+    /// 同じ。`sql::subquery` が束縛前に `col <op> <リテラル>` と同じ AST へ書き換える）。
+    /// 受理するのは列が左辺の形のみ（逆向き・式の内側への埋め込みは `42601`）。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    ScalarSubqueryCompare {
+        column: String,
+        op: ScalarSubqueryOp,
+        inner_tokens: Vec<Token>,
+        depth: usize,
+    },
+}
+
+/// [`WherePredicate::ScalarSubqueryCompare`] の比較演算子（Issue #1191）。
+/// 否定は構文段で演算子反転（[`ScalarSubqueryOp::negated`]）として葉へ押し下げる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarSubqueryOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl ScalarSubqueryOp {
+    /// 三値論理でも成立する演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`）。
+    pub fn negated(self) -> Self {
+        match self {
+            Self::Eq => Self::Ne,
+            Self::Ne => Self::Eq,
+            Self::Lt => Self::Ge,
+            Self::Ge => Self::Lt,
+            Self::Gt => Self::Le,
+            Self::Le => Self::Gt,
+        }
+    }
 }
 
 /// [`WherePredicate::Compare`] の比較演算子（TABLE-13・TASK-199、Issue #891）。
@@ -1627,13 +1670,35 @@ pub(crate) enum SetOperator {
 /// モジュールドキュメント参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetTree {
+    /// 既定の枝（`ORDER BY`／`LIMIT`／`OFFSET` を持たない単一テーブル広域取得）。
+    /// 可視行が `core::MAX_SEARCH_K` を超えたら `54000`（`sql::set_op::eval_branch`）。
     Branch(Box<ValidatedScan>),
+    /// 括弧で囲んだ単一 `SELECT` 枝のうち、枝内に `ORDER BY`／`LIMIT`／`OFFSET` を
+    /// 持つもの（Issue #1191・SQL-29 (c)）。`LIMIT`／`OFFSET`／`order_by` は枝自身の
+    /// 値をそのまま使い、明示 `LIMIT` により切り詰める（`54000` にしない）。
+    /// 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため、この
+    /// variant にはならない。
+    LimitedBranch(Box<ValidatedScan>),
+    /// 集計形（`COUNT(*)`・`GROUP BY`・`HAVING` 等）の枝（Issue #1191）。括弧付きの
+    /// 場合に限り枝内 `ORDER BY`／`LIMIT` を持てる（`ValidatedAggregate::group_by`
+    /// の既存フィールドで表す）。
+    AggregateBranch(Box<SetAggregateBranch>),
     Op {
         op: SetOperator,
         left: Box<SetTree>,
         right: Box<SetTree>,
     },
 }
+
+/// 集合演算の集計形の枝（[`SetTree::AggregateBranch`]）を保持する薄いラッパー。
+/// [`ValidatedAggregate`] は `HAVING` の `f64` リテラルを持つため `Eq` を実装できず、
+/// `Eq` を導出する [`SetTree`]・[`ValidatedSetOperation`]（公開型）の trait 境界を
+/// 変えないために `Eq` を手動で付与する（`HAVING` リテラルは構文段が有限値のみを
+/// 生成する〔NaN にならない〕ため反射律は成立する）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SetAggregateBranch(pub(crate) ValidatedAggregate);
+
+impl Eq for SetAggregateBranch {}
 
 /// 許可形状の構造判定を通過した集合演算文（SQL-29 (c)・RLS-10 (b)・TASK-213）。
 /// 束縛（枝ごとの `bind_scan`）・実行（合成・重複除去・RLS 独立適用）は
@@ -3695,21 +3760,10 @@ impl<'a> Parser<'a> {
                             "NOT visible() is not supported",
                         ));
                     }
-                    // `NOT EXISTS (SELECT ...)`／`NOT <col> IN (SELECT ...)`
-                    // （Cursor Bugbot Medium 指摘対応。Issue #927 の設計文書
-                    // `docs/design/sql-subquery.md`）。宣言的フィルタとして束縛
-                    // できず `Internal` に落ちるのを避け、`0A000` で構文段のうちに
-                    // 明示的に拒否する。
-                    WherePredicate::Exists { .. } => {
-                        return Err(SqlSurfaceError::FeatureNotSupported {
-                            detail: "NOT EXISTS (SELECT ...) is not supported".to_string(),
-                        });
-                    }
-                    WherePredicate::InSubquery { .. } => {
-                        return Err(SqlSurfaceError::FeatureNotSupported {
-                            detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
-                        });
-                    }
+                    // `NOT EXISTS (SELECT ...)`／`NOT <col> IN (SELECT ...)` は
+                    // 解決段（`sql::subquery`）が否定形を評価するため、ここでは
+                    // 他の葉と同じく `Not` で包むだけでよい（Issue #1191。以前は
+                    // `0A000` で拒否していた）。内側の生トークン列は未評価のまま。
                     leaf => leaf,
                 };
                 // `inner` は後置 `NOT`（`NOT LIKE`／`NOT IN`／`NOT BETWEEN`）により
@@ -3719,6 +3773,19 @@ impl<'a> Parser<'a> {
                 if negate_odd {
                     match inner {
                         WherePredicate::Not(x) => vec![*x],
+                        // スカラーサブクエリ比較の否定は演算子反転で表す（Issue #1191。
+                        // 解決段が `Not` 越しの比較を持たずに済む）。
+                        WherePredicate::ScalarSubqueryCompare {
+                            column,
+                            op,
+                            inner_tokens,
+                            depth,
+                        } => vec![WherePredicate::ScalarSubqueryCompare {
+                            column,
+                            op: op.negated(),
+                            inner_tokens,
+                            depth,
+                        }],
                         other => vec![WherePredicate::Not(Box::new(other))],
                     }
                 } else {
@@ -3898,6 +3965,26 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// `tokens[idx..]` の先頭が比較演算子（`= <> < <= > >=`）なら、対応する
+    /// [`ScalarSubqueryOp`] と消費トークン数を返す（スカラーサブクエリ検出専用。
+    /// `<>` は字句上 `<` `>` の 2 トークンで表現される。Issue #1191）。
+    fn scalar_subquery_op_at(&self, idx: usize) -> Option<(ScalarSubqueryOp, usize)> {
+        match self.tokens.get(idx)? {
+            Token::Punct('=') => Some((ScalarSubqueryOp::Eq, 1)),
+            Token::Le => Some((ScalarSubqueryOp::Le, 1)),
+            Token::Ge => Some((ScalarSubqueryOp::Ge, 1)),
+            Token::Punct('>') => Some((ScalarSubqueryOp::Gt, 1)),
+            Token::Punct('<') => {
+                if matches!(self.tokens.get(idx + 1), Some(Token::Punct('>'))) {
+                    Some((ScalarSubqueryOp::Ne, 2))
+                } else {
+                    Some((ScalarSubqueryOp::Lt, 1))
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// 構造的に確定できる `WHERE`／`CHECK` の葉を 1 つ試す。列名 `Ident` を先頭に
     /// 持つ確定形（等価・前方一致・述語呼び出し・BOOLEAN 系・範囲比較・`IN`・
     /// `BETWEEN`・`IS [NOT] NULL`・BOOLEAN 裸参照）のいずれにも一致しない場合は
@@ -3969,6 +4056,39 @@ impl<'a> Parser<'a> {
                 inner_tokens,
                 depth,
             }));
+        }
+        if let Some((op, op_len)) = self.scalar_subquery_op_at(self.pos + 1) {
+            let open_idx = self.pos + 1 + op_len;
+            if matches!(self.tokens.get(open_idx), Some(Token::Punct('(')))
+                && matches!(
+                    self.tokens.get(open_idx + 1),
+                    Some(Token::Keyword(Keyword::Select))
+                )
+            {
+                // `<col> <op> (SELECT ...)`（WHERE 値位置のスカラーサブクエリ。
+                // Issue #1191・SQL-29 (a)・TASK-213）。`IN`／`EXISTS` と同じ手順で
+                // 深さを検査し、内側の生トークン列だけを保持する。逆向き
+                // （`(SELECT ...) <op> <col>`）・式の内側への埋め込みは本腕に
+                // 一致せず、従来どおり式フォールバックで `42601` になる。
+                let depth = self.require_subquery_depth()?;
+                let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+                    SqlSurfaceError::unsupported("unmatched parenthesis in scalar subquery")
+                })?;
+                let inner_tokens = self
+                    .tokens
+                    .get((open_idx + 1)..close_idx)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed scalar subquery boundary")
+                    })?
+                    .to_vec();
+                self.pos = close_idx + 1;
+                return Ok(Some(WherePredicate::ScalarSubqueryCompare {
+                    column: name,
+                    op,
+                    inner_tokens,
+                    depth,
+                }));
+            }
         }
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
@@ -4110,21 +4230,35 @@ impl<'a> Parser<'a> {
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN"))
             && matches!(self.tokens.get(self.pos + 3), Some(Token::Punct('(')))
         {
-            // `<col> NOT IN (SELECT ...)`（Cursor Bugbot Medium 指摘対応。Issue #927
-            // の設計文書 `docs/design/sql-subquery.md`「スコープ（当初計画との
-            // 差分）」で `NOT IN` は「非対応（文法自体が `NOT` を持たない）」と
-            // 明記済み）。`(` の直後が `SELECT` の場合はサブクエリ形と判断し、
-            // 下の `parse_in_list_body`（文字列リテラルしか受理しない）へ回さず
-            // ここで `0A000` として明示的に拒否する（回さないと `parse_in_list_body`
-            // が `SELECT` キーワードを非リテラル要素として `42601` にしてしまい、
-            // 意図が伝わらないエラーメッセージになる）。
+            // `<col> NOT IN (SELECT ...)`（Issue #1191。以前は `0A000` で拒否）。
+            // `(` の直後が `SELECT` の場合はサブクエリ形として `Not(InSubquery)` を
+            // 生成する（`NOT IN` の NULL 規則を含む評価は `sql::subquery` が担う。
+            // `require_subquery_depth` は `Not` で包む前に呼ぶため、サブクエリ
+            // 不許可文脈は従来どおり `42601`）。
             if matches!(
                 self.tokens.get(self.pos + 4),
                 Some(Token::Keyword(Keyword::Select))
             ) {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
-                });
+                let depth = self.require_subquery_depth()?;
+                let open_idx = self.pos + 3;
+                let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+                    SqlSurfaceError::unsupported("unmatched parenthesis in NOT IN subquery")
+                })?;
+                let inner_tokens = self
+                    .tokens
+                    .get((open_idx + 1)..close_idx)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed NOT IN subquery boundary")
+                    })?
+                    .to_vec();
+                self.pos = close_idx + 1;
+                return Ok(Some(WherePredicate::Not(Box::new(
+                    WherePredicate::InSubquery {
+                        column: name,
+                        inner_tokens,
+                        depth,
+                    },
+                ))));
             }
             self.advance();
             self.advance();
@@ -6635,7 +6769,9 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
             // の既定（`subquery_ctx == None`）で解析するため、`parse_where` 自体が
             // サブクエリ構文を `42601` で拒否し、ここへ到達しない
             // （fail-closed の防御的経路）。
-            WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+            WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
                 ));
@@ -6735,7 +6871,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         }
         // `parse_view_body` がサブクエリを構造的に拒否するため到達しない
         // （Issue #927・SQL-29 (a)・TASK-213。上記 `Or` と同じ理由）。
-        WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => String::new(),
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => String::new(),
     }
 }
 
@@ -7491,28 +7629,30 @@ fn looks_like_set_operation(tokens: &[Token]) -> bool {
     })
 }
 
-/// 集合演算の枝（`SELECT <list> FROM <table> [WHERE ...]`）を解析する。検索
-/// SELECT・広域取得が持つランキング段・`LIMIT`・`OFFSET`・`DISTINCT`・集計
-/// （`GROUP BY` を含む）はいずれも受理しない（fail-closed。SQL-29 (c) の対象外
-/// 事項）。`Computed` 投影項目（宣言的 UDF・組み込み関数呼び出し）も、束縛時に
-/// 型を確定できないため受理しない。
+/// 集合演算の枝（`SELECT <list> FROM <table> [WHERE ...]`、または Issue #1191 で
+/// 追加した集計形の枝）を解析する。検索 SELECT・広域取得が持つランキング段・
+/// `LIMIT`・`OFFSET`・`DISTINCT` はいずれも括弧なしの枝では受理しない（fail-closed。
+/// 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため。括弧付きの単一
+/// `SELECT` 枝は [`parse_set_limited_branch`]）。`Computed` 投影項目（宣言的 UDF・
+/// 組み込み関数呼び出し）も、束縛時に型を確定できないため受理しない。
 fn parse_set_branch(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
 ) -> Result<SetTree, SqlSurfaceError> {
-    p.expect_keyword(Keyword::Select)?;
-
-    // Issue #267 の EXPLAIN アーム先読みと同じ判定を枝に適用する（集計形の枝は
-    // 対象外）。
-    if let Some(Token::Ident(name)) = p.peek() {
-        if is_aggregate_function_name(name)
-            && matches!(p.tokens.get(p.pos + 1), Some(Token::Punct('(')))
-        {
-            return Err(SqlSurfaceError::unsupported(
-                "aggregate SELECT is not allowed inside a set operation branch",
-            ));
+    // Issue #1191（SQL-29 (c)）: 集計形の枝（先頭が集計関数、または `GROUP BY` を
+    // 含む）は、枝の終端（深さ 0 の集合演算子・括弧の閉じ・`ORDER BY`・`LIMIT`。
+    // 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため枝には含めない）
+    // までのスライスを既存の集計形状パーサーへ渡す。
+    let branch_start = p.pos;
+    let branch_end = set_branch_end(p.tokens, branch_start);
+    if let Some(slice) = p.tokens.get(branch_start..branch_end) {
+        if looks_like_aggregate_select(slice) {
+            let shape = parse_aggregate_shape(slice, None)?;
+            p.pos = branch_end;
+            return build_set_aggregate_branch(shape, lookup);
         }
     }
+    p.expect_keyword(Keyword::Select)?;
 
     let projection = p.parse_select_list()?;
     if let Projection::Items(items) = &projection {
@@ -7610,6 +7750,172 @@ fn parse_set_branch(
     Ok(SetTree::Branch(Box::new(validated_scan)))
 }
 
+/// 集合演算の枝が終わる位置を返す（`tokens[start..]` から走査し、括弧の深さ 0 で
+/// 集合演算子・対応の無い `)`・`ORDER`・`LIMIT` に達した位置。無ければ末尾）。
+/// `ORDER`／`LIMIT` で止めるのは、括弧なしの末尾 `ORDER BY`／`LIMIT` が PostgreSQL では
+/// 集合演算全体に掛かるため（最後の枝の一部と解釈すると結果が異なる。Issue #1191）。
+fn set_branch_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    while let Some(t) = tokens.get(i) {
+        match t {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            Token::Ident(name)
+                if depth == 0
+                    && is_set_operator_ident(name)
+                    && set_operator_is_followed_by_branch(tokens, i) =>
+            {
+                return i;
+            }
+            Token::Keyword(Keyword::Limit | Keyword::Order) if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    tokens.len()
+}
+
+/// 先頭 `SELECT` のスライスが集計 SELECT の形かどうか（[`validate_select_statement`] の
+/// 先読み判定と同じ規則。ウィンドウ項目 `OVER (...)` を含む形は集計と誤判定しない）。
+fn looks_like_aggregate_select(tokens: &[Token]) -> bool {
+    let contains_group_by = tokens.windows(2).any(|w| {
+        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+            && matches!(w[1], Token::Keyword(Keyword::By))
+    });
+    let contains_window_over = tokens.windows(3).any(|w| {
+        matches!(w[0], Token::Punct(')'))
+            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+            && matches!(w[2], Token::Punct('('))
+    });
+    matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
+        && !contains_window_over
+        && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+            && matches!(tokens.get(2), Some(Token::Punct('('))))
+            || contains_group_by)
+}
+
+/// 集計形の枝をカタログ存在確認して [`SetTree::AggregateBranch`] へ組み立てる。
+/// ビューへの集計は通常の集計 SELECT と同じく対象外（存在しないテーブルとして `42P01`）。
+fn build_set_aggregate_branch(
+    shape: ParsedAggregateShape,
+    lookup: &impl TableLookup,
+) -> Result<SetTree, SqlSurfaceError> {
+    if !lookup.table_exists(&shape.table_name)? {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+    Ok(SetTree::AggregateBranch(Box::new(SetAggregateBranch(
+        ValidatedAggregate {
+            table_name: shape.table_name,
+            items: shape.items,
+            where_predicates: shape.where_predicates,
+            group_by: shape.group_by,
+        },
+    ))))
+}
+
+/// 括弧付き単一 `SELECT` 枝のうち、枝内に `ORDER BY`／`LIMIT`／`OFFSET` を持つもの
+/// （`slice` は括弧の内側）を解析する（Issue #1191・SQL-29 (c)）。集計形は既存の集計
+/// 形状パーサー（`GROUP BY` 句が `ORDER BY`／`LIMIT` を持つ）、それ以外は広域取得の形状
+/// パーサー（スカラー `ORDER BY`・`LIMIT`・`OFFSET`。`LIMIT` 必須）で解析し、ビュー経由の
+/// 列スコープ検査も通常の広域取得と同じ [`build_scan_from_resolved`] を通る。
+/// ベクトル順位付け・`USING PLAN`・ウィンドウ関数・式投影の枝は `42601`。
+fn parse_set_limited_branch(
+    slice: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<SetTree, SqlSurfaceError> {
+    if looks_like_aggregate_select(slice) {
+        let shape = parse_aggregate_shape(slice, None)?;
+        return build_set_aggregate_branch(shape, lookup);
+    }
+    let shape = match parse_select_shape(slice, None)? {
+        ParsedSelect::Scan(shape) => shape,
+        ParsedSelect::Search(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "ranked SELECT is not allowed inside a set operation branch",
+            ));
+        }
+    };
+    if !shape.window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions are not allowed inside a set operation branch",
+        ));
+    }
+    if let Projection::Items(items) = &shape.projection {
+        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })) {
+            return Err(SqlSurfaceError::unsupported(
+                "computed projection items are not allowed inside a set operation branch",
+            ));
+        }
+    }
+    let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+    let scan = build_scan_from_resolved(
+        shape.table_name,
+        resolved,
+        shape.projection,
+        shape.where_predicates,
+        shape.limit,
+        shape.order_by,
+        shape.offset,
+        Vec::new(),
+    )?;
+    Ok(SetTree::LimitedBranch(Box::new(scan)))
+}
+
+/// `tokens[inner_start..]` 以降で、対応する `)` の位置を返す（`(` の直後の位置を渡す）。
+fn set_paren_close(tokens: &[Token], inner_start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = inner_start;
+    while let Some(t) = tokens.get(i) {
+        match t {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 括弧の内側 `inner` が「集合演算子を含まない単一 `SELECT` で、深さ 0 に `ORDER`／
+/// `LIMIT`／`OFFSET` を持つ」形かどうか。
+fn is_limited_single_select(inner: &[Token]) -> bool {
+    if !matches!(inner.first(), Some(Token::Keyword(Keyword::Select))) {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut has_tail = false;
+    for (i, t) in inner.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Ident(name)
+                if depth == 0
+                    && is_set_operator_ident(name)
+                    && set_operator_is_followed_by_branch(inner, i) =>
+            {
+                return false;
+            }
+            Token::Keyword(Keyword::Limit | Keyword::Order) if depth == 0 => has_tail = true,
+            Token::Ident(name) if depth == 0 && name.eq_ignore_ascii_case("OFFSET") => {
+                has_tail = true;
+            }
+            _ => {}
+        }
+    }
+    has_tail
+}
+
 /// `primary := branch | '(' set_expr ')'`（`set_expr` より高い優先順位）。
 fn parse_set_primary(
     p: &mut Parser<'_>,
@@ -7626,6 +7932,27 @@ fn parse_set_primary(
             return Err(SqlSurfaceError::payload_too_large(
                 "set operation nesting depth exceeds limit",
             ));
+        }
+        // Issue #1191: 括弧の内側が単一 `SELECT`（深さ 0 に集合演算子が無い）で、かつ
+        // 枝内に `ORDER BY`／`LIMIT`／`OFFSET` を持つ場合は、枝自身の句として解析する
+        // （括弧なしの末尾句は集合演算全体に掛かるため対象外）。それ以外は従来どおり
+        // 入れ子の集合演算式として再帰する。
+        if let Some(close_idx) = set_paren_close(p.tokens, p.pos) {
+            if let Some(inner) = p.tokens.get(p.pos..close_idx) {
+                if is_limited_single_select(inner) {
+                    *branch_count = branch_count.checked_add(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("too many set operation branches")
+                    })?;
+                    if *branch_count > MAX_SET_OP_BRANCHES {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "too many set operation branches",
+                        ));
+                    }
+                    let branch = parse_set_limited_branch(inner, lookup)?;
+                    p.pos = close_idx + 1;
+                    return Ok(branch);
+                }
+            }
         }
         let inner = parse_set_expr(p, lookup, next_depth, branch_count)?;
         p.expect_punct(')')?;
@@ -8306,6 +8633,49 @@ fn build_scan_from_resolved(
     }
 }
 
+/// [`build_scan_from_resolved`] の集計版（Issue #1191・SQL-29 (b)。CTE の集計主
+/// クエリ専用）。`Resolved::Table` はそのまま、`Resolved::View`（CTE・ビュー連鎖の
+/// 畳み込み結果）は基底テーブル名へ書き換え、ビュー由来の述語を先頭へ合成する。
+/// 集計項目の引数列・`GROUP BY` 列・`WHERE` が CTE の公開列集合に収まることを
+/// [`super::view::check_aggregate_columns_within_view`] で検査する（RLS-10 (b) の
+/// 趣旨: 非公開列を集計・グループ化の対象にして値の推測手段にすることを防ぐ）。
+fn build_aggregate_from_resolved(
+    table_name: String,
+    resolved: super::view::Resolved,
+    items: Vec<AggregateSelectItem>,
+    where_predicates: Vec<WherePredicate>,
+    group_by: Option<GroupByClause>,
+) -> Result<ValidatedAggregate, SqlSurfaceError> {
+    match resolved {
+        super::view::Resolved::Table => Ok(ValidatedAggregate {
+            table_name,
+            items,
+            where_predicates,
+            group_by,
+        }),
+        super::view::Resolved::View {
+            base_table,
+            view_predicates,
+            view_columns,
+        } => {
+            super::view::check_aggregate_columns_within_view(
+                view_columns.as_deref(),
+                &items,
+                group_by.as_ref(),
+                &where_predicates,
+            )?;
+            let mut merged = view_predicates;
+            merged.extend(where_predicates);
+            Ok(ValidatedAggregate {
+                table_name: base_table,
+                items,
+                where_predicates: merged,
+                group_by,
+            })
+        }
+    }
+}
+
 pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
@@ -8385,8 +8755,9 @@ fn validate_sql_tokens_impl(
         // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
         // resolve_relation` を経由し `sql::view::resolve_from` と同じ
         // `build_scan_from_resolved` へ合流させる（第 2 の実行器を作らない）。
-        // 主クエリは広域取得（`ParsedSelect::Scan`）のみを受理し、順位付き
-        // （`ORDER BY`／`USING PLAN`）・集計は明示的に拒否する（`WITH` 句を
+        // 主クエリは広域取得（`ParsedSelect::Scan`）と集計（Issue #1191。
+        // `build_aggregate_from_resolved`）を受理し、順位付き
+        // （`ORDER BY <ベクトル>`／`USING PLAN`）は明示的に拒否する（`WITH` 句を
         // 剥がして後段へ流すと同名の実テーブルを黙って読む危険があるため、
         // 絶対に行わない）。CTE と `EXPLAIN`・集計 SELECT との併用は
         // `is_explain_statement`／`validate_select_statement` 側の先読みが
@@ -8420,22 +8791,33 @@ fn validate_sql_tokens_impl(
                 && ((matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
                     && matches!(main_tokens.get(2), Some(Token::Punct('('))))
                     || main_contains_group_by);
-            if main_is_aggregate_select {
-                return Err(SqlSurfaceError::unsupported(
-                    "WITH does not support an aggregate main query",
-                ));
+            // Issue #1191（SQL-29 (b)）: 集計主クエリ（`GROUP BY`／`HAVING`／
+            // `ORDER BY`／`SELECT DISTINCT` を含む）も受理する。主クエリは
+            // 常に `subquery_ctx: None` で解析し（Issue #927 のサブクエリとの併用は
+            // 対象外。`docs/design/cte.md` 対象外節）、CTE の解決後は
+            // [`build_aggregate_from_resolved`] で通常の集計 SELECT と同じ
+            // [`ValidatedAggregate`] へ畳み込む（第 2 の実行器を作らない）。
+            enum MainShape {
+                Scan(ParsedScanShape),
+                Aggregate(ParsedAggregateShape),
             }
-            // Issue #927（サブクエリ）との併用は対象外（`docs/design/cte.md`
-            // 対象外節）。`WITH` 主クエリは常に `subquery_ctx: None` で解析し、
-            // 主クエリ内の `IN (SELECT ...)`／`EXISTS (...)` は既存の
-            // `Parser::require_subquery_depth` 経路で一律 `42601` に落とす。
-            let shape = match parse_select_shape(main_tokens, None)? {
-                ParsedSelect::Scan(shape) => shape,
-                ParsedSelect::Search(_) => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
-                    ));
+            let main = if is_distinct_modifier(main_tokens, 1) {
+                MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
+            } else if main_is_aggregate_select {
+                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None)?)
+            } else {
+                match parse_select_shape(main_tokens, None)? {
+                    ParsedSelect::Scan(shape) => MainShape::Scan(shape),
+                    ParsedSelect::Search(_) => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
+                        ));
+                    }
                 }
+            };
+            let main_table_name = match &main {
+                MainShape::Scan(shape) => shape.table_name.clone(),
+                MainShape::Aggregate(shape) => shape.table_name.clone(),
             };
 
             // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
@@ -8510,20 +8892,31 @@ fn validate_sql_tokens_impl(
                 lookup,
                 &ctes,
                 ctes.len(),
-                &shape.table_name,
+                &main_table_name,
                 0,
                 &mut budget,
             )?;
-            Ok(Statement::Scan(build_scan_from_resolved(
-                shape.table_name,
-                resolved,
-                shape.projection,
-                shape.where_predicates,
-                shape.limit,
-                shape.order_by,
-                shape.offset,
-                shape.window_items,
-            )?))
+            match main {
+                MainShape::Scan(shape) => Ok(Statement::Scan(build_scan_from_resolved(
+                    shape.table_name,
+                    resolved,
+                    shape.projection,
+                    shape.where_predicates,
+                    shape.limit,
+                    shape.order_by,
+                    shape.offset,
+                    shape.window_items,
+                )?)),
+                MainShape::Aggregate(shape) => {
+                    Ok(Statement::Aggregate(build_aggregate_from_resolved(
+                        shape.table_name,
+                        resolved,
+                        shape.items,
+                        shape.where_predicates,
+                        shape.group_by,
+                    )?))
+                }
+            }
         }
         _ if is_set_statement => {
             let value = parse_set_search_mode(tokens)?;
@@ -15500,16 +15893,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_main_query_ranked_or_aggregate_over_cte() {
+    fn rejects_main_query_ranked_over_cte_but_accepts_aggregate() {
         let lookup = catalog_with(&["documents"]);
-        for sql in [
+        // ベクトル順位付けの主クエリは fail-closed（`42601`）のまま。
+        let err = validate_sql(
             "WITH x AS (SELECT id FROM documents) SELECT * FROM x ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "WITH x AS (SELECT id FROM documents) SELECT COUNT(*) FROM x",
-        ] {
-            let err = validate_sql(sql, &lookup)
-                .expect_err("ranked or aggregate main query over CTE must be rejected");
-            assert_eq!(err.wire_code(), "42601", "sql={sql}");
-        }
+            &lookup,
+        )
+        .expect_err("ranked main query over CTE must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+        // Issue #1191: 集計主クエリは受理し、CTE を基底テーブルへ畳み込んだ
+        // `ValidatedAggregate` になる。
+        let Statement::Aggregate(agg) = validate_sql(
+            "WITH x AS (SELECT id FROM documents WHERE lang = 'ja') SELECT COUNT(*) FROM x",
+            &lookup,
+        )
+        .expect("aggregate main query over CTE must be accepted") else {
+            panic!("expected Statement::Aggregate");
+        };
+        assert_eq!(agg.table_name(), "documents");
+        assert_eq!(agg.where_predicates().len(), 1);
     }
 
     #[test]

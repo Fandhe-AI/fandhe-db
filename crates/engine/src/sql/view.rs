@@ -17,8 +17,8 @@
 //! 可視性が参照者へ引き継がれることは構造的に起こらない。
 
 use super::allowlist::{
-    parse_view_body, AggregateArg, Projection, ScalarOrderKey, SelectItem, SqlSurfaceError,
-    TableLookup, WherePredicate, WindowSelectItem,
+    parse_view_body, AggregateArg, AggregateSelectItem, GroupByClause, Projection, ScalarOrderKey,
+    SelectItem, SqlSurfaceError, TableLookup, WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -233,6 +233,51 @@ pub(crate) fn check_columns_within_view(
     Ok(())
 }
 
+/// 集計 SELECT（Issue #1191・SQL-29 (b)。CTE の集計主クエリ）の列参照が、参照先が
+/// 公開する列集合（`view_columns`）に収まっているかを検査する
+/// （[`check_columns_within_view`] の集計版）。対象は集計項目の引数式・グループキー・
+/// `GROUP BY` 列・`WHERE`。`HAVING`・集計 `ORDER BY` の対象は SELECT リストの出力名
+/// （別名）または `GROUP BY` 列であり、表の列参照ではないため対象外（`COUNT(*)` は
+/// 列参照を持たない）。範囲外は `InvalidInput`（`22000`。既存の未知の列と同じ分類）。
+pub(crate) fn check_aggregate_columns_within_view(
+    view_columns: Option<&[String]>,
+    items: &[AggregateSelectItem],
+    group_by: Option<&GroupByClause>,
+    where_predicates: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    let Some(columns) = view_columns else {
+        return Ok(());
+    };
+    let unknown = |c: &str| SqlSurfaceError::InvalidInput {
+        detail: format!("unknown column: {c}"),
+    };
+    for item in items {
+        match item {
+            AggregateSelectItem::Aggregate(agg) => {
+                if let AggregateArg::Expr(expr) = &agg.arg {
+                    expr_columns_within(columns, expr)?;
+                }
+            }
+            AggregateSelectItem::GroupKey { column, .. } => {
+                if !columns.iter().any(|vc| vc == column) {
+                    return Err(unknown(column));
+                }
+            }
+        }
+    }
+    if let Some(group_by) = group_by {
+        for c in &group_by.columns {
+            if !columns.iter().any(|vc| vc == c) {
+                return Err(unknown(c));
+            }
+        }
+    }
+    for pred in where_predicates {
+        check_predicate_columns_within(columns, pred)?;
+    }
+    Ok(())
+}
+
 /// `pred` が参照する列がすべて `columns`（ビューが公開する列集合）に収まることを
 /// 検査する（TASK-208・SQL-24、Issue #912）。[`WherePredicate::Or`] の分岐へ
 /// **再帰する**ことが本関数の存在理由: 再帰しないと、ビューが公開していない列を
@@ -390,6 +435,7 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         // 外側クエリが参照する実在の列（ビューの公開列範囲チェック対象）。
         // `EXISTS (...)` は外側の列を参照しないため対象外。
         WherePredicate::InSubquery { column, .. } => Some(column),
+        WherePredicate::ScalarSubqueryCompare { column, .. } => Some(column),
         WherePredicate::Exists { .. } => None,
     }
 }

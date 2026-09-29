@@ -481,19 +481,6 @@ fn limit_inside_branch_is_rejected() {
 }
 
 #[test]
-fn aggregate_branch_is_rejected() {
-    let (storage, path) = seeded_two_tables();
-    let _guard = CleanupGuard(path);
-    let core = new_core(storage);
-    let err = run_err(
-        &core,
-        "tenant-a",
-        "SELECT COUNT(*) FROM docs UNION SELECT lang FROM other_docs",
-    );
-    assert_eq!(err.wire_code(), "42601");
-}
-
-#[test]
 fn bare_parenthesized_select_without_operator_is_rejected() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
@@ -1367,4 +1354,216 @@ fn bare_bool_column_followed_by_non_operator_union_ident_is_unaffected() {
         "SELECT lang FROM a WHERE flag union LIMIT 10",
     );
     assert_eq!(err.wire_code(), "42601");
+}
+// ---------- 集計の枝・括弧付き枝の ORDER BY／LIMIT／OFFSET（Issue #1191） ----------
+
+fn cells_of(result: &QueryResult) -> Vec<Vec<engine::sql::exec::Cell>> {
+    result.rows.iter().map(|r| r.cells.clone()).collect()
+}
+
+#[test]
+fn aggregate_branches_combine_left_to_right() {
+    use engine::sql::exec::Cell;
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    // docs=3 行・other_docs=2 行。`COUNT` 同士は静的型 BIGINT で互換。
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM docs UNION ALL SELECT COUNT(*) FROM other_docs",
+    );
+    assert_eq!(
+        cells_of(&result),
+        vec![vec![Cell::Integer(3)], vec![Cell::Integer(2)]]
+    );
+    // `UNION` は同値の行を除去する。
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM docs UNION SELECT COUNT(*) FROM docs",
+    );
+    assert_eq!(cells_of(&result), vec![vec![Cell::Integer(3)]]);
+    // `GROUP BY` の枝（グループキー＋集計の 2 列）。
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang, COUNT(*) FROM docs GROUP BY lang \
+         UNION ALL SELECT lang, COUNT(*) FROM other_docs GROUP BY lang",
+    );
+    let mut got: Vec<(String, u64)> = result
+        .rows
+        .iter()
+        .map(|r| match (&r.cells[0], &r.cells[1]) {
+            (Cell::Text(l), Cell::Integer(n)) => (l.clone(), *n),
+            other => panic!("unexpected cells {other:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("en".to_string(), 1),
+            ("en".to_string(), 1),
+            ("fr".to_string(), 1),
+            ("ja".to_string(), 2)
+        ]
+    );
+    // 集計の枝と広域取得の枝の型整合（`MAX(TEXT)` は TEXT）。
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT MAX(lang) FROM docs UNION SELECT lang FROM other_docs",
+    );
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["en".to_string(), "fr".to_string(), "ja".to_string()]
+    );
+}
+
+#[test]
+fn aggregate_branch_with_incompatible_column_type_is_datatype_mismatch() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    // BIGINT（COUNT）と TEXT は列型不一致（`42804`）。以前は集計の枝そのものが `42601`。
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM docs UNION SELECT lang FROM other_docs",
+    );
+    assert_eq!(err.wire_code(), "42804");
+    // 括弧なしの末尾 `ORDER BY` は集合演算全体に掛かるため対象外（`42601`）。
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY lang",
+    );
+    assert_eq!(err.wire_code(), "42601");
+}
+
+#[test]
+fn aggregate_branch_counts_only_rows_visible_to_the_session() {
+    use engine::sql::exec::Cell;
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    // tenant-a の private 行を追加（tenant-b からは見えない）。
+    insert_row(
+        &storage,
+        DOCS,
+        &ctx("tenant-a"),
+        4,
+        "ja",
+        Visibility::Private,
+    );
+    let core = new_core(storage);
+    let sql = "SELECT COUNT(*) FROM docs UNION ALL SELECT COUNT(*) FROM other_docs";
+    assert_eq!(
+        cells_of(&run(&core, "tenant-a", sql)),
+        vec![vec![Cell::Integer(4)], vec![Cell::Integer(2)]]
+    );
+    // tenant-b は public 行のみ（private の 1 行は数えない）。
+    assert_eq!(
+        cells_of(&run(&core, "tenant-b", sql)),
+        vec![vec![Cell::Integer(3)], vec![Cell::Integer(2)]]
+    );
+}
+
+#[test]
+fn parenthesized_branches_accept_order_by_limit_offset() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    // docs は昇順で en, ja, ja。先頭 2 件 = [en, ja]、other_docs の降順先頭 = fr。
+    let result = run(
+        &core,
+        "tenant-a",
+        "(SELECT lang FROM docs ORDER BY lang LIMIT 2) \
+         UNION ALL (SELECT lang FROM other_docs ORDER BY lang DESC LIMIT 1)",
+    );
+    assert_eq!(
+        langs(&result),
+        vec!["en".to_string(), "ja".to_string(), "fr".to_string()]
+    );
+    // `OFFSET`（docs の 2 番目 = ja）。右枝は既定の枝（括弧なし）。
+    let result = run(
+        &core,
+        "tenant-a",
+        "(SELECT lang FROM docs ORDER BY lang LIMIT 1 OFFSET 1) \
+         UNION ALL SELECT lang FROM other_docs",
+    );
+    let got = langs(&result);
+    assert_eq!(got.first().map(String::as_str), Some("ja"));
+    assert_eq!(got.len(), 3);
+    // 括弧付き枝の切り詰めは 54000 にならず、全体 `LIMIT` は集合演算全体に掛かる。
+    let result = run(
+        &core,
+        "tenant-a",
+        "(SELECT lang FROM docs ORDER BY lang LIMIT 3) UNION ALL SELECT lang FROM other_docs LIMIT 4",
+    );
+    assert_eq!(result.rows.len(), 4);
+    // 集計の括弧付き枝（`GROUP BY` 句内の `ORDER BY`／`LIMIT`）。
+    let result = run(
+        &core,
+        "tenant-a",
+        "(SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY n DESC LIMIT 1) \
+         UNION ALL (SELECT lang, COUNT(*) AS n FROM other_docs GROUP BY lang ORDER BY n LIMIT 1)",
+    );
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn parenthesized_branch_rejects_out_of_scope_forms() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for sql in [
+        // ベクトル順位付けの枝。
+        "(SELECT lang FROM docs ORDER BY embedding <=> '[0.1,0.2]' LIMIT 2) UNION SELECT lang FROM other_docs",
+        // `ORDER BY` のみ（`LIMIT` なし）は広域取得の形状パーサーが要求する `LIMIT` を欠く。
+        "(SELECT lang FROM docs ORDER BY lang) UNION SELECT lang FROM other_docs",
+        // 入れ子の集合演算の全体 `ORDER BY`／`LIMIT`。
+        "(SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY lang LIMIT 2) UNION SELECT lang FROM other_docs",
+        // 括弧なしの枝内 `LIMIT`／`OFFSET`。
+        "SELECT lang FROM docs LIMIT 1 OFFSET 1 UNION SELECT lang FROM other_docs",
+    ] {
+        let err = run_err(&core, "tenant-a", sql);
+        assert_eq!(err.wire_code(), "42601", "sql={sql} err={err:?}");
+    }
+    // 括弧付き枝の `LIMIT` 範囲外は通常の広域取得と同じ分類で拒否する。
+    let plain = run_err(&core, "tenant-a", "SELECT lang FROM docs LIMIT 0");
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "(SELECT lang FROM docs ORDER BY lang LIMIT 0) UNION SELECT lang FROM other_docs",
+    );
+    assert_eq!(err.wire_code(), plain.wire_code());
+}
+
+#[test]
+fn describe_matches_execute_for_aggregate_and_limited_branches() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for sql in [
+        "SELECT lang, COUNT(*) FROM docs GROUP BY lang UNION ALL SELECT lang, COUNT(*) FROM other_docs GROUP BY lang",
+        "(SELECT lang FROM docs ORDER BY lang LIMIT 2) UNION SELECT lang FROM other_docs",
+    ] {
+        let describe_session = SessionState::default();
+        let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+        let described = core
+            .describe_parsed_in_session(&describe_session, &parsed)
+            .expect("describe should succeed")
+            .expect("set operation must produce result columns");
+        let mut exec_session = SessionState::default();
+        let executed = expect_query(
+            core.execute_sql_in_session(&ctx("tenant-a"), &mut exec_session, sql)
+                .expect("execute should succeed"),
+        );
+        assert_eq!(described, executed.columns, "sql={sql}");
+    }
 }

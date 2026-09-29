@@ -1275,7 +1275,8 @@ fn reject_unsupported_predicate_dml_forms(
             | WherePredicate::Not(_)
             | WherePredicate::Or(_)
             | WherePredicate::InSubquery { .. }
-            | WherePredicate::Exists { .. } => {
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. } => {
                 return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "predicate form is not supported for NoSQL update/delete filter",
                 ));
@@ -3174,7 +3175,7 @@ impl EngineCore {
     /// だけをトークン列全体に対して行う）。誤検出（列名 `in`／`exists` の
     /// 通常参照）があっても安全側（拒否）に倒れるだけで、見逃し
     /// （実際にサブクエリを含むのに検出しない）は無い判定条件そのもの
-    /// （`Parser::parse_where_leaf` の受理条件と同一）。
+    /// （`Parser::parse_where_leaf` の受理条件と同一。Issue #1191 でスカラー比較形を追加）。
     fn contains_subquery_syntax(tokens: &[crate::sql::lexer::Token]) -> bool {
         use crate::sql::lexer::{Keyword, Token};
         for i in 0..tokens.len() {
@@ -3184,7 +3185,18 @@ impl EngineCore {
             let is_in = matches!(tokens.get(i + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN"))
                 && matches!(tokens.get(i + 2), Some(Token::Punct('(')))
                 && matches!(tokens.get(i + 3), Some(Token::Keyword(Keyword::Select)));
-            if is_exists || is_in {
+            // スカラーサブクエリ `<col> <op> (SELECT ...)`（Issue #1191）: 比較演算子
+            // トークン（`= < > <= >=`。`<>` は `< >` の 2 トークン）の直後の
+            // `( SELECT` だけを検出する。任意の `( SELECT`（括弧付き集合演算の枝等）へ
+            // 一般化しない（`$n` との併用が従来から受理される形を変えないため）。
+            let is_scalar = matches!(tokens.get(i), Some(Token::Punct('(')))
+                && matches!(tokens.get(i + 1), Some(Token::Keyword(Keyword::Select)))
+                && i > 0
+                && matches!(
+                    tokens.get(i - 1),
+                    Some(Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge)
+                );
+            if is_exists || is_in || is_scalar {
                 return true;
             }
         }
@@ -4800,7 +4812,7 @@ impl EngineCore {
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
-                    &schema,
+                    &[&schema],
                     read_txn,
                     ctx,
                     &self.storage,
@@ -4826,7 +4838,7 @@ impl EngineCore {
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
-                    &schema,
+                    &[&schema],
                     read_txn,
                     ctx,
                     &self.storage,
