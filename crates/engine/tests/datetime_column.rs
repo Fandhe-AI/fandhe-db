@@ -454,11 +454,12 @@ fn where_equality_and_range_on_datetime_column_is_accepted() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");
 
-    // TEXT 列との比較（型不一致）は `22000`。
+    // DATE 列と数値リテラルの比較（型不一致）は `22000`。
+    // （TEXT 列の範囲比較は Issue #1183 で受理されたため、型不一致の例には使わない）
     let err = core
         .execute_sql(
             &alice,
-            &format!("SELECT id FROM {TABLE} WHERE lang > '2024-01-01' LIMIT 10"),
+            &format!("SELECT id FROM {TABLE} WHERE day > 5 LIMIT 10"),
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");

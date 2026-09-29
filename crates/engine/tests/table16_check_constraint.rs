@@ -1222,25 +1222,22 @@ fn multi_column_integer_bigint_table_check_enforces_and_records_both_columns() {
     );
 }
 
-/// 回帰: `CHECK` 専用ポリシー（`ColumnRefPolicy::AllowNumericColumns`）を
-/// 追加しても、汎用の `WHERE` 経路（`ColumnRefPolicy::IdAndVectorOnly`）が
-/// 数値列の式内参照を拒否する既存挙動は変わらない（レーン A は対象外。
-/// `sql::udf_call::bind_expr_in` の `Expr::Ident` 分岐参照）。
+/// Issue #1183: 汎用の `WHERE` でも数値列の式内参照が受理される（旧契約は
+/// `CHECK` 専用の opt-in で `WHERE` 側は `22000` 拒否だった）。空テーブルに対する
+/// 束縛・実行が成功することで、CHECK と共通の束縛になったことを固定する。
 #[test]
-fn select_where_numeric_column_expression_is_still_rejected() {
-    let (core, path) = new_core("check-integer-where-regression");
+fn select_where_numeric_column_expression_is_accepted() {
+    let (core, path) = new_core("check-integer-where-accepted");
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
     core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (qty INTEGER)")
         .expect("create table");
 
-    let err = core
-        .execute_sql_in_session(
-            &alice,
-            &mut SessionState::default(),
-            "SELECT id FROM docs WHERE qty > 0 LIMIT 100",
-        )
-        .expect_err("numeric column expression in WHERE must still be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        "SELECT id FROM docs WHERE qty > 0 LIMIT 100",
+    )
+    .expect("numeric column expression in WHERE must be accepted");
 }

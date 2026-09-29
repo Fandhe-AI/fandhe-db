@@ -253,7 +253,108 @@ impl From<SqlSurfaceError> for GroupAccumulateError {
 /// `NULL` グループが先頭に来て `LIMIT` が意図した先頭の非 `NULL` グループを
 /// 取りこぼす）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GroupKey(Vec<Option<String>>);
+struct GroupKey(Vec<Option<KeyPart>>);
+
+/// グループキー 1 成分の借用ビュー（Issue #1183。`GROUP BY` キー列は TEXT に加えて
+/// INTEGER／BIGINT／REAL／DOUBLE を許すため、成分は型付きにする）。同一クエリ内の
+/// 同じ成分位置は常に同じ列型のため variant は揃う（異なる variant 同士は
+/// 決定性のための防御的な全順序のみ与える）。`Float` は `-0.0` を `0.0` へ
+/// 正規化済みの値だけを持つ（PostgreSQL と同じく同一グループにする）。
+/// NaN・±∞ は `row_codec` が格納を拒否するため到達しない。
+#[derive(Debug, Clone, Copy)]
+enum KeyRef<'a> {
+    Text(&'a str),
+    Int(i64),
+    Float(f64),
+}
+
+impl KeyRef<'_> {
+    fn rank(&self) -> u8 {
+        match self {
+            KeyRef::Text(_) => 0,
+            KeyRef::Int(_) => 1,
+            KeyRef::Float(_) => 2,
+        }
+    }
+
+    fn cmp_key(&self, other: &KeyRef<'_>) -> std::cmp::Ordering {
+        match (self, other) {
+            (KeyRef::Text(x), KeyRef::Text(y)) => x.cmp(y),
+            (KeyRef::Int(x), KeyRef::Int(y)) => x.cmp(y),
+            (KeyRef::Float(x), KeyRef::Float(y)) => x.total_cmp(y),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+/// [`KeyRef`] の所有版（[`GroupKey`] の成分）。
+#[derive(Debug, Clone)]
+enum KeyPart {
+    Text(String),
+    Int(i64),
+    Float(f64),
+}
+
+impl KeyPart {
+    fn as_key_ref(&self) -> KeyRef<'_> {
+        match self {
+            KeyPart::Text(s) => KeyRef::Text(s),
+            KeyPart::Int(v) => KeyRef::Int(*v),
+            KeyPart::Float(v) => KeyRef::Float(*v),
+        }
+    }
+
+    /// 出力セルへ変換する（`SELECT <col>` の投影と同じ型。REAL は `f32` から
+    /// 無損失に `f64` へ広げた値）。
+    fn to_cell(&self) -> Cell {
+        match self {
+            KeyPart::Text(s) => Cell::Text(s.clone()),
+            KeyPart::Int(v) => Cell::SignedInteger(*v),
+            KeyPart::Float(v) => Cell::Float(*v),
+        }
+    }
+}
+
+impl PartialEq for KeyPart {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for KeyPart {}
+
+impl PartialOrd for KeyPart {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyPart {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_key_ref().cmp_key(&other.as_key_ref())
+    }
+}
+
+/// 行の走査済みスカラーからグループキー成分を借用で取り出す（Issue #1183）。
+/// TEXT／INTEGER／BIGINT／REAL／DOUBLE 以外（束縛段が拒否済みで到達しない）と
+/// NULL は `None`（NULL グループ。従来の TEXT 限定 fail-closed 規約と同じ）。
+fn key_ref_from_scalar<'a>(value: Option<row_codec::ScalarRef<'a>>) -> Option<KeyRef<'a>> {
+    use row_codec::ScalarRef;
+    fn norm<'b>(v: f64) -> Option<KeyRef<'b>> {
+        if !v.is_finite() {
+            return None;
+        }
+        Some(KeyRef::Float(if v == 0.0 { 0.0 } else { v }))
+    }
+    match value? {
+        ScalarRef::Text(s) => Some(KeyRef::Text(s)),
+        ScalarRef::Integer(v) => Some(KeyRef::Int(i64::from(v))),
+        ScalarRef::BigInt(v) => Some(KeyRef::Int(v)),
+        ScalarRef::Real(v) => norm(f64::from(v)),
+        ScalarRef::Double(v) => norm(v),
+        _ => None,
+    }
+}
 
 /// [`GroupKey`]（所有）と、複数列 `GROUP BY` の行走査ループが構築する借用成分列
 /// （[`BorrowedGroupKey`]）を同一の比較規約で扱うためのビュー。`GroupKey::cmp`・
@@ -272,27 +373,30 @@ trait GroupKeyView {
     /// キーの成分数（`GROUP BY` 対象列数）。
     fn len(&self) -> usize;
     /// `i` 番目の成分（`None` は NULL 値のグループ）。範囲外は NULL 相当。
-    fn component(&self, i: usize) -> Option<&str>;
+    fn component(&self, i: usize) -> Option<KeyRef<'_>>;
 }
 
 impl GroupKeyView for GroupKey {
     fn len(&self) -> usize {
         self.0.len()
     }
-    fn component(&self, i: usize) -> Option<&str> {
-        self.0.get(i).and_then(|c| c.as_deref())
+    fn component(&self, i: usize) -> Option<KeyRef<'_>> {
+        self.0
+            .get(i)
+            .and_then(|c| c.as_ref())
+            .map(KeyPart::as_key_ref)
     }
 }
 
 /// 行走査ループが構築する借用成分列（各成分は `scanned` から借用した `&str`）。
 /// 所有化前に [`GroupKeyView`] 経由で既存グループを検索するための一時ビュー。
-struct BorrowedGroupKey<'a>(&'a [Option<&'a str>]);
+struct BorrowedGroupKey<'a>(&'a [Option<KeyRef<'a>>]);
 
 impl GroupKeyView for BorrowedGroupKey<'_> {
     fn len(&self) -> usize {
         self.0.len()
     }
-    fn component(&self, i: usize) -> Option<&str> {
+    fn component(&self, i: usize) -> Option<KeyRef<'_>> {
         self.0.get(i).copied().flatten()
     }
 }
@@ -306,7 +410,7 @@ fn cmp_group_key_views(a: &dyn GroupKeyView, b: &dyn GroupKeyView) -> std::cmp::
     let len = a.len().min(b.len());
     for i in 0..len {
         let component_order = match (a.component(i), b.component(i)) {
-            (Some(x), Some(y)) => x.cmp(y),
+            (Some(x), Some(y)) => x.cmp_key(&y),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
@@ -1277,6 +1381,15 @@ pub(crate) fn execute_grouped_aggregate(
     // （SQL-25 (d)）は全走査限定の `multi_groups: BTreeMap<GroupKey, _>` に
     // 一本化する（§計画 3.5「複数列経路は全走査のみ」）。
     let key_count = group_by.column_indices.len();
+    // Issue #1183: 単一キー用の索引経路・`string_groups`／`null_group` は TEXT
+    // 辞書索引が前提のため、キー列が TEXT のときに限る。数値キー（単一でも）は
+    // 全走査の `multi_groups` 経路へ一本化する（索引の有無で結果を変えない）。
+    let single_text_key = key_count == 1
+        && group_by
+            .column_indices
+            .first()
+            .and_then(|&i| schema.columns.get(i))
+            .is_some_and(|c| matches!(c.ty, crate::catalog::ColumnType::Text));
     // 集計表を非 NULL（`string_groups`）と NULL（`null_group`）に分割する
     // （Issue #351）。`string_groups: BTreeMap<String, _>` は `String: Borrow<str>`
     // により `get_mut(&str)` の借用キー検索が標準 API のまま可能で、既存グループ
@@ -1311,7 +1424,7 @@ pub(crate) fn execute_grouped_aggregate(
     // クエリの正しさに影響しない（fail-closed。`aggregate.rs` モジュール
     // ドキュメント「Issue #475」節と同じ設計）。
     let mut used_index_path = false;
-    if key_count != 1 {
+    if !single_text_key {
         // `ScalarIndex::column_groups`／`resolve_candidates` 経由の索引経路は
         // 単一キー専用（`sql::scalar_index::ScalarIndex::column_groups` の
         // 契約）。複数列 `GROUP BY`（SQL-25 (d)）は全走査に一本化するため
@@ -1593,7 +1706,7 @@ pub(crate) fn execute_grouped_aggregate(
                     },
                 };
 
-                if key_count == 1 {
+                if single_text_key {
                     // 単一キー: 借用キー（`&str`）でまず既存グループを 1 回だけ
                     // 探索し、ヒットした行では所有 `String` を一切確保しない
                     // （Issue #351）。GROUP BY キー列は束縛段
@@ -1721,18 +1834,17 @@ pub(crate) fn execute_grouped_aggregate(
                             "GROUP BY column count exceeds MAX_GROUP_BY_COLUMNS at execution time",
                         ));
                     }
-                    let mut borrowed_storage: [Option<&str>; MAX_GROUP_BY_COLUMNS] =
+                    let mut borrowed_storage: [Option<KeyRef<'_>>; MAX_GROUP_BY_COLUMNS] =
                         [None; MAX_GROUP_BY_COLUMNS];
                     let mut key_len: usize = 0;
                     for (slot, &column_index) in
                         borrowed_storage.iter_mut().zip(&group_by.column_indices)
                     {
-                        let value = scanned
-                            .get(column_index)
-                            .copied()
-                            .flatten()
-                            .and_then(|v| v.as_text());
-                        if let Some(s) = value {
+                        let value =
+                            key_ref_from_scalar(scanned.get(column_index).copied().flatten());
+                        // キー累計バイトは文字列成分だけを計上する（数値成分は
+                        // 固定長で `ResultBudget::per_group_bytes` に計上済み）。
+                        if let Some(KeyRef::Text(s)) = value {
                             key_len = key_len.checked_add(s.len()).ok_or_else(|| {
                                 accumulator_bug("GROUP BY key length accounting overflowed")
                             })?;
@@ -1771,7 +1883,7 @@ pub(crate) fn execute_grouped_aggregate(
                         // `try_clone_str` と同じ `try_reserve_exact` ベースの
                         // 確保にする。`.claude/rules/security.md`「不安全な設計」
                         // 対応）。
-                        let mut key_components: Vec<Option<String>> = Vec::new();
+                        let mut key_components: Vec<Option<KeyPart>> = Vec::new();
                         key_components
                             .try_reserve_exact(borrowed_components.len())
                             .map_err(|_| {
@@ -1781,7 +1893,9 @@ pub(crate) fn execute_grouped_aggregate(
                             })?;
                         for value in borrowed_components {
                             key_components.push(match value {
-                                Some(s) => Some(try_clone_str(s)?),
+                                Some(KeyRef::Text(s)) => Some(KeyPart::Text(try_clone_str(s)?)),
+                                Some(KeyRef::Int(v)) => Some(KeyPart::Int(*v)),
+                                Some(KeyRef::Float(v)) => Some(KeyPart::Float(*v)),
                                 None => None,
                             });
                         }
@@ -1822,11 +1936,11 @@ pub(crate) fn execute_grouped_aggregate(
     // 既に `GroupKey::Ord` の昇順）をそのまま使う。
     let total_group_count =
         string_groups.len() + usize::from(null_group.is_some()) + multi_groups.len();
-    let group_entries: Box<dyn Iterator<Item = (GroupKey, Vec<Accumulator>)>> = if key_count == 1 {
+    let group_entries: Box<dyn Iterator<Item = (GroupKey, Vec<Accumulator>)>> = if single_text_key {
         Box::new(
             string_groups
                 .into_iter()
-                .map(|(k, accs)| (GroupKey(vec![Some(k)]), accs))
+                .map(|(k, accs)| (GroupKey(vec![Some(KeyPart::Text(k))]), accs))
                 .chain(
                     null_group
                         .into_iter()
@@ -1940,7 +2054,7 @@ pub(crate) fn execute_grouped_aggregate(
                     // 範囲外は fail-closed に `accumulator_bug`（`XX000`）へ落とす
                     // （`.claude/rules/coding-rust.md`）。
                     ProjectionColumn::GroupKey { key_index, .. } => match key.0.get(*key_index) {
-                        Some(Some(s)) => Cell::Text(s.clone()),
+                        Some(Some(part)) => part.to_cell(),
                         Some(None) => Cell::Null,
                         None => {
                             return Err(accumulator_bug(

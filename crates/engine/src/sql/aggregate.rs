@@ -484,10 +484,15 @@ pub(crate) fn classify_aggregate_access(
         // 単一キー専用のため）。ここも同じ `key_count == 1` ゲートを掛けないと
         // 複数列 `GROUP BY` で `access_path: full_scan`（実行時の実態）と
         // 異なる索引経路を EXPLAIN が返す D5 矛盾出力になる。
-        let single_key_group_by = bound
-            .group_by
-            .as_ref()
-            .is_some_and(|g| g.column_indices.len() == 1);
+        let single_key_group_by = bound.group_by.as_ref().is_some_and(|g| {
+            // Issue #1183: 索引経路は TEXT キー専用。数値キー（単一でも）は
+            // `execute_grouped_aggregate` が全走査へ倒すため同じゲートを掛ける。
+            g.column_indices.len() == 1
+                && g.column_indices
+                    .first()
+                    .and_then(|&i| schema.columns.get(i))
+                    .is_some_and(|c| matches!(c.ty, crate::catalog::ColumnType::Text))
+        });
         let text_min_max_blocks = crate::sql::group_by::has_text_min_max_aggregate(bound.items());
         // Issue #1153: `ScalarIndexGroupEnumeration`（列挙形）は
         // `ScalarIndex::column_groups(key_index)` を直接照会する。宣言で

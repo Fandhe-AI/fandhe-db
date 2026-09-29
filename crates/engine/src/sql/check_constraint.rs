@@ -18,11 +18,10 @@
 //!
 //! `CHECK` の式比較（`WherePredicate::Expression`）で参照できるのは疑似列
 //! `id`・`VECTOR` 列（`vec_norm`/`vec_sum`/`vec_div` 経由）・INTEGER/BIGINT/
-//! REAL/DOUBLE 列（Issue #1075・TABLE-16 ポインタ。`sql::udf_call::
-//! ColumnRefPolicy::AllowNumericColumns` による CHECK 専用の opt-in 拡張）。
+//! REAL/DOUBLE 列（Issue #1075・TABLE-16 ポインタ。Issue #1183 で
+//! `WHERE`／投影と共通の束縛へ統合済み）。
 //! TEXT/BOOLEAN/DATE/NUMERIC 等の他の列型は引き続き拒否される。NULL・非有限値・
-//! 精度の評価規則は `docs/design/sql-check-constraint.md` 参照。汎用の
-//! `WHERE`／`SELECT` へ数値列の式参照を広げるレーン A は対象外（別 Issue）。
+//! 精度の評価規則は `docs/design/sql-check-constraint.md` 参照。
 
 use crate::catalog::{CheckConstraint, TableSchema};
 use crate::declarative_filter::MetadataFilter;
@@ -1344,7 +1343,7 @@ mod tests {
     /// 等はポリシーに関わらず対象外のまま。設計 D-1・D-2）。
     #[test]
     fn validate_and_build_rejects_non_numeric_column_types_in_expressions() {
-        // `bind_check_predicates`（`ColumnRefPolicy::AllowNumericColumns`）でも
+        // `bind_check_predicates` でも
         // 数値列（INTEGER/BIGINT/REAL/DOUBLE）以外の式内参照は引き続き拒否
         // されることを固定する（設計 D-1・D-2。BOOLEAN 列を式の一方の被演算子
         // に置く比較は `Expr::Ident` 経由で `bind_expr_in` に到達する）。

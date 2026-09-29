@@ -381,48 +381,36 @@ fn non_integer_literal_forms_are_rejected_with_22000() {
     assert_eq!(count_rows(&core, &ctx), 0);
 }
 
-/// 整数列を `WHERE`（裸の数値リテラル形。式評価経路）・`GROUP BY`・式で
-/// 参照した場合は fail-closed 拒否として `22000` になる。#891・TASK-199 は
-/// 算術を持たない非数値型（DATE/TIMESTAMP/NUMERIC/UUID/BYTEA）の WHERE 等価・
-/// 範囲比較のみを対象としたため、INTEGER 列を算術・WHERE 範囲比較で使う経路
-/// （レーン A）は引き続き別 Issue（#893 と合わせて）へ申し送り。集計
-/// （`SUM` 等）の直接参照は Issue #892 で受理されたため、この契約からは
-/// 除外する（[`sum_of_integer_column_succeeds_after_issue_892`] 参照）。
+/// 整数列を `WHERE`（数値リテラルとの比較）・`GROUP BY`・式で参照する形は
+/// Issue #1183（SQL-24・SQL-26・TABLE-13 ポインタ）で受理される（旧契約は
+/// レーン A 未実装のため `22000` で拒否していた）。空テーブルに対する束縛・実行が
+/// 成功することを固定する（値の意味論は `scalar_types_predicates` 等で検証）。
 #[test]
-fn integer_column_reference_in_where_group_by_and_expr_is_rejected_with_22000() {
-    let path = unique_db_path("column-type-integer-unsupported-refs");
+fn integer_column_reference_in_where_group_by_and_expr_is_accepted() {
+    let path = unique_db_path("column-type-integer-accepted-refs");
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let ctx = ctx_for("tenant-a");
 
-    let where_err = core
-        .execute_sql(
-            &ctx,
-            &format!("SELECT id FROM {TABLE} WHERE n = 1 LIMIT 10"),
-        )
-        .unwrap_err();
-    assert_eq!(where_err.wire_code(), "22000");
+    core.execute_sql(
+        &ctx,
+        &format!("SELECT id FROM {TABLE} WHERE n = 1 LIMIT 10"),
+    )
+    .expect("WHERE on INTEGER column must be accepted");
 
-    let group_by_err = core
-        .execute_sql(&ctx, &format!("SELECT n, COUNT(*) FROM {TABLE} GROUP BY n"))
-        .unwrap_err();
-    assert_eq!(group_by_err.wire_code(), "22000");
+    core.execute_sql(&ctx, &format!("SELECT n, COUNT(*) FROM {TABLE} GROUP BY n"))
+        .expect("GROUP BY on INTEGER column must be accepted");
 
-    // 式評価: 組み込み関数呼び出し（`vec_div(embedding, n)`）の引数として
-    // `INTEGER` 列を参照すると、`sql::udf_call::bind_expr_in` の列参照束縛が
-    // （引数の型検査より前に）`22000` で拒否する。
-    let expr_err = core
-        .execute_sql(
-            &ctx,
-            &format!(
-                "SELECT vec_div(embedding, n) FROM {TABLE} \
-                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
-            ),
-        )
-        .unwrap_err();
-    assert_eq!(expr_err.wire_code(), "22000");
+    core.execute_sql(
+        &ctx,
+        &format!(
+            "SELECT vec_div(embedding, n) FROM {TABLE} \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+        ),
+    )
+    .expect("INTEGER column in an expression must be accepted");
 }
 
 /// `SUM`/`AVG`/`MIN`/`MAX(<INTEGER>/<BIGINT>)` は Issue #892 で受理された
