@@ -21,9 +21,10 @@
 - 範囲外・暦上不正（月 13、2/30、非閏年の 2/29、時 24、分 60、秒 60、
   年 0000、年 10000 以上等）は新設分類 `DatetimeFieldOverflow`（`22008`。
   ERR-6 の管轄表にある行）へ写像する。
-- 文法違反（区切り文字違い、桁数不足、TZ 接尾辞、小数 7 桁以上、前後空白、
-  非 ASCII 数字、長さ超過等）は既存の `InvalidInput`（`22000`）のまま。
-- `22P02`（`InvalidTextRepresentation`）の新設は行わない（TASK-227・ERR-6 へ
+- 書式違反（区切り文字違い、桁数不足、TZ 接尾辞、小数 7 桁以上、前後空白、
+  非 ASCII 数字、長さ超過等）は Issue #1187 で `InvalidDatetimeFormat`（`22007`）へ
+  変更した（当初は `InvalidInput`〔`22000`〕）。
+- （Issue #1187 で解消: 書式違反は `22007`（`InvalidDatetimeFormat`）へ変更）。当初の記述: `22P02`（`InvalidTextRepresentation`）の新設は行わない（TASK-227・ERR-6 へ
   申し送り。着手時点で兄弟 PR による追加も無かった）。
 
 ### D-2: BREAKING CHANGE として扱う
@@ -146,7 +147,7 @@ build`（production の既定入口）は `DATE`／`TIMESTAMP` を常に構築�
   ワイルドカード腕による fail-closed 拒否のまま（`update` との表層間
   非対称は BOOLEAN 列と同じ既知の制約）。
 - 回帰テストの拡充（#897・TASK-201）。
-- `22P02` の新設（TASK-227・ERR-6）。
+- `22P02` の新設（TASK-227・ERR-6）。Issue #1187 で解消済み（書式違反は `22007`）。
 - SQL `CREATE TABLE` による宣言（SQL-23）。Rust API（`TableSchema`）での
   宣言までが対象。
 - `DATE '...'`／`TIMESTAMP '...'` の型付きリテラル接頭辞。

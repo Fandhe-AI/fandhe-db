@@ -459,10 +459,13 @@ pub enum SqlSurfaceError {
     /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
     /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
     /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
-    /// 文法違反（区切り文字違い・TZ 接尾辞・桁数不足等）は既存の `InvalidInput`
-    /// （`22000`）のまま変えない。ERR-6 の管轄表にある `22008`
-    /// （`DATETIME_FIELD_OVERFLOW`）へ写像する新規分類。
+    /// 書式違反は `InvalidDatetimeFormat`（`22007`。Issue #1187）。ERR-6 の管轄表に
+    /// ある `22008`（`DATETIME_FIELD_OVERFLOW`）へ写像する分類。
     DatetimeFieldOverflow { detail: String },
+    /// `DATE`／`TIMESTAMP` リテラルの書式違反（区切り文字違い・TZ 接尾辞・桁数不足等。
+    /// TABLE-13・ERR-6、Issue #1187）。`22007`
+    /// （[`crate::error_format::ErrorClass::InvalidDatetimeFormat`]）。
+    InvalidDatetimeFormat { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
     /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
     /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
@@ -715,6 +718,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13、Issue #1187）が
+    /// `DATE`／`TIMESTAMP` リテラルの書式違反を報告するために使う。
+    pub(crate) fn invalid_datetime_format(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidDatetimeFormat {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_enum_literal`（Issue #890）が ENUM 列の
     /// 語彙外ラベルを報告するために使う。エラーメッセージには語彙の一覧を
     /// 含めない（型名とクライアント自身の入力値のみ。security.md P0）。
@@ -800,6 +811,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
+            SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
                 ErrorClass::InvalidTextRepresentation
             }
@@ -879,6 +891,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
+            }
+            SqlSurfaceError::InvalidDatetimeFormat { detail } => {
+                write!(f, "invalid datetime format: {detail}")
             }
             SqlSurfaceError::InvalidTextRepresentation { detail } => {
                 write!(f, "invalid text representation: {detail}")

@@ -230,10 +230,10 @@ fn insert_rejects_out_of_range_real_literal_with_22003() {
         .expect("retry with the same operation_id should succeed after the rejected attempt");
 }
 
-/// 文字列リテラルは既存の型不一致と同じ `22000`（InvalidInput）で拒否する
+/// 文字列リテラルは形式不正として `22P02`（InvalidTextRepresentation。Issue #1187）で拒否する
 /// （F7: 文字列からの暗黙変換はしない）。
 #[test]
-fn insert_rejects_string_literal_for_real_column_with_22000() {
+fn insert_rejects_string_literal_for_real_column_with_22p02() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -246,7 +246,7 @@ fn insert_rejects_string_literal_for_real_column_with_22000() {
     let err = core
         .execute_sql_in_session(&alice, &mut session, &sql)
         .expect_err("string literal for REAL column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22P02");
 }
 
 /// `WHERE score = 1` は fail-closed に拒否される（F10: REAL/DOUBLE は算術と
