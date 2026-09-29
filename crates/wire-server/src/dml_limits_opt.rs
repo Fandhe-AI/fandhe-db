@@ -1,5 +1,8 @@
 //! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--max-dml-affected-rows`・
-//! `--max-insert-rows` opt-in CLI 引数のパーサ（Issue #997）。
+//! `--max-insert-rows` opt-in CLI 引数のパーサ（Issue #997）。あわせて
+//! `--batch-max-files`（Issue #1166。`batch_limits.max_files_per_batch`。
+//! 優先順位は CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64）の
+//! 解決 [`resolve_batch_limits`] も本モジュールが担う。
 //!
 //! オーナー判断の改訂（2026-09-27、前回のオーナー判断を置き換え）: 汎用 RDB
 //! （PostgreSQL 等）の挙動に合わせ、述語形 UPDATE／DELETE の 1 文あたり影響行数
@@ -31,6 +34,36 @@ pub const MAX_AFFECTED_ROWS_FLAG: &str = "--max-dml-affected-rows";
 
 /// 複数行 `VALUES` の 1 文あたり行数上限を設定する CLI フラグ名。
 pub const MAX_INSERT_ROWS_FLAG: &str = "--max-insert-rows";
+
+/// `batch_limits.max_files_per_batch` を設定する CLI フラグ名（Issue #1166）。
+/// 環境変数 `VECTOR_DB_BATCH_MAX_FILES` と 1 対 1 に対応し、優先順位は
+/// CLI 明示 > 環境変数 > 既定 64。
+pub const BATCH_MAX_FILES_FLAG: &str = "--batch-max-files";
+
+/// `--batch-max-files` の未パース値から [`engine::batch_limits::BatchLimits`] を
+/// 解決する（Issue #1166）。`base` は環境変数・既定を解決済みの値
+/// （`BatchLimits::default()`）で、`raw` が `Some` のときだけ
+/// `max_files_per_batch` を上書きする（CLI 明示 > 環境変数 > 既定）。範囲
+/// （`1..=MAX_BATCH_MAX_FILES`）は engine 側の単一情報源
+/// [`engine::batch_limits::validate_max_files_per_batch`] に委ね、不正値は
+/// `Err`（fail-closed。既定へ黙って読み替えない）。
+pub fn resolve_batch_limits(
+    base: engine::batch_limits::BatchLimits,
+    raw: Option<&str>,
+) -> Result<engine::batch_limits::BatchLimits, String> {
+    let Some(raw) = raw else {
+        return Ok(base);
+    };
+    let value = parse_strict_decimal(raw).ok_or_else(|| {
+        format!("{BATCH_MAX_FILES_FLAG} expects a non-negative integer, got {raw:?}")
+    })?;
+    let max_files_per_batch = engine::batch_limits::validate_max_files_per_batch(value)
+        .map_err(|e| format!("{BATCH_MAX_FILES_FLAG}: {e}"))?;
+    Ok(engine::batch_limits::BatchLimits {
+        max_files_per_batch,
+        ..base
+    })
+}
 
 /// ASCII 数字のみからなる非空文字列を厳密パースする（`search_engine_opt::
 /// parse_strict_decimal` と同じ設計。`str::parse::<usize>` がそのまま受理して
@@ -80,41 +113,42 @@ pub fn resolve(
 
 /// 複数行 `VALUES`（`BoundInsertForm::RowBatch`）は本モジュールの
 /// `max_insert_rows_per_statement`（構文解析段の上限。`Some` のときのみ判定）に
-/// 加え、独立した別上限 `engine::batch_limits::BatchLimits::max_files_per_batch`
-/// （既定 64。Issue #860 SQL/NoSQL 機能パリティ）も通る二重ゲートである
-/// （`docs/design/predicate-dml-exec.md` §6「`batch_limits.max_files_per_batch`
-/// との二重ゲート」参照）。`wire-server` は現状 `EngineCore::with_batch_limits`
-/// を呼ばず既定値のまま運用するため、`--max-insert-rows` で
-/// `max_files_per_batch` 超の値を指定しても、複数行 `VALUES` は
-/// `max_files_per_batch` 側で `54000` になり CLI の引き上げが黙って無効化
-/// される（codex-review P1 指摘・PR #1122）。この状態を運用者が見落とさない
-/// よう、`--max-insert-rows` を**明示指定**した場合に限り起動ログへ英語の
-/// `WARNING` 行を出す（`--durability none` と同じ「明示選択した非既定値の
-/// 安全上の含意を見落とさせない」設計判断。エラーにはしない——
-/// `max_files_per_batch` 以下の行数しか使わない構成では正当なため
-/// fail-closed で拒否する理由がない）。`limits.max_insert_rows_per_statement`
-/// が `None`（`--max-insert-rows` 未指定・既定）の場合は警告しない
-/// （`batch_limits.max_files_per_batch` は本 Issue 以前から常に適用されて
-/// きた既存の暗黙上限であり、フラグ未指定という「何も選択していない」状態を
-/// 毎回警告すると `--durability`／`--search-engine` 等の既定パターン
-/// 〔非既定値を明示選択したときだけ警告する〕から外れ、通常起動のたびに
-/// ノイズになる）。`max_files_per_batch` 自体を引き上げる CLI フラグは
-/// Issue #997 のオーナー承認範囲（対象 2 つ）に含まれないため追加しない
-/// （環境変数 `VECTOR_DB_BATCH_MAX_FILES`。`engine::batch_limits` モジュール
-/// ドキュメント参照。既存の設定経路を案内するのみ）。
+/// 加え、独立した別上限 `engine::batch_limits::BatchLimits` の
+/// `max_files_per_batch`（既定 64。Issue #860）と `max_batch_chunks`
+/// （既定 4096）も通る多重ゲートであり、実効行数上限は両者の小さい方になる
+/// （`docs/design/predicate-dml-exec.md` §6 参照）。`--max-insert-rows` が
+/// この実効上限を超えると引き上げが黙って無効化されるため（codex-review P1
+/// 指摘・PR #1122）、`--max-insert-rows` を**明示指定**した場合に限り起動ログへ
+/// 英語の `WARNING` 行を出す（`--durability none` と同じ「明示選択した非既定値の
+/// 安全上の含意を見落とさせない」設計判断。エラーにはしない）。
+/// `max_insert_rows_per_statement` が `None`（未指定・既定）の場合は警告しない。
+/// `batch_limits` には main.rs が `EngineCore::with_batch_limits` へ渡すのと
+/// **同じ解決済みの値**（`--batch-max-files` > 環境変数 > 既定。Issue #1166）を
+/// 渡すこと。メッセージには効いている側の上限と引き上げ手段を含める。
 pub fn insert_rows_cap_warning(
     limits: &DmlLimits,
     batch_limits: &engine::batch_limits::BatchLimits,
 ) -> Option<String> {
     let limit = limits.max_insert_rows_per_statement?;
-    if limit.get() <= batch_limits.max_files_per_batch {
+    let files_cap = batch_limits.max_files_per_batch;
+    let chunks_cap = batch_limits.max_batch_chunks;
+    let effective = files_cap.min(chunks_cap);
+    if limit.get() <= effective {
         return None;
     }
+    let remedy = if files_cap <= chunks_cap {
+        format!(
+            "batch_limits.max_files_per_batch; set {BATCH_MAX_FILES_FLAG} (or the \
+             VECTOR_DB_BATCH_MAX_FILES environment variable) to raise it"
+        )
+    } else {
+        "batch_limits.max_batch_chunks; set the VECTOR_DB_BATCH_MAX_CHUNKS \
+         environment variable to raise it"
+            .to_string()
+    };
     Some(format!(
         "{MAX_INSERT_ROWS_FLAG} is set to {limit} but multi-row VALUES statements are still \
-         capped at {} rows by the batch_limits.max_files_per_batch default; set the \
-         VECTOR_DB_BATCH_MAX_FILES environment variable to raise it",
-        batch_limits.max_files_per_batch
+         capped at {effective} rows by {remedy}"
     ))
 }
 
@@ -210,6 +244,70 @@ mod tests {
             warning.contains("VECTOR_DB_BATCH_MAX_FILES"),
             "unexpected: {warning}"
         );
+        assert!(
+            warning.contains(BATCH_MAX_FILES_FLAG),
+            "unexpected: {warning}"
+        );
+    }
+
+    #[test]
+    fn insert_rows_cap_warning_names_chunks_when_chunks_cap_is_effective() {
+        let limits = DmlLimits {
+            max_affected_rows: None,
+            max_insert_rows_per_statement: Some(NonZeroUsize::new(5000).unwrap()),
+        };
+        let batch_limits = engine::batch_limits::BatchLimits {
+            max_files_per_batch: 10000,
+            max_batch_chunks: 4096,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        let warning = insert_rows_cap_warning(&limits, &batch_limits).expect("warning expected");
+        assert!(warning.contains("4096"), "unexpected: {warning}");
+        assert!(
+            warning.contains("VECTOR_DB_BATCH_MAX_CHUNKS"),
+            "unexpected: {warning}"
+        );
+    }
+
+    #[test]
+    fn resolve_batch_limits_none_keeps_base() {
+        let base = engine::batch_limits::BatchLimits {
+            max_files_per_batch: 77,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        let got = resolve_batch_limits(base, None).unwrap();
+        assert_eq!(got.max_files_per_batch, 77);
+    }
+
+    #[test]
+    fn resolve_batch_limits_overrides_only_max_files() {
+        let base = engine::batch_limits::BatchLimits {
+            max_files_per_batch: 77,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        let got = resolve_batch_limits(base, Some("3")).unwrap();
+        assert_eq!(got.max_files_per_batch, 3);
+        assert_eq!(got.max_batch_chunks, base.max_batch_chunks);
+        assert_eq!(got.max_batch_total_bytes, base.max_batch_total_bytes);
+    }
+
+    #[test]
+    fn resolve_batch_limits_accepts_upper_bound_and_rejects_invalid() {
+        let base = engine::batch_limits::BatchLimits::default();
+        let max = engine::batch_limits::MAX_BATCH_MAX_FILES;
+        assert_eq!(
+            resolve_batch_limits(base, Some(&max.to_string()))
+                .unwrap()
+                .max_files_per_batch,
+            max
+        );
+        for bad in ["0", "abc", "+5", " 5", "5 ", ""] {
+            let err = resolve_batch_limits(base, Some(bad)).unwrap_err();
+            assert!(err.contains(BATCH_MAX_FILES_FLAG), "unexpected: {err}");
+        }
+        let over = (max + 1).to_string();
+        let err = resolve_batch_limits(base, Some(&over)).unwrap_err();
+        assert!(err.contains(BATCH_MAX_FILES_FLAG), "unexpected: {err}");
     }
 
     #[test]
