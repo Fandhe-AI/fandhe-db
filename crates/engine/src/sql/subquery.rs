@@ -833,7 +833,7 @@ fn resolve_in_subquery(
             ),
             SubqueryValueFamily::Integer => WherePredicate::Or(
                 ints.into_iter()
-                    .map(|n| vec![int_compare(column, BinOp::Eq, n)])
+                    .map(|n| vec![int_compare(column, BinOp::Eq, i128::from(n))])
                     .collect(),
             ),
             _ => build_in_set_predicate(column, texts),
@@ -871,8 +871,8 @@ fn resolve_in_subquery(
                 ints.into_iter()
                     .map(|n| {
                         WherePredicate::Or(vec![
-                            vec![int_compare(column, BinOp::Lt, n)],
-                            vec![int_compare(column, BinOp::Gt, n)],
+                            vec![int_compare(column, BinOp::Lt, i128::from(n))],
+                            vec![int_compare(column, BinOp::Gt, i128::from(n))],
                         ])
                     })
                     .collect()
@@ -899,8 +899,35 @@ fn resolve_in_subquery(
     })
 }
 
+/// 式評価器（`f64`）が正確に表現できる整数の絶対値上限（`2^53`）。列値側の検査
+/// （`numeric_scalar_from_ref`・`id_as_finite_scalar`）と同じ境界。
+const MAX_EXACT_INT_ABS: i128 = 1 << 53;
+
 /// `<column> <op> <整数>` の式述語（数値リテラルの比較と同じ AST 形）。
-fn int_compare(column: &str, op: BinOp, n: i64) -> WherePredicate {
+///
+/// 内側の値 `n` が `2^53` を超える場合、数値リテラルへ直接変換すると式束縛の
+/// 正確表現ガード（`parse_number_literal`）に拒否され、正当な比較まで `22000`
+/// になる（PR #1235 codex-review P1）。範囲内の列値は `|v| <= 2^53` なので、
+/// 範囲外の `n` との大小関係は符号だけで決まる。そこで範囲外の `n` は境界値
+/// （`±2^53`）との等価な比較へ写像する。列参照は式に残すため、範囲外の列値は
+/// 従来どおり評価時に `22000`（fail-closed）で拒否され、黙って丸められない。
+/// `op` は `Eq`／`Lt`／`Le`／`Gt`／`Ge` のみを想定する。
+fn int_compare(column: &str, op: BinOp, n: i128) -> WherePredicate {
+    let (op, n) = if n > MAX_EXACT_INT_ABS {
+        let op = match op {
+            BinOp::Lt | BinOp::Le => BinOp::Le,
+            _ => BinOp::Gt,
+        };
+        (op, MAX_EXACT_INT_ABS)
+    } else if n < -MAX_EXACT_INT_ABS {
+        let op = match op {
+            BinOp::Gt | BinOp::Ge => BinOp::Ge,
+            _ => BinOp::Lt,
+        };
+        (op, -MAX_EXACT_INT_ABS)
+    } else {
+        (op, n)
+    };
     WherePredicate::Expression(Expr::Binary {
         op,
         lhs: Box::new(Expr::Ident(column.to_string())),
@@ -1090,6 +1117,27 @@ fn scalar_literal_predicate(
                 )),
             }
         }
+        SubqueryValueFamily::Integer
+            if matches!(cell, Cell::Integer(_) | Cell::SignedInteger(_)) =>
+        {
+            // 整数列 × 整数セルは `2^53` 超でも比較できるよう `int_compare` へ写像する。
+            let n: i128 = match cell {
+                Cell::Integer(u) => i128::from(*u),
+                Cell::SignedInteger(i) => i128::from(*i),
+                _ => return Err(unexpected_cell_type()),
+            };
+            Ok(match op {
+                ScalarSubqueryOp::Eq => int_compare(column, BinOp::Eq, n),
+                ScalarSubqueryOp::Lt => int_compare(column, BinOp::Lt, n),
+                ScalarSubqueryOp::Le => int_compare(column, BinOp::Le, n),
+                ScalarSubqueryOp::Gt => int_compare(column, BinOp::Gt, n),
+                ScalarSubqueryOp::Ge => int_compare(column, BinOp::Ge, n),
+                ScalarSubqueryOp::Ne => WherePredicate::Or(vec![
+                    vec![int_compare(column, BinOp::Lt, n)],
+                    vec![int_compare(column, BinOp::Gt, n)],
+                ]),
+            })
+        }
         SubqueryValueFamily::Integer | SubqueryValueFamily::Float => {
             let number = Expr::Number(number_cell_text(cell)?);
             let cmp = |op: BinOp| {
@@ -1212,6 +1260,50 @@ mod tests {
     use crate::storage::{encode_row, RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
     use redb::ReadableDatabase;
+
+    /// PR #1235 codex-review P1 の回帰テスト: `2^53` を超える整数との比較が
+    /// 数値リテラルの正確表現ガードに拒否されず、境界値との等価な比較へ写像される。
+    #[test]
+    fn int_compare_maps_out_of_range_values_to_boundary() {
+        let m = MAX_EXACT_INT_ABS;
+        let parts = |p: WherePredicate| match p {
+            WherePredicate::Expression(Expr::Binary { op, rhs, .. }) => match *rhs {
+                Expr::Number(t) => (op, t),
+                _ => panic!("rhs is not a number"),
+            },
+            _ => panic!("not an expression predicate"),
+        };
+        let big = 9_007_199_254_740_993_i128;
+        assert_eq!(
+            parts(int_compare("c", BinOp::Eq, big)),
+            (BinOp::Gt, m.to_string())
+        );
+        assert_eq!(
+            parts(int_compare("c", BinOp::Lt, big)),
+            (BinOp::Le, m.to_string())
+        );
+        assert_eq!(
+            parts(int_compare("c", BinOp::Gt, big)),
+            (BinOp::Gt, m.to_string())
+        );
+        assert_eq!(
+            parts(int_compare("c", BinOp::Eq, -big)),
+            (BinOp::Lt, (-m).to_string())
+        );
+        assert_eq!(
+            parts(int_compare("c", BinOp::Gt, -big)),
+            (BinOp::Ge, (-m).to_string())
+        );
+        assert_eq!(
+            parts(int_compare("c", BinOp::Lt, -big)),
+            (BinOp::Lt, (-m).to_string())
+        );
+        // 境界ちょうどは写像せずそのまま。
+        assert_eq!(
+            parts(int_compare("c", BinOp::Eq, m)),
+            (BinOp::Eq, m.to_string())
+        );
+    }
 
     fn docs_schema() -> TableSchema {
         TableSchema::new(
