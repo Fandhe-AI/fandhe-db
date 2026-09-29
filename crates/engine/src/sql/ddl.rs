@@ -565,8 +565,9 @@ fn map_add_check_or_foreign_key_error(e: CatalogError) -> SqlSurfaceError {
 /// （の `AlterCheckError::Catalog` 内側）／`Storage::alter_table_add_foreign_key`
 /// の [`CatalogError`] を SQL 表層の契約へ写像する（設計 D4・F5、Issue #1067・
 /// #1068・#1069）。ERR-6 の既存行のみを使い、新しい `wire_code` は追加しない——
-/// 制約名衝突は索引名衝突と同じ `42P07`（[`SqlSurfaceError::DuplicateTable`] を
-/// 流用）、未検出は `DROP INDEX` と同じ `42704`
+/// `ADD UNIQUE`・`DROP CONSTRAINT` 経路の制約名衝突は索引名衝突と同じ `42P07`
+/// （[`SqlSurfaceError::DuplicateTable`] を流用。CHECK・FOREIGN KEY 経路は
+/// `map_add_check_or_foreign_key_error` が先に `42710` へ写像する）、未検出は `DROP INDEX` と同じ `42704`
 /// （[`SqlSurfaceError::UndefinedObject`]）、`FOREIGN KEY` の宣言不正は `42830`
 /// （[`SqlSurfaceError::invalid_foreign_key`]。`execute_create_table` と同じ
 /// 写像）、既存行違反は `23503`（[`SqlSurfaceError::ForeignKeyViolation`]。

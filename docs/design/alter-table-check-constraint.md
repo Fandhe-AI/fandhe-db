@@ -53,8 +53,8 @@ PK は名前を持たない。FOREIGN KEY は当初（本 Issue 実装時点）�
 `docs/design/alter-table-foreign-key-constraint.md` D2 参照）。
 
 - 明示名の衝突（既存 UNIQUE 名・CHECK 名・FOREIGN KEY 名）→
-  `CatalogError::ConstraintAlreadyExists` → `42710`（Issue #1195。`ADD UNIQUE` は `42P07`）（
-  `ADD FOREIGN KEY` は CHECK と同じ）。`validate_schema` より前に判定する。
+  `CatalogError::ConstraintAlreadyExists` → `42710`（Issue #1195。`ADD FOREIGN KEY` も同じ。`ADD UNIQUE` のみ
+  `42P07`）。`validate_schema` より前に判定する。
 - 名前省略時の既定名: `CREATE TABLE` の表制約と同じ `<table>_check`
   （`sql::check_constraint::default_check_name(table, None)`）。衝突解決は
   `resolve_unique_name`（＝ `catalog::resolve_constraint_name`、接頭辞
