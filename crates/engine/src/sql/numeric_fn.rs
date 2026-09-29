@@ -11,7 +11,8 @@
 //! fail-closed の方針（`.claude/rules/security.md`「不安全な設計」）: 0 除算・
 //! 未定義（`0^負数`・負数の非整数乗）・非有限値の生成は黙って丸めず `Err` で
 //! 拒否する。オーバーフロー・アンダーフローは `SqlSurfaceError::numeric_out_of_range`
-//! （`22003`）、それ以外の不正入力（非整数の丸め桁数・0 除算・sqrt の負数等）は
+//! （`22003`）、0 除算は `SqlSurfaceError::division_by_zero`（`22012`、Issue #1163）、
+//! それ以外の不正入力（非整数の丸め桁数・sqrt の負数等）は
 //! `SqlSurfaceError::invalid_input`（`22000`）に写像する。
 
 use crate::sql::allowlist::SqlSurfaceError;
@@ -193,12 +194,11 @@ pub(crate) fn ceil(x: f64) -> Result<f64, SqlSurfaceError> {
 }
 
 /// `mod(x: Scalar, y: Scalar) -> Scalar`（剰余。符号は被除数 `x` に従う。`f64` の
-/// `%` 演算子と同じ意味論）。除数 0 は `22000`（既存の `/` 演算子の前例に揃える。
-/// PostgreSQL の `MOD(x, 0)` 相当の `22012`〔division_by_zero〕への分離は後続
-/// 課題とする）。
+/// `%` 演算子と同じ意味論）。除数 0 は `22012`（division_by_zero。
+/// 既存の `/` 演算子と同じ分類。Issue #1163）。
 pub(crate) fn modulo(x: f64, y: f64) -> Result<f64, SqlSurfaceError> {
     if y == 0.0 {
-        return Err(SqlSurfaceError::invalid_input("mod: division by zero"));
+        return Err(SqlSurfaceError::division_by_zero("mod"));
     }
     finite_result(x % y, "mod")
 }
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn modulo_by_zero_is_rejected_fail_closed() {
         let err = modulo(1.0, 0.0).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22012");
     }
 
     #[test]

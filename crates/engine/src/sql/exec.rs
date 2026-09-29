@@ -379,6 +379,9 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         // として `22000` へ写像する（`sql::parser::bind_in_session` の他の
         // `InvalidInput` と同じ分類）。
         ArenaError::InvalidInput(detail) => SqlSurfaceError::invalid_input(detail),
+        // Issue #1163: 0 除算は `22012`、算術あふれは `22003` を往復で保つ。
+        ArenaError::DivisionByZero(detail) => SqlSurfaceError::division_by_zero(detail),
+        ArenaError::NumericOutOfRange(detail) => SqlSurfaceError::numeric_out_of_range(detail),
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
         | ArenaError::InvalidDim
@@ -392,7 +395,7 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
 /// `sql::udf_call::eval` が返す [`SqlSurfaceError`] を、`on_visible_row`（行フック。
 /// 戻り値が [`ArenaError`] に固定されている）から返せる形へ写像する（TASK-79・
 /// SQL-9）。`map_arena_error` がこの逆写像（`ArenaError` → `SqlSurfaceError`）を
-/// 呼び出し元で行い、`22000`／`54000` の wire_code を保つ（`arena.rs` は sql 表層の
+/// 呼び出し元で行い、`22000`／`22003`／`22012`／`54000` の wire_code を保つ（`arena.rs` は sql 表層の
 /// 型に依存しないため、両関数の対で往復させる）。
 fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
     match e {
@@ -401,6 +404,8 @@ fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
             ArenaError::CapacityExceeded
         }
         SqlSurfaceError::InvalidInput { detail } => ArenaError::InvalidInput(detail),
+        SqlSurfaceError::DivisionByZero { detail } => ArenaError::DivisionByZero(detail),
+        SqlSurfaceError::NumericOutOfRange { detail } => ArenaError::NumericOutOfRange(detail),
         other => ArenaError::Storage(StorageError::Codec(other.to_string())),
     }
 }

@@ -402,8 +402,8 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - 同一テナント内の `id` 重複は `23505`（他テナントの同 `id` とは衝突せず、
   応答は「不在時」と同一——TABLE-12・RLS-9）
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
-  `rows.len()` を INDEX-4 の件数上限相当として判定。環境変数
-  `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
+  `rows.len()` を INDEX-4 の件数上限相当として判定。起動時 CLI
+  `--batch-max-files`〔優先〕または環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
 - 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
   各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
   積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
@@ -543,7 +543,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
 | `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
 | `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`） |
-| `drop_column`（`alter_table`） | △ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線のため常に `0A000` |
+| `drop_column`（`alter_table`） | ○ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線（Issue #1167。エラー契約は SQL 表層と同一）。`add_column` と排他必須 |
 
 成功応答は 3 op 共通で `{"ok":true}`（行数・件数を返さない）。
 
@@ -821,7 +821,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
   NoSQL 側の対応は NOSQL-14 の担当）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `ORDER BY`／`LIMIT` の付与
-- `ALTER TABLE ... DROP COLUMN`（SQL 表層が未結線。`alter_table.drop_column` は `0A000`）
+- `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
 - `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
 - `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
 - `FOREIGN KEY` の `MATCH {SIMPLE|FULL}`／`[NOT] DEFERRABLE`／
@@ -916,14 +916,15 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-16 分類が共有する）。
+22 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
-| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー |
+| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
+| `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | ENUM 列の語彙外ラベル（`insert`／`update`／`filter`） |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `insert` の `operation_id` 欠落 |
