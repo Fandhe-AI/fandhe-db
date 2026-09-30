@@ -608,6 +608,10 @@ struct Run {
     expect: Expect,
     base: Obs,
     flood: Obs,
+    /// 実行前の閲覧側（自テナント）の物理状態（baseline／flooded の各テンプレート）。
+    /// エラー応答時の副作用ゼロ（T1）の比較基準。
+    base_own_before: Snapshot,
+    flood_own_before: Snapshot,
     base_own_after: Snapshot,
     flood_own_after: Snapshot,
     foreign_before: Snapshot,
@@ -686,6 +690,8 @@ fn report() -> &'static Vec<Run> {
             let _g2 = CleanupGuard(flood_tpl.clone());
             let flood_pre = physical_snapshot(&flood_tpl);
             let foreign_before = split_by_tenant(&flood_pre, viewer, false);
+            let base_own_before = split_by_tenant(&physical_snapshot(&base_tpl), viewer, true);
+            let flood_own_before = split_by_tenant(&flood_pre, viewer, true);
             for allow_private in [true, false] {
                 for (idx, shape) in shapes.iter().enumerate() {
                     let (base, base_snap, base_leaks) =
@@ -700,6 +706,8 @@ fn report() -> &'static Vec<Run> {
                         expect: shape.expect,
                         base,
                         flood,
+                        base_own_before: base_own_before.clone(),
+                        flood_own_before: flood_own_before.clone(),
                         base_own_after: split_by_tenant(&base_snap, viewer, true),
                         flood_own_after: split_by_tenant(&flood_snap, viewer, true),
                         foreign_before: foreign_before.clone(),
@@ -879,6 +887,21 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                     "{which}: own docs rows remain after TRUNCATE: {}",
                     label(r)
                 );
+            }
+        }
+        // エラー応答（制約違反・構文エラー等）は副作用ゼロ: 自テナントの物理状態が
+        // 実行前と一致する（baseline・flooded の両方。他テナントは T3 が検査する）。
+        for (which, obs, before, after) in [
+            ("baseline", &r.base, &r.base_own_before, &r.base_own_after),
+            ("flooded", &r.flood, &r.flood_own_before, &r.flood_own_after),
+        ] {
+            if matches!(obs, Obs::Err { .. }) {
+                check_unchanged(before, after).unwrap_or_else(|e| {
+                    panic!(
+                        "{which}: own state changed by a failed statement ({e}): {}",
+                        label(r)
+                    )
+                });
             }
         }
         assert_eq!(r.readback_leaks, 0, "foreign token leaked: {}", label(r));
