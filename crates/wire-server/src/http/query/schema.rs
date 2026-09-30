@@ -121,6 +121,11 @@ pub enum FieldType {
     /// 単一フィールドが複数種別を許容する契約であることを型で表す）。
     Scalar,
     Array(ElementType),
+    /// 単一の文字列、または要素型付き配列のいずれか（Issue #1198・NOSQL-16 (b)。
+    /// `aggregate.group_by` の単一文字列形〔`"lang"`〕と配列形〔`["lang"]`〕の
+    /// 後方互換受理向け。文字列形は要素型が [`ElementType::String`] のときのみ
+    /// 受理する）。読み出しは [`Validated::optional_string_or_array`]。
+    StringOrArray(ElementType),
     /// 値が [`ObjectSchema`] に従うオブジェクトであることを再帰検証する。
     Object(&'static ObjectSchema),
     /// 値が JSON オブジェクトであることのみを検証する（固定フィールド集合を
@@ -169,6 +174,13 @@ fn check_field_type(
             Ok(())
         }
         (FieldType::Array(elem_ty), JsonValue::Array(items)) => {
+            for item in items {
+                check_element_type(item, elem_ty, key)?;
+            }
+            Ok(())
+        }
+        (FieldType::StringOrArray(ElementType::String), JsonValue::String(_)) => Ok(()),
+        (FieldType::StringOrArray(elem_ty), JsonValue::Array(items)) => {
             for item in items {
                 check_element_type(item, elem_ty, key)?;
             }
@@ -248,6 +260,15 @@ impl ObjectSchema {
 
         Ok(Validated { map, schema: self })
     }
+}
+
+/// [`FieldType::StringOrArray`] フィールドの値（Issue #1198）。
+#[derive(Debug, Clone, Copy)]
+pub enum StringOrArray<'a> {
+    /// 単一文字列形。
+    Single(&'a str),
+    /// 配列形（要素の型は [`ObjectSchema::validate`] が検査済み）。
+    Many(&'a [JsonValue]),
 }
 
 /// [`ObjectSchema::validate`] を通過したオブジェクトへの型付きアクセサ。
@@ -401,6 +422,27 @@ impl<'a> Validated<'a> {
         }
     }
 
+    /// `FieldType::StringOrArray` フィールドを読む（Issue #1198・NOSQL-16 (b)）。
+    /// 他アクセサと同じく spec 型を再検査する（多層防御）。
+    pub fn optional_string_or_array(
+        &self,
+        key: &'static str,
+    ) -> Result<Option<StringOrArray<'a>>, SchemaError> {
+        let Some(spec) = self.field_spec(key) else {
+            return Err(SchemaError::UnknownKey);
+        };
+        if !matches!(spec.ty, FieldType::StringOrArray(_)) {
+            return Err(SchemaError::TypeMismatch { key });
+        }
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(JsonValue::Null) if spec.nullable => Ok(None),
+            Some(JsonValue::String(s)) => Ok(Some(StringOrArray::Single(s.as_str()))),
+            Some(JsonValue::Array(items)) => Ok(Some(StringOrArray::Many(items.as_slice()))),
+            _ => Err(SchemaError::TypeMismatch { key }),
+        }
+    }
+
     pub fn required_object(
         &self,
         key: &'static str,
@@ -440,6 +482,36 @@ pub static HYBRID_SCHEMA: ObjectSchema = ObjectSchema {
         ty: FieldType::String,
         nullable: false,
     }],
+};
+
+/// `create_table` の CHECK 述語の葉（`{column, op, value}`）のサブスキーマ
+/// （Issue #1199・NOSQL-13。[`super::ddl`] 専用）。`filter` 配列の形検証は
+/// `http::query::filter` へ集約済み（Issue #1197）のため、CHECK の葉だけが
+/// 本スキーマで形を検査する。
+pub static CHECK_LEAF_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "check_leaf",
+    fields: &[
+        FieldSpec {
+            key: "column",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "value",
+            presence: Presence::Required,
+            // 列型ごとの意味検証は [`super::ddl`] が担うため、形の検証段階では
+            // 文字列・数値・真偽値のいずれも受理する（`null` は不可）。
+            ty: FieldType::Scalar,
+            nullable: false,
+        },
+    ],
 };
 
 /// `aggregates` 配列要素のサブスキーマ（`aggregate` op）。
@@ -492,7 +564,7 @@ pub static HAVING_ITEM_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
-/// `sort` 配列要素のサブスキーマ（`scan` op。Issue #946・NOSQL-15・SQL-25
+/// `sort` 配列要素のサブスキーマ（`scan`・`aggregate` op。Issue #946・NOSQL-15・SQL-25
 /// (a)・TASK-224）。`dir` は語彙・大文字小文字を型検査段では見ず
 /// （`"asc"`／`"desc"` 以外・大文字混じりの拒否は [`super::scan::build_sort`]
 /// が `42601` へ写像する）、値が文字列であることのみ検査する。
@@ -595,8 +667,8 @@ pub static SEARCH_SCHEMA: ObjectSchema = ObjectSchema {
 /// （Issue #946・NOSQL-15・SQL-25 (a)・TASK-224）は末尾に追加した独立
 /// フィールドで、要素の語彙検査・列名解決・上限判定は
 /// [`super::scan::build_sort`] が担う（本モジュールは形のみ検査する）。
-/// `aggregate` op には対応する受理形が無いため `offset`／`sort` いずれも
-/// 宣言しない（`super::scan` モジュール doc の対象外注記を参照）。
+/// `aggregate` op の `offset`／`sort` は [`AGGREGATE_SCHEMA`] が別途宣言する
+/// （Issue #1198。`group_by` 必須。`super::aggregate` 参照）。
 pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
     name: "scan",
     fields: &[
@@ -653,10 +725,9 @@ pub static SCAN_SCHEMA: ObjectSchema = ObjectSchema {
 
 /// `aggregate` op のトップレベルスキーマ（NOSQL-4〜NOSQL-7 ポインタ）。
 /// `group_by`／`having` の意味検証（語彙・列名解決・上限判定）は
-/// [`super::aggregate`]（#769）が担う。`sort` は本スキーマに宣言しないため
-/// 未知キー `42601` で拒否される（Issue #946 のスコープ外。engine の集計
-/// `ORDER BY` を SQL-25 (a) 相当へ揃える先行作業が必要——`nosql-api.md`
-/// 「spec 側への申し送り候補」参照）。
+/// [`super::aggregate`]（#769）が担う。`group_by` は単一文字列形と配列形の
+/// 両方を受理し（Issue #1198・NOSQL-16 (b)）、`sort`／`offset`（Issue #1198・
+/// NOSQL-15。`group_by` 必須）は形のみをここで検査する。
 pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
     name: "aggregate",
     fields: &[
@@ -687,7 +758,7 @@ pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
         FieldSpec {
             key: "group_by",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::String),
+            ty: FieldType::StringOrArray(ElementType::String),
             nullable: false,
         },
         FieldSpec {
@@ -700,6 +771,18 @@ pub static AGGREGATE_SCHEMA: ObjectSchema = ObjectSchema {
             key: "explain",
             presence: Presence::Optional,
             ty: FieldType::Bool,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "offset",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "sort",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::Object(&SORT_ITEM_SCHEMA)),
             nullable: false,
         },
     ],
@@ -963,12 +1046,12 @@ pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: false,
         },
-        // `kind == "check"` 専用。`FILTER_ITEM_SCHEMA` の葉形の配列（要素同士は
+        // `kind == "check"` 専用。`CHECK_LEAF_SCHEMA` 形の葉の配列（要素同士は
         // AND 結合）。
         FieldSpec {
             key: "predicate",
             presence: Presence::Optional,
-            ty: FieldType::Array(ElementType::Object(&FILTER_ITEM_SCHEMA)),
+            ty: FieldType::Array(ElementType::Object(&CHECK_LEAF_SCHEMA)),
             nullable: false,
         },
     ],
@@ -1285,20 +1368,41 @@ mod tests {
     /// 付与すると未知キーとして `42601` へ落ちる（NOSQL-15 のスコープ注記。
     /// `super::scan` モジュール doc の「対象は scan のみ」判断を固定する）。
     #[test]
-    fn offset_is_unknown_key_for_search_and_aggregate() {
+    fn offset_is_unknown_key_for_search() {
         let search_v =
             obj(r#"{"op":"search","table":"docs","limit":10,"vector":[0.1],"offset":5}"#);
         assert_eq!(
             SEARCH_SCHEMA.validate(&search_v).unwrap_err(),
             SchemaError::UnknownKey
         );
+    }
 
-        let aggregate_v = obj(r#"{"op":"aggregate","table":"docs",
-               "aggregates":[{"fn":"count","column":"id"}],"offset":5}"#);
-        assert_eq!(
-            AGGREGATE_SCHEMA.validate(&aggregate_v).unwrap_err(),
-            SchemaError::UnknownKey
-        );
+    /// `aggregate` は `offset`／`sort` と文字列形 `group_by` を型検査段で通す
+    /// （Issue #1198・NOSQL-15・NOSQL-16 (b)。意味検証は `super::aggregate`）。
+    #[test]
+    fn aggregate_accepts_offset_sort_and_string_group_by() {
+        let v = obj(r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"*"}],
+               "group_by":"lang","offset":5,
+               "sort":[{"column":"count","dir":"desc"}]}"#);
+        assert!(AGGREGATE_SCHEMA.validate(&v).is_ok());
+    }
+
+    #[test]
+    fn aggregate_group_by_rejects_non_string_shapes() {
+        for gb in ["1", "{}", "null", r#"["a",1]"#, r#"[["a"]]"#, "true"] {
+            let v = obj(&format!(
+                r#"{{"op":"aggregate","table":"docs",
+                   "aggregates":[{{"fn":"count","column":"*"}}],"group_by":{gb}}}"#
+            ));
+            assert!(
+                matches!(
+                    AGGREGATE_SCHEMA.validate(&v).unwrap_err(),
+                    SchemaError::TypeMismatch { key: "group_by" }
+                ),
+                "group_by={gb}"
+            );
+        }
     }
 
     #[test]

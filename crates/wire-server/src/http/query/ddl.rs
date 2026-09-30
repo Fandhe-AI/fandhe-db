@@ -52,7 +52,7 @@
 //! 書き込み時の検査（違反は `23514`）は engine 側の単一の実装が担い、wire 側に
 //! 型検査・評価器を持たない。
 //!
-//! - `predicate` の葉は `FILTER_ITEM_SCHEMA` 形（`column`／`op`／`value`）で、
+//! - `predicate` の葉は `CHECK_LEAF_SCHEMA` 形（`column`／`op`／`value`）で、
 //!   `op` は `eq`／`prefix`／`lt`／`le`(`lte`)／`gt`／`ge`(`gte`) のみ。`in`・`or`
 //!   グループは engine も CHECK 内で拒否するため wire で先に `42601` とする。
 //! - CREATE TABLE 時点ではスキーマが無いため、値トークンの種類は JSON 値の型で
@@ -97,8 +97,8 @@ use crate::http::session::middleware::SessionPrincipal;
 use super::filter::{is_rls_predicate_column, like_escape};
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{
-    SchemaError, Validated, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA, DDL_CONSTRAINT_SCHEMA,
-    DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA, FILTER_ITEM_SCHEMA,
+    SchemaError, Validated, CHECK_LEAF_SCHEMA, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA,
+    DDL_CONSTRAINT_SCHEMA, DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
 };
 
 /// 旧 `create_table` の CHECK 未実装応答文言。Issue #1199 で CHECK を実装した
@@ -399,7 +399,7 @@ fn check_compare_op_token(op: &str) -> Result<Token, DdlError> {
 /// CHECK 述語の葉 1 件（`{column, op, value}`）をトークン列へ写像する
 /// （[`build_check_tokens`] 専用。モジュール doc「CHECK」節参照）。
 fn check_leaf_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
-    let v = FILTER_ITEM_SCHEMA.validate(item).map_err(DdlError::from)?;
+    let v = CHECK_LEAF_SCHEMA.validate(item).map_err(DdlError::from)?;
     let column = v.required_str("column").map_err(DdlError::from)?;
     let op = v.required_str("op").map_err(DdlError::from)?;
     let value = v.required_scalar("value").map_err(DdlError::from)?;

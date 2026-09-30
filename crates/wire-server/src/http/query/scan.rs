@@ -30,9 +30,9 @@
 //! 決定的な順序（SQL 表層のスカラー `ORDER BY` と同一の並び・NULL 位置・
 //! 同点解決規約）になる。省略時は従来どおり順序保証がない（NOSQL-3・
 //! SQL-15）。`search` の距離順位付けとの相互排他は [`super::schema::
-//! SEARCH_SCHEMA`] が `sort` を宣言しないことで、`aggregate` への `sort` も
-//! 同様に [`super::schema::AGGREGATE_SCHEMA`] が宣言しないことで、いずれも
-//! スキーマの未知キー一般則（`42601`）だけで成立する。[`build_sort`] が
+//! SEARCH_SCHEMA`] が `sort` を宣言しないことで、スキーマの未知キー一般則
+//! （`42601`）だけで成立する（`aggregate` の `sort` は Issue #1198 で別途
+//! 受理）。[`build_sort`] が
 //! JSON `sort[].dir`（`"asc"`／`"desc"`）の語彙検査・識別子形状検査を行い、
 //! [`engine::sql::parser::BoundScan::with_order_by`]（engine と SQL 表層の
 //! `ORDER BY` 束縛を共有する入口）へ列名解決・上限判定・型検査（未知列・
@@ -60,10 +60,9 @@
 //! `docs/design/sql-offset-paging.md` の「`ORDER BY` なし `OFFSET` の
 //! 意味論」節を参照）。`sort` 指定時は `ORDER BY` 適用後の順序に対して
 //! `offset` が適用される（[`BoundScan::with_order_by`] を先に適用し、続けて
-//! [`BoundScan::with_offset`] を適用する束縛順序に対応）。`aggregate` op には
-//! 対応する受理形が engine 側に無いため（`limit` 相当のキーも
-//! `BoundAggregate` の offset setter も存在しない）対象外とする（NOSQL-15 の
-//! aggregate 部分は未対応）。
+//! [`BoundScan::with_offset`] を適用する束縛順序に対応）。`aggregate` op の
+//! `sort`／`offset` は `super::aggregate`（Issue #1198）が担い、`sort` の要素
+//! パースのみ [`parse_sort_items`] を共有する。
 
 use std::time::SystemTime;
 
@@ -261,6 +260,14 @@ fn build_sort(validated: &Validated<'_>) -> Result<Vec<ScalarOrderKey>, ScanErro
     let Some(items) = validated.optional_array("sort")? else {
         return Ok(Vec::new());
     };
+    parse_sort_items(items)
+}
+
+/// `sort` 配列の要素列を [`ScalarOrderKey`] 列へ写像する共有実装（[`build_sort`]
+/// と `super::aggregate::bind`〔Issue #1198・NOSQL-15。`aggregate` の `sort`〕が
+/// 共有し、語彙検査・識別子形状検査・確保量の上限を二重実装しない）。
+/// 失敗は [`ScanError::InvalidSort`]／[`ScanError::InvalidIdentifier`] のみ。
+pub(super) fn parse_sort_items(items: &[JsonValue]) -> Result<Vec<ScalarOrderKey>, ScanError> {
     if items.is_empty() {
         return Err(ScanError::InvalidSort);
     }
