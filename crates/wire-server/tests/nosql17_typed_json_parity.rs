@@ -367,6 +367,130 @@ fn nosql_insert_and_sql_insert_yield_identical_scan() {
     assert_eq!(body_utf8(&a), body_utf8(&b));
 }
 
+/// 数値・日時・UUID 要素の配列列（`integer[]`・`bigint[]`・`double precision[]`・
+/// `date[]`・`timestamp[]`・`uuid[]`）も HTTP `insert`→`scan` が SQL `INSERT`→
+/// `SELECT` とバイト一致する。要素の NULL・空配列・列ごとの `null` を含む。
+#[test]
+fn numeric_temporal_uuid_element_arrays_round_trip_matches_sql() {
+    const ARR_NOSQL: &str = "arr_nosql";
+    const ARR_SQL: &str = "arr_sql";
+    let arr = |elem| ColumnType::Array(ArrayType::new(elem, 4).expect("array type"));
+    let arr_schema = |name: &str| {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("ints", arr(ArrayElemType::Integer), true),
+                ColumnDef::new("bigs", arr(ArrayElemType::BigInt), true),
+                ColumnDef::new("dbls", arr(ArrayElemType::Double), true),
+                ColumnDef::new("days", arr(ArrayElemType::Date), true),
+                ColumnDef::new("ats", arr(ArrayElemType::Timestamp), true),
+                ColumnDef::new("uids", arr(ArrayElemType::Uuid), true),
+            ],
+        )
+    };
+    let path = temp_db::unique_db_path("nosql17-typed-json-arrays");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    for t in [ARR_NOSQL, ARR_SQL] {
+        storage.create_table(&arr_schema(t)).expect("create table");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+
+    // (id, NoSQL 行断片, SQL 列リスト, SQL VALUES 断片)。行 3 は全配列列を `null`
+    // にし、SQL 側は列リスト・VALUES を空にして省略で表す。
+    let rows: [(u64, &str, &str, &str); 3] = [
+        (
+            1,
+            r#""ints":[1,-2,null,2147483647],"bigs":[1234567890123],"dbls":[0.5,-1.25],"days":["2024-02-29",null],"ats":["2024-02-29 12:34:56.5"],"uids":["ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB"]"#,
+            "ints, bigs, dbls, days, ats, uids",
+            "'{1,-2,NULL,2147483647}', '{1234567890123}', '{0.5,-1.25}', \
+             '{2024-02-29,NULL}', '{\"2024-02-29 12:34:56.5\"}', \
+             '{ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB}'",
+        ),
+        (
+            2,
+            r#""ints":[],"bigs":[],"dbls":[],"days":[],"ats":[],"uids":[]"#,
+            "ints, bigs, dbls, days, ats, uids",
+            "'{}', '{}', '{}', '{}', '{}', '{}'",
+        ),
+        (
+            3,
+            r#""ints":null,"bigs":null,"dbls":null,"days":null,"ats":null,"uids":null"#,
+            "",
+            "",
+        ),
+    ];
+    for (id, json, sql_cols, sql_vals) in rows {
+        let body = format!(
+            r#"{{"op":"insert","table":"{ARR_NOSQL}","rows":[{{"id":{id},"embedding":[0.5,0.25],{json}}}],"operation_id":"arr-nosql-{id}"}}"#
+        );
+        let resp = alice(addr, &body);
+        assert_eq!(resp.status, 200, "array insert must succeed: {resp:?}");
+        // SQL 表層は `NULL` リテラルを受け付けないため、行 3 は配列列を
+        // 列リストから省略して NULL を表す（`SEED` 行 4 と同じ方針）。
+        let sql = if sql_cols.is_empty() {
+            format!(
+                "INSERT INTO {ARR_SQL} (id, embedding) VALUES ({id}, '[0.5,0.25]') \
+                 USING OPERATION_ID 'arr-sql-{id}'"
+            )
+        } else {
+            format!(
+                "INSERT INTO {ARR_SQL} (id, embedding, {sql_cols}) VALUES \
+                 ({id}, '[0.5,0.25]', {sql_vals}) USING OPERATION_ID 'arr-sql-{id}'"
+            )
+        };
+        sql_exec(&core, "tenant-a", &sql);
+    }
+
+    let scan = |t: &str| {
+        format!(
+            r#"{{"op":"scan","table":"{t}","columns":["id","ints","bigs","dbls","days","ats","uids"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+        )
+    };
+    let resp = alice(addr, &scan(ARR_NOSQL));
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let body = body_utf8(&resp);
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        &format!(
+            "SELECT id, ints, bigs, dbls, days, ats, uids FROM {ARR_NOSQL} \
+             ORDER BY id ASC LIMIT 100"
+        ),
+    );
+    assert_eq!(body, oracle, "HTTP scan vs SQL SELECT (NoSQL-inserted)");
+    let resp_sql_table = alice(addr, &scan(ARR_SQL));
+    assert_eq!(
+        body_utf8(&resp_sql_table),
+        body,
+        "NoSQL-inserted vs SQL-inserted table"
+    );
+    for needle in [
+        r#""type":"integer[]""#,
+        r#""type":"bigint[]""#,
+        r#""type":"double precision[]""#,
+        r#""type":"date[]""#,
+        r#""type":"timestamp[]""#,
+        r#""type":"uuid[]""#,
+        "[1,-2,null,2147483647]",
+        "[1234567890123]",
+        "[0.5,-1.25]",
+        r#"["2024-02-29",null]"#,
+        r#"["2024-02-29 12:34:56.5"]"#,
+        // UUID 要素も小文字へ正規化される
+        r#"["abcdefab-cdef-abcd-efab-cdefabcdefab"]"#,
+        "[],[],[],[],[],[]",
+        "null,null,null,null,null,null",
+    ] {
+        assert!(body.contains(needle), "missing {needle}: {body}");
+    }
+}
+
 // ------------------------------------------------------------ aggregate
 
 #[test]
@@ -383,8 +507,9 @@ fn numeric_all_functions_match_sql() {
         "",
         "SELECT COUNT(amount), SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM {T}",
     );
-    // NULL 行は COUNT から除外される（4 行中 3 行）。
+    // NULL 行は COUNT から除外される（4 行中 3 行）。SUM は 10.5 + 2.25 + 7。
     assert!(body.contains("[[3,"), "{body}");
+    assert!(body.contains("19.75"), "{body}");
 }
 
 #[test]
@@ -462,36 +587,51 @@ fn filter_eq_on_new_type_lanes_matches_sql_where() {
     let addr = spawn(Arc::clone(&core));
     seed_both(&core, addr);
     let aggs = r#"{"fn":"count","column":"*"},{"fn":"sum","column":"amount"}"#;
-    let cases: [(&str, &str); 6] = [
-        (r#"{"column":"flag","op":"eq","value":true}"#, "flag = TRUE"),
+    // 3 要素目は期待一致件数。両表層がともに 0 件へ落ちる「空の一致」で
+    // パリティが自明に成立するのを防ぐ（各レーンが実際に行を選ぶことを固定）。
+    let cases: [(&str, &str, u32); 6] = [
+        (
+            r#"{"column":"flag","op":"eq","value":true}"#,
+            "flag = TRUE",
+            2,
+        ),
         (
             r#"{"column":"day","op":"eq","value":"2024-02-29"}"#,
             "day = '2024-02-29'",
+            1,
         ),
         (
             r#"{"column":"ext","op":"eq","value":"12345678-9ABC-DEF0-1234-56789ABCDEF0"}"#,
             "ext = '12345678-9abc-def0-1234-56789abcdef0'",
+            1,
         ),
         (
             r#"{"column":"amount","op":"eq","value":7}"#,
             "amount = '7.00'",
+            1,
         ),
         (
             r#"{"column":"amount","op":"eq","value":"2.25"}"#,
             "amount = '2.25'",
+            1,
         ),
         (
             r#"{"column":"at","op":"eq","value":"2023-01-01 00:00:00"}"#,
             "at = '2023-01-01 00:00:00'",
+            1,
         ),
     ];
-    for (filter, where_sql) in cases {
-        assert_aggregate_parity(
+    for (filter, where_sql, expected) in cases {
+        let body = assert_aggregate_parity(
             &core,
             addr,
             aggs,
             &format!(r#","filter":[{filter}]"#),
             &format!("SELECT COUNT(*), SUM(amount) FROM {{T}} WHERE {where_sql}"),
+        );
+        assert!(
+            body.contains(&format!("[[{expected},")),
+            "{filter}: expected {expected} matching rows: {body}"
         );
     }
 }
@@ -501,13 +641,18 @@ fn having_count_on_group_matches_sql() {
     let (core, _g) = new_core();
     let addr = spawn(Arc::clone(&core));
     seed_both(&core, addr);
-    assert_aggregate_parity(
+    // `ja` は amount 非 NULL が 2 行、`en` は行 4 が NULL のため 1 行。
+    // `COUNT(amount) >= 2` は `ja` だけを残し、HAVING が実際に効くことを固定する
+    // （`COUNT(*)` だと両グループ 2 行で HAVING 無しと区別できない）。
+    let body = assert_aggregate_parity(
         &core,
         addr,
-        r#"{"fn":"count","column":"*"}"#,
-        r#","group_by":["lang"],"having":[{"fn":"count","column":"*","op":">=","value":2}]"#,
-        "SELECT lang, COUNT(*) FROM {T} GROUP BY lang HAVING count >= 2",
+        r#"{"fn":"count","column":"amount"}"#,
+        r#","group_by":["lang"],"having":[{"fn":"count","column":"amount","op":">=","value":2}]"#,
+        "SELECT lang, COUNT(amount) FROM {T} GROUP BY lang HAVING count >= 2",
     );
+    assert!(body.contains(r#"["ja",2]"#), "{body}");
+    assert!(!body.contains(r#""en""#), "{body}");
 }
 
 #[test]

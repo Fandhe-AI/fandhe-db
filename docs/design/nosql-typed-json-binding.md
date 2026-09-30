@@ -96,7 +96,7 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 ## テスト
 
 - 層 A: `crates/wire-server/src/http/query/typed_json.rs`（単体）・`insert.rs`／`update.rs` の `mod tests`（新型の bind・end-to-end 実行・`operation_id` 契約）・`crates/wire-server/src/http/query/filter.rs`（型別レーン単体）・`crates/wire-server/src/http/query/response.rs`（`nosql_type_name`・`BIGINT` の閾値）。
-- 層 A（Issue #1203）: `crates/wire-server/tests/nosql17_typed_json_parity.rs`（NUMERIC/BOOLEAN/DATE/TIMESTAMP/UUID/ARRAY の HTTP `insert`→`scan` 往復と `aggregate`〔COUNT/SUM/AVG/MIN/MAX・`group_by`・`having`・`filter`〕が SQL 表層とバイト一致することを固定。RLS 境界・拒否契約〔`wire_code`・副作用ゼロ・エラー本文へ値を echo しない〕を含む）。
+- 層 A（Issue #1203）: `crates/wire-server/tests/nosql17_typed_json_parity.rs`（NUMERIC/BOOLEAN/DATE/TIMESTAMP/UUID/ARRAY〔text・boolean・integer・bigint・double precision・date・timestamp・uuid 要素〕の HTTP `insert`→`scan` 往復と `aggregate`〔COUNT/SUM/AVG/MIN/MAX・`group_by`・`having`・`filter`〕が SQL 表層とバイト一致することを固定。RLS 境界・拒否契約〔`wire_code`・副作用ゼロ・エラー本文へ値を echo しない〕を含む）。
 - 層 A（既存の反転）: `wire_integer_bigint_column.rs`・`wire_float_columns.rs`（旧 `22000` 拒否テストを成功＋SQL 表層との読み戻しパリティへ反転）・`wire_json_column.rs`（非 nullable 列 `null` の拒否コード変更を反映）・`nosql11_response_schema.rs`（SQL wire OID と NoSQL 型名の意図的な乖離を固定）・`three_client_http_e2e.rs`（SQL/NoSQL パリティの型名比較を列名ベースの独立表へ変更。層 B・opt-in）。
 - 層 B: `crates/wire-server/tests/nosql7_filter_mapping.rs`（`search`／`scan`／`aggregate` が同一の `bind_filter` 束縛結果を共有すること・SQL 表層との一致を固定。既存）。
 
