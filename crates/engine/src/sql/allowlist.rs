@@ -528,6 +528,12 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// UPSERT の `ON CONFLICT DO UPDATE` の衝突先が、呼び出しテナントが所有するが
+    /// 可視ではない行だった（Issue #1254・RLS-10・RLS-11）。`42501`
+    /// （`ErrorClass::ForbiddenTenantMismatch` を再利用。新規分類は追加しない）。
+    /// `tenant::TenantWriteError::ConflictTargetNotVisible` の写像先で、行 id・値・
+    /// テナントを含まない固定文言のみを保持する。
+    ConflictTargetNotVisible,
     /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
     /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
@@ -866,7 +872,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
-            SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::ConflictTargetNotVisible => {
+                ErrorClass::ForbiddenTenantMismatch
+            }
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
@@ -982,6 +990,13 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
+            }
+            // id・列値・テナントを含めない固定文言（security.md P0）。
+            SqlSurfaceError::ConflictTargetNotVisible => {
+                write!(
+                    f,
+                    "permission denied: ON CONFLICT DO UPDATE target row is not visible"
+                )
             }
             // カーソル名・他セッション所有かどうかを一切含めない固定文言
             // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント

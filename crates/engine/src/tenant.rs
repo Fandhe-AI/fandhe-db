@@ -317,6 +317,12 @@ pub enum TenantWriteError {
     /// という commit 成功境界違反（codex-review P1 指摘・PR #991）を防ぐ。
     /// `XX000`（内部事象）へ写像する。
     ReturningProjectionFailed(String),
+    /// UPSERT の `ON CONFLICT DO UPDATE` の衝突先が、`ctx` が所有するが可視ではない行
+    /// だった（Issue #1254・RLS-10・RLS-11）。書き込み対象は「所有 ∩ 可視」のため
+    /// 文全体を拒否する。write トランザクションは commit せず破棄する（行・台帳とも
+    /// 痕跡ゼロ。RECOVER-11）。`42501`（`ForbiddenTenantMismatch`）へ写像し、id・値は
+    /// 含めない固定文言にする。
+    ConflictTargetNotVisible,
     /// 上記と同じ commit 前 abort 契約だが、原因が `RETURNING` 結果セットの
     /// バイト量上限超過（`sql::returning::MAX_RETURNING_RESULT_BYTES`）である
     /// 場合の専用 variant。`54000`（`PayloadTooLarge`）へ写像し、クライアントが
@@ -511,6 +517,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
         use crate::error_format::ErrorClass;
         match self {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
+            TenantWriteError::ConflictTargetNotVisible => ErrorClass::ForbiddenTenantMismatch,
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
             TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
             TenantWriteError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
@@ -551,6 +558,10 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::Forbidden => {
                 write!(f, "tenant write forbidden: not the row owner")
             }
+            TenantWriteError::ConflictTargetNotVisible => write!(
+                f,
+                "permission denied: ON CONFLICT DO UPDATE target row is not visible"
+            ),
             TenantWriteError::NotFound => write!(f, "tenant write target row not found"),
             TenantWriteError::IdConflict => write!(f, "tenant write id conflict"),
             TenantWriteError::MissingOperationId => write!(f, "missing operation_id"),
@@ -619,6 +630,7 @@ impl std::fmt::Debug for TenantWriteError {
         // （security.md テナント境界 P0）。variant 名のみを出力する。
         match self {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
+            TenantWriteError::ConflictTargetNotVisible => f.write_str("ConflictTargetNotVisible"),
             TenantWriteError::NotFound => f.write_str("NotFound"),
             TenantWriteError::IdConflict => f.write_str("IdConflict"),
             TenantWriteError::DuplicateOperationId => f.write_str("DuplicateOperationId"),
@@ -1419,8 +1431,9 @@ pub(crate) enum UpsertAction<'a> {
 /// `sql::parser::BoundConflictTarget` に対応する最小表現（`sql` に依存しない
 /// 設計を維持するため独自 enum を持つ。`sql::exec::execute_upsert` が変換する）。
 pub(crate) enum UpsertTarget<'a> {
-    /// `ON CONFLICT (id)`（既存挙動。SQL-20・TASK-193、Issue #872）。衝突判定は
-    /// `(ctx.tenant_id(), id)` の物理キー所有で行う。
+    /// `ON CONFLICT (id)`（既存挙動。SQL-20・TASK-193、Issue #872）。衝突検出は
+    /// `(ctx.tenant_id(), id)` の物理キー所有で行い、書き込み対象は所有 ∩ 可視
+    /// （Issue #1254）。
     RowId,
     /// `ON CONFLICT (<UNIQUE 制約の構成列>)`（Issue #1074）。`indices` は
     /// `schema.columns` に対する論理インデックス（解決した制約の宣言順。
@@ -1450,10 +1463,15 @@ pub(crate) struct UpsertOutcome {
 /// ## 衝突判定スコープ（TABLE-12・RLS-9。`docs/design/sql-upsert.md`「衝突判定
 /// スコープ」節参照）
 ///
-/// 物理キー `(ctx.tenant_id(), id)` の**所有**で判定する（RLS 可視性ではない）。
+/// 衝突の**検出**は物理キー `(ctx.tenant_id(), id)`（UNIQUE 対象は事前走査）の
+/// **所有**で行い、**書き込み対象**は「所有 ∩ 可視」とする（Issue #1254・RLS-10・
+/// RLS-11）。検出した既存行が不可視（ヘッダ不整合を含む）の場合、`DO NOTHING` は
+/// スキップ（件数・`project` 対象外）、`DO UPDATE` は
+/// [`TenantWriteError::ConflictTargetNotVisible`]（`42501`）で文全体を拒否して
+/// write トランザクションを abort する。判定はヘッダのみで行い不可視行の本体は読まない。
 /// [`update_row_unchecked`]／[`delete_row_impl`] と同じ二重防御
 /// （`decode_row_for_key` によるキー↔ヘッダ tenant 整合検査＋`ctx.is_owner`）を
-/// 使う。物理キーが既にテナント名前空間化されているため、他テナントの同一
+/// 使う（可視性判定はヘッダ専用デコード）。物理キーが既にテナント名前空間化されているため、他テナントの同一
 /// `id` は取得すらされず、常に「非衝突＝新規挿入」として扱われる（他テナント
 /// 行の存在で分岐するコードを一切持たない）。
 ///
@@ -1534,6 +1552,16 @@ pub(crate) fn upsert_typed_rows_capturing_unchecked(
         expected_schema,
         Some(project),
     )
+}
+
+/// UPSERT の衝突先の状態（Issue #1254）。`upsert_typed_rows_impl` の内部表現。
+enum ConflictState {
+    /// 衝突先なし（新規挿入）。
+    Absent,
+    /// 所有かつ可視。`DO UPDATE` のときのみ本体をデコードして保持する。
+    Visible(Option<crate::storage::Row>),
+    /// 所有だが不可視（またはヘッダ不整合）。
+    Invisible,
 }
 
 /// [`upsert_typed_rows_unchecked`]・[`upsert_typed_rows_capturing_unchecked`] の
@@ -1767,10 +1795,7 @@ fn upsert_typed_rows_impl(
                 UpsertTarget::RowId => None,
                 UpsertTarget::Unique(indices) => {
                     Some(crate::constraint::scan_tenant_rows_by_unique_key(
-                        &row_table,
-                        &schema,
-                        ctx.tenant_id(),
-                        indices,
+                        &row_table, &schema, ctx, indices,
                     )?)
                 }
             };
@@ -1800,64 +1825,87 @@ fn upsert_typed_rows_impl(
                             })
                     }
                 };
-                // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
-                // （`insert`）と衝突しないようにする（`update_row_unchecked` と
-                // 同じパターン）。所有権判定は `decode_row_for_key`（キー↔ヘッダ
-                // tenant 整合検査。TABLE-12）＋ `ctx.is_owner` の二重防御。
-                let existing_owned: Option<crate::storage::Row> = match conflict_id {
+                // 衝突先の 3 状態判定（Issue #1254・RLS-10・RLS-11）。衝突の**検出**は所有
+                // スコープ（物理キー `(tenant, id)`／UNIQUE 事前走査）のままとし、
+                // **書き込み対象**は「所有 ∩ 可視」に揃える。判定はヘッダのみで行い
+                // （`update_row_columns_unchecked` の判断 D と同じ設計）、不可視行の本体
+                // （値・破損状態）には触れない。ヘッダのデコード失敗・ヘッダ tenant 不一致も
+                // 「不可視」扱いとし、検出済みの衝突を新規挿入へ落として `23505` にしない。
+                // 他テナント行は物理キーの名前空間（TABLE-12）で取得すらされず、常に
+                // `Absent`（新規挿入）となる（RLS-9）。`AccessGuard` の借用は後続の
+                // `insert` と衝突しないようこのブロック内に閉じ込める。
+                let conflict_state: ConflictState = match conflict_id {
                     Some(cid) => match row_table
                         .get(&(ctx.tenant_id(), cid))
                         .map_err(CatalogError::from)?
                     {
                         Some(guard) => {
-                            let row = crate::storage::decode_row_for_key(
-                                ctx.tenant_id(),
-                                cid,
-                                guard.value(),
-                            )
-                            .map_err(TenantWriteError::Storage)?;
-                            Some(row)
+                            let raw = guard.value();
+                            match decode_row_tenant_and_visibility(raw) {
+                                Ok((row_tenant, row_visibility))
+                                    if ctx.is_owner(row_tenant)
+                                        && ctx.is_visible(row_tenant, row_visibility) =>
+                                {
+                                    match action {
+                                        // `DO UPDATE` のみ read-merge-write のため本体が要る。
+                                        // `DO NOTHING` は可視・不可視で応答差が出ないよう本体を
+                                        // 読まない。
+                                        UpsertAction::DoUpdate(_) => ConflictState::Visible(Some(
+                                            crate::storage::decode_row_for_key(
+                                                ctx.tenant_id(),
+                                                cid,
+                                                raw,
+                                            )
+                                            .map_err(TenantWriteError::Storage)?,
+                                        )),
+                                        UpsertAction::DoNothing => ConflictState::Visible(None),
+                                    }
+                                }
+                                _ => ConflictState::Invisible,
+                            }
                         }
-                        None => None,
+                        None => ConflictState::Absent,
                     },
-                    None => None,
+                    None => ConflictState::Absent,
                 };
-                let owns_existing = existing_owned
-                    .as_ref()
-                    .map(|row| ctx.is_owner(row.tenant_id.as_str()))
-                    .unwrap_or(false);
 
-                if owns_existing {
-                    // `owns_existing` が真になり得るのは `conflict_id` が `Some`
-                    // の場合のみ（`existing_owned` の構築規則）であり、以降の
-                    // 分岐は常に `Some` の中身（衝突した既存行の id）を使う。
+                if let ConflictState::Invisible = conflict_state {
+                    match action {
+                        // 不可視の衝突先はスキップ（書き込まず、件数・返却にも数えない）。
+                        UpsertAction::DoNothing => {}
+                        // 書き込み意図を黙って捨てず文全体を拒否する。`Err` で `with_txn` が
+                        // write トランザクションを drop・abort し、行・台帳とも痕跡ゼロ
+                        // （RECOVER-11）。
+                        UpsertAction::DoUpdate(_) => {
+                            return Err(TenantWriteError::ConflictTargetNotVisible);
+                        }
+                    }
+                } else if let ConflictState::Visible(existing_opt) = conflict_state {
                     let write_id = match conflict_id {
                         Some(cid) => cid,
                         None => {
                             return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                "internal: owns_existing without a conflict id".to_string(),
+                                "internal: visible conflict without a conflict id".to_string(),
                             )));
                         }
                     };
                     let key = (ctx.tenant_id(), write_id);
-                    let existing = match existing_owned {
-                        Some(row) => row,
-                        None => {
-                            // `owns_existing` は `existing_owned.is_some()` の場合に
-                            // のみ真になり得ない（`unwrap_or(false)` の契約）ため
-                            // 到達しない。untrusted 経路の添字禁止（coding-rust.md）
-                            // に従い `unwrap` の代わりに fail-closed な内部エラーで
-                            // 閉じる。
-                            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                                "internal: owns_existing without an existing row".to_string(),
-                            )));
-                        }
-                    };
                     match action {
                         UpsertAction::DoNothing => {
                             // 変更なし（新規挿入もしない）。
                         }
                         UpsertAction::DoUpdate(assignments) => {
+                            let existing = match existing_opt {
+                                Some(row) => row,
+                                None => {
+                                    // `DoUpdate` では常に本体をデコード済み。到達しない
+                                    // （添字・unwrap 禁止のため fail-closed な内部エラー）。
+                                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                        "internal: visible conflict without an existing row"
+                                            .to_string(),
+                                    )));
+                                }
+                            };
                             // read-merge-write: 既存行のスカラー列を復元し、SET 対象
                             // 列だけを新しい値で上書きする（宣言順を保持する必要は
                             // ない——最終的な行内容は適用順に依存しない一意な値へ
@@ -7822,5 +7870,282 @@ mod tests {
             Err(TenantWriteError::ReturningProjectionFailed(_))
         ));
         assert_eq!(embedding_of(&storage, &ctx_all, 1), Some(vec![1.0, 0.0]));
+    }
+
+    // ---- Issue #1254: UPSERT の衝突先判定を可視集合に揃える（RLS-10・RLS-11）----
+
+    fn seed_private_docs_row(storage: &Storage, ctx_all: &PolicyContext, id: u64, op: &str) {
+        let op = OperationId::parse(op).expect("valid operation_id");
+        insert_row(
+            storage,
+            "docs",
+            ctx_all,
+            id,
+            &RowInput {
+                tenant_id: ctx_all.tenant_id(),
+                visibility: Visibility::Private,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+            &op,
+        )
+        .expect("seed private row");
+    }
+
+    fn ctx_pair() -> (PolicyContext, PolicyContext) {
+        (
+            PolicyContext::new("tenant-a").expect("valid tenant"),
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant"),
+        )
+    }
+
+    /// 行 `id` の本体末尾を切り詰める（ヘッダは健全なまま本体デコードのみ失敗する形）。
+    fn truncate_row_body(storage: &Storage, id: u64) {
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let name = user_rows_table_name("docs");
+            let mut t = write_txn
+                .open_table(user_rows_table_def(&name))
+                .expect("open row table");
+            let key = ("tenant-a", id);
+            let existing = t
+                .get(&key)
+                .expect("get")
+                .expect("row must exist")
+                .value()
+                .to_vec();
+            let corrupted = &existing[..existing.len() - 4];
+            assert!(crate::storage::decode_row(id, corrupted).is_err());
+            t.insert(key, corrupted).expect("overwrite");
+        }
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").expect("bump generation");
+        crate::recovery::commit_boundary::commit(write_txn).expect("commit corruption");
+    }
+
+    fn run_upsert(
+        storage: &Storage,
+        ctx: &PolicyContext,
+        rows: &[(u64, &[crate::row_codec::Value])],
+        target: &UpsertTarget<'_>,
+        action: &UpsertAction<'_>,
+        op: &str,
+        projected: &mut usize,
+    ) -> Result<UpsertOutcome, TenantWriteError> {
+        let op = OperationId::parse(op).expect("valid operation_id");
+        let ledger = LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve");
+        let mut count = 0usize;
+        let mut project = |_: &CapturedRow| -> Result<(), TenantWriteError> {
+            count += 1;
+            Ok(())
+        };
+        let result = upsert_typed_rows_capturing_unchecked(
+            WriteTarget::Autocommit(storage),
+            "docs",
+            ctx,
+            Visibility::Private,
+            rows,
+            target,
+            action,
+            ledger,
+            None,
+            &mut project,
+        );
+        *projected = count;
+        result
+    }
+
+    #[test]
+    fn upsert_do_update_on_invisible_conflict_is_rejected_and_rolled_back() {
+        let path = unique_db_path("upsert-invisible-update");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let (ctx, ctx_all) = ctx_pair();
+        seed_private_docs_row(&storage, &ctx_all, 1, "seed-1254-a");
+
+        let new_values = [crate::row_codec::Value::Vector(vec![5.0, 5.0])];
+        let upd_values = [crate::row_codec::Value::Vector(vec![7.0, 7.0])];
+        // 新規行を先・不可視衝突先を後にする（先行の新規挿入も巻き戻ること）。
+        let rows: [(u64, &[crate::row_codec::Value]); 2] = [(2, &new_values), (1, &upd_values)];
+        let assignments = [(0usize, UpsertSetValue::Excluded(0))];
+        let mut n = 0;
+        let err = run_upsert(
+            &storage,
+            &ctx,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(&assignments),
+            "op-1254-upd",
+            &mut n,
+        )
+        .expect_err("invisible conflict target must be rejected");
+        assert!(matches!(err, TenantWriteError::ConflictTargetNotVisible));
+        assert_eq!(err.wire_code(), "42501");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("tenant-a") && !shown.contains('1'));
+        assert_eq!(embedding_of(&storage, &ctx_all, 1), Some(vec![1.0, 0.0]));
+        assert!(embedding_of(&storage, &ctx_all, 2).is_none());
+
+        // 同じ operation_id を可視 ctx で再送すると成功（台帳が未 commit）。
+        let mut n = 0;
+        let ok = run_upsert(
+            &storage,
+            &ctx_all,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(&assignments),
+            "op-1254-upd",
+            &mut n,
+        )
+        .expect("visible path succeeds");
+        assert_eq!(
+            ok,
+            UpsertOutcome {
+                inserted: 1,
+                updated: 1
+            }
+        );
+        assert_eq!(n, 2);
+        assert_eq!(embedding_of(&storage, &ctx_all, 1), Some(vec![7.0, 7.0]));
+    }
+
+    #[test]
+    fn upsert_do_nothing_on_invisible_conflict_skips_silently() {
+        let path = unique_db_path("upsert-invisible-nothing");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let (ctx, ctx_all) = ctx_pair();
+        seed_private_docs_row(&storage, &ctx_all, 1, "seed-1254-b");
+
+        let values = [crate::row_codec::Value::Vector(vec![7.0, 7.0])];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(1, &values)];
+        let mut n = 0;
+        let out = run_upsert(
+            &storage,
+            &ctx,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoNothing,
+            "op-1254-nothing",
+            &mut n,
+        )
+        .expect("skip");
+        assert_eq!(out, UpsertOutcome::default());
+        assert_eq!(n, 0);
+        assert_eq!(embedding_of(&storage, &ctx_all, 1), Some(vec![1.0, 0.0]));
+    }
+
+    #[test]
+    fn upsert_corrupt_body_is_not_observable_for_invisible_rows() {
+        let path = unique_db_path("upsert-invisible-corrupt");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let (ctx, ctx_all) = ctx_pair();
+        seed_private_docs_row(&storage, &ctx_all, 1, "seed-1254-c");
+        truncate_row_body(&storage, 1);
+
+        let values = [crate::row_codec::Value::Vector(vec![7.0, 7.0])];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(1, &values)];
+        let assignments = [(0usize, UpsertSetValue::Excluded(0))];
+        let mut n = 0;
+        // 不可視: 本体は読まれず、健全な不可視行と同じ応答。
+        let out = run_upsert(
+            &storage,
+            &ctx,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoNothing,
+            "op-1254-c1",
+            &mut n,
+        )
+        .expect("skip");
+        assert_eq!(out, UpsertOutcome::default());
+        let err = run_upsert(
+            &storage,
+            &ctx,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(&assignments),
+            "op-1254-c2",
+            &mut n,
+        )
+        .expect_err("rejected");
+        assert!(matches!(err, TenantWriteError::ConflictTargetNotVisible));
+        // 可視 + DO NOTHING: 本体を読まずスキップ（可視・不可視で応答差なし）。
+        let out = run_upsert(
+            &storage,
+            &ctx_all,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoNothing,
+            "op-1254-c3",
+            &mut n,
+        )
+        .expect("skip on corrupt visible row");
+        assert_eq!(out, UpsertOutcome::default());
+        assert_eq!(n, 0);
+    }
+    /// Issue #1254 レビュー指摘: UNIQUE 対象の事前走査が不可視行の列データ破損で
+    /// 可視性判定より先に失敗しないこと（不可視の破損行は衝突先候補から外す。
+    /// 可視の破損行は従来どおり fail-closed）。
+    #[test]
+    fn upsert_unique_target_corrupt_invisible_row_does_not_leak_decode_error() {
+        let path = unique_db_path("upsert-unique-invisible-corrupt");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let unique_schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "code".to_string()
+        ])]);
+        storage.create_table(&unique_schema).expect("create table");
+        let (ctx, ctx_all) = ctx_pair();
+        let seed = [
+            crate::row_codec::Value::Vector(vec![1.0, 0.0]),
+            crate::row_codec::Value::Text("k".to_string()),
+        ];
+        let op = OperationId::parse("seed-1254-u").expect("op");
+        insert_typed_rows_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx_all,
+            Visibility::Private,
+            &[(1, &seed)],
+            LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+            None,
+        )
+        .expect("seed unique row");
+        truncate_row_body(&storage, 1);
+
+        // 事前走査は不可視の破損行で失敗せず（衝突先候補から外す）、可視側の ctx では
+        // 破損を fail-closed で伝播する。
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        let name = user_rows_table_name("docs");
+        let row_table = write_txn
+            .open_table(user_rows_table_def(&name))
+            .expect("open row table");
+        let hidden = crate::constraint::scan_tenant_rows_by_unique_key(
+            &row_table,
+            &unique_schema,
+            &ctx,
+            &[1],
+        )
+        .expect("invisible corrupt row must not fail the pre-scan");
+        assert!(hidden.is_empty());
+        let visible = crate::constraint::scan_tenant_rows_by_unique_key(
+            &row_table,
+            &unique_schema,
+            &ctx_all,
+            &[1],
+        );
+        assert!(matches!(visible, Err(TenantWriteError::Storage(_))));
     }
 }

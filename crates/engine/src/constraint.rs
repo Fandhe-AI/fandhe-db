@@ -468,7 +468,7 @@ pub(crate) fn clear_unique_index_for_tenant_in_txn(
 pub(crate) fn scan_tenant_rows_by_unique_key<T>(
     row_table: &T,
     schema: &TableSchema,
-    tenant_id: &str,
+    ctx: &crate::policy::PolicyContext,
     indices: &[usize],
 ) -> Result<HashMap<Vec<u8>, u64>, TenantWriteError>
 where
@@ -485,6 +485,7 @@ where
         }
     }
 
+    let tenant_id = ctx.tenant_id();
     let mut existing: HashMap<Vec<u8>, u64> = HashMap::new();
     let range_start = std::ops::Bound::Included((tenant_id, 0u64));
     let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
@@ -500,7 +501,25 @@ where
             break;
         }
         let buf = v.value();
-        let values = decode_key_columns(schema, &mask, buf)?;
+        // 不可視行（ヘッダ不整合を含む）の列データ破損は可視性判定に到達する前に
+        // エラーとして応答へ現れてはならない（Issue #1254・RLS-10・RLS-11）。
+        // キーを復元できない不可視行は衝突先候補から外す（後続の一意索引検査が
+        // 従来どおり最終的な一意性を担保する）。可視行の破損は fail-closed で伝播する。
+        let values = match decode_key_columns(schema, &mask, buf) {
+            Ok(values) => values,
+            Err(e) => {
+                let row_visible = matches!(
+                    crate::storage::decode_row_tenant_and_visibility(buf),
+                    Ok((row_tenant, row_visibility))
+                        if ctx.is_owner(row_tenant)
+                            && ctx.is_visible(row_tenant, row_visibility)
+                );
+                if row_visible {
+                    return Err(e);
+                }
+                continue;
+            }
+        };
         let Some(key) = key_bytes(&spec, &values).map_err(internal)? else {
             continue;
         };

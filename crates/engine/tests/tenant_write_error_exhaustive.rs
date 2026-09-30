@@ -30,6 +30,7 @@ use engine::tenant::TenantWriteError;
 fn expected_class(e: &TenantWriteError) -> ErrorClass {
     match e {
         TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
+        TenantWriteError::ConflictTargetNotVisible => ErrorClass::ForbiddenTenantMismatch,
         TenantWriteError::NotFound => ErrorClass::RowNotFound,
         TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
         TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
@@ -86,6 +87,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
             detail: "test".to_string(),
         }),
         TenantWriteError::WriteLockTimeout,
+        TenantWriteError::ConflictTargetNotVisible,
     ];
     for case in &cases {
         assert_eq!(

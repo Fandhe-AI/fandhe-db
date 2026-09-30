@@ -3939,6 +3939,9 @@ pub(crate) fn map_write_error(
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        // UPSERT `DO UPDATE` の衝突先が所有だが不可視（Issue #1254）。`_` 節
+        // （`XX000`）へ落とさず `42501` を維持する。
+        TenantWriteError::ConflictTargetNotVisible => SqlSurfaceError::ConflictTargetNotVisible,
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
         // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
         TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
