@@ -18,7 +18,7 @@
 //! 「受理される・非空・他テナント行が混入しない・順序／述語／結合キーが期待どおり」を
 //! 検査する（RLS を外した状態や空振りを測る事態を fail-closed で防ぐ）。
 //! `LIMIT` 後の結果だけでは越境を見逃すため、他テナント行は各 arm の上位に必ず並ぶ
-//! sentinel（述語 arm は問い合わせベクトルの符号反転・`lang=l0`、順序 arm は最小／最大 `qty`）として投入し、
+//! sentinel（述語 arm は計測クエリと同一のベクトル・`lang=l0`、順序 arm は最小／最大 `qty`）として投入し、
 //! 結合は `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページ分割で全件取得して件数まで照合する。加えて他テナント文脈で同じ文が
 //! 他テナント行を返すこと（＝越境が起きれば見える fixture であること）を確認する。
 //!
@@ -342,12 +342,12 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let other = other_tenant_rows(rows) as u64;
     let query = DeterministicRng::new(2).next_vector(DIM);
     // 他テナント行は各 arm の上位（`l0`・最小／最大 `qty`）に並ぶ sentinel とする。ベクトルは
-    // 問い合わせベクトルの符号反転（コサイン距離が最大）にして、近傍収集が RLS より先に行われる
-    // 実装でも対象テナントの上位 k を占有しないようにする（対象テナントの事前検査が分離の正否と
-    // 無関係に空結果で失敗するのを防ぐ）。sentinel が見えることの対照検査は、この反転ベクトルを
-    // 問い合わせとする別リテラル（`literal_b`）で行う。
+    // 計測クエリのベクトルと同一（コサイン距離 0）にして、RLS が外れれば計測クエリ自身の
+    // LIMIT 内へ必ず越境行が入る fixture にする。これで対象テナントの事前検査（他テナント id 非混入）が
+    // 計測クエリそのものの分離検出力を持つ。対照検査も同じ文を他テナント文脈で実行し、sentinel が
+    // 上位に見えること（＝検出可能な fixture であること）を確認する。
     // `qty` は偶数 id を最小（`order_single` 先頭）、奇数 id を最大（`order_multi` の `l0` 内先頭）にする。
-    let sentinel_vector: Vec<f32> = query.iter().map(|x| -x).collect();
+    let sentinel_vector: Vec<f32> = query.clone();
     let make_other = |id: u64| {
         vec![
             Value::Vector(sentinel_vector.clone()),
@@ -378,17 +378,12 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let ctx_b = ctx(TENANT_B);
     let literal =
         vector_literal(&query).unwrap_or_else(|e| fail_closed(format!("vector literal: {e}")));
-    let literal_b = vector_literal(&sentinel_vector)
-        .unwrap_or_else(|e| fail_closed(format!("vector literal: {e}")));
 
     if group.includes(Group::Predicate) {
         let arms = predicate_statements(DOCS, &literal).unwrap_or_else(|e| fail_closed(e));
         for (label, sql) in &arms {
             precheck_predicate(label, &exec(&core, &ctx_a, sql), own);
-        }
-        // 対照: sentinel 自身を問い合わせとする同形の文で、他テナント文脈から sentinel が見えること。
-        let control = predicate_statements(DOCS, &literal_b).unwrap_or_else(|e| fail_closed(e));
-        for (label, sql) in &control {
+            // 対照: 同じ計測クエリを他テナント文脈で実行し、sentinel が結果に現れること。
             precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
         }
         measure_group(
