@@ -71,9 +71,12 @@ name }` を追加した（**BREAKING CHANGE**）。空白を挟まず「識別�
 本体を読まずスキップし、`DO UPDATE` は可視のときだけ本体をデコードして read-merge-write
 する。不可視の衝突先を更新してはならない。
 
-他の DML 実行器（`tenant::update_row_unchecked`・`delete_row_impl`・
-`truncate_table_unchecked`）は `(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner` の二重防御で
-判定する（それらの可視性絞り込みは別 Issue の担当）。
+他の DML 実行器の対象選定は経路ごとに異なる。SQL 経路の `UPDATE`／`DELETE`
+（`delete_row_impl` の `DeleteScope::OwnedVisible` を含む）は #1253 で「所有かつ可視」
+（`ctx.is_owner && ctx.is_visible`）へ揃え済みである。Rust の行 API
+（`tenant::update_row_unchecked`・`delete_row_unchecked`）と `truncate_table_unchecked` は
+従来どおり `(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner` の二重防御のみで判定し、
+可視性は問わない（Rust API の契約は変えない）。
 
 - 可視集合で判定すると「自テナント所有だが ctx に不可視な行」が非衝突扱いになり、
   plain INSERT 経路で行 `id` 衝突の `23505`（`TenantWriteError::IdConflict`）になる
