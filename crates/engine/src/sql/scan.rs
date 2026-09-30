@@ -54,7 +54,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
-    compare_order_key, compare_ref_and_owned_values, expr_value_to_order_value,
+    compare_ref_and_owned_values, compare_statement_order, expr_value_to_order_value,
     extract_order_value_ref, scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, ProjectedColumn};
@@ -909,18 +909,15 @@ impl HeapEntry {
     /// `id` 昇順 → `tenant_id` バイト順。§受入基準 2「決定的な順序」）。
     /// 戻り値は「昇順ソートすると最終的な出力順になる」意味の `Ordering`。
     fn order(&self, other: &Self) -> Ordering {
-        for (idx, key) in self.spec.iter().enumerate() {
-            let a = self.keys.get(idx).and_then(|o| o.as_ref());
-            let b = other.keys.get(idx).and_then(|o| o.as_ref());
-            let ord = compare_order_key(a, b, key.descending);
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        match self.id.cmp(&other.id) {
-            Ordering::Equal => self.tenant_id.as_bytes().cmp(other.tenant_id.as_bytes()),
-            id_ord => id_ord,
-        }
+        compare_statement_order(
+            &self.spec,
+            &self.keys,
+            self.id,
+            self.tenant_id.as_bytes(),
+            &other.keys,
+            other.id,
+            other.tenant_id.as_bytes(),
+        )
     }
 }
 

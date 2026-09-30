@@ -293,6 +293,7 @@ pub enum CatalogError {
     ConstraintNotFound(String),
     ConstraintLimitExceeded(String),
     ForeignKeyViolation,
+    NotNullConstraintViolation(String),
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

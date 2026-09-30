@@ -38,10 +38,15 @@
 //! owned 化した値を、観測のたびにその場で最小限の借用形へ組み立て直す
 //! （[`observe_window_row`]）。
 //!
+//! 文全体のスカラー `ORDER BY`（Issue #1189）は、materialize 段で並べ替えキーを
+//! 集め、[`compute_output_order`] が base scan と同一の比較器で出力順（順列）を
+//! 決め、投影段がその順列で base scan の出力行とウィンドウ値を対応付ける。
+//!
 //! 対象外（`42601`／`54000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）: フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・
-//! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・スカラー
-//! `ORDER BY`／`USING PLAN`／ベクトル検索との併用・`GROUP BY`／集計 SELECT との併用。
+//! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
+//! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
+//! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
 
 use crate::catalog::{self, ColumnType, TableSchema};
 use crate::declarative_filter;
@@ -51,6 +56,10 @@ use crate::sql::aggregate::{self, Accumulator, DecodeTier, RowVector};
 use crate::sql::allowlist::{SqlSurfaceError, WindowFunc};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
+use crate::sql::order_value::{
+    compare_statement_order, extract_order_value_ref, scalar_key_ref_to_owned, OrderValue,
+    ScalarKeyRef,
+};
 use crate::sql::parser::{
     AggregateInput, BoundScan, BoundWindowItem, ProjectedColumn, WindowKeyKind, WindowKeyRef,
 };
@@ -218,6 +227,30 @@ struct MaterializedRow {
     partition_keys: Vec<Vec<Option<WindowKeyValue>>>,
     order_keys: Vec<Vec<Option<WindowKeyValue>>>,
     agg_values: Vec<WindowInputValue>,
+    /// 文全体のスカラー `ORDER BY` キー値（`bound.order_by` と同順。`ORDER BY`
+    /// なしなら空。Issue #1189）。出力順の計算（[`compute_output_order`]）専用で、
+    /// 出力には現れない。
+    stmt_order_keys: Vec<Option<OrderValue>>,
+    /// タイブレーク用の tenant 識別子（[`MaterializeOutput::tenants`] への添字。
+    /// `ORDER BY` なしなら 0 固定で未使用）。
+    tenant_idx: u32,
+}
+
+/// 評価段の成果物（[`build_result`] への入力）。`output_order` は文全体の
+/// `ORDER BY` 適用後の出力順（`materialized` への添字列）、`window_values` は
+/// ウィンドウ項目ごとの `materialized` と同じ添字で引ける値（Issue #1189）。
+struct EvaluatedWindows<'a> {
+    output_order: Option<&'a [usize]>,
+    window_values: &'a [Vec<Cell>],
+}
+
+/// [`materialize_rows`] の結果。`tenants` は行の tenant_id の intern 表で、
+/// 物理走査順が `(tenant_id, id)` 昇順のため連続する同一 tenant を 1 要素に
+/// まとめる（`ORDER BY` なしなら空）。
+struct MaterializeOutput {
+    rows: Vec<MaterializedRow>,
+    tenants: Vec<String>,
+    state_bytes: usize,
 }
 
 /// [`BoundScan`] を実行する（`windows` が非空。`sql::scan::execute_scan_with_budget`
@@ -255,8 +288,11 @@ fn execute_window_scan_with_caps(
     max_result_bytes: usize,
     state_cap: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let (materialized, mut state_bytes) =
-        materialize_rows(read_txn, ctx, schema, bound, state_cap)?;
+    let MaterializeOutput {
+        rows: materialized,
+        tenants,
+        mut state_bytes,
+    } = materialize_rows(read_txn, ctx, schema, bound, state_cap)?;
 
     // ウィンドウ項目ごとに独立してパーティション分割・安定ソート・peer 評価を行い、
     // `materialized` と同じ添字（走査順）で引ける `Vec<Cell>` を作る（他テナントの
@@ -275,15 +311,75 @@ fn execute_window_scan_with_caps(
         )?);
     }
 
+    // Issue #1189: 文全体の `ORDER BY` の出力順（`ORDER BY` なしは恒等順列）。
+    let output_order =
+        compute_output_order(bound, &materialized, &tenants, &mut state_bytes, state_cap)?;
+
     build_result(
         read_txn,
         ctx,
         schema,
         bound,
         &materialized,
-        &window_values,
+        EvaluatedWindows {
+            output_order: output_order.as_deref(),
+            window_values: &window_values,
+        },
         max_result_bytes,
     )
+}
+
+/// 文全体の `ORDER BY` を適用した出力順（`materialized` への添字列）を返す
+/// （Issue #1189・SQL-25・SQL-30）。`ORDER BY` なしは `None`（物理走査順の恒等。順列を確保しない）。
+/// ありの場合は base scan（`sql::scan`）と同一の比較器
+/// （[`compare_statement_order`]。キー → `id` → `tenant_id`）で安定ソートする。
+/// 経路 (A)（先頭キー `id` の早期打ち切り）は自テナント 1 つの範囲走査で `id` が
+/// テナント内一意なため、この順序と一致する。順列とソート一時領域は確保前に state 予算へ計上する。
+fn compute_output_order(
+    bound: &BoundScan,
+    materialized: &[MaterializedRow],
+    tenants: &[String],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<Option<Vec<usize>>, SqlSurfaceError> {
+    // `ORDER BY` なしは物理走査順（添字そのもの）を使うため順列を確保しない
+    // （従来通っていた状態予算ぎりぎりの取得を新たに 54000 にしない。PR #1233 指摘）。
+    if bound.order_by.is_empty() {
+        return Ok(None);
+    }
+    // 順列本体に加え、安定ソート（`sort_by`）の一時領域は最大で要素数分（順列と
+    // 同サイズ）確保されうるため、上限を確保前に合わせて状態予算へ計上する。
+    let bytes = materialized
+        .len()
+        .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|b| b.checked_mul(2))
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("window state size overflowed"))?;
+    *state_bytes = try_accumulate_state_budget(*state_bytes, bytes, state_cap)?;
+    let mut order: Vec<usize> = Vec::new();
+    order
+        .try_reserve_exact(materialized.len())
+        .map_err(|_| SqlSurfaceError::payload_too_large("window state allocation failed"))?;
+    order.extend(0..materialized.len());
+    let tenant_bytes = |row: &MaterializedRow| -> &[u8] {
+        tenants
+            .get(row.tenant_idx as usize)
+            .map(|t| t.as_bytes())
+            .unwrap_or(&[])
+    };
+    // 安定ソート（`sort_unstable*` は決定性検査 `check_sort_determinism.sh` が禁止）。
+    order.sort_by(|&a, &b| match (materialized.get(a), materialized.get(b)) {
+        (Some(x), Some(y)) => compare_statement_order(
+            &bound.order_by,
+            &x.stmt_order_keys,
+            x.id,
+            tenant_bytes(x),
+            &y.stmt_order_keys,
+            y.id,
+            tenant_bytes(y),
+        ),
+        _ => std::cmp::Ordering::Equal,
+    });
+    Ok(Some(order))
 }
 
 /// 対象テーブルを 1 回、`LIMIT` による早期終了なしで走査し、可視かつ `WHERE` を
@@ -300,7 +396,7 @@ fn materialize_rows(
     schema: &TableSchema,
     bound: &BoundScan,
     state_cap: usize,
-) -> Result<(Vec<MaterializedRow>, usize), SqlSurfaceError> {
+) -> Result<MaterializeOutput, SqlSurfaceError> {
     let expected_dim = schema.vector_dim();
     let (tier, scalar_mask) = decode_tier_for_window(schema, bound);
     let expr_filter_programs: Vec<ExprProgram> = bound
@@ -326,6 +422,7 @@ fn materialize_rows(
     let mut embedding_scratch: Vec<f32> = Vec::new();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     let mut materialized: Vec<MaterializedRow> = Vec::new();
+    let mut tenants: Vec<String> = Vec::new();
     let mut seq: usize = 0;
     let mut state_bytes: usize = 0;
     let mut partition_counts: Vec<HashMap<Vec<u8>, usize>> =
@@ -491,12 +588,59 @@ fn materialize_rows(
                 agg_values.push(agg_value);
             }
 
+            // Issue #1189: 文全体の `ORDER BY` キー値と tenant 識別子。確保前に
+            // 借用長から見積もって state 予算へ計上する（`sql::scan` の経路 (B) と
+            // 同方針）。`ORDER BY` なしなら何も確保しない。
+            let mut stmt_order_keys: Vec<Option<OrderValue>> = Vec::new();
+            let mut tenant_idx: u32 = 0;
+            if !bound.order_by.is_empty() {
+                let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
+                    Vec::with_capacity(bound.order_by.len());
+                for key in &bound.order_by {
+                    refs.push(extract_order_value_ref(schema, key, id, &scanned)?);
+                }
+                let mut add = refs
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
+                for r in &refs {
+                    if let Some(ScalarKeyRef::Bytes(b)) = r {
+                        add = add.saturating_add(b.len());
+                    }
+                }
+                let is_new_tenant = tenants.last().map(String::as_str) != Some(tenant_id);
+                if is_new_tenant {
+                    add = add
+                        .saturating_add(std::mem::size_of::<String>())
+                        .saturating_add(tenant_id.len());
+                }
+                state_bytes = try_accumulate_state_budget(state_bytes, add, state_cap)?;
+                stmt_order_keys.reserve_exact(refs.len());
+                for r in refs {
+                    stmt_order_keys.push(match r {
+                        Some(v) => Some(scalar_key_ref_to_owned(v)?),
+                        None => None,
+                    });
+                }
+                if is_new_tenant {
+                    tenants.push(tenant_id.to_string());
+                }
+                let last = tenants
+                    .len()
+                    .checked_sub(1)
+                    .ok_or_else(|| window_bug("tenant intern table unexpectedly empty"))?;
+                tenant_idx = u32::try_from(last).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("window scan tenant count overflowed")
+                })?;
+            }
+
             materialized.push(MaterializedRow {
                 seq,
                 id,
                 partition_keys,
                 order_keys,
                 agg_values,
+                stmt_order_keys,
+                tenant_idx,
             });
             check_total_row_count(materialized.len(), MAX_WINDOW_ROWS)?;
             seq = seq.checked_add(1).ok_or_else(|| {
@@ -505,7 +649,11 @@ fn materialize_rows(
         }
     }
 
-    Ok((materialized, state_bytes))
+    Ok(MaterializeOutput {
+        rows: materialized,
+        tenants,
+        state_bytes,
+    })
 }
 
 /// [`decode_tier_for`](crate::sql::scan) と同じ意図（Issue #350）だが、ウィンドウ
@@ -569,6 +717,17 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
         });
         if group.references_embedding() {
             needs_embedding = true;
+        }
+    }
+
+    // Issue #1189: 文全体の `ORDER BY` キー列もデコード対象へ含める
+    // （`sql::scan::decode_tier_for` と同契約。漏れると NULL として並ぶ）。
+    for key in &bound.order_by {
+        if let crate::sql::parser::BoundOrderTarget::Column(index) = key.target {
+            has_scalar_reference = true;
+            if let Some(slot) = scalar_mask.get_mut(index) {
+                *slot = true;
+            }
         }
     }
 
@@ -1269,6 +1428,15 @@ fn observe_window_row(
     }
 }
 
+/// 出力位置 `pos` に対応する `materialized` の添字を返す。`order` が `None`
+/// （`ORDER BY` なし）なら物理走査順の恒等、`Some` なら順列経由で引く。
+fn resolve_output_index(order: Option<&[usize]>, pos: usize) -> Option<usize> {
+    match order {
+        None => Some(pos),
+        Some(o) => o.get(pos).copied(),
+    }
+}
+
 /// 投影段（§モジュールドキュメント参照）: ウィンドウ以外の投影・`LIMIT`／
 /// `OFFSET` は `windows` を空にした複製を [`crate::sql::scan::execute_scan`] へ
 /// 渡すことで既存の実行器をそのまま再利用し、その結果へウィンドウ列を
@@ -1291,9 +1459,13 @@ fn build_result(
     schema: &TableSchema,
     bound: &BoundScan,
     materialized: &[MaterializedRow],
-    window_values: &[Vec<Cell>],
+    evaluated: EvaluatedWindows<'_>,
     max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    let EvaluatedWindows {
+        output_order,
+        window_values,
+    } = evaluated;
     let offset = bound.offset();
     let limit = bound.limit();
     let output_end = materialized.len().min(offset.saturating_add(limit));
@@ -1318,8 +1490,11 @@ fn build_result(
             max_result_bytes,
         )?;
         for cells in window_values {
-            for cell in cells.get(offset..output_end).unwrap_or(&[]) {
-                if let Cell::Text(s) = cell {
+            for pos in offset..output_end {
+                let Some(mat_idx) = resolve_output_index(output_order, pos) else {
+                    continue;
+                };
+                if let Some(Cell::Text(s)) = cells.get(mat_idx) {
                     window_bytes = try_accumulate_window_result_budget(
                         window_bytes,
                         s.len(),
@@ -1397,8 +1572,12 @@ fn build_result(
     let mut rows = Vec::with_capacity(base_result.rows.len());
     // `materialized`／`window_values` の対応する行への添字（`offset` から開始し、
     // 出力行 1 件ごとに 1 つ進める。§関数ドキュメントの物理走査順の不変条件参照）。
-    let mut materialized_idx = offset;
+    // Issue #1189: 対応する `materialized` の添字は `output_order`（文全体の
+    // `ORDER BY` 適用後の順列。なしなら恒等）経由で引く。
+    let mut output_pos = offset;
     for base_row in base_result.rows {
+        let materialized_idx = resolve_output_index(output_order, output_pos)
+            .ok_or_else(|| window_bug("window scan row correlation index exceeded output order"))?;
         let mat_row = materialized.get(materialized_idx).ok_or_else(|| {
             window_bug("window scan row correlation index exceeded materialized rows")
         })?;
@@ -1441,7 +1620,7 @@ fn build_result(
             score: base_row.score,
             cells,
         });
-        materialized_idx = materialized_idx.checked_add(1).ok_or_else(|| {
+        output_pos = output_pos.checked_add(1).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("window scan row correlation index overflowed")
         })?;
     }
@@ -1644,9 +1823,9 @@ mod budget_regression_tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = bound_min_body_over();
 
-        let (_materialized, materialize_only_bytes) =
-            materialize_rows(&read_txn, &ctx, &schema, &bound, usize::MAX)
-                .expect("materialize should succeed with an unbounded cap");
+        let materialize_only_bytes = materialize_rows(&read_txn, &ctx, &schema, &bound, usize::MAX)
+            .expect("materialize should succeed with an unbounded cap")
+            .state_bytes;
 
         // materialize 段だけでちょうど収まる cap（評価段の追加確保の余地がない）。
         // 修正前は評価段が state_bytes を一切計上しなかったため、この cap でも
@@ -1672,6 +1851,19 @@ mod budget_regression_tests {
             materialize_only_bytes.saturating_add(1_000_000),
         )
         .expect("cap with headroom for the evaluation stage should succeed");
+    }
+
+    /// PR #1233 指摘の回帰: `ORDER BY` なしでは順列を確保せず状態予算にも計上しない
+    /// （予算を使い切った状態でも成功し `None` を返す）。
+    #[test]
+    fn compute_output_order_without_order_by_allocates_nothing() {
+        let bound = bound_min_body_over();
+        assert!(bound.order_by.is_empty());
+        let mut state_bytes = 10usize;
+        let out = compute_output_order(&bound, &[], &[], &mut state_bytes, 10)
+            .expect("no ORDER BY must not touch the state budget");
+        assert!(out.is_none());
+        assert_eq!(state_bytes, 10);
     }
 
     /// `window_func_to_aggregate_func` が `AggregateFunc::Min` へ変換すること

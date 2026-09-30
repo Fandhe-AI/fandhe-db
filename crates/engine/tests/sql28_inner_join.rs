@@ -913,18 +913,37 @@ fn declare_cursor_for_join_is_rejected() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// Issue #925 §2.6・対象外事項: `CREATE VIEW` 本文は専用の単一テーブルパーサー
-/// （`parse_view_body`）で検証され、`looks_like_join` を経由しないため JOIN は
-/// 構造的に `42601` になる。
+/// Issue #1192（TABLE-18）: `CREATE VIEW` 本文に JOIN を書けるようになった
+/// （評価後射影形ビュー）。DDL 権限のない既定セッションは構造検証の後で `42501`、
+/// 権限のあるセッションでは作成でき、参照結果は本文を直接実行した結果と一致する
+/// （参照セッションの RLS が両辺に独立して適用される）。ビューへの JOIN の辺
+/// としての参照は引き続き `42601`。
 #[test]
-fn create_view_with_join_body_is_rejected() {
+fn create_view_with_join_body_is_accepted_and_readable() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
+    let create =
+        "CREATE VIEW v AS SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10";
+    assert_rejected(&core, "tenant-a", create, "42501");
+
+    let mut ddl_session = SessionState::default();
+    ddl_session.allow_ddl();
+    core.execute_sql_in_session(&ctx("tenant-a"), &mut ddl_session, create)
+        .expect("create join view");
+
+    let direct = run(
+        &core,
+        "tenant-a",
+        "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+    );
+    let via_view = run(&core, "tenant-a", "SELECT title FROM v LIMIT 10");
+    assert_eq!(titles(&via_view), titles(&direct));
+
     assert_rejected(
         &core,
         "tenant-a",
-        "CREATE VIEW v AS SELECT * FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+        "SELECT * FROM documents JOIN v ON documents.title = v.title LIMIT 10",
         "42601",
     );
 }

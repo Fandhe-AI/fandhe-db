@@ -230,7 +230,7 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - 未知テーブル → `42P01`
 - 未知列・`VECTOR` 列でない列への `ORDER BY` 相当・非有限ベクトル要素等 → `22000`
 
-`sort`（`scan` op のみが持つ、スカラー列の決定的な並べ替え指定。後述）は
+`sort`（`scan`・`aggregate` op が持つ、決定的な並べ替え指定。後述）は
 本スキーマに宣言していないため、指定すると未知キー `42601` になる（ベクトル
 順位付けとの相互排他。NOSQL-15・SQL-25 (a)・Issue #946）。
 
@@ -254,8 +254,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 
 `vector`／`plan`／`mode`／`hybrid` はスキーマが宣言しないフィールドのため、
 未知キーとして `42601` になる（`scan` への付与自体を個別に判定するロジックは
-持たない）。`offset` も同じ理由で `search`／`aggregate` へ付与すると `42601`
-になる（Issue #947・NOSQL-15。`scan` op 専用）。
+持たない）。`offset` も同じ理由で `search` へ付与すると `42601` になる
+（Issue #947・NOSQL-15）。`aggregate` の `offset` は `group_by` 付きに限り別途
+受理する（[`aggregate`](#aggregate) 参照。Issue #1198）。
 
 要求例:
 
@@ -311,9 +312,11 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 | `table` | ○ | string | |
 | `aggregates` | ○ | object[]（`{"fn","column"}`。1〜32 要素） | `fn` は `count`／`sum`／`avg`／`min`／`max`（小文字完全一致）。`column` は列名、または `count` 専用の `"*"` |
 | `filter` | △ | object[] | |
-| `group_by` | △ | string[]（1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | `TEXT`・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列（Issue #1183。数値キーは昇順・NULL 末尾・`-0.0` と `0.0` は同一グループ） |
+| `group_by` | △ | string \| string[]（配列は 1〜8 要素。`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`） | 単一文字列形 `"lang"` は 1 要素配列 `["lang"]` と完全に同じ扱い（NOSQL-16 (b)。Issue #1198）。`TEXT`・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列（Issue #1183。数値キーは昇順・NULL 末尾・`-0.0` と `0.0` は同一グループ） |
 | `having` | △ | object[]（`{"fn","column","op","value"}`） | `group_by` 必須。`op` は `=`／`<`／`<=`／`>`／`>=` の完全一致 |
-| `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having` 付きでも受理）。`false`／省略時は通常実行 |
+| `sort` | △ | object[]（`{"column","dir"}`。非空、上限 8 要素） | `group_by` 必須。`column` は集計結果の出力列名（`group_by` 列名、または集計項目の既定エイリアス `count`／`sum`／`avg`／`min`／`max`）。`dir` は `"asc"`／`"desc"`（小文字完全一致）。同値はグループキー順。SQL の `GROUP BY ... ORDER BY` と同一結果（Issue #1198・NOSQL-15） |
+| `offset` | △ | number | `group_by` 必須。`0..=10000`。ソート後の結果から先頭 `offset` グループを読み飛ばす（RLS 適用後の可視グループのみが対象）。`sort` 省略時はグループキー昇順の上で適用（Issue #1198・NOSQL-15） |
+| `explain` | △ | bool | [`explain`](#explain)参照。`true` は `QUERY PLAN` を返す（`group_by`／`having`／`sort`／`offset` 付きでも受理）。`false`／省略時は通常実行 |
 
 要求例（単一行集計）:
 
@@ -331,12 +334,29 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
  "having": [{"fn": "count", "column": "*", "op": ">=", "value": 2}]}
 ```
 
+要求例（単一文字列形 `group_by`＋`sort`＋`offset`）:
+
+```json
+{"op": "aggregate", "table": "docs",
+ "aggregates": [{"fn": "count", "column": "*"}],
+ "group_by": "lang",
+ "sort": [{"column": "count", "dir": "desc"}],
+ "offset": 1}
+```
+
 主な `wire_code`:
 
 - `aggregates` が空配列 → `group_by`／`having` の有無を問わず一律 `42601`
   （`having` の参照解決より必ず先に検査する）
-- `group_by` 要素数が 0・`having` のみ単独指定（`group_by` なし）・
-  `fn`／`op` が語彙外・識別子形状不正 → `42601`
+- `group_by` 要素数が 0・`group_by` なしの `having`／`sort`／`offset`
+  （`offset: 0` の明示を含む。SQL 表層に単一行集計への `ORDER BY`／`OFFSET` の
+  受理形がなく、黙って無視すると fail-open になるため）・
+  `fn`／`op` が語彙外・識別子形状不正（`group_by` の空文字列を含む）→ `42601`
+- `sort` が空配列・非オブジェクト要素・`column`／`dir` 欠落・`dir` が語彙外・
+  `column` が識別子形状不正（`"*"` を含む）→ `42601`。要素数が 8 超過 → `54000`
+  （HTTP `413`）。`column` が出力列名に存在しない・複数の出力列に一致
+  （例: `count(*)` と `count(lang)` を併記して `"count"` を指定）→ `22000`
+- `offset` が非整数・負値・`u32` 超過 → `42601`、`10001` 以上 → `22000`
 - `group_by` 要素数が 8（`MAX_GROUP_BY_COLUMNS`）超過・グループ数上限
   （10,000）・グループキー累計バイト・`having` 述語数上限超過 → `54000`
 - `group_by` 列が `TEXT`／数値列（INTEGER／BIGINT／REAL／DOUBLE）でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
@@ -346,9 +366,11 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
   `sum`／`avg`／`min`／`max` は同じ `VECTOR` 列参照を一律 `22000` で拒否
 - `sum` オーバーフロー → `22003`
 
-`sort` は本スキーマに宣言していないため未知キー `42601` になる（Issue #946 の
-スコープ外。engine の集計 `ORDER BY` を SQL-25 (a) 相当へ揃える先行作業が
-必要。[spec 側への申し送り候補](#spec-側への申し送り候補)参照）。
+`sort`／`offset` は engine の `BoundAggregate::with_group_order_by`／
+`with_group_offset`（SQL テキスト経由の `GROUP BY ... ORDER BY ... LIMIT ...
+OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器は持たない）へ写像する。
+`limit` 相当のキーは持たない（SQL の `OFFSET` 単独が受理されないため、`offset`
+のみの要求と SQL の一致は `LIMIT 10000 OFFSET m` で確認する）。
 
 ### `insert`
 
@@ -597,10 +619,11 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 （`column`／`op`／`value`）または「グループ」（`or`）のいずれかの形を取り、
 配列自体・グループ内の分岐はいずれも暗黙に `AND` 結合として扱う（Issue #945・
 NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefix` の 2 語彙・
-`AND` のみだった）。`update`／`delete` の述語形（Issue #1062）でも同じ配列
-表現を使うが、対応語彙は `eq`／`prefix` の 2 語彙・`AND` 結合のみに留まる
-（範囲比較・`IN`・`OR` グループへの拡張は Issue #1118 が明示的に対象外と
-した。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
+`AND` のみだった。Issue #1197 で `ne`・`between`・`like`・`is_null`／
+`not_null`・`not` グループを追加）。`update`／`delete` の述語形（Issue #1062）でも
+同じ配列表現を使うが、対応語彙は `eq`／`ne`／`prefix`／`like`／`between`／
+`is_null`／`not_null` と `not` グループ・`AND` 結合のみに留まる（範囲比較・`IN`・
+`OR` グループへの拡張は Issue #1118 が明示的に対象外とした。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
 台帳照合 `23505`／`22023`〕は各 op の節を参照）。
 
 ```json
@@ -623,12 +646,39 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 ]}]
 ```
 
+追加語彙の例（Issue #1197。SQL の `NOT`・`BETWEEN`・`LIKE`・`IS [NOT] NULL` と
+同じ結果集合を返す）:
+
+```json
+[
+  {"column": "lang", "op": "ne", "value": "ja"},
+  {"column": "created", "op": "between", "value": ["2024-01-01", "2024-12-31"]},
+  {"column": "path", "op": "like", "value": "%/docs/_%"},
+  {"column": "note", "op": "not_null"},
+  {"not": {"or": [
+    {"column": "lang", "op": "eq", "value": "en"},
+    {"column": "note", "op": "is_null"}
+  ]}}
+]
+```
+
 ### 葉（leaf）
 
-- `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値、または
-  `in` に限り配列）の 3 つの必須フィールドのみ
-- `op` は次の 9 語彙（完全一致。大文字小文字の読み替えなし）:
+- `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値、`in`／
+  `between` の配列、ARRAY／JSON 列への `eq`／`ne` の配列・オブジェクト）の 3 つの
+  フィールドのみ。`is_null`／`not_null` は `value` を**持たない**（`null` を含め
+  付いていれば `42601`）
+- `op` は次の 14 語彙（完全一致。大文字小文字の読み替えなし。`"op":"not"` は
+  語彙外で `42601`）:
   - `eq`（一致）・`prefix`（前方一致。従来どおり）
+  - `ne`（`NOT col = <値>` と同じ。値のレーンは `eq` と同じ。NULL 行は除外）
+  - `like`（`TEXT` 列。文字列のみ。`%`・`_`・`\` をワイルドカード・エスケープと
+    して解釈する。列型違反は `22000`、パターン長超過は `54000`）
+  - `between`（`[low, high]` の要素ちょうど 2 個のスカラー配列。違反は `42601`。
+    `DATE`／`TIMESTAMP`／`UUID`／`BYTEA`／`NUMERIC` と `INTEGER`／`BIGINT`／`REAL`／
+    `DOUBLE PRECISION`（JSON 数値のみ。`>= low AND <= high` の式レーン）。
+    `TEXT` 等は SQL の `BETWEEN` と同じく `22000`）
+  - `is_null`／`not_null`（`IS NULL`／`IS NOT NULL`。`VECTOR` 列は `22000`）
   - `lt`／`le`／`lte`／`gt`／`ge`／`gte`（範囲比較。`le`/`lte`・`ge`/`gte` は
     それぞれ完全一致の同義語として両方受理する——Issue の受け入れ条件と
     対象ビヘイビア NOSQL-14 とで表記が食い違うため安全側に倒した判断。
@@ -660,12 +710,24 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   （`udf_call::bind_expr`）で束縛する（Issue #1183）。`BIGINT` の |値| が
   2^53 を超える場合（JSON リテラル・格納値とも）は `22000`。`TEXT` の範囲比較も
   式レーン（バイト順）で受理する。`in` は数値列では従来どおり `22000`。
-  述語形 `update`／`delete` の `filter` では数値列の `eq` を引き続き `0A000` で
-  拒否する
+  述語形 `update`／`delete` の `filter` では数値列の `eq`／`ne`／`between` を
+  `0A000` で拒否する
 - `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
 - `in` は列型に関わらず対応する場合のみ受理する（対象外の列型は `22000`）
 - 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は
   `engine::declarative_filter` の既存契約をそのまま透過する
+
+### グループ（`not`）
+
+- `{"not": <要素>}` の形のみ許可する（キーは `not` 1 つ、値はオブジェクトで、
+  葉・`or` グループ・入れ子の `not` のいずれか）。違反は `42601`
+- 否定は**葉まで押し下げて**束縛する（De Morgan。`or` 群の上に否定を置くと
+  NULL 行が UNKNOWN から真へ反転する fail-open になるため）。結果は SQL の
+  `NOT ( ... )` と一致する。内側の葉の RLS 述語名検査も `not` を貫通する
+- ネスト深さは `or` と共有して数える（上限 32。超過は `54000`）
+- JSON 上の葉の数で事前検査するため、数値列の `between`／`ne`／`not eq` のように
+  展開で 1 葉が 2 葉になる場合、JSON 上で 256 葉ちょうどのとき engine の事後検査
+  だけが `54000` になりうる（拒否側に倒れる既知の差分）
 
 ### グループ（`or`）
 
@@ -687,14 +749,17 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 `AND` のみの既存回帰）・`crates/wire-server/tests/nosql14_filter_operators.rs`
 （範囲比較・`IN`・`OR`。Issue #945）。
 
-**`update`／`delete` の `filter`（述語形）における対応範囲**: 本節の語彙
-（範囲比較 6 語彙・`in`・`or` グループ）は `search`／`scan`／`aggregate`
-専用。`update`／`delete` の `filter` は `eq`／`prefix` の 2 語彙・`AND`
-結合のみに対応し、上記の拡張語彙・`or` を渡すと [`filter::
+**`update`／`delete` の `filter`（述語形）における対応範囲**: 範囲比較 6 語彙・
+`in`・`or` グループは `search`／`scan`／`aggregate` 専用。`update`／`delete` の
+`filter` は `eq`／`ne`／`prefix`／`like`／`between`／`is_null`／`not_null` と、
+それらを包む `not` グループ・`AND` 結合のみに対応し（Issue #1197。SQL の述語形
+`UPDATE`／`DELETE` と同一の構文形へ写像するため、SQL⇄NoSQL の台帳照合も成立
+する）、範囲比較・`in`・`or`（`not` の内側を含む）を渡すと [`filter::
 map_predicate_dml_items`](../src/http/query/filter.rs) が
-`FilterError::UnsupportedOperator`（`42601`）／形状不一致で拒否する
-（Issue #1118 が明示的に対象外とした範囲。上記「`update`」「`delete`」節
-参照）。
+`FilterError::UnsupportedOperatorForPredicateDml`（`42601`）で拒否する
+（Issue #1118 が明示的に対象外とした範囲。上記「`update`」「`delete`」節参照）。
+数値列（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`）への `eq`／`ne`／`between`
+は `0A000`。
 
 ## `explain`
 
@@ -801,6 +866,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `SELECT id, lang FROM docs LIMIT 10 OFFSET 20`（広域取得 `OFFSET`。SQL-25 (b)） | `scan` + `offset`（Issue #947・NOSQL-15） |
 | `SELECT COUNT(*), SUM(id) FROM docs` | `aggregate` |
 | `SELECT lang, COUNT(*) FROM docs GROUP BY lang HAVING count >= 2` | `aggregate` + `group_by` + `having` |
+| `SELECT lang, COUNT(*) FROM docs GROUP BY lang ORDER BY count DESC LIMIT 10000 OFFSET 1`（SQL-25 (a)(b)） | `aggregate` + `group_by` + `sort` + `offset`（Issue #1198・NOSQL-15。`limit` 相当のキーは無く、`LIMIT` は SQL 側のグループ数上限と同値で対応） |
 | `EXPLAIN SELECT COUNT(*) FROM docs` | `aggregate` + `"explain":true`（Issue #948） |
 | `INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID 'op-1'` | `insert` + `operation_id` |
 | `UPDATE docs SET lang = 'en' WHERE id = 1 USING OPERATION_ID 'op-1'` | `update` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
@@ -819,13 +885,10 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - UDF 呼び出し・`CREATE FUNCTION`
 - `SET`（`search_mode` 等のセッション変数設定）
 - 定数のみの `SELECT`
-- `aggregate` への `offset`（`GROUP BY ... LIMIT n OFFSET m` 相当。NoSQL 側は
-  `limit` 相当の受理形も engine 側の公開 offset setter も持たないため未対応）
-- `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
-  中間一致・後方一致・`_` を受理するが、NoSQL `filter` 側は未対応のまま。
-  NoSQL 側の対応は NOSQL-14 の担当）
+- `aggregate` への `limit`（`GROUP BY ... LIMIT n` 相当。`sort`／`offset` は
+  Issue #1198 で対応済みだが、`limit` 相当のキーは未対応）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
-- `GROUP BY` への `ORDER BY`／`LIMIT` の付与
+- `GROUP BY` への `LIMIT` の付与（`ORDER BY` は `aggregate` の `sort` で対応済み）
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
 - `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
 - `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
@@ -1082,7 +1145,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   `nosql15_scan_sort.rs`（`sort`。Issue #946・NOSQL-15）・
   `nosql15_offset.rs`（`offset`。Issue #947・NOSQL-15）
 - `aggregate`: `nosql4_aggregate.rs`・`nosql5_group_by.rs`・
-  `nosql4_5_aggregate_wire_parity.rs`
+  `nosql4_5_aggregate_wire_parity.rs`・`nosql16_multi_group_by.rs`・
+  `nosql15_aggregate_sort_offset.rs`（`sort`／`offset`・単一文字列形 `group_by`。
+  Issue #1198・NOSQL-15）
 - `explain`（`vector` 指定 `search`・`scan`・`aggregate` への対象拡大。
   Issue #948・NOSQL-16・SQL-27）: `nosql16_explain_targets.rs`
 - `insert`: `nosql6_insert.rs`・`nosql6_tenant_row_id_scope.rs`・
@@ -1116,8 +1181,9 @@ curl -s -X POST http://127.0.0.1:5432/v1/session/close \
   （本リポの実装判断であり spec 側での明文化は未定）
 - 集計 `id` 列等の巨大整数（`u64`。2^53 超）を JSON number としてそのまま返す
   ことの是非（文字列化への変更は spec 側判断に委ねられている）
-- `aggregate` への `sort` は engine の集計 `ORDER BY` を SQL-25 (a) 相当へ揃える
-  先行作業が未着手のため対象外とした（Issue #946。現状は未知キー `42601` を
-  維持）
+- `aggregate` への `sort` は Issue #1198 で解消済み（`group_by` 必須・複数キー
+  〔上限 8〕対応。`group_by` なしの単一行集計への `sort`／`offset` は SQL 表層に
+  受理形がないため `42601` を維持しており、spec 側で扱いを明文化するかは
+  申し送り候補）
 - `sort[].dir` を必須・小文字完全一致（`"asc"`／`"desc"`）とした実装既定
   （Issue #946。`filter[].op`・`having[].op` と同じ厳格な語彙判断を踏襲）

@@ -275,7 +275,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             Value::Json("{\"a\":1}".to_string()),
             Value::Json("{\"a\":1}".to_string()),
             Value::Numeric(Decimal::from_parts(12345, 2).unwrap()),
-            Value::Array(ArrayValue::Text(vec!["a".to_string()])),
+            Value::Array(ArrayValue::Text(vec![Some("a".to_string())])),
             Value::Enum("happy".to_string()),
         ],
     );

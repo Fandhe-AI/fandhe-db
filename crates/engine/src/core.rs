@@ -1248,13 +1248,14 @@ struct HnswEngineState {
 ///   （SQL 表層の `WHERE` 句省略が構文段で拒否されることとのパリティ。
 ///   `bind_predicate_delete` 自体には空列を拒否するガードが無いため、
 ///   NoSQL 経路はこの関数が唯一の防御になる）。
-/// - `Equality`／`BoolEquality`／`Prefix` の 3 variant のみを明示的に許可し、
+/// - `Equality`／`BoolEquality`／`Prefix`／`Between`／`IsNull` の 5 variant と、
+///   それらを**直接**包む `Not`（内側は再帰しない。Issue #1197・NOSQL-14 の
+///   `ne`／`between`／`like`／`is_null`／`not_null`／`not`）のみを明示的に許可する。
 ///   それ以外（`PredicateCall`〔RLS 述語 `visible()`。NoSQL `filter` は列名として
 ///   RLS 述語名を拒否するため生成されない契約〕・`Expression`〔wire 層は
-///   `Expr` を構築しない〕・`BoolColumn`・`Compare`・`InList`・`Between`・
-///   `IsNull`・`Not`（内側が許可 3 variant であっても `Not` 自体は許可語彙に
-///   無いため無条件で拒否する）・`Or`（PR #1118〔未マージ〕がマージされるまで
-///   NoSQL `filter` に OR 語彙が無い）・`InSubquery`／`Exists`〔NoSQL に
+///   `Expr` を構築しない〕・`BoolColumn`・`Compare`・`InList`・`Not(Not)`・
+///   `Not(Compare)` 等の許可 5 variant 以外を包む `Not`・`Or`〔述語形 DML の
+///   `or` は #1118 以来の対象外〕・`InSubquery`／`Exists`〔NoSQL に
 ///   サブクエリ構文が無い〕）はすべて `42601` で拒否する（codex-review P2
 ///   指摘対応、PR #1121。`_ => {}` によるワイルドカード許可は将来 variant
 ///   追加時に無言で穴を開けるため使わず、網羅的 `match` にする）。
@@ -1270,30 +1271,49 @@ fn reject_unsupported_predicate_dml_forms(
     }
     for predicate in predicates {
         match predicate {
-            // 契約上 `bind` closure が生成してよい 3 variant のみ許可する
+            // 契約上 `bind` closure が生成してよい 5 variant のみ許可する
             // （関数ドキュメント参照）。
             WherePredicate::Equality { .. }
             | WherePredicate::BoolEquality { .. }
-            | WherePredicate::Prefix { .. } => {}
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. } => {}
+            // `Not` は内側が許可 5 variant のいずれかである場合に限り通す
+            // （再帰はしない。`Not(Not)`・`Not(Compare)` 等は拒否。SQL の
+            // `NOT <葉>` と同じ構文形で、述語形 DML でも SQL 表層より広くならない）。
+            WherePredicate::Not(inner) => match inner.as_ref() {
+                WherePredicate::Equality { .. }
+                | WherePredicate::BoolEquality { .. }
+                | WherePredicate::Prefix { .. }
+                | WherePredicate::Between { .. }
+                | WherePredicate::IsNull { .. } => {}
+                WherePredicate::PredicateCall { .. }
+                | WherePredicate::Expression(_)
+                | WherePredicate::BoolColumn { .. }
+                | WherePredicate::Compare { .. }
+                | WherePredicate::InList { .. }
+                | WherePredicate::Not(_)
+                | WherePredicate::Or(_)
+                | WherePredicate::InSubquery { .. }
+                | WherePredicate::Exists { .. }
+                | WherePredicate::ScalarSubqueryCompare { .. } => {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                        "predicate form is not supported for NoSQL update/delete filter",
+                    ));
+                }
+            },
             // 契約外の variant はすべて拒否する（codex-review P2 指摘対応、
-            // PR #1121）。`_ => {}` によるワイルドカード許可を排し、`WherePredicate`
-            // へ将来 variant が追加された際もコンパイルエラーで気付けるよう
-            // 網羅的に列挙する。`Not` は内側が許可 3 variant（`Equality`・
-            // `BoolEquality`・`Prefix`）であっても、契約が定める NoSQL 述語形
-            // DML の許可語彙（`Not` を含まない）に無いため、内側を再帰検査して
-            // 通す（誤って `Ok` を返す）のではなく `Not` 自体を無条件で拒否する
-            // （codex-review 指摘: `Not(Equality)` が再帰検査を通過していた欠陥）。
+            // PR #1121）。`WherePredicate` へ将来 variant が追加された際も
+            // コンパイルエラーで気付けるよう網羅的に列挙する。
             WherePredicate::PredicateCall { .. }
             | WherePredicate::Expression(_)
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::Compare { .. }
             | WherePredicate::InList { .. }
-            | WherePredicate::Between { .. }
-            | WherePredicate::IsNull { .. }
-            | WherePredicate::Not(_)
             | WherePredicate::Or(_)
             | WherePredicate::InSubquery { .. }
-            | WherePredicate::Exists { .. } => {
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. } => {
                 return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "predicate form is not supported for NoSQL update/delete filter",
                 ));
@@ -2814,7 +2834,11 @@ impl EngineCore {
             // と同じくセッション UDF レジストリを参照しうる束縛経路
             // （`sql::parser::bind_scan`）を通るため、セッションを要する実行本体
             // （`execute_validated_in_session`）へ委譲する。
-            stmt @ crate::sql::allowlist::Statement::Join(_) => {
+            // Issue #1192（TABLE-18）: 評価後射影形ビューへの参照も本文（`Scan`／
+            // `Aggregate`／`Join`）がセッション UDF レジストリを参照しうる束縛
+            // 経路を通るため、同じくセッションを要する実行本体へ委譲する。
+            stmt @ (crate::sql::allowlist::Statement::Join(_)
+            | crate::sql::allowlist::Statement::BufferedView(_)) => {
                 let mut session = crate::sql::mode::SessionState::default();
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
@@ -3192,7 +3216,7 @@ impl EngineCore {
     /// だけをトークン列全体に対して行う）。誤検出（列名 `in`／`exists` の
     /// 通常参照）があっても安全側（拒否）に倒れるだけで、見逃し
     /// （実際にサブクエリを含むのに検出しない）は無い判定条件そのもの
-    /// （`Parser::parse_where_leaf` の受理条件と同一）。
+    /// （`Parser::parse_where_leaf` の受理条件と同一。Issue #1191 でスカラー比較形を追加）。
     fn contains_subquery_syntax(tokens: &[crate::sql::lexer::Token]) -> bool {
         use crate::sql::lexer::{Keyword, Token};
         for i in 0..tokens.len() {
@@ -3202,7 +3226,18 @@ impl EngineCore {
             let is_in = matches!(tokens.get(i + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN"))
                 && matches!(tokens.get(i + 2), Some(Token::Punct('(')))
                 && matches!(tokens.get(i + 3), Some(Token::Keyword(Keyword::Select)));
-            if is_exists || is_in {
+            // スカラーサブクエリ `<col> <op> (SELECT ...)`（Issue #1191）: 比較演算子
+            // トークン（`= < > <= >=`。`<>` は `< >` の 2 トークン）の直後の
+            // `( SELECT` だけを検出する。任意の `( SELECT`（括弧付き集合演算の枝等）へ
+            // 一般化しない（`$n` との併用が従来から受理される形を変えないため）。
+            let is_scalar = matches!(tokens.get(i), Some(Token::Punct('(')))
+                && matches!(tokens.get(i + 1), Some(Token::Keyword(Keyword::Select)))
+                && i > 0
+                && matches!(
+                    tokens.get(i - 1),
+                    Some(Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge)
+                );
+            if is_exists || is_in || is_scalar {
                 return true;
             }
         }
@@ -3934,6 +3969,15 @@ impl EngineCore {
                     .unwrap_or_default();
                 self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
             }
+            // Issue #1192: 評価後射影形ビューも他の読み取り文と同じ経路で読む
+            // （本文が読む全テーブルの未 commit 変更が反映される）。
+            ParsedSql::Statement(stmt @ Statement::BufferedView(v)) => {
+                let table = crate::sql::allowlist::buffered_body_relations(&v.body)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
+            }
             // Issue #1179: 集合演算も他の読み取り文と同じ経路で読む（未 commit の
             // 変更があれば書き込みトランザクションを読み取り源にする）。
             ParsedSql::Statement(stmt @ Statement::SetOperation(v)) => {
@@ -4168,6 +4212,7 @@ impl EngineCore {
             | Statement::Scan(_)
             | Statement::SetOperation(_)
             | Statement::Join(_)
+            | Statement::BufferedView(_)
                 if !is_using_plan_select =>
             {
                 let write_txn = txn.write_txn().ok_or_else(|| {
@@ -4419,6 +4464,31 @@ impl EngineCore {
                 let columns =
                     crate::sql::join::describe_columns(&schemas, validated, session.udfs())?;
                 Ok(Some(columns))
+            }
+            // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
+            // （本文は実行せずに）導出し、外側の射影だけを適用する。
+            ParsedSql::Statement(Statement::BufferedView(validated)) => {
+                let body_parsed = ParsedSql::Statement((*validated.body).clone());
+                // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
+                // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
+                let body_columns = self.describe_parsed_in_session_impl(
+                    session,
+                    &body_parsed,
+                    skip_vector_literal_validation,
+                    &[],
+                )?;
+                match body_columns {
+                    Some(cols) => {
+                        let (_, metas) = crate::sql::view_buffered::resolve_projection(
+                            &cols,
+                            &validated.projection,
+                        )?;
+                        Ok(Some(metas))
+                    }
+                    None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                }
             }
             ParsedSql::Statement(Statement::Select(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
@@ -4775,6 +4845,18 @@ impl EngineCore {
                     &read_txn,
                 )
             }
+            // Issue #1192（TABLE-18）: 評価後射影形ビューは本文を同一スナップ
+            // ショット上で実行してから外側の射影を適用する
+            // （[`Self::execute_read_statement`] の同名アーム参照）。
+            crate::sql::allowlist::Statement::BufferedView(validated) => {
+                let read_txn = self.begin_read_txn()?;
+                self.execute_read_statement(
+                    ctx,
+                    session,
+                    crate::sql::allowlist::Statement::BufferedView(validated),
+                    &read_txn,
+                )
+            }
         }
     }
 
@@ -4817,7 +4899,7 @@ impl EngineCore {
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
-                    &schema,
+                    &[&schema],
                     read_txn,
                     ctx,
                     &self.storage,
@@ -4843,7 +4925,7 @@ impl EngineCore {
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
-                    &schema,
+                    &[&schema],
                     read_txn,
                     ctx,
                     &self.storage,
@@ -4877,6 +4959,35 @@ impl EngineCore {
                 let result =
                     crate::sql::join::execute(read_txn, ctx, &schemas, &validated, session.udfs())?;
                 Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // Issue #1192（TABLE-18・RLS-10 (b)）: 評価後射影形ビュー。本文
+            // （`Scan`／`Aggregate`／`Join`。参照時に再検証済み）を、参照した
+            // セッション自身の `ctx`・同一の `read_txn`（単一スナップショット）で
+            // 既存の実行経路により評価し、結果へ外側の列射影と `LIMIT`／`OFFSET`
+            // だけを適用する。作成者の可視性は引き継がれない（`ctx` は参照者の
+            // もの）。第 2 の実行器は作らない。
+            crate::sql::allowlist::Statement::BufferedView(validated) => {
+                let crate::sql::allowlist::ValidatedBufferedView {
+                    body,
+                    projection,
+                    limit,
+                    offset,
+                    ..
+                } = validated;
+                match self.execute_read_statement(ctx, session, *body, read_txn)? {
+                    crate::sql::SqlOutcome::Query(result) => {
+                        let sliced = crate::sql::view_buffered::project_and_slice(
+                            result,
+                            &projection,
+                            limit,
+                            offset,
+                        )?;
+                        Ok(crate::sql::SqlOutcome::Query(sliced))
+                    }
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    }),
+                }
             }
             _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
@@ -6705,9 +6816,9 @@ impl EngineCore {
     ///    `wire-server::http::query::update::map_set_assignments` と
     ///    `filter::bind_filter_where_predicates` を使う）
     /// 4. `bind` が返した `WherePredicate` 列を検査する（`Equality`／
-    ///    `BoolEquality`／`Prefix` の 3 variant のみ許可し、空列を含む
-    ///    それ以外〔`PredicateCall`／`Expression`／`BoolColumn`／`Compare`／
-    ///    `InList`／`Between`／`IsNull`／`Not`／`Or`／`InSubquery`／`Exists`〕
+    ///    `BoolEquality`／`Prefix`／`Between`／`IsNull` とそれらを直接包む
+    ///    `Not` のみ許可し、空列を含むそれ以外〔`PredicateCall`／`Expression`／
+    ///    `BoolColumn`／`Compare`／`InList`／`Or`／`Not(Not)` 等／`InSubquery`／`Exists`〕
     ///    は `42601` で拒否。NoSQL `filter` 経由では構造上生成されない形への
     ///    多層防御。[`reject_unsupported_predicate_dml_forms`] 参照）
     /// 5. ガード済みの `operation_id`（`bind` closure の外で確定済みの
@@ -10734,7 +10845,9 @@ mod tests {
             max_batch_chunks: 1_000_000,
         };
 
-        let empty_strings: Vec<String> = std::iter::repeat_with(String::new).take(1024).collect();
+        let empty_strings: Vec<Option<String>> = std::iter::repeat_with(|| Some(String::new()))
+            .take(1024)
+            .collect();
         let bound = crate::sql::parser::BoundInsert {
             table: "docs".to_string(),
             id: 1,
@@ -10808,11 +10921,11 @@ mod tests {
 
     // codex-review P2 指摘対応（PR #1121）: `reject_unsupported_predicate_dml_forms`
     // が契約外の `WherePredicate` variant（`Compare`／`BoolColumn`・`Not` に包んだ
-    // `Equality`）を `_ => {}` で通過させていた欠陥の回帰テスト。許可 3 variant
-    // （`Equality`／`BoolEquality`／`Prefix`）は受理し、それ以外はすべて
-    // `42601` で拒否することを確認する。
+    // `Equality`）を `_ => {}` で通過させていた欠陥の回帰テスト。許可 variant
+    // （Issue #1197 で `Between`／`IsNull` と直接包む `Not` を追加）は受理し、
+    // それ以外はすべて `42601` で拒否することを確認する。
     #[test]
-    fn reject_unsupported_predicate_dml_forms_allows_only_the_documented_three_variants() {
+    fn reject_unsupported_predicate_dml_forms_allows_only_the_documented_variants() {
         use crate::sql::allowlist::{CompareOp, WherePredicate};
 
         let allowed = [
@@ -10828,6 +10941,28 @@ mod tests {
                 column: "path".to_string(),
                 pattern: "src/%".to_string(),
             },
+            WherePredicate::Between {
+                column: "amount".to_string(),
+                low: "1".to_string(),
+                high: "2".to_string(),
+            },
+            WherePredicate::IsNull {
+                column: "flag".to_string(),
+                negated: false,
+            },
+            WherePredicate::Not(Box::new(WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            })),
+            WherePredicate::Not(Box::new(WherePredicate::IsNull {
+                column: "flag".to_string(),
+                negated: false,
+            })),
+            WherePredicate::Not(Box::new(WherePredicate::Between {
+                column: "amount".to_string(),
+                low: "1".to_string(),
+                high: "2".to_string(),
+            })),
         ];
         for predicate in allowed {
             assert!(
@@ -10849,23 +10984,39 @@ mod tests {
                 column: "lang".to_string(),
                 values: vec!["ja".to_string()],
             },
-            WherePredicate::Between {
+            // `Not` は許可 5 variant を直接包む場合だけ通す。入れ子の `Not`・
+            // `Or`・`Compare` を包む `Not` は語彙外（再帰的に通過させない）。
+            WherePredicate::Not(Box::new(WherePredicate::Not(Box::new(
+                WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                },
+            )))),
+            WherePredicate::Not(Box::new(WherePredicate::Compare {
                 column: "amount".to_string(),
-                low: "1".to_string(),
-                high: "2".to_string(),
-            },
-            WherePredicate::IsNull {
-                column: "flag".to_string(),
-                negated: false,
-            },
-            // `Not(Equality)` は許可 3 variant の 1 つを包んでいても、
-            // 述語形 DML では `Not` 自体が語彙外（契約は `WherePredicate::Not`
-            // ドキュメント参照）であり、内側の検査を通過させて `Ok` を返して
-            // はならない（欠陥の再現ケース）。
-            WherePredicate::Not(Box::new(WherePredicate::Equality {
-                column: "lang".to_string(),
-                value: "ja".to_string(),
+                op: CompareOp::Lt,
+                value: "1".to_string(),
             })),
+            WherePredicate::Not(Box::new(WherePredicate::Or(vec![
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                }],
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "en".to_string(),
+                }],
+            ]))),
+            WherePredicate::Or(vec![
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                }],
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "en".to_string(),
+                }],
+            ]),
         ];
         for predicate in rejected {
             let err = reject_unsupported_predicate_dml_forms(std::slice::from_ref(&predicate))

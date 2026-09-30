@@ -1945,7 +1945,9 @@ pub(crate) fn execute_grouped_aggregate(
     // 適用する（グループはすでに可視行のみから構成済み〔`sql::aggregate` の
     // 走査ループが RLS を適用してから集約する〕ため、この段で読み飛ばしても RLS
     // 契約は変わらない）。`drain` の範囲は `finished.len()` でクランプし、添字
-    // アクセス（`[]`）を使わない（`.claude/rules/coding-rust.md`）。
+    // アクセス（`[]`）を使わない（`.claude/rules/coding-rust.md`）。直接構築経路
+    // （`BoundAggregate::with_group_offset`・Issue #1198）では `limit` なしでも
+    // `offset` > 0 になりうるが、本段は `limit` の有無に依存しない。
     if group_by.offset > 0 {
         let drop_to = group_by.offset.min(finished.len());
         finished.drain(..drop_to);

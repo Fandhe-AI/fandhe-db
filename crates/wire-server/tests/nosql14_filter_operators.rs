@@ -633,3 +633,213 @@ impl TableLookup for FixedTableLookupForRls {
         Ok(name == TABLE)
     }
 }
+
+/// Issue #1197・NOSQL-14・SQL-24 ポインタ: `ne`・`between`・`like`・
+/// `is_null`／`not_null`・`not` が、同じ意味の SQL `WHERE` と完全に同じ結果集合
+/// （NULL の三値論理を含む）を返すこと、`not` を `or` 群の上に置いても NULL 行が
+/// 返らないこと（fail-open の回帰）、他テナントの行が現れないこと（RLS 境界）を
+/// 実データの scan 実行で固定する。
+#[test]
+fn negation_between_like_null_filters_match_sql_and_respect_tenant_boundary() {
+    let path = temp_db::unique_db_path("nosql14-neg-parity");
+    let _guard = temp_db::CleanupGuard(path.clone());
+
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(4), false),
+            ColumnDef::new("tag", ColumnType::Text, true),
+            ColumnDef::new("created", ColumnType::Date, true),
+            ColumnDef::new("qty", ColumnType::Integer, true),
+        ],
+    );
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema).expect("create table");
+    let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+        .expect("valid tenant-a ctx");
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant-b ctx");
+
+    type Row = (u64, Option<&'static str>, Option<i32>, Option<i32>);
+    let rows_a: [Row; 5] = [
+        (1, Some("alpha"), Some(19732), Some(1)),
+        (2, Some("beta"), Some(19763), Some(2)),
+        (3, Some("gamma"), None, Some(3)),
+        (4, None, Some(19792), None),
+        (5, Some("alphabet"), Some(19823), Some(5)),
+    ];
+    let rows_b: [Row; 2] = [
+        (100, Some("alpha"), Some(19763), Some(2)),
+        (101, None, None, None),
+    ];
+    for (ctx, vis, rows) in [
+        (&ctx_a, Visibility::Public, rows_a.as_slice()),
+        (&ctx_b, Visibility::Private, rows_b.as_slice()),
+    ] {
+        for &(id, tag, created, qty) in rows {
+            let op = engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id");
+            engine::tenant::insert_typed_row(
+                &storage,
+                TABLE,
+                ctx,
+                id,
+                vis,
+                &[
+                    Value::Vector(vec![1.0, 0.0, 0.0, 0.0]),
+                    tag.map_or(Value::Null, |t| Value::Text(t.to_string())),
+                    created.map_or(Value::Null, Value::Date),
+                    qty.map_or(Value::Null, Value::Integer),
+                ],
+                &op,
+            )
+            .expect("insert row");
+        }
+    }
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let session = SessionState::default();
+
+    let cases: [(&str, &str); 20] = [
+        (
+            r#"[{"column":"tag","op":"ne","value":"alpha"}]"#,
+            "NOT tag = 'alpha'",
+        ),
+        (r#"[{"column":"qty","op":"ne","value":2}]"#, "NOT qty = 2"),
+        (
+            r#"[{"column":"created","op":"between","value":["2024-02-01","2024-03-31"]}]"#,
+            "created BETWEEN '2024-02-01' AND '2024-03-31'",
+        ),
+        (
+            r#"[{"column":"qty","op":"between","value":[2,3]}]"#,
+            "qty >= 2 AND qty <= 3",
+        ),
+        (
+            r#"[{"column":"tag","op":"like","value":"%pha%"}]"#,
+            "tag LIKE '%pha%'",
+        ),
+        (
+            r#"[{"column":"tag","op":"like","value":"%a"}]"#,
+            "tag LIKE '%a'",
+        ),
+        (
+            r#"[{"column":"tag","op":"like","value":"_eta"}]"#,
+            "tag LIKE '_eta'",
+        ),
+        (r#"[{"column":"tag","op":"is_null"}]"#, "tag IS NULL"),
+        (r#"[{"column":"tag","op":"not_null"}]"#, "tag IS NOT NULL"),
+        (
+            r#"[{"not":{"column":"tag","op":"eq","value":"alpha"}}]"#,
+            "NOT tag = 'alpha'",
+        ),
+        (
+            r#"[{"not":{"column":"tag","op":"like","value":"al%"}}]"#,
+            "NOT tag LIKE 'al%'",
+        ),
+        (
+            r#"[{"not":{"column":"created","op":"between","value":["2024-02-01","2024-03-31"]}}]"#,
+            "created NOT BETWEEN '2024-02-01' AND '2024-03-31'",
+        ),
+        (
+            r#"[{"not":{"or":[{"column":"tag","op":"eq","value":"alpha"},{"column":"qty","op":"is_null"}]}}]"#,
+            "NOT (tag = 'alpha' OR qty IS NULL)",
+        ),
+        (
+            r#"[{"not":{"or":[{"column":"tag","op":"eq","value":"alpha"},{"column":"qty","op":"gt","value":2}]}}]"#,
+            "NOT (tag = 'alpha' OR qty > 2)",
+        ),
+        (
+            r#"[{"not":{"not":{"column":"tag","op":"eq","value":"alpha"}}}]"#,
+            "tag = 'alpha'",
+        ),
+        (
+            r#"[{"not":{"column":"qty","op":"eq","value":2}}]"#,
+            "NOT qty = 2",
+        ),
+        (
+            r#"[{"not":{"column":"qty","op":"between","value":[2,3]}}]"#,
+            "NOT (qty >= 2 AND qty <= 3)",
+        ),
+        (
+            r#"[{"column":"tag","op":"not_null"},{"not":{"column":"qty","op":"is_null"}}]"#,
+            "tag IS NOT NULL AND qty IS NOT NULL",
+        ),
+        (
+            r#"[{"or":[{"column":"tag","op":"ne","value":"alpha"},{"column":"qty","op":"is_null"}]}]"#,
+            "NOT tag = 'alpha' OR qty IS NULL",
+        ),
+        (
+            r#"[{"column":"tag","op":"ne","value":"nomatch"}]"#,
+            "NOT tag = 'nomatch'",
+        ),
+    ];
+    let run_nosql = |filter_json: &str| {
+        let JsonValue::Array(items) = parse_json(filter_json).expect("valid JSON") else {
+            panic!("expected array");
+        };
+        core.execute_bound_scan_in_session(&ctx_a, &session, TABLE, |schema, udfs| {
+            let bound_filters =
+                bind_filter(&items, schema, udfs).map_err(FilterError::into_sql_surface_error)?;
+            let (metadata_filters, expr_filters, or_filters) = bound_filters.into_parts();
+            Ok(BoundScan::new(
+                TABLE.to_string(),
+                vec![engine::sql::parser::ProjectedColumn::Id],
+                metadata_filters,
+                expr_filters,
+                100,
+            )
+            .with_or_filters(or_filters))
+        })
+        .unwrap_or_else(|e| panic!("nosql filter {filter_json} must execute: {e:?}"))
+    };
+    let run_sql = |where_clause: &str| {
+        core.execute_bound_scan_in_session(&ctx_a, &session, TABLE, |schema, udfs| {
+            let sql_validated = validate_sql(
+                &format!("SELECT id FROM docs WHERE {where_clause} LIMIT 100"),
+                &FixedTableLookupForRls,
+            )?;
+            let Statement::Scan(validated_scan) = sql_validated else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "expected Statement::Scan".to_string(),
+                });
+            };
+            bind_scan(&validated_scan, schema, udfs)
+        })
+        .unwrap_or_else(|e| panic!("sql {where_clause} must execute: {e:?}"))
+    };
+    let sorted_rows = |r: &engine::sql::exec::QueryResult| {
+        let mut v: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| format!("{:?}", row.cells))
+            .collect();
+        v.sort();
+        v
+    };
+    for (filter_json, where_clause) in cases {
+        let nosql = run_nosql(filter_json);
+        let sql = run_sql(where_clause);
+        assert_eq!(
+            sorted_rows(&nosql),
+            sorted_rows(&sql),
+            "NoSQL filter {filter_json} must match SQL WHERE {where_clause}"
+        );
+        for row in &nosql.rows {
+            let cell = format!("{:?}", row.cells);
+            assert!(
+                !cell.contains("100") && !cell.contains("101"),
+                "tenant-b row leaked for {filter_json}: {cell}"
+            );
+        }
+    }
+
+    // 空振り防止と fail-open 回帰: NULL を持つ行 4（tag NULL・qty NULL）は
+    // `not(or(...))` に UNKNOWN で落ちるため返らない。
+    let result = run_nosql(
+        r#"[{"not":{"or":[{"column":"tag","op":"eq","value":"alpha"},{"column":"qty","op":"gt","value":2}]}}]"#,
+    );
+    assert_eq!(result.rows.len(), 1, "only id 2 (beta, qty 2) qualifies");
+    let result = run_nosql(r#"[{"column":"tag","op":"ne","value":"alpha"}]"#);
+    assert_eq!(result.rows.len(), 3, "NULL tag row must be excluded");
+}

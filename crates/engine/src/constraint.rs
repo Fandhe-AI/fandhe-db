@@ -595,6 +595,66 @@ where
     Ok(false)
 }
 
+/// `ALTER TABLE ... ADD PRIMARY KEY`（TABLE-22 (d)、Issue #1196）が主キー追加前に
+/// 呼ぶ既存行の NULL 検査。`row_table`（対象テーブルの行ストア全体）を**全テナント・
+/// `Public`／`Private` を問わず**走査し、`columns` のいずれかが NULL の行が 1 件でも
+/// あれば最初に見つけた NULL 列名を返す（列名はスキーマ情報でありテナント・行・値を
+/// 含まない）。呼び出し元は `catalog::Storage::alter_table_add_primary_key`。
+///
+/// **契約**: `schema` は**変更前**のスキーマ（PK 構成列がまだ nullable のもの）を渡す。
+/// `row_codec::scan_scalar_columns_masked` は行バッファの末尾で途切れた列を nullable
+/// の場合に限り「欠落＝NULL」として許容する。`ADD COLUMN`（DEFAULT なし）より前に
+/// 書かれた行には当該列のバイトが無いため、先に `nullable=false` へ書き換えた
+/// スキーマで走査すると decode エラー（`XX000`）になり `23502` として検出できない。
+/// DEFAULT 付き列の欠落は既定値として読まれるため NULL ではない。
+/// 行ヘッダのテナントと物理キーの整合（TABLE-12）を確認し、不整合・decode 失敗は
+/// `CorruptSchema` へ丸めて fail-closed にする（詳細はクライアントへ渡さない）。
+pub(crate) fn table_first_null_in_columns<T>(
+    row_table: &T,
+    schema: &TableSchema,
+    columns: &[String],
+) -> Result<Option<String>, CatalogError>
+where
+    T: ReadableTable<(&'static str, u64), &'static [u8]>,
+{
+    let mut indices: Vec<(usize, &str)> = Vec::with_capacity(columns.len());
+    for name in columns {
+        let idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| {
+                CatalogError::Invalid(format!("primary key references unknown column: {name}"))
+            })?;
+        indices.push((idx, name.as_str()));
+    }
+    let mut mask = vec![false; schema.columns.len()];
+    for &(idx, _) in &indices {
+        if let Some(slot) = mask.get_mut(idx) {
+            *slot = true;
+        }
+    }
+    for entry in row_table.iter()? {
+        let (k, v) = entry?;
+        let (key_tenant, _id) = k.value();
+        let buf = v.value();
+        let (row_tenant, _visibility, _offset) = crate::storage::decode_row_header(buf)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        let (_dim, metadata) = crate::storage::decode_row_dim_and_metadata_borrowed(buf)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        let values = crate::row_codec::scan_scalar_columns_masked(schema, metadata, Some(&mask))
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        for &(idx, name) in &indices {
+            if values.get(idx).and_then(|v| v.as_ref()).is_none() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// `ALTER TABLE ... ADD CHECK`（TABLE-16・TASK-204、Issue #1068）が新しい CHECK
 /// 制約を追加する前に、対象テーブルの**既存行全件**（全テナント・`Public`／
 /// `Private` を問わない。DDL はテナント横断の共有資源〔カタログ〕を変更する
@@ -734,7 +794,7 @@ pub(crate) fn key_bytes(
 ///   正規化テキスト。キー順・空白だけでなく数値も値として正規化する）。
 /// - 配列: `[要素タグ: u8][要素数: u32 BE][要素列の生ペイロード]`。
 ///   [`crate::row_codec::ArrayRef::payload`] のエンコーダ決定性（要素順保持・
-///   flags 固定・代替表現なし）により、この組は値に対して単射になる。
+///   flags は NULL 要素の有無だけで決まる・代替表現なし）により、この組は値に対して単射になる。
 pub(crate) fn push_canonical_component(
     out: &mut Vec<u8>,
     value: ScalarRef<'_>,
@@ -819,7 +879,14 @@ pub(crate) fn push_canonical_component(
         }
         ScalarRef::Array(a) => {
             let mut payload = Vec::new();
-            payload.push(array_elem_tag(a.elem()));
+            // NULL 要素を含む配列は要素タグへ 0x80 を立て、NULL を含まない配列の
+            // キー（既存値。バイト列不変）と先頭バイトで区別する（Issue #1193）。
+            let null_mark = if a.flags() == 0 {
+                0
+            } else {
+                ARRAY_KEY_NULL_MARK
+            };
+            payload.push(array_elem_tag(a.elem()) | null_mark);
             payload.extend_from_slice(&a.count().to_be_bytes());
             payload.extend_from_slice(a.payload());
             push_len_prefixed(out, ColumnType::ARRAY_UNIQUE_KEY_TAG, &payload)
@@ -887,6 +954,7 @@ pub(crate) fn unique_key_from_values(
                 ScalarRef::Array(crate::row_codec::ArrayRef::from_owned(
                     a.elem(),
                     count,
+                    a.frame_flags(),
                     &array_payload,
                 ))
             }
@@ -931,8 +999,18 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
     match elem {
         crate::catalog::ArrayElemType::Text => 0,
         crate::catalog::ArrayElemType::Bool => 1,
+        crate::catalog::ArrayElemType::Integer => 2,
+        crate::catalog::ArrayElemType::BigInt => 3,
+        crate::catalog::ArrayElemType::Real => 4,
+        crate::catalog::ArrayElemType::Double => 5,
+        crate::catalog::ArrayElemType::Date => 6,
+        crate::catalog::ArrayElemType::Timestamp => 7,
+        crate::catalog::ArrayElemType::Uuid => 8,
     }
 }
+
+/// NULL 要素を含む配列の一意キー要素タグへ立てるマーカービット（Issue #1193）。
+const ARRAY_KEY_NULL_MARK: u8 = 0x80;
 
 /// `FOREIGN KEY` 1 件分の参照元側の検査仕様（TABLE-17・TASK-205、Issue #907）。
 struct ForeignKeySpec<'a> {
@@ -3484,7 +3562,7 @@ mod tests {
                 Value::Null,
                 Value::Null,
                 Value::Array(crate::row_codec::ArrayValue::Text(
-                    items.iter().map(|s| s.to_string()).collect(),
+                    items.iter().map(|s| Some(s.to_string())).collect(),
                 )),
             ]
         };

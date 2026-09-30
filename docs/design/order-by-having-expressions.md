@@ -68,6 +68,9 @@
 - 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー、位置指定 `ORDER BY 1`、`NULLS FIRST/LAST`。
 - `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
 - NoSQL（HTTP）表層、JOIN・集合演算・ウィンドウ・`EXPLAIN` と式 `ORDER BY` の併用。
+- 評価後射影形ビュー（集計・`LIMIT` 本文のビュー。Issue #1192）への外側 `ORDER BY` の式キー（列名キーと
+  同じく `42601`）。ウィンドウ関数・集合演算の枝内 `ORDER BY` との併用も、列名キーに限り併用可能にした
+  後続（Issue #1189・#1191）とは別に、式キーを含む場合は `42601` とする（並べ替えを黙って落とさない）。
 - SQLSTATE の `42883`／`42804` への移行（既存の束縛エラー経路を使うため移行はそのまま効く）。
 
 ## PostgreSQL との既知の差分

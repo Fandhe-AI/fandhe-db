@@ -620,8 +620,8 @@ fn copy_from_stdin_text_format_binds_boolean_array_bytea_enum_columns() {
         vec![
             Cell::Bool(true),
             Cell::Array(engine::row_codec::ArrayValue::Text(vec![
-                "ja".to_string(),
-                "en".to_string()
+                Some("ja".to_string()),
+                Some("en".to_string())
             ])),
             Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
             Cell::Text("happy".to_string()),
@@ -652,8 +652,8 @@ fn copy_from_stdin_csv_format_binds_boolean_array_bytea_enum_columns() {
         vec![
             Cell::Bool(false),
             Cell::Array(engine::row_codec::ArrayValue::Text(vec![
-                "ja".to_string(),
-                "en".to_string()
+                Some("ja".to_string()),
+                Some("en".to_string())
             ])),
             Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
             Cell::Text("sad".to_string()),
@@ -933,8 +933,8 @@ fn copy_to_stdout_projects_boolean_array_bytea_enum_columns() {
             Cell::Integer(1),
             Cell::Bool(true),
             Cell::Array(engine::row_codec::ArrayValue::Text(vec![
-                "ja".to_string(),
-                "en".to_string()
+                Some("ja".to_string()),
+                Some("en".to_string())
             ])),
             Cell::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
             Cell::Text("happy".to_string()),

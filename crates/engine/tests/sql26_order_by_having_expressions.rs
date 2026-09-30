@@ -624,3 +624,89 @@ fn explain_still_rejects_expression_order_by_and_having() {
         assert_eq!(run_err(&core, &ctx, sql), "42601", "{sql}");
     }
 }
+
+// ---------- 後続機能との併用境界（main 取り込み時に追加した拒否・検査経路） ----------
+
+fn session_err(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    sql: &str,
+) -> &'static str {
+    core.execute_sql_in_session(ctx, session, sql)
+        .expect_err(&format!("query must fail: {sql}"))
+        .wire_code()
+}
+
+/// 式キーの `ORDER BY` は、ウィンドウ関数（Issue #1189 で併用可能になったのは列名キーのみ）・
+/// 集合演算の枝内の `ORDER BY`（Issue #1191）とは併用できず `42601`。黙って並べ替えを
+/// 落として `LIMIT` を適用しない。
+#[test]
+fn expression_order_by_rejects_window_and_set_branch_combinations() {
+    let (core, _g) = build("sql26-ob-combos", &[]);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM docs ORDER BY lower(title) LIMIT 5",
+        "(SELECT lang FROM docs ORDER BY lower(title) LIMIT 2) \
+         UNION ALL (SELECT lang FROM docs ORDER BY lang LIMIT 1)",
+    ] {
+        assert_eq!(run_err(&core, &ctx, sql), "42601", "{sql}");
+    }
+    // 列名キーのみなら従来どおり併用できる（上の拒否が式キーに限られることの対照）。
+    let ok = run(
+        &core,
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM docs ORDER BY lang, id LIMIT 3",
+    );
+    assert_eq!(ok.rows.len(), 3);
+}
+
+/// 評価後射影形ビュー（集計本文。Issue #1192）への外側 `ORDER BY` の式キーは `42601`
+/// （列名キーと同じく外側は `LIMIT`／`OFFSET` のみ受理。式キーを黙って落とさない）。
+/// 列を絞ったビューを基にした集計では、式 `HAVING`／`ORDER BY` を公開列・項目名の
+/// 範囲で受理し、非公開列への参照は拒否する。
+#[test]
+fn expression_order_by_and_having_over_views() {
+    let (core, _g) = build("sql26-ob-views", &[]);
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    for ddl in [
+        "CREATE VIEW va AS SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang",
+        "CREATE VIEW vt AS SELECT title, lang FROM docs",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut session, ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e:?}"));
+    }
+    assert_eq!(
+        session_err(
+            &core,
+            &ctx,
+            &mut session,
+            "SELECT * FROM va ORDER BY lower(lang) LIMIT 3",
+        ),
+        "42601"
+    );
+    let ok = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT lang, COUNT(*) AS c FROM vt GROUP BY lang \
+             HAVING abs(c - 3) < 1 ORDER BY CASE WHEN c > 2 THEN 0 ELSE 1 END, lower(lang) DESC",
+        )
+        .expect("aggregate over view with expression HAVING/ORDER BY");
+    match ok {
+        SqlOutcome::Query(rows) => assert_eq!(lang_rows(&rows), vec!["ja", "en"]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    for sql in [
+        "SELECT lang, COUNT(*) AS c FROM vt GROUP BY lang ORDER BY abs(n)",
+        "SELECT lang, COUNT(*) AS c FROM vt GROUP BY lang HAVING abs(n) > 0",
+    ] {
+        assert_eq!(
+            session_err(&core, &ctx, &mut session, sql),
+            "22000",
+            "{sql}"
+        );
+    }
+}

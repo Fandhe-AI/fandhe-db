@@ -1008,3 +1008,100 @@ fn cross_surface_vector_value_nosql_then_sql_resend_is_duplicate() {
     common::expect_error_response_with_sqlstate(&mut sql, "23505");
     common::read_ready_for_query(&mut sql);
 }
+
+// --- Issue #1197・NOSQL-14: 述語形 DML の `ne`／`like`／`is_null`／`not_null`／
+//         `not` が SQL 表層と同一の実行結果・台帳照合（content_hash）を持つ ------
+
+/// (NoSQL の filter 配列 JSON, 等価な SQL の WHERE 句)。いずれも `lang = 'ja'` の
+/// 行だけに一致する（seed は ja・en の 2 行）。
+const PREDICATE_DML_PARITY_CASES: [(&str, &str); 5] = [
+    (
+        r#"[{"column":"lang","op":"ne","value":"en"}]"#,
+        "NOT lang = 'en'",
+    ),
+    (
+        r#"[{"column":"lang","op":"like","value":"%a"}]"#,
+        "lang LIKE '%a'",
+    ),
+    (
+        r#"[{"column":"lang","op":"not_null"},{"column":"lang","op":"like","value":"j_"}]"#,
+        "lang IS NOT NULL AND lang LIKE 'j_'",
+    ),
+    (
+        r#"[{"not":{"column":"lang","op":"prefix","value":"e"}}]"#,
+        "NOT lang LIKE 'e%'",
+    ),
+    (
+        r#"[{"not":{"column":"lang","op":"eq","value":"en"}}]"#,
+        "NOT lang = 'en'",
+    ),
+];
+
+#[test]
+fn cross_surface_predicate_delete_new_operators_resend_is_duplicate() {
+    for (i, (filter_json, where_clause)) in PREDICATE_DML_PARITY_CASES.iter().enumerate() {
+        let (core, _guard) = new_core();
+        let (both, mut sql) = spawn_both(core.clone());
+        query(
+            &both,
+            &insert_body(1, "ja", &format!("n12-1197-seed-a-{i}")),
+        );
+        query(
+            &both,
+            &insert_body(2, "en", &format!("n12-1197-seed-b-{i}")),
+        );
+
+        let op_id = format!("n12-1197-del-{i}");
+        common::send_simple_query(
+            &mut sql,
+            &format!("DELETE FROM docs WHERE {where_clause} USING OPERATION_ID '{op_id}'"),
+        );
+        let tag = common::read_command_complete(&mut sql);
+        assert_eq!(tag, "DELETE 1", "{where_clause}");
+        common::read_ready_for_query(&mut sql);
+
+        let body = format!(
+            r#"{{"op":"delete","table":"docs","filter":{filter_json},"operation_id":"{op_id}"}}"#
+        );
+        let resp = query(&both, body.as_bytes());
+        assert_eq!(resp.status, 409, "{filter_json}: resp={resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), "23505", "{filter_json}");
+    }
+}
+
+#[test]
+fn predicate_update_and_delete_with_new_operators_apply_and_reject_forms() {
+    let (core, _guard) = new_core();
+    let (both, _sql) = spawn_both(core.clone());
+    query(&both, &insert_body(1, "ja", "n12-1197-own-1"));
+    query(&both, &insert_body(2, "en", "n12-1197-own-2"));
+
+    // `ne` の更新が自テナントの全一致行へ届く（他テナント境界は既存テストが担う）。
+    let resp = query(
+        &both,
+        br#"{"op":"update","table":"docs","set":{"lang":"xx"},"filter":[{"column":"lang","op":"ne","value":"zzz"}],"operation_id":"n12-1197-upd-ne"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    let langs = read_back_langs(&core);
+    assert!(
+        langs
+            .iter()
+            .any(|(id, l)| *id == 1 && l.as_deref() == Some("xx"))
+            && langs
+                .iter()
+                .any(|(id, l)| *id == 2 && l.as_deref() == Some("xx")),
+        "own rows must be updated: {langs:?}"
+    );
+
+    // `not(like)` で 0 件一致でも成功（updated/deleted 0）。`or` は述語形 DML で 42601。
+    let resp = query(
+        &both,
+        br#"{"op":"delete","table":"docs","filter":[{"not":{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}}],"operation_id":"n12-1197-del-notor"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    let resp = query(
+        &both,
+        br#"{"op":"delete","table":"docs","filter":[{"column":"lang","op":"lt","value":"a"}],"operation_id":"n12-1197-del-lt"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+}

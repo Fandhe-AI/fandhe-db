@@ -188,6 +188,9 @@ matches_legacy_encoder`）で固定している。シグネチャは
   （`docs/design/wire-type-oid-mapping.md` 参照）。数値・真偽値・
   bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`DATE`／`TIMESTAMP`／
   `JSON`／`JSONB`・集計列（`Computed`）は引き続き非対応
-- 3 クライアントのバイナリ受信モードでの値一致（層 B）→ #934 完了後の
-  別 Issue（本 doc の対象外のまま）
+- 3 クライアントのバイナリ受信モードでの値一致（層 B）→ **Issue #1176 で実施済み**
+  （`three_client_extended_e2e.rs`。psycopg・node pg でテキスト結果との一致を確認。
+  psql は結果のバイナリ受信モードを持たず対象外。node pg はバイナリ DataRow を
+  UTF-8 文字列として読むため 0x80 以上のバイトを含む値は検証対象外とし、
+  psycopg と層 A で担保する）
 - カーソル（WIRE-15）→ #937

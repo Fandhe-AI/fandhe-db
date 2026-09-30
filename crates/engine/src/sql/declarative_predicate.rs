@@ -13,7 +13,7 @@
 use crate::catalog::TableSchema;
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::udf_call::{self, BoundExpr, Expr, ExprType, UdfRegistry};
+use crate::sql::udf_call::{self, BinOp, BoundExpr, Expr, ExprType, UdfRegistry};
 use crate::sql::where_tree::{BoundConjunction, BoundOrGroup};
 
 /// クレート外（`wire-server`）が組み立てる、束縛前の述語ツリー 1 要素。
@@ -241,6 +241,97 @@ fn bind_one(
     }
 }
 
+/// 連言（`AND` 列）の否定を、`Not` を `Or`／`AND` 群の上に残さない連言として
+/// 返す（Issue #1197・NOSQL-14 の `not` グループ。`sql::where_negation::
+/// negate_conjunction` の [`DeclarativePredicate`] 版で、同じ否定表に従う）。
+///
+/// 呼び出し文脈: `wire-server` の `http::query::filter` が `{"not": ...}` を束縛
+/// する際に呼ぶ。二値評価器（`sql::where_tree`）は UNKNOWN を false として扱うため、
+/// 群の上へ否定を置くと NULL 行で UNKNOWN が真へ反転し fail-open になる。そこで
+/// De Morgan で否定を葉まで押し下げる（分配はしないので展開は線形。`Eq` 式のみ
+/// 1 葉が 2 葉になる）。
+///
+/// | 入力 | 結果 |
+/// | ---- | ---- |
+/// | 空の列 | `42601`（fail-closed） |
+/// | `[p]` | `¬p` |
+/// | `[p1..pn]`（n≥2） | `[Or([¬p1], ..., [¬pn])]` |
+/// | `Leaf(f)` | 否定を畳み込んだ `Leaf`（`Not`・`IS [NOT] NULL` は反転） |
+/// | `Expr(a > b)` 等 | 演算子反転（`>`↔`<=`、`<`↔`>=`） |
+/// | `Expr(a = b)` | `Or([a < b], [a > b])` |
+/// | 上記以外の `Expr` | `42601` |
+/// | `Or(branches)` | 各分岐の否定を連結（`AND`） |
+///
+/// 上限（葉数・深さ）は後段の [`bind_declarative_predicates`] が再検査する。
+pub fn negate_conjunction(
+    preds: Vec<DeclarativePredicate>,
+) -> Result<Vec<DeclarativePredicate>, SqlSurfaceError> {
+    let mut iter = preds.into_iter();
+    let Some(first) = iter.next() else {
+        return Err(SqlSurfaceError::unsupported(
+            "NOT must be followed by a predicate",
+        ));
+    };
+    let Some(second) = iter.next() else {
+        return negate_one(first);
+    };
+    let mut branches = vec![negate_one(first)?, negate_one(second)?];
+    for p in iter {
+        branches.push(negate_one(p)?);
+    }
+    Ok(vec![DeclarativePredicate::Or(branches)])
+}
+
+/// [`negate_conjunction`] の 1 要素分（否定表の各行）。
+fn negate_one(pred: DeclarativePredicate) -> Result<Vec<DeclarativePredicate>, SqlSurfaceError> {
+    match pred {
+        DeclarativePredicate::Or(branches) => {
+            let mut out = Vec::new();
+            for branch in branches {
+                out.extend(negate_conjunction(branch)?);
+            }
+            Ok(out)
+        }
+        DeclarativePredicate::Leaf(filter) => {
+            Ok(vec![DeclarativePredicate::Leaf(filter.negate_folded())])
+        }
+        DeclarativePredicate::Expr(Expr::Binary { op, lhs, rhs }) => match op {
+            BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
+                let flipped = match op {
+                    BinOp::Gt => BinOp::Le,
+                    BinOp::Lt => BinOp::Ge,
+                    BinOp::Ge => BinOp::Lt,
+                    _ => BinOp::Gt,
+                };
+                Ok(vec![DeclarativePredicate::Expr(Expr::Binary {
+                    op: flipped,
+                    lhs,
+                    rhs,
+                })])
+            }
+            BinOp::Eq => {
+                let lt = DeclarativePredicate::Expr(Expr::Binary {
+                    op: BinOp::Lt,
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                });
+                let gt = DeclarativePredicate::Expr(Expr::Binary {
+                    op: BinOp::Gt,
+                    lhs,
+                    rhs,
+                });
+                Ok(vec![DeclarativePredicate::Or(vec![vec![lt], vec![gt]])])
+            }
+            _ => Err(SqlSurfaceError::unsupported(
+                "NOT must be followed by a comparison",
+            )),
+        },
+        DeclarativePredicate::Expr(_) => Err(SqlSurfaceError::unsupported(
+            "NOT must be followed by a comparison",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +475,99 @@ mod tests {
         let err = bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default())
             .expect_err("must reject");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    fn eq_leaf(col: &str, v: &str) -> DeclarativePredicate {
+        DeclarativePredicate::Leaf(DeclarativeFilter::equals(col, v))
+    }
+
+    fn cmp_expr(op: udf_call::BinOp, col: &str, n: &str) -> DeclarativePredicate {
+        DeclarativePredicate::Expr(Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ident(col.to_string())),
+            rhs: Box::new(Expr::Number(n.to_string())),
+        })
+    }
+
+    #[test]
+    fn negate_leaf_wraps_and_double_negation_folds() {
+        let once = negate_conjunction(vec![eq_leaf("lang", "ja")]).unwrap();
+        assert_eq!(
+            once,
+            vec![DeclarativePredicate::Leaf(
+                DeclarativeFilter::equals("lang", "ja").negate()
+            )]
+        );
+        let twice = negate_conjunction(once).unwrap();
+        assert_eq!(twice, vec![eq_leaf("lang", "ja")]);
+    }
+
+    #[test]
+    fn negate_is_null_flips_to_is_not_null() {
+        let out = negate_conjunction(vec![DeclarativePredicate::Leaf(
+            DeclarativeFilter::is_null("count"),
+        )])
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![DeclarativePredicate::Leaf(DeclarativeFilter::is_not_null(
+                "count"
+            ))]
+        );
+    }
+
+    #[test]
+    fn negate_expr_flips_ordering_and_splits_eq() {
+        use udf_call::BinOp;
+        assert_eq!(
+            negate_conjunction(vec![cmp_expr(BinOp::Gt, "count", "1")]).unwrap(),
+            vec![cmp_expr(BinOp::Le, "count", "1")]
+        );
+        assert_eq!(
+            negate_conjunction(vec![cmp_expr(BinOp::Ge, "count", "1")]).unwrap(),
+            vec![cmp_expr(BinOp::Lt, "count", "1")]
+        );
+        assert_eq!(
+            negate_conjunction(vec![cmp_expr(BinOp::Eq, "count", "1")]).unwrap(),
+            vec![DeclarativePredicate::Or(vec![
+                vec![cmp_expr(BinOp::Lt, "count", "1")],
+                vec![cmp_expr(BinOp::Gt, "count", "1")],
+            ])]
+        );
+    }
+
+    #[test]
+    fn negate_conjunction_applies_de_morgan() {
+        let a = eq_leaf("lang", "ja");
+        let b = eq_leaf("lang", "en");
+        let not = |p: &DeclarativePredicate| match p {
+            DeclarativePredicate::Leaf(f) => DeclarativePredicate::Leaf(f.clone().negate()),
+            _ => unreachable!(),
+        };
+        // NOT (a AND b) = Or([NOT a], [NOT b])
+        assert_eq!(
+            negate_conjunction(vec![a.clone(), b.clone()]).unwrap(),
+            vec![DeclarativePredicate::Or(vec![vec![not(&a)], vec![not(&b)]])]
+        );
+        // NOT (a OR b) = [NOT a, NOT b]
+        assert_eq!(
+            negate_conjunction(vec![DeclarativePredicate::Or(vec![
+                vec![a.clone()],
+                vec![b.clone()]
+            ])])
+            .unwrap(),
+            vec![not(&a), not(&b)]
+        );
+    }
+
+    #[test]
+    fn negate_rejects_empty_and_non_comparison_expr() {
+        let err = negate_conjunction(vec![]).expect_err("empty must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+        let err = negate_conjunction(vec![DeclarativePredicate::Expr(Expr::Number(
+            "1".to_string(),
+        ))])
+        .expect_err("non-comparison expr must be rejected");
+        assert_eq!(err.wire_code(), "42601");
     }
 }
