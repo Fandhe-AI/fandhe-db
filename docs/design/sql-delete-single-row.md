@@ -120,8 +120,9 @@ delete_resending_used_operation_id_hits_ledger_before_ownership_check` が固定
 ## 削除スコープ: 「所有（`is_owner`）∩ 可視（`is_visible`）」
 
 > **改訂注記（Issue #1251・2026-09-30）**: 削除対象を「所有」のみから「所有 ∩ 可視」へ
-> 改訂した（親 Issue #1250）。実装追随は #1253 で、マージまでコードは旧挙動（所有のみ）
-> である。設計全体は `docs/design/sql-returning.md`「対象選定・RLS 再判定と不変条件」
+> 改訂した（親 Issue #1250）。SQL 経路の id 指定 DELETE は #1253 で実装済み。Rust の
+> 行 API（`delete_row`・`EngineCore::delete_row`）は `update_row` と同じく所有のみで
+> 据え置く。設計全体は `docs/design/sql-returning.md`「対象選定・RLS 再判定と不変条件」
 > 節を参照。
 
 削除対象は `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御に加え、RLS 可視性

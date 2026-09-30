@@ -667,3 +667,47 @@ fn execute_delete_sql_direct_entry_point_matches_session_dispatch_contract() {
     assert_eq!(outcome.rows_affected, 1);
     assert_eq!(count_star(&core, &alice, TABLE), 0);
 }
+
+/// 対象選定は「所有かつ可視」（RLS-10・SQL-21。Issue #1253）: Public のみ可視の
+/// `PolicyContext` では自テナントの Private 行への id 指定 DELETE は 0 行成功になり
+/// 行は残る。台帳は commit されるため同一 `operation_id` の再送は `23505`。
+/// Public＋Private の可視集合では削除できる。
+#[test]
+fn delete_does_not_target_owned_but_invisible_row() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_both = ctx_for("alice", true);
+    let alice_public_only = ctx_for("alice", false);
+    // SQL の INSERT は Private 固定。
+    insert_row(&core, &alice_both, TABLE, 1, "a", "1");
+
+    let mut session = SessionState::default();
+    let sql = format!("DELETE FROM {TABLE} WHERE id = 1 USING OPERATION_ID 'op-invisible'");
+    match core
+        .execute_sql_in_session(&alice_public_only, &mut session, &sql)
+        .expect("invisible target is a 0-row success")
+    {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice_both, TABLE), 1);
+
+    let err = core
+        .execute_sql_in_session(&alice_public_only, &mut session, &sql)
+        .expect_err("resend of a recorded operation_id must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(count_star(&core, &alice_both, TABLE), 1);
+
+    match core
+        .execute_sql_in_session(
+            &alice_both,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 1 USING OPERATION_ID 'op-visible'"),
+        )
+        .expect("visible target is deleted")
+    {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 1),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice_both, TABLE), 0);
+}

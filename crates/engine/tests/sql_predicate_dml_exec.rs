@@ -1204,3 +1204,45 @@ fn predicate_update_succeeds_when_target_tenant_has_no_rows_and_following_tenant
         "bob's rows must remain untouched"
     );
 }
+
+/// 述語形 UPDATE／DELETE の対象は「所有かつ可視」（RLS-10・SQL-21。Issue #1253）:
+/// Public のみ可視の `PolicyContext` では自テナントの Private 行・他テナント行は
+/// 対象にならず 0 件成功。Public＋Private では自テナントの一致行が対象になる。
+#[test]
+fn predicate_dml_targets_only_owned_and_visible_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_both = ctx_for("alice", true);
+    let alice_public_only = ctx_for("alice", false);
+    let bob = ctx_for("bob", true);
+    // SQL の INSERT は Private 固定。
+    insert_row(&core, &alice_both, TABLE, 1, "ja", "a", "1");
+    insert_row(&core, &alice_both, TABLE, 2, "ja", "b", "2");
+    insert_row(&core, &bob, TABLE, 3, "ja", "c", "3");
+
+    for sql in [
+        format!("UPDATE {TABLE} SET body = 'x' WHERE lang = 'ja' USING OPERATION_ID 'op-u-pub'"),
+        format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-d-pub'"),
+    ] {
+        match execute(&core, &alice_public_only, &sql).expect("0-row success") {
+            SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 0),
+            SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    assert_eq!(count_star(&core, &alice_both, TABLE), 2);
+    assert_eq!(count_star(&core, &bob, TABLE), 1);
+
+    match execute(
+        &core,
+        &alice_both,
+        &format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-d-all'"),
+    )
+    .expect("visible rows are deleted")
+    {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Delete, got {other:?}"),
+    }
+    assert_eq!(count_star(&core, &alice_both, TABLE), 0);
+    assert_eq!(count_star(&core, &bob, TABLE), 1);
+}
