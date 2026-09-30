@@ -394,6 +394,33 @@ pub fn rotate_arms(round_index: usize, n_arms: usize) -> Vec<usize> {
     (0..n_arms).map(|i| (i + round_index) % n_arms).collect()
 }
 
+/// 参照 arm を各候補の直前に挟む実行順（policy §3 の `baseline/cand1/baseline/cand2/...` 輪番）。
+///
+/// 候補の並びだけをラウンドごとに回転させ、各候補の直前に必ず参照 arm を置く。返すのは
+/// arm 添字列で、参照 arm 添字は/// 候補ごとに 1 回ずつ現れる。参照 arm が無い場合は `rotate_arms` と同じ扱いにする。
+pub fn interleave_with_reference(
+    round_index: usize,
+    n_arms: usize,
+    reference: Option<usize>,
+) -> Vec<usize> {
+    let Some(r) = reference.filter(|r| *r < n_arms) else {
+        return rotate_arms(round_index, n_arms);
+    };
+    let cands: Vec<usize> = (0..n_arms).filter(|i| *i != r).collect();
+    if cands.is_empty() {
+        return vec![r];
+    }
+    let n = cands.len();
+    let mut order = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        order.push(r);
+        if let Some(c) = cands.get((i + round_index) % n) {
+            order.push(*c);
+        }
+    }
+    order
+}
+
 // --- 出力行（英語。テナント ID・行値・SQL 全文は含めない） ---
 
 fn ms(d: Duration) -> f64 {

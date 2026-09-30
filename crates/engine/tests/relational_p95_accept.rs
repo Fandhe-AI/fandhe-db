@@ -175,6 +175,17 @@ fn rotate_arms_permutes_and_shifts_start() {
 }
 
 #[test]
+fn interleave_places_reference_before_each_candidate() {
+    // 参照 = 0、候補 = 1, 2。各ラウンドで ref/cand/ref/cand の並びになり、候補の開始位置が回転する。
+    assert_eq!(interleave_with_reference(0, 3, Some(0)), vec![0, 1, 0, 2]);
+    assert_eq!(interleave_with_reference(1, 3, Some(0)), vec![0, 2, 0, 1]);
+    assert_eq!(interleave_with_reference(2, 3, Some(0)), vec![0, 1, 0, 2]);
+    // 参照 arm が無ければ通常の輪番へ退避する。
+    assert_eq!(interleave_with_reference(1, 3, None), rotate_arms(1, 3));
+    assert_eq!(interleave_with_reference(0, 1, Some(0)), vec![0]);
+}
+
+#[test]
 fn rendered_lines_have_keys_and_no_tenant() {
     let s = summarize_rounds(&[ms(10), ms(12)]).expect("summary");
     let round = render_round_line("predicate", "pred_or2", 1, ms(10), ms(5), "0.1 0.1 0.1");

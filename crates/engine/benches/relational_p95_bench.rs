@@ -33,12 +33,11 @@ use std::time::Duration;
 use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
-    author_id_for_doc, is_sorted_by_direction, join_statement, lang_for_id, lang_in_first_n,
-    lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
-    parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
+    author_id_for_doc, interleave_with_reference, is_sorted_by_direction, join_statement,
+    lang_for_id, lang_in_first_n, lang_token, order_by_statements, other_tenant_rows, parse_group,
+    parse_rounds, parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
     refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
-    rotate_arms, round_p95, scale_label, summarize_rounds, Group, JOIN_ROWS, REFERENCE_ARM,
-    WIDE_LIMIT,
+    round_p95, scale_label, summarize_rounds, Group, JOIN_ROWS, REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -284,9 +283,15 @@ fn measure_group(
     let config = MeasurementConfig::new(WARMUP, MEASURED, 1)
         .unwrap_or_else(|e| fail_closed(format!("measurement config: {e}")));
     let mut per_arm: Vec<Vec<Duration>> = vec![Vec::new(); arms.len()];
+    let ref_idx = arms.iter().position(|(l, _)| *l == REFERENCE_ARM);
+    // 比率あり群は参照 arm を各候補の直前に挟む（policy §3 の baseline/cand1/baseline/cand2 輪番）。
+    // 各候補は直前に測った参照 arm の p95 と対にして保持し、時間方向の環境変動を比率へ混入させない。
+    let ratio_ref = if with_ratio { ref_idx } else { None };
+    let mut paired_ref: Vec<Vec<Duration>> = vec![Vec::new(); arms.len()];
     for round in 0..rounds as usize {
         let load = loadavg();
-        for idx in rotate_arms(round, arms.len()) {
+        let mut last_ref: Option<Duration> = None;
+        for idx in interleave_with_reference(round, arms.len(), ratio_ref) {
             let Some((label, sql)) = arms.get(idx) else {
                 continue;
             };
@@ -305,21 +310,25 @@ fn measure_group(
             if let Some(v) = per_arm.get_mut(idx) {
                 v.push(p95);
             }
+            if ratio_ref == Some(idx) {
+                last_ref = Some(p95);
+            } else if let (Some(r), Some(v)) = (last_ref, paired_ref.get_mut(idx)) {
+                v.push(r);
+            }
         }
     }
     let summaries: Vec<_> = per_arm
         .iter()
         .map(|v| summarize_rounds(v).unwrap_or_else(|e| fail_closed(e)))
         .collect();
-    let ref_min = arms
-        .iter()
-        .position(|(l, _)| *l == REFERENCE_ARM)
-        .and_then(|i| summaries.get(i))
-        .map(|s| s.min);
-    for ((label, _), summary) in arms.iter().zip(&summaries) {
-        let ratio = match (with_ratio, ref_min) {
-            (true, Some(r)) if *label != REFERENCE_ARM => {
-                Some(ratio_vs_reference(summary.min, r).unwrap_or_else(|e| fail_closed(e)))
+    for (i, ((label, _), summary)) in arms.iter().zip(&summaries).enumerate() {
+        // 比率は候補 min ÷ 「その候補の直前に測った参照 arm」の min（対応付け集計）。
+        let ratio = match (ratio_ref, paired_ref.get(i)) {
+            (Some(r), Some(refs)) if i != r && !refs.is_empty() => {
+                let ref_min = summarize_rounds(refs)
+                    .unwrap_or_else(|e| fail_closed(e))
+                    .min;
+                Some(ratio_vs_reference(summary.min, ref_min).unwrap_or_else(|e| fail_closed(e)))
             }
             _ => None,
         };
