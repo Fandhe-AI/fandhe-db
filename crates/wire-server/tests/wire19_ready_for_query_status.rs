@@ -687,10 +687,12 @@ fn deferred_foreign_key_violation_at_commit_returns_to_idle() {
     expect_error_response_with_sqlstate(&mut stream, "23503");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    // トランザクション外の通常クエリが継続でき、違反行は残っていない。
+    // トランザクション外の通常クエリが継続でき、違反行は残っていない（自テナントの
+    // 行のため残っていれば可視。`DataRow` を挟まず `SELECT 0` で完了することで
+    // ロールバックを確認する）。
     send_simple_query(&mut stream, "SELECT id FROM c LIMIT 1");
     let _ = read_row_description(&mut stream);
-    let _ = read_command_complete(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
     // `Failed` ではなく `Idle` へ戻っている裏付け: `ROLLBACK` は `25P01`。
