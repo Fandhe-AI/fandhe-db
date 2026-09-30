@@ -190,7 +190,27 @@ fn expected_plain(col: &str, func: &str) -> String {
         ),
         "r" => ("Float(4.0)", "Float(2.0)", "Float(1.5)", "Float(2.5)"),
         "d" => ("Float(6.0)", "Float(3.0)", "Float(2.5)", "Float(3.5)"),
-        _ => ("?", "?", "?", "?"),
+        "n" => {
+            let dec =
+                |u: i128, sc: u8| format!("Numeric(Decimal {{ unscaled: {u}, scale: {sc} }})");
+            return match func {
+                "SUM" => dec(320, 2),
+                "AVG" => dec(16_000_000_000_000_000, 16),
+                "MIN" => dec(110, 2),
+                _ => dec(210, 2),
+            };
+        }
+        // DATE / TIMESTAMP は MIN / MAX のみ受理される（k=1・2 の各月 1 日）。
+        "dt" | "ts" => {
+            let day = |month: u32| crate::datetime::days_from_civil(2024, month, 1);
+            let pick = if func == "MIN" { 1 } else { 2 };
+            return if col == "dt" {
+                format!("Date({})", day(pick))
+            } else {
+                format!("Timestamp({})", day(pick) * 86_400_000_000)
+            };
+        }
+        _ => return "?".to_string(),
     };
     match func {
         "SUM" => sum,
@@ -209,14 +229,12 @@ fn assert_plain_cell(col: &str, func: &str, cell: &Cell) {
     if want != "?" {
         assert_eq!(got, want, "{func}({col}) plain oracle");
     } else if func != "COUNT" {
-        // NUMERIC/DATE/TIMESTAMP の値表現は個別に固定せず、NULL でないことと
-        // bob 由来の値（k=9）を含まないことだけを確かめる。
-        assert_ne!(got, "Null", "{func}({col}) must not be NULL");
+        // COUNT のみ受理される列（BOOLEAN 等）は上の COUNT 分岐で固定済みのため、
+        // ここへは到達しない。到達したら期待値表の抜けとして失敗させる。
+        panic!("{func}({col}): no expected value registered");
     }
-    assert!(
-        !got.contains("2024-09") && !got.contains("9.1"),
-        "{func}({col}) leaked invisible row: {got}"
-    );
+    // 不可視行（bob の k=9）の混入は上の期待値一致で検出する。数値・日付の値域は
+    // alice の可視行（k=1・2）と衝突しないため、混入すれば SUM/AVG/MAX が変わる。
 }
 
 fn bind(sql: &str, storage: &Storage, schema: &TableSchema) -> crate::sql::parser::BoundAggregate {
