@@ -119,7 +119,7 @@ fail-closed に拒否する。
 | 1 制約あたりの列数上限を超過 | ― | `54000` |
 | テーブルが無い／ビュー・索引名を指定 | `TableNotFound` | `42P01`／`42809` |
 | 列が無い／型が一意キーに使えない／同一列リストの制約が既にある | `Invalid`（`validate_schema` 経由。既存 Issue #905 由来のロジックを継続） | `42601` |
-| **制約名の衝突**（UNIQUE または CHECK と同名） | `ConstraintAlreadyExists` | `42P07`（索引名衝突と同じ既存行を流用） |
+| **制約名の衝突**（UNIQUE 追加側。UNIQUE・CHECK・FK のいずれかと同名） | `ConstraintAlreadyExists` | `42P07`（索引名衝突と同じ既存行。CHECK・FK 追加側は Issue #1195 で `42710`） |
 | テーブルあたり制約数の上限（`MAX_UNIQUE_CONSTRAINTS` = 32）を超過 | `ConstraintLimitExceeded` | `54000` |
 | 既存行に重複あり | `UniqueConstraintViolation`（既存） | `23505` |
 | DROP する名前が存在しない | `ConstraintNotFound` | `42704` |
@@ -128,9 +128,9 @@ fail-closed に拒否する。
 | 書き込みゲートの待機上限超過 | `WriteLockTimeout` | `55P03` |
 | その他 | ― | `XX000` |
 
-補足: 制約名衝突には ERR-6（`docs/spec/04-behavior/error-format.md`）の
-既存行 `42P07`（索引名衝突と同じ）を流用した。専用 SQLSTATE の要否は
-spec リポ側の課題として申し送る（本実装では対処しない）。
+補足: UNIQUE 追加側の制約名衝突は ERR-6（`docs/spec/04-behavior/error-format.md`）の
+既存行 `42P07`（索引名衝突と同じ）を維持する。CHECK・FOREIGN KEY 追加側は
+Issue #1195 で `42710` へ是正済みで、専用 SQLSTATE の要否は決着している。
 
 HTTP 射影は新しい `ErrorClass` を追加していないため、`error_format.rs` と
 `crates/wire-server/tests/err4_http_projection.rs` は無変更で受入基準
@@ -225,8 +225,7 @@ fail-closed。FOREIGN KEY・CHECK の削除は既存行を変更しないため�
 
 ## 申し送り（Issue は起票しない）
 
-- spec 側の課題: 制約名衝突には ERR-6 の既存行 `42P07` を流用した。専用
-  SQLSTATE の追加要否について spec リポでの判断を依頼する
+- Issue #1195 追記: CHECK・FK 追加側は `42710` へ移行済み。UNIQUE は索引名との衝突の意味論により `42P07` を維持
 - スコープ外として残すもの: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`・
   CHECK／PK／FK の ADD／DROP CONSTRAINT・`DROP CONSTRAINT IF EXISTS`／
   `CASCADE`・制約の一覧を取得する手段（`pg_constraint` 相当）・永続一意索引
