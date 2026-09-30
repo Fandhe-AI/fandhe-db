@@ -18,8 +18,8 @@
 //! 「受理される・非空・他テナント行が混入しない・順序／述語／結合キーが期待どおり」を
 //! 検査する（RLS を外した状態や空振りを測る事態を fail-closed で防ぐ）。
 //! `LIMIT` 後の結果だけでは越境を見逃すため、他テナント行は各 arm の上位に必ず並ぶ
-//! sentinel（述語 arm は問い合わせベクトルと同一・`lang=l0`、順序 arm は最小／最大 `qty`）として投入し、
-//! 結合は `LIMIT` を全行数超へ広げた対照クエリで件数まで照合する。加えて他テナント文脈で同じ文が
+//! sentinel（述語 arm は問い合わせベクトルの符号反転・`lang=l0`、順序 arm は最小／最大 `qty`）として投入し、
+//! 結合は `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページ分割で全件取得して件数まで照合する。加えて他テナント文脈で同じ文が
 //! 他テナント行を返すこと（＝越境が起きれば見える fixture であること）を確認する。
 //!
 //! 使い方は `make bench-relational-p95`。時間非依存の判定ロジックは
@@ -68,6 +68,9 @@ const DOCS: &str = "docs";
 const DOCUMENTS: &str = "documents";
 const AUTHORS: &str = "authors";
 /// ラウンドあたりの warmup／計測回数（p95 の分解能を確保するため計測 200 回）。
+/// 結合の全件検査のページ幅・最大ページ数（`OFFSET` は `MAX_SEARCH_K` 以内）。
+const JOIN_PAGE_ROWS: usize = 5_000;
+const JOIN_PAGES: usize = 3;
 const WARMUP: u32 = 20;
 const MEASURED: u32 = 200;
 
@@ -338,12 +341,16 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let own = rows as u64;
     let other = other_tenant_rows(rows) as u64;
     let query = DeterministicRng::new(2).next_vector(DIM);
-    // 他テナント行は各 arm の上位（距離 0・`l0`・最小 `qty`）に並ぶ sentinel とし、
-    // RLS が外れれば `LIMIT` 後の結果へ必ず現れるようにする。
+    // 他テナント行は各 arm の上位（`l0`・最小／最大 `qty`）に並ぶ sentinel とする。ベクトルは
+    // 問い合わせベクトルの符号反転（コサイン距離が最大）にして、近傍収集が RLS より先に行われる
+    // 実装でも対象テナントの上位 k を占有しないようにする（対象テナントの事前検査が分離の正否と
+    // 無関係に空結果で失敗するのを防ぐ）。sentinel が見えることの対照検査は、この反転ベクトルを
+    // 問い合わせとする別リテラル（`literal_b`）で行う。
     // `qty` は偶数 id を最小（`order_single` 先頭）、奇数 id を最大（`order_multi` の `l0` 内先頭）にする。
+    let sentinel_vector: Vec<f32> = query.iter().map(|x| -x).collect();
     let make_other = |id: u64| {
         vec![
-            Value::Vector(query.clone()),
+            Value::Vector(sentinel_vector.clone()),
             Value::Text(lang_token(0).to_string()),
             Value::BigInt(if id.is_multiple_of(2) { -1 } else { 2_000_000 }),
         ]
@@ -371,11 +378,17 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let ctx_b = ctx(TENANT_B);
     let literal =
         vector_literal(&query).unwrap_or_else(|e| fail_closed(format!("vector literal: {e}")));
+    let literal_b = vector_literal(&sentinel_vector)
+        .unwrap_or_else(|e| fail_closed(format!("vector literal: {e}")));
 
     if group.includes(Group::Predicate) {
         let arms = predicate_statements(DOCS, &literal).unwrap_or_else(|e| fail_closed(e));
         for (label, sql) in &arms {
             precheck_predicate(label, &exec(&core, &ctx_a, sql), own);
+        }
+        // 対照: sentinel 自身を問い合わせとする同形の文で、他テナント文脈から sentinel が見えること。
+        let control = predicate_statements(DOCS, &literal_b).unwrap_or_else(|e| fail_closed(e));
+        for (label, sql) in &control {
             precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
         }
         measure_group(
@@ -409,6 +422,26 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
 /// id から決定的にベクトルを作る（行ごとに `DeterministicRng` を seed する）。
 fn rng_vector_for(id: u64) -> Vec<f32> {
     DeterministicRng::new(id.wrapping_add(1_000)).next_vector(DIM)
+}
+
+/// 結合文を `LIMIT`／`OFFSET` のページ（各 `JOIN_PAGE_ROWS` 行）で全件取得し、行 id を返す。
+/// `LIMIT`・`OFFSET` とも `MAX_SEARCH_K` 以内に収めるための分割で、末尾ページが満杯のまま
+/// 取得上限に達した場合は全件取得できていないため fail-closed する。
+fn exec_join_pages(core: &EngineCore, tenant_ctx: &PolicyContext, head: &str) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for page in 0..JOIN_PAGES {
+        let sql = format!(
+            "{head}LIMIT {JOIN_PAGE_ROWS} OFFSET {}",
+            page * JOIN_PAGE_ROWS
+        );
+        let result = exec(core, tenant_ctx, &sql);
+        let len = result.rows.len();
+        ids.extend(result.rows.iter().map(|r| r.id));
+        if len < JOIN_PAGE_ROWS {
+            return ids;
+        }
+    }
+    fail_closed("join_inner: full join exceeds the paging capacity")
 }
 
 fn run_join_group(rows: usize, rounds: u32) {
@@ -496,19 +529,25 @@ fn run_join_group(rows: usize, rounds: u32) {
             fail_closed("join_inner: join key mismatch");
         }
     }
-    // 対照検査: `LIMIT` を全行数超へ広げ、結合結果が自テナント文書の全件（過不足なし）であることを
-    // 確認する。RLS が外れれば他テナント文書が加わり件数・id 範囲が崩れる。
-    let wide_sql = arm
+    // 対照検査: 結合結果を `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページで全件取得し、対象テナントの
+    // 結合結果が自テナント文書の全件（過不足なし）であることを確認する。RLS が外れれば他テナント
+    // 文書が加わり件数・id 範囲が崩れる。他テナント文脈では自行と Public な他テナント行の双方が見える。
+    let head = arm
         .1
         .strip_suffix(&format!("LIMIT {WIDE_LIMIT}"))
-        .map(|head| format!("{head}LIMIT {}", join_rows + other + 1))
         .unwrap_or_else(|| fail_closed("join_inner: unexpected statement shape"));
-    let full = exec(&core, &ctx_a, &wide_sql);
-    if full.rows.len() as u64 != join_rows || full.rows.iter().any(|r| r.id >= join_rows) {
+    let full = exec_join_pages(&core, &ctx_a, head);
+    if full.len() as u64 != join_rows || full.iter().any(|id| *id >= join_rows) {
         fail_closed("join_inner: full join is not confined to own tenant");
     }
     let ctx_b = ctx(TENANT_B);
-    precheck_other_tenant_visible("join_inner", &exec(&core, &ctx_b, &wide_sql), join_rows);
+    let full_b = exec_join_pages(&core, &ctx_b, head);
+    if full_b.len() as u64 != join_rows + other
+        || !full_b.iter().any(|id| *id >= join_rows)
+        || !full_b.iter().any(|id| *id < join_rows)
+    {
+        fail_closed("join_inner: control query did not see both tenants' rows");
+    }
     measure_group(
         "join",
         (join_rows as usize, scale_label(rows)),
