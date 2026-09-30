@@ -359,6 +359,9 @@ fn assert_truncate_state(db: &Path, lines: &[String]) {
             if n == ALICE_ROWS {
                 // 投入が commit 済みなら台帳も残っている。
                 assert_eq!(err(&core, &alice, &seed), "23505", "{ctx_msg}");
+            } else {
+                // 未反映なら台帳も残っていない（同じ operation_id で再投入できる）。
+                ok(&core, &alice, &seed);
             }
         }
         other => panic!("unexpected marker {other}"),
