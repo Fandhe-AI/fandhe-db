@@ -31,7 +31,7 @@ mod harness;
 use std::time::Duration;
 
 use harness::env_report::EnvReport;
-use harness::protocol::{run, MeasurementConfig};
+use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
     author_id_for_doc, is_sorted_by_direction, join_statement, lang_for_id, lang_in_first_n,
     lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
@@ -69,6 +69,10 @@ const DOCUMENTS: &str = "documents";
 const AUTHORS: &str = "authors";
 /// ラウンドあたりの warmup／計測回数（p95 の分解能を確保するため計測 200 回）。
 /// 結合の全件検査のページ幅・最大ページ数（`OFFSET` は `MAX_SEARCH_K` 以内）。
+/// 結合右辺の越境検出用 probe 間隔。自テナント文書のうち `id % JOIN_PROBE_MOD == JOIN_PROBE_MOD - 1` の行は
+/// 他テナントの作者行（右辺）を結合キーに持つ。右辺の RLS が効く限り内部結合から脱落し、右辺 RLS だけが
+/// 外れると結果へ現れる（事前検査で検出できる fixture。RLS-10）。
+const JOIN_PROBE_MOD: u64 = 100;
 const JOIN_PAGE_ROWS: usize = 5_000;
 const JOIN_PAGES: usize = 3;
 const WARMUP: u32 = 20;
@@ -286,7 +290,8 @@ fn measure_group(
             let Some((label, sql)) = arms.get(idx) else {
                 continue;
             };
-            let m = run(&config, || {
+            // 戻り値（`QueryResult`）の解放を計測区間の外へ出す（`retain_capacity == 0` は計測直後に drop）。
+            let (m, _) = run_bounded_retain(&config, 0, || {
                 let mut session = SessionState::default();
                 core.execute_sql_in_session(tenant_ctx, &mut session, sql)
                     .unwrap_or_else(|e| fail_closed(format!("{label}: execute: {e}")))
@@ -450,11 +455,18 @@ fn run_join_group(rows: usize, rounds: u32) {
             .unwrap_or_else(|e| fail_closed(format!("create table: {e}")));
     }
     let other = other_tenant_rows(join_rows as usize) as u64;
+    let is_probe = |id: u64| id % JOIN_PROBE_MOD == JOIN_PROBE_MOD - 1;
     let make_doc = |id: u64| {
+        // probe 行は他テナントの作者行（id `join_rows..`）を指す。右辺 RLS が効けば内部結合で脱落する。
+        let author = if is_probe(id) {
+            (join_rows + id % other.max(1)) as i64
+        } else {
+            author_id_for_doc(id, join_rows)
+        };
         vec![
             Value::Vector(vec![id as f32, 0.0]),
             Value::Text(format!("t{id}")),
-            Value::BigInt(author_id_for_doc(id, join_rows)),
+            Value::BigInt(author),
         ]
     };
     // 他テナント文書は他テナントの作者行（id `join_rows..`）へ結合させ、対照クエリで結合が成立するようにする。
@@ -517,6 +529,9 @@ fn run_join_group(rows: usize, rounds: u32) {
         if row.id >= join_rows {
             fail_closed("join_inner: row outside own tenant id range");
         }
+        if is_probe(row.id) {
+            fail_closed("join_inner: right-side tenant boundary leaked (probe row joined)");
+        }
         let title = cell_text(row.cells.first());
         let name = cell_text(row.cells.get(1));
         let expected_author = author_id_for_doc(row.id, join_rows);
@@ -532,7 +547,12 @@ fn run_join_group(rows: usize, rounds: u32) {
         .strip_suffix(&format!("LIMIT {WIDE_LIMIT}"))
         .unwrap_or_else(|| fail_closed("join_inner: unexpected statement shape"));
     let full = exec_join_pages(&core, &ctx_a, head);
-    if full.len() as u64 != join_rows || full.iter().any(|id| *id >= join_rows) {
+    let own_joinable = (0..join_rows).filter(|id| !is_probe(*id)).count() as u64;
+    if own_joinable >= join_rows {
+        fail_closed("join_inner: fixture has no cross-tenant probe rows (scale too small)");
+    }
+    if full.len() as u64 != own_joinable || full.iter().any(|id| *id >= join_rows || is_probe(*id))
+    {
         fail_closed("join_inner: full join is not confined to own tenant");
     }
     let ctx_b = ctx(TENANT_B);
