@@ -151,39 +151,174 @@ fn insert_returning_projects_only_listed_columns() {
     );
 }
 
-/// RLS 再判定（多層防御）: `Public` のみ可視な `PolicyContext` で `RETURNING`
-/// した場合、挿入行（常に `Visibility::Private` 固定）は投影行から除外
-/// されるが、`rows_affected` は実際に書き込んだ件数（`1`）のまま変えない
-/// （`ReturningOutcome` ドキュメント参照）。
+/// 不可視な挿入行（Private 固定）の RETURNING は、黙って空にせず `XX000` で書き込み前に
+/// 拒否する（fail-closed。SQL-21・RLS-7、Issue #1252）。行も台帳も消費しないので、同じ
+/// `operation_id` を可視集合の広い ctx で再実行すると `rows_affected == 返却行数 == 1` になる。
 #[test]
-fn insert_returning_rows_affected_is_independent_of_result_row_visibility() {
+fn insert_returning_rejects_invisible_inserted_row_fail_closed() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_public_only = ctx_for("alice", false);
+    let alice_private = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    let sql = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+         (1, '[0.1,0.2]', 'ja', 'secret-body') RETURNING * \
+         USING OPERATION_ID 'op-insert-public-only'"
+    );
+
+    let err = core
+        .execute_sql_in_session(&alice_public_only, &mut session, &sql)
+        .expect_err("invisible inserted row must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+    assert!(!err.client_message().contains("secret-body"));
+    assert_eq!(count_star(&core, &alice_private, TABLE), 0);
+
+    let outcome = expect_returning(
+        core.execute_sql_in_session(&alice_private, &mut session, &sql)
+            .expect("same operation_id must be reusable: ledger was not consumed"),
+    );
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.result.rows.len(), 1);
+    assert_eq!(count_star(&core, &alice_private, TABLE), 1);
+}
+
+/// 複数行 `VALUES` でも全行書き込まれずに `XX000` で拒否される。
+#[test]
+fn insert_returning_multi_row_rejects_invisible_rows_without_writing() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice_public_only = ctx_for("alice", false);
     let mut session = SessionState::default();
 
-    let outcome = expect_returning(
-        core.execute_sql_in_session(
+    let err = core
+        .execute_sql_in_session(
             &alice_public_only,
             &mut session,
             &format!(
                 "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
-                 (1, '[0.1,0.2]', 'ja', 'hello') RETURNING * \
-                 USING OPERATION_ID 'op-insert-public-only'"
+                 (1, '[0.1,0.2]', 'ja', 'a'), (2, '[0.3,0.4]', 'ja', 'b') \
+                 RETURNING id USING OPERATION_ID 'op-insert-multi-public-only'"
             ),
         )
-        .expect("INSERT RETURNING should succeed even when the result row is not visible"),
-    );
+        .expect_err("must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+    assert_eq!(count_star(&core, &ctx_for("alice", true), TABLE), 0);
+}
 
-    assert_eq!(outcome.rows_affected, 1);
-    assert!(
-        outcome.result.rows.is_empty(),
-        "Private row must not be visible under a Public-only PolicyContext"
-    );
-
-    // 行自体は書き込まれている（別 ctx で確認）。
+/// UPSERT の新規挿入行（`DO NOTHING`・`DO UPDATE` の双方）も不可視なら `XX000` で
+/// 書き込みを中止し、行・台帳とも永続化されない（Issue #1252）。
+#[test]
+fn upsert_returning_rejects_invisible_inserted_row_and_persists_nothing() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_public_only = ctx_for("alice", false);
     let alice_private = ctx_for("alice", true);
+    let mut session = SessionState::default();
+
+    for (clause, op) in [
+        ("DO NOTHING", "op-upsert-nothing-invisible"),
+        (
+            "DO UPDATE SET body = EXCLUDED.body",
+            "op-upsert-update-invisible",
+        ),
+    ] {
+        let sql = format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'new') ON CONFLICT (id) {clause} \
+             RETURNING id, body USING OPERATION_ID '{op}'"
+        );
+        let err = core
+            .execute_sql_in_session(&alice_public_only, &mut session, &sql)
+            .expect_err("invisible upsert-inserted row must be rejected");
+        assert_eq!(err.wire_code(), "XX000");
+        assert_eq!(count_star(&core, &alice_private, TABLE), 0);
+
+        let outcome = expect_returning(
+            core.execute_sql_in_session(&alice_private, &mut session, &sql)
+                .expect("ledger was not consumed, so the same operation_id is reusable"),
+        );
+        assert_eq!(outcome.rows_affected, 1);
+        assert_eq!(outcome.result.rows.len(), 1);
+        // 次ループ用に消す（台帳は別 operation_id）。
+        core.execute_sql_in_session(
+            &alice_private,
+            &mut session,
+            &format!("DELETE FROM {TABLE} WHERE id = 1 USING OPERATION_ID '{op}-del'"),
+        )
+        .expect("cleanup delete");
+    }
+}
+
+/// 明示トランザクション内の行形 `INSERT ... RETURNING` も、不可視なら `XX000` で
+/// 拒否され、トランザクション内にも行は書かれない。可視集合が広ければ
+/// `rows_affected == 返却行数`。
+#[test]
+fn insert_returning_in_explicit_txn_rejects_invisible_row_and_writes_nothing() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_public_only = ctx_for("alice", false);
+    let alice_private = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    let sql = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+         (1, '[0.1,0.2]', 'ja', 'x') RETURNING id USING OPERATION_ID 'op-txn-invisible'"
+    );
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice_public_only, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(&alice_public_only, &mut session, &mut txn, &sql)
+        .expect_err("invisible row must be rejected inside a transaction");
+    assert_eq!(err.wire_code(), "XX000");
+    let _ = core.execute_sql_in_txn(&alice_public_only, &mut session, &mut txn, "ROLLBACK");
+    assert_eq!(count_star(&core, &alice_private, TABLE), 0);
+
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice_private, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let outcome = expect_returning(
+        core.execute_sql_in_txn(&alice_private, &mut session, &mut txn, &sql)
+            .expect("visible row is returned"),
+    );
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.result.rows.len(), 1);
+    core.execute_sql_in_txn(&alice_private, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
     assert_eq!(count_star(&core, &alice_private, TABLE), 1);
+}
+
+/// 他テナントの行は、自テナントの INSERT／UPSERT の RETURNING に混入しない。
+#[test]
+fn insert_returning_never_returns_other_tenant_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let bob = ctx_for("bob", true);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &bob, 1, "ja", "bob-secret", "op-bob-seed");
+
+    let outcome = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.1,0.2]', 'ja', 'alice-row') ON CONFLICT (id) DO NOTHING \
+                 RETURNING id, body USING OPERATION_ID 'op-alice-upsert'"
+            ),
+        )
+        .expect("alice's own id 1 is new in her namespace"),
+    );
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(outcome.result.rows.len(), 1);
+    assert_eq!(
+        outcome.result.rows[0].cells[1],
+        Cell::Text("alice-row".to_string())
+    );
 }
 
 /// 複数行 `VALUES ... RETURNING *`（SQL-16 との併用）: `rows_affected` ・
@@ -967,10 +1102,8 @@ fn dml_returning_update_delete_targets_only_visible_rows_and_count_matches_retur
     assert_eq!(count_star(&core, &alice_private, TABLE), 0);
 }
 
-/// UPSERT の `rows_affected` は結果行の可視性と独立（現状の挙動の固定）: Public のみ
-/// 可視の `PolicyContext` でも新規挿入（Private 固定）の件数を返し、結果行は RLS 再判定で
-/// 除外される。新規行の返却挙動は Issue #1252（INSERT／UPSERT の RETURNING）で是正される
-/// ため、その際にこのテストを更新する。
+/// UPSERT の新規挿入行（Private 固定）が可視集合 Public のみの `PolicyContext` から
+/// 不可視なら、黙って返却から外さず `XX000` で中止する（Issue #1252・SQL-21）。
 #[test]
 fn upsert_returning_rows_affected_is_independent_of_result_row_visibility() {
     let (core, path) = new_core_with_table();
@@ -978,21 +1111,19 @@ fn upsert_returning_rows_affected_is_independent_of_result_row_visibility() {
     let alice_public_only = ctx_for("alice", false);
     let mut session = SessionState::default();
 
-    let ups = expect_returning(
-        run(
-            &core,
-            &alice_public_only,
-            &mut session,
-            &format!(
-                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
-                 (3, '[0.1,0.2]', 'ja', 'c') ON CONFLICT (id) DO NOTHING RETURNING * \
-                 USING OPERATION_ID 'op-vis-ups'"
-            ),
-        )
-        .expect("UPSERT"),
-    );
-    assert_eq!(ups.rows_affected, 1);
-    assert!(ups.result.rows.is_empty());
+    // UPSERT の新規挿入行は不可視なら `XX000`（Issue #1252）。書き込まれない。
+    let ups = run(
+        &core,
+        &alice_public_only,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (3, '[0.1,0.2]', 'ja', 'c') ON CONFLICT (id) DO NOTHING RETURNING * \
+             USING OPERATION_ID 'op-vis-ups'"
+        ),
+    )
+    .expect_err("invisible upsert-inserted row must be rejected");
+    assert_eq!(ups.wire_code(), "XX000");
 }
 
 /// 内容照合ハッシュ（RECOVER-10・RECOVER-11）は `RETURNING` の有無に依存しない:

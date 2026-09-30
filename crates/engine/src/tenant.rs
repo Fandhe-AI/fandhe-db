@@ -1959,6 +1959,7 @@ fn upsert_typed_rows_impl(
                                     id: write_id,
                                     tenant_id: ctx.tenant_id().to_string(),
                                     visibility: existing.visibility,
+                                    origin: CapturedRowOrigin::Updated,
                                     values,
                                 })?;
                             }
@@ -2007,6 +2008,7 @@ fn upsert_typed_rows_impl(
                             id: *id,
                             tenant_id: ctx.tenant_id().to_string(),
                             visibility: insert_visibility,
+                            origin: CapturedRowOrigin::Inserted,
                             values,
                         })?;
                     }
@@ -3044,6 +3046,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                             id,
                             tenant_id: ctx.tenant_id().to_string(),
                             visibility,
+                            origin: CapturedRowOrigin::Updated,
                             values: captured_values_from_parts(&schema, embedding, &metadata)?,
                         });
                     }
@@ -3215,6 +3218,22 @@ pub(crate) struct CapturedRow {
     pub tenant_id: String,
     pub visibility: crate::storage::Visibility,
     pub values: Vec<crate::row_codec::Value>,
+    /// 行の由来。`sql::exec::returning_collector` が、新規挿入行の不可視を
+    /// fail-closed（`XX000`）に判定するために使う（SQL-21・RLS-7）。
+    pub origin: CapturedRowOrigin,
+}
+
+/// [`CapturedRow`] の由来（新規挿入／更新／削除）。`RETURNING` の不可視行の扱いを
+/// 由来別に分けるための判別子（新規挿入行のみ `XX000` で中止し、更新・削除行の
+/// 対象選定の可視集合化は #1253／#1254 で扱う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapturedRowOrigin {
+    /// INSERT・UPSERT の新規挿入行。
+    Inserted,
+    /// UPDATE・UPSERT の `DO UPDATE` 行（更新後の値）。
+    Updated,
+    /// DELETE 行（削除前の値）。
+    Deleted,
 }
 
 /// 物理行の構成要素（`embedding`・不透明な `metadata` バイト列）から、
@@ -3442,6 +3461,7 @@ fn delete_row_impl(
                                 id,
                                 tenant_id: row.tenant_id,
                                 visibility: row.visibility,
+                                origin: CapturedRowOrigin::Deleted,
                                 values,
                             });
                         }
@@ -3983,6 +4003,7 @@ fn delete_rows_where_impl<E>(
                                 id: *id,
                                 tenant_id: row.tenant_id,
                                 visibility: row.visibility,
+                                origin: CapturedRowOrigin::Deleted,
                                 values,
                             })
                             .map_err(dml_write_err)?;
@@ -4257,6 +4278,7 @@ fn update_rows_where_impl<E>(
                         id: *id,
                         tenant_id: ctx.tenant_id().to_string(),
                         visibility,
+                        origin: CapturedRowOrigin::Updated,
                         values,
                     })
                     .map_err(dml_write_err)?;

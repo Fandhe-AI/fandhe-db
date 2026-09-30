@@ -95,6 +95,20 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
     let _ = describe_session;
 }
 
+/// 認証経路（RLS-11）と同じ `Public`＋`Private` の可視集合を持つコンテキスト。
+/// INSERT・UPSERT 新規行の RETURNING は挿入行が `Private` のため、Public のみの
+/// `PolicyContext::new` では `XX000` になる（Issue #1252）。
+fn returning_ctx() -> PolicyContext {
+    PolicyContext::with_visibilities(
+        "tenant-a",
+        [
+            engine::storage::Visibility::Public,
+            engine::storage::Visibility::Private,
+        ],
+    )
+    .expect("valid tenant")
+}
+
 #[test]
 fn describe_select_all_matches_execute() {
     let path = unique_db_path("describe-select-all");
@@ -304,7 +318,7 @@ fn describe_insert_returning_matches_execute() {
     let path = unique_db_path("describe-insert-returning");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);
-    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let ctx = returning_ctx();
 
     assert_describe_matches_execute(
         &core,
@@ -430,7 +444,7 @@ fn describe_update_delete_upsert_returning_matches_execute() {
     let path = unique_db_path("describe-dml-returning");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);
-    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let ctx = returning_ctx();
     seed_row(&core, &ctx, 1, "op-seed-1182-1");
     seed_row(&core, &ctx, 2, "op-seed-1182-2");
 
