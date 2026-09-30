@@ -33,12 +33,13 @@ use std::time::Duration;
 use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
-    author_id_for_doc, expected_order_multi, expected_order_single, interleave_with_reference,
-    is_exact_id_set, join_statement, lang_for_id, lang_in_first_n, lang_token, order_by_statements,
-    other_tenant_rows, parse_group, parse_rounds, parse_rows_scale, predicate_statements,
-    qty_for_id, ratio_vs_reference, refuse_under_github_actions, render_round_line,
-    render_summary_line, render_threshold_line, round_p95, scale_label, summarize_rounds, Group,
-    JOIN_ROWS, REFERENCE_ARM, WIDE_LIMIT,
+    author_id_for_doc, cosine_distance, expected_order_multi, expected_order_single,
+    interleave_with_reference, is_exact_id_set, join_statement, lang_for_id, lang_in_first_n,
+    lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
+    parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
+    refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
+    round_p95, scale_label, summarize_rounds, topk_matches, Group, JOIN_ROWS, PRED_LIMIT,
+    REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -206,16 +207,35 @@ fn cell_text(cell: Option<&Cell>) -> &str {
     }
 }
 
-/// 述語 arm の事前検査: 非空・他テナント id 非混入・期待 `lang` 集合。
-fn precheck_predicate(arm: &str, result: &QueryResult, own_rows: u64) {
-    if result.rows.is_empty() {
-        fail_closed(format!("{arm}: empty result"));
-    }
-    let n = match arm {
+/// 述語 arm の期待結果（述語を満たす全自テナント行の `(id, 距離)` の距離昇順）を fixture から求める。
+/// 計測クエリと同じベクトル列を参照実装のコサイン距離で並べ、エンジン出力とは独立に導出する。
+fn expected_predicate_ranked(arm: &str, own_rows: u64, query: &[f32]) -> Vec<(u64, f64)> {
+    let n = predicate_lang_count(arm);
+    let mut ranked: Vec<(u64, f64)> = (0..own_rows)
+        .filter(|id| lang_in_first_n(lang_for_id(*id), n))
+        .map(|id| (id, cosine_distance(&rng_vector_for(id), query)))
+        .collect();
+    ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+    ranked
+}
+
+/// arm が許可する `lang` 集合の大きさ（`l0`..`l{n-1}`）。
+fn predicate_lang_count(arm: &str) -> u64 {
+    match arm {
         "pred_eq" => 1,
         "pred_or2" => 2,
         _ => 8,
-    };
+    }
+}
+
+/// 述語 arm の事前検査: 非空・他テナント id 非混入・述語充足に加え、fixture から導出した
+/// 期待上位 `PRED_LIMIT` 行（件数・id 集合・距離順。同値境界は許容）との照合。
+/// 述語が誤って狭い集合だけを返す等の取り違えを検出する。
+fn precheck_predicate(arm: &str, result: &QueryResult, own_rows: u64, ranked: &[(u64, f64)]) {
+    if result.rows.is_empty() {
+        fail_closed(format!("{arm}: empty result"));
+    }
+    let n = predicate_lang_count(arm);
     for row in &result.rows {
         if row.id >= own_rows {
             fail_closed(format!("{arm}: row outside own tenant id range"));
@@ -223,6 +243,10 @@ fn precheck_predicate(arm: &str, result: &QueryResult, own_rows: u64) {
         if !lang_in_first_n(lang_for_id(row.id), n) {
             fail_closed(format!("{arm}: row does not satisfy predicate"));
         }
+    }
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    if !topk_matches(&ids, ranked, PRED_LIMIT) {
+        fail_closed(format!("{arm}: result is not the expected top rows"));
     }
 }
 
@@ -418,7 +442,8 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     if group.includes(Group::Predicate) {
         let arms = predicate_statements(DOCS, &literal).unwrap_or_else(|e| fail_closed(e));
         for (label, sql) in &arms {
-            precheck_predicate(label, &exec(&core, &ctx_a, sql), own);
+            let ranked = expected_predicate_ranked(label, own, &query);
+            precheck_predicate(label, &exec(&core, &ctx_a, sql), own, &ranked);
             // 対照: 同じ計測クエリを他テナント文脈で実行し、sentinel が結果に現れること。
             precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
         }
@@ -589,10 +614,8 @@ fn run_join_group(rows: usize, rounds: u32) {
     }
     let ctx_b = ctx(TENANT_B);
     let full_b = exec_join_pages(&core, &ctx_b, head);
-    if full_b.len() as u64 != join_rows + other
-        || !full_b.iter().any(|id| *id >= join_rows)
-        || !full_b.iter().any(|id| *id < join_rows)
-    {
+    let expected_b: Vec<u64> = (0..join_rows + other).collect();
+    if !is_exact_id_set(&full_b, &expected_b) {
         fail_closed("join_inner: control query did not see both tenants' rows");
     }
     measure_group(

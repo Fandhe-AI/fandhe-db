@@ -252,3 +252,28 @@ fn expected_order_prefixes_follow_fixture() {
         assert!(w[0].0 < w[1].0 || (w[0].0 == w[1].0 && w[0].1 >= w[1].1));
     }
 }
+
+#[test]
+fn topk_matches_detects_wrong_subset() {
+    // 述語を満たす行が距離 0.1..0.5 で 5 行、k = 3。
+    let ranked = [(10u64, 0.1), (11, 0.2), (12, 0.3), (13, 0.4), (14, 0.5)];
+    assert!(topk_matches(&[10, 11, 12], &ranked, 3));
+    // 同値境界（0.3 と 0.3 + eps 内）は id の入れ替わりを許す。
+    let tied = [(1u64, 0.1), (2, 0.3), (3, 0.3), (4, 0.9)];
+    assert!(topk_matches(&[1, 3], &tied, 2));
+    // 上位に入らない行、取りこぼし、重複、件数不足、順序違い、述語外 id は拒否する。
+    assert!(!topk_matches(&[10, 11, 14], &ranked, 3));
+    assert!(!topk_matches(&[10, 12, 13], &ranked, 3));
+    assert!(!topk_matches(&[10, 10, 11], &ranked, 3));
+    assert!(!topk_matches(&[10, 11], &ranked, 3));
+    assert!(!topk_matches(&[11, 10, 12], &ranked, 3));
+    assert!(!topk_matches(&[10, 11, 99], &ranked, 3));
+    assert!(topk_matches(&[], &[], 3));
+}
+
+#[test]
+fn cosine_distance_reference() {
+    assert!(cosine_distance(&[1.0, 0.0], &[2.0, 0.0]).abs() < 1e-12);
+    assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-12);
+    assert_eq!(cosine_distance(&[0.0, 0.0], &[1.0, 0.0]), 1.0);
+}

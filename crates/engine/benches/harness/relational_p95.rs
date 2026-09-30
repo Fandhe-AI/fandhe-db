@@ -349,6 +349,56 @@ pub fn is_exact_id_set(ids: &[u64], expected_sorted: &[u64]) -> bool {
     got == expected_sorted
 }
 
+/// コサイン距離（`1 - cos`）。`<=>` の期待値を fixture から独立に求めるための参照実装。
+pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = (na * nb).sqrt();
+    if denom == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / denom
+}
+
+/// 距離の同値境界を許容する幅（エンジンの f32 計算と f64 参照実装の差を吸収する。
+/// 縮小規模の実測で順位入れ替わりが 1.5e-3 程度の距離差で出たため 5e-3 とする）。
+pub const DISTANCE_EPS: f64 = 5e-3;
+
+/// 述語 arm（`ORDER BY embedding <=> q LIMIT k`）の返却 id 列が期待どおりかを照合する。
+/// `ranked` は述語を満たす全自テナント行の `(id, 距離)` を距離昇順に並べたもの。
+/// 件数が `min(k, ranked.len())`・id が重複しない・返却行が上位 k の距離内（境界は `DISTANCE_EPS`）・
+/// 境界より明確に近い行の取りこぼしが無い・返却順が距離の昇順、をすべて満たすときだけ true。
+pub fn topk_matches(ids: &[u64], ranked: &[(u64, f64)], k: usize) -> bool {
+    let want = k.min(ranked.len());
+    if ids.len() != want || want == 0 {
+        return want == 0 && ids.is_empty();
+    }
+    let dist: std::collections::HashMap<u64, f64> = ranked.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    let Some(cutoff) = ranked.get(want - 1).map(|r| r.1) else {
+        return false;
+    };
+    let mut prev = f64::NEG_INFINITY;
+    for id in ids {
+        let Some(d) = dist.get(id).copied() else {
+            return false;
+        };
+        if !seen.insert(*id) || d > cutoff + DISTANCE_EPS || d + DISTANCE_EPS < prev {
+            return false;
+        }
+        prev = prev.max(d);
+    }
+    ranked
+        .iter()
+        .take_while(|r| r.1 < cutoff - DISTANCE_EPS)
+        .all(|r| seen.contains(&r.0))
+}
+
 // --- 統計 ---
 
 /// 1 arm の全ラウンド要約。
