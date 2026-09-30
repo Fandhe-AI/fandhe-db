@@ -261,3 +261,27 @@ ENUM は `Storage::create_enum_type`（redb ファイルを要する）を経由
   値があるのに `None` として評価される fail-open になり得る）
 - `GROUP BY` キー列の新型拡張（現状 `TEXT` に限定）・二次索引経路の新型対応
   （Issue #893）はいずれも別 Issue の担当
+
+## #1258 追記: 埋め込み非デコードの直接計数テスト
+
+3 段階デコード（`Fast`／`DimAndScalar`／`Embedding`）が埋め込み本体を読まないことを、
+結果一致や `select_decode_tier` の選択結果ではなくデコード計数で直接固定する
+（TABLE-13・INDEX-5・TASK-199・RLS-7／RLS-8 ポインタ）。
+
+- 計数プローブ: `storage::decode_probe`（`#[cfg(test)]`・thread_local）。
+  `decode_row_body_into`・`decode_row` を埋め込みデコード、
+  `decode_row_dim_and_metadata_borrowed` を構造検証のみのデコードとして数える。
+  production ビルドには含まれない
+- テスト: `sql/aggregate_embedding_decode_tests.rs`
+  - 層 A: `execute_aggregate` 直呼び出し。新スカラー型 13 種の受理される
+    COUNT／SUM／AVG／MIN／MAX と `COUNT(*)`、単一キー GROUP BY で
+    埋め込みデコード 0 回・走査行数 > 0 を確認する
+  - 層 B: `EngineCore::execute_sql` 経由の WHERE なし単一行集計・複数キー GROUP BY と、
+    型不整合の拒否（DATE／TIMESTAMP の SUM／AVG は 42883、その他は 22000）が
+    デコード前に失敗すること
+  - 陽性対照: `vec_norm(embedding)` 集計のデコード回数が可視行数と一致する
+    （RLS で不可視な行が本体デコードに到達しないことも同時に固定）
+- 範囲外: `execute_sql` 経由の単一キー・WHERE なし GROUP BY は cold cache で
+  スカラー索引／arena スナップショット構築（`capture_scalar_index_snapshot`）が
+  可視行全件の埋め込みをデコードする。設計どおりの挙動で 3 段階デコードの契約の外のため
+  層 B には含めない
