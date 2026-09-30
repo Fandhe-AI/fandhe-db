@@ -18,8 +18,10 @@ use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
+use engine::sql::parser::DmlLimits;
 use engine::sql::SqlOutcome;
 use engine::storage::{RowInput, Storage, Visibility};
+use std::num::NonZeroUsize;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -432,4 +434,311 @@ fn execute_truncate_sql_direct_entry_point_matches_session_dispatch_contract() {
         .expect("direct entry point TRUNCATE should succeed");
     let _: engine::sql::exec::TruncateOutcome = outcome;
     assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+// --- Issue #1200: 影響行数上限の非適用・索引失効・途中 abort の副作用ゼロ ----------
+//
+// 以降は SQL 表層（`CREATE TABLE` を DDL セッションで実行）で構築した
+// `docs` テーブル（`kind`／`body` 列つき）を使う。SQL の INSERT は既定で常に
+// `Private` 行になるため、他テナントの行はすべて Private で組み、
+// `ctx_for(_, true)`（Public＋Private 許可）で読み出しても他テナントの行が
+// 混入しない（`Public` のグローバル可視に依存しないオラクルにできる）。
+
+fn sql_ok(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> SqlOutcome {
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(ctx, &mut session, sql)
+        .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
+}
+
+fn sql_err_code(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> String {
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(ctx, &mut session, sql)
+        .map(|o| panic!("{sql} must fail, got {o:?}"))
+        .unwrap_err()
+        .wire_code()
+        .to_string()
+}
+
+fn sql_ids(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
+    match sql_ok(core, ctx, sql) {
+        SqlOutcome::Query(result) => {
+            let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+            ids.sort_unstable();
+            ids
+        }
+        other => panic!("expected Query outcome, got {other:?}"),
+    }
+}
+
+fn new_docs_core(limits: Option<DmlLimits>) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path("truncate-table-1200");
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let mut core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    if let Some(limits) = limits {
+        core = core.with_dml_limits(limits);
+    }
+    sql_ok(
+        &core,
+        &ctx_for("sys", true),
+        "CREATE TABLE docs (embedding VECTOR(2) NOT NULL, kind TEXT NOT NULL, body TEXT)",
+    );
+    (core, guard)
+}
+
+/// `id` の偶数を `kind = 'a'`、奇数を `kind = 'b'` として `ids` を投入する
+/// （body は hybrid 用に偶数のみ検索語を含める）。
+fn seed_docs(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    ids: std::ops::RangeInclusive<u64>,
+    tag: &str,
+) {
+    for id in ids {
+        let (kind, body) = if id % 2 == 0 {
+            ("a", "vector database engine")
+        } else {
+            ("b", "unrelated text")
+        };
+        sql_ok(
+            core,
+            ctx,
+            &format!(
+                "INSERT INTO docs (id, embedding, kind, body) VALUES ({id}, '[{id}.0,0.0]', '{kind}', '{body}') \
+                 USING OPERATION_ID 'seed-{tag}-{id}'"
+            ),
+        );
+    }
+}
+
+const KIND_A_SQL: &str =
+    "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[10.0,0.0]' LIMIT 50";
+const HYBRID_SQL: &str = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'vector database') LIMIT 50";
+
+/// SQL-19（影響行数上限 `54000`）は述語形 DELETE にだけ効き、TRUNCATE には
+/// 適用されない。上限 1 の構成で、同じ 5 行に対し述語形 DELETE は拒否
+/// （副作用ゼロ）、TRUNCATE は成功することを対で固定する。
+#[test]
+fn truncate_is_not_subject_to_dml_affected_rows_limit() {
+    let (core, _guard) = new_docs_core(Some(DmlLimits {
+        max_affected_rows: NonZeroUsize::new(1),
+        max_insert_rows_per_statement: None,
+    }));
+    let alice = ctx_for("alice", true);
+    seed_docs(&core, &alice, 1..=5, "lim");
+    assert_eq!(count_star(&core, &alice, "docs"), 5);
+
+    assert_eq!(
+        sql_err_code(
+            &core,
+            &alice,
+            "DELETE FROM docs WHERE id > 0 USING OPERATION_ID 'op-lim-del'"
+        ),
+        "54000"
+    );
+    assert_eq!(
+        count_star(&core, &alice, "docs"),
+        5,
+        "rejected DELETE must have no effect"
+    );
+
+    let outcome = sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE TABLE docs USING OPERATION_ID 'op-lim-trunc'",
+    );
+    assert!(matches!(outcome, SqlOutcome::Truncate(_)));
+    assert_eq!(count_star(&core, &alice, "docs"), 0);
+}
+
+/// SQL-22/SQL-18: TRUNCATE 後、温まったスカラー二次索引から古いヒットが返らず、
+/// 再投入後は新しい行だけが索引経路で返る。他テナント（bob）の結果は不変。
+#[test]
+fn truncate_invalidates_scalar_index_and_keeps_other_tenant_intact() {
+    let (core, _guard) = new_docs_core(None);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    seed_docs(&core, &alice, 1..=10, "sa");
+    seed_docs(&core, &bob, 501..=510, "sb");
+
+    let alice_before = sql_ids(&core, &alice, KIND_A_SQL);
+    assert_eq!(alice_before, vec![2, 4, 6, 8, 10]);
+    assert_eq!(sql_ids(&core, &alice, KIND_A_SQL), alice_before);
+    let bob_before = sql_ids(&core, &bob, KIND_A_SQL);
+    assert_eq!(bob_before, vec![502, 504, 506, 508, 510]);
+    assert_eq!(sql_ids(&core, &bob, KIND_A_SQL), bob_before);
+    let warm = core.scalar_index_cache_stats();
+    assert!(
+        warm.index_scans > 0,
+        "index path must have been consumed before TRUNCATE"
+    );
+
+    sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE TABLE docs USING OPERATION_ID 'op-idx-trunc'",
+    );
+
+    assert!(sql_ids(&core, &alice, KIND_A_SQL).is_empty());
+    assert!(
+        core.scalar_index_cache_stats().builds > warm.builds,
+        "table generation bump must force a rebuild"
+    );
+    assert_eq!(sql_ids(&core, &bob, KIND_A_SQL), bob_before);
+
+    seed_docs(&core, &alice, 101..=110, "sa2");
+    let scans_before = core.scalar_index_cache_stats().index_scans;
+    let first = sql_ids(&core, &alice, KIND_A_SQL);
+    let second = sql_ids(&core, &alice, KIND_A_SQL);
+    assert_eq!(first, vec![102, 104, 106, 108, 110]);
+    assert_eq!(second, first);
+    assert!(
+        core.scalar_index_cache_stats().index_scans > scans_before,
+        "rebuilt index must be consumed again"
+    );
+    assert_eq!(sql_ids(&core, &bob, KIND_A_SQL), bob_before);
+}
+
+/// SQL-22/SQL-18: TRUNCATE 後の疎索引（hybrid）も世代失効し、旧 id を返さない。
+#[test]
+fn truncate_invalidates_sparse_index_and_keeps_other_tenant_intact() {
+    let (core, _guard) = new_docs_core(None);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    seed_docs(&core, &alice, 1..=10, "ha");
+    seed_docs(&core, &bob, 501..=510, "hb");
+
+    let alice_before = sql_ids(&core, &alice, HYBRID_SQL);
+    assert!(!alice_before.is_empty());
+    assert_eq!(sql_ids(&core, &alice, HYBRID_SQL), alice_before);
+    let bob_before = sql_ids(&core, &bob, HYBRID_SQL);
+    assert!(!bob_before.is_empty());
+    let warm = core.sparse_index_cache_stats();
+    assert!(
+        warm.hits > 0,
+        "sparse index must have been reused before TRUNCATE"
+    );
+
+    sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE TABLE docs USING OPERATION_ID 'op-sparse-trunc'",
+    );
+
+    assert!(sql_ids(&core, &alice, HYBRID_SQL).is_empty());
+    assert_eq!(sql_ids(&core, &bob, HYBRID_SQL), bob_before);
+
+    seed_docs(&core, &alice, 101..=110, "ha2");
+    let after = sql_ids(&core, &alice, HYBRID_SQL);
+    assert!(!after.is_empty());
+    assert!(
+        after.iter().all(|id| (101..=110).contains(id)),
+        "no pre-TRUNCATE id may be returned: {after:?}"
+    );
+    let stats = core.sparse_index_cache_stats();
+    assert!(
+        stats.misses > warm.misses || stats.stale_evictions > warm.stale_evictions,
+        "sparse index must have been rebuilt after the generation bump"
+    );
+    assert_eq!(sql_ids(&core, &bob, HYBRID_SQL), bob_before);
+}
+
+fn create_fk_pair(core: &EngineCore) {
+    let sys = ctx_for("sys", true);
+    sql_ok(
+        core,
+        &sys,
+        "CREATE TABLE parents (code TEXT UNIQUE, name TEXT)",
+    );
+    sql_ok(
+        core,
+        &sys,
+        "CREATE TABLE children (parent_id BIGINT REFERENCES parents, note TEXT)",
+    );
+}
+
+fn assert_parents_untouched(core: &EngineCore, alice: &PolicyContext, bob: &PolicyContext) {
+    assert_eq!(
+        sql_ids(core, alice, "SELECT id FROM parents LIMIT 100"),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        sql_ids(core, bob, "SELECT id FROM parents LIMIT 100").len(),
+        3
+    );
+    // 一意索引が無傷（TRUNCATE の途中でクリアされていない）なら重複は 23505。
+    assert_eq!(
+        sql_err_code(
+            core,
+            alice,
+            "INSERT INTO parents (id, code) VALUES (9, 'c1') USING OPERATION_ID 'op-dup-code'"
+        ),
+        "23505"
+    );
+}
+
+/// SQL-22（TABLE-17 との相互作用）: TRUNCATE は行削除後に FK 検査で `23503`
+/// になる経路があるが、その write txn 全体が abort し副作用が一切残らない
+/// （行・一意索引・台帳）。再オープン後も同じ。
+#[test]
+fn truncate_aborted_by_fk_violation_leaves_no_side_effects_even_after_reopen() {
+    let path = unique_db_path("truncate-table-1200-abort");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        create_fk_pair(&core);
+        sql_ok(
+            &core,
+            &alice,
+            "INSERT INTO parents (id, code) VALUES (1, 'c1'), (2, 'c2'), (3, 'c3') USING OPERATION_ID 'op-pa'",
+        );
+        sql_ok(
+            &core,
+            &bob,
+            "INSERT INTO parents (id, code) VALUES (1, 'c1'), (2, 'c2'), (3, 'c3') USING OPERATION_ID 'op-pb'",
+        );
+        sql_ok(
+            &core,
+            &alice,
+            "INSERT INTO children (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-ca'",
+        );
+
+        assert_eq!(
+            sql_err_code(
+                &core,
+                &alice,
+                "TRUNCATE TABLE parents USING OPERATION_ID 'op-abort'"
+            ),
+            "23503"
+        );
+        assert_parents_untouched(&core, &alice, &bob);
+    }
+
+    // 再オープン後も副作用ゼロ。
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert_parents_untouched(&core, &alice, &bob);
+
+    // 台帳が書かれていない証明: 子行を消せば同じ operation_id で成功する
+    // （abort 済み txn の台帳記録が残っていれば 23505 になる）。
+    sql_ok(
+        &core,
+        &alice,
+        "DELETE FROM children WHERE id = 1 USING OPERATION_ID 'op-cd'",
+    );
+    let outcome = sql_ok(
+        &core,
+        &alice,
+        "TRUNCATE TABLE parents USING OPERATION_ID 'op-abort'",
+    );
+    assert!(matches!(outcome, SqlOutcome::Truncate(_)));
+    assert!(sql_ids(&core, &alice, "SELECT id FROM parents LIMIT 100").is_empty());
+    assert_eq!(
+        sql_ids(&core, &bob, "SELECT id FROM parents LIMIT 100").len(),
+        3
+    );
 }
