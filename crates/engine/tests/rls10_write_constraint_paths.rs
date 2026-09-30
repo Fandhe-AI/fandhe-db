@@ -29,8 +29,10 @@
 //! - T6 負の対照: 捏造した違反を検査器が検出できること
 //!
 //! 可視性モードと書き込み対象: `docs` の Private 行（偶数 id）は、`id` 完全一致形の
-//! UPDATE では Public のみモードで対象外（0 行）、述語形 UPDATE／DELETE では両モード
-//! で対象になる（形状ごとの `Expect::Affected(priv, pub)` に現行挙動を固定している）。
+//! UPDATE では Public のみモードで対象外（0 行。SQL-17・RLS-10 (a) の可視集合どおり）。
+//! 述語形 UPDATE／DELETE は現状 Public のみモードでも自テナントの Private 行を対象に
+//! するが、これは SQL-19・RLS-10 (a)（候補は可視集合の部分集合）と不一致のため、
+//! 該当モードの影響行数は仕様値〜現状値の範囲（[`Count::Between`]）で検査する。
 //! いずれの場合も他テナントの行は候補に入らない点は共通で、本ファイルの主張の中心。
 //!
 //! baseline／flooded の定義: 書き込み候補は `is_owner && is_visible` の行に限られる
@@ -439,20 +441,50 @@ enum Axis {
     Constraint,
 }
 
+/// 影響行数の期待値。仕様と一致する値は `Exact`、現状が仕様と一致しない値は
+/// 仕様値と現状値の両方を含む範囲 `Between(lo, hi)`（両端を含む）で検査する
+/// （仕様違反の現状値を回帰条件として固定しない）。
+#[derive(Clone, Copy, Debug)]
+enum Count {
+    Exact(u64),
+    Between(u64, u64),
+}
+
+impl Count {
+    fn admits(self, n: u64) -> bool {
+        match self {
+            Count::Exact(v) => n == v,
+            Count::Between(lo, hi) => lo <= n && n <= hi,
+        }
+    }
+}
+
+/// RETURNING の返却行（`id`）の期待値。仕様と一致する値は出現順の完全一致 `Exact`、
+/// 現状が SQL-21 と一致しない値は「当該文が変更した自テナントの行の `id`」の部分集合
+/// であること（重複なし・件数は影響行数以下）を検査する `SubsetOf`。
+#[derive(Clone, Copy, Debug)]
+enum Ids {
+    Exact(&'static [u64]),
+    SubsetOf(&'static [u64]),
+}
+
 /// テスト側の真実値。`Affected(priv, pub)` は
 /// （Private 込みモード, Public のみモード）での期待影響行数。
 #[derive(Clone, Copy)]
 enum Expect {
     Affected(u64, u64),
+    /// Private 込みモードは完全一致、Public のみモードは [`Count`] で検査する影響行数。
+    AffectedPub(u64, Count),
     Err(&'static str),
-    /// RETURNING 付き。`affected` は [`Expect::Affected`] と同じ（Private 込み, Public のみ）、
-    /// `ids` は同じ 2 モードでの返却行の `id`（出現順）。返却行は閲覧側に可視な行に限られる
-    /// （Public のみモードでは自テナントの Private 行・既定可視性で投入した行は返らない）。
-    /// この「影響行数と返却行が一致しない」挙動は SQL-21 と不一致の現状を固定したもので、
-    /// #1250 で是正予定（是正時は該当形状の期待値を更新する）。
+    /// RETURNING 付き。`affected`・`ids` は（Private 込み, Public のみ）の 2 モード分。
+    /// Private 込みモードは SQL-21 と一致するため完全一致で検査する。Public のみモードの
+    /// 返却行は現状、閲覧側に可視な行に限られ（自テナントの Private 行・既定可視性で
+    /// 投入した行は返らない）、SQL-21（当該文が変更した行そのものを返す）と一致しない
+    /// 形状がある。該当形状は完全一致をやめて [`Ids::SubsetOf`] で検査し、完全一致の
+    /// 検査は #1256（#1250 の是正後）で戻す。
     Returning {
-        affected: (u64, u64),
-        ids: (&'static [u64], &'static [u64]),
+        affected: (u64, Count),
+        ids: (&'static [u64], Ids),
     },
     /// TRUNCATE。件数を露出しない成功応答（`affected` なし）で、事後に閲覧側の `docs`
     /// 行が可視性を問わず 0 件になる（他テナントの行は T3 が不変を検査する）。
@@ -497,29 +529,37 @@ fn shapes() -> Vec<Shape> {
         w("upd-id-own-private", "UPDATE docs SET score = 999 WHERE id = 2 USING OPERATION_ID '{op}'", Affected(1, 0)),
         w("upd-id-foreign-only", "UPDATE docs SET score = 999 WHERE id = 9 USING OPERATION_ID '{op}'", Affected(0, 0)),
         w("upd-id-missing", "UPDATE docs SET score = 999 WHERE id = 99 USING OPERATION_ID '{op}'", Affected(0, 0)),
-        w("upd-pred-ja", "UPDATE docs SET score = 0 WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 2)),
+        // 述語形の Public のみモードの影響行数は SQL-19・RLS-10 (a) と不一致の現状
+        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
+        w("upd-pred-ja", "UPDATE docs SET score = 0 WHERE lang = 'ja' USING OPERATION_ID '{op}'", AffectedPub(2, Count::Between(1, 2))),
         w("upd-pred-none", "UPDATE docs SET score = 0 WHERE lang = 'zz' USING OPERATION_ID '{op}'", Affected(0, 0)),
-        // SQL-21 と不一致の現状を固定（Public のみモードで影響行数と返却行が一致しない）。
-        // #1250 で是正予定。是正時はこの期待値を更新する。
-        w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (2, 2), ids: (&[1, 2], &[1]) }),
+        // Public のみモードの返却行は SQL-21 と不一致の現状のため部分集合で検査する。
+        // 完全一致の検査は #1256（#1250 の是正後）で戻す。
+        // 述語形の Public のみモードの影響行数も SQL-19・RLS-10 (a) と不一致の現状
+        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
+        w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (2, Count::Between(1, 2)), ids: (&[1, 2], Ids::SubsetOf(&[1, 2])) }),
         w("del-id-own", "DELETE FROM docs WHERE id = 1 USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("del-id-foreign-only", "DELETE FROM docs WHERE id = 9 USING OPERATION_ID '{op}'", Affected(0, 0)),
-        w("del-pred-ja", "DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 2)),
-        w("del-pred-en", "DELETE FROM docs WHERE lang = 'en' USING OPERATION_ID '{op}'", Affected(2, 2)),
-        w("del-id-returning", "DELETE FROM docs WHERE id = 1 RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[1], &[1]) }),
+        // 述語形の Public のみモードの影響行数は SQL-19・RLS-10 (a) と不一致の現状
+        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
+        w("del-pred-ja", "DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID '{op}'", AffectedPub(2, Count::Between(1, 2))),
+        // 述語形の Public のみモードの影響行数は SQL-19・RLS-10 (a) と不一致の現状
+        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
+        w("del-pred-en", "DELETE FROM docs WHERE lang = 'en' USING OPERATION_ID '{op}'", AffectedPub(2, Count::Between(1, 2))),
+        w("del-id-returning", "DELETE FROM docs WHERE id = 1 RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, Count::Exact(1)), ids: (&[1], Ids::Exact(&[1])) }),
         w("ins-foreign-id", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("ins-multi-foreign-ids", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-n1'), (10, 'ja', 2, 'tok-{v}-n2') USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("ins-own-dup-id", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-dup') USING OPERATION_ID '{op}'", Err("23505")),
-        // SQL-21 と不一致の現状を固定（Public のみモードで影響行数と返却行が一致しない）。
-        // #1250 で是正予定。是正時はこの期待値を更新する。
-        w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[9], &[]) }),
+        // Public のみモードの返却行は SQL-21 と不一致の現状のため部分集合で検査する。
+        // 完全一致の検査は #1256（#1250 の是正後）で戻す。
+        w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, Count::Exact(1)), ids: (&[9], Ids::SubsetOf(&[9])) }),
         w("upsert-foreign-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 7, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-foreign-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(0, 0)),
-        // SQL-21 と不一致の現状を固定（Public のみモードで影響行数と返却行が一致しない）。
-        // #1250 で是正予定。是正時はこの期待値を更新する。
-        w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[9], &[]) }),
+        // Public のみモードの返却行は SQL-21 と不一致の現状のため部分集合で検査する。
+        // 完全一致の検査は #1256（#1250 の是正後）で戻す。
+        w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, Count::Exact(1)), ids: (&[9], Ids::SubsetOf(&[9])) }),
         w("truncate", "TRUNCATE TABLE docs USING OPERATION_ID '{op}'", Truncated),
         // ---- (c) 制約検査 ----
         c("uniq-foreign-code", "INSERT INTO uniq (id, code, a, b) VALUES (10, 'shared', 'n1', 'n2') USING OPERATION_ID '{op}'", Affected(1, 1)),
@@ -723,7 +763,20 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                     let want = if mode { p } else { q };
                     assert_eq!(*affected, Some(want), "{which}: {}", label(r));
                 }
-                (Expect::Affected(..), Obs::Err { code, .. }) => {
+                (Expect::AffectedPub(p, q), Obs::Ok { affected, .. }) => {
+                    let n = affected
+                        .unwrap_or_else(|| panic!("{which}: missing affected: {}", label(r)));
+                    if mode {
+                        assert_eq!(n, p, "{which}: {}", label(r));
+                    } else {
+                        assert!(
+                            q.admits(n),
+                            "{which}: affected {n} not in {q:?}: {}",
+                            label(r)
+                        );
+                    }
+                }
+                (Expect::Affected(..) | Expect::AffectedPub(..), Obs::Err { code, .. }) => {
                     panic!("{which}: unexpected error {code}: {}", label(r))
                 }
                 (Expect::Err(code), Obs::Err { code: got, .. }) => {
@@ -743,14 +796,50 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                         ..
                     },
                 ) => {
-                    let (want, want_ids) = if mode { (p, ip) } else { (q, iq) };
-                    assert_eq!(*affected, Some(want), "{which}: {}", label(r));
-                    assert_eq!(
-                        returned_ids.as_deref(),
-                        Some(want_ids),
-                        "{which}: RETURNING rows: {}",
+                    let n = affected
+                        .unwrap_or_else(|| panic!("{which}: missing affected: {}", label(r)));
+                    let got = returned_ids
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{which}: RETURNING rows missing: {}", label(r)));
+                    let (count, ids) = if mode {
+                        (Count::Exact(p), Ids::Exact(ip))
+                    } else {
+                        (q, iq)
+                    };
+                    assert!(
+                        count.admits(n),
+                        "{which}: affected {n} not in {count:?}: {}",
                         label(r)
                     );
+                    match ids {
+                        Ids::Exact(want) => {
+                            assert_eq!(got, want, "{which}: RETURNING rows: {}", label(r));
+                        }
+                        Ids::SubsetOf(changed) => {
+                            // 返却行は当該文が変更した自テナントの行の部分集合（重複なし・
+                            // 件数は影響行数以下）。他テナントの行はトークン検査
+                            // （`readback_leaks`）と T3 が別途検出する。
+                            assert!(
+                                got.iter().all(|id| changed.contains(id)),
+                                "{which}: RETURNING rows {got:?} not within {changed:?}: {}",
+                                label(r)
+                            );
+                            let mut uniq = got.to_vec();
+                            uniq.sort();
+                            uniq.dedup();
+                            assert_eq!(
+                                uniq.len(),
+                                got.len(),
+                                "{which}: duplicate rows: {}",
+                                label(r)
+                            );
+                            assert!(
+                                got.len() as u64 <= n,
+                                "{which}: more RETURNING rows than affected: {}",
+                                label(r)
+                            );
+                        }
+                    }
                 }
                 (Expect::Returning { .. }, Obs::Err { code, .. }) => {
                     panic!("{which}: unexpected error {code}: {}", label(r))
@@ -987,6 +1076,10 @@ fn t6_negative_controls_detect_fabricated_violations() {
         debug: "x".into(),
     };
     assert_ne!(c, d);
+    // 範囲検査は範囲外（仕様値・現状値のいずれでもない値）を検出する。
+    assert!(Count::Between(1, 2).admits(1) && Count::Between(1, 2).admits(2));
+    assert!(!Count::Between(1, 2).admits(0) && !Count::Between(1, 2).admits(3));
+    assert!(!Count::Exact(1).admits(2));
     // FK 違反メッセージの正規化は数値だけを吸収し、文言の差は検出する。
     assert_eq!(
         normalize_digits("key (7) missing"),
