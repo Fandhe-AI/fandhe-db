@@ -238,6 +238,6 @@ TOCTOU は無い（行数に比例するコストは UNIQUE の ADD と同じ扱
   `CASCADE`・1 文複数 ADD/DROP
 - PostgreSQL の既定名（単一列参照時の `<table>_<col>_check`）との差異
   （本リポの `CREATE TABLE` 表制約の既定名に揃えた）
-- 制約名衝突の専用 SQLSTATE（`42710`）の要否は #1067 から引き続き spec 側の
-  課題（Issue #1195 で `42710` へ是正済み）
+- 制約名衝突の SQLSTATE は Issue #1195 で `42710` へ是正済み（#1067 で申し送った
+  spec 側の課題は解消。UNIQUE 追加側のみ `42P07` を維持）
 - 制約一覧の照会手段（`pg_constraint` 相当）が無い点は #1067 と同じ
