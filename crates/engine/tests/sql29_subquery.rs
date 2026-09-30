@@ -5,12 +5,13 @@
 //! production 経路として検証）。
 //!
 //! スコープ（実装既定値。`docs/design/sql-subquery.md` 参照）:
-//! - 対応: WHERE の `<col> IN (SELECT ...)`・`EXISTS (SELECT ...)`。内側は
-//!   `SELECT ... FROM <table> [WHERE ...] LIMIT <n>`（広域取得）のみ。
-//! - 対象外（このファイルでは拒否の確認のみ）: スカラー比較サブクエリ・投影
-//!   位置のサブクエリ・内側が集計／ランキング付き検索 SELECT・内側 `LIMIT`
-//!   省略・相関サブクエリ・拡張クエリプロトコル（Parse/Bind）経由・
-//!   `NOT IN`/`NOT EXISTS`。
+//! - 対応: WHERE の `<col> [NOT] IN (SELECT ...)`・`[NOT] EXISTS (SELECT ...)`
+//!   （`NOT` 系は Issue #1191）。内側は `SELECT ... FROM <table> [WHERE ...]
+//!   LIMIT <n>`（広域取得）のみ。スカラー比較サブクエリ・相関サブクエリの
+//!   `42601`・`IN` 対象型の拡大は `tests/sql29_subquery_scalar.rs`。
+//! - 対象外（このファイルでは拒否の確認のみ）: 投影位置のサブクエリ・内側が
+//!   ランキング付き検索 SELECT・内側 `LIMIT` 省略・拡張クエリプロトコル
+//!   （Parse/Bind）経由の `$n` 併用。
 
 use engine::catalog::{ColumnDef, ColumnType, EnumTypeDef, TableSchema};
 use engine::core::EngineCore;
@@ -272,40 +273,30 @@ fn in_subquery_text_column_matches_independent_oracle() {
 }
 
 #[test]
-fn in_subquery_bigint_column_in_target_is_rejected() {
-    // レビュー指摘の回帰テスト（Issue #927 push 前 Review）: `sql::subquery::
-    // cell_to_equality_predicate` が以前は `BIGINT`/`INTEGER` 列（`Cell::
-    // SignedInteger`）を `WherePredicate::Equality`（`TEXT`/`ENUM` 列専用）へ
-    // 変換していたため、`<BIGINT/INTEGER 列> IN (SELECT ...)` は常に「TEXT
-    // 列でない」で拒否されていた（ドキュメント上の「対応済み」表明と実装が
-    // 矛盾する機能バグ）。`INTEGER`/`BIGINT` 列の等価比較自体がこのリポでは
-    // まだ実装されていない（レーン A。`sql::udf_call::bind_expr_in` 参照）
-    // ため、実装を追加するのではなく `IN` 対象値の対応型を `TEXT`/`BOOLEAN`
-    // のみへ縮小し、`INTEGER`/`BIGINT` は明示的に `22000` へ倒したことを
-    // 検証する（`docs/design/sql-subquery.md`「`IN` 対象値の型」節参照）。
-    // `detail` の内容まで検査するのは、修正前も `Equality` 束縛の「TEXT 列
-    // でない」という別経路の偶発的な `InvalidInput` で同じテストが素通り
-    // してしまい、レビュー指摘（テストカバレッジなし）への回帰テストとして
-    // 機能しなくなるのを防ぐため（`cell_to_equality_predicate` の明示的な
-    // 拒否理由であることをこのアサーションで固定する）。
+fn in_subquery_bigint_column_in_target_matches_independent_oracle() {
+    // Issue #1191: 整数族（INTEGER/BIGINT）の `IN (SELECT ...)` は、数値リテラル
+    // `IN` と同じ式脱糖形（`col = n` の `Or`）へ書き換えて受理する（Issue #927 では
+    // `22000` で拒否していた）。独立オラクル（テスト側で素朴に計算した期待 id 集合）と
+    // 照合する。
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     insert_doc_with_priority(&core, &ctx, 1, "ja", 10);
+    insert_doc_with_priority(&core, &ctx, 2, "en", 20);
+    insert_doc_with_priority(&core, &ctx, 3, "fr", -5);
+    insert_doc(&core, &ctx, 4, "de"); // priority は NULL
     insert_priority(&core, &ctx, 1, 10);
+    insert_priority(&core, &ctx, 2, -5);
+    insert_priority(&core, &ctx, 3, 10); // 重複値
 
-    let err = expect_error_code(
+    let ids = select_ids(
         &core,
         &ctx,
         &format!(
             "SELECT id FROM {DOCS} WHERE priority IN (SELECT priority FROM {PRIORITIES} LIMIT 100) LIMIT 100"
         ),
     );
-    assert!(matches!(
-        &err,
-        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("subquery IN target")
-    ));
+    assert_eq!(ids, vec![1, 3]);
 }
 
 // 疑似列 `id` を対象にした `IN`／`EXISTS`（`id IN (SELECT id FROM ...)`）は
@@ -461,22 +452,23 @@ fn in_subquery_unsupported_type_column_with_empty_inner_result_is_rejected() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
-    insert_doc_with_priority(&core, &ctx, 1, "ja", 10);
-    // priorities は空のまま（内側の結果が 0 行）。修正前はここで `priority`
-    // （`BIGINT`）が対象列として一切検証されず、空結果で成功していた。
+    insert_doc(&core, &ctx, 1, "ja");
+    // 内側の結果が 0 行でも、対象列（`VECTOR`）の型検証は行数に依存せず必ず働く
+    // （PR #1103 追加 codex-review P1 指摘の回帰。Issue #1191 で整数族が対応済みに
+    // なったため、非対応型の代表として `VECTOR` を使う）。
 
     let err = expect_error_code(
         &core,
         &ctx,
         &format!(
-            "SELECT id FROM {DOCS} WHERE priority IN \
-             (SELECT priority FROM {PRIORITIES} LIMIT 100) LIMIT 100"
+            "SELECT id FROM {DOCS} WHERE embedding IN \
+             (SELECT embedding FROM {DOCS} WHERE lang = 'none' LIMIT 100) LIMIT 100"
         ),
     );
     assert!(matches!(
         &err,
         engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("is not a TEXT/ENUM/BOOLEAN column")
+            if detail.contains("not supported as a subquery IN target")
     ));
 }
 
@@ -485,21 +477,20 @@ fn in_subquery_unsupported_type_column_with_null_only_inner_result_is_rejected()
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
-    // `priority` は明示せず NULL のままにする（内側の結果は NULL のみ）。
     insert_doc(&core, &ctx, 1, "ja");
 
     let err = expect_error_code(
         &core,
         &ctx,
         &format!(
-            "SELECT id FROM {DOCS} WHERE priority IN \
-             (SELECT priority FROM {DOCS} LIMIT 100) LIMIT 100"
+            "SELECT id FROM {DOCS} WHERE embedding IN \
+             (SELECT embedding FROM {DOCS} LIMIT 100) LIMIT 100"
         ),
     );
     assert!(matches!(
         &err,
         engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
-            if detail.contains("is not a TEXT/ENUM/BOOLEAN column")
+            if detail.contains("not supported as a subquery IN target")
     ));
 }
 
@@ -1263,64 +1254,239 @@ fn exists_subquery_with_window_function_is_rejected() {
     ));
 }
 
-// --- NOT EXISTS / NOT IN (SELECT ...)（Cursor Bugbot Medium 指摘対応） ------
+// --- NOT EXISTS / NOT IN (SELECT ...)（Issue #1191） ----------------------
 
-/// `docs/design/sql-subquery.md`「スコープ（当初計画との差分）」は `NOT IN`・
-/// `NOT EXISTS` を「非対応（文法自体が `NOT` を持たない）」と明記している。
-/// 前置 `NOT`（`sql::allowlist::Parser::parse_where_leaf`）が構造的に確定した
-/// `EXISTS (SELECT ...)`（`WherePredicate::Exists`）をそのまま `Not` で包むと、
-/// 束縛段（`sql::parser::declarative_leaf_to_filter`）がこれを宣言的フィルタ
-/// として扱えず `Internal` エラー（内部実装詳細の漏えい）になってしまう回帰が
-/// あった。構文段で `0A000`（`FeatureNotSupported`）として明示的に拒否する。
+/// `NOT EXISTS`: 可視行が 1 件でもあれば常に偽、無ければ常に真
+/// （Issue #927 では `0A000` で拒否していた。Issue #1191 で受理）。
 #[test]
-fn not_exists_subquery_is_rejected_with_feature_not_supported() {
+fn not_exists_subquery_matches_independent_oracle() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
-    // visits に可視行を用意する（可視行があっても構文段で拒否されることの確認。
-    // 「実行時に false 相当になるから受理してよい」という誤った緩和を防ぐ）。
-    insert_visit(&core, &ctx, 1, "hit");
 
-    let err = expect_error_code(
-        &core,
-        &ctx,
-        &format!(
-            "SELECT id FROM {DOCS} WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
-        ),
+    let sql = format!(
+        "SELECT id FROM {DOCS} WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
     );
-    assert!(
-        matches!(
-            &err,
-            engine::sql::allowlist::SqlSurfaceError::FeatureNotSupported { .. }
+    // visits が空 → 常に真。
+    assert_eq!(select_ids(&core, &ctx, &sql), vec![1, 2, 3, 4]);
+    insert_visit(&core, &ctx, 1, "hit");
+    // 可視行あり → 常に偽。
+    assert_eq!(select_ids(&core, &ctx, &sql), Vec::<u64>::new());
+    // `NOT (EXISTS ...)` と二重否定の正規化。
+    assert_eq!(
+        select_ids(
+            &core,
+            &ctx,
+            &format!(
+                "SELECT id FROM {DOCS} WHERE NOT (EXISTS (SELECT id FROM {VISITS} LIMIT 1)) LIMIT 100"
+            )
         ),
-        "expected FeatureNotSupported (0A000), got {err:?}"
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        select_ids(
+            &core,
+            &ctx,
+            &format!(
+                "SELECT id FROM {DOCS} WHERE NOT NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
+            )
+        ),
+        vec![1, 2, 3, 4]
+    );
+    // `AND` 併用: 偽側でも他の述語は評価される（結果は空のまま）。
+    assert_eq!(
+        select_ids(
+            &core,
+            &ctx,
+            &format!(
+                "SELECT id FROM {DOCS} WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1) \
+                 AND lang = 'ja' LIMIT 100"
+            )
+        ),
+        Vec::<u64>::new()
+    );
+    // `NOT (EXISTS(...) AND lang = 'ja')` は De Morgan で `NOT EXISTS OR lang <> 'ja'`。
+    assert_eq!(
+        select_ids(
+            &core,
+            &ctx,
+            &format!(
+                "SELECT id FROM {DOCS} WHERE NOT (EXISTS (SELECT id FROM {VISITS} LIMIT 1) \
+                 AND lang = 'ja') LIMIT 100"
+            )
+        ),
+        vec![2, 3, 4]
     );
 }
 
-/// [`not_exists_subquery_is_rejected_with_feature_not_supported`] の
-/// `IN (SELECT ...)` 版。同じ理由（`WherePredicate::InSubquery` を `Not` で
-/// 包むと束縛段で `Internal` エラーになっていた）で `0A000` を固定する。
+/// `NOT IN`: 内側 0 行なら常に真（NULL 行を含む全可視行）・内側に NULL を含めば
+/// 真にならない・外側値が NULL の行は除外される（PostgreSQL と同じ三値論理）。
 #[test]
-fn not_in_subquery_is_rejected_with_feature_not_supported() {
+fn not_in_subquery_follows_null_semantics() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_priority(&core, &ctx, 1, "ja", 10);
+    insert_doc_with_priority(&core, &ctx, 2, "en", 20);
+    insert_doc(&core, &ctx, 3, "fr"); // priority は NULL
+    let not_in = format!(
+        "SELECT id FROM {DOCS} WHERE priority NOT IN (SELECT priority FROM {PRIORITIES} LIMIT 100) LIMIT 100"
+    );
+    // 内側 0 行: 外側値が NULL の行も含めて常に真。
+    assert_eq!(select_ids(&core, &ctx, &not_in), vec![1, 2, 3]);
+    // 内側に非 NULL 値: 一致しない非 NULL 行のみ（NULL 行は UNKNOWN で除外）。
+    insert_priority(&core, &ctx, 1, 10);
+    assert_eq!(select_ids(&core, &ctx, &not_in), vec![2]);
+    // 内側に NULL を含む（`priority` 列が NULL の docs 行を内側にする）: 真にならない。
+    let not_in_with_null = format!(
+        "SELECT id FROM {DOCS} WHERE priority NOT IN (SELECT priority FROM {DOCS} LIMIT 100) LIMIT 100"
+    );
+    assert_eq!(
+        select_ids(&core, &ctx, &not_in_with_null),
+        Vec::<u64>::new()
+    );
+}
+
+/// TEXT 対象の `NOT IN`（後置・前置・`NOT (... IN ...)`・`NOT NOT`）と `Or` 内の配置。
+#[test]
+fn not_in_subquery_text_forms_match_independent_oracle() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
     insert_allowed_lang(&core, &ctx, 1, "ja");
+    insert_allowed_lang(&core, &ctx, 2, "fr");
+    let inner = format!("(SELECT lang FROM {ALLOWED_LANGS} LIMIT 100)");
 
-    let err = expect_error_code(
-        &core,
-        &ctx,
-        &format!(
-            "SELECT id FROM {DOCS} WHERE lang NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"
+    for sql in [
+        format!("SELECT id FROM {DOCS} WHERE lang NOT IN {inner} LIMIT 100"),
+        format!("SELECT id FROM {DOCS} WHERE NOT lang IN {inner} LIMIT 100"),
+        format!("SELECT id FROM {DOCS} WHERE NOT (lang IN {inner}) LIMIT 100"),
+        format!("SELECT id FROM {DOCS} WHERE NOT NOT lang NOT IN {inner} LIMIT 100"),
+    ] {
+        assert_eq!(select_ids(&core, &ctx, &sql), vec![2, 4], "sql={sql}");
+    }
+    // `NOT (lang IN (...) OR lang = 'de')` は `lang NOT IN (...) AND lang <> 'de'`。
+    assert_eq!(
+        select_ids(
+            &core,
+            &ctx,
+            &format!("SELECT id FROM {DOCS} WHERE NOT (lang IN {inner} OR lang = 'de') LIMIT 100")
         ),
+        vec![2]
     );
-    assert!(
-        matches!(
-            &err,
-            engine::sql::allowlist::SqlSurfaceError::FeatureNotSupported { .. }
+    // `OR` 分岐内の `NOT IN`。
+    assert_eq!(
+        select_ids(
+            &core,
+            &ctx,
+            &format!("SELECT id FROM {DOCS} WHERE lang = 'ja' OR lang NOT IN {inner} LIMIT 100")
         ),
-        "expected FeatureNotSupported (0A000), got {err:?}"
+        vec![1, 2, 4]
     );
+}
+
+/// ENUM の語彙外ラベルは NOT IN でも「どの行とも一致しない」として扱う。
+#[test]
+fn not_in_subquery_enum_and_boolean_targets() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_mood(&core, &ctx, 1, "ja", "happy");
+    insert_doc_with_mood(&core, &ctx, 2, "en", "sad");
+    insert_doc(&core, &ctx, 3, "fr"); // mood は NULL
+    insert_allowed_lang(&core, &ctx, 1, "happy");
+    insert_allowed_lang(&core, &ctx, 2, "not-a-label");
+    let sql = format!(
+        "SELECT id FROM {DOCS} WHERE mood NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"
+    );
+    // 語彙内の `happy` のみ除外、語彙外は無視、NULL 行は UNKNOWN で除外。
+    assert_eq!(select_ids(&core, &ctx, &sql), vec![2]);
+
+    // BOOLEAN: 内側 {true} → `active` が false の行のみ（NULL 行は除外）。
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_active(&core, &ctx, 1, "ja", true);
+    insert_doc_with_active(&core, &ctx, 2, "en", false);
+    insert_doc(&core, &ctx, 3, "fr");
+    insert_visit_with_flag(&core, &ctx, 1, "a", true);
+    let sql = format!(
+        "SELECT id FROM {DOCS} WHERE active NOT IN (SELECT flag FROM {VISITS} LIMIT 100) LIMIT 100"
+    );
+    assert_eq!(select_ids(&core, &ctx, &sql), vec![2]);
+    insert_visit_with_flag(&core, &ctx, 2, "b", false);
+    assert_eq!(select_ids(&core, &ctx, &sql), Vec::<u64>::new());
+}
+
+/// RLS-10 (b): `NOT IN`／`NOT EXISTS` の結果は呼び出しセッションの可視行だけで
+/// 決まる（他テナントの行が結果を変えない）。
+#[test]
+fn not_in_and_not_exists_ignore_other_tenant_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let a = ctx_for("tenant-a");
+    let b = ctx_for("tenant-b");
+    seed_docs(&core, &a);
+    insert_allowed_lang(&core, &a, 1, "ja");
+    let not_in = format!(
+        "SELECT id FROM {DOCS} WHERE lang NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"
+    );
+    let not_exists = format!(
+        "SELECT id FROM {DOCS} WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1) LIMIT 100"
+    );
+    let before_in = select_ids(&core, &a, &not_in);
+    let before_ex = select_ids(&core, &a, &not_exists);
+    assert_eq!(before_in, vec![2, 3, 4]);
+    assert_eq!(before_ex, vec![1, 2, 3, 4]);
+    // 他テナントの allowed_langs（`fr` を含む）・visits を追加しても tenant-a の結果は不変。
+    insert_allowed_lang(&core, &b, 100, "fr");
+    insert_visit(&core, &b, 100, "other");
+    assert_eq!(select_ids(&core, &a, &not_in), before_in);
+    assert_eq!(select_ids(&core, &a, &not_exists), before_ex);
+}
+
+/// 静的検証（対象列・型）は内側の行数に依存せず `NOT IN` でも働く。
+#[test]
+fn not_in_subquery_static_validation_is_independent_of_row_count() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    for sql in [
+        format!("SELECT id FROM {DOCS} WHERE nope NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"),
+        format!("SELECT id FROM {DOCS} WHERE lang NOT IN (SELECT flag FROM {VISITS} LIMIT 100) LIMIT 100"),
+        format!("SELECT id FROM {DOCS} WHERE embedding NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"),
+    ] {
+        let err = expect_error_code(&core, &ctx, &sql);
+        assert!(
+            matches!(err, engine::sql::allowlist::SqlSurfaceError::InvalidInput { .. }),
+            "sql={sql} err={err:?}"
+        );
+    }
+}
+
+/// サブクエリ不許可の文脈（述語形 DML）では `NOT IN`／`NOT EXISTS` も `42601` のまま。
+#[test]
+fn not_subquery_forms_stay_rejected_in_non_subquery_contexts() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    for sql in [
+        format!("UPDATE {DOCS} SET lang = 'x' WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1)"),
+        format!("DELETE FROM {DOCS} WHERE lang NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 1)"),
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
+            .expect_err("must be rejected");
+        assert!(
+            matches!(
+                err,
+                engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
+            ),
+            "sql={sql} err={err:?}"
+        );
+    }
 }

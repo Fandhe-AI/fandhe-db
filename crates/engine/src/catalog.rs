@@ -1034,6 +1034,29 @@ pub(crate) const MAX_COLUMN_COUNT: usize = 256;
 /// （.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
 pub(crate) const MAX_PRIMARY_KEY_COLUMNS: usize = 32;
 
+/// 主キーの導出擬似名 `<table>_pkey`（PostgreSQL の慣習。TABLE-22 (a)(d)・
+/// TASK-233、Issue #1196）。PRIMARY KEY は無名（カタログに名前を永続化しない）で、
+/// この名前は `ALTER TABLE ... DROP CONSTRAINT <name>` の名前解決
+/// （[`Storage::alter_table_drop_constraint`]）と `ADD PRIMARY KEY` の応答
+/// （`AlterTableAction::AddConstraint`）でのみ使う純関数の結果。
+/// `table.len() + 5` が [`MAX_IDENTIFIER_LEN`] を超える場合はテーブル名の先頭を
+/// 切り詰め、結果が常に妥当な識別子（ASCII・上限内）になるようにする。
+pub fn primary_key_constraint_name(table: &str) -> String {
+    const SUFFIX: &str = "_pkey";
+    let keep = MAX_IDENTIFIER_LEN.saturating_sub(SUFFIX.len());
+    let head = table.get(..keep.min(table.len())).unwrap_or(table);
+    format!("{head}{SUFFIX}")
+}
+
+/// `name` が `table` の宣言済み主キーの導出擬似名と一致するか（主キー未宣言なら
+/// 常に `false`）。`ADD CONSTRAINT <name> UNIQUE/CHECK/FOREIGN KEY` の明示名が
+/// 擬似名と衝突して `DROP CONSTRAINT` の名前解決が曖昧になるのを防ぐ
+/// （Issue #1196）。`validate_schema` には入れない（既存カタログの decode を
+/// 壊さないため。ALTER の実行経路だけで判定する）。
+fn name_collides_with_primary_key(schema: &TableSchema, table: &str, name: &str) -> bool {
+    schema.primary_key().is_some() && name == primary_key_constraint_name(table)
+}
+
 /// カタログ値（エンコード済みバイト列）のバイト長上限。デコード前に検証し、
 /// 無制限な文字列アロケーションを防ぐ。
 const MAX_CATALOG_VALUE_LEN: usize = 1024 * 1024;
@@ -1231,6 +1254,14 @@ pub enum CatalogError {
     /// 制約追加を拒否した。文言・variant 自体にテナント名・値・行を含めない
     /// （security.md P0。`TenantWriteError::ForeignKeyViolation` と同じ秘匿方針）。
     ForeignKeyViolation,
+    /// [`Storage::alter_table_add_primary_key`]（TABLE-22 (d)・TASK-233、Issue #1196）が、
+    /// 既存行（全テナント）の中に主キー構成列が NULL の行を検出したため主キー追加を
+    /// 拒否した（ERR-6: `23502`）。保持するのは**列名のみ**（スキーマ情報）で、
+    /// テナント・行 ID・値・件数は含めない（security.md P0）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1196）: variant を追加した。`CatalogError` を
+    /// 網羅的に `match` するクレート外のコードは追随が必要。
+    NotNullConstraintViolation(String),
 }
 
 impl fmt::Display for CatalogError {
@@ -1312,6 +1343,12 @@ impl fmt::Display for CatalogError {
                     "insert or update on table violates foreign key constraint"
                 )
             }
+            CatalogError::NotNullConstraintViolation(column) => {
+                write!(
+                    f,
+                    "null value in column {column:?} violates not-null constraint"
+                )
+            }
         }
     }
 }
@@ -1349,7 +1386,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::ConstraintAlreadyExists(_)
             | CatalogError::ConstraintNotFound(_)
             | CatalogError::ConstraintLimitExceeded(_)
-            | CatalogError::ForeignKeyViolation => None,
+            | CatalogError::ForeignKeyViolation
+            | CatalogError::NotNullConstraintViolation(_) => None,
         }
     }
 }
@@ -2506,6 +2544,20 @@ fn exposed_columns_of_view(
 pub enum ArrayElemType {
     Text,
     Bool,
+    /// `INTEGER`（Issue #1193）。行内表現は 4 バイト LE。
+    Integer,
+    /// `BIGINT`（Issue #1193）。行内表現は 8 バイト LE。
+    BigInt,
+    /// `REAL`（Issue #1193）。`-0.0` 正規化済みの 4 バイト LE。
+    Real,
+    /// `DOUBLE PRECISION`（Issue #1193）。`-0.0` 正規化済みの 8 バイト LE。
+    Double,
+    /// `DATE`（Issue #1193）。1970-01-01 起点の日数（4 バイト LE）。
+    Date,
+    /// `TIMESTAMP`（Issue #1193）。1970-01-01 起点のマイクロ秒（8 バイト LE）。
+    Timestamp,
+    /// `UUID`（Issue #1193）。16 バイト生値。
+    Uuid,
 }
 
 impl ArrayElemType {
@@ -2514,6 +2566,13 @@ impl ArrayElemType {
         match self {
             ArrayElemType::Text => "text",
             ArrayElemType::Bool => "boolean",
+            ArrayElemType::Integer => "integer",
+            ArrayElemType::BigInt => "bigint",
+            ArrayElemType::Real => "real",
+            ArrayElemType::Double => "double",
+            ArrayElemType::Date => "date",
+            ArrayElemType::Timestamp => "timestamp",
+            ArrayElemType::Uuid => "uuid",
         }
     }
 
@@ -2523,6 +2582,13 @@ impl ArrayElemType {
         match tag {
             "text" => Ok(ArrayElemType::Text),
             "boolean" => Ok(ArrayElemType::Bool),
+            "integer" => Ok(ArrayElemType::Integer),
+            "bigint" => Ok(ArrayElemType::BigInt),
+            "real" => Ok(ArrayElemType::Real),
+            "double" => Ok(ArrayElemType::Double),
+            "date" => Ok(ArrayElemType::Date),
+            "timestamp" => Ok(ArrayElemType::Timestamp),
+            "uuid" => Ok(ArrayElemType::Uuid),
             other => Err(CatalogError::Invalid(format!(
                 "unsupported array element type: {other:?}"
             ))),
@@ -6673,6 +6739,10 @@ impl Storage {
                 if collides {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
+                // 主キーの導出擬似名との衝突（Issue #1196）。
+                if name_collides_with_primary_key(&schema, table_name, n) {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
             }
             if schema.unique_constraints.len() >= MAX_UNIQUE_CONSTRAINTS {
                 return Err(CatalogError::ConstraintLimitExceeded(format!(
@@ -6725,6 +6795,95 @@ impl Storage {
         // 二重の安全策とする（各テナントは次回の書き込み時に遅延再構築される。
         // `row_table` の借用は上のブロックを抜けた時点で解放済みのため、
         // 別テーブルである索引テーブルの削除はここで安全に行える）。
+        write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(confirmed_name)
+    }
+
+    /// 既存テーブルへ PRIMARY KEY を追加する（TABLE-22 (a)(d)・TASK-233、Issue #1196。
+    /// `ALTER TABLE ... ADD PRIMARY KEY (...)`。SQL 表層
+    /// `sql::ddl::execute_alter_table_add_primary_key` と Rust API の唯一の実装）。
+    /// 成功時は導出擬似名（[`primary_key_constraint_name`]）を返す。
+    ///
+    /// 判定順序（fail-closed。データに依存するのは最後の既存行走査のみ）:
+    /// (1) テーブル取得（`TableNotFound`） (2) 主キー宣言済みなら `Invalid`
+    /// (3) 擬似名が既存 UNIQUE・CHECK・FOREIGN KEY 名と衝突すれば
+    /// `ConstraintAlreadyExists` (4) 追加後スキーマ（PK 構成列を `nullable=false`
+    /// へ）の [`validate_schema`]（未知の列・PK 不可型は `Invalid`。ここでは永続化
+    /// しない） (5) 既存行の**全件**（全テナント・`Public`／`Private` を問わない。
+    /// DDL は `PolicyContext` を取らない共有資源操作のため可視性で母集合を縮めない）
+    /// の NULL 検査（`NotNullConstraintViolation`。**変更前スキーマ**で走査する理由は
+    /// [`crate::constraint::table_first_null_in_columns`] 参照） (6) 既存行の重複検査
+    /// （テナントごとに独立。テナントを跨いだ同値は許容。`UniqueConstraintViolation`）。
+    /// NULL と重複が併存する場合は行順序に関係なく常に NULL 側が優先される。
+    /// 拒否はすべて write txn を commit せず破棄する（副作用ゼロ）。成功時は永続
+    /// 一意索引を無効化（次回書き込みでテナントごとに遅延再構築）し世代を bump する。
+    pub fn alter_table_add_primary_key(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+    ) -> Result<String> {
+        validate_identifier(table_name)?;
+        let pk_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+        let confirmed_name = primary_key_constraint_name(table_name);
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            if schema.primary_key().is_some() {
+                return Err(CatalogError::Invalid(
+                    "table already has a primary key".to_string(),
+                ));
+            }
+            let pseudo_collides = schema
+                .unique_constraints
+                .iter()
+                .any(|u| u.name() == confirmed_name)
+                || schema.checks.iter().any(|c| c.name == confirmed_name)
+                || schema
+                    .foreign_keys
+                    .iter()
+                    .any(|f| f.name() == confirmed_name);
+            if pseudo_collides {
+                return Err(CatalogError::ConstraintAlreadyExists(confirmed_name));
+            }
+
+            let mut updated = schema.clone().with_primary_key(pk_columns.clone());
+            for column in updated.columns.iter_mut() {
+                if pk_columns.iter().any(|n| n == &column.name) {
+                    column.nullable = false;
+                }
+            }
+            validate_schema(&updated)?;
+
+            let row_table_name = user_rows_table_name(table_name);
+            match write_txn.open_table(user_rows_table_def(&row_table_name)) {
+                Ok(row_table) => {
+                    if let Some(column) = crate::constraint::table_first_null_in_columns(
+                        &row_table,
+                        &schema,
+                        &pk_columns,
+                    )? {
+                        return Err(CatalogError::NotNullConstraintViolation(column));
+                    }
+                    if crate::constraint::table_has_duplicate_unique_key(
+                        &row_table,
+                        &schema,
+                        &pk_columns,
+                    )? {
+                        return Err(CatalogError::UniqueConstraintViolation);
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    // 行ストア未作成（既存行 0 件）。
+                }
+                Err(e) => return Err(map_row_table_error(e)),
+            }
+
+            let encoded = encode_schema(&updated)?;
+            let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+            catalog_table.insert(table_name, encoded.as_slice())?;
+        }
         write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
@@ -6792,6 +6951,12 @@ impl Storage {
                     || schema.checks.iter().any(|c| &c.name == n)
                     || schema.foreign_keys.iter().any(|f| f.name() == n.as_str());
                 if collides {
+                    return Err(AlterCheckError::Catalog(
+                        CatalogError::ConstraintAlreadyExists(n.clone()),
+                    ));
+                }
+                // 主キーの導出擬似名との衝突（Issue #1196）。
+                if name_collides_with_primary_key(&schema, table_name, n) {
                     return Err(AlterCheckError::Catalog(
                         CatalogError::ConstraintAlreadyExists(n.clone()),
                     ));
@@ -6929,6 +7094,10 @@ impl Storage {
                 if collides {
                     return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
                 }
+                // 主キーの導出擬似名との衝突（Issue #1196）。
+                if name_collides_with_primary_key(&schema, table_name, n) {
+                    return Err(CatalogError::ConstraintAlreadyExists(n.to_string()));
+                }
             }
             if schema.foreign_keys.len() >= MAX_FOREIGN_KEYS_PER_TABLE {
                 return Err(CatalogError::ConstraintLimitExceeded(format!(
@@ -7051,6 +7220,7 @@ impl Storage {
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let mut dropped_fk_parent_table: Option<String> = None;
+        let mut dropped_primary_key = false;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             let unique_index = schema
@@ -7103,21 +7273,56 @@ impl Storage {
                 let mut fks = schema.foreign_keys.clone();
                 fks.remove(fk_index);
                 schema.clone().with_foreign_keys(fks)
-            } else {
+            } else if let Some(check_index) = schema.checks.iter().position(|c| c.name == name) {
                 // CHECK の削除（Issue #1068 設計 D5）: UNIQUE・FOREIGN KEY と
                 // 異なり他制約からの依存を持ち得ないため依存検査は不要。
-                let check_index = schema.checks.iter().position(|c| c.name == name);
-                let Some(check_index) = check_index else {
-                    return Err(CatalogError::ConstraintNotFound(name.to_string()));
-                };
                 let mut checks = schema.checks.clone();
                 checks.remove(check_index);
                 schema.clone().with_checks(checks)
+            } else if name_collides_with_primary_key(&schema, table_name, name) {
+                // PRIMARY KEY の削除（TABLE-22 (d)、Issue #1196）。実名を持つ制約
+                // （UNIQUE → FOREIGN KEY → CHECK）を先に探した後の最後の候補として、
+                // 導出擬似名で解決する。暗黙の `id` 主キー（未宣言）は削除できず
+                // `ConstraintNotFound`。
+                let pk_columns: Vec<String> = schema
+                    .primary_key()
+                    .map(|c| c.to_vec())
+                    .ok_or_else(|| CatalogError::ConstraintNotFound(name.to_string()))?;
+                // FK 依存検査（自己参照を含む）: `parent_columns` の集合が PK の列集合と
+                // 一致する宣言があれば拒否する（同じ集合を UNIQUE が覆っていても救済
+                // しない。UNIQUE 削除時と対称の fail-closed）。
+                let referencing = referencing_foreign_keys_in_txn(&write_txn, table_name)?;
+                let pk_set: std::collections::HashSet<&str> =
+                    pk_columns.iter().map(|s| s.as_str()).collect();
+                for (_referencing_schema, fk) in &referencing {
+                    if fk.references_parent_id() {
+                        continue;
+                    }
+                    let parent_set: std::collections::HashSet<&str> =
+                        fk.parent_columns().iter().map(|s| s.as_str()).collect();
+                    if parent_set == pk_set {
+                        return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+                    }
+                }
+                dropped_primary_key = true;
+                // PK 構成列の `nullable=false` は戻さない（PostgreSQL も NOT NULL を
+                // 残す。緩める方向は fail-open になりやすい）。
+                let mut cleared = schema.clone();
+                cleared.primary_key = None;
+                cleared
+            } else {
+                return Err(CatalogError::ConstraintNotFound(name.to_string()));
             };
 
             let encoded = encode_schema(&updated)?;
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
+        }
+        // PRIMARY KEY 削除時は永続一意索引を無効化する（PK も UNIQUE も残らない場合
+        // `enforce_unique_keys_in_txn` は即 return し、古い索引が残り続けるのを防ぐ。
+        // Issue #1196）。
+        if dropped_primary_key {
+            write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
         }
         // 索引衛生（P0・設計 §3.4）: カタログ書き換え後（＝索引の要否判定が
         // 「削除後」の状態を見る）に、影響を受けうる表の stale 索引を刈り込む。
@@ -8139,7 +8344,8 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
         // TASK-233、Issue #1069）はテーブル存在確認からは到達しない（網羅性の
         // ため `Internal` へ丸める）。
-        | CatalogError::ForeignKeyViolation => SqlSurfaceError::Internal {
+        | CatalogError::ForeignKeyViolation
+        | CatalogError::NotNullConstraintViolation(_) => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
         // 読み取り専用の存在確認（`table_exists`）は書き込みトランザクションを
@@ -9871,6 +10077,20 @@ mod tests {
         assert_eq!(lang.default, Some(ColumnDefault::Text("ja".to_string())));
     }
 
+    /// 主キーの導出擬似名（Issue #1196）: 通常長は `<table>_pkey`、識別子長の上限に
+    /// 近い・超えるテーブル名は先頭を切り詰め、常に妥当な識別子になる。
+    #[test]
+    fn primary_key_constraint_name_truncates_to_valid_identifier() {
+        assert_eq!(primary_key_constraint_name("docs"), "docs_pkey");
+        for len in [1, 57, 58, 59, 63] {
+            let table = "t".repeat(len);
+            let name = primary_key_constraint_name(&table);
+            assert!(name.ends_with("_pkey"), "len={len}");
+            assert!(name.len() <= MAX_IDENTIFIER_LEN, "len={len}");
+            validate_identifier(&name).expect("derived name must be a valid identifier");
+        }
+    }
+
     /// 主キー宣言なしのスキーマはこれまでどおり v2 のまま（`PRIMARY KEY` 追加が
     /// 既存カタログ値のバイト列に一切影響しないことの回帰）。
     #[test]
@@ -10088,6 +10308,54 @@ mod tests {
             decode_schema("t", &bytes),
             Err(CatalogError::CorruptSchema(_))
         ));
+    }
+
+    /// Issue #1193: 要素型タグは既存のスカラー型タグと同じ綴りで往復し、既存の
+    /// `text`／`boolean` のカタログ表現は不変。`numeric`・`bytea`・`enum`・`json`・
+    /// `vector`・`array` など未対応タグは fail-closed に拒否する。
+    #[test]
+    fn array_element_type_tags_roundtrip_and_unsupported_tags_are_rejected() {
+        for (elem, tag) in [
+            (ArrayElemType::Text, "text"),
+            (ArrayElemType::Bool, "boolean"),
+            (ArrayElemType::Integer, "integer"),
+            (ArrayElemType::BigInt, "bigint"),
+            (ArrayElemType::Real, "real"),
+            (ArrayElemType::Double, "double"),
+            (ArrayElemType::Date, "date"),
+            (ArrayElemType::Timestamp, "timestamp"),
+            (ArrayElemType::Uuid, "uuid"),
+        ] {
+            assert_eq!(elem.catalog_tag(), tag);
+            assert_eq!(ArrayElemType::from_catalog_tag(tag).expect("tag"), elem);
+            let schema = TableSchema::new(
+                "t",
+                vec![ColumnDef::new(
+                    "v",
+                    ColumnType::Array(ArrayType::new(elem, 8).expect("array ty")),
+                    true,
+                )],
+            );
+            let bytes = encode_schema(&schema).expect("encode");
+            assert!(
+                String::from_utf8_lossy(&bytes).contains(&format!("v:array:{tag},8:")),
+                "catalog line must use the element tag {tag}"
+            );
+            let decoded = decode_schema("t", &bytes).expect("decode");
+            assert_eq!(decoded.columns, schema.columns);
+        }
+        for tag in [
+            "numeric", "bytea", "enum", "json", "jsonb", "vector", "array", "int",
+        ] {
+            let bytes = format!("v2\ncols:1\ntags:array:{tag},4:0\n").into_bytes();
+            assert!(
+                matches!(
+                    decode_schema("t", &bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "element tag {tag} must be rejected"
+            );
+        }
     }
 
     #[test]

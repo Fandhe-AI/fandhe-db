@@ -231,3 +231,10 @@ fail-closed。FOREIGN KEY・CHECK の削除は既存行を変更しないため�
 - スコープ外として残すもの: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`・
   CHECK／PK／FK の ADD／DROP CONSTRAINT・`DROP CONSTRAINT IF EXISTS`／
   `CASCADE`・制約の一覧を取得する手段（`pg_constraint` 相当）・永続一意索引
+
+## 追記（Issue #1196）: 主キーの名前解決
+
+`DROP CONSTRAINT` の名前解決の末尾（UNIQUE → FOREIGN KEY → CHECK の後）に、主キーの
+導出擬似名 `<table>_pkey` を追加した。実名を持つ制約を先に探すため既存の挙動は変わらない。
+従来 `42704` だった「主キーの擬似名を指定した DROP」は、主キー宣言済みなら成功する。
+詳細は `docs/design/alter-table-primary-key.md`。

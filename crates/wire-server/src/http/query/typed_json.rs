@@ -168,9 +168,9 @@ pub fn vector_literal_values(items: &[JsonValue], dim: u32) -> Result<Vec<f32>, 
 /// `{...}` 形の配列リテラル要素 1 個を組み立てる。`quote` が `true` のときは
 /// `"`／`\` をエスケープしたうえで二重引用符で囲む（`engine::sql::parser::
 /// parse_array_literal` の引用要素解釈と対称）。`quote` が `false` のときは
-/// 未加工のまま出力する（JSON `null` 要素専用。D-A6・`parse_array_literal` の
-/// 「配列リテラルは NULL 要素を受理しない」契約に照合させ `22000` として拒否
-/// させるため）。
+/// 未加工のまま出力する（JSON `null` 要素の引用なし `NULL`・JSON 数値の生テキスト
+/// 専用。いずれも呼び出し元が固定語または数値文法の検証済みテキストだけを渡す。
+/// Issue #1193）。
 fn push_array_element(out: &mut String, text: &str, quote: bool) {
     if !quote {
         out.push_str(text);
@@ -186,12 +186,15 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
     out.push('"');
 }
 
-/// `ARRAY` 列（`TEXT[]`／`BOOLEAN[]`）向け配列直列化。要素種別を
+/// `ARRAY` 列（`TEXT`／`BOOLEAN`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
+/// `DATE`／`TIMESTAMP`／`UUID` の各要素型）向け配列直列化。要素種別を
 /// `array_ty.elem()` に応じて検証したうえで `{...}` テキストを組み立てる。
 /// 要素数が [`ArrayType::max_len`] を超える場合はテキストを組み立てる**前**に
 /// 拒否する（`54000`。アロケーション前の上限検査。`security.md`「不安全な
-/// 設計」対応）。JSON `null` 要素は引用なしの `NULL` として出力し、判定自体は
-/// `engine::sql::parser::parse_array_literal`（`22000`）へ委譲する。
+/// 設計」対応）。JSON `null` 要素は引用なしの `NULL`（NULL 要素。Issue #1193）、
+/// 数値要素は JSON 数値の生テキスト（整数・浮動小数の範囲・形式判定は
+/// `engine::sql::parser::parse_array_literal` がスカラー列と同じ分類で行う）、
+/// 日時・UUID 要素は JSON 文字列を引用付きで出力する（SQL 表層と同じ値が得られる）。
 pub fn array_literal_text(
     items: &[JsonValue],
     array_ty: ArrayType,
@@ -210,6 +213,17 @@ pub fn array_literal_text(
             (ArrayElemType::Bool, JsonValue::Bool(b)) => {
                 push_array_element(&mut out, if *b { "true" } else { "false" }, true)
             }
+            (
+                ArrayElemType::Integer
+                | ArrayElemType::BigInt
+                | ArrayElemType::Real
+                | ArrayElemType::Double,
+                JsonValue::Number(n),
+            ) => push_array_element(&mut out, &number_literal_text(n), false),
+            (
+                ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid,
+                JsonValue::String(s),
+            ) => push_array_element(&mut out, s, true),
             (ArrayElemType::Text, _) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON string",
@@ -218,6 +232,22 @@ pub fn array_literal_text(
             (ArrayElemType::Bool, _) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON boolean",
+                ))
+            }
+            (
+                ArrayElemType::Integer
+                | ArrayElemType::BigInt
+                | ArrayElemType::Real
+                | ArrayElemType::Double,
+                _,
+            ) => {
+                return Err(TypedJsonError::TypeMismatch(
+                    "ARRAY column element must be a JSON number",
+                ))
+            }
+            (ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid, _) => {
+                return Err(TypedJsonError::TypeMismatch(
+                    "ARRAY column element must be a JSON string",
                 ))
             }
         }
@@ -556,6 +586,81 @@ mod tests {
         let items = vec![JsonValue::Null, JsonValue::String("a".to_string())];
         let text = array_literal_text(&items, array_ty).expect("ok");
         assert_eq!(text, r#"{NULL,"a"}"#);
+    }
+
+    /// Issue #1193: 新しい要素型の JSON 配列は、SQL 表層の配列リテラルと同じ値へ
+    /// 束縛される（往復パリティ）。
+    #[test]
+    fn array_literal_text_new_element_types_match_sql_surface_values() {
+        use engine::row_codec::ArrayValue as V;
+        let parse = |elem: ArrayElemType, json: &str| {
+            let array_ty = ArrayType::new(elem, 8).expect("valid array type");
+            let JsonValue::Array(items) = num(json) else {
+                panic!("array expected");
+            };
+            let text = array_literal_text(&items, array_ty).expect("literal text");
+            engine::sql::parser::parse_array_literal(&text, array_ty).expect("engine parse")
+        };
+        assert_eq!(
+            parse(ArrayElemType::Integer, "[1,null,-3]"),
+            V::Integer(vec![Some(1), None, Some(-3)])
+        );
+        assert_eq!(
+            parse(ArrayElemType::BigInt, "[9007199254740993,null]"),
+            V::BigInt(vec![Some(9_007_199_254_740_993), None])
+        );
+        assert_eq!(
+            parse(ArrayElemType::Real, "[1.5,-0,null]"),
+            V::Real(vec![Some(1.5), Some(0.0), None])
+        );
+        assert_eq!(
+            parse(ArrayElemType::Double, "[2.25,1e2]"),
+            V::Double(vec![Some(2.25), Some(100.0)])
+        );
+        assert_eq!(
+            parse(ArrayElemType::Date, r#"["1970-01-02",null]"#),
+            V::Date(vec![Some(1), None])
+        );
+        assert_eq!(
+            parse(ArrayElemType::Timestamp, r#"["1970-01-01 00:00:01"]"#),
+            V::Timestamp(vec![Some(1_000_000)])
+        );
+        assert!(matches!(
+            parse(
+                ArrayElemType::Uuid,
+                r#"["00000000-0000-0000-0000-000000000001",null]"#
+            ),
+            V::Uuid(items) if items.len() == 2 && items[1].is_none()
+        ));
+    }
+
+    #[test]
+    fn array_literal_text_rejects_new_element_type_mismatches() {
+        let ty = |elem| ArrayType::new(elem, 8).expect("valid array type");
+        for (elem, item) in [
+            (ArrayElemType::Integer, JsonValue::String("1".to_string())),
+            (ArrayElemType::Double, JsonValue::Bool(true)),
+            (ArrayElemType::Date, num("1")),
+            (ArrayElemType::Uuid, JsonValue::Bool(false)),
+            (ArrayElemType::Timestamp, num("[]")),
+        ] {
+            let err = array_literal_text(&[item], ty(elem)).expect_err("reject");
+            assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
+            assert_eq!(err.wire_code(), "42601");
+        }
+    }
+
+    #[test]
+    fn array_literal_text_escapes_string_typed_elements() {
+        // 日時・UUID 要素は文字列を引用・エスケープする（リテラル注入の防止）。
+        // 不正値はテキスト化後に engine が SQL 表層と同じ分類で拒否する。
+        let array_ty = ArrayType::new(ArrayElemType::Uuid, 8).expect("valid array type");
+        let items = vec![JsonValue::String("a\"},{\"b".to_string())];
+        let text = array_literal_text(&items, array_ty).expect("ok");
+        assert_eq!(text, r#"{"a\"},{\"b"}"#);
+        let err =
+            engine::sql::parser::parse_array_literal(&text, array_ty).expect_err("not a uuid");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]

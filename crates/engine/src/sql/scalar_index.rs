@@ -1501,6 +1501,10 @@ impl ScalarIndex {
             | FilterOp::InListLiteral { .. }
             | FilterOp::BetweenLiteral { .. }
             | FilterOp::InTyped(_)
+            | FilterOp::ArrayEquals(_)
+            | FilterOp::InArray(_)
+            | FilterOp::JsonEquals(_)
+            | FilterOp::InJson(_)
             | FilterOp::IsNull
             | FilterOp::IsNotNull
             | FilterOp::Not(_)
