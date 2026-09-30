@@ -233,13 +233,13 @@ fn exact_id_set_detects_duplicate_plus_missing() {
 
 #[test]
 fn expected_order_prefixes_follow_fixture() {
-    let single = expected_order_single(2_000, 100);
+    let single = expected_order_single(&visible_doc_rows(2_000, 0), 100);
     assert_eq!(single.len(), 100);
     assert!(is_sorted_by_direction(&single, false));
     let brute_min = (0..2_000u64).map(qty_for_id).min().expect("non-empty");
     assert_eq!(single.first().copied(), Some(brute_min));
 
-    let multi = expected_order_multi(2_000, 100);
+    let multi = expected_order_multi(&visible_doc_rows(2_000, 0), 100);
     assert_eq!(multi.len(), 100);
     // 先頭は最小の lang（文字列順で "l0"）内の最大 qty。
     let best = (0..2_000u64)
@@ -276,4 +276,20 @@ fn cosine_distance_reference() {
     assert!(cosine_distance(&[1.0, 0.0], &[2.0, 0.0]).abs() < 1e-12);
     assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-12);
     assert_eq!(cosine_distance(&[0.0, 0.0], &[1.0, 0.0]), 1.0);
+}
+
+#[test]
+fn visible_rows_include_sentinels_only_for_other_context() {
+    assert_eq!(visible_doc_rows(10, 0).len(), 10);
+    let both = visible_doc_rows(10, 4);
+    assert_eq!(both.len(), 14);
+    // sentinel は最小 qty（偶数 id）と最大 qty（奇数 id）を持ち、他テナント文脈の上位に現れる。
+    assert_eq!(expected_order_single(&both, 2), vec![-1, -1]);
+    assert_eq!(
+        expected_order_multi(&both, 2),
+        vec![("l0", 2_000_000), ("l0", 2_000_000)]
+    );
+    assert!(expected_order_single(&visible_doc_rows(10, 0), 2)
+        .iter()
+        .all(|q| *q >= 0));
 }

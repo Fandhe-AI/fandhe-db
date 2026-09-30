@@ -38,8 +38,8 @@ use harness::relational_p95::{
     lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
     parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
     refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
-    round_p95, scale_label, summarize_rounds, topk_matches, Group, JOIN_ROWS, PRED_LIMIT,
-    REFERENCE_ARM, WIDE_LIMIT,
+    round_p95, scale_label, sentinel_qty, summarize_rounds, topk_matches, visible_doc_rows, Group,
+    JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -207,14 +207,22 @@ fn cell_text(cell: Option<&Cell>) -> &str {
     }
 }
 
-/// 述語 arm の期待結果（述語を満たす全自テナント行の `(id, 距離)` の距離昇順）を fixture から求める。
+/// 述語 arm の期待結果（文脈から見える述語充足行の `(id, 距離)` の距離昇順）を fixture から求める。
 /// 計測クエリと同じベクトル列を参照実装のコサイン距離で並べ、エンジン出力とは独立に導出する。
-fn expected_predicate_ranked(arm: &str, own_rows: u64, query: &[f32]) -> Vec<(u64, f64)> {
+/// `other_rows > 0`（他テナント文脈）のときは、計測クエリと同一ベクトルの sentinel（距離 0・`l0`）を加える。
+fn expected_predicate_ranked(
+    arm: &str,
+    own_rows: u64,
+    other_rows: u64,
+    query: &[f32],
+) -> Vec<(u64, f64)> {
     let n = predicate_lang_count(arm);
     let mut ranked: Vec<(u64, f64)> = (0..own_rows)
         .filter(|id| lang_in_first_n(lang_for_id(*id), n))
         .map(|id| (id, cosine_distance(&rng_vector_for(id), query)))
         .collect();
+    let sentinel_dist = cosine_distance(query, query);
+    ranked.extend((own_rows..own_rows + other_rows).map(|id| (id, sentinel_dist)));
     ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
     ranked
 }
@@ -231,16 +239,26 @@ fn predicate_lang_count(arm: &str) -> u64 {
 /// 述語 arm の事前検査: 非空・他テナント id 非混入・述語充足に加え、fixture から導出した
 /// 期待上位 `PRED_LIMIT` 行（件数・id 集合・距離順。同値境界は許容）との照合。
 /// 述語が誤って狭い集合だけを返す等の取り違えを検出する。
-fn precheck_predicate(arm: &str, result: &QueryResult, own_rows: u64, ranked: &[(u64, f64)]) {
+fn precheck_predicate(
+    arm: &str,
+    result: &QueryResult,
+    (own_rows, visible_ids): (u64, u64),
+    ranked: &[(u64, f64)],
+) {
     if result.rows.is_empty() {
         fail_closed(format!("{arm}: empty result"));
     }
     let n = predicate_lang_count(arm);
     for row in &result.rows {
-        if row.id >= own_rows {
-            fail_closed(format!("{arm}: row outside own tenant id range"));
+        if row.id >= visible_ids {
+            fail_closed(format!("{arm}: row outside the visible id range"));
         }
-        if !lang_in_first_n(lang_for_id(row.id), n) {
+        let lang = if row.id < own_rows {
+            lang_for_id(row.id)
+        } else {
+            lang_token(0)
+        };
+        if !lang_in_first_n(lang, n) {
             fail_closed(format!("{arm}: row does not satisfy predicate"));
         }
     }
@@ -250,63 +268,54 @@ fn precheck_predicate(arm: &str, result: &QueryResult, own_rows: u64, ranked: &[
     }
 }
 
-/// 順序 arm の事前検査: 非空・他テナント id 非混入・fixture から求めた期待上位 `WIDE_LIMIT` 行との照合。
-/// 各行の値が id の fixture 値と一致し、id が重複せず、`(値)` 列が期待の先頭列と一致することを見る
-/// （`LIMIT` 前の行の取り違えを検出する。同値境界の id 差は許すため値列で照合する）。
-fn precheck_order(arm: &str, result: &QueryResult, own_rows: u64) {
+/// 順序 arm の事前検査: 非空・可視 id 範囲外の混入なし・id の重複なし・各行の値が fixture と一致・
+/// 値列が可視行 `visible`（`visible_doc_rows`）から導出した期待上位 `WIDE_LIMIT` 行と一致。
+/// 対象テナント文脈は自行のみ、他テナント文脈は自行と sentinel を `visible` に含めて同じ関数で検査する
+/// （計測対象の文そのものの結果を照合する。同値境界の id 差は許すため値列で比べる）。
+fn precheck_order(arm: &str, result: &QueryResult, visible: &[(u64, &'static str, i64)]) {
     if result.rows.is_empty() {
         fail_closed(format!("{arm}: empty result"));
     }
-    if result.rows.iter().any(|r| r.id >= own_rows) {
-        fail_closed(format!("{arm}: row outside own tenant id range"));
-    }
+    let by_id: std::collections::HashMap<u64, (&str, i64)> =
+        visible.iter().map(|r| (r.0, (r.1, r.2))).collect();
     let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
     ids.sort_unstable();
     if ids.windows(2).any(|w| w[0] == w[1]) {
         fail_closed(format!("{arm}: duplicate row ids"));
     }
-    if arm == "order_single" {
-        for r in &result.rows {
-            if cell_i64(r.cells.get(1)) != qty_for_id(r.id) {
-                fail_closed("order_single: qty does not match fixture for id");
-            }
+    for r in &result.rows {
+        let Some((lang, qty)) = by_id.get(&r.id).copied() else {
+            fail_closed(format!("{arm}: row outside the visible id range"));
+        };
+        let (qty_col, lang_col) = if arm == "order_single" {
+            (1, None)
+        } else {
+            (2, Some(1))
+        };
+        if cell_i64(r.cells.get(qty_col)) != qty
+            || lang_col.is_some_and(|c| cell_text(r.cells.get(c)) != lang)
+        {
+            fail_closed(format!("{arm}: values do not match fixture for id"));
         }
+    }
+    if arm == "order_single" {
         let got: Vec<i64> = result
             .rows
             .iter()
             .map(|r| cell_i64(r.cells.get(1)))
             .collect();
-        if got != expected_order_single(own_rows, WIDE_LIMIT) {
+        if got != expected_order_single(visible, WIDE_LIMIT) {
             fail_closed("order_single: result is not the expected top rows ascending");
         }
     } else {
-        // lang は文字列昇順、同一 lang 内で qty は降順。
-        for r in &result.rows {
-            if cell_text(r.cells.get(1)) != lang_for_id(r.id)
-                || cell_i64(r.cells.get(2)) != qty_for_id(r.id)
-            {
-                fail_closed("order_multi: values do not match fixture for id");
-            }
-        }
         let got: Vec<(&str, i64)> = result
             .rows
             .iter()
             .map(|r| (cell_text(r.cells.get(1)), cell_i64(r.cells.get(2))))
             .collect();
-        if got != expected_order_multi(own_rows, WIDE_LIMIT) {
+        if got != expected_order_multi(visible, WIDE_LIMIT) {
             fail_closed("order_multi: result is not the expected top rows");
         }
-    }
-}
-
-/// 対照検査: 両 visibility を見える他テナント文脈（Public な自行も見える）で同じ文を実行し、
-/// 結果に他テナント側の行（id が自範囲外）が現れることを確認する。RLS が外れれば対象テナントの
-/// 結果にも同じ sentinel が現れる、という前提（検出可能な fixture）の裏付けになる。
-fn precheck_other_tenant_visible(arm: &str, result: &QueryResult, own_rows: u64) {
-    if !result.rows.iter().any(|r| r.id >= own_rows) {
-        fail_closed(format!(
-            "{arm}: control query returned no other-tenant rows"
-        ));
     }
 }
 
@@ -412,7 +421,7 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         vec![
             Value::Vector(sentinel_vector.clone()),
             Value::Text(lang_token(0).to_string()),
-            Value::BigInt(if id.is_multiple_of(2) { -1 } else { 2_000_000 }),
+            Value::BigInt(sentinel_qty(id)),
         ]
     };
     seed_rows(
@@ -442,10 +451,17 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     if group.includes(Group::Predicate) {
         let arms = predicate_statements(DOCS, &literal).unwrap_or_else(|e| fail_closed(e));
         for (label, sql) in &arms {
-            let ranked = expected_predicate_ranked(label, own, &query);
-            precheck_predicate(label, &exec(&core, &ctx_a, sql), own, &ranked);
-            // 対照: 同じ計測クエリを他テナント文脈で実行し、sentinel が結果に現れること。
-            precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
+            // 計測する文（`arms`）そのものを、対象テナント文脈と他テナント文脈の双方で fixture 由来の
+            // 期待上位行と照合する（他テナント文脈は sentinel が上位に現れること＝越境が見える fixture）。
+            let ranked = expected_predicate_ranked(label, own, 0, &query);
+            precheck_predicate(label, &exec(&core, &ctx_a, sql), (own, own), &ranked);
+            let ranked_b = expected_predicate_ranked(label, own, other, &query);
+            precheck_predicate(
+                label,
+                &exec(&core, &ctx_b, sql),
+                (own, own + other),
+                &ranked_b,
+            );
         }
         measure_group(
             "predicate",
@@ -459,9 +475,11 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     }
     if group.includes(Group::OrderBy) {
         let arms = order_by_statements(DOCS).unwrap_or_else(|e| fail_closed(e));
+        let visible_a = visible_doc_rows(own, 0);
+        let visible_b = visible_doc_rows(own, other);
         for (label, sql) in &arms {
-            precheck_order(label, &exec(&core, &ctx_a, sql), own);
-            precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
+            precheck_order(label, &exec(&core, &ctx_a, sql), &visible_a);
+            precheck_order(label, &exec(&core, &ctx_b, sql), &visible_b);
         }
         measure_group(
             "order_by",
@@ -498,6 +516,34 @@ fn exec_join_pages(core: &EngineCore, tenant_ctx: &PolicyContext, head: &str) ->
         }
     }
     fail_closed("join_inner: full join exceeds the paging capacity")
+}
+
+/// 結合 arm の事前検査（計測する `LIMIT` 付きの文そのものの結果）: 件数が `min(WIDE_LIMIT, 期待集合の大きさ)`・
+/// id の重複なし・全 id が期待集合（`expected_ids`・昇順）に属する・各行のタイトルと作者名が結合キーどおり
+/// （`cells_of(id)`）、をすべて満たすこと。`ORDER BY` が無く先頭 `LIMIT` 行の選択は未規定なので、
+/// どの行が返るかではなく「返る行がすべて期待集合の正しい結合結果であること」を見る。
+fn precheck_join(
+    result: &QueryResult,
+    expected_ids: &[u64],
+    cells_of: &dyn Fn(u64) -> (String, String),
+) {
+    let want = WIDE_LIMIT.min(expected_ids.len());
+    if result.rows.len() != want || want == 0 {
+        fail_closed("join_inner: unexpected row count for the measured statement");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for row in &result.rows {
+        if expected_ids.binary_search(&row.id).is_err() {
+            fail_closed("join_inner: row outside the expected join result");
+        }
+        if !seen.insert(row.id) {
+            fail_closed("join_inner: duplicate row ids");
+        }
+        let (title, name) = cells_of(row.id);
+        if cell_text(row.cells.first()) != title || cell_text(row.cells.get(1)) != name {
+            fail_closed("join_inner: join key mismatch");
+        }
+    }
 }
 
 fn run_join_group(rows: usize, rounds: u32) {
@@ -576,25 +622,24 @@ fn run_join_group(rows: usize, rounds: u32) {
     let ctx_a =
         PolicyContext::new(TENANT_A).unwrap_or_else(|e| fail_closed(format!("policy ctx: {e}")));
     let arm = join_statement(DOCUMENTS, AUTHORS).unwrap_or_else(|e| fail_closed(e));
-    let result = exec(&core, &ctx_a, &arm.1);
-    if result.rows.is_empty() {
-        fail_closed("join_inner: empty result");
-    }
-    // 結合キー一致: 文書 id の作者は `a{author_id}`、タイトルは `t{id}`（doc id = row id）。
-    for row in &result.rows {
-        if row.id >= join_rows {
-            fail_closed("join_inner: row outside own tenant id range");
-        }
-        if is_probe(row.id) {
-            fail_closed("join_inner: right-side tenant boundary leaked (probe row joined)");
-        }
-        let title = cell_text(row.cells.first());
-        let name = cell_text(row.cells.get(1));
-        let expected_author = author_id_for_doc(row.id, join_rows);
-        if title != format!("t{}", row.id) || name != format!("a{expected_author}") {
-            fail_closed("join_inner: join key mismatch");
-        }
-    }
+    // 計測する文（`arm.1`）そのものを、対象テナント文脈と他テナント文脈の双方で照合する。
+    // 対象テナント: 結果は自テナントの結合可能文書のみ（probe 行は右辺 RLS で脱落）。
+    // 他テナント（両 visibility 可視）: 自行・他テナント行とも結合可能で全 id が候補になる。
+    let expected_a: Vec<u64> = (0..join_rows).filter(|id| !is_probe(*id)).collect();
+    let expected_b: Vec<u64> = (0..join_rows + other).collect();
+    let cells_of = |id: u64| -> (String, String) {
+        let author = if id >= join_rows {
+            (join_rows + (id - join_rows) % other.max(1)) as i64
+        } else if is_probe(id) {
+            (join_rows + id % other.max(1)) as i64
+        } else {
+            author_id_for_doc(id, join_rows)
+        };
+        (format!("t{id}"), format!("a{author}"))
+    };
+    let ctx_b = ctx(TENANT_B);
+    precheck_join(&exec(&core, &ctx_a, &arm.1), &expected_a, &cells_of);
+    precheck_join(&exec(&core, &ctx_b, &arm.1), &expected_b, &cells_of);
     // 対照検査: 結合結果を `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページで全件取得し、対象テナントの
     // 結合結果が自テナント文書の全件（過不足なし）であることを確認する。RLS が外れれば他テナント
     // 文書が加わり件数・id 範囲が崩れる。他テナント文脈では自行と Public な他テナント行の双方が見える。
@@ -608,13 +653,10 @@ fn run_join_group(rows: usize, rounds: u32) {
         fail_closed("join_inner: fixture has no cross-tenant probe rows (scale too small)");
     }
     // 件数だけでは重複と欠落が同時に起きても通過するため、期待する文書 id の集合と過不足なく照合する。
-    let expected_ids: Vec<u64> = (0..join_rows).filter(|id| !is_probe(*id)).collect();
-    if !is_exact_id_set(&full, &expected_ids) {
+    if !is_exact_id_set(&full, &expected_a) {
         fail_closed("join_inner: full join is not exactly the own-tenant joinable documents");
     }
-    let ctx_b = ctx(TENANT_B);
     let full_b = exec_join_pages(&core, &ctx_b, head);
-    let expected_b: Vec<u64> = (0..join_rows + other).collect();
     if !is_exact_id_set(&full_b, &expected_b) {
         fail_closed("join_inner: control query did not see both tenants' rows");
     }

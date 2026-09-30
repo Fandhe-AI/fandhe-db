@@ -321,21 +321,41 @@ pub fn is_sorted_by_direction(values: &[i64], descending: bool) -> bool {
     })
 }
 
-/// `order_single`（`ORDER BY qty` 昇順・`LIMIT limit`）で自テナント `0..own_rows` から期待される
-/// 先頭 `limit` 件の `qty` 列。`qty` は同値がありうるため、同値境界での id 差を許すよう値列で照合する。
-pub fn expected_order_single(own_rows: u64, limit: usize) -> Vec<i64> {
-    let mut qty: Vec<i64> = (0..own_rows).map(qty_for_id).collect();
+/// 他テナント sentinel 行の `qty`。偶数 id は最小（`order_single` の先頭）、奇数 id は最大
+/// （`order_multi` の `l0` 内先頭）になる値で、越境すれば上位へ必ず現れる fixture にする。
+pub fn sentinel_qty(id: u64) -> i64 {
+    if id.is_multiple_of(2) {
+        -1
+    } else {
+        2_000_000
+    }
+}
+
+/// 文脈から見える docs 行 `(id, lang, qty)`。自テナント `0..own_rows` と、`other_rows > 0` のとき
+/// 他テナント sentinel（`own_rows..own_rows + other_rows`・`lang = l0`・`sentinel_qty`）を含む。
+/// 対象テナント文脈は `other_rows = 0`、他テナント文脈（両 visibility 可視）は `other_rows = other` を渡す。
+pub fn visible_doc_rows(own_rows: u64, other_rows: u64) -> Vec<(u64, &'static str, i64)> {
+    let own = (0..own_rows).map(|id| (id, lang_for_id(id), qty_for_id(id)));
+    let other = (own_rows..own_rows + other_rows).map(|id| (id, lang_token(0), sentinel_qty(id)));
+    own.chain(other).collect()
+}
+
+/// `order_single`（`ORDER BY qty` 昇順・`LIMIT limit`）で可視行 `visible` から期待される先頭 `limit` 件の
+/// `qty` 列。`qty` は同値がありうるため、同値境界での id 差を許すよう値列で照合する。
+pub fn expected_order_single(visible: &[(u64, &'static str, i64)], limit: usize) -> Vec<i64> {
+    let mut qty: Vec<i64> = visible.iter().map(|r| r.2).collect();
     qty.sort_unstable();
     qty.truncate(limit);
     qty
 }
 
-/// `order_multi`（`ORDER BY lang ASC, qty DESC`・`LIMIT limit`）で期待される先頭 `limit` 件の
+/// `order_multi`（`ORDER BY lang ASC, qty DESC`・`LIMIT limit`）で可視行から期待される先頭 `limit` 件の
 /// `(lang, qty)` 列。`lang` は文字列（バイト）順。同値タプルの id 差は許すため値の組で照合する。
-pub fn expected_order_multi(own_rows: u64, limit: usize) -> Vec<(&'static str, i64)> {
-    let mut rows: Vec<(&'static str, i64)> = (0..own_rows)
-        .map(|id| (lang_for_id(id), qty_for_id(id)))
-        .collect();
+pub fn expected_order_multi(
+    visible: &[(u64, &'static str, i64)],
+    limit: usize,
+) -> Vec<(&'static str, i64)> {
+    let mut rows: Vec<(&'static str, i64)> = visible.iter().map(|r| (r.1, r.2)).collect();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0).then(b.1.cmp(&a.1)));
     rows.truncate(limit);
     rows
