@@ -138,6 +138,19 @@ pub(super) fn run_joins(
     Ok((acc, order))
 }
 
+/// 一致ペアを 1 件追加する。`Vec` へ push する前に 1 ペア分のバイト量を共有予算へ
+/// 計上し、超過なら確保せずに `54000`（fail-closed）を返す。`join_step` から
+/// 呼ばれ、行数上限に達する前でも共有バイト予算で確保を止める。
+fn push_charged_pair(
+    pairs: &mut Vec<(u32, u32)>,
+    budget: &mut JoinBudget,
+    pair: (u32, u32),
+) -> Result<(), SqlSurfaceError> {
+    budget.charge(std::mem::size_of::<(u32, u32)>())?;
+    pairs.push(pair);
+    Ok(())
+}
+
 /// 1 段のハッシュ結合。`acc`（relation 0..=k の結合結果）に relation `new_rel` を
 /// 加える。新 relation 側をビルド側にし、蓄積タプルをプローブする。
 fn join_step(
@@ -206,7 +219,7 @@ fn join_step(
         if let Some(matched) = table.get(&key) {
             let ti_u32 = to_u32(ti, "JOIN row count exceeds limit")?;
             for &new_idx in matched {
-                pairs.push((ti_u32, new_idx));
+                push_charged_pair(&mut pairs, budget, (ti_u32, new_idx))?;
                 if let Some(m) = matched_acc.get_mut(ti) {
                     *m = true;
                 }
@@ -278,4 +291,24 @@ fn join_step(
         }
     }
     Ok(Tuples { n, data })
+}
+
+#[cfg(test)]
+mod pair_budget_tests {
+    use super::*;
+
+    /// 共有予算を超える push は確保前に `54000` で拒否され、ペアが増えない。
+    #[test]
+    fn pair_push_is_charged_before_allocation_and_stops_at_cap() {
+        let per_pair = std::mem::size_of::<(u32, u32)>();
+        let mut budget = JoinBudget::new(per_pair * 3);
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for i in 0..3u32 {
+            push_charged_pair(&mut pairs, &mut budget, (i, i)).expect("within budget");
+        }
+        let err = push_charged_pair(&mut pairs, &mut budget, (9, 9))
+            .expect_err("fourth pair must exceed the shared byte budget");
+        assert_eq!(err.wire_code(), "54000");
+        assert_eq!(pairs.len(), 3, "rejected pair must not be pushed");
+    }
 }
