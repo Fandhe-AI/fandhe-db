@@ -121,9 +121,36 @@ fn seed(
 
 const READER_ITERATION_CAP: u64 = 200_000;
 
+/// DROP と並行クエリの 1 ラウンドで、クエリの実行区間が DROP の実行区間と実際に
+/// 重なったラウンドを得るまでの最大試行回数（重なりはスケジューラ依存のため、観測
+/// できるまで新しい DB で繰り返す。上限まで一度も重ならなければ失敗）。
+const MAX_OVERLAP_ROUNDS: u32 = 20;
+
 /// TABLE-15: DROP と並行するクエリは「事前結果と完全一致」か `42P01` のみ。
+///
+/// 各ラウンドは全 reader が DROP 前の完全な結果を 1 回以上観測してから DROP を発行し、
+/// reader のクエリ実行区間と DROP の実行区間（いずれも `Instant` で計測）が重なった
+/// ことを確認する。重なりは OS のスケジューリングに依存し同期点では強制できない
+/// （engine に DROP 途中の停止点は無い）ため、重なりを観測できたラウンドが得られる
+/// まで新しい DB で繰り返し、各ラウンドで結果の原子性（完全一致か `42P01`）を検査する。
 #[test]
 fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
+    let mut overlapped_round = None;
+    for round in 0..MAX_OVERLAP_ROUNDS {
+        if drop_round_with_concurrent_readers(round) {
+            overlapped_round = Some(round);
+            break;
+        }
+    }
+    let round = overlapped_round.unwrap_or_else(|| {
+        panic!("no reader query overlapped DROP TABLE within {MAX_OVERLAP_ROUNDS} rounds")
+    });
+    eprintln!("reader query overlapped DROP TABLE in round {round}");
+}
+
+/// 1 ラウンド分の DROP と並行クエリ。結果の原子性を検査し、reader のクエリ実行区間の
+/// いずれかが DROP の実行区間と重なったかを返す。
+fn drop_round_with_concurrent_readers(round: u32) -> bool {
     let (core, _guard) = new_core("t15-drop-concurrent", 2);
     let alice = ctx("alice");
     let bob = ctx("bob");
@@ -146,13 +173,12 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
     assert_eq!(expected_ids_bob, vec![102, 104]);
 
     let barrier = Barrier::new(readers.len() + 1);
-    // DROP と読み取りが実際に重なることを保証する: DROP は全 reader が DROP 前の
-    // 完全な結果を 1 回以上観測してから発行する（reader はその後も DROP 完了まで
-    // 反復し続けるため、DROP の実行中に読み取りが重なる）。
+    // DROP は全 reader が DROP 前の完全な結果を 1 回以上観測してから発行する
+    // （reader はその後も `42P01` を受け取るまで反復し続ける）。
     let warmed_readers = AtomicUsize::new(0);
     let core_ref = &core;
 
-    std::thread::scope(|scope| {
+    let (drop_window, query_windows) = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (idx, (c, sql)) in readers.iter().enumerate() {
             let barrier = &barrier;
@@ -162,8 +188,12 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
             handles.push(scope.spawn(move || {
                 barrier.wait();
                 let mut oks = 0u64;
+                let mut windows: Vec<(Instant, Instant)> = Vec::new();
                 for _ in 0..READER_ITERATION_CAP {
-                    match run(core_ref, c, sql) {
+                    let started = Instant::now();
+                    let res = run(core_ref, c, sql);
+                    windows.push((started, Instant::now()));
+                    match res {
                         Ok(outcome) => {
                             oks += 1;
                             match idx {
@@ -181,7 +211,7 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
                                 oks >= 1,
                                 "reader must observe a full result before DROP: {sql}"
                             );
-                            return oks;
+                            return (oks, windows);
                         }
                     }
                 }
@@ -199,13 +229,18 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
                 );
                 std::thread::yield_now();
             }
+            let started = Instant::now();
             ok(core_ref, &ctx("sys"), "DROP TABLE docs");
+            (started, Instant::now())
         });
-        ddl.join().expect("DDL thread must not panic");
+        let drop_window = ddl.join().expect("DDL thread must not panic");
+        let mut query_windows = Vec::new();
         for h in handles {
-            let oks = h.join().expect("reader thread must not panic");
-            eprintln!("reader observed {oks} full results before 42P01");
+            let (oks, windows) = h.join().expect("reader thread must not panic");
+            eprintln!("round {round}: reader observed {oks} full results before 42P01");
+            query_windows.extend(windows);
         }
+        (drop_window, query_windows)
     });
 
     // DROP 完了後は全操作が 42P01（他テナントを含む）。
@@ -226,6 +261,11 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
             );
         }
     }
+
+    let (drop_start, drop_end) = drop_window;
+    query_windows
+        .iter()
+        .any(|(start, end)| *start < drop_end && *end > drop_start)
 }
 
 const DISTANCE_SQL: &str = "SELECT id FROM docs ORDER BY embedding <=> '{Q}' LIMIT 50";
