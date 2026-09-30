@@ -63,10 +63,17 @@ name }` を追加した（**BREAKING CHANGE**）。空白を挟まず「識別�
 > `docs/design/sql-returning.md`「UPSERT の衝突先が不可視の場合」節で確定した。実装追随は
 > #1254 で、マージまでコードは旧挙動である。
 
-既存 DML 実行器（`tenant::update_row_unchecked`・`delete_row_impl`・
-`truncate_table_unchecked`）はいずれも `(ctx.tenant_id(), id)` キー取得＋
-`ctx.is_owner` の二重防御で判定しており、RLS 可視性（`PolicyContext::is_visible`）では
-ない。`tenant::upsert_typed_rows_unchecked` も同じ規約に揃える。
+**新契約（#1251 確定・#1254 で実装追随）**: 衝突の**検出**は所有スコープ
+（`(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner`）、**書き込み対象**は所有 ∩ 可視。
+検出した既存行が可視集合外なら書き込まず、分岐は `sql-returning.md` の定めに従う
+（`DO NOTHING` はスキップ・`DO UPDATE` は `42501`）。不可視の衝突先を更新してはならない。
+
+以下は**現行（旧挙動）の検出規約**の説明である。既存 DML 実行器
+（`tenant::update_row_unchecked`・`delete_row_impl`・`truncate_table_unchecked`）は
+いずれも `(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner` の二重防御で判定しており、
+RLS 可視性（`PolicyContext::is_visible`）では判定していない（書き込み前の可視性判定は
+未実装で、#1254 で追加する）。`tenant::upsert_typed_rows_unchecked` の**衝突検出**も
+同じ所有規約に揃える（書き込み対象の可視性絞り込みは上記新契約に従い #1254 で追加）。
 
 - 可視集合で判定すると「自テナント所有だが ctx に不可視な行」が非衝突扱いになり、
   plain INSERT 経路で行 `id` 衝突の `23505`（`TenantWriteError::IdConflict`）になる
