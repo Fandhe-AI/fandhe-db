@@ -714,22 +714,42 @@ fn too_many_function_parameters_is_rejected_with_54000() {
 }
 
 #[test]
-fn order_by_may_not_reference_a_udf_call() {
-    // 範囲外（本タスクのスコープ外・§8 参照）: `ORDER BY` の関数呼び出し形は
-    // 引き続き `hybrid_rrf`/`HYBRID` のみを許可名として受理し、UDF・組み込み
-    // 関数の呼び出しは通さない（`allowlist::is_allowed_order_by_function_name`
-    // は SQL-9 で変更していない）。
+fn order_by_accepts_scalar_expression_keys_and_rejects_vector_valued_ones() {
+    // Issue #1188・SQL-26: 広域取得の `ORDER BY` は組み込み関数呼び出しの式キーを受理する
+    // （従来は `hybrid_rrf`/`HYBRID` 以外の関数呼び出しを構文段で `42601` にしていた）。
+    // `vec_norm(embedding)` は norm 昇順（id=2: 1、id=3: √3、id=1: 5）で並ぶ。
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    let ids = |sql: &str, session: &mut SessionState| -> Vec<u64> {
+        let outcome = core
+            .execute_sql_in_session(&ctx, session, sql)
+            .expect("scalar expression ORDER BY key must be accepted");
+        expect_query(outcome).rows.iter().map(|r| r.id).collect()
+    };
+    assert_eq!(
+        ids(
+            "SELECT id FROM docs ORDER BY vec_norm(embedding) LIMIT 10",
+            &mut session
+        ),
+        vec![2, 3, 1]
+    );
+    assert_eq!(
+        ids(
+            "SELECT id FROM docs ORDER BY vec_norm(embedding) DESC LIMIT 10",
+            &mut session
+        ),
+        vec![1, 3, 2]
+    );
+    // VECTOR 型を返す式は VECTOR 列を直接キーにした場合と同じく並べ替え不能（22000）。
     let err = core
         .execute_sql_in_session(
             &ctx,
             &mut session,
-            "SELECT id FROM docs ORDER BY vec_norm(embedding) LIMIT 1",
+            "SELECT id FROM docs ORDER BY vec_div(embedding, 2) LIMIT 1",
         )
-        .expect_err("UDF/builtin call in ORDER BY must remain unsupported");
-    assert_eq!(err.wire_code(), "42601");
+        .expect_err("VECTOR-valued ORDER BY expression must be rejected");
+    assert_eq!(err.wire_code(), "22000");
 }
 
 #[test]

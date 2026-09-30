@@ -18,8 +18,8 @@
 
 use super::allowlist::{
     classify_view_body, parse_view_body, AggregateArg, AggregateSelectItem, GroupByClause,
-    Projection, ScalarOrderKey, SelectItem, SqlSurfaceError, Statement, TableLookup, ViewBodyKind,
-    WherePredicate, WindowSelectItem,
+    Projection, ScalarOrderKey, ScanOrderKey, SelectItem, SqlSurfaceError, Statement, TableLookup,
+    ViewBodyKind, WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -321,6 +321,31 @@ pub(crate) fn check_columns_within_view(
     Ok(())
 }
 
+/// 式キーを含む広域取得 `ORDER BY`（Issue #1188）の列参照が、ビューの公開列集合に収まる
+/// ことを検査する。列名キーは疑似列 `id` を含め [`check_columns_within_view`] と同じ規則
+/// （公開列のみ）、式キーは [`expr_columns_within`] で式木内の全列参照を検査する。
+pub(crate) fn check_order_exprs_within_view(
+    view_columns: Option<&[String]>,
+    order_keys: &[ScanOrderKey],
+) -> Result<(), SqlSurfaceError> {
+    let Some(columns) = view_columns else {
+        return Ok(());
+    };
+    for key in order_keys {
+        match key {
+            ScanOrderKey::Column(k) => {
+                if !columns.iter().any(|vc| vc == &k.column) {
+                    return Err(SqlSurfaceError::InvalidInput {
+                        detail: format!("unknown column: {}", k.column),
+                    });
+                }
+            }
+            ScanOrderKey::Expr { expr, .. } => expr_columns_within(columns, expr)?,
+        }
+    }
+    Ok(())
+}
+
 /// 集計 SELECT（`SELECT DISTINCT` の脱糖形を含む）が参照する列が、参照先ビューの
 /// 公開列集合（`view_columns`）に収まっているかを検査する（Issue #1192・TABLE-18・
 /// RLS-10 (b)。[`check_columns_within_view`] の集計向け実装）。グループキー・
@@ -329,7 +354,8 @@ pub(crate) fn check_columns_within_view(
 /// これらを検査しないと、ビューが公開しない列を集計キー・引数・フィルタに使って
 /// 値を推測できてしまう（filter oracle。security.md「アクセス制御の不備」）。
 /// `ORDER BY` の対象は SELECT リスト項目の実効名（別名または既定名）か、公開列の
-/// いずれかに限る。`HAVING` は項目名への参照のため対象外。
+/// いずれかに限る（式キーは式内の識別子が同じ集合に収まること）。従来形の `HAVING` は
+/// 項目名への参照のため対象外、式述語の `HAVING`（Issue #1188）は式内の識別子を検査する。
 /// `view_columns` が `None`（どの段も列を絞り込んでいない）なら検査不要。
 pub(crate) fn check_aggregate_columns_within_view(
     view_columns: Option<&[String]>,
@@ -370,12 +396,25 @@ pub(crate) fn check_aggregate_columns_within_view(
                 return Err(unknown(c));
             }
         }
+        // Issue #1188: 式キーの `ORDER BY`・式述語の `HAVING` は、式内の識別子が
+        // 項目の実効名か公開列のいずれかであることを検査する（束縛段もグループ出力の
+        // 名前にしか解決しないが、非公開列を式経由で参照させない多層防御）。
+        let mut allowed: Vec<String> = columns.to_vec();
+        allowed.extend(effective_names.iter().cloned());
         for key in &gb.order_by {
+            if let Some(expr) = &key.expr {
+                expr_columns_within(&allowed, expr)?;
+                continue;
+            }
             let known = effective_names.iter().any(|n| n == &key.target)
                 || columns.iter().any(|vc| vc == &key.target);
             if !known {
                 return Err(unknown(&key.target));
             }
+        }
+        for h in &gb.having_exprs {
+            expr_columns_within(&allowed, &h.lhs)?;
+            expr_columns_within(&allowed, &h.rhs)?;
         }
     }
     for pred in where_predicates {
