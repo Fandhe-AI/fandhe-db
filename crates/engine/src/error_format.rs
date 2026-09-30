@@ -109,7 +109,9 @@ define_error_classes! {
     /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
     /// の写像。SQL-23・TASK-202・TASK-203（Issue #899・#902）の DDL 実行権限
     /// 不足（[`crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege`]）も
-    /// 同分類へ写像する（複数原因を 1 分類へ束ねる運用）。
+    /// 同分類へ写像する（複数原因を 1 分類へ束ねる運用）。Issue #1254 の UPSERT
+    /// `DO UPDATE` の衝突先が不可視の場合
+    /// （[`crate::tenant::TenantWriteError::ConflictTargetNotVisible`]）も同分類。
     ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH"),
     /// 参照したテーブルがカタログ未存在（`42P01`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] の写像。

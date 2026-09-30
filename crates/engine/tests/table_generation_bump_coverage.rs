@@ -376,7 +376,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1179: 全書き込み経路（INSERT・UPSERT・UPDATE・DELETE）が `with_txn` へ
     // 集約され、`f` のクロージャ内で `bump_table_generation_in_txn` を呼んでから
     // `TxnEffect::Wrote` を返す構造になった（回帰ではなく構造変更への追随。旧: 453）。
-    ("tenant.rs", 460),
+    ("tenant.rs", 466),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

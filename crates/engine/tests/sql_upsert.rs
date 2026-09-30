@@ -600,3 +600,94 @@ fn do_update_result_is_visible_via_select_in_same_session() {
         other => panic!("expected Cell::Text, got {other:?}"),
     }
 }
+
+// --- 衝突先の可視集合判定（Issue #1254・RLS-10・RLS-11） ---
+
+fn invisible_conflict_upsert(action: &str, op_id: &str) -> String {
+    format!(
+        "INSERT INTO {TABLE} (id, embedding, lang) VALUES (1, '[0.9,0.9]', 'en') \
+         ON CONFLICT (id) {action} USING OPERATION_ID '{op_id}'"
+    )
+}
+
+#[test]
+fn do_update_on_owned_but_invisible_conflict_is_rejected_with_42501() {
+    let (core, path) = open_engine("sql-upsert-invisible-update");
+    let _guard = CleanupGuard(path);
+    let ctx_all = ctx_for("tenant-a");
+    let public_only = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    run_sql(
+        &core,
+        &ctx_all,
+        &mut session,
+        &insert_sql(1, "ja", "seed-i1"),
+    )
+    .expect("seed private");
+
+    let sql = invisible_conflict_upsert("DO UPDATE SET lang = EXCLUDED.lang", "op-inv-1");
+    let err = run_sql(&core, &public_only, &mut session, &sql).unwrap_err();
+    assert_eq!(err.wire_code(), "42501");
+    let msg = err.to_string();
+    assert!(!msg.contains("ja") && !msg.contains("0.9") && !msg.contains("tenant-a"));
+    assert_eq!(
+        read_back(&core, &ctx_all),
+        vec![(1, "ja".to_string(), None)]
+    );
+
+    // 台帳は未消費: 同じ operation_id を可視 ctx（認証経路相当）で再送すると成功する。
+    let outcome = run_sql(&core, &ctx_all, &mut session, &sql).expect("visible upsert ok");
+    assert_eq!(insert_rows_affected(outcome), 1);
+    assert_eq!(
+        read_back(&core, &ctx_all),
+        vec![(1, "en".to_string(), None)]
+    );
+}
+
+#[test]
+fn do_nothing_on_owned_but_invisible_conflict_reports_zero_rows() {
+    let (core, path) = open_engine("sql-upsert-invisible-nothing");
+    let _guard = CleanupGuard(path);
+    let ctx_all = ctx_for("tenant-a");
+    let public_only = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    run_sql(
+        &core,
+        &ctx_all,
+        &mut session,
+        &insert_sql(1, "ja", "seed-i2"),
+    )
+    .expect("seed private");
+
+    let sql = invisible_conflict_upsert("DO NOTHING", "op-inv-2");
+    let outcome = run_sql(&core, &public_only, &mut session, &sql).expect("skip ok");
+    assert_eq!(insert_rows_affected(outcome), 0);
+    assert_eq!(
+        read_back(&core, &ctx_all),
+        vec![(1, "ja".to_string(), None)]
+    );
+}
+
+#[test]
+fn other_tenant_private_row_with_same_id_is_not_a_conflict() {
+    let (core, path) = open_engine("sql-upsert-invisible-other-tenant");
+    let _guard = CleanupGuard(path);
+    let ctx_b = ctx_for("tenant-b");
+    let public_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    run_sql(
+        &core,
+        &ctx_b,
+        &mut session,
+        &insert_sql(1, "b-side", "seed-i3"),
+    )
+    .expect("seed b");
+
+    let sql = invisible_conflict_upsert("DO UPDATE SET lang = EXCLUDED.lang", "op-inv-3");
+    let outcome = run_sql(&core, &public_a, &mut session, &sql).expect("new insert for tenant-a");
+    assert_eq!(insert_rows_affected(outcome), 1);
+    assert_eq!(
+        read_back(&core, &ctx_b),
+        vec![(1, "b-side".to_string(), None)]
+    );
+}

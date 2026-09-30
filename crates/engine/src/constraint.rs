@@ -468,9 +468,9 @@ pub(crate) fn clear_unique_index_for_tenant_in_txn(
 pub(crate) fn scan_tenant_rows_by_unique_key<T>(
     row_table: &T,
     schema: &TableSchema,
-    tenant_id: &str,
+    ctx: &crate::policy::PolicyContext,
     indices: &[usize],
-) -> Result<HashMap<Vec<u8>, u64>, TenantWriteError>
+) -> Result<UniqueKeyScan, TenantWriteError>
 where
     T: ReadableTable<(&'static str, u64), &'static [u8]>,
 {
@@ -485,7 +485,11 @@ where
         }
     }
 
+    let tenant_id = ctx.tenant_id();
     let mut existing: HashMap<Vec<u8>, u64> = HashMap::new();
+    // キーを復元できなかった不可視行の id（[`recover_unique_keys_of_corrupt_rows`] が
+    // 永続索引から補完する）。
+    let mut corrupt_invisible: Vec<u64> = Vec::new();
     let range_start = std::ops::Bound::Included((tenant_id, 0u64));
     let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
     for entry in row_table
@@ -500,9 +504,33 @@ where
             break;
         }
         let buf = v.value();
-        let values = decode_key_columns(schema, &mask, buf)?;
-        let Some(key) = key_bytes(&spec, &values).map_err(internal)? else {
-            continue;
+        // 不可視行（ヘッダ不整合を含む）の列データ破損は可視性判定に到達する前に
+        // エラーとして応答へ現れてはならない（Issue #1254・RLS-10・RLS-11）。
+        // キーを復元できない不可視行は衝突先候補から外す（後続の一意索引検査が
+        // 従来どおり最終的な一意性を担保する）。可視行の破損は fail-closed で伝播する。
+        // 正準化（`key_bytes`。破損 REAL の NaN 等で失敗しうる）まで含めて不可視行の
+        // エラーを吸収する。デコード成功後の正準化失敗も同じ補完経路へ送る。
+        let keyed = decode_key_columns(schema, &mask, buf)
+            .and_then(|values| key_bytes(&spec, &values).map_err(internal));
+        let key = match keyed {
+            Ok(Some(key)) => key,
+            Ok(None) => continue,
+            Err(e) => {
+                let row_visible = matches!(
+                    crate::storage::decode_row_tenant_and_visibility(buf),
+                    Ok((row_tenant, row_visibility))
+                        if ctx.is_owner(row_tenant)
+                            && ctx.is_visible(row_tenant, row_visibility)
+                );
+                if row_visible {
+                    return Err(e);
+                }
+                // 件数上限は設けない: 件数に応じた応答差（上限超過時のエラー）は不可視行の
+                // 破損状態を応答へ露出させる（RLS-10）。保持量は 1 行あたり 8 バイトで、
+                // 同じ走査が `existing` に積む健全行のキー保持量を超えない。
+                corrupt_invisible.push(id);
+                continue;
+            }
         };
         if let Some(existing_id) = existing.insert(key, id) {
             if existing_id != id {
@@ -518,7 +546,67 @@ where
             }
         }
     }
-    Ok(existing)
+    Ok((existing, corrupt_invisible))
+}
+
+/// [`scan_tenant_rows_by_unique_key`] の戻り値（対象キー → 既存行 id の対応表と、
+/// キーを復元できなかった不可視行の id 一覧）。
+pub(crate) type UniqueKeyScan = (HashMap<Vec<u8>, u64>, Vec<u64>);
+
+/// 事前走査でキーを復元できなかった不可視行（`corrupt_ids`）の一意キーを永続
+/// 索引の逆引きから補完し、`existing`（キー → 既存行 id）へ加える（Issue #1254・
+/// RLS-10・RLS-11）。これを行わないと、同じキーの新規行の書き込み時に後続の
+/// [`enforce_unique_keys_in_txn`] が所有行の破損を `XX000` として返し、健全な
+/// 不可視行との衝突（`DO NOTHING` はスキップ）との応答差から破損状態が判別できて
+/// しまう。補完後は破損行も健全な不可視行と同じ「所有だが不可視」の衝突先として
+/// 扱われる。索引を更新しない読み取り専用。
+pub(crate) fn recover_unique_keys_of_corrupt_rows(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    indices: &[usize],
+    corrupt_ids: &[u64],
+    existing: &mut HashMap<Vec<u8>, u64>,
+) -> Result<(), TenantWriteError> {
+    if corrupt_ids.is_empty() {
+        return Ok(());
+    }
+    let (specs, _mask) = key_specs(schema)?;
+    let mut recovered: HashSet<u64> = HashSet::new();
+    for (id, key) in unique_index::recover_forward_keys_for_rows(
+        write_txn,
+        table_name,
+        schema,
+        &specs,
+        indices,
+        tenant_id,
+        corrupt_ids,
+    )? {
+        recovered.insert(id);
+        // 健全行の走査で登録済みのキーと異なる行 id が補完された場合は、
+        // `scan_tenant_rows_by_unique_key` と同じく一意性の不変条件違反（内部矛盾）
+        // として fail-closed で拒否する（黙って無視しない）。
+        if let Some(existing_id) = existing.insert(key, id) {
+            if existing_id != id {
+                return Err(internal(
+                    "duplicate existing rows share a UNIQUE key: catalog invariant violated",
+                ));
+            }
+        }
+    }
+    // 索引が未構築・逆引きが無いなどでキーを復元できない破損行が残る場合は、
+    // 対象キーに依らず常に同じ `XX000` で拒否する（Issue #1254・RLS-10）。
+    // 黙って新規挿入経路へ進むと、索引構築時の `XX000` の有無がキー値ごとに変わり、
+    // 健全な不可視行（衝突先としてスキップ／42501）との応答差が生じる。キーが不明な
+    // 以上、健全な不可視行の応答を再現することはできないため、キー非依存で一様に
+    // fail-closed に倒す。
+    if corrupt_ids.iter().any(|id| !recovered.contains(id)) {
+        return Err(internal(
+            "undecodable invisible row without recoverable unique key",
+        ));
+    }
+    Ok(())
 }
 
 /// [`crate::catalog::Storage::alter_table_add_unique_constraint`]（Rust API。
