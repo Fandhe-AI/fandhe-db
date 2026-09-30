@@ -213,8 +213,16 @@ pub(super) fn sort_by_keys(
         }
         std::cmp::Ordering::Equal
     });
-    Ok(perm
-        .into_iter()
-        .filter_map(|p| order.get(p).copied())
-        .collect())
+    // `perm` は `0..order.len()` の並べ替えなので範囲外は起きない。行を黙って
+    // 落とさず、万一の不整合は `Internal` にする。
+    perm.into_iter()
+        .map(|p| {
+            order
+                .get(p)
+                .copied()
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "JOIN sort permutation out of range".to_string(),
+                })
+        })
+        .collect()
 }

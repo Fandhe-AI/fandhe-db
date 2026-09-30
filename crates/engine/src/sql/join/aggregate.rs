@@ -251,16 +251,40 @@ pub(super) fn run_aggregate(
     }
 
     // 決定的な既定順序（キー昇順・NULL 末尾）→ 明示 ORDER BY（安定ソート）。
+    // ソート前に全グループのキー値を比較値へ変換して検証する。宣言にないラベルの
+    // ENUM 値・型クラスとセルの不整合は `Internal`（fail-closed）で伝播させ、
+    // 比較器の中で NULL／Equal へ握りつぶして誤った順序を返さない。
+    for f in &finished {
+        if f.key_cells.len() != agg.keys.len() {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JOIN aggregate key cell count mismatch".to_string(),
+            });
+        }
+        for (cell, kp) in f.key_cells.iter().zip(agg.keys.iter()) {
+            cmp_val(cell, &kp.cmp_class)?;
+        }
+        for o in &agg.order {
+            if let AggOrderTarget::Item(i) = o.target {
+                if i >= f.item_cells.len() {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "JOIN ORDER BY item index out of range".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    // 検証済みのため、比較器内の `get`／`cmp_val` の失敗は起こらない（起きても
+    // Equal で順序を変えないだけで値は返さない）。
     let key_cmp = |a: &Finished, b: &Finished, k: usize, descending: bool| {
         let (Some(ca), Some(cb), Some(kp)) =
             (a.key_cells.get(k), b.key_cells.get(k), agg.keys.get(k))
         else {
             return std::cmp::Ordering::Equal;
         };
-        // 型クラスとセルの不整合は束縛済みの不変条件に反する（比較不能は Equal に倒す）。
-        let va = cmp_val(ca, &kp.cmp_class).ok().flatten();
-        let vb = cmp_val(cb, &kp.cmp_class).ok().flatten();
-        compare_order(va.as_ref(), vb.as_ref(), descending)
+        match (cmp_val(ca, &kp.cmp_class), cmp_val(cb, &kp.cmp_class)) {
+            (Ok(va), Ok(vb)) => compare_order(va.as_ref(), vb.as_ref(), descending),
+            _ => std::cmp::Ordering::Equal,
+        }
     };
     finished.sort_by(|a, b| {
         for k in 0..agg.keys.len() {
@@ -302,7 +326,12 @@ pub(super) fn run_aggregate(
         .saturating_mul(std::mem::size_of::<Cell>())
         .saturating_add(std::mem::size_of::<ResultRow>());
     let mut rows = Vec::with_capacity(end.saturating_sub(start));
-    for f in finished.get(start..end).unwrap_or(&[]) {
+    let window = finished
+        .get(start..end)
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "JOIN aggregate output window out of range".to_string(),
+        })?;
+    for f in window {
         let mut cells = Vec::with_capacity(agg.out.len());
         for o in &agg.out {
             let cell = match o {
@@ -326,4 +355,47 @@ pub(super) fn run_aggregate(
         columns: agg.metas.clone(),
         rows,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::exec::ColumnMeta;
+    use crate::sql::join::plan::KeyPlan;
+    use crate::sql::join::values::{CmpClass, JoinKeyClass};
+
+    /// 宣言にないラベルの ENUM キー値は、ソート前の検証で `Internal` になり、
+    /// NULL 扱いで誤った順序の結果を返さない（fail-closed）。
+    #[test]
+    fn enum_key_outside_declared_labels_fails_closed_instead_of_sorting() {
+        let labels = vec!["a".to_string(), "b".to_string()];
+        let agg = AggPlan {
+            keys: vec![KeyPlan {
+                rel: 0,
+                pos: 0,
+                key_class: JoinKeyClass::Enum("mood".to_string()),
+                cmp_class: CmpClass::Enum {
+                    name: "mood".to_string(),
+                    labels,
+                },
+                meta: ColumnMeta::Id,
+            }],
+            items: Vec::new(),
+            out: vec![AggOut::Key(0)],
+            metas: vec![ColumnMeta::Id],
+            having: Vec::new(),
+            order: Vec::new(),
+        };
+        let row = |id: u64, v: &str| ResultRow {
+            id,
+            score: 0.0,
+            cells: vec![Cell::Text(v.to_string())],
+        };
+        let sides = vec![vec![row(1, "a"), row(2, "zzz")]];
+        let tuples = Tuples::single_relation_for_test(2);
+        let mut budget = JoinBudget::new(1 << 20);
+        let err = run_aggregate(&agg, &sides, &tuples, &[0, 1], (None, 0), 100, &mut budget)
+            .expect_err("undeclared ENUM label must not produce a result");
+        assert_eq!(err.wire_code(), "XX000");
+    }
 }

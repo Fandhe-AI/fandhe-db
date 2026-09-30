@@ -275,7 +275,11 @@ pub(crate) fn execute_with_limits(
             })?;
             let start = offset.min(order.len());
             let end = start.saturating_add(limit).min(order.len());
-            let sliced = order.get(start..end).unwrap_or(&[]);
+            let sliced = order
+                .get(start..end)
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "JOIN output window out of range".to_string(),
+                })?;
 
             // 出力行 1 行あたりの構造体オーバーヘッド（`result_bytes` の
             // per_row_struct_bytes と同じ計算式）。行ごとの見積もりに使う。

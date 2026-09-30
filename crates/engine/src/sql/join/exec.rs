@@ -47,6 +47,17 @@ impl Tuples {
     }
 }
 
+#[cfg(test)]
+impl Tuples {
+    /// 単一 relation の `n_rows` 個のタプル（走査位置 0..n_rows）をテスト用に組み立てる。
+    pub(super) fn single_relation_for_test(n_rows: u32) -> Self {
+        Self {
+            n: 1,
+            data: (0..n_rows).map(Some).collect(),
+        }
+    }
+}
+
 const SLOT_BYTES: usize = std::mem::size_of::<Option<u32>>();
 
 fn to_u32(v: usize, what: &str) -> Result<u32, SqlSurfaceError> {

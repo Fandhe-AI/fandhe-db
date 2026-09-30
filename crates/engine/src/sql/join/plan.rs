@@ -360,13 +360,22 @@ pub(super) fn is_null_rejecting(pred: &JoinWherePredicate) -> bool {
     }
 }
 
+/// relation 番号に対応するビット。32 relation 以上は表現できないため `Internal`
+/// （通常は `MAX_TABLE_REFS` で先に弾かれる。0 へ倒すと述語の参照集合が空になる）。
+fn relation_bit(rel: usize) -> Result<u32, SqlSurfaceError> {
+    u32::try_from(rel)
+        .ok()
+        .and_then(|s| 1u32.checked_shl(s))
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "JOIN relation index exceeds mask width".to_string(),
+        })
+}
+
 fn leaf_mask(pred: &JoinWherePredicate, scope: &BindingScope<'_>) -> Result<u32, SqlSurfaceError> {
     let mut mask = 0u32;
     for c in leaf_colrefs(pred) {
         let rel = scope.resolve(c)?.relation();
-        mask |= 1u32
-            .checked_shl(u32::try_from(rel).unwrap_or(u32::MAX))
-            .unwrap_or(0);
+        mask |= relation_bit(rel)?;
     }
     Ok(mask)
 }
@@ -745,10 +754,7 @@ pub(super) fn build_plan<'a>(
         for c in conjuncts {
             let strict = strict_mask(c, &b.scope)?;
             for r in 0..relations.len() {
-                let bit = u32::try_from(r)
-                    .ok()
-                    .and_then(|s| 1u32.checked_shl(s))
-                    .unwrap_or(0);
+                let bit = relation_bit(r)?;
                 if strict & bit == 0 {
                     continue;
                 }
@@ -936,9 +942,11 @@ fn build_aggregate_shape(
                         )
                     })?;
                 let meta = Binder::meta_with_alias(
-                    keys.get(idx)
-                        .map(|k| k.meta.clone())
-                        .unwrap_or(ColumnMeta::Id),
+                    keys.get(idx).map(|k| k.meta.clone()).ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "JOIN GROUP BY key index out of range".to_string(),
+                        }
+                    })?,
                     alias.as_ref(),
                 );
                 // 出力名は別名、無ければ列名（PostgreSQL と同じく ORDER BY の出力名照合に使う）。

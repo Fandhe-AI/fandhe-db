@@ -42,8 +42,8 @@ having      := <項目名> op ['-'] <数値>
 - 段 k の束縛スコープは relation 0..=k+1 だけで構築する。未出現の relation を前方参照
   すると `BindingScope::resolve` が `42P01` を返す（PostgreSQL と同じ分類）
 - 非集計形は従来どおり `LIMIT` 必須（広域取得形を維持）。集計形は `LIMIT` を省略できる
-- 集計形の判定: SELECT リストに集計項目がある、`AS` 付きの列がある、または `GROUP BY`／
-  `HAVING` がある。`GROUP BY` なしで素の列と集計が混在する形・`GROUP BY` に無い素の列は
+- 集計形の判定: SELECT リストに集計項目がある、または `GROUP BY`／`HAVING` がある。
+  `AS` 付きの列だけの SELECT リストは非集計形として扱い（`LIMIT` 必須）、別名は出力名に反映する。`GROUP BY` なしで素の列と集計が混在する形・`GROUP BY` に無い素の列は
   `42601`（fail-closed）
 
 ### `42601` のまま残す形
