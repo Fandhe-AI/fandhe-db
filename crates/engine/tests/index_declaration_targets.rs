@@ -689,3 +689,86 @@ fn hnsw_scope_declared_gate_cache_ignores_row_dml_but_tracks_index_ddl() {
         "no catalog read failure is expected in this fixture"
     );
 }
+
+// --- 索引の構築遅延（Issue #1201・INDEX-7） -------------------------------------
+
+/// `CREATE INDEX ... USING hnsw` は宣言（カタログ）を書くだけで HNSW の構築を
+/// 行わず、構築は次の DISTANCE クエリ時まで遅延されること（INDEX-7）を、構築
+/// 回数のカウンタで決定的に固定する（実行時間の行数非依存は
+/// `index7_create_index_latency.rs` が担う）。
+#[test]
+fn create_index_defers_hnsw_build_to_next_query() {
+    let (core, _guard, vectors_a, _vectors_b) =
+        two_table_hnsw_core("index-decl-defer-hnsw", HnswScope::Declared);
+    assert_eq!(core.hnsw_index_cache_stats().builds, 0);
+
+    let mut session = allowed_session();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_a_hnsw ON table_a USING hnsw (embedding)",
+    )
+    .expect("declare hnsw index");
+    // DDL 直後: 構築も照会も起きていない。
+    assert_eq!(core.hnsw_index_cache_stats().builds, 0);
+    assert_eq!(hnsw_consulted_count(&core), 0);
+
+    core.execute_sql(
+        &ctx("tenant-a"),
+        &format!(
+            "SELECT id FROM table_a ORDER BY embedding <=> '{}' LIMIT 5",
+            vec_literal(&vectors_a[0])
+        ),
+    )
+    .expect("first distance query");
+    // 最初の DISTANCE クエリで初めて構築される。
+    assert!(
+        core.hnsw_index_cache_stats().builds >= 1,
+        "the hnsw index must be built lazily by the first query: {:?}",
+        core.hnsw_index_cache_stats()
+    );
+}
+
+/// スカラー索引宣言（`CREATE INDEX ... (lang)`）も同様に、宣言時には
+/// `ScalarIndexCache` の構築を行わず、次の述語付き DISTANCE クエリで初めて
+/// 構築される（INDEX-7）。
+#[test]
+fn create_index_defers_scalar_index_build_to_next_query() {
+    let path = unique_db_path("index-decl-defer-scalar");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector("docs"))
+        .expect("create table");
+    let vectors = gen_vectors(5, DIM as usize, 50);
+    seed_rows(&storage, "docs", "tenant-a", &vectors, "base");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert_eq!(core.scalar_index_cache_stats().builds, 0);
+
+    let mut session = allowed_session();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE INDEX idx_lang ON docs (lang)",
+    )
+    .expect("declare scalar index");
+    assert_eq!(
+        core.scalar_index_cache_stats().builds,
+        0,
+        "CREATE INDEX must not build the scalar index"
+    );
+
+    core.execute_sql(
+        &ctx("tenant-a"),
+        &format!(
+            "SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '{}' LIMIT 5",
+            vec_literal(&vectors[0])
+        ),
+    )
+    .expect("first filtered distance query");
+    assert!(
+        core.scalar_index_cache_stats().builds >= 1,
+        "the scalar index must be built lazily by the first query: {:?}",
+        core.scalar_index_cache_stats()
+    );
+}
