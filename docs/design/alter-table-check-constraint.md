@@ -53,8 +53,8 @@ PK は名前を持たない。FOREIGN KEY は当初（本 Issue 実装時点）�
 `docs/design/alter-table-foreign-key-constraint.md` D2 参照）。
 
 - 明示名の衝突（既存 UNIQUE 名・CHECK 名・FOREIGN KEY 名）→
-  `CatalogError::ConstraintAlreadyExists` → `42P07`（`ADD UNIQUE`／
-  `ADD FOREIGN KEY` と同じ）。`validate_schema` より前に判定する。
+  `CatalogError::ConstraintAlreadyExists` → `42710`（Issue #1195。`ADD FOREIGN KEY` も同じ。`ADD UNIQUE` のみ
+  `42P07`）。`validate_schema` より前に判定する。
 - 名前省略時の既定名: `CREATE TABLE` の表制約と同じ `<table>_check`
   （`sql::check_constraint::default_check_name(table, None)`）。衝突解決は
   `resolve_unique_name`（＝ `catalog::resolve_constraint_name`、接頭辞
@@ -101,7 +101,7 @@ CheckEvaluationFailed(SqlSurfaceError)`（0 除算・`BIGINT` 精度超過等）
 | DDL 権限なし | `require_ddl_permission` | `42501`（カタログ照会より前） |
 | 明示トランザクション内 | 既存 catch-all | `0A000` |
 | テーブルが無い／ビュー・索引名 | `TableNotFound` 等 | `42P01`／`42809` |
-| 明示名の衝突（UNIQUE・CHECK・FOREIGN KEY と同名） | `ConstraintAlreadyExists` | `42P07` |
+| 明示名の衝突（UNIQUE・CHECK・FOREIGN KEY と同名） | `ConstraintAlreadyExists` | `42710`（Issue #1195。UNIQUE 追加側は `42P07`） |
 | CHECK 件数上限超過 | `ConstraintLimitExceeded` | `54000` |
 | 述語の意味論エラー（未知列・禁止要素〔`visible()`・UDF〕・参照列数／述語長上限・往復不一致） | `build_check_constraint` と同じ `SqlSurfaceError` | CREATE TABLE と同一（`42601`／`54000` 等） |
 | 既存行が述語を満たさない（FALSE） | `SqlSurfaceError::check_violation(<新制約名>)` | `23514`（HTTP 409） |
@@ -124,7 +124,7 @@ CheckEvaluationFailed(SqlSurfaceError)`（0 除算・`BIGINT` 精度超過等）
 **ADD CHECK**: 構文検証（`42601`。カタログ非参照）→ 明示トランザクション内
 なら `0A000` → `require_ddl_permission`（`42501`）→ テーブル存在確認
 （`42P01`／`42809`）→ **write txn 内で**: スキーマ再取得
-（`require_table_schema_write`）→ 明示名の衝突（`42P07`）→ CHECK 件数上限
+（`require_table_schema_write`）→ 明示名の衝突（`42710`）→ CHECK 件数上限
 （`54000`）→ 取得したスキーマに対する意味論検証（束縛・禁止要素・参照列
 抽出・正規化レンダリング・往復一致）→ 名前確定（明示名 or 既定名）→
 追加後スキーマの `validate_schema` → **新しい CHECK 1 件だけ**をコンパイル
@@ -238,6 +238,6 @@ TOCTOU は無い（行数に比例するコストは UNIQUE の ADD と同じ扱
   `CASCADE`・1 文複数 ADD/DROP
 - PostgreSQL の既定名（単一列参照時の `<table>_<col>_check`）との差異
   （本リポの `CREATE TABLE` 表制約の既定名に揃えた）
-- 制約名衝突の専用 SQLSTATE（`42710`）の要否は #1067 から引き続き spec 側の
-  課題（本実装では `42P07` を流用）
+- 制約名衝突の SQLSTATE は Issue #1195 で `42710` へ是正済み（#1067 で申し送った
+  spec 側の課題は解消。UNIQUE 追加側のみ `42P07` を維持）
 - 制約一覧の照会手段（`pg_constraint` 相当）が無い点は #1067 と同じ

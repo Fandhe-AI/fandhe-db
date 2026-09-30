@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505"];
 
 define_error_classes! {
-    count = 41;
+    count = 42;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -294,6 +294,11 @@ define_error_classes! {
     /// 式評価の 0 除算（`22012`、Issue #1163・SQL-26・ERR-2）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DivisionByZero`] の写像。
     DivisionByZero => ("22012", "DIVISION_BY_ZERO"),
+    /// `ALTER TABLE ... ADD CONSTRAINT` の CHECK・FOREIGN KEY の明示名が既存の
+    /// 制約名と衝突した（`42710`、Issue #1195・TABLE-22・ERR-6）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateObject`] の写像。
+    /// UNIQUE の名前衝突は索引名衝突と同じ `42P07`（`DuplicateTable`）のまま。
+    DuplicateObject => ("42710", "DUPLICATE_OBJECT"),
 }
 
 impl ErrorClass {

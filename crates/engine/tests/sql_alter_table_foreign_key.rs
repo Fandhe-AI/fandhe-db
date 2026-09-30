@@ -415,7 +415,7 @@ fn add_foreign_key_rejects_missing_parent_table_with_42p01() {
     );
 }
 
-/// 明示制約名が既存の UNIQUE・CHECK 制約名と衝突する場合は `42P07`
+/// 明示制約名が既存の UNIQUE・CHECK 制約名と衝突する場合は `42710`
 /// （設計 F1。UNIQUE・CHECK・FOREIGN KEY はテーブル単位の名前空間を共有する）。
 #[test]
 fn add_foreign_key_rejects_name_collision_with_existing_unique() {
@@ -449,11 +449,11 @@ fn add_foreign_key_rejects_name_collision_with_existing_unique() {
             "ALTER TABLE children ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) \
              REFERENCES parents"
         ),
-        "42P07"
+        "42710"
     );
 }
 
-/// 明示制約名が既存の CHECK 制約名と衝突する場合も `42P07`（設計 F1。UNIQUE・
+/// 明示制約名が既存の CHECK 制約名と衝突する場合も `42710`（設計 F1。UNIQUE・
 /// CHECK・FOREIGN KEY はテーブル単位の名前空間を共有する。
 /// `add_foreign_key_rejects_name_collision_with_existing_unique` の CHECK 版。
 /// Cursor Bugbot 指摘・PR #1156 の対称チェック——UNIQUE 追加側の欠落は
@@ -486,7 +486,45 @@ fn add_foreign_key_rejects_name_collision_with_existing_check() {
             "ALTER TABLE children ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) \
              REFERENCES parents"
         ),
-        "42P07"
+        "42710"
+    );
+}
+
+/// 明示制約名が既存の FOREIGN KEY 制約名と衝突する場合も `42710`
+/// （TABLE-22、Issue #1195。FK 同士の衝突）。
+#[test]
+fn add_foreign_key_rejects_name_collision_with_existing_foreign_key() {
+    let (core, path) = new_core("alter-fk-add-name-collision-fk");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE parents (name TEXT)",
+    );
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "CREATE TABLE children (parent_id BIGINT)",
+    );
+    ok(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE children ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) REFERENCES parents",
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &mut session,
+            &owner,
+            "ALTER TABLE children ADD CONSTRAINT dup_name FOREIGN KEY (parent_id) \
+             REFERENCES parents"
+        ),
+        "42710"
     );
 }
 

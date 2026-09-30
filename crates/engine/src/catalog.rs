@@ -1236,8 +1236,9 @@ pub enum CatalogError {
     /// `ALTER TABLE ... ADD [CONSTRAINT <name>] UNIQUE` ／
     /// `ADD [CONSTRAINT <name>] FOREIGN KEY` で指定した制約名が、同一テーブルの
     /// 既存 UNIQUE・CHECK・FOREIGN KEY 制約名（テーブル単位で名前空間を共有する。
-    /// 設計 D1・F1）のいずれかと衝突する（Issue #1067・#1069。ERR-6: `42P07`。
-    /// 索引名衝突〔`IndexAlreadyExists`〕と同じ SQLSTATE を流用する）。
+    /// 設計 D1・F1）のいずれかと衝突する（Issue #1067・#1069。ERR-6）。SQL 表層での写像は
+    /// 追加する制約の種別による（UNIQUE → `42P07`、CHECK・FOREIGN KEY → `42710`。
+    /// Issue #1195）。
     ConstraintAlreadyExists(String),
     /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK・
     /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
