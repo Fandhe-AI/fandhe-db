@@ -520,11 +520,9 @@ where
                 if row_visible {
                     return Err(e);
                 }
-                if corrupt_invisible.len() >= MAX_CORRUPT_INVISIBLE_ROWS {
-                    return Err(internal(
-                        "too many undecodable invisible rows during unique key pre-scan",
-                    ));
-                }
+                // 件数上限は設けない: 件数に応じた応答差（上限超過時のエラー）は不可視行の
+                // 破損状態を応答へ露出させる（RLS-10）。保持量は 1 行あたり 8 バイトで、
+                // 同じ走査が `existing` に積む健全行のキー保持量を超えない。
                 corrupt_invisible.push(id);
                 continue;
             }
@@ -553,10 +551,6 @@ where
 /// キーを復元できなかった不可視行の id 一覧）。
 pub(crate) type UniqueKeyScan = (HashMap<Vec<u8>, u64>, Vec<u64>);
 
-/// [`scan_tenant_rows_by_unique_key`] が 1 回の走査で記録してよい「キーを復元
-/// できない不可視行」の上限（無制限確保の防止。超過は fail-closed）。
-const MAX_CORRUPT_INVISIBLE_ROWS: usize = 4096;
-
 /// 事前走査でキーを復元できなかった不可視行（`corrupt_ids`）の一意キーを永続
 /// 索引の逆引きから補完し、`existing`（キー → 既存行 id）へ加える（Issue #1254・
 /// RLS-10・RLS-11）。これを行わないと、同じキーの新規行の書き込み時に後続の
@@ -577,6 +571,7 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
         return Ok(());
     }
     let (specs, _mask) = key_specs(schema)?;
+    let mut recovered: HashSet<u64> = HashSet::new();
     for (id, key) in unique_index::recover_forward_keys_for_rows(
         write_txn,
         table_name,
@@ -585,7 +580,19 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
         tenant_id,
         corrupt_ids,
     )? {
+        recovered.insert(id);
         existing.entry(key).or_insert(id);
+    }
+    // 索引が未構築・逆引きが無いなどでキーを復元できない破損行が残る場合は、
+    // 対象キーに依らず常に同じ `XX000` で拒否する（Issue #1254・RLS-10）。
+    // 黙って新規挿入経路へ進むと、索引構築時の `XX000` の有無がキー値ごとに変わり、
+    // 健全な不可視行（衝突先としてスキップ／42501）との応答差が生じる。キーが不明な
+    // 以上、健全な不可視行の応答を再現することはできないため、キー非依存で一様に
+    // fail-closed に倒す。
+    if corrupt_ids.iter().any(|id| !recovered.contains(id)) {
+        return Err(internal(
+            "undecodable invisible row without recoverable unique key",
+        ));
     }
     Ok(())
 }

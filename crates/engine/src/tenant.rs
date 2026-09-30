@@ -8268,4 +8268,73 @@ mod tests {
             Err(TenantWriteError::ConflictTargetNotVisible)
         ));
     }
+
+    /// 一意索引の逆引きが無い（索引テーブル未作成）状態で不可視行のキー列が破損して
+    /// いる場合、対象キーの値に依らず同一のエラー（`XX000`）になること
+    /// （Issue #1254・RLS-10。キー値ごとに応答が変わらない）。
+    #[test]
+    fn upsert_unique_target_corrupt_invisible_row_without_index_is_key_independent() {
+        let path = unique_db_path("upsert-unique-invisible-corrupt-noindex");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let unique_schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "code".to_string()
+        ])]);
+        storage.create_table(&unique_schema).expect("create table");
+        let (ctx, ctx_all) = ctx_pair();
+        let seed = [
+            crate::row_codec::Value::Vector(vec![1.0, 0.0]),
+            crate::row_codec::Value::Text("k".to_string()),
+        ];
+        let op = OperationId::parse("seed-1254-u3").expect("op");
+        insert_typed_rows_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx_all,
+            Visibility::Private,
+            &[(1, &seed)],
+            LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+            None,
+        )
+        .expect("seed unique row");
+        truncate_row_body(&storage, 1);
+        // 索引テーブルを丸ごと消して「逆引きが無い」状態にする。
+        {
+            let write_txn = storage.begin_write_txn().expect("begin write txn");
+            let name = crate::catalog::user_uniq_table_name("docs");
+            write_txn
+                .delete_table(crate::catalog::user_uniq_table_def(&name))
+                .expect("delete index table");
+            crate::catalog::bump_table_generation_in_txn(&write_txn, "docs")
+                .expect("bump generation");
+            crate::recovery::commit_boundary::commit(write_txn).expect("commit");
+        }
+        let mut n = 0;
+        let mut outcomes = Vec::new();
+        for (i, code) in ["k", "z"].iter().enumerate() {
+            let incoming = [
+                crate::row_codec::Value::Vector(vec![9.0, 9.0]),
+                crate::row_codec::Value::Text((*code).to_string()),
+            ];
+            let rows: [(u64, &[crate::row_codec::Value]); 1] = [(2, &incoming)];
+            let r = run_upsert(
+                &storage,
+                &ctx,
+                &rows,
+                &UpsertTarget::Unique(&[1]),
+                &UpsertAction::DoNothing,
+                &format!("op-1254-noidx-{i}"),
+                &mut n,
+            );
+            outcomes.push(r.expect_err("must fail closed").to_string());
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
 }
