@@ -7336,6 +7336,99 @@ pub(crate) fn validate_drop_index_tokens(
     Ok(ValidatedDropIndex { name })
 }
 
+/// `CREATE TYPE <name> AS ENUM ('<label>'[, ...])` の許可形状構造検証結果
+/// （TABLE-14・SQL-23・TASK-198、Issue #1194）。カタログ照会を一切行わない
+/// （型名の重複・組み込み型名との衝突・ラベルの重複等はカタログ側
+/// `create_enum_type` の判定に一本化する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateType {
+    pub(crate) name: String,
+    pub(crate) labels: Vec<String>,
+}
+
+impl ValidatedCreateType {
+    /// 型名（大文字小文字は原文のまま保持する）。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 宣言順のラベル列。
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+}
+
+/// `DROP TYPE <name>` の許可形状構造検証結果（TABLE-14・SQL-23・TASK-198、
+/// Issue #1194）。カタログ照会を一切行わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropType {
+    pub(crate) name: String,
+}
+
+impl ValidatedDropType {
+    /// 削除対象の型名。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// 先頭 2 トークンが `CREATE TYPE` か（`core.rs::EngineCore::parse_tokens` の
+/// 分岐判定。[`is_create_index_statement`] と同じ流儀）。
+pub(crate) fn is_create_type_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("TYPE"))
+}
+
+/// 先頭 2 トークンが `DROP TYPE` か（[`is_create_type_statement`] と同じ流儀）。
+pub(crate) fn is_drop_type_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DROP"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("TYPE"))
+}
+
+/// [`ValidatedCreateType`] の構造検証本体（Issue #1194）。型名は識別子形状のみ
+/// ここで検証し（違反は `42601`）、ラベル数は push 前に `MAX_ENUM_LABELS` で
+/// 打ち切る（`54000`）。`IF NOT EXISTS`・スキーマ修飾名・`AS (...)`・空リスト・
+/// 非文字列リテラルのラベル・`$n` はいずれも期待トークン列と一致せず `42601` へ落ちる。
+pub(crate) fn validate_create_type_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateType, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("CREATE")?;
+    p.expect_ident_matching("TYPE")?;
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid type name in CREATE TYPE"))?;
+    p.expect_ident_matching("AS")?;
+    p.expect_ident_matching("ENUM")?;
+    p.expect_punct('(')?;
+    let mut labels = vec![p.expect_string_literal()?];
+    while matches!(p.peek(), Some(Token::Punct(','))) {
+        p.advance();
+        if labels.len() >= crate::catalog::MAX_ENUM_LABELS {
+            return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+        }
+        labels.push(p.expect_string_literal()?);
+    }
+    p.expect_punct(')')?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedCreateType { name, labels })
+}
+
+/// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`IF EXISTS`・`CASCADE`・
+/// 複数名の同時指定はトレイリングトークン検査により構造的に `42601` へ落ちる。
+pub(crate) fn validate_drop_type_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropType, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("DROP")?;
+    p.expect_ident_matching("TYPE")?;
+    let name = p.expect_ident()?;
+    crate::catalog::validate_identifier(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid type name in DROP TYPE"))?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropType { name })
+}
+
 /// [`ValidatedDropView`] の構造検証本体。
 pub(crate) fn validate_drop_view_tokens(
     tokens: &[Token],

@@ -866,6 +866,13 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropIndex(_) => OutcomeResponse::Command {
             tag: "DROP INDEX".to_string(),
         },
+        // TABLE-14・SQL-23・TASK-198（Issue #1194）: ENUM 型 DDL も件数を持たない固定タグ。
+        SqlOutcome::CreateType(_) => OutcomeResponse::Command {
+            tag: "CREATE TYPE".to_string(),
+        },
+        SqlOutcome::DropType(_) => OutcomeResponse::Command {
+            tag: "DROP TYPE".to_string(),
+        },
     }
 }
 
