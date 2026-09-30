@@ -73,6 +73,7 @@ pub mod knn_profile;
 pub mod parse_bind;
 pub mod proc_stats;
 pub mod protocol;
+pub mod relational_p95;
 pub mod rng;
 pub mod scalar_reference;
 pub mod scan_stage_profile;
