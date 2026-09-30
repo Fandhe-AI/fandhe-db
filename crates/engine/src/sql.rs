@@ -170,8 +170,9 @@ pub mod generation_key;
 pub mod group_by;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
-/// `INNER JOIN`（2 テーブル等価結合）の束縛・実行本体（SQL-28・RLS-10、
-/// TASK-212、Issue #925）。`sql::allowlist::ValidatedJoin` を受け取り、
+/// `[INNER|LEFT|RIGHT|FULL] JOIN`（等価結合の left-deep 連鎖・集計形・スカラー
+/// `ORDER BY`）の束縛・実行本体（SQL-28・RLS-10、TASK-212、Issue #925・#926・
+/// #1190）。`sql::allowlist::ValidatedJoin` を受け取り、
 /// `core.rs::EngineCore` の SQL 実行経路から呼ばれる（`sql::set_op` と同じ
 /// 構成）。
 pub(crate) mod join;
