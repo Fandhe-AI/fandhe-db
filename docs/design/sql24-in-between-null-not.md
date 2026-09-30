@@ -92,10 +92,11 @@ flatten()` で NULL と同一視すると、`IsNull` が誤って真になる（
 
 ## 索引経路（`scalar_plan`・`scalar_index`）
 
-`classify_scalar_plan` は `Not`／`IsNull`／`IsNotNull`／`InTyped`／
-`Between{Bytes}` を（単独でも複合述語の一部でも）先頭で `PlainScan` へ倒す
-事前ゲート（`BoolEquals` と同じ設計。`Between{Bytes}`・`TypedCompare{Bytes}` の
-ゲートは Issue #1257 で撤去し、`BYTEA` も二次索引対応になった）。単独の
+`classify_scalar_plan` は `Not`／`IsNull`／`IsNotNull`／`InTyped` を
+（単独でも複合述語の一部でも）先頭で `PlainScan` へ倒す事前ゲート
+（`BoolEquals` と同じ設計）。`Between{Bytes}`・`TypedCompare{Bytes}` の
+ゲートは Issue #1257 で撤去し、`BYTEA` も二次索引対応になった（`Between{Bytes}` は
+`IndexTypedRange` に分類する）。単独の
 `InText` は `ScalarPlan::IndexInList`、単独の `Between` は
 `IndexTypedRange` に合流する。
 
