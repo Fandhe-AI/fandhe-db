@@ -38,7 +38,10 @@ SELECT <投影> FROM <table | view>
 - `ORDER BY` 直後の先頭トークンが距離演算子形・関数呼び出し形（`sql::allowlist::
   Parser::parse_order_by` と同じ判定基準）でなければスカラー形として広域取得
   （`ParsedSelect::Scan`）へ振り分ける。ベクトル順位付け形とは構文上相互排他
-  で、混在（例: `ORDER BY lang, embedding <=> '...'`）は `42601`。
+  で、混在（例: `ORDER BY lang, embedding <=> '...'`）は `42601`。なお Issue #1188 以降は、
+  順位付け関数（`HYBRID`／`HYBRID_RRF`）以外の `<ident> '('` 形と `CASE WHEN` 始まりは
+  スカラー関数・`CASE` 等の式キーとしてこの経路へ振り分ける
+  （`docs/design/order-by-having-expressions.md`）。
 - `ASC`/`DESC` は予約語化せず文脈的（大文字小文字非区別）に照合し、省略時は
   昇順。キー数の上限は `MAX_SCALAR_ORDER_KEYS`（8。NOSQL-15 の同種上限と揃えた
   実装既定値）。超過は `54000`。

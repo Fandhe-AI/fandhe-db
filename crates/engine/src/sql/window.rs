@@ -1767,6 +1767,7 @@ mod budget_regression_tests {
                 order_by: Vec::new(),
                 name: "min_body".to_string(),
             }],
+            order_exprs: Vec::new(),
         }
     }
 

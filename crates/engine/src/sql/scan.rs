@@ -54,8 +54,8 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
-    compare_ref_and_owned_values, compare_statement_order, extract_order_value_ref,
-    scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
+    compare_ref_and_owned_values, compare_statement_order, expr_value_to_key_ref,
+    extract_order_value_ref, scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, ProjectedColumn};
 use crate::sql::udf_call::{self, ExprValue};
@@ -280,11 +280,27 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
     // 束縛段〔`sql::parser::bind_scalar_order_by`〕が構造上 ORDER BY キーとして
     // 拒否済みのため `needs_embedding` は変化しない）。
     for key in &bound.order_by {
-        if let BoundOrderTarget::Column(index) = key.target {
-            has_scalar_reference = true;
-            if let Some(slot) = scalar_mask.get_mut(index) {
-                *slot = true;
+        match key.target {
+            BoundOrderTarget::Column(index) => {
+                has_scalar_reference = true;
+                if let Some(slot) = scalar_mask.get_mut(index) {
+                    *slot = true;
+                }
             }
+            // Issue #1188・SQL-26: 式キーが参照する列・embedding も並べ替え値の評価の
+            // ためにスキャン段でデコードする（マスク外参照を実 NULL と取り違えさせない
+            // fail-closed 契約は投影・WHERE の式と同じ）。
+            BoundOrderTarget::Expr(i) => {
+                if let Some((expr, _)) = bound.order_exprs.get(i) {
+                    if udf_call::references_embedding(expr) {
+                        needs_embedding = true;
+                    }
+                    if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+                        has_scalar_reference = true;
+                    }
+                }
+            }
+            BoundOrderTarget::Id => {}
         }
     }
     // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群が参照する列・embedding も
@@ -1043,6 +1059,8 @@ pub(crate) fn execute_scan_with_budget(
     let mut embedding_scratch: Vec<f32> = Vec::new();
     let mut where_expr_scratch: Vec<StackValue> = Vec::new();
     let mut proj_expr_scratch: Vec<StackValue> = Vec::new();
+    // Issue #1188: 経路 (B) パス 1 の式キー評価用スタック（`ORDER BY` が式キーを持つ場合のみ使う）。
+    let mut order_expr_scratch: Vec<StackValue> = Vec::new();
     let mut byte_budget: usize = 0;
     let mut rows: Vec<ResultRow> = Vec::new();
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` で読み飛ばした「可視かつ WHERE 一致」
@@ -1298,11 +1316,43 @@ pub(crate) fn execute_scan_with_budget(
                 ctx,
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
-                |_dim, scanned, _embedding| {
+                |_dim, scanned, embedding| {
+                    // Issue #1188: 式キーは行ごとに評価し、評価結果（`ExprValue`。TEXT は
+                    // 列参照なら借用・関数結果なら評価時に構築済みの所有値）を借用したまま
+                    // 採否判定・予算照合に使う。複製（所有値化）は採用が決まった候補に
+                    // 対してだけ下の `scalar_key_ref_to_owned` で 1 回行う（列キーの経路と
+                    // 同じ「採用前に複製しない」契約）。RLS・WHERE を通過した可視行に対して
+                    // のみ評価される（`with_visible_row` の順序）。評価エラー（`22012`／
+                    // `22003`／`22008` 等）は可視行の値のみから生じ、そのまま fail-closed で返す。
+                    let mut expr_values: Vec<ExprValue<'_>> =
+                        Vec::with_capacity(bound.order_exprs.len());
+                    for key in &bound.order_by {
+                        if let BoundOrderTarget::Expr(i) = key.target {
+                            let (_, program) = bound.order_exprs.get(i).ok_or_else(|| {
+                                SqlSurfaceError::Internal {
+                                    detail: "expression order key program missing".to_string(),
+                                }
+                            })?;
+                            expr_values.push(program.eval(
+                                id,
+                                embedding,
+                                scanned,
+                                &mut order_expr_scratch,
+                            )?);
+                        }
+                    }
+                    let mut expr_iter = expr_values.iter();
                     let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
                         Vec::with_capacity(bound.order_by.len());
                     for key in &bound.order_by {
-                        refs.push(extract_order_value_ref(schema, key, id, scanned)?);
+                        if matches!(key.target, BoundOrderTarget::Expr(_)) {
+                            let v = expr_iter.next().ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "expression order key value missing".to_string(),
+                            })?;
+                            refs.push(expr_value_to_key_ref(v, key.kind)?);
+                        } else {
+                            refs.push(extract_order_value_ref(schema, key, id, scanned)?);
+                        }
                     }
                     if heap.len() >= heap_capacity {
                         let worst = heap.peek().ok_or_else(|| SqlSurfaceError::Internal {
@@ -1650,6 +1700,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         }
     }
 
@@ -1794,6 +1845,7 @@ mod tests {
             }],
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         // パス 1 のヒープ候補 1 件分の内訳（[`heap_entry_keys_bytes`]・
@@ -2151,6 +2203,7 @@ mod tests {
             }],
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
@@ -2228,6 +2281,7 @@ mod tests {
             }],
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         // 巨大なキーを複製すれば単独でも超過するが、上位候補にならないため
@@ -2306,6 +2360,7 @@ mod tests {
             }],
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         // 十分大きい既定予算では、最終的に id=2（"a"）だけが残る。
@@ -2407,6 +2462,7 @@ mod tests {
             }],
             offset: 5,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         // パス 1 終了時点のヒープ候補 7 件分（`heap_entry_bytes` と同じ計算式。
@@ -2474,6 +2530,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         }
     }
 
@@ -2542,6 +2599,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -2618,6 +2676,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -2687,6 +2746,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -2743,6 +2803,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -2912,6 +2973,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::DimAndScalar);
@@ -2932,6 +2994,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Fast);
@@ -2958,6 +3021,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             windows: Vec::new(),
+            order_exprs: Vec::new(),
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Embedding);

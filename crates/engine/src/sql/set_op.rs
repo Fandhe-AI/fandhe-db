@@ -853,6 +853,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
+            order_keys: Vec::new(),
         }))
     }
 
@@ -1062,6 +1063,7 @@ mod tests {
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
+            order_keys: Vec::new(),
         }))
     }
 
