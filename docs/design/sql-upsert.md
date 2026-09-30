@@ -104,7 +104,8 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
   scan_tenant_rows_by_unique_key`。`enforce_unique_keys_in_txn` と同じ
   `(tenant_id, 0)..=(tenant_id, u64::MAX)` の閉区間・可視性を問わない全行が母集合。
   RLS-9・RLS-10 (c)）、対象キー→既存行 id の対応表を作る（この事前走査の母集合は
-  所有行全体のまま不変。一致した既存行の可視性で `DO NOTHING`／`DO UPDATE` の分岐が
+  所有行全体のまま不変。衝突検出に必要なキー列のみを可視性を問わず読み、不可視行のキー列
+  破損は fail-closed の `XX000`。本体は読まない。契約は `sql-returning.md`「書き込み対象の選定スコープ」節。一致した既存行の可視性で `DO NOTHING`／`DO UPDATE` の分岐が
   変わる点は `sql-returning.md`「UPSERT の衝突先が不可視の場合」節）。各 `VALUES` 行はこの表と
   照合し、一致すればその既存行 id に対して `DO NOTHING`／`DO UPDATE`（read-merge-
   write は `(id)` 対象と共有）を行い、一致しなければ `VALUES` の `id` で新規挿入する
