@@ -321,6 +321,34 @@ pub fn is_sorted_by_direction(values: &[i64], descending: bool) -> bool {
     })
 }
 
+/// `order_single`（`ORDER BY qty` 昇順・`LIMIT limit`）で自テナント `0..own_rows` から期待される
+/// 先頭 `limit` 件の `qty` 列。`qty` は同値がありうるため、同値境界での id 差を許すよう値列で照合する。
+pub fn expected_order_single(own_rows: u64, limit: usize) -> Vec<i64> {
+    let mut qty: Vec<i64> = (0..own_rows).map(qty_for_id).collect();
+    qty.sort_unstable();
+    qty.truncate(limit);
+    qty
+}
+
+/// `order_multi`（`ORDER BY lang ASC, qty DESC`・`LIMIT limit`）で期待される先頭 `limit` 件の
+/// `(lang, qty)` 列。`lang` は文字列（バイト）順。同値タプルの id 差は許すため値の組で照合する。
+pub fn expected_order_multi(own_rows: u64, limit: usize) -> Vec<(&'static str, i64)> {
+    let mut rows: Vec<(&'static str, i64)> = (0..own_rows)
+        .map(|id| (lang_for_id(id), qty_for_id(id)))
+        .collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(b.0).then(b.1.cmp(&a.1)));
+    rows.truncate(limit);
+    rows
+}
+
+/// `ids` が `expected_sorted`（昇順・重複なし）と過不足なく一致するか。件数だけの照合では
+/// 重複と欠落が同時に起きても通過するため、整列して要素ごとに照合する。
+pub fn is_exact_id_set(ids: &[u64], expected_sorted: &[u64]) -> bool {
+    let mut got = ids.to_vec();
+    got.sort_unstable();
+    got == expected_sorted
+}
+
 // --- 統計 ---
 
 /// 1 arm の全ラウンド要約。

@@ -220,3 +220,35 @@ fn github_actions_is_refused() {
     );
     assert_eq!(refuse_under_github_actions(false), Ok(()));
 }
+
+#[test]
+fn exact_id_set_detects_duplicate_plus_missing() {
+    let expected = [0u64, 1, 2, 3];
+    assert!(is_exact_id_set(&[3, 1, 0, 2], &expected));
+    // 件数は同じでも、重複（1 が 2 回）と欠落（3 が無い）が同時に起きれば拒否する。
+    assert!(!is_exact_id_set(&[0, 1, 1, 2], &expected));
+    assert!(!is_exact_id_set(&[0, 1, 2], &expected));
+    assert!(!is_exact_id_set(&[0, 1, 2, 3, 3], &expected));
+}
+
+#[test]
+fn expected_order_prefixes_follow_fixture() {
+    let single = expected_order_single(2_000, 100);
+    assert_eq!(single.len(), 100);
+    assert!(is_sorted_by_direction(&single, false));
+    let brute_min = (0..2_000u64).map(qty_for_id).min().expect("non-empty");
+    assert_eq!(single.first().copied(), Some(brute_min));
+
+    let multi = expected_order_multi(2_000, 100);
+    assert_eq!(multi.len(), 100);
+    // 先頭は最小の lang（文字列順で "l0"）内の最大 qty。
+    let best = (0..2_000u64)
+        .filter(|id| lang_for_id(*id) == "l0")
+        .map(qty_for_id)
+        .max()
+        .expect("l0 rows");
+    assert_eq!(multi.first().copied(), Some(("l0", best)));
+    for w in multi.windows(2) {
+        assert!(w[0].0 < w[1].0 || (w[0].0 == w[1].0 && w[0].1 >= w[1].1));
+    }
+}

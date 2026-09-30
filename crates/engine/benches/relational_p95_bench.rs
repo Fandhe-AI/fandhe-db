@@ -33,11 +33,12 @@ use std::time::Duration;
 use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
-    author_id_for_doc, interleave_with_reference, is_sorted_by_direction, join_statement,
-    lang_for_id, lang_in_first_n, lang_token, order_by_statements, other_tenant_rows, parse_group,
-    parse_rounds, parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
-    refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
-    round_p95, scale_label, summarize_rounds, Group, JOIN_ROWS, REFERENCE_ARM, WIDE_LIMIT,
+    author_id_for_doc, expected_order_multi, expected_order_single, interleave_with_reference,
+    is_exact_id_set, join_statement, lang_for_id, lang_in_first_n, lang_token, order_by_statements,
+    other_tenant_rows, parse_group, parse_rounds, parse_rows_scale, predicate_statements,
+    qty_for_id, ratio_vs_reference, refuse_under_github_actions, render_round_line,
+    render_summary_line, render_threshold_line, round_p95, scale_label, summarize_rounds, Group,
+    JOIN_ROWS, REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -225,7 +226,9 @@ fn precheck_predicate(arm: &str, result: &QueryResult, own_rows: u64) {
     }
 }
 
-/// 順序 arm の事前検査: 非空・他テナント id 非混入・並びの方向。
+/// 順序 arm の事前検査: 非空・他テナント id 非混入・fixture から求めた期待上位 `WIDE_LIMIT` 行との照合。
+/// 各行の値が id の fixture 値と一致し、id が重複せず、`(値)` 列が期待の先頭列と一致することを見る
+/// （`LIMIT` 前の行の取り違えを検出する。同値境界の id 差は許すため値列で照合する）。
 fn precheck_order(arm: &str, result: &QueryResult, own_rows: u64) {
     if result.rows.is_empty() {
         fail_closed(format!("{arm}: empty result"));
@@ -233,27 +236,41 @@ fn precheck_order(arm: &str, result: &QueryResult, own_rows: u64) {
     if result.rows.iter().any(|r| r.id >= own_rows) {
         fail_closed(format!("{arm}: row outside own tenant id range"));
     }
+    let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|w| w[0] == w[1]) {
+        fail_closed(format!("{arm}: duplicate row ids"));
+    }
     if arm == "order_single" {
-        let qty: Vec<i64> = result
+        for r in &result.rows {
+            if cell_i64(r.cells.get(1)) != qty_for_id(r.id) {
+                fail_closed("order_single: qty does not match fixture for id");
+            }
+        }
+        let got: Vec<i64> = result
             .rows
             .iter()
             .map(|r| cell_i64(r.cells.get(1)))
             .collect();
-        if !is_sorted_by_direction(&qty, false) {
-            fail_closed("order_single: result is not ascending");
+        if got != expected_order_single(own_rows, WIDE_LIMIT) {
+            fail_closed("order_single: result is not the expected top rows ascending");
         }
     } else {
         // lang は文字列昇順、同一 lang 内で qty は降順。
-        for pair in result.rows.windows(2) {
-            if let [a, b] = pair {
-                let (la, lb) = (cell_text(a.cells.get(1)), cell_text(b.cells.get(1)));
-                if la > lb {
-                    fail_closed("order_multi: lang is not ascending");
-                }
-                if la == lb && cell_i64(a.cells.get(2)) < cell_i64(b.cells.get(2)) {
-                    fail_closed("order_multi: qty is not descending within lang");
-                }
+        for r in &result.rows {
+            if cell_text(r.cells.get(1)) != lang_for_id(r.id)
+                || cell_i64(r.cells.get(2)) != qty_for_id(r.id)
+            {
+                fail_closed("order_multi: values do not match fixture for id");
             }
+        }
+        let got: Vec<(&str, i64)> = result
+            .rows
+            .iter()
+            .map(|r| (cell_text(r.cells.get(1)), cell_i64(r.cells.get(2))))
+            .collect();
+        if got != expected_order_multi(own_rows, WIDE_LIMIT) {
+            fail_closed("order_multi: result is not the expected top rows");
         }
     }
 }
@@ -307,8 +324,13 @@ fn measure_group(
                 "{}",
                 render_round_line(group, label, round + 1, p95, m.summary.median, &load)
             );
-            if let Some(v) = per_arm.get_mut(idx) {
-                v.push(p95);
+            // 参照 arm は 1 ラウンドに候補数だけ現れる。要約（min_of_n・中央値・ラン間の幅）を
+            // N ラウンド統計に保つため、参照 arm はラウンド最初の 1 回だけ per_arm へ記録する
+            // （比率用の対応付け p95 は paired_ref に別途保持し、全出現の round 行は出力する）。
+            if ratio_ref != Some(idx) || last_ref.is_none() {
+                if let Some(v) = per_arm.get_mut(idx) {
+                    v.push(p95);
+                }
             }
             if ratio_ref == Some(idx) {
                 last_ref = Some(p95);
@@ -560,9 +582,10 @@ fn run_join_group(rows: usize, rounds: u32) {
     if own_joinable >= join_rows {
         fail_closed("join_inner: fixture has no cross-tenant probe rows (scale too small)");
     }
-    if full.len() as u64 != own_joinable || full.iter().any(|id| *id >= join_rows || is_probe(*id))
-    {
-        fail_closed("join_inner: full join is not confined to own tenant");
+    // 件数だけでは重複と欠落が同時に起きても通過するため、期待する文書 id の集合と過不足なく照合する。
+    let expected_ids: Vec<u64> = (0..join_rows).filter(|id| !is_probe(*id)).collect();
+    if !is_exact_id_set(&full, &expected_ids) {
+        fail_closed("join_inner: full join is not exactly the own-tenant joinable documents");
     }
     let ctx_b = ctx(TENANT_B);
     let full_b = exec_join_pages(&core, &ctx_b, head);
