@@ -54,7 +54,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
-    compare_ref_and_owned_values, compare_statement_order, expr_value_to_order_value,
+    compare_ref_and_owned_values, compare_statement_order, expr_value_to_key_ref,
     extract_order_value_ref, scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, ProjectedColumn};
@@ -1317,12 +1317,14 @@ pub(crate) fn execute_scan_with_budget(
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |_dim, scanned, embedding| {
-                    // Issue #1188: 式キーは行ごとに評価して所有値化する（TEXT 結果は
-                    // `Cow::Owned` になりうるため行バッファを借用できない）。RLS・WHERE を
-                    // 通過した可視行に対してのみ評価される（`with_visible_row` の順序）。
-                    // 評価エラー（`22012`／`22003`／`22008` 等）は可視行の値のみから生じ、
-                    // そのまま fail-closed で返す。
-                    let mut owned_exprs: Vec<Option<OrderValue>> =
+                    // Issue #1188: 式キーは行ごとに評価し、評価結果（`ExprValue`。TEXT は
+                    // 列参照なら借用・関数結果なら評価時に構築済みの所有値）を借用したまま
+                    // 採否判定・予算照合に使う。複製（所有値化）は採用が決まった候補に
+                    // 対してだけ下の `scalar_key_ref_to_owned` で 1 回行う（列キーの経路と
+                    // 同じ「採用前に複製しない」契約）。RLS・WHERE を通過した可視行に対して
+                    // のみ評価される（`with_visible_row` の順序）。評価エラー（`22012`／
+                    // `22003`／`22008` 等）は可視行の値のみから生じ、そのまま fail-closed で返す。
+                    let mut expr_values: Vec<ExprValue<'_>> =
                         Vec::with_capacity(bound.order_exprs.len());
                     for key in &bound.order_by {
                         if let BoundOrderTarget::Expr(i) = key.target {
@@ -1331,12 +1333,15 @@ pub(crate) fn execute_scan_with_budget(
                                     detail: "expression order key program missing".to_string(),
                                 }
                             })?;
-                            let value =
-                                program.eval(id, embedding, scanned, &mut order_expr_scratch)?;
-                            owned_exprs.push(expr_value_to_order_value(&value, key.kind)?);
+                            expr_values.push(program.eval(
+                                id,
+                                embedding,
+                                scanned,
+                                &mut order_expr_scratch,
+                            )?);
                         }
                     }
-                    let mut expr_iter = owned_exprs.iter();
+                    let mut expr_iter = expr_values.iter();
                     let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
                         Vec::with_capacity(bound.order_by.len());
                     for key in &bound.order_by {
@@ -1344,7 +1349,7 @@ pub(crate) fn execute_scan_with_budget(
                             let v = expr_iter.next().ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "expression order key value missing".to_string(),
                             })?;
-                            refs.push(v.as_ref().map(OrderValue::as_key_ref));
+                            refs.push(expr_value_to_key_ref(v, key.kind)?);
                         } else {
                             refs.push(extract_order_value_ref(schema, key, id, scanned)?);
                         }
