@@ -369,6 +369,8 @@ fn check_unchanged(before: &Snapshot, after: &Snapshot) -> Result<(), String> {
 enum Obs {
     Ok {
         affected: Option<u64>,
+        /// RETURNING の返却行の `id`（出現順）。RETURNING 以外は `None`。
+        returned_ids: Option<Vec<u64>>,
         debug: String,
     },
     Err {
@@ -388,8 +390,13 @@ fn observe(res: Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>) -> 
                 // TRUNCATE は件数を意図的に露出しない（SQL-22）。
                 _ => None,
             };
+            let returned_ids = match &o {
+                SqlOutcome::Returning(x) => Some(x.result.rows.iter().map(|r| r.id).collect()),
+                _ => None,
+            };
             Obs::Ok {
                 affected,
+                returned_ids,
                 debug: format!("{o:?}"),
             }
         }
@@ -417,6 +424,7 @@ fn run_copy(core: &EngineCore, ctx: &PolicyContext, sql: &str, data: &str) -> Ob
     match res {
         Ok(o) => Obs::Ok {
             affected: Some(o.rows_affected),
+            returned_ids: None,
             debug: format!("{o:?}"),
         },
         Err(e) => observe(Err(e)),
@@ -437,8 +445,16 @@ enum Axis {
 enum Expect {
     Affected(u64, u64),
     Err(&'static str),
-    /// 成否は問わない（応答の不変性と物理不変のみ検査する）。
-    Any,
+    /// RETURNING 付き。`affected` は [`Expect::Affected`] と同じ（Private 込み, Public のみ）、
+    /// `ids` は同じ 2 モードでの返却行の `id`（出現順）。返却行は閲覧側に可視な行に限られる
+    /// （Public のみモードでは自テナントの Private 行・既定可視性で投入した行は返らない）。
+    Returning {
+        affected: (u64, u64),
+        ids: (&'static [u64], &'static [u64]),
+    },
+    /// TRUNCATE。件数を露出しない成功応答（`affected` なし）で、事後に閲覧側の `docs`
+    /// 行が可視性を問わず 0 件になる（他テナントの行は T3 が不変を検査する）。
+    Truncated,
 }
 
 struct Shape {
@@ -481,22 +497,22 @@ fn shapes() -> Vec<Shape> {
         w("upd-id-missing", "UPDATE docs SET score = 999 WHERE id = 99 USING OPERATION_ID '{op}'", Affected(0, 0)),
         w("upd-pred-ja", "UPDATE docs SET score = 0 WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("upd-pred-none", "UPDATE docs SET score = 0 WHERE lang = 'zz' USING OPERATION_ID '{op}'", Affected(0, 0)),
-        w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' USING OPERATION_ID '{op}' RETURNING *", Any),
+        w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (2, 2), ids: (&[1, 2], &[1]) }),
         w("del-id-own", "DELETE FROM docs WHERE id = 1 USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("del-id-foreign-only", "DELETE FROM docs WHERE id = 9 USING OPERATION_ID '{op}'", Affected(0, 0)),
         w("del-pred-ja", "DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("del-pred-en", "DELETE FROM docs WHERE lang = 'en' USING OPERATION_ID '{op}'", Affected(2, 2)),
-        w("del-id-returning", "DELETE FROM docs WHERE id = 1 USING OPERATION_ID '{op}' RETURNING *", Any),
+        w("del-id-returning", "DELETE FROM docs WHERE id = 1 RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[1], &[1]) }),
         w("ins-foreign-id", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("ins-multi-foreign-ids", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-n1'), (10, 'ja', 2, 'tok-{v}-n2') USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("ins-own-dup-id", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-dup') USING OPERATION_ID '{op}'", Err("23505")),
-        w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') USING OPERATION_ID '{op}' RETURNING *", Any),
+        w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[9], &[]) }),
         w("upsert-foreign-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 7, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-foreign-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(1, 1)),
-        w("upsert-own-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Any),
-        w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}' RETURNING *", Any),
-        w("truncate", "TRUNCATE TABLE docs USING OPERATION_ID '{op}'", Any),
+        w("upsert-own-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(0, 0)),
+        w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[9], &[]) }),
+        w("truncate", "TRUNCATE TABLE docs USING OPERATION_ID '{op}'", Truncated),
         // ---- (c) 制約検査 ----
         c("uniq-foreign-code", "INSERT INTO uniq (id, code, a, b) VALUES (10, 'shared', 'n1', 'n2') USING OPERATION_ID '{op}'", Affected(1, 1)),
         c("uniq-foreign-private-code", "INSERT INTO uniq (id, code, a, b) VALUES (10, 'fpriv', 'n1', 'n2') USING OPERATION_ID '{op}'", Affected(1, 1)),
@@ -708,7 +724,49 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                 (Expect::Err(code), Obs::Ok { .. }) => {
                     panic!("{which}: expected error {code} but succeeded: {}", label(r))
                 }
-                (Expect::Any, _) => {}
+                (
+                    Expect::Returning {
+                        affected: (p, q),
+                        ids: (ip, iq),
+                    },
+                    Obs::Ok {
+                        affected,
+                        returned_ids,
+                        ..
+                    },
+                ) => {
+                    let (want, want_ids) = if mode { (p, ip) } else { (q, iq) };
+                    assert_eq!(*affected, Some(want), "{which}: {}", label(r));
+                    assert_eq!(
+                        returned_ids.as_deref(),
+                        Some(want_ids),
+                        "{which}: RETURNING rows: {}",
+                        label(r)
+                    );
+                }
+                (Expect::Returning { .. }, Obs::Err { code, .. }) => {
+                    panic!("{which}: unexpected error {code}: {}", label(r))
+                }
+                (Expect::Truncated, Obs::Ok { affected, .. }) => {
+                    assert_eq!(*affected, None, "{which}: {}", label(r));
+                }
+                (Expect::Truncated, Obs::Err { code, .. }) => {
+                    panic!("{which}: unexpected error {code}: {}", label(r))
+                }
+            }
+        }
+        if matches!(r.expect, Expect::Truncated) {
+            for (which, own) in [
+                ("baseline", &r.base_own_after),
+                ("flooded", &r.flood_own_after),
+            ] {
+                let remaining = own.keys().filter(|(t, _, _)| t == "docs").count();
+                assert_eq!(
+                    remaining,
+                    0,
+                    "{which}: own docs rows remain after TRUNCATE: {}",
+                    label(r)
+                );
             }
         }
         assert_eq!(r.readback_leaks, 0, "foreign token leaked: {}", label(r));
@@ -873,11 +931,25 @@ fn t6_negative_controls_detect_fabricated_violations() {
     // 応答不変性の比較が差分を検出する。
     let a = Obs::Ok {
         affected: Some(1),
+        returned_ids: None,
         debug: "x".into(),
     };
     let b = Obs::Ok {
         affected: Some(2),
+        returned_ids: None,
         debug: "x".into(),
     };
     assert_ne!(a, b);
+    // RETURNING の返却行（id 集合）の差分も検出する。
+    let c = Obs::Ok {
+        affected: Some(1),
+        returned_ids: Some(vec![1]),
+        debug: "x".into(),
+    };
+    let d = Obs::Ok {
+        affected: Some(1),
+        returned_ids: Some(vec![9]),
+        debug: "x".into(),
+    };
+    assert_ne!(c, d);
 }
