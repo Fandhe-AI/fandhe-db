@@ -196,10 +196,10 @@ fn rendered_lines_have_keys_and_no_tenant() {
         5_000,
         scale_label(5_000),
         &s,
-        Some(1.5),
+        Some((1.5, ms(8))),
     );
     assert!(sum.contains("min_of_n=") && sum.contains("scale=reduced"));
-    assert!(sum.contains("ratio_vs_pred_eq=1.500"));
+    assert!(sum.contains("ratio_vs_pred_eq=1.500 ref_min_paired=8.000ms"));
     for line in [&round, &sum] {
         assert!(!line.contains("tenant"));
         assert!(!line.contains("SELECT"));

@@ -556,10 +556,15 @@ pub fn render_summary_line(
     rows: usize,
     scale: &str,
     summary: &RoundSummary,
-    ratio: Option<f64>,
+    ratio: Option<(f64, Duration)>,
 ) -> String {
+    // 比率の分母（その候補の直前に測った参照 arm の min）を併記し、表示値から比率を再現できるようにする。
+    // 参照 arm 自身の `min_of_n` はラウンドごとに 1 回だけの系列で、分母とは別の系列（対応付け集計）。
     let ratio_part = match ratio {
-        Some(r) => format!(" ratio_vs_{REFERENCE_ARM}={r:.3}"),
+        Some((r, ref_min)) => format!(
+            " ratio_vs_{REFERENCE_ARM}={r:.3} ref_min_paired={:.3}ms",
+            ms(ref_min)
+        ),
         None => String::new(),
     };
     format!(

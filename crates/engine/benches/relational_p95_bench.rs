@@ -394,7 +394,8 @@ fn measure_group(
                 let ref_min = summarize_rounds(refs)
                     .unwrap_or_else(|e| fail_closed(e))
                     .min;
-                Some(ratio_vs_reference(summary.min, ref_min).unwrap_or_else(|e| fail_closed(e)))
+                let r = ratio_vs_reference(summary.min, ref_min).unwrap_or_else(|e| fail_closed(e));
+                Some((r, ref_min))
             }
             _ => None,
         };
