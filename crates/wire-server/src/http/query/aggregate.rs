@@ -51,6 +51,20 @@
 //!   限定を外した）・`having` が `MIN`/`MAX(<TEXT 列>)` を
 //!   参照・参照先が `aggregates` に存在しない／曖昧 → `22000`
 //!
+//! `group_by` の単一文字列形・`sort`・`offset`（Issue #1198・NOSQL-15・
+//! NOSQL-16 (b)・SQL-25 (a)(b)）:
+//! - `group_by: "lang"` は `["lang"]` と完全に同じ経路（識別子形状検査 →
+//!   `new_grouped_by_columns`）で扱う。空文字列・識別子形状不正 → `42601`
+//! - `sort`（`{column, dir}` の非空配列。要素パースは [`super::scan`] と共有）は
+//!   engine の `BoundAggregate::with_group_order_by` へ委譲する。空配列・語彙外
+//!   `dir`・識別子形状不正 → `42601`、要素数上限（8）超過 → `54000`、出力列名に
+//!   存在しない／曖昧な `column` → `22000`
+//! - `offset` は形状（有限・非負整数・`u32` 以下）違反 → `42601`、`0..=MAX_SEARCH_K`
+//!   範囲外 → `22000`（`validate_search_offset`）。`with_group_offset` へ委譲する
+//! - `group_by` なしの `sort`／`offset`（`offset: 0` の明示を含む）→ `42601`
+//!   （[`AggregateError::GroupByShape`]。SQL 表層に単一行集計への
+//!   `ORDER BY`／`OFFSET` の受理形がなく、黙って無視すると fail-open になるため）
+//!
 //! RLS: `PolicyContext` は呼び出し元が渡す
 //! [`crate::http::session::middleware::SessionPrincipal::policy_context`]
 //! のみから導出する（本モジュールはヘッダ・JSON からテナントを読む経路を
@@ -63,12 +77,14 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::sql::allowlist::{self, SqlSurfaceError};
 use engine::sql::mode::SessionState;
 use engine::sql::parser::{
-    AggregateTarget, BoundAggregate, BoundAggregateItem, HavingOp, HavingSpec,
+    validate_search_offset, AggregateTarget, BoundAggregate, BoundAggregateItem, HavingOp,
+    HavingSpec,
 };
 
 use super::filter::{self, FilterError};
 use super::ident::{self, InvalidIdentifier};
-use super::schema::{SchemaError, Validated, HAVING_ITEM_SCHEMA};
+use super::scan;
+use super::schema::{SchemaError, StringOrArray, Validated, HAVING_ITEM_SCHEMA};
 
 use crate::http::session::middleware::SessionPrincipal;
 
@@ -145,9 +161,15 @@ pub enum AggregateError {
     /// `group_by` は 1〜[`engine::sql::allowlist::MAX_GROUP_BY_COLUMNS`] 列の
     /// 配列を受理し、`BoundAggregate::new_grouped_by_columns`（SQL-25 (d)）へ
     /// 写像する（列数上限超過は `54000`・重複列名は engine 側で `42601`）。
-    /// `group_by` の裸の文字列形（配列でなく単一文字列）の受理は本 Issue の
-    /// 対象外（NOSQL-16 (b)・別 Issue）。
+    /// `group_by` の単一文字列形は Issue #1198・NOSQL-16 (b) で受理する
+    /// （1 要素配列と同一経路）。あわせて `group_by` なしの `sort`／`offset`
+    /// （`offset: 0` の明示を含む）もこの分類で拒否する（SQL 表層に単一行集計への
+    /// `ORDER BY`／`OFFSET` の受理形がなく、黙って無視すると fail-open になるため）。
     GroupByShape,
+    /// `sort` の形が不正（空配列・非オブジェクト要素・`dir` が `"asc"`／`"desc"`
+    /// 以外）。Issue #1198・NOSQL-15。固定文言で untrusted な内容を含めない
+    /// （`scan::ScanError::InvalidSort` と同型）。
+    InvalidSort,
     /// `having[].op` が [`parse_having_op`] の 5 記号（`=`／`<`／`<=`／`>`／
     /// `>=`）に完全一致しない。
     UnsupportedHavingOperator,
@@ -189,6 +211,7 @@ impl ClassifiedError for AggregateError {
             AggregateError::UnsupportedFunction
             | AggregateError::InvalidIdentifier
             | AggregateError::GroupByShape
+            | AggregateError::InvalidSort
             | AggregateError::UnsupportedHavingOperator
             | AggregateError::NonFiniteHavingLiteral => ErrorClass::UnsupportedSqlSyntax,
             AggregateError::Filter(err) => err.error_class(),
@@ -209,9 +232,13 @@ impl ClassifiedError for AggregateError {
             AggregateError::Filter(err) => err.client_message(),
             AggregateError::Engine(err) => err.client_message(),
             AggregateError::ExplainNotSupported => EXPLAIN_NOT_SUPPORTED_MESSAGE.to_string(),
-            AggregateError::GroupByShape => "group_by must be a non-empty array of column names, \
-                 and having requires group_by"
+            AggregateError::GroupByShape => "group_by must be a column name or a non-empty \
+                 array of column names; having, sort and offset require group_by"
                 .to_string(),
+            AggregateError::InvalidSort => {
+                "sort must be a non-empty array of {column, dir} with dir \"asc\" or \"desc\""
+                    .to_string()
+            }
             AggregateError::UnsupportedHavingOperator => {
                 "unsupported having operator (only \"=\", \"<\", \"<=\", \">\", \">=\" are \
                  allowed)"
@@ -405,19 +432,29 @@ pub fn bind(
         None => (Vec::new(), Vec::new(), Vec::new()),
     };
 
-    let group_by_json = validated.optional_array("group_by")?;
+    let group_by_json = validated.optional_string_or_array("group_by")?;
     let having_json = validated.optional_array("having")?;
+    let sort_json = validated.optional_array("sort")?;
+    let offset_raw = validated.optional_u32("offset")?;
 
     let group_by_columns: Option<Vec<&str>> = match group_by_json {
         None => {
-            // `having` は `group_by` なしに単独で指定できない（黙って無視
-            // すると単一行集計〔SQL-13〕として fail-open に実行してしまう）。
-            if having_json.is_some() {
+            // `having`／`sort`／`offset` は `group_by` なしに単独で指定できない
+            // （黙って無視すると単一行集計〔SQL-13〕として fail-open に実行して
+            // しまう。SQL 表層にも単一行集計への `ORDER BY`／`OFFSET` の受理形は
+            // ない。Issue #1198・NOSQL-15）。`offset: 0` の明示も拒否する。
+            if having_json.is_some() || sort_json.is_some() || offset_raw.is_some() {
                 return Err(AggregateError::GroupByShape);
             }
             None
         }
-        Some(cols) => {
+        Some(StringOrArray::Single(name)) => {
+            // 単一文字列形（Issue #1198・NOSQL-16 (b)）は 1 要素配列と同一経路
+            // （識別子形状検査 → `new_grouped_by_columns`）へ流す。
+            ident::check_identifier(name)?;
+            Some(vec![name])
+        }
+        Some(StringOrArray::Many(cols)) => {
             // `group_by` は 1〜`MAX_GROUP_BY_COLUMNS` 列の列名配列を受理する
             // （Issue #949・NOSQL-16 (b)・SQL-25 (d)。空配列は従来どおり
             // `GroupByShape`）。
@@ -460,6 +497,23 @@ pub fn bind(
         having.push(bind_having_item(item, &item_specs)?);
     }
 
+    // `sort`（Issue #1198・NOSQL-15）: 要素パースは `scan` と共有し、対象名の
+    // 解決・件数上限（`54000`）・未知／曖昧（`22000`）は engine の
+    // `with_group_order_by` に一元化する。
+    let sort_keys = match sort_json {
+        Some(items) => scan::parse_sort_items(items).map_err(|err| match err {
+            scan::ScanError::InvalidIdentifier => AggregateError::InvalidIdentifier,
+            _ => AggregateError::InvalidSort,
+        })?,
+        None => Vec::new(),
+    };
+    // `offset`: 形状（有限・整数・非負・`u32` 以下）は `optional_u32` が、範囲
+    // （`0..=MAX_SEARCH_K`。超過は `22000`）は `validate_search_offset` が検査する。
+    let offset = match offset_raw {
+        Some(raw) => validate_search_offset(raw)?,
+        None => 0,
+    };
+
     let bound = BoundAggregate::new_grouped_by_columns(
         schema.name.clone(),
         items,
@@ -469,6 +523,8 @@ pub fn bind(
         having,
         schema,
     )?
+    .with_group_order_by(&sort_keys, schema)?
+    .with_group_offset(offset)?
     .with_or_filters(or_filters);
     Ok(bound)
 }
@@ -825,6 +881,139 @@ mod tests {
         );
         let bound = bind(&v, &schema(), &udfs()).expect("group_by should bind");
         assert!(bound.has_group_by());
+    }
+
+    // --- Issue #1198・NOSQL-15／NOSQL-16 (b): 文字列形 group_by・sort・offset ---
+
+    fn bind_json(json: &str) -> Result<BoundAggregate, AggregateError> {
+        validated_aggregate!(v, json);
+        bind(&v, &schema(), &udfs())
+    }
+
+    fn agg_json(extra: &str) -> String {
+        format!(
+            r#"{{"op":"aggregate","table":"docs",
+               "aggregates":[{{"fn":"count","column":"*"}}]{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn bind_string_group_by_equals_single_element_array() {
+        let single = bind_json(&agg_json(r#","group_by":"lang""#)).expect("binds");
+        let array = bind_json(&agg_json(r#","group_by":["lang"]"#)).expect("binds");
+        assert_eq!(single, array);
+        assert!(single.has_group_by());
+    }
+
+    #[test]
+    fn bind_string_group_by_rejects_empty_and_malformed_identifier() {
+        for gb in [r#""""#, r#""do cs""#] {
+            let err = bind_json(&agg_json(&format!(r#","group_by":{gb}"#))).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "gb={gb}");
+        }
+        let err = bind_json(&agg_json(r#","group_by":"nope""#)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_sort_and_offset_match_sql_text_path() {
+        let bound = bind_json(&agg_json(
+            r#","group_by":"lang","sort":[{"column":"count","dir":"desc"}],"offset":3"#,
+        ))
+        .expect("binds");
+        let expected = BoundAggregate::new_grouped_by_columns(
+            "docs".to_string(),
+            vec![BoundAggregateItem::bind(
+                engine::sql::allowlist::AggregateFunc::Count,
+                AggregateTarget::Star,
+                &schema(),
+            )
+            .expect("binds")],
+            Vec::new(),
+            Vec::new(),
+            &["lang"],
+            Vec::new(),
+            &schema(),
+        )
+        .and_then(|b| {
+            b.with_group_order_by(
+                &[engine::sql::allowlist::ScalarOrderKey {
+                    column: "count".to_string(),
+                    descending: true,
+                }],
+                &schema(),
+            )
+        })
+        .and_then(|b| b.with_group_offset(3))
+        .expect("binds");
+        assert_eq!(bound, expected);
+    }
+
+    #[test]
+    fn bind_rejects_sort_and_offset_without_group_by() {
+        for extra in [
+            r#","sort":[{"column":"count","dir":"asc"}]"#,
+            r#","sort":[]"#,
+            r#","offset":1"#,
+            r#","offset":0"#,
+        ] {
+            let err = bind_json(&agg_json(extra)).unwrap_err();
+            assert!(matches!(err, AggregateError::GroupByShape), "extra={extra}");
+            assert_eq!(err.wire_code(), "42601");
+        }
+    }
+
+    #[test]
+    fn bind_rejects_malformed_sort() {
+        for sort in [
+            r#"[]"#,
+            r#"[{"column":"count","dir":"DESC"}]"#,
+            r#"[{"column":"count","dir":"up"}]"#,
+        ] {
+            let err =
+                bind_json(&agg_json(&format!(r#","group_by":"lang","sort":{sort}"#))).unwrap_err();
+            assert!(matches!(err, AggregateError::InvalidSort), "sort={sort}");
+            assert_eq!(err.wire_code(), "42601");
+        }
+        for column in ["*", "do cs"] {
+            let err = bind_json(&agg_json(&format!(
+                r#","group_by":"lang","sort":[{{"column":"{column}","dir":"asc"}}]"#
+            )))
+            .unwrap_err();
+            assert!(matches!(err, AggregateError::InvalidIdentifier));
+        }
+        // 固定文言（untrusted 入力を echo しない）。
+        assert!(!AggregateError::InvalidSort
+            .client_message()
+            .contains("DESC"));
+    }
+
+    #[test]
+    fn bind_sort_key_count_limits_and_reference_errors() {
+        let key = r#"{"column":"lang","dir":"asc"}"#;
+        let two = format!(r#","group_by":"lang","sort":[{key},{key}]"#);
+        assert!(bind_json(&agg_json(&two)).is_ok());
+        let nine = [key; engine::sql::allowlist::MAX_SCALAR_ORDER_KEYS + 1].join(",");
+        let err =
+            bind_json(&agg_json(&format!(r#","group_by":"lang","sort":[{nine}]"#))).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        let err = bind_json(&agg_json(
+            r#","group_by":"lang","sort":[{"column":"nope","dir":"asc"}]"#,
+        ))
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_offset_shape_and_range() {
+        for bad in ["-1", "1.5"] {
+            let err =
+                bind_json(&agg_json(&format!(r#","group_by":"lang","offset":{bad}"#))).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "offset={bad}");
+        }
+        assert!(bind_json(&agg_json(r#","group_by":"lang","offset":10000"#)).is_ok());
+        let err = bind_json(&agg_json(r#","group_by":"lang","offset":10001"#)).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]

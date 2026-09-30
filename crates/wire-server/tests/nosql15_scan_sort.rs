@@ -477,8 +477,11 @@ fn sort_on_search_op_rejects_with_42601_unknown_key() {
     assert_eq!(http_common::wire_code_of(&resp), "42601");
 }
 
+/// `aggregate` op の `sort` は Issue #1198 で受理形ができたが、`group_by` なしの
+/// 単一行集計への `sort` は SQL 表層に受理形がないため `42601`（`group_by` ありの
+/// 受理は `nosql15_aggregate_sort_offset.rs` が固定する）。
 #[test]
-fn sort_on_aggregate_op_rejects_with_42601_unknown_key() {
+fn sort_on_group_by_less_aggregate_rejects_with_42601() {
     let (core, _guard) = new_core_scan_docs();
     let addr = spawn(core);
 
@@ -490,6 +493,21 @@ fn sort_on_aggregate_op_rejects_with_42601_unknown_key() {
     );
     assert_eq!(resp.status, 400, "body={resp:?}");
     assert_eq!(http_common::wire_code_of(&resp), "42601");
+}
+
+#[test]
+fn sort_on_group_by_aggregate_is_accepted() {
+    let (core, _guard) = new_core_scan_docs();
+    let addr = spawn(core);
+
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"aggregate","table":"docs",
+             "aggregates":[{"fn":"count","column":"id"}],
+             "group_by":"lang",
+             "sort":[{"column":"lang","dir":"asc"}]}"#,
+    );
+    assert_eq!(resp.status, 200, "body={resp:?}");
 }
 
 #[test]
