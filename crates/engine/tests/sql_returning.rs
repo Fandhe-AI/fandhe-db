@@ -856,15 +856,35 @@ fn upsert_returning_do_update_returns_post_update_and_inserted_rows() {
     );
 }
 
-/// `rows_affected` は結果行の可視性と独立: Public のみ可視の `PolicyContext` でも
-/// 述語形 `UPDATE`／`DELETE`・UPSERT は実際に変更した件数を返し、Private 行は
-/// 結果から除外される（`rows.len() < rows_affected`）。
+/// UPDATE／DELETE（id 指定・述語形）の対象は「所有かつ可視」（RLS-10・SQL-21。
+/// Issue #1253）: 可視集合が Public のみの `PolicyContext` では自テナントの Private
+/// 行は対象にならず、影響行数と返却行数が一致する（不可視行は影響行数にも現れない）。
+/// Public＋Private でも同じ形の文で両者が一致することを固定する。
 #[test]
-fn dml_returning_rows_affected_is_independent_of_result_row_visibility() {
-    let (core, path) = new_core_with_table();
-    let _guard = CleanupGuard(path);
+fn dml_returning_update_delete_targets_only_visible_rows_and_count_matches_returned_rows() {
     let alice_private = ctx_for("alice", true);
     let alice_public_only = ctx_for("alice", false);
+    // 陽性対照: SQL の INSERT は Private 固定のため、Public 行は `EngineCore` へ
+    // 渡す前に API で投入する。
+    let path = unique_db_path("sql-returning-visible-targets");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &alice_private,
+        5,
+        Visibility::Public,
+        &[
+            engine::row_codec::Value::Vector(vec![0.1, 0.2]),
+            engine::row_codec::Value::Text("ja".to_string()),
+            engine::row_codec::Value::Text("pub".to_string()),
+        ],
+        &engine::recovery::required_op_id::OperationId::parse("op-s5").expect("valid operation_id"),
+    )
+    .expect("seed public row");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let mut session = SessionState::default();
     seed(&core, &alice_private, 1, "ja", "a", "op-s1");
     seed(&core, &alice_private, 2, "ja", "b", "op-s2");
@@ -875,14 +895,88 @@ fn dml_returning_rows_affected_is_independent_of_result_row_visibility() {
             &alice_public_only,
             &mut session,
             &format!(
-                "UPDATE {TABLE} SET body = 'x' WHERE lang = 'ja' RETURNING * \
+                "UPDATE {TABLE} SET body = 'x' WHERE lang = 'ja' RETURNING id \
                  USING OPERATION_ID 'op-vis-upd'"
             ),
         )
         .expect("predicate UPDATE"),
     );
-    assert_eq!(upd.rows_affected, 2);
-    assert!(upd.result.rows.is_empty());
+    assert_eq!(upd.rows_affected, 1);
+    assert_eq!(upd.result.rows.len(), 1);
+    assert_eq!(ids(&upd), vec![5]);
+
+    // id 指定 DELETE: 自テナントの Private 行は不可視のため 0 行成功。
+    let del_one = expect_returning(
+        run(
+            &core,
+            &alice_public_only,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE id = 1 RETURNING * USING OPERATION_ID 'op-vis-del1'"
+            ),
+        )
+        .expect("single-row DELETE"),
+    );
+    assert_eq!(del_one.rows_affected, 0);
+    assert!(del_one.result.rows.is_empty());
+
+    let del = expect_returning(
+        run(
+            &core,
+            &alice_public_only,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-vis-del'"
+            ),
+        )
+        .expect("predicate DELETE"),
+    );
+    assert_eq!(del.rows_affected, 1);
+    assert_eq!(ids(&del), vec![5]);
+    // Private 行（id 1, 2）は UPDATE／DELETE の対象外で残る。
+    assert_eq!(count_star(&core, &alice_private, TABLE), 2);
+
+    // Public＋Private の可視集合では全行が対象で、影響行数と返却行数が一致する。
+    let upd_all = expect_returning(
+        run(
+            &core,
+            &alice_private,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'y' WHERE lang = 'ja' RETURNING id \
+                 USING OPERATION_ID 'op-vis-upd-all'"
+            ),
+        )
+        .expect("predicate UPDATE (all visible)"),
+    );
+    assert_eq!(upd_all.rows_affected, 2);
+    assert_eq!(upd_all.result.rows.len(), 2);
+    let del_all = expect_returning(
+        run(
+            &core,
+            &alice_private,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING id USING OPERATION_ID 'op-vis-del-all'"
+            ),
+        )
+        .expect("predicate DELETE (all visible)"),
+    );
+    assert_eq!(del_all.rows_affected, 2);
+    assert_eq!(del_all.result.rows.len(), 2);
+    assert_eq!(count_star(&core, &alice_private, TABLE), 0);
+}
+
+/// UPSERT の `rows_affected` は結果行の可視性と独立（現状の挙動の固定）: Public のみ
+/// 可視の `PolicyContext` でも新規挿入（Private 固定）の件数を返し、結果行は RLS 再判定で
+/// 除外される。新規行の返却挙動は Issue #1252（INSERT／UPSERT の RETURNING）で是正される
+/// ため、その際にこのテストを更新する。
+#[test]
+fn upsert_returning_rows_affected_is_independent_of_result_row_visibility() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice_public_only = ctx_for("alice", false);
+    let mut session = SessionState::default();
 
     let ups = expect_returning(
         run(
@@ -899,21 +993,6 @@ fn dml_returning_rows_affected_is_independent_of_result_row_visibility() {
     );
     assert_eq!(ups.rows_affected, 1);
     assert!(ups.result.rows.is_empty());
-
-    let del = expect_returning(
-        run(
-            &core,
-            &alice_public_only,
-            &mut session,
-            &format!(
-                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-vis-del'"
-            ),
-        )
-        .expect("predicate DELETE"),
-    );
-    assert_eq!(del.rows_affected, 3);
-    assert!(del.result.rows.is_empty());
-    assert_eq!(count_star(&core, &alice_private, TABLE), 0);
 }
 
 /// 内容照合ハッシュ（RECOVER-10・RECOVER-11）は `RETURNING` の有無に依存しない:

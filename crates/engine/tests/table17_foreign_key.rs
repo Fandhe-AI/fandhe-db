@@ -420,11 +420,16 @@ fn parent_rows_count_regardless_of_session_visibility() {
         &alice_public,
         "INSERT INTO children (id, parent_id) VALUES (1, 1) USING OPERATION_ID 'op-c'",
     );
-    // 逆に、参照元が Private でも参照先の削除は阻止される。
+    // 参照先（Private）を削除対象に選べるのは可視なセッションのみ（所有かつ可視。
+    // Issue #1253）。Public のみのセッションでは対象外（0 行）になるため、Private も
+    // 見えるセッションで削除し、Public な参照元が参照先の削除を阻止することを確かめる。
+    let alice_both =
+        PolicyContext::with_visibilities("alice", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
     assert_eq!(
         err_code(
             &core,
-            &alice_public,
+            &alice_both,
             "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-d'"
         ),
         "23503"

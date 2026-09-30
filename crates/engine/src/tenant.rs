@@ -3157,6 +3157,7 @@ pub(crate) fn delete_row_unchecked(
         id,
         ledger_write,
         DeleteNotFoundLedger::Discard,
+        DeleteScope::Owned,
         None,
     )?
     .0
@@ -3171,7 +3172,8 @@ pub(crate) fn delete_row_unchecked(
 pub(crate) enum DeleteRowOutcome {
     /// 対象行を削除した（テーブル世代も進行させた）。
     Deleted,
-    /// 対象行が不存在、または他テナント所有だった（`owns_existing == false`）。
+    /// 対象行が不存在・他テナント所有、または（SQL 経路のみ）所有だが不可視だった
+    /// （`owns_existing == false`。いずれも区別しない）。
     NotFound,
 }
 
@@ -3187,6 +3189,18 @@ enum DeleteNotFoundLedger {
     /// 台帳追記を commit する（テーブル世代は進行させない）。
     /// [`delete_row_ledgered_unchecked`]（SQL 表層専用）が使う。
     Record,
+}
+
+/// [`delete_row_impl`] の対象選定スコープ（Issue #1253）。SQL 表層
+/// （[`delete_row_ledgered_unchecked`] 系）は id 指定 UPDATE と同じ「所有かつ
+/// 可視」、Rust の行 API（[`delete_row_unchecked`]）は従来どおり「所有」のみ
+/// （`update_row` と同じ非対称。Rust API の契約は変えない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteScope {
+    /// 所有行のみを対象にする（可視性を問わない）。
+    Owned,
+    /// 所有かつ可視の行のみを対象にする。所有だが不可視の行は `NotFound`。
+    OwnedVisible,
 }
 
 /// `RETURNING` 句（Issue #873・#1182・SQL-21）向けに捕捉した行内容。`DELETE` は
@@ -3299,6 +3313,7 @@ struct DeleteCapture<'a> {
 /// この write トランザクション内でしか得られないため、投影自体を同じ
 /// トランザクション内・commit 前に実行する必要がある。`None`（既存呼び出し元）
 /// では一切呼ばずビット同一の挙動を保つ。
+#[allow(clippy::too_many_arguments)]
 fn delete_row_impl(
     target: WriteTarget<'_>,
     table: &str,
@@ -3306,6 +3321,7 @@ fn delete_row_impl(
     id: u64,
     ledger_write: LedgerWrite<'_>,
     not_found_ledger: DeleteNotFoundLedger,
+    scope: DeleteScope,
     mut capture: Option<DeleteCapture<'_>>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_identifier(table)?;
@@ -3369,9 +3385,13 @@ fn delete_row_impl(
             let key = (ctx.tenant_id(), id);
             let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
                 Some(guard) => {
-                    let (existing_tenant, _existing_visibility) =
+                    let (existing_tenant, existing_visibility) =
                         decode_row_tenant_and_visibility(guard.value())?;
-                    let owns = ctx.is_owner(existing_tenant);
+                    // `OwnedVisible` では所有だが不可視の行を対象外（`NotFound`）にし、
+                    // 本体（フルデコード）にも触れない（Issue #1253）。
+                    let owns = ctx.is_owner(existing_tenant)
+                        && (scope == DeleteScope::Owned
+                            || ctx.is_visible(existing_tenant, existing_visibility));
                     if owns && (capture.is_some() || needs_fk_removed_pre_image) {
                         // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
                         // （削除後では対象バイト列が失われるため）。物理行フォーマット
@@ -3522,6 +3542,10 @@ fn delete_row_impl(
 /// [`delete_row_unchecked`]（Rust API・`recover4_*` テストが固定する既存契約。
 /// `NotFound` は台帳を commit しない）とは意図的に別関数とし、その呼び出し元
 /// （`delete_row`・`EngineCore::delete_row`）の挙動は変更しない。
+///
+/// 対象選定は「所有かつ可視」（RLS-10・SQL-21。Issue #1253）: 所有だが不可視の行は
+/// 不存在・他テナント所有と同じ `NotFound`（台帳は commit）になる。Rust の行 API
+/// は従来どおり所有のみで判定する。
 pub(crate) fn delete_row_ledgered_unchecked(
     target: WriteTarget<'_>,
     table: &str,
@@ -3557,6 +3581,7 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
         id,
         ledger_write,
         DeleteNotFoundLedger::Record,
+        DeleteScope::OwnedVisible,
         capture.map(|schema| DeleteCapture { schema, project }),
     )
 }
@@ -3645,9 +3670,11 @@ pub(crate) struct DmlCandidate<'a> {
 }
 
 /// [`delete_rows_where_unchecked`]／[`update_rows_where_unchecked`] が共有する
-/// 候補行列挙本体。対象スコープはテナント**所有**（RLS 可視性フィルタではな
-/// く、単一行 DELETE・TRUNCATE と同じテナント所有スコープ——
-/// `docs/design/predicate-dml-exec.md`「削除・更新スコープ」参照）。
+/// 候補行列挙本体。対象スコープはテナント**所有かつ可視**（`is_owner &&
+/// is_visible`。RLS-10・SQL-21。SQL の id 指定 UPDATE／DELETE と同じ選定で、
+/// `RETURNING` の返却行数と影響行数を一致させる。Issue #1253・
+/// `docs/design/predicate-dml-exec.md` §4 参照）。不可視行は本体をデコード
+/// せず述語も評価しない。TRUNCATE・制約検査の母集合は所有行全体のまま別経路。
 ///
 /// 物理キーは `(tenant_id, id)`（TABLE-12）であり、redb のタプル `Key` 実装
 /// は第 1 要素（`tenant_id`）を主キーとして辞書順比較するため、同一テナント
@@ -3731,15 +3758,16 @@ fn enumerate_dml_candidates<E>(
         }
         let buf = v.value();
 
-        let (row_tenant, _visibility, offset) =
+        let (row_tenant, visibility, offset) =
             crate::storage::decode_row_header(buf).map_err(|e| dml_write_err(e))?;
         crate::storage::verify_row_key_tenant(key_tenant, row_tenant)
             .map_err(|e| dml_write_err(e))?;
-        // `range` の走査範囲を対象テナントの物理キー領域に限定した結果として
-        // 常に真になる不変条件を defense-in-depth で明示検査する（テナント
-        // **所有**スコープ。RLS 可視性フィルタではない。TRUNCATE・単一行
-        // DELETE と同じ判断。`docs/design/predicate-dml-exec.md` 参照）。
-        if !ctx.is_owner(row_tenant) {
+        // 所有の検査は物理キー領域の限定により常に真になる不変条件の
+        // defense-in-depth。可視性の検査（Issue #1253）は総走査上限の加算後・
+        // 本体デコードと述語評価の前に置く——上限の数え方は可視性で変えず
+        // （応答から可視性の分布を推測させない）、不可視行の本体は読まない
+        // （破損が `XX000` として観測される経路を作らない）。
+        if !ctx.is_owner(row_tenant) || !ctx.is_visible(row_tenant, visibility) {
             continue;
         }
 
@@ -5889,7 +5917,9 @@ mod tests {
         storage
             .create_table(&file_schema("docs"))
             .expect("create table");
-        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let a =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
 
         let seed_op = OperationId::parse("seed-pred-corrupt").expect("valid operation_id");
         insert_row(
@@ -5968,7 +5998,9 @@ mod tests {
         storage
             .create_table(&schema)
             .expect("create table without a VECTOR column");
-        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
 
         let write_txn = storage.begin_write_txn().expect("begin seed write txn");
         {
@@ -6145,7 +6177,9 @@ mod tests {
             ],
         );
         storage.create_table(&schema).expect("create table");
-        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
 
         // (schema 列 index): embedding=0, path=1, tag=2。各シナリオは専用の
         // id・既存 tag 値を持つ行に対して単独で適用する。
@@ -6672,8 +6706,8 @@ mod tests {
     // （RLS 不可視・未存在・他テナント所有）は内容に一切触れず `UPDATE 0` と
     // 区別できない——が REAL の NULL→値あり遷移でも成立することを固定する
     // （単一行 UPDATE・述語 UPDATE の双方。述語 UPDATE の候補列挙スコープは
-    // テナント所有のみ〔RLS 可視性フィルタではない〕ため他テナント行はそもそも
-    // 候補にならず、可視性差の検証は単一行 UPDATE 側でのみ行う）。
+    // 所有かつ可視（Issue #1253）の行のみ〔不可視行・他テナント行は
+    // 候補にならず内容に触れない〕のため、可視性差の検証は単一行 UPDATE 側で行う）。
     #[test]
     fn update_row_columns_nullable_real_null_to_value_transition_overflow_matches_visibility_parity(
     ) {
@@ -6798,7 +6832,7 @@ mod tests {
     }
 
     // 述語 UPDATE（`update_rows_where_unchecked`）版: 候補列挙スコープが
-    // テナント所有のみ（RLS 可視性フィルタではない。上記単体テストのコメント
+    // テナント所有かつ可視（Issue #1253）の行のみ（上記単体テストのコメント
     // 参照）であるため、他テナント所有行はそもそも候補にならず存在情報が
     // 漏れる余地がない。本テストは、対象行が候補に含まれる場合の overflow
     // エラーと、対象行が候補に含まれない場合（未存在 id）の `rows_affected: 0`
@@ -6818,7 +6852,9 @@ mod tests {
         );
         storage.create_table(&schema).expect("create table");
 
-        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
         let text_len = crate::row_codec::MAX_SCALAR_PAYLOAD_LEN - 8;
         let large_body = "b".repeat(text_len as usize);
         insert_typed_row(

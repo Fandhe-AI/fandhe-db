@@ -328,7 +328,7 @@ pub struct TruncateOutcome {}
 /// security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）。
 ///
 /// 述語形（SQL-19・TASK-192、Issue #871。[`execute_predicate_delete`]）では
-/// `rows_affected` は一致した自テナント所有行の件数をそのまま表す（同じく
+/// `rows_affected` は一致した自テナント所有かつ可視の行の件数をそのまま表す（同じく
 /// 他テナント行・不可視行は候補にすら含まれない）。呼び出し元
 /// `core.rs::EngineCore::dml_limits.max_affected_rows`（`Option<NonZeroUsize>`。
 /// Issue #997 オーナー判断の改訂〔2026-09-27〕で既定 `None`＝上限なしへ変更）が
@@ -373,7 +373,7 @@ pub struct ReturningOutcome {
 /// `Ok(UpdateOutcome { rows_affected: 0 })` を返す（区別しない。
 /// `tenant::update_row_columns_unchecked` ドキュメント参照）。
 ///
-/// 述語形: `rows_affected` は一致した自テナント所有行の件数をそのまま表す
+/// 述語形: `rows_affected` は一致した自テナント所有かつ可視の行の件数をそのまま表す
 /// （他テナント行・不可視行は候補にすら含まれない。[`DeleteOutcome`] の
 /// 述語形と同じ意味論。`EngineCore::dml_limits.max_affected_rows` の
 /// `Some`/`None` に応じた範囲・資源上限の扱いも同じ）。
@@ -3552,7 +3552,8 @@ pub(crate) fn execute_truncate_in(
 /// [`execute_truncate`] と同じ設計）。
 ///
 /// **0 行成功への写像（RLS-9・RLS-10）**: `delete_row_ledgered_unchecked` は
-/// 「対象行が不存在」と「対象行が存在するが他テナント所有」を区別せず
+/// 「対象行が不存在」と「対象行が存在するが他テナント所有または自テナント所有だが
+/// 不可視（Issue #1253）」を区別せず
 /// [`crate::tenant::DeleteRowOutcome::NotFound`] を返す契約（`tenant.rs`
 /// ドキュメント参照）。本関数はこれを `Ok(DeleteOutcome { rows_affected: 0 })`
 /// へ写像する。他テナント保持 id・未存在 id のいずれでも成否・件数・
