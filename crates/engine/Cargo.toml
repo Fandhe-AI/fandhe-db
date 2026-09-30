@@ -242,6 +242,18 @@ harness = false
 test = false
 
 [[bench]]
+# Issue #1204（ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-24・SQL-25・SQL-28）の
+# 実測入口。WHERE の OR／IN 述語・スカラー ORDER BY・2 テーブル結合の p95 を、
+# `docs/design/benchmark-judgement-policy.md` に沿って（N≥5 ラウンド・arm 輪番・min-of-N と
+# median 併記）計測する。共有環境では spec 閾値の確定判定をしない情報提供専用ベンチのため
+# `.github/workflows/*` へは配線しない。harness = false / test = false は上記ベンチと同一方針。
+# `make bench-relational-p95`（Makefile）から実行する。判定ロジック自体（時間非依存）は
+# harness/relational_p95.rs にあり tests/relational_p95_accept.rs で make ci 側から回帰検証する。
+name = "relational_p95_bench"
+harness = false
+test = false
+
+[[bench]]
 # Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。
 # ポインタ: `docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3）の実測入口。
 # `EngineCore::execute_sql` 経由の hybrid_rrf/dense KNN 対照・本文 String 収集・

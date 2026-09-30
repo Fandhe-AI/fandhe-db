@@ -1,0 +1,446 @@
+//! 述語（`OR`／`IN`）・スカラー `ORDER BY`・2 テーブル結合の p95 計測向けの時間非依存ロジック
+//! （Issue #1204。ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-24・SQL-25・SQL-28、
+//! RLS-10）。
+//!
+//! `relational_p95_bench.rs`（実測本体・時間依存）と `tests/relational_p95_accept.rs`
+//! （`make ci` 対象の回帰）の 2 コンパイル単位から `#[path]` で取り込まれる。実測タイマー
+//! （`std::time::Instant`）には依存せず、env のパース・SQL 文の組み立て・fixture 値の生成・
+//! ラウンド統計・出力行の整形だけを純関数として置く（`scan_stage_profile.rs` と同じ分離方針）。
+//!
+//! 計測プロトコルは `docs/design/benchmark-judgement-policy.md`（N≥5 ラウンド・arm 輪番・
+//! min-of-N と median の併記・共有環境では spec 閾値の確定判定をしない）に従う。
+//! SQL 文は定数と検証済みトークンのみから組み立て、未検証文字列を連結しない
+//! （`.claude/rules/coding-rust.md`）。出力にテナント ID・行の値・SQL 全文は含めない。
+//!
+//! `std` と兄弟 harness（`sql_c1`・`accept`）のみに依存する。
+//!
+//! # 暗号用途禁止
+//!
+//! 値生成に使う [`mix64`] は非暗号のハッシュであり、ベンチ入力の擬似ランダム化専用。
+
+use std::fmt;
+use std::time::Duration;
+
+use super::accept::p95_from_samples;
+use super::sql_c1::VectorLiteral;
+
+/// ラウンド数の下限・上限・既定（policy §3 の N≥5）。
+pub const MIN_ROUNDS: u32 = 5;
+pub const MAX_ROUNDS: u32 = 50;
+pub const DEFAULT_ROUNDS: u32 = 5;
+
+/// 行数 env の範囲。上限は spec 規模（既定）と同値で、縮小（スモーク）のみ許す。
+pub const MIN_ROWS: usize = 1_000;
+pub const MAX_ROWS: usize = 100_000;
+pub const DEFAULT_ROWS: usize = 100_000;
+
+/// 結合 fixture の各テーブルの行数（SQL-28 の計測規模に合わせる）。
+pub const JOIN_ROWS: usize = 10_000;
+
+/// `lang` 列のカーディナリティ。選択率は `pred_eq`≈1/16・`pred_or2`≈2/16・`pred_in8`≈8/16。
+pub const LANG_CARDINALITY: u64 = 16;
+
+/// 各文の `LIMIT`（`MAX_SEARCH_K` 以内）。
+pub const PRED_LIMIT: usize = 10;
+pub const WIDE_LIMIT: usize = 100;
+
+/// 参照 arm のラベル（述語グループの比率の分母）。
+pub const REFERENCE_ARM: &str = "pred_eq";
+
+/// 本モジュールのエラー型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationalP95Error {
+    InvalidRounds(String),
+    InvalidGroup(String),
+    InvalidRows(String),
+    EmptySamples,
+    DegenerateRatio(&'static str),
+    InvalidIdentifier(&'static str),
+    RefusedUnderGithubActions,
+}
+
+impl fmt::Display for RelationalP95Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRounds(r) => write!(f, "invalid BENCH_RELATIONAL_P95_ROUNDS: {r}"),
+            Self::InvalidGroup(r) => write!(f, "invalid BENCH_RELATIONAL_P95_GROUP: {r}"),
+            Self::InvalidRows(r) => write!(f, "invalid BENCH_RELATIONAL_P95_ROWS: {r}"),
+            Self::EmptySamples => write!(f, "empty sample set"),
+            Self::DegenerateRatio(r) => write!(f, "degenerate ratio: {r}"),
+            Self::InvalidIdentifier(field) => write!(f, "{field} is not a valid identifier"),
+            Self::RefusedUnderGithubActions => write!(
+                f,
+                "relational_p95_bench refuses to run under GitHub Actions (GITHUB_ACTIONS is set); this bench is manual-only and not wired into any workflow"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelationalP95Error {}
+
+/// `GITHUB_ACTIONS` 下での実行を拒否する（実測値を public ログへ出さないため）。
+pub fn refuse_under_github_actions(under_github_actions: bool) -> Result<(), RelationalP95Error> {
+    if under_github_actions {
+        return Err(RelationalP95Error::RefusedUnderGithubActions);
+    }
+    Ok(())
+}
+
+/// `BENCH_RELATIONAL_P95_ROUNDS` を fail-closed にパースする（空・未設定は既定）。
+pub fn parse_rounds(raw: Option<&str>) -> Result<u32, RelationalP95Error> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_ROUNDS);
+    };
+    let value: u32 = trimmed
+        .parse()
+        .map_err(|_| RelationalP95Error::InvalidRounds(format!("not an integer: {trimmed:?}")))?;
+    if !(MIN_ROUNDS..=MAX_ROUNDS).contains(&value) {
+        return Err(RelationalP95Error::InvalidRounds(format!(
+            "must be in {MIN_ROUNDS}..={MAX_ROUNDS}, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// 計測グループ（1 プロセス 1 グループで回せるようにする。policy §5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Predicate,
+    OrderBy,
+    Join,
+    All,
+}
+
+impl Group {
+    /// このグループが `other`（単一グループ）を含むか。
+    pub fn includes(self, other: Group) -> bool {
+        self == Group::All || self == other
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::Predicate => "predicate",
+            Group::OrderBy => "order_by",
+            Group::Join => "join",
+            Group::All => "all",
+        }
+    }
+}
+
+/// `BENCH_RELATIONAL_P95_GROUP` を完全一致でパースする（空・未設定は `all`）。
+pub fn parse_group(raw: Option<&str>) -> Result<Group, RelationalP95Error> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Group::All);
+    };
+    match trimmed {
+        "predicate" => Ok(Group::Predicate),
+        "order_by" => Ok(Group::OrderBy),
+        "join" => Ok(Group::Join),
+        "all" => Ok(Group::All),
+        other => Err(RelationalP95Error::InvalidGroup(format!(
+            "expected predicate|order_by|join|all, got {other:?}"
+        ))),
+    }
+}
+
+/// `BENCH_RELATIONAL_P95_ROWS` を fail-closed にパースする。縮小のみ許し、
+/// 縮小 run は出力で `scale=reduced` と自己ラベルされ記録には使わない。
+pub fn parse_rows_scale(raw: Option<&str>) -> Result<usize, RelationalP95Error> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_ROWS);
+    };
+    let value: usize = trimmed
+        .parse()
+        .map_err(|_| RelationalP95Error::InvalidRows(format!("not an integer: {trimmed:?}")))?;
+    if !(MIN_ROWS..=MAX_ROWS).contains(&value) {
+        return Err(RelationalP95Error::InvalidRows(format!(
+            "must be in {MIN_ROWS}..={MAX_ROWS}, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// 行数が既定規模かを表すラベル（`full` / `reduced`）。
+pub fn scale_label(rows: usize) -> &'static str {
+    if rows == DEFAULT_ROWS {
+        "full"
+    } else {
+        "reduced"
+    }
+}
+
+/// 他テナント（越境検査用）の Private 行数。
+pub fn other_tenant_rows(rows: usize) -> usize {
+    (rows / 50).max(100)
+}
+
+// --- SQL 文の組み立て ---
+
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `[A-Za-z0-9_]+`（単一引用符・空白・記号を含められない）。
+pub fn is_valid_value_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// テーブル名・列名の識別子検証。
+pub fn check_identifier(field: &'static str, name: &str) -> Result<(), RelationalP95Error> {
+    if is_valid_identifier(name) {
+        Ok(())
+    } else {
+        Err(RelationalP95Error::InvalidIdentifier(field))
+    }
+}
+
+/// 述語グループの arm ラベルと文（先頭が参照 arm）。
+pub fn predicate_statements(
+    table: &str,
+    literal: &VectorLiteral,
+) -> Result<Vec<(&'static str, String)>, RelationalP95Error> {
+    check_identifier("table", table)?;
+    let tail = format!("ORDER BY embedding <=> '{literal}' LIMIT {PRED_LIMIT}");
+    let in_list = (0..8)
+        .map(|i| format!("'{}'", lang_token(i)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(vec![
+        (
+            REFERENCE_ARM,
+            format!(
+                "SELECT id FROM {table} WHERE lang = '{}' {tail}",
+                lang_token(0)
+            ),
+        ),
+        (
+            "pred_or2",
+            format!(
+                "SELECT id FROM {table} WHERE lang = '{}' OR lang = '{}' {tail}",
+                lang_token(0),
+                lang_token(1)
+            ),
+        ),
+        (
+            "pred_in8",
+            format!("SELECT id FROM {table} WHERE lang IN ({in_list}) {tail}"),
+        ),
+    ])
+}
+
+/// 順序グループの arm ラベルと文。
+pub fn order_by_statements(table: &str) -> Result<Vec<(&'static str, String)>, RelationalP95Error> {
+    check_identifier("table", table)?;
+    Ok(vec![
+        (
+            "order_single",
+            format!("SELECT id, qty FROM {table} ORDER BY qty LIMIT {WIDE_LIMIT}"),
+        ),
+        (
+            "order_multi",
+            format!(
+                "SELECT id, lang, qty FROM {table} ORDER BY lang ASC, qty DESC LIMIT {WIDE_LIMIT}"
+            ),
+        ),
+    ])
+}
+
+/// 結合グループの文（2 テーブル等価結合。`LIMIT` 必須）。
+pub fn join_statement(
+    left: &str,
+    right: &str,
+) -> Result<(&'static str, String), RelationalP95Error> {
+    check_identifier("left", left)?;
+    check_identifier("right", right)?;
+    Ok((
+        "join_inner",
+        format!(
+            "SELECT {left}.title, {right}.name FROM {left} JOIN {right} ON {left}.author_id = {right}.id LIMIT {WIDE_LIMIT}"
+        ),
+    ))
+}
+
+// --- fixture の決定的な値生成 ---
+
+/// 非暗号の 64bit 混合（splitmix64 の finalizer）。`qty` を id 順と相関させないためだけに使う。
+pub fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// `l0`..`l15` の語彙。
+pub fn lang_token(index: u64) -> &'static str {
+    const LANGS: [&str; 16] = [
+        "l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10", "l11", "l12", "l13",
+        "l14", "l15",
+    ];
+    LANGS
+        .get((index % LANG_CARDINALITY) as usize)
+        .copied()
+        .unwrap_or("l0")
+}
+
+/// 行 id に対する `lang` 値（`id % 16`）。
+pub fn lang_for_id(id: u64) -> &'static str {
+    lang_token(id % LANG_CARDINALITY)
+}
+
+/// 行 id に対する `qty` 値（id 順と無相関・0..1_000_000）。
+pub fn qty_for_id(id: u64) -> i64 {
+    (mix64(id) % 1_000_000) as i64
+}
+
+/// 文書 id に対する結合キー（右表 id の範囲に全件が一致する）。
+pub fn author_id_for_doc(id: u64, authors_rows: u64) -> i64 {
+    (id % authors_rows.max(1)) as i64
+}
+
+/// `lang` が `pred_*` arm の期待集合（`l0`..`l{n-1}`）に属するか。
+pub fn lang_in_first_n(lang: &str, n: u64) -> bool {
+    (0..n).any(|i| lang_token(i) == lang)
+}
+
+/// 列が非減少か（`descending` なら非増加）。
+pub fn is_sorted_by_direction(values: &[i64], descending: bool) -> bool {
+    values.windows(2).all(|w| match w {
+        [a, b] => {
+            if descending {
+                a >= b
+            } else {
+                a <= b
+            }
+        }
+        _ => true,
+    })
+}
+
+// --- 統計 ---
+
+/// 1 arm の全ラウンド要約。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundSummary {
+    pub min: Duration,
+    pub median: Duration,
+    pub max: Duration,
+    /// `(max - min) / min` を百分率で表したラン間の幅。
+    pub run_to_run_band_pct: f64,
+}
+
+/// ラウンドごとの p95 列から min-of-N・median・max・ラン間幅を求める。
+pub fn summarize_rounds(per_round_p95: &[Duration]) -> Result<RoundSummary, RelationalP95Error> {
+    let min = per_round_p95
+        .iter()
+        .copied()
+        .min()
+        .ok_or(RelationalP95Error::EmptySamples)?;
+    let max = per_round_p95
+        .iter()
+        .copied()
+        .max()
+        .ok_or(RelationalP95Error::EmptySamples)?;
+    if min.is_zero() {
+        return Err(RelationalP95Error::DegenerateRatio(
+            "min of round p95 is zero",
+        ));
+    }
+    let mut sorted = per_round_p95.to_vec();
+    sorted.sort();
+    let mid = sorted.len() / 2;
+    let median = if sorted.len().is_multiple_of(2) {
+        match (sorted.get(mid.wrapping_sub(1)), sorted.get(mid)) {
+            (Some(a), Some(b)) => (*a + *b) / 2,
+            _ => return Err(RelationalP95Error::EmptySamples),
+        }
+    } else {
+        sorted
+            .get(mid)
+            .copied()
+            .ok_or(RelationalP95Error::EmptySamples)?
+    };
+    let band = (max.as_secs_f64() - min.as_secs_f64()) / min.as_secs_f64() * 100.0;
+    Ok(RoundSummary {
+        min,
+        median,
+        max,
+        run_to_run_band_pct: band,
+    })
+}
+
+/// 1 ラウンド分の生サンプルから p95 を取る（`accept::p95_from_samples` の委譲）。
+pub fn round_p95(samples: &[Duration]) -> Result<Duration, RelationalP95Error> {
+    p95_from_samples(samples).map_err(|_| RelationalP95Error::EmptySamples)
+}
+
+/// arm の min-of-N と参照 arm の min-of-N の比。分母 0 は拒否。
+pub fn ratio_vs_reference(arm_min: Duration, ref_min: Duration) -> Result<f64, RelationalP95Error> {
+    if ref_min.is_zero() {
+        return Err(RelationalP95Error::DegenerateRatio("reference min is zero"));
+    }
+    Ok(arm_min.as_secs_f64() / ref_min.as_secs_f64())
+}
+
+/// ラウンドごとに開始位置をずらした arm の実行順（輪番。policy §3）。
+pub fn rotate_arms(round_index: usize, n_arms: usize) -> Vec<usize> {
+    if n_arms == 0 {
+        return Vec::new();
+    }
+    (0..n_arms).map(|i| (i + round_index) % n_arms).collect()
+}
+
+// --- 出力行（英語。テナント ID・行値・SQL 全文は含めない） ---
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+pub fn render_round_line(
+    group: &str,
+    arm: &str,
+    round: usize,
+    p95: Duration,
+    median: Duration,
+    loadavg: &str,
+) -> String {
+    format!(
+        "relational_p95: group={group} arm={arm} round={round} p95={:.3}ms median={:.3}ms loadavg={loadavg}",
+        ms(p95),
+        ms(median)
+    )
+}
+
+pub fn render_summary_line(
+    group: &str,
+    arm: &str,
+    rows: usize,
+    scale: &str,
+    summary: &RoundSummary,
+    ratio: Option<f64>,
+) -> String {
+    let ratio_part = match ratio {
+        Some(r) => format!(" ratio_vs_{REFERENCE_ARM}={r:.3}"),
+        None => String::new(),
+    };
+    format!(
+        "relational_p95: group={group} arm={arm} rows={rows} scale={} min_of_n={:.3}ms median={:.3}ms max={:.3}ms run_to_run_band={:.1}%{ratio_part}",
+        scale,
+        ms(summary.min),
+        ms(summary.median),
+        ms(summary.max),
+        summary.run_to_run_band_pct
+    )
+}
+
+pub fn render_threshold_line(dedicated: bool) -> String {
+    if dedicated {
+        "threshold_judgement: dedicated environment attested; compare min_of_n against the spec criteria manually".to_string()
+    } else {
+        "threshold_judgement: not evaluated (shared environment; reference values only)".to_string()
+    }
+}
