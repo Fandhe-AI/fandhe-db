@@ -170,8 +170,9 @@ pub mod generation_key;
 pub mod group_by;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
-/// `INNER JOIN`（2 テーブル等価結合）の束縛・実行本体（SQL-28・RLS-10、
-/// TASK-212、Issue #925）。`sql::allowlist::ValidatedJoin` を受け取り、
+/// `[INNER|LEFT|RIGHT|FULL] JOIN`（等価結合の left-deep 連鎖・集計形・スカラー
+/// `ORDER BY`）の束縛・実行本体（SQL-28・RLS-10、TASK-212、Issue #925・#926・
+/// #1190）。`sql::allowlist::ValidatedJoin` を受け取り、
 /// `core.rs::EngineCore` の SQL 実行経路から呼ばれる（`sql::set_op` と同じ
 /// 構成）。
 pub(crate) mod join;
@@ -425,4 +426,16 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #908）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropIndex(ddl::DropIndexOutcome),
+    /// `CREATE TYPE <name> AS ENUM (...)`（TABLE-14・SQL-23・TASK-198、
+    /// Issue #1194）がセッション経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1194）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    CreateType(ddl::CreateTypeOutcome),
+    /// `DROP TYPE <name>`（TABLE-14・SQL-23・TASK-198、Issue #1194）が
+    /// セッション経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1194）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    DropType(ddl::DropTypeOutcome),
 }
