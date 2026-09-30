@@ -95,7 +95,7 @@ v11 の上位集合。`uniq:`／`checks:` セクションは 0 件を許し（�
 | 子テーブルが無い／ビュー・索引名 | `TableNotFound`／`WrongObjectKind` | `42P01`／`42809`（子） |
 | 親テーブルが無い／ビュー・索引名 | `TableNotFound`／`WrongObjectKind` | `42P01`／`42809`（**親**の名前で報告） |
 | 参照先が一意キーと一致しない・型不一致 | `InvalidForeignKey` | `42830` |
-| **制約名の衝突**（UNIQUE・CHECK・FOREIGN KEY のいずれかと同名） | `ConstraintAlreadyExists` | `42P07` |
+| **制約名の衝突**（UNIQUE・CHECK・FOREIGN KEY のいずれかと同名） | `ConstraintAlreadyExists` | `42710`（Issue #1195。UNIQUE 追加側は `42P07`） |
 | テーブルあたり FK 数の上限（`MAX_FOREIGN_KEYS_PER_TABLE`）を超過 | `ConstraintLimitExceeded` | `54000` |
 | **既存行が新しい FK を満たさない**（全テナント検証） | `ForeignKeyViolation`（新設） | `23503` |
 | DROP する名前が存在しない | `ConstraintNotFound` | `42704` |
@@ -123,7 +123,7 @@ foreign key constraint` 相当）でテナント・値・行・表名を含ま�
 
 構文検証 → `require_ddl_permission`（`42501`）→ 子テーブルの存在確認
 （`TableNotFound`）→ write txn 内で: スキーマ再取得 → 明示名の衝突
-（UNIQUE∪CHECK∪FK。`42P07`）→ FK 件数上限（`54000`）→ 参照先の解決
+（UNIQUE∪CHECK∪FK。`42710`）→ FK 件数上限（`54000`）→ 参照先の解決
 （ビュー・索引なら `WrongObjectKind`、不在なら `TableNotFound`。自己参照は
 **変更前**の子スキーマ自身を親として解決する——親の列・主キー・UNIQUE 制約は
 今回の FK 追加で変わらないため）→ `resolve_foreign_key_target` の照合

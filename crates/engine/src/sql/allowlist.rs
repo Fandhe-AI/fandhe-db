@@ -507,6 +507,10 @@ pub enum SqlSurfaceError {
     /// 衝突した場合も同じ分類を共有する（ビューはテーブルと名前空間を共有する）。
     /// ERR-6: `42P07`。
     DuplicateTable { name: String },
+    /// `ALTER TABLE ... ADD [CONSTRAINT <name>] {CHECK|FOREIGN KEY}` の明示名が
+    /// 同一テーブルの既存制約名と衝突した（TABLE-22、Issue #1195）。
+    /// ERR-6: `42710`。UNIQUE の名前衝突は `DuplicateTable`（`42P07`）のまま。
+    DuplicateObject { name: String },
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
     DuplicateColumn { name: String },
@@ -662,6 +666,15 @@ impl SqlSurfaceError {
     /// テーブル名は untrusted な字句解析結果のため長さを切り詰める。
     pub(crate) fn duplicate_table(name: impl Into<String>) -> Self {
         SqlSurfaceError::DuplicateTable {
+            name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::ddl` の `ALTER TABLE ... ADD CONSTRAINT`（CHECK・
+    /// FOREIGN KEY。Issue #1195）が `catalog::CatalogError::ConstraintAlreadyExists`
+    /// を写像するために使う。名前は untrusted な字句解析結果のため切り詰める。
+    pub(crate) fn duplicate_object(name: impl Into<String>) -> Self {
+        SqlSurfaceError::DuplicateObject {
             name: truncate_for_error(&name.into()),
         }
     }
@@ -851,6 +864,7 @@ impl ClassifiedError for SqlSurfaceError {
             }
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
+            SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
@@ -956,6 +970,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // 双方の名前衝突を共有する分類のため "relation" と汎称する。
             SqlSurfaceError::DuplicateTable { name } => {
                 write!(f, "relation already exists: {name}")
+            }
+            // 制約名はクライアント自身が指定した識別子。テーブル名・テナントは含めない。
+            SqlSurfaceError::DuplicateObject { name } => {
+                write!(f, "constraint already exists: {name}")
             }
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
