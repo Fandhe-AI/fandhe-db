@@ -713,14 +713,168 @@ fn create_table_unknown_type_and_invalid_vector_shape_are_42601() {
     }
 }
 
+// --- CHECK 制約（Issue #1199・NOSQL-13・TABLE-16。SQL 表層と同じ engine の
+// 検査点が違反を `23514`／HTTP 409 で拒否することを固定する） -------------
+
+const CHECK_TABLE_BODY: &str = r#"{"op":"create_table","table":"items","columns":[
+    {"name":"qty","type":"integer"},
+    {"name":"kind","type":"text"}
+],"constraints":[
+    {"kind":"check","name":"qty_positive","predicate":[{"column":"qty","op":"gt","value":0}]},
+    {"kind":"check","predicate":[{"column":"kind","op":"prefix","value":"a"}]}
+]}"#;
+
+fn create_check_table(session: &Session) {
+    let resp = query(session, CHECK_TABLE_BODY.as_bytes());
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    assert_eq!(String::from_utf8_lossy(&resp.body).trim(), r#"{"ok":true}"#);
+}
+
 #[test]
-fn create_table_check_constraint_is_0a000() {
+fn create_table_check_constraint_rejects_violating_insert_with_23514() {
     let (core, _guard) = new_core();
     let session = ddl_session(core);
-    let body = br#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"integer"}],
-        "constraints":[{"kind":"check","columns":["a"]}]}"#;
+    create_check_table(&session);
+
+    let ok = br#"{"op":"insert","table":"items","rows":[{"id":1,"qty":5,"kind":"apple"}],"operation_id":"chk-ok"}"#;
+    assert_eq!(query(&session, ok).status, 200);
+
+    let bad_qty = br#"{"op":"insert","table":"items","rows":[{"id":2,"qty":0,"kind":"apple"}],"operation_id":"chk-bad-qty"}"#;
+    let resp = query(&session, bad_qty);
+    assert_eq!(resp.status, 409, "got: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23514", "got: {resp:?}");
+
+    let bad_kind = br#"{"op":"insert","table":"items","rows":[{"id":3,"qty":1,"kind":"banana"}],"operation_id":"chk-bad-kind"}"#;
+    let resp = query(&session, bad_kind);
+    assert_eq!(resp.status, 409, "got: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23514", "got: {resp:?}");
+
+    // 違反した書き込みは副作用ゼロ（行が増えていない）。
+    let scan = br#"{"op":"scan","table":"items","limit":10}"#;
+    assert_eq!(scan_row_count(&query(&session, scan)), 1);
+}
+
+#[test]
+fn create_table_check_constraint_rejects_violating_update_with_23514() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    create_check_table(&session);
+
+    let ok = br#"{"op":"insert","table":"items","rows":[{"id":1,"qty":5,"kind":"apple"}],"operation_id":"chk-upd-ok"}"#;
+    assert_eq!(query(&session, ok).status, 200);
+
+    let update = br#"{"op":"update","table":"items","set":{"qty":-1},"where":{"id":1},"operation_id":"chk-upd-bad"}"#;
+    let resp = query(&session, update);
+    assert_eq!(resp.status, 409, "got: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23514", "got: {resp:?}");
+}
+
+#[test]
+fn create_table_unnamed_checks_get_distinct_default_names() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let body = br#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"integer"}],
+        "constraints":[
+          {"kind":"check","predicate":[{"column":"a","op":"gt","value":0}]},
+          {"kind":"check","predicate":[{"column":"a","op":"lt","value":100}]}
+        ]}"#;
     let resp = query(&session, body);
-    assert_eq!(http_common::wire_code_of(&resp), "0A000", "got: {resp:?}");
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+}
+
+#[test]
+fn create_table_duplicate_explicit_check_name_is_42601() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let body = br#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"integer"}],
+        "constraints":[
+          {"kind":"check","name":"dup","predicate":[{"column":"a","op":"gt","value":0}]},
+          {"kind":"check","name":"dup","predicate":[{"column":"a","op":"lt","value":100}]}
+        ]}"#;
+    let resp = query(&session, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42601", "got: {resp:?}");
+}
+
+#[test]
+fn create_table_check_constraint_malformed_forms_are_42601() {
+    let cases: &[(&str, &str)] = &[
+        ("columns mixed in", r#"{"kind":"check","columns":["a"]}"#),
+        (
+            "references mixed in",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"gt","value":0}],"references":{"table":"x"}}"#,
+        ),
+        ("missing predicate", r#"{"kind":"check"}"#),
+        ("empty predicate", r#"{"kind":"check","predicate":[]}"#),
+        (
+            "in op",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"in","value":[1,2]}]}"#,
+        ),
+        (
+            "or group",
+            r#"{"kind":"check","predicate":[{"or":[{"column":"a","op":"gt","value":0}]}]}"#,
+        ),
+        (
+            "unknown op",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"GT","value":0}]}"#,
+        ),
+        (
+            "rls predicate name",
+            r#"{"kind":"check","predicate":[{"column":"visible","op":"eq","value":true}]}"#,
+        ),
+        (
+            "negative number",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"gt","value":-1}]}"#,
+        ),
+        (
+            "exponent number",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"gt","value":1e3}]}"#,
+        ),
+        (
+            "bool with range op",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"gt","value":true}]}"#,
+        ),
+        (
+            "prefix with number",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"prefix","value":1}]}"#,
+        ),
+        (
+            "name on unique",
+            r#"{"kind":"unique","columns":["a"],"name":"u"}"#,
+        ),
+    ];
+    for (label, constraint) in cases {
+        let (core, _guard) = new_core();
+        let session = ddl_session(core);
+        let body = format!(
+            r#"{{"op":"create_table","table":"t","columns":[{{"name":"a","type":"integer"}}],"constraints":[{constraint}]}}"#
+        );
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "case {label}: got {resp:?}"
+        );
+    }
+}
+
+#[test]
+fn create_table_check_constraint_leaf_count_over_limit_is_54000() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let leaves = vec![r#"{"column":"a","op":"gt","value":0}"#; 257].join(",");
+    let body = format!(
+        r#"{{"op":"create_table","table":"t","columns":[{{"name":"a","type":"integer"}}],"constraints":[{{"kind":"check","predicate":[{leaves}]}}]}}"#
+    );
+    let resp = query(&session, body.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "54000", "got: {resp:?}");
+}
+
+#[test]
+fn create_table_check_constraint_without_ddl_permission_is_42501() {
+    let (core, _guard) = new_core();
+    let session = non_ddl_session(core);
+    let resp = query(&session, CHECK_TABLE_BODY.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "42501", "got: {resp:?}");
 }
 
 #[test]

@@ -43,12 +43,24 @@
 //! エラー写像は engine 側に一本化され、NoSQL 側に第 2 の判定を持たない。
 //! `ALTER COLUMN TYPE` 相当の op は未提供（別論点）。
 //!
-//! ## 未実装形（fail-closed。成功を偽装しない）
+//! ## `create_table.constraints[].kind == "check"`（Issue #1199）
 //!
-//! - `create_table.constraints[].kind == "check"`: 述語の JSON 写像が別論点
-//!   のため、常に [`CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`]（`0A000`）を返す。
+//! `{"kind":"check","name":"<任意>","predicate":[<filter 葉形>, ...]}` を
+//! 表制約 `[CONSTRAINT <name>] CHECK (<葉> AND <葉> ...)` のトークン列へ写像し、
+//! SQL 表層の CHECK（TABLE-16・TASK-204）と同じ `validate_create_table_tokens`
+//! → `run_ddl` へ合流させる。意味検証（列型との整合・既定名の確定・件数上限）と
+//! 書き込み時の検査（違反は `23514`）は engine 側の単一の実装が担い、wire 側に
+//! 型検査・評価器を持たない。
 //!
-//! いずれも engine を一切呼ばず副作用ゼロで拒否する。
+//! - `predicate` の葉は `CHECK_LEAF_SCHEMA` 形（`column`／`op`／`value`）で、
+//!   `op` は `eq`／`prefix`／`lt`／`le`(`lte`)／`gt`／`ge`(`gte`) のみ。`in`・`or`
+//!   グループは engine も CHECK 内で拒否するため wire で先に `42601` とする。
+//! - CREATE TABLE 時点ではスキーマが無いため、値トークンの種類は JSON 値の型で
+//!   決める（`prefix` は `LIKE '<escaped>%'`、真偽値は `eq` のみ）。
+//! - 表制約としてのみ生成するため既定名は `<table>_check` 系となる（SQL の列制約
+//!   形の `<table>_<col>_check` とは既定名だけが異なる。意図した差分）。
+//! - `kind` と矛盾するフィールド（check への `columns`／`references`、他 kind への
+//!   `name`）は黙って無視せず `42601` で拒否する（fail-closed）。
 //!
 //! ## untrusted 入力の取り扱い
 //! - 識別子（テーブル名・列名・制約参照列・参照先テーブル・ENUM 型名）は
@@ -76,20 +88,22 @@ use engine::sql::allowlist::{
     validate_alter_table_tokens, validate_create_table_tokens, validate_drop_table_tokens,
     SqlSurfaceError,
 };
-use engine::sql::lexer::{tokenize, Token};
+use engine::sql::lexer::{tokenize, Keyword, Token};
 use engine::sql::mode::SessionState;
 
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
+use super::filter::{is_rls_predicate_column, like_escape};
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{
-    SchemaError, Validated, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA, DDL_CONSTRAINT_SCHEMA,
-    DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
+    SchemaError, Validated, CHECK_LEAF_SCHEMA, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA,
+    DDL_CONSTRAINT_SCHEMA, DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
 };
 
-/// `create_table.constraints[].kind == "check"` の固定応答文言（述語の JSON
-/// 写像は別論点。モジュール doc 参照）。
+/// 旧 `create_table` の CHECK 未実装応答文言。Issue #1199 で CHECK を実装した
+/// ため、本クレート内では使用しない（公開 API 互換のため残置）。
+#[deprecated(note = "CHECK constraints are supported via the NoSQL DDL surface (Issue #1199)")]
 pub const CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE: &str =
     "CHECK constraints are not available via the NoSQL DDL surface yet";
 
@@ -111,7 +125,7 @@ pub enum DdlError {
     /// （`bool`／`null`／配列／オブジェクト）・`references.on_delete`／
     /// `on_update` の語彙外の値〔Issue #1148〕等）。
     InvalidRequest,
-    /// 未実装形（[`CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE`]）。
+    /// 未実装形のための予約変種（現状、構築箇所なし。公開 API 互換のため残置）。
     FeatureNotSupported(&'static str),
     /// `engine::sql::allowlist::validate_*_tokens`／
     /// `EngineCore::execute_parsed_in_session` のエラー（DDL 実行権限不足
@@ -368,8 +382,101 @@ fn referential_action_tokens(raw: &str) -> Result<Vec<Token>, DdlError> {
     }
 }
 
+/// CHECK 述語の比較演算子（`=`／`<`／`<=`／`>`／`>=`）の固定語彙写像。
+/// `prefix`・`in` は本関数の対象外（呼び出し元が分岐する）。語彙外は
+/// [`DdlError::InvalidRequest`]。JSON 文字列を `Token::Ident` へ流用しない。
+fn check_compare_op_token(op: &str) -> Result<Token, DdlError> {
+    match op {
+        "eq" => Ok(Token::Punct('=')),
+        "lt" => Ok(Token::Punct('<')),
+        "gt" => Ok(Token::Punct('>')),
+        "le" | "lte" => Ok(Token::Le),
+        "ge" | "gte" => Ok(Token::Ge),
+        _ => Err(DdlError::InvalidRequest),
+    }
+}
+
+/// CHECK 述語の葉 1 件（`{column, op, value}`）をトークン列へ写像する
+/// （[`build_check_tokens`] 専用。モジュール doc「CHECK」節参照）。
+fn check_leaf_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
+    let v = CHECK_LEAF_SCHEMA.validate(item).map_err(DdlError::from)?;
+    let column = v.required_str("column").map_err(DdlError::from)?;
+    let op = v.required_str("op").map_err(DdlError::from)?;
+    let value = v.required_scalar("value").map_err(DdlError::from)?;
+    // `visible()` 等の RLS 述語名は CHECK の列にできない（多層防御。engine も拒否）。
+    if is_rls_predicate_column(column) {
+        return Err(DdlError::InvalidRequest);
+    }
+    let mut tokens = vec![ident_token(column)?];
+    if op == "prefix" {
+        let JsonValue::String(raw) = value else {
+            return Err(DdlError::InvalidRequest);
+        };
+        if raw.chars().any(|c| c.is_control()) {
+            return Err(DdlError::InvalidRequest);
+        }
+        tokens.push(Token::Ident("LIKE".to_string()));
+        tokens.push(Token::StringLiteral(format!("{}%", like_escape(raw))));
+        return Ok(tokens);
+    }
+    let op_token = check_compare_op_token(op)?;
+    match value {
+        JsonValue::Bool(b) => {
+            // 真偽値は等価比較のみ（BoolEquality 形）。
+            if op != "eq" {
+                return Err(DdlError::InvalidRequest);
+            }
+            tokens.push(op_token);
+            tokens.push(Token::Ident(if *b { "true" } else { "false" }.to_string()));
+        }
+        other => {
+            tokens.push(op_token);
+            tokens.extend(default_literal_tokens(other)?);
+        }
+    }
+    Ok(tokens)
+}
+
+/// `kind == "check"` の制約をトークン列へ写像する（Issue #1199・NOSQL-13・
+/// TABLE-16）。`columns`／`references` の混入と、空・欠落の `predicate` は
+/// fail-closed で拒否する。
+fn build_check_tokens(
+    v: &Validated<'_>,
+    map: &std::collections::BTreeMap<String, JsonValue>,
+) -> Result<Vec<Token>, DdlError> {
+    if map.contains_key("columns") || map.contains_key("references") {
+        return Err(DdlError::InvalidRequest);
+    }
+    let predicate = v
+        .optional_array("predicate")
+        .map_err(DdlError::from)?
+        .ok_or(DdlError::InvalidRequest)?;
+    if predicate.is_empty() {
+        return Err(DdlError::InvalidRequest);
+    }
+    // 確保前に件数上限を検査する（DoS 対策。`54000`）。
+    engine::declarative_filter::check_filter_count(predicate.len()).map_err(DdlError::from)?;
+    let name = v.optional_str("name").map_err(DdlError::from)?;
+
+    let mut tokens = Vec::new();
+    if let Some(name) = name {
+        tokens.push(Token::Ident("CONSTRAINT".to_string()));
+        tokens.push(ident_token(name)?);
+    }
+    tokens.push(Token::Ident("CHECK".to_string()));
+    tokens.push(Token::Punct('('));
+    for (i, leaf) in predicate.iter().enumerate() {
+        if i > 0 {
+            tokens.push(Token::Keyword(Keyword::And));
+        }
+        tokens.extend(check_leaf_tokens(leaf)?);
+    }
+    tokens.push(Token::Punct(')'));
+    Ok(tokens)
+}
+
 /// `create_table.constraints[*]` 1 件をトークン列へ写像する（`primary_key`／
-/// `unique`／`foreign_key` のみ。`check` は [`DdlError::FeatureNotSupported`]）。
+/// `unique`／`foreign_key`／`check`）。
 fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
     let v = DDL_CONSTRAINT_SCHEMA
         .validate(item)
@@ -383,6 +490,11 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
 
     match kind {
         "primary_key" | "unique" => {
+            // `name`／`predicate` は `check` 専用（engine は `CONSTRAINT <name>` を
+            // CHECK の前置としてのみ受理する）。黙って捨てず先に拒否する。
+            if map.contains_key("name") || map.contains_key("predicate") {
+                return Err(DdlError::InvalidRequest);
+            }
             // `references` は `foreign_key` 専用フィールドだが
             // `DDL_CONSTRAINT_SCHEMA` は `kind` に関わらず形状として許容する
             // （意味検証は本関数が担う）。`kind` と矛盾する `references` を
@@ -405,6 +517,9 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
             Ok(tokens)
         }
         "foreign_key" => {
+            if map.contains_key("name") || map.contains_key("predicate") {
+                return Err(DdlError::InvalidRequest);
+            }
             let columns = v.required_array("columns").map_err(DdlError::from)?;
             let references_raw = map.get("references").ok_or(DdlError::InvalidRequest)?;
             let refs_v = DDL_REFERENCES_SCHEMA
@@ -441,9 +556,7 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
             }
             Ok(tokens)
         }
-        "check" => Err(DdlError::FeatureNotSupported(
-            CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE,
-        )),
+        "check" => build_check_tokens(&v, map),
         _ => Err(DdlError::InvalidRequest),
     }
 }
@@ -1203,10 +1316,95 @@ mod tests {
         assert_eq!(omitted_validated, explicit_validated);
     }
 
+    fn check_table_tokens(constraint_tokens: Vec<Token>) -> Vec<Token> {
+        let mut t = tokenize("CREATE TABLE t (qty INTEGER, kind TEXT,").expect("lex");
+        t.extend(constraint_tokens);
+        t.push(Token::Punct(')'));
+        t
+    }
+
     #[test]
-    fn build_constraint_tokens_check_is_feature_not_supported() {
-        let value = obj(r#"{"kind":"check"}"#);
-        let err = build_constraint_tokens(&value).expect_err("check must be unsupported");
-        assert!(matches!(err, DdlError::FeatureNotSupported(_)));
+    fn build_constraint_tokens_check_matches_sql_surface_parity() {
+        let value = obj(r#"{"kind":"check","name":"c1","predicate":[
+                {"column":"qty","op":"gt","value":0},
+                {"column":"kind","op":"prefix","value":"a%_\\"}]}"#);
+        let tokens = build_check_case(&value);
+        let nosql = validate_create_table_tokens(&check_table_tokens(tokens)).expect("nosql");
+        let sql_tokens = tokenize(
+            "CREATE TABLE t (qty INTEGER, kind TEXT, CONSTRAINT c1 CHECK (qty > 0 AND kind LIKE 'a\\%\\_\\\\%'))",
+        )
+        .expect("lex");
+        let sql = validate_create_table_tokens(&sql_tokens).expect("sql");
+        assert_eq!(nosql, sql);
+    }
+
+    fn build_check_case(value: &JsonValue) -> Vec<Token> {
+        build_constraint_tokens(value).expect("check must map")
+    }
+
+    #[test]
+    fn build_constraint_tokens_check_unnamed_and_range_synonyms() {
+        let value = obj(r#"{"kind":"check","predicate":[
+                {"column":"qty","op":"lte","value":9},
+                {"column":"qty","op":"ge","value":1},
+                {"column":"kind","op":"eq","value":"x"}]}"#);
+        let nosql = validate_create_table_tokens(&check_table_tokens(build_check_case(&value)))
+            .expect("nosql");
+        let sql_tokens = tokenize(
+            "CREATE TABLE t (qty INTEGER, kind TEXT, CHECK (qty <= 9 AND qty >= 1 AND kind = 'x'))",
+        )
+        .expect("lex");
+        let sql = validate_create_table_tokens(&sql_tokens).expect("sql");
+        assert_eq!(nosql, sql);
+    }
+
+    #[test]
+    fn build_constraint_tokens_check_bool_equality_maps_to_ident() {
+        let value =
+            obj(r#"{"kind":"check","predicate":[{"column":"flag","op":"eq","value":true}]}"#);
+        let tokens = build_check_case(&value);
+        assert!(tokens.contains(&Token::Ident("true".to_string())));
+    }
+
+    #[test]
+    fn build_constraint_tokens_check_negative_number_splits_sign() {
+        let value = obj(r#"{"kind":"check","predicate":[{"column":"qty","op":"gt","value":-1}]}"#);
+        let tokens = build_check_case(&value);
+        assert!(tokens.contains(&Token::Punct('-')));
+        assert!(tokens.contains(&Token::Number("1".to_string())));
+    }
+
+    #[test]
+    fn build_constraint_tokens_check_rejects_malformed_forms() {
+        let cases = [
+            r#"{"kind":"check"}"#,
+            r#"{"kind":"check","predicate":[]}"#,
+            r#"{"kind":"check","columns":["a"],"predicate":[{"column":"a","op":"gt","value":0}]}"#,
+            r#"{"kind":"check","predicate":[{"column":"a","op":"in","value":[1]}]}"#,
+            r#"{"kind":"check","predicate":[{"column":"a","op":"neq","value":1}]}"#,
+            r#"{"kind":"check","predicate":[{"column":"visible","op":"eq","value":true}]}"#,
+            r#"{"kind":"check","predicate":[{"column":"a","op":"prefix","value":"\u0001"}]}"#,
+            r#"{"kind":"check","predicate":[{"column":"a","op":"lt","value":false}]}"#,
+            r#"{"kind":"primary_key","columns":["a"],"name":"n"}"#,
+        ];
+        for c in cases {
+            let err = build_constraint_tokens(&obj(c)).expect_err(c);
+            assert!(
+                matches!(
+                    err,
+                    DdlError::InvalidRequest | DdlError::InvalidIdentifier | DdlError::Shape(_)
+                ),
+                "case {c}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_constraint_tokens_check_leaf_count_over_limit_is_engine_error() {
+        let leaf = r#"{"column":"a","op":"gt","value":0}"#;
+        let leaves = vec![leaf; 257].join(",");
+        let value = obj(&format!(r#"{{"kind":"check","predicate":[{leaves}]}}"#));
+        let err = build_constraint_tokens(&value).expect_err("over limit");
+        assert!(matches!(err, DdlError::Engine(_)), "{err:?}");
     }
 }

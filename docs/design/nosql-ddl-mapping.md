@@ -83,10 +83,38 @@ validate_drop_table_tokens}`（`pub(crate)` → `pub` へ Issue #910 で公開�
 
 ## 未実装形（fail-closed。成功を偽装しない）
 
-- `create_table.constraints[].kind == "check"`: 述語の JSON 写像（`NOSQL-7` の
-  filter 形との対応）が別論点のため、常に `0A000`。
 - `create_index`／`drop_index`／`create_view`／`drop_view`: NOSQL-13 の対象外の
   まま語彙外（`0A000`）に据え置く。
+
+## CHECK 制約（Issue #1199・NOSQL-13・TABLE-16・SQL-23）
+
+`create_table.constraints[]` に `{"kind":"check","name":"<任意>","predicate":[...]}`
+を指定できる。`predicate` は `FILTER_ITEM_SCHEMA` の葉形（`column`／`op`／`value`）の
+配列で、要素同士は AND 結合。表制約 `[CONSTRAINT <name>] CHECK (<葉> AND ...)` の
+トークン列へ写像し、SQL 表層と同じ `validate_create_table_tokens` → `run_ddl` へ
+合流する（第 2 の DDL 実行器・評価器・権限判定は作らない）。
+
+| JSON | トークン |
+| ---- | -------- |
+| `name` 指定 | `CONSTRAINT <ident>`（省略時の名前は engine が確定） |
+| `eq`／`lt`／`gt` | `=`／`<`／`>` |
+| `le`・`lte`／`ge`・`gte` | `<=`／`>=` |
+| `prefix`（文字列のみ） | `LIKE '<メタ文字エスケープ済み>%'`（update/delete の prefix と同じ `like_escape`） |
+| 値: 文字列・数値 | `default_literal_tokens`（負数は `-` と数値に分かれ、engine が SQL 表層と同じ `42601` で拒否） |
+| 値: 真偽値（`eq` のみ） | `true`／`false` |
+
+- CREATE TABLE 時点ではスキーマが無いため、値トークンの種類は JSON 値の型で決め、
+  列型との整合は engine の束縛が判定する（wire に型検査を持たない）。
+- 表制約としてのみ生成するため既定名は `<table>_check` 系（SQL の列制約形の
+  `<table>_<col>_check` とは既定名だけが異なる。意図した差分）。
+- fail-closed の拒否（すべて `42601`）: check への `columns`／`references`、
+  pk/unique/foreign_key への `name`／`predicate`、`predicate` の欠落・空配列、
+  `in` と `or` グループ、語彙外の `op`、RLS 述語名の列、`prefix` と非文字列、
+  真偽値と `eq` 以外。葉が 256 件を超える場合は確保前に `54000`。
+- 違反した書き込み（insert／update）は engine の単一検査点が `23514`（HTTP 409）で
+  拒否する。応答には制約名のみを含む。
+- `DdlError::FeatureNotSupported` と `CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE` は
+  公開 API 互換のため残置（後者は deprecated。現状、構築箇所なし）。
 
 ## エラー射影（ERR-4 との整合）
 
@@ -99,16 +127,17 @@ permission_denial_is_byte_identical_regardless_of_table_existence` で固定）�
 その他の分類は SQL 表層と共有: `42P07`（重複テーブル）・`42P01`（未定義テーブル）・
 `42701`（列名重複）・`42601`（構文・意味検証）・`42830`（参照アクションの
 宣言時検査失敗。Issue #1148）・`54000`（参照アクション連鎖の深さ・行数上限
-超過。副作用ゼロ。Issue #1148）・`23503`（連鎖適用後も含む参照整合性違反）。
+超過。副作用ゼロ。Issue #1148）・`23503`（連鎖適用後も含む参照整合性違反）・`23514`（CHECK 違反。Issue #1199）。
 
 ## 検証
 
 - `crates/engine/tests/sql_ddl_tokens_public_api.rs`: トークン入口が SQL テキスト
   経由の `parse_sql` と同一の `ParsedSql` になることを固定。
 - `crates/wire-server/tests/nosql13_ddl.rs`: HTTP フレーミング越しの成功系・
-  権限拒否・エラー分類・SQL/NoSQL パリティを固定（27 件。うち 7 件は
+  権限拒否・エラー分類・SQL/NoSQL パリティを固定（うち 7 件は
   Issue #1148 の参照アクション宣言・連鎖適用・宣言時検査・上限超過・
-  テナント境界）。
+  テナント境界、7 件は Issue #1199 の CHECK 違反 `23514`・既定名・拒否・
+  件数上限・権限）。
 - `crates/wire-server/src/http/query/ddl.rs`・`op.rs`・`schema.rs`・`gate.rs`・
   `http/session/{store,issue,middleware}.rs` の単体テスト。
 
@@ -116,5 +145,6 @@ permission_denial_is_byte_identical_regardless_of_table_existence` で固定）�
 
 - `ALTER COLUMN TYPE` 相当の op 語彙（`alter_table.drop_column` は Issue #1167 で
   SQL 表層と同じ入口へ結線済み）。
-- `create_table.constraints[].kind == "check"` の JSON 写像。
+- `alter_table` での CHECK 追加・削除、算術式を含む CHECK 述語、列制約形の
+  既定名、pk/unique/fk の制約名指定の NoSQL 表現。
 - `create_index`／`drop_index`／`create_view`／`drop_view` の NoSQL 対応。
