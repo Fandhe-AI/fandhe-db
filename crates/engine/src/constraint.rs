@@ -508,8 +508,13 @@ where
         // エラーとして応答へ現れてはならない（Issue #1254・RLS-10・RLS-11）。
         // キーを復元できない不可視行は衝突先候補から外す（後続の一意索引検査が
         // 従来どおり最終的な一意性を担保する）。可視行の破損は fail-closed で伝播する。
-        let values = match decode_key_columns(schema, &mask, buf) {
-            Ok(values) => values,
+        // 正準化（`key_bytes`。破損 REAL の NaN 等で失敗しうる）まで含めて不可視行の
+        // エラーを吸収する。デコード成功後の正準化失敗も同じ補完経路へ送る。
+        let keyed = decode_key_columns(schema, &mask, buf)
+            .and_then(|values| key_bytes(&spec, &values).map_err(internal));
+        let key = match keyed {
+            Ok(Some(key)) => key,
+            Ok(None) => continue,
             Err(e) => {
                 let row_visible = matches!(
                     crate::storage::decode_row_tenant_and_visibility(buf),
@@ -526,9 +531,6 @@ where
                 corrupt_invisible.push(id);
                 continue;
             }
-        };
-        let Some(key) = key_bytes(&spec, &values).map_err(internal)? else {
-            continue;
         };
         if let Some(existing_id) = existing.insert(key, id) {
             if existing_id != id {
@@ -575,6 +577,7 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
     for (id, key) in unique_index::recover_forward_keys_for_rows(
         write_txn,
         table_name,
+        schema,
         &specs,
         indices,
         tenant_id,

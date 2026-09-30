@@ -601,6 +601,7 @@ where
 pub(super) fn recover_forward_keys_for_rows(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
+    schema: &TableSchema,
     specs: &[KeySpec],
     indices: &[usize],
     tenant_id: &str,
@@ -618,6 +619,24 @@ pub(super) fn recover_forward_keys_for_rows(
     let index_table = write_txn
         .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
         .map_err(table_error)?;
+    // 索引が現在のスキーマ・形式のものでなければ、逆引きは旧キーを指しうるため
+    // 全行を復元不能として扱う（呼び出し側が一様に fail-closed に倒す）。
+    let signature = schema_signature(schema, specs);
+    let marker_ok = match index_table
+        .get((tenant_id, MARKER_SUBKEY.as_slice()))
+        .map_err(storage_error)?
+    {
+        Some(guard) => {
+            let v = guard.value();
+            v.len() == 4 + signature.len()
+                && v.get(0..4) == Some(FORMAT_VERSION.to_be_bytes().as_slice())
+                && v.get(4..) == Some(signature.as_slice())
+        }
+        None => false,
+    };
+    if !marker_ok {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for &id in ids {
         let rev_sub = reverse_subkey(id);
@@ -633,7 +652,16 @@ pub(super) fn recover_forward_keys_for_rows(
             if !is_target {
                 continue;
             }
-            if let Some(key) = sub.get(3..) {
+            let Some(key) = sub.get(3..) else {
+                continue;
+            };
+            // 正引きが同じ行 id を指すことを確認する（古い索引の旧キーを採用しない）。
+            let owner = index_table
+                .get((tenant_id, sub.as_slice()))
+                .map_err(storage_error)?
+                .map(|g| decode_row_id(g.value()))
+                .transpose()?;
+            if owner == Some(id) {
                 out.push((id, key.to_vec()));
             }
         }
