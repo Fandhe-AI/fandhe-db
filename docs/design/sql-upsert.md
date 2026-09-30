@@ -55,7 +55,13 @@ name }` を追加した（**BREAKING CHANGE**）。空白を挟まず「識別�
 ... SET` の右辺以外の位置に `QualifiedIdent` が現れた場合は `expect_ident` 系ヘルパーが
 受理せず `42601` へ落とす（構文上その位置以外に出現できない）。
 
-## 衝突判定スコープ: 物理キー `(tenant_id, id)` の所有（可視性ではない）
+## 衝突検出スコープ: 物理キー `(tenant_id, id)` の所有（書き込み対象は所有 ∩ 可視）
+
+> **改訂注記（Issue #1251・2026-09-30）**: 衝突の**検出**（どの既存行と衝突するか）は
+> 下記のとおり所有スコープのまま（`23505` を構造的に出さない契約の維持）。検出した既存行
+> が可視集合外の場合の分岐（`DO NOTHING` はスキップ・`DO UPDATE` は `42501`）は
+> `docs/design/sql-returning.md`「UPSERT の衝突先が不可視の場合」節で確定した。実装追随は
+> #1254 で、マージまでコードは旧挙動である。
 
 既存 DML 実行器（`tenant::update_row_unchecked`・`delete_row_impl`・
 `truncate_table_unchecked`）はいずれも `(ctx.tenant_id(), id)` キー取得＋
@@ -97,7 +103,9 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
   書き込み**前**に対象テナントの既存行を 1 回だけ走査し（`constraint::
   scan_tenant_rows_by_unique_key`。`enforce_unique_keys_in_txn` と同じ
   `(tenant_id, 0)..=(tenant_id, u64::MAX)` の閉区間・可視性を問わない全行が母集合。
-  RLS-9・RLS-10 (c)）、対象キー→既存行 id の対応表を作る。各 `VALUES` 行はこの表と
+  RLS-9・RLS-10 (c)）、対象キー→既存行 id の対応表を作る（この事前走査の母集合は
+  所有行全体のまま不変。一致した既存行の可視性で `DO NOTHING`／`DO UPDATE` の分岐が
+  変わる点は `sql-returning.md`「UPSERT の衝突先が不可視の場合」節）。各 `VALUES` 行はこの表と
   照合し、一致すればその既存行 id に対して `DO NOTHING`／`DO UPDATE`（read-merge-
   write は `(id)` 対象と共有）を行い、一致しなければ `VALUES` の `id` で新規挿入する
   （同じ `id` を持つ既存行があれば通常どおり `23505`）。対象キーの正準化

@@ -76,8 +76,8 @@ ADR §4 のレイアウトをそのまま `crates/engine/src/recovery/content_ha
 2. `ledger::record_in_txn`（候補列挙より**先**。使用済み `operation_id` は可視集合を
    一切走査せず `23505`／`22023` へ短絡する）。
 3. テナント**所有**スコープ（`(tenant, 0)..=(tenant, u64::MAX)`。`is_owner` の二重
-   防御）を走査し、呼び出し元が注入した述語クロージャで候補 `id` を確定する
-   （`limit + 1` 件で打ち切り）。
+   防御）を走査し、ヘッダで可視性を判定して所有かつ可視の行にのみ、呼び出し元が注入した
+   述語クロージャを評価して候補 `id` を確定する（`limit + 1` 件で打ち切り）。
 4. `limit` 超過なら `write_txn` を drop し `LimitExceeded` を返す（行・台帳とも
    痕跡ゼロ）。
 5. 候補 `id` をすべて適用（DELETE は `remove`、UPDATE は read-merge-write。
@@ -93,16 +93,27 @@ execute_scan` の走査ループと同一の意味論（`declarative_filter::mat
 
 ## 4. 削除・更新スコープ
 
-候補列挙は「RLS 可視行」ではなく「テナント**所有**（`(tenant_id, id)` キー名前空間
-＋ `is_owner`）」スコープを対象とする（単一行 DELETE・`TRUNCATE` と同じ判断。
-`docs/design/sql-delete-single-row.md`「削除スコープ」節参照）。
+> **改訂注記（Issue #1251・2026-09-30）**: 候補スコープを「所有」から「所有 ∩ 可視」へ
+> 改訂した（親 Issue #1250）。実装追随は #1253（`UPDATE`／`DELETE` の対象選定）・
+> #1255／#1256（テスト）で、マージまでコードは旧挙動（所有のみ）である。
+> 設計全体は `docs/design/sql-returning.md`「対象選定・RLS 再判定と不変条件」節を参照。
+
+候補列挙は、テナント**所有**（`(tenant_id, id)` キー名前空間＋ `is_owner`）かつ
+RLS 可視（`PolicyContext::is_visible`）の行を対象とする（`id` 指定 `UPDATE` と同じ
+スコープ。`docs/design/sql-delete-single-row.md`「削除スコープ」節参照）。`TRUNCATE`
+（SQL-22）は所有行全体のまま据え置く。
 
 - wire 経由では RLS-11（認証主体は自テナント `Private` 行が可視）により「所有 ⊆
-  可視」が成立し、両者は一致する。
+  可視」が成立し、両者は一致するため結果は変わらない。
 - 他テナントの `Public` 行は「可視だが所有ではない」ため候補にならない
   （`SELECT` では見えるが述語つき `UPDATE`／`DELETE` の対象外）。
-- engine 直呼び出しの既定 ctx（`Public` のみ）でも自テナント `Private` 行は候補に
-  なる（単一行 DELETE と同じ）。
+- engine 直呼び出しの既定 ctx（`Public` のみ）では、自テナント `Private` 行は不可視
+  のため候補にならない（`RETURNING` の返却行数と影響行数を一致させるため）。
+- 可視性はヘッダ専用デコード（`storage::decode_row_tenant_and_visibility`）で本体
+  デコードより先に判定し、不可視行の本体は読まない（判断 D。不可視行の破損が応答差に
+  ならないようにする）。
+- 総走査上限（`tenant::MAX_SCANNED_ROWS`）は所有行の走査ごとに加算し、可視性で
+  数え方を変えない。
 - `enumerate_dml_candidates` は物理キー `(tenant_id, id)`（TABLE-12）が redb の
   タプル `Key` 比較で第 1 要素（`tenant_id`）を主キーとする辞書順になる性質
   （`catalog.rs::scan_table_page` のカーソルが同じ前提に依拠）を利用し、
@@ -315,7 +326,8 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
 - `crates/engine/tests/sql_predicate_dml_exec.rs`: 候補列挙・応答件数の同値性
   （DELETE／UPDATE）・RLS 境界（他テナント行の非影響・非漏えい）・0 行一致の台帳
   記録と再送拒否・内容照合ハッシュ（述語順入替での `22023`）・`WHERE visible()`
-  のみの DELETE の拒否（`42601`・副作用ゼロ）・`operation_id` 欠落・`execute_sql`（セッション無し）の既存拒否・
+  のみの DELETE の拒否（`42601`・副作用ゼロ）・可視性による候補の絞り込み（#1253・
+  #1255 で追加）・`operation_id` 欠落・`execute_sql`（セッション無し）の既存拒否・
   既定（`--max-dml-affected-rows` 未指定＝上限なし）で旧既定値（1,000）超の
   一致でも成功すること（BREAKING CHANGE の外部観測。DELETE 側
   `predicate_delete_default_has_no_affected_rows_cap`・UPDATE 側
