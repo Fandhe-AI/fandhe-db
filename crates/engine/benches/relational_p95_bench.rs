@@ -19,7 +19,7 @@
 //! 検査する（RLS を外した状態や空振りを測る事態を fail-closed で防ぐ）。
 //! `LIMIT` 後の結果だけでは越境を見逃すため、他テナント行は各 arm の上位に必ず並ぶ
 //! sentinel（述語 arm は計測クエリと同一のベクトル・`lang=l0`、順序 arm は最小／最大 `qty`）として投入し、
-//! 結合は `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページ分割で全件取得して件数まで照合する。加えて他テナント文脈で同じ文が
+//! 結合は一意キーの `ORDER BY` 付きで `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページ分割により全件取得し、id 集合まで照合する。加えて他テナント文脈で同じ文が
 //! 他テナント行を返すこと（＝越境が起きれば見える fixture であること）を確認する。
 //!
 //! 使い方は `make bench-relational-p95`。時間非依存の判定ロジックは
@@ -532,13 +532,15 @@ fn rng_vector_for(id: u64) -> Vec<f32> {
 }
 
 /// 結合文を `LIMIT`／`OFFSET` のページ（各 `JOIN_PAGE_ROWS` 行）で全件取得し、行 id を返す。
+/// 行順が未規定だとページ間で重複・取りこぼしが起きうるため、一意キー（`title` は `t{id}` で行ごとに一意）の
+/// `ORDER BY` を付けてページ境界を固定する（結合のスカラー `ORDER BY` は Issue #1190 で対応済み）。
 /// `LIMIT`・`OFFSET` とも `MAX_SEARCH_K` 以内に収めるための分割で、末尾ページが満杯のまま
 /// 取得上限に達した場合は全件取得できていないため fail-closed する。
 fn exec_join_pages(core: &EngineCore, tenant_ctx: &PolicyContext, head: &str) -> Vec<u64> {
     let mut ids = Vec::new();
     for page in 0..JOIN_PAGES {
         let sql = format!(
-            "{head}LIMIT {JOIN_PAGE_ROWS} OFFSET {}",
+            "{head}ORDER BY {DOCUMENTS}.title LIMIT {JOIN_PAGE_ROWS} OFFSET {}",
             page * JOIN_PAGE_ROWS
         );
         let result = exec(core, tenant_ctx, &sql);
