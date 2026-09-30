@@ -1300,6 +1300,58 @@ pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(&str, Visi
     Ok((tenant_id, visibility))
 }
 
+/// 集計の 3 段階デコード（`docs/design/aggregate-decode-skip.md`・Issue #1258）が
+/// 埋め込み本体（`Vec<f32>` 化）を読まないことを直接観測するための計数プローブ。
+///
+/// `#[cfg(test)]` 限定で production ビルドには含まれない。`sql/aggregate.rs`・
+/// `sql/group_by.rs` の走査ループは呼び出しスレッド上で同期実行されるため、
+/// 並列実行される他テストの計数が混入しないよう global atomic ではなく
+/// thread_local を使う。計数は各デコード関数の入口で 1 回加算するだけで、検証・
+/// エラー経路（fail-closed 契約）には触れない。
+#[cfg(test)]
+pub(crate) mod decode_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static EMBEDDING_DECODES: Cell<u64> = const { Cell::new(0) };
+        static DIM_AND_METADATA_DECODES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// 計数のスナップショット。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct DecodeCounts {
+        /// 埋め込み本体をデコードした回数（`decode_row_body_into`・`decode_row`）。
+        pub(crate) embedding: u64,
+        /// 構造検証のみの借用デコード回数（`decode_row_dim_and_metadata_borrowed`）。
+        pub(crate) dim_and_metadata: u64,
+    }
+
+    impl DecodeCounts {
+        /// `before` からの増分を返す。
+        pub(crate) fn since(self, before: DecodeCounts) -> DecodeCounts {
+            DecodeCounts {
+                embedding: self.embedding - before.embedding,
+                dim_and_metadata: self.dim_and_metadata - before.dim_and_metadata,
+            }
+        }
+    }
+
+    pub(crate) fn record_embedding_decode() {
+        EMBEDDING_DECODES.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn record_dim_and_metadata_decode() {
+        DIM_AND_METADATA_DECODES.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn snapshot() -> DecodeCounts {
+        DecodeCounts {
+            embedding: EMBEDDING_DECODES.with(Cell::get),
+            dim_and_metadata: DIM_AND_METADATA_DECODES.with(Cell::get),
+        }
+    }
+}
+
 /// 行バイト列から `metadata`（スカラー列ペイロード）だけを取り出す（[`decode_row`] と
 /// 同じヘッダ・embedding フィールド検証を経るが、embedding は `Vec<f32>` へ確保せず
 /// 長さ検証のみでオフセットを進める）。`metadata` は `buf` を借用した `&[u8]`。
@@ -1358,6 +1410,8 @@ pub(crate) fn decode_row_body_into<'a>(
     offset: usize,
     out_embedding: &mut Vec<f32>,
 ) -> Result<(u32, &'a [u8])> {
+    #[cfg(test)]
+    decode_probe::record_embedding_decode();
     let mut offset = offset;
     let dim_field_end = offset
         .checked_add(4)
@@ -1445,6 +1499,8 @@ pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
 /// embedding を `Vec<f32>` へ確保する必要がある場合は
 /// [`decode_row_embedding_and_metadata_into`] を使う。
 pub(crate) fn decode_row_dim_and_metadata_borrowed(buf: &[u8]) -> Result<(u32, &[u8])> {
+    #[cfg(test)]
+    decode_probe::record_dim_and_metadata_decode();
     let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
 
     let dim_field_end = offset
@@ -1534,6 +1590,8 @@ pub(crate) fn verify_row_key_tenant(key_tenant: &str, header_tenant: &str) -> Re
 /// `pub(crate)`: `txn.rs`（TASK-88）の読み取りスナップショットハンドルが、`Storage::get`
 /// と同一のデコード・fail-closed 契約で行を読み出すために再利用する。
 pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
+    #[cfg(test)]
+    decode_probe::record_embedding_decode();
     let (tenant_id, visibility, mut offset) = decode_row_header(buf)?;
 
     let dim_field_end = offset

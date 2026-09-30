@@ -144,6 +144,8 @@
 //! `execute_predicate_update`／`execute_predicate_delete` の担当。
 
 pub mod aggregate;
+#[cfg(test)]
+mod aggregate_embedding_decode_tests;
 pub mod allowlist;
 pub(crate) mod arena_cache;
 pub(crate) mod check_constraint;
