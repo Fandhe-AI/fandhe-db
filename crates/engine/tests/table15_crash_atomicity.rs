@@ -37,6 +37,9 @@ use temp_db::{unique_db_path, CleanupGuard};
 const ROLE_ENV: &str = "TABLE15_CRASH_CHILD_ROLE";
 const DB_ENV: &str = "TABLE15_CRASH_CHILD_DB";
 const LOG_ENV: &str = "TABLE15_CRASH_CHILD_LOG";
+/// 親の狙いマーカー（`"<kind> <最小サイクル>"`）。子はこのマーカーを書いた直後に
+/// 親の合図（`go` ファイル）を待ってから次の操作へ進む。
+const HOLD_ENV: &str = "TABLE15_CRASH_CHILD_HOLD";
 
 /// 子の最大サイクル数（暴走防止。親は必ずこれより先に kill する）。
 const MAX_CYCLES: u64 = 1_000;
@@ -104,6 +107,37 @@ fn mark(log: &Path, line: &str) {
         .expect("child: open log");
     f.write_all(format!("{line}\n").as_bytes())
         .expect("child: write marker");
+    hold_at_target(log, line);
+}
+
+/// 狙いマーカーを書いた直後に 1 回だけ、親の合図（`go` ファイルの出現）を待つ。
+/// 親のポーリングが負荷で遅れても狙いマーカーが最新行のまま残り、狙いを取り逃して
+/// 子が全サイクルを終えてしまうことを防ぐ（kill 位置は合図後の `jitter` でばらつく）。
+/// 合図が来ないまま上限を過ぎた場合は進む（親側の `POLL_TIMEOUT` が失敗として扱う）。
+fn hold_at_target(log: &Path, line: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HELD: AtomicBool = AtomicBool::new(false);
+    let Ok(spec) = std::env::var(HOLD_ENV) else {
+        return;
+    };
+    let mut want = spec.split(' ');
+    let (Some(kind), Some(min)) = (want.next(), want.next()) else {
+        return;
+    };
+    let min: u64 = min.parse().expect("child: hold cycle");
+    let mut got = line.split(' ');
+    let (Some(got_kind), Some(got_k)) = (got.next(), got.next()) else {
+        return;
+    };
+    let got_k: u64 = got_k.parse().expect("child: marker cycle");
+    if got_kind != kind || got_k < min || HELD.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let go = log.with_extension("go");
+    let start = Instant::now();
+    while !go.exists() && start.elapsed() < POLL_TIMEOUT {
+        std::thread::yield_now();
+    }
 }
 
 fn child_env() -> Option<(String, PathBuf, PathBuf)> {
@@ -194,8 +228,9 @@ fn complete_lines(log: &Path) -> Vec<String> {
     }
 }
 
-/// 子を起動し、マーカー行数が `threshold` 以上になってから `jitter` 待って SIGKILL
-/// する。kill 後の（完全な行だけの）マーカー列を返す。
+/// 子を起動し、狙いマーカー（`target`・サイクル `min_cycle` 以上）が最新行になったら
+/// 子へ合図（[`hold_at_target`]）して `jitter` 待って SIGKILL する。kill 後の（完全な
+/// 行だけの）マーカー列を返す。
 fn run_and_kill(
     test_name: &str,
     role: &str,
@@ -206,11 +241,14 @@ fn run_and_kill(
     jitter: Duration,
 ) -> Vec<String> {
     let exe = std::env::current_exe().expect("current_exe");
+    let go = log.with_extension("go");
+    let _ = std::fs::remove_file(&go);
     let child = Command::new(exe)
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(ROLE_ENV, role)
         .env(DB_ENV, db)
         .env(LOG_ENV, log)
+        .env(HOLD_ENV, format!("{target} {min_cycle}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -239,11 +277,15 @@ fn run_and_kill(
         );
         std::thread::yield_now();
     }
+    // 子は狙いマーカーの直後で合図を待っている。合図してから `jitter` 後に kill する
+    // （`jitter` 中に子は次の操作〔TRUNCATE／DROP・投入〕を進める）。
+    std::fs::write(&go, b"").expect("write go signal");
     if !jitter.is_zero() {
         std::thread::sleep(jitter);
     }
     guard.0.kill().expect("SIGKILL child");
     guard.0.wait().expect("reap child");
+    let _ = std::fs::remove_file(&go);
     complete_lines(log)
 }
 
