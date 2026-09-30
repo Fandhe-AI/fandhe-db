@@ -427,10 +427,10 @@ fn drop_constraint_naming_a_check_constraint_succeeds() {
     assert_eq!(err.wire_code(), "42704");
 }
 
-/// 主キーの実装名（`<table>_pkey` 相当の慣習名）は UNIQUE・CHECK いずれにも
-/// 存在しないため `42704`（PRIMARY KEY は名前を持たない。設計 D1）。
+/// 主キーは導出擬似名（`<table>_pkey`）で `DROP CONSTRAINT` できる（TABLE-22 (d)、
+/// Issue #1196）。削除後の再 DROP は `42704`（PRIMARY KEY 自体は無名。設計 D1）。
 #[test]
-fn drop_constraint_naming_primary_key_convention_is_42704() {
+fn drop_constraint_naming_primary_key_pseudo_name_succeeds_once() {
     let (core, path) = new_core("alter-unique-drop-pkey-name");
     let _guard = CleanupGuard(path);
     let owner = ctx("owner");
@@ -443,13 +443,20 @@ fn drop_constraint_naming_primary_key_convention_is_42704() {
     )
     .expect("create table with primary key");
 
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs DROP CONSTRAINT docs_pkey",
+    )
+    .expect("primary key is droppable by its derived name");
     let err = exec(
         &core,
         &mut session,
         &owner,
         "ALTER TABLE docs DROP CONSTRAINT docs_pkey",
     )
-    .expect_err("PRIMARY KEY has no name to drop");
+    .expect_err("no primary key is left to drop");
     assert_eq!(err.wire_code(), "42704");
 }
 
@@ -579,6 +586,15 @@ fn out_of_scope_alter_table_forms_are_rejected_with_42601() {
     )
     .expect_err("DROP CONSTRAINT IF EXISTS is out of scope for this Issue");
     assert_eq!(err.wire_code(), "42601");
+
+    // PRIMARY KEY は無名（Issue #1196）。名前付き形・暗黙の `id` 主キーの再宣言は拒否する。
+    for sql in [
+        "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (a)",
+        "ALTER TABLE docs ADD PRIMARY KEY (id)",
+    ] {
+        let err = exec(&core, &mut session, &owner, sql).expect_err("out of scope form");
+        assert_eq!(err.wire_code(), "42601", "{sql}");
+    }
 }
 
 // --- 明示トランザクション内 --------------------------------------------------

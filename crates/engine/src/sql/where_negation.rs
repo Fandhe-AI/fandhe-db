@@ -25,7 +25,8 @@
 //! | `Expression(a > b)` 等 | 演算子反転（`>`↔`<=`、`<`↔`>=`） |
 //! | `Expression(a = b)` | `Or([a < b], [a > b])`（`BinOp` に `<>` が無いため） |
 //! | `visible()` | `42601`（RLS-7: 否定越しに RLS 述語を扱わせない） |
-//! | `IN (SELECT)`／`EXISTS` | `0A000`（既存の非対応契約） |
+//! | `IN (SELECT)`／`EXISTS` | `Not(..)`（解決段 `sql::subquery` が NULL 規則込みで否定形を評価する。Issue #1191） |
+//! | `<col> <op> (SELECT)` | 演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`。Issue #1191） |
 //!
 //! 演算子反転の根拠: 束縛段の比較は同型（数値×数値・TEXT×TEXT・DATE/TIMESTAMP 系）
 //! でのみ成立し、値は全順序を持つ（非有限の REAL/DOUBLE は束縛・評価で拒否される）。
@@ -118,12 +119,22 @@ fn negate_one(
         WherePredicate::PredicateCall { .. } => Err(SqlSurfaceError::unsupported(
             "NOT visible() is not supported",
         )),
-        WherePredicate::Exists { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "NOT EXISTS (SELECT ...) is not supported".to_string(),
-        }),
-        WherePredicate::InSubquery { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "NOT <col> IN (SELECT ...) is not supported".to_string(),
-        }),
+        // サブクエリの否定は解決段が評価する（Issue #1191）。`Not(Not(x))` は上の
+        // `Not` 腕で畳まれる。
+        leaf @ (WherePredicate::Exists { .. } | WherePredicate::InSubquery { .. }) => {
+            Ok(vec![WherePredicate::Not(Box::new(leaf))])
+        }
+        WherePredicate::ScalarSubqueryCompare {
+            column,
+            op,
+            inner_tokens,
+            depth,
+        } => Ok(vec![WherePredicate::ScalarSubqueryCompare {
+            column,
+            op: op.negated(),
+            inner_tokens,
+            depth,
+        }]),
         WherePredicate::Expression(Expr::Binary { op, lhs, rhs }) => match op {
             BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
                 let flipped = match op {
@@ -262,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_visible_and_subqueries() {
+    fn rejects_visible_and_wraps_subqueries() {
         let mut b = 100;
         assert!(matches!(
             negate_conjunction(
@@ -273,15 +284,39 @@ mod tests {
             ),
             Err(SqlSurfaceError::UnsupportedSyntax { .. })
         ));
-        assert!(matches!(
-            negate_conjunction(
-                vec![WherePredicate::Exists {
-                    inner_tokens: vec![],
-                    depth: 1
-                }],
-                &mut b
-            ),
-            Err(SqlSurfaceError::FeatureNotSupported { .. })
-        ));
+        let exists = WherePredicate::Exists {
+            inner_tokens: vec![],
+            depth: 1,
+        };
+        assert_eq!(
+            negate_conjunction(vec![exists.clone()], &mut b).unwrap(),
+            vec![WherePredicate::Not(Box::new(exists.clone()))]
+        );
+        // 二重否定は畳まれる。
+        assert_eq!(
+            negate_conjunction(vec![WherePredicate::Not(Box::new(exists.clone()))], &mut b)
+                .unwrap(),
+            vec![exists]
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_negation_flips_operator() {
+        use crate::sql::allowlist::ScalarSubqueryOp;
+        let mut b = 100;
+        let p = |op| WherePredicate::ScalarSubqueryCompare {
+            column: "c".into(),
+            op,
+            inner_tokens: vec![],
+            depth: 1,
+        };
+        for (a, n) in [
+            (ScalarSubqueryOp::Eq, ScalarSubqueryOp::Ne),
+            (ScalarSubqueryOp::Lt, ScalarSubqueryOp::Ge),
+            (ScalarSubqueryOp::Gt, ScalarSubqueryOp::Le),
+        ] {
+            assert_eq!(negate_conjunction(vec![p(a)], &mut b).unwrap(), vec![p(n)]);
+            assert_eq!(negate_conjunction(vec![p(n)], &mut b).unwrap(), vec![p(a)]);
+        }
     }
 }
