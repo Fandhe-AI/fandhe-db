@@ -3624,8 +3624,9 @@ pub(crate) fn execute_delete_in(
 /// （[`crate::sql::returning::project_row`] を再利用）。
 ///
 /// - RLS 再判定（多層防御）: `ctx.is_visible(row_tenant, row_visibility)` を
-///   再適用し、不可視行は結果へ積まない（`rows_affected` は呼び出し元が
-///   `tenant` 層の実変更行数から決めるため影響しない）。
+///   再適用する。新規挿入行（`CapturedRowOrigin::Inserted`）が不可視なら `XX000`
+///   で write を中止し（fail-closed）、更新・削除行は #1253／#1254 まで従来どおり
+///   結果へ積まない（`rows_affected` は `tenant` 層の実変更行数から決まる）。
 /// - `budget` は文全体で共有し、全行の累計で `MAX_RETURNING_RESULT_BYTES` を
 ///   適用する（`PayloadTooLarge` は `ReturningProjectionTooLarge`〔`54000`〕、
 ///   その他は `ReturningProjectionFailed`〔`XX000`〕へ写像し、いずれも
@@ -3639,6 +3640,14 @@ fn returning_collector<'a>(
 ) -> impl FnMut(&crate::tenant::CapturedRow) -> Result<(), crate::tenant::TenantWriteError> + 'a {
     move |row: &crate::tenant::CapturedRow| {
         if !ctx.is_visible(&row.tenant_id, row.visibility) {
+            // 新規挿入行は不可視なら `XX000` で書き込みを中止する（fail-closed。
+            // 黙って落とすと影響行数と返却行数がずれる）。更新・削除行は対象選定を
+            // 可視集合へ揃える #1253／#1254 まで従来どおり返却から除外する。
+            if row.origin == crate::tenant::CapturedRowOrigin::Inserted {
+                return Err(crate::tenant::TenantWriteError::ReturningProjectionFailed(
+                    "RETURNING row is not visible under the policy context".to_string(),
+                ));
+            }
             return Ok(());
         }
         match crate::sql::returning::project_row(row.id, &row.values, returning, budget) {
@@ -4517,8 +4526,6 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
-    use crate::storage::Visibility;
-
     let Some(first) = bounds.first() else {
         return Err(SqlSurfaceError::invalid_input(
             "INSERT batch must contain at least one row",
@@ -4549,7 +4556,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         target,
         table,
         ctx,
-        Visibility::Private,
+        INSERT_ROW_VISIBILITY,
         &rows,
         ledger_write,
         expected_schema,
@@ -4574,11 +4581,10 @@ pub(crate) fn execute_insert_batch_with_schema_in(
 /// 存在しないため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
 /// なしで投影する。
 ///
-/// **RLS 再判定（多層防御）**: 挿入行の tenant は常に `ctx.tenant_id()`・
-/// visibility は常に `crate::storage::Visibility::Private` 固定
-/// （`execute_insert_with_schema` と同じ契約）のため `ctx.is_visible` は通常
-/// 常に真だが、[`execute_delete_returning`] と同じ形で再適用し判定経路を
-/// 統一する（security.md「テナント境界」多層防御方針）。
+/// **RLS 可視性の検査（fail-closed）**: 挿入行の tenant は常に `ctx.tenant_id()`・
+/// visibility は常に `Private` 固定。`ctx` から不可視（`Public` のみの
+/// `PolicyContext::new` を直接使う場合）なら、書き込み前に `XX000` で拒否する
+/// （黙って返却から外さない）。wire／HTTP の認証経路は RLS-11 により発生しない。
 pub fn execute_insert_returning(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -4596,6 +4602,9 @@ pub fn execute_insert_returning(
         schema,
     )
 }
+
+/// `INSERT` の挿入行に固定で付く可視性（書き込み側と RETURNING の可視性検査で共有する）。
+const INSERT_ROW_VISIBILITY: crate::storage::Visibility = crate::storage::Visibility::Private;
 
 /// [`execute_insert_returning`] の本体（明示トランザクション対応版。SQL-31・TASK-221、Issue #1179）。
 /// `target` が `InTxn` の場合は呼び出し元（`core::EngineCore::execute_in_active_txn`）が
@@ -4623,18 +4632,24 @@ pub(crate) fn execute_insert_returning_in(
     // 同じ目的の別経路を使う。codex-review P1 指摘・PR #991 対応。
     // ドキュメント参照）。
     let columns = crate::sql::returning::column_meta(returning, schema)?;
-    let is_visible = ctx.is_visible(ctx.tenant_id(), crate::storage::Visibility::Private);
+    // 挿入行の可視性は書き込み側（`execute_insert_batch_with_schema_in` が渡す
+    // `Visibility::Private`）と同じ値で判定する。不可視なら書き込み**前**に `XX000`
+    // で拒否する（行も台帳も消費しない。黙って空にして「影響 n 行・返却 0 行」の
+    // ずれを作らない。docs/design/sql-returning.md・SQL-21・RLS-7）。
+    if !ctx.is_visible(ctx.tenant_id(), INSERT_ROW_VISIBILITY) {
+        return Err(SqlSurfaceError::Internal {
+            detail: "RETURNING row is not visible under the policy context".to_string(),
+        });
+    }
     let mut rows = Vec::new();
-    if is_visible {
-        let mut budget = 0usize;
-        for bound in bounds {
-            rows.push(crate::sql::returning::project_row(
-                bound.id,
-                &bound.values,
-                returning,
-                &mut budget,
-            )?);
-        }
+    let mut budget = 0usize;
+    for bound in bounds {
+        rows.push(crate::sql::returning::project_row(
+            bound.id,
+            &bound.values,
+            returning,
+            &mut budget,
+        )?);
     }
 
     let insert_outcome =
@@ -5425,6 +5440,80 @@ mod tests {
             )
             .expect_err("stale bound schema must be rejected for upsert too");
             assert_eq!(err.wire_code(), "22000");
+        }
+    }
+
+    /// `returning_collector` の不可視行の扱いを由来別に検査する（Issue #1252・SQL-21）。
+    /// 新規挿入行は `XX000` 相当（`ReturningProjectionFailed`）、更新・削除行は #1253／#1254
+    /// まで従来どおり黙って除外、可視行は積む。
+    mod returning_collector_origin {
+        use super::super::returning_collector;
+        use crate::policy::PolicyContext;
+        use crate::row_codec::Value;
+        use crate::sql::exec::ResultRow;
+        use crate::sql::parser::ProjectedColumn;
+        use crate::storage::Visibility;
+        use crate::tenant::{CapturedRow, CapturedRowOrigin, TenantWriteError};
+
+        fn row(origin: CapturedRowOrigin) -> CapturedRow {
+            CapturedRow {
+                id: 7,
+                tenant_id: "tenant-a".to_string(),
+                visibility: Visibility::Private,
+                values: vec![Value::Null],
+                origin,
+            }
+        }
+
+        fn collect(
+            ctx: &PolicyContext,
+            origin: CapturedRowOrigin,
+        ) -> (Result<(), TenantWriteError>, Vec<ResultRow>) {
+            let projection = [ProjectedColumn::Id];
+            let mut budget = 0usize;
+            let mut rows = Vec::new();
+            let result =
+                returning_collector(ctx, &projection, &mut budget, &mut rows)(&row(origin));
+            (result, rows)
+        }
+
+        #[test]
+        fn invisible_inserted_row_is_rejected_fail_closed() {
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+            let (result, rows) = collect(&ctx, CapturedRowOrigin::Inserted);
+            assert!(matches!(
+                result,
+                Err(TenantWriteError::ReturningProjectionFailed(_))
+            ));
+            assert!(rows.is_empty());
+        }
+
+        #[test]
+        fn invisible_updated_or_deleted_row_is_silently_excluded() {
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+            for origin in [CapturedRowOrigin::Updated, CapturedRowOrigin::Deleted] {
+                let (result, rows) = collect(&ctx, origin);
+                assert!(result.is_ok());
+                assert!(rows.is_empty());
+            }
+        }
+
+        #[test]
+        fn visible_row_is_collected_for_every_origin() {
+            let ctx = PolicyContext::with_visibilities(
+                "tenant-a",
+                [Visibility::Public, Visibility::Private],
+            )
+            .expect("valid tenant");
+            for origin in [
+                CapturedRowOrigin::Inserted,
+                CapturedRowOrigin::Updated,
+                CapturedRowOrigin::Deleted,
+            ] {
+                let (result, rows) = collect(&ctx, origin);
+                assert!(result.is_ok());
+                assert_eq!(rows.len(), 1);
+            }
         }
     }
 

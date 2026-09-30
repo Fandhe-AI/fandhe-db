@@ -490,6 +490,14 @@ enum Expect {
         affected: (u64, Count),
         ids: (&'static [u64], Ids),
     },
+    /// INSERT・UPSERT 新規行の RETURNING（Issue #1252）。Private 込みモードは影響行数・返却
+    /// id の完全一致。Public のみモードは挿入行（Private 固定）が不可視のため、黙って空に
+    /// せず `pub_code`（`XX000`）で書き込み前に拒否される（fail-closed）。
+    ReturningPubErr {
+        affected: u64,
+        ids: &'static [u64],
+        pub_code: &'static str,
+    },
     /// TRUNCATE。件数を露出しない成功応答（`affected` なし）で、事後に閲覧側の `docs`
     /// 行が可視性を問わず 0 件になる（他テナントの行は T3 が不変を検査する）。
     Truncated,
@@ -555,18 +563,14 @@ fn shapes() -> Vec<Shape> {
         w("ins-foreign-id", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("ins-multi-foreign-ids", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-n1'), (10, 'ja', 2, 'tok-{v}-n2') USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("ins-own-dup-id", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-dup') USING OPERATION_ID '{op}'", Err("23505")),
-        // Public のみモードの返却行は SQL-21 と不一致の現状のため部分集合で検査する
-        // （現状の返却は 0 行のため下限 `must` は付けられない）。完全一致の検査は
-        // #1256（#1250 の是正後）で戻す。
-        w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, Count::Exact(1)), ids: (&[9], Ids::Between { must: &[], within: &[9] }) }),
+        // #1252 で是正済み: Public のみモードは挿入行が不可視のため `XX000` で書き込み前に拒否する。
+        w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') RETURNING * USING OPERATION_ID '{op}'", ReturningPubErr { affected: 1, ids: &[9], pub_code: "XX000" }),
         w("upsert-foreign-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 7, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-foreign-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(0, 0)),
-        // Public のみモードの返却行は SQL-21 と不一致の現状のため部分集合で検査する
-        // （現状の返却は 0 行のため下限 `must` は付けられない）。完全一致の検査は
-        // #1256（#1250 の是正後）で戻す。
-        w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, Count::Exact(1)), ids: (&[9], Ids::Between { must: &[], within: &[9] }) }),
+        // #1252 で是正済み: Public のみモードは挿入行が不可視のため `XX000` で書き込み前に拒否する。
+        w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score RETURNING * USING OPERATION_ID '{op}'", ReturningPubErr { affected: 1, ids: &[9], pub_code: "XX000" }),
         w("truncate", "TRUNCATE TABLE docs USING OPERATION_ID '{op}'", Truncated),
         // ---- (c) 制約検査 ----
         c("uniq-foreign-code", "INSERT INTO uniq (id, code, a, b) VALUES (10, 'shared', 'n1', 'n2') USING OPERATION_ID '{op}'", Affected(1, 1)),
@@ -866,6 +870,37 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                 }
                 (Expect::Returning { .. }, Obs::Err { code, .. }) => {
                     panic!("{which}: unexpected error {code}: {}", label(r))
+                }
+                (
+                    Expect::ReturningPubErr {
+                        affected: want_affected,
+                        ids: want_ids,
+                        ..
+                    },
+                    Obs::Ok {
+                        affected,
+                        returned_ids,
+                        ..
+                    },
+                ) => {
+                    assert!(
+                        mode,
+                        "{which}: Public-only mode must be rejected, but succeeded: {}",
+                        label(r)
+                    );
+                    assert_eq!(*affected, Some(want_affected), "{which}: {}", label(r));
+                    let got = returned_ids
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{which}: RETURNING rows missing: {}", label(r)));
+                    assert_eq!(got, want_ids, "{which}: RETURNING rows: {}", label(r));
+                }
+                (Expect::ReturningPubErr { pub_code, .. }, Obs::Err { code, .. }) => {
+                    assert!(
+                        !mode,
+                        "{which}: unexpected error {code} in Private-inclusive mode: {}",
+                        label(r)
+                    );
+                    assert_eq!(code, pub_code, "{which}: {}", label(r));
                 }
                 (Expect::Truncated, Obs::Ok { affected, .. }) => {
                     assert_eq!(*affected, None, "{which}: {}", label(r));
