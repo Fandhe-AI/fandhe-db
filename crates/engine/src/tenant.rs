@@ -3046,7 +3046,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                             id,
                             tenant_id: ctx.tenant_id().to_string(),
                             visibility,
-                            origin: CapturedRowOrigin::Deleted,
+                            origin: CapturedRowOrigin::Updated,
                             values: captured_values_from_parts(&schema, embedding, &metadata)?,
                         });
                     }
