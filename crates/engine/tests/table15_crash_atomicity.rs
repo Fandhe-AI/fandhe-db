@@ -88,6 +88,19 @@ fn insert_sql(prefix: &str, first: u64, count: u64, op: &str) -> String {
     )
 }
 
+/// 台帳の残存確認用の再送 SQL。`op` は検査対象と同じ operation_id を使い、行（`id`・
+/// UNIQUE 列 `code`）は既存行と重ならない値にする。行の重複（`23505`）と区別し、台帳が
+/// 残っていれば内容不一致（`22023`）で拒否され、残っていなければ成功する。
+fn ledger_probe_sql(op: &str) -> String {
+    format!(
+        "INSERT INTO docs (id, code, embedding) VALUES (800001, 'ledger-probe', '[0.1,0.2]') \
+         USING OPERATION_ID '{op}'"
+    )
+}
+
+/// 台帳が残っている場合の再送の SQLSTATE（operation_id の内容不一致）。
+const LEDGER_PRESENT: &str = "22023";
+
 /// `COUNT(*)`。テーブル不在は `Err("42P01")`。
 fn count(core: &EngineCore, c: &PolicyContext) -> Result<u64, String> {
     match run(core, c, "SELECT COUNT(*) FROM docs")? {
@@ -357,8 +370,9 @@ fn assert_truncate_state(db: &Path, lines: &[String]) {
         "BEGIN_SEED" => {
             let seed = insert_sql("c", 1, ALICE_ROWS, &format!("seed-{k}"));
             if n == ALICE_ROWS {
-                // 投入が commit 済みなら台帳も残っている。
-                assert_eq!(err(&core, &alice, &seed), "23505", "{ctx_msg}");
+                // 投入が commit 済みなら台帳も残っている（行の重複と区別できる再送で確認）。
+                let probe = ledger_probe_sql(&format!("seed-{k}"));
+                assert_eq!(err(&core, &alice, &probe), LEDGER_PRESENT, "{ctx_msg}");
             } else {
                 // 未反映なら台帳も残っていない（同じ operation_id で再投入できる）。
                 ok(&core, &alice, &seed);
@@ -426,9 +440,9 @@ fn assert_table_fully_present(core: &EngineCore, k: u64, msg: &str) {
         "{msg}"
     );
     assert_eq!(count(core, &bob).expect("bob count"), BOB_ROWS, "{msg}");
-    // 台帳が残っている（同一 operation_id の再送は重複）。
-    let reseed = insert_sql("c", 1, ALICE_ROWS, &format!("seed-a-{k}"));
-    assert_eq!(err(core, &alice, &reseed), "23505", "{msg}");
+    // 台帳が残っている（同一 operation_id・重ならない行の再送は内容不一致）。
+    let probe = ledger_probe_sql(&format!("seed-a-{k}"));
+    assert_eq!(err(core, &alice, &probe), LEDGER_PRESENT, "{msg}");
     // 一意索引が残っている（既存 code の別 id への投入は UNIQUE 違反）。
     assert_eq!(
         err(
@@ -507,14 +521,16 @@ fn assert_drop_state(db: &Path, lines: &[String]) {
                 }
                 let reseed = insert_sql("c", 1, ALICE_ROWS, &format!("seed-a-{k}"));
                 if n == ALICE_ROWS {
-                    assert_eq!(err(&core, &ctx("alice"), &reseed), "23505", "{msg}");
+                    let probe = ledger_probe_sql(&format!("seed-a-{k}"));
+                    assert_eq!(err(&core, &ctx("alice"), &probe), LEDGER_PRESENT, "{msg}");
                 } else {
                     // 行が無いなら台帳も無い（再投入できる）。
                     ok(&core, &ctx("alice"), &reseed);
                 }
                 let reseed_bob = insert_sql("b", BOB_ID_BASE, BOB_ROWS, &format!("seed-b-{k}"));
                 if nb == BOB_ROWS {
-                    assert_eq!(err(&core, &ctx("bob"), &reseed_bob), "23505", "{msg}");
+                    let probe = ledger_probe_sql(&format!("seed-b-{k}"));
+                    assert_eq!(err(&core, &ctx("bob"), &probe), LEDGER_PRESENT, "{msg}");
                 } else {
                     ok(&core, &ctx("bob"), &reseed_bob);
                 }
