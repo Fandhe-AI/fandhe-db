@@ -1385,6 +1385,62 @@ fn deferred_foreign_key_violation_at_commit_discards_entire_transaction() {
     assert_eq!(row_count(&core, &alice, "unrelated"), 0);
 }
 
+/// `COMMIT` 時の判定順序（Issue #1201・TABLE-21）: 持続時間上限超過（`54000`）を
+/// 遅延 FK 検査（`23503`）より先に判定する。違反を抱えたまま期限を超えた
+/// トランザクションは `23503` ではなく `54000` で拒否され、`Failed` へ遷移する
+/// （続く `ROLLBACK` は成功して `Idle`）。対照は上の
+/// `deferred_foreign_key_violation_at_commit_discards_entire_transaction`
+/// （遅延違反経路では `23503` → `Idle` → `ROLLBACK` は `25P01`）で、終了状態の
+/// 違いで判定経路を区別する。
+#[test]
+fn commit_duration_limit_is_judged_before_deferred_foreign_key_check() {
+    use engine::sql::transaction::TransactionLimits;
+
+    let (core, path) = new_core("fk-deferred-commit-duration");
+    let _guard = CleanupGuard(path);
+    // 負荷下でも INSERT が期限内に終わるよう幅を持たせる（#1213 の経緯）。
+    let max_duration = std::time::Duration::from_secs(1);
+    let core = core.with_transaction_limits(TransactionLimits {
+        max_duration,
+        max_statements: 1_000,
+    });
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE p (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE c (parent_id BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    let alice = ctx("alice");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        // 親が存在しない（遅延のため文時点では成功する）。
+        "INSERT INTO c (id, parent_id) VALUES (1, 999) USING OPERATION_ID 'op-c'",
+    )
+    .expect("insert with a dangling deferred reference must succeed at statement time");
+    std::thread::sleep(max_duration * 2);
+    let err = core
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect_err("COMMIT past the duration limit must be rejected");
+    assert_eq!(
+        err.wire_code(),
+        "54000",
+        "duration limit precedes the deferred check"
+    );
+    // 遅延違反の経路なら `Idle` になる。`Failed` であることが期限判定経路の証拠。
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+        .expect("ROLLBACK of a failed transaction must succeed");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert_eq!(row_count(&core, &alice, "c"), 0);
+}
+
 /// R1: 親を `TRUNCATE` してから同じキーで再挿入した場合、COMMIT 時点の事後
 /// 状態だけを見るため成功する。`TRUNCATE` だけで終えた場合は COMMIT が違反に
 /// なり、親の行は残る（TABLE-17・TASK-205、Issue #1077）。

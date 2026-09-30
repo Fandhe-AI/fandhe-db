@@ -366,6 +366,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-parse-bind をスキップ"
 endif
 
+.PHONY: bench-relational-p95
+bench-relational-p95: ## Issue #1204（述語 OR/IN・スカラー ORDER BY・2 テーブル結合）の p95 計測ベンチを実行する（env: BENCH_RELATIONAL_P95_ROUNDS / _GROUP / _ROWS。時間依存・spec 閾値の CI 判定なし・手動実行専用のため ci には含めない）
+ifdef HAS_CARGO
+	cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-relational-p95 をスキップ"
+endif
+
 # --------------------------------------------------
 # hybrid_rrf クエリ段別内訳プロファイル（Issue #356。crates/engine/benches/hybrid_profile_bench.rs）
 # --------------------------------------------------

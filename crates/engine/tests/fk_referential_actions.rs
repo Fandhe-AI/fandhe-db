@@ -142,6 +142,72 @@ fn declaring_always_failing_referential_actions_is_rejected_with_42830() {
     }
 }
 
+/// 宣言時検査（Issue #1201・TABLE-20）: `ON UPDATE CASCADE` で参照元列が `NOT NULL`・
+/// 参照先列が NULL 許容の組は、参照先が NULL へ更新された瞬間に必ず失敗する宣言
+/// のため `42830` で拒否する。`CREATE TABLE`（列制約形・表制約形）と
+/// `ALTER TABLE ... ADD FOREIGN KEY` の 2 経路（いずれも
+/// `catalog::resolve_foreign_key_target` を通る）と、拒否後に副作用が残らないこと、
+/// 拒否されない対照形（陽性対照）を固定する。(a)(b) は上のテストが担う。
+#[test]
+fn declaring_on_update_cascade_from_not_null_to_nullable_parent_is_rejected_with_42830() {
+    let (core, path) = new_core("fkact-a8c");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    // `code` は NULL 許容の UNIQUE 列（`PRIMARY KEY` は NOT NULL 扱いのため使わない）。
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE parents (code TEXT UNIQUE, label TEXT)",
+    );
+    let column_form =
+        "CREATE TABLE c1 (code TEXT NOT NULL REFERENCES parents(code) ON UPDATE CASCADE)";
+    let table_form = "CREATE TABLE c2 (code TEXT NOT NULL, \
+         FOREIGN KEY (code) REFERENCES parents(code) ON UPDATE CASCADE)";
+    for sql in [column_form, table_form] {
+        assert_eq!(err_code(&core, &sys, sql), "42830", "{sql}");
+    }
+    // 副作用ゼロ: カタログに何も残っていない（同名テーブルを正しい形で作れる）。
+    ok(&core, &sys, "CREATE TABLE c1 (code TEXT NOT NULL)");
+    ok(&core, &sys, "CREATE TABLE c2 (code TEXT NOT NULL)");
+
+    // ALTER TABLE 経路。
+    ok(&core, &sys, "CREATE TABLE c3 (code TEXT NOT NULL)");
+    assert_eq!(
+        err_code(
+            &core,
+            &sys,
+            "ALTER TABLE c3 ADD FOREIGN KEY (code) REFERENCES parents(code) ON UPDATE CASCADE"
+        ),
+        "42830"
+    );
+    // 拒否後に FK は追加されていない（参照を満たさない行の INSERT が成功する）。
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO c3 (id, code) VALUES (1, 'no-such-parent') USING OPERATION_ID 'op-c3'",
+    );
+
+    // 陽性対照: 同形でも受理される宣言。
+    for sql in [
+        "CREATE TABLE ok1 (code TEXT NOT NULL REFERENCES parents(code) ON UPDATE NO ACTION)",
+        "CREATE TABLE ok2 (code TEXT NOT NULL REFERENCES parents(code) ON DELETE CASCADE)",
+        "CREATE TABLE ok3 (code TEXT REFERENCES parents(code) ON UPDATE CASCADE)",
+    ] {
+        ok(&core, &sys, sql);
+    }
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE strict_parents (code TEXT NOT NULL UNIQUE, label TEXT)",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE ok4 (code TEXT NOT NULL REFERENCES strict_parents(code) ON UPDATE CASCADE)",
+    );
+}
+
 // --- ON DELETE ----------------------------------------------------------------
 
 fn create_id_parent_with_action(core: &EngineCore, on_delete: &str) {
@@ -1247,4 +1313,115 @@ fn on_update_cascade_syncs_key_index_for_grandchild_no_action_check() {
         select_cell(&core, &alice, "cities", 1, "country"),
         Some(Cell::Text("JP".to_string()))
     );
+}
+
+// --- 連鎖行数の上限（Issue #1201・TABLE-20） ---------------------------------
+
+/// 1 文あたりの連鎖対象行数の上限（`constraint::MAX_REFERENTIAL_ACTION_ROWS` =
+/// 10,000）を超える `ON DELETE CASCADE` は `54000` で拒否され、副作用ゼロ
+/// （親・子とも変更なし・台帳未記録）であること、予算がテナント内に閉じて
+/// 他テナントの行に触れないこと、上限ちょうど（10,000 行）は成功することを固定する。
+#[test]
+fn cascade_delete_beyond_row_limit_is_54000_with_zero_side_effects() {
+    use engine::batch_limits::BatchLimits;
+
+    let path = unique_db_path("fkact-row-limit");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // 1 万行超の複数行 INSERT を少ない文数で投入するため、バッチ行数上限を広げる。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(
+        BatchLimits {
+            max_files_per_batch: 20_000,
+            ..BatchLimits::default()
+        },
+    );
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE parents (name TEXT)");
+    ok(
+        &core,
+        &sys,
+        "CREATE TABLE children (parent_id BIGINT REFERENCES parents ON DELETE CASCADE, note TEXT)",
+    );
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO parents (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-a-p'",
+    );
+    ok(
+        &core,
+        &bob,
+        "INSERT INTO parents (id, name) VALUES (1, 'p') USING OPERATION_ID 'op-b-p'",
+    );
+    let insert_children = |who: &PolicyContext, tag: &str, first: u64, count: u64| {
+        let mut done = 0;
+        let mut chunk = 0;
+        while done < count {
+            let n = (count - done).min(1_000);
+            let values: Vec<String> = (0..n)
+                .map(|i| format!("({}, 1, 'c')", first + done + i))
+                .collect();
+            ok(
+                &core,
+                who,
+                &format!(
+                    "INSERT INTO children (id, parent_id, note) VALUES {} USING OPERATION_ID 'op-{tag}-{chunk}'",
+                    values.join(", ")
+                ),
+            );
+            done += n;
+            chunk += 1;
+        }
+    };
+    insert_children(&alice, "a", 1, 10_001);
+    insert_children(&bob, "b", 1, 50);
+
+    let count = |who: &PolicyContext, table: &str| -> usize {
+        // `LIMIT` 上限（10,000）を超える件数を観測するため `COUNT(*)` を使う。
+        match ok(&core, who, &format!("SELECT COUNT(*) FROM {table}")) {
+            SqlOutcome::Query(result) => match result.rows.first().map(|r| r.cells[0].clone()) {
+                Some(Cell::Integer(n)) => n as usize,
+                other => panic!("expected Integer count, got {other:?}"),
+            },
+            other => panic!("expected Query outcome, got {other:?}"),
+        }
+    };
+    assert_eq!(count(&alice, "children"), 10_001);
+
+    // 10,001 行 > 上限 10,000 行 → 54000。
+    for _ in 0..2 {
+        // 2 回目は同じ operation_id の再送: 台帳に残っていないため同じ結果になる。
+        assert_eq!(
+            err_code(
+                &core,
+                &alice,
+                "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-del'"
+            ),
+            "54000"
+        );
+    }
+    // 副作用ゼロ。他テナントも不変。
+    assert_eq!(count(&alice, "parents"), 1);
+    assert_eq!(count(&alice, "children"), 10_001);
+    assert_eq!(count(&bob, "parents"), 1);
+    assert_eq!(count(&bob, "children"), 50);
+
+    // 境界: 子を 1 行減らして 10,000 行にすると連鎖は成功する。
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM children WHERE id = 1 USING OPERATION_ID 'op-del-one'",
+    );
+    assert_eq!(count(&alice, "children"), 10_000);
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM parents WHERE id = 1 USING OPERATION_ID 'op-del-ok'",
+    );
+    assert_eq!(count(&alice, "parents"), 0);
+    assert_eq!(count(&alice, "children"), 0);
+    // 予算・適用ともテナント内に閉じ、bob の行は変更されない。
+    assert_eq!(count(&bob, "parents"), 1);
+    assert_eq!(count(&bob, "children"), 50);
 }
