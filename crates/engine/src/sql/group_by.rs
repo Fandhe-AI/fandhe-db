@@ -2105,13 +2105,20 @@ fn eval_group_row_exprs(
 
 /// 集計・キーの出力セルを、式評価用の行スカラー（[`row_codec::ScalarRef`]）へ写す
 /// （Issue #1188。束縛側の合成列型 `INTEGER`／`BIGINT`→`BIGINT`・`REAL`／`DOUBLE`→`DOUBLE`
-/// と対応）。`COUNT`・`id` 系の `Cell::Integer(u64)` が `i64` に収まらない場合は `22003`。
+/// と対応）。`COUNT`・`id` 系の `Cell::Integer(u64)` は、`WHERE`・投影の式で `id` を参照する
+/// ときと同じ `f64` で正確に表現できる範囲（`2^53` 以下。
+/// [`crate::sql::udf_call::id_as_finite_scalar`]）に限り受け付け、超える値は黙って丸めず
+/// 同じ `22000` で拒否する（`i64` 範囲外の値も同じ扱い）。
+/// 参照されない列（`group_row_mask` が偽）はそもそも本関数を通らない。
 fn cell_to_scalar_ref(cell: &Cell) -> Result<Option<row_codec::ScalarRef<'_>>, SqlSurfaceError> {
     Ok(match cell {
         Cell::Null => None,
-        Cell::Integer(v) => Some(row_codec::ScalarRef::BigInt(i64::try_from(*v).map_err(
-            |_| SqlSurfaceError::numeric_out_of_range("bigint out of range in HAVING/ORDER BY"),
-        )?)),
+        Cell::Integer(v) => {
+            crate::sql::udf_call::id_as_finite_scalar(*v)?;
+            Some(row_codec::ScalarRef::BigInt(i64::try_from(*v).map_err(
+                |_| accumulator_bug("integer within 2^53 did not fit in i64"),
+            )?))
+        }
         Cell::SignedInteger(v) => Some(row_codec::ScalarRef::BigInt(*v)),
         Cell::Float(v) => Some(row_codec::ScalarRef::Double(*v)),
         Cell::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
@@ -2131,6 +2138,21 @@ fn cell_to_scalar_ref(cell: &Cell) -> Result<Option<row_codec::ScalarRef<'_>>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1188: 式形の `HAVING`／`ORDER BY` が参照する `Cell::Integer(u64)` は、`WHERE`・
+    /// 投影の式の `id` と同じ `2^53` 境界で扱う（`i64` 範囲外を含め超過は `22000`）。
+    #[test]
+    fn group_row_integer_cell_uses_exact_f64_boundary() {
+        let exact = 1u64 << 53;
+        assert!(matches!(
+            cell_to_scalar_ref(&Cell::Integer(exact)),
+            Ok(Some(row_codec::ScalarRef::BigInt(v))) if v == exact as i64
+        ));
+        for v in [exact + 1, i64::MAX as u64 + 1, u64::MAX] {
+            let err = cell_to_scalar_ref(&Cell::Integer(v)).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "22000", "v={v}");
+        }
+    }
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::sql::allowlist::AggregateFunc;
     use crate::sql::parser::{AggregateInput, BoundAggregate, BoundAggregateItem, BoundGroupBy};

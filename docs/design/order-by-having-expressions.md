@@ -76,7 +76,8 @@
 ## PostgreSQL との既知の差分
 
 - `EXTRACT` の戻り型は `numeric` ではなく `f64`。`EXTRACT(hour FROM date)` はエラーにせず 0（`date_part` と同じ）。
-- 式形の `HAVING`／`ORDER BY` は `f64` 意味論（2^53 超の整数は丸める）。従来形の `HAVING` は厳密比較のまま。
+- 式形の `HAVING`／`ORDER BY` は `f64` 意味論。`2^53` を超える整数（`id`・`COUNT`・`SUM` 等の結果を含む）は
+  `WHERE`・投影の式と同じく丸めずに `22000` で拒否する。従来形の `HAVING` は厳密比較のまま。
 
 ## テスト
 
