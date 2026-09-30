@@ -584,7 +584,16 @@ pub(crate) fn recover_unique_keys_of_corrupt_rows(
         corrupt_ids,
     )? {
         recovered.insert(id);
-        existing.entry(key).or_insert(id);
+        // 健全行の走査で登録済みのキーと異なる行 id が補完された場合は、
+        // `scan_tenant_rows_by_unique_key` と同じく一意性の不変条件違反（内部矛盾）
+        // として fail-closed で拒否する（黙って無視しない）。
+        if let Some(existing_id) = existing.insert(key, id) {
+            if existing_id != id {
+                return Err(internal(
+                    "duplicate existing rows share a UNIQUE key: catalog invariant violated",
+                ));
+            }
+        }
     }
     // 索引が未構築・逆引きが無いなどでキーを復元できない破損行が残る場合は、
     // 対象キーに依らず常に同じ `XX000` で拒否する（Issue #1254・RLS-10）。
