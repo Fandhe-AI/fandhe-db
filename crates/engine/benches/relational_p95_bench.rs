@@ -34,12 +34,12 @@ use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
     author_id_for_doc, expected_order_multi, expected_order_single, inner_product_distance,
-    interleave_with_reference, is_exact_id_set, join_statement, lang_for_id, lang_in_first_n,
-    lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
-    parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
-    refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
-    round_p95, scale_label, sentinel_dominates, sentinel_qty, sentinel_scale, summarize_rounds,
-    topk_matches, visible_doc_rows, Group, JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
+    interleave_with_reference, is_exact_id_set, join_scale_label, join_statement, lang_for_id,
+    lang_in_first_n, lang_token, order_by_statements, other_tenant_rows, pair_ratio, parse_group,
+    parse_rounds, parse_rows_scale, predicate_statements, qty_for_id, refuse_under_github_actions,
+    render_round_line, render_summary_line, render_threshold_line, round_p95, scale_label,
+    sentinel_dominates, sentinel_qty, sentinel_scale, summarize_rounds, topk_matches,
+    visible_doc_rows, Group, JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -68,14 +68,14 @@ const TENANT_B: &str = "bench-tenant-b";
 const DOCS: &str = "docs";
 const DOCUMENTS: &str = "documents";
 const AUTHORS: &str = "authors";
-/// ラウンドあたりの warmup／計測回数（p95 の分解能を確保するため計測 200 回）。
-/// 結合の全件検査のページ幅・最大ページ数（`OFFSET` は `MAX_SEARCH_K` 以内）。
 /// 結合右辺の越境検出用 probe 間隔。自テナント文書のうち `id % JOIN_PROBE_MOD == JOIN_PROBE_MOD - 1` の行は
 /// 他テナントの作者行（右辺）を結合キーに持つ。右辺の RLS が効く限り内部結合から脱落し、右辺 RLS だけが
 /// 外れると結果へ現れる（事前検査で検出できる fixture。RLS-10）。
 const JOIN_PROBE_MOD: u64 = 100;
+/// 結合の全件検査のページ幅・最大ページ数（`OFFSET` は `MAX_SEARCH_K` 以内）。
 const JOIN_PAGE_ROWS: usize = 5_000;
 const JOIN_PAGES: usize = 3;
+/// ラウンドあたりの warmup／計測回数（p95 の分解能を確保するため計測 200 回）。
 const WARMUP: u32 = 20;
 const MEASURED: u32 = 200;
 
@@ -348,7 +348,7 @@ fn measure_group(
     // 比率あり群は参照 arm を各候補の直前に挟む（policy §3 の baseline/cand1/baseline/cand2 輪番）。
     // 各候補は直前に測った参照 arm の p95 と対にして保持し、時間方向の環境変動を比率へ混入させない。
     let ratio_ref = if with_ratio { ref_idx } else { None };
-    let mut paired_ref: Vec<Vec<Duration>> = vec![Vec::new(); arms.len()];
+    let mut pairs: Vec<Vec<(Duration, Duration)>> = vec![Vec::new(); arms.len()];
     for round in 0..rounds as usize {
         let load = loadavg();
         let mut last_ref: Option<Duration> = None;
@@ -370,7 +370,7 @@ fn measure_group(
             );
             // 参照 arm は 1 ラウンドに候補数だけ現れる。要約（min_of_n・中央値・ラン間の幅）を
             // N ラウンド統計に保つため、参照 arm はラウンド最初の 1 回だけ per_arm へ記録する
-            // （比率用の対応付け p95 は paired_ref に別途保持し、全出現の round 行は出力する）。
+            // （比率用の対応付け p95 は pairs に別途保持し、全出現の round 行は出力する）。
             if ratio_ref != Some(idx) || last_ref.is_none() {
                 if let Some(v) = per_arm.get_mut(idx) {
                     v.push(p95);
@@ -378,8 +378,8 @@ fn measure_group(
             }
             if ratio_ref == Some(idx) {
                 last_ref = Some(p95);
-            } else if let (Some(r), Some(v)) = (last_ref, paired_ref.get_mut(idx)) {
-                v.push(r);
+            } else if let (Some(r), Some(v)) = (last_ref, pairs.get_mut(idx)) {
+                v.push((p95, r));
             }
         }
     }
@@ -388,14 +388,11 @@ fn measure_group(
         .map(|v| summarize_rounds(v).unwrap_or_else(|e| fail_closed(e)))
         .collect();
     for (i, ((label, _), summary)) in arms.iter().zip(&summaries).enumerate() {
-        // 比率は候補 min ÷ 「その候補の直前に測った参照 arm」の min（対応付け集計）。
-        let ratio = match (ratio_ref, paired_ref.get(i)) {
-            (Some(r), Some(refs)) if i != r && !refs.is_empty() => {
-                let ref_min = summarize_rounds(refs)
-                    .unwrap_or_else(|e| fail_closed(e))
-                    .min;
-                let r = ratio_vs_reference(summary.min, ref_min).unwrap_or_else(|e| fail_closed(e));
-                Some((r, ref_min))
+        // 比率は候補 min ÷ 「その min を出したペアで直前に測った参照 arm の p95」。分子と分母を同一ペアに
+        // 揃え、分母を `ref_paired` として併記するので、出力した値から比率を再現できる。
+        let ratio = match (ratio_ref, pairs.get(i)) {
+            (Some(r), Some(ps)) if i != r && !ps.is_empty() => {
+                Some(pair_ratio(ps).unwrap_or_else(|e| fail_closed(e)))
             }
             _ => None,
         };
@@ -700,7 +697,7 @@ fn run_join_group(rows: usize, rounds: u32) {
     }
     measure_group(
         "join",
-        (join_rows as usize, scale_label(rows)),
+        (join_rows as usize, join_scale_label(join_rows as usize)),
         rounds,
         &core,
         &ctx_a,
@@ -739,5 +736,12 @@ fn main() {
     if group.includes(Group::Join) {
         run_join_group(rows, rounds);
     }
-    println!("{}", render_threshold_line(dedicated));
+    // 実行した全グループが規定の行数のときだけ「閾値との比較」を案内する（縮小規模は専有環境でも対象外）。
+    let docs_full = !(group.includes(Group::Predicate) || group.includes(Group::OrderBy))
+        || scale_label(rows) == "full";
+    let join_full = !group.includes(Group::Join) || join_scale_label(rows.min(JOIN_ROWS)) == "full";
+    println!(
+        "{}",
+        render_threshold_line(dedicated, docs_full && join_full)
+    );
 }

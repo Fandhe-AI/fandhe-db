@@ -161,6 +161,15 @@ pub fn parse_rows_scale(raw: Option<&str>) -> Result<usize, RelationalP95Error> 
 }
 
 /// 行数が既定規模かを表すラベル（`full` / `reduced`）。
+/// 結合グループの規模ラベル。実際に使った結合行数 `join_rows` を規定の `JOIN_ROWS` と比べて決める。
+pub fn join_scale_label(join_rows: usize) -> &'static str {
+    if join_rows == JOIN_ROWS {
+        "full"
+    } else {
+        "reduced"
+    }
+}
+
 pub fn scale_label(rows: usize) -> &'static str {
     if rows == DEFAULT_ROWS {
         "full"
@@ -487,6 +496,22 @@ pub fn round_p95(samples: &[Duration]) -> Result<Duration, RelationalP95Error> {
 }
 
 /// arm の min-of-N と参照 arm の min-of-N の比。分母 0 は拒否。
+/// `(候補 p95, 直前に測った参照 p95)` のペア列から、候補 p95 が最小のペアを選び、そのペアの比率と
+/// 参照値を返す。分子（候補 min）と分母（同じペアの参照値）が同一ペア由来になり、出力した 2 値から
+/// 比率を再現できる。候補 p95 が同値のペアは先に測ったものを選ぶ。
+pub fn pair_ratio(pairs: &[(Duration, Duration)]) -> Result<(f64, Duration), RelationalP95Error> {
+    let Some((cand, reference)) = pairs
+        .iter()
+        .copied()
+        .reduce(|best, p| if p.0 < best.0 { p } else { best })
+    else {
+        return Err(RelationalP95Error::DegenerateRatio(
+            "no candidate/reference pair",
+        ));
+    };
+    Ok((ratio_vs_reference(cand, reference)?, reference))
+}
+
 pub fn ratio_vs_reference(arm_min: Duration, ref_min: Duration) -> Result<f64, RelationalP95Error> {
     if ref_min.is_zero() {
         return Err(RelationalP95Error::DegenerateRatio("reference min is zero"));
@@ -558,11 +583,11 @@ pub fn render_summary_line(
     summary: &RoundSummary,
     ratio: Option<(f64, Duration)>,
 ) -> String {
-    // 比率の分母（その候補の直前に測った参照 arm の min）を併記し、表示値から比率を再現できるようにする。
+    // 比率の分母（候補の min と同じペアで直前に測った参照 arm の p95）を併記し、表示値から比率を再現できるようにする。
     // 参照 arm 自身の `min_of_n` はラウンドごとに 1 回だけの系列で、分母とは別の系列（対応付け集計）。
     let ratio_part = match ratio {
         Some((r, ref_min)) => format!(
-            " ratio_vs_{REFERENCE_ARM}={r:.3} ref_min_paired={:.3}ms",
+            " ratio_vs_{REFERENCE_ARM}={r:.3} ref_paired={:.3}ms",
             ms(ref_min)
         ),
         None => String::new(),
@@ -577,9 +602,11 @@ pub fn render_summary_line(
     )
 }
 
-pub fn render_threshold_line(dedicated: bool) -> String {
-    if dedicated {
+pub fn render_threshold_line(dedicated: bool, full_scale: bool) -> String {
+    if dedicated && full_scale {
         "threshold_judgement: dedicated environment attested; compare min_of_n against the spec criteria manually".to_string()
+    } else if dedicated {
+        "threshold_judgement: not evaluated (reduced scale; reference values only)".to_string()
     } else {
         "threshold_judgement: not evaluated (shared environment; reference values only)".to_string()
     }

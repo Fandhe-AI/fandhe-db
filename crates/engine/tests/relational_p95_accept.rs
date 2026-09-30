@@ -53,6 +53,19 @@ fn parse_rows_scale_bounds() {
     }
     assert_eq!(scale_label(DEFAULT_ROWS), "full");
     assert_eq!(scale_label(5_000), "reduced");
+    // 結合の規模は実際の結合行数で決まる（docs 行数が規定でも結合が縮小なら reduced）。
+    assert_eq!(join_scale_label(JOIN_ROWS), "full");
+    assert_eq!(join_scale_label(1_000), "reduced");
+}
+
+#[test]
+fn pair_ratio_uses_reference_of_the_min_pair() {
+    // 候補 min（8ms）のペアの参照（4ms）で割る。別ペアの参照 min（2ms）は使わない。
+    let pairs = [(ms(10), ms(2)), (ms(8), ms(4)), (ms(9), ms(3))];
+    let (ratio, reference) = pair_ratio(&pairs).expect("ratio");
+    assert_eq!(reference, ms(4));
+    assert!((ratio - 2.0).abs() < 1e-9);
+    assert!(pair_ratio(&[]).is_err());
 }
 
 #[test]
@@ -199,7 +212,7 @@ fn rendered_lines_have_keys_and_no_tenant() {
         Some((1.5, ms(8))),
     );
     assert!(sum.contains("min_of_n=") && sum.contains("scale=reduced"));
-    assert!(sum.contains("ratio_vs_pred_eq=1.500 ref_min_paired=8.000ms"));
+    assert!(sum.contains("ratio_vs_pred_eq=1.500 ref_paired=8.000ms"));
     for line in [&round, &sum] {
         assert!(!line.contains("tenant"));
         assert!(!line.contains("SELECT"));
@@ -208,8 +221,11 @@ fn rendered_lines_have_keys_and_no_tenant() {
 
 #[test]
 fn threshold_line_states_not_evaluated_when_shared() {
-    assert!(render_threshold_line(false).contains("not evaluated"));
-    assert!(!render_threshold_line(true).contains("not evaluated"));
+    assert!(render_threshold_line(false, true).contains("not evaluated"));
+    assert!(render_threshold_line(false, false).contains("not evaluated"));
+    // 専有環境でも縮小規模なら閾値との比較を促さない。
+    assert!(render_threshold_line(true, false).contains("reduced scale"));
+    assert!(!render_threshold_line(true, true).contains("not evaluated"));
 }
 
 #[test]
