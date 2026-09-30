@@ -292,12 +292,30 @@ fn a3_exactly_at_limit_succeeds() {
 
 // --- A4: 単一行形（where.id）は上限の対象外 ---------------------------------
 
+/// 単一行形（`where.id`）は、設定できる最も厳しい上限でも拒否されない。
+///
+/// 上限は `NonZeroUsize`（`0` は「上限なし」の `None` と同義で設定できない）のため最小値は
+/// `1` で、影響行数が高々 1 の単一行形は上限を**超える状態を作れない**。そこで、上限 `1`
+/// の同じ core で述語形（一致 3 行）が `413`／`54000` になること（リミッタが働いている
+/// ことの陽性対照）を確かめたうえで、単一行形の更新・削除が成功し、指定した行だけが
+/// 変わることを固定する（影響行数ではなくテーブル行数や候補数で上限を判定する回帰を
+/// 検出する）。
 #[test]
 fn a4_single_row_form_is_not_subject_to_the_limit() {
-    let rows = rows_of("tenant-a", 1..=(LIMIT as u64 + 1), "ja");
-    let (core, _guard) = new_core(&rows, Some(LIMIT));
+    const MIN_LIMIT: usize = 1;
+    let rows = rows_of("tenant-a", 1..=3, "ja");
+    let (core, _guard) = new_core(&rows, Some(MIN_LIMIT));
     let http = spawn_http(core.clone());
 
+    // 陽性対照: 同じ上限で述語形（一致 3 行 > 1）は拒否され、副作用も無い。
+    let before = read_rows(&core, "tenant-a");
+    let resp = http.q("alice", &pred_update("ja", "en", "a4-pred-upd"));
+    assert_limit_rejection(&resp);
+    let resp = http.q("alice", &pred_delete("ja", "a4-pred-del"));
+    assert_limit_rejection(&resp);
+    assert_eq!(read_rows(&core, "tenant-a"), before, "no side effect");
+
+    // 単一行形は上限 1 でも成功し、指定した行だけが変わる。
     let resp = http.q(
         "alice",
         r#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"a4-upd"}"#,
@@ -308,6 +326,10 @@ fn a4_single_row_form_is_not_subject_to_the_limit() {
         r#"{"op":"delete","table":"docs","where":{"id":2},"operation_id":"a4-del"}"#,
     );
     assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert_eq!(
+        read_rows(&core, "tenant-a"),
+        vec![(1, Some("en".to_string())), (3, Some("ja".to_string()))]
+    );
 }
 
 // --- A5: RLS-10 (a) × NOSQL-12 の交差 ---------------------------------------
