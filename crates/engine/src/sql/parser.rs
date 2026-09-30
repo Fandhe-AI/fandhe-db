@@ -4190,6 +4190,8 @@ pub(crate) struct BoundHaving {
 pub(crate) enum OrderTarget {
     GroupKey(usize),
     Aggregate(usize),
+    /// 式キー（Issue #1188・SQL-26）。[`BoundGroupBy::order_exprs`] の添字。
+    Expr(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4207,6 +4209,18 @@ pub(crate) struct BoundOrderBy {
 pub(crate) struct BoundGroupBy {
     pub(crate) keys: Vec<BoundOrderKey>,
     pub(crate) having: Vec<BoundHaving>,
+    /// 式述語の `HAVING`（Issue #1188・SQL-26）をステップ列コンパイルした実行形。
+    /// 「グループ出力行ビュー」（[`group_row_schema`]。`keys`・`items` の順に並ぶ列）を
+    /// 行スカラーとして評価し、`Bool(true)` のグループだけを残す。従来形 `having` と
+    /// AND 結合。直接構築経路（NoSQL）は常に空。
+    pub(crate) having_exprs: Vec<crate::sql::expr_program::ExprProgram>,
+    /// 式キーの `ORDER BY`（Issue #1188）。`(コンパイル済み式, 比較規約)`。
+    /// [`OrderTarget::Expr`] の添字先。
+    pub(crate) order_exprs: Vec<(crate::sql::expr_program::ExprProgram, OrderKind)>,
+    /// `having_exprs`／`order_exprs` が参照するグループ出力行ビューの列（`keys`・`items`
+    /// の順。長さ `keys.len() + items.len()`）のマスク。参照されない列は評価時に
+    /// 値化しない（未参照の列の変換エラーで無関係な式が失敗しないようにする）。
+    pub(crate) group_row_mask: Vec<bool>,
     pub(crate) order_by: Vec<BoundOrderBy>,
     pub(crate) limit: Option<usize>,
     /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。Issue #916・SQL-25 (b)・
@@ -4227,7 +4241,7 @@ impl BoundGroupBy {
             .iter()
             .filter_map(|k| match k.target {
                 BoundOrderTarget::Column(index) => Some(index),
-                BoundOrderTarget::Id => None,
+                BoundOrderTarget::Id | BoundOrderTarget::Expr(_) => None,
             })
             .collect()
     }
@@ -4375,6 +4389,13 @@ impl BoundAggregate {
                         detail: "GROUP BY key index resolved out of bounds".to_string(),
                     })?,
                 BoundOrderTarget::Id => "id",
+                // グループキーは列か疑似列 `id` にしか束縛されない（式キーは
+                // `ORDER BY` 専用）。到達は配線不備のみ（fail-closed）。
+                BoundOrderTarget::Expr(_) => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "GROUP BY key resolved to an expression target".to_string(),
+                    })
+                }
             };
             key_names.push(name);
         }
@@ -4540,6 +4561,9 @@ impl BoundAggregate {
             group_by: Some(BoundGroupBy {
                 keys,
                 having: bound_having,
+                having_exprs: Vec::new(),
+                order_exprs: Vec::new(),
+                group_row_mask: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
@@ -5010,6 +5034,8 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             schema,
             &items,
             &group_key_aliases,
+            udfs,
+            &mut node_budget,
         )?),
     };
 
@@ -5075,7 +5101,17 @@ pub struct BoundScan {
     /// 完全に同一の実行経路（`sql::scan::execute_scan_with_budget`）を通る。
     /// [`Self::new`]（NoSQL 表層の直接構築経路）は常に空にする。
     pub(crate) windows: Vec<BoundWindowItem>,
+    /// 式キー（`BoundOrderTarget::Expr(i)` の `i` が指す）の束縛済み式とそのステップ列
+    /// コンパイル結果（Issue #1188・SQL-26）。式キーを持たない文・[`Self::new`] 経由の
+    /// 直接構築は空。
+    pub(crate) order_exprs: BoundOrderExprs,
 }
+
+/// 広域取得の式キーの `(束縛済み式, コンパイル済みプログラム)` 列（[`BoundScan::order_exprs`]）。
+pub(crate) type BoundOrderExprs = Vec<(
+    crate::sql::udf_call::BoundExpr,
+    crate::sql::expr_program::ExprProgram,
+)>;
 
 /// スカラー `ORDER BY` の対象（Issue #915・SQL-25）。`Id` は疑似列
 /// （[`ProjectedColumn::Id`] と同じ行キー由来）。
@@ -5083,6 +5119,9 @@ pub struct BoundScan {
 pub(crate) enum BoundOrderTarget {
     Id,
     Column(usize),
+    /// 式キー（Issue #1188）。[`BoundScan::order_exprs`] の添字。広域取得の
+    /// `ORDER BY` 専用で、`GROUP BY` キーには現れない。
+    Expr(usize),
 }
 
 /// 型ごとの比較規約の分類（[`crate::sql::scan`] の比較器がこの分類で分岐する。
@@ -5188,6 +5227,58 @@ fn bind_scalar_order_by(
     Ok(bound)
 }
 
+/// 式キーの静的型から比較規約を決める（Issue #1188）。`VECTOR` 値の式は VECTOR 列を
+/// キーにした場合と同じく並べ替え不能として `22000`。
+fn order_kind_for_expr_type(
+    ty: crate::sql::udf_call::ExprType,
+) -> Result<OrderKind, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Scalar => Ok(OrderKind::Float),
+        ExprType::Text => Ok(OrderKind::Bytes),
+        ExprType::Bool => Ok(OrderKind::Bool),
+        ExprType::Date | ExprType::Timestamp => Ok(OrderKind::SignedInt),
+        ExprType::Vector => Err(SqlSurfaceError::invalid_input(
+            "unsupported ORDER BY expression type: VECTOR",
+        )),
+    }
+}
+
+/// 式キーを含む広域取得 `ORDER BY`（[`crate::sql::allowlist::ScanOrderKey`]）を束縛する
+/// （Issue #1188・SQL-26）。列名キーは [`bind_scalar_order_by`] を共有し、式キーは
+/// [`crate::sql::udf_call::bind_expr`]（未知関数・型不整合・未知列は既存の束縛エラー）で
+/// 束縛してステップ列へコンパイルする。戻り値の第 2 要素が
+/// [`BoundOrderTarget::Expr`] の添字先。
+fn bind_scan_order_keys(
+    keys: &[crate::sql::allowlist::ScanOrderKey],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(Vec<BoundOrderKey>, BoundOrderExprs), SqlSurfaceError> {
+    use crate::sql::allowlist::ScanOrderKey;
+    let mut bound = Vec::with_capacity(keys.len());
+    let mut exprs = Vec::new();
+    for key in keys {
+        match key {
+            ScanOrderKey::Column(k) => {
+                bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
+            }
+            ScanOrderKey::Expr { expr, descending } => {
+                let (be, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                let kind = order_kind_for_expr_type(ty)?;
+                let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                bound.push(BoundOrderKey {
+                    target: BoundOrderTarget::Expr(exprs.len()),
+                    kind,
+                    descending: *descending,
+                });
+                exprs.push((be, program));
+            }
+        }
+    }
+    Ok((bound, exprs))
+}
+
 impl BoundScan {
     /// クレート外から `BoundScan` を直接構築する constructor（TASK-186・NOSQL-3。
     /// SQL テキストの構文解析・[`crate::sql::allowlist::validate_sql`] を経由せずに
@@ -5219,6 +5310,7 @@ impl BoundScan {
             expr_filter_programs,
             or_filters: Vec::new(),
             limit,
+            order_exprs: Vec::new(),
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
             // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
             // 続けて `with_order_by` を呼ぶ（builder 形。シグネチャは変えない）。
@@ -5690,7 +5782,13 @@ pub(crate) fn bind_scan_with_dummy_flags(
     let offset = validate_search_offset(stmt.offset())?;
 
     // Issue #915・SQL-25: スカラー ORDER BY の列名解決・比較規約の割り当て。
-    let order_by = bind_scalar_order_by(stmt.order_by(), schema)?;
+    // Issue #1188・SQL-26: 式キーを含む場合は `order_keys` が正本（`order_by` は空）。
+    // 式のノード予算は `WHERE`・投影と同じ `node_budget` を共有する。
+    let (order_by, order_exprs) = if stmt.order_keys.is_empty() {
+        (bind_scalar_order_by(stmt.order_by(), schema)?, Vec::new())
+    } else {
+        bind_scan_order_keys(&stmt.order_keys, schema, udfs, &mut node_budget)?
+    };
 
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
@@ -5712,6 +5810,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         order_by,
         offset,
         windows,
+        order_exprs,
     })
 }
 
@@ -5844,6 +5943,8 @@ fn bind_group_by_clause(
     schema: &TableSchema,
     items: &[BoundAggregateItem],
     group_key_aliases: &[(usize, String)],
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
     // GROUP BY 列は並べ替え可能な型の列か疑似列 `id` のみ許可する（VECTOR 等・
     // 未知列は型不整合 `22000`。Issue #1185・SQL-25 (d)）。SQL テキスト経由・
@@ -5867,7 +5968,7 @@ fn bind_group_by_clause(
         let target = resolve_target(&pred.item_name)?;
         let item_index = match target {
             OrderTarget::Aggregate(idx) => idx,
-            OrderTarget::GroupKey(_) => {
+            OrderTarget::GroupKey(_) | OrderTarget::Expr(_) => {
                 // GROUP BY 列（TEXT）は数値比較の対象にならない（HAVING 右辺は
                 // 常に数値リテラル）。列名一致でも `GroupKey` を指した場合は
                 // 型不整合として拒否する。
@@ -5892,11 +5993,48 @@ fn bind_group_by_clause(
         });
     }
 
+    // Issue #1188・SQL-26: 式述語の `HAVING`・式キーの `ORDER BY` は「グループ出力行ビュー」
+    // （`GROUP BY` キー列＋集計項目の結果を並べた合成スキーマ）に対して束縛する。式中の識別子は
+    // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。曖昧・未知は `22000`）で
+    // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
+    // ことはない。
+    let view_schema = group_row_schema(schema, &keys, items);
+    let mut group_row_mask = vec![false; keys.len().saturating_add(items.len())];
+    let mut having_exprs = Vec::with_capacity(clause.having_exprs.len());
+    for pred in &clause.having_exprs {
+        let expr = Expr::Binary {
+            op: pred.op,
+            lhs: Box::new(rewrite_group_row_idents(&pred.lhs, &resolve_target)?),
+            rhs: Box::new(rewrite_group_row_idents(&pred.rhs, &resolve_target)?),
+        };
+        let (bound, ty) = crate::sql::udf_call::bind_expr(&expr, &view_schema, udfs, node_budget)?;
+        if ty != crate::sql::udf_call::ExprType::Bool {
+            return Err(SqlSurfaceError::invalid_input(
+                "HAVING expression must be a boolean comparison",
+            ));
+        }
+        crate::sql::udf_call::mark_referenced_scalar_columns(&bound, &mut group_row_mask);
+        having_exprs.push(crate::sql::expr_program::ExprProgram::compile(&bound));
+    }
+
     // `clause.order_by` の長さは構文段が `MAX_SCALAR_ORDER_KEYS` 以下へ検査済み。
     let mut order_by = Vec::with_capacity(clause.order_by.len());
+    let mut order_exprs = Vec::new();
     for ob in &clause.order_by {
+        let target = match &ob.expr {
+            None => resolve_target(&ob.target)?,
+            Some(expr) => {
+                let rewritten = rewrite_group_row_idents(expr, &resolve_target)?;
+                let (bound, ty) =
+                    crate::sql::udf_call::bind_expr(&rewritten, &view_schema, udfs, node_budget)?;
+                let kind = order_kind_for_expr_type(ty)?;
+                crate::sql::udf_call::mark_referenced_scalar_columns(&bound, &mut group_row_mask);
+                order_exprs.push((crate::sql::expr_program::ExprProgram::compile(&bound), kind));
+                OrderTarget::Expr(order_exprs.len() - 1)
+            }
+        };
         order_by.push(BoundOrderBy {
-            target: resolve_target(&ob.target)?,
+            target,
             descending: ob.descending,
         });
     }
@@ -5924,12 +6062,131 @@ fn bind_group_by_clause(
     // とは別軸の「可視かつ WHERE 一致の行数」に対する上限）。
     let offset = validate_search_offset(clause.offset)?;
 
+    // 式を持たない文は直接構築経路（`new_grouped`）と同じ空マスクにそろえる。
+    if having_exprs.is_empty() && order_exprs.is_empty() {
+        group_row_mask.clear();
+    }
     Ok(BoundGroupBy {
         keys,
         having,
+        having_exprs,
+        order_exprs,
+        group_row_mask,
         order_by,
         limit,
         offset,
+    })
+}
+
+/// 集計項目の結果セルに対応する静的な列型（Issue #1188。グループ出力行ビューの合成列型）。
+/// 実行時のセル variant（`Accumulator::finish`）と対応させる: `COUNT`・`id` 系は
+/// `Cell::Integer(u64)`／整数列は `Cell::SignedInteger` → `BIGINT`、浮動小数・`AVG`・式入力は
+/// `Cell::Float` → `DOUBLE`、`TEXT`／`DATE`／`TIMESTAMP` の `MIN`/`MAX` は同名型。式中で扱えない
+/// 結果型（`NUMERIC` 等）は `BYTEA`（束縛が「式内で使えない列」として `22000` で拒否する）へ倒す。
+fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
+    use crate::sql::allowlist::AggregateFunc;
+    match item.func {
+        AggregateFunc::Count => ColumnType::BigInt,
+        AggregateFunc::Avg => match item.input {
+            AggregateInput::NumericColumn { .. } => ColumnType::Bytea,
+            _ => ColumnType::Double,
+        },
+        AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => match &item.input {
+            AggregateInput::IdU64
+            | AggregateInput::IntegerColumn(_)
+            | AggregateInput::BigIntColumn(_) => ColumnType::BigInt,
+            AggregateInput::RealColumn(_)
+            | AggregateInput::DoubleColumn(_)
+            | AggregateInput::ScalarExpr { .. } => ColumnType::Double,
+            AggregateInput::TextColumn(_) => ColumnType::Text,
+            AggregateInput::DateColumn(_) => ColumnType::Date,
+            AggregateInput::TimestampColumn(_) => ColumnType::Timestamp,
+            _ => ColumnType::Bytea,
+        },
+    }
+}
+
+/// グループ出力行ビューの合成スキーマ（Issue #1188・SQL-26）。列は `GROUP BY` キー
+/// （`__gk<i>`）→ 集計項目（`__ga<j>`）の順で、`HAVING`／`ORDER BY` の式束縛
+/// （[`crate::sql::udf_call::bind_expr`]）と実行時の行スカラービュー
+/// （`sql::group_by`）が同じ添字系列を共有する。キー列の型は実列型を正規化して使う
+/// （`INTEGER`→`BIGINT`・`REAL`→`DOUBLE`・`ENUM`→`TEXT`〔セルがラベル文字列のため〕、疑似列
+/// `id`→`BIGINT`）ため、非 `TEXT` キー（Issue #1185）にもそのまま追従する。
+fn group_row_schema(
+    schema: &TableSchema,
+    keys: &[BoundOrderKey],
+    items: &[BoundAggregateItem],
+) -> TableSchema {
+    let mut columns = Vec::with_capacity(keys.len().saturating_add(items.len()));
+    for (i, key) in keys.iter().enumerate() {
+        let ty = match key.target {
+            BoundOrderTarget::Column(index) => match schema.columns.get(index).map(|c| &c.ty) {
+                Some(ColumnType::Integer | ColumnType::BigInt) => ColumnType::BigInt,
+                Some(ColumnType::Real | ColumnType::Double) => ColumnType::Double,
+                Some(ColumnType::Enum(_)) => ColumnType::Text,
+                Some(other) => other.clone(),
+                None => ColumnType::Bytea,
+            },
+            BoundOrderTarget::Id => ColumnType::BigInt,
+            BoundOrderTarget::Expr(_) => ColumnType::Bytea,
+        };
+        columns.push(ColumnDef::new(format!("__gk{i}"), ty, true));
+    }
+    for (j, item) in items.iter().enumerate() {
+        columns.push(ColumnDef::new(
+            format!("__ga{j}"),
+            aggregate_result_column_type(item),
+            true,
+        ));
+    }
+    TableSchema::new("__group_row", columns)
+}
+
+/// 式中の識別子を `resolve_target`（`GROUP BY` キー名・別名・集計項目名）で解決し、
+/// グループ出力行ビューの合成列名（`__gk<i>`／`__ga<j>`）へ置換した式を返す
+/// （Issue #1188）。
+/// 未知・曖昧な識別子は `resolve_target` の `22000` をそのまま返す。
+fn rewrite_group_row_idents(
+    expr: &Expr,
+    resolve_target: &dyn Fn(&str) -> Result<OrderTarget, SqlSurfaceError>,
+) -> Result<Expr, SqlSurfaceError> {
+    let rec = |e: &Expr| rewrite_group_row_idents(e, resolve_target);
+    Ok(match expr {
+        Expr::Ident(name) => match resolve_target(name)? {
+            OrderTarget::GroupKey(i) => Expr::Ident(format!("__gk{i}")),
+            OrderTarget::Aggregate(j) => Expr::Ident(format!("__ga{j}")),
+            OrderTarget::Expr(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "identifier resolved to an expression target".to_string(),
+                })
+            }
+        },
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_) => expr.clone(),
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(rec).collect::<Result<_, _>>()?,
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
+        Expr::Case { whens, else_result } => Expr::Case {
+            whens: whens
+                .iter()
+                .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
+                .collect::<Result<_, SqlSurfaceError>>()?,
+            else_result: match else_result {
+                Some(e) => Some(Box::new(rec(e)?)),
+                None => None,
+            },
+        },
+        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
+        Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
     })
 }
 

@@ -44,11 +44,11 @@ use crate::sql::allowlist::{SqlSurfaceError, MAX_GROUP_BY_COLUMNS};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::order_value::{
-    compare_key_refs, compare_order_key, extract_order_value_ref, order_value_to_cell,
-    scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
+    compare_key_refs, compare_order_key, expr_value_to_order_value, extract_order_value_ref,
+    order_value_to_cell, scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{
-    BoundAggregate, BoundOrderTarget, OrderKind, OrderTarget, ProjectionColumn,
+    BoundAggregate, BoundGroupBy, BoundOrderTarget, OrderKind, OrderTarget, ProjectionColumn,
 };
 use crate::sql::udf_call::{self, BinOp, ExprValue};
 use crate::storage;
@@ -387,7 +387,7 @@ pub(crate) fn single_text_key_column(group_by: &crate::sql::parser::BoundGroupBy
     match group_by.keys.as_slice() {
         [key] if key.kind == OrderKind::Bytes => match key.target {
             BoundOrderTarget::Column(index) => Some(index),
-            BoundOrderTarget::Id => None,
+            BoundOrderTarget::Id | BoundOrderTarget::Expr(_) => None,
         },
         _ => None,
     }
@@ -1867,7 +1867,17 @@ pub(crate) fn execute_grouped_aggregate(
             Box::new(multi_groups.into_iter())
         };
 
-    let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(total_group_count);
+    // Issue #1188・SQL-26: 式述語の `HAVING`・式キーの `ORDER BY` は、確定済みグループ
+    // （可視行のみから作られたグループ）のキー・集計結果を並べた行ビューに対して評価する。
+    // グループが 0 件なら一切評価されない（可視行 0 件でエラーにならない既存契約〔Issue #353〕）。
+    let mut row_expr_scratch: Vec<StackValue> = Vec::new();
+    // 第 3 要素は式キーの事前評価値（`sort_by` のクロージャは `Result` を返せないため、
+    // ソート前に 1 グループ 1 回だけ評価してエラーをここで返す）。
+    let mut finished: Vec<(GroupKey, Vec<Cell>, Vec<Option<OrderValue>>)> =
+        Vec::with_capacity(total_group_count);
+    // 式キーの所有値（`finished` がソート完了まで全グループ分保持する）の累計見積り
+    // バイト数。所有値化の前に [`OrderKeyCharge`] 経由で [`ResultBudget`] へ課金する。
+    let mut order_key_bytes: usize = 0;
     for (key, accs) in group_entries {
         let cells: Vec<Cell> = accs
             .into_iter()
@@ -1883,8 +1893,25 @@ pub(crate) fn execute_grouped_aggregate(
                 break;
             }
         }
+        let mut order_values: Vec<Option<OrderValue>> = Vec::new();
+        if keep && (!group_by.having_exprs.is_empty() || !group_by.order_exprs.is_empty()) {
+            (keep, order_values) = eval_group_row_exprs(
+                group_by,
+                schema,
+                &key,
+                &cells,
+                &mut row_expr_scratch,
+                &mut OrderKeyCharge {
+                    budget: &budget,
+                    group_count: total_group_count,
+                    total_key_bytes,
+                    total_text_bytes: total_text_accumulator_bytes,
+                    order_key_bytes: &mut order_key_bytes,
+                },
+            )?;
+        }
         if keep {
-            finished.push((key, cells));
+            finished.push((key, cells, order_values));
         }
     }
 
@@ -1898,9 +1925,9 @@ pub(crate) fn execute_grouped_aggregate(
     // 保証によりそもそも到達しない防御的分岐）。`sort_by`（安定ソート）を使い、
     // `sort_unstable*` は使わない（決定性。`make sort-determinism-check`）。
     if group_by.order_by.is_empty() {
-        finished.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+        finished.sort_by(|(ka, _, _), (kb, _, _)| ka.cmp(kb));
     } else {
-        finished.sort_by(|(ka, ca), (kb, cb)| {
+        finished.sort_by(|(ka, ca, va), (kb, cb, vb)| {
             for order_by in &group_by.order_by {
                 let ord = match order_by.target {
                     OrderTarget::GroupKey(key_index) => compare_order_key(
@@ -1911,6 +1938,13 @@ pub(crate) fn execute_grouped_aggregate(
                     OrderTarget::Aggregate(idx) => cmp_cells_pg_nulls(
                         ca.get(idx).unwrap_or(&Cell::Null),
                         cb.get(idx).unwrap_or(&Cell::Null),
+                        order_by.descending,
+                    ),
+                    // 式キー（Issue #1188）: 事前評価済みの値を PostgreSQL 既定の NULL 位置
+                    // （ASC 末尾・DESC 先頭）で比較する（広域取得の式 `ORDER BY` と同じ比較器）。
+                    OrderTarget::Expr(idx) => compare_order_key(
+                        va.get(idx).and_then(Option::as_ref),
+                        vb.get(idx).and_then(Option::as_ref),
                         order_by.descending,
                     ),
                 };
@@ -1942,7 +1976,7 @@ pub(crate) fn execute_grouped_aggregate(
     let columns: Vec<ColumnMeta> = crate::sql::aggregate::aggregate_projection_columns(bound);
 
     let mut rows = Vec::with_capacity(finished.len());
-    for (key, cells) in finished {
+    for (key, cells, _) in finished {
         let mut row_cells = Vec::with_capacity(bound.projection.len());
         for col in &bound.projection {
             let cell =
@@ -1961,6 +1995,13 @@ pub(crate) fn execute_grouped_aggregate(
                                 )?;
                             let ty = match target {
                                 BoundOrderTarget::Id => None,
+                                // `GROUP BY` キーは式キーを持たない（Issue #1188 は広域取得の
+                                // `ORDER BY` 専用）。到達は束縛の不変条件違反のみ。
+                                BoundOrderTarget::Expr(_) => {
+                                    return Err(accumulator_bug(
+                                        "group key must not be an expression key",
+                                    ))
+                                }
                                 BoundOrderTarget::Column(index) => Some(
                                     &schema
                                         .columns
@@ -1997,9 +2038,178 @@ pub(crate) fn execute_grouped_aggregate(
     Ok(QueryResult { columns, rows })
 }
 
+/// 集計文の式 `ORDER BY` キーの所有値（[`eval_group_row_exprs`] が作り、`finished` が
+/// ソート完了まで全グループ分保持する）を [`ResultBudget`] へ課金する状態（Issue #1188・
+/// codex P1 対応）。長い TEXT を返す式（`concat` 等）を最大 [`MAX_GROUPS`] グループ分
+/// 保持して容量上限を超えるメモリを確保させないため、所有値化の前に累計を加算し、
+/// 超過は `54000`（[`RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL`]。索引経路の全走査フォール
+/// バック対象ではない）で拒否する。
+struct OrderKeyCharge<'a> {
+    budget: &'a ResultBudget,
+    group_count: usize,
+    total_key_bytes: usize,
+    total_text_bytes: usize,
+    order_key_bytes: &'a mut usize,
+}
+
+impl OrderKeyCharge<'_> {
+    /// `value` の保持分（固定分＋TEXT 長）を加算して予算照合する。
+    fn charge(&mut self, value: &ExprValue<'_>) -> Result<(), SqlSurfaceError> {
+        let len = match value {
+            ExprValue::Text(t) => t.len(),
+            _ => 0,
+        };
+        let add = len.saturating_add(RESULT_CELL_FIXED_BYTES);
+        let next = self.order_key_bytes.checked_add(add).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+        })?;
+        let held = self.total_key_bytes.checked_add(next).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+        })?;
+        self.budget.check(
+            self.group_count,
+            held,
+            self.total_text_bytes,
+            RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL,
+        )?;
+        *self.order_key_bytes = next;
+        Ok(())
+    }
+}
+
+/// 確定済みグループ 1 件について、式述語の `HAVING`（[`BoundGroupBy::having_exprs`]）と式キーの
+/// `ORDER BY`（[`BoundGroupBy::order_exprs`]）を評価する（Issue #1188・SQL-26）。戻り値は
+/// `(グループを残すか, 式キーの比較値)`。`HAVING` は `Bool(true)` のグループだけを残す
+/// （`false`／`NULL` は除外。PostgreSQL の 3 値論理）。評価エラー（`22012`／`22003`／`22008`
+/// 等）は可視行から作られたグループの値のみから生じ、そのまま fail-closed で返す。
+///
+/// 行ビューは [`BoundGroupBy::group_row_mask`] が立つ列だけ値化する（`GROUP BY` キー〔`keys`〕→
+/// 集計項目〔`items`〕の順。束縛側の `sql::parser::group_row_schema` と同じ添字系列）。
+fn eval_group_row_exprs(
+    group_by: &BoundGroupBy,
+    schema: &TableSchema,
+    key: &GroupKey,
+    cells: &[Cell],
+    scratch: &mut Vec<StackValue>,
+    charge: &mut OrderKeyCharge<'_>,
+) -> Result<(bool, Vec<Option<OrderValue>>), SqlSurfaceError> {
+    let nkeys = group_by.keys.len();
+    // キー成分は出力セルと同じ復元規則（`order_value_to_cell`）で `Cell` 化してから
+    // 行スカラーへ写す（`ENUM` はラベル文字列・疑似列 `id` は `Cell::Integer`）。
+    let mut key_cells: Vec<Cell> = Vec::with_capacity(nkeys);
+    for (i, bound_key) in group_by.keys.iter().enumerate() {
+        let wanted = group_by.group_row_mask.get(i).copied().unwrap_or(false);
+        let component = key.0.get(i).and_then(Option::as_ref);
+        let cell = match (wanted, component) {
+            (true, Some(value)) => {
+                let ty = match bound_key.target {
+                    BoundOrderTarget::Id => None,
+                    BoundOrderTarget::Column(index) => Some(
+                        &schema
+                            .columns
+                            .get(index)
+                            .ok_or_else(|| accumulator_bug("group key column index out of range"))?
+                            .ty,
+                    ),
+                    BoundOrderTarget::Expr(_) => {
+                        return Err(accumulator_bug("group key must not be an expression key"))
+                    }
+                };
+                order_value_to_cell(value, ty)?
+            }
+            _ => Cell::Null,
+        };
+        key_cells.push(cell);
+    }
+    let mut scalars: Vec<Option<row_codec::ScalarRef<'_>>> =
+        Vec::with_capacity(nkeys.saturating_add(cells.len()));
+    for (i, cell) in key_cells.iter().enumerate() {
+        if group_by.group_row_mask.get(i).copied().unwrap_or(false) {
+            scalars.push(cell_to_scalar_ref(cell)?);
+        } else {
+            scalars.push(None);
+        }
+    }
+    for (j, cell) in cells.iter().enumerate() {
+        let idx = nkeys.saturating_add(j);
+        if group_by.group_row_mask.get(idx).copied().unwrap_or(false) {
+            scalars.push(cell_to_scalar_ref(cell)?);
+        } else {
+            scalars.push(None);
+        }
+    }
+
+    for program in &group_by.having_exprs {
+        match program.eval(0, &[], &scalars, scratch)? {
+            ExprValue::Bool(true) => {}
+            ExprValue::Bool(false) | ExprValue::Null => return Ok((false, Vec::new())),
+            _ => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "HAVING expression did not evaluate to a boolean",
+                ))
+            }
+        }
+    }
+    let mut order_values = Vec::with_capacity(group_by.order_exprs.len());
+    for (program, kind) in &group_by.order_exprs {
+        let value = program.eval(0, &[], &scalars, scratch)?;
+        // 所有値化（TEXT の複製）の前に、式キーの保持分を結果予算へ課金する。
+        charge.charge(&value)?;
+        order_values.push(expr_value_to_order_value(&value, *kind)?);
+    }
+    Ok((true, order_values))
+}
+
+/// 集計・キーの出力セルを、式評価用の行スカラー（[`row_codec::ScalarRef`]）へ写す
+/// （Issue #1188。束縛側の合成列型 `INTEGER`／`BIGINT`→`BIGINT`・`REAL`／`DOUBLE`→`DOUBLE`
+/// と対応）。`COUNT`・`id` 系の `Cell::Integer(u64)` は、`WHERE`・投影の式で `id` を参照する
+/// ときと同じ `f64` で正確に表現できる範囲（`2^53` 以下。
+/// [`crate::sql::udf_call::id_as_finite_scalar`]）に限り受け付け、超える値は黙って丸めず
+/// 同じ `22000` で拒否する（`i64` 範囲外の値も同じ扱い）。
+/// 参照されない列（`group_row_mask` が偽）はそもそも本関数を通らない。
+fn cell_to_scalar_ref(cell: &Cell) -> Result<Option<row_codec::ScalarRef<'_>>, SqlSurfaceError> {
+    Ok(match cell {
+        Cell::Null => None,
+        Cell::Integer(v) => {
+            crate::sql::udf_call::id_as_finite_scalar(*v)?;
+            Some(row_codec::ScalarRef::BigInt(i64::try_from(*v).map_err(
+                |_| accumulator_bug("integer within 2^53 did not fit in i64"),
+            )?))
+        }
+        Cell::SignedInteger(v) => Some(row_codec::ScalarRef::BigInt(*v)),
+        Cell::Float(v) => Some(row_codec::ScalarRef::Double(*v)),
+        Cell::Text(t) => Some(row_codec::ScalarRef::Text(t.as_str())),
+        Cell::Date(d) => Some(row_codec::ScalarRef::Date(*d)),
+        Cell::Timestamp(t) => Some(row_codec::ScalarRef::Timestamp(*t)),
+        Cell::Bool(b) => Some(row_codec::ScalarRef::Bool(*b)),
+        Cell::Numeric(d) => Some(row_codec::ScalarRef::Numeric(*d)),
+        Cell::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
+        Cell::Vector(_) | Cell::Array(_) | Cell::Bytes(_) | Cell::Json(_) => {
+            return Err(accumulator_bug(
+                "group row cell type is not usable in an expression",
+            ))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1188: 式形の `HAVING`／`ORDER BY` が参照する `Cell::Integer(u64)` は、`WHERE`・
+    /// 投影の式の `id` と同じ `2^53` 境界で扱う（`i64` 範囲外を含め超過は `22000`）。
+    #[test]
+    fn group_row_integer_cell_uses_exact_f64_boundary() {
+        let exact = 1u64 << 53;
+        assert!(matches!(
+            cell_to_scalar_ref(&Cell::Integer(exact)),
+            Ok(Some(row_codec::ScalarRef::BigInt(v))) if v == exact as i64
+        ));
+        for v in [exact + 1, i64::MAX as u64 + 1, u64::MAX] {
+            let err = cell_to_scalar_ref(&Cell::Integer(v)).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "22000", "v={v}");
+        }
+    }
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::sql::allowlist::AggregateFunc;
     use crate::sql::parser::{AggregateInput, BoundAggregate, BoundAggregateItem, BoundGroupBy};
@@ -2074,6 +2284,9 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
+                having_exprs: Vec::new(),
+                order_exprs: Vec::new(),
+                group_row_mask: Vec::new(),
                 keys: vec![crate::sql::parser::BoundOrderKey {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
@@ -2217,6 +2430,9 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
+                having_exprs: Vec::new(),
+                order_exprs: Vec::new(),
+                group_row_mask: Vec::new(),
                 keys: vec![crate::sql::parser::BoundOrderKey {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
@@ -2432,6 +2648,32 @@ mod tests {
         assert_eq!(cmp_signed_to_literal(i64::MIN, -1e30), Ordering::Greater);
     }
 
+    /// Issue #1188・codex P1: 式 `ORDER BY` キーの TEXT 所有値は、複製の前に累計が
+    /// 結果予算へ課金され、超過は `54000` で拒否される（予算内なら通る）。
+    #[test]
+    fn order_key_charge_rejects_text_keys_exceeding_result_budget() {
+        let budget = ResultBudget {
+            max_result_bytes: 1_000,
+            per_group_bytes: 16,
+        };
+        let long = "x".repeat(400);
+        let mut held = 0usize;
+        let mut charge = OrderKeyCharge {
+            budget: &budget,
+            group_count: 2,
+            total_key_bytes: 0,
+            total_text_bytes: 0,
+            order_key_bytes: &mut held,
+        };
+        let value = ExprValue::Text(std::borrow::Cow::Borrowed(long.as_str()));
+        charge.charge(&value).expect("first key fits");
+        charge.charge(&value).expect("second key fits");
+        let err = charge.charge(&value).expect_err("third key exceeds budget");
+        assert!(matches!(err, SqlSurfaceError::PayloadTooLarge { .. }));
+        // 超過した課金は累計へ反映されない。
+        assert_eq!(held, 2 * (400 + RESULT_CELL_FIXED_BYTES));
+    }
+
     #[test]
     fn cmp_signed_to_literal_rejects_nan_as_not_equal() {
         use std::cmp::Ordering;
@@ -2498,6 +2740,9 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
+                having_exprs: Vec::new(),
+                order_exprs: Vec::new(),
+                group_row_mask: Vec::new(),
                 keys: vec![crate::sql::parser::BoundOrderKey {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,

@@ -801,6 +801,7 @@ pub(super) fn build_plan<'a>(
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
+            order_keys: Vec::new(),
         });
     }
 

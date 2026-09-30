@@ -31,9 +31,9 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | 比較 | `DATE`⋈`DATE`・`TIMESTAMP`⋈`TIMESTAMP`・`DATE`⋈`TIMESTAMP`（`DATE` 側を深夜 0 時の `TIMESTAMP` へ暗黙昇格） |
 | CASE/COALESCE/NULLIF | 分岐・引数が同じ日時型どうしなら受理 |
 
-`EXTRACT(field FROM src)` 構文は本 PR のスコープ外（下記「スコープ外・
-後続課題」参照）。`date_part` は提供済みのため、`EXTRACT` 相当は
-`date_part('field', src)` で代替できる。
+`EXTRACT(field FROM src)` 構文は Issue #1188 で追加した（構文段で
+`date_part('field', src)` へ脱糖するため、値・NULL 伝播・エラー分類は
+`date_part` と同一。詳細は `docs/design/order-by-having-expressions.md`）。
 
 ## 型規約とエラー写像
 
@@ -73,7 +73,7 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
   `date_part` と同じく `DATE` を昇格して 0 を返す。
 - (b) PG は `DATE` を入力にした `date_trunc` で `timestamptz` を返すが、
   本実装は naive `TIMESTAMP` を返す（`TIMESTAMPTZ` は未対応）。
-- (c) `EXTRACT` 構文自体が未実装（`date_part` で代替）。
+- (c) （解消）`EXTRACT` 構文は Issue #1188 で実装済み。既定の結果列名は PG 互換の `extract`（明示の `date_part(...)` は `date_part` のまま）。
 - (d) `EXTRACT`/`date_part` の戻り値は PG では `numeric` だが、本実装は
   `Scalar`（`f64`）。
 
@@ -116,8 +116,9 @@ builtin_name` に追加する（`round` と同じ流儀）。
 ### UDF 予約名
 
 `date_part`・`date_trunc` は `is_builtin_function_name` 経由で予約名になる。
-`date`／`timestamp`／`extract` は予約しない（`EXTRACT` 構文が未実装のため、
-`extract` はただの識別子・UDF 名として使える）。
+`date`／`timestamp`／`extract` は予約しない（`EXTRACT` 構文は `extract` の直後の
+括弧内が「識別子または文字列リテラル `FROM`」の並びのときだけ専用形として解析する先読み
+方式のため、それ以外の `extract(...)` は通常の関数呼び出し・UDF 名として使える）。
 
 ### 行スカラービューの一般化
 
@@ -145,14 +146,14 @@ is_not_masked_out` で分岐内参照のみの回帰を固定する）。
 
 ## スコープ外・後続課題
 
-- `EXTRACT(field FROM src)` 構文（`FROM` を通常の `SELECT ... FROM` と
-  誤認しないための `allowlist.rs::Parser` の事前判定の拡張が必要。
-  `date_part` で代替可能なため本 PR では見送った）。
+- （解消: Issue #1188）`EXTRACT(field FROM src)` 構文。
 - `INTERVAL`・`TIMESTAMPTZ`・`AT TIME ZONE`・`make_date` 系関数。
-- `ORDER BY`/`GROUP BY`/`HAVING` の式位置・`SELECT` 頂点の非関数式
+- `GROUP BY` キーの式化・`SELECT` 頂点の非関数式
   （`SELECT d + 1` 等。`sql::allowlist::Parser::parse_select_item` は
   `CASE`／関数呼び出し以外の識別子始まりの式を投影項目として受理しない
   既存の構造的制約。数値スカラー関数群 ADR と同じ既知の制約）。
+  `ORDER BY`／`HAVING` の式位置は Issue #1188 で対応済み
+  （`docs/design/order-by-having-expressions.md`）。
 - `42804`/`42883` への移行（ERR-6・TASK-227 の横断課題）。
 - NoSQL（HTTP）表層での日時関数対応。
 - `DATE`／`TIMESTAMP` 列型の `CREATE TABLE` SQL DDL 経由の宣言（現状は
