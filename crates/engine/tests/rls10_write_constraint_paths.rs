@@ -30,9 +30,9 @@
 //!
 //! 可視性モードと書き込み対象: `docs` の Private 行（偶数 id）は、`id` 完全一致形の
 //! UPDATE では Public のみモードで対象外（0 行。SQL-17・RLS-10 (a) の可視集合どおり）。
-//! 述語形 UPDATE／DELETE は現状 Public のみモードでも自テナントの Private 行を対象に
-//! するが、これは SQL-19・RLS-10 (a)（候補は可視集合の部分集合）と不一致のため、
-//! 該当モードの影響行数は仕様値〜現状値の範囲（[`Count::Between`]）で検査する。
+//! 述語形 UPDATE／DELETE も両モードで書き込み候補は「所有 ∩ 可視」であり、Public のみ
+//! モードでは自テナントの Private 行は対象外（SQL-19・RLS-10 (a)。#1253 で是正済み）。
+//! 影響行数・返却行は両モードとも完全一致で検査する。
 //! いずれの場合も他テナントの行は候補に入らない点は共通で、本ファイルの主張の中心。
 //!
 //! baseline／flooded の定義: 書き込み候補は `is_owner && is_visible` の行に限られる
@@ -441,54 +441,18 @@ enum Axis {
     Constraint,
 }
 
-/// 影響行数の期待値。仕様と一致する値は `Exact`、現状が仕様と一致しない値は
-/// 仕様値と現状値の両方を含む範囲 `Between(lo, hi)`（両端を含む）で検査する
-/// （仕様違反の現状値を回帰条件として固定しない）。
-#[derive(Clone, Copy, Debug)]
-enum Count {
-    Exact(u64),
-    Between(u64, u64),
-}
-
-impl Count {
-    fn admits(self, n: u64) -> bool {
-        match self {
-            Count::Exact(v) => n == v,
-            Count::Between(lo, hi) => lo <= n && n <= hi,
-        }
-    }
-}
-
-/// RETURNING の返却行（`id`）の期待値。仕様と一致する値は出現順の完全一致 `Exact`、
-/// 現状が SQL-21 と一致しない値は `Between` で `must ⊆ 返却 ⊆ within` を検査する
-/// （`within` は当該文が変更した自テナントの行の `id`、`must` は現状でも必ず返る行の
-/// `id`。重複なし・件数は影響行数以下も併せて検査する）。
-#[derive(Clone, Copy, Debug)]
-enum Ids {
-    Exact(&'static [u64]),
-    Between {
-        must: &'static [u64],
-        within: &'static [u64],
-    },
-}
-
 /// テスト側の真実値。`Affected(priv, pub)` は
 /// （Private 込みモード, Public のみモード）での期待影響行数。
 #[derive(Clone, Copy)]
 enum Expect {
     Affected(u64, u64),
-    /// Private 込みモードは完全一致、Public のみモードは [`Count`] で検査する影響行数。
-    AffectedPub(u64, Count),
     Err(&'static str),
     /// RETURNING 付き。`affected`・`ids` は（Private 込み, Public のみ）の 2 モード分。
-    /// Private 込みモードは SQL-21 と一致するため完全一致で検査する。Public のみモードの
-    /// 返却行は現状、閲覧側に可視な行に限られ（自テナントの Private 行・既定可視性で
-    /// 投入した行は返らない）、SQL-21（当該文が変更した行そのものを返す）と一致しない
-    /// 形状がある。該当形状は完全一致をやめて [`Ids::Between`] で検査し、完全一致の
-    /// 検査は #1256（#1250 の是正後）で戻す。
+    /// 両モードとも影響行数・返却 id（出現順）を完全一致で検査し、返却行数が影響行数と
+    /// 一致することも表明する（SQL-21。Public のみモードは #1253・#1252 で是正済み）。
     Returning {
-        affected: (u64, Count),
-        ids: (&'static [u64], Ids),
+        affected: (u64, u64),
+        ids: (&'static [u64], &'static [u64]),
     },
     /// INSERT・UPSERT 新規行の RETURNING（Issue #1252）。Private 込みモードは影響行数・返却
     /// id の完全一致。Public のみモードは挿入行（Private 固定）が不可視のため、黙って空に
@@ -541,25 +505,17 @@ fn shapes() -> Vec<Shape> {
         w("upd-id-own-private", "UPDATE docs SET score = 999 WHERE id = 2 USING OPERATION_ID '{op}'", Affected(1, 0)),
         w("upd-id-foreign-only", "UPDATE docs SET score = 999 WHERE id = 9 USING OPERATION_ID '{op}'", Affected(0, 0)),
         w("upd-id-missing", "UPDATE docs SET score = 999 WHERE id = 99 USING OPERATION_ID '{op}'", Affected(0, 0)),
-        // 述語形の Public のみモードの影響行数は SQL-19・RLS-10 (a) と不一致の現状
-        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
-        w("upd-pred-ja", "UPDATE docs SET score = 0 WHERE lang = 'ja' USING OPERATION_ID '{op}'", AffectedPub(2, Count::Between(1, 2))),
+        // #1253 で是正済み: 述語形も Public のみモードは可視の自テナント行だけが対象（SQL-19・RLS-10 (a)）。
+        w("upd-pred-ja", "UPDATE docs SET score = 0 WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 1)),
         w("upd-pred-none", "UPDATE docs SET score = 0 WHERE lang = 'zz' USING OPERATION_ID '{op}'", Affected(0, 0)),
-        // Public のみモードの返却行は SQL-21 と不一致の現状のため、Public のみモードで
-        // 可視の変更行（id 1）⊆ 返却 ⊆ 変更行で検査する。完全一致の検査は #1256
-        // （#1250 の是正後）で戻す。
-        // 述語形の Public のみモードの影響行数も SQL-19・RLS-10 (a) と不一致の現状
-        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
-        w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (2, Count::Between(1, 2)), ids: (&[1, 2], Ids::Between { must: &[1], within: &[1, 2] }) }),
+        // #1253 で是正済み: Public のみモードは可視の変更行（id 1）だけを影響行数・返却行に数える（SQL-21）。
+        w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (2, 1), ids: (&[1, 2], &[1]) }),
         w("del-id-own", "DELETE FROM docs WHERE id = 1 USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("del-id-foreign-only", "DELETE FROM docs WHERE id = 9 USING OPERATION_ID '{op}'", Affected(0, 0)),
-        // 述語形の Public のみモードの影響行数は SQL-19・RLS-10 (a) と不一致の現状
-        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
-        w("del-pred-ja", "DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID '{op}'", AffectedPub(2, Count::Between(1, 2))),
-        // 述語形の Public のみモードの影響行数は SQL-19・RLS-10 (a) と不一致の現状
-        // （自テナントの Private 行も対象になる）のため、仕様値〜現状値の範囲で検査する。
-        w("del-pred-en", "DELETE FROM docs WHERE lang = 'en' USING OPERATION_ID '{op}'", AffectedPub(2, Count::Between(1, 2))),
-        w("del-id-returning", "DELETE FROM docs WHERE id = 1 RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, Count::Exact(1)), ids: (&[1], Ids::Exact(&[1])) }),
+        // #1253 で是正済み: 述語形も Public のみモードは可視の自テナント行だけが対象（SQL-19・RLS-10 (a)）。
+        w("del-pred-ja", "DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 1)),
+        w("del-pred-en", "DELETE FROM docs WHERE lang = 'en' USING OPERATION_ID '{op}'", Affected(2, 1)),
+        w("del-id-returning", "DELETE FROM docs WHERE id = 1 RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[1], &[1]) }),
         w("ins-foreign-id", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("ins-multi-foreign-ids", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-n1'), (10, 'ja', 2, 'tok-{v}-n2') USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("ins-own-dup-id", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-dup') USING OPERATION_ID '{op}'", Err("23505")),
@@ -782,20 +738,7 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                     let want = if mode { p } else { q };
                     assert_eq!(*affected, Some(want), "{which}: {}", label(r));
                 }
-                (Expect::AffectedPub(p, q), Obs::Ok { affected, .. }) => {
-                    let n = affected
-                        .unwrap_or_else(|| panic!("{which}: missing affected: {}", label(r)));
-                    if mode {
-                        assert_eq!(n, p, "{which}: {}", label(r));
-                    } else {
-                        assert!(
-                            q.admits(n),
-                            "{which}: affected {n} not in {q:?}: {}",
-                            label(r)
-                        );
-                    }
-                }
-                (Expect::Affected(..) | Expect::AffectedPub(..), Obs::Err { code, .. }) => {
+                (Expect::Affected(..), Obs::Err { code, .. }) => {
                     panic!("{which}: unexpected error {code}: {}", label(r))
                 }
                 (Expect::Err(code), Obs::Err { code: got, .. }) => {
@@ -820,53 +763,16 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                     let got = returned_ids
                         .as_deref()
                         .unwrap_or_else(|| panic!("{which}: RETURNING rows missing: {}", label(r)));
-                    let (count, ids) = if mode {
-                        (Count::Exact(p), Ids::Exact(ip))
-                    } else {
-                        (q, iq)
-                    };
-                    assert!(
-                        count.admits(n),
-                        "{which}: affected {n} not in {count:?}: {}",
+                    let (want_n, want_ids) = if mode { (p, ip) } else { (q, iq) };
+                    assert_eq!(n, want_n, "{which}: affected: {}", label(r));
+                    assert_eq!(got, want_ids, "{which}: RETURNING rows: {}", label(r));
+                    // 返却行数 = 影響行数（SQL-21）を両モードで直接表明する。
+                    assert_eq!(
+                        got.len() as u64,
+                        n,
+                        "{which}: RETURNING rows != affected: {}",
                         label(r)
                     );
-                    match ids {
-                        Ids::Exact(want) => {
-                            assert_eq!(got, want, "{which}: RETURNING rows: {}", label(r));
-                        }
-                        Ids::Between {
-                            must,
-                            within: changed,
-                        } => {
-                            // 返却行は必須行を含み、当該文が変更した自テナントの行の部分集合
-                            // （重複なし・件数は影響行数以下）。他テナントの行はトークン検査
-                            // （`readback_leaks`）と T3 が別途検出する。
-                            assert!(
-                                must.iter().all(|id| got.contains(id)),
-                                "{which}: RETURNING rows {got:?} miss required {must:?}: {}",
-                                label(r)
-                            );
-                            assert!(
-                                got.iter().all(|id| changed.contains(id)),
-                                "{which}: RETURNING rows {got:?} not within {changed:?}: {}",
-                                label(r)
-                            );
-                            let mut uniq = got.to_vec();
-                            uniq.sort();
-                            uniq.dedup();
-                            assert_eq!(
-                                uniq.len(),
-                                got.len(),
-                                "{which}: duplicate rows: {}",
-                                label(r)
-                            );
-                            assert!(
-                                got.len() as u64 <= n,
-                                "{which}: more RETURNING rows than affected: {}",
-                                label(r)
-                            );
-                        }
-                    }
                 }
                 (Expect::Returning { .. }, Obs::Err { code, .. }) => {
                     panic!("{which}: unexpected error {code}: {}", label(r))
@@ -1202,10 +1108,6 @@ fn t6_negative_controls_detect_fabricated_violations() {
         debug: "x".into(),
     };
     assert_ne!(c, d);
-    // 範囲検査は範囲外（仕様値・現状値のいずれでもない値）を検出する。
-    assert!(Count::Between(1, 2).admits(1) && Count::Between(1, 2).admits(2));
-    assert!(!Count::Between(1, 2).admits(0) && !Count::Between(1, 2).admits(3));
-    assert!(!Count::Exact(1).admits(2));
     // FK 違反メッセージの正規化は数値だけを吸収し、文言の差は検出する。
     assert_eq!(
         normalize_digits("key (7) missing"),
