@@ -787,6 +787,12 @@ mod tests {
             StatementEffect::Write
         );
         assert_eq!(classify_statement("DROP INDEX i"), StatementEffect::Write);
+        // Issue #1194: ENUM 型 DDL も書き込み系（カタログを commit する）。
+        assert_eq!(
+            classify_statement("CREATE TYPE t AS ENUM ('a')"),
+            StatementEffect::Write
+        );
+        assert_eq!(classify_statement("DROP TYPE t"), StatementEffect::Write);
         // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）は読み取り系
         // （`sql::allowlist::validate_sql_tokens` の `WITH` 分岐が受理する形は
         // 主クエリが広域取得のみで、書き込みを持たない）。
