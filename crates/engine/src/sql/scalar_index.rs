@@ -166,6 +166,16 @@ fn try_owned_string(s: &str) -> Result<String, ScalarIndexBuildError> {
     Ok(out)
 }
 
+/// `b` の複製を失敗しうるアロケーションとして構築する（[`try_owned_string`]
+/// の `BYTEA` 版。Issue #1257）。
+fn try_owned_bytes(b: &[u8]) -> Result<Vec<u8>, ScalarIndexBuildError> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(b.len())
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    out.extend_from_slice(b);
+    Ok(out)
+}
+
 /// 1 件の文字列値を索引へ追加する際の概算バイト量（[`TextColumnIndex::
 /// approx_heap_bytes`] の `values`/`equality` の計上方法と揃える）。
 fn approx_string_entry_bytes(s: &str) -> usize {
@@ -334,6 +344,10 @@ enum OrderedColumnIndex {
     F64Sortable(Vec<(u64, u32)>),
     I128(Vec<(i128, u32)>, u8),
     U128(Vec<(u128, u32)>),
+    /// `BYTEA` 列（Issue #1257・TABLE-13・INDEX-5 ポインタ）。キーは可変長の
+    /// バイト列で、`Vec<u8>` の `Ord`（辞書順。空バイト列が最小）は
+    /// `declarative_filter::FilterOp::eval` の `&[u8]` 比較と一致する。
+    Bytes(Vec<(Vec<u8>, u32)>),
 }
 
 /// `f64`（有限値・`-0.0` は `+0.0` へ正規化済みである契約——`scalar_float.rs`
@@ -403,6 +417,35 @@ fn range_slots<K: Ord + Copy>(
     let mut out: Vec<u32> = Vec::new();
     out.try_reserve_exact(end - start).ok()?;
     out.extend(pairs[start..end].iter().map(|(_, slot)| *slot));
+    out.sort_unstable(); // sort-determinism: allow u32 スロット番号の全順序（重複なし）による昇順整列
+    Some(out)
+}
+
+/// [`range_slots`] の `BYTEA`（可変長バイト列キー）版（Issue #1257）。キーが
+/// `Copy` でないため境界を参照で受ける。後続値の導出は行わず、`Excluded`
+/// で `FilterOp::eval` の `cmp` と厳密に同値な区間を得る。
+fn range_slots_bytes(
+    pairs: &[(Vec<u8>, u32)],
+    lower: std::ops::Bound<&[u8]>,
+    upper: std::ops::Bound<&[u8]>,
+) -> Option<Vec<u32>> {
+    use std::ops::Bound;
+    let start = match lower {
+        Bound::Unbounded => 0,
+        Bound::Included(l) => pairs.partition_point(|(k, _)| k.as_slice() < l),
+        Bound::Excluded(l) => pairs.partition_point(|(k, _)| k.as_slice() <= l),
+    };
+    let end = match upper {
+        Bound::Unbounded => pairs.len(),
+        Bound::Included(u) => pairs.partition_point(|(k, _)| k.as_slice() <= u),
+        Bound::Excluded(u) => pairs.partition_point(|(k, _)| k.as_slice() < u),
+    };
+    if start >= end {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve_exact(end - start).ok()?;
+    out.extend(pairs.get(start..end)?.iter().map(|(_, slot)| *slot));
     out.sort_unstable(); // sort-determinism: allow u32 スロット番号の全順序（重複なし）による昇順整列
     Some(out)
 }
@@ -597,9 +640,9 @@ pub(crate) struct ScalarIndex {
     /// `schema.columns` と同じ長さ・順序。`TEXT`／`ENUM` 列のみ `Some`。
     columns: Vec<Option<TextColumnIndex>>,
     /// `schema.columns` と同じ長さ・順序。`INTEGER`／`BIGINT`／`REAL`／
-    /// `DOUBLE`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID` 列のみ `Some`
-    /// （Issue #893。`columns` と排他——同じ添字が両方 `Some` になることは
-    /// ない。`BOOLEAN`／`BYTEA`／`JSON`／`JSONB`／`ARRAY`／`VECTOR` 列は
+    /// `DOUBLE`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列のみ `Some`
+    /// （Issue #893・`BYTEA` は Issue #1257。`columns` と排他——同じ添字が両方
+    /// `Some` になることはない。`BOOLEAN`／`JSON`／`JSONB`／`ARRAY`／`VECTOR` 列は
     /// いずれも `None` のまま索引対象外。モジュールドキュメント参照）。
     typed_columns: Vec<Option<OrderedColumnIndex>>,
     /// `id` 昇順（同一 `id` 内はスロット昇順）に整列した `(id, slot)`。全行が
@@ -1077,10 +1120,30 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column_typed.push(Some(OrderedColumnIndex::U128(acc)));
                 }
+                // `BYTEA` 列（レーン B。Issue #1257 で production 結線）は可変長
+                // バイト列キーの順序索引（`OrderedColumnIndex::Bytes`）で扱う。
+                // 値 1 件が最大 4 MiB になりうるため、`(Vec<u8>, u32)` 配列の
+                // 初期確保分をここで計上し、値本体の複製分は行走査側で
+                // 複製前に予算検証・計上する（`TEXT` 列と同型。平均値長ゲート
+                // も同様に適用する）。常に構築する。
+                ColumnType::Bytea => {
+                    per_column.push(None);
+                    let entry_size = std::mem::size_of::<(Vec<u8>, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(Vec<u8>, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::Bytes(acc)));
+                }
                 // `BOOLEAN` 列は索引対象外（Issue #883・D-e。値域が 2 値のため
                 // 索引化コストに見合わず、対応述語 `BoolEquals` は常に
                 // plain scan——`scalar_plan.rs` 参照——のまま据え置く）。
-                // `ARRAY`（TABLE-14・Issue #888）・`BYTEA`（Issue #886）・
+                // `ARRAY`（TABLE-14・Issue #888）・
                 // `JSON`／`JSONB`（TABLE-14・Issue #889）列はいずれも等価・
                 // 前方一致・範囲述語を持たないため同じく非索引化（判断根拠は
                 // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
@@ -1088,7 +1151,6 @@ impl ScalarIndex {
                 ColumnType::Vector(_)
                 | ColumnType::Boolean
                 | ColumnType::Array(_)
-                | ColumnType::Bytea
                 | ColumnType::Json
                 | ColumnType::Jsonb => {
                     per_column.push(None);
@@ -1117,6 +1179,67 @@ impl ScalarIndex {
                 if !is_indexed_column {
                     // 数値・日時・`NUMERIC`・`UUID` 列の候補か（Issue #893）。
                     // 該当しない・既に除外済みの列は静かにスキップする。
+                    if matches!(
+                        per_column_typed.get(col_index),
+                        Some(Some(OrderedColumnIndex::Bytes(_)))
+                    ) {
+                        // `BYTEA` 列（Issue #1257）: 値本体を複製するため、平均値長
+                        // ゲート（Issue #632 と同じ累積平均判定）・複製前の予算検証・
+                        // fallible な複製を行う専用分岐。`TEXT` 列用の
+                        // `col_running_bytes`／`col_nonnull_count` は列添字で
+                        // 排他のため BYTEA 列でも再利用できる。
+                        let running = col_running_bytes.get(col_index).copied().unwrap_or(0);
+                        let nonnull = col_nonnull_count.get(col_index).copied().unwrap_or(0);
+                        let ScalarRef::Bytes(b) = &v else {
+                            // 型不一致（構造的に到達しない多層防御）: 列単位で縮退。
+                            let refund = typed_col_reservation_bytes
+                                .get(col_index)
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(running);
+                            approx_bytes = approx_bytes.saturating_sub(refund);
+                            if let Some(slot_acc) = per_column_typed.get_mut(col_index) {
+                                *slot_acc = None;
+                            }
+                            continue;
+                        };
+                        let b: &[u8] = b;
+                        let prospective_count = nonnull.saturating_add(1);
+                        let prospective_bytes = running.saturating_add(b.len());
+                        let avg_threshold_bytes =
+                            prospective_count.saturating_mul(MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN);
+                        if prospective_bytes > avg_threshold_bytes {
+                            // 平均値長超過: 列単位の fail-soft 縮退（初期確保分＋
+                            // 複製済み本体分を予算から差し戻す）。
+                            let refund = typed_col_reservation_bytes
+                                .get(col_index)
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(running);
+                            approx_bytes = approx_bytes.saturating_sub(refund);
+                            if let Some(slot_acc) = per_column_typed.get_mut(col_index) {
+                                *slot_acc = None;
+                            }
+                            continue;
+                        }
+                        if let Some(Some(OrderedColumnIndex::Bytes(acc))) =
+                            per_column_typed.get_mut(col_index)
+                        {
+                            check_scalar_index_budget(approx_bytes, b.len())?;
+                            let owned = try_owned_bytes(b)?;
+                            approx_bytes = approx_bytes.saturating_add(b.len());
+                            // 行数ちょうどを事前確保済み・1 行 1 回のみ push のため
+                            // 再確保は起きない。
+                            acc.push((owned, slot_u32));
+                            if let Some(slot) = col_running_bytes.get_mut(col_index) {
+                                *slot = prospective_bytes;
+                            }
+                            if let Some(slot) = col_nonnull_count.get_mut(col_index) {
+                                *slot = prospective_count;
+                            }
+                        }
+                        continue;
+                    }
                     if matches!(per_column_typed.get(col_index), Some(Some(_))) {
                         let keep = if let Some(Some(accum)) = per_column_typed.get_mut(col_index) {
                             push_typed_value(accum, &v, slot_u32)
@@ -1328,6 +1451,10 @@ impl ScalarIndex {
                     pairs.sort_unstable(); // sort-determinism: allow (u128 キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
                     typed_columns.push(Some(OrderedColumnIndex::U128(pairs)));
                 }
+                Some(OrderedColumnIndex::Bytes(mut pairs)) => {
+                    pairs.sort_unstable(); // sort-determinism: allow (バイト列キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
+                    typed_columns.push(Some(OrderedColumnIndex::Bytes(pairs)));
+                }
             }
         }
 
@@ -1437,9 +1564,8 @@ impl ScalarIndex {
         }
         // `BETWEEN`（`FilterOp::Between`。SQL-24・TASK-208 ポインタ）は
         // `Ge`∧`Le` の交差として導出する（`typed_compare_candidates` を 2 回
-        // 呼ぶ。`BYTEA` は `OrderedColumnIndex` に対応 variant が無く
-        // `typed_compare_candidates` 自身が `None` を返すため、ここでも
-        // 未対応のまま fail-closed に縮退する）。
+        // 呼ぶ。`BYTEA` も Issue #1257 で `OrderedColumnIndex::Bytes` に対応
+        // 済みのため同じ経路で交差を導出する。未索引なら `None`＝fail-closed）。
         if let FilterOp::Between { low, high } = filter.op() {
             use crate::declarative_filter::CompareOp;
             let lower = self.typed_compare_candidates(filter.column_index(), CompareOp::Ge, low)?;
@@ -1517,8 +1643,7 @@ impl ScalarIndex {
     }
 
     /// [`FilterOp::TypedCompare`] 述語（`DATE`／`TIMESTAMP`／`NUMERIC`／
-    /// `UUID`。`BYTEA` は [`OrderedColumnIndex`] に対応 variant を持たず
-    /// 未対応のまま——モジュールドキュメント「データモデル」参照）の一致
+    /// `UUID`・`BYTEA`〔Issue #1257〕）の一致
     /// スロットを返す（Issue #893 production 接続）。`DATE`／`TIMESTAMP`／
     /// `UUID` は列・リテラルともに同一表現の厳密な整数キーのため、境界は
     /// 単純な `checked_add`/`checked_sub` で導出する。`NUMERIC` はリテラルが
@@ -1602,8 +1727,20 @@ impl ScalarIndex {
                 let (lower, upper) = exact_u128_bounds(op, uuid_to_sortable_u128(u.as_bytes()));
                 range_slots(pairs, lower, upper)
             }
-            // `Bytea`（`OrderedColumnIndex` に対応 variant を持たず未対応の
-            // まま）・列型とリテラル型の不一致（構造的に到達しないはずだが
+            // `BYTEA`（Issue #1257）: 後続値を導出せず `Excluded` で境界を表す
+            // （`FilterOp::eval` の `&[u8]` 辞書順比較と厳密に同値）。
+            (OrderedColumnIndex::Bytes(pairs), TypedLiteral::Bytes(v)) => {
+                let v = v.as_slice();
+                let (lower, upper) = match op {
+                    CompareOp::Eq => (Bound::Included(v), Bound::Included(v)),
+                    CompareOp::Gt => (Bound::Excluded(v), Bound::Unbounded),
+                    CompareOp::Ge => (Bound::Included(v), Bound::Unbounded),
+                    CompareOp::Lt => (Bound::Unbounded, Bound::Excluded(v)),
+                    CompareOp::Le => (Bound::Unbounded, Bound::Included(v)),
+                };
+                range_slots_bytes(pairs, lower, upper)
+            }
+            // 列型とリテラル型の不一致（構造的に到達しないはずだが
             // untrusted 由来の対応関係への多層防御）はいずれも索引未対応
             // として扱う。
             _ => None,
@@ -1785,6 +1922,9 @@ impl ScalarIndex {
                     map_bound(upper, extract)?,
                 )
             }
+            // `TypedKey` は `Copy` のため可変長キーを表せない。テスト専用経路
+            // では `BYTEA` を未対応（`None`）として扱う。
+            OrderedColumnIndex::Bytes(_) => None,
         }
     }
 
@@ -1955,6 +2095,14 @@ impl ScalarIndex {
                 OrderedColumnIndex::U128(v) => v
                     .capacity()
                     .saturating_mul(std::mem::size_of::<(u128, u32)>()),
+                // 可変長キー: 配列本体に各要素の確保容量（`capacity` ベース）を加える。
+                OrderedColumnIndex::Bytes(v) => v
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(Vec<u8>, u32)>())
+                    .saturating_add(
+                        v.iter()
+                            .fold(0usize, |acc, (k, _)| acc.saturating_add(k.capacity())),
+                    ),
             })
             .fold(0usize, |acc, n| acc.saturating_add(n));
         columns_bytes
@@ -4467,7 +4615,7 @@ mod tests {
         );
     }
 
-    /// `BOOLEAN`／`BYTEA`／`JSON`／`JSONB`／`ARRAY`／`VECTOR` 列は typed 索引の
+    /// `BOOLEAN`／`JSON`／`JSONB`／`ARRAY`／`VECTOR` 列は typed 索引の
     /// 対象外のまま（`candidates_typed_range` は常に `None`）。
     #[test]
     fn typed_columns_exclude_non_indexable_types() {
@@ -4921,5 +5069,196 @@ mod tests {
                 );
             }
         }
+    }
+    // --- BYTEA 二次索引（Issue #1257・TABLE-13・INDEX-5 ポインタ） ------------
+
+    fn bytea_schema() -> TableSchema {
+        TableSchema::new(
+            "typed_docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("blob", ColumnType::Bytea, true),
+            ],
+        )
+    }
+
+    fn insert_bytea_rows(storage: &Storage, c: &PolicyContext, rows: &[Option<Vec<u8>>]) {
+        for (i, blob) in rows.iter().enumerate() {
+            let id = (i as u64) + 1;
+            crate::tenant::insert_typed_row(
+                storage,
+                "typed_docs",
+                c,
+                id,
+                Visibility::Public,
+                &[
+                    Value::Vector(vec![0.0, 0.0]),
+                    blob.clone().map(Value::Bytes).unwrap_or(Value::Null),
+                ],
+                &op_id(&format!("bytea-seed-{id}")),
+            )
+            .expect("insert bytea row");
+        }
+    }
+
+    fn hex_literal(b: &[u8]) -> String {
+        let mut s = String::from("\\x");
+        for byte in b {
+            s.push_str(&format!("{byte:02x}"));
+        }
+        s
+    }
+
+    /// `BYTEA` 列の等価・範囲・`BETWEEN` が、`MetadataFilter::matches` による
+    /// 全行評価（オラクル）と完全一致する（空バイト列・前方一致関係の値・
+    /// `NULL` を含む。信頼マスクが候補を再評価しないため厳密一致が前提）。
+    #[test]
+    fn bytea_candidates_match_brute_force_oracle() {
+        use crate::declarative_filter::{bind_all, CompareOp, DeclarativeFilter};
+        let db_path = unique_db_path("scalar-index-bytea-oracle");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        storage.create_table(&bytea_schema()).expect("create");
+        let c = ctx("tenant-a");
+        let values: Vec<Option<Vec<u8>>> = vec![
+            Some(vec![]),
+            Some(vec![0x00]),
+            Some(vec![0x07]),
+            Some(vec![0x07, 0x00]),
+            Some(vec![0x08]),
+            None,
+            Some(vec![0xff]),
+            Some(vec![0xff, 0xff]),
+            Some(vec![0x07]),
+        ];
+        insert_bytea_rows(&storage, &c, &values);
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        assert!(index.typed_column_is_indexed(typed_col(&schema, "blob")));
+
+        let mut probes: Vec<Vec<u8>> = values.iter().flatten().cloned().collect();
+        probes.push(vec![0x06]);
+        probes.push(vec![0x07, 0x01]);
+        probes.push(vec![0xff, 0xff, 0x00]);
+        probes.push(vec![0x00, 0x00]);
+
+        let blob_col = typed_col(&schema, "blob");
+        let scan_slot = |slot: usize| -> Option<Vec<u8>> {
+            let meta = snapshot
+                .metadata()
+                .get(slot)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let scanned = scan_scalar_columns(&schema, meta).expect("decode");
+            match scanned.get(blob_col) {
+                Some(Some(ScalarRef::Bytes(b))) => Some(b.to_vec()),
+                _ => None,
+            }
+        };
+        let oracle = |filter: &MetadataFilter| -> Vec<u32> {
+            let mut out = Vec::new();
+            for slot in 0..snapshot.arena().len() {
+                let v = scan_slot(slot);
+                if filter.matches(v.as_deref().map(ScalarRef::Bytes)) {
+                    out.push(slot as u32);
+                }
+            }
+            out
+        };
+
+        let mut filters: Vec<DeclarativeFilter> = Vec::new();
+        for p in &probes {
+            for op in [
+                CompareOp::Eq,
+                CompareOp::Lt,
+                CompareOp::Le,
+                CompareOp::Gt,
+                CompareOp::Ge,
+            ] {
+                filters.push(DeclarativeFilter::compare("blob", op, hex_literal(p)));
+            }
+            for q in &probes {
+                filters.push(DeclarativeFilter::between(
+                    "blob",
+                    hex_literal(p),
+                    hex_literal(q),
+                ));
+            }
+        }
+        let mut checked = 0usize;
+        for f in filters {
+            let bound = bind_all(&[f], &schema).expect("bind");
+            let filter = bound.first().expect("one filter");
+            let got = index.candidates_for(filter).expect("indexed BYTEA column");
+            assert_eq!(got, oracle(filter), "filter {filter:?}");
+            checked += 1;
+        }
+        assert!(checked > 100);
+    }
+
+    /// 平均値長が閾値（64 バイト）を超える `BYTEA` 列は列単位で索引対象外に
+    /// なり、`candidates_for` は `None`（全走査へ縮退）を返す。
+    #[test]
+    fn bytea_column_with_large_average_value_is_excluded() {
+        use crate::declarative_filter::{bind_all, CompareOp, DeclarativeFilter};
+        let db_path = unique_db_path("scalar-index-bytea-avg-gate");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        storage.create_table(&bytea_schema()).expect("create");
+        let c = ctx("tenant-a");
+        insert_bytea_rows(
+            &storage,
+            &c,
+            &[
+                Some(vec![1u8; 200]),
+                Some(vec![2u8; 200]),
+                Some(vec![3u8; 200]),
+            ],
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        assert!(!index.typed_column_is_indexed(typed_col(&schema, "blob")));
+        let bound = bind_all(
+            &[DeclarativeFilter::compare("blob", CompareOp::Ge, "\\x01")],
+            &schema,
+        )
+        .expect("bind");
+        assert_eq!(index.candidates_for(bound.first().expect("one")), None);
+    }
+
+    /// 索引化された `BYTEA` 列の概算ヒープ量は値本体のバイト量を含む。
+    #[test]
+    fn bytea_index_heap_bytes_include_value_bodies() {
+        let db_path = unique_db_path("scalar-index-bytea-heap-bytes");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        storage.create_table(&bytea_schema()).expect("create");
+        let c = ctx("tenant-a");
+        insert_bytea_rows(&storage, &c, &[Some(vec![1u8; 40]), Some(vec![2u8; 40])]);
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        assert!(index.typed_column_is_indexed(typed_col(&schema, "blob")));
+        assert!(index.approx_heap_bytes() >= 80);
+    }
+
+    #[test]
+    fn range_slots_bytes_handles_bounds_and_empty_key() {
+        use std::ops::Bound;
+        let pairs: Vec<(Vec<u8>, u32)> = vec![
+            (vec![], 3),
+            (vec![7], 0),
+            (vec![7], 5),
+            (vec![7, 0], 1),
+            (vec![8], 2),
+        ];
+        let all = range_slots_bytes(&pairs, Bound::Unbounded, Bound::Unbounded).unwrap();
+        assert_eq!(all, vec![0, 1, 2, 3, 5]);
+        let eq_empty =
+            range_slots_bytes(&pairs, Bound::Included(&[]), Bound::Included(&[])).unwrap();
+        assert_eq!(eq_empty, vec![3]);
+        let lt_empty = range_slots_bytes(&pairs, Bound::Unbounded, Bound::Excluded(&[])).unwrap();
+        assert!(lt_empty.is_empty());
+        let gt_7 = range_slots_bytes(&pairs, Bound::Excluded(&[7]), Bound::Unbounded).unwrap();
+        assert_eq!(gt_7, vec![1, 2]);
     }
 }
