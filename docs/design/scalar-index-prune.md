@@ -230,9 +230,11 @@ Phase 2（Issue #881〜#890）で追加した新スカラー型は、`ScalarInde
   として扱う `OrderedColumnIndex::U128`（`crate::uuid::Uuid` の `Ord` 導出
   ——バイト列辞書順——と同じ大小関係）
 
-`BOOLEAN`・`BYTEA`・`JSON`・`JSONB`・`ARRAY`・`VECTOR` 列は引き続き索引対象外
+`BOOLEAN`・`JSON`・`JSONB`・`ARRAY`・`VECTOR` 列は引き続き索引対象外
 （`typed_columns[i] = None`）。値域が 2 値（`BOOLEAN`）・等価/前方一致/範囲
-述語を持たない（他）という Issue #883・#886・#888・#889 時点の判断を維持する。
+述語を持たない（他）という Issue #883・#888・#889 時点の判断を維持する。
+`BYTEA` は当初対象外だったが Issue #1257 で索引対象になった（末尾の
+「Issue #1257」節参照）。
 
 `NULL` はいずれの typed 列索引にもエントリを作らない（`TextColumnIndex` と
 同じ契約）。予算計上（`typed_column_reservation_bytes`）は固定長キーのため
@@ -296,10 +298,9 @@ FilterOp::TypedCompare`（`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` �
 `OrderedColumnIndex::I128`（`NUMERIC` 用）は列固定の `scale` を第 2 要素と
 して一緒に保持し、境界計算に使う。
 
-`BYTEA` 列の `TypedCompare`（`TypedLiteral::Bytes`）は `OrderedColumnIndex`
-に対応 variant を持たないため引き続き未対応のまま（`candidates_for` が
-`None` を返し `sql::scalar_plan::classify_scalar_plan` が `PlainScan` へ
-縮退させる）。
+`BYTEA` 列の `TypedCompare`（`TypedLiteral::Bytes`）は Issue #893 時点では
+`OrderedColumnIndex` に対応 variant を持たず `PlainScan` へ縮退させていたが、
+Issue #1257 で `OrderedColumnIndex::Bytes` へ接続した（末尾の「Issue #1257」節）。
 
 ### `ScalarIndex::build` のレーン別構築
 
@@ -320,9 +321,9 @@ FilterOp::TypedCompare`（`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` �
 `sql::scalar_plan::ScalarPlan` へ `IndexTypedRange` variant（単独の
 `TypedCompare` 述語。2 件以上は既存の `IndexConjunction` に合流）を追加し、
 `EXPLAIN` の `scalar_plan:` トークンへ `index_typed_range` を追記した。
-`classify_scalar_plan` は `BoolEquals` と同じ理由で `BYTEA` の
-`TypedCompare` のみ先頭で `PlainScan` へ倒し、それ以外の `TypedCompare` は
-索引対応述語として扱う。
+`classify_scalar_plan` は（Issue #893 時点では `BYTEA` の `TypedCompare` のみ
+先頭で `PlainScan` へ倒していたが、Issue #1257 で撤去したため）すべての
+`TypedCompare` を索引対応述語として扱う。
 
 `resolve_candidates` が `Use` を返した場合、`sql::exec::mask_trusted_defer`・
 `sql::aggregate::count_star_only`・`sql::group_by::observe_group_count_only`
@@ -345,10 +346,10 @@ typed_compare_*`——と、`tests/scalar_index_typed_range.rs` の SQL 表層�
 | `crates/engine/src/sql/scalar_index.rs` | `OrderedColumnIndex`（`I128` へ列 `scale` 追加）・`TypedKey`・`typed_columns`・`push_typed_value`・`candidates_for`（`TypedCompare` 分岐・`typed_compare_candidates`）・`candidates_typed_range`（テスト専用に縮小）・`resolve_candidates`（`typed_preds` 引数を削除）・`build`（レーン B を常に構築）・単体テスト |
 | `crates/engine/src/numeric.rs` | `rescale_bounds_for_column`・単体テスト |
 | `crates/engine/src/declarative_filter.rs` | `CompareOp::accepts` を `pub(crate)` へ昇格 |
-| `crates/engine/src/sql/scalar_plan.rs` | `ScalarPlan::IndexTypedRange`・`classify_scalar_plan`（`BYTEA` のみ `PlainScan` へ限定）・`TypedRangePredicate` を削除 |
+| `crates/engine/src/sql/scalar_plan.rs` | `ScalarPlan::IndexTypedRange`・`classify_scalar_plan`（Issue #893 時点。`BYTEA` の限定は Issue #1257 で撤去）・`TypedRangePredicate` を削除 |
 | `crates/engine/src/sql/explain.rs` | `scalar_plan_token` へ `index_typed_range` 追加 |
 | `crates/engine/src/sql/exec.rs`・`aggregate.rs`・`group_by.rs` | `resolve_candidates` 呼び出しを 2 引数へ更新（コメント更新のみ・呼び出し形状は不変） |
-| `crates/engine/tests/scalar_index_typed_range.rs` | 新設。SQL 表層結合テスト（cold/hot 等価性・NUMERIC の scale 不一致・RLS・世代進行・`BYTEA` フォールバック） |
+| `crates/engine/tests/scalar_index_typed_range.rs` | 新設。SQL 表層結合テスト（cold/hot 等価性・NUMERIC の scale 不一致・RLS・世代進行・`BYTEA` フォールバック。Issue #1257 で索引消費の検証へ置換） |
 
 依存追加なし・`unsafe` なし・spec 本文転記なし。`TEXT`・`id` の既存索引経路
 （`Equals`／`StartsWith`／`IndexIdRange`／`IndexConjunction`）の挙動・
@@ -379,3 +380,64 @@ typed_compare_*`——と、`tests/scalar_index_typed_range.rs` の SQL 表層�
 （`None`）へ構築を遅延させたまま維持し、未接続の索引だけが原因で既存の
 `TEXT`／`ENUM` 索引が巻き添えになる退行リスクを解消した（上記「`ScalarIndex::
 build` のレーン別構築」節参照）。
+
+## Issue #1257: BYTEA 列の等価・範囲比較の二次索引対応
+
+ポインタ: TABLE-13・INDEX-5（INDEX-7 との関係は下記「索引宣言との関係」参照）。
+
+Issue #893 で `BYTEA` の `TypedCompare`／`Between` を `PlainScan` へ倒していた
+事前ゲートを撤去し、`BYTEA` 列を `DATE`／`NUMERIC`／`UUID` と同じレーン B の
+順序索引として扱う。
+
+### 索引表現・境界
+
+- `OrderedColumnIndex::Bytes(Vec<(Vec<u8>, u32)>)` を追加した。キー昇順・同一キー内は
+  スロット昇順の整列不変条件は既存 variant と同じ。`Vec<u8>` の `Ord`（バイト
+  辞書順。空バイト列が最小）は `FilterOp::eval` の `&[u8]` 比較と一致する。
+- `NULL` はエントリを作らない（`eval` が UNKNOWN＝不一致とするため候補と一致する）。
+- 範囲照会は `range_slots_bytes`（境界を参照で受ける版）で行う。後続値の導出は
+  せず `Excluded` 境界で表すため、`Eq`／`Lt`／`Le`／`Gt`／`Ge`／`Between` のいずれも
+  `eval` と厳密に同値になる。信頼マスク（Issue #844）は候補を再評価しないため、
+  この厳密一致が正しさの前提である。
+- テスト専用の `TypedKey` は `Copy` のため可変長キーを表せず、
+  `candidates_typed_range` の `Bytes` 腕は `None` を返す。
+
+### 構築とメモリ予算
+
+値 1 件が最大 4 MiB の可変長になるため、固定長キーの typed 経路ではなく `TEXT`
+列と同型の扱いにした。
+
+- 初期確保（`row_count` × `(Vec<u8>, u32)` のサイズ）を確保前に予算検証して計上する。
+- 行走査では、平均値長ゲート（`MAX_SCALAR_INDEX_COLUMN_AVG_TEXT_LEN`。Issue #632 と
+  同じ累積平均判定）、複製前の予算検証（超過は `TooLarge`＝索引なし＝全走査）、
+  `try_reserve_exact` による fallible な複製を行う。ゲート超過時は列単位で除外し、
+  初期確保分と複製済み本体分を予算から差し戻す。
+- `compute_approx_heap_bytes` は `capacity` ベースで本体のバイト量を計上する。
+- 平均値長ゲートで除外された列は、`EXPLAIN`（静的判定）では `index_typed_range`
+  と表示されるが、実行時は `FallbackNoIndex` で全走査になる。`TEXT` 列の既存の
+  乖離と同一で、結果の正しさには影響しない。
+
+### プラン分類
+
+`classify_scalar_plan` の `BYTEA` 事前ゲートを削除した。単独述語は
+`IndexTypedRange`、複合述語は `IndexConjunction` になる。`InTyped`（`BYTEA` の
+`IN` を含む）の事前ゲートは維持する（本 Issue の対象外）。
+
+### 索引宣言との関係
+
+`catalog::is_declarable_scalar_index_type` は `BYTEA` を拒否したまま据え置く
+（宣言対象としての受理は INDEX-7 の別スコープ）。宣言を持つテーブルでは `BYTEA`
+列は宣言対象外のため、`EXPLAIN`・実行時とも `PlainScan` になる（一貫した
+fail-closed）。
+
+### 対象ファイル（本 Issue 分）
+
+| パス | 変更 |
+| --- | --- |
+| `crates/engine/src/sql/scalar_index.rs` | `OrderedColumnIndex::Bytes`・`range_slots_bytes`・`try_owned_bytes`・`build` の `Bytea` 腕と行走査の専用分岐・`typed_compare_candidates`・`compute_approx_heap_bytes`・単体テスト |
+| `crates/engine/src/sql/scalar_plan.rs` | `BYTEA` 事前ゲートの削除・単体テストの期待値反転 |
+| `crates/engine/src/catalog.rs` | `is_declarable_scalar_index_type` のコメントのみ更新 |
+| `crates/engine/tests/scalar_index_bytea.rs` | 新設。等価・範囲・`BETWEEN`・空バイト列・`NULL`・複合述語・RLS・世代進行・信頼マスク・集計・`EXPLAIN` |
+| `crates/engine/tests/scalar_index_typed_range.rs` | 契約 6 を「`BYTEA` も索引経路」へ改訂 |
+
+依存追加なし・`unsafe` なし・spec 本文転記なし。

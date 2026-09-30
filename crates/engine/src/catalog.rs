@@ -364,10 +364,10 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
-/// スカラー索引宣言が対象にできる列型（`sql::scalar_index::ScalarIndex` が現に扱う
-/// 型に限る。`VECTOR`・`BOOLEAN`／`BYTEA`／`JSON(B)`／`ARRAY`・未結線の数値型
-/// 〔`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`〕は、宣言しても索引化に一切効かない
-/// 状態を作らないため fail-closed に拒否する）。
+/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY`・未結線の
+/// 数値型は索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動
+/// （`Auto`）構築では索引化される（Issue #1257）が、宣言での受理は INDEX-7 の別スコープの
+/// ため拒否のまま据え置く（宣言付きテーブルでは `BYTEA` 列は `PlainScan` になる）。
 fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
     matches!(
         ty,

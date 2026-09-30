@@ -45,11 +45,11 @@ pub enum ScalarPlan {
     IndexPrefix,
     /// 索引対応述語がちょうど 1 件で、`id` に対する単純比較。
     IndexIdRange,
-    /// 索引対応述語がちょうど 1 件で、`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`
-    /// 列の範囲比較（`FilterOp::TypedCompare`。`BYTEA` は対象外——索引が
-    /// 未対応のため常に `PlainScan`。Issue #891・TASK-199 で production
-    /// 結線済み・Issue #893 で二次索引へ接続済み）。`FilterOp::Between`
-    /// （`BYTEA` 以外。SQL-24・TASK-208 ポインタ）も同じ分類へ合流する
+    /// 索引対応述語がちょうど 1 件で、`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`
+    /// 列の範囲比較（`FilterOp::TypedCompare`。Issue #891・TASK-199 で
+    /// production 結線済み・Issue #893 で二次索引へ接続済み。`BYTEA` は
+    /// Issue #1257 で接続）。`FilterOp::Between`
+    /// （SQL-24・TASK-208 ポインタ）も同じ分類へ合流する
     /// （`sql::scalar_index::ScalarIndex::candidates_for` が `Ge`∧`Le` の
     /// 積で候補を導出する）。
     IndexTypedRange,
@@ -172,37 +172,12 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     {
         return ScalarPlan::PlainScan;
     }
-    // `BYTEA` 列の範囲比較（`FilterOp::TypedCompare` かつ
-    // `TypedLiteral::Bytes`）は二次索引が対応しない
-    // （`OrderedColumnIndex` に対応 variant を持たない。
-    // `sql::scalar_index::ScalarIndex::candidates_for` が `None` を返す）
-    // ため、`BoolEquals` と同じ理由で先頭から plain scan へ倒す。`DATE`／
-    // `TIMESTAMP`／`NUMERIC`／`UUID` の `TypedCompare` は Issue #893 で
-    // 二次索引へ接続済みのため、ここでは弾かない。複合述語に紛れて
-    // 誤って索引被覆済みと判定されるのを防ぐ単一情報源。
-    if input.metadata_filters.iter().any(|f| {
-        matches!(
-            f.op(),
-            crate::declarative_filter::FilterOp::TypedCompare {
-                value: crate::declarative_filter::TypedLiteral::Bytes(_),
-                ..
-            }
-        ) || matches!(
-            f.op(),
-            crate::declarative_filter::FilterOp::Between {
-                low: crate::declarative_filter::TypedLiteral::Bytes(_),
-                ..
-            }
-        )
-    }) {
-        return ScalarPlan::PlainScan;
-    }
     // `Not`／`IsNull`／`IsNotNull`／`InTyped`（SQL-24・TASK-208 ポインタ）は
     // 索引未対応（`sql::scalar_index::ScalarIndex::candidates_for` が `None` を
     // 返す）。`mask_trusted_defer`／`count_star_only` は「索引が返した候補集合が
     // 厳密一致」を前提に再評価を省略するため、索引側が対応しない op が複合述語
     // へ紛れ込んだまま `IndexConjunction` に分類されるのを防ぐ単一の事前ゲート
-    // （`BoolEquals`・`TypedCompare{Bytes}` と同じ設計）。
+    // （`BoolEquals` と同じ設計）。
     if input.metadata_filters.iter().any(|f| {
         matches!(
             f.op(),
@@ -226,7 +201,7 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     // 二次索引が対応しない（`sql::scalar_index::ScalarIndex::candidates_for` が
     // `None` を返す）。純粋な前方一致・完全一致は束縛時に `StartsWith`／
     // `Equals` へ既に振り分け済みのため、ここへ到達する `Like` は必ず
-    // 一般形——`BoolEquals`／`TypedCompare(Bytes)` と同じ理由で、複合述語に
+    // 一般形——`BoolEquals` と同じ理由で、複合述語に
     // 紛れて誤って索引被覆済みと判定されるのを防ぐ単一情報源として先頭で
     // plain scan へ倒す。
     if input
@@ -263,13 +238,11 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
             // `observe_group_count_only` が BOOLEAN 述語を「索引で完全被覆
             // 済み」と誤って信頼しないための単一情報源での保証。
             crate::declarative_filter::FilterOp::BoolEquals(_) => ScalarPlan::PlainScan,
-            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID` 列の範囲比較
-            // （`BYTEA` は上の事前判定で既に `PlainScan` を返し済みのため
-            // ここへは到達しない）。Issue #891・TASK-199 の production 結線・
-            // Issue #893 の二次索引接続により索引対応述語として扱う。
+            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較。
+            // Issue #891・TASK-199 の production 結線・Issue #893 の二次索引
+            // 接続（`BYTEA` は Issue #1257）により索引対応述語として扱う。
             crate::declarative_filter::FilterOp::TypedCompare { .. }
-            // `Between`（`BYTEA` は上の事前判定で `PlainScan` 済みのため
-            // ここへは到達しない。SQL-24・TASK-208 ポインタ）。
+            // `Between`（SQL-24・TASK-208 ポインタ）。
             | crate::declarative_filter::FilterOp::Between { .. } => ScalarPlan::IndexTypedRange,
             // `TEXT`／`ENUM` 列の `IN`（SQL-24・TASK-208 ポインタ）。
             crate::declarative_filter::FilterOp::InText(_) => ScalarPlan::IndexInList,
@@ -526,7 +499,7 @@ mod tests {
         bound.into_iter().next().expect("one filter")
     }
 
-    /// `BYTEA` 列の `BETWEEN` 述語（`OrderedColumnIndex` 未対応。SQL-24・
+    /// `BYTEA` 列の `BETWEEN` 述語（Issue #1257 で二次索引対応。SQL-24・
     /// TASK-208 ポインタ）。
     fn between_bytea_filter(column_index: usize) -> MetadataFilter {
         let schema = test_schema();
@@ -612,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_scan_for_single_bytea_between_predicate() {
+    fn index_typed_range_for_single_bytea_between_predicate() {
         let filters = vec![between_bytea_filter(5)];
         let input = ScalarShapeInput {
             scalar_prefilter: true,
@@ -620,11 +593,11 @@ mod tests {
             expr_filters: &[],
             or_filters: &[],
         };
-        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexTypedRange);
     }
 
     #[test]
-    fn plain_scan_when_bytea_between_predicate_mixed_with_text_equality() {
+    fn index_conjunction_when_bytea_between_predicate_mixed_with_text_equality() {
         let filters = vec![eq_filter(1), between_bytea_filter(5)];
         let input = ScalarShapeInput {
             scalar_prefilter: true,
@@ -632,7 +605,7 @@ mod tests {
             expr_filters: &[],
             or_filters: &[],
         };
-        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexConjunction);
     }
 
     #[test]
@@ -765,11 +738,11 @@ mod tests {
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexConjunction);
     }
 
-    /// `BYTEA` 列の範囲比較は [`OrderedColumnIndex`]（`sql::scalar_index`）が
-    /// 対応 variant を持たないため、単独でも複合述語の一部でも常に
-    /// `PlainScan` に分類される（`BoolEquals` と同じ単一情報源での保証）。
+    /// `BYTEA` 列の範囲比較は Issue #1257 で [`OrderedColumnIndex::Bytes`]
+    /// （`sql::scalar_index`）へ接続済みのため、単独なら `IndexTypedRange`・
+    /// 複合述語の一部なら `IndexConjunction` に分類される。
     #[test]
-    fn plain_scan_for_single_bytea_typed_compare_predicate() {
+    fn index_typed_range_for_single_bytea_typed_compare_predicate() {
         let filters = vec![typed_compare_bytea_filter(5)];
         let input = ScalarShapeInput {
             scalar_prefilter: true,
@@ -777,11 +750,11 @@ mod tests {
             expr_filters: &[],
             or_filters: &[],
         };
-        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexTypedRange);
     }
 
     #[test]
-    fn plain_scan_when_bytea_typed_compare_predicate_mixed_with_text_equality() {
+    fn index_conjunction_when_bytea_typed_compare_predicate_mixed_with_text_equality() {
         let filters = vec![eq_filter(1), typed_compare_bytea_filter(5)];
         let input = ScalarShapeInput {
             scalar_prefilter: true,
@@ -789,7 +762,7 @@ mod tests {
             expr_filters: &[],
             or_filters: &[],
         };
-        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexConjunction);
     }
 
     /// Issue #883・D-e: BOOLEAN 述語は単独でも複合述語の一部でも常に

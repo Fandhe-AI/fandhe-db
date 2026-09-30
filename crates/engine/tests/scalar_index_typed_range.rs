@@ -18,9 +18,8 @@
 //!    正しく交差する
 //! 4. RLS: 他テナントの private 行は typed 索引経路でも一切露出しない
 //! 5. テーブル世代の進行後、typed 索引は再構築され結果は一貫し続ける
-//! 6. `BYTEA` 列の範囲比較は二次索引が未対応のまま（`OrderedColumnIndex` に
-//!    対応 variant を持たない）ため `PlainScan` へ縮退するが、結果自体は
-//!    引き続き正しい
+//! 6. `BYTEA` 列の範囲比較も二次索引経路を使い（Issue #1257）、cold／hot の
+//!    結果が一致する
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -356,11 +355,11 @@ fn typed_index_rebuilds_after_generation_bump_and_results_stay_consistent() {
     assert_cold_hot_equivalent(&core, "tenant-a", sql);
 }
 
-// --- 契約 6: BYTEA は引き続き未対応（plain scan 縮退） ----------------------
+// --- 契約 6: BYTEA も二次索引経路を使う（Issue #1257） ----------------------
 
 #[test]
-fn bytea_typed_compare_falls_back_to_plain_scan_but_result_matches() {
-    let path = unique_db_path("scalar-index-typed-range-bytea-fallback");
+fn bytea_typed_compare_uses_index_and_result_matches() {
+    let path = unique_db_path("scalar-index-typed-range-bytea-index");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema()).expect("create table");
@@ -368,17 +367,14 @@ fn bytea_typed_compare_falls_back_to_plain_scan_but_result_matches() {
     let core = new_core(storage);
 
     // `blob` は `id as u8` の 1 バイト。`blob > '\x07'` は id 8・9・10 に一致
-    // する（`OrderedColumnIndex` に `BYTEA` 用の variant が無いため二次索引
-    // 対象外のまま——`sql::scalar_plan::classify_scalar_plan` が `PlainScan`
-    // へ縮退させる。結果自体は plain scan で正しく求まる）。
-    let before = core.scalar_index_cache_stats().index_scans;
+    // する（`OrderedColumnIndex::Bytes` 経由の索引候補）。
     let sql = "SELECT id FROM typed_docs WHERE blob > '\\x07' \
                ORDER BY embedding <=> '[10.0,0.0]' LIMIT 20";
-    let result = run(&core, "tenant-a", sql);
-    let after = core.scalar_index_cache_stats().index_scans;
-    assert_eq!(
-        before, after,
-        "a BYTEA range predicate must never be consumed by the index"
+    let index_scans = assert_cold_hot_equivalent(&core, "tenant-a", sql);
+    assert!(
+        index_scans > 0,
+        "a BYTEA range predicate must be consumed by the index on the hot path"
     );
+    let result = run(&core, "tenant-a", sql);
     assert_eq!(result_ids(&result), vec![8, 9, 10]);
 }

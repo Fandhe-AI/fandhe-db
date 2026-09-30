@@ -94,8 +94,9 @@ flatten()` で NULL と同一視すると、`IsNull` が誤って真になる（
 
 `classify_scalar_plan` は `Not`／`IsNull`／`IsNotNull`／`InTyped`／
 `Between{Bytes}` を（単独でも複合述語の一部でも）先頭で `PlainScan` へ倒す
-事前ゲート（`BoolEquals`・`TypedCompare{Bytes}` と同じ設計）。単独の
-`InText` は `ScalarPlan::IndexInList`、単独の `Between`（`Bytes` 以外）は
+事前ゲート（`BoolEquals` と同じ設計。`Between{Bytes}`・`TypedCompare{Bytes}` の
+ゲートは Issue #1257 で撤去し、`BYTEA` も二次索引対応になった）。単独の
+`InText` は `ScalarPlan::IndexInList`、単独の `Between` は
 `IndexTypedRange` に合流する。
 
 `ScalarIndex::candidates_for` は `InText` を値ごとの等価スロットの和集合
