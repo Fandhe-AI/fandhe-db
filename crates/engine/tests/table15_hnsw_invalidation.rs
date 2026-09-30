@@ -197,6 +197,8 @@ fn assert_fresh_generation(
     seed_storage(&ref_storage, "tenant-a", NEW_BASE, new_corpus, "ref");
     let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
 
+    // 温め段階の hit と区別するため、再投入後のクエリ前の hit 数を控える。
+    let hits_before = core.hnsw_index_cache_stats().hits;
     let mut recalls = Vec::new();
     for q in &queries_from(new_corpus) {
         let got = query_ids(core, alice, q);
@@ -216,7 +218,10 @@ fn assert_fresh_generation(
         stats.builds > builds_before,
         "HNSW index must be rebuilt for the new generation"
     );
-    assert!(stats.hits > 0, "rebuilt index must be consumed");
+    assert!(
+        stats.hits > hits_before,
+        "rebuilt index must be reused by the post-invalidation queries"
+    );
 }
 
 fn new_hnsw_core(path: &std::path::Path) -> (EngineCore, Vec<Vec<f32>>) {

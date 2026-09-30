@@ -450,12 +450,28 @@ fn assert_drop_state(db: &Path, lines: &[String]) {
             if exists {
                 let n = count(&core, &ctx("alice")).expect("alice count");
                 assert!(n == 0 || n == ALICE_ROWS, "partial state n={n}: {msg}");
+                // bob の投入は alice の後段の独立 commit。行数は {0, M'} で、alice が
+                // 未投入なら bob も未投入（投入順の逆転・部分反映は失敗）。
+                let nb = count(&core, &ctx("bob")).expect("bob count");
+                assert!(
+                    nb == 0 || nb == BOB_ROWS,
+                    "partial bob state nb={nb}: {msg}"
+                );
+                if n == 0 {
+                    assert_eq!(nb, 0, "bob seeded before alice: {msg}");
+                }
                 let reseed = insert_sql("c", 1, ALICE_ROWS, &format!("seed-a-{k}"));
                 if n == ALICE_ROWS {
                     assert_eq!(err(&core, &ctx("alice"), &reseed), "23505", "{msg}");
                 } else {
                     // 行が無いなら台帳も無い（再投入できる）。
                     ok(&core, &ctx("alice"), &reseed);
+                }
+                let reseed_bob = insert_sql("b", BOB_ID_BASE, BOB_ROWS, &format!("seed-b-{k}"));
+                if nb == BOB_ROWS {
+                    assert_eq!(err(&core, &ctx("bob"), &reseed_bob), "23505", "{msg}");
+                } else {
+                    ok(&core, &ctx("bob"), &reseed_bob);
                 }
                 return;
             }

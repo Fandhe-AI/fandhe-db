@@ -15,7 +15,9 @@
 //! `CleanupGuard`）に従う。他テナントとの区別は Private 行だけで組む
 //! （`Public` はグローバル可視のため）。
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Barrier;
+use std::time::{Duration, Instant};
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -144,6 +146,10 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
     assert_eq!(expected_ids_bob, vec![102, 104]);
 
     let barrier = Barrier::new(readers.len() + 1);
+    // DROP と読み取りが実際に重なることを保証する: DROP は全 reader が DROP 前の
+    // 完全な結果を 1 回以上観測してから発行する（reader はその後も DROP 完了まで
+    // 反復し続けるため、DROP の実行中に読み取りが重なる）。
+    let warmed_readers = AtomicUsize::new(0);
     let core_ref = &core;
 
     std::thread::scope(|scope| {
@@ -152,6 +158,7 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
             let barrier = &barrier;
             let expected_ids_alice = &expected_ids_alice;
             let expected_ids_bob = &expected_ids_bob;
+            let warmed_readers = &warmed_readers;
             handles.push(scope.spawn(move || {
                 barrier.wait();
                 let mut oks = 0u64;
@@ -164,9 +171,16 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
                                 1 => assert_eq!(count_of(outcome), expected_count_alice),
                                 _ => assert_eq!(&ids_of(outcome), expected_ids_bob),
                             }
+                            if oks == 1 {
+                                warmed_readers.fetch_add(1, AtomicOrdering::SeqCst);
+                            }
                         }
                         Err(code) => {
                             assert_eq!(code, "42P01", "only 42P01 is allowed during DROP: {sql}");
+                            assert!(
+                                oks >= 1,
+                                "reader must observe a full result before DROP: {sql}"
+                            );
                             return oks;
                         }
                     }
@@ -176,6 +190,15 @@ fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
         }
         let ddl = scope.spawn(|| {
             barrier.wait();
+            // reader が先に panic した場合に無限待ちにしない（上限到達は失敗として報告）。
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while warmed_readers.load(AtomicOrdering::SeqCst) < readers.len() {
+                assert!(
+                    Instant::now() < deadline,
+                    "readers did not observe a full result before the DROP deadline"
+                );
+                std::thread::yield_now();
+            }
             ok(core_ref, &ctx("sys"), "DROP TABLE docs");
         });
         ddl.join().expect("DDL thread must not panic");
