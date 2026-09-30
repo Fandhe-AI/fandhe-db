@@ -22,6 +22,7 @@
 //! `crates/engine/tests/sql_predicate_dml_exec.rs`・
 //! `crates/engine/tests/insert_multi_row.rs`（`EngineCore::with_dml_limits`
 //! 経由）の担当（本ファイルは CLI 解析の外形確認に徹する）。
+//! NoSQL 表層（HTTP）まで上限が届くことは `nosql12_affected_rows_limit.rs` が担当する。
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
