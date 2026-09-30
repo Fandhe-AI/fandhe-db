@@ -1159,9 +1159,9 @@ pub enum CatalogError {
     /// ENUM 型の `CREATE TYPE` 相当 API で同名の型が既に存在する（上書きしない）。
     TypeAlreadyExists(String),
     /// `DROP TYPE` 相当 API で、依存列（当該型を使う `ColumnType::Enum` 列）が
-    /// 1 つ以上残っているため削除を拒否する（SQL-23 結線時は `2BP01` へ写像する
-    /// 想定だが、本 variant は Rust API 専用であり wire への送出経路を持たない
-    /// ため `ErrorClass` には追加しない）。
+    /// 1 つ以上残っているため削除を拒否する。SQL 表層の `DROP TYPE`
+    /// （SQL-23・TASK-198、Issue #1194）では `sql::ddl` が `2BP01` へ写像する
+    /// （`ErrorClass` への追加は不要）。
     DependentObjectsStillExist(String),
     /// `DROP VIEW` の対象名がカタログ・ビュー双方のいずれにも存在しない
     /// （TABLE-18・SQL-23・TASK-205、Issue #909）。テーブルの `TableNotFound` とは
@@ -7489,9 +7489,10 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
-    /// 新規 ENUM 型を定義する（TABLE-14・TASK-198、Issue #890）。SQL-23（`CREATE
-    /// TYPE ... AS ENUM`）未実装のため Rust API 専用の DDL。同名の型が既に
-    /// 存在する場合は上書きせず `Err(CatalogError::TypeAlreadyExists)`。
+    /// 新規 ENUM 型を定義する（TABLE-14・TASK-198、Issue #890）。SQL 表層の
+    /// `CREATE TYPE ... AS ENUM`（SQL-23、Issue #1194）から `sql::ddl` 経由で
+    /// 呼ばれる。同名の型が既に存在する場合は上書きせず
+    /// `Err(CatalogError::TypeAlreadyExists)`。
     pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
         let encoded = encode_enum_type_def(name, &labels)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
@@ -7573,7 +7574,7 @@ impl Storage {
     /// `DROP TYPE <name>` 相当。依存列（[`ColumnType::Enum`] でこの型を参照する
     /// 列）が 1 つでも残っている場合は
     /// `Err(CatalogError::DependentObjectsStillExist)` で拒否する（SQL-23 結線時は
-    /// `2BP01` へ写像する想定。Issue #890 D5）。
+    /// `2BP01` へ写像する。Issue #890 D5・Issue #1194）。
     pub fn drop_enum_type(&self, name: &str) -> Result<()> {
         validate_identifier(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;

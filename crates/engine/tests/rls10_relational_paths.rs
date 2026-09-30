@@ -492,6 +492,28 @@ fn shapes() -> Vec<Shape> {
             sql: "SELECT documents.title, authors.name FROM documents FULL JOIN authors ON documents.author_id = authors.id LIMIT 50",
             check: Check::Token,
         },
+        // Issue #1190: 3 テーブル以上の連鎖・スカラー ORDER BY・結合での集計形。
+        // 各 relation が独立に RLS を適用されることを同じ独立オラクルで検査する。
+        Shape {
+            axis: "join_three_way",
+            sql: "SELECT documents.title, authors.name, langs.lang FROM documents JOIN authors ON documents.author_id = authors.id JOIN langs ON documents.lang = langs.lang LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
+            axis: "join_three_way_left_or",
+            sql: "SELECT documents.title, authors.name, langs.lang FROM documents LEFT JOIN authors ON documents.author_id = authors.id LEFT JOIN langs ON documents.lang = langs.lang WHERE documents.lang = 'ja' OR authors.name LIKE '%x' LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
+            axis: "join_order_by",
+            sql: "SELECT documents.title, authors.name FROM documents JOIN authors ON documents.author_id = authors.id ORDER BY authors.name DESC, documents.title LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
+            axis: "join_aggregate",
+            sql: "SELECT authors.name, COUNT(*) AS n, SUM(documents.score) AS total FROM documents JOIN authors ON documents.author_id = authors.id JOIN langs ON documents.lang = langs.lang GROUP BY authors.name ORDER BY authors.name",
+            check: Check::Token,
+        },
         Shape {
             axis: "subquery_in",
             sql: "SELECT id, title FROM documents WHERE lang IN (SELECT lang FROM langs LIMIT 1000) LIMIT 50",
@@ -627,6 +649,10 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
         "join_left",
         "join_right",
         "join_full",
+        "join_three_way",
+        "join_three_way_left_or",
+        "join_order_by",
+        "join_aggregate",
         "subquery_in",
         "subquery_exists",
         "cte",
