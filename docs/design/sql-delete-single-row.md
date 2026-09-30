@@ -117,18 +117,22 @@ delete_resending_a_0_row_operation_id_after_the_target_id_is_inserted_does_not_d
 （`NotFound`〔0 行成功へ写像〕）へ到達する。`crates/engine/tests/sql_delete_single_row.rs::
 delete_resending_used_operation_id_hits_ledger_before_ownership_check` が固定する。
 
-## 削除スコープ: 「所有（`is_owner`）」（`TRUNCATE` と同じ、可視性とは独立）
+## 削除スコープ: 「所有（`is_owner`）∩ 可視（`is_visible`）」
 
-`delete_row_ledgered_unchecked` の判定は `(tenant_id, id)` キー（TABLE-12）＋
-`is_owner` の二重防御であり、RLS 可視性（`is_visible`）ではない。`TRUNCATE` と同じ
-「テナント所有」
-スコープをそのまま採用する（他テナントの `Public` 行は可視でも所有でないため削除
-不能 → 0 行成功）。
+> **改訂注記（Issue #1251・2026-09-30）**: 削除対象を「所有」のみから「所有 ∩ 可視」へ
+> 改訂した（親 Issue #1250）。実装追随は #1253 で、マージまでコードは旧挙動（所有のみ）
+> である。設計全体は `docs/design/sql-returning.md`「対象選定・RLS 再判定と不変条件」
+> 節を参照。
 
-wire 経由では RLS-11（TASK-195）により自テナント行は常に可視のため、可視集合との
+削除対象は `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御に加え、RLS 可視性
+（`is_visible`）を満たす行に限る（`id` 指定 `UPDATE` と同じスコープ）。他テナントの
+`Public` 行は可視でも所有でないため削除不能、自テナントの不可視行は不存在と同形の
+`DELETE 0`（内容に触れない）で 0 行成功となる。`TRUNCATE` は所有行全体のまま据え置く
+（SQL-22）。
+
+wire 経由では RLS-11（TASK-195）により自テナント行は常に可視のため結果は変わらない。
 差は engine 直呼び出しの既定 ctx（`Public` のみ）で自テナント `Private` 行を削除する
-場合にのみ現れる（この場合も `is_owner` は可視性ラベルを問わず自テナント判定のため
-削除は成功する）。production コードはこの点について変更しない。
+場合にのみ現れ、この場合は削除されなくなる。
 
 ## RECOVER-10: 台帳キー空間は INSERT と共有
 

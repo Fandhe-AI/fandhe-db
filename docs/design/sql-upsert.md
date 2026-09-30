@@ -55,12 +55,25 @@ name }` を追加した（**BREAKING CHANGE**）。空白を挟まず「識別�
 ... SET` の右辺以外の位置に `QualifiedIdent` が現れた場合は `expect_ident` 系ヘルパーが
 受理せず `42601` へ落とす（構文上その位置以外に出現できない）。
 
-## 衝突判定スコープ: 物理キー `(tenant_id, id)` の所有（可視性ではない）
+## 衝突検出スコープ: 物理キー `(tenant_id, id)` の所有（書き込み対象は所有 ∩ 可視）
 
-既存 DML 実行器（`tenant::update_row_unchecked`・`delete_row_impl`・
-`truncate_table_unchecked`）はいずれも `(ctx.tenant_id(), id)` キー取得＋
-`ctx.is_owner` の二重防御で判定しており、RLS 可視性（`PolicyContext::is_visible`）では
-ない。`tenant::upsert_typed_rows_unchecked` も同じ規約に揃える。
+> **改訂注記（Issue #1251・2026-09-30）**: 衝突の**検出**（どの既存行と衝突するか）は
+> 下記のとおり所有スコープのまま（`23505` を構造的に出さない契約の維持）。検出した既存行
+> が可視集合外の場合の分岐（`DO NOTHING` はスキップ・`DO UPDATE` は `42501`）は
+> `docs/design/sql-returning.md`「UPSERT の衝突先が不可視の場合」節で確定した。実装追随は
+> #1254 で、マージまでコードは旧挙動である。
+
+**新契約（#1251 確定・#1254 で実装追随）**: 衝突の**検出**は所有スコープ
+（`(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner`）、**書き込み対象**は所有 ∩ 可視。
+検出した既存行が可視集合外なら書き込まず、分岐は `sql-returning.md` の定めに従う
+（`DO NOTHING` はスキップ・`DO UPDATE` は `42501`）。不可視の衝突先を更新してはならない。
+
+以下は**現行（旧挙動）の検出規約**の説明である。既存 DML 実行器
+（`tenant::update_row_unchecked`・`delete_row_impl`・`truncate_table_unchecked`）は
+いずれも `(ctx.tenant_id(), id)` キー取得＋`ctx.is_owner` の二重防御で判定しており、
+RLS 可視性（`PolicyContext::is_visible`）では判定していない（書き込み前の可視性判定は
+未実装で、#1254 で追加する）。`tenant::upsert_typed_rows_unchecked` の**衝突検出**も
+同じ所有規約に揃える（書き込み対象の可視性絞り込みは上記新契約に従い #1254 で追加）。
 
 - 可視集合で判定すると「自テナント所有だが ctx に不可視な行」が非衝突扱いになり、
   plain INSERT 経路で行 `id` 衝突の `23505`（`TenantWriteError::IdConflict`）になる
@@ -97,7 +110,10 @@ PR #1053（Issue #905・UNIQUE 制約）が対象外とした「UPSERT の衝突
   書き込み**前**に対象テナントの既存行を 1 回だけ走査し（`constraint::
   scan_tenant_rows_by_unique_key`。`enforce_unique_keys_in_txn` と同じ
   `(tenant_id, 0)..=(tenant_id, u64::MAX)` の閉区間・可視性を問わない全行が母集合。
-  RLS-9・RLS-10 (c)）、対象キー→既存行 id の対応表を作る。各 `VALUES` 行はこの表と
+  RLS-9・RLS-10 (c)）、対象キー→既存行 id の対応表を作る（この事前走査の母集合は
+  所有行全体のまま不変。衝突検出に必要なキー列のみを可視性を問わず読み、不可視行のキー列
+  破損は fail-closed の `XX000`。本体は読まない。契約は `sql-returning.md`「書き込み対象の選定スコープ」節。一致した既存行の可視性で `DO NOTHING`／`DO UPDATE` の分岐が
+  変わる点は `sql-returning.md`「UPSERT の衝突先が不可視の場合」節）。各 `VALUES` 行はこの表と
   照合し、一致すればその既存行 id に対して `DO NOTHING`／`DO UPDATE`（read-merge-
   write は `(id)` 対象と共有）を行い、一致しなければ `VALUES` の `id` で新規挿入する
   （同じ `id` を持つ既存行があれば通常どおり `23505`）。対象キーの正準化

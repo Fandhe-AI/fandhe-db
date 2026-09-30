@@ -1,5 +1,11 @@
 # `INSERT`／`UPDATE`／`DELETE`／UPSERT の `RETURNING` 句（Issue #873・#1182・SQL-21・TASK-193）
 
+> **改訂注記（Issue #1251・2026-09-30）**: 「RLS 再判定」「`CommandComplete` タグの件数」の
+> 2 節と UPSERT の不可視衝突の扱いを改訂した（親 Issue #1250）。実装追随は #1252
+> （`INSERT`／UPSERT 新規行）・#1253（`UPDATE`／`DELETE` の対象選定）・#1254（UPSERT の
+> 衝突先）・#1255／#1256（テスト）。これらのマージまでコードは旧挙動であり、本書の
+> 新方針が実装の目標仕様となる。
+
 ## 背景・スコープ
 
 書き込み文（DML）が「その文で実際に変更した行」を結果セットとして返せる
@@ -52,7 +58,7 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 | ファイル形 `INSERT`（`path`/`body` 列指定）＋ `RETURNING` | `42601`（束縛段。サーバー側チャンク化行を返す応答形が未定義のため fail-closed） |
 | 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | 受理（Issue #1182。削除前の値を返す） |
 | 単一行・述語形いずれの `UPDATE ... RETURNING ...`（セッション経路） | 受理（Issue #1182。更新後の値を返す） |
-| `INSERT ... ON CONFLICT ... RETURNING ...` | 受理（Issue #1182。挿入行・`DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない） |
+| `INSERT ... ON CONFLICT ... RETURNING ...` | 受理（Issue #1182。挿入行・`DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。所有だが不可視な衝突先は `DO NOTHING` ではスキップ、`DO UPDATE` では `42501`。下記「UPSERT の衝突先が不可視の場合」節） |
 | 未知列・式項目の `RETURNING`（全 DML） | 書き込み前に `22000`／`42601`（台帳は消費しない） |
 | `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`／`execute_update_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない。`RETURNING` を黙って落とす fail-open を避ける） |
 | 明示トランザクション内（`BEGIN ... COMMIT`）の `UPDATE`／`DELETE`／UPSERT（`RETURNING` の有無を問わず）・`RETURNING` 付き `INSERT` | `0A000`（従来どおり未対応。fail-closed） |
@@ -96,6 +102,8 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
   `sql::exec::execute_upsert_returning` → `tenant::
   upsert_typed_rows_capturing_unchecked`。新規挿入行は挿入した値、`DO UPDATE` 行は
   更新後の値を `VALUES` 記述順に返す。`DO NOTHING` で衝突した行は返さない。
+  所有だが不可視な衝突先は `DO NOTHING` ではスキップ、`DO UPDATE` では `42501`
+  （下記「UPSERT の衝突先が不可視の場合」節）。
   INDEX-4 バッチ上限は `validate_upsert_batch_limits` で `RETURNING` なしと共有。
 - 投影コールバックは `sql::exec::returning_collector` が全経路で共有する
   （RLS 再判定・文全体で累計する結果バイト予算・行バッファの `try_reserve`）。
@@ -114,29 +122,125 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
   も一切永続化されない。`INSERT` は書き込み予定値が呼び出し前から既知の
   ため引き続き書き込みより前に投影する（対称ではない別経路）。
 
-## RLS 再判定（多層防御）
+## 対象選定・RLS 再判定と不変条件
 
-返却行はいずれも書き込み経路（テナント名前空間キー `(tenant_id, id)`・
-TABLE-12）由来のため通常は `ctx` から可視だが、投影の直前に
-`PolicyContext::is_visible(row_tenant, row_visibility)` を再適用する
-（RLS-7・RLS-8 と同じ判定。security.md「テナント境界」多層防御方針）。
-不可視の場合は `result.rows` を空にするが、`rows_affected`（実際に変更した
-行数）は変えない——`PolicyContext::new`（`Public` のみ可視）で `Private`
-行（挿入行は常に `Private` 固定）を `RETURNING` した場合、
-`INSERT 0 1` は返るが `DataRow` は 0 件になる。この非対称は意図した設計
-判断であり、`crates/engine/tests/sql_returning.rs::
-insert_returning_rows_affected_is_independent_of_result_row_visibility` が
-固定する。
+### 書き込み対象の選定スコープ
 
-## `CommandComplete` タグと件数の独立性
+`UPDATE`（`id` 指定・述語形）・`DELETE`（`id` 指定・述語形）・UPSERT の既存行は、
+書き込み対象を次の**両方**を満たす行に絞る（RLS-10・SQL-21 と整合）。
+
+- **所有**: 物理キー `(tenant_id, 0)..=(tenant_id, u64::MAX)` の範囲（TABLE-12。
+  `is_owner` の二重防御）
+- **可視**: `PolicyContext::is_visible`（RLS-7・RLS-8 と同じ判定）
+
+「可視」単独ではなく「所有 ∩ 可視」である。他テナントの `Public` 行は可視だが
+所有ではないため、従来どおり対象外となる（越境書き込みを認めない）。他テナント行は
+物理キーの範囲走査で構造的に除外され、取得すらされない（RLS-9）。
+
+- 可視性の判定は**ヘッダ専用デコード**（`storage::decode_row_tenant_and_visibility`）で
+  先に行い、所有かつ可視の行だけを本体デコード・述語評価の対象にする
+  （`docs/design/update-single-row.md`「判断 D 再改訂」と同じ設計）。不可視行の
+  本体破損が `XX000` として観測され、存在オラクルになることを防ぐ。
+  この「本体を読まない」契約は**対象選定**（述語評価・`RETURNING` 投影・書き込み対象
+  の確定）の範囲に限る。制約検査の母集合（下記「据え置き」）と UPSERT の
+  `UpsertTarget::Unique` 衝突表の事前走査（`scan_tenant_rows_by_unique_key`）は、衝突検出に
+  必要な**キー列だけ**を所有行全体から読む（可視性を問わない）。不可視行のキー列が
+  破損していた場合は fail-closed で `XX000` とし、衝突を「無し」と見なして続行しない
+  （見逃すと一意性違反を通すため）。この `XX000` は自テナント所有行の破損のみを示し、
+  他テナントの存在・内容は含まない。自テナントの不可視行の存在は、制約検査が
+  従来から `23505` で観測させる範囲（RLS-10 の制約検査）に含まれ、新たな存在オラクルは
+  生まない。キー列以外の本体は、衝突先が可視と判明した後にのみ読む。
+- 総走査上限（`tenant::MAX_SCANNED_ROWS`）の加算は従来どおり対象テナント所有行の
+  走査ごとに行い、可視性で数え方を変えない（他テナントのデータ量に依存しない性質の維持）。
+- `id` 指定 `UPDATE` は既にこのスコープである。`id` 指定 `DELETE`・述語形
+  `UPDATE`／`DELETE` をこれに揃える（実装は #1253）。
+- **据え置き**: `TRUNCATE`（SQL-22）の削除母集合と、UNIQUE／PRIMARY KEY／FOREIGN KEY
+  等の制約検査の母集合（RLS-10 の制約検査・TABLE-16・TABLE-17）は、所有行全体のまま
+  変えない。母集合を可視集合へ狭めると、不可視行との一意性衝突を見逃すため。
+
+### 新規挿入行の返却
+
+`INSERT`・UPSERT の新規行は、書き込み経路（`(ctx.tenant_id(), id)` キー・`is_owner`
+検査済み）由来の「文が挿入した行そのもの」であり、他テナント名義の行の挿入は
+`is_owner` 検査（`42501`）で書き込み前に拒否されるため、返却行に他テナント行は
+構造的に入らない。ただし `is_owner`（書き込み権限）は読み取り時の `is_visible` の
+代わりにならない。`RETURNING` は読み取り経路でもあるため、**返却にも可視性の検査を
+維持する**（RLS の可視性を迂回する例外は設けない）。
+
+- 投影直前に `PolicyContext::is_visible` を適用する。可視なら返す。
+- 不可視（`PolicyContext::new` 等で `Private` 行が不可視なコンテキストが
+  `Private` 行を挿入した場合）は、通常の読み取りで見えない行の値を返さず、かつ
+  黙って落とさず（影響行数との不一致を避ける）、内部エラー（`XX000`）で write
+  トランザクションを abort する（行・台帳とも永続化しない。fail-closed）。
+  wire／HTTP の認証経路は所有集合 ⊆ 可視集合（RLS-11）のため通常は発生しない。
+
+### 投影直前の RLS 再判定（`sql::exec::returning_collector`）
+
+`INSERT`・UPSERT（新規行・既存行）・`UPDATE`・`DELETE` のすべてで、投影直前の
+`PolicyContext::is_visible` 再適用を**不変条件の検査**として残す（多層防御。
+security.md「テナント境界」）。対象選定または書き込みを通過した行が再判定で不可視だった
+場合は、行を黙って落とさず内部エラー（`XX000`）で write トランザクションを abort する
+（行・台帳とも永続化しない）。黙って落とすと影響行数と返却行数が食い違い、#1250 の
+不一致が再発するため。この再判定を所有検査に置き換えない。
+
+### 不変条件
+
+- (a) すべての DML（`INSERT`・UPSERT・`UPDATE`〔`id` 指定・述語形〕・`DELETE`〔`id`
+  指定・述語形〕）で、`RETURNING` の `DataRow` 数と `rows_affected` は一致する。可視集合が
+  `Public` のみでも `Public`＋`Private` でも成立し、`RETURNING` を返す全経路に適用する。
+- (b) 他テナント行は候補集合・返却行・影響行数のいずれにも現れない（混入 0 件。
+  RLS-7〜10）。
+- (c) `TRUNCATE` の削除母集合（SQL-22）と制約検査の母集合（TABLE-16・TABLE-17・RLS-10 の
+  制約検査）は所有行全体のまま不変。
+- (d) wire／HTTP の認証経路は RLS-11 により「所有集合 ⊆ 可視集合」（自テナント所有行は
+  常に可視。可視集合は他テナントの `Public` 行を含みうるため一致はしない）が成り立つ。
+  書き込み対象は「所有 ∩ 可視」＝所有集合となり（他テナントの `Public` 行は書き込み時の
+  所有検査で従来どおり除外される）、外部挙動は変わらない。差が観測されるのは所有行が
+  不可視になりうる engine 直呼び出し（`PolicyContext::new` 等）のみであり、
+  #1253・#1254 を BREAKING CHANGE とする理由である。この場合でも `RETURNING` は
+  不可視行の値を返さず、`XX000` で abort する（上記「新規挿入行の返却」）。
+- (e) `CommandComplete` タグは引き続き `rows_affected` を使う（(a) により
+  `result.rows.len()` と一致する）。
+
+固定するテストは #1255 の全経路テストと、#1252／#1253 で更新される既存テストである。
+
+## UPSERT の衝突先が不可視の場合
+
+本構文は `ON CONFLICT` の対象（`(id)` または `UpsertTarget::Unique`）で**検出した衝突**
+について `23505` を出さない契約（`docs/design/sql-upsert.md`）のため、検出した衝突先が
+不可視でも不存在扱いして新規挿入へ進む案（物理キー衝突で `23505` になる）は採れない。
+なお UNIQUE キー不一致のまま挿入予定 `id` が既存行と重なる場合は、`sql-upsert.md` の
+とおり従来どおり `23505` であり、本節の対象外（この契約は変えない）。
+衝突の**検出**は物理キー（`UpsertTarget::Unique` では UNIQUE 列の事前走査）の所有
+スコープのまま行い、検出した既存行の可視性で次のとおり分岐する。
+
+| アクション | 衝突先が所有かつ可視 | 衝突先が所有だが不可視 |
+| ---------- | -------------------- | ---------------------- |
+| `DO NOTHING` | 変更なし（影響・返却とも数えない） | スキップ（書き込まない・影響行数に数えない・返却しない）。可視時と同じ応答形 |
+| `DO UPDATE` | read-merge-write で更新し、更新後の値を返却 | 文全体を `42501` で拒否 |
+
+- `DO UPDATE` の拒否は write トランザクションを abort し、全 `VALUES` 行・台帳とも
+  副作用ゼロ（RECOVER-11）。台帳エントリは commit されないため、同一 `operation_id` は
+  再利用できる（制約違反時と同じ扱い）。
+- 根拠: 単一行 `UPDATE ... WHERE id = <n>` は不可視が `UPDATE 0` となり不存在と区別
+  できないが、UPSERT には不存在と同形の結果がなく、どの選択肢でも自テナント内の存在は
+  観測されうる。漏れる範囲は自テナント内（TABLE-12 のキー名前空間）に限られ、他テナント行
+  はキーが異なり取得すらされない（RLS-9 の性質は不変）。そのうえで `DO UPDATE` の書き込み
+  意図を黙って捨てる fail-open を避け、拒否側（fail-closed）に倒す。
+- エラー形の制約: `wire_code` は `42501`、エラー文言は固定の英語文字列で、対象行の
+  `id`・列値を含めない。Rust 上の形（`TenantWriteError::Forbidden` の流用は分類名
+  `FORBIDDEN_TENANT_MISMATCH` が不正確なため、専用 variant の要否）は #1254 で判断する。
+- 判定順序（#1254 向け）: ヘッダ専用デコードで所有かつ可視を先に確定し、可視な行だけ
+  本体デコードする（上記「判断 D」と同じ設計）。
+
+## `CommandComplete` タグの件数
 
 `wire-server::simple_query` は `SqlOutcome::Returning` を受け取ると
 `respond_rows_with_tag`（`respond_query_result` から切り出した共通本体）で
 `RowDescription`→`DataRow`*→`CommandComplete` を送出する。タグの件数は
-`result.rows.len()`（RLS 再判定後の投影行数）ではなく必ず
-`outcome.rows_affected`（実際に変更した行数）を使う——`SELECT`/`EXPLAIN` の
-`format!("{tag} {}", result.rows.len())` は再利用できない（両者が一致しない
-ケースがあるため）。
+`outcome.rows_affected` を使う。不変条件 (a) により `result.rows.len()` と一致する
+が、DML の件数の正本は書き込み経路の `rows_affected` であるため、`SELECT`/`EXPLAIN` の
+`format!("{tag} {}", result.rows.len())` は再利用しない。
 
 | DML | タグ |
 | --- | ---- |
