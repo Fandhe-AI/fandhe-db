@@ -17,6 +17,10 @@
 //! fixture には必ず他テナントの Private 行を混ぜ、計測前に各 arm を 1 回実行して
 //! 「受理される・非空・他テナント行が混入しない・順序／述語／結合キーが期待どおり」を
 //! 検査する（RLS を外した状態や空振りを測る事態を fail-closed で防ぐ）。
+//! `LIMIT` 後の結果だけでは越境を見逃すため、他テナント行は各 arm の上位に必ず並ぶ
+//! sentinel（述語 arm は問い合わせベクトルと同一・`lang=l0`、順序 arm は最小／最大 `qty`）として投入し、
+//! 結合は `LIMIT` を全行数超へ広げた対照クエリで件数まで照合する。加えて他テナント文脈で同じ文が
+//! 他テナント行を返すこと（＝越境が起きれば見える fixture であること）を確認する。
 //!
 //! 使い方は `make bench-relational-p95`。時間非依存の判定ロジックは
 //! `harness::relational_p95` にあり `tests/relational_p95_accept.rs` が `make ci` で検証する。
@@ -30,10 +34,11 @@ use harness::env_report::EnvReport;
 use harness::protocol::{run, MeasurementConfig};
 use harness::relational_p95::{
     author_id_for_doc, is_sorted_by_direction, join_statement, lang_for_id, lang_in_first_n,
-    order_by_statements, other_tenant_rows, parse_group, parse_rounds, parse_rows_scale,
-    predicate_statements, qty_for_id, ratio_vs_reference, refuse_under_github_actions,
-    render_round_line, render_summary_line, render_threshold_line, rotate_arms, round_p95,
-    scale_label, summarize_rounds, Group, JOIN_ROWS, REFERENCE_ARM,
+    lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
+    parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
+    refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
+    rotate_arms, round_p95, scale_label, summarize_rounds, Group, JOIN_ROWS, REFERENCE_ARM,
+    WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -247,6 +252,17 @@ fn precheck_order(arm: &str, result: &QueryResult, own_rows: u64) {
     }
 }
 
+/// 対照検査: 両 visibility を見える他テナント文脈（Public な自行も見える）で同じ文を実行し、
+/// 結果に他テナント側の行（id が自範囲外）が現れることを確認する。RLS が外れれば対象テナントの
+/// 結果にも同じ sentinel が現れる、という前提（検出可能な fixture）の裏付けになる。
+fn precheck_other_tenant_visible(arm: &str, result: &QueryResult, own_rows: u64) {
+    if !result.rows.iter().any(|r| r.id >= own_rows) {
+        fail_closed(format!(
+            "{arm}: control query returned no other-tenant rows"
+        ));
+    }
+}
+
 /// arm 群を輪番で N ラウンド計測し、要約行を出力する。
 fn measure_group(
     group: &str,
@@ -321,6 +337,17 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     };
     let own = rows as u64;
     let other = other_tenant_rows(rows) as u64;
+    let query = DeterministicRng::new(2).next_vector(DIM);
+    // 他テナント行は各 arm の上位（距離 0・`l0`・最小 `qty`）に並ぶ sentinel とし、
+    // RLS が外れれば `LIMIT` 後の結果へ必ず現れるようにする。
+    // `qty` は偶数 id を最小（`order_single` 先頭）、奇数 id を最大（`order_multi` の `l0` 内先頭）にする。
+    let make_other = |id: u64| {
+        vec![
+            Value::Vector(query.clone()),
+            Value::Text(lang_token(0).to_string()),
+            Value::BigInt(if id.is_multiple_of(2) { -1 } else { 2_000_000 }),
+        ]
+    };
     seed_rows(
         &storage,
         &schema,
@@ -335,13 +362,13 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         TENANT_B,
         Visibility::Private,
         own..own + other,
-        &make,
+        &make_other,
     );
 
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
     let ctx_a =
         PolicyContext::new(TENANT_A).unwrap_or_else(|e| fail_closed(format!("policy ctx: {e}")));
-    let query = DeterministicRng::new(2).next_vector(DIM);
+    let ctx_b = ctx(TENANT_B);
     let literal =
         vector_literal(&query).unwrap_or_else(|e| fail_closed(format!("vector literal: {e}")));
 
@@ -349,6 +376,7 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         let arms = predicate_statements(DOCS, &literal).unwrap_or_else(|e| fail_closed(e));
         for (label, sql) in &arms {
             precheck_predicate(label, &exec(&core, &ctx_a, sql), own);
+            precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
         }
         measure_group(
             "predicate",
@@ -364,6 +392,7 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         let arms = order_by_statements(DOCS).unwrap_or_else(|e| fail_closed(e));
         for (label, sql) in &arms {
             precheck_order(label, &exec(&core, &ctx_a, sql), own);
+            precheck_other_tenant_visible(label, &exec(&core, &ctx_b, sql), own);
         }
         measure_group(
             "order_by",
@@ -400,6 +429,14 @@ fn run_join_group(rows: usize, rounds: u32) {
             Value::BigInt(author_id_for_doc(id, join_rows)),
         ]
     };
+    // 他テナント文書は他テナントの作者行（id `join_rows..`）へ結合させ、対照クエリで結合が成立するようにする。
+    let make_other_doc = |id: u64| {
+        vec![
+            Value::Vector(vec![id as f32, 0.0]),
+            Value::Text(format!("t{id}")),
+            Value::BigInt((join_rows + (id - join_rows) % other.max(1)) as i64),
+        ]
+    };
     let make_author = |id: u64| {
         vec![
             Value::Vector(vec![id as f32, 1.0]),
@@ -420,7 +457,7 @@ fn run_join_group(rows: usize, rounds: u32) {
         TENANT_B,
         Visibility::Private,
         join_rows..join_rows + other,
-        &make_doc,
+        &make_other_doc,
     );
     seed_rows(
         &storage,
@@ -459,6 +496,19 @@ fn run_join_group(rows: usize, rounds: u32) {
             fail_closed("join_inner: join key mismatch");
         }
     }
+    // 対照検査: `LIMIT` を全行数超へ広げ、結合結果が自テナント文書の全件（過不足なし）であることを
+    // 確認する。RLS が外れれば他テナント文書が加わり件数・id 範囲が崩れる。
+    let wide_sql = arm
+        .1
+        .strip_suffix(&format!("LIMIT {WIDE_LIMIT}"))
+        .map(|head| format!("{head}LIMIT {}", join_rows + other + 1))
+        .unwrap_or_else(|| fail_closed("join_inner: unexpected statement shape"));
+    let full = exec(&core, &ctx_a, &wide_sql);
+    if full.rows.len() as u64 != join_rows || full.rows.iter().any(|r| r.id >= join_rows) {
+        fail_closed("join_inner: full join is not confined to own tenant");
+    }
+    let ctx_b = ctx(TENANT_B);
+    precheck_other_tenant_visible("join_inner", &exec(&core, &ctx_b, &wide_sql), join_rows);
     measure_group(
         "join",
         (join_rows as usize, scale_label(rows)),
