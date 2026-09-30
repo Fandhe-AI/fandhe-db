@@ -448,6 +448,8 @@ enum Expect {
     /// RETURNING 付き。`affected` は [`Expect::Affected`] と同じ（Private 込み, Public のみ）、
     /// `ids` は同じ 2 モードでの返却行の `id`（出現順）。返却行は閲覧側に可視な行に限られる
     /// （Public のみモードでは自テナントの Private 行・既定可視性で投入した行は返らない）。
+    /// この「影響行数と返却行が一致しない」挙動は SQL-21 と不一致の現状を固定したもので、
+    /// #1250 で是正予定（是正時は該当形状の期待値を更新する）。
     Returning {
         affected: (u64, u64),
         ids: (&'static [u64], &'static [u64]),
@@ -497,6 +499,8 @@ fn shapes() -> Vec<Shape> {
         w("upd-id-missing", "UPDATE docs SET score = 999 WHERE id = 99 USING OPERATION_ID '{op}'", Affected(0, 0)),
         w("upd-pred-ja", "UPDATE docs SET score = 0 WHERE lang = 'ja' USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("upd-pred-none", "UPDATE docs SET score = 0 WHERE lang = 'zz' USING OPERATION_ID '{op}'", Affected(0, 0)),
+        // SQL-21 と不一致の現状を固定（Public のみモードで影響行数と返却行が一致しない）。
+        // #1250 で是正予定。是正時はこの期待値を更新する。
         w("upd-pred-returning", "UPDATE docs SET score = 5 WHERE lang = 'ja' RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (2, 2), ids: (&[1, 2], &[1]) }),
         w("del-id-own", "DELETE FROM docs WHERE id = 1 USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("del-id-foreign-only", "DELETE FROM docs WHERE id = 9 USING OPERATION_ID '{op}'", Affected(0, 0)),
@@ -506,11 +510,15 @@ fn shapes() -> Vec<Shape> {
         w("ins-foreign-id", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("ins-multi-foreign-ids", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-n1'), (10, 'ja', 2, 'tok-{v}-n2') USING OPERATION_ID '{op}'", Affected(2, 2)),
         w("ins-own-dup-id", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-dup') USING OPERATION_ID '{op}'", Err("23505")),
+        // SQL-21 と不一致の現状を固定（Public のみモードで影響行数と返却行が一致しない）。
+        // #1250 で是正予定。是正時はこの期待値を更新する。
         w("ins-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-new') RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[9], &[]) }),
         w("upsert-foreign-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-update", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 7, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-foreign-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(1, 1)),
         w("upsert-own-id-nothing", "INSERT INTO docs (id, lang, score, body) VALUES (1, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO NOTHING USING OPERATION_ID '{op}'", Affected(0, 0)),
+        // SQL-21 と不一致の現状を固定（Public のみモードで影響行数と返却行が一致しない）。
+        // #1250 で是正予定。是正時はこの期待値を更新する。
         w("upsert-returning", "INSERT INTO docs (id, lang, score, body) VALUES (9, 'ja', 1, 'tok-{v}-up') ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score RETURNING * USING OPERATION_ID '{op}'", Returning { affected: (1, 1), ids: (&[9], &[]) }),
         w("truncate", "TRUNCATE TABLE docs USING OPERATION_ID '{op}'", Truncated),
         // ---- (c) 制約検査 ----
