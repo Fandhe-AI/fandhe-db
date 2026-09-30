@@ -33,7 +33,7 @@ use std::time::Duration;
 use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
-    author_id_for_doc, cosine_distance, expected_order_multi, expected_order_single,
+    author_id_for_doc, expected_order_multi, expected_order_single, inner_product_distance,
     interleave_with_reference, is_exact_id_set, join_statement, lang_for_id, lang_in_first_n,
     lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
     parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
@@ -208,7 +208,7 @@ fn cell_text(cell: Option<&Cell>) -> &str {
 }
 
 /// 述語 arm の期待結果（文脈から見える述語充足行の `(id, 距離)` の距離昇順）を fixture から求める。
-/// 計測クエリと同じベクトル列を参照実装のコサイン距離で並べ、エンジン出力とは独立に導出する。
+/// 計測クエリと同じベクトル列を参照実装の負の内積距離（エンジンのスコアは内積）で並べ、エンジン出力とは独立に導出する。
 /// `other_rows > 0`（他テナント文脈）のときは、計測クエリと同一ベクトルの sentinel（距離 0・`l0`）を加える。
 fn expected_predicate_ranked(
     arm: &str,
@@ -219,9 +219,9 @@ fn expected_predicate_ranked(
     let n = predicate_lang_count(arm);
     let mut ranked: Vec<(u64, f64)> = (0..own_rows)
         .filter(|id| lang_in_first_n(lang_for_id(*id), n))
-        .map(|id| (id, cosine_distance(&rng_vector_for(id), query)))
+        .map(|id| (id, inner_product_distance(&rng_vector_for(id), query)))
         .collect();
-    let sentinel_dist = cosine_distance(query, query);
+    let sentinel_dist = inner_product_distance(query, query);
     ranked.extend((own_rows..own_rows + other_rows).map(|id| (id, sentinel_dist)));
     ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
     ranked
@@ -411,7 +411,7 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let other = other_tenant_rows(rows) as u64;
     let query = DeterministicRng::new(2).next_vector(DIM);
     // 他テナント行は各 arm の上位（`l0`・最小／最大 `qty`）に並ぶ sentinel とする。ベクトルは
-    // 計測クエリのベクトルと同一（コサイン距離 0）にして、RLS が外れれば計測クエリ自身の
+    // 計測クエリのベクトルと同一（内積が最大）にして、RLS が外れれば計測クエリ自身の
     // LIMIT 内へ必ず越境行が入る fixture にする。これで対象テナントの事前検査（他テナント id 非混入）が
     // 計測クエリそのものの分離検出力を持つ。対照検査も同じ文を他テナント文脈で実行し、sentinel が
     // 上位に見えること（＝検出可能な fixture であること）を確認する。

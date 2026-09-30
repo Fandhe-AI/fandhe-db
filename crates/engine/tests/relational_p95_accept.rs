@@ -272,10 +272,11 @@ fn topk_matches_detects_wrong_subset() {
 }
 
 #[test]
-fn cosine_distance_reference() {
-    assert!(cosine_distance(&[1.0, 0.0], &[2.0, 0.0]).abs() < 1e-12);
-    assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-12);
-    assert_eq!(cosine_distance(&[0.0, 0.0], &[1.0, 0.0]), 1.0);
+fn inner_product_distance_reference() {
+    // 正規化しない内積のため、大きさの違うベクトルは距離が異なる（コサインなら同じ 0）。
+    assert_eq!(inner_product_distance(&[1.0, 0.0], &[2.0, 0.0]), -2.0);
+    assert_eq!(inner_product_distance(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+    assert_eq!(inner_product_distance(&[3.0, 4.0], &[3.0, 4.0]), -25.0);
 }
 
 #[test]

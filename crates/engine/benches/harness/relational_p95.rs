@@ -369,25 +369,18 @@ pub fn is_exact_id_set(ids: &[u64], expected_sorted: &[u64]) -> bool {
     got == expected_sorted
 }
 
-/// コサイン距離（`1 - cos`）。`<=>` の期待値を fixture から独立に求めるための参照実装。
-pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
-    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
-    for (x, y) in a.iter().zip(b) {
-        let (x, y) = (f64::from(*x), f64::from(*y));
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = (na * nb).sqrt();
-    if denom == 0.0 {
-        return 1.0;
-    }
-    1.0 - dot / denom
+/// 検索カーネルのスコア（内積。大きいほど近い。`kernel.rs` の `dot`）に対応する距離 `-dot(a, b)`。
+/// `ORDER BY embedding <=> q` は正規化なしの内積で並ぶため、期待順序を fixture から独立に求める
+/// 参照実装は f64 の負の内積とする（コサイン距離だと順位が入れ替わる）。
+pub fn inner_product_distance(a: &[f32], b: &[f32]) -> f64 {
+    -a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum::<f64>()
 }
 
-/// 距離の同値境界を許容する幅（エンジンの f32 計算と f64 参照実装の差を吸収する。
-/// 縮小規模の実測で順位入れ替わりが 1.5e-3 程度の距離差で出たため 5e-3 とする）。
-pub const DISTANCE_EPS: f64 = 5e-3;
+/// 距離の同値境界を許容する幅（エンジンの f32 内積と f64 参照実装の累積誤差を吸収する）。
+pub const DISTANCE_EPS: f64 = 1e-3;
 
 /// 述語 arm（`ORDER BY embedding <=> q LIMIT k`）の返却 id 列が期待どおりかを照合する。
 /// `ranked` は述語を満たす全自テナント行の `(id, 距離)` を距離昇順に並べたもの。
