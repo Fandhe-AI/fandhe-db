@@ -1794,9 +1794,23 @@ fn upsert_typed_rows_impl(
             let unique_existing: Option<std::collections::HashMap<Vec<u8>, u64>> = match target {
                 UpsertTarget::RowId => None,
                 UpsertTarget::Unique(indices) => {
-                    Some(crate::constraint::scan_tenant_rows_by_unique_key(
-                        &row_table, &schema, ctx, indices,
-                    )?)
+                    let (mut existing, corrupt_ids) =
+                        crate::constraint::scan_tenant_rows_by_unique_key(
+                            &row_table, &schema, ctx, indices,
+                        )?;
+                    // キーを復元できない不可視行は永続索引から補完し、健全な不可視行と
+                    // 応答が変わらないようにする（Issue #1254。後続の一意索引検査が
+                    // 破損を `XX000` で漏らさない）。
+                    crate::constraint::recover_unique_keys_of_corrupt_rows(
+                        write_txn,
+                        table,
+                        &schema,
+                        ctx.tenant_id(),
+                        indices,
+                        &corrupt_ids,
+                        &mut existing,
+                    )?;
+                    Some(existing)
                 }
             };
 
@@ -8154,7 +8168,7 @@ mod tests {
         let row_table = write_txn
             .open_table(user_rows_table_def(&name))
             .expect("open row table");
-        let hidden = crate::constraint::scan_tenant_rows_by_unique_key(
+        let (hidden, hidden_corrupt) = crate::constraint::scan_tenant_rows_by_unique_key(
             &row_table,
             &unique_schema,
             &ctx,
@@ -8162,6 +8176,7 @@ mod tests {
         )
         .expect("invisible corrupt row must not fail the pre-scan");
         assert!(hidden.is_empty());
+        assert_eq!(hidden_corrupt.len(), 1);
         let visible = crate::constraint::scan_tenant_rows_by_unique_key(
             &row_table,
             &unique_schema,
@@ -8169,5 +8184,88 @@ mod tests {
             &[1],
         );
         assert!(matches!(visible, Err(TenantWriteError::Storage(_))));
+    }
+
+    /// Issue #1254 レビュー指摘（P1）: 不可視の破損行と同じ UNIQUE キーの新規行を
+    /// UPSERT しても、後続の一意索引検査が破損を `XX000` で漏らさず、健全な不可視行
+    /// との衝突と同じ応答（`DO NOTHING` はスキップ、`DO UPDATE` は
+    /// `ConflictTargetNotVisible`）になること。
+    #[test]
+    fn upsert_unique_target_corrupt_invisible_row_response_matches_healthy_invisible() {
+        let path = unique_db_path("upsert-unique-invisible-corrupt-e2e");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let unique_schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("code", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![crate::catalog::UniqueConstraint::new(vec![
+            "code".to_string()
+        ])]);
+        storage.create_table(&unique_schema).expect("create table");
+        let (ctx, ctx_all) = ctx_pair();
+        let seed = [
+            crate::row_codec::Value::Vector(vec![1.0, 0.0]),
+            crate::row_codec::Value::Text("k".to_string()),
+        ];
+        let op = OperationId::parse("seed-1254-u2").expect("op");
+        insert_typed_rows_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx_all,
+            Visibility::Private,
+            &[(1, &seed)],
+            LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
+            None,
+        )
+        .expect("seed unique row");
+
+        let incoming = [
+            crate::row_codec::Value::Vector(vec![9.0, 9.0]),
+            crate::row_codec::Value::Text("k".to_string()),
+        ];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(2, &incoming)];
+        let target = UpsertTarget::Unique(&[1]);
+        let assignments = [(0usize, UpsertSetValue::Excluded(0))];
+        let mut n = 0;
+        let run_both = |tag: &str, n: &mut usize| {
+            let nothing = run_upsert(
+                &storage,
+                &ctx,
+                &rows,
+                &target,
+                &UpsertAction::DoNothing,
+                &format!("op-1254-{tag}-n"),
+                n,
+            );
+            let update = run_upsert(
+                &storage,
+                &ctx,
+                &rows,
+                &target,
+                &UpsertAction::DoUpdate(&assignments),
+                &format!("op-1254-{tag}-u"),
+                n,
+            );
+            (nothing, update)
+        };
+        // 健全な不可視行。
+        let (healthy_nothing, healthy_update) = run_both("healthy", &mut n);
+        assert_eq!(healthy_nothing.expect("skip"), UpsertOutcome::default());
+        assert!(matches!(
+            healthy_update,
+            Err(TenantWriteError::ConflictTargetNotVisible)
+        ));
+        // 同じ不可視行を破損させても応答は同一。
+        truncate_row_body(&storage, 1);
+        let (corrupt_nothing, corrupt_update) = run_both("corrupt", &mut n);
+        assert_eq!(corrupt_nothing.expect("skip"), UpsertOutcome::default());
+        assert!(matches!(
+            corrupt_update,
+            Err(TenantWriteError::ConflictTargetNotVisible)
+        ));
     }
 }

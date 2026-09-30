@@ -470,7 +470,7 @@ pub(crate) fn scan_tenant_rows_by_unique_key<T>(
     schema: &TableSchema,
     ctx: &crate::policy::PolicyContext,
     indices: &[usize],
-) -> Result<HashMap<Vec<u8>, u64>, TenantWriteError>
+) -> Result<UniqueKeyScan, TenantWriteError>
 where
     T: ReadableTable<(&'static str, u64), &'static [u8]>,
 {
@@ -487,6 +487,9 @@ where
 
     let tenant_id = ctx.tenant_id();
     let mut existing: HashMap<Vec<u8>, u64> = HashMap::new();
+    // キーを復元できなかった不可視行の id（[`recover_unique_keys_of_corrupt_rows`] が
+    // 永続索引から補完する）。
+    let mut corrupt_invisible: Vec<u64> = Vec::new();
     let range_start = std::ops::Bound::Included((tenant_id, 0u64));
     let range_end = std::ops::Bound::Included((tenant_id, u64::MAX));
     for entry in row_table
@@ -517,6 +520,12 @@ where
                 if row_visible {
                     return Err(e);
                 }
+                if corrupt_invisible.len() >= MAX_CORRUPT_INVISIBLE_ROWS {
+                    return Err(internal(
+                        "too many undecodable invisible rows during unique key pre-scan",
+                    ));
+                }
+                corrupt_invisible.push(id);
                 continue;
             }
         };
@@ -537,7 +546,48 @@ where
             }
         }
     }
-    Ok(existing)
+    Ok((existing, corrupt_invisible))
+}
+
+/// [`scan_tenant_rows_by_unique_key`] の戻り値（対象キー → 既存行 id の対応表と、
+/// キーを復元できなかった不可視行の id 一覧）。
+pub(crate) type UniqueKeyScan = (HashMap<Vec<u8>, u64>, Vec<u64>);
+
+/// [`scan_tenant_rows_by_unique_key`] が 1 回の走査で記録してよい「キーを復元
+/// できない不可視行」の上限（無制限確保の防止。超過は fail-closed）。
+const MAX_CORRUPT_INVISIBLE_ROWS: usize = 4096;
+
+/// 事前走査でキーを復元できなかった不可視行（`corrupt_ids`）の一意キーを永続
+/// 索引の逆引きから補完し、`existing`（キー → 既存行 id）へ加える（Issue #1254・
+/// RLS-10・RLS-11）。これを行わないと、同じキーの新規行の書き込み時に後続の
+/// [`enforce_unique_keys_in_txn`] が所有行の破損を `XX000` として返し、健全な
+/// 不可視行との衝突（`DO NOTHING` はスキップ）との応答差から破損状態が判別できて
+/// しまう。補完後は破損行も健全な不可視行と同じ「所有だが不可視」の衝突先として
+/// 扱われる。索引を更新しない読み取り専用。
+pub(crate) fn recover_unique_keys_of_corrupt_rows(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    indices: &[usize],
+    corrupt_ids: &[u64],
+    existing: &mut HashMap<Vec<u8>, u64>,
+) -> Result<(), TenantWriteError> {
+    if corrupt_ids.is_empty() {
+        return Ok(());
+    }
+    let (specs, _mask) = key_specs(schema)?;
+    for (id, key) in unique_index::recover_forward_keys_for_rows(
+        write_txn,
+        table_name,
+        &specs,
+        indices,
+        tenant_id,
+        corrupt_ids,
+    )? {
+        existing.entry(key).or_insert(id);
+    }
+    Ok(())
 }
 
 /// [`crate::catalog::Storage::alter_table_add_unique_constraint`]（Rust API。
