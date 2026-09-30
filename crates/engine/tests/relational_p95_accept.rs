@@ -294,3 +294,15 @@ fn visible_rows_include_sentinels_only_for_other_context() {
         .iter()
         .all(|q| *q >= 0));
 }
+
+#[test]
+fn sentinel_scale_dominates_fixture() {
+    let (max_dot, nsq) = (60.0, 256.0);
+    let f = f64::from(sentinel_scale(max_dot, nsq));
+    assert!(f >= 2.0);
+    assert!(sentinel_dominates(f * nsq, max_dot));
+    // fixture の最大内積が負・ゼロでも係数は 2 以上（クエリと同一以下にならない）。
+    assert!(sentinel_scale(-5.0, nsq) >= 2.0);
+    assert!(sentinel_scale(10.0, 0.0) >= 2.0);
+    assert!(!sentinel_dominates(60.0, 60.0));
+}

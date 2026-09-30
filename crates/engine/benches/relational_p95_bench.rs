@@ -38,8 +38,8 @@ use harness::relational_p95::{
     lang_token, order_by_statements, other_tenant_rows, parse_group, parse_rounds,
     parse_rows_scale, predicate_statements, qty_for_id, ratio_vs_reference,
     refuse_under_github_actions, render_round_line, render_summary_line, render_threshold_line,
-    round_p95, scale_label, sentinel_qty, summarize_rounds, topk_matches, visible_doc_rows, Group,
-    JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
+    round_p95, scale_label, sentinel_dominates, sentinel_qty, sentinel_scale, summarize_rounds,
+    topk_matches, visible_doc_rows, Group, JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -214,6 +214,7 @@ fn expected_predicate_ranked(
     arm: &str,
     own_rows: u64,
     other_rows: u64,
+    sentinel: &[f32],
     query: &[f32],
 ) -> Vec<(u64, f64)> {
     let n = predicate_lang_count(arm);
@@ -221,7 +222,7 @@ fn expected_predicate_ranked(
         .filter(|id| lang_in_first_n(lang_for_id(*id), n))
         .map(|id| (id, inner_product_distance(&rng_vector_for(id), query)))
         .collect();
-    let sentinel_dist = inner_product_distance(query, query);
+    let sentinel_dist = inner_product_distance(sentinel, query);
     ranked.extend((own_rows..own_rows + other_rows).map(|id| (id, sentinel_dist)));
     ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
     ranked
@@ -272,9 +273,19 @@ fn precheck_predicate(
 /// 値列が可視行 `visible`（`visible_doc_rows`）から導出した期待上位 `WIDE_LIMIT` 行と一致。
 /// 対象テナント文脈は自行のみ、他テナント文脈は自行と sentinel を `visible` に含めて同じ関数で検査する
 /// （計測対象の文そのものの結果を照合する。同値境界の id 差は許すため値列で比べる）。
-fn precheck_order(arm: &str, result: &QueryResult, visible: &[(u64, &'static str, i64)]) {
+fn precheck_order(
+    arm: &str,
+    result: &QueryResult,
+    visible: &[(u64, &'static str, i64)],
+    sentinel_from: Option<u64>,
+) {
     if result.rows.is_empty() {
         fail_closed(format!("{arm}: empty result"));
+    }
+    // 他テナント文脈（`sentinel_from = Some(own_rows)`）では、sentinel が上位へ実際に現れること
+    // （越境すれば必ず検出できる fixture であること）を実測で確認する。
+    if sentinel_from.is_some_and(|own| !result.rows.iter().any(|r| r.id >= own)) {
+        fail_closed(format!("{arm}: no sentinel row in the top rows"));
     }
     let by_id: std::collections::HashMap<u64, (&str, i64)> =
         visible.iter().map(|r| (r.0, (r.1, r.2))).collect();
@@ -410,13 +421,30 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let own = rows as u64;
     let other = other_tenant_rows(rows) as u64;
     let query = DeterministicRng::new(2).next_vector(DIM);
-    // 他テナント行は各 arm の上位（`l0`・最小／最大 `qty`）に並ぶ sentinel とする。ベクトルは
-    // 計測クエリのベクトルと同一（内積が最大）にして、RLS が外れれば計測クエリ自身の
-    // LIMIT 内へ必ず越境行が入る fixture にする。これで対象テナントの事前検査（他テナント id 非混入）が
-    // 計測クエリそのものの分離検出力を持つ。対照検査も同じ文を他テナント文脈で実行し、sentinel が
-    // 上位に見えること（＝検出可能な fixture であること）を確認する。
-    // `qty` は偶数 id を最小（`order_single` 先頭）、奇数 id を最大（`order_multi` の `l0` 内先頭）にする。
-    let sentinel_vector: Vec<f32> = query.clone();
+    // 他テナント行は各 arm の上位（`l0`・最小／最大 `qty`）に並ぶ sentinel とする。順位は正規化しない
+    // 内積で決まるため、ベクトルは「クエリ方向 × 係数」とし、内積が自テナント fixture 全行の最大内積を
+    // 必ず上回るようにする（生成時に assert）。RLS が外れれば計測クエリ自身の LIMIT 内へ越境行が
+    // 必ず入る fixture になる。`qty` は fixture の範囲外（偶数 id が最小、奇数 id が最大）で、これも生成時に
+    // assert する。他テナント文脈の事前検査は、sentinel が実際に上位へ現れることを実測で確認する。
+    let max_fixture_dot = (0..own)
+        .map(|id| -inner_product_distance(&rng_vector_for(id), &query))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let query_norm_sq = -inner_product_distance(&query, &query);
+    let sentinel_vector: Vec<f32> = {
+        let factor = sentinel_scale(max_fixture_dot, query_norm_sq);
+        query.iter().map(|x| x * factor).collect()
+    };
+    assert!(
+        sentinel_dominates(
+            -inner_product_distance(&sentinel_vector, &query),
+            max_fixture_dot
+        ),
+        "sentinel inner product must exceed every fixture row"
+    );
+    assert!(
+        (0..own).all(|id| qty_for_id(id) > sentinel_qty(0) && qty_for_id(id) < sentinel_qty(1)),
+        "sentinel qty must lie outside the fixture qty range"
+    );
     let make_other = |id: u64| {
         vec![
             Value::Vector(sentinel_vector.clone()),
@@ -453,15 +481,20 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         for (label, sql) in &arms {
             // 計測する文（`arms`）そのものを、対象テナント文脈と他テナント文脈の双方で fixture 由来の
             // 期待上位行と照合する（他テナント文脈は sentinel が上位に現れること＝越境が見える fixture）。
-            let ranked = expected_predicate_ranked(label, own, 0, &query);
+            let ranked = expected_predicate_ranked(label, own, 0, &sentinel_vector, &query);
             precheck_predicate(label, &exec(&core, &ctx_a, sql), (own, own), &ranked);
-            let ranked_b = expected_predicate_ranked(label, own, other, &query);
-            precheck_predicate(
-                label,
-                &exec(&core, &ctx_b, sql),
-                (own, own + other),
-                &ranked_b,
-            );
+            let ranked_b = expected_predicate_ranked(label, own, other, &sentinel_vector, &query);
+            let result_b = exec(&core, &ctx_b, sql);
+            precheck_predicate(label, &result_b, (own, own + other), &ranked_b);
+            // 越境すれば必ず検出できる fixture であることの実測: 他テナント文脈の上位 `PRED_LIMIT` 件は
+            // 全件が sentinel（対象テナントの行は 1 件も入らない）。
+            if result_b.rows.len() != PRED_LIMIT.min(other as usize)
+                || result_b.rows.iter().any(|r| r.id < own)
+            {
+                fail_closed(format!(
+                    "{label}: sentinel rows do not dominate the top rows"
+                ));
+            }
         }
         measure_group(
             "predicate",
@@ -478,8 +511,8 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         let visible_a = visible_doc_rows(own, 0);
         let visible_b = visible_doc_rows(own, other);
         for (label, sql) in &arms {
-            precheck_order(label, &exec(&core, &ctx_a, sql), &visible_a);
-            precheck_order(label, &exec(&core, &ctx_b, sql), &visible_b);
+            precheck_order(label, &exec(&core, &ctx_a, sql), &visible_a, None);
+            precheck_order(label, &exec(&core, &ctx_b, sql), &visible_b, Some(own));
         }
         measure_group(
             "order_by",
@@ -522,6 +555,8 @@ fn exec_join_pages(core: &EngineCore, tenant_ctx: &PolicyContext, head: &str) ->
 /// id の重複なし・全 id が期待集合（`expected_ids`・昇順）に属する・各行のタイトルと作者名が結合キーどおり
 /// （`cells_of(id)`）、をすべて満たすこと。`ORDER BY` が無く先頭 `LIMIT` 行の選択は未規定なので、
 /// どの行が返るかではなく「返る行がすべて期待集合の正しい結合結果であること」を見る。
+/// `ORDER BY` が無いため越境行が先頭 `LIMIT` 内に入る保証は作れない。越境の検出力は、同じ結合を
+/// `LIMIT`／`OFFSET` ページで全件取得して期待 id 集合と過不足なく照合する検査（`run_join_group`）が担う。
 fn precheck_join(
     result: &QueryResult,
     expected_ids: &[u64],

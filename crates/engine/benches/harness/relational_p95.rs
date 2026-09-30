@@ -379,6 +379,23 @@ pub fn inner_product_distance(a: &[f32], b: &[f32]) -> f64 {
         .sum::<f64>()
 }
 
+/// sentinel ベクトルのクエリ方向の係数。sentinel = `query * factor` の内積は `factor * |q|^2` で、
+/// fixture 全行の内積の最大値 `max_fixture_dot` の 2 倍を超える（順位は正規化しない内積で決まるため、
+/// 「クエリと同一ベクトル」では上位に入る保証にならない）。呼び出し側は生成時にさらに
+/// `sentinel_dominates` で保証を assert する。
+pub fn sentinel_scale(max_fixture_dot: f64, query_norm_sq: f64) -> f32 {
+    if query_norm_sq <= 0.0 {
+        return 2.0;
+    }
+    let factor = (2.0 * max_fixture_dot.max(0.0) / query_norm_sq).ceil() + 2.0;
+    factor.min(f64::from(f32::MAX)) as f32
+}
+
+/// sentinel の内積が fixture 全行の内積の最大値を厳密に上回るか。
+pub fn sentinel_dominates(sentinel_dot: f64, max_fixture_dot: f64) -> bool {
+    sentinel_dot > max_fixture_dot
+}
+
 /// 距離の同値境界を許容する幅（エンジンの f32 内積と f64 参照実装の累積誤差を吸収する）。
 pub const DISTANCE_EPS: f64 = 1e-3;
 
