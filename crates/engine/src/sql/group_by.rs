@@ -1875,6 +1875,9 @@ pub(crate) fn execute_grouped_aggregate(
     // ソート前に 1 グループ 1 回だけ評価してエラーをここで返す）。
     let mut finished: Vec<(GroupKey, Vec<Cell>, Vec<Option<OrderValue>>)> =
         Vec::with_capacity(total_group_count);
+    // 式キーの所有値（`finished` がソート完了まで全グループ分保持する）の累計見積り
+    // バイト数。所有値化の前に [`OrderKeyCharge`] 経由で [`ResultBudget`] へ課金する。
+    let mut order_key_bytes: usize = 0;
     for (key, accs) in group_entries {
         let cells: Vec<Cell> = accs
             .into_iter()
@@ -1892,8 +1895,20 @@ pub(crate) fn execute_grouped_aggregate(
         }
         let mut order_values: Vec<Option<OrderValue>> = Vec::new();
         if keep && (!group_by.having_exprs.is_empty() || !group_by.order_exprs.is_empty()) {
-            (keep, order_values) =
-                eval_group_row_exprs(group_by, schema, &key, &cells, &mut row_expr_scratch)?;
+            (keep, order_values) = eval_group_row_exprs(
+                group_by,
+                schema,
+                &key,
+                &cells,
+                &mut row_expr_scratch,
+                &mut OrderKeyCharge {
+                    budget: &budget,
+                    group_count: total_group_count,
+                    total_key_bytes,
+                    total_text_bytes: total_text_accumulator_bytes,
+                    order_key_bytes: &mut order_key_bytes,
+                },
+            )?;
         }
         if keep {
             finished.push((key, cells, order_values));
@@ -2023,6 +2038,45 @@ pub(crate) fn execute_grouped_aggregate(
     Ok(QueryResult { columns, rows })
 }
 
+/// 集計文の式 `ORDER BY` キーの所有値（[`eval_group_row_exprs`] が作り、`finished` が
+/// ソート完了まで全グループ分保持する）を [`ResultBudget`] へ課金する状態（Issue #1188・
+/// codex P1 対応）。長い TEXT を返す式（`concat` 等）を最大 [`MAX_GROUPS`] グループ分
+/// 保持して容量上限を超えるメモリを確保させないため、所有値化の前に累計を加算し、
+/// 超過は `54000`（[`RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL`]。索引経路の全走査フォール
+/// バック対象ではない）で拒否する。
+struct OrderKeyCharge<'a> {
+    budget: &'a ResultBudget,
+    group_count: usize,
+    total_key_bytes: usize,
+    total_text_bytes: usize,
+    order_key_bytes: &'a mut usize,
+}
+
+impl OrderKeyCharge<'_> {
+    /// `value` の保持分（固定分＋TEXT 長）を加算して予算照合する。
+    fn charge(&mut self, value: &ExprValue<'_>) -> Result<(), SqlSurfaceError> {
+        let len = match value {
+            ExprValue::Text(t) => t.len(),
+            _ => 0,
+        };
+        let add = len.saturating_add(RESULT_CELL_FIXED_BYTES);
+        let next = self.order_key_bytes.checked_add(add).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+        })?;
+        let held = self.total_key_bytes.checked_add(next).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
+        })?;
+        self.budget.check(
+            self.group_count,
+            held,
+            self.total_text_bytes,
+            RESULT_BUDGET_GROUPS_EXCEEDED_DETAIL,
+        )?;
+        *self.order_key_bytes = next;
+        Ok(())
+    }
+}
+
 /// 確定済みグループ 1 件について、式述語の `HAVING`（[`BoundGroupBy::having_exprs`]）と式キーの
 /// `ORDER BY`（[`BoundGroupBy::order_exprs`]）を評価する（Issue #1188・SQL-26）。戻り値は
 /// `(グループを残すか, 式キーの比較値)`。`HAVING` は `Bool(true)` のグループだけを残す
@@ -2037,6 +2091,7 @@ fn eval_group_row_exprs(
     key: &GroupKey,
     cells: &[Cell],
     scratch: &mut Vec<StackValue>,
+    charge: &mut OrderKeyCharge<'_>,
 ) -> Result<(bool, Vec<Option<OrderValue>>), SqlSurfaceError> {
     let nkeys = group_by.keys.len();
     // キー成分は出力セルと同じ復元規則（`order_value_to_cell`）で `Cell` 化してから
@@ -2098,6 +2153,8 @@ fn eval_group_row_exprs(
     let mut order_values = Vec::with_capacity(group_by.order_exprs.len());
     for (program, kind) in &group_by.order_exprs {
         let value = program.eval(0, &[], &scalars, scratch)?;
+        // 所有値化（TEXT の複製）の前に、式キーの保持分を結果予算へ課金する。
+        charge.charge(&value)?;
         order_values.push(expr_value_to_order_value(&value, *kind)?);
     }
     Ok((true, order_values))
@@ -2589,6 +2646,32 @@ mod tests {
         // `i64` の表現域を超えるリテラルは符号だけで確定する。
         assert_eq!(cmp_signed_to_literal(i64::MAX, 1e30), Ordering::Less);
         assert_eq!(cmp_signed_to_literal(i64::MIN, -1e30), Ordering::Greater);
+    }
+
+    /// Issue #1188・codex P1: 式 `ORDER BY` キーの TEXT 所有値は、複製の前に累計が
+    /// 結果予算へ課金され、超過は `54000` で拒否される（予算内なら通る）。
+    #[test]
+    fn order_key_charge_rejects_text_keys_exceeding_result_budget() {
+        let budget = ResultBudget {
+            max_result_bytes: 1_000,
+            per_group_bytes: 16,
+        };
+        let long = "x".repeat(400);
+        let mut held = 0usize;
+        let mut charge = OrderKeyCharge {
+            budget: &budget,
+            group_count: 2,
+            total_key_bytes: 0,
+            total_text_bytes: 0,
+            order_key_bytes: &mut held,
+        };
+        let value = ExprValue::Text(std::borrow::Cow::Borrowed(long.as_str()));
+        charge.charge(&value).expect("first key fits");
+        charge.charge(&value).expect("second key fits");
+        let err = charge.charge(&value).expect_err("third key exceeds budget");
+        assert!(matches!(err, SqlSurfaceError::PayloadTooLarge { .. }));
+        // 超過した課金は累計へ反映されない。
+        assert_eq!(held, 2 * (400 + RESULT_CELL_FIXED_BYTES));
     }
 
     #[test]
