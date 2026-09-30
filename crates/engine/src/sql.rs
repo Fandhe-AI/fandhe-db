@@ -425,4 +425,16 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #908）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードはすべて更新済み。
     DropIndex(ddl::DropIndexOutcome),
+    /// `CREATE TYPE <name> AS ENUM (...)`（TABLE-14・SQL-23・TASK-198、
+    /// Issue #1194）がセッション経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1194）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    CreateType(ddl::CreateTypeOutcome),
+    /// `DROP TYPE <name>`（TABLE-14・SQL-23・TASK-198、Issue #1194）が
+    /// セッション経由の実行経路で成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1194）: 本 variant の追加により `SqlOutcome`
+    /// を網羅的にマッチする既存コードはすべて更新済み。
+    DropType(ddl::DropTypeOutcome),
 }

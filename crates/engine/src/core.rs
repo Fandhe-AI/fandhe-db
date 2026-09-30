@@ -1486,6 +1486,11 @@ pub enum ParsedSql {
     CreateIndex(crate::sql::allowlist::ValidatedCreateIndex),
     /// `DROP INDEX <name>`（TASK-206・INDEX-7・SQL-23、Issue #908）。
     DropIndex(crate::sql::allowlist::ValidatedDropIndex),
+    /// `CREATE TYPE <name> AS ENUM (...)`（TABLE-14・SQL-23・TASK-198、
+    /// Issue #1194）。権限ゲートは `execute_parsed_in_session` が担う。
+    CreateType(crate::sql::allowlist::ValidatedCreateType),
+    /// `DROP TYPE <name>`（TABLE-14・SQL-23・TASK-198、Issue #1194）。
+    DropType(crate::sql::allowlist::ValidatedDropType),
 }
 
 /// `read_txn`（確定済みスナップショットまたは明示トランザクションの書き込み
@@ -2678,6 +2683,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::CreateType(_)
+                    | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -2718,6 +2725,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::CreateType(_)
+                    | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -2755,6 +2764,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::CreateType(_)
+                    | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -2799,6 +2810,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::CreateType(_)
+                    | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -2839,6 +2852,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropView(_)
                     | crate::sql::SqlOutcome::CreateIndex(_)
                     | crate::sql::SqlOutcome::DropIndex(_)
+                    | crate::sql::SqlOutcome::CreateType(_)
+                    | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
@@ -3103,6 +3118,11 @@ impl EngineCore {
         // `is_drop_statement`（`DROP TABLE` 扱い）より前に分岐する。
         // `validate_drop_index_tokens` はカタログ照会を一切行わない
         // （`DropTable`・`DropView` と同じ設計）。
+        // Issue #1194: `DROP TYPE` も汎用 `DROP`（`DROP TABLE` 扱い）より前に分岐する。
+        if crate::sql::allowlist::is_drop_type_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_type_tokens(&tokens)?;
+            return Ok(ParsedSql::DropType(stmt));
+        }
         if crate::sql::allowlist::is_drop_index_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_index_tokens(&tokens)?;
             return Ok(ParsedSql::DropIndex(stmt));
@@ -3156,6 +3176,11 @@ impl EngineCore {
         // `CreateView` と同じくカタログ照会を一切行わない構造検証のみで束縛し、
         // `sql::allowlist::validate_sql_tokens` 内の `CREATE FUNCTION` 分岐へ
         // 渡さない。
+        // Issue #1194: `CREATE TYPE` も `CREATE FUNCTION` 分岐へ渡さない。
+        if crate::sql::allowlist::is_create_type_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_type_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateType(stmt));
+        }
         if crate::sql::allowlist::is_create_index_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_index_tokens(&tokens)?;
             return Ok(ParsedSql::CreateIndex(stmt));
@@ -3250,13 +3275,15 @@ impl EngineCore {
         // 拒否する（PostgreSQL の DDL がバインドパラメータを受け付けない
         // のと同じ方針。`sql::params::validate_param_positions` の汎用位置
         // 判定へ DDL 分岐を混在させない設計）。
+        // Issue #1194: `CREATE TYPE`／`DROP TYPE` も同じ理由で `$n` を一律拒否する。
         let is_create_or_drop_view = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
                 if name.eq_ignore_ascii_case("CREATE") || name.eq_ignore_ascii_case("DROP")
         ) && matches!(
             tokens.get(1),
-            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("VIEW")
+            Some(crate::sql::lexer::Token::Ident(name))
+                if name.eq_ignore_ascii_case("VIEW") || name.eq_ignore_ascii_case("TYPE")
         );
         if is_create_or_drop_view
             && tokens
@@ -3264,7 +3291,7 @@ impl EngineCore {
                 .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
         {
             return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                "bind parameters are not supported in CREATE VIEW / DROP VIEW",
+                "bind parameters are not supported in CREATE VIEW / DROP VIEW / CREATE TYPE / DROP TYPE",
             ));
         }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
@@ -3638,6 +3665,19 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_index(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropIndex(outcome))
+            }
+            // TABLE-14・SQL-23・TASK-198（Issue #1194）: 他の DDL と同じ判定順序
+            // （DDL 実行権限ゲート → 実行本体）。ENUM 型は全テナント共有カタログで
+            // `ctx` は取らない。権限の無い主体には型の有無を問わず常に `42501`。
+            ParsedSql::CreateType(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_create_type(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateType(outcome))
+            }
+            ParsedSql::DropType(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_type(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropType(outcome))
             }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -4342,6 +4382,9 @@ impl EngineCore {
             // TASK-206・INDEX-7（Issue #908）: 索引 DDL も結果列を持たない。
             ParsedSql::CreateIndex(_) => Ok(None),
             ParsedSql::DropIndex(_) => Ok(None),
+            // Issue #1194: 型 DDL も結果列を持たない。
+            ParsedSql::CreateType(_) => Ok(None),
+            ParsedSql::DropType(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {
