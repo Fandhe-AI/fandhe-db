@@ -814,6 +814,25 @@ fn t3_foreign_tenants_rows_are_physically_untouched() {
     }
 }
 
+/// 連続する ASCII 数字を `<n>` へ置き換える（参照値だけが異なる FK 違反メッセージを
+/// 文言単位で比較するための正規化）。
+fn normalize_digits(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut in_digits = false;
+    for ch in message.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push_str("<n>");
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// T4 FK／UNIQUE の存在情報秘匿: 他テナントにだけ親・値がある場合の応答が、どこにも
 /// 無い場合（baseline）と一致し、かつ「親がどこにも無い」場合と同一の応答になる。
 #[test]
@@ -851,8 +870,16 @@ fn t4_constraint_errors_do_not_reveal_foreign_existence() {
                 ) => {
                     assert_eq!(c1, "23503");
                     assert_eq!(c1, c2);
-                    // メッセージが参照値そのものを埋め込む場合は値部分だけが異なりうる。
-                    // 他テナント固有の情報（テナント名・トークン）を含まないことを保証する。
+                    // メッセージが参照値そのものを埋め込む場合は値部分（7 と 99）だけが
+                    // 異なりうる。数値を正規化した文言が一致すること（他テナントに親が
+                    // ある場合だけ文言が変わらないこと）と、他テナント固有の情報
+                    // （テナント名・トークン）を含まないことを保証する。
+                    assert_eq!(
+                        normalize_digits(m1),
+                        normalize_digits(m2),
+                        "{}",
+                        label(foreign_parent)
+                    );
                     assert_eq!(leaked_tokens(m1, viewer), 0);
                     assert_eq!(leaked_tokens(m2, viewer), 0);
                 }
@@ -960,4 +987,13 @@ fn t6_negative_controls_detect_fabricated_violations() {
         debug: "x".into(),
     };
     assert_ne!(c, d);
+    // FK 違反メッセージの正規化は数値だけを吸収し、文言の差は検出する。
+    assert_eq!(
+        normalize_digits("key (7) missing"),
+        normalize_digits("key (99) missing")
+    );
+    assert_ne!(
+        normalize_digits("key (7) missing"),
+        normalize_digits("key (7) hidden")
+    );
 }
