@@ -696,3 +696,114 @@ fn add_then_drop_constraint_take_effect_immediately_in_the_same_session() {
     )
     .expect("drop takes effect immediately");
 }
+
+// --- ADD: 既存行検証のテナント境界（Issue #1201・TABLE-22・RLS-9・RLS-10） ---------
+
+/// 既存行の重複検証の母集合を、テナントごとに閉じたものとして固定する
+/// （`constraint::table_has_duplicate_unique_key`）。tenant-a と tenant-b が同じ
+/// 値（単一列・複合列の双方）を持っていても違反にせず `ADD UNIQUE` は成功し、
+/// 追加後も一意性は各テナント内でのみ効く。
+#[test]
+fn add_unique_existing_row_validation_ignores_equal_values_across_tenants() {
+    let (core, path) = new_core("alter-unique-cross-tenant-equal");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    let tenant_a = ctx("tenant-a");
+    let tenant_b = ctx("tenant-b");
+    let mut session = ddl_session();
+    create_docs_table(&core, &mut session, &sys);
+    for (who, op) in [(&tenant_a, "op-a"), (&tenant_b, "op-b")] {
+        exec(
+            &core,
+            &mut session,
+            who,
+            &format!("INSERT INTO docs (id, a, b) VALUES (1, 'x', 'y') USING OPERATION_ID '{op}'"),
+        )
+        .expect("seed insert");
+    }
+
+    exec(&core, &mut session, &sys, "ALTER TABLE docs ADD UNIQUE (a)")
+        .expect("equal values held by different tenants must not violate ADD UNIQUE");
+    exec(
+        &core,
+        &mut session,
+        &sys,
+        "ALTER TABLE docs ADD UNIQUE (a, b)",
+    )
+    .expect("equal composite keys held by different tenants must not violate ADD UNIQUE");
+
+    // 追加後の一意性は各テナント内でのみ効く。
+    let err = exec(
+        &core,
+        &mut session,
+        &tenant_a,
+        "INSERT INTO docs (id, a, b) VALUES (2, 'x', 'z') USING OPERATION_ID 'op-a2'",
+    )
+    .expect_err("duplicate inside the same tenant must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    // tenant-b が保持する値 'x' と同じ値でも、tenant-a 側に無い値なら成功する。
+    exec(
+        &core,
+        &mut session,
+        &tenant_b,
+        "INSERT INTO docs (id, a, b) VALUES (2, 'only-b', 'z') USING OPERATION_ID 'op-b2'",
+    )
+    .expect("distinct value succeeds");
+    exec(
+        &core,
+        &mut session,
+        &tenant_a,
+        "INSERT INTO docs (id, a, b) VALUES (3, 'only-b', 'z') USING OPERATION_ID 'op-a3'",
+    )
+    .expect("a value held only by another tenant is not a duplicate");
+}
+
+/// 既存行にテナント内の重複があって `ADD UNIQUE` が `23505` で拒否される場合、
+/// 応答（client message）にテナント ID も値も含めず、制約は追加されない
+/// （副作用ゼロ）ことを固定する（RLS-9・RLS-10。エラー経由の他テナント情報の
+/// 漏えいがないこと）。
+#[test]
+fn add_unique_rejection_does_not_leak_other_tenant_rows() {
+    let (core, path) = new_core("alter-unique-reject-no-leak");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    let tenant_a = ctx("tenant-a");
+    let tenant_b = ctx("tenant-b");
+    let mut session = ddl_session();
+    create_docs_table(&core, &mut session, &sys);
+    for (who, id, op) in [
+        (&tenant_a, 1, "op-a1"),
+        (&tenant_a, 2, "op-a2"),
+        (&tenant_b, 1, "op-b1"),
+    ] {
+        exec(
+            &core,
+            &mut session,
+            who,
+            &format!(
+                "INSERT INTO docs (id, a, b) VALUES ({id}, 'dup-secret', 'y') USING OPERATION_ID '{op}'"
+            ),
+        )
+        .expect("seed insert");
+    }
+
+    let err = exec(&core, &mut session, &sys, "ALTER TABLE docs ADD UNIQUE (a)")
+        .expect_err("in-tenant duplicates must reject ADD UNIQUE");
+    assert_eq!(err.wire_code(), "23505");
+    let message = err.client_message();
+    for forbidden in ["tenant-a", "tenant-b", "dup-secret"] {
+        assert!(
+            !message.contains(forbidden),
+            "client message must not contain {forbidden:?}: {message}"
+        );
+    }
+
+    // 副作用ゼロ: 制約は追加されておらず、重複 INSERT は依然として成功する。
+    exec(
+        &core,
+        &mut session,
+        &tenant_b,
+        "INSERT INTO docs (id, a, b) VALUES (2, 'dup-secret', 'y') USING OPERATION_ID 'op-b2'",
+    )
+    .expect("no unique constraint must have been added by the rejected ALTER");
+}
