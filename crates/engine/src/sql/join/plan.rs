@@ -999,15 +999,28 @@ fn build_aggregate_shape(
     // HAVING: 集計項目名のみを参照でき、数値として比較できる結果に限る。
     let mut having: Vec<(usize, BinOp, f64)> = Vec::with_capacity(agg.having.len());
     for h in &agg.having {
-        let idx = item_names
+        // 同名の集計項目が複数あるときは曖昧として拒否する（先頭一致で黙って解決しない。
+        // 単一テーブル集計の `resolve_group_reference` と同じ 22000）。
+        let mut hits = item_names
             .iter()
-            .position(|n| n == &h.item_name)
-            .ok_or_else(|| {
-                SqlSurfaceError::invalid_input(format!(
+            .enumerate()
+            .filter(|(_, n)| *n == &h.item_name)
+            .map(|(i, _)| i);
+        let idx = match (hits.next(), hits.next()) {
+            (Some(_), Some(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "HAVING target {:?} is ambiguous",
+                    h.item_name
+                )))
+            }
+            (Some(i), None) => i,
+            (None, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
                     "HAVING target {:?} is not an aggregate item",
                     h.item_name
-                ))
-            })?;
+                )))
+            }
+        };
         if let Some(it) = items.get(idx) {
             crate::sql::parser::check_having_target_is_numeric(&it.item, &h.item_name)?;
         }
@@ -1032,10 +1045,26 @@ fn build_aggregate_shape(
         } else {
             Vec::new()
         };
-        let item_match: Option<usize> = if target.qualifier().is_none() {
-            item_names.iter().position(|n| n == target.name())
+        // 同名の集計項目が複数あるときは、先頭一致で解決せず曖昧として拒否する。
+        let item_hits: Vec<usize> = if target.qualifier().is_none() {
+            item_names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| *n == target.name())
+                .map(|(i, _)| i)
+                .collect()
         } else {
-            None
+            Vec::new()
+        };
+        let item_match: Option<usize> = match item_hits.as_slice() {
+            [] => None,
+            [i] => Some(*i),
+            _ => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "ORDER BY target {:?} is ambiguous",
+                    target.name()
+                )))
+            }
         };
         let ambiguous = || {
             SqlSurfaceError::invalid_input(format!(

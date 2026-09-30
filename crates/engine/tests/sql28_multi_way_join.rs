@@ -879,6 +879,24 @@ fn aggregate_type_and_name_errors_use_the_single_table_classification() {
         &format!("SELECT dept.dname, COUNT(*) AS n {base} GROUP BY dept.dname HAVING zz > 1"),
         "22000",
     );
+    // 同名の集計項目が複数ある別名は、ORDER BY・HAVING とも曖昧として拒否する
+    // （先頭の集計値へ黙って解決しない。単一テーブル集計と同じ 22000）。
+    assert_rejected(
+        &core,
+        &format!(
+            "SELECT dept.dname, SUM(emp.salary) AS total, SUM(emp.id) AS total {base} \
+             GROUP BY dept.dname ORDER BY total"
+        ),
+        "22000",
+    );
+    assert_rejected(
+        &core,
+        &format!(
+            "SELECT dept.dname, SUM(emp.salary) AS total, SUM(emp.id) AS total {base} \
+             GROUP BY dept.dname HAVING total > 0"
+        ),
+        "22000",
+    );
     // ORDER BY の対象がキーにも集計項目にも一致しない／両方に一致する。
     assert_rejected(
         &core,
