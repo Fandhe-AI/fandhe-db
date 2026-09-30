@@ -46,8 +46,8 @@ use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnType,
     ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable,
-    ValidatedDropView,
+    ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
+    ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::SqlColumnTypeName;
 use crate::sql::mode::SessionState;
@@ -466,7 +466,8 @@ pub(crate) fn execute_alter_table_drop_constraint(
 ///    トランザクション内で名前衝突・件数上限・意味論検証・既存行の全件走査を
 ///    判定。TOCTOU なし）。`AlterCheckError::Sql` は評価エラー・意味論検証
 ///    エラーの `SqlSurfaceError` をそのまま透過し、`AlterCheckError::Catalog`
-///    は [`map_alter_constraint_error`] へ委譲する（UNIQUE と共有する契約）。
+///    は [`map_add_check_or_foreign_key_error`] へ委譲する（名前衝突のみ
+///    `42710`、他は UNIQUE と共有する [`map_alter_constraint_error`] の契約）。
 pub(crate) fn execute_alter_table_add_check(
     storage: &Storage,
     stmt: &ValidatedAlterTableAddCheck,
@@ -476,7 +477,7 @@ pub(crate) fn execute_alter_table_add_check(
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
-        Err(other) => return Err(map_alter_constraint_error(other)),
+        Err(other) => return Err(map_add_check_or_foreign_key_error(other)),
     }
     let confirmed_name = storage
         .alter_table_add_check_constraint(&stmt.table_name, &stmt.check)
@@ -484,7 +485,7 @@ pub(crate) fn execute_alter_table_add_check(
             AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
                 undefined_table_or_view(storage, &stmt.table_name)
             }
-            AlterCheckError::Catalog(other) => map_alter_constraint_error(other),
+            AlterCheckError::Catalog(other) => map_add_check_or_foreign_key_error(other),
             AlterCheckError::Sql(sql_err) => sql_err,
         })?;
     Ok(AlterTableOutcome {
@@ -558,7 +559,7 @@ pub(crate) fn execute_alter_table_add_foreign_key(
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
         }
-        Err(other) => return Err(map_alter_constraint_error(other)),
+        Err(other) => return Err(map_add_check_or_foreign_key_error(other)),
     }
     let confirmed_name = storage
         .alter_table_add_foreign_key(
@@ -570,7 +571,7 @@ pub(crate) fn execute_alter_table_add_foreign_key(
             CatalogError::TableNotFound(name) if name == stmt.table_name => {
                 undefined_table_or_view(storage, &stmt.table_name)
             }
-            other => map_alter_constraint_error(other),
+            other => map_add_check_or_foreign_key_error(other),
         })?;
     Ok(AlterTableOutcome {
         table_name: stmt.table_name.clone(),
@@ -580,13 +581,25 @@ pub(crate) fn execute_alter_table_add_foreign_key(
     })
 }
 
+/// `ALTER TABLE ... ADD CONSTRAINT` の CHECK・FOREIGN KEY 経路専用の写像
+/// （TABLE-22・ERR-6、Issue #1195）。制約名衝突だけを `42710`
+/// （[`SqlSurfaceError::DuplicateObject`]）へ写像し、他の variant は
+/// [`map_alter_constraint_error`] へ委譲する（UNIQUE は `42P07` のまま）。
+fn map_add_check_or_foreign_key_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::duplicate_object(name),
+        other => map_alter_constraint_error(other),
+    }
+}
+
 /// `Storage::alter_table_add_named_unique_constraint`／
 /// `Storage::alter_table_drop_constraint`／`Storage::alter_table_add_check_constraint`
 /// （の `AlterCheckError::Catalog` 内側）／`Storage::alter_table_add_foreign_key`
 /// の [`CatalogError`] を SQL 表層の契約へ写像する（設計 D4・F5、Issue #1067・
 /// #1068・#1069）。ERR-6 の既存行のみを使い、新しい `wire_code` は追加しない——
-/// 制約名衝突は索引名衝突と同じ `42P07`（[`SqlSurfaceError::DuplicateTable`] を
-/// 流用）、未検出は `DROP INDEX` と同じ `42704`
+/// `ADD UNIQUE`・`DROP CONSTRAINT` 経路の制約名衝突は索引名衝突と同じ `42P07`
+/// （[`SqlSurfaceError::DuplicateTable`] を流用。CHECK・FOREIGN KEY 経路は
+/// `map_add_check_or_foreign_key_error` が先に `42710` へ写像する）、未検出は `DROP INDEX` と同じ `42704`
 /// （[`SqlSurfaceError::UndefinedObject`]）、`FOREIGN KEY` の宣言不正は `42830`
 /// （[`SqlSurfaceError::invalid_foreign_key`]。`execute_create_table` と同じ
 /// 写像）、既存行違反は `23503`（[`SqlSurfaceError::ForeignKeyViolation`]。
@@ -1134,9 +1147,113 @@ fn map_drop_index_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `CREATE TYPE ... AS ENUM`（TABLE-14・SQL-23・TASK-198、Issue #1194）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTypeOutcome {}
+
+/// `DROP TYPE`（TABLE-14・SQL-23・TASK-198、Issue #1194）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTypeOutcome {}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
+/// （Issue #1194）。`Storage::create_enum_type`（単一 write txn 内で名前検証・
+/// 重複判定・件数上限を行う）へ委譲する。ENUM 型は全テナント共有カタログのため
+/// `PolicyContext` は取らない。
+pub(crate) fn execute_create_type(
+    storage: &Storage,
+    validated: &ValidatedCreateType,
+) -> Result<CreateTypeOutcome, SqlSurfaceError> {
+    storage
+        .create_enum_type(validated.name(), validated.labels().to_vec())
+        .map_err(map_create_type_error)?;
+    Ok(CreateTypeOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
+/// （Issue #1194）。`Storage::drop_enum_type`（同一 write txn 内で依存列を判定し、
+/// 残っていれば `DependentObjectsStillExist`）へ委譲する。
+pub(crate) fn execute_drop_type(
+    storage: &Storage,
+    validated: &ValidatedDropType,
+) -> Result<DropTypeOutcome, SqlSurfaceError> {
+    storage
+        .drop_enum_type(validated.name())
+        .map_err(map_drop_type_error)?;
+    Ok(DropTypeOutcome {})
+}
+
+/// `Storage::create_enum_type` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （型名重複は ERR-6 に専用行が無いため `42P07`。定義不正・型数上限は `42601`）。
+/// エラー文言にはラベル・テナント・redb 内部詳細を含めない（security.md P0）。
+fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "CREATE TYPE failed".to_string(),
+        },
+    }
+}
+
+/// `Storage::drop_enum_type` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （型不在 `42704`、依存列が残っている場合 `2BP01`）。文言に含めるのは削除対象の
+/// 型名のみで、依存テーブル名は含めない。
+fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedObject { name },
+        CatalogError::DependentObjectsStillExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed type reference in DROP TYPE")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "DROP TYPE failed".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 型 DDL のエラー写像（Issue #1194）。
+    #[test]
+    fn type_ddl_error_mapping() {
+        let code = |e: SqlSurfaceError| e.wire_code();
+        assert_eq!(
+            code(map_create_type_error(CatalogError::TypeAlreadyExists(
+                "t".into()
+            ))),
+            "42P07"
+        );
+        assert_eq!(
+            code(map_create_type_error(CatalogError::Invalid("x".into()))),
+            "42601"
+        );
+        assert_eq!(
+            code(map_create_type_error(CatalogError::WriteLockTimeout)),
+            "55P03"
+        );
+        assert_eq!(
+            code(map_drop_type_error(CatalogError::TypeNotFound("t".into()))),
+            "42704"
+        );
+        assert_eq!(
+            code(map_drop_type_error(
+                CatalogError::DependentObjectsStillExist("t".into())
+            )),
+            "2BP01"
+        );
+        assert_eq!(
+            code(map_drop_type_error(CatalogError::CorruptSchema("x".into()))),
+            "XX000"
+        );
+    }
 
     /// 書き込みゲートの待機上限超過は `ALTER TABLE ADD COLUMN` でも `55P03`
     /// （SQL-31・TASK-221。他の DDL 入口と同じ契約。Issue #900）。
@@ -1364,5 +1481,29 @@ mod tests {
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// Issue #1195: 制約名衝突は UNIQUE・DROP 経路で `42P07`、CHECK・FK 経路で
+    /// `42710`。他の variant は両写像で同一。
+    #[test]
+    fn constraint_name_collision_maps_by_constraint_kind() {
+        let dup = || CatalogError::ConstraintAlreadyExists("c".to_string());
+        assert_eq!(map_alter_constraint_error(dup()).wire_code(), "42P07");
+        let err = map_add_check_or_foreign_key_error(dup());
+        assert!(matches!(err, SqlSurfaceError::DuplicateObject { .. }));
+        assert_eq!(err.wire_code(), "42710");
+        let others = || {
+            vec![
+                CatalogError::TableNotFound("t".to_string()),
+                CatalogError::ConstraintNotFound("c".to_string()),
+                CatalogError::ConstraintLimitExceeded("limit".to_string()),
+            ]
+        };
+        for (a, b) in others().into_iter().zip(others()) {
+            assert_eq!(
+                map_alter_constraint_error(a).wire_code(),
+                map_add_check_or_foreign_key_error(b).wire_code()
+            );
+        }
     }
 }

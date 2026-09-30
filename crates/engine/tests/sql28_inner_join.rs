@@ -273,6 +273,70 @@ fn table_aliases_and_as_keyword_are_accepted() {
     assert_eq!(result.rows.len(), 3);
 }
 
+/// 出力列名（`ColumnMeta` の名前）を取り出す。
+fn col_name(m: &engine::sql::exec::ColumnMeta) -> String {
+    use engine::sql::exec::ColumnMeta;
+    match m {
+        ColumnMeta::Id => "id".to_string(),
+        ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name.clone(),
+    }
+}
+
+#[test]
+fn id_pseudo_column_alias_is_reflected_in_output_names() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT d.id AS x, a.id AS y FROM documents AS d JOIN authors a ON d.author_id = a.id LIMIT 10",
+    );
+    let names: Vec<String> = result.columns.iter().map(col_name).collect();
+    assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
+
+    let grouped = run(
+        &core,
+        "tenant-a",
+        "SELECT a.id AS key FROM documents AS d JOIN authors a ON d.author_id = a.id GROUP BY a.id",
+    );
+    let names: Vec<String> = grouped.columns.iter().map(col_name).collect();
+    assert_eq!(names, vec!["key".to_string()]);
+}
+
+#[test]
+fn order_by_resolves_select_list_alias() {
+    let (storage, path) = seeded_basic();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let asc = run(
+        &core,
+        "tenant-a",
+        "SELECT d.title AS t FROM documents AS d JOIN authors a ON d.author_id = a.id ORDER BY t LIMIT 10",
+    );
+    let desc = run(
+        &core,
+        "tenant-a",
+        "SELECT d.title AS t FROM documents AS d JOIN authors a ON d.author_id = a.id ORDER BY t DESC LIMIT 10",
+    );
+    assert_eq!(asc.rows.len(), 3);
+    let mut rev = desc.rows.clone();
+    rev.reverse();
+    assert_eq!(asc.rows, rev);
+
+    // 別名 `title` が別テーブルの実在列 `name` を指すとき、出力列（別名）側で並べる。
+    let by_alias = run(
+        &core,
+        "tenant-a",
+        "SELECT a.name AS title FROM documents AS d JOIN authors a ON d.author_id = a.id ORDER BY title LIMIT 10",
+    );
+    let mut sorted = by_alias.rows.clone();
+    sorted.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(by_alias.rows, sorted);
+}
+
 #[test]
 fn star_projection_expands_left_then_right_with_id_columns() {
     let (storage, path) = seeded_basic();
@@ -407,17 +471,21 @@ fn rejects_join_using_clause() {
     );
 }
 
+/// Issue #1190: 3 テーブル以上の連鎖 JOIN を受理する（旧 `rejects_three_table_join_chain`
+/// を反転）。詳細な意味論は `tests/sql28_multi_way_join.rs`。
 #[test]
-fn rejects_three_table_join_chain() {
+fn accepts_three_table_join_chain() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id JOIN authors AS a2 ON authors.id = a2.id LIMIT 10",
-        "42601",
     );
+    assert_eq!(result.rows.len(), 3);
+    // documents(4 列: id + 3) + authors(3 列) + a2(3 列)
+    assert_eq!(result.columns.len(), 10);
 }
 
 #[test]
@@ -485,17 +553,18 @@ fn rejects_order_by_combined_with_join() {
     );
 }
 
+/// Issue #1190: JOIN の WHERE で `OR` を受理する（旧 `rejects_where_or_in_join` を反転）。
 #[test]
-fn rejects_where_or_in_join() {
+fn accepts_where_or_in_join() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
-        "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id WHERE authors.name = 'alice' OR authors.name = 'bob' LIMIT 10",
-        "42601",
+        "SELECT documents.title FROM documents JOIN authors ON documents.author_id = authors.id WHERE authors.name = 'alice' OR authors.name = 'bob' LIMIT 10",
     );
+    assert_eq!(titles(&result), vec!["doc-a1", "doc-a2", "doc-b1"]);
 }
 
 #[test]
@@ -517,17 +586,19 @@ fn rejects_join_where_with_excessive_and_conjuncts() {
     assert_rejected(&core, "tenant-a", &sql, "54000");
 }
 
+/// Issue #1190: JOIN の WHERE で列同士の比較を受理する（旧
+/// `rejects_where_column_to_column_comparison_in_join` を反転）。
 #[test]
-fn rejects_where_column_to_column_comparison_in_join() {
+fn accepts_where_column_to_column_comparison_in_join() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id WHERE documents.title = authors.name LIMIT 10",
-        "42601",
     );
+    assert!(result.rows.is_empty(), "no title equals an author name");
 }
 
 #[test]

@@ -72,6 +72,11 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `DuplicateColumn`（`42701`。Issue #899）は `CREATE TABLE` の列リスト
         // 自体が不正という構文的な分類のため、他の 42xxx 系と同じ 400 とする。
         | ErrorClass::DuplicateColumn
+        // Issue #1195・TABLE-22・ERR-6: 制約名重複（`42710`）。ERR-4 の「ERR-6 新設行は
+        // 400」規則に従い、`DuplicateColumn` と同じ DDL 宣言不正の分類として 400
+        // とする（`42P07` の 409 とはあえて揃えない）。NoSQL の `alter_table` は
+        // ADD CONSTRAINT を持たず構造的に到達しないが網羅性のため射影を定める。
+        | ErrorClass::DuplicateObject
         // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
         // が新設する 2 分類（`DuplicateTable` は上で `UniqueViolation` と
         // 同じ 409 に既に分類済みのためここには含めない）。いずれも
@@ -131,7 +136,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 41] = [
+    const EXPECTED: [(ErrorClass, u16); 42] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -149,6 +154,7 @@ mod tests {
         (ErrorClass::InternalError, 500),
         (ErrorClass::NumericOutOfRange, 400),
         (ErrorClass::DivisionByZero, 400),
+        (ErrorClass::DuplicateObject, 400),
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidDatetimeFormat, 400),

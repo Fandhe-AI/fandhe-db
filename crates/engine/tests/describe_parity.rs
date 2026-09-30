@@ -74,6 +74,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DropView(_)
         | SqlOutcome::CreateIndex(_)
         | SqlOutcome::DropIndex(_)
+        | SqlOutcome::CreateType(_)
+        | SqlOutcome::DropType(_)
         | SqlOutcome::Begin
         | SqlOutcome::Commit
         | SqlOutcome::Rollback
