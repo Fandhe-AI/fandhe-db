@@ -4,7 +4,9 @@
 //! 責務境界: `sql::allowlist::validate_sql_tokens` が構造検証した
 //! [`crate::sql::allowlist::ValidatedSetOperation`]（構文木は
 //! [`crate::sql::allowlist::SetTree`]。葉は単一テーブルの広域取得
-//! [`crate::sql::allowlist::ValidatedScan`] に限定する——TASK-212（`JOIN`・複数
+//! [`crate::sql::allowlist::ValidatedScan`]（Issue #1191 で、括弧付き枝の枝内
+//! `ORDER BY`／`LIMIT`／`OFFSET` と、集計形の枝
+//! [`crate::sql::allowlist::ValidatedAggregate`] を追加）に限定する——TASK-212（`JOIN`・複数
 //! テーブル実行計画基盤）を前提にしない設計判断。TASK-213 は TASK-212 に後続
 //! するが、本実装は各枝を独立した単一テーブル走査として扱うことで基盤の完成を
 //! 待たずに導入する）を受け取り、`core.rs::EngineCore` の SQL 実行経路
@@ -32,7 +34,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::policy::PolicyContext;
-use crate::sql::allowlist::{SetOperator, SetTree, SqlSurfaceError, ValidatedScan};
+use crate::sql::allowlist::{
+    SetAggregateBranch, SetOperator, SetTree, SqlSurfaceError, ValidatedScan,
+};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::UdfRegistry;
 
@@ -126,9 +130,14 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
 /// ために使う（`read_txn_with_schemas`）。
 pub(crate) fn collect_branch_tables(tree: &SetTree, out: &mut Vec<String>) {
     match tree {
-        SetTree::Branch(scan) => {
+        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
             if !out.iter().any(|t| t == &scan.table_name) {
                 out.push(scan.table_name.clone());
+            }
+        }
+        SetTree::AggregateBranch(agg) => {
+            if !out.iter().any(|t| t == &agg.0.table_name) {
+                out.push(agg.0.table_name.clone());
             }
         }
         SetTree::Op { left, right, .. } => {
@@ -146,15 +155,24 @@ struct EvalOutcome {
     has_vector: bool,
 }
 
-/// [`ColumnMeta`] 同士の型整合判定（SQL-29 (c) §2.2）。枝の投影は構文検証段
-/// （`sql::allowlist::parse_set_branch`）で `Computed` 項目を拒否済みのため、
-/// ここで到達するのは `Id`／`Scalar` のみ（`Computed` が現れた場合は防御的に
-/// 不一致として扱う）。
+/// [`ColumnMeta`] 同士の型整合判定（SQL-29 (c) §2.2）。広域取得の枝は `Id`／`Scalar`
+/// のみ。集計形の枝（Issue #1191）は `Computed` を返し、束縛時に確定した静的型
+/// （`Some(ty)`。Issue #1173）を `Scalar` と同じ型として比較する。静的型を持たない
+/// `Computed { ty: None }` は不一致として扱う（fail-closed。`42804`）。
 fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
+    fn static_type(m: &ColumnMeta) -> Option<&ColumnType> {
+        match m {
+            ColumnMeta::Scalar { ty, .. } => Some(ty),
+            ColumnMeta::Computed { ty: Some(ty), .. } => Some(ty),
+            ColumnMeta::Id | ColumnMeta::Computed { ty: None, .. } => None,
+        }
+    }
     match (a, b) {
         (ColumnMeta::Id, ColumnMeta::Id) => true,
-        (ColumnMeta::Scalar { ty: ta, .. }, ColumnMeta::Scalar { ty: tb, .. }) => ta == tb,
-        _ => false,
+        _ => match (static_type(a), static_type(b)) {
+            (Some(ta), Some(tb)) => ta == tb,
+            _ => false,
+        },
     }
 }
 
@@ -237,10 +255,19 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
     for cell in &row.cells {
         match cell {
             Cell::Null => out.push(0),
-            Cell::Integer(v) => {
-                out.push(1);
-                out.extend_from_slice(&v.to_be_bytes());
-            }
+            // 集計項目（`COUNT` 等。`Cell::Integer`）と `BIGINT` 列（`Cell::SignedInteger`）は
+            // 静的型が同じ（`BigInt`）で互換とみなされるため、`i64` に収まる値は同じ
+            // 型タグ・同じ表現へ正準化して同値判定する（Issue #1191）。
+            Cell::Integer(v) => match i64::try_from(*v) {
+                Ok(signed) => {
+                    out.push(5);
+                    out.extend_from_slice(&signed.to_be_bytes());
+                }
+                Err(_) => {
+                    out.push(1);
+                    out.extend_from_slice(&v.to_be_bytes());
+                }
+            },
             Cell::Text(s) => {
                 out.push(2);
                 push_len_prefixed(&mut out, s.as_bytes())?;
@@ -381,6 +408,12 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
 /// `MAX_SEARCH_K + 1` を上限として走査する）。文全体で共有する `budget`
 /// （[`SetOpBudget`]）の残り予算を枝の実行に渡し（枝単体でも残り予算を超えられ
 /// ない）、実行結果のバイト量を消費として計上する。
+///
+/// `explicit_limit` は括弧付き枝が枝内 `LIMIT`／`OFFSET`／`ORDER BY` を持つ場合
+/// （[`SetTree::LimitedBranch`]。Issue #1191）で、枝自身の `limit`・`offset`・
+/// `order_by` をそのまま使って切り詰める（`54000` にしない。`bind_scan` が
+/// `1..=MAX_SEARCH_K` を検証済みのため結果は上限内）。それ以外（既定の枝）は従来どおり
+/// `MAX_SEARCH_K + 1` へ差し替えて超過を検出する。
 fn eval_branch(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -388,18 +421,58 @@ fn eval_branch(
     validated: &ValidatedScan,
     udfs: &UdfRegistry,
     budget: &mut SetOpBudget,
+    explicit_limit: bool,
 ) -> Result<EvalOutcome, SqlSurfaceError> {
     let mut bound = crate::sql::parser::bind_scan(validated, schema, udfs)?;
-    // §2.3: 可視行数の上限判定は「可視行数だけに依存」させる（全体 `LIMIT` の
-    // 有無で成否が変わらない単純な規則）。`bound.limit`（`pub(crate)`）を
-    // `MAX_SEARCH_K + 1` へ差し替えて超過を検出できるようにする。
-    bound.limit = MAX_SET_OP_ROWS + 1;
+    if !explicit_limit {
+        // §2.3: 可視行数の上限判定は「可視行数だけに依存」させる（全体 `LIMIT` の
+        // 有無で成否が変わらない単純な規則）。`bound.limit`（`pub(crate)`）を
+        // `MAX_SEARCH_K + 1` へ差し替えて超過を検出できるようにする。
+        bound.limit = MAX_SET_OP_ROWS + 1;
+    }
     let result = crate::sql::scan::execute_scan_with_budget(
         read_txn,
         ctx,
         schema,
         &bound,
         budget.remaining(),
+    )?;
+    if result.rows.len() > MAX_SET_OP_ROWS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "set operation branch exceeds the visible row limit",
+        ));
+    }
+    budget.charge(result_bytes(&result.columns, &result.rows))?;
+    let has_vector = columns_have_vector(&result.columns);
+    Ok(EvalOutcome {
+        columns: result.columns,
+        rows: result.rows,
+        has_vector,
+    })
+}
+
+/// 集計形の枝（[`SetTree::AggregateBranch`]。Issue #1191）を束縛・実行する。通常の
+/// 集計 SELECT と同じ `bind_aggregate` → `execute_aggregate_with_cache`（キャッシュ
+/// 非経由）で、RLS 暗黙適用・fail-closed を第 2 の実行器なしに継承する。結果バイトは
+/// 文全体で共有する `budget` へ計上し、結果行数は `MAX_SET_OP_ROWS` で頭打ちにする。
+fn eval_aggregate_branch(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    branch: &SetAggregateBranch,
+    udfs: &UdfRegistry,
+    budget: &mut SetOpBudget,
+) -> Result<EvalOutcome, SqlSurfaceError> {
+    let bound = crate::sql::parser::bind_aggregate(&branch.0, schema, udfs)?;
+    let result = crate::sql::aggregate::execute_aggregate_with_cache(
+        read_txn,
+        ctx,
+        schema,
+        &bound,
+        budget.remaining(),
+        None,
+        None,
+        None,
     )?;
     if result.rows.len() > MAX_SET_OP_ROWS {
         return Err(SqlSurfaceError::payload_too_large(
@@ -430,7 +503,7 @@ fn validate_tree_types(
     udfs: &UdfRegistry,
 ) -> Result<(Vec<ColumnMeta>, bool), SqlSurfaceError> {
     match tree {
-        SetTree::Branch(validated) => {
+        SetTree::Branch(validated) | SetTree::LimitedBranch(validated) => {
             let schema =
                 schemas
                     .get(&validated.table_name)
@@ -439,6 +512,18 @@ fn validate_tree_types(
                     })?;
             let bound = crate::sql::parser::bind_scan(validated, schema, udfs)?;
             let columns = crate::sql::describe::projected_columns(bound.projection(), schema);
+            let has_vector = columns_have_vector(&columns);
+            Ok((columns, has_vector))
+        }
+        SetTree::AggregateBranch(branch) => {
+            let schema =
+                schemas
+                    .get(&branch.0.table_name)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "schema missing for set operation branch table".to_string(),
+                    })?;
+            let bound = crate::sql::parser::bind_aggregate(&branch.0, schema, udfs)?;
+            let columns = crate::sql::describe::aggregate_columns(&bound);
             let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
         }
@@ -472,14 +557,32 @@ fn eval_tree(
     budget: &mut SetOpBudget,
 ) -> Result<EvalOutcome, SqlSurfaceError> {
     match tree {
-        SetTree::Branch(validated) => {
+        SetTree::Branch(validated) | SetTree::LimitedBranch(validated) => {
             let schema =
                 schemas
                     .get(&validated.table_name)
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "schema missing for set operation branch table".to_string(),
                     })?;
-            eval_branch(read_txn, ctx, schema, validated, udfs, budget)
+            let explicit_limit = matches!(tree, SetTree::LimitedBranch(_));
+            eval_branch(
+                read_txn,
+                ctx,
+                schema,
+                validated,
+                udfs,
+                budget,
+                explicit_limit,
+            )
+        }
+        SetTree::AggregateBranch(branch) => {
+            let schema =
+                schemas
+                    .get(&branch.0.table_name)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "schema missing for set operation branch table".to_string(),
+                    })?;
+            eval_aggregate_branch(read_txn, ctx, schema, branch, udfs, budget)
         }
         SetTree::Op { op, left, right } => {
             let l = eval_tree(read_txn, ctx, schemas, left, udfs, budget)?;
@@ -654,7 +757,7 @@ fn describe_tree(
     dummy_equality_flags: &[bool],
 ) -> Result<(Vec<ColumnMeta>, bool), SqlSurfaceError> {
     match tree {
-        SetTree::Branch(validated) => {
+        SetTree::Branch(validated) | SetTree::LimitedBranch(validated) => {
             let schema =
                 schemas
                     .get(&validated.table_name)
@@ -668,6 +771,23 @@ fn describe_tree(
                 dummy_equality_flags,
             )?;
             let columns = crate::sql::describe::projected_columns(bound.projection(), schema);
+            let has_vector = columns_have_vector(&columns);
+            Ok((columns, has_vector))
+        }
+        SetTree::AggregateBranch(branch) => {
+            let schema =
+                schemas
+                    .get(&branch.0.table_name)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "schema missing for set operation branch table".to_string(),
+                    })?;
+            let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
+                &branch.0,
+                schema,
+                udfs,
+                dummy_equality_flags,
+            )?;
+            let columns = crate::sql::describe::aggregate_columns(&bound);
             let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
         }

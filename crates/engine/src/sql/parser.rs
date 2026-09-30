@@ -1470,7 +1470,8 @@ fn declarative_leaf_to_filter(
         | WherePredicate::Expression(_)
         | WherePredicate::Or(_)
         | WherePredicate::InSubquery { .. }
-        | WherePredicate::Exists { .. } => Err(SqlSurfaceError::Internal {
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -1653,7 +1654,24 @@ fn bind_where_predicates_recursive(
             // 経由せずここへ到達しうるため、未解決のまま束縛に届いた場合は
             // 一律 `42601` で拒否する（fail-closed。構文段の
             // `Parser::require_subquery_depth` と二重にゲートする）。
-            WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+            WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "subquery is not supported for this statement shape",
+                ));
+            }
+            // `NOT IN (SELECT ...)`／`NOT EXISTS (SELECT ...)`（Issue #1191）も
+            // 解決を経由しないまま届いたら同じく拒否する（`declarative_leaf_to_filter`
+            // へ渡して `Internal` にしない。fail-closed）。
+            WherePredicate::Not(inner)
+                if matches!(
+                    inner.as_ref(),
+                    WherePredicate::InSubquery { .. }
+                        | WherePredicate::Exists { .. }
+                        | WherePredicate::ScalarSubqueryCompare { .. }
+                ) =>
+            {
                 return Err(SqlSurfaceError::unsupported(
                     "subquery is not supported for this statement shape",
                 ));
@@ -4312,7 +4330,8 @@ impl BoundAggregate {
     /// `sql::declarative_predicate::bind_declarative_predicates` の束縛結果
     /// （`BoundWhereFilters::into_parts`）をそのまま渡す入口。[`Self::new`]・
     /// [`Self::new_grouped`]・[`Self::new_grouped_by_columns`] のいずれの戻り値にも
-    /// 適用できる）。
+    /// 適用できる。`GROUP BY` 用の [`Self::with_group_order_by`]・
+    /// [`Self::with_group_offset`] も同じ戻り値にチェーンできる）。
     #[must_use]
     pub fn with_or_filters(
         mut self,
@@ -4320,6 +4339,70 @@ impl BoundAggregate {
     ) -> Self {
         self.or_filters = or_filters;
         self
+    }
+
+    /// 集計結果の `ORDER BY` を設定した [`Self`] を返す（Issue #1198・NOSQL-15・
+    /// SQL-25 (a)。NoSQL `aggregate` の `sort` を、SQL テキスト経由の
+    /// [`bind_group_by_clause`] と同じ解決規則〔[`resolve_group_reference`]〕で
+    /// [`BoundGroupBy::order_by`] へ写す builder。`sort` は `GROUP BY` 列名か集計項目の
+    /// 既定エイリアスを指す）。空スライスは no-op。`GROUP BY` なし（単一行集計）は
+    /// 多層防御で `42601`、件数が [`crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS`] を
+    /// 超えれば `54000`（束縛より前に検査）、未知・曖昧な参照は `22000`。
+    pub fn with_group_order_by(
+        mut self,
+        keys: &[crate::sql::allowlist::ScalarOrderKey],
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
+        if keys.is_empty() {
+            return Ok(self);
+        }
+        if keys.len() > crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many aggregate ORDER BY keys",
+            ));
+        }
+        let group_by = self.group_by.as_mut().ok_or_else(|| {
+            SqlSurfaceError::unsupported("ORDER BY requires GROUP BY in an aggregate")
+        })?;
+        let mut key_names: Vec<&str> = Vec::with_capacity(group_by.keys.len());
+        for key in &group_by.keys {
+            let name = match key.target {
+                BoundOrderTarget::Column(index) => schema
+                    .columns
+                    .get(index)
+                    .map(|c| c.name.as_str())
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "GROUP BY key index resolved out of bounds".to_string(),
+                    })?,
+                BoundOrderTarget::Id => "id",
+            };
+            key_names.push(name);
+        }
+        let mut order_by = Vec::with_capacity(keys.len());
+        for key in keys {
+            order_by.push(BoundOrderBy {
+                target: resolve_group_reference(&key_names, &[], &self.items, &key.column)?,
+                descending: key.descending,
+            });
+        }
+        group_by.order_by = order_by;
+        Ok(self)
+    }
+
+    /// 集計結果の `OFFSET` を設定した [`Self`] を返す（Issue #1198・NOSQL-15・
+    /// SQL-25 (b)）。[`validate_search_offset`] と同じ範囲（`0..=MAX_SEARCH_K`。
+    /// 超過は `22000`）で多層防御的に再検査する。`GROUP BY` なしで `offset > 0` は
+    /// `42601`（`0` は no-op）。`limit` なしでも適用される（`sql::group_by`）。
+    pub fn with_group_offset(mut self, offset: usize) -> Result<Self, SqlSurfaceError> {
+        if offset == 0 {
+            return Ok(self);
+        }
+        let checked = validate_search_offset(u32::try_from(offset).unwrap_or(u32::MAX))?;
+        let group_by = self.group_by.as_mut().ok_or_else(|| {
+            SqlSurfaceError::unsupported("OFFSET requires GROUP BY in an aggregate")
+        })?;
+        group_by.offset = checked;
+        Ok(self)
     }
 
     /// クレート外から単一列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
@@ -4366,8 +4449,9 @@ impl BoundAggregate {
     /// `Parser::parse_group_by_clause` と同じ分類）、各列は `schema` 上の既存
     /// 列名か疑似列 `id`（Issue #1185・SQL-25 (d) で `TEXT` 限定を外した。未知列・
     /// 並べ替え不能な型〔`VECTOR` 等〕は `22000`）。
-    /// `ORDER BY`／`LIMIT` 相当は本入口の対象外（`order_by: None`・`limit: None`
-    /// 固定。NoSQL 表層のスキーマにこれらに相当するキーが存在しないため）。
+    /// `ORDER BY`／`OFFSET` は [`Self::with_group_order_by`]・
+    /// [`Self::with_group_offset`] で後付けし、`LIMIT` は本入口の対象外
+    /// （`limit: None` 固定）。既定は `order_by` 空・`offset` 0。
     /// `projection` は `[GroupKey{0..k}] ++ items`（宣言順）の規範形に固定する
     /// （SQL の規範形 `SELECT <col...>, <aggs...> FROM t GROUP BY <col...>` と
     /// 同一の列順・既定エイリアス名）。`rls_predicate_present` は [`Self::new`]
@@ -5406,7 +5490,7 @@ fn bind_window_item(
 /// すべて `out` へ集める（SQL-30・TASK-214。WHERE がウィンドウ別名を参照する形の
 /// 拒否判定でのみ使う）。`Or` の分岐へ再帰する（`sql::view::
 /// check_predicate_columns_within` と同じ理由: 非公開の判定漏れを防ぐ）。
-fn collect_where_predicate_idents(
+pub(crate) fn collect_where_predicate_idents(
     predicates: &[WherePredicate],
     out: &mut std::collections::HashSet<String>,
 ) {
@@ -5441,6 +5525,9 @@ fn collect_where_predicate_idents(
             // 自分の FROM テーブルのスキーマのみで束縛される。
             // `sql::subquery` モジュールドキュメント参照）。
             WherePredicate::Exists { .. } => {}
+            WherePredicate::ScalarSubqueryCompare { column, .. } => {
+                out.insert(column.clone());
+            }
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。
@@ -5458,7 +5545,7 @@ fn collect_where_predicate_idents(
 
 /// [`Expr::Ident`] をすべて再帰的に集める（[`collect_where_predicate_idents`] の
 /// 式項目向け実装。`sql::view::expr_columns_within` と同じ走査規則）。
-fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match expr {
         // Issue #919・SQL-26: 文字列リテラルは列識別子を参照しない。
         Expr::Number(_) | Expr::String(_) => {}
@@ -5700,6 +5787,47 @@ pub(crate) fn check_having_target_is_numeric(
     Ok(())
 }
 
+/// `HAVING`／`ORDER BY` の対象名を [`OrderTarget`] へ解決する（TASK-167・SQL-14）。
+/// SQL テキスト経由の [`bind_group_by_clause`] と、直接構築経由の
+/// [`BoundAggregate::with_group_order_by`]（Issue #1198・NOSQL-15）が共有する
+/// 単一実装。`key_names` は宣言順の `GROUP BY` 列名、`group_key_aliases` は
+/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件・複数一致は
+/// いずれも `22000`（エコーするのは呼び出し元が識別子形状検査済みの名前のみ）。
+fn resolve_group_reference<S: AsRef<str>>(
+    key_names: &[S],
+    group_key_aliases: &[(usize, String)],
+    items: &[BoundAggregateItem],
+    name: &str,
+) -> Result<OrderTarget, SqlSurfaceError> {
+    let mut key_matches: Vec<usize> = key_names
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.as_ref() == name)
+        .map(|(idx, _)| idx)
+        .collect();
+    for (idx, alias) in group_key_aliases {
+        if alias == name && !key_matches.contains(idx) {
+            key_matches.push(*idx);
+        }
+    }
+    let item_matches: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.name == name)
+        .map(|(idx, _)| idx)
+        .collect();
+    match (key_matches.as_slice(), item_matches.as_slice()) {
+        ([key_idx], []) => Ok(OrderTarget::GroupKey(*key_idx)),
+        ([], [idx]) => Ok(OrderTarget::Aggregate(*idx)),
+        ([], []) => Err(SqlSurfaceError::invalid_input(format!(
+            "unknown GROUP BY reference: {name}"
+        ))),
+        _ => Err(SqlSurfaceError::invalid_input(format!(
+            "ambiguous GROUP BY reference: {name}"
+        ))),
+    }
+}
+
 /// [`crate::sql::allowlist::GroupByClause`] を `schema`・束縛済み `items`（アキュムレータ
 /// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14。SQL-25 (d) で
 /// 複数キーへ拡張）。`HAVING`/`ORDER BY` の対象名は SELECT リストの集計項目の
@@ -5731,34 +5859,7 @@ fn bind_group_by_clause(
     // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
     // （曖昧・非存在は `22000`）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
-        let mut key_matches: Vec<usize> = clause
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.as_str() == name)
-            .map(|(idx, _)| idx)
-            .collect();
-        for (idx, alias) in group_key_aliases {
-            if alias == name && !key_matches.contains(idx) {
-                key_matches.push(*idx);
-            }
-        }
-        let item_matches: Vec<usize> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.name == name)
-            .map(|(idx, _)| idx)
-            .collect();
-        match (key_matches.as_slice(), item_matches.as_slice()) {
-            ([key_idx], []) => Ok(OrderTarget::GroupKey(*key_idx)),
-            ([], [idx]) => Ok(OrderTarget::Aggregate(*idx)),
-            ([], []) => Err(SqlSurfaceError::invalid_input(format!(
-                "unknown GROUP BY reference: {name}"
-            ))),
-            _ => Err(SqlSurfaceError::invalid_input(format!(
-                "ambiguous GROUP BY reference: {name}"
-            ))),
-        }
+        resolve_group_reference(&clause.columns, group_key_aliases, items, name)
     };
 
     let mut having = Vec::with_capacity(clause.having.len());
@@ -7637,6 +7738,164 @@ mod tests {
             bound.items[0].input,
             AggregateInput::TextColumn(_)
         ));
+    }
+
+    // --- with_group_order_by／with_group_offset（Issue #1198・NOSQL-15） --------
+
+    fn grouped_direct(cols: &[&str]) -> BoundAggregate {
+        let count = BoundAggregateItem::bind(
+            crate::sql::allowlist::AggregateFunc::Count,
+            AggregateTarget::Star,
+            &docs_schema(),
+        )
+        .expect("count(*) binds");
+        BoundAggregate::new_grouped_by_columns(
+            "documents".to_string(),
+            vec![count],
+            Vec::new(),
+            Vec::new(),
+            cols,
+            Vec::new(),
+            &docs_schema(),
+        )
+        .expect("grouped plan binds")
+    }
+
+    fn sort_key(column: &str, descending: bool) -> crate::sql::allowlist::ScalarOrderKey {
+        crate::sql::allowlist::ScalarOrderKey {
+            column: column.to_string(),
+            descending,
+        }
+    }
+
+    #[test]
+    fn group_order_by_resolves_group_key_and_aggregate_alias() {
+        let bound = grouped_direct(&["lang"])
+            .with_group_order_by(
+                &[sort_key("count", true), sort_key("lang", false)],
+                &docs_schema(),
+            )
+            .expect("resolves");
+        let gb = bound.group_by.expect("grouped");
+        assert_eq!(
+            gb.order_by,
+            vec![
+                BoundOrderBy {
+                    target: OrderTarget::Aggregate(0),
+                    descending: true
+                },
+                BoundOrderBy {
+                    target: OrderTarget::GroupKey(0),
+                    descending: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_order_by_matches_sql_text_path() {
+        let sql = bind_aggregate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang \
+             ORDER BY count DESC, lang LIMIT 10000 OFFSET 1",
+        )
+        .expect("sql binds")
+        .group_by
+        .expect("grouped");
+        let direct = grouped_direct(&["lang"])
+            .with_group_order_by(
+                &[sort_key("count", true), sort_key("lang", false)],
+                &docs_schema(),
+            )
+            .and_then(|b| b.with_group_offset(1))
+            .expect("direct binds")
+            .group_by
+            .expect("grouped");
+        assert_eq!(sql.order_by, direct.order_by);
+        assert_eq!(sql.offset, direct.offset);
+    }
+
+    #[test]
+    fn group_order_by_rejects_unknown_and_too_many_keys() {
+        let unknown = grouped_direct(&["lang"])
+            .with_group_order_by(&[sort_key("nope", false)], &docs_schema())
+            .unwrap_err();
+        assert_eq!(unknown.wire_code(), "22000");
+        let many: Vec<_> = (0..=crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS)
+            .map(|_| sort_key("lang", false))
+            .collect();
+        let err = grouped_direct(&["lang"])
+            .with_group_order_by(&many, &docs_schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn group_order_by_rejects_ambiguous_reference() {
+        // 既定名 `count` の集計項目を 2 つ並べ、`count` 参照を曖昧にする。
+        let count = || {
+            BoundAggregateItem::bind(
+                crate::sql::allowlist::AggregateFunc::Count,
+                AggregateTarget::Star,
+                &docs_schema(),
+            )
+            .expect("binds")
+        };
+        let plan = BoundAggregate::new_grouped_by_columns(
+            "documents".to_string(),
+            vec![count(), count()],
+            Vec::new(),
+            Vec::new(),
+            &["lang"],
+            Vec::new(),
+            &docs_schema(),
+        )
+        .expect("binds");
+        let err = plan
+            .with_group_order_by(&[sort_key("count", false)], &docs_schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn group_builders_reject_missing_group_by() {
+        let count = BoundAggregateItem::bind(
+            crate::sql::allowlist::AggregateFunc::Count,
+            AggregateTarget::Star,
+            &docs_schema(),
+        )
+        .expect("binds");
+        let plain = || {
+            BoundAggregate::new(
+                "documents".to_string(),
+                vec![count.clone()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("single-row aggregate binds")
+        };
+        let err = plain()
+            .with_group_order_by(&[sort_key("count", false)], &docs_schema())
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = plain().with_group_offset(1).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        assert!(plain().with_group_offset(0).is_ok());
+        assert!(plain().with_group_order_by(&[], &docs_schema()).is_ok());
+    }
+
+    #[test]
+    fn group_offset_boundary() {
+        let ok = grouped_direct(&["lang"])
+            .with_group_offset(crate::core::MAX_SEARCH_K)
+            .expect("max accepted");
+        assert_eq!(
+            ok.group_by.expect("grouped").offset,
+            crate::core::MAX_SEARCH_K
+        );
+        let err = grouped_direct(&["lang"])
+            .with_group_offset(crate::core::MAX_SEARCH_K + 1)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 
     // --- bind_column_projection（Issue #763・NOSQL-2） -------------------------

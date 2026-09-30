@@ -1,7 +1,7 @@
-# サブクエリ（スカラー・IN・EXISTS）
+# サブクエリ（スカラー・IN・NOT IN・EXISTS・NOT EXISTS）
 
 - ステータス: **Accepted（実装既定値。当初計画からスコープを大きく縮小して実装）**
-- 対応: Issue #927
+- 対応: Issue #927（`IN`／`EXISTS`）・Issue #1191（スカラー比較・`NOT IN`／`NOT EXISTS`・`IN` 対象型の拡大・相関サブクエリの `42601`）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-29 (a)・`docs/spec/04-behavior/rls.md`
   RLS-10 (b)・`docs/spec/05-tasks.md` TASK-213
 - 関連ポインタ: SQL-24・TASK-208（`WHERE` の `OR` 結合。本 Issue が再利用する
@@ -27,14 +27,14 @@
 | ネスト（`MAX_SUBQUERY_DEPTH` = 4 まで） | 対応 |
 | 外側が広域取得 SELECT（`Statement::Scan`）・集計 SELECT（`Statement::Aggregate`） | 対応 |
 | 外側がランキング付き検索 SELECT（`ORDER BY <=>`・`HYBRID`・`USING PLAN`） | **非対応**（構文は受理するが束縛時に `42601`） |
-| スカラー比較サブクエリ（`<col> <cmp> (SELECT ...)`）・投影位置のスカラーサブクエリ | **非対応**（構文自体を提供しない） |
-| 内側が集計（`GROUP BY`）・ランキング付き検索 SELECT | **非対応**（`42601`） |
+| WHERE 値位置のスカラー比較サブクエリ（`<col> <op> (SELECT ...)`。`<op>` は `= <> < <= > >=`） | 対応（Issue #1191）。逆向き（`(SELECT ...) <op> <col>`）・式への埋め込み・投影位置のスカラーサブクエリは **非対応**（`42601`） |
+| 内側がランキング付き検索 SELECT・集合演算・JOIN | **非対応**（`42601`）。集計形（単一集計項目。`GROUP BY` の有無を問わず `LIMIT` 不要）はスカラー比較の内側に限り対応（Issue #1191）。`IN`／`EXISTS` の内側の集計形は非対応 |
 | 内側の `LIMIT` 省略 | **非対応**（`42601`。内側は常に明示 `LIMIT` が必要） |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
-| 相関サブクエリ | **非対応**。専用の構造検出は持たず、内側の束縛（`bind_scan`）が内側テーブルのスキーマにない列参照を既存の `22000`（unknown column）へ落とすことに委ねる（内側は常に自分の FROM テーブルのスキーマのみで束縛される） |
-| `NOT IN`・`NOT EXISTS` | **非対応**（文法自体が `NOT` を持たない） |
+| 相関サブクエリ | **非対応**。束縛前の静的走査で `42601`（Issue #1191。内側スキーマに無く外側スコープのいずれかに有る非修飾列名の参照を検出する。どこにも無い名前は従来どおり `22000`） |
+| `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
 | `IN` 対象列が疑似列 `id` | 実測範囲外（このリポの既存 `WherePredicate::Equality` 束縛自体が疑似列 `id` を対象にしていないため。`sql::subquery::cell_to_equality_predicate` の `Cell::Integer` 分岐は将来の拡張に備えて到達可能コードとして残す） |
-| `IN` 対象値の型 | `TEXT`／`BOOLEAN` のみ。`INTEGER`／`BIGINT`（`WherePredicate::Equality` が `TEXT`／`ENUM` 列専用のため対象外。等価比較自体がこのリポ未実装〔レーン A〕）・`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`VECTOR`／配列／JSON は `22000`（push 前 Review 指摘対応。Issue #927） |
+| `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大。内側の投影列は同じ値族であること）。`REAL`／`DOUBLE`／`VECTOR`／配列／JSON・疑似列 `id` は `22000` |
 | 拡張クエリプロトコル（Parse/Bind、`$n`） | **非対応**（`42601`。理由は後述） |
 | Describe（拡張クエリプロトコルの投影列導出） | 対象外（拡張クエリプロトコル自体が非対応のため） |
 | `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・述語形 `UPDATE`/`DELETE`・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
@@ -211,16 +211,79 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 を検出し、一律 `42601` で拒否する（簡易クエリプロトコル
 `EngineCore::parse_sql`／`execute_sql` はこの経路を通らないため影響しない）。
 
+## Issue #1191 追記: スカラー比較・NOT IN／NOT EXISTS・相関の `42601`
+
+ポインタ: SQL-29 (a)・RLS-10 (b)・RLS-7・RLS-8・TASK-213・ERR-6（`42804`）。
+
+### `NOT IN`／`NOT EXISTS`（非破壊）
+
+新 variant は足さず `WherePredicate::Not(Box<InSubquery>)`／`Not(Box<Exists>)` で表す。
+構文段は `require_subquery_depth` を `Not` で包む前に呼ぶため、サブクエリ不許可の
+文脈（`EXPLAIN`・ビュー本体・CHECK・カーソル・`COPY`・述語形 DML・CTE 主クエリ・
+集合演算の枝）は従来どおり `42601`。`sql::where_negation` は `NOT ( ... )` の De Morgan
+押し下げで `Not(InSubquery)`／`Not(Exists)` を葉として残し、二重否定は畳む。解決段
+（`sql::subquery`）が否定形を評価し、`Not` は束縛前に消える（解決を経由せず束縛へ届いた
+場合は `42601`）。
+
+- `NOT EXISTS`: 可視行が 1 件でもあれば `Or(vec![])`（常に偽）、無ければ述語なし（常に真）。
+- `NOT IN`（対象列の存在・型・値族の静的検証は内側の行数に依存せず先に行う）:
+  1. 内側 0 行: 常に真（外側値が NULL でも真。述語を追加しない）。
+  2. 内側の結果に NULL を 1 つでも含む: 真にならない（`Or(vec![])`）。NULL の検出は
+     語彙外 ENUM ラベルの除外より前に行う。
+  3. それ以外: distinct 値のチャンクごとに `Not(InList)` を連言で並べる。外側値が NULL の
+     行は宣言的フィルタの三値評価（UNKNOWN）で除外される。照合集合が空（語彙外ラベルのみ等）
+     でも内側は非空のため、外側値が非 NULL の行だけを残す（`IS NOT NULL`）。
+  整数列は数値リテラル `IN` と同じ式脱糖形（`Expression(col = n)` の `Or`。`NOT IN` は
+  `col < n OR col > n` の連言）。1 サイトの distinct 値数は式ノード予算（1024）に収まる
+  上限（`IN` は 256、`NOT IN` は 128）で、超過は `54000`。
+- 否定を葉まで押し下げた後の葉で UNKNOWN を偽に潰すのは、上位が単調な AND／OR のみで
+  あるため WHERE 最終判定と同値（`where_negation` のモジュールドキュメントと同じ根拠）。
+
+### スカラー比較サブクエリ（BREAKING CHANGE）
+
+`WherePredicate::ScalarSubqueryCompare { column, op, inner_tokens, depth }`（と
+`ScalarSubqueryOp`）を追加した。`WherePredicate` は公開・非 `non_exhaustive` のため、
+網羅 `match` を持つ外部コードは要対応。否定は演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`）。
+
+解決結果は「同じ列型で `col <op> <リテラル>` と書いたときにパーサーが生成する AST と
+同一形」にする（第 2 の評価器を作らない）:
+
+| 対象列の値族 | 生成する述語 |
+| ------------ | ------------ |
+| `TEXT`／`ENUM` | `=`: `Equality`、`<>`: `Not(Equality)`、範囲: `Compare`（`TEXT` のみ。`ENUM` の範囲比較は `22000`）。`ENUM` の語彙外の値は `=` が常に偽・`<>` が非 NULL の全行で真 |
+| `BOOLEAN` | `=`／`<>` のみ（`BoolEquality`）。範囲は `22000` |
+| `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` | `=`: `Equality`、`<>`: `Not(Equality)`、範囲: `Compare`（値は wire と同じ既存フォーマッタによる正準テキスト） |
+| `INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／疑似列 `id`（数値族。集計の DOUBLE 結果とも比較可） | `Expression`（`<>` は `<` と `>` の `Or`） |
+
+結果の扱い: 0 行または NULL は UNKNOWN（常に偽）。**2 行以上はエラー**（先頭行を採用
+しない）。`21000`（cardinality_violation）相当の分類は本リポの `wire_code` 表に無いため、
+既存分類の `22000` で PostgreSQL と同じ文言を返す。判定は内側の可視行のみに依存する
+（他テナント行では発火しない）。投影列数 ≠ 1 は `42601`、値族の不一致は `22000`
+（いずれも内側の行数・値に依存しない静的検証）。
+
+拡張クエリプロトコルは `core.rs::contains_subquery_syntax` が比較演算子直後の
+`( SELECT` を検出し、`$n` 併用は従来どおり `42601`（`$n` なしは簡易クエリと同じ）。
+
+### 相関サブクエリの `42601`
+
+内側が参照する非修飾の列名（投影・WHERE の全葉・式内の識別子・スカラー `ORDER BY`、
+集計内側は集計引数・グループキー・`GROUP BY` 列）のうち、内側スキーマに無く外側スコープ
+（ネストの深さ分の連鎖）のいずれかに有るものがあれば、束縛・走査より前に `42601`
+（`correlated subqueries are not supported`）。PostgreSQL の名前解決順に合わせ、内外に同名の
+列があれば内側を優先する。疑似列 `id` は全テーブルにあるため相関と判定しない。修飾参照は
+内側の構文解析が `42601` にする。エラー文言は静的文字列のみ。
+
 ## 実装ファイル
 
 | パス | 内容 |
 | ---- | ---- |
-| `crates/engine/src/sql/allowlist.rs` | `WherePredicate::InSubquery`/`Exists`（BREAKING CHANGE）・`Parser::subquery_ctx`・`MAX_SUBQUERY_DEPTH`・`parse_select_shape`/`parse_aggregate_shape` の ctx 引数・`validate_sql_tokens_with_subquery_ctx` |
+| `crates/engine/src/sql/allowlist.rs` | `WherePredicate::InSubquery`/`Exists`/`ScalarSubqueryCompare`（BREAKING CHANGE）・`Parser::subquery_ctx`・`MAX_SUBQUERY_DEPTH`・`parse_select_shape`/`parse_aggregate_shape` の ctx 引数・`validate_sql_tokens_with_subquery_ctx` |
 | `crates/engine/src/sql/subquery.rs`（新設） | 解決本体（`resolve_where_predicates`・`MAX_SUBQUERY_EXECUTIONS`） |
 | `crates/engine/src/sql/parser.rs` | `bind_where_predicates_recursive` の防御的拒否腕 |
 | `crates/engine/src/core.rs` | `Statement::Scan`/`Statement::Aggregate` アームでの解決呼び出し・`parse_sql`/`execute_sql` のサブクエリ許可化・`parse_sql_prepared` の拒否ガード |
 | `crates/engine/src/sql/view.rs`・`check_constraint.rs`・`recovery/content_hash.rs` | 網羅 `match` の防御的拒否腕（いずれも到達不能。構文段のゲートで先に拒否される） |
-| `crates/engine/tests/sql29_subquery.rs`（新設） | 結合テスト（受理・RLS 境界・深さ上限・文脈拒否） |
+| `crates/engine/tests/sql29_subquery.rs`（新設） | 結合テスト（受理・RLS 境界・深さ上限・文脈拒否・`NOT IN`／`NOT EXISTS`） |
+| `crates/engine/tests/sql29_subquery_scalar.rs`（Issue #1191） | スカラー比較・相関 `42601`・`IN` 対象型拡大・RLS の結合テスト |
 
 ## OWASP Top 10 観点
 
@@ -242,16 +305,16 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 
 ## スコープ外（Issue 化はユーザー承認後に判断）
 
-- スカラー比較サブクエリ・投影位置のスカラーサブクエリ
-- 内側の集計・ランキング付き検索 SELECT
+- 投影位置のスカラーサブクエリ（Describe が実行なしで結果列の静的型・列名を確定する必要があり、`Expr`／`SelectItem` の公開 enum 変更と型 OID 導出の設計が別途必要。`42601` 維持）
+- スカラー比較の 2 行以上を `21000` で返すこと（`wire_code` 表への分類追加が前提。現状は `22000`）
+- `IN`／`EXISTS` の内側の集計形・ランキング付き検索 SELECT・`REAL`／`DOUBLE` 等の `IN` 対象型
 - 内側のウィンドウ関数（SQL-30・TASK-214、Issue #930）: `IN`／`EXISTS`
   いずれも内側に `window_items` が含まれる場合は `42601` で一律拒否する
   （PR #1103 Cursor Bugbot 指摘対応。理由は「上限（DoS 対策）」節参照。
   サブクエリとウィンドウ関数の組合せが正しく動く経路は設計上未検証のため、
   作り込むのではなく fail-closed に倒した）。
-- 相関サブクエリ
+- 相関サブクエリ（`42601` で拒否。実行はしない）
 - 拡張クエリプロトコル経由のサブクエリ・Describe 対応
-- `NOT IN`・`NOT EXISTS`（#913 の `NOT` 対応に依存）
 - ランキング付き検索 SELECT（外側）でのサブクエリ対応
 - サブクエリ述語に対するスカラー二次索引の最適化（現状は `PlainScan` 相当のまま。
   チャンク化 `InList` への `IndexInList` 適用による候補削減も同様に対象外）

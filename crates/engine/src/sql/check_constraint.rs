@@ -110,7 +110,9 @@ fn render_predicate(predicate: &WherePredicate) -> String {
         // Issue #927・SQL-29 (a)・TASK-213: `CHECK (...)` 本体も `Parser::new`
         // の既定（`subquery_ctx == None`）で解析するため、構文段が既に `42601`
         // で拒否し到達しない（`Or` と同じ防御的経路）。
-        WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => String::new(),
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => String::new(),
     }
 }
 
@@ -330,7 +332,9 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
             }
             // Issue #927・SQL-29 (a)・TASK-213: 同上（構文段が既に `42601`
             // で拒否するため到達しない防御的経路）。
-            WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+            WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "CHECK constraint predicate must not contain a subquery",
                 ));

@@ -366,3 +366,132 @@ fn declare_cursor_for_with_query_works() {
     core.execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
         .expect("commit");
 }
+// --- 集計主クエリ・ORDER BY 付き広域取得（Issue #1191・SQL-29 (b)） -------------
+
+fn first_cells(result: &QueryResult) -> Vec<engine::sql::exec::Cell> {
+    result
+        .rows
+        .iter()
+        .filter_map(|r| r.cells.first().cloned())
+        .collect()
+}
+
+#[test]
+fn cte_aggregate_main_query_counts_visible_rows_only() {
+    let (core, _guard) = open_seeded();
+    use engine::sql::exec::Cell;
+    let sql = "WITH ja AS (SELECT id, lang FROM docs WHERE lang = 'ja') SELECT COUNT(*) FROM ja";
+    // 可視性は「public 全件 + 自テナントの private」。ja 行は alice 1・2（public）・
+    // 4（private）・bob 5（public）・6（private）・carol 7（public）。
+    // alice: 1,2,4,5,7 の 5 件。
+    assert_eq!(
+        first_cells(&query(&core, "alice", sql).expect("alice")),
+        vec![Cell::Integer(5)]
+    );
+    // bob: 1,2,5,6,7 の 5 件（alice の private 4 は見えない）。
+    assert_eq!(
+        first_cells(&query(&core, "bob", sql).expect("bob")),
+        vec![Cell::Integer(5)]
+    );
+    // carol: public のみの 1,2,5,7 の 4 件（alice・bob の private は見えない）。
+    assert_eq!(
+        first_cells(&query(&core, "carol", sql).expect("carol")),
+        vec![Cell::Integer(4)]
+    );
+    // 主クエリの WHERE が CTE の述語へ合成される（`id` は CTE の公開列）。
+    let composed = "WITH ja AS (SELECT id, lang FROM docs WHERE lang = 'ja') \
+                    SELECT COUNT(*) FROM ja WHERE id > 1";
+    assert_eq!(
+        first_cells(&query(&core, "alice", composed).expect("composed")),
+        vec![Cell::Integer(4)]
+    );
+}
+
+#[test]
+fn cte_aggregate_main_query_group_by_having_order_by() {
+    let (core, _guard) = open_seeded();
+    use engine::sql::exec::Cell;
+    let result = query(
+        &core,
+        "alice",
+        "WITH a AS (SELECT id, lang FROM docs) \
+         SELECT lang, COUNT(*) AS n FROM a GROUP BY lang ORDER BY n DESC",
+    )
+    .expect("group by over CTE");
+    let rows: Vec<(String, Cell)> = result
+        .rows
+        .iter()
+        .map(|r| {
+            let Some(Cell::Text(lang)) = r.cells.first().cloned() else {
+                panic!("first cell must be the group key: {r:?}");
+            };
+            (lang, r.cells.get(1).cloned().expect("count cell"))
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("ja".to_string(), Cell::Integer(5)),
+            ("en".to_string(), Cell::Integer(1))
+        ]
+    );
+    let having = query(
+        &core,
+        "alice",
+        "WITH a AS (SELECT id, lang FROM docs) \
+         SELECT lang, COUNT(*) AS n FROM a GROUP BY lang HAVING n > 1",
+    )
+    .expect("having over CTE");
+    assert_eq!(having.rows.len(), 1);
+    // `SELECT DISTINCT` の脱糖形。
+    let distinct = query(
+        &core,
+        "alice",
+        "WITH a AS (SELECT id, lang FROM docs) SELECT DISTINCT lang FROM a",
+    )
+    .expect("distinct over CTE");
+    assert_eq!(distinct.rows.len(), 2);
+}
+
+#[test]
+fn cte_aggregate_main_query_rejects_columns_hidden_by_the_cte() {
+    let (core, _guard) = open_seeded();
+    for sql in [
+        "WITH a AS (SELECT id, lang FROM docs) SELECT COUNT(body) FROM a",
+        "WITH a AS (SELECT id, lang FROM docs) SELECT body, COUNT(*) FROM a GROUP BY body",
+        "WITH a AS (SELECT id, lang FROM docs) SELECT COUNT(*) FROM a WHERE body = 'x'",
+        "WITH a AS (SELECT id, lang FROM docs) SELECT DISTINCT body FROM a",
+    ] {
+        let err = query_err(&core, "alice", sql);
+        assert!(
+            matches!(err, SqlSurfaceError::InvalidInput { .. }),
+            "sql={sql} err={err:?}"
+        );
+    }
+}
+
+#[test]
+fn cte_main_query_scalar_order_by_is_supported() {
+    let (core, _guard) = open_seeded();
+    let result = query(
+        &core,
+        "alice",
+        "WITH a AS (SELECT id, lang FROM docs) SELECT id FROM a ORDER BY id DESC LIMIT 100",
+    )
+    .expect("scalar ORDER BY over CTE");
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![7, 5, 4, 3, 2, 1]);
+}
+
+#[test]
+fn cte_main_query_still_rejects_subquery_and_explain_forms() {
+    let (core, _guard) = open_seeded();
+    for sql in [
+        "WITH a AS (SELECT id, lang FROM docs) SELECT COUNT(*) FROM a WHERE lang IN (SELECT lang FROM docs LIMIT 10)",
+        "WITH a AS (SELECT id, lang FROM docs) SELECT id FROM a WHERE lang = (SELECT lang FROM docs LIMIT 1) LIMIT 10",
+        "EXPLAIN WITH a AS (SELECT id FROM docs) SELECT COUNT(*) FROM a",
+    ] {
+        let err = query_err(&core, "alice", sql);
+        assert_eq!(err.wire_code(), "42601", "sql={sql} err={err:?}");
+    }
+}
