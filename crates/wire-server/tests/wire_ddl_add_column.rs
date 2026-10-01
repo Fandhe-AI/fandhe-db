@@ -124,6 +124,7 @@ fn wire_add_column_with_not_null_and_default_receives_command_complete() {
         "ALTER TABLE docs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ja'",
         "ALTER TABLE docs ADD COLUMN n INTEGER DEFAULT 3",
         "ALTER TABLE docs ADD COLUMN d DATE NOT NULL DEFAULT '2020-01-01'",
+        "ALTER TABLE docs ADD COLUMN u UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001'",
     ] {
         send_simple_query(&mut stream, sql);
         let tag = read_command_complete(&mut stream);
@@ -224,6 +225,22 @@ fn wire_date_default_errors_are_mapped_to_sqlstate() {
         ),
         ("ALTER TABLE docs ADD COLUMN d DATE DEFAULT 'abc'", "22007"),
         ("ALTER TABLE docs ADD COLUMN d DATE DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// `UUID` 列の不正な `DEFAULT` は engine の SQLSTATE 写像どおり拒否される（Issue #1281）。
+#[test]
+fn wire_uuid_default_errors_are_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for (sql, code) in [
+        ("ALTER TABLE docs ADD COLUMN u UUID DEFAULT 'abc'", "22P02"),
+        ("ALTER TABLE docs ADD COLUMN u UUID DEFAULT 1", "42601"),
     ] {
         send_simple_query(&mut stream, sql);
         expect_error_response_with_sqlstate(&mut stream, code);

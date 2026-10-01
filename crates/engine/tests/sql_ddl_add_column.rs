@@ -912,9 +912,19 @@ fn default_type_check_errors() {
         ("c3 DATE DEFAULT '2020-02-30'", "22008"),
         ("c4 DATE DEFAULT '2020-13-01'", "22008"),
         ("c5 TIMESTAMP DEFAULT '2020-01-01 00:00:00'", "0A000"),
+        ("d UUID DEFAULT 1", "42601"),
+        ("d2 UUID DEFAULT 'abc'", "22P02"),
         (
-            "d UUID DEFAULT '00000000-0000-0000-0000-000000000000'",
-            "0A000",
+            "d3 UUID DEFAULT '00000000000000000000000000000001'",
+            "22P02",
+        ),
+        (
+            "d4 UUID DEFAULT '{00000000-0000-0000-0000-000000000001}'",
+            "22P02",
+        ),
+        (
+            "d5 UUID DEFAULT 'zzzzzzzz-0000-0000-0000-000000000001'",
+            "22P02",
         ),
         ("e TEXT DEFAULT 1", "42601"),
         ("f BOOLEAN DEFAULT 'x'", "42601"),
@@ -1097,5 +1107,123 @@ fn date_not_null_outcome_is_independent_of_rows_and_tenants() {
             &format!("SELECT d FROM {TABLE} WHERE id = 1 LIMIT 1")
         ),
         Cell::Date(v) if v == days
+    ));
+}
+
+/// `UUID` 列の `DEFAULT`（Issue #1281）。既存行は読み出し時に既定値で補われ、
+/// 読み出しでは正規小文字表記になる。新規 INSERT の列省略でも同じ値になる。
+#[test]
+fn uuid_default_fills_existing_rows_across_read_paths() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    let upper = "0A0B0C0D-0000-0000-0000-00000000000F";
+    let lower = "0a0b0c0d-0000-0000-0000-00000000000f";
+    let other = "00000000-0000-0000-0000-000000000002";
+    add_column(&core, &format!("u UUID NOT NULL DEFAULT '{upper}'")).expect("ADD COLUMN UUID");
+    add_column(&core, &format!("un UUID DEFAULT '{other}'")).expect("ADD COLUMN nullable UUID");
+
+    let q = |col: &str| {
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        )
+    };
+    assert!(matches!(q("u"), Cell::Uuid(v) if v.to_string() == lower));
+    assert!(matches!(q("un"), Cell::Uuid(v) if v.to_string() == other));
+    assert_eq!(
+        count_star(&core, &owner, TABLE),
+        1,
+        "row count must be unchanged"
+    );
+    let filtered = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE u = '{lower}' LIMIT 10"),
+        )
+        .expect("WHERE on UUID default");
+    assert_eq!(filtered.rows.len(), 1);
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting u");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, u) VALUES (3, '[0.3,0.4]', '{other}') USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit u");
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT u FROM {TABLE} WHERE id = 2 LIMIT 1")),
+        Cell::Uuid(v) if v.to_string() == lower
+    ));
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT u FROM {TABLE} WHERE id = 3 LIMIT 1")),
+        Cell::Uuid(v) if v.to_string() == other
+    ));
+}
+
+/// `UUID DEFAULT` は再オープン後も既定値として読める。
+#[test]
+fn uuid_default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(
+        &core,
+        "u UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001'",
+    )
+    .expect("ADD COLUMN");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT u FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Uuid(v) if v.to_string() == "00000000-0000-0000-0000-000000000001"
+    ));
+}
+
+/// `UUID NOT NULL`（DEFAULT なし）は行の有無にかかわらず同一の `42601`、
+/// `UUID NOT NULL DEFAULT` の成功も行の有無に依存しない（テナント境界 P0）。
+#[test]
+fn uuid_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "u UUID NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "u UUID NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "u"));
+
+    add_column(
+        &core,
+        "u UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001'",
+    )
+    .expect("other tenant rows: ok");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &ctx("bob"),
+            &format!("SELECT u FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Uuid(v) if v.to_string() == "00000000-0000-0000-0000-000000000001"
     ));
 }

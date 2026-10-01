@@ -2646,7 +2646,7 @@ impl ArrayType {
 ///
 /// `Text` は SQL 文字列リテラルの原文を保持する。`TEXT` 列ではそのまま値になり、
 /// `DATE` 列（Issue #1279）では `row_codec::default_scalar` が列型に従って
-/// 解釈する。後続の `TIMESTAMP`／`UUID`／`ENUM`（Issue #1280〜#1282）も新 variant
+/// 解釈する。`UUID`（Issue #1281）も同様。後続の `TIMESTAMP`／`ENUM`（Issue #1280・#1282）も新 variant
 /// を足さず、`compatible_with`・`column_default_compatible_with_tag`・
 /// `row_codec::default_scalar`・`sql::ddl::add_column_default` の対応表へ同じ形で
 /// 腕を足して拡張する（公開 enum の variant 追加による破壊的変更とカタログ符号化の
@@ -2683,16 +2683,17 @@ impl ColumnDefault {
     fn compatible_with(&self, ty: &ColumnType) -> bool {
         matches!(
             (self, ty),
-            (ColumnDefault::Text(_), ColumnType::Text | ColumnType::Date)
-                | (
-                    ColumnDefault::Number(_),
-                    ColumnType::Integer
-                        | ColumnType::BigInt
-                        | ColumnType::Real
-                        | ColumnType::Double
-                        | ColumnType::Numeric { .. },
-                )
-                | (ColumnDefault::Bool(_), ColumnType::Boolean)
+            (
+                ColumnDefault::Text(_),
+                ColumnType::Text | ColumnType::Date | ColumnType::Uuid
+            ) | (
+                ColumnDefault::Number(_),
+                ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
+                    | ColumnType::Numeric { .. },
+            ) | (ColumnDefault::Bool(_), ColumnType::Boolean)
         )
     }
 
@@ -8886,7 +8887,7 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
 fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> bool {
     matches!(
         (default, tag),
-        (ColumnDefault::Text(_), "text" | "date")
+        (ColumnDefault::Text(_), "text" | "date" | "uuid")
             | (
                 ColumnDefault::Number(_),
                 "integer" | "bigint" | "real" | "double" | "numeric"
@@ -10899,6 +10900,21 @@ mod tests {
         // 日時の他型は後続 Issue（#1280 以降）まで未対応のまま。
         assert!(!text.compatible_with(&ColumnType::Timestamp));
         assert!(!column_default_compatible_with_tag(&text, "timestamp"));
+    }
+
+    /// `UUID` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1281）。完全版と軽量版が一致する。
+    #[test]
+    fn uuid_column_accepts_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("00000000-0000-0000-0000-000000000001".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        assert!(text.compatible_with(&ColumnType::Uuid));
+        assert!(!num.compatible_with(&ColumnType::Uuid));
+        assert!(!flag.compatible_with(&ColumnType::Uuid));
+        assert!(column_default_compatible_with_tag(&text, "uuid"));
+        assert!(!column_default_compatible_with_tag(&num, "uuid"));
+        assert!(!column_default_compatible_with_tag(&flag, "uuid"));
     }
 
     /// 上と対の検証: `default` フィールドのデコード自体は成功しても、列の型
