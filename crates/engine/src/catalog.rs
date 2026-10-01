@@ -2643,7 +2643,6 @@ impl ArrayType {
 /// [`column_default_compatible`] で列型の大分類（テキスト系／数値系／真偽値）
 /// との整合のみを検証し、`sql` 層に依存しない自己完結の防御として持つ
 /// （decode 時・Rust API 直接構築時にも効く多層防御）。
-#[derive(Debug, Clone, PartialEq, Eq)]
 ///
 /// `Text` は SQL 文字列リテラルの原文を保持する。`TEXT` 列ではそのまま値になり、
 /// `DATE` 列（Issue #1279）では `row_codec::default_scalar` が列型に従って
@@ -2652,6 +2651,7 @@ impl ArrayType {
 /// `row_codec::default_scalar`・`sql::ddl::add_column_default` の対応表へ同じ形で
 /// 腕を足して拡張する（公開 enum の variant 追加による破壊的変更とカタログ符号化の
 /// 変更を避ける）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnDefault {
     /// 文字列リテラルの原文（`TEXT` 値、または型付き列で列型に従い解釈される）。
     Text(String),
@@ -10883,10 +10883,6 @@ mod tests {
             .expect("enum type must still exist after the rejected drop");
     }
 
-    /// 上と対の検証: `default` フィールドのデコード自体は成功しても、列の型
-    /// タグと大分類が一致しない（`integer` 列に `TEXT` の DEFAULT）場合も
-    /// `validate_schema`（`ColumnDefault::compatible_with`）と同じく拒否する
-    /// （codex-review P1 指摘・Issue #904・PR #1051）。
     /// `DATE` 列は `Text`（文字列リテラル）の既定値だけを大分類として許容する
     /// （Issue #1279）。完全版（`compatible_with`）と軽量版（列タグ）が一致する。
     #[test]
@@ -10905,6 +10901,10 @@ mod tests {
         assert!(!column_default_compatible_with_tag(&text, "timestamp"));
     }
 
+    /// 上と対の検証: `default` フィールドのデコード自体は成功しても、列の型
+    /// タグと大分類が一致しない（`integer` 列に `TEXT` の DEFAULT）場合も
+    /// `validate_schema`（`ColumnDefault::compatible_with`）と同じく拒否する
+    /// （codex-review P1 指摘・Issue #904・PR #1051）。
     #[test]
     fn drop_enum_type_rejects_v5_catalog_value_with_type_incompatible_default() {
         let path = unique_db_path("catalog-drop-enum-v5-bad-default-type");
