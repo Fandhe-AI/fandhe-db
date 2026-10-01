@@ -2173,6 +2173,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Numeric(d) => Ok(Value::Numeric(d)),
             ScalarRef::Bool(b) => Ok(Value::Bool(b)),
             ScalarRef::Date(d) => Ok(Value::Date(d)),
+            ScalarRef::Enum(s) => Ok(Value::Enum(s.to_string())),
             ScalarRef::Uuid(u) => Ok(Value::Uuid(u)),
             ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
             _ => Err(SqlSurfaceError::invalid_input(format!(
@@ -2189,6 +2190,14 @@ pub(crate) fn bind_column_default(
         Err(DefaultBindError::Malformed) => {
             Err(SqlSurfaceError::invalid_text_representation(format!(
                 "column {:?} DEFAULT has an invalid input syntax for its type",
+                column.name
+            )))
+        }
+        // ENUM 語彙外は `bind_enum_literal` と同じ 22P02。語彙の一覧は含めない
+        // （列名のみ。P0）。
+        Err(DefaultBindError::EnumLabel) => {
+            Err(SqlSurfaceError::invalid_text_representation(format!(
+                "column {:?} DEFAULT is not a valid label of its enum type",
                 column.name
             )))
         }

@@ -855,7 +855,7 @@ fn resolve_column_type(
 
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
 /// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
-/// （BYTEA・JSON・ENUM・配列等）は `0A000`、対応型でリテラル種別が
+/// （BYTEA・JSON・配列等）は `0A000`、対応型でリテラル種別が
 /// 合わない場合は `42601`、長さ上限超過は `54000`。
 fn add_column_default(
     column_name: &str,
@@ -871,6 +871,7 @@ fn add_column_default(
         | ColumnType::Numeric { .. } => "numeric",
         ColumnType::Boolean => "boolean",
         ColumnType::Date => "date",
+        ColumnType::Enum(_) => "enum",
         ColumnType::Uuid => "uuid",
         ColumnType::Timestamp => "timestamp",
         _ => {
@@ -885,10 +886,15 @@ fn add_column_default(
         ))
     };
     match literal {
-        // `DATE`／`TIMESTAMP`／`UUID` は文字列リテラルの原文を保持し、解釈は束縛時
-        // （`parser::bind_column_default`）に行う（Issue #1279・#1280・#1281）。
+        // `DATE`／`TIMESTAMP`／`UUID`／`ENUM` は文字列リテラルの原文を保持し、解釈（ENUM は語彙照合）は
+        // 束縛時（`parser::bind_column_default`）に行う（Issue #1279・#1280・#1281・#1282）。
+        // ENUM の型名解決（未登録は 42601）は DEFAULT 評価より先に済んでいる。
         InsertLiteral::String(s)
-            if kind == "text" || kind == "date" || kind == "timestamp" || kind == "uuid" =>
+            if kind == "text"
+                || kind == "date"
+                || kind == "timestamp"
+                || kind == "uuid"
+                || kind == "enum" =>
         {
             if s.len() > MAX_COLUMN_DEFAULT_LEN {
                 return Err(default_too_long(column_name));
