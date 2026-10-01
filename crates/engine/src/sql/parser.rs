@@ -2173,6 +2173,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Numeric(d) => Ok(Value::Numeric(d)),
             ScalarRef::Bool(b) => Ok(Value::Bool(b)),
             ScalarRef::Date(d) => Ok(Value::Date(d)),
+            ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
                 column.name
