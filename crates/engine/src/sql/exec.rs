@@ -4756,6 +4756,8 @@ pub fn execute_upsert_returning(
 
 /// [`execute_upsert_returning`] の本体（明示トランザクション対応版。Issue #1179・#1182）。
 /// `target` が `InTxn` の場合の commit 責務は [`execute_upsert_in`] と同じ。
+/// 呼び出し元: `core::EngineCore::execute_insert_returning_form`
+/// （autocommit、および `execute_in_active_txn` 経由の `InTxn`。Issue #1273）。
 pub(crate) fn execute_upsert_returning_in(
     target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
