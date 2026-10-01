@@ -908,6 +908,25 @@ fn aggregate_type_and_name_errors_use_the_single_table_classification() {
         &format!("SELECT dept.dname, COUNT(*) AS dname {base} GROUP BY dept.dname ORDER BY dname"),
         "42702",
     );
+    // HAVING でもキーの出力名と集計項目名が衝突すれば曖昧（ORDER BY と同じ 42702。Issue #1270）。
+    assert_rejected(
+        &core,
+        &format!(
+            "SELECT dept.dname, COUNT(*) AS dname {base} GROUP BY dept.dname HAVING dname > 0"
+        ),
+        "42702",
+    );
+    // キーの別名と集計項目名の衝突も、HAVING・ORDER BY の双方で曖昧。
+    assert_rejected(
+        &core,
+        &format!("SELECT dept.dname AS k, COUNT(*) AS k {base} GROUP BY dept.dname HAVING k > 0"),
+        "42702",
+    );
+    assert_rejected(
+        &core,
+        &format!("SELECT dept.dname AS k, COUNT(*) AS k {base} GROUP BY dept.dname ORDER BY k"),
+        "42702",
+    );
     // キー別名の重複も曖昧（42702）。
     assert_rejected(
         &core,

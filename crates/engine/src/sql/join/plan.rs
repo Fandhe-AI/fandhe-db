@@ -1005,11 +1005,14 @@ fn build_aggregate_shape(
         }
     }
 
-    // HAVING: 集計項目名のみを参照でき、数値として比較できる結果に限る。
+    // HAVING: 集計項目名のみを参照でき（キー出力名との衝突は 42702）、数値として比較できる結果に限る。
     let mut having: Vec<(usize, BinOp, f64)> = Vec::with_capacity(agg.having.len());
     for h in &agg.having {
         // 同名の集計項目が複数あるときは曖昧として拒否する（先頭一致で黙って解決しない。
         // 単一テーブル集計の `resolve_group_reference` と同じ 42702。Issue #1270）。
+        // GROUP BY キーの出力名（別名・列名）と集計項目名が衝突する場合も曖昧とする
+        // （単一テーブル経路と同じ判定。キー名だけに一致するときは従来どおり集計項目でない扱い）。
+        let key_hit = key_aliases.iter().any(|(_, a)| a == &h.item_name);
         let mut hits = item_names
             .iter()
             .enumerate()
@@ -1017,6 +1020,9 @@ fn build_aggregate_shape(
             .map(|(i, _)| i);
         let idx = match (hits.next(), hits.next()) {
             (Some(_), Some(_)) => {
+                return Err(SqlSurfaceError::ambiguous_column(h.item_name.as_str()))
+            }
+            (Some(_), None) if key_hit => {
                 return Err(SqlSurfaceError::ambiguous_column(h.item_name.as_str()))
             }
             (Some(i), None) => i,
