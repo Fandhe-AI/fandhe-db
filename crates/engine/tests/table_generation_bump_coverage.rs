@@ -182,6 +182,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ドキュメンテーションコメント更新のみ）で行番号が +1 移動したための追随。
     // Issue #1195（制約名衝突の 42710 写像。`CatalogError` のドキュメンテーション
     // コメント更新のみ）でさらに +1 移動したための追随。
+    // Issue #1281（UUID 列の DEFAULT。`catalog.rs` のドキュメンテーションコメント更新のみ）で行番号が +1 移動したための追随。
     ("catalog.rs", 7523),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
