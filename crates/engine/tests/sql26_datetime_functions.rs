@@ -311,14 +311,14 @@ fn datetime_arithmetic_and_field_errors_have_deterministic_wire_codes() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22008");
 
-    // `day + 1.5`（非整数）は `22000`。
+    // `day + 1.5`（非整数）は型不一致の `42804`（Issue #1274）。
     let err = core
         .execute_sql(
             &ctx,
             &format!("SELECT id FROM {TABLE} WHERE day + 1.5 > day AND id = 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 
     // `day + 3000000000`（i32 範囲外）は `22003`。
     let err = core
@@ -778,7 +778,7 @@ fn date_subtraction_with_i32_min_operand_is_accepted_not_rejected_as_out_of_rang
          the result is genuinely outside DATE's representable range"
     );
 
-    // `n` が非整数か `i32` 範囲外の場合の通常の拒否（`22000`／`22003`）は
+    // `n` が非整数か `i32` 範囲外の場合の通常の拒否（`42804`／`22003`）は
     // 従来どおり機能する。
     let err = core
         .execute_sql(
@@ -786,7 +786,7 @@ fn date_subtraction_with_i32_min_operand_is_accepted_not_rejected_as_out_of_rang
             &format!("SELECT id FROM {TABLE} WHERE day - 1.5 < day AND id = 1 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42804");
 
     let err = core
         .execute_sql(

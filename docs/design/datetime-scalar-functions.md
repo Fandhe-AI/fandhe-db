@@ -41,7 +41,7 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | -- | ------ | ------ |
 | `date_part(f, DATE\|TIMESTAMP)` | Scalar（f64） | 未知の field: `22000`（束縛時） |
 | `date_trunc(u, DATE\|TIMESTAMP)` | TIMESTAMP | 未知の unit: `22000`（束縛時）。結果が範囲外（1〜9 年の `decade` 切り捨て等）: `22008` |
-| `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `22000`。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
+| `DATE ± n` / `n + DATE` | DATE | `n` が非整数: `42804`（Issue #1274）。`n` が `i32` 範囲外: `22003`（`NumericOutOfRange`）。結果が `DATE` 受理範囲外: `22008` |
 | `DATE - DATE` | Scalar（日数） | なし（範囲内の差は必ず表現できる） |
 | `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
 | 型付きリテラルの書式違反 / 範囲外 | — | `22007` / `22008`（Issue #1187。`datetime-column.md` と同じ写像） |
