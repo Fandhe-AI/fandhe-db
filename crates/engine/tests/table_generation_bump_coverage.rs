@@ -182,7 +182,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ドキュメンテーションコメント更新のみ）で行番号が +1 移動したための追随。
     // Issue #1195（制約名衝突の 42710 写像。`CatalogError` のドキュメンテーション
     // コメント更新のみ）でさらに +1 移動したための追随。
-    // Issue #1282（ENUM 列の DEFAULT。`catalog.rs` 冒頭側に行が追加）でさらに追随（旧: 7522）。
+    // Issue #1280・#1282（TIMESTAMP・ENUM 列の DEFAULT。`catalog.rs` 冒頭側に行が追加）でさらに追随。
     ("catalog.rs", 7534),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
@@ -236,7 +236,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
     // Issue #1192（ビュー本文の受理形拡大。`catalog.rs` の view 検査追加）で行番号が移動したための追随。
-    // Issue #1282 で追随（旧: 7601）。
+    // Issue #1280・#1282 で追随。
     ("catalog.rs", 7613),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
@@ -282,7 +282,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
     // Issue #1192（ビュー本文の受理形拡大。`catalog.rs` の view 検査追加）で行番号が移動したための追随。
-    // Issue #1282 で追随（旧: 7704）。
+    // Issue #1280・#1282 で追随。
     ("catalog.rs", 7716),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
@@ -333,7 +333,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 是正で `catalog.rs` にドキュメンテーションコメントが追加され、
     // 再度追随。
     // Issue #1192（ビュー本文の受理形拡大。`catalog.rs` の view 検査追加）で行番号が移動したための追随。
-    // Issue #1282 で追随（旧: 7737）。
+    // Issue #1280・#1282 で追随。
     ("catalog.rs", 7749),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`

@@ -911,7 +911,11 @@ fn default_type_check_errors() {
         ("c2 DATE DEFAULT 'abc'", "22007"),
         ("c3 DATE DEFAULT '2020-02-30'", "22008"),
         ("c4 DATE DEFAULT '2020-13-01'", "22008"),
-        ("c5 TIMESTAMP DEFAULT '2020-01-01 00:00:00'", "0A000"),
+        ("c5 TIMESTAMP DEFAULT 1", "42601"),
+        ("c6 TIMESTAMP DEFAULT 'abc'", "22007"),
+        ("c7 TIMESTAMP DEFAULT '2020-01-01'", "22007"),
+        ("c8 TIMESTAMP DEFAULT '2020-02-30 00:00:00'", "22008"),
+        ("c9 TIMESTAMP DEFAULT '2020-01-01 24:00:00'", "22008"),
         (
             "d UUID DEFAULT '00000000-0000-0000-0000-000000000000'",
             "0A000",
@@ -1099,6 +1103,7 @@ fn date_not_null_outcome_is_independent_of_rows_and_tenants() {
         Cell::Date(v) if v == days
     ));
 }
+
 // --- ENUM 列の DEFAULT（Issue #1282。ポインタ: TABLE-5・TABLE-14・TABLE-16） ---
 
 fn mood_core() -> (EngineCore, std::path::PathBuf) {
@@ -1257,4 +1262,137 @@ fn enum_default_column_keeps_type_ddl_dependency_checks() {
     ));
     // 追記された語彙も DEFAULT に使える。
     add_column(&core, "m2 mood DEFAULT 'excited'").expect("new label as DEFAULT");
+}
+
+/// `TIMESTAMP` 列の `DEFAULT`（Issue #1280）。既存行は読み出し時に既定値で補われ、
+/// 各読み出し経路（投影・WHERE・集計）と新規 INSERT の列省略で同じ値になる。
+#[test]
+fn timestamp_default_fills_existing_rows_across_read_paths() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(
+        &core,
+        "ts TIMESTAMP NOT NULL DEFAULT '2020-01-02 03:04:05.5'",
+    )
+    .expect("ADD COLUMN TIMESTAMP");
+    add_column(&core, "tn TIMESTAMP DEFAULT '1999-12-31T23:59:59'")
+        .expect("ADD COLUMN nullable TIMESTAMP");
+
+    let micros = engine::datetime::parse_timestamp("2020-01-02 03:04:05.5").expect("ts");
+    let micros_n = engine::datetime::parse_timestamp("1999-12-31T23:59:59").expect("ts");
+    let q = |col: &str| {
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        )
+    };
+    assert!(matches!(q("ts"), Cell::Timestamp(v) if v == micros));
+    assert!(matches!(q("tn"), Cell::Timestamp(v) if v == micros_n));
+    assert_eq!(
+        count_star(&core, &owner, TABLE),
+        1,
+        "row count must be unchanged"
+    );
+    let filtered = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE ts = '2020-01-02 03:04:05.5' LIMIT 10"),
+        )
+        .expect("WHERE on TIMESTAMP default");
+    assert_eq!(filtered.rows.len(), 1);
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting ts");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, ts) VALUES (3, '[0.3,0.4]', '2021-03-04 05:06:07') USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit ts");
+    let explicit = engine::datetime::parse_timestamp("2021-03-04 05:06:07").expect("ts");
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT ts FROM {TABLE} WHERE id = 2 LIMIT 1")),
+        Cell::Timestamp(v) if v == micros
+    ));
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT ts FROM {TABLE} WHERE id = 3 LIMIT 1")),
+        Cell::Timestamp(v) if v == explicit
+    ));
+}
+
+/// `TIMESTAMP DEFAULT` は再オープン後も既定値として読める。
+#[test]
+fn timestamp_default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "ts TIMESTAMP NOT NULL DEFAULT '2020-01-02 03:04:05'").expect("ADD COLUMN");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let micros = engine::datetime::parse_timestamp("2020-01-02 03:04:05").expect("ts");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT ts FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Timestamp(v) if v == micros
+    ));
+}
+
+/// `TIMESTAMP NOT NULL`（DEFAULT なし）は行の有無にかかわらず同一の `42601`、
+/// `TIMESTAMP NOT NULL DEFAULT` の成功も行の有無に依存しない（テナント境界 P0）。
+#[test]
+fn timestamp_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "t TIMESTAMP NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "t TIMESTAMP NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "t"));
+
+    add_column(&core, "t TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00'")
+        .expect("other tenant rows: ok");
+    let micros = engine::datetime::parse_timestamp("2020-01-01 00:00:00").expect("ts");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &ctx("bob"),
+            &format!("SELECT t FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Timestamp(v) if v == micros
+    ));
+}
+
+/// 揮発性の既定値（`CURRENT_TIMESTAMP`・`now()`）は読み出し時補完と両立しないため拒否する。
+#[test]
+fn timestamp_volatile_default_is_rejected() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    for decl in [
+        "ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ts TIMESTAMP DEFAULT now()",
+    ] {
+        let err = add_column(&core, decl).expect_err(decl);
+        assert_eq!(err.wire_code(), "42601", "{decl}: {err:?}");
+        assert!(!column_exists(&core, &ctx("owner"), TABLE, "ts"), "{decl}");
+    }
 }
