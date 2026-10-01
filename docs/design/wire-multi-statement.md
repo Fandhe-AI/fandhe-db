@@ -120,7 +120,7 @@ commit は高々 1 回という既存の不変条件を維持するため）。
   同じ契約）。
 - **今の時点で原子的に実行できる複数書き込みは、単一行 `INSERT`（`RETURNING` なし）と
   `TRUNCATE` の組み合わせに限られる**（明示トランザクションと同じ許可リスト）。
-  `UPDATE`・`DELETE`・UPSERT・複数行 `INSERT`・DDL・`RETURNING` は `0A000` で暗黙
+  `UPDATE`・`DELETE`・UPSERT・複数行 `INSERT`・DDL・UPSERT の `RETURNING` は `0A000` で暗黙
   トランザクション全体をロールバックする（fail-closed。#1179 で許可リストが広がれば
   自動的に広がる）。
 - **既知の逸脱**: 書き込み済みテーブルの読み取りは `0A000`（明示トランザクションと
@@ -203,7 +203,7 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 - 3 クライアント e2e（`three_client_e2e.rs` 等）への追加は opt-in の任意
   追加に留め、本 Issue では必須にしない。
 - 暗黙トランザクション内での `UPDATE`・`DELETE`・UPSERT・複数行／ファイル形 `INSERT`・
-  `RETURNING`・DDL・COPY、および書き込み済みテーブルの読み取り（#1179 の成果を
+  UPSERT の `RETURNING`（`UPDATE`・`DELETE` の `RETURNING` は #1272 で対応済み）・DDL・COPY、および書き込み済みテーブルの読み取り（#1179 の成果を
   自動的に引き継ぐ）。`BEGIN` より前の書き込みを明示ブロックへ昇格させる PostgreSQL の
   意味論（`INSERT; BEGIN; ...`）、lexer でのコメント・二重引用符識別子・ドル引用・
   E 文字列の受理、拡張クエリプロトコルでの暗黙トランザクション（Sync 単位）も対象外。

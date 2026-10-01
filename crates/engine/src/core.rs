@@ -1413,7 +1413,7 @@ pub enum ParsedSql {
     /// `DELETE`（単一行・`id` 完全一致形／述語形。SQL-18・SQL-19）。
     Delete(crate::sql::allowlist::DeleteStatement),
     /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19。`RETURNING` は
-    /// セッション経路のみ。SQL-21）。
+    /// セッション経路（autocommit・明示/暗黙トランザクション内。Issue #1272）のみ。SQL-21）。
     Update(crate::sql::allowlist::ValidatedUpdateForm),
     /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。トランザクション文脈を
     /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
@@ -3811,12 +3811,12 @@ impl EngineCore {
     ///   （`ParsedSql::Transaction(Rollback)` は上の分岐で既に処理済み）。
     /// - `Active`: 上限検査・`operation_id` 再利用検査（[`crate::sql::
     ///   transaction::SessionTransaction::check_and_register_statement`]）を
-    ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT` 単一行
-    ///   形・`TRUNCATE`）・読み取り系（未書き込みテーブルの `SELECT`／
+    ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT`・
+    ///   `UPDATE`・`DELETE`・`TRUNCATE`。`RETURNING` は UPSERT を除き対応。
+    ///   Issue #1272）・読み取り系（未書き込みテーブルの `SELECT`／
     ///   `Aggregate`／`Scan`）文のみを実行する。対応外の文
-    ///   （複数行/ファイル形/`UPSERT` の `INSERT`・`UPDATE`・`DELETE`・
-    ///   `UPSERT`・COPY・書き込み済みテーブルへの読み取り等）は `0A000` で
-    ///   拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
+    ///   （ファイル形 `INSERT`・UPSERT の `RETURNING`・COPY・書き込み済み
+    ///   テーブルへの読み取り等）は `0A000` で拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
     ///   `Failed` へ遷移させ（[`crate::sql::transaction::SessionTransaction::
     ///   fail`]）、元のエラーをそのまま返す（部分書き込みを残さない
     ///   fail-closed 契約。`docs/design/explicit-transaction.md` 参照）。
@@ -3871,10 +3871,10 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
 
-        // 注意（Issue #1182）: 明示トランザクション内の `RETURNING` は `INSERT`（単一行・
-        // 複数行）と単一行 `DELETE` のみ対応。`UPDATE`・述語形 `DELETE`・UPSERT の
-        // `RETURNING` は未対応として `0A000` で拒否する（fail-closed）。DML 腕を追加・
-        // 変更する際も `RETURNING` を黙って落とさない分岐を必ず持たせること。
+        // 注意（Issue #1182・#1272）: 明示トランザクション内の `RETURNING` は `INSERT`
+        // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）に対応する。UPSERT の
+        // `RETURNING` のみ未対応（#1273。フォーム側が拒否する fail-closed）。DML 腕を
+        // 追加・変更する際も `RETURNING` を黙って落とさない分岐を必ず持たせること。
         match parsed {
             // Issue #1179: 単一行・複数行 `VALUES`・`ON CONFLICT`（UPSERT）を
             // 受理する（`RETURNING` は単一行・複数行のみ。UPSERT との併用は
@@ -3900,16 +3900,6 @@ impl EngineCore {
                 Ok(outcome)
             }
             ParsedSql::Delete(stmt) => {
-                // 述語形 `DELETE ... RETURNING`（Issue #1182）は明示トランザクション内では
-                // 未対応（fail-closed。書き込みトランザクションを開く前に拒否し、
-                // `RETURNING` を黙って落とさない）。単一行形の `RETURNING` は対応済み。
-                if let crate::sql::allowlist::DeleteStatement::Predicate(v) = stmt {
-                    if v.returning().is_some() {
-                        return Err(SqlSurfaceError::transaction_feature_not_supported(
-                            "RETURNING on predicate DELETE is not supported inside an explicit transaction",
-                        ));
-                    }
-                }
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -3927,41 +3917,54 @@ impl EngineCore {
                         };
                         (outcome, v.table_name.as_str())
                     }
-                    crate::sql::allowlist::DeleteStatement::Predicate(v) => (
-                        crate::sql::SqlOutcome::Delete(
-                            self.execute_predicate_delete_form(target, ctx, session, v)?,
-                        ),
-                        v.table_name(),
-                    ),
+                    // Issue #1272: 述語形 `RETURNING` も autocommit と同じフォーム関数へ
+                    // `InTxn` を渡して受理する（`RETURNING` を黙って落とさない）。
+                    crate::sql::allowlist::DeleteStatement::Predicate(v) => {
+                        let outcome = if v.returning().is_some() {
+                            crate::sql::SqlOutcome::Returning(
+                                self.execute_predicate_delete_returning_form(
+                                    target, ctx, session, v,
+                                )?,
+                            )
+                        } else {
+                            crate::sql::SqlOutcome::Delete(
+                                self.execute_predicate_delete_form(target, ctx, session, v)?,
+                            )
+                        };
+                        (outcome, v.table_name())
+                    }
                 };
                 txn.mark_written(ctx.tenant_id(), table);
                 Ok(outcome)
             }
             ParsedSql::Update(stmt) => {
-                // `UPDATE ... RETURNING`（Issue #1182）は明示トランザクション内では未対応
-                // （fail-closed。書き込みトランザクションを開く前に拒否する）。
+                // Issue #1272: `UPDATE ... RETURNING`（単一行・述語形）も autocommit と
+                // 同じフォーム関数へ `InTxn` を渡して受理する（SQL-31・SQL-21）。
                 let has_returning = match stmt {
                     crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.returning.is_some(),
                     crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => {
                         v.returning().is_some()
                     }
                 };
-                if has_returning {
-                    return Err(SqlSurfaceError::transaction_feature_not_supported(
-                        "RETURNING on UPDATE is not supported inside an explicit transaction",
-                    ));
-                }
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
-                let outcome = self.execute_predicate_update_form(target, ctx, session, stmt)?;
+                let outcome = if has_returning {
+                    crate::sql::SqlOutcome::Returning(
+                        self.execute_update_returning_form(target, ctx, session, stmt)?,
+                    )
+                } else {
+                    crate::sql::SqlOutcome::Update(
+                        self.execute_predicate_update_form(target, ctx, session, stmt)?,
+                    )
+                };
                 let table = match stmt {
                     crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.table_name.as_str(),
                     crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => v.table_name(),
                 };
                 txn.mark_written(ctx.tenant_id(), table);
-                Ok(crate::sql::SqlOutcome::Update(outcome))
+                Ok(outcome)
             }
             ParsedSql::Truncate(stmt) => {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
@@ -4029,8 +4032,7 @@ impl EngineCore {
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
-            // 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・
-            // COPY 等、明示トランザクション内での対応外の文（対象外。
+            // ファイル形 INSERT・COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
@@ -8080,7 +8082,8 @@ impl EngineCore {
         })
     }
 
-    /// [`Self::execute_sql_in_session`] の `RETURNING` 付き述語形 `DELETE`
+    /// [`Self::execute_sql_in_session`]（autocommit）と [`Self::execute_in_active_txn`]
+    /// （`InTxn`。Issue #1272）の `RETURNING` 付き述語形 `DELETE`
     /// （Issue #1182・SQL-21）分岐が呼ぶ実行本体。[`Self::
     /// execute_predicate_delete_form`] と同じ手順（スキーマ取得 → 束縛 → 内容照合
     /// ハッシュ計算 → 実行）に `RETURNING` の投影束縛（書き込み前。未知列は
@@ -8349,7 +8352,8 @@ impl EngineCore {
         Ok((predicate, content_hash_value, legacy_hash))
     }
 
-    /// [`Self::execute_sql_in_session`] の `RETURNING` 付き `UPDATE`
+    /// [`Self::execute_sql_in_session`]（autocommit）と [`Self::execute_in_active_txn`]
+    /// （`InTxn`。Issue #1272）の `RETURNING` 付き `UPDATE`
     /// （Issue #1182・SQL-21。単一行 `id` 指定形・述語形の双方）分岐が呼ぶ実行
     /// 本体。[`Self::execute_predicate_update_form`] と同じ手順（スキーマ取得 →
     /// 束縛 → （述語形のみ）内容照合ハッシュ計算 → 実行）に `RETURNING` の投影束縛

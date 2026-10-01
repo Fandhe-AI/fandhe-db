@@ -9,7 +9,8 @@
 //! (3) 同一トランザクション内での `operation_id` 再利用は `25000`、
 //! (4) `INITIALLY DEFERRED` の FK は `COMMIT` 時に検査される（参照アクションの
 //! 連鎖で書き換わった子テーブルを含む）、(5) 自トランザクションの未 commit 変更の
-//! 読み取り（Scan・Aggregate・JOIN・サブクエリ・カーソル）。
+//! 読み取り（Scan・Aggregate・JOIN・サブクエリ・カーソル）、(6) `UPDATE`（単一行・
+//! 述語形）・述語形 `DELETE` の `RETURNING`（Issue #1272）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -231,6 +232,193 @@ fn delete_returning_inside_transaction_returns_the_deleted_row() {
     }
     tx.ok("ROLLBACK");
     assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 3);
+}
+
+// --- UPDATE・述語形 DELETE の RETURNING（Issue #1272） ---------------------------
+
+fn returning_rows(outcome: SqlOutcome) -> (u64, Vec<Vec<String>>) {
+    match outcome {
+        SqlOutcome::Returning(o) => (
+            o.rows_affected,
+            o.result
+                .rows
+                .iter()
+                .map(|r| r.cells.iter().map(|c| format!("{c:?}")).collect())
+                .collect(),
+        ),
+        other => panic!("expected Returning, got {other:?}"),
+    }
+}
+
+fn int(n: i64) -> String {
+    format!("SignedInteger({n})")
+}
+
+fn text(s: &str) -> String {
+    format!("Text({s:?})")
+}
+
+#[test]
+fn update_and_predicate_delete_returning_read_your_writes_and_commit() {
+    let (core, path) = new_core("txn-dml-ret-ryw");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let (n, rows) = returning_rows(
+        tx.ok("UPDATE docs SET n = 21 WHERE id = 2 RETURNING id, n USING OPERATION_ID 'u1'"),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], int(21));
+    assert_eq!(
+        tx_rows(&mut tx, "SELECT n FROM docs WHERE id = 2 LIMIT 10"),
+        vec![vec![int(21)]]
+    );
+
+    let (n, rows) =
+        returning_rows(tx.ok(
+            "UPDATE docs SET tag = 'z' WHERE tag = 'c' RETURNING id, tag USING OPERATION_ID 'u2'",
+        ));
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], text("z"));
+    assert_eq!(
+        tx_rows(&mut tx, "SELECT tag FROM docs WHERE id = 3 LIMIT 10"),
+        vec![vec![text("z")]]
+    );
+
+    let (n, rows) = returning_rows(
+        tx.ok("DELETE FROM docs WHERE tag = 'a' RETURNING id, n USING OPERATION_ID 'd1'"),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], int(10));
+    assert!(tx_rows(&mut tx, "SELECT n FROM docs WHERE id = 1 LIMIT 10").is_empty());
+
+    tx.ok("COMMIT");
+    assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 2);
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 2 LIMIT 10"),
+        vec![vec![int(21)]]
+    );
+}
+
+#[test]
+fn update_and_predicate_delete_returning_rollback_leaves_no_trace() {
+    let (core, path) = new_core("txn-dml-ret-rollback");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE udocs (n BIGINT, u TEXT UNIQUE)");
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c') \
+         USING OPERATION_ID 'seed'",
+    );
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    returning_rows(
+        tx.ok("UPDATE udocs SET u = 'zz' WHERE id = 1 RETURNING id, u USING OPERATION_ID 'u1'"),
+    );
+    returning_rows(
+        tx.ok("UPDATE udocs SET u = 'yy' WHERE n = 20 RETURNING id, u USING OPERATION_ID 'u2'"),
+    );
+    returning_rows(tx.ok("DELETE FROM udocs WHERE n = 30 RETURNING id, u USING OPERATION_ID 'd1'"));
+    tx.ok("ROLLBACK");
+
+    // 行: 元に戻る。
+    assert_eq!(ids(&core, &alice, "udocs").len(), 3);
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT u FROM udocs WHERE id = 1 LIMIT 10"),
+        vec![vec![text("a")]]
+    );
+    // 索引: 新しい値は空き、元の値は残っている。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (7, 70, 'zz') USING OPERATION_ID 'i1'",
+    );
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "INSERT INTO udocs (id, n, u) VALUES (8, 80, 'a') USING OPERATION_ID 'i2'",
+        )
+        .expect_err("original unique entry must remain");
+    assert_eq!(err.wire_code(), "23505");
+    // 台帳: 同じ operation_id を再利用できる。
+    ok(
+        &core,
+        &alice,
+        "UPDATE udocs SET u = 'q1' WHERE id = 2 RETURNING id USING OPERATION_ID 'u2'",
+    );
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM udocs WHERE n = 30 RETURNING id USING OPERATION_ID 'd1'",
+    );
+}
+
+#[test]
+fn update_and_predicate_delete_returning_stay_inside_the_tenant_boundary() {
+    let (core, path) = new_core("txn-dml-ret-tenant");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+    seed(&core, "bob");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let (n, rows) = returning_rows(
+        tx.ok("UPDATE docs SET tag = 'x' WHERE n >= 10 RETURNING id, tag USING OPERATION_ID 'u1'"),
+    );
+    assert_eq!(n, 3);
+    assert_eq!(rows.len(), 3);
+    let (n, rows) = returning_rows(
+        tx.ok("DELETE FROM docs WHERE tag = 'x' RETURNING id, tag USING OPERATION_ID 'd1'"),
+    );
+    assert_eq!(n, 3);
+    assert_eq!(rows.len(), 3);
+    tx.ok("COMMIT");
+
+    assert!(ids(&core, &ctx("alice"), "docs").is_empty());
+    assert_eq!(ids(&core, &ctx("bob"), "docs").len(), 3);
+    assert_eq!(
+        auto_rows(&core, "bob", "SELECT tag FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![text("a")]]
+    );
+}
+
+#[test]
+fn returning_with_unknown_column_fails_the_transaction_closed() {
+    let (core, path) = new_core("txn-dml-ret-failclosed");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let code = tx.err_code(
+        "UPDATE docs SET n = 99 WHERE id = 1 RETURNING no_such_col USING OPERATION_ID 'u1'",
+    );
+    assert_eq!(code, "22000");
+    assert_eq!(tx.status(), TransactionStatus::Failed);
+    tx.ok("ROLLBACK");
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![int(10)]]
+    );
+    ok(
+        &core,
+        &ctx("alice"),
+        "UPDATE docs SET n = 99 WHERE id = 1 USING OPERATION_ID 'u1'",
+    );
 }
 
 // --- operation_id の再利用検査 ---------------------------------------------------
