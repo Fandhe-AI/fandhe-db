@@ -1167,3 +1167,125 @@ fn other_tenants_rows_never_leak_into_multi_way_results_or_aggregates() {
     );
     assert_eq!(rows(&b_result), vec!["15"]);
 }
+
+/// 実行結果を SQLSTATE（成功は "ok"）へ写す。単一テーブル経路と JOIN 経路の分類比較に使う。
+fn outcome_code(core: &EngineCore, sql: &str) -> String {
+    let mut session = SessionState::default();
+    match core.execute_sql_in_session(&ctx("tenant-a"), &mut session, sql) {
+        Ok(_) => "ok".to_string(),
+        Err(e) => e.wire_code().to_string(),
+    }
+}
+
+/// 集計の HAVING／ORDER BY の名前解決（Issue #1270）を、単一テーブル経路（`resolve_group_reference`。
+/// 照合する名前空間は GROUP BY 列の元の列名・SELECT リスト上のキー別名・集計項目名）と JOIN 経路で
+/// 同じ表から検査する。キー（`dname`）の別名の有無 × 集計項目名との衝突の有無 × HAVING／ORDER BY ×
+/// キーが SELECT に出るか、の形ごとに、2 経路が同じ SQLSTATE になること（および期待値）を固定する。
+#[test]
+fn group_reference_resolution_matches_between_single_table_and_join() {
+    let (storage, path) = seeded();
+    let _g = CleanupGuard(path);
+    let core = new_core(storage);
+    // (SELECT リスト〔単一テーブル用: 非修飾／JOIN 用: dept. 修飾〕, 参照名, 期待)
+    // キー列は dept.dname。`ok` は解決成功、`22000` は集計項目でない HAVING 対象。
+    struct Case {
+        select: &'static str,
+        name: &'static str,
+        having: &'static str,
+        order: &'static str,
+    }
+    let cases = [
+        // キー別名なし・集計名がキーの列名と衝突
+        Case {
+            select: "{k}, COUNT(*) AS dname",
+            name: "dname",
+            having: "42702",
+            order: "42702",
+        },
+        // キー別名あり・集計名がキーの元の列名と衝突（別名では衝突しない）
+        Case {
+            select: "{k} AS k, COUNT(*) AS dname",
+            name: "dname",
+            having: "42702",
+            order: "42702",
+        },
+        // キー別名と集計名の衝突
+        Case {
+            select: "{k} AS k, COUNT(*) AS k",
+            name: "k",
+            having: "42702",
+            order: "42702",
+        },
+        // キーが SELECT に出ない場合も、GROUP BY 列名は照合される
+        Case {
+            select: "COUNT(*) AS dname",
+            name: "dname",
+            having: "42702",
+            order: "42702",
+        },
+        // 衝突なし: キー別名／キー列名はキーへ解決（HAVING は集計項目でないため 22000、ORDER BY は成功）
+        Case {
+            select: "{k} AS k, COUNT(*) AS n",
+            name: "k",
+            having: "22000",
+            order: "ok",
+        },
+        Case {
+            select: "{k} AS k, COUNT(*) AS n",
+            name: "dname",
+            having: "22000",
+            order: "ok",
+        },
+        Case {
+            select: "{k}, COUNT(*) AS n",
+            name: "dname",
+            having: "22000",
+            order: "ok",
+        },
+        // 衝突なし: 集計名は集計項目へ解決
+        Case {
+            select: "{k} AS k, COUNT(*) AS n",
+            name: "n",
+            having: "ok",
+            order: "ok",
+        },
+        // どれにも一致しない
+        Case {
+            select: "{k}, COUNT(*) AS n",
+            name: "zz",
+            having: "22000",
+            order: "22000",
+        },
+    ];
+    for c in &cases {
+        for (clause, expected) in [("HAVING", c.having), ("ORDER BY", c.order)] {
+            let tail = |name: &str| {
+                if clause == "HAVING" {
+                    format!("GROUP BY dname HAVING {name} > 0")
+                } else {
+                    format!("GROUP BY dname ORDER BY {name}")
+                }
+            };
+            let single = format!(
+                "SELECT {} FROM dept {}",
+                c.select.replace("{k}", "dname"),
+                tail(c.name)
+            );
+            let join = format!(
+                "SELECT {} FROM dept JOIN emp ON emp.dept_id = dept.id {}",
+                c.select.replace("{k}", "dept.dname"),
+                tail(c.name).replace("GROUP BY dname", "GROUP BY dept.dname")
+            );
+            assert_eq!(
+                outcome_code(&core, &single),
+                expected,
+                "single sql={single:?}"
+            );
+            assert_eq!(outcome_code(&core, &join), expected, "join sql={join:?}");
+        }
+    }
+    // 修飾名の ORDER BY は列参照として解決し、同名の集計項目があっても曖昧にならない（JOIN 経路のみ）。
+    let qualified = "SELECT dept.dname, COUNT(*) AS dname FROM dept \
+                     JOIN emp ON emp.dept_id = dept.id GROUP BY dept.dname ORDER BY dept.dname";
+    assert_eq!(outcome_code(&core, qualified), "ok", "sql={qualified:?}");
+}

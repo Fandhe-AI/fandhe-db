@@ -1005,14 +1005,21 @@ fn build_aggregate_shape(
         }
     }
 
-    // HAVING: 集計項目名のみを参照でき（キー出力名との衝突は 42702）、数値として比較できる結果に限る。
+    // 非修飾名がキーの名前空間（`GROUP BY` 列の元の列名・SELECT リスト上のキー出力名〔別名〕）に
+    // 一致するか。単一テーブル経路の `resolve_group_reference`（キー名＋キー別名）と同じ範囲で照合し、
+    // 集計項目名との衝突を 42702 とするために使う。修飾名は列参照として別経路で解決するため対象外。
+    let key_name_hit = |name: &str| -> bool {
+        key_cols.iter().any(|k| k.name == name) || key_aliases.iter().any(|(_, a)| a == name)
+    };
+
+    // HAVING: 集計項目名のみを参照でき（キーの列名・別名との衝突は 42702）、数値として比較できる結果に限る。
     let mut having: Vec<(usize, BinOp, f64)> = Vec::with_capacity(agg.having.len());
     for h in &agg.having {
         // 同名の集計項目が複数あるときは曖昧として拒否する（先頭一致で黙って解決しない。
         // 単一テーブル集計の `resolve_group_reference` と同じ 42702。Issue #1270）。
         // GROUP BY キーの出力名（別名・列名）と集計項目名が衝突する場合も曖昧とする
         // （単一テーブル経路と同じ判定。キー名だけに一致するときは従来どおり集計項目でない扱い）。
-        let key_hit = key_aliases.iter().any(|(_, a)| a == &h.item_name);
+        let key_hit = key_name_hit(h.item_name.as_str());
         let mut hits = item_names
             .iter()
             .enumerate()
@@ -1074,6 +1081,10 @@ fn build_aggregate_shape(
             _ => return Err(SqlSurfaceError::ambiguous_column(target.name())),
         };
         let ambiguous = || SqlSurfaceError::ambiguous_column(target.name());
+        // キーの元の列名（別名の有無を問わない）と集計項目名の衝突も曖昧（HAVING と同じ範囲）。
+        if target.qualifier().is_none() && item_match.is_some() && key_name_hit(target.name()) {
+            return Err(ambiguous());
+        }
         let resolved = if alias_keys.is_empty() && item_match.is_none() {
             let r = b.scope.resolve(target)?;
             let name = slot_name(
