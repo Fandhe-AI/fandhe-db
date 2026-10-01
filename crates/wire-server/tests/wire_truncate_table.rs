@@ -71,7 +71,7 @@ fn seed_private_rows(core: &EngineCore, tenant: &str, ids: std::ops::Range<u64>)
     }
 }
 
-fn users_file() -> std::path::PathBuf {
+fn users_file() -> common::UserStoreFile {
     write_user_store_file(USERS)
 }
 

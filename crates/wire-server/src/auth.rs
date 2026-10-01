@@ -592,6 +592,75 @@ pub const DEFAULT_PARAMS: Params = argon2id::RECOMMENDED_PARAMS;
 
 #[cfg(test)]
 mod tests {
+    /// テストごとに一意な一時ディレクトリを作り、`Drop`（panic 時の unwinding 含む）で
+    /// 削除するガード（Issue #1303）。従来は pid 単位の共有ディレクトリを作りっぱなしに
+    /// していた。`Deref<Target = Path>` なので `dir.join(..)` をそのまま使える。
+    /// 削除失敗はテストを失敗させず stderr へ出すのみ。
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        /// `label` はパス区切りを含まないテストコード内リテラルを渡すこと。
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            assert!(
+                !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "invalid temp dir label"
+            );
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "wire-server-auth-test-{label}-{}-{}-{seq}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock must not be before UNIX_EPOCH")
+                    .as_nanos()
+            ));
+            // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる。
+            std::fs::create_dir(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for TestDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: failed to remove temp dir {}: {e}",
+                        self.0.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `TestDir` 配下のファイルパス。ディレクトリのガードを保持する。
+    struct TestFile {
+        _dir: TestDir,
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TestFile {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TestFile {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
     use super::*;
 
     /// テスト実行時間短縮のための軽量パラメータ（`m` は許容最小値 `8*p`）。
@@ -715,8 +784,7 @@ mod tests {
     /// ユーザーストアロード時、重複 username を拒否すること。
     #[test]
     fn load_from_file_rejects_duplicate_username() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_dup.txt");
         let phc = dummy_phc();
         std::fs::write(
@@ -735,8 +803,7 @@ mod tests {
     /// `:` を含む username を含む行はフィールド数不一致として拒否されること。
     #[test]
     fn load_from_file_rejects_colon_in_username() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_colon.txt");
         let phc = dummy_phc();
         std::fs::write(&path, format!("ali:ce:tenant-a:{phc}\n")).expect("write fixture");
@@ -748,8 +815,7 @@ mod tests {
     /// 空 tenant_id を含む行を拒否すること。
     #[test]
     fn load_from_file_rejects_empty_tenant_id() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_empty_tenant.txt");
         let phc = dummy_phc();
         std::fs::write(&path, format!("alice::{phc}\n")).expect("write fixture");
@@ -761,8 +827,7 @@ mod tests {
     /// 不正な PHC ハッシュを含む行を拒否すること。
     #[test]
     fn load_from_file_rejects_invalid_phc() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_bad_phc.txt");
         std::fs::write(&path, "alice:tenant-a:not-a-valid-phc\n").expect("write fixture");
         let result = UserStore::load_from_file(&path);
@@ -776,8 +841,7 @@ mod tests {
     /// する。現在は完全一致検証がこの範囲外検出も自動的に兼ねる）。
     #[test]
     fn load_from_file_rejects_oversized_m_cost() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_oversized_m_cost.txt");
         // salt は下限（8 バイト）以上の有効値にし、m_cost の検証だけを分離する。
         std::fs::write(
@@ -796,8 +860,7 @@ mod tests {
     /// （8 バイト）以上の有効値にし、m_cost の検証だけを分離する。
     #[test]
     fn load_from_file_rejects_m_cost_above_reduced_ceiling() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_reduced_m_cost_ceiling.txt");
         let over_ceiling = argon2id::MAX_M_COST_KIB as u64 + 1;
         std::fs::write(
@@ -819,8 +882,7 @@ mod tests {
     /// なるのを起動時に前倒しで検出する）。
     #[test]
     fn load_from_file_rejects_hash_shorter_than_4_bytes() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_short_hash.txt");
         // "AAAAAAAAAAAAAAAAAAAAAA" は 16 バイト（下限 8 バイト以上）の有効な salt。
         // "AA" は 1 バイトにしか decode されない hash フィールド
@@ -843,15 +905,7 @@ mod tests {
     /// 固定して診断（`UserStore::is_empty`）の土台にする。
     #[test]
     fn load_from_file_accepts_empty_file_as_empty_store() {
-        let dir = std::env::temp_dir().join(format!(
-            "wire-server-test-empty-store-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock must not be before UNIX_EPOCH")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("empty-store");
         let path = dir.join("users_empty.txt");
         std::fs::write(&path, "").expect("write empty fixture");
         let store = UserStore::load_from_file(&path).expect("empty file must load as empty store");
@@ -864,8 +918,7 @@ mod tests {
     /// 含む PHC を起動時に拒否すること（短 hash と同じ fail-closed の起動時検証）。
     #[test]
     fn load_from_file_rejects_salt_shorter_than_8_bytes() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_short_salt.txt");
         // "AAAAAAAAAA" は 7 バイト（下限 8 バイト未満）に decode される salt。
         // "aGFzaA" は "hash"（4 バイト、下限以上）に decode される有効な hash
@@ -885,8 +938,7 @@ mod tests {
     /// （上限がないと、認証試行のたびに大きな出力バッファを確保し続ける経路になる）。
     #[test]
     fn load_from_file_rejects_hash_longer_than_max_hash_len() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_oversized_hash.txt");
         // "AAAAAAAAAAAAAAAAAAAAAA" は 16 バイト（下限 8 バイト以上）の有効な salt。
         // 87 文字の 'A' は 65 バイト（上限 64 バイトを 1 バイト超える）に decode
@@ -910,8 +962,7 @@ mod tests {
     /// たびに大きな `Vec` を確保し続ける）。
     #[test]
     fn load_from_file_rejects_salt_longer_than_max_salt_len() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_oversized_salt.txt");
         // 87 文字の 'A' は 65 バイト（上限 64 バイトを 1 バイト超える）に decode
         // される salt フィールド。"aGFzaA" は "hash"（4 バイト、下限以上上限以下）に
@@ -936,8 +987,7 @@ mod tests {
     /// （タイミング側チャネル対策）。
     #[test]
     fn load_from_file_rejects_in_range_params_that_are_not_canonical() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_noncanonical_params.txt");
         std::fs::write(
             &path,
@@ -953,8 +1003,7 @@ mod tests {
     /// こと（拒否側だけでなく許容側の境界も明示する）。
     #[test]
     fn load_from_file_accepts_params_equal_to_recommended_params() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_canonical_accept.txt");
         let phc = dummy_phc();
         std::fs::write(&path, format!("alice:tenant-a:{phc}\n")).expect("write fixture");
@@ -974,8 +1023,7 @@ mod tests {
     /// 確認する。
     #[test]
     fn load_from_file_enforces_same_kdf_params_as_dummy_phc() {
-        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = TestDir::new("users");
         let path = dir.join("users_matches_dummy_params.txt");
         let salt = b"0123456789abcdef";
         let real_phc = argon2id::encode_phc(b"correct-horse", salt, &argon2id::RECOMMENDED_PARAMS)
@@ -996,20 +1044,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    fn write_users_file_with_content(name_hint: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "wire-server-test-scram-{}-{}-{}",
-            std::process::id(),
-            name_hint,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+    fn write_users_file_with_content(name_hint: &str, content: &str) -> TestFile {
+        let dir = TestDir::new(name_hint);
         let path = dir.join("users.txt");
         std::fs::write(&path, content).expect("write fixture");
-        path
+        TestFile { _dir: dir, path }
     }
 
     fn sample_scram_line(username: &str, tenant_id: &str, password: &[u8]) -> String {

@@ -5,6 +5,9 @@
 //! （`tests/wire_auth.rs` と同じ流儀。結合テスト間でモジュールを共有しないため
 //! ヘルパーはこのファイル内に閉じる）。
 
+#[path = "common/fixture_guard.rs"]
+mod fixture_guard;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +26,7 @@ const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 /// プロセス内単調カウンタ（`wire_auth.rs` と同一クラスの競合対策。Issue #172）。
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
+fn write_user_store_file(records: &[(&str, &str, &str)]) -> fixture_guard::UserStoreFile {
     let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "wire-server-wire-limits-test-{}-{}-{}",
@@ -47,7 +50,7 @@ fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
         content.push_str(&format!("{username}:{tenant_id}:{phc}\n"));
     }
     std::fs::write(&path, content).expect("write user store fixture");
-    path
+    fixture_guard::UserStoreFile::new(dir, path)
 }
 
 /// `wire_server::server::accept_loop_with_limiter` をサーバースレッドで起動し、

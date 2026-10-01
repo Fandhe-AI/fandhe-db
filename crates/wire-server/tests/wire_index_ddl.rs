@@ -83,7 +83,7 @@ fn spawn_with_ddl_allowed_users(
     addr
 }
 
-fn users() -> std::path::PathBuf {
+fn users() -> common::UserStoreFile {
     write_user_store_file(&[
         ("alice", "tenant-a", "pw-alice"),
         ("bob", "tenant-b", "pw-bob"),
