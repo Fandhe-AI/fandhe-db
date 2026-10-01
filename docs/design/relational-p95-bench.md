@@ -18,6 +18,8 @@ SQL 表層の関係演算経路を通るが、p95 を測る回帰ベンチが無
 | -------- | --- | -------------- | ---- |
 | predicate | `pred_eq`（参照） | `WHERE lang = 'l0' ORDER BY embedding <=> '<vec>' LIMIT 10` | 100,000 行 x 768 次元 |
 | predicate | `pred_or2` | `WHERE lang = 'l0' OR lang = 'l1' ...`（OR 2 項） | 同上 |
+| predicate | `pred_in2` | `WHERE lang IN ('l0','l1') ...`（IN 2 要素。診断用。Issue #1275） | 同上 |
+| predicate | `pred_or_same` | `WHERE lang = 'l0' OR lang = 'l0' ...`（同一リテラルの OR。診断用。Issue #1275） | 同上 |
 | predicate | `pred_in8` | `WHERE lang IN ('l0',...,'l7') ...`（IN 8 要素） | 同上 |
 | order_by | `order_single` | `SELECT id, qty ... ORDER BY qty LIMIT 100` | 100,000 行 |
 | order_by | `order_multi` | `ORDER BY lang ASC, qty DESC LIMIT 100` | 同上 |
@@ -98,4 +100,93 @@ BENCH_RELATIONAL_P95_ROWS=5000 make bench-relational-p95
 - `OFFSET`・`DISTINCT`・集計文の `ORDER BY` 形の p95
 - NoSQL 表層の同等計測
 - ハッシュ結合での二次索引の活用
-- `pred_or2` の遅さの原因調査
+- `pred_or2` の遅さの原因調査 → 実施済み（Issue #1275。下記「`pred_or2` の遅さの原因調査」）。改善の実装は別 Issue
+
+## `pred_or2` の遅さの原因調査
+
+Issue #1275。SQL-24・SQL-2・RLS-10 ポインタ。production コード（`crates/engine/src/`）は変更せず、
+診断用 arm 2 本と経路の自己検査をベンチへ足して原因を切り分けた。
+
+### 方法
+
+- 選択率と経路を直交させる診断用 arm を追加した。`pred_in2`（`IN` 2 要素。`pred_or2` と同じ選択率 12.5% で索引経路）と
+  `pred_or_same`（同一リテラルの OR。`pred_eq` と同じ選択率 6.25% で OR 群の経路）である
+- 計測前に全 arm を 1 回ずつ実行してキャッシュを温め、arm ごとに `EXPLAIN` の `scalar_plan:` トークンと
+  カウンタ差分（`scalar_index_cache_stats`・`sql_arena_cache_stats`）を取って期待と照合する。
+  期待と異なれば非 0 で終了する（出力は arm ラベル・トークン・カウンタ差分だけ）
+- 再現: `BENCH_RELATIONAL_P95_GROUP=predicate make bench-relational-p95`（縮小は `BENCH_RELATIONAL_P95_ROWS=20000` を併用）
+
+### 経路の確認
+
+| arm | `scalar_plan` | `index_scans` | `index_trusted_mask_scans` | `full_rebuild_copies` |
+| --- | ------------- | ------------- | -------------------------- | --------------------- |
+| `pred_eq` | `index_equality` | +1 | +1 | +0 |
+| `pred_in2` | `index_in_list` | +1 | +1 | +0 |
+| `pred_in8` | `index_in_list` | +1 | +1 | +0 |
+| `pred_or2` | `plain_scan` | +0 | +0 | +1 |
+| `pred_or_same` | `plain_scan` | +0 | +0 | +1 |
+
+差分はキャッシュを温めた後の 1 回の実行あたり。縮小規模（2 万行）と本規模（10 万行）で同じ結果だった。
+`pred_in8`（選択率 50%）も索引経路のままで、選択度による切替は起きない。
+
+### 実測
+
+本規模（100,000 行 x 768 次元・N=5）。単位は ms。round 行の p95 を並べた。共有環境（10 論理 CPU・loadavg 約 9〜10。
+専有環境の申告なし）のため参考値で、ラウンド間のばらつきが大きい。`perf_event_paranoid` は 4 で、
+非 root の `perf record` は使えなかったため、経路の根拠は上記のカウンタと A/B arm とした。
+
+| arm | round1 | round2 | round3 | round4 | round5 | min-of-N | median | ラン間幅 |
+| --- | ------ | ------ | ------ | ------ | ------ | -------- | ------ | -------- |
+| `pred_eq` | - | - | - | - | - | 0.637 | 0.788 | 926.0% |
+| `pred_in2` | 1.588 | 1.561 | 2.227 | 3.133 | 5.251 | 1.561 | 2.227 | 236.5% |
+| `pred_in8` | 6.651 | 7.280 | 7.926 | 9.339 | 6.883 | 6.651 | 7.280 | 40.4% |
+| `pred_or_same` | 13.360 | 12.444 | 14.300 | 26.309 | 14.194 | 12.444 | 14.194 | 111.4% |
+| `pred_or2` | 34.618 | 51.872 | 69.247 | 119.371 | 100.254 | 34.618 | 69.247 | 244.8% |
+
+縮小規模（2 万行）でも同じ順序だった（min-of-N は `pred_eq` 0.166・`pred_in2` 0.306・`pred_in8` 1.030・
+`pred_or_same` 1.168・`pred_or2` 1.779）。`pred_eq` の round 行は輪番で複数回現れるため、表では要約値だけを載せた。
+
+### 分解
+
+- 同じ選択率での経路の差: `pred_or2` と `pred_in2`（12.5%）は 34.6 ms と 1.56 ms で約 22 倍、
+  `pred_or_same` と `pred_eq`（6.25%）は 12.4 ms と 0.64 ms で約 19 倍。選択率が同じでも OR 群の経路だけで
+  1 桁以上遅く、遅さの主因は述語の意味や選択率ではなく経路である
+- 索引経路の一致 1 行あたりの費用: `(pred_in8 - pred_in2) / 37,500 行` は約 0.14 us。
+  OR 群の経路は `(pred_or2 - pred_or_same) / 6,250 行` が約 3.5 us で、約 25 倍になる
+- `PlainScan` を「全件評価の固定費 F ＋ 一致 1 行あたりの費用 c」の線形モデルに当てはめると F が負になった
+  （`2 x pred_or_same - pred_or2` が約 -9.7 ms）。費用は選択率に対して線形ではなく超線形で、
+  この環境のノイズ（ラン間幅 100% 超）では F と c の比率を分離できない。固定費と複製費の内訳は
+  専有環境の再計測か、段別のプロファイル（`filtered-distance-stage-profile.md` 参照）で確かめる必要がある
+
+### 原因
+
+`classify_scalar_plan` は OR 群（`or_filters` が空でない）を一律に `PlainScan` へ縮退させる
+（`sql/scalar_plan.rs`。索引経路が OR 群の和集合に未対応のため）。このため `pred_or2` は次の 2 点で
+`IN`・等価述語と異なる経路を通る。
+
+1. 索引候補もスロットマスクも使わず、可視行の全件に対して行ごとの SCALAR 評価（マスク付きデコードと OR 分岐ごとの照合）を行う
+2. 一致行の embedding を owned の `VectorArena` へ複製してから距離を計算する
+   （`full_rebuild_copies` が +1。約 12,500 行 x 768 次元 x 4 B で約 38 MB）。索引経路はスナップショットの
+   `VectorArena` を借用したまま探索するため複製しない
+
+根拠は経路の確認の表（カウンタ・`EXPLAIN`）と、選択率を揃えた A/B arm の差である。
+OR の各分岐は束縛段で再帰的に束縛される（`parser.rs` の `bind_where_predicates_recursive`）。
+1 と 2 のどちらがどれだけ占めるかは上記のとおり未分離である。
+
+### 判断
+
+SQL-24 の数値基準（10 万本 x 768 次元で p95 100 ms 以下）に対し、`pred_or2` の min-of-N は今回 34.6 ms で
+基準内である（前回記録は 27.2 ms）。ただしラウンド別の p95 は共有環境の負荷下で最大 119 ms まで上がった
+ため、閾値判定は専有環境の再測定（オーナー作業）で確定する。現時点の結論は
+「基準は共有環境の min-of-N では満たす。OR 群の経路は索引経路より約 20 倍遅く、改善は任意の最適化」とする。
+
+### 改善案（本 Issue では実装しない）
+
+| 案 | 内容 | 効果の範囲 | 見積・リスク |
+| -- | ---- | ---------- | ------------ |
+| A | 束縛時に、全分岐が同じ TEXT／ENUM 列の等価（または IN）1 件だけの OR 群を、1 本の `IN` フィルタへ書き換える（AND の連言に足すだけで意味は同じ。NULL は両形とも不一致） | `pred_or2` 型（同じ列の OR） | `EXPLAIN` の `scalar_plan` が `plain_scan` から `index_in_list` に変わる。`HINT ORDER` の経路・NoSQL の `or`・型付き等価の扱いを決める必要があり、2h を超える見込み |
+| B | `ScalarIndex::resolve_candidates` に OR 群の分岐ごとの候補の和集合を足し、`ScalarPlan` に新しい variant を足す | 異なる列にまたがる OR、Issue #1165 のチャンク化した `IN (SELECT ...)` | 分類・`EXPLAIN` トークン・信頼マスクの不変条件の再証明が要り、規模が大きい |
+| C | `PlainScan` でも hybrid でない距離順位付けは、複製しないマスク経路（`filter_cached_rls_rows_subset` と同じ形）へ載せる | 残余述語を持つすべての `PlainScan` クエリ（一致 1 行あたりの複製費） | 全件の SCALAR 評価は残る。中程度 |
+
+A と B は全件評価と複製の両方を、C は複製だけを削る。いずれも 2h に収まらない見込みのため、
+別 Issue として提案する（起票はオーナーの承認待ち）。着手前に、専有環境で F と c の内訳を再測定して案の優先度を決める。

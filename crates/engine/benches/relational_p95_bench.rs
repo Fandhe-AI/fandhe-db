@@ -231,8 +231,8 @@ fn expected_predicate_ranked(
 /// arm が許可する `lang` 集合の大きさ（`l0`..`l{n-1}`）。
 fn predicate_lang_count(arm: &str) -> u64 {
     match arm {
-        "pred_eq" => 1,
-        "pred_or2" => 2,
+        "pred_eq" | "pred_or_same" => 1,
+        "pred_or2" | "pred_in2" => 2,
         _ => 8,
     }
 }
@@ -266,6 +266,73 @@ fn precheck_predicate(
     let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
     if !topk_matches(&ids, ranked, PRED_LIMIT) {
         fail_closed(format!("{arm}: result is not the expected top rows"));
+    }
+}
+
+/// arm ごとに期待する実行経路（Issue #1275）。`(EXPLAIN の scalar_plan トークン, 索引経路か)`。
+/// 索引経路は信頼マスク走査を 1 回通り `full_rebuild_copies` を増やさず、OR 群（PlainScan）は
+/// 可視行全件を評価して `full_rebuild_copies` を 1 回増やす。期待と異なれば計測を始めず終了する。
+fn expected_path(arm: &str) -> (&'static str, bool) {
+    match arm {
+        "pred_eq" => ("index_equality", true),
+        "pred_in2" | "pred_in8" => ("index_in_list", true),
+        _ => ("plain_scan", false),
+    }
+}
+
+/// `EXPLAIN` の `scalar_plan:` 行から経路トークン（先頭語）を取り出す。
+fn explain_scalar_plan_token(core: &EngineCore, tenant_ctx: &PolicyContext, sql: &str) -> String {
+    let mut session = SessionState::default();
+    match core.execute_sql_in_session(tenant_ctx, &mut session, &format!("EXPLAIN {sql}")) {
+        Ok(SqlOutcome::Explain(result)) => result
+            .rows
+            .iter()
+            .filter_map(|r| match r.cells.first() {
+                Some(Cell::Text(t)) => t.strip_prefix("scalar_plan: "),
+                _ => None,
+            })
+            .find_map(|t| t.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| fail_closed("explain: no scalar_plan line")),
+        _ => fail_closed("explain: unexpected outcome"),
+    }
+}
+
+/// 述語 arm の経路自己検査: EXPLAIN トークンとカウンタ差分が `expected_path` と一致することを確かめ、
+/// 出力は arm ラベル・トークン・カウンタ差分だけにする（テナント ID・行の値・SQL 全文は出さない）。
+/// 呼び出し前に全 arm を 1 回ずつ実行してキャッシュを温めておくこと（初回は redb 走査経路を通るため）。
+fn check_predicate_path(core: &EngineCore, tenant_ctx: &PolicyContext, label: &str, sql: &str) {
+    let (token_expected, indexed) = expected_path(label);
+    let token = explain_scalar_plan_token(core, tenant_ctx, sql);
+    let (i0, c0) = (
+        core.scalar_index_cache_stats(),
+        core.sql_arena_cache_stats(),
+    );
+    let _ = exec(core, tenant_ctx, sql);
+    let (i1, c1) = (
+        core.scalar_index_cache_stats(),
+        core.sql_arena_cache_stats(),
+    );
+    let d_trusted = i1
+        .index_trusted_mask_scans
+        .saturating_sub(i0.index_trusted_mask_scans);
+    let d_scans = i1.index_scans.saturating_sub(i0.index_scans);
+    let d_plain = i1
+        .plain_scan_fallbacks
+        .saturating_sub(i0.plain_scan_fallbacks);
+    let d_copy = c1
+        .full_rebuild_copies
+        .saturating_sub(c0.full_rebuild_copies);
+    println!(
+        "path arm={label} scalar_plan={token} d_index_scans={d_scans} d_trusted_mask_scans={d_trusted} d_plain_scan_fallbacks={d_plain} d_full_rebuild_copies={d_copy}"
+    );
+    let ok = token == token_expected
+        && if indexed {
+            d_trusted == 1 && d_copy == 0
+        } else {
+            d_scans == 0 && d_copy == 1
+        };
+    if !ok {
+        fail_closed(format!("{label}: unexpected execution path"));
     }
 }
 
@@ -493,6 +560,13 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
                     "{label}: sentinel rows do not dominate the top rows"
                 ));
             }
+        }
+        // 経路の自己検査（Issue #1275）。全 arm を 1 回ずつ実行してキャッシュを温めてから測る。
+        for (_, sql) in &arms {
+            let _ = exec(&core, &ctx_a, sql);
+        }
+        for (label, sql) in &arms {
+            check_predicate_path(&core, &ctx_a, label, sql);
         }
         measure_group(
             "predicate",
