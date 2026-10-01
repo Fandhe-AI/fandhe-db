@@ -85,7 +85,7 @@ v11 の上位集合。`uniq:`／`checks:` セクションは 0 件を許し（�
   参照先側の書き込み検査・`required_key_index_names_in_txn`（§ 索引衛生）の
   いずれもが fail-open になる）
 
-### F5. エラー契約（ERR-6 の既存行だけを使い、新しい wire_code は作らない）
+### F5. エラー契約（新しい `wire_code` は追加しない。ERR-6 ポインタ）
 
 | 条件 | `CatalogError` | `wire_code` |
 | --- | --- | --- |

@@ -129,7 +129,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 | `n` の範囲外 | `22000` | `validate_search_limit` を再利用 |
 | 同時カーソル数の上限超過（`MAX_CURSORS_PER_SESSION`＝16 本目の次） | `54000` | 内側の `SELECT` を実行する**前**に判定する |
 | セッション内でカーソルが保持する確定行の合計バイト数の上限超過（`MAX_CURSOR_BYTES_PER_SESSION`＝16 MiB） | `54000` | `wire-server::limits::MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION` と同じ根拠 |
-| カーソル名の重複 | `22000` | spec 未定義。PostgreSQL の `42P03` は ERR-6 の管轄表に無く独自コードの新設は禁止のため、「構文上は受理された値が不正」という `22000` の判定境界に寄せた（実装既定値。確定はオーナー判断待ち） |
+| カーソル名の重複 | `22000` | PostgreSQL は `42P03` を返すが、本リポは既存の `22000`（`InvalidInput`）へ写像した（実装既定値。ERR-6 ポインタ） |
 | ベクトル順位付けの `SELECT`・規範形以外の構文 | `42601` | |
 | 同じトランザクションで書き込み済みのテーブルに対する `DECLARE` | 成功（未 commit 変更を反映） | Issue #1179 で `0A000` から変更 |
 | `Failed` 中の `DECLARE`／`FETCH`／`CLOSE` | `25P02` | 既存の仕組み |
@@ -208,8 +208,6 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 
 ## 対象外・申し送り
 
-- 重複カーソル名の `wire_code`（PostgreSQL の `42P03` は ERR-6 の表に無い）を
-  spec 側でどう扱うか → オーナー判断・spec リポの課題として申し送り。
 - `SCROLL`／`WITH HOLD`／`BINARY`／`FETCH ALL`／`BACKWARD`／`CLOSE ALL`／
   `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。

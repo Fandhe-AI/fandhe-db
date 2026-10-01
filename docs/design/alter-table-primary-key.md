@@ -55,7 +55,7 @@ PRIMARY KEY はカタログに名前を永続化しない。`catalog::primary_ke
   NOT NULL を残す）。
 - 永続一意索引を無効化し、キー索引の衛生処理と世代 bump を同じ txn で行う。
 
-## エラー契約（ERR-6 の既存行のみ・新しい `wire_code` なし）
+## エラー契約（新しい `wire_code` は追加しない。ERR-6 ポインタ）
 
 | 条件 | wire_code |
 | --- | --- |
@@ -78,6 +78,6 @@ PRIMARY KEY はカタログに名前を永続化しない。`catalog::primary_ke
 
 ## 申し送り（Issue は起票しない）
 
-- 主キーの重複宣言は PostgreSQL では `42P16` だが ERR-6 に無いため `42601` とした。
+- 主キーの重複宣言は PostgreSQL では `42P16` だが、本リポは既存の `42601` へ写像した（ERR-6 ポインタ）。
 - 主キー削除後に NOT NULL を外す手段（`ALTER COLUMN ... DROP NOT NULL`）は未対応。
 - `ADD CONSTRAINT <name> PRIMARY KEY`・NoSQL（HTTP）表層からの追加・削除は未対応。
