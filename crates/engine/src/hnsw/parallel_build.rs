@@ -1275,25 +1275,84 @@ mod tests {
         assert!(profile.total >= profile.sequential_prefix);
     }
 
+    /// `tests/hnsw.rs::assert_degree_and_wellformed_invariants` と同じ発想の
+    /// 決定的不変条件（次数上限・自己ループ／重複なし・隣接先の層所属）の検査。
+    /// 並列構築は挿入順が非決定的でグラフ形状が実行ごとに変わるが、これらは
+    /// スケジューリングに依らず常に成立する契約のため確率的な Recall 比較とは
+    /// 分けて検査する（Issue #1268。`src` 内部テストは独立に複製する流儀）。
+    fn assert_degree_and_wellformed_invariants(index: &PubHnswIndex, rows: usize) {
+        assert_eq!(index.len(), rows);
+        for node in 0..rows as u32 {
+            let level = index.level_of(node).unwrap();
+            for l in 0..=level {
+                let neighbors = index.neighbors(l, node).unwrap();
+                assert!(
+                    neighbors.len() <= index.max_degree(l),
+                    "node {node} layer {l} exceeds degree limit"
+                );
+                assert!(!neighbors.contains(&node), "node {node} has a self loop");
+                let mut sorted = neighbors.to_vec();
+                sorted.sort_unstable(); // 一意性検証のみに使う（順序規約とは無関係）
+                sorted.dedup();
+                assert_eq!(
+                    sorted.len(),
+                    neighbors.len(),
+                    "node {node} layer {l} has duplicate neighbors"
+                );
+                for &n in neighbors {
+                    assert!((n as usize) < rows);
+                    assert!(
+                        index.level_of(n).unwrap() >= l,
+                        "neighbor {n} of node {node} does not reach layer {l}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 各層でエントリポイントから全メンバへ到達できること
+    /// （`freeze` 経路の `repair_reachability` が保証する契約）を検査する。
+    fn assert_fully_connected_from_entry(index: &PubHnswIndex, rows: usize) {
+        use std::collections::{HashSet, VecDeque};
+        let entry = index.entry_point().expect("non-empty index has an entry");
+        let max_level = index.max_level().expect("non-empty index has a level");
+        for level in 0..=max_level {
+            let members: HashSet<u32> = (0..rows as u32)
+                .filter(|&n| index.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .collect();
+            let mut visited = HashSet::new();
+            let mut queue = VecDeque::new();
+            visited.insert(entry);
+            queue.push_back(entry);
+            while let Some(node) = queue.pop_front() {
+                if let Some(neighbors) = index.neighbors(level, node) {
+                    for &n in neighbors {
+                        if visited.insert(n) {
+                            queue.push_back(n);
+                        }
+                    }
+                }
+            }
+            let missing: Vec<u32> = members.difference(&visited).copied().collect();
+            assert!(
+                missing.is_empty(),
+                "level {level} not fully connected from entry; unreachable: {missing:?}"
+            );
+        }
+    }
+
     /// 並列経路（`threads >= 2` かつ `n > SEQUENTIAL_PREFIX_NODES`）では、
     /// ワーカー統計の内訳（挿入件数の合計・ロック統計の整合・段別壁時間の
-    /// 内訳）が非 vacuous であり、既定エンジン対照 Recall@10 が逐次構築と
-    /// 同水準（`tests/hnsw_search.rs::parallel_build_recall_at_10_matches_
-    /// sequential_build_within_margin` と同じ `-0.02` マージン）であることを
-    /// 確認する（レビュー指摘 P1-B）。
+    /// 内訳）が非 vacuous であり、スケジューリングに依らず成立する決定的
+    /// 不変条件（全ノード収録・次数上限・全層のエントリ到達性）が保たれる
+    /// ことを確認する（レビュー指摘 P1-B）。ロック競合・修復経路を強めに
+    /// 通すため `m=8`・`ef_construction=40` の軽い構築条件を維持する。
     ///
-    /// クエリ集合は 1000 件（Issue #1083・計測条件の是正。`docs/design/
-    /// hnsw-parallel-build.md` の「決定性契約」のとおり `threads >= 2` の
-    /// 並列構築は挿入順が非決定的で、実スレッドスケジューリングにより
-    /// `observed` のグラフ形状が実行のたびに変わり得る。100 件では
-    /// クエリ標本のノイズにより Recall@10 の測定値自体が run ごとに
-    /// 数 % 揺れ、負荷下では稀に `-0.02` マージンを超えて間欠失敗して
-    /// いた（負荷再現・taskset 2 コア制限下 40 試行 × ef 2 種で失敗率
-    /// 約 1.6%、最大差分 0.04）。クエリを 1000 件に増やすと同条件・
-    /// 同試行回数で失敗 0・最大差分 0.0065 まで縮小した。マージン
-    /// `-0.02` 自体・`m`／`ef_construction` 等の構築パラメータは変更
-    /// していない——推定量のノイズを減らす計測条件の是正であり、閾値の
-    /// 弱体化ではない）。
+    /// Recall 比較は Issue #1268 で
+    /// `build_with_threads_observed_parallel_path_recall_matches_sequential_within_margin`
+    /// へ分離した。この条件では Recall@10 が 0.72 前後の非飽和帯にあり、
+    /// 並列構築のグラフ間ばらつき自体が判定マージンに匹敵して間欠失敗
+    /// するため、確率的な比較と決定的な検査を 1 テストに同居させない。
     #[test]
     fn build_with_threads_observed_parallel_path_reports_consistent_worker_stats() {
         let dim = 16usize;
@@ -1308,7 +1367,6 @@ mod tests {
         let seed = 0x1122_3344_5566;
         let threads = 4usize;
 
-        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
         let (observed, profile) =
             PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
                 .unwrap();
@@ -1342,14 +1400,71 @@ mod tests {
                     + profile.repair_reachability
         );
 
+        assert_degree_and_wellformed_invariants(&observed, rows);
+        assert_fully_connected_from_entry(&observed, rows);
+    }
+
+    /// 並列構築の Recall@10 が逐次構築と同水準（`tests/hnsw_search.rs::
+    /// parallel_build_recall_at_10_matches_sequential_build_within_margin`
+    /// と同じ `-0.02` マージン、ef ∈ {64, 256}）であることを確認する
+    /// （Issue #1268。CORE-9・CORE-10 ポインタ）。並列経路を通ったことも
+    /// ワーカー統計で独立に確認する。
+    ///
+    /// `threads >= 2` の並列構築は挿入順が非決定的で、グラフ形状が実行ごとに
+    /// 変わる。旧条件（`m=8`・`ef_construction=40`）は Recall@10 が 0.72 前後の
+    /// 非飽和帯で、このグラフ間ばらつき自体がマージンを超え得た（CI 実測:
+    /// ef=64 で observed 0.7015 / sequential 0.725）。クエリ数を増やしても減る
+    /// のは推定量ノイズのみでグラフ間分散は残るため、(1) 構築条件を
+    /// `HnswParams::default()` へ変更し（ef=64 で 0.89 前後・ef=256 で 0.999）、
+    /// (2) 並列構築を 4 回行い Recall の平均を逐次構築と比較する。単発比較では
+    /// 負荷下の外れ値で 200 回中 3 回失敗したが、4 回平均で外れ値が希釈され
+    /// 200 回中 0 失敗（最大差分 0.0099）になった。マージン `-0.02`・ef 集合・
+    /// クエリ 1000 件は不変であり、閾値の弱体化ではない。決定的不変条件は
+    /// `build_with_threads_observed_parallel_path_reports_consistent_worker_stats`
+    /// が検査する。
+    #[test]
+    fn build_with_threads_observed_parallel_path_recall_matches_sequential_within_margin() {
+        // 複数ビルド平均の構築回数。並列構築 1 回あたりの Recall はスケジューリング
+        // 由来のグラフ形状ばらつきで揺れ、負荷下では片側へ外れ値が出るため、
+        // 外れ値を平均で希釈する。
+        const PARALLEL_BUILDS: usize = 4;
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let clusters = 20usize;
+        let vectors = gen_clustered_corpus(0xB0B0_1234, dim, rows, clusters);
+        let params = HnswParams::default();
+        let seed = 0x1122_3344_5566;
+        let threads = 4usize;
+        let efs = [64usize, 256];
+
+        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
         let queries = gen_queries(0x51DE_0007, dim, clusters, 1000);
-        for ef in [64usize, 256] {
-            let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
-            let obs_recall = recall_at_10(&observed, &vectors, dim, rows, ef, &queries);
+
+        let mut obs_sum = [0.0f64; 2];
+        for _ in 0..PARALLEL_BUILDS {
+            let (observed, profile) = PubHnswIndex::build_with_threads_observed(
+                params, dim as u32, &vectors, seed, threads,
+            )
+            .unwrap();
+            // 並列経路を通ったこと（縮退経路でないこと）の確認。
+            assert_eq!(profile.workers.len(), threads);
+            let total_inserted: u64 = profile.workers.iter().map(|w| w.inserted_nodes).sum();
+            assert_eq!(
+                total_inserted,
+                (rows - super::super::SEQUENTIAL_PREFIX_NODES) as u64
+            );
+            for (i, ef) in efs.iter().enumerate() {
+                obs_sum[i] += recall_at_10(&observed, &vectors, dim, rows, *ef, &queries);
+            }
+        }
+
+        for (i, ef) in efs.iter().enumerate() {
+            let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, *ef, &queries);
+            let obs_recall = obs_sum[i] / PARALLEL_BUILDS as f64;
             assert!(
                 obs_recall >= seq_recall - 0.02,
-                "ef={ef} observed Recall@10={obs_recall} must be within 0.02 of \
-                 sequential Recall@10={seq_recall}"
+                "ef={ef} mean observed Recall@10={obs_recall} over {PARALLEL_BUILDS} builds \
+                 must be within 0.02 of sequential Recall@10={seq_recall}"
             );
         }
     }

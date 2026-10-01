@@ -2643,8 +2643,18 @@ impl ArrayType {
 /// [`column_default_compatible`] で列型の大分類（テキスト系／数値系／真偽値）
 /// との整合のみを検証し、`sql` 層に依存しない自己完結の防御として持つ
 /// （decode 時・Rust API 直接構築時にも効く多層防御）。
+///
+/// `Text` は SQL 文字列リテラルの原文を保持する。`TEXT` 列ではそのまま値になり、
+/// `DATE`／`TIMESTAMP`／`UUID` 列（Issue #1279・#1280・#1281）では `row_codec::default_scalar` が
+/// 列型に従って解釈し、`ENUM` 列（Issue #1282）では語彙に含まれるラベルかを照合する。
+/// 新 variant
+/// を足さず、`compatible_with`・`column_default_compatible_with_tag`・
+/// `row_codec::default_scalar`・`sql::ddl::add_column_default` の対応表へ同じ形で
+/// 腕を足して拡張する（公開 enum の variant 追加による破壊的変更とカタログ符号化の
+/// 変更を避ける）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnDefault {
+    /// 文字列リテラルの原文（`TEXT` 値、または型付き列で列型に従い解釈される）。
     Text(String),
     Number(String),
     Bool(bool),
@@ -2674,16 +2684,21 @@ impl ColumnDefault {
     fn compatible_with(&self, ty: &ColumnType) -> bool {
         matches!(
             (self, ty),
-            (ColumnDefault::Text(_), ColumnType::Text)
-                | (
-                    ColumnDefault::Number(_),
-                    ColumnType::Integer
-                        | ColumnType::BigInt
-                        | ColumnType::Real
-                        | ColumnType::Double
-                        | ColumnType::Numeric { .. },
-                )
-                | (ColumnDefault::Bool(_), ColumnType::Boolean)
+            (
+                ColumnDefault::Text(_),
+                ColumnType::Text
+                    | ColumnType::Date
+                    | ColumnType::Timestamp
+                    | ColumnType::Uuid
+                    | ColumnType::Enum(_),
+            ) | (
+                ColumnDefault::Number(_),
+                ColumnType::Integer
+                    | ColumnType::BigInt
+                    | ColumnType::Real
+                    | ColumnType::Double
+                    | ColumnType::Numeric { .. },
+            ) | (ColumnDefault::Bool(_), ColumnType::Boolean)
         )
     }
 
@@ -6298,10 +6313,23 @@ impl Storage {
             // `encoded` は型名のみを持つため、ここで未登録の型名を通すと
             // 存在しない型を参照する列が作成されてしまう）。カタログ側は
             // 型名だけを永続化するため、呼び出し元が渡した `Arc<EnumTypeDef>`
-            // の中身（語彙）自体は検証結果として使わず捨てる。
+            // の中身（語彙）自体は永続化には使わない。ただし `DEFAULT` を持つ ENUM 列は、
+            // 呼び出し元の `Arc` の語彙ではなく登録済みの定義で DEFAULT を再検証する
+            // （`alter_table_add_column` と同じ。省略すると語彙外ラベルの DEFAULT が
+            // 永続化され、列を省略した INSERT の束縛が常に失敗する。Issue #1282）。
             for column in &schema.columns {
                 if let ColumnType::Enum(def) = &column.ty {
-                    get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    if column.default.is_some() {
+                        let mut checked = column.clone();
+                        checked.ty = ColumnType::Enum(registered);
+                        if crate::row_codec::column_default_scalar(&checked).is_err() {
+                            return Err(CatalogError::Invalid(
+                                "column has a DEFAULT that is not a registered ENUM label"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 }
             }
             let table = write_txn.open_table(CATALOG_TABLE)?;
@@ -6493,6 +6521,16 @@ impl Storage {
             // （未登録の語彙を呼び出し元が持ち込めないようにする。Issue #890 D2）。
             if let ColumnType::Enum(def) = &column.ty {
                 column.ty = ColumnType::Enum(get_enum_type_in_write_txn(&write_txn, def.name())?);
+                // txn 前の検査は呼び出し元の `Arc` の語彙で行っているため、登録済みの
+                // 定義へ置き換えた後で DEFAULT を再検証する。省略すると未登録ラベルが
+                // 既定値として永続化され、既存行の読み出し時補完が常に失敗する
+                // （Issue #1282）。
+                if crate::row_codec::column_default_scalar(&column).is_err() {
+                    return Err(CatalogError::Invalid(
+                        "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
+                            .to_string(),
+                    ));
+                }
             }
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             let existing: Vec<u8> = {
@@ -8877,12 +8915,13 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
 fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> bool {
     matches!(
         (default, tag),
-        (ColumnDefault::Text(_), "text")
-            | (
-                ColumnDefault::Number(_),
-                "integer" | "bigint" | "real" | "double" | "numeric"
-            )
-            | (ColumnDefault::Bool(_), "boolean")
+        (
+            ColumnDefault::Text(_),
+            "text" | "date" | "timestamp" | "uuid" | "enum"
+        ) | (
+            ColumnDefault::Number(_),
+            "integer" | "bigint" | "real" | "double" | "numeric"
+        ) | (ColumnDefault::Bool(_), "boolean")
     )
 }
 
@@ -10872,6 +10911,157 @@ mod tests {
         storage
             .get_enum_type(type_name)
             .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `DATE` 列は `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1279）。完全版（`compatible_with`）と軽量版（列タグ）が一致する。
+    #[test]
+    fn date_column_accepts_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("2020-01-01".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        assert!(text.compatible_with(&ColumnType::Date));
+        assert!(!num.compatible_with(&ColumnType::Date));
+        assert!(!flag.compatible_with(&ColumnType::Date));
+        assert!(column_default_compatible_with_tag(&text, "date"));
+        assert!(!column_default_compatible_with_tag(&num, "date"));
+        assert!(!column_default_compatible_with_tag(&flag, "date"));
+    }
+
+    /// `TIMESTAMP` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1280）。完全版と軽量版（列タグ）が一致する。
+    #[test]
+    fn timestamp_column_accepts_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("2020-01-01 00:00:00".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        assert!(text.compatible_with(&ColumnType::Timestamp));
+        assert!(!num.compatible_with(&ColumnType::Timestamp));
+        assert!(!flag.compatible_with(&ColumnType::Timestamp));
+        assert!(column_default_compatible_with_tag(&text, "timestamp"));
+        assert!(!column_default_compatible_with_tag(&num, "timestamp"));
+        assert!(!column_default_compatible_with_tag(&flag, "timestamp"));
+    }
+
+    /// `ENUM` 列は `Text` の既定値だけを大分類として許容し、完全版・軽量版（列タグ）の
+    /// 判定が一致する。語彙照合は `row_codec::default_scalar` が行う（Issue #1282）。
+    #[test]
+    fn enum_column_accepts_only_text_default_and_default_scalar_checks_vocabulary() {
+        use crate::row_codec::{default_scalar, DefaultBindError, ScalarRef};
+        let def = Arc::new(EnumTypeDef {
+            name: "mood".to_string(),
+            labels: vec!["happy".to_string(), "sad".to_string()],
+        });
+        let ty = ColumnType::Enum(def);
+        let text = ColumnDefault::Text("happy".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        assert!(text.compatible_with(&ty));
+        assert!(!num.compatible_with(&ty));
+        assert!(!flag.compatible_with(&ty));
+        assert!(column_default_compatible_with_tag(&text, "enum"));
+        assert!(!column_default_compatible_with_tag(&num, "enum"));
+        assert!(!column_default_compatible_with_tag(&flag, "enum"));
+
+        assert_eq!(default_scalar(&ty, &text), Ok(ScalarRef::Enum("happy")));
+        assert_eq!(
+            default_scalar(&ty, &ColumnDefault::Text("angry".to_string())),
+            Err(DefaultBindError::EnumLabel)
+        );
+        assert_eq!(
+            default_scalar(&ty, &ColumnDefault::Text("HAPPY".to_string())),
+            Err(DefaultBindError::EnumLabel)
+        );
+        assert_eq!(
+            default_scalar(&ty, &num),
+            Err(DefaultBindError::Incompatible)
+        );
+        assert_eq!(
+            default_scalar(&ty, &flag),
+            Err(DefaultBindError::Incompatible)
+        );
+    }
+
+    /// 呼び出し元が持ち込んだ架空の語彙の `Arc` でラベルを通しても、write txn 内で
+    /// 登録済みの定義へ置き換えた後の再検証で拒否され、カタログは変化しない
+    /// （Issue #1282。読み出し時補完が常に失敗する自己 DoS の防止）。
+    #[test]
+    fn alter_table_add_column_rejects_enum_default_absent_from_registered_vocabulary() {
+        let path = unique_db_path("catalog-add-column-enum-default-fake-vocab");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        storage
+            .create_enum_type("mood", vec!["happy".to_string()])
+            .expect("create enum type");
+        let before = storage.get_table_schema("docs").expect("schema");
+
+        let fake = Arc::new(EnumTypeDef {
+            name: "mood".to_string(),
+            labels: vec!["happy".to_string(), "ghost".to_string()],
+        });
+        let column = ColumnDef::new("m", ColumnType::Enum(fake), true)
+            .with_default(ColumnDefault::Text("ghost".to_string()));
+        let err = storage
+            .alter_table_add_column("docs", column)
+            .expect_err("label absent from registered vocabulary");
+        assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+        assert_eq!(storage.get_table_schema("docs").expect("schema"), before);
+    }
+    /// `UUID` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1281）。完全版と軽量版が一致する。
+    #[test]
+    fn uuid_column_accepts_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("00000000-0000-0000-0000-000000000001".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        assert!(text.compatible_with(&ColumnType::Uuid));
+        assert!(!num.compatible_with(&ColumnType::Uuid));
+        assert!(!flag.compatible_with(&ColumnType::Uuid));
+        assert!(column_default_compatible_with_tag(&text, "uuid"));
+        assert!(!column_default_compatible_with_tag(&num, "uuid"));
+        assert!(!column_default_compatible_with_tag(&flag, "uuid"));
+    }
+
+    /// `create_table` 経路でも、登録済み語彙にないラベルの ENUM DEFAULT は write txn 内の
+    /// 再検証で拒否され、テーブルは作成されない（Issue #1282）。登録済みラベルは受理する。
+    #[test]
+    fn create_table_rejects_enum_default_absent_from_registered_vocabulary() {
+        let path = unique_db_path("catalog-create-table-enum-default-vocab");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_enum_type("mood", vec!["happy".to_string()])
+            .expect("create enum type");
+        let fake = Arc::new(EnumTypeDef {
+            name: "mood".to_string(),
+            labels: vec!["happy".to_string(), "ghost".to_string()],
+        });
+        let schema_with = |def: Arc<EnumTypeDef>, label: &str| {
+            TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("m", ColumnType::Enum(def), true)
+                        .with_default(ColumnDefault::Text(label.to_string())),
+                ],
+            )
+        };
+        let err = storage
+            .create_table(&schema_with(fake.clone(), "ghost"))
+            .expect_err("label absent from registered vocabulary");
+        assert!(matches!(err, CatalogError::Invalid(_)), "{err:?}");
+        assert!(storage.get_table_schema("docs").is_err());
+
+        let registered = storage.get_enum_type("mood").expect("registered def");
+        storage
+            .create_table(&schema_with(registered, "happy"))
+            .expect("registered label is accepted");
     }
 
     /// 上と対の検証: `default` フィールドのデコード自体は成功しても、列の型

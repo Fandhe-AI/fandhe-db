@@ -82,8 +82,10 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 
 `sql::exec` は各実行関数の `_in` 版（`WriteTarget` を受け取る本体）を持ち、既存の
 関数は `Autocommit` を渡す薄いラッパーとして挙動を変えない。`core.rs` の
-`execute_in_active_txn` が `Insert`（単一行・複数行・UPSERT。`RETURNING` は単一行・
-複数行のみ）・`Delete`・`Update` を受理し、成功後に `mark_written` する。
+`execute_in_active_txn` が `Insert`（単一行・複数行・UPSERT）・`Delete`・`Update` を
+受理し、成功後に `mark_written` する。`RETURNING` は UPSERT を除く全 DML
+（`INSERT`・`UPDATE`・`DELETE`。Issue #1272 で `UPDATE`・述語形 `DELETE` を追加）で
+受け付け、UPSERT だけ下記の `0A000` で拒否する。
 `parsed_operation_id` は `Delete`・`Update` の `operation_id` も返し、同一
 トランザクション内での再利用（`25000`）は全 DML に効く。
 
@@ -91,6 +93,24 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 （`replace_typed_rows_by_text_key`。埋め込み I/O を単一ライタの保持中に行うことに
 なるため autocommit 専用のまま）、DDL、`USING PLAN` を伴う検索 SELECT・`EXPLAIN`
 のうち対象テーブルが dirty のもの（「6. トランザクション内の読み取り」参照）。
+
+**明示トランザクション内の `RETURNING` で拒否（`0A000`）するもの（Issue #1182・#1272・#1273 の
+経緯・SQL-31・SQL-21）**: なし（全 DML の `RETURNING` を受理する）。UPSERT
+（`INSERT ... ON CONFLICT ... RETURNING`）は Issue #1273 で受理に変わり、
+`execute_insert_returning_form` の `Upsert` 腕が autocommit と同じ
+`execute_upsert_returning_in` へ `WriteTarget::InTxn` を渡す（衝突判定・不可視な衝突先の
+扱い・台帳・制約検査は `tenant::upsert_typed_rows_impl` が共有）。
+単一行・述語形の `UPDATE ... RETURNING` と述語形の `DELETE ... RETURNING` は Issue #1272
+で受理に変わり、`execute_in_active_txn` が autocommit と同じ
+`execute_update_returning_form`・`execute_predicate_delete_returning_form` へ
+`WriteTarget::InTxn` を渡す（返却行数＝影響行数・可視集合での対象選定・RLS は共通）。
+`RETURNING` を黙って落とす fail-open にはしない。fail-closed の契約: autocommit では
+投影の失敗（`54000` 等）がその文自身の write トランザクションを abort するが、`InTxn` では
+文ごとの abort は無く、`execute_parsed_in_txn` がエラーを受けて `txn.fail()` を呼び共有の
+`write_txn` を drop（abort）する。明示トランザクションは `Failed` へ遷移して部分書き込みは
+永続化されず（COMMIT は `25P02`、受け付けるのは ROLLBACK だけ）、暗黙トランザクション
+（WIRE-16・Issue #1175。文の実行ディスパッチは起源を区別しない）は abort して `Idle` に
+戻る。
 
 **commit 後の副作用の監査（Issue #1179）**: 上記の書き込み関数と呼び出し元
 （`sql::exec`・`core.rs`）に、`commit_boundary::commit` の後で共有インメモリ状態
@@ -297,11 +317,25 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   `25000`・対応外文（DDL）の `0A000`・文数上限の `54000`・TRUNCATE と INSERT の原子的
   commit・接続断相当（drop）での完全ロールバックを固定。
 - `crates/engine/tests/sql31_txn_dml.rs`（Issue #1179）: 複数行 INSERT・UPSERT・
-  UPDATE・DELETE（RETURNING を含む）の COMMIT／ROLLBACK／drop、全 DML への
+  UPDATE・DELETE の COMMIT／ROLLBACK／drop、`UPDATE`・述語形 `DELETE` の `RETURNING`
+  （Issue #1272。read-your-writes・ROLLBACK で行・索引・台帳に痕跡なし・テナント境界・
+  未知列での fail-closed）、全 DML への
   `operation_id` 再利用検査、遅延 FK の COMMIT 時検査（連鎖で書き換わったテーブルの
   下位の遅延 FK を含む）、未 commit 変更の読み取り（Scan・Aggregate・GROUP BY・JOIN・
   自己 JOIN・サブクエリ・集合演算・カーソル）、キャッシュ汚染の回帰（ROLLBACK 後に
   世代が再利用されても未 commit 行が現れない）、RLS を固定。
+- `crates/engine/tests/sql_returning.rs`
+  （`upsert_returning_inside_explicit_transaction_returns_changed_rows`）: 明示トランザクション内の
+  UPSERT の `RETURNING` が受理され返却行数＝影響行数になることを固定（Issue #1273）。
+  `sql31_txn_dml.rs` の `upsert_returning_*` は read-your-writes・ROLLBACK で行／索引／台帳に
+  痕跡なし・DO NOTHING 衝突行を返さない・テナント境界・不可視な衝突先の `42501` と
+  `Failed` 遷移を固定。
+  `sql21_returning_row_count_parity.rs` は UPSERT・`UPDATE`・述語形 `DELETE` の `txn: true` セルで
+  返却行数・影響行数・物理差分の一致を両可視性モードで固定。暗黙トランザクション側の
+  対応外文の例は `DROP TABLE`（`crates/engine/tests/wire16_implicit_txn.rs`・
+  `crates/wire-server/tests/wire16_multi_statement.rs`・`wire16_implicit_transaction.rs`）で
+  固定し、`UPDATE ... RETURNING`・UPSERT の `RETURNING` の受理は
+  `wire16_implicit_transaction.rs` が固定。
 - `crates/wire-server/tests/wire19_ready_for_query_status.rs`・
   `wire942_extended_transaction.rs`（Issue #1179）: トランザクション内 COPY の
   ReadyForQuery 状態・拡張クエリ経路の UPDATE／DELETE／UPSERT・停滞した COPY の
@@ -343,8 +377,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   **Issue #1175 で実装済み（制約付き）**。`BEGIN` を含まないメッセージのうち書き込みが
   最後以外にある形は、メッセージ全体を 1 つの暗黙トランザクションで原子的に実行する
   （詳細は [`wire-multi-statement.md`](./wire-multi-statement.md)「原子性」節）。
-  使える文は明示トランザクションと同じ許可リストで、`UPDATE`・`DELETE` 等は `0A000`
-  （#1179 で明示トランザクション側が広がれば自動的に広がる）。`BEGIN` より前の書き込みを
+  使える文は明示トランザクションと同じ許可リスト（Issue #1179 で拡大済み。`RETURNING`
+  は UPSERT のみ未対応）。`BEGIN` より前の書き込みを
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
