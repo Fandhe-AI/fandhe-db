@@ -22,9 +22,8 @@
 //! - 全セル: 他テナントの行は返却にも物理状態にも現れない（同一 id・同一 lang の他テナント
 //!   Public 行を置き、越境を実効的に検出する）
 //!
-//! 明示トランザクション内の `RETURNING` 付き UPSERT のみ `0A000` で拒否される既知の
-//! 未対応領域（#1273）のため、マトリクスには入れない。UPDATE・述語形 DELETE は
-//! Issue #1272 で受理され `txn: true` セルとして含む。
+//! 明示トランザクション内の `RETURNING` 付き UPSERT（Issue #1273）・UPDATE・述語形
+//! DELETE（Issue #1272）は受理され、autocommit と同じ期待値の `txn: true` セルとして含む。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -49,7 +48,7 @@ const TABLE: &str = "documents";
 const VIEWER: &str = "tenant-a";
 const OTHER: &str = "tenant-b";
 /// 総セル数（空振り防止。セルを増減したら本定数も更新する）。
-const CELL_COUNT: usize = 28;
+const CELL_COUNT: usize = 37;
 
 fn ctx_for(tenant: &str, allow_private: bool) -> PolicyContext {
     if allow_private {
@@ -394,6 +393,69 @@ fn cells() -> Vec<Cell> {
             txn: true,
             public_only: ok(&[5, 6]),
             with_private: ok(&[1, 2, 5, 6]),
+        },
+        Cell {
+            name: "TXN UPSERT new DO NOTHING",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (10, '[0.3,0.4]', 'ja', 'ins-10') ON CONFLICT (id) DO NOTHING RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: Expect::Err("XX000"),
+            with_private: ok(&[10]),
+        },
+        Cell {
+            name: "TXN UPSERT new DO UPDATE",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (10, '[0.3,0.4]', 'ja', 'ins-10') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: Expect::Err("XX000"),
+            with_private: ok(&[10]),
+        },
+        Cell {
+            name: "TXN UPSERT conflict DO UPDATE own Public",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (5, '[0.3,0.4]', 'ja', 'upd-5') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: ok(&[5]),
+            with_private: ok(&[5]),
+        },
+        Cell {
+            name: "TXN UPSERT conflict DO UPDATE own Private",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (1, '[0.3,0.4]', 'ja', 'upd-1') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: Expect::Err("42501"),
+            with_private: ok(&[1]),
+        },
+        Cell {
+            name: "TXN UPSERT conflict DO NOTHING own Public",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (5, '[0.3,0.4]', 'ja', 'ins-5') ON CONFLICT (id) DO NOTHING RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: ok(&[]),
+            with_private: ok(&[]),
+        },
+        Cell {
+            name: "TXN UPSERT conflict DO NOTHING own Private",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (1, '[0.3,0.4]', 'ja', 'ins-1') ON CONFLICT (id) DO NOTHING RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: ok(&[]),
+            with_private: ok(&[]),
+        },
+        Cell {
+            name: "TXN UPSERT mixed DO UPDATE",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (5, '[0.3,0.4]', 'ja', 'upd-5'), (10, '[0.3,0.4]', 'ja', 'upd-10') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: Expect::Err("XX000"),
+            with_private: ok(&[5, 10]),
+        },
+        Cell {
+            name: "TXN UPSERT mixed DO NOTHING",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (5, '[0.3,0.4]', 'ja', 'ins-5'), (10, '[0.3,0.4]', 'ja', 'ins-10') ON CONFLICT (id) DO NOTHING RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: Expect::Err("XX000"),
+            with_private: ok(&[10]),
+        },
+        Cell {
+            name: "TXN UPSERT id only in other tenant",
+            sql: "INSERT INTO documents (id, embedding, lang, body) VALUES (9, '[0.3,0.4]', 'ja', 'ins-9') ON CONFLICT (id) DO NOTHING RETURNING id, body USING OPERATION_ID '{op}'",
+            txn: true,
+            public_only: Expect::Err("XX000"),
+            with_private: ok(&[9]),
         },
     ]
 }

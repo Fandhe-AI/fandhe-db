@@ -182,6 +182,31 @@ fn update_returning_in_implicit_transaction_is_accepted_and_committed() {
     assert_eq!(visible_ids(&mut alice), vec!["1", "2", "3", "61"]);
 }
 
+/// 暗黙トランザクション内の `INSERT ... ON CONFLICT ... RETURNING`（Issue #1273）は
+/// 受理され、`INSERT` の応答 → RowDescription → DataRow（挿入行のみ。DO NOTHING で
+/// 衝突した id=1 は返さない）→ `INSERT 0 1` → `'I'` の順に返り、全体が commit される。
+#[test]
+fn upsert_returning_in_implicit_transaction_is_accepted_and_committed() {
+    let (core, _guard) = new_core_three_tenant_docs();
+    let (mut alice, _bob) = spawn_both(core);
+
+    send_simple_query(
+        &mut alice,
+        &format!(
+            "{}; INSERT INTO docs (id, embedding, lang) VALUES \
+             (1, '[0.1,0.2,0.3]', 'ja'), (62, '[0.1,0.2,0.3]', 'ja') \
+             ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'imp-up'",
+            insert_sql(61, "imp-1")
+        ),
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    let _columns = read_row_description(&mut alice);
+    assert_eq!(read_data_row(&mut alice)[0].as_deref(), Some("62"));
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut alice), b'I');
+    assert_eq!(visible_ids(&mut alice), vec!["1", "2", "3", "61", "62"]);
+}
+
 /// 暗黙トランザクション内で対応できない文（`DROP TABLE`。`UPDATE ... RETURNING` は
 /// Issue #1272 で対応済み）は `0A000`。先行する書き込みは残らず、接続は `'I'`。
 #[test]
