@@ -907,7 +907,11 @@ fn default_type_check_errors() {
     for (decl, code) in [
         ("a INTEGER DEFAULT 99999999999", "22003"),
         ("b NUMERIC(3,1) DEFAULT 123.45", "22003"),
-        ("c DATE DEFAULT '2020-01-01'", "0A000"),
+        ("c DATE DEFAULT 1", "42601"),
+        ("c2 DATE DEFAULT 'abc'", "22007"),
+        ("c3 DATE DEFAULT '2020-02-30'", "22008"),
+        ("c4 DATE DEFAULT '2020-13-01'", "22008"),
+        ("c5 TIMESTAMP DEFAULT '2020-01-01 00:00:00'", "0A000"),
         (
             "d UUID DEFAULT '00000000-0000-0000-0000-000000000000'",
             "0A000",
@@ -981,4 +985,117 @@ fn default_add_column_requires_ddl_permission_before_anything_else() {
         )
         .expect_err("no DDL privilege");
     assert_eq!(err.wire_code(), "42501");
+}
+
+/// `DATE` 列の `DEFAULT`（Issue #1279）。既存行は読み出し時に既定値で補われ、
+/// 各読み出し経路（投影・WHERE・集計）と新規 INSERT の列省略で同じ値になる。
+#[test]
+fn date_default_fills_existing_rows_across_read_paths() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "dt DATE NOT NULL DEFAULT '2020-01-02'").expect("ADD COLUMN DATE");
+    add_column(&core, "dn DATE DEFAULT '1999-12-31'").expect("ADD COLUMN nullable DATE");
+
+    let days = engine::datetime::parse_date("2020-01-02").expect("date");
+    let days_n = engine::datetime::parse_date("1999-12-31").expect("date");
+    let q = |col: &str| {
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        )
+    };
+    assert!(matches!(q("dt"), Cell::Date(d) if d == days));
+    assert!(matches!(q("dn"), Cell::Date(d) if d == days_n));
+    assert_eq!(
+        count_star(&core, &owner, TABLE),
+        1,
+        "row count must be unchanged"
+    );
+    let filtered = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE dt = '2020-01-02' LIMIT 10"),
+        )
+        .expect("WHERE on DATE default");
+    assert_eq!(filtered.rows.len(), 1);
+
+    // 新規 INSERT で列省略 → 既定値、明示値 → その値。
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting dt");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, dt) VALUES (3, '[0.3,0.4]', '2021-03-04') USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit dt");
+    let explicit = engine::datetime::parse_date("2021-03-04").expect("date");
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT dt FROM {TABLE} WHERE id = 2 LIMIT 1")),
+        Cell::Date(d) if d == days
+    ));
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT dt FROM {TABLE} WHERE id = 3 LIMIT 1")),
+        Cell::Date(d) if d == explicit
+    ));
+}
+
+/// `DATE DEFAULT` は再オープン後も既定値として読める。
+#[test]
+fn date_default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "dt DATE NOT NULL DEFAULT '2020-01-02'").expect("ADD COLUMN");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let days = engine::datetime::parse_date("2020-01-02").expect("date");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT dt FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Date(d) if d == days
+    ));
+}
+
+/// `DATE NOT NULL`（DEFAULT なし）は行の有無にかかわらず同一の `42601`、
+/// `DATE NOT NULL DEFAULT` の成功も行の有無に依存しない（テナント境界 P0）。
+#[test]
+fn date_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "d DATE NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "d DATE NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "d"));
+
+    add_column(&core, "d DATE NOT NULL DEFAULT '2020-01-01'").expect("other tenant rows: ok");
+    let days = engine::datetime::parse_date("2020-01-01").expect("date");
+    assert!(matches!(
+        one_cell(
+            &core,
+            &ctx("bob"),
+            &format!("SELECT d FROM {TABLE} WHERE id = 1 LIMIT 1")
+        ),
+        Cell::Date(v) if v == days
+    ));
 }
