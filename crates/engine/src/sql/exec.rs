@@ -4105,7 +4105,9 @@ pub(crate) fn execute_predicate_delete_in(
 /// [`execute_predicate_delete_inner`] で共有）。`rows_affected` は実際に削除した
 /// 件数で、RLS 再判定で除外された行があっても変わらない
 /// （[`ReturningOutcome`] 参照）。唯一の到達経路は `core.rs::EngineCore` の
-/// セッション経路（`execute_predicate_delete_returning_form`）。
+/// `execute_predicate_delete_returning_form`（autocommit のセッション経路と、
+/// 明示・暗黙トランザクション内の `WriteTarget::InTxn` 経路。Issue #1272。どちらも
+/// 返却行数＝影響行数・可視集合での対象選定・RLS の契約は同一）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_predicate_delete_returning(
     target: crate::tenant::WriteTarget<'_>,

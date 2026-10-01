@@ -93,7 +93,7 @@ CheckEvaluationFailed(SqlSurfaceError)`（0 除算・`BIGINT` 精度超過等）
 新しい `CatalogError` variant・`ErrorClass`・`wire_code` は追加しない
 （HTTP 射影・`err4_http_projection.rs` は無変更で整合）。
 
-### D4. エラー契約（ERR-6 の既存行のみ）
+### D4. エラー契約（新しい `wire_code` は追加しない。ERR-6 ポインタ）
 
 | 条件 | 経路 | `wire_code` |
 | --- | --- | --- |

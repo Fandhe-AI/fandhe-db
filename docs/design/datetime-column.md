@@ -4,7 +4,7 @@
 - 対象: TABLE-1・TABLE-7・TABLE-13・TASK-197（`docs/spec/05-tasks.md`・
   `docs/spec/04-behavior/data-model.md`）
 - 関連: `column-type-extension.md`（BOOLEAN 列型・TASK-196。同じ拡張方式を
-  踏襲）、ERR-6（`docs/spec/04-behavior/error-format.md`。エラーコード管轄表）
+  踏襲）、ERR-6（`docs/spec/04-behavior/error-format.md`）
 
 本ドキュメントは実装既定値・設計判断のみを記す。private spec 本文は転記せず
 ビヘイビア ID・タスク ID のポインタ表記に限る（`.claude/rules/spec-confidentiality.md`）。
@@ -20,12 +20,10 @@
 
 - 範囲外・暦上不正（月 13、2/30、非閏年の 2/29、時 24、分 60、秒 60、
   年 0000、年 10000 以上等）は新設分類 `DatetimeFieldOverflow`（`22008`。
-  ERR-6 の管轄表にある行）へ写像する。
+  ERR-6 ポインタ）へ写像する。
 - 書式違反（区切り文字違い、桁数不足、TZ 接尾辞、小数 7 桁以上、前後空白、
   非 ASCII 数字、長さ超過等）は Issue #1187 で `InvalidDatetimeFormat`（`22007`）へ
   変更した（当初は `InvalidInput`〔`22000`〕）。
-- （Issue #1187 で解消: 書式違反は `22007`（`InvalidDatetimeFormat`）へ変更）。当初の記述: `22P02`（`InvalidTextRepresentation`）の新設は行わない（TASK-227・ERR-6 へ
-  申し送り。着手時点で兄弟 PR による追加も無かった）。
 
 ### D-2: BREAKING CHANGE として扱う
 
