@@ -1739,6 +1739,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         Some(ScalarRef::Bool(b)) => Value::Bool(b),
                         Some(ScalarRef::Date(d)) => Value::Date(d),
                         Some(ScalarRef::Uuid(u)) => Value::Uuid(u),
+                        Some(ScalarRef::Timestamp(t)) => Value::Timestamp(t),
                         _ => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} has an invalid DEFAULT for its type",
@@ -3304,9 +3305,9 @@ pub(crate) enum DefaultBindError {
     Malformed,
     /// 列型の値域外（`INTEGER` オーバーフロー・`NUMERIC` 桁数超過等）。
     OutOfRange,
-    /// `DATE` リテラルの書式違反（SQLSTATE `22007`。Issue #1279）。
+    /// `DATE`／`TIMESTAMP` リテラルの書式違反（SQLSTATE `22007`。Issue #1279・#1280）。
     DatetimeFormat,
-    /// `DATE` リテラルの範囲外・暦上不正（SQLSTATE `22008`。Issue #1279）。
+    /// `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（SQLSTATE `22008`。Issue #1279・#1280）。
     DatetimeOverflow,
 }
 
@@ -3387,6 +3388,19 @@ pub(crate) fn default_scalar<'a>(
         (ColumnDefault::Text(s), ColumnType::Uuid) => crate::uuid::parse_uuid_text(s)
             .map(ScalarRef::Uuid)
             .map_err(|_| DefaultBindError::Malformed),
+        // `TIMESTAMP` 列も同様に `datetime::parse_timestamp`（INSERT のリテラル束縛と
+        // 同じ閉じた文法。揮発性の式は受理しない）で解釈する（Issue #1280）。
+        (ColumnDefault::Text(s), ColumnType::Timestamp) => {
+            match crate::datetime::parse_timestamp(s) {
+                Ok(micros) => Ok(ScalarRef::Timestamp(micros)),
+                Err(crate::datetime::DateTimeLiteralError::Format(_)) => {
+                    Err(DefaultBindError::DatetimeFormat)
+                }
+                Err(crate::datetime::DateTimeLiteralError::Overflow(_)) => {
+                    Err(DefaultBindError::DatetimeOverflow)
+                }
+            }
+        }
         _ => Err(DefaultBindError::Incompatible),
     }
 }
@@ -5779,6 +5793,65 @@ mod tests {
                 "{bad} (masked out)"
             );
         }
+    }
+
+    /// `TIMESTAMP` 列の既定値（Issue #1280）。scan・v1 decode の両方で補完され、
+    /// 束縛できない値はカタログ破損相当として fail-closed に拒否する。
+    #[test]
+    fn timestamp_default_is_filled_and_invalid_timestamp_default_is_rejected() {
+        let micros = crate::datetime::parse_timestamp("2020-01-02 03:04:05.123456").expect("ts");
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![ColumnDef::new("ts", ColumnType::Timestamp, false)
+                .with_default(ColumnDefault::Text(
+                    "2020-01-02 03:04:05.123456".to_string(),
+                ))]);
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], Some(ScalarRef::Timestamp(micros)));
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode");
+        assert_eq!(decoded[1], Value::Timestamp(micros));
+
+        for bad in ["2020-02-30 00:00:00", "abc"] {
+            let (buf, schema) = old_row_and_extended_schema(vec![ColumnDef::new(
+                "ts",
+                ColumnType::Timestamp,
+                true,
+            )
+            .with_default(ColumnDefault::Text(bad.to_string()))]);
+            assert!(
+                matches!(
+                    scan_scalar_columns(&schema, &buf),
+                    Err(RowCodecError::Invalid(_))
+                ),
+                "{bad}"
+            );
+            let mask = vec![false; schema.columns.len()];
+            assert!(
+                matches!(
+                    scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+                    Err(RowCodecError::Invalid(_))
+                ),
+                "{bad} (masked out)"
+            );
+        }
+    }
+
+    #[test]
+    fn default_scalar_maps_timestamp_errors() {
+        assert_eq!(
+            default_scalar(
+                &ColumnType::Timestamp,
+                &ColumnDefault::Text("2020-02-30 00:00:00".into())
+            ),
+            Err(DefaultBindError::DatetimeOverflow)
+        );
+        assert_eq!(
+            default_scalar(&ColumnType::Timestamp, &ColumnDefault::Text("abc".into())),
+            Err(DefaultBindError::DatetimeFormat)
+        );
+        assert_eq!(
+            default_scalar(&ColumnType::Timestamp, &ColumnDefault::Number("1".into())),
+            Err(DefaultBindError::Incompatible)
+        );
     }
 
     #[test]

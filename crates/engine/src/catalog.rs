@@ -2645,8 +2645,8 @@ impl ArrayType {
 /// （decode 時・Rust API 直接構築時にも効く多層防御）。
 ///
 /// `Text` は SQL 文字列リテラルの原文を保持する。`TEXT` 列ではそのまま値になり、
-/// `DATE` 列（Issue #1279）では `row_codec::default_scalar` が列型に従って
-/// 解釈する。`UUID`（Issue #1281）も同様。後続の `TIMESTAMP`／`ENUM`（Issue #1280・#1282）も新 variant
+/// `DATE`／`TIMESTAMP`／`UUID` 列（Issue #1279・#1280・#1281）では `row_codec::default_scalar` が
+/// 列型に従って解釈する。後続の `ENUM`（Issue #1282）も新 variant
 /// を足さず、`compatible_with`・`column_default_compatible_with_tag`・
 /// `row_codec::default_scalar`・`sql::ddl::add_column_default` の対応表へ同じ形で
 /// 腕を足して拡張する（公開 enum の variant 追加による破壊的変更とカタログ符号化の
@@ -2685,7 +2685,7 @@ impl ColumnDefault {
             (self, ty),
             (
                 ColumnDefault::Text(_),
-                ColumnType::Text | ColumnType::Date | ColumnType::Uuid
+                ColumnType::Text | ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid
             ) | (
                 ColumnDefault::Number(_),
                 ColumnType::Integer
@@ -8887,12 +8887,13 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
 fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> bool {
     matches!(
         (default, tag),
-        (ColumnDefault::Text(_), "text" | "date" | "uuid")
-            | (
-                ColumnDefault::Number(_),
-                "integer" | "bigint" | "real" | "double" | "numeric"
-            )
-            | (ColumnDefault::Bool(_), "boolean")
+        (
+            ColumnDefault::Text(_),
+            "text" | "date" | "timestamp" | "uuid"
+        ) | (
+            ColumnDefault::Number(_),
+            "integer" | "bigint" | "real" | "double" | "numeric"
+        ) | (ColumnDefault::Bool(_), "boolean")
     )
 }
 
@@ -10897,9 +10898,21 @@ mod tests {
         assert!(column_default_compatible_with_tag(&text, "date"));
         assert!(!column_default_compatible_with_tag(&num, "date"));
         assert!(!column_default_compatible_with_tag(&flag, "date"));
-        // 日時の他型は後続 Issue（#1280 以降）まで未対応のまま。
-        assert!(!text.compatible_with(&ColumnType::Timestamp));
-        assert!(!column_default_compatible_with_tag(&text, "timestamp"));
+    }
+
+    /// `TIMESTAMP` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1280）。完全版と軽量版（列タグ）が一致する。
+    #[test]
+    fn timestamp_column_accepts_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("2020-01-01 00:00:00".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        assert!(text.compatible_with(&ColumnType::Timestamp));
+        assert!(!num.compatible_with(&ColumnType::Timestamp));
+        assert!(!flag.compatible_with(&ColumnType::Timestamp));
+        assert!(column_default_compatible_with_tag(&text, "timestamp"));
+        assert!(!column_default_compatible_with_tag(&num, "timestamp"));
+        assert!(!column_default_compatible_with_tag(&flag, "timestamp"));
     }
 
     /// `UUID` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
