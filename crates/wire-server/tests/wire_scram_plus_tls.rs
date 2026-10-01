@@ -12,6 +12,9 @@
 #[path = "common/tls_client.rs"]
 mod tls_client;
 
+#[path = "common/fixture_guard.rs"]
+mod fixture_guard;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -204,7 +207,7 @@ fn extract_sqlstate(body: &[u8]) -> String {
     panic!("ErrorResponse body has no 'C' (SQLSTATE) field: {body:?}");
 }
 
-fn write_scram_user_store_file(password: &[u8]) -> std::path::PathBuf {
+fn write_scram_user_store_file(password: &[u8]) -> fixture_guard::UserStoreFile {
     // `tests/wire_scram_auth.rs::write_scram_user_store_file` と同型
     // （SCRAM 検証子を持つユーザーストアを直接書く、本ファイル専用の実装）。
     let dir = std::env::temp_dir().join(format!(
@@ -228,7 +231,7 @@ fn write_scram_user_store_file(password: &[u8]) -> std::path::PathBuf {
     .expect("valid phc");
     let content = format!("alice:tenant-a:{phc}:{}\n", verifier.to_verifier_string());
     std::fs::write(&path, &content).expect("write fixture");
-    path
+    fixture_guard::UserStoreFile::new(dir, path)
 }
 
 const TEST_SCRAM_MOCK_KEY_SECRET: &[u8] = b"wire-scram-plus-tls-test-mock-key-secret!!";

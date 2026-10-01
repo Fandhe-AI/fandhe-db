@@ -122,6 +122,29 @@ pub fn unique_db_path(label: &str) -> PathBuf {
     path
 }
 
+/// プロセス寿命のバックグラウンドスレッド（accept ループ等）へ `EngineCore` を move
+/// するテスト用に、DB ファイルを open 直後に unlink する（Issue #1303）。
+///
+/// そうしたスレッドはプロセス終了まで生き続けるため `CleanupGuard` を結び付けられず、
+/// 実行のたびに一時ファイルが残置していた。unix ではオープン済みファイルを unlink しても
+/// ハンドル経由の読み書きは継続でき、実体は最後の close（プロセス終了）で解放される
+/// （`Storage` は open 後にパスを再利用しないこと前提）。非 unix（Windows）では開いたままの
+/// ファイルを削除できないため従来通り残置する（文書化された例外）。削除失敗はテストを
+/// 失敗させず `eprintln!` のみ（他テナント情報・秘密情報を含まない）。
+pub fn unlink_open_db_file(path: &Path) {
+    #[cfg(unix)]
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "warning: failed to unlink open db file {}: {e}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// `unique_db_path` で払い出したパスのファイルを、値が drop されるタイミングで
 /// 削除する RAII ガード。既存呼び出しサイトの `CleanupGuard(path.clone())` 記法を
 /// 維持するため、フィールドは公開タプルとする。

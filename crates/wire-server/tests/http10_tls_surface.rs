@@ -106,6 +106,9 @@ fn spawn_router_listener_tls_with_limiter_and_read_timeout(
     let addr = listener.local_addr().expect("local addr");
     let core_path = http_common::temp_db::unique_db_path("http10-tls-surface-throwaway");
     let core = EngineCore::open(&core_path).expect("open throwaway engine core");
+    // プロセス寿命の accept スレッドへ move するため Drop ガードを使えない。open 直後に
+    // unlink して残置を防ぐ（Issue #1303。非 unix は残置する文書化された例外）。
+    http_common::temp_db::unlink_open_db_file(&core_path);
     let sessions = SessionStore::new();
     let router = Router::with_engine(Arc::new(store), sessions, Arc::new(core));
     let tls_config: Arc<TlsServerConfig> = tls_client::test_config();
@@ -257,6 +260,23 @@ fn error_wire_code(value: &JsonValue) -> &str {
     json_str(error, "wire_code")
 }
 
+/// フィクスチャ一時ディレクトリを `Drop` で削除するガード（Issue #1303）。assert 失敗の
+/// panic 経路でも削除される。削除失敗はテストを失敗させず stderr へ出すのみ。
+struct FixtureDirGuard(std::path::PathBuf);
+
+impl Drop for FixtureDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to remove temp dir {}: {e}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+}
+
 // --- TLS-1: TLS 上で session → query → close が完走する -------------------
 
 #[test]
@@ -270,6 +290,7 @@ fn tls_session_query_close_round_trip_completes_over_tls() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -330,8 +351,6 @@ fn tls_session_query_close_round_trip_completes_over_tls() {
     let response = read_one_response(&mut channel);
     let parsed = parse_response(&response);
     assert_eq!(parsed.status, 200, "session close must succeed over TLS");
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 // --- TLS-2: require 下で平文 HTTP は応答なしで閉じられる ------------------
@@ -347,6 +366,7 @@ fn plaintext_http_is_closed_without_response_when_tls_required() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -377,8 +397,6 @@ fn plaintext_http_is_closed_without_response_when_tls_required() {
             panic!("expected no HTTP response over plaintext when tls-mode=require, got {other:?}")
         }
     }
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 // --- TLS-3: allow 下では平文・TLS のいずれでも完走する --------------------
@@ -394,6 +412,7 @@ fn allow_mode_accepts_both_plaintext_and_tls() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -438,8 +457,6 @@ fn allow_mode_accepts_both_plaintext_and_tls() {
         200,
         "plaintext login must also succeed under allow"
     );
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 // --- TLS-4: 不正な ClientHello で他接続へ波及しない ------------------------
@@ -455,6 +472,7 @@ fn malformed_client_hello_does_not_crash_or_affect_later_connections() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -495,8 +513,6 @@ fn malformed_client_hello_does_not_crash_or_affect_later_connections() {
         200,
         "a later well-formed TLS connection must still succeed"
     );
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 // --- TLS-5/6: 同時接続数上限超過時のエラー契約（Issue #968 codex-review
@@ -533,6 +549,7 @@ fn allow_mode_still_returns_503_for_plaintext_over_capacity() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -577,8 +594,6 @@ fn allow_mode_still_returns_503_for_plaintext_over_capacity() {
         "allow mode must still return 503 for plaintext over capacity, got: {text:?}"
     );
     assert!(text.contains("53300"), "got: {text:?}");
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 /// TLS-6: `--tls-mode require` の下で同時接続数上限を超過した接続は
@@ -594,6 +609,7 @@ fn require_mode_closes_over_capacity_connection_without_response() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -618,8 +634,6 @@ fn require_mode_closes_over_capacity_connection_without_response() {
             panic!("expected no HTTP response over capacity when tls-mode=require, got {other:?}")
         }
     }
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 /// TLS-8: `--tls-mode allow` の下で同時接続数上限を超過した接続の先頭
@@ -640,6 +654,7 @@ fn allow_mode_returns_503_over_tls_for_tls_over_capacity() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -672,8 +687,6 @@ fn allow_mode_returns_503_over_tls_for_tls_over_capacity() {
         "allow mode must return 503 over TLS for TLS-record over capacity, got: {text:?}"
     );
     assert!(text.contains("53300"), "got: {text:?}");
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 /// TLS-7: TLS レコード 1 個分の暗号文を 1 バイトずつ小さな間隔で送り続けて
@@ -696,6 +709,7 @@ fn tls_trickle_within_one_record_is_bounded_by_absolute_read_deadline() {
             .as_nanos()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
     let users_path = fixture_dir.join("users.txt");
     write_user_store_with_alice(&users_path);
 
@@ -782,6 +796,4 @@ fn tls_trickle_within_one_record_is_bounded_by_absolute_read_deadline() {
         elapsed < read_deadline + Duration::from_secs(1),
         "absolute read deadline was not enforced over TLS trickle: elapsed={elapsed:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }

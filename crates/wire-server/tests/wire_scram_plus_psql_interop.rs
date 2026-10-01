@@ -18,6 +18,9 @@
 #[path = "common/tls_client.rs"]
 mod tls_client;
 
+#[path = "common/fixture_guard.rs"]
+mod fixture_guard;
+
 use std::net::TcpListener;
 use std::process::Command;
 use std::sync::Arc;
@@ -45,7 +48,7 @@ enum Expected {
     ClientRefusesNoPlus,
 }
 
-fn write_scram_user_store_file(username: &str, password: &[u8]) -> std::path::PathBuf {
+fn write_scram_user_store_file(username: &str, password: &[u8]) -> fixture_guard::UserStoreFile {
     let dir = std::env::temp_dir().join(format!(
         "wire-server-psql-interop-{}-{}",
         std::process::id(),
@@ -74,7 +77,7 @@ fn write_scram_user_store_file(username: &str, password: &[u8]) -> std::path::Pa
         verifier.to_verifier_string()
     );
     std::fs::write(&path, &content).expect("write fixture");
-    path
+    fixture_guard::UserStoreFile::new(dir, path)
 }
 
 /// `plus_enabled` で `TlsServerConfig::with_scram_channel_binding` を切り替えた

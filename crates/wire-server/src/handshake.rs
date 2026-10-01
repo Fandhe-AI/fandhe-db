@@ -1653,6 +1653,23 @@ fn connection_counter() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// フィクスチャ用一時ディレクトリを `Drop` で削除するガード（Issue #1303）。
+    /// 削除失敗はテストを失敗させず stderr へ出すのみ。
+    struct DirCleanup(std::path::PathBuf);
+
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: failed to remove temp dir {}: {e}",
+                        self.0.display()
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2056,6 +2073,7 @@ mod tests {
         // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
         // （Issue #172）。
         std::fs::create_dir(&dir).expect("create unique fixture dir");
+        let _dir_cleanup = DirCleanup(dir.clone());
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         let store = UserStore::load_from_file(&path).expect("valid empty store");

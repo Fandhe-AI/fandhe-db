@@ -67,19 +67,16 @@ impl TempUserStore {
 
 impl Drop for TempUserStore {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// `common::write_user_store_file` 等、削除手段を返さないヘルパーが作る一時
-/// ディレクトリを `Drop` で確実に削除するための汎用ガード（review 指摘対応。
-/// `TempUserStore` は自前で生成したディレクトリのみを対象とするため、共有
-/// ヘルパー由来のディレクトリはこちらで管理する）。
-struct TempDirGuard(std::path::PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // 削除失敗はテストを失敗させず（Drop 内 panic は二重 panic の恐れがある）、
+        // パスとエラーだけを stderr へ出す（Issue #1303）。
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to remove temp entry {}: {e}",
+                    self.dir.display()
+                );
+            }
+        }
     }
 }
 
@@ -190,18 +187,10 @@ fn loopback_bind_starts_listening() {
 fn common_listen_helper_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server() {
     const RESET_CONNECTIONS: usize = 3;
 
-    // `common::write_user_store_file` は生成した一時ディレクトリを削除する
-    // 手段を返り値に含めないため（他の大多数の呼び出し元と同じ前提）、ここでは
-    // 親ディレクトリを自前の `Drop` ガードで管理し、以降の `assert!`／`panic!`
-    // 経路でも確実に削除されるようにする（review 指摘: 回帰テストのクリーン
-    // アップ不備）。
+    // `common::write_user_store_file` が返す `UserStoreFile` ガードは、一時ディレクトリを
+    // `Drop` で削除する（Issue #1303）。子プロセスの `ChildGuard` より先に宣言して
+    // いるため、子の kill/wait 後に削除される。
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let _users_dir_guard = TempDirGuard(
-        users_path
-            .parent()
-            .expect("user store file has a parent dir")
-            .to_path_buf(),
-    );
     let users_store = TempUserStore::new();
     let db_path = users_store.db_path_str();
 
@@ -273,6 +262,6 @@ fn common_listen_helper_keeps_draining_stderr_so_logged_connection_errors_do_not
     );
 
     // 子プロセスの kill/wait と一時ディレクトリの削除は `ChildGuard`／
-    // `TempDirGuard` の `Drop` に委ねる（このスコープを抜ける時点で、成功時
+    // `UserStoreFile` の `Drop` に委ねる（このスコープを抜ける時点で、成功時
     // ・panic 時のいずれでも実行される）。
 }

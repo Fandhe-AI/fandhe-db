@@ -100,7 +100,7 @@ fn connect_alice(addr: std::net::SocketAddr) -> std::net::TcpStream {
     authenticate_to_ready_for_query(addr, "alice", "pw-alice")
 }
 
-fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, std::path::PathBuf) {
+fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, common::UserStoreFile) {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     let addr = spawn_server_with_engine(&users_path, core);
     (connect_alice(addr), users_path)

@@ -59,7 +59,16 @@ impl TempFixtureDir {
 
 impl Drop for TempFixtureDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // 削除失敗はテストを失敗させず（Drop 内 panic は二重 panic の恐れがある）、
+        // パスとエラーだけを stderr へ出す（Issue #1303）。
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to remove temp entry {}: {e}",
+                    self.dir.display()
+                );
+            }
+        }
     }
 }
 

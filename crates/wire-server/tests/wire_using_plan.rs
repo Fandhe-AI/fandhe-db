@@ -161,7 +161,7 @@ fn seeded_storage() -> (Storage, temp_db::CleanupGuard) {
     (storage, guard)
 }
 
-fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, std::path::PathBuf) {
+fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, common::UserStoreFile) {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     let addr = spawn_server_with_engine(&users_path, core);
     let stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");

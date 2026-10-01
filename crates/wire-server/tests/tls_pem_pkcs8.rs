@@ -54,7 +54,16 @@ impl TempFile {
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // 削除失敗はテストを失敗させず（Drop 内 panic は二重 panic の恐れがある）、
+        // パスとエラーだけを stderr へ出す（Issue #1303）。
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: failed to remove temp entry {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
     }
 }
 
