@@ -34,7 +34,15 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   拒否する。
 - `DEFAULT` の判定順序（決定的）: テーブル存在（`42P01`／`42809`）→ 型名解決（VECTOR `0A000`）→
   DEFAULT 非対応型（`0A000`）→ リテラル種別不一致（`42601`）・長さ超過（`54000`）→ 値の束縛
-  （範囲外 `22003`・不正 `22000`）→ カタログ更新。
+  （数値の範囲外 `22003`・不正 `22000`・`DATE` の書式違反 `22007`・範囲外／暦上不正 `22008`）→
+  カタログ更新。
+- `DATE` 列の `DEFAULT`（Issue #1279）: 文字列リテラルのみ受理し（`DATE DEFAULT 1` は `42601`）、
+  `ColumnDefault::Text` が文字列リテラルの原文として列型に従い解釈される
+  （`row_codec::default_scalar` が `datetime::parse_date` へ委譲。INSERT のリテラル束縛と同じ
+  文法・SQLSTATE）。新 variant は足さず、カタログ符号化（v5 の `s` タグ）も変えない。後続の
+  `TIMESTAMP`／`UUID`／`ENUM`（#1280〜#1282）も同じ対応表へ腕を足して拡張する。DDL の成否は
+  カタログと入力のみで決まり、行ストアは参照しない（テナント境界）。HTTP の
+  `alter_table.add_column` は引き続き DEFAULT を受け取らない。
 - 予約列名（`id`・`tenant_id`・`visibility`。ASCII の大文字小文字を無視）は
   `CREATE TABLE`（Issue #899）の列定義と同じく構造検証段階で `42601` 拒否する
   （`sql::parser` が疑似列・RLS 内部列として扱う名前を DDL で隠蔽させない）。
@@ -203,7 +211,8 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 
 - `CREATE TABLE`: #899（実装済み。DDL 権限ゲートを共有）
 - `DROP COLUMN`・`ALTER COLUMN TYPE` の SQL 表層構文: #901（Rust API のみ実装済み）
-- `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #1169 で実装済み
+- `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #1169 で実装済み（`DATE` の DEFAULT は #1279 で
+  実装済み。`TIMESTAMP`・`UUID`・`ENUM` は #1280〜#1282）
 - 制約（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` 等）: #903・#905〜#907
 - NoSQL 表層の DDL op: #910
 - 配列型の DDL 表記: #899 へ申し送り

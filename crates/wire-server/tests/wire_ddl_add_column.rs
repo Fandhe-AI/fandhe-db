@@ -123,6 +123,7 @@ fn wire_add_column_with_not_null_and_default_receives_command_complete() {
     for sql in [
         "ALTER TABLE docs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ja'",
         "ALTER TABLE docs ADD COLUMN n INTEGER DEFAULT 3",
+        "ALTER TABLE docs ADD COLUMN d DATE NOT NULL DEFAULT '2020-01-01'",
     ] {
         send_simple_query(&mut stream, sql);
         let tag = read_command_complete(&mut stream);
@@ -208,6 +209,26 @@ fn wire_duplicate_column_is_rejected_with_42701() {
     send_simple_query(&mut stream, "ALTER TABLE docs ADD COLUMN embedding TEXT");
     expect_error_response_with_sqlstate(&mut stream, "42701");
     read_ready_for_query(&mut stream);
+}
+
+/// `DATE` 列の不正な `DEFAULT` は engine の SQLSTATE 写像どおり拒否される（Issue #1279）。
+#[test]
+fn wire_date_default_errors_are_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for (sql, code) in [
+        (
+            "ALTER TABLE docs ADD COLUMN d DATE DEFAULT '2020-02-30'",
+            "22008",
+        ),
+        ("ALTER TABLE docs ADD COLUMN d DATE DEFAULT 'abc'", "22007"),
+        ("ALTER TABLE docs ADD COLUMN d DATE DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
 }
 
 #[test]
