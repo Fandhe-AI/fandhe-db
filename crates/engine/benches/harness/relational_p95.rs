@@ -235,6 +235,24 @@ pub fn predicate_statements(
                 lang_token(1)
             ),
         ),
+        // 診断用 arm（Issue #1275）。`pred_in2` は `pred_or2` と同じ選択率のまま索引経路を通り、
+        // `pred_or_same` は `pred_eq` と同じ選択率のまま OR 群（PlainScan）経路を通る。
+        // 選択率と経路を直交させて、OR 群の遅さが経路由来であることを切り分ける。
+        (
+            "pred_in2",
+            format!(
+                "SELECT id FROM {table} WHERE lang IN ('{}', '{}') {tail}",
+                lang_token(0),
+                lang_token(1)
+            ),
+        ),
+        (
+            "pred_or_same",
+            format!(
+                "SELECT id FROM {table} WHERE lang = '{0}' OR lang = '{0}' {tail}",
+                lang_token(0)
+            ),
+        ),
         (
             "pred_in8",
             format!("SELECT id FROM {table} WHERE lang IN ({in_list}) {tail}"),

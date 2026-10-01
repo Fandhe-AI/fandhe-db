@@ -72,17 +72,38 @@ fn pair_ratio_uses_reference_of_the_min_pair() {
 fn predicate_statement_structure() {
     let lit = vector_literal(&[0.5, 1.0]).expect("literal");
     let stmts = predicate_statements("docs", &lit).expect("statements");
-    assert_eq!(stmts.len(), 3);
+    assert_eq!(stmts.len(), 5);
     assert_eq!(stmts[0].0, REFERENCE_ARM);
-    let or2 = &stmts[1].1;
-    assert_eq!(or2.matches(" OR ").count(), 1);
-    let in8 = &stmts[2].1;
-    let list = in8
-        .split("IN (")
+    let by_label = |label: &str| -> &str {
+        stmts
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map(|(_, s)| s.as_str())
+            .expect("arm exists")
+    };
+    let in_list_len = |sql: &str| -> usize {
+        sql.split("IN (")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("in list")
+            .split(',')
+            .count()
+    };
+    assert_eq!(by_label("pred_or2").matches(" OR ").count(), 1);
+    // 診断用 arm: 同一リテラルの OR は参照 arm と同じ選択率、2 要素 IN は pred_or2 と同じ選択率。
+    let same = by_label("pred_or_same");
+    assert_eq!(same.matches(" OR ").count(), 1);
+    let lits: Vec<&str> = same
+        .split("WHERE ")
         .nth(1)
-        .and_then(|s| s.split(')').next())
-        .expect("in list");
-    assert_eq!(list.split(',').count(), 8);
+        .and_then(|s| s.split(" ORDER").next())
+        .expect("where clause")
+        .split(" OR ")
+        .collect();
+    assert_eq!(lits.len(), 2);
+    assert_eq!(lits[0], lits[1]);
+    assert_eq!(in_list_len(by_label("pred_in2")), 2);
+    assert_eq!(in_list_len(by_label("pred_in8")), 8);
     for (_, sql) in &stmts {
         let last = sql.split_whitespace().last().expect("token");
         assert_eq!(last, PRED_LIMIT.to_string());
