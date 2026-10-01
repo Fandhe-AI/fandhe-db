@@ -47,7 +47,7 @@ ENUM 型は全テナント共有カタログで `PolicyContext` を取らない�
 
 ## 既知の制限・対象外
 
-- 型名の重複は ERR-6 に専用行が無いため `42P07`（PostgreSQL の `42710` ではない）。
+- 型名の重複は既存の `42P07` へ写像した（PostgreSQL の `42710` ではない。ERR-6 ポインタ）。
 - 型数上限（`MAX_ENUM_TYPES`）超過はカタログが `Invalid` を返すため `42601`（`54000` ではない）。
 - `ALTER TYPE ... ADD VALUE` の SQL 公開、`CREATE TABLE` 列定義での ENUM 型名、NoSQL 表層での型 DDL は対象外
   （ENUM 列は `ALTER TABLE ... ADD COLUMN` で宣言する）。

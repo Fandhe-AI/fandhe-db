@@ -9,7 +9,9 @@
 //! (3) 同一トランザクション内での `operation_id` 再利用は `25000`、
 //! (4) `INITIALLY DEFERRED` の FK は `COMMIT` 時に検査される（参照アクションの
 //! 連鎖で書き換わった子テーブルを含む）、(5) 自トランザクションの未 commit 変更の
-//! 読み取り（Scan・Aggregate・JOIN・サブクエリ・カーソル）。
+//! 読み取り（Scan・Aggregate・JOIN・サブクエリ・カーソル）、(6) `UPDATE`（単一行・
+//! 述語形）・述語形 `DELETE` の `RETURNING`（Issue #1272）、(7) UPSERT
+//! （`INSERT ... ON CONFLICT`）の `RETURNING`（Issue #1273）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -76,6 +78,16 @@ impl<'e> Tx<'e> {
         Self {
             core,
             ctx: ctx(tenant),
+            session: SessionState::default(),
+            txn: core.new_session_transaction(),
+        }
+    }
+
+    /// 可視性モードを呼び出し側で指定するコンストラクタ（Public のみのセッション用）。
+    fn with_ctx(core: &'e EngineCore, ctx: PolicyContext) -> Self {
+        Self {
+            core,
+            ctx,
             session: SessionState::default(),
             txn: core.new_session_transaction(),
         }
@@ -233,6 +245,409 @@ fn delete_returning_inside_transaction_returns_the_deleted_row() {
     assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 3);
 }
 
+// --- UPDATE・述語形 DELETE の RETURNING（Issue #1272） ---------------------------
+
+fn returning_rows(outcome: SqlOutcome) -> (u64, Vec<Vec<String>>) {
+    match outcome {
+        SqlOutcome::Returning(o) => (
+            o.rows_affected,
+            o.result
+                .rows
+                .iter()
+                .map(|r| r.cells.iter().map(|c| format!("{c:?}")).collect())
+                .collect(),
+        ),
+        other => panic!("expected Returning, got {other:?}"),
+    }
+}
+
+fn int(n: i64) -> String {
+    format!("SignedInteger({n})")
+}
+
+fn text(s: &str) -> String {
+    format!("Text({s:?})")
+}
+
+#[test]
+fn update_and_predicate_delete_returning_read_your_writes_and_commit() {
+    let (core, path) = new_core("txn-dml-ret-ryw");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let (n, rows) = returning_rows(
+        tx.ok("UPDATE docs SET n = 21 WHERE id = 2 RETURNING id, n USING OPERATION_ID 'u1'"),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], int(21));
+    assert_eq!(
+        tx_rows(&mut tx, "SELECT n FROM docs WHERE id = 2 LIMIT 10"),
+        vec![vec![int(21)]]
+    );
+
+    let (n, rows) =
+        returning_rows(tx.ok(
+            "UPDATE docs SET tag = 'z' WHERE tag = 'c' RETURNING id, tag USING OPERATION_ID 'u2'",
+        ));
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], text("z"));
+    assert_eq!(
+        tx_rows(&mut tx, "SELECT tag FROM docs WHERE id = 3 LIMIT 10"),
+        vec![vec![text("z")]]
+    );
+
+    let (n, rows) = returning_rows(
+        tx.ok("DELETE FROM docs WHERE tag = 'a' RETURNING id, n USING OPERATION_ID 'd1'"),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], int(10));
+    assert!(tx_rows(&mut tx, "SELECT n FROM docs WHERE id = 1 LIMIT 10").is_empty());
+
+    tx.ok("COMMIT");
+    assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 2);
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 2 LIMIT 10"),
+        vec![vec![int(21)]]
+    );
+}
+
+#[test]
+fn update_and_predicate_delete_returning_rollback_leaves_no_trace() {
+    let (core, path) = new_core("txn-dml-ret-rollback");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE udocs (n BIGINT, u TEXT UNIQUE)");
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c') \
+         USING OPERATION_ID 'seed'",
+    );
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    returning_rows(
+        tx.ok("UPDATE udocs SET u = 'zz' WHERE id = 1 RETURNING id, u USING OPERATION_ID 'u1'"),
+    );
+    returning_rows(
+        tx.ok("UPDATE udocs SET u = 'yy' WHERE n = 20 RETURNING id, u USING OPERATION_ID 'u2'"),
+    );
+    returning_rows(tx.ok("DELETE FROM udocs WHERE n = 30 RETURNING id, u USING OPERATION_ID 'd1'"));
+    tx.ok("ROLLBACK");
+
+    // 行: 元に戻る。
+    assert_eq!(ids(&core, &alice, "udocs").len(), 3);
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT u FROM udocs WHERE id = 1 LIMIT 10"),
+        vec![vec![text("a")]]
+    );
+    // 索引: 新しい値は空き、元の値は残っている。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (7, 70, 'zz') USING OPERATION_ID 'i1'",
+    );
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "INSERT INTO udocs (id, n, u) VALUES (8, 80, 'a') USING OPERATION_ID 'i2'",
+        )
+        .expect_err("original unique entry must remain");
+    assert_eq!(err.wire_code(), "23505");
+    // 台帳: 同じ operation_id を再利用できる。
+    ok(
+        &core,
+        &alice,
+        "UPDATE udocs SET u = 'q1' WHERE id = 2 RETURNING id USING OPERATION_ID 'u2'",
+    );
+    ok(
+        &core,
+        &alice,
+        "DELETE FROM udocs WHERE n = 30 RETURNING id USING OPERATION_ID 'd1'",
+    );
+}
+
+#[test]
+fn update_and_predicate_delete_returning_stay_inside_the_tenant_boundary() {
+    let (core, path) = new_core("txn-dml-ret-tenant");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+    seed(&core, "bob");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let (n, rows) = returning_rows(
+        tx.ok("UPDATE docs SET tag = 'x' WHERE n >= 10 RETURNING id, tag USING OPERATION_ID 'u1'"),
+    );
+    assert_eq!(n, 3);
+    assert_eq!(rows.len(), 3);
+    let (n, rows) = returning_rows(
+        tx.ok("DELETE FROM docs WHERE tag = 'x' RETURNING id, tag USING OPERATION_ID 'd1'"),
+    );
+    assert_eq!(n, 3);
+    assert_eq!(rows.len(), 3);
+    tx.ok("COMMIT");
+
+    assert!(ids(&core, &ctx("alice"), "docs").is_empty());
+    assert_eq!(ids(&core, &ctx("bob"), "docs").len(), 3);
+    assert_eq!(
+        auto_rows(&core, "bob", "SELECT tag FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![text("a")]]
+    );
+}
+
+#[test]
+fn returning_with_unknown_column_fails_the_transaction_closed() {
+    let (core, path) = new_core("txn-dml-ret-failclosed");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let code = tx.err_code(
+        "UPDATE docs SET n = 99 WHERE id = 1 RETURNING no_such_col USING OPERATION_ID 'u1'",
+    );
+    assert_eq!(code, "22000");
+    assert_eq!(tx.status(), TransactionStatus::Failed);
+    tx.ok("ROLLBACK");
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![int(10)]]
+    );
+    ok(
+        &core,
+        &ctx("alice"),
+        "UPDATE docs SET n = 99 WHERE id = 1 USING OPERATION_ID 'u1'",
+    );
+}
+
+// --- UPSERT の RETURNING（Issue #1273） -------------------------------------------
+
+#[test]
+fn upsert_returning_read_your_writes_and_commit() {
+    let (core, path) = new_core("txn-upsert-ret-ryw");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    tx.ok("INSERT INTO docs (id, n, tag) VALUES (10, 100, 'new') USING OPERATION_ID 'i1'");
+    // 同一トランザクション内で先に挿入した行への衝突（read-your-writes）。
+    let (n, rows) = returning_rows(
+        tx.ok("INSERT INTO docs (id, n, tag) VALUES (10, 101, 'upd') \
+         ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n RETURNING id, n USING OPERATION_ID 'u1'"),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], int(101));
+    // 既存 id（衝突・返さない）と新規 id（返す）の混在 DO NOTHING。
+    let (n, rows) = returning_rows(tx.ok(
+        "INSERT INTO docs (id, n, tag) VALUES (1, 0, 'x'), (11, 110, 'y') \
+         ON CONFLICT (id) DO NOTHING RETURNING id, n USING OPERATION_ID 'u2'",
+    ));
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], int(110));
+    assert_eq!(
+        tx_rows(&mut tx, "SELECT n FROM docs WHERE id = 10 LIMIT 10"),
+        vec![vec![int(101)]]
+    );
+    tx.ok("COMMIT");
+    assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 5);
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 10 LIMIT 10"),
+        vec![vec![int(101)]]
+    );
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![int(10)]]
+    );
+}
+
+#[test]
+fn upsert_returning_rollback_leaves_no_trace() {
+    let (core, path) = new_core("txn-upsert-ret-rollback");
+    let _guard = CleanupGuard(path);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE udocs (n BIGINT, u TEXT UNIQUE)");
+    let alice = ctx("alice");
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (1, 10, 'a'), (2, 20, 'b') USING OPERATION_ID 'seed'",
+    );
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    returning_rows(tx.ok("INSERT INTO udocs (id, n, u) VALUES (1, 11, 'zz') \
+         ON CONFLICT (id) DO UPDATE SET u = EXCLUDED.u RETURNING id, u USING OPERATION_ID 'u1'"));
+    returning_rows(tx.ok("INSERT INTO udocs (id, n, u) VALUES (5, 50, 'new') \
+         ON CONFLICT (id) DO NOTHING RETURNING id, u USING OPERATION_ID 'u2'"));
+    tx.ok("ROLLBACK");
+
+    // 行: 元に戻り、新規行は残らない。
+    assert_eq!(ids(&core, &alice, "udocs").len(), 2);
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT u FROM udocs WHERE id = 1 LIMIT 10"),
+        vec![vec![text("a")]]
+    );
+    // 索引: 新しい値は空き、元の値は残っている。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (7, 70, 'zz') USING OPERATION_ID 'i1'",
+    );
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (8, 80, 'new') USING OPERATION_ID 'i3'",
+    );
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "INSERT INTO udocs (id, n, u) VALUES (9, 90, 'a') USING OPERATION_ID 'i2'",
+        )
+        .expect_err("original unique entry must remain");
+    assert_eq!(err.wire_code(), "23505");
+    // 台帳: 同じ operation_id を autocommit で再利用できる。
+    ok(
+        &core,
+        &alice,
+        "INSERT INTO udocs (id, n, u) VALUES (2, 21, 'q1') \
+         ON CONFLICT (id) DO UPDATE SET u = EXCLUDED.u RETURNING id USING OPERATION_ID 'u1'",
+    );
+}
+
+#[test]
+fn upsert_returning_do_nothing_conflict_is_not_returned() {
+    let (core, path) = new_core("txn-upsert-ret-nothing");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let (n, rows) = returning_rows(tx.ok(
+        "INSERT INTO docs (id, n, tag) VALUES (1, 0, 'x'), (2, 0, 'y') \
+         ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'u1'",
+    ));
+    assert_eq!(n, 0);
+    assert!(rows.is_empty());
+    assert_eq!(tx.status(), TransactionStatus::InTransaction);
+    tx.ok("COMMIT");
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![int(10)]]
+    );
+}
+
+#[test]
+fn upsert_returning_stays_inside_the_tenant_boundary() {
+    let (core, path) = new_core("txn-upsert-ret-tenant");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+    ok(
+        &core,
+        &ctx("bob"),
+        "INSERT INTO docs (id, n, tag) VALUES (1, 10, 'a'), (99, 990, 'bob-only') \
+         USING OPERATION_ID 'seed'",
+    );
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let (n, rows) = returning_rows(tx.ok(
+        "INSERT INTO docs (id, n, tag) VALUES (1, 5, 'mine'), (99, 5, 'fresh') \
+         ON CONFLICT (id) DO UPDATE SET tag = EXCLUDED.tag RETURNING id, tag \
+         USING OPERATION_ID 'u1'",
+    ));
+    // bob だけが持つ id 99 は alice にとって衝突なし（新規挿入）。
+    assert_eq!(n, 2);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], text("mine"));
+    assert_eq!(rows[1][1], text("fresh"));
+    tx.ok("COMMIT");
+
+    assert_eq!(
+        auto_rows(&core, "bob", "SELECT tag FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![text("a")]]
+    );
+    assert_eq!(
+        auto_rows(&core, "bob", "SELECT tag FROM docs WHERE id = 99 LIMIT 10"),
+        vec![vec![text("bob-only")]]
+    );
+    assert_eq!(
+        auto_rows(
+            &core,
+            "alice",
+            "SELECT tag FROM docs WHERE id = 99 LIMIT 10"
+        ),
+        vec![vec![text("fresh")]]
+    );
+}
+
+#[test]
+fn upsert_returning_fails_closed_and_fails_the_transaction() {
+    let (core, path) = new_core("txn-upsert-ret-failclosed");
+    let _guard = CleanupGuard(path);
+    setup_docs(&core);
+    seed(&core, "alice");
+
+    // 不可視（Private）な自テナント行への DO UPDATE は 42501。
+    let public_only = PolicyContext::new("alice").expect("valid tenant");
+    let mut tx = Tx::with_ctx(&core, public_only);
+    tx.ok("BEGIN");
+    let code = tx.err_code(
+        "INSERT INTO docs (id, n, tag) VALUES (1, 99, 'x') \
+         ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n RETURNING id USING OPERATION_ID 'u1'",
+    );
+    assert_eq!(code, "42501");
+    assert_eq!(tx.status(), TransactionStatus::Failed);
+    tx.ok("ROLLBACK");
+    assert_eq!(
+        auto_rows(&core, "alice", "SELECT n FROM docs WHERE id = 1 LIMIT 10"),
+        vec![vec![int(10)]]
+    );
+
+    // 未知列の RETURNING は 22000 でトランザクションを Failed にする。
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    let code = tx.err_code(
+        "INSERT INTO docs (id, n, tag) VALUES (5, 50, 'x') \
+         ON CONFLICT (id) DO NOTHING RETURNING nope USING OPERATION_ID 'u2'",
+    );
+    assert_eq!(code, "22000");
+    assert_eq!(tx.status(), TransactionStatus::Failed);
+    tx.ok("ROLLBACK");
+    assert_eq!(ids(&core, &ctx("alice"), "docs").len(), 3);
+    // 台帳未消費（'u1'・'u2' とも再利用できる）。
+    ok(
+        &core,
+        &ctx("alice"),
+        "INSERT INTO docs (id, n, tag) VALUES (1, 99, 'x') \
+         ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n RETURNING id USING OPERATION_ID 'u1'",
+    );
+    ok(
+        &core,
+        &ctx("alice"),
+        "INSERT INTO docs (id, n, tag) VALUES (5, 50, 'x') \
+         ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'u2'",
+    );
+}
 // --- operation_id の再利用検査 ---------------------------------------------------
 
 #[test]

@@ -112,10 +112,9 @@ engine の `ErrorClass`（閉じた 16 分類）にも spec にも、未定義�
 | パラメータ型宣言（`num_param_types > 0`） | #1171 以降は受理（上限 64 超過は `54000`、プレースホルダ数超過は `08P01`。WIRE-12） |
 | SQL 検証失敗 | `SqlSurfaceError::error_class()`（簡易クエリと同一） |
 
-**申し送り（spec リポ側の課題）**: PostgreSQL の `26000`（undefined prepared
-statement）・`42P05`（duplicate prepared statement）相当の分類が
-ERR-2／ERR-6 に無いため、WIRE-11 確定時に分類を定めるかは spec リポ側の
-判断に委ねる。
+PostgreSQL の `26000`（undefined prepared statement）・`42P05`（duplicate
+prepared statement）に相当する分類は `ErrorClass` に無く、本実装は上表の写像を
+使う（WIRE-11・ERR-2・ERR-6 ポインタ）。
 
 ## 暫定契約（#934 で置換済み）
 

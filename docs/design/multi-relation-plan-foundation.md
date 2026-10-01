@@ -75,9 +75,9 @@ spec に数値基準は無く、後続の JOIN 実装（#925 以降）が要求�
 
 ### `42712`（相関名重複）を採用しない
 
-ERR-6 に相関名重複専用の SQLSTATE 行が無いため、公開名重複は新規分類を増やさず既存の
-`UnsupportedSyntax`（`42601`）へ fail-closed に倒す。JOIN 開放時に必要になれば #925 で
-再検討する。
+公開名重複は新規分類を増やさず、既存の `UnsupportedSyntax`（`42601`）へ
+fail-closed に倒す（PostgreSQL の `42712` は採用しない。ERR-6 ポインタ）。JOIN 開放時に
+必要になれば #925 で再検討する。
 
 ### `TableGenerationKey` / `GenerationKeyedCache<V>`
 

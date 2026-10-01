@@ -1301,38 +1301,33 @@ fn dml_returning_unknown_column_is_rejected_before_write() {
     .expect("operation_id must still be usable");
 }
 
-/// 明示トランザクション内の DML `RETURNING`（UPDATE／DELETE／UPSERT）は従来どおり
-/// 未対応として拒否される（fail-closed の維持。Issue #1182 のスコープ外）。
+/// 明示トランザクション内の UPSERT `RETURNING` は受理され、挿入行を返し
+/// `rows_affected` と一致する（Issue #1273。拒否していた旧挙動からの仕様変更）。
 #[test]
-fn dml_returning_inside_explicit_transaction_is_still_rejected() {
+fn upsert_returning_inside_explicit_transaction_returns_changed_rows() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
     seed(&core, &alice, 1, "ja", "hello", "op-seed");
 
-    for sql in [
-        format!(
-            "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING * USING OPERATION_ID 'op-tx'"
-        ),
-        format!("DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING * USING OPERATION_ID 'op-tx'"),
-        format!(
-            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES (9, '[0.1,0.2]', 'ja', 'x') \
-             ON CONFLICT (id) DO NOTHING RETURNING * USING OPERATION_ID 'op-tx'"
-        ),
-    ] {
-        let mut session = SessionState::default();
-        let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
-            .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&alice, &mut session, &mut txn, &sql)
-            .expect_err("RETURNING DML inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        let _ = core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK");
-    }
+    let sql = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES (9, '[0.1,0.2]', 'ja', 'x') \
+         ON CONFLICT (id) DO NOTHING RETURNING * USING OPERATION_ID 'op-tx'"
+    );
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let outcome = expect_returning(
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, &sql)
+            .expect("UPSERT RETURNING inside a transaction must be accepted"),
+    );
+    assert_eq!(outcome.rows_affected, 1, "{sql}");
+    assert_eq!(outcome.result.rows.len(), 1, "{sql}");
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
     let readback = core
         .execute_sql(&alice, &format!("SELECT lang FROM {TABLE} LIMIT 10"))
         .expect("select");
-    assert_eq!(readback.rows.len(), 1);
-    assert_eq!(readback.rows[0].cells, vec![Cell::Text("ja".to_string())]);
+    assert_eq!(readback.rows.len(), 2);
 }

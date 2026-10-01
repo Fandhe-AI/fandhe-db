@@ -2173,6 +2173,9 @@ pub(crate) fn bind_column_default(
             ScalarRef::Numeric(d) => Ok(Value::Numeric(d)),
             ScalarRef::Bool(b) => Ok(Value::Bool(b)),
             ScalarRef::Date(d) => Ok(Value::Date(d)),
+            ScalarRef::Enum(s) => Ok(Value::Enum(s.to_string())),
+            ScalarRef::Uuid(u) => Ok(Value::Uuid(u)),
+            ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
                 column.name
@@ -2187,6 +2190,14 @@ pub(crate) fn bind_column_default(
         Err(DefaultBindError::Malformed) => {
             Err(SqlSurfaceError::invalid_text_representation(format!(
                 "column {:?} DEFAULT has an invalid input syntax for its type",
+                column.name
+            )))
+        }
+        // ENUM 語彙外は `bind_enum_literal` と同じ 22P02。語彙の一覧は含めない
+        // （列名のみ。P0）。
+        Err(DefaultBindError::EnumLabel) => {
+            Err(SqlSurfaceError::invalid_text_representation(format!(
+                "column {:?} DEFAULT is not a valid label of its enum type",
                 column.name
             )))
         }
@@ -8573,5 +8584,17 @@ mod tests {
         let err = bind_column_default(&col(ColumnType::Boolean), &number("1"))
             .expect_err("incompatible default must be rejected");
         assert_eq!(err.wire_code(), "22000");
+
+        // UUID（Issue #1281）: 文法不正は INSERT の UUID リテラル束縛と同じ 22P02。
+        let text = |s: &str| ColumnDefault::Text(s.to_string());
+        let err = bind_column_default(&col(ColumnType::Uuid), &text("abc"))
+            .expect_err("malformed UUID default must be rejected");
+        assert_eq!(err.wire_code(), "22P02");
+        let ok = bind_column_default(
+            &col(ColumnType::Uuid),
+            &text("00000000-0000-0000-0000-000000000001"),
+        )
+        .expect("valid UUID default");
+        assert!(matches!(ok, crate::row_codec::Value::Uuid(_)));
     }
 }
