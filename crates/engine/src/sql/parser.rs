@@ -4361,7 +4361,7 @@ impl BoundAggregate {
     /// [`BoundGroupBy::order_by`] へ写す builder。`sort` は `GROUP BY` 列名か集計項目の
     /// 既定エイリアスを指す）。空スライスは no-op。`GROUP BY` なし（単一行集計）は
     /// 多層防御で `42601`、件数が [`crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS`] を
-    /// 超えれば `54000`（束縛より前に検査）、未知・曖昧な参照は `22000`。
+    /// 超えれば `54000`（束縛より前に検査）、未知の参照は `22000`、曖昧な参照は `42702`（Issue #1270）。
     pub fn with_group_order_by(
         mut self,
         keys: &[crate::sql::allowlist::ScalarOrderKey],
@@ -5890,8 +5890,9 @@ pub(crate) fn check_having_target_is_numeric(
 /// SQL テキスト経由の [`bind_group_by_clause`] と、直接構築経由の
 /// [`BoundAggregate::with_group_order_by`]（Issue #1198・NOSQL-15）が共有する
 /// 単一実装。`key_names` は宣言順の `GROUP BY` 列名、`group_key_aliases` は
-/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件・複数一致は
-/// いずれも `22000`（エコーするのは呼び出し元が識別子形状検査済みの名前のみ）。
+/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件は `22000`、複数一致
+/// （重複した集計名・キー別名の重複・キーと集計項目の衝突）は `42702`
+/// （Issue #1270・SQL-28／ERR-6。エコーするのは呼び出し元が識別子形状検査済みの名前のみ）。
 fn resolve_group_reference<S: AsRef<str>>(
     key_names: &[S],
     group_key_aliases: &[(usize, String)],
@@ -5921,9 +5922,7 @@ fn resolve_group_reference<S: AsRef<str>>(
         ([], []) => Err(SqlSurfaceError::invalid_input(format!(
             "unknown GROUP BY reference: {name}"
         ))),
-        _ => Err(SqlSurfaceError::invalid_input(format!(
-            "ambiguous GROUP BY reference: {name}"
-        ))),
+        _ => Err(SqlSurfaceError::ambiguous_column(name)),
     }
 }
 
@@ -8110,7 +8109,7 @@ mod tests {
         let err = plan
             .with_group_order_by(&[sort_key("count", false)], &docs_schema())
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42702");
     }
 
     #[test]

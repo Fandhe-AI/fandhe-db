@@ -608,6 +608,8 @@ pub enum SqlSurfaceError {
     /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
     /// 含め、候補テーブルの列挙はしない（security.md P0「存在情報を漏らさない」
     /// 対応。曖昧な列は「どのテーブルの候補があるか」自体が情報になり得る）。
+    /// 集計の `HAVING`／`ORDER BY` が出力名（重複した集計名・キー別名の重複・
+    /// キーと集計項目の衝突）を複数一致で解決できない場合も同分類（Issue #1270）。
     AmbiguousColumn { name: String },
 }
 
@@ -829,6 +831,8 @@ impl SqlSurfaceError {
     /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
     /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
     /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
+    /// 集計の出力名解決（`parser::resolve_group_reference`・`join::plan` の集計束縛、
+    /// Issue #1270）からも呼ばれる。
     pub(crate) fn ambiguous_column(name: impl Into<String>) -> Self {
         SqlSurfaceError::AmbiguousColumn {
             name: truncate_for_error(&name.into()),

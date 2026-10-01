@@ -1009,7 +1009,7 @@ fn build_aggregate_shape(
     let mut having: Vec<(usize, BinOp, f64)> = Vec::with_capacity(agg.having.len());
     for h in &agg.having {
         // 同名の集計項目が複数あるときは曖昧として拒否する（先頭一致で黙って解決しない。
-        // 単一テーブル集計の `resolve_group_reference` と同じ 22000）。
+        // 単一テーブル集計の `resolve_group_reference` と同じ 42702。Issue #1270）。
         let mut hits = item_names
             .iter()
             .enumerate()
@@ -1017,10 +1017,7 @@ fn build_aggregate_shape(
             .map(|(i, _)| i);
         let idx = match (hits.next(), hits.next()) {
             (Some(_), Some(_)) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "HAVING target {:?} is ambiguous",
-                    h.item_name
-                )))
+                return Err(SqlSurfaceError::ambiguous_column(h.item_name.as_str()))
             }
             (Some(i), None) => i,
             (None, _) => {
@@ -1068,19 +1065,9 @@ fn build_aggregate_shape(
         let item_match: Option<usize> = match item_hits.as_slice() {
             [] => None,
             [i] => Some(*i),
-            _ => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "ORDER BY target {:?} is ambiguous",
-                    target.name()
-                )))
-            }
+            _ => return Err(SqlSurfaceError::ambiguous_column(target.name())),
         };
-        let ambiguous = || {
-            SqlSurfaceError::invalid_input(format!(
-                "ORDER BY target {:?} is ambiguous",
-                target.name()
-            ))
-        };
+        let ambiguous = || SqlSurfaceError::ambiguous_column(target.name());
         let resolved = if alias_keys.is_empty() && item_match.is_none() {
             let r = b.scope.resolve(target)?;
             let name = slot_name(

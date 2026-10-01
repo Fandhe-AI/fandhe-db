@@ -344,9 +344,8 @@ const EXPECTED_STATUS: [(&str, u16); 40] = [
     // （`42P07` の 409 とは揃えない）。
     ("42710", 400),
     // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
-    // 参照スコープでの非修飾列の曖昧解決。本 Issue では SQL 表層が JOIN・複数
-    // FROM を受理しないため到達不能で、`err4_f_unreachable_classes_project_via_production_encoder`
-    // が射影のみを検証する。
+    // 参照スコープでの非修飾列の曖昧解決。`aggregate.sort` の出力名の複数一致
+    // からも到達可能（Issue #1270。`err4_f_ambiguous_sort_reachable_via_nosql_aggregate`）。
     ("42702", 400),
 ];
 
@@ -887,10 +886,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // （`UndefinedFunction`〔`42883`〕は `aggregate` op から到達可能。固定は
         // `err4_f_sum_on_date_column_projects_42883_to_400` が担う）
         ErrorClass::DuplicateFunction,
-        // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
-        // 参照スコープの基盤導入のみで、許可リストは JOIN・複数 FROM を引き続き
-        // `42601` で拒否するため NoSQL 表層からは到達不能。
-        ErrorClass::AmbiguousColumn,
+        // （`AmbiguousColumn`〔`42702`〕は Issue #1270 で `aggregate.sort` から到達
+        // 可能になったためこの一覧から外した。固定は
+        // `err4_f_ambiguous_sort_reachable_via_nosql_aggregate` が担う）
         // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: `ALTER TABLE ... ADD
         // CONSTRAINT` の CHECK・FOREIGN KEY の名前衝突。NoSQL の `alter_table` は
         // `add_column`／`drop_column` だけで到達不能。
@@ -901,6 +899,23 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
     }
+}
+
+/// `AmbiguousColumn`（`42702`。Issue #1270）は NoSQL 表層の実要求から到達可能:
+/// `aggregate.sort` が複数一致する出力名（`count(*)` と `count(lang)` の既定名
+/// `count`）を参照すると engine の共有リゾルバが拒否する。400 に射影し、応答に
+/// テナントを含めない。
+#[test]
+fn err4_f_ambiguous_sort_reachable_via_nosql_aggregate() {
+    let (core, _guard) = new_core();
+    let addr = spawn(core);
+
+    let body = br#"{"op":"aggregate","table":"docs",
+        "aggregates":[{"fn":"count","column":"*"},{"fn":"count","column":"lang"}],
+        "group_by":"lang","sort":[{"column":"count","dir":"asc"}]}"#;
+    let resp = query_as_alice(addr, body);
+    assert_projected(&resp, "42702");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 
 /// `UndefinedFunction`（`42883`。SQL-26、Issue #1186）は NoSQL 表層の実要求から

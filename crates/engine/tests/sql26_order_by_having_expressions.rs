@@ -557,6 +557,11 @@ fn having_and_order_by_expression_error_contract() {
     ] {
         assert_eq!(run_err(&core, &ctx, &sql), "22000", "{sql}");
     }
+    // 出力名が複数一致する識別子は式形でも 42702（Issue #1270）。未知名は上で 22000。
+    for tail in ["ORDER BY abs(t)", "HAVING abs(t) > 0"] {
+        let sql = format!("SELECT lang, SUM(n) AS t, SUM(n) AS t FROM docs GROUP BY lang {tail}");
+        assert_eq!(run_err(&core, &ctx, &sql), "42702", "{sql}");
+    }
     // 評価エラーはグループが存在するときのみ発生する。
     assert_eq!(
         run_err(&core, &ctx, &format!("{AGG} HAVING abs(1 / (c - c)) > 0")),

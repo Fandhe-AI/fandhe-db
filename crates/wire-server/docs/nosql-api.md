@@ -360,7 +360,10 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 - `group_by` 要素数が 8（`MAX_GROUP_BY_COLUMNS`）超過・グループ数上限
   （10,000）・グループキー累計バイト・`having` 述語数上限超過 → `54000`
 - `group_by` 列が `TEXT`／数値列（INTEGER／BIGINT／REAL／DOUBLE）でない・`having` が `MIN`/`MAX(<TEXT列>)` を参照・
-  参照先が `aggregates` に存在しない／曖昧 → `22000`
+  参照先が `aggregates` に存在しない／曖昧（`(fn, column)` の重複照合） → `22000`
+- `sort[].column` が集計結果の出力名に存在しない → `22000`、複数一致で曖昧（例: `count(*)` と
+  `count(<列>)` を併記した既定名 `count`） → `42702`（Issue #1270。SQL の `ORDER BY` と同じ分類。
+  候補は列挙せず参照名のみを返す）
 - `VECTOR` 列の集計: `count` は列の裸の列参照を受理し非 `NULL` 行数を数える
   （`resolve_aggregate_input` の `AggregateInput::VectorColumnPresence`）。
   `sum`／`avg`／`min`／`max` は同じ `VECTOR` 列参照を一律 `22000` で拒否
@@ -1005,7 +1008,7 @@ Date: <IMF-fixdate>
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
-| `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕で SQL 表層からは到達可能になったが、NoSQL 表層の op 語彙に JOIN 相当が無いため。後述） |
+| `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | `aggregate.sort` が複数一致する出力名を参照したとき到達可能（Issue #1270）。`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕は NoSQL 表層の op 語彙に無い。後述 |
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP INDEX` は op 許可リスト外。後述） |
 | `42710` | `DUPLICATE_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD CONSTRAINT` は SQL 表層専用。後述） |
@@ -1031,7 +1034,7 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 17 分類（`42501`・`34000`・`P0002`・`42701`・`42702`・`42P07`・`2BP01`・
+到達不能な 16 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42704`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
@@ -1047,9 +1050,10 @@ Issue #900）が誘発する分類だが、NoSQL 表層の `op` 許可リスト�
 `docs/design/sql-alter-table-add-column.md` 参照）。`AmbiguousColumn`（`42702`。
 SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql::relation`）が
 新設した分類で、`INNER JOIN`（Issue #925）により SQL 表層からは到達可能に
-なった（`docs/design/inner-join.md` 参照）。ただし NoSQL 表層の `op` 許可
-リストに JOIN 相当が無いため、実要求（HTTP API 経由）からは引き続き到達
-しない。`DuplicateObject`（`42710`。TABLE-22、Issue #1195）は
+なった（`docs/design/inner-join.md` 参照）。NoSQL 表層には JOIN 相当が無いが、
+`aggregate.sort` の出力名が複数一致で曖昧なときは engine の共有リゾルバから
+`42702` が実要求（HTTP API 経由）で到達する（Issue #1270。到達不能の一覧からは
+外した）。`DuplicateObject`（`42710`。TABLE-22、Issue #1195）は
 `ALTER TABLE ... ADD CONSTRAINT`（CHECK・FOREIGN KEY）の制約名衝突で、NoSQL
 `alter_table` は `add_column`／`drop_column` のみのため到達しない。
 `DuplicateFunction`（`42723`。SQL-26、Issue #1186）は

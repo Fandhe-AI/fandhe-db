@@ -962,7 +962,7 @@ fn group_by_desc_order_places_null_group_first_for_limit() {
 // `HAVING` は `SUM(id)` のように `2^53` を超えうる整数集計値を精度損失なく比較
 // する（PR #230 codex-review P1 指摘対応: 以前は `Cell::Integer(u64)` を無条件に
 // `f64` へキャストしていたため、`2^53` 超の集計値が丸められ等号・不等号比較が
-// 誤判定しうた）。HAVING リテラル自体は束縛段で `2^53` 以下に制限されるため、
+// 誤判定し得た）。HAVING リテラル自体は束縛段で `2^53` 以下に制限されるため、
 // ここでは集計値側（`SUM(id)`）を `2^53` 超にして検証する。
 #[test]
 fn having_compares_large_integer_sum_without_precision_loss() {
@@ -1028,4 +1028,49 @@ fn having_compares_large_integer_sum_without_precision_loss() {
         1,
         "SUM(id) = {HUGE_ID} must compare greater than the literal {MAX_LITERAL}"
     );
+}
+
+// Issue #1270（SQL-28・ERR-6）: 集計の `HAVING`／`ORDER BY` が出力名を複数一致で
+// 解決できないとき `42702`（曖昧）、一致 0 件は従来どおり `22000`。文言は参照名
+// のみをエコーし、候補（他の列名・テーブル名）を列挙しない。
+#[test]
+fn ambiguous_output_name_in_having_and_order_by_is_42702() {
+    let path = unique_db_path("group-by-ambiguous-42702");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let _truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-a", true);
+
+    let cases = [
+        // 重複した集計別名（ORDER BY・HAVING）。
+        "SELECT lang, SUM(id) AS total, SUM(id) AS total FROM docs GROUP BY lang ORDER BY total",
+        "SELECT lang, SUM(id) AS total, SUM(id) AS total FROM docs GROUP BY lang HAVING total > 0",
+        // 既定名の重複。
+        "SELECT lang, COUNT(*), COUNT(*) FROM docs GROUP BY lang ORDER BY count",
+        // キーと集計項目の衝突。
+        "SELECT lang, COUNT(*) AS lang FROM docs GROUP BY lang ORDER BY lang",
+        // キー別名の重複（別キー番号へ同名で射影）。
+        "SELECT lang AS k, id AS k, COUNT(*) FROM docs GROUP BY lang, id ORDER BY k",
+    ];
+    for sql in cases {
+        let err = core
+            .execute_sql(&ctx, sql)
+            .expect_err("ambiguous output name must be rejected");
+        assert_eq!(err.wire_code(), "42702", "sql={sql:?} err={err:?}");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("docs") && !msg.contains("embedding"),
+            "message must not enumerate candidates: {msg}"
+        );
+    }
+
+    // 一致 0 件（未知名）は 22000 のまま。
+    for sql in [
+        "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY zz",
+        "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING zz > 0",
+    ] {
+        let err = core.execute_sql(&ctx, sql).expect_err("unknown name");
+        assert_eq!(err.wire_code(), "22000", "sql={sql:?} err={err:?}");
+    }
 }
