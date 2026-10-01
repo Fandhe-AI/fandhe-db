@@ -82,8 +82,9 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 
 `sql::exec` は各実行関数の `_in` 版（`WriteTarget` を受け取る本体）を持ち、既存の
 関数は `Autocommit` を渡す薄いラッパーとして挙動を変えない。`core.rs` の
-`execute_in_active_txn` が `Insert`（単一行・複数行・UPSERT。`RETURNING` は単一行・
-複数行のみ）・`Delete`・`Update` を受理し、成功後に `mark_written` する。
+`execute_in_active_txn` が `Insert`（単一行・複数行・UPSERT）・`Delete`・`Update` を
+受理し、成功後に `mark_written` する。`RETURNING` を受け付けるのは単一行・複数行の
+`INSERT` と単一行 `DELETE` だけで、それ以外は下記の `0A000` で拒否する。
 `parsed_operation_id` は `Delete`・`Update` の `operation_id` も返し、同一
 トランザクション内での再利用（`25000`）は全 DML に効く。
 
@@ -91,6 +92,16 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 （`replace_typed_rows_by_text_key`。埋め込み I/O を単一ライタの保持中に行うことに
 なるため autocommit 専用のまま）、DDL、`USING PLAN` を伴う検索 SELECT・`EXPLAIN`
 のうち対象テーブルが dirty のもの（「6. トランザクション内の読み取り」参照）。
+
+**明示トランザクション内の `RETURNING` で拒否（`0A000`）するもの（Issue #1182 の
+経緯・SQL-31・SQL-21）**: 単一行・述語形の `UPDATE ... RETURNING`、述語形の
+`DELETE ... RETURNING`、UPSERT（`INSERT ... ON CONFLICT ... RETURNING`）。
+`UPDATE`／`DELETE` は `execute_in_active_txn` の中で書き込みトランザクションに触れる前に、
+UPSERT は `execute_insert_returning_form` の `Upsert` 腕で束縛の後・書き込みの前に
+拒否する。`RETURNING` を黙って落とす fail-open にはせず、エラーで `Failed` へ遷移する
+ため部分書き込みは永続化されない。文の実行ディスパッチは起源を区別しないので、暗黙
+トランザクション（WIRE-16・Issue #1175）でも同じ制限になる。受け付けるようにする
+後続は Issue #1272（`UPDATE`・述語形 `DELETE`）と Issue #1273（UPSERT）。
 
 **commit 後の副作用の監査（Issue #1179）**: 上記の書き込み関数と呼び出し元
 （`sql::exec`・`core.rs`）に、`commit_boundary::commit` の後で共有インメモリ状態
@@ -297,11 +308,17 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   `25000`・対応外文（DDL）の `0A000`・文数上限の `54000`・TRUNCATE と INSERT の原子的
   commit・接続断相当（drop）での完全ロールバックを固定。
 - `crates/engine/tests/sql31_txn_dml.rs`（Issue #1179）: 複数行 INSERT・UPSERT・
-  UPDATE・DELETE（RETURNING を含む）の COMMIT／ROLLBACK／drop、全 DML への
+  UPDATE・DELETE の COMMIT／ROLLBACK／drop（`RETURNING` を扱うのは単一行 `DELETE` と
+  複数行 `INSERT` のみ）、全 DML への
   `operation_id` 再利用検査、遅延 FK の COMMIT 時検査（連鎖で書き換わったテーブルの
   下位の遅延 FK を含む）、未 commit 変更の読み取り（Scan・Aggregate・GROUP BY・JOIN・
   自己 JOIN・サブクエリ・集合演算・カーソル）、キャッシュ汚染の回帰（ROLLBACK 後に
   世代が再利用されても未 commit 行が現れない）、RLS を固定。
+- `crates/engine/tests/sql_returning.rs`
+  （`dml_returning_inside_explicit_transaction_is_still_rejected`）: 明示トランザクション内の
+  単一行 `UPDATE`・述語形 `DELETE`・UPSERT の `RETURNING` が `0A000` になり行が変わらない
+  ことを固定。暗黙トランザクション側は `crates/engine/tests/wire16_implicit_txn.rs`・
+  `crates/wire-server/tests/wire16_multi_statement.rs` が固定。
 - `crates/wire-server/tests/wire19_ready_for_query_status.rs`・
   `wire942_extended_transaction.rs`（Issue #1179）: トランザクション内 COPY の
   ReadyForQuery 状態・拡張クエリ経路の UPDATE／DELETE／UPSERT・停滞した COPY の
@@ -331,6 +348,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 ## 対象外・申し送り
 
+- 明示トランザクション内の `UPDATE`（単一行・述語形）・述語形 `DELETE` の `RETURNING`
+  受理は Issue #1272、UPSERT の `RETURNING` 受理は Issue #1273（#1272 の後）。現状は
+  上記「`RETURNING` で拒否（`0A000`）するもの」のとおり（SQL-31・SQL-21）。
 - 明示トランザクション内のファイル形 INSERT（埋め込み I/O。`0A000` のまま）と、
   dirty テーブルに対する `USING PLAN` の検索 SELECT・`EXPLAIN`（`0A000` のまま。
   上記「6. トランザクション内の読み取り」の残る既知の逸脱）。
@@ -343,8 +363,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   **Issue #1175 で実装済み（制約付き）**。`BEGIN` を含まないメッセージのうち書き込みが
   最後以外にある形は、メッセージ全体を 1 つの暗黙トランザクションで原子的に実行する
   （詳細は [`wire-multi-statement.md`](./wire-multi-statement.md)「原子性」節）。
-  使える文は明示トランザクションと同じ許可リストで、`UPDATE`・`DELETE` 等は `0A000`
-  （#1179 で明示トランザクション側が広がれば自動的に広がる）。`BEGIN` より前の書き込みを
+  使える文は明示トランザクションと同じ許可リスト（Issue #1179 で拡大済み。`RETURNING`
+  の制限も同じ）。`BEGIN` より前の書き込みを
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
