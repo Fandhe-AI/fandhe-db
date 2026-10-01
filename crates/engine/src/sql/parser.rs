@@ -5981,7 +5981,7 @@ fn bind_group_by_clause(
     // HAVING/ORDER BY の対象名解決: いずれかの `GROUP BY` 列名そのもの、その
     // キーの SELECT リストでの実効名（`group_key_aliases` のいずれか）、または
     // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
-    // （曖昧・非存在は `22000`）。
+    // （非存在は `22000`、曖昧は `42702`。Issue #1270）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
         resolve_group_reference(&clause.columns, group_key_aliases, items, name)
     };
@@ -6018,7 +6018,7 @@ fn bind_group_by_clause(
 
     // Issue #1188・SQL-26: 式述語の `HAVING`・式キーの `ORDER BY` は「グループ出力行ビュー」
     // （`GROUP BY` キー列＋集計項目の結果を並べた合成スキーマ）に対して束縛する。式中の識別子は
-    // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。曖昧・未知は `22000`）で
+    // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。未知は `22000`・曖昧は `42702`）で
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
     let view_schema = group_row_schema(schema, &keys, items);
@@ -6168,7 +6168,7 @@ fn group_row_schema(
 /// 式中の識別子を `resolve_target`（`GROUP BY` キー名・別名・集計項目名）で解決し、
 /// グループ出力行ビューの合成列名（`__gk<i>`／`__ga<j>`）へ置換した式を返す
 /// （Issue #1188）。
-/// 未知・曖昧な識別子は `resolve_target` の `22000` をそのまま返す。
+/// 未知（`22000`）・曖昧（`42702`）な識別子は `resolve_target` の分類をそのまま返す。
 fn rewrite_group_row_idents(
     expr: &Expr,
     resolve_target: &dyn Fn(&str) -> Result<OrderTarget, SqlSurfaceError>,
