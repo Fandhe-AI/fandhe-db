@@ -1396,6 +1396,36 @@ impl MetadataFilter {
         &self.op
     }
 
+    /// 束縛済みの TEXT／ENUM 辞書等価の値集合から `InText` フィルタを組み立てる
+    /// （Issue #1305。`sql::where_tree::BoundOrGroup::as_same_column_text_in` が
+    /// 同じ列への等価 `OR` を 1 本の `IN` へ畳む際に使う）。
+    ///
+    /// 入力は束縛済み（長さ検査・ENUM ラベル検証済み）を前提とし、束縛時の `IN` と
+    /// 同じく sort・dedup する（`InText` の `binary_search` 評価と、索引側の
+    /// 辞書スロット昇順連結が前提とする不変条件）。空、または重複除去後に
+    /// [`MAX_IN_LIST_ITEMS`] を超える場合は `None`（「畳まない」の意味でありエラー
+    /// ではない。呼び出し元は従来どおり `OR` 群のまま残す＝fail-closed）。
+    pub(crate) fn from_bound_text_in(
+        column_index: usize,
+        mut values: Vec<String>,
+    ) -> Option<MetadataFilter> {
+        values.sort();
+        values.dedup();
+        if values.is_empty() || values.len() > MAX_IN_LIST_ITEMS {
+            return None;
+        }
+        Some(MetadataFilter {
+            column_index,
+            op: FilterOp::InText(values),
+        })
+    }
+
+    /// 単体テスト用に束縛済みフィルタを直接組み立てる。
+    #[cfg(test)]
+    pub(crate) fn for_test(column_index: usize, op: FilterOp) -> MetadataFilter {
+        MetadataFilter { column_index, op }
+    }
+
     /// `value`（対象列の値。`None` は NULL）がこのフィルタに一致するかを PG 互換の
     /// 三値論理（`eval`）で判定し、`Some(true)` のときだけ真とする（SQL-24。
     /// TASK-208 ポインタ）。UNKNOWN（型不一致・NULL 経由の未確定）は不一致として
@@ -1497,6 +1527,18 @@ pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<ScalarRef<'_>>]
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn from_bound_text_in_sorts_dedups_and_bounds() {
+        let f = MetadataFilter::from_bound_text_in(3, vec!["b".into(), "a".into(), "a".into()])
+            .unwrap();
+        assert_eq!(f.column_index(), 3);
+        assert!(matches!(f.op(), FilterOp::InText(v) if v == &["a".to_string(), "b".to_string()]));
+        assert!(MetadataFilter::from_bound_text_in(0, vec![]).is_none());
+        let n = |k: usize| (0..k).map(|i| format!("v{i:04}")).collect::<Vec<_>>();
+        assert!(MetadataFilter::from_bound_text_in(0, n(MAX_IN_LIST_ITEMS)).is_some());
+        assert!(MetadataFilter::from_bound_text_in(0, n(MAX_IN_LIST_ITEMS + 1)).is_none());
+    }
+
     use super::*;
     use crate::catalog::ColumnDef;
 

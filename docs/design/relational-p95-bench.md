@@ -129,6 +129,17 @@ Issue #1275。SQL-24・SQL-2・RLS-10 ポインタ。production コード（`cra
 差分はキャッシュを温めた後の 1 回の実行あたり。縮小規模（2 万行）と本規模（10 万行）で同じ結果だった。
 `pred_in8`（選択率 50%）も索引経路のままで、選択度による切替は起きない。
 
+Issue #1305（案 A の実装）以降は、`pred_or2` と `pred_or_same` も束縛時に `IN` へ畳まれ、次の経路になる
+（縮小規模 2 万行で確認。経路自己検査は通る）。上の表は #1275 時点の値で、履歴として残す。
+
+| arm | `scalar_plan` | `index_scans` | `index_trusted_mask_scans` | `full_rebuild_copies` |
+| --- | ------------- | ------------- | -------------------------- | --------------------- |
+| `pred_or2`（#1305 後） | `index_in_list` | +1 | +1 | +0 |
+| `pred_or_same`（#1305 後） | `index_in_list` | +1 | +1 | +0 |
+
+縮小規模（2 万行・共有環境・負荷平均約 12）の参考値: `pred_or2` の p95 は約 0.31 ms で `pred_in2`（約 0.30 ms）と同等になった。
+専有環境の再測定ではないため、閾値判定には使わない。
+
 ### 実測
 
 本規模（100,000 行 x 768 次元・N=5）。単位は ms。round 行の p95 を並べた。共有環境（10 論理 CPU・loadavg 約 9〜10。
@@ -180,11 +191,11 @@ SQL-24 の数値基準（10 万本 x 768 次元で p95 100 ms 以下）に対し
 ため、閾値判定は専有環境の再測定（オーナー作業）で確定する。現時点の結論は
 「基準は共有環境の min-of-N では満たす。OR 群の経路は索引経路より約 20 倍遅く、改善は任意の最適化」とする。
 
-### 改善案（本 Issue では実装しない）
+### 改善案（案 A は Issue #1305 で実装済み。詳細は [sql-or-to-in-rewrite.md](./sql-or-to-in-rewrite.md)）
 
 | 案 | 内容 | 効果の範囲 | 見積・リスク |
 | -- | ---- | ---------- | ------------ |
-| A | 束縛時に、全分岐が同じ TEXT／ENUM 列の等価（または IN）1 件だけの OR 群を、1 本の `IN` フィルタへ書き換える（AND の連言に足すだけで意味は同じ。NULL は両形とも不一致） | `pred_or2` 型（同じ列の OR） | `EXPLAIN` の `scalar_plan` が `plain_scan` から `index_in_list` に変わる。`HINT ORDER` の経路・NoSQL の `or`・型付き等価の扱いを決める必要があり、2h を超える見込み |
+| A（実装済み: Issue #1305） | 束縛時に、全分岐が同じ TEXT／ENUM 列の等価（または IN）1 件だけの OR 群を、1 本の `IN` フィルタへ書き換える（AND の連言に足すだけで意味は同じ。NULL は両形とも不一致） | `pred_or2` 型（同じ列の OR） | `EXPLAIN` の `scalar_plan` が `plain_scan` から `index_in_list` に変わる。`HINT ORDER` の経路・NoSQL の `or`・型付き等価の扱いを決める必要があり、2h を超える見込み |
 | B | `ScalarIndex::resolve_candidates` に OR 群の分岐ごとの候補の和集合を足し、`ScalarPlan` に新しい variant を足す | 異なる列にまたがる OR、Issue #1165 のチャンク化した `IN (SELECT ...)` | 分類・`EXPLAIN` トークン・信頼マスクの不変条件の再証明が要り、規模が大きい |
 | C | `PlainScan` でも hybrid でない距離順位付けは、複製しないマスク経路（`filter_cached_rls_rows_subset` と同じ形）へ載せる | 残余述語を持つすべての `PlainScan` クエリ（一致 1 行あたりの複製費） | 全件の SCALAR 評価は残る。中程度 |
 

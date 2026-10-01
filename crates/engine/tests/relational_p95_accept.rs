@@ -343,3 +343,13 @@ fn sentinel_scale_dominates_fixture() {
     assert!(sentinel_scale(10.0, 0.0) >= 2.0);
     assert!(!sentinel_dominates(60.0, 60.0));
 }
+
+#[test]
+fn expected_path_pins_or_arms_to_index_in_list() {
+    // Issue #1305: 同じ列への等価 OR は束縛時に IN へ畳まれ索引経路になる。
+    assert_eq!(expected_path("pred_eq"), ("index_equality", true));
+    for arm in ["pred_or2", "pred_or_same", "pred_in2", "pred_in8"] {
+        assert_eq!(expected_path(arm), ("index_in_list", true), "{arm}");
+    }
+    assert_eq!(expected_path("unknown_arm"), ("plain_scan", false));
+}

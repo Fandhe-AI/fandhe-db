@@ -922,8 +922,8 @@ fn observe_candidate_slots_grouped_inner(
                 }
             }
         }
-        // TASK-208・Issue #912: `classify_scalar_plan` は OR 群を含む述語を常に
-        // `PlainScan` へ縮退させるため通常到達しないが、多層防御として評価する
+        // TASK-208・Issue #912: `classify_scalar_plan` は（束縛時に `IN` へ畳めなかった）
+        // OR 群を含む述語を常に `PlainScan` へ縮退させるため通常到達しないが、多層防御として評価する
         // （`aggregate::observe_candidate_slots` と同じ判断）。
         for group in &bound.or_filters {
             let group_embedding: &[f32] = if group.references_embedding() {

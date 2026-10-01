@@ -85,7 +85,10 @@ pub struct ScalarShapeInput<'a> {
     ///
     /// 索引経路（`sql::scalar_index`）は現時点で OR 群の和集合計算に対応して
     /// いない（Issue #912 のスコープでは索引最適化を対象外とし、正しさを優先
-    /// して `ScalarPlan::PlainScan` へ一律縮退する。索引対応は別 Issue）。
+    /// して `ScalarPlan::PlainScan` へ一律縮退する）。ただし WHERE トップレベルの
+    /// 「同じ TEXT／ENUM 列への等価 OR」は束縛時に `InText` へ畳まれて
+    /// `metadata_filters` 側へ移る（Issue #1305。`sql::parser` の
+    /// `fold_same_column_text_or_groups`）ため、ここへ届くのは畳めなかった OR 群だけ。
     pub or_filters: &'a [BoundOrGroup],
 }
 

@@ -235,9 +235,9 @@ pub fn predicate_statements(
                 lang_token(1)
             ),
         ),
-        // 診断用 arm（Issue #1275）。`pred_in2` は `pred_or2` と同じ選択率のまま索引経路を通り、
-        // `pred_or_same` は `pred_eq` と同じ選択率のまま OR 群（PlainScan）経路を通る。
-        // 選択率と経路を直交させて、OR 群の遅さが経路由来であることを切り分ける。
+        // 診断用 arm（Issue #1275）。`pred_in2` は `pred_or2` と同じ選択率の `IN` 形で、
+        // `pred_or_same` は `pred_eq` と同じ選択率の同一列 OR。Issue #1305 以降は OR が束縛時に
+        // `IN` へ畳まれるため `pred_or2`／`pred_or_same` とも索引経路を通る（#1275 時点は PlainScan）。
         (
             "pred_in2",
             format!(
@@ -627,5 +627,18 @@ pub fn render_threshold_line(dedicated: bool, full_scale: bool) -> String {
         "threshold_judgement: not evaluated (reduced scale; reference values only)".to_string()
     } else {
         "threshold_judgement: not evaluated (shared environment; reference values only)".to_string()
+    }
+}
+
+/// arm ごとに期待する実行経路（Issue #1275・#1305）。`(EXPLAIN の scalar_plan トークン, 索引経路か)`。
+/// 索引経路は信頼マスク走査を 1 回通り `full_rebuild_copies` を増やさず、PlainScan は
+/// 可視行全件を評価して `full_rebuild_copies` を 1 回増やす。同じ列への等価 OR
+/// （`pred_or2`・`pred_or_same`）は Issue #1305 で束縛時に `IN` フィルタへ畳まれ索引経路になる。
+/// 期待と異なれば計測を始めず終了する（ベンチ本体と `tests/relational_p95_accept.rs` が共有）。
+pub fn expected_path(arm: &str) -> (&'static str, bool) {
+    match arm {
+        "pred_eq" => ("index_equality", true),
+        "pred_in2" | "pred_in8" | "pred_or2" | "pred_or_same" => ("index_in_list", true),
+        _ => ("plain_scan", false),
     }
 }
