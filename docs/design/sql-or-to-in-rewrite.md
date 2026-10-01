@@ -13,7 +13,7 @@ Issue #1305。ポインタ: TASK-208・SQL-24・SQL-2・RLS-10（spec 本文は�
 
 WHERE のトップレベルで、全分岐が「同じ TEXT／ENUM 列への等価（または `IN`）1 件だけ」の
 OR 群を、束縛時に 1 本の `InText` メタデータフィルタへ書き換える
-（`sql::parser::fold_same_column_text_or_groups`、判定は `BoundOrGroup::as_same_column_text_in`、
+（`sql::where_tree::fold_same_column_text_or_groups`、判定は `BoundOrGroup::as_same_column_text_in`、
 構築は `MetadataFilter::from_bound_text_in`）。`EXPLAIN` の `scalar_plan` は `index_in_list` になる。
 分類ロジック（`classify_scalar_plan`）は変えない。束縛結果が変わるだけで、実行・`EXPLAIN`・
 集計・GROUP BY の判定が同じ入力から同時に追従する。
@@ -39,6 +39,12 @@ OR 群を、束縛時に 1 本の `InText` メタデータフィルタへ書き�
 評価順は metadata、式、OR 群の順のため、畳むと OR 群が式述語より前に評価され、
 従来は式のエラーになっていた文が空結果になり得る。これを避けるため、式述語を含む文は畳まない。
 
+## 適用範囲
+
+- SQL WHERE のトップレベル（`sql::parser::bind_where_predicates`）。
+- NoSQL（HTTP）`filter` のトップレベルの `or`（Issue #1306。`sql::declarative_predicate::bind_declarative_predicates`）。
+  同じ関数を共有し、入れ子の `or`（分岐内の `or`）・式述語の併用などの対象外条件も SQL と同じ。
+
 ## 対象外とその理由
 
 | 経路 | 理由 |
@@ -46,7 +52,6 @@ OR 群を、束縛時に 1 本の `InText` メタデータフィルタへ書き�
 | JOIN の残余 | 1 分岐の `Or` で包んで束縛され（条件 2 で除外）、索引も参照しないため効果が無い |
 | `IN (SELECT ...)` | 1 チャンクでも 1 分岐の `Or` で包む。2 チャンク以上は先頭が 256 件で上限超過。計画形状は不変 |
 | CHECK | 別の入口（`bind_check_predicates`）。永続化・再オープン時の再検証経路を変えない |
-| NoSQL の `or` | 別 binder（`declarative_predicate`）。判定関数は再利用できる形にしてある |
 | 型付き等価（DATE 等）・BOOLEAN | `InTyped` は索引非対応で効果が無い |
 | TEXT の範囲比較・LIKE・IS NULL・NOT | 等価でないため畳めない |
 | 入れ子の OR | 索引の効果が無い |

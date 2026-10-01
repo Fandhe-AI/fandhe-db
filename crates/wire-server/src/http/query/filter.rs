@@ -1616,12 +1616,24 @@ mod tests {
 
     #[test]
     fn two_branch_or_binds_to_or_group() {
+        // 異なる列への `or` は IN へ畳めず OR 群のまま残る。
         let bound = bind(
-            r#"[{"or":[{"column":"lang","op":"eq","value":"ja"},{"column":"lang","op":"eq","value":"en"}]}]"#,
+            r#"[{"or":[{"column":"lang","op":"eq","value":"ja"},{"column":"path","op":"eq","value":"en"}]}]"#,
         )
         .expect("bind ok");
         assert!(bound.metadata_filters().is_empty());
         assert_eq!(bound.or_filters().len(), 1);
+    }
+
+    #[test]
+    fn same_column_eq_or_folds_into_in_text() {
+        // 同じ列への等価 `or` は SQL 表層と同じく `InText` 1 件へ畳まれる（Issue #1306）。
+        let bound = bind(
+            r#"[{"or":[{"column":"lang","op":"eq","value":"ja"},{"column":"lang","op":"eq","value":"en"}]}]"#,
+        )
+        .expect("bind ok");
+        assert_eq!(bound.metadata_filters().len(), 1);
+        assert!(bound.or_filters().is_empty());
     }
 
     #[test]

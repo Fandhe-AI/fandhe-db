@@ -178,6 +178,13 @@ pub fn bind_declarative_predicates(
             &mut or_filters,
         )?;
     }
+    // トップレベルの同列等価 OR を IN へ畳む（Issue #1306。SQL 側と共通。
+    // `bind_one` の分岐再帰では呼ばない＝入れ子は対象外）。
+    let or_filters = crate::sql::where_tree::fold_same_column_text_or_groups(
+        &mut metadata_filters,
+        &expr_filters,
+        or_filters,
+    );
     Ok(BoundWhereFilters {
         metadata_filters,
         expr_filters,
@@ -392,6 +399,56 @@ mod tests {
                 "2024-01-01",
             ))],
         ])];
+        let bound =
+            bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default()).unwrap();
+        assert!(bound.metadata_filters().is_empty());
+        assert_eq!(bound.or_filters().len(), 1);
+    }
+
+    fn eq_branch(col: &str, v: &str) -> Vec<DeclarativePredicate> {
+        vec![DeclarativePredicate::Leaf(DeclarativeFilter::equals(
+            col, v,
+        ))]
+    }
+
+    #[test]
+    fn folds_same_column_eq_or_into_in_text() {
+        let preds = vec![DeclarativePredicate::Or(vec![
+            eq_branch("lang", "ja"),
+            eq_branch("lang", "en"),
+            eq_branch("lang", "fr"),
+        ])];
+        let bound =
+            bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default()).unwrap();
+        assert_eq!(bound.metadata_filters().len(), 1);
+        assert!(bound.or_filters().is_empty());
+    }
+
+    #[test]
+    fn does_not_fold_nested_or() {
+        let preds = vec![DeclarativePredicate::Or(vec![
+            eq_branch("lang", "ja"),
+            vec![DeclarativePredicate::Or(vec![
+                eq_branch("lang", "en"),
+                eq_branch("lang", "fr"),
+            ])],
+        ])];
+        let bound =
+            bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default()).unwrap();
+        assert!(bound.metadata_filters().is_empty());
+        assert_eq!(bound.or_filters().len(), 1);
+    }
+
+    #[test]
+    fn does_not_fold_when_top_level_expr_present() {
+        let preds = vec![
+            DeclarativePredicate::Or(vec![eq_branch("lang", "ja"), eq_branch("lang", "en")]),
+            DeclarativePredicate::Expr(Expr::Binary {
+                op: udf_call::BinOp::Eq,
+                lhs: Box::new(Expr::Ident("lang".to_string())),
+                rhs: Box::new(Expr::String("ja".to_string())),
+            }),
+        ];
         let bound =
             bind_declarative_predicates(&preds, &schema(), &UdfRegistry::default()).unwrap();
         assert!(bound.metadata_filters().is_empty());

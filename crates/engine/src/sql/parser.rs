@@ -1501,49 +1501,9 @@ pub(crate) fn bind_where_predicates(
         &mut equality_ordinal,
         true,
     )?;
-    let or_filters = fold_same_column_text_or_groups(&mut metadata, &expr, or_filters);
+    let or_filters =
+        crate::sql::where_tree::fold_same_column_text_or_groups(&mut metadata, &expr, or_filters);
     Ok((metadata, expr, rls, or_filters))
-}
-
-/// WHERE トップレベルの「同じ TEXT／ENUM 列への等価（または `IN`）だけの `OR` 群」
-/// を 1 本の `InText` メタデータフィルタへ畳む（Issue #1305・TASK-208・SQL-24
-/// ポインタ）。畳むと `sql::scalar_plan::classify_scalar_plan` が `IndexInList` へ
-/// 分類でき、EXPLAIN と実行経路（exec／aggregate／group_by）が同じ束縛結果から
-/// 同時に追従する。
-///
-/// - トップレベル限定: 入れ子の `OR` は索引の効果が無いため対象外。CHECK は別の入口
-///   （[`bind_check_predicates`]）で再帰本体を直接呼ぶため本関数を通らず、永続化・
-///   再オープン時の再検証経路は不変。
-/// - 分岐 2 個以上のみ（`OR` 群側の判定。JOIN の残余〔`sql::join::plan`〕と
-///   `IN (SELECT ...)` の 1 チャンクは 1 分岐の `Or` 包みで、形状を保つ）。
-/// - エラー順序のゲート: 式述語はエラーを返し得るが metadata フィルタは返さない。
-///   畳むと `OR` 群が式述語より前に評価されるため、トップレベルに式述語が無く、
-///   かつ畳まずに残る `OR` 群も式述語を含まない場合に限る。
-/// - フィルタ件数は `MAX_METADATA_FILTERS` を超えない場合のみ追加する。
-///
-/// 条件を満たさない群は従来どおり `or_filters` に残り `PlainScan` へ縮退する
-/// （新しいエラーは導入しない）。
-fn fold_same_column_text_or_groups(
-    metadata: &mut Vec<MetadataFilter>,
-    expr_filters: &[crate::sql::udf_call::BoundExpr],
-    or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
-) -> Vec<crate::sql::where_tree::BoundOrGroup> {
-    if !expr_filters.is_empty() || or_filters.iter().any(|g| g.contains_expr()) {
-        return or_filters;
-    }
-    let mut remaining = Vec::with_capacity(or_filters.len());
-    for group in or_filters {
-        let folded = if metadata.len() < declarative_filter::MAX_METADATA_FILTERS {
-            group.as_same_column_text_in()
-        } else {
-            None
-        };
-        match folded {
-            Some(f) => metadata.push(f),
-            None => remaining.push(group),
-        }
-    }
-    remaining
 }
 
 /// `CHECK` 制約の式述語束縛専用（Issue #1075・TABLE-16 ポインタ）。
