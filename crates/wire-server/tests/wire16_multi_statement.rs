@@ -284,7 +284,7 @@ fn read_then_write_is_accepted() {
 /// 書き込みが最後以外にある組み合わせは暗黙トランザクションで原子的に実行される
 /// （Issue #1175）。書き込みだけで完結する形は commit され、直後の読み取りは自トランザクションの
 /// 未 commit 変更を反映する（Issue #1179）。暗黙トランザクション内で対応できない文
-/// （`UPDATE ... RETURNING`）は `0A000` でメッセージ全体をロールバックする。
+/// （`DROP TABLE`。`UPDATE ... RETURNING` は Issue #1272 で対応済み）は `0A000` でメッセージ全体をロールバックする。
 /// いずれの場合も `ReadyForQuery` は `'I'`。
 #[test]
 fn write_not_last_runs_in_an_implicit_transaction_and_rolls_back_on_unsupported_statements() {
@@ -316,13 +316,13 @@ fn write_not_last_runs_in_an_implicit_transaction_and_rolls_back_on_unsupported_
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    // (3) INSERT; UPDATE ... RETURNING は暗黙トランザクション内では未対応。INSERT の応答の後に
+    // (3) INSERT; DROP TABLE は暗黙トランザクション内では未対応。INSERT の応答の後に
     //     0A000 となり、INSERT はロールバックされる。
     send_simple_query(
         &mut stream,
         "INSERT INTO docs (id, embedding, lang) VALUES (53, '[0.1,0.2,0.3]', 'ja') \
          USING OPERATION_ID 'wl-5'; \
-         UPDATE docs SET lang = 'en' WHERE id = 1 RETURNING id USING OPERATION_ID 'wl-6'",
+         DROP TABLE docs",
     );
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     expect_error_response_with_sqlstate(&mut stream, "0A000");
