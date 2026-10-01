@@ -41,7 +41,7 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   `ColumnDefault::Text` が文字列リテラルの原文として列型に従い解釈される
   （`row_codec::default_scalar` が `datetime::parse_date` へ委譲。INSERT のリテラル束縛と同じ
   文法・SQLSTATE）。新 variant は足さず、カタログ符号化（v5 の `s` タグ）も変えない。後続の
-  `TIMESTAMP`／`UUID`／`ENUM`（#1280〜#1282）も同じ対応表へ腕を足して拡張する。DDL の成否は
+  `TIMESTAMP`／`ENUM`（#1280・#1282）も同じ対応表へ腕を足して拡張する。DDL の成否は
   カタログと入力のみで決まり、行ストアは参照しない（テナント境界）。HTTP の
   `alter_table.add_column` は引き続き DEFAULT を受け取らない。
 - `UUID` 列の `DEFAULT`（Issue #1281）: 文字列リテラルのみ受理し（`UUID DEFAULT 1` は `42601`）、
