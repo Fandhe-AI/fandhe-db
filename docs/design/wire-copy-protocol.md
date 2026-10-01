@@ -32,7 +32,6 @@
   - 拡張クエリプロトコル（TASK-216）経由の COPY・Sync までの同期回復。
   - `HEADER`／`DELIMITER`／`NULL`／`QUOTE` などの COPY オプション、binary
     形式（WIRE-14 関連）、テーブル形 `COPY t TO STDOUT`、8 進・16 進エスケープ。
-  - `CopyFail` に割り当てる `wire_code`（後述）の ERR-6 表への追加要否。
 
 ## 設計（決定事項）
 
@@ -150,9 +149,8 @@
    独立に設けている）。`d`（CopyData）に加え、`H`（Flush）／`S`（Sync）も
    この読み捨て予算を共有する（後述）。
 3. **`CopyFail` の `wire_code`**: PostgreSQL は `57014`
-   （query_canceled）を返すが、ERR-6 の管轄表に `57014` が無く表外の新設は
-   禁じられているため、既存の分類（`InvalidInput`／`22000`）へ写像した。
-   spec 側で確認してもらう事項として申し送る。
+   （query_canceled）を返すが、本リポは既存の分類（`InvalidInput`／`22000`）へ
+   写像した（ERR-6 ポインタ）。
 4. **空の COPY（0 行）**: 既存の複数行 `INSERT` バッチ契約と同じく `22000`
    （空バッチ拒否）とする。PostgreSQL の `COPY 0`（成功）とは異なる。
 5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
