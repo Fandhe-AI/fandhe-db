@@ -800,7 +800,8 @@ impl SqlSurfaceError {
     }
 
     /// `pub(crate)`: `sql::set_op`（SQL-29 (c)・RLS-10 (b)・TASK-213）が集合演算の
-    /// 両辺の列数・列型不一致を報告するために使う（式の型不一致〔`CASE`/
+    /// 両辺の列数・列型不一致を報告するために使う。`sql::datetime_fn` も
+    /// `DATE ± n` の非整数 `n`（SQL-26・Issue #1274）の拒否に使う（式の型不一致〔`CASE`/
     /// `COALESCE`/`NULLIF`。SQL-26、Issue #921〕は `SqlSurfaceError::
     /// DatatypeMismatch` を直接構築する別経路を持つ。写像先の `wire_code`
     /// （`42804`）・`ErrorClass::DatatypeMismatch` は共有する）。

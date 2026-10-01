@@ -266,9 +266,13 @@ pub(crate) fn date_trunc(unit: DateTruncUnit, micros: i64) -> Result<i64, SqlSur
 /// 値を保存したまま `i32` へ変換する（`date_add_days`／`date_sub_days` の
 /// 共有前段。両者とも符号反転前にこの検証を行う契約 ― `date_sub_days` の
 /// ドキュメンテーションコメント参照）。
+///
+/// 非整数（NaN・±Inf を含む）は「整数ではない」型不一致として `42804`
+/// （[`SqlSurfaceError::datatype_mismatch`]。SQL-26・Issue #1274）で拒否する。
+/// 非整数の判定を `i32` 範囲検査（`22003`）より先に行う順序は変えない。
 fn validate_and_narrow_date_arithmetic_operand(n: f64) -> Result<i32, SqlSurfaceError> {
     if !n.is_finite() || n.fract() != 0.0 {
-        return Err(SqlSurfaceError::invalid_input(
+        return Err(SqlSurfaceError::datatype_mismatch(
             "DATE arithmetic operand must be a whole number of days",
         ));
     }
@@ -317,14 +321,14 @@ fn date_add_or_sub_days(days: i32, n: f64, sign: i64) -> Result<i32, SqlSurfaceE
 }
 
 /// `DATE + n`／`n + DATE`（`n` は日数のスカラー）。`n` が整数でない場合は
-/// `22000`、`i32` 範囲外は `22003`（[`SqlSurfaceError::numeric_out_of_range`]）、
+/// 型不一致の `42804`（Issue #1274）、`i32` 範囲外は `22003`（[`SqlSurfaceError::numeric_out_of_range`]）、
 /// 結果が `DATE` の受理範囲外は `22008` で拒否する（§2-2）。
 pub(crate) fn date_add_days(days: i32, n: f64) -> Result<i32, SqlSurfaceError> {
     date_add_or_sub_days(days, n, 1)
 }
 
 /// `DATE - n`（`n` は日数のスカラー）。エラー分類は [`date_add_days`] と同じ
-/// （`22000`／`22003`／`22008`）。
+/// （`42804`／`22003`／`22008`）。
 ///
 /// Cursor Bugbot 指摘対応（PR #1120）: `n` を先に符号反転してから
 /// `date_add_days` へ委譲する実装だと、`n == i32::MIN`
@@ -445,8 +449,15 @@ mod tests {
         let base = crate::datetime::parse_date("2024-01-01").unwrap();
         assert!(matches!(
             date_add_days(base, 1.5).unwrap_err(),
-            SqlSurfaceError::InvalidInput { .. }
+            SqlSurfaceError::DatatypeMismatch { .. }
         ));
+        // NaN・±Inf・範囲外かつ非整数は、非整数検査が先に働き型不一致になる。
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 3_000_000_000.5] {
+            assert!(matches!(
+                date_add_days(base, bad).unwrap_err(),
+                SqlSurfaceError::DatatypeMismatch { .. }
+            ));
+        }
         assert!(matches!(
             date_add_days(base, 3_000_000_000.0).unwrap_err(),
             SqlSurfaceError::NumericOutOfRange { .. }
@@ -481,7 +492,7 @@ mod tests {
         let normal_base = crate::datetime::parse_date("2024-01-01").unwrap();
         assert!(matches!(
             date_sub_days(normal_base, 1.5).unwrap_err(),
-            SqlSurfaceError::InvalidInput { .. }
+            SqlSurfaceError::DatatypeMismatch { .. }
         ));
         assert!(matches!(
             date_sub_days(normal_base, 3_000_000_000.0).unwrap_err(),
