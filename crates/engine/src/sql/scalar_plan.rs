@@ -87,8 +87,8 @@ pub struct ScalarShapeInput<'a> {
     /// いない（Issue #912 のスコープでは索引最適化を対象外とし、正しさを優先
     /// して `ScalarPlan::PlainScan` へ一律縮退する）。ただし WHERE トップレベルの
     /// 「同じ TEXT／ENUM 列への等価 OR」は束縛時に `InText` へ畳まれて
-    /// `metadata_filters` 側へ移る（Issue #1305。`sql::parser` の
-    /// `fold_same_column_text_or_groups`）ため、ここへ届くのは畳めなかった OR 群だけ。
+    /// `metadata_filters` 側へ移る（Issue #1305。`sql::where_tree::
+    /// fold_same_column_text_or_groups`。NoSQL filter も Issue #1306 で同様）ため、ここへ届くのは畳めなかった OR 群だけ。
     pub or_filters: &'a [BoundOrGroup],
 }
 
