@@ -1739,6 +1739,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         Some(ScalarRef::Bool(b)) => Value::Bool(b),
                         Some(ScalarRef::Date(d)) => Value::Date(d),
                         Some(ScalarRef::Enum(t)) => Value::Enum(t.to_string()),
+                        Some(ScalarRef::Uuid(u)) => Value::Uuid(u),
                         Some(ScalarRef::Timestamp(t)) => Value::Timestamp(t),
                         _ => {
                             return Err(RowCodecError::Invalid(format!(
@@ -3301,7 +3302,7 @@ impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
 pub(crate) enum DefaultBindError {
     /// 列型とリテラル種別が合わない（大分類の不整合・DEFAULT 非対応型）。
     Incompatible,
-    /// リテラルの文法が不正（`Malformed` 詳細は保持しない）。
+    /// リテラルの文法が不正（`UUID` の文字列不正を含む。詳細は保持しない）。
     Malformed,
     /// 列型の値域外（`INTEGER` オーバーフロー・`NUMERIC` 桁数超過等）。
     OutOfRange,
@@ -3395,6 +3396,12 @@ pub(crate) fn default_scalar<'a>(
                 Err(DefaultBindError::EnumLabel)
             }
         }
+        // `UUID` 列の既定値は文字列リテラルを `uuid::parse_uuid_text`（INSERT の
+        // `bind_uuid_literal` と同じ厳密文法）で解釈する（Issue #1281）。文法不正は
+        // `Malformed`（22P02）。原文のまま保持し、読み出し時は正規小文字表記になる。
+        (ColumnDefault::Text(s), ColumnType::Uuid) => crate::uuid::parse_uuid_text(s)
+            .map(ScalarRef::Uuid)
+            .map_err(|_| DefaultBindError::Malformed),
         // `TIMESTAMP` 列も同様に `datetime::parse_timestamp`（INSERT のリテラル束縛と
         // 同じ閉じた文法。揮発性の式は受理しない）で解釈する（Issue #1280）。
         (ColumnDefault::Text(s), ColumnType::Timestamp) => {
@@ -5875,6 +5882,60 @@ mod tests {
             default_scalar(&ColumnType::Date, &ColumnDefault::Number("1".into())),
             Err(DefaultBindError::Incompatible)
         );
+    }
+
+    /// `UUID` 列の既定値（Issue #1281）。scan・v1 decode の両方で補完され、
+    /// 束縛できない値はカタログ破損相当として fail-closed に拒否する。
+    #[test]
+    fn uuid_default_is_filled_and_invalid_uuid_default_is_rejected() {
+        let text = "0A0B0C0D-0000-0000-0000-00000000000F";
+        let uuid = crate::uuid::parse_uuid_text(text).expect("uuid");
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![ColumnDef::new("u", ColumnType::Uuid, false)
+                .with_default(ColumnDefault::Text(text.to_string()))]);
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], Some(ScalarRef::Uuid(uuid)));
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode");
+        assert_eq!(decoded[1], Value::Uuid(uuid));
+
+        for bad in ["abc", "00000000000000000000000000000001"] {
+            let (buf, schema) =
+                old_row_and_extended_schema(vec![ColumnDef::new("u", ColumnType::Uuid, true)
+                    .with_default(ColumnDefault::Text(bad.to_string()))]);
+            assert!(
+                matches!(
+                    scan_scalar_columns(&schema, &buf),
+                    Err(RowCodecError::Invalid(_))
+                ),
+                "{bad}"
+            );
+            let mask = vec![false; schema.columns.len()];
+            assert!(
+                matches!(
+                    scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+                    Err(RowCodecError::Invalid(_))
+                ),
+                "{bad} (masked out)"
+            );
+        }
+    }
+
+    #[test]
+    fn default_scalar_maps_uuid_errors() {
+        assert_eq!(
+            default_scalar(&ColumnType::Uuid, &ColumnDefault::Text("abc".into())),
+            Err(DefaultBindError::Malformed)
+        );
+        assert_eq!(
+            default_scalar(&ColumnType::Uuid, &ColumnDefault::Number("1".into())),
+            Err(DefaultBindError::Incompatible)
+        );
+        let upper_default = ColumnDefault::Text("ABCDEF00-0000-0000-0000-000000000000".into());
+        let lower_default = ColumnDefault::Text("abcdef00-0000-0000-0000-000000000000".into());
+        let upper = default_scalar(&ColumnType::Uuid, &upper_default);
+        let lower = default_scalar(&ColumnType::Uuid, &lower_default);
+        assert!(matches!(upper, Ok(ScalarRef::Uuid(_))));
+        assert_eq!(upper, lower);
     }
 
     #[test]
