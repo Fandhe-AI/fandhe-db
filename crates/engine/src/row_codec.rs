@@ -1738,6 +1738,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         Some(ScalarRef::Numeric(d)) => Value::Numeric(d),
                         Some(ScalarRef::Bool(b)) => Value::Bool(b),
                         Some(ScalarRef::Date(d)) => Value::Date(d),
+                        Some(ScalarRef::Enum(t)) => Value::Enum(t.to_string()),
                         _ => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} has an invalid DEFAULT for its type",
@@ -3307,6 +3308,8 @@ pub(crate) enum DefaultBindError {
     DatetimeFormat,
     /// `DATE` リテラルの範囲外・暦上不正（SQLSTATE `22008`。Issue #1279）。
     DatetimeOverflow,
+    /// `ENUM` の既定値が語彙外のラベル（SQLSTATE `22P02`。Issue #1282）。
+    EnumLabel,
 }
 
 /// 列の `DEFAULT` を型付きスカラー値へ変換する唯一の実装（Issue #1169）。
@@ -3380,6 +3383,17 @@ pub(crate) fn default_scalar<'a>(
                 Err(DefaultBindError::DatetimeOverflow)
             }
         },
+        // `ENUM` 列の既定値は文字列リテラルの原文を、カタログ登録済みの語彙
+        // （`EnumTypeDef::contains`。語彙検証の単一情報源）で照合する（Issue #1282）。
+        // `ScalarRef::Text` ではなく `ScalarRef::Enum` を返し、下流（encode の型ガード・
+        // 等価フィルタ・二次索引）が ENUM として一貫して扱えるようにする。
+        (ColumnDefault::Text(s), ColumnType::Enum(def)) => {
+            if def.contains(s) {
+                Ok(ScalarRef::Enum(s.as_str()))
+            } else {
+                Err(DefaultBindError::EnumLabel)
+            }
+        }
         _ => Err(DefaultBindError::Incompatible),
     }
 }

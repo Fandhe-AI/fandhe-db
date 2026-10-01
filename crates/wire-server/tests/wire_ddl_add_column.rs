@@ -299,3 +299,33 @@ fn wire_alter_table_by_one_principal_is_visible_to_other_tenants_over_wire() {
     expect_error_response_with_sqlstate(&mut bob_stream, "42501");
     read_ready_for_query(&mut bob_stream);
 }
+/// `ENUM` 列の `DEFAULT` は語彙内なら受理され、語彙外・型不一致は engine の
+/// SQLSTATE 写像どおり拒否される（Issue #1282）。
+#[test]
+fn wire_enum_default_is_accepted_or_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    send_simple_query(&mut stream, "CREATE TYPE mood AS ENUM ('happy', 'sad')");
+    let _ = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN m mood NOT NULL DEFAULT 'happy'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    for (sql, code) in [
+        (
+            "ALTER TABLE docs ADD COLUMN m2 mood DEFAULT 'angry'",
+            "22P02",
+        ),
+        ("ALTER TABLE docs ADD COLUMN m3 mood DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}

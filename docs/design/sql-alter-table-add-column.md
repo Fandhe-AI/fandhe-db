@@ -34,15 +34,24 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   拒否する。
 - `DEFAULT` の判定順序（決定的）: テーブル存在（`42P01`／`42809`）→ 型名解決（VECTOR `0A000`）→
   DEFAULT 非対応型（`0A000`）→ リテラル種別不一致（`42601`）・長さ超過（`54000`）→ 値の束縛
-  （数値の範囲外 `22003`・不正 `22000`・`DATE` の書式違反 `22007`・範囲外／暦上不正 `22008`）→
+  （数値の範囲外 `22003`・不正 `22000`・`DATE` の書式違反 `22007`・範囲外／暦上不正 `22008`・
+  `ENUM` の語彙外ラベル `22P02`）→
   カタログ更新。
 - `DATE` 列の `DEFAULT`（Issue #1279）: 文字列リテラルのみ受理し（`DATE DEFAULT 1` は `42601`）、
   `ColumnDefault::Text` が文字列リテラルの原文として列型に従い解釈される
   （`row_codec::default_scalar` が `datetime::parse_date` へ委譲。INSERT のリテラル束縛と同じ
   文法・SQLSTATE）。新 variant は足さず、カタログ符号化（v5 の `s` タグ）も変えない。後続の
-  `TIMESTAMP`／`UUID`／`ENUM`（#1280〜#1282）も同じ対応表へ腕を足して拡張する。DDL の成否は
+  `TIMESTAMP`／`UUID`（#1280・#1281）も同じ対応表へ腕を足して拡張する。DDL の成否は
   カタログと入力のみで決まり、行ストアは参照しない（テナント境界）。HTTP の
   `alter_table.add_column` は引き続き DEFAULT を受け取らない。
+- `ENUM` 列の `DEFAULT`（Issue #1282）: 文字列リテラルのみ受理し（数値・真偽値は `42601`）、
+  語彙照合は `EnumTypeDef::contains`（語彙検証の単一情報源）へ一本化する。語彙外は INSERT の
+  リテラル束縛と同じ `22P02`、既定値は `ScalarRef::Enum`／`Value::Enum` として補完される。
+  ENUM の型名解決（未登録は `42601`）は DEFAULT 評価より先に行う。`Storage::
+  alter_table_add_column` は write txn 内でカタログ登録済みの定義へ置き換えた後に DEFAULT を
+  再検証し、呼び出し元の `Arc` に由来する未登録ラベルの永続化（読み出し時補完が常に失敗する
+  自己 DoS）を防ぐ。`DROP TYPE`／`ALTER TYPE ... ADD VALUE` の依存判定（軽量パーサー）も
+  `enum` タグの Text 既定値を受理する。エラー文言に語彙は含めない。
 - 予約列名（`id`・`tenant_id`・`visibility`。ASCII の大文字小文字を無視）は
   `CREATE TABLE`（Issue #899）の列定義と同じく構造検証段階で `42601` 拒否する
   （`sql::parser` が疑似列・RLS 内部列として扱う名前を DDL で隠蔽させない）。
@@ -212,7 +221,7 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 - `CREATE TABLE`: #899（実装済み。DDL 権限ゲートを共有）
 - `DROP COLUMN`・`ALTER COLUMN TYPE` の SQL 表層構文: #901（Rust API のみ実装済み）
 - `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #1169 で実装済み（`DATE` の DEFAULT は #1279 で
-  実装済み。`TIMESTAMP`・`UUID`・`ENUM` は #1280〜#1282）
+  実装済み、`ENUM` の DEFAULT は #1282 で実装済み。`TIMESTAMP`・`UUID` は #1280・#1281）
 - 制約（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` 等）: #903・#905〜#907
 - NoSQL 表層の DDL op: #910
 - 配列型の DDL 表記: #899 へ申し送り

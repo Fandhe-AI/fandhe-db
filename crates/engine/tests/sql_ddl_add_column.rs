@@ -1099,3 +1099,162 @@ fn date_not_null_outcome_is_independent_of_rows_and_tenants() {
         Cell::Date(v) if v == days
     ));
 }
+// --- ENUM 列の DEFAULT（Issue #1282。ポインタ: TABLE-5・TABLE-14・TABLE-16） ---
+
+fn mood_core() -> (EngineCore, std::path::PathBuf) {
+    new_core_with_table_and_enum("mood", vec!["happy".to_string(), "sad".to_string()])
+}
+
+/// `ENUM` 列の `DEFAULT`。既存行は読み出し時に既定値で補われ、各読み出し経路と
+/// 新規 INSERT の列省略・明示値で一貫する。
+#[test]
+fn enum_default_fills_existing_rows_across_read_paths() {
+    let (core, path) = mood_core();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "m mood NOT NULL DEFAULT 'happy'").expect("ADD COLUMN ENUM");
+    add_column(&core, "n mood DEFAULT 'sad'").expect("ADD COLUMN nullable ENUM");
+
+    let q = |col: &str| {
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        )
+    };
+    assert!(matches!(q("m"), Cell::Text(ref t) if t == "happy"));
+    assert!(matches!(q("n"), Cell::Text(ref t) if t == "sad"));
+    assert_eq!(count_star(&core, &owner, TABLE), 1);
+    let filtered = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE m = 'happy' LIMIT 10"),
+        )
+        .expect("WHERE on ENUM default");
+    assert_eq!(filtered.rows.len(), 1);
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting m");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, m) VALUES (3, '[0.3,0.4]', 'sad') USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit m");
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT m FROM {TABLE} WHERE id = 2 LIMIT 1")),
+        Cell::Text(ref t) if t == "happy"
+    ));
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT m FROM {TABLE} WHERE id = 3 LIMIT 1")),
+        Cell::Text(ref t) if t == "sad"
+    ));
+    let err = core
+        .execute_sql_in_session(
+            &owner,
+            &mut s,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, m) VALUES (4, '[0.3,0.4]', 'angry') USING OPERATION_ID 'op-4'"
+            ),
+        )
+        .expect_err("out-of-vocabulary explicit value");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
+/// `ENUM DEFAULT` は再オープン後も既定値として読める。
+#[test]
+fn enum_default_persists_across_reopen() {
+    let (core, path) = mood_core();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "m mood NOT NULL DEFAULT 'happy'").expect("ADD COLUMN");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT m FROM {TABLE} WHERE id = 1 LIMIT 1")),
+        Cell::Text(ref t) if t == "happy"
+    ));
+}
+
+/// 型不一致・語彙外・長さ超過・未登録型名の拒否。いずれも列は追加されない。
+#[test]
+fn enum_default_type_check_errors() {
+    let (core, path) = mood_core();
+    let _guard = CleanupGuard(path);
+    let too_long = format!("m6 mood DEFAULT '{}'", "x".repeat(70_000));
+    for (decl, code) in [
+        ("m1 mood DEFAULT 1".to_string(), "42601"),
+        ("m2 mood DEFAULT true".to_string(), "42601"),
+        ("m3 mood DEFAULT 'angry'".to_string(), "22P02"),
+        ("m4 mood DEFAULT 'HAPPY'".to_string(), "22P02"),
+        ("m5 nosuchtype DEFAULT 'x'".to_string(), "42601"),
+        (too_long, "54000"),
+    ] {
+        let err = add_column(&core, &decl).expect_err(&decl[..decl.len().min(40)]);
+        assert_eq!(err.wire_code(), code, "{err:?}");
+        let name = decl.split(' ').next().unwrap_or("");
+        assert!(!column_exists(&core, &ctx("owner"), TABLE, name));
+        // 語彙は P0 としてエラー文言へ含めない。
+        assert!(!err.to_string().contains("sad"), "{err}");
+    }
+}
+
+/// `ENUM NOT NULL`（DEFAULT なし）は行の有無・他テナントの行に依存せず同一の `42601`。
+#[test]
+fn enum_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = mood_core();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "m mood NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "m mood NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+
+    add_column(&core, "m mood NOT NULL DEFAULT 'happy'").expect("other tenant rows: ok");
+    assert!(matches!(
+        one_cell(&core, &ctx("bob"), &format!("SELECT m FROM {TABLE} WHERE id = 1 LIMIT 1")),
+        Cell::Text(ref t) if t == "happy"
+    ));
+}
+
+/// ENUM の DEFAULT 列を持つテーブルがあっても `ALTER TYPE ADD VALUE`／`DROP TYPE` の
+/// 依存判定（カタログ軽量パーサー）が壊れない。
+#[test]
+fn enum_default_column_keeps_type_ddl_dependency_checks() {
+    let (core, path) = mood_core();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "m mood NOT NULL DEFAULT 'happy'").expect("ADD COLUMN");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    storage
+        .alter_enum_type_add_value("mood", "excited".to_string())
+        .expect("ADD VALUE must succeed");
+    assert!(matches!(
+        storage.drop_enum_type("mood"),
+        Err(engine::catalog::CatalogError::DependentObjectsStillExist(_))
+    ));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT m FROM {TABLE} WHERE id = 1 LIMIT 1")),
+        Cell::Text(ref t) if t == "happy"
+    ));
+    // 追記された語彙も DEFAULT に使える。
+    add_column(&core, "m2 mood DEFAULT 'excited'").expect("new label as DEFAULT");
+}
