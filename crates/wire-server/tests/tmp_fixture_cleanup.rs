@@ -58,8 +58,15 @@ fn temp_fixture_dir_is_removed_on_drop_even_with_files_inside() {
 #[test]
 fn remove_dir_all_logged_tolerates_missing_dir() {
     // 削除失敗（NotFound）はテストを失敗させない（panic しない）契約。
-    let missing = std::env::temp_dir().join("wire-server-tmp-fixture-cleanup-missing-dir");
+    // 共有 TMPDIR 上の固定名パスは他実行の所有物を再帰削除しうるため、本テスト専用の
+    // 一意な所有ディレクトリ（TempFixtureDir）配下の未作成サブパスを渡す。
+    let fixture = common::TempFixtureDir::new("tmp-fixture-cleanup-missing");
+    let users = PathBuf::from(fixture.users_path_str());
+    let owned = users.parent().expect("parent").to_path_buf();
+    let missing = owned.join("never-created-subdir");
+    assert!(!missing.exists(), "precondition: path must not exist");
     common::remove_dir_all_logged(&missing);
+    assert!(owned.exists(), "owned fixture dir must be untouched");
 }
 
 #[cfg(unix)]
