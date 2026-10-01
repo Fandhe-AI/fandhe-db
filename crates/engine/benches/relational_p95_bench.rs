@@ -33,13 +33,14 @@ use std::time::Duration;
 use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
-    author_id_for_doc, expected_order_multi, expected_order_single, inner_product_distance,
-    interleave_with_reference, is_exact_id_set, join_scale_label, join_statement, lang_for_id,
-    lang_in_first_n, lang_token, order_by_statements, other_tenant_rows, pair_ratio, parse_group,
-    parse_rounds, parse_rows_scale, predicate_statements, qty_for_id, refuse_under_github_actions,
-    render_round_line, render_summary_line, render_threshold_line, round_p95, scale_label,
-    sentinel_dominates, sentinel_qty, sentinel_scale, summarize_rounds, topk_matches,
-    visible_doc_rows, Group, JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
+    author_id_for_doc, expected_order_multi, expected_order_single, expected_path,
+    inner_product_distance, interleave_with_reference, is_exact_id_set, join_scale_label,
+    join_statement, lang_for_id, lang_in_first_n, lang_token, order_by_statements,
+    other_tenant_rows, pair_ratio, parse_group, parse_rounds, parse_rows_scale,
+    predicate_statements, qty_for_id, refuse_under_github_actions, render_round_line,
+    render_summary_line, render_threshold_line, round_p95, scale_label, sentinel_dominates,
+    sentinel_qty, sentinel_scale, summarize_rounds, topk_matches, visible_doc_rows, Group,
+    JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -266,17 +267,6 @@ fn precheck_predicate(
     let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
     if !topk_matches(&ids, ranked, PRED_LIMIT) {
         fail_closed(format!("{arm}: result is not the expected top rows"));
-    }
-}
-
-/// arm ごとに期待する実行経路（Issue #1275）。`(EXPLAIN の scalar_plan トークン, 索引経路か)`。
-/// 索引経路は信頼マスク走査を 1 回通り `full_rebuild_copies` を増やさず、OR 群（PlainScan）は
-/// 可視行全件を評価して `full_rebuild_copies` を 1 回増やす。期待と異なれば計測を始めず終了する。
-fn expected_path(arm: &str) -> (&'static str, bool) {
-    match arm {
-        "pred_eq" => ("index_equality", true),
-        "pred_in2" | "pred_in8" => ("index_in_list", true),
-        _ => ("plain_scan", false),
     }
 }
 

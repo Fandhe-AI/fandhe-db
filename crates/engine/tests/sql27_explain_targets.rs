@@ -430,6 +430,9 @@ fn group_by_explain_with_or_only_where_does_not_become_enumeration() {
     // Issue #912 回帰: OR だけの `WHERE` は「WHERE なし」と誤判定されず
     // （`where_less` が `false`）、索引未対応（`classify_scalar_plan` が
     // `PlainScan`）のため列挙形にも候補削減形にもならず `full_scan`。
+    // 同じ列への等価 OR は Issue #1305 で束縛時に `IN` へ畳まれるため、
+    // 畳めない OR（`LIKE` 前方一致を含む）でこの回帰を維持し、畳める OR は
+    // 同じ文脈の `IN` 形と EXPLAIN 行が完全一致することを固定する。
     let path = unique_db_path("sql27-groupby-or-only");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -448,16 +451,23 @@ fn group_by_explain_with_or_only_where_does_not_become_enumeration() {
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     let mut session = SessionState::default();
-    let outcome = core
-        .execute_sql_in_session(
-            &ctx("tenant-a"),
-            &mut session,
-            "EXPLAIN SELECT lang, COUNT(*) FROM docs WHERE lang = 'ja' OR lang = 'en' GROUP BY lang",
-        )
-        .expect("EXPLAIN over an OR-only WHERE GROUP BY must succeed");
+    let mut explain = |predicate: &str| {
+        let outcome = core
+            .execute_sql_in_session(
+                &ctx("tenant-a"),
+                &mut session,
+                &format!("EXPLAIN SELECT lang, COUNT(*) FROM docs WHERE {predicate} GROUP BY lang"),
+            )
+            .expect("EXPLAIN over an OR-only WHERE GROUP BY must succeed");
+        explain_lines(outcome)
+    };
     assert_eq!(
-        explain_lines(outcome),
+        explain("lang = 'ja' OR lang LIKE 'e%'"),
         vec!["scalar_plan: plain_scan", "access_path: full_scan"]
+    );
+    assert_eq!(
+        explain("lang = 'ja' OR lang = 'en'"),
+        explain("lang IN ('ja', 'en')")
     );
 }
 

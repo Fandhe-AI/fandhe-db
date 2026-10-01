@@ -4,9 +4,11 @@
 //! `EngineCore::execute_sql`／`execute_sql_in_session` を production 経路として
 //! 検証）。検索 SELECT・広域取得（scan）・集計（`COUNT(*)`）・述語つき
 //! `DELETE`／`UPDATE`・RLS 境界の各経路で OR が独立オラクルと一致することを
-//! 固定する。索引最適化（`ScalarPlan::IndexDisjunction` 相当）は本 Issue の
-//! スコープ外（`sql::scalar_plan` の単体テストで `PlainScan` への縮退を別途
-//! 固定済み）。
+//! 固定する。異なる列にまたがる OR の索引最適化（`ScalarPlan::IndexDisjunction`
+//! 相当）は本 Issue のスコープ外（`sql::scalar_plan` の単体テストで `PlainScan` への
+//! 縮退を別途固定済み）。同じ列への等価 OR の `IN` 書き換えは Issue #1305 で追加
+//! され、`tests/sql_where_or_in_rewrite.rs` が固定する（本ファイルの結果は書き換えの
+//! 前後で不変）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
