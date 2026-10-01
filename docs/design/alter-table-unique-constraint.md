@@ -107,7 +107,7 @@ fail-closed に拒否する。
   `DROP TABLE` の `2BP01` 判定と、参照先側の書き込み検査から消える fail-open
   になる）
 
-### D4. エラー契約（ERR-6 の既存行だけを使い、新しい wire_code は作らない）
+### D4. エラー契約（新しい `wire_code` は追加しない。ERR-6 ポインタ）
 
 | 条件 | `CatalogError` | `wire_code` |
 | --- | --- | --- |
@@ -128,9 +128,9 @@ fail-closed に拒否する。
 | 書き込みゲートの待機上限超過 | `WriteLockTimeout` | `55P03` |
 | その他 | ― | `XX000` |
 
-補足: UNIQUE 追加側の制約名衝突は ERR-6（`docs/spec/04-behavior/error-format.md`）の
-既存行 `42P07`（索引名衝突と同じ）を維持する。CHECK・FOREIGN KEY 追加側は
-Issue #1195 で `42710` へ是正済みで、専用 SQLSTATE の要否は決着している。
+補足: UNIQUE 追加側の制約名衝突は既存の `42P07`（索引名衝突と同じ）を維持する。
+CHECK・FOREIGN KEY 追加側は Issue #1195 で `42710` へ変更した
+（ERR-6・`docs/spec/04-behavior/error-format.md` ポインタ）。
 
 HTTP 射影は新しい `ErrorClass` を追加していないため、`error_format.rs` と
 `crates/wire-server/tests/err4_http_projection.rs` は無変更で受入基準

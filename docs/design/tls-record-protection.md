@@ -171,6 +171,21 @@ Handshake メッセージは application epoch では構造的に受理できな
   CCS は鍵状態を持たない固定レコードのため、呼び出し元が `Sealer` を
   経由せず `tls::record::Record` を直接組み立てる契約とする）。
   保護 epoch では内側型に CCS を許可しない。
+- epoch ごとに送出できる内側 content type（Issue #1284。`seal`／
+  `seal_fragmented`／`seal_detached` 共通。拒否はシーケンス番号の消費・
+  nonce 導出・暗号化より前に行うため、拒否後も seq は進まない）:
+
+  | epoch | 許可 | 拒否 |
+  | ----- | ---- | ---- |
+  | `Plaintext` | `Handshake`／`Alert` | `ApplicationData`・CCS（`SendContractViolation`） |
+  | `Handshake` | `Handshake`／`Alert` | `ApplicationData`（`SendContractViolation`）・CCS（`ForbiddenInnerType`） |
+  | `Application` | `Alert`／`ApplicationData` | `Handshake`（`SendContractViolation`）・CCS（`ForbiddenInnerType`） |
+
+  `Application` epoch の内側 Handshake 拒否は、受信側 `Opener::open` が
+  同 epoch の内側 Handshake を拒否する（post-handshake の
+  NewSessionTicket・KeyUpdate 非対応）のと対称にするための fail-closed。
+  `seal_detached` は `Application` epoch の `Alert`／`ApplicationData`
+  のみ許可する。
 - `seal_fragmented(content_type, payload)`: `payload` を
   `MAX_INNER_PLAINTEXT_LEN - 1`（内側 content type 分を差し引いた長さ）
   ごとに分割して seal する。`Alert` は分割禁止（超過は `Err`）。
@@ -196,7 +211,7 @@ Handshake メッセージは application epoch では構造的に受理できな
 | `InnerOverflow` | `TLSInnerPlaintext` 長超過 | `record_overflow`（22） |
 | `SequenceExhausted` | シーケンス番号上限 | なし（alert を送らず切断） |
 | `InvalidTransition` | 鍵切替 API の誤用 | `internal_error`（80） |
-| `SendContractViolation` | 呼び出し契約違反（送信側長さ超過等） | `internal_error`（80） |
+| `SendContractViolation` | 呼び出し契約違反（送信側長さ超過・epoch で許可されない content type 等） | `internal_error`（80） |
 
 `AeadError::TagMismatch`／`CiphertextLength` はいずれも `BadRecordMac`
 へ収束させ（`tls::aes_gcm` の設計をそのまま踏襲。攻撃者にタグ不一致か

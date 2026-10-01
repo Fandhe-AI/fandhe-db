@@ -710,3 +710,175 @@ fn expression_order_by_and_having_over_views() {
         );
     }
 }
+// ---------- 整数セル（Cell::Integer）の 2^53 境界（Issue #1277） ----------
+//
+// `COUNT`・`SUM(id)`・`MIN(id)`・`MAX(id)` の結果（`Cell::Integer(u64)`）を式形 `HAVING`／
+// `ORDER BY` が参照するとき、`sql/group_by.rs` の `cell_to_scalar_ref` が `WHERE`／投影式で
+// `id` を扱う場合と同じ 2^53 境界で f64 へ変換する（`2^53` ちょうどは受理・超過と `i64`
+// 範囲外は `22000`）。単体テスト `group_row_integer_cell_uses_exact_f64_boundary` と対になる
+// SQL 表層（`EngineCore::execute_sql`）側の固定。2^53 を超える数値リテラルは束縛段で
+// `22000` になるため、境界超過はリテラルでなく大きな id の投入（セル値側）で作る。
+
+/// 2^53（f64 で連続して表現できる整数の上限）。
+const P53: u64 = 1u64 << 53;
+
+/// 大きな値のグループ `"big"` を作る Private 行（`MAX(id)`／`SUM(id)` のセル値になる）。
+fn big_row(id: u64) -> Row {
+    row(id, None, "big", None, None)
+}
+
+const AGG_ID: &str =
+    "SELECT lang, COUNT(*) AS c, MAX(id) AS m, SUM(id) AS s FROM docs GROUP BY lang";
+
+/// `lang` が `group` の行の `idx` 番目のセルを返す（0: lang, 1: c, 2: m, 3: s）。
+fn group_cell(result: &QueryResult, group: &str, idx: usize) -> Cell {
+    result
+        .rows
+        .iter()
+        .find(|r| matches!(r.cells.first(), Some(Cell::Text(t)) if t == group))
+        .and_then(|r| r.cells.get(idx).cloned())
+        .unwrap_or_else(|| panic!("group {group} / cell {idx} not found"))
+}
+
+/// `2^53` ちょうどは受理され、`HAVING`／`ORDER BY` の両方で丸めず比較・並べ替えできる。
+#[test]
+fn integer_cell_exactly_2p53_is_accepted_and_compared_exactly() {
+    let (core, _g) = build("sql26-p53-exact", &[big_row(P53)]);
+    let ctx = ctx_for("tenant-a");
+    for having in [
+        "HAVING abs(m - 9007199254740992) < 1",
+        "HAVING abs(m - 9007199254740991) = 1",
+        "HAVING CASE WHEN m >= 9007199254740992 THEN 1 ELSE 0 END = 1",
+    ] {
+        let r = run(&core, &ctx, &format!("{AGG_ID} {having} ORDER BY lang"));
+        assert_eq!(lang_rows(&r), vec!["big"], "{having}");
+        assert_eq!(group_cell(&r, "big", 2), Cell::Integer(P53), "{having}");
+    }
+    for (order, expected) in [
+        ("ORDER BY abs(m) DESC", vec!["big", "fr", "en", "ja"]),
+        ("ORDER BY abs(m)", vec!["ja", "en", "fr", "big"]),
+        (
+            "ORDER BY CASE WHEN m = 9007199254740992 THEN 0 ELSE 1 END, lang",
+            vec!["big", "en", "fr", "ja"],
+        ),
+    ] {
+        let r = run(&core, &ctx, &format!("{AGG_ID} {order}"));
+        assert_eq!(lang_rows(&r), expected, "{order}");
+    }
+}
+
+/// `2^53` 超過（`2^53 + 1`）は、式が値を参照すると `HAVING`／`ORDER BY` の両方で `22000`
+/// （黙った丸めをしない fail-closed）。参照しない式・従来形の厳密比較は影響を受けない。
+#[test]
+fn integer_cell_over_2p53_is_rejected_when_referenced_by_expression() {
+    let (core, _g) = build("sql26-p53-over", &[big_row(P53 + 1)]);
+    let ctx = ctx_for("tenant-a");
+    for sql in [
+        format!("{AGG_ID} HAVING abs(m) > 0"),
+        format!("{AGG_ID} ORDER BY abs(m)"),
+        format!("{AGG_ID} ORDER BY CASE WHEN m > 0 THEN 0 ELSE 1 END"),
+    ] {
+        assert_eq!(run_err(&core, &ctx, &sql), "22000", "{sql}");
+    }
+    // 対照 (a): 範囲外のセルを参照しない式は成功し、投影値は丸められない。
+    let r = run(
+        &core,
+        &ctx,
+        &format!("{AGG_ID} HAVING abs(c - 1) < 1 ORDER BY lower(lang)"),
+    );
+    assert_eq!(lang_rows(&r), vec!["big"]);
+    assert_eq!(group_cell(&r, "big", 2), Cell::Integer(P53 + 1));
+    let r = run(&core, &ctx, &format!("{AGG_ID} ORDER BY lower(lang) DESC"));
+    assert_eq!(lang_rows(&r), vec!["ja", "fr", "en", "big"]);
+    // 対照 (b): 従来形（リテラル比較）の HAVING は厳密比較の経路で成功する。
+    let r = run(
+        &core,
+        &ctx,
+        &format!("{AGG_ID} HAVING m > 9007199254740992 ORDER BY lang"),
+    );
+    assert_eq!(lang_rows(&r), vec!["big"]);
+}
+
+/// `i64` 範囲外（`i64::MAX + 1`・`u64::MAX`）も `HAVING`／`ORDER BY` の両方で `22000`。
+#[test]
+fn integer_cell_beyond_i64_is_rejected_when_referenced_by_expression() {
+    let ctx = ctx_for("tenant-a");
+    for (name, id) in [
+        ("sql26-p53-i64over", i64::MAX as u64 + 1),
+        ("sql26-p53-u64max", u64::MAX),
+    ] {
+        let (core, _g) = build(name, &[big_row(id)]);
+        for sql in [
+            format!("{AGG_ID} HAVING abs(m) > 0"),
+            format!("{AGG_ID} ORDER BY abs(m)"),
+        ] {
+            assert_eq!(run_err(&core, &ctx, &sql), "22000", "id={id}: {sql}");
+        }
+        let r = run(
+            &core,
+            &ctx,
+            &format!("{AGG_ID} HAVING m > 9007199254740992 ORDER BY lang"),
+        );
+        assert_eq!(lang_rows(&r), vec!["big"], "id={id}");
+        assert_eq!(group_cell(&r, "big", 2), Cell::Integer(id), "id={id}");
+    }
+}
+
+/// 集計値 `SUM(id)` が境界をまたぐ場合（各入力 id は表現可能）。ちょうど `2^53` は受理、
+/// `2^53 + 1` は `s` を参照する式のみ `22000`（`m` は範囲内なので受理）。
+#[test]
+fn integer_cell_sum_crossing_2p53_follows_same_boundary() {
+    let ctx = ctx_for("tenant-a");
+    let (core, _g) = build(
+        "sql26-p53-sum-exact",
+        &[big_row((1 << 52) - 1), big_row((1 << 52) + 1)],
+    );
+    let r = run(
+        &core,
+        &ctx,
+        &format!("{AGG_ID} HAVING abs(s - 9007199254740992) < 1"),
+    );
+    assert_eq!(lang_rows(&r), vec!["big"]);
+    assert_eq!(group_cell(&r, "big", 3), Cell::Integer(P53));
+    let r = run(&core, &ctx, &format!("{AGG_ID} ORDER BY abs(s) DESC"));
+    assert_eq!(lang_rows(&r), vec!["big", "fr", "en", "ja"]);
+
+    let (core, _g2) = build(
+        "sql26-p53-sum-over",
+        &[big_row(1 << 52), big_row((1 << 52) + 1)],
+    );
+    for sql in [
+        format!("{AGG_ID} HAVING abs(s) > 0"),
+        format!("{AGG_ID} ORDER BY abs(s)"),
+    ] {
+        assert_eq!(run_err(&core, &ctx, &sql), "22000", "{sql}");
+    }
+    let r = run(
+        &core,
+        &ctx,
+        &format!("{AGG_ID} HAVING abs(m - 4503599627370497) < 1"),
+    );
+    assert_eq!(lang_rows(&r), vec!["big"]);
+}
+
+/// 他テナントの Private 行にある範囲外の値は、エラーにも結果にも現れない（RLS・Issue #353）。
+/// 所有テナントでは同じクエリが `22000`（境界検査が実際に効いていることの対照）。
+#[test]
+fn integer_cell_boundary_does_not_leak_through_other_tenants() {
+    let (without, _g1) = build("sql26-p53-rls-a", &[]);
+    let (with, _g2) = build("sql26-p53-rls-b", &[big_row(u64::MAX)]);
+    let other = ctx_for("tenant-b");
+    let owner = ctx_for("tenant-a");
+    for sql in [
+        format!("{AGG_ID} HAVING abs(m) > 0 ORDER BY abs(m) DESC"),
+        format!("{AGG_ID} HAVING abs(s) >= 0 ORDER BY abs(s), lang"),
+    ] {
+        let a = run(&without, &other, &sql);
+        let b = run(&with, &other, &sql);
+        let cells = |r: &QueryResult| r.rows.iter().map(|x| x.cells.clone()).collect::<Vec<_>>();
+        assert_eq!(cells(&a), cells(&b), "{sql}");
+        assert_eq!(run_err(&with, &owner, &sql), "22000", "{sql}");
+        let none = run(&with, &private_only_ctx("tenant-z"), &sql);
+        assert!(none.rows.is_empty(), "{sql}");
+    }
+}

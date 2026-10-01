@@ -123,6 +123,9 @@ fn wire_add_column_with_not_null_and_default_receives_command_complete() {
     for sql in [
         "ALTER TABLE docs ADD COLUMN lang TEXT NOT NULL DEFAULT 'ja'",
         "ALTER TABLE docs ADD COLUMN n INTEGER DEFAULT 3",
+        "ALTER TABLE docs ADD COLUMN d DATE NOT NULL DEFAULT '2020-01-01'",
+        "ALTER TABLE docs ADD COLUMN u UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001'",
+        "ALTER TABLE docs ADD COLUMN ts TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00'",
     ] {
         send_simple_query(&mut stream, sql);
         let tag = read_command_complete(&mut stream);
@@ -210,6 +213,65 @@ fn wire_duplicate_column_is_rejected_with_42701() {
     read_ready_for_query(&mut stream);
 }
 
+/// `DATE` 列の不正な `DEFAULT` は engine の SQLSTATE 写像どおり拒否される（Issue #1279）。
+#[test]
+fn wire_date_default_errors_are_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for (sql, code) in [
+        (
+            "ALTER TABLE docs ADD COLUMN d DATE DEFAULT '2020-02-30'",
+            "22008",
+        ),
+        ("ALTER TABLE docs ADD COLUMN d DATE DEFAULT 'abc'", "22007"),
+        ("ALTER TABLE docs ADD COLUMN d DATE DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// `UUID` 列の不正な `DEFAULT` は engine の SQLSTATE 写像どおり拒否される（Issue #1281）。
+#[test]
+fn wire_uuid_default_errors_are_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for (sql, code) in [
+        ("ALTER TABLE docs ADD COLUMN u UUID DEFAULT 'abc'", "22P02"),
+        ("ALTER TABLE docs ADD COLUMN u UUID DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// `TIMESTAMP` 列の不正な `DEFAULT` は engine の SQLSTATE 写像どおり拒否される（Issue #1280）。
+#[test]
+fn wire_timestamp_default_errors_are_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    for (sql, code) in [
+        (
+            "ALTER TABLE docs ADD COLUMN t TIMESTAMP DEFAULT '2020-02-30 00:00:00'",
+            "22008",
+        ),
+        (
+            "ALTER TABLE docs ADD COLUMN t TIMESTAMP DEFAULT 'abc'",
+            "22007",
+        ),
+        ("ALTER TABLE docs ADD COLUMN t TIMESTAMP DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}
+
 #[test]
 fn wire_vector_column_is_rejected_with_0a000() {
     let (core, _guard) = new_core_with_docs_table();
@@ -277,4 +339,34 @@ fn wire_alter_table_by_one_principal_is_visible_to_other_tenants_over_wire() {
     send_simple_query(&mut bob_stream, "ALTER TABLE docs ADD COLUMN other TEXT");
     expect_error_response_with_sqlstate(&mut bob_stream, "42501");
     read_ready_for_query(&mut bob_stream);
+}
+/// `ENUM` 列の `DEFAULT` は語彙内なら受理され、語彙外・型不一致は engine の
+/// SQLSTATE 写像どおり拒否される（Issue #1282）。
+#[test]
+fn wire_enum_default_is_accepted_or_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    send_simple_query(&mut stream, "CREATE TYPE mood AS ENUM ('happy', 'sad')");
+    let _ = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN m mood NOT NULL DEFAULT 'happy'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    for (sql, code) in [
+        (
+            "ALTER TABLE docs ADD COLUMN m2 mood DEFAULT 'angry'",
+            "22P02",
+        ),
+        ("ALTER TABLE docs ADD COLUMN m3 mood DEFAULT 1", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
 }

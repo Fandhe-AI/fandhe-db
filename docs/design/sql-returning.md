@@ -62,7 +62,7 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 | `INSERT ... ON CONFLICT ... RETURNING ...` | 受理（Issue #1182。挿入行・`DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。所有だが不可視な衝突先は `DO NOTHING` ではスキップ、`DO UPDATE` では `42501`。下記「UPSERT の衝突先が不可視の場合」節） |
 | 未知列・式項目の `RETURNING`（全 DML） | 書き込み前に `22000`／`42601`（台帳は消費しない） |
 | `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`／`execute_update_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない。`RETURNING` を黙って落とす fail-open を避ける） |
-| 明示トランザクション内（`BEGIN ... COMMIT`）の `UPDATE`／`DELETE`／UPSERT（`RETURNING` の有無を問わず）・`RETURNING` 付き `INSERT` | `0A000`（従来どおり未対応。fail-closed） |
+| 明示トランザクション内（`BEGIN ... COMMIT`）の単一行・述語形 `UPDATE ... RETURNING`、述語形 `DELETE ... RETURNING`、UPSERT の `RETURNING` | 受理（Issue #1272・#1273。autocommit と同じ契約。詳細は `explicit-transaction.md`） |
 
 ## 実行経路
 
@@ -299,10 +299,6 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 
 ## 対象外・申し送り
 
-- **明示トランザクション内の DML `RETURNING`**: `execute_in_active_txn` は
-  `UPDATE`／`DELETE`／UPSERT を従来どおり未対応（`0A000`）として拒否する。
-  トランザクション内の DML を追加する際（Issue #1179 系）は、`INSERT` 腕と同様に
-  `returning.is_none()` ガードを持たせ、`RETURNING` を黙って落とさないこと。
 - **ファイル形 `INSERT`**: 従来どおり `42601`（サーバー側チャンク化行を返す応答形が未定義）。
 - **NoSQL 表層**: `op: insert`／`update`／`delete`／`search`／`scan`／`aggregate` の
   いずれにも `returning` キーは無い（`http/query/update.rs`・`delete.rs` は

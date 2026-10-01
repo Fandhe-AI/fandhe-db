@@ -24,7 +24,10 @@
 //! - `KeyUpdate` による rekey・0-RTT・送信パディング方針の決定（対象外。
 //!   [`Opener::open`] は application epoch で内側 Handshake 型を受理せず
 //!   `unexpected_message` で拒否するため、`KeyUpdate`（type 24）を含む
-//!   post-handshake Handshake メッセージは構造的に受理できない）
+//!   post-handshake Handshake メッセージは構造的に受理できない。送信側も
+//!   [`Sealer`]（`seal`／`seal_fragmented`／`seal_detached`）が application
+//!   epoch の内側 Handshake を [`ProtectionError::SendContractViolation`]
+//!   で拒否し、送受信で対称にしている）
 //!
 //! # 定数時間についての整理
 //!
@@ -97,8 +100,9 @@ pub enum ProtectionError {
     /// （逆戻り・同じ epoch への二重 install・`Plaintext` から
     /// `Application` への直接遷移）。
     InvalidTransition,
-    /// 呼び出し契約違反（`seal` 側の長さ超過・Plaintext epoch での
-    /// 許可されない content type の送信要求）。
+    /// 呼び出し契約違反（`seal` 側の長さ超過、および epoch で許可されない
+    /// content type の送信要求: Plaintext の ApplicationData／CCS・
+    /// Handshake epoch の ApplicationData・Application epoch の Handshake）。
     SendContractViolation,
 }
 
@@ -479,6 +483,22 @@ impl Sealer {
     /// `Handshake` epoch でも `ApplicationData` は送信できない
     /// （[`ProtectionError::SendContractViolation`]。0-RTT 非対応の本実装
     /// では Finished 完了前のアプリケーションデータ送信を認めないため）。
+    ///
+    /// epoch ごとに送出できる内側 content type は次のとおり（CCS は
+    /// `Plaintext` で `SendContractViolation`、保護 epoch で
+    /// `ForbiddenInnerType`）。
+    ///
+    /// | epoch | 許可 | 拒否（`SendContractViolation`） |
+    /// | ----- | ---- | ------------------------------ |
+    /// | `Plaintext` | `Handshake`／`Alert` | `ApplicationData`・CCS |
+    /// | `Handshake` | `Handshake`／`Alert` | `ApplicationData` |
+    /// | `Application` | `Alert`／`ApplicationData` | `Handshake` |
+    ///
+    /// `Application` epoch の内側 Handshake は、受信側 [`Opener::open`] が
+    /// 同 epoch の内側 Handshake を拒否する（post-handshake の
+    /// NewSessionTicket・KeyUpdate 非対応）のと対称に、送信側でも拒否する。
+    /// 拒否はシーケンス番号の消費・nonce 導出・暗号化より前に行うため、
+    /// 拒否後も seq は進まない。
     pub fn seal(
         &mut self,
         content_type: ContentType,
@@ -545,8 +565,15 @@ impl Sealer {
                 })
             }
             Epoch::Application(cipher) => {
+                // post-handshake の Handshake（NewSessionTicket・KeyUpdate）
+                // は非対応で、受信側 `Opener::open` が同 epoch の内側
+                // Handshake を拒否するのと対称に、送信側も fail-closed で
+                // 拒否する（TASK-228・WIRE-9 のポインタ）。
                 match content_type {
-                    ContentType::Handshake | ContentType::Alert | ContentType::ApplicationData => {}
+                    ContentType::Alert | ContentType::ApplicationData => {}
+                    ContentType::Handshake => {
+                        return Err(ProtectionError::SendContractViolation);
+                    }
                     ContentType::ChangeCipherSpec => {
                         return Err(ProtectionError::ForbiddenInnerType(
                             ContentType::ChangeCipherSpec.as_u8(),
@@ -596,7 +623,9 @@ impl Sealer {
     /// 入れると、この不変条件が壊れて nonce 再利用になる。
     ///
     /// `Application` epoch でのみ許可する（`Plaintext`／`Handshake` では
-    /// [`ProtectionError::SendContractViolation`]）。
+    /// [`ProtectionError::SendContractViolation`]）。内側 content type は
+    /// `Alert`／`ApplicationData` のみで、`Handshake` は [`Sealer::seal`] と
+    /// 同じく `SendContractViolation` で拒否する。
     pub fn seal_detached(
         &self,
         content_type: ContentType,
@@ -609,7 +638,10 @@ impl Sealer {
             }
         };
         match content_type {
-            ContentType::Handshake | ContentType::Alert | ContentType::ApplicationData => {}
+            ContentType::Alert | ContentType::ApplicationData => {}
+            ContentType::Handshake => {
+                return Err(ProtectionError::SendContractViolation);
+            }
             ContentType::ChangeCipherSpec => {
                 return Err(ProtectionError::ForbiddenInnerType(
                     ContentType::ChangeCipherSpec.as_u8(),
@@ -643,7 +675,12 @@ impl Sealer {
     /// - `Alert` は分割禁止（RFC 8446 §5.1）。上限超過は `Err`
     /// - `ApplicationData` の空 payload は空の `Vec` を返す（0 長レコードを
     ///   送らない）
-    /// - `Handshake` の空 payload は `Err`（0 長 Handshake フラグメント禁止）
+    /// - `Handshake` の空 payload は `Err`（0 長 Handshake フラグメント禁止。
+    ///   epoch に関係なく `EmptyContent` を先に返す）
+    ///
+    /// content type の epoch 制約は [`Sealer::seal`] と同じ（`Application`
+    /// epoch の `Handshake` は最初の chunk で `SendContractViolation` となり、
+    /// レコードは 1 件も生成されず seq も進まない）。
     pub fn seal_fragmented(
         &mut self,
         content_type: ContentType,
@@ -1111,20 +1148,23 @@ mod tests {
     }
 
     #[test]
-    fn application_epoch_rejects_inner_handshake_type() {
+    fn application_epoch_open_rejects_inner_handshake_type() {
         let keys = dummy_keys(27, 28);
-        let mut sealer = Sealer::new();
-        sealer.install_handshake_keys(&keys).expect("install");
-        sealer
-            .install_application_keys(&keys)
-            .expect("handshake -> application");
 
-        // Sealer は application epoch でも Handshake を seal できてしまう
-        // （送信側は KeyUpdate 等の post-handshake Handshake を想定しうる
-        // 送信 API のままにしておき、受信側だけが拒否する非対称設計）。
-        let record = sealer
-            .seal(ContentType::Handshake, b"key-update-like", 0)
-            .expect("seal");
+        // Sealer は application epoch で内側 Handshake を送出しないため、
+        // 受信側の防御を直接暗号化した fixture で固定する（seq 0 なので
+        // nonce は iv と等しい）。
+        let inner = build_inner_plaintext(ContentType::Handshake, b"key-update-like", 0)
+            .expect("inner plaintext");
+        let aad = seal_aad(inner.len() + TAG_LEN).expect("aad within u16 range");
+        let sealed = Aes128Gcm::new(keys.key())
+            .seal(keys.iv(), &aad, &inner)
+            .expect("seal inner handshake directly");
+        let record = Record {
+            content_type: ContentType::ApplicationData,
+            legacy_version: record::LEGACY_RECORD_VERSION,
+            fragment: sealed,
+        };
 
         let mut opener = Opener::new();
         opener.install_handshake_keys(&keys).expect("install");
@@ -1137,6 +1177,128 @@ mod tests {
                 ContentType::Handshake.as_u8()
             ))
         );
+    }
+
+    fn application_pair(seed: u8) -> (Sealer, Opener) {
+        let keys = dummy_keys(seed, seed + 1);
+        let mut sealer = Sealer::new();
+        sealer.install_handshake_keys(&keys).expect("install");
+        sealer
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+        let mut opener = Opener::new();
+        opener.install_handshake_keys(&keys).expect("install");
+        opener
+            .install_application_keys(&keys)
+            .expect("handshake -> application");
+        (sealer, opener)
+    }
+
+    fn assert_application_seq_is_zero(sealer: &Sealer) {
+        if let Epoch::Application(c) = &sealer.epoch {
+            assert_eq!(c.seq, 0, "rejected seal must not consume seq");
+        } else {
+            panic!("expected Application epoch");
+        }
+    }
+
+    #[test]
+    fn application_epoch_seal_rejects_handshake_without_consuming_seq() {
+        let (mut sealer, mut opener) = application_pair(101);
+        assert_eq!(
+            sealer.seal(ContentType::Handshake, b"x", 0),
+            Err(ProtectionError::SendContractViolation)
+        );
+        // 判定順の固定: 空・上限超過でも content type 違反が先に返る。
+        assert_eq!(
+            sealer.seal(ContentType::Handshake, b"", 0),
+            Err(ProtectionError::SendContractViolation)
+        );
+        let oversized = vec![1u8; MAX_INNER_PLAINTEXT_LEN + 1];
+        assert_eq!(
+            sealer.seal(ContentType::Handshake, &oversized, 0),
+            Err(ProtectionError::SendContractViolation)
+        );
+        assert_application_seq_is_zero(&sealer);
+
+        // seq 0 で seal されたことを受信側で確認する。
+        let record = sealer
+            .seal(ContentType::ApplicationData, b"after", 0)
+            .expect("seal");
+        let inner = opener.open(&record).expect("open at seq 0");
+        assert_eq!(inner.content_type, ContentType::ApplicationData);
+        assert_eq!(inner.content, b"after");
+    }
+
+    #[test]
+    fn application_epoch_seal_fragmented_rejects_handshake_without_consuming_seq() {
+        let (mut sealer, mut opener) = application_pair(103);
+        let large = vec![2u8; MAX_INNER_PLAINTEXT_LEN * 2];
+        assert_eq!(
+            sealer.seal_fragmented(ContentType::Handshake, &large),
+            Err(ProtectionError::SendContractViolation)
+        );
+        assert_eq!(
+            sealer.seal_fragmented(ContentType::Handshake, b"small"),
+            Err(ProtectionError::SendContractViolation)
+        );
+        // 空 Handshake は epoch に関係なく EmptyContent を先に返す。
+        assert_eq!(
+            sealer.seal_fragmented(ContentType::Handshake, b""),
+            Err(ProtectionError::EmptyContent)
+        );
+        assert_application_seq_is_zero(&sealer);
+
+        let records = sealer
+            .seal_fragmented(ContentType::ApplicationData, b"after")
+            .expect("seal");
+        let first = records.first().expect("one record");
+        assert_eq!(opener.open(first).expect("open at seq 0").content, b"after");
+    }
+
+    #[test]
+    fn seal_detached_rejects_handshake_in_application_epoch() {
+        let (sealer, _opener) = application_pair(105);
+        assert_eq!(
+            sealer.seal_detached(ContentType::Handshake, b"x"),
+            Err(ProtectionError::SendContractViolation)
+        );
+        assert_eq!(
+            sealer.seal_detached(ContentType::Handshake, b""),
+            Err(ProtectionError::SendContractViolation)
+        );
+        assert_application_seq_is_zero(&sealer);
+    }
+
+    #[test]
+    fn application_epoch_seal_still_allows_alert_and_application_data() {
+        let (mut sealer, mut opener) = application_pair(107);
+        let alert = sealer
+            .seal_fragmented(ContentType::Alert, &[1, 0])
+            .expect("seal alert");
+        let data = sealer
+            .seal_fragmented(ContentType::ApplicationData, b"payload")
+            .expect("seal data");
+        let detached = sealer
+            .seal_detached(ContentType::ApplicationData, b"emergency")
+            .expect("seal detached");
+        let single = sealer.seal(ContentType::Alert, &[1, 0], 0).expect("seal");
+
+        let a = opener
+            .open(alert.first().expect("alert record"))
+            .expect("open alert");
+        assert_eq!(a.content_type, ContentType::Alert);
+        assert_eq!(a.content, [1, 0]);
+        let d = opener
+            .open(data.first().expect("data record"))
+            .expect("open data");
+        assert_eq!(d.content_type, ContentType::ApplicationData);
+        assert_eq!(d.content, b"payload");
+        // detached は seq を消費せず次の通常 seal と nonce を共有するため、
+        // ここでは open せず形だけ確認する。
+        assert_eq!(detached.content_type, ContentType::ApplicationData);
+        let s = opener.open(&single).expect("open single alert");
+        assert_eq!(s.content_type, ContentType::Alert);
     }
 
     #[test]
