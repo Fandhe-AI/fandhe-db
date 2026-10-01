@@ -138,14 +138,14 @@ sql-create-table.md` 参照）のため、`DEFAULT` が実質的に使えるの�
 for_typed_insert`／`for_typed_insert_batch`）は束縛後（`DEFAULT` 適用後）の
 値をハッシュするため、本変更後も同一文の再送判定は決定的なまま変わらない。
 
-## エラー契約（ERR-6: `wire_code` の共有）
+## エラー契約（`wire_code` の共有。ERR-6 ポインタ）
 
 NOT NULL 違反は新設の `ErrorClass::NotNullViolation`（`code` ラベル
 `NOT_NULL_VIOLATION`）へ写像する。`wire_code` は `23502` を
 `ErrorClass::MissingOperationId`（`USING OPERATION_ID` 句の省略）と**共有**する
 ——本リポでは PostgreSQL の `not_null_violation` 相当コードを先に別用途へ
-割り当て済みだったため、ERR-6 が認める「`wire_code` の共有と `code` ラベルに
-よる区別」の枠組みで新設した。
+割り当て済みだったため、`wire_code` を共有し `code` ラベルで区別する形で
+新設した（ERR-6 ポインタ）。
 
 - `error_format.rs::SHARED_WIRE_CODES`（`#[cfg(test)]` 専用。現状
   `{"23502"}` のみ）が、既存の「`wire_code` は分類ごとに一意」という
