@@ -198,6 +198,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため crash-test-unique-index をスキップ"
 endif
 
+.PHONY: tmp-leak-check
+tmp-leak-check: ## テスト一時領域の残置検出ゲート（Issue #1303。scripts/check_tmp_leak.sh を実行。FULL=1 で workspace 全テスト）
+ifdef HAS_CARGO
+	scripts/check_tmp_leak.sh
+else
+	@echo "skip: Cargo.toml 未追加のため tmp-leak-check をスキップ"
+endif
+
 .PHONY: core-api-check
 core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差分検知（TASK-125・CORE-1。cargo 不要のテキスト比較）
 	scripts/check_core_api.sh --self-test
@@ -276,7 +284,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index tmp-leak-check core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
