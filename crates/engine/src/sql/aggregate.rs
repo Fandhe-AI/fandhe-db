@@ -2852,8 +2852,9 @@ pub(crate) fn observe_candidate_slots(
                 }
             }
         }
-        // TASK-208・Issue #912: `classify_scalar_plan` は OR 群を含む述語を常に
-        // `PlainScan` へ縮退させるため、この索引経由の候補走査へは通常到達しない
+        // TASK-208・Issue #912: `classify_scalar_plan` は（束縛時に `IN` へ畳めなかった）
+        // OR 群を含む述語を常に `PlainScan` へ縮退させるため、この索引経由の候補走査へは
+        // 通常到達しない（Issue #1305）
         // （`bound.or_filters` は空のはず）。多層防御として、万一到達しても
         // OR を黙って無視しない（fail-open 防止）。
         for group in &bound.or_filters {

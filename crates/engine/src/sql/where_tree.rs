@@ -17,7 +17,7 @@
 //! その葉だけを false にする（`AND` のように行全体を除外しない。分岐の他の
 //! 葉・他の分岐は評価を続ける）。
 
-use crate::declarative_filter::{self, MetadataFilter};
+use crate::declarative_filter::{self, FilterOp, MetadataFilter};
 use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::expr_program::{ExprProgram, StackValue};
@@ -65,8 +65,10 @@ impl BoundOrGroup {
     /// バッファ（[`ExprProgram::eval`] の契約と同じ。行ごとに使い回してよい）。
     ///
     /// 索引経路（`sql::scalar_plan`・`sql::scalar_index`）は OR 群を含む述語を
-    /// 一律 `ScalarPlan::PlainScan` へ縮退させるため（TASK-208 時点のスコープ、
-    /// Issue #912）、行ループでは本メソッドが行ごとに呼ばれる。式述語の
+    /// 一律 `ScalarPlan::PlainScan` へ縮退させる（TASK-208 時点のスコープ、
+    /// Issue #912）。ただし WHERE トップレベルの「同じ列への等価 OR」は束縛時に
+    /// `InText` へ畳まれる（Issue #1305。[`Self::as_same_column_text_in`]）ため、
+    /// 本メソッドが呼ばれるのは畳めなかった OR 群だけで、行ごとに呼ばれる。式述語の
     /// [`ExprProgram`] は [`BoundConjunction::new`]（束縛時）に 1 回だけ
     /// コンパイル済み（`expr_programs`）で、本メソッドはそれを `eval` するだけ
     /// （索引和集合の実装は将来の Issue で扱う）。
@@ -115,6 +117,58 @@ impl BoundOrGroup {
     /// どうかを判定するために使う。
     pub(crate) fn contains_expr(&self) -> bool {
         self.branches.iter().any(BoundConjunction::contains_expr)
+    }
+
+    /// 全分岐が「同じ TEXT／ENUM 列への等価または `IN` 1 件だけ」の `OR` 群を、
+    /// 1 本の `InText` フィルタへ畳んだものを返す（Issue #1305・TASK-208・SQL-24
+    /// ポインタ）。畳めない場合は `None`（従来どおり `OR` 群のまま扱う）。
+    ///
+    /// 呼び出し元は `sql::parser::bind_where_predicates` の入口のみ（WHERE の
+    /// トップレベル）。畳めた場合の統合後の値は sort・dedup 済みで、1 件以上
+    /// `MAX_IN_LIST_ITEMS` 件以下に限る。値の積算は `Vec` を伸ばす前に
+    /// `checked_add` で上限判定する（無制限確保を避ける）。
+    pub(crate) fn as_same_column_text_in(&self) -> Option<MetadataFilter> {
+        // 1 分岐は JOIN 残余・IN サブクエリの 1 チャンク包みであり、形状を保つため畳まない。
+        if self.branches.len() < 2 {
+            return None;
+        }
+        let mut column: Option<usize> = None;
+        let mut total: usize = 0;
+        for branch in &self.branches {
+            if !branch.expr_filters.is_empty() || !branch.or_groups.is_empty() {
+                return None;
+            }
+            let mut filters = branch.metadata_filters.iter();
+            let filter = filters.next()?;
+            if filters.next().is_some() {
+                return None;
+            }
+            match column {
+                None => column = Some(filter.column_index()),
+                Some(c) if c != filter.column_index() => return None,
+                Some(_) => {}
+            }
+            let n = match filter.op() {
+                FilterOp::Equals(_) => 1,
+                FilterOp::InText(values) => values.len(),
+                _ => return None,
+            };
+            total = total.checked_add(n)?;
+            if total > declarative_filter::MAX_IN_LIST_ITEMS {
+                return None;
+            }
+        }
+        let mut values = Vec::with_capacity(total);
+        for branch in &self.branches {
+            for filter in &branch.metadata_filters {
+                match filter.op() {
+                    FilterOp::Equals(v) => values.push(v.clone()),
+                    FilterOp::InText(vs) => values.extend(vs.iter().cloned()),
+                    _ => return None,
+                }
+            }
+        }
+        MetadataFilter::from_bound_text_in(column?, values)
     }
 
     /// 生の `scanned`（`row_codec::scan_scalar_columns` 由来。実 NULL と型不一致を
@@ -277,5 +331,111 @@ fn eval_expr_predicate(
         _ => Err(SqlSurfaceError::invalid_input(
             "WHERE expression did not evaluate to a boolean",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eq(col: usize, v: &str) -> BoundConjunction {
+        with_op(col, FilterOp::Equals(v.to_string()))
+    }
+
+    fn in_text(col: usize, vs: &[&str]) -> BoundConjunction {
+        with_op(
+            col,
+            FilterOp::InText(vs.iter().map(|s| s.to_string()).collect()),
+        )
+    }
+
+    fn with_op(col: usize, op: FilterOp) -> BoundConjunction {
+        BoundConjunction::new(vec![MetadataFilter::for_test(col, op)], vec![], vec![])
+    }
+
+    fn folded_values(group: &BoundOrGroup) -> Option<Vec<String>> {
+        match group.as_same_column_text_in()?.op() {
+            FilterOp::InText(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn folds_equals_and_in_with_sort_and_dedup() {
+        let g = BoundOrGroup::new(vec![eq(1, "b"), in_text(1, &["c", "a"]), eq(1, "a")]);
+        assert_eq!(
+            folded_values(&g),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
+            g.as_same_column_text_in().map(|f| f.column_index()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn folds_identical_literals_to_single_value() {
+        let g = BoundOrGroup::new(vec![eq(0, "a"), eq(0, "a")]);
+        assert_eq!(folded_values(&g), Some(vec!["a".into()]));
+    }
+
+    #[test]
+    fn rejects_single_branch_and_empty() {
+        assert!(BoundOrGroup::new(vec![eq(0, "a")])
+            .as_same_column_text_in()
+            .is_none());
+        assert!(BoundOrGroup::new(vec![]).as_same_column_text_in().is_none());
+    }
+
+    #[test]
+    fn rejects_different_columns() {
+        let g = BoundOrGroup::new(vec![eq(0, "a"), eq(1, "b")]);
+        assert!(g.as_same_column_text_in().is_none());
+    }
+
+    #[test]
+    fn rejects_non_equality_ops() {
+        for op in [
+            FilterOp::StartsWith("a".into()),
+            FilterOp::IsNull,
+            FilterOp::BoolEquals(true),
+            FilterOp::Not(Box::new(FilterOp::Equals("a".into()))),
+        ] {
+            let g = BoundOrGroup::new(vec![eq(0, "x"), with_op(0, op)]);
+            assert!(g.as_same_column_text_in().is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_branch_with_two_filters_or_nested_or() {
+        let two = BoundConjunction::new(
+            vec![
+                MetadataFilter::for_test(0, FilterOp::Equals("a".into())),
+                MetadataFilter::for_test(1, FilterOp::Equals("b".into())),
+            ],
+            vec![],
+            vec![],
+        );
+        assert!(BoundOrGroup::new(vec![eq(0, "x"), two])
+            .as_same_column_text_in()
+            .is_none());
+        let nested = BoundConjunction::new(
+            vec![MetadataFilter::for_test(0, FilterOp::Equals("a".into()))],
+            vec![],
+            vec![BoundOrGroup::new(vec![eq(0, "p"), eq(0, "q")])],
+        );
+        assert!(BoundOrGroup::new(vec![eq(0, "x"), nested])
+            .as_same_column_text_in()
+            .is_none());
+    }
+
+    #[test]
+    fn enforces_total_value_limit() {
+        let a: Vec<String> = (0..255).map(|i| format!("v{i:04}")).collect();
+        let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+        let ok = BoundOrGroup::new(vec![in_text(0, &refs), eq(0, "zzz")]);
+        assert_eq!(folded_values(&ok).map(|v| v.len()), Some(256));
+        let over = BoundOrGroup::new(vec![in_text(0, &refs), eq(0, "zzz"), eq(0, "yyy")]);
+        assert!(over.as_same_column_text_in().is_none());
     }
 }
