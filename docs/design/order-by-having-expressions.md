@@ -86,3 +86,7 @@
   NULL 位置・`LIMIT`／`OFFSET`・`wire_code` 契約・RLS 非漏えい・ビュー列スコープ・可視行 0 件）。
 - 契約更新: `tests/sql_udf_call.rs` は、`ORDER BY vec_norm(embedding)` を従来 `42601` としていた
   テストを、受理と VECTOR 型式キーの `22000` を確認するテストへ置き換えた（受理範囲の意図的な拡大）。
+- wire 層: `crates/wire-server/tests/wire_sql26_extract_order_having.rs`（簡易・拡張クエリ両経路で
+  `RowDescription` の列名と型 OID・`DataRow`・`ErrorResponse` の SQLSTATE 完全一致・
+  `ParameterDescription` の推論〔SELECT リストの `EXTRACT(... FROM ...)` を含む回帰ガード〕・
+  束縛値とリテラル形のバイト一致・RLS 非漏えい。Issue #1276）。
