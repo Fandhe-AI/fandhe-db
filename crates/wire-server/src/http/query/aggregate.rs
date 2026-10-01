@@ -49,7 +49,8 @@
 //!   と非対称になる）
 //! - `group_by` 列が並べ替え不能な型（`VECTOR` 等）・未知列（Issue #1185 で `TEXT`
 //!   限定を外した）・`having` が `MIN`/`MAX(<TEXT 列>)` を
-//!   参照・参照先が `aggregates` に存在しない／曖昧 → `22000`
+//!   参照・参照先が `aggregates` に存在しない／曖昧（`(fn, column)` の重複照合。
+//!   出力名の参照解決ではないため `sort` の曖昧 `42702` とは別契約）→ `22000`
 //!
 //! `group_by` の単一文字列形・`sort`・`offset`（Issue #1198・NOSQL-15・
 //! NOSQL-16 (b)・SQL-25 (a)(b)）:
@@ -58,7 +59,8 @@
 //! - `sort`（`{column, dir}` の非空配列。要素パースは [`super::scan`] と共有）は
 //!   engine の `BoundAggregate::with_group_order_by` へ委譲する。空配列・語彙外
 //!   `dir`・識別子形状不正 → `42601`、要素数上限（8）超過 → `54000`、出力列名に
-//!   存在しない／曖昧な `column` → `22000`
+//!   存在しない `column` → `22000`、複数一致で曖昧な `column` → `42702`
+//!   （Issue #1270・SQL と同じ分類）
 //! - `offset` は形状（有限・非負整数・`u32` 以下）違反 → `42601`、`0..=MAX_SEARCH_K`
 //!   範囲外 → `22000`（`validate_search_offset`）。`with_group_offset` へ委譲する
 //! - `group_by` なしの `sort`／`offset`（`offset: 0` の明示を含む）→ `42601`
@@ -147,7 +149,7 @@ pub enum AggregateError {
     /// execute_bound_aggregate_in_session` の束縛・実行エラー（型不整合
     /// `22000`・オーバーフロー `22003`・テーブル不存在 `42P01`・集計項目数／
     /// `HAVING` 述語数・グループ数上限超過 `54000`・`having` 参照先なし／
-    /// 曖昧 `22000` 等）をそのまま透過する（TASK-186・NOSQL-5）。
+    /// 曖昧 `22000`、`sort` の出力名が曖昧 `42702` 等）をそのまま透過する（TASK-186・NOSQL-5）。
     Engine(SqlSurfaceError),
     /// `explain: true` を伴う要求（SQL-6 の `EXPLAIN` が `USING PLAN` 付き
     /// 検索 `SELECT` 専用で、集計 `SELECT` への適用を拒否する契約の写像。
@@ -307,7 +309,8 @@ fn bind_item(
 /// （[`bind_item`] が返した `(func, target)` の宣言順一覧）から一意に解決
 /// する（TASK-186・NOSQL-5）。SQL テキスト経由の `bind_group_by_clause` に
 /// おける「HAVING 対象名の一意解決」と同じ判断（一致 0 件は unknown・
-/// 2 件以上は ambiguous、いずれも `22000`）。`raw_column == "*"` は
+/// 2 件以上は ambiguous、いずれも `22000`。出力名解決の曖昧 `42702` は `sort`
+/// 側の別契約で、`having` は `(fn, column)` 照合のため `22000` のまま）。`raw_column == "*"` は
 /// [`AggregateTarget::Star`] とのみ一致し得る（`AggregateTarget::Column`
 /// はユーザーが `*` という列名を指定できないため——[`bind_item`] が
 /// `column == "*"` を常に `Star` へ写像する）。
@@ -498,7 +501,7 @@ pub fn bind(
     }
 
     // `sort`（Issue #1198・NOSQL-15）: 要素パースは `scan` と共有し、対象名の
-    // 解決・件数上限（`54000`）・未知／曖昧（`22000`）は engine の
+    // 解決・件数上限（`54000`）・未知（`22000`）／曖昧（`42702`。Issue #1270）は engine の
     // `with_group_order_by` に一元化する。
     let sort_keys = match sort_json {
         Some(items) => scan::parse_sort_items(items).map_err(|err| match err {
@@ -1002,6 +1005,14 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+        // 既定名 `count` が複数一致する `sort` は曖昧（Issue #1270・42702）。
+        let err = bind_json(
+            r#"{"op":"aggregate","table":"docs",
+               "aggregates":[{"fn":"count","column":"*"},{"fn":"count","column":"lang"}],
+               "group_by":"lang","sort":[{"column":"count","dir":"asc"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42702");
     }
 
     #[test]

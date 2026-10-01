@@ -122,9 +122,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::DuplicateFunction
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
         // 参照スコープでの非修飾列の曖昧解決。SQL 表層は `INNER JOIN`（Issue
-        // #925）で到達可能になったが、NoSQL 表層は引き続き `op` 語彙に対応する
-        // 経路が無く到達不能（許可リストは JOIN・複数 FROM を拒否したままの
-        // NoSQL 表層 API から SQL 表層の JOIN 文を組み立てる経路が無い）。
+        // #925）で到達可能になった。NoSQL 表層は JOIN 経路を持たないが、
+        // `aggregate.sort` が出力名を複数一致で解決できない場合（例: 同名の既定
+        // エイリアスになる `count(*)` と `count(<列>)` を併記した `count`）に
+        // engine の共有リゾルバから到達可能（Issue #1270）。
         // `ErrorClass` の網羅性のため ERR-6 新設行の射影規則（400）を定める。
         | ErrorClass::AmbiguousColumn => 400,
     }

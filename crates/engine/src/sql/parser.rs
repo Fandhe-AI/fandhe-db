@@ -4385,7 +4385,7 @@ impl BoundAggregate {
     /// [`BoundGroupBy::order_by`] へ写す builder。`sort` は `GROUP BY` 列名か集計項目の
     /// 既定エイリアスを指す）。空スライスは no-op。`GROUP BY` なし（単一行集計）は
     /// 多層防御で `42601`、件数が [`crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS`] を
-    /// 超えれば `54000`（束縛より前に検査）、未知・曖昧な参照は `22000`。
+    /// 超えれば `54000`（束縛より前に検査）、未知の参照は `22000`、曖昧な参照は `42702`（Issue #1270）。
     pub fn with_group_order_by(
         mut self,
         keys: &[crate::sql::allowlist::ScalarOrderKey],
@@ -5914,8 +5914,9 @@ pub(crate) fn check_having_target_is_numeric(
 /// SQL テキスト経由の [`bind_group_by_clause`] と、直接構築経由の
 /// [`BoundAggregate::with_group_order_by`]（Issue #1198・NOSQL-15）が共有する
 /// 単一実装。`key_names` は宣言順の `GROUP BY` 列名、`group_key_aliases` は
-/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件・複数一致は
-/// いずれも `22000`（エコーするのは呼び出し元が識別子形状検査済みの名前のみ）。
+/// SELECT リスト側のキー別名（直接構築経路では空）。一致 0 件は `22000`、複数一致
+/// （重複した集計名・キー別名の重複・キーと集計項目の衝突）は `42702`
+/// （Issue #1270・SQL-28／ERR-6。エコーするのは呼び出し元が識別子形状検査済みの名前のみ）。
 fn resolve_group_reference<S: AsRef<str>>(
     key_names: &[S],
     group_key_aliases: &[(usize, String)],
@@ -5945,9 +5946,7 @@ fn resolve_group_reference<S: AsRef<str>>(
         ([], []) => Err(SqlSurfaceError::invalid_input(format!(
             "unknown GROUP BY reference: {name}"
         ))),
-        _ => Err(SqlSurfaceError::invalid_input(format!(
-            "ambiguous GROUP BY reference: {name}"
-        ))),
+        _ => Err(SqlSurfaceError::ambiguous_column(name)),
     }
 }
 
@@ -5982,7 +5981,7 @@ fn bind_group_by_clause(
     // HAVING/ORDER BY の対象名解決: いずれかの `GROUP BY` 列名そのもの、その
     // キーの SELECT リストでの実効名（`group_key_aliases` のいずれか）、または
     // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
-    // （曖昧・非存在は `22000`）。
+    // （非存在は `22000`、曖昧は `42702`。Issue #1270）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
         resolve_group_reference(&clause.columns, group_key_aliases, items, name)
     };
@@ -6019,7 +6018,7 @@ fn bind_group_by_clause(
 
     // Issue #1188・SQL-26: 式述語の `HAVING`・式キーの `ORDER BY` は「グループ出力行ビュー」
     // （`GROUP BY` キー列＋集計項目の結果を並べた合成スキーマ）に対して束縛する。式中の識別子は
-    // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。曖昧・未知は `22000`）で
+    // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。未知は `22000`・曖昧は `42702`）で
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
     let view_schema = group_row_schema(schema, &keys, items);
@@ -6169,7 +6168,7 @@ fn group_row_schema(
 /// 式中の識別子を `resolve_target`（`GROUP BY` キー名・別名・集計項目名）で解決し、
 /// グループ出力行ビューの合成列名（`__gk<i>`／`__ga<j>`）へ置換した式を返す
 /// （Issue #1188）。
-/// 未知・曖昧な識別子は `resolve_target` の `22000` をそのまま返す。
+/// 未知（`22000`）・曖昧（`42702`）な識別子は `resolve_target` の分類をそのまま返す。
 fn rewrite_group_row_idents(
     expr: &Expr,
     resolve_target: &dyn Fn(&str) -> Result<OrderTarget, SqlSurfaceError>,
@@ -8134,7 +8133,7 @@ mod tests {
         let err = plan
             .with_group_order_by(&[sort_key("count", false)], &docs_schema())
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42702");
     }
 
     #[test]

@@ -447,12 +447,12 @@ fn malformed_sort_is_rejected_without_echoing_input() {
         assert!(!body_utf8(&resp).contains("row_count"));
         assert!(!body_utf8(&resp).contains("DESC"));
     }
-    // 曖昧な参照: `count(*)` と `count(lang)` を併記した `count` は SQL と同型に 22000。
+    // 曖昧な参照: `count(*)` と `count(lang)` を併記した `count` は SQL と同型に 42702（Issue #1270）。
     let ambiguous = r#"{"op":"aggregate","table":"docs",
         "aggregates":[{"fn":"count","column":"*"},{"fn":"count","column":"lang"}],
         "group_by":"lang","sort":[{"column":"count","dir":"asc"}]}"#;
     let resp = query_as_alice(addr, ambiguous);
-    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "42702", "resp={resp:?}");
 }
 
 #[test]

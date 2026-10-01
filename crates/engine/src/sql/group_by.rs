@@ -1046,7 +1046,7 @@ fn observe_candidate_slots_grouped_inner(
 /// HAVING リテラル（`f64`。構文段 `parse_number_literal` が非有限値を拒否済み）
 /// を精度損失なく比較し、両者の大小関係を返す（PR #230 codex-review 指摘対応:
 /// 以前は `Cell::Integer` を無条件に `f64` へキャストしていたため、`2^53` 超の
-/// 集計値が丸められ `HAVING` の等号・不等号比較が誤判定しうた）。
+/// 集計値が丸められ `HAVING` の等号・不等号比較が誤判定し得た）。
 fn cmp_integer_to_literal(n: u64, literal: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if literal.is_nan() {
