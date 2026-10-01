@@ -94,9 +94,12 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 なるため autocommit 専用のまま）、DDL、`USING PLAN` を伴う検索 SELECT・`EXPLAIN`
 のうち対象テーブルが dirty のもの（「6. トランザクション内の読み取り」参照）。
 
-**明示トランザクション内の `RETURNING` で拒否（`0A000`）するもの（Issue #1182・#1272 の
-経緯・SQL-31・SQL-21）**: UPSERT（`INSERT ... ON CONFLICT ... RETURNING`）のみ。
-`execute_insert_returning_form` の `Upsert` 腕で束縛の後・書き込みの前に拒否する。
+**明示トランザクション内の `RETURNING` で拒否（`0A000`）するもの（Issue #1182・#1272・#1273 の
+経緯・SQL-31・SQL-21）**: なし（全 DML の `RETURNING` を受理する）。UPSERT
+（`INSERT ... ON CONFLICT ... RETURNING`）は Issue #1273 で受理に変わり、
+`execute_insert_returning_form` の `Upsert` 腕が autocommit と同じ
+`execute_upsert_returning_in` へ `WriteTarget::InTxn` を渡す（衝突判定・不可視な衝突先の
+扱い・台帳・制約検査は `tenant::upsert_typed_rows_impl` が共有）。
 単一行・述語形の `UPDATE ... RETURNING` と述語形の `DELETE ... RETURNING` は Issue #1272
 で受理に変わり、`execute_in_active_txn` が autocommit と同じ
 `execute_update_returning_form`・`execute_predicate_delete_returning_form` へ
@@ -107,7 +110,7 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 `write_txn` を drop（abort）する。明示トランザクションは `Failed` へ遷移して部分書き込みは
 永続化されず（COMMIT は `25P02`、受け付けるのは ROLLBACK だけ）、暗黙トランザクション
 （WIRE-16・Issue #1175。文の実行ディスパッチは起源を区別しない）は abort して `Idle` に
-戻る。受け付けるようにする後続は Issue #1273（UPSERT）。
+戻る。
 
 **commit 後の副作用の監査（Issue #1179）**: 上記の書き込み関数と呼び出し元
 （`sql::exec`・`core.rs`）に、`commit_boundary::commit` の後で共有インメモリ状態
@@ -322,13 +325,17 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   自己 JOIN・サブクエリ・集合演算・カーソル）、キャッシュ汚染の回帰（ROLLBACK 後に
   世代が再利用されても未 commit 行が現れない）、RLS を固定。
 - `crates/engine/tests/sql_returning.rs`
-  （`upsert_returning_inside_explicit_transaction_is_still_rejected`）: 明示トランザクション内の
-  UPSERT の `RETURNING` が `0A000` になり行が変わらないことを固定（#1273 まで）。
-  `sql21_returning_row_count_parity.rs` は `UPDATE`・述語形 `DELETE` の `txn: true` セルで
+  （`upsert_returning_inside_explicit_transaction_returns_changed_rows`）: 明示トランザクション内の
+  UPSERT の `RETURNING` が受理され返却行数＝影響行数になることを固定（Issue #1273）。
+  `sql31_txn_dml.rs` の `upsert_returning_*` は read-your-writes・ROLLBACK で行／索引／台帳に
+  痕跡なし・DO NOTHING 衝突行を返さない・テナント境界・不可視な衝突先の `42501` と
+  `Failed` 遷移を固定。
+  `sql21_returning_row_count_parity.rs` は UPSERT・`UPDATE`・述語形 `DELETE` の `txn: true` セルで
   返却行数・影響行数・物理差分の一致を両可視性モードで固定。暗黙トランザクション側の
   対応外文の例は `DROP TABLE`（`crates/engine/tests/wire16_implicit_txn.rs`・
   `crates/wire-server/tests/wire16_multi_statement.rs`・`wire16_implicit_transaction.rs`）で
-  固定し、`UPDATE ... RETURNING` の受理は `wire16_implicit_transaction.rs` が固定。
+  固定し、`UPDATE ... RETURNING`・UPSERT の `RETURNING` の受理は
+  `wire16_implicit_transaction.rs` が固定。
 - `crates/wire-server/tests/wire19_ready_for_query_status.rs`・
   `wire942_extended_transaction.rs`（Issue #1179）: トランザクション内 COPY の
   ReadyForQuery 状態・拡張クエリ経路の UPDATE／DELETE／UPSERT・停滞した COPY の
@@ -358,8 +365,6 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 ## 対象外・申し送り
 
-- 明示トランザクション内の UPSERT の `RETURNING` 受理は Issue #1273。現状は
-  上記「`RETURNING` で拒否（`0A000`）するもの」のとおり（SQL-31・SQL-21）。
 - 明示トランザクション内のファイル形 INSERT（埋め込み I/O。`0A000` のまま）と、
   dirty テーブルに対する `USING PLAN` の検索 SELECT・`EXPLAIN`（`0A000` のまま。
   上記「6. トランザクション内の読み取り」の残る既知の逸脱）。

@@ -3812,11 +3812,11 @@ impl EngineCore {
     /// - `Active`: 上限検査・`operation_id` 再利用検査（[`crate::sql::
     ///   transaction::SessionTransaction::check_and_register_statement`]）を
     ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT`・
-    ///   `UPDATE`・`DELETE`・`TRUNCATE`。`RETURNING` は UPSERT を除き対応。
-    ///   Issue #1272）・読み取り系（未書き込みテーブルの `SELECT`／
+    ///   `UPDATE`・`DELETE`・`TRUNCATE`。全 DML の `RETURNING` に対応。
+    ///   Issue #1272・#1273）・読み取り系（未書き込みテーブルの `SELECT`／
     ///   `Aggregate`／`Scan`）文のみを実行する。対応外の文
-    ///   （ファイル形 `INSERT`・UPSERT の `RETURNING`・COPY・書き込み済み
-    ///   テーブルへの読み取り等）は `0A000` で拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
+    ///   （ファイル形 `INSERT`・COPY・書き込み済みテーブルへの読み取り等）は
+    ///   `0A000` で拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
     ///   `Failed` へ遷移させ（[`crate::sql::transaction::SessionTransaction::
     ///   fail`]）、元のエラーをそのまま返す（部分書き込みを残さない
     ///   fail-closed 契約。`docs/design/explicit-transaction.md` 参照）。
@@ -3872,13 +3872,13 @@ impl EngineCore {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
 
         // 注意（Issue #1182・#1272）: 明示トランザクション内の `RETURNING` は `INSERT`
-        // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）に対応する。UPSERT の
-        // `RETURNING` のみ未対応（#1273。フォーム側が拒否する fail-closed）。DML 腕を
-        // 追加・変更する際も `RETURNING` を黙って落とさない分岐を必ず持たせること。
+        // （単一行・複数行）・`DELETE`・`UPDATE`（単一行・述語形）・UPSERT に対応する
+        // （#1273）。DML 腕を追加・変更する際も `RETURNING` を黙って落とさない分岐を必ず持たせること。
         match parsed {
             // Issue #1179: 単一行・複数行 `VALUES`・`ON CONFLICT`（UPSERT）を
-            // 受理する（`RETURNING` は単一行・複数行のみ。UPSERT との併用は
-            // フォーム側が `42601`、ファイル形は `0A000`）。autocommit と同じ
+            // 受理する（`RETURNING` は単一行・複数行・UPSERT とも受理。Issue #1273。
+            // ファイル形は `RETURNING` なしなら `0A000`（`execute_insert_form`）、
+            // ありなら `42601`（`execute_insert_returning_form`））。autocommit と同じ
             // フォーム関数（INDEX-4 上限・束縛・台帳順序を共有。第 2 の書き込み
             // 経路を作らない）へ `InTxn` を渡す。
             ParsedSql::Insert(stmt) => {
@@ -7857,14 +7857,9 @@ impl EngineCore {
             // [`crate::sql::exec::execute_upsert_returning`] へ委譲する。挿入行・
             // `DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
-                // 明示トランザクション内の UPSERT `RETURNING` は未対応（fail-closed）。
-                if matches!(target, crate::tenant::WriteTarget::InTxn(_)) {
-                    return Err(
-                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                            "RETURNING on UPSERT is not supported inside an explicit transaction",
-                        ),
-                    );
-                }
+                // autocommit と [`Self::execute_in_active_txn`]（`InTxn`。Issue #1273）の
+                // 双方から呼ばれる。衝突判定・不可視な衝突先の扱い・台帳・制約検査は
+                // `tenant::upsert_typed_rows_impl` が `WriteTarget` 越しに共有する。
                 self.validate_upsert_batch_limits(&bound.rows)?;
                 crate::sql::exec::execute_upsert_returning_in(
                     target,
