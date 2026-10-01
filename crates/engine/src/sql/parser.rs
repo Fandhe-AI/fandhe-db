@@ -2172,6 +2172,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Double(v) => Ok(Value::Double(v)),
             ScalarRef::Numeric(d) => Ok(Value::Numeric(d)),
             ScalarRef::Bool(b) => Ok(Value::Bool(b)),
+            ScalarRef::Date(d) => Ok(Value::Date(d)),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
                 column.name
@@ -2186,6 +2187,18 @@ pub(crate) fn bind_column_default(
         Err(DefaultBindError::Malformed) => {
             Err(SqlSurfaceError::invalid_text_representation(format!(
                 "column {:?} DEFAULT has an invalid input syntax for its type",
+                column.name
+            )))
+        }
+        Err(DefaultBindError::DatetimeFormat) => {
+            Err(SqlSurfaceError::invalid_datetime_format(format!(
+                "column {:?} DEFAULT has an invalid datetime format for its type",
+                column.name
+            )))
+        }
+        Err(DefaultBindError::DatetimeOverflow) => {
+            Err(SqlSurfaceError::datetime_field_overflow(format!(
+                "column {:?} DEFAULT is out of range for its type",
                 column.name
             )))
         }
