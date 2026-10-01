@@ -5,6 +5,9 @@
 //! による無改造クライアント検証は `tests/three_client_e2e.rs`（`#[ignore]`。
 //! TASK-73・WIRE-1）が別途担う。
 
+#[path = "common/fixture_guard.rs"]
+mod fixture_guard;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +30,7 @@ const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 /// 「同一プロセス内で値が重複して払い出されない」ことだけが要件のため。
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
+fn write_user_store_file(records: &[(&str, &str, &str)]) -> fixture_guard::UserStoreFile {
     let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "wire-server-wire-auth-test-{}-{}-{}",
@@ -61,7 +64,7 @@ fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
         readback, content,
         "fixture file content must match what was just written (possible fixture race)"
     );
-    path
+    fixture_guard::UserStoreFile::new(dir, path)
 }
 
 /// サーバースレッドを起動し、`(接続先アドレス, 停止用ハンドル)` を返す。

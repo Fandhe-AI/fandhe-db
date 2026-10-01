@@ -113,6 +113,9 @@ pub fn spawn_router_listener(
 ) -> SocketAddr {
     let path = temp_db::unique_db_path("query-gate-throwaway");
     let core = EngineCore::open(&path).expect("open throwaway engine core");
+    // プロセス寿命の accept スレッドへ move するため Drop ガードを使えない。open 直後に
+    // unlink して残置を防ぐ（Issue #1303。非 unix は残置する文書化された例外）。
+    temp_db::unlink_open_db_file(&path);
     spawn_router_listener_with_engine(users_path, sessions, std::sync::Arc::new(core))
 }
 

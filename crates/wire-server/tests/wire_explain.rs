@@ -87,7 +87,7 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, std::path::PathBuf) {
+fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, common::UserStoreFile) {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     let addr = spawn_server_with_engine(&users_path, core);
     (

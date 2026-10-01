@@ -55,7 +55,7 @@ const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 /// プロセス内単調カウンタ（`wire_auth.rs` と同一クラスの競合対策。Issue #172）。
 static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-pub fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
+pub fn write_user_store_file(records: &[(&str, &str, &str)]) -> UserStoreFile {
     let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "wire-server-wire-extended-query-test-{}-{}-{}",
@@ -79,8 +79,12 @@ pub fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathB
         content.push_str(&format!("{username}:{tenant_id}:{phc}\n"));
     }
     std::fs::write(&path, content).expect("write user store fixture");
-    path
+    UserStoreFile::new(dir, path)
 }
+
+#[path = "fixture_guard.rs"]
+mod fixture_guard;
+pub use fixture_guard::{remove_dir_all_logged, UserStoreFile};
 
 /// サーバースレッドを起動し、1 接続だけ受理してスレッドを終了する。
 pub fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketAddr {
@@ -648,7 +652,7 @@ impl TempFixtureDir {
 
 impl Drop for TempFixtureDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        remove_dir_all_logged(&self.dir);
     }
 }
 

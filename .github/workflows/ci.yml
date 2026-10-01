@@ -120,6 +120,26 @@ jobs:
         run: make crash-test
 
   # --------------------------------------------------
+  # tmp-leak-check（テスト一時領域の残置検出ゲート。Issue #1303）
+  # --------------------------------------------------
+  # テストが TMPDIR 配下へ作る一時ディレクトリ・ファイルを終了時に削除していること
+  # （残置が inode を使い切って ENOSPC を起こす問題の再発防止）を scripts/check_tmp_leak.sh
+  # で検証する。crash-test と同形の独立ジョブ（第三者 action は SHA 固定）。
+  # branch protection の必須チェックへ追加する運用はユーザー作業（PR 本文参照）。
+  tmp-leak-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run tmp-leak-check
+        run: make tmp-leak-check
+
+  # --------------------------------------------------
   # crash-test-interrupt（crash_test.sh の中断パス・回帰テスト。
   # Issue #134・TASK-142）
   # --------------------------------------------------

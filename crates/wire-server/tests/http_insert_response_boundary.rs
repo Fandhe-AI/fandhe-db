@@ -377,6 +377,11 @@ fn subprocess_post_commit_panic_during_http_insert_aborts_without_fail_fast_inst
             wire_server::auth::UserStore::load_from_file(&users_path)
                 .expect("child: load empty user store"),
         );
+        // 子プロセスは意図的に abort するため Drop ガードが走らない。読み込み済みの
+        // ファイルをここで削除して残置を防ぐ（Issue #1303）。
+        if let Err(e) = std::fs::remove_file(&users_path) {
+            eprintln!("warning: failed to remove {}: {e}", users_path.display());
+        }
 
         let sessions = wire_server::http::session::store::SessionStore::new();
         let ctx = PolicyContext::new(TENANT).expect("child: valid tenant");

@@ -49,6 +49,9 @@ fn spawn_router_server(
     let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
     let core_path = temp_db::unique_db_path("http4-session-issue-throwaway");
     let core = EngineCore::open(&core_path).expect("open throwaway engine core");
+    // プロセス寿命の accept スレッドへ move するため Drop ガードを使えない。open 直後に
+    // unlink して残置を防ぐ（Issue #1303。非 unix は残置する文書化された例外）。
+    temp_db::unlink_open_db_file(&core_path);
     let router = Router::with_engine(
         std::sync::Arc::new(store),
         sessions,

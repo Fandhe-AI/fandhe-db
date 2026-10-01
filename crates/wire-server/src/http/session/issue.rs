@@ -203,6 +203,23 @@ fn success_body(token_encoded: &str, ttl: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// フィクスチャ用一時ディレクトリを `Drop` で削除するガード（Issue #1303）。
+    /// 削除失敗はテストを失敗させず stderr へ出すのみ。
+    struct DirCleanup(std::path::PathBuf);
+
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: failed to remove temp dir {}: {e}",
+                        self.0.display()
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::auth::argon2id;
     use crate::limits::SESSION_TTL;
@@ -225,6 +242,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&dir).expect("create unique fixture dir");
+        let _dir_cleanup = DirCleanup(dir.clone());
         let path = dir.join("users.txt");
         std::fs::write(&path, content).expect("write fixture");
         UserStore::load_from_file(&path).expect("valid user store")

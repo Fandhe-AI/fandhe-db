@@ -9,6 +9,9 @@
 //! 素材関数（`hmac_sha256`・`generate_verifier` 等は crate 内部限定のため、本ファイル
 //! では `wire_server::auth::scram`／`base64_std` の公開 API のみで独立に計算する）。
 
+#[path = "common/fixture_guard.rs"]
+mod fixture_guard;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +32,9 @@ static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `wire_auth.rs::write_user_store_file` と同じ設計（ユニークな一時ディレクトリ・
 /// 書き込み直後の読み戻し検証）に、4 番目のフィールド（SCRAM 検証子）を追加した版。
 /// `password` が `None` の行は SCRAM 検証子を持たない（cleartext 専用・混在確認用）。
-fn write_scram_user_store_file(records: &[(&str, &str, Option<&[u8]>)]) -> std::path::PathBuf {
+fn write_scram_user_store_file(
+    records: &[(&str, &str, Option<&[u8]>)],
+) -> fixture_guard::UserStoreFile {
     let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "wire-server-wire-scram-test-{}-{}-{}",
@@ -67,7 +72,7 @@ fn write_scram_user_store_file(records: &[(&str, &str, Option<&[u8]>)]) -> std::
         readback, content,
         "fixture file content must match what was just written (possible fixture race)"
     );
-    path
+    fixture_guard::UserStoreFile::new(dir, path)
 }
 
 /// `--auth-method scram-sha-256` 相当（`UserStore::require_scram`）でサーバー
