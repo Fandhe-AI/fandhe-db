@@ -1007,3 +1007,45 @@ fn unique_violation_rolls_back_only_the_failing_chunk() {
     let tags: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
     assert_eq!(tags, vec!["k", "x2", "x3"]);
 }
+
+/// 走査中（commit 前）に届いた取り消しは、最終チャンクでも完了として返さず、
+/// そのチャンクを破棄して行・ジョブ記録・世代を変えない。
+#[test]
+fn cancel_during_scan_of_only_chunk_discards_chunk_and_leaves_no_record() {
+    let (storage, _g) = setup("pdml-cancel-mid-chunk");
+    let rows: Vec<(u64, &str)> = (1..=3).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-cancel-mid");
+    let h = hash(b"h-cm");
+    let c = ctx("t-a");
+    let gen_before = generation(&storage);
+    let registry = std::sync::Arc::clone(storage.partitioned_job_registry());
+    let pred = |cand: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        if cand.id == 2 {
+            let key = JobKey::for_context(&c, TABLE, &o);
+            assert!(registry.request_cancel(&key));
+        }
+        Ok(true)
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(100, 1000, 1000),
+        None,
+        pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("cancelled before commit");
+    assert!(matches!(err.cause, PartitionedStopCause::CancelRequested));
+    assert_eq!(err.committed_total, 0);
+    assert_eq!(rows_of(&storage, "t-a").len(), 3);
+    assert_eq!(generation(&storage), gen_before);
+    assert!(!ledger_has(&storage, "t-a", &o));
+    let key = JobKey::for_context(&c, TABLE, &o);
+    let read_txn = storage.db().begin_read().expect("read");
+    assert!(partitioned_job::lookup_in_read_txn(&read_txn, &key)
+        .expect("lookup")
+        .is_none());
+}

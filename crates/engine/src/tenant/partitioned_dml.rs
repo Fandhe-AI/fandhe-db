@@ -511,6 +511,13 @@ fn chunk_loop<E>(
             }
         };
 
+        // commit 直前の取り消し確認。走査・適用中に届いた要求は、このチャンクを破棄
+        // （write txn を drop）して記録を残さず止める。最終チャンクでも完了として返さない。
+        if guard.cancel_requested() {
+            drop(write_txn);
+            return Err(PartitionedStopCause::CancelRequested);
+        }
+
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(|e| w(TenantWriteError::from(e)))?;
 
