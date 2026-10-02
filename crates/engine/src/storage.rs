@@ -744,6 +744,28 @@ impl Storage {
         })
     }
 
+    /// 分割実行（述語形 UPDATE／DELETE のチャンク。ADR `docs/design/partitioned-dml.md`
+    /// §8.2）用の入口。通常の書き込みが待機している間はゲートを取得せず譲る。
+    /// `tenant::partitioned_dml` の実行器がチャンクごとに呼ぶ。待機上限超過は
+    /// `WriteLockTimeout`（`55P03`）。
+    #[allow(dead_code)] // 実行器（tenant::partitioned_dml）が結線されるまで未使用
+    pub(crate) fn begin_partitioned_chunk_txn(&self) -> Result<GatedWriteTxn> {
+        let permit = self
+            .writer_gate
+            .acquire_yielding(self.write_lock_wait)
+            .map_err(|e| match e {
+                writer_gate::GateError::Timeout => StorageError::WriteLockTimeout,
+                writer_gate::GateError::HeldByCurrentThread => {
+                    StorageError::WriteTxnHeldByCurrentSession
+                }
+            })?;
+        let txn = self.begin_write_txn_raw()?;
+        Ok(GatedWriteTxn {
+            txn,
+            _permit: permit,
+        })
+    }
+
     /// ゲートを待機上限（[`Self::write_lock_wait`]）つきで取得する。超過は
     /// `WriteLockTimeout`、同一スレッドからの再入は `WriteTxnHeldByCurrentSession`
     /// （いずれも `55P03`）。

@@ -38,6 +38,10 @@ pub enum GateError {
 struct GateState {
     /// 明示トランザクションがゲートを保持している間、そのスレッド ID を保持する。
     held_by: Option<ThreadId>,
+    /// 通常の書き込み（[`WriterGate::acquire`]）が待機中の数。分割実行
+    /// （[`WriterGate::acquire_yielding`]）は 0 になるまで取得を見送り、
+    /// 通常の書き込みを優先する（ADR `docs/design/partitioned-dml.md` §8.2・Q2）。
+    waiting_normal: usize,
 }
 
 /// 単一ライタを守るゲート本体。`Storage` が `Arc` で保持し、[`WriterPermit`] と
@@ -51,7 +55,10 @@ pub struct WriterGate {
 impl WriterGate {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(GateState { held_by: None }),
+            state: Mutex::new(GateState {
+                held_by: None,
+                waiting_normal: 0,
+            }),
             cvar: Condvar::new(),
         })
     }
@@ -66,10 +73,20 @@ impl WriterGate {
             return Err(GateError::HeldByCurrentThread);
         }
         let deadline = Instant::now() + timeout;
-        while guard.held_by.is_some() {
+        // 待機に入る場合だけ通常待機者として計上する。抜ける全経路（取得・
+        // Timeout）で必ず減算し、0 になったら譲っている分割実行側へ通知する。
+        let mut registered = false;
+        let result = loop {
+            if guard.held_by.is_none() {
+                break Ok(());
+            }
             let now = Instant::now();
             if now >= deadline {
-                return Err(GateError::Timeout);
+                break Err(GateError::Timeout);
+            }
+            if !registered {
+                guard.waiting_normal = guard.waiting_normal.saturating_add(1);
+                registered = true;
             }
             let wait_for = deadline - now;
             let (g, timeout_result) = self
@@ -78,13 +95,60 @@ impl WriterGate {
                 .unwrap_or_else(|p| p.into_inner());
             guard = g;
             if timeout_result.timed_out() && guard.held_by.is_some() {
+                break Err(GateError::Timeout);
+            }
+        };
+        if registered {
+            guard.waiting_normal = guard.waiting_normal.saturating_sub(1);
+            if guard.waiting_normal == 0 {
+                self.cvar.notify_all();
+            }
+        }
+        result?;
+        guard.held_by = Some(current);
+        Ok(WriterPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    /// 分割実行（述語形 UPDATE／DELETE のチャンク）用の取得。ゲートが空いていても、
+    /// 通常の書き込みが待機している間は取得せず譲る（ADR §8.2）。同じ mutex の
+    /// 下で判定するため、通常側の待機計上との行き違いは起きない。
+    /// [`crate::storage::Storage::begin_partitioned_chunk_txn`] から呼ばれる。
+    pub fn acquire_yielding(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<WriterPermit, GateError> {
+        let current = std::thread::current().id();
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.held_by == Some(current) {
+            return Err(GateError::HeldByCurrentThread);
+        }
+        let deadline = Instant::now() + timeout;
+        while guard.held_by.is_some() || guard.waiting_normal > 0 {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(GateError::Timeout);
             }
+            let (g, _) = self
+                .cvar
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            guard = g;
         }
         guard.held_by = Some(current);
         Ok(WriterPermit {
             gate: Arc::clone(self),
         })
+    }
+
+    /// テスト同期用: 現在の通常待機者数。
+    #[cfg(test)]
+    fn waiting_normal_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .waiting_normal
     }
 }
 
@@ -172,5 +236,73 @@ mod tests {
         drop(permit);
         handle.join().unwrap();
         assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn yielding_waits_for_normal_waiter_and_normal_goes_first() {
+        let gate = WriterGate::new();
+        let permit = gate.acquire(Duration::from_secs(5)).expect("acquire");
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let g_n = Arc::clone(&gate);
+        let o_n = Arc::clone(&order);
+        let normal = std::thread::spawn(move || {
+            let p = g_n.acquire(Duration::from_secs(10)).expect("normal");
+            o_n.lock().unwrap().push("normal");
+            std::thread::sleep(Duration::from_millis(30));
+            drop(p);
+        });
+        while gate.waiting_normal_for_test() == 0 {
+            std::thread::yield_now();
+        }
+        let g_y = Arc::clone(&gate);
+        let o_y = Arc::clone(&order);
+        let yielding = std::thread::spawn(move || {
+            let p = g_y
+                .acquire_yielding(Duration::from_secs(10))
+                .expect("yield");
+            o_y.lock().unwrap().push("yielding");
+            drop(p);
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        drop(permit);
+        normal.join().unwrap();
+        yielding.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["normal", "yielding"]);
+        assert_eq!(gate.waiting_normal_for_test(), 0);
+    }
+
+    #[test]
+    fn yielding_acquires_after_normal_waiter_times_out() {
+        let gate = WriterGate::new();
+        let permit = gate.acquire(Duration::from_secs(5)).expect("acquire");
+        let g_n = Arc::clone(&gate);
+        let normal = std::thread::spawn(move || {
+            g_n.acquire(Duration::from_millis(50)).expect_err("timeout")
+        });
+        while gate.waiting_normal_for_test() == 0 {
+            std::thread::yield_now();
+        }
+        let g_y = Arc::clone(&gate);
+        let yielding =
+            std::thread::spawn(move || g_y.acquire_yielding(Duration::from_secs(10)).map(|_| ()));
+        assert_eq!(normal.join().unwrap(), GateError::Timeout);
+        drop(permit);
+        assert!(yielding.join().unwrap().is_ok());
+        assert_eq!(gate.waiting_normal_for_test(), 0);
+    }
+
+    #[test]
+    fn yielding_times_out_while_held() {
+        let gate = WriterGate::new();
+        let permit = gate.acquire(Duration::from_secs(5)).expect("acquire");
+        let g = Arc::clone(&gate);
+        let err = std::thread::spawn(move || {
+            g.acquire_yielding(Duration::from_millis(40))
+                .expect_err("timeout")
+        })
+        .join()
+        .unwrap();
+        assert_eq!(err, GateError::Timeout);
+        drop(permit);
     }
 }
