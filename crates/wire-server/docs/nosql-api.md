@@ -1,9 +1,10 @@
 # NoSQL API
 
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
-`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 9 値
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 11 値
 （`search`／`scan`／`aggregate`／`insert`／`update`／`delete`／`create_table`／
-`alter_table`／`drop_table`）の JSON スキーマを利用者向けに整理する。
+`alter_table`／`drop_table`／`show_partitioned_dml`／`cancel_partitioned_dml`）の JSON
+スキーマを利用者向けに整理する。
 `update`／`delete` は `where`（単一行・`id` 完全一致形）・`filter`（述語形）の
 いずれも束縛・実行結線済み（後述の各節参照）。`create_table`／`alter_table`／
 `drop_table`（DDL 3 op）は
@@ -150,7 +151,7 @@ JSON キー・ヘッダ（`tenant`／`tenant-id`／`tenantid` 相当。`x-` 接�
 2. `Authorization: Bearer` 認証（`28000`）
 3. ヘッダの `tenant_id` 相当拒否（`42601`）
 4. 本文の UTF-8／JSON 構文／`op` フィールドの形（`42601`）
-5. `op` 許可リスト判定（6 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
+5. `op` 許可リスト判定（11 値の厳密一致。語彙外は `0A000`。DDL・UDF 呼び出し・
    トランザクション制御を含む）
 6. op 別スキーマ検証（必須キー欠落・未知キー・型不一致・`null` は `42601`）
 7. op 別の意味検証・実行（`search` は `explain: true` を通常実行より先に判定）
@@ -466,6 +467,8 @@ SQL の `WHERE` 句省略とのパリティ）。
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層の字句解析・束縛とのパリティ。詳細は design doc 参照）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `UPDATE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により内容一致 `23505`（`DUPLICATE_OPERATION_ID`）・不一致 `22023`（SQL 表層と共有） |
+| `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
+| `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
 
 成功応答: `{"updated":<n>,"operation_id":"<echo>"}`。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `updated:0`・
@@ -517,6 +520,8 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 | `where` | △ | `{"id": number}` | 単一行・`id` 完全一致形。小数は `22000`、負数は `42601`（SQL 表層とのパリティ）。`filter` との排他（両方・双方欠落はいずれも `42601`） |
 | `filter` | △ | object[] | [`filter` 配列](#filter-配列)参照。空配列は `42601`。非空は述語形 `DELETE` として実行される（影響行数上限 `MAX_DML_AFFECTED_ROWS` 超過は `54000`。副作用ゼロ） |
 | `operation_id` | △ | string | 欠落・`null`・空文字は `23502`。同一値への再送は台帳照合により `23505`（`DUPLICATE_OPERATION_ID`。内容一致。`DELETE` は行の有無に関わらず同一内容） |
+| `mode` | | string | 分割実行の修飾（Issue #1130・NOSQL-12）。受理値は `"partitioned"` のみで、それ以外の文字列・非文字列は `42601`（黙って原子実行へ切り替えない）。`filter`（述語形）とだけ組み合わせられ、`where` との併用は `42601`。詳細は[分割実行](#分割実行-dml)参照 |
+| `chunk` | | number | 1 チャンクの行数（`mode` 指定時のみ有効。`mode` なしは `42601`）。`0`・小数・`usize` 超過は `22000`、負数は `42601`、サーバー設定のチャンク幅超過は `22000`（SQL の `CHUNK n` と同じ規則） |
 
 成功応答: `{"deleted":<n>,"operation_id":"<echo>"}`。`where` 形（単一行）は
 `n` が `0` または `1`（他テナント所有 id・未存在 id はいずれも `deleted:0`・
@@ -539,6 +544,65 @@ execute_delete`）・同一の台帳キー空間を共有する。`filter`（述
 SQL 表層とのパリティ・RLS-9 応答同一性・台帳のプロセス・表層横断永続は
 層 B `three_client_http_e2e.rs::run_sql_nosql_dml_parity_scenario`
 （Issue #877）が検証する。
+
+### 分割実行 DML
+
+`update`／`delete` の `filter`（述語形）に `"mode": "partitioned"` を付けると、SQL 表層の
+`... USING OPERATION_ID '<id>' PARTITIONED [CHUNK n]`（SQL-19）と**同一の実行器・上限・
+部分完了の意味論**で、一致行をチャンク単位に commit しながら処理する（Issue #1130・
+NOSQL-12・RECOVER-11。設計判断は `docs/design/partitioned-dml.md` 10 節）。
+
+- 述語の語彙は、既存の述語形 `update`／`delete` の `filter` と同じ（Issue #1197 で
+  追加した `ne`・`like`・`between`・`is_null`・`not_null`・`not` を含む）。`lt`・`gt`・`or`
+  などはこれまでどおり `42601`
+- `operation_id` は必須（欠落は `23502`）。内容照合ハッシュのドメインは SQL 表層の分割実行と
+  共有するため、表層を跨いだ同一 `operation_id` の再送で、中断ジョブの再開・完了済みへの
+  `23505`・内容不一致の `22023` が SQL 表層と一致する。原子的な述語形（`mode` なし）とは
+  ハッシュを共有しない（同じ `operation_id` は互いに `22023`）
+- 完了時の応答本文は原子実行と同じ形（`{"updated":<n>,"operation_id":"..."}`・
+  `{"deleted":<n>,"operation_id":"..."}`。`n` は累計件数）
+- 1 チャンク以上 commit した後に止まると `409`・`VD001`（`PARTIAL_COMPLETION`）、取り消し済み
+  ジョブへの再送・取り消しで止まった文は `409`・`VD002`（`PARTITIONED_DML_CANCELLED`）を返す。
+  本文の `error.data` に `committed`（自テナントで commit 済みの件数）と `operation_id`
+  （クライアントが指定した値）が入る（[エラー応答](#エラー応答)参照）。同じ要求を再送すると
+  カーソルから再開する
+- `explain: true` は引き続き未知キーとして `42601`（`EXPLAIN ... PARTITIONED` の NoSQL 版は
+  未対応）
+- 多列 `set` は JSON パース時点でキーがアルファベット順へ正規化される。分割実行の内容照合
+  ハッシュは SQL の記述順に依存するため、SQL 表層が非アルファベット順で書いた多列 `SET`
+  と同一内容でも表層を跨ぐと `22023` になる（原子的な述語形にもある非対称。単一列、または
+  アルファベット順で書けば一致する）
+- 長時間要求の注意: 分割実行は 1 つの HTTP 要求の中でチャンクを最後まで進める。クライアントが
+  切断してもサーバー側のジョブは止まらない。実行中のジョブへの再送は `55P03`（503）、
+  中断（`VD001`）後の再送で再開する。クライアント側のタイムアウトは余裕を持って設定すること
+
+```json
+{"op": "update", "table": "docs", "set": {"lang": "en"},
+ "filter": [{"column": "lang", "op": "not_null"}],
+ "mode": "partitioned", "chunk": 100, "operation_id": "op-1"}
+```
+
+#### `show_partitioned_dml`／`cancel_partitioned_dml`
+
+SQL 表層の `SHOW`／`CANCEL PARTITIONED DML '<id>' ON <table>` に対応する op。要求は
+`table`（必須。識別子検査は `42601`）と `operation_id`（欠落・`null`・空文字は `23502`）だけを
+持つ。それ以外のキー（`tenant_id` 自己申告を含む）は未知キーとして `42601`。
+
+応答は SQL 表層と同じ結果セット形（`status`・`rows` の 2 列。`status` は `interrupted`・
+`completed`・`cancelled` のいずれか）。ジョブなし・他テナントのジョブ・テーブルなし・見えない
+テーブルは、いずれも 0 行の同一応答になる（RLS-9。バイト一致をテストで固定）。`cancel` は
+中断ジョブを `cancelled` にし、完了済みジョブは `completed` のまま変えない。
+
+```json
+{"op": "show_partitioned_dml", "table": "docs", "operation_id": "op-1"}
+```
+
+```json
+{"op": "cancel_partitioned_dml", "table": "docs", "operation_id": "op-1"}
+```
+
+検証コード: `crates/wire-server/tests/nosql12_partitioned_dml.rs`・
+`crates/engine/tests/partitioned_dml_bound_session.rs`。
 
 ### `create_table`／`alter_table`／`drop_table`（DDL）
 
@@ -944,7 +1008,10 @@ status.rs`（`wire_code` → HTTP ステータスの射影）・`error_body.rs`�
   利用者は `message` の具体的な文言そのものを契約として依存しないこと
 - 通常応答は `data` キーを**決して**含まない。緊急応答専用の
   `encode_may_be_committed` と本文組み立てが構造的に分離されている
-  （[緊急応答の `data`](#緊急応答の-data) を参照）
+  （[緊急応答の `data`](#緊急応答の-data) を参照）。例外は分割実行 DML の `VD001`・`VD002`
+  （専用の `encode_partitioned`）で、`data` は `{"committed": <n>, "operation_id": "<id>"}`
+  の 2 キーだけを持つ（自テナントで commit 済みの件数と、クライアントが指定した
+  `operation_id`。他テナントの情報・テーブル名・内側のメッセージは載せない）
 
 golden 例（`ErrorClass::InternalError`・`message="internal error"` から
 `error_body::encode`／`encode_may_be_committed` が実際に返す本文。
@@ -1028,17 +1095,16 @@ Date: <IMF-fixdate>
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
-| `VD001` | `PARTIAL_COMPLETION` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（SQL 表層の分割実行 DML `UPDATE`／`DELETE ... PARTITIONED` が 1 チャンク以上 commit した後に止まった。NoSQL 表層の分割実行 op は Issue #1130 の担当。後述） |
-| `VD002` | `PARTITIONED_DML_CANCELLED` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（SQL 表層の `CANCEL PARTITIONED DML` で取り消された分割実行 DML、または取り消し済みジョブへの再送。後述） |
+| `VD001` | `PARTIAL_COMPLETION` | 409 | Conflict | 分割実行 DML（`update`／`delete` の `mode: "partitioned"`。SQL 表層は `... PARTITIONED`）が 1 チャンク以上 commit した後に止まった（Issue #1130。本文に `data` が付く。後述） |
+| `VD002` | `PARTITIONED_DML_CANCELLED` | 409 | Conflict | `cancel_partitioned_dml`（SQL 表層は `CANCEL PARTITIONED DML`）で取り消された分割実行 DML、または取り消し済みジョブへの再送（Issue #1130。本文に `data` が付く。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過、`FOREIGN KEY` 参照アクション連鎖（`ON DELETE CASCADE` 等。宣言が SQL／NoSQL いずれでも。Issue #1148）の深さ・行数上限超過（副作用ゼロ） |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 18 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42704`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・
-`VD001`・`VD002`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 16 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42704`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -1060,10 +1126,10 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 `ALTER TABLE ... ADD CONSTRAINT`（CHECK・FOREIGN KEY）の制約名衝突で、NoSQL
 `alter_table` は `add_column`／`drop_column` のみのため到達しない。
 `PartialCompletion`（`VD001`）・`PartitionedDmlCancelled`（`VD002`。SQL-19・
-RECOVER-11、Issue #1129）は SQL 表層の分割実行 DML（`UPDATE`／`DELETE ...
-PARTITIONED`）と `CANCEL PARTITIONED DML` が送出する分類で、NoSQL 表層の `op`
-許可リストに分割実行の語彙が無い（Issue #1130 で追加予定）ため実要求からは到達しない。
-射影は部分完了・取り消しとも 409 とする。
+RECOVER-11、Issue #1129）は SQL 表層の分割実行 DML と `CANCEL PARTITIONED DML`
+が送出する分類で、NoSQL 表層からも Issue #1130 で `update`／`delete` の
+`mode: "partitioned"` と `cancel_partitioned_dml` から実要求で到達できる
+（到達不能の一覧からは外した）。射影は部分完了・取り消しとも 409 とする。
 `DuplicateFunction`（`42723`。SQL-26、Issue #1186）は
 `CREATE FUNCTION`／WASM UDF 登録の名前衝突で、NoSQL `op` 許可リストに関数
 登録が無いため到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・

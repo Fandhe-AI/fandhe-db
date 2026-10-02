@@ -135,7 +135,8 @@ PR #1038〔Issue #896 レビュー指摘〕以降の実装に合わせた記述�
 
 `table` `required_str` → `ident::check_identifier`（`42601`） →
 `where`/`filter` の形判定（両方 `42601`／どちらも無し `42601`／`filter` のみ
-`0A000`） → [`update` のみ] `set` 非空＋各キー `check_identifier`（`42601`）
+`0A000`） → 分割実行修飾（`mode`・`chunk`。Issue #1130。`mode` の値・`chunk` の値・
+`mode`＋`where` は `42601`／`22000`。`chunk` のみは `42601`） → [`update` のみ] `set` 非空＋各キー `check_identifier`（`42601`）
 → JSON→`InsertLiteral` 写像（`22000`） → `where.id` は
 `JsonNumber::as_exact_u64` のみ受理し、非受理時は variant で分岐する
 （`dml_target.rs::DmlTargetError`）→ `operation_id`（`optional_str` の

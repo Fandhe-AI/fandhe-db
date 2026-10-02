@@ -7165,6 +7165,148 @@ impl EngineCore {
         )
     }
 
+    /// NoSQL 表層 `update` op の分割実行修飾（`mode: partitioned`。Issue #1130・
+    /// NOSQL-12・SQL-19・RECOVER-11、ADR `docs/design/partitioned-dml.md` 10 節）。
+    /// `wire-server::http::query::update` から呼ばれ、SQL 表層
+    /// `UPDATE ... PARTITIONED [CHUNK n]` と**同一の共通本体**
+    /// （[`Self::run_partitioned_update`]）へ到達させる（内容照合ハッシュ・実行器・上限・
+    /// 失敗写像が構造的に同一。第 2 の実行器を作らない）。
+    ///
+    /// 判定順序（fail-closed）:
+    /// 1. `ledger_mode.resolve`（`23502`）
+    /// 2. `chunk_rows` のサーバー幅検査（`22000`。テーブル不存在より先）
+    /// 3. スキーマ取得（`42P01`）
+    /// 4. `bind` closure（SET 割当・述語列）
+    /// 5. 非許可の述語形の拒否（`42601`。[`reject_unsupported_predicate_dml_forms`]）
+    /// 6. `read_txn` を drop して共通本体へ
+    pub fn execute_bound_partitioned_update_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        chunk_rows: Option<std::num::NonZeroUsize>,
+        bind: F,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            (
+                Vec<(String, crate::sql::allowlist::InsertLiteral)>,
+                Vec<crate::sql::allowlist::WherePredicate>,
+            ),
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+        let clause = crate::sql::partitioned::PartitionedClause { chunk_rows };
+        let limits =
+            crate::sql::partitioned::apply_chunk_override(&clause, &self.partitioned_dml_limits)?;
+
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let (assignments, where_predicates) = bind(&schema)?;
+        reject_unsupported_predicate_dml_forms(&where_predicates)?;
+        drop(read_txn);
+
+        let validated = crate::sql::allowlist::ValidatedPredicateUpdate {
+            table_name: table.to_string(),
+            assignments,
+            where_predicates,
+            operation_id: operation_id.cloned(),
+            returning: None,
+            partitioned: Some(clause),
+        };
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        self.run_partitioned_update(ctx, &udfs, &validated, &schema, &limits)
+    }
+
+    /// NoSQL 表層 `delete` op の分割実行修飾（Issue #1130）。
+    /// [`Self::execute_bound_partitioned_update_in_session`] と同じ判定順序・設計
+    /// （`bind` は述語列のみを返す）。
+    pub fn execute_bound_partitioned_delete_in_session<F>(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+        chunk_rows: Option<std::num::NonZeroUsize>,
+        bind: F,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError>
+    where
+        F: FnOnce(
+            &crate::catalog::TableSchema,
+        ) -> Result<
+            Vec<crate::sql::allowlist::WherePredicate>,
+            crate::sql::allowlist::SqlSurfaceError,
+        >,
+    {
+        self.ledger_mode
+            .resolve(operation_id)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+        let clause = crate::sql::partitioned::PartitionedClause { chunk_rows };
+        let limits =
+            crate::sql::partitioned::apply_chunk_override(&clause, &self.partitioned_dml_limits)?;
+
+        let (read_txn, schema) = self.read_txn_with_schema(table)?;
+        let where_predicates = bind(&schema)?;
+        reject_unsupported_predicate_dml_forms(&where_predicates)?;
+        drop(read_txn);
+
+        let validated = crate::sql::allowlist::ValidatedPredicateDelete {
+            table_name: table.to_string(),
+            where_predicates,
+            operation_id: operation_id.cloned(),
+            returning: None,
+            partitioned: Some(clause),
+        };
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+        self.run_partitioned_delete(ctx, &udfs, &validated, &schema, &limits)
+    }
+
+    /// NoSQL 表層 `show_partitioned_dml` op（Issue #1130・RLS-9・RECOVER-11）。
+    /// SQL `SHOW PARTITIONED DML '<id>' ON <table>` と同じ
+    /// [`crate::sql::partitioned::execute_show`] を呼ぶ。テーブル名は識別子の構文検査のみで
+    /// ユーザーテーブルのカタログは引かない（ジョブなし・他テナント・テーブルなし・
+    /// 見えないテーブルは同一応答）。`wire-server::http::query::partitioned` から呼ばれる。
+    pub fn show_partitioned_dml_in_session(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: &crate::recovery::required_op_id::OperationId,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        let job = Self::partitioned_job_ref(table, operation_id)?;
+        crate::sql::partitioned::execute_show(&self.storage, ctx, &job)
+    }
+
+    /// NoSQL 表層 `cancel_partitioned_dml` op（Issue #1130）。SQL `CANCEL PARTITIONED DML`
+    /// と同じ [`crate::sql::partitioned::execute_cancel`] を呼ぶ（該当なしは常に同じ応答。RLS-9）。
+    pub fn cancel_partitioned_dml_in_session(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        operation_id: &crate::recovery::required_op_id::OperationId,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        let job = Self::partitioned_job_ref(table, operation_id)?;
+        crate::sql::partitioned::execute_cancel(&self.storage, ctx, &job)
+    }
+
+    /// show／cancel 共通: 識別子の構文検査（SQL 表層と同じ固定文言の `42601`）の後で
+    /// [`crate::sql::partitioned::PartitionedJobRef`] を engine 内部で構築する。
+    fn partitioned_job_ref(
+        table: &str,
+        operation_id: &crate::recovery::required_op_id::OperationId,
+    ) -> Result<crate::sql::partitioned::PartitionedJobRef, crate::sql::allowlist::SqlSurfaceError>
+    {
+        crate::catalog::validate_identifier(table).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::unsupported("invalid table identifier")
+        })?;
+        Ok(crate::sql::partitioned::PartitionedJobRef {
+            table: table.to_string(),
+            operation_id: operation_id.clone(),
+        })
+    }
+
     /// `--max-insert-rows`（`self.dml_limits.max_insert_rows_per_statement`）を、
     /// `stmt.rows.len()`（`ValidatedInsert` の行数。単一行形も `rows.len() == 1`
     /// として同じ形を持つ）に対して**実行時にも**検査する（codex-review P1
@@ -8244,23 +8386,7 @@ impl EngineCore {
         let limits =
             crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
-        let udfs = session.udfs();
-        let bound = crate::sql::parser::bind_predicate_delete(stmt, &schema, udfs)?;
-        let content_hash_value = crate::recovery::content_hash::for_delete_where_partitioned(
-            stmt.table_name(),
-            stmt.where_predicates(),
-            udfs,
-        )?;
-        crate::sql::exec::execute_predicate_delete_partitioned(
-            &self.storage,
-            ctx,
-            &bound,
-            self.ledger_mode,
-            &schema,
-            &content_hash_value,
-            &limits,
-            self.dml_limits.max_affected_rows,
-        )
+        self.run_partitioned_delete(ctx, session.udfs(), stmt, &schema, &limits)
     }
 
     /// 述語形 `UPDATE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行 form。
@@ -8280,8 +8406,52 @@ impl EngineCore {
         let limits =
             crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
-        let udfs = session.udfs();
-        let bound = crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
+        self.run_partitioned_update(ctx, session.udfs(), stmt, &schema, &limits)
+    }
+
+    /// 分割実行 DELETE の束縛以降の共通本体（Issue #1130）。SQL 表層
+    /// （[`Self::execute_partitioned_delete_form`]）と NoSQL 表層
+    /// （[`Self::execute_bound_partitioned_delete_in_session`]）の両方が呼ぶ。
+    /// 述語束縛・内容照合ハッシュ（ドメイン共有。RECOVER-11）・分割実行器・上限を
+    /// 1 箇所に集約し、表層を跨いだ同一 `operation_id` の再送判定を構造的に一致させる。
+    /// `limits` は呼び出し元が `apply_chunk_override` 済みの値を渡す。
+    fn run_partitioned_delete(
+        &self,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+        schema: &crate::catalog::TableSchema,
+        limits: &crate::sql::parser::PartitionedDmlLimits,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let bound = crate::sql::parser::bind_predicate_delete(stmt, schema, udfs)?;
+        let content_hash_value = crate::recovery::content_hash::for_delete_where_partitioned(
+            stmt.table_name(),
+            stmt.where_predicates(),
+            udfs,
+        )?;
+        crate::sql::exec::execute_predicate_delete_partitioned(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            schema,
+            &content_hash_value,
+            limits,
+            self.dml_limits.max_affected_rows,
+        )
+    }
+
+    /// 分割実行 UPDATE の束縛以降の共通本体（Issue #1130）。
+    /// [`Self::run_partitioned_delete`] と同じ位置付け（SQL・NoSQL 両表層の共有本体）。
+    fn run_partitioned_update(
+        &self,
+        ctx: &PolicyContext,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+        stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
+        schema: &crate::catalog::TableSchema,
+        limits: &crate::sql::parser::PartitionedDmlLimits,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let bound = crate::sql::parser::bind_predicate_update(stmt, schema, udfs)?;
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = stmt
             .assignments()
             .iter()
@@ -8292,16 +8462,16 @@ impl EngineCore {
             &assignment_refs,
             stmt.where_predicates(),
             udfs,
-            &schema,
+            schema,
         )?;
         crate::sql::exec::execute_predicate_update_partitioned(
             &self.storage,
             ctx,
             &bound,
             self.ledger_mode,
-            &schema,
+            schema,
             &content_hash_value,
-            &limits,
+            limits,
             self.dml_limits.max_affected_rows,
         )
     }

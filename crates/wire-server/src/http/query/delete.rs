@@ -22,6 +22,12 @@
 //! と同一の `WherePredicate` へ写像する。`content_hash` 一致のため必須）を
 //! 経由する。いずれも第 2 の実行器は作らない。
 //!
+//! 分割実行修飾（`mode: "partitioned"`・`chunk`。Issue #1130・NOSQL-12・RECOVER-11）は
+//! `bind_target_form` の後で [`super::partitioned::parse_modifier`] が解析し、述語形
+//! （`filter`）のときだけ `EngineCore::execute_bound_partitioned_delete_in_session` へ委譲する
+//! （SQL 表層の `... PARTITIONED` と同一の共通本体。`where` との併用は `42601`）。
+//! `VD001`／`VD002` は [`handle`] が 409 と `data` 付き本文へ写像する。
+//!
 //! テナントは `principal`（唯一の入口）からのみ導出する（`security.md` P0）。
 //!
 //! `operation_id` の欠落・`null`・空文字はいずれも `23502`。同一
@@ -57,6 +63,7 @@ use crate::http::session::middleware::SessionPrincipal;
 use super::dml_target::{bind_target_form, DmlTargetError, TargetForm};
 use super::filter;
 use super::ident::{self, InvalidIdentifier};
+use super::partitioned::{self, PartitionedRequestError};
 use super::schema::{SchemaError, Validated};
 
 /// [`execute`] の失敗を表す。いずれも [`ClassifiedError`] を実装する
@@ -72,6 +79,8 @@ pub enum DeleteError {
     /// `EngineCore::execute_bound_delete_in_session` のエラー
     /// （`operation_id` 必須化・台帳照合・テーブル不存在等）をそのまま透過する。
     Engine(SqlSurfaceError),
+    /// 分割実行修飾（`mode`／`chunk`）の解析・検査の失敗（Issue #1130）。
+    Partitioned(PartitionedRequestError),
 }
 
 impl From<SchemaError> for DeleteError {
@@ -92,6 +101,12 @@ impl From<DmlTargetError> for DeleteError {
     }
 }
 
+impl From<PartitionedRequestError> for DeleteError {
+    fn from(err: PartitionedRequestError) -> Self {
+        DeleteError::Partitioned(err)
+    }
+}
+
 impl From<SqlSurfaceError> for DeleteError {
     fn from(err: SqlSurfaceError) -> Self {
         DeleteError::Engine(err)
@@ -105,6 +120,7 @@ impl ClassifiedError for DeleteError {
             DeleteError::InvalidIdentifier => ErrorClass::UnsupportedSqlSyntax,
             DeleteError::Target(err) => err.error_class(),
             DeleteError::Engine(err) => err.error_class(),
+            DeleteError::Partitioned(err) => err.error_class(),
         }
     }
 
@@ -114,6 +130,7 @@ impl ClassifiedError for DeleteError {
             DeleteError::InvalidIdentifier => "invalid identifier".to_string(),
             DeleteError::Target(err) => err.client_message(),
             DeleteError::Engine(err) => err.client_message(),
+            DeleteError::Partitioned(err) => err.client_message(),
         }
     }
 }
@@ -150,6 +167,9 @@ pub fn execute(
     ident::check_identifier(table)?;
 
     let target = bind_target_form(validated)?;
+    // 分割実行修飾（Issue #1130）。述語形（`filter`）だけが受理する。
+    let modifier = partitioned::parse_modifier(validated)?;
+    partitioned::check_target_form(modifier, &target)?;
 
     let operation_id_raw = validated
         .optional_str("operation_id")
@@ -172,15 +192,29 @@ pub fn execute(
         // （台帳照合・影響行数上限・RLS 適用）は `EngineCore::
         // execute_bound_predicate_delete_in_session` に一任し、第 2 の実行器は
         // 作らない。
-        TargetForm::Predicate(items) => core.execute_bound_predicate_delete_in_session(
-            principal.policy_context(),
-            table,
-            Some(&operation_id),
-            |schema| {
+        TargetForm::Predicate(items) => {
+            let bind = |schema: &engine::catalog::TableSchema| {
                 filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)
-            },
-        )?,
+            };
+            match modifier {
+                // 分割実行（Issue #1130）: SQL 表層 `DELETE ... PARTITIONED` と同一の
+                // 共通本体へ到達する。
+                Some(m) => core.execute_bound_partitioned_delete_in_session(
+                    principal.policy_context(),
+                    table,
+                    Some(&operation_id),
+                    m.chunk_rows,
+                    bind,
+                )?,
+                None => core.execute_bound_predicate_delete_in_session(
+                    principal.policy_context(),
+                    table,
+                    Some(&operation_id),
+                    bind,
+                )?,
+            }
+        }
     };
 
     Ok(DeleteSuccess {
@@ -200,6 +234,10 @@ pub fn handle(
 ) -> Vec<u8> {
     match execute(core, principal, validated) {
         Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
+        // `VD001`／`VD002` は 409 と `data` 付きの本文（Issue #1130）。
+        Err(DeleteError::Engine(err)) => {
+            partitioned::encode_engine_error(&err, validated, now_wall)
+        }
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
 }

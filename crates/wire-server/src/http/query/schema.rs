@@ -332,6 +332,27 @@ impl<'a> Validated<'a> {
         }
     }
 
+    /// `FieldType::Number` フィールドを元の [`engine::json::JsonNumber`] のまま読む
+    /// （Issue #1130。`chunk` のように整数性・符号で `wire_code` を分ける呼び出し元向け。
+    /// `f64` 経由の丸めを避ける）。
+    pub fn optional_json_number(
+        &self,
+        key: &'static str,
+    ) -> Result<Option<&'a engine::json::JsonNumber>, SchemaError> {
+        let Some(spec) = self.field_spec(key) else {
+            return Err(SchemaError::UnknownKey);
+        };
+        if !matches!(spec.ty, FieldType::Number) {
+            return Err(SchemaError::TypeMismatch { key });
+        }
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(JsonValue::Null) if spec.nullable => Ok(None),
+            Some(JsonValue::Number(n)) => Ok(Some(n)),
+            _ => Err(SchemaError::TypeMismatch { key }),
+        }
+    }
+
     /// `required_number` の結果を `u32` として再検査する（Issue #763・#766・
     /// TASK-175）。SQL 表層の `LIMIT` 許可リスト検査（`sql::allowlist`）が
     /// `LIMIT 1.5`／`LIMIT -1`／`u32` 超過をいずれも構文段階の `42601` で
@@ -883,6 +904,19 @@ pub static UPDATE_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: true,
         },
+        // 分割実行修飾（Issue #1130・NOSQL-12）。値の意味検査は `super::partitioned` が担う。
+        FieldSpec {
+            key: "mode",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "chunk",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
     ],
 };
 
@@ -924,6 +958,19 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
             presence: Presence::Optional,
             ty: FieldType::String,
             nullable: true,
+        },
+        // 分割実行修飾（Issue #1130・NOSQL-12）。値の意味検査は `super::partitioned` が担う。
+        FieldSpec {
+            key: "mode",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "chunk",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
         },
     ],
 };
@@ -1199,9 +1246,61 @@ pub static DROP_TABLE_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
+/// `show_partitioned_dml`／`cancel_partitioned_dml` op 共通のフィールド宣言を持つスキーマ
+/// （Issue #1130・NOSQL-12・RECOVER-11）。`operation_id` は欠落・`null`・空文字を
+/// `23502` へ収束させるため Optional＋nullable（`update` op と同じ）。
+pub static SHOW_PARTITIONED_DML_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "show_partitioned_dml",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "operation_id",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: true,
+        },
+    ],
+};
+
+/// `cancel_partitioned_dml` op のスキーマ（形は [`SHOW_PARTITIONED_DML_SCHEMA`] と同一）。
+pub static CANCEL_PARTITIONED_DML_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "cancel_partitioned_dml",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "operation_id",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: true,
+        },
+    ],
+};
+
 /// op 名（厳密一致。trim・大文字小文字の読み替えはしない）→ [`ObjectSchema`]
 /// の対応表。`schema_for` の実体であり、単一情報源として扱う。
-pub const OP_SCHEMAS: [(&str, &ObjectSchema); 9] = [
+pub const OP_SCHEMAS: [(&str, &ObjectSchema); 11] = [
     ("search", &SEARCH_SCHEMA),
     ("scan", &SCAN_SCHEMA),
     ("aggregate", &AGGREGATE_SCHEMA),
@@ -1211,6 +1310,8 @@ pub const OP_SCHEMAS: [(&str, &ObjectSchema); 9] = [
     ("create_table", &CREATE_TABLE_SCHEMA),
     ("alter_table", &ALTER_TABLE_SCHEMA),
     ("drop_table", &DROP_TABLE_SCHEMA),
+    ("show_partitioned_dml", &SHOW_PARTITIONED_DML_SCHEMA),
+    ("cancel_partitioned_dml", &CANCEL_PARTITIONED_DML_SCHEMA),
 ];
 
 /// `op` 名からスキーマを引く。語彙外は `None`（`0A000` への写像・応答は
@@ -1261,6 +1362,8 @@ mod tests {
                 "create_table",
                 "alter_table",
                 "drop_table",
+                "show_partitioned_dml",
+                "cancel_partitioned_dml",
             ]
         );
         for (name, schema) in OP_SCHEMAS.iter() {
@@ -1710,15 +1813,12 @@ mod tests {
 
     #[test]
     fn update_and_delete_reject_explain_and_search_only_fields() {
-        // NOSQL-12 ポインタ: update／delete は explain／vector／limit／mode を
+        // NOSQL-12 ポインタ: update／delete は explain／vector／limit を
         // 宣言しないため、未知キーとして 42601 で拒否される（一般則から自然に
-        // 成立する。個別の除外ロジックは持たない）。
-        for field_json in [
-            r#""explain":true"#,
-            r#""vector":[0.1]"#,
-            r#""limit":10"#,
-            r#""mode":"precision""#,
-        ] {
+        // 成立する。個別の除外ロジックは持たない）。`mode` は Issue #1130 で分割実行
+        // 修飾として宣言したため対象外（`mode:"precision"` 等の語彙外の値は
+        // `partitioned::parse_modifier` が 42601 で拒否する）。
+        for field_json in [r#""explain":true"#, r#""vector":[0.1]"#, r#""limit":10"#] {
             let update_json =
                 format!(r#"{{"op":"update","table":"docs","set":{{"lang":"en"}},{field_json}}}"#);
             assert_eq!(
