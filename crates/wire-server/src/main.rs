@@ -143,6 +143,17 @@
 //! `wire_server::dml_limits_opt::resolve_batch_limits` に一本化し、同じ値を
 //! `EngineCore::with_batch_limits` と `insert_rows_cap_warning` の両方へ渡す。
 //!
+//! `--partitioned-dml-chunk-rows <N>`／`--partitioned-dml-scan-budget <N>`／
+//! `--partitioned-dml-max-hold-ms <MS>`（Issue #1128。ADR `docs/design/
+//! partitioned-dml.md` §15.2。フラグ名は仮称で #1129 が確定する）: 述語形
+//! `UPDATE`／`DELETE` の分割実行の 1 チャンクの適用行数（既定 1,000・範囲
+//! `1..=1,000,000`）・走査予算（既定 100,000・範囲 `1..=1,000,000`）・writer
+//! 保持時間の上限（既定 1,000 ms・範囲 `100..=5,000`）をプロセス全体に対して
+//! 起動時に設定する。環境変数は設けない。範囲外・非数値・値欠落・2 回目以降の
+//! 重複指定は fail-closed で起動エラー。解決は
+//! `wire_server::dml_limits_opt::resolve_partitioned_dml_limits` に一本化し、
+//! `EngineCore::with_partitioned_dml_limits` へ 1 回だけ注入する。
+//!
 //! `--hnsw-scope`（Issue #1065・オーナー判断 2026-09-28）: HNSW opt-in
 //! （`--search-engine hnsw*`）時に HNSW 経路を使うテーブルの範囲を選ぶ
 //! （`all`＝全テーブル〔既定・既存挙動とビット同一〕／`declared`＝`CREATE
@@ -290,6 +301,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut batch_max_files_raw: Option<String> = None;
+    let mut partitioned_chunk_rows_raw: Option<String> = None;
+    let mut partitioned_scan_budget_raw: Option<String> = None;
+    let mut partitioned_max_hold_ms_raw: Option<String> = None;
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
@@ -559,6 +573,66 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 batch_max_files_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1128: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_chunk_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_chunk_rows_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::PARTITIONED_SCAN_BUDGET_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_SCAN_BUDGET_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1128: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_scan_budget_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_SCAN_BUDGET_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_scan_budget_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::PARTITIONED_MAX_HOLD_MS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_HOLD_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1128: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_max_hold_ms_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_HOLD_MS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_max_hold_ms_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::ddl_permission_opt::FLAG => {
@@ -851,6 +925,22 @@ fn run_server(args: &[String]) -> ExitCode {
         Ok(limits) => limits,
         Err(e) => {
             engine::log_stderr!("wire-server: invalid batch limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Issue #1128: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間）を
+    // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
+    // listen へ進まず起動エラー）。環境変数は設けない（ADR §15.2）。
+    let partitioned_dml_limits = match wire_server::dml_limits_opt::resolve_partitioned_dml_limits(
+        engine::sql::parser::PartitionedDmlLimits::default(),
+        partitioned_chunk_rows_raw.as_deref(),
+        partitioned_scan_budget_raw.as_deref(),
+        partitioned_max_hold_ms_raw.as_deref(),
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid partitioned DML configuration: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1232,6 +1322,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
+    core = core.with_partitioned_dml_limits(partitioned_dml_limits);
     // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで
     // 解決済みで、`EngineCore` の既定 `BatchLimits::default()` とビット同一）。
     core = core.with_batch_limits(batch_limits);

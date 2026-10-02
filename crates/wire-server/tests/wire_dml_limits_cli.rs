@@ -5,7 +5,7 @@
 //! `Command::new(env!("CARGO_BIN_EXE_wire-server"))` で起動し、stderr の
 //! `listening on` 行または非 0 終了・エラーメッセージを外形的に確認する）。
 //!
-//! - R1: 範囲内（`1..=1_000_000`）の値はいずれのフラグも `listening on` に
+//! - R1: 範囲内（Issue #1128 で分割実行 DML の 3 フラグも同じ R1〜R4 に含める）（`1..=1_000_000`）の値はいずれのフラグも `listening on` に
 //!   到達すること（起動を妨げない）
 //! - R2: 値の欠落は非 0 終了・stderr にフラグ名を含むこと
 //! - R3: 重複指定は非 0 終了・stderr に "specified more than once" を含むこと
@@ -167,9 +167,19 @@ fn wait_for_listening_lines(child: &mut Child) -> Vec<String> {
 /// R1: 範囲内の値はいずれのフラグも起動を妨げない。
 #[test]
 fn in_range_values_start_listening() {
-    let cases: [&[&str]; 3] = [
+    let cases: [&[&str]; 5] = [
         &["--max-dml-affected-rows", "5"],
         &["--max-insert-rows", "5"],
+        // Issue #1128: 分割実行 DML の 3 フラグ（範囲の両端を含む）。
+        &[
+            "--partitioned-dml-chunk-rows",
+            "1",
+            "--partitioned-dml-scan-budget",
+            "1000000",
+            "--partitioned-dml-max-hold-ms",
+            "100",
+        ],
+        &["--partitioned-dml-max-hold-ms", "5000"],
         &[
             "--max-dml-affected-rows",
             "1000000",
@@ -262,6 +272,78 @@ fn invalid_missing_duplicate_or_out_of_range_values_are_rejected() {
             vec!["--max-dml-affected-rows", "abc"],
         ),
         ("--max-insert-rows", vec!["--max-insert-rows", "+5"]),
+        // Issue #1128: 分割実行 DML の 3 フラグ（値欠落・重複・範囲外・非数値）。
+        (
+            "--partitioned-dml-chunk-rows",
+            vec!["--partitioned-dml-chunk-rows"],
+        ),
+        (
+            "--partitioned-dml-scan-budget",
+            vec!["--partitioned-dml-scan-budget"],
+        ),
+        (
+            "--partitioned-dml-max-hold-ms",
+            vec!["--partitioned-dml-max-hold-ms"],
+        ),
+        (
+            "--partitioned-dml-chunk-rows",
+            vec![
+                "--partitioned-dml-chunk-rows",
+                "5",
+                "--partitioned-dml-chunk-rows",
+                "10",
+            ],
+        ),
+        (
+            "--partitioned-dml-scan-budget",
+            vec![
+                "--partitioned-dml-scan-budget",
+                "5",
+                "--partitioned-dml-scan-budget",
+                "10",
+            ],
+        ),
+        (
+            "--partitioned-dml-max-hold-ms",
+            vec![
+                "--partitioned-dml-max-hold-ms",
+                "200",
+                "--partitioned-dml-max-hold-ms",
+                "300",
+            ],
+        ),
+        (
+            "--partitioned-dml-chunk-rows",
+            vec!["--partitioned-dml-chunk-rows", "0"],
+        ),
+        (
+            "--partitioned-dml-chunk-rows",
+            vec!["--partitioned-dml-chunk-rows", "1000001"],
+        ),
+        (
+            "--partitioned-dml-scan-budget",
+            vec!["--partitioned-dml-scan-budget", "0"],
+        ),
+        (
+            "--partitioned-dml-scan-budget",
+            vec!["--partitioned-dml-scan-budget", "1000001"],
+        ),
+        (
+            "--partitioned-dml-max-hold-ms",
+            vec!["--partitioned-dml-max-hold-ms", "99"],
+        ),
+        (
+            "--partitioned-dml-max-hold-ms",
+            vec!["--partitioned-dml-max-hold-ms", "5001"],
+        ),
+        (
+            "--partitioned-dml-chunk-rows",
+            vec!["--partitioned-dml-chunk-rows", "+5"],
+        ),
+        (
+            "--partitioned-dml-max-hold-ms",
+            vec!["--partitioned-dml-max-hold-ms", "abc"],
+        ),
     ];
 
     for (expected_flag, extra_args) in cases {

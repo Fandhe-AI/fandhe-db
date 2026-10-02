@@ -1138,6 +1138,10 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_dml_limits`] のみ。`crate::sql::parser::DmlLimits`
     /// モジュールドキュメント参照。
     dml_limits: crate::sql::parser::DmlLimits,
+    /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
+    /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
+    /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
+    partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits,
     /// `dictionary.rs` の辞書的情報源（TASK-109・PLAN-5）の世代整合キャッシュ。
     /// [`Self::dictionary_snapshot`] がこれを経由して再構築を再利用する（詳細は
     /// [`DictionaryCache`] のドキュメント参照）。
@@ -1961,6 +1965,7 @@ impl EngineCore {
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dml_limits: crate::sql::parser::DmlLimits::default(),
+            partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
@@ -2168,6 +2173,22 @@ impl EngineCore {
     pub fn with_dml_limits(mut self, limits: crate::sql::parser::DmlLimits) -> Self {
         self.dml_limits = limits;
         self
+    }
+
+    /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
+    /// ビルダーを返す。`wire-server` の起動時 CLI フラグ（プロセス全体・1 回限り）から
+    /// のみ呼ぶ。未呼び出しなら既定値（ADR §15.2）。
+    pub fn with_partitioned_dml_limits(
+        mut self,
+        limits: crate::sql::parser::PartitionedDmlLimits,
+    ) -> Self {
+        self.partitioned_dml_limits = limits;
+        self
+    }
+
+    /// 現在の分割実行 DML の設定。
+    pub fn partitioned_dml_limits(&self) -> crate::sql::parser::PartitionedDmlLimits {
+        self.partitioned_dml_limits
     }
 
     /// HNSW opt-in 時に HNSW 経路を使うテーブルの範囲

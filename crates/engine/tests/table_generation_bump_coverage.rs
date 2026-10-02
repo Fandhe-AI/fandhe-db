@@ -75,8 +75,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `Storage::put`/`Storage::put_batch` の行番号がさらに移動したための追随
     // （旧: 652／683）。
     // Issue #1179（`storage::read_source` モジュール宣言の追加）で行番号が移動したための追随（旧: 804／835）。
-    ("storage.rs", 820),
-    ("storage.rs", 851),
+    // Issue #1128（`begin_partitioned_chunk_txn` の追加）で行番号が移動したための追随（旧: 820／851）。
+    ("storage.rs", 842),
+    ("storage.rs", 873),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 201),
     ("txn.rs", 372),
