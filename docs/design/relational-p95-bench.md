@@ -336,9 +336,11 @@ SQL-24・SQL-25・SQL-28・SQL-2 の数値基準（ポインタ）の確定判�
 set -o pipefail
 out="/path/to/logdir"  # 保存先ディレクトリの絶対パスへ書き換える（引用符は残す）
 ts=$(date -u +%Y%m%dT%H%M%SZ)
+rc=0
 for g in predicate order_by join; do
-  BENCH_DEDICATED_ENV=1 BENCH_RELATIONAL_P95_GROUP=$g make bench-relational-p95 2>&1 | tee "$out/${ts}-${g}.log" || { echo "FAILED: $g"; break; }
+  BENCH_DEDICATED_ENV=1 BENCH_RELATIONAL_P95_GROUP=$g make bench-relational-p95 2>&1 | tee "$out/${ts}-${g}.log" || { echo "FAILED: $g" >&2; rc=1; break; }
 done
+(exit "$rc")  # 失敗したグループがあれば手順全体を非ゼロで終える（直前の break で終了状態が 0 に戻らないようにする）
 ```
 
 - 終了コードが 0 以外のグループの値は記録に使わない（fail-closed）。原因は `relational_p95_bench: ...` 行（stderr）に出る。
@@ -350,13 +352,13 @@ done
 
 段別内訳（Issue #1319）は predicate グループのプロセスで自動的に出力され、追加の環境変数は不要である。
 `stage_summary` は全ラウンドをプールした median・Q1・Q3・min、`stage_diff` は `residual_median`（`current`）と `c_median`（`plain_scan_ref`。逆転時は `n/a`）、`stage_round` は生データである。
-path と段の定義は「述語経路の段別内訳」節を参照する。抽出例（`<log>` は各ログのパス）:
+path と段の定義は「述語経路の段別内訳」節を参照する。抽出例（`$log` は各ログのパスを入れた変数。例: `log="$out/${ts}-predicate.log"`）:
 
 ```bash
-grep -E '^relational_p95: group=.* min_of_n=' <log>        # arm 要約
-grep -E '^relational_p95: group=.* round=' <log>           # ラウンド別 p95（生データ）
-grep -E '^relational_p95: stage_(summary|diff) ' <log>     # 段別内訳
-grep -E '^(env:|relational_p95_bench:|threshold_judgement:|path arm=)' <log>
+grep -E '^relational_p95: group=.* min_of_n=' "$log"        # arm 要約
+grep -E '^relational_p95: group=.* round=' "$log"           # ラウンド別 p95（生データ）
+grep -E '^relational_p95: stage_(summary|diff) ' "$log"     # 段別内訳
+grep -E '^(env:|relational_p95_bench:|threshold_judgement:|path arm=)' "$log"
 ```
 
 ### 4. 閾値判定の読み方
