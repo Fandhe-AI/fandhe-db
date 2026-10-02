@@ -362,7 +362,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 実行器側（`tenant/partitioned_dml.rs::finalize_cancel`）と `CANCEL PARTITIONED DML`
     // 文（`sql/partitioned.rs::execute_cancel`）の 2 箇所。
     ("tenant/partitioned_dml.rs", 254),
-    ("sql/partitioned.rs", 322),
+    ("sql/partitioned.rs", 333),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を

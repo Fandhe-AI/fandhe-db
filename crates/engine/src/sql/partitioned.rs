@@ -272,6 +272,9 @@ pub(crate) fn execute_show(
     )
 }
 
+/// `execute_cancel` の状態再判定の上限回数。
+const CANCEL_RETRY_LIMIT: usize = 8;
+
 /// `CANCEL PARTITIONED DML`（autocommit 専用）: 実行中なら次のチャンク境界で止める要求を出し、
 /// 中断中なら取り消し済みへ縮める。commit 済みのチャンクは戻さない。
 ///
@@ -290,56 +293,68 @@ pub(crate) fn execute_cancel(
     let key = JobKey::for_context(ctx, &job.table, &job.operation_id);
     let registry = storage.partitioned_job_registry();
 
-    if registry.request_cancel(&key) {
-        return cancelling_result(storage, &key);
-    }
-    match lookup_record(storage, &key)? {
-        None => return Ok(empty_status_result()),
-        Some(JobRecord::Completed { total, .. }) => return Ok(status_result("completed", total)),
-        Some(JobRecord::Cancelled { committed, .. }) => {
-            return Ok(status_result("cancelled", committed))
+    // 登録の再確認後に実行器が終了して要求が届かない窓があるため、状態を読み直して再判定する。
+    // 再開と終了が競合し続ける場合に備えて回数を上限で打ち切る（fail-closed）。
+    for _ in 0..CANCEL_RETRY_LIMIT {
+        if registry.request_cancel(&key) {
+            return cancelling_result(storage, &key);
         }
-        Some(JobRecord::Running { .. }) => {}
-    }
+        match lookup_record(storage, &key)? {
+            None => return Ok(empty_status_result()),
+            Some(JobRecord::Completed { total, .. }) => {
+                return Ok(status_result("completed", total))
+            }
+            Some(JobRecord::Cancelled { committed, .. }) => {
+                return Ok(status_result("cancelled", committed))
+            }
+            Some(JobRecord::Running { .. }) => {}
+        }
 
-    let txn = storage.begin_write_txn().map_err(|e| match e {
-        crate::storage::StorageError::WriteLockTimeout
-        | crate::storage::StorageError::WriteTxnHeldByCurrentSession => {
-            SqlSurfaceError::LockNotAvailable
-        }
-        _ => SqlSurfaceError::Internal {
-            detail: "cancel failed".to_string(),
-        },
-    })?;
-    if registry.is_registered(&key) {
-        // 直前に再開された。実行器へ要求を渡す（writer を手放してから）。
-        drop(txn);
-        registry.request_cancel(&key);
-        return cancelling_result(storage, &key);
-    }
-    match partitioned_job::cancel_in_txn(&txn, &key).map_err(job_record_error)? {
-        Some(committed) => {
-            crate::recovery::commit_boundary::commit(txn).map_err(|_| {
-                SqlSurfaceError::Internal {
-                    detail: "cancel failed".to_string(),
-                }
-            })?;
-            Ok(status_result("cancelled", committed))
-        }
-        None => {
-            // 読み取りと書き込みの間で状態が変わった（完了・取り消し済み）。書き込まずに返す。
-            let record =
-                partitioned_job::lookup_in_write_txn(&txn, &key).map_err(job_record_error)?;
+        let txn = storage.begin_write_txn().map_err(|e| match e {
+            crate::storage::StorageError::WriteLockTimeout
+            | crate::storage::StorageError::WriteTxnHeldByCurrentSession => {
+                SqlSurfaceError::LockNotAvailable
+            }
+            _ => SqlSurfaceError::Internal {
+                detail: "cancel failed".to_string(),
+            },
+        })?;
+        if registry.is_registered(&key) {
+            // 直前に再開された。実行器へ要求を渡す（writer を手放してから）。
             drop(txn);
-            Ok(match record {
-                Some(JobRecord::Completed { total, .. }) => status_result("completed", total),
-                Some(JobRecord::Cancelled { committed, .. }) => {
-                    status_result("cancelled", committed)
-                }
-                _ => empty_status_result(),
-            })
+            if registry.request_cancel(&key) {
+                return cancelling_result(storage, &key);
+            }
+            // 要求が届く前に実行器が終了して登録が外れた。受理を通知せず、記録を読み直して判定する。
+            continue;
         }
+        return match partitioned_job::cancel_in_txn(&txn, &key).map_err(job_record_error)? {
+            Some(committed) => {
+                crate::recovery::commit_boundary::commit(txn).map_err(|_| {
+                    SqlSurfaceError::Internal {
+                        detail: "cancel failed".to_string(),
+                    }
+                })?;
+                Ok(status_result("cancelled", committed))
+            }
+            None => {
+                // 読み取りと書き込みの間で状態が変わった（完了・取り消し済み）。書き込まずに返す。
+                let record =
+                    partitioned_job::lookup_in_write_txn(&txn, &key).map_err(job_record_error)?;
+                drop(txn);
+                Ok(match record {
+                    Some(JobRecord::Completed { total, .. }) => status_result("completed", total),
+                    Some(JobRecord::Cancelled { committed, .. }) => {
+                        status_result("cancelled", committed)
+                    }
+                    _ => empty_status_result(),
+                })
+            }
+        };
     }
+    Err(SqlSurfaceError::Internal {
+        detail: "cancel failed".to_string(),
+    })
 }
 
 /// `cancelling` 応答（要求を出した時点の commit 済み件数を添える）。
