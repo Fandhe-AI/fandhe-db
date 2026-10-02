@@ -126,23 +126,27 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
             let mut prev = u64::MAX;
             let mut violations = 0u64;
             let mut searches = 0u64;
+            // 検索の失敗・想定外の結果型は黙って捨てず記録し、最後に拒否する。
+            let mut errors: Vec<String> = Vec::new();
             // stop が先に立っても最低 1 周は検索する（stop の確認は 1 周の処理後）。
             for _ in 0..MAX_SEARCHES {
-                if let Ok(SqlOutcome::Query(q)) =
-                    run(&core, "SELECT id FROM docs WHERE tag = 'x' LIMIT 1000")
-                {
-                    let n = q.rows.len() as u64;
-                    searches += 1;
-                    if n > prev {
-                        violations += 1;
+                match run(&core, "SELECT id FROM docs WHERE tag = 'x' LIMIT 1000") {
+                    Ok(SqlOutcome::Query(q)) => {
+                        let n = q.rows.len() as u64;
+                        searches += 1;
+                        if n > prev {
+                            violations += 1;
+                        }
+                        prev = n;
                     }
-                    prev = n;
+                    Ok(other) => errors.push(format!("unexpected outcome {other:?}")),
+                    Err(e) => errors.push(format!("search failed: {e:?}")),
                 }
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
             }
-            (violations, searches)
+            (violations, searches, errors)
         })
     };
 
@@ -158,11 +162,15 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
     };
     stop.store(true, Ordering::Relaxed);
     let (failures, last_n) = normal.join().expect("normal thread");
-    let (violations, searches) = search.join().expect("search thread");
+    let (violations, searches, search_errors) = search.join().expect("search thread");
 
     assert_eq!(deleted, MATCHING);
     // 通常の書き込みは分割実行に待たされて拒否されない（ADR 8.2。55P03 が 0 件）。
     assert!(failures.is_empty(), "normal writes failed: {failures:?}");
+    assert!(
+        search_errors.is_empty(),
+        "concurrent searches failed: {search_errors:?}"
+    );
     assert_eq!(violations, 0, "matching count must never increase");
     // 並行動作が空振りしていない（両スレッドが実際に処理した）ことを確認する。
     assert!(last_n >= 1, "normal write thread never ran");
