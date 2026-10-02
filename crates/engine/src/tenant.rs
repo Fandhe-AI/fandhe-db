@@ -8337,4 +8337,139 @@ mod tests {
         }
         assert_eq!(outcomes[0], outcomes[1]);
     }
+
+    // --- Issue #1127: 分割実行ジョブ中の operation_id を通常 DML が使えない --------
+
+    /// 通常 DML（単一行・述語形）が、同じ `operation_id` の分割実行ジョブ（`Running`／
+    /// `Cancelled`／`Completed`）に対して `OperationIdContentMismatch`（`22023`）で
+    /// 拒否され、行も台帳も変わらないことを固定する（ADR
+    /// `docs/design/partitioned-dml.md` §6）。
+    #[test]
+    fn normal_dml_rejects_operation_id_of_partitioned_job() {
+        use crate::recovery::partitioned_job::{
+            cancel_in_txn, complete_in_txn, record_chunk_progress_in_txn, JobKey,
+        };
+        let path = unique_db_path("partitioned-job-vs-normal-dml");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let job_hash = content_hash::ContentHash::for_test(b"partitioned-job");
+
+        let assert_rejected = |op_id: &OperationId| {
+            let single = insert_row(
+                &storage,
+                "docs",
+                &ctx,
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: b"x",
+                },
+                op_id,
+            );
+            assert!(
+                matches!(single, Err(TenantWriteError::OperationIdContentMismatch)),
+                "single-row DML must be rejected: {single:?}"
+            );
+            let predicate = delete_rows_where_unchecked(
+                WriteTarget::Autocommit(&storage),
+                "docs",
+                &ctx,
+                LedgerWrite::Record(op_id),
+                &content_hash::ContentHash::for_test(b"normal-delete"),
+                None,
+                false,
+                Some(std::num::NonZeroUsize::new(100).expect("nonzero")),
+                |_c: &DmlCandidate<'_>| -> Result<bool, std::convert::Infallible> { Ok(true) },
+            );
+            assert!(
+                matches!(
+                    predicate,
+                    Err(PredicateDmlError::Write(
+                        TenantWriteError::OperationIdContentMismatch
+                    ))
+                ),
+                "predicate DML must be rejected: {:?}",
+                predicate.map(|_| ())
+            );
+            assert!(visible_rows(&storage, "docs", &ctx)
+                .expect("visible rows")
+                .is_empty());
+        };
+
+        // Running（実行中・中断）。
+        let running = OperationId::parse("job-running").expect("op");
+        {
+            let txn = storage.begin_write_txn().expect("txn");
+            let key = JobKey::for_context(&ctx, "docs", &running);
+            record_chunk_progress_in_txn(&txn, &key, &job_hash, 1, 1, 10).expect("running");
+            txn.commit_raw_for_test().expect("commit");
+        }
+        assert_rejected(&running);
+
+        // Cancelled。
+        {
+            let txn = storage.begin_write_txn().expect("txn");
+            let key = JobKey::for_context(&ctx, "docs", &running);
+            cancel_in_txn(&txn, &key).expect("cancel");
+            txn.commit_raw_for_test().expect("commit");
+        }
+        assert_rejected(&running);
+
+        // Completed（台帳エントリあり。台帳側の内容不一致で拒否される）。
+        let completed = OperationId::parse("job-completed").expect("op");
+        {
+            let txn = storage.begin_write_txn().expect("txn");
+            let key = JobKey::for_context(&ctx, "docs", &completed);
+            complete_in_txn(&txn, &key, &job_hash, 0).expect("complete");
+            txn.commit_raw_for_test().expect("commit");
+        }
+        assert_rejected(&completed);
+    }
+
+    /// `DROP TABLE` が分割実行ジョブ記録も掃除し、同名再作成後に同じ `operation_id` を
+    /// 通常 DML で使えることを固定する（Issue #1127）。
+    #[test]
+    fn drop_table_clears_partitioned_job_so_operation_id_is_reusable() {
+        use crate::recovery::partitioned_job::{record_chunk_progress_in_txn, JobKey};
+        let path = unique_db_path("partitioned-job-drop-table");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("job-reuse").expect("op");
+        {
+            let txn = storage.begin_write_txn().expect("txn");
+            let key = JobKey::for_context(&ctx, "docs", &op_id);
+            record_chunk_progress_in_txn(
+                &txn,
+                &key,
+                &content_hash::ContentHash::for_test(b"job"),
+                1,
+                1,
+                10,
+            )
+            .expect("running");
+            txn.commit_raw_for_test().expect("commit");
+        }
+        storage.drop_table("docs").expect("drop");
+        storage.create_table(&schema("docs")).expect("recreate");
+        insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: b"x",
+            },
+            &op_id,
+        )
+        .expect("operation_id must be reusable after DROP TABLE");
+    }
 }
