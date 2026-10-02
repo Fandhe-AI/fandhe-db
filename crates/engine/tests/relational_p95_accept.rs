@@ -353,3 +353,146 @@ fn expected_path_pins_or_arms_to_index_in_list() {
     }
     assert_eq!(expected_path("unknown_arm"), ("plain_scan", false));
 }
+
+// --- 述語経路の段別計測（Issue #1319。SQL-24・SQL-2 ポインタ） ---
+
+fn us(n: u64) -> Duration {
+    Duration::from_micros(n)
+}
+
+#[test]
+fn quantile_nearest_rank_boundaries() {
+    let odd = [us(5), us(1), us(3), us(2), us(4)];
+    assert_eq!(quantile_nearest_rank(&odd, 0.5), Ok(us(3)));
+    assert_eq!(quantile_nearest_rank(&odd, 0.25), Ok(us(2)));
+    assert_eq!(quantile_nearest_rank(&odd, 0.75), Ok(us(4)));
+    assert_eq!(quantile_nearest_rank(&odd, 1.0), Ok(us(5)));
+    // 偶数長は nearest-rank（ceil(q * n) 番目）。
+    let even = [us(4), us(1), us(3), us(2)];
+    assert_eq!(quantile_nearest_rank(&even, 0.5), Ok(us(2)));
+    assert_eq!(quantile_nearest_rank(&even, 0.75), Ok(us(3)));
+    // 単一要素はどの q でもその値。
+    assert_eq!(quantile_nearest_rank(&[us(7)], 0.25), Ok(us(7)));
+    // 空・範囲外の q は拒否する。
+    assert_eq!(
+        quantile_nearest_rank(&[], 0.5),
+        Err(RelationalP95Error::EmptySamples)
+    );
+    for bad in [0.0, -0.1, 1.01, f64::NAN] {
+        assert_eq!(
+            quantile_nearest_rank(&odd, bad),
+            Err(RelationalP95Error::InvalidQuantile),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn summarize_stage_reports_median_quartiles_and_min() {
+    let samples: Vec<Duration> = (1..=8).map(us).collect();
+    let s = summarize_stage(&samples).expect("summary");
+    assert_eq!((s.q1, s.median, s.q3, s.min), (us(2), us(4), us(6), us(1)));
+    assert_eq!(s.samples, 8);
+    assert!(summarize_stage(&[]).is_err());
+}
+
+#[test]
+fn arm_values_match_statements() {
+    let literal = vector_literal(&[0.5, 0.5]).expect("literal");
+    let arms = predicate_statements("docs", &literal).expect("statements");
+    let want = [
+        ("pred_eq", 1usize, PredForm::Equality),
+        ("pred_or2", 2, PredForm::OrBranches),
+        ("pred_in2", 2, PredForm::InList),
+        ("pred_or_same", 1, PredForm::OrBranches),
+        ("pred_in8", 8, PredForm::InList),
+    ];
+    assert_eq!(arms.len(), want.len());
+    for (label, distinct, form) in want {
+        assert_eq!(arm_pred_form(label), Ok(form), "{label}");
+        let values = arm_lang_values(label).expect("values");
+        assert_eq!(values.len(), distinct, "{label}");
+        // 値集合は SQL 文に現れる `'lN'` トークンと一致する（文と段別計測の取り違え検出）。
+        let sql = &arms.iter().find(|(l, _)| *l == label).expect("arm").1;
+        for v in &values {
+            assert!(sql.contains(&format!("'{v}'")), "{label}: {v}");
+        }
+    }
+    // 同一値 OR は分岐が 2 本、重複なし集合は 1 本。
+    assert_eq!(arm_branch_values("pred_or_same").expect("b").len(), 2);
+    assert!(arm_lang_values("nope").is_err());
+    assert!(arm_pred_form("nope").is_err());
+    assert!(expected_match_ids("nope", 10).is_err());
+}
+
+#[test]
+fn expected_match_ids_follow_fixture_selectivity() {
+    // lang は id % 16。1000 行なら 1/16・2/16・8/16 の選択率になる。
+    let eq = expected_match_ids("pred_eq", 1_000).expect("ids");
+    assert_eq!(eq.len(), 63);
+    assert!(eq.iter().all(|id| id % 16 == 0));
+    assert!(eq.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(expected_match_ids("pred_or_same", 1_000).expect("ids"), eq);
+    let two = expected_match_ids("pred_or2", 1_000).expect("ids");
+    assert_eq!(two, expected_match_ids("pred_in2", 1_000).expect("ids"));
+    assert!(two.iter().all(|id| id % 16 < 2));
+    assert_eq!(
+        expected_match_ids("pred_in8", 1_000).expect("ids").len(),
+        504
+    );
+}
+
+#[test]
+fn stage_diffs_use_checked_arithmetic() {
+    assert_eq!(checked_stage_diff(us(10), us(4)), Some(us(6)));
+    assert_eq!(checked_stage_diff(us(4), us(10)), None);
+    assert_eq!(checked_residual(us(100), us(30), us(50)), Some(us(20)));
+    assert_eq!(checked_residual(us(100), us(60), us(50)), None);
+    let inverted = render_stage_diff_line("pred_or2", StagePath::Current, "residual_median", None);
+    assert!(inverted.contains("residual_median=n/a"));
+    let ok = render_stage_diff_line(
+        "pred_or2",
+        StagePath::PlainScanRef,
+        "c_median",
+        Some(us(12)),
+    );
+    assert!(ok.contains("path=plain_scan_ref") && ok.contains("c_median=12.000us"));
+}
+
+#[test]
+fn stage_lines_have_keys_and_no_tenant() {
+    let s = summarize_stage(&[us(3), us(1), us(2)]).expect("summary");
+    let round = render_stage_round_line(
+        "pred_in2",
+        StagePath::Current,
+        STAGE_IDX_SEARCH_SUBSET,
+        2,
+        us(5),
+        "scanned_rows=10 k=10",
+    );
+    let sum = render_stage_summary_line(
+        "pred_in2",
+        StagePath::PlainScanRef,
+        STAGE_PLAIN_COPY,
+        &s,
+        "matched=3 copied_bytes=9",
+    );
+    assert!(round.contains("stage=idx_search_subset") && round.contains("round=2"));
+    assert!(round.contains("path=current") && round.contains("scanned_rows=10"));
+    for key in [
+        "median=",
+        "q1=",
+        "q3=",
+        "min=",
+        "samples=3",
+        "path=plain_scan_ref",
+    ] {
+        assert!(sum.contains(key), "{key}");
+    }
+    for line in [&round, &sum] {
+        assert!(!line.contains("tenant"));
+        assert!(!line.contains("SELECT"));
+    }
+    assert_eq!(StagePath::Current.label(), "current");
+    assert_eq!(StagePath::PlainScanRef.label(), "plain_scan_ref");
+}

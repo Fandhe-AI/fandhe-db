@@ -57,6 +57,10 @@ pub enum RelationalP95Error {
     DegenerateRatio(&'static str),
     InvalidIdentifier(&'static str),
     RefusedUnderGithubActions,
+    /// 段別計測（Issue #1319）で未知の arm ラベルを受け取った。
+    UnknownArm(String),
+    /// 分位点の q が `(0, 1]` の外。
+    InvalidQuantile,
 }
 
 impl fmt::Display for RelationalP95Error {
@@ -68,6 +72,8 @@ impl fmt::Display for RelationalP95Error {
             Self::EmptySamples => write!(f, "empty sample set"),
             Self::DegenerateRatio(r) => write!(f, "degenerate ratio: {r}"),
             Self::InvalidIdentifier(field) => write!(f, "{field} is not a valid identifier"),
+            Self::UnknownArm(a) => write!(f, "unknown predicate arm: {a:?}"),
+            Self::InvalidQuantile => write!(f, "quantile must be in (0, 1]"),
             Self::RefusedUnderGithubActions => write!(
                 f,
                 "relational_p95_bench refuses to run under GitHub Actions (GITHUB_ACTIONS is set); this bench is manual-only and not wired into any workflow"
@@ -641,4 +647,187 @@ pub fn expected_path(arm: &str) -> (&'static str, bool) {
         "pred_in2" | "pred_in8" | "pred_or2" | "pred_or_same" => ("index_in_list", true),
         _ => ("plain_scan", false),
     }
+}
+
+// --- 述語経路の段別計測（Issue #1319。SQL-24・SQL-2 ポインタ） ---
+//
+// `relational_p95_bench.rs` の段別計測が使う時間非依存の部品。段本体（タイマー・arena・SQL 実行）は
+// ベンチ側にあり、ここには arm→述語形の対応・独立な期待一致 id の導出・分位点・出力行だけを置く。
+
+/// 段別計測の系列。`Current` は現 HEAD の索引 trusted-mask 経路の再実装、
+/// `PlainScanRef` は #1275 時点の PlainScan 経路（全件 SCALAR 評価＋一致行の複製）の反実仮想。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagePath {
+    Current,
+    PlainScanRef,
+}
+
+impl StagePath {
+    pub fn label(self) -> &'static str {
+        match self {
+            StagePath::Current => "current",
+            StagePath::PlainScanRef => "plain_scan_ref",
+        }
+    }
+}
+
+/// 段ラベル（出力・設計文書と共通）。
+pub const STAGE_IDX_CANDIDATE_RESOLVE: &str = "idx_candidate_resolve";
+pub const STAGE_IDX_SEARCH_SUBSET: &str = "idx_search_subset";
+pub const STAGE_PLAIN_SCALAR_EVAL: &str = "plain_scalar_eval";
+pub const STAGE_PLAIN_COPY: &str = "plain_copy";
+pub const STAGE_PLAIN_SEARCH: &str = "plain_search";
+/// 同ラウンドで測った同 arm の SQL 全体（残差の算出にだけ使う）。
+pub const STAGE_E2E: &str = "e2e";
+
+/// arm の述語の形。PlainScan 反実仮想での評価方法（OR 分岐の any／IN／等価）を決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredForm {
+    Equality,
+    OrBranches,
+    InList,
+}
+
+/// arm の述語形。未知の arm は拒否する（fail-closed）。
+pub fn arm_pred_form(arm: &str) -> Result<PredForm, RelationalP95Error> {
+    match arm {
+        "pred_eq" => Ok(PredForm::Equality),
+        "pred_or2" | "pred_or_same" => Ok(PredForm::OrBranches),
+        "pred_in2" | "pred_in8" => Ok(PredForm::InList),
+        other => Err(RelationalP95Error::UnknownArm(other.to_string())),
+    }
+}
+
+/// arm の分岐値（`predicate_statements` の文と同じ並び。`pred_or_same` は同一値の 2 分岐）。
+pub fn arm_branch_values(arm: &str) -> Result<Vec<&'static str>, RelationalP95Error> {
+    let tokens = |n: u64| (0..n).map(lang_token).collect::<Vec<_>>();
+    match arm {
+        "pred_eq" => Ok(tokens(1)),
+        "pred_or_same" => Ok(vec![lang_token(0), lang_token(0)]),
+        "pred_or2" | "pred_in2" => Ok(tokens(2)),
+        "pred_in8" => Ok(tokens(8)),
+        other => Err(RelationalP95Error::UnknownArm(other.to_string())),
+    }
+}
+
+/// arm の重複なし値集合（索引の候補解決が引く値）。
+pub fn arm_lang_values(arm: &str) -> Result<Vec<&'static str>, RelationalP95Error> {
+    let mut values = arm_branch_values(arm)?;
+    values.dedup();
+    Ok(values)
+}
+
+/// fixture 規則（`lang_for_id`）だけから導く期待一致 id（昇順）。段本体の再実装ロジックを通らない。
+pub fn expected_match_ids(arm: &str, rows: u64) -> Result<Vec<u64>, RelationalP95Error> {
+    let n = arm_lang_values(arm)?.len() as u64;
+    Ok((0..rows)
+        .filter(|id| lang_in_first_n(lang_for_id(*id), n))
+        .collect())
+}
+
+/// nearest-rank 分位点（`q` は `(0, 1]`）。空入力・範囲外の q は拒否する。
+pub fn quantile_nearest_rank(samples: &[Duration], q: f64) -> Result<Duration, RelationalP95Error> {
+    if samples.is_empty() {
+        return Err(RelationalP95Error::EmptySamples);
+    }
+    if !(q > 0.0 && q <= 1.0) {
+        return Err(RelationalP95Error::InvalidQuantile);
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted
+        .get(rank - 1)
+        .copied()
+        .ok_or(RelationalP95Error::EmptySamples)
+}
+
+/// 段のプール済みサンプルの要約（median・Q1・Q3 は nearest-rank）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageSummary {
+    pub median: Duration,
+    pub q1: Duration,
+    pub q3: Duration,
+    pub min: Duration,
+    pub samples: usize,
+}
+
+pub fn summarize_stage(samples: &[Duration]) -> Result<StageSummary, RelationalP95Error> {
+    Ok(StageSummary {
+        median: quantile_nearest_rank(samples, 0.5)?,
+        q1: quantile_nearest_rank(samples, 0.25)?,
+        q3: quantile_nearest_rank(samples, 0.75)?,
+        min: samples
+            .iter()
+            .copied()
+            .min()
+            .ok_or(RelationalP95Error::EmptySamples)?,
+        samples: samples.len(),
+    })
+}
+
+fn us(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000_000.0
+}
+
+/// 段のラウンド別中央値（生データ。`counts` は `key=value` 列）。
+pub fn render_stage_round_line(
+    arm: &str,
+    path: StagePath,
+    stage: &str,
+    round: usize,
+    median: Duration,
+    counts: &str,
+) -> String {
+    format!(
+        "relational_p95: stage_round group=predicate arm={arm} path={} stage={stage} round={round} median={:.3}us {counts}",
+        path.label(),
+        us(median)
+    )
+}
+
+/// 段の全ラウンドプール要約（median・Q1・Q3・min）。
+pub fn render_stage_summary_line(
+    arm: &str,
+    path: StagePath,
+    stage: &str,
+    summary: &StageSummary,
+    counts: &str,
+) -> String {
+    format!(
+        "relational_p95: stage_summary group=predicate arm={arm} path={} stage={stage} samples={} median={:.3}us q1={:.3}us q3={:.3}us min={:.3}us {counts}",
+        path.label(),
+        summary.samples,
+        us(summary.median),
+        us(summary.q1),
+        us(summary.q3),
+        us(summary.min)
+    )
+}
+
+/// 差分行。`current` は残差 `residual`（e2e − 候補解決 − search_subset）、`plain_scan_ref` は
+/// 複製費 `c`（plain_copy − plain_scalar_eval。F は plain_scalar_eval 自身）。median 同士の差で、逆転は `n/a`。
+pub fn render_stage_diff_line(
+    arm: &str,
+    path: StagePath,
+    label: &str,
+    value: Option<Duration>,
+) -> String {
+    let shown = value
+        .map(|d| format!("{:.3}us", us(d)))
+        .unwrap_or_else(|| "n/a".to_string());
+    format!(
+        "relational_p95: stage_diff group=predicate arm={arm} path={} {label}={shown} (median-based; n/a when inverted by noise)",
+        path.label()
+    )
+}
+
+/// `a - b`（median 同士の差）。逆転は `None`。
+pub fn checked_stage_diff(a: Duration, b: Duration) -> Option<Duration> {
+    a.checked_sub(b)
+}
+
+/// 残差 `e2e - (a + b)`。加算あふれ・逆転は `None`。
+pub fn checked_residual(e2e: Duration, a: Duration, b: Duration) -> Option<Duration> {
+    e2e.checked_sub(a.checked_add(b)?)
 }

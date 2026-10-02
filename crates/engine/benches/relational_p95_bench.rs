@@ -22,6 +22,16 @@
 //! 結合は一意キーの `ORDER BY` 付きで `MAX_SEARCH_K` 以内の `LIMIT`／`OFFSET` ページ分割により全件取得し、id 集合まで照合する。加えて他テナント文脈で同じ文が
 //! 他テナント行を返すこと（＝越境が起きれば見える fixture であること）を確認する。
 //!
+//! # 述語経路の段別計測（Issue #1319。SQL-24・SQL-2 ポインタ）
+//!
+//! 述語グループは p95 行の後に、arm ごとの段別内訳（`stage_round`／`stage_summary`／`stage_diff` 行。
+//! 全ラウンドのサンプルをプールした median・Q1・Q3）を出力する。`perf` が使えない環境でも、
+//! プロセス内のタイマーと件数だけで PlainScan 反実仮想の「全件 SCALAR 評価の固定費 F」と
+//! 「一致行の複製費 c」を分離できる。engine 本体は無変更で、段は pub API によるベンチ内の再実装
+//! （`path=current` は現 HEAD の索引 trusted-mask 経路、`path=plain_scan_ref` は #1275 時点の
+//! PlainScan 経路の反実仮想。後者は現 HEAD の述語 arm の実経路ではない）。出力は閾値判定に使わない。
+//! 毎ラウンド、各段の結果を fixture 規則から独立に導いた期待と照合し、違反は非 0 終了する。
+//!
 //! 使い方は `make bench-relational-p95`。時間非依存の判定ロジックは
 //! `harness::relational_p95` にあり `tests/relational_p95_accept.rs` が `make ci` で検証する。
 
@@ -33,23 +43,32 @@ use std::time::Duration;
 use harness::env_report::EnvReport;
 use harness::protocol::{run_bounded_retain, MeasurementConfig};
 use harness::relational_p95::{
-    author_id_for_doc, expected_order_multi, expected_order_single, expected_path,
-    inner_product_distance, interleave_with_reference, is_exact_id_set, join_scale_label,
-    join_statement, lang_for_id, lang_in_first_n, lang_token, order_by_statements,
-    other_tenant_rows, pair_ratio, parse_group, parse_rounds, parse_rows_scale,
-    predicate_statements, qty_for_id, refuse_under_github_actions, render_round_line,
-    render_summary_line, render_threshold_line, round_p95, scale_label, sentinel_dominates,
-    sentinel_qty, sentinel_scale, summarize_rounds, topk_matches, visible_doc_rows, Group,
-    JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, WIDE_LIMIT,
+    arm_branch_values, arm_lang_values, arm_pred_form, author_id_for_doc, checked_residual,
+    checked_stage_diff, expected_match_ids, expected_order_multi, expected_order_single,
+    expected_path, inner_product_distance, interleave_with_reference, is_exact_id_set,
+    join_scale_label, join_statement, lang_for_id, lang_in_first_n, lang_token,
+    order_by_statements, other_tenant_rows, pair_ratio, parse_group, parse_rounds,
+    parse_rows_scale, predicate_statements, qty_for_id, quantile_nearest_rank,
+    refuse_under_github_actions, render_round_line, render_stage_diff_line,
+    render_stage_round_line, render_stage_summary_line, render_summary_line, render_threshold_line,
+    rotate_arms, round_p95, scale_label, sentinel_dominates, sentinel_qty, sentinel_scale,
+    summarize_rounds, summarize_stage, topk_matches, visible_doc_rows, Group, PredForm, StagePath,
+    StageSummary, JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, STAGE_E2E, STAGE_IDX_CANDIDATE_RESOLVE,
+    STAGE_IDX_SEARCH_SUBSET, STAGE_PLAIN_COPY, STAGE_PLAIN_SCALAR_EVAL, STAGE_PLAIN_SEARCH,
+    WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
 
+use engine::arena::VectorArena;
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::declarative_filter::{matches_all, DeclarativeFilter, MetadataFilter};
+use engine::kernel::{CandidateHit, SearchInput, SearchProvider, SubsetSearchInput};
+use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
-use engine::row_codec::{encode_scalar_columns, Value};
+use engine::row_codec::{encode_scalar_columns, scan_scalar_columns_masked, Value};
 use engine::search_engine;
 use engine::sql::exec::{Cell, QueryResult};
 use engine::sql::mode::SessionState;
@@ -460,6 +479,497 @@ fn measure_group(
     }
 }
 
+// --- 述語経路の段別計測（Issue #1319。SQL-24・SQL-2 ポインタ） ---
+//
+// engine の `pub(crate)` 関数は直接呼ばず、pub API（`VectorArena::build_filtered_with_rows`・
+// `row_codec::scan_scalar_columns_masked`・`declarative_filter::matches_all`・
+// `ParallelSearchProvider::{search, search_subset}`）で段をベンチ内に再実装する
+// （`scan_stage_profile_bench.rs` の I 系列・W 系列と同じ方式。production 無変更のため既定ビルドの
+// 挙動・性能は構造的に不変）。段本体は `#[inline(never)]` に分離する（Issue #682 の前例）。
+//
+// 系列は 2 つ: `current`（現 HEAD が通る索引 trusted-mask 経路）と `plain_scan_ref`
+// （#1275 時点の PlainScan 経路の反実仮想。F＝全件の SCALAR 評価・c＝一致行の複製の分離用。
+// 現 HEAD の述語 arm はどれもこの経路を通らない）。
+
+/// 段計測のラウンド内 warmup／計測回数（段は短いので p95 ではなくプール済み分位点で見る）。
+const STAGE_WARMUP: u32 = 20;
+const STAGE_MEASURED: u32 = 20;
+
+/// 段別計測が共有する、計測外で構築した可視行スナップショットと索引相当の辞書。
+struct StageFixture<'a> {
+    schema: &'a TableSchema,
+    /// 可視行（スロット順）の metadata バイト列と行 id。
+    metadata: Vec<Vec<u8>>,
+    ids: Vec<u64>,
+    /// 借用して探索に使うスナップショット arena。
+    arena: &'a VectorArena,
+    /// `lang` 値 → 値索引（`ScalarIndex` の `column.equality` 相当）。
+    lang_dict: std::collections::HashMap<String, usize>,
+    /// 値索引 → 候補スロット（昇順。`slots_for_value_index` 相当）。
+    lang_slots: Vec<Vec<u32>>,
+    /// `lang` 列だけ true の列マスク（`scan_scalar_columns_masked` 用）。
+    lang_mask: Vec<bool>,
+    query: &'a [f32],
+}
+
+impl<'a> StageFixture<'a> {
+    fn new(
+        schema: &'a TableSchema,
+        arena: &'a VectorArena,
+        ids: Vec<u64>,
+        metadata: Vec<Vec<u8>>,
+        query: &'a [f32],
+    ) -> Self {
+        let lang_col = schema
+            .columns
+            .iter()
+            .position(|c| c.name == "lang")
+            .unwrap_or_else(|| fail_closed("stage fixture: lang column not found"));
+        let lang_mask: Vec<bool> = (0..schema.columns.len()).map(|i| i == lang_col).collect();
+        let mut lang_dict: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut lang_slots: Vec<Vec<u32>> = Vec::new();
+        for (slot, meta) in metadata.iter().enumerate() {
+            let scanned = scan_scalar_columns_masked(schema, meta, Some(&lang_mask))
+                .unwrap_or_else(|e| fail_closed(format!("stage fixture: scan: {e}")));
+            let Some(text) = scanned
+                .get(lang_col)
+                .and_then(|v| v.as_ref())
+                .and_then(|v| v.as_text())
+            else {
+                fail_closed("stage fixture: lang cell is not text");
+            };
+            let slot = u32::try_from(slot)
+                .unwrap_or_else(|_| fail_closed("stage fixture: slot exceeds u32"));
+            let next = lang_slots.len();
+            let vi = *lang_dict.entry(text.to_string()).or_insert(next);
+            if vi == next {
+                lang_slots.push(Vec::new());
+            }
+            lang_slots
+                .get_mut(vi)
+                .unwrap_or_else(|| fail_closed("stage fixture: value index out of range"))
+                .push(slot);
+        }
+        Self {
+            schema,
+            metadata,
+            ids,
+            arena,
+            lang_dict,
+            lang_slots,
+            lang_mask,
+            query,
+        }
+    }
+}
+
+/// PlainScan 反実仮想が複製する、一致行の owned バッファ（embedding・id・tenant_id・visibility）。
+struct CopiedRows {
+    ids: Vec<u64>,
+    embeddings: Vec<f32>,
+    tenants: Vec<String>,
+    visibilities: Vec<Visibility>,
+}
+
+impl CopiedRows {
+    /// 複製した総バイト数（tenant 文字列は本体長のみ）。
+    fn bytes(&self) -> usize {
+        self.embeddings.len() * std::mem::size_of::<f32>()
+            + self.ids.len() * std::mem::size_of::<u64>()
+            + self.tenants.iter().map(String::len).sum::<usize>()
+            + self.visibilities.len() * std::mem::size_of::<Visibility>()
+    }
+}
+
+/// arm の述語を `lang` 列へ束縛したフィルタ列。評価は「いずれかが一致」（OR 分岐の any）。
+/// IN 形は 1 本の `in_list`、等価は 1 本、OR 形は分岐ごとの等価。
+fn plain_filters(arm: &str, schema: &TableSchema) -> Vec<MetadataFilter> {
+    let values = arm_branch_values(arm).unwrap_or_else(|e| fail_closed(e));
+    let form = arm_pred_form(arm).unwrap_or_else(|e| fail_closed(e));
+    let declared: Vec<DeclarativeFilter> = match form {
+        PredForm::InList => vec![DeclarativeFilter::in_list(
+            "lang",
+            values.iter().map(|v| v.to_string()).collect(),
+        )],
+        PredForm::Equality | PredForm::OrBranches => values
+            .iter()
+            .map(|v| DeclarativeFilter::equals("lang", *v))
+            .collect(),
+    };
+    declared
+        .iter()
+        .map(|f| {
+            f.bind(schema)
+                .unwrap_or_else(|e| fail_closed(format!("bind stage filter: {e}")))
+        })
+        .collect()
+}
+
+#[inline(always)]
+fn row_matches(fx: &StageFixture<'_>, meta: &[u8], filters: &[MetadataFilter]) -> bool {
+    let scanned = scan_scalar_columns_masked(fx.schema, meta, Some(&fx.lang_mask))
+        .unwrap_or_else(|e| fail_closed(format!("stage scan: {e}")));
+    filters
+        .iter()
+        .any(|f| matches_all(std::slice::from_ref(f), &scanned))
+}
+
+/// 索引経路の候補解決。実経路（`ScalarIndex::candidates_for`）の手順に合わせ、値 → 値索引 →
+/// 候補スロットの順で引く。単一値（`pred_eq`・重複除去後に 1 値の `pred_or_same`）は
+/// スロット列の複製のみで整列・重複除去しない（`FilterOp::Equals` 腕と同じ）。複数値
+/// （IN・OR 形）は値ごとのスロットを連結し、呼び出し元と同じ後処理（整列＋重複除去）を行う
+/// （`FilterOp::InText` 腕＋`sql::exec` の後処理相当。OR 形の実経路は分岐ごとの候補和集合で
+/// あり、ここでは IN 形と同じ連結＋整列で近似する）。
+#[inline(never)]
+fn stage_idx_candidate_resolve(fx: &StageFixture<'_>, values: &[&str]) -> Vec<u32> {
+    let slots_of = |v: &str| {
+        fx.lang_dict
+            .get(v)
+            .and_then(|&vi| fx.lang_slots.get(vi))
+            .map(|s| s.as_slice())
+    };
+    if let [single] = values {
+        return slots_of(single).map(|s| s.to_vec()).unwrap_or_default();
+    }
+    let mut out: Vec<u32> = Vec::new();
+    for v in values {
+        if let Some(slots) = slots_of(v) {
+            out.extend_from_slice(slots);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// 索引経路の距離計算・順位付け（借用した arena 上の `search_subset`。複製なし）。
+#[inline(never)]
+fn stage_idx_search_subset(fx: &StageFixture<'_>, slots: &[u32]) -> Vec<CandidateHit> {
+    ParallelSearchProvider
+        .search_subset(SubsetSearchInput {
+            slots,
+            vectors: fx.arena.vectors(),
+            dim: DIM as u32,
+            query: fx.query,
+            k: PRED_LIMIT,
+        })
+        .unwrap_or_else(|e| fail_closed(format!("search_subset: {e}")))
+}
+
+/// PlainScan 反実仮想の F: 可視行全件の SCALAR 評価（`lang` 列だけデコード）。戻り値は一致件数。
+#[inline(never)]
+fn stage_plain_scalar_eval(fx: &StageFixture<'_>, filters: &[MetadataFilter]) -> u64 {
+    let mut matched = 0u64;
+    for meta in &fx.metadata {
+        if row_matches(fx, meta, filters) {
+            matched += 1;
+        }
+    }
+    matched
+}
+
+/// PlainScan 反実仮想の F＋c: F と同じ評価に加え、一致行を owned バッファへ複製する
+/// （`Vec::new()` から amortized 成長。embedding だけでなく id・tenant_id・visibility も複製）。
+#[inline(never)]
+fn stage_plain_copy(fx: &StageFixture<'_>, filters: &[MetadataFilter]) -> CopiedRows {
+    let mut out = CopiedRows {
+        ids: Vec::new(),
+        embeddings: Vec::new(),
+        tenants: Vec::new(),
+        visibilities: Vec::new(),
+    };
+    let vectors = fx.arena.vectors();
+    for (slot, meta) in fx.metadata.iter().enumerate() {
+        if !row_matches(fx, meta, filters) {
+            continue;
+        }
+        let (Some(emb), Some(id)) = (vectors.get(slot * DIM..(slot + 1) * DIM), fx.ids.get(slot))
+        else {
+            fail_closed("stage copy: slot out of range");
+        };
+        out.embeddings.extend_from_slice(emb);
+        out.ids.push(*id);
+        out.tenants.push(TENANT_A.to_string());
+        out.visibilities.push(Visibility::Public);
+    }
+    out
+}
+
+/// PlainScan 反実仮想の距離計算・順位付け（複製済みバッファへの `search`）。
+#[inline(never)]
+fn stage_plain_search(fx: &StageFixture<'_>, copied: &CopiedRows) -> Vec<CandidateHit> {
+    ParallelSearchProvider
+        .search(SearchInput {
+            ids: &copied.ids,
+            vectors: &copied.embeddings,
+            dim: DIM as u32,
+            query: fx.query,
+            k: PRED_LIMIT,
+        })
+        .unwrap_or_else(|e| fail_closed(format!("search: {e}")))
+}
+
+/// 段のプール済みサンプル 1 件分（arm × 系列 × 段）。
+struct StageAcc {
+    arm: &'static str,
+    path: StagePath,
+    stage: &'static str,
+    samples: Vec<Duration>,
+    round_medians: Vec<Duration>,
+    counts: String,
+}
+
+fn stage_acc<'a>(
+    accs: &'a mut Vec<StageAcc>,
+    arm: &'static str,
+    path: StagePath,
+    stage: &'static str,
+) -> &'a mut StageAcc {
+    let pos = accs
+        .iter()
+        .position(|a| a.arm == arm && a.path == path && a.stage == stage);
+    let idx = pos.unwrap_or_else(|| {
+        accs.push(StageAcc {
+            arm,
+            path,
+            stage,
+            samples: Vec::new(),
+            round_medians: Vec::new(),
+            counts: String::new(),
+        });
+        accs.len() - 1
+    });
+    match accs.get_mut(idx) {
+        Some(a) => a,
+        None => fail_closed("stage accumulator index out of range"),
+    }
+}
+
+/// arm ごとの段計測の事前計算（計測外）。
+struct ArmStagePlan {
+    label: &'static str,
+    sql: String,
+    values: Vec<&'static str>,
+    filters: Vec<MetadataFilter>,
+    expected_ids: Vec<u64>,
+    ranked: Vec<(u64, f64)>,
+}
+
+/// スロット列を行 id 列へ写す。範囲外は fail-closed。
+fn slot_ids(fx: &StageFixture<'_>, slots: impl Iterator<Item = u64>) -> Vec<u64> {
+    slots
+        .map(|s| {
+            usize::try_from(s)
+                .ok()
+                .and_then(|i| fx.ids.get(i).copied())
+                .unwrap_or_else(|| fail_closed("stage verify: slot out of range"))
+        })
+        .collect()
+}
+
+/// 述語グループの段別内訳を測って出力する。毎ラウンド、計測前に各段の出力を fixture 規則から
+/// 独立に導いた期待（一致 id 集合・Top-k）と照合し、違反は値を出さず非 0 終了する（fail-closed）。
+/// 出力は全検査・全計測の完了後にまとめて行う。
+fn measure_predicate_stages(
+    rounds: u32,
+    fx: &StageFixture<'_>,
+    own: u64,
+    sentinel: &[f32],
+    arms: &[(&'static str, String)],
+    core: &EngineCore,
+    tenant_ctx: &PolicyContext,
+) {
+    let config = MeasurementConfig::new(STAGE_WARMUP, STAGE_MEASURED, 1)
+        .unwrap_or_else(|e| fail_closed(format!("measurement config: {e}")));
+    let plans: Vec<ArmStagePlan> = arms
+        .iter()
+        .map(|(label, sql)| ArmStagePlan {
+            label,
+            sql: sql.clone(),
+            values: arm_lang_values(label).unwrap_or_else(|e| fail_closed(e)),
+            filters: plain_filters(label, fx.schema),
+            expected_ids: expected_match_ids(label, own).unwrap_or_else(|e| fail_closed(e)),
+            ranked: expected_predicate_ranked(label, own, 0, sentinel, fx.query),
+        })
+        .collect();
+    let mut accs: Vec<StageAcc> = Vec::new();
+    for round in 0..rounds as usize {
+        for idx in rotate_arms(round, plans.len()) {
+            let Some(plan) = plans.get(idx) else { continue };
+            let arm = plan.label;
+            // 検証（計測前）: 索引系列。
+            let slots = stage_idx_candidate_resolve(fx, &plan.values);
+            let mut cand_ids = slot_ids(fx, slots.iter().map(|s| u64::from(*s)));
+            cand_ids.sort_unstable();
+            if cand_ids != plan.expected_ids {
+                fail_closed(format!(
+                    "{arm}: index candidates diverged from expected ids"
+                ));
+            }
+            let hits = stage_idx_search_subset(fx, &slots);
+            let hit_ids = slot_ids(fx, hits.iter().map(|h| h.id));
+            if !topk_matches(&hit_ids, &plan.ranked, PRED_LIMIT) {
+                fail_closed(format!(
+                    "{arm}: search_subset result is not the expected top rows"
+                ));
+            }
+            // 検証（計測前）: PlainScan 反実仮想系列。
+            let matched = stage_plain_scalar_eval(fx, &plan.filters);
+            let copied = stage_plain_copy(fx, &plan.filters);
+            let mut copied_ids = copied.ids.clone();
+            copied_ids.sort_unstable();
+            if matched != plan.expected_ids.len() as u64 || copied_ids != plan.expected_ids {
+                fail_closed(format!(
+                    "{arm}: plain scan matches diverged from expected ids"
+                ));
+            }
+            let plain_hits = stage_plain_search(fx, &copied);
+            let plain_ids: Vec<u64> = plain_hits.iter().map(|h| h.id).collect();
+            if !topk_matches(&plain_ids, &plan.ranked, PRED_LIMIT) {
+                fail_closed(format!(
+                    "{arm}: plain search result is not the expected top rows"
+                ));
+            }
+            // 計測。戻り値の解放は計測区間の外へ出す（`run_bounded_retain` の retain 0）。
+            let cand =
+                run_bounded_retain(&config, 0, || stage_idx_candidate_resolve(fx, &plan.values))
+                    .map(|r| r.0);
+            let subset =
+                run_bounded_retain(&config, 0, || stage_idx_search_subset(fx, &slots)).map(|r| r.0);
+            // e2e は各反復の結果を全件保持（`STAGE_MEASURED` 件・Top-k 行のみで小さい）し、
+            // 計測区間の外で期待 Top-k と照合する（誤った結果を返す経路の時間を採らない）。
+            let e2e = run_bounded_retain(&config, STAGE_MEASURED as usize, || {
+                let mut session = SessionState::default();
+                match core.execute_sql_in_session(tenant_ctx, &mut session, &plan.sql) {
+                    Ok(SqlOutcome::Query(result)) => result,
+                    Ok(_) => fail_closed(format!("{arm}: execute: not a query result")),
+                    Err(e) => fail_closed(format!("{arm}: execute: {e}")),
+                }
+            })
+            .unwrap_or_else(|e| fail_closed(format!("{arm}: protocol violation: {e}")));
+            if e2e.1.len() != STAGE_MEASURED as usize {
+                fail_closed(format!("{arm}: e2e results were not retained"));
+            }
+            for result in &e2e.1 {
+                let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+                if !topk_matches(&ids, &plan.ranked, PRED_LIMIT) {
+                    fail_closed(format!("{arm}: e2e result is not the expected top rows"));
+                }
+            }
+            let e2e = Ok(e2e.0);
+            let eval =
+                run_bounded_retain(&config, 0, || stage_plain_scalar_eval(fx, &plan.filters))
+                    .map(|r| r.0);
+            let copy =
+                run_bounded_retain(&config, 0, || stage_plain_copy(fx, &plan.filters)).map(|r| r.0);
+            let search =
+                run_bounded_retain(&config, 0, || stage_plain_search(fx, &copied)).map(|r| r.0);
+            let k = PRED_LIMIT;
+            let rows_n = fx.metadata.len();
+            let series: [(StagePath, &'static str, _, String); 6] = [
+                (
+                    StagePath::Current,
+                    STAGE_IDX_CANDIDATE_RESOLVE,
+                    cand,
+                    format!("candidates={} values={}", slots.len(), plan.values.len()),
+                ),
+                (
+                    StagePath::Current,
+                    STAGE_IDX_SEARCH_SUBSET,
+                    subset,
+                    format!("scanned_rows={} k={k}", slots.len()),
+                ),
+                (StagePath::Current, STAGE_E2E, e2e, format!("k={k}")),
+                (
+                    StagePath::PlainScanRef,
+                    STAGE_PLAIN_SCALAR_EVAL,
+                    eval,
+                    format!("evaluated_rows={rows_n} matched={matched}"),
+                ),
+                (
+                    StagePath::PlainScanRef,
+                    STAGE_PLAIN_COPY,
+                    copy,
+                    format!("matched={matched} copied_bytes={}", copied.bytes()),
+                ),
+                (
+                    StagePath::PlainScanRef,
+                    STAGE_PLAIN_SEARCH,
+                    search,
+                    format!("rows={} k={k}", copied.ids.len()),
+                ),
+            ];
+            for (path, stage, result, counts) in series {
+                let m = result
+                    .unwrap_or_else(|e| fail_closed(format!("{arm}: protocol violation: {e}")));
+                let acc = stage_acc(&mut accs, arm, path, stage);
+                acc.samples.extend_from_slice(&m.samples);
+                // 段サマリと同じ nearest-rank 定義の中央値（`m.summary.median` は線形補間のため使わない）。
+                let round_median = quantile_nearest_rank(&m.samples, 0.5)
+                    .unwrap_or_else(|e| fail_closed(format!("{arm}: round median: {e}")));
+                acc.round_medians.push(round_median);
+                acc.counts = counts;
+            }
+        }
+    }
+    // 出力（全検査完了後）。
+    for acc in &accs {
+        for (i, median) in acc.round_medians.iter().enumerate() {
+            println!(
+                "{}",
+                render_stage_round_line(acc.arm, acc.path, acc.stage, i + 1, *median, &acc.counts)
+            );
+        }
+    }
+    let summaries: Vec<(&StageAcc, StageSummary)> = accs
+        .iter()
+        .map(|a| {
+            (
+                a,
+                summarize_stage(&a.samples).unwrap_or_else(|e| fail_closed(e)),
+            )
+        })
+        .collect();
+    for (acc, summary) in &summaries {
+        println!(
+            "{}",
+            render_stage_summary_line(acc.arm, acc.path, acc.stage, summary, &acc.counts)
+        );
+    }
+    let median_of = |arm: &str, path: StagePath, stage: &str| -> Option<Duration> {
+        summaries
+            .iter()
+            .find(|(a, _)| a.arm == arm && a.path == path && a.stage == stage)
+            .map(|(_, s)| s.median)
+    };
+    for plan in &plans {
+        let arm = plan.label;
+        let cur = StagePath::Current;
+        let plain = StagePath::PlainScanRef;
+        let residual = match (
+            median_of(arm, cur, STAGE_E2E),
+            median_of(arm, cur, STAGE_IDX_CANDIDATE_RESOLVE),
+            median_of(arm, cur, STAGE_IDX_SEARCH_SUBSET),
+        ) {
+            (Some(e), Some(a), Some(b)) => checked_residual(e, a, b),
+            _ => None,
+        };
+        println!(
+            "{}",
+            render_stage_diff_line(arm, cur, "residual_median", residual)
+        );
+        let c = match (
+            median_of(arm, plain, STAGE_PLAIN_COPY),
+            median_of(arm, plain, STAGE_PLAIN_SCALAR_EVAL),
+        ) {
+            (Some(fc), Some(f)) => checked_stage_diff(fc, f),
+            _ => None,
+        };
+        println!("{}", render_stage_diff_line(arm, plain, "c_median", c));
+    }
+}
+
 fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
     let (storage, _guard) = open_storage("docs");
     let schema = docs_schema();
@@ -524,9 +1034,34 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
         &make_other,
     );
 
-    let core = EngineCore::from_storage(storage, search_engine::default_engine());
     let ctx_a =
         PolicyContext::new(TENANT_A).unwrap_or_else(|e| fail_closed(format!("policy ctx: {e}")));
+    // 述語グループの段別計測（Issue #1319）用に、対象テナントの可視行スナップショットを
+    // `EngineCore::from_storage` が storage を消費する前に捕捉する（RLS を通る pub API 経由。
+    // 他テナントの Private sentinel 行が含まれないことを件数で検査し、違反は fail-closed）。
+    let mut stage_ids: Vec<u64> = Vec::new();
+    let mut stage_metadata: Vec<Vec<u8>> = Vec::new();
+    let stage_arena = if group.includes(Group::Predicate) {
+        let arena = VectorArena::build_filtered_with_rows(
+            &storage,
+            DOCS,
+            |t, v| ctx_a.is_visible(t, v),
+            |_slot, id, _embedding, metadata| {
+                stage_ids.push(id);
+                stage_metadata.push(metadata.to_vec());
+                Ok(true)
+            },
+        )
+        .unwrap_or_else(|e| fail_closed(format!("stage snapshot: {e}")));
+        if arena.len() as u64 != own || stage_ids.len() != arena.len() {
+            fail_closed("stage snapshot: visible row count does not match the own-tenant rows");
+        }
+        Some(arena)
+    } else {
+        None
+    };
+
+    let core = EngineCore::from_storage(storage, search_engine::default_engine());
     let ctx_b = ctx(TENANT_B);
     let literal =
         vector_literal(&query).unwrap_or_else(|e| fail_closed(format!("vector literal: {e}")));
@@ -567,6 +1102,11 @@ fn run_docs_groups(group: Group, rows: usize, rounds: u32) {
             &arms,
             true,
         );
+        // 既存の p95 行の後に別ループで段別内訳を測る（p95 行の意味・値を変えない）。
+        if let Some(arena) = stage_arena.as_ref() {
+            let fx = StageFixture::new(&schema, arena, stage_ids, stage_metadata, &query);
+            measure_predicate_stages(rounds, &fx, own, &sentinel_vector, &arms, &core, &ctx_a);
+        }
     }
     if group.includes(Group::OrderBy) {
         let arms = order_by_statements(DOCS).unwrap_or_else(|e| fail_closed(e));
