@@ -1028,14 +1028,17 @@ Date: <IMF-fixdate>
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
+| `VD001` | `PARTIAL_COMPLETION` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（SQL 表層の分割実行 DML `UPDATE`／`DELETE ... PARTITIONED` が 1 チャンク以上 commit した後に止まった。NoSQL 表層の分割実行 op は Issue #1130 の担当。後述） |
+| `VD002` | `PARTITIONED_DML_CANCELLED` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（SQL 表層の `CANCEL PARTITIONED DML` で取り消された分割実行 DML、または取り消し済みジョブへの再送。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過、`FOREIGN KEY` 参照アクション連鎖（`ON DELETE CASCADE` 等。宣言が SQL／NoSQL いずれでも。Issue #1148）の深さ・行数上限超過（副作用ゼロ） |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 16 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42704`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 18 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42704`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・
+`VD001`・`VD002`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -1056,6 +1059,11 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 外した）。`DuplicateObject`（`42710`。TABLE-22、Issue #1195）は
 `ALTER TABLE ... ADD CONSTRAINT`（CHECK・FOREIGN KEY）の制約名衝突で、NoSQL
 `alter_table` は `add_column`／`drop_column` のみのため到達しない。
+`PartialCompletion`（`VD001`）・`PartitionedDmlCancelled`（`VD002`。SQL-19・
+RECOVER-11、Issue #1129）は SQL 表層の分割実行 DML（`UPDATE`／`DELETE ...
+PARTITIONED`）と `CANCEL PARTITIONED DML` が送出する分類で、NoSQL 表層の `op`
+許可リストに分割実行の語彙が無い（Issue #1130 で追加予定）ため実要求からは到達しない。
+射影は部分完了・取り消しとも 409 とする。
 `DuplicateFunction`（`42723`。SQL-26、Issue #1186）は
 `CREATE FUNCTION`／WASM UDF 登録の名前衝突で、NoSQL `op` 許可リストに関数
 登録が無いため到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・

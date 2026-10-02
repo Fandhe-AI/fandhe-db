@@ -66,8 +66,8 @@ pub fn resolve_batch_limits(
 }
 
 /// 分割実行 DML のチャンク幅（1 チャンクの適用行数）を設定する CLI フラグ名
-/// （Issue #1128。ADR `docs/design/partitioned-dml.md` §15.2。フラグ名は仮称で、
-/// #1129 が確定する）。
+/// （Issue #1128 で導入、Issue #1129 でフラグ名を確定。ADR
+/// `docs/design/partitioned-dml.md` §15.2）。
 pub const PARTITIONED_CHUNK_ROWS_FLAG: &str = "--partitioned-dml-chunk-rows";
 
 /// 分割実行 DML のチャンクごとの走査予算（行数）を設定する CLI フラグ名。
@@ -76,19 +76,81 @@ pub const PARTITIONED_SCAN_BUDGET_FLAG: &str = "--partitioned-dml-scan-budget";
 /// 分割実行 DML の 1 チャンクの writer 保持時間上限（ミリ秒）を設定する CLI フラグ名。
 pub const PARTITIONED_MAX_HOLD_MS_FLAG: &str = "--partitioned-dml-max-hold-ms";
 
-/// 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間）を解決する
-/// （Issue #1128）。`base` は既定値（[`PartitionedDmlLimits::default`]）で、`Some`
-/// のフラグだけを上書きする。範囲は engine 側の単一情報源
-/// （`validate_partitioned_*`）に委ね、最後に [`PartitionedDmlLimits::validate`]
-/// （起動時検証の唯一の入口。#1129 が組合せ制約を足す）を通す。不正値は `Err`
-/// （fail-closed。既定へ黙って読み替えない）。
+/// テナント単位の同時実行数の上限を設定する CLI フラグ名（Issue #1129。既定 1・範囲
+/// `1..=64`・全体の上限以下）。
+pub const PARTITIONED_MAX_JOBS_PER_TENANT_FLAG: &str = "--partitioned-dml-max-jobs-per-tenant";
+
+/// プロセス全体の同時実行数の上限を設定する CLI フラグ名（Issue #1129。既定 4・範囲 `1..=64`）。
+pub const PARTITIONED_MAX_JOBS_FLAG: &str = "--partitioned-dml-max-jobs";
+
+/// `(tenant, table)` 単位の中断記録数の上限を設定する CLI フラグ名（Issue #1129。既定
+/// 1,000・範囲 `1..=1,000,000`）。
+pub const PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG: &str =
+    "--partitioned-dml-max-interrupted-records";
+
+/// 分割実行 DML の 6 つの CLI フラグの生の値（未指定は `None`）。`main.rs` が引数解析で
+/// 集め、[`resolve_partitioned_dml_limits`] へ渡す。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PartitionedDmlRawFlags<'a> {
+    pub chunk_rows: Option<&'a str>,
+    pub scan_budget: Option<&'a str>,
+    pub max_hold_ms: Option<&'a str>,
+    pub max_jobs_per_tenant: Option<&'a str>,
+    pub max_jobs: Option<&'a str>,
+    pub max_interrupted_records: Option<&'a str>,
+}
+
+/// 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・同時実行数・中断記録数）を
+/// 解決する（Issue #1128・#1129）。`base` は既定値（[`PartitionedDmlLimits::default`]）で、
+/// `Some` のフラグだけを上書きする。範囲は engine 側の単一情報源（`validate_partitioned_*`）
+/// に委ね、最後に [`PartitionedDmlLimits::validate`]（起動時検証の唯一の入口。テナント単位の
+/// 同時実行数が全体を超える組合せもここで拒否する）を通す。不正値は `Err`（fail-closed。
+/// 既定へ黙って読み替えない）。
 pub fn resolve_partitioned_dml_limits(
     base: PartitionedDmlLimits,
-    chunk_rows_raw: Option<&str>,
-    scan_budget_raw: Option<&str>,
-    max_hold_ms_raw: Option<&str>,
+    raw: PartitionedDmlRawFlags<'_>,
 ) -> Result<PartitionedDmlLimits, String> {
+    let PartitionedDmlRawFlags {
+        chunk_rows: chunk_rows_raw,
+        scan_budget: scan_budget_raw,
+        max_hold_ms: max_hold_ms_raw,
+        max_jobs_per_tenant: max_jobs_per_tenant_raw,
+        max_jobs: max_jobs_raw,
+        max_interrupted_records: max_interrupted_raw,
+    } = raw;
     let mut limits = base;
+    if let Some(raw) = max_jobs_per_tenant_raw {
+        let value = parse_strict_decimal(raw).ok_or_else(|| {
+            format!(
+                "{PARTITIONED_MAX_JOBS_PER_TENANT_FLAG} expects a non-negative integer, got {raw:?}"
+            )
+        })?;
+        limits.max_jobs_per_tenant = engine::sql::parser::validate_partitioned_max_jobs(
+            "partitioned max jobs per tenant",
+            value,
+        )
+        .map_err(|e| format!("{PARTITIONED_MAX_JOBS_PER_TENANT_FLAG}: {e}"))?;
+    }
+    if let Some(raw) = max_jobs_raw {
+        let value = parse_strict_decimal(raw).ok_or_else(|| {
+            format!("{PARTITIONED_MAX_JOBS_FLAG} expects a non-negative integer, got {raw:?}")
+        })?;
+        limits.max_jobs_total =
+            engine::sql::parser::validate_partitioned_max_jobs("partitioned max jobs", value)
+                .map_err(|e| format!("{PARTITIONED_MAX_JOBS_FLAG}: {e}"))?;
+    }
+    if let Some(raw) = max_interrupted_raw {
+        let value = parse_strict_decimal(raw)
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG} expects a non-negative integer, got {raw:?}"
+                )
+            })?;
+        limits.interrupted_record_limit =
+            engine::sql::parser::validate_partitioned_interrupted_record_limit(value)
+                .map_err(|e| format!("{PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG}: {e}"))?;
+    }
     if let Some(raw) = chunk_rows_raw {
         let value = parse_strict_decimal(raw).ok_or_else(|| {
             format!("{PARTITIONED_CHUNK_ROWS_FLAG} expects a non-negative integer, got {raw:?}")
@@ -219,8 +281,11 @@ mod tests {
 
     #[test]
     fn partitioned_limits_default_when_unset() {
-        let l = resolve_partitioned_dml_limits(PartitionedDmlLimits::default(), None, None, None)
-            .unwrap();
+        let l = resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            PartitionedDmlRawFlags::default(),
+        )
+        .unwrap();
         assert_eq!(l, PartitionedDmlLimits::default());
     }
 
@@ -228,43 +293,163 @@ mod tests {
     fn partitioned_limits_apply_each_flag() {
         let l = resolve_partitioned_dml_limits(
             PartitionedDmlLimits::default(),
-            Some("10"),
-            Some("20"),
-            Some("250"),
+            PartitionedDmlRawFlags {
+                chunk_rows: Some("10"),
+                scan_budget: Some("20"),
+                max_hold_ms: Some("250"),
+                max_jobs_per_tenant: Some("2"),
+                max_jobs: Some("8"),
+                max_interrupted_records: Some("77"),
+            },
         )
         .unwrap();
         assert_eq!(l.chunk_rows.get(), 10);
         assert_eq!(l.scan_budget_rows.get(), 20);
         assert_eq!(l.max_writer_hold, std::time::Duration::from_millis(250));
+        assert_eq!(l.max_jobs_per_tenant.get(), 2);
+        assert_eq!(l.max_jobs_total.get(), 8);
+        assert_eq!(l.interrupted_record_limit.get(), 77);
     }
 
     #[test]
     fn partitioned_limits_reject_out_of_range_and_malformed() {
         let base = PartitionedDmlLimits::default();
-        for (c, s, h, flag) in [
-            (Some("0"), None, None, PARTITIONED_CHUNK_ROWS_FLAG),
-            (Some("1000001"), None, None, PARTITIONED_CHUNK_ROWS_FLAG),
-            (None, Some("0"), None, PARTITIONED_SCAN_BUDGET_FLAG),
-            (None, Some("1000001"), None, PARTITIONED_SCAN_BUDGET_FLAG),
-            (None, None, Some("99"), PARTITIONED_MAX_HOLD_MS_FLAG),
-            (None, None, Some("5001"), PARTITIONED_MAX_HOLD_MS_FLAG),
-            (Some("+5"), None, None, PARTITIONED_CHUNK_ROWS_FLAG),
-            (None, Some(" 5"), None, PARTITIONED_SCAN_BUDGET_FLAG),
-            (None, None, Some("abc"), PARTITIONED_MAX_HOLD_MS_FLAG),
-            (None, None, Some(""), PARTITIONED_MAX_HOLD_MS_FLAG),
-        ] {
-            let err = resolve_partitioned_dml_limits(base, c, s, h).unwrap_err();
+        type Set = fn(&mut PartitionedDmlRawFlags<'static>, &'static str);
+        let cases: [(Set, &'static str, &'static str); 18] = [
+            (
+                |f, v| f.chunk_rows = Some(v),
+                "0",
+                PARTITIONED_CHUNK_ROWS_FLAG,
+            ),
+            (
+                |f, v| f.chunk_rows = Some(v),
+                "1000001",
+                PARTITIONED_CHUNK_ROWS_FLAG,
+            ),
+            (
+                |f, v| f.chunk_rows = Some(v),
+                "+5",
+                PARTITIONED_CHUNK_ROWS_FLAG,
+            ),
+            (
+                |f, v| f.scan_budget = Some(v),
+                "0",
+                PARTITIONED_SCAN_BUDGET_FLAG,
+            ),
+            (
+                |f, v| f.scan_budget = Some(v),
+                "1000001",
+                PARTITIONED_SCAN_BUDGET_FLAG,
+            ),
+            (
+                |f, v| f.scan_budget = Some(v),
+                " 5",
+                PARTITIONED_SCAN_BUDGET_FLAG,
+            ),
+            (
+                |f, v| f.max_hold_ms = Some(v),
+                "99",
+                PARTITIONED_MAX_HOLD_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_hold_ms = Some(v),
+                "5001",
+                PARTITIONED_MAX_HOLD_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_hold_ms = Some(v),
+                "abc",
+                PARTITIONED_MAX_HOLD_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_hold_ms = Some(v),
+                "",
+                PARTITIONED_MAX_HOLD_MS_FLAG,
+            ),
+            (
+                |f, v| f.max_jobs_per_tenant = Some(v),
+                "0",
+                PARTITIONED_MAX_JOBS_PER_TENANT_FLAG,
+            ),
+            (
+                |f, v| f.max_jobs_per_tenant = Some(v),
+                "65",
+                PARTITIONED_MAX_JOBS_PER_TENANT_FLAG,
+            ),
+            (
+                |f, v| f.max_jobs_per_tenant = Some(v),
+                "x",
+                PARTITIONED_MAX_JOBS_PER_TENANT_FLAG,
+            ),
+            (|f, v| f.max_jobs = Some(v), "0", PARTITIONED_MAX_JOBS_FLAG),
+            (|f, v| f.max_jobs = Some(v), "65", PARTITIONED_MAX_JOBS_FLAG),
+            (
+                |f, v| f.max_interrupted_records = Some(v),
+                "0",
+                PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG,
+            ),
+            (
+                |f, v| f.max_interrupted_records = Some(v),
+                "1000001",
+                PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG,
+            ),
+            (
+                |f, v| f.max_interrupted_records = Some(v),
+                "-1",
+                PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG,
+            ),
+        ];
+        for (set, value, flag) in cases {
+            let mut raw = PartitionedDmlRawFlags::default();
+            set(&mut raw, value);
+            let err = resolve_partitioned_dml_limits(base, raw).unwrap_err();
             assert!(err.contains(flag), "flag {flag}: unexpected error: {err}");
         }
+    }
+
+    #[test]
+    fn partitioned_limits_reject_tenant_limit_above_total() {
+        // 既定の全体上限（4）を超えるテナント単位の上限は組合せ違反で起動拒否。
+        let err = resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            PartitionedDmlRawFlags {
+                max_jobs_per_tenant: Some("5"),
+                ..PartitionedDmlRawFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("partitioned DML limits"), "{err}");
+        // 全体の上限を同時に引き上げれば受理される。
+        assert!(resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            PartitionedDmlRawFlags {
+                max_jobs_per_tenant: Some("5"),
+                max_jobs: Some("5"),
+                ..PartitionedDmlRawFlags::default()
+            },
+        )
+        .is_ok());
+        // 全体だけを 1 へ下げると既定のテナント単位（1）と一致して受理される。
+        assert!(resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            PartitionedDmlRawFlags {
+                max_jobs: Some("1"),
+                ..PartitionedDmlRawFlags::default()
+            },
+        )
+        .is_ok());
     }
 
     #[test]
     fn partitioned_limits_accept_boundaries() {
         let l = resolve_partitioned_dml_limits(
             PartitionedDmlLimits::default(),
-            Some("1"),
-            Some("1000000"),
-            Some("5000"),
+            PartitionedDmlRawFlags {
+                chunk_rows: Some("1"),
+                scan_budget: Some("1000000"),
+                max_hold_ms: Some("5000"),
+                ..PartitionedDmlRawFlags::default()
+            },
         )
         .unwrap();
         assert_eq!(l.chunk_rows.get(), 1);
@@ -272,9 +457,22 @@ mod tests {
         assert_eq!(l.max_writer_hold, std::time::Duration::from_millis(5000));
         assert!(resolve_partitioned_dml_limits(
             PartitionedDmlLimits::default(),
-            Some("1000000"),
-            None,
-            Some("100")
+            PartitionedDmlRawFlags {
+                chunk_rows: Some("1000000"),
+                max_hold_ms: Some("100"),
+                ..PartitionedDmlRawFlags::default()
+            },
+        )
+        .is_ok());
+        // 同時実行数の上限値の境界（テナント単位 ≤ 全体 ≤ 64）。
+        assert!(resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            PartitionedDmlRawFlags {
+                max_jobs_per_tenant: Some("64"),
+                max_jobs: Some("64"),
+                max_interrupted_records: Some("1000000"),
+                ..PartitionedDmlRawFlags::default()
+            },
         )
         .is_ok());
     }

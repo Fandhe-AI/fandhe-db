@@ -206,7 +206,9 @@ mod tests {
                 "class={class:?}"
             );
             // 通常応答は D フィールドを含まない。
-            assert!(!body.contains(&b'D'), "class={class:?}");
+            // フィールド種別（タグ）として `D` が無いことを確認する（SQLSTATE `VD001` のように
+            // 値の中に文字 `D` を含む分類があるため、バイト列の単純な検索はしない）。
+            assert!(find_field(body, b'D').is_none(), "class={class:?}");
             assert_eq!(body.last().copied(), Some(0), "field terminator");
         }
     }
@@ -223,7 +225,7 @@ mod tests {
     fn encode_never_includes_a_detail_field() {
         for class in ErrorClass::ALL {
             let msg = encode(class, "internal error").expect("encode");
-            assert!(!body_of(&msg).contains(&b'D'), "class={class:?}");
+            assert!(find_field(body_of(&msg), b'D').is_none(), "class={class:?}");
         }
     }
 

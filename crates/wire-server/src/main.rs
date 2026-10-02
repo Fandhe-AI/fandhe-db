@@ -144,13 +144,17 @@
 //! `EngineCore::with_batch_limits` と `insert_rows_cap_warning` の両方へ渡す。
 //!
 //! `--partitioned-dml-chunk-rows <N>`／`--partitioned-dml-scan-budget <N>`／
-//! `--partitioned-dml-max-hold-ms <MS>`（Issue #1128。ADR `docs/design/
-//! partitioned-dml.md` §15.2。フラグ名は仮称で #1129 が確定する）: 述語形
-//! `UPDATE`／`DELETE` の分割実行の 1 チャンクの適用行数（既定 1,000・範囲
-//! `1..=1,000,000`）・走査予算（既定 100,000・範囲 `1..=1,000,000`）・writer
-//! 保持時間の上限（既定 1,000 ms・範囲 `100..=5,000`）をプロセス全体に対して
-//! 起動時に設定する。環境変数は設けない。範囲外・非数値・値欠落・2 回目以降の
-//! 重複指定は fail-closed で起動エラー。解決は
+//! `--partitioned-dml-max-hold-ms <MS>`／`--partitioned-dml-max-jobs-per-tenant <N>`／
+//! `--partitioned-dml-max-jobs <N>`／`--partitioned-dml-max-interrupted-records <N>`
+//! （Issue #1128 で導入、Issue #1129 でフラグ名を確定。ADR `docs/design/
+//! partitioned-dml.md` §15.2）: 述語形 `UPDATE`／`DELETE ... PARTITIONED` の分割実行の
+//! 1 チャンクの適用行数（既定 1,000・範囲 `1..=1,000,000`）・走査予算（既定 100,000・
+//! 範囲 `1..=1,000,000`）・writer 保持時間の上限（既定 1,000 ms・範囲 `100..=5,000`）・
+//! テナント単位の同時実行数（既定 1・範囲 `1..=64`・全体の上限以下）・プロセス全体の
+//! 同時実行数（既定 4・範囲 `1..=64`）・`(tenant, table)` 単位の中断記録数の上限
+//! （既定 1,000・範囲 `1..=1,000,000`）をプロセス全体に対して起動時に設定する。
+//! 環境変数は設けない。範囲外・非数値・値欠落・2 回目以降の重複指定・組合せ違反
+//! （テナント単位 > 全体）は fail-closed で起動エラー。解決は
 //! `wire_server::dml_limits_opt::resolve_partitioned_dml_limits` に一本化し、
 //! `EngineCore::with_partitioned_dml_limits` へ 1 回だけ注入する。
 //!
@@ -304,6 +308,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
+    let mut partitioned_max_jobs_per_tenant_raw: Option<String> = None;
+    let mut partitioned_max_jobs_raw: Option<String> = None;
+    let mut partitioned_max_interrupted_raw: Option<String> = None;
     let mut ddl_allowed_users_raw: Option<String> = None;
     let mut auth_method_raw: Option<String> = None;
     let mut scram_mock_key_file_raw: Option<PathBuf> = None;
@@ -635,6 +642,66 @@ fn run_server(args: &[String]) -> ExitCode {
                 partitioned_max_hold_ms_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_PER_TENANT_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_PER_TENANT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1129: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_max_jobs_per_tenant_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_PER_TENANT_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_max_jobs_per_tenant_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1129: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_max_jobs_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_JOBS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_max_jobs_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::dml_limits_opt::PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1129: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if partitioned_max_interrupted_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::dml_limits_opt::PARTITIONED_MAX_INTERRUPTED_RECORDS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                partitioned_max_interrupted_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::ddl_permission_opt::FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -929,14 +996,20 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
-    // Issue #1128: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間）を
+    // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
+    // 同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
     // listen へ進まず起動エラー）。環境変数は設けない（ADR §15.2）。
     let partitioned_dml_limits = match wire_server::dml_limits_opt::resolve_partitioned_dml_limits(
         engine::sql::parser::PartitionedDmlLimits::default(),
-        partitioned_chunk_rows_raw.as_deref(),
-        partitioned_scan_budget_raw.as_deref(),
-        partitioned_max_hold_ms_raw.as_deref(),
+        wire_server::dml_limits_opt::PartitionedDmlRawFlags {
+            chunk_rows: partitioned_chunk_rows_raw.as_deref(),
+            scan_budget: partitioned_scan_budget_raw.as_deref(),
+            max_hold_ms: partitioned_max_hold_ms_raw.as_deref(),
+            max_jobs_per_tenant: partitioned_max_jobs_per_tenant_raw.as_deref(),
+            max_jobs: partitioned_max_jobs_raw.as_deref(),
+            max_interrupted_records: partitioned_max_interrupted_raw.as_deref(),
+        },
     ) {
         Ok(limits) => limits,
         Err(e) => {

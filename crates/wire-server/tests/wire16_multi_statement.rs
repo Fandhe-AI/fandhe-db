@@ -543,3 +543,114 @@ fn single_statement_behavior_is_unchanged() {
     expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 }
+/// 分割実行 DML（Issue #1129）: 複数文メッセージに `PARTITIONED` 付き DML や `CANCEL` が
+/// 含まれると、位置・先行文の内容によらず `25001` で全体を拒否し何も実行しない
+/// （黙って autocommit・原子実行へ切り替えない）。
+#[test]
+fn partitioned_dml_in_a_multi_statement_message_is_rejected_without_executing_anything() {
+    let (core, _guard) = new_core_three_tenant_docs();
+    let mut stream = spawn_with_alice(core);
+
+    for sql in [
+        "SELECT id FROM docs LIMIT 1; \
+         DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'pm-1' PARTITIONED",
+        "DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'pm-2' PARTITIONED; SELECT 1",
+        "SELECT id FROM docs LIMIT 1; CANCEL PARTITIONED DML 'pm-3' ON docs",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate_and_message(
+            &mut stream,
+            "25001",
+            "partitioned DML cannot run inside a transaction block",
+        );
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+    }
+
+    // 何も実行されていない（行は残り、ジョブ記録もない）。
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _columns = read_row_description(&mut stream);
+    for _ in 0..3 {
+        let _row = read_data_row(&mut stream);
+    }
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "SHOW PARTITIONED DML 'pm-1' ON docs");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["status", "rows"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    read_ready_for_query(&mut stream);
+}
+
+/// 単一文の `PARTITIONED` 付き `DELETE` は完了時に `DELETE <累計件数>` を返し、1 チャンク
+/// 以上 commit した後に止まると SQLSTATE `VD001` の `ErrorResponse` を返す（Issue #1129）。
+#[test]
+fn partitioned_dml_over_the_wire_reports_completion_and_vd001() {
+    let path = temp_db::unique_db_path("wire-pdml");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    {
+        let sys =
+            PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        let mut session = engine::sql::mode::SessionState::default();
+        session.allow_ddl();
+        core.execute_sql_in_session(
+            &sys,
+            &mut session,
+            "CREATE TABLE udocs (n BIGINT, u TEXT UNIQUE)",
+        )
+        .expect("create table");
+        let alice =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        core.execute_sql_in_session(
+            &alice,
+            &mut session,
+            "INSERT INTO udocs (id, n, u) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c') \
+             USING OPERATION_ID 'seed'",
+        )
+        .expect("seed");
+    }
+    let mut stream = spawn_with_alice(Arc::new(core));
+
+    // 2 チャンク目で UNIQUE 違反: 1 件 commit 済みなので VD001（件数・原因コード入り）。
+    send_simple_query(
+        &mut stream,
+        "UPDATE udocs SET u = 'dup' WHERE n > 0 USING OPERATION_ID 'wp-1' PARTITIONED CHUNK 1",
+    );
+    expect_error_response_with_sqlstate_and_message(&mut stream, "VD001", "committed 1 rows");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // 進捗照会は `interrupted`。
+    send_simple_query(&mut stream, "SHOW PARTITIONED DML 'wp-1' ON udocs");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["status", "rows"]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("interrupted"));
+    assert_eq!(row[1].as_deref(), Some("1"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // 取り消すと、再送は VD002。
+    send_simple_query(&mut stream, "CANCEL PARTITIONED DML 'wp-1' ON udocs");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("cancelled"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "UPDATE udocs SET u = 'dup' WHERE n > 0 USING OPERATION_ID 'wp-1' PARTITIONED CHUNK 1",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "VD002");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // 完了する分割実行は累計件数を CommandComplete で返す。
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM udocs WHERE n > 0 USING OPERATION_ID 'wp-2' PARTITIONED CHUNK 2",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DELETE 3");
+    read_ready_for_query(&mut stream);
+}

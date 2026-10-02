@@ -355,6 +355,14 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 抽出し、Issue #1179 で COMMIT 時の遅延 FK 検査対象を dirty テーブル（世代の変化
     // から検出）へ拡張したことでさらに移動（旧: 330）。書き込み内容・commit の意味は不変。
     ("sql/transaction.rs", 793),
+    // Issue #1129（分割実行 DML の取り消し）: 取り消し済み記録への縮小（`partitioned_job::
+    // cancel_in_txn`）はジョブ表（`PARTITIONED_JOB_TABLE`・索引表）だけを書き、
+    // `CATALOG_TABLE`／`user_rows/{table}` のいずれにも触れない（commit 済みチャンクの行は
+    // 戻さない）。`USING PLAN` の世代照合が見る対象は行・カタログの変更だけなのでバンプ不要。
+    // 実行器側（`tenant/partitioned_dml.rs::finalize_cancel`）と `CANCEL PARTITIONED DML`
+    // 文（`sql/partitioned.rs::execute_cancel`）の 2 箇所。
+    ("tenant/partitioned_dml.rs", 254),
+    ("sql/partitioned.rs", 333),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を

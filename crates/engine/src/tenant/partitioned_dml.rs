@@ -16,10 +16,11 @@
 //!
 //! # 呼び出し元・呼び出し先の文脈
 //!
-//! - 呼び出し元: #1129 の `sql::exec`（SQL 構文 `PARTITIONED`・`CHUNK n` の結線時）。
-//!   現状は未結線のため入口に `#[allow(dead_code)]` を付けている（結線時に外す）。
-//!   入口は autocommit 専用の `&Storage` を取り、[`super::WriteTarget`] は取らない
-//!   （明示トランザクション内での分割実行を型で不可能にする。#1129 が `25001` で拒否）。
+//! - 呼び出し元: `EngineCore`（`core.rs`）の述語形 `UPDATE`／`DELETE ... PARTITIONED`
+//!   実行 form（Issue #1129）。入口は autocommit 専用の `&Storage` を取り、
+//!   [`super::WriteTarget`] は取らない（明示トランザクション内での分割実行を型で不可能に
+//!   する。トランザクション内・複数文メッセージ内の指定は SQL 表層が `25001` で拒否）。
+//!   停止原因のエラーコード写像は `sql::partitioned::map_partitioned_failure`。
 //! - 呼び出し先: [`crate::storage::Storage::begin_partitioned_chunk_txn`]（通常の書き込みを
 //!   優先する writer gate 取得）、`recovery::partitioned_job`（登録簿・ジョブ記録）、
 //!   `recovery::ledger::lookup_in_write_txn`（台帳照合）。
@@ -58,18 +59,16 @@ pub(crate) enum PartitionedDmlOutcome {
 }
 
 /// 分割実行の停止。`committed_total` は commit 済みチャンクの累計件数（再開前の処理済み
-/// 件数を含む）。#1129 は `committed_total > 0` なら部分完了（`VD001`）へ写像する。
+/// 件数を含む）。SQL 表層は `committed_total > 0` なら部分完了（`VD001`）へ写像する。
 #[derive(Debug)]
-#[allow(dead_code)] // #1129 が停止原因を写像するまで読み手がない
 pub(crate) struct PartitionedDmlFailure<E> {
     pub cause: PartitionedStopCause<E>,
     pub committed_total: u64,
 }
 
 /// 分割実行の停止原因。公開 enum は増やさず `pub(crate)` で閉じる。コードへの写像は
-/// #1129 の担当（各 variant の想定コードを併記する）。
+/// `sql::partitioned::map_partitioned_failure`（各 variant の想定コードを併記する）。
 #[derive(Debug)]
-#[allow(dead_code)] // #1129 が停止原因を写像するまで読み手がない
 pub(crate) enum PartitionedStopCause<E> {
     /// 既存の書き込みエラー（`55P03` の gate 待機超過・`22023`・`23505`・制約違反・
     /// `XX000` 等。[`TenantWriteError`] の variant をそのまま再利用する）。
@@ -83,16 +82,19 @@ pub(crate) enum PartitionedStopCause<E> {
     InterruptedRecordLimitReached,
     /// 同じキーのジョブがこのプロセスで実行中（`55P03`）。
     AlreadyRunning,
-    /// 取り消し済みジョブへの再送（`VD002`）。
-    ResendCancelled,
-    /// チャンク境界で取り消し要求を検出した（`VD002`。取り消し済み記録の書き込みは #1129）。
+    /// 同時実行数の上限（テナント単位・全体）に達した（`55P03`。どちらの上限でも同じ）。
+    ConcurrencyLimitReached,
+    /// 取り消し済みジョブへの再送（`VD002`。`committed` は取り消し時点の件数）。
+    ResendCancelled { committed: u64 },
+    /// チャンク境界で取り消し要求を検出した（`VD002`。取り消し済み記録は
+    /// [`finalize_cancel`] が書いてから返す）。
     CancelRequested,
     /// 台帳を持たない構成（`LedgerWrite::Disabled`）での実行を拒否した（`0A000` を推奨）。
     LedgerRequired,
 }
 
-/// 述語形 `DELETE` の分割実行入口（#1129 が結線する）。
-#[allow(clippy::too_many_arguments, dead_code)] // #1129 の SQL 表層が結線するまで未使用
+/// 述語形 `DELETE` の分割実行入口（`core.rs` の分割実行 form から呼ばれる）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     storage: &Storage,
     table: &str,
@@ -121,9 +123,10 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     )
 }
 
-/// 述語形 `UPDATE` の分割実行入口（#1129 が結線する）。UPDATE は分割版のハッシュ
-/// （新しいドメイン）だけを使い、旧ハッシュ互換（`legacy_hashes`）は持たない。
-#[allow(clippy::too_many_arguments, dead_code)] // #1129 の SQL 表層が結線するまで未使用
+/// 述語形 `UPDATE` の分割実行入口（`core.rs` の分割実行 form から呼ばれる）。UPDATE は
+/// 分割版のハッシュ（新しいドメイン）だけを使い、旧ハッシュ互換（`legacy_hashes`）は
+/// 持たない。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     storage: &Storage,
     table: &str,
@@ -218,6 +221,45 @@ fn map_job_err<E>(e: PartitionedJobError) -> PartitionedStopCause<E> {
             PartitionedStopCause::InterruptedRecordLimitReached
         }
         PartitionedJobError::AlreadyRunning => PartitionedStopCause::AlreadyRunning,
+        PartitionedJobError::ConcurrencyLimitReached => {
+            PartitionedStopCause::ConcurrencyLimitReached
+        }
+    }
+}
+
+/// 取り消し検出時に、中断（`Running`）記録があれば `Cancelled` へ縮めて commit する。
+/// 実行中の write txn は呼び出し前に drop 済みであること。記録がなければ何も書かない
+/// （最初の変更チャンクより前の取り消しは記録を残さず、`operation_id` を再利用できる）。
+/// 判定はメモリ上の `has_record` ではなく永続記録で行う（再開ジョブがループ先頭で
+/// 取り消された場合、`has_record` はまだ false のため）。失敗は呼び出し元へ返し、
+/// 記録は中断のまま残る（再度の `CANCEL` で取り消せる）。
+fn finalize_cancel(storage: &Storage, key: &JobKey<'_>) -> Result<(), TenantWriteError> {
+    let has_running = {
+        let read_txn = storage
+            .db()
+            .begin_read()
+            .map_err(|e| TenantWriteError::from(StorageError::from(e)))?;
+        matches!(
+            partitioned_job::lookup_in_read_txn(&read_txn, key)
+                .map_err(|e| TenantWriteError::LedgerCorrupted(e.into_storage_error()))?,
+            Some(JobRecord::Running { .. })
+        )
+    };
+    if !has_running {
+        return Ok(());
+    }
+    let txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
+    partitioned_job::cancel_in_txn(&txn, key)
+        .map_err(|e| TenantWriteError::LedgerCorrupted(e.into_storage_error()))?;
+    crate::recovery::commit_boundary::commit(txn).map_err(TenantWriteError::from)
+}
+
+/// 取り消し検出時の共通終了処理。記録の書き込みに失敗した場合はその原因を返す
+/// （committed_total > 0 なら呼び出し側が部分完了として報告する）。
+fn cancel_stop<E>(storage: &Storage, key: &JobKey<'_>) -> PartitionedStopCause<E> {
+    match finalize_cancel(storage, key) {
+        Ok(()) => PartitionedStopCause::CancelRequested,
+        Err(e) => PartitionedStopCause::Write(e),
     }
 }
 
@@ -289,9 +331,14 @@ fn chunk_loop<E>(
     let tenant = ctx.tenant_id();
     let key = JobKey::for_context(ctx, table, op_id);
     // 登録は関数の終わりまで保持する（drop で外れる。二重実行の拒否と取り消し要求の受け口）。
+    // 同時実行数の判定と登録は 1 つのロックの中で原子的に行う（並行起動でも上限を超えない）。
     let guard = storage
         .partitioned_job_registry()
-        .try_register(&key)
+        .try_register_with_limits(
+            &key,
+            limits.max_jobs_per_tenant.get(),
+            limits.max_jobs_total.get(),
+        )
         .map_err(map_job_err)?;
     let clock = hooks.clock;
     let mut chunk_index: usize = 0;
@@ -322,7 +369,7 @@ fn chunk_loop<E>(
 
     loop {
         if guard.cancel_requested() {
-            return Err(PartitionedStopCause::CancelRequested);
+            return Err(cancel_stop(storage, &key));
         }
         // 通常の書き込みが待機している間は取得されない（ADR §8.2）。失敗は `55P03`。
         let write_txn = storage
@@ -347,7 +394,18 @@ fn chunk_loop<E>(
         let record = partitioned_job::lookup_in_write_txn(&write_txn, &key).map_err(map_job_err)?;
         if state.first_chunk {
             match partitioned_job::classify_resend(record.as_ref(), hash, false) {
-                ResendDecision::Fresh => {}
+                ResendDecision::Fresh => {
+                    // 新規ジョブの開始時に中断記録数の上限を判定する（commit 前なので副作用
+                    // なし）。`Resume` は新しい記録を作らないため対象外。作成 txn 内での再計数は
+                    // `record_chunk_progress_in_txn` が行う。
+                    let limit = limits.interrupted_record_limit.get();
+                    let count =
+                        partitioned_job::count_interrupted_in_txn(&write_txn, tenant, table, limit)
+                            .map_err(map_job_err)?;
+                    if count >= limit {
+                        return Err(PartitionedStopCause::InterruptedRecordLimitReached);
+                    }
+                }
                 ResendDecision::Resume { cursor, processed } => {
                     state.cursor = Some(cursor);
                     state.processed = processed;
@@ -357,7 +415,9 @@ fn chunk_loop<E>(
                 ResendDecision::ContentMismatch => {
                     return Err(w(TenantWriteError::OperationIdContentMismatch))
                 }
-                ResendDecision::Cancelled => return Err(PartitionedStopCause::ResendCancelled),
+                ResendDecision::Cancelled { committed } => {
+                    return Err(PartitionedStopCause::ResendCancelled { committed })
+                }
                 ResendDecision::AlreadyRunning => return Err(PartitionedStopCause::AlreadyRunning),
             }
             state.first_chunk = false;
@@ -515,7 +575,7 @@ fn chunk_loop<E>(
         // （write txn を drop）して記録を残さず止める。最終チャンクでも完了として返さない。
         if guard.cancel_requested() {
             drop(write_txn);
-            return Err(PartitionedStopCause::CancelRequested);
+            return Err(cancel_stop(storage, &key));
         }
 
         crate::recovery::commit_boundary::commit(write_txn)

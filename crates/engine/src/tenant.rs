@@ -4997,7 +4997,7 @@ pub(crate) fn last_operation(
         .map_err(TenantWriteError::LedgerCorrupted)
 }
 
-mod partitioned_dml;
+pub(crate) mod partitioned_dml;
 
 #[cfg(test)]
 mod tests {

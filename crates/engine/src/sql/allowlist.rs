@@ -511,6 +511,24 @@ pub enum SqlSurfaceError {
     /// 同一テーブルの既存制約名と衝突した（TABLE-22、Issue #1195）。
     /// ERR-6: `42710`。UNIQUE の名前衝突は `DuplicateTable`（`42P07`）のまま。
     DuplicateObject { name: String },
+    /// 分割実行 DML が 1 チャンク以上 commit した後に止まった（Issue #1129・
+    /// RECOVER-11。`VD001`）。`cause` は止めた原因の分類（コードのみを応答へ載せ、
+    /// 内側のメッセージは載せない）。`operation_id` はクライアント自身が指定した値。
+    PartialCompletion {
+        committed: u64,
+        cause: ErrorClass,
+        operation_id: String,
+    },
+    /// 分割実行 DML が取り消された（Issue #1129・RECOVER-11。`VD002`。`committed` は
+    /// commit 済みの累計件数）。
+    PartitionedDmlCancelled { committed: u64 },
+    /// 分割実行 DML を明示トランザクション・暗黙トランザクション（複数文メッセージ）の
+    /// 中で実行しようとした（Issue #1129。`25001`）。黙って原子実行へ切り替えず拒否する。
+    /// 再 `BEGIN` の [`Self::ActiveSqlTransaction`] とは固定文言で区別する。
+    PartitionedDmlInTransaction,
+    /// 同じ `operation_id` の分割実行ジョブが実行中、または同時実行数の上限（テナント
+    /// 単位・全体）に達した（Issue #1129。`55P03`）。上限の種別は文言に含めない。
+    PartitionedJobBusy { detail: String },
     /// `CREATE TABLE` の列リストに同名の列が複数回宣言された（TABLE-6、
     /// Issue #899）。ERR-6: `42701`。
     DuplicateColumn { name: String },
@@ -684,6 +702,27 @@ impl SqlSurfaceError {
     pub(crate) fn duplicate_object(name: impl Into<String>) -> Self {
         SqlSurfaceError::DuplicateObject {
             name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: 分割実行の部分完了（`VD001`）。`operation_id` は検証済みだが念のため
+    /// 切り詰める。Display の書式は固定（原因はコードのみ）。
+    pub(crate) fn partial_completion(
+        committed: u64,
+        cause: ErrorClass,
+        operation_id: &str,
+    ) -> Self {
+        SqlSurfaceError::PartialCompletion {
+            committed,
+            cause,
+            operation_id: truncate_for_error(operation_id),
+        }
+    }
+
+    /// `pub(crate)`: 分割実行ジョブの重複実行・同時実行数上限超過（`55P03`）。
+    pub(crate) fn partitioned_job_busy(detail: &'static str) -> Self {
+        SqlSurfaceError::PartitionedJobBusy {
+            detail: detail.to_string(),
         }
     }
 
@@ -876,6 +915,10 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
+            SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
+            SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
+            SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
+            SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege | SqlSurfaceError::ConflictTargetNotVisible => {
                 ErrorClass::ForbiddenTenantMismatch
@@ -987,6 +1030,32 @@ impl std::fmt::Display for SqlSurfaceError {
             // 制約名はクライアント自身が指定した識別子。テーブル名・テナントは含めない。
             SqlSurfaceError::DuplicateObject { name } => {
                 write!(f, "constraint already exists: {name}")
+            }
+            // 件数（自テナントで commit 済み）・原因コード・クライアント自身の operation_id
+            // だけを載せる。内側のメッセージ・テーブル名・他テナント情報は含めない。
+            SqlSurfaceError::PartialCompletion {
+                committed,
+                cause,
+                operation_id,
+            } => {
+                write!(
+                    f,
+                    "partial completion: committed {committed} rows before stopping (cause {}); resend the same statement with operation_id '{operation_id}' to resume",
+                    cause.wire_code()
+                )
+            }
+            SqlSurfaceError::PartitionedDmlCancelled { committed } => {
+                write!(
+                    f,
+                    "partitioned DML cancelled: committed {committed} rows before stopping"
+                )
+            }
+            // 再 BEGIN の `transaction already in progress` と区別できる固定文言。
+            SqlSurfaceError::PartitionedDmlInTransaction => {
+                write!(f, "partitioned DML cannot run inside a transaction block")
+            }
+            SqlSurfaceError::PartitionedJobBusy { detail } => {
+                write!(f, "{detail}")
             }
             SqlSurfaceError::DuplicateColumn { name } => {
                 write!(f, "duplicate column name: {name}")
@@ -2498,6 +2567,9 @@ pub struct ValidatedPredicateDelete {
     /// `RETURNING` 句（Issue #1182・SQL-21）。削除前の値を返す
     /// （`sql::exec::execute_predicate_delete_returning`）。
     pub(crate) returning: Option<Projection>,
+    /// `PARTITIONED [CHUNK n]` 修飾（Issue #1129・SQL-19）。`Some` なら分割実行
+    /// （非原子・チャンクごとに commit）。`RETURNING` とは併用できない（構文段で拒否）。
+    pub(crate) partitioned: Option<crate::sql::partitioned::PartitionedClause>,
 }
 
 impl ValidatedPredicateDelete {
@@ -2522,6 +2594,11 @@ impl ValidatedPredicateDelete {
     /// `RETURNING` 句の投影（Issue #1182）。省略時は `None`。
     pub fn returning(&self) -> Option<&Projection> {
         self.returning.as_ref()
+    }
+
+    /// `PARTITIONED [CHUNK n]` 修飾（Issue #1129）。省略時は `None`（原子実行）。
+    pub(crate) fn partitioned(&self) -> Option<&crate::sql::partitioned::PartitionedClause> {
+        self.partitioned.as_ref()
     }
 }
 
@@ -5711,12 +5788,21 @@ impl<'a> Parser<'a> {
         // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
         let returning = self.parse_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
+        // `PARTITIONED [CHUNK n]`（Issue #1129）は `USING OPERATION_ID` 句の直後。
+        let partitioned = self.parse_partitioned_clause()?;
+        if partitioned.is_some() {
+            reject_partitioned_combination(
+                matches!(where_clause, ParsedDeleteWhere::RowId { .. }),
+                returning.is_some(),
+            )?;
+        }
 
         Ok(ParsedDeleteShape {
             table_name,
             where_clause,
             operation_id,
             returning,
+            partitioned,
         })
     }
 
@@ -5789,6 +5875,14 @@ impl<'a> Parser<'a> {
         // 必須化の判定は `validate_update`／`validate_update_form` が
         // `LedgerMode::require` へ委譲する）。
         let operation_id = self.parse_operation_id_clause()?;
+        // `PARTITIONED [CHUNK n]`（Issue #1129）は `USING OPERATION_ID` 句の直後。
+        let partitioned = self.parse_partitioned_clause()?;
+        if partitioned.is_some() {
+            reject_partitioned_combination(
+                matches!(where_form, UpdateWhereForm::Id(_)),
+                returning.is_some(),
+            )?;
+        }
 
         Ok(ParsedUpdateShape {
             table_name,
@@ -5796,6 +5890,7 @@ impl<'a> Parser<'a> {
             where_form,
             operation_id,
             returning,
+            partitioned,
         })
     }
 
@@ -5873,6 +5968,61 @@ impl<'a> Parser<'a> {
             ));
         }
         Ok(Some(projection))
+    }
+
+    /// 文末専用句 `PARTITIONED [CHUNK <n>]`（Issue #1129・SQL-19）の構造パース。
+    /// [`Self::parse_operation_id_clause`] の**直後**にだけ置ける（`parse_delete`／
+    /// `parse_update` が呼ぶ。`INSERT`（UPSERT を含む）・`TRUNCATE` のパーサーは呼ばない
+    /// ため、それらに付けた `PARTITIONED` は `expect_end_of_statement` が余剰トークンとして
+    /// `42601` で拒否する）。`PARTITIONED`・`CHUNK` は文脈キーワード（[`Keyword`] を増やさず、
+    /// 既存の列名・テーブル名を壊さない）。`CHUNK` の値は数字だけの `Token::Number` に限り、
+    /// 0・`usize` に収まらない値は `22000`。サーバー設定のチャンク幅を超えないことの検査は
+    /// 設定を持つ `EngineCore` 側が行う（実行時にも再検査する多層防御）。
+    fn parse_partitioned_clause(
+        &mut self,
+    ) -> Result<Option<crate::sql::partitioned::PartitionedClause>, SqlSurfaceError> {
+        if !self.peek_contextual_keyword("PARTITIONED") {
+            return Ok(None);
+        }
+        self.advance();
+        if !self.peek_contextual_keyword("CHUNK") {
+            return Ok(Some(crate::sql::partitioned::PartitionedClause {
+                chunk_rows: None,
+            }));
+        }
+        self.advance();
+        let raw = self.expect_number()?;
+        let chunk = raw
+            .parse::<usize>()
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .ok_or_else(|| SqlSurfaceError::invalid_input("CHUNK must be a positive integer"))?;
+        Ok(Some(crate::sql::partitioned::PartitionedClause {
+            chunk_rows: Some(chunk),
+        }))
+    }
+
+    /// `SHOW PARTITIONED DML '<operation_id>' ON <table>`・
+    /// `CANCEL PARTITIONED DML '<operation_id>' ON <table>`（Issue #1129）の構造パース。
+    /// 先頭語（`SHOW`／`CANCEL`）は呼び出し元が判定済みで、ここで消費する。
+    /// テーブル名は構文（識別子規則）だけを検査し、カタログは引かない（存在オラクルに
+    /// しない。RLS-9）。
+    fn parse_partitioned_job_ref(
+        &mut self,
+    ) -> Result<crate::sql::partitioned::PartitionedJobRef, SqlSurfaceError> {
+        self.advance(); // SHOW / CANCEL
+        self.expect_contextual_keyword("PARTITIONED")?;
+        self.expect_contextual_keyword("DML")?;
+        let raw = self.expect_string_literal()?;
+        let operation_id = OperationId::parse(&raw)?;
+        self.expect_contextual_keyword("ON")?;
+        let table = self.expect_ident()?;
+        crate::catalog::validate_identifier(&table)
+            .map_err(|_| SqlSurfaceError::unsupported("invalid table identifier"))?;
+        Ok(crate::sql::partitioned::PartitionedJobRef {
+            table,
+            operation_id,
+        })
     }
 
     /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）の構造パースのみを
@@ -10393,6 +10543,7 @@ struct ParsedDeleteShape {
     where_clause: ParsedDeleteWhere,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
+    partitioned: Option<crate::sql::partitioned::PartitionedClause>,
 }
 
 /// [`Parser::parse_delete`] ＋ 文末検証を共有する private ヘルパー（Issue #870）。
@@ -10521,8 +10672,48 @@ pub(crate) fn validate_delete_statement_tokens(
                 where_predicates,
                 operation_id: shape.operation_id,
                 returning: shape.returning,
+                partitioned: shape.partitioned,
             })
         }
+    })
+}
+
+/// `PARTITIONED` 修飾と併用できない形（単一行・`id` 指定形・`RETURNING`）を `42601` で
+/// 拒否する（Issue #1129）。固定文言で、入力断片を含めない。
+fn reject_partitioned_combination(
+    single_row_form: bool,
+    has_returning: bool,
+) -> Result<(), SqlSurfaceError> {
+    if single_row_form {
+        return Err(SqlSurfaceError::unsupported(
+            "PARTITIONED requires a predicate-form WHERE (single-row id form is not allowed)",
+        ));
+    }
+    if has_returning {
+        return Err(SqlSurfaceError::unsupported(
+            "PARTITIONED cannot be combined with RETURNING",
+        ));
+    }
+    Ok(())
+}
+
+/// `SHOW PARTITIONED DML ...`・`CANCEL PARTITIONED DML ...` を検証する（Issue #1129。
+/// `core.rs::EngineCore::parse_tokens` が先頭語 `SHOW`／`CANCEL` で呼ぶ）。カタログ照会は
+/// 行わない（テーブルの存在・可視性を応答に表さない。RLS-9）。
+pub(crate) fn validate_partitioned_control_tokens(
+    tokens: &[lexer::Token],
+) -> Result<crate::sql::partitioned::PartitionedControl, SqlSurfaceError> {
+    let is_show = matches!(
+        tokens.first(),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("SHOW")
+    );
+    let mut p = Parser::new(tokens);
+    let job = p.parse_partitioned_job_ref()?;
+    p.expect_end_of_statement()?;
+    Ok(if is_show {
+        crate::sql::partitioned::PartitionedControl::Show(job)
+    } else {
+        crate::sql::partitioned::PartitionedControl::Cancel(job)
     })
 }
 
@@ -11135,6 +11326,7 @@ struct ParsedUpdateShape {
     where_form: UpdateWhereForm,
     operation_id: Option<OperationId>,
     returning: Option<Projection>,
+    partitioned: Option<crate::sql::partitioned::PartitionedClause>,
 }
 
 /// 許可形状の構造判定を通過した述語つき `UPDATE` 文（SQL-19、TASK-192）。
@@ -11178,6 +11370,9 @@ pub struct ValidatedPredicateUpdate {
     /// `RETURNING` 句（Issue #1182・SQL-21）。実行結線済み（セッション経路の
     /// `sql::exec::execute_predicate_update_returning`）。
     pub(crate) returning: Option<Projection>,
+    /// `PARTITIONED [CHUNK n]` 修飾（Issue #1129・SQL-19）。[`ValidatedPredicateDelete`]
+    /// の同名フィールドと同じ契約。
+    pub(crate) partitioned: Option<crate::sql::partitioned::PartitionedClause>,
 }
 
 impl ValidatedPredicateUpdate {
@@ -11204,6 +11399,11 @@ impl ValidatedPredicateUpdate {
     /// `RETURNING` 句の投影（Issue #1182）。省略時は `None`。
     pub fn returning(&self) -> Option<&Projection> {
         self.returning.as_ref()
+    }
+
+    /// `PARTITIONED [CHUNK n]` 修飾（Issue #1129）。省略時は `None`（原子実行）。
+    pub(crate) fn partitioned(&self) -> Option<&crate::sql::partitioned::PartitionedClause> {
+        self.partitioned.as_ref()
     }
 }
 
@@ -11354,6 +11554,7 @@ pub(crate) fn validate_update_form_tokens(
                 where_predicates,
                 operation_id: shape.operation_id,
                 returning: shape.returning,
+                partitioned: shape.partitioned,
             })
         }
     })

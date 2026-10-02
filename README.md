@@ -75,6 +75,10 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--durability immediate|none] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
+  [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
+  [--partitioned-dml-max-hold-ms <100-5000>] \
+  [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
+  [--partitioned-dml-max-interrupted-records <1-1000000>] \
   [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>] \
@@ -262,6 +266,33 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 `VECTOR_DB_BATCH_MAX_CHUNKS`〕の小さい方）を超える場合、起動ログへ `WARNING`
 行が 1 行出ます（`--max-insert-rows` 未指定〔既定〕では出ません。詳細:
 `docs/design/predicate-dml-exec.md` §6）。
+
+分割実行 DML（Issue #1129。設計: `docs/design/partitioned-dml.md`）は、述語形
+`UPDATE`／`DELETE` の末尾に `USING OPERATION_ID '<id>' PARTITIONED [CHUNK <n>]` を付けると、
+対象をキー順のチャンクに区切って**チャンクごとに commit** する非原子の実行です。要点は次のとおりです。
+
+- 途中状態は他のセッションから見えます（全体を 1 回で commit する原子実行ではありません）。
+  実行開始後にカーソルより前へ入った行は対象外です。
+- 完了すると `UPDATE n`／`DELETE n`（再開をまたいだ累計）を返します。1 チャンク以上 commit した後に
+  止まると SQLSTATE `VD001`（`PARTIAL_COMPLETION`）、取り消された場合は `VD002`
+  （`PARTITIONED_DML_CANCELLED`）を返し、HTTP では 409 に射影します。1 件も commit していない
+  失敗は原因のコードのまま返ります。
+- **同じ文を同じ `operation_id` で再送すると、保存したカーソルから再開します**（内容が違えば
+  `22023`、完了済みなら `23505`、実行中なら `55P03`）。
+- 明示トランザクション・複数文メッセージの中では `25001` で拒否します（黙って原子実行へ
+  切り替えません）。単一行形・`RETURNING`・`INSERT`・`TRUNCATE` との併用は `42601` です。
+- `CHUNK <n>` はサーバー設定のチャンク幅より小さい方向にだけ変えられます（超過は `22000`）。
+- 進捗照会は `SHOW PARTITIONED DML '<id>' ON <table>`、取り消しは
+  `CANCEL PARTITIONED DML '<id>' ON <table>`（次のチャンク境界で止め、commit 済みのチャンクは戻りません）、
+  実行せずに内容を見るには `EXPLAIN UPDATE|DELETE ... PARTITIONED` を使います。
+  照会・取り消しは自テナントのジョブだけを対象にし、該当なし・他テナント・存在しないテーブルは
+  同じ応答（`status`・`rows` の 2 列で 0 行）になります。
+
+`--partitioned-dml-chunk-rows`（既定 1,000）・`--partitioned-dml-scan-budget`（既定 100,000）・
+`--partitioned-dml-max-hold-ms`（既定 1,000）・`--partitioned-dml-max-jobs-per-tenant`（既定 1）・
+`--partitioned-dml-max-jobs`（既定 4）・`--partitioned-dml-max-interrupted-records`（既定 1,000）は、
+分割実行の資源上限をプロセス全体に対して起動時に設定します（環境変数なし。範囲外・非数値・値欠落・
+重複指定・組合せ違反〔テナント単位 > 全体〕は起動エラー）。
 
 `--batch-max-files <N>`（Issue #1166）は `batch_limits.max_files_per_batch`
 （SQL 複数行 `VALUES`・NoSQL `insert` の `rows[]`・ファイル形バッチ・

@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505"];
 
 define_error_classes! {
-    count = 42;
+    count = 44;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -301,6 +301,17 @@ define_error_classes! {
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateObject`] の写像。
     /// UNIQUE の名前衝突は索引名衝突と同じ `42P07`（`DuplicateTable`）のまま。
     DuplicateObject => ("42710", "DUPLICATE_OBJECT"),
+    /// 分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`。Issue #1129・SQL-19・
+    /// RECOVER-11・ERR-1）が 1 チャンク以上 commit した後に止まった（`VD001`）。
+    /// commit 済みのチャンクは戻らない。応答に件数・原因コード・`operation_id` を含め、
+    /// 同じ文の再送でカーソルから再開できる。ベンダー拡張コード（PostgreSQL 標準
+    /// SQLSTATE と衝突しない `VD` クラス）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::PartialCompletion`] の写像。
+    PartialCompletion => ("VD001", "PARTIAL_COMPLETION"),
+    /// 分割実行 DML が取り消された（`VD002`。`CANCEL PARTITIONED DML` による取り消しで
+    /// 止まった文と、取り消し済みジョブへの再送）。commit 済みのチャンクは戻らない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::PartitionedDmlCancelled`] の写像。
+    PartitionedDmlCancelled => ("VD002", "PARTITIONED_DML_CANCELLED"),
 }
 
 impl ErrorClass {

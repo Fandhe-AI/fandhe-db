@@ -105,6 +105,7 @@ fn limits(chunk: usize, budget: usize, hold_ms: u64) -> PartitionedDmlLimits {
         scan_budget_rows: NonZeroUsize::new(budget).expect("non-zero"),
         max_writer_hold: Duration::from_millis(hold_ms),
         interrupted_record_limit: std::num::NonZeroU64::new(1_000).expect("non-zero"),
+        ..PartitionedDmlLimits::default()
     }
 }
 
@@ -465,8 +466,8 @@ fn hold_limit_cuts_apply_stage_and_cursor_is_last_applied_id() {
 }
 
 #[test]
-fn cancel_at_chunk_boundary_then_resume_skips_rows_before_cursor() {
-    let (storage, _g) = setup("pdml-cancel-resume");
+fn cancel_at_chunk_boundary_writes_cancelled_record_and_resend_is_rejected() {
+    let (storage, _g) = setup("pdml-cancel-boundary");
     let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
     seed(&storage, "t-a", &rows);
     let o = op("op-resume");
@@ -491,6 +492,58 @@ fn cancel_at_chunk_boundary_then_resume_skips_rows_before_cursor() {
     )
     .expect_err("cancelled at boundary");
     assert!(matches!(err.cause, PartitionedStopCause::CancelRequested));
+    assert_eq!(err.committed_total, 3);
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+
+    // 取り消し済み記録が書かれ（件数入り）、再送は `ResendCancelled` で拒否される。
+    let key = JobKey::for_context(&c, TABLE, &o);
+    let read_txn = storage.db().begin_read().expect("read");
+    assert!(matches!(
+        partitioned_job::lookup_in_read_txn(&read_txn, &key).expect("lookup"),
+        Some(JobRecord::Cancelled { committed: 3, .. })
+    ));
+    drop(read_txn);
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("resend of cancelled");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::ResendCancelled { committed: 3 }
+    ));
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+}
+
+#[test]
+fn interrupted_job_resumes_from_cursor_and_skips_rows_before_it() {
+    let (storage, _g) = setup("pdml-interrupt-resume");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-resume");
+    let h = hash(b"hr");
+    // 累計上限で 2 チャンク目に止める（1 チャンク目の 3 件は commit 済み）。
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        NonZeroUsize::new(5),
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("limit exceeded");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::AffectedRowsLimitExceeded { .. }
+    ));
     assert_eq!(err.committed_total, 3);
     assert_eq!(rows_of(&storage, "t-a").len(), 6);
 
@@ -590,14 +643,6 @@ fn resend_of_cancelled_job_is_rejected() {
         &mut real_hooks(Some(&mut hook)),
     )
     .expect_err("cancelled");
-    let txn = storage.begin_write_txn().expect("begin");
-    let key = JobKey::for_context(&c, TABLE, &o);
-    assert_eq!(
-        partitioned_job::cancel_in_txn(&txn, &key).expect("cancel"),
-        Some(2)
-    );
-    crate::catalog::bump_table_generation_in_txn(&txn, TABLE).expect("bump");
-    crate::recovery::commit_boundary::commit(txn).expect("commit");
     let err = run_delete(
         &storage,
         "t-a",
@@ -609,7 +654,10 @@ fn resend_of_cancelled_job_is_rejected() {
         &mut real_hooks(None),
     )
     .expect_err("cancelled resend");
-    assert!(matches!(err.cause, PartitionedStopCause::ResendCancelled));
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::ResendCancelled { committed: 2 }
+    ));
 }
 
 /// 通常の DML が同じ `operation_id` を確定した状況を、別ハッシュの台帳エントリで再現する。
@@ -811,25 +859,17 @@ fn early_failure_on_resumed_first_chunk_still_reports_committed_total() {
     seed(&storage, "t-a", &rows);
     let o = op("op-resume-early");
     let h = hash(b"h-re");
-    let c = ctx("t-a");
-    let registry = std::sync::Arc::clone(storage.partitioned_job_registry());
-    let mut hook = |n: usize| {
-        if n == 1 {
-            let key = JobKey::for_context(&c, TABLE, &o);
-            assert!(registry.request_cancel(&key));
-        }
-    };
     let err = run_delete(
         &storage,
         "t-a",
         &o,
         &h,
         &limits(3, 1000, 1000),
-        None,
+        NonZeroUsize::new(5),
         match_x as Pred,
-        &mut real_hooks(Some(&mut hook)),
+        &mut real_hooks(None),
     )
-    .expect_err("cancelled at boundary");
+    .expect_err("interrupted by total limit");
     assert_eq!(err.committed_total, 3);
 
     // 再送の最初のチャンクがスキーマ検査で止まっても、commit 済みの 3 件を報告する。
@@ -1048,4 +1088,168 @@ fn cancel_during_scan_of_only_chunk_discards_chunk_and_leaves_no_record() {
     assert!(partitioned_job::lookup_in_read_txn(&read_txn, &key)
         .expect("lookup")
         .is_none());
+}
+
+/// 同時実行数の上限（テナント単位）は、同じ文言で拒否され副作用がない。
+#[test]
+fn concurrency_limit_per_tenant_rejects_without_side_effects() {
+    let (storage, _g) = setup("pdml-conc-tenant");
+    seed(&storage, "t-a", &[(1, "x")]);
+    let other = op("op-other");
+    let c = ctx("t-a");
+    let _guard = storage
+        .partitioned_job_registry()
+        .try_register(&JobKey::for_context(&c, TABLE, &other))
+        .expect("register");
+    let gen_before = generation(&storage);
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &op("op-new"),
+        &hash(b"h-new"),
+        &limits(5, 100, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("tenant limit");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::ConcurrencyLimitReached
+    ));
+    assert_eq!(err.committed_total, 0);
+    assert_eq!(rows_of(&storage, "t-a").len(), 1);
+    assert_eq!(generation(&storage), gen_before);
+}
+
+/// 全体の上限も同じ停止原因になる（別テナントのジョブで枠が埋まっている場合）。
+#[test]
+fn concurrency_limit_total_rejects_with_same_cause() {
+    let (storage, _g) = setup("pdml-conc-total");
+    seed(&storage, "t-a", &[(1, "x")]);
+    let other = op("op-other");
+    let cb = ctx("t-b");
+    let _guard = storage
+        .partitioned_job_registry()
+        .try_register(&JobKey::for_context(&cb, TABLE, &other))
+        .expect("register");
+    let mut lim = limits(5, 100, 1000);
+    lim.max_jobs_total = NonZeroUsize::MIN;
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &op("op-new"),
+        &hash(b"h-new"),
+        &lim,
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("total limit");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::ConcurrencyLimitReached
+    ));
+}
+
+/// 新規ジョブの開始時に中断記録数の上限へ達していれば、副作用なしで `54000` 相当で止まる。
+/// 既存の中断ジョブの再送（`Resume`）は上限の対象外。
+#[test]
+fn interrupted_record_limit_blocks_fresh_job_but_not_resume() {
+    let (storage, _g) = setup("pdml-interrupted-limit");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let mut lim = limits(3, 1000, 1000);
+    lim.interrupted_record_limit = std::num::NonZeroU64::MIN;
+    // 中断ジョブを 1 件作る（2 チャンク目で累計上限に達して止まる）。
+    let o1 = op("op-int-1");
+    let h1 = hash(b"h-int-1");
+    run_delete(
+        &storage,
+        "t-a",
+        &o1,
+        &h1,
+        &lim,
+        NonZeroUsize::new(5),
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("interrupted");
+    let gen_before = generation(&storage);
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &op("op-int-2"),
+        &hash(b"h-int-2"),
+        &lim,
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("limit reached");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::InterruptedRecordLimitReached
+    ));
+    assert_eq!(err.committed_total, 0);
+    assert_eq!(generation(&storage), gen_before);
+    // 既存ジョブの再送は上限の対象外で、再開して完了する。
+    let outcome = run_delete(
+        &storage,
+        "t-a",
+        &o1,
+        &h1,
+        &lim,
+        None,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect("resume");
+    assert_eq!(outcome, PartitionedDmlOutcome::Completed { total_rows: 9 });
+}
+
+/// 再開ジョブがループ先頭で取り消されても、永続記録に基づき取り消し済み記録が書かれる。
+#[test]
+fn cancel_before_first_chunk_of_resumed_job_writes_cancelled_record() {
+    let (storage, _g) = setup("pdml-cancel-resumed");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-cr");
+    let h = hash(b"h-cr");
+    run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        NonZeroUsize::new(5),
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("interrupted");
+    // 取り消し要求は登録後にしか立てられないため、述語内（1 行目の評価時）で要求する。
+    let c = ctx("t-a");
+    let registry = std::sync::Arc::clone(storage.partitioned_job_registry());
+    let pred = |_: &DmlCandidate<'_>| -> Result<bool, Infallible> {
+        registry.request_cancel(&JobKey::for_context(&c, TABLE, &o));
+        Ok(true)
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        None,
+        pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("cancelled");
+    assert!(matches!(err.cause, PartitionedStopCause::CancelRequested));
+    let key = JobKey::for_context(&c, TABLE, &o);
+    let read_txn = storage.db().begin_read().expect("read");
+    assert!(matches!(
+        partitioned_job::lookup_in_read_txn(&read_txn, &key).expect("lookup"),
+        Some(JobRecord::Cancelled { committed: 3, .. })
+    ));
 }

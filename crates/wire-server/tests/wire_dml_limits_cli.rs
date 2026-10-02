@@ -167,7 +167,7 @@ fn wait_for_listening_lines(child: &mut Child) -> Vec<String> {
 /// R1: 範囲内の値はいずれのフラグも起動を妨げない。
 #[test]
 fn in_range_values_start_listening() {
-    let cases: [&[&str]; 5] = [
+    let cases: [&[&str]; 7] = [
         &["--max-dml-affected-rows", "5"],
         &["--max-insert-rows", "5"],
         // Issue #1128: 分割実行 DML の 3 フラグ（範囲の両端を含む）。
@@ -180,6 +180,23 @@ fn in_range_values_start_listening() {
             "100",
         ],
         &["--partitioned-dml-max-hold-ms", "5000"],
+        // Issue #1129: 同時実行数・中断記録数の 3 フラグ（範囲の両端と、テナント単位 = 全体）。
+        &[
+            "--partitioned-dml-max-jobs-per-tenant",
+            "64",
+            "--partitioned-dml-max-jobs",
+            "64",
+            "--partitioned-dml-max-interrupted-records",
+            "1000000",
+        ],
+        &[
+            "--partitioned-dml-max-jobs-per-tenant",
+            "1",
+            "--partitioned-dml-max-jobs",
+            "1",
+            "--partitioned-dml-max-interrupted-records",
+            "1",
+        ],
         &[
             "--max-dml-affected-rows",
             "1000000",
@@ -343,6 +360,90 @@ fn invalid_missing_duplicate_or_out_of_range_values_are_rejected() {
         (
             "--partitioned-dml-max-hold-ms",
             vec!["--partitioned-dml-max-hold-ms", "abc"],
+        ),
+        // Issue #1129: 同時実行数・中断記録数の 3 フラグ（値欠落・重複・範囲外・非数値）。
+        (
+            "--partitioned-dml-max-jobs-per-tenant",
+            vec!["--partitioned-dml-max-jobs-per-tenant"],
+        ),
+        (
+            "--partitioned-dml-max-jobs",
+            vec!["--partitioned-dml-max-jobs"],
+        ),
+        (
+            "--partitioned-dml-max-interrupted-records",
+            vec!["--partitioned-dml-max-interrupted-records"],
+        ),
+        (
+            "--partitioned-dml-max-jobs-per-tenant",
+            vec![
+                "--partitioned-dml-max-jobs-per-tenant",
+                "1",
+                "--partitioned-dml-max-jobs-per-tenant",
+                "2",
+            ],
+        ),
+        (
+            "--partitioned-dml-max-jobs",
+            vec![
+                "--partitioned-dml-max-jobs",
+                "2",
+                "--partitioned-dml-max-jobs",
+                "3",
+            ],
+        ),
+        (
+            "--partitioned-dml-max-interrupted-records",
+            vec![
+                "--partitioned-dml-max-interrupted-records",
+                "2",
+                "--partitioned-dml-max-interrupted-records",
+                "3",
+            ],
+        ),
+        (
+            "--partitioned-dml-max-jobs-per-tenant",
+            vec!["--partitioned-dml-max-jobs-per-tenant", "0"],
+        ),
+        (
+            "--partitioned-dml-max-jobs-per-tenant",
+            vec!["--partitioned-dml-max-jobs-per-tenant", "65"],
+        ),
+        (
+            "--partitioned-dml-max-jobs",
+            vec!["--partitioned-dml-max-jobs", "0"],
+        ),
+        (
+            "--partitioned-dml-max-jobs",
+            vec!["--partitioned-dml-max-jobs", "65"],
+        ),
+        (
+            "--partitioned-dml-max-interrupted-records",
+            vec!["--partitioned-dml-max-interrupted-records", "0"],
+        ),
+        (
+            "--partitioned-dml-max-interrupted-records",
+            vec!["--partitioned-dml-max-interrupted-records", "1000001"],
+        ),
+        (
+            "--partitioned-dml-max-jobs",
+            vec!["--partitioned-dml-max-jobs", "+2"],
+        ),
+        // 組合せ制約: テナント単位（5）が既定の全体上限（4）を超える構成は起動拒否。
+        (
+            "partitioned DML",
+            vec!["--partitioned-dml-max-jobs-per-tenant", "5"],
+        ),
+        // 全体だけを 1 へ下げても、既定のテナント単位（1）と一致するので受理される。
+        // （ここでは拒否ケースのみ列挙）テナント単位 3 > 全体 2 は起動拒否。
+        (
+            "partitioned DML",
+            vec![
+                "--partitioned-dml-max-jobs-per-tenant",
+                "3",
+                "--partitioned-dml-max-jobs",
+                "2",
+            ],
         ),
     ];
 
@@ -588,5 +689,16 @@ fn insert_rows_warning_reports_chunks_cap_when_effective() {
             && l.contains("VECTOR_DB_BATCH_MAX_CHUNKS")
             && l.contains("4096")),
         "expected chunks-side WARNING, got: {lines:?}"
+    );
+}
+
+/// 分割実行 DML の同時実行数の上限値（engine 側 `MAX_PARTITIONED_JOBS`）は、最大接続数
+/// （`limits::MAX_CONNECTIONS`）と同じ値に揃える（Issue #1129。engine から wire-server へ
+/// 依存させないため、一致をここで固定する）。
+#[test]
+fn partitioned_max_jobs_ceiling_matches_max_connections() {
+    assert_eq!(
+        engine::sql::parser::MAX_PARTITIONED_JOBS,
+        wire_server::limits::MAX_CONNECTIONS
     );
 }
