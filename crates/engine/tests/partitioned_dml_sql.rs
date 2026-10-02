@@ -739,3 +739,91 @@ fn seed_without_ledger(core: &EngineCore) {
         "INSERT INTO docs (id, n, u) VALUES (1, 1, 'a')",
     );
 }
+
+// --- 再起動後の「中断」扱い（Issue #1131。RECOVER-11・RECOVER-12） ---------------------
+
+/// 開き直し（プロセス再起動の模擬。登録簿は空になる）。
+fn reopen(path: &std::path::Path) -> EngineCore {
+    EngineCore::from_storage(
+        Storage::open(path).expect("reopen storage"),
+        Box::new(CpuScalarProvider),
+    )
+}
+
+/// 再起動すると `Running` 記録は SQL 層でも `interrupted` として見え、再送で累計件数のまま
+/// 完了し、完了後に開き直しても `completed` が保たれる。
+#[test]
+fn interrupted_job_is_reported_interrupted_after_reopen_and_resumes() {
+    let path = unique_db_path("pdml-sql-reopen");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = reopen(&path);
+        ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+        seed(&core, "alice", &[(1, 10, "a"), (2, 20, "b")]);
+        assert_eq!(
+            make_interrupted(&core, "alice", "op-re").wire_code(),
+            "VD001"
+        );
+        assert_eq!(
+            show(&core, "alice", "docs", "op-re"),
+            vec![("interrupted".to_string(), 1)]
+        );
+    }
+    let core = reopen(&path);
+    assert_eq!(
+        show(&core, "alice", "docs", "op-re"),
+        vec![("interrupted".to_string(), 1)]
+    );
+    // 他テナントは存在を観測できない。
+    assert!(show(&core, "bob", "docs", "op-re").is_empty());
+
+    // 原因（衝突する UNIQUE 値）を取り除いて再送すると、累計件数で完了する。
+    ok(
+        &core,
+        "alice",
+        "UPDATE docs SET u = 'fixed' WHERE id = 1 USING OPERATION_ID 'fix-1'",
+    );
+    let n = affected(ok(
+        &core,
+        "alice",
+        "UPDATE docs SET u = 'dup' WHERE n > 0 USING OPERATION_ID 'op-re' PARTITIONED CHUNK 1",
+    ));
+    assert_eq!(n, 2);
+    drop(core);
+    let core = reopen(&path);
+    assert_eq!(
+        show(&core, "alice", "docs", "op-re"),
+        vec![("completed".to_string(), 2)]
+    );
+}
+
+/// 再起動後の中断ジョブは `CANCEL` で `cancelled` になり、再送は `VD002` で拒否される。
+#[test]
+fn interrupted_job_can_be_cancelled_after_reopen() {
+    let path = unique_db_path("pdml-sql-reopen-cancel");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = reopen(&path);
+        ddl(&core, "CREATE TABLE docs (n BIGINT, u TEXT UNIQUE)");
+        seed(&core, "alice", &[(1, 10, "a"), (2, 20, "b")]);
+        assert_eq!(
+            make_interrupted(&core, "alice", "op-rc").wire_code(),
+            "VD001"
+        );
+    }
+    let core = reopen(&path);
+    let out = status_rows(ok(&core, "alice", "CANCEL PARTITIONED DML 'op-rc' ON docs"));
+    assert_eq!(out, vec![("cancelled".to_string(), 1)]);
+    assert_eq!(
+        show(&core, "alice", "docs", "op-rc"),
+        vec![("cancelled".to_string(), 1)]
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "UPDATE docs SET u = 'dup' WHERE n > 0 USING OPERATION_ID 'op-rc' PARTITIONED CHUNK 1"
+        ),
+        "VD002"
+    );
+}
