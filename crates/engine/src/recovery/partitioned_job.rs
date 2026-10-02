@@ -408,6 +408,10 @@ pub(crate) fn lookup_in_read_txn(
 
 /// `Running` 記録の件数を `(tenant, table)` 単位で数える（索引の範囲走査。
 /// `stop_at` 件で打ち切るため計算量は O(上限)）。他テナント・他テーブルは混ざらない。
+///
+/// 数える各索引エントリについて、索引値のバージョンと、対応する主表記録が `Running`
+/// であることを検証する。欠落・不一致は [`PartitionedJobError::Corrupted`]
+/// （fail-closed。索引だけを数えて上限を過小・過大評価しない）。
 pub(crate) fn count_interrupted_in_txn(
     txn: &redb::WriteTransaction,
     tenant: &str,
@@ -415,14 +419,33 @@ pub(crate) fn count_interrupted_in_txn(
     stop_at: u64,
 ) -> Result<u64, PartitionedJobError> {
     let active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
+    let jobs = txn.open_table(PARTITIONED_JOB_TABLE)?;
     let lower = Bound::Included((tenant, table, ""));
     let iter = active.range::<(&str, &str, &str)>((lower, Bound::Unbounded))?;
     let mut count: u64 = 0;
     for entry in iter {
-        let (k, _v) = entry?;
-        let (t, tb, _op) = k.value();
+        let (k, v) = entry?;
+        let (t, tb, op) = k.value();
         if t != tenant || tb != table {
             break;
+        }
+        if v.value() != ACTIVE_INDEX_VALUE.as_slice() {
+            return Err(PartitionedJobError::corrupt(
+                "partitioned job active index has an unknown value",
+            ));
+        }
+        let record = match jobs.get((t, tb, op))? {
+            Some(g) => decode_record(g.value())?,
+            None => {
+                return Err(PartitionedJobError::corrupt(
+                    "partitioned job active index entry has no record",
+                ))
+            }
+        };
+        if !matches!(record, JobRecord::Running { .. }) {
+            return Err(PartitionedJobError::corrupt(
+                "partitioned job active index entry points to a non-running record",
+            ));
         }
         count = count
             .checked_add(1)
@@ -432,6 +455,25 @@ pub(crate) fn count_interrupted_in_txn(
         }
     }
     Ok(count)
+}
+
+/// 既存 `Running` 記録に対応する索引エントリが正しい値で存在することを検証する
+/// （欠落・不明な値は `Corrupted`。fail-closed）。
+fn verify_active_index_present(
+    txn: &redb::WriteTransaction,
+    key: &JobKey<'_>,
+) -> Result<(), PartitionedJobError> {
+    let active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
+    let got = active.get(key.tuple())?;
+    match got {
+        Some(g) if g.value() == ACTIVE_INDEX_VALUE.as_slice() => Ok(()),
+        Some(_) => Err(PartitionedJobError::corrupt(
+            "partitioned job active index has an unknown value",
+        )),
+        None => Err(PartitionedJobError::corrupt(
+            "partitioned job active index entry is missing",
+        )),
+    }
 }
 
 /// [`record_chunk_progress_in_txn`] の結果。
@@ -505,6 +547,7 @@ pub(crate) fn record_chunk_progress_in_txn(
             if !hash.matches(&stored) || last_scanned <= cursor {
                 return Err(PartitionedJobError::StateConflict);
             }
+            verify_active_index_present(txn, key)?;
             let processed = processed
                 .checked_add(rows_changed)
                 .ok_or_else(|| PartitionedJobError::corrupt("partitioned job count overflow"))?;
@@ -1191,6 +1234,73 @@ mod tests {
         wt.commit().expect("c");
         assert_eq!(active_count(&db), 3);
         assert_eq!(running_count(&db), 3);
+    }
+
+    #[test]
+    fn count_interrupted_fails_closed_on_index_record_mismatch() {
+        let (db, _g) = open_db("pj-index-mismatch");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        // 主表に記録が無い索引（余分な索引）。
+        let wt = db.begin_write().expect("w");
+        {
+            let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
+            a.insert(k.tuple(), ACTIVE_INDEX_VALUE.as_slice())
+                .expect("i");
+            wt.open_table(PARTITIONED_JOB_TABLE).expect("j");
+        }
+        assert!(matches!(
+            count_interrupted_in_txn(&wt, "t1", "docs", 100),
+            Err(PartitionedJobError::Corrupted(_))
+        ));
+        drop(wt);
+        // 索引値が不明なバージョン。
+        let wt = db.begin_write().expect("w");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+        {
+            let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
+            a.insert(k.tuple(), [9u8].as_slice()).expect("i");
+        }
+        assert!(matches!(
+            count_interrupted_in_txn(&wt, "t1", "docs", 100),
+            Err(PartitionedJobError::Corrupted(_))
+        ));
+        drop(wt);
+        // 索引が指す記録が Running 以外。
+        let wt = db.begin_write().expect("w");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+        write_record(
+            &wt,
+            &k,
+            &JobRecord::Cancelled {
+                hash: *hash("h").as_bytes(),
+                committed: 1,
+            },
+        )
+        .expect("w");
+        assert!(matches!(
+            count_interrupted_in_txn(&wt, "t1", "docs", 100),
+            Err(PartitionedJobError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn running_update_fails_closed_when_active_index_is_missing() {
+        let (db, _g) = open_db("pj-index-missing");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        let wt = db.begin_write().expect("w");
+        record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+        wt.commit().expect("c");
+        let wt = db.begin_write().expect("w");
+        {
+            let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
+            a.remove(k.tuple()).expect("rm");
+        }
+        assert!(matches!(
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100),
+            Err(PartitionedJobError::Corrupted(_))
+        ));
     }
 
     #[test]
