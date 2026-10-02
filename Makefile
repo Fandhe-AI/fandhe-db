@@ -198,6 +198,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため crash-test-unique-index をスキップ"
 endif
 
+.PHONY: crash-test-partitioned-dml
+crash-test-partitioned-dml: ## 分割実行 DML の crash 耐性回帰テスト（Issue #1131・RECOVER-11/PERSIST-1 ポインタ。scripts/crash_test_partitioned_dml.sh を実行）
+ifdef HAS_CARGO
+	scripts/crash_test_partitioned_dml.sh
+else
+	@echo "skip: Cargo.toml 未追加のため crash-test-partitioned-dml をスキップ"
+endif
+
 .PHONY: tmp-leak-check
 tmp-leak-check: ## テスト一時領域の残置検出ゲート（Issue #1303。scripts/check_tmp_leak.sh を実行。FULL=1 で workspace 全テスト）
 ifdef HAS_CARGO
@@ -284,7 +292,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index tmp-leak-check core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index crash-test-partitioned-dml tmp-leak-check core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）

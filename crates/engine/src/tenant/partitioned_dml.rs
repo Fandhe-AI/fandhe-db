@@ -705,3 +705,6 @@ fn scan_chunk<E>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scenario_tests;
