@@ -30,6 +30,12 @@
 //!   変わったら打ち切る（他テナント領域のキー・値は読まない。RLS-9・RLS-10）。
 //! - 走査行数は自テナントの行だけで数える（他テナントの行数が応答に表れない）。
 //! - 1 チャンクの走査予算は `MAX_SCANNED_ROWS` 以下で、ジョブ全体には課さない。
+//! - writer 保持時間の上限（`max_writer_hold`）は**行境界での打ち切り判定**であり、
+//!   走査の各行の後と適用の各行の前にだけ時計を見る。上限を超えて保持し得るのは、
+//!   最後に判定を通過した 1 行の適用（UNIQUE 索引・FK 即時検査を含む）と、世代 bump・
+//!   ジョブ記録の保存・commit（いずれも行数に比例しない固定段）だけで、時計では中断
+//!   できない（redb の書き込みは途中で打ち切ると不整合になるため、段の途中では切らない）。
+//!   通常の書き込みの待ちは「上限 × 2 ＋ この非中断段の所要」で見積もる（ADR §15.2）。
 //! - どの段で失敗しても write txn は commit せず drop（abort）する。停止原因と一緒に
 //!   返す `committed_total` は commit 済みのチャンクの累計だけを表す。
 //! - 失敗は fail-closed。ジョブ記録とメモリ上の状態の不一致は `XX000` 相当で止める。
@@ -289,6 +295,30 @@ fn chunk_loop<E>(
         .map_err(map_job_err)?;
     let clock = hooks.clock;
     let mut chunk_index: usize = 0;
+
+    // 再開時の commit 済み累計を、取り消し・gate 待機・スキーマ検査など最初のチャンクの
+    // どの早期失敗よりも前にメモリ状態へ復元する（失敗に添える `committed_total` が
+    // 0 になり「副作用ゼロ」と誤認されるのを防ぐ。#1129 は `> 0` を部分完了へ写像する）。
+    // 判定の正は最初のチャンクの write txn 内の照合（そこで同じ値が再設定される）。
+    // 同じキーのジョブは登録簿により本プロセスで 1 つだけなので、ここと照合の間に
+    // 記録が変わることはない。ハッシュ不一致・完了済み・取り消し済みは復元しない
+    // （それらは書き込みを行わずに止まるため 0 が正しい）。
+    {
+        let read_txn = storage
+            .db()
+            .begin_read()
+            .map_err(|e| w(StorageError::from(e)))?;
+        if let Some(JobRecord::Running {
+            hash: stored,
+            processed,
+            ..
+        }) = partitioned_job::lookup_in_read_txn(&read_txn, &key).map_err(map_job_err)?
+        {
+            if hash.matches(&stored) {
+                state.processed = processed;
+            }
+        }
+    }
 
     loop {
         if guard.cancel_requested() {

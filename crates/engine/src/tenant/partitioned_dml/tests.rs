@@ -805,6 +805,62 @@ fn stale_expected_schema_is_rejected_before_any_change() {
 }
 
 #[test]
+fn early_failure_on_resumed_first_chunk_still_reports_committed_total() {
+    let (storage, _g) = setup("pdml-resume-early-fail");
+    let rows: Vec<(u64, &str)> = (1..=9).map(|i| (i, "x")).collect();
+    seed(&storage, "t-a", &rows);
+    let o = op("op-resume-early");
+    let h = hash(b"h-re");
+    let c = ctx("t-a");
+    let registry = std::sync::Arc::clone(storage.partitioned_job_registry());
+    let mut hook = |n: usize| {
+        if n == 1 {
+            let key = JobKey::for_context(&c, TABLE, &o);
+            assert!(registry.request_cancel(&key));
+        }
+    };
+    let err = run_delete(
+        &storage,
+        "t-a",
+        &o,
+        &h,
+        &limits(3, 1000, 1000),
+        None,
+        match_x as Pred,
+        &mut real_hooks(Some(&mut hook)),
+    )
+    .expect_err("cancelled at boundary");
+    assert_eq!(err.committed_total, 3);
+
+    // 再送の最初のチャンクがスキーマ検査で止まっても、commit 済みの 3 件を報告する。
+    let stale = TableSchema::new(
+        TABLE,
+        vec![ColumnDef::new("other", ColumnType::Text, false)],
+    );
+    let err = run_partitioned(
+        &storage,
+        TABLE,
+        &ctx("t-a"),
+        LedgerWrite::Record(&o),
+        &h,
+        Some(&stale),
+        false,
+        &limits(3, 1000, 1000),
+        None,
+        Kind::Delete,
+        match_x as Pred,
+        &mut real_hooks(None),
+    )
+    .expect_err("schema changed");
+    assert!(matches!(
+        err.cause,
+        PartitionedStopCause::Write(TenantWriteError::Catalog(_))
+    ));
+    assert_eq!(err.committed_total, 3);
+    assert_eq!(rows_of(&storage, "t-a").len(), 6);
+}
+
+#[test]
 fn alter_table_between_chunks_stops_the_job() {
     let (storage, _g) = setup("pdml-alter-between");
     let rows: Vec<(u64, &str)> = (1..=6).map(|i| (i, "x")).collect();
