@@ -249,6 +249,8 @@ test = false
 # `.github/workflows/*` へは配線しない。harness = false / test = false は上記ベンチと同一方針。
 # `make bench-relational-p95`（Makefile）から実行する。判定ロジック自体（時間非依存）は
 # harness/relational_p95.rs にあり tests/relational_p95_accept.rs で make ci 側から回帰検証する。
+# Issue #1319 で述語グループへ段別内訳（索引経路と PlainScan 反実仮想の F・c 分離。pub API による
+# ベンチ内再実装で engine 本体は無変更）を追加した。依存・feature は変更しない。
 name = "relational_p95_bench"
 harness = false
 test = false

@@ -383,7 +383,7 @@ else
 endif
 
 .PHONY: bench-relational-p95
-bench-relational-p95: ## Issue #1204（述語 OR/IN・スカラー ORDER BY・2 テーブル結合）の p95 計測ベンチを実行する（env: BENCH_RELATIONAL_P95_ROUNDS / _GROUP / _ROWS。時間依存・spec 閾値の CI 判定なし・手動実行専用のため ci には含めない）
+bench-relational-p95: ## Issue #1204（述語 OR/IN・スカラー ORDER BY・2 テーブル結合）の p95 計測ベンチを実行する（述語グループは段別内訳〔median・Q1/Q3〕も出力。env: BENCH_RELATIONAL_P95_ROUNDS / _GROUP / _ROWS。時間依存・spec 閾値の CI 判定なし・手動実行専用のため ci には含めない）
 ifdef HAS_CARGO
 	cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine
 else
