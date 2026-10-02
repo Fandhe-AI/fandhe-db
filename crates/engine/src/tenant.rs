@@ -3981,7 +3981,7 @@ fn delete_rows_where_impl<E>(
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
-    mut project: Option<&mut ReturningProjectFn<'_>>,
+    project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
     target.with_txn(|write_txn| {
@@ -4031,7 +4031,7 @@ fn delete_rows_where_impl<E>(
             &schema,
             &candidate_ids,
             target.fk_check_mode(),
-            project.as_deref_mut(),
+            project,
             None,
         )?;
         debug_assert_eq!(applied, candidate_ids.len());
@@ -4150,7 +4150,7 @@ fn update_rows_where_impl<E>(
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
-    mut project: Option<&mut ReturningProjectFn<'_>>,
+    project: Option<&mut ReturningProjectFn<'_>>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_identifier(table).map_err(dml_write_err)?;
     target.with_txn(|write_txn| {
@@ -4210,7 +4210,7 @@ fn update_rows_where_impl<E>(
             &candidate_ids,
             assignments,
             target.fk_check_mode(),
-            project.as_deref_mut(),
+            project,
             None,
         )?;
         debug_assert_eq!(applied, candidate_ids.len());
@@ -4996,6 +4996,8 @@ pub(crate) fn last_operation(
     ledger::last_operation_in_read_txn(&read_txn, ctx.tenant_id(), table)
         .map_err(TenantWriteError::LedgerCorrupted)
 }
+
+mod partitioned_dml;
 
 #[cfg(test)]
 mod tests {

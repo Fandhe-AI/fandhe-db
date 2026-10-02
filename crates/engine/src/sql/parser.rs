@@ -2989,6 +2989,169 @@ pub struct DmlLimits {
     pub max_insert_rows_per_statement: Option<std::num::NonZeroUsize>,
 }
 
+/// チャンク幅（1 チャンクの適用行数）の既定値（ADR `docs/design/partitioned-dml.md` §15.2）。
+pub const DEFAULT_PARTITIONED_CHUNK_ROWS: usize = 1_000;
+/// チャンク幅の指定可能範囲（`MAX_DML_ROW_LIMIT` と同じ）。
+pub const MIN_PARTITIONED_CHUNK_ROWS: usize = 1;
+pub const MAX_PARTITIONED_CHUNK_ROWS: usize = MAX_DML_ROW_LIMIT;
+/// チャンクごとの走査予算の既定値（読み取り経路の可視行上限と同じ。§15.2）。
+pub const DEFAULT_PARTITIONED_SCAN_BUDGET_ROWS: usize = 100_000;
+pub const MIN_PARTITIONED_SCAN_BUDGET_ROWS: usize = 1;
+/// 走査予算の上限（1 文の総走査行数上限 `MAX_SCANNED_ROWS` を超えない）。
+pub const MAX_PARTITIONED_SCAN_BUDGET_ROWS: usize = crate::tenant::MAX_SCANNED_ROWS;
+/// 1 チャンクの writer 保持時間の既定値（ミリ秒。§15.2）。
+pub const DEFAULT_PARTITIONED_MAX_HOLD_MS: u64 = 1_000;
+pub const MIN_PARTITIONED_MAX_HOLD_MS: u64 = 100;
+pub const MAX_PARTITIONED_MAX_HOLD_MS: u64 = 5_000;
+/// 中断記録数の上限の既定値と範囲（§15.2。CLI フラグは #1129）。
+pub const DEFAULT_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1_000;
+pub const MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1;
+pub const MAX_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1_000_000;
+
+/// [`PartitionedDmlLimits`] の各値の範囲外を示すエラー。`Display` には項目名・入力値・
+/// 許容範囲だけを含める（テナント・行内容に触れない。fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedDmlLimitsError {
+    item: &'static str,
+    value: u64,
+    min: u64,
+    max: u64,
+}
+
+impl std::fmt::Display for PartitionedDmlLimitsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} value {} is out of range {}..={}",
+            self.item, self.value, self.min, self.max
+        )
+    }
+}
+
+impl std::error::Error for PartitionedDmlLimitsError {}
+
+fn partitioned_range_check(
+    item: &'static str,
+    value: u64,
+    min: u64,
+    max: u64,
+) -> Result<(), PartitionedDmlLimitsError> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(PartitionedDmlLimitsError {
+            item,
+            value,
+            min,
+            max,
+        })
+    }
+}
+
+/// チャンク幅を検証して `NonZeroUsize` へ変換する（wire-server の CLI 解析から呼ばれる）。
+pub fn validate_partitioned_chunk_rows(
+    value: usize,
+) -> Result<std::num::NonZeroUsize, PartitionedDmlLimitsError> {
+    let v = u64::try_from(value).unwrap_or(u64::MAX);
+    partitioned_range_check(
+        "partitioned chunk rows",
+        v,
+        MIN_PARTITIONED_CHUNK_ROWS as u64,
+        MAX_PARTITIONED_CHUNK_ROWS as u64,
+    )?;
+    std::num::NonZeroUsize::new(value).ok_or(PartitionedDmlLimitsError {
+        item: "partitioned chunk rows",
+        value: v,
+        min: MIN_PARTITIONED_CHUNK_ROWS as u64,
+        max: MAX_PARTITIONED_CHUNK_ROWS as u64,
+    })
+}
+
+/// チャンクごとの走査予算を検証して `NonZeroUsize` へ変換する。
+pub fn validate_partitioned_scan_budget(
+    value: usize,
+) -> Result<std::num::NonZeroUsize, PartitionedDmlLimitsError> {
+    let v = u64::try_from(value).unwrap_or(u64::MAX);
+    partitioned_range_check(
+        "partitioned scan budget",
+        v,
+        MIN_PARTITIONED_SCAN_BUDGET_ROWS as u64,
+        MAX_PARTITIONED_SCAN_BUDGET_ROWS as u64,
+    )?;
+    std::num::NonZeroUsize::new(value).ok_or(PartitionedDmlLimitsError {
+        item: "partitioned scan budget",
+        value: v,
+        min: MIN_PARTITIONED_SCAN_BUDGET_ROWS as u64,
+        max: MAX_PARTITIONED_SCAN_BUDGET_ROWS as u64,
+    })
+}
+
+/// writer 保持時間（ミリ秒）を検証して `Duration` へ変換する。
+pub fn validate_partitioned_max_hold_ms(
+    value: u64,
+) -> Result<std::time::Duration, PartitionedDmlLimitsError> {
+    partitioned_range_check(
+        "partitioned max hold ms",
+        value,
+        MIN_PARTITIONED_MAX_HOLD_MS,
+        MAX_PARTITIONED_MAX_HOLD_MS,
+    )?;
+    Ok(std::time::Duration::from_millis(value))
+}
+
+/// 述語形 UPDATE／DELETE の分割実行（ADR `docs/design/partitioned-dml.md` §15.2）の
+/// プロセス全体の設定値。`core.rs::EngineCore::with_partitioned_dml_limits` が受け取り、
+/// `wire-server` の起動時 CLI フラグからのみ設定する（[`DmlLimits`] と同じ「起動時に
+/// 1 回だけ設定するプロセス構成値」。セッション・テナント単位の差し替えは設けない）。
+/// 範囲検証は各 `validate_partitioned_*` と [`Self::validate`]（起動時検証の唯一の
+/// 入口。同時実行数の組合せ制約は #1129 でここへ足す）が担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionedDmlLimits {
+    /// 1 チャンクの適用行数（既定 1,000。`1..=1,000,000`）。
+    pub chunk_rows: std::num::NonZeroUsize,
+    /// 1 チャンクの走査行数の予算（既定 100,000。`1..=MAX_SCANNED_ROWS`）。
+    pub scan_budget_rows: std::num::NonZeroUsize,
+    /// 1 チャンクの writer 保持時間の上限（既定 1 秒。`100..=5,000` ms）。
+    pub max_writer_hold: std::time::Duration,
+    /// `(tenant, table)` 単位の中断記録数の上限（既定 1,000。CLI フラグは #1129）。
+    pub interrupted_record_limit: std::num::NonZeroU64,
+}
+
+impl Default for PartitionedDmlLimits {
+    fn default() -> Self {
+        // 既定値は定数で範囲内・非 0 のため `new` は必ず `Some` だが、`unwrap` を避け
+        // 万一前提が崩れても最小値へ倒す（panic させない）。
+        Self {
+            chunk_rows: std::num::NonZeroUsize::new(DEFAULT_PARTITIONED_CHUNK_ROWS)
+                .unwrap_or(std::num::NonZeroUsize::MIN),
+            scan_budget_rows: std::num::NonZeroUsize::new(DEFAULT_PARTITIONED_SCAN_BUDGET_ROWS)
+                .unwrap_or(std::num::NonZeroUsize::MIN),
+            max_writer_hold: std::time::Duration::from_millis(DEFAULT_PARTITIONED_MAX_HOLD_MS),
+            interrupted_record_limit: std::num::NonZeroU64::new(
+                DEFAULT_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+            )
+            .unwrap_or(std::num::NonZeroU64::MIN),
+        }
+    }
+}
+
+impl PartitionedDmlLimits {
+    /// 全項目の範囲を再検証する（起動時検証の唯一の入口。範囲外は fail-closed で
+    /// 起動を拒否する側が使う）。
+    pub fn validate(&self) -> Result<(), PartitionedDmlLimitsError> {
+        validate_partitioned_chunk_rows(self.chunk_rows.get())?;
+        validate_partitioned_scan_budget(self.scan_budget_rows.get())?;
+        let hold_ms = u64::try_from(self.max_writer_hold.as_millis()).unwrap_or(u64::MAX);
+        validate_partitioned_max_hold_ms(hold_ms)?;
+        partitioned_range_check(
+            "partitioned interrupted record limit",
+            self.interrupted_record_limit.get(),
+            MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+            MAX_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+        )
+    }
+}
+
 /// 束縛済みの述語つき `UPDATE` 文（SQL-19、TASK-192・Issue #869。実行結線は
 /// Issue #871 の担当）。[`BoundUpdate`]（単一行・id 指定形）とは別型として扱う
 /// （[`BoundUpdateForm`] 参照）。
@@ -7553,6 +7716,48 @@ mod tests {
         let limits = DmlLimits::default();
         assert_eq!(limits.max_affected_rows, None);
         assert_eq!(limits.max_insert_rows_per_statement, None);
+    }
+
+    #[test]
+    fn partitioned_dml_limits_default_matches_adr_and_validates() {
+        let d = PartitionedDmlLimits::default();
+        assert_eq!(d.chunk_rows.get(), 1_000);
+        assert_eq!(d.scan_budget_rows.get(), 100_000);
+        assert_eq!(d.max_writer_hold, std::time::Duration::from_secs(1));
+        assert_eq!(d.interrupted_record_limit.get(), 1_000);
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn partitioned_dml_limit_validators_enforce_boundaries() {
+        assert!(validate_partitioned_chunk_rows(0).is_err());
+        assert!(validate_partitioned_chunk_rows(1).is_ok());
+        assert!(validate_partitioned_chunk_rows(1_000_000).is_ok());
+        assert!(validate_partitioned_chunk_rows(1_000_001).is_err());
+        assert!(validate_partitioned_scan_budget(0).is_err());
+        assert!(validate_partitioned_scan_budget(1).is_ok());
+        assert!(validate_partitioned_scan_budget(crate::tenant::MAX_SCANNED_ROWS).is_ok());
+        assert!(validate_partitioned_scan_budget(crate::tenant::MAX_SCANNED_ROWS + 1).is_err());
+        assert!(validate_partitioned_max_hold_ms(99).is_err());
+        assert!(validate_partitioned_max_hold_ms(100).is_ok());
+        assert!(validate_partitioned_max_hold_ms(5_000).is_ok());
+        assert!(validate_partitioned_max_hold_ms(5_001).is_err());
+    }
+
+    #[test]
+    fn partitioned_dml_limits_validate_rejects_out_of_range_fields() {
+        let l = PartitionedDmlLimits {
+            max_writer_hold: std::time::Duration::from_millis(5_001),
+            ..PartitionedDmlLimits::default()
+        };
+        assert!(l.validate().is_err());
+        let l = PartitionedDmlLimits {
+            interrupted_record_limit: std::num::NonZeroU64::MAX,
+            ..PartitionedDmlLimits::default()
+        };
+        let err = l.validate().expect_err("out of range");
+        let msg = err.to_string();
+        assert!(msg.contains("out of range"));
     }
 
     #[test]
