@@ -431,6 +431,16 @@ fn verify(path: &str, mode: Mode) -> Result<(String, i64), String> {
     // 一致行は「未変更」か「変更済み」のどちらかで、内容も整合している。
     for id in &matching {
         if changed.contains(id) {
+            // UPDATE 済み行は tag だけが変わり n は不変（n == id）であること。
+            // 更新済み行の n 破損を見逃さない（DELETE の変更済み行は存在しない）。
+            if mode == Mode::Update {
+                match rows.get(id) {
+                    Some((tag, n)) if tag == "done" && *n == *id as i64 => {}
+                    other => {
+                        return Err(format!("updated row {id} is corrupted: {other:?}"));
+                    }
+                }
+            }
             continue;
         }
         match rows.get(id) {

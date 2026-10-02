@@ -87,10 +87,9 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
         std::thread::spawn(move || {
             let mut failures: Vec<String> = Vec::new();
             let mut last = 0u64;
+            // stop が先に立っても最低 1 周は処理する（空振り成功の防止）ため、
+            // stop の確認は 1 周の処理後に行う。
             for i in 0..MAX_NORMAL_WRITES {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
                 last = i + 1;
                 // 奇数 id 1 の n を更新する（tag は 'y' のまま）。
                 if let Err(e) = run(
@@ -111,6 +110,9 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
                 ) {
                     failures.push(format!("insert {i}: {}", e.wire_code()));
                 }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
             }
             (failures, last)
         })
@@ -123,20 +125,24 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
         std::thread::spawn(move || {
             let mut prev = u64::MAX;
             let mut violations = 0u64;
+            let mut searches = 0u64;
+            // stop が先に立っても最低 1 周は検索する（stop の確認は 1 周の処理後）。
             for _ in 0..MAX_SEARCHES {
+                if let Ok(SqlOutcome::Query(q)) =
+                    run(&core, "SELECT id FROM docs WHERE tag = 'x' LIMIT 1000")
+                {
+                    let n = q.rows.len() as u64;
+                    searches += 1;
+                    if n > prev {
+                        violations += 1;
+                    }
+                    prev = n;
+                }
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let n = match run(&core, "SELECT id FROM docs WHERE tag = 'x' LIMIT 1000") {
-                    Ok(SqlOutcome::Query(q)) => q.rows.len() as u64,
-                    _ => continue,
-                };
-                if n > prev {
-                    violations += 1;
-                }
-                prev = n;
             }
-            violations
+            (violations, searches)
         })
     };
 
@@ -152,12 +158,15 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
     };
     stop.store(true, Ordering::Relaxed);
     let (failures, last_n) = normal.join().expect("normal thread");
-    let violations = search.join().expect("search thread");
+    let (violations, searches) = search.join().expect("search thread");
 
     assert_eq!(deleted, MATCHING);
     // 通常の書き込みは分割実行に待たされて拒否されない（ADR 8.2。55P03 が 0 件）。
     assert!(failures.is_empty(), "normal writes failed: {failures:?}");
     assert_eq!(violations, 0, "matching count must never increase");
+    // 並行動作が空振りしていない（両スレッドが実際に処理した）ことを確認する。
+    assert!(last_n >= 1, "normal write thread never ran");
+    assert!(searches >= 1, "search thread never completed a search");
 
     // 完了後: 一致行は 0 件・SHOW は completed と一致数・N の最後の値が残っている。
     match run(&core, "SELECT id FROM docs WHERE tag = 'x' LIMIT 1000").expect("select") {
@@ -178,13 +187,11 @@ fn partitioned_delete_coexists_with_normal_writes_and_searches() {
         }
         other => panic!("unexpected outcome {other:?}"),
     }
-    if last_n > 0 {
-        match run(&core, "SELECT id, n FROM docs WHERE id = 1 LIMIT 1").expect("select n") {
-            SqlOutcome::Query(q) => {
-                let row = q.rows.first().expect("row 1");
-                assert!(row.cells.contains(&Cell::SignedInteger(last_n as i64)));
-            }
-            other => panic!("unexpected outcome {other:?}"),
+    match run(&core, "SELECT id, n FROM docs WHERE id = 1 LIMIT 1").expect("select n") {
+        SqlOutcome::Query(q) => {
+            let row = q.rows.first().expect("row 1");
+            assert!(row.cells.contains(&Cell::SignedInteger(last_n as i64)));
         }
+        other => panic!("unexpected outcome {other:?}"),
     }
 }
