@@ -49,7 +49,11 @@
 //!    空配列は `42601`。`super::dml_target::DmlTargetError::EmptyFilter`）。
 //!    `engine` 未接続時の `Op::Scan`／`Op::Aggregate`／`Op::Insert`／
 //!    `Op::Search`／`Op::Update`／`Op::Delete` はすべて
-//!    [`PLACEHOLDER_MESSAGE`] へ落ちる
+//!    [`PLACEHOLDER_MESSAGE`] へ落ちる。分割実行 DML（Issue #1130・NOSQL-12・
+//!    RECOVER-11）は、`update`／`delete` の修飾（`mode`／`chunk`）が各 `handle`
+//!    内部で engine の分割実行入口へ、`(Op::ShowPartitionedDml, Some(engine))`・
+//!    `(Op::CancelPartitionedDml, Some(engine))` が [`super::partitioned::handle_show`]・
+//!    [`super::partitioned::handle_cancel`] へ委譲する
 //!
 //! 手順 3（op 許可リスト）は手順 4（スキーマ検証）より前に行う。語彙外の
 //! `op` にスキーマ検証由来の情報（未知キー等）が先に返ることはない
@@ -67,7 +71,7 @@ use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
 use crate::http::query::schema::Validated;
-use crate::http::query::{ddl, delete, insert, scan, update};
+use crate::http::query::{ddl, delete, insert, partitioned, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
@@ -172,6 +176,13 @@ pub fn handle(
         }
         (Op::DropTable, Some(engine)) => {
             ddl::handle_drop_table(engine, principal, &validated, now_wall)
+        }
+        // 分割実行 DML の進捗照会・取り消し（Issue #1130・NOSQL-12・RECOVER-11）。
+        (Op::ShowPartitionedDml, Some(engine)) => {
+            partitioned::handle_show(engine, principal, &validated, now_wall)
+        }
+        (Op::CancelPartitionedDml, Some(engine)) => {
+            partitioned::handle_cancel(engine, principal, &validated, now_wall)
         }
         // `engine` 未接続時（`Router::new` 経由）は全 op がこの暫定応答へ
         // 落ちる（実行器なしで応答を偽装しない）。
@@ -568,8 +579,8 @@ mod tests {
     }
 
     #[test]
-    fn tenant_id_in_json_is_rejected_for_all_nine_ops() {
-        let cases: [&[u8]; 9] = [
+    fn tenant_id_in_json_is_rejected_for_all_eleven_ops() {
+        let cases: [&[u8]; 11] = [
             br#"{"op":"search","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"scan","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"aggregate","table":"docs","aggregates":[],"tenant_id":"evil"}"#,
@@ -579,6 +590,8 @@ mod tests {
             br#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text"}],"tenant_id":"evil"}"#,
             br#"{"op":"alter_table","table":"docs","add_column":{"name":"a","type":"text"},"tenant_id":"evil"}"#,
             br#"{"op":"drop_table","table":"docs","tenant_id":"evil"}"#,
+            br#"{"op":"show_partitioned_dml","table":"docs","operation_id":"x","tenant_id":"evil"}"#,
+            br#"{"op":"cancel_partitioned_dml","table":"docs","operation_id":"x","tenant_id":"evil"}"#,
         ];
         for body in cases {
             let response = run(body, &[]);
@@ -602,7 +615,7 @@ mod tests {
     fn ddl_udf_transaction_ops_reject_with_0a000() {
         // UDF 呼び出し・トランザクション制御・NOSQL-13 対象外の DDL 相当
         // （index／view 系）・表記揺れは、いずれも許可リスト（Op::parse の
-        // 9 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
+        // 11 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
         // 回帰確認。`update`／`delete` は Issue #875、`create_table`／
         // `alter_table`／`drop_table` は Issue #910 で語彙へ加わったため
         // 本テストの対象から除外した）。

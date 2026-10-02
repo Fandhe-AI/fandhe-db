@@ -404,10 +404,24 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
     let engine::json::JsonValue::Object(error_obj) = error_value else {
         panic!("error value must be an object: {body_str}");
     };
-    assert!(
-        !error_obj.contains_key("data"),
-        "normal error response must not carry a data key: {body_str}"
-    );
+    // `data` は分割実行 DML の `VD001`／`VD002`（Issue #1130。`committed`・`operation_id` のみ）
+    // にだけ許す。他の分類は従来どおり `data` を持たない。
+    if matches!(
+        class,
+        ErrorClass::PartialCompletion | ErrorClass::PartitionedDmlCancelled
+    ) && error_obj.contains_key("data")
+    {
+        let Some(engine::json::JsonValue::Object(data)) = error_obj.get("data") else {
+            panic!("data must be an object: {body_str}");
+        };
+        let keys: Vec<&str> = data.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["committed", "operation_id"], "{body_str}");
+    } else {
+        assert!(
+            !error_obj.contains_key("data"),
+            "normal error response must not carry a data key: {body_str}"
+        );
+    }
     assert_eq!(
         resp.header("content-type"),
         Some(wire_server::http::response::CONTENT_TYPE_JSON_UTF8)
@@ -896,16 +910,44 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // CONSTRAINT` の CHECK・FOREIGN KEY の名前衝突。NoSQL の `alter_table` は
         // `add_column`／`drop_column` だけで到達不能。
         ErrorClass::DuplicateObject,
-        // `PartialCompletion`／`PartitionedDmlCancelled`（`VD001`／`VD002`。Issue #1129）:
-        // NoSQL 表層の分割実行 op は Issue #1130 の担当で、本 Issue 時点では SQL 表層
-        // だけが送出するため NoSQL の実要求からは到達不能。
-        ErrorClass::PartialCompletion,
-        ErrorClass::PartitionedDmlCancelled,
+        // （`PartialCompletion`／`PartitionedDmlCancelled`〔`VD001`／`VD002`〕は Issue #1130 で
+        // `update`／`delete` の分割実行修飾から到達可能になったため外した。固定は
+        // `err4_f_partitioned_dml_vd001_vd002_reachable_via_nosql_update` が担う）
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
+    }
+}
+
+/// `PartialCompletion`／`PartitionedDmlCancelled`（`VD001`／`VD002`。Issue #1130・NOSQL-12・
+/// RECOVER-11）は NoSQL 表層の `update`／`delete` の分割実行修飾から実要求で到達可能
+/// （UNIQUE 列への書き込みを `chunk: 1` で止める要求と取り消し後の再送。実要求での固定は
+/// `tests/nosql12_partitioned_dml.rs` が担う）。本テストは分割実行専用の応答エンコーダ
+/// （[`wire_server::http::response::encode_error_partitioned`]。`data` 付き本文）を通した
+/// バイト列でも 409 へ射影され、通常本文と同じ `wire_code`・`code` を持つことを固定する。
+#[test]
+fn err4_f_partitioned_dml_vd001_vd002_project_to_409_with_data() {
+    for class in [
+        ErrorClass::PartialCompletion,
+        ErrorClass::PartitionedDmlCancelled,
+    ] {
+        let raw = wire_server::http::response::encode_error_partitioned(
+            class,
+            "test message",
+            1,
+            "op-1",
+            SystemTime::now(),
+        );
+        let resp = http_common::parse_single_response(&raw);
+        assert_projected(&resp, class.wire_code());
+        assert_eq!(resp.status, 409);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains(r#""data":{"committed":1,"operation_id":"op-1"}"#),
+            "{body}"
+        );
     }
 }
 

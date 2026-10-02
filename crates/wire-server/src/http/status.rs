@@ -53,8 +53,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // Issue #1129・SQL-19・RECOVER-11: 分割実行 DML の部分完了（`VD001`）・取り消し
         // （`VD002`）。commit 済みのチャンクと矛盾する状態（再送で再開する対象の状態）の
         // ため `UniqueViolation` と同じ「対象の状態と矛盾する」意味論として 409 とする。
-        // NoSQL 表層の分割実行 op は Issue #1130 の担当で、本 Issue では SQL 表層のみが
-        // 送出するが、`ErrorClass` の網羅性のため射影を定める。
+        // NoSQL 表層からも Issue #1130 で `update`／`delete` の分割実行修飾から到達可能
+        // （本文は `data.committed`・`data.operation_id` 付き。`error_body::encode_partitioned`）。
         | ErrorClass::PartialCompletion
         | ErrorClass::PartitionedDmlCancelled => 409,
         ErrorClass::PayloadTooLarge => 413,

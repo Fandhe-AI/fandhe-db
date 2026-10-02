@@ -287,6 +287,7 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
   実行せずに内容を見るには `EXPLAIN UPDATE|DELETE ... PARTITIONED` を使います。
   照会・取り消しは自テナントのジョブだけを対象にし、該当なし・他テナント・存在しないテーブルは
   同じ応答（`status`・`rows` の 2 列で 0 行）になります。
+- NoSQL（HTTP）表層では、述語形 `update`／`delete` に `"mode": "partitioned"`（任意で `"chunk"`）を付けると同じ実行器・同じ内容照合ハッシュで実行され（SQL との間でも再送で再開できます）、進捗照会・取り消しは `show_partitioned_dml`／`cancel_partitioned_dml` op を使います。部分完了（`VD001`）・取り消し（`VD002`）は 409 で、本文の `error.data` に `committed`・`operation_id` が入ります（`crates/wire-server/docs/nosql-api.md`）。
 
 `--partitioned-dml-chunk-rows`（既定 1,000）・`--partitioned-dml-scan-budget`（既定 100,000）・
 `--partitioned-dml-max-hold-ms`（既定 1,000）・`--partitioned-dml-max-jobs-per-tenant`（既定 1）・

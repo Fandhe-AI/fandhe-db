@@ -3094,6 +3094,16 @@ const PHASE7_WRITE_CASES: &[Phase7WriteCase] = &[
         json_body: r#"{"op":"scan","table":"widgets","limit":1}"#,
         expect: Phase7CaseExpectation::RejectionOnly,
     },
+    // 分割実行 DML の進捗照会・取り消し（Issue #1130・NOSQL-12）。原子的な `delete`
+    // （`op-del-1`）は分割実行ジョブを作らないため、いずれも 200・0 行（該当なし）。
+    Phase7WriteCase {
+        json_body: r#"{"op":"show_partitioned_dml","table":"widgets","operation_id":"op-del-1"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
+    Phase7WriteCase {
+        json_body: r#"{"op":"cancel_partitioned_dml","table":"widgets","operation_id":"op-del-1"}"#,
+        expect: Phase7CaseExpectation::Success,
+    },
 ];
 
 fn run_phase7_write_parity_scenario(client: HttpClient) {
@@ -3330,6 +3340,16 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
         nosql_rows, sql_rows,
         "read-back after predicate delete must match between SQL and NoSQL surfaces"
     );
+
+    for case in &PHASE7_WRITE_CASES[8..=9] {
+        let (status, body) = query(&alice_token, case.json_body, &mut seq);
+        assert_eq!(status, 200, "NoSQL partitioned DML control op: {body}");
+        let obj = json_object(&body);
+        assert!(
+            matches!(obj.get("rows"), Some(JsonValue::Array(rows)) if rows.is_empty()),
+            "no partitioned job exists, rows must be empty: {body}"
+        );
+    }
 
     let (status, body) = query(&alice_token, PHASE7_WRITE_CASES[1].json_body, &mut seq);
     assert_eq!(status, 200, "NoSQL drop_table: {body}");

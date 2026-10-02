@@ -77,6 +77,10 @@
 //! （`EngineCore::execute_parsed_in_session`）へトークン列として到達させる
 //! （`gate.rs` の `Op::CreateTable`／`Op::AlterTable`／`Op::DropTable` アーム
 //! から呼ばれる）。
+//! [`partitioned`] は分割実行 DML の語彙（Issue #1130・NOSQL-12・RECOVER-11）を
+//! 担い、`update`／`delete` の `mode`／`chunk` 修飾の解析、`show_partitioned_dml`／
+//! `cancel_partitioned_dml` op、部分完了（`VD001`）・取り消し（`VD002`）の 409 本文
+//! （`data.committed`・`data.operation_id`）を提供する。
 
 pub mod aggregate;
 pub mod base64_std;
@@ -89,6 +93,7 @@ pub mod gate;
 pub mod ident;
 pub mod insert;
 pub mod op;
+pub mod partitioned;
 pub mod response;
 pub mod scan;
 pub mod schema;

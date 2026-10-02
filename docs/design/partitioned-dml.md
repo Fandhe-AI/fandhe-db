@@ -376,10 +376,26 @@ UPDATE／DELETE を kill するシナリオはない（F14）。
 - 実行器・上限・部分完了の意味論・内容照合ハッシュのドメインは SQL 表層と同じ（同じ
   `operation_id` で SQL と NoSQL を跨いで再送すると、内容が同じなら再開・`23505`、違えば
   `22023`）。
-- 述語は既存の述語形 DML の `filter` と同じく `eq`／`prefix` のみ（F13）。
+- 述語は既存の述語形 DML の `filter` と同じ語彙にする（起草時点の F13 は `eq`／`prefix` のみだったが、その後 #1197 で述語形 DML の `filter` が広がったため、それに追従する。下記「確定（Issue #1130）」）。
 - HTTP 射影は 5.2 節の H1。長時間の HTTP 要求はクライアント・中継のタイムアウトに当たりうるが、
   再送で再開できる（5.3 節）ことを利用者向けの文書に書く。
 - NoSQL 表層にはトランザクションがない（`explicit-transaction.md`）ため、3.3 節の拒否は該当しない。
+
+**確定（Issue #1130）**:
+
+- `update`／`delete` の任意キー `"mode"`（`"partitioned"` のみ受理。それ以外の値は `42601`）と
+  `"chunk"`（`mode` 指定時のみ有効。値は SQL の `CHUNK n` と同じ規則: `0`・小数・`usize` 超過は
+  `22000`、負数は `42601`、サーバー幅超過は `22000`）。`where`（単一行形）との組合せは `42601`。
+  `explain` は引き続き未知キーとして `42601`。
+- 進捗照会・取り消しの op 名は `show_partitioned_dml`／`cancel_partitioned_dml`。要求は `table`・
+  `operation_id` だけを持ち、応答は SQL 表層と同じ結果セット形（`status`・`rows` の 2 列）。
+- 述語の語彙は、既存の述語形 DML の `filter` の語彙をそのまま再利用する（`bind_filter_where_predicates`
+  を変更しない）。分割実行専用の追加制限は設けない。**オーナーが覆せる判断**として PR 本文に明記する。
+- 共有の仕組み: SQL 経路と NoSQL 経路が、束縛以降の同じ private 関数（`run_partitioned_update`／
+  `run_partitioned_delete`）を呼ぶ。内容照合ハッシュ・実行器・上限・失敗写像が構造的に同一になる。
+- 部分完了（`VD001`）・取り消し（`VD002`）は HTTP 409。本文は通常のキー集合に `data` を追加し、
+  `data` は `committed`（自テナントで commit 済みの件数）と `operation_id`（クライアントが指定した値）
+  だけを持つ。
 
 ## 11. 採用案のまとめ
 

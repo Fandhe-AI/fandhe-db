@@ -25,6 +25,12 @@
 //! SET 対象の禁止列（`id`／`tenant_id`／`visibility`）・重複列・未知列・
 //! 型不一致の検査を担い、いずれも第 2 の実行器は作らない。
 //!
+//! 分割実行修飾（`mode: "partitioned"`・`chunk`。Issue #1130・NOSQL-12・RECOVER-11）は
+//! `bind_target_form` の後で [`super::partitioned::parse_modifier`] が解析し、述語形
+//! （`filter`）のときだけ `EngineCore::execute_bound_partitioned_update_in_session` へ委譲する
+//! （SQL 表層の `... PARTITIONED` と同一の共通本体。`where` との併用は `42601`）。
+//! `VD001`／`VD002` は [`handle`] が 409 と `data` 付き本文へ写像する。
+//!
 //! テナントは `principal`（唯一の入口）からのみ導出する（`security.md` P0）。
 //!
 //! `set` の JSON → `InsertLiteral` 写像は **配列形のみ**を `VECTOR` 列の値と
@@ -88,6 +94,7 @@ use crate::http::session::middleware::SessionPrincipal;
 use super::dml_target::{bind_target_form, DmlTargetError, TargetForm};
 use super::filter;
 use super::ident::{self, InvalidIdentifier};
+use super::partitioned::{self, PartitionedRequestError};
 use super::schema::{SchemaError, Validated};
 use super::typed_json::{self, TypedJsonError};
 
@@ -112,6 +119,8 @@ pub enum UpdateError {
     /// `EngineCore::execute_bound_update_in_session`（`operation_id` 必須化・
     /// 台帳照合・テーブル不存在）のエラーをそのまま透過する。
     Engine(SqlSurfaceError),
+    /// 分割実行修飾（`mode`／`chunk`）の解析・検査の失敗（Issue #1130）。
+    Partitioned(PartitionedRequestError),
 }
 
 impl From<SchemaError> for UpdateError {
@@ -132,6 +141,12 @@ impl From<DmlTargetError> for UpdateError {
     }
 }
 
+impl From<PartitionedRequestError> for UpdateError {
+    fn from(err: PartitionedRequestError) -> Self {
+        UpdateError::Partitioned(err)
+    }
+}
+
 impl From<SqlSurfaceError> for UpdateError {
     fn from(err: SqlSurfaceError) -> Self {
         UpdateError::Engine(err)
@@ -147,6 +162,7 @@ impl ClassifiedError for UpdateError {
             UpdateError::EmptySet => ErrorClass::UnsupportedSqlSyntax,
             UpdateError::Set(err) => err.error_class(),
             UpdateError::Engine(err) => err.error_class(),
+            UpdateError::Partitioned(err) => err.error_class(),
         }
     }
 
@@ -158,6 +174,7 @@ impl ClassifiedError for UpdateError {
             UpdateError::EmptySet => "SET clause must specify at least one column".to_string(),
             UpdateError::Set(err) => err.client_message(),
             UpdateError::Engine(err) => err.client_message(),
+            UpdateError::Partitioned(err) => err.client_message(),
         }
     }
 }
@@ -241,11 +258,12 @@ fn map_set_assignments_for_engine(
         // `bind_target_form`／`Shape`／`InvalidIdentifier` はこの
         // closure より前に確定済みのため到達不能だが、fail-closed の
         // まま網羅する。
-        UpdateError::Shape(_) | UpdateError::InvalidIdentifier | UpdateError::Target(_) => {
-            SqlSurfaceError::Internal {
-                detail: "unexpected error during UPDATE SET binding".to_string(),
-            }
-        }
+        UpdateError::Shape(_)
+        | UpdateError::InvalidIdentifier
+        | UpdateError::Target(_)
+        | UpdateError::Partitioned(_) => SqlSurfaceError::Internal {
+            detail: "unexpected error during UPDATE SET binding".to_string(),
+        },
     })
 }
 
@@ -262,6 +280,9 @@ pub fn execute(
     ident::check_identifier(table)?;
 
     let target = bind_target_form(validated)?;
+    // 分割実行修飾（Issue #1130）。述語形（`filter`）だけが受理する。
+    let modifier = partitioned::parse_modifier(validated)?;
+    partitioned::check_target_form(modifier, &target)?;
 
     let set = validated
         .required_object("set")
@@ -306,17 +327,31 @@ pub fn execute(
         // （台帳照合・影響行数上限・RLS 適用）は
         // `EngineCore::execute_bound_predicate_update_in_session` に一任し、
         // 第 2 の実行器は作らない。
-        TargetForm::Predicate(items) => core.execute_bound_predicate_update_in_session(
-            principal.policy_context(),
-            table,
-            Some(&operation_id),
-            |schema| {
+        TargetForm::Predicate(items) => {
+            let bind = |schema: &TableSchema| {
                 let assignments = map_set_assignments_for_engine(set, schema)?;
                 let predicates = filter::bind_filter_where_predicates(items, schema)
                     .map_err(filter::FilterError::into_sql_surface_error)?;
                 Ok((assignments, predicates))
-            },
-        )?,
+            };
+            match modifier {
+                // 分割実行（Issue #1130）: SQL 表層 `UPDATE ... PARTITIONED` と同一の
+                // 共通本体（内容照合ハッシュ・実行器・上限）へ到達する。
+                Some(m) => core.execute_bound_partitioned_update_in_session(
+                    principal.policy_context(),
+                    table,
+                    Some(&operation_id),
+                    m.chunk_rows,
+                    bind,
+                )?,
+                None => core.execute_bound_predicate_update_in_session(
+                    principal.policy_context(),
+                    table,
+                    Some(&operation_id),
+                    bind,
+                )?,
+            }
+        }
     };
 
     Ok(UpdateSuccess {
@@ -335,6 +370,10 @@ pub fn handle(
 ) -> Vec<u8> {
     match execute(core, principal, validated) {
         Ok(success) => http_response::encode_ok(&encode_success_body(&success), now_wall),
+        // `VD001`／`VD002` は 409 と `data` 付きの本文（Issue #1130）。
+        Err(UpdateError::Engine(err)) => {
+            partitioned::encode_engine_error(&err, validated, now_wall)
+        }
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
     }
 }
