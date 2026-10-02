@@ -494,7 +494,8 @@ pub(crate) enum ChunkCommitOutcome {
 ///
 /// - 記録なしで `rows_changed == 0`: 何も書かない（ジョブ記録は最初に行を変更した
 ///   チャンクの commit と同時に作る）。
-/// - 記録なしで `rows_changed > 0`: 索引を数え、`interrupted_limit` 件に達していれば
+/// - 記録なしで `rows_changed > 0`: 同じ `operation_id` の台帳エントリが既にあれば
+///   [`PartitionedJobError::LedgerConflict`]（commit 前に拒否）。なければ索引を数え、`interrupted_limit` 件に達していれば
 ///   [`PartitionedJobError::InterruptedRecordLimitReached`]（上限は作成と同じ txn 内で
 ///   再判定する）。達していなければ `Running` を作り索引を追加する。
 /// - `Running` あり: カーソルと件数を更新する。書き込み直前の再読込でハッシュ不一致、
@@ -517,6 +518,13 @@ pub(crate) fn record_chunk_progress_in_txn(
         None => {
             if rows_changed == 0 {
                 return Ok(ChunkCommitOutcome::NoRecord);
+            }
+            // 通常 DML が同じ operation_id を既に確定済みなら、行変更を commit する前に
+            // 拒否する（完了時の台帳衝突で初めて気づくと二重適用になる。fail-closed）。
+            if ledger_entry_exists_in_txn(txn, key)? {
+                return Err(PartitionedJobError::LedgerConflict(
+                    LedgerRecordError::ContentMismatch,
+                ));
             }
             let existing = count_interrupted_in_txn(txn, key.tenant, key.table, interrupted_limit)?;
             if existing >= interrupted_limit {
@@ -650,12 +658,31 @@ fn remove_active_index(
     key: &JobKey<'_>,
 ) -> Result<(), PartitionedJobError> {
     let mut active = txn.open_table(PARTITIONED_JOB_ACTIVE_TABLE)?;
-    if active.remove(key.tuple())?.is_none() {
+    let removed_ok = match active.remove(key.tuple())? {
+        None => {
+            return Err(PartitionedJobError::corrupt(
+                "partitioned job active index entry is missing",
+            ))
+        }
+        Some(g) => g.value() == ACTIVE_INDEX_VALUE.as_slice(),
+    };
+    if !removed_ok {
+        // 不明な索引バージョンは破損として扱い、呼び出し元は commit しない。
         return Err(PartitionedJobError::corrupt(
-            "partitioned job active index entry is missing",
+            "partitioned job active index entry has unknown version",
         ));
     }
     Ok(())
+}
+
+/// 同じ `(tenant, table, operation_id)` の台帳エントリが write txn 内に存在するか。
+fn ledger_entry_exists_in_txn(
+    txn: &redb::WriteTransaction,
+    key: &JobKey<'_>,
+) -> Result<bool, PartitionedJobError> {
+    let ledger = txn.open_table(crate::recovery::ledger::OP_LEDGER_TABLE)?;
+    let found = ledger.get(key.tuple())?.is_some();
+    Ok(found)
 }
 
 /// `DROP TABLE`（[`crate::catalog::Storage::drop_table`]）と同一 write txn で、対象
@@ -1301,6 +1328,45 @@ mod tests {
             record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 5, 100),
             Err(PartitionedJobError::Corrupted(_))
         ));
+    }
+
+    #[test]
+    fn first_chunk_is_rejected_when_ledger_entry_exists() {
+        let (db, _g) = open_db("pj-ledger-first");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        let wt = db.begin_write().expect("w");
+        ledger::record_partitioned_completion_in_txn(&wt, "t1", "docs", &id, &hash("h"))
+            .expect("ledger");
+        wt.commit().expect("c");
+        let wt = db.begin_write().expect("w");
+        assert!(matches!(
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100),
+            Err(PartitionedJobError::LedgerConflict(_))
+        ));
+        assert!(lookup_in_write_txn(&wt, &k).expect("l").is_none());
+    }
+
+    #[test]
+    fn complete_and_cancel_fail_closed_on_unknown_active_index_version() {
+        let (db, _g) = open_db("pj-index-version");
+        let id = op("op-1");
+        let k = key("t1", "docs", &id);
+        for cancel in [false, true] {
+            let wt = db.begin_write().expect("w");
+            record_chunk_progress_in_txn(&wt, &k, &hash("h"), 1, 1, 100).expect("p");
+            {
+                let mut a = wt.open_table(PARTITIONED_JOB_ACTIVE_TABLE).expect("a");
+                a.insert(k.tuple(), [9u8].as_slice()).expect("i");
+            }
+            let r = if cancel {
+                cancel_in_txn(&wt, &k).map(|_| ())
+            } else {
+                complete_in_txn(&wt, &k, &hash("h"), 1).map(|_| ())
+            };
+            assert!(matches!(r, Err(PartitionedJobError::Corrupted(_))));
+            drop(wt);
+        }
     }
 
     #[test]
