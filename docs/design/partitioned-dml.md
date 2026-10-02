@@ -361,6 +361,9 @@ UPDATE／DELETE を kill するシナリオはない（F14）。
   4. **台帳**: 完了前は台帳エントリがなく、完了後はちょうど 1 エントリある。
 - 新しい `crash_tool` と `scripts/crash_test_*.sh`・Makefile ターゲットを追加する形が候補だが、
   `make ci` に入れるかは実行時間を見て #1131 で決める。
+- **#1131 の結論**: `crash_tool_partitioned_dml`・`scripts/crash_test_partitioned_dml.sh`・Makefile ターゲット
+  `crash-test-partitioned-dml` を追加した。全体で 1 秒前後（既定 2 セット）と短いため `make ci` と ci.yml の
+  独立ジョブに入れた。既存の crash-test 系は変更していない。
 
 ## 10. 論点 8: NoSQL 表層とのパリティ
 
