@@ -404,3 +404,5 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **応答**: 完了は原子実行と同じ本文。`VD001`／`VD002` は 409 で、`error.data` に `committed`・`operation_id`（要求の値）だけを載せる（`error_body::encode_partitioned`・`response::encode_error_partitioned`）。
 - **テスト**: `crates/engine/tests/partitioned_dml_bound_session.rs`、`crates/wire-server/tests/nosql12_partitioned_dml.rs`（成功・拒否・部分完了・取り消し・表層横断の再開と再送・RLS-9 のバイト一致・語彙）、`partitioned.rs`・`error_body.rs` の単体テスト、`err4_http_projection`・`nosql1_op_vocabulary`・`nosql9_op_allowlist` の更新。
 - **対象外（申し送り）**: NoSQL の `explain` による分割実行の説明、HTTP 切断でジョブを止める仕組み（再送で再開する運用を文書化）、中断・crash・並行書き込みの総合検証（#1131）、pg wire の CancelRequest・`statement_timeout`、spec リポ側の NOSQL-12・ERR-4 等への追記。
+
+**Issue #1320（docs(design): 関係演算 p95 ベンチの専有環境での再測定手順をまとめる。SQL-24・SQL-25・SQL-28・SQL-2 ポインタ。詳細は `docs/design/relational-p95-bench.md`「専有環境での再測定」）**: docs のみ。環境の条件と事前確認（Linux／macOS）・本規模での実行・段別内訳の抽出・閾値行と判定区分（pass／fail／要再測定）の読み方・任意の perf 手順・記録の雛形を追加した。縮小規模（2 万行）・共有環境で 3 グループが完走し、抽出コマンドで期待行が取れることを確認した。コード変更・依存追加なし。**対象外**: 本規模・専有環境での実測と確定判定（オーナー作業）、改善案 B／C の優先度確定、macOS 経路・perf 手順の実機確認。
