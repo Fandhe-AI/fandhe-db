@@ -2197,7 +2197,7 @@ mod tests {
     use super::*;
 
     /// Issue #1188: 式形の `HAVING`／`ORDER BY` が参照する `Cell::Integer(u64)` は、`WHERE`・
-    /// 投影の式の `id` と同じ `2^53` 境界で扱う（`i64` 範囲外を含め超過は `22000`）。
+    /// 投影の式の `id` と同じ `2^53` 境界で扱う（`i64` 範囲外を含め超過は `22003`）。
     #[test]
     fn group_row_integer_cell_uses_exact_f64_boundary() {
         let exact = 1u64 << 53;
@@ -2207,7 +2207,7 @@ mod tests {
         ));
         for v in [exact + 1, i64::MAX as u64 + 1, u64::MAX] {
             let err = cell_to_scalar_ref(&Cell::Integer(v)).expect_err("must be rejected");
-            assert_eq!(err.wire_code(), "22000", "v={v}");
+            assert_eq!(err.wire_code(), "22003", "v={v}");
         }
     }
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};

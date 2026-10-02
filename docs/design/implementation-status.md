@@ -406,3 +406,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **対象外（申し送り）**: NoSQL の `explain` による分割実行の説明、HTTP 切断でジョブを止める仕組み（再送で再開する運用を文書化）、中断・crash・並行書き込みの総合検証（#1131）、pg wire の CancelRequest・`statement_timeout`、spec リポ側の NOSQL-12・ERR-4 等への追記。
 
 **Issue #1320（docs(design): 関係演算 p95 ベンチの専有環境での再測定手順をまとめる。SQL-24・SQL-25・SQL-28・SQL-2 ポインタ。詳細は `docs/design/relational-p95-bench.md`「専有環境での再測定」）**: docs のみ。環境の条件と事前確認（Linux／macOS）・本規模での実行・段別内訳の抽出・閾値行と判定区分（pass／fail／要再測定）の読み方・任意の perf 手順・記録の雛形を追加した。縮小規模（2 万行）・共有環境で 3 グループが完走し、抽出コマンドで期待行が取れることを確認した。コード変更・依存追加なし。**対象外**: 本規模・専有環境での実測と確定判定（オーナー作業）、改善案 B／C の優先度確定、macOS 経路・perf 手順の実機確認。
+
+**Issue #1336（fix(engine): f64 で正確に表せない BIGINT 値の拒否を 22003 に揃える。TABLE-16・ERR-2・ERR-4 ポインタ。#1215 の延長）**: 式評価で `|v| > 2^53` の整数を拒否するときの分類を `22000` から `22003`（`NumericOutOfRange`）へ是正した。拒否する判定境界は不変で、丸めて受け入れる経路は作っていない。
+
+- **変更箇所**: `sql::udf_call` の `parse_number_literal`（桁あふれ・`2^53` 超・小数／指数表記の整数値）・`id_as_finite_scalar`・`numeric_scalar_from_ref` の `BigInt` 腕。CHECK 評価・WHERE 式・投影式・HAVING・`expr_program` が共有するため全経路が追随する。HTTP 射影は既存の `NumericOutOfRange` → 400 がそのまま効く。
+- **変えないもの**: `bind_integer_literal`（INSERT／UPDATE の値束縛。`i64` 範囲外のみ `22003`）、`ADD COLUMN DEFAULT` の束縛、索引の縮退、集計・一意制約。CHECK も式も無い BIGINT 列は `i64` 全域を受理する。
+- **既知の挙動変化**: 上記の拒否の `wire_code` が `22000` から `22003` に変わる（HTTP は 400 のまま `code` のみ変化）。
+- **テスト**: `crates/engine/tests/bigint_f64_exact_range.rs`（境界値 ±2^53・±(2^53+1)・`i64` 両端。CHECK INSERT／UPDATE・ADD COLUMN DEFAULT の後段評価・WHERE・RLS 非漏えい）、`crates/wire-server/tests/nosql_bigint_f64_exact_range.rs`（NoSQL insert／update の 400 と `22003`）、`udf_call`・`check_constraint`・`group_by` の単体の期待値更新。
+- **対象外（申し送り）**: `parse_number_literal` の非有限リテラル（`numeric literal is not finite`）の `22000`、NoSQL DDL からの CHECK 宣言、NoSQL フィルタでの INTEGER／BIGINT 比較。

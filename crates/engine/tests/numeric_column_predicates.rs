@@ -297,7 +297,7 @@ fn numeric_and_text_range_predicates_never_match_other_tenants() {
 }
 
 #[test]
-fn bigint_beyond_exact_f64_range_fails_closed_with_22000() {
+fn bigint_beyond_exact_f64_range_fails_closed_with_22003() {
     let big = (1i64 << 53) + 1;
     let (core, path) = seed(&[(1, "alpha", Some(1), Some(big), None, None)], &[]);
     let _guard = CleanupGuard(path);
@@ -307,7 +307,7 @@ fn bigint_beyond_exact_f64_range_fails_closed_with_22000() {
             &format!("SELECT id FROM {TABLE} WHERE total > 0 LIMIT 10"),
         )
         .expect_err("inexact BIGINT must fail closed");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "22003");
 
     // 境界ちょうど（2^53）は受理される。
     let (core, path2) = seed(&[(1, "alpha", Some(1), Some(1i64 << 53), None, None)], &[]);
