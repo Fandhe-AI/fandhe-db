@@ -112,6 +112,35 @@ pub fn encode_may_be_committed(class: ErrorClass, message: &str) -> String {
     encode_inner(class, message, true)
 }
 
+/// 分割実行 DML の部分完了（`VD001`）・取り消し（`VD002`）の応答本文（Issue #1130・
+/// NOSQL-12・ERR-4・RECOVER-11）。[`encode`] と同じ 3 フィールドの直後に
+/// `"data":{"committed":<n>,"operation_id":"<escaped>"}` を追加する。
+///
+/// `data` に載せるのは自テナントで commit 済みの件数とクライアント自身が指定した
+/// `operation_id` だけ（呼び出し元の契約。他テナント情報・テーブル名・内側のメッセージは
+/// 載せない）。通常 API・緊急応答 API とは構造的に分離し、誤って他の経路へ `data` が
+/// 混入しないようにする（`wire-server::http::query::partitioned` の 2 variant のみが呼ぶ）。
+pub fn encode_partitioned(
+    class: ErrorClass,
+    message: &str,
+    committed: u64,
+    operation_id: &str,
+) -> String {
+    let mut out = String::with_capacity(message.len() + operation_id.len() + 128);
+    out.push_str("{\"error\":{\"wire_code\":\"");
+    escape_json_string_into(&mut out, class.wire_code());
+    out.push_str("\",\"code\":\"");
+    escape_json_string_into(&mut out, class.label());
+    out.push_str("\",\"message\":\"");
+    escape_json_string_into(&mut out, message);
+    out.push_str("\",\"data\":{\"committed\":");
+    let _ = write!(out, "{committed}");
+    out.push_str(",\"operation_id\":\"");
+    escape_json_string_into(&mut out, operation_id);
+    out.push_str("\"}}}");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +341,22 @@ mod tests {
         let body = encode(ErrorClass::InvalidInput, "");
         let obj = error_object(&body);
         assert_eq!(as_str(&obj["message"]), "");
+    }
+
+    /// Issue #1130: 分割実行本文の golden 文字列（キー順固定）とエスケープ。
+    #[test]
+    fn partitioned_body_golden_and_escaping() {
+        let body = encode_partitioned(ErrorClass::PartialCompletion, "m", 3, "op-1");
+        assert_eq!(
+            body,
+            "{\"error\":{\"wire_code\":\"VD001\",\"code\":\"PARTIAL_COMPLETION\",\"message\":\"m\",\"data\":{\"committed\":3,\"operation_id\":\"op-1\"}}}"
+        );
+        let body = encode_partitioned(ErrorClass::PartitionedDmlCancelled, "m", 0, "a\"b\\c\u{1}");
+        let obj = error_object(&body);
+        let JsonValue::Object(data) = &obj["data"] else {
+            panic!("data must be an object");
+        };
+        assert_eq!(as_str(&data["operation_id"]), "a\"b\\c\u{1}");
+        assert_eq!(as_str(&obj["wire_code"]), "VD002");
     }
 }

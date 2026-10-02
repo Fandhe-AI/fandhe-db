@@ -199,6 +199,30 @@ pub fn encode_error_may_be_committed(class: ErrorClass, message: &str, now: Syst
     })
 }
 
+/// 分割実行 DML の部分完了（`VD001`）・取り消し（`VD002`）の応答（Issue #1130・
+/// NOSQL-12・ERR-4）: [`http_status`]（いずれも 409）＋
+/// [`error_body::encode_partitioned`] の本文（`data.committed`・`data.operation_id` 付き）。
+/// 呼び出しは `SqlSurfaceError::PartialCompletion`／`PartitionedDmlCancelled` の 2 variant に
+/// 限る（`wire-server::http::query::partitioned`）。縮退時は [`encode_error`] と同一。
+pub fn encode_error_partitioned(
+    class: ErrorClass,
+    message: &str,
+    committed: u64,
+    operation_id: &str,
+    now: SystemTime,
+) -> Vec<u8> {
+    let status = http_status(class);
+    let body = error_body::encode_partitioned(class, message, committed, operation_id);
+    encode(status, &body, now).unwrap_or_else(|ResponseEncodeError| {
+        encode_known(
+            500,
+            "Internal Server Error",
+            &error_body::encode(ErrorClass::InternalError, "internal error"),
+            now,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

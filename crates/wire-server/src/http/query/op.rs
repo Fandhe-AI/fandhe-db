@@ -6,9 +6,12 @@
 //! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9・NOSQL-12・
 //! NOSQL-13）。
 //!
+//! 分割実行 DML の `show_partitioned_dml`／`cancel_partitioned_dml` は Issue #1130
+//! （NOSQL-12・RECOVER-11）で語彙へ加わった（実行は [`super::partitioned`]）。
+//!
 //! 責務境界: [`super::schema::extract_op`] が取り出した `op` 文字列を、
 //! [`Op::parse`] により **完全一致（大文字小文字・trim の読み替えなし）**
-//! でこの 9 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
+//! でこの 11 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
 //! トランザクション制御・`create_index`／`drop_index`／`create_view`／
 //! `drop_view`（NOSQL-13 の対象外）・表記揺れをすべて含む）は
 //! [`UnsupportedOp`] として `ErrorClass::FeatureNotSupported`（`0A000`）へ
@@ -40,7 +43,7 @@ use super::schema::ObjectSchema;
 
 /// `POST /v1/query` の `op` が取りうる閉じた語彙。
 ///
-/// この 9 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
+/// この 11 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Search,
@@ -57,12 +60,16 @@ pub enum Op {
     AlterTable,
     /// `DROP TABLE`（NOSQL-13・TASK-207、Issue #910）。
     DropTable,
+    /// `SHOW PARTITIONED DML` 相当の進捗照会（NOSQL-12・RECOVER-11、Issue #1130）。
+    ShowPartitionedDml,
+    /// `CANCEL PARTITIONED DML` 相当の取り消し（NOSQL-12・RECOVER-11、Issue #1130）。
+    CancelPartitionedDml,
 }
 
 impl Op {
     /// 全 variant（宣言順）。[`super::schema::OP_SCHEMAS`] と名前列が
     /// 順序込みで一致することをテストで固定する。
-    pub const ALL: [Op; 9] = [
+    pub const ALL: [Op; 11] = [
         Op::Search,
         Op::Scan,
         Op::Aggregate,
@@ -72,6 +79,8 @@ impl Op {
         Op::CreateTable,
         Op::AlterTable,
         Op::DropTable,
+        Op::ShowPartitionedDml,
+        Op::CancelPartitionedDml,
     ];
 
     /// `raw` を語彙へ分類する。完全一致のみ（大文字小文字の読み替え・
@@ -87,6 +96,8 @@ impl Op {
             "create_table" => Some(Op::CreateTable),
             "alter_table" => Some(Op::AlterTable),
             "drop_table" => Some(Op::DropTable),
+            "show_partitioned_dml" => Some(Op::ShowPartitionedDml),
+            "cancel_partitioned_dml" => Some(Op::CancelPartitionedDml),
             _ => None,
         }
     }
@@ -103,6 +114,8 @@ impl Op {
             Op::CreateTable => "create_table",
             Op::AlterTable => "alter_table",
             Op::DropTable => "drop_table",
+            Op::ShowPartitionedDml => "show_partitioned_dml",
+            Op::CancelPartitionedDml => "cancel_partitioned_dml",
         }
     }
 
@@ -119,6 +132,8 @@ impl Op {
             Op::CreateTable => &super::schema::CREATE_TABLE_SCHEMA,
             Op::AlterTable => &super::schema::ALTER_TABLE_SCHEMA,
             Op::DropTable => &super::schema::DROP_TABLE_SCHEMA,
+            Op::ShowPartitionedDml => &super::schema::SHOW_PARTITIONED_DML_SCHEMA,
+            Op::CancelPartitionedDml => &super::schema::CANCEL_PARTITIONED_DML_SCHEMA,
         }
     }
 }
@@ -160,7 +175,7 @@ mod tests {
     use crate::http::query::schema::OP_SCHEMAS;
 
     #[test]
-    fn parse_accepts_exact_nine_values() {
+    fn parse_accepts_exact_eleven_values() {
         assert_eq!(Op::parse("search"), Some(Op::Search));
         assert_eq!(Op::parse("scan"), Some(Op::Scan));
         assert_eq!(Op::parse("aggregate"), Some(Op::Aggregate));
@@ -170,10 +185,18 @@ mod tests {
         assert_eq!(Op::parse("create_table"), Some(Op::CreateTable));
         assert_eq!(Op::parse("alter_table"), Some(Op::AlterTable));
         assert_eq!(Op::parse("drop_table"), Some(Op::DropTable));
+        assert_eq!(
+            Op::parse("show_partitioned_dml"),
+            Some(Op::ShowPartitionedDml)
+        );
+        assert_eq!(
+            Op::parse("cancel_partitioned_dml"),
+            Some(Op::CancelPartitionedDml)
+        );
     }
 
     #[test]
-    fn parse_rejects_vocabulary_outside_nine_values() {
+    fn parse_rejects_vocabulary_outside_eleven_values() {
         let negatives = [
             "",
             " search",
@@ -187,6 +210,10 @@ mod tests {
             "create_table ",
             "ALTER_TABLE",
             "DROP_TABLE",
+            "SHOW_PARTITIONED_DML",
+            " show_partitioned_dml",
+            "cancel_partitioned_dml ",
+            "Cancel_Partitioned_Dml",
             "create_index",
             "drop_index",
             "create_view",
