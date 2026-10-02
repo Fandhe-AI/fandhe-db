@@ -26,7 +26,7 @@
 //! `main.rs` の引数走査ループは他の閉じた語彙フラグ（`--search-engine` 等）と
 //! 同じ理由で 2 回目以降の指定を fail-closed に拒否する（last-wins にしない）。
 
-use engine::sql::parser::DmlLimits;
+use engine::sql::parser::{DmlLimits, PartitionedDmlLimits};
 use std::num::NonZeroUsize;
 
 /// 述語形 UPDATE／DELETE の 1 文あたり影響行数上限を設定する CLI フラグ名。
@@ -63,6 +63,61 @@ pub fn resolve_batch_limits(
         max_files_per_batch,
         ..base
     })
+}
+
+/// 分割実行 DML のチャンク幅（1 チャンクの適用行数）を設定する CLI フラグ名
+/// （Issue #1128。ADR `docs/design/partitioned-dml.md` §15.2。フラグ名は仮称で、
+/// #1129 が確定する）。
+pub const PARTITIONED_CHUNK_ROWS_FLAG: &str = "--partitioned-dml-chunk-rows";
+
+/// 分割実行 DML のチャンクごとの走査予算（行数）を設定する CLI フラグ名。
+pub const PARTITIONED_SCAN_BUDGET_FLAG: &str = "--partitioned-dml-scan-budget";
+
+/// 分割実行 DML の 1 チャンクの writer 保持時間上限（ミリ秒）を設定する CLI フラグ名。
+pub const PARTITIONED_MAX_HOLD_MS_FLAG: &str = "--partitioned-dml-max-hold-ms";
+
+/// 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間）を解決する
+/// （Issue #1128）。`base` は既定値（[`PartitionedDmlLimits::default`]）で、`Some`
+/// のフラグだけを上書きする。範囲は engine 側の単一情報源
+/// （`validate_partitioned_*`）に委ね、最後に [`PartitionedDmlLimits::validate`]
+/// （起動時検証の唯一の入口。#1129 が組合せ制約を足す）を通す。不正値は `Err`
+/// （fail-closed。既定へ黙って読み替えない）。
+pub fn resolve_partitioned_dml_limits(
+    base: PartitionedDmlLimits,
+    chunk_rows_raw: Option<&str>,
+    scan_budget_raw: Option<&str>,
+    max_hold_ms_raw: Option<&str>,
+) -> Result<PartitionedDmlLimits, String> {
+    let mut limits = base;
+    if let Some(raw) = chunk_rows_raw {
+        let value = parse_strict_decimal(raw).ok_or_else(|| {
+            format!("{PARTITIONED_CHUNK_ROWS_FLAG} expects a non-negative integer, got {raw:?}")
+        })?;
+        limits.chunk_rows = engine::sql::parser::validate_partitioned_chunk_rows(value)
+            .map_err(|e| format!("{PARTITIONED_CHUNK_ROWS_FLAG}: {e}"))?;
+    }
+    if let Some(raw) = scan_budget_raw {
+        let value = parse_strict_decimal(raw).ok_or_else(|| {
+            format!("{PARTITIONED_SCAN_BUDGET_FLAG} expects a non-negative integer, got {raw:?}")
+        })?;
+        limits.scan_budget_rows = engine::sql::parser::validate_partitioned_scan_budget(value)
+            .map_err(|e| format!("{PARTITIONED_SCAN_BUDGET_FLAG}: {e}"))?;
+    }
+    if let Some(raw) = max_hold_ms_raw {
+        let value = parse_strict_decimal(raw)
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| {
+                format!(
+                    "{PARTITIONED_MAX_HOLD_MS_FLAG} expects a non-negative integer, got {raw:?}"
+                )
+            })?;
+        limits.max_writer_hold = engine::sql::parser::validate_partitioned_max_hold_ms(value)
+            .map_err(|e| format!("{PARTITIONED_MAX_HOLD_MS_FLAG}: {e}"))?;
+    }
+    limits
+        .validate()
+        .map_err(|e| format!("partitioned DML limits: {e}"))?;
+    Ok(limits)
 }
 
 /// ASCII 数字のみからなる非空文字列を厳密パースする（`search_engine_opt::
@@ -161,6 +216,68 @@ pub fn insert_rows_cap_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitioned_limits_default_when_unset() {
+        let l = resolve_partitioned_dml_limits(PartitionedDmlLimits::default(), None, None, None)
+            .unwrap();
+        assert_eq!(l, PartitionedDmlLimits::default());
+    }
+
+    #[test]
+    fn partitioned_limits_apply_each_flag() {
+        let l = resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            Some("10"),
+            Some("20"),
+            Some("250"),
+        )
+        .unwrap();
+        assert_eq!(l.chunk_rows.get(), 10);
+        assert_eq!(l.scan_budget_rows.get(), 20);
+        assert_eq!(l.max_writer_hold, std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn partitioned_limits_reject_out_of_range_and_malformed() {
+        let base = PartitionedDmlLimits::default();
+        for (c, s, h, flag) in [
+            (Some("0"), None, None, PARTITIONED_CHUNK_ROWS_FLAG),
+            (Some("1000001"), None, None, PARTITIONED_CHUNK_ROWS_FLAG),
+            (None, Some("0"), None, PARTITIONED_SCAN_BUDGET_FLAG),
+            (None, Some("1000001"), None, PARTITIONED_SCAN_BUDGET_FLAG),
+            (None, None, Some("99"), PARTITIONED_MAX_HOLD_MS_FLAG),
+            (None, None, Some("5001"), PARTITIONED_MAX_HOLD_MS_FLAG),
+            (Some("+5"), None, None, PARTITIONED_CHUNK_ROWS_FLAG),
+            (None, Some(" 5"), None, PARTITIONED_SCAN_BUDGET_FLAG),
+            (None, None, Some("abc"), PARTITIONED_MAX_HOLD_MS_FLAG),
+            (None, None, Some(""), PARTITIONED_MAX_HOLD_MS_FLAG),
+        ] {
+            let err = resolve_partitioned_dml_limits(base, c, s, h).unwrap_err();
+            assert!(err.contains(flag), "flag {flag}: unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn partitioned_limits_accept_boundaries() {
+        let l = resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            Some("1"),
+            Some("1000000"),
+            Some("5000"),
+        )
+        .unwrap();
+        assert_eq!(l.chunk_rows.get(), 1);
+        assert_eq!(l.scan_budget_rows.get(), 1_000_000);
+        assert_eq!(l.max_writer_hold, std::time::Duration::from_millis(5000));
+        assert!(resolve_partitioned_dml_limits(
+            PartitionedDmlLimits::default(),
+            Some("1000000"),
+            None,
+            Some("100")
+        )
+        .is_ok());
+    }
 
     #[test]
     fn resolve_defaults_when_both_unset() {
