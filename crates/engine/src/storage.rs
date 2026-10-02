@@ -661,6 +661,11 @@ pub struct Storage {
     /// 明示トランザクション（SQL-31・TASK-221）と autocommit の間で単一ライタを
     /// 安全に共有する choke point（[`writer_gate`] 参照）。
     writer_gate: std::sync::Arc<writer_gate::WriterGate>,
+    /// 分割実行 DML の実行中ジョブ登録簿（Issue #1127）。1 DB ファイルにつき 1 つの
+    /// プロセス内 choke point という点で [`Self::writer_gate`] と同形。
+    #[allow(dead_code)]
+    // #1128 の実行器が結線するまで [`Self::partitioned_job_registry`] 経由のみ
+    partitioned_jobs: std::sync::Arc<crate::recovery::partitioned_job::JobRegistry>,
     /// 書き込みトランザクション取得（autocommit・明示トランザクション双方）が
     /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
     /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
@@ -689,8 +694,18 @@ impl Storage {
             #[cfg(test)]
             write_txn_creations: std::sync::atomic::AtomicU64::new(0),
             writer_gate: writer_gate::WriterGate::new(),
+            partitioned_jobs: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
         })
+    }
+
+    /// 実行中の分割実行ジョブ登録簿（Issue #1127）。tenant 層・#1128 の実行器が
+    /// `WriteTarget::Autocommit(&Storage)` 経由で届くよう `Storage` に置く。
+    #[allow(dead_code)] // #1128 の実行器・#1129 の照会／取り消しが結線するまで未使用
+    pub(crate) fn partitioned_job_registry(
+        &self,
+    ) -> &std::sync::Arc<crate::recovery::partitioned_job::JobRegistry> {
+        &self.partitioned_jobs
     }
 
     /// 書き込みロック待ちの上限（[`Self::writer_gate`]）を明示指定する（トランザクション
@@ -3023,6 +3038,7 @@ mod tests {
                 durability: WriteDurability::default(),
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
+                partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
@@ -3085,6 +3101,7 @@ mod tests {
                 durability: WriteDurability::default(),
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
+                partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
@@ -3143,6 +3160,7 @@ mod tests {
                 durability: WriteDurability::None,
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
+                partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 
@@ -3181,6 +3199,7 @@ mod tests {
                 durability: WriteDurability::default(),
                 write_txn_creations: std::sync::atomic::AtomicU64::new(0),
                 writer_gate: writer_gate::WriterGate::new(),
+                partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             };
 

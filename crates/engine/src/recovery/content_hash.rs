@@ -117,6 +117,15 @@ enum OpTag {
     /// 単一行 `id` 完全一致形（[`OpTag::Delete`]）とは別ドメインに分離する
     /// （ADR 同上）。[`for_delete_where`] ドキュメント参照。
     DeleteWhere = 10,
+    /// 分割実行（チャンクごとに commit する非原子）版の述語つき `UPDATE ... WHERE`
+    /// 用（Issue #1127。ADR `docs/design/partitioned-dml.md` §6）。原子版
+    /// （[`OpTag::UpdateWhere`]）とは別ドメインに分離し、同じ `operation_id` を
+    /// 原子版と分割版で取り違えた再送を内容不一致（`22023`）として検出する。
+    /// [`for_update_where_partitioned`] ドキュメント参照。
+    UpdateWherePartitioned = 11,
+    /// 分割実行版の述語つき `DELETE ... WHERE` 用（Issue #1127。ADR 同上）。
+    /// [`for_delete_where_partitioned`] ドキュメント参照。
+    DeleteWherePartitioned = 12,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -977,12 +986,57 @@ pub(crate) fn for_update_where(
     // [`push_dml_assignments`] 参照。
     schema: &crate::catalog::TableSchema,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
-    let mut b = HashInputBuilder::new(OpTag::UpdateWhere);
+    update_where_with_tag(
+        OpTag::UpdateWhere,
+        table,
+        assignments,
+        where_predicates,
+        udf_registry,
+        schema,
+    )
+}
+
+/// [`for_update_where`] と [`for_update_where_partitioned`] が共有する本体
+/// （タグのみが異なる。出力レイアウトは従来と同一）。
+fn update_where_with_tag(
+    tag: OpTag,
+    table: &str,
+    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+    schema: &crate::catalog::TableSchema,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    let mut b = HashInputBuilder::new(tag);
     b.push_bytes(table.as_bytes())
         .map_err(|_| dml_hash_field_too_large())?;
     push_dml_assignments(&mut b, assignments, DmlVectorRepr::Canonical, schema)?;
     push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
     Ok(b.finish())
+}
+
+/// 分割実行版述語つき `UPDATE ... WHERE`（Issue #1127。ADR
+/// `docs/design/partitioned-dml.md` §6・RECOVER-11）の内容照合ハッシュ。
+/// [`for_update_where`] と同じ直列化に別タグ（[`OpTag::UpdateWherePartitioned`]）を
+/// 付ける。**チャンク幅を引数に取らない**（再送ごとに幅が変わってもジョブを
+/// 同一視するため、シグネチャでハッシュ入力に入らないことを保証する）。
+/// 新しいドメインで過去の記録が存在しないため legacy 版は持たない。
+/// 呼び出し元は #1128 の分割実行器。
+#[allow(dead_code)] // #1128 の分割実行器が結線するまで未使用
+pub(crate) fn for_update_where_partitioned(
+    table: &str,
+    assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+    schema: &crate::catalog::TableSchema,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    update_where_with_tag(
+        OpTag::UpdateWherePartitioned,
+        table,
+        assignments,
+        where_predicates,
+        udf_registry,
+        schema,
+    )
 }
 
 /// [`for_update_where`] の legacy 版（Issue #1061）。`legacy_hashes`
@@ -1043,11 +1097,40 @@ pub(crate) fn for_delete_where(
     where_predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
-    let mut b = HashInputBuilder::new(OpTag::DeleteWhere);
+    delete_where_with_tag(OpTag::DeleteWhere, table, where_predicates, udf_registry)
+}
+
+/// [`for_delete_where`] と [`for_delete_where_partitioned`] が共有する本体
+/// （タグのみが異なる）。
+fn delete_where_with_tag(
+    tag: OpTag,
+    table: &str,
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    let mut b = HashInputBuilder::new(tag);
     b.push_bytes(table.as_bytes())
         .map_err(|_| dml_hash_field_too_large())?;
     push_dml_where_predicates(&mut b, where_predicates, udf_registry)?;
     Ok(b.finish())
+}
+
+/// 分割実行版述語つき `DELETE ... WHERE`（Issue #1127。ADR
+/// `docs/design/partitioned-dml.md` §6・RECOVER-11）の内容照合ハッシュ。
+/// [`for_delete_where`] と同じ直列化に別タグ（[`OpTag::DeleteWherePartitioned`]）を
+/// 付ける。チャンク幅は入力に含めない（[`for_update_where_partitioned`] 参照）。
+#[allow(dead_code)] // #1128 の分割実行器が結線するまで未使用
+pub(crate) fn for_delete_where_partitioned(
+    table: &str,
+    where_predicates: &[crate::sql::allowlist::WherePredicate],
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+) -> Result<ContentHash, crate::sql::allowlist::SqlSurfaceError> {
+    delete_where_with_tag(
+        OpTag::DeleteWherePartitioned,
+        table,
+        where_predicates,
+        udf_registry,
+    )
 }
 
 /// [`push_dml_assignments`] における `VECTOR` 列 `String` 割当の表現モード
@@ -3420,5 +3503,67 @@ mod tests {
         .expect("push numeric");
         let h4 = b4.finish();
         assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
+    }
+
+    // --- Issue #1127: 分割実行版ハッシュのドメイン分離 -------------------------
+
+    fn partitioned_test_predicates() -> Vec<crate::sql::allowlist::WherePredicate> {
+        vec![crate::sql::allowlist::WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        }]
+    }
+
+    /// 分割実行版は原子版と別ドメイン（タグ 11／12）で、同一入力でも別ハッシュ
+    /// になり、かつ決定的である。原子版の出力は共有本体の導入前後で不変
+    /// （タグ・直列化を手組みした参照ビルダーと一致する）。
+    #[test]
+    fn partitioned_hashes_are_separate_domains_and_atomic_hashes_are_unchanged() {
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let predicates = partitioned_test_predicates();
+        let schema = crate::catalog::TableSchema::new(String::new(), Vec::new());
+        let literal = crate::sql::allowlist::InsertLiteral::String("x".to_string());
+        let assignments = [("title", &literal)];
+
+        let atomic_del = for_delete_where("t", &predicates, &registry).expect("hash");
+        let part_del = for_delete_where_partitioned("t", &predicates, &registry).expect("hash");
+        assert_ne!(atomic_del, part_del);
+        assert_eq!(
+            part_del,
+            for_delete_where_partitioned("t", &predicates, &registry).expect("hash again")
+        );
+
+        let atomic_upd =
+            for_update_where("t", &assignments, &predicates, &registry, &schema).expect("hash");
+        let part_upd =
+            for_update_where_partitioned("t", &assignments, &predicates, &registry, &schema)
+                .expect("hash");
+        assert_ne!(atomic_upd, part_upd);
+        assert_ne!(part_upd, part_del);
+
+        // 原子版は従来レイアウト（タグ 10／9 ＋同一直列化）のまま。
+        let mut expected_del = HashInputBuilder::new(OpTag::DeleteWhere);
+        expected_del.push_bytes(b"t").expect("push");
+        push_dml_where_predicates(&mut expected_del, &predicates, &registry).expect("push");
+        assert_eq!(atomic_del, expected_del.finish());
+
+        let mut expected_upd = HashInputBuilder::new(OpTag::UpdateWhere);
+        expected_upd.push_bytes(b"t").expect("push");
+        push_dml_assignments(
+            &mut expected_upd,
+            &assignments,
+            DmlVectorRepr::Canonical,
+            &schema,
+        )
+        .expect("push");
+        push_dml_where_predicates(&mut expected_upd, &predicates, &registry).expect("push");
+        assert_eq!(atomic_upd, expected_upd.finish());
+
+        // 分割版のレイアウトはタグ以外が原子版と同一（チャンク幅の入力は無い）。
+        let mut expected_part = HashInputBuilder::new(OpTag::DeleteWherePartitioned);
+        expected_part.push_bytes(b"t").expect("push");
+        push_dml_where_predicates(&mut expected_part, &predicates, &registry).expect("push");
+        assert_eq!(part_del, expected_part.finish());
     }
 }

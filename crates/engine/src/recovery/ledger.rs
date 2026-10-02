@@ -276,6 +276,14 @@ pub(crate) fn record_in_txn(
 /// 判定にのみ使い、新規記録・上書きには常に `content_hash`（正準ハッシュ）を使う
 /// （keep-first 契約は変えない。「新方式のハッシュを計算できる場合は必ずそれを
 /// 保存する」という不変条件を保ち、正規化方式の変遷を後続の呼び出しへ持ち越さない）。
+///
+/// 台帳エントリが無い場合、分割実行ジョブ表（Issue #1127・
+/// [`crate::recovery::partitioned_job`]）も引く。同じ `operation_id` のジョブが
+/// 実行中・中断・取り消し済み（`Running`／`Cancelled`）なら内容不一致
+/// （[`LedgerRecordError::ContentMismatch`]・`22023`）として拒否する（commit 済み確定の
+/// 根拠にしない。ADR `docs/design/partitioned-dml.md` §6）。`Completed` なのに台帳
+/// エントリが無いのは不変条件違反なので [`LedgerRecordError::Corrupted`]（`XX000`）。
+/// [`LedgerWrite::Disabled`] はジョブ表にも触れない（テーブルも作らない）。
 pub(crate) fn record_in_txn_accepting(
     write_txn: &redb::WriteTransaction,
     tenant_id: &str,
@@ -283,6 +291,57 @@ pub(crate) fn record_in_txn_accepting(
     ledger: LedgerWrite<'_>,
     content_hash: &ContentHash,
     legacy_hashes: &[ContentHash],
+) -> Result<RecordOutcome, LedgerRecordError> {
+    record_core(
+        write_txn,
+        tenant_id,
+        table,
+        ledger,
+        content_hash,
+        legacy_hashes,
+        JobTableCheck::Enforce,
+    )
+}
+
+/// 分割実行の完了経路（[`crate::recovery::partitioned_job::complete_in_txn`]）専用の
+/// 台帳記録。ジョブ表の照合は行わない（自身が `Running` 記録を持つため）。それ以外の
+/// 台帳の契約（keep-first・v2 値・`last_op` 更新）は通常の記録と同一。
+pub(crate) fn record_partitioned_completion_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+    op_id: &OperationId,
+    content_hash: &ContentHash,
+) -> Result<RecordOutcome, LedgerRecordError> {
+    record_core(
+        write_txn,
+        tenant_id,
+        table,
+        LedgerWrite::Record(op_id),
+        content_hash,
+        &[],
+        JobTableCheck::Skip,
+    )
+}
+
+/// [`record_core`] がジョブ表を照合するか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobTableCheck {
+    /// 通常 DML の記録経路。台帳エントリが無ければジョブ表を引いて衝突を拒否する。
+    Enforce,
+    /// 分割実行の完了経路。ジョブ表を引かない。
+    Skip,
+}
+
+/// [`record_in_txn_accepting`]・[`record_partitioned_completion_in_txn`] の共通本体。
+fn record_core(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+    ledger: LedgerWrite<'_>,
+    content_hash: &ContentHash,
+    legacy_hashes: &[ContentHash],
+    job_check: JobTableCheck,
 ) -> Result<RecordOutcome, LedgerRecordError> {
     let op_id = match ledger {
         LedgerWrite::Record(op_id) => op_id,
@@ -309,6 +368,23 @@ pub(crate) fn record_in_txn_accepting(
                 }
             }
         };
+    }
+    if job_check == JobTableCheck::Enforce {
+        use crate::recovery::partitioned_job::{lookup_in_write_txn, JobKey, JobRecord};
+        let job_key = JobKey::from_ledger_scope(tenant_id, table, op_id);
+        match lookup_in_write_txn(write_txn, &job_key)
+            .map_err(|e| LedgerRecordError::Corrupted(e.into_storage_error()))?
+        {
+            None => {}
+            Some(JobRecord::Running { .. } | JobRecord::Cancelled { .. }) => {
+                return Err(LedgerRecordError::ContentMismatch);
+            }
+            Some(JobRecord::Completed { .. }) => {
+                return Err(LedgerRecordError::Corrupted(StorageError::Codec(
+                    "completed partitioned job has no ledger entry".to_string(),
+                )));
+            }
+        }
     }
     ledger_table.insert(key, encode_entry_v2(content_hash).as_slice())?;
     // `last_op`（TASK-98・RECOVER-7）: 同一 write トランザクション内で upsert する
@@ -447,6 +523,38 @@ pub(crate) fn delete_table_in_txn(
     }
 
     Ok(())
+}
+
+/// write txn 内で `(tenant_id, table, op_id)` が台帳に記録済みかを照会する
+/// （Issue #1127。分割実行の各チャンクが走査前に台帳を引く #1128 の土台）。
+/// 台帳テーブルが未作成なら `false`（`list_tables` で存在確認し、write txn の
+/// `open_table` の自動作成で空テーブルを作らない）。
+#[allow(dead_code)] // #1128 の分割実行器が結線するまで未使用
+pub(crate) fn lookup_in_write_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+    op_id: &OperationId,
+) -> Result<bool, LedgerRecordError> {
+    let exists = write_txn
+        .list_tables()?
+        .any(|handle| handle.name() == OP_LEDGER_TABLE.name());
+    if !exists {
+        return Ok(false);
+    }
+    let ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+    let found = match ledger_table.get((tenant_id, table, op_id.as_str()))? {
+        Some(guard) => {
+            decode_entry(guard.value()).map_err(|_| {
+                LedgerRecordError::Corrupted(StorageError::Codec(
+                    "op_ledger entry has unknown format version".to_string(),
+                ))
+            })?;
+            true
+        }
+        None => false,
+    };
+    Ok(found)
 }
 
 /// `read_txn` 内で `(tenant_id, table, op_id)` が台帳に記録済みかを照会する（TASK-93、

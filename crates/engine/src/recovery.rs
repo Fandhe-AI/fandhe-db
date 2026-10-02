@@ -29,6 +29,11 @@
 //! プロセスを終了させる ―― `commit_boundary`・`panic_hook` の狭い
 //! commit-pending 限定の abort とは異なり、プロセス全体への最終防衛線となる。
 //!
+//! [`partitioned_job`] が分割実行 DML（チャンクごとに commit する非原子の述語形
+//! `UPDATE`／`DELETE`）のジョブ状態・再開位置の永続化と実行中ジョブ登録簿を提供する
+//! （Issue #1127。ポインタ: ADR `docs/design/partitioned-dml.md`・RECOVER-11）。
+//! 詳細は `partitioned_job` モジュールドキュメント参照。
+//!
 //! [`stderr_log`] は `fail_fast`（RECOVER-8）の例外として、診断用 stderr
 //! 出力の書き込み失敗（読み手が閉じた後の `EPIPE` 等）を無視する
 //! （Issue #1081、判断の記録: `docs/design/stderr-log-write-failure.md`）。
@@ -40,5 +45,9 @@ pub(crate) mod content_hash;
 pub mod fail_fast;
 pub mod ledger;
 pub mod panic_hook;
+// 後続 Issue（#1128 実行器・#1129 SQL 表層）が使う API を先行して提供するため、
+// 結線前は未使用警告が出る（結線後に外す）。
+#[allow(dead_code)]
+pub(crate) mod partitioned_job;
 pub mod required_op_id;
 pub mod stderr_log;

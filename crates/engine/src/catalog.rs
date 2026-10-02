@@ -6398,6 +6398,8 @@ impl Storage {
     /// [`crate::recovery::ledger::delete_table_in_txn`] により当該テーブル名分を
     /// 削除する（Issue #226 レビュー対応: drop 後の同名テーブル再作成で旧台帳
     /// エントリが引き継がれ、正当な書き込みを誤って重複拒否する事故を防ぐ）。
+    /// 分割実行ジョブ表（Issue #1127）の当該テーブル分も同じ理由で同一 txn 内で
+    /// 削除する。
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         validate_identifier(table_name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
@@ -6468,6 +6470,10 @@ impl Storage {
         // コメント参照）。行ストア削除と異なりテーブル自体は残す（他テーブル分の
         // エントリが同居するため）。
         crate::recovery::ledger::delete_table_in_txn(&write_txn, table_name)
+            .map_err(convert_storage_error)?;
+        // 分割実行ジョブ表（Issue #1127）も同一 txn で整合させる（同名再作成での旧ジョブ
+        // 記録の引き継ぎ防止）。
+        crate::recovery::partitioned_job::delete_table_in_txn(&write_txn, table_name)
             .map_err(convert_storage_error)?;
         // 索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn・同一 commit で整合
         // させる（[`delete_indexes_for_table_in_txn`] 参照）。
