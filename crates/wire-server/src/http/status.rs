@@ -49,7 +49,14 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::DuplicateOperationId
         | ErrorClass::DuplicateTable
         | ErrorClass::CheckViolation
-        | ErrorClass::ForeignKeyViolation => 409,
+        | ErrorClass::ForeignKeyViolation
+        // Issue #1129・SQL-19・RECOVER-11: 分割実行 DML の部分完了（`VD001`）・取り消し
+        // （`VD002`）。commit 済みのチャンクと矛盾する状態（再送で再開する対象の状態）の
+        // ため `UniqueViolation` と同じ「対象の状態と矛盾する」意味論として 409 とする。
+        // NoSQL 表層の分割実行 op は Issue #1130 の担当で、本 Issue では SQL 表層のみが
+        // 送出するが、`ErrorClass` の網羅性のため射影を定める。
+        | ErrorClass::PartialCompletion
+        | ErrorClass::PartitionedDmlCancelled => 409,
         ErrorClass::PayloadTooLarge => 413,
         ErrorClass::InternalError => 500,
         ErrorClass::FeatureNotSupported => 501,
@@ -137,7 +144,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 42] = [
+    const EXPECTED: [(ErrorClass, u16); 44] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -156,6 +163,8 @@ mod tests {
         (ErrorClass::NumericOutOfRange, 400),
         (ErrorClass::DivisionByZero, 400),
         (ErrorClass::DuplicateObject, 400),
+        (ErrorClass::PartialCompletion, 409),
+        (ErrorClass::PartitionedDmlCancelled, 409),
         (ErrorClass::OperationIdContentMismatch, 400),
         (ErrorClass::DatetimeFieldOverflow, 400),
         (ErrorClass::InvalidDatetimeFormat, 400),

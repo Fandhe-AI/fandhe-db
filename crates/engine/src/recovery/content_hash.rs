@@ -1021,7 +1021,7 @@ fn update_where_with_tag(
 /// 同一視するため、シグネチャでハッシュ入力に入らないことを保証する）。
 /// 新しいドメインで過去の記録が存在しないため legacy 版は持たない。
 /// 呼び出し元は #1128 の分割実行器。
-#[allow(dead_code)] // #1128 の分割実行器が結線するまで未使用
+// 分割実行（core.rs の分割実行 form）が呼ぶ。
 pub(crate) fn for_update_where_partitioned(
     table: &str,
     assignments: &[(&str, &crate::sql::allowlist::InsertLiteral)],
@@ -1119,7 +1119,7 @@ fn delete_where_with_tag(
 /// `docs/design/partitioned-dml.md` §6・RECOVER-11）の内容照合ハッシュ。
 /// [`for_delete_where`] と同じ直列化に別タグ（[`OpTag::DeleteWherePartitioned`]）を
 /// 付ける。チャンク幅は入力に含めない（[`for_update_where_partitioned`] 参照）。
-#[allow(dead_code)] // #1128 の分割実行器が結線するまで未使用
+// 分割実行（core.rs の分割実行 form）が呼ぶ。
 pub(crate) fn for_delete_where_partitioned(
     table: &str,
     where_predicates: &[crate::sql::allowlist::WherePredicate],

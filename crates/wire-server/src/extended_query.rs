@@ -1806,6 +1806,13 @@ fn execute_portal<'e, S: WireStream>(
             ParsedSql::Statement(_) => false,
             ParsedSql::Transaction(engine::sql::transaction::TxnControl::Commit) => true,
             ParsedSql::Transaction(_) => false,
+            // Issue #1129: `SHOW`・`EXPLAIN ... PARTITIONED` は読み取りのみで commit を伴わない
+            // （`CANCEL` と分割実行 DML は書き込みとして下の既定へ落とす）。
+            ParsedSql::Partitioned(
+                engine::sql::partitioned::PartitionedControl::Show(_)
+                | engine::sql::partitioned::PartitionedControl::ExplainDelete(_)
+                | engine::sql::partitioned::PartitionedControl::ExplainUpdate(_),
+            ) => false,
             _ => !was_active_before_execution,
         };
 

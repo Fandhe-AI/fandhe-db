@@ -701,7 +701,7 @@ impl Storage {
 
     /// 実行中の分割実行ジョブ登録簿（Issue #1127）。tenant 層・#1128 の実行器が
     /// `WriteTarget::Autocommit(&Storage)` 経由で届くよう `Storage` に置く。
-    #[allow(dead_code)] // #1128 の実行器・#1129 の照会／取り消しが結線するまで未使用
+    // 実行器（tenant::partitioned_dml）と SQL 表層の照会／取り消し（sql::partitioned）が使う。
     pub(crate) fn partitioned_job_registry(
         &self,
     ) -> &std::sync::Arc<crate::recovery::partitioned_job::JobRegistry> {
@@ -748,7 +748,7 @@ impl Storage {
     /// §8.2）用の入口。通常の書き込みが待機している間はゲートを取得せず譲る。
     /// `tenant::partitioned_dml` の実行器がチャンクごとに呼ぶ。待機上限超過は
     /// `WriteLockTimeout`（`55P03`）。
-    #[allow(dead_code)] // 実行器（tenant::partitioned_dml）が結線されるまで未使用
+    // tenant::partitioned_dml の実行器がチャンクごとに呼ぶ（Issue #1129 で結線）。
     pub(crate) fn begin_partitioned_chunk_txn(&self) -> Result<GatedWriteTxn> {
         let permit = self
             .writer_gate

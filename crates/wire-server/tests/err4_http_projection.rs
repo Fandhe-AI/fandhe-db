@@ -277,7 +277,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 40] = [
+const EXPECTED_STATUS: [(&str, u16); 42] = [
     ("22000", 400),
     ("22012", 400),
     ("28P01", 401),
@@ -343,6 +343,9 @@ const EXPECTED_STATUS: [(&str, u16); 40] = [
     // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: ERR-6 の新設行。400
     // （`42P07` の 409 とは揃えない）。
     ("42710", 400),
+    // 分割実行 DML の部分完了（`VD001`）・取り消し（`VD002`）（Issue #1129・SQL-19）: 409。
+    ("VD001", 409),
+    ("VD002", 409),
     // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
     // 参照スコープでの非修飾列の曖昧解決。`aggregate.sort` の出力名の複数一致
     // からも到達可能（Issue #1270。`err4_f_ambiguous_sort_reachable_via_nosql_aggregate`）。
@@ -414,7 +417,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 42);
+const _: () = assert!(ErrorClass::ALL.len() == 44);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -893,6 +896,11 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // CONSTRAINT` の CHECK・FOREIGN KEY の名前衝突。NoSQL の `alter_table` は
         // `add_column`／`drop_column` だけで到達不能。
         ErrorClass::DuplicateObject,
+        // `PartialCompletion`／`PartitionedDmlCancelled`（`VD001`／`VD002`。Issue #1129）:
+        // NoSQL 表層の分割実行 op は Issue #1130 の担当で、本 Issue 時点では SQL 表層
+        // だけが送出するため NoSQL の実要求からは到達不能。
+        ErrorClass::PartialCompletion,
+        ErrorClass::PartitionedDmlCancelled,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());

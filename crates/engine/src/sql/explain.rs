@@ -547,7 +547,7 @@ fn append_index_suffix(line: &mut String, names: &[String]) {
 /// ない疑似値 `0`）へ変換する（[`build_explain_result`]・
 /// [`build_search_explain_result`]・[`build_relational_explain_result`] が
 /// 共有する終端処理）。
-fn lines_to_query_result(lines: Vec<String>) -> QueryResult {
+pub(crate) fn lines_to_query_result(lines: Vec<String>) -> QueryResult {
     let rows = lines
         .into_iter()
         .map(|text| ResultRow {

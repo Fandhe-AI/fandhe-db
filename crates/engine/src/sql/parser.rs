@@ -3007,6 +3007,14 @@ pub const MAX_PARTITIONED_MAX_HOLD_MS: u64 = 5_000;
 pub const DEFAULT_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1_000;
 pub const MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1;
 pub const MAX_PARTITIONED_INTERRUPTED_RECORD_LIMIT: u64 = 1_000_000;
+/// 分割実行の同時実行数（テナント単位）の既定値と範囲（§15.2。Issue #1129 で CLI フラグ確定）。
+pub const DEFAULT_PARTITIONED_MAX_JOBS_PER_TENANT: usize = 1;
+/// 分割実行の同時実行数（プロセス全体）の既定値（§15.2）。
+pub const DEFAULT_PARTITIONED_MAX_JOBS_TOTAL: usize = 4;
+pub const MIN_PARTITIONED_MAX_JOBS: usize = 1;
+/// 同時実行数の上限値。wire-server の最大接続数（`limits::MAX_CONNECTIONS`）と同じ値に
+/// 揃える（一致は wire-server 側のテストで固定する。engine から wire-server へ依存しない）。
+pub const MAX_PARTITIONED_JOBS: usize = 64;
 
 /// [`PartitionedDmlLimits`] の各値の範囲外を示すエラー。`Display` には項目名・入力値・
 /// 許容範囲だけを含める（テナント・行内容に触れない。fail-closed）。
@@ -3086,6 +3094,44 @@ pub fn validate_partitioned_scan_budget(
     })
 }
 
+/// 同時実行数（テナント単位・全体のいずれにも使う）を検証して `NonZeroUsize` へ変換する。
+pub fn validate_partitioned_max_jobs(
+    item: &'static str,
+    value: usize,
+) -> Result<std::num::NonZeroUsize, PartitionedDmlLimitsError> {
+    let v = u64::try_from(value).unwrap_or(u64::MAX);
+    partitioned_range_check(
+        item,
+        v,
+        MIN_PARTITIONED_MAX_JOBS as u64,
+        MAX_PARTITIONED_JOBS as u64,
+    )?;
+    std::num::NonZeroUsize::new(value).ok_or(PartitionedDmlLimitsError {
+        item,
+        value: v,
+        min: MIN_PARTITIONED_MAX_JOBS as u64,
+        max: MAX_PARTITIONED_JOBS as u64,
+    })
+}
+
+/// 中断記録数の上限を検証して `NonZeroU64` へ変換する（wire-server の CLI 解析から呼ばれる）。
+pub fn validate_partitioned_interrupted_record_limit(
+    value: u64,
+) -> Result<std::num::NonZeroU64, PartitionedDmlLimitsError> {
+    partitioned_range_check(
+        "partitioned interrupted record limit",
+        value,
+        MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+        MAX_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+    )?;
+    std::num::NonZeroU64::new(value).ok_or(PartitionedDmlLimitsError {
+        item: "partitioned interrupted record limit",
+        value,
+        min: MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+        max: MAX_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
+    })
+}
+
 /// writer 保持時間（ミリ秒）を検証して `Duration` へ変換する。
 pub fn validate_partitioned_max_hold_ms(
     value: u64,
@@ -3113,8 +3159,12 @@ pub struct PartitionedDmlLimits {
     pub scan_budget_rows: std::num::NonZeroUsize,
     /// 1 チャンクの writer 保持時間の上限（既定 1 秒。`100..=5,000` ms）。
     pub max_writer_hold: std::time::Duration,
-    /// `(tenant, table)` 単位の中断記録数の上限（既定 1,000。CLI フラグは #1129）。
+    /// `(tenant, table)` 単位の中断記録数の上限（既定 1,000。`1..=1,000,000`）。
     pub interrupted_record_limit: std::num::NonZeroU64,
+    /// テナント単位の同時実行数の上限（既定 1。`1..=64`。全体の上限以下）。
+    pub max_jobs_per_tenant: std::num::NonZeroUsize,
+    /// プロセス全体の同時実行数の上限（既定 4。`1..=64`）。
+    pub max_jobs_total: std::num::NonZeroUsize,
 }
 
 impl Default for PartitionedDmlLimits {
@@ -3131,6 +3181,12 @@ impl Default for PartitionedDmlLimits {
                 DEFAULT_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
             )
             .unwrap_or(std::num::NonZeroU64::MIN),
+            max_jobs_per_tenant: std::num::NonZeroUsize::new(
+                DEFAULT_PARTITIONED_MAX_JOBS_PER_TENANT,
+            )
+            .unwrap_or(std::num::NonZeroUsize::MIN),
+            max_jobs_total: std::num::NonZeroUsize::new(DEFAULT_PARTITIONED_MAX_JOBS_TOTAL)
+                .unwrap_or(std::num::NonZeroUsize::MIN),
         }
     }
 }
@@ -3143,12 +3199,23 @@ impl PartitionedDmlLimits {
         validate_partitioned_scan_budget(self.scan_budget_rows.get())?;
         let hold_ms = u64::try_from(self.max_writer_hold.as_millis()).unwrap_or(u64::MAX);
         validate_partitioned_max_hold_ms(hold_ms)?;
-        partitioned_range_check(
-            "partitioned interrupted record limit",
-            self.interrupted_record_limit.get(),
-            MIN_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
-            MAX_PARTITIONED_INTERRUPTED_RECORD_LIMIT,
-        )
+        validate_partitioned_interrupted_record_limit(self.interrupted_record_limit.get())?;
+        validate_partitioned_max_jobs(
+            "partitioned max jobs per tenant",
+            self.max_jobs_per_tenant.get(),
+        )?;
+        validate_partitioned_max_jobs("partitioned max jobs", self.max_jobs_total.get())?;
+        // 組合せ制約: テナント単位の上限が全体の上限を超える構成は意味を成さないため、
+        // 起動時に fail-closed で拒否する。
+        if self.max_jobs_per_tenant > self.max_jobs_total {
+            return Err(PartitionedDmlLimitsError {
+                item: "partitioned max jobs per tenant (must not exceed partitioned max jobs)",
+                value: u64::try_from(self.max_jobs_per_tenant.get()).unwrap_or(u64::MAX),
+                min: MIN_PARTITIONED_MAX_JOBS as u64,
+                max: u64::try_from(self.max_jobs_total.get()).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -7312,6 +7379,7 @@ mod tests {
             where_predicates,
             operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
             returning: None,
+            partitioned: None,
         };
         let err = bind_predicate_delete(
             &stmt,
@@ -7725,6 +7793,8 @@ mod tests {
         assert_eq!(d.scan_budget_rows.get(), 100_000);
         assert_eq!(d.max_writer_hold, std::time::Duration::from_secs(1));
         assert_eq!(d.interrupted_record_limit.get(), 1_000);
+        assert_eq!(d.max_jobs_per_tenant.get(), 1);
+        assert_eq!(d.max_jobs_total.get(), 4);
         assert!(d.validate().is_ok());
     }
 
@@ -7758,6 +7828,30 @@ mod tests {
         let err = l.validate().expect_err("out of range");
         let msg = err.to_string();
         assert!(msg.contains("out of range"));
+    }
+
+    #[test]
+    fn partitioned_dml_max_jobs_boundaries_and_combination_constraint() {
+        assert!(validate_partitioned_max_jobs("x", 0).is_err());
+        assert!(validate_partitioned_max_jobs("x", 1).is_ok());
+        assert!(validate_partitioned_max_jobs("x", MAX_PARTITIONED_JOBS).is_ok());
+        assert!(validate_partitioned_max_jobs("x", MAX_PARTITIONED_JOBS + 1).is_err());
+        assert!(validate_partitioned_interrupted_record_limit(0).is_err());
+        assert!(validate_partitioned_interrupted_record_limit(1).is_ok());
+        assert!(validate_partitioned_interrupted_record_limit(1_000_001).is_err());
+        let nz = |n: usize| std::num::NonZeroUsize::new(n).expect("non-zero");
+        let ok = PartitionedDmlLimits {
+            max_jobs_per_tenant: nz(2),
+            max_jobs_total: nz(2),
+            ..PartitionedDmlLimits::default()
+        };
+        assert!(ok.validate().is_ok());
+        let bad = PartitionedDmlLimits {
+            max_jobs_per_tenant: nz(3),
+            max_jobs_total: nz(2),
+            ..PartitionedDmlLimits::default()
+        };
+        assert!(bad.validate().is_err());
     }
 
     #[test]

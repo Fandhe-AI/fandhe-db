@@ -96,6 +96,9 @@ pub(crate) enum PartitionedJobError {
     /// 同じ `(tenant, table, operation_id)` のジョブがこのプロセスで実行中
     /// （`55P03` 相当）。登録簿が poisoned の場合も拒否側に倒す。
     AlreadyRunning,
+    /// 同時実行数の上限（テナント単位または全体）に達している（`55P03` 相当）。
+    /// どちらの上限でも同じ variant に統一する（超過した上限の種別を外へ出さない）。
+    ConcurrencyLimitReached,
     /// 記録のハッシュ不一致、または期待しない状態（`Running` 以外等）に対する更新要求。
     /// TOCTOU 対策として書き込み直前の再読込で検出し、拒否する。
     StateConflict,
@@ -344,8 +347,8 @@ pub(crate) enum ResendDecision {
     Fresh,
     /// `Running`（中断）でハッシュ一致。カーソルから再開する。
     Resume { cursor: u64, processed: u64 },
-    /// 取り消し済み（ハッシュ一致）。
-    Cancelled,
+    /// 取り消し済み（ハッシュ一致）。`committed` は取り消し時点の commit 済み件数。
+    Cancelled { committed: u64 },
     /// 完了済み（ハッシュ一致）。重複。
     Duplicate,
     /// ハッシュ不一致（内容の異なる誤用）。
@@ -376,7 +379,9 @@ pub(crate) fn classify_resend(
             cursor: *cursor,
             processed: *processed,
         },
-        JobRecord::Cancelled { .. } => ResendDecision::Cancelled,
+        JobRecord::Cancelled { committed, .. } => ResendDecision::Cancelled {
+            committed: *committed,
+        },
         JobRecord::Completed { .. } => ResendDecision::Duplicate,
     }
 }
@@ -765,6 +770,7 @@ pub(crate) struct JobRegistry {
 impl JobRegistry {
     /// 登録する。既にあれば [`PartitionedJobError::AlreadyRunning`]。mutex が poisoned
     /// の場合も拒否側（fail-closed）に倒す。返す [`JobGuard`] の drop で登録が外れる。
+    #[cfg(test)]
     pub(crate) fn try_register(
         self: &Arc<Self>,
         key: &JobKey<'_>,
@@ -776,6 +782,38 @@ impl JobRegistry {
         let owned = key.owned();
         if map.contains_key(&owned) {
             return Err(PartitionedJobError::AlreadyRunning);
+        }
+        let slot = Arc::new(JobSlot::default());
+        map.insert(owned.clone(), Arc::clone(&slot));
+        Ok(JobGuard {
+            registry: Arc::clone(self),
+            key: owned,
+            slot,
+        })
+    }
+
+    /// 同時実行数の上限を判定してから登録する。同じキー・テナント単位の件数・全体の件数を
+    /// 1 つのロックの中で判定して挿入するため、並行起動でも上限を超えない（TOCTOU 防止）。
+    /// 判定順は「同じキーの登録済み（`AlreadyRunning`）→ テナント単位 → 全体」。
+    /// テナント単位・全体のどちらの超過も [`PartitionedJobError::ConcurrencyLimitReached`]
+    /// に統一する。mutex が poisoned の場合は拒否側に倒す。
+    pub(crate) fn try_register_with_limits(
+        self: &Arc<Self>,
+        key: &JobKey<'_>,
+        per_tenant: usize,
+        total: usize,
+    ) -> Result<JobGuard, PartitionedJobError> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| PartitionedJobError::AlreadyRunning)?;
+        let owned = key.owned();
+        if map.contains_key(&owned) {
+            return Err(PartitionedJobError::AlreadyRunning);
+        }
+        let tenant_count = map.keys().filter(|(t, _, _)| t == &owned.0).count();
+        if tenant_count >= per_tenant || map.len() >= total {
+            return Err(PartitionedJobError::ConcurrencyLimitReached);
         }
         let slot = Arc::new(JobSlot::default());
         map.insert(owned.clone(), Arc::clone(&slot));
@@ -1407,6 +1445,61 @@ mod tests {
     // --- 再送判定・状態導出 -------------------------------------------------
 
     #[test]
+    fn try_register_with_limits_enforces_tenant_and_total_atomically() {
+        let reg = Arc::new(JobRegistry::default());
+        let (a, b, c) = (op("a"), op("b"), op("c"));
+        let g1 = reg
+            .try_register_with_limits(&key("t1", "docs", &a), 1, 2)
+            .expect("first");
+        // 同じキーは AlreadyRunning（上限判定より先）。
+        assert!(matches!(
+            reg.try_register_with_limits(&key("t1", "docs", &a), 1, 2),
+            Err(PartitionedJobError::AlreadyRunning)
+        ));
+        // テナント単位の上限（1）。
+        assert!(matches!(
+            reg.try_register_with_limits(&key("t1", "docs", &b), 1, 2),
+            Err(PartitionedJobError::ConcurrencyLimitReached)
+        ));
+        // 別テナントは通る。全体の上限（2）に達する。
+        let _g2 = reg
+            .try_register_with_limits(&key("t2", "docs", &b), 1, 2)
+            .expect("other tenant");
+        assert!(matches!(
+            reg.try_register_with_limits(&key("t3", "docs", &c), 1, 2),
+            Err(PartitionedJobError::ConcurrencyLimitReached)
+        ));
+        drop(g1);
+        let _g3 = reg
+            .try_register_with_limits(&key("t3", "docs", &c), 1, 2)
+            .expect("after release");
+    }
+
+    #[test]
+    fn try_register_with_limits_lets_only_one_of_racing_threads_win() {
+        let reg = Arc::new(JobRegistry::default());
+        let wins = std::sync::atomic::AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let (reg, wins, barrier) = (&reg, &wins, &barrier);
+                s.spawn(move || {
+                    let id = op(&format!("op-{i}"));
+                    barrier.wait();
+                    let g = reg.try_register_with_limits(&key("t1", "docs", &id), 1, 8);
+                    if let Ok(g) = g {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // 他スレッドの判定が終わるまで保持する。
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        drop(g);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn classify_resend_covers_every_branch() {
         let h = hash("h");
         let other = hash("o");
@@ -1441,7 +1534,7 @@ mod tests {
         );
         assert_eq!(
             classify_resend(Some(&cancelled), &h, false),
-            ResendDecision::Cancelled
+            ResendDecision::Cancelled { committed: 2 }
         );
         assert_eq!(
             classify_resend(Some(&cancelled), &other, false),

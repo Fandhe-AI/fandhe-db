@@ -184,6 +184,7 @@ pub(crate) mod numeric_fn;
 pub(crate) mod order_value;
 pub mod params;
 pub mod parser;
+pub mod partitioned;
 pub mod plan;
 pub mod relation;
 pub mod relation_snapshot;

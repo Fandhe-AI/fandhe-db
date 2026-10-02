@@ -112,8 +112,13 @@
 | S2 専用文 | `PARTITIONED UPDATE ...`／`BATCH DELETE ...` のような別の先頭キーワード | 先頭トークンで経路が分かれ、既存の文と取り違えない | 先頭トークン分岐と許可リストを二重に持つことになり、述語・`SET` の検証を共有する設計（`delete-predicate-form.md`）から外れやすい |
 | S3 非同期ジョブ形 | 起動文がジョブ識別子を即座に返し、サーバー側のワーカーが実行する。照会・取り消しは別の文 | 接続を保持しなくてよい | サーバー内にバックグラウンド実行器・スケジューラが必要。セッションを持たない実行主体が RLS の文脈（`PolicyContext`）を保持・永続化する必要があり、テナント境界の検査面が増える。再起動後の自動再開も実装しなければならない |
 
-**採用**: S1（同期実行の文修飾）。キーワード名・チャンク幅指定の形は #1129 で確定する
-（例示の `PARTITIONED`・`CHUNK` は仮）。S3 は S1 の実績を見てから必要性を判断する。
+**採用**: S1（同期実行の文修飾）。S3 は S1 の実績を見てから必要性を判断する。
+
+**確定（Issue #1129）**: キーワードは文脈キーワード（字句解析のキーワードは増やさない）で、
+文の末尾の `USING OPERATION_ID '<id>'` の直後に `PARTITIONED [CHUNK <n>]` を置く。進捗照会は
+`SHOW PARTITIONED DML '<id>' ON <table>`、取り消しは `CANCEL PARTITIONED DML '<id>' ON <table>`、
+実行せずに確認するには `EXPLAIN UPDATE|DELETE ... PARTITIONED` を使う。`INSERT`（UPSERT を含む）・
+`TRUNCATE`・単一行形・`RETURNING` との併用は `42601`。
 
 ### 3.3 トランザクション内での扱い
 
@@ -494,8 +499,10 @@ Accepted と、15 節の提案値のオーナー確認後」。後者は 2026-10
 
 設定方法:
 
-- いずれも `wire-server` 起動時の CLI フラグだけで設定する（フラグ名は #1129 で確定。例:
-  `--partitioned-dml-chunk-rows`）。範囲外・非数値・多重指定は起動時に fail-closed で拒否する。
+- いずれも `wire-server` 起動時の CLI フラグだけで設定する（フラグ名は #1129 で確定:
+  `--partitioned-dml-chunk-rows`・`--partitioned-dml-scan-budget`・`--partitioned-dml-max-hold-ms`・
+  `--partitioned-dml-max-jobs-per-tenant`・`--partitioned-dml-max-jobs`・
+  `--partitioned-dml-max-interrupted-records`）。範囲外・非数値・多重指定は起動時に fail-closed で拒否する。
   根拠: `--max-dml-affected-rows`・`--max-insert-rows`（`predicate-dml-exec.md` §6）と同じ流儀で、
   セッション・テナント単位の設定は持たない。環境変数は設けない（`batch_limits` の
   `VECTOR_DB_BATCH_MAX_FILES` は既存互換のためのもので、新しい上限には広げない）。

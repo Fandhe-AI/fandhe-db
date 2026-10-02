@@ -1459,6 +1459,14 @@ pub enum ParsedSql {
     /// すべて更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードが
     /// あれば追随が必要。
     Cursor(crate::sql::cursor::CursorStatement),
+    /// 分割実行 DML の制御文・説明文（Issue #1129・SQL-19）: `SHOW PARTITIONED DML`・
+    /// `CANCEL PARTITIONED DML`・`EXPLAIN UPDATE|DELETE ... PARTITIONED`。分割実行そのもの
+    /// （`UPDATE`／`DELETE ... PARTITIONED`）は [`Self::Update`]／[`Self::Delete`] の述語形が
+    /// 修飾を保持する。`SHOW`・`EXPLAIN` は読み取りのみ、`CANCEL` は autocommit 専用の書き込み。
+    ///
+    /// **BREAKING CHANGE**（Issue #1129）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    Partitioned(crate::sql::partitioned::PartitionedControl),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
     /// Issue #900）・`ALTER TABLE <table> ADD [CONSTRAINT <name>] UNIQUE
     /// (<col>[, ...])`／`DROP CONSTRAINT <name>`（TABLE-16・TASK-204、
@@ -1576,6 +1584,22 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
             v.operation_id().map(|id| id.as_str())
         }
         _ => None,
+    }
+}
+
+/// `parsed` が分割実行に属する書き込み（`UPDATE`／`DELETE ... PARTITIONED`・`CANCEL
+/// PARTITIONED DML`）か。明示・暗黙トランザクション内では黙って原子実行へ切り替えず
+/// `25001` で拒否するための判定（Issue #1129）。
+fn is_partitioned_write(parsed: &ParsedSql) -> bool {
+    match parsed {
+        ParsedSql::Delete(crate::sql::allowlist::DeleteStatement::Predicate(v)) => {
+            v.partitioned().is_some()
+        }
+        ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
+            v.partitioned().is_some()
+        }
+        ParsedSql::Partitioned(control) => control.writes(),
+        _ => false,
     }
 }
 
@@ -2184,6 +2208,13 @@ impl EngineCore {
     ) -> Self {
         self.partitioned_dml_limits = limits;
         self
+    }
+
+    /// 結合ではなくモジュール内テストが登録簿などの内部状態へ届くための入口
+    /// （Issue #1129 の同時実行数上限のテスト用。本番ビルドには含めない）。
+    #[cfg(test)]
+    pub(crate) fn storage_for_test(&self) -> &Storage {
+        &self.storage
     }
 
     /// 現在の分割実行 DML の設定。
@@ -3041,6 +3072,68 @@ impl EngineCore {
         e
     }
 
+    /// `CHUNK n` がサーバー設定のチャンク幅以下であることを検査する（Issue #1129。
+    /// 解析時と実行時の 2 回呼ぶ多層防御。`PARTITIONED` なしは何もしない）。
+    fn check_partitioned_chunk(
+        &self,
+        clause: Option<&crate::sql::partitioned::PartitionedClause>,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        if let Some(clause) = clause {
+            crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
+        }
+        Ok(())
+    }
+
+    /// `EXPLAIN UPDATE|DELETE ... PARTITIONED [CHUNK n]` の構造検証（Issue #1129）。先頭の
+    /// `EXPLAIN` を除いた残りを既存の述語形検証へ渡し、`PARTITIONED` 付きの述語形だけを
+    /// 受理する（それ以外は `42601`）。実行は束縛までで、書き込み・登録簿・ジョブ表には触れない。
+    fn parse_explain_partitioned_dml(
+        &self,
+        tokens: &[crate::sql::lexer::Token],
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{DeleteStatement, SqlSurfaceError, ValidatedUpdateForm};
+        use crate::sql::partitioned::PartitionedControl;
+
+        let reject = || {
+            SqlSurfaceError::unsupported(
+                "EXPLAIN requires a SELECT or partitioned UPDATE/DELETE statement",
+            )
+        };
+        let rest = tokens.get(1..).ok_or_else(reject)?;
+        let is_delete = matches!(
+            rest.first(),
+            Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("DELETE")
+        );
+        if is_delete {
+            let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
+                rest,
+                &self.storage,
+                self.ledger_mode,
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            return match stmt {
+                DeleteStatement::Predicate(v) if v.partitioned().is_some() => {
+                    self.check_partitioned_chunk(v.partitioned())?;
+                    Ok(ParsedSql::Partitioned(PartitionedControl::ExplainDelete(v)))
+                }
+                _ => Err(reject()),
+            };
+        }
+        let stmt = crate::sql::allowlist::validate_update_form_tokens(
+            rest,
+            &self.storage,
+            self.ledger_mode,
+        )
+        .map_err(|e| self.reclassify_write_to_view_error(e))?;
+        match stmt {
+            ValidatedUpdateForm::Predicate(v) if v.partitioned().is_some() => {
+                self.check_partitioned_chunk(v.partitioned())?;
+                Ok(ParsedSql::Partitioned(PartitionedControl::ExplainUpdate(v)))
+            }
+            _ => Err(reject()),
+        }
+    }
+
     /// [`Self::parse_sql`] の字句解析済みトークン列版（Issue #935・WIRE-12。
     /// `sql::allowlist::validate_sql`/`validate_sql_tokens` の分割と同じ理由）。
     /// [`Self::parse_sql_prepared`]・[`Self::bind_prepared`] が、拡張クエリ
@@ -3063,6 +3156,33 @@ impl EngineCore {
         if txn_control_head {
             let ctrl = crate::sql::transaction::validate_transaction_control_tokens(&tokens)?;
             return Ok(ParsedSql::Transaction(ctrl));
+        }
+
+        // Issue #1129: `SHOW`／`CANCEL PARTITIONED DML '<id>' ON <table>`。カタログは引かない
+        // （テーブルの存在・可視性を応答に表さない。RLS-9）。
+        let is_partitioned_control = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name))
+                if name.eq_ignore_ascii_case("SHOW") || name.eq_ignore_ascii_case("CANCEL")
+        );
+        if is_partitioned_control {
+            let control = crate::sql::allowlist::validate_partitioned_control_tokens(&tokens)?;
+            return Ok(ParsedSql::Partitioned(control));
+        }
+
+        // Issue #1129: `EXPLAIN UPDATE|DELETE ... PARTITIONED`。分割実行でない DML の
+        // `EXPLAIN` は従来どおり許可リスト外（`42601`）。
+        if let (
+            Some(crate::sql::lexer::Token::Ident(head)),
+            Some(crate::sql::lexer::Token::Ident(second)),
+        ) = (tokens.first(), tokens.get(1))
+        {
+            if head.eq_ignore_ascii_case("EXPLAIN")
+                && (second.eq_ignore_ascii_case("DELETE") || second.eq_ignore_ascii_case("UPDATE"))
+                && crate::sql::partitioned::tokens_have_partitioned_clause(&tokens)
+            {
+                return self.parse_explain_partitioned_dml(&tokens);
+            }
         }
 
         let is_insert_statement = matches!(
@@ -3106,6 +3226,9 @@ impl EngineCore {
                 self.ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
+                self.check_partitioned_chunk(v.partitioned())?;
+            }
             return Ok(ParsedSql::Delete(stmt));
         }
 
@@ -3120,6 +3243,9 @@ impl EngineCore {
                 self.ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
+                self.check_partitioned_chunk(v.partitioned())?;
+            }
             return Ok(ParsedSql::Update(stmt));
         }
 
@@ -3599,6 +3725,11 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => {
+                    // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
+                    if v.partitioned().is_some() {
+                        let outcome = self.execute_partitioned_delete_form(ctx, session, v)?;
+                        return Ok(crate::sql::SqlOutcome::Delete(outcome));
+                    }
                     if v.returning().is_some() {
                         let outcome = self.execute_predicate_delete_returning_form(
                             crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -3618,6 +3749,13 @@ impl EngineCore {
                 }
             },
             ParsedSql::Update(stmt) => {
+                // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
+                if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
+                    if v.partitioned().is_some() {
+                        let outcome = self.execute_partitioned_update_form(ctx, session, v)?;
+                        return Ok(crate::sql::SqlOutcome::Update(outcome));
+                    }
+                }
                 // `RETURNING`（Issue #1182・SQL-21）は単一行・述語形いずれも
                 // セッション経路（本分岐）でのみ実行結線する（非セッション入口
                 // `execute_update_sql` は `validate_update` が `42601` 拒否する）。
@@ -3643,6 +3781,9 @@ impl EngineCore {
                     stmt,
                 )?;
                 Ok(crate::sql::SqlOutcome::Update(outcome))
+            }
+            ParsedSql::Partitioned(control) => {
+                self.execute_partitioned_control(ctx, session, control)
             }
             // SQL-23・TASK-203（Issue #902）: DDL 実行権限ゲート
             // （`sql::ddl::require_ddl_permission`）を、カタログ照会（対象
@@ -3871,6 +4012,14 @@ impl EngineCore {
             TransactionStatus::Idle => self.execute_parsed_in_session(ctx, session, parsed),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
+                // Issue #1129: 分割実行（`PARTITIONED` 付き `UPDATE`／`DELETE`・`CANCEL`）は
+                // 黙って原子実行へ切り替えず `25001` で拒否する（トランザクションは `Failed`）。
+                if is_partitioned_write(parsed) {
+                    txn.fail();
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction,
+                    );
+                }
                 txn.check_and_register_statement(parsed_operation_id(parsed))?;
                 let result = self.execute_in_active_txn(ctx, session, txn, parsed);
                 if result.is_err() {
@@ -4052,6 +4201,15 @@ impl EngineCore {
             }
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
+            // Issue #1129: `SHOW`・`EXPLAIN` は書き込みも gate も伴わないためトランザクション内でも
+            // autocommit と同じ処理で許可する。`CANCEL` は独立に commit し自セッションの writer と
+            // 衝突するため拒否する（`execute_parsed_in_txn` が先に拒否済みの多層防御）。
+            ParsedSql::Partitioned(control) if control.writes() => {
+                Err(SqlSurfaceError::PartitionedDmlInTransaction)
+            }
+            ParsedSql::Partitioned(control) => {
+                self.execute_partitioned_control(ctx, session, control)
+            }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
             // ファイル形 INSERT・COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
@@ -4467,6 +4625,11 @@ impl EngineCore {
                     )?)),
                     None => Ok(None),
                 }
+            }
+            // Issue #1129: `SHOW`／`CANCEL` は `status`・`rows` の 2 列、`EXPLAIN` は
+            // `QUERY PLAN` 単一列（いずれも入力文の内容によらず固定のため実行しない）。
+            ParsedSql::Partitioned(control) => {
+                Ok(Some(crate::sql::partitioned::describe_columns(control)))
             }
             ParsedSql::Statement(Statement::SetSearchMode { .. }) => Ok(None),
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
@@ -6941,6 +7104,7 @@ impl EngineCore {
             where_predicates,
             operation_id: operation_id.cloned(),
             returning: None,
+            partitioned: None,
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         // 判定 6: 実書き込み（`Self::run_predicate_update` 内部の独自 write トランザクション）。
@@ -6989,6 +7153,7 @@ impl EngineCore {
             where_predicates,
             operation_id: operation_id.cloned(),
             returning: None,
+            partitioned: None,
         };
         let udfs = crate::sql::udf_call::UdfRegistry::default();
         self.run_predicate_delete(
@@ -8044,6 +8209,11 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない
+        // （黙って原子実行へ切り替えない。fail-closed）。
+        if stmt.partitioned().is_some() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
+        }
         let (bound, content_hash_value) = Self::prepare_predicate_delete(stmt, schema, udfs)?;
         crate::sql::exec::execute_predicate_delete_in(
             target,
@@ -8056,6 +8226,166 @@ impl EngineCore {
         )
     }
 
+    /// 述語形 `DELETE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行 form。
+    /// スキーマ取得 → 束縛 → 分割実行用の内容照合ハッシュ（チャンク幅は含めない）→ 分割実行器、
+    /// の順で、原子経路（[`Self::run_predicate_delete`]）の入口とは独立している。autocommit
+    /// 専用（[`crate::tenant::WriteTarget`] を取らない）。`CHUNK n` は実行時にも再検査する。
+    fn execute_partitioned_delete_form(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let clause =
+            stmt.partitioned()
+                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "internal: partitioned DELETE without PARTITIONED clause".to_string(),
+                })?;
+        let limits =
+            crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
+        let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+        let udfs = session.udfs();
+        let bound = crate::sql::parser::bind_predicate_delete(stmt, &schema, udfs)?;
+        let content_hash_value = crate::recovery::content_hash::for_delete_where_partitioned(
+            stmt.table_name(),
+            stmt.where_predicates(),
+            udfs,
+        )?;
+        crate::sql::exec::execute_predicate_delete_partitioned(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            &schema,
+            &content_hash_value,
+            &limits,
+            self.dml_limits.max_affected_rows,
+        )
+    }
+
+    /// 述語形 `UPDATE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行 form。
+    /// [`Self::execute_partitioned_delete_form`] と同じ構成で、UPDATE は分割実行用ハッシュだけを
+    /// 使う（旧ハッシュ互換の `legacy_hashes` は持たない）。
+    fn execute_partitioned_update_form(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let clause =
+            stmt.partitioned()
+                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "internal: partitioned UPDATE without PARTITIONED clause".to_string(),
+                })?;
+        let limits =
+            crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
+        let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+        let udfs = session.udfs();
+        let bound = crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
+        let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = stmt
+            .assignments()
+            .iter()
+            .map(|(name, literal)| (name.as_str(), literal))
+            .collect();
+        let content_hash_value = crate::recovery::content_hash::for_update_where_partitioned(
+            stmt.table_name(),
+            &assignment_refs,
+            stmt.where_predicates(),
+            udfs,
+            &schema,
+        )?;
+        crate::sql::exec::execute_predicate_update_partitioned(
+            &self.storage,
+            ctx,
+            &bound,
+            self.ledger_mode,
+            &schema,
+            &content_hash_value,
+            &limits,
+            self.dml_limits.max_affected_rows,
+        )
+    }
+
+    /// `SHOW`／`CANCEL PARTITIONED DML`・`EXPLAIN ... PARTITIONED`（Issue #1129）の実行。
+    /// `SHOW`・`CANCEL` はユーザーテーブルのカタログを引かず、自テナントのジョブ表だけを
+    /// 見る（該当なしは常に同じ応答。RLS-9）。`EXPLAIN` は束縛（スキーマ取得・述語束縛・
+    /// ハッシュ計算）までで、書き込み・登録簿・ジョブ表には触れない。
+    fn execute_partitioned_control(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        control: &crate::sql::partitioned::PartitionedControl,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::partitioned::PartitionedControl;
+        match control {
+            PartitionedControl::Show(job) => Ok(crate::sql::SqlOutcome::Query(
+                crate::sql::partitioned::execute_show(&self.storage, ctx, job)?,
+            )),
+            PartitionedControl::Cancel(job) => Ok(crate::sql::SqlOutcome::Query(
+                crate::sql::partitioned::execute_cancel(&self.storage, ctx, job)?,
+            )),
+            PartitionedControl::ExplainDelete(stmt) => {
+                let clause = stmt
+                    .partitioned()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal: EXPLAIN DELETE without PARTITIONED clause".to_string(),
+                    })?;
+                let limits = crate::sql::partitioned::apply_chunk_override(
+                    clause,
+                    &self.partitioned_dml_limits,
+                )?;
+                let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+                let udfs = session.udfs();
+                crate::sql::parser::bind_predicate_delete(stmt, &schema, udfs)?;
+                crate::recovery::content_hash::for_delete_where_partitioned(
+                    stmt.table_name(),
+                    stmt.where_predicates(),
+                    udfs,
+                )?;
+                Ok(crate::sql::SqlOutcome::Explain(
+                    crate::sql::partitioned::explain_result(
+                        "delete",
+                        &self.partitioned_dml_limits,
+                        limits.chunk_rows.get(),
+                    ),
+                ))
+            }
+            PartitionedControl::ExplainUpdate(stmt) => {
+                let clause = stmt
+                    .partitioned()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal: EXPLAIN UPDATE without PARTITIONED clause".to_string(),
+                    })?;
+                let limits = crate::sql::partitioned::apply_chunk_override(
+                    clause,
+                    &self.partitioned_dml_limits,
+                )?;
+                let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+                let udfs = session.udfs();
+                crate::sql::parser::bind_predicate_update(stmt, &schema, udfs)?;
+                let assignment_refs: Vec<(&str, &crate::sql::allowlist::InsertLiteral)> = stmt
+                    .assignments()
+                    .iter()
+                    .map(|(name, literal)| (name.as_str(), literal))
+                    .collect();
+                crate::recovery::content_hash::for_update_where_partitioned(
+                    stmt.table_name(),
+                    &assignment_refs,
+                    stmt.where_predicates(),
+                    udfs,
+                    &schema,
+                )?;
+                Ok(crate::sql::SqlOutcome::Explain(
+                    crate::sql::partitioned::explain_result(
+                        "update",
+                        &self.partitioned_dml_limits,
+                        limits.chunk_rows.get(),
+                    ),
+                ))
+            }
+        }
+    }
     /// 述語形 `DELETE` の束縛と内容照合ハッシュ計算（RECOVER-11）。`RETURNING` の
     /// 有無に関わらず**同一の入力**（`stmt.where_predicates()` のみ）からハッシュを
     /// 計算するため、[`Self::run_predicate_delete`] と
@@ -8449,6 +8779,10 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない。
+        if validated.partitioned().is_some() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
+        }
         let (predicate, content_hash_value, legacy_hash) =
             Self::prepare_predicate_update(validated, schema, udfs)?;
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();

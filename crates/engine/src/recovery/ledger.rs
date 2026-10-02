@@ -529,7 +529,7 @@ pub(crate) fn delete_table_in_txn(
 /// （Issue #1127。分割実行の各チャンクが走査前に台帳を引く #1128 の土台）。
 /// 台帳テーブルが未作成なら `false`（`list_tables` で存在確認し、write txn の
 /// `open_table` の自動作成で空テーブルを作らない）。
-#[allow(dead_code)] // #1128 の分割実行器が結線するまで未使用
+// 分割実行器（tenant::partitioned_dml）が各チャンクの走査前に呼ぶ。
 pub(crate) fn lookup_in_write_txn(
     write_txn: &redb::WriteTransaction,
     tenant_id: &str,

@@ -4454,6 +4454,117 @@ fn execute_predicate_update_inner(
     }
 }
 
+/// 述語形 `DELETE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行本体。
+/// 述語評価は原子経路と同じ [`run_where_predicate`] を共有し（第 2 の述語評価器を作らない）、
+/// 実行は [`crate::tenant::partitioned_dml`] の非原子実行器（チャンクごとに commit）へ渡す。
+/// 唯一の到達経路は `core.rs::EngineCore::execute_partitioned_delete_form`（autocommit 専用。
+/// [`crate::tenant::WriteTarget`] を取らず、トランザクション内での分割実行を型で不可能にする）。
+/// `limits` は `CHUNK n` 適用済みの実効設定。成功時は再開をまたいだジョブ累計件数を返し、
+/// 停止は [`crate::sql::partitioned::map_partitioned_failure`] で `VD001`／`VD002`／原因コードへ写す。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_predicate_delete_partitioned(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundPredicateDelete,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    schema: &TableSchema,
+    content_hash_value: &crate::recovery::content_hash::ContentHash,
+    limits: &crate::sql::parser::PartitionedDmlLimits,
+    max_affected_rows: Option<std::num::NonZeroUsize>,
+) -> Result<DeleteOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+    let op_id = bound.operation_id().map(|o| o.as_str()).unwrap_or("");
+    let result = run_where_predicate(
+        schema,
+        bound.metadata_filters(),
+        bound.expr_filters(),
+        bound.or_filters(),
+        |needs_embedding, predicate| {
+            crate::tenant::partitioned_dml::delete_rows_where_partitioned_unchecked(
+                storage,
+                bound.table(),
+                ctx,
+                ledger_write,
+                content_hash_value,
+                Some(schema),
+                needs_embedding,
+                limits,
+                max_affected_rows,
+                predicate,
+            )
+        },
+    );
+    match result {
+        Ok(crate::tenant::partitioned_dml::PartitionedDmlOutcome::Completed { total_rows }) => {
+            Ok(DeleteOutcome {
+                rows_affected: total_rows,
+            })
+        }
+        Err(failure) => Err(crate::sql::partitioned::map_partitioned_failure(
+            failure,
+            op_id,
+            "delete",
+            |e| e,
+        )),
+    }
+}
+
+/// 述語形 `UPDATE ... PARTITIONED [CHUNK n]`（Issue #1129・SQL-19）の実行本体。
+/// [`execute_predicate_delete_partitioned`] と同じ設計。UPDATE は分割実行用ハッシュだけを
+/// 使い、旧ハッシュ互換（`legacy_hashes`）は持たない。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_predicate_update_partitioned(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &BoundPredicateUpdate,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    schema: &TableSchema,
+    content_hash_value: &crate::recovery::content_hash::ContentHash,
+    limits: &crate::sql::parser::PartitionedDmlLimits,
+    max_affected_rows: Option<std::num::NonZeroUsize>,
+) -> Result<UpdateOutcome, SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+    let op_id = bound.operation_id().map(|o| o.as_str()).unwrap_or("");
+    let result = run_where_predicate(
+        schema,
+        bound.metadata_filters(),
+        bound.expr_filters(),
+        bound.or_filters(),
+        |needs_embedding, predicate| {
+            crate::tenant::partitioned_dml::update_rows_where_partitioned_unchecked(
+                storage,
+                bound.table(),
+                ctx,
+                ledger_write,
+                content_hash_value,
+                Some(schema),
+                bound.assignments(),
+                needs_embedding,
+                limits,
+                max_affected_rows,
+                predicate,
+            )
+        },
+    );
+    match result {
+        Ok(crate::tenant::partitioned_dml::PartitionedDmlOutcome::Completed { total_rows }) => {
+            Ok(UpdateOutcome {
+                rows_affected: total_rows,
+            })
+        }
+        Err(failure) => Err(crate::sql::partitioned::map_partitioned_failure(
+            failure,
+            op_id,
+            "update",
+            |e| e,
+        )),
+    }
+}
+
 /// NoSQL 表層（`wire-server::http::query::insert`。Issue #771・TASK-178・NOSQL-6）
 /// の `insert` op が `rows` 配列全体を 1 つの `operation_id` に対応づけて書き込む
 /// ための複数行版。SQL-10 の [`execute_insert`]（1 呼び出し = 1 台帳エントリ）とは

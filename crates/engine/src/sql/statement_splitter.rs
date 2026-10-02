@@ -78,6 +78,11 @@ pub enum MultiStatementError {
     /// 呼び出し元へ届くのは制御文（`BEGIN`／`COMMIT`／`ROLLBACK`）を含む場合のみ。
     /// 本モジュールのドキュメント「原子性」節参照。
     WriteNotLast,
+    /// 文が 2 つ以上のメッセージに分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`）または
+    /// `CANCEL PARTITIONED DML` が含まれる（`25001`。Issue #1129）。複数文メッセージは暗黙
+    /// トランザクションに相当し、分割実行はトランザクション内で実行できないため、黙って
+    /// 原子実行や autocommit へ切り替えず全体を拒否する（何も実行しない）。
+    PartitionedInMultiStatement,
 }
 
 impl ClassifiedError for MultiStatementError {
@@ -85,6 +90,7 @@ impl ClassifiedError for MultiStatementError {
         match self {
             MultiStatementError::TooManyStatements => ErrorClass::PayloadTooLarge,
             MultiStatementError::WriteNotLast => ErrorClass::FeatureNotSupported,
+            MultiStatementError::PartitionedInMultiStatement => ErrorClass::ActiveSqlTransaction,
         }
     }
 
@@ -98,6 +104,10 @@ impl ClassifiedError for MultiStatementError {
                  are only supported as the last statement in a multi-statement query \
                  that contains transaction control statements"
                     .to_string()
+            }
+            // 単一文での `PartitionedDmlInTransaction` と同じ固定文言。
+            MultiStatementError::PartitionedInMultiStatement => {
+                "partitioned DML cannot run inside a transaction block".to_string()
             }
         }
     }
@@ -301,6 +311,9 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
     match first {
         Token::Keyword(Keyword::Select) => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => StatementEffect::ReadOnly,
+        // Issue #1129: `SHOW PARTITIONED DML` はジョブ表の読み取りのみ（commit を伴わない）。
+        // `CANCEL`（書き込み）は未知の先頭語として `Write`（fail-closed）に落とす。
+        Token::Ident(name) if name.eq_ignore_ascii_case("SHOW") => StatementEffect::ReadOnly,
         // WIRE-15・TASK-218: `DECLARE`／`FETCH`／`CLOSE`（カーソル）はいずれも
         // redb の commit を伴わない（`DECLARE` は既存の読み取り経路を 1 回
         // 実行するのみ・`FETCH`／`CLOSE` はセッション内メモリ状態のみを操作する）
@@ -404,6 +417,11 @@ pub fn plan_multi_statement(
     stmts: &[&str],
     session_in_txn: bool,
 ) -> Result<MultiStatementPlan, MultiStatementError> {
+    // Issue #1129: 2 文以上のメッセージに分割実行が含まれていれば全体を拒否する
+    // （メッセージ内の位置・セッション状態によらず。何も実行しない）。
+    if stmts.len() >= 2 && stmts.iter().any(|s| is_partitioned_statement(s)) {
+        return Err(MultiStatementError::PartitionedInMultiStatement);
+    }
     let has_control = stmts.iter().any(|s| {
         matches!(
             classify_statement(s),
@@ -418,6 +436,18 @@ pub fn plan_multi_statement(
         Ok(()) => Ok(MultiStatementPlan::Sequential),
         Err(MultiStatementError::WriteNotLast) => Ok(MultiStatementPlan::ImplicitTransaction),
         Err(other) => Err(other),
+    }
+}
+
+/// 1 文が分割実行（`USING OPERATION_ID ... PARTITIONED` 修飾、または `CANCEL PARTITIONED`）か。
+/// 字句解析に失敗する文は `false`（実行されても許可リスト外で拒否され副作用がない）。
+fn is_partitioned_statement(stmt: &str) -> bool {
+    match tokenize(stmt) {
+        Ok(tokens) => {
+            crate::sql::partitioned::tokens_have_partitioned_clause(&tokens)
+                || crate::sql::partitioned::tokens_are_partitioned_cancel(&tokens)
+        }
+        Err(_) => false,
     }
 }
 
@@ -867,5 +897,73 @@ mod tests {
     fn check_write_placement_rejects_drop_table_not_last() {
         assert!(check_write_placement(&["DROP TABLE docs", "SELECT 1"], false).is_err());
         assert!(check_write_placement(&["SELECT 1", "DROP TABLE docs"], false).is_ok());
+    }
+
+    // --- 分割実行 DML（Issue #1129）---------------------------------------------
+
+    const PARTITIONED_DELETE: &str =
+        "DELETE FROM t WHERE n > 0 USING OPERATION_ID 'op' PARTITIONED CHUNK 2";
+
+    #[test]
+    fn partitioned_statement_in_a_multi_statement_message_is_rejected_at_any_position() {
+        for stmts in [
+            vec![PARTITIONED_DELETE, "SELECT 1"],
+            vec!["SELECT 1", PARTITIONED_DELETE],
+            vec!["SELECT 1", "CANCEL PARTITIONED DML 'op' ON t"],
+            vec!["BEGIN", PARTITIONED_DELETE, "COMMIT"],
+        ] {
+            for in_txn in [false, true] {
+                assert_eq!(
+                    plan_multi_statement(&stmts, in_txn),
+                    Err(MultiStatementError::PartitionedInMultiStatement),
+                    "{stmts:?}"
+                );
+            }
+        }
+        assert_eq!(
+            MultiStatementError::PartitionedInMultiStatement.error_class(),
+            ErrorClass::ActiveSqlTransaction
+        );
+        assert_eq!(
+            MultiStatementError::PartitionedInMultiStatement.client_message(),
+            "partitioned DML cannot run inside a transaction block"
+        );
+    }
+
+    #[test]
+    fn a_column_or_table_named_partitioned_is_not_detected() {
+        for stmt in [
+            "DELETE FROM partitioned WHERE partitioned = 1 USING OPERATION_ID 'op'",
+            "UPDATE t SET partitioned = 'x' WHERE n > 0 USING OPERATION_ID 'op'",
+            "SELECT partitioned FROM t",
+        ] {
+            assert!(!is_partitioned_statement(stmt), "{stmt}");
+        }
+        assert!(is_partitioned_statement(PARTITIONED_DELETE));
+        assert!(is_partitioned_statement(
+            "UPDATE t SET n = 1 WHERE n > 0 USING OPERATION_ID NULL PARTITIONED"
+        ));
+        assert!(is_partitioned_statement("cancel partitioned dml 'x' on t"));
+        // 字句解析に失敗する文は対象外（実行されても許可リスト外で拒否される）。
+        assert!(!is_partitioned_statement(
+            "DELETE FROM t WHERE x = 'unterminated"
+        ));
+        // 単一の分割実行文は複数文ではないので拒否されない。
+        assert_eq!(
+            plan_multi_statement(&[PARTITIONED_DELETE], false),
+            Ok(MultiStatementPlan::Sequential)
+        );
+    }
+
+    #[test]
+    fn show_is_read_only_and_cancel_is_a_write() {
+        assert_eq!(
+            classify_statement("SHOW PARTITIONED DML 'x' ON t"),
+            StatementEffect::ReadOnly
+        );
+        assert_eq!(
+            classify_statement("CANCEL PARTITIONED DML 'x' ON t"),
+            StatementEffect::Write
+        );
     }
 }
