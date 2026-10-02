@@ -48,13 +48,14 @@ use harness::relational_p95::{
     expected_path, inner_product_distance, interleave_with_reference, is_exact_id_set,
     join_scale_label, join_statement, lang_for_id, lang_in_first_n, lang_token,
     order_by_statements, other_tenant_rows, pair_ratio, parse_group, parse_rounds,
-    parse_rows_scale, predicate_statements, qty_for_id, refuse_under_github_actions,
-    render_round_line, render_stage_diff_line, render_stage_round_line, render_stage_summary_line,
-    render_summary_line, render_threshold_line, rotate_arms, round_p95, scale_label,
-    sentinel_dominates, sentinel_qty, sentinel_scale, summarize_rounds, summarize_stage,
-    topk_matches, visible_doc_rows, Group, PredForm, StagePath, StageSummary, JOIN_ROWS,
-    PRED_LIMIT, REFERENCE_ARM, STAGE_E2E, STAGE_IDX_CANDIDATE_RESOLVE, STAGE_IDX_SEARCH_SUBSET,
-    STAGE_PLAIN_COPY, STAGE_PLAIN_SCALAR_EVAL, STAGE_PLAIN_SEARCH, WIDE_LIMIT,
+    parse_rows_scale, predicate_statements, qty_for_id, quantile_nearest_rank,
+    refuse_under_github_actions, render_round_line, render_stage_diff_line,
+    render_stage_round_line, render_stage_summary_line, render_summary_line, render_threshold_line,
+    rotate_arms, round_p95, scale_label, sentinel_dominates, sentinel_qty, sentinel_scale,
+    summarize_rounds, summarize_stage, topk_matches, visible_doc_rows, Group, PredForm, StagePath,
+    StageSummary, JOIN_ROWS, PRED_LIMIT, REFERENCE_ARM, STAGE_E2E, STAGE_IDX_CANDIDATE_RESOLVE,
+    STAGE_IDX_SEARCH_SUBSET, STAGE_PLAIN_COPY, STAGE_PLAIN_SCALAR_EVAL, STAGE_PLAIN_SEARCH,
+    WIDE_LIMIT,
 };
 use harness::rng::DeterministicRng;
 use harness::sql_c1::vector_literal;
@@ -836,12 +837,27 @@ fn measure_predicate_stages(
                     .map(|r| r.0);
             let subset =
                 run_bounded_retain(&config, 0, || stage_idx_search_subset(fx, &slots)).map(|r| r.0);
-            let e2e = run_bounded_retain(&config, 0, || {
+            // e2e は各反復の結果を全件保持（`STAGE_MEASURED` 件・Top-k 行のみで小さい）し、
+            // 計測区間の外で期待 Top-k と照合する（誤った結果を返す経路の時間を採らない）。
+            let e2e = run_bounded_retain(&config, STAGE_MEASURED as usize, || {
                 let mut session = SessionState::default();
-                core.execute_sql_in_session(tenant_ctx, &mut session, &plan.sql)
-                    .unwrap_or_else(|e| fail_closed(format!("{arm}: execute: {e}")))
+                match core.execute_sql_in_session(tenant_ctx, &mut session, &plan.sql) {
+                    Ok(SqlOutcome::Query(result)) => result,
+                    Ok(_) => fail_closed(format!("{arm}: execute: not a query result")),
+                    Err(e) => fail_closed(format!("{arm}: execute: {e}")),
+                }
             })
-            .map(|r| r.0);
+            .unwrap_or_else(|e| fail_closed(format!("{arm}: protocol violation: {e}")));
+            if e2e.1.len() != STAGE_MEASURED as usize {
+                fail_closed(format!("{arm}: e2e results were not retained"));
+            }
+            for result in &e2e.1 {
+                let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+                if !topk_matches(&ids, &plan.ranked, PRED_LIMIT) {
+                    fail_closed(format!("{arm}: e2e result is not the expected top rows"));
+                }
+            }
+            let e2e = Ok(e2e.0);
             let eval =
                 run_bounded_retain(&config, 0, || stage_plain_scalar_eval(fx, &plan.filters))
                     .map(|r| r.0);
@@ -889,7 +905,10 @@ fn measure_predicate_stages(
                     .unwrap_or_else(|e| fail_closed(format!("{arm}: protocol violation: {e}")));
                 let acc = stage_acc(&mut accs, arm, path, stage);
                 acc.samples.extend_from_slice(&m.samples);
-                acc.round_medians.push(m.summary.median);
+                // 段サマリと同じ nearest-rank 定義の中央値（`m.summary.median` は線形補間のため使わない）。
+                let round_median = quantile_nearest_rank(&m.samples, 0.5)
+                    .unwrap_or_else(|e| fail_closed(format!("{arm}: round median: {e}")));
+                acc.round_medians.push(round_median);
                 acc.counts = counts;
             }
         }
