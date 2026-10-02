@@ -775,7 +775,7 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
   JSON 数値のみ受理し（文字列・真偽値は型不一致）、式レーン
   （`udf_call::bind_expr`）で束縛する（Issue #1183）。`BIGINT` の |値| が
-  2^53 を超える場合（JSON リテラル・格納値とも）は `22000`。`TEXT` の範囲比較も
+  2^53 を超える場合（JSON リテラル・格納値とも）は `22003`（`NumericOutOfRange`。HTTP は `400`）。`TEXT` の範囲比較も
   式レーン（バイト順）で受理する。`in` は数値列では従来どおり `22000`。
   述語形 `update`／`delete` の `filter` では数値列の `eq`／`ne`／`between` を
   `0A000` で拒否する
@@ -1060,7 +1060,7 @@ Date: <IMF-fixdate>
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
-| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ |
+| `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ、`BIGINT` が `f64` で正確に表せない値（絶対値が 2^53 超）の拒否 |
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
