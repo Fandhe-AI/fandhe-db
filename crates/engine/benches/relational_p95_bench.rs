@@ -502,8 +502,10 @@ struct StageFixture<'a> {
     ids: Vec<u64>,
     /// 借用して探索に使うスナップショット arena。
     arena: &'a VectorArena,
-    /// `lang` 値 → 候補スロット（昇順）。`ScalarIndex` の等価辞書相当。
-    lang_dict: std::collections::HashMap<String, Vec<u32>>,
+    /// `lang` 値 → 値索引（`ScalarIndex` の `column.equality` 相当）。
+    lang_dict: std::collections::HashMap<String, usize>,
+    /// 値索引 → 候補スロット（昇順。`slots_for_value_index` 相当）。
+    lang_slots: Vec<Vec<u32>>,
     /// `lang` 列だけ true の列マスク（`scan_scalar_columns_masked` 用）。
     lang_mask: Vec<bool>,
     query: &'a [f32],
@@ -523,8 +525,9 @@ impl<'a> StageFixture<'a> {
             .position(|c| c.name == "lang")
             .unwrap_or_else(|| fail_closed("stage fixture: lang column not found"));
         let lang_mask: Vec<bool> = (0..schema.columns.len()).map(|i| i == lang_col).collect();
-        let mut lang_dict: std::collections::HashMap<String, Vec<u32>> =
+        let mut lang_dict: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        let mut lang_slots: Vec<Vec<u32>> = Vec::new();
         for (slot, meta) in metadata.iter().enumerate() {
             let scanned = scan_scalar_columns_masked(schema, meta, Some(&lang_mask))
                 .unwrap_or_else(|e| fail_closed(format!("stage fixture: scan: {e}")));
@@ -537,7 +540,15 @@ impl<'a> StageFixture<'a> {
             };
             let slot = u32::try_from(slot)
                 .unwrap_or_else(|_| fail_closed("stage fixture: slot exceeds u32"));
-            lang_dict.entry(text.to_string()).or_default().push(slot);
+            let next = lang_slots.len();
+            let vi = *lang_dict.entry(text.to_string()).or_insert(next);
+            if vi == next {
+                lang_slots.push(Vec::new());
+            }
+            lang_slots
+                .get_mut(vi)
+                .unwrap_or_else(|| fail_closed("stage fixture: value index out of range"))
+                .push(slot);
         }
         Self {
             schema,
@@ -545,6 +556,7 @@ impl<'a> StageFixture<'a> {
             ids,
             arena,
             lang_dict,
+            lang_slots,
             lang_mask,
             query,
         }
@@ -602,15 +614,26 @@ fn row_matches(fx: &StageFixture<'_>, meta: &[u8], filters: &[MetadataFilter]) -
         .any(|f| matches_all(std::slice::from_ref(f), &scanned))
 }
 
-/// 索引経路の候補解決（`ScalarIndex::candidates_for` と同じ処理順: lookup → 連結 → 整列 → 重複除去）。
+/// 索引経路の候補解決。実経路（`ScalarIndex::candidates_for`）の手順に合わせ、値 → 値索引 →
+/// 候補スロットの順で引く。単一値（`pred_eq`・重複除去後に 1 値の `pred_or_same`）は
+/// スロット列の複製のみで整列・重複除去しない（`FilterOp::Equals` 腕と同じ）。複数値
+/// （IN・OR 形）は値ごとのスロットを連結し、呼び出し元と同じ後処理（整列＋重複除去）を行う
+/// （`FilterOp::InText` 腕＋`sql::exec` の後処理相当。OR 形の実経路は分岐ごとの候補和集合で
+/// あり、ここでは IN 形と同じ連結＋整列で近似する）。
 #[inline(never)]
-fn stage_idx_candidate_resolve(
-    dict: &std::collections::HashMap<String, Vec<u32>>,
-    values: &[&str],
-) -> Vec<u32> {
+fn stage_idx_candidate_resolve(fx: &StageFixture<'_>, values: &[&str]) -> Vec<u32> {
+    let slots_of = |v: &str| {
+        fx.lang_dict
+            .get(v)
+            .and_then(|&vi| fx.lang_slots.get(vi))
+            .map(|s| s.as_slice())
+    };
+    if let [single] = values {
+        return slots_of(single).map(|s| s.to_vec()).unwrap_or_default();
+    }
     let mut out: Vec<u32> = Vec::new();
     for v in values {
-        if let Some(slots) = dict.get(*v) {
+        if let Some(slots) = slots_of(v) {
             out.extend_from_slice(slots);
         }
     }
@@ -775,7 +798,7 @@ fn measure_predicate_stages(
             let Some(plan) = plans.get(idx) else { continue };
             let arm = plan.label;
             // 検証（計測前）: 索引系列。
-            let slots = stage_idx_candidate_resolve(&fx.lang_dict, &plan.values);
+            let slots = stage_idx_candidate_resolve(fx, &plan.values);
             let mut cand_ids = slot_ids(fx, slots.iter().map(|s| u64::from(*s)));
             cand_ids.sort_unstable();
             if cand_ids != plan.expected_ids {
@@ -808,10 +831,9 @@ fn measure_predicate_stages(
                 ));
             }
             // 計測。戻り値の解放は計測区間の外へ出す（`run_bounded_retain` の retain 0）。
-            let cand = run_bounded_retain(&config, 0, || {
-                stage_idx_candidate_resolve(&fx.lang_dict, &plan.values)
-            })
-            .map(|r| r.0);
+            let cand =
+                run_bounded_retain(&config, 0, || stage_idx_candidate_resolve(fx, &plan.values))
+                    .map(|r| r.0);
             let subset =
                 run_bounded_retain(&config, 0, || stage_idx_search_subset(fx, &slots)).map(|r| r.0);
             let e2e = run_bounded_retain(&config, 0, || {
