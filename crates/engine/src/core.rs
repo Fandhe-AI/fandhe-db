@@ -1241,87 +1241,117 @@ struct HnswEngineState {
 /// codex-review P1 指摘対応、PR #266）。
 /// [`EngineCore::execute_bound_predicate_update_in_session`]・[`EngineCore::
 /// execute_bound_predicate_delete_in_session`]（TASK-186・NOSQL-12、
-/// Issue #1062）が `bind` closure の戻り値へ課す多層防御。NoSQL 表層の
+/// Issue #1062・#1356）が `bind` closure の戻り値へ課す多層防御。NoSQL 表層の
 /// `filter` から構築される `WherePredicate` は
-/// `wire-server::http::query::filter::bind_filter_where_predicates` が
-/// `Equality`／`BoolEquality`／`Prefix` のみを生成する契約だが、`bind`
-/// closure 自体は engine の外（wire-server）にあるため、契約が壊れた
-/// 場合に備えてここでも fail-closed に拒否する。
+/// `wire-server::http::query::filter::bind_filter_where_predicates` が SQL の述語形
+/// DML（SQL-19）と同じ語彙（等価・前方一致・範囲比較・`IN`・`BETWEEN`・`IS NULL`・
+/// 数値列の式比較・それらの `NOT`・`OR`）だけを生成する契約だが、`bind` closure 自体は
+/// engine の外（wire-server）にあるため、契約が壊れた場合に備えてここでも
+/// fail-closed に拒否する。
 ///
 /// - 空列（`WHERE` 句省略に相当）は全行対象の DML になりうるため `42601` で拒否する
 ///   （SQL 表層の `WHERE` 句省略が構文段で拒否されることとのパリティ。
 ///   `bind_predicate_delete` 自体には空列を拒否するガードが無いため、
 ///   NoSQL 経路はこの関数が唯一の防御になる）。
-/// - `Equality`／`BoolEquality`／`Prefix`／`Between`／`IsNull` の 5 variant と、
-///   それらを**直接**包む `Not`（内側は再帰しない。Issue #1197・NOSQL-14 の
-///   `ne`／`between`／`like`／`is_null`／`not_null`／`not`）のみを明示的に許可する。
-///   それ以外（`PredicateCall`〔RLS 述語 `visible()`。NoSQL `filter` は列名として
-///   RLS 述語名を拒否するため生成されない契約〕・`Expression`〔wire 層は
-///   `Expr` を構築しない〕・`BoolColumn`・`Compare`・`InList`・`Not(Not)`・
-///   `Not(Compare)` 等の許可 5 variant 以外を包む `Not`・`Or`〔述語形 DML の
-///   `or` は #1118 以来の対象外〕・`InSubquery`／`Exists`〔NoSQL に
-///   サブクエリ構文が無い〕）はすべて `42601` で拒否する（codex-review P2
-///   指摘対応、PR #1121。`_ => {}` によるワイルドカード許可は将来 variant
-///   追加時に無言で穴を開けるため使わず、網羅的 `match` にする）。
+/// - 葉として `Equality`／`BoolEquality`／`Prefix`／`Between`／`IsNull`／`Compare`／
+///   `InList` を許可し、`Not` はそれらを**直接**包む場合に限り許可する（再帰しない。
+///   SQL の `NOT <葉>` と同じ構文形）。
+/// - `Expression` は「列識別子 × 数値リテラルの比較（`= < <= > >=`）」の形に**限り**
+///   許可する（数値 4 型の列向け式レーン。`Expr::Call`＝UDF 呼び出しは持ち込めない
+///   ので既定の UDF レジストリで足りる）。`Not(Expression)` は構文段が演算子反転で
+///   押し下げるため生成されず拒否する。
+/// - `Or` は分岐 2 個以上・各分岐が空でないものに限り許可し、分岐の中身を再帰検査する
+///   （空の分岐は恒真になり fail-open なので拒否。再帰は [`MAX_PREDICATE_DML_DEPTH`]
+///   で打ち切る）。`Not(Or)` は構文段が押し下げるため拒否する。
+/// - それ以外（`PredicateCall`〔RLS 述語 `visible()`。`Or` の内側を含む〕・
+///   `BoolColumn`・`Not(Not)`・許可形以外を包む `Not`・`InSubquery`／`Exists`／
+///   `ScalarSubqueryCompare`〔NoSQL にサブクエリ構文が無い〕）はすべて `42601` で
+///   拒否する。網羅的 `match` にし、将来 variant 追加時に無言で穴が開かないようにする。
 fn reject_unsupported_predicate_dml_forms(
     predicates: &[crate::sql::allowlist::WherePredicate],
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-    use crate::sql::allowlist::WherePredicate;
-
     if predicates.is_empty() {
         return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
             "predicate-form update/delete requires at least one filter predicate",
         ));
     }
+    reject_unsupported_predicate_dml_conjunction(predicates, 0)
+}
+
+/// 述語形 DML の再帰検査の深さ上限（`Or` の入れ子。構文段の上限と同値）。
+const MAX_PREDICATE_DML_DEPTH: usize = crate::sql::udf_call::MAX_EXPR_DEPTH;
+
+/// [`reject_unsupported_predicate_dml_forms`] の再帰本体（`AND` 列 1 本分）。
+fn reject_unsupported_predicate_dml_conjunction(
+    predicates: &[crate::sql::allowlist::WherePredicate],
+    depth: usize,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::allowlist::{SqlSurfaceError, WherePredicate};
+    use crate::sql::udf_call::{BinOp, Expr};
+
+    let unsupported = || {
+        SqlSurfaceError::unsupported(
+            "predicate form is not supported for NoSQL update/delete filter",
+        )
+    };
+    if depth > MAX_PREDICATE_DML_DEPTH {
+        return Err(SqlSurfaceError::payload_too_large(
+            "predicate nesting exceeds the allowed depth",
+        ));
+    }
     for predicate in predicates {
         match predicate {
-            // 契約上 `bind` closure が生成してよい 5 variant のみ許可する
-            // （関数ドキュメント参照）。
             WherePredicate::Equality { .. }
             | WherePredicate::BoolEquality { .. }
             | WherePredicate::Prefix { .. }
             | WherePredicate::Between { .. }
-            | WherePredicate::IsNull { .. } => {}
-            // `Not` は内側が許可 5 variant のいずれかである場合に限り通す
-            // （再帰はしない。`Not(Not)`・`Not(Compare)` 等は拒否。SQL の
-            // `NOT <葉>` と同じ構文形で、述語形 DML でも SQL 表層より広くならない）。
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. } => {}
+            // `Not` は内側が許可葉のいずれかである場合に限り通す（再帰しない）。
             WherePredicate::Not(inner) => match inner.as_ref() {
                 WherePredicate::Equality { .. }
                 | WherePredicate::BoolEquality { .. }
                 | WherePredicate::Prefix { .. }
                 | WherePredicate::Between { .. }
-                | WherePredicate::IsNull { .. } => {}
+                | WherePredicate::IsNull { .. }
+                | WherePredicate::Compare { .. }
+                | WherePredicate::InList { .. } => {}
                 WherePredicate::PredicateCall { .. }
                 | WherePredicate::Expression(_)
                 | WherePredicate::BoolColumn { .. }
-                | WherePredicate::Compare { .. }
-                | WherePredicate::InList { .. }
                 | WherePredicate::Not(_)
                 | WherePredicate::Or(_)
                 | WherePredicate::InSubquery { .. }
                 | WherePredicate::Exists { .. }
-                | WherePredicate::ScalarSubqueryCompare { .. } => {
-                    return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                        "predicate form is not supported for NoSQL update/delete filter",
-                    ));
-                }
+                | WherePredicate::ScalarSubqueryCompare { .. } => return Err(unsupported()),
             },
-            // 契約外の variant はすべて拒否する（codex-review P2 指摘対応、
-            // PR #1121）。`WherePredicate` へ将来 variant が追加された際も
-            // コンパイルエラーで気付けるよう網羅的に列挙する。
+            // 列 × 数値リテラルの比較の形に限る（`Call` 等は持ち込ませない）。
+            WherePredicate::Expression(expr) => match expr {
+                Expr::Binary { op, lhs, rhs }
+                    if matches!(
+                        op,
+                        BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    ) && matches!(lhs.as_ref(), Expr::Ident(_))
+                        && matches!(rhs.as_ref(), Expr::Number(_)) => {}
+                _ => return Err(unsupported()),
+            },
+            WherePredicate::Or(branches) => {
+                if branches.len() < 2 {
+                    return Err(unsupported());
+                }
+                for branch in branches {
+                    if branch.is_empty() {
+                        return Err(unsupported());
+                    }
+                    reject_unsupported_predicate_dml_conjunction(branch, depth.saturating_add(1))?;
+                }
+            }
             WherePredicate::PredicateCall { .. }
-            | WherePredicate::Expression(_)
             | WherePredicate::BoolColumn { .. }
-            | WherePredicate::Compare { .. }
-            | WherePredicate::InList { .. }
-            | WherePredicate::Or(_)
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
-            | WherePredicate::ScalarSubqueryCompare { .. } => {
-                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                    "predicate form is not supported for NoSQL update/delete filter",
-                ));
-            }
+            | WherePredicate::ScalarSubqueryCompare { .. } => return Err(unsupported()),
         }
     }
     Ok(())
@@ -7207,12 +7237,11 @@ impl EngineCore {
     /// 3. `bind` closure で SET 割当・`WHERE` 述語列を得る（呼び出し元は
     ///    `wire-server::http::query::update::map_set_assignments` と
     ///    `filter::bind_filter_where_predicates` を使う）
-    /// 4. `bind` が返した `WherePredicate` 列を検査する（`Equality`／
-    ///    `BoolEquality`／`Prefix`／`Between`／`IsNull` とそれらを直接包む
-    ///    `Not` のみ許可し、空列を含むそれ以外〔`PredicateCall`／`Expression`／
-    ///    `BoolColumn`／`Compare`／`InList`／`Or`／`Not(Not)` 等／`InSubquery`／`Exists`〕
-    ///    は `42601` で拒否。NoSQL `filter` 経由では構造上生成されない形への
-    ///    多層防御。[`reject_unsupported_predicate_dml_forms`] 参照）
+    /// 4. `bind` が返した `WherePredicate` 列を検査する（等価・前方一致・範囲比較・
+    ///    `IN`・`BETWEEN`・`IS NULL`・列×数値リテラルの式比較・直接包む `Not`・
+    ///    `Or` のみ許可し、空列を含むそれ以外〔`PredicateCall`／`BoolColumn`／
+    ///    `Not(Not)` 等／`InSubquery`／`Exists`〕は `42601` で拒否。
+    ///    [`reject_unsupported_predicate_dml_forms`] 参照）
     /// 5. ガード済みの `operation_id`（`bind` closure の外で確定済みの
     ///    引数そのもの）から [`crate::sql::allowlist::ValidatedPredicateUpdate`]
     ///    を engine 内部で構築する（`pub(crate)` フィールドへの struct
@@ -7226,8 +7255,9 @@ impl EngineCore {
     ///    へ渡す
     ///
     /// UDF レジストリは [`crate::sql::udf_call::UdfRegistry::default()`] を
-    /// 渡す（NoSQL 表層にはセッション UDF が無く、wire 層は `Expression` 述語を
-    /// 生成しないため——判定 4 が `Expression` を拒否することの前提でもある）。
+    /// 渡す（NoSQL 表層にはセッション UDF が無く、wire 層は列×数値リテラルの比較に
+    /// 限って `Expression` 述語を生成する——判定 4 が `Expr::Call` を拒否することの
+    /// 前提でもある）。
     pub fn execute_bound_predicate_update_in_session<F>(
         &self,
         ctx: &PolicyContext,
@@ -11644,20 +11674,37 @@ mod tests {
         assert_eq!(err.wire_code(), "42P01");
     }
 
-    // codex-review P2 指摘対応（PR #1121）: `reject_unsupported_predicate_dml_forms`
-    // が契約外の `WherePredicate` variant（`Compare`／`BoolColumn`・`Not` に包んだ
-    // `Equality`）を `_ => {}` で通過させていた欠陥の回帰テスト。許可 variant
-    // （Issue #1197 で `Between`／`IsNull` と直接包む `Not` を追加）は受理し、
-    // それ以外はすべて `42601` で拒否することを確認する。
+    // codex-review P2 指摘対応（PR #1121）・Issue #1356: `reject_unsupported_predicate_dml_forms`
+    // の許可範囲（述語形 DML の SQL パリティ）を固定する。許可形は受理し、それ以外は
+    // すべて `42601` で拒否する。
     #[test]
     fn reject_unsupported_predicate_dml_forms_allows_only_the_documented_variants() {
         use crate::sql::allowlist::{CompareOp, WherePredicate};
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        let eq = |v: &str| WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: v.to_string(),
+        };
+        let num = |op: BinOp, n: &str| {
+            WherePredicate::Expression(Expr::Binary {
+                op,
+                lhs: Box::new(Expr::Ident("qty".to_string())),
+                rhs: Box::new(Expr::Number(n.to_string())),
+            })
+        };
+        let compare = WherePredicate::Compare {
+            column: "amount".to_string(),
+            op: CompareOp::Lt,
+            value: "1".to_string(),
+        };
+        let in_list = WherePredicate::InList {
+            column: "lang".to_string(),
+            values: vec!["ja".to_string()],
+        };
 
         let allowed = [
-            WherePredicate::Equality {
-                column: "lang".to_string(),
-                value: "ja".to_string(),
-            },
+            eq("ja"),
             WherePredicate::BoolEquality {
                 column: "flag".to_string(),
                 value: true,
@@ -11675,19 +11722,25 @@ mod tests {
                 column: "flag".to_string(),
                 negated: false,
             },
-            WherePredicate::Not(Box::new(WherePredicate::Equality {
-                column: "lang".to_string(),
-                value: "ja".to_string(),
-            })),
+            WherePredicate::Not(Box::new(eq("ja"))),
             WherePredicate::Not(Box::new(WherePredicate::IsNull {
                 column: "flag".to_string(),
                 negated: false,
             })),
-            WherePredicate::Not(Box::new(WherePredicate::Between {
-                column: "amount".to_string(),
-                low: "1".to_string(),
-                high: "2".to_string(),
-            })),
+            compare.clone(),
+            in_list.clone(),
+            WherePredicate::Not(Box::new(compare.clone())),
+            WherePredicate::Not(Box::new(in_list.clone())),
+            num(BinOp::Eq, "5"),
+            num(BinOp::Le, "5"),
+            WherePredicate::Or(vec![vec![eq("ja")], vec![eq("en")]]),
+            WherePredicate::Or(vec![
+                vec![num(BinOp::Ge, "1"), num(BinOp::Le, "5")],
+                vec![WherePredicate::Or(vec![
+                    vec![eq("ja")],
+                    vec![compare.clone()],
+                ])],
+            ]),
         ];
         for predicate in allowed {
             assert!(
@@ -11696,52 +11749,45 @@ mod tests {
             );
         }
 
+        let call_expr = WherePredicate::Expression(Expr::Binary {
+            op: BinOp::Eq,
+            lhs: Box::new(Expr::Call {
+                name: "abs".to_string(),
+                args: vec![Expr::Ident("qty".to_string())],
+            }),
+            rhs: Box::new(Expr::Number("1".to_string())),
+        });
         let rejected = [
             WherePredicate::BoolColumn {
                 column: "flag".to_string(),
             },
-            WherePredicate::Compare {
-                column: "amount".to_string(),
-                op: CompareOp::Lt,
-                value: "1".to_string(),
+            WherePredicate::PredicateCall {
+                name: "visible".to_string(),
             },
-            WherePredicate::InList {
-                column: "lang".to_string(),
-                values: vec!["ja".to_string()],
-            },
-            // `Not` は許可 5 variant を直接包む場合だけ通す。入れ子の `Not`・
-            // `Or`・`Compare` を包む `Not` は語彙外（再帰的に通過させない）。
-            WherePredicate::Not(Box::new(WherePredicate::Not(Box::new(
-                WherePredicate::Equality {
-                    column: "lang".to_string(),
-                    value: "ja".to_string(),
-                },
-            )))),
-            WherePredicate::Not(Box::new(WherePredicate::Compare {
-                column: "amount".to_string(),
-                op: CompareOp::Lt,
-                value: "1".to_string(),
-            })),
+            // `Not` は許可葉を直接包む場合だけ通す。
+            WherePredicate::Not(Box::new(WherePredicate::Not(Box::new(eq("ja"))))),
+            WherePredicate::Not(Box::new(num(BinOp::Eq, "5"))),
             WherePredicate::Not(Box::new(WherePredicate::Or(vec![
-                vec![WherePredicate::Equality {
-                    column: "lang".to_string(),
-                    value: "ja".to_string(),
-                }],
-                vec![WherePredicate::Equality {
-                    column: "lang".to_string(),
-                    value: "en".to_string(),
-                }],
+                vec![eq("ja")],
+                vec![eq("en")],
             ]))),
+            // 式述語は「列 × 数値リテラルの比較」に限る。
+            call_expr.clone(),
+            WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Ident("qty".to_string())),
+                rhs: Box::new(Expr::Number("1".to_string())),
+            }),
+            // `Or` は 2 分岐以上・空分岐なし・内側の RLS 述語／呼び出し式も拒否。
+            WherePredicate::Or(vec![vec![eq("ja")]]),
+            WherePredicate::Or(vec![vec![eq("ja")], vec![]]),
             WherePredicate::Or(vec![
-                vec![WherePredicate::Equality {
-                    column: "lang".to_string(),
-                    value: "ja".to_string(),
-                }],
-                vec![WherePredicate::Equality {
-                    column: "lang".to_string(),
-                    value: "en".to_string(),
+                vec![eq("ja")],
+                vec![WherePredicate::PredicateCall {
+                    name: "visible".to_string(),
                 }],
             ]),
+            WherePredicate::Or(vec![vec![eq("ja")], vec![call_expr]]),
         ];
         for predicate in rejected {
             let err = reject_unsupported_predicate_dml_forms(std::slice::from_ref(&predicate))
@@ -11752,5 +11798,11 @@ mod tests {
                 "unexpected wire_code for {predicate:?}: {err:?}"
             );
         }
+        assert_eq!(
+            reject_unsupported_predicate_dml_forms(&[])
+                .expect_err("empty predicate list must be rejected")
+                .wire_code(),
+            "42601"
+        );
     }
 }
