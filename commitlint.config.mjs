@@ -28,5 +28,13 @@ export default {
   // 問わず 1 行目だけを比較する。
   ignores: [
     (commit) => commit.split('\n', 1)[0] === 'merge: origin/main を取り込み',
+    // PR #1386（Issue #1354）の中間コミット 2 件は本文に 1 行 100 文字超の行を持ち
+    // body-max-line-length に違反する。共有済みブランチの force-push を避けるため、
+    // 上記と同方針で subject 行の完全一致に限定して検証対象から除外する。
+    (commit) =>
+      [
+        'test(wire): 新しい BEGIN 内の再送による成否確定を層 A と 3 クライアントで検証する',
+        'test(engine): 明示トランザクションの再送で台帳照合が行制約より先に走ることを固定する',
+      ].includes(commit.split('\n', 1)[0]),
   ],
 };
