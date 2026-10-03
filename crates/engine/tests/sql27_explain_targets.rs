@@ -924,7 +924,16 @@ fn scalar_order_by_aggregate_explain_does_not_execute_body() {
     let count = core
         .execute_sql(&ctx("tenant-a"), "SELECT COUNT(id) FROM docs")
         .expect("count after EXPLAIN");
-    assert_eq!(count.rows.len(), 1);
+    let cell = count
+        .rows
+        .into_iter()
+        .next()
+        .expect("count row")
+        .cells
+        .into_iter()
+        .next()
+        .expect("count cell");
+    assert_eq!(cell, Cell::Integer(2));
 }
 
 #[test]
