@@ -840,24 +840,9 @@ fn dml_inside_transaction_does_not_touch_other_tenants_rows() {
     assert_eq!(ids(&core, &ctx("bob"), "docs").len(), 3);
 }
 
-#[test]
-fn file_form_insert_stays_unsupported_inside_transaction() {
-    let (core, path) = new_core("txn-dml-file-form");
-    let _guard = CleanupGuard(path);
-    let sys = ctx("sys");
-    ok(
-        &core,
-        &sys,
-        "CREATE TABLE files (path TEXT, body TEXT, embedding VECTOR(2))",
-    );
-    let mut tx = Tx::new(&core, "alice");
-    tx.ok("BEGIN");
-    let code = tx.err_code(
-        "INSERT INTO files (path, body) VALUES ('a.txt', 'hello') USING OPERATION_ID 'f1'",
-    );
-    assert_eq!(code, "0A000");
-    assert_eq!(tx.status(), TransactionStatus::Failed);
-}
+// ファイル形 `INSERT` の明示トランザクション対応（Issue #1353）は
+// `sql31_txn_file_insert_using_plan.rs` が検証する。
+
 // --- 未 commit 変更の読み取り（read-your-writes） ---------------------------------
 
 fn rows_of(outcome: SqlOutcome) -> Vec<Vec<String>> {
