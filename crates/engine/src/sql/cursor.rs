@@ -300,7 +300,7 @@ fn estimate_array_bytes(arr: &crate::row_codec::ArrayValue) -> usize {
     arr.approx_heap_bytes().saturating_add(8)
 }
 
-fn estimate_result_bytes(result: &QueryResult) -> usize {
+pub(crate) fn estimate_result_bytes(result: &QueryResult) -> usize {
     result.rows.iter().fold(0usize, |acc, row| {
         acc.saturating_add(estimate_row_bytes(row))
     })

@@ -10548,6 +10548,7 @@ fn validate_select_statement(
                     || !shape.order_by.is_empty()
                     || !shape.order_keys.is_empty()
                     || !shape.window_items.is_empty()
+                    || !shape.scalar_subquery_items.is_empty()
                     || matches!(shape.projection, Projection::Items(_))
                 {
                     return Err(SqlSurfaceError::unsupported(

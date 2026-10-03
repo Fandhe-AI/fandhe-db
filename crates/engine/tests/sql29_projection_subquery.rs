@@ -304,3 +304,43 @@ fn projection_subquery_ignores_other_tenant_rows() {
     // 陽性対照: tenant-b 自身には refs が 20 行見えるため複数行エラー。
     assert_eq!(code(&core, &b, &q), "22000");
 }
+#[test]
+fn projection_subquery_runtime_error_is_deferred_until_outer_has_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+
+    // 内側の集計の数値あふれ（22003）は、外側が 0 行なら発生せず、行があれば返る。
+    ins(&core, &ctx, REFS, 5, "big1", Some(i64::MAX));
+    ins(&core, &ctx, REFS, 6, "big2", Some(i64::MAX));
+    let inner = format!("(SELECT SUM(qty) FROM {REFS} WHERE qty > 100)");
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert!(run(&core, &ctx, &none).rows.is_empty());
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    assert_eq!(code(&core, &ctx, &some), "22003");
+}
+
+#[test]
+fn projection_subquery_on_buffered_view_is_rejected_not_dropped() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!("CREATE VIEW bv AS SELECT name FROM {ITEMS} LIMIT 10"),
+    )
+    .expect("create view");
+    let err = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!("SELECT name, (SELECT qty FROM {REFS} LIMIT 1) FROM bv LIMIT 10"),
+        )
+        .expect_err("must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}

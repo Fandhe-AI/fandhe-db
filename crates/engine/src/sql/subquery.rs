@@ -846,7 +846,7 @@ fn resolve_in_subquery(
     bools.dedup();
     ints.sort_unstable();
     ints.dedup();
-    floats.sort_unstable_by(f64::total_cmp);
+    floats.sort_by(f64::total_cmp);
     floats.dedup();
     let distinct = texts.len() + bools.len() + ints.len() + floats.len();
     // 整数・浮動小数列は値ごとの式述語（式ノード予算あり）へ展開するため、1 サイトの
@@ -1031,6 +1031,10 @@ pub(crate) struct ResolvedScalarItem {
     /// 内側が 2 行以上を返したか。外側の結果が 1 行以上のときだけエラーにする
     /// （PostgreSQL の遅延評価と同じ。判定は自テナント可視行のみで決まる）。
     multi_row: bool,
+    /// 内側の実行時エラー（式評価のデータ例外 `22xxx`。0 除算 `22012`・数値あふれ `22003` 等。静的な `22000` は含めない）。外側が 1 行以上の
+    /// ときだけ返す（PostgreSQL の遅延評価と同じ。外側 0 行では内側は評価されない）。
+    /// 静的エラー（`42xxx`・`22000`・`54000` 等）はここへ入れず解決時点で即返す。
+    deferred_error: Option<SqlSurfaceError>,
 }
 
 /// 投影位置のスカラーサブクエリ（Issue #1352・SQL-29 (a)・RLS-10 (b)・TASK-213）を
@@ -1052,7 +1056,7 @@ pub(crate) fn resolve_scalar_projection_items(
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let result = execute_inner_query(
+        let result = match execute_inner_query(
             &item.inner_tokens,
             item.depth,
             InnerScanIntent::ScalarValue,
@@ -1063,7 +1067,23 @@ pub(crate) fn resolve_scalar_projection_items(
             udfs,
             budget,
             in_value_budget,
-        )?;
+        ) {
+            Ok(r) => r,
+            // 実行時エラーのみ外側の行数が判明するまで遅延する（メタデータは得られない
+            // ため `Computed`・型なしの代替列で位置を確保する）。それ以外は即返す。
+            Err(e) if e.wire_code().starts_with("22") && e.wire_code() != "22000" => {
+                let name = item.alias.clone().unwrap_or_else(|| "?column?".to_string());
+                out.push(ResolvedScalarItem {
+                    position: item.position,
+                    meta: ColumnMeta::Computed { name, ty: None },
+                    cell: Cell::Null,
+                    multi_row: false,
+                    deferred_error: Some(e),
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if result.columns.len() != 1 {
             return Err(SqlSurfaceError::unsupported(
                 "subquery used as a value must select exactly one column",
@@ -1110,6 +1130,7 @@ pub(crate) fn resolve_scalar_projection_items(
             meta,
             cell,
             multi_row,
+            deferred_error: None,
         });
     }
     Ok(out)
@@ -1120,7 +1141,7 @@ pub(crate) fn resolve_scalar_projection_items(
 ///
 /// - 内側が 2 行以上で外側の結果が 1 行以上なら `22000`（PostgreSQL の `21000` 相当。
 ///   `wire_code` 表に無いため既存分類）。外側が 0 行ならエラーにしない。
-/// - 追加セルの推定バイト（全行ぶん）を確保前に `checked_*` で検査し、結果バイト上限
+/// - 外側結果の推定バイトに追加セルの推定バイト（全行ぶん）を加えた合計を確保前に `checked_*` で検査し、結果バイト上限
 ///   （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]。`sql::scan` の結果バイト上限と同値）を
 ///   超えれば `54000`。
 /// - 位置が現在の列数を超える場合は `Internal`（fail-closed。添字アクセスは使わない）。
@@ -1128,12 +1149,21 @@ pub(crate) fn merge_scalar_projection_items(
     mut result: super::exec::QueryResult,
     items: Vec<ResolvedScalarItem>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    if !result.rows.is_empty() {
+        if let Some(e) = items.iter().find_map(|i| i.deferred_error.clone()) {
+            return Err(e);
+        }
+    }
     if !result.rows.is_empty() && items.iter().any(|i| i.multi_row) {
         return Err(SqlSurfaceError::invalid_input(
             "more than one row returned by a subquery used as an expression",
         ));
     }
-    let mut total_bytes: usize = 0;
+    // 外側結果の使用量を引き継ぎ、追加分との合計を確保前に検査する。
+    let mut total_bytes: usize = super::cursor::estimate_result_bytes(&result);
+    if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
+        return Err(merge_too_large());
+    }
     for item in &items {
         let per_cell = std::mem::size_of::<Cell>()
             .checked_add(super::cursor::estimate_cell_bytes(&item.cell))
