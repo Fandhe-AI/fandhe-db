@@ -9,7 +9,32 @@ export default {
     // 固有名詞・識別子で始まることが多く、config-conventional の subject-case
     // （sentence-case 等の禁止）と構造的に衝突するため大文字小文字の検査は無効化する
     'subject-case': [0],
+    // 標準の body-max-line-length は下記プラグインの限定版へ置き換える。
+    // 対象は本文行の長さ検査のみで、他の全規則は全コミットへ適用し続ける。
+    'body-max-line-length': [0],
+    'local/body-max-line-length-with-exemptions': [2, 'always', 100],
   },
+  plugins: [
+    {
+      rules: {
+        // PR #1386（Issue #1354）の中間コミット 2 件は本文に 100 文字超の行を持つ。
+        // 共有済みブランチの force-push を避けるため、この 2 件の subject 完全一致に
+        // 限り本文行長の検査だけを免除する。type・subject・footer 等の検査は免除せず、
+        // それ以外のコミットは標準と同じく 1 行 100 文字（既定。設定値で上書き）で検査する。
+        'local/body-max-line-length-with-exemptions': (parsed, _when, value) => {
+          const exempt = [
+            'test(wire): 新しい BEGIN 内の再送による成否確定を層 A と 3 クライアントで検証する',
+            'test(engine): 明示トランザクションの再送で台帳照合が行制約より先に走ることを固定する',
+          ];
+          if (exempt.includes(parsed.header)) return [true];
+          const limit = typeof value === 'number' ? value : 100;
+          const lines = (parsed.body ?? '').split('\n');
+          const bad = lines.find((l) => /^\s*https?:\/\//.test(l) ? false : [...l].length > limit);
+          return [bad === undefined, `body's lines must not be longer than ${limit} characters`];
+        },
+      },
+    },
+  ],
   // `git merge --no-edit`（origin/main 取り込み）が生成する既定のマージコミット
   // メッセージ（「Merge branch '...' into ...」等）は commitlint の
   // `defaultIgnores` により既に対象外だが、過去に本リポで使われていた
@@ -28,13 +53,5 @@ export default {
   // 問わず 1 行目だけを比較する。
   ignores: [
     (commit) => commit.split('\n', 1)[0] === 'merge: origin/main を取り込み',
-    // PR #1386（Issue #1354）の中間コミット 2 件は本文に 1 行 100 文字超の行を持ち
-    // body-max-line-length に違反する。共有済みブランチの force-push を避けるため、
-    // 上記と同方針で subject 行の完全一致に限定して検証対象から除外する。
-    (commit) =>
-      [
-        'test(wire): 新しい BEGIN 内の再送による成否確定を層 A と 3 クライアントで検証する',
-        'test(engine): 明示トランザクションの再送で台帳照合が行制約より先に走ることを固定する',
-      ].includes(commit.split('\n', 1)[0]),
   ],
 };
