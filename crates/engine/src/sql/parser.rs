@@ -2179,6 +2179,7 @@ pub(crate) fn bind_column_default(
             ScalarRef::Enum(s) => Ok(Value::Enum(s.to_string())),
             ScalarRef::Uuid(u) => Ok(Value::Uuid(u)),
             ScalarRef::Timestamp(t) => Ok(Value::Timestamp(t)),
+            ScalarRef::Json(j) => Ok(Value::Json(j.to_string())),
             _ => Err(SqlSurfaceError::invalid_input(format!(
                 "column {:?} DEFAULT is not compatible with its type",
                 column.name
@@ -8898,5 +8899,22 @@ mod tests {
         )
         .expect("valid UUID default");
         assert!(matches!(ok, crate::row_codec::Value::Uuid(_)));
+
+        // JSON／JSONB（Issue #1337）: 構文不正・JSONB の非正規形は 22P02。
+        let ok = bind_column_default(&col(ColumnType::Json), &text("{\"b\": 1}"))
+            .expect("valid JSON default");
+        assert_eq!(ok, crate::row_codec::Value::Json("{\"b\": 1}".to_string()));
+        let ok = bind_column_default(&col(ColumnType::Jsonb), &text("{\"a\":1}"))
+            .expect("canonical JSONB default");
+        assert_eq!(ok, crate::row_codec::Value::Json("{\"a\":1}".to_string()));
+        for (ty, bad) in [
+            (ColumnType::Json, "abc"),
+            (ColumnType::Jsonb, "{\"a\":"),
+            (ColumnType::Jsonb, "{\"b\": 1}"),
+        ] {
+            let err = bind_column_default(&col(ty), &text(bad))
+                .expect_err("invalid JSON default must be rejected");
+            assert_eq!(err.wire_code(), "22P02");
+        }
     }
 }

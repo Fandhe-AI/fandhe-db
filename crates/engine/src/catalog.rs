@@ -2690,7 +2690,9 @@ impl ColumnDefault {
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Uuid
-                    | ColumnType::Enum(_),
+                    | ColumnType::Enum(_)
+                    | ColumnType::Json
+                    | ColumnType::Jsonb,
             ) | (
                 ColumnDefault::Number(_),
                 ColumnType::Integer
@@ -3610,6 +3612,18 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             if !default.compatible_with(&column.ty) {
                 return Err(CatalogError::Invalid(format!(
                     "column {:?} has a DEFAULT that is not compatible with its type",
+                    column.name
+                )));
+            }
+            // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
+            // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
+            // ここで拒否しないと Rust API 経由の作成が成功した後にスキーマが読み込み
+            // 不能になる（Issue #1337）。
+            if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb)
+                && crate::row_codec::default_scalar(&column.ty, default).is_err()
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "column {:?} has a malformed JSON DEFAULT",
                     column.name
                 )));
             }
@@ -5680,6 +5694,22 @@ fn decode_schema_body(
                     // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
                     // による型整合は後続の `validate_schema` が担う。
                     column.default = ColumnDefault::decode_catalog_field(field)?;
+                    // JSON／JSONB の既定値は読み出し時補完が再検証を省く
+                    // （`row_codec::default_scalar_for_read`。Issue #1337）ため、
+                    // 構文・JSONB 正規形の完全検証をここ（デコード時）で済ませ、
+                    // 破損カタログ値を読み込み不能にする（fail-closed）。
+                    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb) {
+                        if let Some(default) = &column.default {
+                            crate::row_codec::default_scalar(&column.ty, default).map_err(
+                                |_| {
+                                    CatalogError::Invalid(format!(
+                                        "column {:?} has a malformed JSON DEFAULT",
+                                        column.name
+                                    ))
+                                },
+                            )?;
+                        }
+                    }
                 }
                 columns.push(column);
             }
@@ -8923,7 +8953,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
         (default, tag),
         (
             ColumnDefault::Text(_),
-            "text" | "date" | "timestamp" | "uuid" | "enum"
+            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb"
         ) | (
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
@@ -10005,6 +10035,23 @@ mod tests {
         assert_eq!(names(&storage), vec!["sib_hnsw".to_string()]);
     }
 
+    /// Rust API 直接構築の JSON／JSONB DEFAULT も永続化前に検証される
+    /// （構文不正・JSONB 非正規形は拒否、正規形は受理。Issue #1337）。
+    #[test]
+    fn validate_schema_checks_json_and_jsonb_defaults() {
+        let build = |ty: ColumnType, text: &str| {
+            let mut col = ColumnDef::new("j", ty, true);
+            col.default = Some(ColumnDefault::Text(text.to_string()));
+            TableSchema::new("docs", vec![col])
+        };
+        assert!(validate_schema(&build(ColumnType::Json, "{\"a\": 1}")).is_ok());
+        assert!(validate_schema(&build(ColumnType::Json, "{not json")).is_err());
+        assert!(validate_schema(&build(ColumnType::Jsonb, "{\"a\":1}")).is_ok());
+        // 非正規形（空白・キー順）は拒否する。
+        assert!(validate_schema(&build(ColumnType::Jsonb, "{\"b\": 1, \"a\": 2}")).is_err());
+        assert!(validate_schema(&build(ColumnType::Jsonb, "{bad")).is_err());
+    }
+
     #[test]
     fn validate_schema_rejects_more_than_one_vector_column() {
         let schema = TableSchema::new(
@@ -10090,6 +10137,51 @@ mod tests {
         );
     }
 
+    /// 破損した JSON／JSONB の DEFAULT（構文不正・JSONB 非正規形）を持つカタログ値は、
+    /// デコード時に拒否される（読み出し時補完が再検証を省くための fail-closed。Issue #1337）。
+    #[test]
+    fn decode_rejects_malformed_json_defaults() {
+        for (ty, bad) in [
+            (ColumnType::Json, "{not json"),
+            (ColumnType::Jsonb, "{\"b\": 1,  \"a\":2}"),
+            (ColumnType::Jsonb, "{not json"),
+        ] {
+            // `encode_schema` は永続化前検証（`validate_schema`）を通るため不正値を
+            // エンコードできない。有効な目印の既定値（JSON 文字列 `"zq"`）で作った
+            // バイト列の既定値フィールド（16 進）を不正値へ差し替えて破損カタログを再現する。
+            let schema = TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                    ColumnDef::new("j", ty, true)
+                        .with_default(ColumnDefault::Text("\"zq\"".to_string())),
+                ],
+            );
+            let encoded = encode_schema(&schema).expect("encode should succeed");
+            let marker = "s227a7122";
+            let bad_field = format!(
+                "s{}",
+                bad.bytes().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+            let text = String::from_utf8(encoded).expect("catalog encoding is UTF-8");
+            assert_eq!(text.matches(marker).count(), 1);
+            let corrupted = text.replace(marker, &bad_field);
+            assert!(
+                decode_schema("docs", corrupted.as_bytes()).is_err(),
+                "malformed JSON default must be rejected: {bad}"
+            );
+        }
+        let ok = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("j", ColumnType::Json, true)
+                    .with_default(ColumnDefault::Text("{\"a\":1}".to_string())),
+            ],
+        );
+        let encoded = encode_schema(&ok).expect("encode should succeed");
+        assert_eq!(decode_schema("docs", &encoded).expect("decode"), ok);
+    }
     /// `PRIMARY KEY`（Issue #903・v4）と `DEFAULT`（Issue #904・v5）の両方を
     /// 持つスキーマは v5 で書かれ、`pk:` 行（非空）・`default` フィールドの
     /// 両方が往復すること（base 取り込みマージで両フォーマットを統合した際の
@@ -11032,6 +11124,26 @@ mod tests {
         assert!(column_default_compatible_with_tag(&text, "uuid"));
         assert!(!column_default_compatible_with_tag(&num, "uuid"));
         assert!(!column_default_compatible_with_tag(&flag, "uuid"));
+    }
+
+    /// `JSON`／`JSONB` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1337）。完全版と軽量版が一致し、`BYTEA`／配列は引き続き非対応。
+    #[test]
+    fn json_columns_accept_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("{\"a\":1}".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        for (ty, tag) in [(ColumnType::Json, "json"), (ColumnType::Jsonb, "jsonb")] {
+            assert!(text.compatible_with(&ty));
+            assert!(!num.compatible_with(&ty));
+            assert!(!flag.compatible_with(&ty));
+            assert!(column_default_compatible_with_tag(&text, tag));
+            assert!(!column_default_compatible_with_tag(&num, tag));
+            assert!(!column_default_compatible_with_tag(&flag, tag));
+        }
+        assert!(!text.compatible_with(&ColumnType::Bytea));
+        assert!(!column_default_compatible_with_tag(&text, "bytea"));
+        assert!(!column_default_compatible_with_tag(&text, "array"));
     }
 
     /// `create_table` 経路でも、登録済み語彙にないラベルの ENUM DEFAULT は write txn 内の
