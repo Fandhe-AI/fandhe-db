@@ -5682,6 +5682,22 @@ fn decode_schema_body(
                     // 読み込み不能にする）」方針。`ColumnDefault::compatible_with`
                     // による型整合は後続の `validate_schema` が担う。
                     column.default = ColumnDefault::decode_catalog_field(field)?;
+                    // JSON／JSONB の既定値は読み出し時補完が再検証を省く
+                    // （`row_codec::default_scalar_for_read`。Issue #1337）ため、
+                    // 構文・JSONB 正規形の完全検証をここ（デコード時）で済ませ、
+                    // 破損カタログ値を読み込み不能にする（fail-closed）。
+                    if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb) {
+                        if let Some(default) = &column.default {
+                            crate::row_codec::default_scalar(&column.ty, default).map_err(
+                                |_| {
+                                    CatalogError::Invalid(format!(
+                                        "column {:?} has a malformed JSON DEFAULT",
+                                        column.name
+                                    ))
+                                },
+                            )?;
+                        }
+                    }
                 }
                 columns.push(column);
             }
@@ -10092,6 +10108,40 @@ mod tests {
         );
     }
 
+    /// 破損した JSON／JSONB の DEFAULT（構文不正・JSONB 非正規形）を持つカタログ値は、
+    /// デコード時に拒否される（読み出し時補完が再検証を省くための fail-closed。Issue #1337）。
+    #[test]
+    fn decode_rejects_malformed_json_defaults() {
+        for (ty, bad) in [
+            (ColumnType::Json, "{not json"),
+            (ColumnType::Jsonb, "{\"b\": 1,  \"a\":2}"),
+            (ColumnType::Jsonb, "{not json"),
+        ] {
+            let schema = TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                    ColumnDef::new("j", ty, true)
+                        .with_default(ColumnDefault::Text(bad.to_string())),
+                ],
+            );
+            let encoded = encode_schema(&schema).expect("encode should succeed");
+            assert!(
+                decode_schema("docs", &encoded).is_err(),
+                "malformed JSON default must be rejected: {bad}"
+            );
+        }
+        let ok = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("j", ColumnType::Json, true)
+                    .with_default(ColumnDefault::Text("{\"a\":1}".to_string())),
+            ],
+        );
+        let encoded = encode_schema(&ok).expect("encode should succeed");
+        assert_eq!(decode_schema("docs", &encoded).expect("decode"), ok);
+    }
     /// `PRIMARY KEY`（Issue #903・v4）と `DEFAULT`（Issue #904・v5）の両方を
     /// 持つスキーマは v5 で書かれ、`pk:` 行（非空）・`default` フィールドの
     /// 両方が往復すること（base 取り込みマージで両フォーマットを統合した際の
