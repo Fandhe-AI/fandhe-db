@@ -481,6 +481,6 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 
 - **対象ビヘイビア**: SQL-26・ERR-6（ERR-2・ERR-4 の決定的分類と HTTP 射影は維持）。
 - **変更箇所**: `sql/udf_call.rs`（組み込み・宣言的 UDF・WASM UDF の arity 不一致を束縛時・`CREATE FUNCTION` 定義時とも `undefined_function` へ）、`sql/parser.rs`（`resolve_aggregate_input` の TEXT の `SUM`/`AVG`、BOOLEAN・VECTOR・ARRAY・BYTEA・JSON/JSONB・ENUM・UUID の COUNT 以外を `undefined_function` へ。式でも同じ型・関数に同じコード）。
-- **性質**: 拒否される入力は変わらず、`wire_code` を `22000` から `42883`（HTTP 400）へ振り替えるのみ（fail-closed 維持）。新しい分類・公開 API の変更なし。SQL 単一行・GROUP BY・ウィンドウ・NoSQL `aggregate`・CHECK 制約式の各経路に反映。
+- **性質**: 拒否される入力は変わらず、`wire_code` を `22000` から `42883`（HTTP 400）へ振り替えるのみ（fail-closed 維持）。新しい分類の追加はないが、`wire_code` は公開エラー契約のため、SQL・NoSQL の利用者が受け取るコードが `22000` から `42883`（HTTP 400）へ変わる互換性影響がある（`22000` を固定で判定するクライアントは `42883` への追従が必要。SQLSTATE クラス 22 から 42 へ移る）。SQL 単一行・GROUP BY・ウィンドウ・NoSQL `aggregate`・CHECK 制約式の各経路に反映。
 - **テスト**: 既存の `22000` 固定を `42883` へ厳格化し、`tests/sql26_scalar_functions.rs`・`tests/sql_aggregate.rs` に回帰テストを追加。
 - **対象外（申し送り）**: 集計・ウィンドウ関数自体の arity（構文層の `42601`）、ARRAY・ENUM の `MIN`/`MAX` 対応、`COUNT(DISTINCT <json/array/vector 列>)` の `22000`。
