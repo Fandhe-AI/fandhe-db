@@ -847,7 +847,7 @@ fn typed_text_binding_matches_literal_form_and_tenant_boundary_holds() {
 }
 
 #[test]
-fn typed_slots_reject_malformed_values_with_22p02_and_binary_with_0a000() {
+fn typed_slots_reject_malformed_values_with_22p02_and_decode_binary_per_wire14() {
     let (core, _g) = new_core();
     seed(&core, 1);
     let addr = spawn(core);
@@ -861,8 +861,18 @@ fn typed_slots_reject_malformed_values_with_22p02_and_binary_with_0a000() {
     }
     send_pbes_expect_error(&mut s, bool_sql, &[], &[], &[Some(b"maybe")], "22P02");
     send_pbes_expect_error(&mut s, id_sql, &[], &[], &[Some(b"abc")], "22P02");
-    // 数値・真偽値スロットのバイナリ format は text として誤解釈せず 0A000。
-    send_pbes_expect_error(&mut s, int_sql, &[], &[1], &[Some(b"1234")], "0A000");
-    send_pbes_expect_error(&mut s, bool_sql, &[], &[1], &[Some(b"t")], "0A000");
+    // Issue #1345（WIRE-14）: 数値・真偽値スロットのバイナリ format は PostgreSQL の
+    // 受信形式で復号される（仕様変更に基づく期待値更新。アサーションの弱体化ではない）。
+    // text 形式で同じ値を送った場合と同一の応答になる。
+    let (text_rows, text_tag) = run_extended(&mut s, int_sql, &[0], &[Some(b"1234")]);
+    let (bin_rows, bin_tag) = run_extended(&mut s, int_sql, &[1], &[Some(&1234i32.to_be_bytes())]);
+    assert_eq!((text_rows, text_tag), (bin_rows, bin_tag));
+    let (text_rows, _) = run_extended(&mut s, bool_sql, &[0], &[Some(b"t")]);
+    let (bin_rows, _) = run_extended(&mut s, bool_sql, &[1], &[Some(&[1])]);
+    assert_eq!(text_rows, bin_rows);
+    // 長さ不正は 08P01。
+    send_pbes_expect_error(&mut s, int_sql, &[], &[1], &[Some(b"12345")], "08P01");
+    send_pbes_expect_error(&mut s, bool_sql, &[], &[1], &[Some(b"tt")], "08P01");
+    // id スロットは宣言 0（実効 numeric）のバイナリを引き続き 0A000 で拒否する。
     send_pbes_expect_error(&mut s, id_sql, &[], &[1], &[Some(b"1")], "0A000");
 }

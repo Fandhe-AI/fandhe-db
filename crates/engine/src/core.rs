@@ -3606,8 +3606,8 @@ impl EngineCore {
 
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
     /// [`Self::parse_sql_prepared`] が返したテンプレートへ、実値（バイト列。
-    /// text 系スロットのバイナリ形式は UTF-8 バイト恒等でそのまま渡され、それ以外
-    /// のバイナリ形式は wire 層が `0A000` で拒否済みの前提）を束縛し、
+    /// バイナリ形式の値は wire 層が受信形式を正規テキストへ復号済み、復号できない
+    /// スロットは wire 層が `0A000` で拒否済みの前提。Issue #1345）を束縛し、
     /// [`Self::parse_sql`] が SQL テキストから直接返すのと**完全に同一**の
     /// [`ParsedSql`] を返す（第 2 の実行器を作らない設計。実行・Describe は
     /// 以降すべて既存の [`Self::execute_parsed_in_session`]／

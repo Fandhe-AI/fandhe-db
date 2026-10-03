@@ -21,9 +21,15 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
 - 宣言件数がプレースホルダ数を超える Parse は `08P01`（PostgreSQL は受理するが、
   fail-closed な逸脱）。
 - Bind: 値数が要求数と異なれば `08P01`。パラメータ format code は 0・1 以外を `08P01`。
-  binary は text 系スロット（推論がバイナリ対応・置換種別が String かつ宣言 OID が 0・25・1043）だけ
-  受理し、UTF-8 バイト恒等でそのまま `bind_prepared` へ渡す。それ以外のバイナリは `0A000`
-  （WIRE-14）。
+  binary は、text 系スロット（宣言 OID が 0・25・1043）は UTF-8 バイト恒等で、`int4`／`int8`／
+  `float4`／`float8`／`bool`／`bytea`／`uuid` は PostgreSQL の受信形式で正規テキストへ復号して
+  から `bind_prepared` へ渡す（Issue #1345・WIRE-14）。受理は推論スロット型と実効 OID（宣言が
+  0 以外ならそれ、0 なら推論）の互換表（整数列は 23／20、`REAL` は 700、`DOUBLE` は 701、
+  `BOOLEAN` は 16、`BYTEA` は 17、`UUID` は 2950、`id` は宣言 23／20 のみ）に載る組み合わせに限り、
+  PostgreSQL の暗黙キャストより意図的に厳しい fail-closed とする。非対応スロット
+  （`NUMERIC`・日時・`JSON`・配列・`ENUM`・`VECTOR`・宣言 0 の `id` 等）への binary 指定は
+  `0A000`、値の長さが固定長型の受信形式と合わなければ `08P01`（値は応答に含めない）。判定順は
+  「全スロットの非対応判定（`0A000`）→ 復号（`08P01`）」で、復号後の値で保持量上限を判定する。
 - 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は据え置き
   `22000`。
 - 束縛済み `ParsedSql` は値を保持するため、portal が保持する束縛値バイトの接続単位合計を
@@ -178,8 +184,8 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
   `dummy_parsed` とする。`WHERE <列> = $n` のダミーフラグ（ENUM 語彙照合の省略判定）は
   種別確定後に求め、非 String 種別の `$n` は序数に数えない（置換後は
   `WherePredicate::Equality` にならないため。数えると別述語へ省略が誤適用される）。
-- 数値・真偽値スロットは text 形式のみ受理し、バイナリ形式は `0A000`（バイナリを UTF-8
-  として誤解釈して受理しない。バイナリ数値の復号は WIRE-14 の申し送り）。
+- 数値・真偽値スロットのバイナリ形式は Issue #1345 で受信形式の復号に置き換わった
+  （バイナリを UTF-8 として誤解釈して受理しない）。
 - 既知の制約: `WHERE <整数列> = -N` はリテラル形でも式項の単項マイナス未対応で `42601`
   になり、`$n` に負値を束縛してもリテラル同値で同じ結果になる（`INSERT` の値位置は受理）。
 - Parse 後に列型が変わった場合は種別が Parse 時点のままのため、既存の型不一致エラー
@@ -234,12 +240,12 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
 
 - wire 側（Parse の宣言型受理・`ParameterDescription`・Bind の値保持・
   `bind_prepared` 結線）は #934 マージ後の別 PR。
-- パラメータのバイナリ形式復号（WIRE-14）。
+- パラメータのバイナリ形式復号（WIRE-14）→ Issue #1345 で 7 型を実装済み。
 - `REAL`／`DOUBLE`／`NUMERIC`／`DATE`／`TIMESTAMP`／`UUID`／`BYTEA` 列への型付き `$n` 束縛、
-  および数値・真偽値パラメータのバイナリ復号（WIRE-14。psycopg 3 の Python `int`／`bool` は
-  バイナリ送信のため引き続き `0A000`）。
-- 非 text スロット（`REAL`／`BYTEA`／`UUID` 等）で宣言 OID 0 のバイナリ値を UTF-8 恒等で
-  受理している点（本変更は `id`・`INTEGER`・`BIGINT`・`BOOLEAN` のみ是正）。
+  （数値・真偽値のバイナリ復号は Issue #1345 で解消済み。`REAL`／`DOUBLE` は engine の型付き
+  束縛が未対応のため text・binary とも `22P02`）。
+- 非 text スロットで宣言 OID 0 のバイナリ値を UTF-8 恒等で受理していた点は Issue #1345 で
+  解消済み。
 - NULL パラメータ値の意味論的な位置別処理（`USING OPERATION_ID $n` へ NULL を
   「省略と同義」として通す等）。
 - 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`UPDATE ... SET
