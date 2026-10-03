@@ -502,3 +502,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: カタログ・スキーマ・世代は確定済みスナップショットから、辞書と `USING PLAN` の行の読みだけ共有 write トランザクションから読む。辞書は `DictionaryCache` を経由しない（ROLLBACK 後の世代再利用による漏えいの防止）。新しい `wire_code` の追加なし。
 - **テスト**: `tests/sql31_txn_file_insert_using_plan.rs`（COMMIT／ROLLBACK／drop・置換・`25000`・テナント境界・fail-closed・dirty の `USING PLAN` の行と辞書・RLS・キャッシュ非汚染・全 `EXPLAIN` variant）。`sql31_transaction.rs`・`sql31_txn_dml.rs` の旧 `0A000` アサーションを撤去。
 - **対象外（申し送り）**: NoSQL バッチのトランザクション対応、書き込み後の読み取りでのキャッシュ・HNSW 再利用。
+
+## Issue #1354: 明示トランザクションの成否確定手順の補完（台帳照合の順序・3 クライアント）
+
+- **対象ビヘイビア**: RECOVER-12（関連: RECOVER-10・ERR-2・SQL-31・TABLE-16）。
+- **変更箇所**: テストと検証用クライアントのみ（本番コードの変更・依存追加なし）。`crates/engine/tests/recover12_explicit_txn_resend.rs`・`crates/wire-server/tests/recover12_explicit_txn_resend.rs` を新規追加、`three_client_e2e.rs` に層 B のテストと `Client::expect_error_excluding`／`abandon_open_transaction` を追加、`psycopg_client.py` に opt-in の `WIRE_ABANDON_OPEN_TRANSACTION` を追加。
+- **性質**: 行制約を持つ表で、新しい `BEGIN` 内の再送が台帳由来の `23505`（`DuplicateOperationId`）になり行制約由来（`UniqueViolation`／`IdConflict`）に落ちないことを、variant と固定文言で固定する。順序を入れ替える一時変更で engine・wire 層 A・層 B が失敗することを確認済み。
+- **テスト**: engine 5 件（commit 済み再送・対照・未 commit 接続断・衝突時の再送・テナント境界。`PRIMARY KEY` のみ／`UNIQUE` のみ／両方の 3 構成）、wire 層 A 2 件、層 B 1 件（3 クライアント）。
+- **対象外（申し送り）**: `--fault-inject` の注入点を `COMMIT` 文へ広げること、先頭文が 0 行 `DELETE` の場合の再送判定、明示トランザクション内の UPDATE／UPSERT／複数行 INSERT への対応。

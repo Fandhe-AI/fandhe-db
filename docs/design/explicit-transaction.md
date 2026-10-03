@@ -392,6 +392,10 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
+- RECOVER-12 の再送手順の検証（Issue #1354）: engine の
+  `tests/recover12_explicit_txn_resend.rs`（行制約を持つ表での台帳照合の順序）、wire の
+  `tests/recover12_explicit_txn_resend.rs`（層 A）、`three_client_e2e.rs` の層 B
+  （[`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
 - 先頭文が 0 行 DELETE の場合に RECOVER-12 の再送判定が成立しない制約
   （SQL-18 の既存契約〔0 行 DELETE は台帳非記録〕との相互作用）。
 - 上限の既定値（20 秒・1,000 件・30 秒）の確定 → オーナー判断。
