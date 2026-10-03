@@ -1419,9 +1419,11 @@ fn declarative_leaf_to_filter(
             ))
         }
         WherePredicate::BoolEquality { column, value } => {
-            // `$n` は常に `Token::StringLiteral` へ置換されるため
-            // `Ident '=' Ident("true"/"false")` の形にはならず、この述語の
-            // 右辺も `$n` に由来し得ない。
+            // Issue #1342: BOOLEAN 列位置の `$n` は Bind 時に `Ident("true"/"false")`
+            // へ置換されこの述語になり得るが、`sql::params::
+            // where_equality_literal_is_param_typed` が非 String 種別の `$n` を
+            // `dummy_equality_flags` の序数に数えないため、ここでは常に実値扱い
+            // （ENUM 語彙照合の省略対象にならず序数もずれない）。
             Ok((
                 DeclarativeFilter::bool_equals(column.clone(), *value),
                 false,

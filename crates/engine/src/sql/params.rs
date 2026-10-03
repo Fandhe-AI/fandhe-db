@@ -30,14 +30,24 @@
 //! スコープ外として `42601` で拒否する（後続 Issue へ申し送り。詳細は
 //! `docs/design/wire-extended-query-param-binding.md` 参照）。
 //!
-//! ## 値の形式
+//! ## 値の形式（Issue #1342 で型付き置換へ拡張）
 //!
-//! すべてのプレースホルダは常に [`Token::StringLiteral`] として置換する。
-//! `id` 列・`BOOLEAN` 列など、生の [`Token::Number`]／`Token::Ident("true"/"false")`
-//! を要求する位置（例: `INSERT ... VALUES ($1)` の `$1` が `id` 列や `BOOLEAN` 列に
-//! 対応する場合）は本バージョンのスコープ外であり、束縛すると「同じ値をクォート
-//! したリテラルで書いた SQL」と同一の型不一致エラー（構造検証・束縛の既存契約
-//! そのまま）で拒否される——これは fail-closed な既知の制約であり誤動作ではない。
+//! 置換トークンは `$n` の推論型（[`PreparedParamType`]）から導く
+//! [`ParamLiteralKind`] で決まり、字句解析器が同じ値をリテラルで書いた SQL から
+//! 生成するトークン列と**同一**になるよう組み立てる（リテラル同値性を構造上
+//! 保証し、第 2 の実行器・パーサーを作らない）。
+//!
+//! - `String`（既定）: 常に 1 個の [`Token::StringLiteral`]。
+//! - `Integer`（`id`・`INTEGER`・`BIGINT` 列）: 値が `-?[0-9]+` に一致するとき
+//!   [`Token::Number`]（負値は `Punct('-')` + `Number`）。それ以外は `22P02`
+//!   （`+` 符号・空白・小数・指数は fail-closed で拒否）。
+//! - `Boolean`（`BOOLEAN` 列）: PostgreSQL の真偽値入力表記（`t`/`true`/`yes`/`on`/`1`
+//!   等。大文字小文字無視・前後空白許容）を正規形 `Ident("true"/"false")` へ。
+//!   それ以外は `22P02`。
+//!
+//! 不正値のエラーメッセージには値本文を含めない（番号と期待型のみ）。
+//! 値は SQL テキストにも字句解析器にも戻らず、検証済みの値から直接トークンを
+//! 組み立てるため、値経由のインジェクション経路は構造的に存在しない。
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::lexer::{self, Token};
@@ -202,6 +212,20 @@ fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
 /// `sql::params` が受理する `$n` 位置（パターン 4）の対象外（`Ident '=' $n`
 /// の形にしかならない）であり、本関数の走査対象にもならない。
 pub fn where_equality_literal_is_param(tokens: &[Token]) -> Vec<bool> {
+    where_equality_literal_is_param_typed(tokens, &[])
+}
+
+/// [`where_equality_literal_is_param`] の型付き版（Issue #1342）。`kinds`
+/// （`$n` の置換リテラル種別。番号 1 始まりの `n` が `n - 1` 番目。範囲外は
+/// `String` 扱い）が `String` 以外の `$n` は、置換後に `WherePredicate::Equality`
+/// ではなく `Expression`（整数）／`BoolEquality`（真偽値）になり
+/// `sql::parser::declarative_leaf_to_filter` の `equality_ordinal` に数えられない。
+/// そのためフラグを積まずに読み飛ばし、序数が別の述語へずれて ENUM 語彙照合の
+/// 省略が実リテラルに誤適用される事態を防ぐ。
+pub(crate) fn where_equality_literal_is_param_typed(
+    tokens: &[Token],
+    kinds: &[ParamLiteralKind],
+) -> Vec<bool> {
     let Some((start, end)) = where_region(tokens) else {
         return Vec::new();
     };
@@ -212,8 +236,10 @@ pub fn where_equality_literal_is_param(tokens: &[Token]) -> Vec<bool> {
             && matches!(tokens.get(i + 1), Some(Token::Punct('=')))
         {
             match tokens.get(i + 2) {
-                Some(Token::Param(_)) => {
-                    flags.push(true);
+                Some(Token::Param(n)) => {
+                    if kind_of(kinds, *n) == ParamLiteralKind::String {
+                        flags.push(true);
+                    }
                     i += 3;
                     continue;
                 }
@@ -228,6 +254,15 @@ pub fn where_equality_literal_is_param(tokens: &[Token]) -> Vec<bool> {
         i += 1;
     }
     flags
+}
+
+/// 番号 `n`（1 始まり）の置換リテラル種別。範囲外・0 は `String`（fail-closed）。
+fn kind_of(kinds: &[ParamLiteralKind], n: u16) -> ParamLiteralKind {
+    usize::from(n)
+        .checked_sub(1)
+        .and_then(|i| kinds.get(i))
+        .copied()
+        .unwrap_or(ParamLiteralKind::String)
 }
 
 /// パターン 5（`INSERT ... VALUES`）の受理範囲 `(VALUES の位置, 節末の位置)` を
@@ -431,6 +466,96 @@ pub enum PreparedParamType {
     Column(crate::sql::exec::ColumnMeta),
 }
 
+impl PreparedParamType {
+    /// このスロットが「text 形式の値を UTF-8 恒等で受理してよい」かどうか。
+    /// 数値・真偽値スロット（[`ParamLiteralKind`] が `String` 以外）は text 形式
+    /// のみを受理し、バイナリ形式は wire 層が `0A000` で拒否する（バイナリ値を
+    /// UTF-8 として誤解釈して黙って受理する経路を塞ぐ。数値のバイナリ復号は
+    /// WIRE-14 の申し送り）。wire-server の `build_param_slots` が参照する。
+    pub fn binds_as_text_literal(&self) -> bool {
+        matches!(self.literal_kind(), ParamLiteralKind::String)
+    }
+
+    /// 置換リテラル種別（[`ParamLiteralKind`]）を導出する。`Id`・`INTEGER`・
+    /// `BIGINT` は `Integer`、`BOOLEAN` は `Boolean`、それ以外は `String`。
+    pub(crate) fn literal_kind(&self) -> ParamLiteralKind {
+        use crate::catalog::ColumnType;
+        use crate::sql::exec::ColumnMeta;
+        match self {
+            PreparedParamType::Column(ColumnMeta::Id) => ParamLiteralKind::Integer,
+            PreparedParamType::Column(ColumnMeta::Scalar { ty, .. }) => match ty {
+                ColumnType::Integer | ColumnType::BigInt => ParamLiteralKind::Integer,
+                ColumnType::Boolean => ParamLiteralKind::Boolean,
+                _ => ParamLiteralKind::String,
+            },
+            _ => ParamLiteralKind::String,
+        }
+    }
+}
+
+/// `$n` を置換するリテラルトークンの種別（Issue #1342）。
+/// [`PreparedParamType::literal_kind`] が導出し、`core.rs` の Parse／Bind が
+/// 型付き置換（[`substitute_dummy_typed`]・[`substitute_values_typed`]）へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamLiteralKind {
+    /// クォート付き文字列リテラル（既定）。
+    String,
+    /// 整数リテラル（`id`・`INTEGER`・`BIGINT`）。
+    Integer,
+    /// 真偽値リテラル（`BOOLEAN`）。
+    Boolean,
+}
+
+/// `value` を整数リテラルのトークン列へ変換する（`-?[0-9]+` のみ受理）。
+/// 負値は字句解析器と同じく `Punct('-')` + `Number`。
+fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SqlSurfaceError::invalid_text_representation(format!(
+            "invalid input syntax for parameter ${n} (expected integer)"
+        )));
+    }
+    let mut out = Vec::with_capacity(2);
+    if negative {
+        out.push(Token::Punct('-'));
+    }
+    out.push(Token::Number(digits.to_string()));
+    Ok(out)
+}
+
+/// `value` を PostgreSQL の `boolin` 互換表記で解釈し、正規形の識別子トークンへ
+/// 変換する（前後の ASCII 空白除去・大文字小文字無視。`of` は `off` の省略形として受理し、`o` 単独は曖昧なので拒否）。
+fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+    let lowered = value
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_ascii_lowercase();
+    let is_prefix_of = |full: &str| !lowered.is_empty() && full.starts_with(lowered.as_str());
+    let truth = if lowered == "1" || is_prefix_of("true") || is_prefix_of("yes") || lowered == "on"
+    {
+        Some(true)
+    } else if lowered == "0"
+        || is_prefix_of("false")
+        || is_prefix_of("no")
+        || lowered == "off"
+        || lowered == "of"
+    {
+        Some(false)
+    } else {
+        None
+    };
+    match truth {
+        Some(b) => Ok(vec![Token::Ident(
+            if b { "true" } else { "false" }.to_string(),
+        )]),
+        None => Err(SqlSurfaceError::invalid_text_representation(format!(
+            "invalid input syntax for parameter ${n} (expected boolean)"
+        ))),
+    }
+}
+
 /// `$n` ごとの出現位置種別を、トークン列上の位置から求める（番号 1 始まりの
 /// `n` に対し戻り値の `n - 1` 番目。未参照の番号は空 `Vec`）。
 /// 許可位置判定は [`validate_param_positions`] が先に済ませている前提で、
@@ -517,16 +642,17 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     })
 }
 
-/// [`Token::Param`] をすべて `value_for` が返す文字列の [`Token::StringLiteral`]
-/// へ置換したトークン列を返す。`value_for` は 1 始まりのパラメータ番号を受け取る。
+/// [`Token::Param`] をすべて `value_for` が返すトークン列へ置換したトークン列を
+/// 返す（1 個の `$n` から複数トークン〔負の整数の `-` + 数値〕を出せる）。
+/// `value_for` は 1 始まりのパラメータ番号を受け取る。
 fn substitute_with<E>(
     tokens: &[Token],
-    mut value_for: impl FnMut(u16) -> Result<String, E>,
+    mut value_for: impl FnMut(u16) -> Result<Vec<Token>, E>,
 ) -> Result<Vec<Token>, E> {
     let mut out = Vec::with_capacity(tokens.len());
     for token in tokens {
         match token {
-            Token::Param(n) => out.push(Token::StringLiteral(value_for(*n)?)),
+            Token::Param(n) => out.extend(value_for(*n)?),
             other => out.push(other.clone()),
         }
     }
@@ -541,27 +667,55 @@ fn substitute_with<E>(
 /// 得られたトークン列を実行・Describe に使ってはならない（値未確定のダミーの
 /// ため、呼び出し元は構造検証の結果だけを見て破棄する）。
 pub fn substitute_dummy(tokens: &[Token]) -> Vec<Token> {
-    substitute_with(tokens, |_| {
-        Ok::<_, std::convert::Infallible>("0".to_string())
+    substitute_dummy_typed(tokens, &[])
+}
+
+/// [`substitute_dummy`] の型付き版（Issue #1342）。`Integer` 種別の `$n` は
+/// `Number("0")`、`Boolean` 種別は `Ident("false")` のダミーへ置換し、数値・真偽値
+/// 列の位置でも Describe 用の構造検証が通るようにする。
+pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<Token> {
+    substitute_with(tokens, |n| {
+        Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
+            ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
+            ParamLiteralKind::Integer => Token::Number("0".to_string()),
+            ParamLiteralKind::Boolean => Token::Ident("false".to_string()),
+        }])
     })
     .unwrap_or_default()
 }
 
 /// Bind 時点: `values`（`$1` から順に 1 始まりで対応する実値）で全 `$n` を
-/// 置換する。呼び出し元は事前に `values.len()` が [`validate_param_positions`]
-/// の返す `param_count` と一致することを確認していること（本関数は添字
-/// アクセスに `checked_sub`／`get` を使うが、この事前条件自体は検査しない）。
+/// 文字列リテラルとして置換する。呼び出し元は事前に `values.len()` が
+/// [`validate_param_positions`] の返す `param_count` と一致することを確認して
+/// いること（本関数は添字アクセスに `checked_sub`／`get` を使うが、この事前条件
+/// 自体は検査しない）。
 pub fn substitute_values(
     tokens: &[Token],
     values: &[String],
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    substitute_values_typed(tokens, values, &[])
+}
+
+/// [`substitute_values`] の型付き版（Issue #1342）。種別に応じて整数・真偽値の
+/// 形式を検証し（不正は `22P02`）、字句解析器がリテラルから生成するのと同一の
+/// トークン列へ置換する。[`crate::core::EngineCore::bind_prepared`] が呼ぶ。
+pub(crate) fn substitute_values_typed(
+    tokens: &[Token],
+    values: &[String],
+    kinds: &[ParamLiteralKind],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     substitute_with(tokens, |n| {
         let idx = usize::from(n).checked_sub(1).ok_or_else(|| {
             SqlSurfaceError::unsupported("parameter placeholder $0 is not valid".to_string())
         })?;
-        values.get(idx).cloned().ok_or_else(|| {
+        let value = values.get(idx).ok_or_else(|| {
             SqlSurfaceError::invalid_input(format!("missing bind value for parameter ${n}"))
-        })
+        })?;
+        match kind_of(kinds, n) {
+            ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
+            ParamLiteralKind::Integer => integer_literal_tokens(n, value),
+            ParamLiteralKind::Boolean => boolean_literal_tokens(n, value),
+        }
     })
 }
 
@@ -1215,5 +1369,86 @@ mod tests {
         let small_value = "y".repeat(128);
         let err = decode_bind_values(&tokens, &[Some(small_value.into_bytes())]).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+}
+/// 型付き置換（Issue #1342）の単体テスト。
+#[cfg(test)]
+mod typed_tests {
+    use super::*;
+    use crate::sql::lexer::tokenize_with_params;
+
+    #[test]
+    fn integer_literal_follows_lexer_token_shape() {
+        assert_eq!(
+            integer_literal_tokens(1, "5").unwrap(),
+            vec![Token::Number("5".into())]
+        );
+        assert_eq!(
+            integer_literal_tokens(1, "007").unwrap(),
+            vec![Token::Number("007".into())]
+        );
+        assert_eq!(
+            integer_literal_tokens(1, "-5").unwrap(),
+            vec![Token::Punct('-'), Token::Number("5".into())]
+        );
+        for bad in ["", "-", "+5", " 5", "5.0", "1e3", "abc", "1 OR 1=1", "--5"] {
+            let err = integer_literal_tokens(2, bad).unwrap_err();
+            assert_eq!(err.wire_code(), "22P02", "{bad:?}");
+            if !bad.is_empty() {
+                assert!(!err.to_string().contains(bad), "must not echo {bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_literal_accepts_pg_spellings_only() {
+        for t in ["t", "TRUE", " yes ", "on", "1", "tr", "Y"] {
+            assert_eq!(
+                boolean_literal_tokens(1, t).unwrap(),
+                vec![Token::Ident("true".into())],
+                "{t:?}"
+            );
+        }
+        for f in ["f", "False", "no", "OFF", "of", "0", "n"] {
+            assert_eq!(
+                boolean_literal_tokens(1, f).unwrap(),
+                vec![Token::Ident("false".into())],
+                "{f:?}"
+            );
+        }
+        for bad in ["o", "maybe", "true OR", "", "2", "tru e"] {
+            assert_eq!(
+                boolean_literal_tokens(1, bad).unwrap_err().wire_code(),
+                "22P02",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_substitution_and_dummy_flags() {
+        let tokens = tokenize_with_params(
+            "SELECT id FROM t WHERE lang = $1 AND n = $2 AND flag = $3 AND body = $4",
+        )
+        .unwrap();
+        let kinds = [
+            ParamLiteralKind::String,
+            ParamLiteralKind::Integer,
+            ParamLiteralKind::Boolean,
+            ParamLiteralKind::String,
+        ];
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &kinds),
+            vec![true, true]
+        );
+        assert_eq!(where_equality_literal_is_param(&tokens), vec![true; 4]);
+        let dummy = substitute_dummy_typed(&tokens, &kinds);
+        assert!(dummy.contains(&Token::Number("0".into())));
+        assert!(dummy.contains(&Token::Ident("false".into())));
+        let values: Vec<String> = ["ja", "-3", "t", "x"].map(String::from).to_vec();
+        let bound = substitute_values_typed(&tokens, &values, &kinds).unwrap();
+        assert!(bound.contains(&Token::Punct('-')));
+        assert!(bound.contains(&Token::Ident("true".into())));
+        assert!(!bound.iter().any(|t| matches!(t, Token::Param(_))));
     }
 }

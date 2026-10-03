@@ -1226,7 +1226,9 @@ fn build_param_slots(
                 PreparedParamType::VectorText => (result_encoder::WireType::Text.oid(), false),
                 PreparedParamType::Column(meta) => (
                     result_encoder::column_wire_type(meta).oid(),
-                    result_encoder::column_binary_support(meta),
+                    // Issue #1342: 数値・真偽値スロットは text 形式のみ受理する
+                    // （バイナリを UTF-8 として誤解釈する経路を塞ぐ。WIRE-14 申し送り）。
+                    result_encoder::column_binary_support(meta) && ty.binds_as_text_literal(),
                 ),
             };
             let declared_oid = declared.get(i).copied().unwrap_or(0);

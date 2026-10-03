@@ -1006,3 +1006,279 @@ fn parsed_if_unparameterized_matches_parse_sql_only_without_params() {
         .expect("parse_sql_prepared should succeed");
     assert!(with_param.parsed_if_unparameterized().is_none());
 }
+// --- 型付き置換（Issue #1342・WIRE-12）: 行 id・INTEGER・BIGINT・BOOLEAN 列 -----
+
+/// `id`・`n INTEGER`・`b BIGINT`・`flag BOOLEAN`・`mood ENUM`・`body TEXT` を持つ表。
+fn new_core_with_typed_table(path: &std::path::Path) -> EngineCore {
+    let storage = Storage::open(path).expect("open storage");
+    let mood = storage
+        .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+        .expect("create enum type");
+    storage
+        .create_table(&TableSchema::new(
+            "typed",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("b", ColumnType::BigInt, true),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
+                ColumnDef::new("mood", ColumnType::Enum(mood), true),
+            ],
+        ))
+        .expect("create table");
+    EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+}
+
+fn assert_bind_matches_literal(
+    core: &EngineCore,
+    template: &str,
+    values: &[&str],
+    literal_sql: &str,
+) {
+    let prepared = core
+        .parse_sql_prepared(template)
+        .expect("parse_sql_prepared should succeed");
+    let vals: Vec<Option<Vec<u8>>> = values.iter().map(|v| some(v)).collect();
+    let bound = core
+        .bind_prepared(&prepared, &vals)
+        .expect("bind_prepared should succeed");
+    let literal = core
+        .parse_sql(literal_sql)
+        .expect("parse_sql should succeed");
+    assert_eq!(bound, literal, "bound form must equal literal form");
+    // Describe(S) も成功し、リテラル形と同じ列メタを返す。
+    let session = SessionState::default();
+    let described = core
+        .describe_prepared_in_session(&session, &prepared)
+        .expect("describe_prepared_in_session should succeed");
+    let literal_described = core
+        .describe_parsed_in_session(&session, &literal)
+        .expect("describe_parsed_in_session should succeed");
+    assert_eq!(described, literal_described);
+}
+
+/// PR #1372 レビュー指摘: 同一種別（Integer）で列名・型が異なる複数位置に現れる
+/// `$n` も Text へ後退せず整数リテラルとして束縛される。
+#[test]
+fn typed_bind_reused_param_across_integer_columns_stays_integer() {
+    let path = unique_db_path("prepared-typed-reuse");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, n FROM typed WHERE n = $1 AND b = $1 LIMIT 5",
+        &["7"],
+        "SELECT id, n FROM typed WHERE n = 7 AND b = 7 LIMIT 5",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, n FROM typed WHERE id = $1 AND n = $1 LIMIT 5",
+        &["7"],
+        "SELECT id, n FROM typed WHERE id = 7 AND n = 7 LIMIT 5",
+    );
+}
+
+#[test]
+fn typed_bind_matches_literal_form_for_id_integer_bigint_boolean() {
+    let path = unique_db_path("prepared-typed-parity");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, body FROM typed WHERE id = $1 LIMIT 5",
+        &["5"],
+        "SELECT id, body FROM typed WHERE id = 5 LIMIT 5",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, n FROM typed WHERE n = $1 LIMIT 5",
+        &["7"],
+        "SELECT id, n FROM typed WHERE n = 7 LIMIT 5",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, b FROM typed WHERE b = $1 LIMIT 5",
+        &["9000000000"],
+        "SELECT id, b FROM typed WHERE b = 9000000000 LIMIT 5",
+    );
+    for (text, lit) in [
+        ("t", "true"),
+        ("TRUE", "true"),
+        ("1", "true"),
+        (" yes ", "true"),
+        ("f", "false"),
+        ("off", "false"),
+        ("0", "false"),
+    ] {
+        assert_bind_matches_literal(
+            &core,
+            "SELECT id, flag FROM typed WHERE flag = $1 LIMIT 5",
+            &[text],
+            &format!("SELECT id, flag FROM typed WHERE flag = {lit} LIMIT 5"),
+        );
+    }
+    assert_bind_matches_literal(
+        &core,
+        "SELECT count(*) FROM typed WHERE n = $1",
+        &["7"],
+        "SELECT count(*) FROM typed WHERE n = 7",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "DELETE FROM typed WHERE id = $1 USING OPERATION_ID $2",
+        &["5", "op-1"],
+        "DELETE FROM typed WHERE id = 5 USING OPERATION_ID 'op-1'",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "UPDATE typed SET body = 'x' WHERE id = $1 USING OPERATION_ID $2",
+        &["5", "op-2"],
+        "UPDATE typed SET body = 'x' WHERE id = 5 USING OPERATION_ID 'op-2'",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "INSERT INTO typed (id, embedding, body, n, flag) VALUES ($1, '[0.1,0.2,0.3]', 'hi', $2, $3) USING OPERATION_ID $4",
+        &["1", "-5", "t", "op-3"],
+        "INSERT INTO typed (id, embedding, body, n, flag) VALUES (1, '[0.1,0.2,0.3]', 'hi', -5, true) USING OPERATION_ID 'op-3'",
+    );
+}
+
+#[test]
+fn typed_bind_rejects_malformed_values_with_22p02_and_no_value_echo() {
+    let path = unique_db_path("prepared-typed-22p02");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+
+    let int_stmt = core
+        .parse_sql_prepared("SELECT id FROM typed WHERE n = $1 LIMIT 5")
+        .expect("parse");
+    for bad in [
+        "abc",
+        "5.0",
+        "+5",
+        " 5",
+        "",
+        "-",
+        "1e3",
+        "1 OR 1=1",
+        "5; DROP TABLE typed",
+    ] {
+        let err = core
+            .bind_prepared(&int_stmt, &[some(bad)])
+            .expect_err("malformed integer must be rejected");
+        assert_eq!(err.wire_code(), "22P02", "value {bad:?}");
+        if !bad.is_empty() {
+            assert!(!err.to_string().contains(bad), "must not echo {bad:?}");
+        }
+    }
+    let bool_stmt = core
+        .parse_sql_prepared("SELECT id FROM typed WHERE flag = $1 LIMIT 5")
+        .expect("parse");
+    for bad in ["maybe", "o", "", "true OR", "true; DROP TABLE typed"] {
+        let err = core
+            .bind_prepared(&bool_stmt, &[some(bad)])
+            .expect_err("malformed boolean must be rejected");
+        assert_eq!(err.wire_code(), "22P02", "value {bad:?}");
+    }
+    // テーブルは残っている。
+    core.parse_sql("SELECT id FROM typed LIMIT 1")
+        .expect("table must remain");
+}
+
+#[test]
+fn typed_bind_keeps_literal_form_limits() {
+    let path = unique_db_path("prepared-typed-literal-limits");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+    // 負値 WHERE はリテラル形でも同じエラー（式項の単項マイナス未対応。既存制約）。
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM typed WHERE n = $1 LIMIT 5")
+        .expect("parse");
+    for (value, literal_sql) in [
+        ("-5", "SELECT id FROM typed WHERE n = -5 LIMIT 5"),
+        (
+            "2147483648",
+            "SELECT id FROM typed WHERE n = 2147483648 LIMIT 5",
+        ),
+    ] {
+        let bound = core.bind_prepared(&prepared, &[some(value)]);
+        let literal = core.parse_sql(literal_sql);
+        assert_eq!(
+            bound.as_ref().map_err(|e| e.wire_code()),
+            literal.as_ref().map_err(|e| e.wire_code()),
+            "value {value}"
+        );
+    }
+}
+
+#[test]
+fn typed_params_do_not_shift_enum_dummy_flags() {
+    let path = unique_db_path("prepared-typed-ordinal");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+    let session = SessionState::default();
+
+    // 実リテラルの不正 ENUM ラベルは、型付き `$n` が前後にあっても Describe で弾く。
+    for sql in [
+        "SELECT id FROM typed WHERE mood = 'bogus' AND n = $1 LIMIT 5",
+        "SELECT id FROM typed WHERE n = $1 AND mood = 'bogus' LIMIT 5",
+        "SELECT id FROM typed WHERE flag = $1 AND mood = 'bogus' LIMIT 5",
+    ] {
+        let prepared = core.parse_sql_prepared(sql).expect("parse");
+        let err = core
+            .describe_prepared_in_session(&session, &prepared)
+            .expect_err("invalid enum label must not slip through Describe");
+        assert_eq!(err.wire_code(), "22P02", "{sql}");
+    }
+    // `$n` の ENUM 等価と型付き `$n` の混在は Describe 成功。
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM typed WHERE mood = $1 AND n = $2 LIMIT 5")
+        .expect("parse");
+    core.describe_prepared_in_session(&session, &prepared)
+        .expect("describe should succeed");
+}
+
+#[test]
+fn typed_bind_executes_with_rls_boundary() {
+    let path = unique_db_path("prepared-typed-exec-rls");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+    let ctx_a =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    let mut session = SessionState::default();
+
+    let insert = core
+        .parse_sql_prepared(
+            "INSERT INTO typed (id, embedding, body, n, flag) VALUES ($1, '[0.1,0.2,0.3]', 'row', $2, $3) USING OPERATION_ID $4",
+        )
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&insert, &[some("1"), some("-5"), some("t"), some("op-ins")])
+        .expect("bind");
+    core.execute_parsed_in_session(&ctx_a, &mut session, &bound)
+        .expect("insert should succeed");
+
+    let rows = |ctx: &PolicyContext, session: &mut SessionState, sql: &str, v: &str| {
+        let prepared = core.parse_sql_prepared(sql).expect("parse");
+        let bound = core.bind_prepared(&prepared, &[some(v)]).expect("bind");
+        match core
+            .execute_parsed_in_session(ctx, session, &bound)
+            .expect("execute")
+        {
+            SqlOutcome::Query(result) => result.rows.len(),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    };
+    let by_id = "SELECT id FROM typed WHERE id = $1 LIMIT 5";
+    let by_flag = "SELECT id FROM typed WHERE flag = $1 LIMIT 5";
+    assert_eq!(rows(&ctx_a, &mut session, by_id, "1"), 1);
+    assert_eq!(rows(&ctx_a, &mut session, by_flag, "t"), 1);
+    assert_eq!(rows(&ctx_a, &mut session, by_flag, "f"), 0);
+    assert_eq!(rows(&ctx_b, &mut session, by_id, "1"), 0);
+    assert_eq!(rows(&ctx_b, &mut session, by_flag, "t"), 0);
+}
