@@ -62,12 +62,22 @@
   グループごとに 1 回評価して保持し（評価エラーはここで返す）、広域取得と同じ比較器で並べる。
   グループが 0 件なら一切評価しない（Issue #353 の契約）。
 
+### EXPLAIN との併用（Issue #1350）
+
+- セッション経由の入口（pg wire の `execute_sql_in_txn`／`execute_sql_in_session`）では、式 `ORDER BY`／`HAVING`
+  付きの広域取得・集計への `EXPLAIN` を受理し、静的判定の行だけを返す（SQL-27 の対象拡張と SQL-26 の組み合わせ。
+  列名キーの前例は Issue #1189）。本体の式評価・行走査は行わない。
+- 束縛は非 EXPLAIN と同じ経路を通るため、未知列・VECTOR 型・集計関数の直接記述などのエラー分類（SQLSTATE）は
+  `EXPLAIN` の有無で一致する。`EXPLAIN` を前置しても束縛検証は迂回できない。
+- セッションなしの入口 `EngineCore::execute_sql` は、式の有無にかかわらず `EXPLAIN` 全般を `42601` とする入口契約のまま。
+  engine 側テストが以前この入口を呼んでいたため式併用の拒否を検証できておらず、pg wire との差に見えていた。
+
 ## 対象外（Issue 起票なし・後続の管轄を除く）
 
 - `HAVING`／`ORDER BY` 内の集計関数呼び出し（`HAVING count(*) > 1`・`ORDER BY sum(x)`）は `42601` のまま。
 - 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー、位置指定 `ORDER BY 1`、`NULLS FIRST/LAST`。
 - `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
-- NoSQL（HTTP）表層、JOIN・集合演算・ウィンドウ・`EXPLAIN` と式 `ORDER BY` の併用。
+- NoSQL（HTTP）表層、JOIN・集合演算・ウィンドウと式 `ORDER BY` の併用。
 - 評価後射影形ビュー（集計・`LIMIT` 本文のビュー。Issue #1192）への外側 `ORDER BY` の式キー（列名キーと
   同じく `42601`）。ウィンドウ関数・集合演算の枝内 `ORDER BY` との併用も、列名キーに限り併用可能にした
   後続（Issue #1189・#1191）とは別に、式キーを含む場合は `42601` とする（並べ替えを黙って落とさない）。
@@ -90,3 +100,7 @@
   `RowDescription` の列名と型 OID・`DataRow`・`ErrorResponse` の SQLSTATE 完全一致・
   `ParameterDescription` の推論〔SELECT リストの `EXTRACT(... FROM ...)` を含む回帰ガード〕・
   束縛値とリテラル形のバイト一致・RLS 非漏えい。Issue #1276）。
+- EXPLAIN 併用（Issue #1350）: `tests/sql26_order_by_having_expressions.rs` の
+  `explain_accepts_expression_order_by_and_having_in_session`・`explain_expression_error_codes_match_non_explain`、
+  wire 層 `crates/wire-server/tests/wire_sql26_explain_expression_order_having.rs`（簡易・拡張両経路の受理・
+  SQLSTATE パリティ・本体非評価・テナント文脈間での応答同一性）。

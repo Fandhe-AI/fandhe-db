@@ -616,18 +616,110 @@ fn having_and_order_by_expression_do_not_leak_other_tenants_private_rows() {
     );
     assert!(hidden.rows.is_empty());
 }
-/// `EXPLAIN` は式キー付きの広域取得・集計も従来どおり受理しない（`explain_rejects_scalar_order_by_scan`
-/// と同じ分類。EXPLAIN と式 `ORDER BY`／`HAVING` の併用は本 Issue の対象外）。
+/// セッション経由の `EXPLAIN` が式キー付きの広域取得・集計（式 `ORDER BY`／`HAVING`）を受理し、
+/// 静的判定の行だけを返すことを固定する（Issue #1350。ポインタ: SQL-26・SQL-27、TASK-210）。
+/// セッションなしの入口 `execute_sql` は EXPLAIN 全般を `42601` とする入口契約のままで、
+/// 本テストが以前その入口を呼んでいたため式の併用拒否を検証できていなかった（空振り）。
+/// 受理形は wire-server の経路（`execute_sql_in_txn`／`execute_sql_in_session`）と同じ。
 #[test]
-fn explain_still_rejects_expression_order_by_and_having() {
+fn explain_accepts_expression_order_by_and_having_in_session() {
     let (core, _g) = build("sql26-explain", &[]);
     let ctx = ctx_for("tenant-a");
-    for sql in [
-        "EXPLAIN SELECT id FROM docs ORDER BY lower(title) LIMIT 5",
-        "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang HAVING lower(lang) = 'ja'",
-    ] {
+    let scan = vec!["scalar_plan: plain_scan", "access_path: full_scan"];
+    let cases: [(&str, Vec<&str>); 4] = [
+        (
+            "EXPLAIN SELECT id FROM docs ORDER BY lower(title) LIMIT 5",
+            scan.clone(),
+        ),
+        (
+            "EXPLAIN SELECT id FROM docs ORDER BY lang DESC, lower(title) LIMIT 5",
+            scan,
+        ),
+        (
+            "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang HAVING lower(lang) = 'ja'",
+            Vec::new(),
+        ),
+        (
+            "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY lower(lang) DESC",
+            Vec::new(),
+        ),
+    ];
+    for (sql, expected) in cases {
+        let mut session = SessionState::default();
+        let outcome = core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must be accepted: {e:?}"));
+        let SqlOutcome::Explain(result) = outcome else {
+            panic!("expected Explain for {sql}");
+        };
+        let lines: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| match &r.cells[0] {
+                Cell::Text(t) => t.clone(),
+                other => panic!("expected Cell::Text, got {other:?}"),
+            })
+            .collect();
+        if expected.is_empty() {
+            // 集計の行内容は固定済みの EXPLAIN 集計テストに委ね、式の有無で変わらないことだけ確認する。
+            let plain_agg = "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang";
+            let mut s2 = SessionState::default();
+            let SqlOutcome::Explain(base) = core
+                .execute_sql_in_session(&ctx, &mut s2, plain_agg)
+                .expect("plain aggregate EXPLAIN")
+            else {
+                panic!("expected Explain");
+            };
+            let base_lines: Vec<String> = base
+                .rows
+                .iter()
+                .map(|r| match &r.cells[0] {
+                    Cell::Text(t) => t.clone(),
+                    other => panic!("expected Cell::Text, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(lines, base_lines, "sql={sql}");
+        } else {
+            assert_eq!(lines, expected, "sql={sql}");
+        }
+        // セッションなしの入口は EXPLAIN 全般を 42601 とする（入口契約。式の有無と無関係）。
         assert_eq!(run_err(&core, &ctx, sql), "42601", "{sql}");
     }
+}
+
+/// `EXPLAIN` を前置しても式の束縛検証は迂回できず、エラー分類が非 EXPLAIN と一致する。
+/// `EXPLAIN` は本体を評価しないため、評価時エラー（ゼロ除算）は EXPLAIN では発生しない。
+#[test]
+fn explain_expression_error_codes_match_non_explain() {
+    let (core, _g) = build("sql26-explain-parity", &[]);
+    let ctx = ctx_for("tenant-a");
+    for body in [
+        "SELECT id FROM docs ORDER BY lower(nope) LIMIT 3".to_string(),
+        "SELECT id FROM docs ORDER BY vec_div(embedding, 2) LIMIT 3".to_string(),
+        "SELECT id FROM docs ORDER BY count(*) LIMIT 3".to_string(),
+        "SELECT DISTINCT lang FROM docs ORDER BY lower(lang)".to_string(),
+        "SELECT id FROM missing ORDER BY lower(title) LIMIT 3".to_string(),
+        format!("{AGG} HAVING count(*) > 1"),
+        format!("{AGG} HAVING lang = 'ja'"),
+        format!("{AGG} HAVING abs(zzz) > 1"),
+        format!("{AGG} HAVING lower(title) = 'a'"),
+        format!("{AGG} ORDER BY lower(title)"),
+    ] {
+        let mut s1 = SessionState::default();
+        let plain = session_err(&core, &ctx, &mut s1, &body);
+        let mut s2 = SessionState::default();
+        let explained = session_err(&core, &ctx, &mut s2, &format!("EXPLAIN {body}"));
+        assert_eq!(plain, explained, "sql={body}");
+    }
+    // 評価時エラーは EXPLAIN では起きない（本体を評価しない）。
+    let mut s = SessionState::default();
+    let eval_err = "SELECT id FROM docs ORDER BY abs(1 / (n - n)) LIMIT 100";
+    assert_eq!(session_err(&core, &ctx, &mut s, eval_err), "22012");
+    let mut s = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(&ctx, &mut s, &format!("EXPLAIN {eval_err}"))
+        .expect("EXPLAIN must not evaluate the body");
+    assert!(matches!(outcome, SqlOutcome::Explain(_)));
 }
 
 // ---------- 後続機能との併用境界（main 取り込み時に追加した拒否・検査経路） ----------
