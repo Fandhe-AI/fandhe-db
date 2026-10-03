@@ -22,6 +22,112 @@
 
 use super::allowlist::SqlSurfaceError;
 use super::lexer::Token;
+use crate::catalog::{ArrayElemType, ArrayType, ColumnType, MAX_ARRAY_ELEMENTS};
+
+/// 構文木を、カタログを参照せずに可能な範囲で `ColumnType` へ写した結果
+/// （[`to_static_column_type`] の戻り値。Issue #1348）。
+///
+/// ENUM 型名の存在確認は実行段（`sql::ddl`。DDL 権限ゲートの後）でのみ行う契約の
+/// ため、ENUM 候補は未解決のまま運ぶ。`CREATE TABLE` の構文検証
+/// （`sql::allowlist`）は本型を使い、実行段（`sql::ddl::resolve_column_type`）が
+/// 同じ変換表を共有する（変換表を 2 つ持たない）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StaticColumnType {
+    /// カタログ参照なしで確定した型。
+    Resolved(ColumnType),
+    /// ENUM 型名の候補（実行段が `Storage::get_enum_type` で解決する）。
+    EnumCandidate(String),
+    /// 要素が ENUM 型名候補の配列（`<enum>[N]`）。配列の要素型は現状スカラー型に
+    /// 限られるため、実行段は型名の存在確認のうえ登録済みでも `0A000` で拒否する。
+    ArrayOfEnumCandidate(String),
+}
+
+/// 構文木 [`SqlColumnTypeName`] を [`StaticColumnType`] へ写す（カタログ非参照の純関数）。
+///
+/// - `VECTOR(N)` は `Resolved(Vector(N))`（採否は呼び出し元が決める。`ADD COLUMN` は
+///   実行段で `0A000`、`CREATE TABLE` は従来どおり受理）
+/// - 配列は要素型を写したうえで [`ArrayType::new`] へ渡す。`[]` は
+///   `MAX_ARRAY_ELEMENTS`、範囲外の `[N]` は `42601`。要素が `VECTOR`・配列は `42601`、
+///   `ArrayElemType` に対応が無い型（NUMERIC・BYTEA・JSON・JSONB）は `0A000`
+/// - `ColumnType` から `ArrayElemType` への写像はワイルドカードを使わず網羅的に
+///   書く（要素型が増えたときコンパイラが追従漏れを検出する）
+pub(crate) fn to_static_column_type(
+    ty: &SqlColumnTypeName,
+) -> Result<StaticColumnType, SqlSurfaceError> {
+    let resolved = match ty {
+        SqlColumnTypeName::Text => ColumnType::Text,
+        SqlColumnTypeName::Integer => ColumnType::Integer,
+        SqlColumnTypeName::BigInt => ColumnType::BigInt,
+        SqlColumnTypeName::Real => ColumnType::Real,
+        SqlColumnTypeName::Double => ColumnType::Double,
+        SqlColumnTypeName::Boolean => ColumnType::Boolean,
+        SqlColumnTypeName::Date => ColumnType::Date,
+        SqlColumnTypeName::Timestamp => ColumnType::Timestamp,
+        SqlColumnTypeName::Bytea => ColumnType::Bytea,
+        SqlColumnTypeName::Json => ColumnType::Json,
+        SqlColumnTypeName::Jsonb => ColumnType::Jsonb,
+        SqlColumnTypeName::Uuid => ColumnType::Uuid,
+        SqlColumnTypeName::Numeric { precision, scale } => ColumnType::Numeric {
+            precision: *precision,
+            scale: *scale,
+        },
+        SqlColumnTypeName::Vector(dim) => ColumnType::Vector(*dim),
+        SqlColumnTypeName::Enum(name) => return Ok(StaticColumnType::EnumCandidate(name.clone())),
+        SqlColumnTypeName::Array { elem, max_len } => {
+            let max_len = max_len.unwrap_or(MAX_ARRAY_ELEMENTS);
+            let elem_ty = match to_static_column_type(elem)? {
+                StaticColumnType::Resolved(t) => t,
+                StaticColumnType::EnumCandidate(name) => {
+                    // 上限の範囲だけは型名の存在確認より先に検証する（実行段の
+                    // 解決を待たずに構文として確定できる誤りのため）。
+                    ArrayType::new(ArrayElemType::Text, max_len).map_err(array_size_error)?;
+                    return Ok(StaticColumnType::ArrayOfEnumCandidate(name));
+                }
+                StaticColumnType::ArrayOfEnumCandidate(_) => {
+                    return Err(nested_array_error());
+                }
+            };
+            let elem_ty = match elem_ty {
+                ColumnType::Text => ArrayElemType::Text,
+                ColumnType::Boolean => ArrayElemType::Bool,
+                ColumnType::Integer => ArrayElemType::Integer,
+                ColumnType::BigInt => ArrayElemType::BigInt,
+                ColumnType::Real => ArrayElemType::Real,
+                ColumnType::Double => ArrayElemType::Double,
+                ColumnType::Date => ArrayElemType::Date,
+                ColumnType::Timestamp => ArrayElemType::Timestamp,
+                ColumnType::Uuid => ArrayElemType::Uuid,
+                ColumnType::Vector(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "VECTOR cannot be an array element type",
+                    ))
+                }
+                ColumnType::Array(_) => return Err(nested_array_error()),
+                ColumnType::Numeric { .. }
+                | ColumnType::Bytea
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Enum(_) => {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "this array element type is not supported yet".to_string(),
+                    })
+                }
+            };
+            let array = ArrayType::new(elem_ty, max_len).map_err(array_size_error)?;
+            ColumnType::Array(array)
+        }
+    };
+    Ok(StaticColumnType::Resolved(resolved))
+}
+
+fn nested_array_error() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported("nested or multi-dimensional array types are not supported")
+}
+
+/// 配列の要素数上限が範囲外（`catalog::ArrayType::new` の拒否）を `42601` へ写す。
+fn array_size_error(e: crate::catalog::CatalogError) -> SqlSurfaceError {
+    SqlSurfaceError::unsupported(format!("invalid array type: {e}"))
+}
 
 /// 型名の許可リスト構文木。`ALTER TABLE ADD COLUMN`（将来 `CREATE TABLE` とも
 /// 共有する前提。`docs/design/sql-alter-table-add-column.md` 参照）が受理する
@@ -33,8 +139,10 @@ use super::lexer::Token;
 /// テーブルへの `VECTOR` 列追加は、arena 構築・KNN・HNSW 各経路の安全性が
 /// 未検証のため。詳細は `docs/design/sql-alter-table-add-column.md` 参照）。
 ///
-/// 配列型（`<型>[]`）は対象外——`lexer` が `[`／`]` を字句化できないため、
-/// 字句解析段階で `42601` になる（`lexer.rs` を広げない設計判断）。
+/// 配列型（`<型>[]`・`<型>[N]`。TABLE-14・Issue #1348）は [`Self::Array`] で表す。
+/// 多次元（`<型>[][]`）は構文段階で `42601`。`[N]` の `N` は書き込み時の要素数上限
+/// （`catalog::ArrayType::max_len`）として実行段が `1..=MAX_ARRAY_ELEMENTS` を検証する
+/// （PostgreSQL と異なり、サイズ指定は無視されず超過書き込みが `54000` になる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlColumnTypeName {
     Text,
@@ -64,12 +172,48 @@ pub enum SqlColumnTypeName {
     /// 上記いずれの予約型名にも一致しなかった識別子。ENUM 型名の候補として
     /// 実行段が `Storage::get_enum_type` で存在確認・語彙解決する。
     Enum(String),
+    /// `<型>[]`／`<型>[N]`（Issue #1348）。`max_len` が `None` は `[]`（実行段が
+    /// `MAX_ARRAY_ELEMENTS` を採用）。要素型が配列・`VECTOR` の場合は実行段が拒否する
+    /// （構文段では入れ子を作らない）。
+    Array {
+        elem: Box<SqlColumnTypeName>,
+        max_len: Option<u32>,
+    },
 }
 
 /// `tokens[*pos..]` の先頭から型名 1 個を読み取り、消費した分だけ `*pos` を
 /// 進める。`sql::allowlist::Parser::parse_alter_table_add_column` が自身の
 /// `tokens`／`pos` を共有して呼ぶ。
 pub(crate) fn parse_column_type_name(
+    tokens: &[Token],
+    pos: &mut usize,
+) -> Result<SqlColumnTypeName, SqlSurfaceError> {
+    let base = parse_base_type_name(tokens, pos)?;
+    // 配列サフィックス `[]`／`[N]`（高々 1 個。2 個目の `[` は呼び出し元の余剰
+    // トークン判定が `42601` で拒否するため、ここでは明示的に拒否する）。
+    if !matches!(tokens.get(*pos), Some(Token::Punct('['))) {
+        return Ok(base);
+    }
+    *pos += 1;
+    let max_len = if matches!(tokens.get(*pos), Some(Token::Number(_))) {
+        Some(expect_strict_u32(tokens, pos)?)
+    } else {
+        None
+    };
+    expect_punct(tokens, pos, ']')?;
+    if matches!(tokens.get(*pos), Some(Token::Punct('['))) {
+        return Err(SqlSurfaceError::unsupported(
+            "multi-dimensional array types are not supported",
+        ));
+    }
+    Ok(SqlColumnTypeName::Array {
+        elem: Box::new(base),
+        max_len,
+    })
+}
+
+/// 配列サフィックスを除いた基本型名 1 個の解析（[`parse_column_type_name`] の下請け）。
+fn parse_base_type_name(
     tokens: &[Token],
     pos: &mut usize,
 ) -> Result<SqlColumnTypeName, SqlSurfaceError> {
@@ -302,6 +446,55 @@ mod tests {
     fn enum_candidate_preserves_original_case() {
         let (ty, _) = parse_type("MoodEnum").expect("valid");
         assert_eq!(ty, SqlColumnTypeName::Enum("MoodEnum".to_string()));
+    }
+
+    #[test]
+    fn accepts_array_suffix_with_and_without_size() {
+        let (ty, consumed) = parse_type("INTEGER[]").expect("valid");
+        assert_eq!(
+            ty,
+            SqlColumnTypeName::Array {
+                elem: Box::new(SqlColumnTypeName::Integer),
+                max_len: None
+            }
+        );
+        assert_eq!(consumed, 3);
+        let (ty, consumed) = parse_type("text[3]").expect("valid");
+        assert_eq!(
+            ty,
+            SqlColumnTypeName::Array {
+                elem: Box::new(SqlColumnTypeName::Text),
+                max_len: Some(3)
+            }
+        );
+        assert_eq!(consumed, 4);
+        // 範囲（0・上限超）の検証は実行段の責務。構文上は受理する。
+        assert!(parse_type("TEXT[0]").is_ok());
+        let (ty, _) = parse_type("mood[]").expect("valid");
+        assert!(matches!(ty, SqlColumnTypeName::Array { .. }));
+    }
+
+    #[test]
+    fn rejects_malformed_array_suffix() {
+        for raw in [
+            "INTEGER[][]",
+            "INTEGER[3][]",
+            "INTEGER[-1]",
+            "INTEGER[01]",
+            "INTEGER[1.5]",
+            "INTEGER[4294967296]",
+            "INTEGER[",
+            "INTEGER[3",
+            "INTEGER[a]",
+            "INTEGER]",
+        ] {
+            // `INTEGER]` は型名として読めても `]` が残る。残余の拒否は呼び出し元の責務。
+            let mut pos = 0;
+            let tokens = crate::sql::lexer::tokenize(raw).expect("tokenize");
+            let r = parse_column_type_name(&tokens, &mut pos);
+            let rejected = r.is_err() || pos < tokens.len();
+            assert!(rejected, "expected {raw:?} to be rejected");
+        }
     }
 
     #[test]

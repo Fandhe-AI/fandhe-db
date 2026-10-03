@@ -1900,6 +1900,21 @@ pub struct EnumTypeDef {
 }
 
 impl EnumTypeDef {
+    /// 語彙を持たない「未解決」マーカー（`CREATE TABLE` の構文検証が、カタログ参照
+    /// なしで ENUM 列を表すために使う。Issue #1348）。
+    ///
+    /// 構文段（`sql::allowlist`）は DDL 権限ゲートより前に走るため型の存在確認を
+    /// 行えず、型名だけを運ぶ。実行段（`sql::ddl::execute_create_table`）が必ず
+    /// `Storage::get_enum_type` の結果へ差し替える。差し替えが漏れても語彙が空の
+    /// ため全ラベルが拒否され fail-closed になり、`Storage::create_table` も
+    /// 書き込みトランザクション内で名前から語彙を再解決する。
+    pub(crate) fn unresolved(name: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            labels: Vec::new(),
+        })
+    }
+
     /// 型名。
     pub fn name(&self) -> &str {
         &self.name

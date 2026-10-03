@@ -469,3 +469,10 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **変更箇所**: `crates/wire-server/tests/three_client_e2e.rs`（`Client::rows_and_tag`・`seed_returning_db`・`three_clients_receive_returning_rows_and_command_tags`）、`three_client/pg_client.js`（INSERT タグに oid を含める）。production コードは変更なし。
 - **テスト**: INSERT／UPDATE／DELETE／UPSERT の返却行・タグ、他テナント id と存在しない id の 0 行同一応答、`RETURNING` 位置違反の `42601`、永続化値との一致を 3 クライアントで確認（`#[ignore]`・`make e2e-three-client`）。
 - **対象外（申し送り）**: 拡張クエリ・明示トランザクション内の `RETURNING`、NoSQL 表層、ベクトル列の投影の層 B。
+
+## Issue #1348: CREATE TABLE で配列型と ENUM 型の列を宣言する（SQL-23・TABLE-14）
+
+- **変更箇所**: `sql/lexer.rs`（`[`／`]` を `Punct` 化）、`sql/ddl_column_type.rs`（`SqlColumnTypeName::Array`・配列サフィックス解析・カタログ非参照の変換 `to_static_column_type`）、`sql/allowlist.rs`（`CREATE TABLE` の列型を共有パーサーへ切替・`pending_array_enum_types`）、`sql/ddl.rs`（`resolve_column_type` の配列対応・`execute_create_table` の ENUM 解決と DEFAULT 束縛・`TypeNotFound` を `42601` へ写像）、`catalog.rs`（`EnumTypeDef::unresolved`）。
+- **テスト**: `tests/sql_create_table_composite_types.rs`（往復・再起動・要素数上限 `54000`・未知型 `42601`・権限ゲート先行 `42501`・`DROP TYPE` の `2BP01`・ADD COLUMN の配列）、lexer・型名パーサーの単体テスト。
+- **互換性**: `SqlColumnTypeName` に variant を追加し、`CREATE TABLE` の受理型が全スカラー型へ広がった（旧: `BOOLEAN` 等は `42601`）。
+- **対象外（申し送り）**: NoSQL `create_table` の型拡張、配列の要素型 `NUMERIC`・`BYTEA`・`ENUM`・`JSON`。

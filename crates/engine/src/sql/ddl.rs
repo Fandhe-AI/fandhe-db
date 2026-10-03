@@ -49,7 +49,7 @@ use crate::sql::allowlist::{
     ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
     ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
-use crate::sql::ddl_column_type::SqlColumnTypeName;
+use crate::sql::ddl_column_type::{to_static_column_type, SqlColumnTypeName, StaticColumnType};
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
@@ -89,7 +89,30 @@ pub(crate) fn execute_create_table(
     storage: &Storage,
     validated: &ValidatedCreateTable,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
-    let mut schema = TableSchema::new(validated.table_name.clone(), validated.columns.clone());
+    // ENUM 列（構文段は未解決マーカー）を登録済みの型定義へ差し替える。型の存在確認は
+    // DDL 権限ゲート（`core.rs` の `require_ddl_permission`）の後のここでのみ行い、
+    // 未登録は `ADD COLUMN` と同じ `42601`。解決から `create_table` までの間に
+    // `DROP TYPE` が割り込んだ場合も `create_table` 側の `TypeNotFound` を `42601` へ写す。
+    let mut columns = validated.columns.clone();
+    for column in &mut columns {
+        if let ColumnType::Enum(def) = &column.ty {
+            column.ty = ColumnType::Enum(resolve_enum_type(storage, def.name())?);
+        }
+    }
+    if let Some(name) = validated.pending_array_enum_types.first() {
+        resolve_enum_type(storage, name)?;
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ENUM array element type is not supported yet".to_string(),
+        });
+    }
+    // 解決後の列型に対して DEFAULT を束縛検証する（ENUM の語彙外・DATE/NUMERIC の
+    // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
+    for column in &columns {
+        if let Some(default) = &column.default {
+            crate::sql::parser::bind_column_default(column, default)?;
+        }
+    }
+    let mut schema = TableSchema::new(validated.table_name.clone(), columns);
     // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
     // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
     // 正規化済みのため、ここでは素通しするだけでよい。
@@ -132,13 +155,17 @@ pub(crate) fn execute_create_table(
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        // ENUM 列が参照する型が解決後〜書き込みトランザクションまでの間に削除された
+        // 場合（Issue #1348）。事前解決の未登録と同じ `42601` に揃える。
+        CatalogError::TypeNotFound(name) => SqlSurfaceError::UnsupportedSyntax {
+            detail: format!("unknown type name: {name}"),
+        },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::ColumnAlreadyExists(_)
         | CatalogError::RowNotFound(_)
         | CatalogError::IncompatibleRowKeyFormat
         | CatalogError::TableGenerationCounterOverflow
-        | CatalogError::TypeNotFound(_)
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::DependentObjectsStillExist(_)
         // `ColumnNotFound`／`ProtectedColumn`／`IncompatibleTypeChange` は
@@ -818,46 +845,49 @@ fn resolve_column_type(
     storage: &Storage,
     ty: &SqlColumnTypeName,
 ) -> Result<ColumnType, SqlSurfaceError> {
-    match ty {
-        SqlColumnTypeName::Text => Ok(ColumnType::Text),
-        SqlColumnTypeName::Integer => Ok(ColumnType::Integer),
-        SqlColumnTypeName::BigInt => Ok(ColumnType::BigInt),
-        SqlColumnTypeName::Real => Ok(ColumnType::Real),
-        SqlColumnTypeName::Double => Ok(ColumnType::Double),
-        SqlColumnTypeName::Boolean => Ok(ColumnType::Boolean),
-        SqlColumnTypeName::Date => Ok(ColumnType::Date),
-        SqlColumnTypeName::Timestamp => Ok(ColumnType::Timestamp),
-        SqlColumnTypeName::Bytea => Ok(ColumnType::Bytea),
-        SqlColumnTypeName::Json => Ok(ColumnType::Json),
-        SqlColumnTypeName::Jsonb => Ok(ColumnType::Jsonb),
-        SqlColumnTypeName::Uuid => Ok(ColumnType::Uuid),
-        SqlColumnTypeName::Numeric { precision, scale } => Ok(ColumnType::Numeric {
-            precision: *precision,
-            scale: *scale,
-        }),
-        // 既存行が埋め込みバイトを持たないテーブルへの VECTOR 列追加は、
-        // arena 構築・KNN・HNSW 各経路の安全性が未検証のため常に拒否する
-        // （`sql::ddl_column_type` モジュールドキュメント参照）。
-        SqlColumnTypeName::Vector(_) => Err(SqlSurfaceError::FeatureNotSupported {
+    // 既存行が埋め込みバイトを持たないテーブルへの VECTOR 列追加は、
+    // arena 構築・KNN・HNSW 各経路の安全性が未検証のため常に拒否する
+    // （`sql::ddl_column_type` モジュールドキュメント参照）。
+    if matches!(ty, SqlColumnTypeName::Vector(_)) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "ALTER TABLE ADD COLUMN does not support VECTOR columns yet".to_string(),
-        }),
-        SqlColumnTypeName::Enum(name) => {
-            let def = storage.get_enum_type(name).map_err(|e| match e {
-                CatalogError::TypeNotFound(_) => SqlSurfaceError::UnsupportedSyntax {
-                    detail: format!("unknown type name: {name}"),
-                },
-                other => map_add_column_error(other),
-            })?;
-            Ok(ColumnType::Enum(def))
+        });
+    }
+    match to_static_column_type(ty)? {
+        StaticColumnType::Resolved(t) => Ok(t),
+        StaticColumnType::EnumCandidate(name) => {
+            Ok(ColumnType::Enum(resolve_enum_type(storage, &name)?))
+        }
+        // 型名の存在確認（未登録は 42601）を済ませたうえで、配列要素に ENUM を
+        // 取れない現状は 0A000 で拒否する（Issue #1348。要素型の拡張は別 Issue）。
+        StaticColumnType::ArrayOfEnumCandidate(name) => {
+            resolve_enum_type(storage, &name)?;
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ENUM array element type is not supported yet".to_string(),
+            })
         }
     }
+}
+
+/// ENUM 型名を `Storage::get_enum_type` で解決する。未登録は `42601`
+/// （`unknown type name`。`ADD COLUMN`・`CREATE TABLE` 共通）。
+fn resolve_enum_type(
+    storage: &Storage,
+    name: &str,
+) -> Result<std::sync::Arc<crate::catalog::EnumTypeDef>, SqlSurfaceError> {
+    storage.get_enum_type(name).map_err(|e| match e {
+        CatalogError::TypeNotFound(_) => SqlSurfaceError::UnsupportedSyntax {
+            detail: format!("unknown type name: {name}"),
+        },
+        other => map_add_column_error(other),
+    })
 }
 
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
 /// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
 /// （BYTEA・配列等）は `0A000`、対応型でリテラル種別が
 /// 合わない場合は `42601`、長さ上限超過は `54000`。
-fn add_column_default(
+pub(crate) fn add_column_default(
     column_name: &str,
     ty: &ColumnType,
     literal: &InsertLiteral,
@@ -1318,6 +1348,7 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            pending_array_enum_types: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table");
         storage
@@ -1474,6 +1505,7 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            pending_array_enum_types: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
@@ -1494,6 +1526,7 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            pending_array_enum_types: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
         let err = execute_create_table(&storage, &validated)
@@ -1515,6 +1548,7 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            pending_array_enum_types: Vec::new(),
         };
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");

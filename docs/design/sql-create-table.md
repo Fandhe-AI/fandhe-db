@@ -14,9 +14,13 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 ```
 
-- `<type>` は `TEXT`・`VECTOR ( <N> )`・`INTEGER`・`BIGINT` のみ（`INTEGER`／`BIGINT`
-  は `id` を参照する `FOREIGN KEY` の参照元列用に TABLE-17・Issue #907 が追加した。
-  TABLE-13／14 のその他の追加型は別 Issue の管轄）。`IF NOT EXISTS`・
+- `<type>` は `ALTER TABLE ADD COLUMN` と共有する型名パーサー（`sql::ddl_column_type`）で
+  読む（Issue #1348）。受理するのは、全スカラー型（`TEXT`・`INTEGER`・`BIGINT`・`REAL`・
+  `DOUBLE PRECISION`・`BOOLEAN`・`DATE`・`TIMESTAMP`・`BYTEA`・`JSON`・`JSONB`・`UUID`・
+  `NUMERIC(p,s)`）・`VECTOR ( <N> )`・配列型（`<型>[]`・`<型>[N]`。TABLE-14）・登録済みの
+  ENUM 型名。未知の型名は `42601`。`VECTOR` は従来どおり常に非 nullable で `DEFAULT`・
+  `UNIQUE` を持てない。DEFAULT の型別変換は `ADD COLUMN` と同じ純関数
+  （`sql::ddl::add_column_default`）を共有する。`IF NOT EXISTS`・
   `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
   `42601`）。列制約 `REFERENCES <table> [(<col>[, ...])]`・表制約
   `FOREIGN KEY (<col>[, ...]) REFERENCES ...`（Issue #907。
@@ -192,3 +196,20 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
   `NOT NULL`／`DEFAULT` は Issue #904 で実装済み（上記節参照）。
 - `EXPLAIN CREATE TABLE`・`CREATE TABLE` への `USING OPERATION_ID` 付与はいずれも
   許可形状に存在しないため構造的に `42601`。
+
+## 列型の解決順序（Issue #1348）
+
+1. 構文検証（`sql::allowlist`）はカタログを参照しない。ENUM 型名候補は語彙を持たない
+   未解決マーカー（`EnumTypeDef::unresolved`）として運ぶ。要素が ENUM 型名候補の配列は
+   `ValidatedCreateTable::pending_array_enum_types` に名前だけを積む。
+2. DDL 権限ゲート（`42501`）を通過した後、`sql::ddl::execute_create_table` が ENUM 型名を
+   `Storage::get_enum_type` で解決する。未登録は `42601`（型の存在有無は権限のない
+   セッションには見えない）。要素が ENUM の配列は、登録済みでも `0A000`。
+3. 解決後の列型で `DEFAULT` を束縛検証する（ENUM の語彙外は `22P02`）。
+4. `Storage::create_table`（書き込みトランザクション内で型名を再解決する）。解決から
+   書き込みまでの間に `DROP TYPE` が割り込んだ場合の `TypeNotFound` も `42601` へ写す。
+
+配列の `[N]` は書き込み時の要素数上限（超過は `54000`）として意味を持ち、範囲は
+`1..=1024`（`[]` は 1024）。範囲外・多次元・`VECTOR` 要素は `42601`、`NUMERIC`・
+`BYTEA`・`JSON`・`JSONB` 要素は `0A000`。`CREATE TABLE` が列型キーワードとして予約する語
+（制約名の衝突判定）は、受理するスカラー型名すべてに広がった。

@@ -296,10 +296,14 @@ fn create_table_rejects_unknown_type() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        // `INTEGER`／`BIGINT` は `FOREIGN KEY` の参照元列用に受理する（TABLE-17・
-        // TASK-205、Issue #907）ため、未対応型の代表として `BOOLEAN` を使う。
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a BOOLEAN)")
-        .expect_err("unsupported type must be rejected");
+        // スカラー型・配列・ENUM は受理する（Issue #1348）ため、未知の型名の代表として
+        // 未登録の識別子を使う（ENUM 型名候補として実行段で存在確認され `42601`）。
+        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a no_such_type)")
+        .expect_err("unknown type must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+    let err = core
+        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a no_such_type[])")
+        .expect_err("unknown array element type must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
 

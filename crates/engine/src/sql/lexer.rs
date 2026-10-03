@@ -41,7 +41,10 @@ pub enum Token {
     Ident(String),
     StringLiteral(String),
     Number(String),
-    /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<`（TASK-79・SQL-9 で `+ - / > <` を追加。
+    /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]`（TASK-79・SQL-9 で `+ - / > <` を追加。
+    /// `[`／`]` は配列型の列宣言 `<型>[N]`（SQL-23・TABLE-14。Issue #1348）専用で、
+    /// 構文上の受理位置は `sql::ddl_column_type` の型名解析に限る（それ以外の位置に
+    /// 現れた場合は各パーサーが `42601` で拒否する）。
     /// `*` は SELECT リストの `*` と式内の乗算の両方を表す。文脈による使い分けは
     /// `allowlist::Parser` の管轄）。
     Punct(char),
@@ -329,7 +332,7 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             continue;
         }
 
-        if matches!(c, '(' | ')' | ',' | '*' | '=' | ';' | '+') {
+        if matches!(c, '(' | ')' | ',' | '*' | '=' | ';' | '+' | '[' | ']') {
             tokens.push(Token::Punct(c));
             chars.next();
             continue;
@@ -1276,5 +1279,29 @@ mod tests {
         let tokens = tokenize("1e+").expect("tokenize should succeed");
         assert_eq!(tokens.first(), Some(&Token::Number("1".to_string())));
         assert!(tokens.len() >= 2);
+    }
+
+    #[test]
+    fn tokenize_reads_square_brackets_as_punct() {
+        // Issue #1348: 配列型 `<型>[N]` の宣言用に `[`／`]` を `Punct` として字句化する。
+        let tokens = tokenize("INTEGER[]").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("INTEGER".to_string()),
+                Token::Punct('['),
+                Token::Punct(']')
+            ]
+        );
+        let tokens = tokenize("TEXT[3]").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("TEXT".to_string()),
+                Token::Punct('['),
+                Token::Number("3".to_string()),
+                Token::Punct(']')
+            ]
+        );
     }
 }

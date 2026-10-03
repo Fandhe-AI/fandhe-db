@@ -223,3 +223,11 @@ DISTANCE 先行の再評価経路（`sql::exec` の `candidate_value_to_scalar_r
 - `ARRAY[...]` コンストラクタ、要素・パス演算子（`[]`・`@>`・`->`）による述語
 - NoSQL `filter` の `in` を配列列・JSON 列に使うこと
 - 配列列・JSON 列の二次索引化
+
+## Issue #1348 追記: SQL DDL での配列列宣言
+
+`lexer` が `[`／`]` を `Punct` として字句化するようになり、`CREATE TABLE`・
+`ALTER TABLE ADD COLUMN` の型名（`<型>[]`・`<型>[N]`）で配列列を宣言できる
+（SQL-23・TABLE-14）。`[N]` は PostgreSQL と異なりサイズ指定が無視されず、列の要素数
+上限（`ArrayType::max_len`。書き込みの超過は `54000`）になる。要素・パス演算子
+（`tags[1]` 等）は引き続き構文検証で `42601`。
