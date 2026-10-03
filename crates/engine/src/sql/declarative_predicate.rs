@@ -289,6 +289,24 @@ pub fn negate_conjunction(
     Ok(vec![DeclarativePredicate::Or(branches)])
 }
 
+/// 構文形 [`crate::sql::allowlist::WherePredicate`] 列（`AND` 結合）の否定を、SQL の
+/// `NOT` と同一の AST で返す（`sql::where_negation::negate_conjunction` の公開入口。
+/// Issue #1356・NOSQL-12 の述語形 DML）。
+///
+/// 呼び出し文脈: `wire-server` の `http::query::filter::bind_filter_where_predicates`
+/// が NoSQL `update`／`delete` の `{"not": ...}`・数値列 `ne` を構文形へ写す際に呼ぶ。
+/// 述語形 DML の `content_hash` は束縛前の構文形をハッシュ源にする（RECOVER-10）ため、
+/// SQL パーサと同じ否定の押し下げ結果をバイト単位で再現する必要がある。wire 側で否定を
+/// 再実装すると第 2 の評価器になり AST もずれるので、この関数を唯一の入口とする。
+/// `budget` は式ノード予算（[`udf_call::MAX_EXPR_NODES`] で初期化し filter 全体で共有する。
+/// 枯渇は `54000`）。
+pub fn negate_where_conjunction(
+    preds: Vec<crate::sql::allowlist::WherePredicate>,
+    budget: &mut usize,
+) -> Result<Vec<crate::sql::allowlist::WherePredicate>, SqlSurfaceError> {
+    crate::sql::where_negation::negate_conjunction(preds, budget)
+}
+
 /// [`negate_conjunction`] の 1 要素分（否定表の各行）。
 fn negate_one(pred: DeclarativePredicate) -> Result<Vec<DeclarativePredicate>, SqlSurfaceError> {
     match pred {
