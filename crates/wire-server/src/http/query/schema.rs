@@ -1179,6 +1179,20 @@ pub static DDL_ADD_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::String,
             nullable: false,
         },
+        // Issue #1338（TABLE-16・NOSQL-13）: SQL 表層の `NOT NULL`／
+        // `DEFAULT <literal>` 列制約と同じ意味。意味検証は engine へ一本化する。
+        FieldSpec {
+            key: "not_null",
+            presence: Presence::Optional,
+            ty: FieldType::Bool,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "default",
+            presence: Presence::Optional,
+            ty: FieldType::Scalar,
+            nullable: false,
+        },
     ],
 };
 
