@@ -498,6 +498,6 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 ## Issue #1352（投影位置のスカラーサブクエリと IN の対象型拡大）
 
 - **対象ビヘイビア**: SQL-29 (a)・RLS-10 (b)・TASK-213。
-- **変更箇所**: `crates/engine/src/sql/subquery.rs`（`validate_in_target_column` が `REAL`／`DOUBLE PRECISION` と疑似列 `id` を受理。浮動小数の distinct 集合を式述語の `Or` へ展開）、`crates/engine/tests/sql29_subquery_scalar.rs`、`docs/design/sql-subquery.md`。公開 enum の変更なし。
+- **変更箇所**: `crates/engine/src/sql/subquery.rs`（`validate_in_target_column` が `REAL`／`DOUBLE PRECISION` と疑似列 `id` を受理。浮動小数の distinct 集合を式述語の `Or` へ展開）、`crates/engine/tests/sql29_subquery_scalar.rs`、`docs/design/sql-subquery.md`。**破壊的変更**: 公開 enum `sql::allowlist::WherePredicate` に内部用 variant `IdCompare` を追加した（疑似列 `id` のサブクエリ比較を整数のまま厳密に照合するため。TASK-213 ポインタ。spec 側の定義変更とは対で扱う）。網羅的 `match` を持つ外部コードは要対応。
 - **投影位置のスカラーサブクエリ**: `sql::allowlist`（`ScalarSubqueryItem`・SELECT リスト解析）、`sql::subquery`（`resolve_scalar_projection_items`・`merge_scalar_projection_items`）、`core.rs` の `Statement::Scan` アーム。`crates/engine/tests/sql29_projection_subquery.rs`。詳細は `docs/design/sql-subquery.md`。
 - **性質**: 内側の行数に依存しない静的な値族検証、他テナント行が結果・エラーを変えない。非有限値は `22000`。
