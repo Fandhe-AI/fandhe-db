@@ -61,7 +61,7 @@ const PAGE_LIMIT: u32 = 10_000;
 /// （coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」対応）。
 /// テーブル全体の総行数ではなく可視行数を上限にすることで、大量の不可視行を持つ
 /// テーブルでも呼び出し元テナントの可視行数だけに比例した確保量に収まる。
-const MAX_VISIBLE_ROWS: usize = 100_000;
+pub(crate) const MAX_VISIBLE_ROWS: usize = 100_000;
 
 /// [`visible_rows`] が 1 回の呼び出しで走査してよい総行数（可視・不可視を問わない）の
 /// 上限。`MAX_VISIBLE_ROWS` は出力（確保量）を抑えるが、他テナントの不可視行を
@@ -426,9 +426,9 @@ fn convert_write_txn_err(e: StorageError) -> TenantWriteError {
 ///
 /// `InTxn` を受理するのは、行を書き換える全 `*_unchecked` 経路（単一行・複数行の
 /// `INSERT`・UPSERT・`UPDATE`〔単一行・述語形〕・`DELETE`〔単一行・述語形〕・
-/// `TRUNCATE`。Issue #1179）。例外は [`replace_typed_rows_by_text_key`]（ファイル形
-/// `INSERT`。埋め込み I/O を単一ライタの保持中に行うことになるため autocommit 専用の
-/// まま。明示トランザクション内では `core.rs` が `0A000` で拒否する）。
+/// `TRUNCATE`。Issue #1179）、およびファイル形 `INSERT` の置換書き込み
+/// （[`replace_typed_rows_by_text_key`]。Issue #1353。埋め込み I/O は BEGIN 時点で
+/// 既に保持している単一ライタの下で、セッションの `max_duration` の範囲内に行う）。
 ///
 /// 連鎖適用（参照アクション）で書き換わる子テーブルも同じ `write_txn` へ書き込まれ、
 /// テーブル世代が bump される（`SessionTransaction::dirty_tables` が世代の変化から
@@ -478,7 +478,7 @@ impl<'a> WriteTarget<'a> {
     /// （`constraint::FkCheckMode`。TABLE-17・TASK-205、Issue #1077）。
     /// `Autocommit`（1 文＝1 トランザクション）は `INITIALLY DEFERRED` の
     /// 宣言でも必ず文単位で検査する（`All`）。`InTxn`（明示トランザクション。
-    /// `replace_typed_rows_by_text_key` を除く全書き込み経路）は
+    /// 全書き込み経路）は
     /// `INITIALLY DEFERRED` の FK を文単位検査から除外し
     /// （`ImmediateOnly`）、COMMIT 時
     /// （`constraint::enforce_deferred_foreign_keys_in_txn`）へ先送りする。
@@ -4604,7 +4604,7 @@ pub(crate) struct ReplaceByTextKey<'a> {
 }
 
 pub(crate) fn replace_typed_rows_by_text_key(
-    storage: &Storage,
+    target: WriteTarget<'_>,
     ctx: &PolicyContext,
     req: ReplaceByTextKey<'_>,
 ) -> Result<ReplaceOutcome, TenantWriteError> {
@@ -4620,332 +4620,336 @@ pub(crate) fn replace_typed_rows_by_text_key(
         ledger_write,
     } = req;
     validate_identifier(table)?;
-    let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-    // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。クロージャ内で
-    // 可変参照として捕捉し、削除した旧チャンク行の削除前の値を積む（下記の
-    // `needs_fk_removed_pre_image` 代入箇所のドキュメント参照）。
-    let mut needs_fk_removed_pre_image = false;
-    let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
-    // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
-    // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
-    // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
-    // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
-    // 置換で実際に削除した旧行 id（クロージャ内の `to_remove` の写し）。
-    // `ReplaceOutcome`（公開 API）に id 一覧を持たせずに済ませるため、クロージャの
-    // 外側でこの `Vec` を用意し、クロージャ内から書き込む（Issue #1071: 参照先側
-    // FK 検査〔`ReferencedRowsChange::Removed`〕が索引の同期に必要とする）。
-    let mut removed_ids: Vec<u64> = Vec::new();
-    let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
-        let schema = require_table_schema_write(&write_txn, table)?;
-        let vector_idx = schema
-            .columns
-            .iter()
-            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
-            .ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "table has no VECTOR column".to_string(),
-                ))
-            })?;
-        let key_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == key_column)
-            .ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(format!(
-                    "unknown key column: {key_column}"
-                )))
-            })?;
+    target.with_txn(|write_txn| {
+        // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。クロージャ内で
+        // 可変参照として捕捉し、削除した旧チャンク行の削除前の値を積む（下記の
+        // `needs_fk_removed_pre_image` 代入箇所のドキュメント参照）。
+        let mut needs_fk_removed_pre_image = false;
+        let mut removed_pre_images = crate::constraint::UpdatedKeyPreImages::new();
+        // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
+        // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
+        // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
+        // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
+        // 置換で実際に削除した旧行 id（クロージャ内の `to_remove` の写し）。
+        // `ReplaceOutcome`（公開 API）に id 一覧を持たせずに済ませるため、クロージャの
+        // 外側でこの `Vec` を用意し、クロージャ内から書き込む（Issue #1071: 参照先側
+        // FK 検査〔`ReferencedRowsChange::Removed`〕が索引の同期に必要とする）。
+        let mut removed_ids: Vec<u64> = Vec::new();
+        let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
+            let schema = require_table_schema_write(write_txn, table)?;
+            let vector_idx = schema
+                .columns
+                .iter()
+                .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+                .ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "table has no VECTOR column".to_string(),
+                    ))
+                })?;
+            let key_idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name == key_column)
+                .ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                        "unknown key column: {key_column}"
+                    )))
+                })?;
 
-        // `user_rows/{table}` を開く**前**に、このテーブルを参照先とする
-        // FOREIGN KEY（列参照。`id` 参照は索引を使わない）の永続キー索引を、
-        // テナント `ctx.tenant_id()` の現在（この文の削除・挿入より前）の状態
-        // から backfill・登録しておく（Issue #1071 レビュー指摘・cursor bugbot
-        // 指摘: この backfill が旧行の物理削除**後**に初めて走ると、削除された
-        // 旧行の旧キーが逆引き索引の pre-image に一度も現れず、直後の
-        // 参照先側検査〔`enforce_referencing_rows_in_txn`〕が「失われたキー
-        // なし」と誤判定し他の子行からの参照をすり抜ける。行ストアを開いた
-        // 後に呼ぶと `redb::TableError::TableAlreadyOpen`
-        // になる（`ensure_index_in_txn` も同じ行ストアを開くため。この関数の
-        // `mut row_table` は削除・挿入の完了までこのクロージャ内で生き続ける）。
-        // 削除対象が実際にあるかどうかはこの時点でまだ分からないが、
-        // 冪等（既に登録済みなら何もしない）なので無条件に呼んでよい。
-        // `constraint::prepare_referenced_key_indexes_in_txn` ドキュメント参照。
-        crate::constraint::prepare_referenced_key_indexes_in_txn(
-            &write_txn,
-            table,
-            &schema,
-            ctx.tenant_id(),
-        )?;
+            // `user_rows/{table}` を開く**前**に、このテーブルを参照先とする
+            // FOREIGN KEY（列参照。`id` 参照は索引を使わない）の永続キー索引を、
+            // テナント `ctx.tenant_id()` の現在（この文の削除・挿入より前）の状態
+            // から backfill・登録しておく（Issue #1071 レビュー指摘・cursor bugbot
+            // 指摘: この backfill が旧行の物理削除**後**に初めて走ると、削除された
+            // 旧行の旧キーが逆引き索引の pre-image に一度も現れず、直後の
+            // 参照先側検査〔`enforce_referencing_rows_in_txn`〕が「失われたキー
+            // なし」と誤判定し他の子行からの参照をすり抜ける。行ストアを開いた
+            // 後に呼ぶと `redb::TableError::TableAlreadyOpen`
+            // になる（`ensure_index_in_txn` も同じ行ストアを開くため。この関数の
+            // `mut row_table` は削除・挿入の完了までこのクロージャ内で生き続ける）。
+            // 削除対象が実際にあるかどうかはこの時点でまだ分からないが、
+            // 冪等（既に登録済みなら何もしない）なので無条件に呼んでよい。
+            // `constraint::prepare_referenced_key_indexes_in_txn` ドキュメント参照。
+            crate::constraint::prepare_referenced_key_indexes_in_txn(
+                write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+            )?;
 
-        let row_table_name = user_rows_table_name(table);
-        let mut row_table = write_txn
-            .open_table(user_rows_table_def(&row_table_name))
-            .map_err(map_row_table_error)?;
+            let row_table_name = user_rows_table_name(table);
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
 
-        let tenant = ctx.tenant_id();
-        // テナント名前空間内の既存行を走査し、削除対象 id・既存最大 id（削除対象・
-        // 対象外を問わない）を同時に収集する。`range` の借用は本ブロックで閉じ、
-        // 後続の `remove`/`insert`（`&mut` 借用）と衝突しないようにする
-        // （`update_row`/`delete_row` の `AccessGuard` スコープと同じ方針）。
-        let mut to_remove: Vec<u64> = Vec::new();
-        let mut max_id: Option<u64> = None;
-        let mut scanned_count: usize = 0;
-        {
-            let start = std::ops::Bound::Included((tenant, 0u64));
-            let end = std::ops::Bound::Included((tenant, u64::MAX));
-            let mut iter = row_table
-                .range::<(&str, u64)>((start, end))
-                .map_err(CatalogError::from)?;
-            for entry in &mut iter {
-                let (k, v) = entry.map_err(CatalogError::from)?;
-                let (_key_tenant, id) = k.value();
-                let raw = v.value();
-                scanned_count = scanned_count.saturating_add(1);
-                if scanned_count > MAX_SCANNED_ROWS {
-                    return Err(TenantWriteError::Storage(StorageError::Codec(format!(
-                        "too many rows scanned for replace: max {MAX_SCANNED_ROWS}"
-                    ))));
-                }
-                // embedding は比較に不要なため、metadata（スカラー列ペイロード）のみを
-                // 借用で取り出す（`decode_row` は行ごとに `Vec<f32>` を確保するため、
-                // テナント全行走査のホットパスでは使わない。`storage.rs`
-                // `decode_row_metadata_borrowed` モジュールドキュメント参照。
-                // coding-rust.md「不安全な設計 / DoS」対応）。
-                let metadata = crate::storage::decode_row_metadata_borrowed(raw)
-                    .map_err(TenantWriteError::Storage)?;
-                max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
-                let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
-                    .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
-                if scanned
-                    .get(key_idx)
-                    .copied()
-                    .flatten()
-                    .and_then(|v| v.as_text())
-                    == Some(key_value)
-                {
-                    to_remove.push(id);
-                    if to_remove.len() > MAX_VISIBLE_ROWS {
+            let tenant = ctx.tenant_id();
+            // テナント名前空間内の既存行を走査し、削除対象 id・既存最大 id（削除対象・
+            // 対象外を問わない）を同時に収集する。`range` の借用は本ブロックで閉じ、
+            // 後続の `remove`/`insert`（`&mut` 借用）と衝突しないようにする
+            // （`update_row`/`delete_row` の `AccessGuard` スコープと同じ方針）。
+            let mut to_remove: Vec<u64> = Vec::new();
+            let mut max_id: Option<u64> = None;
+            let mut scanned_count: usize = 0;
+            {
+                let start = std::ops::Bound::Included((tenant, 0u64));
+                let end = std::ops::Bound::Included((tenant, u64::MAX));
+                let mut iter = row_table
+                    .range::<(&str, u64)>((start, end))
+                    .map_err(CatalogError::from)?;
+                for entry in &mut iter {
+                    let (k, v) = entry.map_err(CatalogError::from)?;
+                    let (_key_tenant, id) = k.value();
+                    let raw = v.value();
+                    scanned_count = scanned_count.saturating_add(1);
+                    if scanned_count > MAX_SCANNED_ROWS {
                         return Err(TenantWriteError::Storage(StorageError::Codec(format!(
-                            "too many matching rows for replace: max {MAX_VISIBLE_ROWS}"
+                            "too many rows scanned for replace: max {MAX_SCANNED_ROWS}"
                         ))));
+                    }
+                    // embedding は比較に不要なため、metadata（スカラー列ペイロード）のみを
+                    // 借用で取り出す（`decode_row` は行ごとに `Vec<f32>` を確保するため、
+                    // テナント全行走査のホットパスでは使わない。`storage.rs`
+                    // `decode_row_metadata_borrowed` モジュールドキュメント参照。
+                    // coding-rust.md「不安全な設計 / DoS」対応）。
+                    let metadata = crate::storage::decode_row_metadata_borrowed(raw)
+                        .map_err(TenantWriteError::Storage)?;
+                    max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
+                    let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
+                        .map_err(|e| {
+                            TenantWriteError::Storage(StorageError::Codec(e.to_string()))
+                        })?;
+                    if scanned
+                        .get(key_idx)
+                        .copied()
+                        .flatten()
+                        .and_then(|v| v.as_text())
+                        == Some(key_value)
+                    {
+                        to_remove.push(id);
+                        if to_remove.len() > MAX_VISIBLE_ROWS {
+                            return Err(TenantWriteError::Storage(StorageError::Codec(format!(
+                                "too many matching rows for replace: max {MAX_VISIBLE_ROWS}"
+                            ))));
+                        }
                     }
                 }
             }
-        }
 
-        let removed = to_remove.len();
-        if removed == 0 && rows.is_empty() {
-            // 変更ゼロ。`insert_rows` の空バッチと同じく世代を進めずに成功する
-            // （呼び出し元が commit せず drop することを、戻り値の 0/0/None から判断する）。
-            return Ok(ReplaceOutcome {
-                removed: 0,
-                inserted: 0,
-                first_id: None,
-            });
-        }
+            let removed = to_remove.len();
+            if removed == 0 && rows.is_empty() {
+                // 変更ゼロ。`insert_rows` の空バッチと同じく世代を進めずに成功する
+                // （呼び出し元が commit せず drop することを、戻り値の 0/0/None から判断する）。
+                return Ok(ReplaceOutcome {
+                    removed: 0,
+                    inserted: 0,
+                    first_id: None,
+                });
+            }
 
-        // 台帳記録は行の削除・挿入と同一の write トランザクション内で行う
-        // （TASK-93・RECOVER-2。`insert_typed_row_unchecked` と同型。失敗すれば
-        // トランザクションごと abort し、行変更も台帳も残さない）。ハッシュ入力は
-        // 要求由来フィールド（`key_column`・`key_value`・`visibility`・
-        // `content_hash_path`・`content_hash_body`・`content_hash_template_values`）
-        // のみ（TASK-101・RECOVER-10。削除対象集合・採番 id 等の DB 状態由来の値に加え、
-        // チャンク化・埋め込み後の派生行データ（`rows`）も含めない。
-        // `content_hash::for_replace_by_text_key` ドキュメント参照）。同一内容の再送は
-        // `23505`、内容不一致は `22023` へ写像される（呼び出し元の共通 `TenantWriteError`
-        // 契約に従う。行形 `INSERT` 経路と同じ扱い。TASK-94・RECOVER-3 の重複拒否契約を
-        // 包含する）。
-        //
-        // `content_hash_template_values`（`schema.columns.len()` 幅・位置インデックス
-        // 基準の配列。`sql::parser::bind_file_insert` が構築）をそのまま渡さず、
-        // 列名付きペアへ変換してから渡す（cursor bugbot 指摘・PR #248。
-        // `content_hash::push_named_scalar_columns` ドキュメント参照。`insert_typed_row_unchecked`
-        // と同じ理由: 位置基準のままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で
-        // 配列幅がずれ、内容一致の再送が `22023` に誤判定される）。
-        let named_template_columns: Vec<(&str, &crate::row_codec::Value)> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(idx, column)| {
-                *idx != vector_idx && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
-            })
-            .filter_map(|(idx, column)| {
-                content_hash_template_values
-                    .get(idx)
-                    .map(|value| (column.name.as_str(), value))
-            })
-            .collect();
-        let content_hash = content_hash::for_replace_by_text_key(
-            key_column,
-            key_value,
-            visibility,
-            content_hash_path,
-            content_hash_body,
-            &named_template_columns,
-        )?;
-        ledger::record_in_txn(
-            &write_txn,
-            ctx.tenant_id(),
-            table,
-            ledger_write,
-            &content_hash,
-        )?;
-
-        // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`・
-        // `delete_rows_where_unchecked` と同じ判定条件・同じ理由
-        // （`removed_pre_images` のドキュメント参照。`id` 参照 FK を考慮する
-        // PR #1138 の修正を含む）で `remove` の戻り値（削除前の物理行）から
-        // 旧値を復元して積む。`needs_fk_removed_pre_image`・`removed_pre_images`
-        // は本クロージャの外で宣言し可変参照で捕捉する（`ReplaceOutcome` は
-        // 他クレートも参照する公開構造体のため、フィールド追加で契約を広げない）。
-        needs_fk_removed_pre_image = schema.primary_key().is_some()
-            || !schema.unique_constraints().is_empty()
-            || crate::catalog::referencing_foreign_keys_in_txn(&write_txn, table)?
+            // 台帳記録は行の削除・挿入と同一の write トランザクション内で行う
+            // （TASK-93・RECOVER-2。`insert_typed_row_unchecked` と同型。失敗すれば
+            // トランザクションごと abort し、行変更も台帳も残さない）。ハッシュ入力は
+            // 要求由来フィールド（`key_column`・`key_value`・`visibility`・
+            // `content_hash_path`・`content_hash_body`・`content_hash_template_values`）
+            // のみ（TASK-101・RECOVER-10。削除対象集合・採番 id 等の DB 状態由来の値に加え、
+            // チャンク化・埋め込み後の派生行データ（`rows`）も含めない。
+            // `content_hash::for_replace_by_text_key` ドキュメント参照）。同一内容の再送は
+            // `23505`、内容不一致は `22023` へ写像される（呼び出し元の共通 `TenantWriteError`
+            // 契約に従う。行形 `INSERT` 経路と同じ扱い。TASK-94・RECOVER-3 の重複拒否契約を
+            // 包含する）。
+            //
+            // `content_hash_template_values`（`schema.columns.len()` 幅・位置インデックス
+            // 基準の配列。`sql::parser::bind_file_insert` が構築）をそのまま渡さず、
+            // 列名付きペアへ変換してから渡す（cursor bugbot 指摘・PR #248。
+            // `content_hash::push_named_scalar_columns` ドキュメント参照。`insert_typed_row_unchecked`
+            // と同じ理由: 位置基準のままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で
+            // 配列幅がずれ、内容一致の再送が `22023` に誤判定される）。
+            let named_template_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+                .columns
                 .iter()
-                .any(|(_, fk)| fk.references_parent_id());
-        for id in &to_remove {
-            let removed_guard = row_table
-                .remove(&(tenant, *id))
-                .map_err(CatalogError::from)?;
-            if needs_fk_removed_pre_image {
-                if let Some(guard) = removed_guard {
-                    let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
-                        TenantWriteError::CapturedRowDecodeFailed(format!(
-                            "removed row decode failed: {e}"
-                        ))
-                    })?;
-                    let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
-                        .map_err(|e| {
+                .enumerate()
+                .filter(|(idx, column)| {
+                    *idx != vector_idx
+                        && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+                })
+                .filter_map(|(idx, column)| {
+                    content_hash_template_values
+                        .get(idx)
+                        .map(|value| (column.name.as_str(), value))
+                })
+                .collect();
+            let content_hash = content_hash::for_replace_by_text_key(
+                key_column,
+                key_value,
+                visibility,
+                content_hash_path,
+                content_hash_body,
+                &named_template_columns,
+            )?;
+            ledger::record_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                &content_hash,
+            )?;
+
+            // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。`delete_row_impl`・
+            // `delete_rows_where_unchecked` と同じ判定条件・同じ理由
+            // （`removed_pre_images` のドキュメント参照。`id` 参照 FK を考慮する
+            // PR #1138 の修正を含む）で `remove` の戻り値（削除前の物理行）から
+            // 旧値を復元して積む。`needs_fk_removed_pre_image`・`removed_pre_images`
+            // は本クロージャの外で宣言し可変参照で捕捉する（`ReplaceOutcome` は
+            // 他クレートも参照する公開構造体のため、フィールド追加で契約を広げない）。
+            needs_fk_removed_pre_image = schema.primary_key().is_some()
+                || !schema.unique_constraints().is_empty()
+                || crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?
+                    .iter()
+                    .any(|(_, fk)| fk.references_parent_id());
+            for id in &to_remove {
+                let removed_guard = row_table
+                    .remove(&(tenant, *id))
+                    .map_err(CatalogError::from)?;
+                if needs_fk_removed_pre_image {
+                    if let Some(guard) = removed_guard {
+                        let row = crate::storage::decode_row(*id, guard.value()).map_err(|e| {
                             TenantWriteError::CapturedRowDecodeFailed(format!(
                                 "removed row decode failed: {e}"
                             ))
                         })?;
-                    removed_pre_images.record(*id, values);
+                        let values =
+                            crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                                .map_err(|e| {
+                                    TenantWriteError::CapturedRowDecodeFailed(format!(
+                                        "removed row decode failed: {e}"
+                                    ))
+                                })?;
+                        removed_pre_images.record(*id, values);
+                    }
                 }
             }
-        }
-        // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。この経路は
-        // UNIQUE 制約を持つテーブルを事前に拒否しているが、主キーだけの
-        // テーブルは通るため、旧行の後片付けが必要（`row_table` はこの後も
-        // 新行の挿入に使うため開いたままだが、索引テーブルは別名のため
-        // `TableAlreadyOpen` にならない）。
-        crate::constraint::forget_unique_index_rows_in_txn(
-            &write_txn, table, &schema, tenant, &to_remove,
-        )?;
+            // 永続一意索引（TABLE-16・TASK-204、Issue #1070）の後片付け。この経路は
+            // UNIQUE 制約を持つテーブルを事前に拒否しているが、主キーだけの
+            // テーブルは通るため、旧行の後片付けが必要（`row_table` はこの後も
+            // 新行の挿入に使うため開いたままだが、索引テーブルは別名のため
+            // `TableAlreadyOpen` にならない）。
+            crate::constraint::forget_unique_index_rows_in_txn(
+                write_txn, table, &schema, tenant, &to_remove,
+            )?;
 
-        // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
-        // （`Vec<u8>` 新規確保）を避け、`scratch.clear()` → `encode_row_into` で
-        // 同一バッファへ追記する。この経路（`execute_insert_sql_batch`）の台帳
-        // ハッシュ `for_replace_by_text_key` はエンコード済みバイト列を使わないため、
-        // `insert_rows_unchecked`（Issue #398）の連続 arena は不要（ハッシュ計算
-        // 完了後の行ループでのみエンコードすれば足りる）。
-        let mut scratch: Vec<u8> = Vec::new();
-        let mut next_id = max_id.map_or(Ok(0u64), |m| {
-            m.checked_add(1).ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "id namespace exhausted".to_string(),
-                ))
-            })
-        })?;
-        let mut first_id: Option<u64> = None;
-        let mut inserted = 0usize;
-        for values in rows {
-            let embedding = match values.get(vector_idx) {
-                Some(crate::row_codec::Value::Vector(v)) => v.clone(),
-                _ => {
-                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
-                        "VECTOR column value missing or not a Vector".to_string(),
-                    )))
-                }
-            };
-            schema.validate_embedding_dim(embedding.len())?;
-            let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
-                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-            let row = RowInput {
-                tenant_id: ctx.tenant_id(),
-                visibility,
-                embedding: &embedding,
-                metadata: &metadata,
-            };
-            let id = next_id;
-            let key = (ctx.tenant_id(), id);
-            // 上の採番規則により既存行との衝突は起こらないはずだが、`insert_row` と
-            // 同じ防御（TOCTOU 対策の単一 write トランザクション内チェック）を残す。
-            if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-                return Err(TenantWriteError::IdConflict);
-            }
-            scratch.clear();
-            crate::storage::encode_row_into(&mut scratch, &row)?;
-            row_table
-                .insert(key, scratch.as_slice())
-                .map_err(CatalogError::from)?;
-            if first_id.is_none() {
-                first_id = Some(id);
-            }
-            inserted += 1;
-            next_id = id.checked_add(1).ok_or_else(|| {
-                TenantWriteError::Catalog(CatalogError::Invalid(
-                    "id namespace exhausted".to_string(),
-                ))
+            // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
+            // （`Vec<u8>` 新規確保）を避け、`scratch.clear()` → `encode_row_into` で
+            // 同一バッファへ追記する。この経路（`execute_insert_sql_batch`）の台帳
+            // ハッシュ `for_replace_by_text_key` はエンコード済みバイト列を使わないため、
+            // `insert_rows_unchecked`（Issue #398）の連続 arena は不要（ハッシュ計算
+            // 完了後の行ループでのみエンコードすれば足りる）。
+            let mut scratch: Vec<u8> = Vec::new();
+            let mut next_id = max_id.map_or(Ok(0u64), |m| {
+                m.checked_add(1).ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "id namespace exhausted".to_string(),
+                    ))
+                })
             })?;
-        }
+            let mut first_id: Option<u64> = None;
+            let mut inserted = 0usize;
+            for values in rows {
+                let embedding = match values.get(vector_idx) {
+                    Some(crate::row_codec::Value::Vector(v)) => v.clone(),
+                    _ => {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "VECTOR column value missing or not a Vector".to_string(),
+                        )))
+                    }
+                };
+                schema.validate_embedding_dim(embedding.len())?;
+                let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                    .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                let row = RowInput {
+                    tenant_id: ctx.tenant_id(),
+                    visibility,
+                    embedding: &embedding,
+                    metadata: &metadata,
+                };
+                let id = next_id;
+                let key = (ctx.tenant_id(), id);
+                // 上の採番規則により既存行との衝突は起こらないはずだが、`insert_row` と
+                // 同じ防御（TOCTOU 対策の単一 write トランザクション内チェック）を残す。
+                if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
+                    return Err(TenantWriteError::IdConflict);
+                }
+                scratch.clear();
+                crate::storage::encode_row_into(&mut scratch, &row)?;
+                row_table
+                    .insert(key, scratch.as_slice())
+                    .map_err(CatalogError::from)?;
+                if first_id.is_none() {
+                    first_id = Some(id);
+                }
+                inserted += 1;
+                next_id = id.checked_add(1).ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "id namespace exhausted".to_string(),
+                    ))
+                })?;
+            }
 
-        removed_ids = to_remove.clone();
-        Ok(ReplaceOutcome {
-            removed,
-            inserted,
-            first_id,
-        })
-    })();
-    let outcome = outcome?;
-    if outcome.removed == 0 && outcome.inserted == 0 {
-        drop(write_txn);
-        return Ok(outcome);
-    }
-    // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905・#1072。TABLE-16・TASK-204）のテナント内一意性制約検査。
-    // このファイル形 `INSERT`（同一パス置換）は採番 id が `first_id` から連番で
-    // 割り当てられる（上記クロージャの `next_id` 採番規則）ため、書き込んだ id
-    // 集合は `first_id..first_id + inserted` の連続範囲として再構築できる。
-    // `removed` のみで `inserted == 0` の場合（`rows` が空で既存行を削除しただけ）
-    // は新規に書き込んだ行がないため検査不要（削除は一意性制約に違反し得ない）。
-    // 旧チャンク行の削除は上記クロージャ内（この検査より前）で同一 write
-    // トランザクション内に完了しているため、走査時の母集合から除外済み
-    // （関数 doc コメント参照。redb の write トランザクションは自分が消した
-    // 行をそのまま読める）。
-    if outcome.inserted > 0 {
-        if let Some(first_id) = outcome.first_id {
-            let ids: Vec<u64> = (0..outcome.inserted as u64)
-                .filter_map(|offset| first_id.checked_add(offset))
-                .collect();
-            let schema_for_pk = require_table_schema_write(&write_txn, table)?;
-            crate::constraint::enforce_row_constraints_in_txn(
-                &write_txn,
+            removed_ids = to_remove.clone();
+            Ok(ReplaceOutcome {
+                removed,
+                inserted,
+                first_id,
+            })
+        })();
+        let outcome = outcome?;
+        if outcome.removed == 0 && outcome.inserted == 0 {
+            // 変更ゼロ。autocommit は commit せず abort で閉じ、世代を進めない。
+            return Ok((outcome, TxnEffect::NoOp));
+        }
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905・#1072。TABLE-16・TASK-204）のテナント内一意性制約検査。
+        // このファイル形 `INSERT`（同一パス置換）は採番 id が `first_id` から連番で
+        // 割り当てられる（上記クロージャの `next_id` 採番規則）ため、書き込んだ id
+        // 集合は `first_id..first_id + inserted` の連続範囲として再構築できる。
+        // `removed` のみで `inserted == 0` の場合（`rows` が空で既存行を削除しただけ）
+        // は新規に書き込んだ行がないため検査不要（削除は一意性制約に違反し得ない）。
+        // 旧チャンク行の削除は上記クロージャ内（この検査より前）で同一 write
+        // トランザクション内に完了しているため、走査時の母集合から除外済み
+        // （関数 doc コメント参照。redb の write トランザクションは自分が消した
+        // 行をそのまま読める）。
+        if outcome.inserted > 0 {
+            if let Some(first_id) = outcome.first_id {
+                let ids: Vec<u64> = (0..outcome.inserted as u64)
+                    .filter_map(|offset| first_id.checked_add(offset))
+                    .collect();
+                let schema_for_pk = require_table_schema_write(write_txn, table)?;
+                crate::constraint::enforce_row_constraints_in_txn(
+                    write_txn,
+                    table,
+                    &schema_for_pk,
+                    ctx.tenant_id(),
+                    &ids,
+                    target.fk_check_mode(),
+                )?;
+            }
+        }
+        // 置換で旧行を削除した場合、このテーブルを参照先とする `FOREIGN KEY`
+        // （TABLE-17・TASK-205、Issue #907）の参照先側を検査する（旧行 id を参照する
+        // 参照元行が残れば `23503`）。
+        if outcome.removed > 0 {
+            let schema_for_fk = require_table_schema_write(write_txn, table)?;
+            crate::constraint::enforce_referencing_rows_in_txn(
+                write_txn,
                 table,
-                &schema_for_pk,
+                &schema_for_fk,
                 ctx.tenant_id(),
-                &ids,
-                crate::constraint::FkCheckMode::All,
+                crate::constraint::ReferencedRowsChange::Removed { ids: &removed_ids },
+                needs_fk_removed_pre_image.then_some(&removed_pre_images),
+                target.fk_check_mode(),
             )?;
         }
-    }
-    // 置換で旧行を削除した場合、このテーブルを参照先とする `FOREIGN KEY`
-    // （TABLE-17・TASK-205、Issue #907）の参照先側を検査する（旧行 id を参照する
-    // 参照元行が残れば `23503`）。
-    if outcome.removed > 0 {
-        let schema_for_fk = require_table_schema_write(&write_txn, table)?;
-        crate::constraint::enforce_referencing_rows_in_txn(
-            &write_txn,
-            table,
-            &schema_for_fk,
-            ctx.tenant_id(),
-            crate::constraint::ReferencedRowsChange::Removed { ids: &removed_ids },
-            needs_fk_removed_pre_image.then_some(&removed_pre_images),
-            crate::constraint::FkCheckMode::All,
-        )?;
-    }
-    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
-    crate::recovery::commit_boundary::commit(write_txn)?;
-    Ok(outcome)
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        Ok((outcome, TxnEffect::Wrote))
+    })
 }
 
 /// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア: RECOVER-2）。
@@ -5207,7 +5211,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
         replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
                 table: "docs",
@@ -5225,7 +5229,7 @@ mod tests {
         .expect("seed other path");
 
         let first = replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
                 table: "docs",
@@ -5246,7 +5250,7 @@ mod tests {
         assert!(first.first_id.is_some());
 
         let second = replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
                 table: "docs",
@@ -5308,7 +5312,7 @@ mod tests {
         let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
 
         replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx_b,
             ReplaceByTextKey {
                 table: "docs",
@@ -5326,7 +5330,7 @@ mod tests {
         .expect("tenant-b seed should succeed");
 
         replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx_a,
             ReplaceByTextKey {
                 table: "docs",
@@ -5363,7 +5367,7 @@ mod tests {
 
         let before = storage.current_generation().expect("read generation");
         let outcome = replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
                 table: "docs",
@@ -5400,7 +5404,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
         let err = replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
                 table: "docs",
@@ -5695,7 +5699,7 @@ mod tests {
 
         let file_docs_gen_before_replace = read_gen("docs");
         replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &a,
             ReplaceByTextKey {
                 table: "docs",
@@ -5730,7 +5734,7 @@ mod tests {
             .expect("create file-shaped table");
         let file_gen_before = read_gen(file_table);
         replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &a,
             ReplaceByTextKey {
                 table: file_table,
@@ -7396,7 +7400,7 @@ mod tests {
 
         // ファイル形 INSERT（TASK-120 の同一パス置換書き込み経路）。
         replace_typed_rows_by_text_key(
-            &storage,
+            WriteTarget::Autocommit(&storage),
             &ctx,
             ReplaceByTextKey {
                 table: "typed_docs",

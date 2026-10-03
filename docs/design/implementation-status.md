@@ -494,3 +494,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: 集計文＋スカラー `ORDER BY` の `EXPLAIN` が (a) 可視行の異なるテナント間でバイト一致、(b) `ORDER BY` を除いた同文の `EXPLAIN` と一致、(c) 固定出力、(d) 本体を評価しない（本体なら `22003` になるデータでも成功）、(e) 束縛エラーの `wire_code` が `EXPLAIN` 有無で一致（fail-closed の非迂回）。`EXPLAIN` は `execute_sql_in_session` 経由のみで検証し、`execute_sql` は `42601` のまま。
 - **テスト**: `scalar_order_by_aggregate_explain_is_identical_across_tenants_and_independent_of_order_by`・`scalar_order_by_aggregate_explain_does_not_execute_body`・`scalar_order_by_aggregate_explain_error_codes_match_non_explain`。
 - **対象外（申し送り）**: NoSQL `aggregate` の `sort` と `explain: true` の併用、pg wire 経由の層 B 検証、ウィンドウ関数・JOIN・集合演算との EXPLAIN 併用。
+
+## Issue #1353: 明示トランザクション内のファイル形 INSERT と書き込み済みテーブルへの USING PLAN・EXPLAIN
+
+- **対象ビヘイビア**: SQL-31（TASK-221。関連: RECOVER-12・TABLE-17・WIRE-16）。
+- **変更箇所**: `tenant.rs`（`replace_typed_rows_by_text_key` を `WriteTarget` 対応にし FK 検査モードを `target.fk_check_mode()` へ）、`incremental.rs`・`sql/exec.rs`（`WriteTarget` の受け渡し）、`core.rs`（ファイル形 INSERT の拒否を撤去、`read_only_in_active_txn` の dirty 分岐を書き直し、辞書の入力元 `dict_txn` を `expand_query`・`plan_using_plan_expansion`・`run_using_plan_select`・`run_explain_plan` へ貫通、`dictionary_from_write_txn` を追加）。
+- **性質**: カタログ・スキーマ・世代は確定済みスナップショットから、辞書と `USING PLAN` の行の読みだけ共有 write トランザクションから読む。辞書は `DictionaryCache` を経由しない（ROLLBACK 後の世代再利用による漏えいの防止）。新しい `wire_code` の追加なし。
+- **テスト**: `tests/sql31_txn_file_insert_using_plan.rs`（COMMIT／ROLLBACK／drop・置換・`25000`・テナント境界・fail-closed・dirty の `USING PLAN` の行と辞書・RLS・キャッシュ非汚染・全 `EXPLAIN` variant）。`sql31_transaction.rs`・`sql31_txn_dml.rs` の旧 `0A000` アサーションを撤去。
+- **対象外（申し送り）**: NoSQL バッチのトランザクション対応、書き込み後の読み取りでのキャッシュ・HNSW 再利用。

@@ -5005,7 +5005,12 @@ fn execute_upsert_inner(
 /// （codex-review P1 指摘・PR #221。security.md P0）。行形 `INSERT`
 /// （[`execute_insert`]）はガードを関数内部で自己完結して適用するため
 /// Issue #730 で公開 API へ昇格した対比がある（本関数は対象外のまま）。
+/// 明示トランザクション対応（Issue #1353・SQL-31・TASK-221）: `target` が `InTxn` の場合、
+/// 置換書き込みは呼び出し元（`sql::transaction`）が保持する共有 write トランザクションへ行い
+/// commit しない。`storage` はチャンク化段階のスキーマ取得用（トランザクション内は DDL 不可・
+/// 単一ライタ保持のためスキーマは BEGIN 以降不変）。`Autocommit` は従来どおり 1 文 1 トランザクション。
 pub(crate) fn execute_file_insert(
+    target: crate::tenant::WriteTarget<'_>,
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     embedder: Option<&dyn crate::embedding::Embedder>,
@@ -5035,9 +5040,16 @@ pub(crate) fn execute_file_insert(
         vector_column_index: bound.vector_column_index,
     };
 
-    let outcome =
-        crate::incremental::index_file(storage, ctx, embedder, config, &input, ledger_write)
-            .map_err(map_incremental_error)?;
+    let outcome = crate::incremental::index_file(
+        target,
+        storage,
+        ctx,
+        embedder,
+        config,
+        &input,
+        ledger_write,
+    )
+    .map_err(map_incremental_error)?;
 
     Ok(InsertOutcome {
         rows_affected: outcome.rows_replaced as u64,

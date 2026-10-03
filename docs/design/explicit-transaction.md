@@ -79,6 +79,12 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
   `update_row_columns_unchecked`（単一行 `UPDATE`）・`delete_row_impl`
   （単一行 `DELETE`。`RETURNING` を含む）・`delete_rows_where_unchecked`・
   `update_rows_where_unchecked`（述語形 `DELETE`／`UPDATE`）
+- （Issue #1353）`replace_typed_rows_by_text_key`（ファイル形 `INSERT` のチャンク置換）。
+  `incremental::index_file`・`sql::exec::execute_file_insert` が `WriteTarget` を受け取り、
+  埋め込み I/O は BEGIN 時点で既に保持している単一ライタの下で `max_duration` の範囲内に行う
+  （文の前にしか期限を見ないため、埋め込み中に期限を超えても次の要求の期限解放と COMMIT 時の
+  期限検査が abort させる。正しさは崩れない）。`INITIALLY DEFERRED` の FK は他の書き込み経路と同じく
+  COMMIT 時の検査へ回す。NoSQL バッチ（`index_file_batch`）は従来どおり `Autocommit` のみ
 
 `sql::exec` は各実行関数の `_in` 版（`WriteTarget` を受け取る本体）を持ち、既存の
 関数は `Autocommit` を渡す薄いラッパーとして挙動を変えない。`core.rs` の
@@ -89,10 +95,9 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 `parsed_operation_id` は `Delete`・`Update` の `operation_id` も返し、同一
 トランザクション内での再利用（`25000`）は全 DML に効く。
 
-**明示トランザクション内で拒否（`0A000`）を維持するもの**: ファイル形 `INSERT`
-（`replace_typed_rows_by_text_key`。埋め込み I/O を単一ライタの保持中に行うことに
-なるため autocommit 専用のまま）、DDL、`USING PLAN` を伴う検索 SELECT・`EXPLAIN`
-のうち対象テーブルが dirty のもの（「6. トランザクション内の読み取り」参照）。
+**明示トランザクション内で拒否（`0A000`）を維持するもの**: DDL。ファイル形 `INSERT`
+と、`USING PLAN` を伴う検索 SELECT・`EXPLAIN` は Issue #1353 で受理に変わった
+（「6. トランザクション内の読み取り」参照）。
 
 **明示トランザクション内の `RETURNING` で拒否（`0A000`）するもの（Issue #1182・#1272・#1273 の
 経緯・SQL-31・SQL-21）**: なし（全 DML の `RETURNING` を受理する）。UPSERT
@@ -236,10 +241,18 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 `WriteTransaction` を読み取り源にするときは、存在しないテーブルを `open_table` が作成
 してしまう副作用を避けるため、`list_tables` で存在を確認してから開く。
 
-**残る既知の逸脱**: LLM I/O とテーブル世代の再照合を伴う `USING PLAN` の検索 SELECT と
-`EXPLAIN` は、対象テーブルが dirty のとき `0A000` を返し `Failed` へ遷移する（黙って
-古い結果を返さない）。書き込み後の読み取りはキャッシュ・HNSW を使わない brute-force に
-なる（性能上のトレードオフ。テーブル単位のキャッシュ再利用は後続課題）。
+**`USING PLAN`・`EXPLAIN` の扱い（Issue #1353）**: dirty のとき、カタログ・スキーマ・
+テーブル世代・索引宣言は確定済みスナップショットから読み、辞書構築（LLM 展開の入力）と
+`USING PLAN` の検索本体の行の読みだけを共有書き込みトランザクションへ切り替える
+（`EngineCore::execute_validated_with_dict`・`dictionary_from_write_txn`）。トランザクション
+内は DDL 不可で単一ライタを保持するため、BEGIN 以降カタログと確定済みの世代は誰にも変えられない。
+世代の事前・事後照合は同じ確定済み側から読むので一致し、書き込みトランザクション側で読むと
+dirty では必ず不一致になるため使わない。辞書は `DictionaryCache` に lookup も insert もしない
+（未 commit の行から作った辞書を世代キーのキャッシュに載せると、ROLLBACK 後の世代再利用で
+別セッション・別テナントへ漏れる。P0）。行を読まない `EXPLAIN`（`USING PLAN` なしの
+Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定外の文種別は `Internal` で拒否する。
+書き込み後の読み取りはキャッシュ・HNSW を使わない brute-force になる
+（性能上のトレードオフ。テーブル単位のキャッシュ再利用は後続課題）。
 
 ## `#943` との分担
 
@@ -365,9 +378,6 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 ## 対象外・申し送り
 
-- 明示トランザクション内のファイル形 INSERT（埋め込み I/O。`0A000` のまま）と、
-  dirty テーブルに対する `USING PLAN` の検索 SELECT・`EXPLAIN`（`0A000` のまま。
-  上記「6. トランザクション内の読み取り」の残る既知の逸脱）。
 - 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
   brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で

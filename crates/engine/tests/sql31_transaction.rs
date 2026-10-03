@@ -100,8 +100,7 @@ fn begin_insert_insert_commit_makes_both_rows_visible() {
 
 /// 同一トランザクション内で書き込んだテーブルの読み取りは、自トランザクションの未 commit
 /// 変更を反映する（Issue #1179。読み取りは書き込みトランザクションを読み取り源にする）。
-/// 別セッション（autocommit）からは見えない。`USING PLAN` を伴う検索 SELECT は
-/// 対象テーブルが dirty の間は従来どおり `0A000`（既知の逸脱）。
+/// 別セッション（autocommit）からは見えない。
 #[test]
 fn reading_a_table_written_in_the_same_transaction_sees_the_uncommitted_row() {
     let (engine, path) = new_core();
@@ -136,18 +135,8 @@ fn reading_a_table_written_in_the_same_transaction_sees_the_uncommitted_row() {
         other => panic!("expected Query, got {other:?}"),
     }
 
-    // `USING PLAN` は dirty テーブルに対して `0A000`（既知の逸脱）。
-    let err = engine
-        .execute_sql_in_txn(
-            &caller,
-            &mut session,
-            &mut txn,
-            &format!("SELECT id FROM {TABLE} USING PLAN('anything') LIMIT 10"),
-        )
-        .expect_err("USING PLAN over a dirty table is not supported");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
-
+    // `USING PLAN`・`EXPLAIN` を dirty テーブルへ向ける検証は辞書必須列（path/body）を持つ
+    // テーブルが要るため `sql31_txn_file_insert_using_plan.rs`（Issue #1353）が担う。
     assert_eq!(
         engine
             .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")

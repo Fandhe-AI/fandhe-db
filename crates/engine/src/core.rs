@@ -2491,6 +2491,93 @@ impl EngineCore {
         )))
     }
 
+    /// 明示トランザクション内（Issue #1353）で、自トランザクションの未 commit の変更を含む
+    /// 辞書スナップショットと正規化索引を `write_txn` から直接構築する。
+    ///
+    /// 呼び出し元は `expand_query`（`USING PLAN` の SELECT・`EXPLAIN` が、書き込み済みテーブルを
+    /// 含む明示トランザクションの中で LLM 展開する経路）のみ。結果は
+    /// [`DictionaryCache`] に **lookup も insert もしない**（P0）。未 commit の行から作った辞書を
+    /// 世代キーのキャッシュへ載せると、ROLLBACK 後にテーブル世代が再利用された際に別セッション・
+    /// 別テナントへ ROLLBACK 済みの語が漏れる。スキーマは `write_txn` 自身から読む（行と同一
+    /// スナップショット）。可視判定・走査上限・デコード失敗時の fail-closed は
+    /// [`Self::dictionary_snapshot_with_index`] と同一。
+    fn dictionary_from_write_txn(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        write_txn: &redb::WriteTransaction,
+    ) -> Result<
+        (
+            Arc<crate::dictionary::Dictionary>,
+            Arc<crate::tiering::NormalizedDictionaryIndex>,
+        ),
+        CoreError,
+    > {
+        let schema = crate::catalog::get_table_schema_in_txn(write_txn, table)?;
+        let (path_idx, body_idx) = dictionary_required_columns(&schema)
+            .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
+
+        let row_table_name = crate::catalog::user_rows_table_name(table);
+        let row_table =
+            match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
+                Ok(t) => Some(t),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(CoreError::from(crate::catalog::map_row_table_error(e))),
+            };
+
+        let mut builder = crate::dictionary::DictionaryBuilder::new(self.dictionary_config.clone());
+        if let Some(row_table) = row_table {
+            use redb::ReadableTable;
+            let invalid = |msg: &str| CoreError::from(CatalogError::Invalid(msg.to_string()));
+            const DECODE_FAILED: &str =
+                "failed to decode a visible row while building dictionary snapshot";
+            let mut scanned: usize = 0;
+            let mut visible: usize = 0;
+            let iter = row_table
+                .range::<(&str, u64)>(..)
+                .map_err(CatalogError::from)?;
+            for entry in iter {
+                let (k, v) = entry.map_err(CatalogError::from)?;
+                let (key_tenant, id) = k.value();
+                let raw = v.value();
+                scanned = scanned.saturating_add(1);
+                if scanned > crate::tenant::MAX_SCANNED_ROWS {
+                    return Err(invalid("too many rows to build dictionary snapshot"));
+                }
+                let (row_tenant, visibility) =
+                    crate::storage::decode_row_tenant_and_visibility(raw)
+                        .map_err(|_| invalid(DECODE_FAILED))?;
+                if !ctx.is_visible(row_tenant, visibility) {
+                    continue;
+                }
+                visible = visible.saturating_add(1);
+                if visible > crate::tenant::MAX_VISIBLE_ROWS {
+                    return Err(invalid("too many rows to build dictionary snapshot"));
+                }
+                let row = crate::storage::decode_row_for_key(key_tenant, id, raw)
+                    .map_err(|_| invalid(DECODE_FAILED))?;
+                let values = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                    .map_err(|_| invalid(DECODE_FAILED))?;
+                let (
+                    Some(crate::row_codec::Value::Text(path)),
+                    Some(crate::row_codec::Value::Text(body)),
+                ) = (values.get(path_idx), values.get(body_idx))
+                else {
+                    return Err(invalid(
+                        "path or body column value was unexpectedly not text while building \
+                         dictionary snapshot",
+                    ));
+                };
+                builder.ingest(path.as_str(), body.as_str());
+            }
+        }
+        let dictionary = Arc::new(builder.finish());
+        let normalized_index = Arc::new(crate::tiering::NormalizedDictionaryIndex::build(
+            &dictionary,
+        ));
+        Ok((dictionary, normalized_index))
+    }
+
     /// `table` に対する自然言語 `question` を LLM クエリプランニング（TASK-110・
     /// PLAN-1）で展開し、[`crate::query_planner::QueryExpansion`] を返す。
     /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
@@ -2514,7 +2601,7 @@ impl EngineCore {
         table: &str,
         question: &str,
     ) -> Result<crate::query_planner::QueryExpansion, CoreError> {
-        let (expansion, _classification) = self.expand_query(ctx, table, question)?;
+        let (expansion, _classification) = self.expand_query(ctx, table, question, None)?;
         Ok(expansion)
     }
 
@@ -2540,7 +2627,7 @@ impl EngineCore {
         ),
         CoreError,
     > {
-        self.expand_query(ctx, table, question)
+        self.expand_query(ctx, table, question, None)
     }
 
     /// `table` に対する自然言語 `question` を LLM クエリプランニング（TASK-110・
@@ -2567,7 +2654,22 @@ impl EngineCore {
         query_mode: Option<crate::sql::mode::SearchMode>,
         session_mode: Option<crate::sql::mode::SearchMode>,
     ) -> Result<crate::query_planner::PlannedQuery, CoreError> {
-        let (expansion, _classification) = self.expand_query(ctx, table, question)?;
+        self.plan_query_with_mode_in(ctx, table, question, query_mode, session_mode, None)
+    }
+
+    /// [`Self::plan_query_with_mode`] の本体。`dict_txn` が `Some` のとき辞書を共有 write
+    /// トランザクションから構築する（明示トランザクション内の `EXPLAIN ... USING PLAN`。
+    /// Issue #1353。[`Self::expand_query`] 参照）。公開 API のシグネチャは変えない。
+    fn plan_query_with_mode_in(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+        query_mode: Option<crate::sql::mode::SearchMode>,
+        session_mode: Option<crate::sql::mode::SearchMode>,
+        dict_txn: Option<&redb::WriteTransaction>,
+    ) -> Result<crate::query_planner::PlannedQuery, CoreError> {
+        let (expansion, _classification) = self.expand_query(ctx, table, question, dict_txn)?;
         let resolved = crate::sql::mode::resolve_mode_with_planner(
             query_mode,
             session_mode,
@@ -2580,11 +2682,17 @@ impl EngineCore {
     /// [`Self::plan_query_with_mode`] が共有する展開フロー本体（辞書スナップショット
     /// 取得 → ティア判定〔[`PlannerBinding::Tiered`] 構成時のみ〕 → 固定接頭辞
     /// レンダリング → LLM 呼び出し → 厳格パース）。
+    ///
+    /// `dict_txn`（Issue #1353）が `Some` のときは、辞書を [`DictionaryCache`] を経由せず
+    /// 共有 write トランザクションから構築する（[`Self::dictionary_from_write_txn`]。
+    /// 明示トランザクション内で自トランザクションの未 commit の行を辞書へ反映し、
+    /// キャッシュには一切載せない）。`None` は従来どおりキャッシュ経由の確定済み辞書。
     fn expand_query(
         &self,
         ctx: &PolicyContext,
         table: &str,
         question: &str,
+        dict_txn: Option<&redb::WriteTransaction>,
     ) -> Result<
         (
             crate::query_planner::QueryExpansion,
@@ -2596,7 +2704,10 @@ impl EngineCore {
             .query_planner
             .as_ref()
             .ok_or(CoreError::QueryPlannerUnavailable)?;
-        let (dictionary, normalized_index) = self.dictionary_snapshot_with_index(ctx, table)?;
+        let (dictionary, normalized_index) = match dict_txn {
+            Some(write_txn) => self.dictionary_from_write_txn(ctx, table, write_txn)?,
+            None => self.dictionary_snapshot_with_index(ctx, table)?,
+        };
 
         let (client, classification): (&dyn crate::query_planner::LlmClient, _) = match binding {
             PlannerBinding::Single(client) => (client.as_ref(), None),
@@ -4004,10 +4115,10 @@ impl EngineCore {
     ///   transaction::SessionTransaction::check_and_register_statement`]）を
     ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT`・
     ///   `UPDATE`・`DELETE`・`TRUNCATE`。全 DML の `RETURNING` に対応。
-    ///   Issue #1272・#1273）・読み取り系（未書き込みテーブルの `SELECT`／
-    ///   `Aggregate`／`Scan`）文のみを実行する。対応外の文
-    ///   （ファイル形 `INSERT`・COPY・書き込み済みテーブルへの読み取り等）は
-    ///   `0A000` で拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
+    ///   Issue #1272・#1273。ファイル形 `INSERT` は Issue #1353）・読み取り系
+    ///   （`SELECT`／`Aggregate`／`Scan`／`EXPLAIN`／`USING PLAN`。書き込み済み
+    ///   テーブルは未 commit の変更を反映する）文のみを実行する。対応外の文
+    ///   （COPY・DDL 等）は `0A000` で拒否する。文の実行中にエラーが起きた場合は必ずトランザクションを
     ///   `Failed` へ遷移させ（[`crate::sql::transaction::SessionTransaction::
     ///   fail`]）、元のエラーをそのまま返す（部分書き込みを残さない
     ///   fail-closed 契約。`docs/design/explicit-transaction.md` 参照）。
@@ -4076,8 +4187,9 @@ impl EngineCore {
         match parsed {
             // Issue #1179: 単一行・複数行 `VALUES`・`ON CONFLICT`（UPSERT）を
             // 受理する（`RETURNING` は単一行・複数行・UPSERT とも受理。Issue #1273。
-            // ファイル形は `RETURNING` なしなら `0A000`（`execute_insert_form`）、
-            // ありなら `42601`（`execute_insert_returning_form`））。autocommit と同じ
+            // ファイル形は `RETURNING` なしなら受理（Issue #1353。埋め込み I/O は保持済みの
+            // 単一ライタの下で行う）、ありなら `42601`（`execute_insert_returning_form`））。
+            // autocommit と同じ
             // フォーム関数（INDEX-4 上限・束縛・台帳順序を共有。第 2 の書き込み
             // 経路を作らない）へ `InTxn` を渡す。
             ParsedSql::Insert(stmt) => {
@@ -4181,53 +4293,19 @@ impl EngineCore {
             ParsedSql::Statement(
                 stmt @ (Statement::SetSearchMode { .. } | Statement::CreateFunction { .. }),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
-            ParsedSql::Statement(stmt @ Statement::Select(v)) => {
-                self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
-            }
-            ParsedSql::Statement(stmt @ Statement::Aggregate(v)) => {
-                let table = v.table_name().to_string();
-                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
-            }
-            ParsedSql::Statement(stmt @ Statement::Scan(v)) => {
-                let table = v.table_name().to_string();
-                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
-            }
-            ParsedSql::Statement(stmt @ Statement::Explain(v)) => {
-                let table = v.table_name().to_string();
-                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
-            }
-            // Issue #925（SQL-28・RLS-10、TASK-212）: JOIN は 2 relation を参照する
-            // ため、`read_only_in_active_txn`（単一テーブル版）ではなく
-            // `sql::relation::ensure_relations_not_written` で両辺が書き込み済み
-            // でないことを確認してから実行する（`docs/design/
-            // multi-relation-plan-foundation.md` の申し送り事項を消化する）。
-            ParsedSql::Statement(stmt @ Statement::Join(v)) => {
-                // `table` は `USING PLAN`／`EXPLAIN` の dirty 判定にしか使われず、JOIN は
-                // 常に読み取り経路（未 commit 変更の反映）へ入るため参考値（先頭のリレーション）。
-                let table = v
-                    .relations
-                    .first()
-                    .map(|r| r.table().to_string())
-                    .unwrap_or_default();
-                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
-            }
-            // Issue #1192: 評価後射影形ビューも他の読み取り文と同じ経路で読む
-            // （本文が読む全テーブルの未 commit 変更が反映される）。
-            ParsedSql::Statement(stmt @ Statement::BufferedView(v)) => {
-                let table = crate::sql::allowlist::buffered_body_relations(&v.body)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
-            }
-            // Issue #1179: 集合演算も他の読み取り文と同じ経路で読む（未 commit の
-            // 変更があれば書き込みトランザクションを読み取り源にする）。
-            ParsedSql::Statement(stmt @ Statement::SetOperation(v)) => {
-                let mut tables = Vec::new();
-                crate::sql::set_op::collect_branch_tables(&v.tree, &mut tables);
-                let table = tables.first().cloned().unwrap_or_default();
-                self.read_only_in_active_txn(ctx, session, txn, &table, stmt.clone())
-            }
+            // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
+            // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
+            // `USING PLAN`／`EXPLAIN` の読み取り源の切り替えは `read_only_in_active_txn`
+            // が文全体に対して一括で判定する（文ごとの対象テーブルは判定に使わない）。
+            ParsedSql::Statement(
+                stmt @ (Statement::Select(_)
+                | Statement::Aggregate(_)
+                | Statement::Scan(_)
+                | Statement::Explain(_)
+                | Statement::Join(_)
+                | Statement::BufferedView(_)
+                | Statement::SetOperation(_)),
+            ) => self.read_only_in_active_txn(ctx, session, txn, stmt.clone()),
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
             // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
             // Issue #1129: `SHOW`・`EXPLAIN` は書き込みも gate も伴わないためトランザクション内でも
@@ -4240,7 +4318,7 @@ impl EngineCore {
                 self.execute_partitioned_control(ctx, session, control)
             }
             ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
-            // ファイル形 INSERT・COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
+            // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
@@ -4437,15 +4515,19 @@ impl EngineCore {
     /// JOIN・集合演算が別テーブルの未 commit 変更を読む場合も、文全体が同じ読み取り源
     /// を使うため反映される。
     ///
-    /// 例外: `USING PLAN` を伴う検索 SELECT と `EXPLAIN` は LLM I/O・テーブル世代の
-    /// 再照合を伴い確定済みスナップショットに依存するため、対象テーブル（`table`）が
-    /// dirty のときは `0A000` で拒否する（黙って古い結果を返さない。既知の逸脱）。
+    /// `USING PLAN` を伴う検索 SELECT と `EXPLAIN` も dirty のとき受け付ける（Issue #1353）。
+    /// カタログ・スキーマ・テーブル世代は確定済みスナップショットから読み（トランザクション内は
+    /// DDL 不可・単一ライタ保持のため BEGIN 以降不変）、辞書構築と SELECT 本体の行の読みだけを
+    /// 共有 write トランザクションへ切り替える
+    /// （[`Self::execute_validated_with_dict`]・[`Self::dictionary_from_write_txn`]）。
+    /// 辞書は [`DictionaryCache`] に載せない。行を読まない `EXPLAIN`（`USING PLAN` なしの
+    /// 3 variant）の出力はスキーマ・索引宣言・束縛結果だけで決まるため確定済みスナップショットの
+    /// ままでよい。想定外の文種別は fail-closed に `Internal` で拒否する。
     fn read_only_in_active_txn<'e>(
         &'e self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
         txn: &crate::sql::transaction::SessionTransaction<'e>,
-        table: &str,
         stmt: crate::sql::allowlist::Statement,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::Statement;
@@ -4454,33 +4536,30 @@ impl EngineCore {
         if dirty.is_empty() {
             return self.execute_validated_in_session(ctx, session, stmt);
         }
-        let is_using_plan_select =
-            matches!(&stmt, Statement::Select(v) if v.using_plan().is_some());
+        let write_txn =
+            txn.write_txn()
+                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
         match stmt {
+            Statement::Select(ref v) if v.using_plan().is_some() => {
+                self.execute_validated_with_dict(ctx, session, stmt, Some(write_txn))
+            }
+            Statement::Explain(_) => {
+                self.execute_validated_with_dict(ctx, session, stmt, Some(write_txn))
+            }
             Statement::Select(_)
             | Statement::Aggregate(_)
             | Statement::Scan(_)
             | Statement::SetOperation(_)
             | Statement::Join(_)
-            | Statement::BufferedView(_)
-                if !is_using_plan_select =>
-            {
-                let write_txn = txn.write_txn().ok_or_else(|| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    }
-                })?;
+            | Statement::BufferedView(_) => {
                 self.execute_read_statement(ctx, session, stmt, write_txn)
             }
-            other => {
-                if dirty.contains(table) {
-                    return Err(
-                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                            "this read of a table already written in the same transaction is not supported",
-                        ),
-                    );
-                }
-                self.execute_validated_in_session(ctx, session, other)
+            Statement::SetSearchMode { .. } | Statement::CreateFunction { .. } => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected statement in transactional read path".to_string(),
+                })
             }
         }
     }
@@ -4825,6 +4904,21 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         stmt: crate::sql::allowlist::Statement,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_validated_with_dict(ctx, session, stmt, None)
+    }
+
+    /// [`Self::execute_validated_in_session`] の本体。`dict_txn`（Issue #1353）が `Some` の
+    /// とき、`USING PLAN` を伴う SELECT・`EXPLAIN ... USING PLAN` だけが辞書構築（と SELECT の
+    /// 検索本体の行の読み）を共有 write トランザクションへ切り替える（明示トランザクション内で
+    /// 自トランザクションの未 commit の変更を反映する。キャッシュは使わない）。それ以外の
+    /// 文は `dict_txn` を参照しない。`None` は autocommit と同一の挙動。
+    fn execute_validated_with_dict(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+        dict_txn: Option<&redb::WriteTransaction>,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::Statement::SetSearchMode { value } => {
                 let mode = crate::sql::mode::SearchMode::parse_literal(&value)?;
@@ -4914,6 +5008,7 @@ impl EngineCore {
                         question,
                         validated.search_mode(),
                         validated.limit(),
+                        dict_txn,
                         |schema, udfs| {
                             crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
                                 .map(|_| ())
@@ -5044,6 +5139,7 @@ impl EngineCore {
                         validated.table_name(),
                         question,
                         validated.search_mode(),
+                        dict_txn,
                         |schema, udfs| {
                             crate::sql::using_plan::pre_check_bindable(&validated, schema, udfs)
                         },
@@ -5333,6 +5429,13 @@ impl EngineCore {
     /// [`crate::sql::parser::BoundStatement`] を組み立てる（SQL アームは
     /// [`crate::sql::using_plan::bind_expansion`] を委譲する）。
     ///
+    /// `dict_txn`（Issue #1353）が `Some` のとき、辞書構築と検索本体の行の読みを共有
+    /// write トランザクションへ切り替える（明示トランザクション内で自トランザクションの
+    /// 未 commit の変更を反映する）。カタログ・スキーマ・テーブル世代の照合は常に確定済み
+    /// スナップショットから行う（トランザクション内は DDL 不可・単一ライタ保持のため
+    /// BEGIN 以降不変で、世代は write_txn 側だけが進むため write_txn から読むと必ず不一致
+    /// になる）。`None` は従来どおり。
+    ///
     /// `pre_check`・`bind` はいずれも `read_txn` が開いている間（`pre_check`
     /// は計画開始時のスキーマ取得直後、`bind` は I/O 完了後の再取得直後）に
     /// 呼ばれる契約であり、[`Self::execute_bound_scan_in_session`] と同じ
@@ -5346,6 +5449,7 @@ impl EngineCore {
         question: &str,
         mode_literal: Option<&str>,
         limit: u32,
+        dict_txn: Option<&redb::WriteTransaction>,
         pre_check: Pre,
         bind: Bind,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError>
@@ -5409,7 +5513,8 @@ impl EngineCore {
             None => None,
         };
 
-        let planned = self.plan_using_plan_expansion(ctx, session, table, query_mode, question)?;
+        let planned =
+            self.plan_using_plan_expansion(ctx, session, table, query_mode, question, dict_txn)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
 
         // I/O 完了後の世代照合（対象テーブル限定化の理由は上記・
@@ -5432,7 +5537,13 @@ impl EngineCore {
             .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
         let bound = bind(&schema, session.udfs(), planned)?;
-        self.run_select_plan(&read_txn, ctx, &schema, &bound)
+        match dict_txn {
+            // 明示トランザクション内（Issue #1353）: 検索本体の行の読みだけを共有 write
+            // トランザクションへ切り替える。`snapshot()` が `None` のためキャッシュ
+            // （sparse・arena・hnsw・scalar）は構造的に使われない。
+            Some(write_txn) => self.run_select_plan(write_txn, ctx, &schema, &bound),
+            None => self.run_select_plan(&read_txn, ctx, &schema, &bound),
+        }
     }
 
     /// 束縛済み検索計画（[`crate::sql::parser::BoundStatement`]）を単一
@@ -5542,6 +5653,7 @@ impl EngineCore {
             question,
             mode_literal,
             limit,
+            None,
             |schema, udfs| {
                 // `VECTOR` 列の存在は LLM 展開・再埋め込み（高コスト I/O）より
                 // 前に確定させる（`sql::using_plan::pre_check_bindable` と同じ
@@ -5703,6 +5815,7 @@ impl EngineCore {
     /// （呼び出し元ごとに異なるエラー型を返せるようにするため。SQL アーム
     /// 自身は blanket `impl<T> From<T> for T` により `E = SqlSurfaceError`
     /// のまま変更なく動く）。
+    #[allow(clippy::too_many_arguments)]
     fn run_explain_plan<F, E>(
         &self,
         ctx: &PolicyContext,
@@ -5710,6 +5823,7 @@ impl EngineCore {
         table: &str,
         question: &str,
         mode_literal: Option<&str>,
+        dict_txn: Option<&redb::WriteTransaction>,
         bind: F,
     ) -> Result<crate::sql::exec::QueryResult, E>
     where
@@ -5792,7 +5906,14 @@ impl EngineCore {
         };
 
         let planned = self
-            .plan_query_with_mode(ctx, table, question, query_mode, session.search_mode())
+            .plan_query_with_mode_in(
+                ctx,
+                table,
+                question,
+                query_mode,
+                session.search_mode(),
+                dict_txn,
+            )
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("EXPLAIN query expansion failed: {e}"),
             })?;
@@ -6376,7 +6497,7 @@ impl EngineCore {
         ) -> Result<crate::sql::explain::ExplainShape, E>,
         E: From<crate::sql::allowlist::SqlSurfaceError>,
     {
-        self.run_explain_plan(ctx, session, table, question, mode_literal, bind)
+        self.run_explain_plan(ctx, session, table, question, mode_literal, None, bind)
     }
 
     /// 束縛済み広域取得計画（[`crate::sql::parser::BoundScan`]）を単一
@@ -7527,6 +7648,7 @@ impl EngineCore {
         table: &str,
         query_mode: Option<crate::sql::mode::SearchMode>,
         question: &str,
+        dict_txn: Option<&redb::WriteTransaction>,
     ) -> Result<UsingPlanExpansionResult, crate::sql::allowlist::SqlSurfaceError> {
         let embedder = self.embedder.as_deref().ok_or_else(|| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -7553,11 +7675,12 @@ impl EngineCore {
             )
         })?;
 
-        let expansion = self.plan_query(ctx, table, question).map_err(|e| {
-            crate::sql::allowlist::SqlSurfaceError::Internal {
+        let expansion = self
+            .expand_query(ctx, table, question, dict_txn)
+            .map(|(expansion, _classification)| expansion)
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("USING PLAN query expansion failed: {e}"),
-            }
-        })?;
+            })?;
 
         // PLAN-10 ポインタ: 密側（再埋め込み）と疎側（`hybrid_search` の全文検索側）は
         // 別々のテキストを使う（codex-review P1 指摘対応、PR #266）。密側は
@@ -8114,17 +8237,10 @@ impl EngineCore {
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
-                // ファイル形は埋め込み I/O を単一ライタ保持中に行うことになるため、
-                // 明示トランザクション（`InTxn`）内では受理しない（Issue #1179。
-                // `execute_in_active_txn` が事前に拒否するが、本層でも fail-closed）。
-                if matches!(target, crate::tenant::WriteTarget::InTxn(_)) {
-                    return Err(
-                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
-                            "file-form INSERT is not supported inside an explicit transaction",
-                        ),
-                    );
-                }
+                // 明示トランザクション内でも受理する（Issue #1353）。埋め込み I/O は BEGIN
+                // 時点で保持済みの単一ライタの下・セッションの `max_duration` の範囲で行う。
                 crate::sql::exec::execute_file_insert(
+                    target,
                     &self.storage,
                     ctx,
                     self.embedder.as_deref(),
@@ -10584,7 +10700,7 @@ mod tests {
 
         // I/O フェーズ（スキーマに依存しない）。
         let planned = core
-            .plan_using_plan_expansion(&ctx, &session, validated.table_name(), None, question)
+            .plan_using_plan_expansion(&ctx, &session, validated.table_name(), None, question, None)
             .expect("plan_using_plan_expansion should succeed");
 
         // I/O 完了後・束縛前に DDL が挟まる（同名テーブルの列順を入れ替えて再作成）。
@@ -11297,7 +11413,7 @@ mod tests {
         let question = validated.using_plan().expect("USING PLAN present");
 
         let planned = core
-            .plan_using_plan_expansion(&ctx, &session, validated.table_name(), None, question)
+            .plan_using_plan_expansion(&ctx, &session, validated.table_name(), None, question, None)
             .expect("plan_using_plan_expansion should succeed");
 
         let seen = spy.seen.lock().expect("spy lock not poisoned");
