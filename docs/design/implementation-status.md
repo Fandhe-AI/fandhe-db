@@ -510,3 +510,10 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: 行制約を持つ表で、新しい `BEGIN` 内の再送が台帳由来の `23505`（`DuplicateOperationId`）になり行制約由来（`UniqueViolation`／`IdConflict`）に落ちないことを、variant と固定文言で固定する。順序を入れ替える一時変更で engine・wire 層 A・層 B が失敗することを確認済み。
 - **テスト**: engine 5 件（commit 済み再送・対照・未 commit 接続断・衝突時の再送・テナント境界。`PRIMARY KEY` のみ／`UNIQUE` のみ／両方の 3 構成）、wire 層 A 2 件、層 B 1 件（3 クライアント）。
 - **対象外（申し送り）**: `--fault-inject` の注入点を `COMMIT` 文へ広げること、先頭文が 0 行 `DELETE` の場合の再送判定、明示トランザクション内の UPDATE／UPSERT／複数行 INSERT への対応。
+
+## Issue #1355: RLS の越境一括検証に明示トランザクションの経路を加える
+
+- **対象ビヘイビア**: RLS-10 (a)(c)（関連: SQL-31・RECOVER-12・ERR-2）。
+- **変更箇所**: テストのみ（本番コード・公開 API・依存の変更なし）。`crates/engine/tests/rls10_write_constraint_paths.rs` に実行経路の次元（autocommit／明示トランザクション）を追加した。
+- **性質**: 既存の 41 形状を、`BEGIN` → 形状 → 成功なら同一トランザクション内の読み戻し → `COMMIT` の経路でも実行し、T0〜T6 の同一オラクルを適用する。エラー時は `Failed` 遷移・`COMMIT` の `25P02` 拒否・`ROLLBACK` で `Idle` へ戻ることを能動的に表明する。T7 で両経路の応答と自テナントの事後物理状態の完全一致を固定する。T0・T4・T5 の集計は経路別に更新した（T4 の比較件数 72、総 run 数 492）。
+- **対象外（申し送り）**: `INITIALLY DEFERRED` の FK（COMMIT 時検査）・暗黙トランザクション（WIRE-16）・ROLLBACK 後の全テナント物理不変の専用検査。
