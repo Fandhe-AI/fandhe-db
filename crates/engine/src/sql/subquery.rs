@@ -562,7 +562,7 @@ fn execute_inner_scan_statement(
     // 済みのため、ここでは budget のみ検査すれば足りる）。
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
-    validated.where_predicates = resolve_where_predicates(
+    validated.where_predicates = match resolve_where_predicates(
         validated.where_predicates,
         &chain,
         read_txn,
@@ -571,7 +571,20 @@ fn execute_inner_scan_statement(
         udfs,
         budget,
         in_value_budget,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // 入れ子 WHERE サブクエリの実行時データ例外は、投影位置の外側が行数判明まで
+            // 遅延できるよう、投影メタデータ（WHERE に依存しない）を先に確定する。
+            if intent == InnerScanIntent::ScalarValue {
+                validated.where_predicates = Vec::new();
+                if let Ok(bound) = super::parser::bind_scan(&validated, &inner_schema, udfs) {
+                    *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
+                }
+            }
+            return Err(e);
+        }
+    };
 
     if intent == InnerScanIntent::ExistenceOnly {
         // ユーザー指定の `LIMIT` 自体の範囲検証（`bind_scan` が本来行う契約）
@@ -632,7 +645,7 @@ fn execute_inner_aggregate_statement(
     )?;
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
-    validated.where_predicates = resolve_where_predicates(
+    validated.where_predicates = match resolve_where_predicates(
         validated.where_predicates,
         &chain,
         read_txn,
@@ -641,7 +654,17 @@ fn execute_inner_aggregate_statement(
         udfs,
         budget,
         in_value_budget,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // スキャン側と同じ理由で、入れ子 WHERE の失敗時も投影メタデータを確定する。
+            validated.where_predicates = Vec::new();
+            if let Ok(bound) = super::parser::bind_aggregate(&validated, &inner_schema, udfs) {
+                *meta_sink = Some(super::describe::aggregate_columns(&bound));
+            }
+            return Err(e);
+        }
+    };
     let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
     *meta_sink = Some(super::describe::aggregate_columns(&bound));
     super::aggregate::execute_aggregate_with_cache(
@@ -818,7 +841,7 @@ fn resolve_in_subquery(
     let mut has_null = false;
     let mut texts: Vec<String> = Vec::new();
     let mut bools: Vec<bool> = Vec::new();
-    let mut ints: Vec<i64> = Vec::new();
+    let mut ints: Vec<i128> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     for row in &result.rows {
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
@@ -852,13 +875,10 @@ fn resolve_in_subquery(
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Integer => match cell {
-                Cell::SignedInteger(n) => ints.push(*n),
-                // `u64` が `i64` に収まらない値は、どの整数列の値とも一致し得ない。
-                Cell::Integer(n) => {
-                    if let Ok(n) = i64::try_from(*n) {
-                        ints.push(n);
-                    }
-                }
+                Cell::SignedInteger(n) => ints.push(i128::from(*n)),
+                // 疑似列 `id` は `u64` 全域を取り得るため、`i128` で保持して落とさない
+                // （`i64` 超の値も等価比較の対象とする。範囲外の写像は `int_compare` が担う）。
+                Cell::Integer(n) => ints.push(i128::from(*n)),
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Float => match cell {
@@ -927,7 +947,7 @@ fn resolve_in_subquery(
             ),
             SubqueryValueFamily::Integer => WherePredicate::Or(
                 ints.into_iter()
-                    .map(|n| vec![int_compare(column, BinOp::Eq, i128::from(n))])
+                    .map(|n| vec![int_compare(column, BinOp::Eq, n)])
                     .collect(),
             ),
             SubqueryValueFamily::Float => WherePredicate::Or(
@@ -971,8 +991,8 @@ fn resolve_in_subquery(
                 ints.into_iter()
                     .map(|n| {
                         WherePredicate::Or(vec![
-                            vec![int_compare(column, BinOp::Lt, i128::from(n))],
-                            vec![int_compare(column, BinOp::Gt, i128::from(n))],
+                            vec![int_compare(column, BinOp::Lt, n)],
+                            vec![int_compare(column, BinOp::Gt, n)],
                         ])
                     })
                     .collect()

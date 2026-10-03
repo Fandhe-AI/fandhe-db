@@ -322,6 +322,24 @@ fn projection_subquery_runtime_error_is_deferred_until_outer_has_rows() {
 }
 
 #[test]
+fn projection_subquery_nested_where_runtime_error_is_deferred() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "big1", Some(i64::MAX));
+    ins(&core, &ctx, REFS, 6, "big2", Some(i64::MAX));
+    // 入れ子 WHERE サブクエリ内の数値あふれ（22003）も、外側 0 行なら発生しない。
+    let inner = format!(
+        "(SELECT name FROM {REFS} WHERE qty = (SELECT SUM(qty) FROM {REFS} WHERE qty > 100) LIMIT 1)"
+    );
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert!(run(&core, &ctx, &none).rows.is_empty());
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    assert_eq!(code(&core, &ctx, &some), "22003");
+}
+
+#[test]
 fn projection_subquery_alias_of_id_keeps_numeric_type() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
