@@ -211,6 +211,43 @@ fn describe_row_description_matches_simple_query_row_description() {
     stream.shutdown(Shutdown::Write).ok();
 }
 
+/// ウィンドウ関数を含む `SELECT` の Describe(S) が返す `RowDescription` の型 OID は、
+/// 簡易クエリの実行結果と一致する（Issue #1344・WIRE-13・SQL-30）。
+#[test]
+fn describe_window_columns_announce_same_oids_as_simple_query() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let sql = "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, COUNT(*) OVER () AS c, \
+               SUM(id) OVER () AS s, AVG(id) OVER () AS a, MIN(body) OVER () AS b \
+               FROM documents LIMIT 5";
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("stmt_w", sql, 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1');
+
+    send_length_prefixed_message(&mut stream, b'D', &describe_body(b'S', "stmt_w"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b't');
+    let described = read_row_description_with_oids(&mut stream);
+    assert_eq!(
+        described,
+        vec![
+            ("rn".to_string(), 20),
+            ("c".to_string(), 20),
+            ("s".to_string(), 1700),
+            ("a".to_string(), 701),
+            ("b".to_string(), 25),
+        ]
+    );
+
+    send_simple_query(&mut stream, sql);
+    let executed = read_row_description_with_oids(&mut stream);
+    assert_eq!(described, executed);
+    stream.shutdown(Shutdown::Write).ok();
+}
+
 /// Parse／Describe を挟んでも簡易クエリ（'Q'）の応答は不変（受け入れ条件 4）。
 /// `Q` → Parse → Describe → `Q` と交互に送っても、2 回の `Q` の応答が同一の
 /// バイト列であることを確認する。

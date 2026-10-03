@@ -442,3 +442,10 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **挙動変更**: `text` 公告だが `Cell::Float` を運ぶ列（ウィンドウ関数結果など）も PG 形式の数値文字列になる。
 - **テスト**: `scalar_float` の境界値表・f64 ビットパターン往復掃引、`wire_float_columns` の float8 出力テスト、`wire14_binary_typed_columns` のオラクル更新。
 - **対象外（申し送り）**: HTTP（NoSQL）応答の JSON number 表記、`VECTOR` 要素の表記、`extra_float_digits` による精度切り替え、格納時の `-0.0` 正規化、EXPLAIN 内の数値表記、3 クライアント（psql・psycopg・node pg）e2e の追加（opt-in。未実行）。
+
+**Issue #1344（fix(wire): ウィンドウ関数の結果列の型 OID を入力型に従って公告する。WIRE-13・SQL-30 ポインタ）**: ウィンドウ関数の結果列（`ColumnMeta::Computed`）が `ty: None`（text 公告）だったのを、順位関数・`COUNT` は `int8`、`SUM`／`AVG`／`MIN`／`MAX` は集計式と同じ規則の型で公告するよう是正した。#1343 項の「text 公告だが `Cell::Float` を運ぶ列（ウィンドウ関数結果など）」のうちウィンドウ列は、本 Issue で型付き公告になった。
+
+- **変更箇所**: `engine` の `sql::window::window_result_type`（新設。`aggregate_result_type` を流用する唯一の写像）を、実行経路 `window::build_result` と Describe の `sql::describe::scan_columns` が共有する。`wire-server` の `src/` は変更なし（`column_wire_type` が `Computed{ty: Some(_)}` を既に型付き公告する）。
+- **挙動変更**: RowDescription の型 OID が text（25）から型付き（20・23・700・701・1700・1082・1114 等）へ変わる。判定不能な場合は `None`（text 公告）に倒れる fail-closed。
+- **網羅ガード**: `window` の単体テスト、`describe_parity`（Describe と実行の列メタ一致）、`sql30_window` の型アサーション、`wire13_type_oid`（自テナントの OID・値と他テナントの同一 OID・0 行）、`wire_scan_window`・`wire11_parse_describe`。
+- **対象外（申し送り）**: HTTP（NoSQL）`columns[].type` の型名化（NOSQL-11 の判断事項）、ウィンドウ列のバイナリ結果形式、3 クライアント e2e（opt-in。未実行）。

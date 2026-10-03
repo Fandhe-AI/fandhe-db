@@ -230,6 +230,54 @@ fn describe_typed_aggregate_and_expression_columns_match_execute() {
     );
 }
 
+/// ウィンドウ関数の結果列（Issue #1344）でも Describe と実行の列メタが `ty` を含めて
+/// 一致し、順位関数・COUNT が BigInt、`MIN(TEXT)` が Text になること。
+#[test]
+fn describe_window_scan_matches_execute() {
+    let path = unique_db_path("describe-window");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    seed_row(&core, &ctx, 1, "op-seed-0201");
+    seed_row(&core, &ctx, 2, "op-seed-0202");
+
+    let sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, RANK() OVER (ORDER BY id) AS rk, \
+               COUNT(*) OVER () AS c, SUM(id) OVER () AS s, AVG(id) OVER () AS a, \
+               MIN(body) OVER () AS b FROM documents LIMIT 10";
+    assert_describe_matches_execute(&core, &ctx, sql);
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(&ctx, &mut session, sql)
+        .expect("window select should succeed");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected query outcome");
+    };
+    let tys: Vec<_> = result
+        .columns
+        .iter()
+        .skip(1)
+        .map(|c| match c {
+            engine::sql::exec::ColumnMeta::Computed { ty, .. } => ty.clone(),
+            other => panic!("expected Computed, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        tys,
+        vec![
+            Some(ColumnType::BigInt),
+            Some(ColumnType::BigInt),
+            Some(ColumnType::BigInt),
+            Some(ColumnType::Numeric {
+                precision: 20,
+                scale: 0
+            }),
+            Some(ColumnType::Double),
+            Some(ColumnType::Text),
+        ]
+    );
+}
+
 /// `EXPLAIN` の実行本体（`run_explain_plan`）は辞書抽出用の `path` 列等、本
 /// ファイルの最小テーブルには無い前提を要求するため、実行結果との突き合わせは
 /// 行わず、`sql::explain::build_explain_result` が常に返す単一列

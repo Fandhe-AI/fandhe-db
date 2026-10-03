@@ -1312,6 +1312,27 @@ fn window_key_value_eq(a: &Option<WindowKeyValue>, b: &Option<WindowKeyValue>) -
     }
 }
 
+/// ウィンドウ項目の結果列の静的型を返す（Issue #1344。WIRE-13・SQL-30 のポインタ）。
+///
+/// 実行経路（[`build_result`]）と Describe（`sql::describe::scan_columns`）が共有する
+/// 唯一の写像で、wire-server の RowDescription 型 OID の元になる。順位関数と
+/// `COUNT` は `BigInt`、`SUM`／`AVG`／`MIN`／`MAX` は `Accumulator::finish` が返す
+/// セル型と対応する集計 SELECT の規則（`aggregate::aggregate_result_type`）を流用する。
+/// 判定不能な場合は `None`（wire では text 公告へ倒れる fail-closed 側）。
+pub(crate) fn window_result_type(item: &BoundWindowItem) -> Option<ColumnType> {
+    use crate::sql::allowlist::AggregateFunc;
+    let func = match item.func {
+        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::Count => {
+            return Some(ColumnType::BigInt);
+        }
+        WindowFunc::Sum => AggregateFunc::Sum,
+        WindowFunc::Avg => AggregateFunc::Avg,
+        WindowFunc::Min => AggregateFunc::Min,
+        WindowFunc::Max => AggregateFunc::Max,
+    };
+    aggregate::aggregate_result_type(func, item.input.as_ref()?)
+}
+
 fn window_func_to_aggregate_func(
     func: WindowFunc,
 ) -> Result<crate::sql::allowlist::AggregateFunc, SqlSurfaceError> {
@@ -1552,10 +1573,10 @@ fn build_result(
     }
     for item in bound.windows() {
         if let Some(slot) = final_columns.get_mut(item.position) {
-            // ウィンドウ関数の結果型は Issue #1173 の対象外（静的型なし＝text）。
+            // ウィンドウ関数の結果型は入力型に従う静的型（Issue #1344）。
             *slot = Some(ColumnMeta::Computed {
                 name: item.name.clone(),
-                ty: None,
+                ty: window_result_type(item),
             });
         }
     }
@@ -1706,6 +1727,55 @@ mod budget_regression_tests {
     use crate::storage::{RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
     use redb::ReadableDatabase;
+
+    fn item(func: WindowFunc, input: Option<AggregateInput>) -> BoundWindowItem {
+        BoundWindowItem {
+            position: 0,
+            func,
+            input,
+            partition_by: Vec::new(),
+            order_by: Vec::new(),
+            name: "w".to_string(),
+        }
+    }
+
+    /// 順位関数と `COUNT` は `BigInt`、集計系は集計 SELECT と同じ規則（Issue #1344）。
+    #[test]
+    fn window_result_type_maps_ranking_count_and_aggregates() {
+        for f in [
+            WindowFunc::RowNumber,
+            WindowFunc::Rank,
+            WindowFunc::DenseRank,
+        ] {
+            assert_eq!(window_result_type(&item(f, None)), Some(ColumnType::BigInt));
+        }
+        assert_eq!(
+            window_result_type(&item(WindowFunc::Count, Some(AggregateInput::AllVisible))),
+            Some(ColumnType::BigInt)
+        );
+        let inputs = || {
+            vec![
+                AggregateInput::IdU64,
+                AggregateInput::IntegerColumn(0),
+                AggregateInput::BigIntColumn(0),
+                AggregateInput::RealColumn(0),
+                AggregateInput::DoubleColumn(0),
+            ]
+        };
+        for (wf, af) in [
+            (WindowFunc::Sum, AggregateFunc::Sum),
+            (WindowFunc::Avg, AggregateFunc::Avg),
+            (WindowFunc::Min, AggregateFunc::Min),
+            (WindowFunc::Max, AggregateFunc::Max),
+        ] {
+            for input in inputs() {
+                let expected = aggregate::aggregate_result_type(af, &input);
+                assert!(expected.is_some());
+                assert_eq!(window_result_type(&item(wf, Some(input))), expected);
+            }
+        }
+        assert_eq!(window_result_type(&item(WindowFunc::Sum, None)), None);
+    }
 
     /// `body`（TEXT・nullable）1 列のみのテーブル（`MIN(body) OVER (...)` の
     /// 検証専用）。

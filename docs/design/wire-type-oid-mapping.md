@@ -28,7 +28,7 @@ float／日付／バイナリ／UUID／JSON 列をネイティブ型へ復元で
 | --- | --- | --- | --- | --- |
 | `Id` | `Numeric` | 1700 | -1 | `numeric` |
 | `Text` | `Text` | 25 | -1 | `text` |
-| `Vector(_)`／`Array(_)`／`Enum(_)`／`Computed{ty: None}` | `Text` | 25 | -1 | `text` |
+| `Vector(_)`／`Array(_)`／`Enum(_)`／`Computed{ty: None}`（ベクトル式など型なしの式列） | `Text` | 25 | -1 | `text` |
 | `Computed{ty: Some(t)}` | `t` の写像と同じ（Issue #1173。下記「集計・式列の型」参照） | — | — | — |
 | `Integer` | `Int4` | 23 | 4 | `int4` |
 | `BigInt` | `Int8` | 20 | 8 | `int8` |
@@ -126,7 +126,8 @@ engine の `ColumnMeta::Computed` に静的な結果型 `ty: Option<ColumnType>`
 | `MIN／MAX(DATE／TIMESTAMP／TEXT)` | `Date`（1082）／`Timestamp`（1114）／`Text`（25） |
 | `GROUP BY` キー | `Text`（25。現状 `TEXT` キーのみ受理） |
 | 式列（スカラー式／比較式／TEXT・DATE・TIMESTAMP 式） | `Double`（701）／`Boolean`（16）／`Text`／`Date`／`Timestamp` |
-| ベクトル式・ウィンドウ関数・`EXPLAIN` の `QUERY PLAN` | 型なし（ウィンドウ・ベクトル式）は `text`。`QUERY PLAN` は `Text` |
+| ベクトル式・`EXPLAIN` の `QUERY PLAN` | 型なし（ベクトル式）は `text`。`QUERY PLAN` は `Text` |
+| ウィンドウ関数の結果列（Issue #1344） | 順位関数（`ROW_NUMBER`／`RANK`／`DENSE_RANK`）と `COUNT` は `int8`（20）。`SUM`／`AVG`／`MIN`／`MAX` は集計式と同じ規則（`aggregate_result_type`）で決まる型。実行経路と Describe は `window_result_type` を共有する |
 
 `REAL`（`float4`）列のテキスト値は PostgreSQL の float4 出力形式で出す
 （`result_encoder::cell_to_text_for_column`。`docs/design/float-column-types.md` F6）。
