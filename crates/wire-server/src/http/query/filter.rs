@@ -860,7 +860,7 @@ fn declare_eq(
         ColumnType::Array(array_ty) => match value {
             JsonValue::Array(items) => {
                 let text =
-                    typed_json::array_literal_text(items, *array_ty).map_err(FilterError::Value)?;
+                    typed_json::array_literal_text(items, array_ty).map_err(FilterError::Value)?;
                 Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
                     column, text,
                 )))

@@ -37,9 +37,10 @@ pub(crate) enum StaticColumnType {
     Resolved(ColumnType),
     /// ENUM 型名の候補（実行段が `Storage::get_enum_type` で解決する）。
     EnumCandidate(String),
-    /// 要素が ENUM 型名候補の配列（`<enum>[N]`）。配列の要素型は現状スカラー型に
-    /// 限られるため、実行段は型名の存在確認のうえ登録済みでも `0A000` で拒否する。
-    ArrayOfEnumCandidate(String),
+    /// 要素が ENUM 型名候補の配列（`<enum>[N]`。Issue #1357）。第 2 要素は要素数上限。
+    /// 実行段（DDL 権限ゲートの後）が `Storage::get_enum_type` で語彙を解決して
+    /// [`ArrayType::new_enum`] へ差し替える。
+    ArrayOfEnumCandidate(String, u32),
 }
 
 /// 構文木 [`SqlColumnTypeName`] を [`StaticColumnType`] へ写す（カタログ非参照の純関数）。
@@ -47,8 +48,8 @@ pub(crate) enum StaticColumnType {
 /// - `VECTOR(N)` は `Resolved(Vector(N))`（採否は呼び出し元が決める。`ADD COLUMN` は
 ///   実行段で `0A000`、`CREATE TABLE` は従来どおり受理）
 /// - 配列は要素型を写したうえで [`ArrayType::new`] へ渡す。`[]` は
-///   `MAX_ARRAY_ELEMENTS`、範囲外の `[N]` は `42601`。要素が `VECTOR`・配列は `42601`、
-///   `ArrayElemType` に対応が無い型（NUMERIC・BYTEA・JSON・JSONB）は `0A000`
+///   `MAX_ARRAY_ELEMENTS`、範囲外の `[N]` は `42601`。要素が `VECTOR`・配列は `42601`。
+///   NUMERIC・BYTEA・JSON・JSONB・ENUM 要素も受理する（Issue #1357）
 /// - `ColumnType` から `ArrayElemType` への写像はワイルドカードを使わず網羅的に
 ///   書く（要素型が増えたときコンパイラが追従漏れを検出する）
 pub(crate) fn to_static_column_type(
@@ -81,9 +82,9 @@ pub(crate) fn to_static_column_type(
                     // 上限の範囲だけは型名の存在確認より先に検証する（実行段の
                     // 解決を待たずに構文として確定できる誤りのため）。
                     ArrayType::new(ArrayElemType::Text, max_len).map_err(array_size_error)?;
-                    return Ok(StaticColumnType::ArrayOfEnumCandidate(name));
+                    return Ok(StaticColumnType::ArrayOfEnumCandidate(name, max_len));
                 }
-                StaticColumnType::ArrayOfEnumCandidate(_) => {
+                StaticColumnType::ArrayOfEnumCandidate(..) => {
                     return Err(nested_array_error());
                 }
             };
@@ -97,17 +98,22 @@ pub(crate) fn to_static_column_type(
                 ColumnType::Date => ArrayElemType::Date,
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
                 ColumnType::Uuid => ArrayElemType::Uuid,
+                ColumnType::Numeric { precision, scale } => {
+                    ArrayElemType::Numeric { precision, scale }
+                }
+                ColumnType::Bytea => ArrayElemType::Bytea,
+                ColumnType::Json => ArrayElemType::Json,
+                ColumnType::Jsonb => ArrayElemType::Jsonb,
                 ColumnType::Vector(_) => {
                     return Err(SqlSurfaceError::unsupported(
                         "VECTOR cannot be an array element type",
                     ))
                 }
                 ColumnType::Array(_) => return Err(nested_array_error()),
-                ColumnType::Numeric { .. }
-                | ColumnType::Bytea
-                | ColumnType::Json
-                | ColumnType::Jsonb
-                | ColumnType::Enum(_) => {
+                // ENUM 要素は上の `EnumCandidate` 腕で処理済み（型名の解決は実行段）。
+                // `to_static_column_type` が `Resolved(Enum)` を返すことは無いが、
+                // 到達した場合は拒否側（fail-closed）に倒す。
+                ColumnType::Enum(_) => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })

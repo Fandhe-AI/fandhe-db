@@ -218,8 +218,8 @@ DISTANCE 先行の再評価経路（`sql::exec` の `candidate_value_to_scalar_r
 
 ### 対象外（申し送り。Issue 起票はユーザー承認後）
 
-- 要素型 `NUMERIC(p,s)`・`BYTEA`・`ENUM`・`JSON`（カタログ param 文法の拡張と配列テキストの引用規則の設計が要る）
-- SQL `CREATE TABLE`／`ALTER TABLE` での `<型>[]` 宣言（lexer の拡張。#899 系）
+- ~~要素型 `NUMERIC(p,s)`・`BYTEA`・`ENUM`・`JSON`~~（Issue #1357 で対応済み）
+- ~~SQL `CREATE TABLE`／`ALTER TABLE` での `<型>[]` 宣言~~（Issue #1348 で対応済み）
 - `ARRAY[...]` コンストラクタ、要素・パス演算子（`[]`・`@>`・`->`）による述語
 - NoSQL `filter` の `in` を配列列・JSON 列に使うこと
 - 配列列・JSON 列の二次索引化
@@ -231,3 +231,45 @@ DISTANCE 先行の再評価経路（`sql::exec` の `candidate_value_to_scalar_r
 （SQL-23・TABLE-14）。`[N]` は PostgreSQL と異なりサイズ指定が無視されず、列の要素数
 上限（`ArrayType::max_len`。書き込みの超過は `54000`）になる。要素・パス演算子
 （`tags[1]` 等）は引き続き構文検証で `42601`。
+
+## Issue #1357 追記: 要素型 NUMERIC・BYTEA・ENUM・JSON・JSONB
+
+TABLE-14・NOSQL-17 に従い、配列の要素型に `NUMERIC(p,s)`・`BYTEA`・名前付き ENUM・
+`JSON`・`JSONB` を加えた（SQL の `CREATE TABLE`／`ALTER TABLE ADD COLUMN` の宣言、
+SQL の INSERT／UPDATE／UPSERT／COPY、NoSQL の insert／update／filter `eq`）。
+
+- **型表現**: `ArrayElemType` は `Copy` を保ち、`Numeric { precision, scale }`・`Bytea`・
+  `Json`・`Jsonb`・`Enum`（マーカー）を追加した。ENUM の語彙は `ArrayType::enum_def`
+  （`Arc<EnumTypeDef>`）が持つため `ArrayType` は `Copy` ではなくなり、ENUM 要素は
+  `ArrayType::new_enum` だけが構築経路。`ArrayValue` は variant を追加した（公開型への
+  追加で破壊的）。
+- **カタログ param**: `<tag>,<max_len>`（新規タグ `bytea`・`json`・`jsonb`）、
+  `numeric,<p>,<s>,<max_len>`、`enum,<type_name>,<max_len>`。フィールド数は先頭の要素
+  タグで決まり、過不足・非正準数値・範囲外は fail-closed に拒否する。フォーマット版は
+  上げない（旧バイナリは未知タグで拒否側に倒れる）。
+- **ENUM の依存判定（P0）**: `catalog_value_references_enum_type` は `array` 列の
+  `enum,<type_name>,...` も依存として検出する（`DROP TYPE` の `2BP01` と
+  `ALTER TYPE ADD VALUE` のテーブル世代更新）。壊れた param は `CorruptSchema`。
+  削除済み列（墓標）は ENUM／JSON／JSONB 要素の配列を `TEXT[]` へ正規化し、依存に
+  数えない（スカラー列と同じ扱い）。
+- **行内表現**: `NUMERIC` は固定幅 16 バイト（`unscaled` の i128 LE。位取りは列宣言が
+  正で、encode 時に位取り一致と精度を検査し、decode 時に再検証する）。`BYTEA`・`JSON`・
+  `JSONB`・`ENUM` は TEXT と同じ長さ前置本文（`BYTEA` は UTF-8 検証なし。decode 時の
+  JSON 再パース・ENUM 語彙検査はしない）。既存要素型のバイト列は不変。
+- **値等価**: `JSON`／`JSONB`／`NUMERIC` 要素の `=`・UNIQUE キー・集合演算は、
+  `ArrayValue::equality_payload`（`ArrayRef::equality_payload`）で値等価の正準形へ
+  差し替える。JSON はスカラー JSON 列と同じ `canonical_equality_text`、`NUMERIC` は
+  末尾ゼロを除いた `(unscaled, scale)`。UNIQUE キーの要素タグは 9〜13 を新規採番した
+  （`user_uniq` へ永続化される値のため既存タグは不変）。
+- **SQL リテラル**: 要素はスカラー列と同じ束縛関数へ委譲し、エラー分類を揃える
+  （`NUMERIC` の形式不正 `22P02`・桁あふれ `22003`、`BYTEA` の `\x` 16 進、JSON の構文不正
+  `22P02`、ENUM の語彙外 `22P02`、要素数超過 `54000`）。
+- **wire**: pg wire は text（OID 25）のまま。`BYTEA` 要素は `"\\x0102"`、JSON 要素は
+  引用・エスケープして描画し、同じ文字列を右辺に使うと元の値へ戻る。NoSQL は
+  `numeric[]`・`bytea[]`・`json[]`・`jsonb[]`・`enum[]` を型名とし、NUMERIC は JSON number、
+  BYTEA は base64 文字列、JSON／JSONB は native JSON（再パース＋正規化）、ENUM は文字列で
+  描画する。束縛（insert／update／filter `eq`）はスカラー列と同じ入力形式で、JSON `null`
+  要素は NULL 要素。
+- **対象外（申し送り）**: NoSQL の DDL での配列宣言、配列列への DEFAULT（`0A000` を維持）、
+  `numeric[]` の `ALTER COLUMN TYPE` による精度拡大（`42804` を維持）、配列要素・JSON パス
+  演算子による述語、配列・JSON 列の二次索引化、NoSQL filter の `in` の配列列への適用。

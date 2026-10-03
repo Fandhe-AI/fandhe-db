@@ -194,11 +194,19 @@ impl ArrayKey {
         }
     }
 
-    fn matches(&self, actual: &crate::row_codec::ArrayRef<'_>) -> bool {
-        actual.elem() == self.elem
-            && actual.count() == self.count
-            && actual.flags() == self.flags
-            && actual.payload() == self.bytes.as_slice()
+    /// 行側の配列値との等価判定。壊れた格納値（`JSON` 要素が JSON として読めない等）
+    /// で正準化に失敗した場合は UNKNOWN（`None`。スカラー JSON 列の
+    /// `json_canonical_of` と同じ fail-closed）。
+    fn matches(&self, actual: &crate::row_codec::ArrayRef<'_>) -> Option<bool> {
+        // `NUMERIC` 要素は精度・位取りが列宣言ごとに異なりうるため種別一致で比べ、
+        // 値の等価は正準ペイロード（`JSON`／`NUMERIC` は値等価。Issue #1357 D4）で判定する。
+        let payload = actual.equality_payload().ok()?;
+        Some(
+            crate::row_codec::array_elem_kind_eq(actual.elem(), self.elem)
+                && actual.count() == self.count
+                && actual.flags() == self.flags
+                && payload.as_ref() == self.bytes.as_slice(),
+        )
     }
 }
 
@@ -268,11 +276,27 @@ impl FilterOp {
             }
             // 配列・JSON 列の等価（Issue #1193）。型不一致・破損値は UNKNOWN。
             FilterOp::ArrayEquals(key) => match value? {
-                ScalarRef::Array(a) => Some(key.matches(&a)),
+                ScalarRef::Array(a) => key.matches(&a),
                 _ => None,
             },
             FilterOp::InArray(keys) => match value? {
-                ScalarRef::Array(a) => Some(keys.iter().any(|k| k.matches(&a))),
+                ScalarRef::Array(a) => {
+                    // 破損した格納値は全キーに対して UNKNOWN（`NOT IN` 越しに誤って
+                    // 真へ反転しない。fail-closed）。
+                    let mut unknown = false;
+                    for k in keys {
+                        match k.matches(&a) {
+                            Some(true) => return Some(true),
+                            Some(false) => {}
+                            None => unknown = true,
+                        }
+                    }
+                    if unknown {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                }
                 _ => None,
             },
             FilterOp::JsonEquals(expected) => {
@@ -677,7 +701,7 @@ fn bind_filter_op(
                     return Ok(if skip_enum_label_validation {
                         FilterOp::ArrayEquals(ArrayKey::placeholder(array_ty.elem()))
                     } else {
-                        FilterOp::ArrayEquals(bind_array_key(value, *array_ty)?)
+                        FilterOp::ArrayEquals(bind_array_key(value, array_ty)?)
                     });
                 }
                 ColumnType::Json | ColumnType::Jsonb => {
@@ -926,7 +950,7 @@ fn bind_filter_op(
                         bound.push(if skip_enum_label_validation {
                             ArrayKey::placeholder(array_ty.elem())
                         } else {
-                            bind_array_key(v, *array_ty)?
+                            bind_array_key(v, array_ty)?
                         });
                     }
                     FilterOp::InArray(bound)
@@ -1030,7 +1054,7 @@ fn bind_filter_op(
 /// `22003`／`22007`／`22008`）を書き込み経路と揃える。
 fn bind_array_key(
     literal: &str,
-    array_ty: crate::catalog::ArrayType,
+    array_ty: &crate::catalog::ArrayType,
 ) -> Result<ArrayKey, SqlSurfaceError> {
     let value = crate::sql::parser::parse_array_literal(literal, array_ty)?;
     ArrayKey::from_value(&value)
@@ -1527,6 +1551,29 @@ pub fn matches_all(filters: &[MetadataFilter], scanned: &[Option<ScalarRef<'_>>]
 
 #[cfg(test)]
 mod tests {
+    /// 壊れた格納値（JSON 要素が JSON として読めない）への配列等価・`IN` は UNKNOWN
+    /// （`None`）で、`NOT` 越しにも反転しない（Issue #1357 D4・fail-closed）。
+    #[test]
+    fn array_equality_on_corrupt_stored_json_element_is_unknown() {
+        use crate::catalog::ArrayElemType;
+        use crate::row_codec::{ArrayRef, ArrayValue, ScalarRef};
+
+        let key_value = ArrayValue::Json(vec![Some(r#"{"a":1}"#.to_string())]);
+        let key = ArrayKey::from_value(&key_value).expect("key");
+        // 長さ前置（4 バイト LE）＋ JSON として不正な本文。
+        let mut corrupt = 4u32.to_le_bytes().to_vec();
+        corrupt.extend_from_slice(b"{bad");
+        let row = ArrayRef::from_owned(ArrayElemType::Json, 1, 0, &corrupt);
+        let eq = FilterOp::ArrayEquals(key.clone());
+        assert_eq!(eq.eval(Some(ScalarRef::Array(row))), None);
+        assert_eq!(
+            FilterOp::Not(Box::new(eq)).eval(Some(ScalarRef::Array(row))),
+            None
+        );
+        let in_op = FilterOp::InArray(vec![key]);
+        assert_eq!(in_op.eval(Some(ScalarRef::Array(row))), None);
+    }
+
     #[test]
     fn from_bound_text_in_sorts_dedups_and_bounds() {
         let f = MetadataFilter::from_bound_text_in(3, vec!["b".into(), "a".into(), "a".into()])

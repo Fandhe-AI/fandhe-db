@@ -118,10 +118,10 @@ fn unknown_and_invalid_types_are_rejected_with_42601() {
     ] {
         assert_eq!(code(&core, &mut s, sql), "42601", "{sql}");
     }
-    // NUMERIC 等は配列要素にまだ取れない（0A000）。
+    // NUMERIC の精度・位取りが範囲外の配列要素は 42601（Issue #1357 で NUMERIC 要素は受理）。
     assert_eq!(
-        code(&core, &mut s, "CREATE TABLE t (a NUMERIC(5,2)[])"),
-        "0A000"
+        code(&core, &mut s, "CREATE TABLE t (a NUMERIC(5,9)[])"),
+        "42601"
     );
     // 配列列の DEFAULT は 0A000。
     assert_eq!(
@@ -178,12 +178,21 @@ fn add_column_accepts_array_columns_and_rejects_invalid_ones() {
     .expect("create table");
     run(&core, &mut s, "ALTER TABLE t ADD COLUMN tags TEXT[3]").expect("add array column");
     run(&core, &mut s, "ALTER TABLE t ADD COLUMN nums INTEGER[]").expect("add array column");
+    // Issue #1357: NUMERIC・BYTEA・JSON・JSONB 要素の配列列も追加できる。
+    for sql in [
+        "ALTER TABLE t ADD COLUMN n NUMERIC(5,2)[]",
+        "ALTER TABLE t ADD COLUMN b BYTEA[]",
+        "ALTER TABLE t ADD COLUMN j JSON[2]",
+        "ALTER TABLE t ADD COLUMN jb JSONB[]",
+    ] {
+        run(&core, &mut s, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
     for (sql, expected) in [
         ("ALTER TABLE t ADD COLUMN x no_such[]", "42601"),
         ("ALTER TABLE t ADD COLUMN x VECTOR(2)[]", "42601"),
         ("ALTER TABLE t ADD COLUMN x INTEGER[0]", "42601"),
         ("ALTER TABLE t ADD COLUMN x INTEGER[2000]", "42601"),
-        ("ALTER TABLE t ADD COLUMN x BYTEA[]", "0A000"),
+        ("ALTER TABLE t ADD COLUMN x NUMERIC(5,9)[]", "42601"),
         (
             "ALTER TABLE t ADD COLUMN x INTEGER[] DEFAULT '{1}'",
             "0A000",

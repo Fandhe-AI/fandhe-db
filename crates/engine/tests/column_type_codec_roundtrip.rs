@@ -85,6 +85,11 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::Date => "date",
         ArrayElemType::Timestamp => "timestamp",
         ArrayElemType::Uuid => "uuid",
+        ArrayElemType::Numeric { .. } => "numeric",
+        ArrayElemType::Bytea => "bytea",
+        ArrayElemType::Json => "json",
+        ArrayElemType::Jsonb => "jsonb",
+        ArrayElemType::Enum => "enum",
     }
 }
 
@@ -242,6 +247,14 @@ fn all_column_type_variants_are_covered_by_case_table() {
         ArrayElemType::Date,
         ArrayElemType::Timestamp,
         ArrayElemType::Uuid,
+        ArrayElemType::Numeric {
+            precision: 10,
+            scale: 2,
+        },
+        ArrayElemType::Bytea,
+        ArrayElemType::Json,
+        ArrayElemType::Jsonb,
+        ArrayElemType::Enum,
     ]
     .iter()
     .map(array_elem_label)
@@ -257,7 +270,12 @@ fn all_column_type_variants_are_covered_by_case_table() {
             "double",
             "date",
             "timestamp",
-            "uuid"
+            "uuid",
+            "numeric",
+            "bytea",
+            "json",
+            "jsonb",
+            "enum"
         ])
     );
 }
@@ -1319,6 +1337,11 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Date(_) => ArrayValue::Date(vec![]),
             ArrayValue::Timestamp(_) => ArrayValue::Timestamp(vec![]),
             ArrayValue::Uuid(_) => ArrayValue::Uuid(vec![]),
+            ArrayValue::Numeric(_) => ArrayValue::Numeric(vec![]),
+            ArrayValue::Bytea(_) => ArrayValue::Bytea(vec![]),
+            ArrayValue::Json(_) => ArrayValue::Json(vec![]),
+            ArrayValue::Jsonb(_) => ArrayValue::Jsonb(vec![]),
+            ArrayValue::Enum(_) => ArrayValue::Enum(vec![]),
         };
         roundtrip_single(array_schema_of(elem), Value::Array(empty));
     }
@@ -1481,4 +1504,149 @@ fn array_encode_rejects_out_of_range_and_non_finite_elements() {
         ),
         Err(RowCodecError::Invalid(_))
     ));
+}
+
+// --- Issue #1357: 配列の要素型 NUMERIC・BYTEA・ENUM・JSON・JSONB ----------------
+
+fn dec(unscaled: i128, scale: u8) -> Decimal {
+    Decimal::from_parts(unscaled, scale).expect("decimal")
+}
+
+fn numeric_array_ty(precision: u8, scale: u8) -> ColumnType {
+    ColumnType::Array(
+        ArrayType::new(ArrayElemType::Numeric { precision, scale }, 16).expect("array ty"),
+    )
+}
+
+fn enum_array_ty(def: std::sync::Arc<engine::catalog::EnumTypeDef>) -> ColumnType {
+    ColumnType::Array(ArrayType::new_enum(def, 16).expect("array ty"))
+}
+
+#[test]
+fn array_numeric_bytea_json_roundtrip_with_and_without_null_elements() {
+    for value in [
+        Value::Array(ArrayValue::Numeric(vec![
+            Some(dec(12345, 2)),
+            None,
+            Some(dec(-1, 2)),
+            Some(dec(0, 2)),
+        ])),
+        Value::Array(ArrayValue::Numeric(vec![])),
+        Value::Array(ArrayValue::Numeric(vec![None, None])),
+    ] {
+        roundtrip_single(numeric_array_ty(10, 2), value);
+    }
+    // 精度 38 の最大桁（境界値）。
+    let max38 = 10i128.pow(38) - 1;
+    roundtrip_single(
+        numeric_array_ty(38, 0),
+        Value::Array(ArrayValue::Numeric(vec![
+            Some(dec(max38, 0)),
+            Some(dec(-max38, 0)),
+        ])),
+    );
+    roundtrip_single(
+        array_schema_of(ArrayElemType::Bytea),
+        Value::Array(ArrayValue::Bytea(vec![
+            Some(vec![]),
+            None,
+            Some(vec![0x00, 0xff, 0xfe]),
+        ])),
+    );
+    roundtrip_single(
+        array_schema_of(ArrayElemType::Json),
+        Value::Array(ArrayValue::Json(vec![
+            Some(r#"{ "b" : 1, "a" : [1, 2] }"#.to_string()),
+            None,
+            Some("null".to_string()),
+        ])),
+    );
+    roundtrip_single(
+        array_schema_of(ArrayElemType::Jsonb),
+        Value::Array(ArrayValue::Jsonb(vec![
+            Some(r#"{"a":[1,2],"b":1}"#.to_string()),
+            None,
+        ])),
+    );
+}
+
+#[test]
+fn array_numeric_rejects_scale_mismatch_and_precision_overflow_on_encode() {
+    let schema = single_col_schema(numeric_array_ty(5, 2));
+    for bad in [
+        // 位取り不一致。
+        ArrayValue::Numeric(vec![Some(dec(1, 3))]),
+        // 精度超過（|unscaled| >= 10^5）。
+        ArrayValue::Numeric(vec![Some(dec(100_000, 2))]),
+    ] {
+        let err = encode_row(&schema, "t", Visibility::Public, &[Value::Array(bad)]);
+        assert!(matches!(err, Err(RowCodecError::Invalid(_))));
+    }
+}
+
+#[test]
+fn array_json_and_jsonb_reject_invalid_or_non_canonical_elements_on_encode() {
+    let json_schema = single_col_schema(array_schema_of(ArrayElemType::Json));
+    let bad_json = Value::Array(ArrayValue::Json(vec![Some("{not json".to_string())]));
+    assert!(encode_row(&json_schema, "t", Visibility::Public, &[bad_json]).is_err());
+    let jsonb_schema = single_col_schema(array_schema_of(ArrayElemType::Jsonb));
+    let not_canonical = Value::Array(ArrayValue::Jsonb(vec![Some(r#"{ "a" : 1 }"#.to_string())]));
+    assert!(encode_row(&jsonb_schema, "t", Visibility::Public, &[not_canonical]).is_err());
+}
+
+#[test]
+fn array_element_type_mismatch_between_new_variants_is_rejected() {
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Bytea));
+    let wrong = Value::Array(ArrayValue::Json(vec![Some("1".to_string())]));
+    assert!(encode_row(&schema, "t", Visibility::Public, &[wrong]).is_err());
+}
+
+#[test]
+fn array_enum_roundtrip_validates_vocabulary_on_encode_only() {
+    let (_storage, path, def) = open_with_enum();
+    let _guard = CleanupGuard(path);
+    roundtrip_single(
+        enum_array_ty(def.clone()),
+        Value::Array(ArrayValue::Enum(vec![
+            Some("alpha".to_string()),
+            None,
+            Some("omega".to_string()),
+        ])),
+    );
+    let schema = single_col_schema(enum_array_ty(def));
+    let outside = Value::Array(ArrayValue::Enum(vec![Some("gamma".to_string())]));
+    assert!(encode_row(&schema, "t", Visibility::Public, &[outside]).is_err());
+}
+
+#[test]
+fn array_existing_element_bytes_are_unchanged_by_new_variants() {
+    // 既存要素型（BIGINT）の行バイトは #1357 で不変（永続形式の互換性）。
+    let schema = single_col_schema(array_schema_of(ArrayElemType::BigInt));
+    let encoded = encode_row(
+        &schema,
+        "t",
+        Visibility::Public,
+        &[Value::Array(ArrayValue::BigInt(vec![Some(1), Some(2)]))],
+    )
+    .expect("encode");
+    let payload: Vec<u8> = [1i64.to_le_bytes(), 2i64.to_le_bytes()].concat();
+    assert!(encoded
+        .windows(payload.len())
+        .any(|w| w == payload.as_slice()));
+}
+
+#[test]
+fn array_new_elem_types_reject_truncated_and_trailing_payloads_on_decode() {
+    let schema = single_col_schema(array_schema_of(ArrayElemType::Bytea));
+    let mut encoded = encode_row(
+        &schema,
+        "t",
+        Visibility::Public,
+        &[Value::Array(ArrayValue::Bytea(vec![Some(vec![1, 2, 3])]))],
+    )
+    .expect("encode");
+    let truncated = &encoded[..encoded.len() - 1];
+    assert!(decode_row(&schema, truncated).is_err());
+    encoded.push(0xAA);
+    assert!(decode_row(&schema, &encoded).is_err());
 }
