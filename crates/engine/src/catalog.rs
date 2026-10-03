@@ -2750,7 +2750,7 @@ fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
             validate_identifier(name).map_err(|_| corrupt())?;
             let canonical = max_len
                 .parse::<u32>()
-                .map(|n| n.to_string() == *max_len)
+                .map(|n| n.to_string() == *max_len && (1..=MAX_ARRAY_ELEMENTS).contains(&n))
                 .unwrap_or(false);
             if !canonical {
                 return Err(corrupt());
@@ -10761,6 +10761,8 @@ mod tests {
         for corrupt in [
             "v2\ncols:1\nm:array:enum,mood:0\n",
             "v2\ncols:1\nm:array:enum,mood,04:0\n",
+            "v2\ncols:1\nm:array:enum,mood,0:0\n",
+            "v2\ncols:1\nm:array:enum,mood,1025:0\n",
             "v2\ncols:1\nm:array:enum,mood,4,1:0\n",
             "v2\ncols:1\nm:array:enum,bad name,4:0\n",
         ] {
