@@ -21,7 +21,8 @@
 // WIRE_PRINT_COMMAND_TAG（任意・Issue #1339・SQL-32）: "1" のときのみ、本体 SQL の
 // 実行後に `${result.command} ${result.rowCount}`（CommandComplete のコマンドタグ。
 // 例 "UPDATE 2"）を stdout へ 1 行出力する（分割実行 DML の件数がドライバ API へ
-// 届くことの観測用）。語彙は "1" のみで、それ以外の値は fail-closed でエラー終了
+// 届くことの観測用。Issue #1347・SQL-21: `RETURNING` の行とタグを 1 回の実行で
+// 観測するため、INSERT は `INSERT ${result.oid} ${result.rowCount}` で出力する）。語彙は "1" のみで、それ以外の値は fail-closed でエラー終了
 // する。未指定なら従来どおり何も出さない（挙動不変）。
 // 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 // 出力し終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう全列を
@@ -118,7 +119,14 @@ client
       process.stdout.write(`${Object.values(row).join("|")}\n`);
     }
     if (printTag === "1" && result.command) {
-      process.stdout.write(`${result.command} ${result.rowCount}\n`);
+      // INSERT のタグは `INSERT <oid> <rows>`。pg は oid を result.oid へ保持するため、
+      // 整数のときのみ 3 語形式で出力し 3 クライアントで完全一致比較できるようにする。
+      // 整数でなければ従来の 2 語形式のまま出し、期待値不一致で fail-closed にする。
+      if (result.command === "INSERT" && Number.isInteger(result.oid)) {
+        process.stdout.write(`${result.command} ${result.oid} ${result.rowCount}\n`);
+      } else {
+        process.stdout.write(`${result.command} ${result.rowCount}\n`);
+      }
     }
     return client.end();
   })

@@ -1065,3 +1065,32 @@ ADR `docs/design/partitioned-dml.md`。
 - Issue #1339: `three_client_e2e.rs` に分割実行 DML の層 B を追加し、
   `psycopg_client.py`／`pg_client.js` に opt-in の `WIRE_PRINT_COMMAND_TAG` を追加した
   （production コードの変更なし）。
+
+## RETURNING の 3 クライアント検証（Issue #1347・SQL-21）
+
+`INSERT`／`UPDATE`／`DELETE`／UPSERT の `RETURNING` が、無改造の psql・psycopg・node `pg` の
+API へ返却行と `CommandComplete` タグを届けることを確認する層 B。層 A
+（`tests/wire_returning.rs`）と engine の `tests/sql_returning.rs`・
+`tests/sql21_returning_row_count_parity.rs` が主たる回帰保護で、本節は実クライアントでの到達確認に限る。
+仕様ポインタ: SQL-21、RLS-9・RLS-10。ADR `docs/design/sql-returning.md`。
+
+- テスト: `three_client_e2e.rs::three_clients_receive_returning_rows_and_command_tags`
+  （`#[ignore]`・`make e2e-three-client` に含まれる）。クライアントごとに新しいサーバーと DB。
+  対象は簡易クエリ・autocommit のみ。拡張クエリは層 A の `wire11_bind_execute_sync.rs`、
+  明示トランザクション内の `RETURNING` は対象外。
+- 検証項目: 単一行／複数行 INSERT（VALUES 記述順）、単一行・述語形 UPDATE（更新後の値）・DELETE
+  （削除前の値）、UPSERT の `DO NOTHING`（衝突行は返さない）・`DO UPDATE`（read-merge-write 後の値）の
+  返却行とタグ件数、他テナント id への UPDATE／DELETE が存在しない id と同一応答（0 行・`... 0`）に
+  なること、`RETURNING` を `USING` 句の後ろに置いた文の `42601`、返却値と永続化値の一致。
+- 1 回の実行で行とタグを取る理由: `operation_id` 台帳により同一文の再送は `23505` になるため
+  （`Client::rows_and_tag`）。stdout の最後の非空行をタグ、残りを結果行とする。
+- タグの観測経路: psql は `-q` なしの stdout（`-At -F '|'`）、psycopg は `cur.statusmessage`、
+  node `pg` は `result.command`／`result.oid`／`result.rowCount`。node の INSERT は `INSERT <oid> <rows>` を
+  出力し 3 クライアントで `INSERT 0 n` に完全一致させる（`WIRE_PRINT_COMMAND_TAG=1`。oid が整数でなければ
+  2 語形式のまま出し、期待値不一致で fail-closed）。
+- 決定性: 固定の seed（`rdocs`・非ベクトル・NULL なし）・固定の文順。投影は明示列 `id, n, lang`。
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-vector-db-wire-server
+  --features fault-injection --test three_client_e2e three_clients_receive_returning --
+  --ignored --nocapture --test-threads=1` の `[e2e-record]` 行を PR 本文へ転記する。
+  実測（psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0）: 3 クライアントとも全タグ・
+  RLS 0 行同一・`42601`・読み戻しが一致し、`three_client_e2e` の `--ignored` 11 件が green。

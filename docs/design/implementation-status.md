@@ -463,3 +463,9 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **挙動変更**: コメント・引用符識別子を含む文が `42601` から受理へ。中身が許可形でない引用符識別子（空・空白・`.`・`""`・予約語・非 ASCII）・未終端のコメント・引用符は従来どおり `42601`。受理範囲を広げるのみで既存の受理形の意味は変えない。
 - **テスト**: lexer・splitter の単体テスト（入れ子・未終端・上限判定・密輸防止・lexer との連動）、`wire16_multi_statement`（コメント・引用符識別子・RLS）、`wire11_parse_describe`（コメントだけの Parse）。
 - **対象外（申し送り）**: `COPY` 判定が先頭コメントを見ない点（fail-closed の `42601`）、任意文字を含む引用符識別子（永続 SQL の描画側で識別子を引用する対応が先に必要）、`U&"..."`・引用符付き修飾名。
+
+## Issue #1347: RETURNING の 3 クライアント層 B 検証（SQL-21）
+
+- **変更箇所**: `crates/wire-server/tests/three_client_e2e.rs`（`Client::rows_and_tag`・`seed_returning_db`・`three_clients_receive_returning_rows_and_command_tags`）、`three_client/pg_client.js`（INSERT タグに oid を含める）。production コードは変更なし。
+- **テスト**: INSERT／UPDATE／DELETE／UPSERT の返却行・タグ、他テナント id と存在しない id の 0 行同一応答、`RETURNING` 位置違反の `42601`、永続化値との一致を 3 クライアントで確認（`#[ignore]`・`make e2e-three-client`）。
+- **対象外（申し送り）**: 拡張クエリ・明示トランザクション内の `RETURNING`、NoSQL 表層、ベクトル列の投影の層 B。
