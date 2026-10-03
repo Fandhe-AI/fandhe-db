@@ -1300,7 +1300,8 @@ fn reject_unsupported_predicate_dml_forms(
                 | WherePredicate::Or(_)
                 | WherePredicate::InSubquery { .. }
                 | WherePredicate::Exists { .. }
-                | WherePredicate::ScalarSubqueryCompare { .. } => {
+                | WherePredicate::ScalarSubqueryCompare { .. }
+                | WherePredicate::IdCompare { .. } => {
                     return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                         "predicate form is not supported for NoSQL update/delete filter",
                     ));
@@ -1317,7 +1318,8 @@ fn reject_unsupported_predicate_dml_forms(
             | WherePredicate::Or(_)
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
-            | WherePredicate::ScalarSubqueryCompare { .. } => {
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. } => {
                 return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "predicate form is not supported for NoSQL update/delete filter",
                 ));

@@ -582,6 +582,8 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         WherePredicate::InSubquery { column, .. } => Some(column),
         WherePredicate::ScalarSubqueryCompare { column, .. } => Some(column),
         WherePredicate::Exists { .. } => None,
+        // 解決段が生成する内部専用の葉（疑似列 `id` の比較）。列参照を持たない。
+        WherePredicate::IdCompare { .. } => None,
     }
 }
 

@@ -172,9 +172,9 @@ fn negate_one(
                 "NOT must be followed by a comparison",
             )),
         },
-        WherePredicate::Expression(_) => Err(SqlSurfaceError::unsupported(
-            "NOT must be followed by a comparison",
-        )),
+        WherePredicate::Expression(_) | WherePredicate::IdCompare { .. } => Err(
+            SqlSurfaceError::unsupported("NOT must be followed by a comparison"),
+        ),
         leaf @ (WherePredicate::Equality { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::BoolEquality { .. }

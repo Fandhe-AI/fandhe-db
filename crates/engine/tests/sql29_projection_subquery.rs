@@ -406,3 +406,50 @@ fn projection_subquery_on_buffered_view_is_rejected_not_dropped() {
         .expect_err("must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
+/// PR #1384 codex-review P1 の回帰テスト: 疑似列 `id` が `2^53` 超（`u64` 全域）でも、
+/// `IN`／`NOT IN`／スカラー比較のサブクエリが整数のまま厳密に照合できる
+/// （式評価器の `f64` 写像による `22003` や境界値への丸めで落ちない）。
+#[test]
+fn id_in_subquery_matches_ids_beyond_2_pow_53() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let big1: u64 = (1u64 << 53) + 1;
+    let big2: u64 = u64::MAX - 1;
+    ins(&core, &ctx, ITEMS, 1, "small", Some(1));
+    ins(&core, &ctx, ITEMS, big1, "big1", Some(2));
+    ins(&core, &ctx, ITEMS, big2, "big2", Some(3));
+    ins(&core, &ctx, REFS, big1, "r1", Some(1));
+    ins(&core, &ctx, REFS, big2, "r2", Some(2));
+
+    let ids = |sql: String| -> Vec<u64> {
+        sorted_rows(&run(&core, &ctx, &sql))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    };
+    assert_eq!(
+        ids(format!(
+            "SELECT name FROM {ITEMS} WHERE id IN (SELECT id FROM {REFS} LIMIT 10) LIMIT 100"
+        )),
+        vec![big1, big2]
+    );
+    assert_eq!(
+        ids(format!(
+            "SELECT name FROM {ITEMS} WHERE id NOT IN (SELECT id FROM {REFS} LIMIT 10) LIMIT 100"
+        )),
+        vec![1]
+    );
+    assert_eq!(
+        ids(format!(
+            "SELECT name FROM {ITEMS} WHERE id = (SELECT id FROM {REFS} WHERE name = 'r2' LIMIT 10) LIMIT 100"
+        )),
+        vec![big2]
+    );
+    assert_eq!(
+        ids(format!(
+            "SELECT name FROM {ITEMS} WHERE id > (SELECT id FROM {REFS} WHERE name = 'r1' LIMIT 10) LIMIT 100"
+        )),
+        vec![big2]
+    );
+}

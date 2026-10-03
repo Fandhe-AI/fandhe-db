@@ -294,6 +294,15 @@ pub enum BoundExpr {
     },
     /// 疑似列 `id`（行 `id` を `f64` として扱う）。
     IdRef,
+    /// 疑似列 `id` と整数 `value` の厳密比較（Issue #1352）。`IdRef` は行 `id` を
+    /// `f64` へ写すため `2^53` 超で `22003` になるが、本ノードは `u64` の行 `id` を
+    /// `i128` へ無損失拡大して整数のまま比較する（`id` は NULL にならないため結果は
+    /// 常に `Bool`）。`sql::subquery` が生成する `WherePredicate::IdCompare` の束縛
+    /// 結果としてのみ作られる。`op` は `Eq`／`Lt`／`Le`／`Gt`／`Ge` のみ。
+    IdCompare {
+        op: BinOp,
+        value: i128,
+    },
     /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、TABLE-1。
     /// `catalog::encode_schema` が内部で呼ぶ `validate_schema` により
     /// `CREATE TABLE`・`ALTER TABLE ADD COLUMN` の双方で fail-closed に強制される
@@ -380,6 +389,10 @@ impl PartialEq for BoundExpr {
             ) => a == b,
             (BoundExpr::ColumnRef { index: a }, BoundExpr::ColumnRef { index: b }) => a == b,
             (BoundExpr::IdRef, BoundExpr::IdRef) => true,
+            (
+                BoundExpr::IdCompare { op: oa, value: va },
+                BoundExpr::IdCompare { op: ob, value: vb },
+            ) => oa == ob && va == vb,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
@@ -1092,6 +1105,21 @@ struct BindEnv<'a> {
 /// クローンする部分木のサイズを `node_budget` へ課金するために使う
 /// （`bind_expr_in` の `Expr::Ident` 分岐を参照）。木の深さは束縛段で既に
 /// `node_budget` により上限が掛かっているため、単純な再帰で数え上げてよい。
+/// 行 `id`（`u64`）と整数 `value` を `i128` で厳密比較する（`BoundExpr::IdCompare` の
+/// 評価本体。`udf_call::eval` と `sql::expr_program` の両評価器が共有する）。比較
+/// 演算子以外（算術等）は束縛段が生成しないため、到達しても偽（fail-closed）とする。
+pub(crate) fn id_compare(op: BinOp, id: u64, value: i128) -> bool {
+    let id = i128::from(id);
+    match op {
+        BinOp::Eq => id == value,
+        BinOp::Lt => id < value,
+        BinOp::Le => id <= value,
+        BinOp::Gt => id > value,
+        BinOp::Ge => id >= value,
+        _ => false,
+    }
+}
+
 fn count_bound_nodes(expr: &BoundExpr) -> usize {
     match expr {
         BoundExpr::Number(_)
@@ -1103,6 +1131,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
+        | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::Null => 1,
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
@@ -1146,6 +1175,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
+        | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::Null => 0,
         BoundExpr::Builtin { args, .. } => {
@@ -1194,6 +1224,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::TimestampColumnRef { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
+        | BoundExpr::IdCompare { .. }
         | BoundExpr::Null => false,
         BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Binary { lhs, rhs, .. } => {
@@ -1226,6 +1257,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::IdRef
+        | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::Null => {}
         BoundExpr::Builtin { args, .. } | BoundExpr::WasmCall { args, .. } => {
@@ -1288,6 +1320,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::Date(_)
         | BoundExpr::Timestamp(_)
         | BoundExpr::IdRef
+        | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::Null => false,
         // `any`/`fold` は短絡評価となり、先頭の一致以降の引数をマークし損ねる
@@ -2404,6 +2437,7 @@ pub(crate) fn eval_with_scalars<'a>(
             Some(Some(v)) => numeric_scalar_from_ref(v).map(ExprValue::Scalar),
         },
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
+        BoundExpr::IdCompare { op, value } => Ok(ExprValue::Bool(id_compare(*op, id, *value))),
         BoundExpr::VectorRef => {
             // Issue #352: 行の embedding をそのまま借用する。テーブル `VECTOR` 列の
             // 素通し参照（`WHERE vec_norm(embedding) > x` 等の読み取り経路）では

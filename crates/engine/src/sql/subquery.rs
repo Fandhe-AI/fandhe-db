@@ -947,7 +947,7 @@ fn resolve_in_subquery(
             ),
             SubqueryValueFamily::Integer => WherePredicate::Or(
                 ints.into_iter()
-                    .map(|n| vec![int_compare(column, BinOp::Eq, n)])
+                    .map(|n| vec![target_int_compare(column, target_ty, BinOp::Eq, n)])
                     .collect(),
             ),
             SubqueryValueFamily::Float => WherePredicate::Or(
@@ -991,8 +991,8 @@ fn resolve_in_subquery(
                 ints.into_iter()
                     .map(|n| {
                         WherePredicate::Or(vec![
-                            vec![int_compare(column, BinOp::Lt, n)],
-                            vec![int_compare(column, BinOp::Gt, n)],
+                            vec![target_int_compare(column, target_ty, BinOp::Lt, n)],
+                            vec![target_int_compare(column, target_ty, BinOp::Gt, n)],
                         ])
                     })
                     .collect()
@@ -1032,6 +1032,24 @@ fn resolve_in_subquery(
             }
         }
     })
+}
+
+/// 整数値 `n` との比較述語を対象列に応じて組み立てる。疑似列 `id`（スキーマに同名の
+/// 実カラムが無く `target_ty == None`）は `u64` 全域を取り得るため、式評価器の `f64`
+/// 写像（`2^53` 超で `22003`）を避けて厳密整数比較の [`WherePredicate::IdCompare`] を
+/// 返す。実カラム（`BIGINT` 等）は従来どおり [`int_compare`] の式述語を返す。
+/// `op` は `Eq`／`Lt`／`Le`／`Gt`／`Ge` のみを想定する（Issue #1352）。
+fn target_int_compare(
+    column: &str,
+    target_ty: Option<&ColumnType>,
+    op: BinOp,
+    n: i128,
+) -> WherePredicate {
+    if target_ty.is_none() && column == "id" {
+        WherePredicate::IdCompare { op, value: n }
+    } else {
+        int_compare(column, op, n)
+    }
 }
 
 /// 式評価器（`f64`）が正確に表現できる整数の絶対値上限（`2^53`）。列値側の検査
@@ -1466,14 +1484,14 @@ fn scalar_literal_predicate(
                 _ => return Err(unexpected_cell_type()),
             };
             Ok(match op {
-                ScalarSubqueryOp::Eq => int_compare(column, BinOp::Eq, n),
-                ScalarSubqueryOp::Lt => int_compare(column, BinOp::Lt, n),
-                ScalarSubqueryOp::Le => int_compare(column, BinOp::Le, n),
-                ScalarSubqueryOp::Gt => int_compare(column, BinOp::Gt, n),
-                ScalarSubqueryOp::Ge => int_compare(column, BinOp::Ge, n),
+                ScalarSubqueryOp::Eq => target_int_compare(column, target_ty, BinOp::Eq, n),
+                ScalarSubqueryOp::Lt => target_int_compare(column, target_ty, BinOp::Lt, n),
+                ScalarSubqueryOp::Le => target_int_compare(column, target_ty, BinOp::Le, n),
+                ScalarSubqueryOp::Gt => target_int_compare(column, target_ty, BinOp::Gt, n),
+                ScalarSubqueryOp::Ge => target_int_compare(column, target_ty, BinOp::Ge, n),
                 ScalarSubqueryOp::Ne => WherePredicate::Or(vec![
-                    vec![int_compare(column, BinOp::Lt, n)],
-                    vec![int_compare(column, BinOp::Gt, n)],
+                    vec![target_int_compare(column, target_ty, BinOp::Lt, n)],
+                    vec![target_int_compare(column, target_ty, BinOp::Gt, n)],
                 ]),
             })
         }

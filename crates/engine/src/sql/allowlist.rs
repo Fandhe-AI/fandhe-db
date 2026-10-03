@@ -1423,6 +1423,15 @@ pub enum WherePredicate {
         inner_tokens: Vec<Token>,
         depth: usize,
     },
+    /// 疑似列 `id`（`u64` 全域）と整数 `value` の厳密比較（Issue #1352）。構文解析は
+    /// 生成せず、`sql::subquery` が `IN`／スカラー比較のサブクエリを解決する際にだけ
+    /// 生成する内部専用の葉。式評価器は行 `id` を `f64` へ写すため `2^53` 超で
+    /// `22003` になるが、本葉は束縛時に `BoundExpr::IdCompare` へ写り、行 `id` を
+    /// 整数のまま比較する。`op` は `Eq`／`Lt`／`Le`／`Gt`／`Ge` のみ。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    IdCompare { op: BinOp, value: i128 },
 }
 
 /// [`WherePredicate::ScalarSubqueryCompare`] の比較演算子（Issue #1191）。
@@ -7391,7 +7400,8 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
             // （fail-closed の防御的経路）。
             WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
-            | WherePredicate::ScalarSubqueryCompare { .. } => {
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
                 ));
@@ -7613,7 +7623,8 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // （Issue #927・SQL-29 (a)・TASK-213。上記 `Or` と同じ理由）。
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => String::new(),
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::IdCompare { .. } => String::new(),
     }
 }
 

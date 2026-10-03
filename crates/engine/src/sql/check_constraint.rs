@@ -112,7 +112,8 @@ fn render_predicate(predicate: &WherePredicate) -> String {
         // で拒否し到達しない（`Or` と同じ防御的経路）。
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => String::new(),
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::IdCompare { .. } => String::new(),
     }
 }
 
@@ -334,7 +335,8 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
             // で拒否するため到達しない防御的経路）。
             WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
-            | WherePredicate::ScalarSubqueryCompare { .. } => {
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "CHECK constraint predicate must not contain a subquery",
                 ));

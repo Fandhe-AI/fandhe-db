@@ -43,8 +43,8 @@ use std::sync::Arc;
 use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    self, apply_builtin, finite_scalar, id_as_finite_scalar, BinOp, BoundExpr, BuiltinFn,
-    ExprValue, MAX_BUILTIN_ARITY,
+    self, apply_builtin, finite_scalar, id_as_finite_scalar, id_compare, BinOp, BoundExpr,
+    BuiltinFn, ExprValue, MAX_BUILTIN_ARITY,
 };
 use crate::wasm_udf::WasmUdfBackend;
 
@@ -59,6 +59,9 @@ pub(crate) enum ExprStep {
     ConstBool(bool),
     /// 行 `id` を [`id_as_finite_scalar`] 経由でスカラー値として push する。
     PushId,
+    /// 行 `id`（`u64`）と整数 `value` を `i128` で厳密比較し真偽値を push する
+    /// （`BoundExpr::IdCompare`。`f64` を経由しないため `2^53` 超でも `22003` にならない）。
+    IdCompare { op: BinOp, value: i128 },
     /// テーブルの `VECTOR` 列（行の `embedding`）への参照を push する。
     /// `embedding` が空スライス（`VECTOR` 列が NULL。`dim == 0`）の行では
     /// [`StackValue::Null`] を push し、それ以外では [`StackValue::VectorRef`]
@@ -436,6 +439,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         // （`IdRef` と同じ理由。CHECK の式述語束縛でのみ生成される）。
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
+        | BoundExpr::IdCompare { .. }
         | BoundExpr::VectorRef
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
@@ -473,6 +477,14 @@ fn compile_node(
         }
         BoundExpr::IdRef => {
             steps.push(ExprStep::PushId);
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::IdCompare { op, value } => {
+            steps.push(ExprStep::IdCompare {
+                op: *op,
+                value: *value,
+            });
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -721,6 +733,10 @@ impl ExprProgram {
                 }
                 ExprStep::PushId => {
                     scratch.push(StackValue::Scalar(id_as_finite_scalar(id)?));
+                    pc += 1;
+                }
+                ExprStep::IdCompare { op, value } => {
+                    scratch.push(StackValue::Bool(id_compare(*op, id, *value)));
                     pc += 1;
                 }
                 ExprStep::PushVector => {
