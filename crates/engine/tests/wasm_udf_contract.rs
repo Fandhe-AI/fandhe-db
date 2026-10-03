@@ -555,7 +555,7 @@ fn wasm_call_with_wrong_argument_count_is_rejected() {
              ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1",
         )
         .expect_err("wrong argument count must be rejected at bind time");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
     assert_eq!(call_count.load(Ordering::SeqCst), 0);
 }
 

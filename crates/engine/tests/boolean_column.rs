@@ -380,7 +380,7 @@ fn where_rejects_type_mismatched_boolean_and_text_predicates() {
     let err = core
         .execute_sql(&alice, &format!("SELECT SUM(flag) FROM {TABLE}"))
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // --- UPDATE（単一行）・UPSERT の往復 ------------------------------------------

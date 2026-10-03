@@ -4895,12 +4895,16 @@ impl BoundAggregate {
 /// - `DATE`/`TIMESTAMP` 列 → `COUNT`・`MIN`/`MAX` を受理、`SUM`/`AVG` は
 ///   `42883`（Issue #1186。式でも同じ）
 /// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
-///   （非 NULL 行のみ数える）、それ以外は型不整合（`22000`）
+///   （非 NULL 行のみ数える）、それ以外は `42883`（Issue #1349）
+/// - `TEXT`・`BOOLEAN`・`ARRAY`・`BYTEA`・`JSON`／`JSONB`・`ENUM`・`UUID` 列 →
+///   `COUNT` は受理、`SUM`/`AVG`（`TEXT` 以外は `MIN`/`MAX` も）は `42883`
+///   （Issue #1349。該当シグネチャの関数が無い）
 /// - 上記以外の識別子 → 未知の列（`22000`）
 /// - 複合式（`Expr::Call`・`Expr::Binary`・`Expr::Number`）→
 ///   `sql::udf_call::bind_expr` に委譲し、`Scalar` 型のみ
-///   [`AggregateInput::ScalarExpr`] として受理、`Vector`/`Bool` 型は型不整合
-///   （`22000`）
+///   [`AggregateInput::ScalarExpr`] として受理、`Text`/`Bool`/`Vector` 式の
+///   `SUM`/`AVG`・`Bool`/`Vector` 式の `MIN`/`MAX` は `42883`（Issue #1349）、
+///   その他の非スカラー式は型不整合（`22000`）
 fn resolve_aggregate_input(
     func: crate::sql::allowlist::AggregateFunc,
     arg: &crate::sql::allowlist::AggregateArg,
@@ -4922,7 +4926,7 @@ fn resolve_aggregate_input(
             {
                 return match (&column.ty, func) {
                     (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
-                        Err(SqlSurfaceError::invalid_input(format!(
+                        Err(SqlSurfaceError::undefined_function(format!(
                             "column {name:?} is TEXT and cannot be used with SUM/AVG"
                         )))
                     }
@@ -4930,9 +4934,11 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
-                    (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
-                        "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
-                    ))),
+                    (ColumnType::Vector(_), _) => {
+                        Err(SqlSurfaceError::undefined_function(format!(
+                            "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
+                        )))
+                    }
                     // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
                     // のすべてで受理する（TABLE-13・TASK-196、Issue #881・
                     // #892）。
@@ -4945,7 +4951,7 @@ fn resolve_aggregate_input(
                     (ColumnType::Boolean, AggregateFunc::Count) => {
                         Ok(AggregateInput::BooleanColumn(index))
                     }
-                    (ColumnType::Boolean, _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Boolean, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is BOOLEAN and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                     // `DATE`／`TIMESTAMP` 列は `COUNT`・`MIN`/`MAX` を受理する
@@ -4968,27 +4974,27 @@ fn resolve_aggregate_input(
                     (ColumnType::Array(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::ArrayColumn(index))
                     }
-                    (ColumnType::Array(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Array(_), _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is ARRAY and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                     (ColumnType::Bytea, AggregateFunc::Count) => {
                         Ok(AggregateInput::ByteaColumn(index))
                     }
-                    (ColumnType::Bytea, _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Bytea, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is BYTEA and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                     (ColumnType::Json | ColumnType::Jsonb, AggregateFunc::Count) => {
                         Ok(AggregateInput::JsonColumn(index))
                     }
                     (ColumnType::Json | ColumnType::Jsonb, _) => {
-                        Err(SqlSurfaceError::invalid_input(format!(
+                        Err(SqlSurfaceError::undefined_function(format!(
                             "column {name:?} is JSON and cannot be used with SUM/AVG/MIN/MAX"
                         )))
                     }
                     (ColumnType::Enum(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::EnumColumn(index))
                     }
-                    (ColumnType::Enum(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Enum(_), _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is ENUM and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                     // `NUMERIC(p, s)` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` の
@@ -5005,7 +5011,7 @@ fn resolve_aggregate_input(
                     (ColumnType::Uuid, AggregateFunc::Count) => {
                         Ok(AggregateInput::UuidColumn(index))
                     }
-                    (ColumnType::Uuid, _) => Err(SqlSurfaceError::invalid_input(format!(
+                    (ColumnType::Uuid, _) => Err(SqlSurfaceError::undefined_function(format!(
                         "column {name:?} is UUID and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
                 };
@@ -5044,6 +5050,23 @@ fn resolve_aggregate_input(
                 {
                     Err(SqlSurfaceError::undefined_function(
                         "SUM/AVG cannot be applied to a DATE or TIMESTAMP expression",
+                    ))
+                }
+                // Issue #1349: 列参照と同じ型・同じ関数には同じコードを返す（ERR-2）。
+                // `TEXT`／`BOOLEAN`／`VECTOR` 式への `SUM`／`AVG`、`BOOLEAN`／`VECTOR`
+                // 式への `MIN`／`MAX` は該当シグネチャの関数が無いため `42883`。
+                ExprType::Text | ExprType::Bool | ExprType::Vector
+                    if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
+                {
+                    Err(SqlSurfaceError::undefined_function(
+                        "SUM/AVG cannot be applied to a non-numeric expression",
+                    ))
+                }
+                ExprType::Bool | ExprType::Vector
+                    if matches!(func, AggregateFunc::Min | AggregateFunc::Max) =>
+                {
+                    Err(SqlSurfaceError::undefined_function(
+                        "MIN/MAX cannot be applied to a BOOLEAN or VECTOR expression",
                     ))
                 }
                 ExprType::Vector
@@ -8193,8 +8216,8 @@ mod tests {
             let err = bind_aggregate_sql(&sql).unwrap_err();
             assert_eq!(
                 err.wire_code(),
-                "22000",
-                "{func}(embedding) should be 22000"
+                "42883",
+                "{func}(embedding) should be 42883"
             );
         }
     }
@@ -8204,7 +8227,7 @@ mod tests {
         for func in ["SUM", "AVG"] {
             let sql = format!("SELECT {func}(lang) FROM documents");
             let err = bind_aggregate_sql(&sql).unwrap_err();
-            assert_eq!(err.wire_code(), "22000", "{func}(lang) should be 22000");
+            assert_eq!(err.wire_code(), "42883", "{func}(lang) should be 42883");
         }
     }
 
@@ -8250,14 +8273,14 @@ mod tests {
             &crate::sql::udf_call::UdfRegistry::default(),
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
     }
 
     #[test]
     fn binds_sum_on_vector_typed_expression_as_type_mismatch() {
         let err =
             bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
     }
 
     #[test]

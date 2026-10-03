@@ -321,7 +321,7 @@ fn vector_column_rejects_sum_avg_min_max_with_22000() {
         let resp = query_as_alice(addr, body.as_bytes());
         assert_eq!(
             http_common::wire_code_of(&resp),
-            "22000",
+            "42883",
             "func={func} resp={resp:?}"
         );
     }

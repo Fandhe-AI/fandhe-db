@@ -821,7 +821,7 @@ mod tests {
             r#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"embedding"}]}"#
         );
         let err = bind(&v_sum, &schema(), &udfs()).expect_err("SUM(VECTOR) must be rejected");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
 
         validated_aggregate!(
             v_count,

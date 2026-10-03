@@ -277,7 +277,7 @@ ENUM は `Storage::create_enum_type`（redb ファイルを要する）を経由
     COUNT／SUM／AVG／MIN／MAX と `COUNT(*)`、単一キー GROUP BY で
     埋め込みデコード 0 回・走査行数 > 0 を確認する
   - 層 B: `EngineCore::execute_sql` 経由の WHERE なし単一行集計・複数キー GROUP BY と、
-    型不整合の拒否（DATE／TIMESTAMP の SUM／AVG は 42883、その他は 22000）が
+    型不整合の拒否（非数値型への集計はすべて 42883。Issue #1186・#1349）が
     デコード前に失敗すること
   - 陽性対照: `vec_norm(embedding)` 集計のデコード回数が可視行数と一致する
     （RLS で不可視な行が本体デコードに到達しないことも同時に固定）

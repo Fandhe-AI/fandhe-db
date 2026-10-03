@@ -424,7 +424,7 @@ fn sql_aggregate_rejections_are_fail_closed_and_connection_survives() {
     let (mut stream, _users_path) = spawn_with_alice(core);
 
     for (sql, expected_sqlstate) in [
-        ("SELECT SUM(embedding) FROM docs", "22000"),
+        ("SELECT SUM(embedding) FROM docs", "42883"),
         ("SELECT COUNT(*) FROM docs GROUP BY embedding", "22000"),
         ("SELECT COUNT(*) FROM docs HAVING count > 1", "42601"),
         ("SELECT COUNT(*), lang FROM docs", "42601"),

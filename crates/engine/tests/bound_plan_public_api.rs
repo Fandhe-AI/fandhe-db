@@ -761,7 +761,7 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
     let core = open_engine_core(&path);
     let ctx_a = ctx_public("tenant-a");
 
-    // VECTOR 列への直接集計は `22000`（invalid input）で拒否される
+    // VECTOR 列への直接集計は `42883`（undefined_function。Issue #1349）で拒否される
     // （`tests/sql_aggregate.rs` の既存契約と同一）。
     let sql_vector_sum = "SELECT SUM(embedding) FROM docs";
     let mut session = SessionState::default();
@@ -779,11 +779,11 @@ fn bound_and_sql_paths_share_error_classification_for_same_invalid_input() {
         })
         .expect_err("SUM(embedding) should be rejected on the bound path");
     // 両経路の `wire_code` が一致するだけでなく、その一致先が実際に契約どおりの
-    // `22000`（invalid input）であることを固定オラクルとして検査する。一致検査
+    // `42883`（undefined_function）であることを固定オラクルとして検査する。一致検査
     // のみでは両経路が「同じ間違ったコード」で一致する vacuous pass を防げない
     // （レビュー指摘）。
-    assert_eq!(sql_err.wire_code(), "22000", "sql_err={sql_err:?}");
-    assert_eq!(bound_err.wire_code(), "22000", "bound_err={bound_err:?}");
+    assert_eq!(sql_err.wire_code(), "42883", "sql_err={sql_err:?}");
+    assert_eq!(bound_err.wire_code(), "42883", "bound_err={bound_err:?}");
     assert_eq!(
         sql_err.wire_code(),
         bound_err.wire_code(),

@@ -851,7 +851,7 @@ impl Accumulator {
                 self.observe_text(value)
             }
             // BOOLEAN 列の裸参照は COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #883）。値の真偽は
+            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。Issue #883）。値の真偽は
             // 問わず「NULL でない」ことだけを数える。
             AggregateInput::BooleanColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
@@ -958,7 +958,7 @@ impl Accumulator {
                 }
             }
             // BYTEA 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。Issue #886）。
+            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。Issue #886）。
             AggregateInput::ByteaColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
@@ -967,7 +967,7 @@ impl Accumulator {
                 }
             }
             // JSON／JSONB 列の裸参照も COUNT（非 NULL 行数）専用
-            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
+            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を 42883 で
             // 拒否済み。TABLE-14・Issue #889）。
             AggregateInput::JsonColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
@@ -977,7 +977,7 @@ impl Accumulator {
                 }
             }
             // ENUM 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-14・TASK-198、
+            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。TABLE-14・TASK-198、
             // Issue #890）。
             AggregateInput::EnumColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
@@ -1011,7 +1011,7 @@ impl Accumulator {
                 self.observe_numeric(value)
             }
             // UUID 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-13〔検討中〕・
+            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。TABLE-13〔検討中〕・
             // TASK-197、Issue #887）。
             AggregateInput::UuidColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {

@@ -494,7 +494,7 @@ fn sum_avg_min_max_on_json_column_are_rejected_but_count_is_accepted() {
         let err = core
             .execute_sql(&alice, &format!("SELECT {func}(doc) FROM {TABLE}"))
             .unwrap_err();
-        assert_eq!(err.wire_code(), "22000", "func: {func}");
+        assert_eq!(err.wire_code(), "42883", "func: {func}");
     }
 
     let result = core

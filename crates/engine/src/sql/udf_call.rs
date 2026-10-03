@@ -934,7 +934,7 @@ pub fn define_wasm_function(
 
 /// UDF 本体式が「パラメータ参照・数値リテラル・演算子・組み込み関数・登録済み UDF
 /// 呼び出しのみ」で構成されているかを構造的に検査する（列参照禁止＝閉じた関数）。
-/// 未登録の呼び出し名・引数個数の不整合はここで拒否する（`22000`）。自己参照・
+/// 未登録の呼び出し名・引数個数の不整合はここで拒否する（`42883`。Issue #1349）。自己参照・
 /// 前方参照は、レジストリが「検証成功後にのみ挿入する」追記専用のため構造上
 /// 発生し得ない（本関数の時点で `registry` に現在定義中の名前はまだ存在しない）。
 fn validate_closed_expr(
@@ -974,13 +974,13 @@ fn validate_closed_expr(
             // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
             if name.eq_ignore_ascii_case("concat") {
                 if args.is_empty() {
-                    return Err(SqlSurfaceError::invalid_input(
+                    return Err(SqlSurfaceError::undefined_function(
                         "function concat expects at least 1 argument, got 0",
                     ));
                 }
             } else if name.eq_ignore_ascii_case("substr") {
                 if !matches!(args.len(), 2 | 3) {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects 2 or 3 arguments, got {}",
                         args.len()
                     )));
@@ -992,7 +992,7 @@ fn validate_closed_expr(
                 // 呼び出し時（`bind_call`）に第 1 引数が Text リテラルか検査する
                 // ため、定義時はここで arity（常に 2）のみ検査する。
                 if args.len() != 2 {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects 2 argument(s), got {}",
                         args.len()
                     )));
@@ -1003,7 +1003,7 @@ fn validate_closed_expr(
                 // 妥当性のみ検査する（実際の variant 解決は呼び出し時の
                 // `bind_call` が行う）。
                 if !(1..=2).contains(&args.len()) {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects 1 or 2 argument(s), got {}",
                         args.len()
                     )));
@@ -1011,7 +1011,7 @@ fn validate_closed_expr(
             } else if let Some(builtin) = builtin_from_name(name) {
                 let (param_types, _ret) = builtin_signature(builtin);
                 if args.len() != param_types.len() {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects {} argument(s), got {}",
                         param_types.len(),
                         args.len()
@@ -1019,7 +1019,7 @@ fn validate_closed_expr(
                 }
             } else if let Some(def) = registry.get(name) {
                 if args.len() != def.params.len() {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects {} argument(s), got {}",
                         def.params.len(),
                         args.len()
@@ -1029,7 +1029,7 @@ fn validate_closed_expr(
                 // WASM UDF（TASK-149）は ABI 固定シグネチャ
                 // `(Vector, Scalar) -> Scalar` のみのため、常に 2 引数固定。
                 if args.len() != WASM_CALL_ARITY {
-                    return Err(SqlSurfaceError::invalid_input(format!(
+                    return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects {WASM_CALL_ARITY} argument(s), got {}",
                         args.len()
                     )));
@@ -1888,7 +1888,7 @@ fn bind_call(
             1 => BuiltinFn::Round1,
             2 => BuiltinFn::Round2,
             n => {
-                return Err(SqlSurfaceError::invalid_input(format!(
+                return Err(SqlSurfaceError::undefined_function(format!(
                     "function round expects 1 or 2 argument(s), got {n}"
                 )));
             }
@@ -1920,7 +1920,7 @@ fn bind_call(
     if let Some(builtin) = builtin_from_name(name) {
         let (param_types, ret) = builtin_signature(builtin);
         if args.len() != param_types.len() {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::undefined_function(format!(
                 "function {name} expects {} argument(s), got {}",
                 param_types.len(),
                 args.len()
@@ -1953,7 +1953,7 @@ fn bind_call(
         // 束縛済み実引数の対応表で束縛し直す（インライン展開。呼び出し元は
         // 展開後の `BoundExpr` のみを受け取り、`registry` を実行時に参照しない）。
         if args.len() != def.params.len() {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::undefined_function(format!(
                 "function {name} expects {} argument(s), got {}",
                 def.params.len(),
                 args.len()
@@ -1988,7 +1988,7 @@ fn bind_call(
         // のため引数個数・型は常にこの形で検査する（組み込み `vec_div` と同じ
         // 引数検査の流儀）。
         if args.len() != WASM_CALL_ARITY {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::undefined_function(format!(
                 "function {name} expects {WASM_CALL_ARITY} argument(s), got {}",
                 args.len()
             )));
@@ -2031,7 +2031,7 @@ fn bind_concat(
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     if args.is_empty() {
-        return Err(SqlSurfaceError::invalid_input(
+        return Err(SqlSurfaceError::undefined_function(
             "function concat expects at least 1 argument, got 0",
         ));
     }
@@ -2127,7 +2127,7 @@ fn bind_date_part_or_trunc(
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     if args.len() != 2 {
-        return Err(SqlSurfaceError::invalid_input(format!(
+        return Err(SqlSurfaceError::undefined_function(format!(
             "function {lower_name} expects 2 argument(s), got {}",
             args.len()
         )));
@@ -2136,12 +2136,12 @@ fn bind_date_part_or_trunc(
     // 直前の args.len() != 2 検査により両方 Some になるが、兄弟実装（bind_substr・
     // bind_concat）の様式に合わせ、ここでも fail-closed な Err 経路を明示する。
     let field_arg = args.first().ok_or_else(|| {
-        SqlSurfaceError::invalid_input(format!(
+        SqlSurfaceError::undefined_function(format!(
             "function {lower_name} expects 2 argument(s), got 0"
         ))
     })?;
     let src_arg = args.get(1).ok_or_else(|| {
-        SqlSurfaceError::invalid_input(format!(
+        SqlSurfaceError::undefined_function(format!(
             "function {lower_name} expects 2 argument(s), got 1"
         ))
     })?;
@@ -2230,7 +2230,7 @@ fn bind_substr(
         2 => BuiltinFn::Substr2,
         3 => BuiltinFn::Substr3,
         got => {
-            return Err(SqlSurfaceError::invalid_input(format!(
+            return Err(SqlSurfaceError::undefined_function(format!(
                 "function {name} expects 2 or 3 arguments, got {got}"
             )))
         }
@@ -3397,7 +3397,7 @@ mod tests {
         // `vec_norm` は 1 引数だが 0 引数で呼び出す本体を定義しようとする。
         let mut registry = UdfRegistry::default();
         let err = define_function(&mut registry, "f", &[], &call("vec_norm", vec![])).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
         assert!(registry.is_empty());
     }
 
@@ -3413,7 +3413,7 @@ mod tests {
             &call("g", vec![ident("v"), ident("v")]),
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
         assert_eq!(registry.len(), 1, "h should not have been registered");
     }
 
@@ -3959,7 +3959,7 @@ mod tests {
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
         let err = bind_expr(&call("round", vec![]), &schema, &registry, &mut budget).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "42883");
     }
 
     #[test]

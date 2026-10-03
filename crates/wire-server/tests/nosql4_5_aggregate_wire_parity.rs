@@ -805,7 +805,7 @@ fn rejections_do_not_poison_session_token() {
     let overflow_body =
         br#"{"op":"aggregate","table":"docs","aggregates":[{"fn":"sum","column":"embedding"}]}"#;
     let resp1 = post(addr, &token, overflow_body);
-    assert_eq!(http_common::wire_code_of(&resp1), "22000", "resp={resp1:?}");
+    assert_eq!(http_common::wire_code_of(&resp1), "42883", "resp={resp1:?}");
 
     let max = engine::sql::allowlist::MAX_AGGREGATE_ITEMS;
     let items: Vec<String> = (0..=max)

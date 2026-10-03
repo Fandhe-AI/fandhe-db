@@ -523,7 +523,7 @@ NoSQL の insert/update/filter に送出経路を持つ。エラーメッセー�
   経路（Issue #843/#844）は TEXT と同じ辞書・同じ等価意味論のため無変更で
   安全。`LIKE`（前方一致）は TEXT 限定のまま `22000` で拒否。
 - 集計: `COUNT(<enum列>)`（非 NULL 行数）のみ受理し `AggregateInput::
-  EnumColumn` を新設。`SUM`/`AVG`/`MIN`/`MAX` は `22000`（PostgreSQL の enum
+  EnumColumn` を新設。`SUM`/`AVG`/`MIN`/`MAX` は `42883`（Issue #1349）（PostgreSQL の enum
   は宣言順で `MIN`/`MAX` 比較できるが、辞書順で代用すると意味論が食い違う
   ため意図的に受理しない）。`GROUP BY` キー列は TEXT 限定のまま対象外。
 - UDF／式評価・hybrid 本文列・`USING PLAN`・scoring_boost への ENUM 列の

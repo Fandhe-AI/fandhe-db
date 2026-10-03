@@ -401,7 +401,7 @@ fn bound_aggregate_item_bind_rejects_vector_column_for_sum_avg_min_max_but_accep
             &schema_val,
         )
         .expect_err("VECTOR column with SUM/AVG/MIN/MAX must be rejected");
-        assert_eq!(err.wire_code(), "22000", "func={func:?}");
+        assert_eq!(err.wire_code(), "42883", "func={func:?}");
     }
     BoundAggregateItem::bind(
         AggregateFunc::Count,
@@ -422,7 +422,7 @@ fn bound_aggregate_item_bind_rejects_text_column_for_sum_and_avg() {
             &schema_val,
         )
         .expect_err("TEXT column with SUM/AVG must be rejected");
-        assert_eq!(err.wire_code(), "22000", "func={func:?}");
+        assert_eq!(err.wire_code(), "42883", "func={func:?}");
     }
 }
 
