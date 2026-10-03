@@ -1611,8 +1611,9 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
 /// ままダミー値束縛済みの結果を再利用する）の入力になる。
 ///
 /// フィールドは非公開（構築は [`EngineCore::parse_sql_prepared`] のみ）。値は
-/// 常に `tokens` 内の [`crate::sql::lexer::Token::StringLiteral`]（Bind 時に
-/// 置換されるまでは `Token::Param`）としてのみ保持され、SQL テキストへは
+/// Bind 時に型付きリテラルトークン（文字列は `StringLiteral`、`id`・`INTEGER`・
+/// `BIGINT` は `Number`、`BOOLEAN` は `true`/`false` 識別子。Issue #1342）へ
+/// 置換されるまでは `Token::Param` として保持され、SQL テキストへは
 /// 一度も戻らない（インジェクション経路を作らない設計。`sql::params`
 /// モジュールドキュメント参照）。
 #[derive(Debug, Clone)]
@@ -3485,11 +3486,26 @@ impl EngineCore {
         // 消えるため、置換後トークン列からは判定できない）。
         let order_by_distance_literal_is_param =
             crate::sql::params::order_by_distance_literal_is_param(&tokens);
+        // Issue #1342: 2 段 parse。文字列ダミーで構造検証・型推論（INSERT の列
+        // 対応付けに `dummy_parsed` が要る）を行い、推論型から置換リテラル種別を
+        // 導出する。数値・真偽値スロットがあれば型付きダミーで再 parse して
+        // `dummy_parsed` を差し替える。等価述語のダミーフラグは種別確定後に求める
+        // （非 String 種別は `WherePredicate::Equality` にならず序数に数えない）。
+        let string_dummy_parsed =
+            self.parse_tokens(crate::sql::params::substitute_dummy(&tokens))?;
+        let param_types = self.infer_param_types(&tokens, param_count, &string_dummy_parsed);
+        let kinds: Vec<crate::sql::params::ParamLiteralKind> =
+            param_types.iter().map(|t| t.literal_kind()).collect();
         let where_equality_dummy_flags =
-            crate::sql::params::where_equality_literal_is_param(&tokens);
-        let dummy_tokens = crate::sql::params::substitute_dummy(&tokens);
-        let dummy_parsed = self.parse_tokens(dummy_tokens)?;
-        let param_types = self.infer_param_types(&tokens, param_count, &dummy_parsed);
+            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds);
+        let dummy_parsed = if kinds
+            .iter()
+            .any(|k| *k != crate::sql::params::ParamLiteralKind::String)
+        {
+            self.parse_tokens(crate::sql::params::substitute_dummy_typed(&tokens, &kinds))?
+        } else {
+            string_dummy_parsed
+        };
         Ok(PreparedSql {
             tokens,
             param_count,
@@ -3610,7 +3626,13 @@ impl EngineCore {
             ));
         }
         let decoded = crate::sql::params::decode_bind_values(&prepared.tokens, values)?;
-        let substituted = crate::sql::params::substitute_values(&prepared.tokens, &decoded)?;
+        let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
+            .param_types
+            .iter()
+            .map(|t| t.literal_kind())
+            .collect();
+        let substituted =
+            crate::sql::params::substitute_values_typed(&prepared.tokens, &decoded, &kinds)?;
         self.parse_tokens(substituted)
     }
 

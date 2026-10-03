@@ -730,3 +730,139 @@ fn using_plan_parameter_matches_literal_form() {
     assert_eq!(got, want);
     assert_eq!(got.0.len(), 2);
 }
+// --- 型付き置換（Issue #1342・WIRE-12）: 行 id・INTEGER・BOOLEAN 列 -----------
+
+#[test]
+fn typed_slots_report_column_oids() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut s = connect(addr, "alice");
+
+    assert_eq!(
+        describe_statement_oids(
+            &mut s,
+            "SELECT id FROM documents WHERE id = $1 LIMIT 5",
+            &[]
+        ),
+        vec![1700]
+    );
+    assert_eq!(
+        describe_statement_oids(&mut s, "SELECT id FROM documents WHERE n = $1 LIMIT 5", &[]),
+        vec![23]
+    );
+    assert_eq!(
+        describe_statement_oids(
+            &mut s,
+            "SELECT id FROM documents WHERE flag = $1 LIMIT 5",
+            &[]
+        ),
+        vec![16]
+    );
+    assert_eq!(
+        describe_statement_oids(
+            &mut s,
+            "INSERT INTO documents (id, embedding, n, flag) VALUES ($1, '[0.1,0.2,0.3]', $2, $3) USING OPERATION_ID 'x'",
+            &[]
+        ),
+        vec![1700, 23, 16]
+    );
+    // 宣言 OID の echo は従来どおり。
+    assert_eq!(
+        describe_statement_oids(
+            &mut s,
+            "SELECT id FROM documents WHERE n = $1 LIMIT 5",
+            &[21]
+        ),
+        vec![21]
+    );
+}
+
+#[test]
+fn typed_text_binding_matches_literal_form_and_tenant_boundary_holds() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut alice = connect(addr, "alice");
+    let mut alice_simple = connect(addr, "alice");
+    let mut bob = connect(addr, "bob");
+
+    let insert = "INSERT INTO documents (id, embedding, body, n, flag) VALUES ($1, '[0.1,0.2,0.3]', 'typed', $2, $3) USING OPERATION_ID $4";
+    let (_, tag) = run_extended(
+        &mut alice,
+        insert,
+        &[],
+        &[Some(b"7"), Some(b"-5"), Some(b"t"), Some(b"typed-op")],
+    );
+    assert_eq!(tag, "INSERT 0 1");
+
+    for (sql, vals, lit) in [
+        (
+            "SELECT id, body FROM documents WHERE id = $1 LIMIT 5",
+            &b"7"[..],
+            "SELECT id, body FROM documents WHERE id = 7 LIMIT 5",
+        ),
+        (
+            "SELECT id, body FROM documents WHERE flag = $1 LIMIT 5",
+            &b"TRUE"[..],
+            "SELECT id, body FROM documents WHERE flag = true LIMIT 5",
+        ),
+        (
+            "SELECT id, body FROM documents WHERE flag = $1 LIMIT 5",
+            &b"f"[..],
+            "SELECT id, body FROM documents WHERE flag = false LIMIT 5",
+        ),
+        (
+            "SELECT id, body FROM documents WHERE n = $1 LIMIT 5",
+            &b"3"[..],
+            "SELECT id, body FROM documents WHERE n = 3 LIMIT 5",
+        ),
+    ] {
+        let got = run_extended(&mut alice, sql, &[], &[Some(vals)]);
+        let want = run_simple(&mut alice_simple, lit);
+        assert_eq!(got, want, "{sql}");
+    }
+    let by_id = run_extended(
+        &mut alice,
+        "SELECT id FROM documents WHERE id = $1 LIMIT 5",
+        &[],
+        &[Some(b"7")],
+    );
+    assert_eq!(by_id.0.len(), 1);
+    // 他テナントの行は束縛した id でも見えない。
+    let other = run_extended(
+        &mut bob,
+        "SELECT id FROM documents WHERE id = $1 LIMIT 5",
+        &[],
+        &[Some(b"7")],
+    );
+    assert!(other.0.is_empty());
+
+    // 束縛した DELETE がリテラル形と同じく 1 行を消す。
+    let (_, tag) = run_extended(
+        &mut alice,
+        "DELETE FROM documents WHERE id = $1 USING OPERATION_ID $2",
+        &[],
+        &[Some(b"7"), Some(b"typed-del")],
+    );
+    assert_eq!(tag, "DELETE 1");
+}
+
+#[test]
+fn typed_slots_reject_malformed_values_with_22p02_and_binary_with_0a000() {
+    let (core, _g) = new_core();
+    seed(&core, 1);
+    let addr = spawn(core);
+    let mut s = connect(addr, "alice");
+    let int_sql = "SELECT id FROM documents WHERE n = $1 LIMIT 5";
+    let bool_sql = "SELECT id FROM documents WHERE flag = $1 LIMIT 5";
+    let id_sql = "SELECT id FROM documents WHERE id = $1 LIMIT 5";
+
+    for bad in [&b"abc"[..], b"5.0", b"+5", b"1 OR 1=1"] {
+        send_pbes_expect_error(&mut s, int_sql, &[], &[], &[Some(bad)], "22P02");
+    }
+    send_pbes_expect_error(&mut s, bool_sql, &[], &[], &[Some(b"maybe")], "22P02");
+    send_pbes_expect_error(&mut s, id_sql, &[], &[], &[Some(b"abc")], "22P02");
+    // 数値・真偽値スロットのバイナリ format は text として誤解釈せず 0A000。
+    send_pbes_expect_error(&mut s, int_sql, &[], &[1], &[Some(b"1234")], "0A000");
+    send_pbes_expect_error(&mut s, bool_sql, &[], &[1], &[Some(b"t")], "0A000");
+    send_pbes_expect_error(&mut s, id_sql, &[], &[1], &[Some(b"1")], "0A000");
+}

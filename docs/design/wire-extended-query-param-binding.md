@@ -21,7 +21,7 @@ wire 側（`crates/wire-server/src/extended_query.rs`）の Parse／Describe(S)�
 - 宣言件数がプレースホルダ数を超える Parse は `08P01`（PostgreSQL は受理するが、
   fail-closed な逸脱）。
 - Bind: 値数が要求数と異なれば `08P01`。パラメータ format code は 0・1 以外を `08P01`。
-  binary は text 系スロット（推論がバイナリ対応かつ宣言 OID が 0・25・1043）だけ
+  binary は text 系スロット（推論がバイナリ対応・置換種別が String かつ宣言 OID が 0・25・1043）だけ
   受理し、UTF-8 バイト恒等でそのまま `bind_prepared` へ渡す。それ以外のバイナリは `0A000`
   （WIRE-14）。
 - 値の形式不正（非 UTF-8・NUL）は `22P02` へ移行した（従来 `22000`）。NULL は据え置き
@@ -155,18 +155,37 @@ prepared_params.rs` で固定）。
 WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形 UPDATE／DELETE の
 `WHERE` にも同じ判定がそのまま適用される）。
 
-## 値の形式（スコープ縮小）
+## 値の形式（型付き置換。Issue #1342）
 
-すべてのプレースホルダは常に `Token::StringLiteral` として置換する。`id` 列・
-`BOOLEAN` 列など、生の `Token::Number`／`Token::Ident("true"/"false")` を
-要求する位置（例: `INSERT ... VALUES ($1)` の `$1` が `id` 列や `BOOLEAN` 列に
-対応する場合）は本バージョンのスコープ外であり、束縛すると「同じ値をクォート
-したリテラルで書いた SQL」と同一の型不一致エラー（`bind_insert` 等、既存の
-構造検証・束縛契約そのまま）で拒否される——これは fail-closed な既知の制約で
-あり誤動作ではない。`VECTOR`・`BYTEA` 列は `StringLiteral` 形のまま構造検証を
-通り、実際のリテラル形式の妥当性（角括弧・`\x` 接頭辞等）は既存の
-`bind_insert`（Bind 後、`parse_tokens` を経由した実行時）が判定する——
-リテラル SQL テキストで書いた場合と完全に同じ検証経路を通る。
+置換トークンは `$n` の推論型から導く置換リテラル種別で決まり、字句解析器が同じ値を
+リテラルで書いた SQL から生成するトークン列と同一になるよう組み立てる（リテラル
+同値性を構造上保証する。第 2 の実行器・パーサーは作らない）。
+
+| 種別 | 対象列 | 置換トークン | 形式不正 |
+| ---- | ------ | ------------ | -------- |
+| String | 上記以外（`TEXT`・`ENUM`・`VECTOR` 等・未参照番号） | `Token::StringLiteral` | なし（値の意味検証は束縛後の既存経路） |
+| Integer | `id`・`INTEGER`・`BIGINT` | `Number`（負値は `Punct('-')` + `Number`） | `22P02` |
+| Boolean | `BOOLEAN` | `Ident("true"/"false")` | `22P02` |
+
+- 整数の文法は `-?[0-9]+` のみ（`+` 符号・空白・小数・指数は fail-closed で拒否。
+  PostgreSQL の `int4in` より狭い）。値域外は束縛後の既存経路がリテラル形と同じ
+  コードで拒否する（`INTEGER` は `22003`、`id` の負値・u64 超過は `22000`）。
+- 真偽値は PostgreSQL の `boolin` 互換（前後空白除去・大文字小文字無視。
+  `t`/`true`/`yes`/`on`/`1` 系と `f`/`false`/`no`/`off`/`0` 系。`o` 単独は曖昧なので拒否）。
+- エラーメッセージは値本文を含めない（`$n` の番号と期待型のみ）。
+- Parse は 2 段: 文字列ダミーで構造検証・型推論を行い、数値・真偽値スロットがあれば
+  型付きダミー（`Number("0")`／`Ident("false")`）で再 parse して Describe 用の
+  `dummy_parsed` とする。`WHERE <列> = $n` のダミーフラグ（ENUM 語彙照合の省略判定）は
+  種別確定後に求め、非 String 種別の `$n` は序数に数えない（置換後は
+  `WherePredicate::Equality` にならないため。数えると別述語へ省略が誤適用される）。
+- 数値・真偽値スロットは text 形式のみ受理し、バイナリ形式は `0A000`（バイナリを UTF-8
+  として誤解釈して受理しない。バイナリ数値の復号は WIRE-14 の申し送り）。
+- 既知の制約: `WHERE <整数列> = -N` はリテラル形でも式項の単項マイナス未対応で `42601`
+  になり、`$n` に負値を束縛してもリテラル同値で同じ結果になる（`INSERT` の値位置は受理）。
+- Parse 後に列型が変わった場合は種別が Parse 時点のままのため、既存の型不一致エラー
+  （fail-closed）になる。
+- `VECTOR`・`BYTEA` 列は `StringLiteral` 形のまま構造検証を通り、リテラル形式の妥当性は
+  既存の `bind_insert`（Bind 後）が判定する。
 
 ## NULL パラメータ値
 
@@ -216,7 +235,11 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
 - wire 側（Parse の宣言型受理・`ParameterDescription`・Bind の値保持・
   `bind_prepared` 結線）は #934 マージ後の別 PR。
 - パラメータのバイナリ形式復号（WIRE-14）。
-- 数値列（`id`）・`BOOLEAN` 列への `$n` 束縛（上記「値の形式」参照）。
+- `REAL`／`DOUBLE`／`NUMERIC`／`DATE`／`TIMESTAMP`／`UUID`／`BYTEA` 列への型付き `$n` 束縛、
+  および数値・真偽値パラメータのバイナリ復号（WIRE-14。psycopg 3 の Python `int`／`bool` は
+  バイナリ送信のため引き続き `0A000`）。
+- 非 text スロット（`REAL`／`BYTEA`／`UUID` 等）で宣言 OID 0 のバイナリ値を UTF-8 恒等で
+  受理している点（本変更は `id`・`INTEGER`・`BIGINT`・`BOOLEAN` のみ是正）。
 - NULL パラメータ値の意味論的な位置別処理（`USING OPERATION_ID $n` へ NULL を
   「省略と同義」として通す等）。
 - 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`UPDATE ... SET

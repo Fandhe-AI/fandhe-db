@@ -429,3 +429,9 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **変更箇所**: `crates/wire-server/tests/three_client_e2e.rs`（`three_clients_run_partitioned_dml_and_receive_vd001_vd002_25001`）、`tests/three_client/{psycopg_client.py,pg_client.js}`（opt-in の `WIRE_PRINT_COMMAND_TAG`。`"1"` のみ受理で他は fail-closed）、`docs/design/three-client-e2e-harness.md`、`Makefile` のヘルプ文。
 - **網羅ガード**: 更新対象なし（HTTP 側 `parity_matrix_covers_every_nosql_op` は #1315 で対応済み）。
 - **対象外（申し送り）**: 実行中ジョブの別接続からの取り消し、CancelRequest・`statement_timeout`、拡張クエリ・TLS 経由の分割実行。
+
+**Issue #1342（feat(wire): 行 id・INTEGER・BOOLEAN 列の位置の `$n` を束縛できるようにする。WIRE-12・ERR-1・ERR-2・ERR-4 ポインタ）**: 拡張クエリの `$n` を、推論型に応じた型付きリテラル（`id`・`INTEGER`・`BIGINT` は整数、`BOOLEAN` は真偽値識別子）へ置換するようにした。字句解析器がリテラルから生成するのと同一のトークン列を組み立てるため、束縛結果はリテラル形の `ParsedSql` と一致する。形式不正は `22P02`（値本文を含めない）。
+
+- **変更箇所**: `engine` の `sql::params`（`ParamLiteralKind`・型付き置換・型付きダミーフラグ・`PreparedParamType::binds_as_text_literal`）、`core.rs` の `parse_sql_prepared`（2 段 parse）・`bind_prepared`、`wire-server` の `build_param_slots`（数値・真偽値スロットのバイナリを `0A000` へ）、`docs/design/wire-extended-query-param-binding.md`。
+- **網羅ガード**: 層 A（`crates/engine/tests/prepared_params.rs`）にリテラル同値・Describe 同値・`22P02`・RLS・ENUM ダミーフラグ序数ずれの回帰、`crates/wire-server/tests/wire12_param_binding.rs` に OID 公告・実行・テナント境界・`22P02`・バイナリ `0A000` を追加。
+- **対象外（申し送り）**: `WHERE <整数列> = -N` の `42601`（リテラル形でも同じ既存制約）、`REAL`／`DOUBLE`／`NUMERIC`／日時／`UUID`／`BYTEA` の型付き束縛、数値・真偽値のバイナリ復号（WIRE-14）、非 text スロットの宣言 OID 0 バイナリ UTF-8 恒等受理、NULL パラメータ。
