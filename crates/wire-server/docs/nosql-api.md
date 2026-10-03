@@ -672,7 +672,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
  "add_column": {"name": "n", "type": "integer", "not_null": true, "default": 0}}
 ```
 
-意図した差分: 制御文字（改行など）を含む文字列の `default` は、`create_table` と同じく NoSQL では `42601` で拒否する（SQL 表層では受理される）。
+意図した差分: 制御文字（改行など）を含む文字列の `default` は、`create_table` と同じく NoSQL では `42601` で拒否する（SQL 表層では受理される）。また数値の `default` は指数表記（`1e5`・`1E-3` 等。JSON としては有効）を `42601` で拒否する（SQL 表層の数値リテラルも指数表記を受理しないため SQL との差分ではなく、`create_table` の `default` と同じ受理形式）。`100000`・`0.001` のように通常の十進表記で渡す。
 
 要求例（`drop_table`）:
 
