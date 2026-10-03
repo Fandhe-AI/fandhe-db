@@ -6,6 +6,16 @@
 //!
 //! 未対応の記号は許可リスト外として [`LexError`] で拒否する（拒否リストではなく、
 //! 既知トークンのみを許可リストとして認識する構造）。
+//!
+//! `--` 行コメントと `/* */` ブロックコメント（PostgreSQL と同じく入れ子可）は空白と
+//! 同様に読み飛ばす（WIRE-16・TASK-219。Issue #1346）。二重引用符識別子は、中身が
+//! 引用符なしでもそのまま 1 個の [`Token::Ident`] として字句解析できる語（英数字と
+//! `_` のみ・先頭は英字か `_`・予約語でない）に限って受理する。ビュー本体・CHECK 式は
+//! 識別子を引用符なしで永続 SQL へ描画して再字句解析するため（`render_tokens` 等）、
+//! 中身を自由にすると再解析で別の文・別のトークンへ化ける注入経路になる。
+//! コメント・引用の終端走査（[`line_comment_end`]・[`block_comment_end`]・
+//! [`quoted_identifier_end`]）は `sql::statement_splitter` と共有し、分割器と lexer の
+//! 解釈が食い違わないようにしている。
 
 /// トークナイザが認識する字句の種類。
 ///
@@ -207,6 +217,24 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             continue;
         }
 
+        // コメントもトークンを生成しないため空白と同じ位置（上限判定より前）で
+        // 読み飛ばす。`--`／`/*` の検出は `-`／`/` を `Punct` 化する分岐より必ず先に
+        // 行う（順序を入れ替えるとコメントが演算子の列に化ける）。
+        if c == '-' && input.get(offset..).is_some_and(|r| r.starts_with("--")) {
+            advance_to(&mut chars, line_comment_end(input, offset));
+            continue;
+        }
+        if c == '/' && input.get(offset..).is_some_and(|r| r.starts_with("/*")) {
+            let Some(end) = block_comment_end(input, offset) else {
+                return Err(LexError {
+                    message: "unterminated block comment".to_string(),
+                    byte_offset: offset,
+                });
+            };
+            advance_to(&mut chars, end);
+            continue;
+        }
+
         if tokens.len() >= MAX_TOKEN_COUNT {
             return Err(LexError {
                 message: "too many tokens".to_string(),
@@ -214,43 +242,44 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             });
         }
 
-        // SQL コメントは許可リスト外として fail-closed に拒否する（緩和は後続タスク判断）。
-        // TASK-79・SQL-9: `-`（減算）・`/`（除算）を式演算子として追加する際も、
-        // コメント検出は演算子トークン化より必ず先に行う（順序を入れ替えると
-        // `--`/`/*` を無条件に許可してしまう fail-closed の後退になる）。
         if c == '-' {
-            let mut lookahead = chars.clone();
-            lookahead.next();
-            if matches!(lookahead.peek(), Some(&(_, '-'))) {
-                return Err(LexError {
-                    message: "SQL comments are not supported".to_string(),
-                    byte_offset: offset,
-                });
-            }
             tokens.push(Token::Punct('-'));
             chars.next();
             continue;
         }
         if c == '/' {
-            let mut lookahead = chars.clone();
-            lookahead.next();
-            if matches!(lookahead.peek(), Some(&(_, '*'))) {
-                return Err(LexError {
-                    message: "SQL comments are not supported".to_string(),
-                    byte_offset: offset,
-                });
-            }
             tokens.push(Token::Punct('/'));
             chars.next();
             continue;
         }
 
-        // 二重引用符識別子は許可リスト外（受理範囲を単純化するため）。
+        // 二重引用符識別子（Issue #1346）。中身は引用符なしでも 1 個の `Ident` に
+        // なる語に限る（モジュールドキュメント参照）。それ以外は fail-closed に拒否。
         if c == '"' {
-            return Err(LexError {
-                message: "quoted identifiers are not supported".to_string(),
-                byte_offset: offset,
-            });
+            let Some(end) = quoted_identifier_end(input, offset) else {
+                return Err(LexError {
+                    message: "unterminated quoted identifier".to_string(),
+                    byte_offset: offset,
+                });
+            };
+            let content = input
+                .get(offset.saturating_add(1)..end.saturating_sub(1))
+                .unwrap_or("");
+            if content.is_empty() {
+                return Err(LexError {
+                    message: "zero-length quoted identifier".to_string(),
+                    byte_offset: offset,
+                });
+            }
+            if !is_plain_identifier(content) {
+                return Err(LexError {
+                    message: "unsupported quoted identifier".to_string(),
+                    byte_offset: offset,
+                });
+            }
+            tokens.push(Token::Ident(content.to_string()));
+            advance_to(&mut chars, end);
+            continue;
         }
 
         if c == '\'' {
@@ -385,6 +414,87 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
     }
 
     Ok(tokens)
+}
+
+/// `--` で始まる行コメントの終端（`\n`／`\r` の位置。無ければ入力末尾）を返す。
+/// `start` は `--` の先頭。改行自体は含めず、呼び出し側が空白として扱う。
+/// lexer の読み飛ばしと `sql::statement_splitter::split_statements` が共有する。
+pub(crate) fn line_comment_end(input: &str, start: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut j = start.saturating_add(2);
+    while let Some(&c) = bytes.get(j) {
+        if c == b'\n' || c == b'\r' {
+            break;
+        }
+        j = j.saturating_add(1);
+    }
+    j.min(bytes.len())
+}
+
+/// `/*` で始まるブロックコメントの終端の直後の位置を返す。PostgreSQL と同じく
+/// 入れ子を数える（再帰ではなく深さカウンタ。追加の確保なし）。未終端なら `None`。
+/// `start` は `/*` の先頭。lexer と分割器が共有する。
+pub(crate) fn block_comment_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut j = start.saturating_add(2);
+    let mut depth: usize = 1;
+    loop {
+        let c = *bytes.get(j)?;
+        let n = bytes.get(j.saturating_add(1)).copied();
+        if c == b'/' && n == Some(b'*') {
+            depth = depth.saturating_add(1);
+            j = j.saturating_add(2);
+        } else if c == b'*' && n == Some(b'/') {
+            depth = depth.saturating_sub(1);
+            j = j.saturating_add(2);
+            if depth == 0 {
+                return Some(j);
+            }
+        } else {
+            j = j.saturating_add(1);
+        }
+    }
+}
+
+/// `"` で始まる二重引用符識別子の閉じ `"` の直後の位置を返す。連続 2 個の `"` は
+/// エスケープとして継続する（領域の境界を PostgreSQL と一致させる）。未終端なら
+/// `None`。中身の妥当性は検証しない（lexer の `is_plain_identifier` が担う）。
+/// `start` は開き `"` の位置。lexer と分割器が共有する。
+pub(crate) fn quoted_identifier_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut j = start.saturating_add(1);
+    loop {
+        let c = *bytes.get(j)?;
+        if c == b'"' {
+            if bytes.get(j.saturating_add(1)) == Some(&b'"') {
+                j = j.saturating_add(2);
+                continue;
+            }
+            return Some(j.saturating_add(1));
+        }
+        j = j.saturating_add(1);
+    }
+}
+
+/// 二重引用符識別子の中身が、引用符なしで字句解析しても同じ 1 個の `Ident` に
+/// なる語か（空でない・`[A-Za-z_][A-Za-z0-9_]*`・予約語でない）。
+fn is_plain_identifier(content: &str) -> bool {
+    let mut it = content.chars();
+    let Some(first) = it.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && keyword_from_str(content).is_none()
+}
+
+/// 字句解析するとトークンが 1 つも残らない（空白・コメントのみ）SQL か。字句解析に
+/// 失敗する入力は `false`（通常の parse 経路でエラーにする。fail-closed）。
+/// `wire-server::extended_query` の Parse が、コメントだけの文を空文
+/// （EmptyQueryResponse）として扱う判定に使う。`$n` を含み得るため
+/// [`tokenize_with_params`] で判定する。
+pub fn is_effectively_empty(sql: &str) -> bool {
+    matches!(tokenize_with_params(sql), Ok(t) if t.is_empty())
 }
 
 /// `chars` イテレータを `byte_offset` の直前まで読み飛ばす。文字列リテラル・数値・
@@ -827,19 +937,118 @@ mod tests {
         assert!(tokenize("'abc").is_err());
     }
 
-    #[test]
-    fn rejects_line_comment() {
-        assert!(tokenize("SELECT * FROM docs -- comment").is_err());
+    fn toks(sql: &str) -> Vec<Token> {
+        tokenize(sql).expect("tokenize should succeed")
+    }
+
+    fn ident(s: &str) -> Token {
+        Token::Ident(s.to_string())
     }
 
     #[test]
-    fn rejects_block_comment() {
-        assert!(tokenize("SELECT /* c */ * FROM docs").is_err());
+    fn skips_line_comment() {
+        assert_eq!(
+            toks("SELECT * FROM docs -- comment"),
+            toks("SELECT * FROM docs")
+        );
+        assert_eq!(toks("SELECT -- c\n 1"), toks("SELECT 1"));
+        assert_eq!(toks("SELECT -- c\r 1"), toks("SELECT 1"));
+        assert_eq!(toks("-- only"), vec![]);
     }
 
     #[test]
-    fn rejects_quoted_identifier() {
-        assert!(tokenize("SELECT * FROM \"docs\"").is_err());
+    fn skips_nested_block_comment() {
+        assert_eq!(
+            toks("SELECT /* c */ * FROM docs"),
+            toks("SELECT * FROM docs")
+        );
+        assert_eq!(toks("SELECT /* a /* b */ c */ 1"), toks("SELECT 1"));
+        assert_eq!(toks("/* a ; b */"), vec![]);
+    }
+
+    #[test]
+    fn rejects_unterminated_block_comment() {
+        assert!(tokenize("SELECT /* c").is_err());
+        assert!(tokenize("SELECT /* a /* b */ c").is_err());
+        assert!(tokenize("/*/").is_err());
+    }
+
+    #[test]
+    fn comment_detection_precedes_operator_tokens() {
+        assert_eq!(toks("1--1"), vec![Token::Number("1".to_string())]);
+        assert_eq!(toks("1 - -1").len(), 4);
+        assert_eq!(
+            toks("a */ b"),
+            vec![ident("a"), Token::Punct('*'), Token::Punct('/'), ident("b")]
+        );
+    }
+
+    #[test]
+    fn comment_contents_are_ignored() {
+        assert_eq!(toks("SELECT 1 -- ' \" $1"), toks("SELECT 1"));
+        assert_eq!(
+            tokenize_with_params("SELECT 1 -- $1").expect("ok"),
+            toks("SELECT 1")
+        );
+        assert_eq!(toks("SELECT /* ' \" */ 1"), toks("SELECT 1"));
+    }
+
+    #[test]
+    fn comment_markers_inside_string_literal_are_content() {
+        assert_eq!(
+            toks("'a -- b /* c'"),
+            vec![Token::StringLiteral("a -- b /* c".to_string())]
+        );
+    }
+
+    #[test]
+    fn comments_do_not_count_toward_token_limit() {
+        let base = "*".repeat(MAX_TOKEN_COUNT);
+        assert!(tokenize(&format!("{base}/* c */")).is_ok());
+        assert!(tokenize(&format!("{base}-- c")).is_ok());
+    }
+
+    #[test]
+    fn accepts_plain_quoted_identifier() {
+        assert_eq!(toks("SELECT * FROM \"docs\""), toks("SELECT * FROM docs"));
+        assert_eq!(toks("\"Docs\""), vec![ident("Docs")]);
+        assert_eq!(toks("\"_a1\""), vec![ident("_a1")]);
+    }
+
+    #[test]
+    fn rejects_unsafe_quoted_identifiers() {
+        for sql in [
+            "\"\"",
+            "\"a b\"",
+            "\"a\"\"b\"",
+            "\"\u{e9}\"",
+            "\"1a\"",
+            "\"select\"",
+            "\"SELECT\"",
+            "\"Limit\"",
+            "\"abc",
+            "\"a.b\"",
+            "\"a;b\"",
+            "\"a--\"",
+        ] {
+            assert!(tokenize(sql).is_err(), "should reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn quoted_identifier_error_does_not_leak_content() {
+        let err = tokenize("\"a b\"").expect_err("rejected");
+        assert!(!err.message.contains('a'));
+    }
+
+    #[test]
+    fn is_effectively_empty_cases() {
+        assert!(is_effectively_empty(""));
+        assert!(is_effectively_empty("  -- c"));
+        assert!(is_effectively_empty("/* c */ -- d"));
+        assert!(!is_effectively_empty("SELECT 1"));
+        assert!(!is_effectively_empty("/* unterminated"));
+        assert!(!is_effectively_empty("'x"));
     }
 
     #[test]

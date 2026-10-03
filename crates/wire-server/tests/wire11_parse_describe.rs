@@ -177,6 +177,36 @@ fn parse_of_empty_query_then_describe_returns_no_data() {
     stream.shutdown(Shutdown::Write).ok();
 }
 
+/// コメントだけの Parse は空文として扱い（Issue #1346）、Describe は
+/// `ParameterDescription(0)` + `NoData`、Execute は `EmptyQueryResponse` を返す。
+#[test]
+fn parse_of_comment_only_query_is_an_empty_statement() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("c1", "-- only a comment", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1');
+
+    send_length_prefixed_message(&mut stream, b'D', &describe_body(b'S', "c1"));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b't', "expected ParameterDescription");
+    assert_eq!(body, 0i16.to_be_bytes());
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'n', "expected NoData");
+
+    send_length_prefixed_message(&mut stream, b'B', &common::bind_body("", "c1"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
+    send_length_prefixed_message(&mut stream, b'E', &common::execute_body("", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'I', "expected EmptyQueryResponse");
+
+    stream.shutdown(Shutdown::Write).ok();
+}
+
 /// `SELECT` の Describe が返す `RowDescription` の列名は、同一 SQL を簡易
 /// クエリで実行した場合の `RowDescription` と一致する（受け入れ条件 3）。
 #[test]

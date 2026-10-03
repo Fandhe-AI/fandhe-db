@@ -537,10 +537,84 @@ fn single_statement_behavior_is_unchanged() {
     expect_error_response_with_sqlstate(&mut stream, "42P01");
     read_ready_for_query(&mut stream);
 
-    // コメントを含む文は分割せず、元テキスト全体を `42601` として拒否する
+    // 未終端のブロックコメントは分割せず、元テキスト全体を `42601` として拒否する
     // （1 文目の応答は出ない）。
-    send_simple_query(&mut stream, "SELECT 1 -- x\n; SELECT 2");
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM docs LIMIT 1; /* x ; SELECT id FROM docs LIMIT 1",
+    );
     expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}
+
+/// コメント・二重引用符識別子を含む文を受理する（Issue #1346）。コメント内の `;` は
+/// 区切りにならず、コメントだけの断片は空文として無視される。
+#[test]
+fn comments_and_quoted_identifiers_are_accepted() {
+    let (core, _guard) = new_core_three_tenant_docs();
+    let mut stream = spawn_with_alice(core);
+
+    // 行コメントを挟んだ 2 文。
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM docs LIMIT 1 -- x ; ignored\n; SELECT lang FROM docs LIMIT 1",
+    );
+    assert_eq!(read_row_description(&mut stream), vec!["id"]);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_row_description(&mut stream), vec!["lang"]);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // 末尾のコメントだけの断片は単一文と同じ応答。
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 1; -- done");
+    assert_eq!(read_row_description(&mut stream), vec!["id"]);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // コメントだけは EmptyQueryResponse。
+    for sql in ["-- only", "/* only */", ";-- c", "/* a */ ; /* b */"] {
+        send_simple_query(&mut stream, sql);
+        expect_empty_query_response(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+
+    // 二重引用符識別子（列名・テーブル名）。
+    send_simple_query(&mut stream, "SELECT \"id\" FROM \"docs\" LIMIT 1");
+    assert_eq!(read_row_description(&mut stream), vec!["id"]);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // 中身が許可形でない引用符識別子・未終端の引用符は `42601`。
+    for sql in [
+        "SELECT \"id\" FROM \"do cs\" LIMIT 1",
+        "SELECT \"id\" FROM \"select\" LIMIT 1",
+        "SELECT \"id FROM docs LIMIT 1",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "42601");
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// 引用符付きテーブル名でも RLS（テナント境界）は同じく適用される。
+#[test]
+fn quoted_table_name_keeps_tenant_visibility() {
+    let (core, _guard) = new_core_three_tenant_docs();
+    let mut stream = spawn_with_bob(core);
+
+    send_simple_query(&mut stream, "SELECT id FROM \"docs\" LIMIT 10");
+    let _columns = read_row_description(&mut stream);
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(read_data_row(&mut stream)[0].clone().expect("id"));
+    }
+    ids.sort();
+    assert_eq!(ids, vec!["1", "2", "3"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
     read_ready_for_query(&mut stream);
 }
 /// 分割実行 DML（Issue #1129）: 複数文メッセージに `PARTITIONED` 付き DML や `CANCEL` が
