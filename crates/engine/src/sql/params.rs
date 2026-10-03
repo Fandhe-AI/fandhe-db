@@ -527,7 +527,7 @@ fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
 }
 
 /// `value` を PostgreSQL の `boolin` 互換表記で解釈し、正規形の識別子トークンへ
-/// 変換する（前後の ASCII 空白除去・大文字小文字無視。`o` 単独は曖昧なので拒否）。
+/// 変換する（前後の ASCII 空白除去・大文字小文字無視。`of` は `off` の省略形として受理し、`o` 単独は曖昧なので拒否）。
 fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
     let lowered = value
         .trim_matches(|c: char| c.is_ascii_whitespace())
@@ -536,7 +536,12 @@ fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
     let truth = if lowered == "1" || is_prefix_of("true") || is_prefix_of("yes") || lowered == "on"
     {
         Some(true)
-    } else if lowered == "0" || is_prefix_of("false") || is_prefix_of("no") || lowered == "off" {
+    } else if lowered == "0"
+        || is_prefix_of("false")
+        || is_prefix_of("no")
+        || lowered == "off"
+        || lowered == "of"
+    {
         Some(false)
     } else {
         None
@@ -1404,7 +1409,7 @@ mod typed_tests {
                 "{t:?}"
             );
         }
-        for f in ["f", "False", "no", "OFF", "0", "n"] {
+        for f in ["f", "False", "no", "OFF", "of", "0", "n"] {
             assert_eq!(
                 boolean_literal_tokens(1, f).unwrap(),
                 vec![Token::Ident("false".into())],
