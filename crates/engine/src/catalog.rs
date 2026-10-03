@@ -3615,6 +3615,18 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                     column.name
                 )));
             }
+            // JSON／JSONB の既定値は構文（JSONB は正規形も）を永続化前に検証する。
+            // カタログ decode 側が同じ検証を必須とする（`decode_schema_body`）ため、
+            // ここで拒否しないと Rust API 経由の作成が成功した後にスキーマが読み込み
+            // 不能になる（Issue #1337）。
+            if matches!(column.ty, ColumnType::Json | ColumnType::Jsonb)
+                && crate::row_codec::default_scalar(&column.ty, default).is_err()
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "column {:?} has a malformed JSON DEFAULT",
+                    column.name
+                )));
+            }
         }
     }
     if vector_column_count > 1 {
@@ -10023,6 +10035,23 @@ mod tests {
         assert_eq!(names(&storage), vec!["sib_hnsw".to_string()]);
     }
 
+    /// Rust API 直接構築の JSON／JSONB DEFAULT も永続化前に検証される
+    /// （構文不正・JSONB 非正規形は拒否、正規形は受理。Issue #1337）。
+    #[test]
+    fn validate_schema_checks_json_and_jsonb_defaults() {
+        let build = |ty: ColumnType, text: &str| {
+            let mut col = ColumnDef::new("j", ty, true);
+            col.default = Some(ColumnDefault::Text(text.to_string()));
+            TableSchema::new("docs", vec![col])
+        };
+        assert!(validate_schema(&build(ColumnType::Json, "{\"a\": 1}")).is_ok());
+        assert!(validate_schema(&build(ColumnType::Json, "{not json")).is_err());
+        assert!(validate_schema(&build(ColumnType::Jsonb, "{\"a\":1}")).is_ok());
+        // 非正規形（空白・キー順）は拒否する。
+        assert!(validate_schema(&build(ColumnType::Jsonb, "{\"b\": 1, \"a\": 2}")).is_err());
+        assert!(validate_schema(&build(ColumnType::Jsonb, "{bad")).is_err());
+    }
+
     #[test]
     fn validate_schema_rejects_more_than_one_vector_column() {
         let schema = TableSchema::new(
@@ -10117,17 +10146,28 @@ mod tests {
             (ColumnType::Jsonb, "{\"b\": 1,  \"a\":2}"),
             (ColumnType::Jsonb, "{not json"),
         ] {
+            // `encode_schema` は永続化前検証（`validate_schema`）を通るため不正値を
+            // エンコードできない。有効な目印の既定値（JSON 文字列 `"zq"`）で作った
+            // バイト列の既定値フィールド（16 進）を不正値へ差し替えて破損カタログを再現する。
             let schema = TableSchema::new(
                 "docs",
                 vec![
                     ColumnDef::new("embedding", ColumnType::Vector(4), false),
                     ColumnDef::new("j", ty, true)
-                        .with_default(ColumnDefault::Text(bad.to_string())),
+                        .with_default(ColumnDefault::Text("\"zq\"".to_string())),
                 ],
             );
             let encoded = encode_schema(&schema).expect("encode should succeed");
+            let marker = "s227a7122";
+            let bad_field = format!(
+                "s{}",
+                bad.bytes().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+            let text = String::from_utf8(encoded).expect("catalog encoding is UTF-8");
+            assert_eq!(text.matches(marker).count(), 1);
+            let corrupted = text.replace(marker, &bad_field);
             assert!(
-                decode_schema("docs", &encoded).is_err(),
+                decode_schema("docs", corrupted.as_bytes()).is_err(),
                 "malformed JSON default must be rejected: {bad}"
             );
         }
