@@ -495,8 +495,9 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **テスト**: `scalar_order_by_aggregate_explain_is_identical_across_tenants_and_independent_of_order_by`・`scalar_order_by_aggregate_explain_does_not_execute_body`・`scalar_order_by_aggregate_explain_error_codes_match_non_explain`。
 - **対象外（申し送り）**: NoSQL `aggregate` の `sort` と `explain: true` の併用、pg wire 経由の層 B 検証、ウィンドウ関数・JOIN・集合演算との EXPLAIN 併用。
 
-## Issue #1352（IN サブクエリの対象型拡大）
+## Issue #1352（投影位置のスカラーサブクエリと IN の対象型拡大）
 
 - **対象ビヘイビア**: SQL-29 (a)・RLS-10 (b)・TASK-213。
 - **変更箇所**: `crates/engine/src/sql/subquery.rs`（`validate_in_target_column` が `REAL`／`DOUBLE PRECISION` と疑似列 `id` を受理。浮動小数の distinct 集合を式述語の `Or` へ展開）、`crates/engine/tests/sql29_subquery_scalar.rs`、`docs/design/sql-subquery.md`。公開 enum の変更なし。
+- **投影位置のスカラーサブクエリ**: `sql::allowlist`（`ScalarSubqueryItem`・SELECT リスト解析）、`sql::subquery`（`resolve_scalar_projection_items`・`merge_scalar_projection_items`）、`core.rs` の `Statement::Scan` アーム。`crates/engine/tests/sql29_projection_subquery.rs`。詳細は `docs/design/sql-subquery.md`。
 - **性質**: 内側の行数に依存しない静的な値族検証、他テナント行が結果・エラーを変えない。非有限値は `22000`。

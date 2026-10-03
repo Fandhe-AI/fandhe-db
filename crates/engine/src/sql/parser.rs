@@ -6006,6 +6006,14 @@ pub(crate) fn bind_scan_with_dummy_flags(
     udfs: &crate::sql::udf_call::UdfRegistry,
     dummy_equality_flags: &[bool],
 ) -> Result<BoundScan, SqlSurfaceError> {
+    // Issue #1352: 投影位置のスカラーサブクエリは `core.rs` の `Statement::Scan`
+    // アームが解決・合流してから束縛へ渡す（解決済みの文は項目を空にして渡す）。
+    // 解決を経ずに届いた場合（Describe 等）に投影列を黙って落とさないよう拒否する。
+    if !stmt.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subquery in the SELECT list is not allowed in this context",
+        ));
+    }
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;

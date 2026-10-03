@@ -4,7 +4,7 @@
 //! `CleanupGuard`、実 `Storage`＋`CpuScalarProvider`、`EngineCore::execute_sql` を
 //! production 経路として検証）。期待値はテスト側で素朴に計算した独立オラクル。
 //!
-//! 対象外（このファイルでは拒否の確認のみ）: 投影位置のスカラーサブクエリ・逆向き比較・
+//! 対象外（このファイルでは拒否の確認のみ）: 式内の投影位置スカラーサブクエリ・逆向き比較・
 //! 式への埋め込み・相関参照・拡張クエリプロトコルの `$n` 併用。
 
 use engine::catalog::{ColumnDef, ColumnType, EnumTypeDef, TableSchema};
@@ -389,10 +389,11 @@ fn scalar_static_validation_and_unsupported_forms() {
         (format!("SELECT id FROM {ITEMS} WHERE name = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 100"), "22000"),
         // 未知の対象列。
         (format!("SELECT id FROM {ITEMS} WHERE nope = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 100"), "22000"),
-        // 逆向き比較・式への埋め込み・投影位置。
+        // 逆向き比較・式への埋め込み・投影位置の式内への埋め込み
+        // （項目全体の投影位置サブクエリは Issue #1352 で対応。`sql29_projection_subquery.rs`）。
         (format!("SELECT id FROM {ITEMS} WHERE (SELECT qty FROM {REFS} LIMIT 1) < qty LIMIT 100"), "42601"),
         (format!("SELECT id FROM {ITEMS} WHERE qty > (SELECT qty FROM {REFS} LIMIT 1) * 2 LIMIT 100"), "42601"),
-        (format!("SELECT (SELECT qty FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 100"), "42601"),
+        (format!("SELECT (SELECT qty FROM {REFS} LIMIT 1) + 1 FROM {ITEMS} LIMIT 100"), "42601"),
         // ランキング付き検索・集合演算の内側。
         (format!("SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} UNION SELECT qty FROM {REFS}) LIMIT 100"), "42601"),
         // `LIMIT` 省略（Scan 形）。

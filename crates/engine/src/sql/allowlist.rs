@@ -2156,6 +2156,25 @@ pub(crate) struct WindowSelectItem {
     pub(crate) alias: Option<String>,
 }
 
+/// 広域取得 SELECT の投影位置にあるスカラーサブクエリ 1 項目
+/// （`(SELECT <単一列> FROM <table> ... LIMIT n) [AS <alias>]`。Issue #1352・
+/// SQL-29 (a)・RLS-10 (b)・TASK-213）。
+///
+/// 内側の生トークン列を保持するのみで未評価（[`WherePredicate::InSubquery`] と同じ設計）。
+/// 公開 enum [`Projection`]／[`SelectItem`] を変更しないよう [`WindowSelectItem`] と同様に
+/// 通常項目とは別に保持し、[`Self::position`]（SELECT リスト全体での出現位置）で
+/// 実行時（`core.rs` の `Statement::Scan` アームが `sql::subquery` へ委譲）に元の
+/// 並び順へ合流する。解決を経ずに束縛へ届いた場合は `sql::parser::bind_scan` が拒否する
+/// （fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScalarSubqueryItem {
+    pub(crate) position: usize,
+    pub(crate) inner_tokens: Vec<Token>,
+    /// このサブクエリ自身の入れ子深さ（[`Parser::require_subquery_depth`] の戻り値）。
+    pub(crate) depth: usize,
+    pub(crate) alias: Option<String>,
+}
+
 /// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
 /// `GroupKey` は `GROUP BY` 句がある場合にのみ現れ、`GROUP BY` 列と同名の裸の
 /// 識別子（任意で `AS <alias>`）だけを構造上受理する（`allowlist::Parser::parse_select_item`
@@ -2314,6 +2333,10 @@ pub struct ValidatedScan {
     /// （従来どおり `order_by` が正本）。公開型 [`ScalarOrderKey`] を壊さないための
     /// crate 内専用の拡張で、束縛（`sql::parser::bind_scan`）が正本として読む。
     pub(crate) order_keys: Vec<ScanOrderKey>,
+    /// 投影位置のスカラーサブクエリ（Issue #1352）。空なら従来どおり。非空のとき
+    /// [`Self::projection`] はこれらを含まず、`core.rs` が解決して結果列へ合流する
+    /// （合流前に束縛へ渡すと `sql::parser::bind_scan` が拒否する）。
+    pub(crate) scalar_subquery_items: Vec<ScalarSubqueryItem>,
 }
 
 impl ValidatedScan {
@@ -3427,16 +3450,26 @@ impl<'a> Parser<'a> {
     /// 落ちる。
     fn parse_select_list_with_windows(
         &mut self,
-    ) -> Result<(Projection, Vec<WindowSelectItem>), SqlSurfaceError> {
+    ) -> Result<(Projection, Vec<WindowSelectItem>, Vec<ScalarSubqueryItem>), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('*'))) {
             self.advance();
-            return Ok((Projection::All, Vec::new()));
+            return Ok((Projection::All, Vec::new(), Vec::new()));
         }
         let mut plain_items: Vec<SelectItem> = Vec::new();
         let mut window_items: Vec<WindowSelectItem> = Vec::new();
+        let mut scalar_items: Vec<ScalarSubqueryItem> = Vec::new();
         let mut position: usize = 0;
         loop {
-            if self.peek_is_window_item_start() {
+            if self.peek_is_scalar_subquery_start() {
+                // Issue #1352: 項目数は構文段でも実行回数上限で頭打ちにする。
+                if scalar_items.len() >= super::subquery::MAX_SUBQUERY_EXECUTIONS {
+                    return Err(SqlSurfaceError::payload_too_large(format!(
+                        "subquery execution count exceeds limit {}",
+                        super::subquery::MAX_SUBQUERY_EXECUTIONS
+                    )));
+                }
+                scalar_items.push(self.parse_scalar_subquery_item(position)?);
+            } else if self.peek_is_window_item_start() {
                 if window_items.len() >= MAX_AGGREGATE_ITEMS {
                     return Err(SqlSurfaceError::payload_too_large("too many window items"));
                 }
@@ -3471,7 +3504,51 @@ impl<'a> Parser<'a> {
         } else {
             Projection::Items(plain_items)
         };
-        Ok((projection, window_items))
+        Ok((projection, window_items, scalar_items))
+    }
+
+    /// 現在位置が投影位置のスカラーサブクエリ（`'(' SELECT`）の開始かを、消費せず
+    /// 判定する（Issue #1352）。SELECT リスト項目の先頭に `(` が現れる正当な既存形は
+    /// 無いため、`( SELECT` の並びだけで一意に判定できる。
+    fn peek_is_scalar_subquery_start(&self) -> bool {
+        matches!(self.peek(), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Keyword(Keyword::Select))
+            )
+    }
+
+    /// 投影位置のスカラーサブクエリ 1 項目 `( SELECT ... ) [AS <alias>]` を読む
+    /// （Issue #1352）。サブクエリを許可しない文脈（`subquery_ctx == None`）は
+    /// [`Self::require_subquery_depth`] が `42601`、深さ超過は `54000`。内側トークン列は
+    /// 対応する閉じ括弧で切り出すのみで、検証は実行時に同じ許可リストパーサーが行う。
+    fn parse_scalar_subquery_item(
+        &mut self,
+        position: usize,
+    ) -> Result<ScalarSubqueryItem, SqlSurfaceError> {
+        let depth = self.require_subquery_depth()?;
+        let open_idx = self.pos;
+        let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+            SqlSurfaceError::unsupported("unmatched parenthesis in scalar subquery")
+        })?;
+        let inner_tokens = self
+            .tokens
+            .get((open_idx + 1)..close_idx)
+            .ok_or_else(|| SqlSurfaceError::unsupported("malformed scalar subquery boundary"))?
+            .to_vec();
+        self.pos = close_idx + 1;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(ScalarSubqueryItem {
+            position,
+            inner_tokens,
+            depth,
+            alias,
+        })
     }
 
     /// 現在位置が「`<ident> '(' ... ')' OVER '('`」の並びで始まるかを、消費せず
@@ -7967,6 +8044,8 @@ struct ParsedScanShape {
     /// 式キーを含む `ORDER BY`（Issue #1188）。式キーを含む場合のみ全キーを保持し、
     /// このとき `order_by` は空。
     order_keys: Vec<ScanOrderKey>,
+    /// 投影位置のスカラーサブクエリ（Issue #1352）。
+    scalar_subquery_items: Vec<ScalarSubqueryItem>,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -8918,6 +8997,7 @@ fn parse_set_branch(
             // （ウィンドウ関数を含む枝は非対応。Issue #929 のスコープ外事項）。
             window_items: Vec::new(),
             order_keys: Vec::new(),
+            scalar_subquery_items: Vec::new(),
         },
         super::view::Resolved::View {
             base_table,
@@ -8947,6 +9027,7 @@ fn parse_set_branch(
                 // 上と同じ理由（集合演算の枝はウィンドウ関数非対応）。
                 window_items: Vec::new(),
                 order_keys: Vec::new(),
+                scalar_subquery_items: Vec::new(),
             }
         }
         // Issue #1192: 評価後射影形ビューは集合演算の枝として参照できない。
@@ -9082,6 +9163,7 @@ fn parse_set_limited_branch(
         shape.offset,
         Vec::new(),
         shape.order_keys,
+        shape.scalar_subquery_items,
     )?;
     Ok(SetTree::LimitedBranch(Box::new(scan)))
 }
@@ -9313,7 +9395,14 @@ fn parse_select_shape(
     // 通常項目と混在しうるため、`ORDER BY`／`USING PLAN` を伴う検索 SELECT 経路か
     // ランキング段を持たない広域取得かを判定する**前**にリストを読み終える必要が
     // ある（既存の `parse_select_list` 呼び出しをそのまま置き換える）。
-    let (projection, window_items) = p.parse_select_list_with_windows()?;
+    let (projection, window_items, scalar_subquery_items) = p.parse_select_list_with_windows()?;
+    // Issue #1352: 投影位置のスカラーサブクエリとウィンドウ項目の併用は非対応
+    // （ウィンドウ実行は結果列を独自に組み立てるため、合流位置の整合を持たない）。
+    if !window_items.is_empty() && !scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries cannot be combined with window functions in the SELECT list",
+        ));
+    }
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
 
@@ -9339,6 +9428,11 @@ fn parse_select_shape(
         if !window_items.is_empty() {
             return Err(SqlSurfaceError::unsupported(
                 "window functions cannot be combined with USING PLAN",
+            ));
+        }
+        if !scalar_subquery_items.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "scalar subqueries in the SELECT list cannot be combined with USING PLAN",
             ));
         }
         let using_plan = p.parse_using_plan_clause()?;
@@ -9398,6 +9492,7 @@ fn parse_select_shape(
             offset,
             window_items,
             order_keys: Vec::new(),
+            scalar_subquery_items,
         }));
     }
 
@@ -9429,6 +9524,11 @@ fn parse_select_shape(
     if is_vector_ranking && !window_items.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "window functions cannot be combined with vector ORDER BY",
+        ));
+    }
+    if is_vector_ranking && !scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries in the SELECT list cannot be combined with vector ORDER BY",
         ));
     }
 
@@ -9473,6 +9573,7 @@ fn parse_select_shape(
             // Issue #1189: スカラー ORDER BY とウィンドウ項目は併用できる。
             window_items,
             order_keys,
+            scalar_subquery_items,
         }));
     }
 
@@ -9868,6 +9969,9 @@ fn build_scan_from_resolved(
     window_items: Vec<WindowSelectItem>,
     // Issue #1188: 式キーを含む `ORDER BY`（含まなければ空）。
     order_keys: Vec<ScanOrderKey>,
+    // Issue #1352: 投影位置のスカラーサブクエリ（外側テーブルの列に依存しないため
+    // ビューの公開列検査の対象外。そのまま搬送する）。
+    scalar_subquery_items: Vec<ScalarSubqueryItem>,
 ) -> Result<ValidatedScan, SqlSurfaceError> {
     match resolved {
         super::view::Resolved::Table => Ok(ValidatedScan {
@@ -9879,6 +9983,7 @@ fn build_scan_from_resolved(
             offset,
             window_items,
             order_keys,
+            scalar_subquery_items,
         }),
         super::view::Resolved::View {
             base_table,
@@ -9911,6 +10016,7 @@ fn build_scan_from_resolved(
                 offset,
                 window_items,
                 order_keys,
+                scalar_subquery_items,
             })
         }
         // 評価後射影形ビュー（Issue #1192）は CTE・集合演算の枝など、広域取得の
@@ -10206,6 +10312,7 @@ fn validate_sql_tokens_impl(
                     shape.offset,
                     shape.window_items,
                     shape.order_keys,
+                    shape.scalar_subquery_items,
                 )?)),
                 MainShape::Aggregate(shape) => {
                     Ok(Statement::Aggregate(build_aggregate_from_resolved(
@@ -10257,7 +10364,9 @@ fn validate_sql_tokens_impl(
                 // 非 EXPLAIN 経路と共有のため window_items を持つ `ValidatedScan`
                 // も返しうるが、`sql::explain` 側に対応する記述がなくレビュー
                 // 未了のため、ここで明示的に `42601` へ倒す。
-                Statement::Scan(v) if !v.window_items.is_empty() => {
+                Statement::Scan(v)
+                    if !v.window_items.is_empty() || !v.scalar_subquery_items.is_empty() =>
+                {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for window function queries",
                     ));
@@ -10465,6 +10574,7 @@ fn validate_select_statement(
                 shape.offset,
                 shape.window_items,
                 shape.order_keys,
+                shape.scalar_subquery_items,
             )?))
         }
     }

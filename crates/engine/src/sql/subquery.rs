@@ -25,7 +25,12 @@
 //!   `GROUP BY` の有無を問わず `LIMIT` 不要）。
 //!
 //! ランキング付き検索 SELECT・集合演算・JOIN・内側の `LIMIT` 省略（Scan 形）・
-//! 投影位置のスカラーサブクエリは `42601`（`docs/design/sql-subquery.md` 参照）。
+//! 内側自身の投影位置スカラーサブクエリは `42601`（`docs/design/sql-subquery.md` 参照）。
+//!
+//! 投影位置のスカラーサブクエリ（Issue #1352。外側は広域取得 SELECT のみ）は
+//! [`resolve_scalar_projection_items`] が内側を実行して列メタデータと値（0 行は NULL）へ
+//! 解決し、[`merge_scalar_projection_items`] が外側の走査結果へ SELECT リスト上の位置で
+//! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `22000`。
 //!
 //! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
 //! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
@@ -68,8 +73,9 @@
 use std::collections::HashSet;
 
 use super::allowlist::{
-    AggregateArg, AggregateSelectItem, CompareOp, Projection, ScalarSubqueryOp, SelectItem,
-    SqlSurfaceError, Statement, TableLookup, ValidatedAggregate, ValidatedScan, WherePredicate,
+    AggregateArg, AggregateSelectItem, CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp,
+    SelectItem, SqlSurfaceError, Statement, TableLookup, ValidatedAggregate, ValidatedScan,
+    WherePredicate,
 };
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
@@ -279,6 +285,12 @@ enum InnerScanIntent {
     /// スカラーサブクエリ（Issue #1191）: 単一列の Scan、または単一集計項目の
     /// 集計形を、ユーザー指定のまま実行して行数・値を確認する。
     Scalar,
+    /// 投影位置のスカラーサブクエリ（Issue #1352）: [`Self::Scalar`] と同じく単一列の
+    /// Scan または単一集計項目の集計形を実行するが、値は 0 行（NULL）または 1 行しか
+    /// 使わない。そのため Scan 形は元の `LIMIT` を検証した**後に**実質 `LIMIT 2`
+    /// （「2 行目が存在するか」の判定に足りる最小値）へ差し替える。`WHERE`・RLS の
+    /// 適用は変更しない。
+    ScalarValue,
 }
 
 /// 内側 Scan が参照する非修飾の列名を集める（相関検出専用。疑似列 `id` を含みうる）。
@@ -411,18 +423,19 @@ fn execute_inner_query(
             budget,
             in_value_budget,
         )?,
-        (Statement::Aggregate(validated), InnerScanIntent::Scalar) => {
-            execute_inner_aggregate_statement(
-                validated,
-                outer_scopes,
-                read_txn,
-                ctx,
-                lookup,
-                udfs,
-                budget,
-                in_value_budget,
-            )?
-        }
+        (
+            Statement::Aggregate(validated),
+            InnerScanIntent::Scalar | InnerScanIntent::ScalarValue,
+        ) => execute_inner_aggregate_statement(
+            validated,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            budget,
+            in_value_budget,
+        )?,
         _ => {
             return Err(SqlSurfaceError::unsupported(
                 "subquery must be a plain SELECT ... FROM ... [WHERE ...] LIMIT n \
@@ -479,7 +492,18 @@ fn execute_inner_scan_statement(
         outer_scopes,
     )?;
 
-    if matches!(intent, InnerScanIntent::Values | InnerScanIntent::Scalar) {
+    // Issue #1352: 内側自身の投影位置スカラーサブクエリは非対応（WHERE 経由の入れ子は
+    // 深さ上限内で従来どおり許可）。投影を黙って落とさないよう intent に関わらず拒否する。
+    if !validated.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "a subquery cannot contain a scalar subquery in its SELECT list",
+        ));
+    }
+
+    if matches!(
+        intent,
+        InnerScanIntent::Values | InnerScanIntent::Scalar | InnerScanIntent::ScalarValue
+    ) {
         // 投影列数（ちょうど 1 列）を実行前に静的に確定して拒否する（PR #1103
         // 追加 codex-review P1 指摘の自己点検: 必要以上の投影で走査コストを払って
         // から拒否する問題を避ける。`resolve_in_subquery` 等の実行後チェックは
@@ -530,6 +554,12 @@ fn execute_inner_scan_statement(
         )?;
         validated.projection = Projection::Columns(Vec::new());
         validated.limit = 1;
+    }
+
+    if intent == InnerScanIntent::ScalarValue {
+        // 元の `LIMIT` 自体の範囲検証は差し替えで迂回されないよう先に行う（fail-closed）。
+        super::parser::validate_search_limit(validated.limit)?;
+        validated.limit = validated.limit.min(2);
     }
 
     let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
@@ -990,6 +1020,153 @@ fn float_compare(column: &str, op: BinOp, f: f64) -> Result<WherePredicate, SqlS
         lhs: Box::new(Expr::Ident(column.to_string())),
         rhs: Box::new(Expr::Number(number_cell_text(&Cell::Float(f))?)),
     }))
+}
+
+/// 解決済みの投影位置スカラーサブクエリ 1 項目（Issue #1352）。
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedScalarItem {
+    position: usize,
+    meta: ColumnMeta,
+    cell: Cell,
+    /// 内側が 2 行以上を返したか。外側の結果が 1 行以上のときだけエラーにする
+    /// （PostgreSQL の遅延評価と同じ。判定は自テナント可視行のみで決まる）。
+    multi_row: bool,
+}
+
+/// 投影位置のスカラーサブクエリ（Issue #1352・SQL-29 (a)・RLS-10 (b)・TASK-213）を
+/// すべて実行し、列メタデータと値（0 行は NULL）へ解決する。`core.rs` の
+/// `Statement::Scan` アームが WHERE 側の解決（[`resolve_where_predicates`]）と同じ
+/// `budget`／`in_value_budget`・`read_txn`・`ctx` で呼ぶ。内側は WHERE 側と同じ
+/// 経路（相関拒否・RLS 暗黙適用）を通る。静的エラー（未知列・投影列数・相関）は
+/// 外側の行数に関わらず返る。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_scalar_projection_items(
+    items: &[ScalarSubqueryItem],
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let result = execute_inner_query(
+            &item.inner_tokens,
+            item.depth,
+            InnerScanIntent::ScalarValue,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            budget,
+            in_value_budget,
+        )?;
+        if result.columns.len() != 1 {
+            return Err(SqlSurfaceError::unsupported(
+                "subquery used as a value must select exactly one column",
+            ));
+        }
+        let inner_meta = result
+            .columns
+            .first()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "subquery result missing projected column metadata".to_string(),
+            })?;
+        // 別名があれば列名だけ差し替える（型 OID の根拠となる型は保持する）。別名なしは
+        // 内側の列名（PostgreSQL と同じ）。疑似列 `id` を別名付きで返す場合は名前を
+        // 保持できる枠が `Computed` しか無く、wire では text になる。
+        let meta = match (inner_meta, item.alias.as_ref()) {
+            (meta, None) => meta.clone(),
+            (ColumnMeta::Scalar { ty, .. }, Some(alias)) => ColumnMeta::Scalar {
+                name: alias.clone(),
+                ty: ty.clone(),
+            },
+            (ColumnMeta::Computed { ty, .. }, Some(alias)) => ColumnMeta::Computed {
+                name: alias.clone(),
+                ty: ty.clone(),
+            },
+            (ColumnMeta::Id, Some(alias)) => ColumnMeta::Computed {
+                name: alias.clone(),
+                ty: None,
+            },
+        };
+        let multi_row = result.rows.len() > 1;
+        let cell = match result.rows.first() {
+            None => Cell::Null,
+            Some(_) if multi_row => Cell::Null,
+            Some(row) => row
+                .cells
+                .first()
+                .cloned()
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "subquery row missing projected cell".to_string(),
+                })?,
+        };
+        out.push(ResolvedScalarItem {
+            position: item.position,
+            meta,
+            cell,
+            multi_row,
+        });
+    }
+    Ok(out)
+}
+
+/// 解決済みの投影位置スカラーサブクエリを、外側の結果（投影位置の項目を含まない列）へ
+/// SELECT リスト上の位置どおりに合流する（Issue #1352）。
+///
+/// - 内側が 2 行以上で外側の結果が 1 行以上なら `22000`（PostgreSQL の `21000` 相当。
+///   `wire_code` 表に無いため既存分類）。外側が 0 行ならエラーにしない。
+/// - 追加セルの推定バイト（全行ぶん）を確保前に `checked_*` で検査し、結果バイト上限
+///   （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]。`sql::scan` の結果バイト上限と同値）を
+///   超えれば `54000`。
+/// - 位置が現在の列数を超える場合は `Internal`（fail-closed。添字アクセスは使わない）。
+pub(crate) fn merge_scalar_projection_items(
+    mut result: super::exec::QueryResult,
+    items: Vec<ResolvedScalarItem>,
+) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    if !result.rows.is_empty() && items.iter().any(|i| i.multi_row) {
+        return Err(SqlSurfaceError::invalid_input(
+            "more than one row returned by a subquery used as an expression",
+        ));
+    }
+    let mut total_bytes: usize = 0;
+    for item in &items {
+        let per_cell = std::mem::size_of::<Cell>()
+            .checked_add(super::cursor::estimate_cell_bytes(&item.cell))
+            .ok_or_else(merge_too_large)?;
+        let added = per_cell
+            .checked_mul(result.rows.len())
+            .ok_or_else(merge_too_large)?;
+        total_bytes = total_bytes.checked_add(added).ok_or_else(merge_too_large)?;
+        if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
+            return Err(merge_too_large());
+        }
+    }
+    for item in items {
+        if item.position > result.columns.len() {
+            return Err(SqlSurfaceError::Internal {
+                detail: "scalar subquery position out of range".to_string(),
+            });
+        }
+        result.columns.insert(item.position, item.meta);
+        for row in &mut result.rows {
+            if item.position > row.cells.len() {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scalar subquery position out of range".to_string(),
+                });
+            }
+            row.cells.insert(item.position, item.cell.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn merge_too_large() -> SqlSurfaceError {
+    SqlSurfaceError::payload_too_large("scalar subquery projection result exceeds size limit")
 }
 
 /// 期待外のセル型（静的な値族検証を通ったのに実行時セルが食い違う場合）。fail-closed。

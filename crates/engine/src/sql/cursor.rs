@@ -279,7 +279,7 @@ fn estimate_row_bytes(row: &crate::sql::exec::ResultRow) -> usize {
     total
 }
 
-fn estimate_cell_bytes(cell: &Cell) -> usize {
+pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Null | Cell::Bool(_) => 1,
         Cell::Integer(_) | Cell::SignedInteger(_) | Cell::Float(_) | Cell::Timestamp(_) => 8,
