@@ -14,8 +14,8 @@
 //!   基準にしつつ `-0.0 == +0.0` を保つ）。`NULL` の並び位置は呼び出し側の責務。
 //! - `DOUBLE PRECISION` のテキスト表現は PostgreSQL の float8 出力（最短往復桁・
 //!   指数は `1e+20` 形式。Issue #1343・WIRE-13 のポインタ。[`format_double`]）、
-//!   `REAL` は float4 出力（`1e+06` 形式。Issue #1173。[`format_real`]）に揃える。`f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析
-//!   する（二重丸め防止）。
+//!   `REAL` は float4 出力（`1e+06` 形式。Issue #1173。[`format_real`]）に揃える。
+//!   `f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析する（二重丸め防止）。
 //! - `COPY FROM` は [`format_real`] の出力（指数表記を含む）を再投入できる必要が
 //!   あるため、閉じた文法で指数表記を受理する [`parse_real_text`] を使う
 //!   （WIRE-17 の往復契約。SQL リテラルの [`parse_real`] も #1187 で指数表記を受理）。
