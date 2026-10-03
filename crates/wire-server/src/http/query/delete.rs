@@ -43,9 +43,10 @@
 //! はいずれも `deleted:0`・`200`（RLS-9。`execute_delete` のドキュメント
 //! 参照）。
 //!
-//! 対象外: `RETURNING`（Issue #873。NoSQL は公開しない）・`filter` の
-//! `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`
-//! （Issue #945。`filter.rs` と同じ `0A000`）。
+//! 対象外: `RETURNING`（Issue #873。NoSQL は公開しない）。`filter` は `search` と同じ語彙
+//! （`or`・範囲比較・`in`・数値列を含む。Issue #1356）を `filter.rs` の
+//! `bind_filter_where_predicates` が SQL の述語形 `DELETE` と同一の構文形へ写像する
+//! （`ARRAY`／`JSON`／`JSONB` 列への `eq`／`ne` のみ `0A000`）。
 
 use std::fmt::Write as _;
 

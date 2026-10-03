@@ -1014,7 +1014,7 @@ fn cross_surface_vector_value_nosql_then_sql_resend_is_duplicate() {
 
 /// (NoSQL の filter 配列 JSON, 等価な SQL の WHERE 句)。いずれも `lang = 'ja'` の
 /// 行だけに一致する（seed は ja・en の 2 行）。
-const PREDICATE_DML_PARITY_CASES: [(&str, &str); 5] = [
+const PREDICATE_DML_PARITY_CASES: [(&str, &str); 10] = [
     (
         r#"[{"column":"lang","op":"ne","value":"en"}]"#,
         "NOT lang = 'en'",
@@ -1034,6 +1034,24 @@ const PREDICATE_DML_PARITY_CASES: [(&str, &str); 5] = [
     (
         r#"[{"not":{"column":"lang","op":"eq","value":"en"}}]"#,
         "NOT lang = 'en'",
+    ),
+    // Issue #1356: 範囲比較・`in`・`or`・`not` で包んだ `or`／`in`。
+    (r#"[{"column":"lang","op":"lt","value":"f"}]"#, "lang < 'f'"),
+    (
+        r#"[{"column":"lang","op":"in","value":["en","zz"]}]"#,
+        "lang IN ('en', 'zz')",
+    ),
+    (
+        r#"[{"or":[{"column":"lang","op":"eq","value":"ja"},{"column":"lang","op":"eq","value":"zz"}]}]"#,
+        "lang = 'ja' OR lang = 'zz'",
+    ),
+    (
+        r#"[{"not":{"or":[{"column":"lang","op":"eq","value":"en"},{"column":"lang","op":"eq","value":"zz"}]}}]"#,
+        "NOT (lang = 'en' OR lang = 'zz')",
+    ),
+    (
+        r#"[{"not":{"column":"lang","op":"in","value":["en"]}}]"#,
+        "NOT lang IN ('en')",
     ),
 ];
 
@@ -1093,15 +1111,24 @@ fn predicate_update_and_delete_with_new_operators_apply_and_reject_forms() {
         "own rows must be updated: {langs:?}"
     );
 
-    // `not(like)` で 0 件一致でも成功（updated/deleted 0）。`or` は述語形 DML で 42601。
-    let resp = query(
-        &both,
-        br#"{"op":"delete","table":"docs","filter":[{"not":{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}}],"operation_id":"n12-1197-del-notor"}"#,
-    );
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    // Issue #1356: `or`・範囲比較は述語形 DML でも受理される（SQL の述語形 DML と同じ
+    // 結果集合）。`not{or}` は自テナントの全行（lang = 'xx'）へ届く。
     let resp = query(
         &both,
         br#"{"op":"delete","table":"docs","filter":[{"column":"lang","op":"lt","value":"a"}],"operation_id":"n12-1197-del-lt"}"#,
     );
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp={resp:?}");
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        String::from_utf8_lossy(&resp.body).contains(r#""deleted":0"#),
+        "{resp:?}"
+    );
+    let resp = query(
+        &both,
+        br#"{"op":"delete","table":"docs","filter":[{"not":{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}}],"operation_id":"n12-1197-del-notor"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert!(
+        String::from_utf8_lossy(&resp.body).contains(r#""deleted":2"#),
+        "{resp:?}"
+    );
 }

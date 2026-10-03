@@ -329,6 +329,61 @@ fn eq_and_range_on_integer_column_bind_to_expression_lane() {
     }
 }
 
+/// Issue #1356: 数値 4 型の `in` は JSON 数値のみ（非数値要素は `42601`）・要素数上限超過は
+/// `54000`・空は `42601`。SQL の数値リテラル `IN` と同じく式レーンへ束縛される。
+#[test]
+fn in_on_numeric_columns_binds_to_expression_lane_and_validates_elements() {
+    let schema_with_int = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(4), false),
+            ColumnDef::new("count", ColumnType::Integer, true),
+        ],
+    );
+    let parse_items = |json: &str| {
+        let JsonValue::Array(items) = parse_json(json).expect("valid JSON") else {
+            panic!("expected array");
+        };
+        items
+    };
+    let bound = bind_filter(
+        &parse_items(r#"[{"column":"count","op":"in","value":[1]}]"#),
+        &schema_with_int,
+        &udfs(),
+    )
+    .expect("single-element numeric in must bind");
+    assert_eq!(bound.expr_filters().len(), 1);
+    assert!(bound.or_filters().is_empty());
+    let bound = bind_filter(
+        &parse_items(r#"[{"column":"count","op":"in","value":[1,2]}]"#),
+        &schema_with_int,
+        &udfs(),
+    )
+    .expect("numeric in must bind");
+    assert_eq!(bound.or_filters().len(), 1);
+
+    for (json, code) in [
+        (r#"[{"column":"count","op":"in","value":[1,"2"]}]"#, "42601"),
+        (r#"[{"column":"count","op":"in","value":[]}]"#, "42601"),
+    ] {
+        let err = bind_filter(&parse_items(json), &schema_with_int, &udfs()).expect_err(json);
+        assert_eq!(ClassifiedError::wire_code(&err), code, "{json}");
+    }
+    let values = (0..=engine::declarative_filter::MAX_IN_LIST_ITEMS)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let err = bind_filter(
+        &parse_items(&format!(
+            r#"[{{"column":"count","op":"in","value":[{values}]}}]"#
+        )),
+        &schema_with_int,
+        &udfs(),
+    )
+    .expect_err("over-limit numeric in must be rejected");
+    assert_eq!(ClassifiedError::wire_code(&err), "54000");
+}
+
 type NumericRow = (
     u64,
     &'static str,
@@ -410,7 +465,7 @@ fn numeric_and_text_range_filters_match_sql_and_respect_tenant_boundary() {
     let session = SessionState::default();
 
     // (NoSQL filter JSON, 等価な SQL WHERE)
-    let cases: [(&str, &str); 16] = [
+    let cases: [(&str, &str); 22] = [
         (r#"[{"column":"qty","op":"eq","value":2}]"#, "qty = 2"),
         (r#"[{"column":"qty","op":"gt","value":1}]"#, "qty > 1"),
         (r#"[{"column":"qty","op":"ge","value":3}]"#, "qty >= 3"),
@@ -448,6 +503,28 @@ fn numeric_and_text_range_filters_match_sql_and_respect_tenant_boundary() {
             "qty = 1 OR lang > 'g'",
         ),
         (r#"[{"column":"qty","op":"gt","value":100}]"#, "qty > 100"),
+        // Issue #1356: 数値 4 型の `in`（SQL の数値リテラル `IN` と同じ結果集合）。
+        (
+            r#"[{"column":"qty","op":"in","value":[1,3]}]"#,
+            "qty IN (1, 3)",
+        ),
+        (r#"[{"column":"qty","op":"in","value":[2]}]"#, "qty IN (2)"),
+        (
+            r#"[{"not":{"column":"qty","op":"in","value":[2,3]}}]"#,
+            "NOT qty IN (2, 3)",
+        ),
+        (
+            r#"[{"column":"total","op":"in","value":[10,20]}]"#,
+            "total IN (10, 20)",
+        ),
+        (
+            r#"[{"column":"score","op":"in","value":[0,2.5]}]"#,
+            "score IN (0, 2.5)",
+        ),
+        (
+            r#"[{"column":"ratio","op":"in","value":[0.5,5]},{"column":"lang","op":"gt","value":"a"}]"#,
+            "ratio IN (0.5, 5) AND lang > 'a'",
+        ),
     ];
     let run_nosql = |filter_json: &str| {
         let items = parse_json(filter_json).expect("valid JSON");

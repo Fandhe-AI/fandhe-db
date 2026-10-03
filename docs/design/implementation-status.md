@@ -517,3 +517,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **変更箇所**: テストのみ（本番コード・公開 API・依存の変更なし）。`crates/engine/tests/rls10_write_constraint_paths.rs` に実行経路の次元（autocommit／明示トランザクション）を追加した。
 - **性質**: 既存の 41 形状を、`BEGIN` → 形状 → 成功なら同一トランザクション内の読み戻し → `COMMIT` の経路でも実行し、T0〜T6 の同一オラクルを適用する。エラー時は `Failed` 遷移・`COMMIT` の `25P02` 拒否・`ROLLBACK` で `Idle` へ戻ることを能動的に表明する。T7 で両経路の応答と自テナントの事後物理状態の完全一致を固定する。T0・T4・T5 の集計は経路別に更新した（T4 の比較件数 72、総 run 数 492）。
 - **対象外（申し送り）**: `INITIALLY DEFERRED` の FK（COMMIT 時検査）・暗黙トランザクション（WIRE-16）・ROLLBACK 後の全テナント物理不変の専用検査。
+
+## Issue #1356: NoSQL の update／delete の filter の受理範囲を SQL の述語形 DML に揃える
+
+- **対象ビヘイビア**: NOSQL-12・NOSQL-14・NOSQL-17（関連: SQL-19・SQL-24・RECOVER-10）。
+- **変更箇所**: engine の述語形 DML 入口の多層防御（`reject_unsupported_predicate_dml_forms`）が、範囲比較・`IN`・`OR`・列×数値リテラルの式比較を受理するよう拡張。SQL の `NOT` と同一の AST を得るための公開入口 `declarative_predicate::negate_where_conjunction` を追加。wire-server の `http::query::filter` は述語形 DML の `filter` を `search` と同じ要素検査（`map_filter_items`）に一本化し、`bind_filter_where_predicates` が「全体束縛による検証 → SQL と同一の `WherePredicate` への変換」を行う。`search`／`scan`／`aggregate` の数値 4 型への `in` も受理した。
+- **性質**: 各 JSON 形は対応する SQL テキストの構文解析結果とバイト単位で同一の AST になり（連続する `not`・`ne` は偶奇で畳む）、跨表層の再送が `23505`／`22023` で照合される。述語の葉の上限（256）は不変。数値列の `in` は JSON 上 1 葉と数えるため、256 要素ちょうどで他に葉があると NoSQL だけが `54000` になりうる（拒否側の既知の差）。
+- **テスト**: engine 単体 1（許可形・拒否形の固定）・公開 API 1、wire 単体（`filter.rs`）、層 A `nosql12_predicate_dml_numeric_filter.rs`（跨表層 19 形 × 2 方向・結果集合・型不一致・上限・RLS 名・テナント境界）、`nosql12_update_delete.rs`・`nosql14_filter_operators.rs`・`nosql12_partitioned_dml.rs` の拡張。
+- **対象外（申し送り）**: `ARRAY`／`JSON`／`JSONB` 列への DML の `eq`／`ne`／`in`、負数リテラルの SQL⇄NoSQL ハッシュパリティ（SQL に単項マイナスが無いため対象外）。
