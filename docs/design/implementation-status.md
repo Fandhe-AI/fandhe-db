@@ -486,3 +486,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: 拒否される入力は変わらず、`wire_code` を `22000` から `42883`（HTTP 400）へ振り替えるのみ（fail-closed 維持）。新しい分類の追加はないが、`wire_code` は公開エラー契約のため、SQL・NoSQL の利用者が受け取るコードが `22000` から `42883`（HTTP 400）へ変わる互換性影響がある（`22000` を固定で判定するクライアントは `42883` への追従が必要。SQLSTATE クラス 22 から 42 へ移る）。SQL 単一行・GROUP BY・ウィンドウ・NoSQL `aggregate`・CHECK 制約式の各経路に反映。
 - **テスト**: 既存の `22000` 固定を `42883` へ厳格化し、`tests/sql26_scalar_functions.rs`・`tests/sql_aggregate.rs` に回帰テストを追加。
 - **対象外（申し送り）**: 集計・ウィンドウ関数自体の arity（構文層の `42601`）、ARRAY・ENUM の `MIN`/`MAX` 対応、`COUNT(DISTINCT <json/array/vector 列>)` の `22000`。
+
+## Issue #1351: 集計文のスカラー ORDER BY の EXPLAIN を検証する
+
+- **対象ビヘイビア**: SQL-25・SQL-27・RLS-10（TASK-209）。
+- **変更箇所**: `crates/engine/tests/sql27_explain_targets.rs` へテスト 3 件を追加（テストのみ。本番コードの変更・依存追加なし）。
+- **性質**: 集計文＋スカラー `ORDER BY` の `EXPLAIN` が (a) 可視行の異なるテナント間でバイト一致、(b) `ORDER BY` を除いた同文の `EXPLAIN` と一致、(c) 固定出力、(d) 本体を評価しない（本体なら `22003` になるデータでも成功）、(e) 束縛エラーの `wire_code` が `EXPLAIN` 有無で一致（fail-closed の非迂回）。`EXPLAIN` は `execute_sql_in_session` 経由のみで検証し、`execute_sql` は `42601` のまま。
+- **テスト**: `scalar_order_by_aggregate_explain_is_identical_across_tenants_and_independent_of_order_by`・`scalar_order_by_aggregate_explain_does_not_execute_body`・`scalar_order_by_aggregate_explain_error_codes_match_non_explain`。
+- **対象外（申し送り）**: NoSQL `aggregate` の `sort` と `explain: true` の併用、pg wire 経由の層 B 検証、ウィンドウ関数・JOIN・集合演算との EXPLAIN 併用。

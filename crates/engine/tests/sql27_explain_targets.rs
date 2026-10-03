@@ -4,7 +4,8 @@
 //! 既存契約）・`sql_scan.rs`（広域取得の受理反転）とは別に、本ファイルは
 //! 新設の 2 経路（`USING PLAN` なし検索・集計）の静的判定と、対象拡大が
 //! 既存の非実行契約（行走査・キャッシュ消費・LLM/Embedder 呼び出しを一切
-//! 行わない）を壊していないことに焦点を当てる。
+//! 行わない）を壊していないことに焦点を当てる。Issue #1351 では集計文＋
+//! スカラー ORDER BY の EXPLAIN（本体非実行・テナント間一致・ORDER BY 非依存）も固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -788,4 +789,202 @@ fn scalar_order_by_scan_explain_is_identical_across_tenants_and_does_not_execute
         )
         .expect("scan after EXPLAIN");
     assert_eq!(after.rows.len(), 5);
+}
+
+/// 集計文＋スカラー ORDER BY の `EXPLAIN` を、新しいセッションで 1 回実行して
+/// 結果行を返す（Issue #1351。`EXPLAIN` を受理するのは `execute_sql_in_session`
+/// のみで、`execute_sql` は入口の契約で 42601 になるため必ずこちらを使う）。
+fn explain_in_fresh_session(core: &EngineCore, tenant: &str, sql: &str) -> Vec<String> {
+    let mut session = SessionState::default();
+    explain_lines(
+        core.execute_sql_in_session(&ctx(tenant), &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed: {}", e.wire_code())),
+    )
+}
+
+#[test]
+fn scalar_order_by_aggregate_explain_is_identical_across_tenants_and_independent_of_order_by() {
+    // Issue #1351・SQL-25・SQL-27・RLS-10: 集計文のスカラー ORDER BY 付き EXPLAIN は
+    // 静的判定のみで、(a) 可視行の異なるテナント間でバイト一致し、(b) ORDER BY を除いた
+    // 同じ文の EXPLAIN と一致し（ORDER BY は走査方式の判定に影響しない）、(c) 固定出力になる。
+    let path = unique_db_path("sql27-agg-order-by-explain");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector_and_two_group_columns("docs"))
+        .expect("create table");
+    for (id, kind_pair) in [
+        (1u64, ("ja", "blog")),
+        (2, ("ja", "news")),
+        (3, ("en", "blog")),
+        (4, ("en", "news")),
+    ] {
+        insert_row_with_kind(
+            &storage,
+            "docs",
+            "tenant-a",
+            id,
+            vec![1.0, 0.0, 0.0, 0.0],
+            kind_pair,
+            Visibility::Private,
+        );
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    // (ORDER BY 付き EXPLAIN, ORDER BY を除いた基準 EXPLAIN, 期待行)
+    let cases: [(&str, &str, [&str; 2]); 4] = [
+        (
+            "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY c DESC, lang LIMIT 3 OFFSET 1",
+            "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang LIMIT 3 OFFSET 1",
+            [
+                "scalar_plan: plain_scan",
+                "access_path: scalar_index_group_enumeration",
+            ],
+        ),
+        (
+            "EXPLAIN SELECT lang, kind, COUNT(*) AS c FROM docs GROUP BY lang, kind ORDER BY c DESC, lang ASC, kind DESC",
+            "EXPLAIN SELECT lang, kind, COUNT(*) AS c FROM docs GROUP BY lang, kind",
+            ["scalar_plan: plain_scan", "access_path: full_scan"],
+        ),
+        (
+            "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs WHERE lang = 'ja' GROUP BY lang ORDER BY lang DESC",
+            "EXPLAIN SELECT lang, COUNT(*) AS c FROM docs WHERE lang = 'ja' GROUP BY lang",
+            [
+                "scalar_plan: index_equality",
+                "access_path: scalar_index_candidates",
+            ],
+        ),
+        (
+            "EXPLAIN SELECT DISTINCT lang FROM docs ORDER BY lang DESC",
+            "EXPLAIN SELECT DISTINCT lang FROM docs",
+            [
+                "scalar_plan: plain_scan",
+                "access_path: scalar_index_group_enumeration",
+            ],
+        ),
+    ];
+    for (sql, baseline, expected) in cases {
+        let visible = explain_in_fresh_session(&core, "tenant-a", sql);
+        let invisible = explain_in_fresh_session(&core, "tenant-b", sql);
+        assert_eq!(visible, invisible, "tenant mismatch for {sql}");
+        let plain = explain_in_fresh_session(&core, "tenant-a", baseline);
+        assert_eq!(visible, plain, "ORDER BY changed EXPLAIN for {sql}");
+        assert_eq!(visible, expected, "unexpected plan for {sql}");
+
+        // 入口の契約: `execute_sql` は EXPLAIN を 42601 で拒否する。
+        let err = core
+            .execute_sql(&ctx("tenant-a"), sql)
+            .expect_err("execute_sql must reject EXPLAIN");
+        assert_eq!(err.wire_code(), "42601", "mismatch for {sql}");
+    }
+}
+
+#[test]
+fn scalar_order_by_aggregate_explain_does_not_execute_body() {
+    // Issue #1351・SQL-25・SQL-27: 本体を実行すると SUM(id) が u64 であふれて 22003 に
+    // なるデータで、EXPLAIN は成功する（評価・ソートを行わない）ことを固定する。
+    let path = unique_db_path("sql27-agg-order-by-no-exec");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector("docs"))
+        .expect("create table");
+    for id in [u64::MAX, 1] {
+        insert_row(
+            &storage,
+            "docs",
+            "tenant-a",
+            id,
+            vec![1.0, 0.0, 0.0, 0.0],
+            "ja",
+            Visibility::Private,
+        );
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    let body = "SELECT lang, SUM(id) AS s FROM docs GROUP BY lang ORDER BY s DESC";
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(&ctx("tenant-a"), &mut session, body)
+        .expect_err("body must overflow");
+    assert_eq!(err.wire_code(), "22003", "precondition: body overflows");
+
+    let lines = explain_in_fresh_session(&core, "tenant-a", &format!("EXPLAIN {body}"));
+    assert_eq!(
+        lines,
+        vec![
+            "scalar_plan: plain_scan",
+            "access_path: scalar_index_group_enumeration"
+        ]
+    );
+    let other = explain_in_fresh_session(&core, "tenant-b", &format!("EXPLAIN {body}"));
+    assert_eq!(lines, other);
+
+    // 書き込みしない: 件数は不変。
+    let count = core
+        .execute_sql(&ctx("tenant-a"), "SELECT COUNT(id) FROM docs")
+        .expect("count after EXPLAIN");
+    let cell = count
+        .rows
+        .into_iter()
+        .next()
+        .expect("count row")
+        .cells
+        .into_iter()
+        .next()
+        .expect("count cell");
+    assert_eq!(cell, Cell::Integer(2));
+}
+
+#[test]
+fn scalar_order_by_aggregate_explain_error_codes_match_non_explain() {
+    // Issue #1351・SQL-25: EXPLAIN を前置しても ORDER BY の束縛検証（fail-closed）を
+    // 迂回できず、同じ wire_code で拒否される。
+    let path = unique_db_path("sql27-agg-order-by-error-parity");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_with_vector("docs"))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    let nine_keys = format!(
+        "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY {}",
+        ["c"; 9].join(", ")
+    );
+    let cases: Vec<(String, &str)> = vec![
+        (
+            "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY lang NULLS LAST".into(),
+            "42601",
+        ),
+        (
+            "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY 1".into(),
+            "42601",
+        ),
+        (
+            "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY c, nope".into(),
+            "22000",
+        ),
+        (nine_keys, "54000"),
+        (
+            "SELECT lang, COUNT(*) AS c FROM missing GROUP BY lang ORDER BY c".into(),
+            "42P01",
+        ),
+    ];
+    for (body, expected) in cases {
+        let mut session = SessionState::default();
+        let plain = core
+            .execute_sql_in_session(&ctx("tenant-a"), &mut session, &body)
+            .expect_err(&format!("{body} must be rejected"));
+        let mut session = SessionState::default();
+        let explained = core
+            .execute_sql_in_session(&ctx("tenant-a"), &mut session, &format!("EXPLAIN {body}"))
+            .expect_err(&format!("EXPLAIN {body} must be rejected"));
+        assert_eq!(plain.wire_code(), expected, "plain mismatch for {body}");
+        assert_eq!(
+            explained.wire_code(),
+            plain.wire_code(),
+            "parity mismatch for {body}"
+        );
+    }
 }
