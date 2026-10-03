@@ -971,6 +971,36 @@ psycopg_extended.py`・`pg_extended.js` を追加した。簡易クエリ経路�
 実行結果（本開発環境）: psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0 で
 `--ignored` 5 件 green、非 ignore の fixture ガード 1 件 green。
 
+## 分割実行 DML の 3 クライアント検証（Issue #1339・SQL-32）
+
+分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`・`SHOW`／`CANCEL PARTITIONED DML`）が
+無改造の psql・psycopg・node `pg` のドライバ API まで届くことを確認する層 B。層 A
+（`tests/wire16_multi_statement.rs`・engine `tests/partitioned_dml_sql.rs`）と
+`make crash-test-partitioned-dml` が主たる回帰保護で、本節は実クライアントでの到達確認に限る。
+仕様ポインタ: SQL-32・SQL-19・RECOVER-11・RECOVER-12・RLS-9・RLS-10・ERR-1・ERR-2・ERR-4、
+ADR `docs/design/partitioned-dml.md`。
+
+- テスト: `three_client_e2e.rs::three_clients_run_partitioned_dml_and_receive_vd001_vd002_25001`
+  （`#[ignore]`・`make e2e-three-client` に含まれる）。クライアントごとに新しいサーバーと DB。
+- 検証項目: UPDATE／DELETE の成功とコマンドタグの件数、`SHOW` の進捗（`completed`／
+  `interrupted`／`cancelled`）、`VD001`（件数・原因コード入りメッセージ）、`VD002`、
+  トランザクション内の `25001`、他テナントからの `SHOW`／`CANCEL` が「ジョブなし」と同じ
+  0 行になること、他テナントの行が分割 DELETE の影響を受けないこと。
+- 確定的に起こす方法: `VD001` は UNIQUE 列への一括 UPDATE ＋ `CHUNK 1`（2 チャンク目で違反）、
+  `VD002` は取り消し済みジョブへの再送。実行中の取り消しは時間依存の競合になるため採らない。
+  `25001` は `BEGIN` を別メッセージ（psql は別の `-c`、他は prelude）で送る。複数文メッセージは
+  別経路（層 A の `wire16`）の `25001` になるため。
+- コマンドタグの観測経路: psql は `-q` なしの stdout、psycopg は `cur.statusmessage`、node `pg`
+  は `result.command`／`result.rowCount`。後 2 者は `WIRE_PRINT_COMMAND_TAG=1`（`"1"` のみ受理、
+  他は fail-closed。未指定は挙動不変）でスクリプトが 1 行出力する。ドライバ本体は無改造。
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-vector-db-wire-server
+  --features fault-injection --test three_client_e2e three_clients_run_partitioned_dml --
+  --ignored --nocapture --test-threads=1` の `[e2e-record]` 行を PR 本文へ転記する。行は固定
+  ラベルと観測値のみで、ユーザー名・資格情報・テナント id を含まないことをテストが assert する。
+- 網羅ガード: 常時実行の網羅ガードのうち更新対象は無かった（HTTP 側の
+  `parity_matrix_covers_every_nosql_op` は #1315 で対応済み。`ErrorClass::ALL` 走査は
+  `VD001`／`VD002` を自動で含む）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
@@ -1032,3 +1062,6 @@ psycopg_extended.py`・`pg_extended.js` を追加した。簡易クエリ経路�
   `$n` パラメータ束縛（WIRE-12・#1171）も実装された。ただし `USING MODE $n` は
   `$n` の受理位置外のため引き続き `42601` で拒否され、MVP は簡易クエリの
   `42601` 拒否のみを検証する（層 B での `$n` 検証は後続）
+- Issue #1339: `three_client_e2e.rs` に分割実行 DML の層 B を追加し、
+  `psycopg_client.py`／`pg_client.js` に opt-in の `WIRE_PRINT_COMMAND_TAG` を追加した
+  （production コードの変更なし）。

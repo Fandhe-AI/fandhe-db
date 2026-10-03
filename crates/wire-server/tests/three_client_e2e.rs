@@ -68,6 +68,15 @@
 //! `wire17_copy_*_psql_backslash_copy_*` が層 A で固定する。
 //! ADR: `docs/design/three-client-e2e-harness.md`「Issue #1177」節。
 //!
+//! Issue #1339（SQL-32 ほか）: 分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`・
+//! `SHOW`／`CANCEL PARTITIONED DML`）の成功・件数・進捗照会・取り消し（`VD002`）・
+//! 部分完了（`VD001`）・トランザクション内拒否（`25001`）が、無改造クライアント自身の
+//! API まで届くことを `three_clients_run_partitioned_dml_and_receive_vd001_vd002_25001`
+//! で確認する。生バイトの層 A（`tests/wire16_multi_statement.rs`・engine の
+//! `tests/partitioned_dml_sql.rs`）が主たる回帰保護で、本ファイルは実クライアントでの
+//! 到達確認に限る。コマンドタグは `WIRE_PRINT_COMMAND_TAG`（クライアントスクリプトの
+//! opt-in）で観測する。ADR: `docs/design/three-client-e2e-harness.md`「分割実行 DML」節。
+//!
 //! WIRE-19（Issue #943）: 明示トランザクションの `ReadyForQuery` 状態バイト
 //! （`'I'`/`'T'`/`'E'`。production の中核は Issue #942・PR #1041 で実装済み）
 //! が無改造クライアント自身の API から観測できることを
@@ -1062,6 +1071,19 @@ fn spawn_psycopg_client(
     prelude: &[&str],
     sql: &str,
 ) -> std::process::Output {
+    spawn_psycopg_client_with_env(port, user, password, prelude, sql, &[])
+}
+
+/// `spawn_psycopg_client` に追加の環境変数（Issue #1339 の `WIRE_PRINT_COMMAND_TAG` 等、
+/// クライアントスクリプトの opt-in 設定）を渡せる版。
+fn spawn_psycopg_client_with_env(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let python = resolve_tool("PYTHON_BIN", "python3");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
     let mut cmd = Command::new(&python);
@@ -1075,6 +1097,9 @@ fn spawn_psycopg_client(
         let prelude_json =
             serde_json_prelude(prelude).expect("prelude statements must encode as a JSON array");
         cmd.env("WIRE_SQL_PRELUDE", prelude_json);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn {python}: {e}"))
@@ -1161,6 +1186,19 @@ fn spawn_pg_client(
     prelude: &[&str],
     sql: &str,
 ) -> std::process::Output {
+    spawn_pg_client_with_env(port, user, password, prelude, sql, &[])
+}
+
+/// `spawn_pg_client` に追加の環境変数（Issue #1339 の `WIRE_PRINT_COMMAND_TAG` 等、
+/// クライアントスクリプトの opt-in 設定）を渡せる版。
+fn spawn_pg_client_with_env(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let node = resolve_tool("NODE_BIN", "node");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
     let mut cmd = Command::new(&node);
@@ -1174,6 +1212,9 @@ fn spawn_pg_client(
         let prelude_json =
             serde_json_prelude(prelude).expect("prelude statements must encode as a JSON array");
         cmd.env("WIRE_SQL_PRELUDE", prelude_json);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn {node}: {e}"))
@@ -2493,5 +2534,379 @@ fn three_clients_multi_row_insert_matches_nosql_rows_insert() {
             "{name}: bob must not see alice's rows"
         );
         assert_eq!(s_bob, n_bob, "{name}: bob view must equal NoSQL bob view");
+    }
+}
+// ---- 分割実行 DML（Issue #1339・SQL-32）--------------------------------
+
+/// 分割実行 DML シナリオで使う 3 クライアントの識別子。
+#[derive(Clone, Copy)]
+enum Client {
+    Psql,
+    Psycopg,
+    Pg,
+}
+
+impl Client {
+    fn name(self) -> &'static str {
+        match self {
+            Client::Psql => "psql",
+            Client::Psycopg => "psycopg",
+            Client::Pg => "pg",
+        }
+    }
+
+    /// 結果行（`|` 区切り）を返す。成功しなければ panic。
+    fn rows(self, port: u16, user: &str, prelude: &[&str], sql: &str) -> Vec<String> {
+        let pw = format!("pw-{user}");
+        match self {
+            Client::Psql => run_psql_session(port, user, &pw, prelude, sql),
+            Client::Psycopg => run_psycopg_session(port, user, &pw, prelude, sql),
+            Client::Pg => run_pg_session(port, user, &pw, prelude, sql),
+        }
+    }
+
+    /// コマンドタグ（`UPDATE 2` 等。stdout の最後の非空行）を返す。成功しなければ panic。
+    /// 結果行を持たない文（分割実行 DML）専用で、prelude は使わない。
+    fn command_tag(self, port: u16, user: &str, sql: &str) -> String {
+        let pw = format!("pw-{user}");
+        let output = match self {
+            Client::Psql => {
+                let psql = resolve_tool("PSQL_BIN", "psql");
+                Command::new(&psql)
+                    .env("PGPASSWORD", &pw)
+                    .args([
+                        "-h",
+                        "127.0.0.1",
+                        "-p",
+                        &port.to_string(),
+                        "-U",
+                        user,
+                        "-d",
+                        "irrelevant-db-name",
+                        "-X",
+                        "-w",
+                        "-At",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        sql,
+                    ])
+                    .output()
+                    .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"))
+            }
+            Client::Psycopg => spawn_psycopg_client_with_env(
+                port,
+                user,
+                &pw,
+                &[],
+                sql,
+                &[("WIRE_PRINT_COMMAND_TAG", "1")],
+            ),
+            Client::Pg => spawn_pg_client_with_env(
+                port,
+                user,
+                &pw,
+                &[],
+                sql,
+                &[("WIRE_PRINT_COMMAND_TAG", "1")],
+            ),
+        };
+        assert!(
+            output.status.success(),
+            "{} failed for `{sql}`: stderr={}",
+            self.name(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim())
+            .rfind(|l| !l.is_empty())
+            .unwrap_or_else(|| panic!("{}: no command tag in stdout", self.name()))
+            .to_string()
+    }
+
+    /// `prelude` の後に `sql` が拒否され、stderr に `sqlstate` と `needles` の全てが
+    /// 含まれることを確認する。
+    fn expect_error(
+        self,
+        port: u16,
+        user: &str,
+        prelude: &[&str],
+        sql: &str,
+        sqlstate: &str,
+        needles: &[&str],
+    ) {
+        let pw = format!("pw-{user}");
+        let output = match self {
+            Client::Psql => {
+                let psql = resolve_tool("PSQL_BIN", "psql");
+                let mut args: Vec<String> = [
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-U",
+                    user,
+                    "-d",
+                    "irrelevant-db-name",
+                    "-X",
+                    "-w",
+                    "-q",
+                    "-At",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-v",
+                    "VERBOSITY=verbose",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+                for stmt in prelude.iter().chain(std::iter::once(&sql)) {
+                    args.push("-c".into());
+                    args.push((*stmt).into());
+                }
+                Command::new(&psql)
+                    .env("PGPASSWORD", &pw)
+                    .env("LC_ALL", "C")
+                    .args(&args)
+                    .output()
+                    .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"))
+            }
+            Client::Psycopg => spawn_psycopg_client(port, user, &pw, prelude, sql),
+            Client::Pg => spawn_pg_client(port, user, &pw, prelude, sql),
+        };
+        assert!(
+            !output.status.success(),
+            "{} must exit non-zero for `{sql}`",
+            self.name()
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(sqlstate),
+            "{}: expected SQLSTATE {sqlstate} for `{sql}`, got: {stderr}",
+            self.name()
+        );
+        for needle in needles {
+            assert!(
+                stderr.contains(needle),
+                "{}: expected `{needle}` in error for `{sql}`, got: {stderr}",
+                self.name()
+            );
+        }
+    }
+}
+
+/// `udocs (n BIGINT, u TEXT UNIQUE)` を持つ一時 DB。tenant-a に 3 行、tenant-b に
+/// 重ならない id・`u` の 3 行を投入する（UNIQUE の適用範囲に依存しないため）。
+/// `EngineCore` は返す前に drop し、redb のロックを解放する。
+fn seed_partitioned_dml_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-pdml");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let sys = PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+        .expect("tenant");
+    core.execute_sql_in_session(
+        &sys,
+        &mut session,
+        "CREATE TABLE udocs (n BIGINT, u TEXT UNIQUE)",
+    )
+    .expect("create table");
+    for (tenant, sql) in [
+        (
+            "tenant-a",
+            "INSERT INTO udocs (id, n, u) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c') \
+             USING OPERATION_ID 'seed-a'",
+        ),
+        (
+            "tenant-b",
+            "INSERT INTO udocs (id, n, u) VALUES (101, 10, 'x'), (102, 20, 'y'), (103, 30, 'z') \
+             USING OPERATION_ID 'seed-b'",
+        ),
+    ] {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        core.execute_sql_in_session(&ctx, &mut session, sql)
+            .expect("seed");
+    }
+    drop(core);
+    (path, guard)
+}
+
+/// 分割実行 DML（SQL-32）を 3 クライアントで実行し、コマンドタグ・進捗照会・
+/// `VD001`／`VD002`／`25001` がドライバ API へ届くこと、他テナントからジョブの存在が
+/// 見えないこと（RLS）を検証する。時間依存の競合は使わず、UNIQUE 列＋`CHUNK 1` の
+/// 部分完了と、取り消し済みジョブへの再送で `VD002` を確定的に起こす。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_run_partitioned_dml_and_receive_vd001_vd002_25001() {
+    let users_dir = temp_db::TempDir::new("three-client-e2e-pdml-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    for client in [Client::Psql, Client::Psycopg, Client::Pg] {
+        let name = client.name();
+        let (db, _guard) = seed_partitioned_dml_db();
+        let server = spawn_wire_server(&users_path, &db, &[]);
+        let port = server.port;
+        let op_u = format!("pu-{name}");
+        let op_p = format!("pp-{name}");
+        let op_d = format!("pd-{name}");
+        let op_t = format!("pt-{name}");
+        let show = |op: &str| format!("SHOW PARTITIONED DML '{op}' ON udocs");
+        let cancel = |op: &str| format!("CANCEL PARTITIONED DML '{op}' ON udocs");
+        let alice_show = |op: &str| client.rows(port, "alice", &[], &show(op));
+        let bob_show = |op: &str| client.rows(port, "bob", &[], &show(op));
+
+        // 1. UPDATE の成功とコマンドタグの件数。
+        let update_sql = format!(
+            "UPDATE udocs SET n = 7 WHERE n > 15 USING OPERATION_ID '{op_u}' PARTITIONED CHUNK 1"
+        );
+        let update_tag = client.command_tag(port, "alice", &update_sql);
+        assert_eq!(update_tag, "UPDATE 2", "{name}: update tag");
+
+        // 2. 進捗照会（完了済み・再送の拒否・未知の op は 0 行）。
+        assert_eq!(
+            alice_show(&op_u),
+            vec!["completed|2"],
+            "{name}: show completed"
+        );
+        client.expect_error(port, "alice", &[], &update_sql, "23505", &[]);
+        assert!(alice_show("no-such-op").is_empty(), "{name}: unknown op");
+        assert!(
+            bob_show(&op_u).is_empty(),
+            "{name}: bob must not see alice's job"
+        );
+
+        // 3. 部分完了（VD001）。2 チャンク目で UNIQUE 違反。
+        let partial = format!(
+            "UPDATE udocs SET u = 'dup' WHERE n > 0 USING OPERATION_ID '{op_p}' PARTITIONED CHUNK 1"
+        );
+        client.expect_error(
+            port,
+            "alice",
+            &[],
+            &partial,
+            "VD001",
+            &[
+                "committed 1 rows",
+                "cause 23505",
+                &format!("operation_id '{op_p}"),
+            ],
+        );
+        assert_eq!(
+            alice_show(&op_p),
+            vec!["interrupted|1"],
+            "{name}: show interrupted"
+        );
+        assert!(
+            bob_show(&op_p).is_empty(),
+            "{name}: bob must not see interrupted job"
+        );
+
+        // 4. 取り消し（VD002）。他テナントの取り消しは効かない。
+        assert!(
+            client.rows(port, "bob", &[], &cancel(&op_p)).is_empty(),
+            "{name}: bob cancel must look like no job"
+        );
+        assert_eq!(
+            alice_show(&op_p),
+            vec!["interrupted|1"],
+            "{name}: unaffected by bob cancel"
+        );
+        assert_eq!(
+            client.rows(port, "alice", &[], &cancel(&op_p)),
+            vec!["cancelled|1"],
+            "{name}: cancel"
+        );
+        client.expect_error(port, "alice", &[], &partial, "VD002", &["committed 1 rows"]);
+        assert_eq!(
+            alice_show(&op_p),
+            vec!["cancelled|1"],
+            "{name}: show cancelled"
+        );
+        assert_eq!(
+            client.rows(
+                port,
+                "alice",
+                &[],
+                "SELECT id FROM udocs WHERE u = 'dup' LIMIT 10"
+            ),
+            vec!["1"],
+            "{name}: committed chunk stays after cancel"
+        );
+
+        // 5. トランザクション内の拒否（25001）。BEGIN は別メッセージで送る。
+        client.expect_error(
+            port,
+            "alice",
+            &["BEGIN"],
+            &format!("DELETE FROM udocs WHERE n > 0 USING OPERATION_ID '{op_t}' PARTITIONED"),
+            "25001",
+            &["partitioned DML cannot run inside a transaction block"],
+        );
+        client.expect_error(port, "alice", &["BEGIN"], &cancel(&op_p), "25001", &[]);
+        assert!(
+            alice_show(&op_t).is_empty(),
+            "{name}: rejected job must not exist"
+        );
+        assert_eq!(
+            client
+                .rows(port, "alice", &[], "SELECT id FROM udocs LIMIT 100")
+                .len(),
+            3,
+            "{name}: nothing executed in txn"
+        );
+
+        // 6. DELETE の成功とコマンドタグの件数。
+        let delete_tag = client.command_tag(
+            port,
+            "alice",
+            &format!(
+                "DELETE FROM udocs WHERE n > 0 USING OPERATION_ID '{op_d}' PARTITIONED CHUNK 2"
+            ),
+        );
+        assert_eq!(delete_tag, "DELETE 3", "{name}: delete tag");
+        assert_eq!(
+            alice_show(&op_d),
+            vec!["completed|3"],
+            "{name}: show delete"
+        );
+        assert!(
+            bob_show(&op_d).is_empty(),
+            "{name}: bob must not see delete job"
+        );
+        assert!(
+            client
+                .rows(port, "alice", &[], "SELECT id FROM udocs LIMIT 100")
+                .is_empty(),
+            "{name}: alice rows deleted"
+        );
+
+        // 7. RLS: 他テナントの行は alice の分割 DELETE の影響を受けない。
+        let mut bob_ids = client.rows(port, "bob", &[], "SELECT id FROM udocs LIMIT 100");
+        bob_ids.sort();
+        assert_eq!(
+            bob_ids,
+            vec!["101", "102", "103"],
+            "{name}: bob rows intact"
+        );
+        drop(server);
+
+        let record = format!(
+            "three_clients_partitioned_dml: client={name} update_tag=\"{update_tag}\" \
+             delete_tag=\"{delete_tag}\" show=completed|2,interrupted|1,cancelled|1,completed|3 \
+             vd001=ok(cause 23505) vd002=ok txn_25001=ok rls_other_tenant=empty"
+        );
+        for secret in ["alice", "bob", "carol", "pw-", "tenant-"] {
+            assert!(
+                !record.contains(secret),
+                "record must not contain `{secret}`"
+            );
+        }
+        eprintln!("[e2e-record] {record}");
     }
 }

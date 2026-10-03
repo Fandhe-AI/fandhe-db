@@ -30,6 +30,12 @@ codex-review 指摘・PR #210）。
   psycopg／libpq が受理する値のみ）に限り、語彙外は fail-closed でエラー
   終了する。未指定なら従来どおり kwarg を渡さない（挙動不変）。
 
+- WIRE_PRINT_COMMAND_TAG（任意・Issue #1339・SQL-32）: `"1"` のときのみ、本体 SQL の
+  実行後に `cur.statusmessage`（`CommandComplete` のコマンドタグ。例 `UPDATE 2`）を
+  stdout へ 1 行出力する（分割実行 DML の件数がドライバ API へ届くことの観測用）。
+  語彙は `"1"` のみで、それ以外の値は fail-closed でエラー終了する。未指定なら
+  従来どおり何も出さない（挙動不変）。
+
 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 出力し、終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう
 全列を出力する。`crates/wire-server/tests/three_client_e2e.rs` の
@@ -82,6 +88,14 @@ def main() -> int:
         )
         return 1
 
+    print_tag = os.environ.get("WIRE_PRINT_COMMAND_TAG")
+    if print_tag is not None and print_tag != "1":
+        print(
+            f"psycopg_client: WIRE_PRINT_COMMAND_TAG must be \"1\" if set, got {print_tag!r}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         import psycopg
     except ImportError as e:
@@ -117,6 +131,9 @@ def main() -> int:
                 if cur.description is not None:
                     for row in cur.fetchall():
                         print("|".join(str(value) for value in row))
+                # コマンドタグ（Issue #1339）。opt-in 時のみ、末尾に 1 行出す。
+                if print_tag == "1" and cur.statusmessage:
+                    print(cur.statusmessage)
         return 0
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
         sqlstate = getattr(e, "sqlstate", None)

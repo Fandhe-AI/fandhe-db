@@ -18,6 +18,11 @@
 // 検証用。テスト証明書は検証対象外＝chain 検証は行わない構成のため）。
 // 語彙外（`no-verify` 以外の非空値）は fail-closed でエラー終了する。未指定
 // なら従来どおり ssl オプションを渡さない（挙動不変）。
+// WIRE_PRINT_COMMAND_TAG（任意・Issue #1339・SQL-32）: "1" のときのみ、本体 SQL の
+// 実行後に `${result.command} ${result.rowCount}`（CommandComplete のコマンドタグ。
+// 例 "UPDATE 2"）を stdout へ 1 行出力する（分割実行 DML の件数がドライバ API へ
+// 届くことの観測用）。語彙は "1" のみで、それ以外の値は fail-closed でエラー終了
+// する。未指定なら従来どおり何も出さない（挙動不変）。
 // 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 // 出力し終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう全列を
 // 出力する。`crates/wire-server/tests/three_client_e2e.rs` の `run_psql`／
@@ -65,6 +70,12 @@ if (wireSsl !== undefined && wireSsl !== "no-verify") {
   process.exit(1);
 }
 
+const printTag = process.env.WIRE_PRINT_COMMAND_TAG;
+if (printTag !== undefined && printTag !== "1") {
+  process.stderr.write(`pg_client: WIRE_PRINT_COMMAND_TAG must be "1" if set, got ${JSON.stringify(printTag)}\n`);
+  process.exit(1);
+}
+
 let pg;
 try {
   pg = require("pg");
@@ -105,6 +116,9 @@ client
   .then((result) => {
     for (const row of result.rows) {
       process.stdout.write(`${Object.values(row).join("|")}\n`);
+    }
+    if (printTag === "1" && result.command) {
+      process.stdout.write(`${result.command} ${result.rowCount}\n`);
     }
     return client.end();
   })

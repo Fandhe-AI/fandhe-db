@@ -423,3 +423,9 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **意図した差分**: 制御文字を含む文字列 DEFAULT は NoSQL では `42601`（SQL は受理）。`create_table` の `nullable` に対し add_column は `not_null` を使い、`nullable` は未知キーとして `42601`。
 - **テスト**: `crates/wire-server/tests/nosql13_ddl.rs`（SQL／NoSQL の成否・`wire_code`・HTTP ステータスのパリティ表、形状エラー、`42501` のバイト一致、行の有無に依存しない `42601`、既存行への DEFAULT 反映と `23502`）、`ddl.rs` の単体テスト。
 - **対象外（申し送り）**: create_table の `default` での真偽値受け付け、制御文字入り文字列 DEFAULT の受け付け、`nosql-api.md` の constraints 行に残る `check` は `0A000` という記述の更新、`ALTER COLUMN TYPE`／`SET DEFAULT` 相当の NoSQL op。
+
+**Issue #1339（test(wire): 分割実行 DML を 3 クライアント（psql・psycopg・node pg）で検証する。SQL-32・SQL-19・RECOVER-11・RECOVER-12・RLS-9・RLS-10・ERR-1・ERR-2・ERR-4 ポインタ）**: 分割実行 DML の成功とコマンドタグの件数、進捗照会、取り消し（`VD002`）、部分完了（`VD001`）、トランザクション内拒否（`25001`）、他テナントからのジョブ非可視を、無改造の 3 クライアントで確認する層 B テストを追加した（production コード・依存の変更なし）。
+
+- **変更箇所**: `crates/wire-server/tests/three_client_e2e.rs`（`three_clients_run_partitioned_dml_and_receive_vd001_vd002_25001`）、`tests/three_client/{psycopg_client.py,pg_client.js}`（opt-in の `WIRE_PRINT_COMMAND_TAG`。`"1"` のみ受理で他は fail-closed）、`docs/design/three-client-e2e-harness.md`、`Makefile` のヘルプ文。
+- **網羅ガード**: 更新対象なし（HTTP 側 `parity_matrix_covers_every_nosql_op` は #1315 で対応済み）。
+- **対象外（申し送り）**: 実行中ジョブの別接続からの取り消し、CancelRequest・`statement_timeout`、拡張クエリ・TLS 経由の分割実行。
