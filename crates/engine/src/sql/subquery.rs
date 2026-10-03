@@ -403,6 +403,40 @@ fn execute_inner_query(
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    let mut meta_sink = None;
+    execute_inner_query_with_meta(
+        inner_tokens,
+        depth,
+        intent,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        budget,
+        in_value_budget,
+        &mut meta_sink,
+    )
+}
+
+/// [`execute_inner_query`] の本体。束縛（`bind_scan`／`bind_aggregate`）に成功した時点で、
+/// 実行とは独立に確定する投影列メタデータを `meta_sink` へ書き出す（Issue #1352。
+/// 実行時エラーを遅延する投影位置のスカラーサブクエリが、外側の行数に関わらず同じ列型を
+/// 公告するため）。束縛前に失敗した場合（静的エラー）は `meta_sink` が `None` のまま残る。
+#[allow(clippy::too_many_arguments)]
+fn execute_inner_query_with_meta(
+    inner_tokens: &[Token],
+    depth: usize,
+    intent: InnerScanIntent,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
+) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     *budget = budget.checked_sub(1).ok_or_else(|| {
         SqlSurfaceError::payload_too_large(format!(
             "subquery execution count exceeds limit {MAX_SUBQUERY_EXECUTIONS}"
@@ -422,6 +456,7 @@ fn execute_inner_query(
             udfs,
             budget,
             in_value_budget,
+            meta_sink,
         )?,
         (
             Statement::Aggregate(validated),
@@ -435,6 +470,7 @@ fn execute_inner_query(
             udfs,
             budget,
             in_value_budget,
+            meta_sink,
         )?,
         _ => {
             return Err(SqlSurfaceError::unsupported(
@@ -471,6 +507,7 @@ fn execute_inner_scan_statement(
     udfs: &UdfRegistry,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     // Cursor Bugbot 指摘対応: ウィンドウ関数（SQL-30・TASK-214、Issue #930）を
     // 含む内側は一律拒否する。`window_items` が非空だと `sql::scan::execute_scan` は
@@ -563,6 +600,7 @@ fn execute_inner_scan_statement(
     }
 
     let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+    *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
     super::scan::execute_scan(read_txn, ctx, &inner_schema, &bound)
 }
 
@@ -579,6 +617,7 @@ fn execute_inner_aggregate_statement(
     udfs: &UdfRegistry,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     if validated.items.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
@@ -604,6 +643,7 @@ fn execute_inner_aggregate_statement(
         in_value_budget,
     )?;
     let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
+    *meta_sink = Some(super::describe::aggregate_columns(&bound));
     super::aggregate::execute_aggregate_with_cache(
         read_txn,
         ctx,
@@ -1056,7 +1096,8 @@ pub(crate) fn resolve_scalar_projection_items(
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let result = match execute_inner_query(
+        let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+        let result = match execute_inner_query_with_meta(
             &item.inner_tokens,
             item.depth,
             InnerScanIntent::ScalarValue,
@@ -1067,15 +1108,21 @@ pub(crate) fn resolve_scalar_projection_items(
             udfs,
             budget,
             in_value_budget,
+            &mut meta_sink,
         ) {
             Ok(r) => r,
-            // 実行時エラーのみ外側の行数が判明するまで遅延する（メタデータは得られない
-            // ため `Computed`・型なしの代替列で位置を確保する）。それ以外は即返す。
+            // 束縛に成功した後の実行時データ例外（`22xxx`。0 除算・数値あふれ等）だけを、
+            // 外側の行数が判明するまで遅延する。束縛前に失敗した静的エラー（`meta_sink` が
+            // 未確定。`22P02` 等の bind 時エラーを含む）と `22000` は即返す。列メタデータは
+            // 実行とは独立に束縛結果から確定済みのため、外側の行数で列型は変わらない。
             Err(e) if e.wire_code().starts_with("22") && e.wire_code() != "22000" => {
-                let name = item.alias.clone().unwrap_or_else(|| "?column?".to_string());
+                let inner_meta = match meta_sink.as_deref() {
+                    Some([m]) => m.clone(),
+                    _ => return Err(e),
+                };
                 out.push(ResolvedScalarItem {
                     position: item.position,
-                    meta: ColumnMeta::Computed { name, ty: None },
+                    meta: alias_scalar_meta(&inner_meta, item.alias.as_ref()),
                     cell: Cell::Null,
                     multi_row: false,
                     deferred_error: Some(e),
@@ -1095,24 +1142,7 @@ pub(crate) fn resolve_scalar_projection_items(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "subquery result missing projected column metadata".to_string(),
             })?;
-        // 別名があれば列名だけ差し替える（型 OID の根拠となる型は保持する）。別名なしは
-        // 内側の列名（PostgreSQL と同じ）。疑似列 `id` を別名付きで返す場合は名前を
-        // 保持できる枠が `Computed` しか無く、wire では text になる。
-        let meta = match (inner_meta, item.alias.as_ref()) {
-            (meta, None) => meta.clone(),
-            (ColumnMeta::Scalar { ty, .. }, Some(alias)) => ColumnMeta::Scalar {
-                name: alias.clone(),
-                ty: ty.clone(),
-            },
-            (ColumnMeta::Computed { ty, .. }, Some(alias)) => ColumnMeta::Computed {
-                name: alias.clone(),
-                ty: ty.clone(),
-            },
-            (ColumnMeta::Id, Some(alias)) => ColumnMeta::Computed {
-                name: alias.clone(),
-                ty: None,
-            },
-        };
+        let meta = alias_scalar_meta(inner_meta, item.alias.as_ref());
         let multi_row = result.rows.len() > 1;
         let cell = match result.rows.first() {
             None => Cell::Null,
@@ -1136,6 +1166,30 @@ pub(crate) fn resolve_scalar_projection_items(
     Ok(out)
 }
 
+/// 内側の投影列メタデータへ別名を適用する。別名があれば列名だけ差し替え、型 OID の
+/// 根拠となる型は保持する。疑似列 `id`（名前を持てない）は JOIN の別名処理と同じく
+/// numeric 静的型の `Computed` へ載せ替える（wire 上の型は `Id` と同じ numeric）。
+fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnMeta {
+    match (inner_meta, alias) {
+        (meta, None) => meta.clone(),
+        (ColumnMeta::Scalar { ty, .. }, Some(alias)) => ColumnMeta::Scalar {
+            name: alias.clone(),
+            ty: ty.clone(),
+        },
+        (ColumnMeta::Computed { ty, .. }, Some(alias)) => ColumnMeta::Computed {
+            name: alias.clone(),
+            ty: ty.clone(),
+        },
+        (ColumnMeta::Id, Some(alias)) => ColumnMeta::Computed {
+            name: alias.clone(),
+            ty: Some(crate::catalog::ColumnType::Numeric {
+                precision: 20,
+                scale: 0,
+            }),
+        },
+    }
+}
+
 /// 解決済みの投影位置スカラーサブクエリを、外側の結果（投影位置の項目を含まない列）へ
 /// SELECT リスト上の位置どおりに合流する（Issue #1352）。
 ///
@@ -1149,6 +1203,10 @@ pub(crate) fn merge_scalar_projection_items(
     mut result: super::exec::QueryResult,
     items: Vec<ResolvedScalarItem>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    // 投影セルが無ければ合流しない。外側結果は `sql::scan` が同じ上限で検査済みのため再検査しない。
+    if items.is_empty() {
+        return Ok(result);
+    }
     if !result.rows.is_empty() {
         if let Some(e) = items.iter().find_map(|i| i.deferred_error.clone()) {
             return Err(e);
@@ -1161,9 +1219,6 @@ pub(crate) fn merge_scalar_projection_items(
     }
     // 外側結果の使用量を引き継ぎ、追加分との合計を確保前に検査する。
     let mut total_bytes: usize = super::cursor::estimate_result_bytes(&result);
-    if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
-        return Err(merge_too_large());
-    }
     for item in &items {
         let per_cell = std::mem::size_of::<Cell>()
             .checked_add(super::cursor::estimate_cell_bytes(&item.cell))

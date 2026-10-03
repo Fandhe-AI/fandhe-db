@@ -322,6 +322,50 @@ fn projection_subquery_runtime_error_is_deferred_until_outer_has_rows() {
 }
 
 #[test]
+fn projection_subquery_alias_of_id_keeps_numeric_type() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    let q = format!("SELECT name, (SELECT id FROM {REFS} LIMIT 1) AS ref_id FROM {ITEMS} LIMIT 10");
+    let r = run(&core, &ctx, &q);
+    assert_eq!(
+        r.columns[1],
+        ColumnMeta::Computed {
+            name: "ref_id".to_string(),
+            ty: Some(ColumnType::Numeric {
+                precision: 20,
+                scale: 0
+            }),
+        }
+    );
+}
+
+#[test]
+fn projection_subquery_deferred_error_keeps_static_column_type() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "big1", Some(i64::MAX));
+    ins(&core, &ctx, REFS, 6, "big2", Some(i64::MAX));
+    let inner = format!("(SELECT SUM(qty) FROM {REFS} WHERE qty > 100)");
+    let none = run(
+        &core,
+        &ctx,
+        &format!("SELECT name, {inner} AS s FROM {ITEMS} WHERE qty > 999 LIMIT 100"),
+    );
+    assert!(none.rows.is_empty());
+    assert_eq!(
+        none.columns[1],
+        ColumnMeta::Computed {
+            name: "s".to_string(),
+            ty: Some(ColumnType::BigInt),
+        }
+    );
+}
+
+#[test]
 fn projection_subquery_on_buffered_view_is_rejected_not_dropped() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
