@@ -456,3 +456,10 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **挙動変更**: 7 型スロットの binary 指定が `0A000` から受理へ。`REAL`／`DOUBLE`／`BYTEA`／`UUID` スロット（宣言 OID 0）でバイナリ生バイトを UTF-8 として誤解釈していた受理を受信形式の復号へ是正（固定長不一致は `08P01`）。長さ不正は `08P01`、非対応スロット（`NUMERIC`・日時・`JSON`・配列・`ENUM`・`VECTOR`・宣言 0 の `id`・互換表外の宣言 OID）は従来どおり `0A000`。
 - **テスト**: `binary_param` の往復・境界値・長さ不正の単体テスト、`wire14_binary_params`（バイナリ ≡ テキスト・`08P01`・`0A000` と判定順・NULL・テナント境界）、`wire12_param_binding` の期待値を仕様変更に合わせて更新（アサーション弱体化ではない）。
 - **対象外（申し送り）**: engine の `REAL`／`DOUBLE` 型付き束縛（`ParamLiteralKind::Float` 相当。無い限り float の text・binary 束縛は `22P02`）、int2・numeric・日時・`JSON`・配列・`ENUM`・`VECTOR` のバイナリ受信、暗黙キャスト（float4→float8 等）、3 クライアント e2e（opt-in。未実行）。
+
+**Issue #1346（feat(engine): SQL のコメントと二重引用符識別子を字句解析で受理する。WIRE-16・TASK-219 ポインタ）**: `--` 行コメント・`/* */` ブロックコメント（入れ子可）を空白と同様に読み飛ばし、中身が許可形の二重引用符識別子を `Token::Ident` として受理する。コメントだけの断片は空文として無視する。
+
+- **変更箇所**: `engine` の `sql::lexer`（コメント読み飛ばし・引用符識別子・走査ヘルパーの共有・`is_effectively_empty`）、`sql::statement_splitter`（共有ヘルパーによる読み飛ばし・コメントだけの断片を空文化）、`wire-server` の `extended_query`（コメントだけの Parse を空文扱い）。
+- **挙動変更**: コメント・引用符識別子を含む文が `42601` から受理へ。中身が許可形でない引用符識別子（空・空白・`.`・`""`・予約語・非 ASCII）・未終端のコメント・引用符は従来どおり `42601`。受理範囲を広げるのみで既存の受理形の意味は変えない。
+- **テスト**: lexer・splitter の単体テスト（入れ子・未終端・上限判定・密輸防止・lexer との連動）、`wire16_multi_statement`（コメント・引用符識別子・RLS）、`wire11_parse_describe`（コメントだけの Parse）。
+- **対象外（申し送り）**: `COPY` 判定が先頭コメントを見ない点（fail-closed の `42601`）、任意文字を含む引用符識別子（永続 SQL の描画側で識別子を引用する対応が先に必要）、`U&"..."`・引用符付き修飾名。

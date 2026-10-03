@@ -1234,7 +1234,7 @@ fn handle_parse_body(
     // `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
     // `EngineCore::execute_sql_in_txn` と同じ判定順序。PR #1041 レビュー指摘）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed
-        && !msg.query.trim().is_empty()
+        && !engine::sql::lexer::is_effectively_empty(&msg.query)
         && !engine::sql::transaction::is_rollback_statement(&msg.query)
     {
         return Err(HandlerError::Sql(txn.take_failed_error()));
@@ -1244,8 +1244,8 @@ fn handle_parse_body(
         return Err(HandlerError::TooManyParams);
     }
 
-    let statement = if msg.query.trim().is_empty() {
-        // 空文はプレースホルダ 0 個なので、型宣言が 1 個でもあれば過剰宣言
+    let statement = if engine::sql::lexer::is_effectively_empty(&msg.query) {
+        // 空文（空白・コメントのみを含む。Issue #1346）はプレースホルダ 0 個なので、型宣言が 1 個でもあれば過剰宣言
         // （他の 0 プレースホルダ文と同じ契約・fail-closed）。
         if msg.num_param_types > 0 {
             return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);

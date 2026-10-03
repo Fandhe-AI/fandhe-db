@@ -343,7 +343,7 @@ fn implicit_transaction_respects_tenant_boundaries() {
 }
 
 /// (7) 入れ子ブロックコメントに隠した区切りで文を密輸できない。コメントを含む断片は
-/// 単一文のときと同じ `42601` で拒否され、隠した `INSERT` は実行されない。
+/// コメントだけの断片として無視され（Issue #1346）、隠した `INSERT` は実行されない。
 #[test]
 fn nested_block_comment_cannot_smuggle_a_statement() {
     let (core, _guard) = new_core_three_tenant_docs();
@@ -356,10 +356,11 @@ fn nested_block_comment_cannot_smuggle_a_statement() {
             insert_sql(99, "smuggled")
         ),
     );
-    let _columns = read_row_description(&mut alice);
-    let _row = read_data_row(&mut alice);
-    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
-    expect_error_response_with_sqlstate(&mut alice, "42601");
+    for _ in 0..2 {
+        let _columns = read_row_description(&mut alice);
+        let _row = read_data_row(&mut alice);
+        assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    }
     read_ready_for_query(&mut alice);
 
     assert_eq!(visible_ids(&mut alice), vec!["1", "2", "3"]);

@@ -13,10 +13,13 @@
 //! 通常状態の `;` だけを区切りとする字句走査で分割する。走査は次の 5 状態を持つ:
 //! 通常／`'...'`（`''` エスケープ）／`"..."`（`""` エスケープ）／`--` から改行
 //! （`\n` または `\r`）まで／`/* ... */`（PostgreSQL と同じく入れ子を数える）。
-//! コメント・引用の内部にある `;` は区切りとみなさない。各断片は加工せず（コメントも
-//! 除去せず）そのまま engine へ渡すため、コメントや二重引用符識別子を含む断片は
-//! 単一文のときと同じく lexer が `42601` で拒否する（WIRE-16 の「文ごとに独立して
-//! 許可リストを検証し、複数文であることを理由に受理範囲を変えない」に従う）。
+//! コメント・引用の内部にある `;` は区切りとみなさない。コメントと `"..."` の終端走査は
+//! lexer（`sql::lexer::line_comment_end` 等）と同じ関数を共有し、両者の解釈が食い違わ
+//! ないようにしている。各断片は加工せず（コメントも除去せず）そのまま engine へ渡し、
+//! lexer がコメントを読み飛ばす。コメントと空白だけの断片は空文として無視する
+//! （Issue #1346）。`"..."` の中身が許可形（英数字・`_`・予約語でない）でなければ、
+//! その文だけが lexer の `42601` になる（WIRE-16 の「文ごとに独立して許可リストを
+//! 検証し、複数文であることを理由に受理範囲を変えない」に従う）。
 //!
 //! **PostgreSQL と分割結果が食い違いうる構文では分割しない**（fail-closed）。
 //! 未終端の `'...'`・`"..."`・`/* */`、通常状態の `$`（ドル引用）、E 文字列の接頭辞
@@ -43,7 +46,9 @@
 //!   （`docs/design/wire-multi-statement.md` 参照）。
 
 use crate::error_format::{ClassifiedError, ErrorClass};
-use crate::sql::lexer::{tokenize, Keyword, Token};
+use crate::sql::lexer::{
+    block_comment_end, line_comment_end, quoted_identifier_end, tokenize, Keyword, Token,
+};
 
 /// 1 メッセージで許容する非空文の上限（実装既定値。WIRE-16 のポインタ）。
 /// 超過は [`MultiStatementError::TooManyStatements`]（`54000`）で fail-closed に
@@ -159,19 +164,31 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
     let mut statements: Vec<&str> = Vec::new();
     let mut semicolon_count: usize = 0;
     let mut start = 0usize;
+    // 現在の断片に、空白・コメント以外の文字が 1 つでもあるか。
+    let mut has_content = false;
 
     while let Some(&b) = bytes.get(i) {
         let next = bytes.get(i.saturating_add(1)).copied();
         match b {
-            b'\'' | b'"' => match skip_quoted(bytes, i, b) {
-                Some(end) => i = end,
+            b'\'' => match skip_quoted(bytes, i, b) {
+                Some(end) => {
+                    has_content = true;
+                    i = end;
+                }
                 // 未終端の引用。lexer が同一入力を必ず拒否するため分割せず全文を渡す。
                 None => return Ok(SplitOutcome::Single),
             },
+            b'"' => match quoted_identifier_end(input, i) {
+                Some(end) => {
+                    has_content = true;
+                    i = end;
+                }
+                None => return Ok(SplitOutcome::Single),
+            },
             b'-' if next == Some(b'-') => {
-                i = skip_line_comment(bytes, i);
+                i = line_comment_end(input, i);
             }
-            b'/' if next == Some(b'*') => match skip_block_comment(bytes, i) {
+            b'/' if next == Some(b'*') => match block_comment_end(input, i) {
                 Some(end) => i = end,
                 None => return Ok(SplitOutcome::Single),
             },
@@ -186,7 +203,7 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
             }
             b';' => {
                 let piece = input.get(start..i).unwrap_or("").trim();
-                if !piece.is_empty() {
+                if has_content && !piece.is_empty() {
                     statements.push(piece);
                     if statements.len() > MAX_STATEMENTS_PER_QUERY {
                         return Err(MultiStatementError::TooManyStatements);
@@ -196,14 +213,38 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
                 // `;` は ASCII 1 バイトなので `i + 1` は必ず次の文字境界。
                 i = i.saturating_add(1);
                 start = i;
+                has_content = false;
             }
-            _ => i = i.saturating_add(1),
+            _ if b.is_ascii() => {
+                if !b.is_ascii_whitespace() {
+                    has_content = true;
+                }
+                i = i.saturating_add(1);
+            }
+            // 非 ASCII は 1 文字単位で読み、Unicode 空白（`trim`・lexer と同じ基準）
+            // だけなら内容なしとして扱う。
+            _ => {
+                let ch = input.get(i..).and_then(|r| r.chars().next());
+                match ch {
+                    Some(c) => {
+                        if !c.is_whitespace() {
+                            has_content = true;
+                        }
+                        i = i.saturating_add(c.len_utf8());
+                    }
+                    None => {
+                        has_content = true;
+                        i = i.saturating_add(1);
+                    }
+                }
+            }
         }
     }
 
     let tail = input.get(start..).unwrap_or("");
     let tail_trimmed = tail.trim();
-    if !tail_trimmed.is_empty() {
+    let tail_has_content = has_content && !tail_trimmed.is_empty();
+    if tail_has_content {
         statements.push(tail_trimmed);
         if statements.len() > MAX_STATEMENTS_PER_QUERY {
             return Err(MultiStatementError::TooManyStatements);
@@ -214,21 +255,21 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
         0 => Ok(SplitOutcome::Empty),
         1 => match semicolon_count {
             0 => Ok(SplitOutcome::Single),
-            // 唯一の `;` が文の直後（後ろは空白のみ）であれば既存の単一文
-            // 経路（`expect_end_of_statement` がそのまま受理する形）と同じ
-            // 意味になるため `Single` を返す。先頭に `;` がある場合
-            // （`;SELECT 1` 等）は `tail_trimmed`（＝唯一の `;` の後ろの
-            // テキスト）が非空になるためここに該当せず `Statements` へ回す
+            // 唯一の `;` が文の直後（後ろは空白・コメントのみ）であれば既存の単一文
+            // 経路（lexer がコメントを読み飛ばし、`expect_end_of_statement` が
+            // そのまま受理する形）と同じ意味になるため `Single` を返す。先頭に `;`
+            // がある場合（`;SELECT 1` 等）は唯一の `;` の後ろに内容があり
+            // `tail_has_content` が真になるためここに該当せず `Statements` へ回す
             // （元テキストのままでは先頭の `;` トークンで構文エラーになる
             // ため、除去した形で渡す必要がある）。
-            1 if tail_trimmed.is_empty() => Ok(SplitOutcome::Single),
+            1 if !tail_has_content => Ok(SplitOutcome::Single),
             _ => Ok(SplitOutcome::Statements(statements)),
         },
         _ => Ok(SplitOutcome::Statements(statements)),
     }
 }
 
-/// `bytes[open]` が開き引用符 `quote`（`'` または `"`）であるときに、閉じ引用符の
+/// `bytes[open]` が開き引用符 `quote`（`'`）であるときに、閉じ引用符の
 /// 直後の位置を返す（連続 2 個の引用符はエスケープとして継続する。
 /// `lexer::lex_string_literal` と同じ規則）。未終端なら `None`。
 fn skip_quoted(bytes: &[u8], open: usize, quote: u8) -> Option<usize> {
@@ -246,43 +287,6 @@ fn skip_quoted(bytes: &[u8], open: usize, quote: u8) -> Option<usize> {
     }
 }
 
-/// `--` で始まる行コメントの終端（`\n`／`\r` の位置。無ければ入力末尾）を返す。
-fn skip_line_comment(bytes: &[u8], open: usize) -> usize {
-    let mut j = open.saturating_add(2);
-    while let Some(&c) = bytes.get(j) {
-        if c == b'\n' || c == b'\r' {
-            break;
-        }
-        j = j.saturating_add(1);
-    }
-    j
-}
-
-/// `/*` で始まるブロックコメントの終端の直後の位置を返す。PostgreSQL と同じく
-/// 入れ子を数える（数えないと `/* a /* b */ ; INSERT ... */` の `INSERT` が分割
-/// されて実行されてしまう）。深さは `usize` の飽和演算で数え、追加の確保はしない。
-/// 未終端なら `None`。
-fn skip_block_comment(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut j = open.saturating_add(2);
-    let mut depth: usize = 1;
-    loop {
-        let c = *bytes.get(j)?;
-        let n = bytes.get(j.saturating_add(1)).copied();
-        if c == b'/' && n == Some(b'*') {
-            depth = depth.saturating_add(1);
-            j = j.saturating_add(2);
-        } else if c == b'*' && n == Some(b'/') {
-            depth = depth.saturating_sub(1);
-            j = j.saturating_add(2);
-            if depth == 0 {
-                return Some(j);
-            }
-        } else {
-            j = j.saturating_add(1);
-        }
-    }
-}
-
 /// `bytes[at]` の直前のバイトが識別子の構成文字（英数字・`_`・非 ASCII）か。
 fn is_ident_continue_before(bytes: &[u8], at: usize) -> bool {
     match at.checked_sub(1).and_then(|p| bytes.get(p)) {
@@ -290,6 +294,7 @@ fn is_ident_continue_before(bytes: &[u8], at: usize) -> bool {
         None => false,
     }
 }
+
 /// 1 文の先頭トークンから [`StatementEffect`] を判定する。判定語彙は
 /// `core.rs::execute_sql_in_session` の先頭トークン覗き見分岐（`INSERT`／
 /// `TRUNCATE`／`DELETE`／`UPDATE`／`DROP`）と `sql::allowlist::validate_sql` が
@@ -586,9 +591,9 @@ mod tests {
     }
 
     #[test]
-    fn comments_and_double_quotes_are_split_lexically_and_each_piece_is_rejected_by_lexer() {
-        // コメント・二重引用符内の `;` は区切りにならず、外側の `;` では分割される。
-        // 断片は加工されないため、lexer は各断片を単一文のときと同じく拒否する。
+    fn comments_and_quoted_identifiers_are_split_lexically_and_lexer_accepts_pieces() {
+        // コメント・引用内の `;` は区切りにならず、外側の `;` では分割される。
+        // 断片は加工されず、lexer が各断片を受理する（Issue #1346）。
         let cases: [(&str, Vec<&str>); 5] = [
             (
                 "SELECT 1 -- comment; SELECT 2\n; SELECT 3",
@@ -599,21 +604,70 @@ mod tests {
                 vec!["SELECT 1 /* comment; */", "SELECT 2"],
             ),
             (
-                "SELECT \"a;b\" FROM t; SELECT 2",
-                vec!["SELECT \"a;b\" FROM t", "SELECT 2"],
+                "SELECT 'a;b' /* ; */ ; SELECT \"x\"",
+                vec!["SELECT 'a;b' /* ; */", "SELECT \"x\""],
             ),
             (
-                "SELECT \"a\"\"; b\" FROM t; SELECT 2",
-                vec!["SELECT \"a\"\"; b\" FROM t", "SELECT 2"],
+                "SELECT \"a\" FROM \"t\"; SELECT 2",
+                vec!["SELECT \"a\" FROM \"t\"", "SELECT 2"],
             ),
-            ("SELECT 1; -- done", vec!["SELECT 1", "-- done"]),
+            ("SELECT 1; /* c */; SELECT 2", vec!["SELECT 1", "SELECT 2"]),
         ];
         for (input, expected) in cases {
             let pieces = statements(split_statements(input).expect("split"));
             assert_eq!(pieces, expected, "input: {input}");
-            let rejected = pieces.iter().filter(|p| tokenize(p).is_err()).count();
-            assert!(rejected >= 1, "lexer must reject a piece of: {input}");
+            for p in &pieces {
+                assert!(tokenize(p).is_ok(), "lexer must accept {p:?} of: {input}");
+            }
         }
+    }
+
+    #[test]
+    fn quoted_identifier_with_unsafe_content_is_split_but_rejected_by_lexer() {
+        // 領域の終端は決まるので分割は行い、その文だけが lexer で拒否される。
+        let pieces =
+            statements(split_statements("SELECT \"a;b\" FROM t; SELECT 2").expect("split"));
+        assert_eq!(pieces, vec!["SELECT \"a;b\" FROM t", "SELECT 2"]);
+        assert!(tokenize(pieces[0]).is_err());
+        assert!(tokenize(pieces[1]).is_ok());
+    }
+
+    #[test]
+    fn comment_only_fragments_are_empty_statements() {
+        assert_eq!(
+            split_statements("SELECT 1; -- done").expect("split"),
+            SplitOutcome::Single
+        );
+        assert_eq!(
+            split_statements("SELECT 1 -- c; SELECT 2").expect("split"),
+            SplitOutcome::Single
+        );
+        for input in ["-- only", ";-- c", "/* x */ ;", "/* a */ -- b\n ;; /* c */"] {
+            assert_eq!(
+                split_statements(input).expect("split"),
+                SplitOutcome::Empty,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_prefix_does_not_hide_write_statements() {
+        let pieces = statements(
+            split_statements("/* x */ INSERT INTO t VALUES (1); SELECT 1").expect("split"),
+        );
+        assert_eq!(
+            check_write_placement(&pieces, false),
+            Err(MultiStatementError::WriteNotLast)
+        );
+        assert_eq!(
+            classify_statement("-- c\nINSERT INTO t VALUES (1)"),
+            StatementEffect::Write
+        );
+        assert_eq!(
+            classify_statement("/* c */ SELECT 1"),
+            StatementEffect::ReadOnly
+        );
     }
 
     #[test]
@@ -643,15 +697,8 @@ mod tests {
         // 独立した文として切り出されてしまう。
         let input = "SELECT 1; /* a /* b */ ; INSERT INTO t VALUES (1) */ ; SELECT 2";
         let pieces = statements(split_statements(input).expect("split"));
-        assert_eq!(
-            pieces,
-            vec![
-                "SELECT 1",
-                "/* a /* b */ ; INSERT INTO t VALUES (1) */",
-                "SELECT 2"
-            ]
-        );
-        assert!(tokenize(pieces[1]).is_err());
+        // コメントだけの断片は空文として落ち、`INSERT` は切り出されない。
+        assert_eq!(pieces, vec!["SELECT 1", "SELECT 2"]);
     }
 
     #[test]
