@@ -532,15 +532,118 @@ fn in_and_not_in_support_typed_and_integer_targets() {
         &format!("SELECT id FROM {ITEMS} WHERE day IN (SELECT at FROM {REFS} LIMIT 10) LIMIT 100"),
     );
     assert_eq!(code, "22000");
-    // REAL/DOUBLE 対象の IN は対象外（22000）。
+    // 浮動小数列と疑似列 `id` の IN は Issue #1352 で対象化（専用テストが固定する）。
+    // 値族の不一致（DOUBLE 対象 × TEXT 投影）は 22000 のまま。
     let (code, _) = err_code(
         &core,
         &ctx,
         &format!(
-            "SELECT id FROM {ITEMS} WHERE ratio IN (SELECT ratio FROM {REFS} LIMIT 10) LIMIT 100"
+            "SELECT id FROM {ITEMS} WHERE ratio IN (SELECT name FROM {REFS} LIMIT 10) LIMIT 100"
         ),
     );
     assert_eq!(code, "22000");
+}
+
+/// Issue #1352: `REAL`／`DOUBLE PRECISION` 列と疑似列 `id` を対象とする `IN`／`NOT IN`。
+/// 期待値は Rust 側で素朴に求めた独立オラクル。
+#[test]
+fn in_subquery_float_and_row_id_targets() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    // items: id 1..=4 の ratio（4 は NULL）。refs: ratio 2.5 と -0.0。
+    for (id, v) in [(1u64, "1.5"), (2, "2.5"), (3, "0.0")] {
+        ins(&core, &ctx, ITEMS, id, &[("ratio", v)]);
+    }
+    ins(&core, &ctx, ITEMS, 4, &[]);
+    ins(&core, &ctx, REFS, 1, &[("ratio", "2.5"), ("qty", "3")]);
+    ins(&core, &ctx, REFS, 2, &[("ratio", "-0.0"), ("qty", "-7")]);
+    ins(&core, &ctx, REFS, 3, &[("ratio", "2.5")]);
+    let q = |neg: &str| {
+        format!(
+            "SELECT id FROM {ITEMS} WHERE ratio {neg}IN (SELECT ratio FROM {REFS} LIMIT 100) LIMIT 100"
+        )
+    };
+    // -0.0 と 0.0 は等しい。NULL 行は IN・NOT IN ともに UNKNOWN で除外。
+    assert_eq!(ids(&core, &ctx, &q("")), vec![2, 3]);
+    assert_eq!(ids(&core, &ctx, &q("NOT ")), vec![1]);
+
+    // 疑似列 `id`: 内側が id・BIGINT 列（負値は一致しない・NULL は除外）。
+    let id_in = |inner: &str, neg: &str| {
+        format!("SELECT id FROM {ITEMS} WHERE id {neg}IN ({inner}) LIMIT 100")
+    };
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &id_in(&format!("SELECT id FROM {REFS} LIMIT 100"), "")
+        ),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &id_in(&format!("SELECT qty FROM {REFS} LIMIT 100"), "")
+        ),
+        vec![3]
+    );
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &id_in(
+                &format!("SELECT id FROM {REFS} WHERE id < 3 LIMIT 100"),
+                "NOT "
+            )
+        ),
+        vec![3, 4]
+    );
+    // 内側 0 行は IN で 0 件。
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &id_in(
+                &format!("SELECT id FROM {REFS} WHERE id > 99 LIMIT 100"),
+                ""
+            )
+        ),
+        Vec::<u64>::new()
+    );
+    // 値族の不一致は内側の行数に関わらず 22000。
+    for sql in [
+        format!("SELECT id FROM {ITEMS} WHERE name IN (SELECT id FROM {REFS} LIMIT 10) LIMIT 100"),
+        format!("SELECT id FROM {ITEMS} WHERE ratio IN (SELECT qty FROM {REFS} LIMIT 10) LIMIT 100"),
+        format!("SELECT id FROM {ITEMS} WHERE id IN (SELECT name FROM {REFS} WHERE id > 99 LIMIT 10) LIMIT 100"),
+    ] {
+        assert_eq!(err_code(&core, &ctx, &sql).0, "22000", "sql={sql}");
+    }
+}
+
+/// Issue #1352: 浮動小数・`id` の `IN` でも他テナント行が結果を変えない（RLS-10 (b)）。
+#[test]
+fn in_subquery_float_and_row_id_ignore_other_tenant_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let a = ctx_for("tenant-a");
+    let b = ctx_for("tenant-b");
+    ins(&core, &a, ITEMS, 1, &[("ratio", "1.5")]);
+    ins(&core, &a, ITEMS, 2, &[("ratio", "2.5")]);
+    ins(&core, &a, REFS, 1, &[("ratio", "2.5")]);
+    let queries = [
+        format!("SELECT id FROM {ITEMS} WHERE ratio IN (SELECT ratio FROM {REFS} LIMIT 100) LIMIT 100"),
+        format!("SELECT id FROM {ITEMS} WHERE ratio NOT IN (SELECT ratio FROM {REFS} LIMIT 100) LIMIT 100"),
+        format!("SELECT id FROM {ITEMS} WHERE id IN (SELECT id FROM {REFS} LIMIT 100) LIMIT 100"),
+    ];
+    let before: Vec<Vec<u64>> = queries.iter().map(|q| ids(&core, &a, q)).collect();
+    assert_eq!(before, vec![vec![2], vec![1], vec![1]]);
+    for i in 0..20u64 {
+        ins(&core, &b, REFS, 100 + i, &[("ratio", "1.5")]);
+        ins(&core, &b, ITEMS, 200 + i, &[("ratio", "2.5")]);
+    }
+    let after: Vec<Vec<u64>> = queries.iter().map(|q| ids(&core, &a, q)).collect();
+    assert_eq!(after, before);
 }
 
 #[test]

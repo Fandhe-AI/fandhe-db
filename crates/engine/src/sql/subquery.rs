@@ -650,10 +650,14 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
 }
 
 /// `<column> [NOT] IN (SELECT ...)` の対象列 `column` を `outer_schema`（この
-/// サブクエリを含む文自身のテーブルのスキーマ）に対して検証し、列型と値族を返す。
-/// 存在しない列は `22000`（`unknown column`。通常の `WHERE` 等価述語束縛と同じ
-/// 文言・`wire_code`）、`IN` で扱えない型（`REAL`／`DOUBLE`・`VECTOR`・配列・JSON）
-/// と疑似列 `id` は同じく `22000` で拒否する。
+/// サブクエリを含む文自身のテーブルのスキーマ）に対して検証し、列型（疑似列 `id` は
+/// 型なし＝`None`）と値族を返す。存在しない列は `22000`（`unknown column`。通常の
+/// `WHERE` 等価述語束縛と同じ文言・`wire_code`）、`IN` で扱えない型（`VECTOR`・配列・
+/// JSON）は同じく `22000` で拒否する。
+///
+/// 疑似列 `id` はスキーマに同名の実カラムが無い場合に限り整数族として受理する
+/// （実カラム優先。`udf_call` の識別子束縛・スカラー比較〔[`resolve_scalar_compare`]〕
+/// と同じ規則。Issue #1352）。`REAL`／`DOUBLE PRECISION` は浮動小数族として受理する。
 ///
 /// この検証は内側サブクエリの結果行数（0 行・NULL のみを含む）に一切依存しない
 /// （PR #1103 codex-review P1 指摘対応: 内側が 0 行／NULL のみでも列名・型検証を
@@ -661,15 +665,18 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
 fn validate_in_target_column<'a>(
     column: &str,
     outer_schema: &'a TableSchema,
-) -> Result<(&'a ColumnType, SubqueryValueFamily), SqlSurfaceError> {
-    let column_def = outer_schema
-        .columns
-        .iter()
-        .find(|c| c.name == column)
-        .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {column}")))?;
+) -> Result<(Option<&'a ColumnType>, SubqueryValueFamily), SqlSurfaceError> {
+    let Some(column_def) = outer_schema.columns.iter().find(|c| c.name == column) else {
+        if column == "id" {
+            return Ok((None, SubqueryValueFamily::Integer));
+        }
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "unknown column: {column}"
+        )));
+    };
     match family_of_type(&column_def.ty) {
-        Some(family) if family != SubqueryValueFamily::Float => Ok((&column_def.ty, family)),
-        _ => Err(SqlSurfaceError::invalid_input(format!(
+        Some(family) => Ok((Some(&column_def.ty), family)),
+        None => Err(SqlSurfaceError::invalid_input(format!(
             "column {column:?} type is not supported as a subquery IN target"
         ))),
     }
@@ -742,6 +749,7 @@ fn resolve_in_subquery(
     let mut texts: Vec<String> = Vec::new();
     let mut bools: Vec<bool> = Vec::new();
     let mut ints: Vec<i64> = Vec::new();
+    let mut floats: Vec<f64> = Vec::new();
     for row in &result.rows {
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery row missing projected cell".to_string(),
@@ -757,7 +765,7 @@ fn resolve_in_subquery(
                 // 対象列が ENUM の場合、語彙外ラベルは「その値には一致しない」
                 // として除外する（除外しないと後段の束縛が 22P02 で文全体を
                 // 落とす。PR #1103 追加 codex-review P1 指摘対応）。
-                if let ColumnType::Enum(def) = target_ty {
+                if let Some(ColumnType::Enum(def)) = target_ty {
                     if !def.contains(&value) {
                         continue;
                     }
@@ -783,11 +791,20 @@ fn resolve_in_subquery(
                 }
                 _ => return Err(unexpected_cell_type()),
             },
-            SubqueryValueFamily::Float => {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "float family reached the IN value collection".to_string(),
-                })
-            }
+            SubqueryValueFamily::Float => match cell {
+                // 非有限値（NaN・無限大）は比較が定義できないため、スカラー比較
+                // （[`number_cell_text`]）と同じく `22000` で fail-closed にする。
+                Cell::Float(f) if f.is_finite() => {
+                    // `-0.0` と `+0.0` は等しいため `+0.0` へ正規化して重複除去へ載せる。
+                    floats.push(if *f == 0.0 { 0.0 } else { *f });
+                }
+                Cell::Float(_) => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "subquery returned a non-finite number",
+                    ))
+                }
+                _ => return Err(unexpected_cell_type()),
+            },
         }
     }
 
@@ -799,16 +816,23 @@ fn resolve_in_subquery(
     bools.dedup();
     ints.sort_unstable();
     ints.dedup();
-    let distinct = texts.len() + bools.len() + ints.len();
-    if family == SubqueryValueFamily::Integer {
+    floats.sort_unstable_by(f64::total_cmp);
+    floats.dedup();
+    let distinct = texts.len() + bools.len() + ints.len() + floats.len();
+    // 整数・浮動小数列は値ごとの式述語（式ノード予算あり）へ展開するため、1 サイトの
+    // distinct 値数を式ノード予算に収まる上限へ抑える。
+    if matches!(
+        family,
+        SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+    ) {
         let cap = if negated {
             MAX_INT_NOT_IN_VALUES
         } else {
             crate::declarative_filter::MAX_IN_LIST_ITEMS
         };
-        if ints.len() > cap {
+        if ints.len().max(floats.len()) > cap {
             return Err(SqlSurfaceError::payload_too_large(format!(
-                "subquery IN distinct value count exceeds limit {cap} for integer columns"
+                "subquery IN distinct value count exceeds limit {cap} for numeric columns"
             )));
         }
     }
@@ -835,6 +859,12 @@ fn resolve_in_subquery(
                 ints.into_iter()
                     .map(|n| vec![int_compare(column, BinOp::Eq, i128::from(n))])
                     .collect(),
+            ),
+            SubqueryValueFamily::Float => WherePredicate::Or(
+                floats
+                    .into_iter()
+                    .map(|f| float_compare(column, BinOp::Eq, f).map(|p| vec![p]))
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
             _ => build_in_set_predicate(column, texts),
         };
@@ -876,6 +906,21 @@ fn resolve_in_subquery(
                         ])
                     })
                     .collect()
+            }
+        }
+        SubqueryValueFamily::Float => {
+            if floats.is_empty() {
+                vec![not_null()]
+            } else {
+                floats
+                    .into_iter()
+                    .map(|f| {
+                        Ok(WherePredicate::Or(vec![
+                            vec![float_compare(column, BinOp::Lt, f)?],
+                            vec![float_compare(column, BinOp::Gt, f)?],
+                        ]))
+                    })
+                    .collect::<Result<Vec<_>, SqlSurfaceError>>()?
             }
         }
         _ => {
@@ -933,6 +978,18 @@ fn int_compare(column: &str, op: BinOp, n: i128) -> WherePredicate {
         lhs: Box::new(Expr::Ident(column.to_string())),
         rhs: Box::new(Expr::Number(n.to_string())),
     })
+}
+
+/// `<column> <op> <浮動小数>` の式述語（浮動小数リテラルの比較と同じ AST 形）。
+/// `f` は有限値のみ（呼び出し側で検査済み）。`REAL` 列の値は `f64` へ無損失拡大して
+/// 評価されるため、内側の `REAL` セル（同じ拡大値）とは厳密に一致し、`DOUBLE` 値とは
+/// PostgreSQL と同じく拡大後の値どうしで比較される（Issue #1352）。
+fn float_compare(column: &str, op: BinOp, f: f64) -> Result<WherePredicate, SqlSurfaceError> {
+    Ok(WherePredicate::Expression(Expr::Binary {
+        op,
+        lhs: Box::new(Expr::Ident(column.to_string())),
+        rhs: Box::new(Expr::Number(number_cell_text(&Cell::Float(f))?)),
+    }))
 }
 
 /// 期待外のセル型（静的な値族検証を通ったのに実行時セルが食い違う場合）。fail-closed。

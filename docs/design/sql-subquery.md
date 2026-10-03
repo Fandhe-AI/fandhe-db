@@ -33,8 +33,8 @@
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
 | 相関サブクエリ | **非対応**。束縛前の静的走査で `42601`（Issue #1191。内側スキーマに無く外側スコープのいずれかに有る非修飾列名の参照を検出する。どこにも無い名前は従来どおり `22000`） |
 | `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
-| `IN` 対象列が疑似列 `id` | 実測範囲外（このリポの既存 `WherePredicate::Equality` 束縛自体が疑似列 `id` を対象にしていないため。`sql::subquery::cell_to_equality_predicate` の `Cell::Integer` 分岐は将来の拡張に備えて到達可能コードとして残す） |
-| `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大。内側の投影列は同じ値族であること）。`REAL`／`DOUBLE`／`VECTOR`／配列／JSON・疑似列 `id` は `22000` |
+| `IN` 対象列が疑似列 `id` | 対応（Issue #1352）。スキーマに実カラム `id` が無い場合のみ整数族として扱う（実カラム優先。スカラー比較と同じ規則）。内側は `id` 投影または `INTEGER`／`BIGINT` 列（負値・NULL は一致しない）。`TEXT` 等の他の値族の投影は `22000` |
+| `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大）に加え `REAL`／`DOUBLE PRECISION`（Issue #1352。浮動小数族どうし。`REAL` は `f64` へ無損失拡大して比較し、`-0.0` は `+0.0` と等しい。非有限値は `22000`）。内側の投影列は同じ値族であること。`VECTOR`／配列／JSON は `22000`。整数・浮動小数列の distinct 値数は 1 サイトあたり `IN` 256・`NOT IN` 128 まで（超過は `54000`） |
 | 拡張クエリプロトコル（Parse/Bind、`$n`） | **非対応**（`42601`。理由は後述） |
 | Describe（拡張クエリプロトコルの投影列導出） | 対象外（拡張クエリプロトコル自体が非対応のため） |
 | `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・述語形 `UPDATE`/`DELETE`・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
@@ -307,7 +307,7 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 
 - 投影位置のスカラーサブクエリ（Describe が実行なしで結果列の静的型・列名を確定する必要があり、`Expr`／`SelectItem` の公開 enum 変更と型 OID 導出の設計が別途必要。`42601` 維持）
 - スカラー比較の 2 行以上を `21000` で返すこと（`wire_code` 表への分類追加が前提。現状は `22000`）
-- `IN`／`EXISTS` の内側の集計形・ランキング付き検索 SELECT・`REAL`／`DOUBLE` 等の `IN` 対象型
+- `IN`／`EXISTS` の内側の集計形・ランキング付き検索 SELECT・外側 `INTEGER`／`BIGINT` 以外の数値列を超える `IN` 対象型の拡大
 - 内側のウィンドウ関数（SQL-30・TASK-214、Issue #930）: `IN`／`EXISTS`
   いずれも内側に `window_items` が含まれる場合は `42601` で一律拒否する
   （PR #1103 Cursor Bugbot 指摘対応。理由は「上限（DoS 対策）」節参照。
