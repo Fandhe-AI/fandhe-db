@@ -1094,3 +1094,36 @@ API へ返却行と `CommandComplete` タグを届けることを確認する層
   --ignored --nocapture --test-threads=1` の `[e2e-record]` 行を PR 本文へ転記する。
   実測（psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0）: 3 クライアントとも全タグ・
   RLS 0 行同一・`42601`・読み戻しが一致し、`three_client_e2e` の `--ignored` 11 件が green。
+
+## 明示トランザクションの成否確定手順の 3 クライアント検証（Issue #1354・RECOVER-12）
+
+`COMMIT` の応答を受け取れなかったクライアントが、新しい `BEGIN` の内側で先頭文を同じ
+`operation_id` で再送して成否を確定する手順を、行制約（`PRIMARY KEY`／`UNIQUE`）を持つ表で
+無改造の psql・psycopg・node `pg` から実行する層 B。主たる回帰保護は engine の
+`tests/recover12_explicit_txn_resend.rs`（台帳照合が行制約検査より先に走る順序・variant と固定文言・
+テナント境界）と、層 A の wire `tests/recover12_explicit_txn_resend.rs`（生バイトで `C`／`M` を固定。
+`make ci` で常時実行）。仕様ポインタ: RECOVER-12（関連: RECOVER-10・ERR-2・SQL-31・TABLE-16）。
+
+- テスト: `three_client_e2e.rs::three_clients_confirm_explicit_transaction_outcome_by_resend_in_new_begin`
+  （`#[ignore]`・`make e2e-three-client` に含まれる）。クライアントごとに新しいサーバーと DB
+  （`orders (code TEXT PRIMARY KEY, sku TEXT UNIQUE)`）。
+- シナリオ: S1＝commit 済み（新しい `BEGIN` の先頭文再送が台帳由来の `23505`。値だけ衝突する文・
+  行 `id` だけ衝突する文は行制約由来で別文言。他テナントの同一 `operation_id` は通常成功）、
+  S2＝`COMMIT` 前の接続断（何も残らず再送が成功）、S3＝未 commit のまま再送が別の確定済み行と衝突
+  （行制約由来で commit 済みとは判定されず、衝突解消後の再送が成功）。
+- 2 種類の `23505` の区別: pg wire の `ErrorResponse` は `S`/`C`/`M` の既存形式で、`code` ラベル
+  （`DUPLICATE_OPERATION_ID`／`UNIQUE_VIOLATION`）は HTTP 側だけが運ぶ。そのため固定文言
+  （`M`）の一致・不一致で区別する。観測経路は psql が `-v VERBOSITY=verbose` の stderr、psycopg が
+  例外文字列、node `pg` が `err.message`。`Client::expect_error_excluding` は期待文言の包含に加えて
+  もう一方の文言が含まれないことを確認する。
+- `COMMIT` 応答の喪失の模擬: 実際には起こさず「受信した `COMMIT` を結果不明として扱う」ことで
+  模擬する。`--fault-inject post-commit-panic` は autocommit の `INSERT` の commit 直後にだけ発火し
+  `COMMIT` 文には効かないため。`COMMIT` への注入点拡張は対象外。
+- `COMMIT` 前の接続断（`Client::abandon_open_transaction`）: psql は `-c` 列の終了、node `pg` は
+  `client.end()`。psycopg は `with psycopg.connect(...)` の正常終了が `COMMIT` を送るため、
+  `psycopg_client.py` に opt-in の `WIRE_ABANDON_OPEN_TRANSACTION=1`（本体 SQL の後にプロセスを
+  即時終了。語彙は `"1"` のみで他は fail-closed）を追加した。
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-vector-db-wire-server
+  --features fault-injection --test three_client_e2e three_clients_confirm_explicit_transaction --
+  --ignored --nocapture` の `[e2e-record]` 行（クライアント版を含む。資格情報・テナント id・SQL 本文は
+  出力しない）を PR 本文へ転記する。

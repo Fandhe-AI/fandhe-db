@@ -361,6 +361,11 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   （`55P03`／`25000`／`25001`／`25P01`／`25P02`）を NoSQL 表層からの到達不能
   分類として追加し、production の応答エンコーダ経由で射影のみを固定する
   （NoSQL 表層の `op` 許可リストにトランザクション制御が無いため）。
+- RECOVER-12 の再送手順の検証（Issue #1354。実装済み）: engine の
+  `crates/engine/tests/recover12_explicit_txn_resend.rs`（行制約を持つ表での台帳照合の
+  順序）、wire の `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（層 A）、
+  `three_client_e2e.rs` の層 B（psql／psycopg／node pg の 3 クライアント。
+  [`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
 
 ## 起源（Explicit／Implicit）ごとの遷移差分（Issue #1175）
 
