@@ -303,4 +303,4 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 - **NoSQL 表層**: `op: insert`／`update`／`delete`／`search`／`scan`／`aggregate` の
   いずれにも `returning` キーは無い（`http/query/update.rs`・`delete.rs` は
   `returning: None` 固定）。spec 側の規範化待ち。
-- **3 クライアント層 B の実測実行**: `make e2e-three-client` は運用者作業。
+- **3 クライアント層 B**: Issue #1347 で `three_client_e2e.rs::three_clients_receive_returning_rows_and_command_tags` を追加済み（`make e2e-three-client`・opt-in。詳細は `three-client-e2e-harness.md`「RETURNING」節）。拡張クエリ・明示トランザクション内は対象外。
