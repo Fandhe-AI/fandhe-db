@@ -100,12 +100,12 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
         let as_int: u64 = digits.parse().map_err(|_| {
             // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
             // `f64` で正確に表現できないことに変わりはない。
-            SqlSurfaceError::invalid_input(
+            SqlSurfaceError::numeric_out_of_range(
                 "integer literal exceeds the range that can be exactly represented",
             )
         })?;
         if as_int > MAX_EXACT_F64_INT {
-            return Err(SqlSurfaceError::invalid_input(
+            return Err(SqlSurfaceError::numeric_out_of_range(
                 "integer literal exceeds the range that can be exactly represented",
             ));
         }
@@ -114,7 +114,7 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
     // 数学的に整数なら同じ exactness 判定を丸め変換の前に適用する（NoSQL `filter` が
     // JSON の生数値を渡すため到達する。Issue #1183・codex-review P1）。
     if integral_decimal_exceeds_exact_f64(abs_raw) {
-        return Err(SqlSurfaceError::invalid_input(
+        return Err(SqlSurfaceError::numeric_out_of_range(
             "integer literal exceeds the range that can be exactly represented",
         ));
     }
@@ -1700,7 +1700,7 @@ fn bind_expr_in(
                     // （INTEGER／BIGINT／REAL／DOUBLE）の列参照を `WHERE`／投影／
                     // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
                     // 値は行スカラービュー（`row_scalars`）から解決し、評価時の
-                    // 精度超過（BIGINT の |v| > 2^53）は `22000` で fail-closed。
+                    // 精度超過（BIGINT の |v| > 2^53）は `22003` で fail-closed。
                     ColumnType::Integer
                     | ColumnType::BigInt
                     | ColumnType::Real
@@ -2261,14 +2261,14 @@ fn bind_substr(
 /// 到達させる契約を守ること（本関数自体はその契約を検査しない）。
 ///
 /// fail-closed: 0 除算・非有限値（NaN/∞）の生成は黙って 0 や NULL に丸めず、行単位で
-/// `Err`（`22000`）として伝播する。
+/// `Err` として伝播する（0 除算は `22012`、あふれ・`f64` 正確表現域外は `22003`、その他は `22000`）。
 /// 行 `id`（`u64`）を `ExprValue::Scalar`（`f64`）へ変換する前に、`f64` の 52 bit
 /// 仮数部で正確に表現できる範囲（`2^53` 以下）かを確認する。これを超える `id` を
 /// 無条件に `as f64` で丸めると、`WHERE id = <literal>` のような等価述語が精度欠落
-/// により別 ID の行にも一致しうる（fail-closed: 黙って丸めず `22000` で拒否する）。
+/// により別 ID の行にも一致しうる（fail-closed: 黙って丸めず `22003`（`NumericOutOfRange`）で拒否する。TABLE-16・ERR-2・Issue #1336）。
 pub(crate) fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
     if id > MAX_EXACT_F64_INT {
-        return Err(SqlSurfaceError::invalid_input(
+        return Err(SqlSurfaceError::numeric_out_of_range(
             "row id exceeds the range that can be exactly represented for comparison",
         ));
     }
@@ -2309,7 +2309,7 @@ pub(crate) fn numeric_scalar_from_ref(v: &ScalarRef<'_>) -> Result<f64, SqlSurfa
         }
         ScalarRef::BigInt(b) => {
             if b.unsigned_abs() > MAX_EXACT_F64_INT {
-                Err(SqlSurfaceError::invalid_input(
+                Err(SqlSurfaceError::numeric_out_of_range(
                     "BIGINT column value exceeds the range that can be exactly represented",
                 ))
             } else {
@@ -3422,10 +3422,10 @@ mod tests {
         // Cursor Bugbot 指摘（PR #1020）: `sql::lexer::lex_number`（Issue #885・D5）
         // が生成する末尾ドット付き整数トークン（`1.` 形）は、桁だけを見る旧判定
         // （`bytes().all(is_ascii_digit)`）だと非整数扱いになり exactness ガードを
-        // 素通りしていた。`9007199254740993.`（2^53 超）が `22000` で拒否される
+        // 素通りしていた。`9007199254740993.`（2^53 超）が `22003` で拒否される
         // ことを固定する。
         let err = parse_number_literal("9007199254740993.").unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22003");
     }
 
     #[test]
@@ -3451,14 +3451,14 @@ mod tests {
             "0.9007199254740993e16",
         ] {
             let err = parse_number_literal(raw).unwrap_err();
-            assert_eq!(err.wire_code(), "22000", "{raw}");
+            assert_eq!(err.wire_code(), "22003", "{raw}");
         }
     }
 
-    /// 指数が i64 の端に達する未信頼入力でも panic せず `22000` で拒否する
+    /// 指数が i64 の端に達する未信頼入力でも panic せず `22003` で拒否する
     /// （codex-review P1。checked 演算・fail-closed）。
     #[test]
-    fn extreme_exponents_are_rejected_with_22000_without_panicking() {
+    fn extreme_exponents_are_rejected_with_22003_without_panicking() {
         for raw in [
             "1.0e-9223372036854775808",
             "10e9223372036854775807",
@@ -3467,7 +3467,7 @@ mod tests {
             "1e-99999999999999999999999",
         ] {
             let err = parse_number_literal(raw).unwrap_err();
-            assert_eq!(err.wire_code(), "22000", "{raw}");
+            assert_eq!(err.wire_code(), "22003", "{raw}");
         }
     }
 
@@ -3492,14 +3492,14 @@ mod tests {
         // `f64` へ暗黙丸め変換されたままだと `WHERE id = 9007199254740993` が
         // 精度欠落により `id = 9007199254740992` の行にも一致してしまう。整数
         // リテラルの正確表現域チェックは束縛（`bind_expr`）時点で先に働くべきなので、
-        // ここでは bind 自体が `22000` で拒否されることを確認する
+        // ここでは bind 自体が `22003` で拒否されることを確認する
         // （評価まで到達させない、より早い fail-closed）。
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
         let expr = bin(BinOp::Eq, ident("id"), num("9007199254740993"));
         let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22003");
     }
 
     #[test]
@@ -3507,7 +3507,7 @@ mod tests {
         // 上のテストはリテラル側の正確表現域チェック（bind 時）を確認する。本テストは
         // `id_as_finite_scalar`（eval 時、行 `id` 側）が独立した多重防御として機能する
         // ことを確認する: リテラルは小さく bind を通過させ、行 `id` の方を
-        // `2^53` 超に設定して eval が `22000` で拒否することを見る。
+        // `2^53` 超に設定して eval が `22003` で拒否することを見る。
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
@@ -3515,7 +3515,7 @@ mod tests {
         let (bound, _) =
             bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
         let err = eval(&bound, 9_007_199_254_740_993, &[0.0, 0.0, 0.0]).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22003");
     }
 
     #[test]

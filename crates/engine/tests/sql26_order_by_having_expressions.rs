@@ -720,9 +720,9 @@ fn expression_order_by_and_having_over_views() {
 // `COUNT`・`SUM(id)`・`MIN(id)`・`MAX(id)` の結果（`Cell::Integer(u64)`）を式形 `HAVING`／
 // `ORDER BY` が参照するとき、`sql/group_by.rs` の `cell_to_scalar_ref` が `WHERE`／投影式で
 // `id` を扱う場合と同じ 2^53 境界で f64 へ変換する（`2^53` ちょうどは受理・超過と `i64`
-// 範囲外は `22000`）。単体テスト `group_row_integer_cell_uses_exact_f64_boundary` と対になる
+// 範囲外は `22003`）。単体テスト `group_row_integer_cell_uses_exact_f64_boundary` と対になる
 // SQL 表層（`EngineCore::execute_sql`）側の固定。2^53 を超える数値リテラルは束縛段で
-// `22000` になるため、境界超過はリテラルでなく大きな id の投入（セル値側）で作る。
+// `22003` になるため、境界超過はリテラルでなく大きな id の投入（セル値側）で作る。
 
 /// 2^53（f64 で連続して表現できる整数の上限）。
 const P53: u64 = 1u64 << 53;
@@ -772,7 +772,7 @@ fn integer_cell_exactly_2p53_is_accepted_and_compared_exactly() {
     }
 }
 
-/// `2^53` 超過（`2^53 + 1`）は、式が値を参照すると `HAVING`／`ORDER BY` の両方で `22000`
+/// `2^53` 超過（`2^53 + 1`）は、式が値を参照すると `HAVING`／`ORDER BY` の両方で `22003`
 /// （黙った丸めをしない fail-closed）。参照しない式・従来形の厳密比較は影響を受けない。
 #[test]
 fn integer_cell_over_2p53_is_rejected_when_referenced_by_expression() {
@@ -783,7 +783,7 @@ fn integer_cell_over_2p53_is_rejected_when_referenced_by_expression() {
         format!("{AGG_ID} ORDER BY abs(m)"),
         format!("{AGG_ID} ORDER BY CASE WHEN m > 0 THEN 0 ELSE 1 END"),
     ] {
-        assert_eq!(run_err(&core, &ctx, &sql), "22000", "{sql}");
+        assert_eq!(run_err(&core, &ctx, &sql), "22003", "{sql}");
     }
     // 対照 (a): 範囲外のセルを参照しない式は成功し、投影値は丸められない。
     let r = run(
@@ -804,7 +804,7 @@ fn integer_cell_over_2p53_is_rejected_when_referenced_by_expression() {
     assert_eq!(lang_rows(&r), vec!["big"]);
 }
 
-/// `i64` 範囲外（`i64::MAX + 1`・`u64::MAX`）も `HAVING`／`ORDER BY` の両方で `22000`。
+/// `i64` 範囲外（`i64::MAX + 1`・`u64::MAX`）も `HAVING`／`ORDER BY` の両方で `22003`。
 #[test]
 fn integer_cell_beyond_i64_is_rejected_when_referenced_by_expression() {
     let ctx = ctx_for("tenant-a");
@@ -817,7 +817,7 @@ fn integer_cell_beyond_i64_is_rejected_when_referenced_by_expression() {
             format!("{AGG_ID} HAVING abs(m) > 0"),
             format!("{AGG_ID} ORDER BY abs(m)"),
         ] {
-            assert_eq!(run_err(&core, &ctx, &sql), "22000", "id={id}: {sql}");
+            assert_eq!(run_err(&core, &ctx, &sql), "22003", "id={id}: {sql}");
         }
         let r = run(
             &core,
@@ -830,7 +830,7 @@ fn integer_cell_beyond_i64_is_rejected_when_referenced_by_expression() {
 }
 
 /// 集計値 `SUM(id)` が境界をまたぐ場合（各入力 id は表現可能）。ちょうど `2^53` は受理、
-/// `2^53 + 1` は `s` を参照する式のみ `22000`（`m` は範囲内なので受理）。
+/// `2^53 + 1` は `s` を参照する式のみ `22003`（`m` は範囲内なので受理）。
 #[test]
 fn integer_cell_sum_crossing_2p53_follows_same_boundary() {
     let ctx = ctx_for("tenant-a");
@@ -856,7 +856,7 @@ fn integer_cell_sum_crossing_2p53_follows_same_boundary() {
         format!("{AGG_ID} HAVING abs(s) > 0"),
         format!("{AGG_ID} ORDER BY abs(s)"),
     ] {
-        assert_eq!(run_err(&core, &ctx, &sql), "22000", "{sql}");
+        assert_eq!(run_err(&core, &ctx, &sql), "22003", "{sql}");
     }
     let r = run(
         &core,
@@ -867,7 +867,7 @@ fn integer_cell_sum_crossing_2p53_follows_same_boundary() {
 }
 
 /// 他テナントの Private 行にある範囲外の値は、エラーにも結果にも現れない（RLS・Issue #353）。
-/// 所有テナントでは同じクエリが `22000`（境界検査が実際に効いていることの対照）。
+/// 所有テナントでは同じクエリが `22003`（境界検査が実際に効いていることの対照）。
 #[test]
 fn integer_cell_boundary_does_not_leak_through_other_tenants() {
     let (without, _g1) = build("sql26-p53-rls-a", &[]);
@@ -882,7 +882,7 @@ fn integer_cell_boundary_does_not_leak_through_other_tenants() {
         let b = run(&with, &other, &sql);
         let cells = |r: &QueryResult| r.rows.iter().map(|x| x.cells.clone()).collect::<Vec<_>>();
         assert_eq!(cells(&a), cells(&b), "{sql}");
-        assert_eq!(run_err(&with, &owner, &sql), "22000", "{sql}");
+        assert_eq!(run_err(&with, &owner, &sql), "22003", "{sql}");
         let none = run(&with, &private_only_ctx("tenant-z"), &sql);
         assert!(none.rows.is_empty(), "{sql}");
     }

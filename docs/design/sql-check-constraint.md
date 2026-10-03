@@ -104,9 +104,11 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   同様、CHECK 評価中のエラーは制約違反ではなく式評価エラーとして扱う。
 - **精度**: `BIGINT` の絶対値が `2^53` を超える値は `f64` で正確に表現できない
   ため拒否する（`id`（`id_as_finite_scalar`）と同じ境界。黙って丸めて誤った
-  判定をしない）。これも上記オーナー判断により `wire_code` は通常の式評価と
-  同じ `22000`（`sql::udf_call::numeric_scalar_from_ref` の
-  `SqlSurfaceError::InvalidInput`）になる。`INTEGER`／`REAL` は `f64` で常に
+  判定をしない）。`wire_code` は通常の式評価と同じ `22003`
+  （`sql::udf_call::numeric_scalar_from_ref` の
+  `SqlSurfaceError::NumericOutOfRange`）になる。当初は `22000` だったが、
+  オーナー判断（2026-10-02・Issue #1336・TABLE-16）で数値あふれと同じ `22003` へ
+  是正した（拒否の判定境界は不変）。`INTEGER`／`REAL` は `f64` で常に
   正確に表現できる。
 - **既知の PostgreSQL との相違**（記録のみ）: 算術は `f64` で行うため `/` は
   整数の切り捨て除算にならない。`REAL` と小数リテラルの比較は `f32` を

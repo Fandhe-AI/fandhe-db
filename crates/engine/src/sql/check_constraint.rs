@@ -1259,9 +1259,10 @@ mod tests {
 
     /// `BIGINT` 列の値が `2^53` を超える場合、`f64` へ黙って丸めず
     /// `CheckEvaluationFailed` で fail-closed に拒否する（設計 D-2・D-4）。
-    /// オーナー判断（2026-09-28・Issue #1075）: `wire_code` は `XX000` 固定では
-    /// なく、通常の式評価（`sql::udf_call::numeric_scalar_from_ref`）と同じ
-    /// `22000`（`SqlSurfaceError::InvalidInput`）になる。
+    /// オーナー判断（2026-09-28・Issue #1075）で `XX000` 固定ではなく通常の式評価
+    /// （`sql::udf_call::numeric_scalar_from_ref`）と同じ分類となり、オーナー判断
+    /// （2026-10-02・Issue #1336・TABLE-16）で `22003`
+    /// （`SqlSurfaceError::NumericOutOfRange`）へ是正された。
     #[test]
     fn compiled_checks_enforce_bigint_value_exceeding_exact_range_fails_closed() {
         let v = parse_create_table("CREATE TABLE docs (n BIGINT CHECK (n > 0))");
@@ -1279,9 +1280,9 @@ mod tests {
             .expect_err("BIGINT exceeding 2^53 must fail closed");
         assert!(matches!(
             err,
-            TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::InvalidInput { .. })
+            TenantWriteError::CheckEvaluationFailed(SqlSurfaceError::NumericOutOfRange { .. })
         ));
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22003");
     }
 
     /// 0 除算は違反（`23514`）にも通過にも丸めず `CheckEvaluationFailed` で

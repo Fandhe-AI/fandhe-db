@@ -1917,10 +1917,10 @@ mod tests {
 
     #[test]
     fn numeric_column_filter_rejects_negative_integer_beyond_exact_range() {
-        // 2^53 を超える負数は黙って丸めず `22000`（正の側と対称）。
+        // 2^53 を超える負数は黙って丸めず `22003`（正の側と対称）。
         let err = bind(r#"[{"column":"count","op":"gt","value":-9007199254740993}]"#)
             .expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22003");
     }
 
     #[test]
