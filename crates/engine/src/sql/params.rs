@@ -469,9 +469,9 @@ pub enum PreparedParamType {
 impl PreparedParamType {
     /// このスロットが「text 形式の値を UTF-8 恒等で受理してよい」かどうか。
     /// 数値・真偽値スロット（[`ParamLiteralKind`] が `String` 以外）は text 形式
-    /// のみを受理し、バイナリ形式は wire 層が `0A000` で拒否する（バイナリ値を
-    /// UTF-8 として誤解釈して黙って受理する経路を塞ぐ。数値のバイナリ復号は
-    /// WIRE-14 の申し送り）。wire-server の `build_param_slots` が参照する。
+    /// のみを UTF-8 恒等で受理する。数値・真偽値等のバイナリ形式は wire 層が
+    /// 受信形式を正規テキストへ復号してから渡す（Issue #1345・WIRE-14。バイナリ値を
+    /// UTF-8 として誤解釈して受理する経路は無い）。
     pub fn binds_as_text_literal(&self) -> bool {
         matches!(self.literal_kind(), ParamLiteralKind::String)
     }

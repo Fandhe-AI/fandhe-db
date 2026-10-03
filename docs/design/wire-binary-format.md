@@ -149,8 +149,8 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - 非対応型（`NUMERIC`・`DATE`・`TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM`・
   `VECTOR`・`id`・`Computed`）は従来どおり Bind で `0A000`（当該文のみ拒否・
   接続維持）。
-- 長さ上限検証・`08P01` の範囲: バイナリ形式パラメータの復号は wire 側の
-  `$n` 束縛（#935・WIRE-12）が未結線のため本 Issue の対象外。本 Issue では
+- 長さ上限検証・`08P01` の範囲: バイナリ形式パラメータの復号は本 Issue の対象外
+  （Issue #1345 で実装。下記参照）。本 Issue では
   Bind 本文の不正な長さ・件数が `08P01` になり Sync で回復することを wire
   テストで固定した。
 - 3 クライアント（psycopg `binary=True`・node pg `binary: true`）でのバイナリ
@@ -180,9 +180,10 @@ matches_legacy_encoder`）で固定している。シグネチャは
 - `0A000` のあと当該文だけを拒否して接続を維持する同期回復 →
   **#934 で実施済み**（既存の `respond_error_and_await_sync` 経路をそのまま
   使う）
-- パラメータのバイナリ復号 → Issue #1171 で text 系スロットのみ実装済み
-  （UTF-8 バイト恒等。それ以外のスロットは `0A000`）。text 以外の型
-  （int4・int8・float・bool・bytea・uuid）のバイナリ復号は後続（対象外のまま）
+- パラメータのバイナリ復号 → Issue #1171 で text 系スロットを実装し、Issue #1345 で
+  int4・int8・float4・float8・bool・bytea・uuid を実装済み（`binary_param` モジュールが
+  受信形式を正規テキストへ変換し、テキスト形式と同じ engine 経路へ流す。長さ不正は
+  `08P01`、非対応スロットは `0A000`）
 - 型 OID 拡張（`BOOLEAN`／`REAL`／`DOUBLE PRECISION`／`DATE`／`TIMESTAMP`／
   `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
   （`docs/design/wire-type-oid-mapping.md` 参照）。数値・真偽値・

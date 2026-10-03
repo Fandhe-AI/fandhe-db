@@ -449,3 +449,10 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **挙動変更**: RowDescription の型 OID が text（25）から型付き（20・23・700・701・1700・1082・1114 等）へ変わる。判定不能な場合は `None`（text 公告）に倒れる fail-closed。
 - **網羅ガード**: `window` の単体テスト、`describe_parity`（Describe と実行の列メタ一致）、`sql30_window` の型アサーション、`wire13_type_oid`（自テナントの OID・値と他テナントの同一 OID・0 行）、`wire_scan_window`・`wire11_parse_describe`。
 - **対象外（申し送り）**: HTTP（NoSQL）`columns[].type` の型名化（NOSQL-11 の判断事項）、ウィンドウ列のバイナリ結果形式、3 クライアント e2e（opt-in。未実行）。
+
+**Issue #1345（feat(wire): 非 text 型のバイナリ形式パラメータを復号する。WIRE-14・WIRE-12・TASK-218 ポインタ）**: 拡張クエリの Bind でパラメータ format code が binary（1）のとき、`int4`／`int8`／`float4`／`float8`／`bool`／`bytea`／`uuid` スロットを PostgreSQL の受信形式（ネットワークバイトオーダー）で復号し、テキスト形式と同じ値に束縛する。
+
+- **変更箇所**: `wire-server` の `binary_param`（新設。受信形式 → 正規テキストの復号と単体テスト）、`extended_query` の `ParamSlot.binary`（`BinaryParam` 化・推論型と実効 OID の互換表）・`handle_bind_body`（非対応判定 → 復号の 2 パス、変換後の値で保持量判定と `bind_prepared`）・新 `HandlerError::InvalidBinaryParam`（`08P01`）。`engine` は doc コメントのみ。
+- **挙動変更**: 7 型スロットの binary 指定が `0A000` から受理へ。`REAL`／`DOUBLE`／`BYTEA`／`UUID` スロット（宣言 OID 0）でバイナリ生バイトを UTF-8 として誤解釈していた受理を受信形式の復号へ是正（固定長不一致は `08P01`）。長さ不正は `08P01`、非対応スロット（`NUMERIC`・日時・`JSON`・配列・`ENUM`・`VECTOR`・宣言 0 の `id`・互換表外の宣言 OID）は従来どおり `0A000`。
+- **テスト**: `binary_param` の往復・境界値・長さ不正の単体テスト、`wire14_binary_params`（バイナリ ≡ テキスト・`08P01`・`0A000` と判定順・NULL・テナント境界）、`wire12_param_binding` の期待値を仕様変更に合わせて更新（アサーション弱体化ではない）。
+- **対象外（申し送り）**: engine の `REAL`／`DOUBLE` 型付き束縛（`ParamLiteralKind::Float` 相当。無い限り float の text・binary 束縛は `22P02`）、int2・numeric・日時・`JSON`・配列・`ENUM`・`VECTOR` のバイナリ受信、暗黙キャスト（float4→float8 等）、3 クライアント e2e（opt-in。未実行）。

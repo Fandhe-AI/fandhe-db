@@ -122,6 +122,7 @@
 
 pub mod auth;
 pub mod auth_method_opt;
+pub(crate) mod binary_param;
 pub mod bind_guard;
 pub(crate) mod copy;
 pub mod ddl_permission_opt;

@@ -83,8 +83,11 @@
 //! - 未定義ステートメント名／portal 名への参照・名前付きステートメント／
 //!   portal の重複作成・Bind のパラメータ数不一致・format code の個数不正
 //!   → `08P01`（`ProtocolViolation`）
-//! - Bind のパラメータ format code が binary（1）で対象スロットが text 系以外
-//!   （WIRE-12・#1171）・結果 format code が非対応型の列を
+//! - Bind のパラメータ binary 値の長さ不正（Issue #1345・WIRE-14）
+//!   → `08P01`（`ProtocolViolation`）
+//! - Bind のパラメータ format code が binary（1）で対象スロットが復号非対応
+//!   （int4/int8/float4/float8/bool/bytea/uuid・text 系以外。WIRE-12・#1171・
+//!   #1345）・結果 format code が非対応型の列を
 //!   binary 指定（WIRE-14・[`result_encoder::column_binary_support`]）・
 //!   Describe(Portal) 対象の受理不能・実行結果列の不整合（いずれも `0A000`
 //!   の「未対応機能」区分を fail-closed なガードとして流用）
@@ -107,6 +110,7 @@
 //! 'S'／'C'／'H' のいずれも従来どおり `protocol_dispatch::reject_and_close`
 //! （`0A000` + 切断）のまま（WIRE-8 の契約を維持）。
 
+use std::borrow::Cow;
 use std::io;
 
 use engine::core::{EngineCore, ParsedSql, PreparedSql};
@@ -116,6 +120,7 @@ use engine::sql::exec::ColumnMeta;
 use engine::sql::mode::SessionState;
 use engine::sql::params::{PreparedParamType, MAX_PARAMS};
 
+use crate::binary_param::{self, BinaryParam};
 use crate::error_response;
 use crate::framing::{self, FrameError};
 use crate::limits::{
@@ -457,14 +462,73 @@ pub(crate) struct ParamSlot {
     /// `ParameterDescription` で公告する型 OID（宣言 OID が 0 以外ならその
     /// echo、それ以外は推論 OID）。
     oid: i32,
-    /// バイナリ形式の値を受理してよいか（text 系スロットのみ。バイト列は
-    /// UTF-8 の恒等表現としてそのまま engine へ渡す）。
-    binary: bool,
+    /// バイナリ形式の値の復号種別（Issue #1345）。`Unsupported` は binary 指定を
+    /// `0A000` で拒否する。復号結果は正規テキストとして engine へ渡す。
+    binary: BinaryParam,
 }
 
 /// 宣言 OID のうち、text 系スロットへバイナリ（UTF-8 バイト恒等）を許す型。
 /// 0（未指定）・25（text）・1043（varchar）。
 const TEXT_LIKE_DECLARED_OIDS: [i32; 3] = [0, 25, 1043];
+
+/// 推論スロット型と実効 OID（宣言 OID が 0 以外ならそれ、0 なら推論 OID）から
+/// バイナリ復号種別を決める（Issue #1345）。推論型との互換表に載らない組み合わせは
+/// すべて `Unsupported`（fail-closed）。PostgreSQL の暗黙キャスト（int2→int4、
+/// float4→float8 等）より意図的に厳しい: 値の意味が暗黙キャストと変わりうる
+/// 組み合わせを受理しない。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i32) -> BinaryParam {
+    use engine::catalog::ColumnType;
+    let text_like = || {
+        if TEXT_LIKE_DECLARED_OIDS.contains(&declared_oid) {
+            BinaryParam::Utf8Identity
+        } else {
+            BinaryParam::Unsupported
+        }
+    };
+    let only = |oid: i32, kind: BinaryParam| {
+        if effective_oid == oid {
+            kind
+        } else {
+            BinaryParam::Unsupported
+        }
+    };
+    match ty {
+        PreparedParamType::Text => text_like(),
+        PreparedParamType::VectorText => BinaryParam::Unsupported,
+        PreparedParamType::Column(meta) => match meta {
+            // `id` は宣言 0（実効 1700=NUMERIC）をバイナリ非対応とする。
+            ColumnMeta::Id => int_kind(effective_oid),
+            ColumnMeta::Computed { .. } => BinaryParam::Unsupported,
+            ColumnMeta::Scalar { ty, .. } => match ty {
+                ColumnType::Text => text_like(),
+                ColumnType::Integer | ColumnType::BigInt => int_kind(effective_oid),
+                ColumnType::Real => only(700, BinaryParam::Float4),
+                ColumnType::Double => only(701, BinaryParam::Float8),
+                ColumnType::Boolean => only(16, BinaryParam::Bool),
+                ColumnType::Bytea => only(17, BinaryParam::Bytea),
+                ColumnType::Uuid => only(2950, BinaryParam::Uuid),
+                ColumnType::Vector(_)
+                | ColumnType::Numeric { .. }
+                | ColumnType::Date
+                | ColumnType::Timestamp
+                | ColumnType::Json
+                | ColumnType::Jsonb
+                | ColumnType::Array(_)
+                | ColumnType::Enum(_) => BinaryParam::Unsupported,
+            },
+        },
+    }
+}
+
+/// 整数スロットの実効 OID から復号種別を選ぶ（int4=23・int8=20 のみ）。
+fn int_kind(effective_oid: i32) -> BinaryParam {
+    match effective_oid {
+        23 => BinaryParam::Int4,
+        20 => BinaryParam::Int8,
+        _ => BinaryParam::Unsupported,
+    }
+}
 
 /// 接続単位（`handshake` の接続ループが `SessionState` と並べて所有し、接続終了
 /// で破棄）の名前付き／無名ステートメント保持。無名（`""`）は
@@ -876,6 +940,11 @@ enum HandlerError {
     /// パラメータ format code が binary（1）だが、対象スロットがバイナリ非対応
     /// （text 系以外。WIRE-12・WIRE-14。結果側は [`HandlerError::BinaryFormat`]）。
     BinaryFormatUnsupported,
+    /// バイナリ形式のパラメータ値の長さが型の受信形式と合わない（`08P01`。
+    /// Issue #1345。`index` は 1 始まりの `$n` 番号で、値は含めない）。
+    InvalidBinaryParam {
+        index: usize,
+    },
     /// 結果 format code の解決・事前検査で生じたエラー（WIRE-14。
     /// `result_encoder::BinaryFormatError` をそのまま分類し直したもの）。
     BinaryFormat(result_encoder::BinaryFormatError),
@@ -928,6 +997,7 @@ impl HandlerError {
             HandlerError::ParamCountMismatch => ErrorClass::ProtocolViolation,
             HandlerError::FormatCodeCountMismatch => ErrorClass::ProtocolViolation,
             HandlerError::BinaryFormatUnsupported => ErrorClass::FeatureNotSupported,
+            HandlerError::InvalidBinaryParam { .. } => ErrorClass::ProtocolViolation,
             HandlerError::BinaryFormat(e) => e.error_class(),
             HandlerError::ResultTypeChanged => ErrorClass::FeatureNotSupported,
             HandlerError::SuspendedBytesExceeded => ErrorClass::PayloadTooLarge,
@@ -990,6 +1060,9 @@ impl HandlerError {
             }
             HandlerError::BinaryFormatUnsupported => {
                 "binary parameter format is not supported for this parameter".to_string()
+            }
+            HandlerError::InvalidBinaryParam { index } => {
+                format!("incorrect binary data format in bind parameter ${index}")
             }
             HandlerError::BinaryFormat(result_encoder::BinaryFormatError::FormatCountMismatch) => {
                 "format code count does not match the parameter or result count".to_string()
@@ -1221,24 +1294,21 @@ fn build_param_slots(
         .iter()
         .enumerate()
         .map(|(i, ty)| {
-            let (inferred_oid, inferred_binary) = match ty {
-                PreparedParamType::Text => (result_encoder::WireType::Text.oid(), true),
-                PreparedParamType::VectorText => (result_encoder::WireType::Text.oid(), false),
-                PreparedParamType::Column(meta) => (
-                    result_encoder::column_wire_type(meta).oid(),
-                    // Issue #1342: 数値・真偽値スロットは text 形式のみ受理する
-                    // （バイナリを UTF-8 として誤解釈する経路を塞ぐ。WIRE-14 申し送り）。
-                    result_encoder::column_binary_support(meta) && ty.binds_as_text_literal(),
-                ),
+            let inferred_oid = match ty {
+                PreparedParamType::Text | PreparedParamType::VectorText => {
+                    result_encoder::WireType::Text.oid()
+                }
+                PreparedParamType::Column(meta) => result_encoder::column_wire_type(meta).oid(),
             };
             let declared_oid = declared.get(i).copied().unwrap_or(0);
+            let oid = if declared_oid != 0 {
+                declared_oid
+            } else {
+                inferred_oid
+            };
             ParamSlot {
-                oid: if declared_oid != 0 {
-                    declared_oid
-                } else {
-                    inferred_oid
-                },
-                binary: inferred_binary && TEXT_LIKE_DECLARED_OIDS.contains(&declared_oid),
+                oid,
+                binary: binary_param_kind(ty, declared_oid, oid),
             }
         })
         .collect();
@@ -1523,23 +1593,41 @@ fn handle_bind_body(
         PreparedStatement::Parameterized { prepared, slots } => {
             // 値ごとの format を解決する（0 件は全 text・1 件は全値へ適用・
             // n 件は個別。件数の整合は `validate_format_codes` が検証済み）。
-            // binary は text 系スロットのみ受理し、UTF-8 バイト恒等でそのまま
-            // engine へ渡す（それ以外は `0A000`）。
+            // 第 1 パス: binary 指定でスロットが非対応なら、復号は一切行わず
+            // `0A000` で拒否する（長さ不正の `08P01` より先に判定）。
+            let code_of = |i: usize| match msg.param_format_codes.as_slice() {
+                [] => 0,
+                [one] => *one,
+                many => many.get(i).copied().unwrap_or(0),
+            };
             for (i, slot) in slots.iter().enumerate() {
-                let code = match msg.param_format_codes.as_slice() {
-                    [] => 0,
-                    [one] => *one,
-                    many => many.get(i).copied().unwrap_or(0),
-                };
-                if code == 1 && !slot.binary {
+                if code_of(i) == 1 && slot.binary == BinaryParam::Unsupported {
                     return Err(HandlerError::BinaryFormatUnsupported);
                 }
             }
-            // 同一 `$n` の出現ごとに値が複製されるため、受信量ではなく展開後の
+            // 第 2 パス: binary 指定の値を正規テキストへ復号する（長さ不正は
+            // `08P01`。エラーに値は含めない）。全値 text なら再アロケーションしない。
+            let decoded: Cow<'_, [Option<Vec<u8>>]> = if (0..slots.len()).any(|i| code_of(i) == 1) {
+                let mut out = Vec::with_capacity(msg.param_values.len());
+                for (i, (value, slot)) in msg.param_values.iter().zip(slots).enumerate() {
+                    let v = match value {
+                        Some(raw) if code_of(i) == 1 => Some(
+                            binary_param::decode_to_text(slot.binary, raw)
+                                .map_err(|_| HandlerError::InvalidBinaryParam { index: i + 1 })?,
+                        ),
+                        other => other.clone(),
+                    };
+                    out.push(v);
+                }
+                Cow::Owned(out)
+            } else {
+                Cow::Borrowed(msg.param_values.as_slice())
+            };
+            // 同一 `$n` の出現ごとに値が複製されるため、受信量ではなく変換後・展開後の
             // 実保持量で portal の保持量上限を判定する（PR #1217 レビュー指摘）。
-            bound_bytes = prepared.expanded_bound_bytes(&msg.param_values);
+            bound_bytes = prepared.expanded_bound_bytes(&decoded);
             let bound = engine
-                .bind_prepared(prepared, &msg.param_values)
+                .bind_prepared(prepared, &decoded)
                 .map_err(HandlerError::Sql)?;
             let columns = engine
                 .describe_parsed_in_txn(session, txn, &bound)
