@@ -361,6 +361,11 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   （`55P03`／`25000`／`25001`／`25P01`／`25P02`）を NoSQL 表層からの到達不能
   分類として追加し、production の応答エンコーダ経由で射影のみを固定する
   （NoSQL 表層の `op` 許可リストにトランザクション制御が無いため）。
+- RECOVER-12 の再送手順の検証（Issue #1354。実装済み）: engine の
+  `crates/engine/tests/recover12_explicit_txn_resend.rs`（行制約を持つ表での台帳照合の
+  順序）、wire の `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（層 A）、
+  `three_client_e2e.rs` の層 B（psql／psycopg／node pg の 3 クライアント。
+  [`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
 
 ## 起源（Explicit／Implicit）ごとの遷移差分（Issue #1175）
 
@@ -392,10 +397,6 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
-- RECOVER-12 の再送手順の検証（Issue #1354）: engine の
-  `tests/recover12_explicit_txn_resend.rs`（行制約を持つ表での台帳照合の順序）、wire の
-  `tests/recover12_explicit_txn_resend.rs`（層 A）、`three_client_e2e.rs` の層 B
-  （[`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
 - 先頭文が 0 行 DELETE の場合に RECOVER-12 の再送判定が成立しない制約
   （SQL-18 の既存契約〔0 行 DELETE は台帳非記録〕との相互作用）。
 - 上限の既定値（20 秒・1,000 件・30 秒）の確定 → オーナー判断。
