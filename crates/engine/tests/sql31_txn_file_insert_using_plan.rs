@@ -386,3 +386,44 @@ fn explain_over_a_dirty_table_is_accepted_for_every_variant() {
     assert_eq!(tx.txn.status(), TransactionStatus::InTransaction);
     tx.ok("ROLLBACK");
 }
+/// 生 `redb::Database` を再オープンし、`user_rows/{table}` が物理的に存在するかを確認する
+/// （呼び出し元は先に `EngineCore` を drop してファイルロックを解放しておくこと）。
+fn user_rows_table_exists(path: &std::path::Path, table: &str) -> bool {
+    use redb::{ReadableDatabase, TableHandle};
+    let db = redb::Database::open(path).expect("reopen raw database");
+    let read_txn = db.begin_read().expect("begin read txn");
+    let name = format!("user_rows/{table}");
+    let found = read_txn
+        .list_tables()
+        .expect("list tables")
+        .any(|handle| handle.name() == name);
+    found
+}
+
+#[test]
+fn using_plan_and_explain_over_an_empty_table_never_create_its_row_table() {
+    let (core, _p, path) = new_core("txn-using-plan-no-create", true);
+    let _guard = CleanupGuard(path.clone());
+    setup(&core);
+    ddl(
+        &core,
+        &format!(
+            "CREATE TABLE other (path TEXT NOT NULL, body TEXT NOT NULL, embedding VECTOR({DIM}))"
+        ),
+    );
+
+    let mut tx = Tx::new(&core, "alice");
+    tx.ok("BEGIN");
+    // 別テーブルへの書き込みでトランザクションを dirty にする（`files` は行なしのまま）。
+    tx.ok("INSERT INTO other (path, body) VALUES ('o.txt', 'beta') USING OPERATION_ID 'o1'");
+    assert!(rows(tx.ok(USING_PLAN)).is_empty());
+    tx.ok("EXPLAIN SELECT path FROM files USING PLAN('find alpha') LIMIT 10");
+    tx.ok("COMMIT");
+    drop(tx);
+    drop(core);
+
+    assert!(
+        !user_rows_table_exists(&path, "files"),
+        "reading through USING PLAN / EXPLAIN must not create the row table"
+    );
+}

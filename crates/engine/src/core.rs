@@ -2518,12 +2518,25 @@ impl EngineCore {
             .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
 
         let row_table_name = crate::catalog::user_rows_table_name(table);
-        let row_table =
+        // `WriteTransaction::open_table` は未存在テーブルを作成してしまうため、読み取り経路では
+        // `list_tables` で存在確認してから開く（空の user_rows が COMMIT で永続化されるのを防ぐ）。
+        // 未存在は「行なし」＝空辞書として扱う。
+        let row_table_exists = {
+            use redb::TableHandle;
+            write_txn
+                .list_tables()
+                .map_err(CatalogError::from)?
+                .any(|handle| handle.name() == row_table_name)
+        };
+        let row_table = if row_table_exists {
             match write_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
                 Ok(t) => Some(t),
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
                 Err(e) => return Err(CoreError::from(crate::catalog::map_row_table_error(e))),
-            };
+            }
+        } else {
+            None
+        };
 
         let mut builder = crate::dictionary::DictionaryBuilder::new(self.dictionary_config.clone());
         if let Some(row_table) = row_table {
