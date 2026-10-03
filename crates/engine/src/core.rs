@@ -3584,7 +3584,14 @@ impl EngineCore {
                 match resolved.split_first() {
                     None => PreparedParamType::Text,
                     Some((first, rest)) => {
-                        if rest.iter().all(|t| t == first) {
+                        // 同一種別（Integer／Boolean）の数値・真偽値スロットは列名・
+                        // 型が異なっても統合する（`n = $1 AND m = $1` で Text へ
+                        // 後退させない。PR #1372 レビュー指摘）。
+                        let first_kind = first.literal_kind();
+                        if rest.iter().all(|t| t == first)
+                            || (first_kind != crate::sql::params::ParamLiteralKind::String
+                                && rest.iter().all(|t| t.literal_kind() == first_kind))
+                        {
                             first.clone()
                         } else if resolved.contains(&PreparedParamType::VectorText) {
                             PreparedParamType::VectorText

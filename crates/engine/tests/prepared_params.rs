@@ -1058,6 +1058,28 @@ fn assert_bind_matches_literal(
     assert_eq!(described, literal_described);
 }
 
+/// PR #1372 レビュー指摘: 同一種別（Integer）で列名・型が異なる複数位置に現れる
+/// `$n` も Text へ後退せず整数リテラルとして束縛される。
+#[test]
+fn typed_bind_reused_param_across_integer_columns_stays_integer() {
+    let path = unique_db_path("prepared-typed-reuse");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, n FROM typed WHERE n = $1 AND b = $1 LIMIT 5",
+        &["7"],
+        "SELECT id, n FROM typed WHERE n = 7 AND b = 7 LIMIT 5",
+    );
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id, n FROM typed WHERE id = $1 AND n = $1 LIMIT 5",
+        &["7"],
+        "SELECT id, n FROM typed WHERE id = 7 AND n = 7 LIMIT 5",
+    );
+}
+
 #[test]
 fn typed_bind_matches_literal_form_for_id_integer_bigint_boolean() {
     let path = unique_db_path("prepared-typed-parity");
