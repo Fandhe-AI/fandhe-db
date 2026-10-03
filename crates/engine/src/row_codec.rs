@@ -1723,7 +1723,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                 // 欠落列は `DEFAULT` があれば既定値で補う（`scan_scalar_columns_validated`
                 // と同じ規則。Issue #1169）。
                 if column.default.is_some() {
-                    let scalar = column_default_scalar(column).map_err(|_| {
+                    let scalar = column_default_scalar_for_read(column).map_err(|_| {
                         RowCodecError::Invalid(format!(
                             "column {:?} has an invalid DEFAULT for its type",
                             column.name
@@ -3332,6 +3332,17 @@ pub(crate) fn column_default_scalar(
     }
 }
 
+/// [`column_default_scalar`] の読み出し時補完版（JSON／JSONB は再検証を省く）。
+/// [`default_scalar_for_read`] を参照。
+pub(crate) fn column_default_scalar_for_read(
+    column: &crate::catalog::ColumnDef,
+) -> std::result::Result<Option<ScalarRef<'_>>, DefaultBindError> {
+    match &column.default {
+        None => Ok(None),
+        Some(default) => default_scalar_for_read(&column.ty, default).map(Some),
+    }
+}
+
 /// [`column_default_scalar`] の本体（型と既定値を直接受ける版）。
 pub(crate) fn default_scalar<'a>(
     ty: &ColumnType,
@@ -3436,6 +3447,23 @@ pub(crate) fn default_scalar<'a>(
     }
 }
 
+/// 既存行の読み出し時補完専用の [`default_scalar`]。`JSON`／`JSONB` の既定値は
+/// DDL 時（`catalog::Storage::alter_table_add_column` 等が通す [`column_default_scalar`]）に
+/// 構文検証・正規化済みで、列の `DEFAULT` は作成後に変わらないため、行ごとの再解析・
+/// 正規化文字列の確保を省いて原文を借用する（大量の既存行を読む際の負荷対策。
+/// Issue #1337）。他の型は [`default_scalar`] へ委譲する。
+pub(crate) fn default_scalar_for_read<'a>(
+    ty: &ColumnType,
+    default: &'a crate::catalog::ColumnDefault,
+) -> std::result::Result<ScalarRef<'a>, DefaultBindError> {
+    match (default, ty) {
+        (crate::catalog::ColumnDefault::Text(s), ColumnType::Json | ColumnType::Jsonb) => {
+            Ok(ScalarRef::Json(s.as_str()))
+        }
+        _ => default_scalar(ty, default),
+    }
+}
+
 /// [`scan_scalar_columns_masked`]・[`validate_scalar_columns`] が共有する走査本体。
 /// 列ごとの構造検証（presence タグ・宣言長上限・バッファ境界・UTF-8 妥当性）を
 /// 一箇所に集約し、検証済みの値（`col_index`・`Option<&'a str>`）を `sink` へ渡す
@@ -3488,7 +3516,7 @@ fn scan_scalar_columns_validated<'a>(
                     // マスク外でも DEFAULT の妥当性は検証する（参照列の選択で
                     // カタログ破損の検出結果が変わらないようにする。fail-closed）。
                     // 出力の保持だけを `wanted` で省略する。
-                    let value = default_scalar(column.ty, default).map_err(|_| {
+                    let value = default_scalar_for_read(column.ty, default).map_err(|_| {
                         RowCodecError::Invalid(format!(
                             "column {:?} has an invalid DEFAULT for its type",
                             column.name
@@ -5904,26 +5932,16 @@ mod tests {
         assert_eq!(decoded[1], Value::Json(raw.to_string()));
         assert_eq!(decoded[2], Value::Json(canon.to_string()));
 
+        // 不正値・非正規形は DDL／束縛側の `default_scalar` が拒否する。読み出し時補完は
+        // DDL 検証済みを前提に再検証を省く（`default_scalar_for_read`。Issue #1337）。
         for (ty, bad) in [
             (ColumnType::Json, "abc"),
             (ColumnType::Jsonb, "{\"a\":"),
             (ColumnType::Jsonb, raw),
         ] {
-            let (buf, schema) =
-                old_row_and_extended_schema(vec![ColumnDef::new("j", ty, true)
-                    .with_default(ColumnDefault::Text(bad.to_string()))]);
-            assert!(
-                matches!(
-                    scan_scalar_columns(&schema, &buf),
-                    Err(RowCodecError::Invalid(_))
-                ),
-                "{bad}"
-            );
-            assert!(
-                matches!(
-                    decode_scalar_columns(&schema, &buf),
-                    Err(RowCodecError::Invalid(_))
-                ),
+            assert_eq!(
+                default_scalar(&ty, &ColumnDefault::Text(bad.to_string())),
+                Err(DefaultBindError::Malformed),
                 "{bad}"
             );
         }
