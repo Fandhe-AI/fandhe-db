@@ -230,7 +230,7 @@ fn nosql_insert_accepts_real_column_value_and_round_trips() {
 /// REAL 列の値・式・集計は PostgreSQL の float4 出力形式で返る（Issue #1173・
 /// WIRE-13）: `0.1` は `0.1`（f64 拡張の `0.10000000149011612` ではない）、
 /// `1000000` は `1e+06`。`SUM(REAL)` は real で、`0.1 + 0.2` は `0.3`
-/// （f32 へ丸めた結果）になる。DOUBLE PRECISION 列は従来の表記のまま。
+/// （f32 へ丸めた結果）になる。DOUBLE PRECISION 列は float8 形式（別テスト参照）。
 #[test]
 fn wire_real_text_follows_postgresql_float4_output() {
     let (core, _guard) = new_core_with_metrics_table();
@@ -285,4 +285,52 @@ fn wire_real_text_follows_postgresql_float4_output() {
     assert_eq!(read_data_row(&mut stream), vec![Some("0.3".to_string())]);
     read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
+}
+
+/// DOUBLE PRECISION 列のテキスト出力は PostgreSQL の float8 出力形式（Issue #1343・
+/// WIRE-13 のポインタ）。大小指数は `1e+20`／`1e-05` 形式、通常域は固定小数。
+#[test]
+fn wire_double_text_follows_postgresql_float8_output() {
+    let (core, _guard) = new_core_with_metrics_table();
+    let mut stream = spawn_with_alice(core);
+
+    for (id, weight) in [
+        (1, "1e20"),
+        (2, "0.00001"),
+        (3, "0.1"),
+        (4, "123456789012345"),
+        (5, "1e15"),
+    ] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO metrics (id, embedding, score, weight) \
+                 VALUES ({id}, '[0.1,0.2]', 1, {weight}) USING OPERATION_ID 'wire-d-{id}'"
+            ),
+        );
+        read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+
+    for (id, expected) in [
+        (1, "1e+20"),
+        (2, "1e-05"),
+        (3, "0.1"),
+        (4, "123456789012345"),
+        (5, "1e+15"),
+    ] {
+        send_simple_query(
+            &mut stream,
+            &format!("SELECT weight FROM metrics WHERE id = {id} LIMIT 1"),
+        );
+        let columns = read_row_description_with_oids(&mut stream);
+        assert_eq!(columns, vec![("weight".to_string(), 701)]);
+        assert_eq!(
+            read_data_row(&mut stream),
+            vec![Some(expected.to_string())],
+            "id={id}"
+        );
+        read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
 }

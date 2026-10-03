@@ -48,7 +48,8 @@
 //!   持たない列）は `text`（OID 25）へフォールバックする
 //! - `REAL`（`float4`）列のテキスト値は PostgreSQL の float4 出力形式
 //!   （`0.1` → `0.1`・`1e6` → `1e+06`。[`engine::scalar_float::format_real`]）で出す
-//!   （[`cell_to_text_for_column`]）。`DOUBLE PRECISION` は従来どおり最短往復表記
+//!   （[`cell_to_text_for_column`]）。`DOUBLE PRECISION` は float8 出力形式
+//!   （`1e20` → `1e+20`。[`engine::scalar_float::format_double`]。Issue #1343）
 //!
 //! バイナリ形式（format code 1・WIRE-14・TASK-218・Issue #936）: 列ごとに
 //! テキスト／バイナリを要求できる（PostgreSQL の Bind 規則。[`ResultFormats`]）。
@@ -718,7 +719,9 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
                 .join(",");
             Ok(Some(format!("[{joined}]")))
         }
-        Cell::Float(f) => Ok(Some(f.to_string())),
+        // float8 は PostgreSQL の float8 出力形式（Issue #1343・WIRE-13）。float4 公告列は
+        // 呼び出し元 `cell_to_text_for_column` が先に `format_real` で処理する。
+        Cell::Float(f) => Ok(Some(engine::scalar_float::format_double(*f))),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
         // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
         // `RowDescription` の OID 写像は `int4`／`int8`（Issue #903 レビュー指摘で

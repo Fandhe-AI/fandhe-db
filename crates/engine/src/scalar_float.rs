@@ -12,18 +12,16 @@
 //! - `-0.0` は `+0.0` へ正規化する（符号付きゼロは保持しない）。
 //! - 比較・ソートは [`cmp_real`]／[`cmp_double`] が唯一の情報源（`total_cmp` を
 //!   基準にしつつ `-0.0 == +0.0` を保つ）。`NULL` の並び位置は呼び出し側の責務。
-//! - `DOUBLE PRECISION` のテキスト表現は Rust の `Display`（指数表記を出さない
-//!   最短往復表記）を正準とする。`REAL` のテキスト表現は PostgreSQL の float4 出力
-//!   （最短往復桁・指数は `1e+06` 形式。Issue #1173・WIRE-13 のポインタ）に揃える
-//!   （[`format_real`]）。`f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析
-//!   する（二重丸め防止）。
+//! - `DOUBLE PRECISION` のテキスト表現は PostgreSQL の float8 出力（最短往復桁・
+//!   指数は `1e+20` 形式。Issue #1343・WIRE-13 のポインタ。[`format_double`]）、
+//!   `REAL` は float4 出力（`1e+06` 形式。Issue #1173。[`format_real`]）に揃える。
+//!   `f32`／`f64` は互いを経由せず直接その型の `FromStr` で解析する（二重丸め防止）。
 //! - `COPY FROM` は [`format_real`] の出力（指数表記を含む）を再投入できる必要が
 //!   あるため、閉じた文法で指数表記を受理する [`parse_real_text`] を使う
 //!   （WIRE-17 の往復契約。SQL リテラルの [`parse_real`] も #1187 で指数表記を受理）。
 //!
 //! 指数表記リテラル（`1.5e3`）は Issue #1187 で受理する（PostgreSQL と整合）。
-//! 対象外（申し送り）: `DOUBLE PRECISION` 出力の PostgreSQL 形式化・文字列リテラル
-//! からの暗黙変換は後続 Issue の担当。
+//! 対象外（申し送り）: 文字列リテラルからの暗黙変換は後続 Issue の担当。
 
 use std::cmp::Ordering;
 
@@ -157,14 +155,23 @@ pub fn format_real(value: f32) -> String {
         return format!("{sign}0");
     }
     // `{:e}` は f32 の最短往復表記を `d[.ddd]e<exp>` で返す。
-    let sci = format!("{:e}", value.abs());
+    format_shortest_sci(sign, &format!("{:e}", value.abs()), 6)
+}
+
+/// 最短往復の科学表記（`d[.ddd]e<exp>`）を PostgreSQL の出力形式へ整形する共通部。
+///
+/// `format_real`（float4・`fixed_upper = 6`）と `format_double`（float8・
+/// `fixed_upper = 15`）が共有する。十進指数 `exp` が `-4 <= exp < fixed_upper` なら
+/// 固定小数、それ以外は `d[.ddd]e±XX`（指数は符号必須・2 桁以上ゼロ詰め）。
+/// 入力は呼び出し元が生成する内部文字列で、非有限値・ゼロは呼び出し元が除外済み。
+fn format_shortest_sci(sign: &str, sci: &str, fixed_upper: i32) -> String {
     let (mantissa, exp_text) = match sci.split_once('e') {
         Some(parts) => parts,
         None => return format!("{sign}{sci}"),
     };
     let exp: i32 = exp_text.parse().unwrap_or(0);
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    if (-4..6).contains(&exp) {
+    if (-4..fixed_upper).contains(&exp) {
         let body = if exp < 0 {
             let zeros = usize::try_from(-exp - 1).unwrap_or(0);
             format!("0.{}{}", "0".repeat(zeros), digits)
@@ -179,7 +186,9 @@ pub fn format_real(value: f32) -> String {
         };
         format!("{sign}{body}")
     } else {
-        let (first, rest) = digits.split_at(1);
+        let mut chars = digits.chars();
+        let first = chars.next().unwrap_or('0');
+        let rest = chars.as_str();
         let frac = if rest.is_empty() {
             String::new()
         } else {
@@ -223,9 +232,24 @@ pub fn parse_real_text(input: &str) -> Result<f32, ParseFloatError> {
     Ok(canonicalize_real(value))
 }
 
-/// `DOUBLE PRECISION` 値の正準テキスト表現。
+/// `DOUBLE PRECISION` 値の PostgreSQL float8 出力形式のテキスト表現（Issue #1343・
+/// WIRE-13 のポインタ）。
+///
+/// 桁列は最短往復表記で、十進指数が `-4 <= e < 15` なら固定小数、それ以外は
+/// `d[.ddd]e±XX`。特殊値は [`format_real`] と同じ（`NaN`／`Infinity`／`-Infinity`／`-0`）。
+/// wire-server の `DataRow`・`COPY TO`・配列出力が呼ぶ。
 pub fn format_double(value: f64) -> String {
-    format!("{value}")
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0");
+    }
+    format_shortest_sci(sign, &format!("{:e}", value.abs()), 15)
 }
 
 /// `REAL` 値の全順序比較（F5）。`a == b`（`-0.0 == +0.0` を含む IEEE 754 の
@@ -307,6 +331,51 @@ mod tests {
         ];
         for &(v, expected) in cases {
             assert_eq!(format_real(v), expected, "format_real({v:?})");
+        }
+    }
+
+    #[test]
+    fn format_double_matches_postgresql_float8_output() {
+        let cases: &[(f64, &str)] = &[
+            (2.0, "2"),
+            (0.1, "0.1"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (100.0, "100"),
+            (1e14, "100000000000000"),
+            (123456789012345.0, "123456789012345"),
+            (1e15, "1e+15"),
+            (1234567890123456.0, "1.234567890123456e+15"),
+            (1e20, "1e+20"),
+            (1e100, "1e+100"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (-1.5e-10, "-1.5e-10"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::MIN, "-1.7976931348623157e+308"),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (5e-324, "5e-324"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ];
+        for &(v, expected) in cases {
+            assert_eq!(format_double(v), expected, "format_double({v:?})");
+        }
+    }
+
+    #[test]
+    fn parse_double_roundtrips_bit_pattern_sweep() {
+        let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            let v = f64::from_bits(next());
+            if !v.is_finite() {
+                continue;
+            }
+            let text = format_double(v);
+            let parsed = parse_double(&text).expect("roundtrip parse");
+            assert_eq!(parsed.to_bits(), canonicalize_double(v).to_bits(), "{text}");
         }
     }
 
