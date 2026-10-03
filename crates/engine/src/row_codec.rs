@@ -1741,6 +1741,7 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                         Some(ScalarRef::Enum(t)) => Value::Enum(t.to_string()),
                         Some(ScalarRef::Uuid(u)) => Value::Uuid(u),
                         Some(ScalarRef::Timestamp(t)) => Value::Timestamp(t),
+                        Some(ScalarRef::Json(t)) => Value::Json(t.to_string()),
                         _ => {
                             return Err(RowCodecError::Invalid(format!(
                                 "column {:?} has an invalid DEFAULT for its type",
@@ -3302,7 +3303,8 @@ impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
 pub(crate) enum DefaultBindError {
     /// 列型とリテラル種別が合わない（大分類の不整合・DEFAULT 非対応型）。
     Incompatible,
-    /// リテラルの文法が不正（`UUID` の文字列不正を含む。詳細は保持しない）。
+    /// リテラルの文法が不正（`UUID` の文字列不正、`JSON`／`JSONB` の構文不正・
+    /// `JSONB` の非正規形を含む。詳細は保持しない。Issue #1337）。
     Malformed,
     /// 列型の値域外（`INTEGER` オーバーフロー・`NUMERIC` 桁数超過等）。
     OutOfRange,
@@ -3413,6 +3415,21 @@ pub(crate) fn default_scalar<'a>(
                 Err(crate::datetime::DateTimeLiteralError::Overflow(_)) => {
                     Err(DefaultBindError::DatetimeOverflow)
                 }
+            }
+        }
+        // `JSON` 列の既定値は文字列リテラルの原文を保持し、構文だけを共有検証
+        // （`json::validate_json_column_text`）で確認する（Issue #1337）。
+        (ColumnDefault::Text(s), ColumnType::Json) => {
+            crate::json::validate_json_column_text(s).map_err(|_| DefaultBindError::Malformed)?;
+            Ok(ScalarRef::Json(s.as_str()))
+        }
+        // `JSONB` 列の既定値は DDL 時に正規化済みの文字列を保持する契約。借用で返すため
+        // 正規形との完全一致だけを受理し、非正規形・構文不正は `Malformed` で fail-closed
+        // にする（TooLong は `MAX_COLUMN_DEFAULT_LEN` が小さく到達しないが同じく拒否）。
+        (ColumnDefault::Text(s), ColumnType::Jsonb) => {
+            match crate::json::canonicalize_jsonb_text(s) {
+                Ok(canonical) if canonical == *s => Ok(ScalarRef::Json(s.as_str())),
+                _ => Err(DefaultBindError::Malformed),
             }
         }
         _ => Err(DefaultBindError::Incompatible),
@@ -5866,6 +5883,60 @@ mod tests {
             default_scalar(&ColumnType::Timestamp, &ColumnDefault::Number("1".into())),
             Err(DefaultBindError::Incompatible)
         );
+    }
+
+    /// `JSON`／`JSONB` 列の既定値（Issue #1337）。scan・decode の両方で補完され、
+    /// 不正値・非正規形の JSONB は fail-closed に拒否する。
+    #[test]
+    fn json_defaults_are_filled_and_invalid_ones_rejected() {
+        let raw = "{\"b\": 1,  \"a\": 2}";
+        let canon = "{\"a\":2,\"b\":1}";
+        let (buf, schema) = old_row_and_extended_schema(vec![
+            ColumnDef::new("j", ColumnType::Json, false)
+                .with_default(ColumnDefault::Text(raw.to_string())),
+            ColumnDef::new("jb", ColumnType::Jsonb, false)
+                .with_default(ColumnDefault::Text(canon.to_string())),
+        ]);
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], Some(ScalarRef::Json(raw)));
+        assert_eq!(scanned[2], Some(ScalarRef::Json(canon)));
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode");
+        assert_eq!(decoded[1], Value::Json(raw.to_string()));
+        assert_eq!(decoded[2], Value::Json(canon.to_string()));
+
+        for (ty, bad) in [
+            (ColumnType::Json, "abc"),
+            (ColumnType::Jsonb, "{\"a\":"),
+            (ColumnType::Jsonb, raw),
+        ] {
+            let (buf, schema) =
+                old_row_and_extended_schema(vec![ColumnDef::new("j", ty, true)
+                    .with_default(ColumnDefault::Text(bad.to_string()))]);
+            assert!(
+                matches!(
+                    scan_scalar_columns(&schema, &buf),
+                    Err(RowCodecError::Invalid(_))
+                ),
+                "{bad}"
+            );
+            assert!(
+                matches!(
+                    decode_scalar_columns(&schema, &buf),
+                    Err(RowCodecError::Invalid(_))
+                ),
+                "{bad}"
+            );
+        }
+        for ty in [ColumnType::Json, ColumnType::Jsonb] {
+            assert_eq!(
+                default_scalar(&ty, &ColumnDefault::Number("1".into())),
+                Err(DefaultBindError::Incompatible)
+            );
+            assert_eq!(
+                default_scalar(&ty, &ColumnDefault::Bool(true)),
+                Err(DefaultBindError::Incompatible)
+            );
+        }
     }
 
     #[test]

@@ -370,3 +370,31 @@ fn wire_enum_default_is_accepted_or_mapped_to_sqlstate() {
         read_ready_for_query(&mut stream);
     }
 }
+
+/// `JSON`／`JSONB` 列の `DEFAULT` は受理され、不正値・型不一致・BYTEA は engine の
+/// SQLSTATE 写像どおり届く（Issue #1337）。
+#[test]
+fn wire_json_default_is_accepted_or_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN jb JSONB NOT NULL DEFAULT '{\"a\":1}'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    for (sql, code) in [
+        ("ALTER TABLE docs ADD COLUMN j2 JSON DEFAULT 'abc'", "22P02"),
+        ("ALTER TABLE docs ADD COLUMN j3 JSON DEFAULT 1", "42601"),
+        (
+            "ALTER TABLE docs ADD COLUMN b BYTEA DEFAULT '\\x01'",
+            "0A000",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}

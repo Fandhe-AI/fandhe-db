@@ -932,6 +932,10 @@ fn default_type_check_errors() {
         ),
         ("e TEXT DEFAULT 1", "42601"),
         ("f BOOLEAN DEFAULT 'x'", "42601"),
+        ("j JSON DEFAULT 1", "42601"),
+        ("j2 JSON DEFAULT 'abc'", "22P02"),
+        ("j3 JSONB DEFAULT true", "42601"),
+        ("j4 JSONB DEFAULT '{\"a\":'", "22P02"),
     ] {
         let err = add_column(&core, decl).expect_err(decl);
         assert_eq!(err.wire_code(), code, "{decl}: {err:?}");
@@ -1523,4 +1527,132 @@ fn timestamp_volatile_default_is_rejected() {
         assert_eq!(err.wire_code(), "42601", "{decl}: {err:?}");
         assert!(!column_exists(&core, &ctx("owner"), TABLE, "ts"), "{decl}");
     }
+}
+
+// --- JSON／JSONB 列の DEFAULT（Issue #1337。ポインタ: TABLE-5・TABLE-14・TABLE-16） ---
+
+fn json_text(c: Cell) -> String {
+    match c {
+        Cell::Json(t) => t,
+        other => panic!("expected JSON cell, got {other:?}"),
+    }
+}
+
+/// `JSON`／`JSONB` の DEFAULT は既存行へ読み出し時に補われ、JSON は原文、JSONB は
+/// 正規形で返る。列省略 INSERT の新規行も同じ値になる。
+#[test]
+fn json_default_fills_existing_rows_across_read_paths() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "j JSON NOT NULL DEFAULT '{\"b\": 1, \"a\": [1, 2]}'").expect("JSON");
+    add_column(&core, "jb JSONB DEFAULT '{\"b\": 1, \"a\": 2}'").expect("JSONB");
+    add_column(&core, "jn JSON DEFAULT 'null'").expect("JSON null");
+
+    let q = |col: &str, id: u64| {
+        json_text(one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = {id} LIMIT 1"),
+        ))
+    };
+    assert_eq!(q("j", 1), "{\"b\": 1, \"a\": [1, 2]}");
+    assert_eq!(q("jb", 1), "{\"a\":2,\"b\":1}");
+    assert_eq!(q("jn", 1), "null");
+    assert_eq!(count_star(&core, &owner, TABLE), 1);
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting json columns");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, jb) VALUES (3, '[0.3,0.4]', '{{\"z\": 0}}') USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit jsonb");
+    assert_eq!(q("j", 2), q("j", 1));
+    assert_eq!(q("jb", 2), q("jb", 1));
+    assert_eq!(q("jn", 2), "null");
+    assert_eq!(q("jb", 3), "{\"z\":0}");
+}
+
+/// `JSON`／`JSONB` の DEFAULT は再オープン後も保たれる。
+#[test]
+fn json_default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "j JSON NOT NULL DEFAULT '[1, 2]'").expect("JSON");
+    add_column(&core, "jb JSONB NOT NULL DEFAULT '{\"b\": 1, \"a\": 2}'").expect("JSONB");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let q = |col: &str| {
+        json_text(one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        ))
+    };
+    assert_eq!(q("j"), "[1, 2]");
+    assert_eq!(q("jb"), "{\"a\":2,\"b\":1}");
+}
+
+/// `JSONB NOT NULL`（DEFAULT なし）は行・テナントの有無に依存せず同一の `42601`、
+/// DEFAULT 付きの成功も行の有無に依存しない（テナント境界 P0）。
+#[test]
+fn json_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "jb JSONB NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "jb JSONB NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "jb"));
+
+    add_column(&core, "jb JSONB NOT NULL DEFAULT '{\"a\": 1}'").expect("other tenant rows: ok");
+    assert_eq!(
+        json_text(one_cell(
+            &core,
+            &ctx("bob"),
+            &format!("SELECT jb FROM {TABLE} WHERE id = 1 LIMIT 1")
+        )),
+        "{\"a\":1}"
+    );
+}
+
+/// 長さ上限（1024 バイト）超の JSON／JSONB DEFAULT は `54000`、列は追加されない。
+#[test]
+fn json_default_over_length_limit_is_rejected_with_54000() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let long = format!("[\"{}\"]", "a".repeat(1100));
+    for (col, ty) in [("j", "JSON"), ("jb", "JSONB")] {
+        let err = add_column(&core, &format!("{col} {ty} DEFAULT '{long}'")).expect_err(col);
+        assert_eq!(err.wire_code(), "54000", "{col}");
+        assert!(!column_exists(&core, &ctx("owner"), TABLE, col));
+    }
+}
+
+/// BYTEA の DEFAULT は本 Issue の範囲外で `0A000` のまま（回帰固定）。
+#[test]
+fn bytea_default_remains_unsupported() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let err = add_column(&core, "b BYTEA DEFAULT '\\x01'").expect_err("bytea");
+    assert_eq!(err.wire_code(), "0A000");
+    assert!(!column_exists(&core, &ctx("owner"), TABLE, "b"));
 }

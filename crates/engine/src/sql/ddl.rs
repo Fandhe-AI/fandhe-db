@@ -855,7 +855,7 @@ fn resolve_column_type(
 
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
 /// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
-/// （BYTEA・JSON・配列等）は `0A000`、対応型でリテラル種別が
+/// （BYTEA・配列等）は `0A000`、対応型でリテラル種別が
 /// 合わない場合は `42601`、長さ上限超過は `54000`。
 fn add_column_default(
     column_name: &str,
@@ -874,6 +874,8 @@ fn add_column_default(
         ColumnType::Enum(_) => "enum",
         ColumnType::Uuid => "uuid",
         ColumnType::Timestamp => "timestamp",
+        ColumnType::Json => "json",
+        ColumnType::Jsonb => "jsonb",
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: format!("column {column_name:?}: DEFAULT is not supported for this type"),
@@ -894,12 +896,35 @@ fn add_column_default(
                 || kind == "date"
                 || kind == "timestamp"
                 || kind == "uuid"
-                || kind == "enum" =>
+                || kind == "enum"
+                || kind == "json" =>
         {
             if s.len() > MAX_COLUMN_DEFAULT_LEN {
                 return Err(default_too_long(column_name));
             }
             Ok(ColumnDefault::Text(s.clone()))
+        }
+        // `JSONB` は DDL 時に正規化した形で保持する（読み出し時補完が借用で返せるよう、
+        // 保持値＝格納形とする。Issue #1337）。エラー文言に値は含めない。
+        InsertLiteral::String(s) if kind == "jsonb" => {
+            if s.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            let canonical = match crate::json::canonicalize_jsonb_text(s) {
+                Ok(c) => c,
+                Err(crate::json::JsonColumnError::TooLong) => {
+                    return Err(default_too_long(column_name))
+                }
+                Err(crate::json::JsonColumnError::Invalid) => {
+                    return Err(SqlSurfaceError::invalid_text_representation(format!(
+                        "column {column_name:?} DEFAULT has an invalid input syntax for its type"
+                    )))
+                }
+            };
+            if canonical.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            Ok(ColumnDefault::Text(canonical))
         }
         InsertLiteral::Number(n) if kind == "numeric" => {
             if n.len() > MAX_COLUMN_DEFAULT_LEN {

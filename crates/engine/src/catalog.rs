@@ -2690,7 +2690,9 @@ impl ColumnDefault {
                     | ColumnType::Date
                     | ColumnType::Timestamp
                     | ColumnType::Uuid
-                    | ColumnType::Enum(_),
+                    | ColumnType::Enum(_)
+                    | ColumnType::Json
+                    | ColumnType::Jsonb,
             ) | (
                 ColumnDefault::Number(_),
                 ColumnType::Integer
@@ -8923,7 +8925,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
         (default, tag),
         (
             ColumnDefault::Text(_),
-            "text" | "date" | "timestamp" | "uuid" | "enum"
+            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb"
         ) | (
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
@@ -11032,6 +11034,26 @@ mod tests {
         assert!(column_default_compatible_with_tag(&text, "uuid"));
         assert!(!column_default_compatible_with_tag(&num, "uuid"));
         assert!(!column_default_compatible_with_tag(&flag, "uuid"));
+    }
+
+    /// `JSON`／`JSONB` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
+    /// （Issue #1337）。完全版と軽量版が一致し、`BYTEA`／配列は引き続き非対応。
+    #[test]
+    fn json_columns_accept_only_text_default_in_both_compat_checks() {
+        let text = ColumnDefault::Text("{\"a\":1}".to_string());
+        let num = ColumnDefault::Number("1".to_string());
+        let flag = ColumnDefault::Bool(true);
+        for (ty, tag) in [(ColumnType::Json, "json"), (ColumnType::Jsonb, "jsonb")] {
+            assert!(text.compatible_with(&ty));
+            assert!(!num.compatible_with(&ty));
+            assert!(!flag.compatible_with(&ty));
+            assert!(column_default_compatible_with_tag(&text, tag));
+            assert!(!column_default_compatible_with_tag(&num, tag));
+            assert!(!column_default_compatible_with_tag(&flag, tag));
+        }
+        assert!(!text.compatible_with(&ColumnType::Bytea));
+        assert!(!column_default_compatible_with_tag(&text, "bytea"));
+        assert!(!column_default_compatible_with_tag(&text, "array"));
     }
 
     /// `create_table` 経路でも、登録済み語彙にないラベルの ENUM DEFAULT は write txn 内の
