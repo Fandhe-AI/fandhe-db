@@ -673,7 +673,8 @@ fn empty_set_contract_matches_sql() {
 
 // -------------------------------------------------------- エラー契約
 
-/// 集計の拒否は SQL と同じ `wire_code`（`22000`。DATE/TIMESTAMP への SUM/AVG は `42883`）になる。
+/// 集計の拒否は SQL と同じ `wire_code` になる（非数値型への集計・DATE/TIMESTAMP への SUM/AVG は
+/// `42883`。Issue #1186・#1349）。
 #[test]
 fn unsupported_aggregate_shapes_are_rejected_like_sql() {
     let (core, _g) = new_core();
@@ -725,10 +726,9 @@ fn unsupported_aggregate_shapes_are_rejected_like_sql() {
             sql_code,
             "{agg} {extra}: {resp:?}"
         );
-        assert!(
-            ["22000", "42883"].contains(&sql_code.as_str()),
-            "{agg} {extra}: {sql_code}"
-        );
+        // HAVING 付きの最終ケースは集計型ではなく HAVING 比較の拒否（従来どおり 22000）。
+        let want = if extra.is_empty() { "42883" } else { "22000" };
+        assert_eq!(sql_code, want, "{agg} {extra}: {sql_code}");
     }
 }
 

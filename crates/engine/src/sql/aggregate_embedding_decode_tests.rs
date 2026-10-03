@@ -511,13 +511,9 @@ fn execute_sql_rejected_aggregate_type_combinations_fail_closed_without_decode()
         let sql = format!("SELECT {} FROM docs", sql_for(col, func));
         let (result, d) = run_layer_b(&core, &alice, &sql);
         let err = result.expect_err(&sql);
-        // DATE/TIMESTAMP の SUM/AVG は undefined_function（42883）、それ以外は 22000。
-        let want = if matches!(col, "dt" | "ts") {
-            "42883"
-        } else {
-            "22000"
-        };
-        assert_eq!(err.wire_code(), want, "{sql}");
+        // 拒否される型 × 関数の組み合わせはすべて undefined_function（42883。
+        // Issue #1186・#1349）。
+        assert_eq!(err.wire_code(), "42883", "{sql}");
         assert_eq!(d.embedding, 0, "{sql}: rejection must precede any decode");
     }
 }

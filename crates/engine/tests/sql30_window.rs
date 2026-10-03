@@ -762,13 +762,13 @@ fn rejects_sum_of_non_numeric_column_types() {
     seed_typed_keys(&storage, &ctx);
     let core = new_core(storage);
 
-    // `DATE`／`TIMESTAMP` への `SUM` は `42883`（Issue #1186）。それ以外の
-    // 非数値型は従来どおり `22000`。
+    // 非数値型への `SUM` はすべて `42883`（Issue #1186・#1349）。
+
     for (column, wire_code) in [
-        ("c_bool", "22000"),
+        ("c_bool", "42883"),
         ("c_date", "42883"),
         ("c_ts", "42883"),
-        ("c_uuid", "22000"),
+        ("c_uuid", "42883"),
     ] {
         expect_rejected(
             &core,
@@ -1268,7 +1268,7 @@ fn rejects_sum_of_text_column_type_mismatch() {
         &core,
         &ctx,
         "SELECT id, SUM(lang) OVER () FROM docs LIMIT 10",
-        "22000",
+        "42883",
     );
 }
 

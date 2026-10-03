@@ -136,7 +136,7 @@ GPU 経路は Array 列を一切読まない（masked 走査で不要列とし�
   エラーで fail-closed に拒否（対象外・申し送り）。要素・パス演算子
   （`tags[1]`・`@>`・`->`）は字句解析の時点で `42601`。
 - 集計: `COUNT(<Array 列>)`（非 NULL 行数）のみ受理
-  （`AggregateInput::ArrayColumn`）。`SUM`/`AVG`/`MIN`/`MAX` は `22000`。
+  （`AggregateInput::ArrayColumn`）。`SUM`/`AVG`/`MIN`/`MAX` は `42883`（Issue #1349）。
   `GROUP BY` キーは引き続き TEXT 限定。
 - `RETURNING`（`sql/returning.rs`）: `Value::Array` から `Cell::Array` へ
   予算つきで複製する（`try_clone_array_for_budget`）。

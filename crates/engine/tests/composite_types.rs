@@ -769,5 +769,5 @@ fn count_array_column_is_accepted_but_sum_is_rejected() {
     let err = core
         .execute_sql(&alice, &format!("SELECT SUM(tags) FROM {TABLE}"))
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }

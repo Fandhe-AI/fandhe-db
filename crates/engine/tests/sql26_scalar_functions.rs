@@ -306,7 +306,7 @@ fn type_mismatches_are_rejected_with_22000() {
     let err = core
         .execute_sql(&ctx, "SELECT substr(label) FROM docs LIMIT 1")
         .expect_err("substr with 1 argument should be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // --- CHECK 制約（Issue #919 の CHECK 経路への波及） ---------------------------
@@ -665,4 +665,46 @@ fn position_argument_parsing_does_not_leak_null_literal_permission() {
         )
         .expect_err("POSITION haystack must reject bare NULL the same way ordinary functions do");
     assert_eq!(position_haystack_err.wire_code(), baseline_err.wire_code());
+}
+
+/// Issue #1349（SQL-26・ERR-6）: 関数呼び出しの引数個数の不一致は `42883`
+/// （undefined_function）で拒否する。組み込み・宣言的 UDF の呼び出し時と、
+/// `CREATE FUNCTION` 本体の定義時の双方を固定する。
+#[test]
+fn wrong_arity_calls_are_rejected_with_42883() {
+    let path = unique_db_path("sql26-wrong-arity");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+
+    for call in [
+        "lower()",
+        "lower(label, label)",
+        "substr(label)",
+        "round(1, 2, 3)",
+        "round()",
+        "date_part('year')",
+        "concat()",
+    ] {
+        let err = core
+            .execute_sql(&ctx, &format!("SELECT {call} FROM docs LIMIT 1"))
+            .expect_err(call);
+        assert_eq!(err.wire_code(), "42883", "{call}");
+    }
+
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f1(x) AS x")
+        .expect("define f1");
+    for sql in [
+        "SELECT f1() FROM docs LIMIT 1",
+        "SELECT f1(1, 2) FROM docs LIMIT 1",
+        // 定義時（関数本体内の arity 不一致）。
+        "CREATE FUNCTION f2(x) AS f1(x, x)",
+        "CREATE FUNCTION f3(x) AS lower()",
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "42883", "{sql}");
+    }
 }

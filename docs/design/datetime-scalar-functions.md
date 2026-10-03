@@ -46,7 +46,7 @@ Accepted。数値スカラー関数群は先行 PR（#1107）で実装済み（
 | `TIMESTAMP ± n`・`TIMESTAMP - TIMESTAMP`・`DATE * / n` | — | `42804`（`INTERVAL` 型が無いため対象外。`bind_binary` の型不一致経路） |
 | 型付きリテラルの書式違反 / 範囲外 | — | `22007` / `22008`（Issue #1187。`datetime-column.md` と同じ写像） |
 | 引数の型不一致 | — | `42804`（Issue #1186） |
-| arity 違反 | — | `22000` |
+| arity 違反 | — | `42883`（Issue #1349） |
 | NULL 入力 | NULL | すべて strict（いずれかの引数が NULL なら NULL） |
 
 ## 意味論（PostgreSQL 互換）

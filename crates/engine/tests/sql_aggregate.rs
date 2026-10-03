@@ -607,7 +607,7 @@ fn sql13_vector_column_type_mismatch_and_count_acceptance() {
         let err = core
             .execute_sql(&ctx, &sql)
             .expect_err("aggregate over VECTOR column must be rejected");
-        assert_eq!(err.wire_code(), "22000", "{func}(embedding)");
+        assert_eq!(err.wire_code(), "42883", "{func}(embedding)");
     }
 
     let ok = core
@@ -744,5 +744,46 @@ fn sql13_rejection_is_deterministic_across_repeated_calls() {
         .execute_sql(&ctx, sql)
         .expect_err("second call should fail");
     assert_eq!(first.wire_code(), second.wire_code());
-    assert_eq!(first.wire_code(), "22000");
+    assert_eq!(first.wire_code(), "42883");
+}
+
+/// Issue #1349（SQL-26・ERR-6）: 非数値型への集計は `42883`（undefined_function）。
+/// 数値型・DATE/TIMESTAMP の既存挙動は変えない（正の対照）。拒否内容に他テナントの
+/// 情報を含めない（RLS の対照）。
+#[test]
+fn non_numeric_aggregates_are_rejected_with_42883() {
+    let path = unique_db_path("sql13-non-numeric-42883");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let _truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-a", true);
+
+    for sql in [
+        "SELECT SUM(lang) FROM docs",
+        "SELECT AVG(lang) FROM docs",
+        "SELECT SUM(embedding) FROM docs",
+        "SELECT MIN(embedding) FROM docs",
+        "SELECT SUM(lower(lang)) FROM docs",
+        "SELECT AVG(vec_div(embedding, 2)) FROM docs",
+        "SELECT MAX(vec_div(embedding, 2)) FROM docs",
+    ] {
+        let err = core.execute_sql(&ctx, sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "42883", "{sql}");
+        let msg = format!("{err:?}");
+        assert!(!msg.contains("tenant-b"), "{sql}: {msg}");
+    }
+
+    // 正の対照: TEXT の MIN/MAX・数値型・COUNT は受理のまま。
+    for sql in [
+        "SELECT MIN(lang) FROM docs",
+        "SELECT MAX(lang) FROM docs",
+        "SELECT COUNT(lang) FROM docs",
+        "SELECT COUNT(embedding) FROM docs",
+        "SELECT SUM(id) FROM docs",
+        "SELECT AVG(vec_norm(embedding)) FROM docs",
+    ] {
+        core.execute_sql(&ctx, sql)
+            .unwrap_or_else(|e| panic!("{sql} should succeed: {e:?}"));
+    }
 }

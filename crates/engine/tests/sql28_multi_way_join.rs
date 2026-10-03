@@ -865,8 +865,8 @@ fn aggregate_type_and_name_errors_use_the_single_table_classification() {
     let _g = CleanupGuard(path);
     let core = new_core(storage);
     let base = "FROM dept JOIN emp ON emp.dept_id = dept.id";
-    // TEXT 列への SUM は型不整合（単一テーブル経路と同じ 22000）。
-    assert_rejected(&core, &format!("SELECT SUM(emp.ename) {base}"), "22000");
+    // TEXT 列への SUM は型不整合（単一テーブル経路と同じ 42883。Issue #1349）。
+    assert_rejected(&core, &format!("SELECT SUM(emp.ename) {base}"), "42883");
     // HAVING の対象が数値として比較できない集計結果。
     assert_rejected(
         &core,
