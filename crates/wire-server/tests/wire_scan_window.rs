@@ -74,7 +74,7 @@ fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, common::User
     (connect_alice(addr), users_path)
 }
 
-/// 簡易クエリ経路で `ROW_NUMBER() OVER (...)` が `RowDescription`（text OID）・
+/// 簡易クエリ経路で `ROW_NUMBER() OVER (...)` が `RowDescription`（`row_number` は int8 OID 20。Issue #1344）・
 /// `DataRow`・`CommandComplete` として返る。
 #[test]
 fn row_number_over_wire_returns_expected_rows() {
@@ -85,8 +85,12 @@ fn row_number_over_wire_returns_expected_rows() {
         &mut stream,
         "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score) FROM docs LIMIT 10",
     );
-    let columns = read_row_description(&mut stream);
-    assert_eq!(columns, vec!["id", "row_number"]);
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(
+        columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["id", "row_number"]
+    );
+    assert_eq!(columns.get(1).map(|(_, oid)| *oid), Some(20));
 
     let mut rows: Vec<(String, String)> = Vec::new();
     for _ in 0..3 {

@@ -375,3 +375,90 @@ fn other_tenant_aggregate_has_same_oids_but_sees_no_rows() {
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
 }
+
+/// ウィンドウ関数の結果列（Issue #1344・WIRE-13・SQL-30）の `RowDescription` OID を
+/// 入力型に応じて固定するための SQL。列の別名と `expected_window_oids` が 1 対 1 対応する。
+const WINDOW_SQL: &str = "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, \
+     RANK() OVER (ORDER BY id) AS rk, DENSE_RANK() OVER (ORDER BY id) AS drk, \
+     COUNT(*) OVER () AS c_all, SUM(n) OVER () AS s_n, SUM(b) OVER () AS s_b, \
+     AVG(n) OVER () AS a_n, MIN(n) OVER () AS m_n, MAX(b) OVER () AS x_b, \
+     SUM(r) OVER () AS s_r, MIN(r) OVER () AS m_r, AVG(r) OVER () AS a_r, \
+     SUM(d) OVER () AS s_d, SUM(price) OVER () AS s_p, AVG(price) OVER () AS a_p, \
+     MIN(day) OVER () AS m_day, MAX(ts) OVER () AS x_ts, SUM(id) OVER () AS s_id, \
+     AVG(id) OVER () AS a_id FROM typed_probe LIMIT 10";
+
+fn expected_window_oids() -> Vec<(&'static str, i32)> {
+    vec![
+        ("rn", 20),
+        ("rk", 20),
+        ("drk", 20),
+        ("c_all", 20),
+        ("s_n", 20),
+        ("s_b", 20),
+        ("a_n", 701),
+        ("m_n", 23),
+        ("x_b", 20),
+        ("s_r", 700),
+        ("m_r", 700),
+        ("a_r", 701),
+        ("s_d", 701),
+        ("s_p", 1700),
+        ("a_p", 1700),
+        ("m_day", 1082),
+        ("x_ts", 1114),
+        ("s_id", 1700),
+        ("a_id", 701),
+    ]
+}
+
+#[test]
+fn window_columns_announce_typed_oids_and_encode_values() {
+    let (core, _guard) = new_core_typed_probe();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, WINDOW_SQL);
+    let columns = read_row_description_with_oids(&mut stream);
+    let expected = expected_window_oids();
+    assert_eq!(columns.len(), expected.len());
+    for ((name, oid), (expected_name, expected_oid)) in columns.iter().zip(expected.iter()) {
+        assert_eq!(name, expected_name);
+        assert_eq!(oid, expected_oid, "oid mismatch for column={name}");
+    }
+    // 値のエンコード（float4 公告列が fail-closed に落ちないこと）も検証する。
+    let row = read_data_row(&mut stream);
+    let cell = |i: usize| row.get(i).cloned().flatten();
+    assert_eq!(cell(0).as_deref(), Some("1"));
+    assert_eq!(cell(3).as_deref(), Some("1"));
+    assert_eq!(cell(4).as_deref(), Some("42"));
+    assert_eq!(cell(9).as_deref(), Some("1.5"));
+    assert_eq!(cell(10).as_deref(), Some("1.5"));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+}
+
+/// テナント境界の非退行（Issue #1344）: 他テナントでも型公告は同一のまま、
+/// 自テナントの `Private` 行は母集合に現れず 0 行になる。
+#[test]
+fn other_tenant_window_has_same_oids_but_sees_no_rows() {
+    let (core, _guard) = new_core_typed_probe();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    send_simple_query(&mut stream, WINDOW_SQL);
+    let columns = read_row_description_with_oids(&mut stream);
+    let expected = expected_window_oids();
+    assert_eq!(columns.len(), expected.len());
+    for ((name, oid), (expected_name, expected_oid)) in columns.iter().zip(expected.iter()) {
+        assert_eq!(name, expected_name);
+        assert_eq!(oid, expected_oid, "oid mismatch for column={name}");
+    }
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 0", "other tenant must not see the Private row");
+    read_ready_for_query(&mut stream);
+}

@@ -94,10 +94,10 @@ pub(crate) fn scan_columns(
     }
     for item in bound.windows() {
         if let Some(slot) = out.get_mut(item.position) {
-            // ウィンドウ関数の結果型は本 Issue（#1173）の対象外（静的型なし＝text）。
+            // 実行経路と同じ写像を共有する（Issue #1344）。
             *slot = Some(ColumnMeta::Computed {
                 name: item.name.clone(),
-                ty: None,
+                ty: crate::sql::window::window_result_type(item),
             });
         }
     }

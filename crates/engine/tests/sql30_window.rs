@@ -252,7 +252,13 @@ fn window_item_only_select_has_no_plain_columns() {
         "SELECT ROW_NUMBER() OVER (ORDER BY score) FROM docs LIMIT 10",
     ));
     assert_eq!(result.columns.len(), 1);
-    assert!(matches!(result.columns[0], ColumnMeta::Computed { .. }));
+    assert!(matches!(
+        result.columns[0],
+        ColumnMeta::Computed {
+            ty: Some(ColumnType::BigInt),
+            ..
+        }
+    ));
     assert_eq!(result.rows.len(), 6);
 }
 
@@ -277,7 +283,10 @@ fn window_alias_and_position_are_preserved_among_plain_columns() {
             ..
         }
     ));
-    assert!(matches!(result.columns[1], ColumnMeta::Computed { ref name, .. } if name == "rn"));
+    assert!(matches!(
+        result.columns[1],
+        ColumnMeta::Computed { ref name, ty: Some(ColumnType::BigInt) } if name == "rn"
+    ));
     assert!(matches!(
         result.columns[2],
         ColumnMeta::Scalar {
