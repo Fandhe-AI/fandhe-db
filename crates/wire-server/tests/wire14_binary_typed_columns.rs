@@ -179,7 +179,9 @@ fn decode_binary(col: usize, bytes: &[u8]) -> String {
         2 => engine::scalar_float::format_real(f32::from_bits(u32::from_be_bytes(
             bytes.try_into().unwrap(),
         ))),
-        3 => f64::from_bits(u64::from_be_bytes(bytes.try_into().unwrap())).to_string(),
+        3 => engine::scalar_float::format_double(f64::from_bits(u64::from_be_bytes(
+            bytes.try_into().unwrap(),
+        ))),
         4 => {
             assert_eq!(bytes.len(), 1);
             if bytes[0] == 1 { "t" } else { "f" }.to_string()

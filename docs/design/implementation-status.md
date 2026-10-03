@@ -435,3 +435,12 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **変更箇所**: `engine` の `sql::params`（`ParamLiteralKind`・型付き置換・型付きダミーフラグ・`PreparedParamType::binds_as_text_literal`）、`core.rs` の `parse_sql_prepared`（2 段 parse）・`bind_prepared`、`wire-server` の `build_param_slots`（数値・真偽値スロットのバイナリを `0A000` へ）、`docs/design/wire-extended-query-param-binding.md`。
 - **網羅ガード**: 層 A（`crates/engine/tests/prepared_params.rs`）にリテラル同値・Describe 同値・`22P02`・RLS・ENUM ダミーフラグ序数ずれの回帰、`crates/wire-server/tests/wire12_param_binding.rs` に OID 公告・実行・テナント境界・`22P02`・バイナリ `0A000` を追加。
 - **対象外（申し送り）**: `WHERE <整数列> = -N` の `42601`（リテラル形でも同じ既存制約）、`REAL`／`DOUBLE`／`NUMERIC`／日時／`UUID`／`BYTEA` の型付き束縛、数値・真偽値のバイナリ復号（WIRE-14）、非 text スロットの宣言 OID 0 バイナリ UTF-8 恒等受理、NULL パラメータ。
+
+### Issue #1343: DOUBLE PRECISION のテキスト表現を PostgreSQL の既定出力へ（WIRE-13 ポインタ）
+
+`DOUBLE PRECISION`（float8）列および float8 を公告する式・集計列のテキスト出力を、Rust の `Display` から PostgreSQL の float8 出力形式（最短往復桁・十進指数 `-4 <= e < 15` は固定小数、それ以外は `1e+20`／`1e-05` 形式）へ揃えた。`REAL`（#1218）と共通の整形ヘルパーを共有する。
+
+- **変更箇所**: `engine` の `scalar_float::format_double`（共通ヘルパー `format_shortest_sci` を `format_real` と共有）、`wire-server` の `result_encoder::cell_to_text`（`Cell::Float` の基底腕）。`COPY TO`・配列出力も同じ経路で PG 形式になる。`parse_double` は元から指数表記を受理するため `COPY FROM`・配列リテラルの再投入は無変更で往復する。
+- **挙動変更**: `text` 公告だが `Cell::Float` を運ぶ列（ウィンドウ関数結果など）も PG 形式の数値文字列になる。
+- **テスト**: `scalar_float` の境界値表・f64 ビットパターン往復掃引、`wire_float_columns` の float8 出力テスト、`wire14_binary_typed_columns` のオラクル更新。
+- **対象外（申し送り）**: HTTP（NoSQL）応答の JSON number 表記、`VECTOR` 要素の表記、`extra_float_digits` による精度切り替え、格納時の `-0.0` 正規化、EXPLAIN 内の数値表記、3 クライアント（psql・psycopg・node pg）e2e の追加（opt-in。未実行）。
