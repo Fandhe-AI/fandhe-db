@@ -10,10 +10,11 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
-use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, MAX_COLUMN_DEFAULT_LEN};
+use crate::catalog::{ColumnDef, ColumnType};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
+use crate::sql::ddl_column_type::{SqlColumnTypeName, StaticColumnType};
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
@@ -57,7 +58,23 @@ const MAX_CREATE_TABLE_COLUMNS: usize = 256;
 /// が照合する語と一致させる契約。型を追加する際はここも同時に拡張する）。
 /// `CHECK` 制約名がこれらと一致する場合は拒否する（TABLE-16・TASK-204、
 /// Issue #906。[`Parser::peek_check_clause_start`] の「曖昧さの排除」参照）。
-const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &["TEXT", "VECTOR", "INTEGER", "BIGINT"];
+const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
+    "TEXT",
+    "VECTOR",
+    "INTEGER",
+    "BIGINT",
+    "REAL",
+    "DOUBLE",
+    "BOOLEAN",
+    "DATE",
+    "TIMESTAMP",
+    "BYTEA",
+    "JSON",
+    "JSONB",
+    "UUID",
+    "NUMERIC",
+    "DECIMAL",
+];
 
 /// `PRIMARY KEY (<col>[, <col>]*)` に宣言できる列数の上限（TABLE-16・
 /// TASK-204、Issue #903）。`catalog::validate_schema` が同じ上限
@@ -2364,6 +2381,9 @@ struct ParsedCreateTableColumn {
     /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)] [MATCH ...] [ON ...]
     /// [<遅延属性>]`（TABLE-17・TASK-205、Issue #907／#1076／#1077）の解析結果。
     references: Option<ParsedReferences>,
+    /// 要素が ENUM 型名候補の配列列の型名（[`ValidatedCreateTable::pending_array_enum_types`]
+    /// へ集約する。Issue #1348）。
+    pending_array_enum: Option<String>,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -2637,7 +2657,8 @@ pub enum DeleteStatement {
 /// `id` 参照の参照元列に使う列型 `INTEGER`／`BIGINT` も受理する
 /// （`docs/design/foreign-key.md` 参照）。`REFERENCES` を上記以外の文
 /// （`ALTER TABLE ... ADD COLUMN` 等）に付与する形は許可リスト外のまま。
-/// TABLE-13/14 のその他の追加型は別 Issue の管轄。
+/// 列型は `ALTER TABLE ADD COLUMN` と共有する型名パーサーで読み、全スカラー型・
+/// 配列型（`<型>[N]`）・ENUM 型名を受理する（Issue #1348。ENUM の存在確認は実行段）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedCreateTable {
     /// カタログ存在確認前のテーブル名（識別子形式のみ検証済み）。
@@ -2669,6 +2690,11 @@ pub struct ValidatedCreateTable {
     /// 制約との照合とともに `catalog::Storage::create_table` の write トランザクション
     /// 内で解決される。
     pub foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
+    /// 要素が ENUM 型名候補の配列列（`<enum>[N]`）が参照する型名（Issue #1348）。
+    /// 構文段はカタログを参照できないため名前だけを運び、`sql::ddl::execute_create_table`
+    /// が DDL 権限ゲートの後で存在確認する（未登録は `42601`、登録済みでも配列要素に
+    /// ENUM は取れないため `0A000`）。対応する列は構文段では `Array(Text)` の仮置き。
+    pub pending_array_enum_types: Vec<String>,
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
@@ -6305,6 +6331,8 @@ impl<'a> Parser<'a> {
         // 参照元列の解決は `finalize_foreign_keys`、参照先の解決・照合は
         // `catalog::Storage::create_table` が行う。
         let mut foreign_keys: Vec<crate::catalog::ForeignKeyDef> = Vec::new();
+        // 要素が ENUM 型名候補の配列列（Issue #1348）。列数上限（256）以内にしか増えない。
+        let mut pending_array_enum_types: Vec<String> = Vec::new();
         loop {
             // 表制約 `PRIMARY KEY (<col>[, <col>]*)` は要素先頭が文脈的識別子
             // `PRIMARY` かつ次のトークンが `KEY` の場合にのみ判定する
@@ -6432,6 +6460,9 @@ impl<'a> Parser<'a> {
                         .with_options(refs.match_type, refs.deferrability),
                     );
                 }
+                if let Some(n) = parsed.pending_array_enum {
+                    pending_array_enum_types.push(n);
+                }
                 columns.push(parsed.column);
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -6463,6 +6494,7 @@ impl<'a> Parser<'a> {
             unique_constraints,
             checks,
             foreign_keys,
+            pending_array_enum_types,
         })
     }
 
@@ -6591,41 +6623,45 @@ impl<'a> Parser<'a> {
             return Err(SqlSurfaceError::duplicate_column(name));
         }
 
-        let mut unique = false;
-        let column = if self.peek_ident_matches("TEXT") {
-            self.advance();
-            let constraints = self.parse_column_constraints()?;
-            unique = constraints.unique;
-            let default = match constraints.default {
-                None => None,
-                Some(InsertLiteral::String(s)) => {
-                    if s.len() > MAX_COLUMN_DEFAULT_LEN {
-                        return Err(SqlSurfaceError::payload_too_large(format!(
-                            "column {name:?} DEFAULT literal exceeds length limit"
-                        )));
-                    }
-                    Some(ColumnDefault::Text(s))
-                }
-                Some(_) => {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "column {name:?} DEFAULT expects a text literal"
-                    )))
-                }
-            };
-            let mut column = ColumnDef::new(name, ColumnType::Text, !constraints.not_null);
-            if let Some(default) = default {
-                column = column.with_default(default);
+        // 型名は `ALTER TABLE ADD COLUMN` と共有する型名パーサー
+        // （`sql::ddl_column_type`。配列サフィックス `[]`／`[N]` を含む。Issue #1348）で
+        // 読む。ENUM 型名の存在確認は DDL 権限ゲートの後の実行段が行う（構文段は
+        // カタログを参照しない）ため、ENUM 候補は未解決マーカーのまま運ぶ。
+        let type_name =
+            crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+        let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
+        let mut pending_array_enum = None;
+        let ty = match static_ty {
+            StaticColumnType::Resolved(t) => t,
+            StaticColumnType::EnumCandidate(enum_name) => {
+                ColumnType::Enum(crate::catalog::EnumTypeDef::unresolved(enum_name))
             }
-            column
-        } else if self.peek_ident_matches("VECTOR") {
-            self.advance();
-            self.expect_punct('(')?;
-            let raw_dim = self.expect_number()?;
-            let dim: u32 = raw_dim.parse().map_err(|_| {
-                SqlSurfaceError::unsupported(format!("invalid VECTOR dimension: {raw_dim:?}"))
-            })?;
-            self.expect_punct(')')?;
-            let constraints = self.parse_column_constraints()?;
+            StaticColumnType::ArrayOfEnumCandidate(enum_name) => {
+                // 仮置き（実行段が `pending_array_enum_types` を必ず拒否する）。
+                pending_array_enum = Some(enum_name);
+                match crate::catalog::ArrayType::new(
+                    crate::catalog::ArrayElemType::Text,
+                    match &type_name {
+                        SqlColumnTypeName::Array { max_len, .. } => {
+                            max_len.unwrap_or(crate::catalog::MAX_ARRAY_ELEMENTS)
+                        }
+                        _ => crate::catalog::MAX_ARRAY_ELEMENTS,
+                    },
+                ) {
+                    Ok(a) => ColumnType::Array(a),
+                    Err(e) => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "invalid array type: {e}"
+                        )))
+                    }
+                }
+            }
+        };
+        let constraints = self.parse_column_constraints()?;
+        let unique = constraints.unique;
+        let column = if let ColumnType::Vector(_) = ty {
+            // `VECTOR` は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
+            // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
             if constraints.default.is_some() {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "column {name:?}: VECTOR columns do not support DEFAULT"
@@ -6636,47 +6672,21 @@ impl<'a> Parser<'a> {
                     "column {name:?}: VECTOR columns do not support UNIQUE"
                 )));
             }
-            // VECTOR は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
-            // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
-            ColumnDef::new(name, ColumnType::Vector(dim), false)
-        } else if self.peek_ident_matches("INTEGER") || self.peek_ident_matches("BIGINT") {
-            // `INTEGER`／`BIGINT`（TABLE-17・TASK-205、Issue #907。`id` を参照する
-            // `FOREIGN KEY` の参照元列に使う整数型）。列制約は `TEXT` と同じく
-            // `NOT NULL`／`DEFAULT <数値リテラル>`／`UNIQUE` を受理する（数値の範囲・
-            // 形式は `sql::parser::bind_literal_for_column` が束縛時に検証する）。
-            let ty = if self.peek_ident_matches("INTEGER") {
-                ColumnType::Integer
-            } else {
-                ColumnType::BigInt
-            };
-            self.advance();
-            let constraints = self.parse_column_constraints()?;
-            unique = constraints.unique;
-            let default = match constraints.default {
+            ColumnDef::new(name, ty, false)
+        } else {
+            // DEFAULT の型別変換は `ADD COLUMN` と共有する純関数
+            // （`sql::ddl::add_column_default`）に一本化する。配列・BYTEA は `0A000`、
+            // リテラル種別の不一致は `42601`、長さ超過は `54000`。ENUM の語彙照合は
+            // 実行段（`bind_column_default`）と `Storage::create_table` が行う。
+            let default = match &constraints.default {
                 None => None,
-                Some(InsertLiteral::Number(n)) => {
-                    if n.len() > MAX_COLUMN_DEFAULT_LEN {
-                        return Err(SqlSurfaceError::payload_too_large(format!(
-                            "column {name:?} DEFAULT literal exceeds length limit"
-                        )));
-                    }
-                    Some(ColumnDefault::Number(n))
-                }
-                Some(_) => {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "column {name:?} DEFAULT expects a numeric literal"
-                    )))
-                }
+                Some(literal) => Some(crate::sql::ddl::add_column_default(&name, &ty, literal)?),
             };
             let mut column = ColumnDef::new(name, ty, !constraints.not_null);
             if let Some(default) = default {
                 column = column.with_default(default);
             }
             column
-        } else {
-            return Err(SqlSurfaceError::unsupported(
-                "expected column type TEXT, VECTOR(<dim>), INTEGER or BIGINT",
-            ));
         };
 
         // 列制約 `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`CONSTRAINT
@@ -6727,6 +6737,7 @@ impl<'a> Parser<'a> {
             unique,
             checks,
             references,
+            pending_array_enum,
         })
     }
 
