@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::error_format::ClassifiedError;
 use engine::json::{parse_json, JsonValue};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -1134,4 +1135,265 @@ fn permission_denial_message_does_not_echo_untrusted_table_name() {
     let resp = query(&session, body.as_bytes());
     assert_eq!(http_common::wire_code_of(&resp), "42501");
     http_common::assert_message_does_not_echo(&resp, marker);
+}
+// --- alter_table.add_column の NOT NULL／DEFAULT（Issue #1338） ------------
+
+fn core_with_parity_tables() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("nosql13-ddl-add-column-parity");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    for name in ["docs_sql", "docs_nosql"] {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+    }
+    storage
+        .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+        .expect("create_enum_type");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// SQL の `ALTER TABLE ... ADD COLUMN <decl>` と NoSQL の `add_column` JSON が
+/// 同一の成否・`wire_code`・HTTP ステータスになることを固定する（TABLE-16・
+/// NOSQL-13・ERR-4。制御文字を含む DEFAULT は意図した差分のため含めない）。
+#[test]
+fn sql_and_nosql_add_column_not_null_default_produce_identical_results() {
+    let (core, _guard) = core_with_parity_tables();
+    let ctx = PolicyContext::with_visibilities(
+        TENANT_A,
+        [
+            engine::storage::Visibility::Public,
+            engine::storage::Visibility::Private,
+        ],
+    )
+    .expect("valid tenant ctx");
+    let mut sql_session = engine::sql::mode::SessionState::default();
+    sql_session.allow_ddl();
+    let nosql_session = ddl_session(Arc::clone(&core));
+
+    let long = "x".repeat(70_000);
+    let cases: Vec<(String, String)> = vec![
+        (
+            "a TEXT DEFAULT 'hi'".into(),
+            r#"{"name":"a","type":"text","default":"hi"}"#.into(),
+        ),
+        (
+            "b INTEGER NOT NULL DEFAULT 7".into(),
+            r#"{"name":"b","type":"integer","not_null":true,"default":7}"#.into(),
+        ),
+        (
+            "c BIGINT DEFAULT -5".into(),
+            r#"{"name":"c","type":"bigint","default":-5}"#.into(),
+        ),
+        (
+            "d REAL DEFAULT 1.5".into(),
+            r#"{"name":"d","type":"real","default":1.5}"#.into(),
+        ),
+        (
+            "e BOOLEAN NOT NULL DEFAULT true".into(),
+            r#"{"name":"e","type":"boolean","not_null":true,"default":true}"#.into(),
+        ),
+        (
+            "f DATE DEFAULT '2020-01-02'".into(),
+            r#"{"name":"f","type":"date","default":"2020-01-02"}"#.into(),
+        ),
+        (
+            "g TIMESTAMP DEFAULT '2020-01-01 00:00:00'".into(),
+            r#"{"name":"g","type":"timestamp","default":"2020-01-01 00:00:00"}"#.into(),
+        ),
+        (
+            "h UUID DEFAULT '00000000-0000-0000-0000-000000000001'".into(),
+            r#"{"name":"h","type":"uuid","default":"00000000-0000-0000-0000-000000000001"}"#.into(),
+        ),
+        (
+            "i mood NOT NULL DEFAULT 'happy'".into(),
+            r#"{"name":"i","type":"enum","enum_type":"mood","not_null":true,"default":"happy"}"#
+                .into(),
+        ),
+        (
+            "j INTEGER DEFAULT 99999999999".into(),
+            r#"{"name":"j","type":"integer","default":99999999999}"#.into(),
+        ),
+        (
+            "k DATE DEFAULT 1".into(),
+            r#"{"name":"k","type":"date","default":1}"#.into(),
+        ),
+        (
+            "l DATE DEFAULT 'abc'".into(),
+            r#"{"name":"l","type":"date","default":"abc"}"#.into(),
+        ),
+        (
+            "m UUID DEFAULT 'abc'".into(),
+            r#"{"name":"m","type":"uuid","default":"abc"}"#.into(),
+        ),
+        (
+            "n mood DEFAULT 'angry'".into(),
+            r#"{"name":"n","type":"enum","enum_type":"mood","default":"angry"}"#.into(),
+        ),
+        (
+            "o TEXT DEFAULT 1".into(),
+            r#"{"name":"o","type":"text","default":1}"#.into(),
+        ),
+        (
+            "p BOOLEAN DEFAULT 'x'".into(),
+            r#"{"name":"p","type":"boolean","default":"x"}"#.into(),
+        ),
+        (
+            "q INTEGER NOT NULL".into(),
+            r#"{"name":"q","type":"integer","not_null":true}"#.into(),
+        ),
+        (
+            "r BYTEA DEFAULT 'ab'".into(),
+            r#"{"name":"r","type":"bytea","default":"ab"}"#.into(),
+        ),
+        (
+            format!("s TEXT DEFAULT '{long}'"),
+            format!(r#"{{"name":"s","type":"text","default":"{long}"}}"#),
+        ),
+        (
+            "embedding TEXT NOT NULL DEFAULT 'x'".into(),
+            r#"{"name":"embedding","type":"text","not_null":true,"default":"x"}"#.into(),
+        ),
+    ];
+
+    for (decl, json) in &cases {
+        let sql = core.execute_sql_in_session(
+            &ctx,
+            &mut sql_session,
+            &format!("ALTER TABLE docs_sql ADD COLUMN {decl}"),
+        );
+        let body = format!(r#"{{"op":"alter_table","table":"docs_nosql","add_column":{json}}}"#);
+        let resp = query(&nosql_session, body.as_bytes());
+        let label: String = decl.chars().take(60).collect();
+        match sql {
+            Ok(_) => assert_eq!(resp.status, 200, "parity (ok) for {label}"),
+            Err(err) => {
+                assert_eq!(
+                    http_common::wire_code_of(&resp),
+                    err.wire_code(),
+                    "parity (wire_code) for {label}"
+                );
+                assert_eq!(
+                    resp.status,
+                    wire_server::http::status::http_status(err.error_class()),
+                    "parity (http status) for {label}"
+                );
+            }
+        }
+    }
+
+    // 存在しないテーブル（NOT NULL＋DEFAULT 付き）も SQL と同じ 42P01。
+    let resp = query(
+        &nosql_session,
+        br#"{"op":"alter_table","table":"nope","add_column":{"name":"z","type":"integer","not_null":true,"default":1}}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&resp), "42P01", "got: {resp:?}");
+}
+
+/// NoSQL 固有の形状エラー（`default` の null／配列／オブジェクト、`not_null` の
+/// 型違い、`nullable` 等の未知キー、制御文字入り DEFAULT）は `42601`。
+#[test]
+fn alter_table_add_column_malformed_not_null_default_is_42601() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = ddl_session(core);
+    for add in [
+        r#"{"name":"a","type":"text","default":null}"#,
+        r#"{"name":"a","type":"text","default":[1]}"#,
+        r#"{"name":"a","type":"text","default":{"k":1}}"#,
+        r#"{"name":"a","type":"text","not_null":"x"}"#,
+        r#"{"name":"a","type":"text","not_null":null}"#,
+        r#"{"name":"a","type":"text","nullable":true}"#,
+        r#"{"name":"a","type":"text","default":"a\nb"}"#,
+    ] {
+        let body = format!(r#"{{"op":"alter_table","table":"docs","add_column":{add}}}"#);
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "for {add}: {resp:?}"
+        );
+        assert_eq!(resp.status, 400, "for {add}: {resp:?}");
+    }
+}
+
+/// DDL 権限の無いセッションは `not_null`／`default` やテーブルの有無に関わらず
+/// `42501`（権限ゲートは engine の単一実装・カタログ照会より前）。
+#[test]
+fn alter_table_add_column_not_null_default_without_ddl_permission_is_42501() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = non_ddl_session(core);
+    let existing = query(
+        &session,
+        br#"{"op":"alter_table","table":"docs","add_column":{"name":"n","type":"integer","not_null":true,"default":1}}"#,
+    );
+    let missing = query(
+        &session,
+        br#"{"op":"alter_table","table":"nope","add_column":{"name":"n","type":"integer","not_null":true,"default":1}}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&existing), "42501");
+    assert_eq!(existing.body, missing.body);
+}
+
+/// DEFAULT のない NOT NULL は行の有無に依存しない構造判定で `42601`
+/// （他テナントの行の存在オラクルにならない。テナント境界 P0）。
+#[test]
+fn alter_table_add_column_not_null_without_default_is_42601_regardless_of_rows() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = ddl_session(core);
+    let body = br#"{"op":"alter_table","table":"docs","add_column":{"name":"n","type":"integer","not_null":true}}"#;
+    let empty = query(&session, body);
+    assert_eq!(http_common::wire_code_of(&empty), "42601", "got: {empty:?}");
+    let ins = query(
+        &session,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2]}],"operation_id":"op-1338-a"}"#,
+    );
+    assert_eq!(ins.status, 200, "got: {ins:?}");
+    let with_rows = query(&session, body);
+    assert_eq!(with_rows.body, empty.body);
+}
+
+/// 追加後の観測: 既存行に DEFAULT が見え、NOT NULL 列への明示 null は 23502、
+/// 列省略の insert には DEFAULT が適用される。
+#[test]
+fn alter_table_add_column_not_null_default_applies_to_rows_and_enforces_not_null() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = ddl_session(core);
+    let ins = query(
+        &session,
+        br#"{"op":"insert","table":"docs","rows":[{"id":1,"embedding":[0.1,0.2]}],"operation_id":"op-1338-b"}"#,
+    );
+    assert_eq!(ins.status, 200, "got: {ins:?}");
+    let alter = query(
+        &session,
+        br#"{"op":"alter_table","table":"docs","add_column":{"name":"n","type":"integer","not_null":true,"default":7}}"#,
+    );
+    assert_eq!(alter.status, 200, "got: {alter:?}");
+
+    let scan = query(&session, br#"{"op":"scan","table":"docs","limit":10}"#);
+    assert_eq!(scan.status, 200, "got: {scan:?}");
+    let text = String::from_utf8_lossy(&scan.body).into_owned();
+    assert!(
+        text.contains(r#"[1,[0.1,0.2],7]"#),
+        "existing row must show DEFAULT: {text}"
+    );
+
+    let null_ins = query(
+        &session,
+        br#"{"op":"insert","table":"docs","rows":[{"id":2,"embedding":[0.3,0.4],"n":null}],"operation_id":"op-1338-c"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&null_ins),
+        "23502",
+        "got: {null_ins:?}"
+    );
+
+    let omit_ins = query(
+        &session,
+        br#"{"op":"insert","table":"docs","rows":[{"id":3,"embedding":[0.5,0.6]}],"operation_id":"op-1338-d"}"#,
+    );
+    assert_eq!(omit_ins.status, 200, "got: {omit_ins:?}");
 }

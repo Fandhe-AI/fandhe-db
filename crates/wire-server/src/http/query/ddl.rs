@@ -62,6 +62,15 @@
 //! - `kind` と矛盾するフィールド（check への `columns`／`references`、他 kind への
 //!   `name`）は黙って無視せず `42601` で拒否する（fail-closed）。
 //!
+//! ## `alter_table.add_column` の NOT NULL／DEFAULT（Issue #1338・TABLE-16）
+//! - `not_null`（bool）・`default`（文字列・数値・真偽値）を SQL の列制約と同じ順序
+//!   （`NOT NULL` → `DEFAULT <lit>`）のトークン列へ写し、SQL 表層と同じ engine 経路へ
+//!   渡す。vector 列・DEFAULT なし NOT NULL・型不一致等の意味検証は engine に一本化し、
+//!   wire 側では先回り判定しない（SQLSTATE パリティを自動的に保つため）。
+//! - 真偽値は固定語彙の `true`／`false` 識別子へ写す（[`add_column_default_tokens`]）。
+//! - 制御文字を含む文字列 DEFAULT は create_table と同じく `42601` で拒否する
+//!   （SQL では受理される。意図した差分）。
+//!
 //! ## untrusted 入力の取り扱い
 //! - 識別子（テーブル名・列名・制約参照列・参照先テーブル・ENUM 型名）は
 //!   [`super::ident::check_identifier`]（長さ・文字種の事前フィルタ）を通した
@@ -227,6 +236,18 @@ fn default_literal_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
         JsonValue::Bool(_) | JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => {
             Err(DdlError::InvalidRequest)
         }
+    }
+}
+
+/// `alter_table.add_column.default` 用のリテラル写像（Issue #1338・TABLE-16）。
+/// `execute_alter_table` から呼ばれる。真偽値は SQL の `expect_literal` が受理する
+/// `true`／`false` 識別子（固定語彙）へ写し、それ以外は create_table と共用の
+/// [`default_literal_tokens`] へ委譲する（共用関数の挙動は変えない）。
+fn add_column_default_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
+    match value {
+        JsonValue::Bool(true) => Ok(vec![Token::Ident("true".to_string())]),
+        JsonValue::Bool(false) => Ok(vec![Token::Ident("false".to_string())]),
+        other => default_literal_tokens(other),
     }
 }
 
@@ -745,6 +766,39 @@ fn is_reserved_type_keyword(raw: &str) -> bool {
     RESERVED.iter().any(|kw| raw.eq_ignore_ascii_case(kw))
 }
 
+/// `alter_table.add_column` を SQL の `ALTER TABLE ... ADD COLUMN` と同一の
+/// トークン列へ組み立てる（Issue #1338）。`NOT NULL` → `DEFAULT <lit>` の順で積み、
+/// 意味検証（vector 列・DEFAULT なし NOT NULL・型不一致等）は engine に任せる。
+fn build_add_column_tokens(
+    table_token: Token,
+    add_v: &Validated<'_>,
+) -> Result<Vec<Token>, DdlError> {
+    let column_name = add_v.required_str("name").map_err(DdlError::from)?;
+    let column_name_token = ident_token(column_name)?;
+    let type_tokens = build_add_column_type_tokens(add_v)?;
+    let not_null = add_v.optional_bool("not_null").map_err(DdlError::from)?;
+    let default = optional_scalar(add_v, "default").map_err(DdlError::from)?;
+
+    let mut tokens = vec![
+        Token::Ident("ALTER".to_string()),
+        Token::Ident("TABLE".to_string()),
+        table_token,
+        Token::Ident("ADD".to_string()),
+        Token::Ident("COLUMN".to_string()),
+        column_name_token,
+    ];
+    tokens.extend(type_tokens);
+    if not_null == Some(true) {
+        tokens.push(Token::Ident("NOT".to_string()));
+        tokens.push(Token::Ident("NULL".to_string()));
+    }
+    if let Some(v) = default {
+        tokens.push(Token::Ident("DEFAULT".to_string()));
+        tokens.extend(add_column_default_tokens(v)?);
+    }
+    Ok(tokens)
+}
+
 /// `alter_table` op を実行する。`add_column`／`drop_column` はどちらか
 /// 一方のみ必須（両方指定・両方欠落は [`DdlError::InvalidRequest`]）。
 pub fn execute_alter_table(
@@ -793,19 +847,7 @@ pub fn execute_alter_table(
             let add_v = DDL_ADD_COLUMN_SCHEMA
                 .validate(&wrapped)
                 .map_err(DdlError::from)?;
-            let column_name = add_v.required_str("name").map_err(DdlError::from)?;
-            let column_name_token = ident_token(column_name)?;
-            let type_tokens = build_add_column_type_tokens(&add_v)?;
-
-            let mut tokens = vec![
-                Token::Ident("ALTER".to_string()),
-                Token::Ident("TABLE".to_string()),
-                table_token,
-                Token::Ident("ADD".to_string()),
-                Token::Ident("COLUMN".to_string()),
-                column_name_token,
-            ];
-            tokens.extend(type_tokens);
+            let tokens = build_add_column_tokens(table_token, &add_v)?;
 
             let stmt = validate_alter_table_tokens(&tokens)?;
             run_ddl(core, principal, ParsedSql::AlterTable(stmt))
@@ -948,6 +990,117 @@ mod tests {
             let err = default_literal_tokens(&value)
                 .expect_err("bool/null/array/object DEFAULT must be rejected");
             assert!(matches!(err, DdlError::InvalidRequest), "input: {json}");
+        }
+    }
+
+    // --- add_column の NOT NULL／DEFAULT（Issue #1338） ---------------------
+
+    fn nosql_add_column_validated(
+        json: &str,
+    ) -> Result<engine::sql::allowlist::ValidatedAlterTable, DdlError> {
+        let value = obj(json);
+        let v = DDL_ADD_COLUMN_SCHEMA
+            .validate(&value)
+            .expect("fixture must pass the add_column schema");
+        let table = ident_token("docs").expect("valid ident");
+        let tokens = build_add_column_tokens(table, &v)?;
+        Ok(validate_alter_table_tokens(&tokens)?)
+    }
+
+    fn sql_add_column_validated(
+        decl: &str,
+    ) -> Result<engine::sql::allowlist::ValidatedAlterTable, DdlError> {
+        let tokens = tokenize(&format!("ALTER TABLE docs ADD COLUMN {decl}"))
+            .expect("fixture SQL must tokenize");
+        Ok(validate_alter_table_tokens(&tokens)?)
+    }
+
+    #[test]
+    fn add_column_default_tokens_maps_bool_to_fixed_idents() {
+        assert_eq!(
+            add_column_default_tokens(&JsonValue::Bool(true)).expect("bool"),
+            vec![Token::Ident("true".to_string())]
+        );
+        assert_eq!(
+            add_column_default_tokens(&JsonValue::Bool(false)).expect("bool"),
+            vec![Token::Ident("false".to_string())]
+        );
+    }
+
+    #[test]
+    fn add_column_default_tokens_delegates_other_scalars_and_rejects_invalid() {
+        assert_eq!(
+            add_column_default_tokens(&obj("\"x\"")).expect("string"),
+            vec![Token::StringLiteral("x".to_string())]
+        );
+        assert_eq!(
+            add_column_default_tokens(&obj("-1.5")).expect("neg"),
+            vec![Token::Punct('-'), Token::Number("1.5".to_string())]
+        );
+        assert!(matches!(
+            add_column_default_tokens(&obj("\"a\\nb\"")),
+            Err(DdlError::InvalidRequest)
+        ));
+        assert!(matches!(
+            add_column_default_tokens(&obj("1e5")),
+            Err(DdlError::InvalidRequest)
+        ));
+    }
+
+    #[test]
+    fn add_column_not_null_default_matches_sql_validation() {
+        let cases = [
+            (
+                "n INTEGER NOT NULL DEFAULT 7",
+                r#"{"name":"n","type":"integer","not_null":true,"default":7}"#,
+            ),
+            (
+                "t TEXT DEFAULT 'x'",
+                r#"{"name":"t","type":"text","default":"x"}"#,
+            ),
+            (
+                "b BOOLEAN DEFAULT true",
+                r#"{"name":"b","type":"boolean","default":true}"#,
+            ),
+            (
+                "r REAL DEFAULT -1.5",
+                r#"{"name":"r","type":"real","default":-1.5}"#,
+            ),
+            (
+                "n INTEGER",
+                r#"{"name":"n","type":"integer","not_null":false}"#,
+            ),
+        ];
+        for (sql, json) in cases {
+            let a = sql_add_column_validated(sql).expect("sql side must validate");
+            let b = nosql_add_column_validated(json).expect("nosql side must validate");
+            assert_eq!(a, b, "parity mismatch for {sql}");
+        }
+    }
+
+    #[test]
+    fn add_column_not_null_without_default_is_rejected_like_sql() {
+        let sql = sql_add_column_validated("n INTEGER NOT NULL").expect_err("sql must reject");
+        let nosql = nosql_add_column_validated(r#"{"name":"n","type":"integer","not_null":true}"#)
+            .expect_err("nosql must reject");
+        assert_eq!(sql.wire_code(), "42601");
+        assert_eq!(nosql.wire_code(), "42601");
+    }
+
+    #[test]
+    fn add_column_schema_rejects_malformed_not_null_and_default() {
+        for json in [
+            r#"{"name":"n","type":"text","default":null}"#,
+            r#"{"name":"n","type":"text","default":[1]}"#,
+            r#"{"name":"n","type":"text","default":{"a":1}}"#,
+            r#"{"name":"n","type":"text","not_null":1}"#,
+            r#"{"name":"n","type":"text","not_null":null}"#,
+            r#"{"name":"n","type":"text","nullable":false}"#,
+        ] {
+            let err = DDL_ADD_COLUMN_SCHEMA
+                .validate(&obj(json))
+                .expect_err("malformed add_column must be rejected");
+            assert_eq!(err.wire_code(), "42601", "for {json}");
         }
     }
 

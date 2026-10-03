@@ -416,3 +416,10 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **既知の挙動変化**: 上記の拒否の `wire_code` が `22000` から `22003` に変わる（HTTP は 400 のまま `code` のみ変化）。
 - **テスト**: `crates/engine/tests/bigint_f64_exact_range.rs`（境界値 ±2^53・±(2^53+1)・`i64` 両端。CHECK INSERT／UPDATE・ADD COLUMN DEFAULT の後段評価・WHERE・RLS 非漏えい）、`crates/wire-server/tests/nosql_bigint_f64_exact_range.rs`（NoSQL insert／update の 400 と `22003`）、`udf_call`・`check_constraint`・`group_by` の単体の期待値更新。
 - **対象外（申し送り）**: `parse_number_literal` の非有限リテラル（`numeric literal is not finite`）の `22000`、NoSQL DDL からの CHECK 宣言、NoSQL フィルタでの INTEGER／BIGINT 比較。
+
+**Issue #1338（feat(wire): NoSQL の add_column で NOT NULL と DEFAULT を指定できるようにする。TABLE-16・NOSQL-12・NOSQL-13・SQL-23・TASK-207 ポインタ）**: `alter_table.add_column` に `not_null`（bool）と `default`（文字列・数値・真偽値）を追加した。SQL の `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT <literal>` と同一のトークン列を組み立てて同じ engine 経路へ渡し、意味検証（DEFAULT なし NOT NULL・vector 列・型不一致・長さ上限・束縛エラー・権限）は engine に一本化している。
+
+- **変更箇所**: `http::query::schema` の `DDL_ADD_COLUMN_SCHEMA`、`http::query::ddl` の `build_add_column_tokens`・`add_column_default_tokens`（真偽値は固定語彙の `true`／`false` 識別子へ写像。create_table 共用の `default_literal_tokens` は不変）。
+- **意図した差分**: 制御文字を含む文字列 DEFAULT は NoSQL では `42601`（SQL は受理）。`create_table` の `nullable` に対し add_column は `not_null` を使い、`nullable` は未知キーとして `42601`。
+- **テスト**: `crates/wire-server/tests/nosql13_ddl.rs`（SQL／NoSQL の成否・`wire_code`・HTTP ステータスのパリティ表、形状エラー、`42501` のバイト一致、行の有無に依存しない `42601`、既存行への DEFAULT 反映と `23502`）、`ddl.rs` の単体テスト。
+- **対象外（申し送り）**: create_table の `default` での真偽値受け付け、制御文字入り文字列 DEFAULT の受け付け、`nosql-api.md` の constraints 行に残る `check` は `0A000` という記述の更新、`ALTER COLUMN TYPE`／`SET DEFAULT` 相当の NoSQL op。

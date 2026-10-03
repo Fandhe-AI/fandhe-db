@@ -631,7 +631,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `table` | ○ | string | |
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
 | `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
-| `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`） |
+| `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"not_null"?,"default"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`）。`not_null` は bool（`true` のとき `default` が必須で、無ければ engine が `42601`。`false`・省略は nullable 列）、`default` は文字列・数値・真偽値（Issue #1338。SQL の `NOT NULL`／`DEFAULT <literal>` と同じ実行器・エラー契約）。DATE／TIMESTAMP／UUID／JSON／JSONB／ENUM の DEFAULT は文字列で渡す。`default` の `null`・配列・オブジェクト、`not_null` の非 bool、`nullable` などの未知キーは `42601`。`create_table` の `nullable` に対し `add_column` は `not_null` を使う（`nullable` は受け付けない） |
 | `drop_column`（`alter_table`） | ○ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線（Issue #1167。エラー契約は SQL 表層と同一）。`add_column` と排他必須 |
 
 成功応答は 3 op 共通で `{"ok":true}`（行数・件数を返さない）。
@@ -664,6 +664,15 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 {"op": "alter_table", "table": "docs",
  "add_column": {"name": "note", "type": "text"}}
 ```
+
+`NOT NULL`／`DEFAULT` を伴う例（Issue #1338）:
+
+```json
+{"op": "alter_table", "table": "docs",
+ "add_column": {"name": "n", "type": "integer", "not_null": true, "default": 0}}
+```
+
+意図した差分: 制御文字（改行など）を含む文字列の `default` は、`create_table` と同じく NoSQL では `42601` で拒否する（SQL 表層では受理される）。
 
 要求例（`drop_table`）:
 
@@ -943,6 +952,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
 | `FOREIGN KEY (parent_id) REFERENCES parents (id) ON DELETE CASCADE ON UPDATE SET NULL` | `constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148。同一実行器） |
 | `ALTER TABLE docs ADD COLUMN note TEXT` | `alter_table` + `add_column`（Issue #910。同一実行器） |
+| `ALTER TABLE docs ADD COLUMN n INTEGER NOT NULL DEFAULT 0` | `alter_table` + `add_column`（`not_null`／`default`。Issue #1338。同一実行器） |
 | `DROP TABLE docs` | `drop_table`（Issue #910。同一実行器） |
 
 対応の無いもの（NoSQL 側に受理形が存在しない。実際の応答は語彙外 `op` として
