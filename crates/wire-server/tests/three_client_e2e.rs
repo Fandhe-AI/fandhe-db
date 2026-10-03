@@ -77,6 +77,14 @@
 //! 到達確認に限る。コマンドタグは `WIRE_PRINT_COMMAND_TAG`（クライアントスクリプトの
 //! opt-in）で観測する。ADR: `docs/design/three-client-e2e-harness.md`「分割実行 DML」節。
 //!
+//! Issue #1347（SQL-21）: `INSERT`／`UPDATE`／`DELETE`／UPSERT の `RETURNING` の返却行と
+//! `CommandComplete` タグが、無改造クライアント自身の API まで届くことを
+//! `three_clients_receive_returning_rows_and_command_tags` で確認する。層 A は
+//! `tests/wire_returning.rs`、確定オラクルは engine の `tests/sql_returning.rs`・
+//! `tests/sql21_returning_row_count_parity.rs` で、本ファイルは実クライアントでの
+//! 到達確認に限る（簡易クエリ・autocommit のみ）。ADR:
+//! `docs/design/three-client-e2e-harness.md`「RETURNING」節。
+//!
 //! WIRE-19（Issue #943）: 明示トランザクションの `ReadyForQuery` 状態バイト
 //! （`'I'`/`'T'`/`'E'`。production の中核は Issue #942・PR #1041 で実装済み）
 //! が無改造クライアント自身の API から観測できることを
@@ -2568,6 +2576,14 @@ impl Client {
     /// コマンドタグ（`UPDATE 2` 等。stdout の最後の非空行）を返す。成功しなければ panic。
     /// 結果行を持たない文（分割実行 DML）専用で、prelude は使わない。
     fn command_tag(self, port: u16, user: &str, sql: &str) -> String {
+        self.rows_and_tag(port, user, sql).1
+    }
+
+    /// 1 回の実行で結果行（`|` 区切り・出力順）とコマンドタグ（最後の非空行）の両方を返す。
+    /// `RETURNING` 付き DML は `operation_id` 台帳により再送が `23505` になるため、
+    /// 行とタグを別実行で取れない（Issue #1347）。成功しなければ・出力が空なら panic
+    /// （fail-closed）。prelude は使わない。
+    fn rows_and_tag(self, port: u16, user: &str, sql: &str) -> (Vec<String>, String) {
         let pw = format!("pw-{user}");
         let output = match self {
             Client::Psql => {
@@ -2586,6 +2602,8 @@ impl Client {
                         "-X",
                         "-w",
                         "-At",
+                        "-F",
+                        "|",
                         "-v",
                         "ON_ERROR_STOP=1",
                         "-c",
@@ -2617,12 +2635,15 @@ impl Client {
             self.name(),
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8_lossy(&output.stdout)
+        let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .map(|l| l.trim())
-            .rfind(|l| !l.is_empty())
-            .unwrap_or_else(|| panic!("{}: no command tag in stdout", self.name()))
-            .to_string()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let tag = lines
+            .pop()
+            .unwrap_or_else(|| panic!("{}: no command tag in stdout", self.name()));
+        (lines, tag)
     }
 
     /// `prelude` の後に `sql` が拒否され、stderr に `sqlstate` と `needles` の全てが
@@ -2900,6 +2921,193 @@ fn three_clients_run_partitioned_dml_and_receive_vd001_vd002_25001() {
             "three_clients_partitioned_dml: client={name} update_tag=\"{update_tag}\" \
              delete_tag=\"{delete_tag}\" show=completed|2,interrupted|1,cancelled|1,completed|3 \
              vd001=ok(cause 23505) vd002=ok txn_25001=ok rls_other_tenant=empty"
+        );
+        for secret in ["alice", "bob", "carol", "pw-", "tenant-"] {
+            assert!(
+                !record.contains(secret),
+                "record must not contain `{secret}`"
+            );
+        }
+        eprintln!("[e2e-record] {record}");
+    }
+}
+
+// ---- RETURNING（Issue #1347・SQL-21）----------------------------------
+
+/// `rdocs (n BIGINT, lang TEXT)` を持つ一時 DB。tenant-a・tenant-b に 3 行ずつ入れ、
+/// bob 側の `n`・`lang` を alice と重ねて述語形 DML の RLS 検査が自明に通らないようにする。
+/// `EngineCore` は返す前に drop し、redb のロックを解放する。
+fn seed_returning_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-returning");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let sys = PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+        .expect("tenant");
+    core.execute_sql_in_session(
+        &sys,
+        &mut session,
+        "CREATE TABLE rdocs (n BIGINT, lang TEXT)",
+    )
+    .expect("create table");
+    for (tenant, sql) in [
+        (
+            "tenant-a",
+            "INSERT INTO rdocs (id, n, lang) VALUES (1, 10, 'ja'), (2, 20, 'ja'), (3, 30, 'en') \
+             USING OPERATION_ID 'seed-a'",
+        ),
+        (
+            "tenant-b",
+            "INSERT INTO rdocs (id, n, lang) VALUES (101, 10, 'ja'), (102, 20, 'ja'), \
+             (103, 30, 'en') USING OPERATION_ID 'seed-b'",
+        ),
+    ] {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        core.execute_sql_in_session(&ctx, &mut session, sql)
+            .expect("seed");
+    }
+    drop(core);
+    (path, guard)
+}
+
+/// `RETURNING` の返却行（出力順込み）とコマンドタグを 3 クライアントで検証する。
+/// 固定の seed・固定の文順で決定的。0 行ヒットの応答が「他テナントの id」と
+/// 「存在しない id」で同一であること（RLS・存在情報を漏らさない）、`RETURNING` を
+/// `USING` の後ろに置いた文の `42601`、返却値と永続化値の一致も確認する。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_receive_returning_rows_and_command_tags() {
+    let users_dir = temp_db::TempDir::new("three-client-e2e-returning-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    for client in [Client::Psql, Client::Psycopg, Client::Pg] {
+        let name = client.name();
+        let (db, _guard) = seed_returning_db();
+        let server = spawn_wire_server(&users_path, &db, &[]);
+        let port = server.port;
+        // `RETURNING` は `USING OPERATION_ID` の直前に置く。
+        let run = |user: &str, label: &str, body: &str| -> (Vec<String>, String) {
+            let sql = format!("{body} RETURNING id, n, lang USING OPERATION_ID '{label}-{name}'");
+            client.rows_and_tag(port, user, &sql)
+        };
+        let check = |got: (Vec<String>, String), rows: &[&str], tag: &str, what: &str| {
+            let want: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+            assert_eq!(got.0, want, "{name}: {what} rows");
+            assert_eq!(got.1, tag, "{name}: {what} tag");
+        };
+
+        let s1 = run(
+            "alice",
+            "s1",
+            "INSERT INTO rdocs (id, n, lang) VALUES (4, 40, 'fr')",
+        );
+        let insert_tag = s1.1.clone();
+        check(s1, &["4|40|fr"], "INSERT 0 1", "single insert");
+        let s2 = run(
+            "alice",
+            "s2",
+            "INSERT INTO rdocs (id, n, lang) VALUES (6, 60, 'de'), (5, 50, 'it')",
+        );
+        let multi_insert_tag = s2.1.clone();
+        check(s2, &["6|60|de", "5|50|it"], "INSERT 0 2", "multi insert");
+        let s3 = run("alice", "s3", "UPDATE rdocs SET lang = 'ko' WHERE id = 3");
+        let update_tag = s3.1.clone();
+        check(s3, &["3|30|ko"], "UPDATE 1", "update");
+        let s4a = run(
+            "alice",
+            "s4a",
+            "UPDATE rdocs SET lang = 'xx' WHERE id = 101",
+        );
+        let s4b = run(
+            "alice",
+            "s4b",
+            "UPDATE rdocs SET lang = 'xx' WHERE id = 4242",
+        );
+        assert_eq!(s4a, s4b, "{name}: update 0 rows must not leak existence");
+        check(s4a, &[], "UPDATE 0", "update other tenant");
+        let s5 = run("alice", "s5", "UPDATE rdocs SET n = 99 WHERE lang = 'ja'");
+        let predicate_update_tag = s5.1.clone();
+        check(s5, &["1|99|ja", "2|99|ja"], "UPDATE 2", "predicate update");
+        let s6 = run("alice", "s6", "DELETE FROM rdocs WHERE id = 4");
+        let delete_tag = s6.1.clone();
+        check(s6, &["4|40|fr"], "DELETE 1", "delete");
+        let s7a = run("bob", "s7a", "DELETE FROM rdocs WHERE id = 1");
+        let s7b = run("bob", "s7b", "DELETE FROM rdocs WHERE id = 4242");
+        assert_eq!(s7a, s7b, "{name}: delete 0 rows must not leak existence");
+        check(s7a, &[], "DELETE 0", "delete other tenant");
+        let s8 = run("alice", "s8", "DELETE FROM rdocs WHERE n < 55");
+        let predicate_delete_tag = s8.1.clone();
+        check(s8, &["3|30|ko", "5|50|it"], "DELETE 2", "predicate delete");
+        let s9 = run(
+            "alice",
+            "s9",
+            "INSERT INTO rdocs (id, n, lang) VALUES (1, 11, 'zz'), (7, 70, 'pt') \
+             ON CONFLICT (id) DO NOTHING",
+        );
+        let upsert_nothing_tag = s9.1.clone();
+        check(s9, &["7|70|pt"], "INSERT 0 1", "upsert do nothing");
+        let s10 = run(
+            "alice",
+            "s10",
+            "INSERT INTO rdocs (id, n, lang) VALUES (8, 80, 'nl'), (2, 22, 'sv') \
+             ON CONFLICT (id) DO UPDATE SET lang = EXCLUDED.lang",
+        );
+        let upsert_update_tag = s10.1.clone();
+        check(
+            s10,
+            &["8|80|nl", "2|99|sv"],
+            "INSERT 0 2",
+            "upsert do update",
+        );
+
+        // RETURNING が USING 句の後ろにある文は構文エラー。
+        client.expect_error(
+            port,
+            "alice",
+            &[],
+            &format!(
+                "UPDATE rdocs SET lang = 'q' WHERE id = 1 USING OPERATION_ID 'rneg-{name}' \
+                 RETURNING id"
+            ),
+            "42601",
+            &[],
+        );
+
+        // 返却値と永続化値の一致・他テナントの不変。
+        let mut alice = client.rows(
+            port,
+            "alice",
+            &[],
+            "SELECT id, n, lang FROM rdocs LIMIT 100",
+        );
+        alice.sort();
+        assert_eq!(
+            alice,
+            vec!["1|99|ja", "2|99|sv", "6|60|de", "7|70|pt", "8|80|nl"],
+            "{name}: alice persisted rows"
+        );
+        let mut bob = client.rows(port, "bob", &[], "SELECT id, n, lang FROM rdocs LIMIT 100");
+        bob.sort();
+        assert_eq!(
+            bob,
+            vec!["101|10|ja", "102|20|ja", "103|30|en"],
+            "{name}: bob rows intact"
+        );
+        drop(server);
+
+        let record = format!(
+            "three_clients_returning: client={name} insert_tag=\"{insert_tag}\" \
+             multi_insert_tag=\"{multi_insert_tag}\" update_tag=\"{update_tag}\" \
+             predicate_update_tag=\"{predicate_update_tag}\" delete_tag=\"{delete_tag}\" \
+             predicate_delete_tag=\"{predicate_delete_tag}\" \
+             upsert_nothing_tag=\"{upsert_nothing_tag}\" \
+             upsert_update_tag=\"{upsert_update_tag}\" rls_update0=identical \
+             rls_delete0=identical neg_42601=ok readback=match"
         );
         for secret in ["alice", "bob", "carol", "pw-", "tenant-"] {
             assert!(
