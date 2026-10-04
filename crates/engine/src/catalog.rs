@@ -45,8 +45,8 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 #[cfg(test)]
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{
-    buffered_body_relations, classify_view_body, parse_view_body, SqlSurfaceError,
-    StructuralOnlyLookup, TableLookup, ViewBodyKind,
+    classify_view_body, parse_view_body, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
+    ViewBodyKind,
 };
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
 // `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
@@ -2240,8 +2240,8 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
             buffered: false,
             join: false,
         },
-        ViewBodyKind::Buffered(stmt) => ViewBodyShape {
-            relations: buffered_body_relations(&stmt),
+        ViewBodyKind::Buffered { stmt, relations } => ViewBodyShape {
+            relations,
             buffered: true,
             join: matches!(*stmt, crate::sql::allowlist::Statement::Join(_)),
         },

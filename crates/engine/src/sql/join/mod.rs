@@ -38,7 +38,9 @@ mod aggregate;
 mod exec;
 mod plan;
 mod residual;
-mod values;
+// `sql::view_buffered`（評価後射影形ビューの外側の WHERE・ORDER BY。Issue #1360）が
+// 評価済みセルの比較・述語評価に同じ部品を再利用する（第 2 の比較器を作らない）。
+pub(crate) mod values;
 
 use std::collections::HashMap;
 

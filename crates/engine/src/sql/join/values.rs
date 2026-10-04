@@ -106,7 +106,7 @@ pub(super) fn encode_key_component(
 /// 列同士の比較・スカラー `ORDER BY` の型クラス（Issue #1190）。結合キーと異なり
 /// 浮動小数・`NUMERIC` も比較できる。クラスが一致しない比較は `42804`。
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum CmpClass {
+pub(crate) enum CmpClass {
     Integer,
     Float,
     Numeric,
@@ -121,7 +121,7 @@ pub(super) enum CmpClass {
 
 /// 比較に使える列型か判定する（`None` は疑似列 `id`＝整数クラス）。`VECTOR`・
 /// `JSON`・`ARRAY` は `None`（呼び出し元が文脈に応じた `wire_code` へ写像する）。
-pub(super) fn cmp_class(ty: Option<&ColumnType>) -> Option<CmpClass> {
+pub(crate) fn cmp_class(ty: Option<&ColumnType>) -> Option<CmpClass> {
     match ty {
         None => Some(CmpClass::Integer),
         Some(ColumnType::Integer) | Some(ColumnType::BigInt) => Some(CmpClass::Integer),
@@ -146,7 +146,7 @@ pub(super) fn cmp_class(ty: Option<&ColumnType>) -> Option<CmpClass> {
 /// 正規化する（`OrderValue::Id`／`SignedInt` の異種比較が `Equal` に倒れる実装を
 /// 避けるため）。
 #[derive(Debug, Clone, Copy)]
-pub(super) enum CmpVal<'a> {
+pub(crate) enum CmpVal<'a> {
     Int(i128),
     Float(f64),
     Num(crate::numeric::Decimal),
@@ -158,7 +158,7 @@ pub(super) enum CmpVal<'a> {
 
 /// [`Cell`] を型クラスの比較値へ変換する。`NULL` は `None`。クラスとセルの
 /// 不整合は内部バグとして `Internal`（fail-closed）。
-pub(super) fn cmp_val<'a>(
+pub(crate) fn cmp_val<'a>(
     cell: &'a Cell,
     class: &CmpClass,
 ) -> Result<Option<CmpVal<'a>>, SqlSurfaceError> {
@@ -209,7 +209,7 @@ pub(super) fn compare_vals(a: &CmpVal<'_>, b: &CmpVal<'_>) -> Ordering {
 
 /// `ORDER BY` 1 キー分の比較（PostgreSQL 既定: ASC は NULL 末尾・DESC は NULL 先頭。
 /// 戻り値は「昇順に安定ソートすると最終的な出力順になる」意味の `Ordering`）。
-pub(super) fn compare_order(
+pub(crate) fn compare_order(
     a: Option<&CmpVal<'_>>,
     b: Option<&CmpVal<'_>>,
     descending: bool,
@@ -262,7 +262,7 @@ pub(super) fn op_holds(op: BinOp, ord: Ordering) -> bool {
 /// `i32` を超える値など）は保存データの不整合として `Internal`（fail-closed）。
 /// 述語・集計が扱えない型（`VECTOR`・`ARRAY`）は `Ok(None)` ではなく `Internal`
 /// にして、黙って NULL 扱い（fail-open な誤判定）にしない。
-pub(super) fn cell_scalar<'a>(
+pub(crate) fn cell_scalar<'a>(
     cell: &'a Cell,
     ty: &ColumnType,
 ) -> Result<Option<ScalarRef<'a>>, SqlSurfaceError> {

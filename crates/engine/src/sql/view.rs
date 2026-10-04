@@ -196,7 +196,7 @@ fn reparse_buffered_body(
         rejected_nested: std::cell::Cell::new(false),
     };
     match classify_view_body(&tokens, &guarded) {
-        Ok(ViewBodyKind::Buffered(stmt)) => Ok(*stmt),
+        Ok(ViewBodyKind::Buffered { stmt, .. }) => Ok(*stmt),
         Ok(ViewBodyKind::Simple(_)) => Err(corrupt_view_error()),
         Err(e) if guarded.rejected_nested.get() => Err(e),
         Err(_) => Err(corrupt_view_error()),
