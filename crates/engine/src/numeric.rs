@@ -78,7 +78,7 @@ fn pow10(p: u8) -> Option<i128> {
 /// （`sql::parser`・`row_codec`）が `wire_code`（`22000`/`22003`）へ写像する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NumericError {
-    /// 文法違反（空・符号のみ・複数の `.`・指数表記・非数字・長さ超過等）。
+    /// 文法違反（空・符号のみ・複数の `.`・桁の無い指数・非数字・長さ超過等）。
     Malformed(String),
     /// 列の `NUMERIC(p, s)` に対して桁あふれ（丸め後の整数部が `p - s` 桁を
     /// 超える）。
@@ -339,17 +339,29 @@ impl<'a> DigitReader<'a> {
     }
 }
 
-/// `NUMERIC(precision, scale)` 列向けにリテラル文字列を解析し、束縛値
-/// `Decimal` を返す（D4・D5）。
-///
-/// 受理する文法: `[+-]?(digits)?(\.digits?)?`（整数部・小数部の少なくとも
-/// 一方に 1 桁以上必要）。空白・指数表記（`e`/`E`）・`NaN`/`Infinity`・複数の
-/// `.` は拒否する。丸めは half away from zero（D4）。丸め後の整数部が
-/// `precision - scale` 桁を超える場合は `OutOfRange`（`22003`）。
-///
-/// 1 パス・アロケーションなしで走査し、`unwrap`/`expect`/添字アクセスを
-/// 使わない（coding-rust.md）。
-pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal, NumericError> {
+/// 指数部の絶対値の上限（クランプ値）。仮数部は最大 `MAX_LITERAL_LEN` 桁のため、
+/// これを超える指数は結果（22003 か scale への丸めで 0）を変えない。指数の
+/// 数字列は最大 1024 桁あり得るので、累積は必ずこの値で頭打ちにして `i64` の
+/// 桁あふれを防ぐ。
+const EXP_CLAMP: i64 = 4096;
+
+/// [`scan_literal`] が返す走査結果（入力文字列を借用し、アロケーションしない）。
+struct LiteralParts<'a> {
+    negative: bool,
+    /// 整数部の数字列（先頭ゼロを含む）。
+    int_digits: &'a [u8],
+    /// 小数部の数字列。
+    frac_digits: &'a [u8],
+    /// 指数（`[-EXP_CLAMP, EXP_CLAMP]` にクランプ済み）。指数部が無ければ 0。
+    exp: i64,
+}
+
+/// リテラル文法 `[+-]?(digits)?(\.digits?)?([eE][+-]?digits)?` の唯一の走査実装
+/// （TABLE-13・NOSQL-17、Issue #1358）。[`parse_for_column`] と
+/// [`parse_literal_exact`] が共有し、文法の SSOT を 1 箇所に保つ。
+/// 仮数部（整数部・小数部）に 1 桁以上の数字が必要。長さ・ASCII 検査を
+/// 走査前に行う（untrusted 入力。coding-rust.md）。添字アクセスは使わない。
+fn scan_literal(text: &str) -> Result<LiteralParts<'_>, NumericError> {
     if text.len() > MAX_LITERAL_LEN {
         return Err(NumericError::Malformed("literal too long".to_string()));
     }
@@ -371,87 +383,153 @@ pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal,
         _ => false,
     };
 
-    // 整数部: 有効桁（先頭の連続する `0` は桁数に数えない。`NUMERIC(38,38)` へ
-    // `0.999...9` を通すために必要）が `precision - scale` を超えた時点で
-    // 打ち切って `OutOfRange` にする（丸め前に整数部だけで既に超過が確定する
-    // ケースの早期終了。丸めによる繰り上がりは別途 fits_precision で再検査する）。
-    let int_limit = precision.saturating_sub(scale);
-    let mut int_value: i128 = 0;
-    let mut int_digits: u32 = 0;
-    let mut saw_int_digit = false;
-    let mut leading_zero = true;
-    while let Some(c) = reader.peek() {
-        if c.is_ascii_digit() {
-            saw_int_digit = true;
-            let digit = i128::from(c - b'0');
-            if leading_zero && digit == 0 {
-                // 先頭ゼロは有効桁に数えない（`007` の `int_digits` は 1 の
-                // まま）。
-            } else {
-                leading_zero = false;
-                int_digits += 1;
-                if int_digits > int_limit as u32 {
-                    return Err(NumericError::OutOfRange);
-                }
-            }
-            int_value = int_value
-                .checked_mul(10)
-                .and_then(|v| v.checked_add(digit))
-                .ok_or(NumericError::OutOfRange)?;
-            reader.advance();
-        } else {
-            break;
-        }
+    let int_start = reader.pos;
+    while reader.peek().is_some_and(|c| c.is_ascii_digit()) {
+        reader.advance();
     }
+    let int_end = reader.pos;
 
-    let mut saw_frac_digit = false;
-    let mut frac_value: i128 = 0;
-    let mut round_up = false;
+    let (mut frac_start, mut frac_end) = (int_end, int_end);
     if reader.peek() == Some(b'.') {
         reader.advance();
-        let mut frac_digits: u32 = 0;
-        while let Some(c) = reader.peek() {
-            if c.is_ascii_digit() {
-                saw_frac_digit = true;
-                let digit = c - b'0';
-                if frac_digits < scale as u32 {
-                    frac_value = frac_value
-                        .checked_mul(10)
-                        .and_then(|v| v.checked_add(i128::from(digit)))
-                        .ok_or(NumericError::OutOfRange)?;
-                } else if frac_digits == scale as u32 {
-                    // scale+1 桁目だけを丸め方向の判定に使う（half away from
-                    // zero）。それ以降は数字かどうかの妥当性検査だけ行う。
-                    round_up = digit >= 5;
-                }
-                frac_digits += 1;
+        frac_start = reader.pos;
+        while reader.peek().is_some_and(|c| c.is_ascii_digit()) {
+            reader.advance();
+        }
+        frac_end = reader.pos;
+    }
+
+    if int_end == int_start && frac_end == frac_start {
+        return Err(NumericError::Malformed("literal has no digits".to_string()));
+    }
+
+    let mut exp: i64 = 0;
+    if matches!(reader.peek(), Some(b'e' | b'E')) {
+        reader.advance();
+        let exp_negative = match reader.peek() {
+            Some(b'+') => {
                 reader.advance();
-            } else {
+                false
+            }
+            Some(b'-') => {
+                reader.advance();
+                true
+            }
+            _ => false,
+        };
+        let mut saw_exp_digit = false;
+        while let Some(c) = reader.peek() {
+            if !c.is_ascii_digit() {
                 break;
             }
+            saw_exp_digit = true;
+            exp = exp
+                .saturating_mul(10)
+                .saturating_add(i64::from(c - b'0'))
+                .min(EXP_CLAMP);
+            reader.advance();
         }
-        // 列の scale より入力桁が少ない場合はゼロ埋め相当（既に frac_value は
-        // 0 埋め済みの値になっている必要がある）。
-        if frac_digits < scale as u32 {
-            let missing = scale as u32 - frac_digits;
-            let mul = pow10(missing.min(u32::from(MAX_PRECISION)) as u8).ok_or(
-                NumericError::Malformed("scale exceeds supported precision".to_string()),
-            )?;
-            frac_value = frac_value
-                .checked_mul(mul)
-                .ok_or(NumericError::OutOfRange)?;
+        if !saw_exp_digit {
+            return Err(NumericError::Malformed(
+                "exponent has no digits".to_string(),
+            ));
+        }
+        if exp_negative {
+            exp = -exp;
         }
     }
 
-    if !saw_int_digit && !saw_frac_digit {
-        return Err(NumericError::Malformed("literal has no digits".to_string()));
-    }
-    // 未消費のバイトが残っていれば文法違反（空白・指数表記・複数の `.` 等）。
+    // 未消費のバイトが残っていれば文法違反（空白・複数の `.`・指数後の `.` 等）。
     if reader.peek().is_some() {
         return Err(NumericError::Malformed(
             "literal contains unsupported trailing characters".to_string(),
         ));
     }
+
+    Ok(LiteralParts {
+        negative,
+        int_digits: bytes.get(int_start..int_end).unwrap_or_default(),
+        frac_digits: bytes.get(frac_start..frac_end).unwrap_or_default(),
+        exp,
+    })
+}
+
+/// `NUMERIC(precision, scale)` 列向けにリテラル文字列を解析し、束縛値
+/// `Decimal` を返す（D4・D5）。
+///
+/// 受理する文法: `[+-]?(digits)?(\.digits?)?([eE][+-]?digits)?`（整数部・
+/// 小数部の少なくとも一方に 1 桁以上必要。指数部は Issue #1358 で受理）。
+/// 空白・`NaN`/`Infinity`・複数の `.`・指数部の小数・桁の無い指数は拒否する。
+/// 指数は小数点位置のシフトとして扱い、シフト後の値に対して丸め
+/// （half away from zero、D4）と桁検査を行う。シフト後の整数部が
+/// `precision - scale` 桁を超える場合（丸めの繰り上がり含む）は `OutOfRange`
+/// （`22003`）。極端に大きな負の指数は 0 へ丸まり、非ゼロ仮数の極端に大きな
+/// 正の指数は `OutOfRange` になる（指数は [`EXP_CLAMP`] で頭打ち）。
+///
+/// アロケーションなしで走査し、`unwrap`/`expect`/添字アクセスを使わない
+/// （coding-rust.md）。
+pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal, NumericError> {
+    let parts = scan_literal(text)?;
+    let int_len = parts.int_digits.len();
+    let total_len = int_len + parts.frac_digits.len();
+    // 仮想数字列 D = 整数部 ++ 小数部。k 番目の数字（範囲外・負は暗黙の 0）。
+    let digit_at = |k: i64| -> i128 {
+        let Ok(idx) = usize::try_from(k) else {
+            return 0;
+        };
+        let byte = if idx < int_len {
+            parts.int_digits.get(idx)
+        } else {
+            parts.frac_digits.get(idx - int_len)
+        };
+        byte.map_or(0, |b| i128::from(b.saturating_sub(b'0')))
+    };
+    // 小数点位置（D の先頭から数えた桁数）。負・len(D) 超過もあり得る。
+    let point = (int_len as i64) + parts.exp;
+
+    // 整数部: 有効桁（先頭の連続する `0` は数えない。`NUMERIC(38,38)` へ
+    // `0.999...9` を通すために必要）が `precision - scale` を超えた時点で
+    // `OutOfRange` にする（丸め前に整数部だけで超過が確定するケースの早期終了。
+    // 丸めによる繰り上がりは最後に fits_precision で再検査する）。
+    let int_limit = u32::from(precision.saturating_sub(scale));
+    let mut int_value: i128 = 0;
+    let mut int_sig: u32 = 0;
+    let int_take = usize::try_from(point.max(0)).unwrap_or(0).min(total_len);
+    for k in 0..int_take {
+        let digit = digit_at(k as i64);
+        if int_sig == 0 && digit == 0 {
+            continue;
+        }
+        int_sig += 1;
+        if int_sig > int_limit {
+            return Err(NumericError::OutOfRange);
+        }
+        int_value = int_value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or(NumericError::OutOfRange)?;
+    }
+    // D を超える位置までのシフト分は暗黙の末尾ゼロ。整数部が非ゼロのときだけ
+    // 有効桁に数える。
+    if point > total_len as i64 && int_sig > 0 {
+        let extra = u32::try_from(point - total_len as i64).unwrap_or(u32::MAX);
+        if int_sig.saturating_add(extra) > int_limit {
+            return Err(NumericError::OutOfRange);
+        }
+        // `extra <= int_limit <= 38` が上の検査で保証される。
+        let mul = pow10(extra as u8).ok_or(NumericError::OutOfRange)?;
+        int_value = int_value.checked_mul(mul).ok_or(NumericError::OutOfRange)?;
+    }
+
+    // 小数部: 小数点以降 `scale` 桁（暗黙ゼロ込み）と、その次の桁（丸め判定）。
+    let mut frac_value: i128 = 0;
+    for j in 0..i64::from(scale) {
+        frac_value = frac_value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit_at(point.saturating_add(j))))
+            .ok_or(NumericError::OutOfRange)?;
+    }
+    let round_up = digit_at(point.saturating_add(i64::from(scale))) >= 5;
 
     let scale_mul = pow10(scale).ok_or(NumericError::OutOfRange)?;
     let mut unscaled = int_value
@@ -461,7 +539,7 @@ pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal,
     if round_up {
         unscaled = unscaled.checked_add(1).ok_or(NumericError::OutOfRange)?;
     }
-    if negative && unscaled != 0 {
+    if parts.negative && unscaled != 0 {
         unscaled = -unscaled;
     }
 
@@ -485,14 +563,14 @@ pub fn parse_for_column(text: &str, precision: u8, scale: u8) -> Result<Decimal,
 /// 実際のトークン走査・文法検証は [`parse_for_column`] 1 箇所を共有するため
 /// 「第 2 のパーサー」にはならない。
 ///
-/// `.` 以降の桁数が `u8`（255）を超える、または [`MAX_PRECISION`] を超える
-/// 場合は `NumericError::OutOfRange`（範囲比較に使う `NUMERIC` 値としては
-/// 桁数過多で不成立）。
+/// 正確な `scale` は `max(0, 小数部の桁数 - 指数)`（指数表記は Issue #1358。
+/// `1e-3` は scale 3、`1.5e3` は scale 0）。これが [`MAX_PRECISION`] を超える、
+/// または整数部が 38 桁に収まらない場合は `NumericError::OutOfRange`
+/// （範囲比較に使う `NUMERIC` 値としては桁数過多で不成立）。
 pub fn parse_literal_exact(text: &str) -> Result<Decimal, NumericError> {
-    let scale = match text.split_once('.') {
-        Some((_, frac)) => u8::try_from(frac.len()).map_err(|_| NumericError::OutOfRange)?,
-        None => 0,
-    };
+    let parts = scan_literal(text)?;
+    let exact = (parts.frac_digits.len() as i64).saturating_sub(parts.exp);
+    let scale = u8::try_from(exact.max(0)).map_err(|_| NumericError::OutOfRange)?;
     if scale > MAX_PRECISION {
         return Err(NumericError::OutOfRange);
     }
@@ -612,7 +690,8 @@ mod tests {
     #[test]
     fn rejects_malformed_literals() {
         for bad in [
-            "", "+", "-", "abc", "1.2.3", " 1", "1 ", "1e3", "1E3", "NaN", "Infinity", ".",
+            "", "+", "-", "abc", "1.2.3", " 1", "1 ", "NaN", "Infinity", ".", "1e", "1e+", "1e-",
+            "e3", ".e3", "+e3", "1e3.5", "1e3e4", "1e 3", "1 e3", "1ee3", "1e+-3",
         ] {
             assert!(
                 matches!(
@@ -902,5 +981,98 @@ mod tests {
             rescale_bounds_for_column(&huge_literal, MAX_PRECISION, CompareOp::Eq),
             None
         );
+    }
+
+    fn col(text: &str, p: u8, sc: u8) -> Result<Decimal, NumericError> {
+        parse_for_column(text, p, sc)
+    }
+
+    fn ok(text: &str, p: u8, sc: u8) -> Decimal {
+        col(text, p, sc).unwrap_or_else(|e| panic!("{text:?} should parse: {e:?}"))
+    }
+
+    #[test]
+    fn accepts_exponent_notation() {
+        // Issue #1358: 指数は小数点位置のシフト。
+        assert_eq!(ok("1e2", 5, 2), d(10000, 2));
+        assert_eq!(ok("1E2", 5, 2), d(10000, 2));
+        assert_eq!(ok("1e+2", 5, 2), d(10000, 2));
+        assert_eq!(ok("1.5e2", 5, 2), d(15000, 2));
+        assert_eq!(ok("1.5E+2", 5, 2), d(15000, 2));
+        assert_eq!(ok("-1.5e2", 5, 2), d(-15000, 2));
+        assert_eq!(ok(".5e1", 5, 2), d(500, 2));
+        assert_eq!(ok("5.e1", 5, 2), d(5000, 2));
+        assert_eq!(ok("1e0003", 10, 0), d(1000, 0));
+        assert_eq!(ok("1e-1", 5, 2), d(10, 2));
+    }
+
+    #[test]
+    fn exponent_shift_rounds_after_shift() {
+        assert_eq!(ok("123456e-4", 5, 2), d(1235, 2));
+        assert_eq!(ok("5e-3", 5, 2), d(1, 2));
+        assert_eq!(ok("4e-3", 5, 2), d(0, 2));
+        assert_eq!(ok("-5e-3", 5, 2), d(-1, 2));
+        assert_eq!(ok("-4e-3", 5, 2), d(0, 2));
+        assert_eq!(ok("0e99999", 5, 2), d(0, 2));
+        assert_eq!(ok("-0e5", 5, 2), d(0, 2));
+        assert_eq!(ok("1e-1000", 5, 2), d(0, 2));
+    }
+
+    #[test]
+    fn trailing_garbage_with_int_overflow_is_malformed() {
+        // 走査を先に行うため、文法違反は桁あふれより優先して 22000 になる
+        // （どちらも fail-closed の拒否。Issue #1358 のレビュー指摘で固定）。
+        assert!(matches!(
+            col("99999999x", 5, 2),
+            Err(NumericError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn exponent_overflow_is_out_of_range() {
+        assert_eq!(col("1e3", 5, 2), Err(NumericError::OutOfRange));
+        assert_eq!(col("1.23456e4", 5, 2), Err(NumericError::OutOfRange));
+        // 丸めの繰り上がりで 1000.00 になる。
+        assert_eq!(col("9.99995e2", 5, 2), Err(NumericError::OutOfRange));
+        assert_eq!(col("1e99999", 38, 0), Err(NumericError::OutOfRange));
+        assert_eq!(col("1e38", 38, 0), Err(NumericError::OutOfRange));
+    }
+
+    #[test]
+    fn exponent_boundaries() {
+        let nines = "9".repeat(38);
+        assert_eq!(
+            ok("9.9999999999999999999999999999999999999e37", 38, 0),
+            ok(&nines, 38, 0)
+        );
+        assert_eq!(ok("9.99e-1", 38, 38).scale(), 38);
+        assert_eq!(ok("1e-38", 38, 38), d(1, 38));
+    }
+
+    #[test]
+    fn huge_exponent_is_clamped_without_panic() {
+        let long_exp = format!("1e{}", "9".repeat(1000));
+        assert_eq!(col(&long_exp, 38, 0), Err(NumericError::OutOfRange));
+        let long_neg = format!("1e-{}", "9".repeat(1000));
+        assert_eq!(ok(&long_neg, 5, 2), d(0, 2));
+        let long_zero_exp = format!("0e{}", "9".repeat(1000));
+        assert_eq!(ok(&long_zero_exp, 5, 2), d(0, 2));
+        let lead_zeros = format!("1e{}3", "0".repeat(1000));
+        assert_eq!(ok(&lead_zeros, 10, 0), d(1000, 0));
+    }
+
+    #[test]
+    fn parse_literal_exact_with_exponent() {
+        assert_eq!(parse_literal_exact("1e-3"), Ok(d(1, 3)));
+        assert_eq!(parse_literal_exact("1.5e3"), Ok(d(1500, 0)));
+        assert_eq!(parse_literal_exact("1.50e1"), Ok(d(150, 1)));
+        assert_eq!(parse_literal_exact("1e-50"), Err(NumericError::OutOfRange));
+        assert_eq!(parse_literal_exact("1e40"), Err(NumericError::OutOfRange));
+        assert_eq!(parse_literal_exact("1.005"), Ok(d(1005, 3)));
+        assert_eq!(parse_literal_exact("7"), Ok(d(7, 0)));
+        assert!(matches!(
+            parse_literal_exact("1e"),
+            Err(NumericError::Malformed(_))
+        ));
     }
 }

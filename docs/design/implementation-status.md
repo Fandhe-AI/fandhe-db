@@ -533,3 +533,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: 要素はスカラー列と同じ束縛関数・エラー分類を共有する。既存要素型の行バイト・UNIQUE キーは不変。詳細は `array-column-type.md` の Issue #1357 追記。
 - **テスト**: engine 単体（カタログ param・往復・依存判定・墓標正規化）、層 A `array_extended_elem_types.rs`（往復・再起動・等価・JSON 値等価・UNIQUE・DROP／ALTER TYPE・エラー分類・テナント分離）、`column_type_codec_roundtrip.rs` の拡張、wire `wire_array_column.rs`・NoSQL `nosql17_typed_json_parity.rs`（SQL とのバイト一致）。
 - **対象外（申し送り）**: NoSQL の DDL での配列宣言、配列列への DEFAULT、`numeric[]` の精度拡大、要素・パス演算子、配列・JSON 列の二次索引化、NoSQL filter の `in`。
+
+## Issue #1358: NUMERIC 列への指数表記の数値を受理する
+
+- **対象ビヘイビア**: TABLE-13・NOSQL-17（関連: TASK-197・TASK-199）。
+- **変更箇所**: `engine::numeric` の走査を `scan_literal` に共通化し、文法を `[+-]?(digits)?(\.digits?)?([eE][+-]?digits)?` へ拡張。`parse_for_column` は指数を小数点位置のシフトとして扱い、シフト後の値を half away from zero で丸めて桁検査する（シフト後の整数部が `p - s` 桁を超えれば `22003`）。指数は 4096 で頭打ちにし、巨大な負の指数は 0、非ゼロ仮数の巨大な正の指数は `22003`。`parse_literal_exact`（範囲比較リテラル）も指数込みの正確な scale を導出する（`1e-3` が scale 0 に化けない）。
+- **性質**: 指数部の無い入力の受理・拒否・値は不変（拒否の分類のみ、末尾に不正文字を含み整数部も桁あふれする入力は 22003 でなく 22000 になる。いずれも fail-closed）。SQL の INSERT／UPDATE／UPSERT／COPY／配列要素・列 DEFAULT・NoSQL の insert／update／filter は共有の束縛経路経由で追随する。wire-server のコード変更は無い。
+- **テスト**: `numeric.rs` 単体、`numeric_column.rs`（SQL 経路。`'1e3'` は拒否例から受理側へ契約改訂し、不正形 `'1e'`・`'1e3.5'` を拒否例へ追加）、`declarative_filter` 単体、wire `typed_json` 単体、`nosql17_typed_json_parity.rs`（HTTP と SQL のバイト一致・`22003`）。
+- **対象外（申し送り）**: 前後空白の受理、`NaN`／`Infinity`、式レーンの数値リテラルでの NUMERIC 扱い、scale が 38 を超える範囲比較リテラルの受理。

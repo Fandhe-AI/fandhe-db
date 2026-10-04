@@ -547,6 +547,20 @@ mod tests {
         assert_eq!(lit, InsertLiteral::String("12.34".to_string()));
     }
 
+    // Issue #1358: 指数表記の JSON 数値は生テキストのまま束縛へ渡す（解釈は
+    // engine::numeric 側）。
+    #[test]
+    fn maps_numeric_exponent_number_as_raw_text() {
+        let c = col(ColumnType::Numeric {
+            precision: 5,
+            scale: 2,
+        });
+        for raw in ["1e3", "1.5E-2"] {
+            let lit = map_json_to_literal(&c, &num(raw)).expect("ok");
+            assert_eq!(lit, InsertLiteral::Number(raw.to_string()));
+        }
+    }
+
     #[test]
     fn maps_boolean() {
         let lit =

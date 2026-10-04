@@ -410,7 +410,7 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   nosql-typed-json-binding.md` 参照）: `INTEGER`／`BIGINT` は JSON 整数
   （小数・指数表記は `22P02`、非数値は `42601`。範囲外は `22003`）、`REAL`／`DOUBLE PRECISION`
   は JSON 数値（指数表記を受理。範囲外は `22003`）、`NUMERIC` は JSON 数値または数値文字列
-  （桁あふれは `22003`）、`BOOLEAN` は JSON 真偽値、`DATE`／`TIMESTAMP`／
+  （指数表記を受理しシフト後に列の scale へ丸める。桁あふれは `22003`。Issue #1358）、`BOOLEAN` は JSON 真偽値、`DATE`／`TIMESTAMP`／
   `UUID` は JSON 文字列（書式違反は `22007`、範囲外・暦上不正は `22008`、`UUID` の形式不正は `22P02`）、
   `TEXT[]`／`BOOLEAN[]` は JSON 配列（要素種別不一致は `42601`、要素数
   超過は `54000`）。`TEXT`／`VECTOR`（旧来型）の型不一致のみ引き続き

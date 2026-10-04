@@ -300,6 +300,69 @@ fn assert_aggregate_parity(
     body_utf8(&resp)
 }
 
+// ------------------------------------------------- 指数表記（Issue #1358）
+
+/// NUMERIC(10,2) 列への指数表記の JSON 数値・数値文字列が HTTP `insert` で受理され、
+/// SQL `INSERT`（数値トークン・文字列リテラル）と同じ値で `scan` に現れる。桁数超過は
+/// `22003`（HTTP 400）で行が増えない。
+#[test]
+fn numeric_exponent_json_number_matches_sql() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    // (id, JSON の amount 断片, SQL の amount リテラル)
+    let cases: [(u64, &str, &str); 4] = [
+        (1, "1.5e2", "1.5e2"),
+        (2, "-5E-3", "-5E-3"),
+        (3, "\"2.5e1\"", "'2.5e1'"),
+        (4, "1e+3", "1e+3"),
+    ];
+    for (id, json, sql) in cases {
+        let body = format!(
+            r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"lang":"ja","amount":{json}}}],"operation_id":"exp-nosql-{id}"}}"#
+        );
+        let resp = alice(addr, &body);
+        assert_eq!(resp.status, 200, "exponent insert {json}: {resp:?}");
+        sql_exec(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, amount) VALUES \
+                 ({id}, '[0.5,0.25]', 'ja', {sql}) USING OPERATION_ID 'exp-sql-{id}'"
+            ),
+        );
+    }
+    let scan = format!(
+        r#"{{"op":"scan","table":"{NOSQL_TABLE}","columns":["id","amount"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+    );
+    let resp = alice(addr, &scan);
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        &format!("SELECT id, amount FROM {SQL_TABLE} ORDER BY id ASC LIMIT 100"),
+    );
+    let body = body_utf8(&resp);
+    assert_eq!(body, oracle);
+    for expected in ["150.00", "-0.01", "25.00", "1000.00"] {
+        assert!(body.contains(expected), "{expected} missing: {body}");
+    }
+
+    // NUMERIC(10,2) の整数部は 8 桁まで。1e8 は桁あふれ（22003）で行は増えない。
+    let resp = alice(
+        addr,
+        &format!(
+            r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":9,"embedding":[0.5,0.25],"lang":"ja","amount":1e8}}],"operation_id":"exp-nosql-9"}}"#
+        ),
+    );
+    assert_eq!(resp.status, 400, "{resp:?}");
+    assert!(body_utf8(&resp).contains("22003"), "{}", body_utf8(&resp));
+    let resp = alice(
+        addr,
+        &agg_body(NOSQL_TABLE, r#"{"fn":"count","column":"*"}"#, ""),
+    );
+    assert!(body_utf8(&resp).contains("[[4]]"), "{}", body_utf8(&resp));
+}
+
 // ---------------------------------------------------------------- 往復
 
 /// seed の自己検査: 4 行が両テーブルに入っていることを固定する。
