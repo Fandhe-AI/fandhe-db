@@ -7601,13 +7601,12 @@ impl Storage {
     /// であれば既存の全テナントの既存値は新しい宣言の下でも必ず有効な値として
     /// 読み出せる）。
     ///
-    /// 受理するのはこの 1 パターン（`NUMERIC` → より大きい `precision`・同一
-    /// `scale` の `NUMERIC`）のみで、それ以外の型変更（`INTEGER`→`BIGINT`・
-    /// `REAL`→`DOUBLE PRECISION` を含む、行の書き換えを要する拡大変換や、
-    /// 縮小変換・異種変換・同一型への変更）はすべて
-    /// `Err(CatalogError::IncompatibleTypeChange)` で拒否する（行の書き換えを
-    /// 伴う変換は本 Issue のスコープ外。`docs/design/alter-table-drop-modify-column.md`
-    /// 参照）。
+    /// 本 API が受理するのはこの 1 パターン（`NUMERIC` → より大きい `precision`・
+    /// 同一 `scale` の `NUMERIC`）のみで、それ以外の型変更はすべて
+    /// `Err(CatalogError::IncompatibleTypeChange)` で拒否する。行の書き換えを
+    /// 伴う `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION` は SQL 表層経路の
+    /// [`Self::alter_table_alter_column_type`] だけが受理する（Issue #1361。
+    /// `docs/design/alter-table-drop-modify-column.md` 参照）。
     pub fn alter_table_widen_numeric_precision(
         &self,
         table_name: &str,
@@ -7635,18 +7634,25 @@ impl Storage {
             // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
             // scale <= precision）を検証してから確定する。
             validate_numeric_precision_scale(new_precision, old_scale)?;
-            Ok(ColumnType::Numeric {
-                precision: new_precision,
-                scale: old_scale,
-            })
+            Ok((
+                ColumnType::Numeric {
+                    precision: new_precision,
+                    scale: old_scale,
+                },
+                None,
+            ))
         })
     }
 
     /// `ALTER TABLE ... ALTER COLUMN <column> TYPE <target>`（TABLE-19・SQL-23、
     /// Issue #1167）の実行本体。SQL 表層（`sql::ddl::execute_alter_table_alter_column_type`）
-    /// が呼ぶ。受理するのは `NUMERIC(p0, s)` → `NUMERIC(p1, s)`（`p1 > p0`・同一 scale）
-    /// のみで、それ以外（VECTOR 次元変更・同一型・縮小・scale 変更・異種型・
-    /// 行の書き換えを伴う拡大変換）はすべて `IncompatibleTypeChange`。
+    /// が呼ぶ。受理するのは `NUMERIC(p0, s)` → `NUMERIC(p1, s)`（`p1 > p0`・同一 scale。
+    /// カタログのみ書き換え）と、全テナントの既存行を同一 write txn 内で再エンコード
+    /// する `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`（Issue #1361。
+    /// [`crate::column_rewrite`]。PK／UNIQUE／FOREIGN KEY の構成列は索引が古くなる
+    /// ため `DependentObjectsStillExist`）で、それ以外（VECTOR 次元変更・同一型・縮小・
+    /// scale 変更・異種型・`INTEGER`→`DOUBLE PRECISION` 等）はすべて
+    /// `IncompatibleTypeChange`。成功時は世代を bump して索引キャッシュを失効させる。
     ///
     /// [`Self::alter_table_widen_numeric_precision`] と異なり目標の scale を受け取り、
     /// 判定を単一 write txn 内で完結させる（表層が事前に読んだ scale と書込時点の
@@ -7671,7 +7677,15 @@ impl Storage {
                     precision: p1,
                     scale: s1,
                 },
-            ) if s0 == s1 && p1 > p0 => Ok(target.clone()),
+            ) if s0 == s1 && p1 > p0 => Ok((target.clone(), None)),
+            (ColumnType::Integer, ColumnType::BigInt) => Ok((
+                target.clone(),
+                Some(crate::column_rewrite::WideningKind::IntegerToBigInt),
+            )),
+            (ColumnType::Real, ColumnType::Double) => Ok((
+                target.clone(),
+                Some(crate::column_rewrite::WideningKind::RealToDouble),
+            )),
             (from, to) => {
                 let (from_tag, from_param) = from.catalog_fields();
                 let (to_tag, to_param) = to.catalog_fields();
@@ -7685,14 +7699,21 @@ impl Storage {
     }
 
     /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
-    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → 書き戻し →
+    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → （行の書き換えを
+    /// 伴う拡大変換のみ）PK／UNIQUE／FK 依存検査（`DependentObjectsStillExist`。
+    /// 永続一意索引・キー索引の正準キーが型ごとに異なり、古い索引が一意性・
+    /// 参照整合性検査をすり抜ける fail-open を避ける）と全テナント既存行の
+    /// 再エンコード（[`crate::column_rewrite`]。Issue #1361）→ 書き戻し →
     /// 世代 bump → commit を行う（commit の直前行に必ず bump を置く。
-    /// `table_generation_bump_coverage`）。拒否時は commit せず副作用ゼロ。
+    /// `table_generation_bump_coverage`）。拒否・失敗時は commit せず副作用ゼロ。
     fn alter_column_type_with(
         &self,
         table_name: &str,
         column_name: &str,
-        decide: impl FnOnce(&ColumnType) -> Result<ColumnType>,
+        decide: impl FnOnce(
+            &ColumnType,
+        )
+            -> Result<(ColumnType, Option<crate::column_rewrite::WideningKind>)>,
     ) -> Result<()> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
@@ -7709,7 +7730,8 @@ impl Storage {
                 guard.value().to_vec()
             };
             let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let old_schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let mut schema = old_schema.clone();
             // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が参照する列の型変更は
             // 安全側で拒否する（`alter_table_drop_column` と同じ判断。述語の
             // 意味を黙って変えない）。
@@ -7718,12 +7740,44 @@ impl Storage {
                     column_name.to_string(),
                 ));
             }
+            let logical_index = schema
+                .columns
+                .iter()
+                .position(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             let column = schema
                 .columns
-                .iter_mut()
-                .find(|c| c.name == column_name)
+                .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            column.ty = decide(&column.ty)?;
+            let (new_ty, rewrite) = decide(&column.ty)?;
+            column.ty = new_ty;
+            if let Some(kind) = rewrite {
+                if schema
+                    .primary_key
+                    .as_ref()
+                    .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+                    || schema
+                        .unique_constraints
+                        .iter()
+                        .any(|u| u.columns().iter().any(|c| c == column_name))
+                    || schema
+                        .foreign_keys
+                        .iter()
+                        .any(|fk| fk.columns.iter().any(|c| c == column_name))
+                {
+                    return Err(CatalogError::DependentObjectsStillExist(
+                        column_name.to_string(),
+                    ));
+                }
+                crate::column_rewrite::rewrite_rows_for_widening_in_txn(
+                    &write_txn,
+                    table_name,
+                    &old_schema,
+                    &schema,
+                    logical_index,
+                    kind,
+                )?;
+            }
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
@@ -13065,6 +13119,237 @@ mod tests {
                 ],
             )
             .expect("insert typed row within widened precision");
+    }
+
+    /// 拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`。Issue #1361）は
+    /// 全テナントの既存行を再エンコードし、対象外の列（墓標・DEFAULT 補完を含む）
+    /// の値・行ヘッダ・世代 bump・再オープン後の読み出しを保つ。
+    #[test]
+    fn alter_column_type_widening_rewrites_rows_and_preserves_other_columns() {
+        let path = unique_db_path("widen-int-real-rewrite");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("gone", ColumnType::Text, true),
+                    ColumnDef::new("t", ColumnType::Text, true),
+                    ColumnDef::new("flag", ColumnType::Boolean, true),
+                    ColumnDef::new("n", ColumnType::Integer, true),
+                    ColumnDef::new("r", ColumnType::Real, true),
+                    ColumnDef::new("b", ColumnType::Bytea, true),
+                ],
+            ))
+            .expect("create table");
+        let row = |n: Option<i32>, r: Option<f32>| {
+            vec![
+                RowCodecValue::Vector(vec![1.0, 2.0]),
+                RowCodecValue::Text("g".to_string()),
+                RowCodecValue::Text("hello".to_string()),
+                RowCodecValue::Bool(true),
+                n.map_or(RowCodecValue::Null, RowCodecValue::Integer),
+                r.map_or(RowCodecValue::Null, RowCodecValue::Real),
+                RowCodecValue::Bytes(vec![9, 8, 7]),
+            ]
+        };
+        for (tenant, vis, id, n, r) in [
+            (
+                "tenant-a",
+                Visibility::Public,
+                1u64,
+                Some(i32::MIN),
+                Some(0.1f32),
+            ),
+            ("tenant-a", Visibility::Private, 2, Some(i32::MAX), None),
+            ("tenant-b", Visibility::Public, 1, None, Some(-2.5)),
+        ] {
+            storage
+                .insert_typed_row("docs", id, tenant, vis, &row(n, r))
+                .expect("insert");
+        }
+        storage
+            .alter_table_drop_column("docs", "gone")
+            .expect("drop column creates a tombstone");
+        // DROP 後に DEFAULT 付き列を追加する（追加前の行は読み出し時に補完される）。
+        storage
+            .alter_table_add_column(
+                "docs",
+                ColumnDef::new("d", ColumnType::Real, false)
+                    .with_default(ColumnDefault::Number("0.1".to_string())),
+            )
+            .expect("add default column");
+        let before: Vec<Vec<RowCodecValue>> =
+            [("tenant-a", 1u64), ("tenant-a", 2), ("tenant-b", 1)]
+                .iter()
+                .map(|(t, id)| {
+                    let schema = storage.get_table_schema("docs").expect("schema");
+                    let r = storage.get_row_from_table("docs", t, *id).expect("row");
+                    row_codec::decode_scalar_columns(&schema, &r.metadata).expect("decode")
+                })
+                .collect();
+        let generation_before = storage.table_generation("docs").expect("generation");
+
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect("widen integer");
+        storage
+            .alter_table_alter_column_type("docs", "r", &ColumnType::Double)
+            .expect("widen real");
+        assert!(storage.table_generation("docs").expect("generation") > generation_before);
+
+        let check = |storage: &Storage| {
+            let schema = storage.get_table_schema("docs").expect("schema");
+            for (i, (t, id, vis)) in [
+                ("tenant-a", 1u64, Visibility::Public),
+                ("tenant-a", 2, Visibility::Private),
+                ("tenant-b", 1, Visibility::Public),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let r = storage.get_row_from_table("docs", t, *id).expect("row");
+                assert_eq!(r.visibility, *vis);
+                assert_eq!(r.embedding, vec![1.0, 2.0]);
+                let after = row_codec::decode_scalar_columns(&schema, &r.metadata).expect("decode");
+                assert_eq!(after.len(), before[i].len());
+                for (j, (a, b)) in after.iter().zip(before[i].iter()).enumerate() {
+                    let expected = match b {
+                        RowCodecValue::Integer(v) if j == 3 => RowCodecValue::BigInt(i64::from(*v)),
+                        RowCodecValue::Real(v) if j == 4 => RowCodecValue::Double(f64::from(*v)),
+                        other => other.clone(),
+                    };
+                    assert_eq!(a, &expected, "tenant {t} id {id} column {j}");
+                }
+            }
+        };
+        check(&storage);
+        drop(storage);
+        let reopened = Storage::open(&path).expect("reopen");
+        check(&reopened);
+        // 拡大後の値域でしか入らない行も書ける。
+        reopened
+            .insert_typed_row(
+                "docs",
+                9,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.0, 0.0]),
+                    RowCodecValue::Null,
+                    RowCodecValue::Null,
+                    RowCodecValue::BigInt(i64::from(i32::MAX) + 1),
+                    RowCodecValue::Double(0.1),
+                    RowCodecValue::Null,
+                    RowCodecValue::Real(0.1),
+                ],
+            )
+            .expect("insert wide values");
+    }
+
+    /// 再エンコード結果がペイロード上限を超える場合は `CorruptSchema` で拒否し、
+    /// カタログ・行バイト列・世代のいずれにも痕跡を残さない（fail-closed。Issue #1361）。
+    #[test]
+    fn alter_column_type_widening_is_atomic_when_rewrite_fails() {
+        let path = unique_db_path("widen-int-atomic");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("t", ColumnType::Text, true),
+                    ColumnDef::new("n", ColumnType::Integer, true),
+                ],
+            ))
+            .expect("create table");
+        // 小さい行を先に書き換え済みにしてから失敗行に当たる並び（id 昇順）にする。
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text("small".to_string()),
+                    RowCodecValue::Integer(1),
+                ],
+            )
+            .expect("insert small");
+        // text フレーム（presence 1 + len 4 + 本体）+ integer フレーム 5 = 上限ちょうど。
+        let big = "x".repeat(crate::row_codec::MAX_SCALAR_PAYLOAD_LEN as usize - 10);
+        storage
+            .insert_typed_row(
+                "docs",
+                2,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text(big),
+                    RowCodecValue::Integer(2),
+                ],
+            )
+            .expect("insert max-size row");
+        let schema_before = storage.get_table_schema("docs").expect("schema");
+        let r1 = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row");
+        let r2 = storage
+            .get_row_from_table("docs", "tenant-a", 2)
+            .expect("row");
+        let generation = storage.table_generation("docs").expect("generation");
+
+        let err = storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect_err("rewrite must fail");
+        assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+
+        assert_eq!(
+            storage.get_table_schema("docs").expect("schema"),
+            schema_before
+        );
+        assert_eq!(
+            storage
+                .get_row_from_table("docs", "tenant-a", 1)
+                .expect("row"),
+            r1
+        );
+        assert_eq!(
+            storage
+                .get_row_from_table("docs", "tenant-a", 2)
+                .expect("row"),
+            r2
+        );
+        assert_eq!(
+            storage.table_generation("docs").expect("generation"),
+            generation
+        );
+    }
+
+    /// 行ストア未作成（既存行 0 件）のテーブルでも拡大変換は成功する（Issue #1361）。
+    #[test]
+    fn alter_column_type_widening_succeeds_on_table_without_rows() {
+        let path = unique_db_path("widen-int-empty");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("n", ColumnType::Integer, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect("widen");
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert_eq!(schema.columns[1].ty, ColumnType::BigInt);
     }
 
     /// 縮小・同一精度・異種型（`NUMERIC` 以外）への変更はいずれも

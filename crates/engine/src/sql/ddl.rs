@@ -717,7 +717,8 @@ pub(crate) fn execute_alter_table_drop_column(
 /// SQL-23、Issue #1167）。前提は [`execute_alter_table_drop_column`] と同じ。
 /// 判定順序: テーブル存在確認 → 目標型の解決（[`resolve_alter_target_type`]。
 /// 未登録 ENUM は `42601`）→ `catalog::Storage::alter_table_alter_column_type`
-/// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕）。
+/// （単一 write txn 内で NUMERIC 範囲検証〔`42601`〕→ 列・型互換性判定〔`42804`〕→
+/// 拡大変換なら全テナント既存行の再エンコード〔Issue #1361。PK／UNIQUE／FK 列は `2BP01`〕）。
 pub(crate) fn execute_alter_table_alter_column_type(
     storage: &Storage,
     stmt: &ValidatedAlterTableAlterColumnType,
