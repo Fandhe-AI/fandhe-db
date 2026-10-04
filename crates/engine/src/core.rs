@@ -6349,10 +6349,14 @@ impl EngineCore {
             bound.table(),
             self.hnsw_state.is_some(),
         );
+        // 式述語の数値列（Issue #1359）も `Declared` の宣言列照合へ加える。
         let metadata_filter_columns: Vec<Option<usize>> = bound
             .metadata_filters()
             .iter()
             .map(|f| Some(f.column_index()))
+            .chain(
+                crate::sql::scalar_plan::numeric_predicate_columns(bound.expr_filters()).map(Some),
+            )
             .collect();
         let scalar_plan = crate::sql::scalar_index::scalar_plan_under_target(
             scalar_plan_before_target,

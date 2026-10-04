@@ -268,7 +268,7 @@ FilterOp::TypedCompare`（`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` �
 `INTEGER`／`BIGINT`／`REAL`／`DOUBLE`（レーン A: 算術式・`sql::udf_call`／
 `sql::expr_program` 経由の `WHERE` 比較）は、`#891` の対象外として別 Issue
 （未着手）へ切り出されたままのため、引き続き `WHERE` 述語表現が SQL 表層に
-存在しない。この 4 型は本 Issue でも索引化しない。
+存在しない。この 4 型は本 Issue でも索引化しない（Issue #1359 で接続。下記参照）。
 
 ### 結線方式: `MetadataFilter` を型ごとに振り分ける単一入口
 
@@ -308,7 +308,8 @@ Issue #1257 で `OrderedColumnIndex::Bytes` へ接続した（末尾の「Issue 
 `NUMERIC`／`UUID`（レーン B。`candidates_for` から常に照会可能）は常に構築
 する一方、`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`（レーン A。`WHERE` 述語表現が
 まだ存在せず一度も照会されない）は `BOOLEAN` 等と同じ非索引化（`None`）へ
-構築を遅延させたまま維持する（未接続の索引だけが原因で既存の `TEXT`／
+構築を遅延させたまま維持する（Issue #1359 で接続し本番でも構築する。下記
+「Issue #1359」節。以下は #1359 以前の記述。未接続の索引だけが原因で既存の `TEXT`／
 `ENUM` 索引まで `MAX_SCALAR_INDEX_BYTES` 超過に巻き添えにしない。下記
 「レビュー対応」節の判断を踏襲）。レーン A 列の構築ロジックそのもの
 （`OrderedColumnIndex::I64`／`F64Sortable` の値変換・`2^53` ゲート等）を
@@ -441,3 +442,64 @@ fail-closed）。
 | `crates/engine/tests/scalar_index_typed_range.rs` | 契約 6 を「`BYTEA` も索引経路」へ改訂 |
 
 依存追加なし・`unsafe` なし・spec 本文転記なし。
+
+## Issue #1359: 数値列の比較述語での二次索引対応（レーン A の接続）
+
+ポインタ: TABLE-13・INDEX-5（`IN`／`BETWEEN` の脱糖は SQL-24・TASK-208。INDEX-7 との関係は下記）。
+
+Issue #1183 で `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列を `WHERE` の式で比較できるように
+なったが、`BoundExpr::Binary { 比較, ColumnRef, Number }` として `expr_filters` に
+入るため常に `PlainScan` だった。レーン A を接続し、等価・範囲比較を索引経路に載せる。
+
+### 述語の表現と分類
+
+- `sql::scalar_plan::ExprIndexPredicate`（`Id`／`NumericColumn`）が式側の索引対応述語の
+  唯一の表現。`collect_expr_index_predicates` は「全件が対応形なら全件、1 件でも非対応なら
+  `None`」を返す。旧 `id_predicate_from_expr` の `filter_map` は述語を黙って落とせ、
+  `mask_trusted_defer`／`count_star_only` の信頼経路で候補が上位集合になる fail-open の
+  余地があったため、関数を非公開にして呼び出し側（`exec`・`aggregate`・`group_by`）を
+  この収集口へ統一した。`None` は `FallbackNoIndex`（全走査）へ倒す。
+- 単独の数値列比較は既存の `IndexTypedRange`、2 件以上（`BETWEEN` は 2 本へ脱糖）は
+  `IndexConjunction`。`EXPLAIN` の語彙は増やさない。OR 群（`IN`）・算術式・列同士の比較は
+  従来どおり `PlainScan`。
+
+### 境界の導出
+
+評価側は `(v as f64) op literal` の素の f64 比較（NULL は偽）。
+
+- `INTEGER`／`BIGINT`（`I64` キー。索引の値域は `|v| <= 2^53`）: `numeric_i64_bounds` が
+  `±2^53` へ明示クランプして `i64` 区間を導出する（飽和キャストに頼らない）。非有限は `None`。
+- `REAL`／`DOUBLE`（`F64Sortable` キー）: リテラルを sortable bits へ写像し
+  `Included`／`Excluded` で区間化する。`-0.0` は評価で `0.0` と等しいため、索引キーと
+  リテラルの両方で `+0.0` へ正規化する。REAL は索引側も評価側も f64 へ広げてから比較する。
+- 性質テスト（`numeric_i64_bounds_matches_f64_comparison_property`・
+  `numeric_column_candidates_matches_f64_comparison_oracle`）と結合テスト
+  （`tests/scalar_index_numeric.rs`）で全走査との一致を固定した。
+
+### 構築（本番接続）と予算
+
+- `build_targeted` が数値 4 型の列を構築する。#1032 の指摘（未接続の索引が予算を食い
+  `TEXT` 索引まで `TooLarge` にする）への対策として、レーン A は `TEXT`／`ENUM`／レーン B の
+  予約の**後**に予約する（後置予約）。確保した配列は行走査と `TEXT` 索引の確定まで保持される
+  ため、確保量は `approx_bytes` と列別の予約額へ計上し、以降の予算検査が実メモリを見る。
+  予算の 1/2 を超える・確保に失敗する列は**その列だけ**非索引化（列単位 fail-soft）。計上に
+  よって後続の `TEXT` 等の予算検査が失敗する場合は、`check_budget_shedding_lane_a` が
+  レーン A 列を丸ごと解放して計上を `approx_bytes` から返還したうえで再検査し、既存の索引は
+  残す（超過時の解放）。
+- `BIGINT` が `2^53` を超える行、非有限の `REAL`／`DOUBLE` を含む列は索引から落ち、
+  `resolve_candidates` が `FallbackNoIndex` を返して全走査となり、全走査と同じ 22003 等の
+  エラー契約が維持される（信頼経路が行を評価しない fail-open を防ぐ連鎖）。
+
+### 宣言（INDEX-7）・`EXPLAIN` との関係
+
+数値 4 型は `CREATE INDEX` で宣言できない型のため、`Declared` では構築されない。
+`resolve_candidates` は数値列も候補評価前に静的検査（`expr_predicate_is_indexed`）し、
+`EXPLAIN` 側は `ExplainShape`／`scalar_plan_under_target` の列集合へ数値述語の列を加えて
+`PlainScan` へ降格する。`Auto` では分類結果がそのまま出る。`2^53` ゲート等で実行時に
+列が落ちた場合は `EXPLAIN`（静的）が索引経路を表示しても実行は全走査になるが、
+TEXT／BYTEA と同じ既知の乖離で結果の正しさには影響しない。
+
+### 対象外
+
+数値 4 型の `CREATE INDEX` 対応、`IN`／`NOT IN` の和集合計算、列同士の比較、算術式を含む
+式、選択度閾値の数値列専用調整。

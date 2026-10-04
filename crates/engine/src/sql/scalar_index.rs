@@ -199,6 +199,39 @@ fn check_scalar_index_budget(
     Ok(())
 }
 
+/// [`check_scalar_index_budget`] の検査に、レーン A（Issue #1359）の保持量が
+/// 加わって失敗する場合に限り、レーン A 列を丸ごと解放して計上を差し戻したうえで
+/// 再検査する。レーン A は構築中ずっと配列を保持するため予算へ計上するが、
+/// `TEXT` 等の既存索引を巻き添えにしない（列単位 fail-soft。codex-review P1・
+/// P2 対応・PR #1391）。`typed_col_reservation_bytes` は列別の計上額で、
+/// 解放時に返還して 0 に戻す。
+fn check_budget_shedding_lane_a(
+    approx_bytes: &mut usize,
+    additional: usize,
+    lane_a_columns: &mut Vec<usize>,
+    per_column_typed: &mut [Option<OrderedColumnIndex>],
+    typed_col_reservation_bytes: &mut [usize],
+) -> Result<(), ScalarIndexBuildError> {
+    if check_scalar_index_budget(*approx_bytes, additional).is_ok() {
+        return Ok(());
+    }
+    for &col_index in lane_a_columns.iter() {
+        // 走査中に別経路で既に除外・返還済みの列（`None`）は二重返還しない。
+        let Some(slot_acc) = per_column_typed.get_mut(col_index) else {
+            continue;
+        };
+        if slot_acc.take().is_none() {
+            continue;
+        }
+        if let Some(reserved) = typed_col_reservation_bytes.get_mut(col_index) {
+            *approx_bytes = approx_bytes.saturating_sub(*reserved);
+            *reserved = 0;
+        }
+    }
+    lane_a_columns.clear();
+    check_scalar_index_budget(*approx_bytes, additional)
+}
+
 /// `values`/`offsets`/`slots`/`equality`（[`TextColumnIndex`] の 4 配列）を
 /// 重複排除前の `pair_count` 件分だけ一括で `try_reserve_exact` する際に、
 /// **実際に確保される**構造体サイズ分のバイト量（codex-review P1 対応・
@@ -367,6 +400,18 @@ fn f64_to_sortable_bits(v: f64) -> u64 {
     }
 }
 
+/// `-0.0` を `+0.0` へ正規化する。式評価は f64 比較（`-0.0 == 0.0`）だが
+/// [`f64_to_sortable_bits`] は両者を別キーにするため、索引キーとリテラル
+/// 境界の双方でこれを通して評価と一致させる（保存時の不変条件にも依存しない
+/// 防御。Issue #1359）。
+fn normalize_zero(v: f64) -> f64 {
+    if v == 0.0 {
+        0.0
+    } else {
+        v
+    }
+}
+
 /// `UUID` の 16 バイト（ネットワークバイトオーダー）を `u128`（ビッグエンディアン
 /// 解釈）へ変換する。[`crate::uuid::Uuid`] の `Ord`（derive によるバイト列辞書順）
 /// と同じ大小関係になる（ビッグエンディアン変換はバイト列辞書順を保つ）。
@@ -496,7 +541,7 @@ fn push_typed_value(accum: &mut OrderedColumnIndex, value: &ScalarRef<'_>, slot:
             true
         }
         (OrderedColumnIndex::F64Sortable(acc), ScalarRef::Real(v)) => {
-            let widened = f64::from(*v);
+            let widened = normalize_zero(f64::from(*v));
             if !widened.is_finite() {
                 return false;
             }
@@ -507,7 +552,7 @@ fn push_typed_value(accum: &mut OrderedColumnIndex, value: &ScalarRef<'_>, slot:
             if !v.is_finite() {
                 return false;
             }
-            acc.push((f64_to_sortable_bits(*v), slot));
+            acc.push((f64_to_sortable_bits(normalize_zero(*v)), slot));
             true
         }
         (OrderedColumnIndex::I128(acc, _scale), ScalarRef::Numeric(d)) => {
@@ -854,19 +899,12 @@ impl ScalarIndex {
     /// レーン B——`declarative_filter::FilterOp::TypedCompare`。Issue #891・
     /// TASK-199 で production 結線済み）は、[`Self::candidates_for`] が
     /// `TypedCompare` 述語を直接照会できるため常に構築する。一方
-    /// `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列（レーン A——算術式・
-    /// `sql::udf_call`／`sql::expr_program` 経由の `WHERE` 比較。#891 の
-    /// 対象外として別 Issue へ切り出し済み・未着手）は、これらの型を
-    /// 対象にした `WHERE` 述語表現が SQL 表層にまだ存在せず
-    /// `resolve_candidates` から一度も照会されないため、構築自体を
-    /// 遅延させ `BOOLEAN` 等と同じ非索引化 (`None`) 扱いとする
-    /// （未接続の typed 索引だけが原因で `MAX_SCALAR_INDEX_BYTES` 超過に
-    /// より既存の `TEXT`／`ENUM` 索引まで巻き添えで `TooLarge`（plain scan
-    /// 縮退）になるのを防ぐ。codex-review P2 指摘・PR #1032）。レーン A の
-    /// 構築ロジック自体（`OrderedColumnIndex::I64`／`F64Sortable` の値
-    /// 変換・`2^53` ゲート等）を検証するテスト専用の入口は
-    /// [`Self::build_including_unwired_typed_range_columns`]（`#[cfg(test)]`）
-    /// を使う。
+    /// `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列（レーン A——`WHERE` の式述語
+    /// `<数値列> <op> <数値リテラル>`。Issue #1359 で接続）も構築する。
+    /// ただしレーン A は `TEXT`／`ENUM`／レーン B の予約後に後置で予約し、
+    /// 予算超過・確保失敗は列単位の fail-soft（その列だけ非索引化）にして、
+    /// 既存の `TEXT`／`ENUM` 索引を巻き添えで `TooLarge` にしない（#1032 の
+    /// codex-review P2 指摘への対策）。
     ///
     /// production 経路（`sql::exec`／`sql::aggregate`）は Issue #1065 以降
     /// [`Self::build_targeted`]（`ScalarIndexTarget::Auto`／`Declared` を
@@ -892,30 +930,6 @@ impl ScalarIndex {
     pub(crate) fn build_targeted(
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
-        target: ScalarIndexTarget<'_>,
-    ) -> Result<Self, ScalarIndexBuildError> {
-        Self::build_internal_targeted(schema, snapshot, false, target)
-    }
-
-    /// [`Self::build`] のうち、レーン A（`INTEGER`／`BIGINT`／`REAL`／
-    /// `DOUBLE`。まだ `WHERE` 述語表現を持たず production からは一度も
-    /// 照会されない）の順序索引構築ロジックそのものを検証するテスト専用の
-    /// 入口。production 経路（`sql::exec`／`sql::aggregate`／
-    /// `sql::group_by`）はレーン A 列を索引化しない [`Self::build`] を使い、
-    /// この入口は呼ばない（codex-review P2 指摘・PR #1032。レーン A の
-    /// `WHERE` 述語表現が実装され次第 [`Self::build`] 側へ合流する想定）。
-    #[cfg(test)]
-    fn build_including_unwired_typed_range_columns(
-        schema: &TableSchema,
-        snapshot: &SqlArenaSnapshot,
-    ) -> Result<Self, ScalarIndexBuildError> {
-        Self::build_internal_targeted(schema, snapshot, true, ScalarIndexTarget::Auto)
-    }
-
-    fn build_internal_targeted(
-        schema: &TableSchema,
-        snapshot: &SqlArenaSnapshot,
-        include_unwired_lane_a_columns: bool,
         target: ScalarIndexTarget<'_>,
     ) -> Result<Self, ScalarIndexBuildError> {
         let row_count = snapshot.arena().len();
@@ -975,6 +989,14 @@ impl ScalarIndex {
             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
         col_nonnull_count.resize(column_count, 0);
 
+        // レーン A（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`）列の後置予約対象
+        // （`(列添字, REAL/DOUBLE か)`）。他の索引の予算を食わないよう、列
+        // ループ後に列単位 fail-soft で予約する（Issue #1359）。
+        let mut deferred_lane_a: Vec<(usize, bool)> = Vec::new();
+        deferred_lane_a
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+
         for (col_index, column) in schema.columns.iter().enumerate() {
             // 宣言で絞り込む場合（`ScalarIndexTarget::Declared`）、宣言列に
             // 無い列は型に関わらず「列が索引未対応」（`per_column`／
@@ -1010,32 +1032,15 @@ impl ScalarIndex {
                     per_column.push(Some(acc));
                     per_column_typed.push(None);
                 }
-                // `INTEGER`／`BIGINT` 列（レーン A: 算術式・`sql::udf_call`／
-                // `sql::expr_program` 経由の `WHERE` 比較。#891 の対象外として
-                // 切り出し済み・未着手）は `WHERE` 述語表現が SQL 表層に
-                // まだ無く `resolve_candidates` から一度も照会されないため、
-                // production 経路（`include_unwired_lane_a_columns == false`）
-                // では構築自体を遅延させる（`Self::build` ドキュメント参照。
-                // codex-review P2・PR #1032）。構築ロジック自体は
-                // [`Self::build_including_unwired_typed_range_columns`]
-                // からのみ検証する。
+                // `INTEGER`／`BIGINT` 列（レーン A: `WHERE` の式述語
+                // `<数値列> <op> <数値リテラル>`。Issue #1359 で接続）は、
+                // `TEXT`／`ENUM`／レーン B の予約がすべて終わった後に
+                // 後置で予約する（`deferred_lane_a`。列ループの後ろの
+                // 「レーン A の後置予約」参照）。
                 ColumnType::Integer | ColumnType::BigInt => {
                     per_column.push(None);
-                    if !include_unwired_lane_a_columns {
-                        per_column_typed.push(None);
-                        continue;
-                    }
-                    let entry_size = std::mem::size_of::<(i64, u32)>();
-                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
-                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
-                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
-                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
-                        *slot = reservation_bytes;
-                    }
-                    let mut acc: Vec<(i64, u32)> = Vec::new();
-                    acc.try_reserve_exact(row_count)
-                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
-                    per_column_typed.push(Some(OrderedColumnIndex::I64(acc)));
+                    per_column_typed.push(None);
+                    deferred_lane_a.push((col_index, false));
                 }
                 // `DATE`／`TIMESTAMP` 列（レーン B:
                 // `declarative_filter::FilterOp::TypedCompare`。Issue #891・
@@ -1059,28 +1064,15 @@ impl ScalarIndex {
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column_typed.push(Some(OrderedColumnIndex::I64(acc)));
                 }
-                // `REAL`／`DOUBLE` 列（レーン A。上と同じ理由で production
-                // 経路では構築を遅延させる）は全順序比較可能な `u64` ビット
-                // 表現（[`f64_to_sortable_bits`]）で扱う。値は `scalar_float.rs`
-                // の不変条件（常に有限・`-0.0` は `+0.0` に正規化済み）を前提と
-                // するが、崩れていた場合は防御的に列単位で `None` へ縮退する。
+                // `REAL`／`DOUBLE` 列（レーン A。上と同じく後置予約）は全順序
+                // 比較可能な `u64` ビット表現（[`f64_to_sortable_bits`]）で扱う。
+                // 値は `scalar_float.rs` の不変条件（常に有限・`-0.0` は `+0.0`
+                // に正規化済み）を前提とするが、崩れていた場合は防御的に
+                // 列単位で `None` へ縮退する。
                 ColumnType::Real | ColumnType::Double => {
                     per_column.push(None);
-                    if !include_unwired_lane_a_columns {
-                        per_column_typed.push(None);
-                        continue;
-                    }
-                    let entry_size = std::mem::size_of::<(u64, u32)>();
-                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
-                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
-                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
-                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
-                        *slot = reservation_bytes;
-                    }
-                    let mut acc: Vec<(u64, u32)> = Vec::new();
-                    acc.try_reserve_exact(row_count)
-                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
-                    per_column_typed.push(Some(OrderedColumnIndex::F64Sortable(acc)));
+                    per_column_typed.push(None);
+                    deferred_lane_a.push((col_index, true));
                 }
                 // `NUMERIC(p, s)` 列（レーン B。production 結線済み）は列固定の
                 // `scale` のもとで `unscaled`（`i128`）の大小がそのまま値の
@@ -1159,6 +1151,53 @@ impl ScalarIndex {
             }
         }
 
+        // レーン A の後置予約（Issue #1359）。#1032 の codex P2 指摘（未接続の
+        // typed 索引が予算を食い既存の `TEXT` 索引まで `TooLarge` にする）への
+        // 対策として、(1) `TEXT`／`ENUM`／レーン B の予約後に行い、(2) 上限の
+        // 1/2 を超える・確保に失敗する列はその列だけ `None`（列単位 fail-soft。
+        // 構築全体は失敗させない）にする。確保した配列は行走査と `TEXT` 索引の
+        // 確定処理が終わるまで保持されるため、確保量は `approx_bytes` と列別の
+        // `typed_col_reservation_bytes` へ計上し（codex-review P1 対応・PR #1391）、
+        // 以降の予算検査が実メモリを見るようにする。計上によって後続の `TEXT`
+        // 予算検査が失敗する場合は、`check_budget_shedding_lane_a` がレーン A 列を
+        // 丸ごと解放して差し戻したうえで再検査する（既存索引を巻き添えにしない）。
+        let mut lane_a_columns: Vec<usize> = Vec::new();
+        for &(col_index, is_float) in &deferred_lane_a {
+            let entry_size = if is_float {
+                std::mem::size_of::<(u64, u32)>()
+            } else {
+                std::mem::size_of::<(i64, u32)>()
+            };
+            let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+            if approx_bytes.saturating_add(reservation_bytes) > MAX_SCALAR_INDEX_BYTES / 2 {
+                continue;
+            }
+            let accum = if is_float {
+                let mut acc: Vec<(u64, u32)> = Vec::new();
+                if acc.try_reserve_exact(row_count).is_err() {
+                    continue;
+                }
+                OrderedColumnIndex::F64Sortable(acc)
+            } else {
+                let mut acc: Vec<(i64, u32)> = Vec::new();
+                if acc.try_reserve_exact(row_count).is_err() {
+                    continue;
+                }
+                OrderedColumnIndex::I64(acc)
+            };
+            if lane_a_columns.try_reserve(1).is_err() {
+                continue;
+            }
+            if let Some(slot_acc) = per_column_typed.get_mut(col_index) {
+                *slot_acc = Some(accum);
+                approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                    *slot = reservation_bytes;
+                }
+                lane_a_columns.push(col_index);
+            }
+        }
+
         for slot in 0..row_count {
             let slot_u32 = u32::try_from(slot).map_err(|_| ScalarIndexBuildError::SlotOverflow)?;
             let metadata = snapshot
@@ -1222,10 +1261,16 @@ impl ScalarIndex {
                             }
                             continue;
                         }
+                        check_budget_shedding_lane_a(
+                            &mut approx_bytes,
+                            b.len(),
+                            &mut lane_a_columns,
+                            &mut per_column_typed,
+                            &mut typed_col_reservation_bytes,
+                        )?;
                         if let Some(Some(OrderedColumnIndex::Bytes(acc))) =
                             per_column_typed.get_mut(col_index)
                         {
-                            check_scalar_index_budget(approx_bytes, b.len())?;
                             let owned = try_owned_bytes(b)?;
                             approx_bytes = approx_bytes.saturating_add(b.len());
                             // 行数ちょうどを事前確保済み・1 行 1 回のみ push のため
@@ -1309,7 +1354,13 @@ impl ScalarIndex {
                     // 既に予算計上済みのため、ここでは文字列本体（ヒープ）の
                     // バイト量のみを追加計上する（二重計上を避ける）。
                     let additional = v_len;
-                    check_scalar_index_budget(approx_bytes, additional)?;
+                    check_budget_shedding_lane_a(
+                        &mut approx_bytes,
+                        additional,
+                        &mut lane_a_columns,
+                        &mut per_column_typed,
+                        &mut typed_col_reservation_bytes,
+                    )?;
                     let owned = try_owned_string(v)?;
                     approx_bytes = approx_bytes.saturating_add(additional);
                     // `acc` は列ごとに `row_count` ちょうどの容量を
@@ -1348,7 +1399,13 @@ impl ScalarIndex {
                     // 検証する（codex-review P1 対応・PR #569 未解決分。
                     // `text_column_reservation_bytes` 参照）。
                     let reservation_bytes = text_column_reservation_bytes(pair_count);
-                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    check_budget_shedding_lane_a(
+                        &mut approx_bytes,
+                        reservation_bytes,
+                        &mut lane_a_columns,
+                        &mut per_column_typed,
+                        &mut typed_col_reservation_bytes,
+                    )?;
                     approx_bytes = approx_bytes.saturating_add(reservation_bytes);
                     let mut values: Vec<String> = Vec::new();
                     values
@@ -1397,7 +1454,13 @@ impl ScalarIndex {
                         // `equality_bytes` 計上と対応）ため、複製前に同じ予算
                         // 検証を経る（codex-review P1 対応・PR #569）。
                         let additional = approx_string_entry_bytes(&value);
-                        check_scalar_index_budget(approx_bytes, additional)?;
+                        check_budget_shedding_lane_a(
+                            &mut approx_bytes,
+                            additional,
+                            &mut lane_a_columns,
+                            &mut per_column_typed,
+                            &mut typed_col_reservation_bytes,
+                        )?;
                         let equality_key = try_owned_string(&value)?;
                         approx_bytes = approx_bytes.saturating_add(additional);
                         equality
@@ -1490,7 +1553,17 @@ impl ScalarIndex {
             // 仮値。この構造体は `build` の外へ `0` のまま漏れ出さない。
             approx_bytes: 0,
         };
-        let computed_bytes = built.compute_approx_heap_bytes();
+        let mut computed_bytes = built.compute_approx_heap_bytes();
+        if computed_bytes > MAX_SCALAR_INDEX_BYTES && !lane_a_columns.is_empty() {
+            // レーン A 列が加わったことで上限を超えた場合は、既存の索引を
+            // 巻き添えにせずレーン A 列だけを外す（Issue #1359）。
+            for &col_index in &lane_a_columns {
+                if let Some(slot_acc) = built.typed_columns.get_mut(col_index) {
+                    *slot_acc = None;
+                }
+            }
+            computed_bytes = built.compute_approx_heap_bytes();
+        }
         if computed_bytes > MAX_SCALAR_INDEX_BYTES {
             return Err(ScalarIndexBuildError::TooLarge);
         }
@@ -1928,6 +2001,66 @@ impl ScalarIndex {
         }
     }
 
+    /// 数値列（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`。Issue #1359）の単純比較
+    /// `(v as f64) op literal` に一致する候補スロット（昇順）を返す。評価側
+    /// （`sql::udf_call` の f64 比較）と厳密に同値な区間を導出する。列が未索引
+    /// （`2^53` ゲート・非有限値・予算・宣言で対象外）・variant 不一致・非有限
+    /// リテラルは `None`（判定不能＝呼び出し元は全走査へ縮退する。「一致 0 件」
+    /// とは区別する）。`NULL` 行は索引に載らないため候補に入らない（評価でも
+    /// `NULL` 比較は偽）。
+    fn numeric_column_candidates(
+        &self,
+        column_index: usize,
+        op: crate::sql::udf_call::BinOp,
+        literal: f64,
+    ) -> Option<Vec<u32>> {
+        use std::ops::Bound;
+        match self.typed_columns.get(column_index)?.as_ref()? {
+            OrderedColumnIndex::I64(pairs) => {
+                let (lower, upper) = crate::sql::scalar_plan::numeric_i64_bounds(op, literal)?;
+                range_slots(pairs, lower, upper)
+            }
+            OrderedColumnIndex::F64Sortable(pairs) => {
+                if !literal.is_finite() {
+                    return None;
+                }
+                use crate::sql::udf_call::BinOp;
+                let k = f64_to_sortable_bits(normalize_zero(literal));
+                let (lower, upper) = match op {
+                    BinOp::Eq => (Bound::Included(k), Bound::Included(k)),
+                    BinOp::Gt => (Bound::Excluded(k), Bound::Unbounded),
+                    BinOp::Ge => (Bound::Included(k), Bound::Unbounded),
+                    BinOp::Lt => (Bound::Unbounded, Bound::Excluded(k)),
+                    BinOp::Le => (Bound::Unbounded, Bound::Included(k)),
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
+                };
+                range_slots(pairs, lower, upper)
+            }
+            _ => None,
+        }
+    }
+
+    /// `expr_preds` の数値列が実際に索引化されているかを、値に依存せず構造だけで
+    /// 判定する（[`Self::filter_column_is_indexed`] の式述語版。Issue #1359）。
+    fn expr_predicate_is_indexed(
+        &self,
+        pred: &crate::sql::scalar_plan::ExprIndexPredicate,
+    ) -> bool {
+        match pred {
+            // `id_index` は宣言の有無によらず構築され、`None`（`2^53` 超過）の
+            // 場合は候補評価で `FallbackNoIndex` になる。
+            crate::sql::scalar_plan::ExprIndexPredicate::Id(_) => true,
+            crate::sql::scalar_plan::ExprIndexPredicate::NumericColumn { column_index, .. } => {
+                matches!(
+                    self.typed_columns.get(*column_index),
+                    Some(Some(
+                        OrderedColumnIndex::I64(_) | OrderedColumnIndex::F64Sortable(_)
+                    ))
+                )
+            }
+        }
+    }
+
     /// `metadata_filters`（`TEXT` 列の等価・前方一致）と `id_preds`（`id` の
     /// 単純比較。`sql::scalar_plan::classify_scalar_plan` が
     /// `ScalarPlan::PlainScan` 以外へ分類した述語のみを渡す契約）から候補
@@ -1959,9 +2092,9 @@ impl ScalarIndex {
     pub(crate) fn resolve_candidates(
         &self,
         metadata_filters: &[MetadataFilter],
-        id_preds: &[crate::sql::scalar_plan::IdPredicate],
+        expr_preds: &[crate::sql::scalar_plan::ExprIndexPredicate],
     ) -> CandidateResolution {
-        if metadata_filters.is_empty() && id_preds.is_empty() {
+        if metadata_filters.is_empty() && expr_preds.is_empty() {
             // `classify_scalar_plan` が `PlainScan` 以外を返す限り到達しない
             // 呼び出し規約違反だが、防御的に fail-closed へ倒す。
             return CandidateResolution::FallbackNoIndex;
@@ -1975,6 +2108,15 @@ impl ScalarIndex {
             // 全走査へ倒す。値・述語順序に依存しない静的判定のため、後続の
             // ループの早期打ち切り（交差が空集合になった時点で打ち切る
             // 最適化）が宣言外列の判定を隠してしまうことがない。
+            return CandidateResolution::FallbackNoIndex;
+        }
+        // 式述語側の数値列も同じく静的に検査する（Issue #1359。`Declared` では
+        // 数値列は構築されないため、先行述語の交差が空になっても `EXPLAIN` の
+        // 静的判定と食い違わないようにする）。
+        if expr_preds
+            .iter()
+            .any(|pred| !self.expr_predicate_is_indexed(pred))
+        {
             return CandidateResolution::FallbackNoIndex;
         }
         // 述語ごとの候補列を全件 `Vec<Vec<u32>>` に集めてから交差する実装は、
@@ -2013,16 +2155,25 @@ impl ScalarIndex {
                 },
             });
         }
-        for pred in id_preds {
+        for pred in expr_preds {
             if accumulated.as_deref().is_some_and(<[u32]>::is_empty) {
                 break;
             }
-            let Some((lower, upper)) = crate::sql::scalar_plan::id_bounds(pred) else {
-                return CandidateResolution::FallbackNoIndex;
+            let slots = match pred {
+                crate::sql::scalar_plan::ExprIndexPredicate::Id(id_pred) => {
+                    let Some((lower, upper)) = crate::sql::scalar_plan::id_bounds(id_pred) else {
+                        return CandidateResolution::FallbackNoIndex;
+                    };
+                    self.candidates_id_range(lower, upper)
+                }
+                crate::sql::scalar_plan::ExprIndexPredicate::NumericColumn {
+                    column_index,
+                    op,
+                    literal,
+                } => self.numeric_column_candidates(*column_index, *op, *literal),
             };
-            let slots = match self.candidates_id_range(lower, upper) {
-                Some(slots) => slots,
-                None => return CandidateResolution::FallbackNoIndex,
+            let Some(slots) = slots else {
+                return CandidateResolution::FallbackNoIndex;
             };
             accumulated = Some(match accumulated {
                 None => slots,
@@ -4177,8 +4328,7 @@ mod tests {
         }
 
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
-            .expect("build index");
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
 
         // 列ごとに全行を brute force でスキャンし、`>=` 境界（各列の中央値
         // 相当）で候補を求めるオラクルと索引の結果を突き合わせる。
@@ -4460,15 +4610,12 @@ mod tests {
     }
 
     /// production 経路が実際に呼ぶ [`ScalarIndex::build`] は、レーン B
-    /// （`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`。`FilterOp::TypedCompare` で
-    /// production 結線済み——Issue #891・TASK-199）の順序索引を構築する
-    /// 一方、レーン A（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`。まだ `WHERE`
-    /// 述語表現を持たず一度も照会されない）は `BOOLEAN` 等と同じ非索引化の
-    /// ままであることを固定する。未接続のレーン A 列構築が既存の索引の
-    /// 予算・可用性を巻き添えにしない（codex-review P2 指摘・PR #1032）
-    /// という不変条件が、レーン B 接続後も維持されていることを示す。
+    /// （`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`）に加え、レーン A
+    /// （`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`。Issue #1359 で `WHERE` の
+    /// 式述語 `<数値列> <op> <数値リテラル>` へ接続）の順序索引も構築する。
+    /// `BOOLEAN` は引き続き非索引化。
     #[test]
-    fn build_indexes_lane_b_but_defers_unwired_lane_a_typed_range_columns() {
+    fn build_indexes_lane_a_and_lane_b_typed_range_columns() {
         let db_path = unique_db_path("scalar-index-typed-lane-split");
         let _guard = CleanupGuard(db_path.clone());
         let storage = Storage::open(&db_path).expect("open storage");
@@ -4490,28 +4637,139 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        // production 経路と同じ既定入口。
         let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
-        for name in ["n", "big", "r", "d"] {
-            let col = typed_col(&schema, name);
-            assert!(
-                !index.typed_column_is_indexed(col),
-                "column {name} (lane A) must stay unindexed via the default build() \
-                 entry until a WHERE predicate representation exists for it"
-            );
-        }
-        for name in ["dt", "ts", "num", "uid"] {
+        for name in ["n", "big", "r", "d", "dt", "ts", "num", "uid"] {
             let col = typed_col(&schema, name);
             assert!(
                 index.typed_column_is_indexed(col),
-                "column {name} (lane B) must be indexed via the default build() \
-                 entry now that TypedCompare is wired to production (Issue #891)"
+                "column {name} must be indexed via the default build() entry"
             );
         }
+        assert!(!index.typed_column_is_indexed(typed_col(&schema, "flag")));
     }
 
-    /// `NULL` はいずれの typed 列索引にもエントリを作らない
-    /// （`TextColumnIndex` と同じ契約。モジュールドキュメント参照）。
+    /// Issue #1359: `numeric_column_candidates` が 4 型・全演算子で評価側の
+    /// f64 比較（全走査オラクル）と一致する。`-0.0`・負値・小数リテラル・
+    /// `NULL` 行を含む。
+    #[test]
+    fn numeric_column_candidates_matches_f64_comparison_oracle() {
+        use crate::sql::udf_call::BinOp;
+        let db_path = unique_db_path("scalar-index-numeric-candidates");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        let ints: [Option<i32>; 9] = [
+            Some(-3),
+            Some(0),
+            Some(1),
+            Some(5),
+            Some(6),
+            None,
+            Some(i32::MAX),
+            Some(i32::MIN),
+            Some(5),
+        ];
+        let reals: [Option<f32>; 9] = [
+            Some(-0.0),
+            Some(0.0),
+            Some(0.1),
+            Some(-1.5),
+            Some(2.5),
+            None,
+            Some(f32::MAX),
+            Some(-f32::MAX),
+            Some(0.1),
+        ];
+        let doubles: [Option<f64>; 9] = [
+            Some(-0.0),
+            Some(0.0),
+            Some(1e-300),
+            Some(-1.5),
+            Some(2.5),
+            None,
+            Some(1e300),
+            Some(-1e300),
+            Some(2.5),
+        ];
+        for i in 0..9usize {
+            insert_typed(
+                &storage,
+                &c,
+                (i as u64) + 1,
+                ints[i],
+                ints[i].map(i64::from),
+                reals[i],
+                doubles[i],
+                None,
+                None,
+                None,
+                None,
+                None,
+                Visibility::Public,
+            );
+        }
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        let ids = snapshot.arena().ids().to_vec();
+        let slot_of = |id: u64| ids.iter().position(|&x| x == id).expect("slot") as u32;
+        let literals = [
+            0.0,
+            -0.0,
+            0.1,
+            -1.5,
+            2.5,
+            5.0,
+            5.5,
+            -3.0,
+            1e300,
+            -1e300,
+            2147483647.0,
+            -2147483648.0,
+            f64::from(0.1f32),
+        ];
+        let cases: [(&str, Vec<Option<f64>>); 4] = [
+            ("n", ints.iter().map(|v| v.map(f64::from)).collect()),
+            ("big", ints.iter().map(|v| v.map(f64::from)).collect()),
+            ("r", reals.iter().map(|v| v.map(f64::from)).collect()),
+            ("d", doubles.to_vec()),
+        ];
+        for (name, values) in &cases {
+            let col = typed_col(&schema, name);
+            for &literal in &literals {
+                for op in [BinOp::Gt, BinOp::Lt, BinOp::Ge, BinOp::Le, BinOp::Eq] {
+                    let mut expected: Vec<u32> = values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, v)| {
+                            let x = (*v)?;
+                            let hit = match op {
+                                BinOp::Gt => x > literal,
+                                BinOp::Lt => x < literal,
+                                BinOp::Ge => x >= literal,
+                                BinOp::Le => x <= literal,
+                                _ => x == literal,
+                            };
+                            hit.then(|| slot_of((i as u64) + 1))
+                        })
+                        .collect();
+                    expected.sort_unstable();
+                    let actual = index
+                        .numeric_column_candidates(col, op, literal)
+                        .expect("indexed numeric column");
+                    assert_eq!(actual, expected, "col={name} op={op:?} literal={literal}");
+                }
+            }
+            assert!(index
+                .numeric_column_candidates(col, BinOp::Eq, f64::NAN)
+                .is_none());
+        }
+        // 未索引列（`BOOLEAN`）は判定不能。
+        assert!(index
+            .numeric_column_candidates(typed_col(&schema, "flag"), BinOp::Eq, 1.0)
+            .is_none());
+    }
+
     #[test]
     fn typed_columns_exclude_null_rows() {
         let db_path = unique_db_path("scalar-index-typed-null");
@@ -4550,8 +4808,7 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
-            .expect("build index");
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
         let n_col = typed_col(&schema, "n");
         let all = index
             .candidates_typed_range(n_col, Bound::Unbounded, Bound::Unbounded)
@@ -4602,8 +4859,7 @@ mod tests {
             Visibility::Private,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &tenant_a);
-        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
-            .expect("build index");
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
         let n_col = typed_col(&schema, "n");
         let all = index
             .candidates_typed_range(n_col, Bound::Unbounded, Bound::Unbounded)
@@ -4640,8 +4896,7 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
-            .expect("build index");
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
         let flag_col = typed_col(&schema, "flag");
         let embedding_col = typed_col(&schema, "embedding");
         assert!(!index.typed_column_is_indexed(flag_col));
@@ -4699,8 +4954,7 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
-            .expect("build index");
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
         let n_col = typed_col(&schema, "n");
         let big_col = typed_col(&schema, "big");
         let ts_col = typed_col(&schema, "ts");
@@ -4760,8 +5014,7 @@ mod tests {
             Visibility::Public,
         );
         let (snapshot, schema) = typed_snapshot_from(&storage, &c);
-        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
-            .expect("build index");
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
         let big_col = typed_col(&schema, "big");
         assert!(
             index.typed_column_is_indexed(big_col),
@@ -4778,8 +5031,7 @@ mod tests {
     /// で production 結線済み。Issue #893 production 接続）を、`id_preds` と
     /// 同じ交差契約で絞ることを固定する。`Self::candidates_for` が
     /// `TypedCompare` を内部で `self.typed_columns` へ振り向けることの
-    /// 統合的な検証（`build()` 経由——`build_including_unwired_typed_range_
-    /// columns` は使わない——production 経路と同一の入口）。
+    /// 統合的な検証（`build()` 経由）。
     #[test]
     fn resolve_candidates_intersects_typed_compare_with_metadata_filter() {
         let db_path = unique_db_path("scalar-index-typed-resolve-candidates");
@@ -4867,8 +5119,7 @@ mod tests {
             c.clone(),
             table_generation,
         );
-        // production 経路と同一の既定入口（`build_including_unwired_typed_
-        // range_columns` ではない）。
+        // production 経路と同一の既定入口。
         let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
 
         let kind_filter = MetadataFilter_equals(&schema, "kind", "alpha");

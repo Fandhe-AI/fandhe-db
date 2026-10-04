@@ -231,10 +231,14 @@ impl FilterColumnSet {
         *word |= 1u64 << (column_index % 64);
     }
 
-    fn from_filters(filters: &[MetadataFilter]) -> Self {
+    /// `metadata_filters` の列に、式述語の数値列（Issue #1359）を加えた集合。
+    fn from_filters(filters: &[MetadataFilter], exprs: &[BoundExpr]) -> Self {
         let mut set = Self::empty();
         for filter in filters {
             set.insert(filter.column_index());
+        }
+        for column_index in crate::sql::scalar_plan::numeric_predicate_columns(exprs) {
+            set.insert(column_index);
         }
         set
     }
@@ -348,7 +352,7 @@ impl ExplainShape {
             scalar_plan,
             filter_cols,
             filter_cols_overflow,
-            filter_columns: FilterColumnSet::from_filters(metadata_filters),
+            filter_columns: FilterColumnSet::from_filters(metadata_filters, expr_filters),
         }
     }
 
