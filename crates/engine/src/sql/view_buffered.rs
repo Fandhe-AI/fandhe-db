@@ -109,6 +109,10 @@ struct OrderKeyPlan {
 struct FilterPlan {
     bound: super::parser::BoundScan,
     types: Vec<Option<ColumnType>>,
+    /// 述語が参照する結果列か（`types` と同じ位置。大文字小文字無視の名前一致で
+    /// 判定し、取りこぼしより過剰側へ倒す）。未参照列は評価に使われないため
+    /// 値域変換（`22003`）の対象にしない。
+    referenced: Vec<bool>,
 }
 
 /// 外側の後処理の計画（[`plan_outer`] が Execute・Describe で共有する）。
@@ -230,7 +234,19 @@ fn plan_filter(
         order_keys: Vec::new(),
     };
     let bound = super::parser::bind_scan(&scan, &schema, udfs)?;
-    Ok(Some(FilterPlan { bound, types }))
+    let referenced = body_columns
+        .iter()
+        .map(|m| {
+            idents
+                .iter()
+                .any(|ident| column_name(m).eq_ignore_ascii_case(ident))
+        })
+        .collect();
+    Ok(Some(FilterPlan {
+        bound,
+        types,
+        referenced,
+    }))
 }
 
 /// 外側 `ORDER BY` のキーを本文の結果列名で解決する。未知列は `22000`、同名の結果列が
@@ -313,10 +329,17 @@ fn row_matches(
 ) -> Result<bool, SqlSurfaceError> {
     let mut normalized: Vec<Option<std::borrow::Cow<'_, Cell>>> =
         Vec::with_capacity(plan.types.len());
-    for (cell, ty) in row.cells.iter().zip(plan.types.iter()) {
+    for ((cell, ty), referenced) in row
+        .cells
+        .iter()
+        .zip(plan.types.iter())
+        .zip(plan.referenced.iter())
+    {
+        // 述語が参照しない列は変換しない（`i64::MAX` 超の `COUNT` 等が未参照列に
+        // あっても、その列を使わない述語を `22003` で失敗させない）。
         normalized.push(match ty {
-            Some(ty) => Some(normalize_cell(cell, ty)?),
-            None => None,
+            Some(ty) if *referenced => Some(normalize_cell(cell, ty)?),
+            _ => None,
         });
     }
     // 疑似列 `id` は合成スキーマの実列（本文が公開する `id` 結果列）としてだけ参照
@@ -655,6 +678,21 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn unreferenced_overflowing_column_does_not_fail_where() {
+        let mut r = result();
+        if let Some(row) = r.rows.get_mut(0) {
+            row.cells[1] = Cell::Integer(u64::MAX);
+        }
+        let preds = vec![WherePredicate::Equality {
+            column: "a".to_string(),
+            value: "r0".to_string(),
+        }];
+        let out = run(r, &view(Projection::All, preds, vec![], 10, 0)).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].cells[1], Cell::Integer(u64::MAX));
     }
 
     #[test]
