@@ -351,6 +351,25 @@ fn projection_subquery_nested_where_runtime_error_is_deferred() {
     assert_eq!(code(&core, &ctx, &some), "22003");
 }
 
+/// 入れ子 WHERE の実行時エラーを遅延しても、同じ WHERE の静的な誤り（未知列）と
+/// 外側の静的な誤りは、外側が 0 行でも必ず返る（可視データで契約が変わらない）。
+#[test]
+fn projection_subquery_static_errors_win_over_deferred_runtime_error() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "big1", Some(i64::MAX));
+    ins(&core, &ctx, REFS, 6, "big2", Some(i64::MAX));
+    let overflow = format!("qty = (SELECT SUM(qty) FROM {REFS} WHERE qty > 100)");
+    let inner_static = format!("(SELECT name FROM {REFS} WHERE nope = 1 AND {overflow} LIMIT 1)");
+    let q = format!("SELECT name, {inner_static} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &q), "22000");
+    let inner = format!("(SELECT name FROM {REFS} WHERE {overflow} LIMIT 1)");
+    let outer_static = format!("SELECT nope, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &outer_static), "22000");
+}
+
 #[test]
 fn projection_subquery_alias_of_id_keeps_numeric_type() {
     let (core, path) = new_core();

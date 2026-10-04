@@ -5348,6 +5348,9 @@ impl EngineCore {
                 // `read_txn`・同じ `ctx`（RLS 暗黙適用）で解決し、束縛へは項目を空にして
                 // 渡す。解決結果は外側の走査結果へ SELECT リスト上の位置で合流する。
                 let projection_items = std::mem::take(&mut validated.scalar_subquery_items);
+                // 外側の静的な束縛・検証を内側の実行より先に行う（外側の誤りが内側の
+                // 可視データに依存するエラーで覆われないようにする）。
+                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
                 let resolved_items = crate::sql::subquery::resolve_scalar_projection_items(
                     &projection_items,
                     &[&schema],
@@ -5358,7 +5361,6 @@ impl EngineCore {
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
-                let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
                 let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
                 let result =
                     crate::sql::subquery::merge_scalar_projection_items(result, resolved_items)?;

@@ -560,6 +560,13 @@ fn execute_inner_scan_statement(
     // 自身の WHERE に含まれるさらに深いサブクエリを、束縛（`bind_scan`）の前に
     // 解決する（深さ優先。`depth` は構文解析段で `MAX_SUBQUERY_DEPTH` 検査
     // 済みのため、ここでは budget のみ検査すれば足りる）。
+    // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
+    let static_preds: Vec<WherePredicate> = validated
+        .where_predicates
+        .iter()
+        .filter(|p| !predicate_contains_subquery(p))
+        .cloned()
+        .collect();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
     validated.where_predicates = match resolve_where_predicates(
@@ -576,11 +583,13 @@ fn execute_inner_scan_statement(
         Err(e) => {
             // 入れ子 WHERE サブクエリの実行時データ例外は、投影位置の外側が行数判明まで
             // 遅延できるよう、投影メタデータ（WHERE に依存しない）を先に確定する。
+            // 内側 WHERE の静的な誤り（未知列等）はデータ依存の実行時エラーより優先して
+            // 返す（可視データで契約が変わらないよう、サブクエリを含まない述語は
+            // 束縛検証を完了させる）。
             if intent == InnerScanIntent::ScalarValue {
-                validated.where_predicates = Vec::new();
-                if let Ok(bound) = super::parser::bind_scan(&validated, &inner_schema, udfs) {
-                    *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
-                }
+                validated.where_predicates = static_preds;
+                let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+                *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
             }
             return Err(e);
         }
@@ -643,6 +652,13 @@ fn execute_inner_aggregate_statement(
         &inner_schema,
         outer_scopes,
     )?;
+    // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
+    let static_preds: Vec<WherePredicate> = validated
+        .where_predicates
+        .iter()
+        .filter(|p| !predicate_contains_subquery(p))
+        .cloned()
+        .collect();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
     validated.where_predicates = match resolve_where_predicates(
@@ -658,10 +674,9 @@ fn execute_inner_aggregate_statement(
         Ok(p) => p,
         Err(e) => {
             // スキャン側と同じ理由で、入れ子 WHERE の失敗時も投影メタデータを確定する。
-            validated.where_predicates = Vec::new();
-            if let Ok(bound) = super::parser::bind_aggregate(&validated, &inner_schema, udfs) {
-                *meta_sink = Some(super::describe::aggregate_columns(&bound));
-            }
+            validated.where_predicates = static_preds;
+            let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
+            *meta_sink = Some(super::describe::aggregate_columns(&bound));
             return Err(e);
         }
     };
@@ -677,6 +692,20 @@ fn execute_inner_aggregate_statement(
         None,
         None,
     )
+}
+
+/// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
+/// 入れ子 WHERE の実行時エラー時に、サブクエリを含まない述語だけで静的検証を
+/// 完了させるために使う（`execute_inner_query` 系から呼ばれる）。
+fn predicate_contains_subquery(pred: &WherePredicate) -> bool {
+    match pred {
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => true,
+        WherePredicate::Not(inner) => predicate_contains_subquery(inner),
+        WherePredicate::Or(branches) => branches.iter().flatten().any(predicate_contains_subquery),
+        _ => false,
+    }
 }
 
 /// `outer_scopes` の末尾（＝サブクエリを含む文自身のテーブル）を返す。
