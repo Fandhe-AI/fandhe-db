@@ -4859,11 +4859,12 @@ impl EngineCore {
                 )?;
                 match body_columns {
                     Some(cols) => {
-                        let (_, metas) = crate::sql::view_buffered::resolve_projection(
+                        let plan = crate::sql::view_buffered::plan_outer(
                             &cols,
-                            &validated.projection,
+                            validated,
+                            session.udfs(),
                         )?;
-                        Ok(Some(metas))
+                        Ok(Some(plan.columns().to_vec()))
                     }
                     None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                         detail: "internal error".to_string(),
@@ -5364,22 +5365,19 @@ impl EngineCore {
             // だけを適用する。作成者の可視性は引き継がれない（`ctx` は参照者の
             // もの）。第 2 の実行器は作らない。
             crate::sql::allowlist::Statement::BufferedView(validated) => {
-                let crate::sql::allowlist::ValidatedBufferedView {
-                    body,
-                    projection,
-                    limit,
-                    offset,
-                    ..
-                } = validated;
-                match self.execute_read_statement(ctx, session, *body, read_txn)? {
+                let body = (*validated.body).clone();
+                match self.execute_read_statement(ctx, session, body, read_txn)? {
                     crate::sql::SqlOutcome::Query(result) => {
-                        let sliced = crate::sql::view_buffered::project_and_slice(
-                            result,
-                            &projection,
-                            limit,
-                            offset,
+                        // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は
+                        // 評価済みの本文結果に対する後処理（Describe と同じ
+                        // `plan_outer` で束縛する）。
+                        let plan = crate::sql::view_buffered::plan_outer(
+                            &result.columns,
+                            &validated,
+                            session.udfs(),
                         )?;
-                        Ok(crate::sql::SqlOutcome::Query(sliced))
+                        let processed = crate::sql::view_buffered::apply_outer(result, &plan)?;
+                        Ok(crate::sql::SqlOutcome::Query(processed))
                     }
                     _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                         detail: "internal error".to_string(),

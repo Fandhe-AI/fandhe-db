@@ -79,16 +79,40 @@ RLS-10 (b)・ERR-6。spec 本文は転記しない。
 
 ### 評価後射影形ビューを参照するクエリ
 
-外側クエリは `SELECT <* | 列名リスト> FROM <view> LIMIT n [OFFSET m]` のみ
-（`Statement::BufferedView`。破壊的変更: 公開 enum への variant 追加）。外側の
-`WHERE`／`ORDER BY`／集計／ウィンドウ項目・式項目は `42601`。列指定が本文の結果列に
+外側クエリは `SELECT <* | 列名リスト> FROM <view> [WHERE ...] [ORDER BY <列>, ...]
+LIMIT n [OFFSET m]`（`Statement::BufferedView`。破壊的変更: 公開 enum への variant
+追加）。外側の `WHERE`／`ORDER BY` は Phase 3（Issue #1360）で受理側へ移った
+（下記）。集計・`DISTINCT`・ウィンドウ項目・式項目は `42601`。列指定が本文の結果列に
 無ければ `22000`、本文に同名の結果列が複数あって一意に決まらなければ `42702`
-（PostgreSQL は作成時に拒否するが、本実装は参照時に拒否する差異）。後処理では
-ソートせず、本文が固定した順序をそのまま保つ。`EXPLAIN`・cursor の `DECLARE`・
-サブクエリの内側・CTE・集合演算の枝・JOIN の辺・`validate_statement` からの
-参照は `42601`。明示トランザクション内では他の読み取り文と同じく、未 commit の
-変更を読む経路で本文を評価する。拡張クエリの Describe は本文の列メタデータを
-導出して外側の射影だけを適用する（本文は実行しない）。
+（PostgreSQL は作成時に拒否するが、本実装は参照時に拒否する差異）。`EXPLAIN`・
+cursor の `DECLARE`・サブクエリの内側・CTE・集合演算の枝・JOIN の辺・
+`validate_statement` からの参照は `42601`。明示トランザクション内では他の読み取り文と
+同じく、未 commit の変更を読む経路で本文を評価する。拡張クエリの Describe は
+本文の列メタデータを導出して外側の後処理を束縛する（本文は実行しない）。
+
+### 外側の `WHERE`・`ORDER BY`（評価済みセルに対する後処理）
+
+本文を参照者の `ctx` で実行して得た結果行（評価済みセル）に対し、
+`sql::view_buffered::plan_outer`（Execute・Describe 共通）が束縛し、`apply_outer` が
+`WHERE` → `ORDER BY` → `OFFSET`／`LIMIT` → 射影の順に適用する（PostgreSQL と同じ。
+**本文の `LIMIT` の後で絞り込む**）。第 2 の評価器は作らず、既存部品を再利用する。
+
+- `WHERE`: 本文の結果列から合成した `TableSchema` に既存の `bind_scan` で束縛する。
+  受理するのは宣言的な葉（`=`・`LIKE`・BOOLEAN・比較・`IN`・`BETWEEN`・`IS [NOT] NULL`）・
+  式述語（整数・浮動小数の比較は式として解析される）・`NOT`／`OR`。UDF 述語・サブクエリ
+  は `42601`。評価は `sql::join::values` の `cell_scalar`（評価済みセル→`ScalarRef`）と
+  既存の宣言的フィルタ・式プログラムを使う。集計本文の `COUNT` 等が持つ
+  `Cell::Integer(u64)` は、列の宣言型に合わせて符号付き整数・十進数・浮動小数へ正規化する
+  （範囲外は `22003`。黙って NULL にしない）。
+- `ORDER BY`: 本文の結果列名で解決する列キーのみ（式キーは `42601`）。比較は
+  `sql::join::values` の比較部品（NULL は昇順で末尾・降順で先頭）。`sort_by`（安定）で
+  並べ、同値の行は本文の順序を保つ（`sort_unstable*` は使わない）。
+- 列の解決: 参照できるのは本文の**結果列**だけ。未知の列は `22000`、同名の結果列が複数あれば
+  `42702`、並べ替え・比較できない型（`VECTOR`・`ARRAY` 等）は `22000`。疑似列 `id` は本文が
+  `id` を結果列として公開しているときだけ参照でき（式述語の `id` はその結果列の値）、
+  公開していない本文では `22000`（ビューが公開しない物理キーでの絞り込みを許さない）。
+- 資源: 後処理の対象は本文の結果行（既存の予算で上限済み）で、並べ替えキーは
+  「行数 × キー数」の比較値だけ。
 
 ### 連鎖・依存関係
 
@@ -253,11 +277,13 @@ body のリテラル値・破損理由の詳細をクライアントへ運ばな
 - ~~集計形の body、LIMIT／`ORDER BY` 付きの body~~・~~ビューを対象にした集計~~
   は Phase 2（Issue #1192）で対応済み（上記節参照）。ビューを対象にした
   ベクトル検索（`Statement::Select`）は仕様上も対象外。
-- Phase 2 の申し送り: 評価後射影形ビューに対する外側の `WHERE`／`ORDER BY`／集計／
-  ウィンドウ関数（評価済みセルを評価する仕組みが必要）、評価後射影形の連鎖、本文での
-  CTE・集合演算・サブクエリ・ウィンドウ関数・式項目・UDF 述語、3 テーブル以上の
-  JOIN 本文と JOIN の辺のビュー、評価後射影形ビューへの cursor `DECLARE`／
-  `EXPLAIN`。
+- Phase 2 の申し送りのうち、外側の `WHERE`／`ORDER BY`、本文での CTE・集合演算・
+  サブクエリ、3 テーブル以上の JOIN 本文は Phase 3（Issue #1360）で対応済み。残り:
+  評価後射影形ビューへの外側の集計・`DISTINCT`（評価済みセルに対する集計計画が必要）・
+  ウィンドウ関数・式による `ORDER BY`・外側の UDF 述語・サブクエリ、評価後射影形の連鎖、
+  本文でのウィンドウ関数・式項目・UDF 述語、JOIN の辺のビュー、評価後射影形ビューへの
+  cursor `DECLARE`／`EXPLAIN`、サブクエリ付き本文を参照するクエリの Describe（サブクエリ付き
+  SELECT 自体が Describe 未対応のため `42601`）。
 - 許可名の述語呼び出し（`WherePredicate::PredicateCall`。空引数の呼び出し形
   で列参照を持たない）のビュー越し列スコープ検査。なお式項目
   （`SelectItem::Expr`）・式述語（`WherePredicate::Expression`）は
