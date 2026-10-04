@@ -199,6 +199,39 @@ fn check_scalar_index_budget(
     Ok(())
 }
 
+/// [`check_scalar_index_budget`] の検査に、レーン A（Issue #1359）の保持量が
+/// 加わって失敗する場合に限り、レーン A 列を丸ごと解放して計上を差し戻したうえで
+/// 再検査する。レーン A は構築中ずっと配列を保持するため予算へ計上するが、
+/// `TEXT` 等の既存索引を巻き添えにしない（列単位 fail-soft。codex-review P1・
+/// P2 対応・PR #1391）。`typed_col_reservation_bytes` は列別の計上額で、
+/// 解放時に返還して 0 に戻す。
+fn check_budget_shedding_lane_a(
+    approx_bytes: &mut usize,
+    additional: usize,
+    lane_a_columns: &mut Vec<usize>,
+    per_column_typed: &mut [Option<OrderedColumnIndex>],
+    typed_col_reservation_bytes: &mut [usize],
+) -> Result<(), ScalarIndexBuildError> {
+    if check_scalar_index_budget(*approx_bytes, additional).is_ok() {
+        return Ok(());
+    }
+    for &col_index in lane_a_columns.iter() {
+        // 走査中に別経路で既に除外・返還済みの列（`None`）は二重返還しない。
+        let Some(slot_acc) = per_column_typed.get_mut(col_index) else {
+            continue;
+        };
+        if slot_acc.take().is_none() {
+            continue;
+        }
+        if let Some(reserved) = typed_col_reservation_bytes.get_mut(col_index) {
+            *approx_bytes = approx_bytes.saturating_sub(*reserved);
+            *reserved = 0;
+        }
+    }
+    lane_a_columns.clear();
+    check_scalar_index_budget(*approx_bytes, additional)
+}
+
 /// `values`/`offsets`/`slots`/`equality`（[`TextColumnIndex`] の 4 配列）を
 /// 重複排除前の `pair_count` 件分だけ一括で `try_reserve_exact` する際に、
 /// **実際に確保される**構造体サイズ分のバイト量（codex-review P1 対応・
@@ -1120,14 +1153,15 @@ impl ScalarIndex {
 
         // レーン A の後置予約（Issue #1359）。#1032 の codex P2 指摘（未接続の
         // typed 索引が予算を食い既存の `TEXT` 索引まで `TooLarge` にする）への
-        // 対策として、(1) `TEXT`／`ENUM`／レーン B の予約後に行い、(2) 予算は
-        // `approx_bytes` へ計上せず（行走査中の `TEXT` 値の予算検証を妨げない）
-        // 別建ての `lane_a_bytes` で管理し、(3) 上限の 1/2 を超える・確保に
-        // 失敗する列はその列だけ `None`（列単位 fail-soft。構築全体は失敗
-        // させない）にする。最終的な概算が上限を超えた場合は構築末尾でレーン A
-        // 列を丸ごと外す。
+        // 対策として、(1) `TEXT`／`ENUM`／レーン B の予約後に行い、(2) 上限の
+        // 1/2 を超える・確保に失敗する列はその列だけ `None`（列単位 fail-soft。
+        // 構築全体は失敗させない）にする。確保した配列は行走査と `TEXT` 索引の
+        // 確定処理が終わるまで保持されるため、確保量は `approx_bytes` と列別の
+        // `typed_col_reservation_bytes` へ計上し（codex-review P1 対応・PR #1391）、
+        // 以降の予算検査が実メモリを見るようにする。計上によって後続の `TEXT`
+        // 予算検査が失敗する場合は、`check_budget_shedding_lane_a` がレーン A 列を
+        // 丸ごと解放して差し戻したうえで再検査する（既存索引を巻き添えにしない）。
         let mut lane_a_columns: Vec<usize> = Vec::new();
-        let mut lane_a_bytes: usize = 0;
         for &(col_index, is_float) in &deferred_lane_a {
             let entry_size = if is_float {
                 std::mem::size_of::<(u64, u32)>()
@@ -1135,11 +1169,7 @@ impl ScalarIndex {
                 std::mem::size_of::<(i64, u32)>()
             };
             let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
-            if approx_bytes
-                .saturating_add(lane_a_bytes)
-                .saturating_add(reservation_bytes)
-                > MAX_SCALAR_INDEX_BYTES / 2
-            {
+            if approx_bytes.saturating_add(reservation_bytes) > MAX_SCALAR_INDEX_BYTES / 2 {
                 continue;
             }
             let accum = if is_float {
@@ -1160,7 +1190,10 @@ impl ScalarIndex {
             }
             if let Some(slot_acc) = per_column_typed.get_mut(col_index) {
                 *slot_acc = Some(accum);
-                lane_a_bytes = lane_a_bytes.saturating_add(reservation_bytes);
+                approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                    *slot = reservation_bytes;
+                }
                 lane_a_columns.push(col_index);
             }
         }
@@ -1228,10 +1261,16 @@ impl ScalarIndex {
                             }
                             continue;
                         }
+                        check_budget_shedding_lane_a(
+                            &mut approx_bytes,
+                            b.len(),
+                            &mut lane_a_columns,
+                            &mut per_column_typed,
+                            &mut typed_col_reservation_bytes,
+                        )?;
                         if let Some(Some(OrderedColumnIndex::Bytes(acc))) =
                             per_column_typed.get_mut(col_index)
                         {
-                            check_scalar_index_budget(approx_bytes, b.len())?;
                             let owned = try_owned_bytes(b)?;
                             approx_bytes = approx_bytes.saturating_add(b.len());
                             // 行数ちょうどを事前確保済み・1 行 1 回のみ push のため
@@ -1315,7 +1354,13 @@ impl ScalarIndex {
                     // 既に予算計上済みのため、ここでは文字列本体（ヒープ）の
                     // バイト量のみを追加計上する（二重計上を避ける）。
                     let additional = v_len;
-                    check_scalar_index_budget(approx_bytes, additional)?;
+                    check_budget_shedding_lane_a(
+                        &mut approx_bytes,
+                        additional,
+                        &mut lane_a_columns,
+                        &mut per_column_typed,
+                        &mut typed_col_reservation_bytes,
+                    )?;
                     let owned = try_owned_string(v)?;
                     approx_bytes = approx_bytes.saturating_add(additional);
                     // `acc` は列ごとに `row_count` ちょうどの容量を
@@ -1354,7 +1399,13 @@ impl ScalarIndex {
                     // 検証する（codex-review P1 対応・PR #569 未解決分。
                     // `text_column_reservation_bytes` 参照）。
                     let reservation_bytes = text_column_reservation_bytes(pair_count);
-                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    check_budget_shedding_lane_a(
+                        &mut approx_bytes,
+                        reservation_bytes,
+                        &mut lane_a_columns,
+                        &mut per_column_typed,
+                        &mut typed_col_reservation_bytes,
+                    )?;
                     approx_bytes = approx_bytes.saturating_add(reservation_bytes);
                     let mut values: Vec<String> = Vec::new();
                     values
@@ -1403,7 +1454,13 @@ impl ScalarIndex {
                         // `equality_bytes` 計上と対応）ため、複製前に同じ予算
                         // 検証を経る（codex-review P1 対応・PR #569）。
                         let additional = approx_string_entry_bytes(&value);
-                        check_scalar_index_budget(approx_bytes, additional)?;
+                        check_budget_shedding_lane_a(
+                            &mut approx_bytes,
+                            additional,
+                            &mut lane_a_columns,
+                            &mut per_column_typed,
+                            &mut typed_col_reservation_bytes,
+                        )?;
                         let equality_key = try_owned_string(&value)?;
                         approx_bytes = approx_bytes.saturating_add(additional);
                         equality
