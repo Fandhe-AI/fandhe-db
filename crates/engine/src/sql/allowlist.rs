@@ -7591,7 +7591,12 @@ fn check_body_scan(
     lookup: &impl TableLookup,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
-    if !v.window_items.is_empty() || matches!(v.projection, Projection::Items(_)) {
+    // Issue #1352: 投影位置のスカラーサブクエリは参照時の本文評価で解決されない
+    // ため、ビュー本体には含めさせない（fail-closed）。
+    if !v.window_items.is_empty()
+        || !v.scalar_subquery_items.is_empty()
+        || matches!(v.projection, Projection::Items(_))
+    {
         return Err(body_form_unsupported());
     }
     push_relation(out, &v.table_name);

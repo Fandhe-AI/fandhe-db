@@ -232,13 +232,25 @@ fn projection_subquery_static_and_context_rejections() {
         format!("SELECT ROW_NUMBER() OVER () AS rn, (SELECT qty FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10"),
         // EXPLAIN・カーソル・ビュー本体・CTE・集合演算の枝。
         format!("EXPLAIN SELECT (SELECT qty FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10"),
-        format!("CREATE VIEW pv AS SELECT (SELECT qty FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10"),
         format!("WITH c AS (SELECT (SELECT qty FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10) SELECT * FROM c LIMIT 10"),
         format!("SELECT name FROM {ITEMS} UNION ALL SELECT (SELECT name FROM {REFS} LIMIT 1) FROM {ITEMS}"),
     ] {
         let c = code(&core, &ctx, &sql);
         assert!(c == "42601" || c == "22000", "sql={sql} code={c}");
     }
+    // ビュー本体: DDL 権限ゲート（42501）を通した上で形の拒否を確認する。
+    let mut ddl_session = SessionState::default();
+    ddl_session.allow_ddl();
+    let view_sql =
+        format!("CREATE VIEW pv AS SELECT (SELECT qty FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10");
+    let view_err = core
+        .execute_sql_in_session(&ctx, &mut ddl_session, &view_sql)
+        .expect_err("projection subquery in view body must be rejected");
+    assert!(
+        matches!(view_err.wire_code(), "42601" | "22000"),
+        "code={}",
+        view_err.wire_code()
+    );
     // 未知列は 22000、深さ超過は 54000。
     assert_eq!(
         code(
