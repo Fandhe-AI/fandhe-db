@@ -4,17 +4,23 @@
 `crates/wire-server/tests/three_client_e2e.rs`（TASK-73・WIRE-1、`#[ignore]`）から
 子プロセスとして起動される。接続情報・SQL・タイムアウトはすべて環境変数で受け取り
 （コマンドライン引数・ソース中にダミー資格情報以外の秘密情報を書かない。
-security.md P0）、`autocommit=True` で `execute()` する（非 autocommit だと
-`BEGIN` が簡易クエリとして先行送信され、許可リスト外構文として engine に
-拒否されるため。ハーネス側の設計判断は `docs/design/three-client-e2e-harness.md`
-参照）。
+security.md P0）、`autocommit=True` で `execute()` する（非 autocommit だと psycopg が最初の文の前に
+暗黙の `BEGIN` を送る。`BEGIN` は現在受理される（SQL-31・Issue #942）ため、各文が
+明示トランザクションブロック内で実行され、psql `-c`・node `pg` の autocommit と意味が
+ずれる。DDL は `0A000`（`docs/design/explicit-transaction.md`）、分割実行 DML は
+トランザクション内で拒否される（`docs/design/partitioned-dml.md` 3.3 節）。明示
+トランザクションの検証は `WIRE_SQL_PRELUDE`／`WIRE_SQL` で `BEGIN` を明示送信して行い、
+`autocommit=False` 下の状態遷移の観測は `psycopg_txn_status.py` が担う。ハーネス側の
+設計判断は `docs/design/three-client-e2e-harness.md` 参照）。
 
 `psycopg.ClientCursor` を明示的に使う（既定の `Cursor` は `autocommit=True` でも
 サーバーサイドパラメータバインドを伴う拡張クエリプロトコル（Parse/Bind/Execute）
-で送信するため。本サーバーは拡張クエリメッセージ未対応のため拒否する。
+で送信するため。拡張クエリは WIRE-11（Issue #934・#1176）で実装済みだが、本スクリプトは
+簡易クエリ経路（WIRE-1）を固定する責務を持つので 'Q' メッセージに限定する。拡張クエリ
+経路は `psycopg_extended.py`（`three_client_extended_e2e.rs`）が担う）。
 `ClientCursor` は SQL をクライアント側で文字列合成してから簡易クエリ
 プロトコル（'Q' メッセージ）で送るため、WIRE-1 の検証対象と一致する。
-codex-review 指摘・PR #210）。
+codex-review 指摘・PR #210。
 
 環境変数:
 - WIRE_HOST / WIRE_PORT / WIRE_USER / WIRE_PASSWORD: 接続情報。
