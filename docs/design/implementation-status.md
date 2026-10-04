@@ -582,3 +582,8 @@ Issue #1361（feat(engine): ALTER COLUMN TYPE で INTEGER→BIGINT・REAL→DOUB
 - **変更箇所**: feature `test-sync-points`（既定オフ・依存なし）と `test_sync` モジュール、`Storage::set_sync_hook`。`drop_table` の commit 直前と `execute_read_statement` の先頭に同期点を置いた（feature 無効時は消える）。
 - **テスト**: `tests/table15_drop_table_concurrency.rs` の `sync_point_overlap`（3 テスト）。重なり中の結果は事前結果と完全一致か `42P01` に限る。既存の自由スケジューリング版は残した。
 - **性質**: 公開 API は feature 有効時のみ増える。RLS・テナント境界・`wire_code` は不変。設計は `docs/design/drop-table.md`。
+
+## Issue #1365: NoSQL API・複文許可リスト・クライアント docstring の古い記述の是正
+
+- **変更箇所**: `crates/wire-server/docs/nosql-api.md`（`create_table` の `check` 受理〔Issue #1199〕、分割実行 DML の `status` に `running`／`cancelling` を追記）、`crates/wire-server/tests/three_client/psycopg_client.py`（docstring のみ。`BEGIN` 受理〔SQL-31〕と拡張クエリ実装済み〔WIRE-11〕に合わせた理由へ更新）、`docs/design/wire-multi-statement.md`（文種別分類の現状化、ファイル形 `INSERT`〔#1353〕・書き込み済みテーブルの読み取り〔#1179〕の受理を反映）。
+- **性質**: ドキュメントと docstring のみ。挙動・依存の変更なし。RLS・テナント境界・`wire_code` は不変。
