@@ -447,7 +447,7 @@ fail-closed）。
 
 ポインタ: TABLE-13・INDEX-5（`IN`／`BETWEEN` の脱糖は SQL-24・TASK-208。INDEX-7 との関係は下記）。
 
-#1183 で `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列を `WHERE` の式で比較できるように
+Issue #1183 で `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列を `WHERE` の式で比較できるように
 なったが、`BoundExpr::Binary { 比較, ColumnRef, Number }` として `expr_filters` に
 入るため常に `PlainScan` だった。レーン A を接続し、等価・範囲比較を索引経路に載せる。
 
@@ -466,6 +466,7 @@ fail-closed）。
 ### 境界の導出
 
 評価側は `(v as f64) op literal` の素の f64 比較（NULL は偽）。
+
 - `INTEGER`／`BIGINT`（`I64` キー。索引の値域は `|v| <= 2^53`）: `numeric_i64_bounds` が
   `±2^53` へ明示クランプして `i64` 区間を導出する（飽和キャストに頼らない）。非有限は `None`。
 - `REAL`／`DOUBLE`（`F64Sortable` キー）: リテラルを sortable bits へ写像し
