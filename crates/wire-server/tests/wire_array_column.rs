@@ -261,3 +261,108 @@ fn wire_where_array_column_with_malformed_literal_is_rejected() {
     expect_error_response_with_sqlstate(&mut stream, "22P02");
     read_ready_for_query(&mut stream);
 }
+
+/// Issue #1357: `NUMERIC`・`BYTEA`・`JSON`・`JSONB`・`ENUM` 要素の配列が wire 越しに
+/// 往復する。`RowDescription` の型公告は他の配列列と同じ text のまま（WIRE-13）で、
+/// 配列テキストは PostgreSQL と同形（`BYTEA` は `"\\x0102"`、JSON は引用・エスケープ）。
+/// 描画した配列テキストを `WHERE` の右辺へそのまま使うと同じ行に一致する（往復）。
+#[test]
+fn wire_array_extended_element_types_roundtrip() {
+    let path = temp_db::unique_db_path("wire-array-extended");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let mood = storage
+        .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+        .expect("create enum type");
+    let arr = |elem| ColumnType::Array(ArrayType::new(elem, 4).expect("array ty"));
+    storage
+        .create_table(&TableSchema::new(
+            "ext",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "nums",
+                    arr(ArrayElemType::Numeric {
+                        precision: 5,
+                        scale: 2,
+                    }),
+                    true,
+                ),
+                ColumnDef::new("blobs", arr(ArrayElemType::Bytea), true),
+                ColumnDef::new("js", arr(ArrayElemType::Json), true),
+                ColumnDef::new("jb", arr(ArrayElemType::Jsonb), true),
+                ColumnDef::new(
+                    "moods",
+                    ColumnType::Array(ArrayType::new_enum(mood, 4).expect("array ty")),
+                    true,
+                ),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addrs = spawn_with_users(core, &[("alice", "tenant-alice", "pw-alice")]);
+    let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        r#"INSERT INTO ext (id, embedding, nums, blobs, js, jb, moods) VALUES (1, '[0.1,0.2]', '{1.5,NULL,-3.25}', '{"\\x0102",NULL,"\\x"}', '{"{\"a\":1}",NULL}', '{"{ \"b\" : 1, \"a\" : 2 }"}', '{happy,NULL}') USING OPERATION_ID 'op-1'"#,
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT nums, blobs, js, jb, moods FROM ext WHERE id = 1 LIMIT 1",
+    );
+    let _ = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("{1.50,NULL,-3.25}"));
+    assert_eq!(row[1].as_deref(), Some(r#"{"\\x0102",NULL,"\\x"}"#));
+    assert_eq!(row[2].as_deref(), Some(r#"{"{\"a\":1}",NULL}"#));
+    assert_eq!(row[3].as_deref(), Some(r#"{"{\"a\":2,\"b\":1}"}"#));
+    assert_eq!(row[4].as_deref(), Some("{happy,NULL}"));
+    let _ = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    // 描画した配列テキストを右辺へそのまま使うと同じ行に一致する。
+    for predicate in [
+        "nums = '{1.50,NULL,-3.25}'",
+        r#"blobs = '{"\\x0102",NULL,"\\x"}'"#,
+        r#"js = '{"{\"a\":1}",NULL}'"#,
+        r#"jb = '{"{\"a\":2,\"b\":1}"}'"#,
+        "moods = '{happy,NULL}'",
+    ] {
+        send_simple_query(
+            &mut stream,
+            &format!("SELECT id FROM ext WHERE {predicate} LIMIT 10"),
+        );
+        let _ = read_row_description(&mut stream);
+        let row = read_data_row(&mut stream);
+        assert_eq!(row[0].as_deref(), Some("1"), "predicate: {predicate}");
+        let _ = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+
+    // 要素の形式不正は書き込み前に 22P02、NUMERIC の桁あふれは 22003、
+    // 語彙外 ENUM は 22P02、要素数超過は 54000。
+    for (column, literal, sqlstate) in [
+        ("nums", "{abc}", "22P02"),
+        ("nums", "{123456}", "22003"),
+        ("blobs", "{zz}", "22P02"),
+        ("js", r#"{"{bad"}"#, "22P02"),
+        ("moods", "{ecstatic}", "22P02"),
+        ("moods", "{happy,sad,happy,sad,happy}", "54000"),
+    ] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO ext (id, embedding, {column}) VALUES (9, '[0.1,0.2]', '{literal}') USING OPERATION_ID 'bad-{column}'"
+            ),
+        );
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+}

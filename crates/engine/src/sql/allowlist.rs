@@ -14,7 +14,7 @@ use crate::catalog::{ColumnDef, ColumnType};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
-use crate::sql::ddl_column_type::{SqlColumnTypeName, StaticColumnType};
+use crate::sql::ddl_column_type::StaticColumnType;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
@@ -2381,9 +2381,6 @@ struct ParsedCreateTableColumn {
     /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)] [MATCH ...] [ON ...]
     /// [<遅延属性>]`（TABLE-17・TASK-205、Issue #907／#1076／#1077）の解析結果。
     references: Option<ParsedReferences>,
-    /// 要素が ENUM 型名候補の配列列の型名（[`ValidatedCreateTable::pending_array_enum_types`]
-    /// へ集約する。Issue #1348）。
-    pending_array_enum: Option<String>,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -2690,11 +2687,6 @@ pub struct ValidatedCreateTable {
     /// 制約との照合とともに `catalog::Storage::create_table` の write トランザクション
     /// 内で解決される。
     pub foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
-    /// 要素が ENUM 型名候補の配列列（`<enum>[N]`）が参照する型名（Issue #1348）。
-    /// 構文段はカタログを参照できないため名前だけを運び、`sql::ddl::execute_create_table`
-    /// が DDL 権限ゲートの後で存在確認する（未登録は `42601`、登録済みでも配列要素に
-    /// ENUM は取れないため `0A000`）。対応する列は構文段では `Array(Text)` の仮置き。
-    pub pending_array_enum_types: Vec<String>,
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
@@ -6331,8 +6323,6 @@ impl<'a> Parser<'a> {
         // 参照元列の解決は `finalize_foreign_keys`、参照先の解決・照合は
         // `catalog::Storage::create_table` が行う。
         let mut foreign_keys: Vec<crate::catalog::ForeignKeyDef> = Vec::new();
-        // 要素が ENUM 型名候補の配列列（Issue #1348）。列数上限（256）以内にしか増えない。
-        let mut pending_array_enum_types: Vec<String> = Vec::new();
         loop {
             // 表制約 `PRIMARY KEY (<col>[, <col>]*)` は要素先頭が文脈的識別子
             // `PRIMARY` かつ次のトークンが `KEY` の場合にのみ判定する
@@ -6460,9 +6450,6 @@ impl<'a> Parser<'a> {
                         .with_options(refs.match_type, refs.deferrability),
                     );
                 }
-                if let Some(n) = parsed.pending_array_enum {
-                    pending_array_enum_types.push(n);
-                }
                 columns.push(parsed.column);
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -6494,7 +6481,6 @@ impl<'a> Parser<'a> {
             unique_constraints,
             checks,
             foreign_keys,
-            pending_array_enum_types,
         })
     }
 
@@ -6630,23 +6616,18 @@ impl<'a> Parser<'a> {
         let type_name =
             crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
         let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
-        let mut pending_array_enum = None;
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
             StaticColumnType::EnumCandidate(enum_name) => {
                 ColumnType::Enum(crate::catalog::EnumTypeDef::unresolved(enum_name))
             }
-            StaticColumnType::ArrayOfEnumCandidate(enum_name) => {
-                // 仮置き（実行段が `pending_array_enum_types` を必ず拒否する）。
-                pending_array_enum = Some(enum_name);
-                match crate::catalog::ArrayType::new(
-                    crate::catalog::ArrayElemType::Text,
-                    match &type_name {
-                        SqlColumnTypeName::Array { max_len, .. } => {
-                            max_len.unwrap_or(crate::catalog::MAX_ARRAY_ELEMENTS)
-                        }
-                        _ => crate::catalog::MAX_ARRAY_ELEMENTS,
-                    },
+            // 要素が ENUM の配列（Issue #1357）。語彙は未解決マーカーで仮置きし、
+            // 実行段（`sql::ddl::execute_create_table`）が DDL 権限ゲートの後で
+            // 登録済みの定義へ差し替える（ENUM 列と同じ契約）。
+            StaticColumnType::ArrayOfEnumCandidate(enum_name, max_len) => {
+                match crate::catalog::ArrayType::new_enum(
+                    crate::catalog::EnumTypeDef::unresolved(enum_name),
+                    max_len,
                 ) {
                     Ok(a) => ColumnType::Array(a),
                     Err(e) => {
@@ -6737,7 +6718,6 @@ impl<'a> Parser<'a> {
             unique,
             checks,
             references,
-            pending_array_enum,
         })
     }
 

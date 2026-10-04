@@ -273,6 +273,29 @@ fn write_array(
             quoted(out, &v.to_string());
             Ok(())
         })?,
+        // Issue #1357: スカラー列の `Cell::Numeric`／`Cell::Bytes`／`Cell::Json`／
+        // `Cell::Text`（ENUM）と同じ JSON 表現を要素ごとに使う。
+        ArrayValue::Numeric(items) => each(out, items, |out, d| {
+            let _ = write!(out, "{d}");
+            Ok(())
+        })?,
+        ArrayValue::Bytea(items) => each(out, items, |out, b| {
+            out.push('"');
+            out.push_str(&crate::http::query::base64_std::encode_base64_std(b));
+            out.push('"');
+            Ok(())
+        })?,
+        // JSON／JSONB 要素は再パース＋`write_canonical` で埋め込み、格納テキストを
+        // 生連結しない（`Cell::Json` と同じ安全側の設計）。再パース失敗は fail-closed。
+        ArrayValue::Json(items) | ArrayValue::Jsonb(items) => each(out, items, |out, text| {
+            let value = engine::json::parse_json(text).map_err(|_| ResponseEncodeError)?;
+            engine::json::write_canonical(&value, out);
+            Ok(())
+        })?,
+        ArrayValue::Enum(items) => each(out, items, |out, label| {
+            quoted(out, label);
+            Ok(())
+        })?,
     }
     out.push(']');
     Ok(())
@@ -344,6 +367,11 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
                 engine::catalog::ArrayElemType::Date => "date[]",
                 engine::catalog::ArrayElemType::Timestamp => "timestamp[]",
                 engine::catalog::ArrayElemType::Uuid => "uuid[]",
+                engine::catalog::ArrayElemType::Numeric { .. } => "numeric[]",
+                engine::catalog::ArrayElemType::Bytea => "bytea[]",
+                engine::catalog::ArrayElemType::Json => "json[]",
+                engine::catalog::ArrayElemType::Jsonb => "jsonb[]",
+                engine::catalog::ArrayElemType::Enum => "enum[]",
             },
         },
     }

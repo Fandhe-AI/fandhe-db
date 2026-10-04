@@ -2572,7 +2572,7 @@ fn validate_set_assignments(
                 // Issue #888・D-A3。`row_codec::scalar_array_entry_len` を
                 // 実エンコード（`encode_scalar_columns`）と共有し、事前検証と
                 // 実エンコードの乖離によるテナント境界漏えいを防ぐ）。
-                if av.elem() != array_ty.elem() {
+                if !crate::row_codec::array_elem_kind_eq(av.elem(), array_ty.elem()) {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                         "SET column type does not match the current table schema".to_string(),
                     )));

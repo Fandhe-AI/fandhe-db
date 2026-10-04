@@ -525,3 +525,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: 各 JSON 形は対応する SQL テキストの構文解析結果とバイト単位で同一の AST になり（連続する `not`・`ne` は偶奇で畳む）、跨表層の再送が `23505`／`22023` で照合される。述語の葉の上限（256）は不変。数値列の `in` は JSON 上 1 葉と数えるため、256 要素ちょうどで他に葉があると NoSQL だけが `54000` になりうる（拒否側の既知の差）。
 - **テスト**: engine 単体 1（許可形・拒否形の固定）・公開 API 1、wire 単体（`filter.rs`）、層 A `nosql12_predicate_dml_numeric_filter.rs`（跨表層 19 形 × 2 方向・結果集合・型不一致・上限・RLS 名・テナント境界）、`nosql12_update_delete.rs`・`nosql14_filter_operators.rs`・`nosql12_partitioned_dml.rs` の拡張。
 - **対象外（申し送り）**: `ARRAY`／`JSON`／`JSONB` 列への DML の `eq`／`ne`／`in`、負数リテラルの SQL⇄NoSQL ハッシュパリティ（SQL に単項マイナスが無いため対象外）。
+
+## Issue #1357: 配列の要素型 NUMERIC・BYTEA・ENUM・JSON・JSONB に対応する
+
+- **対象ビヘイビア**: TABLE-14・NOSQL-17（関連: TABLE-6・TABLE-13・WIRE-13・ERR-1/2/4/6、TASK-198）。
+- **変更箇所**: engine の `ArrayElemType`／`ArrayType`／`ArrayValue` に新要素型を追加（`ArrayType` は ENUM 語彙を持つため `Copy` を失う）。カタログ param の拡張（`numeric,<p>,<s>,<max_len>`・`enum,<type_name>,<max_len>`）、ENUM 依存判定への `array` 列の追加、`JSON`／`JSONB`／`NUMERIC` 要素の値等価（`equality_payload`）を `=`・UNIQUE・集合演算へ適用。SQL の列宣言（CREATE TABLE／ADD COLUMN）、リテラル束縛、pg wire の配列テキスト、NoSQL の束縛・描画・filter `eq` を追従。
+- **性質**: 要素はスカラー列と同じ束縛関数・エラー分類を共有する。既存要素型の行バイト・UNIQUE キーは不変。詳細は `array-column-type.md` の Issue #1357 追記。
+- **テスト**: engine 単体（カタログ param・往復・依存判定・墓標正規化）、層 A `array_extended_elem_types.rs`（往復・再起動・等価・JSON 値等価・UNIQUE・DROP／ALTER TYPE・エラー分類・テナント分離）、`column_type_codec_roundtrip.rs` の拡張、wire `wire_array_column.rs`・NoSQL `nosql17_typed_json_parity.rs`（SQL とのバイト一致）。
+- **対象外（申し送り）**: NoSQL の DDL での配列宣言、配列列への DEFAULT、`numeric[]` の精度拡大、要素・パス演算子、配列・JSON 列の二次索引化、NoSQL filter の `in`。

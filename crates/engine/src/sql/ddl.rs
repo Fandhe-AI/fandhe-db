@@ -97,13 +97,17 @@ pub(crate) fn execute_create_table(
     for column in &mut columns {
         if let ColumnType::Enum(def) = &column.ty {
             column.ty = ColumnType::Enum(resolve_enum_type(storage, def.name())?);
+        } else if let ColumnType::Array(array_ty) = &column.ty {
+            // `<enum>[]` 列（Issue #1357）も同様に登録済みの語彙へ差し替える。
+            if let Some(def) = array_ty.enum_def() {
+                let resolved = resolve_enum_type(storage, def.name())?;
+                let array = crate::catalog::ArrayType::new_enum(resolved, array_ty.max_len())
+                    .map_err(|e| {
+                        SqlSurfaceError::unsupported(format!("invalid array type: {e}"))
+                    })?;
+                column.ty = ColumnType::Array(array);
+            }
         }
-    }
-    if let Some(name) = validated.pending_array_enum_types.first() {
-        resolve_enum_type(storage, name)?;
-        return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "ENUM array element type is not supported yet".to_string(),
-        });
     }
     // 解決後の列型に対して DEFAULT を束縛検証する（ENUM の語彙外・DATE/NUMERIC の
     // 不正リテラル等を永続化前に SQLSTATE 付きで拒否する）。
@@ -858,13 +862,13 @@ fn resolve_column_type(
         StaticColumnType::EnumCandidate(name) => {
             Ok(ColumnType::Enum(resolve_enum_type(storage, &name)?))
         }
-        // 型名の存在確認（未登録は 42601）を済ませたうえで、配列要素に ENUM を
-        // 取れない現状は 0A000 で拒否する（Issue #1348。要素型の拡張は別 Issue）。
-        StaticColumnType::ArrayOfEnumCandidate(name) => {
-            resolve_enum_type(storage, &name)?;
-            Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "ENUM array element type is not supported yet".to_string(),
-            })
+        // 要素が ENUM の配列（Issue #1357）。型名の存在確認（未登録は 42601）の
+        // うえで登録済みの語彙を持つ配列型を組み立てる。
+        StaticColumnType::ArrayOfEnumCandidate(name, max_len) => {
+            let def = resolve_enum_type(storage, &name)?;
+            let array = crate::catalog::ArrayType::new_enum(def, max_len)
+                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid array type: {e}")))?;
+            Ok(ColumnType::Array(array))
         }
     }
 }
@@ -1348,7 +1352,6 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
-            pending_array_enum_types: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table");
         storage
@@ -1505,7 +1508,6 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
-            pending_array_enum_types: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
@@ -1526,7 +1528,6 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
-            pending_array_enum_types: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
         let err = execute_create_table(&storage, &validated)
@@ -1548,7 +1549,6 @@ mod tests {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
-            pending_array_enum_types: Vec::new(),
         };
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");

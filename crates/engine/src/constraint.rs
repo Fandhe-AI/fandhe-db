@@ -976,7 +976,11 @@ pub(crate) fn push_canonical_component(
             };
             payload.push(array_elem_tag(a.elem()) | null_mark);
             payload.extend_from_slice(&a.count().to_be_bytes());
-            payload.extend_from_slice(a.payload());
+            // JSON／NUMERIC 要素は値等価の正準形へ差し替える（Issue #1357 D4）。
+            let eq = a
+                .equality_payload()
+                .map_err(|_| "unique key ARRAY column has an invalid stored value")?;
+            payload.extend_from_slice(&eq);
             push_len_prefixed(out, ColumnType::ARRAY_UNIQUE_KEY_TAG, &payload)
         }
     }
@@ -1064,7 +1068,7 @@ pub(crate) fn unique_key_from_values(
 /// `1.5` を同一キーへ正規化する。Issue #1073 D7）。`scale == 0` に達したら
 /// それ以上は割らない。`checked_rem`／`checked_div` で整数演算を明示的に扱う
 /// （coding-rust.md）。
-fn canonical_numeric_parts(d: crate::numeric::Decimal) -> (i128, u8) {
+pub(crate) fn canonical_numeric_parts(d: crate::numeric::Decimal) -> (i128, u8) {
     let mut unscaled = d.unscaled();
     let mut scale = d.scale();
     while scale > 0 {
@@ -1080,9 +1084,11 @@ fn canonical_numeric_parts(d: crate::numeric::Decimal) -> (i128, u8) {
     (unscaled, scale)
 }
 
-/// 配列要素型の一意キー用固定タグ（配列列内部だけで使うスクラッチ値。
-/// [`crate::catalog::ArrayElemType`] のカタログ表現とは独立に採番してよい。
-/// `ColumnType::unique_key_tag` と同じ「非永続化のスクラッチタグ」方針）。
+/// 配列要素型の一意キー用固定タグ。[`crate::catalog::ArrayElemType`] のカタログ
+/// 表現とは独立に採番してよいが、Issue #1070 以降この値は `user_uniq` 索引の
+/// キーの一部として**永続化される**ため、既存タグの意味は変えず、新しい要素型には
+/// 未使用の値を新規に採番する（Issue #1357 で 9〜13 を追加）。値は
+/// [`ARRAY_KEY_NULL_MARK`]（0x80）未満に保つ（NULL 要素マーカーとの衝突防止）。
 fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
     match elem {
         crate::catalog::ArrayElemType::Text => 0,
@@ -1094,6 +1100,11 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
         crate::catalog::ArrayElemType::Date => 6,
         crate::catalog::ArrayElemType::Timestamp => 7,
         crate::catalog::ArrayElemType::Uuid => 8,
+        crate::catalog::ArrayElemType::Numeric { .. } => 9,
+        crate::catalog::ArrayElemType::Bytea => 10,
+        crate::catalog::ArrayElemType::Json => 11,
+        crate::catalog::ArrayElemType::Jsonb => 12,
+        crate::catalog::ArrayElemType::Enum => 13,
     }
 }
 
@@ -3196,6 +3207,42 @@ mod tests {
     use crate::row_codec::Value;
     use crate::storage::{Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 配列要素型タグ（`user_uniq` 索引キーへ永続化される値）は互いに異なり、NULL 要素
+    /// マーカー（0x80）と衝突しない（Issue #1357）。既存タグ 0〜8 の値も固定する。
+    #[test]
+    fn array_elem_tags_are_distinct_persisted_values_below_null_mark() {
+        use crate::catalog::ArrayElemType as E;
+        let elems = [
+            (E::Text, 0u8),
+            (E::Bool, 1),
+            (E::Integer, 2),
+            (E::BigInt, 3),
+            (E::Real, 4),
+            (E::Double, 5),
+            (E::Date, 6),
+            (E::Timestamp, 7),
+            (E::Uuid, 8),
+            (
+                E::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                9,
+            ),
+            (E::Bytea, 10),
+            (E::Json, 11),
+            (E::Jsonb, 12),
+            (E::Enum, 13),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (elem, expected) in elems {
+            let tag = array_elem_tag(elem);
+            assert_eq!(tag, expected, "persisted tag must not be renumbered");
+            assert!(tag < ARRAY_KEY_NULL_MARK);
+            assert!(seen.insert(tag), "duplicate tag {tag}");
+        }
+    }
 
     fn tmp_storage(label: &str) -> (Storage, CleanupGuard) {
         let path = unique_db_path(label);

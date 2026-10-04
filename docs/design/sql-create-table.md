@@ -200,16 +200,17 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
 ## 列型の解決順序（Issue #1348）
 
 1. 構文検証（`sql::allowlist`）はカタログを参照しない。ENUM 型名候補は語彙を持たない
-   未解決マーカー（`EnumTypeDef::unresolved`）として運ぶ。要素が ENUM 型名候補の配列は
-   `ValidatedCreateTable::pending_array_enum_types` に名前だけを積む。
+   未解決マーカー（`EnumTypeDef::unresolved`）として運ぶ。要素が ENUM 型名候補の配列
+   （Issue #1357）も、未解決マーカーを持つ `ArrayType::new_enum` を列型として仮置きする。
 2. DDL 権限ゲート（`42501`）を通過した後、`sql::ddl::execute_create_table` が ENUM 型名を
    `Storage::get_enum_type` で解決する。未登録は `42601`（型の存在有無は権限のない
-   セッションには見えない）。要素が ENUM の配列は、登録済みでも `0A000`。
+   セッションには見えない）。要素が ENUM の配列も同じ経路で登録済みの語彙へ差し替える。
 3. 解決後の列型で `DEFAULT` を束縛検証する（ENUM の語彙外は `22P02`）。
 4. `Storage::create_table`（書き込みトランザクション内で型名を再解決する）。解決から
    書き込みまでの間に `DROP TYPE` が割り込んだ場合の `TypeNotFound` も `42601` へ写す。
 
 配列の `[N]` は書き込み時の要素数上限（超過は `54000`）として意味を持ち、範囲は
-`1..=1024`（`[]` は 1024）。範囲外・多次元・`VECTOR` 要素は `42601`、`NUMERIC`・
-`BYTEA`・`JSON`・`JSONB` 要素は `0A000`。`CREATE TABLE` が列型キーワードとして予約する語
+`1..=1024`（`[]` は 1024）。範囲外・多次元・`VECTOR` 要素は `42601`。`NUMERIC(p,s)`・
+`BYTEA`・`JSON`・`JSONB`・ENUM 要素は受理する（Issue #1357。`NUMERIC` の精度・位取りの
+範囲外は `42601`）。`CREATE TABLE` が列型キーワードとして予約する語
 （制約名の衝突判定）は、受理するスカラー型名すべてに広がった。

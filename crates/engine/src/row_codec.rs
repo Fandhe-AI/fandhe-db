@@ -221,6 +221,16 @@ pub enum ArrayValue {
     Date(Vec<Option<i32>>),
     Timestamp(Vec<Option<i64>>),
     Uuid(Vec<Option<Uuid>>),
+    /// `NUMERIC(p,s)[]`（Issue #1357）。各要素は列の位取りへ正規化済みの `Decimal`。
+    Numeric(Vec<Option<Decimal>>),
+    /// `BYTEA[]`（Issue #1357）。
+    Bytea(Vec<Option<Vec<u8>>>),
+    /// `JSON[]`（Issue #1357）。検証済みの入力テキストをそのまま保持する。
+    Json(Vec<Option<String>>),
+    /// `JSONB[]`（Issue #1357）。正規化済みテキストを保持する。
+    Jsonb(Vec<Option<String>>),
+    /// `<enum>[]`（Issue #1357）。ラベル文字列。語彙検査は encode 時のみ。
+    Enum(Vec<Option<String>>),
 }
 
 /// `ArrayValue` の全 variant に同じ式を適用する内部マクロ（要素型が増えたときの
@@ -237,6 +247,11 @@ macro_rules! array_dispatch {
             ArrayValue::Date($items) => $body,
             ArrayValue::Timestamp($items) => $body,
             ArrayValue::Uuid($items) => $body,
+            ArrayValue::Numeric($items) => $body,
+            ArrayValue::Bytea($items) => $body,
+            ArrayValue::Json($items) => $body,
+            ArrayValue::Jsonb($items) => $body,
+            ArrayValue::Enum($items) => $body,
         }
     };
 }
@@ -245,6 +260,11 @@ impl ArrayValue {
     /// この値の要素型（`ColumnType::Array` の `ArrayType::elem()` と突合する
     /// ために使う。`pub(crate)`: `tenant::validate_set_assignments` が UPDATE
     /// SET 値の事前検証で参照する）。
+    ///
+    /// `Numeric` は値だけでは精度を決められないため、`precision` は最大値
+    /// （[`crate::numeric::MAX_PRECISION`]）、`scale` は最初の非 NULL 要素の位取りを返す
+    /// 代表値である。列宣言との照合は [`ArrayElemType`] の種別比較
+    /// （[`array_elem_kind_eq`]）で行い、精度・位取りの検査は [`write_array_value`] が担う。
     pub(crate) fn elem(&self) -> ArrayElemType {
         match self {
             ArrayValue::Text(_) => ArrayElemType::Text,
@@ -256,6 +276,14 @@ impl ArrayValue {
             ArrayValue::Date(_) => ArrayElemType::Date,
             ArrayValue::Timestamp(_) => ArrayElemType::Timestamp,
             ArrayValue::Uuid(_) => ArrayElemType::Uuid,
+            ArrayValue::Numeric(items) => ArrayElemType::Numeric {
+                precision: crate::numeric::MAX_PRECISION,
+                scale: items.iter().flatten().next().map_or(0, |d| d.scale()),
+            },
+            ArrayValue::Bytea(_) => ArrayElemType::Bytea,
+            ArrayValue::Json(_) => ArrayElemType::Json,
+            ArrayValue::Jsonb(_) => ArrayElemType::Jsonb,
+            ArrayValue::Enum(_) => ArrayElemType::Enum,
         }
     }
 
@@ -282,7 +310,10 @@ impl ArrayValue {
     /// が共有する）。
     pub(crate) fn approx_heap_bytes(&self) -> usize {
         match self {
-            ArrayValue::Text(items) => {
+            ArrayValue::Text(items)
+            | ArrayValue::Json(items)
+            | ArrayValue::Jsonb(items)
+            | ArrayValue::Enum(items) => {
                 let payload: usize = items.iter().flatten().map(|s| s.len()).sum();
                 payload.saturating_add(
                     items
@@ -290,6 +321,17 @@ impl ArrayValue {
                         .saturating_mul(std::mem::size_of::<Option<String>>()),
                 )
             }
+            ArrayValue::Bytea(items) => {
+                let payload: usize = items.iter().flatten().map(|b| b.len()).sum();
+                payload.saturating_add(
+                    items
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Option<Vec<u8>>>()),
+                )
+            }
+            ArrayValue::Numeric(v) => v
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<Decimal>>()),
             ArrayValue::Bool(v) => v.len().saturating_mul(std::mem::size_of::<Option<bool>>()),
             ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
@@ -316,15 +358,64 @@ impl ArrayValue {
             ArrayValue::Date(_) => 6,
             ArrayValue::Timestamp(_) => 7,
             ArrayValue::Uuid(_) => 8,
+            // Issue #1357 の新規採番（既存値は振り直さない）。
+            ArrayValue::Numeric(_) => 9,
+            ArrayValue::Bytea(_) => 10,
+            ArrayValue::Json(_) => 11,
+            ArrayValue::Jsonb(_) => 12,
+            ArrayValue::Enum(_) => 13,
         };
-        let mut payload = Vec::new();
-        write_array_elements_payload(&mut payload, self)?;
-        Ok((ordinal, self.frame_flags(), payload))
+        Ok((ordinal, self.frame_flags(), self.equality_payload()?))
     }
 
-    /// [`Self::canonical_parts`] のペイロード長（確保せずに算出する）。
+    /// 値の等価判定（`=`・UNIQUE キー・集合演算）に使う正準ペイロード（NULL
+    /// ビットマップを含む。Issue #1357 D4）。
+    ///
+    /// 行バイトと同じ [`write_array_elements_payload`] の出力を基本としつつ、
+    /// 生バイトの一致と値の等価が食い違う要素型だけ値等価の形へ差し替える。
+    /// `JSON`／`JSONB` は [`crate::json::canonical_equality_text`]（スカラー JSON 列と同じ
+    /// 値等価）、`NUMERIC` は末尾ゼロを除いた `(unscaled, scale)`（スカラー NUMERIC の
+    /// UNIQUE キーと同じ）。それ以外の要素型は行バイトのペイロードをそのまま返し、
+    /// 既存要素型のバイト列は変わらない。
+    pub(crate) fn equality_payload(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        match self {
+            ArrayValue::Numeric(items) => {
+                write_array_null_bitmap(&mut buf, self);
+                for d in items.iter().flatten() {
+                    let (unscaled, scale) = crate::constraint::canonical_numeric_parts(*d);
+                    buf.extend_from_slice(&unscaled.to_be_bytes());
+                    buf.push(scale);
+                }
+            }
+            ArrayValue::Json(items) | ArrayValue::Jsonb(items) => {
+                write_array_null_bitmap(&mut buf, self);
+                for text in items.iter().flatten() {
+                    let canonical = crate::json::canonical_equality_text(text).map_err(|_| {
+                        RowCodecError::Invalid("array JSON element is not valid JSON".to_string())
+                    })?;
+                    let len = u32::try_from(canonical.len()).map_err(|_| {
+                        RowCodecError::Invalid("array JSON element too long".to_string())
+                    })?;
+                    buf.extend_from_slice(&len.to_le_bytes());
+                    buf.extend_from_slice(canonical.as_bytes());
+                }
+            }
+            _ => write_array_elements_payload(&mut buf, self)?,
+        }
+        Ok(buf)
+    }
+
+    /// [`Self::canonical_parts`] のペイロード長。行バイトと同形の要素型は確保せずに
+    /// 算出し、値等価の形へ差し替える `NUMERIC`／`JSON`／`JSONB`（[`Self::equality_payload`]）
+    /// は実際のペイロードを組み立てて長さを返す（予算見積もりと実バイト数を一致させる）。
     pub(crate) fn canonical_payload_len(&self) -> Result<usize> {
-        Ok(array_elements_byte_len(self.elem(), self)? as usize)
+        match self {
+            ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Jsonb(_) => {
+                Ok(self.equality_payload()?.len())
+            }
+            _ => Ok(array_elements_byte_len(self.elem(), self)? as usize),
+        }
     }
 
     /// エンコードされるフレーム flags（NULL 要素を含むときだけ
@@ -614,18 +705,17 @@ impl<'a> ArrayRef<'a> {
         decode_array_elements(self.elem, self.bytes, self.count, self.flags)
     }
 
-    /// 要素列本文（フレームヘッダを含まない。走査時点で構造・UTF-8・要素数上限を
-    /// 検証済み）への借用（`pub(crate)`。[`crate::constraint::push_canonical_component`]
-    /// が UNIQUE 制約の正準キー（Issue #1073）を組み立てる際に使う）。
-    ///
-    /// エンコーダ（[`write_array_value`]）は要素順を保持し、flags を
-    /// [`ARRAY_FLAGS_RESERVED`]（`0x00`）固定、TEXT 要素は長さ前置＋本文、
-    /// BOOL 要素は 1 バイトのいずれも代替表現を持たない決定的な形式でのみ
-    /// エンコードするため、`(elem, count, payload)` の組は値に対して単射になる
-    /// （呼び出し元がこの単射性に依存する契約。エンコーダの決定性を崩す変更は
-    /// 一意性判定の正しさに影響する）。
-    pub(crate) fn payload(&self) -> &'a [u8] {
-        self.bytes
+    /// 等価判定用の正準ペイロード（[`ArrayValue::equality_payload`] と同じ形。
+    /// Issue #1357 D4）。生バイトの一致が値等価と一致する要素型は借用をそのまま返し、
+    /// `NUMERIC`／`JSON`／`JSONB` だけ値へ復号して正準化する。壊れた格納値は `Err`
+    /// （呼び出し元が fail-closed に扱う）。
+    pub(crate) fn equality_payload(&self) -> Result<std::borrow::Cow<'a, [u8]>> {
+        match self.elem {
+            ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Jsonb => Ok(
+                std::borrow::Cow::Owned(self.to_value()?.equality_payload()?),
+            ),
+            _ => Ok(std::borrow::Cow::Borrowed(self.bytes)),
+        }
     }
 
     /// 束縛済み `VALUES`（`Value::Array`）から一意キー計算専用のスクラッチ
@@ -686,10 +776,22 @@ const ARRAY_BOOL_TRUE_BYTE: u8 = BOOL_TRUE_BYTE;
 /// 上限と揃える。
 const MAX_ARRAY_PAYLOAD_LEN: u32 = MAX_TEXT_FIELD_LEN;
 
+/// 2 つの要素型が同じ種別か（`NUMERIC` は精度・位取りを無視する。Issue #1357）。
+/// [`ArrayValue::elem`] が `NUMERIC` で代表値しか返せないため、列宣言との照合は
+/// 完全一致ではなく種別一致で行う。
+pub(crate) fn array_elem_kind_eq(a: ArrayElemType, b: ArrayElemType) -> bool {
+    std::mem::discriminant(&a) == std::mem::discriminant(&b)
+}
+
 /// 固定長要素型の 1 要素あたりのバイト幅（`TEXT` は可変長なので `None`）。
 fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
     match elem {
-        ArrayElemType::Text => None,
+        ArrayElemType::Text
+        | ArrayElemType::Bytea
+        | ArrayElemType::Json
+        | ArrayElemType::Jsonb
+        | ArrayElemType::Enum => None,
+        ArrayElemType::Numeric { .. } => Some(16),
         ArrayElemType::Bool => Some(1),
         ArrayElemType::Integer | ArrayElemType::Real | ArrayElemType::Date => Some(4),
         ArrayElemType::BigInt | ArrayElemType::Double | ArrayElemType::Timestamp => Some(8),
@@ -701,7 +803,7 @@ fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
 /// バイト長を計算する。オーバーフロー時は `Err`（[`scalar_text_entry_len`] と
 /// 同じ方針）。
 fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u32> {
-    if value.elem() != elem {
+    if !array_elem_kind_eq(value.elem(), elem) {
         return Err(RowCodecError::Invalid(
             "array value element type does not match column element type".to_string(),
         ));
@@ -713,9 +815,22 @@ fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u3
     };
     let mut total: usize = bitmap_len;
     match value {
-        ArrayValue::Text(items) => {
+        ArrayValue::Text(items)
+        | ArrayValue::Json(items)
+        | ArrayValue::Jsonb(items)
+        | ArrayValue::Enum(items) => {
             for item in items.iter().flatten() {
                 // 長さプレフィックス(4) + 本文。
+                let entry = item.len().checked_add(4).ok_or_else(|| {
+                    RowCodecError::Invalid("array element length overflow".to_string())
+                })?;
+                total = total.checked_add(entry).ok_or_else(|| {
+                    RowCodecError::Invalid("array payload length overflow".to_string())
+                })?;
+            }
+        }
+        ArrayValue::Bytea(items) => {
+            for item in items.iter().flatten() {
                 let entry = item.len().checked_add(4).ok_or_else(|| {
                     RowCodecError::Invalid("array element length overflow".to_string())
                 })?;
@@ -762,12 +877,13 @@ pub(crate) fn scalar_array_entry_len(elem: ArrayElemType, value: &ArrayValue) ->
 /// [`Value::Array`] 1 個をバッファへ書き込む（presence タグは呼び出し元が別途
 /// 積む）。`array_ty` の `elem`/`max_len` との不一致（要素型違い・要素数超過）は
 /// `Err`（TABLE-14）。
-fn write_array_value(buf: &mut Vec<u8>, array_ty: ArrayType, value: &ArrayValue) -> Result<()> {
-    if value.elem() != array_ty.elem() {
+fn write_array_value(buf: &mut Vec<u8>, array_ty: &ArrayType, value: &ArrayValue) -> Result<()> {
+    if !array_elem_kind_eq(value.elem(), array_ty.elem()) {
         return Err(RowCodecError::Invalid(
             "array value element type does not match column definition".to_string(),
         ));
     }
+    validate_array_elements(array_ty, value)?;
     let count = u32::try_from(value.len())
         .map_err(|_| RowCodecError::Invalid("array element count too large".to_string()))?;
     if count > array_ty.max_len() || count > MAX_ARRAY_ELEMENTS {
@@ -788,17 +904,74 @@ fn write_array_value(buf: &mut Vec<u8>, array_ty: ArrayType, value: &ArrayValue)
     write_array_elements_payload(buf, value)
 }
 
-/// 配列要素列（フレームヘッダを含まない本文のみ。NULL 要素があれば先頭に
-/// ビットマップ）を `buf` へ書き込む（[`write_array_value`] の本体部分を切り出した
-/// もの。ヘッダ（flags・`count`・`payload_len`）の書き込みは呼び出し元の責務。
-/// flags は [`ArrayValue::frame_flags`]）。`pub(crate)`:
-/// [`crate::constraint::unique_key_from_values`] が UPSERT の `ON CONFLICT`
-/// 対象キー（TABLE-16・Issue #1074）として ARRAY 列の束縛値から一意キー計算用の
-/// スクラッチ `ArrayRef`（[`ArrayRef::from_owned`]）を組み立てる際、この要素書き込み
-/// ロジックを独立に再実装せず共有するために公開する。REAL／DOUBLE は非有限値を
-/// 拒否し `-0.0` を正規化、DATE／TIMESTAMP は値域を検証する（永続化バイト列の
-/// 正準性を保つ多層防御）。
-pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue) -> Result<()> {
+/// 配列要素を列宣言に照らして検証する（Issue #1357。スカラー列の encode 時検証と
+/// 同じ位置づけの多層防御）。`NUMERIC` は位取り一致と精度、`JSON` は構文、`JSONB` は
+/// 正規化済みであること、`ENUM` は語彙、`BYTEA` は長さ上限を確認する。語彙一覧は
+/// エラー文言に含めない。それ以外の要素型は検査対象なし。
+fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<()> {
+    match (array_ty.elem(), value) {
+        (ArrayElemType::Numeric { precision, scale }, ArrayValue::Numeric(items)) => {
+            for d in items.iter().flatten() {
+                if d.scale() != scale {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array NUMERIC element expects scale {scale}, got {}",
+                        d.scale()
+                    )));
+                }
+                if !d.fits_precision(precision) {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array NUMERIC element out of range for precision {precision}"
+                    )));
+                }
+            }
+        }
+        (ArrayElemType::Bytea, ArrayValue::Bytea(items)) => {
+            for b in items.iter().flatten() {
+                if b.len() > crate::bytea::MAX_BYTEA_FIELD_LEN as usize {
+                    return Err(RowCodecError::Invalid(
+                        "array BYTEA element too long".to_string(),
+                    ));
+                }
+            }
+        }
+        (ArrayElemType::Json, ArrayValue::Json(items)) => {
+            for text in items.iter().flatten() {
+                crate::json::validate_json_column_text(text).map_err(|_| {
+                    RowCodecError::Invalid("array JSON element is not valid JSON".to_string())
+                })?;
+            }
+        }
+        (ArrayElemType::Jsonb, ArrayValue::Jsonb(items)) => {
+            for text in items.iter().flatten() {
+                let canonical = crate::json::canonicalize_jsonb_text(text).map_err(|_| {
+                    RowCodecError::Invalid("array JSONB element is not valid JSON".to_string())
+                })?;
+                if canonical != *text {
+                    return Err(RowCodecError::Invalid(
+                        "array JSONB element must be pre-canonicalized".to_string(),
+                    ));
+                }
+            }
+        }
+        (ArrayElemType::Enum, ArrayValue::Enum(items)) => {
+            let def = array_ty.enum_def().ok_or_else(|| {
+                RowCodecError::Invalid("array enum element has no type definition".to_string())
+            })?;
+            for label in items.iter().flatten() {
+                def.validate_label(label).map_err(|_| {
+                    RowCodecError::Invalid(
+                        "array enum element is not a member of the enum type".to_string(),
+                    )
+                })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// NULL 要素があるときだけ NULL ビットマップ（LSB first・1 が NULL）を `buf` へ書く。
+fn write_array_null_bitmap(buf: &mut Vec<u8>, value: &ArrayValue) {
     let nulls = value.null_flags();
     if nulls.iter().any(|b| *b) {
         let mut bitmap = vec![0u8; nulls.len().div_ceil(8)];
@@ -811,7 +984,58 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
         }
         buf.extend_from_slice(&bitmap);
     }
+}
+
+/// 長さ前置（`u32` LE）＋本文を 1 要素として `buf` へ書く（TEXT 系要素の共通形式）。
+fn write_array_len_prefixed(buf: &mut Vec<u8>, body: &[u8]) -> Result<()> {
+    let len = u32::try_from(body.len())
+        .map_err(|_| RowCodecError::Invalid("array element too long".to_string()))?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(body);
+    Ok(())
+}
+
+/// 配列要素列（フレームヘッダを含まない本文のみ。NULL 要素があれば先頭に
+/// ビットマップ）を `buf` へ書き込む（[`write_array_value`] の本体部分を切り出した
+/// もの。ヘッダ（flags・`count`・`payload_len`）の書き込みは呼び出し元の責務。
+/// flags は [`ArrayValue::frame_flags`]）。`pub(crate)`:
+/// [`crate::constraint::unique_key_from_values`] が UPSERT の `ON CONFLICT`
+/// 対象キー（TABLE-16・Issue #1074）として ARRAY 列の束縛値から一意キー計算用の
+/// スクラッチ `ArrayRef`（[`ArrayRef::from_owned`]）を組み立てる際、この要素書き込み
+/// ロジックを独立に再実装せず共有するために公開する。REAL／DOUBLE は非有限値を
+/// 拒否し `-0.0` を正規化、DATE／TIMESTAMP は値域を検証する（永続化バイト列の
+/// 正準性を保つ多層防御）。
+pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue) -> Result<()> {
+    write_array_null_bitmap(buf, value);
     match value {
+        ArrayValue::Json(items) | ArrayValue::Jsonb(items) | ArrayValue::Enum(items) => {
+            for item in items.iter().flatten() {
+                write_array_len_prefixed(buf, item.as_bytes())?;
+            }
+        }
+        ArrayValue::Bytea(items) => {
+            for item in items.iter().flatten() {
+                write_array_len_prefixed(buf, item)?;
+            }
+        }
+        ArrayValue::Numeric(items) => {
+            // 位取りは行に持たない（列宣言が唯一の正）ため、要素間で位取りが
+            // 揃っていることだけをここで保証する（列の位取りとの一致は
+            // `write_array_value` が検査する）。
+            let mut scale: Option<u8> = None;
+            for d in items.iter().flatten() {
+                match scale {
+                    None => scale = Some(d.scale()),
+                    Some(s) if s != d.scale() => {
+                        return Err(RowCodecError::Invalid(
+                            "array NUMERIC elements must share one scale".to_string(),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                buf.extend_from_slice(&d.unscaled().to_le_bytes());
+            }
+        }
         ArrayValue::Text(items) => {
             for item in items.iter().flatten() {
                 let item_bytes = item.as_bytes();
@@ -998,6 +1222,56 @@ fn decode_fixed_array_elements<T>(
     Ok(items)
 }
 
+/// UTF-8 検証のみを行う要素変換（JSON／JSONB／ENUM 要素。JSON の再パースや ENUM の
+/// 語彙検査はしない。スカラー列の decode と同じ契約）。
+fn decode_array_utf8(b: &[u8]) -> Result<String> {
+    std::str::from_utf8(b)
+        .map(str::to_string)
+        .map_err(|_| RowCodecError::Invalid("array element is not valid UTF-8".to_string()))
+}
+
+/// 長さ前置（`u32` LE）＋本文の可変長要素を `nulls` に従って展開する。要素列が
+/// 宣言数をちょうど消費しない場合（不足・余剰いずれも）は `Err`。確保は
+/// `try_reserve_exact`（要素数は呼び出し元が `max_len` 以下を検証済み）。
+fn decode_var_array_elements<T>(
+    rest: &[u8],
+    nulls: &[bool],
+    mut convert: impl FnMut(&[u8]) -> Result<T>,
+) -> Result<Vec<Option<T>>> {
+    let mut offset = 0usize;
+    let mut items: Vec<Option<T>> = Vec::new();
+    items
+        .try_reserve_exact(nulls.len())
+        .map_err(|_| RowCodecError::Invalid("failed to reserve array elements".to_string()))?;
+    for is_null in nulls {
+        if *is_null {
+            items.push(None);
+            continue;
+        }
+        let len_end = offset.checked_add(4).ok_or_else(|| {
+            RowCodecError::Invalid("offset overflow before array element length".to_string())
+        })?;
+        let len_bytes = rest.get(offset..len_end).ok_or_else(|| {
+            RowCodecError::Invalid("array payload truncated at element length field".to_string())
+        })?;
+        let item_len = u32::from_le_bytes(array_le_bytes::<4>(len_bytes)?);
+        let item_end = len_end.checked_add(item_len as usize).ok_or_else(|| {
+            RowCodecError::Invalid("offset overflow after array element".to_string())
+        })?;
+        let item_bytes = rest.get(len_end..item_end).ok_or_else(|| {
+            RowCodecError::Invalid("array payload truncated at element field".to_string())
+        })?;
+        items.push(Some(convert(item_bytes)?));
+        offset = item_end;
+    }
+    if offset != rest.len() {
+        return Err(RowCodecError::Invalid(
+            "array payload has trailing bytes beyond declared elements".to_string(),
+        ));
+    }
+    Ok(items)
+}
+
 /// 配列要素列（フレームヘッダを含まない本文）を、宣言された `count` 個の要素へ
 /// 構造検証しながらデコードする。要素列の実バイト長が `count` 個をちょうど消費
 /// しない場合（不足・余剰いずれも）は `Err`。TEXT 要素は UTF-8、REAL／DOUBLE は
@@ -1012,50 +1286,38 @@ fn decode_array_elements(
 ) -> Result<ArrayValue> {
     let (nulls, rest) = split_array_null_bitmap(bytes, count as usize, flags)?;
     match elem {
-        ArrayElemType::Text => {
-            let mut offset = 0usize;
-            let mut items: Vec<Option<String>> = Vec::new();
-            items.try_reserve_exact(nulls.len()).map_err(|_| {
-                RowCodecError::Invalid("failed to reserve array text elements".to_string())
-            })?;
-            for is_null in &nulls {
-                if *is_null {
-                    items.push(None);
-                    continue;
+        ArrayElemType::Text => decode_var_array_elements(rest, &nulls, |b| {
+            std::str::from_utf8(b).map(str::to_string).map_err(|_| {
+                RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
+            })
+        })
+        .map(ArrayValue::Text),
+        ArrayElemType::Json => {
+            decode_var_array_elements(rest, &nulls, decode_array_utf8).map(ArrayValue::Json)
+        }
+        ArrayElemType::Jsonb => {
+            decode_var_array_elements(rest, &nulls, decode_array_utf8).map(ArrayValue::Jsonb)
+        }
+        ArrayElemType::Enum => {
+            decode_var_array_elements(rest, &nulls, decode_array_utf8).map(ArrayValue::Enum)
+        }
+        ArrayElemType::Bytea => {
+            decode_var_array_elements(rest, &nulls, |b| Ok(b.to_vec())).map(ArrayValue::Bytea)
+        }
+        ArrayElemType::Numeric { precision, scale } => {
+            decode_fixed_array_elements(rest, &nulls, 16, |c| {
+                let unscaled = i128::from_le_bytes(array_le_bytes::<16>(c)?);
+                let d = Decimal::from_parts(unscaled, scale).map_err(|_| {
+                    RowCodecError::Invalid("array NUMERIC scale out of range".to_string())
+                })?;
+                if !d.fits_precision(precision) {
+                    return Err(RowCodecError::Invalid(
+                        "persisted array NUMERIC element out of range for precision".to_string(),
+                    ));
                 }
-                let len_end = offset.checked_add(4).ok_or_else(|| {
-                    RowCodecError::Invalid(
-                        "offset overflow before array text element length".to_string(),
-                    )
-                })?;
-                let len_bytes = rest.get(offset..len_end).ok_or_else(|| {
-                    RowCodecError::Invalid(
-                        "array payload truncated at element length field".to_string(),
-                    )
-                })?;
-                let item_len = u32::from_le_bytes(array_le_bytes::<4>(len_bytes)?);
-                let item_end = len_end.checked_add(item_len as usize).ok_or_else(|| {
-                    RowCodecError::Invalid("offset overflow after array text element".to_string())
-                })?;
-                let item_bytes = rest.get(len_end..item_end).ok_or_else(|| {
-                    RowCodecError::Invalid(
-                        "array payload truncated at text element field".to_string(),
-                    )
-                })?;
-                let item = std::str::from_utf8(item_bytes)
-                    .map_err(|_| {
-                        RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
-                    })?
-                    .to_string();
-                offset = item_end;
-                items.push(Some(item));
-            }
-            if offset != rest.len() {
-                return Err(RowCodecError::Invalid(
-                    "array payload has trailing bytes beyond declared elements".to_string(),
-                ));
-            }
-            Ok(ArrayValue::Text(items))
+                Ok(d)
+            })
+            .map(ArrayValue::Numeric)
         }
         ArrayElemType::Bool => {
             decode_fixed_array_elements(rest, &nulls, 1, |c| match c.first().copied() {
@@ -1524,7 +1786,7 @@ pub fn encode_row(
             }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
-                    ColumnType::Array(array_ty) => *array_ty,
+                    ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -2486,7 +2748,7 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
             }
             Value::Array(array_value) => {
                 let array_ty = match &column.ty {
-                    ColumnType::Array(array_ty) => *array_ty,
+                    ColumnType::Array(array_ty) => array_ty,
                     ColumnType::Text
                     | ColumnType::Integer
                     | ColumnType::BigInt
@@ -2729,7 +2991,7 @@ pub(crate) fn merge_encode_scalar_columns(
 
     let write_array = |buf: &mut Vec<u8>,
                        reserve: &mut dyn FnMut(&mut Vec<u8>, u32) -> Result<()>,
-                       array_ty: ArrayType,
+                       array_ty: &ArrayType,
                        array_value: &ArrayValue|
      -> Result<()> {
         let entry_len = scalar_array_entry_len(array_ty.elem(), array_value)?;
@@ -2960,7 +3222,7 @@ pub(crate) fn merge_encode_scalar_columns(
                 }
                 Value::Array(array_value) => {
                     let array_ty = match &column.ty {
-                        ColumnType::Array(array_ty) => *array_ty,
+                        ColumnType::Array(array_ty) => array_ty,
                         ColumnType::Text
                         | ColumnType::Integer
                         | ColumnType::BigInt

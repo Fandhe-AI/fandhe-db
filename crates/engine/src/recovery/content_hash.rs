@@ -410,6 +410,67 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                         }
                     }
                 }
+                crate::row_codec::ArrayValue::Numeric(items) => {
+                    b.push_u8(9 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u8(item.scale());
+                            b.push_bytes(&item.unscaled().to_le_bytes())?;
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Bytea(items) => {
+                    b.push_u8(10 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_bytes(item)?;
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Json(items) => {
+                    b.push_u8(11 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_bytes(item.as_bytes())?;
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Jsonb(items) => {
+                    b.push_u8(12 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_bytes(item.as_bytes())?;
+                        }
+                    }
+                }
+                crate::row_codec::ArrayValue::Enum(items) => {
+                    b.push_u8(13 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_bytes(item.as_bytes())?;
+                        }
+                    }
+                }
             }
         }
         // タグ 8・9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約し、10 は

@@ -187,7 +187,8 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
 }
 
 /// `ARRAY` 列（`TEXT`／`BOOLEAN`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
-/// `DATE`／`TIMESTAMP`／`UUID` の各要素型）向け配列直列化。要素種別を
+/// `DATE`／`TIMESTAMP`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
+/// 向け配列直列化。要素種別を
 /// `array_ty.elem()` に応じて検証したうえで `{...}` テキストを組み立てる。
 /// 要素数が [`ArrayType::max_len`] を超える場合はテキストを組み立てる**前**に
 /// 拒否する（`54000`。アロケーション前の上限検査。`security.md`「不安全な
@@ -195,9 +196,16 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
 /// 数値要素は JSON 数値の生テキスト（整数・浮動小数の範囲・形式判定は
 /// `engine::sql::parser::parse_array_literal` がスカラー列と同じ分類で行う）、
 /// 日時・UUID 要素は JSON 文字列を引用付きで出力する（SQL 表層と同じ値が得られる）。
+///
+/// `NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` 要素（Issue #1357）は、スカラー列の
+/// NoSQL 束縛（[`map_json_to_literal`]）と同じ入力形式・同じ変換関数で要素テキストを
+/// 組み立てる（`NUMERIC` は JSON 数値または数値文字列、`BYTEA` は base64 文字列、
+/// `JSON`／`JSONB` は JSON オブジェクト・配列、`ENUM` は語彙内のラベル文字列）。
+/// 値の検証・正規化は engine の `parse_array_literal` が担い、ここでは要素を必ず
+/// 引用・エスケープして配列リテラルの構文を壊さないことだけを保証する。
 pub fn array_literal_text(
     items: &[JsonValue],
-    array_ty: ArrayType,
+    array_ty: &ArrayType,
 ) -> Result<String, TypedJsonError> {
     if items.len() as u64 > array_ty.max_len() as u64 {
         return Err(TypedJsonError::ArrayTooLarge);
@@ -224,6 +232,45 @@ pub fn array_literal_text(
                 ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid,
                 JsonValue::String(s),
             ) => push_array_element(&mut out, s, true),
+            (ArrayElemType::Numeric { .. }, JsonValue::Number(n)) => {
+                push_array_element(&mut out, &number_literal_text(n), false)
+            }
+            (ArrayElemType::Numeric { .. }, JsonValue::String(s)) => {
+                push_array_element(&mut out, s, true)
+            }
+            (ArrayElemType::Bytea, JsonValue::String(s)) => {
+                push_array_element(&mut out, &bytea_literal_text(s)?, true)
+            }
+            (
+                ArrayElemType::Json | ArrayElemType::Jsonb,
+                JsonValue::Object(_) | JsonValue::Array(_),
+            ) => push_array_element(&mut out, &json_literal_text(item)?, true),
+            (ArrayElemType::Json | ArrayElemType::Jsonb, _) => {
+                return Err(TypedJsonError::InvalidJson(
+                    "JSON array element must be a JSON object or array",
+                ))
+            }
+            (ArrayElemType::Enum, JsonValue::String(s)) => {
+                if let Some(def) = array_ty.enum_def() {
+                    if def.validate_label(s).is_err() {
+                        return Err(TypedJsonError::InvalidEnumLabel(format!(
+                            "array element value {s:?} is not a member of enum type {:?}",
+                            def.name()
+                        )));
+                    }
+                }
+                push_array_element(&mut out, s, true)
+            }
+            (ArrayElemType::Numeric { .. }, _) => {
+                return Err(TypedJsonError::TypeMismatch(
+                    "ARRAY column element must be a JSON number or numeric string",
+                ))
+            }
+            (ArrayElemType::Bytea | ArrayElemType::Enum, _) => {
+                return Err(TypedJsonError::TypeMismatch(
+                    "ARRAY column element must be a JSON string",
+                ))
+            }
             (ArrayElemType::Text, _) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON string",
@@ -419,7 +466,7 @@ pub fn map_json_to_literal(
         },
         ColumnType::Array(array_ty) => match raw {
             JsonValue::Array(items) => {
-                Ok(InsertLiteral::String(array_literal_text(items, *array_ty)?))
+                Ok(InsertLiteral::String(array_literal_text(items, array_ty)?))
             }
             _ => Err(TypedJsonError::TypeMismatch(
                 "ARRAY column value must be a JSON array",
@@ -556,7 +603,7 @@ mod tests {
             JsonValue::String("a\"b\\c".to_string()),
             JsonValue::String("plain".to_string()),
         ];
-        let text = array_literal_text(&items, array_ty).expect("ok");
+        let text = array_literal_text(&items, &array_ty).expect("ok");
         assert_eq!(text, r#"{"a\"b\\c","plain"}"#);
     }
 
@@ -564,7 +611,7 @@ mod tests {
     fn array_literal_text_rejects_element_type_mismatch() {
         let array_ty = ArrayType::new(ArrayElemType::Bool, 8).expect("valid array type");
         let items = vec![JsonValue::String("true".to_string())];
-        let err = array_literal_text(&items, array_ty).expect_err("reject");
+        let err = array_literal_text(&items, &array_ty).expect_err("reject");
         assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
     }
 
@@ -575,7 +622,7 @@ mod tests {
             JsonValue::String("a".to_string()),
             JsonValue::String("b".to_string()),
         ];
-        let err = array_literal_text(&items, array_ty).expect_err("reject");
+        let err = array_literal_text(&items, &array_ty).expect_err("reject");
         assert!(matches!(err, TypedJsonError::ArrayTooLarge));
         assert_eq!(err.wire_code(), "54000");
     }
@@ -584,7 +631,7 @@ mod tests {
     fn array_literal_text_emits_unquoted_null_for_json_null_element() {
         let array_ty = ArrayType::new(ArrayElemType::Text, 8).expect("valid array type");
         let items = vec![JsonValue::Null, JsonValue::String("a".to_string())];
-        let text = array_literal_text(&items, array_ty).expect("ok");
+        let text = array_literal_text(&items, &array_ty).expect("ok");
         assert_eq!(text, r#"{NULL,"a"}"#);
     }
 
@@ -598,7 +645,7 @@ mod tests {
             let JsonValue::Array(items) = num(json) else {
                 panic!("array expected");
             };
-            let text = array_literal_text(&items, array_ty).expect("literal text");
+            let text = array_literal_text(&items, &array_ty).expect("literal text");
             engine::sql::parser::parse_array_literal(&text, array_ty).expect("engine parse")
         };
         assert_eq!(
@@ -644,7 +691,7 @@ mod tests {
             (ArrayElemType::Uuid, JsonValue::Bool(false)),
             (ArrayElemType::Timestamp, num("[]")),
         ] {
-            let err = array_literal_text(&[item], ty(elem)).expect_err("reject");
+            let err = array_literal_text(&[item], &ty(elem)).expect_err("reject");
             assert!(matches!(err, TypedJsonError::TypeMismatch(_)));
             assert_eq!(err.wire_code(), "42601");
         }
@@ -656,11 +703,57 @@ mod tests {
         // 不正値はテキスト化後に engine が SQL 表層と同じ分類で拒否する。
         let array_ty = ArrayType::new(ArrayElemType::Uuid, 8).expect("valid array type");
         let items = vec![JsonValue::String("a\"},{\"b".to_string())];
-        let text = array_literal_text(&items, array_ty).expect("ok");
+        let text = array_literal_text(&items, &array_ty).expect("ok");
         assert_eq!(text, r#"{"a\"},{\"b"}"#);
         let err =
             engine::sql::parser::parse_array_literal(&text, array_ty).expect_err("not a uuid");
         assert_eq!(err.wire_code(), "22P02");
+    }
+
+    // Issue #1357: NUMERIC・BYTEA・JSON・JSONB・ENUM 要素の配列直列化。要素は必ず
+    // 引用・エスケープされ、engine の配列リテラル解析で同じ値へ戻る。
+    #[test]
+    fn array_literal_text_handles_numeric_bytea_json_and_enum_elements() {
+        let numeric = ArrayType::new(
+            ArrayElemType::Numeric {
+                precision: 8,
+                scale: 2,
+            },
+            8,
+        )
+        .expect("valid array type");
+        let items = vec![
+            num("1.5"),
+            JsonValue::String("2.25".to_string()),
+            JsonValue::Null,
+        ];
+        let text = array_literal_text(&items, &numeric).expect("numeric");
+        assert_eq!(text, r#"{1.5,"2.25",NULL}"#);
+        engine::sql::parser::parse_array_literal(&text, &numeric).expect("engine parse");
+
+        let bytea = ArrayType::new(ArrayElemType::Bytea, 8).expect("valid array type");
+        let text =
+            array_literal_text(&[JsonValue::String("AQI=".to_string())], &bytea).expect("bytea");
+        assert_eq!(text, r#"{"\\x0102"}"#);
+        let parsed = engine::sql::parser::parse_array_literal(&text, &bytea).expect("parse");
+        assert_eq!(
+            parsed,
+            engine::row_codec::ArrayValue::Bytea(vec![Some(vec![1, 2])])
+        );
+        let err = array_literal_text(&[JsonValue::String("***".to_string())], &bytea)
+            .expect_err("base64");
+        assert_eq!(err.wire_code(), "22P02");
+
+        let json = ArrayType::new(ArrayElemType::Jsonb, 8).expect("valid array type");
+        let text = array_literal_text(&[num(r#"{"b":1,"a":"x\"y"}"#)], &json).expect("json");
+        let parsed = engine::sql::parser::parse_array_literal(&text, &json).expect("parse");
+        assert_eq!(
+            parsed,
+            engine::row_codec::ArrayValue::Jsonb(vec![Some(r#"{"a":"x\"y","b":1}"#.to_string())])
+        );
+        // スカラー JSON 要素はスカラー JSON 列と同じく拒否する。
+        let err = array_literal_text(&[num("1")], &json).expect_err("scalar json");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
