@@ -1536,7 +1536,8 @@ fn declarative_leaf_to_filter(
         | WherePredicate::Or(_)
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::Internal {
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::IdCompare { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -1684,6 +1685,19 @@ fn bind_where_predicates_recursive(
                     ));
                 }
                 expr_filters.push(bound);
+            }
+            // Issue #1352: 疑似列 `id` の厳密整数比較（`sql::subquery` が解決段で
+            // 生成する内部専用の葉）。式述語と同じ `expr_filters` へ載せ、行 `id` を
+            // `f64` へ写さず整数のまま比較する（`2^53` 超でも `22003` にならない）。
+            // 式ノード予算は 1 ノードとして計上する（他の式述語と同じ上限を共有）。
+            WherePredicate::IdCompare { op, value } => {
+                *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large("WHERE expression is too large")
+                })?;
+                expr_filters.push(crate::sql::udf_call::BoundExpr::IdCompare {
+                    op: *op,
+                    value: *value,
+                });
             }
             WherePredicate::Or(branches) => {
                 // TASK-208・SQL-24（Issue #912）: 各分岐を自分自身へ再帰的に
@@ -5966,6 +5980,11 @@ pub(crate) fn collect_where_predicate_idents(
             WherePredicate::ScalarSubqueryCompare { column, .. } => {
                 out.insert(column.clone());
             }
+            // 解決段が生成する内部専用の葉。疑似列 `id` は列参照（ウィンドウ別名
+            // との衝突判定対象）として扱う。
+            WherePredicate::IdCompare { .. } => {
+                out.insert("id".to_string());
+            }
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。
@@ -6069,6 +6088,14 @@ pub(crate) fn bind_scan_with_dummy_flags(
     udfs: &crate::sql::udf_call::UdfRegistry,
     dummy_equality_flags: &[bool],
 ) -> Result<BoundScan, SqlSurfaceError> {
+    // Issue #1352: 投影位置のスカラーサブクエリは `core.rs` の `Statement::Scan`
+    // アームが解決・合流してから束縛へ渡す（解決済みの文は項目を空にして渡す）。
+    // 解決を経ずに届いた場合（Describe 等）に投影列を黙って落とさないよう拒否する。
+    if !stmt.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subquery in the SELECT list is not allowed in this context",
+        ));
+    }
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;

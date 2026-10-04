@@ -854,6 +854,7 @@ mod tests {
             offset: 0,
             window_items: Vec::new(),
             order_keys: Vec::new(),
+            scalar_subquery_items: Vec::new(),
         }))
     }
 
@@ -1064,6 +1065,7 @@ mod tests {
             offset: 0,
             window_items: Vec::new(),
             order_keys: Vec::new(),
+            scalar_subquery_items: Vec::new(),
         }))
     }
 

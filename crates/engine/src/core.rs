@@ -1324,7 +1324,8 @@ fn reject_unsupported_predicate_dml_conjunction(
                 | WherePredicate::Or(_)
                 | WherePredicate::InSubquery { .. }
                 | WherePredicate::Exists { .. }
-                | WherePredicate::ScalarSubqueryCompare { .. } => return Err(unsupported()),
+                | WherePredicate::ScalarSubqueryCompare { .. }
+                | WherePredicate::IdCompare { .. } => return Err(unsupported()),
             },
             // 列 × 数値リテラルの比較の形に限る（`Call` 等は持ち込ませない）。
             WherePredicate::Expression(expr) => match expr {
@@ -1351,7 +1352,8 @@ fn reject_unsupported_predicate_dml_conjunction(
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
-            | WherePredicate::ScalarSubqueryCompare { .. } => return Err(unsupported()),
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. } => return Err(unsupported()),
         }
     }
     Ok(())
@@ -3564,7 +3566,18 @@ impl EngineCore {
                     tokens.get(i - 1),
                     Some(Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge)
                 );
-            if is_exists || is_in || is_scalar {
+            // 投影位置のスカラーサブクエリ（Issue #1352）: 直前が `SELECT` または `,` の
+            // `( SELECT`。内側の `$n` が外側の `where_equality_dummy_flags` の添字を
+            // ずらしうるため、`$n` との併用は Parse 段で拒否する。CTE 本体（直前が
+            // `AS`）・集合演算の枝（直前が演算子キーワード）は対象にしない。
+            let is_projection_scalar = matches!(tokens.get(i), Some(Token::Punct('(')))
+                && matches!(tokens.get(i + 1), Some(Token::Keyword(Keyword::Select)))
+                && i > 0
+                && matches!(
+                    tokens.get(i - 1),
+                    Some(Token::Keyword(Keyword::Select) | Token::Punct(','))
+                );
+            if is_exists || is_in || is_scalar || is_projection_scalar {
                 return true;
             }
         }
@@ -5331,8 +5344,26 @@ impl EngineCore {
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
+                // Issue #1352: 投影位置のスカラーサブクエリは WHERE 側と同じ予算・同じ
+                // `read_txn`・同じ `ctx`（RLS 暗黙適用）で解決し、束縛へは項目を空にして
+                // 渡す。解決結果は外側の走査結果へ SELECT リスト上の位置で合流する。
+                let projection_items = std::mem::take(&mut validated.scalar_subquery_items);
+                // 外側の静的な束縛・検証を内側の実行より先に行う（外側の誤りが内側の
+                // 可視データに依存するエラーで覆われないようにする）。
                 let bound = crate::sql::parser::bind_scan(&validated, &schema, session.udfs())?;
+                let resolved_items = crate::sql::subquery::resolve_scalar_projection_items(
+                    &projection_items,
+                    &[&schema],
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    &mut subquery_budget,
+                    &mut subquery_in_value_budget,
+                )?;
                 let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
+                let result =
+                    crate::sql::subquery::merge_scalar_projection_items(result, resolved_items)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // 集合演算・JOIN は複数枝／両辺を単一スナップショット上で評価する必要が

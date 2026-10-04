@@ -1491,6 +1491,13 @@ fn push_dml_where_predicate(
                 detail: "unresolved subquery reached DML content hash".to_string(),
             });
         }
+        // `IdCompare` は `sql::subquery` が解決段で生成する内部専用の葉で、構文解析
+        // からは作られない（述語形 DML の content hash 対象へ到達しない防御的経路）。
+        WherePredicate::IdCompare { .. } => {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal id comparison reached DML content hash".to_string(),
+            });
+        }
     }
     Ok(())
 }

@@ -25,7 +25,12 @@
 //!   `GROUP BY` の有無を問わず `LIMIT` 不要）。
 //!
 //! ランキング付き検索 SELECT・集合演算・JOIN・内側の `LIMIT` 省略（Scan 形）・
-//! 投影位置のスカラーサブクエリは `42601`（`docs/design/sql-subquery.md` 参照）。
+//! 内側自身の投影位置スカラーサブクエリは `42601`（`docs/design/sql-subquery.md` 参照）。
+//!
+//! 投影位置のスカラーサブクエリ（Issue #1352。外側は広域取得 SELECT のみ）は
+//! [`resolve_scalar_projection_items`] が内側を実行して列メタデータと値（0 行は NULL）へ
+//! 解決し、[`merge_scalar_projection_items`] が外側の走査結果へ SELECT リスト上の位置で
+//! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `22000`。
 //!
 //! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
 //! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
@@ -68,8 +73,9 @@
 use std::collections::HashSet;
 
 use super::allowlist::{
-    AggregateArg, AggregateSelectItem, CompareOp, Projection, ScalarSubqueryOp, SelectItem,
-    SqlSurfaceError, Statement, TableLookup, ValidatedAggregate, ValidatedScan, WherePredicate,
+    AggregateArg, AggregateSelectItem, CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp,
+    SelectItem, SqlSurfaceError, Statement, TableLookup, ValidatedAggregate, ValidatedScan,
+    WherePredicate,
 };
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
@@ -279,6 +285,12 @@ enum InnerScanIntent {
     /// スカラーサブクエリ（Issue #1191）: 単一列の Scan、または単一集計項目の
     /// 集計形を、ユーザー指定のまま実行して行数・値を確認する。
     Scalar,
+    /// 投影位置のスカラーサブクエリ（Issue #1352）: [`Self::Scalar`] と同じく単一列の
+    /// Scan または単一集計項目の集計形を実行するが、値は 0 行（NULL）または 1 行しか
+    /// 使わない。そのため Scan 形は元の `LIMIT` を検証した**後に**実質 `LIMIT 2`
+    /// （「2 行目が存在するか」の判定に足りる最小値）へ差し替える。`WHERE`・RLS の
+    /// 適用は変更しない。
+    ScalarValue,
 }
 
 /// 内側 Scan が参照する非修飾の列名を集める（相関検出専用。疑似列 `id` を含みうる）。
@@ -391,6 +403,40 @@ fn execute_inner_query(
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    let mut meta_sink = None;
+    execute_inner_query_with_meta(
+        inner_tokens,
+        depth,
+        intent,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        budget,
+        in_value_budget,
+        &mut meta_sink,
+    )
+}
+
+/// [`execute_inner_query`] の本体。束縛（`bind_scan`／`bind_aggregate`）に成功した時点で、
+/// 実行とは独立に確定する投影列メタデータを `meta_sink` へ書き出す（Issue #1352。
+/// 実行時エラーを遅延する投影位置のスカラーサブクエリが、外側の行数に関わらず同じ列型を
+/// 公告するため）。束縛前に失敗した場合（静的エラー）は `meta_sink` が `None` のまま残る。
+#[allow(clippy::too_many_arguments)]
+fn execute_inner_query_with_meta(
+    inner_tokens: &[Token],
+    depth: usize,
+    intent: InnerScanIntent,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
+) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     *budget = budget.checked_sub(1).ok_or_else(|| {
         SqlSurfaceError::payload_too_large(format!(
             "subquery execution count exceeds limit {MAX_SUBQUERY_EXECUTIONS}"
@@ -410,19 +456,22 @@ fn execute_inner_query(
             udfs,
             budget,
             in_value_budget,
+            meta_sink,
         )?,
-        (Statement::Aggregate(validated), InnerScanIntent::Scalar) => {
-            execute_inner_aggregate_statement(
-                validated,
-                outer_scopes,
-                read_txn,
-                ctx,
-                lookup,
-                udfs,
-                budget,
-                in_value_budget,
-            )?
-        }
+        (
+            Statement::Aggregate(validated),
+            InnerScanIntent::Scalar | InnerScanIntent::ScalarValue,
+        ) => execute_inner_aggregate_statement(
+            validated,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            budget,
+            in_value_budget,
+            meta_sink,
+        )?,
         _ => {
             return Err(SqlSurfaceError::unsupported(
                 "subquery must be a plain SELECT ... FROM ... [WHERE ...] LIMIT n \
@@ -458,6 +507,7 @@ fn execute_inner_scan_statement(
     udfs: &UdfRegistry,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     // Cursor Bugbot 指摘対応: ウィンドウ関数（SQL-30・TASK-214、Issue #930）を
     // 含む内側は一律拒否する。`window_items` が非空だと `sql::scan::execute_scan` は
@@ -479,7 +529,18 @@ fn execute_inner_scan_statement(
         outer_scopes,
     )?;
 
-    if matches!(intent, InnerScanIntent::Values | InnerScanIntent::Scalar) {
+    // Issue #1352: 内側自身の投影位置スカラーサブクエリは非対応（WHERE 経由の入れ子は
+    // 深さ上限内で従来どおり許可）。投影を黙って落とさないよう intent に関わらず拒否する。
+    if !validated.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "a subquery cannot contain a scalar subquery in its SELECT list",
+        ));
+    }
+
+    if matches!(
+        intent,
+        InnerScanIntent::Values | InnerScanIntent::Scalar | InnerScanIntent::ScalarValue
+    ) {
         // 投影列数（ちょうど 1 列）を実行前に静的に確定して拒否する（PR #1103
         // 追加 codex-review P1 指摘の自己点検: 必要以上の投影で走査コストを払って
         // から拒否する問題を避ける。`resolve_in_subquery` 等の実行後チェックは
@@ -499,9 +560,16 @@ fn execute_inner_scan_statement(
     // 自身の WHERE に含まれるさらに深いサブクエリを、束縛（`bind_scan`）の前に
     // 解決する（深さ優先。`depth` は構文解析段で `MAX_SUBQUERY_DEPTH` 検査
     // 済みのため、ここでは budget のみ検査すれば足りる）。
+    // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
+    let static_preds: Vec<WherePredicate> = validated
+        .where_predicates
+        .iter()
+        .filter(|p| !predicate_contains_subquery(p))
+        .cloned()
+        .collect();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
-    validated.where_predicates = resolve_where_predicates(
+    validated.where_predicates = match resolve_where_predicates(
         validated.where_predicates,
         &chain,
         read_txn,
@@ -510,7 +578,22 @@ fn execute_inner_scan_statement(
         udfs,
         budget,
         in_value_budget,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // 入れ子 WHERE サブクエリの実行時データ例外は、投影位置の外側が行数判明まで
+            // 遅延できるよう、投影メタデータ（WHERE に依存しない）を先に確定する。
+            // 内側 WHERE の静的な誤り（未知列等）はデータ依存の実行時エラーより優先して
+            // 返す（可視データで契約が変わらないよう、サブクエリを含まない述語は
+            // 束縛検証を完了させる）。
+            if intent == InnerScanIntent::ScalarValue {
+                validated.where_predicates = static_preds;
+                let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+                *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
+            }
+            return Err(e);
+        }
+    };
 
     if intent == InnerScanIntent::ExistenceOnly {
         // ユーザー指定の `LIMIT` 自体の範囲検証（`bind_scan` が本来行う契約）
@@ -532,7 +615,14 @@ fn execute_inner_scan_statement(
         validated.limit = 1;
     }
 
+    if intent == InnerScanIntent::ScalarValue {
+        // 元の `LIMIT` 自体の範囲検証は差し替えで迂回されないよう先に行う（fail-closed）。
+        super::parser::validate_search_limit(validated.limit)?;
+        validated.limit = validated.limit.min(2);
+    }
+
     let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+    *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
     super::scan::execute_scan(read_txn, ctx, &inner_schema, &bound)
 }
 
@@ -549,6 +639,7 @@ fn execute_inner_aggregate_statement(
     udfs: &UdfRegistry,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     if validated.items.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
@@ -561,9 +652,16 @@ fn execute_inner_aggregate_statement(
         &inner_schema,
         outer_scopes,
     )?;
+    // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
+    let static_preds: Vec<WherePredicate> = validated
+        .where_predicates
+        .iter()
+        .filter(|p| !predicate_contains_subquery(p))
+        .cloned()
+        .collect();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
-    validated.where_predicates = resolve_where_predicates(
+    validated.where_predicates = match resolve_where_predicates(
         validated.where_predicates,
         &chain,
         read_txn,
@@ -572,8 +670,18 @@ fn execute_inner_aggregate_statement(
         udfs,
         budget,
         in_value_budget,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // スキャン側と同じ理由で、入れ子 WHERE の失敗時も投影メタデータを確定する。
+            validated.where_predicates = static_preds;
+            let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
+            *meta_sink = Some(super::describe::aggregate_columns(&bound));
+            return Err(e);
+        }
+    };
     let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
+    *meta_sink = Some(super::describe::aggregate_columns(&bound));
     super::aggregate::execute_aggregate_with_cache(
         read_txn,
         ctx,
@@ -584,6 +692,20 @@ fn execute_inner_aggregate_statement(
         None,
         None,
     )
+}
+
+/// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
+/// 入れ子 WHERE の実行時エラー時に、サブクエリを含まない述語だけで静的検証を
+/// 完了させるために使う（`execute_inner_query` 系から呼ばれる）。
+fn predicate_contains_subquery(pred: &WherePredicate) -> bool {
+    match pred {
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. } => true,
+        WherePredicate::Not(inner) => predicate_contains_subquery(inner),
+        WherePredicate::Or(branches) => branches.iter().flatten().any(predicate_contains_subquery),
+        _ => false,
+    }
 }
 
 /// `outer_scopes` の末尾（＝サブクエリを含む文自身のテーブル）を返す。
@@ -650,10 +772,14 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
 }
 
 /// `<column> [NOT] IN (SELECT ...)` の対象列 `column` を `outer_schema`（この
-/// サブクエリを含む文自身のテーブルのスキーマ）に対して検証し、列型と値族を返す。
-/// 存在しない列は `22000`（`unknown column`。通常の `WHERE` 等価述語束縛と同じ
-/// 文言・`wire_code`）、`IN` で扱えない型（`REAL`／`DOUBLE`・`VECTOR`・配列・JSON）
-/// と疑似列 `id` は同じく `22000` で拒否する。
+/// サブクエリを含む文自身のテーブルのスキーマ）に対して検証し、列型（疑似列 `id` は
+/// 型なし＝`None`）と値族を返す。存在しない列は `22000`（`unknown column`。通常の
+/// `WHERE` 等価述語束縛と同じ文言・`wire_code`）、`IN` で扱えない型（`VECTOR`・配列・
+/// JSON）は同じく `22000` で拒否する。
+///
+/// 疑似列 `id` はスキーマに同名の実カラムが無い場合に限り整数族として受理する
+/// （実カラム優先。`udf_call` の識別子束縛・スカラー比較〔[`resolve_scalar_compare`]〕
+/// と同じ規則。Issue #1352）。`REAL`／`DOUBLE PRECISION` は浮動小数族として受理する。
 ///
 /// この検証は内側サブクエリの結果行数（0 行・NULL のみを含む）に一切依存しない
 /// （PR #1103 codex-review P1 指摘対応: 内側が 0 行／NULL のみでも列名・型検証を
@@ -661,15 +787,18 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
 fn validate_in_target_column<'a>(
     column: &str,
     outer_schema: &'a TableSchema,
-) -> Result<(&'a ColumnType, SubqueryValueFamily), SqlSurfaceError> {
-    let column_def = outer_schema
-        .columns
-        .iter()
-        .find(|c| c.name == column)
-        .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {column}")))?;
+) -> Result<(Option<&'a ColumnType>, SubqueryValueFamily), SqlSurfaceError> {
+    let Some(column_def) = outer_schema.columns.iter().find(|c| c.name == column) else {
+        if column == "id" {
+            return Ok((None, SubqueryValueFamily::Integer));
+        }
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "unknown column: {column}"
+        )));
+    };
     match family_of_type(&column_def.ty) {
-        Some(family) if family != SubqueryValueFamily::Float => Ok((&column_def.ty, family)),
-        _ => Err(SqlSurfaceError::invalid_input(format!(
+        Some(family) => Ok((Some(&column_def.ty), family)),
+        None => Err(SqlSurfaceError::invalid_input(format!(
             "column {column:?} type is not supported as a subquery IN target"
         ))),
     }
@@ -741,7 +870,8 @@ fn resolve_in_subquery(
     let mut has_null = false;
     let mut texts: Vec<String> = Vec::new();
     let mut bools: Vec<bool> = Vec::new();
-    let mut ints: Vec<i64> = Vec::new();
+    let mut ints: Vec<i128> = Vec::new();
+    let mut floats: Vec<f64> = Vec::new();
     for row in &result.rows {
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery row missing projected cell".to_string(),
@@ -757,7 +887,7 @@ fn resolve_in_subquery(
                 // 対象列が ENUM の場合、語彙外ラベルは「その値には一致しない」
                 // として除外する（除外しないと後段の束縛が 22P02 で文全体を
                 // 落とす。PR #1103 追加 codex-review P1 指摘対応）。
-                if let ColumnType::Enum(def) = target_ty {
+                if let Some(ColumnType::Enum(def)) = target_ty {
                     if !def.contains(&value) {
                         continue;
                     }
@@ -774,20 +904,26 @@ fn resolve_in_subquery(
                 _ => return Err(unexpected_cell_type()),
             },
             SubqueryValueFamily::Integer => match cell {
-                Cell::SignedInteger(n) => ints.push(*n),
-                // `u64` が `i64` に収まらない値は、どの整数列の値とも一致し得ない。
-                Cell::Integer(n) => {
-                    if let Ok(n) = i64::try_from(*n) {
-                        ints.push(n);
-                    }
+                Cell::SignedInteger(n) => ints.push(i128::from(*n)),
+                // 疑似列 `id` は `u64` 全域を取り得るため、`i128` で保持して落とさない
+                // （`i64` 超の値も等価比較の対象とする。範囲外の写像は `int_compare` が担う）。
+                Cell::Integer(n) => ints.push(i128::from(*n)),
+                _ => return Err(unexpected_cell_type()),
+            },
+            SubqueryValueFamily::Float => match cell {
+                // 非有限値（NaN・無限大）は比較が定義できないため、スカラー比較
+                // （[`number_cell_text`]）と同じく `22000` で fail-closed にする。
+                Cell::Float(f) if f.is_finite() => {
+                    // `-0.0` と `+0.0` は等しいため `+0.0` へ正規化して重複除去へ載せる。
+                    floats.push(if *f == 0.0 { 0.0 } else { *f });
+                }
+                Cell::Float(_) => {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "subquery returned a non-finite number",
+                    ))
                 }
                 _ => return Err(unexpected_cell_type()),
             },
-            SubqueryValueFamily::Float => {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "float family reached the IN value collection".to_string(),
-                })
-            }
         }
     }
 
@@ -799,16 +935,23 @@ fn resolve_in_subquery(
     bools.dedup();
     ints.sort_unstable();
     ints.dedup();
-    let distinct = texts.len() + bools.len() + ints.len();
-    if family == SubqueryValueFamily::Integer {
+    floats.sort_by(f64::total_cmp);
+    floats.dedup();
+    let distinct = texts.len() + bools.len() + ints.len() + floats.len();
+    // 整数・浮動小数列は値ごとの式述語（式ノード予算あり）へ展開するため、1 サイトの
+    // distinct 値数を式ノード予算に収まる上限へ抑える。
+    if matches!(
+        family,
+        SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+    ) {
         let cap = if negated {
             MAX_INT_NOT_IN_VALUES
         } else {
             crate::declarative_filter::MAX_IN_LIST_ITEMS
         };
-        if ints.len() > cap {
+        if ints.len().max(floats.len()) > cap {
             return Err(SqlSurfaceError::payload_too_large(format!(
-                "subquery IN distinct value count exceeds limit {cap} for integer columns"
+                "subquery IN distinct value count exceeds limit {cap} for numeric columns"
             )));
         }
     }
@@ -833,8 +976,14 @@ fn resolve_in_subquery(
             ),
             SubqueryValueFamily::Integer => WherePredicate::Or(
                 ints.into_iter()
-                    .map(|n| vec![int_compare(column, BinOp::Eq, i128::from(n))])
+                    .map(|n| vec![target_int_compare(column, target_ty, BinOp::Eq, n)])
                     .collect(),
+            ),
+            SubqueryValueFamily::Float => WherePredicate::Or(
+                floats
+                    .into_iter()
+                    .map(|f| float_compare(column, BinOp::Eq, f).map(|p| vec![p]))
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
             _ => build_in_set_predicate(column, texts),
         };
@@ -871,11 +1020,26 @@ fn resolve_in_subquery(
                 ints.into_iter()
                     .map(|n| {
                         WherePredicate::Or(vec![
-                            vec![int_compare(column, BinOp::Lt, i128::from(n))],
-                            vec![int_compare(column, BinOp::Gt, i128::from(n))],
+                            vec![target_int_compare(column, target_ty, BinOp::Lt, n)],
+                            vec![target_int_compare(column, target_ty, BinOp::Gt, n)],
                         ])
                     })
                     .collect()
+            }
+        }
+        SubqueryValueFamily::Float => {
+            if floats.is_empty() {
+                vec![not_null()]
+            } else {
+                floats
+                    .into_iter()
+                    .map(|f| {
+                        Ok(WherePredicate::Or(vec![
+                            vec![float_compare(column, BinOp::Lt, f)?],
+                            vec![float_compare(column, BinOp::Gt, f)?],
+                        ]))
+                    })
+                    .collect::<Result<Vec<_>, SqlSurfaceError>>()?
             }
         }
         _ => {
@@ -897,6 +1061,24 @@ fn resolve_in_subquery(
             }
         }
     })
+}
+
+/// 整数値 `n` との比較述語を対象列に応じて組み立てる。疑似列 `id`（スキーマに同名の
+/// 実カラムが無く `target_ty == None`）は `u64` 全域を取り得るため、式評価器の `f64`
+/// 写像（`2^53` 超で `22003`）を避けて厳密整数比較の [`WherePredicate::IdCompare`] を
+/// 返す。実カラム（`BIGINT` 等）は従来どおり [`int_compare`] の式述語を返す。
+/// `op` は `Eq`／`Lt`／`Le`／`Gt`／`Ge` のみを想定する（Issue #1352）。
+fn target_int_compare(
+    column: &str,
+    target_ty: Option<&ColumnType>,
+    op: BinOp,
+    n: i128,
+) -> WherePredicate {
+    if target_ty.is_none() && column == "id" {
+        WherePredicate::IdCompare { op, value: n }
+    } else {
+        int_compare(column, op, n)
+    }
 }
 
 /// 式評価器（`f64`）が正確に表現できる整数の絶対値上限（`2^53`）。列値側の検査
@@ -933,6 +1115,210 @@ fn int_compare(column: &str, op: BinOp, n: i128) -> WherePredicate {
         lhs: Box::new(Expr::Ident(column.to_string())),
         rhs: Box::new(Expr::Number(n.to_string())),
     })
+}
+
+/// `<column> <op> <浮動小数>` の式述語（浮動小数リテラルの比較と同じ AST 形）。
+/// `f` は有限値のみ（呼び出し側で検査済み）。`REAL` 列の値は `f64` へ無損失拡大して
+/// 評価されるため、内側の `REAL` セル（同じ拡大値）とは厳密に一致し、`DOUBLE` 値とは
+/// PostgreSQL と同じく拡大後の値どうしで比較される（Issue #1352）。
+fn float_compare(column: &str, op: BinOp, f: f64) -> Result<WherePredicate, SqlSurfaceError> {
+    Ok(WherePredicate::Expression(Expr::Binary {
+        op,
+        lhs: Box::new(Expr::Ident(column.to_string())),
+        rhs: Box::new(Expr::Number(number_cell_text(&Cell::Float(f))?)),
+    }))
+}
+
+/// 解決済みの投影位置スカラーサブクエリ 1 項目（Issue #1352）。
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedScalarItem {
+    position: usize,
+    meta: ColumnMeta,
+    cell: Cell,
+    /// 内側が 2 行以上を返したか。外側の結果が 1 行以上のときだけエラーにする
+    /// （PostgreSQL の遅延評価と同じ。判定は自テナント可視行のみで決まる）。
+    multi_row: bool,
+    /// 内側の実行時エラー（式評価のデータ例外 `22xxx`。0 除算 `22012`・数値あふれ `22003` 等。静的な `22000` は含めない）。外側が 1 行以上の
+    /// ときだけ返す（PostgreSQL の遅延評価と同じ。外側 0 行では内側は評価されない）。
+    /// 静的エラー（`42xxx`・`22000`・`54000` 等）はここへ入れず解決時点で即返す。
+    deferred_error: Option<SqlSurfaceError>,
+}
+
+/// 投影位置のスカラーサブクエリ（Issue #1352・SQL-29 (a)・RLS-10 (b)・TASK-213）を
+/// すべて実行し、列メタデータと値（0 行は NULL）へ解決する。`core.rs` の
+/// `Statement::Scan` アームが WHERE 側の解決（[`resolve_where_predicates`]）と同じ
+/// `budget`／`in_value_budget`・`read_txn`・`ctx` で呼ぶ。内側は WHERE 側と同じ
+/// 経路（相関拒否・RLS 暗黙適用）を通る。静的エラー（未知列・投影列数・相関）は
+/// 外側の行数に関わらず返る。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_scalar_projection_items(
+    items: &[ScalarSubqueryItem],
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+        let result = match execute_inner_query_with_meta(
+            &item.inner_tokens,
+            item.depth,
+            InnerScanIntent::ScalarValue,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            budget,
+            in_value_budget,
+            &mut meta_sink,
+        ) {
+            Ok(r) => r,
+            // 束縛に成功した後の実行時データ例外（`22xxx`。0 除算・数値あふれ等）だけを、
+            // 外側の行数が判明するまで遅延する。束縛前に失敗した静的エラー（`meta_sink` が
+            // 未確定。`22P02` 等の bind 時エラーを含む）と `22000` は即返す。列メタデータは
+            // 実行とは独立に束縛結果から確定済みのため、外側の行数で列型は変わらない。
+            Err(e) if e.wire_code().starts_with("22") && e.wire_code() != "22000" => {
+                let inner_meta = match meta_sink.as_deref() {
+                    Some([m]) => m.clone(),
+                    _ => return Err(e),
+                };
+                out.push(ResolvedScalarItem {
+                    position: item.position,
+                    meta: alias_scalar_meta(&inner_meta, item.alias.as_ref()),
+                    cell: Cell::Null,
+                    multi_row: false,
+                    deferred_error: Some(e),
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if result.columns.len() != 1 {
+            return Err(SqlSurfaceError::unsupported(
+                "subquery used as a value must select exactly one column",
+            ));
+        }
+        let inner_meta = result
+            .columns
+            .first()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "subquery result missing projected column metadata".to_string(),
+            })?;
+        let meta = alias_scalar_meta(inner_meta, item.alias.as_ref());
+        let multi_row = result.rows.len() > 1;
+        let cell = match result.rows.first() {
+            None => Cell::Null,
+            Some(_) if multi_row => Cell::Null,
+            Some(row) => row
+                .cells
+                .first()
+                .cloned()
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "subquery row missing projected cell".to_string(),
+                })?,
+        };
+        out.push(ResolvedScalarItem {
+            position: item.position,
+            meta,
+            cell,
+            multi_row,
+            deferred_error: None,
+        });
+    }
+    Ok(out)
+}
+
+/// 内側の投影列メタデータへ別名を適用する。別名があれば列名だけ差し替え、型 OID の
+/// 根拠となる型は保持する。疑似列 `id`（名前を持てない）は JOIN の別名処理と同じく
+/// numeric 静的型の `Computed` へ載せ替える（wire 上の型は `Id` と同じ numeric）。
+fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnMeta {
+    match (inner_meta, alias) {
+        (meta, None) => meta.clone(),
+        (ColumnMeta::Scalar { ty, .. }, Some(alias)) => ColumnMeta::Scalar {
+            name: alias.clone(),
+            ty: ty.clone(),
+        },
+        (ColumnMeta::Computed { ty, .. }, Some(alias)) => ColumnMeta::Computed {
+            name: alias.clone(),
+            ty: ty.clone(),
+        },
+        (ColumnMeta::Id, Some(alias)) => ColumnMeta::Computed {
+            name: alias.clone(),
+            ty: Some(crate::catalog::ColumnType::Numeric {
+                precision: 20,
+                scale: 0,
+            }),
+        },
+    }
+}
+
+/// 解決済みの投影位置スカラーサブクエリを、外側の結果（投影位置の項目を含まない列）へ
+/// SELECT リスト上の位置どおりに合流する（Issue #1352）。
+///
+/// - 内側が 2 行以上で外側の結果が 1 行以上なら `22000`（PostgreSQL の `21000` 相当。
+///   `wire_code` 表に無いため既存分類）。外側が 0 行ならエラーにしない。
+/// - 外側結果の推定バイトに追加セルの推定バイト（全行ぶん）を加えた合計を確保前に `checked_*` で検査し、結果バイト上限
+///   （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]。`sql::scan` の結果バイト上限と同値）を
+///   超えれば `54000`。
+/// - 位置が現在の列数を超える場合は `Internal`（fail-closed。添字アクセスは使わない）。
+pub(crate) fn merge_scalar_projection_items(
+    mut result: super::exec::QueryResult,
+    items: Vec<ResolvedScalarItem>,
+) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    // 投影セルが無ければ合流しない。外側結果は `sql::scan` が同じ上限で検査済みのため再検査しない。
+    if items.is_empty() {
+        return Ok(result);
+    }
+    if !result.rows.is_empty() {
+        if let Some(e) = items.iter().find_map(|i| i.deferred_error.clone()) {
+            return Err(e);
+        }
+    }
+    if !result.rows.is_empty() && items.iter().any(|i| i.multi_row) {
+        return Err(SqlSurfaceError::invalid_input(
+            "more than one row returned by a subquery used as an expression",
+        ));
+    }
+    // 外側結果の使用量を引き継ぎ、追加分との合計を確保前に検査する。
+    let mut total_bytes: usize = super::cursor::estimate_result_bytes(&result);
+    for item in &items {
+        let per_cell = std::mem::size_of::<Cell>()
+            .checked_add(super::cursor::estimate_cell_bytes(&item.cell))
+            .ok_or_else(merge_too_large)?;
+        let added = per_cell
+            .checked_mul(result.rows.len())
+            .ok_or_else(merge_too_large)?;
+        total_bytes = total_bytes.checked_add(added).ok_or_else(merge_too_large)?;
+        if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
+            return Err(merge_too_large());
+        }
+    }
+    for item in items {
+        if item.position > result.columns.len() {
+            return Err(SqlSurfaceError::Internal {
+                detail: "scalar subquery position out of range".to_string(),
+            });
+        }
+        result.columns.insert(item.position, item.meta);
+        for row in &mut result.rows {
+            if item.position > row.cells.len() {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scalar subquery position out of range".to_string(),
+                });
+            }
+            row.cells.insert(item.position, item.cell.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn merge_too_large() -> SqlSurfaceError {
+    SqlSurfaceError::payload_too_large("scalar subquery projection result exceeds size limit")
 }
 
 /// 期待外のセル型（静的な値族検証を通ったのに実行時セルが食い違う場合）。fail-closed。
@@ -1127,14 +1513,14 @@ fn scalar_literal_predicate(
                 _ => return Err(unexpected_cell_type()),
             };
             Ok(match op {
-                ScalarSubqueryOp::Eq => int_compare(column, BinOp::Eq, n),
-                ScalarSubqueryOp::Lt => int_compare(column, BinOp::Lt, n),
-                ScalarSubqueryOp::Le => int_compare(column, BinOp::Le, n),
-                ScalarSubqueryOp::Gt => int_compare(column, BinOp::Gt, n),
-                ScalarSubqueryOp::Ge => int_compare(column, BinOp::Ge, n),
+                ScalarSubqueryOp::Eq => target_int_compare(column, target_ty, BinOp::Eq, n),
+                ScalarSubqueryOp::Lt => target_int_compare(column, target_ty, BinOp::Lt, n),
+                ScalarSubqueryOp::Le => target_int_compare(column, target_ty, BinOp::Le, n),
+                ScalarSubqueryOp::Gt => target_int_compare(column, target_ty, BinOp::Gt, n),
+                ScalarSubqueryOp::Ge => target_int_compare(column, target_ty, BinOp::Ge, n),
                 ScalarSubqueryOp::Ne => WherePredicate::Or(vec![
-                    vec![int_compare(column, BinOp::Lt, n)],
-                    vec![int_compare(column, BinOp::Gt, n)],
+                    vec![target_int_compare(column, target_ty, BinOp::Lt, n)],
+                    vec![target_int_compare(column, target_ty, BinOp::Gt, n)],
                 ]),
             })
         }

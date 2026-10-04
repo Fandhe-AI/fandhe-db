@@ -231,6 +231,7 @@ fn plan_filter(
         order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
+        scalar_subquery_items: Vec::new(),
         order_keys: Vec::new(),
     };
     let bound = super::parser::bind_scan(&scan, &schema, udfs)?;

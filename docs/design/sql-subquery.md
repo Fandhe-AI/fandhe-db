@@ -27,14 +27,15 @@
 | ネスト（`MAX_SUBQUERY_DEPTH` = 4 まで） | 対応 |
 | 外側が広域取得 SELECT（`Statement::Scan`）・集計 SELECT（`Statement::Aggregate`） | 対応 |
 | 外側がランキング付き検索 SELECT（`ORDER BY <=>`・`HYBRID`・`USING PLAN`） | **非対応**（構文は受理するが束縛時に `42601`） |
-| WHERE 値位置のスカラー比較サブクエリ（`<col> <op> (SELECT ...)`。`<op>` は `= <> < <= > >=`） | 対応（Issue #1191）。逆向き（`(SELECT ...) <op> <col>`）・式への埋め込み・投影位置のスカラーサブクエリは **非対応**（`42601`） |
+| WHERE 値位置のスカラー比較サブクエリ（`<col> <op> (SELECT ...)`。`<op>` は `= <> < <= > >=`） | 対応（Issue #1191）。逆向き（`(SELECT ...) <op> <col>`）・式への埋め込みは **非対応**（`42601`） |
+| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] LIMIT <n>) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関のみ。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `22000`（`21000` 相当。分類は既存の `22000`）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
 | 内側がランキング付き検索 SELECT・集合演算・JOIN | **非対応**（`42601`）。集計形（単一集計項目。`GROUP BY` の有無を問わず `LIMIT` 不要）はスカラー比較の内側に限り対応（Issue #1191）。`IN`／`EXISTS` の内側の集計形は非対応 |
 | 内側の `LIMIT` 省略 | **非対応**（`42601`。内側は常に明示 `LIMIT` が必要） |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
 | 相関サブクエリ | **非対応**。束縛前の静的走査で `42601`（Issue #1191。内側スキーマに無く外側スコープのいずれかに有る非修飾列名の参照を検出する。どこにも無い名前は従来どおり `22000`） |
 | `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
-| `IN` 対象列が疑似列 `id` | 実測範囲外（このリポの既存 `WherePredicate::Equality` 束縛自体が疑似列 `id` を対象にしていないため。`sql::subquery::cell_to_equality_predicate` の `Cell::Integer` 分岐は将来の拡張に備えて到達可能コードとして残す） |
-| `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大。内側の投影列は同じ値族であること）。`REAL`／`DOUBLE`／`VECTOR`／配列／JSON・疑似列 `id` は `22000` |
+| `IN` 対象列が疑似列 `id` | 対応（Issue #1352）。スキーマに実カラム `id` が無い場合のみ整数族として扱う（実カラム優先。スカラー比較と同じ規則）。内側は `id` 投影または `INTEGER`／`BIGINT` 列（負値・NULL は一致しない）。`TEXT` 等の他の値族の投影は `22000` |
+| `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大）に加え `REAL`／`DOUBLE PRECISION`（Issue #1352。浮動小数族どうし。`REAL` は `f64` へ無損失拡大して比較し、`-0.0` は `+0.0` と等しい。非有限値は `22000`）。内側の投影列は同じ値族であること。`VECTOR`／配列／JSON は `22000`。整数・浮動小数列の distinct 値数は 1 サイトあたり `IN` 256・`NOT IN` 128 まで（超過は `54000`） |
 | 拡張クエリプロトコル（Parse/Bind、`$n`） | **非対応**（`42601`。理由は後述） |
 | Describe（拡張クエリプロトコルの投影列導出） | 対象外（拡張クエリプロトコル自体が非対応のため） |
 | `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・述語形 `UPDATE`/`DELETE`・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
@@ -283,6 +284,7 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 | `crates/engine/src/core.rs` | `Statement::Scan`/`Statement::Aggregate` アームでの解決呼び出し・`parse_sql`/`execute_sql` のサブクエリ許可化・`parse_sql_prepared` の拒否ガード |
 | `crates/engine/src/sql/view.rs`・`check_constraint.rs`・`recovery/content_hash.rs` | 網羅 `match` の防御的拒否腕（いずれも到達不能。構文段のゲートで先に拒否される） |
 | `crates/engine/tests/sql29_subquery.rs`（新設） | 結合テスト（受理・RLS 境界・深さ上限・文脈拒否・`NOT IN`／`NOT EXISTS`） |
+| `crates/engine/tests/sql29_projection_subquery.rs`（Issue #1352） | 投影位置スカラーサブクエリの結合テスト（列位置・NULL・複数行・拒否形・RLS） |
 | `crates/engine/tests/sql29_subquery_scalar.rs`（Issue #1191） | スカラー比較・相関 `42601`・`IN` 対象型拡大・RLS の結合テスト |
 
 ## OWASP Top 10 観点
@@ -305,9 +307,10 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 
 ## スコープ外（Issue 化はユーザー承認後に判断）
 
-- 投影位置のスカラーサブクエリ（Describe が実行なしで結果列の静的型・列名を確定する必要があり、`Expr`／`SelectItem` の公開 enum 変更と型 OID 導出の設計が別途必要。`42601` 維持）
+- 式の内側（関数引数・演算・`CASE`）に埋め込んだ投影位置スカラーサブクエリ、集計・ランキング付き検索 SELECT・JOIN での投影位置スカラーサブクエリ、Describe（投影位置サブクエリを含む文は `42601`）
+- 投影位置スカラーサブクエリの実装（Issue #1352）: `Projection`／`SelectItem` の公開 enum は変更せず、`ValidatedScan::scalar_subquery_items`（crate 内）へ別保持し、`core.rs` の `Statement::Scan` アームが WHERE 側と同じ予算・`read_txn`・`ctx` で解決して結果列へ位置どおり合流する。内側は実質 `LIMIT 2`（元の `LIMIT` は検証後に差し替え）。合流時に追加セルの推定バイトを検査し超過は `54000`。疑似列 `id` を別名付きで返す場合は wire 上 text になる
 - スカラー比較の 2 行以上を `21000` で返すこと（`wire_code` 表への分類追加が前提。現状は `22000`）
-- `IN`／`EXISTS` の内側の集計形・ランキング付き検索 SELECT・`REAL`／`DOUBLE` 等の `IN` 対象型
+- `IN`／`EXISTS` の内側の集計形・ランキング付き検索 SELECT・外側 `INTEGER`／`BIGINT` 以外の数値列を超える `IN` 対象型の拡大
 - 内側のウィンドウ関数（SQL-30・TASK-214、Issue #930）: `IN`／`EXISTS`
   いずれも内側に `window_items` が含まれる場合は `42601` で一律拒否する
   （PR #1103 Cursor Bugbot 指摘対応。理由は「上限（DoS 対策）」節参照。

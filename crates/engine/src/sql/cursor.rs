@@ -279,7 +279,7 @@ fn estimate_row_bytes(row: &crate::sql::exec::ResultRow) -> usize {
     total
 }
 
-fn estimate_cell_bytes(cell: &Cell) -> usize {
+pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Null | Cell::Bool(_) => 1,
         Cell::Integer(_) | Cell::SignedInteger(_) | Cell::Float(_) | Cell::Timestamp(_) => 8,
@@ -300,7 +300,7 @@ fn estimate_array_bytes(arr: &crate::row_codec::ArrayValue) -> usize {
     arr.approx_heap_bytes().saturating_add(8)
 }
 
-fn estimate_result_bytes(result: &QueryResult) -> usize {
+pub(crate) fn estimate_result_bytes(result: &QueryResult) -> usize {
     result.rows.iter().fold(0usize, |acc, row| {
         acc.saturating_add(estimate_row_bytes(row))
     })
