@@ -1891,6 +1891,22 @@ mod tests {
         ))));
     }
 
+    // Issue #1358: 指数表記の比較リテラルも丸めない正確な scale で束縛される
+    // （`1e-3` が scale 0 の `0` に化けない）。
+    #[test]
+    fn typed_compare_numeric_exponent_literal_keeps_exact_scale() {
+        let schema = typed_compare_schema();
+        let gt = DeclarativeFilter::compare_numeric_literal("price", CompareOp::Gt, "1e-3")
+            .bind(&schema)
+            .expect("bind NUMERIC exponent literal");
+        assert!(!gt.matches(Some(ScalarRef::Numeric(
+            Decimal::from_parts(0, 2).expect("0.00")
+        ))));
+        assert!(gt.matches(Some(ScalarRef::Numeric(
+            Decimal::from_parts(1, 2).expect("0.01")
+        ))));
+    }
+
     #[test]
     fn typed_compare_uuid_range_uses_byte_order() {
         let schema = typed_compare_schema();

@@ -348,7 +348,9 @@ fn malformed_literals_are_rejected_as_invalid_input() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
-    for bad in ["'1e3'", "'abc'", "'1.2.3'", "' 1'", "'NaN'"] {
+    // Issue #1358: 指数表記 `'1e3'` は受理側へ契約改訂（拒否例から外した）。
+    // 桁の無い指数・指数後の小数などの不正形は引き続き 22P02。
+    for bad in ["'1e'", "'1e3.5'", "'abc'", "'1.2.3'", "' 1'", "'NaN'"] {
         let err = core
             .execute_sql_in_session(
                 &alice,
@@ -923,4 +925,69 @@ fn typed_row_insert_roundtrips_numeric_value() {
         .execute_sql(&alice, &format!("SELECT price FROM {TABLE} LIMIT 1"))
         .expect("select should succeed");
     assert_eq!(result.rows[0].cells[0], Cell::Numeric(d(1234, 2)));
+}
+
+// --- Issue #1358: 指数表記の数値リテラル（数値トークン・文字列リテラル） ----------------
+
+fn price_of(core: &EngineCore, ctx: &PolicyContext, id: u64) -> Cell {
+    let result = core
+        .execute_sql(
+            ctx,
+            &format!("SELECT price FROM {TABLE} WHERE id = {id} LIMIT 1"),
+        )
+        .expect("select should succeed");
+    result.rows[0].cells[0].clone()
+}
+
+#[test]
+fn exponent_literals_bind_to_numeric_column() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let cases: &[(&str, i128)] = &[
+        ("1.5e2", 15000),
+        ("-5e-3", -1),
+        ("1E+1", 1000),
+        ("'1.5e2'", 15000),
+    ];
+    for (idx, (literal, expected)) in cases.iter().enumerate() {
+        let id = idx as u64 + 1;
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &insert_sql(id, "ja", literal, id),
+        )
+        .unwrap_or_else(|e| panic!("insert {literal:?} should succeed: {e:?}"));
+        assert_eq!(
+            price_of(&core, &alice, id),
+            Cell::Numeric(d(*expected, 2)),
+            "literal {literal:?}"
+        );
+    }
+    // UPDATE も同じ束縛経路を共有する。
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!("UPDATE {TABLE} SET price = 2.5e1 WHERE id = 1 USING OPERATION_ID 'upd-1358-1'"),
+    )
+    .expect("update with exponent literal should succeed");
+    assert_eq!(price_of(&core, &alice, 1), Cell::Numeric(d(2500, 2)));
+}
+
+#[test]
+fn exponent_literal_overflow_is_22003_with_no_side_effects() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    for bad in ["1e3", "'1e3'", "9.99995e2"] {
+        let err = core
+            .execute_sql_in_session(
+                &alice,
+                &mut SessionState::default(),
+                &insert_sql(1, "ja", bad, 1),
+            )
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22003", "literal {bad:?}");
+    }
+    assert_eq!(count_star(&core, &alice), 0);
 }
