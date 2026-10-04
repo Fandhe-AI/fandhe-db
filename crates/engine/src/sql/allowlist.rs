@@ -528,6 +528,10 @@ pub enum SqlSurfaceError {
     /// 同一テーブルの既存制約名と衝突した（TABLE-22、Issue #1195）。
     /// ERR-6: `42710`。UNIQUE の名前衝突は `DuplicateTable`（`42P07`）のまま。
     DuplicateObject { name: String },
+    /// 主キー宣言済みのテーブルへの `ALTER TABLE ... ADD PRIMARY KEY` の重複宣言
+    /// （TABLE-22 (d)、Issue #1364）。ERR-6: `42P16`。`table` はクライアント自身が
+    /// 指定したテーブル名。
+    InvalidTableDefinition { table: String },
     /// 分割実行 DML が 1 チャンク以上 commit した後に止まった（Issue #1129・
     /// RECOVER-11。`VD001`）。`cause` は止めた原因の分類（コードのみを応答へ載せ、
     /// 内側のメッセージは載せない）。`operation_id` はクライアント自身が指定した値。
@@ -719,6 +723,15 @@ impl SqlSurfaceError {
     pub(crate) fn duplicate_object(name: impl Into<String>) -> Self {
         SqlSurfaceError::DuplicateObject {
             name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::ddl` の `ALTER TABLE ... ADD PRIMARY KEY` の重複宣言
+    /// （Issue #1364）が `catalog::CatalogError::MultiplePrimaryKeys` を写像する
+    /// ために使う。テーブル名は untrusted な字句解析結果のため切り詰める。
+    pub(crate) fn invalid_table_definition(table: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidTableDefinition {
+            table: truncate_for_error(&table.into()),
         }
     }
 
@@ -932,6 +945,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
+            SqlSurfaceError::InvalidTableDefinition { .. } => ErrorClass::InvalidTableDefinition,
             SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
             SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
@@ -1047,6 +1061,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // 制約名はクライアント自身が指定した識別子。テーブル名・テナントは含めない。
             SqlSurfaceError::DuplicateObject { name } => {
                 write!(f, "constraint already exists: {name}")
+            }
+            // クライアント自身が指定したテーブル名のみ。他テナント情報は含めない。
+            SqlSurfaceError::InvalidTableDefinition { table } => {
+                write!(f, "multiple primary keys for table {table} are not allowed")
             }
             // 件数（自テナントで commit 済み）・原因コード・クライアント自身の operation_id
             // だけを載せる。内側のメッセージ・テーブル名・他テナント情報は含めない。
@@ -2942,15 +2960,19 @@ pub struct ValidatedAlterTableAddUnique {
     pub columns: Vec<String>,
 }
 
-/// 許可形状の構造判定を通過した `ALTER TABLE <table> ADD PRIMARY KEY (<col>[, <col>]*)`
-/// 文（TABLE-22 (a)(d)・TASK-233、Issue #1196）。PRIMARY KEY は無名（`CONSTRAINT <name>`
-/// 付きは構造段で `42601`）で、`id` を含む列リストも構造段で `42601`
+/// 許可形状の構造判定を通過した
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY (<col>[, <col>]*)`
+/// 文（TABLE-22 (a)(d)・TASK-233、Issue #1196・#1364）。`constraint_name` は明示名
+/// （省略時は導出名 `<table>_pkey`。識別子の妥当性は構文段が検証済み）。
+/// **BREAKING CHANGE**（Issue #1364）: `constraint_name` フィールドを追加した。
+/// `id` を含む列リストは構造段で `42601`
 /// （`id` は暗黙の主キーで ALTER で再宣言する意味が無いため）。列の存在確認・型適格性・
 /// 既存行の一意性／NOT NULL 検証はカタログ・行の参照を要するため、DDL 権限ゲート通過後の
 /// 実行段（`sql::ddl::execute_alter_table_add_primary_key`）が担う。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedAlterTableAddPrimaryKey {
     pub table_name: String,
+    pub constraint_name: Option<String>,
     pub columns: Vec<String>,
 }
 
@@ -6283,17 +6305,13 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            // `PRIMARY KEY`（Issue #1196・TABLE-22 (a)(d)）。PK は無名のため
-            // `CONSTRAINT <name>` 付きは `42601`（`CREATE TABLE` の
-            // `CONSTRAINT <name> PRIMARY KEY` 拒否と同方針）。`id` は暗黙の主キーで
-            // 何も永続化しないため、`id` を含む列リストも `42601`（見せかけの成功を
-            // 作らない）。いずれもカタログを参照しない構造判定で存在オラクルにならない。
+            // `PRIMARY KEY`（Issue #1196・#1364・TABLE-22 (a)(d)）。明示名
+            // （`CONSTRAINT <name>`）は受理し、名前の識別子検証は上の共通処理が済ませて
+            // いる（名前の衝突・重複宣言はカタログ参照を要する実行段が判定する）。
+            // `id` は暗黙の主キーで何も永続化しないため、`id` を含む列リストは
+            // `42601`（見せかけの成功を作らない）。カタログを参照しない構造判定で
+            // 存在オラクルにならない。
             if self.peek_contextual_keyword("PRIMARY") {
-                if constraint_name.is_some() {
-                    return Err(SqlSurfaceError::unsupported(
-                        "CONSTRAINT <name> is not supported for PRIMARY KEY",
-                    ));
-                }
                 let columns = self.parse_primary_key_table_constraint()?;
                 if columns.iter().any(|c| c.eq_ignore_ascii_case("id")) {
                     return Err(SqlSurfaceError::unsupported(
@@ -6302,6 +6320,7 @@ impl<'a> Parser<'a> {
                 }
                 return Ok(ParsedAlterTableShape::AddPrimaryKey {
                     table_name,
+                    constraint_name,
                     columns,
                 });
             }
@@ -8191,6 +8210,7 @@ enum ParsedAlterTableShape {
     },
     AddPrimaryKey {
         table_name: String,
+        constraint_name: Option<String>,
         columns: Vec<String>,
     },
 }
@@ -11302,9 +11322,11 @@ pub fn validate_alter_table_tokens(
         }),
         ParsedAlterTableShape::AddPrimaryKey {
             table_name,
+            constraint_name,
             columns,
         } => ValidatedAlterTable::AddPrimaryKey(ValidatedAlterTableAddPrimaryKey {
             table_name,
+            constraint_name,
             columns,
         }),
         ParsedAlterTableShape::AlterColumnType {
@@ -11878,12 +11900,21 @@ mod tests {
         match validate_alter_table("ALTER TABLE docs ADD PRIMARY KEY (a, b);") {
             Ok(ValidatedAlterTable::AddPrimaryKey(pk)) => {
                 assert_eq!(pk.table_name, "docs");
+                assert_eq!(pk.constraint_name, None);
                 assert_eq!(pk.columns, vec!["a".to_string(), "b".to_string()]);
             }
             other => panic!("unexpected: {other:?}"),
         }
+        // 名前付き（Issue #1364）は受理され、名前が運ばれる。
+        match validate_alter_table("ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (a)") {
+            Ok(ValidatedAlterTable::AddPrimaryKey(pk)) => {
+                assert_eq!(pk.constraint_name.as_deref(), Some("x"));
+                assert_eq!(pk.columns, vec!["a".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
         for sql in [
-            "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (a)",
+            "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (id)",
             "ALTER TABLE docs ADD PRIMARY KEY (id)",
             "ALTER TABLE docs ADD PRIMARY KEY (a, ID)",
             "ALTER TABLE docs ADD PRIMARY KEY ()",

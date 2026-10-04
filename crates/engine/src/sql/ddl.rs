@@ -205,6 +205,7 @@ pub(crate) fn execute_create_table(
         // での明示制約名指定はスコープ外〔設計 D6〕であり、`allowlist` が常に
         // 未確定名の `UniqueConstraint` を渡す）。
         | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::MultiplePrimaryKeys(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ForeignKeyViolation` は `Storage::alter_table_add_foreign_key`
@@ -427,14 +428,14 @@ pub(crate) fn execute_alter_table_add_unique(
     })
 }
 
-/// `ALTER TABLE <table> ADD PRIMARY KEY (<col>[, ...])` の実行本体（TABLE-22 (a)(d)・
-/// TASK-233、Issue #1196）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を
+/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY (<col>[, ...])` の実行本体
+/// （TABLE-22 (a)(d)・TASK-233、Issue #1196・#1364）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を
 /// 必ず先に呼んでいる前提（権限の無い主体への存在オラクル化を防ぐ）。
 ///
 /// 判定順序（決定的）: テーブル存在確認（`42P01`／`42809`）→
-/// `catalog::Storage::alter_table_add_primary_key`（単一 write txn 内で PK 宣言済み・
-/// 擬似名衝突・スキーマ検証・全テナント既存行の NULL／重複検査を判定。TOCTOU なし）。
-/// 応答の制約名は導出擬似名 `<table>_pkey`（カタログには永続化しない）。
+/// `catalog::Storage::alter_table_add_named_primary_key`（単一 write txn 内で PK 宣言済み
+/// 〔`42P16`〕・名前衝突・スキーマ検証・全テナント既存行の NULL／重複検査を判定。
+/// TOCTOU なし）。応答の制約名は明示名、省略時は導出擬似名 `<table>_pkey`。
 pub(crate) fn execute_alter_table_add_primary_key(
     storage: &Storage,
     stmt: &crate::sql::allowlist::ValidatedAlterTableAddPrimaryKey,
@@ -442,7 +443,11 @@ pub(crate) fn execute_alter_table_add_primary_key(
     ensure_table_exists(storage, &stmt.table_name)?;
     let columns: Vec<&str> = stmt.columns.iter().map(|c| c.as_str()).collect();
     let confirmed_name = storage
-        .alter_table_add_primary_key(&stmt.table_name, &columns)
+        .alter_table_add_named_primary_key(
+            &stmt.table_name,
+            stmt.constraint_name.as_deref(),
+            &columns,
+        )
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_alter_constraint_error(other),
@@ -642,6 +647,9 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
         CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::MultiplePrimaryKeys(table) => {
+            SqlSurfaceError::invalid_table_definition(table)
+        }
         CatalogError::ConstraintNotFound(name) => SqlSurfaceError::UndefinedObject { name },
         CatalogError::ConstraintLimitExceeded(detail) => {
             SqlSurfaceError::PayloadTooLarge { detail }
@@ -805,6 +813,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::UniqueConstraintViolation
         | CatalogError::InvalidForeignKey(_)
         | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::MultiplePrimaryKeys(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         | CatalogError::ForeignKeyViolation
@@ -1037,6 +1046,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
         // 変種で、`alter_table_add_column` からは返らない（到達不能）。
         | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::MultiplePrimaryKeys(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
