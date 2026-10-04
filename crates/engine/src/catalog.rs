@@ -925,18 +925,29 @@ const CATALOG_FORMAT_VERSION_V11: &str = "v11";
 /// フォーマットバージョン」として fail-closed に拒否する（前方互換は持たない）。
 const CATALOG_FORMAT_VERSION_V12: &str = "v12";
 
+/// カタログ v13（TABLE-22・TASK-233、Issue #1364）。v12 の本体の上位集合で、
+/// `pk:` 行の直後に明示された主キー制約名を持つ `pkname:<name>` 行を 1 行追加する
+/// （`ALTER TABLE ... ADD CONSTRAINT <name> PRIMARY KEY`）。`uniq:`／`checks:`／
+/// `fks:` セクションは 0 件を許す（選択理由は主キーの明示名のみで、他の制約の
+/// 有無とは独立なため）。名前が導出名 `<table>_pkey` と同じ主キーは無名と同じ
+/// 正規形（`pkname:` 行なし）で書くため、v13 の `pkname:` は常に導出名以外。
+/// v13 を知らない旧バイナリは「未知のフォーマットバージョン」として fail-closed に
+/// 拒否する（前方互換は持たない）。
+const CATALOG_FORMAT_VERSION_V13: &str = "v13";
+
 /// `FOREIGN KEY` を持ちうるカタログフォーマット版の一覧（TABLE-17・TASK-205・
 /// TABLE-22・TASK-233、Issue #907・#1069）。[`referencing_foreign_keys_in_txn`]
 /// が候補行の絞り込みに使う唯一の情報源。**P0**: 新しい FK 保持版を追加する際は
 /// 必ずここへ追記すること——見落とすと参照先側の書き込み検査
 /// （`constraint::enforce_referencing_rows_in_txn`）と `DROP TABLE` の依存検査
 /// （`2BP01`）の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
-const FK_BEARING_FORMAT_VERSIONS: [&str; 5] = [
+const FK_BEARING_FORMAT_VERSIONS: [&str; 6] = [
     CATALOG_FORMAT_VERSION_V8,
     CATALOG_FORMAT_VERSION_V9,
     CATALOG_FORMAT_VERSION_V10,
     CATALOG_FORMAT_VERSION_V11,
     CATALOG_FORMAT_VERSION_V12,
+    CATALOG_FORMAT_VERSION_V13,
 ];
 
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
@@ -1035,8 +1046,8 @@ pub(crate) const MAX_COLUMN_COUNT: usize = 256;
 pub(crate) const MAX_PRIMARY_KEY_COLUMNS: usize = 32;
 
 /// 主キーの導出擬似名 `<table>_pkey`（PostgreSQL の慣習。TABLE-22 (a)(d)・
-/// TASK-233、Issue #1196）。PRIMARY KEY は無名（カタログに名前を永続化しない）で、
-/// この名前は `ALTER TABLE ... DROP CONSTRAINT <name>` の名前解決
+/// TASK-233、Issue #1196）。名前を明示しない PRIMARY KEY はカタログに名前を
+/// 永続化せず（明示名は Issue #1364 でカタログ v13 に永続化する）、この名前は `ALTER TABLE ... DROP CONSTRAINT <name>` の名前解決
 /// （[`Storage::alter_table_drop_constraint`]）と `ADD PRIMARY KEY` の応答
 /// （`AlterTableAction::AddConstraint`）でのみ使う純関数の結果。
 /// `table.len() + 5` が [`MAX_IDENTIFIER_LEN`] を超える場合はテーブル名の先頭を
@@ -1054,7 +1065,12 @@ pub fn primary_key_constraint_name(table: &str) -> String {
 /// （Issue #1196）。`validate_schema` には入れない（既存カタログの decode を
 /// 壊さないため。ALTER の実行経路だけで判定する）。
 fn name_collides_with_primary_key(schema: &TableSchema, table: &str, name: &str) -> bool {
-    schema.primary_key().is_some() && name == primary_key_constraint_name(table)
+    // 主キーの実効名（明示名があればそれ、無ければ導出名。Issue #1364）で判定する。
+    // `table` は呼び出し元が渡す検証済みテーブル名で `schema.name` と一致する。
+    let _ = table;
+    schema
+        .primary_key_constraint_name_effective()
+        .is_some_and(|effective| effective == name)
 }
 
 /// カタログ値（エンコード済みバイト列）のバイト長上限。デコード前に検証し、
@@ -1240,6 +1256,11 @@ pub enum CatalogError {
     /// 追加する制約の種別による（UNIQUE → `42P07`、CHECK・FOREIGN KEY → `42710`。
     /// Issue #1195）。
     ConstraintAlreadyExists(String),
+    /// 主キーを既に宣言済みのテーブルへ `ALTER TABLE ... ADD [CONSTRAINT <name>]
+    /// PRIMARY KEY` を重ねて宣言した（TABLE-22 (d)・TASK-233、Issue #1364。
+    /// ERR-6: `42P16`）。中身はクライアント自身が指定したテーブル名のみで
+    /// テナントデータを含まない。
+    MultiplePrimaryKeys(String),
     /// `ALTER TABLE ... DROP CONSTRAINT <name>` の対象名が、UNIQUE・CHECK・
     /// FOREIGN KEY いずれの制約としても存在しない（Issue #1067・#1069。
     /// ERR-6: `42704`）。
@@ -1331,6 +1352,9 @@ impl fmt::Display for CatalogError {
             CatalogError::ConstraintAlreadyExists(name) => {
                 write!(f, "constraint already exists: {name}")
             }
+            CatalogError::MultiplePrimaryKeys(table) => {
+                write!(f, "multiple primary keys for table {table} are not allowed")
+            }
             CatalogError::ConstraintNotFound(name) => {
                 write!(f, "constraint not found: {name}")
             }
@@ -1384,6 +1408,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::IndexLimitExceeded(_)
             | CatalogError::InvalidForeignKey(_)
             | CatalogError::ConstraintAlreadyExists(_)
+            | CatalogError::MultiplePrimaryKeys(_)
             | CatalogError::ConstraintNotFound(_)
             | CatalogError::ConstraintLimitExceeded(_)
             | CatalogError::ForeignKeyViolation
@@ -3406,6 +3431,13 @@ pub struct TableSchema {
     /// 主キー構成列を拒否するため、主キー宣言後にここへ現れる名前は常に生存列を
     /// 指す）。空 `Vec` は許さない（[`validate_schema`] が拒否する）。
     primary_key: Option<Vec<String>>,
+    /// 主キー制約の明示名（TABLE-22・TASK-233、Issue #1364）。`None` は導出名
+    /// `<table>_pkey`（[`primary_key_constraint_name`]）を意味し、カタログ
+    /// バイト列も従来から不変。`Some` は導出名と異なる名前だけ（導出名と
+    /// 同じ名前は [`Self::with_primary_key_name`] が `None` へ正規化する）。
+    /// `primary_key` が `Some` のときだけ持てる（[`validate_schema`] が検証）。
+    /// 1 件でも持つスキーマはカタログ v13 で永続化される。
+    primary_key_name: Option<String>,
     /// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）。空が既定（カタログ
     /// v2〜v5 のバイト列不変）。1 件以上持つスキーマは v6 で永続化される。
     unique_constraints: Vec<UniqueConstraint>,
@@ -3428,6 +3460,7 @@ impl TableSchema {
             columns,
             dropped: Vec::new(),
             primary_key: None,
+            primary_key_name: None,
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3450,6 +3483,7 @@ impl TableSchema {
             columns,
             dropped,
             primary_key,
+            primary_key_name: None,
             unique_constraints,
             checks: Vec::new(),
             foreign_keys: Vec::new(),
@@ -3501,6 +3535,30 @@ impl TableSchema {
     pub fn with_primary_key(mut self, columns: Vec<String>) -> Self {
         self.primary_key = Some(columns);
         self
+    }
+
+    /// 主キー制約の明示名（Issue #1364）を設定したコピーを返すビルダー。
+    /// 導出名 `<table>_pkey` と同じ名前は `None` へ正規化する（無名と同じ
+    /// バイト列・同じ意味に保ち、正規形を一意にする）。バリデーションは
+    /// 行わない（[`encode_schema`] 内の [`validate_schema`] が別途通す）。
+    /// [`Storage::alter_table_add_named_primary_key`]・[`decode_schema_body`]
+    /// （v13 の復元）が使う。
+    pub(crate) fn with_primary_key_name(mut self, name: Option<String>) -> Self {
+        let derived = primary_key_constraint_name(&self.name);
+        self.primary_key_name = name.filter(|n| *n != derived);
+        self
+    }
+
+    /// 主キーの実効的な制約名（TABLE-22・TASK-233、Issue #1364）。主キー未宣言は
+    /// `None`、宣言済みで明示名があればそれ、無ければ導出名 `<table>_pkey`。
+    /// `DROP CONSTRAINT` の名前解決と、他制約の名前との衝突判定が使う。
+    pub fn primary_key_constraint_name_effective(&self) -> Option<String> {
+        self.primary_key.as_ref()?;
+        Some(
+            self.primary_key_name
+                .clone()
+                .unwrap_or_else(|| primary_key_constraint_name(&self.name)),
+        )
     }
 
     /// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）を設定したコピーを返す
@@ -3835,6 +3893,30 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     validate_unique_constraints(schema)?;
     validate_check_constraints(schema)?;
     validate_foreign_keys(schema, false)?;
+    // 主キーの明示名（Issue #1364）: 主キー宣言を伴い、識別子として妥当で、
+    // UNIQUE・CHECK・FOREIGN KEY の実名と衝突しないこと（同じテーブル単位の
+    // 名前空間を共有する）。導出名との衝突は従来どおりここでは検査しない
+    // （Issue #1238 の方針。既存カタログの decode を壊さないため ALTER の
+    // 実行経路だけで判定する）。
+    if let Some(pk_name) = &schema.primary_key_name {
+        if schema.primary_key.is_none() {
+            return Err(CatalogError::Invalid(
+                "primary key name requires a primary key".to_string(),
+            ));
+        }
+        validate_identifier(pk_name)?;
+        let used = schema.checks.iter().any(|c| &c.name == pk_name)
+            || schema
+                .unique_constraints
+                .iter()
+                .any(|u| u.name() == pk_name)
+            || schema.foreign_keys.iter().any(|f| f.name() == pk_name);
+        if used {
+            return Err(CatalogError::Invalid(format!(
+                "constraint name {pk_name} is already used by another constraint on this table"
+            )));
+        }
+    }
     // UNIQUE 制約名と CHECK 制約名はテーブル単位の名前空間を共有する（設計 D1・
     // Issue #1067）。個々の検査（`validate_unique_constraints`・
     // `validate_check_constraints`）はそれぞれの集合内の重複しか見ないため、
@@ -4297,6 +4379,10 @@ fn derive_unique_constraint_names(
 /// （TOCTOU 回避。FK の `parent_columns` 未解決中間表現と同じ流儀）。
 fn assign_unique_constraint_names(schema: TableSchema) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    // 主キーの明示名（Issue #1364）は同じ名前空間を使うため既定名の衝突回避対象に
+    // 加える。導出名 `<table>_pkey` は加えない（v12 以下のバイト列・既定名導出を
+    // 変えないため。導出名との衝突は ALTER の実行経路が別途判定する）。
+    used.extend(schema.primary_key_name.clone());
     // 明示 FK 名（TABLE-22・TASK-233、Issue #1069。設計 F1）を衝突回避の対象に
     // 加える。`encode_schema` は UNIQUE 名を FK 名より先に確定するため、この
     // 時点で見える FK 名は「まだ空文字列の既定名待ち」を除いた明示指定分のみ
@@ -4359,6 +4445,8 @@ fn derive_foreign_key_constraint_names(
 /// 参照）。
 fn assign_foreign_key_constraint_names(schema: TableSchema) -> TableSchema {
     let mut used: Vec<String> = schema.checks.iter().map(|c| c.name.clone()).collect();
+    // 主キーの明示名（Issue #1364）。`assign_unique_constraint_names` と同じ理由。
+    used.extend(schema.primary_key_name.clone());
     used.extend(
         schema
             .unique_constraints
@@ -5073,6 +5161,7 @@ fn encode_foreign_key_section_v12(out: &mut String, foreign_keys: &[ForeignKeyDe
 /// ため）。
 fn parse_foreign_key_section_v12<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
+    allow_empty: bool,
 ) -> std::result::Result<Vec<ForeignKeyDef>, String> {
     let fks_line = lines
         .next()
@@ -5083,7 +5172,7 @@ fn parse_foreign_key_section_v12<'a>(
     let count: usize = count_str
         .parse()
         .map_err(|_| format!("malformed foreign key count: {count_str:?}"))?;
-    if count == 0 {
+    if count == 0 && !allow_empty {
         return Err("v12 catalog format requires at least one FOREIGN KEY constraint".to_string());
     }
     if count > MAX_FOREIGN_KEYS_PER_TABLE {
@@ -5200,7 +5289,8 @@ fn parse_foreign_key_section_v12<'a>(
 /// 含み得ないため、区切り文字との衝突は起きない）。エンコード時にも
 /// `validate_schema` を通し、不正なスキーマを永続化しない（fail-closed）。
 ///
-/// バージョン選択: `CHECK` 制約を 1 つでも持つスキーマは（他の宣言の有無を
+/// バージョン選択: 導出名以外の主キー明示名を持つスキーマは v13（Issue #1364。
+/// 他の宣言の有無を問わず最優先）。それ以外で `CHECK` 制約を 1 つでも持つスキーマは（他の宣言の有無を
 /// 問わず）v7 で書く（TABLE-16・TASK-204、Issue #906）。それ以外で
 /// UNIQUE 制約を 1 つでも持つスキーマは（`PRIMARY KEY`・
 /// `DEFAULT`・墓標の有無を問わず）v6 で書く（TABLE-16・TASK-204、Issue #905）。
@@ -5288,13 +5378,27 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             .any(|(fk, derived_name)| fk.name() != derived_name.as_str())
     };
     let mut out = String::new();
-    if has_named_fk {
+    // v13 選択条件（Issue #1364）: 導出名以外の主キー明示名を持つスキーマのみ。
+    // 導出名と同じ名前は `with_primary_key_name` が `None` へ正規化済みだが、
+    // 直接フィールドを構築する経路に備えここでも導出名との一致を除く。
+    let pk_name_explicit: Option<&str> = schema
+        .primary_key_name
+        .as_deref()
+        .filter(|n| *n != primary_key_constraint_name(&schema.name));
+    if has_named_fk || pk_name_explicit.is_some() {
         // カタログ v12（設計 F4。TABLE-22・TASK-233、Issue #1069）: v11 の
         // 上位集合で、`uniq:`／`checks:` セクションは 0 件を許し（この枝へ来る
         // 判断材料は FK の実名のみで UNIQUE・CHECK の有無とは独立なため）、
         // `fks:` セクションのみ名前付き 8 フィールドの `fk:` 行
         // （[`encode_foreign_key_section_v12`]）で書く。
-        out.push_str(CATALOG_FORMAT_VERSION_V12);
+        // v13（Issue #1364）は v12 と同じ本体に `pk:` 行の直後の `pkname:` 行を
+        // 足しただけの上位集合で、同じ出力経路を共有する（UNIQUE・FK の名前は
+        // 常に明示形で書く）。
+        out.push_str(if pk_name_explicit.is_some() {
+            CATALOG_FORMAT_VERSION_V13
+        } else {
+            CATALOG_FORMAT_VERSION_V12
+        });
         out.push('\n');
         out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
         let pk_field = schema
@@ -5303,6 +5407,9 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
             .map(|cols| cols.join(","))
             .unwrap_or_default();
         out.push_str(&format!("pk:{pk_field}\n"));
+        if let Some(pk_name) = pk_name_explicit {
+            out.push_str(&format!("pkname:{pk_name}\n"));
+        }
         for slot in schema.physical_slots() {
             match slot {
                 PhysicalSlot::Live(_, column) => {
@@ -5658,6 +5765,7 @@ fn decode_schema_body(
         V10,
         V11,
         V12,
+        V13,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -5671,6 +5779,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V10 => FormatVersion::V10,
         CATALOG_FORMAT_VERSION_V11 => FormatVersion::V11,
         CATALOG_FORMAT_VERSION_V12 => FormatVersion::V12,
+        CATALOG_FORMAT_VERSION_V13 => FormatVersion::V13,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -5696,8 +5805,9 @@ fn decode_schema_body(
             | FormatVersion::V10
             | FormatVersion::V11
             | FormatVersion::V12
+            | FormatVersion::V13
     );
-    // `pk:` 行を持つのは v4〜v12（v4 は非空必須、v5〜v12 は空を「主キー
+    // `pk:` 行を持つのは v4〜v13（v4 は非空必須、v5〜v12 は空を「主キー
     // なし」として許容する）。
     let has_pk_line = matches!(
         format_version,
@@ -5710,6 +5820,7 @@ fn decode_schema_body(
             | FormatVersion::V10
             | FormatVersion::V11
             | FormatVersion::V12
+            | FormatVersion::V13
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -5765,6 +5876,15 @@ fn decode_schema_body(
             }
             Some(cols)
         }
+    } else {
+        None
+    };
+    // v13 専用: `pk:` 行の直後の `pkname:` 行（Issue #1364）。
+    let primary_key_name: Option<String> = if format_version == FormatVersion::V13 {
+        Some(
+            parse_primary_key_name_line(&mut lines, primary_key.as_deref(), Some(table_name))
+                .map_err(CatalogError::Invalid)?,
+        )
     } else {
         None
     };
@@ -5960,7 +6080,7 @@ fn decode_schema_body(
             .collect(),
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
-        FormatVersion::V12 => parse_unique_section(&mut lines, true, true)
+        FormatVersion::V12 | FormatVersion::V13 => parse_unique_section(&mut lines, true, true)
             .map_err(CatalogError::Invalid)?
             .into_iter()
             .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
@@ -5976,7 +6096,8 @@ fn decode_schema_body(
         | FormatVersion::V9
         | FormatVersion::V10
         | FormatVersion::V11
-        | FormatVersion::V12 => {
+        | FormatVersion::V12
+        | FormatVersion::V13 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -6004,7 +6125,10 @@ fn decode_schema_body(
             parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::Invalid)?
         }
         FormatVersion::V12 => {
-            parse_foreign_key_section_v12(&mut lines).map_err(CatalogError::Invalid)?
+            parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::Invalid)?
+        }
+        FormatVersion::V13 => {
+            parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
     };
@@ -6030,14 +6154,15 @@ fn decode_schema_body(
         unique_constraints,
     )
     .with_checks(checks)
-    .with_foreign_keys(foreign_keys);
+    .with_foreign_keys(foreign_keys)
+    .with_primary_key_name(primary_key_name);
     // v6〜v9（名前の無い UNIQUE 制約）は decode 時に既定名を導出する
     // （設計 D2・Issue #1067）。v10／v11 はすでに実名を持つため素通しする
     // （`assign_unique_constraint_names` は空名の制約にのみ作用するため
     // 呼んでも安全だが、意図を明示するため分岐する）。
     let schema = if matches!(
         format_version,
-        FormatVersion::V10 | FormatVersion::V11 | FormatVersion::V12
+        FormatVersion::V10 | FormatVersion::V11 | FormatVersion::V12 | FormatVersion::V13
     ) {
         schema
     } else {
@@ -6047,7 +6172,7 @@ fn decode_schema_body(
     // F3・Issue #1069）。v12 はすでに実名を持つため素通しする
     // （`assign_foreign_key_constraint_names` は空名の制約にのみ作用するため
     // 呼んでも安全だが、意図を明示するため分岐する）。
-    let schema = if format_version == FormatVersion::V12 {
+    let schema = if matches!(format_version, FormatVersion::V12 | FormatVersion::V13) {
         schema
     } else {
         assign_foreign_key_constraint_names(schema)
@@ -6063,6 +6188,39 @@ fn decode_schema_body(
 /// `false` のときは常に `None`〕・列リスト）。呼び出し元ごとに異なる型を
 /// 書かないための共有エイリアス（clippy `type_complexity` 対応）。
 type ParsedUniqueConstraints = Vec<(Option<String>, Vec<String>)>;
+
+/// カタログ v13 の `pkname:<name>` 行（`pk:` 行の直後。Issue #1364）を構造検証
+/// しつつ読み取る共有パーサー。[`decode_schema_body`] と軽量パーサー
+/// [`catalog_value_references_enum_type`] の両方が使い、fail-closed 判定を
+/// 1 か所に揃える（[`parse_unique_section`] と同じ理由）。
+///
+/// 検証項目: 行の存在・`pkname:` 接頭辞・識別子として妥当（長さ上限を含む）・
+/// 主キー宣言（`pk:` 行が非空）を伴うこと・導出名 `<table>_pkey` と異なること
+/// （導出名は無名と同じ正規形で書くため、v13 には現れない）。UNIQUE・CHECK・FK
+/// 名との衝突は後続の検査（`validate_schema`／軽量パーサー側の名前空間検査）が担う。
+fn parse_primary_key_name_line<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    primary_key: Option<&[String]>,
+    table_name: Option<&str>,
+) -> std::result::Result<String, String> {
+    let line = lines
+        .next()
+        .ok_or_else(|| "catalog value truncated: missing pkname line".to_string())?;
+    let name = line
+        .strip_prefix("pkname:")
+        .ok_or_else(|| "malformed pkname line".to_string())?;
+    if name.is_empty() || name.len() > MAX_IDENTIFIER_LEN {
+        return Err("malformed pkname line".to_string());
+    }
+    validate_identifier(name).map_err(|_| "malformed pkname line".to_string())?;
+    if primary_key.is_none() {
+        return Err("pkname line requires a primary key".to_string());
+    }
+    if table_name.is_some_and(|t| name == primary_key_constraint_name(t)) {
+        return Err("pkname must differ from the derived primary key name".to_string());
+    }
+    Ok(name.to_string())
+}
 
 /// カタログ v6 の `uniq:` セクション（`uniq:<n>` 行と `n` 個の
 /// `U:<col>[,<col>]*` 行。TABLE-16・TASK-204、Issue #905）を構造検証しつつ
@@ -7051,8 +7209,8 @@ impl Storage {
     /// 成功時は導出擬似名（[`primary_key_constraint_name`]）を返す。
     ///
     /// 判定順序（fail-closed。データに依存するのは最後の既存行走査のみ）:
-    /// (1) テーブル取得（`TableNotFound`） (2) 主キー宣言済みなら `Invalid`
-    /// (3) 擬似名が既存 UNIQUE・CHECK・FOREIGN KEY 名と衝突すれば
+    /// (1) テーブル取得（`TableNotFound`） (2) 主キー宣言済みなら
+    /// `MultiplePrimaryKeys`（`42P16`。Issue #1364） (3) 擬似名が既存 UNIQUE・CHECK・FOREIGN KEY 名と衝突すれば
     /// `ConstraintAlreadyExists` (4) 追加後スキーマ（PK 構成列を `nullable=false`
     /// へ）の [`validate_schema`]（未知の列・PK 不可型は `Invalid`。ここでは永続化
     /// しない） (5) 既存行の**全件**（全テナント・`Public`／`Private` を問わない。
@@ -7068,18 +7226,42 @@ impl Storage {
         table_name: &str,
         columns: &[&str],
     ) -> Result<String> {
+        self.alter_table_add_named_primary_key(table_name, None, columns)
+    }
+
+    /// [`Self::alter_table_add_primary_key`] の名前付き版（TABLE-22 (a)(d)・
+    /// TASK-233、Issue #1364。`ALTER TABLE ... ADD CONSTRAINT <name> PRIMARY KEY`）。
+    /// `name` が `None` なら導出擬似名 `<table>_pkey`。成功時は確定名を返す。
+    /// 主キーの名前は UNIQUE・CHECK・FOREIGN KEY と同じテーブル単位の名前空間を
+    /// 共有し、`DROP CONSTRAINT` はこの実効名だけで解決する。
+    ///
+    /// 判定順序（fail-closed）: (1) 識別子検証 (2) テーブル取得（`TableNotFound`）
+    /// (3) **主キー宣言済みなら `MultiplePrimaryKeys`（`42P16`）**——名前の衝突判定
+    /// より先（PostgreSQL と同じ順序。名前の一致は存在オラクルにならない） (4) 確定名が
+    /// 既存 UNIQUE・CHECK・FOREIGN KEY 名と衝突すれば `ConstraintAlreadyExists`
+    /// (5) 以降は [`Self::alter_table_add_primary_key`] 記載の (4)〜(6) と同じ。
+    /// 拒否はすべて write txn を commit せず破棄する（副作用ゼロ）。
+    pub fn alter_table_add_named_primary_key(
+        &self,
+        table_name: &str,
+        name: Option<&str>,
+        columns: &[&str],
+    ) -> Result<String> {
         validate_identifier(table_name)?;
+        if let Some(n) = name {
+            validate_identifier(n)?;
+        }
         let pk_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
-        let confirmed_name = primary_key_constraint_name(table_name);
+        let confirmed_name = name
+            .map(str::to_string)
+            .unwrap_or_else(|| primary_key_constraint_name(table_name));
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             if schema.primary_key().is_some() {
-                return Err(CatalogError::Invalid(
-                    "table already has a primary key".to_string(),
-                ));
+                return Err(CatalogError::MultiplePrimaryKeys(table_name.to_string()));
             }
-            let pseudo_collides = schema
+            let name_collides = schema
                 .unique_constraints
                 .iter()
                 .any(|u| u.name() == confirmed_name)
@@ -7088,11 +7270,14 @@ impl Storage {
                     .foreign_keys
                     .iter()
                     .any(|f| f.name() == confirmed_name);
-            if pseudo_collides {
+            if name_collides {
                 return Err(CatalogError::ConstraintAlreadyExists(confirmed_name));
             }
 
-            let mut updated = schema.clone().with_primary_key(pk_columns.clone());
+            let mut updated = schema
+                .clone()
+                .with_primary_key(pk_columns.clone())
+                .with_primary_key_name(name.map(str::to_string));
             for column in updated.columns.iter_mut() {
                 if pk_columns.iter().any(|n| n == &column.name) {
                     column.nullable = false;
@@ -7223,6 +7408,8 @@ impl Storage {
                         .map(|u| u.name().to_string())
                         .collect();
                     used.extend(schema.checks.iter().map(|c| c.name.clone()));
+                    // 主キーの明示名（Issue #1364）も同じ名前空間を共有する。
+                    used.extend(schema.primary_key_name.clone());
                     // FOREIGN KEY 名も同じ名前空間を共有するため既定名の衝突
                     // 回避対象に含める（設計 F1。UNIQUE・FOREIGN KEY の既定名
                     // 導出〔`assign_unique_constraint_names`／
@@ -7526,7 +7713,7 @@ impl Storage {
             } else if name_collides_with_primary_key(&schema, table_name, name) {
                 // PRIMARY KEY の削除（TABLE-22 (d)、Issue #1196）。実名を持つ制約
                 // （UNIQUE → FOREIGN KEY → CHECK）を先に探した後の最後の候補として、
-                // 導出擬似名で解決する。暗黙の `id` 主キー（未宣言）は削除できず
+                // 実効名（明示名、無ければ導出擬似名）で解決する。暗黙の `id` 主キー（未宣言）は削除できず
                 // `ConstraintNotFound`。
                 let pk_columns: Vec<String> = schema
                     .primary_key()
@@ -7553,6 +7740,9 @@ impl Storage {
                 // 残す。緩める方向は fail-open になりやすい）。
                 let mut cleared = schema.clone();
                 cleared.primary_key = None;
+                // 主キーの明示名も同時に消す（主キーを失った後に名前だけが残る状態を
+                // 作らない。Issue #1364）。
+                cleared.primary_key_name = None;
                 cleared
             } else {
                 return Err(CatalogError::ConstraintNotFound(name.to_string()));
@@ -8640,6 +8830,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）は
         // テーブル存在確認からは到達しない（網羅性のため `Internal` へ丸める）。
         | CatalogError::ConstraintAlreadyExists(_)
+        | CatalogError::MultiplePrimaryKeys(_)
         | CatalogError::ConstraintNotFound(_)
         | CatalogError::ConstraintLimitExceeded(_)
         // `ALTER TABLE ... ADD FOREIGN KEY` の既存行検証違反（TABLE-22・
@@ -8727,7 +8918,19 @@ fn list_tables_in_txn(
 /// として伝播する（codex-review P1 指摘・Issue #890: 破損を「依存なし」に
 /// 丸めると `drop_enum_type` が実際には参照されている ENUM 型を削除できて
 /// しまう。`decode_schema_body` と同じ fail-closed 方針をここでも徹底する）。
+#[cfg(test)]
 fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<bool> {
+    catalog_value_references_enum_type_in_table(bytes, type_name, None)
+}
+
+/// [`catalog_value_references_enum_type`] の本体。`table_name` は v13 の
+/// `pkname:` 行を導出名と照合するための所有テーブル名（カタログのキー。
+/// 不明な単体テストでは `None`）。
+fn catalog_value_references_enum_type_in_table(
+    bytes: &[u8],
+    type_name: &str,
+    table_name: Option<&str>,
+) -> Result<bool> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::CorruptSchema(format!(
             "catalog value too large: {} bytes",
@@ -8779,6 +8982,9 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // セクションが 0 件を許すようになり、`fks:` セクションの `fk:` 行が
         // 名前付き 8 フィールドへ拡張する（下記で検証する）。
         CATALOG_FORMAT_VERSION_V12 => (true, true),
+        // v13（Issue #1364）は v12 の上位集合で、`pk:` 行の直後に `pkname:` 行を
+        // 持つ（下記で `decode_schema_body` と同じ共有パーサーで検証する）。
+        CATALOG_FORMAT_VERSION_V13 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -8794,8 +9000,9 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     let is_v10 = version_line == CATALOG_FORMAT_VERSION_V10;
     let is_v11 = version_line == CATALOG_FORMAT_VERSION_V11;
     let is_v12 = version_line == CATALOG_FORMAT_VERSION_V12;
+    let is_v13 = version_line == CATALOG_FORMAT_VERSION_V13;
     let has_pk_line =
-        is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12;
+        is_v4 || is_v5 || is_v6 || is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -8856,6 +9063,16 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             }
             Some(cols)
         }
+    } else {
+        None
+    };
+    // v13 の `pkname:` 行（Issue #1364）。名前空間の衝突検査は列・制約セクションを
+    // 読み終えてから行う。
+    let pk_name: Option<String> = if is_v13 {
+        Some(
+            parse_primary_key_name_line(&mut lines, pk_cols.as_deref(), table_name)
+                .map_err(CatalogError::CorruptSchema)?,
+        )
     } else {
         None
     };
@@ -8989,9 +9206,10 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         // カタログが本関数だけ「依存なし」に丸められ、ENUM 依存判定の
         // fail-closed 判定が `validate_schema` 側と食い違う）。
         parse_unique_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
-    } else if is_v12 {
+    } else if is_v12 || is_v13 {
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
+        // v13（Issue #1364）も主キーの明示名のみで選ばれるため同様。
         parse_unique_section(&mut lines, true, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
@@ -9001,12 +9219,16 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     // 飛ばすと壊れたセクションを持つカタログが本関数だけ「依存なし」に丸め
     // られるため、`decode_schema_body` と同じ共有パーサーで構造を検証し、
     // 参照列の実在・制約名の一意性も下で検証する。
-    let checks: Vec<CheckConstraint> = if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 {
-        parse_check_section(&mut lines, is_v8 || is_v9 || is_v10 || is_v11 || is_v12)
+    let checks: Vec<CheckConstraint> =
+        if is_v7 || is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13 {
+            parse_check_section(
+                &mut lines,
+                is_v8 || is_v9 || is_v10 || is_v11 || is_v12 || is_v13,
+            )
             .map_err(CatalogError::CorruptSchema)?
-    } else {
-        Vec::new()
-    };
+        } else {
+            Vec::new()
+        };
     // v8／v9／v10／v11 の `fks:` セクション（TABLE-17・TASK-205、Issue #907／
     // #1077／#1067）。`FOREIGN KEY` は ENUM 型への新たな依存を作らないが、
     // `checks:` と同じ理由（壊れたセクションを本関数だけが「依存なし」に丸め
@@ -9025,7 +9247,9 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     } else if is_v11 {
         parse_foreign_key_section(&mut lines, false, true).map_err(CatalogError::CorruptSchema)?
     } else if is_v12 {
-        parse_foreign_key_section_v12(&mut lines).map_err(CatalogError::CorruptSchema)?
+        parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::CorruptSchema)?
+    } else if is_v13 {
+        parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::CorruptSchema)?
     } else {
         Vec::new()
     };
@@ -9171,6 +9395,21 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         }
     }
 
+    // 主キーの明示名（v13。Issue #1364）も UNIQUE・CHECK・FK と同じ名前空間を
+    // 共有する（`validate_schema` と同じ fail-closed 判定を本関数でも徹底する）。
+    if let Some(pk_name) = &pk_name {
+        let used = check_names.contains(pk_name.as_str())
+            || unique_constraints
+                .iter()
+                .any(|(name, _)| name.as_deref() == Some(pk_name.as_str()))
+            || foreign_keys.iter().any(|fk| fk.name() == pk_name.as_str());
+        if used {
+            return Err(CatalogError::CorruptSchema(format!(
+                "constraint name {pk_name:?} is already used by another constraint on this table"
+            )));
+        }
+    }
+
     Ok(found)
 }
 
@@ -9214,7 +9453,8 @@ fn dependent_tables_in_txn(
                 "too many tables: exceeds {MAX_LIST_TABLES}"
             )));
         }
-        if catalog_value_references_enum_type(value.value(), type_name)? {
+        if catalog_value_references_enum_type_in_table(value.value(), type_name, Some(key.value()))?
+        {
             dependents.push(key.value().to_string());
         }
     }
@@ -14633,5 +14873,116 @@ mod tests {
             1,
             prev_generation,
         );
+    }
+
+    // --- カタログ v13（主キーの明示名。Issue #1364）---------------------------
+
+    fn named_pk_schema(pk_name: Option<&str>) -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        )
+        .with_primary_key(vec!["a".to_string()])
+        .with_primary_key_name(pk_name.map(str::to_string))
+    }
+
+    /// v13 のゴールデン: `pk:` 行の直後に `pkname:` 行、0 件セクションを含む。
+    #[test]
+    fn encode_v13_golden_places_pkname_right_after_pk() {
+        let bytes = encode_schema(&named_pk_schema(Some("pk_docs"))).expect("encode");
+        let text = String::from_utf8(bytes.clone()).expect("utf8");
+        assert_eq!(
+            text,
+            "v13\ncols:2\npk:a\npkname:pk_docs\na:text:-:0:L:-\nb:text:-:1:L:-\nuniq:0\nchecks:0\nfks:0\n"
+        );
+        let decoded = decode_schema("docs", &bytes).expect("decode");
+        assert_eq!(decoded, named_pk_schema(Some("pk_docs")));
+        assert_eq!(
+            decoded.primary_key_constraint_name_effective().as_deref(),
+            Some("pk_docs")
+        );
+    }
+
+    /// 導出名と同じ明示名は無名と同じバイト列（正規形が一意）。
+    #[test]
+    fn encode_pk_name_equal_to_derived_name_matches_unnamed_bytes() {
+        let named = encode_schema(&named_pk_schema(Some("docs_pkey"))).expect("encode");
+        let unnamed = encode_schema(&named_pk_schema(None)).expect("encode");
+        assert_eq!(named, unnamed);
+        assert!(unnamed.starts_with(b"v5\n") || unnamed.starts_with(b"v4\n"));
+    }
+
+    /// v13 の不正値は `decode_schema_body` と軽量パーサーの両方が拒否する。
+    #[test]
+    fn v13_corrupt_values_are_rejected_by_both_parsers() {
+        let body = "cols:2\npk:a\n";
+        let cols = "a:enum:mood:0:L:-\nb:text:-:1:L:-\n";
+        let tail = "uniq:0\nchecks:0\nfks:0\n";
+        let cases = [
+            // pkname 行の欠落
+            format!("v13\n{body}{cols}{tail}"),
+            // 導出名と同じ（正規形違反）
+            format!("v13\n{body}pkname:docs_pkey\n{cols}{tail}"),
+            // 不正な識別子
+            format!("v13\n{body}pkname:1bad\n{cols}{tail}"),
+            format!("v13\n{body}pkname:\n{cols}{tail}"),
+            // 主キー無しで pkname だけ
+            format!("v13\ncols:2\npk:\npkname:pk_docs\n{cols}{tail}"),
+            // UNIQUE 名との衝突
+            format!("v13\n{body}pkname:uq\n{cols}uniq:1\nU:uq:b\nchecks:0\nfks:0\n"),
+        ];
+        for text in cases {
+            let mut resolve =
+                |_: &str| -> Result<Arc<EnumTypeDef>> { Ok(EnumTypeDef::unresolved("mood")) };
+            assert!(
+                decode_schema_body("docs", text.as_bytes(), &mut resolve).is_err(),
+                "decode must reject: {text:?}"
+            );
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type_in_table(
+                        text.as_bytes(),
+                        "mood",
+                        Some("docs")
+                    ),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "lightweight parser must reject: {text:?}"
+            );
+        }
+        // 正常な v13 は ENUM 依存を検出できる（「依存なし」に丸めない）。
+        let valid = format!("v13\n{body}pkname:pk_docs\n{cols}{tail}");
+        assert!(catalog_value_references_enum_type_in_table(
+            valid.as_bytes(),
+            "mood",
+            Some("docs")
+        )
+        .expect("valid"));
+    }
+
+    /// v13 は FK 保持版として登録されている（P0。漏れると DROP TABLE の
+    /// `2BP01` 検査が fail-open になる）。
+    #[test]
+    fn v13_is_registered_as_foreign_key_bearing_version() {
+        assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V13));
+    }
+
+    /// 明示名は UNIQUE・CHECK・FK の実名と衝突できず、主キー無しには持てない。
+    #[test]
+    fn validate_schema_rejects_bad_primary_key_names() {
+        let no_pk = TableSchema::new("docs", vec![ColumnDef::new("a", ColumnType::Text, true)])
+            .with_primary_key_name(Some("pk_docs".to_string()));
+        assert!(validate_schema(&no_pk).is_err());
+        let bad = named_pk_schema(Some("bad name"));
+        assert!(validate_schema(&bad).is_err());
+        let colliding =
+            named_pk_schema(Some("uq")).with_unique_constraints(vec![UniqueConstraint::with_name(
+                "uq".to_string(),
+                vec!["b".to_string()],
+            )]);
+        assert!(validate_schema(&colliding).is_err());
     }
 }

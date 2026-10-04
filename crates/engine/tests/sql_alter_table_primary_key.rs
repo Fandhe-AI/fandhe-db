@@ -342,9 +342,9 @@ fn null_takes_precedence_over_duplicate_regardless_of_row_order() {
 
 // --- ADD: 拒否系 ----------------------------------------------------------
 
-/// PK 宣言済み・未知の列・VECTOR 列は `42601`。
+/// 未知の列・VECTOR 列は `42601`。
 #[test]
-fn add_primary_key_invalid_declarations_are_42601() {
+fn add_primary_key_invalid_columns_are_42601() {
     let (core, path, mut session) = setup("alter-pk-invalid");
     let _guard = CleanupGuard(path);
     let owner = ctx("owner");
@@ -354,22 +354,6 @@ fn add_primary_key_invalid_declarations_are_42601() {
             &mut session,
             &owner,
             "ALTER TABLE docs ADD PRIMARY KEY (missing)"
-        )),
-        "42601"
-    );
-    exec(
-        &core,
-        &mut session,
-        &owner,
-        "ALTER TABLE docs ADD PRIMARY KEY (a)",
-    )
-    .expect("first primary key");
-    assert_eq!(
-        code(exec(
-            &core,
-            &mut session,
-            &owner,
-            "ALTER TABLE docs ADD PRIMARY KEY (b)"
         )),
         "42601"
     );
@@ -432,14 +416,14 @@ fn pseudo_name_collisions_are_42p07() {
     );
 }
 
-/// 構文の拒否: 名前付き・`id` を含む・空リスト・重複列は構造段で拒否される。
+/// 構文の拒否: `id` を含む・空リスト・重複列は構造段で拒否される。
 #[test]
 fn structural_rejections() {
     let (core, path, mut session) = setup("alter-pk-syntax");
     let _guard = CleanupGuard(path);
     let owner = ctx("owner");
     for sql in [
-        "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (a)",
+        "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (id)",
         "ALTER TABLE docs ADD PRIMARY KEY (id)",
         "ALTER TABLE docs ADD PRIMARY KEY (ID)",
         "ALTER TABLE docs ADD PRIMARY KEY (id, a)",
@@ -797,4 +781,282 @@ fn primary_key_survives_reopen() {
     let schema = storage.get_table_schema("docs").expect("schema");
     assert_eq!(schema.primary_key(), Some(&["a".to_string()][..]));
     assert_eq!(schema.unique_constraints().len(), 1);
+}
+
+// --- 名前付き主キー・重複宣言（Issue #1364）---------------------------------
+
+fn run(core: &EngineCore, session: &mut SessionState, sql: &str) {
+    exec(core, session, &ctx("owner"), sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+fn fail(core: &EngineCore, session: &mut SessionState, sql: &str) -> String {
+    code(exec(core, session, &ctx("owner"), sql))
+}
+
+/// 名前付き PK が受理され応答に明示名が載り、テナント内の一意性が強制される。
+/// 導出名での DROP は `42704`、明示名での DROP は成功し以後は重複を許す。
+#[test]
+fn named_primary_key_is_accepted_and_dropped_by_explicit_name() {
+    let (core, path, mut session) = setup("alter-pk-named");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let outcome = exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs ADD CONSTRAINT pk_docs PRIMARY KEY (a)",
+    )
+    .expect("named primary key");
+    match outcome {
+        SqlOutcome::AlterTable(o) => assert_eq!(
+            o.action,
+            AlterTableAction::AddConstraint {
+                constraint_name: "pk_docs".to_string()
+            }
+        ),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    insert(&core, &mut session, "owner", 1, Some("x"), "y", "op-1").expect("first");
+    assert_eq!(
+        code(insert(
+            &core,
+            &mut session,
+            "owner",
+            2,
+            Some("x"),
+            "z",
+            "op-2"
+        )),
+        "23505"
+    );
+    assert_eq!(
+        fail(
+            &core,
+            &mut session,
+            "ALTER TABLE docs DROP CONSTRAINT docs_pkey"
+        ),
+        "42704"
+    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs DROP CONSTRAINT pk_docs",
+    );
+    insert(&core, &mut session, "owner", 3, Some("x"), "z", "op-3").expect("pk dropped");
+    // 削除後は同じ名前を再利用できる（名前だけが残らない）。
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT pk_docs UNIQUE (b)",
+    );
+}
+
+/// 名前空間は UNIQUE・CHECK・FK と共有される。導出名は PK の明示名がある間は解放される。
+#[test]
+fn named_primary_key_shares_constraint_namespace() {
+    let (core, path, mut session) = setup("alter-pk-named-ns");
+    let _guard = CleanupGuard(path);
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT pk_docs PRIMARY KEY (a)",
+    );
+    assert_eq!(
+        fail(
+            &core,
+            &mut session,
+            "ALTER TABLE docs ADD CONSTRAINT pk_docs UNIQUE (b)"
+        ),
+        "42P07"
+    );
+    assert_eq!(
+        fail(
+            &core,
+            &mut session,
+            "ALTER TABLE docs ADD CONSTRAINT pk_docs CHECK (b = 'z')"
+        ),
+        "42710"
+    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT docs_pkey UNIQUE (b)",
+    );
+}
+
+/// 明示名が既存の UNIQUE 名と衝突する PK は `42P07` で、スキーマは変わらない。
+#[test]
+fn named_primary_key_colliding_with_existing_constraint_is_42p07() {
+    let (core, path, mut session) = setup("alter-pk-named-collide");
+    let _guard = CleanupGuard(path);
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT uq_b UNIQUE (b)",
+    );
+    assert_eq!(
+        fail(
+            &core,
+            &mut session,
+            "ALTER TABLE docs ADD CONSTRAINT uq_b PRIMARY KEY (a)"
+        ),
+        "42P07"
+    );
+    // PK は付いていないので、無名の PK はまだ追加できる。
+    run(&core, &mut session, "ALTER TABLE docs ADD PRIMARY KEY (a)");
+}
+
+/// 明示名が UNIQUE の既定名と同じでも、後続の ADD UNIQUE は別の導出名へ回避し、
+/// DROP は明示名の PK だけを消す。
+#[test]
+fn named_primary_key_makes_default_unique_name_avoid_it() {
+    let (core, path, mut session) = setup("alter-pk-named-avoid");
+    let _guard = CleanupGuard(path.clone());
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT docs_b_key PRIMARY KEY (a)",
+    );
+    run(&core, &mut session, "ALTER TABLE docs ADD UNIQUE (b)");
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs DROP CONSTRAINT docs_b_key",
+    );
+    drop(session);
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    let schema = storage.get_table_schema("docs").expect("schema");
+    assert!(schema.primary_key().is_none());
+    assert_eq!(schema.unique_constraints().len(), 1);
+    assert_ne!(schema.unique_constraints()[0].name(), "docs_b_key");
+}
+
+/// 主キーの重複宣言（無名・名前付きとも）は `42P16`。名前衝突より優先され、
+/// スキーマは変わらない（副作用ゼロ）。
+#[test]
+fn duplicate_primary_key_declaration_is_42p16_without_side_effects() {
+    let (core, path, mut session) = setup("alter-pk-dup");
+    let _guard = CleanupGuard(path.clone());
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT pk_docs PRIMARY KEY (a)",
+    );
+    let snapshot = |p: &std::path::Path| {
+        let storage = Storage::open(p);
+        storage
+            .ok()
+            .map(|s| s.get_table_schema("docs").expect("schema"))
+    };
+    for sql in [
+        "ALTER TABLE docs ADD PRIMARY KEY (b)",
+        "ALTER TABLE docs ADD CONSTRAINT other PRIMARY KEY (b)",
+        "ALTER TABLE docs ADD CONSTRAINT pk_docs PRIMARY KEY (b)",
+    ] {
+        assert_eq!(fail(&core, &mut session, sql), "42P16", "{sql}");
+    }
+    // 開き直し前後の一致で副作用ゼロを確認する。
+    drop(session);
+    drop(core);
+    let first = snapshot(&path).expect("reopen");
+    assert_eq!(first.primary_key(), Some(&["a".to_string()][..]));
+    assert_eq!(
+        first.primary_key_constraint_name_effective().as_deref(),
+        Some("pk_docs")
+    );
+}
+
+/// 導出名と同じ明示名の PK は無名と同じ扱い（導出名で DROP できる）。
+#[test]
+fn named_primary_key_equal_to_derived_name_behaves_as_unnamed() {
+    let (core, path, mut session) = setup("alter-pk-named-derived");
+    let _guard = CleanupGuard(path);
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT docs_pkey PRIMARY KEY (a)",
+    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs DROP CONSTRAINT docs_pkey",
+    );
+}
+
+/// FK が参照する名前付き PK の DROP は `2BP01`。
+#[test]
+fn drop_named_primary_key_referenced_by_foreign_key_is_2bp01() {
+    let (core, path, mut session) = setup("alter-pk-named-fk");
+    let _guard = CleanupGuard(path);
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE parents (code TEXT, other TEXT)",
+    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE parents ADD CONSTRAINT pk_parents PRIMARY KEY (code)",
+    );
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE kids (p TEXT, CONSTRAINT kid_fk FOREIGN KEY (p) REFERENCES parents)",
+    );
+    assert_eq!(
+        fail(
+            &core,
+            &mut session,
+            "ALTER TABLE parents DROP CONSTRAINT pk_parents"
+        ),
+        "2BP01"
+    );
+    // 親表の DROP TABLE も 2BP01（v13 が FK 保持版として登録されている）。
+    assert_eq!(fail(&core, &mut session, "DROP TABLE parents"), "2BP01");
+}
+
+/// 名前付き PK は名前付き UNIQUE と併存しても再オープンで往復する。
+#[test]
+fn named_primary_key_survives_reopen() {
+    let (core, path, mut session) = setup("alter-pk-named-reopen");
+    let _guard = CleanupGuard(path.clone());
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT uq_b UNIQUE (b)",
+    );
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE docs ADD CONSTRAINT pk_docs PRIMARY KEY (a)",
+    );
+    drop(session);
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    let schema = storage.get_table_schema("docs").expect("schema");
+    assert_eq!(schema.primary_key(), Some(&["a".to_string()][..]));
+    assert_eq!(
+        schema.primary_key_constraint_name_effective().as_deref(),
+        Some("pk_docs")
+    );
+    assert_eq!(schema.unique_constraints().len(), 1);
+    assert_eq!(schema.unique_constraints()[0].name(), "uq_b");
+}
+
+/// 名前付きの形でも DDL 権限ゲート（`42501`）が先に判定される。
+#[test]
+fn named_primary_key_respects_permission_gate() {
+    let (core, path, _session) = setup("alter-pk-named-gate");
+    let _guard = CleanupGuard(path);
+    let mut plain = SessionState::default();
+    assert_eq!(
+        code(exec(
+            &core,
+            &mut plain,
+            &ctx("owner"),
+            "ALTER TABLE docs ADD CONSTRAINT pk_docs PRIMARY KEY (a)"
+        )),
+        "42501"
+    );
 }

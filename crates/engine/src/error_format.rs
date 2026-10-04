@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505"];
 
 define_error_classes! {
-    count = 44;
+    count = 45;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -301,6 +301,11 @@ define_error_classes! {
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateObject`] の写像。
     /// UNIQUE の名前衝突は索引名衝突と同じ `42P07`（`DuplicateTable`）のまま。
     DuplicateObject => ("42710", "DUPLICATE_OBJECT"),
+    /// 主キーを既に宣言済みのテーブルへ `ALTER TABLE ... ADD [CONSTRAINT <name>]
+    /// PRIMARY KEY` を重ねて宣言した（`42P16`、Issue #1364・TABLE-22 (d)・
+    /// ERR-4・ERR-6）。HTTP 射影は 400（DDL 宣言不正）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidTableDefinition`] の写像。
+    InvalidTableDefinition => ("42P16", "INVALID_TABLE_DEFINITION"),
     /// 分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`。Issue #1129・SQL-19・
     /// RECOVER-11・ERR-1）が 1 チャンク以上 commit した後に止まった（`VD001`）。
     /// commit 済みのチャンクは戻らない。応答に件数・原因コード・`operation_id` を含め、

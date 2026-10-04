@@ -583,6 +583,8 @@ Issue #1361（feat(engine): ALTER COLUMN TYPE で INTEGER→BIGINT・REAL→DOUB
 - **テスト**: `tests/table15_drop_table_concurrency.rs` の `sync_point_overlap`（3 テスト）。重なり中の結果は事前結果と完全一致か `42P01` に限る。既存の自由スケジューリング版は残した。
 - **性質**: 公開 API は feature 有効時のみ増える。RLS・テナント境界・`wire_code` は不変。設計は `docs/design/drop-table.md`。
 
+Issue #1364（fix(engine)!: 名前付きの主キーを受理し、主キーの重複宣言を 42P16 で返す。TABLE-22 (a)(d)・ERR-4・ERR-6・TASK-233 ポインタ）: `ALTER TABLE <t> ADD CONSTRAINT <name> PRIMARY KEY (...)` を受理し、その名前で `DROP CONSTRAINT` できるようにした（名前空間は UNIQUE・CHECK・FOREIGN KEY と共有。明示名がある間は導出名 `<t>_pkey` は解放される）。主キー宣言済みのテーブルへの重複宣言は `42P16`（新 `ErrorClass::InvalidTableDefinition`・`INVALID_TABLE_DEFINITION`・HTTP 400）で副作用ゼロ拒否する（名前衝突より先に判定）。明示名の永続化のためカタログ v13（`pkname:` 行）を追加し、`FK_BEARING_FORMAT_VERSIONS` と軽量パーサーも更新した。無名の主キーのバイト列・導出名での削除は不変。破壊的変更: `ValidatedAlterTableAddPrimaryKey.constraint_name`・`CatalogError::MultiplePrimaryKeys`・`SqlSurfaceError::InvalidTableDefinition`・`ErrorClass::InvalidTableDefinition` を追加、ALTER の主キー重複宣言の応答が `42601` から `42P16` へ変更、v13 は旧バイナリが読めない。設計は `docs/design/alter-table-primary-key.md`。テストは `crates/engine/tests/sql_alter_table_primary_key.rs`・`catalog`／`allowlist` の単体テスト・`wire-server` の `err4_http_projection`。依存追加なし・`unsafe` なし。スコープ外: `CREATE TABLE` 内の名前付き主キーと二重宣言の `42P16`・NoSQL 表層・`DROP NOT NULL`。
+
 ## Issue #1365: NoSQL API・複文許可リスト・クライアント docstring の古い記述の是正
 
 - **変更箇所**: `crates/wire-server/docs/nosql-api.md`（`create_table` の `check` 受理〔Issue #1199〕、分割実行 DML の `status` に `running`／`cancelling` を追記）、`crates/wire-server/tests/three_client/psycopg_client.py`（docstring のみ。`BEGIN` 受理〔SQL-31〕と拡張クエリ実装済み〔WIRE-11〕に合わせた理由へ更新）、`docs/design/wire-multi-statement.md`（文種別分類の現状化、ファイル形 `INSERT`〔#1353〕・書き込み済みテーブルの読み取り〔#1179〕の受理を反映）。
