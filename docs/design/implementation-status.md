@@ -541,3 +541,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **性質**: 指数部の無い入力の受理・拒否・値は不変（拒否の分類のみ、末尾に不正文字を含み整数部も桁あふれする入力は 22003 でなく 22000 になる。いずれも fail-closed）。SQL の INSERT／UPDATE／UPSERT／COPY／配列要素・列 DEFAULT・NoSQL の insert／update／filter は共有の束縛経路経由で追随する。wire-server のコード変更は無い。
 - **テスト**: `numeric.rs` 単体、`numeric_column.rs`（SQL 経路。`'1e3'` は拒否例から受理側へ契約改訂し、不正形 `'1e'`・`'1e3.5'` を拒否例へ追加）、`declarative_filter` 単体、wire `typed_json` 単体、`nosql17_typed_json_parity.rs`（HTTP と SQL のバイト一致・`22003`）。
 - **対象外（申し送り）**: 前後空白の受理、`NaN`／`Infinity`、式レーンの数値リテラルでの NUMERIC 扱い、scale が 38 を超える範囲比較リテラルの受理。
+
+## Issue #1359: 数値列の比較述語でスカラー列二次索引を使う
+
+- **対象ビヘイビア**: TABLE-13・INDEX-5（関連: SQL-24・TASK-208）。
+- **変更箇所**: `sql::scalar_plan` に `ExprIndexPredicate`・`collect_expr_index_predicates`・`numeric_i64_bounds` を追加し、`classify_scalar_plan` が数値列の単純比較（`=`・`<`・`<=`・`>`・`>=`、左右どちらにリテラルがあってもよい）を索引対応と分類する（単独は `index_typed_range`、2 件以上・`BETWEEN` は `index_conjunction`）。`sql::scalar_index` はレーン A（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`）を本番でも構築し（後置予約・列単位 fail-soft）、`resolve_candidates` が式側の述語を `ExprIndexPredicate` で受ける。`exec`・`aggregate`・`group_by` の収集は新しい収集口へ統一し、`Declared` 下の `EXPLAIN` は数値述語を `plain_scan` へ降格する。
+- **性質**: 索引経路と全走査の結果（行 id 集合・投影値・`COUNT(*)`）は一致する。`-0.0` は索引キー・リテラルとも正規化する。`2^53` 超過の `BIGINT` を含む列は索引から落ち全走査と同じ 22003 になる。RLS・テナント境界・`wire_code` は不変。
+- **テスト**: `scalar_plan`／`scalar_index` の単体（境界の性質テスト・全走査オラクル）、層 A `scalar_index_numeric.rs`（4 型×全演算子・左右入替・`BETWEEN`・`NOT`・複合述語・NULL・RLS・世代進行・`2^53` 超過・`EXPLAIN`・宣言）。
+- **対象外（申し送り）**: 数値 4 型の `CREATE INDEX` 宣言（INDEX-7）、数値の `IN`（OR 群の和集合）・列同士の比較・算術式の索引化。

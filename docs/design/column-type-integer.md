@@ -93,7 +93,7 @@
 - 集計・`GROUP BY`（`sql/parser.rs::resolve_aggregate_input`・
   `resolve_group_by_column`）: 「TEXT 列でも VECTOR 列でもない」として拒否
   （#892 まで）
-- スカラー列二次索引（`scalar_index.rs`）: 未索引（`Vector` 列と同じ）
+- スカラー列二次索引（`scalar_index.rs`）: Issue #1359 で `WHERE` の単純比較が索引対応（詳細は `scalar-index-prune.md`）。以下は #1359 以前の記述: 未索引（`Vector` 列と同じ）
   （#893 まで）
 - NoSQL 表層（`http/query/update.rs`）: `SET integer column is not supported
   on the NoSQL surface yet` で拒否（#896 まで）。`http/query/insert.rs` は

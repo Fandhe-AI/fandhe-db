@@ -1437,18 +1437,24 @@ pub(crate) fn execute_grouped_aggregate(
                             &mut distinct_budget,
                         )?;
                     } else {
-                        let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
-                            .expr_filters
-                            .iter()
-                            .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
-                            .collect();
                         // 数値・日時・`NUMERIC`・`UUID` 列の範囲述語
                         // （`FilterOp::TypedCompare`。Issue #891・TASK-199 で
                         // production 結線済み）は `bound.metadata_filters` に
                         // 混在したまま渡り、`ScalarIndex::candidates_for` が
                         // 内部で振り分ける（Issue #893 production 接続）。
                         if let crate::sql::scalar_index::CandidateResolution::Use(slots) =
-                            index.resolve_candidates(&bound.metadata_filters, &id_preds)
+                            match crate::sql::scalar_plan::collect_expr_index_predicates(
+                                &bound.expr_filters,
+                            ) {
+                                Some(expr_preds) => {
+                                    index.resolve_candidates(&bound.metadata_filters, &expr_preds)
+                                }
+                                // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
+                                // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
+                                None => {
+                                    crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
+                                }
+                            }
                         {
                             used_index_path = observe_candidate_slots_grouped(
                                 &snapshot,
