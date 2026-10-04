@@ -403,3 +403,32 @@ fn wire_json_default_is_accepted_or_mapped_to_sqlstate() {
         read_ready_for_query(&mut stream);
     }
 }
+/// 配列列の `DEFAULT` は受理され、不正値・型不一致は engine の SQLSTATE 写像どおり届く
+/// （Issue #1374）。
+#[test]
+fn wire_array_default_is_accepted_or_mapped_to_sqlstate() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD COLUMN t INTEGER[] NOT NULL DEFAULT '{1,2}'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    for (sql, code) in [
+        (
+            "ALTER TABLE docs ADD COLUMN a2 INTEGER[] DEFAULT '{a}'",
+            "22P02",
+        ),
+        (
+            "ALTER TABLE docs ADD COLUMN a3 INTEGER[] DEFAULT 1",
+            "42601",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+}

@@ -1808,3 +1808,265 @@ fn create_table_bytea_default_is_accepted_and_applied_on_omission() {
         .expect_err("malformed hex");
     assert_eq!(err.wire_code(), "22P02");
 }
+// --- 配列列の DEFAULT（Issue #1374。ポインタ: TABLE-5・TABLE-14・TABLE-16・SQL-23） ---
+
+fn array_cell(cell: Cell) -> engine::row_codec::ArrayValue {
+    match cell {
+        Cell::Array(a) => a,
+        other => panic!("expected array cell, got {other:?}"),
+    }
+}
+
+fn text_array(items: &[Option<&str>]) -> engine::row_codec::ArrayValue {
+    engine::row_codec::ArrayValue::Text(items.iter().map(|i| i.map(str::to_string)).collect())
+}
+
+fn int_array(items: &[Option<i32>]) -> engine::row_codec::ArrayValue {
+    engine::row_codec::ArrayValue::Integer(items.to_vec())
+}
+
+fn insert_omitting(core: &EngineCore, owner: &PolicyContext, id: u64) {
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES ({id}, '[0.3,0.4]') \
+             USING OPERATION_ID 'arr-op-{id}'"
+        ),
+    )
+    .expect("insert omitting array columns");
+}
+
+/// 配列の DEFAULT は既存行（読み出し時補完）・列省略 INSERT の新規行に同じ値で入り、
+/// 明示した値が優先される。空配列は NULL ではない。
+#[test]
+fn array_default_fills_existing_and_new_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "tags TEXT[] NOT NULL DEFAULT '{a,\"b c\"}'").expect("TEXT[]");
+    add_column(&core, "nums INTEGER[3] DEFAULT '{1,NULL,3}'").expect("INTEGER[3]");
+    add_column(&core, "e INTEGER[] DEFAULT '{}'").expect("empty array");
+
+    let q = |id: u64, col: &str| {
+        array_cell(one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = {id} LIMIT 1"),
+        ))
+    };
+    let tags = text_array(&[Some("a"), Some("b c")]);
+    let nums = int_array(&[Some(1), None, Some(3)]);
+    assert_eq!(q(1, "tags"), tags);
+    assert_eq!(q(1, "nums"), nums);
+    assert_eq!(q(1, "e"), int_array(&[]));
+    // WHERE（NULL 要素を含まない配列の等価）でも既存行が読める。
+    let hit = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE tags = '{{a,\"b c\"}}' LIMIT 10"),
+        )
+        .expect("WHERE on array default");
+    assert_eq!(hit.rows.len(), 1);
+
+    insert_omitting(&core, &owner, 2);
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, tags) VALUES (3, '[0.3,0.4]', '{{z}}') \
+             USING OPERATION_ID 'arr-op-3'"
+        ),
+    )
+    .expect("insert explicit tags");
+    assert_eq!(q(2, "tags"), tags);
+    assert_eq!(q(2, "nums"), nums);
+    assert_eq!(q(2, "e"), int_array(&[]));
+    assert_eq!(q(3, "tags"), text_array(&[Some("z")]));
+    assert_eq!(q(3, "nums"), nums);
+}
+
+/// 代表的な要素型（NUMERIC・DATE・UUID・BOOLEAN・BYTEA・JSONB・ENUM）の DEFAULT が受理され、
+/// 既存行の補完値が読める。
+#[test]
+fn array_default_is_accepted_for_extended_element_types() {
+    let (core, path) = new_core_with_table_and_enum("mood", vec!["happy".into(), "sad".into()]);
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    for decl in [
+        "num NUMERIC(5,2)[] DEFAULT '{1.25,3}'",
+        "dt DATE[] DEFAULT '{2020-01-02}'",
+        "u UUID[] DEFAULT '{00000000-0000-0000-0000-000000000001}'",
+        "bo BOOLEAN[] DEFAULT '{t,false}'",
+        "byt BYTEA[] DEFAULT '{\"\\\\x01\"}'",
+        "jb JSONB[] DEFAULT '{\"{\\\"a\\\":1}\"}'",
+        "m mood[] NOT NULL DEFAULT '{happy,sad}'",
+    ] {
+        add_column(&core, decl).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
+    }
+    for col in ["num", "dt", "u", "bo", "byt", "jb", "m"] {
+        let cell = one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = 1 LIMIT 1"),
+        );
+        assert!(matches!(cell, Cell::Array(_)), "{col}: {cell:?}");
+    }
+    assert_eq!(
+        array_cell(one_cell(
+            &core,
+            &owner,
+            &format!("SELECT m FROM {TABLE} WHERE id = 1 LIMIT 1")
+        )),
+        engine::row_codec::ArrayValue::Enum(vec![Some("happy".into()), Some("sad".into())])
+    );
+}
+
+/// 配列の DEFAULT は再オープン後も既存行・新規行で同じ値になる。
+#[test]
+fn array_default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "nums INTEGER[] NOT NULL DEFAULT '{4,5}'").expect("ADD COLUMN");
+    insert_omitting(&core, &owner, 2);
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    for id in [1, 2] {
+        assert_eq!(
+            array_cell(one_cell(
+                &core,
+                &owner,
+                &format!("SELECT nums FROM {TABLE} WHERE id = {id} LIMIT 1")
+            )),
+            int_array(&[Some(4), Some(5)])
+        );
+    }
+}
+
+/// 配列 DEFAULT の不正は同じリテラルを INSERT したときと同じ SQLSTATE で拒否され、列は
+/// 追加されない。リテラル種別の違い（数値・真偽値）は他の型と同じ 42601。
+#[test]
+fn array_default_errors_match_insert_literal_binding() {
+    let (core, path) = new_core_with_table_and_enum("mood", vec!["happy".into()]);
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let long = format!("{{{}1}}", "1,".repeat(600));
+    for (decl, code) in [
+        ("x INTEGER[] DEFAULT 1".to_string(), "42601"),
+        ("x INTEGER[] DEFAULT true".to_string(), "42601"),
+        ("x INTEGER[] DEFAULT '1'".to_string(), "22P02"),
+        ("x INTEGER[] DEFAULT '{a}'".to_string(), "22P02"),
+        ("x INTEGER[] DEFAULT '{1,}'".to_string(), "22P02"),
+        ("x BOOLEAN[] DEFAULT '{x}'".to_string(), "22P02"),
+        ("x mood[] DEFAULT '{angry}'".to_string(), "22P02"),
+        ("x INTEGER[] DEFAULT '{99999999999}'".to_string(), "22003"),
+        ("x INTEGER[2] DEFAULT '{1,2,3}'".to_string(), "54000"),
+        (format!("x INTEGER[] NOT NULL DEFAULT '{long}'"), "54000"),
+    ] {
+        let err = add_column(&core, &decl).expect_err(&decl);
+        assert_eq!(err.wire_code(), code, "{decl}: {err:?}");
+        assert!(!column_exists(&core, &owner, TABLE, "x"), "{decl}");
+    }
+    // DATE 要素の不正は INSERT の同じリテラルと同じ SQLSTATE になる。
+    let date_err = add_column(&core, "x DATE[] DEFAULT '{2020-13-45}'").expect_err("date");
+    add_column(&core, "d DATE[]").expect("ADD COLUMN d");
+    let mut s = SessionState::default();
+    let insert_err = core
+        .execute_sql_in_session(
+            &owner,
+            &mut s,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, d) VALUES (1, '[0.3,0.4]', '{{2020-13-45}}') \
+                 USING OPERATION_ID 'arr-bad'"
+            ),
+        )
+        .expect_err("insert same literal");
+    assert_eq!(date_err.wire_code(), insert_err.wire_code());
+    assert!(!column_exists(&core, &owner, TABLE, "x"));
+}
+
+/// `ARRAY NOT NULL`（DEFAULT なし）は行・テナントの有無に依存せず同一の `42601`、
+/// DEFAULT 付きの成功は他テナントの行があっても成り補完値が読める（テナント境界 P0）。
+#[test]
+fn array_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "a INTEGER[] NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "a INTEGER[] NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "a"));
+
+    add_column(&core, "a INTEGER[] NOT NULL DEFAULT '{7}'").expect("other tenant rows: ok");
+    assert_eq!(
+        array_cell(one_cell(
+            &core,
+            &ctx("bob"),
+            &format!("SELECT a FROM {TABLE} WHERE id = 1 LIMIT 1")
+        )),
+        int_array(&[Some(7)])
+    );
+}
+
+/// `CREATE TABLE` の列 DEFAULT も `add_column_default` を共有するため配列を受け付け、列省略
+/// INSERT で補われる。ENUM 要素は未解決の語彙で構文段が拒否せず、語彙外ラベルは 22P02。
+#[test]
+fn create_table_array_default_is_accepted_and_applied_on_omission() {
+    let (core, path) = new_core_with_table_and_enum("mood", vec!["happy".into()]);
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut s = ddl_session();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        "CREATE TABLE at (embedding VECTOR(2), m mood[] DEFAULT '{happy}', n INTEGER[] DEFAULT '{1,2}')",
+    )
+    .expect("CREATE TABLE with array DEFAULT");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        "INSERT INTO at (id, embedding) VALUES (1, '[0.3,0.4]') USING OPERATION_ID 'op-at'",
+    )
+    .expect("insert omitting array columns");
+    assert_eq!(
+        array_cell(one_cell(
+            &core,
+            &owner,
+            "SELECT m FROM at WHERE id = 1 LIMIT 1"
+        )),
+        engine::row_codec::ArrayValue::Enum(vec![Some("happy".into())])
+    );
+    assert_eq!(
+        array_cell(one_cell(
+            &core,
+            &owner,
+            "SELECT n FROM at WHERE id = 1 LIMIT 1"
+        )),
+        int_array(&[Some(1), Some(2)])
+    );
+    for (sql, code) in [
+        (
+            "CREATE TABLE at2 (embedding VECTOR(2), m mood[] DEFAULT '{angry}')",
+            "22P02",
+        ),
+        (
+            "CREATE TABLE at3 (embedding VECTOR(2), n INTEGER[] DEFAULT 1)",
+            "42601",
+        ),
+    ] {
+        let err = core
+            .execute_sql_in_session(&owner, &mut s, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), code, "{sql}");
+    }
+}

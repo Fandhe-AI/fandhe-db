@@ -2251,6 +2251,11 @@ pub(crate) fn bind_column_default(
     if let (ColumnType::Bytea, ColumnDefault::Text(s)) = (&column.ty, default) {
         return bind_bytea_literal(s, &column.name);
     }
+    // 配列も借用の `ScalarRef` で返せないため、INSERT のリテラル束縛と同じ
+    // `parse_array_literal` の結果（SQLSTATE 含む）をそのまま返す（Issue #1374）。
+    if let (ColumnType::Array(at), ColumnDefault::Text(s)) = (&column.ty, default) {
+        return parse_array_literal(s, at).map(Value::Array);
+    }
     match crate::row_codec::default_scalar(&column.ty, default) {
         Ok(scalar) => match scalar {
             ScalarRef::Text(s) => Ok(Value::Text(s.to_string())),
@@ -9036,6 +9041,45 @@ mod tests {
             let err = bind_column_default(&col(ty), &text(bad))
                 .expect_err("invalid JSON default must be rejected");
             assert_eq!(err.wire_code(), "22P02");
+        }
+    }
+
+    /// 配列 DEFAULT（Issue #1374）は INSERT のリテラル束縛と同じ `parse_array_literal` を通り、
+    /// SQLSTATE も一致する。
+    #[test]
+    fn bind_column_default_binds_array_literals_like_insert() {
+        let array_ty =
+            |e| ColumnType::Array(crate::catalog::ArrayType::new(e, 2).expect("array type"));
+        let col = |ty| ColumnDef::new("a", ty, true);
+        let text = |s: &str| ColumnDefault::Text(s.to_string());
+        let ok = bind_column_default(
+            &col(array_ty(crate::catalog::ArrayElemType::Integer)),
+            &text("{1,NULL}"),
+        )
+        .expect("valid array default");
+        assert_eq!(
+            ok,
+            crate::row_codec::Value::Array(crate::row_codec::ArrayValue::Integer(vec![
+                Some(1),
+                None
+            ]))
+        );
+        for (lit, code) in [
+            ("1", "22P02"),
+            ("{a}", "22P02"),
+            ("{99999999999}", "22003"),
+            ("{1,2,3}", "54000"),
+        ] {
+            let ty = array_ty(crate::catalog::ArrayElemType::Integer);
+            let err = bind_column_default(&col(ty.clone()), &text(lit))
+                .expect_err("invalid array default");
+            assert_eq!(err.wire_code(), code, "{lit}");
+            // INSERT のリテラル束縛と同じ SQLSTATE。
+            let ColumnType::Array(at) = &ty else {
+                unreachable!()
+            };
+            let insert_err = parse_array_literal(lit, at).expect_err("insert path");
+            assert_eq!(insert_err.wire_code(), code, "{lit}");
         }
     }
 }
