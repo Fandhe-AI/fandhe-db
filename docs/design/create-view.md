@@ -73,9 +73,9 @@ RLS-10 (b)・ERR-6。spec 本文は転記しない。
   フォーマット変更・移行は不要。`ParsedViewBody`／`parse_view_body`／
   `render_view_body` のシグネチャは変更していない（CTE と共有）。
 - 本文に書けないもの（`42601`）: ベクトル順位付け・`HYBRID`・`USING PLAN`・
-  `EXPLAIN`・CTE・集合演算・サブクエリ・ウィンドウ項目・式項目・式述語・
-  UDF 述語・集計引数の式（本文が参照セッションの UDF レジストリに依存しない
-  ようにする）。
+  `EXPLAIN`・ウィンドウ項目・式項目・式述語・UDF 述語・集計引数の式（本文が
+  参照セッションの UDF レジストリに依存しないようにする）。CTE・集合演算・
+  サブクエリは Phase 3（Issue #1360）で受理側へ移った。
 
 ### 評価後射影形ビューを参照するクエリ
 
@@ -123,6 +123,47 @@ RLS-10 (b)・ERR-6。spec 本文は転記しない。
 （JOIN は両辺に独立して適用）、作成者の可視性は構造的に引き継がれない。外側の
 後処理（`sql::view_buffered`）は `PolicyContext` を受け取らず、可視性判定に関与
 しない。3 テナント対照の結合テスト（`tests/table18_view.rs`）で固定した。
+
+## Phase 3（Issue #1360）: 本文の受理形のさらなる拡大
+
+対象ビヘイビア: TABLE-18（主対象）・SQL-28・SQL-29・RLS-10 (b)・ERR-6。spec 本文は
+転記しない。
+
+### 受理する本文（評価後射影形）
+
+先頭トークンは `SELECT`・`WITH`（非再帰 CTE）・`(`（括弧で始まる集合演算）。
+`classify_view_body` は通常の読み取り SELECT と同じ
+`validate_sql_tokens_with_subquery_ctx`（深さ 0）で構造を確定し、
+`check_buffered_body_shape` で形状を絞る。`EXPLAIN`／`SET`／`CREATE` で始まる本文は
+`42601`。
+
+| 本文の形 | 検査 |
+| -------- | ---- |
+| CTE（`WITH`） | 畳み込み後の `Scan`／`Aggregate` に従来の検査。主クエリは従来どおり `subquery_ctx: None`（CTE の主クエリにサブクエリは書けない） |
+| 集合演算 | `SetTree` の全枝（`Branch`／`LimitedBranch`／`AggregateBranch`）へ式項目・式述語・UDF 述語の拒否を適用。全体 `LIMIT` は任意（枝は各 `MAX_SEARCH_K` で頭打ち） |
+| サブクエリ（`IN`／`EXISTS`／スカラー比較。`NOT`・`OR` の中も） | 内側のトークン列を作成時・参照時の双方で `validate_sql_tokens_with_subquery_ctx` により構造検証し、同じ形状検査を再帰的に適用。形の規則は `sql::subquery::execute_inner_query` と同じ（IN／EXISTS は `Scan`、スカラーは `Scan` か `Aggregate`）。実行は従来どおり参照者の `ctx` で `sql::subquery` が行う |
+| 3 テーブル以上の JOIN | 既存の JOIN 経路でそのまま受理される（テストで固定。依存検査は全辺に効く） |
+
+`LIMIT` の無い広域取得本文は、サブクエリ付きであっても従来どおり受理しない
+（インライン展開すると他の経路へサブクエリ述語が漏れるため）。
+
+### relation 一覧（SSOT）
+
+`ViewBodyKind::Buffered { stmt, relations }` の `relations` を `classify_view_body` が
+1 回だけ計算し、`validate_create_view_tokens`（`base_relation` ＝先頭）・
+`catalog::view_body_shape`（存在確認・連鎖拒否・`DROP TABLE` の `2BP01`・
+`DROP COLUMN` の保守的拒否の唯一の根拠）・`sql::view::reparse_buffered_body` が共有する。
+先頭は主クエリの最初の FROM。CTE は各定義の FROM のうち「その位置から見える CTE 名
+でないもの」（参照されない CTE の分も含む。`sql::cte::resolve_relation` の可視範囲と
+同一）、サブクエリは内側の relation、集合演算は全枝、JOIN は全辺を重複なく含む。
+
+### 変えないもの
+
+評価後射影形の連鎖（本文の CTE・サブクエリ・集合演算の枝・JOIN の辺から評価後射影形
+ビューを参照すること）は `42601`（作成時は `Storage::create_view` が relation 一覧を
+`view_is_buffered_in_txn` で判定、参照時は `BufferedBodyLookup`）。JOIN 本文の辺は
+テーブルに限る。本文の大きさの上限（64 KiB・`54000`）、`$n` を含む DDL の Parse 拒否、
+判定順序（構文 `42601` → `42501` → カタログ）は不変。
 
 ## 展開方式（検証段階での書き換え）
 
