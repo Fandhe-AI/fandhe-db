@@ -2849,7 +2849,8 @@ impl ColumnDefault {
                     | ColumnType::Uuid
                     | ColumnType::Enum(_)
                     | ColumnType::Json
-                    | ColumnType::Jsonb,
+                    | ColumnType::Jsonb
+                    | ColumnType::Bytea,
             ) | (
                 ColumnDefault::Number(_),
                 ColumnType::Integer
@@ -3451,6 +3452,84 @@ pub struct TableSchema {
     /// 参照先の解決（主キー・UNIQUE 制約との照合）はカタログ参照を要するため
     /// [`Storage::create_table`] の write トランザクション内で行う。
     foreign_keys: Vec<ForeignKeyDef>,
+    /// BYTEA 列の `DEFAULT`（`\x..` 原文）をデコードしたバイト列の遅延キャッシュ
+    /// （Issue #1373）。非公開で、`TableSchema` の等価性・`Debug` には影響しない。
+    /// 詳細は [`ByteaDefaultCache`]。
+    bytea_defaults: ByteaDefaultCache,
+}
+
+/// [`ByteaDefaultCache`] の 1 エントリ。照合用の原文と、デコード済みバイト列。
+#[derive(Debug)]
+struct ByteaDefaultEntry {
+    logical_index: usize,
+    /// 登録時点の `ColumnDefault::Text` 原文。参照時に現在値と照合する。
+    source: String,
+    bytes: Box<[u8]>,
+}
+
+/// BYTEA 列の `DEFAULT` を読み出し時補完へ借用で渡すための遅延キャッシュ
+/// （Issue #1373）。`row_codec::ScalarRef<'a>` はスキーマ・行バッファを借用する
+/// 型で、`\x..` 原文からデコードしたバイト列を所有できないため、`TableSchema`
+/// 側に非公開で持たせて `&'a [u8]` を借用する。
+///
+/// 不変条件:
+/// - 遅延初期化（`alter_table_add_column` は decode 後にスキーマをその場で書き換える）
+/// - `Clone` は空のキャッシュを返す（clone 後の書き換えで古い値が残らないように）
+/// - `PartialEq`/`Eq` は常に等しい・`Debug` は中身を出さない（`TableSchema` の
+///   derive の意味を変えない。DEFAULT の値をログへ出さない）
+/// - 参照時に原文を現在の `columns` と照合し、食い違えば `None`（fail-closed）
+#[derive(Default)]
+struct ByteaDefaultCache(std::sync::OnceLock<Vec<ByteaDefaultEntry>>);
+
+impl Clone for ByteaDefaultCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ByteaDefaultCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ByteaDefaultCache {}
+
+impl std::fmt::Debug for ByteaDefaultCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ByteaDefaultCache")
+    }
+}
+
+impl TableSchema {
+    /// 論理列 `logical_index` の BYTEA `DEFAULT` のデコード済みバイト列を借用で返す。
+    /// `row_codec::scan_scalar_columns_validated`／`decode_row` が、バッファ末尾で
+    /// 欠落した列（`ALTER TABLE ADD COLUMN` 後の既存行。TABLE-5・TABLE-16）の
+    /// 読み出し時補完に使う。未登録（16 進不正）・原文の食い違い・BYTEA 以外の列は
+    /// `None` で、呼び出し元は invalid DEFAULT として拒否する（NULL へ
+    /// すり替えない）。列の `DEFAULT` は作成後に変わらない前提。
+    pub(crate) fn bytea_default_bytes(&self, logical_index: usize) -> Option<&[u8]> {
+        let entries = self.bytea_defaults.0.get_or_init(|| {
+            let mut out = Vec::new();
+            for (i, c) in self.columns.iter().enumerate() {
+                if let (ColumnType::Bytea, Some(ColumnDefault::Text(text))) = (&c.ty, &c.default) {
+                    if let Ok(bytes) = crate::bytea::parse_hex_text(text) {
+                        out.push(ByteaDefaultEntry {
+                            logical_index: i,
+                            source: text.clone(),
+                            bytes: bytes.into_boxed_slice(),
+                        });
+                    }
+                }
+            }
+            out
+        });
+        let entry = entries.iter().find(|e| e.logical_index == logical_index)?;
+        match self.columns.get(logical_index)?.default.as_ref()? {
+            ColumnDefault::Text(current) if *current == entry.source => Some(&entry.bytes),
+            _ => None,
+        }
+    }
 }
 
 impl TableSchema {
@@ -3464,6 +3543,7 @@ impl TableSchema {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            bytea_defaults: ByteaDefaultCache::default(),
         }
     }
 
@@ -3487,6 +3567,7 @@ impl TableSchema {
             unique_constraints,
             checks: Vec::new(),
             foreign_keys: Vec::new(),
+            bytea_defaults: ByteaDefaultCache::default(),
         }
     }
 
@@ -3843,6 +3924,15 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             {
                 return Err(CatalogError::Invalid(format!(
                     "column {:?} has a malformed JSON DEFAULT",
+                    column.name
+                )));
+            }
+            // BYTEA の 16 進原文も同様に検証する（Issue #1373）。
+            if matches!(column.ty, ColumnType::Bytea)
+                && crate::row_codec::validate_default(&column.ty, default).is_err()
+            {
+                return Err(CatalogError::Invalid(format!(
+                    "column {:?} has a malformed BYTEA DEFAULT",
                     column.name
                 )));
             }
@@ -5988,6 +6078,20 @@ fn decode_schema_body(
                             )?;
                         }
                     }
+                    // BYTEA の既定値も読み出し時にキャッシュへデコードするため、
+                    // 破損した 16 進はここで読み込み不能にする（fail-closed。Issue #1373）。
+                    if matches!(column.ty, ColumnType::Bytea) {
+                        if let Some(default) = &column.default {
+                            crate::row_codec::validate_default(&column.ty, default).map_err(
+                                |_| {
+                                    CatalogError::Invalid(format!(
+                                        "column {:?} has a malformed BYTEA DEFAULT",
+                                        column.name
+                                    ))
+                                },
+                            )?;
+                        }
+                    }
                 }
                 columns.push(column);
             }
@@ -6670,7 +6774,7 @@ impl Storage {
                     if column.default.is_some() {
                         let mut checked = column.clone();
                         checked.ty = ColumnType::Enum(registered);
-                        if crate::row_codec::column_default_scalar(&checked).is_err() {
+                        if crate::row_codec::validate_column_default(&checked).is_err() {
                             return Err(CatalogError::Invalid(
                                 "column has a DEFAULT that is not a registered ENUM label"
                                     .to_string(),
@@ -6855,7 +6959,7 @@ impl Storage {
     pub fn alter_table_add_column(&self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         validate_identifier(table_name)?;
         validate_column(&column)?;
-        if crate::row_codec::column_default_scalar(&column).is_err() {
+        if crate::row_codec::validate_column_default(&column).is_err() {
             return Err(CatalogError::Invalid(
                 "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT".to_string(),
             ));
@@ -6889,7 +6993,7 @@ impl Storage {
                 // 定義へ置き換えた後で DEFAULT を再検証する。省略すると未登録ラベルが
                 // 既定値として永続化され、既存行の読み出し時補完が常に失敗する
                 // （Issue #1282）。
-                if crate::row_codec::column_default_scalar(&column).is_err() {
+                if crate::row_codec::validate_column_default(&column).is_err() {
                     return Err(CatalogError::Invalid(
                         "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
                             .to_string(),
@@ -9423,7 +9527,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
         (default, tag),
         (
             ColumnDefault::Text(_),
-            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb"
+            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb" | "bytea"
         ) | (
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
@@ -11782,9 +11886,9 @@ mod tests {
     }
 
     /// `JSON`／`JSONB` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
-    /// （Issue #1337）。完全版と軽量版が一致し、`BYTEA`／配列は引き続き非対応。
+    /// （Issue #1337）。完全版と軽量版が一致し、配列は引き続き非対応。
     #[test]
-    fn json_columns_accept_only_text_default_in_both_compat_checks() {
+    fn json_and_bytea_columns_accept_only_text_default_in_both_compat_checks() {
         let text = ColumnDefault::Text("{\"a\":1}".to_string());
         let num = ColumnDefault::Number("1".to_string());
         let flag = ColumnDefault::Bool(true);
@@ -11796,9 +11900,69 @@ mod tests {
             assert!(!column_default_compatible_with_tag(&num, tag));
             assert!(!column_default_compatible_with_tag(&flag, tag));
         }
-        assert!(!text.compatible_with(&ColumnType::Bytea));
-        assert!(!column_default_compatible_with_tag(&text, "bytea"));
+        // `BYTEA` も `Text`（`\x..` 原文）の既定値だけを許容する（Issue #1373）。
+        assert!(text.compatible_with(&ColumnType::Bytea));
+        assert!(!num.compatible_with(&ColumnType::Bytea));
+        assert!(!flag.compatible_with(&ColumnType::Bytea));
+        assert!(column_default_compatible_with_tag(&text, "bytea"));
+        assert!(!column_default_compatible_with_tag(&num, "bytea"));
+        assert!(!column_default_compatible_with_tag(&flag, "bytea"));
         assert!(!column_default_compatible_with_tag(&text, "array"));
+    }
+
+    /// 不正な 16 進の BYTEA DEFAULT は Rust API 直接の `create_table`・
+    /// `alter_table_add_column` でも `Invalid` で拒否され、永続化されない（Issue #1373）。
+    #[test]
+    fn malformed_bytea_default_is_rejected_by_rust_api_paths() {
+        let path = unique_db_path("catalog-bytea-default-malformed");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let bytea = |hex: &str| {
+            ColumnDef::new("b", ColumnType::Bytea, true)
+                .with_default(ColumnDefault::Text(hex.to_string()))
+        };
+        let bad = TableSchema::new("bad", vec![bytea("\\xzz")]);
+        assert!(matches!(
+            storage.create_table(&bad),
+            Err(CatalogError::Invalid(_))
+        ));
+
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create docs");
+        for hex in ["ab", "\\x0"] {
+            assert!(matches!(
+                storage.alter_table_add_column("docs", bytea(hex)),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+        storage
+            .alter_table_add_column("docs", bytea("\\x01"))
+            .expect("valid hex");
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert_eq!(schema.columns.len(), 2);
+    }
+
+    /// 破損した BYTEA DEFAULT を持つカタログ値は読み込めない（fail-closed。Issue #1373）。
+    #[test]
+    fn decode_schema_rejects_malformed_bytea_default() {
+        let good = TableSchema::new(
+            "t",
+            vec![ColumnDef::new("b", ColumnType::Bytea, true)
+                .with_default(ColumnDefault::Text("\\x01".to_string()))],
+        );
+        let bytes = encode_schema(&good).expect("encode");
+        assert!(decode_schema("t", &bytes).is_ok());
+        // 16 進化された既定値フィールド（`\x01` = `5c7830 31`）を奇数桁の不正値へ壊す。
+        let text = String::from_utf8(bytes).expect("utf8");
+        let hex = "5c783031";
+        assert!(text.contains(hex), "{text}");
+        let corrupt = text.replace(hex, "5c7830");
+        let err = decode_schema("t", corrupt.as_bytes()).unwrap_err();
+        assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
     }
 
     /// `create_table` 経路でも、登録済み語彙にないラベルの ENUM DEFAULT は write txn 内の

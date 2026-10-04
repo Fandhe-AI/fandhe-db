@@ -1647,12 +1647,164 @@ fn json_default_over_length_limit_is_rejected_with_54000() {
     }
 }
 
-/// BYTEA の DEFAULT は本 Issue の範囲外で `0A000` のまま（回帰固定）。
+fn bytes_cell(c: Cell) -> Vec<u8> {
+    match c {
+        Cell::Bytes(b) => b,
+        other => panic!("expected Cell::Bytes, got {other:?}"),
+    }
+}
+
+/// BYTEA の DEFAULT（Issue #1373）は既存行・列省略 INSERT の新規行に同じ値で補われ、
+/// 投影・WHERE の両経路で読める。空バイト列（`\x`）は NULL ではない。
 #[test]
-fn bytea_default_remains_unsupported() {
+fn bytea_default_fills_existing_rows_across_read_paths() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
-    let err = add_column(&core, "b BYTEA DEFAULT '\\x01'").expect_err("bytea");
-    assert_eq!(err.wire_code(), "0A000");
-    assert!(!column_exists(&core, &ctx("owner"), TABLE, "b"));
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "b BYTEA NOT NULL DEFAULT '\\xDEADbeef'").expect("ADD COLUMN BYTEA");
+    add_column(&core, "b2 BYTEA DEFAULT '\\x'").expect("ADD COLUMN empty BYTEA");
+
+    let q = |id: u64, col: &str| {
+        one_cell(
+            &core,
+            &owner,
+            &format!("SELECT {col} FROM {TABLE} WHERE id = {id} LIMIT 1"),
+        )
+    };
+    assert_eq!(bytes_cell(q(1, "b")), vec![0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(bytes_cell(q(1, "b2")), Vec::<u8>::new());
+    assert_eq!(count_star(&core, &owner, TABLE), 1);
+    let filtered = core
+        .execute_sql(
+            &owner,
+            &format!("SELECT id FROM {TABLE} WHERE b = '\\xdeadbeef' LIMIT 10"),
+        )
+        .expect("WHERE on BYTEA default");
+    assert_eq!(filtered.rows.len(), 1);
+
+    let mut s = SessionState::default();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding) VALUES (2, '[0.3,0.4]') USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert omitting b");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, b) VALUES (3, '[0.3,0.4]', '\\x01') USING OPERATION_ID 'op-3'"
+        ),
+    )
+    .expect("insert explicit b");
+    assert_eq!(bytes_cell(q(2, "b")), vec![0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(bytes_cell(q(3, "b")), vec![0x01]);
+}
+
+/// BYTEA の DEFAULT は再オープン後も保たれる。
+#[test]
+fn bytea_default_persists_across_reopen() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+    add_column(&core, "b BYTEA NOT NULL DEFAULT '\\x0a0B'").expect("BYTEA");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert_eq!(
+        bytes_cell(one_cell(
+            &core,
+            &owner,
+            &format!("SELECT b FROM {TABLE} WHERE id = 1 LIMIT 1")
+        )),
+        vec![0x0a, 0x0b]
+    );
+}
+
+/// BYTEA の DEFAULT の不正は INSERT のリテラル束縛と同じ SQLSTATE で拒否され、列は追加されない。
+#[test]
+fn bytea_default_type_check_errors() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let long = format!("\\x{}", "ab".repeat(600));
+    for (decl, code) in [
+        ("b BYTEA DEFAULT 1".to_string(), "42601"),
+        ("b BYTEA DEFAULT true".to_string(), "42601"),
+        ("b BYTEA DEFAULT 'ab'".to_string(), "22P02"),
+        ("b BYTEA DEFAULT '\\x0'".to_string(), "22P02"),
+        ("b BYTEA DEFAULT '\\xzz'".to_string(), "22P02"),
+        (format!("b BYTEA NOT NULL DEFAULT '{long}'"), "54000"),
+    ] {
+        let err = add_column(&core, &decl).expect_err(&decl);
+        assert_eq!(err.wire_code(), code, "{decl}: {err:?}");
+        assert!(!column_exists(&core, &ctx("owner"), TABLE, "b"), "{decl}");
+    }
+}
+
+/// `BYTEA NOT NULL`（DEFAULT なし）は行・テナントの有無に依存せず同一の `42601`、
+/// DEFAULT 付きの成功も他テナントの行があっても成り、補完値が読める（テナント境界 P0）。
+#[test]
+fn bytea_not_null_outcome_is_independent_of_rows_and_tenants() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let empty_err = add_column(&core, "b BYTEA NOT NULL").expect_err("empty");
+    assert_eq!(empty_err.wire_code(), "42601");
+    insert_row(&core, &ctx("bob"), 1, 1);
+    let other_err = add_column(&core, "b BYTEA NOT NULL").expect_err("other tenant");
+    assert_eq!(other_err.wire_code(), "42601");
+    assert_eq!(empty_err.to_string(), other_err.to_string());
+    assert!(!column_exists(&core, &ctx("bob"), TABLE, "b"));
+
+    add_column(&core, "b BYTEA NOT NULL DEFAULT '\\x01'").expect("other tenant rows: ok");
+    assert_eq!(
+        bytes_cell(one_cell(
+            &core,
+            &ctx("bob"),
+            &format!("SELECT b FROM {TABLE} WHERE id = 1 LIMIT 1")
+        )),
+        vec![0x01]
+    );
+}
+
+/// `CREATE TABLE` の列 DEFAULT も `add_column_default` を共有するため BYTEA を受け付け、
+/// 列省略 INSERT で補われる。16 進不正は 22P02（Issue #1373 の波及を固定する）。
+#[test]
+fn create_table_bytea_default_is_accepted_and_applied_on_omission() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let mut s = ddl_session();
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        "CREATE TABLE bt (embedding VECTOR(2), b BYTEA DEFAULT '\\x01')",
+    )
+    .expect("CREATE TABLE with BYTEA DEFAULT");
+    core.execute_sql_in_session(
+        &owner,
+        &mut s,
+        "INSERT INTO bt (id, embedding) VALUES (1, '[0.3,0.4]') USING OPERATION_ID 'op-bt'",
+    )
+    .expect("insert omitting b");
+    assert_eq!(
+        bytes_cell(one_cell(
+            &core,
+            &owner,
+            "SELECT b FROM bt WHERE id = 1 LIMIT 1"
+        )),
+        vec![0x01]
+    );
+    let err = core
+        .execute_sql_in_session(
+            &owner,
+            &mut s,
+            "CREATE TABLE bt2 (embedding VECTOR(2), b BYTEA DEFAULT 'ab')",
+        )
+        .expect_err("malformed hex");
+    assert_eq!(err.wire_code(), "22P02");
 }

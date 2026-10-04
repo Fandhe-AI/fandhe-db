@@ -2243,8 +2243,14 @@ pub(crate) fn bind_column_default(
     default: &ColumnDefault,
 ) -> Result<crate::row_codec::Value, SqlSurfaceError> {
     use crate::row_codec::{DefaultBindError, ScalarRef, Value};
-    // 変換本体は `row_codec::column_default_scalar`（既存行の読み出し時補完と
+    // 変換本体は `row_codec::default_scalar`（既存行の読み出し時補完と
     // 共有する唯一の実装。Issue #1169）。ここでは SQLSTATE への写像のみ行う。
+    // BYTEA は借用の `ScalarRef` で返せない（`default_scalar` は `Incompatible`）ため、
+    // INSERT のリテラル束縛と同じ `bind_bytea_literal` を再利用する（22P02／54000 の
+    // 写像も共通。Issue #1373）。
+    if let (ColumnType::Bytea, ColumnDefault::Text(s)) = (&column.ty, default) {
+        return bind_bytea_literal(s, &column.name);
+    }
     match crate::row_codec::default_scalar(&column.ty, default) {
         Ok(scalar) => match scalar {
             ScalarRef::Text(s) => Ok(Value::Text(s.to_string())),
