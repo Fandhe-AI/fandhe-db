@@ -587,11 +587,10 @@ fn out_of_scope_alter_table_forms_are_rejected_with_42601() {
     .expect_err("DROP CONSTRAINT IF EXISTS is out of scope for this Issue");
     assert_eq!(err.wire_code(), "42601");
 
-    // PRIMARY KEY は無名（Issue #1196）。名前付き形・暗黙の `id` 主キーの再宣言は拒否する。
-    for sql in [
-        "ALTER TABLE docs ADD CONSTRAINT x PRIMARY KEY (a)",
-        "ALTER TABLE docs ADD PRIMARY KEY (id)",
-    ] {
+    // 名前付き PRIMARY KEY は Issue #1364 で受理に変わった（受理・DROP・重複宣言の
+    // 42P16 は sql_alter_table_primary_key.rs で固定）。暗黙の `id` 主キーの
+    // 再宣言だけは引き続き拒否する。
+    for sql in ["ALTER TABLE docs ADD PRIMARY KEY (id)"] {
         let err = exec(&core, &mut session, &owner, sql).expect_err("out of scope form");
         assert_eq!(err.wire_code(), "42601", "{sql}");
     }
