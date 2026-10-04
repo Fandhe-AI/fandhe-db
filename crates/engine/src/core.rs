@@ -5287,6 +5287,11 @@ impl EngineCore {
         stmt: crate::sql::allowlist::Statement,
         read_txn: &R,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // TABLE-15・Issue #1363: スナップショット確定後・スキーマ解決前の同期点
+        // （feature 限定。既定ビルドでは消える）。
+        #[cfg(feature = "test-sync-points")]
+        self.storage
+            .sync_point(crate::test_sync::SyncPoint::ReadStatementSnapshotAcquired);
         match stmt {
             crate::sql::allowlist::Statement::Select(validated) => {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;

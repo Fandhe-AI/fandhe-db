@@ -103,6 +103,14 @@ cross-encoder = ["dep:ort", "dep:tokenizers"]
 # 一切結線せずテナント境界・RLS 迂回 API も露出しない。
 bench-internals = []
 
+# Issue #1363（TABLE-15）: DROP TABLE の commit 直前と読み取り文の開始時点（スナップショット
+# 確定後）で、テストが登録したコールバックを呼ぶ同期点（`test_sync`）を有効化する feature。
+# 「クエリの実行区間と DROP の実行区間が確実に重なる」状況を決定的に作る結合テスト専用。
+# 依存は追加しない（`[]`）。`bench-internals` と同パターンで default に含めず、
+# `wire-server` でも有効化しない。テナント境界・RLS・認証・fail-closed の経路を迂回する
+# API は露出せず、コールバックへ渡すのは同期点の種別だけ（行・テナント・テーブル名は渡さない）。
+test-sync-points = []
+
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
 # dev-dependency で `EngineCore::storage`/`from_storage`（テナント境界の単一照合パス

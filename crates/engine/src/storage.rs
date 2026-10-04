@@ -670,6 +670,10 @@ pub struct Storage {
     /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
     /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
     write_lock_wait: std::time::Duration,
+    /// テスト専用の同期点コールバック（Issue #1363・TABLE-15）。feature
+    /// `test-sync-points` 限定で、既定ビルドにはフィールドごと存在しない。
+    #[cfg(feature = "test-sync-points")]
+    sync_hook: std::sync::Mutex<Option<crate::test_sync::SyncHook>>,
 }
 
 impl Storage {
@@ -696,7 +700,36 @@ impl Storage {
             writer_gate: writer_gate::WriterGate::new(),
             partitioned_jobs: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+            #[cfg(feature = "test-sync-points")]
+            sync_hook: std::sync::Mutex::new(None),
         })
+    }
+
+    /// 同期点コールバックを設定・解除する（テスト専用。feature `test-sync-points` 限定、
+    /// Issue #1363・TABLE-15）。`EngineCore::from_storage` は `Storage` を取り出せない
+    /// ため、結合テストは所有権を移す前にこれを呼ぶ。コールバックへはテナントデータを渡さない。
+    #[cfg(feature = "test-sync-points")]
+    pub fn set_sync_hook(&self, hook: Option<crate::test_sync::SyncHook>) {
+        let mut guard = self
+            .sync_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = hook;
+    }
+
+    /// 同期点でコールバックを呼ぶ（`drop_table`・`execute_read_statement` から呼ばれる）。
+    /// ロック内で `Arc` を複製して解放してから呼ぶ。保持したまま呼ぶと、コールバック内で
+    /// 停止中のスレッドが別スレッドの同期点到達を塞ぎデッドロックするため。
+    #[cfg(feature = "test-sync-points")]
+    pub(crate) fn sync_point(&self, point: crate::test_sync::SyncPoint) {
+        let hook = self
+            .sync_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
     }
 
     /// 実行中の分割実行ジョブ登録簿（Issue #1127）。tenant 層・#1128 の実行器が
@@ -3062,6 +3095,8 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                #[cfg(feature = "test-sync-points")]
+                sync_hook: std::sync::Mutex::new(None),
             };
 
             // embedding/metadata は空スライスにしない。空だと encoder/decoder が
@@ -3125,6 +3160,8 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                #[cfg(feature = "test-sync-points")]
+                sync_hook: std::sync::Mutex::new(None),
             };
 
             let row1_after = recovered_storage
@@ -3184,6 +3221,8 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                #[cfg(feature = "test-sync-points")]
+                sync_hook: std::sync::Mutex::new(None),
             };
 
             let embedding = [1.5_f32, -2.0, 0.25];
@@ -3223,6 +3262,8 @@ mod tests {
                 writer_gate: writer_gate::WriterGate::new(),
                 partitioned_jobs: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                #[cfg(feature = "test-sync-points")]
+                sync_hook: std::sync::Mutex::new(None),
             };
 
             // commit 成功応答を受け取ったはずの行が、電源断後は失われている

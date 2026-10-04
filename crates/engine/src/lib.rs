@@ -269,6 +269,11 @@ pub(crate) mod sq8;
 pub mod sql;
 pub mod storage;
 pub mod tenant;
+// 注意: `test_sync` は feature `test-sync-points` 限定（既定ビルドには存在しない）。
+// core_api.snapshot は `pub mod` 行のみをテキスト抽出し cfg 属性を含めないため、
+// スナップショット上は無条件の `pub mod test_sync;` として記録される（Issue #1363）。
+#[cfg(feature = "test-sync-points")]
+pub mod test_sync;
 pub mod tiering;
 pub mod txn;
 pub mod uuid;
