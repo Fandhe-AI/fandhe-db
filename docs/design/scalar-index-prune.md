@@ -340,6 +340,10 @@ typed_compare_*`——と、`tests/scalar_index_typed_range.rs` の SQL 表層�
 テスト（cold/hot 等価性・RLS 非漏えい・世代進行後の再構築一貫性）の両方で
 固定している）。
 
+追記（Issue #1362）: 上記は #1257 時点の判断である。その後 `BYTEA` を宣言で受理する
+よう変更した（INDEX-7 ポインタ）。宣言付きテーブルでも宣言した `BYTEA` 列は
+`OrderedColumnIndex::Bytes` の索引経路を使い、`EXPLAIN` の索引名も他の型と同じ規則で付く。
+
 ### 対象ファイル（本 Issue 分）
 
 | パス | 変更 |

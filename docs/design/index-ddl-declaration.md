@@ -86,7 +86,7 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
 到達しない（射影は production の応答エンコーダ経由でのみ固定する）。
 
 スカラー宣言で索引化対応とみなす列型は `TEXT`／`ENUM`／`DATE`／`TIMESTAMP`／
-`NUMERIC`／`UUID`（および暗黙列 `id`）に限る。`BOOLEAN`／`BYTEA`／`JSON(B)`／
+`NUMERIC`／`UUID`／`BYTEA`（および暗黙列 `id`。`BYTEA` は Issue #1362）に限る。`BOOLEAN`／`JSON(B)`／
 `ARRAY`・未結線の数値型（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`）は、宣言しても
 `ScalarIndex` に一切効かない状態を作らないため `0A000` で拒否する。
 

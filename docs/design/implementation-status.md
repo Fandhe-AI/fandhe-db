@@ -567,3 +567,11 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **対象外（申し送り）**: 外側の集計・`DISTINCT`・ウィンドウ・式 `ORDER BY`・UDF 述語・サブクエリ、評価後射影形の連鎖、サブクエリ付き本文の Describe。
 
 Issue #1361（feat(engine): ALTER COLUMN TYPE で INTEGER→BIGINT・REAL→DOUBLE PRECISION を受理する。TABLE-19・TABLE-12 ポインタ）: 物理フレーム幅が変わる 2 変換を、カタログ更新と同一 write txn 内の全テナント既存行の再エンコード（新規 `column_rewrite.rs`。件数上限付きキーバッチ・キー/ヘッダ tenant 整合検査・失敗時は `CorruptSchema` で全体中止）で受理した。PK／UNIQUE／FOREIGN KEY 構成列は索引が古くなるため `2BP01`、縮小・異種・`INTEGER→DOUBLE PRECISION` 等は従来どおり `42804`。成功時は世代 bump で索引キャッシュを失効する。ADD COLUMN 前の行の DEFAULT は書き換え時に実体化される。公開 API の変更・依存追加・`unsafe` なし。テスト: `sql_ddl_drop_alter_column.rs`・`catalog.rs` 単体テスト・`table_generation_bump_coverage.rs`（行番号追随）。設計は `docs/design/alter-table-drop-modify-column.md`。
+
+## Issue #1362: BYTEA 列への CREATE INDEX の宣言を受理する
+
+- **対象ビヘイビア**: INDEX-7（関連: TABLE-13・INDEX-5）。
+- **変更箇所**: `catalog::is_declarable_scalar_index_type` に `BYTEA` を追加した。#1257 で自動構築が対応済みの `OrderedColumnIndex::Bytes` を宣言付きテーブルでも使うため、実行時経路の変更は無い。HNSW 宣言の `VECTOR` 限定は不変。
+- **性質**: 宣言した `BYTEA` 列の述語は索引経路を使い、`EXPLAIN` の `scalar_plan:` 行の索引名は他型と同じ規則で付く。RLS・テナント境界・`wire_code` は不変。
+- **テスト**: `catalog` 単体、`tests/sql_index_ddl.rs`、`tests/index_declaration_bytea.rs`（索引経路・補集合・RLS・`EXPLAIN` 索引名）。
+- **対象外（申し送り）**: `BYTEA` の `IN` の索引化、平均値長ゲートの `BYTEA` 専用閾値化。

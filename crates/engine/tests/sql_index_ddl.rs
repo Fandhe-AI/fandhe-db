@@ -44,6 +44,7 @@ fn schema() -> TableSchema {
             ColumnDef::new("lang", ColumnType::Text, false),
             ColumnDef::new("body", ColumnType::Text, false),
             ColumnDef::new("flag", ColumnType::Boolean, true),
+            ColumnDef::new("blob", ColumnType::Bytea, true),
         ],
     )
 }
@@ -216,6 +217,38 @@ fn create_and_drop_index_succeed_and_persist_across_reopen() {
     let vec_idx = defs.iter().find(|d| d.name == "idx_vec").expect("idx_vec");
     assert_eq!(vec_idx.kind, IndexKind::Hnsw);
     assert_eq!(vec_idx.columns, vec!["embedding".to_string()]);
+}
+
+/// `BYTEA` 列のスカラー宣言（単独・`id` との複合）は受理され永続化され、
+/// `DROP INDEX` で消える（Issue #1362・INDEX-7）。
+#[test]
+fn bytea_scalar_declaration_is_accepted_and_droppable() {
+    let (path, _guard) = open_fixture("index-ddl-bytea");
+    {
+        let core = core_at(&path);
+        let mut session = allowed_session();
+        for sql in [
+            "CREATE INDEX idx_blob ON docs (blob)",
+            "CREATE INDEX idx_blob_id ON docs (id, blob)",
+        ] {
+            assert!(
+                matches!(
+                    run(&core, &mut session, sql),
+                    Ok(SqlOutcome::CreateIndex(_))
+                ),
+                "{sql}"
+            );
+        }
+        assert!(matches!(
+            run(&core, &mut session, "DROP INDEX idx_blob_id"),
+            Ok(SqlOutcome::DropIndex(_))
+        ));
+    }
+    let storage = Storage::open(&path).expect("reopen storage");
+    let defs = storage.list_indexes().expect("list indexes");
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].name, "idx_blob");
+    assert_eq!(defs[0].columns, vec!["blob".to_string()]);
 }
 
 // --- 構文の許可形状（カタログ非参照） -------------------------------------------

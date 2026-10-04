@@ -365,9 +365,8 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
 }
 
 /// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY`・未結線の
-/// 数値型は索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動
-/// （`Auto`）構築では索引化される（Issue #1257）が、宣言での受理は INDEX-7 の別スコープの
-/// ため拒否のまま据え置く（宣言付きテーブルでは `BYTEA` 列は `PlainScan` になる）。
+/// 数値型は索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動・
+/// 宣言とも `OrderedColumnIndex::Bytes` で索引化されるため受理する（#1257・#1362、INDEX-7）。
 fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
     matches!(
         ty,
@@ -377,6 +376,7 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Timestamp
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
+            | ColumnType::Bytea
     )
 }
 
@@ -10119,6 +10119,40 @@ mod tests {
                 "corrupt value must be rejected: {corrupt:?}"
             );
         }
+    }
+
+    /// `BYTEA` 列はスカラー宣言（単独・複合）で受理し、`USING hnsw` では引き続き
+    /// 拒否する（Issue #1362・INDEX-7。HNSW 側の検証を緩めていないことの回帰防止）。
+    #[test]
+    fn create_index_accepts_bytea_scalar_declaration() {
+        let path = unique_db_path("index-ddl-bytea");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "blobs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("blob", ColumnType::Bytea, true),
+                ],
+            ))
+            .expect("create blobs");
+        storage
+            .create_index(&scalar_def("i_blob", "blobs", &["blob"]))
+            .expect("BYTEA is declarable");
+        storage
+            .create_index(&scalar_def("i_id_blob", "blobs", &["id", "blob"]))
+            .expect("composite with BYTEA is declarable");
+        let hnsw = IndexDef::new(
+            "i_hnsw".to_string(),
+            "blobs".to_string(),
+            IndexKind::Hnsw,
+            vec!["blob".to_string()],
+        );
+        assert!(matches!(
+            storage.create_index(&hnsw),
+            Err(CatalogError::IndexKindMismatch(_))
+        ));
     }
 
     /// 列の存在・種別整合の判定（`id` は暗黙列としてスカラー宣言に使えるが
