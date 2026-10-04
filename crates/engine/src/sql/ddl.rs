@@ -899,7 +899,7 @@ fn resolve_enum_type(
 
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
 /// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
-/// （配列等）は `0A000`、対応型でリテラル種別が合わない場合は `42601`、
+/// （VECTOR 等）は `0A000`、対応型でリテラル種別が合わない場合は `42601`、
 /// 長さ上限超過は `54000`、BYTEA の `\x..` 形式不正は `22P02`（Issue #1373）。
 pub(crate) fn add_column_default(
     column_name: &str,
@@ -921,6 +921,14 @@ pub(crate) fn add_column_default(
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
         ColumnType::Bytea => "bytea",
+        // 配列の `{..}` 原文はここでは種別と長さだけを検査し、要素の解析はしない
+        // （Issue #1374）。`CREATE TABLE` の構文段（`allowlist::parse_create_table_column`）は
+        // ENUM 要素の語彙が未解決の配列型でこの関数を呼ぶため、ここで解析すると
+        // `mood[] DEFAULT '{happy}'` を誤って拒否する。要素の検証は語彙解決後の
+        // `parser::bind_column_default`（`execute_create_table`・
+        // `execute_alter_table_add_column` が永続化前に必ず通す）が INSERT と同じ
+        // `parse_array_literal` で行う。BYTEA の形に揃えて解析をここへ移さないこと。
+        ColumnType::Array(_) => "array",
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: format!("column {column_name:?}: DEFAULT is not supported for this type"),
@@ -938,6 +946,7 @@ pub(crate) fn add_column_default(
         // ENUM の型名解決（未登録は 42601）は DEFAULT 評価より先に済んでいる。
         InsertLiteral::String(s)
             if kind == "text"
+                || kind == "array"
                 || kind == "date"
                 || kind == "timestamp"
                 || kind == "uuid"

@@ -346,10 +346,14 @@ fn add_column_accepts_new_element_types_and_alter_column_type_still_rejects_arra
         code(&core, "ALTER TABLE a ADD COLUMN x NUMERIC(5,9)[]"),
         "42601"
     );
-    // 配列 DEFAULT は従来どおり 0A000。
+    // 配列 DEFAULT は受理される（Issue #1374）。要素不正は INSERT と同じ 22P02。
+    ok(
+        &core,
+        "ALTER TABLE a ADD COLUMN xd BYTEA[] DEFAULT '{\"\\\\x01\"}'",
+    );
     assert_eq!(
-        code(&core, "ALTER TABLE a ADD COLUMN x BYTEA[] DEFAULT '{}'"),
-        "0A000"
+        code(&core, "ALTER TABLE a ADD COLUMN xe BYTEA[] DEFAULT '{zz}'"),
+        "22P02"
     );
     // `NUMERIC(p,s)[]` の精度拡大を含め、配列の型変更は 42804 のまま。
     assert_eq!(

@@ -123,10 +123,15 @@ fn unknown_and_invalid_types_are_rejected_with_42601() {
         code(&core, &mut s, "CREATE TABLE t (a NUMERIC(5,9)[])"),
         "42601"
     );
-    // 配列列の DEFAULT は 0A000。
+    // 配列列の DEFAULT は受理され、要素不正・リテラル種別違いは拒否される（Issue #1374）。
+    run(&core, &mut s, "CREATE TABLE t (a INTEGER[] DEFAULT '{1}')").expect("array default");
     assert_eq!(
-        code(&core, &mut s, "CREATE TABLE t (a INTEGER[] DEFAULT '{1}')"),
-        "0A000"
+        code(&core, &mut s, "CREATE TABLE t2 (a INTEGER[] DEFAULT '{x}')"),
+        "22P02"
+    );
+    assert_eq!(
+        code(&core, &mut s, "CREATE TABLE t3 (a INTEGER[] DEFAULT 1)"),
+        "42601"
     );
 }
 
@@ -193,10 +198,12 @@ fn add_column_accepts_array_columns_and_rejects_invalid_ones() {
         ("ALTER TABLE t ADD COLUMN x INTEGER[0]", "42601"),
         ("ALTER TABLE t ADD COLUMN x INTEGER[2000]", "42601"),
         ("ALTER TABLE t ADD COLUMN x NUMERIC(5,9)[]", "42601"),
+        // 配列 DEFAULT の要素不正は INSERT と同じ 22P02、リテラル種別違いは 42601（Issue #1374）。
         (
-            "ALTER TABLE t ADD COLUMN x INTEGER[] DEFAULT '{1}'",
-            "0A000",
+            "ALTER TABLE t ADD COLUMN x INTEGER[] DEFAULT '{a}'",
+            "22P02",
         ),
+        ("ALTER TABLE t ADD COLUMN x INTEGER[] DEFAULT 1", "42601"),
         // 配列への型変更は互換性判定で拒否される。
         ("ALTER TABLE t ALTER COLUMN tags TYPE INTEGER[]", "42804"),
     ] {

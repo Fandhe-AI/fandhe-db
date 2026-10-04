@@ -1993,6 +1993,17 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     values.push(Value::Bytes(bytes.to_vec()));
                     continue;
                 }
+                // 配列の既定値も同じキャッシュから補う（Issue #1374）。
+                if column.default.is_some() && matches!(column.ty, ColumnType::Array(_)) {
+                    let arr = schema.array_default_ref(logical_index).ok_or_else(|| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} has an invalid DEFAULT for its type",
+                            column.name
+                        ))
+                    })?;
+                    values.push(Value::Array(arr.to_value()?));
+                    continue;
+                }
                 // 欠落列は `DEFAULT` があれば既定値で補う（`scan_scalar_columns_validated`
                 // と同じ規則。Issue #1169）。
                 if column.default.is_some() {
@@ -3632,12 +3643,35 @@ pub(crate) fn validate_default(
                 .map(|_| ())
                 .map_err(|_| DefaultBindError::Malformed)
         }
+        // 配列の `DEFAULT` も `{..}` 原文を INSERT と同じ `parse_array_literal` で
+        // 検証する（Issue #1374）。
+        (crate::catalog::ColumnDefault::Text(s), ColumnType::Array(at)) => {
+            parse_array_default(at, s).map(|_| ())
+        }
         _ => default_scalar(ty, default).map(|_| ()),
     }
 }
 
+/// 配列列の `DEFAULT`（`{..}` 原文）を [`ArrayValue`] へ解析する（Issue #1374）。
+/// `catalog` のカタログ検証・読み出し時補完キャッシュ初期化から呼ばれる薄い入口で、
+/// 解析本体は INSERT のリテラル束縛と同じ `sql::parser::parse_array_literal`
+/// （単一実装。INSERT と DEFAULT で解析結果・SQLSTATE が食い違わないようにする）。
+/// `SqlSurfaceError` は `wire_code` で [`DefaultBindError`] へ写像し、未知のコード
+/// （`54000` を含む）は fail-closed に `Malformed` へ寄せる。値・列名は保持しない。
+pub(crate) fn parse_array_default(
+    ty: &crate::catalog::ArrayType,
+    text: &str,
+) -> std::result::Result<ArrayValue, DefaultBindError> {
+    crate::sql::parser::parse_array_literal(text, ty).map_err(|e| match e.wire_code() {
+        "22003" => DefaultBindError::OutOfRange,
+        "22007" => DefaultBindError::DatetimeFormat,
+        "22008" => DefaultBindError::DatetimeOverflow,
+        _ => DefaultBindError::Malformed,
+    })
+}
+
 /// [`validate_column_default`] の本体（型と既定値を直接受ける版）。
-/// BYTEA は借用で返せないため `Incompatible`（検証は [`validate_default`]、
+/// BYTEA・配列は借用で返せないため `Incompatible`（検証は [`validate_default`]、
 /// 束縛は `bind_column_default`、読み出し時補完は `TableSchema::bytea_default_bytes`）。
 pub(crate) fn default_scalar<'a>(
     ty: &ColumnType,
@@ -3821,6 +3855,25 @@ fn scan_scalar_columns_validated<'a>(
                         })?;
                     if wanted {
                         sink(col_index, Some(ScalarRef::Bytes(bytes)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                    continue;
+                }
+                if column.default.is_some() && matches!(column.ty, ColumnType::Array(_)) {
+                    // 配列の既定値は原文から作ったペイロードを `TableSchema` の
+                    // キャッシュから借用する（Issue #1374）。参照できなければ
+                    // invalid DEFAULT として拒否する（fail-closed）。マスク外でも検証する。
+                    let arr = col_index
+                        .and_then(|i| schema.array_default_ref(i))
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(format!(
+                                "column {:?} has an invalid DEFAULT for its type",
+                                column.name
+                            ))
+                        })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Array(arr)))?;
                     } else {
                         sink(col_index, None)?;
                     }
@@ -6342,6 +6395,123 @@ mod tests {
         assert_eq!(mutated.bytea_default_bytes(1), None);
         assert!(scan_scalar_columns(&mutated, &buf).is_err());
         assert!(decode_scalar_columns(&mutated, &buf).is_err());
+    }
+
+    fn array_col(name: &str, elem: ArrayElemType, max_len: u32, lit: &str) -> ColumnDef {
+        ColumnDef::new(
+            name,
+            ColumnType::Array(ArrayType::new(elem, max_len).expect("array type")),
+            false,
+        )
+        .with_default(ColumnDefault::Text(lit.to_string()))
+    }
+
+    /// 配列の既定値は `TableSchema` のキャッシュ経由で scan（`ScalarRef::Array`）・
+    /// `decode_scalar_columns`／`decode_row`（`Value::Array`）が補う（空配列・NULL 要素を
+    /// 含む。Issue #1374）。
+    #[test]
+    fn array_defaults_are_filled_in_scan_and_decode() {
+        let (buf, schema) = old_row_and_extended_schema(vec![
+            array_col("n", ArrayElemType::Integer, 4, "{1,NULL,3}"),
+            array_col("e", ArrayElemType::Integer, 4, "{}"),
+            array_col("t", ArrayElemType::Text, 4, "{a,\"b c\"}"),
+        ]);
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        let Some(ScalarRef::Array(arr)) = &scanned[1] else {
+            panic!("expected array ref: {:?}", scanned[1]);
+        };
+        assert_eq!(arr.count(), 3);
+        assert_eq!(
+            arr.to_value().expect("to_value"),
+            ArrayValue::Integer(vec![Some(1), None, Some(3)])
+        );
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode");
+        assert_eq!(
+            decoded[1],
+            Value::Array(ArrayValue::Integer(vec![Some(1), None, Some(3)]))
+        );
+        assert_eq!(decoded[2], Value::Array(ArrayValue::Integer(Vec::new())));
+        assert_eq!(
+            decoded[3],
+            Value::Array(ArrayValue::Text(vec![
+                Some("a".to_string()),
+                Some("b c".to_string())
+            ]))
+        );
+        let old = TableSchema::new("t", vec![ColumnDef::new("a", ColumnType::Text, false)]);
+        let full = encode_row(
+            &old,
+            "tenant",
+            Visibility::Public,
+            &[Value::Text("x".to_string())],
+        )
+        .expect("encode_row");
+        let row = decode_row(&schema, &full).expect("decode_row");
+        assert_eq!(row.values[1], decoded[1]);
+        assert_eq!(row.values[2], decoded[2]);
+        assert_eq!(row.values[3], decoded[3]);
+    }
+
+    /// 配列 DEFAULT の検証関数の写像（Issue #1374）。
+    #[test]
+    fn array_default_validation_maps_errors() {
+        let ty = |e| ColumnType::Array(ArrayType::new(e, 2).expect("array type"));
+        let text = |s: &str| ColumnDefault::Text(s.to_string());
+        assert_eq!(
+            validate_default(&ty(ArrayElemType::Integer), &text("{1,2}")),
+            Ok(())
+        );
+        assert_eq!(
+            validate_default(&ty(ArrayElemType::Integer), &text("{a}")),
+            Err(DefaultBindError::Malformed)
+        );
+        assert_eq!(
+            validate_default(&ty(ArrayElemType::Integer), &text("{99999999999}")),
+            Err(DefaultBindError::OutOfRange)
+        );
+        assert_eq!(
+            validate_default(&ty(ArrayElemType::Integer), &text("{1,2,3}")),
+            Err(DefaultBindError::Malformed)
+        );
+        assert!(matches!(
+            validate_default(&ty(ArrayElemType::Date), &text("{2020-13-45}")),
+            Err(DefaultBindError::DatetimeFormat | DefaultBindError::DatetimeOverflow)
+        ));
+        for d in [ColumnDefault::Number("1".into()), ColumnDefault::Bool(true)] {
+            assert_eq!(
+                validate_default(&ty(ArrayElemType::Integer), &d),
+                Err(DefaultBindError::Incompatible)
+            );
+        }
+    }
+
+    /// 配列キャッシュの不変条件（Issue #1374）。clone 後の書き換えは新しい値、初回参照後の
+    /// その場書き換え（既定値・列型）は黙って古い値を返さず拒否、`==` は変わらない。
+    #[test]
+    fn array_default_cache_never_serves_stale_values() {
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![array_col("n", ArrayElemType::Integer, 4, "{1}")]);
+        let pristine = schema.clone();
+        assert!(schema.array_default_ref(1).is_some());
+        assert_eq!(schema, pristine, "cache must not affect equality");
+
+        let mut cloned = schema.clone();
+        cloned.columns[1].default = Some(ColumnDefault::Text("{1,2}".to_string()));
+        assert_eq!(cloned.array_default_ref(1).map(|a| a.count()), Some(2));
+
+        // キャッシュを初期化済みの `schema` 自体をその場で書き換える。
+        let mut mutated = schema;
+        mutated.columns[1].default = Some(ColumnDefault::Text("{9}".to_string()));
+        assert!(mutated.array_default_ref(1).is_none());
+        assert!(scan_scalar_columns(&mutated, &buf).is_err());
+        assert!(decode_scalar_columns(&mutated, &buf).is_err());
+
+        let mut retyped = pristine;
+        assert!(retyped.array_default_ref(1).is_some());
+        retyped.columns[1].ty =
+            ColumnType::Array(ArrayType::new(ArrayElemType::BigInt, 4).expect("array type"));
+        assert!(retyped.array_default_ref(1).is_none());
+        assert!(scan_scalar_columns(&retyped, &buf).is_err());
     }
 
     #[test]

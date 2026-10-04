@@ -2850,7 +2850,8 @@ impl ColumnDefault {
                     | ColumnType::Enum(_)
                     | ColumnType::Json
                     | ColumnType::Jsonb
-                    | ColumnType::Bytea,
+                    | ColumnType::Bytea
+                    | ColumnType::Array(_),
             ) | (
                 ColumnDefault::Number(_),
                 ColumnType::Integer
@@ -3452,56 +3453,128 @@ pub struct TableSchema {
     /// 参照先の解決（主キー・UNIQUE 制約との照合）はカタログ参照を要するため
     /// [`Storage::create_table`] の write トランザクション内で行う。
     foreign_keys: Vec<ForeignKeyDef>,
-    /// BYTEA 列の `DEFAULT`（`\x..` 原文）をデコードしたバイト列の遅延キャッシュ
-    /// （Issue #1373）。非公開で、`TableSchema` の等価性・`Debug` には影響しない。
-    /// 詳細は [`ByteaDefaultCache`]。
-    bytea_defaults: ByteaDefaultCache,
+    /// BYTEA／配列列の `DEFAULT`（原文）を読み出し時補完用に実体化した値の遅延
+    /// キャッシュ（Issue #1373・#1374）。非公開で、`TableSchema` の等価性・`Debug`
+    /// には影響しない。詳細は [`MaterializedDefaultCache`]。
+    bytea_defaults: MaterializedDefaultCache,
 }
 
-/// [`ByteaDefaultCache`] の 1 エントリ。照合用の原文と、デコード済みバイト列。
+/// [`MaterializedDefaultCache`] の実体化済みの値。
 #[derive(Debug)]
-struct ByteaDefaultEntry {
+enum MaterializedDefault {
+    /// BYTEA のデコード済みバイト列。
+    Bytes(Box<[u8]>),
+    /// 配列の要素列ペイロード（フレームヘッダなし。`ArrayRef::from_owned` が借用する形）。
+    /// 登録時の列型 `ty` を持ち、参照時に現在の列型と照合する。
+    Array {
+        ty: ArrayType,
+        count: u32,
+        flags: u8,
+        payload: Box<[u8]>,
+    },
+}
+
+/// [`MaterializedDefaultCache`] の 1 エントリ。照合用の原文と実体化済みの値。
+#[derive(Debug)]
+struct MaterializedDefaultEntry {
     logical_index: usize,
     /// 登録時点の `ColumnDefault::Text` 原文。参照時に現在値と照合する。
     source: String,
-    bytes: Box<[u8]>,
+    value: MaterializedDefault,
 }
 
-/// BYTEA 列の `DEFAULT` を読み出し時補完へ借用で渡すための遅延キャッシュ
-/// （Issue #1373）。`row_codec::ScalarRef<'a>` はスキーマ・行バッファを借用する
-/// 型で、`\x..` 原文からデコードしたバイト列を所有できないため、`TableSchema`
-/// 側に非公開で持たせて `&'a [u8]` を借用する。
+/// BYTEA・配列列の `DEFAULT` を読み出し時補完へ借用で渡すための遅延キャッシュ
+/// （Issue #1373・#1374）。`row_codec::ScalarRef<'a>` はスキーマ・行バッファを借用する
+/// 型で、`\x..` 原文からデコードしたバイト列や `{..}` 原文から作った配列ペイロードを
+/// 所有できないため、`TableSchema` 側に非公開で持たせて借用する。
 ///
 /// 不変条件:
 /// - 遅延初期化（`alter_table_add_column` は decode 後にスキーマをその場で書き換える）
 /// - `Clone` は空のキャッシュを返す（clone 後の書き換えで古い値が残らないように）
 /// - `PartialEq`/`Eq` は常に等しい・`Debug` は中身を出さない（`TableSchema` の
 ///   derive の意味を変えない。DEFAULT の値をログへ出さない）
-/// - 参照時に原文を現在の `columns` と照合し、食い違えば `None`（fail-closed）
+/// - 参照時に原文（配列は列型も）を現在の `columns` と照合し、食い違えば `None`
+///   （fail-closed）
 #[derive(Default)]
-struct ByteaDefaultCache(std::sync::OnceLock<Vec<ByteaDefaultEntry>>);
+struct MaterializedDefaultCache(std::sync::OnceLock<Vec<MaterializedDefaultEntry>>);
 
-impl Clone for ByteaDefaultCache {
+impl Clone for MaterializedDefaultCache {
     fn clone(&self) -> Self {
         Self::default()
     }
 }
 
-impl PartialEq for ByteaDefaultCache {
+impl PartialEq for MaterializedDefaultCache {
     fn eq(&self, _other: &Self) -> bool {
         true
     }
 }
 
-impl Eq for ByteaDefaultCache {}
+impl Eq for MaterializedDefaultCache {}
 
-impl std::fmt::Debug for ByteaDefaultCache {
+impl std::fmt::Debug for MaterializedDefaultCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ByteaDefaultCache")
+        f.write_str("MaterializedDefaultCache")
     }
 }
 
 impl TableSchema {
+    /// 初期化済み（なければ初期化する）キャッシュのエントリから、論理列
+    /// `logical_index` の現在の `DEFAULT` 原文と一致するものを返す。
+    fn materialized_default(&self, logical_index: usize) -> Option<&MaterializedDefaultEntry> {
+        let entries = self.bytea_defaults.0.get_or_init(|| {
+            let mut out = Vec::new();
+            for (i, c) in self.columns.iter().enumerate() {
+                let Some(ColumnDefault::Text(text)) = &c.default else {
+                    continue;
+                };
+                match &c.ty {
+                    ColumnType::Bytea => {
+                        if let Ok(bytes) = crate::bytea::parse_hex_text(text) {
+                            out.push(MaterializedDefaultEntry {
+                                logical_index: i,
+                                source: text.clone(),
+                                value: MaterializedDefault::Bytes(bytes.into_boxed_slice()),
+                            });
+                        }
+                    }
+                    ColumnType::Array(at) => {
+                        // 失敗した列は登録しない（参照すると `None`＝invalid DEFAULT）。
+                        let Ok(value) = crate::row_codec::parse_array_default(at, text) else {
+                            continue;
+                        };
+                        let Ok(count) = u32::try_from(value.len()) else {
+                            continue;
+                        };
+                        let mut payload = Vec::new();
+                        if crate::row_codec::write_array_elements_payload(&mut payload, &value)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        out.push(MaterializedDefaultEntry {
+                            logical_index: i,
+                            source: text.clone(),
+                            value: MaterializedDefault::Array {
+                                ty: at.clone(),
+                                count,
+                                flags: value.frame_flags(),
+                                payload: payload.into_boxed_slice(),
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            out
+        });
+        let entry = entries.iter().find(|e| e.logical_index == logical_index)?;
+        match self.columns.get(logical_index)?.default.as_ref()? {
+            ColumnDefault::Text(current) if *current == entry.source => Some(entry),
+            _ => None,
+        }
+    }
+
     /// 論理列 `logical_index` の BYTEA `DEFAULT` のデコード済みバイト列を借用で返す。
     /// `row_codec::scan_scalar_columns_validated`／`decode_row` が、バッファ末尾で
     /// 欠落した列（`ALTER TABLE ADD COLUMN` 後の既存行。TABLE-5・TABLE-16）の
@@ -3509,24 +3582,38 @@ impl TableSchema {
     /// `None` で、呼び出し元は invalid DEFAULT として拒否する（NULL へ
     /// すり替えない）。列の `DEFAULT` は作成後に変わらない前提。
     pub(crate) fn bytea_default_bytes(&self, logical_index: usize) -> Option<&[u8]> {
-        let entries = self.bytea_defaults.0.get_or_init(|| {
-            let mut out = Vec::new();
-            for (i, c) in self.columns.iter().enumerate() {
-                if let (ColumnType::Bytea, Some(ColumnDefault::Text(text))) = (&c.ty, &c.default) {
-                    if let Ok(bytes) = crate::bytea::parse_hex_text(text) {
-                        out.push(ByteaDefaultEntry {
-                            logical_index: i,
-                            source: text.clone(),
-                            bytes: bytes.into_boxed_slice(),
-                        });
-                    }
-                }
-            }
-            out
-        });
-        let entry = entries.iter().find(|e| e.logical_index == logical_index)?;
-        match self.columns.get(logical_index)?.default.as_ref()? {
-            ColumnDefault::Text(current) if *current == entry.source => Some(&entry.bytes),
+        if !matches!(self.columns.get(logical_index)?.ty, ColumnType::Bytea) {
+            return None;
+        }
+        match &self.materialized_default(logical_index)?.value {
+            MaterializedDefault::Bytes(b) => Some(b),
+            MaterializedDefault::Array { .. } => None,
+        }
+    }
+
+    /// 論理列 `logical_index` の配列 `DEFAULT` を、実体化済みペイロードへの借用
+    /// （[`crate::row_codec::ArrayRef`]）で返す（Issue #1374）。用途・fail-closed 規則は
+    /// [`Self::bytea_default_bytes`] と同じで、加えて現在の列型が登録時と同じ配列型
+    /// （要素型・要素数上限・ENUM 語彙）であることを照合し、食い違えば `None`。
+    pub(crate) fn array_default_ref(
+        &self,
+        logical_index: usize,
+    ) -> Option<crate::row_codec::ArrayRef<'_>> {
+        let ColumnType::Array(current) = &self.columns.get(logical_index)?.ty else {
+            return None;
+        };
+        match &self.materialized_default(logical_index)?.value {
+            MaterializedDefault::Array {
+                ty,
+                count,
+                flags,
+                payload,
+            } if ty == current => Some(crate::row_codec::ArrayRef::from_owned(
+                ty.elem(),
+                *count,
+                *flags,
+                payload,
+            )),
             _ => None,
         }
     }
@@ -3543,7 +3630,7 @@ impl TableSchema {
             unique_constraints: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
-            bytea_defaults: ByteaDefaultCache::default(),
+            bytea_defaults: MaterializedDefaultCache::default(),
         }
     }
 
@@ -3567,7 +3654,7 @@ impl TableSchema {
             unique_constraints,
             checks: Vec::new(),
             foreign_keys: Vec::new(),
-            bytea_defaults: ByteaDefaultCache::default(),
+            bytea_defaults: MaterializedDefaultCache::default(),
         }
     }
 
@@ -3935,6 +4022,21 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                     "column {:?} has a malformed BYTEA DEFAULT",
                     column.name
                 )));
+            }
+            // 配列の `{..}` 原文も同様に検証する（Issue #1374）。ENUM 要素の配列は
+            // 呼び出し元の語彙が未解決の場合があり（スカラー ENUM の DEFAULT と同じ扱い）、
+            // ここでは照合しない。write txn 内の再検証（`create_table`・
+            // `alter_table_add_column`）と読み出し時のキャッシュ参照（失敗は拒否）で
+            // fail-closed を保つ。
+            if let ColumnType::Array(at) = &column.ty {
+                if at.enum_def().is_none()
+                    && crate::row_codec::validate_default(&column.ty, default).is_err()
+                {
+                    return Err(CatalogError::Invalid(format!(
+                        "column {:?} has a malformed ARRAY DEFAULT",
+                        column.name
+                    )));
+                }
             }
         }
     }
@@ -6092,6 +6194,21 @@ fn decode_schema_body(
                             )?;
                         }
                     }
+                    // 配列の既定値も読み出し時にキャッシュへ実体化するため、破損した
+                    // `{..}` 原文はここで読み込み不能にする（fail-closed。Issue #1374）。
+                    // ENUM 要素は `validate_schema` と同じ理由で照合しない。
+                    if let ColumnType::Array(at) = &column.ty {
+                        if let (None, Some(default)) = (at.enum_def(), &column.default) {
+                            crate::row_codec::validate_default(&column.ty, default).map_err(
+                                |_| {
+                                    CatalogError::Invalid(format!(
+                                        "column {:?} has a malformed ARRAY DEFAULT",
+                                        column.name
+                                    ))
+                                },
+                            )?;
+                        }
+                    }
                 }
                 columns.push(column);
             }
@@ -6763,10 +6880,25 @@ impl Storage {
             // 永続化され、列を省略した INSERT の束縛が常に失敗する。Issue #1282）。
             for column in &schema.columns {
                 // `<enum>[]` 列の要素型も登録済みであることを確認する（Issue #1357）。
-                // 配列列は DEFAULT を持てないため存在確認のみ。
+                // DEFAULT を持つ場合は登録済みの語彙で再検証する（スカラー ENUM と
+                // 同じ。Issue #1374）。
                 if let ColumnType::Array(array_ty) = &column.ty {
                     if let Some(def) = array_ty.enum_def() {
-                        get_enum_type_in_write_txn(&write_txn, def.name())?;
+                        let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                        if column.default.is_some() {
+                            let mut checked = column.clone();
+                            checked.ty = ColumnType::Array(ArrayType::new_enum(
+                                registered,
+                                array_ty.max_len(),
+                            )?);
+                            if crate::row_codec::validate_column_default(&checked).is_err() {
+                                return Err(CatalogError::Invalid(
+                                    "column has an ARRAY DEFAULT that is not valid for its \
+                                     element type"
+                                        .to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
                 if let ColumnType::Enum(def) = &column.ty {
@@ -6985,6 +7117,13 @@ impl Storage {
                     let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
                     column.ty =
                         ColumnType::Array(ArrayType::new_enum(registered, array_ty.max_len())?);
+                    // 登録済みの語彙で DEFAULT を再検証する（Issue #1374）。
+                    if crate::row_codec::validate_column_default(&column).is_err() {
+                        return Err(CatalogError::Invalid(
+                            "column added via ALTER TABLE ADD COLUMN has an invalid DEFAULT"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
             if let ColumnType::Enum(def) = &column.ty {
@@ -9527,7 +9666,7 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
         (default, tag),
         (
             ColumnDefault::Text(_),
-            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb" | "bytea"
+            "text" | "date" | "timestamp" | "uuid" | "enum" | "json" | "jsonb" | "bytea" | "array"
         ) | (
             ColumnDefault::Number(_),
             "integer" | "bigint" | "real" | "double" | "numeric"
@@ -11888,7 +12027,7 @@ mod tests {
     /// `JSON`／`JSONB` 列も `Text`（文字列リテラル）の既定値だけを大分類として許容する
     /// （Issue #1337）。完全版と軽量版が一致し、配列は引き続き非対応。
     #[test]
-    fn json_and_bytea_columns_accept_only_text_default_in_both_compat_checks() {
+    fn json_bytea_and_array_columns_accept_only_text_default_in_both_compat_checks() {
         let text = ColumnDefault::Text("{\"a\":1}".to_string());
         let num = ColumnDefault::Number("1".to_string());
         let flag = ColumnDefault::Bool(true);
@@ -11907,7 +12046,15 @@ mod tests {
         assert!(column_default_compatible_with_tag(&text, "bytea"));
         assert!(!column_default_compatible_with_tag(&num, "bytea"));
         assert!(!column_default_compatible_with_tag(&flag, "bytea"));
-        assert!(!column_default_compatible_with_tag(&text, "array"));
+        // 配列も `Text`（`{..}` 原文）の既定値だけを許容する（Issue #1374）。
+        let array =
+            ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 4).expect("array type"));
+        assert!(text.compatible_with(&array));
+        assert!(!num.compatible_with(&array));
+        assert!(!flag.compatible_with(&array));
+        assert!(column_default_compatible_with_tag(&text, "array"));
+        assert!(!column_default_compatible_with_tag(&num, "array"));
+        assert!(!column_default_compatible_with_tag(&flag, "array"));
     }
 
     /// 不正な 16 進の BYTEA DEFAULT は Rust API 直接の `create_table`・
@@ -11963,6 +12110,114 @@ mod tests {
         let corrupt = text.replace(hex, "5c7830");
         let err = decode_schema("t", corrupt.as_bytes()).unwrap_err();
         assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+    }
+
+    fn int_array_column(default: &str) -> ColumnDef {
+        ColumnDef::new(
+            "a",
+            ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 4).expect("array type")),
+            true,
+        )
+        .with_default(ColumnDefault::Text(default.to_string()))
+    }
+
+    /// 不正な配列 DEFAULT は Rust API 直接の `create_table`・`alter_table_add_column` でも
+    /// `Invalid` で拒否され、永続化されない（Issue #1374）。
+    #[test]
+    fn malformed_array_default_is_rejected_by_rust_api_paths() {
+        let path = unique_db_path("catalog-array-default-malformed");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let bad = TableSchema::new("bad", vec![int_array_column("{x}")]);
+        assert!(matches!(
+            storage.create_table(&bad),
+            Err(CatalogError::Invalid(_))
+        ));
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create docs");
+        // 構文不正・値域外・要素数超過はいずれも拒否する。
+        for lit in ["1", "{x}", "{1,}", "{99999999999}", "{1,2,3,4,5}"] {
+            assert!(
+                matches!(
+                    storage.alter_table_add_column("docs", int_array_column(lit)),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "{lit}"
+            );
+        }
+        storage
+            .alter_table_add_column("docs", int_array_column("{1,NULL,3}"))
+            .expect("valid array literal");
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert_eq!(schema.columns.len(), 2);
+    }
+
+    /// 破損した配列 DEFAULT を持つカタログ値は読み込めない（fail-closed。Issue #1374）。
+    #[test]
+    fn decode_schema_rejects_malformed_array_default() {
+        let good = TableSchema::new("t", vec![int_array_column("{1,2}")]);
+        let bytes = encode_schema(&good).expect("encode");
+        assert!(decode_schema("t", &bytes).is_ok());
+        // 16 進化された既定値フィールド（`{1,2}`）を `{1,x}` へ壊す。
+        let text = String::from_utf8(bytes).expect("utf8");
+        let hex = "7b312c327d";
+        assert!(text.contains(hex), "{text}");
+        let corrupt = text.replace(hex, "7b312c787d");
+        let err = decode_schema("t", corrupt.as_bytes()).unwrap_err();
+        assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+    }
+
+    /// `<enum>[]` 列の DEFAULT は、呼び出し元の `Arc` の語彙ではなく登録済みの語彙で
+    /// write txn 内に再検証される（Issue #1374）。
+    #[test]
+    fn enum_array_default_is_checked_against_registered_vocabulary() {
+        let path = unique_db_path("catalog-enum-array-default-vocab");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create docs");
+        storage
+            .create_enum_type("mood", vec!["happy".to_string()])
+            .expect("create enum type");
+        let fake = Arc::new(EnumTypeDef {
+            name: "mood".to_string(),
+            labels: vec!["happy".to_string(), "ghost".to_string()],
+        });
+        let column = |def: Arc<EnumTypeDef>, lit: &str| {
+            ColumnDef::new(
+                "m",
+                ColumnType::Array(ArrayType::new_enum(def, 4).expect("enum array")),
+                true,
+            )
+            .with_default(ColumnDefault::Text(lit.to_string()))
+        };
+        // `alter_table_add_column`: 偽の語彙にだけあるラベルは拒否する。
+        assert!(matches!(
+            storage.alter_table_add_column("docs", column(fake.clone(), "{ghost}")),
+            Err(CatalogError::Invalid(_))
+        ));
+        // `create_table`: 同様に write txn 内の再検証で拒否し、テーブルは作られない。
+        let bad = TableSchema::new("bad", vec![column(fake.clone(), "{ghost}")]);
+        assert!(matches!(
+            storage.create_table(&bad),
+            Err(CatalogError::Invalid(_))
+        ));
+        assert!(storage.get_table_schema("bad").is_err());
+        // 登録済みラベルは受理し、読み戻したスキーマから補完値が借用できる。
+        storage
+            .alter_table_add_column("docs", column(fake, "{happy}"))
+            .expect("registered label");
+        let schema = storage.get_table_schema("docs").expect("schema");
+        let arr = schema.array_default_ref(1).expect("array default");
+        assert_eq!(arr.count(), 1);
     }
 
     /// `create_table` 経路でも、登録済み語彙にないラベルの ENUM DEFAULT は write txn 内の

@@ -78,6 +78,17 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   `validate_schema` も 16 進不正を拒否する。`CREATE TABLE` の列 DEFAULT は `add_column_default` を
   共有するため BYTEA を受け付けるようになった（JSON の #1337 と同じ波及）。BYTEA の DEFAULT を持つ
   カタログは旧バイナリでは読み込めない。
+- 配列列の `DEFAULT`（Issue #1374）: `{..}` 形式の文字列リテラルのみ受理し（数値・真偽値は
+  `42601`、要素不正は `22P02`、値域外は `22003`、日時要素の不正は `22007`／`22008`、要素数・長さ超過は
+  `54000`）、`ColumnDefault::Text` を原文のまま保持する（新 variant・カタログ符号化の変更なし）。
+  `add_column_default` は種別と長さだけを検査し、要素の解析は語彙解決後の `bind_column_default`
+  （INSERT と同じ `parse_array_literal`）で行う（`CREATE TABLE` の構文段は ENUM 要素の語彙が未解決の
+  型でこの関数を呼ぶため）。読み出し時補完は BYTEA と同じ非公開キャッシュを一般化して配列ペイロードも
+  持たせ、参照時に原文と列型を現在の列定義と照合して食い違えば拒否する（fail-closed）。
+  カタログ decode と `validate_schema` も破損した配列 DEFAULT を拒否する（ENUM 要素は語彙が
+  未解決の場合があるため write txn 内の再検証と読み出し時の拒否で担保する）。`CREATE TABLE` の
+  列 DEFAULT にも波及する。配列 DEFAULT を持つカタログは旧バイナリでは読み込めない。HTTP（NoSQL）の
+  `alter_table.add_column` は配列型を受け付けないため対象外。
 - 予約列名（`id`・`tenant_id`・`visibility`。ASCII の大文字小文字を無視）は
   `CREATE TABLE`（Issue #899）の列定義と同じく構造検証段階で `42601` 拒否する
   （`sql::parser` が疑似列・RLS 内部列として扱う名前を DDL で隠蔽させない）。
@@ -130,7 +141,7 @@ HNSW 各経路が「埋め込み列を持つがバイトを一切持たない既
 
 配列型（`<型>[]`・`<型>[N]`）は当初対象外としたが、Issue #1348 で `lexer` が `[`／`]` を
 字句化するようになり、型名パーサーが配列サフィックスを受理する。`ADD COLUMN` でも配列列を
-宣言できる（DEFAULT は `0A000`、NOT NULL は DEFAULT 必須のため実質 nullable のみ）。
+宣言できる（DEFAULT は Issue #1374 で対応済み。NOT NULL は DEFAULT 必須）。
 
 ## DDL 権限ゲート（SQL-23 の単一判定点）
 
@@ -249,7 +260,7 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 - `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #1169 で実装済み（`DATE`・`TIMESTAMP`・`UUID`・`ENUM` の DEFAULT は
   #1279・#1280・#1281・#1282 で、`JSON`・`JSONB` の DEFAULT は #1337 で実装済み）
 - `BYTEA` の DEFAULT は #1373 で実装済み（`TableSchema` の非公開な遅延キャッシュ）。
-- 配列の DEFAULT: 符号化済み配列ペイロードを借用できないため後続作業（配列は DDL の型表記対応も前提）
+- 配列の DEFAULT は #1374 で実装済み（BYTEA と同じ遅延キャッシュを一般化）。
 - 制約（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` 等）: #903・#905〜#907
 - NoSQL 表層の DDL op: #910
 - 配列型の DDL 表記: Issue #1348 で対応済み
