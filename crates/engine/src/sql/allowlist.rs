@@ -7473,6 +7473,7 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         WherePredicate::PredicateCall { .. }
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
+        | WherePredicate::IdCompare { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::unsupported(
             "a view with an aggregate/LIMIT body does not support UDF predicates or subqueries in WHERE",
         )),
@@ -7675,6 +7676,7 @@ fn check_body_pred(
         | WherePredicate::Compare { .. }
         | WherePredicate::InList { .. }
         | WherePredicate::Between { .. }
+        | WherePredicate::IdCompare { .. }
         | WherePredicate::IsNull { .. } => Ok(()),
     }
 }
