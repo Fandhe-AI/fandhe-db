@@ -1019,6 +1019,16 @@ mod tests {
     }
 
     #[test]
+    fn trailing_garbage_with_int_overflow_is_malformed() {
+        // 走査を先に行うため、文法違反は桁あふれより優先して 22000 になる
+        // （どちらも fail-closed の拒否。Issue #1358 のレビュー指摘で固定）。
+        assert!(matches!(
+            col("99999999x", 5, 2),
+            Err(NumericError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn exponent_overflow_is_out_of_range() {
         assert_eq!(col("1e3", 5, 2), Err(NumericError::OutOfRange));
         assert_eq!(col("1.23456e4", 5, 2), Err(NumericError::OutOfRange));
