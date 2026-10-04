@@ -269,6 +269,8 @@ pub(crate) mod sq8;
 pub mod sql;
 pub mod storage;
 pub mod tenant;
+#[cfg(feature = "test-sync-points")]
+pub mod test_sync;
 pub mod tiering;
 pub mod txn;
 pub mod uuid;

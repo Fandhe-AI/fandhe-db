@@ -136,6 +136,12 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 （同一 write txn 内。自己参照は参照元ごと削除されるため依存に数えない。詳細は
 `docs/design/foreign-key.md` 参照）。
 
+## DROP 途中の同期点（Issue #1363）
+
+- DROP とクエリの実行区間の重なりを決定的に作るため、feature `test-sync-points`（既定オフ・依存なし・wire-server では無効）で 2 つの同期点を設けた。`Storage::drop_table` の commit 直前（`DropTableBeforeCommit`）と、読み取り文の開始時点＝スナップショット確定後（`ReadStatementSnapshotAcquired`）である。
+- コールバックへ渡すのは種別だけで、行・テナント・テーブル名は渡さない。RLS・権限ゲート・fail-closed の経路には触れない。コールバックはロックを解放してから呼ぶ。
+- テスト（`tests/table15_drop_table_concurrency.rs` の `sync_point_overlap`）: DROP を commit 前で止めた間のクエリ、クエリをスナップショット確定後で止めた間の DROP、さらに同名の次元違い再作成を挟んだ場合のいずれも、結果は「DROP 前と完全一致」か `42P01` に限る。同期点の発火回数も固定する。
+
 ## 対象外・申し送り
 
 - NoSQL 表層の `drop_table` op（#910 の担当）

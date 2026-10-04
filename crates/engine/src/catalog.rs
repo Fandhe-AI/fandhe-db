@@ -6673,6 +6673,9 @@ impl Storage {
         // （`key_index::drop_indexes_for_table_in_txn` ドキュメント参照）。
         crate::key_index::drop_indexes_for_table_in_txn(&write_txn, table_name)?;
         bump_table_generation_in_txn(&write_txn, table_name)?;
+        // TABLE-15・Issue #1363: 全削除済み・commit 前の同期点（feature 限定。既定ビルドでは消える）。
+        #[cfg(feature = "test-sync-points")]
+        self.sync_point(crate::test_sync::SyncPoint::DropTableBeforeCommit);
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 

@@ -575,3 +575,10 @@ Issue #1361（feat(engine): ALTER COLUMN TYPE で INTEGER→BIGINT・REAL→DOUB
 - **性質**: 宣言した `BYTEA` 列の述語は索引経路を使い、`EXPLAIN` の `scalar_plan:` 行の索引名は他型と同じ規則で付く。RLS・テナント境界・`wire_code` は不変。
 - **テスト**: `catalog` 単体、`tests/sql_index_ddl.rs`、`tests/index_declaration_bytea.rs`（索引経路・補集合・RLS・`EXPLAIN` 索引名）。
 - **対象外（申し送り）**: `BYTEA` の `IN` の索引化、平均値長ゲートの `BYTEA` 専用閾値化。
+
+## Issue #1363: DROP TABLE とクエリの実行区間の重なりを保証する並行テスト
+
+- **対象ビヘイビア**: TABLE-15。
+- **変更箇所**: feature `test-sync-points`（既定オフ・依存なし）と `test_sync` モジュール、`Storage::set_sync_hook`。`drop_table` の commit 直前と `execute_read_statement` の先頭に同期点を置いた（feature 無効時は消える）。
+- **テスト**: `tests/table15_drop_table_concurrency.rs` の `sync_point_overlap`（3 テスト）。重なり中の結果は事前結果と完全一致か `42P01` に限る。既存の自由スケジューリング版は残した。
+- **性質**: 公開 API は feature 有効時のみ増える。RLS・テナント境界・`wire_code` は不変。設計は `docs/design/drop-table.md`。

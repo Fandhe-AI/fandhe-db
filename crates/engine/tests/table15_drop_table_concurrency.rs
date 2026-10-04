@@ -7,6 +7,8 @@
 //!    返し（panic なし・部分結果なし・空の `Ok` なし）、DROP 完了後は全 DML／SELECT が
 //!    `42P01` になること。オラクルは exact な集合一致のみでタイミングには依存しない
 //!    （sleep 不使用。全スレッドを `Barrier` で揃えて開始する）。
+//!    クエリと DROP の実行区間の重なりは、feature `test-sync-points` 限定の
+//!    `sync_point_overlap` モジュール（Issue #1363）が同期点で決定的に作って検査する。
 //! 2. 既定エンジンで `EngineCore` を保持したまま DROP → 次元違いの同名 CREATE を行い、
 //!    arena・可視ビットマップ・スカラー・疎の各キャッシュから旧行が返らないこと、
 //!    旧 `operation_id` の台帳もプロセス内で一掃されていること。
@@ -128,10 +130,10 @@ const DROP_ROUNDS: u32 = 5;
 ///
 /// 各ラウンドは全 reader が DROP 前の完全な結果を 1 回以上観測してから DROP を発行し
 /// （reader はその後も `42P01` を受け取るまで反復し続ける）、全ラウンドで結果の原子性
-/// （完全一致か `42P01`）を検査する。reader のクエリ実行中に DROP が走る競合経路は、
-/// engine に DROP 途中の同期点（テスト用フック）が無いため確定させられない。そのため
-/// 重なりの発生は必須条件にせず、クエリ実行区間と DROP 実行区間（`Instant` 計測）が
-/// 重なったラウンド数を情報として出力する。
+/// （完全一致か `42P01`）を検査する。本テストは自由なスケジューリングで
+/// 原子性を確かめるもので、重なりの発生は必須条件にせず、クエリ実行区間と DROP 実行区間
+/// （`Instant` 計測）が重なったラウンド数を情報として出力する。重なりの決定的な保証は
+/// feature `test-sync-points` 限定の `sync_point_overlap` モジュール（Issue #1363）が担う。
 #[test]
 fn concurrent_queries_during_drop_see_either_full_result_or_42p01() {
     let mut overlapped = 0u32;
@@ -336,4 +338,271 @@ fn drop_then_recreate_in_same_process_invalidates_all_default_caches() {
     assert!(b2.misses + b2.stale_evictions > bitmap.misses + bitmap.stale_evictions);
     assert!(sc2.builds > scalar.builds);
     assert!(sp2.misses + sp2.stale_evictions > sparse.misses + sparse.stale_evictions);
+}
+/// Issue #1363（TABLE-15）: テスト専用の同期点で、DROP TABLE の実行区間とクエリの実行区間の
+/// 重なりを決定的に作り、重なり中のクエリ結果が「DROP 前と完全一致」か `42P01` のどちらか
+/// だけであること（部分結果・空の `Ok`・他コード・panic は不可）を固定する。
+/// feature `test-sync-points` 限定（既定ビルドではコンパイルされない）。
+#[cfg(feature = "test-sync-points")]
+mod sync_point_overlap {
+    use super::*;
+    use engine::test_sync::SyncPoint;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+
+    /// 待機の上限。超過は隠れたロック等によるデッドロックとみなして panic（CI をハングさせない）。
+    const WAIT: Duration = Duration::from_secs(30);
+
+    /// 同期点コールバックの制御（テスト側コーディネータ）。arm された種別でだけ 1 回止まる。
+    struct Gate {
+        arm_drop: AtomicBool,
+        arm_read: AtomicBool,
+        drop_hits: AtomicUsize,
+        read_hits: AtomicUsize,
+        paused: Mutex<Sender<SyncPoint>>,
+        resume: Mutex<Receiver<()>>,
+    }
+
+    struct GateHandle {
+        gate: Arc<Gate>,
+        paused_rx: Receiver<SyncPoint>,
+        resume_tx: Sender<()>,
+    }
+
+    impl GateHandle {
+        fn new() -> Self {
+            let (ptx, paused_rx) = channel();
+            let (resume_tx, rrx) = channel();
+            let gate = Arc::new(Gate {
+                arm_drop: AtomicBool::new(false),
+                arm_read: AtomicBool::new(false),
+                drop_hits: AtomicUsize::new(0),
+                read_hits: AtomicUsize::new(0),
+                paused: Mutex::new(ptx),
+                resume: Mutex::new(rrx),
+            });
+            Self {
+                gate,
+                paused_rx,
+                resume_tx,
+            }
+        }
+
+        fn hook(&self) -> engine::test_sync::SyncHook {
+            let gate = Arc::clone(&self.gate);
+            Arc::new(move |point| {
+                let (armed, hits) = match point {
+                    SyncPoint::DropTableBeforeCommit => (&gate.arm_drop, &gate.drop_hits),
+                    SyncPoint::ReadStatementSnapshotAcquired => (&gate.arm_read, &gate.read_hits),
+                    _ => return,
+                };
+                if !armed.swap(false, AtomicOrdering::SeqCst) {
+                    return;
+                }
+                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                gate.paused
+                    .lock()
+                    .expect("paused lock")
+                    .send(point)
+                    .expect("notify pause");
+                gate.resume
+                    .lock()
+                    .expect("resume lock")
+                    .recv_timeout(WAIT)
+                    .expect("resume signal must arrive");
+            })
+        }
+
+        fn wait_paused(&self, expected: SyncPoint) {
+            let got = self
+                .paused_rx
+                .recv_timeout(WAIT)
+                .expect("sync point must be reached");
+            assert_eq!(got, expected);
+        }
+
+        fn resume(&self) {
+            self.resume_tx.send(()).expect("resume");
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Observed {
+        Ids(Vec<u64>),
+        Count(u64),
+    }
+
+    /// COUNT は 1 行 1 セルの `Integer`、距離系は id 列（`SELECT id` のみ）。
+    fn observe(outcome: SqlOutcome, is_count: bool) -> Observed {
+        if is_count {
+            Observed::Count(count_of(outcome))
+        } else {
+            Observed::Ids(ids_of(outcome))
+        }
+    }
+
+    fn gated_core(label: &str, gate: &GateHandle) -> (EngineCore, CleanupGuard) {
+        let path = unique_db_path(label);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.set_sync_hook(Some(gate.hook()));
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        ok(
+            &core,
+            &ctx("sys"),
+            "CREATE TABLE docs (embedding VECTOR(2) NOT NULL, kind TEXT NOT NULL, body TEXT)",
+        );
+        (core, guard)
+    }
+
+    /// (tenant, sql, COUNT か)。
+    const QUERIES: [(&str, &str, bool); 3] = [
+        (
+            "alice",
+            "SELECT id FROM docs ORDER BY embedding <=> '[3.0,0.0]' LIMIT 50",
+            false,
+        ),
+        ("alice", "SELECT COUNT(*) FROM docs", true),
+        (
+            "bob",
+            "SELECT id FROM docs WHERE kind = 'a' ORDER BY embedding <=> '[3.0,0.0]' LIMIT 50",
+            false,
+        ),
+    ];
+
+    fn seeded(label: &str, gate: &GateHandle) -> (EngineCore, CleanupGuard, Vec<Observed>) {
+        let (core, guard) = gated_core(label, gate);
+        seed(&core, &ctx("alice"), 2, 1..=6, "a");
+        seed(&core, &ctx("bob"), 2, 101..=104, "b");
+        let expected: Vec<Observed> = QUERIES
+            .iter()
+            .map(|(t, sql, cnt)| observe(ok(&core, &ctx(t), sql), *cnt))
+            .collect();
+        assert_eq!(expected[0], Observed::Ids(vec![1, 2, 3, 4, 5, 6]));
+        assert_eq!(expected[1], Observed::Count(6));
+        assert_eq!(expected[2], Observed::Ids(vec![102, 104]));
+        (core, guard, expected)
+    }
+
+    /// 結果が「事前結果と完全一致」なら true、`42P01` なら false。それ以外は失敗。
+    fn assert_full_or_42p01(
+        res: Result<SqlOutcome, String>,
+        expected: &Observed,
+        is_count: bool,
+        sql: &str,
+    ) -> bool {
+        match res {
+            Ok(outcome) => {
+                assert_eq!(
+                    &observe(outcome, is_count),
+                    expected,
+                    "partial/foreign result: {sql}"
+                );
+                true
+            }
+            Err(code) => {
+                assert_eq!(code, "42P01", "only 42P01 is allowed: {sql}");
+                false
+            }
+        }
+    }
+
+    fn assert_all_42p01_after_drop(core: &EngineCore) {
+        let stmts = [
+            "SELECT id FROM docs ORDER BY embedding <=> '[3.0,0.0]' LIMIT 5",
+            "SELECT COUNT(*) FROM docs",
+            "INSERT INTO docs (id, embedding, kind) VALUES (900, '[1.0,0.0]', 'a') USING OPERATION_ID 'post-drop-ins'",
+            "TRUNCATE TABLE docs USING OPERATION_ID 'post-drop-trunc'",
+            "UPDATE docs SET kind = 'x' WHERE id = 1 USING OPERATION_ID 'post-drop-upd'",
+            "DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'post-drop-del'",
+        ];
+        for t in ["alice", "bob"] {
+            for sql in stmts {
+                assert_eq!(
+                    run(core, &ctx(t), sql).expect_err("must fail after DROP"),
+                    "42P01",
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    /// シナリオ A: DROP を commit 直前で止め、その間にクエリを重ねる。
+    #[test]
+    fn drop_paused_before_commit_queries_see_full_result_or_42p01() {
+        let gate = GateHandle::new();
+        let (core, _guard, expected) = seeded("t15-sync-a", &gate);
+        gate.gate.arm_drop.store(true, AtomicOrdering::SeqCst);
+
+        let mut full_during_pause = 0u32;
+        std::thread::scope(|scope| {
+            let ddl = scope.spawn(|| ok(&core, &ctx("sys"), "DROP TABLE docs"));
+            gate.wait_paused(SyncPoint::DropTableBeforeCommit);
+            for _ in 0..20 {
+                for ((t, sql, cnt), exp) in QUERIES.iter().zip(&expected) {
+                    if assert_full_or_42p01(run(&core, &ctx(t), sql), exp, *cnt, sql) {
+                        full_during_pause += 1;
+                    }
+                }
+            }
+            gate.resume();
+            ddl.join().expect("DDL thread must not panic");
+        });
+
+        assert_eq!(gate.gate.drop_hits.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            full_during_pause > 0,
+            "queries must have run while DROP was paused before commit"
+        );
+        assert_all_42p01_after_drop(&core);
+    }
+
+    /// シナリオ B／B′: クエリをスナップショット確定後で止め、その下で DROP を commit させる。
+    /// `recreate` が true なら、再開前に次元違いの同名テーブルを作り新しい行を入れる
+    /// （旧テーブルの全件か `42P01` に限り、新しい行・新旧の混在は不可）。
+    fn paused_query_round(query_idx: usize, recreate: bool) {
+        let gate = GateHandle::new();
+        let label = format!("t15-sync-b{query_idx}{}", if recreate { "r" } else { "" });
+        let (core, _guard, expected) = seeded(&label, &gate);
+        let (tenant, sql, is_count) = QUERIES[query_idx];
+        gate.gate.arm_read.store(true, AtomicOrdering::SeqCst);
+
+        let res = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| run(&core, &ctx(tenant), sql));
+            gate.wait_paused(SyncPoint::ReadStatementSnapshotAcquired);
+            ok(&core, &ctx("sys"), "DROP TABLE docs");
+            if recreate {
+                ok(
+                    &core,
+                    &ctx("sys"),
+                    "CREATE TABLE docs (embedding VECTOR(3) NOT NULL, kind TEXT NOT NULL, body TEXT)",
+                );
+                seed(&core, &ctx("alice"), 3, 201..=204, "n");
+                seed(&core, &ctx("bob"), 3, 301..=304, "n");
+            }
+            gate.resume();
+            reader.join().expect("reader thread must not panic")
+        });
+
+        assert_eq!(gate.gate.read_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_full_or_42p01(res, &expected[query_idx], is_count, sql);
+        if !recreate {
+            assert_all_42p01_after_drop(&core);
+        }
+    }
+
+    #[test]
+    fn drop_committed_during_paused_query_yields_full_result_or_42p01() {
+        for idx in 0..QUERIES.len() {
+            paused_query_round(idx, false);
+        }
+    }
+
+    #[test]
+    fn drop_and_recreate_during_paused_query_never_mixes_generations() {
+        for idx in 0..QUERIES.len() {
+            paused_query_round(idx, true);
+        }
+    }
 }
