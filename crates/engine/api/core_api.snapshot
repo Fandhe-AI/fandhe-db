@@ -291,6 +291,7 @@ pub enum CatalogError {
     IndexLimitExceeded(String),
     InvalidForeignKey(String),
     ConstraintAlreadyExists(String),
+    MultiplePrimaryKeys(String),
     ConstraintNotFound(String),
     ConstraintLimitExceeded(String),
     ForeignKeyViolation,
