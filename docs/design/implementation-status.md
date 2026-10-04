@@ -558,3 +558,5 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **テスト**: `tests/table18_view.rs`（多者結合・CTE・集合演算・サブクエリの直接実行との一致・依存検査・拒否・再オープン往復）。
 - **外側の WHERE・ORDER BY**: 評価後射影形ビューへの参照で、`WHERE`（宣言的な葉・式述語・`NOT`／`OR`）と列キーの `ORDER BY` を受理する。`sql::view_buffered` の `plan_outer`（Execute・Describe 共通）が本文の結果列から合成したスキーマへ既存の `bind_scan` で束縛し、`apply_outer` が評価済みセルに対して WHERE → ORDER BY（安定ソート）→ OFFSET／LIMIT → 射影の順に適用する。参照できるのは本文の結果列だけで、本文が公開していない `id` は `22000`。
 - **対象外（申し送り）**: 外側の集計・`DISTINCT`・ウィンドウ・式 `ORDER BY`・UDF 述語・サブクエリ、評価後射影形の連鎖、サブクエリ付き本文の Describe。
+
+Issue #1361（feat(engine): ALTER COLUMN TYPE で INTEGER→BIGINT・REAL→DOUBLE PRECISION を受理する。TABLE-19・TABLE-12 ポインタ）: 物理フレーム幅が変わる 2 変換を、カタログ更新と同一 write txn 内の全テナント既存行の再エンコード（新規 `column_rewrite.rs`。件数上限付きキーバッチ・キー/ヘッダ tenant 整合検査・失敗時は `CorruptSchema` で全体中止）で受理した。PK／UNIQUE／FOREIGN KEY 構成列は索引が古くなるため `2BP01`、縮小・異種・`INTEGER→DOUBLE PRECISION` 等は従来どおり `42804`。成功時は世代 bump で索引キャッシュを失効する。ADD COLUMN 前の行の DEFAULT は書き換え時に実体化される。公開 API の変更・依存追加・`unsafe` なし。テスト: `sql_ddl_drop_alter_column.rs`・`catalog.rs` 単体テスト・`table_generation_bump_coverage.rs`（行番号追随）。設計は `docs/design/alter-table-drop-modify-column.md`。
