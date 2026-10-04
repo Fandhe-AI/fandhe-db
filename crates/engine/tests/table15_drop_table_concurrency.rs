@@ -339,6 +339,7 @@ fn drop_then_recreate_in_same_process_invalidates_all_default_caches() {
     assert!(sc2.builds > scalar.builds);
     assert!(sp2.misses + sp2.stale_evictions > sparse.misses + sparse.stale_evictions);
 }
+
 /// Issue #1363（TABLE-15）: テスト専用の同期点で、DROP TABLE の実行区間とクエリの実行区間の
 /// 重なりを決定的に作り、重なり中のクエリ結果が「DROP 前と完全一致」か `42P01` のどちらか
 /// だけであること（部分結果・空の `Ok`・他コード・panic は不可）を固定する。
