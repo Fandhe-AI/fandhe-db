@@ -899,8 +899,8 @@ fn resolve_enum_type(
 
 /// `ADD COLUMN` の `DEFAULT` リテラルを列型に応じた [`ColumnDefault`] へ変換する
 /// （`CREATE TABLE` の列 DEFAULT と同じ規則。Issue #1169）。DEFAULT 非対応の列型
-/// （BYTEA・配列等）は `0A000`、対応型でリテラル種別が
-/// 合わない場合は `42601`、長さ上限超過は `54000`。
+/// （配列等）は `0A000`、対応型でリテラル種別が合わない場合は `42601`、
+/// 長さ上限超過は `54000`、BYTEA の `\x..` 形式不正は `22P02`（Issue #1373）。
 pub(crate) fn add_column_default(
     column_name: &str,
     ty: &ColumnType,
@@ -920,6 +920,7 @@ pub(crate) fn add_column_default(
         ColumnType::Timestamp => "timestamp",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
+        ColumnType::Bytea => "bytea",
         _ => {
             return Err(SqlSurfaceError::FeatureNotSupported {
                 detail: format!("column {column_name:?}: DEFAULT is not supported for this type"),
@@ -969,6 +970,16 @@ pub(crate) fn add_column_default(
                 return Err(default_too_long(column_name));
             }
             Ok(ColumnDefault::Text(canonical))
+        }
+        // `BYTEA` は `\x..` 原文を保持する（正規化しない）。形式の検証はここで
+        // `bind_bytea_literal`（INSERT と同じ写像）に任せて 22P02 を返し、読み出し時補完は
+        // `TableSchema::bytea_default_bytes` が原文をデコードして借用で渡す（Issue #1373）。
+        InsertLiteral::String(s) if kind == "bytea" => {
+            if s.len() > MAX_COLUMN_DEFAULT_LEN {
+                return Err(default_too_long(column_name));
+            }
+            crate::sql::parser::bind_bytea_literal(s, column_name)?;
+            Ok(ColumnDefault::Text(s.clone()))
         }
         InsertLiteral::Number(n) if kind == "numeric" => {
             if n.len() > MAX_COLUMN_DEFAULT_LEN {

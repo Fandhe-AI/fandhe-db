@@ -1976,12 +1976,23 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
     offset = tenant_end;
 
     let mut values = Vec::with_capacity(schema.columns.len());
-    for column in &schema.columns {
+    for (logical_index, column) in schema.columns.iter().enumerate() {
         // バッファ末尾に達した場合、以降の列はすべて「欠落」として扱う
         // （TABLE-5: ADD COLUMN 後の既存行を NULL として読む）。
         let presence = match buf.get(offset) {
             Some(&b) => b,
             None => {
+                // BYTEA の既定値は `TableSchema` のキャッシュから補う（Issue #1373）。
+                if column.default.is_some() && matches!(column.ty, ColumnType::Bytea) {
+                    let bytes = schema.bytea_default_bytes(logical_index).ok_or_else(|| {
+                        RowCodecError::Invalid(format!(
+                            "column {:?} has an invalid DEFAULT for its type",
+                            column.name
+                        ))
+                    })?;
+                    values.push(Value::Bytes(bytes.to_vec()));
+                    continue;
+                }
                 // 欠落列は `DEFAULT` があれば既定値で補う（`scan_scalar_columns_validated`
                 // と同じ規則。Issue #1169）。
                 if column.default.is_some() {
@@ -3558,7 +3569,7 @@ impl<'a> From<&'a crate::catalog::DroppedSlot> for ScalarSlotView<'a> {
     }
 }
 
-/// [`column_default_scalar`] の失敗種別。SQL 表層の SQLSTATE 写像
+/// [`validate_column_default`] の失敗種別。SQL 表層の SQLSTATE 写像
 /// （`sql::parser::bind_column_default`）とカタログ層の事前検証
 /// （`catalog::Storage::alter_table_add_column`）が共有する。値・列名は保持しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3578,23 +3589,11 @@ pub(crate) enum DefaultBindError {
     EnumLabel,
 }
 
-/// 列の `DEFAULT` を型付きスカラー値へ変換する唯一の実装（Issue #1169）。
-/// `INSERT` の列省略補完（`sql::parser::bind_column_default` 経由）と、
-/// `ALTER TABLE ADD COLUMN` 後の既存行の読み出し時補完
-/// （[`scan_scalar_columns_validated`]）が同じ関数を通り、値の食い違いを構造的に
-/// 排除する。`Text` は `column` を借用しゼロコピー。`default == None` は `Ok(None)`。
-/// 列の `DEFAULT` は作成後に変わらない（`ALTER COLUMN SET DEFAULT` は存在しない）
-/// ことが読み出し時補完の前提で、将来導入する場合は補完専用の値を分離する必要がある。
-pub(crate) fn column_default_scalar(
-    column: &crate::catalog::ColumnDef,
-) -> std::result::Result<Option<ScalarRef<'_>>, DefaultBindError> {
-    match &column.default {
-        None => Ok(None),
-        Some(default) => default_scalar(&column.ty, default).map(Some),
-    }
-}
-
-/// [`column_default_scalar`] の読み出し時補完版（JSON／JSONB は再検証を省く）。
+/// 列の `DEFAULT` を型付きスカラー値へ変換する読み出し時補完版（JSON／JSONB は
+/// 再検証を省く。Issue #1169）。変換本体は [`default_scalar`]（`INSERT` の列省略補完
+/// `sql::parser::bind_column_default` と共有）。列の `DEFAULT` は作成後に変わらない
+/// （`ALTER COLUMN SET DEFAULT` は存在しない）ことが前提で、将来導入する場合は
+/// 補完専用の値を分離する必要がある。
 /// [`default_scalar_for_read`] を参照。
 pub(crate) fn column_default_scalar_for_read(
     column: &crate::catalog::ColumnDef,
@@ -3605,7 +3604,41 @@ pub(crate) fn column_default_scalar_for_read(
     }
 }
 
-/// [`column_default_scalar`] の本体（型と既定値を直接受ける版）。
+/// 列の `DEFAULT` が列型に束縛できるかだけを検証する（Issue #1373）。
+/// BYTEA は `\x..` 原文からデコードしたバイト列を借用で返せない
+/// （[`default_scalar`] は `Incompatible`）ため、`catalog` の DDL 事前検証・
+/// カタログ decode・`validate_schema` はこの関数を通す。値の取り出しは束縛が
+/// `sql::parser::bind_column_default`、読み出し時補完が
+/// `TableSchema::bytea_default_bytes`。
+pub(crate) fn validate_column_default(
+    column: &crate::catalog::ColumnDef,
+) -> std::result::Result<(), DefaultBindError> {
+    match &column.default {
+        None => Ok(()),
+        Some(default) => validate_default(&column.ty, default),
+    }
+}
+
+/// [`validate_column_default`] の本体（型と既定値を直接受ける版）。
+pub(crate) fn validate_default(
+    ty: &ColumnType,
+    default: &crate::catalog::ColumnDefault,
+) -> std::result::Result<(), DefaultBindError> {
+    match (default, ty) {
+        // `TooLong` は `MAX_COLUMN_DEFAULT_LEN` の事前検査で到達しないが、
+        // 到達しても fail-closed に `Malformed` で拒否する。
+        (crate::catalog::ColumnDefault::Text(s), ColumnType::Bytea) => {
+            crate::bytea::parse_hex_text(s)
+                .map(|_| ())
+                .map_err(|_| DefaultBindError::Malformed)
+        }
+        _ => default_scalar(ty, default).map(|_| ()),
+    }
+}
+
+/// [`validate_column_default`] の本体（型と既定値を直接受ける版）。
+/// BYTEA は借用で返せないため `Incompatible`（検証は [`validate_default`]、
+/// 束縛は `bind_column_default`、読み出し時補完は `TableSchema::bytea_default_bytes`）。
 pub(crate) fn default_scalar<'a>(
     ty: &ColumnType,
     default: &'a crate::catalog::ColumnDefault,
@@ -3710,7 +3743,7 @@ pub(crate) fn default_scalar<'a>(
 }
 
 /// 既存行の読み出し時補完専用の [`default_scalar`]。`JSON`／`JSONB` の既定値は
-/// DDL 時（`catalog::Storage::alter_table_add_column` 等が通す [`column_default_scalar`]）に
+/// DDL 時（`catalog::Storage::alter_table_add_column` 等が通す [`validate_column_default`]）に
 /// 構文検証・正規化済みで、列の `DEFAULT` は作成後に変わらないため、行ごとの再解析・
 /// 正規化文字列の確保を省いて原文を借用する（大量の既存行を読む際の負荷対策。
 /// Issue #1337）。他の型は [`default_scalar`] へ委譲する。
@@ -3774,6 +3807,25 @@ fn scan_scalar_columns_validated<'a>(
                 // TABLE-5・TABLE-16、Issue #1169）。生存列で `DEFAULT` があれば
                 // 読み出し時に既定値を補い（行は書き換えない）、なければ nullable
                 // のみ NULL として許容する。墓標は `default == None` のため従来どおり。
+                if column.default.is_some() && matches!(column.ty, ColumnType::Bytea) {
+                    // BYTEA の既定値は原文（`\x..`）からのデコード結果を
+                    // `TableSchema` のキャッシュから借用する（Issue #1373）。
+                    // 参照できなければ invalid DEFAULT として拒否する（fail-closed）。
+                    let bytes = col_index
+                        .and_then(|i| schema.bytea_default_bytes(i))
+                        .ok_or_else(|| {
+                            RowCodecError::Invalid(format!(
+                                "column {:?} has an invalid DEFAULT for its type",
+                                column.name
+                            ))
+                        })?;
+                    if wanted {
+                        sink(col_index, Some(ScalarRef::Bytes(bytes)))?;
+                    } else {
+                        sink(col_index, None)?;
+                    }
+                    continue;
+                }
                 if let Some(default) = column.default {
                     // マスク外でも DEFAULT の妥当性は検証する（参照列の選択で
                     // カタログ破損の検出結果が変わらないようにする。fail-closed）。
@@ -6217,6 +6269,79 @@ mod tests {
                 Err(DefaultBindError::Incompatible)
             );
         }
+    }
+
+    /// BYTEA の既定値は `TableSchema` のキャッシュ経由で `scan_scalar_columns`
+    /// （`ScalarRef::Bytes`）・`decode_scalar_columns`／`decode_row`（`Value::Bytes`）の
+    /// 両方が補う。検証関数は 16 進不正を `Malformed`、他種別を `Incompatible` で返す
+    /// （Issue #1373）。
+    #[test]
+    fn bytea_defaults_are_filled_and_invalid_ones_rejected() {
+        let (buf, schema) = old_row_and_extended_schema(vec![
+            ColumnDef::new("b", ColumnType::Bytea, false)
+                .with_default(ColumnDefault::Text("\\xDEad".to_string())),
+            ColumnDef::new("e", ColumnType::Bytea, true)
+                .with_default(ColumnDefault::Text("\\x".to_string())),
+        ]);
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan");
+        assert_eq!(scanned[1], Some(ScalarRef::Bytes(&[0xde, 0xad])));
+        assert_eq!(scanned[2], Some(ScalarRef::Bytes(&[])));
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode");
+        assert_eq!(decoded[1], Value::Bytes(vec![0xde, 0xad]));
+        assert_eq!(decoded[2], Value::Bytes(Vec::new()));
+        // フル行形式（`decode_row`）も同じキャッシュから補う。
+        let old = TableSchema::new("t", vec![ColumnDef::new("a", ColumnType::Text, false)]);
+        let full = encode_row(
+            &old,
+            "tenant",
+            Visibility::Public,
+            &[Value::Text("x".to_string())],
+        )
+        .expect("encode_row");
+        let row = decode_row(&schema, &full).expect("decode_row");
+        assert_eq!(row.values[1], Value::Bytes(vec![0xde, 0xad]));
+        assert_eq!(row.values[2], Value::Bytes(Vec::new()));
+
+        for bad in ["ab", "\\x0", "\\xzz"] {
+            assert_eq!(
+                validate_default(&ColumnType::Bytea, &ColumnDefault::Text(bad.to_string())),
+                Err(DefaultBindError::Malformed),
+                "{bad}"
+            );
+        }
+        for d in [ColumnDefault::Number("1".into()), ColumnDefault::Bool(true)] {
+            assert_eq!(
+                validate_default(&ColumnType::Bytea, &d),
+                Err(DefaultBindError::Incompatible)
+            );
+        }
+        assert_eq!(
+            validate_default(&ColumnType::Bytea, &ColumnDefault::Text("\\x01".into())),
+            Ok(())
+        );
+    }
+
+    /// キャッシュの不変条件（Issue #1373）。clone 後の書き換えは新しい値になり、
+    /// 初回参照後のその場書き換えは黙って古い値を返さず拒否（`None`）、キャッシュの有無で
+    /// `TableSchema` の `==` は変わらない。
+    #[test]
+    fn bytea_default_cache_never_serves_stale_values() {
+        let (buf, schema) =
+            old_row_and_extended_schema(vec![ColumnDef::new("b", ColumnType::Bytea, false)
+                .with_default(ColumnDefault::Text("\\x01".to_string()))]);
+        let pristine = schema.clone();
+        assert_eq!(schema.bytea_default_bytes(1), Some(&[0x01u8][..]));
+        assert_eq!(schema, pristine, "cache must not affect equality");
+
+        let mut cloned = schema.clone();
+        cloned.columns[1].default = Some(ColumnDefault::Text("\\x02".to_string()));
+        assert_eq!(cloned.bytea_default_bytes(1), Some(&[0x02u8][..]));
+
+        let mut mutated = schema;
+        mutated.columns[1].default = Some(ColumnDefault::Text("\\x03".to_string()));
+        assert_eq!(mutated.bytea_default_bytes(1), None);
+        assert!(scan_scalar_columns(&mutated, &buf).is_err());
+        assert!(decode_scalar_columns(&mutated, &buf).is_err());
     }
 
     #[test]

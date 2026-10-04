@@ -6772,7 +6772,7 @@ impl<'a> Parser<'a> {
             ColumnDef::new(name, ty, false)
         } else {
             // DEFAULT の型別変換は `ADD COLUMN` と共有する純関数
-            // （`sql::ddl::add_column_default`）に一本化する。配列・BYTEA は `0A000`、
+            // （`sql::ddl::add_column_default`）に一本化する。配列は `0A000`、
             // リテラル種別の不一致は `42601`、長さ超過は `54000`。ENUM の語彙照合は
             // 実行段（`bind_column_default`）と `Storage::create_table` が行う。
             let default = match &constraints.default {

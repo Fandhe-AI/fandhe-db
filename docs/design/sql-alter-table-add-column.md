@@ -68,6 +68,16 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   読み出し時補完と INSERT 省略時の値は同じ実装を通るため一致する。新 variant・カタログ符号化の
   変更なし。長さ上限は他型と同じ `54000`。DDL の成否は行ストアを参照しない。HTTP は DEFAULT
   非対応のまま。
+- `BYTEA` 列の `DEFAULT`（Issue #1373）: `\x..` 形式の文字列リテラルのみ受理し（数値・真偽値は
+  `42601`、形式不正は `22P02`、長さ超過は `54000`）、`ColumnDefault::Text` を原文のまま保持する
+  （新 variant・カタログ符号化の変更なし）。デコード後のバイト列は `ScalarRef<'a>` が借用できる
+  出どころが無いため、`TableSchema` の非公開な遅延キャッシュ（`OnceLock`）に持たせて読み出し時補完へ
+  借用で渡す。キャッシュは `Clone` で空に戻り、`PartialEq`／`Debug` には影響せず、参照時に原文を
+  現在の列定義と照合して食い違えば拒否する（fail-closed）。検証は `row_codec::validate_default`、
+  INSERT 省略・FK `SET DEFAULT` の束縛は `bind_bytea_literal` を再利用する。カタログ decode と
+  `validate_schema` も 16 進不正を拒否する。`CREATE TABLE` の列 DEFAULT は `add_column_default` を
+  共有するため BYTEA を受け付けるようになった（JSON の #1337 と同じ波及）。BYTEA の DEFAULT を持つ
+  カタログは旧バイナリでは読み込めない。
 - 予約列名（`id`・`tenant_id`・`visibility`。ASCII の大文字小文字を無視）は
   `CREATE TABLE`（Issue #899）の列定義と同じく構造検証段階で `42601` 拒否する
   （`sql::parser` が疑似列・RLS 内部列として扱う名前を DDL で隠蔽させない）。
@@ -238,9 +248,8 @@ wire 応答は pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を�
 - `DROP COLUMN`・`ALTER COLUMN TYPE` の SQL 表層構文: #901（Rust API のみ実装済み）
 - `NOT NULL`・`DEFAULT` を伴う `ADD COLUMN`: #1169 で実装済み（`DATE`・`TIMESTAMP`・`UUID`・`ENUM` の DEFAULT は
   #1279・#1280・#1281・#1282 で、`JSON`・`JSONB` の DEFAULT は #1337 で実装済み）
-- `BYTEA`・配列の DEFAULT: 読み出し時補完が既定値を `ScalarRef<'a>` として借用で返す設計で、
-  デコード後のバイト列・符号化済み配列ペイロードを借用できないため後続作業（`TableSchema` の
-  非公開な具体化キャッシュ案。配列は DDL の型表記対応も前提）
+- `BYTEA` の DEFAULT は #1373 で実装済み（`TableSchema` の非公開な遅延キャッシュ）。
+- 配列の DEFAULT: 符号化済み配列ペイロードを借用できないため後続作業（配列は DDL の型表記対応も前提）
 - 制約（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` 等）: #903・#905〜#907
 - NoSQL 表層の DDL op: #910
 - 配列型の DDL 表記: Issue #1348 で対応済み

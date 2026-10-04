@@ -1247,6 +1247,10 @@ fn sql_and_nosql_add_column_not_null_default_produce_identical_results() {
             r#"{"name":"q","type":"integer","not_null":true}"#.into(),
         ),
         (
+            "r2 BYTEA DEFAULT '\\x01'".into(),
+            r#"{"name":"r2","type":"bytea","default":"\\x01"}"#.into(),
+        ),
+        (
             "r BYTEA DEFAULT 'ab'".into(),
             r#"{"name":"r","type":"bytea","default":"ab"}"#.into(),
         ),
