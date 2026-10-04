@@ -588,10 +588,13 @@ SQL 表層の `SHOW`／`CANCEL PARTITIONED DML '<id>' ON <table>` に対応す�
 `table`（必須。識別子検査は `42601`）と `operation_id`（欠落・`null`・空文字は `23502`）だけを
 持つ。それ以外のキー（`tenant_id` 自己申告を含む）は未知キーとして `42601`。
 
-応答は SQL 表層と同じ結果セット形（`status`・`rows` の 2 列。`status` は `interrupted`・
-`completed`・`cancelled` のいずれか）。ジョブなし・他テナントのジョブ・テーブルなし・見えない
+応答は SQL 表層と同じ結果セット形（`status`・`rows` の 2 列。`status` は `running`・
+`interrupted`・`completed`・`cancelled`、`cancel` のみ `cancelling` を返しうる。`rows` は commit 済みの件数
+〔`completed` は累計〕）。ジョブなし・他テナントのジョブ・テーブルなし・見えない
 テーブルは、いずれも 0 行の同一応答になる（RLS-9。バイト一致をテストで固定）。`cancel` は
-中断ジョブを `cancelled` にし、完了済みジョブは `completed` のまま変えない。
+中断ジョブを `cancelled` にし、完了済みジョブは `completed` のまま変えない。実行中のジョブには
+取り消しを要求して `cancelling` を返し、実行器は次のチャンク境界で止まる（実行中の要求は `VD002` で
+終わる）。以後の `show` は `cancelled` を返す。commit 済みのチャンクは戻さない。
 
 ```json
 {"op": "show_partitioned_dml", "table": "docs", "operation_id": "op-1"}
@@ -630,7 +633,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `op` | ○ | string | `"create_table"`／`"alter_table"`／`"drop_table"` |
 | `table` | ○ | string | |
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
-| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
+| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?,"name"?,"predicate"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `name`（任意）と `predicate`（filter 葉形 `column`／`op`／`value` の配列。AND 結合）を取り、SQL 表層と同じ DDL 入口へ合流する（Issue #1199・NOSQL-13・TABLE-16）。違反した `insert`／`update` は `23514`。`kind` と矛盾するフィールド・`in`／`or`・語彙外の `op`・RLS 述語名の列は `42601`、葉数の上限超過は `54000`（写像表と拒否条件の詳細は `docs/design/nosql-ddl-mapping.md`「CHECK 制約」節）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
 | `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"not_null"?,"default"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`）。`not_null` は bool（`true` のとき `default` が必須で、無ければ engine が `42601`。`false`・省略は nullable 列）、`default` は文字列・数値・真偽値（Issue #1338。SQL の `NOT NULL`／`DEFAULT <literal>` と同じ実行器・エラー契約）。DATE／TIMESTAMP／UUID／JSON／JSONB／ENUM の DEFAULT は文字列で渡す。`default` の `null`・配列・オブジェクト、`not_null` の非 bool、`nullable` などの未知キーは `42601`。`create_table` の `nullable` に対し `add_column` は `not_null` を使う（`nullable` は受け付けない） |
 | `drop_column`（`alter_table`） | ○ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線（Issue #1167。エラー契約は SQL 表層と同一）。`add_column` と排他必須 |
 
@@ -955,6 +958,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
 | `FOREIGN KEY (parent_id) REFERENCES parents (id) ON DELETE CASCADE ON UPDATE SET NULL` | `constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148。同一実行器） |
+| `CHECK (price > 0)` | `constraints[kind=check].predicate`（Issue #1199。同一実行器） |
 | `ALTER TABLE docs ADD COLUMN note TEXT` | `alter_table` + `add_column`（Issue #910。同一実行器） |
 | `ALTER TABLE docs ADD COLUMN n INTEGER NOT NULL DEFAULT 0` | `alter_table` + `add_column`（`not_null`／`default`。Issue #1338。同一実行器） |
 | `DROP TABLE docs` | `drop_table`（Issue #910。同一実行器） |
@@ -971,7 +975,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `LIMIT` の付与（`ORDER BY` は `aggregate` の `sort` で対応済み）
 - `ALTER TABLE ... ALTER COLUMN TYPE` 相当の op（`alter_table` に語彙なし。別論点）
-- `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
+- `alter_table` での `CHECK` の追加・削除、算術式を含む `CHECK` 述語、列制約形の既定名（Issue #1199 の対象外）
 - `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
 - `FOREIGN KEY` の `MATCH {SIMPLE|FULL}`／`[NOT] DEFERRABLE`／
   `INITIALLY {DEFERRED|IMMEDIATE}` 句（NoSQL `references` に対応キーが無い。
