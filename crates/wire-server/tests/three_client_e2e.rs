@@ -2657,6 +2657,22 @@ impl Client {
         sqlstate: &str,
         needles: &[&str],
     ) {
+        self.expect_error_excluding(port, user, prelude, sql, sqlstate, needles, &[]);
+    }
+
+    /// `expect_error` に加えて、stderr に `forbidden` のいずれも含まれないことを確認する
+    /// （Issue #1354。同じ SQLSTATE を共有する 2 種類のエラーを文言で取り違えないため）。
+    #[allow(clippy::too_many_arguments)]
+    fn expect_error_excluding(
+        self,
+        port: u16,
+        user: &str,
+        prelude: &[&str],
+        sql: &str,
+        sqlstate: &str,
+        needles: &[&str],
+        forbidden: &[&str],
+    ) {
         let pw = format!("pw-{user}");
         let output = match self {
             Client::Psql => {
@@ -2713,6 +2729,51 @@ impl Client {
                 "{}: expected `{needle}` in error for `{sql}`, got: {stderr}",
                 self.name()
             );
+        }
+        for needle in forbidden {
+            assert!(
+                !stderr.contains(needle),
+                "{}: `{needle}` must not appear in error for `{sql}`, got: {stderr}",
+                self.name()
+            );
+        }
+    }
+
+    /// `statements` を同一接続で順に実行し、`COMMIT`／`ROLLBACK` を送らずに接続を断つ
+    /// （`COMMIT` 前の接続断の模擬。Issue #1354）。psql は `-c` 列の終了、pg は
+    /// `client.end()`、psycopg は `WIRE_ABANDON_OPEN_TRANSACTION`（`with` ブロックの
+    /// 正常終了が commit を送るため即時終了で放棄する）で、いずれも明示トランザクションを
+    /// 開いたまま閉じる。
+    fn abandon_open_transaction(self, port: u16, user: &str, statements: &[&str]) {
+        let pw = format!("pw-{user}");
+        let (last, prelude) = statements.split_last().expect("at least one statement");
+        match self {
+            Client::Psql => {
+                run_psql_session(port, user, &pw, prelude, last);
+            }
+            Client::Psycopg => {
+                let output = spawn_psycopg_client_with_env(
+                    port,
+                    user,
+                    &pw,
+                    prelude,
+                    last,
+                    &[("WIRE_ABANDON_OPEN_TRANSACTION", "1")],
+                );
+                assert!(
+                    output.status.success(),
+                    "psycopg abandon failed: stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Client::Pg => {
+                let output = spawn_pg_client(port, user, &pw, prelude, last);
+                assert!(
+                    output.status.success(),
+                    "pg abandon failed: stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
     }
 }
@@ -3110,6 +3171,211 @@ fn three_clients_receive_returning_rows_and_command_tags() {
              rls_delete0=identical neg_42601=ok readback=match"
         );
         for secret in ["alice", "bob", "carol", "pw-", "tenant-"] {
+            assert!(
+                !record.contains(secret),
+                "record must not contain `{secret}`"
+            );
+        }
+        eprintln!("[e2e-record] {record}");
+    }
+}
+// ---- 明示トランザクションの成否確定手順（Issue #1354・RECOVER-12）------------
+
+/// `orders (code TEXT PRIMARY KEY, sku TEXT UNIQUE)` を持つ一時 DB。行制約を持つ表で、
+/// 台帳照合が行制約検査より先に走ることを実クライアントから確認するための seed。
+/// `EngineCore` は返す前に drop し、redb のロックを解放する。
+fn seed_txn_recovery_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-txn-recovery");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let sys = PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+        .expect("tenant");
+    core.execute_sql_in_session(
+        &sys,
+        &mut session,
+        "CREATE TABLE orders (code TEXT PRIMARY KEY, sku TEXT UNIQUE)",
+    )
+    .expect("create table");
+    drop(core);
+    (path, guard)
+}
+
+fn orders_insert(id: u64, code: &str, sku: &str, op: &str) -> String {
+    format!(
+        "INSERT INTO orders (id, code, sku) VALUES ({id}, '{code}', '{sku}') \
+         USING OPERATION_ID '{op}'"
+    )
+}
+
+/// 台帳由来の `23505`（commit 済み再送）の固定文言。pg wire の `M` フィールドに載る。
+const TXN_LEDGER_MESSAGE: &str = "operation_id already recorded with the same content";
+/// 行制約（`PRIMARY KEY`／`UNIQUE`）由来の `23505` の固定文言。
+const TXN_ROW_CONSTRAINT_MESSAGE: &str = "unique constraint violation";
+/// 行 `id` 衝突由来の `23505` の固定文言。
+const TXN_ID_CONFLICT_MESSAGE: &str = "row id already exists";
+
+/// クライアント版の 1 行表記（`[e2e-record]` 用）。取得できなければ `unknown`。印字可能
+/// ASCII のみ・最大 40 文字に丸め、長い出力を記録へ持ち込まない。
+fn client_version(client: Client) -> String {
+    let output = match client {
+        Client::Psql => Command::new(resolve_tool("PSQL_BIN", "psql"))
+            .arg("--version")
+            .output(),
+        Client::Psycopg => Command::new(resolve_tool("PYTHON_BIN", "python3"))
+            .args(["-c", "import psycopg; print(psycopg.__version__)"])
+            .output(),
+        Client::Pg => Command::new(resolve_tool("NODE_BIN", "node"))
+            .args(["-e", "console.log(require('pg/package.json').version)"])
+            .output(),
+    };
+    let text = output
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    // `psql --version` は `psql (PostgreSQL) 18.6 (...)` 形式。版番号の語だけを残す。
+    let text = match client {
+        Client::Psql => text
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("unknown")
+            .to_string(),
+        _ => text,
+    };
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(40)
+        .collect();
+    cleaned.replace(' ', "_")
+}
+
+/// RECOVER-12（Issue #1354）: `COMMIT` の応答を受け取れなかったクライアントが、新しい `BEGIN`
+/// の内側で先頭文を同じ `operation_id` で再送して成否を確定する手順を、実クライアント 3 種で
+/// 実行する。台帳由来の `23505`（commit 済みの根拠）と行制約由来の `23505`（根拠にならない）を、
+/// pg wire では `M` の固定文言で区別する（`code` ラベルは運ばない）。
+///
+/// `COMMIT` 応答の喪失は「受信した `COMMIT` を結果不明として扱う」ことで模擬する
+/// （`--fault-inject post-commit-panic` は autocommit の `INSERT` の commit 直後にだけ発火し
+/// `COMMIT` 文には効かない）。S1＝commit 済み、S2＝`COMMIT` 前の接続断、S3＝未 commit のまま
+/// 再送が別の確定済み行と衝突、の 3 シナリオを各クライアントで独立した DB に対して実行する。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_confirm_explicit_transaction_outcome_by_resend_in_new_begin() {
+    let users_dir = temp_db::TempDir::new("three-client-e2e-txn-recovery-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    for client in [Client::Psql, Client::Psycopg, Client::Pg] {
+        let name = client.name();
+        let (db, _guard) = seed_txn_recovery_db();
+        let server = spawn_wire_server(&users_path, &db, &[]);
+        let port = server.port;
+        let ids = |user: &str| -> Vec<String> {
+            let mut v = client.rows(port, user, &[], "SELECT id FROM orders LIMIT 100");
+            v.sort();
+            v
+        };
+
+        // S1: commit 済み。COMMIT 後に応答を失ったものとして、新しい BEGIN で先頭文を再送する。
+        let s1_first = orders_insert(1, "c1", "s1", "p-1");
+        client.rows(
+            port,
+            "alice",
+            &["BEGIN", &s1_first, &orders_insert(2, "c2", "s2", "p-2")],
+            "COMMIT",
+        );
+        client.expect_error_excluding(
+            port,
+            "alice",
+            &["BEGIN"],
+            &s1_first,
+            "23505",
+            &[TXN_LEDGER_MESSAGE],
+            &[TXN_ROW_CONSTRAINT_MESSAGE, TXN_ID_CONFLICT_MESSAGE],
+        );
+        // 対照: 制約列の値だけが衝突する文・行 id だけが衝突する文は、台帳に当たらず行制約由来。
+        client.expect_error_excluding(
+            port,
+            "alice",
+            &["BEGIN"],
+            &orders_insert(3, "c1", "s3", "p-3"),
+            "23505",
+            &[TXN_ROW_CONSTRAINT_MESSAGE],
+            &[TXN_LEDGER_MESSAGE],
+        );
+        client.expect_error_excluding(
+            port,
+            "alice",
+            &["BEGIN"],
+            &orders_insert(1, "c9", "s9", "p-9"),
+            "23505",
+            &[TXN_ID_CONFLICT_MESSAGE],
+            &[TXN_LEDGER_MESSAGE],
+        );
+        assert_eq!(ids("alice"), vec!["1", "2"], "{name}: S1 rows");
+        // 台帳はテナント単位。bob が同じ operation_id・同内容を送っても通常成功する。
+        client.rows(port, "bob", &["BEGIN", &s1_first], "COMMIT");
+        assert_eq!(ids("bob"), vec!["1"], "{name}: S1 tenant scope");
+        assert_eq!(ids("alice"), vec!["1", "2"], "{name}: S1 alice intact");
+
+        // S2: COMMIT 前の接続断。何も残らず、新しい BEGIN での再送が成功する。
+        let s2_first = orders_insert(3, "c3", "s3", "q-1");
+        let s2_second = orders_insert(4, "c4", "s4", "q-2");
+        client.abandon_open_transaction(port, "alice", &["BEGIN", &s2_first, &s2_second]);
+        assert_eq!(ids("alice"), vec!["1", "2"], "{name}: S2 nothing committed");
+        client.rows(port, "alice", &["BEGIN", &s2_first, &s2_second], "COMMIT");
+        assert_eq!(ids("alice"), vec!["1", "2", "3", "4"], "{name}: S2 resend");
+
+        // S3: 未 commit のまま、再送文が別の確定済み行と衝突する。行制約由来で commit 済み
+        // とは判定されず、衝突を解消すると同内容の再送が成功する。
+        let s3_first = orders_insert(5, "e", "se", "r-1");
+        client.abandon_open_transaction(port, "alice", &["BEGIN", &s3_first]);
+        client.rows(port, "alice", &[], &orders_insert(6, "e", "sx", "o-6"));
+        client.expect_error_excluding(
+            port,
+            "alice",
+            &["BEGIN"],
+            &s3_first,
+            "23505",
+            &[TXN_ROW_CONSTRAINT_MESSAGE],
+            &[TXN_LEDGER_MESSAGE],
+        );
+        client.rows(
+            port,
+            "alice",
+            &[],
+            "DELETE FROM orders WHERE id = 6 USING OPERATION_ID 'd-6'",
+        );
+        client.rows(port, "alice", &["BEGIN", &s3_first], "COMMIT");
+        assert_eq!(
+            ids("alice"),
+            vec!["1", "2", "3", "4", "5"],
+            "{name}: S3 resolved"
+        );
+        // 回復後の再確認は台帳由来になる。
+        client.expect_error_excluding(
+            port,
+            "alice",
+            &["BEGIN"],
+            &s3_first,
+            "23505",
+            &[TXN_LEDGER_MESSAGE],
+            &[TXN_ROW_CONSTRAINT_MESSAGE],
+        );
+        drop(server);
+
+        let record = format!(
+            "three_clients_txn_recovery: client={name} version={} s1_committed_resend=ledger \
+             s1_value_collision=row_constraint s1_id_collision=id_conflict \
+             s1_tenant_scope=independent s2_dropped_resend=ok s3_conflict=row_constraint \
+             s3_resolved=ok rows_final=5",
+            client_version(client)
+        );
+        for secret in ["alice", "bob", "carol", "pw-", "tenant-", "correct-horse"] {
             assert!(
                 !record.contains(secret),
                 "record must not contain `{secret}`"

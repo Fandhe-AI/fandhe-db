@@ -45,8 +45,8 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 #[cfg(test)]
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{
-    buffered_body_relations, classify_view_body, parse_view_body, SqlSurfaceError,
-    StructuralOnlyLookup, TableLookup, ViewBodyKind,
+    classify_view_body, parse_view_body, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
+    ViewBodyKind,
 };
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
 // `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
@@ -1641,10 +1641,7 @@ impl ColumnType {
             ColumnType::Boolean => ("boolean", "-".to_string()),
             ColumnType::Date => ("date", "-".to_string()),
             ColumnType::Timestamp => ("timestamp", "-".to_string()),
-            ColumnType::Array(array_ty) => (
-                "array",
-                format!("{},{}", array_ty.elem().catalog_tag(), array_ty.max_len()),
-            ),
+            ColumnType::Array(array_ty) => ("array", array_ty.catalog_param()),
             ColumnType::Bytea => ("bytea", "-".to_string()),
             ColumnType::Json => ("json", "-".to_string()),
             ColumnType::Jsonb => ("jsonb", "-".to_string()),
@@ -1745,35 +1742,7 @@ impl ColumnType {
                 }
                 Ok(ColumnType::Timestamp)
             }
-            "array" => {
-                // `<elem_tag>,<max_len>` のちょうど 2 要素（Issue #888 D-A2）。
-                // カンマの数が違う場合は要素・上限のいずれかが欠落・過多であり
-                // fail-closed に拒否する。
-                let mut parts = param.splitn(3, ',');
-                let elem_tag = parts
-                    .next()
-                    .ok_or_else(|| CatalogError::Invalid("array param is empty".to_string()))?;
-                let max_len_field = parts.next().ok_or_else(|| {
-                    CatalogError::Invalid(format!("array param missing max_len: {param:?}"))
-                })?;
-                if parts.next().is_some() {
-                    return Err(CatalogError::Invalid(format!(
-                        "array param has too many fields: {param:?}"
-                    )));
-                }
-                let elem = ArrayElemType::from_catalog_tag(elem_tag)?;
-                // 先頭ゼロ等の非正準表現を拒否する（`s != n.to_string()` 比較）。
-                let max_len: u32 = max_len_field.parse().map_err(|_| {
-                    CatalogError::Invalid(format!("malformed array max_len: {max_len_field:?}"))
-                })?;
-                if max_len.to_string() != max_len_field {
-                    return Err(CatalogError::Invalid(format!(
-                        "array max_len is not in canonical form: {max_len_field:?}"
-                    )));
-                }
-                let array_ty = ArrayType::new(elem, max_len)?;
-                Ok(ColumnType::Array(array_ty))
-            }
+            "array" => Ok(ColumnType::Array(parse_array_param(param, resolve_enum)?)),
             "bytea" => {
                 if param != "-" {
                     return Err(CatalogError::Invalid(format!(
@@ -2271,8 +2240,8 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
             buffered: false,
             join: false,
         },
-        ViewBodyKind::Buffered(stmt) => ViewBodyShape {
-            relations: buffered_body_relations(&stmt),
+        ViewBodyKind::Buffered { stmt, relations } => ViewBodyShape {
+            relations,
             buffered: true,
             join: matches!(*stmt, crate::sql::allowlist::Statement::Join(_)),
         },
@@ -2553,8 +2522,11 @@ fn exposed_columns_of_view(
     Ok(parent)
 }
 
-/// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888）。`VECTOR`・`ARRAY`
+/// 配列列（`ColumnType::Array`）の要素型（TABLE-14・Issue #888・#1357）。`VECTOR`・`ARRAY`
 /// （入れ子・多次元配列）を構造的に除外し、`VECTOR` 列との責務境界を型で保証する。
+///
+/// `Copy` を維持するため、`NUMERIC` の精度・位取りのみをペイロードに持つ。`ENUM` の
+/// 語彙は [`ArrayType::enum_def`] が保持し、本 enum はマーカー（`Enum`）だけを持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayElemType {
     Text,
@@ -2573,10 +2545,26 @@ pub enum ArrayElemType {
     Timestamp,
     /// `UUID`（Issue #1193）。16 バイト生値。
     Uuid,
+    /// `NUMERIC(p,s)`（Issue #1357）。行内表現は固定幅 16 バイト（`unscaled` の i128 LE）。
+    /// 位取りは列宣言が固定するため、各要素は列の位取りへ正規化済みであること。
+    Numeric {
+        precision: u8,
+        scale: u8,
+    },
+    /// `BYTEA`（Issue #1357）。長さ前置の生バイト列。
+    Bytea,
+    /// `JSON`（Issue #1357）。検証済みの入力テキストをそのまま保持する。
+    Json,
+    /// `JSONB`（Issue #1357）。正規化済みテキストを保持する。
+    Jsonb,
+    /// 名前付き `ENUM`（Issue #1357）。語彙は [`ArrayType::enum_def`] が保持する。
+    Enum,
 }
 
 impl ArrayElemType {
     /// カタログ v2 の `param` フィールド内で使う要素型タグ（Issue #888 D-A2）。
+    /// `Numeric`／`Enum` は追加フィールド（p,s／型名）を伴うため
+    /// [`ArrayType::catalog_param`] が組み立てる。
     fn catalog_tag(&self) -> &'static str {
         match self {
             ArrayElemType::Text => "text",
@@ -2588,11 +2576,17 @@ impl ArrayElemType {
             ArrayElemType::Date => "date",
             ArrayElemType::Timestamp => "timestamp",
             ArrayElemType::Uuid => "uuid",
+            ArrayElemType::Numeric { .. } => "numeric",
+            ArrayElemType::Bytea => "bytea",
+            ArrayElemType::Json => "json",
+            ArrayElemType::Jsonb => "jsonb",
+            ArrayElemType::Enum => "enum",
         }
     }
 
-    /// [`ArrayElemType::catalog_tag`] の逆変換。`vector`・`array`・未知タグは
-    /// fail-closed に拒否する（配列の入れ子・`VECTOR` 要素は非対応。TABLE-14）。
+    /// [`ArrayElemType::catalog_tag`] の逆変換（追加フィールドを持たない要素型のみ）。
+    /// `numeric`・`enum` は [`parse_array_param`] が個別に扱う。`vector`・`array`・
+    /// 未知タグは fail-closed に拒否する（配列の入れ子・`VECTOR` 要素は非対応。TABLE-14）。
     fn from_catalog_tag(tag: &str) -> Result<ArrayElemType> {
         match tag {
             "text" => Ok(ArrayElemType::Text),
@@ -2604,6 +2598,9 @@ impl ArrayElemType {
             "date" => Ok(ArrayElemType::Date),
             "timestamp" => Ok(ArrayElemType::Timestamp),
             "uuid" => Ok(ArrayElemType::Uuid),
+            "bytea" => Ok(ArrayElemType::Bytea),
+            "json" => Ok(ArrayElemType::Json),
+            "jsonb" => Ok(ArrayElemType::Jsonb),
             other => Err(CatalogError::Invalid(format!(
                 "unsupported array element type: {other:?}"
             ))),
@@ -2612,12 +2609,15 @@ impl ArrayElemType {
 }
 
 /// 配列列 1 個の宣言（要素型＋要素数上限。TABLE-14・TASK-198、Issue #888）。
-/// フィールドを private にし [`ArrayType::new`] のみを構築経路とすることで、
-/// 上限の範囲検証（`1..=MAX_ARRAY_ELEMENTS`）を経ない値を作れないようにする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// フィールドを private にし [`ArrayType::new`]／[`ArrayType::new_enum`] のみを
+/// 構築経路とすることで、上限の範囲検証（`1..=MAX_ARRAY_ELEMENTS`）を経ない値を
+/// 作れないようにする。`ENUM` 要素の語彙（`Arc`）を持つため `Copy` ではない
+/// （Issue #1357）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayType {
     elem: ArrayElemType,
     max_len: u32,
+    enum_def: Option<Arc<EnumTypeDef>>,
 }
 
 /// 配列列 1 個が宣言できる要素数の実装上限（本リポの実装既定値。TASK-198）。
@@ -2626,13 +2626,45 @@ pub const MAX_ARRAY_ELEMENTS: u32 = 1_024;
 
 impl ArrayType {
     /// `max_len` が `1..=MAX_ARRAY_ELEMENTS` の範囲外なら `Err`（TABLE-14）。
+    /// `ENUM` 要素は語彙を要するため [`ArrayType::new_enum`] を使う（本関数は拒否する）。
+    /// `NUMERIC` 要素は精度・位取りの範囲も検証する。
     pub fn new(elem: ArrayElemType, max_len: u32) -> Result<Self> {
+        Self::check_max_len(max_len)?;
+        match elem {
+            ArrayElemType::Enum => {
+                return Err(CatalogError::Invalid(
+                    "enum array element requires a type definition".to_string(),
+                ))
+            }
+            ArrayElemType::Numeric { precision, scale } => {
+                validate_numeric_precision_scale(precision, scale)?
+            }
+            _ => {}
+        }
+        Ok(Self {
+            elem,
+            max_len,
+            enum_def: None,
+        })
+    }
+
+    /// `ENUM` 要素の配列宣言を構築する（Issue #1357）。語彙は `def` が運ぶ。
+    pub fn new_enum(def: Arc<EnumTypeDef>, max_len: u32) -> Result<Self> {
+        Self::check_max_len(max_len)?;
+        Ok(Self {
+            elem: ArrayElemType::Enum,
+            max_len,
+            enum_def: Some(def),
+        })
+    }
+
+    fn check_max_len(max_len: u32) -> Result<()> {
         if max_len == 0 || max_len > MAX_ARRAY_ELEMENTS {
             return Err(CatalogError::Invalid(format!(
                 "array max_len must be within 1..={MAX_ARRAY_ELEMENTS}, got {max_len}"
             )));
         }
-        Ok(Self { elem, max_len })
+        Ok(())
     }
 
     pub fn elem(&self) -> ArrayElemType {
@@ -2641,6 +2673,91 @@ impl ArrayType {
 
     pub fn max_len(&self) -> u32 {
         self.max_len
+    }
+
+    /// `ENUM` 要素の語彙定義（`ENUM` 以外の要素型では `None`）。
+    pub fn enum_def(&self) -> Option<&Arc<EnumTypeDef>> {
+        self.enum_def.as_ref()
+    }
+
+    /// カタログ v2 の `param` フィールド文字列。
+    /// `<tag>,<max_len>`／`numeric,<p>,<s>,<max_len>`／`enum,<type_name>,<max_len>`。
+    fn catalog_param(&self) -> String {
+        match (&self.elem, &self.enum_def) {
+            (ArrayElemType::Numeric { precision, scale }, _) => {
+                format!("numeric,{precision},{scale},{}", self.max_len)
+            }
+            (ArrayElemType::Enum, Some(def)) => format!("enum,{},{}", def.name, self.max_len),
+            (elem, _) => format!("{},{}", elem.catalog_tag(), self.max_len),
+        }
+    }
+}
+
+/// 配列列 `param`（[`ArrayType::catalog_param`] の逆）を `ArrayType` へ復号する
+/// （Issue #1357）。フィールド数は先頭の要素タグで決まり、過不足・非正準数値・
+/// 未知タグは `Invalid` で fail-closed に拒否する。`enum` は `resolve_enum` で語彙を引く。
+fn parse_array_param(
+    param: &str,
+    resolve_enum: &mut dyn FnMut(&str) -> Result<Arc<EnumTypeDef>>,
+) -> Result<ArrayType> {
+    let fields: Vec<&str> = param.split(',').collect();
+    let elem_tag = fields.first().copied().unwrap_or("");
+    let expected = match elem_tag {
+        "numeric" => 4,
+        "enum" => 3,
+        _ => 2,
+    };
+    if fields.len() != expected {
+        return Err(CatalogError::Invalid(format!(
+            "array param has wrong number of fields: {param:?}"
+        )));
+    }
+    let max_len_field = fields.last().copied().unwrap_or("");
+    // 先頭ゼロ等の非正準表現を拒否する（`s != n.to_string()` 比較）。
+    let max_len: u32 = max_len_field.parse().map_err(|_| {
+        CatalogError::Invalid(format!("malformed array max_len: {max_len_field:?}"))
+    })?;
+    if max_len.to_string() != max_len_field {
+        return Err(CatalogError::Invalid(format!(
+            "array max_len is not in canonical form: {max_len_field:?}"
+        )));
+    }
+    match (elem_tag, fields.as_slice()) {
+        ("numeric", [_, p, sc, _]) => {
+            let (precision, scale) = parse_numeric_param(&format!("{p},{sc}"))?;
+            ArrayType::new(ArrayElemType::Numeric { precision, scale }, max_len)
+        }
+        ("enum", [_, name, _]) => {
+            validate_identifier(name)?;
+            let def = resolve_enum(name)?;
+            ArrayType::new_enum(def, max_len)
+        }
+        (other, _) => ArrayType::new(ArrayElemType::from_catalog_tag(other)?, max_len),
+    }
+}
+
+/// 配列列 `param` が参照する ENUM 型名（`enum` 要素でなければ `None`）。
+/// `DROP TYPE`／`ALTER TYPE` の依存判定用（Issue #1357）。壊れた `param` は
+/// 「依存なし」に丸めず `CorruptSchema` で拒否する（fail-closed）。
+fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
+    let fields: Vec<&str> = param.split(',').collect();
+    if fields.first().copied() != Some("enum") {
+        return Ok(None);
+    }
+    let corrupt = || CatalogError::CorruptSchema(format!("malformed array enum param: {param:?}"));
+    match fields.as_slice() {
+        [_, name, max_len] => {
+            validate_identifier(name).map_err(|_| corrupt())?;
+            let canonical = max_len
+                .parse::<u32>()
+                .map(|n| n.to_string() == *max_len && (1..=MAX_ARRAY_ELEMENTS).contains(&n))
+                .unwrap_or(false);
+            if !canonical {
+                return Err(corrupt());
+            }
+            Ok(Some(name))
+        }
+        _ => Err(corrupt()),
     }
 }
 
@@ -2924,7 +3041,36 @@ impl DroppedSlot {
 fn normalize_dropped_column_type(ty: ColumnType) -> ColumnType {
     match ty {
         ColumnType::Enum(_) | ColumnType::Json | ColumnType::Jsonb => ColumnType::Text,
+        // `ENUM`／`JSON`／`JSONB` 要素の配列も、要素が TEXT と同一の長さ前置＋UTF-8 本文の
+        // ため `TEXT[]` へ正規化し、`DROP TYPE` が削除済み列の残存参照でブロックされ続ける
+        // 結合を断つ（Issue #1357）。
+        ColumnType::Array(array_ty) if is_text_framed_array_elem(array_ty.elem()) => {
+            match ArrayType::new(ArrayElemType::Text, array_ty.max_len()) {
+                Ok(text_array) => ColumnType::Array(text_array),
+                // `max_len` は構築時に検証済みのため到達しない。到達した場合は元の型を
+                // 残し、後続の `validate_schema` に拒否させる（fail-closed）。
+                Err(_) => ColumnType::Array(array_ty),
+            }
+        }
         other => other,
+    }
+}
+
+/// 配列の要素が TEXT と同じ物理フレーム（長さ前置＋UTF-8 本文）を持ち、かつ
+/// 墓標では `TEXT[]` へ正規化しなければならない要素型か（Issue #1357）。
+fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
+    matches!(
+        elem,
+        ArrayElemType::Enum | ArrayElemType::Json | ArrayElemType::Jsonb
+    )
+}
+
+/// 墓標（削除済み列）に残してはならない、フレーム等価でない型か（TABLE-19 D1・D2）。
+fn is_non_frame_equivalent_type(ty: &ColumnType) -> bool {
+    match ty {
+        ColumnType::Vector(_) | ColumnType::Enum(_) | ColumnType::Json | ColumnType::Jsonb => true,
+        ColumnType::Array(array_ty) => is_text_framed_array_elem(array_ty.elem()),
+        _ => false,
     }
 }
 
@@ -3657,10 +3803,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     let mut last_physical_index: Option<u16> = None;
     for dropped in &schema.dropped {
         validate_identifier(&dropped.name)?;
-        if matches!(
-            dropped.ty,
-            ColumnType::Vector(_) | ColumnType::Enum(_) | ColumnType::Json | ColumnType::Jsonb
-        ) {
+        if is_non_frame_equivalent_type(&dropped.ty) {
             return Err(CatalogError::Invalid(format!(
                 "dropped column {:?} must be normalized to a frame-equivalent type",
                 dropped.name
@@ -5741,13 +5884,7 @@ fn decode_schema_body(
                 // 墓標の型は必ずフレーム等価型（TABLE-19 D1・D2）でなければ
                 // ならない。手書きの不正データが `VECTOR`／`ENUM`／`JSON`／
                 // `JSONB` を削除済み状態で持ち込むのを拒否する。
-                if matches!(
-                    ty,
-                    ColumnType::Vector(_)
-                        | ColumnType::Enum(_)
-                        | ColumnType::Json
-                        | ColumnType::Jsonb
-                ) {
+                if is_non_frame_equivalent_type(&ty) {
                     return Err(CatalogError::Invalid(format!(
                         "dropped column {name:?} has a non frame-equivalent type"
                     )));
@@ -6363,6 +6500,13 @@ impl Storage {
             // （`alter_table_add_column` と同じ。省略すると語彙外ラベルの DEFAULT が
             // 永続化され、列を省略した INSERT の束縛が常に失敗する。Issue #1282）。
             for column in &schema.columns {
+                // `<enum>[]` 列の要素型も登録済みであることを確認する（Issue #1357）。
+                // 配列列は DEFAULT を持てないため存在確認のみ。
+                if let ColumnType::Array(array_ty) = &column.ty {
+                    if let Some(def) = array_ty.enum_def() {
+                        get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    }
+                }
                 if let ColumnType::Enum(def) = &column.ty {
                     let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
                     if column.default.is_some() {
@@ -6570,6 +6714,14 @@ impl Storage {
             // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
             // この write txn から見えるカタログ登録済みの定義で必ず置き換える
             // （未登録の語彙を呼び出し元が持ち込めないようにする。Issue #890 D2）。
+            // `<enum>[]` 列も同様に登録済みの定義（語彙）へ置き換える（Issue #1357）。
+            if let ColumnType::Array(array_ty) = &column.ty {
+                if let Some(def) = array_ty.enum_def() {
+                    let registered = get_enum_type_in_write_txn(&write_txn, def.name())?;
+                    column.ty =
+                        ColumnType::Array(ArrayType::new_enum(registered, array_ty.max_len())?);
+                }
+            }
             if let ColumnType::Enum(def) = &column.ty {
                 column.ty = ColumnType::Enum(get_enum_type_in_write_txn(&write_txn, def.name())?);
                 // txn 前の検査は呼び出し元の `Arc` の語彙で行っているため、登録済みの
@@ -7449,13 +7601,12 @@ impl Storage {
     /// であれば既存の全テナントの既存値は新しい宣言の下でも必ず有効な値として
     /// 読み出せる）。
     ///
-    /// 受理するのはこの 1 パターン（`NUMERIC` → より大きい `precision`・同一
-    /// `scale` の `NUMERIC`）のみで、それ以外の型変更（`INTEGER`→`BIGINT`・
-    /// `REAL`→`DOUBLE PRECISION` を含む、行の書き換えを要する拡大変換や、
-    /// 縮小変換・異種変換・同一型への変更）はすべて
-    /// `Err(CatalogError::IncompatibleTypeChange)` で拒否する（行の書き換えを
-    /// 伴う変換は本 Issue のスコープ外。`docs/design/alter-table-drop-modify-column.md`
-    /// 参照）。
+    /// 本 API が受理するのはこの 1 パターン（`NUMERIC` → より大きい `precision`・
+    /// 同一 `scale` の `NUMERIC`）のみで、それ以外の型変更はすべて
+    /// `Err(CatalogError::IncompatibleTypeChange)` で拒否する。行の書き換えを
+    /// 伴う `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION` は SQL 表層経路の
+    /// [`Self::alter_table_alter_column_type`] だけが受理する（Issue #1361。
+    /// `docs/design/alter-table-drop-modify-column.md` 参照）。
     pub fn alter_table_widen_numeric_precision(
         &self,
         table_name: &str,
@@ -7483,18 +7634,25 @@ impl Storage {
             // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
             // scale <= precision）を検証してから確定する。
             validate_numeric_precision_scale(new_precision, old_scale)?;
-            Ok(ColumnType::Numeric {
-                precision: new_precision,
-                scale: old_scale,
-            })
+            Ok((
+                ColumnType::Numeric {
+                    precision: new_precision,
+                    scale: old_scale,
+                },
+                None,
+            ))
         })
     }
 
     /// `ALTER TABLE ... ALTER COLUMN <column> TYPE <target>`（TABLE-19・SQL-23、
     /// Issue #1167）の実行本体。SQL 表層（`sql::ddl::execute_alter_table_alter_column_type`）
-    /// が呼ぶ。受理するのは `NUMERIC(p0, s)` → `NUMERIC(p1, s)`（`p1 > p0`・同一 scale）
-    /// のみで、それ以外（VECTOR 次元変更・同一型・縮小・scale 変更・異種型・
-    /// 行の書き換えを伴う拡大変換）はすべて `IncompatibleTypeChange`。
+    /// が呼ぶ。受理するのは `NUMERIC(p0, s)` → `NUMERIC(p1, s)`（`p1 > p0`・同一 scale。
+    /// カタログのみ書き換え）と、全テナントの既存行を同一 write txn 内で再エンコード
+    /// する `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`（Issue #1361。
+    /// [`crate::column_rewrite`]。PK／UNIQUE／FOREIGN KEY の構成列は索引が古くなる
+    /// ため `DependentObjectsStillExist`）で、それ以外（VECTOR 次元変更・同一型・縮小・
+    /// scale 変更・異種型・`INTEGER`→`DOUBLE PRECISION` 等）はすべて
+    /// `IncompatibleTypeChange`。成功時は世代を bump して索引キャッシュを失効させる。
     ///
     /// [`Self::alter_table_widen_numeric_precision`] と異なり目標の scale を受け取り、
     /// 判定を単一 write txn 内で完結させる（表層が事前に読んだ scale と書込時点の
@@ -7519,7 +7677,15 @@ impl Storage {
                     precision: p1,
                     scale: s1,
                 },
-            ) if s0 == s1 && p1 > p0 => Ok(target.clone()),
+            ) if s0 == s1 && p1 > p0 => Ok((target.clone(), None)),
+            (ColumnType::Integer, ColumnType::BigInt) => Ok((
+                target.clone(),
+                Some(crate::column_rewrite::WideningKind::IntegerToBigInt),
+            )),
+            (ColumnType::Real, ColumnType::Double) => Ok((
+                target.clone(),
+                Some(crate::column_rewrite::WideningKind::RealToDouble),
+            )),
             (from, to) => {
                 let (from_tag, from_param) = from.catalog_fields();
                 let (to_tag, to_param) = to.catalog_fields();
@@ -7533,14 +7699,21 @@ impl Storage {
     }
 
     /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
-    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → 書き戻し →
+    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → （行の書き換えを
+    /// 伴う拡大変換のみ）PK／UNIQUE／FK 依存検査（`DependentObjectsStillExist`。
+    /// 永続一意索引・キー索引の正準キーが型ごとに異なり、古い索引が一意性・
+    /// 参照整合性検査をすり抜ける fail-open を避ける）と全テナント既存行の
+    /// 再エンコード（[`crate::column_rewrite`]。Issue #1361）→ 書き戻し →
     /// 世代 bump → commit を行う（commit の直前行に必ず bump を置く。
-    /// `table_generation_bump_coverage`）。拒否時は commit せず副作用ゼロ。
+    /// `table_generation_bump_coverage`）。拒否・失敗時は commit せず副作用ゼロ。
     fn alter_column_type_with(
         &self,
         table_name: &str,
         column_name: &str,
-        decide: impl FnOnce(&ColumnType) -> Result<ColumnType>,
+        decide: impl FnOnce(
+            &ColumnType,
+        )
+            -> Result<(ColumnType, Option<crate::column_rewrite::WideningKind>)>,
     ) -> Result<()> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
@@ -7557,7 +7730,8 @@ impl Storage {
                 guard.value().to_vec()
             };
             let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
-            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let old_schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let mut schema = old_schema.clone();
             // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が参照する列の型変更は
             // 安全側で拒否する（`alter_table_drop_column` と同じ判断。述語の
             // 意味を黙って変えない）。
@@ -7566,12 +7740,44 @@ impl Storage {
                     column_name.to_string(),
                 ));
             }
+            let logical_index = schema
+                .columns
+                .iter()
+                .position(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             let column = schema
                 .columns
-                .iter_mut()
-                .find(|c| c.name == column_name)
+                .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            column.ty = decide(&column.ty)?;
+            let (new_ty, rewrite) = decide(&column.ty)?;
+            column.ty = new_ty;
+            if let Some(kind) = rewrite {
+                if schema
+                    .primary_key
+                    .as_ref()
+                    .is_some_and(|pk| pk.iter().any(|c| c == column_name))
+                    || schema
+                        .unique_constraints
+                        .iter()
+                        .any(|u| u.columns().iter().any(|c| c == column_name))
+                    || schema
+                        .foreign_keys
+                        .iter()
+                        .any(|fk| fk.columns.iter().any(|c| c == column_name))
+                {
+                    return Err(CatalogError::DependentObjectsStillExist(
+                        column_name.to_string(),
+                    ));
+                }
+                crate::column_rewrite::rewrite_rows_for_widening_in_txn(
+                    &write_txn,
+                    table_name,
+                    &old_schema,
+                    &schema,
+                    logical_index,
+                    kind,
+                )?;
+            }
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
@@ -7628,7 +7834,8 @@ impl Storage {
     /// 削除・改名はいずれも提供しない（Issue #890 D4。既存行はラベル文字列を
     /// そのまま格納するため、語彙の単調増加さえ守れば古いスナップショットで
     /// 有効だった値は将来にわたって有効であり続ける契約を維持できる）。
-    /// 依存テーブルが存在する場合、この write txn 内で該当テーブルすべての
+    /// 依存テーブル（`<enum>[]` 配列列を持つテーブルを含む。Issue #1357）が
+    /// 存在する場合、この write txn 内で該当テーブルすべての
     /// 世代を進行させる（多層防御。同一クエリ内でスキーマが再取得されない
     /// キャッシュ経路が新ラベルを見落とす可能性を保守的に潰す）。
     pub fn alter_enum_type_add_value(&self, name: &str, label: String) -> Result<Arc<EnumTypeDef>> {
@@ -7662,7 +7869,8 @@ impl Storage {
     }
 
     /// `DROP TYPE <name>` 相当。依存列（[`ColumnType::Enum`] でこの型を参照する
-    /// 列）が 1 つでも残っている場合は
+    /// 列、および要素型として参照する `<enum>[]` 配列列。Issue #1357）が 1 つでも
+    /// 残っている場合は
     /// `Err(CatalogError::DependentObjectsStillExist)` で拒否する（SQL-23 結線時は
     /// `2BP01` へ写像する。Issue #890 D5・Issue #1194）。
     pub fn drop_enum_type(&self, name: &str) -> Result<()> {
@@ -8749,6 +8957,11 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         if tag == "enum" && param == type_name {
             found = true;
         }
+        // 配列の要素型としての参照（Issue #1357）。見落とすと `DROP TYPE` が
+        // `enum[]` 列の残るテーブルを素通しし fail-open になる。
+        if tag == "array" && array_param_enum_name(param)? == Some(type_name) {
+            found = true;
+        }
     }
     // v6 の `uniq:` セクション（TABLE-16・TASK-204、Issue #905）。
     // `decode_schema_body` と同じ共有パーサー [`parse_unique_section`] で
@@ -8978,6 +9191,8 @@ fn column_default_compatible_with_tag(default: &ColumnDefault, tag: &str) -> boo
 
 /// ENUM 型 `type_name` を参照する列を持つテーブル名の一覧を列挙する
 /// （`DROP TYPE`・`ALTER TYPE ... ADD VALUE` が共有する。Issue #890 D4/D5）。
+/// ENUM 列だけでなく、要素型として参照する配列列（`<enum>[]`。Issue #1357）も
+/// 依存に数える（[`catalog_value_references_enum_type`] 参照）。
 /// [`MAX_LIST_TABLES`] を超える場合は無制限 `Vec` 確保を避けて `Err`。
 fn dependent_tables_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -10463,9 +10678,9 @@ mod tests {
         ));
     }
 
-    /// Issue #1193: 要素型タグは既存のスカラー型タグと同じ綴りで往復し、既存の
-    /// `text`／`boolean` のカタログ表現は不変。`numeric`・`bytea`・`enum`・`json`・
-    /// `vector`・`array` など未対応タグは fail-closed に拒否する。
+    /// Issue #1193・#1357: 要素型タグは既存のスカラー型タグと同じ綴りで往復し、既存の
+    /// `text`／`boolean` のカタログ表現は不変。`vector`・`array`・未知タグ、および
+    /// 追加フィールドを欠く `numeric`／`enum`（`<tag>,<max_len>` 形）は fail-closed に拒否する。
     #[test]
     fn array_element_type_tags_roundtrip_and_unsupported_tags_are_rejected() {
         for (elem, tag) in [
@@ -10478,6 +10693,9 @@ mod tests {
             (ArrayElemType::Date, "date"),
             (ArrayElemType::Timestamp, "timestamp"),
             (ArrayElemType::Uuid, "uuid"),
+            (ArrayElemType::Bytea, "bytea"),
+            (ArrayElemType::Json, "json"),
+            (ArrayElemType::Jsonb, "jsonb"),
         ] {
             assert_eq!(elem.catalog_tag(), tag);
             assert_eq!(ArrayElemType::from_catalog_tag(tag).expect("tag"), elem);
@@ -10497,9 +10715,7 @@ mod tests {
             let decoded = decode_schema("t", &bytes).expect("decode");
             assert_eq!(decoded.columns, schema.columns);
         }
-        for tag in [
-            "numeric", "bytea", "enum", "json", "jsonb", "vector", "array", "int",
-        ] {
+        for tag in ["numeric", "enum", "vector", "array", "int"] {
             let bytes = format!("v2\ncols:1\ntags:array:{tag},4:0\n").into_bytes();
             assert!(
                 matches!(
@@ -10509,6 +10725,153 @@ mod tests {
                 "element tag {tag} must be rejected"
             );
         }
+    }
+
+    fn array_resolver(name: &str) -> Result<Arc<EnumTypeDef>> {
+        if name == "mood" {
+            Ok(Arc::new(EnumTypeDef {
+                name: "mood".to_string(),
+                labels: vec!["happy".to_string(), "sad".to_string()],
+            }))
+        } else {
+            Err(CatalogError::TypeNotFound(name.to_string()))
+        }
+    }
+
+    /// Issue #1357: `NUMERIC`・`ENUM` 要素の `param` は `numeric,<p>,<s>,<max_len>`・
+    /// `enum,<type_name>,<max_len>` で往復し、非正準形・フィールド過不足・範囲外は拒否する。
+    #[test]
+    fn array_numeric_and_enum_params_roundtrip_and_reject_malformed() {
+        let numeric = ColumnType::Array(
+            ArrayType::new(
+                ArrayElemType::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                8,
+            )
+            .expect("array ty"),
+        );
+        assert_eq!(
+            numeric.catalog_fields(),
+            ("array", "numeric,10,2,8".to_string())
+        );
+        let decoded =
+            ColumnType::from_catalog_fields("array", "numeric,10,2,8", &mut array_resolver)
+                .expect("decode numeric array");
+        assert_eq!(decoded, numeric);
+
+        let def = array_resolver("mood").expect("mood");
+        let enum_array = ColumnType::Array(ArrayType::new_enum(def, 4).expect("array ty"));
+        assert_eq!(
+            enum_array.catalog_fields(),
+            ("array", "enum,mood,4".to_string())
+        );
+        let decoded = ColumnType::from_catalog_fields("array", "enum,mood,4", &mut array_resolver)
+            .expect("decode enum array");
+        assert_eq!(decoded, enum_array);
+
+        for bad in [
+            "numeric,10,2",     // max_len 欠落
+            "numeric,10,2,8,1", // 余剰
+            "numeric,010,2,8",  // 先頭ゼロ
+            "numeric,10,02,8",  // 先頭ゼロ
+            "numeric,10,11,8",  // scale > precision
+            "numeric,0,0,8",    // precision 範囲外
+            "numeric,39,0,8",   // precision 範囲外
+            "numeric,10,2,08",  // max_len 非正準
+            "numeric,10,2,0",   // max_len 範囲外
+            "enum,mood",        // max_len 欠落
+            "enum,mood,4,1",    // 余剰
+            "enum,mood,04",     // 非正準
+            "enum,bad name,4",  // 識別子不正
+            "bytea,4,1",        // 余剰
+            "json",             // max_len 欠落
+        ] {
+            assert!(
+                matches!(
+                    ColumnType::from_catalog_fields("array", bad, &mut array_resolver),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "param {bad:?} must be rejected"
+            );
+        }
+        // 未登録の ENUM 型は ENUM 列と同じく `TypeNotFound`。
+        assert!(matches!(
+            ColumnType::from_catalog_fields("array", "enum,ghost,4", &mut array_resolver),
+            Err(CatalogError::TypeNotFound(_))
+        ));
+    }
+
+    /// Issue #1357 D3（P0）: `<enum>[]` 列も ENUM 型への依存として検出する。見落とすと
+    /// `DROP TYPE` が依存テーブルを素通しし fail-open になる。壊れた param は拒否する。
+    #[test]
+    fn catalog_value_references_enum_type_detects_enum_array_columns() {
+        let with_array = b"v2\ncols:2\nmoods:array:enum,mood,4:0\nt:text:-:0\n".to_vec();
+        assert!(catalog_value_references_enum_type(&with_array, "mood").expect("valid"));
+        assert!(!catalog_value_references_enum_type(&with_array, "other").expect("valid"));
+        let without = b"v2\ncols:1\nt:array:text,4:0\n".to_vec();
+        assert!(!catalog_value_references_enum_type(&without, "mood").expect("valid"));
+        for corrupt in [
+            "v2\ncols:1\nm:array:enum,mood:0\n",
+            "v2\ncols:1\nm:array:enum,mood,04:0\n",
+            "v2\ncols:1\nm:array:enum,mood,0:0\n",
+            "v2\ncols:1\nm:array:enum,mood,1025:0\n",
+            "v2\ncols:1\nm:array:enum,mood,4,1:0\n",
+            "v2\ncols:1\nm:array:enum,bad name,4:0\n",
+        ] {
+            assert!(
+                matches!(
+                    catalog_value_references_enum_type(corrupt.as_bytes(), "mood"),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "expected {corrupt:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn array_type_new_rejects_enum_without_definition_and_bad_numeric_params() {
+        assert!(ArrayType::new(ArrayElemType::Enum, 4).is_err());
+        assert!(ArrayType::new(
+            ArrayElemType::Numeric {
+                precision: 0,
+                scale: 0
+            },
+            4
+        )
+        .is_err());
+        assert!(ArrayType::new(
+            ArrayElemType::Numeric {
+                precision: 5,
+                scale: 6
+            },
+            4
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn dropped_text_framed_array_columns_are_normalized_to_text_array() {
+        let def = array_resolver("mood").expect("mood");
+        for ty in [
+            ArrayType::new_enum(def, 4).expect("array ty"),
+            ArrayType::new(ArrayElemType::Json, 4).expect("array ty"),
+            ArrayType::new(ArrayElemType::Jsonb, 4).expect("array ty"),
+        ] {
+            let normalized = normalize_dropped_column_type(ColumnType::Array(ty));
+            assert_eq!(
+                normalized,
+                ColumnType::Array(ArrayType::new(ArrayElemType::Text, 4).expect("array ty"))
+            );
+        }
+        // BYTEA／NUMERIC 要素は物理フレームが TEXT と異なるため保持する。
+        let bytea = ColumnType::Array(ArrayType::new(ArrayElemType::Bytea, 4).expect("array ty"));
+        assert_eq!(normalize_dropped_column_type(bytea.clone()), bytea);
+        assert!(is_non_frame_equivalent_type(&ColumnType::Array(
+            ArrayType::new(ArrayElemType::Json, 4).expect("array ty")
+        )));
+        assert!(!is_non_frame_equivalent_type(&bytea));
     }
 
     #[test]
@@ -12756,6 +13119,237 @@ mod tests {
                 ],
             )
             .expect("insert typed row within widened precision");
+    }
+
+    /// 拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`。Issue #1361）は
+    /// 全テナントの既存行を再エンコードし、対象外の列（墓標・DEFAULT 補完を含む）
+    /// の値・行ヘッダ・世代 bump・再オープン後の読み出しを保つ。
+    #[test]
+    fn alter_column_type_widening_rewrites_rows_and_preserves_other_columns() {
+        let path = unique_db_path("widen-int-real-rewrite");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("gone", ColumnType::Text, true),
+                    ColumnDef::new("t", ColumnType::Text, true),
+                    ColumnDef::new("flag", ColumnType::Boolean, true),
+                    ColumnDef::new("n", ColumnType::Integer, true),
+                    ColumnDef::new("r", ColumnType::Real, true),
+                    ColumnDef::new("b", ColumnType::Bytea, true),
+                ],
+            ))
+            .expect("create table");
+        let row = |n: Option<i32>, r: Option<f32>| {
+            vec![
+                RowCodecValue::Vector(vec![1.0, 2.0]),
+                RowCodecValue::Text("g".to_string()),
+                RowCodecValue::Text("hello".to_string()),
+                RowCodecValue::Bool(true),
+                n.map_or(RowCodecValue::Null, RowCodecValue::Integer),
+                r.map_or(RowCodecValue::Null, RowCodecValue::Real),
+                RowCodecValue::Bytes(vec![9, 8, 7]),
+            ]
+        };
+        for (tenant, vis, id, n, r) in [
+            (
+                "tenant-a",
+                Visibility::Public,
+                1u64,
+                Some(i32::MIN),
+                Some(0.1f32),
+            ),
+            ("tenant-a", Visibility::Private, 2, Some(i32::MAX), None),
+            ("tenant-b", Visibility::Public, 1, None, Some(-2.5)),
+        ] {
+            storage
+                .insert_typed_row("docs", id, tenant, vis, &row(n, r))
+                .expect("insert");
+        }
+        storage
+            .alter_table_drop_column("docs", "gone")
+            .expect("drop column creates a tombstone");
+        // DROP 後に DEFAULT 付き列を追加する（追加前の行は読み出し時に補完される）。
+        storage
+            .alter_table_add_column(
+                "docs",
+                ColumnDef::new("d", ColumnType::Real, false)
+                    .with_default(ColumnDefault::Number("0.1".to_string())),
+            )
+            .expect("add default column");
+        let before: Vec<Vec<RowCodecValue>> =
+            [("tenant-a", 1u64), ("tenant-a", 2), ("tenant-b", 1)]
+                .iter()
+                .map(|(t, id)| {
+                    let schema = storage.get_table_schema("docs").expect("schema");
+                    let r = storage.get_row_from_table("docs", t, *id).expect("row");
+                    row_codec::decode_scalar_columns(&schema, &r.metadata).expect("decode")
+                })
+                .collect();
+        let generation_before = storage.table_generation("docs").expect("generation");
+
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect("widen integer");
+        storage
+            .alter_table_alter_column_type("docs", "r", &ColumnType::Double)
+            .expect("widen real");
+        assert!(storage.table_generation("docs").expect("generation") > generation_before);
+
+        let check = |storage: &Storage| {
+            let schema = storage.get_table_schema("docs").expect("schema");
+            for (i, (t, id, vis)) in [
+                ("tenant-a", 1u64, Visibility::Public),
+                ("tenant-a", 2, Visibility::Private),
+                ("tenant-b", 1, Visibility::Public),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let r = storage.get_row_from_table("docs", t, *id).expect("row");
+                assert_eq!(r.visibility, *vis);
+                assert_eq!(r.embedding, vec![1.0, 2.0]);
+                let after = row_codec::decode_scalar_columns(&schema, &r.metadata).expect("decode");
+                assert_eq!(after.len(), before[i].len());
+                for (j, (a, b)) in after.iter().zip(before[i].iter()).enumerate() {
+                    let expected = match b {
+                        RowCodecValue::Integer(v) if j == 3 => RowCodecValue::BigInt(i64::from(*v)),
+                        RowCodecValue::Real(v) if j == 4 => RowCodecValue::Double(f64::from(*v)),
+                        other => other.clone(),
+                    };
+                    assert_eq!(a, &expected, "tenant {t} id {id} column {j}");
+                }
+            }
+        };
+        check(&storage);
+        drop(storage);
+        let reopened = Storage::open(&path).expect("reopen");
+        check(&reopened);
+        // 拡大後の値域でしか入らない行も書ける。
+        reopened
+            .insert_typed_row(
+                "docs",
+                9,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.0, 0.0]),
+                    RowCodecValue::Null,
+                    RowCodecValue::Null,
+                    RowCodecValue::BigInt(i64::from(i32::MAX) + 1),
+                    RowCodecValue::Double(0.1),
+                    RowCodecValue::Null,
+                    RowCodecValue::Real(0.1),
+                ],
+            )
+            .expect("insert wide values");
+    }
+
+    /// 再エンコード結果がペイロード上限を超える場合は `CorruptSchema` で拒否し、
+    /// カタログ・行バイト列・世代のいずれにも痕跡を残さない（fail-closed。Issue #1361）。
+    #[test]
+    fn alter_column_type_widening_is_atomic_when_rewrite_fails() {
+        let path = unique_db_path("widen-int-atomic");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("t", ColumnType::Text, true),
+                    ColumnDef::new("n", ColumnType::Integer, true),
+                ],
+            ))
+            .expect("create table");
+        // 小さい行を先に書き換え済みにしてから失敗行に当たる並び（id 昇順）にする。
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text("small".to_string()),
+                    RowCodecValue::Integer(1),
+                ],
+            )
+            .expect("insert small");
+        // text フレーム（presence 1 + len 4 + 本体）+ integer フレーム 5 = 上限ちょうど。
+        let big = "x".repeat(crate::row_codec::MAX_SCALAR_PAYLOAD_LEN as usize - 10);
+        storage
+            .insert_typed_row(
+                "docs",
+                2,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text(big),
+                    RowCodecValue::Integer(2),
+                ],
+            )
+            .expect("insert max-size row");
+        let schema_before = storage.get_table_schema("docs").expect("schema");
+        let r1 = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("row");
+        let r2 = storage
+            .get_row_from_table("docs", "tenant-a", 2)
+            .expect("row");
+        let generation = storage.table_generation("docs").expect("generation");
+
+        let err = storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect_err("rewrite must fail");
+        assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+
+        assert_eq!(
+            storage.get_table_schema("docs").expect("schema"),
+            schema_before
+        );
+        assert_eq!(
+            storage
+                .get_row_from_table("docs", "tenant-a", 1)
+                .expect("row"),
+            r1
+        );
+        assert_eq!(
+            storage
+                .get_row_from_table("docs", "tenant-a", 2)
+                .expect("row"),
+            r2
+        );
+        assert_eq!(
+            storage.table_generation("docs").expect("generation"),
+            generation
+        );
+    }
+
+    /// 行ストア未作成（既存行 0 件）のテーブルでも拡大変換は成功する（Issue #1361）。
+    #[test]
+    fn alter_column_type_widening_succeeds_on_table_without_rows() {
+        let path = unique_db_path("widen-int-empty");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("n", ColumnType::Integer, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
+            .expect("widen");
+        let schema = storage.get_table_schema("docs").expect("schema");
+        assert_eq!(schema.columns[1].ty, ColumnType::BigInt);
     }
 
     /// 縮小・同一精度・異種型（`NUMERIC` 以外）への変更はいずれも

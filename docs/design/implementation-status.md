@@ -501,3 +501,69 @@ Issue #1284（fix(wire): TLS の Sealer を Opener と対称にする。TASK-228
 - **変更箇所**: `crates/engine/src/sql/subquery.rs`（`validate_in_target_column` が `REAL`／`DOUBLE PRECISION` と疑似列 `id` を受理。浮動小数の distinct 集合を式述語の `Or` へ展開）、`crates/engine/tests/sql29_subquery_scalar.rs`、`docs/design/sql-subquery.md`。**破壊的変更**: 公開 enum `sql::allowlist::WherePredicate` に内部用 variant `IdCompare` を追加した（疑似列 `id` のサブクエリ比較を整数のまま厳密に照合するため。TASK-213 ポインタ。spec 側の定義変更とは対で扱う）。網羅的 `match` を持つ外部コードは要対応。
 - **投影位置のスカラーサブクエリ**: `sql::allowlist`（`ScalarSubqueryItem`・SELECT リスト解析）、`sql::subquery`（`resolve_scalar_projection_items`・`merge_scalar_projection_items`）、`core.rs` の `Statement::Scan` アーム。`crates/engine/tests/sql29_projection_subquery.rs`。詳細は `docs/design/sql-subquery.md`。
 - **性質**: 内側の行数に依存しない静的な値族検証、他テナント行が結果・エラーを変えない。非有限値は `22000`。
+
+## Issue #1353: 明示トランザクション内のファイル形 INSERT と書き込み済みテーブルへの USING PLAN・EXPLAIN
+
+- **対象ビヘイビア**: SQL-31（TASK-221。関連: RECOVER-12・TABLE-17・WIRE-16）。
+- **変更箇所**: `tenant.rs`（`replace_typed_rows_by_text_key` を `WriteTarget` 対応にし FK 検査モードを `target.fk_check_mode()` へ）、`incremental.rs`・`sql/exec.rs`（`WriteTarget` の受け渡し）、`core.rs`（ファイル形 INSERT の拒否を撤去、`read_only_in_active_txn` の dirty 分岐を書き直し、辞書の入力元 `dict_txn` を `expand_query`・`plan_using_plan_expansion`・`run_using_plan_select`・`run_explain_plan` へ貫通、`dictionary_from_write_txn` を追加）。
+- **性質**: カタログ・スキーマ・世代は確定済みスナップショットから、辞書と `USING PLAN` の行の読みだけ共有 write トランザクションから読む。辞書は `DictionaryCache` を経由しない（ROLLBACK 後の世代再利用による漏えいの防止）。新しい `wire_code` の追加なし。
+- **テスト**: `tests/sql31_txn_file_insert_using_plan.rs`（COMMIT／ROLLBACK／drop・置換・`25000`・テナント境界・fail-closed・dirty の `USING PLAN` の行と辞書・RLS・キャッシュ非汚染・全 `EXPLAIN` variant）。`sql31_transaction.rs`・`sql31_txn_dml.rs` の旧 `0A000` アサーションを撤去。
+- **対象外（申し送り）**: NoSQL バッチのトランザクション対応、書き込み後の読み取りでのキャッシュ・HNSW 再利用。
+
+## Issue #1354: 明示トランザクションの成否確定手順の補完（台帳照合の順序・3 クライアント）
+
+- **対象ビヘイビア**: RECOVER-12（関連: RECOVER-10・ERR-2・SQL-31・TABLE-16）。
+- **変更箇所**: テストと検証用クライアントのみ（本番コードの変更・依存追加なし）。`crates/engine/tests/recover12_explicit_txn_resend.rs`・`crates/wire-server/tests/recover12_explicit_txn_resend.rs` を新規追加、`three_client_e2e.rs` に層 B のテストと `Client::expect_error_excluding`／`abandon_open_transaction` を追加、`psycopg_client.py` に opt-in の `WIRE_ABANDON_OPEN_TRANSACTION` を追加。
+- **性質**: 行制約を持つ表で、新しい `BEGIN` 内の再送が台帳由来の `23505`（`DuplicateOperationId`）になり行制約由来（`UniqueViolation`／`IdConflict`）に落ちないことを、variant と固定文言で固定する。順序を入れ替える一時変更で engine・wire 層 A・層 B が失敗することを確認済み。
+- **テスト**: engine 5 件（commit 済み再送・対照・未 commit 接続断・衝突時の再送・テナント境界。`PRIMARY KEY` のみ／`UNIQUE` のみ／両方の 3 構成）、wire 層 A 2 件、層 B 1 件（3 クライアント）。
+- **対象外（申し送り）**: `--fault-inject` の注入点を `COMMIT` 文へ広げること、先頭文が 0 行 `DELETE` の場合の再送判定、明示トランザクション内の UPDATE／UPSERT／複数行 INSERT への対応。
+
+## Issue #1355: RLS の越境一括検証に明示トランザクションの経路を加える
+
+- **対象ビヘイビア**: RLS-10 (a)(c)（関連: SQL-31・RECOVER-12・ERR-2）。
+- **変更箇所**: テストのみ（本番コード・公開 API・依存の変更なし）。`crates/engine/tests/rls10_write_constraint_paths.rs` に実行経路の次元（autocommit／明示トランザクション）を追加した。
+- **性質**: 既存の 41 形状を、`BEGIN` → 形状 → 成功なら同一トランザクション内の読み戻し → `COMMIT` の経路でも実行し、T0〜T6 の同一オラクルを適用する。エラー時は `Failed` 遷移・`COMMIT` の `25P02` 拒否・`ROLLBACK` で `Idle` へ戻ることを能動的に表明する。T7 で両経路の応答と自テナントの事後物理状態の完全一致を固定する。T0・T4・T5 の集計は経路別に更新した（T4 の比較件数 72、総 run 数 492）。
+- **対象外（申し送り）**: `INITIALLY DEFERRED` の FK（COMMIT 時検査）・暗黙トランザクション（WIRE-16）・ROLLBACK 後の全テナント物理不変の専用検査。
+
+## Issue #1356: NoSQL の update／delete の filter の受理範囲を SQL の述語形 DML に揃える
+
+- **対象ビヘイビア**: NOSQL-12・NOSQL-14・NOSQL-17（関連: SQL-19・SQL-24・RECOVER-10）。
+- **変更箇所**: engine の述語形 DML 入口の多層防御（`reject_unsupported_predicate_dml_forms`）が、範囲比較・`IN`・`OR`・列×数値リテラルの式比較を受理するよう拡張。SQL の `NOT` と同一の AST を得るための公開入口 `declarative_predicate::negate_where_conjunction` を追加。wire-server の `http::query::filter` は述語形 DML の `filter` を `search` と同じ要素検査（`map_filter_items`）に一本化し、`bind_filter_where_predicates` が「全体束縛による検証 → SQL と同一の `WherePredicate` への変換」を行う。`search`／`scan`／`aggregate` の数値 4 型への `in` も受理した。
+- **性質**: 各 JSON 形は対応する SQL テキストの構文解析結果とバイト単位で同一の AST になり（連続する `not`・`ne` は偶奇で畳む）、跨表層の再送が `23505`／`22023` で照合される。述語の葉の上限（256）は不変。数値列の `in` は JSON 上 1 葉と数えるため、256 要素ちょうどで他に葉があると NoSQL だけが `54000` になりうる（拒否側の既知の差）。
+- **テスト**: engine 単体 1（許可形・拒否形の固定）・公開 API 1、wire 単体（`filter.rs`）、層 A `nosql12_predicate_dml_numeric_filter.rs`（跨表層 19 形 × 2 方向・結果集合・型不一致・上限・RLS 名・テナント境界）、`nosql12_update_delete.rs`・`nosql14_filter_operators.rs`・`nosql12_partitioned_dml.rs` の拡張。
+- **対象外（申し送り）**: `ARRAY`／`JSON`／`JSONB` 列への DML の `eq`／`ne`／`in`、負数リテラルの SQL⇄NoSQL ハッシュパリティ（SQL に単項マイナスが無いため対象外）。
+
+## Issue #1357: 配列の要素型 NUMERIC・BYTEA・ENUM・JSON・JSONB に対応する
+
+- **対象ビヘイビア**: TABLE-14・NOSQL-17（関連: TABLE-6・TABLE-13・WIRE-13・ERR-1/2/4/6、TASK-198）。
+- **変更箇所**: engine の `ArrayElemType`／`ArrayType`／`ArrayValue` に新要素型を追加（`ArrayType` は ENUM 語彙を持つため `Copy` を失う）。カタログ param の拡張（`numeric,<p>,<s>,<max_len>`・`enum,<type_name>,<max_len>`）、ENUM 依存判定への `array` 列の追加、`JSON`／`JSONB`／`NUMERIC` 要素の値等価（`equality_payload`）を `=`・UNIQUE・集合演算へ適用。SQL の列宣言（CREATE TABLE／ADD COLUMN）、リテラル束縛、pg wire の配列テキスト、NoSQL の束縛・描画・filter `eq` を追従。
+- **性質**: 要素はスカラー列と同じ束縛関数・エラー分類を共有する。既存要素型の行バイト・UNIQUE キーは不変。詳細は `array-column-type.md` の Issue #1357 追記。
+- **テスト**: engine 単体（カタログ param・往復・依存判定・墓標正規化）、層 A `array_extended_elem_types.rs`（往復・再起動・等価・JSON 値等価・UNIQUE・DROP／ALTER TYPE・エラー分類・テナント分離）、`column_type_codec_roundtrip.rs` の拡張、wire `wire_array_column.rs`・NoSQL `nosql17_typed_json_parity.rs`（SQL とのバイト一致）。
+- **対象外（申し送り）**: NoSQL の DDL での配列宣言、配列列への DEFAULT、`numeric[]` の精度拡大、要素・パス演算子、配列・JSON 列の二次索引化、NoSQL filter の `in`。
+
+## Issue #1358: NUMERIC 列への指数表記の数値を受理する
+
+- **対象ビヘイビア**: TABLE-13・NOSQL-17（関連: TASK-197・TASK-199）。
+- **変更箇所**: `engine::numeric` の走査を `scan_literal` に共通化し、文法を `[+-]?(digits)?(\.digits?)?([eE][+-]?digits)?` へ拡張。`parse_for_column` は指数を小数点位置のシフトとして扱い、シフト後の値を half away from zero で丸めて桁検査する（シフト後の整数部が `p - s` 桁を超えれば `22003`）。指数は 4096 で頭打ちにし、巨大な負の指数は 0、非ゼロ仮数の巨大な正の指数は `22003`。`parse_literal_exact`（範囲比較リテラル）も指数込みの正確な scale を導出する（`1e-3` が scale 0 に化けない）。
+- **性質**: 指数部の無い入力の受理・拒否・値は不変（拒否の分類のみ、末尾に不正文字を含み整数部も桁あふれする入力は 22003 でなく 22000 になる。いずれも fail-closed）。SQL の INSERT／UPDATE／UPSERT／COPY／配列要素・列 DEFAULT・NoSQL の insert／update／filter は共有の束縛経路経由で追随する。wire-server のコード変更は無い。
+- **テスト**: `numeric.rs` 単体、`numeric_column.rs`（SQL 経路。`'1e3'` は拒否例から受理側へ契約改訂し、不正形 `'1e'`・`'1e3.5'` を拒否例へ追加）、`declarative_filter` 単体、wire `typed_json` 単体、`nosql17_typed_json_parity.rs`（HTTP と SQL のバイト一致・`22003`）。
+- **対象外（申し送り）**: 前後空白の受理、`NaN`／`Infinity`、式レーンの数値リテラルでの NUMERIC 扱い、scale が 38 を超える範囲比較リテラルの受理。
+
+## Issue #1359: 数値列の比較述語でスカラー列二次索引を使う
+
+- **対象ビヘイビア**: TABLE-13・INDEX-5（関連: SQL-24・TASK-208）。
+- **変更箇所**: `sql::scalar_plan` に `ExprIndexPredicate`・`collect_expr_index_predicates`・`numeric_i64_bounds` を追加し、`classify_scalar_plan` が数値列の単純比較（`=`・`<`・`<=`・`>`・`>=`、左右どちらにリテラルがあってもよい）を索引対応と分類する（単独は `index_typed_range`、2 件以上・`BETWEEN` は `index_conjunction`）。`sql::scalar_index` はレーン A（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`）を本番でも構築し（後置予約・列単位 fail-soft）、`resolve_candidates` が式側の述語を `ExprIndexPredicate` で受ける。`exec`・`aggregate`・`group_by` の収集は新しい収集口へ統一し、`Declared` 下の `EXPLAIN` は数値述語を `plain_scan` へ降格する。
+- **性質**: 索引経路と全走査の結果（行 id 集合・投影値・`COUNT(*)`）は一致する。`-0.0` は索引キー・リテラルとも正規化する。`2^53` 超過の `BIGINT` を含む列は索引から落ち全走査と同じ 22003 になる。RLS・テナント境界・`wire_code` は不変。
+- **テスト**: `scalar_plan`／`scalar_index` の単体（境界の性質テスト・全走査オラクル）、層 A `scalar_index_numeric.rs`（4 型×全演算子・左右入替・`BETWEEN`・`NOT`・複合述語・NULL・RLS・世代進行・`2^53` 超過・`EXPLAIN`・宣言）。
+- **対象外（申し送り）**: 数値 4 型の `CREATE INDEX` 宣言（INDEX-7）、数値の `IN`（OR 群の和集合）・列同士の比較・算術式の索引化。
+
+## Issue #1360: ビュー本文の受理形の拡大と外側の WHERE・ORDER BY
+
+- **対象ビヘイビア**: TABLE-18（主対象）・SQL-28・SQL-29・RLS-10 (b)。
+- **変更箇所**: `ViewBodyKind::Buffered` が本文の relation 一覧を持つ（`classify_view_body` が 1 回だけ計算。`catalog`・`sql::view` が共有）。本文の先頭に `WITH`・`(` を許し、サブクエリ文脈（深さ 0）で検証する。サブクエリ述語の内側は作成時・参照時に構造検証し、CTE の全定義・サブクエリ内側・集合演算の全枝・JOIN の全辺を依存の根拠にする。
+- **性質**: 作成者の可視性は引き継がれない（本文・サブクエリ内側・各枝は参照者の `ctx` で評価）。評価後射影形の連鎖は `42601`。3 テーブル以上の JOIN 本文は既存経路で受理されることをテストで固定した。
+- **テスト**: `tests/table18_view.rs`（多者結合・CTE・集合演算・サブクエリの直接実行との一致・依存検査・拒否・再オープン往復）。
+- **外側の WHERE・ORDER BY**: 評価後射影形ビューへの参照で、`WHERE`（宣言的な葉・式述語・`NOT`／`OR`）と列キーの `ORDER BY` を受理する。`sql::view_buffered` の `plan_outer`（Execute・Describe 共通）が本文の結果列から合成したスキーマへ既存の `bind_scan` で束縛し、`apply_outer` が評価済みセルに対して WHERE → ORDER BY（安定ソート）→ OFFSET／LIMIT → 射影の順に適用する。参照できるのは本文の結果列だけで、本文が公開していない `id` は `22000`。
+- **対象外（申し送り）**: 外側の集計・`DISTINCT`・ウィンドウ・式 `ORDER BY`・UDF 述語・サブクエリ、評価後射影形の連鎖、サブクエリ付き本文の Describe。
+
+Issue #1361（feat(engine): ALTER COLUMN TYPE で INTEGER→BIGINT・REAL→DOUBLE PRECISION を受理する。TABLE-19・TABLE-12 ポインタ）: 物理フレーム幅が変わる 2 変換を、カタログ更新と同一 write txn 内の全テナント既存行の再エンコード（新規 `column_rewrite.rs`。件数上限付きキーバッチ・キー/ヘッダ tenant 整合検査・失敗時は `CorruptSchema` で全体中止）で受理した。PK／UNIQUE／FOREIGN KEY 構成列は索引が古くなるため `2BP01`、縮小・異種・`INTEGER→DOUBLE PRECISION` 等は従来どおり `42804`。成功時は世代 bump で索引キャッシュを失効する。ADD COLUMN 前の行の DEFAULT は書き換え時に実体化される。公開 API の変更・依存追加・`unsafe` なし。テスト: `sql_ddl_drop_alter_column.rs`・`catalog.rs` 単体テスト・`table_generation_bump_coverage.rs`（行番号追随）。設計は `docs/design/alter-table-drop-modify-column.md`。

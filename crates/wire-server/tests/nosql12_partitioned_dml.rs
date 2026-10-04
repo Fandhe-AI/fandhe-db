@@ -288,6 +288,36 @@ fn partitioned_update_and_delete_succeed_with_the_atomic_body_shape() {
     assert_eq!(count_rows(&core), 0);
 }
 
+/// Issue #1356: 分割実行 DML の `filter` も `or`・範囲比較・数値列の `in` を受理する
+/// （同じ述語形 DML の多層防御を通る）。
+#[test]
+fn partitioned_dml_accepts_or_range_and_numeric_in_filters() {
+    let (core, _g) = new_core(3);
+    let (a, _b, _sql) = spawn_both(core.clone());
+
+    // `n = 10 OR u < 'u2'` は id 1 だけに一致する。
+    let resp = query(
+        &a,
+        r#"{"op":"delete","table":"docs","filter":[{"or":[{"column":"n","op":"eq","value":10},{"column":"u","op":"lt","value":"u2"}]}],"mode":"partitioned","operation_id":"p-or-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&resp.body),
+        r#"{"deleted":1,"operation_id":"p-or-1"}"#
+    );
+    // `n IN (20, 30)` は残りの 2 行に一致する。
+    let resp = query(
+        &a,
+        r#"{"op":"delete","table":"docs","filter":[{"column":"n","op":"in","value":[20,30]}],"mode":"partitioned","operation_id":"p-in-1"}"#,
+    );
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&resp.body),
+        r#"{"deleted":2,"operation_id":"p-in-1"}"#
+    );
+    assert_eq!(count_rows(&core), 0);
+}
+
 // --- 拒否（副作用ゼロ） -----------------------------------------------------------
 
 #[test]
@@ -332,8 +362,10 @@ fn malformed_modifiers_are_rejected_without_side_effects() {
                 .to_string(),
             "42601",
         ),
+        // Issue #1356: 範囲比較・`or`・数値 `in` は受理側へ移ったため、語彙外の `op` で
+        // 述語形の不備（42601）を固定する。
         (
-            r#"{"op":"delete","table":"docs","filter":[{"column":"u","op":"lt","value":"a"}],"mode":"partitioned","operation_id":"r16"}"#
+            r#"{"op":"delete","table":"docs","filter":[{"column":"u","op":"nope","value":"a"}],"mode":"partitioned","operation_id":"r16"}"#
                 .to_string(),
             "42601",
         ),

@@ -212,7 +212,6 @@ fn alter_type_error_contract() {
         ("ALTER TABLE nope ALTER COLUMN note TYPE TEXT", "42P01"),
         ("ALTER TABLE docs ALTER COLUMN missing TYPE TEXT", "42703"),
         ("ALTER TABLE docs ALTER COLUMN note TYPE INTEGER", "42804"),
-        ("ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT", "42804"),
         ("ALTER TABLE docs ALTER COLUMN note TYPE TEXT", "42804"),
         (
             "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(4,2)",
@@ -421,4 +420,228 @@ fn ddl_inside_explicit_transaction_is_rejected_with_0a000() {
             .expect_err("DDL inside an explicit transaction must be rejected");
         assert_eq!(err.wire_code(), "0A000", "{sql}");
     }
+}
+
+// ---- Issue #1361: INTEGER→BIGINT・REAL→DOUBLE PRECISION（行の再エンコードを伴う拡大） ----
+
+fn tenant_ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn select_cells(core: &EngineCore, ctx: &PolicyContext, col: &str) -> Vec<Cell> {
+    core.execute_sql(ctx, &format!("SELECT {col} FROM {TABLE} LIMIT 100"))
+        .expect("select")
+        .rows
+        .into_iter()
+        .map(|r| r.cells.into_iter().next().expect("one cell"))
+        .collect()
+}
+
+#[test]
+fn alter_type_integer_to_bigint_preserves_values_and_accepts_wide_values() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    for (id, v) in [
+        (1u64, "-2147483648"),
+        (2, "2147483647"),
+        (3, "0"),
+        (4, "-5"),
+        (5, "NULL"),
+    ] {
+        if v == "NULL" {
+            insert(&core, id, "note", &format!("'n{id}'"));
+        } else {
+            insert(&core, id, "note, qty", &format!("'n{id}', {v}"));
+        }
+    }
+    let out = run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ALTER COLUMN qty TYPE BIGINT"),
+    )
+    .expect("widen integer");
+    match out {
+        SqlOutcome::AlterTable(o) => assert_eq!(
+            o.action,
+            AlterTableAction::AlterColumnType {
+                column_name: "qty".to_string()
+            }
+        ),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    let mut got: Vec<i64> = Vec::new();
+    let mut nulls = 0;
+    for c in select_cells(&core, &ctx(), "qty") {
+        match c {
+            Cell::SignedInteger(v) => got.push(v),
+            Cell::Null => nulls += 1,
+            other => panic!("unexpected cell: {other:?}"),
+        }
+    }
+    got.sort_unstable();
+    assert_eq!(got, vec![-2147483648, -5, 0, 2147483647]);
+    assert_eq!(nulls, 1);
+    // 他列は変わらない。
+    assert_eq!(select_cells(&core, &ctx(), "note").len(), 5);
+
+    // i32 範囲外の値が入る。
+    insert(&core, 6, "qty", "2147483648");
+    assert!(select_cells(&core, &ctx(), "qty")
+        .iter()
+        .any(|c| matches!(c, Cell::SignedInteger(2147483648))));
+}
+
+#[test]
+fn alter_type_real_to_double_preserves_values_exactly() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN r REAL"),
+    )
+    .expect("add real");
+    for (id, v) in [(1u64, "0.1"), (2, "-2.5")] {
+        insert(&core, id, "r", v);
+    }
+    insert(&core, 3, "note", "'no-r'");
+    run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ALTER COLUMN r TYPE DOUBLE PRECISION"),
+    )
+    .expect("widen real");
+    let cells = select_cells(&core, &ctx(), "r");
+    let floats: Vec<f64> = cells
+        .iter()
+        .filter_map(|c| match c {
+            Cell::Float(f) => Some(*f),
+            _ => None,
+        })
+        .collect();
+    assert!(floats.contains(&f64::from(0.1f32)));
+    assert!(floats.contains(&-2.5f64));
+    assert_eq!(cells.iter().filter(|c| matches!(c, Cell::Null)).count(), 1);
+    // 倍精度でしか表せない値が入る。
+    insert(&core, 4, "r", "0.1");
+    assert!(select_cells(&core, &ctx(), "r")
+        .iter()
+        .any(|c| matches!(c, Cell::Float(f) if *f == 0.1f64)));
+}
+
+#[test]
+fn alter_type_widening_rewrites_rows_of_every_tenant_and_keeps_isolation() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    for (tenant, id, v) in [("owner", 1u64, 11), ("other", 1, 22), ("other", 2, 33)] {
+        let c = tenant_ctx(tenant);
+        let mut s = SessionState::default();
+        core.execute_sql_in_session(
+            &c,
+            &mut s,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, qty) VALUES ({id}, '[0.1,0.2]', {v}) USING OPERATION_ID 'op-{tenant}-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ALTER COLUMN qty TYPE BIGINT"),
+    )
+    .expect("widen");
+    let owner = select_cells(&core, &tenant_ctx("owner"), "qty");
+    assert_eq!(owner.len(), 1);
+    assert!(matches!(owner[0], Cell::SignedInteger(11)));
+    let mut other: Vec<i64> = select_cells(&core, &tenant_ctx("other"), "qty")
+        .into_iter()
+        .map(|c| match c {
+            Cell::SignedInteger(v) => v,
+            o => panic!("unexpected {o:?}"),
+        })
+        .collect();
+    other.sort_unstable();
+    assert_eq!(other, vec![22, 33]);
+}
+
+#[test]
+fn alter_type_non_widening_numeric_changes_stay_42804_and_leave_data_intact() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN big BIGINT"),
+    )
+    .expect("add bigint");
+    run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN r REAL"),
+    )
+    .expect("add real");
+    run(
+        &core,
+        &mut session,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN d DOUBLE PRECISION"),
+    )
+    .expect("add double");
+    insert(&core, 1, "qty, big, r, d", "7, 8, 1.5, 2.5");
+    for sql in [
+        "ALTER TABLE docs ALTER COLUMN big TYPE INTEGER",
+        "ALTER TABLE docs ALTER COLUMN d TYPE REAL",
+        "ALTER TABLE docs ALTER COLUMN qty TYPE INTEGER",
+        "ALTER TABLE docs ALTER COLUMN r TYPE REAL",
+        "ALTER TABLE docs ALTER COLUMN r TYPE BIGINT",
+        "ALTER TABLE docs ALTER COLUMN qty TYPE DOUBLE PRECISION",
+    ] {
+        assert_eq!(code_of(&core, &mut session, sql), "42804", "{sql}");
+    }
+    assert!(matches!(
+        select_cells(&core, &ctx(), "qty")[0],
+        Cell::SignedInteger(7)
+    ));
+    assert!(matches!(
+        select_cells(&core, &ctx(), "r")[0],
+        Cell::Float(f) if f == 1.5
+    ));
+}
+
+#[test]
+fn alter_type_widening_of_key_columns_is_rejected_with_2bp01() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE kp (k INTEGER PRIMARY KEY, u INTEGER, UNIQUE (u), f REAL)",
+    )
+    .expect("create kp");
+    run(
+        &core,
+        &mut session,
+        "CREATE TABLE kc (ref INTEGER, FOREIGN KEY (ref) REFERENCES kp (k))",
+    )
+    .expect("create kc");
+    for sql in [
+        "ALTER TABLE kp ALTER COLUMN k TYPE BIGINT",
+        "ALTER TABLE kp ALTER COLUMN u TYPE BIGINT",
+        "ALTER TABLE kc ALTER COLUMN ref TYPE BIGINT",
+    ] {
+        assert_eq!(code_of(&core, &mut session, sql), "2BP01", "{sql}");
+    }
+    // 制約に関与しない REAL 列は受理される。
+    run(
+        &core,
+        &mut session,
+        "ALTER TABLE kp ALTER COLUMN f TYPE DOUBLE PRECISION",
+    )
+    .expect("widen non-key real");
 }

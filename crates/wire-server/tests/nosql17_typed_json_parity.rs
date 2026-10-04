@@ -300,6 +300,69 @@ fn assert_aggregate_parity(
     body_utf8(&resp)
 }
 
+// ------------------------------------------------- 指数表記（Issue #1358）
+
+/// NUMERIC(10,2) 列への指数表記の JSON 数値・数値文字列が HTTP `insert` で受理され、
+/// SQL `INSERT`（数値トークン・文字列リテラル）と同じ値で `scan` に現れる。桁数超過は
+/// `22003`（HTTP 400）で行が増えない。
+#[test]
+fn numeric_exponent_json_number_matches_sql() {
+    let (core, _g) = new_core();
+    let addr = spawn(Arc::clone(&core));
+    // (id, JSON の amount 断片, SQL の amount リテラル)
+    let cases: [(u64, &str, &str); 4] = [
+        (1, "1.5e2", "1.5e2"),
+        (2, "-5E-3", "-5E-3"),
+        (3, "\"2.5e1\"", "'2.5e1'"),
+        (4, "1e+3", "1e+3"),
+    ];
+    for (id, json, sql) in cases {
+        let body = format!(
+            r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":{id},"embedding":[0.5,0.25],"lang":"ja","amount":{json}}}],"operation_id":"exp-nosql-{id}"}}"#
+        );
+        let resp = alice(addr, &body);
+        assert_eq!(resp.status, 200, "exponent insert {json}: {resp:?}");
+        sql_exec(
+            &core,
+            "tenant-a",
+            &format!(
+                "INSERT INTO {SQL_TABLE} (id, embedding, lang, amount) VALUES \
+                 ({id}, '[0.5,0.25]', 'ja', {sql}) USING OPERATION_ID 'exp-sql-{id}'"
+            ),
+        );
+    }
+    let scan = format!(
+        r#"{{"op":"scan","table":"{NOSQL_TABLE}","columns":["id","amount"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+    );
+    let resp = alice(addr, &scan);
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        &format!("SELECT id, amount FROM {SQL_TABLE} ORDER BY id ASC LIMIT 100"),
+    );
+    let body = body_utf8(&resp);
+    assert_eq!(body, oracle);
+    for expected in ["150.00", "-0.01", "25.00", "1000.00"] {
+        assert!(body.contains(expected), "{expected} missing: {body}");
+    }
+
+    // NUMERIC(10,2) の整数部は 8 桁まで。1e8 は桁あふれ（22003）で行は増えない。
+    let resp = alice(
+        addr,
+        &format!(
+            r#"{{"op":"insert","table":"{NOSQL_TABLE}","rows":[{{"id":9,"embedding":[0.5,0.25],"lang":"ja","amount":1e8}}],"operation_id":"exp-nosql-9"}}"#
+        ),
+    );
+    assert_eq!(resp.status, 400, "{resp:?}");
+    assert!(body_utf8(&resp).contains("22003"), "{}", body_utf8(&resp));
+    let resp = alice(
+        addr,
+        &agg_body(NOSQL_TABLE, r#"{"fn":"count","column":"*"}"#, ""),
+    );
+    assert!(body_utf8(&resp).contains("[[4]]"), "{}", body_utf8(&resp));
+}
+
 // ---------------------------------------------------------------- 往復
 
 /// seed の自己検査: 4 行が両テーブルに入っていることを固定する。
@@ -488,6 +551,167 @@ fn numeric_temporal_uuid_element_arrays_round_trip_matches_sql() {
         "null,null,null,null,null,null",
     ] {
         assert!(body.contains(needle), "missing {needle}: {body}");
+    }
+}
+
+/// Issue #1357: `NUMERIC`・`BYTEA`・`JSON`・`JSONB`・`ENUM` 要素の配列列も HTTP
+/// `insert`→`scan` が SQL `INSERT`→`SELECT` とバイト一致する（要素の NULL・空配列・
+/// 列ごとの `null` を含む）。型不一致・base64 不正・語彙外・要素数超過の分類も固定する。
+#[test]
+fn numeric_bytea_json_enum_element_arrays_round_trip_matches_sql() {
+    const X_NOSQL: &str = "xarr_nosql";
+    const X_SQL: &str = "xarr_sql";
+    let path = temp_db::unique_db_path("nosql17-typed-json-ext-arrays");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let mood = storage
+        .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+        .expect("create enum type");
+    let schema_of = |name: &str| {
+        let arr = |elem| ColumnType::Array(ArrayType::new(elem, 4).expect("array type"));
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new(
+                    "nums",
+                    arr(ArrayElemType::Numeric {
+                        precision: 8,
+                        scale: 2,
+                    }),
+                    true,
+                ),
+                ColumnDef::new("blobs", arr(ArrayElemType::Bytea), true),
+                ColumnDef::new("js", arr(ArrayElemType::Json), true),
+                ColumnDef::new("jb", arr(ArrayElemType::Jsonb), true),
+                ColumnDef::new(
+                    "moods",
+                    ColumnType::Array(ArrayType::new_enum(mood.clone(), 4).expect("array type")),
+                    true,
+                ),
+            ],
+        )
+    };
+    for t in [X_NOSQL, X_SQL] {
+        storage.create_table(&schema_of(t)).expect("create table");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addr = spawn(Arc::clone(&core));
+
+    let rows: [(u64, &str, &str, &str); 3] = [
+        (
+            1,
+            r#""nums":[1.5,null,"2.25"],"blobs":["AQI=",null,""],"js":[{"b":1,"a":[1,2]},null,[3]],"jb":[{"b":1,"a":[1,2]},null],"moods":["happy",null,"sad"]"#,
+            "nums, blobs, js, jb, moods",
+            r#"'{1.5,NULL,2.25}', '{"\\x0102",NULL,"\\x"}', '{"{\"a\":[1,2],\"b\":1}",NULL,"[3]"}', '{"{\"a\":[1,2],\"b\":1}",NULL}', '{happy,NULL,sad}'"#,
+        ),
+        (
+            2,
+            r#""nums":[],"blobs":[],"js":[],"jb":[],"moods":[]"#,
+            "nums, blobs, js, jb, moods",
+            "'{}', '{}', '{}', '{}', '{}'",
+        ),
+        (
+            3,
+            r#""nums":null,"blobs":null,"js":null,"jb":null,"moods":null"#,
+            "",
+            "",
+        ),
+    ];
+    for (id, json, sql_cols, sql_vals) in rows {
+        let body = format!(
+            r#"{{"op":"insert","table":"{X_NOSQL}","rows":[{{"id":{id},"embedding":[0.5,0.25],{json}}}],"operation_id":"xarr-nosql-{id}"}}"#
+        );
+        let resp = alice(addr, &body);
+        assert_eq!(resp.status, 200, "array insert must succeed: {resp:?}");
+        let sql = if sql_cols.is_empty() {
+            format!(
+                "INSERT INTO {X_SQL} (id, embedding) VALUES ({id}, '[0.5,0.25]') \
+                 USING OPERATION_ID 'xarr-sql-{id}'"
+            )
+        } else {
+            format!(
+                "INSERT INTO {X_SQL} (id, embedding, {sql_cols}) VALUES \
+                 ({id}, '[0.5,0.25]', {sql_vals}) USING OPERATION_ID 'xarr-sql-{id}'"
+            )
+        };
+        sql_exec(&core, "tenant-a", &sql);
+    }
+
+    let scan = |t: &str| {
+        format!(
+            r#"{{"op":"scan","table":"{t}","columns":["id","nums","blobs","js","jb","moods"],"sort":[{{"column":"id","dir":"asc"}}],"limit":100}}"#
+        )
+    };
+    let resp = alice(addr, &scan(X_NOSQL));
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let body = body_utf8(&resp);
+    let oracle = sql_oracle_body(
+        &core,
+        "tenant-a",
+        &format!("SELECT id, nums, blobs, js, jb, moods FROM {X_NOSQL} ORDER BY id ASC LIMIT 100"),
+    );
+    assert_eq!(body, oracle, "HTTP scan vs SQL SELECT (NoSQL-inserted)");
+    assert_eq!(
+        body_utf8(&alice(addr, &scan(X_SQL))),
+        body,
+        "NoSQL-inserted vs SQL-inserted table"
+    );
+    for needle in [
+        r#""type":"numeric[]""#,
+        r#""type":"bytea[]""#,
+        r#""type":"json[]""#,
+        r#""type":"jsonb[]""#,
+        r#""type":"enum[]""#,
+        "[1.50,null,2.25]",
+        r#"["AQI=",null,""]"#,
+        // JSON／JSONB 要素は native JSON 値（キー昇順の正規形）で出力される。
+        r#"[{"a":[1,2],"b":1},null,[3]]"#,
+        r#"["happy",null,"sad"]"#,
+        "[],[],[],[],[]",
+        "null,null,null,null,null",
+    ] {
+        assert!(body.contains(needle), "missing {needle}: {body}");
+    }
+
+    // filter `eq` は `array_literal_text` 経由で配列列にも効く（行 1 だけに一致）。
+    for filter in [
+        r#"{"column":"moods","op":"eq","value":["happy",null,"sad"]}"#,
+        r#"{"column":"nums","op":"eq","value":["1.50",null,2.25]}"#,
+        r#"{"column":"blobs","op":"eq","value":["AQI=",null,""]}"#,
+        r#"{"column":"js","op":"eq","value":[{"a":[1.0,2],"b":1},null,[3]]}"#,
+    ] {
+        let body = format!(
+            r#"{{"op":"scan","table":"{X_NOSQL}","columns":["id"],"filter":[{filter}],"limit":10}}"#
+        );
+        let resp = alice(addr, &body);
+        assert_eq!(resp.status, 200, "{filter}: {resp:?}");
+        let text = body_utf8(&resp);
+        assert!(text.contains("[[1]]"), "{filter}: {text}");
+    }
+
+    // 型不一致 42601・base64 不正 22P02・語彙外 22P02・要素数超過 54000。
+    for (fragment, status_code) in [
+        (r#""nums":[true]"#, "42601"),
+        (r#""blobs":[1]"#, "42601"),
+        (r#""blobs":["***"]"#, "22P02"),
+        (r#""js":[1]"#, "42601"),
+        (r#""moods":["ecstatic"]"#, "22P02"),
+        (r#""moods":["happy","sad","happy","sad","happy"]"#, "54000"),
+    ] {
+        let body = format!(
+            r#"{{"op":"insert","table":"{X_NOSQL}","rows":[{{"id":9,"embedding":[0.5,0.25],{fragment}}}],"operation_id":"xarr-bad"}}"#
+        );
+        let resp = alice(addr, &body);
+        assert!(resp.status >= 400, "{fragment} must be rejected: {resp:?}");
+        assert!(
+            body_utf8(&resp).contains(status_code),
+            "{fragment}: expected {status_code}, got {}",
+            body_utf8(&resp)
+        );
     }
 }
 

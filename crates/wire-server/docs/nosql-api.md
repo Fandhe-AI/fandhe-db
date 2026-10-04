@@ -410,7 +410,7 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   nosql-typed-json-binding.md` 参照）: `INTEGER`／`BIGINT` は JSON 整数
   （小数・指数表記は `22P02`、非数値は `42601`。範囲外は `22003`）、`REAL`／`DOUBLE PRECISION`
   は JSON 数値（指数表記を受理。範囲外は `22003`）、`NUMERIC` は JSON 数値または数値文字列
-  （桁あふれは `22003`）、`BOOLEAN` は JSON 真偽値、`DATE`／`TIMESTAMP`／
+  （指数表記を受理しシフト後に列の scale へ丸める。桁あふれは `22003`。Issue #1358）、`BOOLEAN` は JSON 真偽値、`DATE`／`TIMESTAMP`／
   `UUID` は JSON 文字列（書式違反は `22007`、範囲外・暦上不正は `22008`、`UUID` の形式不正は `22P02`）、
   `TEXT[]`／`BOOLEAN[]` は JSON 配列（要素種別不一致は `42601`、要素数
   超過は `54000`）。`TEXT`／`VECTOR`（旧来型）の型不一致のみ引き続き
@@ -552,9 +552,9 @@ SQL 表層とのパリティ・RLS-9 応答同一性・台帳のプロセス・�
 部分完了の意味論**で、一致行をチャンク単位に commit しながら処理する（Issue #1130・
 NOSQL-12・RECOVER-11。設計判断は `docs/design/partitioned-dml.md` 10 節）。
 
-- 述語の語彙は、既存の述語形 `update`／`delete` の `filter` と同じ（Issue #1197 で
-  追加した `ne`・`like`・`between`・`is_null`・`not_null`・`not` を含む）。`lt`・`gt`・`or`
-  などはこれまでどおり `42601`
+- 述語の語彙は、既存の述語形 `update`／`delete` の `filter` と同じ（`search` と同じ語彙。
+  Issue #1197 の `ne`・`like`・`between`・`is_null`・`not_null`・`not`、Issue #1356 の
+  範囲比較・`in`・`or`・数値列の各語彙を含む）
 - `operation_id` は必須（欠落は `23502`）。内容照合ハッシュのドメインは SQL 表層の分割実行と
   共有するため、表層を跨いだ同一 `operation_id` の再送で、中断ジョブの再開・完了済みへの
   `23505`・内容不一致の `22023` が SQL 表層と一致する。原子的な述語形（`mode` なし）とは
@@ -697,9 +697,8 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefix` の 2 語彙・
 `AND` のみだった。Issue #1197 で `ne`・`between`・`like`・`is_null`／
 `not_null`・`not` グループを追加）。`update`／`delete` の述語形（Issue #1062）でも
-同じ配列表現を使うが、対応語彙は `eq`／`ne`／`prefix`／`like`／`between`／
-`is_null`／`not_null` と `not` グループ・`AND` 結合のみに留まる（範囲比較・`IN`・
-`OR` グループへの拡張は Issue #1118 が明示的に対象外とした。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
+同じ配列表現を使い、Issue #1356 以降は `search` と同じ語彙を受理する
+（`ARRAY`／`JSON`／`JSONB` 列への `eq`／`ne` を除く。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
 台帳照合 `23505`／`22023`〕は各 op の節を参照）。
 
 ```json
@@ -779,15 +778,16 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   委譲する
 - `in` は `TEXT`／`ENUM`（文字列配列）・`DATE`／`TIMESTAMP`／`UUID`（文字列配列）・
   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 の JSON string の
-  配列）のみ受理する。他の列型は engine 側の「IN 非対応列」判定（`22000`）へ
-  委譲する
+  配列）・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`（JSON 数値の配列。
+  非数値要素は `42601`。SQL の数値リテラル `col IN (1, 2)` と同じく
+  `col = 1 OR col = 2` の式レーンへ展開し、要素 1 個は平坦化する。Issue #1356）のみ
+  受理する。他の列型（`BOOLEAN`／`VECTOR`）は engine 側の「IN 非対応列」判定
+  （`22000`）へ委譲する
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
   JSON 数値のみ受理し（文字列・真偽値は型不一致）、式レーン
   （`udf_call::bind_expr`）で束縛する（Issue #1183）。`BIGINT` の |値| が
   2^53 を超える場合（JSON リテラル・格納値とも）は `22003`（`NumericOutOfRange`。HTTP は `400`）。`TEXT` の範囲比較も
-  式レーン（バイト順）で受理する。`in` は数値列では従来どおり `22000`。
-  述語形 `update`／`delete` の `filter` では数値列の `eq`／`ne`／`between` を
-  `0A000` で拒否する
+  式レーン（バイト順）で受理する
 - `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
 - `in` は列型に関わらず対応する場合のみ受理する（対象外の列型は `22000`）
 - 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は
@@ -825,17 +825,21 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 `AND` のみの既存回帰）・`crates/wire-server/tests/nosql14_filter_operators.rs`
 （範囲比較・`IN`・`OR`。Issue #945）。
 
-**`update`／`delete` の `filter`（述語形）における対応範囲**: 範囲比較 6 語彙・
-`in`・`or` グループは `search`／`scan`／`aggregate` 専用。`update`／`delete` の
-`filter` は `eq`／`ne`／`prefix`／`like`／`between`／`is_null`／`not_null` と、
-それらを包む `not` グループ・`AND` 結合のみに対応し（Issue #1197。SQL の述語形
-`UPDATE`／`DELETE` と同一の構文形へ写像するため、SQL⇄NoSQL の台帳照合も成立
-する）、範囲比較・`in`・`or`（`not` の内側を含む）を渡すと [`filter::
-map_predicate_dml_items`](../src/http/query/filter.rs) が
-`FilterError::UnsupportedOperatorForPredicateDml`（`42601`）で拒否する
-（Issue #1118 が明示的に対象外とした範囲。上記「`update`」「`delete`」節参照）。
-数値列（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`）への `eq`／`ne`／`between`
-は `0A000`。
+**`update`／`delete` の `filter`（述語形）における対応範囲**: `search`／`scan`／
+`aggregate` と同じ語彙（`eq`／`ne`／`prefix`／`like`／範囲比較 6 語彙／`in`／
+`between`／`is_null`／`not_null`、それらを包む `not`・`or` グループ、`AND` 結合）を
+受理する（Issue #1356。数値列〔`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`〕の
+`eq`／`ne`／`between`／範囲比較／`in` を含む）。SQL の述語形 `UPDATE`／`DELETE`
+（SQL-19）と同一の構文形（`WherePredicate`）へ写像するため、同じ述語は同じ結果集合・
+同じ `wire_code` になり、SQL⇄NoSQL の台帳照合（`23505`／`22023`）も成立する。
+例外は `ARRAY`／`JSON`／`JSONB` 列への `eq`／`ne`（`0A000`。構文形へ写せないため。
+`in` は従来どおり `42601`）。述語の葉の上限（256。超過は `54000`）は変わらない。
+数値列の `in` は JSON 上で 1 葉として事前検査されるが engine の事後検査は展開後の
+式を 1 個ずつ数えるため、他に葉があり `in` が 256 要素ちょうどのとき NoSQL だけが
+`54000` になりうる（拒否側に倒れる既知の差分）。実装は
+[`filter::bind_filter_where_predicates`](../src/http/query/filter.rs)、検証コードは
+`crates/wire-server/tests/nosql12_predicate_dml_numeric_filter.rs`・
+`nosql12_update_delete.rs`。
 
 ## `explain`
 

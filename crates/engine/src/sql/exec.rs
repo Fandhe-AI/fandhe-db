@@ -1512,11 +1512,6 @@ pub(crate) fn execute_statement_with_cache(
                                     && index.built_table_generation()
                                         == snapshot.built_table_generation_for_index()
                                 {
-                                    let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
-                                        .expr_filters
-                                        .iter()
-                                        .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
-                                        .collect();
                                     // 数値・日時・`NUMERIC`・`UUID` 列の範囲
                                     // 述語（`FilterOp::TypedCompare`。Issue
                                     // #891・TASK-199 で production 結線済み）は
@@ -1524,10 +1519,12 @@ pub(crate) fn execute_statement_with_cache(
                                     // 渡り、`ScalarIndex::candidates_for` が
                                     // 内部で振り分ける（Issue #893 production
                                     // 接続）。
-                                    match index.resolve_candidates(
-                                        &bound.metadata_filters,
-                                        &id_preds,
-                                    ) {
+                                    match match crate::sql::scalar_plan::collect_expr_index_predicates(&bound.expr_filters) {
+                                        Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
+                                        // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
+                                        // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
+                                        None => crate::sql::scalar_index::CandidateResolution::FallbackNoIndex,
+                                    } {
                                         crate::sql::scalar_index::CandidateResolution::Use(
                                             slots,
                                         ) => {
@@ -5005,7 +5002,12 @@ fn execute_upsert_inner(
 /// （codex-review P1 指摘・PR #221。security.md P0）。行形 `INSERT`
 /// （[`execute_insert`]）はガードを関数内部で自己完結して適用するため
 /// Issue #730 で公開 API へ昇格した対比がある（本関数は対象外のまま）。
+/// 明示トランザクション対応（Issue #1353・SQL-31・TASK-221）: `target` が `InTxn` の場合、
+/// 置換書き込みは呼び出し元（`sql::transaction`）が保持する共有 write トランザクションへ行い
+/// commit しない。`storage` はチャンク化段階のスキーマ取得用（トランザクション内は DDL 不可・
+/// 単一ライタ保持のためスキーマは BEGIN 以降不変）。`Autocommit` は従来どおり 1 文 1 トランザクション。
 pub(crate) fn execute_file_insert(
+    target: crate::tenant::WriteTarget<'_>,
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     embedder: Option<&dyn crate::embedding::Embedder>,
@@ -5035,9 +5037,16 @@ pub(crate) fn execute_file_insert(
         vector_column_index: bound.vector_column_index,
     };
 
-    let outcome =
-        crate::incremental::index_file(storage, ctx, embedder, config, &input, ledger_write)
-            .map_err(map_incremental_error)?;
+    let outcome = crate::incremental::index_file(
+        target,
+        storage,
+        ctx,
+        embedder,
+        config,
+        &input,
+        ledger_write,
+    )
+    .map_err(map_incremental_error)?;
 
     Ok(InsertOutcome {
         rows_affected: outcome.rows_replaced as u64,

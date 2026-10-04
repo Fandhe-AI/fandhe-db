@@ -785,6 +785,18 @@ fn pg_array_text(array_value: &engine::row_codec::ArrayValue) -> String {
             quote_pg_array_text_elem(&engine::datetime::format_timestamp(*v))
         }),
         ArrayValue::Uuid(items) => render(items, |v| v.to_string()),
+        // Issue #1357: NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を
+        // 含むため常に引用・エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、
+        // JSON／JSONB／ENUM は格納テキスト／ラベルを引用要否判定へ通す。出力は
+        // `engine::sql::parser::parse_array_literal` で同じ値へ往復できる。
+        ArrayValue::Numeric(items) => render(items, |d| d.to_string()),
+        ArrayValue::Bytea(items) => render(items, |b| {
+            quote_pg_array_text_elem(&engine::bytea::format_hex_text(b))
+        }),
+        ArrayValue::Json(items) | ArrayValue::Jsonb(items) => {
+            render(items, |s| quote_pg_array_text_elem(s))
+        }
+        ArrayValue::Enum(items) => render(items, |s| quote_pg_array_text_elem(s)),
     };
     format!("{{{}}}", elements.join(","))
 }

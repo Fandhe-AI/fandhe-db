@@ -404,3 +404,44 @@ fn execute_bound_predicate_update_in_session_accepts_numeric_eq_literal_text_mat
         .expect("predicate update with NUMERIC eq filter should succeed");
     assert_eq!(outcome.rows_affected, 1);
 }
+
+// ---------------------------------------------------------------------
+// Issue #1356: 述語形 DML が OR・範囲比較・IN を受理する（SQL-19 とのパリティ）
+// ---------------------------------------------------------------------
+
+#[test]
+fn execute_bound_predicate_delete_in_session_accepts_or_and_in_forms() {
+    let (core, _guard) = open_core("predicate-delete-session-or-in");
+    let owner = ctx(TENANT_A, [Visibility::Private]);
+    seed_row(&core, &owner, 1, "ja", "seed-1");
+    seed_row(&core, &owner, 2, "en", "seed-2");
+    seed_row(&core, &owner, 3, "fr", "seed-3");
+    seed_row(&core, &owner, 4, "de", "seed-4");
+
+    // OR: lang = 'ja' OR lang = 'en'
+    let outcome = core
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            TABLE,
+            Some(&op("pred-delete-or")),
+            |_schema| Ok(vec![WherePredicate::Or(vec![lang_eq("ja"), lang_eq("en")])]),
+        )
+        .expect("OR predicate delete should succeed");
+    assert_eq!(outcome.rows_affected, 2);
+
+    // IN: lang IN ('fr')
+    let outcome = core
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            TABLE,
+            Some(&op("pred-delete-in")),
+            |_schema| {
+                Ok(vec![WherePredicate::InList {
+                    column: "lang".to_string(),
+                    values: vec!["fr".to_string()],
+                }])
+            },
+        )
+        .expect("IN predicate delete should succeed");
+    assert_eq!(outcome.rows_affected, 1);
+}

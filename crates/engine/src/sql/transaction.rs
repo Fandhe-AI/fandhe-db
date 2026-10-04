@@ -28,9 +28,9 @@
 //! 持つ間（[`SessionTransaction::dirty_tables`] が非空）は、共有書き込み
 //! トランザクションを読み取り源（`storage::read_source::ReadSource`）にして同じ
 //! 実行本体で読み、未 commit の変更を反映する（テーブル世代キーのキャッシュは使わない）。
-//! 残る既知の逸脱は、LLM I/O と世代の再照合を伴う `USING PLAN` の検索 SELECT・
-//! `EXPLAIN` で、対象テーブルが dirty のとき `0A000` で拒否する（黙って古い結果を
-//! 返さない）。詳細は `docs/design/explicit-transaction.md` 参照。
+//! `USING PLAN` の検索 SELECT・`EXPLAIN`・ファイル形 `INSERT` も受け付ける（Issue #1353。
+//! カタログは確定済み、辞書と行の読みは共有書き込みトランザクションから。辞書はキャッシュしない）。
+//! 詳細は `docs/design/explicit-transaction.md` 参照。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -547,7 +547,7 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// `table` の内容が同一トランザクション内で変わっている（dirty）かどうか
-    /// （読み取り時の `0A000` 判定に使う。§2.5 の既知の逸脱）。文が直接書き込んだ
+    /// （`sql::relation::ensure_relations_not_written` が使う）。文が直接書き込んだ
     /// テーブルに加え、参照アクションの連鎖で書き換わった子テーブルも含む
     /// （[`Self::dirty_tables`]。連鎖先を取りこぼすと、確定済みスナップショットの
     /// 古い内容を黙って返してしまう）。dirty 集合の取得に失敗した場合は

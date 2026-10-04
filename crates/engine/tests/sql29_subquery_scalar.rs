@@ -735,6 +735,8 @@ fn scalar_subquery_stays_rejected_in_non_subquery_contexts() {
         format!(
             "EXPLAIN SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 10"
         ),
+        // `LIMIT` の無い広域取得は評価後射影形ビューの本文にできない（`LIMIT` 付きの
+        // サブクエリ本文は受理される。`table18_view.rs` の Issue #1360 のテスト参照）。
         format!(
             "CREATE VIEW v1 AS SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"
         ),

@@ -665,8 +665,11 @@ pub(crate) fn bind_datetime_literal(
 /// `NULL` として扱い（TEXT 以外の要素型では通常の要素として型変換に回す）。
 pub fn parse_array_literal(
     literal: &str,
-    array_ty: crate::catalog::ArrayType,
+    array_ty: impl std::borrow::Borrow<crate::catalog::ArrayType>,
 ) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
+    // `ArrayType` は `ENUM` 要素の語彙（`Arc`）を持ち `Copy` ではないため、値渡し・
+    // 参照渡しのどちらの呼び出し元も受けられるよう `Borrow` で受ける（Issue #1357）。
+    let array_ty: &crate::catalog::ArrayType = array_ty.borrow();
     if literal.len() > MAX_ARRAY_LITERAL_BYTES {
         return Err(SqlSurfaceError::payload_too_large(format!(
             "array literal length {} exceeds limit {MAX_ARRAY_LITERAL_BYTES}",
@@ -786,7 +789,7 @@ pub fn parse_array_literal(
         }
     }
 
-    convert_array_elements(array_ty.elem(), raw_elements)
+    convert_array_elements(array_ty, raw_elements)
 }
 
 /// 切り出し済みの配列要素（`None` は NULL 要素）を要素型へ変換する
@@ -796,10 +799,11 @@ pub fn parse_array_literal(
 /// 委譲し、エラー分類（`22P02`／`22003`／`22007`／`22008`）を列と揃える
 /// （Issue #1193）。
 fn convert_array_elements(
-    elem: crate::catalog::ArrayElemType,
+    array_ty: &crate::catalog::ArrayType,
     raw_elements: Vec<Option<String>>,
 ) -> Result<crate::row_codec::ArrayValue, SqlSurfaceError> {
     use crate::catalog::ArrayElemType as E;
+    let elem = array_ty.elem();
     use crate::row_codec::{ArrayValue, Value};
 
     fn map_all<T>(
@@ -890,6 +894,65 @@ fn convert_array_elements(
             }),
         })
         .map(ArrayValue::Uuid),
+        // Issue #1357: NUMERIC・BYTEA・JSON・JSONB・ENUM 要素もスカラー列と同じ束縛関数へ
+        // 委譲し、エラー分類（`22P02`／`22003`／`54000`）を列と揃える。
+        E::Numeric { precision, scale } => {
+            map_all(&raw_elements, |raw| {
+                match bind_numeric_literal(
+                    &InsertLiteral::String(raw.to_string()),
+                    NAME,
+                    precision,
+                    scale,
+                )? {
+                    Value::Numeric(v) => Ok(v),
+                    _ => Err(SqlSurfaceError::Internal {
+                        detail: "numeric array element bound to a different value type".to_string(),
+                    }),
+                }
+            })
+            .map(ArrayValue::Numeric)
+        }
+        E::Bytea => map_all(&raw_elements, |raw| match bind_bytea_literal(raw, NAME)? {
+            Value::Bytes(v) => Ok(v),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "bytea array element bound to a different value type".to_string(),
+            }),
+        })
+        .map(ArrayValue::Bytea),
+        E::Json => map_all(&raw_elements, |raw| {
+            match bind_json_literal(raw, &ColumnType::Json, NAME)? {
+                Value::Json(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "json array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Json),
+        E::Jsonb => map_all(&raw_elements, |raw| {
+            match bind_json_literal(raw, &ColumnType::Jsonb, NAME)? {
+                Value::Json(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "jsonb array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Jsonb),
+        E::Enum => {
+            let def = array_ty
+                .enum_def()
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "enum array type has no type definition".to_string(),
+                })?;
+            map_all(&raw_elements, |raw| {
+                match bind_enum_literal(def, raw, NAME)? {
+                    Value::Enum(v) => Ok(v),
+                    _ => Err(SqlSurfaceError::Internal {
+                        detail: "enum array element bound to a different value type".to_string(),
+                    }),
+                }
+            })
+            .map(ArrayValue::Enum)
+        }
     }
 }
 
@@ -2395,7 +2458,7 @@ fn bind_insert_row(
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
+                crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
             }
             (
                 ColumnType::Array(_),
@@ -2804,7 +2867,7 @@ fn bind_set_assignments(
                 )))
             }
             (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
-                crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
+                crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
             }
             (
                 ColumnType::Array(_),
@@ -3926,7 +3989,7 @@ fn bind_upsert_assignments(
                         )))
                     }
                     (ColumnType::Array(array_ty), InsertLiteral::String(s)) => {
-                        crate::row_codec::Value::Array(parse_array_literal(s, *array_ty)?)
+                        crate::row_codec::Value::Array(parse_array_literal(s, array_ty)?)
                     }
                     (ColumnType::Array(_), InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(

@@ -27,6 +27,16 @@
 //!   にも無い場合（baseline）と一致すること
 //! - T5 3 テナント回転と試行総数の固定（ループの空回り防止）
 //! - T6 負の対照: 捏造した違反を検査器が検出できること
+//! - T7 経路間パリティ: 同一形状の応答と自テナントの事後物理状態が autocommit と
+//!   明示トランザクションで完全一致すること
+//!
+//! 実行経路（Issue #1355。ポインタ: SQL-31・RECOVER-12）: 全形状を autocommit
+//! （`execute_sql_in_session`／`begin_copy`＋`commit_copy_in`）と、明示トランザクション
+//! （`BEGIN` → 形状 → 成功なら同一トランザクション内の読み戻し → `COMMIT`。エラー時は
+//! `Failed` 遷移・`COMMIT` の `25P02` 拒否・`ROLLBACK`。`execute_sql_in_txn`／
+//! `begin_copy_in_txn`／`commit_copy_in_txn`）の 2 経路で実行し、T0〜T6 の同一オラクルを
+//! 両経路へ適用する。明示トランザクション経路は書き込み本体を共有しつつ読み取り源を
+//! 共有書き込みトランザクションへ切り替えるため、越境の取りこぼしがここに現れうる。
 //!
 //! 可視性モードと書き込み対象: `docs` の Private 行（偶数 id）は、`id` 完全一致形の
 //! UPDATE では Public のみモードで対象外（0 行。SQL-17・RLS-10 (a) の可視集合どおり）。
@@ -43,7 +53,8 @@
 //! 新規に開く（失敗の連鎖と実行時間の両方を避ける）。
 //!
 //! 対象外: レイテンシ分布の統計的区別不能性（共有 CI では不安定になるため専有環境
-//! 計測の担当）、明示トランザクション内の UPDATE／DELETE、NoSQL 表層の越境
+//! 計測の担当）、`INITIALLY DEFERRED` の FK（COMMIT 時検査。`table17_foreign_key.rs`・
+//! `sql31_txn_dml.rs` の担当）、暗黙トランザクション（WIRE-16）、NoSQL 表層の越境
 //! （同一実行器へ写像されるため本ファイルの不変性で代替。NoSQL 固有の影響行数上限は
 //! `crates/wire-server/tests/nosql12_affected_rows_limit.rs` の担当）。
 
@@ -57,6 +68,7 @@ use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::{SessionTransaction, TransactionStatus};
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -433,6 +445,116 @@ fn run_copy(core: &EngineCore, ctx: &PolicyContext, sql: &str, data: &str) -> Ob
     }
 }
 
+/// 明示トランザクション内の COPY FROM（`begin_copy_in_txn` → feed/finish →
+/// `commit_copy_in_txn`）。`run_copy` の明示トランザクション版で、`run_explicit_txn` から
+/// 呼ばれる。エラーは `observe` で `wire_code`・クライアント向け文言へ正規化する。
+fn run_copy_in_txn<'e>(
+    core: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &SessionState,
+    txn: &mut SessionTransaction<'e>,
+    sql: &str,
+    data: &str,
+) -> Obs {
+    let plan = match core.begin_copy_in_txn(ctx, session, txn, sql) {
+        Ok(p) => p,
+        Err(e) => return observe(Err(e)),
+    };
+    let mut cs = match plan {
+        CopyPlan::From(s) => s,
+        CopyPlan::To(..) => panic!("expected COPY FROM plan"),
+    };
+    let res = cs
+        .feed(data.as_bytes())
+        .and_then(|_| cs.finish())
+        .and_then(|batch| core.commit_copy_in_txn(ctx, txn, batch));
+    match res {
+        Ok(o) => Obs::Ok {
+            affected: Some(o.rows_affected),
+            returned_ids: None,
+            debug: format!("{o:?}"),
+        },
+        Err(e) => observe(Err(e)),
+    }
+}
+
+/// 実行経路の次元（Issue #1355）。同一形状を autocommit と明示トランザクションの
+/// 両方で実行し、同じオラクル（T0〜T6）と経路間パリティ（T7）で検査する。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ExecPath {
+    Autocommit,
+    ExplicitTxn,
+}
+
+const EXEC_PATHS: [ExecPath; 2] = [ExecPath::Autocommit, ExecPath::ExplicitTxn];
+
+/// 明示トランザクション経路で 1 形状を実行する（`run_one` から呼ばれる）。
+/// 成功時は同一トランザクション内で読み戻し（dirty 時は共有書き込みトランザクションが
+/// 読み取り源になる）、他テナントの Private トークン件数を返したうえで `COMMIT` する。
+/// エラー時は fail-closed を能動的に表明する: `Failed` へ遷移し、`COMMIT` は `25P02` で
+/// 拒否されて `Failed` のまま（部分書き込みが確定しない）、`ROLLBACK` で `Idle` へ戻る。
+/// 状態遷移の不一致は panic（`report()` が 1 回だけ計算するため全テストが失敗する）。
+fn run_explicit_txn(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    viewer: &str,
+    sql: &str,
+    copy_data: Option<&str>,
+    what: &str,
+) -> (Obs, usize) {
+    let mut txn = core.new_session_transaction();
+    let mut session = SessionState::default();
+    core.execute_sql_in_txn(ctx, &mut session, &mut txn, "BEGIN")
+        .unwrap_or_else(|e| panic!("BEGIN must succeed ({e:?}): {what}"));
+    assert_eq!(txn.status(), TransactionStatus::InTransaction, "{what}");
+    let obs = match copy_data {
+        Some(data) => run_copy_in_txn(
+            core,
+            ctx,
+            &session,
+            &mut txn,
+            sql,
+            &data.replace("{v}", viewer),
+        ),
+        None => observe(core.execute_sql_in_txn(ctx, &mut session, &mut txn, sql)),
+    };
+    let mut leaks = 0;
+    match &obs {
+        Obs::Ok { .. } => {
+            assert_eq!(txn.status(), TransactionStatus::InTransaction, "{what}");
+            let r = core
+                .execute_sql_in_txn(
+                    ctx,
+                    &mut session,
+                    &mut txn,
+                    "SELECT body FROM docs LIMIT 1000",
+                )
+                .unwrap_or_else(|e| panic!("in-txn readback failed ({e:?}): {what}"));
+            let dump = format!("{r:?}");
+            for t in TENANTS.iter().filter(|t| **t != viewer) {
+                for id in [2, 4] {
+                    leaks += dump.matches(&format!("tok-{t}-docs-{id}\"")).count();
+                }
+            }
+            core.execute_sql_in_txn(ctx, &mut session, &mut txn, "COMMIT")
+                .unwrap_or_else(|e| panic!("COMMIT must succeed ({e:?}): {what}"));
+            assert_eq!(txn.status(), TransactionStatus::Idle, "{what}");
+        }
+        Obs::Err { .. } => {
+            assert_eq!(txn.status(), TransactionStatus::Failed, "{what}");
+            let e = core
+                .execute_sql_in_txn(ctx, &mut session, &mut txn, "COMMIT")
+                .expect_err("COMMIT in a failed transaction must be rejected");
+            assert_eq!(e.wire_code(), "25P02", "{what}");
+            assert_eq!(txn.status(), TransactionStatus::Failed, "{what}");
+            core.execute_sql_in_txn(ctx, &mut session, &mut txn, "ROLLBACK")
+                .unwrap_or_else(|e| panic!("ROLLBACK must succeed ({e:?}): {what}"));
+            assert_eq!(txn.status(), TransactionStatus::Idle, "{what}");
+        }
+    }
+    (obs, leaks)
+}
+
 // ---------- 形状 ----------
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -563,6 +685,7 @@ fn shapes() -> Vec<Shape> {
 struct Run {
     viewer: &'static str,
     allow_private: bool,
+    exec: ExecPath,
     shape: &'static str,
     axis: Axis,
     expect: Expect,
@@ -587,6 +710,7 @@ fn run_one(
     allow_private: bool,
     idx: usize,
     shape: &Shape,
+    exec: ExecPath,
 ) -> (Obs, Snapshot, usize) {
     let path = unique_db_path("rls10-write-run");
     let _guard = CleanupGuard(path.clone());
@@ -601,14 +725,26 @@ fn run_one(
             Storage::open(&path).expect("open run db"),
             Box::new(CpuScalarProvider),
         );
-        obs = match shape.copy_data {
-            Some(data) => run_copy(&core, &ctx, &sql, &data.replace("{v}", viewer)),
-            None => {
-                let mut session = SessionState::default();
-                observe(core.execute_sql_in_session(&ctx, &mut session, &sql))
+        obs = match exec {
+            ExecPath::Autocommit => match shape.copy_data {
+                Some(data) => run_copy(&core, &ctx, &sql, &data.replace("{v}", viewer)),
+                None => {
+                    let mut session = SessionState::default();
+                    observe(core.execute_sql_in_session(&ctx, &mut session, &sql))
+                }
+            },
+            ExecPath::ExplicitTxn => {
+                let what = format!(
+                    "viewer={viewer} allow_private={allow_private} shape={} path={exec:?}",
+                    shape.name
+                );
+                let (o, l) = run_explicit_txn(&core, &ctx, viewer, &sql, shape.copy_data, &what);
+                leaks += l;
+                o
             }
         };
-        // 読み戻し: 他テナントの Public 行は読み取りで可視（RLS-7）だが、Private 行
+        // 読み戻し（確定後・autocommit。明示トランザクション経路は事前にトランザクション内
+        // でも読み戻し済み）: 他テナントの Public 行は読み取りで可視（RLS-7）だが、Private 行
         // （docs の偶数 id。テスト側の真実値）は Private 込みモードでも絶対に見えない。
         let all = ctx_for(viewer, true);
         let r = core
@@ -653,27 +789,30 @@ fn report() -> &'static Vec<Run> {
             let base_own_before = split_by_tenant(&physical_snapshot(&base_tpl), viewer, true);
             let flood_own_before = split_by_tenant(&flood_pre, viewer, true);
             for allow_private in [true, false] {
-                for (idx, shape) in shapes.iter().enumerate() {
-                    let (base, base_snap, base_leaks) =
-                        run_one(&base_tpl, viewer, allow_private, idx, shape);
-                    let (flood, flood_snap, flood_leaks) =
-                        run_one(&flood_tpl, viewer, allow_private, idx, shape);
-                    runs.push(Run {
-                        viewer,
-                        allow_private,
-                        shape: shape.name,
-                        axis: shape.axis,
-                        expect: shape.expect,
-                        base,
-                        flood,
-                        base_own_before: base_own_before.clone(),
-                        flood_own_before: flood_own_before.clone(),
-                        base_own_after: split_by_tenant(&base_snap, viewer, true),
-                        flood_own_after: split_by_tenant(&flood_snap, viewer, true),
-                        foreign_before: foreign_before.clone(),
-                        foreign_after: split_by_tenant(&flood_snap, viewer, false),
-                        readback_leaks: base_leaks + flood_leaks,
-                    });
+                for exec in EXEC_PATHS {
+                    for (idx, shape) in shapes.iter().enumerate() {
+                        let (base, base_snap, base_leaks) =
+                            run_one(&base_tpl, viewer, allow_private, idx, shape, exec);
+                        let (flood, flood_snap, flood_leaks) =
+                            run_one(&flood_tpl, viewer, allow_private, idx, shape, exec);
+                        runs.push(Run {
+                            viewer,
+                            allow_private,
+                            exec,
+                            shape: shape.name,
+                            axis: shape.axis,
+                            expect: shape.expect,
+                            base,
+                            flood,
+                            base_own_before: base_own_before.clone(),
+                            flood_own_before: flood_own_before.clone(),
+                            base_own_after: split_by_tenant(&base_snap, viewer, true),
+                            flood_own_after: split_by_tenant(&flood_snap, viewer, true),
+                            foreign_before: foreign_before.clone(),
+                            foreign_after: split_by_tenant(&flood_snap, viewer, false),
+                            readback_leaks: base_leaks + flood_leaks,
+                        });
+                    }
                 }
             }
         }
@@ -683,8 +822,8 @@ fn report() -> &'static Vec<Run> {
 
 fn label(r: &Run) -> String {
     format!(
-        "viewer={} allow_private={} shape={}",
-        r.viewer, r.allow_private, r.shape
+        "viewer={} allow_private={} path={:?} shape={}",
+        r.viewer, r.allow_private, r.exec, r.shape
     )
 }
 
@@ -695,11 +834,17 @@ fn label(r: &Run) -> String {
 fn t0_positive_controls_are_non_vacuous() {
     for viewer in TENANTS {
         for allow_private in [true, false] {
-            for axis in [Axis::Write, Axis::Constraint] {
+            for (axis, exec) in EXEC_PATHS
+                .iter()
+                .flat_map(|e| [(Axis::Write, *e), (Axis::Constraint, *e)])
+            {
                 let scoped: Vec<&Run> = report()
                     .iter()
                     .filter(|r| {
-                        r.viewer == viewer && r.allow_private == allow_private && r.axis == axis
+                        r.viewer == viewer
+                            && r.allow_private == allow_private
+                            && r.axis == axis
+                            && r.exec == exec
                     })
                     .collect();
                 assert!(!scoped.is_empty());
@@ -709,7 +854,7 @@ fn t0_positive_controls_are_non_vacuous() {
                     .count();
                 assert!(
                     hits > 0,
-                    "no successful write with affected>0: viewer={viewer} allow_private={allow_private} axis={axis:?}"
+                    "no successful write with affected>0: viewer={viewer} allow_private={allow_private} axis={axis:?} path={exec:?}"
                 );
                 if axis == Axis::Constraint {
                     let violations = scoped
@@ -718,7 +863,7 @@ fn t0_positive_controls_are_non_vacuous() {
                         .count();
                     assert!(
                         violations >= 2,
-                        "own-tenant constraint violations must be observed: viewer={viewer} allow_private={allow_private}"
+                        "own-tenant constraint violations must be observed: viewer={viewer} allow_private={allow_private} path={exec:?}"
                     );
                 }
             }
@@ -907,12 +1052,18 @@ fn normalize_digits(message: &str) -> String {
 fn t4_constraint_errors_do_not_reveal_foreign_existence() {
     let mut compared = 0;
     for viewer in TENANTS {
-        for allow_private in [true, false] {
+        for (allow_private, exec) in [true, false]
+            .into_iter()
+            .flat_map(|m| EXEC_PATHS.map(|e| (m, e)))
+        {
             let pick = |name: &str| {
                 report()
                     .iter()
                     .find(|r| {
-                        r.viewer == viewer && r.allow_private == allow_private && r.shape == name
+                        r.viewer == viewer
+                            && r.allow_private == allow_private
+                            && r.exec == exec
+                            && r.shape == name
                     })
                     .expect("shape present")
             };
@@ -976,7 +1127,7 @@ fn t4_constraint_errors_do_not_reveal_foreign_existence() {
             compared += 6;
         }
     }
-    assert_eq!(compared, 36);
+    assert_eq!(compared, 72);
 }
 
 /// T5 3 テナント回転と試行総数の固定（空回りしていないこと）。
@@ -1031,16 +1182,27 @@ fn t5_rotation_covers_every_viewer_mode_and_shape() {
     let mut declared: Vec<&str> = shapes().iter().map(|s| s.name).collect();
     declared.sort();
     assert_eq!(declared, want, "declared shape set changed");
-    assert_eq!(report().len(), TENANTS.len() * 2 * EXPECTED_SHAPES.len());
+    assert_eq!(
+        report().len(),
+        TENANTS.len() * 2 * EXEC_PATHS.len() * EXPECTED_SHAPES.len()
+    );
     for viewer in TENANTS {
-        for allow_private in [true, false] {
+        for (allow_private, exec) in [true, false]
+            .into_iter()
+            .flat_map(|m| EXEC_PATHS.map(|e| (m, e)))
+        {
             let mut ran: Vec<&str> = report()
                 .iter()
-                .filter(|r| r.viewer == viewer && r.allow_private == allow_private)
+                .filter(|r| {
+                    r.viewer == viewer && r.allow_private == allow_private && r.exec == exec
+                })
                 .map(|r| r.shape)
                 .collect();
             ran.sort();
-            assert_eq!(ran, want, "viewer={viewer} allow_private={allow_private}");
+            assert_eq!(
+                ran, want,
+                "viewer={viewer} allow_private={allow_private} path={exec:?}"
+            );
         }
     }
     // 経路の網羅（書き込み系・制約系の両軸が形状に含まれる）。
@@ -1055,6 +1217,67 @@ fn t5_rotation_covers_every_viewer_mode_and_shape() {
             .count(),
         18
     );
+}
+
+/// 経路間パリティの比較器: autocommit 側 `a` と明示トランザクション側 `b` の応答が
+/// 一致する（`Obs` 全体の完全一致。デバッグ表現を含む）。
+fn paths_agree(a: &Obs, b: &Obs) -> bool {
+    a == b
+}
+
+/// T7 経路間パリティ: 同一（閲覧側, モード, 形状）で、autocommit と明示トランザクションの
+/// 応答（baseline・flooded）と自テナントの事後物理状態が完全一致する。明示トランザクション
+/// 経路だけ越境の挙動が異なる（読み取り源の切替での取りこぼし等）場合を検出する。
+#[test]
+fn t7_explicit_txn_matches_autocommit() {
+    let mut compared = 0;
+    for r in report().iter().filter(|r| r.exec == ExecPath::ExplicitTxn) {
+        let auto = report()
+            .iter()
+            .find(|a| {
+                a.exec == ExecPath::Autocommit
+                    && a.viewer == r.viewer
+                    && a.allow_private == r.allow_private
+                    && a.shape == r.shape
+            })
+            .expect("autocommit counterpart");
+        assert!(
+            paths_agree(&auto.base, &r.base),
+            "baseline response differs: {}",
+            label(r)
+        );
+        assert!(
+            paths_agree(&auto.flood, &r.flood),
+            "flooded response differs: {}",
+            label(r)
+        );
+        assert_eq!(
+            auto.base_own_after,
+            r.base_own_after,
+            "baseline own state differs: {}",
+            label(r)
+        );
+        assert_eq!(
+            auto.flood_own_after,
+            r.flood_own_after,
+            "flooded own state differs: {}",
+            label(r)
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, TENANTS.len() * 2 * shapes().len());
+    // 比較器が差分を検出する（負の対照）。
+    let x = Obs::Ok {
+        affected: Some(1),
+        returned_ids: None,
+        debug: "x".into(),
+    };
+    let y = Obs::Ok {
+        affected: Some(2),
+        returned_ids: None,
+        debug: "x".into(),
+    };
+    assert!(!paths_agree(&x, &y));
 }
 
 /// T6 負の対照: 検査器が捏造した違反を実際に検出する。

@@ -452,10 +452,12 @@ pub(crate) fn classify_aggregate_access(
         expr_filters: bound.expr_filters(),
         or_filters: bound.or_filters(),
     };
+    // 式述語の数値列（Issue #1359）も `Declared` の宣言列照合へ加える。
     let metadata_filter_columns: Vec<Option<usize>> = bound
         .metadata_filters()
         .iter()
         .map(|f| Some(f.column_index()))
+        .chain(crate::sql::scalar_plan::numeric_predicate_columns(bound.expr_filters()).map(Some))
         .collect();
     // Issue #475 の「索引対応述語のみで構成される」判定と同一
     // （`execute_aggregate_with_cache`・`execute_grouped_aggregate` の
@@ -2558,23 +2560,24 @@ fn try_scalar_index_aggregate(
         }
     };
 
-    let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
-        .expr_filters
-        .iter()
-        .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
-        .collect();
     // 数値・日時・`NUMERIC`・`UUID` 列の範囲述語（`FilterOp::TypedCompare`。
     // Issue #891・TASK-199 で production 結線済み）は `bound.metadata_filters`
     // に混在したまま渡り、`ScalarIndex::candidates_for` が内部で振り分ける
     // （Issue #893 production 接続）。
-    let slots = match index.resolve_candidates(&bound.metadata_filters, &id_preds) {
-        crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
-        crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
-        | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {
-            scalar_access.cache.record_aggregate_plain_scan_fallback();
-            return Ok(None);
-        }
-    };
+    let slots =
+        match match crate::sql::scalar_plan::collect_expr_index_predicates(&bound.expr_filters) {
+            Some(expr_preds) => index.resolve_candidates(&bound.metadata_filters, &expr_preds),
+            // 分類が `PlainScan` 以外なら到達しないが、式述語を 1 件でも落とすと
+            // 候補が上位集合になり fail-open になるため、非対応は全走査へ倒す。
+            None => crate::sql::scalar_index::CandidateResolution::FallbackNoIndex,
+        } {
+            crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
+            crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
+            | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {
+                scalar_access.cache.record_aggregate_plain_scan_fallback();
+                return Ok(None);
+            }
+        };
 
     let mut accumulators = Vec::with_capacity(bound.items.len());
     for item in &bound.items {

@@ -45,16 +45,19 @@
 //!   `TEXT`／`ENUM`／`BOOLEAN`／`VECTOR`／`ARRAY`／`JSON`／`JSONB` は
 //!   engine 側の「範囲比較非対応列」判定（`22000`）へ委譲する
 //! - `in`: `TEXT`／`ENUM`（文字列配列）・`DATE`／`TIMESTAMP`／`UUID`（文字列配列）・
-//!   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 文字列配列）。
-//!   他の列型は engine 側の「IN 非対応列」判定（`22000`）へ委譲する
+//!   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 文字列配列）・
+//!   `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`（JSON 数値の配列。SQL の
+//!   数値リテラル `col IN (1, 2)` の脱糖と同じ `col = 1 OR col = 2` の式レーン。
+//!   Issue #1356）。`BOOLEAN`／`VECTOR` は engine 側の「IN 非対応列」判定
+//!   （`22000`）へ委譲する
 //! - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
 //!   JSON 数値のみを受理し、式レーン（[`DeclarativePredicate::Expr`]。SQL の
 //!   `WHERE qty > 1` と同じ `udf_call::bind_expr` 束縛）へ渡す（Issue #1183・
 //!   NOSQL-14・NOSQL-17 ポインタ）。SQL と同じ束縛経路のため結果集合が構造的に
 //!   一致する。`TEXT` 列の範囲比較も同じ式レーン（バイト順比較）へ渡す。
-//!   述語形 `update`／`delete` の `filter`（[`bind_filter_where_predicates`]）は
-//!   数値列の `eq`／`ne`／`between` を `0A000` で拒否する（DML の filter 語彙は
-//!   意図的に狭く保つ）
+//!   述語形 `update`／`delete` の `filter`（[`bind_filter_where_predicates`]）も
+//!   数値列の `eq`／`ne`／`between`／範囲比較／`in` を受理し、SQL の述語形 DML と
+//!   同じ式述語の構文形へ写す（Issue #1356）
 //! - `VECTOR`／`ARRAY`／`JSON`／`JSONB` への `eq`／`prefix` は SQL 表層にも
 //!   レーンが無いため、従来どおり engine の「`TEXT` 列でない」判定（`22000`）へ
 //!   委譲する
@@ -76,7 +79,8 @@
 //!   （256）超過は `54000`。この事前検査は JSON 上の葉を数えるため、数値列の
 //!   `between`／`ne`／`not eq` のように展開で 1 葉が 2 葉になる場合、JSON 上で
 //!   256 葉ちょうどのとき engine の事後検査だけが `54000` になりうる（拒否側に
-//!   倒れる既知の差分）
+//!   倒れる既知の差分）。数値列の `in`（Issue #1356）も JSON 上は 1 葉だが engine の
+//!   事後検査は展開後の式を 1 個ずつ数えるため、同じ分類（拒否側）になる
 //! - `or`／`not` のネスト深さ: [`engine::sql::udf_call::MAX_EXPR_DEPTH`]（32）超過は
 //!   `54000`
 //! - `in` の要素数: [`engine::declarative_filter::MAX_IN_LIST_ITEMS`]（256）
@@ -87,18 +91,17 @@
 //! `declarative_predicate` 束縛へ委譲する第 2 の実行器は作らない。
 //!
 //! 呼び出し文脈: `scan`／`search`／`aggregate` の各 op ハンドラが `schema`・
-//! `udfs`（UDF レジストリ。`INTEGER` 系列への式レーン用に受け取るが、本 Issue の
-//! 対象外化により現時点では葉の束縛でのみ使う）が届く束縛 closure の内側で
+//! `udfs`（UDF レジストリ。`INTEGER` 系列への式レーン用）が届く束縛 closure の内側で
 //! [`bind_filter`] を呼ぶ。
 //!
 //! 対象外: op 別ハンドラからの呼び出し結線・実行そのもの、HTTP 応答へのエラー
 //! 射影（`http::status`／`http::error_body` が別途 `ErrorClass` から写像する）。
 //! `update`／`delete` op の `filter`（述語形）は本モジュールの
-//! [`bind_filter_where_predicates`]（新設・Issue #1062）を経由し、Issue #1197 で
-//! 葉 `eq`／`ne`／`prefix`／`like`／`between`／`is_null`／`not_null` と、それらを
-//! 包む `{"not": ...}` を SQL 表層と同一の `WherePredicate` AST へ写像する。
-//! 範囲比較・`in`・`or`（`not` の内側の `or` を含む）は #1118 以来の対象外のまま
-//! `42601`。形の検査は本モジュールに集約している（`schema.rs` は要素の形を
+//! [`bind_filter_where_predicates`]（新設・Issue #1062）を経由し、Issue #1356 で
+//! `search` と同じ語彙（`or`・範囲比較・`in`・数値列を含む。`ARRAY`／`JSON`／`JSONB`
+//! 列への `eq`／`ne` を除く）を SQL 表層の述語形 DML と同一の `WherePredicate` AST へ
+//! 写像する（`content_hash` を SQL と揃え、跨表層の台帳照合を成立させるため。
+//! RECOVER-10）。形の検査は本モジュールに集約している（`schema.rs` は要素の形を
 //! 検査しない）。
 
 use std::collections::BTreeMap;
@@ -107,7 +110,9 @@ use engine::catalog::{ColumnType, TableSchema};
 use engine::declarative_filter::{self, CompareOp, DeclarativeFilter};
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
-use engine::sql::allowlist::{is_allowed_where_predicate_name, SqlSurfaceError, WherePredicate};
+use engine::sql::allowlist::{
+    is_allowed_where_predicate_name, CompareOp as SyntaxCompareOp, SqlSurfaceError, WherePredicate,
+};
 use engine::sql::declarative_predicate::{self, DeclarativePredicate};
 use engine::sql::udf_call::{self, BinOp, Expr, MAX_EXPR_DEPTH};
 
@@ -125,18 +130,6 @@ pub enum FilterError {
     /// なし。`"op":"not"` 等の語彙外の値はすべてここに落ちる）。untrusted な `op` 文字列は文言へ含めない固定文言（security.md
     /// 「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
     UnsupportedOperator,
-    /// 述語形 `update`／`delete` の `filter`（[`map_predicate_dml_item`]）で
-    /// `op` が述語形 DML の許可語彙（`eq`／`ne`／`prefix`／`like`／`between`／
-    /// `is_null`／`not_null`）にない、または `or` グループを指定した
-    /// （大文字小文字読み替えなし）。
-    /// [`UnsupportedOperator`]（`search`／`scan`／`aggregate` 用。範囲比較・
-    /// `in` を許可語彙に含む文言）を共用すると、述語形 DML では実際には
-    /// 拒否される `lt`／`in` 等まで許可済みと誤案内するため独立させる
-    /// （codex-review P2 指摘対応、PR #1121）。untrusted な `op` 文字列は
-    /// 文言へ含めない固定文言（security.md 同上）。
-    ///
-    /// [`UnsupportedOperator`]: FilterError::UnsupportedOperator
-    UnsupportedOperatorForPredicateDml,
     /// `column` が RLS 述語名（`is_allowed_where_predicate_name` が真。
     /// 例: `visible`／`visible()`、大文字小文字非区別）と一致した（`or` 分岐の
     /// 内側を含め再帰的に検査する）。
@@ -168,10 +161,6 @@ pub enum FilterError {
     /// 未知列／`TEXT` 列でない／空 prefix／ENUM 語彙外／`DATE`/`TIMESTAMP`/
     /// `UUID`/`NUMERIC` の形式・範囲エラー等）をそのまま透過する。
     Bind(SqlSurfaceError),
-    /// `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較
-    /// （`0A000`。`udf_call::bind_expr` がこれらの列型の式内参照を現時点で
-    /// 受理しないため対象外。Issue #891 へ申し送り）。
-    NumericFilterNotSupported,
     /// 述語形 `update`／`delete` の `eq`／`ne`（`not` で包んだ `eq` を含む）が
     /// `ARRAY`／`JSON`／`JSONB` 列を指した（`0A000`）。これらの列値は
     /// `WherePredicate::Equality` の SQL リテラル形へ写せないため、内部エラーへ
@@ -199,7 +188,6 @@ impl ClassifiedError for FilterError {
     fn error_class(&self) -> ErrorClass {
         match self {
             FilterError::UnsupportedOperator
-            | FilterError::UnsupportedOperatorForPredicateDml
             | FilterError::RlsPredicateNotAllowed
             | FilterError::GroupShape
             | FilterError::BetweenArity
@@ -211,10 +199,7 @@ impl ClassifiedError for FilterError {
             | FilterError::LeafCountExceeded
             | FilterError::InTooMany => ErrorClass::PayloadTooLarge,
             FilterError::Bind(err) => err.error_class(),
-            FilterError::NumericFilterNotSupported
-            | FilterError::CompositeEqNotSupportedForPredicateDml => {
-                ErrorClass::FeatureNotSupported
-            }
+            FilterError::CompositeEqNotSupportedForPredicateDml => ErrorClass::FeatureNotSupported,
             FilterError::Value(err) => err.error_class(),
         }
     }
@@ -223,9 +208,6 @@ impl ClassifiedError for FilterError {
         match self {
             FilterError::UnsupportedOperator => {
                 "unsupported filter operator (only \"eq\", \"ne\", \"prefix\", \"like\", \"lt\", \"le\", \"lte\", \"gt\", \"ge\", \"gte\", \"in\", \"between\", \"is_null\" and \"not_null\" are allowed)".to_string()
-            }
-            FilterError::UnsupportedOperatorForPredicateDml => {
-                "unsupported filter operator or group for predicate-form update/delete (only \"eq\", \"ne\", \"prefix\", \"like\", \"between\", \"is_null\", \"not_null\" and \"not\" are allowed)".to_string()
             }
             FilterError::RlsPredicateNotAllowed => {
                 "filter column must not reference an RLS predicate name".to_string()
@@ -256,10 +238,6 @@ impl ClassifiedError for FilterError {
                 "filter \"in\" value exceeds the allowed number of elements".to_string()
             }
             FilterError::Bind(err) => err.client_message(),
-            FilterError::NumericFilterNotSupported => {
-                "eq/range filter on INTEGER/BIGINT/REAL/DOUBLE PRECISION columns is not supported yet"
-                    .to_string()
-            }
             FilterError::CompositeEqNotSupportedForPredicateDml => {
                 "eq/ne filter on ARRAY/JSON/JSONB columns is not supported in update/delete"
                     .to_string()
@@ -882,7 +860,7 @@ fn declare_eq(
         ColumnType::Array(array_ty) => match value {
             JsonValue::Array(items) => {
                 let text =
-                    typed_json::array_literal_text(items, *array_ty).map_err(FilterError::Value)?;
+                    typed_json::array_literal_text(items, array_ty).map_err(FilterError::Value)?;
                 Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
                     column, text,
                 )))
@@ -1011,6 +989,7 @@ fn numeric_expr_predicate(
         _ => Err(FilterError::Value(TypedJsonError::TypeMismatch(
             match kind {
                 "eq" => "eq filter value for a numeric column must be a JSON number",
+                "in" => "in filter value for a numeric column must be an array of JSON numbers",
                 _ => "range filter value for a numeric column must be a JSON number",
             },
         ))),
@@ -1096,18 +1075,33 @@ fn declare_in(
                 "in filter is not supported for ARRAY/JSON columns (use eq)",
             )))
         }
-        // INTEGER 系・BOOLEAN・VECTOR は engine 側の「IN 非対応列」判定
-        // （`22000`）へ委譲する（SQL の `col IN ('..')` を数値・真偽列へ書いた場合と
-        // 同じ結果になる）。
-        ColumnType::Integer
-        | ColumnType::BigInt
-        | ColumnType::Real
-        | ColumnType::Double
-        | ColumnType::Boolean
-        | ColumnType::Vector(_) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::in_list(
-            column,
-            Vec::new(),
-        ))),
+        // 数値 4 型は SQL の数値リテラル `col IN (1, 2)` の脱糖（`col = 1 OR col = 2`。
+        // 要素 1 個なら平坦化）と同形の式レーンへ写す（Issue #1356。各分岐は
+        // `eq` と同じ式述語）。要素は JSON 数値のみ。
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double => {
+            let mut branches = Vec::with_capacity(items.len());
+            for item in items {
+                branches.push(vec![numeric_expr_predicate(
+                    column,
+                    CompareOp::Eq,
+                    item,
+                    "in",
+                )?]);
+            }
+            match branches.len() {
+                0 => Err(FilterError::InEmpty),
+                1 => Ok(branches
+                    .pop()
+                    .and_then(|mut b| b.pop())
+                    .ok_or(FilterError::InEmpty)?),
+                _ => Ok(DeclarativePredicate::Or(branches)),
+            }
+        }
+        // BOOLEAN・VECTOR は engine 側の「IN 非対応列」判定（`22000`）へ委譲する
+        // （SQL の `col IN ('..')` を真偽列へ書いた場合と同じ結果になる）。
+        ColumnType::Boolean | ColumnType::Vector(_) => Ok(DeclarativePredicate::Leaf(
+            DeclarativeFilter::in_list(column, Vec::new()),
+        )),
     }
 }
 
@@ -1150,19 +1144,17 @@ pub(super) fn like_escape(raw: &str) -> String {
     escaped
 }
 
-/// `(column, op, value)`（列型未確定の葉。[`map_predicate_dml_item`] が
-/// 検証済み）を、SQL 表層の述語形 `UPDATE`／`DELETE`（[`engine::sql::
-/// allowlist::WherePredicate`]）が使うのと同一の構文形へ写像する
-/// （[`bind_filter_where_predicates`] 専用）。呼び出し元が先に
-/// [`declare_leaf`]`(column, op, value, schema)?` の各 `Leaf` を
-/// `DeclarativeFilter::bind` に通していることを前提とし、本関数自身は値の
-/// 型検査をしない（検証済みの `(op, 列型)` の組み合わせのみが渡る契約。
-/// 想定外の組み合わせは `Internal` で fail-closed に落とす）。
+/// 非数値列の葉 1 個（`eq`／`prefix`／`like`／`between`／`is_null`／`not_null`）を、
+/// SQL 表層の述語形 `UPDATE`／`DELETE`（[`engine::sql::allowlist::WherePredicate`]）が
+/// 使うのと同一の構文形へ写像する（[`where_predicates_for_leaf`] の下請け）。
+/// 呼び出し元が先に [`declarative_predicate::bind_declarative_predicates`] で filter
+/// 全体を検証済みであることを前提とし、本関数自身は値の型検査をしない（検証済みの
+/// `(op, 列型)` の組み合わせのみが渡る契約。想定外の組み合わせは `Internal` で
+/// fail-closed に落とす）。
 ///
 /// 各 op の写像（SQL と同一の AST にして `content_hash` を揃える。RECOVER-10）:
-/// `ne` は `Not(Equality)`／`Not(BoolEquality)`、`between` は
-/// `Between{low, high}`（リテラルは `eq` と同じ文字列リテラル形）、`like` は
-/// `Prefix{pattern: 生パターン}`（`prefix` と違いエスケープしない）、
+/// `between` は `Between{low, high}`（リテラルは `eq` と同じ文字列リテラル形）、
+/// `like` は `Prefix{pattern: 生パターン}`（`prefix` と違いエスケープしない）、
 /// `is_null`／`not_null` は `IsNull{negated}`。
 fn where_predicate_for(
     column: &str,
@@ -1192,10 +1184,6 @@ fn where_predicate_for(
                 column: column.to_string(),
                 pattern,
             });
-        }
-        "ne" => {
-            let eq = where_predicate_for(column, "eq", value, col)?;
-            return Ok(WherePredicate::Not(Box::new(eq)));
         }
         "is_null" | "not_null" => {
             return Ok(WherePredicate::IsNull {
@@ -1277,104 +1265,231 @@ fn where_predicate_for(
     }
 }
 
-/// 述語形 `update`／`delete` の `filter` 要素の中間形（[`FilterNode`] の
-/// 葉と `not` だけの部分集合。`or` は #1118 以来の対象外のまま持たない）。
-#[derive(Debug)]
-enum DmlNode<'a> {
-    Leaf {
-        column: &'a str,
-        op: &'a str,
-        value: &'a JsonValue,
-    },
-    Not(Box<DmlNode<'a>>),
+/// 数値 4 型の式述語 `<col> <op> <number>` を 1 個組み立てる（SQL の
+/// `Parser::numeric_comparison` と同じ 3 ノードを式ノード予算へ課金する。枯渇は `54000`）。
+/// `value` は JSON 数値のみ（事前検証済みの契約。違反は `Internal` で fail-closed）。
+fn numeric_where_expr(
+    column: &str,
+    op: BinOp,
+    value: &JsonValue,
+    budget: &mut usize,
+) -> Result<WherePredicate, FilterError> {
+    let JsonValue::Number(n) = value else {
+        return Err(internal_shape_error());
+    };
+    *budget = budget.checked_sub(3).ok_or_else(|| {
+        FilterError::Bind(SqlSurfaceError::PayloadTooLarge {
+            detail: "expression exceeds the allowed node count".to_string(),
+        })
+    })?;
+    Ok(WherePredicate::Expression(Expr::Binary {
+        op,
+        lhs: Box::new(Expr::Ident(column.to_string())),
+        rhs: Box::new(Expr::Number(typed_json::number_literal_text(n))),
+    }))
 }
 
-/// `update`／`delete` op の `filter`（述語形）専用の要素検証。`filter` 配列は
-/// `search`／`scan`／`aggregate` と共通の JSON 語彙を持つが、述語形 DML が受け付ける
-/// のは葉 `eq`／`ne`／`prefix`／`like`／`between`／`is_null`／`not_null` と、
-/// それらを包む `{"not": ...}`（入れ子可）だけで、範囲比較・`in`・`or`
-/// （#1118 以来の対象外。`not` の内側の `or` を含む）は
-/// [`FilterError::UnsupportedOperatorForPredicateDml`] で拒否する。
-/// 語彙・RLS の検証順序・エラー分類は [`map_element`] と揃える（`not` の内側の
-/// 葉も RLS 述語名検査を受ける。深さは [`MAX_EXPR_DEPTH`] で頭打ち）。
-fn map_predicate_dml_item(item: &JsonValue, depth: usize) -> Result<DmlNode<'_>, FilterError> {
-    if depth > MAX_EXPR_DEPTH {
-        return Err(FilterError::DepthExceeded);
+/// 検証済みのはずの filter に想定外の値形状が残っていた場合の fail-closed エラー。
+fn internal_shape_error() -> FilterError {
+    FilterError::Bind(SqlSurfaceError::Internal {
+        detail: "unexpected value shape for a validated filter".to_string(),
+    })
+}
+
+/// 列型が数値 4 型（式レーン）か。
+fn is_numeric_expr_column(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double
+    )
+}
+
+/// 範囲比較の [`CompareOp`]（`declarative_filter` 側）を構文層の [`SyntaxCompareOp`]
+/// へ写す（`Eq` は構文層に variant が無く `None`）。
+fn syntax_compare_op(cmp: CompareOp) -> Option<SyntaxCompareOp> {
+    match cmp {
+        CompareOp::Eq => None,
+        CompareOp::Lt => Some(SyntaxCompareOp::Lt),
+        CompareOp::Le => Some(SyntaxCompareOp::Le),
+        CompareOp::Gt => Some(SyntaxCompareOp::Gt),
+        CompareOp::Ge => Some(SyntaxCompareOp::Ge),
     }
-    let JsonValue::Object(map) = item else {
-        return Err(FilterError::Shape(SchemaError::TypeMismatch {
-            key: "filter_item",
+}
+
+/// 述語形 DML の葉 1 個（`ne` を除く全 op）を、SQL の同じ述語を構文解析した結果と
+/// 同一の `WherePredicate` 列へ写す（[`bind_filter_where_predicates`] の変換段）。
+/// 数値 4 型の `eq`・範囲比較は式述語、`between` は `>= low AND <= high` の 2 述語、
+/// `in` は `Or([col = n1], [col = n2], ...)`（1 要素なら平坦化）へ展開する（SQL の
+/// 数値リテラル `IN`／`BETWEEN` の脱糖と同形）。それ以外の列型の範囲比較は
+/// `Compare{value}`、`in` は `InList{values}`（値は `eq` と同じ文字列リテラル形）。
+fn where_predicates_for_leaf(
+    column: &str,
+    op: &str,
+    value: &JsonValue,
+    schema: &TableSchema,
+    budget: &mut usize,
+) -> Result<Vec<WherePredicate>, FilterError> {
+    let Some(col) = schema.columns.iter().find(|c| c.name == column) else {
+        // 未知列は filter 全体の事前検証が `22000` で拒否済みのため到達しない
+        // （fail-closed フォールバック）。
+        return Err(FilterError::Bind(SqlSurfaceError::Internal {
+            detail: "unexpected unknown column after successful filter bind".to_string(),
         }));
     };
-    if map.contains_key("or") {
-        return Err(FilterError::UnsupportedOperatorForPredicateDml);
+    let numeric = is_numeric_expr_column(&col.ty);
+    if op == "eq" && numeric {
+        return Ok(vec![numeric_where_expr(column, BinOp::Eq, value, budget)?]);
     }
-    if map.contains_key("not") {
-        if map.len() != 1 {
-            return Err(FilterError::NotShape);
-        }
-        let Some(inner @ JsonValue::Object(_)) = map.get("not") else {
-            return Err(FilterError::NotShape);
+    if op == "between" && numeric {
+        let JsonValue::Array(items) = value else {
+            return Err(internal_shape_error());
         };
-        return Ok(DmlNode::Not(Box::new(map_predicate_dml_item(
-            inner,
-            depth + 1,
-        )?)));
+        let (Some(low), Some(high)) = (items.first(), items.get(1)) else {
+            return Err(internal_shape_error());
+        };
+        return Ok(vec![
+            numeric_where_expr(column, BinOp::Ge, low, budget)?,
+            numeric_where_expr(column, BinOp::Le, high, budget)?,
+        ]);
     }
-    let (column, op, value) = extract_leaf_fields(map)?;
-    if is_rls_predicate_column(column) {
-        return Err(FilterError::RlsPredicateNotAllowed);
+    if let Some(cmp) = range_op(op) {
+        if numeric {
+            return Ok(vec![numeric_where_expr(
+                column,
+                bin_op_for(cmp),
+                value,
+                budget,
+            )?]);
+        }
+        let Some(syntax_op) = syntax_compare_op(cmp) else {
+            return Err(internal_shape_error());
+        };
+        return Ok(vec![WherePredicate::Compare {
+            column: column.to_string(),
+            op: syntax_op,
+            value: literal_text_for(&col.ty, value)?,
+        }]);
     }
-    if !matches!(
-        op,
-        "eq" | "ne" | "prefix" | "like" | "between" | "is_null" | "not_null"
-    ) {
-        return Err(FilterError::UnsupportedOperatorForPredicateDml);
-    }
-    validate_leaf_value_shape(op, value)?;
-    Ok(DmlNode::Leaf { column, op, value })
-}
-
-/// `items`（`filter` 配列。述語形 DML 専用の語彙）を検証済みの [`DmlNode`] 列へ
-/// 写像する。件数検査を `Vec` 確保・借用より前に行う（[`map_filter_items`]
-/// と同じ多層防御の判断）。
-fn map_predicate_dml_items(items: &[JsonValue]) -> Result<Vec<DmlNode<'_>>, FilterError> {
-    declarative_filter::check_filter_count(items.len()).map_err(FilterError::Bind)?;
-    items
-        .iter()
-        .map(|item| map_predicate_dml_item(item, 0))
-        .collect()
-}
-
-/// [`DmlNode`] を検証して SQL 表層と同一の [`WherePredicate`] へ変換する。
-/// 葉は [`declare_leaf`] の各 `Leaf` を `DeclarativeFilter::bind`（[`bind_filter`]
-/// の葉と同じ検証経路）に通してから [`where_predicate_for`] で構文形へ変換する
-/// （検証してから変換する不変条件）。`Not` は内側の述語 `p` が `Not(x)` なら
-/// `x`、それ以外なら `Not(p)`（SQL の `NOT <葉>` の畳み込みと同じ。
-/// `Not(IsNull)` を `IsNull` へ反転しない）。
-fn where_predicate_for_node(
-    node: &DmlNode<'_>,
-    schema: &TableSchema,
-) -> Result<WherePredicate, FilterError> {
-    match node {
-        DmlNode::Leaf { column, op, value } => {
-            // Issue #1183: 述語形 DML の `filter` は数値列の `eq`／`ne`／`between`
-            // を対象外に保つ（`declare_leaf` は数値列で式述語を返すため、ここで
-            // 先に拒否して「非 Leaf」の内部エラーへ落とさない）。
-            if matches!(*op, "eq" | "ne" | "between")
-                && schema.columns.iter().any(|c| {
-                    c.name == *column
-                        && matches!(
-                            c.ty,
-                            ColumnType::Integer
-                                | ColumnType::BigInt
-                                | ColumnType::Real
-                                | ColumnType::Double
-                        )
-                })
-            {
-                return Err(FilterError::NumericFilterNotSupported);
+    if op == "in" {
+        let JsonValue::Array(items) = value else {
+            return Err(internal_shape_error());
+        };
+        if numeric {
+            let mut branches = Vec::with_capacity(items.len());
+            for item in items {
+                branches.push(vec![numeric_where_expr(column, BinOp::Eq, item, budget)?]);
             }
+            return match branches.len() {
+                0 => Err(internal_shape_error()),
+                1 => Ok(branches.pop().unwrap_or_default()),
+                _ => Ok(vec![WherePredicate::Or(branches)]),
+            };
+        }
+        let mut values = Vec::with_capacity(items.len());
+        for item in items {
+            values.push(literal_text_for(&col.ty, item)?);
+        }
+        return Ok(vec![WherePredicate::InList {
+            column: column.to_string(),
+            values,
+        }]);
+    }
+    Ok(vec![where_predicate_for(column, op, value, col)?])
+}
+
+/// 非数値列の比較・`IN` 要素の SQL 文字列リテラル形（BYTEA は hex、NUMERIC の
+/// JSON 数値は生テキスト、それ以外の文字列はそのまま）。
+fn literal_text_for(ty: &ColumnType, value: &JsonValue) -> Result<String, FilterError> {
+    match (ty, value) {
+        (ColumnType::Bytea, JsonValue::String(s)) => {
+            typed_json::bytea_literal_text(s).map_err(FilterError::Value)
+        }
+        (ColumnType::Numeric { .. }, JsonValue::Number(n)) => {
+            Ok(typed_json::number_literal_text(n))
+        }
+        (_, JsonValue::String(s)) => Ok(s.clone()),
+        _ => Err(internal_shape_error()),
+    }
+}
+
+/// `preds`（`AND` 列）の否定を SQL の `NOT` と同じ AST で返す。単一の宣言的な葉は
+/// `Not(leaf)`（SQL の前置 `NOT <葉>`。`IsNull` は反転しない）、式述語・`Or`・
+/// 複数述語（数値 `between` 等）は engine の否定押し下げ
+/// （[`declarative_predicate::negate_where_conjunction`]。SQL の `NOT qty = 5`・
+/// `NOT ( ... )` と同じ経路。二値評価器の fail-open を避けるため群の上に否定を
+/// 残さない）へ通す。
+fn negate_where_predicates(
+    preds: Vec<WherePredicate>,
+    budget: &mut usize,
+) -> Result<Vec<WherePredicate>, FilterError> {
+    let single_leaf = matches!(
+        preds.as_slice(),
+        [WherePredicate::Equality { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. }]
+    );
+    if single_leaf {
+        return Ok(preds
+            .into_iter()
+            .map(|leaf| WherePredicate::Not(Box::new(leaf)))
+            .collect());
+    }
+    declarative_predicate::negate_where_conjunction(preds, budget).map_err(FilterError::Bind)
+}
+
+/// [`FilterNode`] を SQL 表層と同一の `WherePredicate` 列へ変換する。連続する `not` と
+/// `ne`（= `not eq`）は先に偶奇で畳む（SQL の `NOT NOT x` が `x` になる畳み込みと
+/// 同じ。畳まないと `not not qty=5` が押し下げの二重適用で別の AST になり、
+/// `content_hash` が SQL とずれる。RECOVER-10）。奇数なら [`negate_where_predicates`]。
+fn where_predicates_for_node(
+    node: &FilterNode<'_>,
+    schema: &TableSchema,
+    budget: &mut usize,
+) -> Result<Vec<WherePredicate>, FilterError> {
+    let mut odd = false;
+    let mut core = node;
+    while let FilterNode::Not(inner) = core {
+        odd = !odd;
+        core = inner;
+    }
+    let preds = match core {
+        FilterNode::Leaf { column, op, value } => {
+            let effective_op = if *op == "ne" {
+                odd = !odd;
+                "eq"
+            } else {
+                op
+            };
+            where_predicates_for_leaf(column, effective_op, value, schema, budget)?
+        }
+        FilterNode::Or(branches) => {
+            let mut converted = Vec::with_capacity(branches.len());
+            for branch in branches {
+                converted.push(where_predicates_for_node(branch, schema, budget)?);
+            }
+            vec![WherePredicate::Or(converted)]
+        }
+        // 上のループが `Not` を剥がし切るため到達しない（fail-closed）。
+        FilterNode::Not(_) => return Err(internal_shape_error()),
+    };
+    if odd {
+        negate_where_predicates(preds, budget)
+    } else {
+        Ok(preds)
+    }
+}
+
+/// 述語形 DML では `eq`／`ne` が `ARRAY`／`JSON`／`JSONB` 列を指す形を
+/// [`FilterError::CompositeEqNotSupportedForPredicateDml`] で拒否する（`or`／`not` の
+/// 内側の葉も再帰的に検査する。これらの列値は `WherePredicate::Equality` の SQL
+/// リテラル形へ写せない）。
+fn reject_composite_eq(node: &FilterNode<'_>, schema: &TableSchema) -> Result<(), FilterError> {
+    match node {
+        FilterNode::Leaf { column, op, .. } => {
             if matches!(*op, "eq" | "ne")
                 && schema.columns.iter().any(|c| {
                     c.name == *column
@@ -1386,64 +1501,56 @@ fn where_predicate_for_node(
             {
                 return Err(FilterError::CompositeEqNotSupportedForPredicateDml);
             }
-            let declared = declare_leaf(column, op, value, schema)?;
-            for pred in &declared {
-                let DeclarativePredicate::Leaf(leaf) = pred else {
-                    // 述語形 DML の語彙は（数値列を除き）常に `Leaf` へ写る。
-                    // 多層防御として明示的に拒否する。
-                    return Err(FilterError::Bind(SqlSurfaceError::Internal {
-                        detail: "unexpected non-leaf predicate for a predicate-form filter"
-                            .to_string(),
-                    }));
-                };
-                // `bind_filter` と同一の検証（未知列・型不一致等）を通す。束縛結果
-                // （`MetadataFilter`）自体は使わない——構文形への変換は独立した
-                // `where_predicate_for` が担う。
-                leaf.bind(schema).map_err(FilterError::Bind)?;
-            }
-            let Some(col) = schema.columns.iter().find(|c| c.name == *column) else {
-                // 未知列は直前の `bind` が先に `22000` で拒否済みのため到達しない
-                // （fail-closed フォールバック）。
-                return Err(FilterError::Bind(SqlSurfaceError::Internal {
-                    detail: "unexpected unknown column after successful filter bind".to_string(),
-                }));
-            };
-            where_predicate_for(column, op, value, col)
+            Ok(())
         }
-        DmlNode::Not(inner) => {
-            let p = where_predicate_for_node(inner, schema)?;
-            Ok(match p {
-                WherePredicate::Not(x) => *x,
-                other => WherePredicate::Not(Box::new(other)),
-            })
-        }
+        FilterNode::Or(branches) => branches
+            .iter()
+            .try_for_each(|branch| reject_composite_eq(branch, schema)),
+        FilterNode::Not(inner) => reject_composite_eq(inner, schema),
     }
 }
 
-/// [`map_predicate_dml_items`] の結果を `schema` へ束縛し、SQL 表層の述語形
-/// `UPDATE`／`DELETE`（`WHERE <col> = <lit> AND <col> LIKE '<pattern>'` 等）が
-/// 使うのと同一の `Vec<WherePredicate>` を得る（NoSQL 表層 `update`／`delete`
-/// op の `filter`。TASK-186・NOSQL-12、Issue #1062・#1197。宣言順を保った `AND`
-/// 結合）。[`bind_filter`]（`BoundWhereFilters` を返す。`scan`／`search`／
-/// `aggregate` 専用で範囲比較・`in`・`or` に対応）とは戻り値の型・対応語彙が
-/// 異なる別 API——述語形 DML の `content_hash`（[`engine::recovery::
-/// content_hash::for_update_where`]・`for_delete_where`）は束縛前の構文形
-/// `WherePredicate` をハッシュ源にするため、SQL 表層と同一のバイト列を
-/// 再現するには `WherePredicate` そのものが必要（`MetadataFilter` へ変換
-/// してしまうと SQL⇄NoSQL 間の台帳照合（`23505`／`22023`、RECOVER-10）が
-/// 成立しなくなる）。
+/// `items`（述語形 `update`／`delete` の `filter`）を `schema` へ束縛し、SQL 表層の
+/// 述語形 `UPDATE`／`DELETE`（SQL-19。`WHERE` を `parse_where` で構文解析した結果）と
+/// 同一の `Vec<WherePredicate>` を得る（NoSQL 表層 `update`／`delete` op の `filter`。
+/// TASK-186・NOSQL-12、Issue #1062・#1197・#1356。宣言順を保った `AND` 結合）。
+/// `search`／`scan`／`aggregate` と同じ語彙（`or`・範囲比較・`in`・数値列の
+/// `eq`／`ne`／`between` を含む。`ARRAY`／`JSON`／`JSONB` 列の `eq`／`ne` を除く）を受理する。
+///
+/// 手順: (1) [`map_filter_items`] で形・語彙・RLS 述語名・上限を検査、(2) `search` と
+/// 同じ経路（[`declare_node`] → [`declarative_predicate::bind_declarative_predicates`]）で
+/// filter 全体を束縛して検証（型不一致 `42601`・未知列／非対応列 `22000` を `search` と同じ
+/// 分類にする。engine は最終的に SQL の束縛器で再束縛する）、(3) [`where_predicates_for_node`]
+/// で構文形へ変換。述語形 DML の `content_hash`
+/// （[`engine::recovery::content_hash::for_update_where`]・`for_delete_where`）は束縛前の
+/// 構文形をハッシュ源にするため、`MetadataFilter` ではなく `WherePredicate` そのものが必要
+/// （SQL⇄NoSQL 間の台帳照合〔`23505`／`22023`、RECOVER-10〕を成立させる）。
 pub fn bind_filter_where_predicates(
     items: &[JsonValue],
     schema: &TableSchema,
 ) -> Result<Vec<WherePredicate>, FilterError> {
-    let mapped = map_predicate_dml_items(items)?;
+    let mapped = map_filter_items(items)?;
+    for node in &mapped {
+        reject_composite_eq(node, schema)?;
+    }
+    let mut declared = Vec::with_capacity(mapped.len());
+    for node in &mapped {
+        declared.extend(declare_node(node, schema)?);
+    }
+    declarative_predicate::bind_declarative_predicates(
+        &declared,
+        schema,
+        &udf_call::UdfRegistry::default(),
+    )
+    .map_err(FilterError::Bind)?;
+
+    let mut budget = udf_call::MAX_EXPR_NODES;
     let mut predicates = Vec::with_capacity(mapped.len());
     for node in &mapped {
-        predicates.push(where_predicate_for_node(node, schema)?);
+        predicates.extend(where_predicates_for_node(node, schema, &mut budget)?);
     }
     Ok(predicates)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1740,10 +1847,19 @@ mod tests {
         assert_eq!(bound.metadata_filters().len(), 1);
     }
 
+    /// Issue #1356: 数値 4 型の `in` は SQL の数値リテラル `IN` と同形の式レーンへ写る。
     #[test]
-    fn in_on_integer_column_delegates_to_engine_22000() {
-        let err = bind(r#"[{"column":"count","op":"in","value":[1,2]}]"#).expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+    fn in_on_integer_column_binds_to_expression_lane() {
+        let b = bind(r#"[{"column":"count","op":"in","value":[1,2]}]"#).expect("in int");
+        assert_eq!(b.or_filters().len(), 1);
+        assert!(b.metadata_filters().is_empty());
+        // 要素 1 個は平坦化される（`Or` を作らない）。
+        let b = bind(r#"[{"column":"count","op":"in","value":[1]}]"#).expect("in int one");
+        assert_eq!(b.expr_filters().len(), 1);
+        assert!(b.or_filters().is_empty());
+        // 非数値要素は `42601`。
+        let err = bind(r#"[{"column":"count","op":"in","value":[1,"2"]}]"#).expect_err("mismatch");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
@@ -2061,10 +2177,10 @@ mod tests {
     }
 
     #[test]
-    fn eq_on_integer_column_is_rejected_before_where_predicate_mapping() {
+    fn eq_on_integer_column_maps_to_numeric_expression_predicate() {
         let items = filter_items(r#"[{"column":"count","op":"eq","value":1}]"#);
-        let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
-        assert!(matches!(err, FilterError::NumericFilterNotSupported));
+        let bound = bind_filter_where_predicates(&items, &predicate_schema()).expect("bind ok");
+        assert_eq!(bound, vec![num_expr("count", BinOp::Eq, "1")]);
     }
 
     #[test]
@@ -2096,21 +2212,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operator_for_predicate_dml_reports_narrower_message_than_general_filter() {
-        // codex-review P2 指摘対応（PR #1121）: 述語形 DML は `eq`／`prefix` の
-        // 2 語彙しか許可しないため、`FilterError::UnsupportedOperator`（`search`／
-        // `scan`／`aggregate` 用。`lt`／`in` 等も許可語彙に含む文言）を誤って
-        // 案内しないことを確認する。
-        let items = filter_items(r#"[{"column":"lang","op":"lt","value":"ja"}]"#);
+    fn unknown_operator_for_predicate_dml_is_rejected_with_42601() {
+        // 述語形 DML も `search` と同じ語彙検査を通る（語彙外の `op` は `42601`）。
+        let items = filter_items(r#"[{"column":"lang","op":"ne ","value":"ja"}]"#);
         let err = bind_filter_where_predicates(&items, &predicate_schema()).expect_err("reject");
-        assert!(matches!(
-            err,
-            FilterError::UnsupportedOperatorForPredicateDml
-        ));
+        assert!(matches!(err, FilterError::UnsupportedOperator));
         assert_eq!(err.wire_code(), "42601");
-        let message = err.client_message();
-        assert!(message.contains("eq") && message.contains("prefix"));
-        assert!(!message.contains("\"lt\"") && !message.contains("\"in\""));
     }
 
     // --- Issue #1197・NOSQL-14: ne／between／like／is_null／not_null／not ------
@@ -2293,36 +2400,176 @@ mod tests {
         );
     }
 
+    fn num_expr(column: &str, op: BinOp, n: &str) -> WherePredicate {
+        WherePredicate::Expression(Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ident(column.to_string())),
+            rhs: Box::new(Expr::Number(n.to_string())),
+        })
+    }
+
+    fn lang_eq(v: &str) -> WherePredicate {
+        WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: v.to_string(),
+        }
+    }
+
+    /// Issue #1356: 述語形 DML の `or`・範囲比較・`in`・数値列の各形が、SQL の同じ述語を
+    /// 構文解析した結果と同じ AST へ写る（RECOVER-10 の `content_hash` パリティ）。
     #[test]
-    fn predicate_dml_rejects_or_range_in_and_numeric_forms() {
+    fn predicate_dml_maps_or_range_in_numeric_to_sql_where_ast() {
         let map =
             |json: &str| bind_filter_where_predicates(&filter_items(json), &predicate_schema());
+        let col = |c: &str| c.to_string();
+        // 範囲比較（非数値列は `Compare`、`le`／`lte` は同義）。
+        assert_eq!(
+            map(r#"[{"column":"lang","op":"lt","value":"a"}]"#).expect("lt"),
+            vec![WherePredicate::Compare {
+                column: col("lang"),
+                op: SyntaxCompareOp::Lt,
+                value: col("a"),
+            }]
+        );
+        assert_eq!(
+            map(r#"[{"column":"lang","op":"lte","value":"a"}]"#).expect("lte"),
+            map(r#"[{"column":"lang","op":"le","value":"a"}]"#).expect("le"),
+        );
+        assert_eq!(
+            map(r#"[{"column":"amount","op":"gt","value":1.5}]"#).expect("numeric gt"),
+            vec![WherePredicate::Compare {
+                column: col("amount"),
+                op: SyntaxCompareOp::Gt,
+                value: col("1.5"),
+            }]
+        );
+        // `in`（非数値は `InList`）。
+        assert_eq!(
+            map(r#"[{"column":"lang","op":"in","value":["a","b"]}]"#).expect("in"),
+            vec![WherePredicate::InList {
+                column: col("lang"),
+                values: vec![col("a"), col("b")],
+            }]
+        );
+        // 数値 4 型: 範囲比較・`between`・`in`・`ne`。
+        assert_eq!(
+            map(r#"[{"column":"count","op":"lt","value":5}]"#).expect("num lt"),
+            vec![num_expr("count", BinOp::Lt, "5")]
+        );
+        assert_eq!(
+            map(r#"[{"column":"count","op":"between","value":[1,5]}]"#).expect("num between"),
+            vec![
+                num_expr("count", BinOp::Ge, "1"),
+                num_expr("count", BinOp::Le, "5")
+            ]
+        );
+        assert_eq!(
+            map(r#"[{"column":"count","op":"in","value":[1]}]"#).expect("num in 1"),
+            vec![num_expr("count", BinOp::Eq, "1")]
+        );
+        assert_eq!(
+            map(r#"[{"column":"count","op":"in","value":[1,2]}]"#).expect("num in 2"),
+            vec![WherePredicate::Or(vec![
+                vec![num_expr("count", BinOp::Eq, "1")],
+                vec![num_expr("count", BinOp::Eq, "2")],
+            ])]
+        );
+        let ne_five = vec![WherePredicate::Or(vec![
+            vec![num_expr("count", BinOp::Lt, "5")],
+            vec![num_expr("count", BinOp::Gt, "5")],
+        ])];
+        assert_eq!(
+            map(r#"[{"column":"count","op":"ne","value":5}]"#).expect("num ne"),
+            ne_five
+        );
+        // `not` の偶奇の畳み込み: `NOT NOT qty = 5` は `qty = 5`。
+        assert_eq!(
+            map(r#"[{"not":{"not":{"column":"count","op":"eq","value":5}}}]"#).expect("nn"),
+            vec![num_expr("count", BinOp::Eq, "5")]
+        );
+        assert_eq!(
+            map(r#"[{"not":{"column":"count","op":"ne","value":5}}]"#).expect("not ne"),
+            vec![num_expr("count", BinOp::Eq, "5")]
+        );
+        assert_eq!(
+            map(r#"[{"not":{"column":"count","op":"eq","value":5}}]"#).expect("not eq"),
+            ne_five
+        );
+        // `NOT qty BETWEEN 1 AND 5` は演算子反転の `Or`。
+        assert_eq!(
+            map(r#"[{"not":{"column":"count","op":"between","value":[1,5]}}]"#).expect("nb"),
+            vec![WherePredicate::Or(vec![
+                vec![num_expr("count", BinOp::Lt, "1")],
+                vec![num_expr("count", BinOp::Gt, "5")],
+            ])]
+        );
+        // 非数値の `not` 葉は `Not(leaf)`。
+        assert_eq!(
+            map(r#"[{"not":{"column":"lang","op":"in","value":["a"]}}]"#).expect("not in"),
+            vec![WherePredicate::Not(Box::new(WherePredicate::InList {
+                column: col("lang"),
+                values: vec![col("a")],
+            }))]
+        );
+        // `or`（葉・入れ子）と `not{or}`（押し下げ）。
+        assert_eq!(
+            map(r#"[{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}]"#)
+                .expect("or"),
+            vec![WherePredicate::Or(vec![
+                vec![lang_eq("a")],
+                vec![lang_eq("b")]
+            ])]
+        );
+        assert_eq!(
+            map(r#"[{"not":{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}}]"#)
+                .expect("not or"),
+            vec![
+                WherePredicate::Not(Box::new(lang_eq("a"))),
+                WherePredicate::Not(Box::new(lang_eq("b"))),
+            ]
+        );
+        // 数値 `between` を含む `or` 分岐は AND 群を保つ。
+        assert_eq!(
+            map(r#"[{"or":[{"column":"count","op":"between","value":[1,2]},{"column":"lang","op":"eq","value":"a"}]}]"#)
+                .expect("or between"),
+            vec![WherePredicate::Or(vec![
+                vec![
+                    num_expr("count", BinOp::Ge, "1"),
+                    num_expr("count", BinOp::Le, "2")
+                ],
+                vec![lang_eq("a")],
+            ])]
+        );
+    }
+
+    #[test]
+    fn predicate_dml_rejects_invalid_forms_with_search_classification() {
+        let map =
+            |json: &str| bind_filter_where_predicates(&filter_items(json), &predicate_schema());
+        // 型不一致（数値列に文字列）は `42601`。
         for json in [
-            r#"[{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}]"#,
-            r#"[{"not":{"or":[{"column":"lang","op":"eq","value":"a"},{"column":"lang","op":"eq","value":"b"}]}}]"#,
-            r#"[{"column":"lang","op":"lt","value":"a"}]"#,
-            r#"[{"column":"lang","op":"in","value":["a"]}]"#,
+            r#"[{"column":"count","op":"eq","value":"1"}]"#,
+            r#"[{"column":"count","op":"in","value":["1"]}]"#,
+            r#"[{"column":"count","op":"lt","value":"1"}]"#,
         ] {
             let err = map(json).expect_err(json);
-            assert!(
-                matches!(err, FilterError::UnsupportedOperatorForPredicateDml),
-                "{json}: {err:?}"
-            );
-            assert_eq!(err.wire_code(), "42601");
+            assert_eq!(err.wire_code(), "42601", "{json}");
         }
+        // 非対応列への `in`・範囲比較は engine の `22000`。
         for json in [
-            r#"[{"column":"count","op":"ne","value":1}]"#,
-            r#"[{"column":"count","op":"between","value":[1,2]}]"#,
-            r#"[{"not":{"column":"count","op":"eq","value":1}}]"#,
+            r#"[{"column":"active","op":"in","value":[true]}]"#,
+            r#"[{"column":"active","op":"lt","value":true}]"#,
         ] {
             let err = map(json).expect_err(json);
-            assert!(
-                matches!(err, FilterError::NumericFilterNotSupported),
-                "{json}"
-            );
-            assert_eq!(err.wire_code(), "0A000");
+            assert_eq!(err.wire_code(), "22000", "{json}");
         }
-        let err = map(r#"[{"not":{"column":"visible","op":"is_null"}}]"#).expect_err("rls");
-        assert!(matches!(err, FilterError::RlsPredicateNotAllowed));
+        // RLS 述語名は `or`／`not` の内側でも拒否される。
+        for json in [
+            r#"[{"not":{"column":"visible","op":"is_null"}}]"#,
+            r#"[{"or":[{"column":"visible","op":"eq","value":"x"},{"column":"lang","op":"eq","value":"a"}]}]"#,
+        ] {
+            let err = map(json).expect_err(json);
+            assert!(matches!(err, FilterError::RlsPredicateNotAllowed), "{json}");
+        }
     }
 }

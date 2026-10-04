@@ -96,7 +96,7 @@ fail-closed に拒否する。v3 の追加検証:
 （decode の完全な検証を経由しない軽量パーサーであるため、fail-closed に倒し
 依存を見落とさない設計とした）。
 
-## D2: ALTER COLUMN TYPE は拡大変換のみ受理（本 Issue では NUMERIC 精度拡大のみ実装）
+## D2: ALTER COLUMN TYPE は拡大変換のみ受理（NUMERIC 精度拡大は Issue #901、INTEGER／REAL の拡大は Issue #1361）
 
 D3（当初計画）では `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION`・
 `NUMERIC(p,s) → NUMERIC(p',s)` の 3 種類の拡大変換を受理する設計とした。この
@@ -113,7 +113,7 @@ O(1) 操作として実装した
 ためのバッチ分割、TABLE-12 のキー/ヘッダ tenant 整合検査の維持、ペイロード
 上限超過時の全体中止など、DROP COLUMN 単独より大きい実装・検証面を持つ）。
 本 Issue の実装時間内では、この行書き換えを伴う変換は実装を見送り、後続
-Issue へ切り出す（「スコープ外・後続 Issue」節）。
+Issue へ切り出した（Issue #1361 で実装。「行書き換えを伴う拡大変換」節）。
 
 `alter_table_widen_numeric_precision` が受理するのはこの 1 パターン
 （`NUMERIC` → より大きい `precision`・同一 `scale`）のみで、それ以外
@@ -217,16 +217,40 @@ SQL-23・ERR-6・NOSQL-13）。
 - **NoSQL**: `alter_table.drop_column` を同じ入口へ結線（`0A000` の仮実装と
   `DROP_COLUMN_UNAVAILABLE_MESSAGE` を削除）。ALTER COLUMN TYPE 相当の op 語彙は
   別論点のためスコープ外。
-- **既知の差分（記録のみ）**: `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION` は engine
-  未実装のため `42804`。同一型への変更も `42804`。ビューが参照する列の DROP は
+- **既知の差分（記録のみ）**: `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION` は
+  Issue #1361 で受理（下記）。同一型への変更は `42804`。ビューが参照する列の DROP は
   DDL 時点で `2BP01` で拒否する（同一 write txn 内で判定）。直接参照するビューに加え、
   連鎖したビュー（`v1 AS SELECT * FROM t`・`v2 AS SELECT c FROM v1`）は各ビューの
   公開列集合を削除後の状態で基底側から導出して検査し、外側ビューが参照する列が
   消える DROP も拒否する。`SELECT *` は公開列集合の導出に使い、それ自体は依存とみなさない。
 
+## 行書き換えを伴う拡大変換（Issue #1361）
+
+`INTEGER → BIGINT`・`REAL → DOUBLE PRECISION` を受理する（ポインタ: TABLE-19・
+TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 + 8）ため、
+カタログ更新と**同一 write txn 内**で全テナントの既存行を再エンコードする
+（`crates/engine/src/column_rewrite.rs`）。
+
+- **方式**: 行バイト列にスキーマ版が無く幅の異なる行が混在できないため、読み出し時の
+  読み替え・墓標＋新スロット追加は採らない。行キー `(tenant_id, id)` を件数上限付き
+  （1,024 件）のバッチで集め、各行を旧スキーマでデコード → 対象列だけ拡大 → 新スキーマで
+  エンコードして同じキーへ書き戻す。tenant・visibility・embedding は保存する。
+  所要時間は O(行数) で、その間は書き込みゲートを保持する。
+- **原子性・fail-closed**: キーとヘッダの tenant 不整合・デコード／エンコード失敗
+  （ペイロード上限超過を含む）は `CorruptSchema`（`XX000`、固定文言。tenant・id・値を含めない）
+  で全体を中止し、commit しない（カタログ・行・世代に痕跡なし）。
+- **依存検査**: PK／UNIQUE／FOREIGN KEY の構成列は `DependentObjectsStillExist`（`2BP01`）で
+  拒否する（索引の正準キーが型ごとに異なり、古い索引が一意性・参照整合性検査をすり抜ける
+  のを避ける）。CHECK 参照列は従来どおり `2BP01`。NUMERIC 精度拡大の判定は不変。
+- **DEFAULT の実体化**: 再エンコードで、ADD COLUMN 前に書かれた行の欠落列は既定値で
+  実体化される。`REAL DEFAULT 0.1` を DOUBLE へ拡大すると既存行は `f64::from(0.1f32)`、
+  拡大後に列を省略した INSERT は `0.1f64` になる（観測可能な差としてテストで固定）。
+- **失効**: 既存の世代 bump により索引・アリーナ等のテーブル世代キャッシュが失効する。
+- **範囲外のまま `42804`**: 縮小・同一型・`INTEGER → DOUBLE PRECISION`・`REAL → BIGINT` 等。
+
 ## スコープ外・後続 Issue
 
-- `INTEGER → BIGINT`・`REAL → DOUBLE PRECISION`（行の書き換えを伴う拡大変換）
+- PK／UNIQUE／FOREIGN KEY 構成列の `INTEGER → BIGINT`（永続一意索引・キー索引の再構築が必要。現状は `2BP01`）
 - NoSQL 表層の `ALTER COLUMN ... TYPE` 相当
 - `DROP TABLE`（#902）・VIEW/FK/INDEX の依存検査（2BP01・#907〜#909）・
   明示トランザクション内の DDL（#942 系）

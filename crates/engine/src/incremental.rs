@@ -2,6 +2,12 @@
 //! ポインタ: `docs/spec/05-tasks.md` TASK-120・`docs/spec/04-behavior/indexing.md`
 //! INDEX-1, INDEX-2）。
 //!
+//! 埋め込みを write トランザクションの外で行うのは autocommit 経路（[`index_file_batch`]
+//! を含む）の話で、明示トランザクション内（`WriteTarget::InTxn`。Issue #1353）では BEGIN の
+//! 時点で単一ライタを既に保持しており、`max_duration` の範囲内で埋め込みを行う。
+//! 文の途中で期限を超えても、次の要求の期限解放と COMMIT 時の期限検査が abort させるため
+//! 正しさは崩れない。
+//!
 //! 責務境界: ファイル形 `INSERT`（`sql::parser::BoundFileInsert`）1 件分を、
 //! チャンク化（`chunking::chunk_file`。TASK-119）→ 埋め込み（`embedding::Embedder`。
 //! write トランザクションの外で実行）→ テナント境界付き置換書き込み
@@ -305,7 +311,7 @@ fn chunk_phase(
 /// 置換書き込みの順に実行する。バッチ経路では①〜④のすべての限度判定を通過した
 /// ファイルに対してのみ呼ばれる契約（`index_file_batch` ドキュメント参照）。
 fn embed_and_write_phase(
-    storage: &Storage,
+    target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
     embedder: &dyn Embedder,
     input: &BoundFileIndexInput<'_>,
@@ -371,7 +377,7 @@ fn embed_and_write_phase(
         inserted,
         first_id: _,
     } = crate::tenant::replace_typed_rows_by_text_key(
-        storage,
+        target,
         ctx,
         crate::tenant::ReplaceByTextKey {
             table: input.table,
@@ -414,6 +420,7 @@ fn embed_and_write_phase(
 /// 実体は [`chunk_phase`] → [`embed_and_write_phase`] を直列に呼ぶだけ（TASK-122 で
 /// バッチ経路 [`index_file_batch`] と共通化するために分割。挙動は分割前と同一）。
 pub(crate) fn index_file(
+    target: crate::tenant::WriteTarget<'_>,
     storage: &Storage,
     ctx: &PolicyContext,
     embedder: &dyn Embedder,
@@ -422,7 +429,7 @@ pub(crate) fn index_file(
     ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
 ) -> Result<IndexOutcome, IncrementalError> {
     let chunked = chunk_phase(storage, embedder.dim(), config, input)?;
-    embed_and_write_phase(storage, ctx, embedder, input, chunked, ledger_write)
+    embed_and_write_phase(target, ctx, embedder, input, chunked, ledger_write)
 }
 
 /// [`index_file_batch`] の失敗理由。バッチ全体に対する上限超過（[`batch_limits`]・
@@ -550,7 +557,7 @@ pub(crate) fn index_file_batch(
         .map_err(|_| BatchIncrementalError::Internal("failed to reserve batch outcome buffer"))?;
     for (index, (item, chunked)) in items.into_iter().zip(chunked_files).enumerate() {
         let outcome = embed_and_write_phase(
-            storage,
+            crate::tenant::WriteTarget::Autocommit(storage),
             ctx,
             embedder,
             &item.input,

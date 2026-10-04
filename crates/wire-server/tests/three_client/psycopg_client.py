@@ -36,6 +36,12 @@ codex-review 指摘・PR #210）。
   語彙は `"1"` のみで、それ以外の値は fail-closed でエラー終了する。未指定なら
   従来どおり何も出さない（挙動不変）。
 
+- WIRE_ABANDON_OPEN_TRANSACTION（任意・Issue #1354・RECOVER-12）: `"1"` のときのみ、本体
+  SQL の実行後に `COMMIT`／`ROLLBACK` を送らずプロセスを即時終了し、開いたままの明示
+  トランザクションを接続断として放棄する（`with psycopg.connect(...)` の正常終了は
+  commit を送ってしまうため、`COMMIT` 前の接続断の模擬にはこの経路が要る）。語彙は
+  `"1"` のみで、それ以外の値は fail-closed でエラー終了する。未指定なら挙動不変。
+
 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 出力し、終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう
 全列を出力する。`crates/wire-server/tests/three_client_e2e.rs` の
@@ -96,6 +102,14 @@ def main() -> int:
         )
         return 1
 
+    abandon = os.environ.get("WIRE_ABANDON_OPEN_TRANSACTION")
+    if abandon is not None and abandon != "1":
+        print(
+            f"psycopg_client: WIRE_ABANDON_OPEN_TRANSACTION must be \"1\" if set, got {abandon!r}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         import psycopg
     except ImportError as e:
@@ -134,6 +148,11 @@ def main() -> int:
                 # コマンドタグ（Issue #1339）。opt-in 時のみ、末尾に 1 行出す。
                 if print_tag == "1" and cur.statusmessage:
                     print(cur.statusmessage)
+                if abandon == "1":
+                    # 開いた明示トランザクションを commit せず接続を断つ。
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(0)
         return 0
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
         sqlstate = getattr(e, "sqlstate", None)

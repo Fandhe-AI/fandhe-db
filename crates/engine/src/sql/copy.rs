@@ -557,7 +557,7 @@ fn bind_copy_record(
                 ColumnType::Vector(dim) => Value::Vector(parse_vector_literal(s, *dim)?),
                 ColumnType::Text => Value::Text(s.clone()),
                 ColumnType::Boolean => Value::Bool(parse_copy_boolean(s, name)?),
-                ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, *array_ty)?),
+                ColumnType::Array(array_ty) => Value::Array(parse_array_literal(s, array_ty)?),
                 ColumnType::Bytea => bind_bytea_literal(s, name)?,
                 ColumnType::Enum(def) => bind_enum_literal(def, s, name)?,
                 ColumnType::Json | ColumnType::Jsonb => bind_json_literal(s, &column.ty, name)?,

@@ -12,8 +12,10 @@
 //! の SCALAR 段は `bound.metadata_filters`（`TEXT` 列の等価・前方一致。
 //! `declarative_filter::bind_all` が構築）と `bound.expr_filters`（`WHERE` の
 //! 式述語。`sql::udf_call::BoundExpr`）を宣言順に短絡評価する。索引が扱えるのは
-//! 前者すべてと、後者のうち **`id <op> <数値リテラル>`**（`op` は
-//! `>`/`<`/`>=`/`<=`/`=`、左右いずれの位置でも可）という狭い形だけである。
+//! 前者すべてと、後者のうち **`id <op> <数値リテラル>`** および
+//! **`<数値列> <op> <数値リテラル>`**（数値列は `INTEGER`／`BIGINT`／`REAL`／
+//! `DOUBLE`。Issue #1359。`op` は `>`/`<`/`>=`/`<=`/`=`、左右いずれの位置でも
+//! 可。`BETWEEN` は 2 本の比較へ脱糖されるため交差になる）という狭い形だけである。
 //! `expr_filters` に 1 つでもこの形に一致しない要素（`Builtin`・`WasmCall`・
 //! `VectorRef` を含む式、ネストした演算等）があれば、それは評価時にエラーに
 //! なりうる残余述語であり、宣言順の短絡評価という既存の fail-closed 契約
@@ -110,17 +112,41 @@ fn flip_comparison(op: BinOp) -> BinOp {
         BinOp::Ge => BinOp::Le,
         BinOp::Le => BinOp::Ge,
         BinOp::Eq => BinOp::Eq,
-        // 算術演算子はこの関数の呼び出し元（`id_predicate_from_expr`）が比較
+        // 算術演算子はこの関数の呼び出し元（`expr_index_predicate_from_expr`）が比較
         // 演算子のみに絞り込んだ後にしか渡さない。
         other => other,
     }
 }
 
-/// `expr` が「`id` と数値リテラルの単純比較」（狭義の索引対応述語）である場合に
-/// 限り [`IdPredicate`] を返す。それ以外（算術式・`Builtin`・`WasmCall`・
-/// `VectorRef` を含む式・ネストした比較等）はすべて `None`（索引非対応。呼び出し元
-/// はこれを「残余述語あり」＝[`ScalarPlan::PlainScan`] の根拠として扱う）。
-pub(crate) fn id_predicate_from_expr(expr: &BoundExpr) -> Option<IdPredicate> {
+/// 式述語（`expr_filters` の要素）のうち二次索引が解決できる形（Issue #1359）。
+///
+/// `sql::exec`・`sql::aggregate`・`sql::group_by` は「分類が `PlainScan` 以外」
+/// を根拠に索引候補を `WHERE` の完全被覆とみなして行ごとの再評価を省く経路
+/// （`mask_trusted_defer`・`count_star_only` 等）を持つ。分類側と候補解決側が
+/// 異なる述語集合を見ると候補が上位集合になり条件外の行を返す（fail-open）ため、
+/// 両者が必ずこの型を介して同じ集合を見る（旧 `id_predicate_from_expr` の
+/// `filter_map` は述語を黙って落とせたので、公開面を
+/// [`collect_expr_index_predicates`] に限定して型で塞ぐ）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ExprIndexPredicate {
+    /// `id <op> <数値リテラル>`。
+    Id(IdPredicate),
+    /// `<数値列> <op> <数値リテラル>`（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`。
+    /// `column_index` は `schema.columns` 添字）。左右入替は `op` を反転して
+    /// 列が左辺に来る形へ揃える。
+    NumericColumn {
+        column_index: usize,
+        op: BinOp,
+        literal: f64,
+    },
+}
+
+/// `expr` が「`id` または数値列と数値リテラルの単純比較」（狭義の索引対応
+/// 述語）である場合に限り [`ExprIndexPredicate`] を返す。それ以外（算術式・
+/// `Builtin`・`WasmCall`・`VectorRef` を含む式・ネストした比較等）はすべて
+/// `None`（索引非対応。呼び出し元はこれを「残余述語あり」＝
+/// [`ScalarPlan::PlainScan`] の根拠として扱う）。
+fn expr_index_predicate_from_expr(expr: &BoundExpr) -> Option<ExprIndexPredicate> {
     let BoundExpr::Binary { op, lhs, rhs } = expr else {
         return None;
     };
@@ -131,16 +157,64 @@ pub(crate) fn id_predicate_from_expr(expr: &BoundExpr) -> Option<IdPredicate> {
         return None;
     }
     match (lhs.as_ref(), rhs.as_ref()) {
-        (BoundExpr::IdRef, BoundExpr::Number(literal)) => Some(IdPredicate {
-            op: *op,
-            literal: *literal,
-        }),
-        (BoundExpr::Number(literal), BoundExpr::IdRef) => Some(IdPredicate {
-            op: flip_comparison(*op),
-            literal: *literal,
-        }),
+        (BoundExpr::IdRef, BoundExpr::Number(literal)) => {
+            Some(ExprIndexPredicate::Id(IdPredicate {
+                op: *op,
+                literal: *literal,
+            }))
+        }
+        (BoundExpr::Number(literal), BoundExpr::IdRef) => {
+            Some(ExprIndexPredicate::Id(IdPredicate {
+                op: flip_comparison(*op),
+                literal: *literal,
+            }))
+        }
+        (BoundExpr::ColumnRef { index }, BoundExpr::Number(literal)) => {
+            Some(ExprIndexPredicate::NumericColumn {
+                column_index: *index,
+                op: *op,
+                literal: *literal,
+            })
+        }
+        (BoundExpr::Number(literal), BoundExpr::ColumnRef { index }) => {
+            Some(ExprIndexPredicate::NumericColumn {
+                column_index: *index,
+                op: flip_comparison(*op),
+                literal: *literal,
+            })
+        }
         _ => None,
     }
+}
+
+/// `exprs` のうち数値列述語（[`ExprIndexPredicate::NumericColumn`]）が参照する
+/// 列添字（`schema.columns` 添字）を列挙する（Issue #1359）。`EXPLAIN` の静的
+/// 判定（`sql::scalar_index::scalar_plan_under_target`）が、索引宣言
+/// （`Declared`。数値列は宣言できず構築されない）の下で数値述語を含む計画を
+/// `PlainScan` へ降格させるために、`metadata_filters` の列と合わせて渡す。
+pub(crate) fn numeric_predicate_columns(exprs: &[BoundExpr]) -> impl Iterator<Item = usize> + '_ {
+    exprs
+        .iter()
+        .filter_map(|expr| match expr_index_predicate_from_expr(expr) {
+            Some(ExprIndexPredicate::NumericColumn { column_index, .. }) => Some(column_index),
+            _ => None,
+        })
+}
+
+/// `exprs`（`bound.expr_filters`）の**全件**が索引対応述語なら全件を返し、
+/// 1 件でも非対応なら `None`（Issue #1359）。`classify_scalar_plan` が
+/// `PlainScan` 以外を返した入力では常に `Some` になる。呼び出し元は `None` を
+/// 「索引経路を使わない」（fail-closed）として扱う。一部だけを落とす
+/// `filter_map` 形を作らせないための唯一の収集口。
+pub(crate) fn collect_expr_index_predicates(
+    exprs: &[BoundExpr],
+) -> Option<Vec<ExprIndexPredicate>> {
+    let mut out: Vec<ExprIndexPredicate> = Vec::new();
+    out.try_reserve_exact(exprs.len()).ok()?;
+    for expr in exprs {
+        out.push(expr_index_predicate_from_expr(expr)?);
+    }
+    Some(out)
 }
 
 /// [`ScalarShapeInput`] から [`ScalarPlan`] を決定する（純粋関数・副作用なし）。
@@ -214,23 +288,31 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     {
         return ScalarPlan::PlainScan;
     }
-    let mut id_predicate_count = 0usize;
+    let mut expr_predicate_count = 0usize;
+    let mut single_expr_is_id = false;
     for expr in input.expr_filters {
-        if id_predicate_from_expr(expr).is_none() {
+        let Some(pred) = expr_index_predicate_from_expr(expr) else {
             // 索引非対応の残余述語（評価時にエラーになりうる式を含む）が
             // 1 つでもあれば、索引経路を使わず宣言順の逐次評価
             // （既存 fail-closed 契約）へ全面的に委ねる。
             return ScalarPlan::PlainScan;
-        }
-        id_predicate_count += 1;
+        };
+        single_expr_is_id = matches!(pred, ExprIndexPredicate::Id(_));
+        expr_predicate_count += 1;
     }
-    let total = input.metadata_filters.len() + id_predicate_count;
+    let total = input.metadata_filters.len() + expr_predicate_count;
     if total >= 2 {
         return ScalarPlan::IndexConjunction;
     }
     // ここに到達する時点で `total == 1`（`total == 0` は上の空判定で除外済み）。
-    if id_predicate_count == 1 {
-        ScalarPlan::IndexIdRange
+    if expr_predicate_count == 1 {
+        // 数値列の単純比較は `DATE`／`NUMERIC` 等と同じ「型付き範囲」区分へ
+        // 載せ、`EXPLAIN` の語彙を増やさない（Issue #1359）。
+        if single_expr_is_id {
+            ScalarPlan::IndexIdRange
+        } else {
+            ScalarPlan::IndexTypedRange
+        }
     } else {
         match input.metadata_filters[0].op() {
             crate::declarative_filter::FilterOp::Equals(_) => ScalarPlan::IndexEquality,
@@ -359,8 +441,89 @@ pub(crate) fn id_bounds(
                 (Bound::Included(v), Bound::Included(v))
             }
         }
-        // `id_predicate_from_expr` が比較演算子のみへ絞り込み済みのため到達
+        // `expr_index_predicate_from_expr` が比較演算子のみへ絞り込み済みのため到達
         // しない。
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
+    })
+}
+
+/// 数値列（`INTEGER`／`BIGINT`。`i64` キーの順序索引）の単純比較
+/// `(v as f64) op literal` を、索引キー `v`（値域は `|v| <= 2^53`。`BIGINT` の
+/// `2^53` 超過は索引構築時に列ごと除外されるため `as f64` が誤差なく表せる）に
+/// 対する `i64` 区間へ変換する（Issue #1359）。`sql::udf_call::eval_binary` の
+/// f64 比較とビット同値になるよう導出する（[`tests::numeric_i64_bounds_matches_f64_comparison_property`]
+/// で固定）。`f64`→`i64` の飽和キャストには頼らず、`±2^53` で明示的に
+/// クランプしてから変換する。
+///
+/// `None` は「判定不能（呼び出し元は全走査へ縮退する）」で「一致 0 件」ではない
+/// （非有限リテラルのみ）。`id_bounds` と同じ正準の空区間（`lower > upper`）で
+/// 「一致 0 件」を表す。
+pub(crate) fn numeric_i64_bounds(
+    op: BinOp,
+    literal: f64,
+) -> Option<(std::ops::Bound<i64>, std::ops::Bound<i64>)> {
+    use std::ops::Bound;
+
+    if !literal.is_finite() {
+        return None;
+    }
+    let l = literal;
+    let max = MAX_EXACT_ID as f64;
+    const EMPTY: (Bound<i64>, Bound<i64>) = (Bound::Included(1), Bound::Included(0));
+    const ALL: (Bound<i64>, Bound<i64>) = (Bound::Unbounded, Bound::Unbounded);
+
+    Some(match op {
+        BinOp::Gt => {
+            if l >= max {
+                EMPTY
+            } else if l < -max {
+                ALL
+            } else {
+                // `l` は `[-2^53, 2^53)` のため `floor` は `i64` へ厳密に収まる。
+                let lower = (l.floor() as i64).checked_add(1)?;
+                (Bound::Included(lower), Bound::Unbounded)
+            }
+        }
+        BinOp::Ge => {
+            if l > max {
+                EMPTY
+            } else if l <= -max {
+                ALL
+            } else {
+                (Bound::Included(l.ceil() as i64), Bound::Unbounded)
+            }
+        }
+        BinOp::Lt => {
+            if l <= -max {
+                EMPTY
+            } else if l > max {
+                ALL
+            } else {
+                let upper = if l.fract() == 0.0 {
+                    (l as i64).checked_sub(1)?
+                } else {
+                    l.floor() as i64
+                };
+                (Bound::Unbounded, Bound::Included(upper))
+            }
+        }
+        BinOp::Le => {
+            if l < -max {
+                EMPTY
+            } else if l >= max {
+                ALL
+            } else {
+                (Bound::Unbounded, Bound::Included(l.floor() as i64))
+            }
+        }
+        BinOp::Eq => {
+            if l.abs() > max || l.fract() != 0.0 {
+                EMPTY
+            } else {
+                let v = l as i64;
+                (Bound::Included(v), Bound::Included(v))
+            }
+        }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
     })
 }
@@ -964,9 +1127,166 @@ mod tests {
             lhs: Box::new(BoundExpr::Number(5.0)),
             rhs: Box::new(BoundExpr::IdRef),
         };
-        let pred = id_predicate_from_expr(&expr).expect("id predicate");
+        let Some(ExprIndexPredicate::Id(pred)) = expr_index_predicate_from_expr(&expr) else {
+            panic!("id predicate expected");
+        };
         assert_eq!(pred.op, BinOp::Lt);
         assert_eq!(pred.literal, 5.0);
+    }
+
+    fn numeric_cmp(op: BinOp, column_on_left: bool, literal: f64) -> BoundExpr {
+        let (lhs, rhs) = if column_on_left {
+            (
+                BoundExpr::ColumnRef { index: 3 },
+                BoundExpr::Number(literal),
+            )
+        } else {
+            (
+                BoundExpr::Number(literal),
+                BoundExpr::ColumnRef { index: 3 },
+            )
+        };
+        BoundExpr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    /// Issue #1359: `5 > n` は `n < 5` へ反転され、列添字が保持される。
+    #[test]
+    fn numeric_column_swap_flips_operator() {
+        let expr = numeric_cmp(BinOp::Gt, false, 5.0);
+        assert_eq!(
+            expr_index_predicate_from_expr(&expr),
+            Some(ExprIndexPredicate::NumericColumn {
+                column_index: 3,
+                op: BinOp::Lt,
+                literal: 5.0
+            })
+        );
+    }
+
+    /// Issue #1359: 全件が対応形なら全件を返し、1 件でも非対応なら `None`。
+    #[test]
+    fn collect_expr_index_predicates_is_all_or_nothing() {
+        let ok = [numeric_cmp(BinOp::Ge, true, 1.0), id_gt(2.0)];
+        assert_eq!(collect_expr_index_predicates(&ok).map(|v| v.len()), Some(2));
+        let arith = BoundExpr::Binary {
+            op: BinOp::Gt,
+            lhs: Box::new(BoundExpr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(BoundExpr::ColumnRef { index: 3 }),
+                rhs: Box::new(BoundExpr::Number(1.0)),
+            }),
+            rhs: Box::new(BoundExpr::Number(5.0)),
+        };
+        let mixed = [numeric_cmp(BinOp::Ge, true, 1.0), arith];
+        assert!(collect_expr_index_predicates(&mixed).is_none());
+    }
+
+    /// Issue #1359: 単独の数値列比較は `IndexTypedRange`、2 本以上は
+    /// `IndexConjunction`、算術式を含むと `PlainScan`。
+    #[test]
+    fn numeric_column_predicates_classify_as_typed_range_or_conjunction() {
+        let one = [numeric_cmp(BinOp::Gt, true, 5.0)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &[],
+            expr_filters: &one,
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexTypedRange);
+        let between = [
+            numeric_cmp(BinOp::Ge, true, 1.0),
+            numeric_cmp(BinOp::Le, true, 9.0),
+        ];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &[],
+            expr_filters: &between,
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexConjunction);
+        let with_id = [id_gt(1.0)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &[],
+            expr_filters: &with_id,
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexIdRange);
+    }
+
+    /// Issue #1359: `numeric_i64_bounds` が索引キー域（`|v| <= 2^53`）全体で
+    /// `(v as f64) op literal` と一致する。
+    #[test]
+    fn numeric_i64_bounds_matches_f64_comparison_property() {
+        use std::ops::Bound;
+        let m: i64 = 1 << 53;
+        let mut values: Vec<i64> = vec![
+            -m,
+            -m + 1,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+            m - 1,
+            m,
+        ];
+        values.extend(-6..=6);
+        let mf = m as f64;
+        let literals = [
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            5.0,
+            5.5,
+            -5.5,
+            mf,
+            -mf,
+            mf - 1.0,
+            -mf + 1.0,
+            mf + 2.0,
+            -mf - 2.0,
+            f64::from(i32::MAX),
+            f64::from(i32::MIN),
+            1e300,
+            -1e300,
+        ];
+        for &literal in &literals {
+            for op in [BinOp::Gt, BinOp::Lt, BinOp::Ge, BinOp::Le, BinOp::Eq] {
+                let (lo, hi) = numeric_i64_bounds(op, literal).expect("finite literal");
+                for &v in &values {
+                    let x = v as f64;
+                    let expected = match op {
+                        BinOp::Gt => x > literal,
+                        BinOp::Lt => x < literal,
+                        BinOp::Ge => x >= literal,
+                        BinOp::Le => x <= literal,
+                        _ => x == literal,
+                    };
+                    let lo_ok = match lo {
+                        Bound::Included(l) => v >= l,
+                        Bound::Excluded(l) => v > l,
+                        Bound::Unbounded => true,
+                    };
+                    let hi_ok = match hi {
+                        Bound::Included(u) => v <= u,
+                        Bound::Excluded(u) => v < u,
+                        Bound::Unbounded => true,
+                    };
+                    assert_eq!(
+                        lo_ok && hi_ok,
+                        expected,
+                        "op={op:?} literal={literal} v={v}"
+                    );
+                }
+            }
+        }
+        assert!(numeric_i64_bounds(BinOp::Eq, f64::NAN).is_none());
+        assert!(numeric_i64_bounds(BinOp::Gt, f64::INFINITY).is_none());
     }
 
     #[test]
