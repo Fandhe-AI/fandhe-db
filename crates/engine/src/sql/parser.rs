@@ -1574,6 +1574,7 @@ pub(crate) fn bind_where_predicates(
     // ため、`equality_ordinal` は再帰全体で 1 つのカウンタを共有する。
     // TASK-208・Issue #912）。
     let mut equality_ordinal: usize = 0;
+    let mut rewrite_total = REWRITE_NODE_BUDGET;
     let (mut metadata, expr, rls, or_filters) = bind_where_predicates_recursive(
         where_predicates,
         schema,
@@ -1581,6 +1582,7 @@ pub(crate) fn bind_where_predicates(
         node_budget,
         dummy_equality_flags,
         &mut equality_ordinal,
+        &mut rewrite_total,
         true,
     )?;
     let or_filters =
@@ -1601,6 +1603,8 @@ pub(crate) fn bind_check_predicates(
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let empty_udfs = crate::sql::udf_call::UdfRegistry::default();
     let mut equality_ordinal: usize = 0;
+    // CHECK 文脈は書き換えを行わない（`allow_text_range_rewrite == false`）ため 0。
+    let mut rewrite_total = 0usize;
     bind_where_predicates_recursive(
         where_predicates,
         schema,
@@ -1608,6 +1612,7 @@ pub(crate) fn bind_check_predicates(
         node_budget,
         &[],
         &mut equality_ordinal,
+        &mut rewrite_total,
         false,
     )
 }
@@ -1758,6 +1763,8 @@ fn numeric_column_string_leaf_as_predicates(
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
 /// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
+// 再帰全体で共有する状態（序数・文単位の書き換え残量）を個別引数で運ぶため上限を超える。
+#[allow(clippy::too_many_arguments)]
 fn bind_where_predicates_recursive(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
@@ -1765,6 +1772,7 @@ fn bind_where_predicates_recursive(
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
     equality_ordinal: &mut usize,
+    rewrite_total: &mut usize,
     allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
@@ -1796,11 +1804,13 @@ fn bind_where_predicates_recursive(
         // （宣言的フィルタが現れたら不変条件違反として fail-closed の `Internal`）。
         if allow_text_range_rewrite {
             // 書き換えで膨らむ分（`NOT IN` は要素 1 つが `<`／`>` の 2 比較になる）は、
-            // 要素数が構文段で `MAX_IN_LIST_ITEMS` 以下に有界なので、共有予算とは別の
-            // 固定上限の局所予算で課金する。共有予算（`MAX_EXPR_NODES`）へ展開後の
-            // 全ノードを課金すると、公開上限内の `NOT IN`（256 要素）が `54000` になる
-            // 退行を招く（codex P1・PR #1420）。共有予算には葉 1 つ分だけ課金する。
-            let mut rewrite_budget = REWRITE_NODE_BUDGET;
+            // 共有予算（`MAX_EXPR_NODES`）へ全ノードを課金すると公開上限内の `NOT IN`
+            // （256 要素）が `54000` になる退行を招く（codex P1・PR #1420）ため、
+            // 共有予算には葉 1 つ分だけ課金する。一方、展開量は文全体でも有界にする必要が
+            // あるので、`rewrite_total`（文単位・全 WHERE 葉で共有する固定上限
+            // `REWRITE_NODE_BUDGET`）をそのまま書き換えの予算として消費させる
+            // （複数の葉を並べても文全体の展開総量は 1 葉分の上限を超えない。fail-closed）。
+            let mut rewrite_budget = *rewrite_total;
             if let Some(rewritten) = numeric_column_string_leaf_as_predicates(
                 predicate,
                 schema,
@@ -1811,15 +1821,22 @@ fn bind_where_predicates_recursive(
                 *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
                     SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
                 })?;
-                let (sub_metadata, sub_expr, _sub_rls, sub_or) = bind_where_predicates_recursive(
+                // 書き換え結果は式・`Or` のみで再書き換えは起きないため、内側の
+                // 文単位残量は 0 とする（万一起きても予算超過で fail-closed）。
+                let mut inner_rewrite_total = 0usize;
+                let bind_result = bind_where_predicates_recursive(
                     &rewritten,
                     schema,
                     udfs,
                     &mut rewrite_budget,
                     dummy_equality_flags,
                     equality_ordinal,
+                    &mut inner_rewrite_total,
                     allow_text_range_rewrite,
-                )?;
+                );
+                // 成否に関わらず消費分を文単位残量へ反映する。
+                *rewrite_total = rewrite_budget;
+                let (sub_metadata, sub_expr, _sub_rls, sub_or) = bind_result?;
                 if !sub_metadata.is_empty() {
                     return Err(SqlSurfaceError::Internal {
                         detail: "numeric literal rewrite produced a declarative filter".to_string(),
@@ -1875,6 +1892,7 @@ fn bind_where_predicates_recursive(
                             node_budget,
                             dummy_equality_flags,
                             equality_ordinal,
+                            rewrite_total,
                             allow_text_range_rewrite,
                         )?;
                     bound_branches.push(crate::sql::where_tree::BoundConjunction::new(

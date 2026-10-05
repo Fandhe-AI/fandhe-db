@@ -317,6 +317,23 @@ fn string_literal_not_in_at_published_limit_is_accepted() {
     assert!(all.len() >= not_in.len());
 }
 
+/// 公開上限ちょうどの `NOT IN`（文字列リテラル）を複数の WHERE 葉へ並べても、書き換え後の
+/// 式の総量は文単位で有界に保たれ、`54000` で fail-closed する（codex P1・PR #1420）。
+#[test]
+fn string_literal_not_in_repeated_leaves_hit_statement_budget() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let (alice, bob) = (ctx_for("alice"), ctx_for("bob"));
+    seed(&core, &alice, &bob);
+    let list = (1000..1256)
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let leaf = format!("qty NOT IN ({list})");
+    let many = [leaf.as_str(); 8].join(" AND ");
+    assert_eq!(code(&core, &alice, &many), "54000");
+}
+
 #[test]
 fn ranked_search_with_string_literal_matches_numeric_form() {
     let (core, path) = new_core();
