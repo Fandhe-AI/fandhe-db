@@ -1077,6 +1077,7 @@ Date: <IMF-fixdate>
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
+| `21000` | `CARDINALITY_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（スカラーサブクエリは SQL 表層専用。後述） |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
 | `22003` | `NUMERIC_OUT_OF_RANGE` | 400 | Bad Request | 集計（`aggregate`）でのオーバーフロー、`CHECK` 制約式の数値あふれ、`BIGINT` が `f64` で正確に表せない値（絶対値が 2^53 超）の拒否 |
 | `22007` | `INVALID_DATETIME_FORMAT` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの書式違反（`insert`／`update`／`filter`。Issue #1187） |
@@ -1103,7 +1104,6 @@ Date: <IMF-fixdate>
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | `create_table.constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148）が宣言時に常に失敗する組み合わせ（`NOT NULL` 列への `set_null`・DEFAULT の無い `NOT NULL` 列への `set_default` 等） |
 | `42883` | `UNDEFINED_FUNCTION` | 400 | Bad Request | `aggregate` の `sum`／`avg` を `DATE`／`TIMESTAMP` 列に指定した場合（SQL-26、Issue #1186）、または `sum`／`avg`（TEXT 以外は `min`／`max` も）を非数値型（TEXT・BOOLEAN・BYTEA・JSON・ARRAY・UUID・ENUM・VECTOR）の列に指定した場合（Issue #1349。未知関数・非決定的関数の呼び出しは SQL 表層専用で到達しない） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD PRIMARY KEY` は SQL 表層専用。後述） |
-| `21000` | `CARDINALITY_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（スカラーサブクエリは SQL 表層専用。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
