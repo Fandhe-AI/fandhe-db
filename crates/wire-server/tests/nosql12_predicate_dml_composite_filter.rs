@@ -7,8 +7,8 @@
 //! `docs/spec/04-behavior/recovery.md` RECOVER-10）。
 //!
 //! 役割分担: `filter.rs` の unit tests は JSON → `WherePredicate` の写像（AST 同一性）を、
-//! 本ファイルは SQL の `DELETE` と NoSQL の `delete` の影響行数・台帳照合の一致、
-//! `search` 系の `in`（ARRAY／JSON 列）が `42601` のまま不変であることを wire 越しに固定する。
+//! 本ファイルは SQL の `DELETE` と NoSQL の `delete` の影響行数・台帳照合の一致を wire 越しに
+//! 固定する（検索系 3 op の `in` は `nosql14_query_composite_in_filter.rs`。Issue #1429）。
 //! SQL 側のリテラルは NoSQL の正規直列化と同じ綴りで書く（台帳照合は綴り一致が前提）。
 
 #[path = "common/mod.rs"]
@@ -364,29 +364,6 @@ fn composite_in_type_mismatch_is_42601_and_limits_are_54000() {
         ),
     );
     assert_eq!(http_common::wire_code_of(&resp), "54000", "{resp:?}");
-}
-
-/// search 系（scan）の `filter` では ARRAY／JSON 列の `in` は従来どおり `42601`。
-#[test]
-fn scan_filter_composite_in_stays_42601() {
-    let (core, _guard) = new_core();
-    let (alice, _bob, _sql) = spawn_both(core);
-    seed(&alice, "s");
-    for (i, filter) in [
-        r#"[{"column":"tags","op":"in","value":[["a"]]}]"#,
-        r#"[{"column":"doc","op":"in","value":[{"k":1}]}]"#,
-    ]
-    .iter()
-    .enumerate()
-    {
-        let body = format!(r#"{{"op":"scan","table":"{TABLE}","filter":{filter},"limit":10}}"#);
-        let resp = query(&alice, body.as_bytes());
-        assert_eq!(
-            http_common::wire_code_of(&resp),
-            "42601",
-            "{i} {filter}: {resp:?}"
-        );
-    }
 }
 
 /// テナント境界: 合成列の `not in`／`ne` でも他テナントの行は削除されない。
