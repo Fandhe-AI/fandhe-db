@@ -593,3 +593,8 @@ Issue #1364（fix(engine)!: 名前付きの主キーを受理し、主キーの�
 
 - **変更箇所**: `crates/wire-server/docs/nosql-api.md`（`create_table` の `check` 受理〔Issue #1199〕、分割実行 DML の `status` に `running`／`cancelling` を追記）、`crates/wire-server/tests/three_client/psycopg_client.py`（docstring のみ。`BEGIN` 受理〔SQL-31〕と拡張クエリ実装済み〔WIRE-11〕に合わせた理由へ更新）、`docs/design/wire-multi-statement.md`（文種別分類の現状化、ファイル形 `INSERT`〔#1353〕・書き込み済みテーブルの読み取り〔#1179〕の受理を反映）。
 - **性質**: ドキュメントと docstring のみ。挙動・依存の変更なし。RLS・テナント境界・`wire_code` は不変。
+
+## Issue #1402: PK・UNIQUE・FOREIGN KEY 構成列での ALTER COLUMN TYPE 拡大変換
+
+- **変更箇所**: `crates/engine/src/catalog.rs`（`alter_column_type_with` から `2BP01` 分岐を撤去し、同一 txn 内で `user_uniq/{table}` と変更列を含む `key_index` を失効。永続スキーマ再検証のみ `INTEGER`／`BIGINT` 食い違いを許す `FkTypeRule`）、`crates/engine/src/key_index.rs`（`drop_indexes_containing_column_in_txn`）、`crates/engine/src/constraint.rs`（`recode_key_for_types`・FK 境界 3 箇所でのキー読み替え・ON UPDATE CASCADE の値の型合わせ）、`crates/engine/tests/sql_alter_column_type_key_columns.rs`（新規。TABLE-19・TABLE-17・TABLE-16 ポインタ）。設計は `docs/design/alter-table-drop-modify-column.md`・`docs/design/foreign-key.md`。
+- **性質**: これまで `2BP01` だった操作を受理に変える非破壊の拡張。縮小・異種変換は `42804` のまま、CREATE／ADD FOREIGN KEY の型混在宣言は `42830` のまま。RLS・テナント境界・fail-closed・`wire_code`・依存は不変。ON UPDATE CASCADE の値域外は `23503` で拒否（`22003` 専用 variant はスコープ外）。

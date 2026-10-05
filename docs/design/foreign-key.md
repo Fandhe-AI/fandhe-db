@@ -404,6 +404,26 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
 いずれの宣言面でも、連鎖適用は engine 側の単一検査点（`constraint` モジュール）
 だけが担う（第 2 の実行経路を作らない）。
 
+## 列型が食い違う FOREIGN KEY（Issue #1402・TABLE-19・TABLE-17）
+
+`ALTER COLUMN TYPE` の `INTEGER → BIGINT` が参照元・参照先の片側だけに適用されると、列型が
+食い違う FK が永続スキーマ上に生じる。正準キーは型タグ付きのため、境界で読み替えないと
+参照先側の検査が素通りする（fail-open）か参照元側で誤検知する。
+
+- **型照合の規則**: `CREATE TABLE`・`ADD FOREIGN KEY` の宣言は従来どおり型の完全一致
+  （食い違いは `42830`）。永続スキーマの再検証（decode・`encode_schema`）に限り、
+  `INTEGER`／`BIGINT` の食い違いを許す（自己参照 FK の PK 拡大を表現するため）。
+- **読み替え**: `constraint::recode_key_for_types` が正準キーを値を保って相手側の型へ
+  再エンコードする。参照元の型で作った必須キー（`verify_required_parent_keys`）、参照先の
+  失われたキー（`enforce_referencing_rows_in_txn`）、参照アクションの対象特定
+  （`collect_action_targets`）の 3 境界で適用し、型が全位置で等しければ恒等（挙動不変）。
+  相手側の列に収まらない値は存在し得ないため、参照元側は違反（`23503`）、参照先側は
+  対象なしとして扱う。長さ・成分数・タグの不整合は内部矛盾として fail-closed。
+- **ON UPDATE CASCADE**: 新しい親キー値を子列の型へ合わせる。子列に収まらない場合は
+  副作用なしで `23503` により拒否する（専用の `22003` variant は公開 enum の破壊的変更に
+  なるためスコープ外）。
+- `id` 疑似列を参照する FK は子列の型で処理済みのため変更なし。
+
 ## 対象外・後続候補
 
 - ~~`ALTER TABLE ... ADD/DROP CONSTRAINT FOREIGN KEY`・制約名
