@@ -523,7 +523,7 @@ fn validate_tree_types(
                         detail: "schema missing for set operation branch table".to_string(),
                     })?;
             let bound = crate::sql::parser::bind_aggregate(&branch.0, schema, udfs)?;
-            let columns = crate::sql::describe::aggregate_columns(&bound);
+            let columns = crate::sql::describe::aggregate_columns(&bound, schema)?;
             let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
         }
@@ -787,7 +787,7 @@ fn describe_tree(
                 udfs,
                 dummy_equality_flags,
             )?;
-            let columns = crate::sql::describe::aggregate_columns(&bound);
+            let columns = crate::sql::describe::aggregate_columns(&bound, schema)?;
             let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
         }

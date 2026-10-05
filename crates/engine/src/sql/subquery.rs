@@ -675,12 +675,12 @@ fn execute_inner_aggregate_statement(
             // スキャン側と同じ理由で、入れ子 WHERE の失敗時も投影メタデータを確定する。
             validated.where_predicates = static_preds;
             let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
-            *meta_sink = Some(super::describe::aggregate_columns(&bound));
+            *meta_sink = Some(super::describe::aggregate_columns(&bound, &inner_schema)?);
             return Err(e);
         }
     };
     let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
-    *meta_sink = Some(super::describe::aggregate_columns(&bound));
+    *meta_sink = Some(super::describe::aggregate_columns(&bound, &inner_schema)?);
     super::aggregate::execute_aggregate_with_cache(
         read_txn,
         ctx,
