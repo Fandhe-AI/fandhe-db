@@ -36,6 +36,16 @@
 //! より前に判定するため。`ParsedSql::CreateTable` 等のドキュメント参照）が
 //! 返る——存在オラクルにならない。
 //!
+//! ## 列型の語彙（Issue #1409）
+//!
+//! `create_table.columns[*]` と `alter_table.add_column` は共通の
+//! [`column_type_tokens`] で型を写像し、SQL 表層と同じ型集合（全スカラー型・
+//! `numeric`・`vector`・ENUM・配列 `{"type":"array","element_type","max_len"}`）を
+//! 受け付ける。型名・`element_type` は固定語彙の `match` で固定トークンへ写し、
+//! 数値パラメータは検証済み整数の 10 進化のみ。配列の要素数上限・VECTOR 要素の
+//! 拒否・ENUM 型名の解決は engine が担い、wire 側に複製しない。
+//! 型と無関係なパラメータの混入は黙って無視せず `42601`（fail-closed）。
+//!
 //! ## `alter_table.drop_column`（Issue #1167）
 //!
 //! SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口（トークン列 →
@@ -67,7 +77,7 @@
 //!   （`NOT NULL` → `DEFAULT <lit>`）のトークン列へ写し、SQL 表層と同じ engine 経路へ
 //!   渡す。vector 列・DEFAULT なし NOT NULL・型不一致等の意味検証は engine に一本化し、
 //!   wire 側では先回り判定しない（SQLSTATE パリティを自動的に保つため）。
-//! - 真偽値は固定語彙の `true`／`false` 識別子へ写す（[`add_column_default_tokens`]）。
+//! - 真偽値は固定語彙の `true`／`false` 識別子へ写す（[`column_default_tokens`]）。
 //! - 制御文字を含む文字列 DEFAULT は create_table と同じく `42601` で拒否する
 //!   （SQL では受理される。意図した差分）。
 //!
@@ -239,11 +249,11 @@ fn default_literal_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
     }
 }
 
-/// `alter_table.add_column.default` 用のリテラル写像（Issue #1338・TABLE-16）。
-/// `execute_alter_table` から呼ばれる。真偽値は SQL の `expect_literal` が受理する
+/// 列 DEFAULT 用のリテラル写像（Issue #1338・#1409・TABLE-16）。
+/// `create_table.columns[*].default`・`alter_table.add_column.default` の両方から呼ばれる。真偽値は SQL の `expect_literal` が受理する
 /// `true`／`false` 識別子（固定語彙）へ写し、それ以外は create_table と共用の
 /// [`default_literal_tokens`] へ委譲する（共用関数の挙動は変えない）。
-fn add_column_default_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
+fn column_default_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
     match value {
         JsonValue::Bool(true) => Ok(vec![Token::Ident("true".to_string())]),
         JsonValue::Bool(false) => Ok(vec![Token::Ident("false".to_string())]),
@@ -267,51 +277,6 @@ fn optional_scalar<'a>(
     }
 }
 
-/// `create_table.columns[*]` の受理型名（SQL 表層の CREATE TABLE と同じ
-/// 集合。モジュール doc 参照）を型トークン列へ写像する。戻り値の `bool` は
-/// `VECTOR` 列か（`UNIQUE`／`DEFAULT`／`nullable: true` が使えない）を表す。
-/// `build_add_column_type_tokens`（`alter_table.add_column`）と同じく
-/// ASCII 大文字小文字を無視して判定する——`create_table` だけ大文字小文字を
-/// 区別すると `alter_table` で通る型名（例: `INTEGER`／`Text`）が
-/// `create_table` では拒否される非対称が生じ、SQL 表層との型名受理集合の
-/// パリティが崩れるため。
-fn create_table_type_tokens(ty: &str, dim: Option<u32>) -> Result<(Vec<Token>, bool), DdlError> {
-    let ty = ty.to_ascii_lowercase();
-    match ty.as_str() {
-        "text" => {
-            if dim.is_some() {
-                return Err(DdlError::InvalidRequest);
-            }
-            Ok((vec![Token::Ident("TEXT".to_string())], false))
-        }
-        "integer" => {
-            if dim.is_some() {
-                return Err(DdlError::InvalidRequest);
-            }
-            Ok((vec![Token::Ident("INTEGER".to_string())], false))
-        }
-        "bigint" => {
-            if dim.is_some() {
-                return Err(DdlError::InvalidRequest);
-            }
-            Ok((vec![Token::Ident("BIGINT".to_string())], false))
-        }
-        "vector" => {
-            let dim = dim.ok_or(DdlError::InvalidRequest)?;
-            Ok((
-                vec![
-                    Token::Ident("VECTOR".to_string()),
-                    Token::Punct('('),
-                    number_token(dim),
-                    Token::Punct(')'),
-                ],
-                true,
-            ))
-        }
-        _ => Err(DdlError::InvalidRequest),
-    }
-}
-
 /// `create_table.columns[*]` 1 件をトークン列へ写像する（`<col> <type>
 /// [NOT NULL] [DEFAULT <lit>]` の順。`sql::allowlist::Parser::
 /// parse_column_constraints` は順序非依存だがこの順に固定して積む）。
@@ -319,12 +284,10 @@ fn build_column_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
     let v = DDL_COLUMN_SCHEMA.validate(item).map_err(DdlError::from)?;
     let name = v.required_str("name").map_err(DdlError::from)?;
     let name_token = ident_token(name)?;
-    let ty = v.required_str("type").map_err(DdlError::from)?;
-    let dim = v.optional_u32("dim").map_err(DdlError::from)?;
     let nullable = v.optional_bool("nullable").map_err(DdlError::from)?;
     let default = optional_scalar(&v, "default").map_err(DdlError::from)?;
 
-    let (type_tokens, is_vector) = create_table_type_tokens(ty, dim)?;
+    let (type_tokens, is_vector) = column_type_tokens(&v)?;
 
     let mut tokens = vec![name_token];
     tokens.extend(type_tokens);
@@ -342,7 +305,7 @@ fn build_column_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
         if is_vector {
             return Err(DdlError::InvalidRequest);
         }
-        let mut lit_tokens = default_literal_tokens(default_value)?;
+        let mut lit_tokens = column_default_tokens(default_value)?;
         tokens.push(Token::Ident("DEFAULT".to_string()));
         tokens.append(&mut lit_tokens);
     }
@@ -621,94 +584,63 @@ pub fn execute_create_table(
     run_ddl(core, principal, ParsedSql::CreateTable(stmt))
 }
 
-/// `alter_table.add_column` 1 件をトークン列（`<type-name>` 部分のみ）へ
-/// 写像する（SQL 表層 `ALTER TABLE ADD COLUMN` と同じ受理集合。モジュール
-/// doc 参照）。
-fn build_add_column_type_tokens(v: &Validated<'_>) -> Result<Vec<Token>, DdlError> {
-    let ty = v
-        .required_str("type")
-        .map_err(DdlError::from)?
-        .to_ascii_lowercase();
-    let dim = v.optional_u32("dim").map_err(DdlError::from)?;
-    let precision = v.optional_u32("precision").map_err(DdlError::from)?;
-    let scale = v.optional_u32("scale").map_err(DdlError::from)?;
-    let enum_type = v.optional_str("enum_type").map_err(DdlError::from)?;
-
-    // ほとんどの型は `dim`／`precision`／`scale`／`enum_type` のいずれも
-    // 取らない（`vector`／`numeric`／`enum` のみの専用パラメータ）。
-    let no_extra = |ok: bool| -> Result<(), DdlError> {
+/// 型名（固定語彙。小文字化済み）と型パラメータから、配列でない型の
+/// トークン列を作る（`create_table.columns[*]`・`alter_table.add_column`・
+/// 配列の要素型で共用。Issue #1409）。戻り値の `bool` は `VECTOR` か
+/// （`create_table` で `UNIQUE`／`DEFAULT`／`nullable: true` が使えない）を表す。
+/// 型と無関係なパラメータの混入は黙って無視せず [`DdlError::InvalidRequest`]
+/// （fail-closed）。`Token::Ident` は固定語彙か [`ident_token`] 経由でのみ作る。
+fn base_type_tokens(
+    ty: &str,
+    dim: Option<u32>,
+    precision: Option<u32>,
+    scale: Option<u32>,
+    enum_type: Option<&str>,
+) -> Result<(Vec<Token>, bool), DdlError> {
+    let no_extra = || -> Result<(), DdlError> {
         if dim.is_some() || precision.is_some() || scale.is_some() || enum_type.is_some() {
-            return Err(DdlError::InvalidRequest);
-        }
-        if !ok {
             return Err(DdlError::InvalidRequest);
         }
         Ok(())
     };
+    let simple = |names: &[&str]| -> Result<(Vec<Token>, bool), DdlError> {
+        no_extra()?;
+        Ok((
+            names
+                .iter()
+                .map(|n| Token::Ident((*n).to_string()))
+                .collect(),
+            false,
+        ))
+    };
 
-    match ty.as_str() {
-        "text" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("TEXT".to_string())])
-        }
-        "integer" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("INTEGER".to_string())])
-        }
-        "bigint" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("BIGINT".to_string())])
-        }
-        "real" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("REAL".to_string())])
-        }
-        "double" => {
-            no_extra(true)?;
-            Ok(vec![
-                Token::Ident("DOUBLE".to_string()),
-                Token::Ident("PRECISION".to_string()),
-            ])
-        }
-        "boolean" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("BOOLEAN".to_string())])
-        }
-        "date" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("DATE".to_string())])
-        }
-        "timestamp" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("TIMESTAMP".to_string())])
-        }
-        "bytea" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("BYTEA".to_string())])
-        }
-        "json" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("JSON".to_string())])
-        }
-        "jsonb" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("JSONB".to_string())])
-        }
-        "uuid" => {
-            no_extra(true)?;
-            Ok(vec![Token::Ident("UUID".to_string())])
-        }
+    match ty {
+        "text" => simple(&["TEXT"]),
+        "integer" => simple(&["INTEGER"]),
+        "bigint" => simple(&["BIGINT"]),
+        "real" => simple(&["REAL"]),
+        "double" => simple(&["DOUBLE", "PRECISION"]),
+        "boolean" => simple(&["BOOLEAN"]),
+        "date" => simple(&["DATE"]),
+        "timestamp" => simple(&["TIMESTAMP"]),
+        "bytea" => simple(&["BYTEA"]),
+        "json" => simple(&["JSON"]),
+        "jsonb" => simple(&["JSONB"]),
+        "uuid" => simple(&["UUID"]),
         "vector" => {
             if precision.is_some() || scale.is_some() || enum_type.is_some() {
                 return Err(DdlError::InvalidRequest);
             }
             let dim = dim.ok_or(DdlError::InvalidRequest)?;
-            Ok(vec![
-                Token::Ident("VECTOR".to_string()),
-                Token::Punct('('),
-                number_token(dim),
-                Token::Punct(')'),
-            ])
+            Ok((
+                vec![
+                    Token::Ident("VECTOR".to_string()),
+                    Token::Punct('('),
+                    number_token(dim),
+                    Token::Punct(')'),
+                ],
+                true,
+            ))
         }
         "numeric" => {
             if dim.is_some() || enum_type.is_some() {
@@ -719,14 +651,17 @@ fn build_add_column_type_tokens(v: &Validated<'_>) -> Result<Vec<Token>, DdlErro
             if precision > u32::from(u8::MAX) || scale > u32::from(u8::MAX) {
                 return Err(DdlError::InvalidRequest);
             }
-            Ok(vec![
-                Token::Ident("NUMERIC".to_string()),
-                Token::Punct('('),
-                number_token(precision),
-                Token::Punct(','),
-                number_token(scale),
-                Token::Punct(')'),
-            ])
+            Ok((
+                vec![
+                    Token::Ident("NUMERIC".to_string()),
+                    Token::Punct('('),
+                    number_token(precision),
+                    Token::Punct(','),
+                    number_token(scale),
+                    Token::Punct(')'),
+                ],
+                false,
+            ))
         }
         "enum" => {
             if dim.is_some() || precision.is_some() || scale.is_some() {
@@ -736,10 +671,56 @@ fn build_add_column_type_tokens(v: &Validated<'_>) -> Result<Vec<Token>, DdlErro
             if is_reserved_type_keyword(enum_type) {
                 return Err(DdlError::InvalidRequest);
             }
-            Ok(vec![ident_token(enum_type)?])
+            Ok((vec![ident_token(enum_type)?], false))
         }
         _ => Err(DdlError::InvalidRequest),
     }
+}
+
+/// 列 1 件の型指定（`type`・`dim`・`precision`・`scale`・`enum_type`・
+/// `element_type`・`max_len`）を型トークン列へ写像する（Issue #1409）。
+/// `create_table.columns[*]` と `alter_table.add_column` の両方から呼ばれ、
+/// SQL 表層の `CREATE TABLE`／`ALTER TABLE ADD COLUMN` と同じ型集合
+/// （全スカラー型・`vector`・`numeric`・`enum`・配列）を受け付ける。
+/// ASCII 大文字小文字は無視する。
+///
+/// 配列は `{"type":"array","element_type":"<要素型>","max_len":N}` で、
+/// `<要素型>[N]`（`max_len` 省略時は `[]`）のトークン列になる。要素型の
+/// パラメータは通常の型と同じキーを使う。要素数上限（0・1024 超）・
+/// 要素が VECTOR の拒否は SQL と同じく engine（`ArrayType::new`）に任せる。
+/// 配列でない型への `element_type`／`max_len` の混入、入れ子配列は拒否する。
+fn column_type_tokens(v: &Validated<'_>) -> Result<(Vec<Token>, bool), DdlError> {
+    let ty = v
+        .required_str("type")
+        .map_err(DdlError::from)?
+        .to_ascii_lowercase();
+    let dim = v.optional_u32("dim").map_err(DdlError::from)?;
+    let precision = v.optional_u32("precision").map_err(DdlError::from)?;
+    let scale = v.optional_u32("scale").map_err(DdlError::from)?;
+    let enum_type = v.optional_str("enum_type").map_err(DdlError::from)?;
+    let element_type = v.optional_str("element_type").map_err(DdlError::from)?;
+    let max_len = v.optional_u32("max_len").map_err(DdlError::from)?;
+
+    if ty != "array" {
+        if element_type.is_some() || max_len.is_some() {
+            return Err(DdlError::InvalidRequest);
+        }
+        return base_type_tokens(&ty, dim, precision, scale, enum_type);
+    }
+
+    let element = element_type
+        .ok_or(DdlError::InvalidRequest)?
+        .to_ascii_lowercase();
+    if element == "array" {
+        return Err(DdlError::InvalidRequest);
+    }
+    let (mut tokens, _) = base_type_tokens(&element, dim, precision, scale, enum_type)?;
+    tokens.push(Token::Punct('['));
+    if let Some(n) = max_len {
+        tokens.push(number_token(n));
+    }
+    tokens.push(Token::Punct(']'));
+    Ok((tokens, false))
 }
 
 /// `enum_type` が予約型キーワード（大小無視）と一致するかを判定する
@@ -775,7 +756,7 @@ fn build_add_column_tokens(
 ) -> Result<Vec<Token>, DdlError> {
     let column_name = add_v.required_str("name").map_err(DdlError::from)?;
     let column_name_token = ident_token(column_name)?;
-    let type_tokens = build_add_column_type_tokens(add_v)?;
+    let (type_tokens, _) = column_type_tokens(add_v)?;
     let not_null = add_v.optional_bool("not_null").map_err(DdlError::from)?;
     let default = optional_scalar(add_v, "default").map_err(DdlError::from)?;
 
@@ -794,7 +775,7 @@ fn build_add_column_tokens(
     }
     if let Some(v) = default {
         tokens.push(Token::Ident("DEFAULT".to_string()));
-        tokens.extend(add_column_default_tokens(v)?);
+        tokens.extend(column_default_tokens(v)?);
     }
     Ok(tokens)
 }
@@ -1016,33 +997,33 @@ mod tests {
     }
 
     #[test]
-    fn add_column_default_tokens_maps_bool_to_fixed_idents() {
+    fn column_default_tokens_maps_bool_to_fixed_idents() {
         assert_eq!(
-            add_column_default_tokens(&JsonValue::Bool(true)).expect("bool"),
+            column_default_tokens(&JsonValue::Bool(true)).expect("bool"),
             vec![Token::Ident("true".to_string())]
         );
         assert_eq!(
-            add_column_default_tokens(&JsonValue::Bool(false)).expect("bool"),
+            column_default_tokens(&JsonValue::Bool(false)).expect("bool"),
             vec![Token::Ident("false".to_string())]
         );
     }
 
     #[test]
-    fn add_column_default_tokens_delegates_other_scalars_and_rejects_invalid() {
+    fn column_default_tokens_delegates_other_scalars_and_rejects_invalid() {
         assert_eq!(
-            add_column_default_tokens(&obj("\"x\"")).expect("string"),
+            column_default_tokens(&obj("\"x\"")).expect("string"),
             vec![Token::StringLiteral("x".to_string())]
         );
         assert_eq!(
-            add_column_default_tokens(&obj("-1.5")).expect("neg"),
+            column_default_tokens(&obj("-1.5")).expect("neg"),
             vec![Token::Punct('-'), Token::Number("1.5".to_string())]
         );
         assert!(matches!(
-            add_column_default_tokens(&obj("\"a\\nb\"")),
+            column_default_tokens(&obj("\"a\\nb\"")),
             Err(DdlError::InvalidRequest)
         ));
         assert!(matches!(
-            add_column_default_tokens(&obj("1e5")),
+            column_default_tokens(&obj("1e5")),
             Err(DdlError::InvalidRequest)
         ));
     }
@@ -1104,7 +1085,7 @@ mod tests {
         }
     }
 
-    // --- build_add_column_type_tokens（numeric precision/scale 上限） ------
+    // --- column_type_tokens（numeric precision/scale 上限） ------
 
     fn add_column_validated(json: &str) -> JsonValue {
         obj(json)
@@ -1115,7 +1096,9 @@ mod tests {
         let value =
             add_column_validated(r#"{"name":"n","type":"numeric","precision":255,"scale":255}"#);
         let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
-        let tokens = build_add_column_type_tokens(&v).expect("precision/scale 255 must succeed");
+        let tokens = column_type_tokens(&v)
+            .map(|(t, _)| t)
+            .expect("precision/scale 255 must succeed");
         assert_eq!(
             tokens,
             vec![
@@ -1134,7 +1117,9 @@ mod tests {
         let value =
             add_column_validated(r#"{"name":"n","type":"numeric","precision":256,"scale":0}"#);
         let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
-        let err = build_add_column_type_tokens(&v).expect_err("precision 256 must be rejected");
+        let err = column_type_tokens(&v)
+            .map(|(t, _)| t)
+            .expect_err("precision 256 must be rejected");
         assert!(matches!(err, DdlError::InvalidRequest));
     }
 
@@ -1143,30 +1128,34 @@ mod tests {
         let value =
             add_column_validated(r#"{"name":"n","type":"numeric","precision":0,"scale":256}"#);
         let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
-        let err = build_add_column_type_tokens(&v).expect_err("scale 256 must be rejected");
+        let err = column_type_tokens(&v)
+            .map(|(t, _)| t)
+            .expect_err("scale 256 must be rejected");
         assert!(matches!(err, DdlError::InvalidRequest));
     }
 
-    // --- create_table_type_tokens（alter_table とのケース正規化パリティ） --
+    // --- column_type_tokens（create_table 側のケース正規化・語彙） ----------
+
+    fn create_type_tokens(json: &str) -> Result<(Vec<Token>, bool), DdlError> {
+        let value = obj(json);
+        let v = DDL_COLUMN_SCHEMA.validate(&value).expect("valid shape");
+        column_type_tokens(&v)
+    }
 
     #[test]
-    fn create_table_type_tokens_accepts_uppercase_and_mixed_case_type_names() {
-        // `build_add_column_type_tokens`（alter_table.add_column）が ASCII
-        // 小文字化してから型名を判定するのに対し、本関数がケース区別のまま
-        // 完全一致していると `INTEGER`／`Text` が create_table では拒否・
-        // alter_table では受理される非対称が生じる（レビュー指摘の回帰）。
-        let (tokens, is_vector) =
-            create_table_type_tokens("INTEGER", None).expect("uppercase type name must succeed");
+    fn column_type_tokens_accepts_uppercase_and_mixed_case_type_names() {
+        let (tokens, is_vector) = create_type_tokens(r#"{"name":"c","type":"INTEGER"}"#)
+            .expect("uppercase type name must succeed");
         assert_eq!(tokens, vec![Token::Ident("INTEGER".to_string())]);
         assert!(!is_vector);
 
-        let (tokens, is_vector) =
-            create_table_type_tokens("Text", None).expect("mixed-case type name must succeed");
+        let (tokens, is_vector) = create_type_tokens(r#"{"name":"c","type":"Text"}"#)
+            .expect("mixed-case type name must succeed");
         assert_eq!(tokens, vec![Token::Ident("TEXT".to_string())]);
         assert!(!is_vector);
 
-        let (tokens, is_vector) =
-            create_table_type_tokens("Vector", Some(3)).expect("mixed-case VECTOR must succeed");
+        let (tokens, is_vector) = create_type_tokens(r#"{"name":"c","type":"Vector","dim":3}"#)
+            .expect("mixed-case VECTOR must succeed");
         assert_eq!(
             tokens,
             vec![
@@ -1180,13 +1169,202 @@ mod tests {
     }
 
     #[test]
-    fn create_table_type_tokens_still_rejects_unknown_type_name() {
-        let err = create_table_type_tokens("bogus", None)
+    fn column_type_tokens_still_rejects_unknown_type_name() {
+        let err = create_type_tokens(r#"{"name":"c","type":"bogus"}"#)
             .expect_err("unknown type name must be rejected regardless of case");
         assert!(matches!(err, DdlError::InvalidRequest));
     }
 
-    // --- build_add_column_type_tokens（enum の予約キーワード判定） ---------
+    #[test]
+    fn column_type_tokens_array_maps_to_suffix_form() {
+        let (tokens, is_vector) = create_type_tokens(
+            r#"{"name":"c","type":"Array","element_type":"Integer","max_len":4}"#,
+        )
+        .expect("array must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("INTEGER".to_string()),
+                Token::Punct('['),
+                Token::Number("4".to_string()),
+                Token::Punct(']'),
+            ]
+        );
+        assert!(!is_vector);
+        let (tokens, _) =
+            create_type_tokens(r#"{"name":"c","type":"array","element_type":"text"}"#)
+                .expect("array without max_len must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("TEXT".to_string()),
+                Token::Punct('['),
+                Token::Punct(']'),
+            ]
+        );
+    }
+
+    #[test]
+    fn column_type_tokens_rejects_malformed_array_and_stray_params() {
+        for json in [
+            // 配列でない型への element_type／max_len の混入
+            r#"{"name":"c","type":"text","max_len":4}"#,
+            r#"{"name":"c","type":"text","element_type":"text"}"#,
+            // array の element_type 欠落・入れ子・未知
+            r#"{"name":"c","type":"array"}"#,
+            r#"{"name":"c","type":"array","element_type":"array"}"#,
+            r#"{"name":"c","type":"array","element_type":"bogus"}"#,
+            // 要素型のパラメータ規則
+            r#"{"name":"c","type":"array","element_type":"vector"}"#,
+            r#"{"name":"c","type":"array","element_type":"numeric","scale":2}"#,
+            r#"{"name":"c","type":"array","element_type":"numeric","precision":256,"scale":0}"#,
+            r#"{"name":"c","type":"array","element_type":"text","dim":3}"#,
+            r#"{"name":"c","type":"array","element_type":"enum"}"#,
+            r#"{"name":"c","type":"array","element_type":"enum","enum_type":"TEXT"}"#,
+            // 型パラメータの混入
+            r#"{"name":"c","type":"integer","precision":3}"#,
+            r#"{"name":"c","type":"text","enum_type":"mood"}"#,
+        ] {
+            let err = create_type_tokens(json).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "for {json}");
+        }
+        // max_len が負数・小数・文字列の場合はスキーマ／型検証で 42601
+        for json in [
+            r#"{"name":"c","type":"array","element_type":"text","max_len":-1}"#,
+            r#"{"name":"c","type":"array","element_type":"text","max_len":1.5}"#,
+            r#"{"name":"c","type":"array","element_type":"text","max_len":"4"}"#,
+        ] {
+            let value = obj(json);
+            let err = match DDL_COLUMN_SCHEMA.validate(&value) {
+                Err(e) => DdlError::from(e),
+                Ok(v) => column_type_tokens(&v).expect_err("must be rejected"),
+            };
+            assert_eq!(err.wire_code(), "42601", "for {json}");
+        }
+    }
+
+    // --- SQL 表層とのカタログ同一性（Issue #1409） --------------------------
+
+    fn sql_create_validated(
+        decl: &str,
+    ) -> Result<engine::sql::allowlist::ValidatedCreateTable, DdlError> {
+        let tokens =
+            tokenize(&format!("CREATE TABLE docs ({decl})")).expect("fixture SQL must tokenize");
+        Ok(validate_create_table_tokens(&tokens)?)
+    }
+
+    fn nosql_create_validated(
+        column_json: &str,
+    ) -> Result<engine::sql::allowlist::ValidatedCreateTable, DdlError> {
+        let mut tokens = vec![
+            Token::Ident("CREATE".to_string()),
+            Token::Ident("TABLE".to_string()),
+            ident_token("docs").expect("valid ident"),
+            Token::Punct('('),
+        ];
+        tokens.extend(build_column_tokens(&obj(column_json))?);
+        tokens.push(Token::Punct(')'));
+        Ok(validate_create_table_tokens(&tokens)?)
+    }
+
+    /// (SQL 列宣言, NoSQL 列 JSON) の行列。create_table／add_column 双方で使う。
+    const TYPE_PARITY_CASES: &[(&str, &str)] = &[
+        ("c TEXT", r#"{"name":"c","type":"text"}"#),
+        ("c INTEGER", r#"{"name":"c","type":"integer"}"#),
+        ("c BIGINT", r#"{"name":"c","type":"bigint"}"#),
+        ("c REAL", r#"{"name":"c","type":"real"}"#),
+        ("c DOUBLE PRECISION", r#"{"name":"c","type":"double"}"#),
+        ("c BOOLEAN", r#"{"name":"c","type":"boolean"}"#),
+        ("c DATE", r#"{"name":"c","type":"date"}"#),
+        ("c TIMESTAMP", r#"{"name":"c","type":"timestamp"}"#),
+        ("c BYTEA", r#"{"name":"c","type":"bytea"}"#),
+        ("c JSON", r#"{"name":"c","type":"json"}"#),
+        ("c JSONB", r#"{"name":"c","type":"jsonb"}"#),
+        ("c UUID", r#"{"name":"c","type":"uuid"}"#),
+        (
+            "c NUMERIC(10,2)",
+            r#"{"name":"c","type":"numeric","precision":10,"scale":2}"#,
+        ),
+        ("c mood", r#"{"name":"c","type":"enum","enum_type":"mood"}"#),
+        (
+            "c TEXT[]",
+            r#"{"name":"c","type":"array","element_type":"text"}"#,
+        ),
+        (
+            "c INTEGER[4]",
+            r#"{"name":"c","type":"array","element_type":"integer","max_len":4}"#,
+        ),
+        (
+            "c NUMERIC(5,2)[]",
+            r#"{"name":"c","type":"array","element_type":"numeric","precision":5,"scale":2}"#,
+        ),
+        (
+            "c mood[3]",
+            r#"{"name":"c","type":"array","element_type":"enum","enum_type":"mood","max_len":3}"#,
+        ),
+        (
+            "c BYTEA[]",
+            r#"{"name":"c","type":"array","element_type":"bytea"}"#,
+        ),
+        (
+            "c JSONB[2]",
+            r#"{"name":"c","type":"array","element_type":"jsonb","max_len":2}"#,
+        ),
+        (
+            "c BOOLEAN NOT NULL DEFAULT true",
+            r#"{"name":"c","type":"boolean","nullable":false,"default":true}"#,
+        ),
+        (
+            "c INTEGER[] DEFAULT '{1,2}'",
+            r#"{"name":"c","type":"array","element_type":"integer","default":"{1,2}"}"#,
+        ),
+        ("c VECTOR(3)", r#"{"name":"c","type":"vector","dim":3}"#),
+    ];
+
+    #[test]
+    fn create_table_column_types_match_sql_validation() {
+        for (sql, json) in TYPE_PARITY_CASES {
+            let a = sql_create_validated(sql).expect("sql side must validate");
+            let b = nosql_create_validated(json).expect("nosql side must validate");
+            assert_eq!(a, b, "create_table parity mismatch for {sql}");
+        }
+    }
+
+    #[test]
+    fn add_column_types_match_sql_validation() {
+        for (sql, json) in TYPE_PARITY_CASES {
+            // create_table 専用キー `nullable` は add_column では `not_null` へ読み替える。
+            let json = json.replace("\"nullable\":false", "\"not_null\":true");
+            let a = sql_add_column_validated(sql).expect("sql side must validate");
+            let b = nosql_add_column_validated(&json).expect("nosql side must validate");
+            assert_eq!(a, b, "add_column parity mismatch for {sql}");
+        }
+    }
+
+    #[test]
+    fn engine_owned_array_bounds_have_same_wire_code_as_sql() {
+        for (sql, json) in [
+            (
+                "c TEXT[0]",
+                r#"{"name":"c","type":"array","element_type":"text","max_len":0}"#,
+            ),
+            (
+                "c TEXT[1025]",
+                r#"{"name":"c","type":"array","element_type":"text","max_len":1025}"#,
+            ),
+            (
+                "c VECTOR(3)[]",
+                r#"{"name":"c","type":"array","element_type":"vector","dim":3}"#,
+            ),
+        ] {
+            let a = sql_create_validated(sql).expect_err("sql must reject");
+            let b = nosql_create_validated(json).expect_err("nosql must reject");
+            assert_eq!(a.wire_code(), "42601", "sql {sql}");
+            assert_eq!(b.wire_code(), a.wire_code(), "nosql {json}");
+        }
+    }
+
+    // --- column_type_tokens（enum の予約キーワード判定） ---------
 
     #[test]
     fn is_reserved_type_keyword_matches_case_insensitively() {
@@ -1200,8 +1378,9 @@ mod tests {
     fn add_column_enum_rejects_reserved_type_keyword() {
         let value = add_column_validated(r#"{"name":"n","type":"enum","enum_type":"TEXT"}"#);
         let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
-        let err =
-            build_add_column_type_tokens(&v).expect_err("reserved keyword enum_type must fail");
+        let err = column_type_tokens(&v)
+            .map(|(t, _)| t)
+            .expect_err("reserved keyword enum_type must fail");
         assert!(matches!(err, DdlError::InvalidRequest));
     }
 
@@ -1209,7 +1388,9 @@ mod tests {
     fn add_column_enum_accepts_non_reserved_type_name() {
         let value = add_column_validated(r#"{"name":"n","type":"enum","enum_type":"mood"}"#);
         let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
-        let tokens = build_add_column_type_tokens(&v).expect("non-reserved enum_type must succeed");
+        let tokens = column_type_tokens(&v)
+            .map(|(t, _)| t)
+            .expect("non-reserved enum_type must succeed");
         assert_eq!(tokens, vec![Token::Ident("mood".to_string())]);
     }
 

@@ -975,12 +975,13 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
-/// `create_table.columns[*]` のサブスキーマ（NOSQL-13・TASK-207、Issue #910）。
-/// 受理する `type` の語彙は SQL 表層の `CREATE TABLE` と同じ 3 種
-/// （`text`／`vector`／`integer`／`bigint`）に限る（意味検証は
-/// [`super::ddl`] が engine のトークン入口
-/// （`engine::sql::allowlist::validate_create_table_tokens`）へ渡す前に行う。
-/// 本スキーマは型のみを検査する）。
+/// `create_table.columns[*]` のサブスキーマ（NOSQL-13・TASK-207、Issue #910・#1409）。
+/// 受理する `type` の語彙は SQL 表層の `CREATE TABLE` と同じ集合（全スカラー型・
+/// `vector`・`numeric`・`enum`・配列 `array`）で、型パラメータ
+/// （`dim`／`precision`／`scale`／`enum_type`／`element_type`／`max_len`）は
+/// `alter_table.add_column` と同じキーを使う。意味検証は [`super::ddl`] が engine の
+/// トークン入口（`engine::sql::allowlist::validate_create_table_tokens`）へ渡す前に
+/// 行い、本スキーマは型のみを検査する。
 pub static DDL_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
     name: "ddl_column",
     fields: &[
@@ -998,6 +999,36 @@ pub static DDL_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
         },
         FieldSpec {
             key: "dim",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "precision",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "scale",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "enum_type",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "element_type",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "max_len",
             presence: Presence::Optional,
             ty: FieldType::Number,
             nullable: false,
@@ -1177,6 +1208,18 @@ pub static DDL_ADD_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
             key: "enum_type",
             presence: Presence::Optional,
             ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "element_type",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "max_len",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
             nullable: false,
         },
         // Issue #1338（TABLE-16・NOSQL-13）: SQL 表層の `NOT NULL`／

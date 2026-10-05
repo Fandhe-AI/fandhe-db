@@ -55,10 +55,14 @@ validate_drop_table_tokens}`（`pub(crate)` → `pub` へ Issue #910 で公開�
   `42601` で拒否する。
 - **`DEFAULT` の文字列**: `Token::StringLiteral(s)` を直接使う（prepared の前例と
   同じ）。制御文字（NUL 等）を含む値は往復不能なため `42601`。
-- **`DEFAULT` の bool／null／配列／オブジェクト**: SQL の `CREATE TABLE` で表現
-  できないため `42601`。
-- **型名**: wire 側に閉じた対応表を置く（`create_table_type_tokens`・
-  `build_add_column_type_tokens`）。表にない値は engine を呼ぶ前に `42601`。
+- **`DEFAULT` の null／配列／オブジェクト**: SQL の `CREATE TABLE` で表現
+  できないため `42601`（真偽値は `add_column` と同じ `true`／`false` 識別子へ写像。
+  配列の既定値は文字列 `"{1,2}"` 形）。
+- **型名**: wire 側に閉じた固定語彙の対応表を置く（`ddl.rs::column_type_tokens`／
+  `base_type_tokens`。`create_table`・`add_column` で共用。Issue #1409）。全スカラー型・
+  `numeric`・`vector`・`enum`・配列を SQL と同じ型集合で受け付け、表にない値・型と
+  無関係なパラメータの混入は engine を呼ぶ前に `42601`。配列の表現は
+  「配列の JSON 表現」節を参照。
 - **参照アクション**（`references.on_delete`／`on_update`。Issue #1148・
   NOSQL-13）: 固定語彙（`no_action`／`restrict`／`cascade`／`set_null`／
   `set_default`。小文字 snake_case・完全一致）から `ON DELETE`／`ON UPDATE`
@@ -67,6 +71,22 @@ validate_drop_table_tokens}`（`pub(crate)` → `pub` へ Issue #910 で公開�
   しない点は識別子と同じ注入防止方針。省略時はトークンを生成せず engine
   既定の `NO ACTION` に委ねる（現行挙動と完全互換）。語彙外・非文字列値は
   `42601`。
+
+## 配列の JSON 表現（Issue #1409・NOSQL-13。spec に規定がないため本リポで決定）
+
+採用: 構造化形式 `{"type":"array","element_type":"text","max_len":8}`。
+`max_len` 省略は SQL の `[]`。要素型のパラメータは既存の `precision`／`scale`／
+`enum_type`／`dim` をそのまま使い、固定語彙の `match` だけでトークン列へ写像する。
+要素数上限（0・1024 超）・VECTOR 要素の拒否は SQL と同じく engine（`ArrayType::new`）に
+一本化し、wire 側に上限定数を複製しない。入れ子配列は wire で `42601`。
+
+却下: `"type":"integer[]"` の接尾辞形式。untrusted な文字列を部分文字列として
+解析する必要があり、応答側の型名（`double precision[]`・`enum[]` 等、精度や型名を
+含まない）とも往復しないため、見た目の一致という利点が実質的に無い。
+
+SQL と NoSQL の同一宣言が同一のカタログ表現になることは、`ddl.rs` の unit tests
+（`validate_*_tokens` の結果比較）と `tests/nosql13_ddl.rs`（SELECT の列メタ
+`ColumnType` の比較）で層 A として固定する。
 
 ## セッションへの DDL 実行権限の搬送
 
