@@ -105,6 +105,39 @@ fn create_table_with_column_level_check_persists_and_survives_reopen() {
     assert_eq!(err.wire_code(), "23514");
 }
 
+/// Issue #1430・SQL-24: 負の数値リテラルを含む CHECK 本体は、永続化・再オープン後の
+/// 再パース（描画文字列の往復。`--` コメント化が起きないこと）でも同じ検査を保つ。
+#[test]
+fn check_with_negative_literal_survives_reopen() {
+    let (core, path) = new_core("check-negative-literal");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (n INTEGER, CHECK (n > -1), CHECK (n - -1 > 0))",
+    )
+    .expect("CREATE TABLE with negative-literal CHECK should succeed");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, n) VALUES (1, -5) USING OPERATION_ID 'op-neg'",
+        )
+        .expect_err("violating row must be rejected after reopen");
+    assert_eq!(err.wire_code(), "23514");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, n) VALUES (2, 3) USING OPERATION_ID 'op-pos'",
+    )
+    .expect("conforming row must be accepted after reopen");
+}
+
 #[test]
 fn create_table_rejects_check_referencing_unknown_column() {
     let (core, path) = new_core("check-unknown-col");

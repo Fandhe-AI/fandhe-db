@@ -1194,7 +1194,7 @@ fn typed_bind_keeps_literal_form_limits() {
     let path = unique_db_path("prepared-typed-literal-limits");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_typed_table(&path);
-    // 負値 WHERE はリテラル形でも同じエラー（式項の単項マイナス未対応。既存制約）。
+    // 負値・範囲外値の WHERE は Bind 形とリテラル形で同じ結果（成否と wire_code）になる。
     let prepared = core
         .parse_sql_prepared("SELECT id FROM typed WHERE n = $1 LIMIT 5")
         .expect("parse");

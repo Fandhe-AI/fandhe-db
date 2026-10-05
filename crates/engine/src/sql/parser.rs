@@ -1760,6 +1760,43 @@ fn numeric_column_string_leaf_as_predicates(
     }
 }
 
+/// NUMERIC 列と裸の数値リテラルの単純比較（`col <op> n`／`n <op> col`、
+/// `op` は `= < <= > >=`）を宣言的フィルタ（`compare_numeric_literal`）へ写す
+/// （Issue #1430・SQL-24）。`bind_where_predicates_recursive` の式述語腕から呼ばれる。
+/// 値の解釈は文字列リテラル形と同じ `numeric::parse_literal_exact` を通るため、
+/// 値・エラーコードは `price = '1'` 形と一致する。列照合は `udf_call::bind_expr_in` と
+/// 同じ名前完全一致。`equality_ordinal` は進めない（`sql::params` がこの形を Prepared の
+/// 等価序数に数えないため、進めるとダミーフラグの序数がずれる）。
+/// 対象外の形（算術・関数呼び出し・列同士など）は `None` を返し従来経路（`22000`）へ回す。
+fn numeric_column_number_compare_as_filter(
+    expr: &Expr,
+    schema: &TableSchema,
+) -> Option<DeclarativeFilter> {
+    use crate::declarative_filter::CompareOp as Op;
+    use crate::sql::udf_call::BinOp;
+    let Expr::Binary { op, lhs, rhs } = expr else {
+        return None;
+    };
+    let (col, number, flipped) = match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Ident(c), Expr::Number(n)) => (c, n, false),
+        (Expr::Number(n), Expr::Ident(c)) => (c, n, true),
+        _ => return None,
+    };
+    let cmp = match (op, flipped) {
+        (BinOp::Eq, _) => Op::Eq,
+        (BinOp::Lt, false) | (BinOp::Gt, true) => Op::Lt,
+        (BinOp::Le, false) | (BinOp::Ge, true) => Op::Le,
+        (BinOp::Gt, false) | (BinOp::Lt, true) => Op::Gt,
+        (BinOp::Ge, false) | (BinOp::Le, true) => Op::Ge,
+        _ => return None,
+    };
+    let is_numeric = schema
+        .columns
+        .iter()
+        .any(|c| &c.name == col && matches!(c.ty, ColumnType::Numeric { .. }));
+    is_numeric.then(|| DeclarativeFilter::compare_numeric_literal(col.clone(), cmp, number.clone()))
+}
+
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
 /// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
@@ -1855,6 +1892,16 @@ fn bind_where_predicates_recursive(
                 rls_predicate_present = true;
             }
             WherePredicate::Expression(expr) => {
+                // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
+                // レーン（`TypedCompare`）へ振り替える（WHERE 文脈限定。CHECK は従来どおり
+                // 式レーンで `22000`）。
+                if allow_text_range_rewrite {
+                    if let Some(filter) = numeric_column_number_compare_as_filter(expr, schema) {
+                        declarative_filters.push(filter);
+                        filter_skip_enum_validation.push(false);
+                        continue;
+                    }
+                }
                 let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
                 if ty != crate::sql::udf_call::ExprType::Bool {
                     return Err(SqlSurfaceError::datatype_mismatch(

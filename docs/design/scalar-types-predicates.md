@@ -178,3 +178,9 @@ NULL は strict 伝播・BIGINT の |値| > 2^53 は `22000`）をそのまま�
 （述語つき DML の `operation_id` 内容照合ハッシュへ `WherePredicate::
 Compare` のタグを追加）。`sql/expr_program.rs`・`sql/udf_call.rs`
 （レーン A 用に計画されていた変更）は無変更。wire-server は無変更。
+
+## 追記: NUMERIC 列 × 裸の数値リテラルと負の数値リテラル（Issue #1430）
+
+- NUMERIC 列と裸の数値リテラル（整数・小数・指数表記）の `=`・範囲比較（左右反転を含む）・`IN`・`BETWEEN` は、WHERE 文脈で `sql::parser` の束縛段が `compare_numeric_literal`（`TypedCompare`）へ振り替える。値の解釈は文字列リテラル形と同じ `numeric::parse_literal_exact` のため、結果・`wire_code` が一致し、NUMERIC 用の二次索引もそのまま使える。CHECK 本体は従来どおり `22000`。
+- 負の数値リテラルは構文段で `-` + 数値を 1 つの数値へ畳む（`- 1` も可）。`- -1`・`-col`・`-(expr)` は `42601` のまま。
+- 述語形 DML の content hash は、f64 で表せない整数リテラルだけ新タグ 11＋生テキストで直列化する（既存ハッシュは不変）。f64 で同値となる 2 つの正確な NUMERIC リテラルは同一ハッシュになる既知の制限が残る。

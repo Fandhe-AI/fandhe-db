@@ -1583,11 +1583,22 @@ fn push_dml_expr(
     use crate::sql::udf_call::Expr;
 
     match expr {
-        Expr::Number(raw) => {
-            b.push_u8(1);
-            let v = crate::sql::udf_call::parse_number_literal(raw)?;
-            b.push_raw(&v.to_bits().to_le_bytes());
-        }
+        // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの比較は束縛段で正確な 10 進値
+        // として受理されるため、f64 で正確に表せない整数（2^53 超）もここへ到達する。
+        // 従来どおり f64 で直列化できる入力はタグ 1 のまま（既存ハッシュ不変）、できない入力
+        // だけを新タグ 11＋生テキストで直列化する（従来エラーだった入力のみが対象で台帳互換）。
+        // 値の妥当性（範囲・型）は束縛段が検査する。
+        Expr::Number(raw) => match crate::sql::udf_call::parse_number_literal(raw) {
+            Ok(v) => {
+                b.push_u8(1);
+                b.push_raw(&v.to_bits().to_le_bytes());
+            }
+            Err(_) => {
+                b.push_u8(11);
+                b.push_bytes(raw.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+            }
+        },
         Expr::Ident(name) => {
             b.push_u8(2);
             let is_param = params
