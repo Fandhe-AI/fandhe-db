@@ -1651,6 +1651,12 @@ fn text_range_compare_as_expr(
     })
 }
 
+/// 数値列 × 文字列リテラルの書き換え 1 葉あたりの式ノード局所予算。`IN`／`NOT IN` は
+/// 要素数が `MAX_IN_LIST_ITEMS` 以下に有界で、`NOT IN` 要素は `Or(<, >)`（束縛後
+/// 約 2 比較 × 4 ノード）へ展開される。その最大値に余裕を持たせた固定上限で、
+/// 無制限確保にはならない。
+const REWRITE_NODE_BUDGET: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS * 16 + 64;
+
 /// 数値列（INTEGER／BIGINT／REAL／DOUBLE）と文字列リテラルの宣言的な葉（`=`・範囲比較・
 /// `IN`・`BETWEEN`、およびその `NOT`）を、式レーンの比較（`Expression`）へ書き換える
 /// （Issue #1408・SQL-24・ERR-2・ERR-6）。PostgreSQL は型の付いていない文字列リテラルを
@@ -1789,18 +1795,27 @@ fn bind_where_predicates_recursive(
         // `Or` だけで構成されるため、再帰束縛して式・`Or` 群のみを取り込む
         // （宣言的フィルタが現れたら不変条件違反として fail-closed の `Internal`）。
         if allow_text_range_rewrite {
+            // 書き換えで膨らむ分（`NOT IN` は要素 1 つが `<`／`>` の 2 比較になる）は、
+            // 要素数が構文段で `MAX_IN_LIST_ITEMS` 以下に有界なので、共有予算とは別の
+            // 固定上限の局所予算で課金する。共有予算（`MAX_EXPR_NODES`）へ展開後の
+            // 全ノードを課金すると、公開上限内の `NOT IN`（256 要素）が `54000` になる
+            // 退行を招く（codex P1・PR #1420）。共有予算には葉 1 つ分だけ課金する。
+            let mut rewrite_budget = REWRITE_NODE_BUDGET;
             if let Some(rewritten) = numeric_column_string_leaf_as_predicates(
                 predicate,
                 schema,
-                node_budget,
+                &mut rewrite_budget,
                 equality_ordinal,
                 dummy_equality_flags,
             )? {
+                *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
+                })?;
                 let (sub_metadata, sub_expr, _sub_rls, sub_or) = bind_where_predicates_recursive(
                     &rewritten,
                     schema,
                     udfs,
-                    node_budget,
+                    &mut rewrite_budget,
                     dummy_equality_flags,
                     equality_ordinal,
                     allow_text_range_rewrite,

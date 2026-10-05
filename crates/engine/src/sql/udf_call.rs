@@ -1956,11 +1956,14 @@ fn bind_unknown_literal_against(
             // 等価性が崩れる（Cursor Bugbot 指摘・PR #1420）。そのため正規化済みの
             // 原文を同じ exactness 検査へ渡す。
             let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
-            let unsigned_plus = trimmed.strip_prefix('+').unwrap_or(trimmed);
-            let (neg, body) = match unsigned_plus.strip_prefix('-') {
+            // 符号は高々 1 つ（`+-1`・`-+1` は不正形として 22P02。整数経路と同じ）
+            let (neg, body) = match trimmed.strip_prefix('-') {
                 Some(rest) => ("-", rest),
-                None => ("", unsigned_plus),
+                None => ("", trimmed.strip_prefix('+').unwrap_or(trimmed)),
             };
+            if body.starts_with(['+', '-']) {
+                return Err(invalid());
+            }
             let (mantissa, exp) = match body.find(['e', 'E']) {
                 Some(i) => (body.get(..i).unwrap_or(""), body.get(i..).unwrap_or("")),
                 None => (body, ""),

@@ -283,7 +283,38 @@ fn real_double_string_literal_trailing_dot_matches_numeric_form() {
         );
         assert_eq!(code(&core, &alice, &format!("{col} = '.'")), "22P02");
         assert_eq!(code(&core, &alice, &format!("{col} = 'inf'")), "22P02");
+        // 符号の重ね掛けは不正形（整数列と同じ 22P02）。
+        for bad in ["+-1.5", "-+1.5", "--1.5", "++1.5"] {
+            assert_eq!(
+                code(&core, &alice, &format!("{col} = '{bad}'")),
+                "22P02",
+                "{col} {bad}"
+            );
+        }
     }
+}
+
+/// 公開上限（`MAX_IN_LIST_ITEMS` = 256）ちょうどの数値列 `IN`／`NOT IN`（文字列リテラル）は
+/// 式ノード予算で拒否されず、数値リテラル形の補集合と一致する（codex P1・PR #1420）。
+#[test]
+fn string_literal_not_in_at_published_limit_is_accepted() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let (alice, bob) = (ctx_for("alice"), ctx_for("bob"));
+    seed(&core, &alice, &bob);
+    let list = (1000..1256)
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let all = ids(&core, &alice, "qty IS NOT NULL OR qty IS NULL");
+    assert_eq!(
+        ids(&core, &alice, &format!("qty IN ({list})")),
+        Vec::<u64>::new()
+    );
+    let not_in = ids(&core, &alice, &format!("qty NOT IN ({list})"));
+    let not_null = ids(&core, &alice, "qty IS NOT NULL");
+    assert_eq!(not_in, not_null);
+    assert!(all.len() >= not_in.len());
 }
 
 #[test]
