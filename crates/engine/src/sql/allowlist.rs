@@ -6694,6 +6694,10 @@ impl<'a> Parser<'a> {
         // 検証済み。カタログを参照しない構造段の判定のため存在オラクルにならず、
         // 何も書き込まない。
         if duplicate_primary_key {
+            // 文末の構文検証（余剰トークンの `42601`）を先に済ませる（ERR-6 の構文
+            // エラー優先）。呼び出し元 `validate_create_table_tokens` の同検査は
+            // 本分岐の早期 return で到達しないため、ここで前倒しする。
+            self.expect_end_of_statement()?;
             return Err(SqlSurfaceError::invalid_table_definition(table_name));
         }
         // 列定義は 1 件以上必須（表制約 `PRIMARY KEY`／`UNIQUE`／`CHECK` だけの
@@ -17354,6 +17358,13 @@ mod tests {
                 .wire_code(),
             "42601"
         );
+        // 文末の余剰トークンも 42P16 より優先する。
+        for sql in [
+            "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY) garbage",
+            "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY); SELECT 1",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
         assert_eq!(
             parse_create_table_err(
                 "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b, b))"
