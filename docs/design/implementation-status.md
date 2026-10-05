@@ -686,3 +686,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: 明示名で `ALTER TABLE ... DROP CONSTRAINT` でき、再オープン後も名前が保たれる。`CREATE TABLE` 内の名前重複は UNIQUE 系が `42P07`、FOREIGN KEY を含めば `42710`（`ALTER TABLE ADD CONSTRAINT` と同じ写像）、主キーと CHECK は `42601`。構文エラー・`42P16` を名前重複より優先し、カタログを参照しないため存在オラクルにならない。RLS・テナント境界・fail-closed・依存は不変。
 - **BREAKING CHANGE**: `CREATE TABLE` 内の FK と CHECK／FK と FK／主キーと FK の明示名重複が `42601` から `42710` へ変わった。主キーのあるテーブルで制約を導出名 `<table>_pkey` と名付ける宣言は受理から拒否になった。
 - **対象外**: NoSQL 表層の `constraints[].name`（UNIQUE・FOREIGN KEY）、`CONSTRAINT <n>` を `NOT NULL`・`DEFAULT` の前に置く形、列制約の順序の自由化、既定 CHECK 名が明示名を避ける改善、CHECK 同士の名前重複の `42710` 化。
+
+## Issue #1429: NoSQL の search／scan／aggregate の filter で配列・JSON 列の in を受理する
+
+- **対象ビヘイビア**: NOSQL-14（関連: NOSQL-17・SQL-24）。
+- **変更箇所**: `crates/wire-server/src/http/query/filter.rs`（`FilterSurface` を撤去し、述語形 DML と同じ `declare_in` の ARRAY／JSON／JSONB 腕を `search`／`scan`／`aggregate` でも通す）、テスト（`tests/nosql14_query_composite_in_filter.rs` 新規・`nosql12_predicate_dml_composite_filter.rs`・`filter.rs` 単体）、`crates/wire-server/docs/nosql-api.md`。engine の変更なし。
+- **性質**: 3 op の `filter` が SQL の `SELECT ... WHERE col IN (...)` と同じ結果集合を返す。型不一致は `42601`、葉数・要素数の上限超過は `54000`。#1410 の既知の差分のうち search 系の項は解消した。RLS・テナント境界・fail-closed・依存は不変。
+- **分類変更**: BOOLEAN／VECTOR 列への配列・オブジェクト要素の `in` は検索系で `42601` から engine の `22000` に変わり、述語形 DML・SQL 表層と揃う。
+- **対象外**: `FilterError::CompositeEqNotSupportedForPredicateDml` の削除（公開 enum の破壊的変更）、ARRAY／JSON 列の範囲比較・`prefix`・`like`。

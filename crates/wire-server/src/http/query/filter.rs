@@ -20,7 +20,7 @@
 //! いずれも暗黙に `AND` 結合として扱う（`or` キー以外での `OR` 表現は存在しない）。
 //! `value` は文字列・数値・真偽値（`eq`／`ne`／`prefix`／`like`／範囲比較）、
 //! 配列（`in`。要素は文字列・数値・真偽値。`between` は要素ちょうど 2 個のスカラー
-//! 配列 `[low, high]`）、配列・オブジェクト（ARRAY／JSON 列への `eq`／`ne`、および述語形 DML の `in` の要素）の
+//! 配列 `[low, high]`）、配列・オブジェクト（ARRAY／JSON 列への `eq`／`ne`、および `in` の要素。Issue #1429）の
 //! いずれかを受理する。`is_null`／`not_null` は `value` を**持たない**（`null` を
 //! 含め付いていれば `42601`）。対象列の型に応じて [`bind_filter`] がレーンを
 //! 振り分ける。
@@ -48,7 +48,8 @@
 //!   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 文字列配列）・
 //!   `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`（JSON 数値の配列。SQL の
 //!   数値リテラル `col IN (1, 2)` の脱糖と同じ `col = 1 OR col = 2` の式レーン。
-//!   Issue #1356）。`BOOLEAN`／`VECTOR` は engine 側の「IN 非対応列」判定
+//!   Issue #1356）・`ARRAY`（JSON 配列の配列）・`JSON`／`JSONB`（オブジェクトか
+//!   配列の配列。NOSQL-14・Issue #1429。述語形 DML と同じ写像）。`BOOLEAN`／`VECTOR` は engine 側の「IN 非対応列」判定
 //!   （`22000`）へ委譲する
 //! - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
 //!   JSON 数値のみを受理し、式レーン（[`DeclarativePredicate::Expr`]。SQL の
@@ -406,27 +407,11 @@ fn extract_leaf_fields(
     Ok((column, op, value))
 }
 
-/// フィルタの適用先表層。述語形 `update`／`delete`（SQL-19 と同じ構文形へ写す経路）だけ
-/// `ARRAY`／`JSON`／`JSONB` 列の `in`（要素が JSON 配列・オブジェクト）を受理し、
-/// `search`／`scan`／`aggregate` は従来どおり `42601` で拒否する（Issue #1410。
-/// [`bind_filter`] が `Query`、[`bind_filter_where_predicates`] が `PredicateDml` を渡す）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FilterSurface {
-    /// `search`／`scan`／`aggregate`。
-    Query,
-    /// 述語形 `update`／`delete`。
-    PredicateDml,
-}
-
 /// `op`・`value` の形（配列可否・要素数・要素の JSON 型）を検査する
 /// （`Vec` 確保・借用より前の多層防御の一部。`in` の要素数上限
 /// （[`declarative_filter::MAX_IN_LIST_ITEMS`]）はここで検査する——列型に
 /// 依存しないため schema 到達を待たずに検査できる）。
-fn validate_leaf_value_shape(
-    op: &str,
-    value: &JsonValue,
-    surface: FilterSurface,
-) -> Result<(), FilterError> {
+fn validate_leaf_value_shape(op: &str, value: &JsonValue) -> Result<(), FilterError> {
     if op == "in" {
         let JsonValue::Array(items) = value else {
             return Err(FilterError::Shape(SchemaError::TypeMismatch {
@@ -439,15 +424,17 @@ fn validate_leaf_value_shape(
         if items.len() > declarative_filter::MAX_IN_LIST_ITEMS {
             return Err(FilterError::InTooMany);
         }
-        // 述語形 DML では ARRAY／JSON 列の `in` 用に要素の配列・オブジェクトも通す
-        // （列型との適否は `declare_in` が判定する。要素数上限は上で検査済み）。
-        let composite_ok = surface == FilterSurface::PredicateDml;
+        // ARRAY／JSON 列の `in` 用に要素の配列・オブジェクトも通す（Issue #1429。
+        // 述語形 DML と共有。列型との適否は `declare_in` が判定する。要素数上限は上で検査済み）。
         for item in items {
             let ok = matches!(
                 item,
-                JsonValue::String(_) | JsonValue::Number(_) | JsonValue::Bool(_)
-            ) || (composite_ok
-                && matches!(item, JsonValue::Array(_) | JsonValue::Object(_)));
+                JsonValue::String(_)
+                    | JsonValue::Number(_)
+                    | JsonValue::Bool(_)
+                    | JsonValue::Array(_)
+                    | JsonValue::Object(_)
+            );
             if !ok {
                 return Err(FilterError::Shape(SchemaError::TypeMismatch {
                     key: "value",
@@ -502,7 +489,6 @@ fn map_element<'a>(
     item: &'a JsonValue,
     depth: usize,
     leaves: &mut usize,
-    surface: FilterSurface,
 ) -> Result<FilterNode<'a>, FilterError> {
     if depth > MAX_EXPR_DEPTH {
         return Err(FilterError::DepthExceeded);
@@ -530,7 +516,7 @@ fn map_element<'a>(
         declarative_filter::check_filter_count(branches_json.len()).map_err(FilterError::Bind)?;
         let mut branches = Vec::with_capacity(branches_json.len());
         for branch_json in branches_json {
-            branches.push(map_element(branch_json, depth + 1, leaves, surface)?);
+            branches.push(map_element(branch_json, depth + 1, leaves)?);
         }
         if branches.len() == 1 {
             // 単一分岐の `or` は親の AND 列へ平坦化する（`sql::allowlist::
@@ -555,7 +541,6 @@ fn map_element<'a>(
             inner,
             depth + 1,
             leaves,
-            surface,
         )?)));
     }
 
@@ -566,7 +551,7 @@ fn map_element<'a>(
     if !is_known_op(op) {
         return Err(FilterError::UnsupportedOperator);
     }
-    validate_leaf_value_shape(op, value, surface)?;
+    validate_leaf_value_shape(op, value)?;
 
     let next = leaves
         .checked_add(1)
@@ -584,15 +569,12 @@ fn map_element<'a>(
 /// へ写像する。件数検査（[`declarative_filter::check_filter_count`]、`54000`）を
 /// `Vec` 確保・借用より**前**に行う（`.claude/rules/security.md`「不安全な設計｜
 /// 無制限リソース確保（DoS）」対応）。
-fn map_filter_items(
-    items: &[JsonValue],
-    surface: FilterSurface,
-) -> Result<Vec<FilterNode<'_>>, FilterError> {
+fn map_filter_items(items: &[JsonValue]) -> Result<Vec<FilterNode<'_>>, FilterError> {
     declarative_filter::check_filter_count(items.len()).map_err(FilterError::Bind)?;
     let mut leaves = 0usize;
     let mut mapped = Vec::with_capacity(items.len());
     for item in items {
-        mapped.push(map_element(item, 0, &mut leaves, surface)?);
+        mapped.push(map_element(item, 0, &mut leaves)?);
     }
     Ok(mapped)
 }
@@ -604,19 +586,18 @@ fn map_filter_items(
 fn declare_node(
     node: &FilterNode<'_>,
     schema: &TableSchema,
-    surface: FilterSurface,
 ) -> Result<Vec<DeclarativePredicate>, FilterError> {
     match node {
-        FilterNode::Leaf { column, op, value } => declare_leaf(column, op, value, schema, surface),
+        FilterNode::Leaf { column, op, value } => declare_leaf(column, op, value, schema),
         FilterNode::Or(branches) => {
             let mut bound_branches = Vec::with_capacity(branches.len());
             for branch in branches {
-                bound_branches.push(declare_node(branch, schema, surface)?);
+                bound_branches.push(declare_node(branch, schema)?);
             }
             Ok(vec![DeclarativePredicate::Or(bound_branches)])
         }
         FilterNode::Not(inner) => {
-            let inner_preds = declare_node(inner, schema, surface)?;
+            let inner_preds = declare_node(inner, schema)?;
             declarative_predicate::negate_conjunction(inner_preds).map_err(FilterError::Bind)
         }
     }
@@ -630,7 +611,6 @@ fn declare_leaf(
     op: &str,
     value: &JsonValue,
     schema: &TableSchema,
-    surface: FilterSurface,
 ) -> Result<Vec<DeclarativePredicate>, FilterError> {
     let Some(col) = schema.columns.iter().find(|c| c.name == column) else {
         // 未知列は op・値によらず engine の「unknown column」（`22000`）へ委譲する
@@ -662,9 +642,7 @@ fn declare_leaf(
         "not_null" => Ok(vec![DeclarativePredicate::Leaf(
             DeclarativeFilter::is_not_null(column),
         )]),
-        _ => Ok(vec![declare_basic_leaf(
-            column, op, value, schema, surface,
-        )?]),
+        _ => Ok(vec![declare_basic_leaf(column, op, value, schema)?]),
     }
 }
 
@@ -748,7 +726,6 @@ fn declare_basic_leaf(
     op: &str,
     value: &JsonValue,
     schema: &TableSchema,
-    surface: FilterSurface,
 ) -> Result<DeclarativePredicate, FilterError> {
     let Some(col) = schema.columns.iter().find(|c| c.name == column) else {
         return Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
@@ -779,7 +756,7 @@ fn declare_basic_leaf(
                 key: "value",
             }));
         };
-        return declare_in(column, &col.ty, items, surface);
+        return declare_in(column, &col.ty, items);
     }
 
     if let Some(cmp) = range_op(op) {
@@ -1030,7 +1007,6 @@ fn declare_in(
     column: &str,
     ty: &ColumnType,
     items: &[JsonValue],
-    surface: FilterSurface,
 ) -> Result<DeclarativePredicate, FilterError> {
     match ty {
         ColumnType::Text | ColumnType::Enum(_) => {
@@ -1098,9 +1074,9 @@ fn declare_in(
                 column, values,
             )))
         }
-        // 述語形 DML の配列列 `in`: 各要素は JSON 配列（SQL の `tags IN ('{..}', ..)` の
+        // 配列列 `in`（search／scan／aggregate・述語形 DML 共通。Issue #1410・#1429）: 各要素は JSON 配列（SQL の `tags IN ('{..}', ..)` の
         // 配列リテラル文字列と同じ綴りへ正規化する。Issue #1410）。
-        ColumnType::Array(at) if surface == FilterSurface::PredicateDml => {
+        ColumnType::Array(at) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 match item {
@@ -1118,8 +1094,8 @@ fn declare_in(
                 column, values,
             )))
         }
-        // 述語形 DML の JSON／JSONB 列 `in`: 各要素は JSON オブジェクトか配列（正規直列化）。
-        ColumnType::Json | ColumnType::Jsonb if surface == FilterSurface::PredicateDml => {
+        // JSON／JSONB 列 `in`（同上）: 各要素は JSON オブジェクトか配列（正規直列化）。
+        ColumnType::Json | ColumnType::Jsonb => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 match item {
@@ -1135,13 +1111,6 @@ fn declare_in(
             }
             Ok(DeclarativePredicate::Leaf(DeclarativeFilter::in_list(
                 column, values,
-            )))
-        }
-        // search／scan／aggregate では配列列・JSON 列の `in` は対象外（曖昧に受理せず
-        // 明示的な型不一致 `42601` で拒否する。Issue #1193。述語形 DML は上の腕）。
-        ColumnType::Array(_) | ColumnType::Json | ColumnType::Jsonb => {
-            Err(FilterError::Value(TypedJsonError::TypeMismatch(
-                "in filter is not supported for ARRAY/JSON columns (use eq)",
             )))
         }
         // 数値 4 型は SQL の数値リテラル `col IN (1, 2)` の脱糖（`col = 1 OR col = 2`。
@@ -1183,10 +1152,10 @@ pub fn bind_filter(
     schema: &TableSchema,
     udfs: &udf_call::UdfRegistry,
 ) -> Result<declarative_predicate::BoundWhereFilters, FilterError> {
-    let mapped = map_filter_items(items, FilterSurface::Query)?;
+    let mapped = map_filter_items(items)?;
     let mut preds = Vec::with_capacity(mapped.len());
     for node in &mapped {
-        preds.extend(declare_node(node, schema, FilterSurface::Query)?);
+        preds.extend(declare_node(node, schema)?);
     }
     declarative_predicate::bind_declarative_predicates(&preds, schema, udfs)
         .map_err(FilterError::Bind)
@@ -1573,7 +1542,7 @@ fn where_predicates_for_node(
 /// TASK-186・NOSQL-12、Issue #1062・#1197・#1356。宣言順を保った `AND` 結合）。
 /// `search`／`scan`／`aggregate` と同じ語彙（`or`・範囲比較・`in`・数値列の
 /// `eq`／`ne`／`between`、`ARRAY`／`JSON`／`JSONB` 列の `eq`／`ne`／`in`〔Issue #1410〕を含む）を受理する。
-/// なお `search`／`scan`／`aggregate` では ARRAY／JSON 列の `in` は従来どおり `42601`。
+/// `search`／`scan`／`aggregate`（[`bind_filter`]）も ARRAY／JSON 列の `in` を同じ `declare_in` 腕で束縛する（Issue #1429）。
 ///
 /// 手順: (1) [`map_filter_items`] で形・語彙・RLS 述語名・上限を検査、(2) `search` と
 /// 同じ経路（[`declare_node`] → [`declarative_predicate::bind_declarative_predicates`]）で
@@ -1587,10 +1556,10 @@ pub fn bind_filter_where_predicates(
     items: &[JsonValue],
     schema: &TableSchema,
 ) -> Result<Vec<WherePredicate>, FilterError> {
-    let mapped = map_filter_items(items, FilterSurface::PredicateDml)?;
+    let mapped = map_filter_items(items)?;
     let mut declared = Vec::with_capacity(mapped.len());
     for node in &mapped {
-        declared.extend(declare_node(node, schema, FilterSurface::PredicateDml)?);
+        declared.extend(declare_node(node, schema)?);
     }
     declarative_predicate::bind_declarative_predicates(
         &declared,
@@ -1972,7 +1941,7 @@ mod tests {
         // 範囲・prefix・in の値には配列・オブジェクトを許さない。
         let err = bind(r#"[{"column":"doc","op":"prefix","value":{"a":1}}]"#).expect_err("reject");
         assert!(matches!(err, FilterError::Shape(_)));
-        // 配列列・JSON 列の in は明示的に拒否する。
+        // 配列列・JSON 列の in はスカラー要素を型不一致（42601）で拒否する。
         for json in [
             r#"[{"column":"tags","op":"in","value":["{a}"]}]"#,
             r#"[{"column":"doc","op":"in","value":["{}"]}]"#,
@@ -2305,15 +2274,71 @@ mod tests {
     }
 
     #[test]
-    fn composite_in_stays_rejected_for_query_surface() {
-        let items = filter_items(r#"[{"column":"tags","op":"in","value":[["a"]]}]"#);
-        let err = bind_filter(&items, &schema(), &udf_call::UdfRegistry::default())
-            .expect_err("query surface rejects");
-        assert_eq!(err.wire_code(), "42601");
-        let items = filter_items(r#"[{"column":"doc","op":"in","value":[{"k":1}]}]"#);
-        let err = bind_filter(&items, &schema(), &udf_call::UdfRegistry::default())
-            .expect_err("query surface rejects");
-        assert_eq!(err.wire_code(), "42601");
+    fn composite_in_binds_on_query_surface() {
+        // search／scan／aggregate も述語形 DML と同じ写像で ARRAY／JSON 列の in を受理する（Issue #1429）。
+        for json in [
+            r#"[{"column":"tags","op":"in","value":[["a"]]}]"#,
+            r#"[{"column":"tags","op":"in","value":[["a"],["b","c"]]}]"#,
+            r#"[{"column":"doc","op":"in","value":[{"k":1},[1,2]]}]"#,
+            r#"[{"not":{"column":"tags","op":"in","value":[["a"]]}}]"#,
+            r#"[{"or":[{"column":"tags","op":"in","value":[["a"]]},{"column":"doc","op":"in","value":[{"k":1}]}]}]"#,
+        ] {
+            let items = filter_items(json);
+            let bound = bind_filter(&items, &schema(), &udf_call::UdfRegistry::default())
+                .unwrap_or_else(|e| panic!("{json}: {}", e.wire_code()));
+            // `or` は metadata_filters ではなく OR 群として保持されるため、それ以外のみ件数を見る。
+            if !json.contains("\"or\"") {
+                assert_eq!(bound.metadata_filters().len(), 1, "{json}");
+            }
+            // 述語形 DML 経路でも同じ入力が束縛できる（写像共有）。
+            bind_filter_where_predicates(&items, &schema()).expect("dml parity");
+        }
+    }
+
+    #[test]
+    fn composite_in_type_mismatch_and_limits_on_query_surface() {
+        let q = |json: &str| {
+            bind_filter(
+                &filter_items(json),
+                &schema(),
+                &udf_call::UdfRegistry::default(),
+            )
+            .err()
+            .map(|e| e.wire_code())
+        };
+        for json in [
+            r#"[{"column":"tags","op":"in","value":[{"a":1}]}]"#,
+            r#"[{"column":"tags","op":"in","value":[null]}]"#,
+            r#"[{"column":"tags","op":"in","value":["{a}"]}]"#,
+            r#"[{"column":"doc","op":"in","value":[1]}]"#,
+            r#"[{"column":"doc","op":"in","value":["x"]}]"#,
+            r#"[{"column":"doc","op":"in","value":[null]}]"#,
+            r#"[{"column":"lang","op":"in","value":[["a"]]}]"#,
+        ] {
+            assert_eq!(q(json), Some("42601"), "{json}");
+        }
+        assert_eq!(
+            q(r#"[{"column":"tags","op":"in","value":[["a","b","c","d","e"]]}]"#),
+            Some("54000")
+        );
+        let many = format!(
+            r#"[{{"column":"doc","op":"in","value":[{}]}}]"#,
+            vec!["{}"; declarative_filter::MAX_IN_LIST_ITEMS + 1].join(",")
+        );
+        assert_eq!(q(&many), Some("54000"));
+    }
+
+    #[test]
+    fn composite_in_on_boolean_column_is_22000_on_both_surfaces() {
+        // 要素形状ゲートを撤去した結果の意図した分類変更（Issue #1429）:
+        // BOOLEAN 列への合成要素の in は engine の「IN 非対応列」（22000）になり、
+        // 述語形 DML・SQL 表層と同じ分類へ揃う。
+        let items = filter_items(r#"[{"column":"active","op":"in","value":[[1]]}]"#);
+        let q = bind_filter(&items, &schema(), &udf_call::UdfRegistry::default())
+            .expect_err("boolean in unsupported");
+        let d = bind_filter_where_predicates(&items, &schema()).expect_err("dml parity");
+        assert_eq!(q.wire_code(), "22000");
+        assert_eq!(d.wire_code(), q.wire_code());
     }
 
     #[test]

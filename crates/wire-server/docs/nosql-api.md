@@ -761,7 +761,8 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 ### 葉（leaf）
 
 - `column`（文字列）・`op`（文字列）・`value`（文字列・数値・真偽値、`in`／
-  `between` の配列、ARRAY／JSON 列への `eq`／`ne` の配列・オブジェクト）の 3 つの
+  `between` の配列、ARRAY／JSON 列への `eq`／`ne` の配列・オブジェクト、`in` の要素としての
+  配列・オブジェクト）の 3 つの
   フィールドのみ。`is_null`／`not_null` は `value` を**持たない**（`null` を含め
   付いていれば `42601`）
 - `op` は次の 14 語彙（完全一致。大文字小文字の読み替えなし。`"op":"not"` は
@@ -801,8 +802,10 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   `NUMERIC`（数値または数値文字列の配列）・`BYTEA`（base64 の JSON string の
   配列）・`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`（JSON 数値の配列。
   非数値要素は `42601`。SQL の数値リテラル `col IN (1, 2)` と同じく
-  `col = 1 OR col = 2` の式レーンへ展開し、要素 1 個は平坦化する。Issue #1356）のみ
-  受理する。他の列型（`BOOLEAN`／`VECTOR`）は engine 側の「IN 非対応列」判定
+  `col = 1 OR col = 2` の式レーンへ展開し、要素 1 個は平坦化する。Issue #1356）・
+  `ARRAY`（JSON 配列の配列。正規直列化して配列等価で照合）・`JSON`／`JSONB`（JSON
+  オブジェクトか配列の配列。Issue #1429）のみ受理する。ARRAY／JSON 列へのスカラー要素は
+  `42601`、要素数 256 超・配列要素数の上限超過は `54000`。他の列型（`BOOLEAN`／`VECTOR`）は engine 側の「IN 非対応列」判定
   （`22000`）へ委譲する
 - `INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION` 列への `eq`・範囲比較は
   JSON 数値のみ受理し（文字列・真偽値は型不一致）、式レーン
@@ -811,8 +814,8 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   式レーン（バイト順）で受理する
 - `prefix` は従来どおり `TEXT` 列限定（他の列型は `22000`）
 - `in` は列型に関わらず対応する場合のみ受理する（対象外の列型は `22000`）
-- 未知列・`VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否（`22000`）は
-  `engine::declarative_filter` の既存契約をそのまま透過する
+- 未知列、および範囲比較・`prefix` に対する `VECTOR`／`ARRAY`／`JSON`／`JSONB` 列拒否
+  （`22000`）は `engine::declarative_filter` の既存契約をそのまま透過する
 
 ### グループ（`not`）
 
@@ -858,14 +861,15 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 （それ以外の要素は `42601`、要素数 256 超・配列要素数の上限超過は `54000`）。値は
 サーバーの正規直列化（text[] は `{"a","b"}`、JSON はキー昇順・空白なし）でリテラル化
 するため、SQL 側のリテラルが同じ綴りのときに台帳照合が `23505` になり、綴りが違えば
-`22023`（拒否側）になる。なお `search`／`scan`／`aggregate` の `filter` では ARRAY／JSON
-列の `in` は従来どおり `42601`。述語の葉の上限（256。超過は `54000`）は変わらない。
+`22023`（拒否側）になる。`search`／`scan`／`aggregate` の `filter` も ARRAY／JSON 列の `in` を
+同じ写像で受理し、SQL の `SELECT ... WHERE col IN (...)` と同じ結果集合になる
+（Issue #1429。検証は `nosql14_query_composite_in_filter.rs`）。述語の葉の上限（256。超過は `54000`）は変わらない。
 数値列の `in` は JSON 上で 1 葉として事前検査されるが engine の事後検査は展開後の
 式を 1 個ずつ数えるため、他に葉があり `in` が 256 要素ちょうどのとき NoSQL だけが
 `54000` になりうる（拒否側に倒れる既知の差分）。実装は
 [`filter::bind_filter_where_predicates`](../src/http/query/filter.rs)、検証コードは
 `crates/wire-server/tests/nosql12_predicate_dml_numeric_filter.rs`・
-`nosql12_predicate_dml_composite_filter.rs`・
+`nosql12_predicate_dml_composite_filter.rs`・`nosql14_query_composite_in_filter.rs`・
 `nosql12_update_delete.rs`。
 
 ## `explain`
