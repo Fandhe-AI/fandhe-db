@@ -656,3 +656,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/sql/allowlist.rs`（`ValidatedBufferedView` を `outer: BufferedOuter`〔`Rows`／`Aggregate`〕へ再構成、集計・DISTINCT のルーティング、`check_buffered_body_shape` の連鎖アーム、`buffered_layer_statement`）、`sql/view_buffered.rs`（外側の計画・実行。集計・式 `ORDER BY`・ウィンドウ・列スコープ検査）、`sql/group_by.rs`（`finish_groups` の切り出しと `GroupedRowAccumulator`）、`sql/window.rs`（`collect_window_row_values` の切り出しと `CellWindowEvaluator`）、`sql/view.rs`（連鎖の畳み込み・深さ計数の lookup）、`catalog.rs`（DAG 深さ・作成時の実カタログ検証 `TxnViewLookup`）、テスト（`tests/table18_buffered_outer.rs` 新規・`table18_view.rs` の期待値反転・単体テスト）、`docs/design/create-view.md`（Phase 4 節）。
 - **性質**: 外側の集計・`GROUP BY`・`HAVING`・`SELECT DISTINCT`・ウィンドウ関数・式 `ORDER BY` が、参照セッション自身の RLS で評価した本文の結果を母集合に評価される。ビューが公開しない物理キー `id` は集計・グループ化・並べ替え・分割に使えず `22000`。評価後射影形ビューの連鎖（評価後射影形→評価後射影形・単純形→評価後射影形）を受理し、深さ上限（4）超過は `54000`。依存検査（`2BP01`・`DROP COLUMN` の保守的拒否）は不変。RLS・テナント境界・fail-closed・依存は不変。
 - **対象外**: 外側の式項目・投影位置のスカラーサブクエリ・UDF 述語／サブクエリ述語・集計の式引数、CTE・サブクエリ・集合演算の枝・JOIN の辺からの評価後射影形ビュー参照、本文でのウィンドウ関数・式項目・UDF 述語、評価後射影形ビューへの `EXPLAIN`・cursor `DECLARE`、NoSQL 表層でのビュー指定。
+
+## Issue #1412: CREATE TABLE の名前付き主キーと主キー重複宣言の 42P16
+
+- **対象ビヘイビア**: TABLE-22 (a)(d)（関連: ERR-4・ERR-6）。
+- **変更箇所**: `crates/engine/src/sql/allowlist.rs`（`ValidatedCreateTable.primary_key_name` 追加、表制約・列制約の `CONSTRAINT <name> PRIMARY KEY`、重複宣言の遅延 `42P16`、名前付き `(id)` の `42601`、明示名重複検査）、`sql/ddl.rs`（`with_primary_key_name` の適用）、テスト（`tests/sql_create_table_named_primary_key.rs` 新規・`table16_primary_key.rs` の期待値を `42P16` へ変更・単体テスト・`wire-server/tests/err4_http_projection.rs`）、`crates/wire-server/docs/nosql-api.md`、`docs/design/sql-primary-key.md`・`alter-table-primary-key.md`。
+- **性質**: `CREATE TABLE` が名前付き主キーを受理し、その名前で `DROP CONSTRAINT` できる。主キーの重複宣言は構文検証後に `42P16`（HTTP 400）で拒否し副作用は残さない。NoSQL の `create_table.constraints` の `primary_key` 重複も `42P16` で到達可能。RLS・テナント境界・fail-closed・依存は不変。
+- **破壊的変更**: `CREATE TABLE` の主キー重複宣言の SQLSTATE が `42601` から `42P16` へ変わる。公開構造体 `ValidatedCreateTable` に pub フィールド `primary_key_name` を追加。
+- **対象外**: NoSQL 表層の名前付き主キー、`CREATE TABLE` 内の `CONSTRAINT <name> UNIQUE`・列制約の `CONSTRAINT <name> REFERENCES`、明示 PK 名と既定 CHECK 名の衝突回避。

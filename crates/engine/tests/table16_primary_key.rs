@@ -142,8 +142,10 @@ fn create_table_accepts_id_only_primary_key_as_a_no_op() {
     );
 }
 
-// --- 拒否系（構造検証段階。42601／42701／54000） -------------------------
+// --- 拒否系（構造検証段階。42601／42701／42P16／54000） -------------------------
 
+/// 主キーの重複宣言は `42P16`（TABLE-22(d)・ERR-6。Issue #1412 で `42601` から変更）。
+/// 構造段で拒否するため副作用は無く、同名テーブルをその後作成できる。
 #[test]
 fn create_table_rejects_multiple_primary_key_declarations() {
     let (core, path) = new_core("pk-multiple-declarations");
@@ -151,23 +153,27 @@ fn create_table_rejects_multiple_primary_key_declarations() {
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    let err = core
-        .execute_sql_in_session(
-            &alice,
-            &mut session,
-            "CREATE TABLE docs (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY)",
-        )
-        .expect_err("two column-constraint PRIMARY KEY declarations must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    for sql in [
+        "CREATE TABLE docs (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY)",
+        "CREATE TABLE docs (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b))",
+    ] {
+        let err = core
+            .execute_sql_in_session(&alice, &mut session, sql)
+            .expect_err("duplicate PRIMARY KEY declarations must be rejected");
+        assert_eq!(err.wire_code(), "42P16", "{sql}");
+        assert_eq!(
+            ClassifiedError::error_class(&err),
+            ErrorClass::InvalidTableDefinition
+        );
+    }
 
-    let err = core
-        .execute_sql_in_session(
-            &alice,
-            &mut session,
-            "CREATE TABLE docs2 (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b))",
-        )
-        .expect_err("a column-constraint and a table-constraint PRIMARY KEY must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    // 副作用ゼロ: テーブルは作られておらず、正しい定義で作成できる。
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a TEXT PRIMARY KEY, b TEXT)",
+    )
+    .expect("table must not exist after rejected duplicate declarations");
 }
 
 #[test]

@@ -536,8 +536,9 @@ pub enum SqlSurfaceError {
     /// Issue #1405）。ERR-6: `42710`（`DuplicateObject` と同じ分類を共有する）。
     /// 既存の型定義は変更しない。
     DuplicateType { name: String },
-    /// 主キー宣言済みのテーブルへの `ALTER TABLE ... ADD PRIMARY KEY` の重複宣言
-    /// （TABLE-22 (d)、Issue #1364）。ERR-6: `42P16`。`table` はクライアント自身が
+    /// 主キーの重複宣言: 主キー宣言済みのテーブルへの `ALTER TABLE ... ADD PRIMARY KEY`
+    /// （Issue #1364）と `CREATE TABLE` 内の 2 個目以降の主キー宣言（Issue #1412）
+    /// （TABLE-22 (d)）。ERR-6: `42P16`。`table` はクライアント自身が
     /// 指定したテーブル名。
     InvalidTableDefinition { table: String },
     /// 分割実行 DML が 1 チャンク以上 commit した後に止まった（Issue #1129・
@@ -745,7 +746,7 @@ impl SqlSurfaceError {
 
     /// `pub(crate)`: `sql::ddl` の `ALTER TABLE ... ADD PRIMARY KEY` の重複宣言
     /// （Issue #1364）が `catalog::CatalogError::MultiplePrimaryKeys` を写像する
-    /// ために使う。テーブル名は untrusted な字句解析結果のため切り詰める。
+    /// ほか、`CREATE TABLE` の構文段（Issue #1412）が主キー重複宣言に使う。テーブル名は untrusted な字句解析結果のため切り詰める。
     pub(crate) fn invalid_table_definition(table: impl Into<String>) -> Self {
         SqlSurfaceError::InvalidTableDefinition {
             table: truncate_for_error(&table.into()),
@@ -2506,6 +2507,8 @@ struct ColumnConstraints {
 struct ParsedCreateTableColumn {
     column: ColumnDef,
     primary_key: bool,
+    /// 列制約 `CONSTRAINT <name> PRIMARY KEY` の明示名（Issue #1412。TABLE-22）。
+    primary_key_name: Option<String>,
     unique: bool,
     /// 列定義の後ろに続く列制約 `[CONSTRAINT <name>] CHECK (...)`（0 個以上。
     /// TABLE-16・TASK-204、Issue #906）。
@@ -2819,6 +2822,14 @@ pub struct ValidatedCreateTable {
     /// 制約との照合とともに `catalog::Storage::create_table` の write トランザクション
     /// 内で解決される。
     pub foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
+    /// `CONSTRAINT <name> PRIMARY KEY` で明示された主キー制約名（TABLE-22、
+    /// Issue #1412）。最初に現れた主キー宣言の名前だけを保持し、未指定は `None`。
+    /// 導出名 `<table>_pkey` との一致の正規化はカタログ側
+    /// （`TableSchema::with_primary_key_name`）が行う。
+    ///
+    /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは
+    /// 追随が必要）。
+    pub primary_key_name: Option<String>,
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
@@ -2832,6 +2843,7 @@ fn finalize_foreign_keys(
     foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
     columns: &[ColumnDef],
     checks: &[ParsedCheck],
+    primary_key_name: Option<&str>,
 ) -> Result<Vec<crate::catalog::ForeignKeyDef>, SqlSurfaceError> {
     for fk in &foreign_keys {
         for name in fk.columns() {
@@ -2848,9 +2860,19 @@ fn finalize_foreign_keys(
     // （`sql::check_constraint::validate_and_build`）と同じ `42601` に揃える。
     // 既定名（空文字列）同士は互いに衝突判定の対象外
     // （`assign_foreign_key_constraint_names` が最終的に確定する）。
+    // 明示主キー名（Issue #1412）も同じ名前空間に属するため、先に積んで CHECK・FK
+    // の明示名との重複を `42601` にする。
     let mut explicit_names: Vec<&str> = Vec::new();
+    if let Some(pk) = primary_key_name {
+        explicit_names.push(pk);
+    }
     for check in checks {
         if let Some(n) = &check.name {
+            if primary_key_name == Some(n.as_str()) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "duplicate constraint name: {n}"
+                )));
+            }
             explicit_names.push(n.as_str());
         }
     }
@@ -6501,6 +6523,11 @@ impl<'a> Parser<'a> {
         // まとめて行う（表制約は宣言順に関わらず任意位置の列を参照できる
         // ため）。
         let mut primary_key: Option<Vec<String>> = None;
+        // 最初の主キー宣言の明示名（Issue #1412）と、2 個目以降の主キー宣言の検出
+        // フラグ。重複宣言は構文を最後まで消費・検証した後、列リストの `)` 直後で
+        // `42P16` にする（構文エラーを優先。ERR-6）。
+        let mut primary_key_name: Option<String> = None;
+        let mut duplicate_primary_key = false;
         // UNIQUE 制約（列制約・表制約。TABLE-16・TASK-204、Issue #905）。参照列の
         // 解決は `finalize_unique_constraints` が列リスト全体の構文判定後に行う。
         let mut unique_constraints: Vec<Vec<String>> = Vec::new();
@@ -6517,12 +6544,28 @@ impl<'a> Parser<'a> {
             // （`KEY` は列型キーワードではないため、列名 `primary` との構文上の
             // 曖昧さは生じない）。
             if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
+                let cols = self.parse_primary_key_table_constraint()?;
                 if primary_key.is_some() {
-                    return Err(SqlSurfaceError::unsupported(
-                        "CREATE TABLE must declare at most one PRIMARY KEY",
-                    ));
+                    duplicate_primary_key = true;
+                } else {
+                    primary_key = Some(cols);
                 }
-                primary_key = Some(self.parse_primary_key_table_constraint()?);
+            } else if self.peek_ident_matches("CONSTRAINT")
+                && self.peek_ident_matches_at(2, "PRIMARY")
+                && self.peek_ident_matches_at(3, "KEY")
+            {
+                // 表制約 `CONSTRAINT <name> PRIMARY KEY (...)`（TABLE-22(a)・
+                // Issue #1412）。`FOREIGN KEY` 形と同様、素の `CONSTRAINT` を CHECK
+                // 句開始とみなす `peek_check_clause_start` より先に判定する。
+                self.advance();
+                let name = self.parse_constraint_name()?;
+                let cols = self.parse_primary_key_table_constraint()?;
+                if primary_key.is_some() {
+                    duplicate_primary_key = true;
+                } else {
+                    primary_key = Some(cols);
+                    primary_key_name = Some(name);
+                }
             } else if self.peek_ident_matches("UNIQUE")
                 && matches!(
                     self.tokens.get(self.pos.saturating_add(1)),
@@ -6607,11 +6650,11 @@ impl<'a> Parser<'a> {
                 checks.extend(parsed.checks);
                 if parsed.primary_key {
                     if primary_key.is_some() {
-                        return Err(SqlSurfaceError::unsupported(
-                            "CREATE TABLE must declare at most one PRIMARY KEY",
-                        ));
+                        duplicate_primary_key = true;
+                    } else {
+                        primary_key = Some(vec![parsed.column.name.clone()]);
+                        primary_key_name = parsed.primary_key_name.clone();
                     }
-                    primary_key = Some(vec![parsed.column.name.clone()]);
                 }
                 if parsed.unique {
                     if unique_constraints.len() >= crate::catalog::MAX_UNIQUE_CONSTRAINTS {
@@ -6647,6 +6690,12 @@ impl<'a> Parser<'a> {
             break;
         }
         self.expect_punct(')')?;
+        // 主キーの重複宣言（TABLE-22(d)・ERR-6、Issue #1412）。構文は上で最後まで
+        // 検証済み。カタログを参照しない構造段の判定のため存在オラクルにならず、
+        // 何も書き込まない。
+        if duplicate_primary_key {
+            return Err(SqlSurfaceError::invalid_table_definition(table_name));
+        }
         // 列定義は 1 件以上必須（表制約 `PRIMARY KEY`／`UNIQUE`／`CHECK` だけの
         // 列リストは列を持たないテーブルになる）。カタログの `validate_schema` も
         // 拒否するが、構文段の不変条件としてここで `42601` にする（fail-closed。
@@ -6658,9 +6707,20 @@ impl<'a> Parser<'a> {
             ));
         }
 
+        // 名前付きの `PRIMARY KEY (id)` は暗黙主キー（`None` へ正規化され何も
+        // 永続化されない）と両立せず、名前が黙って捨てられるため `42601`（fail-closed）。
+        if primary_key_name.is_some()
+            && matches!(&primary_key, Some(cols) if cols.len() == 1
+                && cols.iter().any(|c| c.eq_ignore_ascii_case("id")))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "a named PRIMARY KEY must not declare only the implicit id column",
+            ));
+        }
         let primary_key = finalize_primary_key(primary_key, &mut columns)?;
         let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
-        let foreign_keys = finalize_foreign_keys(foreign_keys, &columns, &checks)?;
+        let foreign_keys =
+            finalize_foreign_keys(foreign_keys, &columns, &checks, primary_key_name.as_deref())?;
 
         Ok(ValidatedCreateTable {
             table_name,
@@ -6669,13 +6729,34 @@ impl<'a> Parser<'a> {
             unique_constraints,
             checks,
             foreign_keys,
+            primary_key_name,
         })
+    }
+
+    /// 制約名 1 個を読み、識別子形式と列型キーワードとの非衝突を検証する
+    /// （CHECK・FK・PK の明示名で共通。Issue #1412）。違反は `42601`。
+    fn parse_constraint_name(&mut self) -> Result<String, SqlSurfaceError> {
+        let name = self.expect_ident()?;
+        crate::catalog::validate_identifier(&name)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid constraint name: {e}")))?;
+        if CREATE_TABLE_COLUMN_TYPE_KEYWORDS
+            .iter()
+            .any(|kw| name.eq_ignore_ascii_case(kw))
+        {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "constraint name {name:?} collides with a column type keyword"
+            )));
+        }
+        Ok(name)
     }
 
     /// 現在位置が `CREATE TABLE` の列リスト要素としての `CHECK` 句の開始位置
     /// （`CHECK (`、または `CONSTRAINT`）であるかを消費せずに判定する（TABLE-16・
     /// TASK-204、Issue #906）。`CHECK`／`CONSTRAINT` はキーワード化しない
     /// （`sql::lexer` のモジュール方針。この位置でのみ文脈的に照合する）。
+    ///
+    /// 手前で表制約 `CONSTRAINT <name> FOREIGN KEY`・`CONSTRAINT <name> PRIMARY KEY`
+    /// の 2 分岐が先に判定するため、本関数が `true` を返すのはそれ以外の `CONSTRAINT`。
     ///
     /// 曖昧さの排除: 列名 `check`／`constraint` は [`Self::parse_create_table_column`]
     /// が予約語として `42601` で拒否するため、要素先頭の `CONSTRAINT` は常に制約
@@ -6858,14 +6939,25 @@ impl<'a> Parser<'a> {
             column
         };
 
-        // 列制約 `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`CONSTRAINT
-        // <name> PRIMARY KEY` 形・`REFERENCES` はいずれも許可リスト外のまま
-        // （受理しない。`CONSTRAINT <name>` は後段の `CHECK` にのみ前置できる）。`NOT NULL`／`DEFAULT`（Issue #904）・`UNIQUE`
+        // 列制約 `[CONSTRAINT <name>] PRIMARY KEY`（TABLE-16・TASK-204、Issue #903／
+        // #1412）。`CONSTRAINT <name>` は `PRIMARY KEY` と後段の `CHECK` に前置できる。`NOT NULL`／`DEFAULT`（Issue #904）・`UNIQUE`
         // （Issue #905）は列型キーワードの直後（`parse_column_constraints` 内）で
         // 先に受理済みで、`PRIMARY KEY` は
         // その後段の独立した列制約として構文上共存できる（`finalize_primary_key`
         // が主キー列の `nullable` を最終的に `false` へ強制する）。
+        let mut pk_name: Option<String> = None;
         let is_pk = if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
+            self.advance();
+            self.advance();
+            true
+        } else if self.peek_ident_matches("CONSTRAINT")
+            && self.peek_ident_matches_at(2, "PRIMARY")
+            && self.peek_ident_matches_at(3, "KEY")
+        {
+            // 列制約 `CONSTRAINT <name> PRIMARY KEY`（TABLE-22(a)・Issue #1412）。
+            // CHECK ループの `peek_check_clause_start` より先に消費する。
+            self.advance();
+            pk_name = Some(self.parse_constraint_name()?);
             self.advance();
             self.advance();
             true
@@ -6903,6 +6995,7 @@ impl<'a> Parser<'a> {
         Ok(ParsedCreateTableColumn {
             column,
             primary_key: is_pk,
+            primary_key_name: pk_name,
             unique,
             checks,
             references,
@@ -17221,6 +17314,70 @@ mod tests {
             Ok(v) => panic!("expected error, got ok: {v:?}"),
             Err(e) => e,
         }
+    }
+
+    // --- 名前付き主キー・重複宣言（TABLE-22(a)(d)・ERR-6、Issue #1412） -----
+
+    #[test]
+    fn create_table_accepts_named_primary_key_table_and_column_form() {
+        let v = parse_create_table_ok(
+            "CREATE TABLE t (a TEXT, b TEXT, CONSTRAINT pk_t PRIMARY KEY (a, b))",
+        );
+        assert_eq!(v.primary_key, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(v.primary_key_name.as_deref(), Some("pk_t"));
+        let v =
+            parse_create_table_ok("CREATE TABLE t (a TEXT CONSTRAINT pk_t PRIMARY KEY, b TEXT)");
+        assert_eq!(v.primary_key, Some(vec!["a".to_string()]));
+        assert_eq!(v.primary_key_name.as_deref(), Some("pk_t"));
+        let v = parse_create_table_ok("CREATE TABLE t (a TEXT PRIMARY KEY)");
+        assert_eq!(v.primary_key_name, None);
+    }
+
+    #[test]
+    fn create_table_duplicate_primary_key_is_42p16() {
+        for sql in [
+            "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY)",
+            "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b))",
+            "CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a), PRIMARY KEY (b))",
+            "CREATE TABLE t (a TEXT, b TEXT, CONSTRAINT x PRIMARY KEY (a), CONSTRAINT y PRIMARY KEY (b))",
+            "CREATE TABLE t (a TEXT CONSTRAINT x PRIMARY KEY, b TEXT, CONSTRAINT y PRIMARY KEY (b))",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42P16", "{sql}");
+        }
+    }
+
+    #[test]
+    fn create_table_duplicate_primary_key_syntax_error_takes_precedence() {
+        // 遅延判定: 後続の構文エラー（列リスト未完）は 42P16 より優先する。
+        assert_eq!(
+            parse_create_table_err("CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT PRIMARY KEY, c")
+                .wire_code(),
+            "42601"
+        );
+        assert_eq!(
+            parse_create_table_err(
+                "CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT, PRIMARY KEY (b, b))"
+            )
+            .wire_code(),
+            "42701"
+        );
+    }
+
+    #[test]
+    fn create_table_named_primary_key_rejections_are_42601() {
+        for sql in [
+            "CREATE TABLE t (a TEXT, CONSTRAINT x PRIMARY KEY (id))",
+            "CREATE TABLE t (a TEXT, CONSTRAINT text PRIMARY KEY (a))",
+            "CREATE TABLE t (a TEXT CONSTRAINT text PRIMARY KEY)",
+            "CREATE TABLE t (a TEXT, CONSTRAINT x PRIMARY KEY (a), CONSTRAINT x CHECK (a = 'v'))",
+            "CREATE TABLE t (a TEXT, CONSTRAINT x CHECK (a = 'v'), CONSTRAINT x PRIMARY KEY (a))",
+            "CREATE TABLE t (a TEXT, b TEXT, CONSTRAINT x PRIMARY KEY (a), CONSTRAINT x FOREIGN KEY (b) REFERENCES t (a))",
+        ] {
+            assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
+        }
+        // 無名の `PRIMARY KEY (id)` は従来どおり受理して `None` に正規化する。
+        let v = parse_create_table_ok("CREATE TABLE t (a TEXT, PRIMARY KEY (id))");
+        assert_eq!(v.primary_key, None);
     }
 
     #[test]
