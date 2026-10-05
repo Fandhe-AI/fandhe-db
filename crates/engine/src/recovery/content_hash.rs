@@ -1588,7 +1588,8 @@ fn canonical_decimal_parts(raw: &str) -> Option<String> {
         None => 0,
     };
     let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if int_part.is_empty()
+    // 先頭ドット形（`.5`）は整数部が空でも小数部があれば `0.5` と同一視する。
+    if (int_part.is_empty() && frac_part.is_empty())
         || !int_part.bytes().all(|c| c.is_ascii_digit())
         || !frac_part.bytes().all(|c| c.is_ascii_digit())
     {
@@ -1612,23 +1613,6 @@ fn canonical_decimal_text(raw: &str) -> String {
     canonical_decimal_parts(raw).unwrap_or_else(|| raw.to_string())
 }
 
-/// 数値リテラル `raw` が f64 `v` へ値を変えずに往復できるか。`v` の最短往復表記
-/// （`{:e}`。桁数に依らず指数形）と正確な十進値の正規形が一致するときのみ忠実とみなす。
-/// 平文十進・指数表記のどちらも同じ基準で判定する（Issue #1430 codex P1・Bugbot 指摘）。
-/// 非有限値・解釈不能な入力は忠実でない（呼び出し側が生テキスト系へ倒す）。
-fn number_literal_is_f64_faithful(raw: &str, v: f64) -> bool {
-    if !v.is_finite() {
-        return false;
-    }
-    match (
-        canonical_decimal_parts(raw),
-        canonical_decimal_parts(&format!("{v:e}")),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
-
 /// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
 /// `Ident` が参照 UDF 自身のパラメータ（大文字小文字を区別せず照合）を指すときに
 /// 限り小文字化して連結する（ADR §4.4.1「6.」。`bind_expr_in` のパラメータ解決が
@@ -1645,27 +1629,20 @@ fn push_dml_expr(
     match expr {
         // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの比較は束縛段で正確な 10 進値
         // として受理されるため、f64 で正確に表せない整数（2^53 超）もここへ到達する。
-        // 従来どおり f64 で直列化できる入力はタグ 1 のまま（既存ハッシュ不変）、できない入力
-        // だけを新タグ 11＋生テキストで直列化する（従来エラーだった入力のみが対象で台帳互換）。
-        // 値の妥当性（範囲・型）は束縛段が検査する。
+        // 従来 f64 へ解釈できた（受理済みの）リテラルは、小数・指数表記を含めすべてタグ 1＋
+        // f64 ビット列のまま直列化する（既存の operation_id 台帳の content hash を変えず、
+        // 再送照合の互換を保つ。公開 API・エラー契約の互換性）。従来 `parse_number_literal`
+        // が拒否していた入力（2^53 超の整数等）だけを新タグ 11＋正規化した十進文字列で
+        // 直列化する（従来エラーだった入力のみが対象で台帳互換）。値の妥当性（範囲・型）は
+        // 束縛段が検査する。
         Expr::Number(raw) => match crate::sql::udf_call::parse_number_literal(raw) {
-            // 十進表記が f64 の最短往復表記と一致する（f64 へ丸めても値が変わらない）入力は
-            // 従来どおりタグ 1（既存ハッシュ不変）。f64 へ丸めると別の十進値と同一視される
-            // 入力（`1.0000000000000001` と `1.0000000000000002` 等。NUMERIC 列との正確な
-            // 比較では別述語）は、RECOVER-10 の内容照合を誤一致させないようタグ 11＋
-            // 正規化した十進文字列で直列化する（Issue #1430 codex P1 指摘）。
-            Ok(v) if number_literal_is_f64_faithful(raw, v) => {
+            Ok(v) => {
                 b.push_u8(1);
                 b.push_raw(&v.to_bits().to_le_bytes());
             }
-            Ok(_) => {
-                b.push_u8(11);
-                b.push_bytes(canonical_decimal_text(raw).as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
             Err(_) => {
                 b.push_u8(11);
-                b.push_bytes(raw.as_bytes())
+                b.push_bytes(canonical_decimal_text(raw).as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
             }
         },
@@ -3654,37 +3631,34 @@ mod tests {
         assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
     }
 
-    /// Issue #1430（codex P1）: f64 へ丸めると同値になる異なる十進リテラルは別ハッシュ、
-    /// f64 で往復できる従来入力は表記差があっても同一（既存ハッシュ不変）。
+    /// Issue #1430（codex P1）: 従来受理されていた数値リテラル（小数・指数表記・先頭ドット
+    /// 形を含む）は従来どおりタグ 1＋f64 ビット列で直列化され、既存の台帳ハッシュを変えない。
+    /// 2^53 超の整数（従来エラー）だけがタグ 11＋正規化十進文字列になる。
     #[test]
-    fn dml_number_literal_hash_distinguishes_lossy_decimals() {
+    fn dml_number_literal_hash_keeps_legacy_tag1() {
         use crate::sql::udf_call::Expr;
         let hash = |raw: &str| {
             let mut b = HashInputBuilder::new(OpTag::Insert);
             push_dml_expr(&mut b, &Expr::Number(raw.to_string()), None).expect("push");
             b.finish()
         };
-        assert_ne!(hash("1.0000000000000001"), hash("1.0000000000000002"));
-        assert_ne!(hash("1.0000000000000001"), hash("1"));
-        assert_eq!(hash("1.0000000000000001"), hash("1.00000000000000010"));
-        assert_eq!(hash("1.5"), hash("1.50"));
-        assert_eq!(hash("1"), hash("1."));
-        // 指数表記も正確な十進値で判定する（f64 で別値になる指数表記は区別する）。
-        assert_ne!(hash("1.0000000000000001e0"), hash("1.0000000000000002e0"));
-        assert_ne!(hash("1.0000000000000001e0"), hash("1e0"));
-        assert_eq!(hash("1.0000000000000001e0"), hash("1.0000000000000001"));
-        // 1e-4 未満の小さな平文十進は従来どおりタグ 1（指数表記と同一ハッシュ）。
-        let mut small = HashInputBuilder::new(OpTag::Insert);
-        small.push_u8(1);
-        small.push_raw(&0.00001f64.to_bits().to_le_bytes());
-        assert_eq!(hash("0.00001"), small.finish());
-        assert_eq!(hash("0.00001"), hash("1e-5"));
-        assert_eq!(hash("100"), hash("1e2"));
-        // 従来入力（f64 で往復できる）はタグ 1＋ビット列のまま。
-        let mut b = HashInputBuilder::new(OpTag::Insert);
-        b.push_u8(1);
-        b.push_raw(&0.1f64.to_bits().to_le_bytes());
-        assert_eq!(hash("0.1"), b.finish());
+        let legacy = |v: f64| {
+            let mut b = HashInputBuilder::new(OpTag::Insert);
+            b.push_u8(1);
+            b.push_raw(&v.to_bits().to_le_bytes());
+            b.finish()
+        };
+        assert_eq!(hash("1.0000000000000001"), legacy(1.0000000000000001));
+        assert_eq!(hash("0.1"), legacy(0.1));
+        assert_eq!(hash(".5"), legacy(0.5));
+        assert_eq!(hash(".5"), hash("0.5"));
+        assert_eq!(hash("1."), legacy(1.0));
+        assert_eq!(hash("1e2"), hash("100"));
+        assert_eq!(hash("0.00001"), legacy(0.00001));
+        // 従来エラーだった 2^53 超の整数のみ新タグ。末尾ドット有無は同一視する。
+        assert_ne!(hash("9007199254740993"), hash("9007199254740995"));
+        assert_eq!(hash("9007199254740993"), hash("9007199254740993."));
+        assert_ne!(hash("9007199254740993"), legacy(9007199254740993f64));
     }
 
     // --- Issue #1127: 分割実行版ハッシュのドメイン分離 -------------------------
