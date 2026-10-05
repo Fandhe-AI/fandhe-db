@@ -1072,7 +1072,7 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-26 分類が共有する）。
+27 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
@@ -1103,6 +1103,7 @@ Date: <IMF-fixdate>
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | `create_table.constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148）が宣言時に常に失敗する組み合わせ（`NOT NULL` 列への `set_null`・DEFAULT の無い `NOT NULL` 列への `set_default` 等） |
 | `42883` | `UNDEFINED_FUNCTION` | 400 | Bad Request | `aggregate` の `sum`／`avg` を `DATE`／`TIMESTAMP` 列に指定した場合（SQL-26、Issue #1186）、または `sum`／`avg`（TEXT 以外は `min`／`max` も）を非数値型（TEXT・BOOLEAN・BYTEA・JSON・ARRAY・UUID・ENUM・VECTOR）の列に指定した場合（Issue #1349。未知関数・非決定的関数の呼び出しは SQL 表層専用で到達しない） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD PRIMARY KEY` は SQL 表層専用。後述） |
+| `21000` | `CARDINALITY_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（スカラーサブクエリは SQL 表層専用。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -1122,7 +1123,7 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 17 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+到達不能な 18 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42704`・`42804`・`42710`・`42P16`・`42723`・`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
@@ -1146,6 +1147,8 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 `alter_table` は `add_column`／`drop_column` のみのため到達しない。
 `InvalidTableDefinition`（`42P16`。TABLE-22 (d)、Issue #1364）は
 `ALTER TABLE ... ADD PRIMARY KEY` の主キー重複宣言で、同じく到達しない。
+`CardinalityViolation`（`21000`。SQL-29、Issue #1404）はスカラーサブクエリの
+2 行以上返却で、NoSQL 表層にサブクエリ構文が無いため到達しない。
 `PartialCompletion`（`VD001`）・`PartitionedDmlCancelled`（`VD002`。SQL-19・
 RECOVER-11、Issue #1129）は SQL 表層の分割実行 DML と `CANCEL PARTITIONED DML`
 が送出する分類で、NoSQL 表層からも Issue #1130 で `update`／`delete` の

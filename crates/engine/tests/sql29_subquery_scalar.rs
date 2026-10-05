@@ -367,7 +367,7 @@ fn scalar_two_rows_is_an_error_but_only_for_visible_rows() {
     // 自テナントに 2 行目を足すとエラー（先頭行を採用しない）。
     ins(&core, &a, REFS, 2, &[("qty", "6")]);
     let (code, e) = err_code(&core, &a, &sql);
-    assert_eq!(code, "22000");
+    assert_eq!(code, "21000");
     assert!(e.to_string().contains("more than one row"));
     // `LIMIT 1` を付ければ 1 行になり成功する。
     let limited =
@@ -717,7 +717,7 @@ fn subquery_forms_ignore_other_tenant_rows() {
     let after: Vec<Vec<u64>> = queries.iter().map(|q| ids(&core, &a, q)).collect();
     assert_eq!(after, before);
     // 陽性対照: tenant-b 自身には自分の refs（40 行）が見えるため、スカラーは行数エラーになる。
-    assert_eq!(err_code(&core, &b, &queries[0]).0, "22000");
+    assert_eq!(err_code(&core, &b, &queries[0]).0, "21000");
     // tenant-c の内側は NULL 40 行のみ → NOT IN は真にならず 0 件（自分の items は 0 行）。
     assert_eq!(ids(&core, &c, &queries[1]), Vec::<u64>::new());
 }

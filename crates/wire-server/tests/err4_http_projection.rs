@@ -277,9 +277,10 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 43] = [
+const EXPECTED_STATUS: [(&str, u16); 44] = [
     ("22000", 400),
     ("22012", 400),
+    ("21000", 400),
     ("28P01", 401),
     ("28000", 401),
     ("42501", 403),
@@ -434,7 +435,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 45);
+const _: () = assert!(ErrorClass::ALL.len() == 46);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -917,6 +918,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // ... ADD PRIMARY KEY` の主キー重複宣言。NoSQL の `alter_table` は
         // `add_column`／`drop_column` だけで到達不能。
         ErrorClass::InvalidTableDefinition,
+        // `CardinalityViolation`（`21000`。SQL-29、Issue #1404）: スカラーサブクエリの
+        // 2 行以上返却。NoSQL 表層にはサブクエリ構文が無く到達不能。
+        ErrorClass::CardinalityViolation,
         // （`PartialCompletion`／`PartitionedDmlCancelled`〔`VD001`／`VD002`〕は Issue #1130 で
         // `update`／`delete` の分割実行修飾から到達可能になったため外した。固定は
         // `err4_f_partitioned_dml_vd001_vd002_reachable_via_nosql_update` が担う）

@@ -605,3 +605,10 @@ Issue #1364（fix(engine)!: 名前付きの主キーを受理し、主キーの�
 - **変更箇所**: `crates/engine/tests/recover12_explicit_txn_resend.rs` にテストを追加し、`docs/design/explicit-transaction.md` の既知の制約の記述を解消済みへ更新した。本番コードの変更は無い（#1179 以降、明示トランザクション内の DELETE は autocommit と同じフォーム関数を `WriteTarget::InTxn` で使い、#983 以降 0 行でも台帳を記録するため、再送判定は成立していた）。
 - **性質**: 単一行形・述語形の 0 行 DELETE について、commit 後の新しい BEGIN 内での再送が台帳由来の `23505`、COMMIT 前の接続断では台帳が残らず再送が成功、後から INSERT された行は再送で削除されない、台帳はテナント単位、別対象の再送は `22023`。RLS・テナント境界・fail-closed・`wire_code`・依存は不変。
 - **対象外**: wire 層・3 クライアント層での同シナリオ、`RETURNING` 付き 0 行 DELETE、暗黙トランザクション内の 0 行 DELETE。
+
+## Issue #1404: スカラーサブクエリが 2 行以上を返す場合を 21000 で返す
+
+- **対象ビヘイビア**: SQL-29・ERR-6・ERR-4（関連: TASK-213・RLS-10 (b)）。
+- **変更箇所**: `crates/engine/src/error_format.rs`（`ErrorClass::CardinalityViolation`＝`21000`／`CARDINALITY_VIOLATION`）、`crates/engine/src/sql/allowlist.rs`（`SqlSurfaceError::CardinalityViolation`）、`crates/engine/src/sql/subquery.rs`（WHERE 値位置・投影位置の 2 行以上返却を `22000` から置換）、`crates/wire-server/src/http/status.rs`（HTTP 400）、`crates/wire-server/docs/nosql-api.md`・`docs/design/sql-subquery.md`。
+- **性質**: 破壊的変更（応答 SQLSTATE が `22000` から `21000` へ。公開 enum `ErrorClass`・`SqlSurfaceError` への variant 追加）。評価順序（投影位置は外側が 1 行以上のときだけ、WHERE 位置は走査前に解決）と、自テナント可視行のみで判定する点（他テナント行は結果・エラーに影響しない）、fail-closed、依存は不変。
+- **対象外**: 投影位置の内側に入れ子になった WHERE スカラーサブクエリの行数エラーは、外側 0 行でも即時に返る既存挙動のまま。式の内側に置いたスカラーサブクエリは引き続き `42601`。

@@ -197,7 +197,7 @@ fn projection_subquery_multiple_rows_errors_only_when_outer_has_rows() {
     ins(&core, &ctx, REFS, 2, "second", Some(8));
 
     let multi = format!("SELECT name, (SELECT qty FROM {REFS} LIMIT 10) FROM {ITEMS} LIMIT 100");
-    assert_eq!(code(&core, &ctx, &multi), "22000");
+    assert_eq!(code(&core, &ctx, &multi), "21000");
     // 外側が 0 行なら発生しない。
     let none = format!(
         "SELECT name, (SELECT qty FROM {REFS} LIMIT 10) FROM {ITEMS} WHERE qty > 999 LIMIT 100"
@@ -314,7 +314,7 @@ fn projection_subquery_ignores_other_tenant_rows() {
     let after = run(&core, &a, &q);
     assert_eq!(after, before);
     // 陽性対照: tenant-b 自身には refs が 20 行見えるため複数行エラー。
-    assert_eq!(code(&core, &b, &q), "22000");
+    assert_eq!(code(&core, &b, &q), "21000");
 }
 #[test]
 fn projection_subquery_runtime_error_is_deferred_until_outer_has_rows() {
