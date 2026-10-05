@@ -1946,14 +1946,23 @@ fn bind_unknown_literal_against(
             v.to_string()
         }
         _ => {
-            let v = crate::scalar_float::parse_double(s).map_err(|e| match e {
+            // `parse_double` は書式・範囲（非有限・アンダーフロー）の検証にだけ使い、
+            // 丸め後の値は使わない。丸め値を文字列化して渡すと 2^53 超の整数字面が
+            // `parse_number_literal` の exactness 検査（22003）より前に近傍の f64 へ
+            // 丸められ、数値リテラル形式との等価性が崩れる（Cursor Bugbot 指摘・PR #1420）。
+            // 検証済みの原文をそのまま渡し、同じ exactness 検査を通す。
+            crate::scalar_float::parse_double(s).map_err(|e| match e {
                 crate::scalar_float::ParseFloatError::Malformed => invalid(),
                 crate::scalar_float::ParseFloatError::OutOfRange => out_of_range(),
             })?;
-            format!("{v}")
+            s.to_string()
         }
     };
-    let n = parse_number_literal(&text)?;
+    let mut n = parse_number_literal(&text)?;
+    if n == 0.0 {
+        // `-0` 字面も `+0.0` へ正規化する（`parse_double` の canonicalize と同じ F4 契約）。
+        n = 0.0;
+    }
     Ok((BoundExpr::Number(n), ExprType::Scalar))
 }
 fn bind_binary(

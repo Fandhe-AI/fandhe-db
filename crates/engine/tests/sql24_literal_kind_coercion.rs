@@ -229,6 +229,25 @@ fn string_literal_input_grammar_and_error_codes() {
     assert_eq!(code(&core, &alice, "qty = '3000000000'"), "22003");
     assert_eq!(code(&core, &alice, "big = '9007199254740993'"), "22003");
     assert_eq!(code(&core, &alice, "big = 9007199254740993"), "22003");
+    // REAL／DOUBLE 列でも、2^53 超の整数字面は丸め前に数値リテラル形と同じ `22003` で拒否する。
+    for col in ["r", "d"] {
+        for lit in [
+            "9007199254740993",
+            "9007199254740993.0",
+            "9.007199254740993e15",
+        ] {
+            assert_eq!(
+                code(&core, &alice, &format!("{col} = '{lit}'")),
+                "22003",
+                "{col} {lit}"
+            );
+            assert_eq!(
+                code(&core, &alice, &format!("{col} = {lit}")),
+                "22003",
+                "{col} {lit} numeric"
+            );
+        }
+    }
     // エラーはリテラル本文を反射しない。
     let err = core
         .execute_sql(
