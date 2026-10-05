@@ -1569,6 +1569,49 @@ fn collect_referenced_udfs(
     }
 }
 
+/// 素の十進表記（`-?digits[.digits]`）を正規化する（先頭 0・末尾 0・末尾ドットを除去。
+/// 値が 0 の場合は符号を保持した `0`／`-0`）。指数表記など他の形は変換せずそのまま返す。
+/// `push_dml_expr` の数値リテラル直列化から呼ばれ、同じ十進値の異なる綴りを同一視する。
+fn canonical_decimal_text(raw: &str) -> String {
+    let (neg, body) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let plain = !int_part.is_empty()
+        && int_part.bytes().all(|c| c.is_ascii_digit())
+        && frac_part.bytes().all(|c| c.is_ascii_digit());
+    if !plain {
+        return raw.to_string();
+    }
+    let int_t = int_part.trim_start_matches('0');
+    let frac_t = frac_part.trim_end_matches('0');
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(if int_t.is_empty() { "0" } else { int_t });
+    if !frac_t.is_empty() {
+        out.push('.');
+        out.push_str(frac_t);
+    }
+    out
+}
+
+/// 数値リテラル `raw` が f64 `v` へ値を変えずに往復できるか（最短往復表記との一致）。
+/// 指数表記など素の十進形でない入力は従来どおり f64 解釈のため忠実とみなす（台帳互換）。
+fn number_literal_is_f64_faithful(raw: &str, v: f64) -> bool {
+    let body = raw.strip_prefix('-').unwrap_or(raw);
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let plain = !int_part.is_empty()
+        && int_part.bytes().all(|c| c.is_ascii_digit())
+        && frac_part.bytes().all(|c| c.is_ascii_digit());
+    if !plain {
+        return true;
+    }
+    canonical_decimal_text(raw) == canonical_decimal_text(&format!("{v}"))
+}
+
 /// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
 /// `Ident` が参照 UDF 自身のパラメータ（大文字小文字を区別せず照合）を指すときに
 /// 限り小文字化して連結する（ADR §4.4.1「6.」。`bind_expr_in` のパラメータ解決が
@@ -1589,9 +1632,19 @@ fn push_dml_expr(
         // だけを新タグ 11＋生テキストで直列化する（従来エラーだった入力のみが対象で台帳互換）。
         // 値の妥当性（範囲・型）は束縛段が検査する。
         Expr::Number(raw) => match crate::sql::udf_call::parse_number_literal(raw) {
-            Ok(v) => {
+            // 十進表記が f64 の最短往復表記と一致する（f64 へ丸めても値が変わらない）入力は
+            // 従来どおりタグ 1（既存ハッシュ不変）。f64 へ丸めると別の十進値と同一視される
+            // 入力（`1.0000000000000001` と `1.0000000000000002` 等。NUMERIC 列との正確な
+            // 比較では別述語）は、RECOVER-10 の内容照合を誤一致させないようタグ 11＋
+            // 正規化した十進文字列で直列化する（Issue #1430 codex P1 指摘）。
+            Ok(v) if number_literal_is_f64_faithful(raw, v) => {
                 b.push_u8(1);
                 b.push_raw(&v.to_bits().to_le_bytes());
+            }
+            Ok(_) => {
+                b.push_u8(11);
+                b.push_bytes(canonical_decimal_text(raw).as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
             }
             Err(_) => {
                 b.push_u8(11);
@@ -3582,6 +3635,28 @@ mod tests {
         .expect("push numeric");
         let h4 = b4.finish();
         assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
+    }
+
+    /// Issue #1430（codex P1）: f64 へ丸めると同値になる異なる十進リテラルは別ハッシュ、
+    /// f64 で往復できる従来入力は表記差があっても同一（既存ハッシュ不変）。
+    #[test]
+    fn dml_number_literal_hash_distinguishes_lossy_decimals() {
+        use crate::sql::udf_call::Expr;
+        let hash = |raw: &str| {
+            let mut b = HashInputBuilder::new(OpTag::Insert);
+            push_dml_expr(&mut b, &Expr::Number(raw.to_string()), None).expect("push");
+            b.finish()
+        };
+        assert_ne!(hash("1.0000000000000001"), hash("1.0000000000000002"));
+        assert_ne!(hash("1.0000000000000001"), hash("1"));
+        assert_eq!(hash("1.0000000000000001"), hash("1.00000000000000010"));
+        assert_eq!(hash("1.5"), hash("1.50"));
+        assert_eq!(hash("1"), hash("1."));
+        // 従来入力（f64 で往復できる）はタグ 1＋ビット列のまま。
+        let mut b = HashInputBuilder::new(OpTag::Insert);
+        b.push_u8(1);
+        b.push_raw(&0.1f64.to_bits().to_le_bytes());
+        assert_eq!(hash("0.1"), b.finish());
     }
 
     // --- Issue #1127: 分割実行版ハッシュのドメイン分離 -------------------------
