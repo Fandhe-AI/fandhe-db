@@ -1401,3 +1401,282 @@ fn alter_table_add_column_not_null_default_applies_to_rows_and_enforces_not_null
     );
     assert_eq!(omit_ins.status, 200, "got: {omit_ins:?}");
 }
+// --- 列型の SQL パリティ（Issue #1409・NOSQL-13・TABLE-6/13/14。create_table／
+// add_column が SQL 表層と同じ型集合・同じカタログ表現になることを固定する） --
+
+/// 同一宣言を SQL と NoSQL JSON の両方で書いた (列名, SQL 型, NoSQL 列 JSON 断片)。
+/// 全スカラー型・`numeric`・ENUM（`mood`。事前に `CREATE TYPE` 済み）・配列。
+const TYPE_PARITY_COLUMNS: &[(&str, &str, &str)] = &[
+    ("c_text", "TEXT", r#""type":"text""#),
+    ("c_int", "INTEGER", r#""type":"integer""#),
+    ("c_big", "BIGINT", r#""type":"bigint""#),
+    ("c_real", "REAL", r#""type":"real""#),
+    ("c_dbl", "DOUBLE PRECISION", r#""type":"double""#),
+    ("c_bool", "BOOLEAN", r#""type":"boolean""#),
+    ("c_date", "DATE", r#""type":"date""#),
+    ("c_ts", "TIMESTAMP", r#""type":"timestamp""#),
+    ("c_bytea", "BYTEA", r#""type":"bytea""#),
+    ("c_json", "JSON", r#""type":"json""#),
+    ("c_jsonb", "JSONB", r#""type":"jsonb""#),
+    ("c_uuid", "UUID", r#""type":"uuid""#),
+    (
+        "c_num",
+        "NUMERIC(10,2)",
+        r#""type":"numeric","precision":10,"scale":2"#,
+    ),
+    ("c_enum", "mood", r#""type":"enum","enum_type":"mood""#),
+    (
+        "a_text",
+        "TEXT[]",
+        r#""type":"array","element_type":"text""#,
+    ),
+    (
+        "a_int",
+        "INTEGER[4]",
+        r#""type":"array","element_type":"integer","max_len":4"#,
+    ),
+    (
+        "a_num",
+        "NUMERIC(5,2)[]",
+        r#""type":"array","element_type":"numeric","precision":5,"scale":2"#,
+    ),
+    (
+        "a_enum",
+        "mood[3]",
+        r#""type":"array","element_type":"enum","enum_type":"mood","max_len":3"#,
+    ),
+    (
+        "a_bytea",
+        "BYTEA[]",
+        r#""type":"array","element_type":"bytea""#,
+    ),
+    (
+        "a_jsonb",
+        "JSONB[2]",
+        r#""type":"array","element_type":"jsonb","max_len":2"#,
+    ),
+];
+
+fn parity_ctx() -> PolicyContext {
+    PolicyContext::with_visibilities(
+        TENANT_A,
+        [
+            engine::storage::Visibility::Public,
+            engine::storage::Visibility::Private,
+        ],
+    )
+    .expect("valid tenant ctx")
+}
+
+/// `SELECT <列...> FROM <table> LIMIT 1` の列メタ（列ごとの `ColumnType`）を返す。
+/// カタログに格納された型（解決済み ENUM 定義・配列の `max_len`・`Numeric{p,s}` を含む）
+/// を SQL 表層の結果メタ越しに比較するための入口。
+fn column_types_of(
+    core: &EngineCore,
+    session: &mut engine::sql::mode::SessionState,
+    table: &str,
+    columns: &[&str],
+) -> Vec<(String, ColumnType)> {
+    use engine::sql::exec::ColumnMeta;
+    use engine::sql::SqlOutcome;
+    let sql = format!("SELECT {} FROM {table} LIMIT 1", columns.join(", "));
+    let outcome = core
+        .execute_sql_in_session(&parity_ctx(), session, &sql)
+        .unwrap_or_else(|e| panic!("select on {table} must succeed: {e:?}"));
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected SqlOutcome::Query for {sql:?}");
+    };
+    result
+        .columns
+        .into_iter()
+        .map(|c| match c {
+            ColumnMeta::Scalar { name, ty } => (name, ty),
+            other => panic!("expected scalar column meta, got {other:?}"),
+        })
+        .collect()
+}
+
+fn parity_core_with_enum() -> (
+    Arc<EngineCore>,
+    temp_db::CleanupGuard,
+    engine::sql::mode::SessionState,
+) {
+    let (core, guard) = new_core();
+    let mut sql_session = engine::sql::mode::SessionState::default();
+    sql_session.allow_ddl();
+    core.execute_sql_in_session(
+        &parity_ctx(),
+        &mut sql_session,
+        "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+    )
+    .expect("CREATE TYPE must succeed");
+    (core, guard, sql_session)
+}
+
+#[test]
+fn nosql_and_sql_create_table_produce_identical_column_types() {
+    let (core, _guard, mut sql_session) = parity_core_with_enum();
+    let sql_cols: Vec<String> = TYPE_PARITY_COLUMNS
+        .iter()
+        .map(|(n, t, _)| format!("{n} {t}"))
+        .collect();
+    core.execute_sql_in_session(
+        &parity_ctx(),
+        &mut sql_session,
+        &format!("CREATE TABLE t_sql ({})", sql_cols.join(", ")),
+    )
+    .expect("sql CREATE TABLE must succeed");
+
+    let nosql_cols: Vec<String> = TYPE_PARITY_COLUMNS
+        .iter()
+        .map(|(n, _, j)| format!(r#"{{"name":"{n}",{j}}}"#))
+        .collect();
+    let body = format!(
+        r#"{{"op":"create_table","table":"t_nosql","columns":[{}]}}"#,
+        nosql_cols.join(",")
+    );
+    let session = ddl_session(Arc::clone(&core));
+    let resp = query(&session, body.as_bytes());
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+
+    let names: Vec<&str> = TYPE_PARITY_COLUMNS.iter().map(|(n, _, _)| *n).collect();
+    let sql_types = column_types_of(&core, &mut sql_session, "t_sql", &names);
+    let nosql_types = column_types_of(&core, &mut sql_session, "t_nosql", &names);
+    assert_eq!(sql_types.len(), names.len());
+    assert_eq!(sql_types, nosql_types, "catalog column types must match");
+}
+
+#[test]
+fn nosql_and_sql_add_column_produce_identical_column_types() {
+    let (core, _guard, mut sql_session) = parity_core_with_enum();
+    for t in ["b_sql", "b_nosql"] {
+        core.execute_sql_in_session(
+            &parity_ctx(),
+            &mut sql_session,
+            &format!("CREATE TABLE {t} (base TEXT)"),
+        )
+        .expect("fixture CREATE TABLE must succeed");
+    }
+    let session = ddl_session(Arc::clone(&core));
+    for (name, sql_ty, json) in TYPE_PARITY_COLUMNS {
+        core.execute_sql_in_session(
+            &parity_ctx(),
+            &mut sql_session,
+            &format!("ALTER TABLE b_sql ADD COLUMN {name} {sql_ty}"),
+        )
+        .unwrap_or_else(|e| panic!("sql ADD COLUMN {name} must succeed: {e:?}"));
+        let body = format!(
+            r#"{{"op":"alter_table","table":"b_nosql","add_column":{{"name":"{name}",{json}}}}}"#
+        );
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(resp.status, 200, "add_column {name} got: {resp:?}");
+    }
+    let names: Vec<&str> = TYPE_PARITY_COLUMNS.iter().map(|(n, _, _)| *n).collect();
+    let sql_types = column_types_of(&core, &mut sql_session, "b_sql", &names);
+    let nosql_types = column_types_of(&core, &mut sql_session, "b_nosql", &names);
+    assert_eq!(sql_types, nosql_types, "catalog column types must match");
+}
+
+#[test]
+fn create_table_array_max_len_is_enforced_on_insert_like_sql() {
+    let (core, _guard, mut sql_session) = parity_core_with_enum();
+    core.execute_sql_in_session(
+        &parity_ctx(),
+        &mut sql_session,
+        "CREATE TABLE lim_sql (tags TEXT[2])",
+    )
+    .expect("sql CREATE TABLE must succeed");
+    let session = ddl_session(Arc::clone(&core));
+    let create = br#"{"op":"create_table","table":"lim_nosql","columns":[
+        {"name":"tags","type":"array","element_type":"text","max_len":2}]}"#;
+    assert_eq!(query(&session, create).status, 200);
+
+    for table in ["lim_sql", "lim_nosql"] {
+        let ok = format!(
+            r#"{{"op":"insert","table":"{table}","rows":[{{"id":1,"tags":["a","b"]}}],"operation_id":"ok-{table}"}}"#
+        );
+        let resp = query(&session, ok.as_bytes());
+        assert_eq!(resp.status, 200, "{table} at limit: {resp:?}");
+        let over = format!(
+            r#"{{"op":"insert","table":"{table}","rows":[{{"id":2,"tags":["a","b","c"]}}],"operation_id":"over-{table}"}}"#
+        );
+        let resp = query(&session, over.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "54000",
+            "{table} over limit: {resp:?}"
+        );
+        assert_eq!(resp.status, 413, "{table} over limit: {resp:?}");
+    }
+}
+
+#[test]
+fn create_table_new_types_error_classification_matches_sql() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(Arc::clone(&core));
+    let mut sql_session = engine::sql::mode::SessionState::default();
+    sql_session.allow_ddl();
+    // (SQL 列宣言, NoSQL 列 JSON)。いずれも engine 側で拒否され同じ `wire_code` になる。
+    let cases = [
+        (
+            "c TEXT[0]",
+            r#"{"name":"c","type":"array","element_type":"text","max_len":0}"#,
+        ),
+        (
+            "c TEXT[1025]",
+            r#"{"name":"c","type":"array","element_type":"text","max_len":1025}"#,
+        ),
+        (
+            "c VECTOR(3)[]",
+            r#"{"name":"c","type":"array","element_type":"vector","dim":3}"#,
+        ),
+        // 未登録の ENUM 型名
+        (
+            "c nosuch",
+            r#"{"name":"c","type":"enum","enum_type":"nosuch"}"#,
+        ),
+        (
+            "c nosuch[]",
+            r#"{"name":"c","type":"array","element_type":"enum","enum_type":"nosuch"}"#,
+        ),
+    ];
+    for (i, (sql_decl, json)) in cases.iter().enumerate() {
+        let sql_err = core
+            .execute_sql_in_session(
+                &parity_ctx(),
+                &mut sql_session,
+                &format!("CREATE TABLE e_sql_{i} ({sql_decl})"),
+            )
+            .expect_err("sql must reject");
+        let body = format!(r#"{{"op":"create_table","table":"e_nosql_{i}","columns":[{json}]}}"#);
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            ClassifiedError::wire_code(&sql_err),
+            "nosql {json}: {resp:?}"
+        );
+        assert_eq!(
+            ClassifiedError::wire_code(&sql_err),
+            "42601",
+            "sql {sql_decl}"
+        );
+    }
+}
+
+#[test]
+fn create_table_new_types_without_ddl_permission_is_42501() {
+    let (core, _guard) = new_core();
+    let session = non_ddl_session(core);
+    for body in [
+        r#"{"op":"create_table","table":"x","columns":[{"name":"c","type":"array","element_type":"text","max_len":2}]}"#,
+        r#"{"op":"create_table","table":"x","columns":[{"name":"c","type":"boolean","default":true}]}"#,
+        r#"{"op":"alter_table","table":"x","add_column":{"name":"c","type":"array","element_type":"integer"}}"#,
+    ] {
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42501",
+            "body={body} got: {resp:?}"
+        );
+    }
+}

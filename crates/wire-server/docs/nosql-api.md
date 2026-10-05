@@ -621,20 +621,28 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 固定される）。権限の無いセッションは、対象テーブルの有無にかかわらず常に
 `42501`（`403`）のみを返す（存在オラクル非公開。テナント境界とは別軸の判定）。
 
-`create_table.columns[].type` の受理集合は `text`／`vector`／`integer`／
-`bigint`（SQL 表層の `CREATE TABLE` と同じ）。`alter_table.add_column.type` は
+`create_table.columns[].type` と `alter_table.add_column.type` は、SQL 表層の
+`CREATE TABLE`／`ALTER TABLE ADD COLUMN` と同じ型集合を受け付ける（Issue #1409）。
 `text`／`integer`／`bigint`／`real`／`double`（`DOUBLE PRECISION`）／
 `boolean`／`date`／`timestamp`／`bytea`／`json`／`jsonb`／`uuid`／
-`numeric`（`precision`／`scale` 必須）／`vector`（`dim` 必須。構文は通るが
-実行段で `0A000`）／`enum`（`enum_type` 必須）。
+`numeric`（`precision`／`scale` 必須）／`vector`（`dim` 必須。`add_column` では構文は通るが
+実行段で `0A000`）／`enum`（`enum_type` 必須）／`array`。大文字小文字は区別しない。
+
+配列は `{"type":"array","element_type":"<要素型>","max_len":N}` で宣言する
+（SQL の `<要素型>[N]`。`max_len` 省略は `[]`）。`element_type` は上記のうち
+`array` 以外の型名で、要素型のパラメータ（`precision`／`scale`／`enum_type`）は
+通常の型と同じキーで渡す。`max_len` が 0・1024 超、要素型が `vector`、
+入れ子配列、未登録の ENUM 型名は `42601`（SQL と同じ分類）。型と無関係な
+パラメータ（配列でない型への `element_type`／`max_len` 等）も黙って無視せず `42601`。
+配列要素数の上限超過の書き込みは `54000`（HTTP 413）。
 
 | キー | 必須 | 型 | 備考 |
 | --- | --- | --- | --- |
 | `op` | ○ | string | `"create_table"`／`"alter_table"`／`"drop_table"` |
 | `table` | ○ | string | |
-| `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
+| `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"element_type"?,"max_len"?,"nullable"?,"default"?}`。`default` は文字列・数値・真偽値（配列の既定値は文字列 `"{1,2}"` 形）。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
 | `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?,"name"?,"predicate"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `name`（任意）と `predicate`（filter 葉形 `column`／`op`／`value` の配列。AND 結合）を取り、SQL 表層と同じ DDL 入口へ合流する（Issue #1199・NOSQL-13・TABLE-16）。違反した `insert`／`update` は `23514`。`kind` と矛盾するフィールド・`in`／`or`・語彙外の `op`・RLS 述語名の列は `42601`、葉数の上限超過は `54000`（写像表と拒否条件の詳細は `docs/design/nosql-ddl-mapping.md`「CHECK 制約」節）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
-| `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"not_null"?,"default"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`）。`not_null` は bool（`true` のとき `default` が必須で、無ければ engine が `42601`。`false`・省略は nullable 列）、`default` は文字列・数値・真偽値（Issue #1338。SQL の `NOT NULL`／`DEFAULT <literal>` と同じ実行器・エラー契約）。DATE／TIMESTAMP／UUID／JSON／JSONB／ENUM の DEFAULT は文字列で渡す。`default` の `null`・配列・オブジェクト、`not_null` の非 bool、`nullable` などの未知キーは `42601`。`create_table` の `nullable` に対し `add_column` は `not_null` を使う（`nullable` は受け付けない） |
+| `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"element_type"?,"max_len"?,"not_null"?,"default"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`）。`not_null` は bool（`true` のとき `default` が必須で、無ければ engine が `42601`。`false`・省略は nullable 列）、`default` は文字列・数値・真偽値（Issue #1338。SQL の `NOT NULL`／`DEFAULT <literal>` と同じ実行器・エラー契約）。DATE／TIMESTAMP／UUID／JSON／JSONB／ENUM の DEFAULT は文字列で渡す。`default` の `null`・配列・オブジェクト、`not_null` の非 bool、`nullable` などの未知キーは `42601`。`create_table` の `nullable` に対し `add_column` は `not_null` を使う（`nullable` は受け付けない） |
 | `drop_column`（`alter_table`） | ○ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線（Issue #1167。エラー契約は SQL 表層と同一）。`add_column` と排他必須 |
 
 成功応答は 3 op 共通で `{"ok":true}`（行数・件数を返さない）。
@@ -666,6 +674,16 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 ```json
 {"op": "alter_table", "table": "docs",
  "add_column": {"name": "note", "type": "text"}}
+```
+
+配列・ENUM 列の例（Issue #1409）:
+
+```json
+{"op": "create_table", "table": "posts", "columns": [
+  {"name": "tags", "type": "array", "element_type": "text", "max_len": 8},
+  {"name": "prices", "type": "array", "element_type": "numeric", "precision": 10, "scale": 2},
+  {"name": "mood", "type": "enum", "enum_type": "mood"}
+]}
 ```
 
 `NOT NULL`／`DEFAULT` を伴う例（Issue #1338）:
@@ -957,6 +975,7 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 | `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
 | `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（結線済み。同一実行器・同一台帳キー空間。Issue #1062） |
 | `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
+| `CREATE TABLE posts (tags TEXT[8], price NUMERIC(10,2), mood mood)` | `create_table` + `columns`（`type:"array"`＋`element_type`／`max_len`、`numeric`、`enum`。Issue #1409。同一実行器・同一カタログ表現） |
 | `FOREIGN KEY (parent_id) REFERENCES parents (id) ON DELETE CASCADE ON UPDATE SET NULL` | `constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148。同一実行器） |
 | `CHECK (price > 0)` | `constraints[kind=check].predicate`（Issue #1199。同一実行器） |
 | `ALTER TABLE docs ADD COLUMN note TEXT` | `alter_table` + `add_column`（Issue #910。同一実行器） |
