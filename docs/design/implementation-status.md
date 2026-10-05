@@ -598,3 +598,10 @@ Issue #1364（fix(engine)!: 名前付きの主キーを受理し、主キーの�
 
 - **変更箇所**: `crates/engine/src/catalog.rs`（`alter_column_type_with` から `2BP01` 分岐を撤去し、同一 txn 内で `user_uniq/{table}` と変更列を含む `key_index` を失効。永続スキーマ再検証のみ `INTEGER`／`BIGINT` 食い違いを許す `FkTypeRule`）、`crates/engine/src/key_index.rs`（`drop_indexes_containing_column_in_txn`）、`crates/engine/src/constraint.rs`（`recode_key_for_types`・FK 境界 3 箇所でのキー読み替え・ON UPDATE CASCADE の値の型合わせ）、`crates/engine/tests/sql_alter_column_type_key_columns.rs`（新規。TABLE-19・TABLE-17・TABLE-16 ポインタ）。設計は `docs/design/alter-table-drop-modify-column.md`・`docs/design/foreign-key.md`。
 - **性質**: これまで `2BP01` だった操作を受理に変える非破壊の拡張。縮小・異種変換は `42804` のまま、CREATE／ADD FOREIGN KEY の型混在宣言は `42830` のまま。RLS・テナント境界・fail-closed・`wire_code`・依存は不変。ON UPDATE CASCADE の値域外は `23503` で拒否（`22003` 専用 variant はスコープ外）。
+
+## Issue #1403: 明示トランザクションの先頭文が 0 行 DELETE の場合の再送判定
+
+- **対象ビヘイビア**: RECOVER-12（関連: SQL-18・SQL-31・RECOVER-10・RLS-10・TABLE-12）。
+- **変更箇所**: `crates/engine/tests/recover12_explicit_txn_resend.rs` にテストを追加し、`docs/design/explicit-transaction.md` の既知の制約の記述を解消済みへ更新した。本番コードの変更は無い（#1179 以降、明示トランザクション内の DELETE は autocommit と同じフォーム関数を `WriteTarget::InTxn` で使い、#983 以降 0 行でも台帳を記録するため、再送判定は成立していた）。
+- **性質**: 単一行形・述語形の 0 行 DELETE について、commit 後の新しい BEGIN 内での再送が台帳由来の `23505`、COMMIT 前の接続断では台帳が残らず再送が成功、後から INSERT された行は再送で削除されない、台帳はテナント単位、別対象の再送は `22023`。RLS・テナント境界・fail-closed・`wire_code`・依存は不変。
+- **対象外**: wire 層・3 クライアント層での同シナリオ、`RETURNING` 付き 0 行 DELETE、暗黙トランザクション内の 0 行 DELETE。
