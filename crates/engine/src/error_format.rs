@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505"];
 
 define_error_classes! {
-    count = 45;
+    count = 46;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -317,6 +317,10 @@ define_error_classes! {
     /// 止まった文と、取り消し済みジョブへの再送）。commit 済みのチャンクは戻らない。
     /// [`crate::sql::allowlist::SqlSurfaceError::PartitionedDmlCancelled`] の写像。
     PartitionedDmlCancelled => ("VD002", "PARTITIONED_DML_CANCELLED"),
+    /// スカラーサブクエリ（WHERE 値位置・投影位置）が 2 行以上を返した（`21000`。
+    /// Issue #1404・SQL-29・ERR-6）。判定は自テナントの可視行だけで決まる。
+    /// [`crate::sql::allowlist::SqlSurfaceError::CardinalityViolation`] の写像。
+    CardinalityViolation => ("21000", "CARDINALITY_VIOLATION"),
 }
 
 impl ErrorClass {

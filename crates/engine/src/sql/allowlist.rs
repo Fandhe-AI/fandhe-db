@@ -431,6 +431,10 @@ pub enum SqlSurfaceError {
     /// 非有限値・次元不一致、`LIMIT` 範囲外、hybrid の 2 引数形（実行不能）等。ERR-2:
     /// `22000`）。
     InvalidInput { detail: String },
+    /// スカラーサブクエリが 2 行以上を返した（`21000`。Issue #1404・SQL-29・ERR-6）。
+    /// fail-closed で先頭行は採用しない。行数は自テナントの可視行だけで決まり、
+    /// 固定文言のため行の値・他テナントの情報は含まない。
+    CardinalityViolation,
     /// untrusted 入力のサイズがアロケーション前の上限を超過した（ベクトルリテラル
     /// 64 KiB 超過、候補集合の容量上限超過等。ERR-2: `54000`）。
     PayloadTooLarge { detail: String },
@@ -772,6 +776,12 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::subquery` がスカラーサブクエリの 2 行以上返却（`21000`）を
+    /// 報告するために使う（Issue #1404）。
+    pub(crate) fn cardinality_violation() -> Self {
+        SqlSurfaceError::CardinalityViolation
+    }
+
     /// `pub(crate)`: `sql::parser::bind`・`sql::exec`（TASK-75）がアロケーション前の
     /// サイズ上限超過を報告するために使う。
     pub(crate) fn payload_too_large(detail: impl Into<String>) -> Self {
@@ -922,6 +932,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UndefinedTable { .. } => ErrorClass::TableNotFound,
             SqlSurfaceError::Internal { .. } => ErrorClass::InternalError,
             SqlSurfaceError::InvalidInput { .. } => ErrorClass::InvalidInput,
+            SqlSurfaceError::CardinalityViolation => ErrorClass::CardinalityViolation,
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
@@ -990,6 +1001,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::UndefinedTable { name } => write!(f, "undefined table: {name}"),
             SqlSurfaceError::Internal { detail } => write!(f, "internal error: {detail}"),
             SqlSurfaceError::InvalidInput { detail } => write!(f, "invalid input: {detail}"),
+            SqlSurfaceError::CardinalityViolation => write!(
+                f,
+                "more than one row returned by a subquery used as an expression"
+            ),
             SqlSurfaceError::PayloadTooLarge { detail } => {
                 write!(f, "payload too large: {detail}")
             }

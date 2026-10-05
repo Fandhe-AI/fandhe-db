@@ -30,7 +30,7 @@
 //! 投影位置のスカラーサブクエリ（Issue #1352。外側は広域取得 SELECT のみ）は
 //! [`resolve_scalar_projection_items`] が内側を実行して列メタデータと値（0 行は NULL）へ
 //! 解決し、[`merge_scalar_projection_items`] が外側の走査結果へ SELECT リスト上の位置で
-//! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `22000`。
+//! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `21000`。
 //!
 //! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
 //! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
@@ -44,8 +44,7 @@
 //!   外側値が NULL の行は UNKNOWN として除外される。
 //! - `NOT EXISTS`: 可視行が 1 件でもあれば常に偽、無ければ常に真。
 //! - スカラー: 0 行または NULL は UNKNOWN（否定は構文段で演算子反転済みのため
-//!   常に偽）。2 行以上は「先頭行を採用」せずエラー（`22000`。PostgreSQL の
-//!   `21000` 相当の分類は本リポの `wire_code` 表に無いため既存分類で拒否する）。
+//!   常に偽）。2 行以上は「先頭行を採用」せずエラー（`21000`。Issue #1404）。
 //!
 //! DoS 対策（security.md「不安全な設計｜無制限リソース確保」対応）:
 //! - ネスト深さは構文解析段（[`super::allowlist::MAX_SUBQUERY_DEPTH`]・
@@ -1182,6 +1181,8 @@ pub(crate) fn resolve_scalar_projection_items(
             // 外側の行数が判明するまで遅延する。束縛前に失敗した静的エラー（`meta_sink` が
             // 未確定。`22P02` 等の bind 時エラーを含む）と `22000` は即返す。列メタデータは
             // 実行とは独立に束縛結果から確定済みのため、外側の行数で列型は変わらない。
+            // `21000`（行数違反）は `22` で始まらないためここでも即返す（外側の行数を待たない。
+            // 従来の `22000` と同じ評価順序を保つ。Issue #1404）。
             Err(e) if e.wire_code().starts_with("22") && e.wire_code() != "22000" => {
                 let inner_meta = match meta_sink.as_deref() {
                     Some([m]) => m.clone(),
@@ -1260,8 +1261,7 @@ fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnM
 /// 解決済みの投影位置スカラーサブクエリを、外側の結果（投影位置の項目を含まない列）へ
 /// SELECT リスト上の位置どおりに合流する（Issue #1352）。
 ///
-/// - 内側が 2 行以上で外側の結果が 1 行以上なら `22000`（PostgreSQL の `21000` 相当。
-///   `wire_code` 表に無いため既存分類）。外側が 0 行ならエラーにしない。
+/// - 内側が 2 行以上で外側の結果が 1 行以上なら `21000`（Issue #1404）。外側が 0 行ならエラーにしない。
 /// - 外側結果の推定バイトに追加セルの推定バイト（全行ぶん）を加えた合計を確保前に `checked_*` で検査し、結果バイト上限
 ///   （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]。`sql::scan` の結果バイト上限と同値）を
 ///   超えれば `54000`。
@@ -1280,9 +1280,7 @@ pub(crate) fn merge_scalar_projection_items(
         }
     }
     if !result.rows.is_empty() && items.iter().any(|i| i.multi_row) {
-        return Err(SqlSurfaceError::invalid_input(
-            "more than one row returned by a subquery used as an expression",
-        ));
+        return Err(SqlSurfaceError::cardinality_violation());
     }
     // 外側結果の使用量を引き継ぎ、追加分との合計を確保前に検査する。
     let mut total_bytes: usize = super::cursor::estimate_result_bytes(&result);
@@ -1369,7 +1367,7 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
 /// 内側は単一列の Scan または単一集計項目の集計形。静的検証（投影列数・対象列の
 /// 存在・値族の一致）は内側の行数・値に依存せず先に行う。結果は 0 行または NULL なら
 /// UNKNOWN（空の `Or`＝常に偽。否定は構文段で演算子反転済み）、1 行ならその値、
-/// 2 行以上なら先頭行を採用せず `22000` でエラーにする（判定は内側の可視行のみに
+/// 2 行以上なら先頭行を採用せず `21000` でエラーにする（判定は内側の可視行のみに
 /// 依存するため、他テナント行では発火しない）。
 #[allow(clippy::too_many_arguments)]
 fn resolve_scalar_compare(
@@ -1442,9 +1440,7 @@ fn resolve_scalar_compare(
         return Ok(WherePredicate::Or(Vec::new()));
     };
     if rows.next().is_some() {
-        return Err(SqlSurfaceError::invalid_input(
-            "more than one row returned by a subquery used as an expression",
-        ));
+        return Err(SqlSurfaceError::cardinality_violation());
     }
     let cell = first
         .cells
