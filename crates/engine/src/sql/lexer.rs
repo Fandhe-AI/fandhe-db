@@ -630,6 +630,25 @@ fn lex_number(input: &str, start: usize) -> (String, usize) {
     (word, start + end)
 }
 
+/// `s` 全体が字句解析器の数値トークン 1 個（符号なし）と完全に一致するかを返す
+/// （Issue #1406。`sql::params` の REAL／DOUBLE 型付き束縛が、値をリテラルで書いた
+/// SQL と同一の `Token::Number` だけを受理するために使う。第 2 の数値文法を作らず
+/// `lex_number` の規則を再利用する）。メインループの進入条件（先頭が数字、または
+/// `.` の直後が数字）を満たし、かつ `lex_number` が `s` を丸ごと消費する場合のみ真。
+pub(crate) fn is_single_number_literal(s: &str) -> bool {
+    let mut chars = s.chars();
+    let starts_number = match chars.next() {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('.') => matches!(chars.next(), Some(d) if d.is_ascii_digit()),
+        _ => false,
+    };
+    if !starts_number {
+        return false;
+    }
+    let (_, end) = lex_number(s, 0);
+    end == s.len()
+}
+
 /// `$<digits>`（Issue #935・WIRE-12）を読み取り、1 始まりのパラメータ番号を返す。
 /// 呼び出し元は `$` の位置（`start`）を確認済み。`sql::allowlist::Parser` は
 /// この形状を一切知らず、`sql::params` が Bind 時に置換するトークンとしてのみ
@@ -719,6 +738,34 @@ fn lex_word(input: &str, start: usize) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::is_single_number_literal;
+
+    #[test]
+    fn single_number_literal_accepts_and_rejects() {
+        for ok in ["1", "1.5", ".5", "1.", "1.5e3", "1E-3", "3.e+4", "0"] {
+            assert!(is_single_number_literal(ok), "{ok}");
+        }
+        for ng in [
+            "",
+            "+1",
+            " 1",
+            "1 ",
+            "-1",
+            "1e",
+            "1e+",
+            "1.5.3",
+            "NaN",
+            "Infinity",
+            ".",
+            "e5",
+            "1a",
+            "0x10",
+            "1.5 OR 1=1",
+        ] {
+            assert!(!is_single_number_literal(ng), "{ng}");
+        }
+    }
+
     /// TABLE-18・Issue #1192: 描画 → 再トークン化で同一トークン列に戻る。
     #[test]
     fn render_tokens_round_trips() {

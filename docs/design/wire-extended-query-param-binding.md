@@ -169,13 +169,27 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
 
 | 種別 | 対象列 | 置換トークン | 形式不正 |
 | ---- | ------ | ------------ | -------- |
-| String | 上記以外（`TEXT`・`ENUM`・`VECTOR` 等・未参照番号） | `Token::StringLiteral` | なし（値の意味検証は束縛後の既存経路） |
+| String | 上記以外（`TEXT`・`ENUM`・`VECTOR`・`NUMERIC`・`DATE`・`TIMESTAMP`・`UUID`・`BYTEA` 等・未参照番号） | `Token::StringLiteral` | なし（値の意味検証は束縛後の既存経路） |
 | Integer | `id`・`INTEGER`・`BIGINT` | `Number`（負値は `Punct('-')` + `Number`） | `22P02` |
+| Float | `REAL`・`DOUBLE` | `Number`（負値は `Punct('-')` + `Number`） | `22P02` |
 | Boolean | `BOOLEAN` | `Ident("true"/"false")` | `22P02` |
 
 - 整数の文法は `-?[0-9]+` のみ（`+` 符号・空白・小数・指数は fail-closed で拒否。
   PostgreSQL の `int4in` より狭い）。値域外は束縛後の既存経路がリテラル形と同じ
   コードで拒否する（`INTEGER` は `22003`、`id` の負値・u64 超過は `22000`）。
+- 浮動小数（Issue #1406）の文法は字句解析器の数値トークン 1 個（符号なし）に完全一致
+  する値（`1.5`・`.5`・`1.`・`1.5e3`）に、先頭の `-` を 1 個だけ許したもの。`+` 符号・
+  前後空白・`NaN`・`Infinity`・`1e`・`1.5 OR 1=1` は `22P02`。判定は
+  `sql::lexer::is_single_number_literal`（`lex_number` の規則の再利用）が担い第 2 の
+  数値文法は持たない。REAL への値域外（`1e40` 等）は束縛後の既存経路がリテラル形と
+  同じコード（INSERT は `22003`）で拒否する。
+- `NUMERIC`・`DATE`・`TIMESTAMP`・`UUID`・`BYTEA` のリテラル形は文字列リテラルのため
+  `String` 種別のまま列型別の既存束縛（Bind 後）で束縛され、束縛形とリテラル形は
+  同一になる。形式不正のコードもリテラル形と同一（`NUMERIC`・`UUID`・`BYTEA` は
+  `22P02`、`DATE`・`TIMESTAMP` は書式不正 `22007`・範囲外 `22008`。WIRE-12 の
+  「リテラル形と同一判定」に従い、束縛経路専用の第 2 の日時検証器は作らない）。
+  `NUMERIC` を `Float` 種別へ寄せてはならない（`WHERE <NUMERIC 列> = <数値リテラル>` は
+  既存仕様で拒否されるため）。
 - 真偽値は PostgreSQL の `boolin` 互換（前後空白除去・大文字小文字無視。
   `t`/`true`/`yes`/`on`/`1` 系と `f`/`false`/`no`/`off`/`0` 系。`o` 単独は曖昧なので拒否）。
 - エラーメッセージは値本文を含めない（`$n` の番号と期待型のみ）。
@@ -186,7 +200,7 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
   `WherePredicate::Equality` にならないため。数えると別述語へ省略が誤適用される）。
 - 数値・真偽値スロットのバイナリ形式は Issue #1345 で受信形式の復号に置き換わった
   （バイナリを UTF-8 として誤解釈して受理しない）。
-- 既知の制約: `WHERE <整数列> = -N` はリテラル形でも式項の単項マイナス未対応で `42601`
+- 既知の制約: `WHERE <整数列・浮動小数列> = -N` はリテラル形でも式項の単項マイナス未対応で `42601`
   になり、`$n` に負値を束縛してもリテラル同値で同じ結果になる（`INSERT` の値位置は受理）。
 - Parse 後に列型が変わった場合は種別が Parse 時点のままのため、既存の型不一致エラー
   （fail-closed）になる。
@@ -241,9 +255,11 @@ WHERE b = $n` の `WHERE` 節内の等価条件は受理——後者は述語形
 - wire 側（Parse の宣言型受理・`ParameterDescription`・Bind の値保持・
   `bind_prepared` 結線）は #934 マージ後の別 PR。
 - パラメータのバイナリ形式復号（WIRE-14）→ Issue #1345 で 7 型を実装済み。
-- `REAL`／`DOUBLE`／`NUMERIC`／`DATE`／`TIMESTAMP`／`UUID`／`BYTEA` 列への型付き `$n` 束縛、
-  （数値・真偽値のバイナリ復号は Issue #1345 で解消済み。`REAL`／`DOUBLE` は engine の型付き
-  束縛が未対応のため text・binary とも `22P02`）。
+- `REAL`／`DOUBLE`／`NUMERIC`／`DATE`／`TIMESTAMP`／`UUID`／`BYTEA` 列への型付き `$n` 束縛
+  → Issue #1406 で実装済み（上記「値の形式」参照）。バイナリは `REAL`／`DOUBLE`／`UUID`／
+  `BYTEA` のみ受理し、`NUMERIC`／`DATE`／`TIMESTAMP` は WIRE-14 どおり `0A000`、
+  バイナリの `NaN`・`±Infinity` はリテラル形でも表現不能のため `22P02`。絶対値が非常に
+  大きい浮動小数の `WHERE` 比較がリテラル形でも `22003` になる点は式評価側の既存挙動。
 - 非 text スロットで宣言 OID 0 のバイナリ値を UTF-8 恒等で受理していた点は Issue #1345 で
   解消済み。
 - NULL パラメータ値の意味論的な位置別処理（`USING OPERATION_ID $n` へ NULL を

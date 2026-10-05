@@ -41,6 +41,11 @@
 //! - `Integer`（`id`・`INTEGER`・`BIGINT` 列）: 値が `-?[0-9]+` に一致するとき
 //!   [`Token::Number`]（負値は `Punct('-')` + `Number`）。それ以外は `22P02`
 //!   （`+` 符号・空白・小数・指数は fail-closed で拒否）。
+//! - `Float`（`REAL`・`DOUBLE` 列。Issue #1406）: 値が字句解析器の数値トークン 1 個
+//!   （符号なし）に完全一致するとき [`Token::Number`]（負値は `Punct('-')` + `Number`）。
+//!   それ以外（`+` 符号・空白・`NaN`・`Infinity` 等）は `22P02`。`NUMERIC`・`DATE`・
+//!   `TIMESTAMP`・`UUID`・`BYTEA` はリテラル形が文字列のため `String` 種別のまま
+//!   既存の列型別束縛へ委ねる。
 //! - `Boolean`（`BOOLEAN` 列）: PostgreSQL の真偽値入力表記（`t`/`true`/`yes`/`on`/`1`
 //!   等。大文字小文字無視・前後空白許容）を正規形 `Ident("true"/"false")` へ。
 //!   それ以外は `22P02`。
@@ -477,7 +482,7 @@ impl PreparedParamType {
     }
 
     /// 置換リテラル種別（[`ParamLiteralKind`]）を導出する。`Id`・`INTEGER`・
-    /// `BIGINT` は `Integer`、`BOOLEAN` は `Boolean`、それ以外は `String`。
+    /// `BIGINT` は `Integer`、`REAL`・`DOUBLE` は `Float`、`BOOLEAN` は `Boolean`、それ以外は `String`。
     pub(crate) fn literal_kind(&self) -> ParamLiteralKind {
         use crate::catalog::ColumnType;
         use crate::sql::exec::ColumnMeta;
@@ -485,6 +490,7 @@ impl PreparedParamType {
             PreparedParamType::Column(ColumnMeta::Id) => ParamLiteralKind::Integer,
             PreparedParamType::Column(ColumnMeta::Scalar { ty, .. }) => match ty {
                 ColumnType::Integer | ColumnType::BigInt => ParamLiteralKind::Integer,
+                ColumnType::Real | ColumnType::Double => ParamLiteralKind::Float,
                 ColumnType::Boolean => ParamLiteralKind::Boolean,
                 _ => ParamLiteralKind::String,
             },
@@ -502,6 +508,8 @@ pub(crate) enum ParamLiteralKind {
     String,
     /// 整数リテラル（`id`・`INTEGER`・`BIGINT`）。
     Integer,
+    /// 浮動小数リテラル（`REAL`・`DOUBLE`。Issue #1406）。
+    Float,
     /// 真偽値リテラル（`BOOLEAN`）。
     Boolean,
 }
@@ -523,6 +531,29 @@ fn integer_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
         out.push(Token::Punct('-'));
     }
     out.push(Token::Number(digits.to_string()));
+    Ok(out)
+}
+
+/// `value` を浮動小数リテラルのトークン列へ変換する（Issue #1406）。先頭の `-` を
+/// 1 個だけ剥がして `Punct('-')` とし、残りが字句解析器の数値トークン 1 個に完全一致
+/// する場合のみ `Number` を出す（[`lexer::is_single_number_literal`]）。不正値の
+/// エラーに値本文は含めない。値域外（REAL への `1e40` 等）は束縛後の既存経路が
+/// リテラル形と同じコードで拒否する。
+fn float_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+    let (negative, body) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    if !lexer::is_single_number_literal(body) {
+        return Err(SqlSurfaceError::invalid_text_representation(format!(
+            "invalid input syntax for parameter ${n} (expected floating-point number)"
+        )));
+    }
+    let mut out = Vec::with_capacity(2);
+    if negative {
+        out.push(Token::Punct('-'));
+    }
+    out.push(Token::Number(body.to_string()));
     Ok(out)
 }
 
@@ -677,7 +708,7 @@ pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind
     substitute_with(tokens, |n| {
         Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
             ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
-            ParamLiteralKind::Integer => Token::Number("0".to_string()),
+            ParamLiteralKind::Integer | ParamLiteralKind::Float => Token::Number("0".to_string()),
             ParamLiteralKind::Boolean => Token::Ident("false".to_string()),
         }])
     })
@@ -714,6 +745,7 @@ pub(crate) fn substitute_values_typed(
         match kind_of(kinds, n) {
             ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
             ParamLiteralKind::Integer => integer_literal_tokens(n, value),
+            ParamLiteralKind::Float => float_literal_tokens(n, value),
             ParamLiteralKind::Boolean => boolean_literal_tokens(n, value),
         }
     })
@@ -1395,6 +1427,38 @@ mod typed_tests {
             let err = integer_literal_tokens(2, bad).unwrap_err();
             assert_eq!(err.wire_code(), "22P02", "{bad:?}");
             if !bad.is_empty() {
+                assert!(!err.to_string().contains(bad), "must not echo {bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_literal_follows_lexer_token_shape() {
+        assert_eq!(
+            float_literal_tokens(1, "1.5").unwrap(),
+            vec![Token::Number("1.5".into())]
+        );
+        assert_eq!(
+            float_literal_tokens(1, "-1.5e3").unwrap(),
+            vec![Token::Punct('-'), Token::Number("1.5e3".into())]
+        );
+        for bad in [
+            "",
+            "-",
+            "+1.5",
+            " 1.5",
+            "1.5 ",
+            "NaN",
+            "Infinity",
+            "abc",
+            "1e",
+            "1.5.3",
+            "--1",
+            "1.5 OR 1=1",
+        ] {
+            let err = float_literal_tokens(2, bad).unwrap_err();
+            assert_eq!(err.wire_code(), "22P02", "{bad:?}");
+            if bad.chars().any(|c| c.is_ascii_alphanumeric()) {
                 assert!(!err.to_string().contains(bad), "must not echo {bad:?}");
             }
         }
