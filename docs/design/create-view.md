@@ -81,8 +81,9 @@ RLS-10 (b)・ERR-6。spec 本文は転記しない。
 
 外側クエリは `SELECT <* | 列名リスト> FROM <view> [WHERE ...] [ORDER BY <列>, ...]
 LIMIT n [OFFSET m]`（`Statement::BufferedView`。破壊的変更: 公開 enum への variant
-追加）。外側の `WHERE`／`ORDER BY` は Phase 3（Issue #1360）で受理側へ移った
-（下記）。集計・`DISTINCT`・ウィンドウ項目・式項目は `42601`。列指定が本文の結果列に
+追加）。外側の `WHERE`／`ORDER BY` は Phase 3（Issue #1360）で、集計・`DISTINCT`・
+ウィンドウ関数・式 `ORDER BY` は Phase 4（Issue #1411）で受理側へ移った（下記）。
+式項目・投影位置のスカラーサブクエリは `42601`。列指定が本文の結果列に
 無ければ `22000`、本文に同名の結果列が複数あって一意に決まらなければ `42702`
 （PostgreSQL は作成時に拒否するが、本実装は参照時に拒否する差異）。`EXPLAIN`・
 cursor の `DECLARE`・サブクエリの内側・CTE・集合演算の枝・JOIN の辺・
@@ -116,10 +117,8 @@ cursor の `DECLARE`・サブクエリの内側・CTE・集合演算の枝・JOI
 
 ### 連鎖・依存関係
 
-- 評価後射影形は連鎖の最外段の 1 段に限る（再帰の深さの上限）。評価後射影形本文が
-  別の評価後射影形ビューを指す、または単純形ビューが評価後射影形ビューを指す
-  `CREATE VIEW` は `42601`（`Storage::create_view` が write txn 内で判定）。
-  参照時も内側に現れた場合は `42601`（`BufferedBodyLookup` が再帰しない）。
+- ~~評価後射影形は連鎖の最外段の 1 段に限る~~ は Phase 4（Issue #1411）で緩和した
+  （下記「連鎖」節）。
 - 本文が読む**すべての** relation の存在を作成時に確認する（`42P01`。JOIN の右辺を
   含む）。JOIN 本文の両辺はテーブルに限る（`42601`）。
 - `DROP TABLE`／`DROP VIEW` の依存検査は `base_relation` だけでなく本文が読む全
@@ -183,11 +182,78 @@ cursor の `DECLARE`・サブクエリの内側・CTE・集合演算の枝・JOI
 
 ### 変えないもの
 
-評価後射影形の連鎖（本文の CTE・サブクエリ・集合演算の枝・JOIN の辺から評価後射影形
-ビューを参照すること）は `42601`（作成時は `Storage::create_view` が relation 一覧を
-`view_is_buffered_in_txn` で判定、参照時は `BufferedBodyLookup`）。JOIN 本文の辺は
-テーブルに限る。本文の大きさの上限（64 KiB・`54000`）、`$n` を含む DDL の Parse 拒否、
+本文の CTE・サブクエリ・集合演算の枝・JOIN の辺から評価後射影形ビューを参照することは
+`42601`（Phase 4 でも不変。主 FROM に評価後射影形ビューを取る連鎖だけが受理側へ移った）。
+JOIN 本文の辺はテーブルに限る。本文の大きさの上限（64 KiB・`54000`）、`$n` を含む DDL の Parse 拒否、
 判定順序（構文 `42601` → `42501` → カタログ）は不変。
+
+## Phase 4（Issue #1411）: 外側の集計・DISTINCT・ウィンドウ・式 ORDER BY と連鎖
+
+対象ビヘイビア: TABLE-18（主対象）・RLS-10 (b)・ERR-1／ERR-2／ERR-4／ERR-6。spec 本文は
+転記しない。
+
+### 外側の形（`Statement::BufferedView` の中身の拡張）
+
+`Statement` の variant は増やさず、`ValidatedBufferedView` を `view_name`・`body`・
+`outer`（`BufferedOuter`）へ再構成した（フィールドは `pub(crate)`）。`outer` は 2 系統。
+
+| 外側 | 受理する形 | 実行 |
+| ---- | ---------- | ---- |
+| 行形（`Rows`） | 列射影・宣言的／式 `WHERE`・`ORDER BY`（列キーまたは式キー）・ウィンドウ項目・`LIMIT`／`OFFSET` | `WHERE` → ウィンドウ計算（`WHERE` 通過後の行が母集合）→ `ORDER BY`（安定ソート）→ `OFFSET`／`LIMIT` → 射影 |
+| 集計形（`Aggregate`） | `COUNT`／`SUM`／`AVG`／`MIN`／`MAX`（引数は裸の列参照か `*`）・`GROUP BY`・`HAVING`・`ORDER BY`・`SELECT DISTINCT`（脱糖後の集計形）・`LIMIT`／`OFFSET` | `WHERE` → `sql::group_by::GroupedRowAccumulator`（グループ表・予算・`HAVING`・`ORDER BY`・結果列の終端処理はストレージ走査経路と共有） |
+
+第 2 の実行器は作らない。本文の結果列から合成した `TableSchema`（列位置は本文の結果列と
+一致。評価できない列は到達不能なプレースホルダ名）に既存の `bind_scan`／`bind_aggregate`
+で束縛し、評価済みセルは `cell_scalar` で `ScalarRef` へ写して既存の述語・式・
+アキュムレータ・ウィンドウ評価へ流す。`group_by.rs` は終端処理を `finish_groups` へ切り出し
+（挙動不変）、`window.rs` はキー抽出を `collect_window_row_values` へ切り出して
+`CellWindowEvaluator` と共有する。
+
+- 式 `ORDER BY`: 広域取得と同じ比較器（`compare_order_key`。NULL は昇順で末尾・降順で先頭）。
+  キー値は行ごとに評価して所有値へ展開し、`sort_by`（安定）で並べる。式キーとウィンドウ項目の
+  併用は構文段で `42601`（広域取得と同じ）。
+- 集計の `GROUP BY` なしは 0 行でも 1 行（`COUNT` は 0、他は NULL）、`GROUP BY` ありで 0 行なら
+  0 行。グループ数・キー・TEXT 集計状態・`COUNT(DISTINCT)` の予算は広域の集計と同じ
+  （超過は `54000`）。ウィンドウの行数・パーティション数・状態予算も既存の定数を共有する。
+- 列の公開範囲（P0）: 外側が参照する識別子（`WHERE`・集計引数・`GROUP BY`・`HAVING`／`ORDER BY` の
+  式・ウィンドウの `PARTITION BY`／`ORDER BY`／引数・式キー）はすべて `sql::view` の列スコープ検査
+  （`check_*_within_view`）を本文の結果列名に対して通す。ビューが公開していない物理キー `id`
+  は集計・グループ化・並べ替え・分割のいずれにも使えず `22000`。同名の結果列が複数ある識別子は
+  `42702`。`VECTOR`／`ARRAY`／型なし列を集計・並べ替え・分割に使うと `22000`。参照列だけを
+  `normalize_cell`（`COUNT` の `u64` を宣言型へ。範囲外は `22003`）の対象にする。ウィンドウ別名を
+  `WHERE`／`ORDER BY` で参照する形は広域取得と同じく `42601`。
+- RLS-10 (b): 外側の後処理は `PolicyContext` を受け取らず、母集合は参照セッションの `ctx` で
+  評価した本文の結果だけ。他テナントの行はグループ・件数・順位・パーティションに現れない
+  （他テナントの `Private` 行を増減させても閲覧テナントの応答が変わらないことを結合テストで固定）。
+
+### 連鎖
+
+- 評価後射影形 → 評価後射影形: 本文の FROM が評価後射影形ビューなら、参照時の再検証で本文が
+  `Statement::BufferedView` になる（`check_buffered_body_shape` に受理アームを追加。本文として
+  持てるのは列射影・宣言的 `WHERE`・`LIMIT`／`OFFSET`、または裸の列引数の集計だけで、式キー・
+  ウィンドウ・式述語・UDF 述語・サブクエリは `42601`）。
+- 単純形 → 評価後射影形: `resolve_from` が連鎖の各段（単純形）を、下位の本文の上に重ねた行形の
+  `BufferedView`（`LIMIT` なし）として内側から畳み込む。各段の列スコープは下位の結果列に対する
+  外側の検査（`22000`／`42702`）で担保する。式項目・UDF 述語を持つ段は作成時に `42601`。
+- 深さ: `catalog::resolve_reference_depth_in_txn` を DAG の最大深さ（反復・メモ付き。再帰しない）へ
+  一般化した。評価後射影形ビューは本文が読む全 relation の最大深さ + 1、単純形は `base_relation`。
+  新規ビューの深さが `MAX_VIEW_NESTING_DEPTH`（4）を超える作成は `54000`。参照時の再検証は
+  `TableLookup::buffered_depth`（`BufferedBodyLookup` が 1 段ずつ加算）で打ち切り、カタログ破損で
+  循環していても無限再帰にならず `54000`。
+- 作成時の検証: 本文がいずれかの relation 経由で評価後射影形ビューへ到達する場合、参照時と同じ
+  実カタログ照会（`TxnViewLookup`。write txn 内）で `classify_view_body` を通す。CTE・サブクエリ・
+  集合演算の枝・JOIN の辺から評価後射影形ビューを参照する本文は従来どおり `42601`
+  （作成できても参照時に必ず失敗する定義を作らない）。
+- 依存検査は不変: `DROP TABLE`／`DROP VIEW` は `base_relation`・本文の全 relation で判定し
+  `2BP01`、`DROP COLUMN` は最下段の評価後射影形ビューが対象テーブルを読む限り保守的に拒否する
+  （無関係なテーブルは妨げない）。
+
+### 対象外（Phase 4 時点）
+
+外側の式項目（`SELECT lower(lang) FROM v`）・投影位置のスカラーサブクエリ・外側の UDF 述語／
+サブクエリ述語・集計の式引数、CTE・サブクエリ・集合演算の枝・JOIN の辺からの評価後射影形ビュー
+参照、JOIN の辺をビューにすること、本文でのウィンドウ関数・式項目・UDF 述語、評価後射影形ビューへの
+`EXPLAIN`・cursor `DECLARE`、NoSQL 表層でのビュー指定（`42P01` のまま）。
 
 ## 展開方式（検証段階での書き換え）
 
@@ -279,8 +345,8 @@ body のリテラル値・破損理由の詳細をクライアントへ運ばな
   ベクトル検索（`Statement::Select`）は仕様上も対象外。
 - Phase 2 の申し送りのうち、外側の `WHERE`／`ORDER BY`、本文での CTE・集合演算・
   サブクエリ、3 テーブル以上の JOIN 本文は Phase 3（Issue #1360）で対応済み。残り:
-  評価後射影形ビューへの外側の集計・`DISTINCT`（評価済みセルに対する集計計画が必要）・
-  ウィンドウ関数・式による `ORDER BY`・外側の UDF 述語・サブクエリ、評価後射影形の連鎖、
+  外側の集計・`DISTINCT`・ウィンドウ関数・式による `ORDER BY`・評価後射影形の連鎖は
+  Phase 4（Issue #1411）で対応済み。残り: 外側の UDF 述語・サブクエリ・式項目・集計の式引数、
   本文でのウィンドウ関数・式項目・UDF 述語、JOIN の辺のビュー、評価後射影形ビューへの
   cursor `DECLARE`／`EXPLAIN`、サブクエリ付き本文を参照するクエリの Describe（サブクエリ付き
   SELECT 自体が Describe 未対応のため `42601`）。

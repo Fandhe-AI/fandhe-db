@@ -227,3 +227,139 @@ fn wire_create_view_not_last_in_multi_statement_message_is_rejected() {
     expect_error_response_with_sqlstate(&mut stream, "0A000");
     read_ready_for_query(&mut stream);
 }
+/// 評価後射影形ビューへの外側の集計・DISTINCT・ウィンドウ・式 `ORDER BY` と連鎖
+/// （TABLE-18・RLS-10 (b)、Issue #1411）が wire 越しでも同じ結果・`ErrorResponse` SQLSTATE に
+/// なる（意味論の確定オラクルは `crates/engine/tests/table18_buffered_outer.rs`）。
+/// 2 接続（別テナント）で、参照者自身の可視行だけが集計・順位に現れることも確認する。
+#[test]
+fn wire_buffered_view_outer_forms_and_chain() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice"],
+    );
+    let addr = spawn_server_with_engine_and_store(store, core);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    for (id, lang, op) in [
+        (1, "ja", "op-a-1"),
+        (2, "ja", "op-a-2"),
+        (3, "en", "op-a-3"),
+    ] {
+        send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO docs (id, embedding, lang) VALUES ({id}, '[0.1,0.2,0.3]', '{lang}') USING OPERATION_ID '{op}'"
+            ),
+        );
+        let _tag = read_command_complete(&mut alice);
+        read_ready_for_query(&mut alice);
+    }
+    for sql in [
+        "CREATE VIEW top_docs AS SELECT id, lang FROM docs ORDER BY id DESC LIMIT 10",
+        "CREATE VIEW top_chain AS SELECT id, lang FROM top_docs LIMIT 5",
+    ] {
+        send_simple_query(&mut alice, sql);
+        let tag = read_command_complete(&mut alice);
+        assert_eq!(tag, "CREATE VIEW", "sql={sql}");
+        read_ready_for_query(&mut alice);
+    }
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    send_simple_query(
+        &mut bob,
+        "INSERT INTO docs (id, embedding, lang) VALUES (4, '[0.4,0.5,0.6]', 'fr') USING OPERATION_ID 'op-b-1'",
+    );
+    let _tag = read_command_complete(&mut bob);
+    read_ready_for_query(&mut bob);
+
+    // 外側の集計: alice の可視行は 3 件（bob の private 行 4 は見えない）。
+    send_simple_query(&mut alice, "SELECT COUNT(*) FROM top_docs");
+    let _columns = read_row_description(&mut alice);
+    assert_eq!(read_data_row(&mut alice), vec![Some("3".to_string())]);
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+
+    // bob は自分の行だけを集計する。
+    send_simple_query(
+        &mut bob,
+        "SELECT lang, COUNT(*) FROM top_docs GROUP BY lang",
+    );
+    let _columns = read_row_description(&mut bob);
+    assert_eq!(
+        read_data_row(&mut bob),
+        vec![Some("fr".to_string()), Some("1".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut bob), "SELECT 1");
+    read_ready_for_query(&mut bob);
+
+    // DISTINCT・式 ORDER BY・ウィンドウ・連鎖。
+    send_simple_query(&mut alice, "SELECT DISTINCT lang FROM top_docs");
+    let _columns = read_row_description(&mut alice);
+    assert_eq!(read_data_row(&mut alice), vec![Some("en".to_string())]);
+    assert_eq!(read_data_row(&mut alice), vec![Some("ja".to_string())]);
+    assert_eq!(read_command_complete(&mut alice), "SELECT 2");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "SELECT id FROM top_docs ORDER BY lower(lang), id DESC LIMIT 10",
+    );
+    let _columns = read_row_description(&mut alice);
+    for expected in ["3", "2", "1"] {
+        assert_eq!(read_data_row(&mut alice), vec![Some(expected.to_string())]);
+    }
+    assert_eq!(read_command_complete(&mut alice), "SELECT 3");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM top_docs LIMIT 10",
+    );
+    let _columns = read_row_description(&mut alice);
+    for expected in [("3", "3"), ("2", "2"), ("1", "1")] {
+        assert_eq!(
+            read_data_row(&mut alice),
+            vec![Some(expected.0.to_string()), Some(expected.1.to_string())]
+        );
+    }
+    assert_eq!(read_command_complete(&mut alice), "SELECT 3");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, "SELECT COUNT(*) FROM top_chain");
+    let _columns = read_row_description(&mut alice);
+    assert_eq!(read_data_row(&mut alice), vec![Some("3".to_string())]);
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+
+    // ErrorResponse の SQLSTATE（接続は維持される）: 非公開の物理キーは 22000、未対応の外側の形は
+    // 42601。
+    send_simple_query(
+        &mut alice,
+        "CREATE VIEW no_id AS SELECT lang FROM docs ORDER BY lang LIMIT 5",
+    );
+    let _tag = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+    send_simple_query(&mut alice, "SELECT COUNT(id) FROM no_id");
+    expect_error_response_with_sqlstate(&mut alice, "22000");
+    read_ready_for_query(&mut alice);
+    send_simple_query(&mut alice, "SELECT lower(lang) FROM top_docs LIMIT 5");
+    expect_error_response_with_sqlstate(&mut alice, "42601");
+    read_ready_for_query(&mut alice);
+
+    // 連鎖の深さ上限（テーブル 0 → top_docs 1 → top_chain 2 → c3 3 → c4 4 → c5 は 5 で `54000`）。
+    for sql in [
+        "CREATE VIEW c3 AS SELECT id FROM top_chain",
+        "CREATE VIEW c4 AS SELECT COUNT(*) AS n FROM c3",
+    ] {
+        send_simple_query(&mut alice, sql);
+        let _tag = read_command_complete(&mut alice);
+        read_ready_for_query(&mut alice);
+    }
+    send_simple_query(&mut alice, "CREATE VIEW c5 AS SELECT COUNT(*) AS n FROM c4");
+    expect_error_response_with_sqlstate(&mut alice, "54000");
+    read_ready_for_query(&mut alice);
+}

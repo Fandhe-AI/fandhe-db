@@ -1132,17 +1132,14 @@ fn buffered_view_rejects_unsupported_outer_forms_and_chaining() {
     )
     .expect("create");
     for sql in [
-        "SELECT COUNT(*) FROM top_ja",
-        "SELECT DISTINCT lang FROM top_ja",
-        "SELECT lang, COUNT(*) FROM top_ja GROUP BY lang",
-        "SELECT id, ROW_NUMBER() OVER (ORDER BY lang) FROM top_ja LIMIT 5",
         "EXPLAIN SELECT * FROM top_ja LIMIT 5",
         "SELECT id FROM docs WHERE id IN (SELECT id FROM top_ja LIMIT 5) LIMIT 5",
         "WITH x AS (SELECT * FROM top_ja) SELECT * FROM x LIMIT 5",
         "SELECT * FROM top_ja INNER JOIN docs ON top_ja.id = docs.id LIMIT 5",
-        // Issue #1360: 外側の WHERE は宣言的な述語・式述語のみ（UDF 述語・サブクエリ不可）、
-        // ORDER BY は列キーのみ（式キー不可）。
-        "SELECT * FROM top_ja ORDER BY lower(lang) LIMIT 5",
+        // Issue #1360: 外側の WHERE は宣言的な述語・式述語のみ（UDF 述語・サブクエリ不可）。
+        // 外側の集計・DISTINCT・式 ORDER BY は Issue #1411 で受理側へ移った
+        // （`table18_buffered_outer.rs`）。集計の式引数は不可。
+        "SELECT SUM(id + 1) FROM top_ja",
         "SELECT * FROM top_ja WHERE id IN (SELECT id FROM docs LIMIT 5) LIMIT 5",
         "SELECT * FROM top_ja WHERE EXISTS (SELECT id FROM docs LIMIT 1) LIMIT 5",
         "SELECT lower(lang) FROM top_ja LIMIT 5",
@@ -1155,17 +1152,24 @@ fn buffered_view_rejects_unsupported_outer_forms_and_chaining() {
     let err = scan(&core, "alice", "SELECT * FROM top_ja LIMIT 0").expect_err("limit 0");
     assert_eq!(err.wire_code(), "22000");
 
-    // 連鎖: 評価後射影形 → 評価後射影形、単純形 → 評価後射影形、いずれも作成不可。
+    // 連鎖（Issue #1411）: 評価後射影形ビューを主 FROM に取る本文は作成できる
+    // （`table18_buffered_outer.rs`）。CTE・サブクエリ・集合演算の枝・JOIN の辺からの参照と、
+    // 式項目を持つ単純形の段は作成不可（何も永続化されない）。
     for sql in [
-        "CREATE VIEW v2 AS SELECT * FROM top_ja LIMIT 5",
-        "CREATE VIEW v3 AS SELECT id FROM top_ja",
-        "CREATE VIEW v4 AS SELECT COUNT(*) AS n FROM top_ja",
+        "CREATE VIEW c1 AS WITH x AS (SELECT * FROM top_ja) SELECT * FROM x LIMIT 5",
+        "CREATE VIEW c2 AS SELECT id FROM docs WHERE id IN (SELECT id FROM top_ja LIMIT 5) LIMIT 5",
+        "CREATE VIEW c3 AS (SELECT id FROM docs) UNION (SELECT id FROM top_ja)",
+        "CREATE VIEW c4 AS SELECT docs.id FROM docs INNER JOIN top_ja ON docs.id = top_ja.id LIMIT 5",
+        "CREATE VIEW c5 AS SELECT lower(lang) FROM top_ja",
     ] {
         let err = create_view(&core, &mut session, sql).expect_err(sql);
         assert_eq!(err.wire_code(), "42601", "sql={sql}");
     }
-    let err = scan(&core, "alice", "SELECT * FROM v2 LIMIT 5").expect_err("not persisted");
-    assert_eq!(err.wire_code(), "42P01");
+    for name in ["c1", "c2", "c3", "c4", "c5"] {
+        let err = scan(&core, "alice", &format!("SELECT * FROM {name} LIMIT 5"))
+            .expect_err("not persisted");
+        assert_eq!(err.wire_code(), "42P01", "name={name}");
+    }
 
     // 単純形ビューを源にする評価後射影形は作成できる。
     create_view(
