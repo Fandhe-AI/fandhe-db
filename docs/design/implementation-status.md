@@ -642,3 +642,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/wire-server/src/http/query/ddl.rs`（型トークン生成を `column_type_tokens`／`base_type_tokens` に統合し `create_table`・`add_column` で共用。配列は `element_type`／`max_len`。`create_table` の DEFAULT も真偽値を受理）、`schema.rs`（列スキーマに型パラメータキーを追加）、`tests/nosql13_ddl.rs`（SQL との列型カタログ同一性・要素数上限・エラー分類・権限）。
 - **性質**: `create_table`／`add_column` が SQL と同じ型集合（全スカラー型・`numeric`・ENUM・配列）を受け付け、同じ宣言は同じカタログ表現になる。要素数上限等の意味検証は engine に一本化。RLS・テナント境界・fail-closed・依存は不変。
 - **対象外**: `"double precision"` を入力別名として受理すること、応答 `columns[].type` の配列／numeric／enum の詳細表示、JSON 配列そのものの DEFAULT、`ALTER COLUMN TYPE` 相当の op、`nullable`／`not_null` のキー名非対称の解消。
+
+## Issue #1410: NoSQL の update／delete の filter で配列・JSON 列の述語を SQL と揃える
+
+- **対象ビヘイビア**: NOSQL-12（関連: NOSQL-14・NOSQL-17・SQL-19・SQL-24・RECOVER-10）。
+- **変更箇所**: `crates/wire-server/src/http/query/filter.rs`（適用先表層 `FilterSurface` を導入し、述語形 DML だけ ARRAY／JSON／JSONB 列の `in` の要素〔配列・オブジェクト〕を受理。`reject_composite_eq` を削除し、`eq`／`ne`／`in` を `Equality`／`Not(Equality)`／`InList` へ写像）、`update.rs`・`delete.rs`・`search.rs` の doc、`crates/wire-server/docs/nosql-api.md`、層 A `tests/nosql12_predicate_dml_composite_filter.rs`。engine は変更なし。
+- **性質**: SQL の述語形 DML と同じ AST のため同じ影響行数・`wire_code`・台帳照合（`23505`／`22023`）になる。`search`／`scan`／`aggregate` の ARRAY／JSON 列 `in` は `42601` のまま。RLS・テナント境界・fail-closed・依存は不変。`FilterError::CompositeEqNotSupportedForPredicateDml` は公開 enum の互換性のため残置（生成されない）。
+- **既知の差分**: 台帳照合はリテラルの綴り（サーバーの正規直列化）に依存する。search 系の `in` は ARRAY／JSON 列で未対応のまま。
