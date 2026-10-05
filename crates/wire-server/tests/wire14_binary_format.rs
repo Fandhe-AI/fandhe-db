@@ -206,6 +206,54 @@ fn computed_column_binary_request_is_rejected_as_feature_not_supported() {
     assert_eq!(err.error_class().wire_code(), "0A000");
 }
 
+/// Issue #1407: `Computed{ty: Some(対応型)}` は通り、非対応型は `0A000`。
+#[test]
+fn computed_column_binary_request_follows_static_type() {
+    for ty in [
+        ColumnType::BigInt,
+        ColumnType::Integer,
+        ColumnType::Real,
+        ColumnType::Double,
+        ColumnType::Boolean,
+        ColumnType::Text,
+    ] {
+        let columns = vec![ColumnMeta::Computed {
+            name: "agg".to_string(),
+            ty: Some(ty.clone()),
+        }];
+        let formats = ResultFormats::new(&[1])
+            .resolve(columns.len())
+            .expect("resolve");
+        assert!(
+            validate_binary_formats(&columns, &formats).is_ok(),
+            "{ty:?}"
+        );
+    }
+    for ty in [
+        ColumnType::Numeric {
+            precision: 20,
+            scale: 0,
+        },
+        ColumnType::Date,
+        ColumnType::Timestamp,
+    ] {
+        let columns = vec![ColumnMeta::Computed {
+            name: "agg".to_string(),
+            ty: Some(ty.clone()),
+        }];
+        let formats = ResultFormats::new(&[1])
+            .resolve(columns.len())
+            .expect("resolve");
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(
+            err,
+            BinaryFormatError::UnsupportedType { column_index: 0 },
+            "{ty:?}"
+        );
+        assert_eq!(err.error_class().wire_code(), "0A000");
+    }
+}
+
 #[test]
 fn json_column_binary_request_is_rejected_as_feature_not_supported() {
     // `JSON`／`JSONB` 列（TABLE-14・Issue #889）は BYTEA と同じ理由（値の実体が

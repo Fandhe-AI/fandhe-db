@@ -124,7 +124,7 @@ engine の `ColumnMeta::Computed` に静的な結果型 `ty: Option<ColumnType>`
 | `SUM／AVG／MIN／MAX(NUMERIC)` | `Numeric`（1700） |
 | `SUM／MIN／MAX(id)` | `Numeric`（1700。`ColumnMeta::Id` と同じく u64 全域を表現） |
 | `MIN／MAX(DATE／TIMESTAMP／TEXT)` | `Date`（1082）／`Timestamp`（1114）／`Text`（25） |
-| `GROUP BY` キー | `Text`（25。現状 `TEXT` キーのみ受理） |
+| `GROUP BY` キー | キー列の型の写像（Issue #1407。`TEXT` は `Text`〔25〕、`INTEGER` は `Integer`〔23〕など。疑似列 `id` は `Numeric`〔1700〕） |
 | 式列（スカラー式／比較式／TEXT・DATE・TIMESTAMP 式） | `Double`（701）／`Boolean`（16）／`Text`／`Date`／`Timestamp` |
 | ベクトル式・`EXPLAIN` の `QUERY PLAN` | 型なし（ベクトル式）は `text`。`QUERY PLAN` は `Text` |
 | ウィンドウ関数の結果列（Issue #1344） | 順位関数（`ROW_NUMBER`／`RANK`／`DENSE_RANK`）と `COUNT` は `int8`（20）。`SUM`／`AVG`／`MIN`／`MAX` は集計式と同じ規則（`aggregate_result_type`）で決まる型。実行経路と Describe は `window_result_type` を共有する |
@@ -132,8 +132,8 @@ engine の `ColumnMeta::Computed` に静的な結果型 `ty: Option<ColumnType>`
 `REAL`（`float4`）列のテキスト値は PostgreSQL の float4 出力形式で出す
 （`result_encoder::cell_to_text_for_column`。`docs/design/float-column-types.md` F6）。
 `encode_data_row*` は列メタを受け取る（値の整形が列の公告型に依存するため。列数と
-セル数が食い違う場合は `EncodeError`）。バイナリ形式は `Computed` を引き続き
-`column_binary_support = false` とする（fail-closed）。
+セル数が食い違う場合は `EncodeError`）。バイナリ形式は Issue #1407 で `Computed{ty: Some(t)}` が `t` の対応可否に従う
+（`ty: None`・非対応型は引き続き `column_binary_support = false`。fail-closed）。
 
 NoSQL（HTTP）表層の `columns[].type` は NOSQL-11 の契約に従い `Computed` を `"text"`
 固定のまま据え置く（wire 側との意図的な非対称。計算列の型名化は spec 判断が必要）。
