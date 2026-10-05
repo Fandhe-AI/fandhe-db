@@ -364,9 +364,11 @@ fn validate_index_columns(def: &IndexDef, schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
-/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY`・未結線の
-/// 数値型は索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動・
+/// スカラー索引宣言が対象にできる列型。`VECTOR`・`BOOLEAN`／`JSON(B)`／`ARRAY` は
+/// 索引化に効かない宣言を作らないため fail-closed に拒否する。`BYTEA` は自動・
 /// 宣言とも `OrderedColumnIndex::Bytes` で索引化されるため受理する（#1257・#1362、INDEX-7）。
+/// 数値 4 型（INTEGER／BIGINT／REAL／DOUBLE PRECISION）もレーン A（#1359）で自動・
+/// 宣言とも索引化されるため受理する（#1413、INDEX-7）。
 fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
     matches!(
         ty,
@@ -377,6 +379,10 @@ fn is_declarable_scalar_index_type(ty: &ColumnType) -> bool {
             | ColumnType::Numeric { .. }
             | ColumnType::Uuid
             | ColumnType::Bytea
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
     )
 }
 
@@ -10817,6 +10823,45 @@ mod tests {
             storage.create_index(&hnsw),
             Err(CatalogError::IndexKindMismatch(_))
         ));
+    }
+
+    /// 数値 4 型（INTEGER／BIGINT／REAL／DOUBLE）のスカラー宣言（単独・`id` との複合）は
+    /// 受理され、`USING hnsw` は `VECTOR` 限定のまま拒否される（Issue #1413・INDEX-7）。
+    #[test]
+    fn create_index_accepts_numeric_scalar_declaration() {
+        let path = unique_db_path("index-ddl-numeric");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "nums",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("a", ColumnType::Integer, true),
+                    ColumnDef::new("b", ColumnType::BigInt, true),
+                    ColumnDef::new("c", ColumnType::Real, true),
+                    ColumnDef::new("d", ColumnType::Double, true),
+                ],
+            ))
+            .expect("create nums");
+        for col in ["a", "b", "c", "d"] {
+            storage
+                .create_index(&scalar_def(&format!("i_{col}"), "nums", &[col]))
+                .expect("numeric is declarable");
+            storage
+                .create_index(&scalar_def(&format!("i_id_{col}"), "nums", &["id", col]))
+                .expect("composite with numeric is declarable");
+            let hnsw = IndexDef::new(
+                format!("i_hnsw_{col}"),
+                "nums".to_string(),
+                IndexKind::Hnsw,
+                vec![col.to_string()],
+            );
+            assert!(matches!(
+                storage.create_index(&hnsw),
+                Err(CatalogError::IndexKindMismatch(_))
+            ));
+        }
     }
 
     /// 列の存在・種別整合の判定（`id` は暗黙列としてスカラー宣言に使えるが

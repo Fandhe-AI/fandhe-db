@@ -664,3 +664,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: `CREATE TABLE` が名前付き主キーを受理し、その名前で `DROP CONSTRAINT` できる。主キーの重複宣言は構文検証後に `42P16`（HTTP 400）で拒否し副作用は残さない。NoSQL の `create_table.constraints` の `primary_key` 重複も `42P16` で到達可能。RLS・テナント境界・fail-closed・依存は不変。
 - **破壊的変更**: `CREATE TABLE` の主キー重複宣言の SQLSTATE が `42601` から `42P16` へ変わる。公開構造体 `ValidatedCreateTable` に pub フィールド `primary_key_name` を追加。
 - **対象外**: NoSQL 表層の名前付き主キー、`CREATE TABLE` 内の `CONSTRAINT <name> UNIQUE`・列制約の `CONSTRAINT <name> REFERENCES`、明示 PK 名と既定 CHECK 名の衝突回避。
+
+## Issue #1413: 数値列への CREATE INDEX の宣言を受理する
+
+- **対象ビヘイビア**: INDEX-7（関連: TABLE-13・INDEX-5・TASK-206・SQL-27）。
+- **変更箇所**: `crates/engine/src/catalog.rs`（`is_declarable_scalar_index_type` に INTEGER／BIGINT／REAL／DOUBLE を追加）、`core.rs`（`scalar_filter_column_names_with_numeric`。検索・集計 `EXPLAIN` の索引名の被覆判定に式述語の数値列を加える）、`sql/explain.rs`（`ExplainShape::from_filters` の索引名用ビット集合に数値列を加える。`USING PLAN` 経路）、`sql/scalar_plan.rs`・テストのコメント、テスト（`tests/index_declaration_numeric.rs` 新規・`tests/sql_index_ddl.rs`・`catalog.rs` 単体）、`docs/design/index-ddl-declaration.md`・`scalar-index-prune.md`・`explain-search-engine-exposure.md`。
+- **性質**: 数値 4 型の宣言を受理し、宣言付きテーブル（HNSW opt-in）でも宣言した数値列の述語が索引経路を使う。未宣言の数値列は従来どおり `plain_scan` へ降格する。`EXPLAIN` の `index=` は他型と同じ規則（昇順・重複排除・`id` 除外）で付く。`USING hnsw` は VECTOR 限定のまま。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: 数値の `IN`／`NOT IN`・列同士の比較・算術式の索引化、選択度閾値の数値列専用調整、`2^53` ゲートや予算解放で実行時に列が落ちた場合の `EXPLAIN`（静的）と実行の乖離（TEXT／BYTEA と同じ既知の挙動）。

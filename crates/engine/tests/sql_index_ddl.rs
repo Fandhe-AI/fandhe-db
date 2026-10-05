@@ -251,6 +251,59 @@ fn bytea_scalar_declaration_is_accepted_and_droppable() {
     assert_eq!(defs[0].columns, vec!["blob".to_string()]);
 }
 
+/// 数値 4 型のスカラー宣言は受理され永続化され、`DROP INDEX` で消える。
+/// `USING hnsw` は `0A000` のまま（Issue #1413・INDEX-7）。
+#[test]
+fn numeric_scalar_declaration_is_accepted_and_droppable() {
+    let path = unique_db_path("index-ddl-numeric");
+    let _guard = CleanupGuard(path.clone());
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                TABLE,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("qty", ColumnType::Integer, true),
+                    ColumnDef::new("total", ColumnType::BigInt, true),
+                    ColumnDef::new("ratio", ColumnType::Real, true),
+                    ColumnDef::new("score", ColumnType::Double, true),
+                ],
+            ))
+            .expect("create table");
+    }
+    {
+        let core = core_at(&path);
+        let mut session = allowed_session();
+        for col in ["qty", "total", "ratio", "score"] {
+            let sql = format!("CREATE INDEX idx_{col} ON docs ({col})");
+            assert!(
+                matches!(
+                    run(&core, &mut session, &sql),
+                    Ok(SqlOutcome::CreateIndex(_))
+                ),
+                "{sql}"
+            );
+            let hnsw = format!("CREATE INDEX idx_h_{col} ON docs USING hnsw ({col})");
+            let err = run(&core, &mut session, &hnsw).expect_err("hnsw on numeric");
+            assert_eq!(err.wire_code(), "0A000", "{hnsw}");
+        }
+        assert!(matches!(
+            run(&core, &mut session, "DROP INDEX idx_total"),
+            Ok(SqlOutcome::DropIndex(_))
+        ));
+    }
+    let storage = Storage::open(&path).expect("reopen storage");
+    let mut names: Vec<String> = storage
+        .list_indexes()
+        .expect("list indexes")
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["idx_qty", "idx_ratio", "idx_score"]);
+}
+
 // --- 構文の許可形状（カタログ非参照） -------------------------------------------
 
 /// 構文検証段の拒否はカタログを参照しないため、対象テーブルが存在しなくても

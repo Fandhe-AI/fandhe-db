@@ -345,6 +345,11 @@ impl ExplainShape {
                 f.column_index(),
             );
         }
+        // Issue #1413: 数値列述語（式述語側）も索引名の被覆判定に含める。
+        // `id` 述語は `numeric_predicate_columns` が返さないため対象外のまま。
+        for column_index in crate::sql::scalar_plan::numeric_predicate_columns(expr_filters) {
+            set_filter_col_bit(&mut filter_cols, &mut filter_cols_overflow, column_index);
+        }
         Self {
             filters_empty: metadata_filters.is_empty()
                 && expr_filters.is_empty()
@@ -377,7 +382,7 @@ impl ExplainShape {
         self.scalar_plan
     }
 
-    /// Issue #1066: `metadata_filters` が参照した列インデックスの列挙
+    /// Issue #1066: `metadata_filters` と式述語の数値列（#1413）が参照した列インデックスの列挙
     /// （`core.rs::EngineCore::run_explain_plan` が索引名注記の被覆判定に使う。
     /// 添字は束縛時スキーマの `columns` と同一空間）。[`Self::
     /// filter_columns_overflowed`] が `true` の場合、呼び出し元はこの列挙を
