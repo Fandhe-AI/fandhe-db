@@ -14,6 +14,9 @@
 //! `sql31_transaction.rs` の回復系テストは制約を持たない表が対象で、台帳照合が行制約より
 //! 先であること自体は守れない（行制約側が先に走る退行でも通る）。本ファイルはその穴を
 //! 塞ぐ。autocommit 経路は `unique_constraint.rs` が担う。
+//!
+//! Issue #1403: 先頭文（または唯一の文）が 0 行の `DELETE` でも同じ再送判定が成立すること
+//! （SQL-18・#983 で SQL 表層の 0 行 DELETE も台帳記録）を、単一行形・述語形の両方で固定する。
 
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
@@ -303,4 +306,219 @@ fn ledger_is_tenant_scoped_for_explicit_transaction_resend() {
         .expect_err("alice resend stays a ledger duplicate");
     assert_ledger_duplicate(&err);
     rollback_to_idle(&core, &alice, &mut txn);
+}
+
+/// 0 行 `DELETE` の形（単一行形 `WHERE id = n`／述語形 `WHERE code = 'v'`）。
+/// 述語形は `id` 以外の列を使う（`id` 指定は単一行形として束縛されるため）。
+#[derive(Clone, Copy, Debug)]
+enum DelForm {
+    Single,
+    Predicate,
+}
+
+const DEL_FORMS: [DelForm; 2] = [DelForm::Single, DelForm::Predicate];
+
+/// 行 `n`（id = n・code = `z{n}`）を対象にする `DELETE ... USING OPERATION_ID` 文を組み立てる。
+fn del_sql(form: DelForm, n: u64, op: &str) -> String {
+    match form {
+        DelForm::Single => format!("DELETE FROM orders WHERE id = {n} USING OPERATION_ID '{op}'"),
+        DelForm::Predicate => {
+            format!("DELETE FROM orders WHERE code = 'z{n}' USING OPERATION_ID '{op}'")
+        }
+    }
+}
+
+/// 対象行 `n` に一致する行を INSERT する文。
+fn ins_target(n: u64, op: &str) -> String {
+    ins(n, &format!("z{n}"), &format!("s{n}"), op)
+}
+
+/// 0 行 `DELETE` が成功し `rows_affected == 0` であることを確かめる。
+fn assert_zero_row_delete(out: SqlOutcome) {
+    match out {
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 0),
+        other => panic!("expected zero-row Delete, got {other:?}"),
+    }
+}
+
+fn commit<'a>(core: &'a EngineCore, caller: &PolicyContext, txn: &mut SessionTransaction<'a>) {
+    assert_eq!(
+        step(core, caller, txn, "COMMIT").expect("commit"),
+        SqlOutcome::Commit
+    );
+}
+
+/// 唯一の文が 0 行 `DELETE` のトランザクションを commit した後、新しい `BEGIN` で同じ
+/// `operation_id` を再送すると台帳由来の `23505` になる（RECOVER-12・SQL-18）。
+#[test]
+fn zero_row_delete_as_sole_statement_resend_is_ledger_duplicate() {
+    for form in DEL_FORMS {
+        let (core, path) = new_core("recover12-zero-del-sole", "code TEXT, sku TEXT");
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+
+        let mut txn = begin(&core, &alice);
+        assert_zero_row_delete(
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("zero-row delete"),
+        );
+        commit(&core, &alice, &mut txn);
+
+        let mut txn = begin(&core, &alice);
+        let err = step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1"))
+            .expect_err("resend of a committed zero-row delete");
+        assert_ledger_duplicate(&err);
+        let blocked = step(&core, &alice, &mut txn, &ins_target(9, "zd-x"))
+            .expect_err("statement in a failed transaction");
+        assert_eq!(blocked.wire_code(), "25P02", "{form:?}");
+        rollback_to_idle(&core, &alice, &mut txn);
+        assert_eq!(visible_rows(&core, &alice), 0, "{form:?}");
+    }
+}
+
+/// 先頭文が 0 行 `DELETE`・後続が INSERT のトランザクションを commit した後、新しい `BEGIN` で
+/// 先頭文を再送すると台帳由来の `23505` になり、INSERT は二重適用されない（RECOVER-12）。
+#[test]
+fn zero_row_delete_as_first_statement_resend_is_ledger_duplicate() {
+    for form in DEL_FORMS {
+        let (core, path) = new_core("recover12-zero-del-first", "code TEXT, sku TEXT");
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+
+        let mut txn = begin(&core, &alice);
+        assert_zero_row_delete(
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("zero-row delete"),
+        );
+        step(&core, &alice, &mut txn, &ins(1, "c1", "s1", "zd-ins")).expect("insert");
+        commit(&core, &alice, &mut txn);
+
+        let mut txn = begin(&core, &alice);
+        let err = step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1"))
+            .expect_err("resend of the committed first statement");
+        assert_ledger_duplicate(&err);
+        rollback_to_idle(&core, &alice, &mut txn);
+        assert_eq!(visible_rows(&core, &alice), 1, "{form:?}");
+    }
+}
+
+/// 対照（非 vacuous 性）: COMMIT 前に接続が断たれた 0 行 `DELETE` は台帳を残さず、再送は通常
+/// 成功する。commit 後の再送で初めて台帳由来になる（台帳エントリが COMMIT に由来する証跡）。
+#[test]
+fn zero_row_delete_dropped_before_commit_leaves_no_ledger_entry() {
+    for form in DEL_FORMS {
+        let (core, path) = new_core("recover12-zero-del-drop", "code TEXT, sku TEXT");
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+        {
+            let mut txn = begin(&core, &alice);
+            assert_zero_row_delete(
+                step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("zero-row delete"),
+            );
+            // COMMIT せずに drop（接続断）。
+        }
+
+        let mut txn = begin(&core, &alice);
+        assert_zero_row_delete(
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("resend succeeds"),
+        );
+        commit(&core, &alice, &mut txn);
+
+        let mut txn = begin(&core, &alice);
+        let err = step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1"))
+            .expect_err("re-resend after recovery");
+        assert_ledger_duplicate(&err);
+        rollback_to_idle(&core, &alice, &mut txn);
+    }
+}
+
+/// 再送の安全性: 0 行 `DELETE` の commit 後に対象行が別経路で INSERT されても、再送は台帳由来の
+/// `23505` で拒否され、後から入った行は削除されない（台帳照合が候補列挙・所有権判定より先）。
+#[test]
+fn zero_row_delete_resend_does_not_delete_row_inserted_later() {
+    for form in DEL_FORMS {
+        let (core, path) = new_core("recover12-zero-del-safe", "code TEXT, sku TEXT");
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+
+        let mut txn = begin(&core, &alice);
+        assert_zero_row_delete(
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("zero-row delete"),
+        );
+        commit(&core, &alice, &mut txn);
+
+        core.execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &ins_target(7, "zd-ins"),
+        )
+        .expect("insert the target afterwards");
+
+        let mut txn = begin(&core, &alice);
+        let err = step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1"))
+            .expect_err("resend must be rejected by the ledger");
+        assert_ledger_duplicate(&err);
+        rollback_to_idle(&core, &alice, &mut txn);
+        assert_eq!(visible_rows(&core, &alice), 1, "{form:?}");
+    }
+}
+
+/// テナント境界（RLS-10・TABLE-12）: 他テナントだけが持つ行への 0 行 `DELETE` は他テナントの行を
+/// 変えず、再送は固定文言の台帳由来 `23505`。台帳はテナント単位なので他テナントの処理に影響しない。
+#[test]
+fn zero_row_delete_resend_is_tenant_scoped() {
+    for form in DEL_FORMS {
+        let (core, path) = new_core("recover12-zero-del-tenant", "code TEXT, sku TEXT");
+        let _guard = CleanupGuard(path);
+        let alice = ctx("tenant-a");
+        let bob = ctx("tenant-b");
+        core.execute_sql_in_session(&bob, &mut SessionState::default(), &ins_target(7, "b-ins"))
+            .expect("bob seed");
+
+        let mut txn = begin(&core, &alice);
+        assert_zero_row_delete(
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("zero-row delete"),
+        );
+        commit(&core, &alice, &mut txn);
+        assert_eq!(visible_rows(&core, &bob), 1, "{form:?}");
+
+        let mut txn = begin(&core, &alice);
+        let err =
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect_err("alice resend");
+        assert_ledger_duplicate(&err);
+        rollback_to_idle(&core, &alice, &mut txn);
+
+        // bob には alice の台帳が見えず、同じ operation_id・同じ文は通常処理（実削除）になる。
+        let mut txn = begin(&core, &bob);
+        match step(&core, &bob, &mut txn, &del_sql(form, 7, "zd-1")).expect("bob delete") {
+            SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 1, "{form:?}"),
+            other => panic!("expected Delete, got {other:?}"),
+        }
+        commit(&core, &bob, &mut txn);
+        assert_eq!(visible_rows(&core, &bob), 0, "{form:?}");
+    }
+}
+
+/// 同じ `operation_id` で別の対象を再送すると内容不一致（`22023`）になる（RECOVER-10）。
+#[test]
+fn zero_row_delete_resend_with_different_target_is_content_mismatch() {
+    for form in DEL_FORMS {
+        let (core, path) = new_core("recover12-zero-del-mismatch", "code TEXT, sku TEXT");
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+
+        let mut txn = begin(&core, &alice);
+        assert_zero_row_delete(
+            step(&core, &alice, &mut txn, &del_sql(form, 7, "zd-1")).expect("zero-row delete"),
+        );
+        commit(&core, &alice, &mut txn);
+
+        let mut txn = begin(&core, &alice);
+        let err = step(&core, &alice, &mut txn, &del_sql(form, 8, "zd-1"))
+            .expect_err("different target under the same operation_id");
+        assert!(
+            matches!(err, SqlSurfaceError::OperationIdContentMismatch),
+            "expected OperationIdContentMismatch, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), "22023");
+        rollback_to_idle(&core, &alice, &mut txn);
+    }
 }

@@ -6,7 +6,7 @@
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
 - 関連ポインタ: RECOVER-5・RECOVER-6・RECOVER-8・TASK-96・TASK-97・TASK-99・
-  TABLE-3・SQL-18（0 行 DELETE は台帳非記録）・WIRE-16（複数文実行。
+  TABLE-3・SQL-18（SQL 表層の 0 行 DELETE も台帳記録。#983）・WIRE-16（複数文実行。
   `wire-multi-statement.md`）・WIRE-19（`ReadyForQuery` 状態バイト。PR #1041
   レビュー指摘対応で #943 の担当分を本 PR へ吸収し実装済み）
 
@@ -366,6 +366,13 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   順序）、wire の `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（層 A）、
   `three_client_e2e.rs` の層 B（psql／psycopg／node pg の 3 クライアント。
   [`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
+- 先頭文（または唯一の文）が 0 行 DELETE の場合の再送判定（Issue #1403。実装済み）:
+  明示トランザクション内の DELETE は autocommit と同じフォーム関数へ `WriteTarget::InTxn`
+  を渡し、0 行でも台帳を共有 write txn へ記録して `mark_written` する。このため従来の
+  既知の制約は解消済みで、engine の `recover12_explicit_txn_resend.rs` が単一行形・
+  述語形の両方で固定する（commit 後の再送は台帳由来の `23505`、COMMIT 前の接続断では
+  台帳が残らない対照、後から INSERT された行を再送が消さないこと、テナント単位の台帳）。
+  本番コードの変更は不要だった。
 
 ## 起源（Explicit／Implicit）ごとの遷移差分（Issue #1175）
 
@@ -397,8 +404,6 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
-- 先頭文が 0 行 DELETE の場合に RECOVER-12 の再送判定が成立しない制約
-  （SQL-18 の既存契約〔0 行 DELETE は台帳非記録〕との相互作用）。
 - 上限の既定値（20 秒・1,000 件・30 秒）の確定 → オーナー判断。
 
 ## カーソルとの関係
