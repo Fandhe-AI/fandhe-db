@@ -259,6 +259,34 @@ fn string_literal_input_grammar_and_error_codes() {
 }
 
 #[test]
+fn real_double_string_literal_trailing_dot_matches_numeric_form() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let (alice, bob) = (ctx_for("alice"), ctx_for("bob"));
+    seed(&core, &alice, &bob);
+    // 数値リテラルとして受理される末尾ドット形は、文字列リテラルでも同じ値へ束縛する。
+    for col in ["r", "d"] {
+        for lit in ["1.", "2.", "10."] {
+            for op in ["=", "<", ">="] {
+                assert_eq!(
+                    ids(&core, &alice, &format!("{col} {op} {lit}")),
+                    ids(&core, &alice, &format!("{col} {op} '{lit}'")),
+                    "{col} {op} {lit}"
+                );
+            }
+        }
+        assert_eq!(ids(&core, &alice, &format!("{col} > ' 2. '")), vec![2, 4]);
+        assert_eq!(ids(&core, &alice, &format!("{col} > '+2.'")), vec![2, 4]);
+        assert_eq!(
+            ids(&core, &alice, &format!("{col} = '.5e1'")),
+            Vec::<u64>::new()
+        );
+        assert_eq!(code(&core, &alice, &format!("{col} = '.'")), "22P02");
+        assert_eq!(code(&core, &alice, &format!("{col} = 'inf'")), "22P02");
+    }
+}
+
+#[test]
 fn ranked_search_with_string_literal_matches_numeric_form() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);

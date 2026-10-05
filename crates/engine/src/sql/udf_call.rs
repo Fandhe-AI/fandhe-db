@@ -1946,16 +1946,44 @@ fn bind_unknown_literal_against(
             v.to_string()
         }
         _ => {
-            // `parse_double` は書式・範囲（非有限・アンダーフロー）の検証にだけ使い、
-            // 丸め後の値は使わない。丸め値を文字列化して渡すと 2^53 超の整数字面が
-            // `parse_number_literal` の exactness 検査（22003）より前に近傍の f64 へ
-            // 丸められ、数値リテラル形式との等価性が崩れる（Cursor Bugbot 指摘・PR #1420）。
-            // 検証済みの原文をそのまま渡し、同じ exactness 検査を通す。
-            crate::scalar_float::parse_double(s).map_err(|e| match e {
+            // 文字列からの変換文法は数値リテラル形に揃える: 前後空白除去・先頭 `+`／`-`・
+            // 末尾ドット（`1.`）・先頭ドット（`.5`）を受理する（Codex P1・PR #1420）。
+            // `parse_double` は閉じた文法（整数部・小数部とも 1 桁以上）なので、
+            // 仮数部の欠けた側を正規化した形で検証する。
+            // 検証は書式・範囲（非有限・アンダーフロー）にだけ使い、丸め後の値は使わない。
+            // 丸め値を文字列化して渡すと 2^53 超の整数字面が `parse_number_literal` の
+            // exactness 検査（22003）より前に近傍の f64 へ丸められ、数値リテラル形式との
+            // 等価性が崩れる（Cursor Bugbot 指摘・PR #1420）。そのため正規化済みの
+            // 原文を同じ exactness 検査へ渡す。
+            let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+            let unsigned_plus = trimmed.strip_prefix('+').unwrap_or(trimmed);
+            let (neg, body) = match unsigned_plus.strip_prefix('-') {
+                Some(rest) => ("-", rest),
+                None => ("", unsigned_plus),
+            };
+            let (mantissa, exp) = match body.find(['e', 'E']) {
+                Some(i) => (body.get(..i).unwrap_or(""), body.get(i..).unwrap_or("")),
+                None => (body, ""),
+            };
+            let (int_part, frac_part) = match mantissa.split_once('.') {
+                Some((i, f)) => (i, Some(f)),
+                None => (mantissa, None),
+            };
+            let frac_norm = frac_part.filter(|f| !f.is_empty());
+            let int_norm = if int_part.is_empty() && frac_norm.is_some() {
+                "0"
+            } else {
+                int_part
+            };
+            let normalized = match frac_norm {
+                Some(f) => format!("{neg}{int_norm}.{f}{exp}"),
+                None => format!("{neg}{int_norm}{exp}"),
+            };
+            crate::scalar_float::parse_double(&normalized).map_err(|e| match e {
                 crate::scalar_float::ParseFloatError::Malformed => invalid(),
                 crate::scalar_float::ParseFloatError::OutOfRange => out_of_range(),
             })?;
-            s.to_string()
+            normalized
         }
     };
     let mut n = parse_number_literal(&text)?;
