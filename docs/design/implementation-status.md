@@ -649,3 +649,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/wire-server/src/http/query/filter.rs`（適用先表層 `FilterSurface` を導入し、述語形 DML だけ ARRAY／JSON／JSONB 列の `in` の要素〔配列・オブジェクト〕を受理。`reject_composite_eq` を削除し、`eq`／`ne`／`in` を `Equality`／`Not(Equality)`／`InList` へ写像）、`update.rs`・`delete.rs`・`search.rs` の doc、`crates/wire-server/docs/nosql-api.md`、層 A `tests/nosql12_predicate_dml_composite_filter.rs`。engine は変更なし。
 - **性質**: SQL の述語形 DML と同じ AST のため同じ影響行数・`wire_code`・台帳照合（`23505`／`22023`）になる。`search`／`scan`／`aggregate` の ARRAY／JSON 列 `in` は `42601` のまま。RLS・テナント境界・fail-closed・依存は不変。`FilterError::CompositeEqNotSupportedForPredicateDml` は公開 enum の互換性のため残置（生成されない）。
 - **既知の差分**: 台帳照合はリテラルの綴り（サーバーの正規直列化）に依存する。search 系の `in` は ARRAY／JSON 列で未対応のまま。
+
+## Issue #1411: 評価後射影形ビューへの外側の集計・DISTINCT・ウィンドウ・式 ORDER BY と連鎖
+
+- **対象ビヘイビア**: TABLE-18（関連: RLS-10 (b)・ERR-1／ERR-2／ERR-4／ERR-6・TASK-205）。
+- **変更箇所**: `crates/engine/src/sql/allowlist.rs`（`ValidatedBufferedView` を `outer: BufferedOuter`〔`Rows`／`Aggregate`〕へ再構成、集計・DISTINCT のルーティング、`check_buffered_body_shape` の連鎖アーム、`buffered_layer_statement`）、`sql/view_buffered.rs`（外側の計画・実行。集計・式 `ORDER BY`・ウィンドウ・列スコープ検査）、`sql/group_by.rs`（`finish_groups` の切り出しと `GroupedRowAccumulator`）、`sql/window.rs`（`collect_window_row_values` の切り出しと `CellWindowEvaluator`）、`sql/view.rs`（連鎖の畳み込み・深さ計数の lookup）、`catalog.rs`（DAG 深さ・作成時の実カタログ検証 `TxnViewLookup`）、テスト（`tests/table18_buffered_outer.rs` 新規・`table18_view.rs` の期待値反転・単体テスト）、`docs/design/create-view.md`（Phase 4 節）。
+- **性質**: 外側の集計・`GROUP BY`・`HAVING`・`SELECT DISTINCT`・ウィンドウ関数・式 `ORDER BY` が、参照セッション自身の RLS で評価した本文の結果を母集合に評価される。ビューが公開しない物理キー `id` は集計・グループ化・並べ替え・分割に使えず `22000`。評価後射影形ビューの連鎖（評価後射影形→評価後射影形・単純形→評価後射影形）を受理し、深さ上限（4）超過は `54000`。依存検査（`2BP01`・`DROP COLUMN` の保守的拒否）は不変。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: 外側の式項目・投影位置のスカラーサブクエリ・UDF 述語／サブクエリ述語・集計の式引数、CTE・サブクエリ・集合演算の枝・JOIN の辺からの評価後射影形ビュー参照、本文でのウィンドウ関数・式項目・UDF 述語、評価後射影形ビューへの `EXPLAIN`・cursor `DECLARE`、NoSQL 表層でのビュー指定。

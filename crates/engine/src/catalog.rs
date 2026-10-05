@@ -2273,37 +2273,16 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
     })
 }
 
-/// `name` が評価後射影形（[`ViewBodyShape::buffered`]）のビューなら `true`
-/// （テーブル・未登録は `false`）。格納本文の再検証失敗はカタログ破損として
+/// `name` が評価後射影形（[`ViewBodyShape::buffered`]）のビュー、または単純形ビューの
+/// 連鎖を経て評価後射影形ビューへ到達するビューなら `true`（テーブル・未登録は `false`。
+/// Issue #1411）。格納本文の再検証失敗・循環・過大な連鎖はカタログ破損として
 /// `CorruptSchema`。
-fn view_is_buffered_in_txn(views_table: &redb::Table<'_, &str, &[u8]>, name: &str) -> Result<bool> {
-    match views_table.get(name)? {
-        None => Ok(false),
-        Some(guard) => {
-            let def = decode_view_def(guard.value())?;
-            let shape = view_body_shape(&def.body_sql).map_err(|_| {
-                CatalogError::CorruptSchema("stored view body is invalid".to_string())
-            })?;
-            Ok(shape.buffered)
-        }
-    }
-}
-
-/// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
-/// それを直接参照するビューが深さ 1）を計算する（[`Storage::create_view`] が
-/// 新規ビューのネスト深さ判定に使う。同一 write txn 内で完結させ TOCTOU を
-/// 避ける）。`start` がテーブル・ビューのいずれにも存在しない場合は
-/// `CatalogError::TableNotFound`。循環・異常に長い連鎖はカタログ破損として
-/// `CorruptSchema`（正常経路では発生しない。[`Storage::create_view`] が新規
-/// ビュー名の被参照を作成前に拒否するため自己参照は構造的に作れない）。
-fn resolve_reference_depth_in_txn(
-    catalog_table: &redb::Table<'_, &str, &[u8]>,
+fn view_reaches_buffered_in_txn(
     views_table: &redb::Table<'_, &str, &[u8]>,
-    start: &str,
-) -> Result<u32> {
-    let mut current = start.to_string();
+    name: &str,
+) -> Result<bool> {
+    let mut current = name.to_string();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut depth = 0u32;
     loop {
         if !visited.insert(current.clone()) {
             return Err(CatalogError::CorruptSchema(
@@ -2315,18 +2294,151 @@ fn resolve_reference_depth_in_txn(
                 "view reference chain too long".to_string(),
             ));
         }
-        if catalog_table.get(current.as_str())?.is_some() {
-            return Ok(depth);
+        let Some(guard) = views_table.get(current.as_str())? else {
+            return Ok(false);
+        };
+        let def = decode_view_def(guard.value())?;
+        let shape = view_body_shape(&def.body_sql)
+            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+        if shape.buffered {
+            return Ok(true);
         }
-        match views_table.get(current.as_str())? {
-            Some(guard) => {
-                let def = decode_view_def(guard.value())?;
-                depth = depth.checked_add(1).ok_or_else(|| {
-                    CatalogError::CorruptSchema("view nesting depth overflow".to_string())
-                })?;
-                current = def.base_relation;
+        current = def.base_relation;
+    }
+}
+
+/// `CREATE VIEW` の write txn 内で、参照時と同じ実カタログ照会
+/// （[`TableLookup`]）を提供する（Issue #1411。評価後射影形ビューを読む本文を、参照時の
+/// 再検証 `sql::view::resolve_from` と同一の経路で作成前に検証するために使う）。
+struct TxnViewLookup<'a, 'txn> {
+    catalog_table: &'a redb::Table<'txn, &'static str, &'static [u8]>,
+    views_table: &'a redb::Table<'txn, &'static str, &'static [u8]>,
+}
+
+impl TableLookup for TxnViewLookup<'_, '_> {
+    fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        self.catalog_table
+            .get(name)
+            .map(|v| v.is_some())
+            .map_err(|e| table_lookup_error(CatalogError::from(e)))
+    }
+
+    fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
+        match self
+            .views_table
+            .get(name)
+            .map_err(|e| table_lookup_error(CatalogError::from(e)))?
+        {
+            None => Ok(None),
+            Some(guard) => decode_view_def(guard.value())
+                .map(Some)
+                .map_err(table_lookup_error),
+        }
+    }
+}
+
+/// `start` から始めてテーブルへ到達するまでの参照段数（テーブル自身が深さ 0、
+/// それを直接参照するビューが深さ 1）を計算する（[`Storage::create_view`] が
+/// 新規ビューのネスト深さ判定に使う。同一 write txn 内で完結させ TOCTOU を
+/// 避ける）。ビューの深さは、単純形ビューは `base_relation`、評価後射影形ビューは本文が読む
+/// 全 relation（[`ViewBodyShape::relations`]）の最大深さ + 1（Issue #1411。評価後射影形
+/// ビューの連鎖で、複数 relation を読む本文の深さを過小評価しない）。`start` が
+/// テーブル・ビューのいずれにも存在しない場合は `CatalogError::TableNotFound`。循環・異常に
+/// 長い連鎖はカタログ破損として `CorruptSchema`（正常経路では発生しない。
+/// [`Storage::create_view`] が新規ビュー名の被参照を作成前に拒否するため自己参照は構造的に
+/// 作れない）。再帰せず、明示スタックとメモで反復する。
+fn resolve_reference_depth_in_txn(
+    catalog_table: &redb::Table<'_, &str, &[u8]>,
+    views_table: &redb::Table<'_, &str, &[u8]>,
+    start: &str,
+) -> Result<u32> {
+    struct Frame {
+        name: String,
+        children: Vec<String>,
+        next: usize,
+        max_child: u32,
+    }
+    let mut memo: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut on_stack: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut pushed = 0usize;
+
+    // `name` の深さが確定していれば `Some`、未確定なら（ビューなら）フレームを積んで `None`。
+    let open = |name: &str,
+                memo: &mut std::collections::HashMap<String, u32>,
+                on_stack: &mut std::collections::HashSet<String>,
+                stack: &mut Vec<Frame>,
+                pushed: &mut usize|
+     -> Result<Option<u32>> {
+        if let Some(d) = memo.get(name) {
+            return Ok(Some(*d));
+        }
+        if catalog_table.get(name)?.is_some() {
+            memo.insert(name.to_string(), 0);
+            return Ok(Some(0));
+        }
+        let Some(guard) = views_table.get(name)? else {
+            return Err(CatalogError::TableNotFound(start.to_string()));
+        };
+        if !on_stack.insert(name.to_string()) {
+            return Err(CatalogError::CorruptSchema(
+                "view reference cycle detected".to_string(),
+            ));
+        }
+        *pushed += 1;
+        if *pushed > MAX_VIEW_CHAIN_WALK {
+            return Err(CatalogError::CorruptSchema(
+                "view reference chain too long".to_string(),
+            ));
+        }
+        let def = decode_view_def(guard.value())?;
+        let shape = view_body_shape(&def.body_sql)
+            .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
+        let children = if shape.buffered {
+            shape.relations
+        } else {
+            vec![def.base_relation]
+        };
+        stack.push(Frame {
+            name: name.to_string(),
+            children,
+            next: 0,
+            max_child: 0,
+        });
+        Ok(None)
+    };
+
+    if let Some(d) = open(start, &mut memo, &mut on_stack, &mut stack, &mut pushed)? {
+        return Ok(d);
+    }
+    loop {
+        let Some(top) = stack.last_mut() else {
+            // 最初のフレームが完了した時点で `memo` に結果が入っている。
+            return memo.get(start).copied().ok_or_else(|| {
+                CatalogError::CorruptSchema("view depth resolution lost its result".to_string())
+            });
+        };
+        if let Some(child) = top.children.get(top.next).cloned() {
+            top.next += 1;
+            if let Some(d) = open(&child, &mut memo, &mut on_stack, &mut stack, &mut pushed)? {
+                if let Some(top) = stack.last_mut() {
+                    top.max_child = top.max_child.max(d);
+                }
             }
-            None => return Err(CatalogError::TableNotFound(start.to_string())),
+            continue;
+        }
+        let Some(done) = stack.pop() else {
+            return Err(CatalogError::CorruptSchema(
+                "view depth resolution stack underflow".to_string(),
+            ));
+        };
+        on_stack.remove(&done.name);
+        let depth = done.max_child.checked_add(1).ok_or_else(|| {
+            CatalogError::CorruptSchema("view nesting depth overflow".to_string())
+        })?;
+        memo.insert(done.name, depth);
+        if let Some(parent) = stack.last_mut() {
+            parent.max_child = parent.max_child.max(depth);
         }
     }
 }
@@ -2394,8 +2506,10 @@ fn views_reference_column_in_txn(
         // Issue #1192: 評価後射影形本文（集計・JOIN 等）の列参照は単純形の列
         // スコープ検査では追えないため、対象テーブルを読んでいれば保守的に
         // 「依存あり」とする（fail-closed）。無関係なテーブルのみを読む本文は
-        // 対象外。再検証できない本文も「依存あり」。評価後射影形ビューは他の
-        // ビューの参照先にならないため、以降の連鎖走査（`defs`）には含めない。
+        // 対象外。再検証できない本文も「依存あり」。評価後射影形ビューは以降の連鎖走査
+        // （`defs`。単純形ビューの公開列の導出）には含めない。評価後射影形ビューを参照する
+        // ビュー（Issue #1411 の連鎖）も、最下段の評価後射影形ビューが基底テーブルを読む限り
+        // そちらで保守的に「依存あり」と検出されるため、連鎖下でも結果は変わらない。
         match view_body_shape(&def.body_sql) {
             Ok(shape) if shape.buffered => {
                 buffered_relations.extend(shape.relations);
@@ -8421,21 +8535,49 @@ impl Storage {
                 let d = resolve_reference_depth_in_txn(&catalog_table, &views_table, rel)?;
                 depth = depth.max(d);
             }
-            // Issue #1192: 評価後射影形ビューは連鎖の最外段の 1 段に限る
-            // （再帰の深さを 1 段に抑える）。評価後射影形本文は別の評価後射影形
-            // ビューを、単純形ビューは評価後射影形ビューを参照できない。JOIN 本文の
-            // 両辺はテーブルに限る（参照時に JOIN 内のビュー参照は拒否されるため、
-            // 作成できても参照できない定義を作らない）。
+            // Issue #1192・#1411: JOIN 本文の両辺はテーブルに限る（参照時に JOIN 内のビュー
+            // 参照は拒否されるため、作成できても参照できない定義を作らない）。評価後射影形
+            // ビュー（または単純形の連鎖でそこへ到達するビュー）を読む本文は、参照時と同じ
+            // 再検証（`sql::view::resolve_from`。実カタログ照会）を作成前に通し、CTE・
+            // サブクエリ・集合演算の枝・JOIN の辺からの参照など参照時に必ず拒否される形は
+            // `Invalid`（`42601`）にする。単純形ビューは、評価後射影形ビューの上に重ねられる形
+            // （列射影・宣言的 `WHERE` のみ）に限る。
+            let mut reaches_buffered = false;
             for rel in &shape.relations {
-                if view_is_buffered_in_txn(&views_table, rel)? {
-                    return Err(CatalogError::Invalid(
-                        "a view cannot reference a view with an aggregate/LIMIT body".to_string(),
-                    ));
+                if view_reaches_buffered_in_txn(&views_table, rel)? {
+                    reaches_buffered = true;
                 }
                 if shape.join && catalog_table.get(rel.as_str())?.is_none() {
                     return Err(CatalogError::Invalid(
                         "JOIN in a view body cannot reference a view".to_string(),
                     ));
+                }
+            }
+            if reaches_buffered {
+                let invalid = || {
+                    CatalogError::Invalid(
+                        "a view cannot reference a view with an aggregate/LIMIT body in this position"
+                            .to_string(),
+                    )
+                };
+                if shape.buffered {
+                    let lookup = TxnViewLookup {
+                        catalog_table: &catalog_table,
+                        views_table: &views_table,
+                    };
+                    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| invalid())?;
+                    classify_view_body(&tokens, &lookup).map_err(|e| match e {
+                        // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
+                        SqlSurfaceError::PayloadTooLarge { detail } => {
+                            CatalogError::ViewLimitExceeded(detail)
+                        }
+                        _ => invalid(),
+                    })?;
+                } else {
+                    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| invalid())?;
+                    let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
+                    crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
+                        .map_err(|_| invalid())?;
                 }
             }
             // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは

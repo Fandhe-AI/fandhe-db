@@ -535,58 +535,19 @@ fn materialize_rows(
                 state_cap,
             )?;
 
-            let mut partition_keys = Vec::with_capacity(bound.windows().len());
-            let mut order_keys = Vec::with_capacity(bound.windows().len());
-            let mut agg_values = Vec::with_capacity(bound.windows().len());
-            for (item_index, item) in bound.windows().iter().enumerate() {
-                let mut pkeys = Vec::with_capacity(item.partition_by.len());
-                for key in &item.partition_by {
-                    let value = extract_window_key(key, id, &scanned)?;
-                    state_bytes = try_accumulate_state_budget(
-                        state_bytes,
-                        window_key_value_bytes(&value),
-                        state_cap,
-                    )?;
-                    pkeys.push(value);
-                }
-                let partition_bytes = partition_key_bytes(&pkeys);
-                let counts = &mut partition_counts[item_index];
-                let is_new_partition = !counts.contains_key(&partition_bytes);
-                if is_new_partition {
-                    check_new_partition_capacity(counts.len(), MAX_WINDOW_PARTITIONS)?;
-                }
-                let count = counts.entry(partition_bytes).or_insert(0);
-                *count += 1;
-                check_partition_row_count(*count, MAX_WINDOW_FRAME_ROWS)?;
-
-                let mut okeys = Vec::with_capacity(item.order_by.len());
-                for (key, _descending) in &item.order_by {
-                    let value = extract_window_key(key, id, &scanned)?;
-                    state_bytes = try_accumulate_state_budget(
-                        state_bytes,
-                        window_key_value_bytes(&value),
-                        state_cap,
-                    )?;
-                    okeys.push(value);
-                }
-
-                let agg_value = match &item.input {
-                    None => WindowInputValue::None,
-                    Some(input) => {
-                        let value = extract_window_input(input, dim, &scanned)?;
-                        state_bytes = try_accumulate_state_budget(
-                            state_bytes,
-                            window_input_value_bytes(&value),
-                            state_cap,
-                        )?;
-                        value
-                    }
-                };
-
-                partition_keys.push(pkeys);
-                order_keys.push(okeys);
-                agg_values.push(agg_value);
-            }
+            let WindowRowValues {
+                partition_keys,
+                order_keys,
+                agg_values,
+            } = collect_window_row_values(
+                bound.windows(),
+                id,
+                dim,
+                &scanned,
+                &mut partition_counts,
+                &mut state_bytes,
+                state_cap,
+            )?;
 
             // Issue #1189: 文全体の `ORDER BY` キー値と tenant 識別子。確保前に
             // 借用長から見積もって state 予算へ計上する（`sql::scan` の経路 (B) と
@@ -654,6 +615,180 @@ fn materialize_rows(
         tenants,
         state_bytes,
     })
+}
+
+/// 1 行分の、ウィンドウ項目ごとの `PARTITION BY`／`ORDER BY` キー・集計引数の値
+/// （[`MaterializedRow`] の構成要素）。
+struct WindowRowValues {
+    partition_keys: Vec<Vec<Option<WindowKeyValue>>>,
+    order_keys: Vec<Vec<Option<WindowKeyValue>>>,
+    agg_values: Vec<WindowInputValue>,
+}
+
+/// `scanned`（1 行分のスカラー列）から `items`（`bound.windows()`）ごとのキー・引数の値を
+/// 取り出し、状態予算（`state_bytes`／`state_cap`）・パーティション数・パーティション行数の
+/// 上限（いずれも超過は `54000`）へ計上する。ストレージ走査（[`materialize_rows`]）と
+/// 評価済みセル（[`CellWindowEvaluator`]。Issue #1411）が共有する唯一の実装で、第 2 の
+/// ウィンドウ値抽出を作らない。
+fn collect_window_row_values(
+    items: &[BoundWindowItem],
+    id: u64,
+    dim: u32,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    partition_counts: &mut [HashMap<Vec<u8>, usize>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<WindowRowValues, SqlSurfaceError> {
+    let mut partition_keys = Vec::with_capacity(items.len());
+    let mut order_keys = Vec::with_capacity(items.len());
+    let mut agg_values = Vec::with_capacity(items.len());
+    for (item_index, item) in items.iter().enumerate() {
+        let mut pkeys = Vec::with_capacity(item.partition_by.len());
+        for key in &item.partition_by {
+            let value = extract_window_key(key, id, scanned)?;
+            *state_bytes = try_accumulate_state_budget(
+                *state_bytes,
+                window_key_value_bytes(&value),
+                state_cap,
+            )?;
+            pkeys.push(value);
+        }
+        let partition_bytes = partition_key_bytes(&pkeys);
+        let counts = partition_counts
+            .get_mut(item_index)
+            .ok_or_else(|| window_bug("partition count table missing for a window item"))?;
+        let is_new_partition = !counts.contains_key(&partition_bytes);
+        if is_new_partition {
+            check_new_partition_capacity(counts.len(), MAX_WINDOW_PARTITIONS)?;
+        }
+        let count = counts.entry(partition_bytes).or_insert(0);
+        *count += 1;
+        check_partition_row_count(*count, MAX_WINDOW_FRAME_ROWS)?;
+
+        let mut okeys = Vec::with_capacity(item.order_by.len());
+        for (key, _descending) in &item.order_by {
+            let value = extract_window_key(key, id, scanned)?;
+            *state_bytes = try_accumulate_state_budget(
+                *state_bytes,
+                window_key_value_bytes(&value),
+                state_cap,
+            )?;
+            okeys.push(value);
+        }
+
+        let agg_value = match &item.input {
+            None => WindowInputValue::None,
+            Some(input) => {
+                let value = extract_window_input(input, dim, scanned)?;
+                *state_bytes = try_accumulate_state_budget(
+                    *state_bytes,
+                    window_input_value_bytes(&value),
+                    state_cap,
+                )?;
+                value
+            }
+        };
+
+        partition_keys.push(pkeys);
+        order_keys.push(okeys);
+        agg_values.push(agg_value);
+    }
+    Ok(WindowRowValues {
+        partition_keys,
+        order_keys,
+        agg_values,
+    })
+}
+
+/// 評価済みのセル由来の行を母集合としてウィンドウ項目を評価する実行器（Issue #1411・
+/// TABLE-18。`sql::view_buffered` が評価後射影形ビューの本文結果に対する外側のウィンドウ関数で
+/// 使う）。ストレージを読まないため RLS・可視性判定には関与しない（渡される行は呼び出し元
+/// ＝本文の実行経路が参照セッションの `PolicyContext` で確定済みで、さらに外側 `WHERE` を
+/// 通った行だけ）。キー・引数の抽出・状態予算・パーティション／行数の上限・パーティション
+/// 評価（安定ソート → peer 分割 → 順位／集計）は [`materialize_rows`]／[`evaluate_window_item`] と
+/// 同じ実装を共有する。行の同順位のタイブレークは投入順（`seq`）で、行 `id` は持たない
+/// （疑似列 `id` をキーに使う項目は構築時に拒否する。ビューが公開する `id` は実列として束縛される）。
+pub(crate) struct CellWindowEvaluator<'a> {
+    items: &'a [BoundWindowItem],
+    rows: Vec<MaterializedRow>,
+    state_bytes: usize,
+    partition_counts: Vec<HashMap<Vec<u8>, usize>>,
+}
+
+impl<'a> CellWindowEvaluator<'a> {
+    /// `items` は合成スキーマ（本文の結果列と同じ並び）に束縛済みのウィンドウ項目。
+    pub(crate) fn new(items: &'a [BoundWindowItem]) -> Result<Self, SqlSurfaceError> {
+        for item in items {
+            let uses_pseudo_id = item
+                .partition_by
+                .iter()
+                .chain(item.order_by.iter().map(|(k, _)| k))
+                .any(|k| matches!(k, WindowKeyRef::Id))
+                || matches!(item.input, Some(AggregateInput::IdU64));
+            if uses_pseudo_id {
+                return Err(window_bug(
+                    "window item references the pseudo column id over evaluated cells",
+                ));
+            }
+        }
+        Ok(Self {
+            items,
+            rows: Vec::new(),
+            state_bytes: 0,
+            partition_counts: vec![HashMap::new(); items.len()],
+        })
+    }
+
+    /// 1 行（`scanned` は合成スキーマ長のセル由来スカラー）を母集合へ加える。
+    pub(crate) fn push_row(
+        &mut self,
+        scanned: &[Option<row_codec::ScalarRef<'_>>],
+    ) -> Result<(), SqlSurfaceError> {
+        self.state_bytes = try_accumulate_state_budget(
+            self.state_bytes,
+            std::mem::size_of::<MaterializedRow>(),
+            MAX_WINDOW_STATE_BYTES,
+        )?;
+        let WindowRowValues {
+            partition_keys,
+            order_keys,
+            agg_values,
+        } = collect_window_row_values(
+            self.items,
+            0,
+            0,
+            scanned,
+            &mut self.partition_counts,
+            &mut self.state_bytes,
+            MAX_WINDOW_STATE_BYTES,
+        )?;
+        let seq = self.rows.len();
+        self.rows.push(MaterializedRow {
+            seq,
+            id: 0,
+            partition_keys,
+            order_keys,
+            agg_values,
+            stmt_order_keys: Vec::new(),
+            tenant_idx: 0,
+        });
+        check_total_row_count(self.rows.len(), MAX_WINDOW_ROWS)
+    }
+
+    /// ウィンドウ値を確定する。戻り値は `[項目][投入順の行]`。
+    pub(crate) fn finish(mut self) -> Result<Vec<Vec<Cell>>, SqlSurfaceError> {
+        let mut out = Vec::with_capacity(self.items.len());
+        for (item_index, item) in self.items.iter().enumerate() {
+            out.push(evaluate_window_item(
+                item,
+                item_index,
+                &self.rows,
+                &mut self.state_bytes,
+                MAX_WINDOW_STATE_BYTES,
+            )?);
+        }
+        Ok(out)
+    }
 }
 
 /// [`decode_tier_for`](crate::sql::scan) と同じ意図（Issue #350）だが、ウィンドウ

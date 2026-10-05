@@ -775,15 +775,25 @@ fn expression_order_by_and_having_over_views() {
         core.execute_sql_in_session(&ctx, &mut session, ddl)
             .unwrap_or_else(|e| panic!("{ddl}: {e:?}"));
     }
-    assert_eq!(
-        session_err(
-            &core,
+    // 評価後射影形ビュー（集計本文）への式 `ORDER BY` は Issue #1411 で受理側へ移った
+    // （評価済みセルに対する外側の並べ替え。`table18_buffered_outer.rs` が詳細を固定）。
+    match core
+        .execute_sql_in_session(
             &ctx,
             &mut session,
             "SELECT * FROM va ORDER BY lower(lang) LIMIT 3",
-        ),
-        "42601"
-    );
+        )
+        .expect("expression ORDER BY over a buffered view")
+    {
+        SqlOutcome::Query(rows) => {
+            let langs = lang_rows(&rows);
+            let mut sorted = langs.clone();
+            sorted.sort();
+            assert!(!langs.is_empty());
+            assert_eq!(langs, sorted);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
     let ok = core
         .execute_sql_in_session(
             &ctx,

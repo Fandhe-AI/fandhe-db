@@ -1873,6 +1873,34 @@ pub(crate) fn execute_grouped_aggregate(
             Box::new(multi_groups.into_iter())
         };
 
+    finish_groups(
+        group_entries,
+        total_group_count,
+        bound,
+        schema,
+        &budget,
+        total_key_bytes,
+        total_text_accumulator_bytes,
+    )
+}
+
+/// 確定したグループ表（キー昇順。[`GroupKey`] の `Ord`）から結果を組み立てる終端処理
+/// （FINISH／ORDER BY／OFFSET・LIMIT／PROJECT 段）。[`execute_grouped_aggregate`]（ストレージ
+/// 走査）と [`GroupedRowAccumulator`]（評価済みセル。`sql::view_buffered`・Issue #1411）が
+/// 共有し、`HAVING`・`ORDER BY`・結果列の組み立てを第 2 の実装にしない。
+fn finish_groups(
+    group_entries: Box<dyn Iterator<Item = (GroupKey, Vec<Accumulator>)>>,
+    total_group_count: usize,
+    bound: &BoundAggregate,
+    schema: &TableSchema,
+    budget: &ResultBudget,
+    total_key_bytes: usize,
+    total_text_accumulator_bytes: usize,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let group_by = bound
+        .group_by
+        .as_ref()
+        .ok_or_else(|| accumulator_bug("finish_groups called without a GROUP BY"))?;
     // Issue #1188・SQL-26: 式述語の `HAVING`・式キーの `ORDER BY` は、確定済みグループ
     // （可視行のみから作られたグループ）のキー・集計結果を並べた行ビューに対して評価する。
     // グループが 0 件なら一切評価されない（可視行 0 件でエラーにならない既存契約〔Issue #353〕）。
@@ -1908,7 +1936,7 @@ pub(crate) fn execute_grouped_aggregate(
                 &cells,
                 &mut row_expr_scratch,
                 &mut OrderKeyCharge {
-                    budget: &budget,
+                    budget,
                     group_count: total_group_count,
                     total_key_bytes,
                     total_text_bytes: total_text_accumulator_bytes,
@@ -2045,6 +2073,211 @@ pub(crate) fn execute_grouped_aggregate(
     Ok(QueryResult { columns, rows })
 }
 
+/// 評価済みの行（セル由来の `scanned`）を 1 行ずつ受け取って集計する実行器
+/// （Issue #1411・TABLE-18。`sql::view_buffered` が評価後射影形ビューの本文結果に対する
+/// 外側集計で使う）。ストレージを読まないため RLS・可視性判定には関与しない
+/// （渡される行は呼び出し元＝本文の実行経路が参照セッションの `PolicyContext` で確定済み）。
+///
+/// グループ表・予算（[`MAX_GROUPS`]・グループキー累計・TEXT 集計状態・`COUNT(DISTINCT)`）・
+/// 終端処理（[`finish_groups`]）はストレージ走査経路と同じ実装を共有し、`GROUP BY` なしは
+/// 可視行が 0 件でも 1 行（`COUNT` は 0、他は NULL）を返す。
+pub(crate) struct GroupedRowAccumulator<'a> {
+    bound: &'a BoundAggregate,
+    schema: &'a TableSchema,
+    budget: ResultBudget,
+    /// `GROUP BY` ありの集計表（キー昇順。NULL は末尾）。
+    groups: BTreeMap<GroupKey, Vec<Accumulator>>,
+    /// `GROUP BY` なしの単一行集計のアキュムレータ。
+    single: Option<Vec<Accumulator>>,
+    total_key_bytes: usize,
+    total_text_accumulator_bytes: usize,
+    distinct_budget: crate::sql::distinct::DistinctBudget,
+    scratch: Vec<StackValue>,
+}
+
+impl<'a> GroupedRowAccumulator<'a> {
+    /// `bound` は合成スキーマ `schema`（本文の結果列と同じ並び）に束縛済みの集計。
+    pub(crate) fn new(
+        bound: &'a BoundAggregate,
+        schema: &'a TableSchema,
+        max_result_bytes: usize,
+    ) -> Result<Self, SqlSurfaceError> {
+        let single = if bound.group_by.is_none() {
+            Some(new_accumulators(&bound.items)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            bound,
+            schema,
+            budget: ResultBudget::new(bound, max_result_bytes)?,
+            groups: BTreeMap::new(),
+            single,
+            total_key_bytes: 0,
+            total_text_accumulator_bytes: 0,
+            distinct_budget: crate::sql::distinct::DistinctBudget::new(),
+            scratch: Vec::new(),
+        })
+    }
+
+    /// 1 行（`scanned` は合成スキーマ長のセル由来スカラー。`WHERE` 通過済み）を集計へ反映する。
+    pub(crate) fn observe(
+        &mut self,
+        scanned: &[Option<row_codec::ScalarRef<'_>>],
+    ) -> Result<(), SqlSurfaceError> {
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let bound = self.bound;
+        let Some(group_by) = bound.group_by.as_ref() else {
+            let accs = self
+                .single
+                .as_mut()
+                .ok_or_else(|| accumulator_bug("single-row accumulators missing"))?;
+            return accumulate_row(
+                accs,
+                &bound.items,
+                0,
+                &vector,
+                scanned,
+                &mut self.total_text_accumulator_bytes,
+                1,
+                0,
+                &self.budget,
+                &mut self.scratch,
+                &mut self.distinct_budget,
+            );
+        };
+        let key_count = group_by.keys.len();
+        if key_count > MAX_GROUP_BY_COLUMNS {
+            return Err(accumulator_bug(
+                "GROUP BY column count exceeds MAX_GROUP_BY_COLUMNS at execution time",
+            ));
+        }
+        let mut borrowed_storage: [Option<ScalarKeyRef<'_>>; MAX_GROUP_BY_COLUMNS] =
+            [None; MAX_GROUP_BY_COLUMNS];
+        let mut key_len: usize = 0;
+        for (slot, key) in borrowed_storage.iter_mut().zip(&group_by.keys) {
+            let value = extract_order_value_ref(self.schema, key, 0, scanned)?;
+            key_len = key_len
+                .checked_add(key_component_budget_bytes(value.as_ref()))
+                .ok_or_else(|| accumulator_bug("GROUP BY key length accounting overflowed"))?;
+            *slot = value;
+        }
+        let borrowed_components = borrowed_storage
+            .get(..key_count)
+            .ok_or_else(|| accumulator_bug("GROUP BY key slice out of range"))?;
+        let probe = BorrowedGroupKey(borrowed_components);
+        let group_count = self.groups.len();
+        if let Some(accs) = self.groups.get_mut(&probe as &dyn GroupKeyView) {
+            return accumulate_row(
+                accs,
+                &bound.items,
+                0,
+                &vector,
+                scanned,
+                &mut self.total_text_accumulator_bytes,
+                group_count,
+                self.total_key_bytes,
+                &self.budget,
+                &mut self.scratch,
+                &mut self.distinct_budget,
+            );
+        }
+        check_new_group_budget(
+            group_count,
+            &mut self.total_key_bytes,
+            key_len,
+            self.total_text_accumulator_bytes,
+            &self.budget,
+        )?;
+        let mut key_components: Vec<Option<OrderValue>> = Vec::new();
+        key_components
+            .try_reserve_exact(borrowed_components.len())
+            .map_err(|_| {
+                SqlSurfaceError::payload_too_large(
+                    "GROUP BY key allocation exceeds available memory",
+                )
+            })?;
+        for value in borrowed_components {
+            key_components.push(match value {
+                Some(v) => Some(scalar_key_ref_to_owned(*v)?),
+                None => None,
+            });
+        }
+        let mut accs = new_accumulators(&bound.items)?;
+        accumulate_row(
+            &mut accs,
+            &bound.items,
+            0,
+            &vector,
+            scanned,
+            &mut self.total_text_accumulator_bytes,
+            group_count.saturating_add(1),
+            self.total_key_bytes,
+            &self.budget,
+            &mut self.scratch,
+            &mut self.distinct_budget,
+        )?;
+        self.groups.insert(GroupKey(key_components), accs);
+        Ok(())
+    }
+
+    /// 集計を確定して結果を返す（`GROUP BY` ありは `HAVING`・`ORDER BY`・`OFFSET`／`LIMIT` を
+    /// 適用済み。なしは 1 行）。
+    pub(crate) fn finish(self) -> Result<QueryResult, SqlSurfaceError> {
+        let Self {
+            bound,
+            schema,
+            budget,
+            groups,
+            single,
+            total_key_bytes,
+            total_text_accumulator_bytes,
+            ..
+        } = self;
+        if bound.group_by.is_none() {
+            let accs = single.ok_or_else(|| accumulator_bug("single-row accumulators missing"))?;
+            let mut cells = Vec::with_capacity(accs.len());
+            for acc in accs {
+                cells.push(acc.finish()?);
+            }
+            let columns = crate::sql::aggregate::aggregate_projection_columns(bound, schema)?;
+            let mut row_cells = Vec::with_capacity(bound.projection.len());
+            for col in &bound.projection {
+                match col {
+                    ProjectionColumn::Aggregate { item_index, .. } => {
+                        row_cells.push(cells.get(*item_index).cloned().ok_or_else(|| {
+                            accumulator_bug("projection item_index out of bounds")
+                        })?)
+                    }
+                    ProjectionColumn::GroupKey { .. } => {
+                        return Err(accumulator_bug("group key projected without GROUP BY"))
+                    }
+                }
+            }
+            return Ok(QueryResult {
+                columns,
+                rows: vec![ResultRow {
+                    id: 0,
+                    score: 0.0,
+                    cells: row_cells,
+                }],
+            });
+        }
+        let total_group_count = groups.len();
+        finish_groups(
+            Box::new(groups.into_iter()),
+            total_group_count,
+            bound,
+            schema,
+            &budget,
+            total_key_bytes,
+            total_text_accumulator_bytes,
+        )
+    }
+}
 /// 集計文の式 `ORDER BY` キーの所有値（[`eval_group_row_exprs`] が作り、`finished` が
 /// ソート完了まで全グループ分保持する）を [`ResultBudget`] へ課金する状態（Issue #1188・
 /// codex P1 対応）。長い TEXT を返す式（`concat` 等）を最大 [`MAX_GROUPS`] グループ分

@@ -43,12 +43,18 @@ pub(crate) enum Resolved {
     /// 評価後射影形ビュー（Issue #1192。`LIMIT`・`ORDER BY`・集計・JOIN を含む
     /// 本文）。インライン展開できない（外側の `WHERE` を合成すると `LIMIT`／集計の
     /// 意味が変わる）ため、本文をそのまま 1 文として実行し、結果に対して外側の
-    /// 列射影・`LIMIT`／`OFFSET` を適用する（`sql::view_buffered`）。連鎖の
-    /// 最外段（クエリが直接参照した名前）に限る。
+    /// クエリ（`sql::view_buffered`）を適用する。
+    ///
+    /// 連鎖（Issue #1411）: クエリが直接参照した名前と評価後射影形ビューの間に単純形
+    /// ビューの段がある場合、各段は下位の本文の上に重ねた行形の
+    /// [`Statement::BufferedView`]（`LIMIT` なし）として `body` に畳み込まれる。評価後射影形
+    /// 本文の FROM が別の評価後射影形ビューなら、本文自体が [`Statement::BufferedView`]
+    /// になる。いずれも実行・Describe は既存の再帰（本文の実行）に乗る。
     Buffered {
         /// クエリが参照したビュー名。
         view_name: String,
-        /// 参照時に再検証済みの本文（`Scan`／`Aggregate`／`Join` のいずれか）。
+        /// 参照時に再検証済みの本文（`Scan`／`Aggregate`／`Join`／`SetOperation`／
+        /// `BufferedView` のいずれか）。
         body: Box<Statement>,
     },
 }
@@ -73,7 +79,7 @@ pub(crate) fn resolve_from(
     // 行わない——内側の露出列が確定するまでは外側の参照が妥当かどうか
     // 判断できないため、確定は第 2 パスへ分離する）。
     let mut current = name.to_string();
-    let mut chain: Vec<super::allowlist::ParsedViewBody> = Vec::new();
+    let mut chain: Vec<(String, super::allowlist::ParsedViewBody)> = Vec::new();
     let mut depth: u32 = 0;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -92,20 +98,22 @@ pub(crate) fn resolve_from(
                 let parsed = match reparse_stored_body(&body_sql) {
                     Ok(parsed) => parsed,
                     Err(_) => {
-                        // 単純形として再パースできない本文は評価後射影形
-                        // （Issue #1192）。最外段のみ許可し、連鎖の内側に
-                        // 現れた場合は 42601 で拒否する（再帰の深さを 1 段に
-                        // 限定し、外側 `WHERE` の合成できない本文を単純形の
-                        // 畳み込みへ混入させない）。
-                        let body = reparse_buffered_body(lookup, &body_sql)?;
-                        if !chain.is_empty() {
-                            return Err(SqlSurfaceError::unsupported(
-                                "a view over an aggregate/LIMIT view is not supported",
-                            ));
+                        // 単純形として再パースできない本文は評価後射影形（Issue #1192）。
+                        // 本文を再検証し（本文の FROM が別の評価後射影形ビューなら再帰的に
+                        // 解決される。深さは `BufferedBodyLookup` が上限で打ち切る。
+                        // Issue #1411）、クエリとの間にある単純形ビューの段は内側から順に
+                        // 行形の外側として重ねる。
+                        let mut stmt = reparse_buffered_body(lookup, &body_sql)?;
+                        for (layer_name, layer) in chain.into_iter().rev() {
+                            stmt = super::allowlist::buffered_layer_statement(
+                                &layer_name,
+                                stmt,
+                                layer,
+                            )?;
                         }
                         return Ok(Resolved::Buffered {
                             view_name: name.to_string(),
-                            body: Box::new(body),
+                            body: Box::new(stmt),
                         });
                     }
                 };
@@ -115,7 +123,7 @@ pub(crate) fn resolve_from(
                         "view nesting depth exceeds limit",
                     ));
                 }
-                chain.push(parsed);
+                chain.push((current.clone(), parsed));
                 current = base_relation;
             }
             None => {
@@ -142,7 +150,7 @@ pub(crate) fn resolve_from(
     // には検出されない）も、連鎖のどの段であれ参照時に一様に拒否できる。
     let mut exposed: Option<Vec<String>> = None;
     let mut acc_predicates: Vec<WherePredicate> = Vec::new();
-    for view in chain.into_iter().rev() {
+    for (_, view) in chain.into_iter().rev() {
         // ビュー本文（`ParsedViewBody`）は構文上 `ORDER BY` を持たない
         // （[`parse_view_body`] のドキュメント参照）ため、連鎖の各段の検査には
         // 空スライスを渡す（クエリ自身の ORDER BY 検査は呼び出し元
@@ -183,35 +191,47 @@ fn reparse_stored_body(
 /// 単純形として再パースできなかった格納本文を評価後射影形（Issue #1192）として
 /// 再検証する。第 2 のパーサーは作らず、`CREATE VIEW` 時と同じ
 /// [`classify_view_body`] の経路（許可リスト構造検証＋本文形状検査）を、
-/// 参照時の実カタログ（[`BufferedBodyLookup`] 越し）で通す。本文の FROM が
-/// 別の評価後射影形ビューを指す場合は `42601`、それ以外の失敗（破損・
-/// 非互換な形状）は固定文言の `XX000` へ丸める（本文のリテラルを含めない）。
+/// 参照時の実カタログ（[`BufferedBodyLookup`] 越し）で通す。本文の FROM が別の評価後射影形
+/// ビューを指す場合は再帰的に解決する（Issue #1411）が、入れ子の深さが
+/// `MAX_VIEW_NESTING_DEPTH` を超えたら `54000`。それ以外の失敗（破損・非互換な形状）は
+/// 固定文言の `XX000` へ丸める（本文のリテラルを含めない）。
 fn reparse_buffered_body(
     lookup: &impl TableLookup,
     body_sql: &str,
 ) -> Result<Statement, SqlSurfaceError> {
     let tokens = super::lexer::tokenize(body_sql).map_err(|_| corrupt_view_error())?;
+    let depth = lookup
+        .buffered_depth()
+        .checked_add(1)
+        .ok_or_else(corrupt_view_error_fn)?;
+    // 正常経路では作成時の深さ検査（`catalog::Storage::create_view`）により上限内。
+    // 破損したカタログの循環・過大な連鎖でも再帰を有限にする。
+    if depth > MAX_VIEW_NESTING_DEPTH as usize {
+        return Err(SqlSurfaceError::payload_too_large(
+            "view nesting depth exceeds limit",
+        ));
+    }
     let guarded = BufferedBodyLookup {
         inner: lookup,
-        rejected_nested: std::cell::Cell::new(false),
+        depth,
     };
     match classify_view_body(&tokens, &guarded) {
         Ok(ViewBodyKind::Buffered { stmt, .. }) => Ok(*stmt),
         Ok(ViewBodyKind::Simple(_)) => Err(corrupt_view_error()),
-        Err(e) if guarded.rejected_nested.get() => Err(e),
+        // 入れ子の深さ超過は規則に基づく拒否として呼び出し元へ伝える。
+        Err(e @ SqlSurfaceError::PayloadTooLarge { .. }) => Err(e),
         Err(_) => Err(corrupt_view_error()),
     }
 }
 
 /// 評価後射影形の本文を参照時に再検証する際の [`TableLookup`] ラッパー
-/// （Issue #1192）。`view_definition` が返す定義が評価後射影形（単純形として
-/// 再パースできない本文）であれば `42601` を返し、評価後射影形ビューの
-/// 入れ子（再帰）を構造的に 1 段へ限定する。カタログ破損で循環があっても
+/// （Issue #1192・Issue #1411）。ビュー定義の取得はそのまま委譲し、入れ子の深さ
+/// （[`TableLookup::buffered_depth`]）だけを 1 段ずつ進める。これにより評価後射影形ビューの
+/// 連鎖の再検証が `MAX_VIEW_NESTING_DEPTH` で打ち切られ、カタログ破損で循環があっても
 /// 無限再帰にならない。
 struct BufferedBodyLookup<'a> {
     inner: &'a dyn TableLookup,
-    /// ネスト拒否で `42601` を返したことの目印（破損由来のエラーと区別する）。
-    rejected_nested: std::cell::Cell<bool>,
+    depth: usize,
 }
 
 impl TableLookup for BufferedBodyLookup<'_> {
@@ -220,20 +240,15 @@ impl TableLookup for BufferedBodyLookup<'_> {
     }
 
     fn view_definition(&self, name: &str) -> Result<Option<ViewDef>, SqlSurfaceError> {
-        let def = self.inner.view_definition(name)?;
-        if let Some(d) = &def {
-            if reparse_stored_body(&d.body_sql).is_err() {
-                self.rejected_nested.set(true);
-                return Err(SqlSurfaceError::unsupported(
-                    "a view over an aggregate/LIMIT view is not supported",
-                ));
-            }
-        }
-        Ok(def)
+        self.inner.view_definition(name)
     }
 
     fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
         self.inner.table_columns(name)
+    }
+
+    fn buffered_depth(&self) -> usize {
+        self.depth
     }
 }
 
@@ -666,20 +681,43 @@ mod tests {
         assert!(!format!("{err:?}").contains("leak-me"));
     }
 
-    /// 連鎖の内側・評価後射影形本文の FROM が評価後射影形ビューなら `42601`
-    /// （破損カタログで循環していても無限再帰にならない）。
+    /// 評価後射影形ビューの連鎖（Issue #1411）。評価後射影形本文の FROM が評価後射影形
+    /// ビューなら本文自体が `BufferedView`、単純形ビューが評価後射影形ビューを包む場合は
+    /// その段が行形の `BufferedView`（`LIMIT` なし）として畳み込まれる。
     #[test]
-    fn nested_buffered_view_is_rejected() {
+    fn nested_buffered_views_resolve_into_layered_statements() {
         let lookup = MapLookup(vec![
             ("inner_b", def("docs", "SELECT id FROM docs LIMIT 3")),
             ("outer_b", def("inner_b", "SELECT id FROM inner_b LIMIT 2")),
             ("outer_s", def("inner_b", "SELECT id FROM inner_b")),
-            ("loop_b", def("loop_b", "SELECT id FROM loop_b LIMIT 2")),
+            (
+                "outer_s2",
+                def("outer_s", "SELECT id FROM outer_s WHERE id = '1'"),
+            ),
         ]);
-        for name in ["outer_b", "outer_s", "loop_b"] {
-            let err = resolve_from(&lookup, name).err().expect(name);
-            assert_eq!(err.wire_code(), "42601", "name={name}");
+        for name in ["outer_b", "outer_s", "outer_s2"] {
+            match resolve_from(&lookup, name) {
+                Ok(Resolved::Buffered { view_name, body }) => {
+                    assert_eq!(view_name, name);
+                    assert!(
+                        matches!(*body, Statement::BufferedView(_)),
+                        "name={name}: expected a layered statement"
+                    );
+                }
+                other => panic!("name={name}: expected Buffered, got ok={}", other.is_ok()),
+            }
         }
+    }
+
+    /// 破損カタログで循環していても、入れ子の深さ上限で `54000` になり無限再帰にならない。
+    #[test]
+    fn cyclic_buffered_view_hits_the_depth_limit() {
+        let lookup = MapLookup(vec![(
+            "loop_b",
+            def("loop_b", "SELECT id FROM loop_b LIMIT 2"),
+        )]);
+        let err = resolve_from(&lookup, "loop_b").err().expect("must fail");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     /// 集計の列スコープ検査は `OR`／`NOT`／式を越えて非公開列を拒否する。

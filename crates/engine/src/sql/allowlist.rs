@@ -1257,6 +1257,14 @@ pub trait TableLookup {
         let _ = name;
         Ok(None)
     }
+
+    /// 評価後射影形ビューの本文を参照時に再検証する入れ子の深さ（Issue #1411。
+    /// 既定は 0）。評価後射影形ビューの連鎖（`sql::view::resolve_from` が本文を再検証する
+    /// たびに +1 するラッパーが上書きする）を `MAX_VIEW_NESTING_DEPTH` で打ち切り、
+    /// 破損したカタログの循環でも再帰が無限にならないようにする。
+    fn buffered_depth(&self) -> usize {
+        0
+    }
 }
 
 /// ORDER BY 関数呼び出し形（`FunctionCall`, TASK-75）の 1 引数。本モジュールは
@@ -1780,8 +1788,8 @@ pub enum Statement {
     BufferedView(ValidatedBufferedView),
 }
 
-/// 評価後射影形ビュー参照（[`Statement::BufferedView`]。Issue #1192・Issue #1360）。
-/// フィールドは `pub(crate)`（クレート外からの直読み・直書き不可）。
+/// 評価後射影形ビュー参照（[`Statement::BufferedView`]。Issue #1192・Issue #1360・
+/// Issue #1411）。フィールドは `pub(crate)`（クレート外からの直読み・直書き不可）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedBufferedView {
     /// 参照されたビュー名。
@@ -1789,15 +1797,39 @@ pub struct ValidatedBufferedView {
     /// 参照時に再検証済みの本文（`Scan`／`Aggregate`／`Join`／`SetOperation` の
     /// いずれか）。
     pub(crate) body: Box<Statement>,
+    /// 本文の結果に対する外側クエリ（行形または集計形。Issue #1411）。
+    pub(crate) outer: BufferedOuter,
+}
+
+/// 評価後射影形ビューへの外側クエリの形（Issue #1411）。どちらも本文の評価済みセルに
+/// 対する後処理で、`sql::view_buffered` が計画（Describe と Execute で共有）と実行を担う。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BufferedOuter {
+    /// 列射影・宣言的 `WHERE`・`ORDER BY`（列キー／式キー）・ウィンドウ項目・
+    /// `LIMIT`／`OFFSET`。
+    Rows(Box<BufferedRows>),
+    /// 集計・`GROUP BY`・`HAVING`・`SELECT DISTINCT`（脱糖後の集計形）。`table_name` は
+    /// ビュー名で、束縛は本文の結果列から合成したスキーマに対して行う。
+    Aggregate(Box<ValidatedAggregate>),
+}
+
+/// [`BufferedOuter::Rows`] の中身（Issue #1360・Issue #1411）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BufferedRows {
     /// 外側の射影（`Projection::All` または `Projection::Columns` のみ）。
     pub(crate) projection: Projection,
-    /// 外側 `WHERE`（Issue #1360）。宣言的な葉と `NOT`／`OR` だけ（式・UDF 述語・
-    /// サブクエリは構文検証段で `42601`）。本文の結果行に対して `sql::view_buffered` が
-    /// 評価する（本文の `LIMIT` の後で絞り込む）。空なら絞り込みなし。
+    /// 外側 `WHERE`。宣言的な葉と `NOT`／`OR`・式述語だけ（UDF 述語・サブクエリは
+    /// 構文検証段で `42601`）。本文の結果行に対して `sql::view_buffered` が評価する
+    /// （本文の `LIMIT` の後で絞り込む）。空なら絞り込みなし。
     pub(crate) where_predicates: Vec<WherePredicate>,
-    /// 外側 `ORDER BY`（Issue #1360）。本文の結果列名で解決する列キーだけ（式キーは
-    /// `42601`）。空なら本文の順序をそのまま保つ。
+    /// 外側 `ORDER BY` の列キー（式キーを含まない形のとき。式キーを含むときは空で、
+    /// 正本は `order_keys`）。
     pub(crate) order_by: Vec<ScalarOrderKey>,
+    /// 式キーを含む外側 `ORDER BY` の全キー（出現順。Issue #1411）。非空のとき
+    /// `order_by` は空。
+    pub(crate) order_keys: Vec<ScanOrderKey>,
+    /// ウィンドウ項目（Issue #1411）。
+    pub(crate) window_items: Vec<WindowSelectItem>,
     /// 外側 `LIMIT`（範囲検証済み）。
     pub(crate) limit: u32,
     /// 外側 `OFFSET`（範囲検証済み。既定 0）。
@@ -1810,14 +1842,20 @@ impl ValidatedBufferedView {
         &self.view_name
     }
 
-    /// 外側 `LIMIT`。
+    /// 外側 `LIMIT`（集計形は `LIMIT` 指定がなければ 0）。
     pub fn limit(&self) -> u32 {
-        self.limit
+        match &self.outer {
+            BufferedOuter::Rows(r) => r.limit,
+            BufferedOuter::Aggregate(a) => a.group_by.as_ref().and_then(|g| g.limit).unwrap_or(0),
+        }
     }
 
-    /// 外側 `OFFSET`。
+    /// 外側 `OFFSET`（集計形は `OFFSET` 指定がなければ 0）。
     pub fn offset(&self) -> u32 {
-        self.offset
+        match &self.outer {
+            BufferedOuter::Rows(r) => r.offset,
+            BufferedOuter::Aggregate(a) => a.group_by.as_ref().map_or(0, |g| g.offset),
+        }
     }
 }
 
@@ -7631,8 +7669,94 @@ pub(crate) fn check_buffered_body_shape(
             Ok(())
         }
         Statement::SetOperation(v) => check_body_set_tree(&v.tree, lookup, out),
+        // Issue #1411: 本文の FROM が別の評価後射影形ビュー（または単純形ビュー経由で
+        // そこへ到達するビュー）の連鎖。本文として許すのは列射影・宣言的 `WHERE`・
+        // `LIMIT`／`OFFSET`、または裸の列引数の集計だけで、式キーの `ORDER BY`・ウィンドウ項目・
+        // 式述語・UDF 述語・サブクエリは本文に持てない（本文が参照セッションの UDF レジストリや
+        // 追加の実行に依存しないようにする。単純形・集計本文と同じ規則）。
+        Statement::BufferedView(v) => check_body_buffered_view(v, lookup, out),
         _ => Err(body_form_unsupported()),
     }
+}
+
+fn check_body_buffered_view(
+    v: &ValidatedBufferedView,
+    lookup: &impl TableLookup,
+    out: &mut Vec<String>,
+) -> Result<(), SqlSurfaceError> {
+    match &v.outer {
+        BufferedOuter::Rows(rows) => {
+            if !rows.order_keys.is_empty() || !rows.window_items.is_empty() {
+                return Err(body_form_unsupported());
+            }
+            push_relation(out, &v.view_name);
+            rows.where_predicates
+                .iter()
+                .try_for_each(|p| check_body_pred(p, lookup, out))
+        }
+        BufferedOuter::Aggregate(agg) => {
+            check_body_aggregate(agg, lookup, out)?;
+            // 集計の `HAVING`／`ORDER BY` の式（束縛段が参照セッションの UDF レジストリで
+            // 解決しうる式）は本文に持てない。
+            if let Some(gb) = &agg.group_by {
+                if !gb.having_exprs.is_empty() || gb.order_by.iter().any(|k| k.expr.is_some()) {
+                    return Err(body_form_unsupported());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 単純形ビューの 1 段（`SELECT <*|列> FROM <下位> [WHERE ...]`）を、下位の評価後射影形
+/// ビューの本文 `body` の上へ重ねた行形の [`Statement::BufferedView`] を作る
+/// （Issue #1411。`sql::view::resolve_from` が連鎖を畳み込む）。この段は `LIMIT` を持たない
+/// （`u32::MAX`＝無制限）。列の公開範囲は `sql::view_buffered::plan_outer` が下位の結果列
+/// に対して検査する（`22000`／`42702`）。式項目・UDF 述語・サブクエリ述語は `42601`。
+pub(crate) fn buffered_layer_statement(
+    view_name: &str,
+    body: Statement,
+    parsed: ParsedViewBody,
+) -> Result<Statement, SqlSurfaceError> {
+    if matches!(parsed.projection, Projection::Items(_)) {
+        return Err(SqlSurfaceError::unsupported(
+            "a view over a view with an aggregate/LIMIT body supports only column projections",
+        ));
+    }
+    parsed
+        .where_predicates
+        .iter()
+        .try_for_each(check_buffered_outer_pred)?;
+    Ok(Statement::BufferedView(ValidatedBufferedView {
+        view_name: view_name.to_string(),
+        body: Box::new(body),
+        outer: BufferedOuter::Rows(Box::new(BufferedRows {
+            projection: parsed.projection,
+            where_predicates: parsed.where_predicates,
+            order_by: Vec::new(),
+            order_keys: Vec::new(),
+            window_items: Vec::new(),
+            limit: u32::MAX,
+            offset: 0,
+        })),
+    }))
+}
+
+/// 単純形ビュー本文 `parsed` が評価後射影形ビューの上に重ねられる形か
+/// （[`buffered_layer_statement`] と同じ規則。`CREATE VIEW` 時に、作成できても参照時に
+/// 必ず失敗する定義を作らないための検査。Issue #1411）。
+pub(crate) fn check_simple_layer_over_buffered(
+    parsed: &ParsedViewBody,
+) -> Result<(), SqlSurfaceError> {
+    if matches!(parsed.projection, Projection::Items(_)) {
+        return Err(SqlSurfaceError::unsupported(
+            "a view over a view with an aggregate/LIMIT body supports only column projections",
+        ));
+    }
+    parsed
+        .where_predicates
+        .iter()
+        .try_for_each(check_buffered_outer_pred)
 }
 
 fn body_form_unsupported() -> SqlSurfaceError {
@@ -10303,10 +10427,63 @@ fn build_aggregate_from_resolved(
                 group_by,
             })
         }
+        // 評価後射影形ビューへの集計は [`aggregate_statement_from_resolved`] が
+        // [`Statement::BufferedView`] として先に分岐する（Issue #1411）。ここへ
+        // 到達するのは配線不備のみ（fail-closed）。
         super::view::Resolved::Buffered { .. } => Err(SqlSurfaceError::unsupported(
-            "aggregate over a view with an aggregate/LIMIT body is not supported",
+            "aggregate over a view with an aggregate/LIMIT body is not supported here",
         )),
     }
+}
+
+/// 集計・`SELECT DISTINCT` の FROM の解決結果から [`Statement`] を組み立てる
+/// （[`build_aggregate_from_resolved`] の入口。Issue #1411）。評価後射影形ビュー
+/// （[`super::view::Resolved::Buffered`]）への集計は、本文を実行した評価済みセルに
+/// 対する外側集計（[`BufferedOuter::Aggregate`]）として [`Statement::BufferedView`]
+/// を返す。外側の `WHERE` は宣言的述語・式述語のみ（UDF 述語・サブクエリは `42601`）、
+/// 集計引数は裸の列参照か `*` のみ（式引数は `42601`。本文側の
+/// [`check_body_aggregate`] と同じ規則）。列の公開範囲（`id` を含む非公開列の参照拒否）
+/// は計画時に本文の結果列に対して `sql::view_buffered` が検査する。
+fn aggregate_statement_from_resolved(
+    table_name: String,
+    resolved: super::view::Resolved,
+    items: Vec<AggregateSelectItem>,
+    where_predicates: Vec<WherePredicate>,
+    group_by: Option<GroupByClause>,
+) -> Result<Statement, SqlSurfaceError> {
+    if let super::view::Resolved::Buffered { view_name, body } = resolved {
+        for item in &items {
+            if let AggregateSelectItem::Aggregate(agg) = item {
+                if let AggregateArg::Expr(e) = &agg.arg {
+                    if !matches!(e, Expr::Ident(_)) {
+                        return Err(SqlSurfaceError::unsupported(
+                            "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                        ));
+                    }
+                }
+            }
+        }
+        where_predicates
+            .iter()
+            .try_for_each(check_buffered_outer_pred)?;
+        return Ok(Statement::BufferedView(ValidatedBufferedView {
+            view_name: view_name.clone(),
+            body,
+            outer: BufferedOuter::Aggregate(Box::new(ValidatedAggregate {
+                table_name: view_name,
+                items,
+                where_predicates,
+                group_by,
+            })),
+        }));
+    }
+    Ok(Statement::Aggregate(build_aggregate_from_resolved(
+        table_name,
+        resolved,
+        items,
+        where_predicates,
+        group_by,
+    )?))
 }
 
 pub(crate) fn validate_sql_tokens(
@@ -10729,24 +10906,24 @@ fn validate_select_statement(
         // Issue #1192: FROM がビューなら単純形は基底テーブルへ書き換える
         // （`resolve_from` がテーブル・ビューの存在確認を兼ねる）。
         let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
-        return Ok(Statement::Aggregate(build_aggregate_from_resolved(
+        return aggregate_statement_from_resolved(
             shape.table_name,
             resolved,
             shape.items,
             shape.where_predicates,
             shape.group_by,
-        )?));
+        );
     }
     if is_aggregate_select {
         let shape = parse_aggregate_shape(tokens, subquery_ctx)?;
         let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
-        return Ok(Statement::Aggregate(build_aggregate_from_resolved(
+        return aggregate_statement_from_resolved(
             shape.table_name,
             resolved,
             shape.items,
             shape.where_predicates,
             shape.group_by,
-        )?));
+        );
     }
     match parse_select_shape(tokens, subquery_ctx)? {
         ParsedSelect::Search(shape) => {
@@ -10774,18 +10951,17 @@ fn validate_select_statement(
         // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
         ParsedSelect::Scan(shape) => {
             let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
-            // Issue #1192・#1360: 評価後射影形ビューへの参照は本文実行＋外側の後処理の
-            // 別 variant へ分岐する。外側は `SELECT <*|列> FROM <view> [WHERE ...]
-            // [ORDER BY <列>] LIMIT n [OFFSET m]`。WHERE は宣言的な葉と NOT／OR のみ、
-            // ORDER BY は列キーのみ（式・ウィンドウ項目・式項目は `42601`）。
+            // Issue #1192・#1360・#1411: 評価後射影形ビューへの参照は本文実行＋外側の
+            // 後処理の別 variant へ分岐する。外側は `SELECT <*|列> FROM <view> [WHERE ...]
+            // [ORDER BY <列|式>] LIMIT n [OFFSET m]`（ウィンドウ項目を含みうる）。WHERE は
+            // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
+            // `42601`。
             if let super::view::Resolved::Buffered { view_name, body } = resolved {
-                if !shape.order_keys.is_empty()
-                    || !shape.window_items.is_empty()
-                    || !shape.scalar_subquery_items.is_empty()
+                if !shape.scalar_subquery_items.is_empty()
                     || matches!(shape.projection, Projection::Items(_))
                 {
                     return Err(SqlSurfaceError::unsupported(
-                        "a view with an aggregate/LIMIT body supports only column projections, declarative WHERE and column ORDER BY",
+                        "a view with an aggregate/LIMIT body supports only column projections, declarative WHERE, ORDER BY, window functions and aggregates",
                     ));
                 }
                 shape
@@ -10797,11 +10973,15 @@ fn validate_select_statement(
                 return Ok(Statement::BufferedView(ValidatedBufferedView {
                     view_name,
                     body,
-                    projection: shape.projection,
-                    where_predicates: shape.where_predicates,
-                    order_by: shape.order_by,
-                    limit: shape.limit,
-                    offset: shape.offset,
+                    outer: BufferedOuter::Rows(Box::new(BufferedRows {
+                        projection: shape.projection,
+                        where_predicates: shape.where_predicates,
+                        order_by: shape.order_by,
+                        order_keys: shape.order_keys,
+                        window_items: shape.window_items,
+                        limit: shape.limit,
+                        offset: shape.offset,
+                    })),
                 }));
             }
             Ok(Statement::Scan(build_scan_from_resolved(
