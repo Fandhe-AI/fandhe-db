@@ -755,7 +755,8 @@ fn readding_foreign_key_after_parent_unique_gap_detects_current_parent_rows() {
 
 // --- CREATE TABLE との相互作用 ----------------------------------------------
 
-/// `CREATE TABLE` の明示 FK 名と CHECK 名の重複は `42601`（設計 F6）。
+/// `CREATE TABLE` の明示 FK 名と CHECK 名の重複は `42710`（設計 F6・Issue #1428。
+/// `ALTER TABLE ADD CONSTRAINT` と同じ写像）。
 #[test]
 fn create_table_rejects_duplicate_name_between_foreign_key_and_check() {
     let (core, path) = new_core("create-table-fk-check-name-collision");
@@ -777,7 +778,7 @@ fn create_table_rejects_duplicate_name_between_foreign_key_and_check() {
              CONSTRAINT dup CHECK (v > 0), \
              CONSTRAINT dup FOREIGN KEY (v) REFERENCES parents)"
         ),
-        "42601"
+        "42710"
     );
 }
 

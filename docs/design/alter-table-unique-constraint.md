@@ -165,8 +165,9 @@ HTTP 射影は新しい `ErrorClass` を追加していないため、`error_for
 
 ### D6. スコープの境界（fail-closed 側に倒す）
 
-対象外（`42601` のまま）: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`
-（`CREATE TABLE` に明示制約名を持つ UNIQUE を書く構文は未対応）・
+~~`CREATE TABLE` での `CONSTRAINT <name> UNIQUE`~~（Issue #1428 で表制約・列制約とも受理。
+`CREATE TABLE` 内の名前重複は UNIQUE 系が `42P07`、FOREIGN KEY を含めば `42710`）。
+対象外（`42601` のまま）:
 ~~`ADD CONSTRAINT ... CHECK/PRIMARY KEY/FOREIGN KEY`~~（`CHECK` は Issue #1068
 で `ALTER TABLE ... ADD [CONSTRAINT <name>] CHECK` として、`FOREIGN KEY` は
 Issue #1069 で `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY` として
@@ -226,8 +227,7 @@ fail-closed。FOREIGN KEY・CHECK の削除は既存行を変更しないため�
 ## 申し送り（Issue は起票しない）
 
 - Issue #1195 追記: CHECK・FK 追加側は `42710` へ移行済み。UNIQUE は索引名との衝突の意味論により `42P07` を維持
-- スコープ外として残すもの: `CREATE TABLE` での `CONSTRAINT <name> UNIQUE`・
-  CHECK／PK／FK の ADD／DROP CONSTRAINT・`DROP CONSTRAINT IF EXISTS`／
+- スコープ外として残すもの: CHECK／PK／FK の ADD／DROP CONSTRAINT・`DROP CONSTRAINT IF EXISTS`／
   `CASCADE`・制約の一覧を取得する手段（`pg_constraint` 相当）・永続一意索引
 
 ## 追記（Issue #1196）: 主キーの名前解決
