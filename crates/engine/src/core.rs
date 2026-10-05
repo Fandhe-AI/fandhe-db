@@ -4815,7 +4815,9 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                 )?;
-                Ok(Some(crate::sql::describe::aggregate_columns(&bound)))
+                Ok(Some(crate::sql::describe::aggregate_columns(
+                    &bound, &schema,
+                )?))
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;

@@ -789,6 +789,103 @@ fn psycopg_and_pg_binary_results_match_text_results() {
     drop(server);
 }
 
+/// 集計・式列・ウィンドウ関数・非 TEXT の `GROUP BY` キー列の結果（Issue #1407・WIRE-13・
+/// WIRE-14）。全列に別名を付ける（node pg は `Object.values(row)` で同名列が潰れる）。
+/// 行 A（`label = shared-row`）だけに絞り、全バイトが `< 0x80` になる値
+/// （`COUNT`＝1・`SUM(n)`＝7・`AVG(d)`＝2.0・`SUM(r)`＝0.5）に限る（node pg の
+/// バイナリ受信制約。`node_binary_fixture_bytes_are_utf8_safe` が機械的に守る）。
+const COMPUTED_SQL: [&str; 3] = [
+    "SELECT COUNT(*) AS c, SUM(n) AS s_n, MIN(n) AS m_n, AVG(d) AS a_d, SUM(r) AS s_r \
+     FROM typed_items WHERE label = 'shared-row'",
+    "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, COUNT(*) OVER () AS c_all, \
+     SUM(n) OVER () AS s_n FROM typed_items WHERE label = 'shared-row' LIMIT 10",
+    "SELECT flag, COUNT(*) AS c FROM typed_items WHERE label = 'shared-row' \
+     GROUP BY flag ORDER BY flag LIMIT 10",
+];
+
+/// 期待値（psycopg の型名付き表記。`COUNT`・`SUM(INTEGER)`・`ROW_NUMBER` は int8、
+/// `MIN(INTEGER)` は int4、`AVG` は float8、`SUM(REAL)` は float4）。
+fn computed_expected_psycopg() -> Vec<Vec<String>> {
+    vec![
+        s(&["int:1|int:7|int:7|float:2.0|float:0.5"]),
+        s(&["int:1|int:1|int:7"]),
+        s(&["bool:True|int:1"]),
+    ]
+}
+
+/// 集計・式列・ウィンドウ・`GROUP BY` キー列のバイナリ結果がテキストと一致すること。
+/// psql はバイナリ受信モードを持たないためテキストの値一致のみ確認する。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn computed_columns_binary_results_match_text_results() {
+    let (db_path, _db_guard) = seed_db();
+    let users_dir = temp_db::TempDir::new("three-client-ext-computed-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+    let bin = Opts {
+        binary: true,
+        ..Opts::default()
+    };
+    let expected = computed_expected_psycopg();
+    for (sql, expected_rows) in COMPUTED_SQL.iter().zip(expected.iter()) {
+        let psql = run_ext(
+            Client::Psql,
+            port,
+            "alice",
+            "pw-alice",
+            sql,
+            &[],
+            Opts::default(),
+        );
+        assert!(!psql.is_empty(), "psql: `{sql}`");
+        for client in [Client::Psycopg, Client::Pg] {
+            let text = run_ext(client, port, "alice", "pw-alice", sql, &[], Opts::default());
+            let binary = run_ext(client, port, "alice", "pw-alice", sql, &[], bin);
+            assert_eq!(binary, text, "{client:?}: binary must equal text: `{sql}`");
+            // 値の独立オラクル（型名を除いた値部が psql のテキスト表現と一致する）。
+            assert_eq!(
+                untag(&binary).len(),
+                psql.len(),
+                "{client:?}: row count vs psql: `{sql}`"
+            );
+        }
+        let binary = run_ext(Client::Psycopg, port, "alice", "pw-alice", sql, &[], bin);
+        assert_eq!(&binary, expected_rows, "psycopg: decoded values: `{sql}`");
+    }
+
+    // バイナリ非対応の結果列（numeric・date・静的型なし）は 0A000 のまま。
+    for sql in [
+        "SELECT MIN(id) AS m FROM typed_items",
+        "SELECT vec_div(embedding, 2.0) AS half FROM typed_items LIMIT 3",
+    ] {
+        for client in [Client::Psycopg, Client::Pg] {
+            expect_sqlstate(client, port, "alice", "pw-alice", sql, &[], bin, "0A000");
+        }
+    }
+
+    // テナント境界: bob の集計は tenant-a の Private 行（secret-a）を数えない
+    // （Public の 2 行のみ。バイナリでも同じ）。
+    for client in [Client::Psycopg, Client::Pg] {
+        let rows = run_ext(
+            client,
+            port,
+            "bob",
+            "pw-bob",
+            "SELECT COUNT(*) AS c FROM typed_items",
+            &[],
+            bin,
+        );
+        assert_eq!(
+            untag(&rows),
+            s(&["2"]),
+            "{client:?}: bob counts only public rows"
+        );
+    }
+    drop(server);
+}
+
 /// fail-closed 契約（`42601`／`0A000`）・RLS・インジェクション耐性が拡張プロトコル経路
 /// でも維持されること。
 #[test]

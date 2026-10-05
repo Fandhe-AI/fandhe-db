@@ -55,9 +55,11 @@
 //! テキスト／バイナリを要求できる（PostgreSQL の Bind 規則。[`ResultFormats`]）。
 //! 対応型は `TEXT`（UTF-8 生バイト）と、Issue #1172 で追加した `INTEGER`・
 //! `BIGINT`・`REAL`・`DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`（PostgreSQL の
-//! send 形式。結線は [`encode_data_row_into_with_columns`]）で、`Id`（`numeric`）・
-//! `Vector`（text 表現だが値はベクトル）・`Computed`（Issue #1173 で型 OID は公告するが、バイナリ表現は未対応）
-//! はいずれもバイナリ非対応として事前検査（[`validate_binary_formats`]）で
+//! send 形式。`Computed{ty: Some(t)}`〔集計・式列・ウィンドウ関数の結果列〕も `t` が
+//! 対応型ならバイナリ可。Issue #1407。結線は
+//! [`encode_data_row_into_with_columns`]）で、`Id`（`numeric`）・
+//! `Vector`（text 表現だが値はベクトル）・静的型を持たない `Computed{ty: None}` は
+//! バイナリ非対応として事前検査（[`validate_binary_formats`]）で
 //! `0A000` に拒否する（spec の WIRE-14 が定める対応範囲。`VECTOR` 列の独自
 //! バイナリ表現は定義しない）。`NUMERIC`・`DATE`・
 //! `TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM` も `0A000` のまま。
@@ -460,88 +462,52 @@ impl WireType {
     }
 }
 
-/// `ColumnMeta` 1 個がバイナリ形式に対応するか（WIRE-14）。`Id`・
-/// `Scalar{ty: Text}` は [`column_wire_type`] が公告する [`WireType`] の
-/// [`WireType::supports_binary`] へそのまま委譲できるが、
-/// `Scalar{ty: Vector(_)}`・`Computed` は公告 OID が `text` でも本来の値が
-/// ベクトル／実行時型であるため、`WireType` だけでは判定できず列種別を
-/// 直接判定する必要がある（[`column_wire_type`] と同じ「網羅 `match` で
-/// variant 増加をコンパイルエラーにする」方針を踏襲）。
+/// `ColumnMeta` 1 個がバイナリ形式に対応するか（WIRE-14）。`Id` は公告する
+/// [`WireType`] の [`WireType::supports_binary`] へ委譲する（`numeric` のため非対応）。
+/// `Scalar{ty}` と `Computed{ty: Some(ty)}`（集計結果・式列・ウィンドウ関数の静的な結果型。
+/// Issue #1407）は同じ [`scalar_type_binary_support`] で判定する。静的型を持たない
+/// `Computed{ty: None}`（ベクトル式など）は値の実体が実行時型で決まるため fail-closed で
+/// 非対応とする（[`column_wire_type`] と同じ「網羅 `match` で variant 増加を
+/// コンパイルエラーにする」方針を踏襲）。
 #[deny(clippy::wildcard_enum_match_arm)]
 pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
     match meta {
         ColumnMeta::Id => column_wire_type(meta).supports_binary(),
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Text,
-            ..
-        } => column_wire_type(meta).supports_binary(),
-        // `VECTOR` 列はバイナリ非対応として `0A000` で拒否する（spec の
-        // WIRE-14 決定。独自のバイナリ表現は定義しない）。公告 OID
-        // （`WireType::Text`）は `supports_binary() == true` だが、値の実体が
-        // ベクトルであるため `WireType` の判定を上書きして拒否する。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Vector(_),
-            ..
-        } => false,
-        // 数値・真偽値・bytea・uuid 列は公告する `WireType` の対応可否へ委譲する
-        // （WIRE-14・TASK-218・Issue #1172）。値の実体（`Cell`）との整合は
-        // `encode_binary_cell` が検査する。
-        ColumnMeta::Scalar {
-            ty:
-                engine::catalog::ColumnType::Integer
-                | engine::catalog::ColumnType::BigInt
-                | engine::catalog::ColumnType::Boolean
-                | engine::catalog::ColumnType::Real
-                | engine::catalog::ColumnType::Double
-                | engine::catalog::ColumnType::Bytea
-                | engine::catalog::ColumnType::Uuid,
-            ..
-        } => column_wire_type(meta).supports_binary(),
-        // `ENUM` 列（TABLE-14・TASK-198、Issue #890）は Issue #895 の据え置き
-        // 判断により専用 OID を持たず `WireType::Text` を公告する。値は
-        // `Cell::Text`（TEXT と同一表示形）に写像されるが、`ColumnMeta::Scalar`
-        // としては別 variant であるため `Text` 分岐へは流れ込まない
-        // （多層防御。バイナリ指定は `BinaryFormatError::UnsupportedType`
-        // （`0A000`）で拒否する）。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Enum(_),
-            ..
-        } => false,
-        // `ARRAY` 列（TABLE-14・Issue #888）も Issue #895 の据え置き判断により
-        // 専用 OID を持たず `WireType::Text` を公告する。`VECTOR`・`ENUM` と
-        // 同様に fail-closed で非対応とする。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Array(_),
-            ..
-        } => false,
-        // `JSON`／`JSONB` 列（TABLE-14・Issue #889）は Issue #895 で
-        // `WireType::Json`／`Jsonb` を公告するが、値の実体が `Cell::Json` の
-        // 格納テキストでありバイナリ表現は spec 側で未策定のため
-        // fail-closed で非対応とする。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Json | engine::catalog::ColumnType::Jsonb,
-            ..
-        } => false,
-        // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）は値の実体が
-        // `Cell::Numeric`（`Decimal` の正規テキスト）であり `Text` の単純な
-        // UTF-8 生バイト表現とは異なるため、他の後発型と同様に fail-closed
-        // で非対応とする（RowDescription・HTTP 応答への OID 1700／
-        // `"numeric"` 公告は `column_wire_type` が既に担う。ここで非対応と
-        // するのはバイナリ表現のみ）。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Numeric { .. },
-            ..
-        } => false,
-        // `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）は Issue #895
-        // で `WireType::Date`／`Timestamp` を公告するが、バイナリ表現は
-        // spec 側で未策定のため fail-closed で非対応とする。
-        ColumnMeta::Scalar {
-            ty: engine::catalog::ColumnType::Date | engine::catalog::ColumnType::Timestamp,
-            ..
-        } => false,
-        // 実行時型（式・集計結果）が静的に決まらないため fail-closed で
-        // 非対応とする（`Computed` は WIRE-13・Issue #895 の対象外のまま）。
-        ColumnMeta::Computed { .. } => false,
+        ColumnMeta::Scalar { ty, .. } => scalar_type_binary_support(ty),
+        ColumnMeta::Computed { ty: Some(ty), .. } => scalar_type_binary_support(ty),
+        ColumnMeta::Computed { ty: None, .. } => false,
+    }
+}
+
+/// `ColumnType` 1 個がバイナリ形式に対応するか（`Scalar`／`Computed{ty: Some}` の共有判定。
+/// WIRE-14・TASK-218・Issue #1172・#1407）。対応型は `TEXT`・`INTEGER`・`BIGINT`・`REAL`・
+/// `DOUBLE PRECISION`・`BOOLEAN`・`BYTEA`・`UUID`。値の実体（`Cell`）との整合は
+/// `encode_binary_cell` が検査する。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
+    use engine::catalog::ColumnType;
+    match ty {
+        ColumnType::Text
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Boolean
+        | ColumnType::Real
+        | ColumnType::Double
+        | ColumnType::Bytea
+        | ColumnType::Uuid => scalar_wire_type(ty).supports_binary(),
+        // `VECTOR` は公告 OID が `text` でも値の実体がベクトルのため、独自の
+        // バイナリ表現は定義せず `0A000` で拒否する（WIRE-14 決定）。
+        // `ENUM`・`ARRAY` は専用 OID を持たない据え置き判断（Issue #895）、
+        // `JSON`／`JSONB`・`NUMERIC`・`DATE`／`TIMESTAMP` はバイナリ表現が
+        // 未策定のため、いずれも fail-closed で非対応とする。
+        ColumnType::Vector(_)
+        | ColumnType::Enum(_)
+        | ColumnType::Array(_)
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Numeric { .. }
+        | ColumnType::Date
+        | ColumnType::Timestamp => false,
     }
 }
 
@@ -970,6 +936,12 @@ fn encode_binary_cell(
             push_fixed(out, wire_type, &binary::int4(v))
         }
         (WireType::Int8, Cell::SignedInteger(v)) => push_fixed(out, wire_type, &binary::int8(*v)),
+        // `COUNT`・`ROW_NUMBER`/`RANK` 系は `int8` を公告しつつ `Cell::Integer(u64)` を返す
+        // （Issue #1407）。`i64` に収まらない値は fail-closed（`XX000`）。
+        (WireType::Int8, Cell::Integer(v)) => {
+            let v = i64::try_from(*v).map_err(|_| EncodeError)?;
+            push_fixed(out, wire_type, &binary::int8(v))
+        }
         (WireType::Float4, Cell::Float(v)) => {
             let narrowed = if v.is_nan() { f32::NAN } else { *v as f32 };
             // NaN 以外は f64 へ戻して一致する（無損失）場合のみ受理する。
@@ -1324,8 +1296,16 @@ mod tests {
             assert_eq!(wire_type.oid(), oid, "oid for {ty:?}");
             assert_eq!(wire_type.typlen(), typlen, "typlen for {ty:?}");
         }
-        // Computed 列はバイナリ非対応のまま（fail-closed）。
-        assert!(!column_binary_support(&computed(Some(ColumnType::BigInt))));
+        // Computed 列は静的型が対応型ならバイナリ可、非対応型・`ty: None` は
+        // fail-closed のまま（Issue #1407）。
+        assert!(column_binary_support(&computed(Some(ColumnType::BigInt))));
+        assert!(!column_binary_support(&computed(None)));
+        assert!(!column_binary_support(&computed(Some(
+            ColumnType::Numeric {
+                precision: 38,
+                scale: 2,
+            }
+        ))));
     }
 
     fn real_column() -> ColumnMeta {
@@ -2064,6 +2044,33 @@ mod tests {
             name: "expr".to_string(),
             ty: None,
         }));
+        // `Computed{ty: Some(対応型)}` は対応、非対応型は非対応（Issue #1407）。
+        for ty in [
+            engine::catalog::ColumnType::BigInt,
+            engine::catalog::ColumnType::Real,
+            engine::catalog::ColumnType::Double,
+            engine::catalog::ColumnType::Boolean,
+            engine::catalog::ColumnType::Text,
+        ] {
+            assert!(column_binary_support(&ColumnMeta::Computed {
+                name: "agg".to_string(),
+                ty: Some(ty),
+            }));
+        }
+        for ty in [
+            engine::catalog::ColumnType::Numeric {
+                precision: 20,
+                scale: 0,
+            },
+            engine::catalog::ColumnType::Date,
+            engine::catalog::ColumnType::Timestamp,
+            engine::catalog::ColumnType::Vector(3),
+        ] {
+            assert!(!column_binary_support(&ColumnMeta::Computed {
+                name: "agg".to_string(),
+                ty: Some(ty),
+            }));
+        }
         // 数値・真偽値・bytea・uuid は対応（WIRE-14・Issue #1172）。
         for ty in [
             engine::catalog::ColumnType::Integer,
@@ -2543,6 +2550,56 @@ mod tests {
             assert!(r.is_err(), "{ty:?}");
             assert_eq!(out, b"KEEP");
         }
+    }
+
+    fn computed(ty: engine::catalog::ColumnType) -> ColumnMeta {
+        ColumnMeta::Computed {
+            name: "c".to_string(),
+            ty: Some(ty),
+        }
+    }
+
+    fn one_computed_binary(
+        ty: engine::catalog::ColumnType,
+        cell: Cell,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![cell],
+        };
+        encode_data_row_into_with_columns(&row, &[computed(ty)], &[FormatCode::Binary], out)
+    }
+
+    /// Issue #1407: `COUNT`・`ROW_NUMBER` 系の `Computed{BigInt}`＋`Cell::Integer(u64)` は
+    /// int8 で出る。`i64` 範囲外は fail-closed で部分フレームを残さない。
+    #[test]
+    fn binary_computed_bigint_accepts_unsigned_integer_cell() {
+        use engine::catalog::ColumnType as T;
+        let mut out = Vec::new();
+        one_computed_binary(T::BigInt, Cell::Integer(5), &mut out).unwrap();
+        let mut expected = vec![b'D', 0, 0, 0, 18, 0, 1];
+        expected.extend_from_slice(&with_len(&5i64.to_be_bytes()));
+        assert_eq!(out, expected);
+
+        let mut out = b"KEEP".to_vec();
+        assert!(one_computed_binary(T::BigInt, Cell::Integer(u64::MAX), &mut out).is_err());
+        assert_eq!(out, b"KEEP");
+    }
+
+    /// Issue #1407: `Computed{Real}` は f32 へ無損失な `Cell::Float` を float4 で出し、
+    /// 型と Cell の不一致（`Text`＋`SignedInteger`）は fail-closed のまま。
+    #[test]
+    fn binary_computed_real_and_mismatch() {
+        use engine::catalog::ColumnType as T;
+        let mut out = Vec::new();
+        one_computed_binary(T::Real, Cell::Float(f64::from(0.5f32)), &mut out).unwrap();
+        assert_eq!(out.get(7..).unwrap(), with_len(&0.5f32.to_be_bytes()));
+
+        let mut out = b"KEEP".to_vec();
+        assert!(one_computed_binary(T::Text, Cell::SignedInteger(1), &mut out).is_err());
+        assert_eq!(out, b"KEEP");
     }
 
     #[test]

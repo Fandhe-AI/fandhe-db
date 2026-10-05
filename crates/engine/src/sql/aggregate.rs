@@ -2072,7 +2072,7 @@ pub(crate) fn execute_aggregate_with_cache(
                         )?;
                     }
                 }
-                return finish_aggregate_result(accumulators, bound);
+                return finish_aggregate_result(accumulators, bound, schema);
             }
         }
     }
@@ -2346,7 +2346,7 @@ pub(crate) fn execute_aggregate_with_cache(
         }
     }
 
-    finish_aggregate_result(accumulators, bound)
+    finish_aggregate_result(accumulators, bound, schema)
 }
 
 /// 集計項目の結果列の静的型（Issue #1173。WIRE-13・TABLE-13 のポインタ）。
@@ -2414,25 +2414,55 @@ pub(crate) fn aggregate_result_type(
 /// 集計（`GROUP BY` の有無を問わない）の出力列メタを `bound.projection` の列順で
 /// 組み立てる（Issue #1173）。実行経路（`finish_aggregate_result`・
 /// `sql::group_by` の PROJECT 段）と Describe（`sql::describe::aggregate_columns`）
-/// が共有し、両者の列メタが構造的に一致する。`GROUP BY` キー列は現状 `TEXT` のみ
-/// 受理するため `Text`（非 TEXT キーを受理する拡張〔#1185〕ではキー列の型から導出する）。
-pub(crate) fn aggregate_projection_columns(bound: &BoundAggregate) -> Vec<ColumnMeta> {
+/// が共有し、両者の列メタが構造的に一致する。`GROUP BY` キー列の型は束縛したキー対象
+/// から導出する（Issue #1407・WIRE-13/14 のポインタ。列は `schema` の列型、疑似列 `id` は
+/// `NUMERIC(20,0)`。実セルは `order_value_to_cell` が同じ型から生成するため、公告型と
+/// セルが一致する）。束縛の不変条件に反する状態（式キー・範囲外の列添字）は
+/// fail-closed で `Internal`（`XX000`）。
+pub(crate) fn aggregate_projection_columns(
+    bound: &BoundAggregate,
+    schema: &TableSchema,
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    use crate::sql::parser::BoundOrderTarget;
     bound
         .projection
         .iter()
         .map(|col| match col {
-            crate::sql::parser::ProjectionColumn::GroupKey { name, .. } => ColumnMeta::Computed {
-                name: name.clone(),
-                ty: Some(crate::catalog::ColumnType::Text),
-            },
+            crate::sql::parser::ProjectionColumn::GroupKey { name, key_index } => {
+                let target = bound
+                    .group_by
+                    .as_ref()
+                    .and_then(|g| g.keys.get(*key_index))
+                    .map(|k| k.target)
+                    .ok_or_else(|| accumulator_bug("projection key_index has no bound key"))?;
+                let ty = match target {
+                    BoundOrderTarget::Id => crate::catalog::ColumnType::Numeric {
+                        precision: 20,
+                        scale: 0,
+                    },
+                    BoundOrderTarget::Column(index) => schema
+                        .columns
+                        .get(index)
+                        .ok_or_else(|| accumulator_bug("group key column index out of range"))?
+                        .ty
+                        .clone(),
+                    BoundOrderTarget::Expr(_) => {
+                        return Err(accumulator_bug("group key must not be an expression key"))
+                    }
+                };
+                Ok(ColumnMeta::Computed {
+                    name: name.clone(),
+                    ty: Some(ty),
+                })
+            }
             crate::sql::parser::ProjectionColumn::Aggregate { item_index, name } => {
-                ColumnMeta::Computed {
+                Ok(ColumnMeta::Computed {
                     name: name.clone(),
                     ty: bound
                         .items
                         .get(*item_index)
                         .and_then(aggregate_item_result_type),
-                }
+                })
             }
         })
         .collect()
@@ -2453,6 +2483,7 @@ fn aggregate_item_result_type(
 fn finish_aggregate_result(
     accumulators: Vec<Accumulator>,
     bound: &BoundAggregate,
+    schema: &TableSchema,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let mut cells = Vec::with_capacity(bound.items.len());
     for accumulator in accumulators {
@@ -2461,7 +2492,7 @@ fn finish_aggregate_result(
     // 単一行集計では `projection` が `items` と 1 対 1（`GROUP BY` キー列なし）。
     // 列メタは実行経路・Describe・GROUP BY 経路が共有する
     // `aggregate_projection_columns` で組み立てる（Issue #1173）。
-    let columns = aggregate_projection_columns(bound);
+    let columns = aggregate_projection_columns(bound, schema)?;
 
     Ok(QueryResult {
         columns,
@@ -2618,7 +2649,7 @@ fn try_scalar_index_aggregate(
         }
     }
     scalar_access.cache.record_aggregate_index_scan();
-    Ok(Some(finish_aggregate_result(accumulators, bound)?))
+    Ok(Some(finish_aggregate_result(accumulators, bound, schema)?))
 }
 
 /// Issue #475: `WHERE` なし・索引対応述語のみの `WHERE` を持つ `GROUP BY` の

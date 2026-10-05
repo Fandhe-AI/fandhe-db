@@ -87,11 +87,12 @@ PostgreSQL の Bind 規則に従う。
 | `Scalar{ty: Integer／BigInt／Real／Double／Boolean／Bytea／Uuid}` | int4／int8／float4／float8／bool／bytea／uuid | 対応（Issue #1172。PostgreSQL の send 形式） |
 | `Scalar{ty: Numeric／Date／Timestamp／Json／Jsonb／Array／Enum}` | numeric／date／timestamp／json／jsonb／text | **非対応 → `0A000`** |
 | `Scalar{ty: Vector(_)}` | text（25） | **非対応 → `0A000`**（詳細は WIRE-14 参照） |
-| `ColumnMeta::Computed` | text（25） | **非対応 → `0A000`**（fail-closed。詳細は WIRE-14 参照） |
+| `ColumnMeta::Computed{ty: Some(t)}` | `t` の写像（Issue #1407。集計・式列・ウィンドウ関数の結果列） | `t` が対応型（`Integer／BigInt／Real／Double／Boolean／Text`）なら対応、非対応型なら **`0A000`** |
+| `ColumnMeta::Computed{ty: None}` | text（25） | **非対応 → `0A000`**（静的型を持たないベクトル式など。fail-closed。詳細は WIRE-14 参照） |
 
 `WireType::supports_binary`（`Id`／`Text` の型そのものの対応可否）と
-`column_binary_support`（列種別を見た最終判定。`Vector`／`Computed` の
-上書きを含む）を分離し、`#[deny(clippy::wildcard_enum_match_arm)]` を付けた
+`column_binary_support`（列種別を見た最終判定。`Vector`／`Computed{ty: None}` の
+上書きと、`Computed{ty: Some(t)}` の `t` への委譲を含む）を分離し、`#[deny(clippy::wildcard_enum_match_arm)]` を付けた
 網羅 `match` にすることで、`ColumnMeta`／`WireType` に variant が増えたとき
 （Issue #895 で実際に増えた）にバイナリ可否の決定漏れをコンパイルエラーで
 検出する。
@@ -147,7 +148,7 @@ matches_legacy_encoder`）で固定している。シグネチャは
   text へ黙ってフォールバックしない。`bytea`／`text` の長さは `i32::try_from` で検証する。
   失敗時に部分フレームを残さない契約は不変。
 - 非対応型（`NUMERIC`・`DATE`・`TIMESTAMP`・`JSON`・`JSONB`・配列・`ENUM`・
-  `VECTOR`・`id`・`Computed`）は従来どおり Bind で `0A000`（当該文のみ拒否・
+  `VECTOR`・`id`・`Computed{ty: None}`・非対応型の `Computed`）は従来どおり Bind で `0A000`（当該文のみ拒否・
   接続維持）。
 - 長さ上限検証・`08P01` の範囲: バイナリ形式パラメータの復号は本 Issue の対象外
   （Issue #1345 で実装。下記参照）。本 Issue では
@@ -188,10 +189,25 @@ matches_legacy_encoder`）で固定している。シグネチャは
   `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
   （`docs/design/wire-type-oid-mapping.md` 参照）。数値・真偽値・
   bytea・uuid のバイナリ対応は Issue #1172 で実施済み。`id`・`DATE`／`TIMESTAMP`／
-  `JSON`／`JSONB`・集計列（`Computed`）は引き続き非対応
+  `JSON`／`JSONB` は引き続き非対応。集計・式列・ウィンドウ関数の結果列は Issue #1407 で
+  対応（下記「Issue #1407 追記」）
 - 3 クライアントのバイナリ受信モードでの値一致（層 B）→ **Issue #1176 で実施済み**
   （`three_client_extended_e2e.rs`。psycopg・node pg でテキスト結果との一致を確認。
   psql は結果のバイナリ受信モードを持たず対象外。node pg はバイナリ DataRow を
   UTF-8 文字列として読むため 0x80 以上のバイトを含む値は検証対象外とし、
   psycopg と層 A で担保する）
 - カーソル（WIRE-15）→ #937
+
+## Issue #1407 追記: 集計式・式列・ウィンドウ関数の結果列
+
+- **判定**: `column_binary_support` は `Computed{ty: Some(t)}` を `Scalar{ty: t}` と同じ
+  `scalar_type_binary_support` で判定する（WIRE-13・WIRE-14 のポインタ）。`ty: None`・
+  `NUMERIC`（`SUM／MIN／MAX(id)` を含む）・`DATE`／`TIMESTAMP` は従来どおり `0A000`。
+- **符号化**: `COUNT`・`ROW_NUMBER` 系は `int8` を公告しつつセルが `Cell::Integer(u64)` のため、
+  `(Int8, Cell::Integer)` を `i64::try_from` 付きで追加した（範囲外は `EncodeError`＝`XX000`・
+  部分フレームなし）。型と Cell の他の不一致は fail-closed のまま。
+- **前提の是正**: 非 TEXT の `GROUP BY` キー列は公告型が `text` 固定でセルが実型だったため、
+  キー列の型（疑似列 `id` は `numeric`）から導出する（`aggregate_projection_columns`）。
+  テキスト形式でも公告 OID が `25` から列型の OID に変わる（破壊的変更）。
+- **検証**: 層 A は `wire14_binary_typed_columns.rs`、層 B は
+  `three_client_extended_e2e.rs::computed_columns_binary_results_match_text_results`。

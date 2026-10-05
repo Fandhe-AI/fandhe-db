@@ -115,6 +115,9 @@ pub(crate) fn scan_columns(
 /// 実行経路（`sql::aggregate::finish_aggregate_result`・`sql::group_by` の
 /// PROJECT 段）と同一の写像（[`crate::sql::aggregate::aggregate_projection_columns`]）
 /// に委譲する。結果型は集計関数と入力型から静的に決まる（Issue #1173）。
-pub(crate) fn aggregate_columns(bound: &BoundAggregate) -> Vec<ColumnMeta> {
-    crate::sql::aggregate::aggregate_projection_columns(bound)
+pub(crate) fn aggregate_columns(
+    bound: &BoundAggregate,
+    schema: &crate::catalog::TableSchema,
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    crate::sql::aggregate::aggregate_projection_columns(bound, schema)
 }

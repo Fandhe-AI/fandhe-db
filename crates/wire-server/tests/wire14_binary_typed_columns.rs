@@ -444,3 +444,195 @@ fn binary_results_respect_tenant_boundary() {
     let (_, rows) = run(&mut s, "SELECT n FROM t WHERE id = 1 LIMIT 10", &[1]);
     assert!(rows.is_empty(), "alice's private row must not be visible");
 }
+
+// --- 集計・式列・ウィンドウ関数・GROUP BY キー列（Issue #1407）---
+
+/// `RowDescription` の各列の型 OID。
+fn row_description_oids(body: &[u8]) -> Vec<u32> {
+    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        while body[pos] != 0 {
+            pos += 1;
+        }
+        pos += 1 + 4 + 2;
+        out.push(u32::from_be_bytes([
+            body[pos],
+            body[pos + 1],
+            body[pos + 2],
+            body[pos + 3],
+        ]));
+        pos += 4 + 2 + 4 + 2;
+    }
+    out
+}
+
+/// `sql` を指定 format code で実行し `(型 OID 列, DataRow 群)` を返す。
+fn run_with_oids(stream: &mut Stream, sql: &str, codes: &[i16]) -> (Vec<u32>, Vec<i16>, Rows) {
+    close_all(stream);
+    parse(stream, "s", sql);
+    send_length_prefixed_message(stream, b'B', &bind_with_formats("p", "s", codes));
+    let (kind, _) = read_message(stream);
+    assert_eq!(kind, b'2', "expected BindComplete");
+    send_length_prefixed_message(stream, b'D', &describe_body(b'P', "p"));
+    let (kind, body) = read_message(stream);
+    assert_eq!(kind, b'T');
+    let oids = row_description_oids(&body);
+    let formats = row_description_formats(&body);
+    send_length_prefixed_message(stream, b'E', &execute_body("p", 0));
+    let mut rows = Vec::new();
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'D' => rows.push(parse_data_row(&body)),
+            b'C' => break,
+            other => panic!("unexpected message {other}"),
+        }
+    }
+    send_sync(stream);
+    expect_ready(stream);
+    (oids, formats, rows)
+}
+
+/// バイナリセルを型 OID に応じて text 表現へ復号する。
+fn decode_by_oid(oid: u32, bytes: &[u8]) -> String {
+    match oid {
+        16 => {
+            assert_eq!(bytes.len(), 1);
+            if bytes[0] == 1 { "t" } else { "f" }.to_string()
+        }
+        20 => i64::from_be_bytes(bytes.try_into().unwrap()).to_string(),
+        23 => i32::from_be_bytes(bytes.try_into().unwrap()).to_string(),
+        25 => String::from_utf8(bytes.to_vec()).unwrap(),
+        700 => engine::scalar_float::format_real(f32::from_bits(u32::from_be_bytes(
+            bytes.try_into().unwrap(),
+        ))),
+        701 => engine::scalar_float::format_double(f64::from_bits(u64::from_be_bytes(
+            bytes.try_into().unwrap(),
+        ))),
+        other => panic!("unexpected oid {other}"),
+    }
+}
+
+/// 同じ SQL をテキスト／バイナリで実行し、バイナリを復号した値がテキストと一致すること、
+/// 型 OID が期待どおりであることを確かめる（全列バイナリ要求）。
+fn assert_binary_matches_text(stream: &mut Stream, sql: &str, expected_oids: &[u32]) -> Rows {
+    let (toids, tf, text_rows) = run_with_oids(stream, sql, &[0]);
+    assert!(tf.iter().all(|f| *f == 0), "{sql}");
+    let (boids, bf, bin_rows) = run_with_oids(stream, sql, &[1]);
+    assert!(
+        bf.iter().all(|f| *f == 1),
+        "RowDescription must advertise binary: {sql}"
+    );
+    assert_eq!(toids, expected_oids, "{sql}");
+    assert_eq!(boids, expected_oids, "{sql}");
+    assert!(!text_rows.is_empty(), "{sql}");
+    assert_eq!(text_rows.len(), bin_rows.len(), "{sql}");
+    for (trow, brow) in text_rows.iter().zip(bin_rows.iter()) {
+        for (col, (t, b)) in trow.iter().zip(brow.iter()).enumerate() {
+            match (t, b) {
+                (None, None) => {}
+                (Some(t), Some(b)) => assert_eq!(
+                    String::from_utf8(t.clone()).unwrap(),
+                    decode_by_oid(expected_oids[col], b),
+                    "{sql} col={col}"
+                ),
+                other => panic!("null mismatch {sql} col={col}: {other:?}"),
+            }
+        }
+    }
+    bin_rows
+}
+
+/// Issue #1407: 集計結果列（`COUNT`＝int8・`SUM(INTEGER)`＝int8・`AVG`＝float8・
+/// `MIN(INTEGER)`＝int4・`SUM(REAL)`＝float4）のバイナリがテキストと同じ値へ戻る。
+#[test]
+fn aggregate_columns_binary_matches_text() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    let rows = assert_binary_matches_text(
+        &mut s,
+        "SELECT COUNT(*) AS c, SUM(n) AS s_n, SUM(b) AS s_b, AVG(n) AS a_n, MIN(n) AS m_n, \
+         MAX(b) AS x_b, SUM(r) AS s_r, AVG(d) AS a_d FROM t",
+        &[20, 20, 20, 701, 23, 20, 700, 701],
+    );
+    // COUNT(*) は alice の 3 行（tenant-b の Private 行は含まない）。
+    assert_eq!(rows[0][0].as_deref(), Some(&3i64.to_be_bytes()[..]));
+}
+
+/// Issue #1407: ウィンドウ関数の結果列（`ROW_NUMBER`・`RANK`・`COUNT`・`SUM` の各 OVER）。
+#[test]
+fn window_columns_binary_matches_text() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    let rows = assert_binary_matches_text(
+        &mut s,
+        "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, RANK() OVER (ORDER BY id) AS rk, \
+         COUNT(*) OVER () AS c_all, SUM(n) OVER () AS s_n, MIN(n) OVER () AS m_n FROM t LIMIT 10",
+        &[20, 20, 20, 20, 23],
+    );
+    assert_eq!(rows.len(), 3, "tenant-b の Private 行は混ざらない");
+    assert_eq!(rows[0][2].as_deref(), Some(&3i64.to_be_bytes()[..]));
+}
+
+/// Issue #1407: 非 TEXT の `GROUP BY` キー列はキー列の型（int4・bool）で公告され、
+/// バイナリがテキストと同じ値へ戻る。
+#[test]
+fn group_by_key_columns_binary_matches_text() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    assert_binary_matches_text(
+        &mut s,
+        "SELECT n, COUNT(*) AS c FROM t GROUP BY n ORDER BY n LIMIT 10",
+        &[23, 20],
+    );
+    assert_binary_matches_text(
+        &mut s,
+        "SELECT flag, COUNT(*) AS c FROM t GROUP BY flag ORDER BY flag LIMIT 10",
+        &[16, 20],
+    );
+}
+
+/// Issue #1407: 式列（`vec_norm`＝float8）のバイナリがテキストと同じ値へ戻る。
+#[test]
+fn expression_columns_binary_matches_text() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    assert_binary_matches_text(
+        &mut s,
+        "SELECT vec_norm(embedding) AS nrm FROM t WHERE id = 1 LIMIT 10",
+        &[701],
+    );
+}
+
+/// Issue #1407: バイナリ非対応の静的型（`numeric`・`date`・`timestamp`）や静的型なし
+/// （ベクトル式）、非対応キー列の `GROUP BY` は引き続き `0A000` で、接続は維持される。
+#[test]
+fn unsupported_computed_columns_binary_request_is_0a000_and_connection_survives() {
+    let (mut s, _g, _) = connect("alice", "correct-horse");
+    for sql in [
+        "SELECT MIN(id) AS m FROM t",
+        "SELECT MIN(day) AS m FROM t",
+        "SELECT MAX(ts) AS m FROM t",
+        "SELECT SUM(price) AS m FROM t",
+        "SELECT vec_div(embedding, 2.0) AS half FROM t LIMIT 10",
+        "SELECT day, COUNT(*) AS c FROM t GROUP BY day LIMIT 10",
+        "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, MIN(day) OVER () AS m FROM t LIMIT 10",
+    ] {
+        close_all(&mut s);
+        parse(&mut s, "s", sql);
+        send_length_prefixed_message(&mut s, b'B', &bind_with_formats("p", "s", &[1]));
+        expect_error_then_recover(&mut s, "0A000");
+        // 回復後、同じ接続でテキスト形式は通る。
+        let (_, rows) = run(&mut s, sql, &[0]);
+        assert!(!rows.is_empty(), "{sql}");
+    }
+}
+
+/// Issue #1407: 集計・ウィンドウのバイナリ結果にも他テナントの Private 行は混ざらない（RLS-7）。
+#[test]
+fn computed_binary_results_respect_tenant_boundary() {
+    let (mut s, _g, _) = connect("bob", "battery-staple");
+    let (_, _, rows) = run_with_oids(&mut s, "SELECT COUNT(*) AS c FROM t", &[1]);
+    assert_eq!(rows[0][0].as_deref(), Some(&1i64.to_be_bytes()[..]));
+    let (_, _, rows) = run_with_oids(&mut s, "SELECT COUNT(*) OVER () AS c FROM t LIMIT 10", &[1]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_deref(), Some(&1i64.to_be_bytes()[..]));
+}

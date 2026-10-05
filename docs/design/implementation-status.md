@@ -621,3 +621,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/sql/params.rs`（`ParamLiteralKind::Float` 追加。`REAL`・`DOUBLE` を `Number` トークンで置換）、`crates/engine/src/sql/lexer.rs`（`is_single_number_literal`）、テスト（`prepared_params.rs`・`wire12_param_binding.rs`・`wire14_binary_params.rs`）、`docs/design/wire-extended-query-param-binding.md`。
 - **性質**: `NUMERIC`・`DATE`・`TIMESTAMP`・`UUID`・`BYTEA` は String 種別のまま既存の列型別束縛で成立しており、テストでリテラル同値性・型 OID・エラーコードを固定（`DATE`・`TIMESTAMP` の形式不正はリテラル形と同一の `22007`／`22008`）。RLS・テナント境界・fail-closed・依存は不変。
 - **対象外**: 式項の単項マイナス（`WHERE <数値列> = -N` の `42601`）、大きな絶対値の浮動小数 `WHERE` 比較の `22003`、`NaN`／`Infinity` 入力、`NUMERIC`／`DATE`／`TIMESTAMP` のバイナリ受信、追加のプレースホルダ位置・NULL パラメータ。
+
+## Issue #1407: 集計式・式列・ウィンドウ関数の結果列のバイナリ形式
+
+- **対象ビヘイビア**: WIRE-13・WIRE-14（関連: TASK-217/218）。
+- **変更箇所**: `crates/wire-server/src/result_encoder.rs`（`column_binary_support` を `scalar_type_binary_support` 経由に集約・`(Int8, Cell::Integer)` 追加）、`crates/engine/src/sql/aggregate.rs`（`aggregate_projection_columns` が `GROUP BY` キー列の型をキー列から導出。`group_by.rs`・`describe.rs`・`core.rs`・`set_op.rs`・`subquery.rs` が追随）、テスト（`result_encoder` 単体・`wire14_binary_format.rs`・`wire14_binary_typed_columns.rs`・`three_client_extended_e2e.rs`）、`docs/design/wire-binary-format.md`・`wire-type-oid-mapping.md`
+- **性質**: `Computed{ty: Some(対応型)}` はテキスト形式と同じ値でバイナリ受信できる。`ty: None`・`NUMERIC`・`DATE`／`TIMESTAMP` は `0A000` のまま接続維持。非 TEXT の `GROUP BY` キー列の公告 OID は `25` から列型の OID へ変わる（破壊的変更）。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: `NUMERIC`・`DATE`／`TIMESTAMP`・`JSON`／`JSONB`・配列・`ENUM`・`id` のバイナリ表現、NoSQL（HTTP）の `columns[].type` の型名化。
