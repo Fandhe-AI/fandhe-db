@@ -557,15 +557,17 @@ fn float_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceErr
     Ok(out)
 }
 
-/// `value` を PostgreSQL の `boolin` 互換表記で解釈し、正規形の識別子トークンへ
-/// 変換する（前後の ASCII 空白除去・大文字小文字無視。`of` は `off` の省略形として受理し、`o` 単独は曖昧なので拒否）。
-fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+/// PostgreSQL の `boolin` 互換の真偽値表記（前後の ASCII 空白除去・大文字小文字無視・
+/// `true`／`yes` の接頭辞・`on`・`1`、`false`／`no` の接頭辞・`off`・`of`・`0`。`o` 単独は
+/// 曖昧なので拒否）を解釈する。Prepared の BOOLEAN 位置の `$n`（[`boolean_literal_tokens`]）と、
+/// 比較述語の BOOLEAN 列 × 文字列リテラル（`sql::parser` の `declarative_leaf_to_filter`。
+/// Issue #1408・SQL-24）が同じ文法を共有するための単一実装。解釈できなければ `None`。
+pub(crate) fn parse_pg_bool(value: &str) -> Option<bool> {
     let lowered = value
         .trim_matches(|c: char| c.is_ascii_whitespace())
         .to_ascii_lowercase();
     let is_prefix_of = |full: &str| !lowered.is_empty() && full.starts_with(lowered.as_str());
-    let truth = if lowered == "1" || is_prefix_of("true") || is_prefix_of("yes") || lowered == "on"
-    {
+    if lowered == "1" || is_prefix_of("true") || is_prefix_of("yes") || lowered == "on" {
         Some(true)
     } else if lowered == "0"
         || is_prefix_of("false")
@@ -576,8 +578,12 @@ fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
         Some(false)
     } else {
         None
-    };
-    match truth {
+    }
+}
+
+/// `value` を [`parse_pg_bool`] で解釈し、正規形の識別子トークンへ変換する。
+fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceError> {
+    match parse_pg_bool(value) {
         Some(b) => Ok(vec![Token::Ident(
             if b { "true" } else { "false" }.to_string(),
         )]),

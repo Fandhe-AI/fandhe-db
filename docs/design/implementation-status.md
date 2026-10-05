@@ -628,3 +628,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/wire-server/src/result_encoder.rs`（`column_binary_support` を `scalar_type_binary_support` 経由に集約・`(Int8, Cell::Integer)` 追加）、`crates/engine/src/sql/aggregate.rs`（`aggregate_projection_columns` が `GROUP BY` キー列の型をキー列から導出。`group_by.rs`・`describe.rs`・`core.rs`・`set_op.rs`・`subquery.rs` が追随）、テスト（`result_encoder` 単体・`wire14_binary_format.rs`・`wire14_binary_typed_columns.rs`・`three_client_extended_e2e.rs`）、`docs/design/wire-binary-format.md`・`wire-type-oid-mapping.md`
 - **性質**: `Computed{ty: Some(対応型)}` はテキスト形式と同じ値でバイナリ受信できる。`ty: None`・`NUMERIC`・`DATE`／`TIMESTAMP` は `0A000` のまま接続維持。非 TEXT の `GROUP BY` キー列の公告 OID は `25` から列型の OID へ変わる（破壊的変更）。RLS・テナント境界・fail-closed・依存は不変。
 - **対象外**: `NUMERIC`・`DATE`／`TIMESTAMP`・`JSON`／`JSONB`・配列・`ENUM`・`id` のバイナリ表現、NoSQL（HTTP）の `columns[].type` の型名化。
+
+## Issue #1408: 比較述語でのリテラルの種別不一致を PostgreSQL と揃える
+
+- **対象ビヘイビア**: SQL-24（関連: ERR-2・ERR-6）。
+- **変更箇所**: `crates/engine/src/sql/udf_call.rs`（比較腕で文字列リテラルを反対側の数値型として解釈する `bind_unknown_literal_against`、演算子が存在しない型の組の `42883` 化）、`crates/engine/src/sql/parser.rs`（数値列 × 文字列リテラルの宣言的な葉を式レーンへ書き換える `numeric_column_string_leaf_as_predicates`、BOOLEAN 列の文字列等価の解釈）、`crates/engine/src/sql/params.rs`（`parse_pg_bool` の切り出し。挙動不変）、テスト（`sql24_literal_kind_coercion.rs` 新規、既存テストの期待値反転）、`docs/design/scalar-types-predicates.md`。
+- **性質**: `qty > '1'` は `qty > 1` と同じ行集合。解釈不能は `22P02`、範囲外は `22003`、比較演算子が存在しない型の組は `42883`（従来は `22000`／`42804`）。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: NUMERIC 列 × 裸の数値リテラル、CHECK 本体の構文葉、算術演算の型不一致、DATE／TIMESTAMP の逆向き文字列、`id` 疑似列 × 文字列、BOOLEAN の範囲比較・`IN`・`BETWEEN` の文字列形、`lang = true` の `42883` 化。

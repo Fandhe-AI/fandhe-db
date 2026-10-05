@@ -326,7 +326,8 @@ fn type_mismatched_comparisons_are_rejected_at_bind_time() {
             &format!("SELECT id FROM {TABLE} WHERE day > 5 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "42804");
+    // 比較演算子が存在しない型の組（Issue #1408）は `42883`。
+    assert_eq!(err.wire_code(), "42883");
 
     // DATE 列に UUID 形式のリテラルは形式違反として `22007`。
     let err = core
@@ -367,15 +368,9 @@ fn integer_column_comparison_and_expression_reference_are_accepted() {
     let alice = ctx_for("alice");
     seed_two_rows(&core, &alice);
 
-    // `qty > '1'`（文字列リテラルとの比較）は PostgreSQL の暗黙型変換に当たるため
-    // 引き続き対象外（`22000`）。
-    let err = core
-        .execute_sql(
-            &alice,
-            &format!("SELECT id FROM {TABLE} WHERE qty > '1' LIMIT 10"),
-        )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    // `qty > '1'`（文字列リテラルとの比較）は PostgreSQL と同じく列の型として解釈され、
+    // 数値リテラル形と同じ結果になる（Issue #1408。網羅は `sql24_literal_kind_coercion.rs`）。
+    assert_eq!(select_ids(&core, &alice, "qty > '1'"), vec![2]);
 
     assert_eq!(select_ids(&core, &alice, "qty > 1"), vec![2]);
     assert_eq!(select_ids(&core, &alice, "qty >= 1"), vec![1, 2]);

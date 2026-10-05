@@ -65,8 +65,10 @@ pub enum FilterOp {
     Equals(String),
     StartsWith(String),
     /// BOOLEAN 列の等価条件（TABLE-13・TASK-196、Issue #883・D-c）。`Equals`/
-    /// `StartsWith` は TEXT 列限定のまま据え置き、文字列比較（`flag = 'true'`）は
-    /// 受理しない（fail-closed。`bind` が列型で振り分ける）。
+    /// `StartsWith` は TEXT 列限定のまま据え置く。BOOLEAN 列と文字列リテラルの等価
+    /// （`flag = 'true'`）は Issue #1408 で `sql::parser` が `boolin` 互換文法で解釈して
+    /// この `BoolEquals` へ振り分ける（公開 API の `equals` は TEXT 限定のまま。
+    /// 解釈できない文字列は `22P02`）。
     BoolEquals(bool),
     /// `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較条件
     /// （TABLE-13・TASK-199、Issue #891・レーン B）。`value` は列型で解析済みの

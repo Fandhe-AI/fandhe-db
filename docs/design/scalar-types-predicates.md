@@ -135,6 +135,15 @@ NULL は strict 伝播・BIGINT の |値| > 2^53 は `22000`）をそのまま�
   文字列リテラル形（`price > '1.5'`）のみを受理する。
 - 逆向きの比較（`'2024-01-01' < day`）は対象外（構文段で式フォールバックへ
   回り `42601`）。
+- 比較述語での文字列リテラルの型解釈（Issue #1408・SQL-24・ERR-2・ERR-6）:
+  数値列（INTEGER/BIGINT/REAL/DOUBLE）と文字列リテラルの比較（`=`・範囲・`IN`・
+  `BETWEEN`・`NOT`・逆向き）は列の型として解釈し、数値リテラル形と同じ結果にする
+  （解釈不能は `22P02`、範囲外は `22003`）。BOOLEAN 列との文字列等価は `boolin`
+  互換文法で解釈する。比較演算子が存在しない組み合わせ（TEXT／DATE／VECTOR 列 ×
+  数値リテラル、BOOLEAN／UUID／BYTEA／ARRAY／JSON／ENUM 列 × 数値リテラル）は
+  `42883`。算術演算の型不一致（`42804`）・NUMERIC 列 × 裸の数値リテラル・
+  CHECK 本体の構文葉（`CHECK (qty > '0')`）・DATE／TIMESTAMP の逆向き文字列は対象外のまま。
+  この型解釈は式束縛の共通経路にあるため、式形の `CHECK ('0' < qty)` も受理される。
 - INTEGER/BIGINT/REAL/DOUBLE（レーン A）・投影/式中での新型列参照・
   非数値型の列同士の比較は対象外。
 - 二次索引（`sql::scalar_index`）による候補削減は対象外（常に `PlainScan`）。

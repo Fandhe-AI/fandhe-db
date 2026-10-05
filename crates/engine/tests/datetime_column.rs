@@ -459,7 +459,7 @@ fn where_equality_and_range_on_datetime_column_is_accepted() {
         .unwrap_err();
     assert_eq!(err.wire_code(), "22007");
 
-    // DATE 列と数値リテラルの比較（型不一致）は `42804`。
+    // DATE 列と数値リテラルの比較（演算子が存在しない。Issue #1408）は `42883`。
     // （TEXT 列の範囲比較は Issue #1183 で受理されたため、型不一致の例には使わない）
     let err = core
         .execute_sql(
@@ -467,7 +467,7 @@ fn where_equality_and_range_on_datetime_column_is_accepted() {
             &format!("SELECT id FROM {TABLE} WHERE day > 5 LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "42804");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 // --- RLS 境界: 他テナントの日時値行は見えない ---------------------------------

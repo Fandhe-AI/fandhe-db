@@ -365,7 +365,9 @@ fn where_rejects_type_mismatched_boolean_and_text_predicates() {
             &format!("SELECT id FROM {TABLE} WHERE flag = 'x' LIMIT 10"),
         )
         .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    // Issue #1408: 解釈できない文字列リテラルは `22P02`（`flag = 'true'` 等の受理は
+    // `sql24_literal_kind_coercion.rs` で検証する）。
+    assert_eq!(err.wire_code(), "22P02");
 
     // BOOLEAN 列への LIKE。
     let err = core

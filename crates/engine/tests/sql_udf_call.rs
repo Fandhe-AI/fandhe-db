@@ -508,9 +508,10 @@ fn unknown_function_call_is_rejected_with_42883() {
 }
 
 #[test]
-fn where_comparison_between_a_vector_and_a_scalar_is_rejected_with_42804() {
+fn where_comparison_between_a_vector_and_a_scalar_is_rejected_with_42883() {
     // `<expr> <cmp> <expr>` の両辺は `Scalar` でなければならない（束縛段の型検査）。
-    // `embedding`（`Vector`）を直接比較に使うと `22000` で拒否される。
+    // `embedding`（`Vector`）を直接比較に使うと、演算子が存在しない型の組として
+    // `42883` で拒否される（Issue #1408。従来は `42804`）。
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -521,7 +522,7 @@ fn where_comparison_between_a_vector_and_a_scalar_is_rejected_with_42804() {
             "SELECT id FROM docs WHERE embedding > 2.0 ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
         )
         .expect_err("comparing a vector to a scalar must be rejected");
-    assert_eq!(err.wire_code(), "42804");
+    assert_eq!(err.wire_code(), "42883");
 }
 
 #[test]
