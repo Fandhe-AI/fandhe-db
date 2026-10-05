@@ -741,8 +741,12 @@ pub(crate) fn execute_alter_table_alter_column_type(
     storage
         .alter_table_alter_column_type(&stmt.table_name, &stmt.column_name, &target)
         .map_err(|e| match e {
-            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
-            other => map_drop_alter_column_error(other),
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+            // 拡大変換後の CHECK 再検証失敗（`23514`・式評価エラー。Issue #1427）。
+            AlterCheckError::Sql(sql_err) => sql_err,
         })?;
     Ok(AlterTableOutcome {
         table_name: stmt.table_name.clone(),

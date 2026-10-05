@@ -1183,15 +1183,15 @@ fn drop_column_referenced_by_numeric_check_is_rejected() {
     ));
 }
 
-/// `CHECK` が参照する数値列は `ALTER TABLE ... ALTER COLUMN TYPE` 相当の型変更
-/// （`alter_table_widen_numeric_precision`）からも拒否される（設計 D5。
-/// `schema_check_references_column` の依存判定は列型を問わず先に走るため、
-/// `ColumnType::Numeric` 以外の列（ここでは INTEGER）でも
-/// `IncompatibleTypeChange` より前に `DependentObjectsStillExist` になる。
-/// Issue #1075 以前は CHECK が INTEGER 列を参照できず、この経路自体が到達
-/// 不能だった＝実際には検証されていなかった分岐）。
+/// `CHECK` が参照する INTEGER 列に NUMERIC 精度拡大 API
+/// （`alter_table_widen_numeric_precision`）を呼ぶと `IncompatibleTypeChange`
+/// （縮小・非互換は CHECK の有無にかかわらず 42804 側。Issue #1427 で CHECK 依存ゲートが
+/// 型互換性判定の後ろへ移ったため、旧 `DependentObjectsStillExist` から変わった。
+/// どちらも拒否で fail-open ではない）。NUMERIC 列の精度拡大が CHECK 参照下で
+/// `DependentObjectsStillExist` のままであることは catalog.rs の単体テスト
+/// `alter_table_rejects_changes_to_check_referenced_columns` が担保する。
 #[test]
-fn widen_numeric_precision_on_check_referenced_integer_column_is_rejected() {
+fn widen_numeric_precision_on_check_referenced_integer_column_is_incompatible() {
     let (core, path) = new_core("check-integer-widen-precision");
     let _guard = CleanupGuard(path.clone());
     let alice = ctx("alice");
@@ -1207,10 +1207,10 @@ fn widen_numeric_precision_on_check_referenced_integer_column_is_rejected() {
     let storage = Storage::open(&path).expect("reopen storage");
     let err = storage
         .alter_table_widen_numeric_precision("docs", "qty", 10)
-        .expect_err("widening a CHECK-referenced column must be rejected");
+        .expect_err("non-numeric column precision widening must be rejected");
     assert!(matches!(
         err,
-        engine::catalog::CatalogError::DependentObjectsStillExist(_)
+        engine::catalog::CatalogError::IncompatibleTypeChange { .. }
     ));
 }
 

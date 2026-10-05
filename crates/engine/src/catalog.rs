@@ -1444,6 +1444,7 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 /// `sql::ddl::execute_alter_table_add_check` が唯一の呼び出し元で、`Sql` は
 /// そのまま `SqlSurfaceError` として透過し、`Catalog` は既存の
 /// `map_alter_constraint_error`（UNIQUE と共有）へ渡す。
+#[derive(Debug)]
 pub(crate) enum AlterCheckError {
     Catalog(CatalogError),
     Sql(SqlSurfaceError),
@@ -5020,13 +5021,21 @@ fn encode_column_line_v5(
 /// 多層防御）。再計算に失敗した制約は「依存あり」とみなす（fail-closed。制約を
 /// 黙って壊す `ALTER` を通さない）。
 fn schema_check_references_column(schema: &TableSchema, column_name: &str) -> bool {
-    schema.checks.iter().any(|c| {
-        c.columns.iter().any(|col| col == column_name)
-            || match crate::sql::check_constraint::recompute_referenced_columns(schema, c) {
-                Ok(columns) => columns.iter().any(|col| col == column_name),
-                Err(_) => true,
-            }
-    })
+    schema
+        .checks
+        .iter()
+        .any(|c| check_references_column(schema, c, column_name))
+}
+
+/// 単一の `CHECK` 制約 `c` が列 `column_name` を参照しているか
+/// （[`schema_check_references_column`] の 1 制約版。判定規則・fail-closed は同一。
+/// 列型変更後の再検証対象の抽出〔Issue #1427〕と判定を共有する）。
+fn check_references_column(schema: &TableSchema, c: &CheckConstraint, column_name: &str) -> bool {
+    c.columns.iter().any(|col| col == column_name)
+        || match crate::sql::check_constraint::recompute_referenced_columns(schema, c) {
+            Ok(columns) => columns.iter().any(|col| col == column_name),
+            Err(_) => true,
+        }
 }
 
 /// `CHECK` 制約セクション（`checks:<N>` 行 + N 行の
@@ -8224,6 +8233,15 @@ impl Storage {
                 None,
             ))
         })
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(c) => c,
+            // CHECK 再検証は拡大変換（行の書き換えを伴う型変更）でのみ走り、本 API は
+            // 行の書き換えを伴わない NUMERIC 精度拡大のみを受理するため構造上到達しない。
+            // 万一到達しても panic せず fail-closed に丸める（詳細はクライアントへ渡さない）。
+            AlterCheckError::Sql(_) => {
+                CatalogError::CorruptSchema("unexpected CHECK revalidation failure".to_string())
+            }
+        })
     }
 
     /// `ALTER TABLE ... ALTER COLUMN <column> TYPE <target>`（TABLE-19・SQL-23、
@@ -8245,7 +8263,7 @@ impl Storage {
         table_name: &str,
         column_name: &str,
         target: &ColumnType,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), AlterCheckError> {
         if let ColumnType::Numeric { precision, scale } = target {
             validate_numeric_precision_scale(*precision, *scale)?;
         }
@@ -8281,13 +8299,22 @@ impl Storage {
     }
 
     /// 列型変更の共通本体。単一 write txn 内で 予約名拒否 → スキーマ decode →
-    /// CHECK 依存検査 → 列検索 → `decide` による新型決定 → （行の書き換えを
-    /// 伴う拡大変換のみ）全テナント既存行の再エンコード
-    /// （[`crate::column_rewrite`]。Issue #1361）と、PK／UNIQUE／FK 構成列の
-    /// 永続一意索引・キー索引の失効（正準キーが型ごとに異なり、古い索引が
-    /// 一意性・参照整合性検査をすり抜ける fail-open を避ける。Issue #1402）→ 書き戻し →
-    /// 世代 bump → commit を行う（commit の直前行に必ず bump を置く。
+    /// 列検索 → `decide` による新型決定（縮小・非互換は CHECK の有無にかかわらず
+    /// `IncompatibleTypeChange`）→ CHECK 依存ゲート（`CHECK` 制約が参照する列は
+    /// 行の書き換えを伴う拡大変換〔`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`〕
+    /// のみ受理し、NUMERIC 精度拡大など他は `DependentObjectsStillExist`。
+    /// Issue #1427・TABLE-19・TABLE-16）→ （拡大変換のみ）全テナント既存行の
+    /// 再エンコード（[`crate::column_rewrite`]。Issue #1361）と、PK／UNIQUE／FK
+    /// 構成列の永続一意索引・キー索引の失効（正準キーが型ごとに異なり、古い索引が
+    /// 一意性・参照整合性検査をすり抜ける fail-open を避ける。Issue #1402）→
+    /// 変更列を参照する CHECK の再コンパイルと全テナント・全可視性の既存行の再検証
+    /// （多層防御。可視性で絞ると不可視行の違反を見逃す fail-open になるため
+    /// `PolicyContext` は取らない。ADD CHECK と同じ）→ 書き戻し → 世代 bump →
+    /// commit を行う（commit の直前行に必ず bump を置く。
     /// `table_generation_bump_coverage`）。拒否・失敗時は commit せず副作用ゼロ。
+    /// 呼び出し元は [`Self::alter_table_alter_column_type`]（SQL 表層
+    /// `sql::ddl::execute_alter_table_alter_column_type` 経由）と
+    /// [`Self::alter_table_widen_numeric_precision`]。
     fn alter_column_type_with(
         &self,
         table_name: &str,
@@ -8296,32 +8323,27 @@ impl Storage {
             &ColumnType,
         )
             -> Result<(ColumnType, Option<crate::column_rewrite::WideningKind>)>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), AlterCheckError> {
         validate_identifier(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
-            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()).into());
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
-            let mut table = write_txn.open_table(CATALOG_TABLE)?;
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .map_err(CatalogError::from)?;
             let existing: Vec<u8> = {
                 let guard = table
-                    .get(table_name)?
+                    .get(table_name)
+                    .map_err(CatalogError::from)?
                     .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
                 guard.value().to_vec()
             };
             let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
             let old_schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
             let mut schema = old_schema.clone();
-            // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）が参照する列の型変更は
-            // 安全側で拒否する（`alter_table_drop_column` と同じ判断。述語の
-            // 意味を黙って変えない）。
-            if schema_check_references_column(&schema, column_name) {
-                return Err(CatalogError::DependentObjectsStillExist(
-                    column_name.to_string(),
-                ));
-            }
             let logical_index = schema
                 .columns
                 .iter()
@@ -8333,6 +8355,23 @@ impl Storage {
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
             let (new_ty, rewrite) = decide(&column.ty)?;
             column.ty = new_ty;
+            // `CHECK` 制約が参照する列の型変更は、評価結果が不変であることを論証できる
+            // 拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`）に限り受理する
+            // （Issue #1427）。それ以外（NUMERIC 精度拡大）は述語の意味を黙って変えない
+            // よう安全側で拒否する（`alter_table_drop_column` と同じ判断）。
+            let check_dependent = schema_check_references_column(&old_schema, column_name);
+            match rewrite {
+                Some(crate::column_rewrite::WideningKind::IntegerToBigInt)
+                | Some(crate::column_rewrite::WideningKind::RealToDouble) => {}
+                None => {
+                    if check_dependent {
+                        return Err(CatalogError::DependentObjectsStillExist(
+                            column_name.to_string(),
+                        )
+                        .into());
+                    }
+                }
+            }
             if let Some(kind) = rewrite {
                 crate::column_rewrite::rewrite_rows_for_widening_in_txn(
                     &write_txn,
@@ -8357,19 +8396,60 @@ impl Storage {
                         .any(|u| u.columns().iter().any(|c| c == column_name))
                 {
                     write_txn
-                        .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+                        .delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))
+                        .map_err(CatalogError::from)?;
                 }
                 crate::key_index::drop_indexes_containing_column_in_txn(
                     &write_txn,
                     table_name,
                     column_name,
                 )?;
+                // 変更列を参照する CHECK を新スキーマで再コンパイルし、全テナント・
+                // 全可視性の既存行を再検証する（多層防御。評価結果が変わらない前提を
+                // コードで担保する。違反は `23514`・評価エラーは透過、他は fail-closed）。
+                if check_dependent {
+                    let referencing: Vec<CheckConstraint> = old_schema
+                        .checks
+                        .iter()
+                        .filter(|c| check_references_column(&old_schema, c, column_name))
+                        .cloned()
+                        .collect();
+                    let subset_schema = schema.clone().with_checks(referencing);
+                    let compiled =
+                        crate::sql::check_constraint::CompiledChecks::compile(&subset_schema)
+                            .map_err(map_tenant_write_error_to_alter_check)?
+                            .ok_or_else(|| {
+                                AlterCheckError::Catalog(CatalogError::CorruptSchema(
+                                    "CHECK constraint failed to recompile after column type change"
+                                        .to_string(),
+                                ))
+                            })?;
+                    match write_txn
+                        .open_table(user_rows_table_def(&user_rows_table_name(table_name)))
+                    {
+                        Ok(row_table) => {
+                            crate::constraint::validate_existing_rows_for_check(
+                                &row_table,
+                                &subset_schema,
+                                &compiled,
+                            )
+                            .map_err(map_tenant_write_error_to_alter_check)?;
+                        }
+                        Err(redb::TableError::TableDoesNotExist(_)) => {
+                            // 行ストア未作成（既存行 0 件）。
+                        }
+                        Err(e) => return Err(AlterCheckError::Catalog(map_row_table_error(e))),
+                    }
+                }
             }
             let encoded = encode_schema(&schema)?;
-            table.insert(table_name, encoded.as_slice())?;
+            table
+                .insert(table_name, encoded.as_slice())
+                .map_err(CatalogError::from)?;
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(())
     }
 
     /// 新規 ENUM 型を定義する（TABLE-14・TASK-198、Issue #890）。SQL 表層の
@@ -11321,24 +11401,32 @@ mod tests {
         let err = storage
             .alter_table_alter_column_type("docs", "amt", &numeric(10, 2))
             .expect_err("scale mismatch must be rejected");
-        assert!(matches!(err, CatalogError::IncompatibleTypeChange { .. }));
+        assert!(matches!(
+            err,
+            AlterCheckError::Catalog(CatalogError::IncompatibleTypeChange { .. })
+        ));
         // 範囲不正は互換性判定より先に Invalid。
         let err = storage
             .alter_table_alter_column_type("docs", "amt", &numeric(5, 6))
             .expect_err("invalid numeric must be rejected");
-        assert!(matches!(err, CatalogError::Invalid(_)));
+        assert!(matches!(
+            err,
+            AlterCheckError::Catalog(CatalogError::Invalid(_))
+        ));
         // 予約名・存在しない列・VECTOR 次元変更。
         assert!(matches!(
             storage.alter_table_alter_column_type("docs", "id", &ColumnType::Text),
-            Err(CatalogError::ProtectedColumn(_))
+            Err(AlterCheckError::Catalog(CatalogError::ProtectedColumn(_)))
         ));
         assert!(matches!(
             storage.alter_table_alter_column_type("docs", "nope", &ColumnType::Text),
-            Err(CatalogError::ColumnNotFound(_))
+            Err(AlterCheckError::Catalog(CatalogError::ColumnNotFound(_)))
         ));
         assert!(matches!(
             storage.alter_table_alter_column_type("docs", "embedding", &ColumnType::Vector(3)),
-            Err(CatalogError::IncompatibleTypeChange { .. })
+            Err(AlterCheckError::Catalog(
+                CatalogError::IncompatibleTypeChange { .. }
+            ))
         ));
     }
 
@@ -14225,7 +14313,13 @@ mod tests {
         let err = storage
             .alter_table_alter_column_type("docs", "n", &ColumnType::BigInt)
             .expect_err("rewrite must fail");
-        assert!(matches!(err, CatalogError::CorruptSchema(_)), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                AlterCheckError::Catalog(CatalogError::CorruptSchema(_))
+            ),
+            "{err:?}"
+        );
 
         assert_eq!(
             storage.get_table_schema("docs").expect("schema"),

@@ -239,7 +239,7 @@ TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 
 - **原子性・fail-closed**: キーとヘッダの tenant 不整合・デコード／エンコード失敗
   （ペイロード上限超過を含む）は `CorruptSchema`（`XX000`、固定文言。tenant・id・値を含めない）
   で全体を中止し、commit しない（カタログ・行・世代に痕跡なし）。
-- **依存検査**: CHECK 参照列は従来どおり `2BP01`。NUMERIC 精度拡大の判定は不変。
+- **依存検査**: CHECK 参照列の `DROP COLUMN` は従来どおり `2BP01`。`ALTER COLUMN TYPE` は型互換性判定（縮小・非互換は `42804`）の後に CHECK 依存ゲートを置き、行の書き換えを伴う拡大変換（`INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION`）のみ受理する（Issue #1427。評価結果が列型に依存しないことが根拠。同一 txn 内で変更列を参照する CHECK を新スキーマで再コンパイルし、全テナント・全可視性の既存行を再検証する多層防御付き。違反は `23514`、式評価エラーは透過）。NUMERIC 精度拡大は CHECK 参照下で `2BP01` のまま。
   PK／UNIQUE／FOREIGN KEY（参照元・参照先の両方）の構成列も受理する（Issue #1402。TABLE-19・
   TABLE-17）。正準キーは型タグ付きで `INTEGER 5` と `BIGINT 5` が別バイト列になるため、
   同一 write txn 内で永続一意索引 `user_uniq/{table}`（PK／UNIQUE 構成列のとき）と、変更列を

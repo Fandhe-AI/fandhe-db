@@ -243,8 +243,9 @@ fn alter_type_error_contract() {
         // 予約名。
         ("ALTER TABLE docs ALTER COLUMN id TYPE TEXT", "42601"),
         ("ALTER TABLE docs ALTER COLUMN TENANT_ID TYPE TEXT", "42601"),
-        // CHECK が参照する列。
-        ("ALTER TABLE checked ALTER COLUMN a TYPE BIGINT", "2BP01"),
+        // CHECK が参照する列でも、非互換な型変更は 42804（拡大変換の BIGINT 化は
+        // Issue #1427 で受理。成功系は sql_alter_column_type_check_columns.rs）。
+        ("ALTER TABLE checked ALTER COLUMN a TYPE TEXT", "42804"),
     ] {
         assert_eq!(code_of(&core, &mut session, sql), code, "{sql}");
     }
