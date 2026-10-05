@@ -3,7 +3,7 @@
 //!
 //! 意味論そのものは `crates/engine/tests/sql_enum_type_ddl.rs` が確定オラクル。
 //! 本ファイルは `wire_create_view.rs` と同じ流儀で、DDL 実行権限の wire 越しの
-//! 反映・`CommandComplete` タグ・`42501`／`2BP01`／`42704`／`42P07` の SQLSTATE・
+//! 反映・`CommandComplete` タグ・`42501`／`2BP01`／`42704`／`42710` の SQLSTATE・
 //! 複数文メッセージでの `0A000` に徹する。
 
 #[path = "common/mod.rs"]
@@ -102,7 +102,7 @@ fn wire_type_ddl_lifecycle_and_sqlstates() {
     read_ready_for_query(&mut stream);
 
     send_simple_query(&mut stream, "CREATE TYPE mood AS ENUM ('x')");
-    expect_error_response_with_sqlstate(&mut stream, "42P07");
+    expect_error_response_with_sqlstate(&mut stream, "42710");
     read_ready_for_query(&mut stream);
 
     send_simple_query(&mut stream, "ALTER TABLE docs ADD COLUMN m mood");

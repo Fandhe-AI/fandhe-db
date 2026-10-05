@@ -30,7 +30,7 @@ ENUM 型は全テナント共有カタログで `PolicyContext` を取らない�
 
 | CatalogError | CREATE TYPE | DROP TYPE |
 | ------------ | ----------- | --------- |
-| `TypeAlreadyExists` | `42P07` | - |
+| `TypeAlreadyExists` | `42710` | - |
 | `TypeNotFound` | - | `42704` |
 | `DependentObjectsStillExist` | - | `2BP01` |
 | `Invalid` | `42601` | `42601` |
@@ -47,7 +47,7 @@ ENUM 型は全テナント共有カタログで `PolicyContext` を取らない�
 
 ## 既知の制限・対象外
 
-- 型名の重複は既存の `42P07` へ写像した（PostgreSQL の `42710` ではない。ERR-6 ポインタ）。
+- 型名の重複は Issue #1405 で `42710`（`SqlSurfaceError::DuplicateType`）へ是正済み（当初は `42P07`）。
 - 型数上限（`MAX_ENUM_TYPES`）超過はカタログが `Invalid` を返すため `42601`（`54000` ではない）。
 - `ALTER TYPE ... ADD VALUE` の SQL 公開、`CREATE TABLE` 列定義での ENUM 型名、NoSQL 表層での型 DDL は対象外
   （ENUM 列は `ALTER TABLE ... ADD COLUMN` で宣言する）。
@@ -55,3 +55,5 @@ ENUM 型は全テナント共有カタログで `PolicyContext` を取らない�
 ## 破壊的変更
 
 `SqlOutcome` に `CreateType`／`DropType` variant を追加（網羅 match の追随が必要）。
+
+Issue #1405: 型名重複の SQLSTATE を `42P07` から `42710` へ変更し、`SqlSurfaceError` に `DuplicateType` variant を追加（網羅 match の追随が必要）。

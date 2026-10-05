@@ -10,6 +10,7 @@
 //! - DDL 実行権限ゲートが型の実在有無を問わず `42501` を返し、カタログを変更しない
 //! - 構文の許可形状（`42601`／`54000`）は権限の有無に関わらずカタログを参照しない
 //! - SQL だけで `2BP01`（依存列あり）に到達でき、依存が消えれば削除できる
+//! - 型名の重複は `42710`（副作用ゼロ。Issue #1405）
 //! - 明示トランザクション内の型 DDL は `0A000`
 //! - 拡張クエリプロトコルの `$n` は `42601`、Describe は結果列なし
 
@@ -131,10 +132,30 @@ fn create_type_registers_labels_in_declaration_order() {
     ));
     assert_eq!(
         code(&core, &mut s, "CREATE TYPE mood AS ENUM ('x')"),
-        "42P07"
+        "42710"
     );
     let def = reopen(core, &p).get_enum_type("mood").expect("registered");
     assert_eq!(def.labels(), ["happy".to_string(), "sad".to_string()]);
+}
+
+/// Issue #1405: 型名重複だけが `42710`。テーブル・ビューの重複作成は `42P07` のまま。
+#[test]
+fn duplicate_relations_stay_42p07_while_duplicate_type_is_42710() {
+    let (_p, _g, core) = open_fixture("enum-ddl-dup-codes");
+    let mut s = allowed_session();
+    run(&core, &mut s, "CREATE TYPE mood AS ENUM ('happy')").expect("create type");
+    run(&core, &mut s, "CREATE VIEW v AS SELECT * FROM t").expect("create view");
+    assert_eq!(
+        code(&core, &mut s, "CREATE TABLE t (embedding VECTOR(2))"),
+        "42P07"
+    );
+    assert_eq!(
+        code(&core, &mut s, "CREATE VIEW v AS SELECT * FROM t"),
+        "42P07"
+    );
+    let err = run(&core, &mut s, "CREATE TYPE mood AS ENUM ('x')").expect_err("dup type");
+    assert_eq!(err.wire_code(), "42710");
+    assert!(err.to_string().starts_with("type already exists"));
 }
 
 #[test]

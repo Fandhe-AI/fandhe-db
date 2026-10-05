@@ -85,6 +85,7 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 400」規則に従い、`DuplicateColumn` と同じ DDL 宣言不正の分類として 400
         // とする（`42P07` の 409 とはあえて揃えない）。NoSQL の `alter_table` は
         // ADD CONSTRAINT を持たず構造的に到達しないが網羅性のため射影を定める。
+        // `CREATE TYPE` の型名重複（Issue #1405）も同分類（型 DDL は SQL 表層専用）。
         | ErrorClass::DuplicateObject
         // ERR-4・ERR-6（Issue #1364）: `ALTER TABLE ... ADD PRIMARY KEY` の主キー
         // 重複宣言（`42P16`）。`DuplicateObject` と同じ DDL 宣言不正の分類として 400。

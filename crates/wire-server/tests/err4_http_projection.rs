@@ -912,7 +912,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `err4_f_ambiguous_sort_reachable_via_nosql_aggregate` が担う）
         // `DuplicateObject`（`42710`。TABLE-22、Issue #1195）: `ALTER TABLE ... ADD
         // CONSTRAINT` の CHECK・FOREIGN KEY の名前衝突。NoSQL の `alter_table` は
-        // `add_column`／`drop_column` だけで到達不能。
+        // `add_column`／`drop_column` だけで到達不能。`CREATE TYPE` の型名重複
+        // （Issue #1405）も同分類で、型 DDL は SQL 表層専用のため到達不能。
         ErrorClass::DuplicateObject,
         // `InvalidTableDefinition`（`42P16`。TABLE-22 (d)、Issue #1364）: `ALTER TABLE
         // ... ADD PRIMARY KEY` の主キー重複宣言。NoSQL の `alter_table` は
