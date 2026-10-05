@@ -206,7 +206,8 @@ pub(crate) fn execute_create_table(
         | CatalogError::IndexLimitExceeded(_)
         // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
         // 変種で、`Storage::create_table` からは返らない（到達不能。`CREATE TABLE`
-        // での UNIQUE の明示制約名指定はスコープ外〔設計 D6〕。主キー重複は構造段が
+        // 内の明示制約名の重複は構文段〔`check_create_table_constraint_namespace`。
+        // Issue #1428〕が `42P07`／`42710` で先に拒否する。主キー重複も構造段が
         // `42P16` で先に拒否するため `MultiplePrimaryKeys` も返らない）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)

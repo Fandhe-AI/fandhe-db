@@ -114,10 +114,14 @@ foreign key constraint` 相当）でテナント・値・行・表名を含ま�
 表制約 `CONSTRAINT <name> FOREIGN KEY (...) REFERENCES ...` を受理する
 （`allowlist::Parser::parse_create_table` に専用の先読み分岐を追加し、素の
 `CONSTRAINT` を CHECK 句の開始として扱う既存の `peek_check_clause_start` より
-前で判定する）。列制約 `<col> ... CONSTRAINT <n> REFERENCES` は引き続き
-`42601`（fail-closed。列制約に FK を書く構文自体は元から非対応）。
-`CREATE TABLE` 内の明示名重複（FK 同士・FK と CHECK）は `42601`
-（`finalize_foreign_keys` が CHECK の明示名一覧と照合する）。
+前で判定する）。列制約 `<col> ... CONSTRAINT <n> REFERENCES` も Issue #1428 で
+受理する（`parse_create_table_column` が PK 判定の後・CHECK ループの前で名前を読む）。
+`CREATE TABLE` 内の明示名重複は Issue #1428 で
+`allowlist::check_create_table_constraint_namespace` に一本化し、宣言順に依存しない
+1 つの規則で判定する（FOREIGN KEY を含めば `42710`、含まず UNIQUE を含めば `42P07`、
+主キーと CHECK は `42601`、CHECK 同士は従来どおり `validate_and_build` の `42601`）。
+主キーの実効名（明示名、無ければ主キーが実在するときの導出名 `<table>_pkey`）も同じ
+名前空間に含め、導出名と同名の制約は DROP で主キーを隠すため拒否する。
 
 ### F7. 判定順（ADD。決定的・fail-closed）
 
