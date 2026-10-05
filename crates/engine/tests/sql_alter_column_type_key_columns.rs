@@ -345,6 +345,27 @@ fn on_update_cascade_with_mixed_types() {
     assert_eq!(ints(&core, &o, "SELECT ref FROM kc LIMIT 10"), vec![100]);
 }
 
+/// ON UPDATE CASCADE: 参照する子行が無い親キーは、子の列に収まらない値へも更新できる
+/// （値域検査は子行へ伝播する場合にだけ行う。codex-review 指摘・PR #1414）。
+#[test]
+fn on_update_cascade_allows_out_of_child_range_when_no_child_row() {
+    let (core, path) = setup_parent_child("akc-upd2", "INTEGER", "INTEGER", " ON UPDATE CASCADE");
+    let _g = CleanupGuard(path);
+    let o = ctx("owner");
+    ok(&core, &o, "ALTER TABLE kp ALTER COLUMN k TYPE BIGINT");
+    // 親 id=2（k=2）を参照する子行は無い。
+    ok(
+        &core,
+        &o,
+        &format!("UPDATE kp SET k = {WIDE} WHERE id = 2 USING OPERATION_ID 'u3'"),
+    );
+    assert_eq!(
+        ints(&core, &o, "SELECT k FROM kp LIMIT 10"),
+        vec![1, 3, WIDE]
+    );
+    assert_eq!(ints(&core, &o, "SELECT ref FROM kc LIMIT 10"), vec![1]);
+}
+
 /// UNIQUE・PK 列の拡大後も、複数テナントで重複判定が正しい（索引の再構築）。
 #[test]
 fn unique_and_primary_key_checks_hold_across_tenants_after_widening() {

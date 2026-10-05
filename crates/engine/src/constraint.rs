@@ -3041,20 +3041,21 @@ fn collect_action_targets(
                 if new_key.as_ref() == Some(&old_key) {
                     continue;
                 }
+                // 新キー値は親の型のまま保持する。子の型への変換・値域検査は、子行を
+                // 特定できたキーだけに後段で行う（子行が無い親キーの更新を、子の列に
+                // 収まらない値を理由に拒否しない。codex-review 指摘・PR #1414）。
                 let new_key_values: Option<Vec<crate::row_codec::Value>> =
                     if matches!(action, ReferentialAction::Cascade) {
                         match &new_values {
                             Some(values) => Some(
-                                recoder.coerce_parent_values_to_child(
-                                    parent_indices
-                                        .iter()
-                                        .map(|&idx| {
-                                            values.get(idx).cloned().ok_or_else(|| {
-                                                internal("parent row value index out of range")
-                                            })
+                                parent_indices
+                                    .iter()
+                                    .map(|&idx| {
+                                        values.get(idx).cloned().ok_or_else(|| {
+                                            internal("parent row value index out of range")
                                         })
-                                        .collect::<Result<_, _>>()?,
-                                )?,
+                                    })
+                                    .collect::<Result<_, _>>()?,
                             ),
                             // 親行自体が同一トランザクション内で削除された（先に
                             // ON DELETE 連鎖が走った等）。ON UPDATE CASCADE の
@@ -3089,7 +3090,14 @@ fn collect_action_targets(
             )?;
             let mut out = Vec::new();
             for (key, ids) in &child_rows {
-                let new_key_values = wanted.get(key).cloned().flatten();
+                // 子行が実在するキーに限り、新キー値を子の型へ変換する（値域外は
+                // fail-closed で `ForeignKeyViolation`）。
+                let new_key_values = match wanted.get(key).cloned().flatten() {
+                    Some(values) if !ids.is_empty() => {
+                        Some(recoder.coerce_parent_values_to_child(values)?)
+                    }
+                    other => other,
+                };
                 for &id in ids {
                     out.push((id, new_key_values.clone()));
                 }
