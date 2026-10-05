@@ -37,17 +37,26 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 `PRIMARY`／`KEY` は `lexer::Keyword` へ追加せず、`CREATE TABLE` の列リスト内という
 文脈でのみ文脈的キーワードとして照合する（`TEXT`／`VECTOR` と同方針）。
 
-- 列制約: `<col> <type> PRIMARY KEY`
-- 表制約: `PRIMARY KEY (<col>[, <col>]*)`（複合キーを含む。列リスト中の要素として
+- 列制約: `<col> <type> [CONSTRAINT <name>] PRIMARY KEY`（名前付きは Issue #1412）
+- 表制約: `[CONSTRAINT <name>] PRIMARY KEY (<col>[, <col>]*)`（複合キーを含む。列リスト中の要素として
   任意位置に置ける）
 - 判定順序: 列リストの各要素を先頭から見て、`Ident("PRIMARY")` の次のトークンが
   `Ident("KEY")` なら表制約、それ以外は通常の列定義として解釈する（`KEY` は列型
   キーワードではないため、列名 `primary` を宣言する既存 SQL との構文上の曖昧さは
   生じない）。
+- 名前付き主キー（TABLE-22 (a)・Issue #1412）: 明示名は `ALTER TABLE ... DROP
+  CONSTRAINT <name>` の対象になる。名前の検証は CHECK・FK の明示名と同じ
+  （識別子形式・列型キーワードとの非衝突は `42601`）。導出名 `<table>_pkey` と同じ
+  名前は無名と同じ扱い（カタログ側で正規化）。名前付きの `PRIMARY KEY (id)` は名前が
+  黙って捨てられるため `42601`。明示 PK 名と明示 CHECK／FK 名の重複・既定 CHECK 名との
+  衝突は `42601`、既定 UNIQUE／FK 名は PK 名を避ける。
+- 主キーの重複宣言（列制約 × 2・列制約 + 表制約・表制約 × 2。名前の有無を問わない）は
+  `42P16`（TABLE-22 (d)・ERR-6。Issue #1412 で `42601` から変更）。宣言の構文は最後まで
+  検証し、列リストの `)` の直後（`finalize_*` の前）で返す（構文エラーが優先）。カタログを
+  参照しない構造段の判定で、副作用は残らない。
 - 拒否（いずれも `42601`。決定的な構造検証段で判定し、権限ゲート・カタログ照会より
   前に確定する）:
-  - 主キー宣言が 2 つ以上（列制約 × 2・列制約 + 表制約・表制約 × 2）
-  - `CONSTRAINT <name> PRIMARY KEY` 形・`CHECK`／`REFERENCES`（`NOT NULL`／
+  - `CHECK`／`REFERENCES` の列制約順序違反（`NOT NULL`／
     `DEFAULT` は Issue #904、`UNIQUE` は Issue #905 で受理済み）
   - 空リスト `PRIMARY KEY ()`
   - 列リストに存在しない列名（`42703` は `ErrorClass` 未実装のため既存の

@@ -123,6 +123,10 @@ pub(crate) fn execute_create_table(
     if let Some(primary_key) = validated.primary_key.clone() {
         schema = schema.with_primary_key(primary_key);
     }
+    // 明示主キー名（TABLE-22(a)・Issue #1412）。導出名 `<table>_pkey` と同じ名前は
+    // カタログ側が `None` へ正規化する。名前衝突は `validate_schema` の `Invalid`
+    // として下記の `42601` へ写像される。
+    schema = schema.with_primary_key_name(validated.primary_key_name.clone());
     // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）。参照列の実在・型適格性は
     // `sql::allowlist` が構造検証段階で判定済みで、`catalog::validate_schema`
     // （`create_table` 内）が同じ不変条件を再検証する（違反は `Invalid` として
@@ -202,8 +206,8 @@ pub(crate) fn execute_create_table(
         | CatalogError::IndexLimitExceeded(_)
         // 制約名の操作（`ALTER TABLE ... ADD/DROP CONSTRAINT`。Issue #1067）専用の
         // 変種で、`Storage::create_table` からは返らない（到達不能。`CREATE TABLE`
-        // での明示制約名指定はスコープ外〔設計 D6〕であり、`allowlist` が常に
-        // 未確定名の `UniqueConstraint` を渡す）。
+        // での UNIQUE の明示制約名指定はスコープ外〔設計 D6〕。主キー重複は構造段が
+        // `42P16` で先に拒否するため `MultiplePrimaryKeys` も返らない）。
         | CatalogError::ConstraintAlreadyExists(_)
         | CatalogError::MultiplePrimaryKeys(_)
         | CatalogError::ConstraintNotFound(_)
@@ -1378,6 +1382,7 @@ mod tests {
     fn undefined_table_or_view_distinguishes_view_and_missing() {
         let (storage, _guard) = tmp_storage("undefined-or-view");
         let validated = ValidatedCreateTable {
+            primary_key_name: None,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -1531,6 +1536,7 @@ mod tests {
     fn execute_create_table_succeeds_for_new_table() {
         let (storage, _guard) = tmp_storage("succeeds");
         let validated = ValidatedCreateTable {
+            primary_key_name: None,
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -1554,6 +1560,7 @@ mod tests {
     fn execute_create_table_rejects_duplicate_name() {
         let (storage, _guard) = tmp_storage("duplicate-name");
         let validated = ValidatedCreateTable {
+            primary_key_name: None,
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -1576,6 +1583,7 @@ mod tests {
     fn execute_create_table_rejects_two_vector_columns() {
         let (storage, _guard) = tmp_storage("two-vector");
         let validated = ValidatedCreateTable {
+            primary_key_name: None,
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),

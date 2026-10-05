@@ -915,10 +915,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `add_column`／`drop_column` だけで到達不能。`CREATE TYPE` の型名重複
         // （Issue #1405）も同分類で、型 DDL は SQL 表層専用のため到達不能。
         ErrorClass::DuplicateObject,
-        // `InvalidTableDefinition`（`42P16`。TABLE-22 (d)、Issue #1364）: `ALTER TABLE
-        // ... ADD PRIMARY KEY` の主キー重複宣言。NoSQL の `alter_table` は
-        // `add_column`／`drop_column` だけで到達不能。
-        ErrorClass::InvalidTableDefinition,
+        // （`InvalidTableDefinition`〔`42P16`〕は Issue #1412 で `create_table.constraints` の
+        // `primary_key` 重複から到達可能になったため外した。固定は
+        // `err4_f_invalid_table_definition_reachable_via_nosql_create_table` が担う）
         // `CardinalityViolation`（`21000`。SQL-29、Issue #1404）: スカラーサブクエリの
         // 2 行以上返却。NoSQL 表層にはサブクエリ構文が無く到達不能。
         ErrorClass::CardinalityViolation,
@@ -1086,6 +1085,32 @@ fn err4_f_invalid_foreign_key_reachable_via_nosql_create_table() {
     let resp = query_as_alice(addr, child);
     assert_projected(&resp, "42830");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// `42P16`（`InvalidTableDefinition`。TABLE-22 (d)・ERR-6、Issue #1412）は NoSQL
+/// `create_table.constraints` に `primary_key` を 2 個並べた要求から到達可能。
+/// 応答にテナントを含めず、拒否後に同名テーブルを有効な定義で作成できる（副作用ゼロ）。
+#[test]
+fn err4_f_invalid_table_definition_reachable_via_nosql_create_table() {
+    let (core, _guard) = new_core();
+    let addr = spawn_with_ddl(core);
+
+    let dup = br#"{"op":"create_table","table":"dups","columns":[
+        {"name":"a","type":"integer"},
+        {"name":"b","type":"integer"}
+    ],"constraints":[
+        {"kind":"primary_key","columns":["a"]},
+        {"kind":"primary_key","columns":["b"]}
+    ]}"#;
+    let resp = query_as_alice(addr, dup);
+    assert_projected(&resp, "42P16");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+
+    let ok = br#"{"op":"create_table","table":"dups","columns":[
+        {"name":"a","type":"integer"},
+        {"name":"b","type":"integer"}
+    ],"constraints":[{"kind":"primary_key","columns":["a"]}]}"#;
+    assert_eq!(query_as_alice(addr, ok).status, 200);
 }
 
 /// `54000`（`QueryCanceled` 相当の副作用ゼロ拒否。TABLE-17・TASK-205、
