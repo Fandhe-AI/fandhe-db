@@ -1145,6 +1145,7 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 外した）。`DuplicateObject`（`42710`。TABLE-22、Issue #1195）は
 `ALTER TABLE ... ADD CONSTRAINT`（CHECK・FOREIGN KEY）の制約名衝突で、NoSQL
 `alter_table` は `add_column`／`drop_column` のみのため到達しない。
+`CREATE TYPE` の型名重複（Issue #1405）も同じ `42710` だが、型 DDL は SQL 表層専用のため到達しない。
 `InvalidTableDefinition`（`42P16`。TABLE-22 (d)、Issue #1364）は
 `ALTER TABLE ... ADD PRIMARY KEY` の主キー重複宣言で、同じく到達しない。
 `CardinalityViolation`（`21000`。SQL-29、Issue #1404）はスカラーサブクエリの

@@ -1287,11 +1287,11 @@ pub(crate) fn execute_drop_type(
 }
 
 /// `Storage::create_enum_type` の [`CatalogError`] を SQL 表層の契約へ写像する
-/// （型名重複は ERR-6 に専用行が無いため `42P07`。定義不正・型数上限は `42601`）。
+/// （型名重複は `42710`（Issue #1405・TABLE-14・ERR-6）。定義不正・型数上限は `42601`）。
 /// エラー文言にはラベル・テナント・redb 内部詳細を含めない（security.md P0）。
 fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
     match e {
-        CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::duplicate_type(name),
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
         }
@@ -1333,8 +1333,12 @@ mod tests {
             code(map_create_type_error(CatalogError::TypeAlreadyExists(
                 "t".into()
             ))),
-            "42P07"
+            "42710"
         );
+        // 制約用 variant への退行を防ぐ（Issue #1405）。
+        let dup = map_create_type_error(CatalogError::TypeAlreadyExists("t".into()));
+        assert!(matches!(dup, SqlSurfaceError::DuplicateType { .. }));
+        assert!(dup.to_string().starts_with("type already exists"));
         assert_eq!(
             code(map_create_type_error(CatalogError::Invalid("x".into()))),
             "42601"

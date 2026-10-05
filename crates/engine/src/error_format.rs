@@ -300,6 +300,8 @@ define_error_classes! {
     /// 制約名と衝突した（`42710`、Issue #1195・TABLE-22・ERR-6）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateObject`] の写像。
     /// UNIQUE の名前衝突は索引名衝突と同じ `42P07`（`DuplicateTable`）のまま。
+    /// `CREATE TYPE` の型名重複（Issue #1405・TABLE-14）も共有する
+    /// （`SqlSurfaceError::DuplicateType` の写像）。
     DuplicateObject => ("42710", "DUPLICATE_OBJECT"),
     /// 主キーを既に宣言済みのテーブルへ `ALTER TABLE ... ADD [CONSTRAINT <name>]
     /// PRIMARY KEY` を重ねて宣言した（`42P16`、Issue #1364・TABLE-22 (d)・

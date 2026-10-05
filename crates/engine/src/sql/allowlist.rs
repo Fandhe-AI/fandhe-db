@@ -532,6 +532,10 @@ pub enum SqlSurfaceError {
     /// 同一テーブルの既存制約名と衝突した（TABLE-22、Issue #1195）。
     /// ERR-6: `42710`。UNIQUE の名前衝突は `DuplicateTable`（`42P07`）のまま。
     DuplicateObject { name: String },
+    /// `CREATE TYPE ... AS ENUM` の型名が既存の型名と重複した（TABLE-14、
+    /// Issue #1405）。ERR-6: `42710`（`DuplicateObject` と同じ分類を共有する）。
+    /// 既存の型定義は変更しない。
+    DuplicateType { name: String },
     /// 主キー宣言済みのテーブルへの `ALTER TABLE ... ADD PRIMARY KEY` の重複宣言
     /// （TABLE-22 (d)、Issue #1364）。ERR-6: `42P16`。`table` はクライアント自身が
     /// 指定したテーブル名。
@@ -726,6 +730,15 @@ impl SqlSurfaceError {
     /// を写像するために使う。名前は untrusted な字句解析結果のため切り詰める。
     pub(crate) fn duplicate_object(name: impl Into<String>) -> Self {
         SqlSurfaceError::DuplicateObject {
+            name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::ddl` の `CREATE TYPE ... AS ENUM`（Issue #1405）が
+    /// `catalog::CatalogError::TypeAlreadyExists` を写像するために使う。
+    /// 名前は untrusted な字句解析結果のため切り詰める。
+    pub(crate) fn duplicate_type(name: impl Into<String>) -> Self {
+        SqlSurfaceError::DuplicateType {
             name: truncate_for_error(&name.into()),
         }
     }
@@ -956,6 +969,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
+            SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::InvalidTableDefinition { .. } => ErrorClass::InvalidTableDefinition,
             SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
             SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
@@ -1076,6 +1090,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // 制約名はクライアント自身が指定した識別子。テーブル名・テナントは含めない。
             SqlSurfaceError::DuplicateObject { name } => {
                 write!(f, "constraint already exists: {name}")
+            }
+            // 型名はクライアント自身が指定した識別子。ラベル・テナント情報は含めない。
+            SqlSurfaceError::DuplicateType { name } => {
+                write!(f, "type already exists: {name}")
             }
             // クライアント自身が指定したテーブル名のみ。他テナント情報は含めない。
             SqlSurfaceError::InvalidTableDefinition { table } => {
