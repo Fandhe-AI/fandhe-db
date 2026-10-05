@@ -671,3 +671,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/catalog.rs`（`is_declarable_scalar_index_type` に INTEGER／BIGINT／REAL／DOUBLE を追加）、`core.rs`（`scalar_filter_column_names_with_numeric`。検索・集計 `EXPLAIN` の索引名の被覆判定に式述語の数値列を加える）、`sql/explain.rs`（`ExplainShape::from_filters` の索引名用ビット集合に数値列を加える。`USING PLAN` 経路）、`sql/scalar_plan.rs`・テストのコメント、テスト（`tests/index_declaration_numeric.rs` 新規・`tests/sql_index_ddl.rs`・`catalog.rs` 単体）、`docs/design/index-ddl-declaration.md`・`scalar-index-prune.md`・`explain-search-engine-exposure.md`。
 - **性質**: 数値 4 型の宣言を受理し、宣言付きテーブル（HNSW opt-in）でも宣言した数値列の述語が索引経路を使う。未宣言の数値列は従来どおり `plain_scan` へ降格する。`EXPLAIN` の `index=` は他型と同じ規則（昇順・重複排除・`id` 除外）で付く。`USING hnsw` は VECTOR 限定のまま。RLS・テナント境界・fail-closed・依存は不変。
 - **対象外**: 数値の `IN`／`NOT IN`・列同士の比較・算術式の索引化、選択度閾値の数値列専用調整、`2^53` ゲートや予算解放で実行時に列が落ちた場合の `EXPLAIN`（静的）と実行の乖離（TEXT／BYTEA と同じ既知の挙動）。
+
+## Issue #1427: CHECK 制約が参照する列でも ALTER COLUMN TYPE の拡大変換を受理する
+
+- **対象ビヘイビア**: TABLE-19（関連: TABLE-16・SQL-23・ERR-1・ERR-2・ERR-6）。
+- **変更箇所**: `crates/engine/src/catalog.rs`（`alter_column_type_with` の判定順序を「型互換性判定 → CHECK 依存ゲート」へ変更し、戻り値を `AlterCheckError` 化。拡大変換では変更列を参照する CHECK を新スキーマで再コンパイルし全テナント・全可視性の既存行を再検証）、`sql/ddl.rs`（`AlterCheckError` の写像）。
+- **性質**: CHECK 参照列の `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION` を受理し、`23514`・式評価エラーの `wire_code` は拡大前後で不変。縮小・非互換は CHECK の有無にかかわらず `42804`（CHECK 参照列への非互換変更は従来の `2BP01` から `42804` に変わるが拒否である点は同じ）。NUMERIC 精度拡大は CHECK 参照下で `2BP01` のまま。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: CHECK 参照列の NUMERIC 精度拡大、CHECK 参照列の `DROP COLUMN`（`2BP01` のまま）、NoSQL 表層の列型変更。

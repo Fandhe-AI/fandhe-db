@@ -158,14 +158,29 @@ fn wire_dependent_check_column_is_rejected_with_2bp01() {
     );
     assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
     read_ready_for_query(&mut stream);
-    for sql in [
-        "ALTER TABLE docs DROP COLUMN qty",
-        "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT",
-    ] {
-        send_simple_query(&mut stream, sql);
-        expect_error_response_with_sqlstate(&mut stream, "2BP01");
-        read_ready_for_query(&mut stream);
-    }
+    send_simple_query(&mut stream, "ALTER TABLE docs DROP COLUMN qty");
+    expect_error_response_with_sqlstate(&mut stream, "2BP01");
+    read_ready_for_query(&mut stream);
+}
+
+/// CHECK 参照列でも拡大変換（INTEGER→BIGINT）は受理され（Issue #1427）、
+/// 非互換な変換は 42804 のまま。
+#[test]
+fn wire_check_column_widening_is_accepted_and_incompatible_is_42804() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice_as_ddl_principal(core);
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE docs ADD CONSTRAINT qty_ck CHECK (qty > 0)",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ALTER TABLE docs ALTER COLUMN qty TYPE TEXT");
+    expect_error_response_with_sqlstate(&mut stream, "42804");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
 }
 
 #[test]

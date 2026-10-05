@@ -248,8 +248,16 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `alter_table_drop_column`：CHECK が参照する列の削除は
   `CatalogError::DependentObjectsStillExist` で拒否する（PostgreSQL は制約を
   自動削除するが、制約を黙って弱める経路を作らないよう安全側に倒す）。
-- `alter_table_widen_numeric_precision`：CHECK が参照する列の型変更も同様に
-  拒否する。
+- `alter_table_widen_numeric_precision`：CHECK が参照する NUMERIC 列の精度拡大は
+  同様に拒否する（`DependentObjectsStillExist`。意味不変の論証が無いため安全側）。
+  NUMERIC 以外の列に対しては `IncompatibleTypeChange`（型互換性判定が先）。
+- `ALTER COLUMN TYPE` の拡大変換（Issue #1427）：CHECK 参照列でも
+  `INTEGER`→`BIGINT`・`REAL`→`DOUBLE PRECISION` は受理する。式評価の列参照は
+  `f64` へ揃えられ（INTEGER 値・REAL 値はともに無損失）、算術・比較・0 除算
+  （`22012`）・非有限（`22003`）の規則が列型に依存しないため、既存値の評価結果は
+  変わらない。加えて同一 txn 内で変更列を参照する CHECK を新スキーマで再コンパイルし、
+  全テナント・全可視性の既存行を再検証する（違反は `23514`、評価エラーは透過、
+  拒否時は commit しない）。
 - 索引宣言（TASK-206・INDEX-7、Issue #908）との関係: `alter_table_drop_column` は
   削除列を含む索引宣言を同一 write トランザクションで掃除するが、CHECK 参照列の
   拒否はその掃除より前に判定し commit しないため、拒否時は索引宣言も一切変わら
