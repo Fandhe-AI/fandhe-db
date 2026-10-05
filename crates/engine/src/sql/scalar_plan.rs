@@ -190,8 +190,9 @@ fn expr_index_predicate_from_expr(expr: &BoundExpr) -> Option<ExprIndexPredicate
 /// `exprs` のうち数値列述語（[`ExprIndexPredicate::NumericColumn`]）が参照する
 /// 列添字（`schema.columns` 添字）を列挙する（Issue #1359）。`EXPLAIN` の静的
 /// 判定（`sql::scalar_index::scalar_plan_under_target`）が、索引宣言
-/// （`Declared`。数値列は宣言できず構築されない）の下で数値述語を含む計画を
-/// `PlainScan` へ降格させるために、`metadata_filters` の列と合わせて渡す。
+/// （`Declared`）の下で未宣言の数値列を含む計画を `PlainScan` へ降格させる
+/// ために、`metadata_filters` の列と合わせて渡す。`EXPLAIN` の索引名の被覆判定
+/// にも使う（#1413。`id` 述語は返さないため対象外）。
 pub(crate) fn numeric_predicate_columns(exprs: &[BoundExpr]) -> impl Iterator<Item = usize> + '_ {
     exprs
         .iter()

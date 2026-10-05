@@ -259,7 +259,7 @@ NoSQL 表層が独自の行・語彙を追加することはない。
   適格性そのものが宣言に依存する `Declared` scope に限定した）
 - **scalar**: 宣言の有効化スイッチ（起動時 HNSW opt-in）が有効・
   `scalar_plan` が `plain_scan` 以外・`WHERE` の索引対応述語
-  （`metadata_filters`）が参照する列**すべて**がいずれかのスカラー宣言で
+  （`metadata_filters` の列と、式述語の数値列〔Issue #1413。`id` 述語は除く〕）が参照する列**すべて**がいずれかのスカラー宣言で
   被覆されている場合のみ、被覆に用いる宣言集合（複数可）。1 列でも
   非被覆なら索引名は付けない。`id` 述語（常設の暗黙索引で宣言索引ではない）
   は対象外。実行側 `catalog::declared_index_targets_in_txn` は宣言名を捨て

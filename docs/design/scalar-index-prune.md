@@ -496,14 +496,15 @@ Issue #1183 で `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列を `WHERE` の式�
 
 ### 宣言（INDEX-7）・`EXPLAIN` との関係
 
-数値 4 型は `CREATE INDEX` で宣言できない型のため、`Declared` では構築されない。
-`resolve_candidates` は数値列も候補評価前に静的検査（`expr_predicate_is_indexed`）し、
+数値 4 型は Issue #1413 から `CREATE INDEX` で宣言できる。`Declared` では宣言した数値列が
+構築され、宣言していない数値列は構築されない。`resolve_candidates` は数値列も候補評価前に静的検査（`expr_predicate_is_indexed`）し、
 `EXPLAIN` 側は `ExplainShape`／`scalar_plan_under_target` の列集合へ数値述語の列を加えて
-`PlainScan` へ降格する。`Auto` では分類結果がそのまま出る。`2^53` ゲート等で実行時に
+`PlainScan` へ降格する（宣言済みなら降格しない）。索引名（`index=`）の被覆判定には
+`metadata_filters` の列に加え式述語の数値列も含める（`id` 述語は対象外）。`Auto` では分類結果がそのまま出る。`2^53` ゲート等で実行時に
 列が落ちた場合は `EXPLAIN`（静的）が索引経路を表示しても実行は全走査になるが、
 TEXT／BYTEA と同じ既知の乖離で結果の正しさには影響しない。
 
 ### 対象外
 
-数値 4 型の `CREATE INDEX` 対応、`IN`／`NOT IN` の和集合計算、列同士の比較、算術式を含む
+`IN`／`NOT IN` の和集合計算、列同士の比較、算術式を含む
 式、選択度閾値の数値列専用調整。

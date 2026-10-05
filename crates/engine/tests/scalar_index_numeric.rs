@@ -7,7 +7,7 @@
 //! 索引非対応の述語（`id + 0 > 0`）を足して全走査へ強制した結果とも比較し、
 //! 索引経路と全走査の結果が完全一致することを固定する。RLS（他テナントの行）・
 //! `2^53` 超過の `BIGINT`（列が索引から落ち全走査と同じ 22003 になる fail-closed
-//! の連鎖）・索引宣言（`Declared` では数値列は構築されず `plain_scan`）も扱う。
+//! の連鎖）・索引宣言（`Declared` では未宣言の数値列は構築されず `plain_scan`）も扱う。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -446,7 +446,7 @@ fn explain_reports_index_for_numeric_predicates() {
     ));
 }
 
-/// 索引宣言（`Declared`）の下では数値列は構築されない（宣言できない型）ため、
+/// 索引宣言（`Declared`）の下では、宣言していない数値列は構築されないため、
 /// `EXPLAIN` も実行時も全走査になり、結果は全走査と一致する。
 #[test]
 fn declared_scalar_index_target_excludes_numeric_columns() {

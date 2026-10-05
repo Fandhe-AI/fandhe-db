@@ -189,7 +189,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1364（名前付き主キー・カタログ v13。`catalog.rs` に行が追加）で追随（旧: 7811）。
     // Issue #1373（BYTEA 列の DEFAULT。`catalog.rs` に行が追加）で一括追随（+104 行。旧: 8001）。
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8275）。
-    ("catalog.rs", 8389),
+    ("catalog.rs", 8395),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -247,7 +247,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1361 で追随（旧: 7835）。
     // Issue #1364（名前付き主キー・カタログ v13。`catalog.rs` に行が追加）で追随（旧: 7892）。
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8356）。
-    ("catalog.rs", 8470),
+    ("catalog.rs", 8476),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -297,7 +297,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1361 で追随（旧: 7938）。
     // Issue #1364（名前付き主キー・カタログ v13。`catalog.rs` に行が追加）で追随（旧: 7995）。
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8459）。
-    ("catalog.rs", 8601),
+    ("catalog.rs", 8607),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -352,7 +352,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1361 で追随（旧: 7971）。
     // Issue #1364（名前付き主キー・カタログ v13。`catalog.rs` に行が追加）で追随（旧: 8028）。
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8492）。
-    ("catalog.rs", 8634),
+    ("catalog.rs", 8640),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

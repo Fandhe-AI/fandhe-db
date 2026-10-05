@@ -1782,6 +1782,23 @@ fn metadata_filter_column_names<'a>(
     Some(names)
 }
 
+/// [`metadata_filter_column_names`] に式述語の数値列（Issue #1413・INDEX-7）を
+/// 加えた版。数値列述語は `expr_filters` 側にあり `metadata_filters` には現れない
+/// ため、索引名の被覆判定へ入れるには別途列を集める必要がある。`id` 述語は
+/// `numeric_predicate_columns` が返さず対象外のまま（既存契約）。範囲外添字が
+/// あれば `None`（fail-closed で名前なし）。
+fn scalar_filter_column_names_with_numeric<'a>(
+    schema: &'a crate::catalog::TableSchema,
+    metadata_filters: &[crate::declarative_filter::MetadataFilter],
+    expr_filters: &[crate::sql::udf_call::BoundExpr],
+) -> Option<Vec<&'a str>> {
+    let mut names = metadata_filter_column_names(schema, metadata_filters)?;
+    for idx in crate::sql::scalar_plan::numeric_predicate_columns(expr_filters) {
+        names.push(schema.columns.get(idx)?.name.as_str());
+    }
+    Some(names)
+}
+
 /// `column_names` の**全列**がいずれかのスカラー索引宣言（`(名前, 対象列)`。
 /// [`crate::catalog::TableIndexDecls::scalar`]）で被覆されている場合に限り、
 /// 被覆に用いる宣言の名前（貪欲法選択・グローバルな最小性は保証しない。
@@ -6375,8 +6392,11 @@ impl EngineCore {
         // 列名へ写像する（添字は `MetadataFilter::column_index` のドキュメント
         // どおり `schema.columns` と同一空間）。写像に失敗する列があれば
         // fail-closed に `None`（索引名なし）へ倒す。
-        let scalar_filter_column_names =
-            metadata_filter_column_names(schema, bound.metadata_filters());
+        let scalar_filter_column_names = scalar_filter_column_names_with_numeric(
+            schema,
+            bound.metadata_filters(),
+            bound.expr_filters(),
+        );
         // Issue #1153: `sql::exec` が索引構築対象選択に使うのと同じ単一
         // 情報源から `target` を解決し、宣言で対象外にした列への述語を
         // `scalar_plan_under_target` で `PlainScan` へ補正する。
@@ -6492,7 +6512,11 @@ impl EngineCore {
             crate::sql::explain::AccessPath::ScalarIndexCandidates
         ) && self.hnsw_state.is_some()
         {
-            match metadata_filter_column_names(schema, bound.metadata_filters()) {
+            match scalar_filter_column_names_with_numeric(
+                schema,
+                bound.metadata_filters(),
+                bound.expr_filters(),
+            ) {
                 Some(cols) if !cols.is_empty() => {
                     match self.read_explain_index_names_in_txn(read_txn, bound.table()) {
                         Ok(decls) => crate::sql::explain::ExplainIndexNames::new(
