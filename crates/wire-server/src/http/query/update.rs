@@ -74,8 +74,8 @@
 //!
 //! 対象外: `RETURNING`（Issue #873）。`filter` は `search` と同じ語彙（`or`・範囲比較・
 //! `in`・数値列を含む。Issue #1356）を `filter.rs` の `bind_filter_where_predicates` が
-//! SQL の述語形 `UPDATE` と同一の構文形へ写像する（`ARRAY`／`JSON`／`JSONB` 列への
-//! `eq`／`ne` のみ `0A000`）。
+//! SQL の述語形 `UPDATE` と同一の構文形へ写像する（`ARRAY`／`JSON`／`JSONB` 列の
+//! `eq`／`ne`／`in` も受理する。Issue #1410）。
 
 use std::fmt::Write as _;
 

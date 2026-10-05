@@ -719,7 +719,7 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 `AND` のみだった。Issue #1197 で `ne`・`between`・`like`・`is_null`／
 `not_null`・`not` グループを追加）。`update`／`delete` の述語形（Issue #1062）でも
 同じ配列表現を使い、Issue #1356 以降は `search` と同じ語彙を受理する
-（`ARRAY`／`JSON`／`JSONB` 列への `eq`／`ne` を除く。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
+（`ARRAY`／`JSON`／`JSONB` 列の `eq`／`ne`／`in` も Issue #1410 以降は受理する。`WHERE <述語> USING OPERATION_ID` の意味論〔影響行数上限 `54000`・
 台帳照合 `23505`／`22023`〕は各 op の節を参照）。
 
 ```json
@@ -853,13 +853,19 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
 `eq`／`ne`／`between`／範囲比較／`in` を含む）。SQL の述語形 `UPDATE`／`DELETE`
 （SQL-19）と同一の構文形（`WherePredicate`）へ写像するため、同じ述語は同じ結果集合・
 同じ `wire_code` になり、SQL⇄NoSQL の台帳照合（`23505`／`22023`）も成立する。
-例外は `ARRAY`／`JSON`／`JSONB` 列への `eq`／`ne`（`0A000`。構文形へ写せないため。
-`in` は従来どおり `42601`）。述語の葉の上限（256。超過は `54000`）は変わらない。
+`ARRAY`／`JSON`／`JSONB` 列の `eq`／`ne`／`in` も同じ構文形で受理する（Issue #1410）。
+`in` の要素は、ARRAY 列では JSON 配列、JSON／JSONB 列では JSON オブジェクトか配列
+（それ以外の要素は `42601`、要素数 256 超・配列要素数の上限超過は `54000`）。値は
+サーバーの正規直列化（text[] は `{"a","b"}`、JSON はキー昇順・空白なし）でリテラル化
+するため、SQL 側のリテラルが同じ綴りのときに台帳照合が `23505` になり、綴りが違えば
+`22023`（拒否側）になる。なお `search`／`scan`／`aggregate` の `filter` では ARRAY／JSON
+列の `in` は従来どおり `42601`。述語の葉の上限（256。超過は `54000`）は変わらない。
 数値列の `in` は JSON 上で 1 葉として事前検査されるが engine の事後検査は展開後の
 式を 1 個ずつ数えるため、他に葉があり `in` が 256 要素ちょうどのとき NoSQL だけが
 `54000` になりうる（拒否側に倒れる既知の差分）。実装は
 [`filter::bind_filter_where_predicates`](../src/http/query/filter.rs)、検証コードは
 `crates/wire-server/tests/nosql12_predicate_dml_numeric_filter.rs`・
+`nosql12_predicate_dml_composite_filter.rs`・
 `nosql12_update_delete.rs`。
 
 ## `explain`

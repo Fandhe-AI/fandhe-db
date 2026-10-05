@@ -471,7 +471,7 @@ pub const EXPLAIN_NOT_YET_SUPPORTED_MESSAGE: &str = "search explain is not yet a
 /// SearchError` により最終的な `wire_code`／`client_message` はここでの分類
 /// のまま保たれる）。
 ///
-/// `FilterError::CompositeEqNotSupportedForPredicateDml` 等の `0A000` 分類は
+/// `FilterError` 由来の `0A000` 分類は
 /// `SqlSurfaceError::FeatureNotSupported` としてこの closure 境界をそのまま通過する
 /// （`docs/design/nosql-typed-json-binding.md` 参照）。
 fn to_sql_surface_error(err: SearchError) -> SqlSurfaceError {
