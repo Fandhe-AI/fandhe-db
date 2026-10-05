@@ -307,6 +307,7 @@ fn ledger_is_tenant_scoped_for_explicit_transaction_resend() {
     assert_ledger_duplicate(&err);
     rollback_to_idle(&core, &alice, &mut txn);
 }
+
 /// 0 行 `DELETE` の形（単一行形 `WHERE id = n`／述語形 `WHERE code = 'v'`）。
 /// 述語形は `id` 以外の列を使う（`id` 指定は単一行形として束縛されるため）。
 #[derive(Clone, Copy, Debug)]
