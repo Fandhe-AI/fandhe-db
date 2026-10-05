@@ -1569,47 +1569,64 @@ fn collect_referenced_udfs(
     }
 }
 
-/// 素の十進表記（`-?digits[.digits]`）を正規化する（先頭 0・末尾 0・末尾ドットを除去。
-/// 値が 0 の場合は符号を保持した `0`／`-0`）。指数表記など他の形は変換せずそのまま返す。
-/// `push_dml_expr` の数値リテラル直列化から呼ばれ、同じ十進値の異なる綴りを同一視する。
-fn canonical_decimal_text(raw: &str) -> String {
+/// 数値リテラル（平文十進・指数表記）を正確な十進値の正規形 `-?<有効数字>e<10 の指数>`
+/// へ変換する（先頭 0・末尾 0 を除去し、指数へ繰り込む。値が 0 の場合は符号を保持した
+/// `0`／`-0`）。解釈できない形（指数部の欠落・範囲外等）は `None`。
+/// `push_dml_expr` の数値リテラル直列化から呼ばれ、同じ十進値の異なる綴り
+/// （平文十進と指数表記を含む）を同一視する。
+fn canonical_decimal_parts(raw: &str) -> Option<String> {
     let (neg, body) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, raw),
     };
-    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
-    let plain = !int_part.is_empty()
-        && int_part.bytes().all(|c| c.is_ascii_digit())
-        && frac_part.bytes().all(|c| c.is_ascii_digit());
-    if !plain {
-        return raw.to_string();
+    let (mantissa, exp_text) = match body.find(['e', 'E']) {
+        Some(i) => (body.get(..i)?, Some(body.get(i + 1..)?)),
+        None => (body, None),
+    };
+    let exp10: i64 = match exp_text {
+        Some(t) => t.strip_prefix('+').unwrap_or(t).parse().ok()?,
+        None => 0,
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty()
+        || !int_part.bytes().all(|c| c.is_ascii_digit())
+        || !frac_part.bytes().all(|c| c.is_ascii_digit())
+    {
+        return None;
     }
-    let int_t = int_part.trim_start_matches('0');
-    let frac_t = frac_part.trim_end_matches('0');
-    let mut out = String::new();
-    if neg {
-        out.push('-');
+    let sign = if neg { "-" } else { "" };
+    let digits: String = [int_part, frac_part].concat();
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(format!("{sign}0"));
     }
-    out.push_str(if int_t.is_empty() { "0" } else { int_t });
-    if !frac_t.is_empty() {
-        out.push('.');
-        out.push_str(frac_t);
-    }
-    out
+    let trimmed = digits.trim_end_matches('0');
+    let trailing = i64::try_from(digits.len() - trimmed.len()).ok()?;
+    let frac_len = i64::try_from(frac_part.len()).ok()?;
+    let exp = exp10.checked_sub(frac_len)?.checked_add(trailing)?;
+    Some(format!("{sign}{trimmed}e{exp}"))
 }
 
-/// 数値リテラル `raw` が f64 `v` へ値を変えずに往復できるか（最短往復表記との一致）。
-/// 指数表記など素の十進形でない入力は従来どおり f64 解釈のため忠実とみなす（台帳互換）。
+/// 数値リテラルの正規形を文字列で返す。解釈できない形は生テキストのまま返す。
+fn canonical_decimal_text(raw: &str) -> String {
+    canonical_decimal_parts(raw).unwrap_or_else(|| raw.to_string())
+}
+
+/// 数値リテラル `raw` が f64 `v` へ値を変えずに往復できるか。`v` の最短往復表記
+/// （`{:e}`。桁数に依らず指数形）と正確な十進値の正規形が一致するときのみ忠実とみなす。
+/// 平文十進・指数表記のどちらも同じ基準で判定する（Issue #1430 codex P1・Bugbot 指摘）。
+/// 非有限値・解釈不能な入力は忠実でない（呼び出し側が生テキスト系へ倒す）。
 fn number_literal_is_f64_faithful(raw: &str, v: f64) -> bool {
-    let body = raw.strip_prefix('-').unwrap_or(raw);
-    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
-    let plain = !int_part.is_empty()
-        && int_part.bytes().all(|c| c.is_ascii_digit())
-        && frac_part.bytes().all(|c| c.is_ascii_digit());
-    if !plain {
-        return true;
+    if !v.is_finite() {
+        return false;
     }
-    canonical_decimal_text(raw) == canonical_decimal_text(&format!("{v}"))
+    match (
+        canonical_decimal_parts(raw),
+        canonical_decimal_parts(&format!("{v:e}")),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
@@ -3652,6 +3669,17 @@ mod tests {
         assert_eq!(hash("1.0000000000000001"), hash("1.00000000000000010"));
         assert_eq!(hash("1.5"), hash("1.50"));
         assert_eq!(hash("1"), hash("1."));
+        // 指数表記も正確な十進値で判定する（f64 で別値になる指数表記は区別する）。
+        assert_ne!(hash("1.0000000000000001e0"), hash("1.0000000000000002e0"));
+        assert_ne!(hash("1.0000000000000001e0"), hash("1e0"));
+        assert_eq!(hash("1.0000000000000001e0"), hash("1.0000000000000001"));
+        // 1e-4 未満の小さな平文十進は従来どおりタグ 1（指数表記と同一ハッシュ）。
+        let mut small = HashInputBuilder::new(OpTag::Insert);
+        small.push_u8(1);
+        small.push_raw(&0.00001f64.to_bits().to_le_bytes());
+        assert_eq!(hash("0.00001"), small.finish());
+        assert_eq!(hash("0.00001"), hash("1e-5"));
+        assert_eq!(hash("100"), hash("1e2"));
         // 従来入力（f64 で往復できる）はタグ 1＋ビット列のまま。
         let mut b = HashInputBuilder::new(OpTag::Insert);
         b.push_u8(1);
