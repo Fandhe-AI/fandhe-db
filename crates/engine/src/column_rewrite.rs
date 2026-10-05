@@ -7,6 +7,10 @@
 //! `catalog::Storage::alter_table_alter_column_type` が呼び出し元の write txn 内で
 //! 本モジュールを呼び、全テナントの既存行を新スキーマで再エンコードする。
 //!
+//! PK／UNIQUE／FOREIGN KEY の構成列も対象になる（Issue #1402）。型タグ付きの索引
+//! （`user_uniq`・`key_index`）の失効は本モジュールの責務ではなく、呼び出し元の
+//! `alter_column_type_with` が同一 txn 内で行う。
+//!
 //! 契約（fail-closed）:
 //! - 書き換えるのは対象テーブルの行だけで、行キー `(tenant_id, id)`・tenant・
 //!   visibility・embedding は保存する（行の追加・削除・テナント移動は行わない）

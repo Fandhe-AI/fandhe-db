@@ -208,7 +208,7 @@ SQL-23・ERR-6・NOSQL-13）。
 - **判定順序**: 構文検証 → DDL 権限ゲート（`42501`）→ テーブル存在確認
   （`42P01`／`42809`）→（ALTER TYPE のみ）目標型解決 → engine の単一 write txn。
 - **エラー写像**: 列なし `42703`／VECTOR 列・保護列・最後の 1 列・NUMERIC 範囲不正・
-  未登録 ENUM `42601`／PK・UNIQUE・CHECK・FK 参照列 `2BP01`／非互換な型変更
+  未登録 ENUM `42601`／PK・UNIQUE・FK 参照列（DROP COLUMN のみ）・CHECK 参照列 `2BP01`／非互換な型変更
   `42804`／ロック待機超過 `55P03`。新しい `wire_code`・`ErrorClass` は追加しない。
 - **ALTER TYPE の engine 側**: `Storage::alter_table_alter_column_type`（crate 内部）が
   目標の precision/scale を受け取り、単一 write txn 内で判定する（表層で事前に読んだ
@@ -239,9 +239,13 @@ TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 
 - **原子性・fail-closed**: キーとヘッダの tenant 不整合・デコード／エンコード失敗
   （ペイロード上限超過を含む）は `CorruptSchema`（`XX000`、固定文言。tenant・id・値を含めない）
   で全体を中止し、commit しない（カタログ・行・世代に痕跡なし）。
-- **依存検査**: PK／UNIQUE／FOREIGN KEY の構成列は `DependentObjectsStillExist`（`2BP01`）で
-  拒否する（索引の正準キーが型ごとに異なり、古い索引が一意性・参照整合性検査をすり抜ける
-  のを避ける）。CHECK 参照列は従来どおり `2BP01`。NUMERIC 精度拡大の判定は不変。
+- **依存検査**: CHECK 参照列は従来どおり `2BP01`。NUMERIC 精度拡大の判定は不変。
+  PK／UNIQUE／FOREIGN KEY（参照元・参照先の両方）の構成列も受理する（Issue #1402。TABLE-19・
+  TABLE-17）。正準キーは型タグ付きで `INTEGER 5` と `BIGINT 5` が別バイト列になるため、
+  同一 write txn 内で永続一意索引 `user_uniq/{table}`（PK／UNIQUE 構成列のとき）と、変更列を
+  含む `key_index`（全テナント分。fwd／rev／登録簿）を失効させ、次の検査で新しい型により遅延
+  再構築する（DDL 内で全テナント分を一括構築しない）。参照元・参照先の型が食い違う FK は
+  [foreign-key.md](./foreign-key.md)「列型が食い違う FOREIGN KEY」のとおり境界でキーを読み替える。
 - **DEFAULT の実体化**: 再エンコードで、ADD COLUMN 前に書かれた行の欠落列は既定値で
   実体化される。`REAL DEFAULT 0.1` を DOUBLE へ拡大すると既存行は `f64::from(0.1f32)`、
   拡大後に列を省略した INSERT は `0.1f64` になる（観測可能な差としてテストで固定）。
@@ -250,7 +254,6 @@ TABLE-12）。物理フレーム幅が変わる（presence 1 + 4 → presence 1 
 
 ## スコープ外・後続 Issue
 
-- PK／UNIQUE／FOREIGN KEY 構成列の `INTEGER → BIGINT`（永続一意索引・キー索引の再構築が必要。現状は `2BP01`）
 - NoSQL 表層の `ALTER COLUMN ... TYPE` 相当
 - `DROP TABLE`（#902）・VIEW/FK/INDEX の依存検査（2BP01・#907〜#909）・
   明示トランザクション内の DDL（#942 系）

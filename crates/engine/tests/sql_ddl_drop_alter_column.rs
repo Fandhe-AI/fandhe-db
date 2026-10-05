@@ -614,7 +614,9 @@ fn alter_type_non_widening_numeric_changes_stay_42804_and_leave_data_intact() {
 }
 
 #[test]
-fn alter_type_widening_of_key_columns_is_rejected_with_2bp01() {
+fn alter_type_widening_of_key_columns_is_accepted() {
+    // Issue #1402: PK／UNIQUE／FK の構成列でも拡大変換を受理する（旧仕様は `2BP01`）。
+    // 参照整合性・一意性の詳細は `sql_alter_column_type_key_columns.rs` で検証する。
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
@@ -634,14 +636,8 @@ fn alter_type_widening_of_key_columns_is_rejected_with_2bp01() {
         "ALTER TABLE kp ALTER COLUMN k TYPE BIGINT",
         "ALTER TABLE kp ALTER COLUMN u TYPE BIGINT",
         "ALTER TABLE kc ALTER COLUMN ref TYPE BIGINT",
-    ] {
-        assert_eq!(code_of(&core, &mut session, sql), "2BP01", "{sql}");
-    }
-    // 制約に関与しない REAL 列は受理される。
-    run(
-        &core,
-        &mut session,
         "ALTER TABLE kp ALTER COLUMN f TYPE DOUBLE PRECISION",
-    )
-    .expect("widen non-key real");
+    ] {
+        run(&core, &mut session, sql).unwrap_or_else(|e| panic!("{sql} must succeed: {e:?}"));
+    }
 }

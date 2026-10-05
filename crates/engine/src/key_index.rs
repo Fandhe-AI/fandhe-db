@@ -623,6 +623,52 @@ pub(crate) fn prune_unneeded_indexes_in_txn(
     Ok(())
 }
 
+/// `table` の登録簿にある索引のうち、構成列に `column` を含むものを全テナント分
+/// 削除する（Issue #1402）。`ALTER COLUMN TYPE` の拡大変換（`INTEGER`→`BIGINT`）が
+/// PK・UNIQUE・FOREIGN KEY の構成列を書き換えると、索引キーの型タグが旧型のまま
+/// 残り、以後の照会が一致せず参照整合性検査をすり抜ける（fail-open）。呼び出し元
+/// （[`crate::catalog::Storage::alter_table_alter_column_type`] の同一 write txn）が
+/// 変更直後に呼び、次の検査で [`ensure_index_in_txn`] が新しい型で遅延再構築する。
+/// 構成列に `column` を含まない索引は触れない。fwd／rev の実テーブルと登録簿の
+/// 全テナント分のエントリを削除する（[`prune_unneeded_indexes_in_txn`] の
+/// 列名指定版）。
+pub(crate) fn drop_indexes_containing_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    column: &str,
+) -> Result<(), CatalogError> {
+    let entries = registry_entries_for_table(write_txn, table)?;
+    let stale: BTreeSet<&str> = entries
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| {
+            columns_from_index_name(name).is_some_and(|cols| cols.iter().any(|c| c == column))
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    for name in &stale {
+        let fwd_name = fwd_table_name(table, name);
+        let rev_name = rev_table_name(table, name);
+        match write_txn.delete_table(fwd_table_def(&fwd_name)) {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match write_txn.delete_table(rev_table_def(&rev_name)) {
+            Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut reg = write_txn.open_table(REGISTRY_TABLE)?;
+    for (name, tenant) in &entries {
+        if stale.contains(name.as_str()) {
+            reg.remove((table, name.as_str(), tenant.as_str()))?;
+        }
+    }
+    Ok(())
+}
+
 /// `columns`（`schema` の生存列名）に対応する索引を、テナント `tenant_id` の
 /// 現在行から構築し、そのテナントに限り登録簿へ登録する（未登録の索引を
 /// フォールバック走査で判定した直後に呼ぶ「初回だけそのテナント分を走査する」

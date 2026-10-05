@@ -1233,6 +1233,185 @@ fn push_required_key(
     Ok(())
 }
 
+/// 参照元・参照先で列型が異なる組（`ALTER COLUMN TYPE` の `INTEGER`→`BIGINT` 拡大が
+/// 片側だけに適用された状態。Issue #1402）の正準キーバイト列を、`source` 側の型の
+/// 表現から `target` 側の型の表現へ読み替える。
+///
+/// 正準キーは型タグ付きのため `INTEGER 5` と `BIGINT 5` は別のバイト列になる。
+/// 参照元・参照先の境界（子のキーで親の索引を引く・親の失われたキーで子の索引を引く）
+/// でこの読み替えを行わないと、同じ値が一致せず参照整合性検査が素通りする
+/// （fail-open）か誤検知になる。
+///
+/// - 位置ごとに型が等しい成分はそのままコピーする（型が全位置で等しければ入力を
+///   そのまま返す高速経路）。
+/// - `INTEGER`／`BIGINT` 同士の成分は値を保って再エンコードする。`target` の値域に
+///   収まらない値は `Ok(None)`（その列にその値を持つ行は構造的に存在し得ない）。
+/// - 上記以外の型の組・成分数や長さの不整合・末尾の余りは内部矛盾として `Err`
+///   （fail-closed）。`REAL`／`DOUBLE PRECISION` は FK 列になれないため対象外。
+pub(crate) fn recode_key_for_types(
+    key: &[u8],
+    source: &[&ColumnType],
+    target: &[&ColumnType],
+) -> Result<Option<Vec<u8>>, &'static str> {
+    if source.len() != target.len() {
+        return Err("foreign key column count mismatch while recoding a key");
+    }
+    if source == target {
+        return Ok(Some(key.to_vec()));
+    }
+    let mut out = Vec::with_capacity(key.len());
+    let mut pos = 0usize;
+    for (src, dst) in source.iter().zip(target.iter()) {
+        let tag = *key.get(pos).ok_or("truncated canonical key component")?;
+        let len_start = pos.checked_add(1).ok_or("canonical key offset overflow")?;
+        let len_end = len_start
+            .checked_add(4)
+            .ok_or("canonical key offset overflow")?;
+        let len_bytes: [u8; 4] = key
+            .get(len_start..len_end)
+            .and_then(|b| b.try_into().ok())
+            .ok_or("truncated canonical key component length")?;
+        let len = usize::try_from(u32::from_be_bytes(len_bytes))
+            .map_err(|_| "canonical key component length overflow")?;
+        let payload_end = len_end
+            .checked_add(len)
+            .ok_or("canonical key offset overflow")?;
+        let payload = key
+            .get(len_end..payload_end)
+            .ok_or("canonical key component exceeds the key length")?;
+        let component = key
+            .get(pos..payload_end)
+            .ok_or("canonical key component exceeds the key length")?;
+        pos = payload_end;
+        if src == dst {
+            out.extend_from_slice(component);
+            continue;
+        }
+        let both_integer = matches!(src, ColumnType::Integer | ColumnType::BigInt)
+            && matches!(dst, ColumnType::Integer | ColumnType::BigInt);
+        if !both_integer || tag != src.unique_key_tag() {
+            return Err("foreign key columns have incompatible key types");
+        }
+        let value: i64 = match src {
+            ColumnType::Integer => {
+                let raw: [u8; 4] = payload
+                    .try_into()
+                    .map_err(|_| "INTEGER key component has an unexpected length")?;
+                i64::from(i32::from_be_bytes(raw))
+            }
+            _ => {
+                let raw: [u8; 8] = payload
+                    .try_into()
+                    .map_err(|_| "BIGINT key component has an unexpected length")?;
+                i64::from_be_bytes(raw)
+            }
+        };
+        let scalar = match dst {
+            ColumnType::Integer => match i32::try_from(value) {
+                Ok(v) => ScalarRef::Integer(v),
+                Err(_) => return Ok(None),
+            },
+            _ => ScalarRef::BigInt(value),
+        };
+        push_canonical_component(&mut out, scalar)?;
+    }
+    if pos != key.len() {
+        return Err("trailing bytes after the last canonical key component");
+    }
+    Ok(Some(out))
+}
+
+/// 1 個の `FOREIGN KEY` について、参照元列・参照先列の型の並びを保持し、
+/// 境界をまたぐ正準キーの読み替え（[`recode_key_for_types`]）を提供する
+/// （Issue #1402）。`id` 参照は参照元列の型でそのままエンコードされ参照先に
+/// 型の概念がないため、常に恒等として扱う。
+struct FkKeyRecoder<'a> {
+    child: Vec<&'a ColumnType>,
+    parent: Vec<&'a ColumnType>,
+    identical: bool,
+}
+
+impl<'a> FkKeyRecoder<'a> {
+    fn new(
+        child_schema: &'a TableSchema,
+        parent_schema: &'a TableSchema,
+        fk: &ForeignKeyDef,
+    ) -> Result<Self, TenantWriteError> {
+        if fk.references_parent_id() {
+            return Ok(Self {
+                child: Vec::new(),
+                parent: Vec::new(),
+                identical: true,
+            });
+        }
+        let lookup = |schema: &'a TableSchema,
+                      names: &[String]|
+         -> Result<Vec<&'a ColumnType>, TenantWriteError> {
+            names
+                .iter()
+                .map(|name| {
+                    schema
+                        .columns
+                        .iter()
+                        .find(|c| &c.name == name)
+                        .map(|c| &c.ty)
+                        .ok_or_else(|| internal("foreign key column not found in live schema"))
+                })
+                .collect()
+        };
+        let child = lookup(child_schema, fk.columns())?;
+        let parent = lookup(parent_schema, fk.parent_columns())?;
+        let identical = child == parent;
+        Ok(Self {
+            child,
+            parent,
+            identical,
+        })
+    }
+
+    /// 参照元の型で作ったキーを参照先の型の表現へ読み替える。参照先の列に
+    /// 収まらない値は `None`。
+    fn child_to_parent(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, TenantWriteError> {
+        if self.identical {
+            return Ok(Some(key));
+        }
+        recode_key_for_types(&key, &self.child, &self.parent).map_err(internal)
+    }
+
+    /// 参照先の型で作ったキーを参照元の型の表現へ読み替える。参照元の列に
+    /// 収まらない値は `None`（その値を持つ子行は存在し得ない）。
+    fn parent_to_child(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, TenantWriteError> {
+        if self.identical {
+            return Ok(Some(key));
+        }
+        recode_key_for_types(&key, &self.parent, &self.child).map_err(internal)
+    }
+
+    /// 参照先の値（ON UPDATE CASCADE の新キー値）を参照元列の型へ合わせる。
+    /// 参照元の列に収まらない値は fail-closed で `ForeignKeyViolation`
+    /// （専用の `22003` variant は公開 enum の破壊的変更になるためスコープ外）。
+    fn coerce_parent_values_to_child(
+        &self,
+        values: Vec<crate::row_codec::Value>,
+    ) -> Result<Vec<crate::row_codec::Value>, TenantWriteError> {
+        use crate::row_codec::Value;
+        if self.identical {
+            return Ok(values);
+        }
+        values
+            .into_iter()
+            .zip(self.child.iter())
+            .map(|(value, child_ty)| match (value, child_ty) {
+                (Value::Integer(v), ColumnType::BigInt) => Ok(Value::BigInt(i64::from(v))),
+                (Value::BigInt(v), ColumnType::Integer) => i32::try_from(v)
+                    .map(Value::Integer)
+                    .map_err(|_| TenantWriteError::ForeignKeyViolation),
+                (other, _) => Ok(other),
+            })
+            .collect()
+    }
+}
+
 /// 参照先テーブル `parent_table`（スキーマ `parent_schema`）の**同一テナントの
 /// 全行**（可視性を問わない。RLS-10 (c)）に、`required` の値の組がすべて存在する
 /// ことを確かめる（TABLE-17・TASK-205、Issue #907）。1 つでも欠ければ
@@ -1256,6 +1435,7 @@ fn verify_required_parent_keys(
     write_txn: &redb::WriteTransaction,
     parent_table: &str,
     parent_schema: &TableSchema,
+    child_schema: &TableSchema,
     fk: &ForeignKeyDef,
     tenant_id: &str,
     required: RequiredParentKeys,
@@ -1291,7 +1471,20 @@ fn verify_required_parent_keys(
             }
             Ok(())
         }
-        RequiredParentKeys::Keys(pending) => {
+        RequiredParentKeys::Keys(child_pending) => {
+            // 参照元と参照先で列型が異なる組（Issue #1402）は、参照元の型で作った
+            // キーを参照先の型へ読み替えてから照会する。参照先の列に収まらない値は
+            // 参照先に存在し得ないため違反。
+            let recoder = FkKeyRecoder::new(child_schema, parent_schema, fk)?;
+            let mut pending: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for key in child_pending {
+                match recoder.child_to_parent(key)? {
+                    Some(recoded) => {
+                        pending.insert(recoded);
+                    }
+                    None => return Err(TenantWriteError::ForeignKeyViolation),
+                }
+            }
             let columns = fk.parent_columns().to_vec();
             match crate::key_index::all_keys_exist_in_txn(
                 write_txn,
@@ -1466,6 +1659,7 @@ fn enforce_foreign_keys_in_txn(
             write_txn,
             spec.fk.parent_table(),
             parent.as_ref().unwrap_or(schema),
+            schema,
             spec.fk,
             tenant_id,
             req,
@@ -1860,7 +2054,15 @@ fn enforce_referencing_rows_by_scan_for_fk(
             push_required_key(spec, &values, &mut required)?;
         }
     }
-    verify_required_parent_keys(write_txn, table_name, schema, fk, tenant_id, required)
+    verify_required_parent_keys(
+        write_txn,
+        table_name,
+        schema,
+        child_schema,
+        fk,
+        tenant_id,
+        required,
+    )
 }
 
 /// `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY`
@@ -2156,7 +2358,18 @@ pub(crate) fn enforce_referencing_rows_in_txn(
             // 指摘・docs/design/foreign-key.md 参照）。
             None
         } else {
-            let lost = delta.lost_keys(fk.parent_columns());
+            let lost_parent = delta.lost_keys(fk.parent_columns());
+            // 失われたキーは参照先の型の表現。子の索引は子の型で作られているため、
+            // 列型が異なる組（Issue #1402）は子の型へ読み替えて照会する（読み替えを
+            // 省くと型タグ違いで一致せず、参照中の親行の削除が通る fail-open）。
+            // 子の列に収まらない値は子行が持ち得ないため捨てる。
+            let recoder = FkKeyRecoder::new(child_schema, schema, fk)?;
+            let mut lost: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for key in lost_parent {
+                if let Some(recoded) = recoder.parent_to_child(key)? {
+                    lost.insert(recoded);
+                }
+            }
             if lost.is_empty() {
                 Some(())
             } else {
@@ -2596,6 +2809,9 @@ fn collect_action_targets(
     action: ReferentialAction,
     remaining_budget: u32,
 ) -> Result<ActionTargets, TenantWriteError> {
+    // 参照元と参照先で列型が異なる組（Issue #1402）では、親の型で組んだキーと子の
+    // 走査が返す子の型のキーを混ぜて照合しないよう、境界で読み替える。
+    let recoder = FkKeyRecoder::new(child_schema, parent_schema, fk)?;
     match change {
         PropagatedChange::Removed => {
             if let Some(pre) = pre_images {
@@ -2688,12 +2904,31 @@ fn collect_action_targets(
                 if wanted_keys.is_empty() {
                     return Ok(Vec::new());
                 }
+                // 子の走査は子の型のキーで照合する。子の列に収まらない値を持つ子行は
+                // 存在し得ないため対象から外す。
+                let mut wanted_child_keys: HashSet<ChildKey> =
+                    HashSet::with_capacity(wanted_keys.len());
+                for key in wanted_keys {
+                    match key {
+                        ChildKey::Bytes(bytes) => {
+                            if let Some(recoded) = recoder.parent_to_child(bytes)? {
+                                wanted_child_keys.insert(ChildKey::Bytes(recoded));
+                            }
+                        }
+                        other => {
+                            wanted_child_keys.insert(other);
+                        }
+                    }
+                }
+                if wanted_child_keys.is_empty() {
+                    return Ok(Vec::new());
+                }
                 let child_rows = scan_child_fk_rows_for_keys(
                     write_txn,
                     child_schema,
                     fk,
                     tenant_id,
-                    Some(&wanted_keys),
+                    Some(&wanted_child_keys),
                     remaining_budget,
                 )?;
                 let mut out = Vec::new();
@@ -2748,9 +2983,14 @@ fn collect_action_targets(
             for (key, ids) in child_rows {
                 let exists = match &key {
                     ChildKey::Id(id) => parent_row_exists(write_txn, parent_table, tenant_id, *id)?,
-                    ChildKey::Bytes(bytes) => present_keys
-                        .as_ref()
-                        .is_some_and(|present| present.contains(bytes)),
+                    // 子の型のキーを親の型へ読み替えて照合する（親の列に収まらない
+                    // 値は親に存在しない）。
+                    ChildKey::Bytes(bytes) => match recoder.child_to_parent(bytes.clone())? {
+                        Some(parent_key) => present_keys
+                            .as_ref()
+                            .is_some_and(|present| present.contains(&parent_key)),
+                        None => false,
+                    },
                 };
                 if !exists {
                     for id in ids {
@@ -2805,14 +3045,16 @@ fn collect_action_targets(
                     if matches!(action, ReferentialAction::Cascade) {
                         match &new_values {
                             Some(values) => Some(
-                                parent_indices
-                                    .iter()
-                                    .map(|&idx| {
-                                        values.get(idx).cloned().ok_or_else(|| {
-                                            internal("parent row value index out of range")
+                                recoder.coerce_parent_values_to_child(
+                                    parent_indices
+                                        .iter()
+                                        .map(|&idx| {
+                                            values.get(idx).cloned().ok_or_else(|| {
+                                                internal("parent row value index out of range")
+                                            })
                                         })
-                                    })
-                                    .collect::<Result<_, _>>()?,
+                                        .collect::<Result<_, _>>()?,
+                                )?,
                             ),
                             // 親行自体が同一トランザクション内で削除された（先に
                             // ON DELETE 連鎖が走った等）。ON UPDATE CASCADE の
@@ -2822,6 +3064,15 @@ fn collect_action_targets(
                     } else {
                         None
                     };
+                // 子の走査・突合せは子の型のキーで行う（子の列に収まらない旧キーを
+                // 持つ子行は存在し得ないため対象外）。
+                let old_key = match old_key {
+                    ChildKey::Bytes(bytes) => match recoder.parent_to_child(bytes)? {
+                        Some(recoded) => ChildKey::Bytes(recoded),
+                        None => continue,
+                    },
+                    other => other,
+                };
                 wanted.insert(old_key, new_key_values);
             }
             if wanted.is_empty() {
@@ -4214,6 +4465,71 @@ mod tests {
             pre_images.old_values.get(&1),
             Some(&vec![Value::Text("original".to_string())]),
             "2 回目以降の record は最初の値を上書きしてはならない"
+        );
+    }
+
+    // ---- recode_key_for_types（Issue #1402） ----
+
+    fn canon(parts: &[ScalarRef<'_>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in parts {
+            push_canonical_component(&mut out, *p).expect("encode");
+        }
+        out
+    }
+
+    #[test]
+    fn recode_is_identity_for_equal_types() {
+        let key = canon(&[ScalarRef::Text("a"), ScalarRef::Integer(7)]);
+        let tys = [&ColumnType::Text, &ColumnType::Integer];
+        assert_eq!(
+            recode_key_for_types(&key, &tys, &tys),
+            Ok(Some(key.clone()))
+        );
+    }
+
+    #[test]
+    fn recode_integer_bigint_round_trip_and_range() {
+        let int = canon(&[ScalarRef::Text("a"), ScalarRef::Integer(-5)]);
+        let big = canon(&[ScalarRef::Text("a"), ScalarRef::BigInt(-5)]);
+        let src = [&ColumnType::Text, &ColumnType::Integer];
+        let dst = [&ColumnType::Text, &ColumnType::BigInt];
+        assert_eq!(
+            recode_key_for_types(&int, &src, &dst),
+            Ok(Some(big.clone()))
+        );
+        assert_eq!(recode_key_for_types(&big, &dst, &src), Ok(Some(int)));
+        let wide = canon(&[
+            ScalarRef::Text("a"),
+            ScalarRef::BigInt(i64::from(i32::MAX) + 1),
+        ]);
+        assert_eq!(recode_key_for_types(&wide, &dst, &src), Ok(None));
+    }
+
+    #[test]
+    fn recode_rejects_malformed_or_mismatched_keys() {
+        let src = [&ColumnType::Integer];
+        let dst = [&ColumnType::BigInt];
+        let good = canon(&[ScalarRef::Integer(1)]);
+        // 末尾の余り
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(recode_key_for_types(&trailing, &src, &dst).is_err());
+        // 切り詰め・長さ破損
+        assert!(recode_key_for_types(&good[..good.len() - 1], &src, &dst).is_err());
+        assert!(recode_key_for_types(&[], &src, &dst).is_err());
+        let mut bad_len = good.clone();
+        bad_len[4] = 0xFF;
+        assert!(recode_key_for_types(&bad_len, &src, &dst).is_err());
+        // タグと型の不一致（BIGINT のキーを INTEGER として読む）
+        let big = canon(&[ScalarRef::BigInt(1)]);
+        assert!(recode_key_for_types(&big, &src, &dst).is_err());
+        // 整数以外の型の組・成分数不一致
+        assert!(
+            recode_key_for_types(&good, &[&ColumnType::Integer], &[&ColumnType::Text]).is_err()
+        );
+        assert!(
+            recode_key_for_types(&good, &src, &[&ColumnType::BigInt, &ColumnType::BigInt]).is_err()
         );
     }
 }
