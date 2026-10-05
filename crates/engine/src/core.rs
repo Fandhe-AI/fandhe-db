@@ -3751,7 +3751,7 @@ impl EngineCore {
                 match resolved.split_first() {
                     None => PreparedParamType::Text,
                     Some((first, rest)) => {
-                        // 同一種別（Integer／Boolean）の数値・真偽値スロットは列名・
+                        // 同一種別（Integer／Float／Boolean）の数値・真偽値スロットは列名・
                         // 型が異なっても統合する（`n = $1 AND m = $1` で Text へ
                         // 後退させない。PR #1372 レビュー指摘）。
                         let first_kind = first.literal_kind();

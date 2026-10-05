@@ -63,8 +63,8 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         Box::new(CpuScalarProvider),
     ));
     let sql = format!(
-        "INSERT INTO t (id, embedding, n, b, flag, blob, uid) VALUES \
-         (1, '[1,0]', 7, 9000000000, true, '\\x00ff10', '{UID_TEXT}') USING OPERATION_ID 'seed-1'"
+        "INSERT INTO t (id, embedding, n, b, r, d, flag, blob, uid) VALUES \
+         (1, '[1,0]', 7, 9000000000, 0.25, 1.5, true, '\\x00ff10', '{UID_TEXT}') USING OPERATION_ID 'seed-1'"
     );
     let mut session = engine::sql::mode::SessionState::default();
     core.execute_sql_in_session(
@@ -352,8 +352,9 @@ fn binary_equals_text_for_integer_bool_bytea_uuid() {
 fn binary_float_matches_text_outcome() {
     let (core, _g) = new_core();
     let mut s = connect(spawn(core), "alice");
-    // 現状の engine は REAL／DOUBLE 列への文字列リテラルを拒否する（型付き束縛は
-    // 別 Issue）。バイナリは同じ SQLSTATE（または同じ結果）になることを固定する。
+    let rows_of = |o: &Outcome| o.as_ref().expect("query ok").0.len();
+    // Issue #1406: REAL／DOUBLE は型付き束縛が成立するため、バイナリはテキスト形式と
+    // 同一の結果になることに加え、挿入済みの行が実際にヒットすることを固定する。
     let text = query(
         &mut s,
         "SELECT id FROM t WHERE d = $1 LIMIT 5",
@@ -369,6 +370,7 @@ fn binary_float_matches_text_outcome() {
         &[Some(&1.5f64.to_be_bytes())],
     );
     assert_eq!(text, bin);
+    assert_eq!(rows_of(&bin), 1);
     let text = query(
         &mut s,
         "SELECT id FROM t WHERE r = $1 LIMIT 5",
@@ -384,6 +386,7 @@ fn binary_float_matches_text_outcome() {
         &[Some(&0.25f32.to_be_bytes())],
     );
     assert_eq!(text, bin);
+    assert_eq!(rows_of(&bin), 1);
     // 長さ不正は宣言が許容する型に対して 08P01。
     let o = query(
         &mut s,

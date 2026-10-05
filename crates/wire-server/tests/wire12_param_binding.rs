@@ -53,6 +53,29 @@ fn open_storage() -> (Storage, temp_db::CleanupGuard) {
             ],
         ))
         .expect("create table");
+    // Issue #1406: REAL・DOUBLE・NUMERIC・DATE・TIMESTAMP・UUID・BYTEA 列の型付き束縛用。
+    storage
+        .create_table(&TableSchema::new(
+            "seven",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new(
+                    "num",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("dt", ColumnType::Date, true),
+                ColumnDef::new("ts", ColumnType::Timestamp, true),
+                ColumnDef::new("u", ColumnType::Uuid, true),
+                ColumnDef::new("bin", ColumnType::Bytea, true),
+            ],
+        ))
+        .expect("create table");
     (storage, guard)
 }
 
@@ -875,4 +898,167 @@ fn typed_slots_reject_malformed_values_with_22p02_and_decode_binary_per_wire14()
     send_pbes_expect_error(&mut s, bool_sql, &[], &[1], &[Some(b"tt")], "08P01");
     // id スロットは宣言 0（実効 numeric）のバイナリを引き続き 0A000 で拒否する。
     send_pbes_expect_error(&mut s, id_sql, &[], &[1], &[Some(b"1")], "0A000");
+}
+
+// --- 型付き束縛（Issue #1406・WIRE-12・WIRE-14）: 7 型の列位置 -----------------
+
+#[test]
+fn seven_type_slots_report_column_oids() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core), "alice");
+    for (col, oid) in [
+        ("r", 700),
+        ("d", 701),
+        ("num", 1700),
+        ("dt", 1082),
+        ("ts", 1114),
+        ("u", 2950),
+        ("bin", 17),
+    ] {
+        assert_eq!(
+            describe_statement_oids(
+                &mut s,
+                &format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5"),
+                &[]
+            ),
+            vec![oid],
+            "WHERE {col}"
+        );
+        assert_eq!(
+            describe_statement_oids(
+                &mut s,
+                &format!(
+                    "INSERT INTO seven (id, embedding, {col}) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID 'x'"
+                ),
+                &[]
+            ),
+            vec![1700, oid],
+            "INSERT {col}"
+        );
+    }
+}
+
+#[test]
+fn seven_type_text_binding_matches_literal_form_and_tenant_boundary_holds() {
+    let (core, _g) = new_core();
+    let addr = spawn(core);
+    let mut alice = connect(addr, "alice");
+    let mut alice_simple = connect(addr, "alice");
+    let mut bob = connect(addr, "bob");
+
+    let values: [(&str, &str); 7] = [
+        ("r", "1.5"),
+        ("d", "2.25"),
+        ("num", "3.14"),
+        ("dt", "2026-01-02"),
+        ("ts", "2026-01-02 03:04:05"),
+        ("u", "123e4567-e89b-12d3-a456-426614174000"),
+        ("bin", "\\x0102"),
+    ];
+    for (i, (col, val)) in values.iter().enumerate() {
+        let id = (i + 1).to_string();
+        let op = format!("seven-op-{i}");
+        let (_, tag) = run_extended(
+            &mut alice,
+            &format!(
+                "INSERT INTO seven (id, embedding, {col}) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3"
+            ),
+            &[],
+            &[Some(id.as_bytes()), Some(val.as_bytes()), Some(op.as_bytes())],
+        );
+        assert_eq!(tag, "INSERT 0 1", "{col}");
+        let lit = if matches!(*col, "r" | "d") {
+            (*val).to_string()
+        } else {
+            format!("'{val}'")
+        };
+        let got = run_extended(
+            &mut alice,
+            &format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5"),
+            &[],
+            &[Some(val.as_bytes())],
+        );
+        let want = run_simple(
+            &mut alice_simple,
+            &format!("SELECT id FROM seven WHERE {col} = {lit} LIMIT 5"),
+        );
+        assert_eq!(got, want, "{col}");
+        assert_eq!(got.0.len(), 1, "{col} must hit the inserted row");
+        // 他テナントには束縛値でも見えない。
+        let other = run_extended(
+            &mut bob,
+            &format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5"),
+            &[],
+            &[Some(val.as_bytes())],
+        );
+        assert!(other.0.is_empty(), "{col}");
+    }
+}
+
+#[test]
+fn seven_type_malformed_values_and_binary_per_wire14() {
+    let (core, _g) = new_core();
+    let mut s = connect(spawn(core), "alice");
+    let sel = |col: &str| format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5");
+
+    for (col, bad, code) in [
+        ("r", &b"abc"[..], "22P02"),
+        ("r", b"+1.5", "22P02"),
+        ("r", b"1.5 OR 1=1", "22P02"),
+        ("d", b"NaN", "22P02"),
+        ("d", b"Infinity", "22P02"),
+        ("num", b"abc", "22P02"),
+        ("u", b"zz", "22P02"),
+        ("bin", b"abc", "22P02"),
+        ("dt", b"abc", "22007"),
+        ("dt", b"2026-13-02", "22008"),
+        ("ts", b"abc", "22007"),
+    ] {
+        send_pbes_expect_error(&mut s, &sel(col), &[], &[], &[Some(bad)], code);
+    }
+
+    // バイナリ: REAL・DOUBLE・UUID・BYTEA はテキスト形式と同一結果。
+    let uid = "123e4567-e89b-12d3-a456-426614174000";
+    let uid_bin: Vec<u8> = (0..16)
+        .map(|i| u8::from_str_radix(&uid.replace('-', "")[i * 2..i * 2 + 2], 16).expect("hex"))
+        .collect();
+    for (idx, (col, text, bin)) in [
+        ("r", b"1.5".to_vec(), 1.5f32.to_be_bytes().to_vec()),
+        ("d", b"2.25".to_vec(), 2.25f64.to_be_bytes().to_vec()),
+        ("u", uid.as_bytes().to_vec(), uid_bin),
+        ("bin", b"\\x0102".to_vec(), vec![1u8, 2]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = (90 + idx).to_string();
+        let ins = format!(
+            "INSERT INTO seven (id, embedding, {col}) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3"
+        );
+        let op = format!("bin-op-{col}");
+        let (_, tag) = run_extended(
+            &mut s,
+            &ins,
+            &[0, 0, 0],
+            &[Some(id.as_bytes()), Some(&text), Some(op.as_bytes())],
+        );
+        assert_eq!(tag, "INSERT 0 1", "{col}");
+        let t = run_extended(&mut s, &sel(col), &[0], &[Some(&text)]);
+        let b = run_extended(&mut s, &sel(col), &[1], &[Some(&bin)]);
+        assert_eq!(t, b, "{col} binary == text");
+        assert_eq!(b.0.len(), 1, "{col} binary must hit");
+    }
+    // バイナリ NaN はリテラル形でも表現不能のため 22P02。
+    send_pbes_expect_error(
+        &mut s,
+        &sel("d"),
+        &[],
+        &[1],
+        &[Some(&f64::NAN.to_be_bytes())],
+        "22P02",
+    );
+    // NUMERIC・DATE・TIMESTAMP のバイナリは WIRE-14 どおり 0A000（接続は維持）。
+    for col in ["num", "dt", "ts"] {
+        send_pbes_expect_error(&mut s, &sel(col), &[], &[1], &[Some(b"1")], "0A000");
+    }
 }

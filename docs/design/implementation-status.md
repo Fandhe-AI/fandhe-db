@@ -614,3 +614,10 @@ Issue #1364（fix(engine)!: 名前付きの主キーを受理し、主キーの�
 - **対象外**: 投影位置の内側に入れ子になった WHERE スカラーサブクエリの行数エラーは、外側 0 行でも即時に返る既存挙動のまま。式の内側に置いたスカラーサブクエリは引き続き `42601`。
 
 Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。TABLE-14・ERR-6 ポインタ）: `sql::ddl::map_create_type_error` の `TypeAlreadyExists` 写像を `42P07`（`DuplicateTable`）から新設 `SqlSurfaceError::DuplicateType`（`ErrorClass::DuplicateObject`・`42710`）へ変更。HTTP 射影は 400（型 DDL は SQL 表層専用で NoSQL から到達不能）。テーブル・ビュー・索引・UNIQUE 制約名の `42P07` は不変、副作用ゼロ・RLS・fail-closed は不変。テスト: `sql_enum_type_ddl.rs`・`wire_create_type.rs` 更新と回帰テスト追加。対象外: 型数上限超過の `42601`、ENUM 型名とテーブル名の名前空間共有。BREAKING CHANGE: 型名重複の SQLSTATE 変更、公開 enum `SqlSurfaceError` への variant 追加。依存追加なし・`unsafe` なし。
+
+## Issue #1406: REAL・DOUBLE・NUMERIC・DATE・TIMESTAMP・UUID・BYTEA 列の `$n` を型付きで束縛する
+
+- **対象ビヘイビア**: WIRE-12（関連: WIRE-13・WIRE-14・TASK-217/218）。
+- **変更箇所**: `crates/engine/src/sql/params.rs`（`ParamLiteralKind::Float` 追加。`REAL`・`DOUBLE` を `Number` トークンで置換）、`crates/engine/src/sql/lexer.rs`（`is_single_number_literal`）、テスト（`prepared_params.rs`・`wire12_param_binding.rs`・`wire14_binary_params.rs`）、`docs/design/wire-extended-query-param-binding.md`。
+- **性質**: `NUMERIC`・`DATE`・`TIMESTAMP`・`UUID`・`BYTEA` は String 種別のまま既存の列型別束縛で成立しており、テストでリテラル同値性・型 OID・エラーコードを固定（`DATE`・`TIMESTAMP` の形式不正はリテラル形と同一の `22007`／`22008`）。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: 式項の単項マイナス（`WHERE <数値列> = -N` の `42601`）、大きな絶対値の浮動小数 `WHERE` 比較の `22003`、`NaN`／`Infinity` 入力、`NUMERIC`／`DATE`／`TIMESTAMP` のバイナリ受信、追加のプレースホルダ位置・NULL パラメータ。

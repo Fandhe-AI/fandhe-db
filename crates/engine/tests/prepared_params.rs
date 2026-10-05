@@ -703,7 +703,8 @@ fn bind_prepared_enum_where_equality_rejects_invalid_label_after_bind() {
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_enum_documents_table(&path);
     let ctx =
-        PolicyContext::with_visibilities("tenant-a", [Visibility::Public]).expect("valid tenant");
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
     let mut session = SessionState::default();
 
     let prepared = core
@@ -1281,4 +1282,309 @@ fn typed_bind_executes_with_rls_boundary() {
     assert_eq!(rows(&ctx_a, &mut session, by_flag, "f"), 0);
     assert_eq!(rows(&ctx_b, &mut session, by_id, "1"), 0);
     assert_eq!(rows(&ctx_b, &mut session, by_flag, "t"), 0);
+}
+// --- 型付き束縛（Issue #1406・WIRE-12）: REAL・DOUBLE・NUMERIC・DATE・TIMESTAMP・UUID・BYTEA ---
+
+/// 7 型の列（`r REAL`・`d DOUBLE`・`num NUMERIC`・`dt DATE`・`ts TIMESTAMP`・`u UUID`・
+/// `bin BYTEA`）を持つ表。
+fn new_core_with_seven_type_table(path: &std::path::Path) -> EngineCore {
+    let storage = Storage::open(path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "seven",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new(
+                    "num",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("dt", ColumnType::Date, true),
+                ColumnDef::new("ts", ColumnType::Timestamp, true),
+                ColumnDef::new("u", ColumnType::Uuid, true),
+                ColumnDef::new("bin", ColumnType::Bytea, true),
+            ],
+        ))
+        .expect("create table");
+    EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+}
+
+fn seven_ctx() -> PolicyContext {
+    PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+#[test]
+fn typed_float_param_types_are_column_types() {
+    use engine::sql::exec::ColumnMeta;
+    use engine::sql::params::PreparedParamType;
+    let path = unique_db_path("prepared-seven-types");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_seven_type_table(&path);
+    let ty_of = |sql: &str| {
+        core.parse_sql_prepared(sql)
+            .expect("parse")
+            .param_types()
+            .to_vec()
+    };
+    for (col, ty) in [
+        ("r", ColumnType::Real),
+        ("d", ColumnType::Double),
+        ("dt", ColumnType::Date),
+        ("ts", ColumnType::Timestamp),
+        ("u", ColumnType::Uuid),
+        ("bin", ColumnType::Bytea),
+    ] {
+        assert_eq!(
+            ty_of(&format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5")),
+            vec![PreparedParamType::Column(ColumnMeta::Scalar {
+                name: col.to_string(),
+                ty,
+            })],
+            "{col}"
+        );
+    }
+    // 同一 `$n` が REAL と DOUBLE に現れても Float 種別で統合され束縛できる。
+    assert_bind_matches_literal(
+        &core,
+        "SELECT id FROM seven WHERE r = $1 AND d = $1 LIMIT 5",
+        &["1.5"],
+        "SELECT id FROM seven WHERE r = 1.5 AND d = 1.5 LIMIT 5",
+    );
+}
+
+#[test]
+fn typed_float_bind_matches_literal_form_and_executes() {
+    let path = unique_db_path("prepared-float-parity");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_seven_type_table(&path);
+    let ctx = seven_ctx();
+    let mut session = SessionState::default();
+
+    for (i, v) in ["1.5", "0.25", "2.25", "1.5e3"].iter().enumerate() {
+        assert_bind_matches_literal(
+            &core,
+            "SELECT id FROM seven WHERE r = $1 LIMIT 5",
+            &[v],
+            &format!("SELECT id FROM seven WHERE r = {v} LIMIT 5"),
+        );
+        assert_bind_matches_literal(
+            &core,
+            "SELECT id FROM seven WHERE d = $1 LIMIT 5",
+            &[v],
+            &format!("SELECT id FROM seven WHERE d = {v} LIMIT 5"),
+        );
+        let template = "INSERT INTO seven (id, embedding, r, d) VALUES ($1, '[0.1,0.2,0.3]', $2, $3) USING OPERATION_ID $4";
+        let id = (i + 1).to_string();
+        let op = format!("op-{i}");
+        assert_bind_matches_literal(
+            &core,
+            template,
+            &[&id, v, v, &op],
+            &format!(
+                "INSERT INTO seven (id, embedding, r, d) VALUES ({id}, '[0.1,0.2,0.3]', {v}, {v}) USING OPERATION_ID '{op}'"
+            ),
+        );
+        let prepared = core.parse_sql_prepared(template).expect("parse");
+        let bound = core
+            .bind_prepared(&prepared, &[some(&id), some(v), some(v), some(&op)])
+            .expect("bind");
+        core.execute_parsed_in_session(&ctx, &mut session, &bound)
+            .expect("insert should succeed");
+    }
+    let count = |sql: &str, v: &str| {
+        let prepared = core.parse_sql_prepared(sql).expect("parse");
+        let bound = core.bind_prepared(&prepared, &[some(v)]).expect("bind");
+        match core
+            .execute_parsed_in_session(&ctx, &mut SessionState::default(), &bound)
+            .expect("execute")
+        {
+            SqlOutcome::Query(result) => result.rows.len(),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    };
+    assert_eq!(count("SELECT id FROM seven WHERE r = $1 LIMIT 5", "1.5"), 1);
+    assert_eq!(
+        count("SELECT id FROM seven WHERE d = $1 LIMIT 5", "0.25"),
+        1
+    );
+    assert_eq!(count("SELECT id FROM seven WHERE d = $1 LIMIT 5", "9.5"), 0);
+}
+
+#[test]
+fn typed_float_bind_rejects_malformed_values_and_keeps_literal_limits() {
+    let path = unique_db_path("prepared-float-22p02");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_seven_type_table(&path);
+    for col in ["r", "d"] {
+        let stmt = core
+            .parse_sql_prepared(&format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5"))
+            .expect("parse");
+        for bad in [
+            "abc",
+            "+1.5",
+            " 1.5",
+            "1.5 ",
+            "NaN",
+            "Infinity",
+            "",
+            "-",
+            "1.5 OR 1=1",
+            "1; DROP TABLE seven",
+        ] {
+            let err = core
+                .bind_prepared(&stmt, &[some(bad)])
+                .expect_err("malformed float must be rejected");
+            assert_eq!(err.wire_code(), "22P02", "{col} {bad:?}");
+            if bad.chars().any(|c| c.is_ascii_alphabetic()) {
+                assert!(!err.to_string().contains(bad), "must not echo {bad:?}");
+            }
+        }
+    }
+    // 負値: INSERT はリテラル形と一致、WHERE はリテラル形と同じ結果（式項の単項マイナス未対応）。
+    assert_bind_matches_literal(
+        &core,
+        "INSERT INTO seven (id, embedding, r) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3",
+        &["1", "-1.5", "op-n"],
+        "INSERT INTO seven (id, embedding, r) VALUES (1, '[0.1,0.2,0.3]', -1.5) USING OPERATION_ID 'op-n'",
+    );
+    let where_neg = core
+        .parse_sql_prepared("SELECT id FROM seven WHERE r = $1 LIMIT 5")
+        .expect("parse");
+    let bound = core.bind_prepared(&where_neg, &[some("-1.5")]);
+    let literal = core.parse_sql("SELECT id FROM seven WHERE r = -1.5 LIMIT 5");
+    assert_eq!(
+        bound.as_ref().map(|_| ()).map_err(|e| e.wire_code()),
+        literal.as_ref().map(|_| ()).map_err(|e| e.wire_code()),
+    );
+    // REAL への値域外は束縛後の既存経路がリテラル形と同じコードで拒否する。
+    let ctx = seven_ctx();
+    let mut session = SessionState::default();
+    let ins = core
+        .parse_sql_prepared(
+            "INSERT INTO seven (id, embedding, r) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3",
+        )
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&ins, &[some("2"), some("1e40"), some("op-o")])
+        .expect("bind");
+    let bound_err = core
+        .execute_parsed_in_session(&ctx, &mut session, &bound)
+        .expect_err("out of range must be rejected");
+    let lit = core
+        .parse_sql(
+            "INSERT INTO seven (id, embedding, r) VALUES (2, '[0.1,0.2,0.3]', 1e40) USING OPERATION_ID 'op-o2'",
+        )
+        .expect("parse literal");
+    let lit_err = core
+        .execute_parsed_in_session(&ctx, &mut session, &lit)
+        .expect_err("out of range must be rejected");
+    assert_eq!(bound_err.wire_code(), lit_err.wire_code());
+}
+
+#[test]
+fn typed_string_kind_columns_match_literal_form_and_error_codes() {
+    let path = unique_db_path("prepared-string-kinds");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_seven_type_table(&path);
+    for (col, val) in [
+        ("num", "3.14"),
+        ("dt", "2026-01-02"),
+        ("ts", "2026-01-02 03:04:05"),
+        ("u", "123e4567-e89b-12d3-a456-426614174000"),
+        ("bin", "\\x0102"),
+    ] {
+        assert_bind_matches_literal(
+            &core,
+            &format!("SELECT id FROM seven WHERE {col} = $1 LIMIT 5"),
+            &[val],
+            &format!("SELECT id FROM seven WHERE {col} = '{val}' LIMIT 5"),
+        );
+        assert_bind_matches_literal(
+            &core,
+            &format!(
+                "INSERT INTO seven (id, embedding, {col}) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3"
+            ),
+            &["1", val, "op-s"],
+            &format!(
+                "INSERT INTO seven (id, embedding, {col}) VALUES (1, '[0.1,0.2,0.3]', '{val}') USING OPERATION_ID 'op-s'"
+            ),
+        );
+    }
+    // 形式不正は束縛形とリテラル形で同じ wire_code（NUMERIC/UUID/BYTEA は 22P02、
+    // DATE/TIMESTAMP は 22007／22008）。
+    let ctx = seven_ctx();
+    for (col, bad, code) in [
+        ("num", "abc", "22P02"),
+        ("num", "NaN", "22P02"),
+        ("u", "zz", "22P02"),
+        ("bin", "abc", "22P02"),
+        ("dt", "abc", "22007"),
+        ("dt", "2026-13-02", "22008"),
+        ("ts", "abc", "22007"),
+    ] {
+        let sql = format!(
+            "INSERT INTO seven (id, embedding, {col}) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3"
+        );
+        let prepared = core.parse_sql_prepared(&sql).expect("parse");
+        let bound = core.bind_prepared(&prepared, &[some("1"), some(bad), some("op-e")]);
+        let mut session = SessionState::default();
+        let bound_code = match bound {
+            Err(e) => e.wire_code(),
+            Ok(b) => core
+                .execute_parsed_in_session(&ctx, &mut session, &b)
+                .expect_err("malformed value must be rejected")
+                .wire_code(),
+        };
+        assert_eq!(bound_code, code, "{col} {bad:?}");
+        let lit_sql = format!(
+            "INSERT INTO seven (id, embedding, {col}) VALUES (1, '[0.1,0.2,0.3]', '{bad}') USING OPERATION_ID 'op-e'"
+        );
+        let lit_code = match core.parse_sql(&lit_sql) {
+            Err(e) => e.wire_code(),
+            Ok(p) => core
+                .execute_parsed_in_session(&ctx, &mut session, &p)
+                .expect_err("malformed literal must be rejected")
+                .wire_code(),
+        };
+        assert_eq!(bound_code, lit_code, "{col} {bad:?} literal parity");
+    }
+}
+
+#[test]
+fn typed_float_bind_respects_rls_boundary() {
+    let path = unique_db_path("prepared-float-rls");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_seven_type_table(&path);
+    let ctx_a = seven_ctx();
+    let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    let mut session = SessionState::default();
+    let ins = core
+        .parse_sql_prepared(
+            "INSERT INTO seven (id, embedding, r) VALUES ($1, '[0.1,0.2,0.3]', $2) USING OPERATION_ID $3",
+        )
+        .expect("parse");
+    let bound = core
+        .bind_prepared(&ins, &[some("1"), some("1.5"), some("op-r")])
+        .expect("bind");
+    core.execute_parsed_in_session(&ctx_a, &mut session, &bound)
+        .expect("insert");
+    let sel = core
+        .parse_sql_prepared("SELECT id FROM seven WHERE r = $1 LIMIT 5")
+        .expect("parse");
+    let bound = core.bind_prepared(&sel, &[some("1.5")]).expect("bind");
+    let rows = |ctx: &PolicyContext, session: &mut SessionState| match core
+        .execute_parsed_in_session(ctx, session, &bound)
+        .expect("execute")
+    {
+        SqlOutcome::Query(result) => result.rows.len(),
+        other => panic!("expected Query, got {other:?}"),
+    };
+    assert_eq!(rows(&ctx_a, &mut session), 1);
+    assert_eq!(rows(&ctx_b, &mut session), 0);
 }
