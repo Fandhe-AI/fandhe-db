@@ -695,18 +695,18 @@ fn bind_error_takes_priority_over_limit_out_of_range() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    // `author_id`（`BigInt`）への範囲比較（`>`）は束縛段（`declarative_filter
-    // ::bind_impl`）でのみ「range comparison 非対応」として拒否される
-    // （`build_plan` の列解決は通過する）。LIMIT 0 と共存させ、束縛完了が
+    // `author_id`（`BigInt`）への解釈できない文字列リテラルとの比較（`> 'abc'`）は
+    // 束縛段（`udf_call::bind_unknown_literal_against`。Issue #1408）でのみ `22P02` として
+    // 拒否される（`build_plan` の列解決は通過する）。LIMIT 0 と共存させ、束縛完了が
     // LIMIT 検証より先であることを確認する。
     let sql = "SELECT * FROM documents JOIN authors ON documents.author_id = authors.id \
-               WHERE documents.author_id > '5' LIMIT 0";
+               WHERE documents.author_id > 'abc' LIMIT 0";
     let err = run_err(&core, "tenant-a", sql);
-    assert_eq!(err.wire_code(), "22000", "sql={sql:?} err={err:?}");
+    assert_eq!(err.wire_code(), "22P02", "sql={sql:?} err={err:?}");
     let detail = format!("{err:?}");
     assert!(
-        detail.contains("range comparison"),
-        "expected the bind-time range-comparison error to take priority over the LIMIT range error, got {detail}"
+        detail.contains("invalid input syntax"),
+        "expected the bind-time invalid-input error to take priority over the LIMIT range error, got {detail}"
     );
 
     let describe_session = SessionState::default();
@@ -714,10 +714,10 @@ fn bind_error_takes_priority_over_limit_out_of_range() {
     let describe_err = core
         .describe_parsed_in_session(&describe_session, &parsed)
         .expect_err("describe must reject the same bind error as execute");
-    assert_eq!(describe_err.wire_code(), "22000", "err={describe_err:?}");
+    assert_eq!(describe_err.wire_code(), "22P02", "err={describe_err:?}");
     let describe_detail = format!("{describe_err:?}");
     assert!(
-        describe_detail.contains("range comparison"),
+        describe_detail.contains("invalid input syntax"),
         "expected describe to report the same bind-time error, got {describe_detail}"
     );
 }

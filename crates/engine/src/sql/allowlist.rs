@@ -5039,8 +5039,9 @@ impl<'a> Parser<'a> {
             }
             // Issue #919・SQL-26: 文字列リテラルを式項として受理する。値は字句段で
             // 既にクォート解除済み（`Token::StringLiteral`）。PostgreSQL の
-            // unknown 型リテラルの暗黙型変換は行わず、常に TEXT 型として束縛する
-            // （`udf_call::bind_expr_in` の `Expr::String` 分岐）。
+            // 単独では TEXT 型として束縛する（`udf_call::bind_expr_in` の `Expr::String`
+            // 分岐）。数値との比較の片側に置かれた場合の型解釈は Issue #1408 で
+            // `udf_call::bind_unknown_literal_against` が行う。
             Some(Token::StringLiteral(s)) => {
                 self.advance();
                 self.consume_expr_node()?;

@@ -1435,12 +1435,33 @@ fn declarative_leaf_to_filter(
             // Issue #891）へ振り分ける。列が未知の場合（後続の `bind_all`
             // が「unknown column」で拒否する既存契約）はそのまま
             // `DeclarativeFilter::equals` へ流し、挙動を変えない。
-            let is_typed_compare_column = schema
+            let column_ty = schema
                 .columns
                 .iter()
                 .find(|c| &c.name == column)
-                .map(|c| is_typed_compare_column_type(&c.ty))
+                .map(|c| &c.ty);
+            let is_typed_compare_column =
+                column_ty.map(is_typed_compare_column_type).unwrap_or(false);
+            let skip = dummy_equality_flags
+                .get(*equality_ordinal)
+                .copied()
                 .unwrap_or(false);
+            *equality_ordinal += 1;
+            // Issue #1408・SQL-24・ERR-6: BOOLEAN 列 × 文字列リテラルは `boolin` 互換の
+            // 文法で解釈する（解釈できなければ `22P02`。Describe のダミー値は解釈せず
+            // 仮置きする）。`bool_equals` は NoSQL `filter` と共有する公開 API で変更しない。
+            if matches!(column_ty, Some(ColumnType::Boolean)) {
+                let truth = match crate::sql::params::parse_pg_bool(value) {
+                    Some(b) => b,
+                    None if skip => false,
+                    None => {
+                        return Err(SqlSurfaceError::invalid_text_representation(
+                            "invalid input syntax for type boolean",
+                        ));
+                    }
+                };
+                return Ok((DeclarativeFilter::bool_equals(column.clone(), truth), false));
+            }
             let filter = if is_typed_compare_column {
                 DeclarativeFilter::compare(
                     column.clone(),
@@ -1450,11 +1471,6 @@ fn declarative_leaf_to_filter(
             } else {
                 DeclarativeFilter::equals(column.clone(), value.clone())
             };
-            let skip = dummy_equality_flags
-                .get(*equality_ordinal)
-                .copied()
-                .unwrap_or(false);
-            *equality_ordinal += 1;
             Ok((filter, skip))
         }
         WherePredicate::Compare { column, op, value } => {
@@ -1635,6 +1651,104 @@ fn text_range_compare_as_expr(
     })
 }
 
+/// 数値列（INTEGER／BIGINT／REAL／DOUBLE）と文字列リテラルの宣言的な葉（`=`・範囲比較・
+/// `IN`・`BETWEEN`、およびその `NOT`）を、式レーンの比較（`Expression`）へ書き換える
+/// （Issue #1408・SQL-24・ERR-2・ERR-6）。PostgreSQL は型の付いていない文字列リテラルを
+/// 相手列の型として解釈するため、解釈は式束縛（`udf_call::bind_unknown_literal_against`）に
+/// 任せ、右辺は `Expr::String` のまま残す——これで数値リテラル形（`qty > 1`）と同じ
+/// 束縛・評価・二次索引分類を通り、結果が構成上一致する。`NOT` は書き換え後の連言を
+/// [`crate::sql::where_negation::negate_conjunction`] へ通す（否定実装は 1 つに保つ）。
+///
+/// 対象外の述語・列型は `Ok(None)`（従来の宣言的経路へ委ねる）。`Equality` を書き換えた場合も
+/// `equality_ordinal` を進める（Prepared の Describe 用ダミーフラグ序数を保つため）。
+/// ダミー値（`dummy_equality_flags` が立つ位置）は解釈できないので `0` を仮置きする。
+/// `bind_where_predicates_recursive` の WHERE 文脈（`allow_text_range_rewrite == true`）
+/// からのみ呼ばれる。
+fn numeric_column_string_leaf_as_predicates(
+    predicate: &WherePredicate,
+    schema: &TableSchema,
+    node_budget: &mut usize,
+    equality_ordinal: &mut usize,
+    dummy_equality_flags: &[bool],
+) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
+    use crate::sql::allowlist::CompareOp;
+    use crate::sql::udf_call::BinOp;
+    let (leaf, negated) = match predicate {
+        WherePredicate::Not(inner) => (inner.as_ref(), true),
+        other => (other, false),
+    };
+    let column = match leaf {
+        WherePredicate::Equality { column, .. }
+        | WherePredicate::Compare { column, .. }
+        | WherePredicate::InList { column, .. }
+        | WherePredicate::Between { column, .. } => column,
+        _ => return Ok(None),
+    };
+    let is_numeric = schema.columns.iter().any(|c| {
+        &c.name == column
+            && matches!(
+                c.ty,
+                ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double
+            )
+    });
+    if !is_numeric {
+        return Ok(None);
+    }
+    let cmp = |op: BinOp, value: &str| {
+        WherePredicate::Expression(Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ident(column.clone())),
+            rhs: Box::new(Expr::String(value.to_string())),
+        })
+    };
+    let conjunction = match leaf {
+        WherePredicate::Equality { value, .. } => {
+            let skip = dummy_equality_flags
+                .get(*equality_ordinal)
+                .copied()
+                .unwrap_or(false);
+            *equality_ordinal += 1;
+            if skip {
+                vec![WherePredicate::Expression(Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Ident(column.clone())),
+                    rhs: Box::new(Expr::Number("0".to_string())),
+                })]
+            } else {
+                vec![cmp(BinOp::Eq, value)]
+            }
+        }
+        WherePredicate::Compare { op, value, .. } => {
+            let bin = match op {
+                CompareOp::Lt => BinOp::Lt,
+                CompareOp::Le => BinOp::Le,
+                CompareOp::Gt => BinOp::Gt,
+                CompareOp::Ge => BinOp::Ge,
+            };
+            vec![cmp(bin, value)]
+        }
+        WherePredicate::InList { values, .. } => match values.as_slice() {
+            [] => return Ok(None),
+            [only] => vec![cmp(BinOp::Eq, only)],
+            many => vec![WherePredicate::Or(
+                many.iter().map(|v| vec![cmp(BinOp::Eq, v)]).collect(),
+            )],
+        },
+        WherePredicate::Between { low, high, .. } => {
+            vec![cmp(BinOp::Ge, low), cmp(BinOp::Le, high)]
+        }
+        _ => return Ok(None),
+    };
+    if negated {
+        Ok(Some(crate::sql::where_negation::negate_conjunction(
+            conjunction,
+            node_budget,
+        )?))
+    } else {
+        Ok(Some(conjunction))
+    }
+}
+
 /// [`bind_where_predicates`]・[`bind_check_predicates`] の再帰本体。トップレベルの
 /// 述語列だけでなく、[`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも
 /// 自分自身を再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
@@ -1669,6 +1783,37 @@ fn bind_where_predicates_recursive(
             let (bound, _ty) = crate::sql::udf_call::bind_expr(&expr, schema, udfs, node_budget)?;
             expr_filters.push(bound);
             continue;
+        }
+        // Issue #1408・SQL-24: 数値列 × 文字列リテラルの宣言的な葉は式レーンへ書き換える
+        // （詳細は `numeric_column_string_leaf_as_predicates`）。書き換え結果は式述語・
+        // `Or` だけで構成されるため、再帰束縛して式・`Or` 群のみを取り込む
+        // （宣言的フィルタが現れたら不変条件違反として fail-closed の `Internal`）。
+        if allow_text_range_rewrite {
+            if let Some(rewritten) = numeric_column_string_leaf_as_predicates(
+                predicate,
+                schema,
+                node_budget,
+                equality_ordinal,
+                dummy_equality_flags,
+            )? {
+                let (sub_metadata, sub_expr, _sub_rls, sub_or) = bind_where_predicates_recursive(
+                    &rewritten,
+                    schema,
+                    udfs,
+                    node_budget,
+                    dummy_equality_flags,
+                    equality_ordinal,
+                    allow_text_range_rewrite,
+                )?;
+                if !sub_metadata.is_empty() {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "numeric literal rewrite produced a declarative filter".to_string(),
+                    });
+                }
+                expr_filters.extend(sub_expr);
+                or_filters.extend(sub_or);
+                continue;
+            }
         }
         match predicate {
             WherePredicate::PredicateCall { .. } => {

@@ -229,8 +229,9 @@ pub enum Expr {
     /// 数値リテラル（`lexer::Token::Number` の生文字列。小数を許容）。
     Number(String),
     /// 文字列リテラル（Issue #919・SQL-26。値は字句段でクォート解除済み）。
-    /// PostgreSQL の unknown 型リテラルの暗黙型変換は行わず、常に TEXT 型として
-    /// 束縛する（対象外事項。docs/design/implementation-status.md 参照）。
+    /// 単独では TEXT 型として束縛する。比較演算子（`> < >= <= =`）の片側だけが
+    /// 文字列リテラルで、反対側が数値のときに限り、PostgreSQL の unknown 型リテラルと
+    /// 同様に反対側の型として解釈する（Issue #1408。`bind_unknown_literal_against`）。
     String(String),
     /// 識別子（列参照・UDF パラメータ参照のいずれかは束縛段で解決する）。
     Ident(String),
@@ -1787,6 +1788,27 @@ fn bind_expr_in(
         }
         Expr::Call { name, args } => bind_call(name, args, env, node_budget),
         Expr::Binary { op, lhs, rhs } => {
+            if matches!(
+                op,
+                BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
+            ) {
+                reject_numeric_literal_vs_operatorless_column(lhs, rhs, env)?;
+                // Issue #1408・SQL-24: 片側だけが文字列リテラル（PostgreSQL の unknown 型）の
+                // 比較は、反対側の型としてリテラルを解釈する。
+                match (lhs.as_ref(), rhs.as_ref()) {
+                    (other, Expr::String(s)) if !matches!(other, Expr::String(_)) => {
+                        let (l, lt) = bind_expr_in(other, env, node_budget)?;
+                        let (r, rt) = bind_unknown_literal_against(s, &l, lt, env, node_budget)?;
+                        return bind_binary(*op, l, lt, r, rt);
+                    }
+                    (Expr::String(s), other) if !matches!(other, Expr::String(_)) => {
+                        let (r, rt) = bind_expr_in(other, env, node_budget)?;
+                        let (l, lt) = bind_unknown_literal_against(s, &r, rt, env, node_budget)?;
+                        return bind_binary(*op, l, lt, r, rt);
+                    }
+                    _ => {}
+                }
+            }
             let (l, lt) = bind_expr_in(lhs, env, node_budget)?;
             let (r, rt) = bind_expr_in(rhs, env, node_budget)?;
             bind_binary(*op, l, lt, r, rt)
@@ -1810,6 +1832,130 @@ fn bind_expr_in(
     }
 }
 
+/// 列の型名（エラーメッセージ用。リテラル本文は含めない）。
+fn column_type_label(ty: &ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Text => "text",
+        ColumnType::Vector(_) => "vector",
+        ColumnType::Integer => "integer",
+        ColumnType::BigInt => "bigint",
+        ColumnType::Real => "real",
+        ColumnType::Double => "double precision",
+        ColumnType::Boolean => "boolean",
+        ColumnType::Date => "date",
+        ColumnType::Timestamp => "timestamp",
+        ColumnType::Array(_) => "array",
+        ColumnType::Bytea => "bytea",
+        ColumnType::Json => "json",
+        ColumnType::Jsonb => "jsonb",
+        ColumnType::Enum(_) => "enum",
+        ColumnType::Numeric { .. } => "numeric",
+        ColumnType::Uuid => "uuid",
+    }
+}
+
+/// 比較の片側が数値リテラル、もう片側が「式中参照を持たない列型」（BOOLEAN／UUID／
+/// BYTEA／ARRAY／JSON／JSONB／ENUM）の列である場合に、列参照の拒否（`22000`）より先に
+/// `42883`（演算子が存在しない。PostgreSQL の `operator does not exist` 相当）を返す
+/// （Issue #1408・SQL-24・ERR-2）。NUMERIC 列は PostgreSQL に演算子があるため対象外で、
+/// 従来の拒否のまま据え置く。`bind_expr_in` の比較腕のみから呼ばれる。
+fn reject_numeric_literal_vs_operatorless_column(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &BindEnv<'_>,
+) -> Result<(), SqlSurfaceError> {
+    let ident = match (lhs, rhs) {
+        (Expr::Ident(n), Expr::Number(_)) | (Expr::Number(_), Expr::Ident(n)) => n,
+        _ => return Ok(()),
+    };
+    let Some(schema) = env.schema else {
+        return Ok(());
+    };
+    if env.params.contains_key(ident.to_ascii_lowercase().as_str()) {
+        return Ok(());
+    }
+    let Some(column) = schema.columns.iter().find(|c| &c.name == ident) else {
+        return Ok(());
+    };
+    match column.ty {
+        ColumnType::Boolean
+        | ColumnType::Uuid
+        | ColumnType::Bytea
+        | ColumnType::Array(_)
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Enum(_) => Err(SqlSurfaceError::undefined_function(format!(
+            "operator does not exist: {} and numeric",
+            column_type_label(&column.ty)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// 比較の相手側が文字列リテラル（PostgreSQL の unknown 型）のとき、反対側 `other` の型に
+/// 合わせてリテラルを束縛する（Issue #1408・SQL-24・ERR-2・ERR-6）。反対側が数値
+/// （`ExprType::Scalar`）なら数値として解釈する: INTEGER／BIGINT 列は整数文法
+/// （前後空白除去・任意の符号・1 桁以上の数字。`1.5` 等は `22P02`、列の範囲外は `22003`）、
+/// それ以外（REAL／DOUBLE・式結果）は [`crate::scalar_float::parse_double`]。最終的に
+/// [`parse_number_literal`] を通すため、数値リテラル形と同じ 2^53 の exactness 判定を共有する。
+/// 反対側が数値以外のときは通常の文字列リテラル束縛（TEXT）へ委ね、型不一致は
+/// [`bind_binary`] が `42883` にする。エラーにリテラル本文は含めない。
+fn bind_unknown_literal_against(
+    s: &str,
+    other: &BoundExpr,
+    other_ty: ExprType,
+    env: &BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+        return Err(SqlSurfaceError::payload_too_large(
+            "string literal exceeds the maximum TEXT field length",
+        ));
+    }
+    if other_ty != ExprType::Scalar {
+        return Ok((BoundExpr::Text(s.to_string()), ExprType::Text));
+    }
+    let column_ty = match other {
+        BoundExpr::ColumnRef { index } => env
+            .schema
+            .and_then(|sc| sc.columns.get(*index))
+            .map(|c| &c.ty),
+        _ => None,
+    };
+    let invalid = || {
+        SqlSurfaceError::invalid_text_representation("invalid input syntax for a numeric operand")
+    };
+    let out_of_range =
+        || SqlSurfaceError::numeric_out_of_range("numeric literal is out of range for the operand");
+    let text = match column_ty {
+        Some(ColumnType::Integer) | Some(ColumnType::BigInt) => {
+            let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+            let v: i64 = trimmed.parse().map_err(|e: std::num::ParseIntError| {
+                use std::num::IntErrorKind::{NegOverflow, PosOverflow};
+                match e.kind() {
+                    PosOverflow | NegOverflow => out_of_range(),
+                    _ => invalid(),
+                }
+            })?;
+            if matches!(column_ty, Some(ColumnType::Integer)) && i32::try_from(v).is_err() {
+                return Err(out_of_range());
+            }
+            v.to_string()
+        }
+        _ => {
+            let v = crate::scalar_float::parse_double(s).map_err(|e| match e {
+                crate::scalar_float::ParseFloatError::Malformed => invalid(),
+                crate::scalar_float::ParseFloatError::OutOfRange => out_of_range(),
+            })?;
+            format!("{v}")
+        }
+    };
+    let n = parse_number_literal(&text)?;
+    Ok((BoundExpr::Number(n), ExprType::Scalar))
+}
 fn bind_binary(
     op: BinOp,
     l: BoundExpr,
@@ -1877,8 +2023,10 @@ fn bind_binary(
             (ExprType::Timestamp, ExprType::Date) => {
                 Ok((mk(op, l, wrap_date_to_timestamp(r)), ExprType::Bool))
             }
-            _ => Err(SqlSurfaceError::datatype_mismatch(
-                "comparison operators require both operands to be scalar, both text, or both date/timestamp",
+            // Issue #1408・SQL-24・ERR-2: 比較演算子が存在しない型の組（PostgreSQL の
+            // `operator does not exist`）は `42883`（従来は `42804`）。算術腕は据え置き。
+            _ => Err(SqlSurfaceError::undefined_function(
+                "operator does not exist: comparison operands must be both scalar, both text, or both date/timestamp",
             )),
         },
     }
