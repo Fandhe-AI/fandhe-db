@@ -39,14 +39,48 @@ high() { HIGH=$((HIGH + 1)); echo "  [HIGH] $*"; }
 medium() { MEDIUM=$((MEDIUM + 1)); echo "  [MEDIUM] $*"; }
 info() { INFO=$((INFO + 1)); echo "  [INFO] $*"; }
 
-# 取り込む側の変更（HEAD と BASE の 2 点差分）
-INCOMING="$(g diff --name-only "${HEAD_SHA}" "${BASE_SHA}" --)"
-INCOMING_ADDED="$(g diff --name-only --diff-filter=A "${HEAD_SHA}" "${BASE_SHA}" --)"
+# 取り込む側の変更（HEAD と BASE の 2 点差分）。パスは NUL 区切りで配列へ読み込み、改行・引用符を含む
+# パスでも 1 パス 1 要素のまま比較する。--no-renames で rename を「旧パス削除 + 新パス追加」に分解し、
+# 旧パス側の変更（INCOMING）と新パス側の追加（INCOMING_ADDED）の両方を取りこぼさない。
+INCOMING=()
+while IFS= read -r -d '' _p; do INCOMING+=("${_p}"); done \
+  < <(g diff --name-only --no-renames -z "${HEAD_SHA}" "${BASE_SHA}" --)
+INCOMING_ADDED=()
+while IFS= read -r -d '' _p; do INCOMING_ADDED+=("${_p}"); done \
+  < <(g diff --name-only --no-renames --diff-filter=A -z "${HEAD_SHA}" "${BASE_SHA}" --)
+# カテゴリ判定（正規表現）専用の改行区切り文字列。パス単位の照合には使わない。
 # 注意: pipefail 下では `printf | grep -q` が grep の早期終了で SIGPIPE となり偽陰性になる
 # （入力が pipe バッファを超える大量変更時）。here-string で入力を渡して回避する。
-has_incoming() { grep -Eq "$1" <<<"${INCOMING}"; }
-# submodule（gitlink）のパス一覧。状態は Submodules 節で評価するため Tracked changes からは除外する
-SUBS="$(g ls-tree -r HEAD | awk '$1 == "160000" { print $4 }')"
+INCOMING_TEXT="$(printf '%s\n' ${INCOMING[@]+"${INCOMING[@]}"})"
+has_incoming() { grep -Eq "$1" <<<"${INCOMING_TEXT}"; }
+# in_list <needle> <要素...>: 完全一致で含まれるか（空配列は ${a[@]+"${a[@]}"} 形式で渡す）
+in_list() {
+  local needle="$1" x
+  shift
+  for x in "$@"; do
+    if [ "${x}" = "${needle}" ]; then return 0; fi
+  done
+  return 1
+}
+# collides <untracked パス> <上流の追加パス>: 完全一致、または一方が他方の親ディレクトリである場合に真。
+# untracked の `foo/bar` と上流追加の `foo`（ファイル）、untracked の `foo`（ファイル / 入れ子 repo）と
+# 上流追加の `foo/bar` はいずれも pull（merge）が中断される。
+collides() {
+  local u="${1%/}" a="${2%/}"
+  if [ "${u}" = "${a}" ]; then return 0; fi
+  case "${u}" in "${a}"/*) return 0 ;; esac
+  case "${a}" in "${u}"/*) return 0 ;; esac
+  return 1
+}
+# submodule（gitlink）のパス一覧（NUL 区切りで配列化）。状態は Submodules 節で評価するため
+# Tracked changes からは除外する
+SUBS=()
+while IFS= read -r -d '' _rec; do
+  _meta="${_rec%%$'\t'*}"
+  case "${_meta}" in 160000\ *) SUBS+=("${_rec#*$'\t'}") ;; esac
+done < <(g ls-tree -r -z HEAD)
+# 取り込み元の鮮度が確認できない（REMOTE_CHECK で STALE / 確認失敗）場合 1 にし、最終判定を保留する
+VERDICT_DEFERRED=0
 
 echo "== Summary =="
 read -r BEHIND AHEAD < <(g rev-list --left-right --count "${BASE_SHA}...${HEAD_SHA}")
@@ -63,27 +97,33 @@ if [ "${REMOTE_CHECK:-0}" = "1" ]; then
   REMOTE_SHA="$(g ls-remote origin refs/heads/main 2>/dev/null | cut -f1 | head -n1 || true)"
   if [ -z "${REMOTE_SHA}" ]; then
     echo "  remote main: UNKNOWN (ls-remote failed)"
+    VERDICT_DEFERRED=1
   elif [ "${REMOTE_SHA}" = "${BASE_SHA}" ]; then
     echo "  remote main: ${REMOTE_SHA} (local ${BASE_REF} is up to date)"
   else
     echo "  remote main: ${REMOTE_SHA} (local ${BASE_REF} is STALE; run fetch before the final decision)"
     info "local ${BASE_REF} is stale; real lag is larger than reported"
+    VERDICT_DEFERRED=1
   fi
 fi
 
 echo "== Tracked changes =="
-# -z 出力: rename は "XY new\0old\0" の 2 トークンになり、特殊文字パスもクォートされない
+# -z 出力: rename / copy は "XY new\0old\0" の 2 トークンになり、特殊文字パスもクォートされない。
+# 旧パス（_orig）も上流の変更と照合する（上流が元パスを変更していれば pull で競合する）。
 HAS_TRACKED=0
 while IFS= read -r -d '' entry; do
   xy="${entry:0:2}"
   path="${entry:3}"
+  orig=""
   case "${xy}" in
-    R* | C* | *R | *C) IFS= read -r -d '' _orig || true ;;
+    R* | C* | *R | *C) IFS= read -r -d '' orig || true ;;
   esac
-  if grep -Fxq -- "${path}" <<<"${SUBS}"; then continue; fi
+  if in_list "${path}" ${SUBS[@]+"${SUBS[@]}"}; then continue; fi
   HAS_TRACKED=1
-  if grep -Fxq -- "${path}" <<<"${INCOMING}"; then
+  if in_list "${path}" ${INCOMING[@]+"${INCOMING[@]}"}; then
     high "locally modified file also changed upstream: ${path}"
+  elif [ -n "${orig}" ] && in_list "${orig}" ${INCOMING[@]+"${INCOMING[@]}"}; then
+    high "locally renamed file's original path also changed upstream: ${orig} (renamed to ${path})"
   else
     info "locally modified file (not touched upstream): ${path}"
   fi
@@ -93,25 +133,29 @@ if [ "${HAS_TRACKED}" -eq 0 ]; then
 fi
 
 echo "== Untracked collisions =="
-UNTRACKED="$(g ls-files --others --exclude-standard)"
-if [ -z "${UNTRACKED}" ]; then
+UNTRACKED=()
+while IFS= read -r -d '' _p; do UNTRACKED+=("${_p}"); done < <(g ls-files --others --exclude-standard -z)
+if [ "${#UNTRACKED[@]}" -eq 0 ]; then
   echo "  none"
 else
-  while IFS= read -r path; do
-    if grep -Fxq -- "${path}" <<<"${INCOMING_ADDED}"; then
-      high "untracked file collides with a path added upstream (pull would abort): ${path}"
+  for path in "${UNTRACKED[@]}"; do
+    hit=""
+    for added in ${INCOMING_ADDED[@]+"${INCOMING_ADDED[@]}"}; do
+      if collides "${path}" "${added}"; then hit="${added}"; break; fi
+    done
+    if [ -n "${hit}" ]; then
+      high "untracked path collides with a path added upstream (pull would abort): ${path} (upstream: ${hit})"
     else
-      info "untracked file (no collision): ${path}"
+      info "untracked path (no collision): ${path}"
     fi
-  done <<<"${UNTRACKED}"
+  done
 fi
 
 echo "== Submodules =="
-if [ -z "${SUBS}" ]; then
+if [ "${#SUBS[@]}" -eq 0 ]; then
   echo "  none"
 fi
-while IFS= read -r sub; do
-  [ -n "${sub}" ] || continue
+for sub in ${SUBS[@]+"${SUBS[@]}"}; do
   head_link="$(g ls-tree HEAD -- "${sub}" | awk '{print $3}')"
   base_link="$(g ls-tree "${BASE_SHA}" -- "${sub}" | awk '{print $3}')"
   echo "  ${sub}: HEAD gitlink=${head_link:-none} BASE gitlink=${base_link:-none}"
@@ -130,8 +174,9 @@ while IFS= read -r sub; do
     info "submodule ${sub} state UNKNOWN"
     continue
   fi
-  if [ -n "$(git -C "${REPO}/${sub}" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    high "submodule ${sub} has local uncommitted changes"
+  # untracked も評価対象にする（submodule update / checkout が未追跡ファイルで中断・汚染されうる）
+  if [ -n "$(git -C "${REPO}/${sub}" status --porcelain 2>/dev/null)" ]; then
+    high "submodule ${sub} has local uncommitted or untracked changes"
   fi
   if [ "${cur}" = "${head_link}" ]; then
     echo "    relation: in sync with HEAD gitlink"
@@ -146,10 +191,10 @@ while IFS= read -r sub; do
   else
     high "submodule ${sub}: checkout diverged from HEAD gitlink"
   fi
-done <<<"${SUBS}"
+done
 
 echo "== Incoming change categories =="
-echo "  incoming changed files: $(printf '%s\n' "${INCOMING}" | grep -c . || true)"
+echo "  incoming changed files: ${#INCOMING[@]}"
 if has_incoming '^Cargo\.lock$'; then medium "Cargo.lock changes (dependency update; rebuild required)"; fi
 if has_incoming '(^|/)Cargo\.toml$'; then
   dep_lines="$(g diff -U0 "${HEAD_SHA}" "${BASE_SHA}" -- ':(glob)**/Cargo.toml' | grep -Ec '^[+-][a-zA-Z0-9_-]+ *= *["{]' || true)"
@@ -171,7 +216,9 @@ echo "  linked worktrees: $(g worktree list --porcelain | grep -c '^worktree ' |
 
 echo "== Risk verdict =="
 echo "  HIGH=${HIGH} MEDIUM=${MEDIUM} INFO=${INFO}"
-if [ "${HIGH}" -eq 0 ] && [ "${AHEAD}" -eq 0 ]; then
+if [ "${VERDICT_DEFERRED}" -eq 1 ]; then
+  echo "  recommendation: DEFERRED; ${BASE_REF} freshness is not confirmed (stale or ls-remote failed); run git fetch, then re-run this check"
+elif [ "${HIGH}" -eq 0 ] && [ "${AHEAD}" -eq 0 ]; then
   echo "  recommendation: git pull --ff-only, then submodule update / make hooks as flagged above"
 else
   echo "  recommendation: do NOT pull yet; resolve the HIGH items individually"

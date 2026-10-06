@@ -88,7 +88,7 @@ expect_rc "S2 STRICT exit 1" 1
 d="$(setup s3)"; upstream_commit "${d}" new.txt x
 echo mine >"${d}/c/new.txt"
 run "${d}"
-expect "S3 collision HIGH" "${OUT}" "untracked file collides with a path added upstream (pull would abort): new.txt"
+expect "S3 collision HIGH" "${OUT}" "untracked path collides with a path added upstream (pull would abort): new.txt"
 expect_rc "S3 non-strict exit 0" 0
 
 # S4: ローカルが ahead
@@ -147,7 +147,7 @@ echo local >"${d}/c/a.txt"
 echo mine >"${d}/c/zz_added.txt"
 run "${d}" STRICT=1
 expect "S8 same-file HIGH (large list)" "${OUT}" "locally modified file also changed upstream: a.txt"
-expect "S8 untracked collision HIGH (large list)" "${OUT}" "untracked file collides with a path added upstream (pull would abort): zz_added.txt"
+expect "S8 untracked collision HIGH (large list)" "${OUT}" "untracked path collides with a path added upstream (pull would abort): zz_added.txt"
 expect "S8 Cargo.lock category (large list)" "${OUT}" "Cargo.lock changes"
 expect "S8 lefthook category (large list)" "${OUT}" "lefthook.yml changes"
 expect_rc "S8 STRICT exit 1" 1
@@ -157,6 +157,80 @@ d="$(setup s9)"; upstream_commit "${d}" b.txt b
 "${GITC[@]}" -C "${d}/c" mv a.txt b.txt
 run "${d}"
 expect "S9 rename new path HIGH" "${OUT}" "locally modified file also changed upstream: b.txt"
+
+# S10: 上流が元パスを変更し、ローカルは staged rename（旧パス側の衝突）
+d="$(setup s10)"; upstream_commit "${d}" a.txt changed
+"${GITC[@]}" -C "${d}/c" mv a.txt renamed.txt
+run "${d}"
+expect "S10 rename original path HIGH" "${OUT}" "original path also changed upstream: a.txt"
+
+# S11: 改行・引用符を含むパスの untracked 衝突を取りこぼさない
+d="$(setup s11)"
+weird=$'we ird"\nname.txt'
+echo x >"${d}/up/${weird}"
+"${GITC[@]}" -C "${d}/up" add -A
+"${GITC[@]}" -C "${d}/up" commit -q -m weird
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+echo mine >"${d}/c/${weird}"
+run "${d}"
+expect "S11 special-char collision HIGH" "${OUT}" "untracked path collides with a path added upstream"
+expect "S11 HIGH count" "${OUT}" "HIGH=1"
+
+# S12: 上流の rename 先（追加扱い）と untracked の衝突
+d="$(setup s12)"
+"${GITC[@]}" -C "${d}/up" mv a.txt moved.txt
+"${GITC[@]}" -C "${d}/up" commit -q -m rename
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+echo mine >"${d}/c/moved.txt"
+run "${d}"
+expect "S12 rename target collision HIGH" "${OUT}" "untracked path collides with a path added upstream (pull would abort): moved.txt"
+
+# S13: 親子関係の衝突（untracked foo/bar と上流追加ファイル foo、untracked foo と上流追加 foo/bar）
+d="$(setup s13)"
+echo f >"${d}/up/foo"
+"${GITC[@]}" -C "${d}/up" add -A
+"${GITC[@]}" -C "${d}/up" commit -q -m addfile
+mkdir -p "${d}/up/dir"
+echo g >"${d}/up/dir/inner"
+"${GITC[@]}" -C "${d}/up" add -A
+"${GITC[@]}" -C "${d}/up" commit -q -m adddir
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+mkdir -p "${d}/c/foo"
+echo mine >"${d}/c/foo/bar"
+echo mine >"${d}/c/dir"
+run "${d}" STRICT=1
+expect "S13 dir-under-upstream-file HIGH" "${OUT}" "untracked path collides with a path added upstream (pull would abort): foo/bar"
+expect "S13 file-over-upstream-dir HIGH" "${OUT}" "untracked path collides with a path added upstream (pull would abort): dir"
+expect_rc "S13 STRICT exit 1" 1
+
+# S14: 鮮度が確認できない場合は判定を保留する（STALE / ls-remote 失敗）
+d="$(setup s14)"; upstream_commit "${d}" b.txt b
+"${GITC[@]}" -C "${d}/up" commit -q --allow-empty -m "newer upstream"
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+run "${d}" REMOTE_CHECK=1
+expect "S14 stale deferred" "${OUT}" "recommendation: DEFERRED"
+refute "S14 stale no pull recommendation" "${OUT}" "recommendation: git pull"
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+run "${d}" REMOTE_CHECK=1
+expect "S14 fresh recommends pull" "${OUT}" "recommendation: git pull --ff-only"
+"${GITC[@]}" -C "${d}/c" remote set-url origin "${d}/does-not-exist.git"
+run "${d}" REMOTE_CHECK=1
+expect "S14 ls-remote failure deferred" "${OUT}" "recommendation: DEFERRED"
+
+# S15: submodule 内の untracked ファイルも HIGH にする
+d="$(setup s15)"
+"${GITC[@]}" init -q "${d}/sub"
+echo 1 >"${d}/sub/f"
+"${GITC[@]}" -C "${d}/sub" add -A
+"${GITC[@]}" -C "${d}/sub" commit -q -m one
+"${GITC[@]}" -C "${d}/c" submodule add -q "${d}/sub" docs/spec 2>/dev/null
+"${GITC[@]}" -C "${d}/c" commit -q -m "add sub"
+echo stray >"${d}/c/docs/spec/untracked.txt"
+run "${d}"
+expect "S15 submodule untracked HIGH" "${OUT}" "submodule docs/spec has local uncommitted or untracked changes"
 
 if [ "${FAILS}" -ne 0 ]; then
   echo "${FAILS} check(s) failed"
