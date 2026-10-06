@@ -291,6 +291,14 @@ else
 	@echo "skip: Cargo.toml または deny.toml 未追加のため deny をスキップ"
 endif
 
+.PHONY: worktree-lag-check
+worktree-lag-check: ## メイン worktree の origin/main からの遅れと pull 前リスクを読み取り専用で評価する（Issue #1329。REPO=<worktree> BASE_REF=origin/main REMOTE_CHECK=1 STRICT=1 を任意指定。環境依存の運用ツールのため ci には含めない）
+	scripts/check_worktree_lag.sh
+
+.PHONY: worktree-lag-check-selftest
+worktree-lag-check-selftest: ## worktree-lag-check のセルフテスト（一時 git リポジトリで判定と読み取り専用性を検証。Issue #1329）
+	scripts/tests/check_worktree_lag_test.sh
+
 .PHONY: ci
 ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index crash-test-partitioned-dml tmp-leak-check core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
