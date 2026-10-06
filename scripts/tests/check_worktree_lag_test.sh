@@ -232,6 +232,35 @@ echo stray >"${d}/c/docs/spec/untracked.txt"
 run "${d}"
 expect "S15 submodule untracked HIGH" "${OUT}" "submodule docs/spec has local uncommitted or untracked changes"
 
+# S16: ignored ローカルファイルと上流の追加パスの衝突（merge で上書きされ得る）を HIGH にする
+d="$(setup s16)"
+echo "cache.dat" >"${d}/c/.gitignore"
+"${GITC[@]}" -C "${d}/c" add -A
+"${GITC[@]}" -C "${d}/c" commit -q -m ignore
+"${GITC[@]}" -C "${d}/c" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/up" pull -q origin main 2>/dev/null
+echo mine >"${d}/c/cache.dat"
+echo mine >"${d}/c/other.dat"
+# 上流側でも ignore されるため -f で追跡対象として追加する
+echo upstream >"${d}/up/cache.dat"
+"${GITC[@]}" -C "${d}/up" add -f cache.dat
+"${GITC[@]}" -C "${d}/up" commit -q -m "add cache.dat"
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+run "${d}" STRICT=1
+expect "S16 ignored collision HIGH" "${OUT}" "ignored local path collides with a path added upstream (pull would overwrite it): cache.dat"
+expect_rc "S16 STRICT exit 1" 1
+
+# S17: REMOTE_CHECK は BASE_REF に対応する remote / branch を照会し、追跡 ref 以外は拒否する
+d="$(setup s17)"; upstream_commit "${d}" b.txt b
+"${GITC[@]}" -C "${d}/c" remote add other "${d}/origin.git"
+"${GITC[@]}" -C "${d}/c" fetch -q other
+"${GITC[@]}" -C "${d}/c" remote set-url origin "${d}/does-not-exist.git"
+run "${d}" REMOTE_CHECK=1 BASE_REF=other/main
+expect "S17 other remote queried (fresh)" "${OUT}" "local other/main is up to date"
+run "${d}" REMOTE_CHECK=1 BASE_REF=HEAD
+expect_rc "S17 non-remote BASE_REF rejected" 2
+
 if [ "${FAILS}" -ne 0 ]; then
   echo "${FAILS} check(s) failed"
   exit 1

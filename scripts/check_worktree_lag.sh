@@ -11,10 +11,14 @@
 # docs/design/main-worktree-lag-assessment.md を参照。
 #
 # 環境変数: REPO（既定: カレントの toplevel）/ BASE_REF（既定: origin/main）/
-#           REMOTE_CHECK=1 / STRICT=1（HIGH があれば exit 1）
+#           REMOTE_CHECK=1（BASE_REF は <remote>/<branch> 形式必須）/ STRICT=1（HIGH があれば exit 1）
 # 終了コード: 0=レポート出力済み、1=STRICT で HIGH 検出、2=入力不正
 
 set -euo pipefail
+
+# `git status` 等が index を opportunistic に更新（書き込み）しないよう、サブモジュール内を含む
+# 全 git 呼び出しで optional lock を無効化する（読み取り専用の保証。環境変数は子 git へ継承される）。
+export GIT_OPTIONAL_LOCKS=0
 
 BASE_REF="${BASE_REF:-origin/main}"
 REPO="${REPO:-$(git rev-parse --show-toplevel)}"
@@ -94,14 +98,32 @@ else
   high "local branch is ahead of ${BASE_REF} by ${AHEAD} commit(s); pull --ff-only would fail"
 fi
 if [ "${REMOTE_CHECK:-0}" = "1" ]; then
-  REMOTE_SHA="$(g ls-remote origin refs/heads/main 2>/dev/null | cut -f1 | head -n1 || true)"
+  # BASE_REF が `<remote>/<branch>` 形式のリモート追跡 ref のときだけ、その remote / branch を照会する
+  # （常に origin の main を見ると、別 BASE_REF 指定時に誤った鮮度判定になる）。それ以外は入力不正。
+  REMOTE_NAME=""
+  REMOTE_BRANCH=""
+  while IFS= read -r _r; do
+    case "${BASE_REF}" in
+      "${_r}"/?*)
+        if [ "${#_r}" -gt "${#REMOTE_NAME}" ]; then
+          REMOTE_NAME="${_r}"
+          REMOTE_BRANCH="${BASE_REF#"${_r}"/}"
+        fi
+        ;;
+    esac
+  done < <(g remote)
+  if [ -z "${REMOTE_NAME}" ] || ! g rev-parse --verify --quiet "refs/remotes/${BASE_REF}" >/dev/null; then
+    echo "error: REMOTE_CHECK=1 requires BASE_REF to be a remote-tracking ref (<remote>/<branch>)" >&2
+    exit 2
+  fi
+  REMOTE_SHA="$(g ls-remote "${REMOTE_NAME}" "refs/heads/${REMOTE_BRANCH}" 2>/dev/null | cut -f1 | head -n1 || true)"
   if [ -z "${REMOTE_SHA}" ]; then
-    echo "  remote main: UNKNOWN (ls-remote failed)"
+    echo "  remote ${REMOTE_BRANCH}: UNKNOWN (ls-remote failed)"
     VERDICT_DEFERRED=1
   elif [ "${REMOTE_SHA}" = "${BASE_SHA}" ]; then
-    echo "  remote main: ${REMOTE_SHA} (local ${BASE_REF} is up to date)"
+    echo "  remote ${REMOTE_BRANCH}: ${REMOTE_SHA} (local ${BASE_REF} is up to date)"
   else
-    echo "  remote main: ${REMOTE_SHA} (local ${BASE_REF} is STALE; run fetch before the final decision)"
+    echo "  remote ${REMOTE_BRANCH}: ${REMOTE_SHA} (local ${BASE_REF} is STALE; run fetch before the final decision)"
     info "local ${BASE_REF} is stale; real lag is larger than reported"
     VERDICT_DEFERRED=1
   fi
@@ -150,6 +172,20 @@ else
     fi
   done
 fi
+# ignored ファイルは --exclude-standard の untracked 一覧に出ないが、上流が同一パスを追跡対象として
+# 追加すると merge で上書きされ得る（ローカルの ignored データが消える）。ディレクトリ単位
+# （--directory）で列挙し、上流の追加パスとの衝突を HIGH として扱う。
+IGNORED=()
+while IFS= read -r -d '' _p; do IGNORED+=("${_p}"); done \
+  < <(g ls-files --others --ignored --exclude-standard --directory -z)
+for path in ${IGNORED[@]+"${IGNORED[@]}"}; do
+  for added in ${INCOMING_ADDED[@]+"${INCOMING_ADDED[@]}"}; do
+    if collides "${path}" "${added}"; then
+      high "ignored local path collides with a path added upstream (pull would overwrite it): ${path} (upstream: ${added})"
+      break
+    fi
+  done
+done
 
 echo "== Submodules =="
 if [ "${#SUBS[@]}" -eq 0 ]; then
