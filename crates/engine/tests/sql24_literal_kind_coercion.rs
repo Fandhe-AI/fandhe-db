@@ -229,7 +229,8 @@ fn string_literal_input_grammar_and_error_codes() {
     assert_eq!(code(&core, &alice, "qty = '3000000000'"), "22003");
     assert_eq!(code(&core, &alice, "big = '9007199254740993'"), "22003");
     assert_eq!(code(&core, &alice, "big = 9007199254740993"), "22003");
-    // REAL／DOUBLE 列でも、2^53 超の整数字面は丸め前に数値リテラル形と同じ `22003` で拒否する。
+    // REAL／DOUBLE 列は float8 同士の比較として 2^53 超の整数字面も受理し（Issue #1438。
+    // 整数列の `22003` は上で維持）、数値形と文字列形は同じ行集合になる。
     for col in ["r", "d"] {
         for lit in [
             "9007199254740993",
@@ -237,14 +238,14 @@ fn string_literal_input_grammar_and_error_codes() {
             "9.007199254740993e15",
         ] {
             assert_eq!(
-                code(&core, &alice, &format!("{col} = '{lit}'")),
-                "22003",
+                ids(&core, &alice, &format!("{col} = '{lit}'")),
+                ids(&core, &alice, &format!("{col} = {lit}")),
                 "{col} {lit}"
             );
             assert_eq!(
-                code(&core, &alice, &format!("{col} = {lit}")),
-                "22003",
-                "{col} {lit} numeric"
+                ids(&core, &alice, &format!("{col} < {lit}")),
+                vec![1, 2, 4],
+                "{col} {lit}"
             );
         }
     }

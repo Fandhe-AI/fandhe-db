@@ -1806,6 +1806,18 @@ fn bind_expr_in(
                         let (l, lt) = bind_unknown_literal_against(s, &r, rt, env, node_budget)?;
                         return bind_binary(*op, l, lt, r, rt);
                     }
+                    // Issue #1438・SQL-24: REAL／DOUBLE 列と数値リテラルの比較は float8 同士の
+                    // 比較なので 2^53 exactness 判定をかけない（整数列・`id` は従来どおり）。
+                    (col, Expr::Number(raw)) if float_column_ident(col, env) => {
+                        let (l, lt) = bind_expr_in(col, env, node_budget)?;
+                        let (r, rt) = bind_float_number_literal(raw, node_budget)?;
+                        return bind_binary(*op, l, lt, r, rt);
+                    }
+                    (Expr::Number(raw), col) if float_column_ident(col, env) => {
+                        let (l, lt) = bind_float_number_literal(raw, node_budget)?;
+                        let (r, rt) = bind_expr_in(col, env, node_budget)?;
+                        return bind_binary(*op, l, lt, r, rt);
+                    }
                     _ => {}
                 }
             }
@@ -1892,6 +1904,93 @@ fn reject_numeric_literal_vs_operatorless_column(
     }
 }
 
+/// 浮動小数の文字列／数値リテラルを `scalar_float::parse_double` の閉じた文法へ正規化する
+/// （前後空白除去・符号は高々 1 つ・末尾ドット `1.` と先頭ドット `.5` の補完・指数部保持）。
+/// 不正形は `None`（呼び出し側が `22P02` にする）。`bind_unknown_literal_against` と
+/// [`parse_float_operand_literal`] が共有する（Issue #1408・#1438・SQL-24）。
+fn normalize_float_literal_text(s: &str) -> Option<String> {
+    let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    // 符号は高々 1 つ（`+-1`・`-+1` は不正形）
+    let (neg, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if body.starts_with(['+', '-']) {
+        return None;
+    }
+    let (mantissa, exp) = match body.find(['e', 'E']) {
+        Some(i) => (body.get(..i).unwrap_or(""), body.get(i..).unwrap_or("")),
+        None => (body, ""),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let frac_norm = frac_part.filter(|f| !f.is_empty());
+    let int_norm = if int_part.is_empty() && frac_norm.is_some() {
+        "0"
+    } else {
+        int_part
+    };
+    Some(match frac_norm {
+        Some(f) => format!("{neg}{int_norm}.{f}{exp}"),
+        None => format!("{neg}{int_norm}{exp}"),
+    })
+}
+
+/// REAL／DOUBLE 列と比較される数値リテラル（数値形・文字列形の双方）を `f64` へ解釈する
+/// （Issue #1438・SQL-24・TABLE-13・ERR-2・ERR-4 ポインタ）。PostgreSQL は
+/// `float 列 <op> リテラル` を float8 同士の比較として解決するため、整数列・疑似列 `id` 用の
+/// 2^53 exactness 判定（[`parse_number_literal`]）はかけない。書式不正は `22P02`、
+/// オーバーフロー・非ゼロのアンダーフローは `22003`。`-0` は `+0` へ正規化される。
+/// エラーにリテラル本文は含めない。`bind_expr_in` の比較腕と
+/// `bind_unknown_literal_against` から呼ばれる。
+fn parse_float_operand_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
+    let malformed = || {
+        SqlSurfaceError::invalid_text_representation("invalid input syntax for a numeric operand")
+    };
+    let normalized = normalize_float_literal_text(raw).ok_or_else(malformed)?;
+    crate::scalar_float::parse_double(&normalized).map_err(|e| match e {
+        crate::scalar_float::ParseFloatError::Malformed => malformed(),
+        crate::scalar_float::ParseFloatError::OutOfRange => SqlSurfaceError::numeric_out_of_range(
+            "numeric literal is out of range for type double precision",
+        ),
+    })
+}
+
+/// `expr` が UDF 仮引数に遮られない REAL／DOUBLE 実列の参照かを構文的に判定する
+/// （Ident 束縛の優先順〔仮引数 > 実列〕と一致させる。Issue #1438）。
+fn float_column_ident(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    let Expr::Ident(name) = expr else {
+        return false;
+    };
+    let Some(schema) = env.schema else {
+        return false;
+    };
+    if env.params.contains_key(name.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    schema
+        .columns
+        .iter()
+        .find(|c| &c.name == name)
+        .is_some_and(|c| matches!(c.ty, ColumnType::Real | ColumnType::Double))
+}
+
+/// 浮動小数列相手の数値リテラルを束縛する（1 ノード課金。[`parse_float_operand_literal`] 経由）。
+fn bind_float_number_literal(
+    raw: &str,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    Ok((
+        BoundExpr::Number(parse_float_operand_literal(raw)?),
+        ExprType::Scalar,
+    ))
+}
+
 /// 比較の相手側が文字列リテラル（PostgreSQL の unknown 型）のとき、反対側 `other` の型に
 /// 合わせてリテラルを束縛する（Issue #1408・SQL-24・ERR-2・ERR-6）。反対側が数値
 /// （`ExprType::Scalar`）なら数値として解釈する: INTEGER／BIGINT 列は整数文法
@@ -1946,42 +2045,18 @@ fn bind_unknown_literal_against(
             v.to_string()
         }
         _ => {
-            // 文字列からの変換文法は数値リテラル形に揃える: 前後空白除去・先頭 `+`／`-`・
-            // 末尾ドット（`1.`）・先頭ドット（`.5`）を受理する（Codex P1・PR #1420）。
-            // `parse_double` は閉じた文法（整数部・小数部とも 1 桁以上）なので、
-            // 仮数部の欠けた側を正規化した形で検証する。
-            // 検証は書式・範囲（非有限・アンダーフロー）にだけ使い、丸め後の値は使わない。
-            // 丸め値を文字列化して渡すと 2^53 超の整数字面が `parse_number_literal` の
-            // exactness 検査（22003）より前に近傍の f64 へ丸められ、数値リテラル形式との
-            // 等価性が崩れる（Cursor Bugbot 指摘・PR #1420）。そのため正規化済みの
-            // 原文を同じ exactness 検査へ渡す。
-            let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
-            // 符号は高々 1 つ（`+-1`・`-+1` は不正形として 22P02。整数経路と同じ）
-            let (neg, body) = match trimmed.strip_prefix('-') {
-                Some(rest) => ("-", rest),
-                None => ("", trimmed.strip_prefix('+').unwrap_or(trimmed)),
-            };
-            if body.starts_with(['+', '-']) {
-                return Err(invalid());
+            // 文字列からの変換文法は数値リテラル形に揃える（正規化・検証は
+            // [`parse_float_operand_literal`] と共有）。REAL／DOUBLE 列相手の比較は
+            // 浮動小数同士の比較なので、2^53 の exactness 判定（整数列・疑似列 `id` 用）は
+            // かけない（Issue #1438）。式結果相手（`column_ty == None`）だけは従来どおり
+            // 下の `parse_number_literal` を通す。
+            if matches!(column_ty, Some(ColumnType::Real) | Some(ColumnType::Double)) {
+                return Ok((
+                    BoundExpr::Number(parse_float_operand_literal(s)?),
+                    ExprType::Scalar,
+                ));
             }
-            let (mantissa, exp) = match body.find(['e', 'E']) {
-                Some(i) => (body.get(..i).unwrap_or(""), body.get(i..).unwrap_or("")),
-                None => (body, ""),
-            };
-            let (int_part, frac_part) = match mantissa.split_once('.') {
-                Some((i, f)) => (i, Some(f)),
-                None => (mantissa, None),
-            };
-            let frac_norm = frac_part.filter(|f| !f.is_empty());
-            let int_norm = if int_part.is_empty() && frac_norm.is_some() {
-                "0"
-            } else {
-                int_part
-            };
-            let normalized = match frac_norm {
-                Some(f) => format!("{neg}{int_norm}.{f}{exp}"),
-                None => format!("{neg}{int_norm}{exp}"),
-            };
+            let normalized = normalize_float_literal_text(s).ok_or_else(invalid)?;
             crate::scalar_float::parse_double(&normalized).map_err(|e| match e {
                 crate::scalar_float::ParseFloatError::Malformed => invalid(),
                 crate::scalar_float::ParseFloatError::OutOfRange => out_of_range(),
@@ -3335,6 +3410,41 @@ fn apply_vector_scalar_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1438: 浮動小数列相手のリテラルは 2^53 exactness 判定をかけず f64 範囲で解釈する。
+    #[test]
+    fn float_operand_literal_accepts_large_values_and_normalizes() {
+        for (raw, want) in [
+            ("1e21", 1e21),
+            ("1E+21", 1e21),
+            ("-1e21", -1e21),
+            ("9007199254740993", 9007199254740992.0),
+            ("1.", 1.0),
+            (".5e1", 5.0),
+            ("0e999", 0.0),
+            ("1e-310", 1e-310),
+        ] {
+            assert_eq!(parse_float_operand_literal(raw).expect(raw), want, "{raw}");
+        }
+        let zero = parse_float_operand_literal("-0").expect("-0");
+        assert!(zero == 0.0 && zero.is_sign_positive());
+    }
+
+    #[test]
+    fn float_operand_literal_rejects_out_of_range_without_echoing_literal() {
+        for raw in ["1e309", "-1e309", "1e-400", "1e99999999999999999999"] {
+            let err = parse_float_operand_literal(raw).unwrap_err();
+            assert_eq!(err.wire_code(), "22003", "{raw}");
+            assert!(!format!("{err:?}").contains(raw), "{raw}");
+        }
+        for raw in ["", "abc", "+-1", "1e", "inf"] {
+            assert_eq!(
+                parse_float_operand_literal(raw).unwrap_err().wire_code(),
+                "22P02",
+                "{raw}"
+            );
+        }
+    }
     use crate::catalog::ColumnDef;
 
     fn schema_with_vector() -> TableSchema {

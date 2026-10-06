@@ -736,3 +736,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/wire-server/src/http/query/ddl.rs`（`primary_key` の `name` を `CONSTRAINT <ident> PRIMARY KEY (...)` へ写像。単体テスト更新・追加）、`schema.rs`（コメントのみ）、`crates/wire-server/tests/nosql13_ddl.rs`（結合テスト追加）、`crates/wire-server/docs/nosql-api.md`・`docs/design/nosql-ddl-mapping.md`。engine の変更なし。
 - **性質**: 名前付き主キーは SQL と同じカタログ表現になり、その名前で `DROP CONSTRAINT` できる。重複宣言（`42P16`）・名前衝突・名前付き `(id)` 単独（`42601`）の `wire_code` は SQL と一致（engine に一本化）。単体テストの拒否ケース `primary_key` + `name` は仕様変更により受理側へ移し、`unique`／`foreign_key` への `name` などの拒否ケースを追加した。RLS・テナント境界・fail-closed・依存は不変。
 - **対象外**: NoSQL の名前付き UNIQUE／FK、`alter_table` による主キーの追加・削除、3 クライアント層 B。
+
+## Issue #1438: 浮動小数列と大きな数値リテラル（1e21 等）の比較を受理する
+
+- **対象ビヘイビア**: SQL-24・TABLE-13（関連: ERR-2・ERR-4・WIRE-12）。Issue #1418 の対象外として残っていた項目の解消。
+- **原因**: 比較の数値リテラル束縛が相手の列型によらず 2^53 の exactness 判定を適用しており、`REAL`／`DOUBLE` 列と `1e21` の比較が `22003` になっていた。
+- **変更箇所**: `crates/engine/src/sql/udf_call.rs`（比較腕に浮動小数列用の束縛を追加。`parse_float_operand_literal`・`normalize_float_literal_text` を新設し、文字列リテラル形と共有）。結合テスト `sql24_float_large_literal_compare.rs` 新設、`sql24_literal_kind_coercion`・`scalar_index_numeric`・`prepared_params`・NoSQL filter 等価性テストを更新。
+- **性質**: 浮動小数列相手は float8 比較（範囲内は受理、範囲外は `22003`）。整数列・`id`・式結果・HAVING は不変。索引経路と全走査の結果は一致する。
+- **対象外**: 算術式内の大きなリテラル、HAVING リテラル、整数列と範囲外リテラルの比較（PostgreSQL は numeric 比較で受理するが本 Issue では現状維持）、REAL 列に対する f32 範囲外の `$n`／文字列リテラルの float4 厳密解釈。
