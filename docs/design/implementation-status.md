@@ -783,3 +783,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **決定**: 反映経路を `update-external.yml` の同期 PR に一本化し、人手の squash merge と CI green を必須とする。前進条件・順序・公開範囲などは [spec-submodule-sync-policy.md](spec-submodule-sync-policy.md) に記録した。
 - **変更箇所**: `docs/design/spec-submodule-sync-policy.md`（新規）・本節。コード・依存の変更なし。
 - **対象外**: メイン作業ツリーの追従（#1329）・`push1230b.log` の整理（#1330）・ブランチ／マージ戦略（#1334）・`SUBMODULE_AUTO_MERGE` の有効化（オーナー判断）。
+
+## Issue #1331: 実装・テスト・レビュー面の残課題の集約
+
+- **調査**: main の CI・週次 schedule（bench・recall）の状況、CI から実行されないテスト、実装記録の「対象外」の残り、CLAUDE.md・README の書き漏れ。
+- **成果物**: [remaining-issues-audit-2026-10.md](remaining-issues-audit-2026-10.md)（2026-10-06・`origin/main` `1b3d517e` 時点）。失敗中の CI・定期ワークフローは無かった。
+- **是正した書き漏れ**: CLAUDE.md の構成ツリー（`detect-features.yml`・`update-external.yml`・`simd-codegen-check`・主要スクリプト・ルート直下の項目）と README のタスクランナー表（ガード系・クロス確認・`make test-eval`）。
+- **対象外**: Python テストの make・CI への接続、裸の `#[ignore]` への理由付与、#1454 の成果物の反映（未マージ）、未解消の対象外項目の実装。Issue は起票していない。
+- **性質**: ドキュメントのみの変更。コード・依存・CI・Makefile は不変。
