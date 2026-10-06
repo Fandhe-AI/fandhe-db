@@ -776,3 +776,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **ポインタ更新の履歴**（PR 番号のみ）: #951 → #1059 → #1142 → #1144 → #1161 → #1208（`dd640e7d`）→ #1368（`9d8b71ac`）→ #1443（`16136c84`）。本記録の時点で main が記録するポインタは `16136c84` で、`f18bb6ac` の取り込み内容（TASK-228 の分解記録・親 Issue #941 は CLOSED）は反映済みである。
 - **本 Issue でのポインタ操作**: なし。ポインタの更新・巻き戻し、およびメイン作業ツリーの submodule 作業コピーの修正は行っていない（作業コピーのずれの扱いは #1329、breaking change と spec の対応確認は #1326、spec 側の整合確認は #1327 の担当）。
 - **後続 Issue への引き継ぎ**: #1326 は #1215・#1224 の breaking change を、ポインタ `16136c84` 時点の `docs/spec/04-behavior/` 配下（`records/` を含む）のビヘイビア ID と照合する。
+
+## Issue #1333: spec リポ側対応の main リポへの反映とマージ方針の決定
+
+- **確認結果**: `origin/main` の `docs/spec` gitlink（`16136c84`）はリモート spec main と一致しており、本 Issue でのポインタ操作はない（更新・巻き戻しなし）。
+- **決定**: 反映経路を `update-external.yml` の同期 PR に一本化し、人手の squash merge と CI green を必須とする。前進条件・順序・公開範囲などは [spec-submodule-sync-policy.md](spec-submodule-sync-policy.md) に記録した。
+- **変更箇所**: `docs/design/spec-submodule-sync-policy.md`（新規）・本節。コード・依存の変更なし。
+- **対象外**: メイン作業ツリーの追従（#1329）・`push1230b.log` の整理（#1330）・ブランチ／マージ戦略（#1334）・`SUBMODULE_AUTO_MERGE` の有効化（オーナー判断）。
