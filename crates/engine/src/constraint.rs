@@ -4540,4 +4540,28 @@ mod tests {
             recode_key_for_types(&good, &src, &[&ColumnType::BigInt, &ColumnType::BigInt]).is_err()
         );
     }
+
+    /// INTEGER／BIGINT の `Ok(None)` 規則に浮動小数版は無い。REAL／DOUBLE PRECISION は D3 により
+    /// FK 列になり得ないため、浮動小数の組は値に依らず内部矛盾として `Err`（fail-closed。Issue #1434）。
+    #[test]
+    fn recode_rejects_real_double_pairs_fail_closed() {
+        let real = ColumnType::Real;
+        let double = ColumnType::Double;
+        let r2d = canon(&[ScalarRef::Real(1.5)]);
+        assert!(recode_key_for_types(&r2d, &[&real], &[&double]).is_err());
+        for v in [1.0e300, 0.1] {
+            let d = canon(&[ScalarRef::Double(v)]);
+            assert!(
+                recode_key_for_types(&d, &[&double], &[&real]).is_err(),
+                "{v}"
+            );
+        }
+        let mixed = canon(&[ScalarRef::Text("a"), ScalarRef::Real(1.5)]);
+        assert!(recode_key_for_types(
+            &mixed,
+            &[&ColumnType::Text, &real],
+            &[&ColumnType::Text, &double]
+        )
+        .is_err());
+    }
 }

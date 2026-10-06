@@ -715,3 +715,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（制約なしの表 `notes` を使うテスト 9 件を追加）、`docs/design/explicit-transaction.md`・`wire-multi-statement.md`（検証場所の追記）。本番コードの変更なし。
 - **性質**: 単一行形・述語形の 0 行 `DELETE` について、(a) 明示トランザクションの唯一の文／先頭文の再送、(b) `RETURNING` 付き（`RowDescription` → `DELETE 0`、再送は先行メッセージ無しの `ErrorResponse`）、(c) 暗黙トランザクション（複数文メッセージ。再送は `ReadyForQuery('I')`）がいずれも台帳由来の `23505`（固定文言）になる。台帳照合は候補列挙より先（後から INSERT された行は消えない）、台帳はテナント単位、途中エラーで全体ロールバックされた暗黙トランザクションは台帳を残さない。
 - **対象外**: 3 クライアント層 B、拡張クエリプロトコル、engine 層での `RETURNING`／暗黙トランザクション版、HTTP（NoSQL）表層（トランザクションを持たない）。
+
+## Issue #1434: REAL と DOUBLE PRECISION が混在する FOREIGN KEY の照合を確かめる
+
+- **対象ビヘイビア**: TABLE-17・TABLE-19・TABLE-20（Issue #1402・#1414 の後続）。
+- **変更箇所**: `crates/engine/tests/sql_alter_column_type_key_columns.rs`（結合テスト 2 件）、`crates/engine/src/constraint.rs`（`mod tests` に単体テスト 1 件）、`docs/design/foreign-key.md`（追記）。本番コードの変更なし。
+- **性質**: REAL／DOUBLE PRECISION は D3 により FK 列になれず、片側だけ拡大した混在 FK の状態は作れない。現契約として (a) CREATE TABLE（表制約・列制約・自己参照）と ALTER TABLE ADD FOREIGN KEY が `42830` で副作用なし、(b) REAL の UNIQUE 列を DOUBLE PRECISION へ拡大した後も値を保って `23505` が働きテナント内に閉じる、(c) `recode_key_for_types` の浮動小数の組は `Err`（fail-closed）、を固定した。
+- **対象外**: REAL／DOUBLE PRECISION の FK 列受理と f32／f64 キーの読み替え実装（D3 を覆す機能拡張でありオーナー判断事項。spec 側の同期記録と D3 の食い違いの整理を含む）、NoSQL（HTTP）`references` 経由の射影テスト、`unique_constraint.rs`・`sql/allowlist.rs` の古いコメント。
