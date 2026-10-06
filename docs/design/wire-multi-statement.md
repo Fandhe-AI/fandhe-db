@@ -277,6 +277,10 @@ Issue #1175 による変化:
   途中エラーでの全体ロールバック（行・`operation_id` 台帳・セッション状態）・
   `ReadyForQuery('I')`・RLS・区切りの密輸防止。`wire_fault_injection_cli.rs` は
   暗黙トランザクションの commit 後 panic の緊急応答が 1 回だけ送られること。
+- `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（Issue #1433）:
+  暗黙トランザクション内の 0 行 `DELETE`（`RETURNING` 有無）の再送が台帳由来の
+  `23505`・`ReadyForQuery('I')` になること、途中エラーで全体ロールバックされた場合は
+  台帳が残らないこと。
 - 回帰: `crates/engine/tests/rls_implicit.rs`（engine API の単一文 `42601`
   契約）・既存 wire 結合テスト一式（`wire1_simple_query.rs` 等）・
   `wire_fault_injection_cli.rs`（commit 後 panic の緊急応答経路が文単位の

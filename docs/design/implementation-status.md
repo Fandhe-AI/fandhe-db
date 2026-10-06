@@ -708,3 +708,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/sql/lexer.rs`（`!=` を `<>` と同じ 2 つの `Punct` へ字句化。`!` 単独は拒否のまま）、`sql/allowlist.rs`（`<col> <> '<lit>'` を `Not(Equality)` へ desugar）、`sql/params.rs`（Prepared の Describe 用ダミーフラグ序数が `<> '<lit>'` を実リテラルとして数える）、`sql/parser.rs`（疑似列 `id` を数値書き換えの対象へ追加、BOOLEAN 列 × 文字列の範囲比較・`IN`・`BETWEEN` を `BoolEquality`／`IsNull`／常に偽の `Or` へ書き換える束縛処理）。
 - **性質**: 新しい AST／トークン variant は無く、既存形への desugar のみ。(a) `<>`／`!=` は `NOT col = 'x'` と同じ結果・同じ `wire_code`。(b) `id` × 文字列は数値リテラル形と同じ結果（`id = 'abc'` は `22P02`、2^53 超の厳密表現範囲外は数値リテラル形と同じ `22003`）。実カラム `id` があればそちらが優先。(c) BOOLEAN は `false < true` の順序で、NULL 行は除外。解釈できない文字列は `22P02`（メッセージにリテラルを含めない）。
 - **対象外**: CHECK 本体での BOOLEAN 範囲・`IN`・`BETWEEN`（従来どおり拒否）、裸の数値リテラルとの `<>`、JOIN の修飾名・逆向きの文字列リテラル、NoSQL（HTTP）`filter`。空白を挟んだ `< >` も `<>` として受理される既存の寛容さは据え置き。
+
+## Issue #1433: 明示トランザクションの 0 行 DELETE の再送を wire・RETURNING・暗黙トランザクションで確かめる
+
+- **対象ビヘイビア**: RECOVER-12・SQL-18・SQL-21・WIRE-16（関連: WIRE-19・RECOVER-10・ERR-1・ERR-2・RLS-10）。Issue #1415（engine 層 A）の対象外だった 3 経路の後続。
+- **変更箇所**: `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（制約なしの表 `notes` を使うテスト 9 件を追加）、`docs/design/explicit-transaction.md`・`wire-multi-statement.md`（検証場所の追記）。本番コードの変更なし。
+- **性質**: 単一行形・述語形の 0 行 `DELETE` について、(a) 明示トランザクションの唯一の文／先頭文の再送、(b) `RETURNING` 付き（`RowDescription` → `DELETE 0`、再送は先行メッセージ無しの `ErrorResponse`）、(c) 暗黙トランザクション（複数文メッセージ。再送は `ReadyForQuery('I')`）がいずれも台帳由来の `23505`（固定文言）になる。台帳照合は候補列挙より先（後から INSERT された行は消えない）、台帳はテナント単位、途中エラーで全体ロールバックされた暗黙トランザクションは台帳を残さない。
+- **対象外**: 3 クライアント層 B、拡張クエリプロトコル、engine 層での `RETURNING`／暗黙トランザクション版、HTTP（NoSQL）表層（トランザクションを持たない）。
