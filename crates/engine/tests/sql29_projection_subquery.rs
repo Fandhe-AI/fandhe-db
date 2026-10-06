@@ -370,6 +370,147 @@ fn projection_subquery_static_errors_win_over_deferred_runtime_error() {
     assert_eq!(code(&core, &ctx, &outer_static), "22000");
 }
 
+/// 入れ子 WHERE のスカラーサブクエリが 2 行以上を返す `21000` も、外側 0 行なら発生せず、
+/// 外側に行があれば返る（Issue #1432・SQL-29・ERR-6）。Scan 形・集計形・深さ 2 を通す。
+#[test]
+fn projection_subquery_nested_where_cardinality_violation_is_deferred() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("(SELECT qty FROM {REFS} LIMIT 10)");
+    let inners = [
+        format!("(SELECT name FROM {REFS} WHERE qty = {multi} LIMIT 1)"),
+        format!("(SELECT COUNT(*) FROM {REFS} WHERE qty = {multi})"),
+        format!(
+            "(SELECT name FROM {REFS} WHERE qty IN (SELECT qty FROM {REFS} WHERE qty = {multi} LIMIT 10) LIMIT 1)"
+        ),
+    ];
+    for inner in &inners {
+        let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+        assert!(run(&core, &ctx, &none).rows.is_empty(), "{inner}");
+        let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+        assert_eq!(code(&core, &ctx, &some), "21000", "{inner}");
+    }
+}
+
+/// 遅延した `21000` でも、外側 0 行の結果の列メタデータは遅延なしの場合と同じ。
+#[test]
+fn projection_subquery_deferred_cardinality_keeps_column_meta() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let deferred = format!(
+        "SELECT name, (SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) LIMIT 1) AS v FROM {ITEMS} WHERE qty > 999 LIMIT 100"
+    );
+    let plain = format!(
+        "SELECT name, (SELECT name FROM {REFS} WHERE qty = 1 LIMIT 1) AS v FROM {ITEMS} WHERE qty > 999 LIMIT 100"
+    );
+    let a = run(&core, &ctx, &deferred);
+    let b = run(&core, &ctx, &plain);
+    assert_eq!(a.columns, b.columns);
+}
+
+/// 静的エラー（内側の未知列・外側の未知列）は、21000 が遅延対象でも外側 0 行で必ず返る。
+#[test]
+fn projection_subquery_static_errors_win_over_deferred_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let inner_static = format!("(SELECT name FROM {REFS} WHERE nope = 1 AND {multi} LIMIT 1)");
+    let q = format!("SELECT name, {inner_static} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &q), "22000");
+    let inner = format!("(SELECT name FROM {REFS} WHERE {multi} LIMIT 1)");
+    let outer_static = format!("SELECT nope, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &outer_static), "22000");
+}
+
+/// 先行サブクエリが 21000 でも、後続サブクエリの静的エラー（未知テーブル・未知列）は
+/// 外側 0 行で必ず返る（Issue #1432 codex-review P1）。Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_later_static_error_wins_over_earlier_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let bad_table = "qty = (SELECT qty FROM no_such_table LIMIT 1)";
+    let bad_col = format!("qty = (SELECT nope FROM {REFS} LIMIT 1)");
+    for bad in [bad_table.to_string(), bad_col] {
+        let inners = [
+            format!("(SELECT name FROM {REFS} WHERE {multi} AND {bad} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {multi} AND {bad})"),
+            // OR 分岐内でも、先行分岐の 21000 が後続分岐の静的エラーを隠さない。
+            format!("(SELECT name FROM {REFS} WHERE {multi} OR {bad} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {multi} OR {bad})"),
+        ];
+        for inner in &inners {
+            let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+            let c = code(&core, &ctx, &none);
+            assert_ne!(c, "21000", "{inner}");
+            let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+            assert_eq!(code(&core, &ctx, &some), c, "{inner}");
+        }
+    }
+}
+
+/// 21000 を返すスカラーサブクエリを多数 OR で並べても、失敗時の静的再検査が予算枯渇
+/// （54000）を新規生成せず、外側 0 行なら成功し行ありなら 21000 のまま
+/// （Issue #1432 codex-review P1）。Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_many_or_cardinality_does_not_exhaust_probe_budget() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let ors = vec![multi; 17].join(" OR ");
+    let inners = [
+        format!("(SELECT name FROM {REFS} WHERE {ors} LIMIT 1)"),
+        format!("(SELECT COUNT(*) FROM {REFS} WHERE {ors})"),
+    ];
+    for inner in &inners {
+        let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+        assert!(run(&core, &ctx, &none).rows.is_empty(), "{inner}");
+        let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+        assert_eq!(code(&core, &ctx, &some), "21000", "{inner}");
+    }
+}
+
+/// 他テナントの行数は 21000 の有無に影響しない（RLS-10 (b)）。
+#[test]
+fn projection_subquery_nested_cardinality_is_tenant_isolated() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let a = ctx_for("tenant-a");
+    let b = ctx_for("tenant-b");
+    seed(&core, &a);
+    seed(&core, &b);
+    for id in 10..13 {
+        ins(&core, &b, REFS, id, "rb", Some(id as i64));
+    }
+    let inner =
+        format!("(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) LIMIT 1)");
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert!(!run(&core, &a, &some).rows.is_empty());
+    assert_eq!(code(&core, &b, &some), "21000");
+    assert!(run(&core, &b, &none).rows.is_empty());
+}
+
 #[test]
 fn projection_subquery_alias_of_id_keeps_numeric_type() {
     let (core, path) = new_core();
@@ -483,4 +624,182 @@ fn id_in_subquery_matches_ids_beyond_2_pow_53() {
         )),
         vec![big2]
     );
+}
+
+/// 入れ子 WHERE の比較・IN の対象列が未知列／型不一致なら、内側が 2 行以上でも静的エラーが
+/// 21000 に隠れず、外側 0 行でも返る（Issue #1432 codex-review P1）。Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_static_target_error_wins_over_multi_row_inner() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let preds = [
+        format!("nope = (SELECT qty FROM {REFS} LIMIT 10)"),
+        format!("nope IN (SELECT qty FROM {REFS} LIMIT 10)"),
+        format!("name = (SELECT qty FROM {REFS} LIMIT 10)"),
+        format!("name IN (SELECT qty FROM {REFS} LIMIT 10)"),
+    ];
+    for pred in &preds {
+        let inners = [
+            format!("(SELECT name FROM {REFS} WHERE {pred} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {pred})"),
+            // 先行する 21000 の述語があっても、後続の対象列エラーは隠れない。
+            format!("(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) AND {pred} LIMIT 1)"),
+        ];
+        for inner in &inners {
+            let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+            let c = code(&core, &ctx, &none);
+            assert_eq!(c, "22000", "{inner}");
+            let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+            assert_eq!(code(&core, &ctx, &some), c, "{inner}");
+        }
+    }
+}
+
+/// 比較・IN の内側サブクエリ自身が入れ子の WHERE スカラーサブクエリで 21000 になっても、
+/// 同じ述語の対象列エラーは隠れず、外側 0 行でも返る（Issue #1432 codex-review P1）。
+/// Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_static_target_error_wins_over_nested_inner_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let nested =
+        format!("(SELECT qty FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) LIMIT 1)");
+    let preds = [
+        format!("nope = {nested}"),
+        format!("nope IN {nested}"),
+        format!("name = {nested}"),
+        format!("name IN {nested}"),
+    ];
+    for pred in &preds {
+        let inners = [
+            format!("(SELECT name FROM {REFS} WHERE {pred} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {pred})"),
+        ];
+        for inner in &inners {
+            let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+            let c = code(&core, &ctx, &none);
+            assert_eq!(c, "22000", "{inner}");
+            let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+            assert_eq!(code(&core, &ctx, &some), c, "{inner}");
+        }
+    }
+}
+
+/// 入れ子 WHERE の `OR` 内にあるサブクエリを含まない葉の未知列も、21000 に隠れず
+/// 外側 0 行でも `22000` を返す（AND 形と同じ。Issue #1432 PR レビュー指摘）。
+#[test]
+fn projection_subquery_or_leaf_static_error_wins_over_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let inner = format!(
+        "(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) OR nope = 1 LIMIT 1)"
+    );
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &none), "22000");
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    assert_eq!(code(&core, &ctx, &some), "22000");
+}
+
+/// 先頭で 21000 を起こし後続に多数のサブクエリ述語を置いても、エラー経路の静的検証は
+/// 内側を実行しない（予算を消費せず 54000 も生まない）ため、外側 0 行なら成功し、
+/// 行ありなら 21000 のまま（Issue #1432 codex-review P1）。
+#[test]
+fn projection_subquery_error_path_static_check_does_not_execute() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let many: Vec<String> = (0..20)
+        .map(|_| format!("qty IN (SELECT qty FROM {REFS} LIMIT 10)"))
+        .collect();
+    let inner = format!(
+        "(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) AND {} LIMIT 1)",
+        many.join(" AND ")
+    );
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    assert_eq!(code(&core, &ctx, &some), "21000");
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert!(run(&core, &ctx, &none).rows.is_empty());
+}
+
+/// 先頭で 21000 を起こし、実行回数予算（16 回）を超える数の有効なサブクエリ述語の後ろに
+/// 静的エラー（未知テーブル・未知列・対象列の型不一致）を置いても、静的エラーが外側の
+/// 行数に関わらず返る（予算枯渇で静的検証が打ち切られない。Issue #1432 codex-review P1）。
+/// Scan 形・集計形、AND・OR の連結を通す。
+#[test]
+fn projection_subquery_static_error_after_budget_sized_predicates_is_reported() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let valid: Vec<String> = (0..20)
+        .map(|_| format!("qty IN (SELECT qty FROM {REFS} LIMIT 10)"))
+        .collect();
+    let bads = [
+        (
+            "qty = (SELECT qty FROM no_such_table LIMIT 1)".to_string(),
+            "42P01",
+        ),
+        (format!("qty = (SELECT nope FROM {REFS} LIMIT 1)"), "22000"),
+        (
+            format!("name IN (SELECT qty FROM {REFS} LIMIT 10)"),
+            "22000",
+        ),
+        (
+            format!("EXISTS (SELECT qty FROM {REFS} WHERE nope = 1 LIMIT 1)"),
+            "22000",
+        ),
+    ];
+    for (bad, expected) in &bads {
+        for sep in [" AND ", " OR "] {
+            let preds = format!("{multi}{sep}{}{sep}{bad}", valid.join(sep));
+            let inners = [
+                format!("(SELECT name FROM {REFS} WHERE {preds} LIMIT 1)"),
+                format!("(SELECT COUNT(*) FROM {REFS} WHERE {preds})"),
+            ];
+            for inner in &inners {
+                let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+                assert_eq!(code(&core, &ctx, &none), *expected, "{inner}");
+                let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+                assert_eq!(code(&core, &ctx, &some), *expected, "{inner}");
+            }
+        }
+    }
+}
+
+/// `EXISTS` の内側 WHERE で入れ子の 21000 が起きても、同じ `EXISTS` 内側の静的エラーは
+/// 外側 0 行でも返る（Issue #1432）。
+#[test]
+fn projection_subquery_static_error_inside_exists_wins_over_nested_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let exists = format!(
+        "EXISTS (SELECT qty FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) AND nope = 1 LIMIT 1)"
+    );
+    let inner = format!("(SELECT name FROM {REFS} WHERE {exists} LIMIT 1)");
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &none), "22000");
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    assert_eq!(code(&core, &ctx, &some), "22000");
 }

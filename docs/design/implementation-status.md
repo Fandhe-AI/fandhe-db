@@ -744,3 +744,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/sql/udf_call.rs`（比較腕に浮動小数列用の束縛を追加。`parse_float_operand_literal`・`normalize_float_literal_text` を新設し、文字列リテラル形と共有）。結合テスト `sql24_float_large_literal_compare.rs` 新設、`sql24_literal_kind_coercion`・`scalar_index_numeric`・`prepared_params`・NoSQL filter 等価性テストを更新。
 - **性質**: 浮動小数列相手は float8 比較（範囲内は受理、範囲外は `22003`）。整数列・`id`・式結果・HAVING は不変。索引経路と全走査の結果は一致する。
 - **対象外**: 算術式内の大きなリテラル、HAVING リテラル、整数列と範囲外リテラルの比較（PostgreSQL は numeric 比較で受理するが本 Issue では現状維持）、REAL 列に対する f32 範囲外の `$n`／文字列リテラルの float4 厳密解釈。
+
+## Issue #1432: 投影位置スカラーサブクエリ内の入れ子 WHERE スカラーサブクエリの 21000 を外側の行数に合わせる
+
+- **対象ビヘイビア**: SQL-29・ERR-6（関連: ERR-4・RLS-10 (b)・TASK-213）。
+- **変更箇所**: `crates/engine/src/sql/subquery.rs`（`resolve_scalar_projection_items` の遅延条件へ `SqlSurfaceError::CardinalityViolation` を追加。`22xxx` と同じく束縛成功後〔`meta_sink` 確定済み〕に限る）、テスト（`crates/engine/tests/sql29_projection_subquery.rs`・新規 `crates/wire-server/tests/wire_sql29_scalar_subquery.rs`）、`docs/design/sql-subquery.md`。
+- **性質**: 入れ子由来の `21000` は外側の結果が 0 行なら発生せず、1 行以上なら返る（#1404 で対象外としていた非対称の解消）。静的エラー優先・自テナント可視行のみで判定・fail-closed・依存は不変。wire 経由は簡易クエリで `21000` の ErrorResponse と接続回復を固定。
+- **静的エラー優先の検証**: 入れ子 WHERE が遅延対象エラーで打ち切られたときは、残りのサブクエリ述語（`OR` の分岐・`NOT`・`EXISTS` の内側を含む）を内側の実行なしに静的検証する（`static_validate_subquery_predicates`）。実行回数予算を消費しないため、予算枯渇で後続の静的エラーが見落とされない。実行経路の予算（16 回）は不変。
+- **対象外**: トップレベル WHERE 値位置の `21000`（走査前に解決するため即時のまま）。拡張クエリプロトコルはサブクエリを含む文を Bind で `42601` とする既存設計のため `21000` に到達せず、その契約（`42601`・Sync 後の回復）をテストで固定するに留める。

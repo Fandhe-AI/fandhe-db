@@ -31,6 +31,7 @@
 //! [`resolve_scalar_projection_items`] が内側を実行して列メタデータと値（0 行は NULL）へ
 //! 解決し、[`merge_scalar_projection_items`] が外側の走査結果へ SELECT リスト上の位置で
 //! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `21000`。
+//! 内側 WHERE に入れ子のスカラーサブクエリの `21000` も同様に外側の行数判明まで遅延する（Issue #1432）。
 //!
 //! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
 //! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
@@ -51,7 +52,9 @@
 //!   `Parser::require_subquery_depth`）が担う。
 //! - 1 文（トップレベル実行 1 回）あたりの内側クエリ実行回数は本モジュールの
 //!   [`MAX_SUBQUERY_EXECUTIONS`] で頭打ちにする（`budget` を呼び出し階層全体で
-//!   共有する `&mut usize` として引き回す）。
+//!   共有する `&mut usize` として引き回す）。入れ子 WHERE が遅延対象エラーで打ち切られた
+//!   ときの静的検証（[`static_validate_subquery_predicates`]）は内側を実行せず、スキーマ取得と
+//!   束縛のみ（文の長さとネスト深さで有界）のため、この予算を消費しない（Issue #1432）。
 //! - 内側の可視行数は [`crate::core::MAX_SEARCH_K`] を超えたら `54000`。
 //! - `IN`／`NOT IN` は内側の distinct 値を [`crate::declarative_filter::MAX_IN_LIST_ITEMS`]
 //!   件以下のチャンクへ分け、チャンクごとの `WherePredicate::InList`（既存評価器の
@@ -471,13 +474,7 @@ fn execute_inner_query_with_meta(
             in_value_budget,
             meta_sink,
         )?,
-        _ => {
-            return Err(SqlSurfaceError::unsupported(
-                "subquery must be a plain SELECT ... FROM ... [WHERE ...] LIMIT n \
-                 (no HYBRID / USING PLAN / set operation / JOIN; GROUP BY only as a scalar \
-                 aggregate)",
-            ))
-        }
+        _ => return Err(unsupported_inner_statement()),
     };
 
     // `bind_scan` の LIMIT 範囲検証とは独立に、内側の可視結果行数を
@@ -494,20 +491,26 @@ fn execute_inner_query_with_meta(
     Ok(result)
 }
 
-/// [`execute_inner_query`] の広域取得（`Statement::Scan`）側の本体。
-#[allow(clippy::too_many_arguments)]
-fn execute_inner_scan_statement(
-    mut validated: ValidatedScan,
+/// 内側が広域取得・スカラー用途の集計形のいずれでもない場合の `42601`。
+/// [`execute_inner_query_with_meta`] と [`static_validate_inner_query`] で共有する。
+fn unsupported_inner_statement() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported(
+        "subquery must be a plain SELECT ... FROM ... [WHERE ...] LIMIT n \
+         (no HYBRID / USING PLAN / set operation / JOIN; GROUP BY only as a scalar \
+         aggregate)",
+    )
+}
+
+/// 内側 Scan の、WHERE 解決・束縛より前に行う静的検査（ウィンドウ関数・未知テーブル・
+/// 相関参照・内側の投影位置サブクエリ・投影列数）を行い、内側スキーマを返す。
+/// 実行経路（[`execute_inner_scan_statement`]）と失敗時の静的検証
+/// （[`static_validate_inner_query`]）が同じ検査を共有する（2 系統の検査を分岐させない）。
+fn inner_scan_prechecks(
+    validated: &ValidatedScan,
     intent: InnerScanIntent,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
-    ctx: &PolicyContext,
-    lookup: &impl TableLookup,
-    udfs: &UdfRegistry,
-    budget: &mut usize,
-    in_value_budget: &mut usize,
-    meta_sink: &mut Option<Vec<ColumnMeta>>,
-) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+) -> Result<TableSchema, SqlSurfaceError> {
     // Cursor Bugbot 指摘対応: ウィンドウ関数（SQL-30・TASK-214、Issue #930）を
     // 含む内側は一律拒否する。`window_items` が非空だと `sql::scan::execute_scan` は
     // `sql::window::execute_window_scan` へ分岐し、`LIMIT` による早期終了なしに
@@ -523,7 +526,7 @@ fn execute_inner_scan_statement(
 
     // 相関サブクエリは束縛・走査より前に静的に拒否する（Issue #1191）。
     reject_correlated(
-        &scan_referenced_columns(&validated),
+        &scan_referenced_columns(validated),
         &inner_schema,
         outer_scopes,
     )?;
@@ -555,17 +558,51 @@ fn execute_inner_scan_statement(
             ));
         }
     }
+    Ok(inner_schema)
+}
+
+/// 内側の集計形（スカラー用途）の、WHERE 解決・束縛より前に行う静的検査（集計項目数・
+/// 未知テーブル・相関参照）を行い、内側スキーマを返す。[`inner_scan_prechecks`] の集計版。
+fn inner_aggregate_prechecks(
+    validated: &ValidatedAggregate,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+) -> Result<TableSchema, SqlSurfaceError> {
+    if validated.items.len() != 1 {
+        return Err(SqlSurfaceError::unsupported(
+            "subquery used as a value must select exactly one column",
+        ));
+    }
+    let inner_schema = inner_table_schema(read_txn, &validated.table_name)?;
+    reject_correlated(
+        &aggregate_referenced_columns(validated),
+        &inner_schema,
+        outer_scopes,
+    )?;
+    Ok(inner_schema)
+}
+
+/// [`execute_inner_query`] の広域取得（`Statement::Scan`）側の本体。
+#[allow(clippy::too_many_arguments)]
+fn execute_inner_scan_statement(
+    mut validated: ValidatedScan,
+    intent: InnerScanIntent,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    meta_sink: &mut Option<Vec<ColumnMeta>>,
+) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?;
 
     // 自身の WHERE に含まれるさらに深いサブクエリを、束縛（`bind_scan`）の前に
     // 解決する（深さ優先。`depth` は構文解析段で `MAX_SUBQUERY_DEPTH` 検査
     // 済みのため、ここでは budget のみ検査すれば足りる）。
-    // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
-    let static_preds: Vec<WherePredicate> = validated
-        .where_predicates
-        .iter()
-        .filter(|p| !predicate_contains_subquery(p))
-        .cloned()
-        .collect();
+    // 実行時エラー時に、解決前の述語で静的検証を完了させるための控え。
+    let original_preds: Vec<WherePredicate> = validated.where_predicates.clone();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
     validated.where_predicates = match resolve_where_predicates(
@@ -585,8 +622,18 @@ fn execute_inner_scan_statement(
             // 内側 WHERE の静的な誤り（未知列等）はデータ依存の実行時エラーより優先して
             // 返す（可視データで契約が変わらないよう、サブクエリを含まない述語は
             // 束縛検証を完了させる）。
-            if intent == InnerScanIntent::ScalarValue {
-                validated.where_predicates = static_preds;
+            if intent != InnerScanIntent::ExistenceOnly {
+                if is_deferrable_runtime_error(&e) {
+                    // 実行せず予算も消費しない静的検証（fail-closed。Issue #1432）。
+                    static_validate_subquery_predicates(
+                        &original_preds,
+                        &chain,
+                        read_txn,
+                        lookup,
+                        udfs,
+                    )?;
+                }
+                validated.where_predicates = static_validation_predicates(&original_preds);
                 let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
                 *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
             }
@@ -640,24 +687,9 @@ fn execute_inner_aggregate_statement(
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
-    if validated.items.len() != 1 {
-        return Err(SqlSurfaceError::unsupported(
-            "subquery used as a value must select exactly one column",
-        ));
-    }
-    let inner_schema = inner_table_schema(read_txn, &validated.table_name)?;
-    reject_correlated(
-        &aggregate_referenced_columns(&validated),
-        &inner_schema,
-        outer_scopes,
-    )?;
-    // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
-    let static_preds: Vec<WherePredicate> = validated
-        .where_predicates
-        .iter()
-        .filter(|p| !predicate_contains_subquery(p))
-        .cloned()
-        .collect();
+    let inner_schema = inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?;
+    // 実行時エラー時に、解決前の述語で静的検証を完了させるための控え。
+    let original_preds: Vec<WherePredicate> = validated.where_predicates.clone();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
     validated.where_predicates = match resolve_where_predicates(
@@ -673,7 +705,16 @@ fn execute_inner_aggregate_statement(
         Ok(p) => p,
         Err(e) => {
             // スキャン側と同じ理由で、入れ子 WHERE の失敗時も投影メタデータを確定する。
-            validated.where_predicates = static_preds;
+            if is_deferrable_runtime_error(&e) {
+                static_validate_subquery_predicates(
+                    &original_preds,
+                    &chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                )?;
+            }
+            validated.where_predicates = static_validation_predicates(&original_preds);
             let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
             *meta_sink = Some(super::describe::aggregate_columns(&bound, &inner_schema)?);
             return Err(e);
@@ -691,6 +732,211 @@ fn execute_inner_aggregate_statement(
         None,
         None,
     )
+}
+
+/// 外側の行数が判明するまで遅延してよい実行時エラーか（入れ子スカラーサブクエリの
+/// `21000`、または静的な `22000` 以外の式評価データ例外 `22xxx`）。
+/// [`resolve_scalar_projection_items`] と内側クエリの失敗時静的検証から呼ばれる。
+fn is_deferrable_runtime_error(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::CardinalityViolation)
+        || (e.wire_code().starts_with("22") && e.wire_code() != "22000")
+}
+
+/// 先行サブクエリが遅延対象エラー（入れ子の `21000` 等）で解決を打ち切った後に、
+/// サブクエリを含む述語（`OR` の分岐・`NOT` の内側を含む）を**実行せずに**静的検証し、
+/// 静的・構造的なエラー（未知テーブル・未知列・投影列数・相関参照・値族の不一致等）を
+/// 最初の 1 件返す（Issue #1432。`execute_inner_scan_statement`／
+/// `execute_inner_aggregate_statement` の失敗時経路から呼ばれる）。
+///
+/// 内側クエリを実行しないため、実行回数予算（[`MAX_SUBQUERY_EXECUTIONS`]）・`IN` 値予算は
+/// 消費せず、予算の残量によって検査が打ち切られることもない（予算枯渇を「静的エラー
+/// なし」とみなして後続の静的エラーを見落とす経路を作らない＝fail-closed）。
+/// コストはカタログからのスキーマ取得と束縛のみで、文の長さと
+/// [`super::allowlist::MAX_SUBQUERY_DEPTH`] で有界（可視行の読み取りは行わない）。
+/// 行数・値に依存する検査（`21000`・`MAX_SEARCH_K` 超過・`IN` 値予算）は対象外。
+fn static_validate_subquery_predicates(
+    preds: &[WherePredicate],
+    chain: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+) -> Result<(), SqlSurfaceError> {
+    for pred in preds {
+        match pred {
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    static_validate_subquery_predicates(branch, chain, read_txn, lookup, udfs)?;
+                }
+            }
+            WherePredicate::Not(inner) => static_validate_subquery_predicates(
+                std::slice::from_ref(inner.as_ref()),
+                chain,
+                read_txn,
+                lookup,
+                udfs,
+            )?,
+            WherePredicate::InSubquery {
+                column,
+                inner_tokens,
+                depth,
+            } => {
+                // [`resolve_in_subquery`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）で検証する。
+                let meta = static_validate_inner_query(
+                    inner_tokens,
+                    *depth,
+                    InnerScanIntent::Values,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                )?;
+                let [inner_meta] = meta.as_slice() else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "subquery used with IN must select exactly one column",
+                    ));
+                };
+                let (_, family) = validate_in_target_column(column, owner_schema(chain)?)?;
+                if inner_value_family(inner_meta) != Some(family) {
+                    return Err(in_family_mismatch(column));
+                }
+            }
+            WherePredicate::Exists {
+                inner_tokens,
+                depth,
+            } => {
+                static_validate_inner_query(
+                    inner_tokens,
+                    *depth,
+                    InnerScanIntent::ExistenceOnly,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                )?;
+            }
+            WherePredicate::ScalarSubqueryCompare {
+                column,
+                inner_tokens,
+                depth,
+                ..
+            } => {
+                // [`resolve_scalar_compare`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）。
+                let meta = static_validate_inner_query(
+                    inner_tokens,
+                    *depth,
+                    InnerScanIntent::Scalar,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                )?;
+                let [inner_meta] = meta.as_slice() else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "subquery used as a value must select exactly one column",
+                    ));
+                };
+                let (_, target_family) = scalar_target_column(column, chain)?;
+                check_scalar_family_compatible(column, inner_meta, target_family)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// [`static_validate_subquery_predicates`] 用に、内側トークン列を実行せずに
+/// [`execute_inner_query_with_meta`] と同じ静的検証（構文・文の形・相関参照・投影列数・
+/// 入れ子 WHERE の再帰的な静的検証・束縛）にかけ、投影列メタデータを返す。
+/// 実行回数予算は消費しない（呼び出し元の契約参照）。
+fn static_validate_inner_query(
+    inner_tokens: &[Token],
+    depth: usize,
+    intent: InnerScanIntent,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    let stmt =
+        super::allowlist::validate_sql_tokens_with_subquery_ctx(inner_tokens, lookup, depth)?;
+    match (stmt, intent) {
+        (Statement::Scan(mut validated), _) => {
+            let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?;
+            let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+            chain.push(&inner_schema);
+            static_validate_subquery_predicates(
+                &validated.where_predicates,
+                &chain,
+                read_txn,
+                lookup,
+                udfs,
+            )?;
+            validated.where_predicates = static_validation_predicates(&validated.where_predicates);
+            match intent {
+                InnerScanIntent::ExistenceOnly => {
+                    // 実行経路（`execute_inner_scan_statement`）と同じく、差し替え前の
+                    // `LIMIT`・投影を検証してから可視性判定用の形へ差し替える。
+                    super::parser::validate_search_limit(validated.limit)?;
+                    let mut probe_node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+                    super::parser::bind_projection(
+                        &validated.projection,
+                        &inner_schema,
+                        udfs,
+                        &mut probe_node_budget,
+                    )?;
+                    validated.projection = Projection::Columns(Vec::new());
+                    validated.limit = 1;
+                }
+                InnerScanIntent::ScalarValue => {
+                    super::parser::validate_search_limit(validated.limit)?;
+                    validated.limit = validated.limit.min(2);
+                }
+                InnerScanIntent::Values | InnerScanIntent::Scalar => {}
+            }
+            let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+            super::describe::scan_columns(&bound, &inner_schema)
+        }
+        (
+            Statement::Aggregate(mut validated),
+            InnerScanIntent::Scalar | InnerScanIntent::ScalarValue,
+        ) => {
+            let inner_schema = inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?;
+            let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+            chain.push(&inner_schema);
+            static_validate_subquery_predicates(
+                &validated.where_predicates,
+                &chain,
+                read_txn,
+                lookup,
+                udfs,
+            )?;
+            validated.where_predicates = static_validation_predicates(&validated.where_predicates);
+            let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
+            super::describe::aggregate_columns(&bound, &inner_schema)
+        }
+        _ => Err(unsupported_inner_statement()),
+    }
+}
+
+/// 内側クエリ失敗時の静的束縛検証に使う述語を作る。サブクエリを含まない述語に加え、
+/// サブクエリを含む `OR` の分岐のうちサブクエリを含まない葉も個別に取り出す
+/// （`OR` 全体を落とすと、その葉の未知列等の束縛時エラーが遅延対象エラーに
+/// 隠れるため）。束縛検証専用で実行はしないため、AND 連結の意味差は影響しない。
+fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate> {
+    fn collect_leaves(pred: &WherePredicate, out: &mut Vec<WherePredicate>) {
+        if !predicate_contains_subquery(pred) {
+            out.push(pred.clone());
+        } else if let WherePredicate::Or(branches) = pred {
+            for p in branches.iter().flatten() {
+                collect_leaves(p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for p in preds {
+        collect_leaves(p, &mut out);
+    }
+    out
 }
 
 /// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
@@ -803,6 +1049,14 @@ fn validate_in_target_column<'a>(
     }
 }
 
+/// `IN` の内側投影列と対象列の値族不一致の静的エラー（`resolve_in_subquery` 用）。
+fn in_family_mismatch(column: &str) -> SqlSurfaceError {
+    SqlSurfaceError::invalid_input(format!(
+        "subquery projection type is not compatible with IN target column {column:?} \
+         (the subquery projection must have the same value family as the target column)"
+    ))
+}
+
 /// `IN`／`NOT IN (SELECT ...)` を解決し、連言の述語列を返す。内側は投影列が
 /// ちょうど 1 列であることを要求し（`42601`）、[`validate_in_target_column`] で
 /// 対象列を検証した上で、内側の投影列の値族が対象列の値族と一致することを検証する
@@ -829,7 +1083,8 @@ fn resolve_in_subquery(
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let result = execute_inner_query(
+    let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+    let result = match execute_inner_query_with_meta(
         inner_tokens,
         depth,
         InnerScanIntent::Values,
@@ -840,7 +1095,24 @@ fn resolve_in_subquery(
         udfs,
         budget,
         in_value_budget,
-    )?;
+        &mut meta_sink,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 内側の入れ子 `21000`／実行時データ例外は外側の行数判明まで遅延される契約の
+            // ため、同じ述語の対象列・値族エラーを隠さないよう、遅延対象エラーのときだけ
+            // 静的検証を先に行う（Issue #1432。fail-closed）。
+            if is_deferrable_runtime_error(&e) {
+                let (_, family) = validate_in_target_column(column, owner_schema(outer_scopes)?)?;
+                if let Some([inner_meta]) = meta_sink.as_deref() {
+                    if inner_value_family(inner_meta) != Some(family) {
+                        return Err(in_family_mismatch(column));
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
     if result.columns.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
             "subquery used with IN must select exactly one column",
@@ -859,10 +1131,7 @@ fn resolve_in_subquery(
             detail: "subquery result missing projected column metadata".to_string(),
         })?;
     if inner_value_family(inner_meta) != Some(family) {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "subquery projection type is not compatible with IN target column {column:?} \
-             (the subquery projection must have the same value family as the target column)"
-        )));
+        return Err(in_family_mismatch(column));
     }
 
     let inner_empty = result.rows.is_empty();
@@ -1181,9 +1450,11 @@ pub(crate) fn resolve_scalar_projection_items(
             // 外側の行数が判明するまで遅延する。束縛前に失敗した静的エラー（`meta_sink` が
             // 未確定。`22P02` 等の bind 時エラーを含む）と `22000` は即返す。列メタデータは
             // 実行とは独立に束縛結果から確定済みのため、外側の行数で列型は変わらない。
-            // `21000`（行数違反）は `22` で始まらないためここでも即返す（外側の行数を待たない。
-            // 従来の `22000` と同じ評価順序を保つ。Issue #1404）。
-            Err(e) if e.wire_code().starts_with("22") && e.wire_code() != "22000" => {
+            // 内側 WHERE に入れ子になったスカラーサブクエリの行数違反（`21000`。投影位置
+            // サブクエリ自身の 2 行以上は `multi_row` で扱うため、ここへ届く `21000` は
+            // 入れ子由来のみ）も、`22xxx` と同じく外側の行数が判明するまで遅延する
+            // （Issue #1432。SQL-29・ERR-6）。`meta_sink` 未確定なら従来どおり即返す。
+            Err(e) if is_deferrable_runtime_error(&e) => {
                 let inner_meta = match meta_sink.as_deref() {
                     Some([m]) => m.clone(),
                     _ => return Err(e),
@@ -1361,6 +1632,50 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     }
 }
 
+/// スカラーサブクエリ比較の内側投影列の値族が対象列の値族と比較可能かを検証する
+/// （数値族どうしは可。内側の結果行数・値に依存しない静的検証）。
+fn check_scalar_family_compatible(
+    column: &str,
+    inner_meta: &ColumnMeta,
+    target_family: SubqueryValueFamily,
+) -> Result<(), SqlSurfaceError> {
+    let compatible = match inner_value_family(inner_meta) {
+        Some(inner) => inner == target_family || (inner.is_number() && target_family.is_number()),
+        None => false,
+    };
+    if !compatible {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "subquery result type is not compatible with column {column:?} \
+             (the subquery must have the same value family as the column)"
+        )));
+    }
+    Ok(())
+}
+
+/// スカラーサブクエリ比較の対象列（`outer_scopes` 末尾のテーブル）の型と値の族を検証して返す。
+/// 疑似列 `id` は整数族。未知列・型非対応は `invalid_input`（静的エラー）。
+/// [`resolve_scalar_compare`] から、内側の実行結果に依存せず呼ばれる。
+fn scalar_target_column<'a>(
+    column: &str,
+    outer_scopes: &[&'a TableSchema],
+) -> Result<(Option<&'a ColumnType>, SubqueryValueFamily), SqlSurfaceError> {
+    let owner = owner_schema(outer_scopes)?;
+    match owner.columns.iter().find(|c| c.name == column) {
+        Some(def) => Ok((
+            Some(&def.ty),
+            family_of_type(&def.ty).ok_or_else(|| {
+                SqlSurfaceError::invalid_input(format!(
+                    "column {column:?} type is not supported for a scalar subquery comparison"
+                ))
+            })?,
+        )),
+        None if column == "id" => Ok((None, SubqueryValueFamily::Integer)),
+        None => Err(SqlSurfaceError::invalid_input(format!(
+            "unknown column: {column}"
+        ))),
+    }
+}
+
 /// `<column> <op> (SELECT ...)`（スカラーサブクエリ。Issue #1191）を解決し、
 /// `<column> <op> <リテラル>` と同じ AST の述語 1 つを返す。
 ///
@@ -1383,7 +1698,8 @@ fn resolve_scalar_compare(
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<WherePredicate, SqlSurfaceError> {
-    let result = execute_inner_query(
+    let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+    let result = match execute_inner_query_with_meta(
         inner_tokens,
         depth,
         InnerScanIntent::Scalar,
@@ -1394,46 +1710,37 @@ fn resolve_scalar_compare(
         udfs,
         budget,
         in_value_budget,
-    )?;
+        &mut meta_sink,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 内側の入れ子 `21000`／実行時データ例外は外側の行数判明まで遅延される契約の
+            // ため、同じ述語の静的エラー（対象列の未知・型非対応）を隠さないよう、
+            // 遅延対象エラーのときだけ対象列検証を先に行って静的エラーを優先する
+            // （Issue #1432。fail-closed）。それ以外の内側エラーは従来どおり即返す。
+            if is_deferrable_runtime_error(&e) {
+                let (_, target_family) = scalar_target_column(column, outer_scopes)?;
+                if let Some([inner_meta]) = meta_sink.as_deref() {
+                    check_scalar_family_compatible(column, inner_meta, target_family)?;
+                }
+            }
+            return Err(e);
+        }
+    };
     if result.columns.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
             "subquery used as a value must select exactly one column",
         ));
     }
     // 対象列（疑似列 `id` は整数族）。行数に依存せず必ず検証する。
-    let owner = owner_schema(outer_scopes)?;
-    let (target_ty, target_family) = match owner.columns.iter().find(|c| c.name == column) {
-        Some(def) => (
-            Some(&def.ty),
-            family_of_type(&def.ty).ok_or_else(|| {
-                SqlSurfaceError::invalid_input(format!(
-                    "column {column:?} type is not supported for a scalar subquery comparison"
-                ))
-            })?,
-        ),
-        None if column == "id" => (None, SubqueryValueFamily::Integer),
-        None => {
-            return Err(SqlSurfaceError::invalid_input(format!(
-                "unknown column: {column}"
-            )))
-        }
-    };
+    let (target_ty, target_family) = scalar_target_column(column, outer_scopes)?;
     let inner_meta = result
         .columns
         .first()
         .ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery result missing projected column metadata".to_string(),
         })?;
-    let compatible = match inner_value_family(inner_meta) {
-        Some(inner) => inner == target_family || (inner.is_number() && target_family.is_number()),
-        None => false,
-    };
-    if !compatible {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "subquery result type is not compatible with column {column:?} \
-             (the subquery must have the same value family as the column)"
-        )));
-    }
+    check_scalar_family_compatible(column, inner_meta, target_family)?;
 
     let mut rows = result.rows.iter();
     let Some(first) = rows.next() else {
