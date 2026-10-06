@@ -59,12 +59,17 @@ pub(crate) struct WorkerBudgetGuard(usize);
 impl WorkerBudgetGuard {
     pub(crate) fn acquire(desired: usize) -> Self {
         let mut reserved = 0usize;
-        let _ = GLOBAL_WORKER_BUDGET.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        let updated = GLOBAL_WORKER_BUDGET.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
             let available = MAX_TOTAL_EXTRA_WORKER_THREADS.saturating_sub(cur);
             reserved = desired.min(available);
             Some(cur.saturating_add(reserved))
         });
-        Self(reserved)
+        // 更新が成立した場合のみ確保済みとして扱う（fail-closed）。クロージャは常に Some を
+        // 返すため通常は Ok だが、万一 Err なら未確保の枠を Drop で減算しないよう 0 件にする。
+        match updated {
+            Ok(_) => Self(reserved),
+            Err(_) => Self(0),
+        }
     }
 
     pub(crate) fn granted(&self) -> usize {
