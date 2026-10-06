@@ -729,3 +729,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/catalog.rs`（`FkTypeRule` を廃止し `resolve_foreign_key_target` の型照合を宣言・再検証で一本化）、`crates/engine/src/constraint.rs`（コメントのみ）、`crates/engine/tests/sql_alter_column_type_key_columns.rs`（結合テストの更新・追加）、`docs/design/foreign-key.md`・`alter-table-foreign-key-constraint.md`。
 - **性質**: `CREATE TABLE`（表制約・列制約・自己参照・複合キー）と `ALTER TABLE ADD FOREIGN KEY` で INTEGER／BIGINT が混在する宣言を受理し、実行時は #1414 の読み替え（`recode_key_for_types`）で参照整合性を検査する（値域外は `23503`）。整数型どうし以外の混在は `42830` のまま。Issue #1402 の節にある「宣言は `42830` のまま」を本 Issue で置き換えた（#1402 の節は履歴として残す）。実行時コード・永続フォーマットの変更なし。
 - **対象外**: REAL／DOUBLE PRECISION の FK 列化、ON UPDATE CASCADE 値域外の `22003` 専用 variant、INTEGER／BIGINT と NUMERIC の間の参照、3 クライアント層 B e2e。
+
+## Issue #1437: NoSQL の create_table で名前付きの主キーを宣言できるようにする
+
+- **対象ビヘイビア**: NOSQL-13・TABLE-22（関連: ERR-4・ERR-6。Issue #1412 の後続）。
+- **変更箇所**: `crates/wire-server/src/http/query/ddl.rs`（`primary_key` の `name` を `CONSTRAINT <ident> PRIMARY KEY (...)` へ写像。単体テスト更新・追加）、`schema.rs`（コメントのみ）、`crates/wire-server/tests/nosql13_ddl.rs`（結合テスト追加）、`crates/wire-server/docs/nosql-api.md`・`docs/design/nosql-ddl-mapping.md`。engine の変更なし。
+- **性質**: 名前付き主キーは SQL と同じカタログ表現になり、その名前で `DROP CONSTRAINT` できる。重複宣言（`42P16`）・名前衝突・名前付き `(id)` 単独（`42601`）の `wire_code` は SQL と一致（engine に一本化）。単体テストの拒否ケース `primary_key` + `name` は仕様変更により受理側へ移し、`unique`／`foreign_key` への `name` などの拒否ケースを追加した。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: NoSQL の名前付き UNIQUE／FK、`alter_table` による主キーの追加・削除、3 クライアント層 B。

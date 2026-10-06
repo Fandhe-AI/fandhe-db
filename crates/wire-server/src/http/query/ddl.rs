@@ -69,8 +69,17 @@
 //!   決める（`prefix` は `LIKE '<escaped>%'`、真偽値は `eq` のみ）。
 //! - 表制約としてのみ生成するため既定名は `<table>_check` 系となる（SQL の列制約
 //!   形の `<table>_<col>_check` とは既定名だけが異なる。意図した差分）。
-//! - `kind` と矛盾するフィールド（check への `columns`／`references`、他 kind への
-//!   `name`）は黙って無視せず `42601` で拒否する（fail-closed）。
+//! - `kind` と矛盾するフィールド（check への `columns`／`references`、unique／
+//!   foreign_key への `name`）は黙って無視せず `42601` で拒否する（fail-closed）。
+//!
+//! ## `create_table.constraints[].kind == "primary_key"` の `name`（Issue #1437）
+//!
+//! `{"kind":"primary_key","name":"<任意>","columns":[...]}` を
+//! `CONSTRAINT <name> PRIMARY KEY (...)` へ写し、SQL 表層（TABLE-22）と同じ
+//! カタログ表現（`ALTER TABLE ... DROP CONSTRAINT <name>` の対象）にする（NOSQL-13）。
+//! 名前は [`ident_token`] と engine の制約名検証の二段で検証し、重複宣言（`42P16`）・
+//! 名前衝突・名前付き単独 `(id)`（`42601`）の判定は engine に一本化して wire 側では
+//! 先回り判定しない（SQLSTATE パリティを自動的に保つため）。
 //!
 //! ## `alter_table.add_column` の NOT NULL／DEFAULT（Issue #1338・TABLE-16）
 //! - `not_null`（bool）・`default`（文字列・数値・真偽値）を SQL の列制約と同じ順序
@@ -474,9 +483,10 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
 
     match kind {
         "primary_key" | "unique" => {
-            // `name`／`predicate` は `check` 専用（engine は `CONSTRAINT <name>` を
-            // CHECK の前置としてのみ受理する）。黙って捨てず先に拒否する。
-            if map.contains_key("name") || map.contains_key("predicate") {
+            // `predicate` は `check` 専用のため黙って捨てず先に拒否する。
+            // `name` は `primary_key`（Issue #1437）と `check` でのみ受理する。
+            // `unique` の名前付き宣言は対象外で、従来どおり fail-closed に拒否する。
+            if map.contains_key("predicate") || (kind == "unique" && map.contains_key("name")) {
                 return Err(DdlError::InvalidRequest);
             }
             // `references` は `foreign_key` 専用フィールドだが
@@ -490,10 +500,19 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
             }
             let columns = v.required_array("columns").map_err(DdlError::from)?;
             let mut tokens = if kind == "primary_key" {
-                vec![
-                    Token::Ident("PRIMARY".to_string()),
-                    Token::Ident("KEY".to_string()),
-                ]
+                // 名前付き主キーは SQL の `CONSTRAINT <name> PRIMARY KEY (...)` と
+                // 同じトークン列へ写し、engine の同分岐へ合流させる（第 2 の検証器を
+                // 作らない）。名前は `ident_token` で単一識別子であることを確認し、
+                // 識別子形式・列型キーワードとの非衝突・重複宣言（42P16）・
+                // CHECK 名との衝突は engine 側で判定する（SQLSTATE パリティ）。
+                let mut t = Vec::new();
+                if let Some(name) = v.optional_str("name").map_err(DdlError::from)? {
+                    t.push(Token::Ident("CONSTRAINT".to_string()));
+                    t.push(ident_token(name)?);
+                }
+                t.push(Token::Ident("PRIMARY".to_string()));
+                t.push(Token::Ident("KEY".to_string()));
+                t
             } else {
                 vec![Token::Ident("UNIQUE".to_string())]
             };
@@ -1672,6 +1691,109 @@ mod tests {
         assert_eq!(nosql, sql);
     }
 
+    /// 名前付き主キーが SQL 表層の `CONSTRAINT <name> PRIMARY KEY` と同じ
+    /// `ValidatedCreateTable`（カタログ表現）になること（Issue #1437）。
+    #[test]
+    fn build_constraint_tokens_named_primary_key_matches_sql_surface() {
+        for (json, sql_cols) in [
+            (
+                r#"{"kind":"primary_key","name":"pk_t","columns":["qty"]}"#,
+                "qty",
+            ),
+            (
+                r#"{"kind":"primary_key","name":"pk_t","columns":["qty","kind"]}"#,
+                "qty, kind",
+            ),
+        ] {
+            let tokens = build_constraint_tokens(&obj(json)).expect("named pk must map");
+            let nosql = validate_create_table_tokens(&check_table_tokens(tokens)).expect("nosql");
+            let sql_tokens = tokenize(&format!(
+                "CREATE TABLE t (qty INTEGER, kind TEXT, CONSTRAINT pk_t PRIMARY KEY ({sql_cols}))"
+            ))
+            .expect("lex");
+            let sql = validate_create_table_tokens(&sql_tokens).expect("sql");
+            assert_eq!(nosql, sql);
+            assert_eq!(nosql.primary_key_name.as_deref(), Some("pk_t"));
+        }
+    }
+
+    /// 構造段で判定される名前付き主キーの `wire_code` が SQL 表層と一致すること。
+    #[test]
+    fn build_constraint_tokens_named_primary_key_wire_codes_match_sql() {
+        let cases: [(&[&str], &str, &str); 5] = [
+            (
+                &[
+                    r#"{"kind":"primary_key","name":"a","columns":["qty"]}"#,
+                    r#"{"kind":"primary_key","name":"b","columns":["kind"]}"#,
+                ],
+                "CONSTRAINT a PRIMARY KEY (qty), CONSTRAINT b PRIMARY KEY (kind)",
+                "42P16",
+            ),
+            (
+                &[
+                    r#"{"kind":"primary_key","name":"a","columns":["qty"]}"#,
+                    r#"{"kind":"primary_key","columns":["kind"]}"#,
+                ],
+                "CONSTRAINT a PRIMARY KEY (qty), PRIMARY KEY (kind)",
+                "42P16",
+            ),
+            (
+                &[r#"{"kind":"primary_key","name":"a","columns":["qty"]}"#],
+                "CONSTRAINT a PRIMARY KEY (qty)",
+                "ok",
+            ),
+            (
+                &[
+                    r#"{"kind":"primary_key","name":"same","columns":["qty"]}"#,
+                    r#"{"kind":"check","name":"same","predicate":[{"column":"qty","op":"gt","value":0}]}"#,
+                ],
+                "CONSTRAINT same PRIMARY KEY (qty), CONSTRAINT same CHECK (qty > 0)",
+                "42601",
+            ),
+            (
+                &[r#"{"kind":"primary_key","name":"a","columns":["qty"]}"#],
+                "CONSTRAINT a PRIMARY KEY (qty)",
+                "ok",
+            ),
+        ];
+        for (items, sql_constraints, expected) in cases {
+            let mut t = tokenize("CREATE TABLE t (qty INTEGER, kind TEXT").expect("lex");
+            for item in items {
+                t.push(Token::Punct(','));
+                t.extend(build_constraint_tokens(&obj(item)).expect("map"));
+            }
+            t.push(Token::Punct(')'));
+            let nosql = validate_create_table_tokens(&t);
+            let sql = validate_create_table_tokens(
+                &tokenize(&format!(
+                    "CREATE TABLE t (qty INTEGER, kind TEXT, {sql_constraints})"
+                ))
+                .expect("lex"),
+            );
+            let code = |r: &Result<_, SqlSurfaceError>| match r {
+                Ok(_) => "ok",
+                Err(e) => e.wire_code(),
+            };
+            assert_eq!(code(&nosql), code(&sql), "{sql_constraints}");
+            assert_eq!(code(&nosql), expected, "{sql_constraints}");
+        }
+        // 名前付きの `(id)` 単独は 42601（名前が黙って捨てられる形を作らない）。
+        let id_tokens = build_constraint_tokens(&obj(
+            r#"{"kind":"primary_key","name":"a","columns":["id"]}"#,
+        ))
+        .expect("map");
+        let mut t = tokenize("CREATE TABLE t (id INTEGER,").expect("lex");
+        t.extend(id_tokens);
+        t.push(Token::Punct(')'));
+        let nosql = validate_create_table_tokens(&t).expect_err("named (id)");
+        let sql = validate_create_table_tokens(
+            &tokenize("CREATE TABLE t (id INTEGER, CONSTRAINT a PRIMARY KEY (id))").expect("lex"),
+        )
+        .expect_err("sql named (id)");
+        assert_eq!(nosql.wire_code(), sql.wire_code());
+        assert_eq!(nosql.wire_code(), "42601");
+    }
+
     fn build_check_case(value: &JsonValue) -> Vec<Token> {
         build_constraint_tokens(value).expect("check must map")
     }
@@ -1719,7 +1841,11 @@ mod tests {
             r#"{"kind":"check","predicate":[{"column":"visible","op":"eq","value":true}]}"#,
             r#"{"kind":"check","predicate":[{"column":"a","op":"prefix","value":"\u0001"}]}"#,
             r#"{"kind":"check","predicate":[{"column":"a","op":"lt","value":false}]}"#,
-            r#"{"kind":"primary_key","columns":["a"],"name":"n"}"#,
+            r#"{"kind":"unique","columns":["a"],"name":"u"}"#,
+            r#"{"kind":"foreign_key","columns":["a"],"references":{"table":"p"},"name":"f"}"#,
+            r#"{"kind":"primary_key","columns":["a"],"name":"n","predicate":[{"column":"a","op":"gt","value":0}]}"#,
+            r#"{"kind":"primary_key","columns":["a"],"name":"select"}"#,
+            r#"{"kind":"primary_key","columns":["a"],"name":"bad-name"}"#,
         ];
         for c in cases {
             let err = build_constraint_tokens(&obj(c)).expect_err(c);

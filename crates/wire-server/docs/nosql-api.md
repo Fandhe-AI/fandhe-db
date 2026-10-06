@@ -641,7 +641,7 @@ JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像�
 | `op` | ○ | string | `"create_table"`／`"alter_table"`／`"drop_table"` |
 | `table` | ○ | string | |
 | `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"element_type"?,"max_len"?,"nullable"?,"default"?}`。`default` は文字列・数値・真偽値（配列の既定値は文字列 `"{1,2}"` 形）。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
-| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?,"name"?,"predicate"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `name`（任意）と `predicate`（filter 葉形 `column`／`op`／`value` の配列。AND 結合）を取り、SQL 表層と同じ DDL 入口へ合流する（Issue #1199・NOSQL-13・TABLE-16）。違反した `insert`／`update` は `23514`。`kind` と矛盾するフィールド・`in`／`or`・語彙外の `op`・RLS 述語名の列は `42601`、葉数の上限超過は `54000`（写像表と拒否条件の詳細は `docs/design/nosql-ddl-mapping.md`「CHECK 制約」節）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
+| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?,"name"?,"predicate"?}`。`references`＝`{"table","columns"?,"on_delete"?,"on_update"?}`。`check` は `name`（任意）と `predicate`（filter 葉形 `column`／`op`／`value` の配列。AND 結合）を取り、SQL 表層と同じ DDL 入口へ合流する（Issue #1199・NOSQL-13・TABLE-16）。`primary_key` も `name`（任意）を取り、SQL の `CONSTRAINT <name> PRIMARY KEY (...)` と同じカタログ表現になる（`ALTER TABLE ... DROP CONSTRAINT <name>` の対象。Issue #1437・NOSQL-13・TABLE-22）。名前付きの `["id"]` 単独・主キー名と `check` 名の衝突・不正な識別子は `42601`、主キーの重複宣言は名前の有無に関わらず `42P16`。`unique`／`foreign_key` への `name` は引き続き `42601`。違反した `insert`／`update` は `23514`。`kind` と矛盾するフィールド・`in`／`or`・語彙外の `op`・RLS 述語名の列は `42601`、葉数の上限超過は `54000`（写像表と拒否条件の詳細は `docs/design/nosql-ddl-mapping.md`「CHECK 制約」節）。`foreign_key` の `on_delete`／`on_update` は `"no_action"｜"restrict"｜"cascade"｜"set_null"｜"set_default"` の固定語彙（小文字 snake_case・完全一致。Issue #1148）で `ON DELETE`／`ON UPDATE` 参照アクション（TABLE-17・TASK-205、Issue #907）を宣言できる。省略時・`"no_action"`／`"restrict"` はいずれも `NO ACTION` と同じカタログ表現になる。語彙外・大文字混じり・非文字列値は `42601`（副作用ゼロ）。参照元列が `NOT NULL` の状態で `"set_null"` を付ける・DEFAULT の無い `NOT NULL` 列に `"set_default"` を付けるなど宣言時に常に失敗する組み合わせは `42830`。宣言済みテーブルへの `update`／`delete` op は SQL 表層と同一の単一検査点を通るため連鎖が発火し、連鎖の深さ・行数の上限超過は `54000`（HTTP `413`。副作用ゼロ）として到達する |
 | `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?,"element_type"?,"max_len"?,"not_null"?,"default"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`）。`not_null` は bool（`true` のとき `default` が必須で、無ければ engine が `42601`。`false`・省略は nullable 列）、`default` は文字列・数値・真偽値（Issue #1338。SQL の `NOT NULL`／`DEFAULT <literal>` と同じ実行器・エラー契約）。DATE／TIMESTAMP／UUID／JSON／JSONB／ENUM の DEFAULT は文字列で渡す。`default` の `null`・配列・オブジェクト、`not_null` の非 bool、`nullable` などの未知キーは `42601`。`create_table` の `nullable` に対し `add_column` は `not_null` を使う（`nullable` は受け付けない） |
 | `drop_column`（`alter_table`） | ○ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` と同じ入口へ結線（Issue #1167。エラー契約は SQL 表層と同一）。`add_column` と排他必須 |
 
@@ -1132,7 +1132,7 @@ Date: <IMF-fixdate>
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `42830` | `INVALID_FOREIGN_KEY` | 400 | Bad Request | `create_table.constraints[kind=foreign_key].references.on_delete`／`on_update`（Issue #1148）が宣言時に常に失敗する組み合わせ（`NOT NULL` 列への `set_null`・DEFAULT の無い `NOT NULL` 列への `set_default` 等） |
 | `42883` | `UNDEFINED_FUNCTION` | 400 | Bad Request | `aggregate` の `sum`／`avg` を `DATE`／`TIMESTAMP` 列に指定した場合（SQL-26、Issue #1186）、または `sum`／`avg`（TEXT 以外は `min`／`max` も）を非数値型（TEXT・BOOLEAN・BYTEA・JSON・ARRAY・UUID・ENUM・VECTOR）の列に指定した場合（Issue #1349。未知関数・非決定的関数の呼び出しは SQL 表層専用で到達しない） |
-| `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（TABLE-22 (d)、Issue #1412。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
+| `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -1179,7 +1179,8 @@ SQL-28・RLS-10）は複数テーブル参照スコープの束縛基盤（`sql:
 `ALTER TABLE ... ADD PRIMARY KEY` の主キー重複宣言は SQL 表層専用で到達しないが、
 `create_table.constraints` に `primary_key` を 2 個以上並べた要求は engine の構文段で
 `42P16`（400）になる（Issue #1412。到達不能の一覧からは外した）。名前付き主キー
-（`primary_key` の `name`）は NoSQL 表層では引き続き受け付けない。
+（`primary_key` の `name`）は Issue #1437 で受け付けるようになった（SQL の
+`CONSTRAINT <name> PRIMARY KEY` と同じカタログ表現・同じ `wire_code`）。
 `CardinalityViolation`（`21000`。SQL-29、Issue #1404）はスカラーサブクエリの
 2 行以上返却で、NoSQL 表層にサブクエリ構文が無いため到達しない。
 `PartialCompletion`（`VD001`）・`PartitionedDmlCancelled`（`VD002`。SQL-19・
