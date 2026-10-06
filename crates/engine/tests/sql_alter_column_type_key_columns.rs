@@ -6,6 +6,10 @@
 //! でも参照整合性検査・一意性検査の結果が変わらないことを production 経路
 //! （`EngineCore::execute_sql_in_session`）で確認する。特に参照先の拡大後に
 //! 参照中の親行の削除が `23503` になること（索引の型タグ不一致による fail-open の回帰）が要。
+//!
+//! REAL／DOUBLE PRECISION（Issue #1434・TABLE-17・TABLE-19・TABLE-20）は FK 列になれない（D3）ため
+//! 混在 FK の状態は作れない。末尾の節で、その契約（宣言面が `42830`・副作用なし）と、
+//! REAL の UNIQUE 列を拡大した後も値を保って一意性が働くことを固定する。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -449,5 +453,125 @@ fn non_widening_stays_42804_and_declarations_stay_strict() {
             "ALTER TABLE ky ADD FOREIGN KEY (ref) REFERENCES kp (k)"
         ),
         "42830"
+    );
+}
+
+fn floats(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<f64> {
+    let mut v: Vec<f64> = core
+        .execute_sql(ctx, sql)
+        .expect("select")
+        .rows
+        .into_iter()
+        .map(|r| match r.cells.into_iter().next().expect("cell") {
+            Cell::Float(v) => v,
+            other => panic!("unexpected cell {other:?}"),
+        })
+        .collect();
+    v.sort_by(f64::total_cmp);
+    v
+}
+
+/// REAL／DOUBLE PRECISION は FK 列になれず（D3）、どの宣言面でも `42830` で拒否され副作用が無い。
+/// 混在 FK（片側だけ REAL→DOUBLE PRECISION）の状態は構造的に到達できないことの固定（Issue #1434）。
+#[test]
+fn real_and_double_columns_cannot_form_foreign_keys() {
+    let (core, path) = new_core("akc-fp-decl");
+    let _g = CleanupGuard(path);
+    let o = ctx("owner");
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE fp (k INTEGER PRIMARY KEY, r REAL, d DOUBLE PRECISION, UNIQUE (r), UNIQUE (d))",
+    );
+    for sql in [
+        "CREATE TABLE fc (x REAL, FOREIGN KEY (x) REFERENCES fp (r))",
+        "CREATE TABLE fc (x DOUBLE PRECISION, FOREIGN KEY (x) REFERENCES fp (d))",
+        "CREATE TABLE fc (x REAL, FOREIGN KEY (x) REFERENCES fp (d))",
+        "CREATE TABLE fc (x DOUBLE PRECISION, FOREIGN KEY (x) REFERENCES fp (r))",
+        "CREATE TABLE fc (x REAL REFERENCES fp (r))",
+        "CREATE TABLE fc (x DOUBLE PRECISION REFERENCES fp (d))",
+        "CREATE TABLE fc (x REAL, CONSTRAINT n FOREIGN KEY (x) REFERENCES fp (r))",
+        "CREATE TABLE fc (r REAL, UNIQUE (r), up REAL, FOREIGN KEY (up) REFERENCES fc (r))",
+    ] {
+        assert_eq!(code(&core, &o, sql), "42830", "{sql}");
+        // 拒否された CREATE TABLE はテーブルを残さない（同名の再作成が成功する）。
+        ok(&core, &o, "CREATE TABLE fc (x REAL)");
+        ok(&core, &o, "DROP TABLE fc");
+    }
+    for ty in ["REAL", "DOUBLE PRECISION"] {
+        ok(&core, &o, &format!("CREATE TABLE fz (x {ty})"));
+        for target in ["r", "d"] {
+            assert_eq!(
+                code(
+                    &core,
+                    &o,
+                    &format!("ALTER TABLE fz ADD FOREIGN KEY (x) REFERENCES fp ({target})")
+                ),
+                "42830",
+                "{ty} -> {target}"
+            );
+        }
+        // FK が付いていない（親に無い値を挿入できる）。
+        ok(
+            &core,
+            &o,
+            "INSERT INTO fz (id, x) VALUES (1, 9.5) USING OPERATION_ID 'z1'",
+        );
+        ok(&core, &o, "DROP TABLE fz");
+    }
+}
+
+/// REAL の UNIQUE 列（FK の参照先になり得る唯一の REAL 一意キー）を DOUBLE PRECISION へ広げた後も、
+/// 値を保って一意性が働き、判定はテナント内に閉じる（Issue #1434）。
+#[test]
+fn widening_real_unique_column_preserves_values_and_uniqueness_per_tenant() {
+    let (core, path) = new_core("akc-fp-uniq");
+    let _g = CleanupGuard(path);
+    let o = ctx("owner");
+    ok(&core, &o, "CREATE TABLE fu (r REAL, UNIQUE (r))");
+    let tenants = [ctx("tenant-a"), ctx("tenant-b")];
+    for (t, c) in tenants.iter().enumerate() {
+        for (i, v) in ["1.5", "0.1", "0.0"].iter().enumerate() {
+            ok(
+                &core,
+                c,
+                &format!("INSERT INTO fu (id, r) VALUES ({i}, {v}) USING OPERATION_ID 'u{t}{i}'"),
+            );
+        }
+    }
+    ok(
+        &core,
+        &o,
+        "ALTER TABLE fu ALTER COLUMN r TYPE DOUBLE PRECISION",
+    );
+    for (t, c) in tenants.iter().enumerate() {
+        assert_eq!(
+            floats(&core, c, "SELECT r FROM fu LIMIT 10"),
+            vec![0.0, f64::from(0.1f32), 1.5]
+        );
+        for (i, v) in ["1.5", "-0.0"].iter().enumerate() {
+            let sql = format!(
+                "INSERT INTO fu (id, r) VALUES ({}, {v}) USING OPERATION_ID 'd{t}{i}'",
+                10 + i
+            );
+            assert_eq!(code(&core, c, &sql), "23505", "{sql}");
+        }
+        // 旧 REAL 表現とは一致しない DOUBLE の 0.1 は別の値として受理される。
+        ok(
+            &core,
+            c,
+            "INSERT INTO fu (id, r) VALUES (20, 0.1) USING OPERATION_ID 'e'",
+        );
+    }
+    // テナント境界: 片方の新しい値は他方の判定に影響しない。
+    ok(
+        &core,
+        &tenants[0],
+        "INSERT INTO fu (id, r) VALUES (30, 2.25) USING OPERATION_ID 'f'",
+    );
+    ok(
+        &core,
+        &tenants[1],
+        "INSERT INTO fu (id, r) VALUES (30, 2.25) USING OPERATION_ID 'f'",
     );
 }

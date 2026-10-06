@@ -423,6 +423,10 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
   副作用なしで `23503` により拒否する（専用の `22003` variant は公開 enum の破壊的変更に
   なるためスコープ外）。
 - `id` 疑似列を参照する FK は子列の型で処理済みのため変更なし。
+- **REAL／DOUBLE PRECISION（Issue #1434）**: D3 により FK 列になれないため混在状態は生じない。
+  宣言面が `42830` で副作用なしであること、REAL の UNIQUE 列を拡大した後の一意性、浮動小数の組の
+  読み替えが `Err` になることは `tests/sql_alter_column_type_key_columns.rs` と
+  `constraint::tests::recode_rejects_real_double_pairs_fail_closed` で固定している。
 
 ## 対象外・後続候補
 
