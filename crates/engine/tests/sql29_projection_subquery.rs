@@ -692,3 +692,44 @@ fn projection_subquery_static_target_error_wins_over_nested_inner_cardinality() 
         }
     }
 }
+
+/// 入れ子 WHERE の `OR` 内にあるサブクエリを含まない葉の未知列も、21000 に隠れず
+/// 外側 0 行でも `22000` を返す（AND 形と同じ。Issue #1432 PR レビュー指摘）。
+#[test]
+fn projection_subquery_or_leaf_static_error_wins_over_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let inner = format!(
+        "(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) OR nope = 1 LIMIT 1)"
+    );
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &none), "22000");
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    assert_eq!(code(&core, &ctx, &some), "22000");
+}
+
+/// 先頭で 21000 を起こし後続に多数のサブクエリ述語を置いても、エラー経路の再検査は
+/// 共有予算で頭打ちになり、上限超の再実行をしない（遅延対象エラーか予算超過で終わる）。
+#[test]
+fn projection_subquery_error_path_probe_shares_execution_budget() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let many: Vec<String> = (0..20)
+        .map(|_| format!("qty IN (SELECT qty FROM {REFS} LIMIT 10)"))
+        .collect();
+    let inner = format!(
+        "(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) AND {} LIMIT 1)",
+        many.join(" AND ")
+    );
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    let c = code(&core, &ctx, &some);
+    assert!(c == "21000" || c == "54000", "{c}");
+}

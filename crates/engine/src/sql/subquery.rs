@@ -561,12 +561,8 @@ fn execute_inner_scan_statement(
     // 解決する（深さ優先。`depth` は構文解析段で `MAX_SUBQUERY_DEPTH` 検査
     // 済みのため、ここでは budget のみ検査すれば足りる）。
     // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
-    let static_preds: Vec<WherePredicate> = validated
-        .where_predicates
-        .iter()
-        .filter(|p| !predicate_contains_subquery(p))
-        .cloned()
-        .collect();
+    let static_preds: Vec<WherePredicate> =
+        static_validation_predicates(&validated.where_predicates);
     // 先行サブクエリの遅延対象エラーで解決が打ち切られても、後続サブクエリの静的エラーを
     // 検出できるよう、サブクエリを含む述語の控えも持つ。
     let subquery_preds: Vec<WherePredicate> = validated
@@ -603,6 +599,8 @@ fn execute_inner_scan_statement(
                         ctx,
                         lookup,
                         udfs,
+                        budget,
+                        in_value_budget,
                     ) {
                         return Err(static_err);
                     }
@@ -673,12 +671,8 @@ fn execute_inner_aggregate_statement(
         outer_scopes,
     )?;
     // 実行時エラー時に静的検証を完了させるための、サブクエリを含まない述語の控え。
-    let static_preds: Vec<WherePredicate> = validated
-        .where_predicates
-        .iter()
-        .filter(|p| !predicate_contains_subquery(p))
-        .cloned()
-        .collect();
+    let static_preds: Vec<WherePredicate> =
+        static_validation_predicates(&validated.where_predicates);
     // 先行サブクエリの遅延対象エラーで解決が打ち切られても、後続サブクエリの静的エラーを
     // 検出できるよう、サブクエリを含む述語の控えも持つ。
     let subquery_preds: Vec<WherePredicate> = validated
@@ -710,6 +704,8 @@ fn execute_inner_aggregate_statement(
                     ctx,
                     lookup,
                     udfs,
+                    budget,
+                    in_value_budget,
                 ) {
                     return Err(static_err);
                 }
@@ -744,8 +740,12 @@ fn is_deferrable_runtime_error(e: &SqlSurfaceError) -> bool {
 
 /// 先行サブクエリが遅延対象エラーで解決を打ち切った後に、サブクエリを含む各述語を
 /// 個別に解決し直して、遅延対象でない（静的・構造的な）エラーを最初の 1 件返す。
-/// 遅延対象エラーと成功は無視する。過去の予算消費や他の検査単位に影響されないよう、検査単位ごとに
-/// 予算を初期値で独立に確保する（エラー経路専用。通常経路では呼ばれない）。
+/// 遅延対象エラーと成功は無視する。再検査の実行は通常経路と同じ `budget`／
+/// `in_value_budget` を共有して消費する（エラー経路で上限を再設定すると、先頭で
+/// `21000` を起こし後続に多数のサブクエリ述語を置くことで上限超の読み取りを繰り返せる
+/// ため）。予算が尽きた場合（`54000`）は再検査を打ち切り、元の遅延対象エラーに委ねる
+/// （エラー経路専用。通常経路では呼ばれない）。
+#[allow(clippy::too_many_arguments)]
 fn first_static_error_in_subquery_predicates(
     subquery_preds: &[WherePredicate],
     chain: &[&TableSchema],
@@ -753,6 +753,8 @@ fn first_static_error_in_subquery_predicates(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
 ) -> Option<SqlSurfaceError> {
     // `OR` の分岐内でも先行サブクエリの遅延対象エラーが後続を打ち切るため、分岐も
     // 含めてサブクエリ述語を 1 件ずつ独立に解決し直す。
@@ -761,10 +763,6 @@ fn first_static_error_in_subquery_predicates(
         collect_subquery_probe_units(pred, &mut units);
     }
     for pred in units {
-        // 検査単位ごとに予算を初期化する。共有すると、21000 で止まる通常解決では
-        // 起きない予算枯渇（54000）を再検査自身が作り、遅延契約を壊すため。
-        let mut budget = MAX_SUBQUERY_EXECUTIONS;
-        let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
         if let Err(e) = resolve_where_predicates(
             vec![pred.clone()],
             chain,
@@ -772,15 +770,40 @@ fn first_static_error_in_subquery_predicates(
             ctx,
             lookup,
             udfs,
-            &mut budget,
-            &mut in_value_budget,
+            budget,
+            in_value_budget,
         ) {
+            if matches!(e, SqlSurfaceError::PayloadTooLarge { .. }) {
+                // 共有予算の枯渇。これ以上は実行せず元のエラーを優先する。
+                return None;
+            }
             if !is_deferrable_runtime_error(&e) {
                 return Some(e);
             }
         }
     }
     None
+}
+
+/// 内側クエリ失敗時の静的束縛検証に使う述語を作る。サブクエリを含まない述語に加え、
+/// サブクエリを含む `OR` の分岐のうちサブクエリを含まない葉も個別に取り出す
+/// （`OR` 全体を落とすと、その葉の未知列等の束縛時エラーが遅延対象エラーに
+/// 隠れるため）。束縛検証専用で実行はしないため、AND 連結の意味差は影響しない。
+fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate> {
+    fn collect_leaves(pred: &WherePredicate, out: &mut Vec<WherePredicate>) {
+        if !predicate_contains_subquery(pred) {
+            out.push(pred.clone());
+        } else if let WherePredicate::Or(branches) = pred {
+            for p in branches.iter().flatten() {
+                collect_leaves(p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for p in preds {
+        collect_leaves(p, &mut out);
+    }
+    out
 }
 
 /// [`first_static_error_in_subquery_predicates`] 用に、`WherePredicate::Or` の分岐を
