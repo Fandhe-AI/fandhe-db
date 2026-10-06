@@ -346,50 +346,14 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
     Ok(())
 }
 
+/// `CHECK` 述語の式に組み込み関数以外の呼び出しが無いことを検査する。走査は
+/// [`udf_call::first_non_builtin_call`]（連鎖ビュー本文の検査と共有）に一本化している。
 fn reject_forbidden_expr(expr: &Expr) -> Result<(), SqlSurfaceError> {
-    match expr {
-        Expr::Number(_) | Expr::Ident(_) | Expr::String(_) => Ok(()),
-        Expr::Call { name, args } => {
-            if !udf_call::is_builtin_function_name(name) {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "CHECK constraint predicate must not call non-builtin function {name}()"
-                )));
-            }
-            for arg in args {
-                reject_forbidden_expr(arg)?;
-            }
-            Ok(())
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            reject_forbidden_expr(lhs)?;
-            reject_forbidden_expr(rhs)
-        }
-        // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は
-        // それ自体が決定的なので許可し、子を再帰的に検査する。
-        Expr::Null => Ok(()),
-        Expr::Case { whens, else_result } => {
-            for (cond, result) in whens {
-                reject_forbidden_expr(cond)?;
-                reject_forbidden_expr(result)?;
-            }
-            if let Some(else_result) = else_result {
-                reject_forbidden_expr(else_result)?;
-            }
-            Ok(())
-        }
-        Expr::Coalesce(args) => {
-            for a in args {
-                reject_forbidden_expr(a)?;
-            }
-            Ok(())
-        }
-        Expr::NullIf(lhs, rhs) => {
-            reject_forbidden_expr(lhs)?;
-            reject_forbidden_expr(rhs)
-        }
-        // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
-        // Issue #920）は定数のため許可する。
-        Expr::DateLiteral(_) | Expr::TimestampLiteral(_) => Ok(()),
+    match udf_call::first_non_builtin_call(expr) {
+        Some(name) => Err(SqlSurfaceError::unsupported(format!(
+            "CHECK constraint predicate must not call non-builtin function {name}()"
+        ))),
+        None => Ok(()),
     }
 }
 

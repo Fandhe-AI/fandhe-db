@@ -730,6 +730,13 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: `CREATE TABLE`（表制約・列制約・自己参照・複合キー）と `ALTER TABLE ADD FOREIGN KEY` で INTEGER／BIGINT が混在する宣言を受理し、実行時は #1414 の読み替え（`recode_key_for_types`）で参照整合性を検査する（値域外は `23503`）。整数型どうし以外の混在は `42830` のまま。Issue #1402 の節にある「宣言は `42830` のまま」を本 Issue で置き換えた（#1402 の節は履歴として残す）。実行時コード・永続フォーマットの変更なし。
 - **対象外**: REAL／DOUBLE PRECISION の FK 列化、ON UPDATE CASCADE 値域外の `22003` 専用 variant、INTEGER／BIGINT と NUMERIC の間の参照、3 クライアント層 B e2e。
 
+## Issue #1436: 連鎖した評価後射影形ビューの本文の WHERE で式述語を受理する
+
+- **対象ビヘイビア**: TABLE-18・SQL-24・SQL-26・RLS-10 (b)・ERR-1/2/4（Issue #1411 の対象外項目の解消）。
+- **変更箇所**: `crates/engine/src/sql/allowlist.rs`（`ViewBodyCheck`・`BodyExprPolicy` を導入し `classify_view_body` に検証段を追加。連鎖本文〔`BufferedView`〕の式述語を組み込み関数だけに限り受理。構造検証ではトップレベルの式述語を保留）、`sql/udf_call.rs`（`first_non_builtin_call`）、`sql/check_constraint.rs`（走査を共有ヘルパーへ一本化。挙動不変）、`sql/view.rs`、`catalog.rs`（`ViewBodyShape.deferred_expr`。保留した本文を `create_view` が実カタログで再検証）、`crates/engine/tests/table18_buffered_outer.rs`、`docs/design/create-view.md`。
+- **性質**: 連鎖本文の `WHERE` の関数呼び出し・算術・数値比較が、同じ述語を外側クエリに書いた結果と一致する。非組み込み関数の呼び出しは `42601`。テーブル直下・単純形経由の本文の式述語は従来どおり `42601`（拒否の段のみカタログ段へ移る）。RLS・依存検査（`2BP01`）・`wire_code` 契約・fail-closed は不変。
+- **対象外**: テーブル直下の評価後射影形本文の式述語、単純形の段の式述語、連鎖本文の式キー `ORDER BY`・ウィンドウ項目・集計の `HAVING` 式・式引数、UDF 述語・サブクエリ述語、CTE・サブクエリ・集合演算の枝・JOIN の辺からのビュー参照、式述語の型不一致の作成時検出。
+
 ## Issue #1437: NoSQL の create_table で名前付きの主キーを宣言できるようにする
 
 - **対象ビヘイビア**: NOSQL-13・TABLE-22（関連: ERR-4・ERR-6。Issue #1412 の後続）。

@@ -19,7 +19,7 @@
 use super::allowlist::{
     classify_view_body, parse_view_body, AggregateArg, AggregateSelectItem, GroupByClause,
     Projection, ScalarOrderKey, ScanOrderKey, SelectItem, SqlSurfaceError, Statement, TableLookup,
-    ViewBodyKind, WherePredicate, WindowSelectItem,
+    ViewBodyCheck, ViewBodyKind, WherePredicate, WindowSelectItem,
 };
 use crate::catalog::{ViewDef, MAX_VIEW_NESTING_DEPTH};
 use crate::sql::udf_call::Expr;
@@ -215,7 +215,7 @@ fn reparse_buffered_body(
         inner: lookup,
         depth,
     };
-    match classify_view_body(&tokens, &guarded) {
+    match classify_view_body(&tokens, &guarded, ViewBodyCheck::Resolved) {
         Ok(ViewBodyKind::Buffered { stmt, .. }) => Ok(*stmt),
         Ok(ViewBodyKind::Simple(_)) => Err(corrupt_view_error()),
         // 入れ子の深さ超過は規則に基づく拒否として呼び出し元へ伝える。

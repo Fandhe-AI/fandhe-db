@@ -590,7 +590,8 @@ fn chain_depth_limit_and_rejected_positions() {
         "CREATE VIEW r3 AS (SELECT id FROM docs) UNION (SELECT id FROM top_docs)",
         "CREATE VIEW r4 AS SELECT docs.id FROM docs INNER JOIN top_docs ON docs.id = top_docs.id LIMIT 5",
         "CREATE VIEW r5 AS SELECT lower(lang) FROM top_docs",
-        "CREATE VIEW r6 AS SELECT id FROM top_docs WHERE lower(lang) = 'ja'",
+        // 連鎖本文でも組み込み関数以外の呼び出しを含む式述語は拒否される（Issue #1436）。
+        "CREATE VIEW r6 AS SELECT id FROM top_docs WHERE no_such_fn(lang) = 'ja' LIMIT 5",
     ] {
         let err = ddl(&core, sql).expect_err(sql);
         assert_eq!(err.wire_code(), "42601", "sql={sql}");
@@ -828,4 +829,266 @@ fn chain_depth_counts_every_relation_of_a_buffered_body() {
     assert_eq!(err.wire_code(), "54000");
     let err = run(&core, "alice", "SELECT * FROM w LIMIT 1").expect_err("not persisted");
     assert_eq!(err.wire_code(), "42P01");
+}
+/// Issue #1436: 連鎖した評価後射影形ビューの本文の `WHERE` に、組み込み関数・算術・数値比較の
+/// 式述語を書ける。結果は (a) 同じ SELECT を下位ビューへの外側クエリとして直接実行した結果、
+/// (b) 本文の結果行から Rust 側で独立に計算した期待値の双方と一致する（3 テナント対照）。
+#[test]
+fn chained_body_expression_predicates_match_direct_execution() {
+    let (core, _g) = open_core("buffered-outer-expr", false);
+    create_top_docs(&core);
+    ddl(
+        &core,
+        "CREATE VIEW v_agg AS SELECT lang, COUNT(*) AS n FROM top_docs GROUP BY lang",
+    )
+    .expect("v_agg");
+    ddl(
+        &core,
+        "CREATE VIEW v_simple AS SELECT id, lang FROM top_docs",
+    )
+    .expect("v_simple");
+    // (作成する名前, 本文の SELECT)
+    let cases = [
+        ("e_num", "SELECT lang, n FROM v_agg WHERE n > 1 LIMIT 10"),
+        (
+            "e_fn",
+            "SELECT id, lang FROM top_docs WHERE lower(lang) = 'ja' LIMIT 10",
+        ),
+        (
+            "e_arith",
+            "SELECT id, lang FROM top_docs WHERE length(lang) + 0 >= 2 LIMIT 10",
+        ),
+        (
+            "e_agg",
+            "SELECT lang, COUNT(*) AS c FROM top_docs WHERE upper(lang) = 'JA' GROUP BY lang",
+        ),
+        (
+            "e_simple_layer",
+            "SELECT id, lang FROM v_simple WHERE lower(lang) = 'ja' LIMIT 10",
+        ),
+    ];
+    for (name, body) in cases {
+        ddl(&core, &format!("CREATE VIEW {name} AS {body}"))
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
+    for tenant in TENANTS {
+        let rows = body_rows(&core, tenant);
+        for (name, body) in cases {
+            let direct = run(&core, tenant, body).unwrap_or_else(|e| panic!("{body}: {e:?}"));
+            let via = run(&core, tenant, &format!("SELECT * FROM {name} LIMIT 100"))
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(cells(&via), cells(&direct), "tenant={tenant} view={name}");
+        }
+        // (b) 独立オラクル。
+        let ja: Vec<u64> = rows
+            .iter()
+            .filter(|(_, l)| l == "ja")
+            .map(|(i, _)| *i)
+            .collect();
+        let r = run(&core, tenant, "SELECT id FROM e_fn LIMIT 100").expect("e_fn");
+        assert_eq!(
+            r.rows.iter().map(|x| x.id).collect::<Vec<_>>(),
+            ja,
+            "tenant={tenant} e_fn"
+        );
+        let r = run(&core, tenant, "SELECT id FROM e_simple_layer LIMIT 100").expect("layer");
+        assert_eq!(
+            r.rows.iter().map(|x| x.id).collect::<Vec<_>>(),
+            ja,
+            "tenant={tenant} e_simple_layer"
+        );
+        let mut by_lang: BTreeMap<String, u64> = BTreeMap::new();
+        for (_, l) in &rows {
+            *by_lang.entry(l.clone()).or_default() += 1;
+        }
+        let r = run(&core, tenant, "SELECT lang FROM e_num LIMIT 100").expect("e_num");
+        let want: Vec<Vec<Cell>> = by_lang
+            .iter()
+            .filter(|(_, c)| **c > 1)
+            .map(|(l, _)| vec![text(l)])
+            .collect();
+        assert_eq!(cells(&r), want, "tenant={tenant} e_num");
+        let r = run(&core, tenant, "SELECT c FROM e_agg LIMIT 100").expect("e_agg");
+        let want: Vec<Vec<Cell>> = if ja.is_empty() {
+            vec![]
+        } else {
+            vec![vec![int(ja.len() as u64)]]
+        };
+        assert_eq!(cells(&r), want, "tenant={tenant} e_agg");
+    }
+    // Describe は Execute と一致する。
+    for sql in [
+        "SELECT * FROM e_num LIMIT 100",
+        "SELECT id FROM e_fn LIMIT 100",
+        "SELECT c FROM e_agg LIMIT 100",
+    ] {
+        let session = SessionState::default();
+        let parsed = core.parse_sql(sql).expect("parse");
+        let described = core
+            .describe_parsed_in_session(&session, &parsed)
+            .expect("describe")
+            .expect("has columns");
+        let executed = run(&core, "alice", sql).expect("execute");
+        assert_eq!(described, executed.columns, "sql={sql}");
+    }
+}
+
+/// Issue #1436 の RLS: 他テナントの private 行（式述語に一致しうる値）の増減が、
+/// 連鎖本文の式述語の結果を変えない。
+#[test]
+fn other_tenants_private_rows_do_not_change_chained_expression_results() {
+    let queries = [
+        "SELECT id FROM e_zz LIMIT 100",
+        "SELECT lang, n FROM e_cnt LIMIT 100",
+    ];
+    let mut results: Vec<Vec<Vec<Vec<Vec<Cell>>>>> = Vec::new();
+    for extra in [false, true] {
+        let (core, _g) = open_core(&format!("buffered-outer-expr-rls-{extra}"), extra);
+        create_top_docs(&core);
+        ddl(
+            &core,
+            "CREATE VIEW v_cnt AS SELECT lang, COUNT(*) AS n FROM top_docs GROUP BY lang",
+        )
+        .expect("v_cnt");
+        ddl(
+            &core,
+            "CREATE VIEW e_zz AS SELECT id, lang FROM top_docs WHERE lower(lang) = 'zz' LIMIT 10",
+        )
+        .expect("e_zz");
+        ddl(
+            &core,
+            "CREATE VIEW e_cnt AS SELECT lang, n FROM v_cnt WHERE n > 0 LIMIT 10",
+        )
+        .expect("e_cnt");
+        let mut per = Vec::new();
+        for tenant in ["alice", "carol"] {
+            per.push(
+                queries
+                    .iter()
+                    .map(|q| cells(&run(&core, tenant, q).expect("query")))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        results.push(per);
+    }
+    assert_eq!(results[0], results[1]);
+    // alice・carol には 'zz' の行が見えない。
+    assert!(results[1].iter().all(|per| per[0].is_empty()));
+}
+
+/// Issue #1436: 式述語つきの連鎖ビューがあっても依存検査（`2BP01`）は不変。
+#[test]
+fn chained_expression_views_keep_dependency_checks() {
+    let (core, _g) = open_core("buffered-outer-expr-deps", false);
+    create_top_docs(&core);
+    ddl(
+        &core,
+        "CREATE VIEW x2 AS SELECT id, lang FROM top_docs WHERE lower(lang) = 'ja' LIMIT 3",
+    )
+    .expect("x2");
+    for sql in [
+        "DROP VIEW top_docs",
+        "DROP TABLE docs",
+        "ALTER TABLE docs DROP COLUMN body",
+    ] {
+        let err = ddl(&core, sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "2BP01", "sql={sql}");
+    }
+    ddl(&core, "DROP VIEW x2").expect("drop upper first");
+    ddl(&core, "DROP VIEW top_docs").expect("drop lower");
+}
+
+/// Issue #1436: 拒否（fail-closed）。非組み込み関数・セッション UDF・テーブル直下や単純形ビュー
+/// 経由の本文の式述語は `42601` で、何も永続化されない。非公開の `id` を式述語で参照する連鎖本文は
+/// 参照時に `22000`。
+#[test]
+fn chained_body_expression_predicates_fail_closed() {
+    let (core, _g) = open_core("buffered-outer-expr-reject", false);
+    create_top_docs(&core);
+    ddl(&core, "CREATE VIEW s_simple AS SELECT id, lang FROM docs").expect("s_simple");
+    // セッション UDF を登録しても、本文では呼べない。
+    let mut session = allowed_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, "CREATE FUNCTION f(x) AS x + 1")
+        .expect("create function");
+    let err = core
+        .execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
+            "CREATE VIEW u1 AS SELECT id FROM top_docs WHERE f(id) = 1 LIMIT 5",
+        )
+        .expect_err("session udf in body");
+    assert_eq!(err.wire_code(), "42601");
+    for (name, sql) in [
+        (
+            "u2",
+            "CREATE VIEW u2 AS SELECT id FROM top_docs WHERE no_such_fn(lang) = 'ja' LIMIT 5",
+        ),
+        (
+            "u3",
+            "CREATE VIEW u3 AS SELECT id FROM docs WHERE lower(lang) = 'ja' LIMIT 5",
+        ),
+        (
+            "u4",
+            "CREATE VIEW u4 AS SELECT id FROM s_simple WHERE lower(lang) = 'ja' LIMIT 5",
+        ),
+        (
+            "u5",
+            "CREATE VIEW u5 AS SELECT lang, COUNT(*) AS c FROM docs WHERE lower(lang) = 'ja' GROUP BY lang",
+        ),
+    ] {
+        let err = ddl(&core, sql).expect_err(name);
+        assert_eq!(err.wire_code(), "42601", "sql={sql}");
+    }
+    for name in ["u1", "u2", "u3", "u4", "u5"] {
+        let err = run(&core, "alice", &format!("SELECT * FROM {name} LIMIT 1"))
+            .expect_err("not persisted");
+        assert_eq!(err.wire_code(), "42P01", "name={name}");
+    }
+    // id を公開しない下位ビューの上で式述語が id を参照する本文は、参照時に 22000。
+    ddl(
+        &core,
+        "CREATE VIEW no_id AS SELECT lang FROM top_docs LIMIT 3",
+    )
+    .expect("no_id");
+    ddl(
+        &core,
+        "CREATE VIEW no_id_w AS SELECT lang FROM no_id WHERE id + 0 > 1 LIMIT 5",
+    )
+    .expect("created; rejected at reference time");
+    let err = run(&core, "alice", "SELECT * FROM no_id_w LIMIT 1").expect_err("hidden id");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// Issue #1436: 式述語つきの連鎖ビューは再オープン後も同じ結果で参照できる。
+#[test]
+fn chained_expression_views_persist_across_reopen() {
+    let path = unique_db_path("buffered-outer-expr-reopen");
+    let _guard = CleanupGuard(path.clone());
+    let expected;
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema()).expect("create table");
+        seed(&storage, false);
+        let core = new_core(storage);
+        create_top_docs(&core);
+        for sql in [
+            "CREATE VIEW q_agg AS SELECT lang, COUNT(*) AS n FROM top_docs GROUP BY lang",
+            "CREATE VIEW q_num AS SELECT lang, n FROM q_agg WHERE n > 1 LIMIT 10",
+            "CREATE VIEW q_fn AS SELECT id, lang FROM top_docs WHERE lower(lang) = 'ja' LIMIT 10",
+        ] {
+            ddl(&core, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        expected = [
+            cells(&run(&core, "alice", "SELECT * FROM q_num LIMIT 100").expect("q_num")),
+            cells(&run(&core, "alice", "SELECT * FROM q_fn LIMIT 100").expect("q_fn")),
+        ];
+    }
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = new_core(storage);
+    let again = [
+        cells(&run(&core, "alice", "SELECT * FROM q_num LIMIT 100").expect("q_num")),
+        cells(&run(&core, "alice", "SELECT * FROM q_fn LIMIT 100").expect("q_fn")),
+    ];
+    assert_eq!(again, expected);
+    assert!(!again[0].is_empty() && !again[1].is_empty());
 }
