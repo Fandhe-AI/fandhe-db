@@ -768,3 +768,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **メイン worktree の `M docs/spec`**: submodule 実チェックアウト（`f18bb6ac`）が gitlink（`dd640e7d`）より古い stale checkout で、更新ではない。コミットしてはならない。解消（`git submodule update`）はグローバル状態を変えるため本 Issue では行わない。
 - **申し送り**: メイン worktree の遅れ・一時ファイルの整理は #1329・#1330・#1333 の担当。spec 側に残る remote-tracking ref `origin/docs/sync-phase1-task-status` は remote に存在しない残骸で、prune は行っていない。
 - **再現**: `git ls-tree HEAD docs/spec` と `git ls-remote <spec リポ> refs/heads/main` の SHA 比較、および `git grep -hoE '\bTASK-[0-9]+\b'` の出力と spec の `05-tasks.md` の突合。
+
+## Issue #1325: spec サブモジュール更新内容の確認
+
+- **結論**: メイン作業ツリーの `git status` に出ていた `M docs/spec` は新しい spec 更新ではない。submodule の作業コピーが `f18bb6ac`（spec #22・#951 で取り込み済み）のまま残り、記録済みポインタより古い状態だった。`f18bb6ac` は `dd640e7d`（spec #30・#1208 で設定）の祖先であり、更新の向きは「`dd640e7d` → `f18bb6ac`」ではなく逆（遅れ）である。
+- **ポインタ更新の履歴**（PR 番号のみ）: #951 → #1059 → #1142 → #1144 → #1161 → #1208（`dd640e7d`）→ #1368（`9d8b71ac`）→ #1443（`16136c84`）。本記録の時点で main が記録するポインタは `16136c84` で、`f18bb6ac` の取り込み内容（TASK-228 の分解記録・親 Issue #941 は CLOSED）は反映済みである。
+- **本 Issue でのポインタ操作**: なし。ポインタの更新・巻き戻し、およびメイン作業ツリーの submodule 作業コピーの修正は行っていない（作業コピーのずれの扱いは #1329、breaking change と spec の対応確認は #1326、spec 側の整合確認は #1327 の担当）。
+- **後続 Issue への引き継ぎ**: #1326 は #1215・#1224 の breaking change を、ポインタ `16136c84` 時点の `docs/spec/04-behavior/` 配下（`records/` を含む）のビヘイビア ID と照合する。
