@@ -4767,6 +4767,25 @@ impl<'a> Parser<'a> {
                 value,
             }));
         }
+        if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('<')))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct('>')))
+            && matches!(self.tokens.get(self.pos + 3), Some(Token::StringLiteral(_)))
+        {
+            // `<col> <> '<lit>'`／`<col> != '<lit>'`（字句段が `!=` を `<>` へ写す。
+            // Issue #1431・SQL-24 ポインタ）。`NOT <col> = '<lit>'` と同じ
+            // `Not(Equality)` へ desugar するため、列型ごとの解釈・エラーコードは
+            // 構成上 `=` 形と一致する（`sql::subquery` の `Ne` 展開と同じ形）。
+            self.advance();
+            self.advance();
+            self.advance();
+            let value = self.expect_string_literal()?;
+            return Ok(Some(WherePredicate::Not(Box::new(
+                WherePredicate::Equality {
+                    column: name,
+                    value,
+                },
+            ))));
+        }
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
         {
@@ -13478,8 +13497,39 @@ mod tests {
     fn rejects_unsupported_where_condition() {
         // 単一等価・単一 RLS 呼び出し以外（比較演算子・OR 等）は許可リスト外。
         assert_rejected_as_syntax_error(
-            "SELECT * FROM documents WHERE lang != 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE lang IS TRUE ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
+    }
+
+    #[test]
+    fn not_equal_string_literal_desugars_to_not_equality() {
+        // `<>`／`!=`（字句段で同形）は `Not(Equality)`（Issue #1431）。
+        let expected = vec![WherePredicate::Not(Box::new(WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "ja".to_string(),
+        }))];
+        for op in ["<>", "!="] {
+            assert_eq!(
+                where_predicates_of(&format!(
+                    "SELECT * FROM documents WHERE lang {op} 'ja' \
+                     ORDER BY embedding <=> '[0.1]' LIMIT 5"
+                )),
+                expected,
+                "{op}"
+            );
+            // 前置 `NOT` は `Not(Not(..))` にならず `Equality` へ戻る。
+            assert_eq!(
+                where_predicates_of(&format!(
+                    "SELECT * FROM documents WHERE NOT lang {op} 'ja' \
+                     ORDER BY embedding <=> '[0.1]' LIMIT 5"
+                )),
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                }],
+                "NOT {op}"
+            );
+        }
     }
 
     #[test]

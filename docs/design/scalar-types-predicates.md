@@ -184,3 +184,10 @@ Compare` のタグを追加）。`sql/expr_program.rs`・`sql/udf_call.rs`
 - NUMERIC 列と裸の数値リテラル（整数・小数・指数表記）の `=`・範囲比較（左右反転を含む）・`IN`・`BETWEEN` は、WHERE 文脈で `sql::parser` の束縛段が `compare_numeric_literal`（`TypedCompare`）へ振り替える。値の解釈は文字列リテラル形と同じ `numeric::parse_literal_exact` のため、結果・`wire_code` が一致し、NUMERIC 用の二次索引もそのまま使える。CHECK 本体は従来どおり `22000`。
 - 負の数値リテラルは構文段で `-` + 数値を 1 つの数値へ畳む（`- 1` も可）。`- -1`・`-col`・`-(expr)` は `42601` のまま。
 - 述語形 DML の content hash は、f64 で表せない整数リテラルだけ新タグ 11＋生テキストで直列化する（既存ハッシュは不変）。f64 へ丸めると別の十進値と同一視される小数リテラルも、正規化した十進文字列をタグ 11 で直列化して区別する（f64 で往復できる入力は従来ハッシュのまま）。
+
+## 追記: 残る文字列リテラル形（Issue #1431）
+
+- `<col> <> '<lit>'`／`!=` は構文段で `NOT col = '<lit>'` と同じ `Not(Equality)` になり、列型ごとの解釈とエラーコードは `=` 形と一致する。`!=` は字句段で `<>` と同じトークン列になる。
+- 疑似列 `id`（実カラム `id` が無い場合）× 文字列リテラルは数値リテラル形と同じ式へ書き換えられる。
+- BOOLEAN 列 × 文字列の範囲比較・`IN`・`BETWEEN`（`NOT` 付き含む）は、`false < true` で許容集合を求めて `BoolEquality`／`IS NOT NULL`／常に偽へ書き換える。NULL 行は否定前後とも除外される。
+- 既知の制限: CHECK 本体では BOOLEAN の範囲・`IN`・`BETWEEN` を書き換えず拒否する。

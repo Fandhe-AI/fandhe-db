@@ -317,6 +317,26 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             continue;
         }
 
+        if c == '!' {
+            // `!=` は PostgreSQL では `<>` の別名（Issue #1431・SQL-24 ポインタ）。
+            // 字句段で `<>` と同じ 2 つの `Punct` へ写し、構文段の `<>` 文法
+            // （`allowlist::Parser`）にそのまま合流させる（新しい `Token` は作らない）。
+            // `!` 単独は従来どおり未対応文字として拒否する（fail-closed）。
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '='))) {
+                lookahead.next();
+                tokens.push(Token::Punct('<'));
+                tokens.push(Token::Punct('>'));
+                chars = lookahead;
+                continue;
+            }
+            return Err(LexError {
+                message: format!("unsupported character: {c:?}"),
+                byte_offset: offset,
+            });
+        }
+
         if c == '>' {
             // `>=`（比較演算子）→ `>`（比較演算子）の最長一致（TASK-79・SQL-9）。
             let mut lookahead = chars.clone();
@@ -738,6 +758,19 @@ fn lex_word(input: &str, start: usize) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bang_equal_lexes_as_not_equal_punct_pair() {
+        // Issue #1431: `!=` は `<>` と同じトークン列。`!` 単独・文字列内の `!` は影響しない。
+        let ne = tokenize("a != 'x'").expect("tokenize");
+        assert_eq!(ne, tokenize("a <> 'x'").expect("tokenize"));
+        assert!(tokenize("a ! 'x'").is_err());
+        assert!(tokenize("a !").is_err());
+        assert_eq!(
+            tokenize("'a!=b'").expect("tokenize"),
+            vec![Token::StringLiteral("a!=b".to_string())]
+        );
+    }
+
     use super::is_single_number_literal;
 
     #[test]
