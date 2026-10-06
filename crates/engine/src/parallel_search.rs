@@ -59,7 +59,7 @@ pub(crate) struct WorkerBudgetGuard(usize);
 impl WorkerBudgetGuard {
     pub(crate) fn acquire(desired: usize) -> Self {
         let mut reserved = 0usize;
-        let _ = GLOBAL_WORKER_BUDGET.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+        let _ = GLOBAL_WORKER_BUDGET.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
             let available = MAX_TOTAL_EXTRA_WORKER_THREADS.saturating_sub(cur);
             reserved = desired.min(available);
             Some(cur.saturating_add(reserved))
