@@ -1416,6 +1416,49 @@ fn typed_float_bind_matches_literal_form_and_executes() {
     assert_eq!(count("SELECT id FROM seven WHERE d = $1 LIMIT 5", "9.5"), 0);
 }
 
+/// Issue #1438・SQL-24: 浮動小数列と大きな数値の `$n` 束縛もリテラル形と同じ結果になる
+/// （範囲内は受理、float8 範囲外は `22003`）。
+#[test]
+fn typed_float_bind_accepts_large_values_and_rejects_out_of_range() {
+    let path = unique_db_path("prepared-float-large");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_seven_type_table(&path);
+    let ctx = seven_ctx();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut SessionState::default(),
+        "INSERT INTO seven (id, embedding, d) VALUES (1, '[0.1,0.2,0.3]', 1e21) USING OPERATION_ID 'op-big'",
+    )
+    .expect("insert");
+    let run = |v: &str| {
+        let prepared = core
+            .parse_sql_prepared("SELECT id FROM seven WHERE d = $1 LIMIT 5")
+            .expect("parse");
+        let bound = core.bind_prepared(&prepared, &[some(v)]).expect("bind");
+        core.execute_parsed_in_session(&ctx, &mut SessionState::default(), &bound)
+    };
+    for v in ["1e21", "1000000000000000000000"] {
+        match run(v).expect("execute") {
+            SqlOutcome::Query(result) => assert_eq!(result.rows.len(), 1, "{v}"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+    match run("-1e21").expect("execute") {
+        SqlOutcome::Query(result) => assert_eq!(result.rows.len(), 0),
+        other => panic!("expected Query, got {other:?}"),
+    }
+    let literal_code = core
+        .execute_sql(&ctx, "SELECT id FROM seven WHERE d = 1e400 LIMIT 5")
+        .expect_err("literal out of range")
+        .wire_code()
+        .to_string();
+    assert_eq!(literal_code, "22003");
+    assert_eq!(
+        run("1e400").expect_err("bound out of range").wire_code(),
+        literal_code
+    );
+}
+
 #[test]
 fn typed_float_bind_rejects_malformed_values_and_keeps_literal_limits() {
     let path = unique_db_path("prepared-float-22p02");

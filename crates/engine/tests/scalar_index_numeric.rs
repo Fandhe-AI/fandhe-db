@@ -214,7 +214,7 @@ fn all_four_types_all_operators_match_oracle() {
     let (core, _guard) = open_core("scalar-index-numeric-ops");
     // (列, SQL リテラル, f64 リテラル)。`ratio` の 0.1 は REAL を広げた値と
     // 比較される（`0.1` リテラルは f64 の 0.1 であり REAL の広げ値とは異なる）。
-    let probes: [(&str, &str, f64); 14] = [
+    let probes: [(&str, &str, f64); 19] = [
         ("qty", "3", 3.0),
         ("qty", "0", 0.0),
         ("qty", "2.5", 2.5),
@@ -229,6 +229,12 @@ fn all_four_types_all_operators_match_oracle() {
         ("score", "0.5", 0.5),
         ("score", "0", 0.0),
         ("score", "1000", 1000.0),
+        // Issue #1438: 大きな数値リテラル（2^53 超・f32 範囲外）でも索引経路と全走査が一致する。
+        ("ratio", "1e21", 1e21),
+        ("ratio", "1e39", 1e39),
+        ("score", "1e21", 1e21),
+        ("score", "-1e300", -1e300),
+        ("score", "9007199254740993", 9007199254740992.0),
     ];
     for (col, lit, l) in probes {
         assert_indexed(&core, &format!("{col} = {lit}"), &oracle(col, |v| v == l));
