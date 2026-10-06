@@ -50,7 +50,7 @@ private submodule のコミット件名は記載しない。
 | - | ---- | ---- | ---------------- |
 | D1 | メイン作業ツリーの取り込みは `git pull --ff-only` のみ。ahead が 1 以上なら pull せず、ローカルのコミットを別ブランチへ退避してから判断する | 遅れは 132 コミットで ahead は 0。履歴を書き換えず fail-closed に止まれる | `pull --rebase`・merge コミット: ローカル変更を暗黙に書き換える／無意味な merge コミットが残る |
 | D2 | pull の時期は次の 3 条件がそろった後。(a) 並列の implement-issue-tree ランが動いていない (b) 本ツリーの open PR（#1453・#1454・#1457）がマージかクローズで片付いた (c) #1333 で gitlink が確定した。実行前に #1454 がマージ済みなら `make worktree-lag-check REMOTE_CHECK=1` で HIGH=0 を確認し、未マージなら同じ観点を手動で確認する | 並列ラン中の共有状態の変更を避ける。gitlink 確定前に取り込むと submodule のずれが再発する | 今すぐ pull: 並列ランと open PR の conflict 解消に干渉する |
-| D3 | push 済み feature ブランチへの base の取り込みは `git merge origin/main`（Issue #361 の形式）。push 後の rebase と force push はしない | remote-ahead／diverged 検査が fail-closed で止まる。PR refs に中間コミットが残るので rewrite に意味が無い。squash merge で main には 1 コミットしか残らないため merge コミットは main に残らない | rebase + force push: ruleset の非高速転送禁止と既存検査に反する |
+| D3 | push 済み feature ブランチへの base の取り込みは `git merge origin/main`。push 後の rebase と force push はしない | remote-ahead／diverged 検査が fail-closed で止まる。PR refs に中間コミットが残るので rewrite に意味が無い。squash merge で main には 1 コミットしか残らないため merge コミットは main に残らない | rebase + force push: ruleset の非高速転送禁止と既存検査に反する |
 | D4 | 古くなった open PR は D3 の取り込みと CI 再実行で更新する。strict が false なので最新化は必須ではないが、conflict がある場合や CI failure の原因が base 側にある場合は取り込む | 不要な再実行を避けつつ、conflict は必ず解消する | 全 PR を一律に最新化: CI コストが増える |
 | D5 | `implementation-status.md` 末尾への追記どうしの conflict は、両方の記録を残し、Issue 番号順ではなくマージ順で並べて解消する | 追記専用ファイルなので内容の取捨は不要 | 片方を採用: 記録が欠落する |
 | D6 | pull の後に `git submodule update --init` を実行する（アクセス権が無ければスキップ）。gitlink の更新方針は #1333 に任せ、本書では決めない | 作業コピーを gitlink に合わせる。方針の重複決定を避ける | gitlink を手元で更新: #1333 の責務と衝突する |
