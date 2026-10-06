@@ -1613,6 +1613,22 @@ fn canonical_decimal_text(raw: &str) -> String {
     canonical_decimal_parts(raw).unwrap_or_else(|| raw.to_string())
 }
 
+/// `v`（`raw` を f64 へ解釈した値）の最短表現が `raw` と同じ十進値かを返す。
+/// 偽なら f64 へ丸めると別の十進値と同一視されるため、`push_dml_expr` は
+/// 正規化十進文字列（タグ 11）で直列化する。
+fn f64_round_trips_decimal(v: f64, raw: &str) -> bool {
+    if !v.is_finite() {
+        return false;
+    }
+    match (
+        canonical_decimal_parts(&format!("{v:e}")),
+        canonical_decimal_parts(raw),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `Expr` をタグ付き前置順で直列化する（ADR §4.4）。`params` が `Some` の場合、
 /// `Ident` が参照 UDF 自身のパラメータ（大文字小文字を区別せず照合）を指すときに
 /// 限り小文字化して連結する（ADR §4.4.1「6.」。`bind_expr_in` のパラメータ解決が
@@ -1628,19 +1644,23 @@ fn push_dml_expr(
 
     match expr {
         // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの比較は束縛段で正確な 10 進値
-        // として受理されるため、f64 で正確に表せない整数（2^53 超）もここへ到達する。
-        // 従来 f64 へ解釈できた（受理済みの）リテラルは、小数・指数表記を含めすべてタグ 1＋
-        // f64 ビット列のまま直列化する（既存の operation_id 台帳の content hash を変えず、
-        // 再送照合の互換を保つ。公開 API・エラー契約の互換性）。従来 `parse_number_literal`
-        // が拒否していた入力（2^53 超の整数等）だけを新タグ 11＋正規化した十進文字列で
-        // 直列化する（従来エラーだった入力のみが対象で台帳互換）。値の妥当性（範囲・型）は
+        // として受理されるため、f64 へ丸めると別の十進値と同一視されるリテラル
+        // （`1` と `1.0000000000000001` 等）をハッシュ段で区別する必要がある。
+        // f64 へ解釈でき、かつ f64 の最短表現が元の十進値と一致する（往復できる）リテラルは、
+        // 小数・指数表記を含めタグ 1＋f64 ビット列のまま直列化する（通常の桁数のリテラルは
+        // 既存の operation_id 台帳の content hash を変えず再送照合の互換を保つ）。
+        // f64 で往復できないリテラル（17 桁超の精度を持つ小数・2^53 超の整数等）は
+        // 新タグ 11＋正規化した十進文字列で直列化する。互換性の扱い: この区別により、
+        // 従来 f64 へ丸めて受理されていた往復不能な桁数のリテラルを含む DML だけは
+        // content hash が変わる（桁あふれ分を f64 比較列で区別できないまま同一視する
+        // 方が誤再送判定の害が大きいため、fail-closed 側に倒す）。値の妥当性（範囲・型）は
         // 束縛段が検査する。
         Expr::Number(raw) => match crate::sql::udf_call::parse_number_literal(raw) {
-            Ok(v) => {
+            Ok(v) if f64_round_trips_decimal(v, raw) => {
                 b.push_u8(1);
                 b.push_raw(&v.to_bits().to_le_bytes());
             }
-            Err(_) => {
+            _ => {
                 b.push_u8(11);
                 b.push_bytes(canonical_decimal_text(raw).as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
@@ -3631,9 +3651,10 @@ mod tests {
         assert_ne!(h1, h4, "differing scale must not collapse to the same hash");
     }
 
-    /// Issue #1430（codex P1）: 従来受理されていた数値リテラル（小数・指数表記・先頭ドット
+    /// Issue #1430（codex P1）: f64 で往復できる数値リテラル（小数・指数表記・先頭ドット
     /// 形を含む）は従来どおりタグ 1＋f64 ビット列で直列化され、既存の台帳ハッシュを変えない。
-    /// 2^53 超の整数（従来エラー）だけがタグ 11＋正規化十進文字列になる。
+    /// f64 で往復できない十進値（`1` と `1.0000000000000001` 等）と 2^53 超の整数は
+    /// タグ 11＋正規化十進文字列になり、互いに区別される。
     #[test]
     fn dml_number_literal_hash_keeps_legacy_tag1() {
         use crate::sql::udf_call::Expr;
@@ -3648,7 +3669,12 @@ mod tests {
             b.push_raw(&v.to_bits().to_le_bytes());
             b.finish()
         };
-        assert_eq!(hash("1.0000000000000001"), legacy(1.0000000000000001));
+        assert_eq!(hash("1"), legacy(1.0));
+        assert_eq!(hash("1.0"), hash("1"));
+        assert_ne!(hash("1"), hash("1.0000000000000001"));
+        assert_ne!(hash("1.0000000000000001"), hash("1.0000000000000002"));
+        assert_ne!(hash("1.0000000000000001"), legacy(1.0000000000000001));
+        assert_eq!(hash("1.0000000000000001"), hash("1.00000000000000010"));
         assert_eq!(hash("0.1"), legacy(0.1));
         assert_eq!(hash(".5"), legacy(0.5));
         assert_eq!(hash(".5"), hash("0.5"));
