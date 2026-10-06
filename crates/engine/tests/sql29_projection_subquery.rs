@@ -451,6 +451,9 @@ fn projection_subquery_later_static_error_wins_over_earlier_cardinality() {
         let inners = [
             format!("(SELECT name FROM {REFS} WHERE {multi} AND {bad} LIMIT 1)"),
             format!("(SELECT COUNT(*) FROM {REFS} WHERE {multi} AND {bad})"),
+            // OR 分岐内でも、先行分岐の 21000 が後続分岐の静的エラーを隠さない。
+            format!("(SELECT name FROM {REFS} WHERE {multi} OR {bad} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {multi} OR {bad})"),
         ];
         for inner in &inners {
             let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");

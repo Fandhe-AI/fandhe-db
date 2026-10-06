@@ -756,7 +756,13 @@ fn first_static_error_in_subquery_predicates(
 ) -> Option<SqlSurfaceError> {
     let mut budget = MAX_SUBQUERY_EXECUTIONS;
     let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
+    // `OR` の分岐内でも先行サブクエリの遅延対象エラーが後続を打ち切るため、分岐も
+    // 含めてサブクエリ述語を 1 件ずつ独立に解決し直す。
+    let mut units: Vec<&WherePredicate> = Vec::new();
     for pred in subquery_preds {
+        collect_subquery_probe_units(pred, &mut units);
+    }
+    for pred in units {
         if let Err(e) = resolve_where_predicates(
             vec![pred.clone()],
             chain,
@@ -773,6 +779,20 @@ fn first_static_error_in_subquery_predicates(
         }
     }
     None
+}
+
+/// [`first_static_error_in_subquery_predicates`] 用に、`WherePredicate::Or` の分岐を
+/// 再帰的に展開し、サブクエリを含む述語を個別の検査単位として集める。
+fn collect_subquery_probe_units<'a>(pred: &'a WherePredicate, out: &mut Vec<&'a WherePredicate>) {
+    match pred {
+        WherePredicate::Or(branches) => {
+            for p in branches.iter().flatten() {
+                collect_subquery_probe_units(p, out);
+            }
+        }
+        other if predicate_contains_subquery(other) => out.push(other),
+        _ => {}
+    }
 }
 
 /// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
