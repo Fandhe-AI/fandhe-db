@@ -373,6 +373,10 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   述語形の両方で固定する（commit 後の再送は台帳由来の `23505`、COMMIT 前の接続断では
   台帳が残らない対照、後から INSERT された行を再送が消さないこと、テナント単位の台帳）。
   本番コードの変更は不要だった。
+  wire 層 A（`crates/wire-server/tests/recover12_explicit_txn_resend.rs`）にも同じ
+  シナリオを射影した（Issue #1433）: 単一行形・述語形 × `RETURNING` 有無（0 行のため
+  `DataRow` は無く、再送は `RowDescription` より前に `ErrorResponse`）・暗黙トランザクション
+  （複数文メッセージ）。本番コードの変更は無い。
 
 ## 起源（Explicit／Implicit）ごとの遷移差分（Issue #1175）
 
