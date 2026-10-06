@@ -199,3 +199,10 @@ overflow_matches_visibility_parity`・
 ## Issue #896 追記
 
 NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。
+
+## Issue #1438 追記: 浮動小数列と大きな数値リテラルの比較
+
+- 対象ビヘイビア: SQL-24・TABLE-13（関連: ERR-2・ERR-4）。
+- `REAL`／`DOUBLE PRECISION` 列と数値リテラル（数値形・文字列形）の比較は float8 同士の比較として束縛し、整数列・疑似列 `id` 用の 2^53 exactness 判定（`parse_number_literal`）をかけない。`1e21`・`1e39` のような f32 範囲外でも f64 範囲内なら受理する（REAL 列も f64 範囲で比較する）。
+- float8 範囲外（オーバーフロー・非ゼロのアンダーフロー）は `22003`、書式不正は `22P02`。エラー文言にリテラル本文は含めない。
+- 整数列（`INTEGER`／`BIGINT`）・疑似列 `id`・式の結果（`d + 0 > 1e21` 等）・HAVING リテラルは従来どおり exactness 判定を維持する。書き込み経路（INSERT／UPDATE／COPY）の REAL 範囲検査も変更しない。

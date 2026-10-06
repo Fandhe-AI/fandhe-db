@@ -21,7 +21,7 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 | --- | ---- | ---- |
 | D1 | 参照先列は、参照先テーブルの `id` 疑似列（物理キー）・宣言済み主キー・UNIQUE 制約のいずれかと**列集合**が一致すること。それ以外は `42830` | 一意性を保証しない列を参照先にすると、同値の参照先行の 1 行を削除しても残りが参照を満たし続ける等、`NO ACTION` の意味論が定まらない |
 | D2 | 参照先列の省略（`REFERENCES <t>`）は参照先の主キー、未宣言なら `id` へ解決し、解決済みの列名をカタログへ永続化する | PostgreSQL と同じ規約。解決結果を永続化することで、後から参照先が変わっても宣言の意味が変わらない |
-| D3 | 参照元列と参照先列の型は位置ごとに一致すること（型タグ＋パラメータ。ENUM は型名を含む）。`id` 参照の参照元列は `INTEGER`／`BIGINT`。不一致は `42830` | 参照先の照合を一意性検査と同じ型タグ付き正準キーで行うため、型が異なる組は常に違反になる（黙って常に失敗する宣言を受理しない） |
+| D3 | 参照元列と参照先列の型は位置ごとに一致すること（型タグ＋パラメータ。ENUM は型名を含む）。ただし `INTEGER`／`BIGINT` の組は混在を許し、実行時に読み替える（Issue #1435）。`id` 参照の参照元列は `INTEGER`／`BIGINT`。それ以外の不一致は `42830` | 参照先の照合を一意性検査と同じ型タグ付き正準キーで行うため、型が異なる組は常に違反になる（黙って常に失敗する宣言を受理しない） |
 | D4 | SQL 表層 `CREATE TABLE` の列型へ `INTEGER`／`BIGINT` を追加（`NOT NULL`／`DEFAULT <数値>`／`UNIQUE`／`PRIMARY KEY` も受理） | `id` を参照する参照元列を SQL で宣言するための最小限の前提整備 |
 | D5 | ~~参照動作は既定の `NO ACTION` のみ~~（Issue #1076 で改訂。D16〜参照）。`MATCH`（D13）・遅延属性（D14）は Issue #1077 で受理するようになった。表制約 `CONSTRAINT <name> FOREIGN KEY (...)` 前置は Issue #1069 で受理するようになった（列制約 `<col> ... CONSTRAINT <n> REFERENCES` も Issue #1428 で受理。詳細は [alter-table-foreign-key-constraint.md](./alter-table-foreign-key-constraint.md) F6 参照） | 対象外の動作を黙って既定動作へ丸めない（fail-closed） |
 | D6 | `MATCH SIMPLE`（既定）は NULL を含む値の組を検査しない。`MATCH FULL`（D13）は全 NULL の組のみ検査しない | PostgreSQL の既定 |
@@ -410,9 +410,9 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
 食い違う FK が永続スキーマ上に生じる。正準キーは型タグ付きのため、境界で読み替えないと
 参照先側の検査が素通りする（fail-open）か参照元側で誤検知する。
 
-- **型照合の規則**: `CREATE TABLE`・`ADD FOREIGN KEY` の宣言は従来どおり型の完全一致
-  （食い違いは `42830`）。永続スキーマの再検証（decode・`encode_schema`）に限り、
-  `INTEGER`／`BIGINT` の食い違いを許す（自己参照 FK の PK 拡大を表現するため）。
+- **型照合の規則**: `CREATE TABLE`・`ADD FOREIGN KEY` の宣言と永続スキーマの再検証
+  （decode・`encode_schema`）は同じ規則で、`INTEGER`／`BIGINT` の組は混在を許し
+  （Issue #1435。それ以前は宣言のみ完全一致だった）、それ以外の食い違いは `42830`。
 - **読み替え**: `constraint::recode_key_for_types` が正準キーを値を保って相手側の型へ
   再エンコードする。参照元の型で作った必須キー（`verify_required_parent_keys`）、参照先の
   失われたキー（`enforce_referencing_rows_in_txn`）、参照アクションの対象特定
@@ -423,6 +423,10 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
   副作用なしで `23503` により拒否する（専用の `22003` variant は公開 enum の破壊的変更に
   なるためスコープ外）。
 - `id` 疑似列を参照する FK は子列の型で処理済みのため変更なし。
+- **REAL／DOUBLE PRECISION（Issue #1434）**: D3 により FK 列になれないため混在状態は生じない。
+  宣言面が `42830` で副作用なしであること、REAL の UNIQUE 列を拡大した後の一意性、浮動小数の組の
+  読み替えが `Err` になることは `tests/sql_alter_column_type_key_columns.rs` と
+  `constraint::tests::recode_rejects_real_double_pairs_fail_closed` で固定している。
 
 ## 対象外・後続候補
 

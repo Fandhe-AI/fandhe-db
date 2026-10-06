@@ -709,6 +709,42 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: 新しい AST／トークン variant は無く、既存形への desugar のみ。(a) `<>`／`!=` は `NOT col = 'x'` と同じ結果・同じ `wire_code`。(b) `id` × 文字列は数値リテラル形と同じ結果（`id = 'abc'` は `22P02`、2^53 超の厳密表現範囲外は数値リテラル形と同じ `22003`）。実カラム `id` があればそちらが優先。(c) BOOLEAN は `false < true` の順序で、NULL 行は除外。解釈できない文字列は `22P02`（メッセージにリテラルを含めない）。
 - **対象外**: CHECK 本体での BOOLEAN 範囲・`IN`・`BETWEEN`（従来どおり拒否）、裸の数値リテラルとの `<>`、JOIN の修飾名・逆向きの文字列リテラル、NoSQL（HTTP）`filter`。空白を挟んだ `< >` も `<>` として受理される既存の寛容さは据え置き。
 
+## Issue #1433: 明示トランザクションの 0 行 DELETE の再送を wire・RETURNING・暗黙トランザクションで確かめる
+
+- **対象ビヘイビア**: RECOVER-12・SQL-18・SQL-21・WIRE-16（関連: WIRE-19・RECOVER-10・ERR-1・ERR-2・RLS-10）。Issue #1415（engine 層 A）の対象外だった 3 経路の後続。
+- **変更箇所**: `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（制約なしの表 `notes` を使うテスト 9 件を追加）、`docs/design/explicit-transaction.md`・`wire-multi-statement.md`（検証場所の追記）。本番コードの変更なし。
+- **性質**: 単一行形・述語形の 0 行 `DELETE` について、(a) 明示トランザクションの唯一の文／先頭文の再送、(b) `RETURNING` 付き（`RowDescription` → `DELETE 0`、再送は先行メッセージ無しの `ErrorResponse`）、(c) 暗黙トランザクション（複数文メッセージ。再送は `ReadyForQuery('I')`）がいずれも台帳由来の `23505`（固定文言）になる。台帳照合は候補列挙より先（後から INSERT された行は消えない）、台帳はテナント単位、途中エラーで全体ロールバックされた暗黙トランザクションは台帳を残さない。
+- **対象外**: 3 クライアント層 B、拡張クエリプロトコル、engine 層での `RETURNING`／暗黙トランザクション版、HTTP（NoSQL）表層（トランザクションを持たない）。
+
+## Issue #1434: REAL と DOUBLE PRECISION が混在する FOREIGN KEY の照合を確かめる
+
+- **対象ビヘイビア**: TABLE-17・TABLE-19・TABLE-20（Issue #1402・#1414 の後続）。
+- **変更箇所**: `crates/engine/tests/sql_alter_column_type_key_columns.rs`（結合テスト 2 件）、`crates/engine/src/constraint.rs`（`mod tests` に単体テスト 1 件）、`docs/design/foreign-key.md`（追記）。本番コードの変更なし。
+- **性質**: REAL／DOUBLE PRECISION は D3 により FK 列になれず、片側だけ拡大した混在 FK の状態は作れない。現契約として (a) CREATE TABLE（表制約・列制約・自己参照）と ALTER TABLE ADD FOREIGN KEY が `42830` で副作用なし、(b) REAL の UNIQUE 列を DOUBLE PRECISION へ拡大した後も値を保って `23505` が働きテナント内に閉じる、(c) `recode_key_for_types` の浮動小数の組は `Err`（fail-closed）、を固定した。
+- **対象外**: REAL／DOUBLE PRECISION の FK 列受理と f32／f64 キーの読み替え実装（D3 を覆す機能拡張でありオーナー判断事項。spec 側の同期記録と D3 の食い違いの整理を含む）、NoSQL（HTTP）`references` 経由の射影テスト、`unique_constraint.rs`・`sql/allowlist.rs` の古いコメント。
+
+## Issue #1435: INTEGER と BIGINT が混在する FOREIGN KEY の宣言を受理する
+
+- **対象ビヘイビア**: TABLE-17・TABLE-22・ERR-6（Issue #1402・#1414 の後続）。
+- **変更箇所**: `crates/engine/src/catalog.rs`（`FkTypeRule` を廃止し `resolve_foreign_key_target` の型照合を宣言・再検証で一本化）、`crates/engine/src/constraint.rs`（コメントのみ）、`crates/engine/tests/sql_alter_column_type_key_columns.rs`（結合テストの更新・追加）、`docs/design/foreign-key.md`・`alter-table-foreign-key-constraint.md`。
+- **性質**: `CREATE TABLE`（表制約・列制約・自己参照・複合キー）と `ALTER TABLE ADD FOREIGN KEY` で INTEGER／BIGINT が混在する宣言を受理し、実行時は #1414 の読み替え（`recode_key_for_types`）で参照整合性を検査する（値域外は `23503`）。整数型どうし以外の混在は `42830` のまま。Issue #1402 の節にある「宣言は `42830` のまま」を本 Issue で置き換えた（#1402 の節は履歴として残す）。実行時コード・永続フォーマットの変更なし。
+- **対象外**: REAL／DOUBLE PRECISION の FK 列化、ON UPDATE CASCADE 値域外の `22003` 専用 variant、INTEGER／BIGINT と NUMERIC の間の参照、3 クライアント層 B e2e。
+
+## Issue #1437: NoSQL の create_table で名前付きの主キーを宣言できるようにする
+
+- **対象ビヘイビア**: NOSQL-13・TABLE-22（関連: ERR-4・ERR-6。Issue #1412 の後続）。
+- **変更箇所**: `crates/wire-server/src/http/query/ddl.rs`（`primary_key` の `name` を `CONSTRAINT <ident> PRIMARY KEY (...)` へ写像。単体テスト更新・追加）、`schema.rs`（コメントのみ）、`crates/wire-server/tests/nosql13_ddl.rs`（結合テスト追加）、`crates/wire-server/docs/nosql-api.md`・`docs/design/nosql-ddl-mapping.md`。engine の変更なし。
+- **性質**: 名前付き主キーは SQL と同じカタログ表現になり、その名前で `DROP CONSTRAINT` できる。重複宣言（`42P16`）・名前衝突・名前付き `(id)` 単独（`42601`）の `wire_code` は SQL と一致（engine に一本化）。単体テストの拒否ケース `primary_key` + `name` は仕様変更により受理側へ移し、`unique`／`foreign_key` への `name` などの拒否ケースを追加した。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: NoSQL の名前付き UNIQUE／FK、`alter_table` による主キーの追加・削除、3 クライアント層 B。
+
+## Issue #1438: 浮動小数列と大きな数値リテラル（1e21 等）の比較を受理する
+
+- **対象ビヘイビア**: SQL-24・TABLE-13（関連: ERR-2・ERR-4・WIRE-12）。Issue #1418 の対象外として残っていた項目の解消。
+- **原因**: 比較の数値リテラル束縛が相手の列型によらず 2^53 の exactness 判定を適用しており、`REAL`／`DOUBLE` 列と `1e21` の比較が `22003` になっていた。
+- **変更箇所**: `crates/engine/src/sql/udf_call.rs`（比較腕に浮動小数列用の束縛を追加。`parse_float_operand_literal`・`normalize_float_literal_text` を新設し、文字列リテラル形と共有）。結合テスト `sql24_float_large_literal_compare.rs` 新設、`sql24_literal_kind_coercion`・`scalar_index_numeric`・`prepared_params`・NoSQL filter 等価性テストを更新。
+- **性質**: 浮動小数列相手は float8 比較（範囲内は受理、範囲外は `22003`）。整数列・`id`・式結果・HAVING は不変。索引経路と全走査の結果は一致する。
+- **対象外**: 算術式内の大きなリテラル、HAVING リテラル、整数列と範囲外リテラルの比較（PostgreSQL は numeric 比較で受理するが本 Issue では現状維持）、REAL 列に対する f32 範囲外の `$n`／文字列リテラルの float4 厳密解釈。
+
 ## Issue #1432: 投影位置スカラーサブクエリ内の入れ子 WHERE スカラーサブクエリの 21000 を外側の行数に合わせる
 
 - **対象ビヘイビア**: SQL-29・ERR-6（関連: ERR-4・RLS-10 (b)・TASK-213）。

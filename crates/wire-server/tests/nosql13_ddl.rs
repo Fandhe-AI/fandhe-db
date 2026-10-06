@@ -838,6 +838,10 @@ fn create_table_check_constraint_malformed_forms_are_42601() {
             "name on unique",
             r#"{"kind":"unique","columns":["a"],"name":"u"}"#,
         ),
+        (
+            "name on foreign_key",
+            r#"{"kind":"foreign_key","columns":["a"],"references":{"table":"p"},"name":"f"}"#,
+        ),
     ];
     for (label, constraint) in cases {
         let (core, _guard) = new_core();
@@ -852,6 +856,146 @@ fn create_table_check_constraint_malformed_forms_are_42601() {
             "case {label}: got {resp:?}"
         );
     }
+}
+
+// --- 名前付き主キー（Issue #1437・NOSQL-13・TABLE-22） ---------------------------
+
+/// DDL 権限付きの SQL セッション（NoSQL と同じ `core` へ SQL を流し、カタログ表現と
+/// `wire_code` を SQL 表層と比較するため）。
+fn sql_ddl_session() -> (PolicyContext, engine::sql::mode::SessionState) {
+    let ctx = PolicyContext::with_visibilities(
+        TENANT_A,
+        [
+            engine::storage::Visibility::Public,
+            engine::storage::Visibility::Private,
+        ],
+    )
+    .expect("valid tenant ctx");
+    let mut st = engine::sql::mode::SessionState::default();
+    st.allow_ddl();
+    (ctx, st)
+}
+
+#[test]
+fn create_table_named_primary_key_is_enforced_and_droppable_by_name() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(Arc::clone(&core));
+    let body = br#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"text"}],
+        "constraints":[{"kind":"primary_key","name":"pk_t","columns":["a"]}]}"#;
+    let resp = query(&session, body);
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+
+    let ins = |id: u32| {
+        format!(
+            r#"{{"op":"insert","table":"t","rows":[{{"id":{id},"a":"x"}}],"operation_id":"op-{id}"}}"#
+        )
+    };
+    assert_eq!(query(&session, ins(1).as_bytes()).status, 200);
+    let dup = query(&session, ins(2).as_bytes());
+    assert_eq!(http_common::wire_code_of(&dup), "23505", "got: {dup:?}");
+
+    let (ctx, mut sql) = sql_ddl_session();
+    // 導出名ではなく明示名がカタログに入っている。
+    let err = core
+        .execute_sql_in_session(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT t_pkey")
+        .expect_err("derived name must not exist");
+    assert_eq!(err.wire_code(), "42704");
+    core.execute_sql_in_session(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT pk_t")
+        .expect("drop by explicit name");
+    assert_eq!(query(&session, ins(3).as_bytes()).status, 200);
+}
+
+#[test]
+fn create_table_named_primary_key_equal_to_derived_name_behaves_as_unnamed() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(Arc::clone(&core));
+    let body = br#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"text"}],
+        "constraints":[{"kind":"primary_key","name":"t_pkey","columns":["a"]}]}"#;
+    assert_eq!(query(&session, body).status, 200);
+    let (ctx, mut sql) = sql_ddl_session();
+    core.execute_sql_in_session(&ctx, &mut sql, "ALTER TABLE t DROP CONSTRAINT t_pkey")
+        .expect("derived name is droppable");
+}
+
+#[test]
+fn create_table_named_primary_key_wire_codes_match_sql_surface() {
+    // (ラベル, NoSQL constraints 配列, 同等の SQL 表制約, 期待 wire_code)
+    let cases = [
+        (
+            "dup named+named",
+            r#"{"kind":"primary_key","name":"a","columns":["x"]},{"kind":"primary_key","name":"b","columns":["y"]}"#,
+            "CONSTRAINT a PRIMARY KEY (x), CONSTRAINT b PRIMARY KEY (y)",
+            "42P16",
+        ),
+        (
+            "dup named+unnamed",
+            r#"{"kind":"primary_key","name":"a","columns":["x"]},{"kind":"primary_key","columns":["y"]}"#,
+            "CONSTRAINT a PRIMARY KEY (x), PRIMARY KEY (y)",
+            "42P16",
+        ),
+        (
+            "named single id",
+            r#"{"kind":"primary_key","name":"a","columns":["id"]}"#,
+            "CONSTRAINT a PRIMARY KEY (id)",
+            "42601",
+        ),
+        (
+            "name equals check name",
+            r#"{"kind":"primary_key","name":"same","columns":["x"]},{"kind":"check","name":"same","predicate":[{"column":"x","op":"gt","value":0}]}"#,
+            "CONSTRAINT same PRIMARY KEY (x), CONSTRAINT same CHECK (x > 0)",
+            "42601",
+        ),
+        (
+            "name is column type keyword",
+            r#"{"kind":"primary_key","name":"text","columns":["x"]}"#,
+            "CONSTRAINT text PRIMARY KEY (x)",
+            "42601",
+        ),
+        (
+            "invalid identifier",
+            r#"{"kind":"primary_key","name":"bad-name","columns":["x"]}"#,
+            "",
+            "42601",
+        ),
+    ];
+    for (label, nosql_constraints, sql_constraint, expected) in cases {
+        let (core, _guard) = new_core();
+        let session = ddl_session(Arc::clone(&core));
+        let body = format!(
+            r#"{{"op":"create_table","table":"t","columns":[{{"name":"x","type":"integer"}},{{"name":"y","type":"integer"}}],"constraints":[{nosql_constraints}]}}"#
+        );
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(resp.status, 400, "case {label}: got {resp:?}");
+        assert_eq!(http_common::wire_code_of(&resp), expected, "case {label}");
+        http_common::assert_message_does_not_echo(&resp, TENANT_A);
+
+        if !sql_constraint.is_empty() {
+            let (ctx, mut sql) = sql_ddl_session();
+            let err = core
+                .execute_sql_in_session(
+                    &ctx,
+                    &mut sql,
+                    &format!("CREATE TABLE t (x INTEGER, y INTEGER, {sql_constraint})"),
+                )
+                .expect_err("sql must reject");
+            assert_eq!(err.wire_code(), expected, "case {label}: sql parity");
+        }
+
+        // 副作用ゼロ: 同名テーブルを有効な定義で作成できる。
+        let ok = br#"{"op":"create_table","table":"t","columns":[{"name":"x","type":"integer"}],
+            "constraints":[{"kind":"primary_key","name":"pk_ok","columns":["x"]}]}"#;
+        assert_eq!(query(&session, ok).status, 200, "case {label}: retry");
+    }
+}
+
+#[test]
+fn create_table_named_primary_key_without_ddl_permission_is_42501() {
+    let (core, _guard) = new_core();
+    let session = non_ddl_session(core);
+    let body = br#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"text"}],
+        "constraints":[{"kind":"primary_key","name":"pk_t","columns":["a"]}]}"#;
+    let resp = query(&session, body);
+    assert_eq!(http_common::wire_code_of(&resp), "42501", "got: {resp:?}");
 }
 
 /// Issue #1430・SQL-24: SQL 表層が負の数値リテラルを受理するようになったため、

@@ -1233,8 +1233,9 @@ fn push_required_key(
     Ok(())
 }
 
-/// 参照元・参照先で列型が異なる組（`ALTER COLUMN TYPE` の `INTEGER`→`BIGINT` 拡大が
-/// 片側だけに適用された状態。Issue #1402）の正準キーバイト列を、`source` 側の型の
+/// 参照元・参照先で列型が異なる組（`INTEGER`／`BIGINT` が混在する FK。宣言による
+/// 混在、または `ALTER COLUMN TYPE` の拡大が片側だけに適用された状態。
+/// Issue #1402・#1435）の正準キーバイト列を、`source` 側の型の
 /// 表現から `target` 側の型の表現へ読み替える。
 ///
 /// 正準キーは型タグ付きのため `INTEGER 5` と `BIGINT 5` は別のバイト列になる。
@@ -4539,5 +4540,29 @@ mod tests {
         assert!(
             recode_key_for_types(&good, &src, &[&ColumnType::BigInt, &ColumnType::BigInt]).is_err()
         );
+    }
+
+    /// INTEGER／BIGINT の `Ok(None)` 規則に浮動小数版は無い。REAL／DOUBLE PRECISION は D3 により
+    /// FK 列になり得ないため、浮動小数の組は値に依らず内部矛盾として `Err`（fail-closed。Issue #1434）。
+    #[test]
+    fn recode_rejects_real_double_pairs_fail_closed() {
+        let real = ColumnType::Real;
+        let double = ColumnType::Double;
+        let r2d = canon(&[ScalarRef::Real(1.5)]);
+        assert!(recode_key_for_types(&r2d, &[&real], &[&double]).is_err());
+        for v in [1.0e300, 0.1] {
+            let d = canon(&[ScalarRef::Double(v)]);
+            assert!(
+                recode_key_for_types(&d, &[&double], &[&real]).is_err(),
+                "{v}"
+            );
+        }
+        let mixed = canon(&[ScalarRef::Text("a"), ScalarRef::Real(1.5)]);
+        assert!(recode_key_for_types(
+            &mixed,
+            &[&ColumnType::Text, &real],
+            &[&ColumnType::Text, &double]
+        )
+        .is_err());
     }
 }

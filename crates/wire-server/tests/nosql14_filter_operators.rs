@@ -465,7 +465,7 @@ fn numeric_and_text_range_filters_match_sql_and_respect_tenant_boundary() {
     let session = SessionState::default();
 
     // (NoSQL filter JSON, 等価な SQL WHERE)
-    let cases: [(&str, &str); 22] = [
+    let cases: [(&str, &str); 25] = [
         (r#"[{"column":"qty","op":"eq","value":2}]"#, "qty = 2"),
         (r#"[{"column":"qty","op":"gt","value":1}]"#, "qty > 1"),
         (r#"[{"column":"qty","op":"ge","value":3}]"#, "qty >= 3"),
@@ -524,6 +524,19 @@ fn numeric_and_text_range_filters_match_sql_and_respect_tenant_boundary() {
         (
             r#"[{"column":"ratio","op":"in","value":[0.5,5]},{"column":"lang","op":"gt","value":"a"}]"#,
             "ratio IN (0.5, 5) AND lang > 'a'",
+        ),
+        // Issue #1438: 浮動小数列と大きな数値リテラルの比較は SQL と同じ結果集合（受理）。
+        (
+            r#"[{"column":"score","op":"gt","value":1e21}]"#,
+            "score > 1e21",
+        ),
+        (
+            r#"[{"column":"ratio","op":"lt","value":1e39}]"#,
+            "ratio < 1e39",
+        ),
+        (
+            r#"[{"column":"score","op":"gte","value":-1e300}]"#,
+            "score >= -1e300",
         ),
     ];
     let run_nosql = |filter_json: &str| {
