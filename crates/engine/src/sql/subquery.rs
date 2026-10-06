@@ -594,7 +594,7 @@ fn execute_inner_scan_statement(
             // 内側 WHERE の静的な誤り（未知列等）はデータ依存の実行時エラーより優先して
             // 返す（可視データで契約が変わらないよう、サブクエリを含まない述語は
             // 束縛検証を完了させる）。
-            if intent == InnerScanIntent::ScalarValue {
+            if intent != InnerScanIntent::ExistenceOnly {
                 if is_deferrable_runtime_error(&e) {
                     if let Some(static_err) = first_static_error_in_subquery_predicates(
                         &subquery_preds,
@@ -907,6 +907,14 @@ fn validate_in_target_column<'a>(
     }
 }
 
+/// `IN` の内側投影列と対象列の値族不一致の静的エラー（`resolve_in_subquery` 用）。
+fn in_family_mismatch(column: &str) -> SqlSurfaceError {
+    SqlSurfaceError::invalid_input(format!(
+        "subquery projection type is not compatible with IN target column {column:?} \
+         (the subquery projection must have the same value family as the target column)"
+    ))
+}
+
 /// `IN`／`NOT IN (SELECT ...)` を解決し、連言の述語列を返す。内側は投影列が
 /// ちょうど 1 列であることを要求し（`42601`）、[`validate_in_target_column`] で
 /// 対象列を検証した上で、内側の投影列の値族が対象列の値族と一致することを検証する
@@ -933,7 +941,8 @@ fn resolve_in_subquery(
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let result = execute_inner_query(
+    let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+    let result = match execute_inner_query_with_meta(
         inner_tokens,
         depth,
         InnerScanIntent::Values,
@@ -944,7 +953,24 @@ fn resolve_in_subquery(
         udfs,
         budget,
         in_value_budget,
-    )?;
+        &mut meta_sink,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 内側の入れ子 `21000`／実行時データ例外は外側の行数判明まで遅延される契約の
+            // ため、同じ述語の対象列・値族エラーを隠さないよう、遅延対象エラーのときだけ
+            // 静的検証を先に行う（Issue #1432。fail-closed）。
+            if is_deferrable_runtime_error(&e) {
+                let (_, family) = validate_in_target_column(column, owner_schema(outer_scopes)?)?;
+                if let Some([inner_meta]) = meta_sink.as_deref() {
+                    if inner_value_family(inner_meta) != Some(family) {
+                        return Err(in_family_mismatch(column));
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
     if result.columns.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
             "subquery used with IN must select exactly one column",
@@ -963,10 +989,7 @@ fn resolve_in_subquery(
             detail: "subquery result missing projected column metadata".to_string(),
         })?;
     if inner_value_family(inner_meta) != Some(family) {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "subquery projection type is not compatible with IN target column {column:?} \
-             (the subquery projection must have the same value family as the target column)"
-        )));
+        return Err(in_family_mismatch(column));
     }
 
     let inner_empty = result.rows.is_empty();
@@ -1467,6 +1490,50 @@ fn number_cell_text(cell: &Cell) -> Result<String, SqlSurfaceError> {
     }
 }
 
+/// スカラーサブクエリ比較の内側投影列の値族が対象列の値族と比較可能かを検証する
+/// （数値族どうしは可。内側の結果行数・値に依存しない静的検証）。
+fn check_scalar_family_compatible(
+    column: &str,
+    inner_meta: &ColumnMeta,
+    target_family: SubqueryValueFamily,
+) -> Result<(), SqlSurfaceError> {
+    let compatible = match inner_value_family(inner_meta) {
+        Some(inner) => inner == target_family || (inner.is_number() && target_family.is_number()),
+        None => false,
+    };
+    if !compatible {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "subquery result type is not compatible with column {column:?} \
+             (the subquery must have the same value family as the column)"
+        )));
+    }
+    Ok(())
+}
+
+/// スカラーサブクエリ比較の対象列（`outer_scopes` 末尾のテーブル）の型と値の族を検証して返す。
+/// 疑似列 `id` は整数族。未知列・型非対応は `invalid_input`（静的エラー）。
+/// [`resolve_scalar_compare`] から、内側の実行結果に依存せず呼ばれる。
+fn scalar_target_column<'a>(
+    column: &str,
+    outer_scopes: &[&'a TableSchema],
+) -> Result<(Option<&'a ColumnType>, SubqueryValueFamily), SqlSurfaceError> {
+    let owner = owner_schema(outer_scopes)?;
+    match owner.columns.iter().find(|c| c.name == column) {
+        Some(def) => Ok((
+            Some(&def.ty),
+            family_of_type(&def.ty).ok_or_else(|| {
+                SqlSurfaceError::invalid_input(format!(
+                    "column {column:?} type is not supported for a scalar subquery comparison"
+                ))
+            })?,
+        )),
+        None if column == "id" => Ok((None, SubqueryValueFamily::Integer)),
+        None => Err(SqlSurfaceError::invalid_input(format!(
+            "unknown column: {column}"
+        ))),
+    }
+}
+
 /// `<column> <op> (SELECT ...)`（スカラーサブクエリ。Issue #1191）を解決し、
 /// `<column> <op> <リテラル>` と同じ AST の述語 1 つを返す。
 ///
@@ -1489,7 +1556,8 @@ fn resolve_scalar_compare(
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<WherePredicate, SqlSurfaceError> {
-    let result = execute_inner_query(
+    let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+    let result = match execute_inner_query_with_meta(
         inner_tokens,
         depth,
         InnerScanIntent::Scalar,
@@ -1500,46 +1568,37 @@ fn resolve_scalar_compare(
         udfs,
         budget,
         in_value_budget,
-    )?;
+        &mut meta_sink,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 内側の入れ子 `21000`／実行時データ例外は外側の行数判明まで遅延される契約の
+            // ため、同じ述語の静的エラー（対象列の未知・型非対応）を隠さないよう、
+            // 遅延対象エラーのときだけ対象列検証を先に行って静的エラーを優先する
+            // （Issue #1432。fail-closed）。それ以外の内側エラーは従来どおり即返す。
+            if is_deferrable_runtime_error(&e) {
+                let (_, target_family) = scalar_target_column(column, outer_scopes)?;
+                if let Some([inner_meta]) = meta_sink.as_deref() {
+                    check_scalar_family_compatible(column, inner_meta, target_family)?;
+                }
+            }
+            return Err(e);
+        }
+    };
     if result.columns.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
             "subquery used as a value must select exactly one column",
         ));
     }
     // 対象列（疑似列 `id` は整数族）。行数に依存せず必ず検証する。
-    let owner = owner_schema(outer_scopes)?;
-    let (target_ty, target_family) = match owner.columns.iter().find(|c| c.name == column) {
-        Some(def) => (
-            Some(&def.ty),
-            family_of_type(&def.ty).ok_or_else(|| {
-                SqlSurfaceError::invalid_input(format!(
-                    "column {column:?} type is not supported for a scalar subquery comparison"
-                ))
-            })?,
-        ),
-        None if column == "id" => (None, SubqueryValueFamily::Integer),
-        None => {
-            return Err(SqlSurfaceError::invalid_input(format!(
-                "unknown column: {column}"
-            )))
-        }
-    };
+    let (target_ty, target_family) = scalar_target_column(column, outer_scopes)?;
     let inner_meta = result
         .columns
         .first()
         .ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery result missing projected column metadata".to_string(),
         })?;
-    let compatible = match inner_value_family(inner_meta) {
-        Some(inner) => inner == target_family || (inner.is_number() && target_family.is_number()),
-        None => false,
-    };
-    if !compatible {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "subquery result type is not compatible with column {column:?} \
-             (the subquery must have the same value family as the column)"
-        )));
-    }
+    check_scalar_family_compatible(column, inner_meta, target_family)?;
 
     let mut rows = result.rows.iter();
     let Some(first) = rows.next() else {

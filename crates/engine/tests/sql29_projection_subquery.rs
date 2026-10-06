@@ -658,3 +658,37 @@ fn projection_subquery_static_target_error_wins_over_multi_row_inner() {
         }
     }
 }
+
+/// 比較・IN の内側サブクエリ自身が入れ子の WHERE スカラーサブクエリで 21000 になっても、
+/// 同じ述語の対象列エラーは隠れず、外側 0 行でも返る（Issue #1432 codex-review P1）。
+/// Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_static_target_error_wins_over_nested_inner_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let nested =
+        format!("(SELECT qty FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) LIMIT 1)");
+    let preds = [
+        format!("nope = {nested}"),
+        format!("nope IN {nested}"),
+        format!("name = {nested}"),
+        format!("name IN {nested}"),
+    ];
+    for pred in &preds {
+        let inners = [
+            format!("(SELECT name FROM {REFS} WHERE {pred} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {pred})"),
+        ];
+        for inner in &inners {
+            let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+            let c = code(&core, &ctx, &none);
+            assert_eq!(c, "22000", "{inner}");
+            let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+            assert_eq!(code(&core, &ctx, &some), c, "{inner}");
+        }
+    }
+}
