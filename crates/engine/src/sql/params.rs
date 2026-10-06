@@ -256,6 +256,19 @@ pub(crate) fn where_equality_literal_is_param_typed(
                 _ => {}
             }
         }
+        // `<col> <> '<lit>'`（`!=` は字句段で同形になる。Issue #1431）は構文段で
+        // `Not(Equality)` になり `equality_ordinal` を進めるため、実リテラルの
+        // フラグ `false` を積んで序数を揃える。`<> $n` は許可位置ではない
+        // （`validate_param_positions` が拒否する）ので Param 側は数えない。
+        if matches!(tokens.get(i), Some(Token::Ident(_)))
+            && matches!(tokens.get(i + 1), Some(Token::Punct('<')))
+            && matches!(tokens.get(i + 2), Some(Token::Punct('>')))
+            && matches!(tokens.get(i + 3), Some(Token::StringLiteral(_)))
+        {
+            flags.push(false);
+            i += 4;
+            continue;
+        }
         i += 1;
     }
     flags
@@ -866,6 +879,21 @@ pub fn decode_bind_values(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn not_equal_string_literal_counts_as_real_literal_flag() {
+        // Issue #1431: `a <> 'x'`（`!=` 含む）は `Not(Equality)` として序数を進めるため、
+        // 後続の `b = $1` のフラグは 2 番目になる。
+        for op in ["<>", "!="] {
+            let sql = format!("SELECT id FROM t WHERE a {op} 'x' AND b = $1");
+            let tokens = crate::sql::lexer::tokenize_with_params(&sql).expect("tokenize");
+            assert_eq!(
+                where_equality_literal_is_param_typed(&tokens, &[]),
+                vec![false, true],
+                "{op}"
+            );
+        }
+    }
+
     use super::*;
     use crate::sql::lexer::tokenize_with_params;
 

@@ -1702,7 +1702,11 @@ fn numeric_column_string_leaf_as_predicates(
                 ColumnType::Integer | ColumnType::BigInt | ColumnType::Real | ColumnType::Double
             )
     });
-    if !is_numeric {
+    // 疑似列 `id`（スキーマに実カラム `id` が無い場合のみ。実カラム優先は
+    // `udf_call::bind_expr_in`・投影束縛と同じ。Issue #1431・SQL-24）は wire 型が
+    // `numeric` で、束縛段が `IdRef` として数値リテラル形と同じ文法で解釈する。
+    let is_pseudo_id = column == "id" && !schema.columns.iter().any(|c| c.name == "id");
+    if !is_numeric && !is_pseudo_id {
         return Ok(None);
     }
     let cmp = |op: BinOp, value: &str| {
@@ -1758,6 +1762,101 @@ fn numeric_column_string_leaf_as_predicates(
     } else {
         Ok(Some(conjunction))
     }
+}
+
+/// BOOLEAN 列 × 文字列リテラルの範囲比較・`IN`・`BETWEEN`（およびその `NOT`）を、
+/// 宣言的経路が既に扱える葉（`BoolEquality`／`IsNull`／常に偽の `Or`）へ書き換える
+/// （Issue #1431・SQL-24・ERR-2）。PostgreSQL の BOOLEAN 順序 `false < true` で非 NULL 値の
+/// 許容集合を計算し、`NOT` は非 NULL 上の補集合とする（NULL 行は否定前後とも UNKNOWN で
+/// 除外されるため三値論理でも正しい）。各リテラルは `parse_pg_bool` で解釈し、
+/// 解釈できなければ `22P02`（メッセージにリテラル本文を含めない）。
+/// `bind_where_predicates_recursive` の WHERE 文脈（`allow_text_range_rewrite == true`）
+/// からのみ呼ばれる。BOOLEAN 以外の列・対象外の葉は `Ok(None)`。
+fn boolean_column_string_leaf_as_predicate(
+    predicate: &WherePredicate,
+    schema: &TableSchema,
+) -> Result<Option<WherePredicate>, SqlSurfaceError> {
+    use crate::sql::allowlist::CompareOp;
+    let (leaf, negated) = match predicate {
+        WherePredicate::Not(inner) => (inner.as_ref(), true),
+        other => (other, false),
+    };
+    let column = match leaf {
+        WherePredicate::Compare { column, .. }
+        | WherePredicate::InList { column, .. }
+        | WherePredicate::Between { column, .. } => column,
+        _ => return Ok(None),
+    };
+    let is_boolean = schema
+        .columns
+        .iter()
+        .any(|c| &c.name == column && matches!(c.ty, ColumnType::Boolean));
+    if !is_boolean {
+        return Ok(None);
+    }
+    let parse = |lit: &str| {
+        crate::sql::params::parse_pg_bool(lit).ok_or_else(|| {
+            SqlSurfaceError::invalid_text_representation("invalid input syntax for type boolean")
+        })
+    };
+    // 許容集合 `[false が含まれるか, true が含まれるか]`。
+    let mut allowed = [false, false];
+    match leaf {
+        WherePredicate::Compare { op, value, .. } => {
+            let v = parse(value)?;
+            for (idx, candidate) in [false, true].into_iter().enumerate() {
+                let ord = candidate.cmp(&v);
+                let keep = match op {
+                    CompareOp::Lt => ord.is_lt(),
+                    CompareOp::Le => ord.is_le(),
+                    CompareOp::Gt => ord.is_gt(),
+                    CompareOp::Ge => ord.is_ge(),
+                };
+                if let Some(slot) = allowed.get_mut(idx) {
+                    *slot = keep;
+                }
+            }
+        }
+        WherePredicate::InList { values, .. } => {
+            if values.is_empty() {
+                return Ok(None);
+            }
+            for value in values {
+                if let Some(slot) = allowed.get_mut(usize::from(parse(value)?)) {
+                    *slot = true;
+                }
+            }
+        }
+        WherePredicate::Between { low, high, .. } => {
+            let (lo, hi) = (parse(low)?, parse(high)?);
+            for (idx, candidate) in [false, true].into_iter().enumerate() {
+                if let Some(slot) = allowed.get_mut(idx) {
+                    *slot = candidate >= lo && candidate <= hi;
+                }
+            }
+        }
+        _ => return Ok(None),
+    }
+    if negated {
+        let [f, t] = allowed;
+        allowed = [!f, !t];
+    }
+    let column = column.clone();
+    Ok(Some(match allowed {
+        [false, false] => WherePredicate::Or(Vec::new()),
+        [true, false] => WherePredicate::BoolEquality {
+            column,
+            value: false,
+        },
+        [false, true] => WherePredicate::BoolEquality {
+            column,
+            value: true,
+        },
+        [true, true] => WherePredicate::IsNull {
+            column,
+            negated: true,
+        },
+    }))
 }
 
 /// NUMERIC 列と裸の数値リテラルの単純比較（`col <op> n`／`n <op> col`、
@@ -1818,6 +1917,15 @@ fn bind_where_predicates_recursive(
     let mut rls_predicate_present = false;
     let mut or_filters = Vec::new();
     for predicate in where_predicates {
+        // Issue #1431・SQL-24: BOOLEAN 列 × 文字列の範囲比較・`IN`・`BETWEEN` は
+        // 述語をその場で宣言的に扱える葉へ差し替え、以降の既存経路へ流す
+        // （WHERE 文脈限定。CHECK は従来どおり拒否）。
+        let boolean_rewritten = if allow_text_range_rewrite {
+            boolean_column_string_leaf_as_predicate(predicate, schema)?
+        } else {
+            None
+        };
+        let predicate = boolean_rewritten.as_ref().unwrap_or(predicate);
         // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: TEXT 列の範囲比較
         // （`<col> < 'lit'`、およびその `NOT`）は宣言的経路（レーン B）に TEXT の
         // 順序比較が無いため、AST（`WherePredicate`）を変えず束縛段で式レーンの
@@ -8065,14 +8173,14 @@ mod tests {
     #[test]
     fn bind_update_form_predicate_arm_rejects_id_equality_with_non_numeric_literal() {
         // `WHERE id = 'x'` は id 単純形の 3 トークン一致（`Number` 期待）に外れて
-        // 述語形へ流れ、`declarative_filter` が `id` を未知列として `22000` で
-        // 拒否する（`validate_update` 経由の `42601` とは異なるエントリポイント
-        // ごとの契約差。計画 §2.2 参照）。
+        // 述語形へ流れる。疑似列 `id` × 文字列リテラルは数値リテラル形と同じ文法で
+        // 解釈され（Issue #1431・SQL-24）、解釈できない `'x'` は `22P02` で拒否する
+        // （従来は `id` を未知列として `22000`）。
         let err = bind_update_form_sql(
             "UPDATE documents SET body = 'x' WHERE id = 'x' USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22P02");
     }
 
     #[test]
