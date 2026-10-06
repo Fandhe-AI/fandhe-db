@@ -7831,9 +7831,14 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
 ///
 /// 受理する先頭トークンは `SELECT`・`WITH`（非再帰 CTE）・`(`（括弧で始まる集合演算）。
 /// `EXPLAIN`・`SET`・`CREATE` 等は `42601`。
+///
+/// `check` は検証の段（[`ViewBodyCheck`]）。構造検証では FROM がテーブルかビューか
+/// 判別できないため、トップレベルの `Scan`／`Aggregate` の組み込み関数だけの式述語を
+/// 保留して通し（Issue #1436）、実カタログでの再検証（`Resolved`）で確定させる。
 pub(crate) fn classify_view_body(
     tokens: &[Token],
     lookup: &impl TableLookup,
+    check: ViewBodyCheck,
 ) -> Result<ViewBodyKind, SqlSurfaceError> {
     if let Ok(simple) = parse_view_body(tokens) {
         return Ok(ViewBodyKind::Simple(simple));
@@ -7853,7 +7858,7 @@ pub(crate) fn classify_view_body(
     let body = strip_trailing_semicolons(tokens);
     let stmt = validate_sql_tokens_with_subquery_ctx(body, lookup, 0)?;
     let mut relations = Vec::new();
-    check_buffered_body_shape(&stmt, lookup, &mut relations)?;
+    check_buffered_body_shape(&stmt, lookup, check, &mut relations)?;
     if is_with {
         collect_cte_definition_relations(body, &mut relations)?;
     }
@@ -7861,6 +7866,33 @@ pub(crate) fn classify_view_body(
         stmt: Box::new(stmt),
         relations,
     })
+}
+
+/// [`classify_view_body`] の検証の段（TABLE-18・Issue #1436）。
+///
+/// - `Structural`: `CREATE VIEW` の構文検証（[`validate_create_view_tokens`]）と
+///   カタログの形状導出（`catalog::view_body_shape`）。カタログを照会しない
+///   [`StructuralOnlyLookup`] で呼ぶためビューの FROM もテーブル扱いになり、連鎖本文
+///   （`BufferedView`）の式述語を判定できない。そのためトップレベルの `Scan`／
+///   `Aggregate` の組み込み関数だけの式述語は**保留**して通す。保留した本文は
+///   `catalog::Storage::create_view` が実カタログ（`Resolved`）で必ず再検証する。
+/// - `Resolved`: 実カタログ越しの検証（`create_view` の書き込み Tx 内・参照時の
+///   `sql::view::reparse_buffered_body`）。`Scan`／`Aggregate` の式述語は常に `42601`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewBodyCheck {
+    Structural,
+    Resolved,
+}
+
+/// 本文の `WHERE` 式述語（[`WherePredicate::Expression`]）の扱い（Issue #1436）。
+/// 組み込み関数だけの式なら、参照セッションの UDF レジストリに依存せず意味が一定に
+/// なる（組み込み関数はレジストリより先に解決され、同名 UDF は登録できない）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyExprPolicy {
+    /// 式述語は常に `42601`（単純形・テーブル直下本文・サブクエリ内側・集合演算の枝）。
+    Reject,
+    /// 組み込み関数だけを呼ぶ式述語を受理する（連鎖本文、および構造検証での保留）。
+    BuiltinOnly,
 }
 
 /// `WITH` 句の各 CTE 定義が読む実 relation（その位置から見える CTE 名でないもの）を
@@ -7906,11 +7938,18 @@ fn push_relation(out: &mut Vec<String>, name: &str) {
 pub(crate) fn check_buffered_body_shape(
     stmt: &Statement,
     lookup: &impl TableLookup,
+    check: ViewBodyCheck,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
+    // トップレベルの `Scan`／`Aggregate` の式述語は、構造検証では保留（組み込み関数のみ
+    // 受理）、実カタログ検証では拒否（テーブル直下の本文は式述語を持てない）。
+    let top_policy = match check {
+        ViewBodyCheck::Structural => BodyExprPolicy::BuiltinOnly,
+        ViewBodyCheck::Resolved => BodyExprPolicy::Reject,
+    };
     match stmt {
-        Statement::Scan(v) => check_body_scan(v, lookup, out),
-        Statement::Aggregate(v) => check_body_aggregate(v, lookup, out),
+        Statement::Scan(v) => check_body_scan(v, lookup, top_policy, out),
+        Statement::Aggregate(v) => check_body_aggregate(v, lookup, top_policy, out),
         Statement::Join(v) => {
             for t in super::join::collect_join_tables(v) {
                 push_relation(out, &t);
@@ -7919,12 +7958,32 @@ pub(crate) fn check_buffered_body_shape(
         }
         Statement::SetOperation(v) => check_body_set_tree(&v.tree, lookup, out),
         // Issue #1411: 本文の FROM が別の評価後射影形ビュー（または単純形ビュー経由で
-        // そこへ到達するビュー）の連鎖。本文として許すのは列射影・宣言的 `WHERE`・
-        // `LIMIT`／`OFFSET`、または裸の列引数の集計だけで、式キーの `ORDER BY`・ウィンドウ項目・
-        // 式述語・UDF 述語・サブクエリは本文に持てない（本文が参照セッションの UDF レジストリや
-        // 追加の実行に依存しないようにする。単純形・集計本文と同じ規則）。
+        // そこへ到達するビュー）の連鎖。本文として許すのは列射影・`WHERE`（宣言的述語、
+        // および組み込み関数だけの式述語。Issue #1436）・`LIMIT`／`OFFSET`、または裸の列引数の
+        // 集計だけで、式キーの `ORDER BY`・ウィンドウ項目・UDF 述語・サブクエリは本文に持てない
+        // （本文が参照セッションの UDF レジストリや追加の実行に依存しないようにする）。
         Statement::BufferedView(v) => check_body_buffered_view(v, lookup, out),
         _ => Err(body_form_unsupported()),
+    }
+}
+
+/// 本文のトップレベルの `Scan`／`Aggregate` が `WHERE` 式述語（`Not`／`Or` の内側を含む）を
+/// 持つか（Issue #1436）。構造検証（[`ViewBodyCheck::Structural`]）で保留した本文を
+/// `catalog::Storage::create_view` が実カタログで再検証すべきかの判定に使う
+/// （保留ルールと同じ場所で管理する）。
+pub(crate) fn top_level_body_has_expression_predicate(stmt: &Statement) -> bool {
+    fn has(p: &WherePredicate) -> bool {
+        match p {
+            WherePredicate::Expression(_) => true,
+            WherePredicate::Not(inner) => has(inner),
+            WherePredicate::Or(branches) => branches.iter().flatten().any(has),
+            _ => false,
+        }
+    }
+    match stmt {
+        Statement::Scan(v) => v.where_predicates.iter().any(has),
+        Statement::Aggregate(v) => v.where_predicates.iter().any(has),
+        _ => false,
     }
 }
 
@@ -7941,10 +8000,10 @@ fn check_body_buffered_view(
             push_relation(out, &v.view_name);
             rows.where_predicates
                 .iter()
-                .try_for_each(|p| check_body_pred(p, lookup, out))
+                .try_for_each(|p| check_body_pred(p, lookup, BodyExprPolicy::BuiltinOnly, out))
         }
         BufferedOuter::Aggregate(agg) => {
-            check_body_aggregate(agg, lookup, out)?;
+            check_body_aggregate(agg, lookup, BodyExprPolicy::BuiltinOnly, out)?;
             // 集計の `HAVING`／`ORDER BY` の式（束縛段が参照セッションの UDF レジストリで
             // 解決しうる式）は本文に持てない。
             if let Some(gb) = &agg.group_by {
@@ -8015,6 +8074,7 @@ fn body_form_unsupported() -> SqlSurfaceError {
 fn check_body_scan(
     v: &ValidatedScan,
     lookup: &impl TableLookup,
+    policy: BodyExprPolicy,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
     // Issue #1352: 投影位置のスカラーサブクエリは参照時の本文評価で解決されない
@@ -8028,12 +8088,13 @@ fn check_body_scan(
     push_relation(out, &v.table_name);
     v.where_predicates
         .iter()
-        .try_for_each(|p| check_body_pred(p, lookup, out))
+        .try_for_each(|p| check_body_pred(p, lookup, policy, out))
 }
 
 fn check_body_aggregate(
     v: &ValidatedAggregate,
     lookup: &impl TableLookup,
+    policy: BodyExprPolicy,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
     for item in &v.items {
@@ -8048,7 +8109,7 @@ fn check_body_aggregate(
     push_relation(out, &v.table_name);
     v.where_predicates
         .iter()
-        .try_for_each(|p| check_body_pred(p, lookup, out))
+        .try_for_each(|p| check_body_pred(p, lookup, policy, out))
 }
 
 /// 集合演算の全枝（`Branch`／`LimitedBranch`／`AggregateBranch`）へ同じ形状検査を
@@ -8059,8 +8120,12 @@ fn check_body_set_tree(
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
     match tree {
-        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => check_body_scan(scan, lookup, out),
-        SetTree::AggregateBranch(agg) => check_body_aggregate(&agg.0, lookup, out),
+        SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
+            check_body_scan(scan, lookup, BodyExprPolicy::Reject, out)
+        }
+        SetTree::AggregateBranch(agg) => {
+            check_body_aggregate(&agg.0, lookup, BodyExprPolicy::Reject, out)
+        }
         SetTree::Op { left, right, .. } => {
             check_body_set_tree(left, lookup, out)?;
             check_body_set_tree(right, lookup, out)
@@ -8068,20 +8133,32 @@ fn check_body_set_tree(
     }
 }
 
+/// 本文の `WHERE` 述語 1 件の検査。式述語は `policy` に従い、`BuiltinOnly` では
+/// 組み込み関数以外の呼び出し（セッション UDF・WASM UDF・未知の名前）を含めば `42601`
+/// （[`udf_call::first_non_builtin_call`]。fail-closed）。UDF 述語は常に `42601`。
 fn check_body_pred(
     pred: &WherePredicate,
     lookup: &impl TableLookup,
+    policy: BodyExprPolicy,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
     match pred {
-        WherePredicate::PredicateCall { .. } | WherePredicate::Expression(_) => {
-            Err(body_form_unsupported())
-        }
-        WherePredicate::Not(inner) => check_body_pred(inner, lookup, out),
+        WherePredicate::PredicateCall { .. } => Err(body_form_unsupported()),
+        WherePredicate::Expression(e) => match policy {
+            BodyExprPolicy::Reject => Err(body_form_unsupported()),
+            BodyExprPolicy::BuiltinOnly => {
+                if super::udf_call::first_non_builtin_call(e).is_some() {
+                    Err(body_form_unsupported())
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        WherePredicate::Not(inner) => check_body_pred(inner, lookup, policy, out),
         WherePredicate::Or(branches) => {
             for branch in branches {
                 for leaf in branch {
-                    check_body_pred(leaf, lookup, out)?;
+                    check_body_pred(leaf, lookup, policy, out)?;
                 }
             }
             Ok(())
@@ -8126,7 +8203,7 @@ fn check_body_subquery(
     let inner = validate_sql_tokens_with_subquery_ctx(inner_tokens, lookup, depth)?;
     match (&inner, scalar) {
         (Statement::Scan(_), _) | (Statement::Aggregate(_), true) => {
-            check_buffered_body_shape(&inner, lookup, out)
+            check_buffered_body_shape(&inner, lookup, ViewBodyCheck::Resolved, out)
         }
         _ => Err(body_form_unsupported()),
     }
@@ -8274,7 +8351,11 @@ pub(crate) fn validate_create_view_tokens(
     let (name, body_tokens) = p.parse_create_view()?;
     // 判定順序（構文 `42601` → 本文サイズ `54000`）を保つため、本文の構造検証は
     // カタログを照会しない [`StructuralOnlyLookup`] で行う。
-    let (base_relation, body_sql) = match classify_view_body(body_tokens, &StructuralOnlyLookup)? {
+    let (base_relation, body_sql) = match classify_view_body(
+        body_tokens,
+        &StructuralOnlyLookup,
+        ViewBodyCheck::Structural,
+    )? {
         ViewBodyKind::Simple(body) => {
             let sql = render_view_body(&body);
             (body.table_name, sql)
@@ -18676,5 +18757,67 @@ mod tests {
             "WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE id = 'lit' LIMIT 10",
             &lookup,
         );
+    }
+}
+
+/// 連鎖本文の式述語の保留規則（Issue #1436。構造検証 `Structural` と実カタログ検証
+/// `Resolved` の差）の単体テスト。
+#[cfg(test)]
+mod body_expr_policy_tests {
+    use super::*;
+
+    fn classify(sql: &str, check: ViewBodyCheck) -> Result<ViewBodyKind, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        classify_view_body(&tokens, &StructuralOnlyLookup, check)
+    }
+
+    #[test]
+    fn structural_defers_builtin_expression_predicate_at_top_level() {
+        let kind = classify(
+            "SELECT id FROM x WHERE lower(lang) = 'ja' LIMIT 5",
+            ViewBodyCheck::Structural,
+        )
+        .expect("deferred");
+        match kind {
+            ViewBodyKind::Buffered { stmt, .. } => {
+                assert!(top_level_body_has_expression_predicate(&stmt));
+            }
+            ViewBodyKind::Simple(_) => panic!("expected buffered"),
+        }
+    }
+
+    #[test]
+    fn structural_rejects_non_builtin_call() {
+        let err = classify(
+            "SELECT id FROM x WHERE myfn(lang) = 'ja' LIMIT 5",
+            ViewBodyCheck::Structural,
+        )
+        .err()
+        .expect("rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn resolved_rejects_top_level_expression_predicate() {
+        let err = classify(
+            "SELECT id FROM x WHERE lower(lang) = 'ja' LIMIT 5",
+            ViewBodyCheck::Resolved,
+        )
+        .err()
+        .expect("rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn subquery_inner_and_set_branch_expression_predicates_stay_rejected() {
+        for sql in [
+            "SELECT id FROM x WHERE id IN (SELECT id FROM y WHERE lower(lang) = 'ja' LIMIT 5) LIMIT 5",
+            "(SELECT id FROM x WHERE lower(lang) = 'ja') UNION (SELECT id FROM y)",
+        ] {
+            let err = classify(sql, ViewBodyCheck::Structural)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} should be rejected"));
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 }

@@ -46,7 +46,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{
     classify_view_body, parse_view_body, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
-    ViewBodyKind,
+    ViewBodyCheck, ViewBodyKind,
 };
 // `RowInput` / `Visibility` は `insert_row_into_table` / `insert_rows_into_table` /
 // `insert_typed_row`（いずれも `#[cfg(test)]` 限定。Issue #1078）とユニットテストのみが
@@ -2253,6 +2253,9 @@ struct ViewBodyShape {
     relations: Vec<String>,
     buffered: bool,
     join: bool,
+    /// トップレベルの `Scan`／`Aggregate` に、構造検証で保留した `WHERE` 式述語がある
+    /// （Issue #1436）。実カタログでの再検証（`create_view`）で確定させる。
+    deferred_expr: bool,
 }
 
 /// [`ViewBodyShape`] を本文から導出する。字句・構造検証に失敗した本文は
@@ -2261,21 +2264,24 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
     let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| {
         CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
     })?;
-    let kind = classify_view_body(&tokens, &StructuralOnlyLookup).map_err(|_| {
-        CatalogError::Invalid(
-            "view body does not match the allowed view definition shape".to_string(),
-        )
-    })?;
+    let kind = classify_view_body(&tokens, &StructuralOnlyLookup, ViewBodyCheck::Structural)
+        .map_err(|_| {
+            CatalogError::Invalid(
+                "view body does not match the allowed view definition shape".to_string(),
+            )
+        })?;
     Ok(match kind {
         ViewBodyKind::Simple(parsed) => ViewBodyShape {
             relations: vec![parsed.table_name],
             buffered: false,
             join: false,
+            deferred_expr: false,
         },
         ViewBodyKind::Buffered { stmt, relations } => ViewBodyShape {
             relations,
             buffered: true,
             join: matches!(*stmt, crate::sql::allowlist::Statement::Join(_)),
+            deferred_expr: crate::sql::allowlist::top_level_body_has_expression_predicate(&stmt),
         },
     })
 }
@@ -8622,7 +8628,11 @@ impl Storage {
                     ));
                 }
             }
-            if reaches_buffered {
+            // Issue #1436: 構造検証で保留した式述語（トップレベルの `Scan`／`Aggregate`）は、
+            // 実カタログで確定させる。FROM が評価後射影形ビューの連鎖なら受理され、テーブル
+            // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
+            // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
+            if reaches_buffered || shape.deferred_expr {
                 let invalid = || {
                     CatalogError::Invalid(
                         "a view cannot reference a view with an aggregate/LIMIT body in this position"
@@ -8635,12 +8645,14 @@ impl Storage {
                         views_table: &views_table,
                     };
                     let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| invalid())?;
-                    classify_view_body(&tokens, &lookup).map_err(|e| match e {
-                        // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
-                        SqlSurfaceError::PayloadTooLarge { detail } => {
-                            CatalogError::ViewLimitExceeded(detail)
+                    classify_view_body(&tokens, &lookup, ViewBodyCheck::Resolved).map_err(|e| {
+                        match e {
+                            // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
+                            SqlSurfaceError::PayloadTooLarge { detail } => {
+                                CatalogError::ViewLimitExceeded(detail)
+                            }
+                            _ => invalid(),
                         }
-                        _ => invalid(),
                     })?;
                 } else {
                     let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| invalid())?;

@@ -587,6 +587,39 @@ pub(crate) fn is_builtin_function_name(name: &str) -> bool {
     builtin_from_name(name).is_some() || is_variadic_or_overloaded_builtin_name(name)
 }
 
+/// 式木の中で最初に見つかった「組み込み関数以外の呼び出し」の関数名を返す
+/// （無ければ `None`）。呼び出し元は 2 つ: `sql::check_constraint`（`CHECK` 述語の
+/// 禁止要素検査。TABLE-16）と `sql::allowlist` の連鎖ビュー本文の `WHERE` 式述語検査
+/// （TABLE-18・Issue #1436）。組み込み関数は [`bind_call`] でレジストリより先に
+/// 解決され、同名 UDF は登録できない（`42723`）ため、組み込み関数だけの式は
+/// 参照セッションの UDF レジストリに依存せず意味が一定になる。`Expr` の全 variant を
+/// 網羅し `_ =>` を置かない（variant 追加時にコンパイルエラーで検査漏れに気づく。
+/// fail-closed）。再帰の深さは構文段の式ネスト上限で抑えられる。
+pub(crate) fn first_non_builtin_call(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Number(_)
+        | Expr::Ident(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_) => None,
+        Expr::Call { name, args } => {
+            if !is_builtin_function_name(name) {
+                return Some(name.as_str());
+            }
+            args.iter().find_map(first_non_builtin_call)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::NullIf(lhs, rhs) => {
+            first_non_builtin_call(lhs).or_else(|| first_non_builtin_call(rhs))
+        }
+        Expr::Case { whens, else_result } => whens
+            .iter()
+            .find_map(|(c, r)| first_non_builtin_call(c).or_else(|| first_non_builtin_call(r)))
+            .or_else(|| else_result.as_deref().and_then(first_non_builtin_call)),
+        Expr::Coalesce(args) => args.iter().find_map(first_non_builtin_call),
+    }
+}
+
 /// `substr`／`concat` は arity に応じて `BuiltinFn` variant（`Substr2`/`Substr3`）
 /// を選ぶか可変長を左畳み込みへ展開する必要があるため、この一意な名前解決には
 /// 含めない（[`bind_call`]・[`validate_closed_expr`] が個別に扱う）。予約名判定
@@ -4835,5 +4868,56 @@ mod tests {
         // `Internal` として fail-closed に拒否する。
         let empty: [Option<ScalarRef<'_>>; 0] = [];
         assert!(eval_with_scalars(&expr, 1, &[], &empty).is_err());
+    }
+
+    #[test]
+    fn first_non_builtin_call_accepts_builtin_only_exprs() {
+        assert_eq!(
+            first_non_builtin_call(&call("lower", vec![ident("lang")])),
+            None
+        );
+        let arith = Expr::Binary {
+            op: BinOp::Gt,
+            lhs: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(call("length", vec![ident("x")])),
+                rhs: Box::new(Expr::Number("1".into())),
+            }),
+            rhs: Box::new(Expr::Number("2".into())),
+        };
+        assert_eq!(first_non_builtin_call(&arith), None);
+        let case = Expr::Case {
+            whens: vec![(
+                ident("a"),
+                call("round", vec![ident("x"), Expr::Number("2".into())]),
+            )],
+            else_result: Some(Box::new(Expr::Null)),
+        };
+        assert_eq!(first_non_builtin_call(&case), None);
+        let co = Expr::Coalesce(vec![
+            ident("a"),
+            Expr::NullIf(Box::new(ident("b")), Box::new(Expr::Null)),
+        ]);
+        assert_eq!(first_non_builtin_call(&co), None);
+    }
+
+    #[test]
+    fn first_non_builtin_call_finds_nested_non_builtin() {
+        assert_eq!(
+            first_non_builtin_call(&call("myfn", vec![ident("x")])),
+            Some("myfn")
+        );
+        let nested = call("lower", vec![call("myfn", vec![ident("x")])]);
+        assert_eq!(first_non_builtin_call(&nested), Some("myfn"));
+        let case = Expr::Case {
+            whens: vec![(call("f", vec![ident("x")]), Expr::Null)],
+            else_result: None,
+        };
+        assert_eq!(first_non_builtin_call(&case), Some("f"));
+        let else_case = Expr::Case {
+            whens: vec![],
+            else_result: Some(Box::new(call("g", vec![]))),
+        };
+        assert_eq!(first_non_builtin_call(&else_case), Some("g"));
     }
 }
