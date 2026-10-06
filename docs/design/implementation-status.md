@@ -759,3 +759,12 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: 入れ子由来の `21000` は外側の結果が 0 行なら発生せず、1 行以上なら返る（#1404 で対象外としていた非対称の解消）。静的エラー優先・自テナント可視行のみで判定・fail-closed・依存は不変。wire 経由は簡易クエリで `21000` の ErrorResponse と接続回復を固定。
 - **静的エラー優先の検証**: 入れ子 WHERE が遅延対象エラーで打ち切られたときは、残りのサブクエリ述語（`OR` の分岐・`NOT`・`EXISTS` の内側を含む）を内側の実行なしに静的検証する（`static_validate_subquery_predicates`）。実行回数予算を消費しないため、予算枯渇で後続の静的エラーが見落とされない。実行経路の予算（16 回）は不変。
 - **対象外**: トップレベル WHERE 値位置の `21000`（走査前に解決するため即時のまま）。拡張クエリプロトコルはサブクエリを含む文を Bind で `42601` とする既存設計のため `21000` に到達せず、その契約（`42601`・Sync 後の回復）をテストで固定するに留める。
+
+## Issue #1327: spec リポ側のマージ・整合性確認
+
+- **確認日**: 2026-10-06。
+- **ポインタ整合**: 本リポ `main` の `docs/spec` gitlink は `16136c84`、spec リポ `main`（`git ls-remote` で取得）も `16136c84` で一致。`dd640e7d..16136c84` は spec PR #31〜#34 で、本リポ側の追随は #1368・#1443 で取り込み済み。
+- **ID 突合**: 本リポの `crates/`・`docs/design/`・README・AGENTS.md・CLAUDE.md に現れるビヘイビア ID はすべて spec 側に実在。TASK ID は `TASK-281` の 1 件のみ spec に存在せず、導入コミット（PR #296・Closes #281）の文脈から `Issue #281` の誤記と判断し、`crates/engine/tests/incremental_recall.rs` の doc コメントを `Issue #281` 表記へ訂正した。
+- **メイン worktree の `M docs/spec`**: submodule 実チェックアウト（`f18bb6ac`）が gitlink（`dd640e7d`）より古い stale checkout で、更新ではない。コミットしてはならない。解消（`git submodule update`）はグローバル状態を変えるため本 Issue では行わない。
+- **申し送り**: メイン worktree の遅れ・一時ファイルの整理は #1329・#1330・#1333 の担当。spec 側に残る remote-tracking ref `origin/docs/sync-phase1-task-status` は remote に存在しない残骸で、prune は行っていない。
+- **再現**: `git ls-tree HEAD docs/spec` と `git ls-remote <spec リポ> refs/heads/main` の SHA 比較、および `git grep -hoE '\bTASK-[0-9]+\b'` の出力と spec の `05-tasks.md` の突合。
