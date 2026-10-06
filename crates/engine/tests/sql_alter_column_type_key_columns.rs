@@ -7,8 +7,10 @@
 //! （`EngineCore::execute_sql_in_session`）で確認する。特に参照先の拡大後に
 //! 参照中の親行の削除が `23503` になること（索引の型タグ不一致による fail-open の回帰）が要。
 //!
+//! Issue #1435: 混在 FK は宣言（CREATE TABLE・ADD FOREIGN KEY）でも作れる（TABLE-17・TABLE-22）。
+//!
 //! REAL／DOUBLE PRECISION（Issue #1434・TABLE-17・TABLE-19・TABLE-20）は FK 列になれない（D3）ため
-//! 混在 FK の状態は作れない。末尾の節で、その契約（宣言面が `42830`・副作用なし）と、
+//! FK 列の整数以外の混在は作れない。末尾の節で、その契約（宣言面が `42830`・副作用なし）と、
 //! REAL の UNIQUE 列を拡大した後も値を保って一意性が働くことを固定する。
 
 use engine::core::EngineCore;
@@ -423,10 +425,11 @@ fn unique_and_primary_key_checks_hold_across_tenants_after_widening() {
     );
 }
 
-/// 縮小・異種の変換はこれまでどおり `42804` でデータは変わらず、CREATE／ADD FOREIGN KEY の
-/// 型混在宣言は `42830` のまま（受理範囲を広げない）。
+/// 縮小・異種の ALTER は `42804` のまま。INTEGER／BIGINT が混在する宣言は受理され、
+/// 参照整合性が拡大変換後と同じ規則で働く。整数以外の混在宣言は `42830` のまま
+/// （Issue #1435・TABLE-17・TABLE-22）。
 #[test]
-fn non_widening_stays_42804_and_declarations_stay_strict() {
+fn non_widening_stays_42804_and_mixed_integer_declarations_are_enforced() {
     let (core, path) = setup_parent_child("akc-strict", "BIGINT", "BIGINT", "");
     let _g = CleanupGuard(path);
     let o = ctx("owner");
@@ -437,22 +440,164 @@ fn non_widening_stays_42804_and_declarations_stay_strict() {
         assert_eq!(code(&core, &o, sql), "42804", "{sql}");
     }
     assert_eq!(ints(&core, &o, "SELECT k FROM kp LIMIT 10"), vec![1, 2, 3]);
+    // 親 BIGINT・子 INTEGER の混在宣言（表制約・ADD FOREIGN KEY）は受理する。
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE kx (ref INTEGER, FOREIGN KEY (ref) REFERENCES kp (k))",
+    );
+    ok(&core, &o, "CREATE TABLE ky (ref INTEGER)");
+    ok(
+        &core,
+        &o,
+        "ALTER TABLE ky ADD FOREIGN KEY (ref) REFERENCES kp (k)",
+    );
+    for t in ["kx", "ky"] {
+        ok(
+            &core,
+            &o,
+            &format!("INSERT INTO {t} (id, ref) VALUES (1, 2) USING OPERATION_ID '{t}ok'"),
+        );
+        assert_eq!(
+            code(
+                &core,
+                &o,
+                &format!("INSERT INTO {t} (id, ref) VALUES (2, 99) USING OPERATION_ID '{t}ng'")
+            ),
+            "23503",
+            "{t}"
+        );
+    }
     assert_eq!(
         code(
             &core,
             &o,
-            "CREATE TABLE kx (ref INTEGER, FOREIGN KEY (ref) REFERENCES kp (k))"
+            "DELETE FROM kp WHERE id = 2 USING OPERATION_ID 'dkp2'"
+        ),
+        "23503"
+    );
+    // 整数以外の混在は拒否のまま（副作用なし）。
+    for sql in [
+        "CREATE TABLE kz (ref TEXT, FOREIGN KEY (ref) REFERENCES kp (k))",
+        "CREATE TABLE kz (ref REAL, FOREIGN KEY (ref) REFERENCES kp (k))",
+        "CREATE TABLE kz (ref NUMERIC(10,2), FOREIGN KEY (ref) REFERENCES kp (k))",
+    ] {
+        assert_eq!(code(&core, &o, sql), "42830", "{sql}");
+    }
+    ok(&core, &o, "CREATE TABLE kz (ref INTEGER)");
+    ok(&core, &o, "CREATE TABLE kw (ref TEXT)");
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE kw ADD FOREIGN KEY (ref) REFERENCES kp (k)"
         ),
         "42830"
     );
-    ok(&core, &o, "CREATE TABLE ky (ref INTEGER)");
+}
+
+/// 宣言による混在 FK（子 BIGINT・親 INTEGER）: 親の値域外は `23503`、ADD FOREIGN KEY の
+/// 既存行検証も同じ規則で `23503`（FK は付かない）。自己参照・複合キー・列制約形も受理する。
+#[test]
+fn declared_mixed_foreign_keys_enforce_integrity() {
+    let (core, path) = new_core("akc-declared");
+    let _g = CleanupGuard(path);
+    let o = ctx("owner");
+    ok(&core, &o, "CREATE TABLE p (k INTEGER PRIMARY KEY)");
+    ok(&core, &o, "CREATE TABLE c (ref BIGINT REFERENCES p (k))");
+    ok(
+        &core,
+        &o,
+        "INSERT INTO p (id, k) VALUES (1, 1) USING OPERATION_ID 'p1'",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO c (id, ref) VALUES (1, 1) USING OPERATION_ID 'c1'",
+    );
     assert_eq!(
         code(
             &core,
             &o,
-            "ALTER TABLE ky ADD FOREIGN KEY (ref) REFERENCES kp (k)"
+            &format!("INSERT INTO c (id, ref) VALUES (2, {WIDE}) USING OPERATION_ID 'c2'")
         ),
-        "42830"
+        "23503"
+    );
+    // ADD FOREIGN KEY の既存行検証: 値域外の既存行があれば 23503 で FK は付かない。
+    ok(&core, &o, "CREATE TABLE d (ref BIGINT)");
+    ok(
+        &core,
+        &o,
+        &format!("INSERT INTO d (id, ref) VALUES (1, {WIDE}) USING OPERATION_ID 'd1'"),
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE d ADD FOREIGN KEY (ref) REFERENCES p (k)"
+        ),
+        "23503"
+    );
+    // 自己参照（親 INTEGER・子 BIGINT）。
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE nodes (k INTEGER PRIMARY KEY, up BIGINT, FOREIGN KEY (up) REFERENCES nodes (k))",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO nodes (id, k) VALUES (1, 1) USING OPERATION_ID 'n1'",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO nodes (id, k, up) VALUES (2, 2, 1) USING OPERATION_ID 'n2'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO nodes (id, k, up) VALUES (3, 3, 9) USING OPERATION_ID 'n3'"
+        ),
+        "23503"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "DELETE FROM nodes WHERE id = 1 USING OPERATION_ID 'nd1'"
+        ),
+        "23503"
+    );
+    // 複合キー（一方の位置だけ混在）。
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE cp (a BIGINT, b TEXT, PRIMARY KEY (a, b))",
+    );
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE cc (a INTEGER, b TEXT, FOREIGN KEY (a, b) REFERENCES cp (a, b))",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO cp (id, a, b) VALUES (1, 1, 'x') USING OPERATION_ID 'cp1'",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO cc (id, a, b) VALUES (1, 1, 'x') USING OPERATION_ID 'cc1'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO cc (id, a, b) VALUES (2, 1, 'y') USING OPERATION_ID 'cc2'"
+        ),
+        "23503"
     );
 }
 

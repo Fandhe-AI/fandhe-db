@@ -1233,8 +1233,9 @@ fn push_required_key(
     Ok(())
 }
 
-/// 参照元・参照先で列型が異なる組（`ALTER COLUMN TYPE` の `INTEGER`→`BIGINT` 拡大が
-/// 片側だけに適用された状態。Issue #1402）の正準キーバイト列を、`source` 側の型の
+/// 参照元・参照先で列型が異なる組（`INTEGER`／`BIGINT` が混在する FK。宣言による
+/// 混在、または `ALTER COLUMN TYPE` の拡大が片側だけに適用された状態。
+/// Issue #1402・#1435）の正準キーバイト列を、`source` 側の型の
 /// 表現から `target` 側の型の表現へ読み替える。
 ///
 /// 正準キーは型タグ付きのため `INTEGER 5` と `BIGINT 5` は別のバイト列になる。

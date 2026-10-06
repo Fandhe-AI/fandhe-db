@@ -722,3 +722,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/tests/sql_alter_column_type_key_columns.rs`（結合テスト 2 件）、`crates/engine/src/constraint.rs`（`mod tests` に単体テスト 1 件）、`docs/design/foreign-key.md`（追記）。本番コードの変更なし。
 - **性質**: REAL／DOUBLE PRECISION は D3 により FK 列になれず、片側だけ拡大した混在 FK の状態は作れない。現契約として (a) CREATE TABLE（表制約・列制約・自己参照）と ALTER TABLE ADD FOREIGN KEY が `42830` で副作用なし、(b) REAL の UNIQUE 列を DOUBLE PRECISION へ拡大した後も値を保って `23505` が働きテナント内に閉じる、(c) `recode_key_for_types` の浮動小数の組は `Err`（fail-closed）、を固定した。
 - **対象外**: REAL／DOUBLE PRECISION の FK 列受理と f32／f64 キーの読み替え実装（D3 を覆す機能拡張でありオーナー判断事項。spec 側の同期記録と D3 の食い違いの整理を含む）、NoSQL（HTTP）`references` 経由の射影テスト、`unique_constraint.rs`・`sql/allowlist.rs` の古いコメント。
+
+## Issue #1435: INTEGER と BIGINT が混在する FOREIGN KEY の宣言を受理する
+
+- **対象ビヘイビア**: TABLE-17・TABLE-22・ERR-6（Issue #1402・#1414 の後続）。
+- **変更箇所**: `crates/engine/src/catalog.rs`（`FkTypeRule` を廃止し `resolve_foreign_key_target` の型照合を宣言・再検証で一本化）、`crates/engine/src/constraint.rs`（コメントのみ）、`crates/engine/tests/sql_alter_column_type_key_columns.rs`（結合テストの更新・追加）、`docs/design/foreign-key.md`・`alter-table-foreign-key-constraint.md`。
+- **性質**: `CREATE TABLE`（表制約・列制約・自己参照・複合キー）と `ALTER TABLE ADD FOREIGN KEY` で INTEGER／BIGINT が混在する宣言を受理し、実行時は #1414 の読み替え（`recode_key_for_types`）で参照整合性を検査する（値域外は `23503`）。整数型どうし以外の混在は `42830` のまま。Issue #1402 の節にある「宣言は `42830` のまま」を本 Issue で置き換えた（#1402 の節は履歴として残す）。実行時コード・永続フォーマットの変更なし。
+- **対象外**: REAL／DOUBLE PRECISION の FK 列化、ON UPDATE CASCADE 値域外の `22003` 専用 variant、INTEGER／BIGINT と NUMERIC の間の参照、3 クライアント層 B e2e。

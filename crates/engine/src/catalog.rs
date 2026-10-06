@@ -4416,16 +4416,10 @@ fn validate_foreign_keys(schema: &TableSchema, allow_unresolved: bool) -> Result
         // 静的に検証できる（解決済みの宣言のみ。未解決は `create_table` の
         // write トランザクション内で解決・照合する）。
         if fk.parent_table == schema.name && !fk.parent_columns.is_empty() {
-            // 永続スキーマの再検証（decode・`encode_schema`）では、`ALTER COLUMN
-            // TYPE` の拡大変換で `INTEGER`／`BIGINT` が食い違った組を許す
-            // （Issue #1402）。`CREATE TABLE` の事前検証（`allow_unresolved`）は
-            // 宣言の受理規則なので厳格なまま。
-            let rule = if allow_unresolved {
-                FkTypeRule::Exact
-            } else {
-                FkTypeRule::AllowIntegerWidening
-            };
-            resolve_foreign_key_target(schema, fk, schema, rule)?;
+            // 型照合の規則は宣言（`CREATE TABLE`）・永続スキーマの再検証で共通
+            // （`INTEGER`／`BIGINT` の混在は許し、それ以外の不一致は拒否。
+            // Issue #1402・#1435、TABLE-17・TABLE-22）。
+            resolve_foreign_key_target(schema, fk, schema)?;
         }
     }
     Ok(())
@@ -4467,31 +4461,21 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
     Ok(())
 }
 
-/// [`resolve_foreign_key_target`] の参照元列・参照先列の型照合規則（Issue #1402）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FkTypeRule {
-    /// 型タグ＋パラメータの完全一致（`CREATE TABLE`・`ADD FOREIGN KEY` の宣言）。
-    Exact,
-    /// 完全一致に加え、`INTEGER`／`BIGINT` の食い違いを許す。永続スキーマの再検証
-    /// 専用（`ALTER COLUMN TYPE` が片側だけを拡大した状態を表現できるようにする。
-    /// 実行時は `constraint::recode_key_for_types` が境界でキーを読み替える）。
-    AllowIntegerWidening,
-}
-
 /// `FOREIGN KEY` 宣言 `fk`（参照元 `child`）を参照先スキーマ `parent` に照らして
 /// 解決・検証する（TABLE-17・TASK-205、Issue #907）。参照先列の省略は `parent` の
 /// 主キー（未宣言なら `id` 疑似列）へ解決する。解決後の参照先列は、`id` 単独・
 /// `parent` の主キー・UNIQUE 制約のいずれかと**列集合**が一致しなければならず
 /// （順序は問わない。対応は `columns` との位置で決まる）、参照元列と参照先列の
-/// 型は位置ごとに一致しなければならない（`id` 参照は参照元列が `INTEGER`／
-/// `BIGINT`）。いずれの違反も [`CatalogError::InvalidForeignKey`]（`42830`）。
+/// 型は位置ごとに一致しなければならない（ただし `INTEGER`／`BIGINT` の組は混在を
+/// 許し、実行時は `constraint::recode_key_for_types` が境界でキーを読み替える。
+/// Issue #1402・#1435。`id` 参照は参照元列が `INTEGER`／`BIGINT`）。
+/// いずれの違反も [`CatalogError::InvalidForeignKey`]（`42830`）。
 /// 一意性を保証しない列集合を参照先にすると、参照先の同値行が 1 行削除されても
 /// 残りの行が参照を満たし続ける等、NO ACTION の意味論が定まらないため拒否する。
 fn resolve_foreign_key_target(
     child: &TableSchema,
     fk: &ForeignKeyDef,
     parent: &TableSchema,
-    type_rule: FkTypeRule,
 ) -> Result<ForeignKeyDef> {
     let parent_columns: Vec<String> = if fk.parent_columns.is_empty() {
         match parent.primary_key() {
@@ -4567,10 +4551,10 @@ fn resolve_foreign_key_target(
         // 型の同一性は型タグ＋パラメータ（`catalog_fields`。ENUM は型名を含む）で
         // 判定する。一意性検査と同じ正準キー（型タグ付き）で参照先を照合するため、
         // 型が異なる組は値が「等しく」見えても一致しない（黙って常に違反になる
-        // 宣言を受理しない）。
+        // 宣言を受理しない）。例外は `INTEGER`／`BIGINT` の組で、実行時に
+        // `constraint::recode_key_for_types` が正準キーを読み替えるため受理する。
         let child_ty = child_type(child_name)?;
-        let integer_widened = matches!(type_rule, FkTypeRule::AllowIntegerWidening)
-            && matches!(child_ty, ColumnType::Integer | ColumnType::BigInt)
+        let integer_widened = matches!(child_ty, ColumnType::Integer | ColumnType::BigInt)
             && matches!(parent_ty, ColumnType::Integer | ColumnType::BigInt);
         if !integer_widened && child_ty.catalog_fields() != parent_ty.catalog_fields() {
             return Err(CatalogError::InvalidForeignKey(format!(
@@ -7963,8 +7947,7 @@ impl Storage {
                 owned_parent = require_table_schema_write(&write_txn, &parent_table_name)?;
                 &owned_parent
             };
-            let resolved =
-                resolve_foreign_key_target(&schema, &fk_declared, parent, FkTypeRule::Exact)?;
+            let resolved = resolve_foreign_key_target(&schema, &fk_declared, parent)?;
 
             let mut fks = schema.foreign_keys.clone();
             fks.push(resolved);
@@ -9994,12 +9977,7 @@ fn resolve_foreign_keys_in_txn(
             owned_parent = require_table_schema_write(write_txn, &fk.parent_table)?;
             &owned_parent
         };
-        resolved.push(resolve_foreign_key_target(
-            schema,
-            fk,
-            parent,
-            FkTypeRule::Exact,
-        )?);
+        resolved.push(resolve_foreign_key_target(schema, fk, parent)?);
     }
     Ok(schema.clone().with_foreign_keys(resolved))
 }

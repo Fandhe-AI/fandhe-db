@@ -94,7 +94,7 @@ v11 の上位集合。`uniq:`／`checks:` セクションは 0 件を許し（�
 | 構文が許可リスト外（`NOT VALID`・列制約 `CONSTRAINT n REFERENCES` 等） | ― | `42601` |
 | 子テーブルが無い／ビュー・索引名 | `TableNotFound`／`WrongObjectKind` | `42P01`／`42809`（子） |
 | 親テーブルが無い／ビュー・索引名 | `TableNotFound`／`WrongObjectKind` | `42P01`／`42809`（**親**の名前で報告） |
-| 参照先が一意キーと一致しない・型不一致 | `InvalidForeignKey` | `42830` |
+| 参照先が一意キーと一致しない・整数型どうし以外の型不一致 | `InvalidForeignKey` | `42830` |
 | **制約名の衝突**（UNIQUE・CHECK・FOREIGN KEY のいずれかと同名） | `ConstraintAlreadyExists` | `42710`（Issue #1195。UNIQUE 追加側は `42P07`） |
 | テーブルあたり FK 数の上限（`MAX_FOREIGN_KEYS_PER_TABLE`）を超過 | `ConstraintLimitExceeded` | `54000` |
 | **既存行が新しい FK を満たさない**（全テナント検証） | `ForeignKeyViolation`（新設） | `23503` |
