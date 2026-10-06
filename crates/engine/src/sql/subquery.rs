@@ -744,7 +744,7 @@ fn is_deferrable_runtime_error(e: &SqlSurfaceError) -> bool {
 
 /// 先行サブクエリが遅延対象エラーで解決を打ち切った後に、サブクエリを含む各述語を
 /// 個別に解決し直して、遅延対象でない（静的・構造的な）エラーを最初の 1 件返す。
-/// 遅延対象エラーと成功は無視する。過去の予算消費に影響されないよう、プローブ用に
+/// 遅延対象エラーと成功は無視する。過去の予算消費や他の検査単位に影響されないよう、検査単位ごとに
 /// 予算を初期値で独立に確保する（エラー経路専用。通常経路では呼ばれない）。
 fn first_static_error_in_subquery_predicates(
     subquery_preds: &[WherePredicate],
@@ -754,8 +754,6 @@ fn first_static_error_in_subquery_predicates(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
 ) -> Option<SqlSurfaceError> {
-    let mut budget = MAX_SUBQUERY_EXECUTIONS;
-    let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
     // `OR` の分岐内でも先行サブクエリの遅延対象エラーが後続を打ち切るため、分岐も
     // 含めてサブクエリ述語を 1 件ずつ独立に解決し直す。
     let mut units: Vec<&WherePredicate> = Vec::new();
@@ -763,6 +761,10 @@ fn first_static_error_in_subquery_predicates(
         collect_subquery_probe_units(pred, &mut units);
     }
     for pred in units {
+        // 検査単位ごとに予算を初期化する。共有すると、21000 で止まる通常解決では
+        // 起きない予算枯渇（54000）を再検査自身が作り、遅延契約を壊すため。
+        let mut budget = MAX_SUBQUERY_EXECUTIONS;
+        let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
         if let Err(e) = resolve_where_predicates(
             vec![pred.clone()],
             chain,

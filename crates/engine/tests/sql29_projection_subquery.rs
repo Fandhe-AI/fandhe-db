@@ -465,6 +465,31 @@ fn projection_subquery_later_static_error_wins_over_earlier_cardinality() {
     }
 }
 
+/// 21000 を返すスカラーサブクエリを多数 OR で並べても、失敗時の静的再検査が予算枯渇
+/// （54000）を新規生成せず、外側 0 行なら成功し行ありなら 21000 のまま
+/// （Issue #1432 codex-review P1）。Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_many_or_cardinality_does_not_exhaust_probe_budget() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let ors = vec![multi; 17].join(" OR ");
+    let inners = [
+        format!("(SELECT name FROM {REFS} WHERE {ors} LIMIT 1)"),
+        format!("(SELECT COUNT(*) FROM {REFS} WHERE {ors})"),
+    ];
+    for inner in &inners {
+        let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+        assert!(run(&core, &ctx, &none).rows.is_empty(), "{inner}");
+        let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+        assert_eq!(code(&core, &ctx, &some), "21000", "{inner}");
+    }
+}
+
 /// 他テナントの行数は 21000 の有無に影響しない（RLS-10 (b)）。
 #[test]
 fn projection_subquery_nested_cardinality_is_tenant_isolated() {
