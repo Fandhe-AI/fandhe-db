@@ -4,6 +4,10 @@ target/
 # ローカル作業ディレクトリ（git 管理外）
 _/
 
+# リポジトリ直下に出力された一時ログ（git push 時の lefthook 出力のリダイレクト等）。
+# docs/design/bench-data/ 配下のベンチログ（追跡対象）を巻き込まないよう、ルート直下に限定する
+/*.log
+
 # macOS
 .DS_Store
 
