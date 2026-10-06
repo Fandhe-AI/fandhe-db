@@ -4468,7 +4468,8 @@ fn validate_referential_action_declaration(schema: &TableSchema, fk: &ForeignKey
 /// （順序は問わない。対応は `columns` との位置で決まる）、参照元列と参照先列の
 /// 型は位置ごとに一致しなければならない（ただし `INTEGER`／`BIGINT` の組は混在を
 /// 許し、実行時は `constraint::recode_key_for_types` が境界でキーを読み替える。
-/// Issue #1402・#1435。`id` 参照は参照元列が `INTEGER`／`BIGINT`）。いずれの違反も [`CatalogError::InvalidForeignKey`]（`42830`）。
+/// Issue #1402・#1435。`id` 参照は参照元列が `INTEGER`／`BIGINT`）。
+/// いずれの違反も [`CatalogError::InvalidForeignKey`]（`42830`）。
 /// 一意性を保証しない列集合を参照先にすると、参照先の同値行が 1 行削除されても
 /// 残りの行が参照を満たし続ける等、NO ACTION の意味論が定まらないため拒否する。
 fn resolve_foreign_key_target(

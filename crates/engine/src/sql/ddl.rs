@@ -153,7 +153,7 @@ pub(crate) fn execute_create_table(
         // `FOREIGN KEY` の参照先（TABLE-17・TASK-205、Issue #907）。`create_table` が
         // `TableNotFound` を返すのは参照先テーブルの不在のみ（作成対象自身の重複は
         // 上の `TableAlreadyExists` が先に判定する）。参照先名がビュー・索引名なら
-        // 種別不一致（`42809`）、参照先列が一意キーと一致しない・型不一致は `42830`。
+        // 種別不一致（`42809`）、参照先列が一意キーと一致しない・整数型どうし以外の型不一致は `42830`。
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
