@@ -800,3 +800,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **是正した書き漏れ**: CLAUDE.md の構成ツリー（`detect-features.yml`・`update-external.yml`・`simd-codegen-check`・主要スクリプト・ルート直下の項目）と README のタスクランナー表（ガード系・クロス確認・`make test-eval`）。
 - **対象外**: Python テストの make・CI への接続、裸の `#[ignore]` への理由付与、#1454 の成果物の反映（未マージ）、未解消の対象外項目の実装。Issue は起票していない。
 - **性質**: ドキュメントのみの変更。コード・依存・CI・Makefile は不変。
+
+## Issue #1334: ブランチ管理と次のアクションの決定
+
+- **成果物**: [branch-management-next-actions.md](branch-management-next-actions.md)（2026-10-06・`origin/main` `fbe23e7c` 時点）。
+- **決定の要点**: メイン作業ツリーの取り込みは `git pull --ff-only` のみ（D1）。pull は並列ランの停止・open PR の片付け・#1333 の gitlink 確定の後（D2）。push 済みブランチへの base 取り込みは `git merge origin/main` で、push 後の rebase と force push はしない（D3）。古い PR は conflict か base 起因の CI failure のときだけ取り込む（D4）。
+- **次のアクション**: 同書の「次のアクション」を参照（#1453・#1454・#1457 の解消 → #1333 → pull → submodule 更新 → `make ci` → 棚卸し → Phase 親のクローズ判断）。
+- **対象外**: `pull`・submodule 更新・stash と一時ログの削除の実行、#1333 の決定事項。Issue は起票していない。
+- **性質**: ドキュメントのみの変更。コード・依存・CI・Makefile は不変。
