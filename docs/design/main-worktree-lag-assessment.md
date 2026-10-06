@@ -11,7 +11,7 @@ Issue タイトルの「69 コミット」は起票時点（2026-10-02）の値�
 | 区分 | 基準 | 例 |
 | ---- | ---- | -- |
 | HIGH | pull が失敗する、または作業を失いうる | ローカルが ahead（ff 不可）、取り込む側と同じファイルへの未コミット変更、取り込む側が追加するパスと衝突する untracked、submodule 内のローカル変更・ローカルコミット |
-| MEDIUM | pull は通るが、追随作業が必要 | `Cargo.lock`・依存行の変更、`rust-toolchain.toml` の変更、`lefthook.yml` の変更（`make hooks` 再実行）、submodule の gitlink 変更（`git submodule update`） |
+| MEDIUM | pull は通るが、追随作業が必要 | `Cargo.lock`・依存行の変更、`rust-toolchain.toml` の変更、`lefthook.yml` の変更（`make hooks` 再実行）、submodule の gitlink 変更・上流での新規追加（`git submodule update --init`） |
 | INFO | 判断材料 | untracked の非衝突ファイル、submodule チェックアウトが gitlink より古いだけ、stash・worktree 件数、Makefile／CI／skills の変更 |
 
 判定できない状態（submodule のオブジェクト未取得など）は OK とせず INFO（UNKNOWN）として明示する。
@@ -37,8 +37,8 @@ make worktree-lag-check-selftest   # セルフテスト
 
 ## 推奨する pull 手順
 
-1. `REMOTE_CHECK=1` で評価し、ahead=0 かつ HIGH=0 を確認する（`origin/main` が STALE と出たら先に `git fetch origin`）
-2. `git pull --ff-only`
+1. `REMOTE_CHECK=1` で評価し（未指定だと鮮度未確認として DEFERRED になり pull は推奨されない）、ahead=0 かつ HIGH=0 を確認する（`origin/main` が STALE と出たら先に `git fetch origin`）
+2. スクリプトの推奨どおり取り込み先を明示して `git pull --ff-only <remote> <branch>`（既定は `git pull --ff-only origin main`。引数なしの pull は upstream 設定次第で比較した BASE_REF と別の ref を取り込むため使わない）
 3. `git submodule update --init`（private のためアクセス権が無ければスキップ）
 4. `lefthook.yml` の変更が出ていれば `make hooks`
 5. `make ci`

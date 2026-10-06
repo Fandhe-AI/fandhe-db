@@ -11,7 +11,7 @@
 # docs/design/main-worktree-lag-assessment.md を参照。
 #
 # 環境変数: REPO（既定: カレントの toplevel）/ BASE_REF（既定: origin/main）/
-#           REMOTE_CHECK=1（BASE_REF は <remote>/<branch> 形式必須）/ STRICT=1（HIGH があれば exit 1）
+#           REMOTE_CHECK=1（鮮度確認。未指定だと判定は DEFERRED。BASE_REF は <remote>/<branch> 形式必須）/ STRICT=1（HIGH があれば exit 1）
 # 終了コード: 0=レポート出力済み、1=STRICT で HIGH 検出、2=入力不正
 
 set -euo pipefail
@@ -83,6 +83,16 @@ while IFS= read -r -d '' _rec; do
   _meta="${_rec%%$'\t'*}"
   case "${_meta}" in 160000\ *) SUBS+=("${_rec#*$'\t'}") ;; esac
 done < <(g ls-tree -r -z HEAD)
+# BASE 側で新規追加される submodule も評価対象に含める（HEAD の gitlink だけだと追随作業を見落とす）
+while IFS= read -r -d '' _rec; do
+  _meta="${_rec%%$'\t'*}"
+  case "${_meta}" in
+    160000\ *)
+      _sp="${_rec#*$'\t'}"
+      if ! in_list "${_sp}" ${SUBS[@]+"${SUBS[@]}"}; then SUBS+=("${_sp}"); fi
+      ;;
+  esac
+done < <(g ls-tree -r -z "${BASE_SHA}")
 # 取り込み元の鮮度が確認できない（REMOTE_CHECK で STALE / 確認失敗）場合 1 にし、最終判定を保留する
 VERDICT_DEFERRED=0
 
@@ -97,22 +107,30 @@ else
   echo "  fast-forward: NOT possible"
   high "local branch is ahead of ${BASE_REF} by ${AHEAD} commit(s); pull --ff-only would fail"
 fi
-if [ "${REMOTE_CHECK:-0}" = "1" ]; then
-  # BASE_REF が `<remote>/<branch>` 形式のリモート追跡 ref のときだけ、その remote / branch を照会する
-  # （常に origin の main を見ると、別 BASE_REF 指定時に誤った鮮度判定になる）。それ以外は入力不正。
+# BASE_REF が `<remote>/<branch>` 形式のリモート追跡 ref のとき、その remote / branch を導出する
+# （REMOTE_CHECK の照会先と、推奨する pull コマンドの取り込み先の両方に使う。最長一致の remote 名を採用）。
+REMOTE_NAME=""
+REMOTE_BRANCH=""
+while IFS= read -r _r; do
+  case "${BASE_REF}" in
+    "${_r}"/?*)
+      if [ "${#_r}" -gt "${#REMOTE_NAME}" ]; then
+        REMOTE_NAME="${_r}"
+        REMOTE_BRANCH="${BASE_REF#"${_r}"/}"
+      fi
+      ;;
+  esac
+done < <(g remote)
+if [ -n "${REMOTE_NAME}" ] && ! g rev-parse --verify --quiet "refs/remotes/${BASE_REF}" >/dev/null; then
   REMOTE_NAME=""
   REMOTE_BRANCH=""
-  while IFS= read -r _r; do
-    case "${BASE_REF}" in
-      "${_r}"/?*)
-        if [ "${#_r}" -gt "${#REMOTE_NAME}" ]; then
-          REMOTE_NAME="${_r}"
-          REMOTE_BRANCH="${BASE_REF#"${_r}"/}"
-        fi
-        ;;
-    esac
-  done < <(g remote)
-  if [ -z "${REMOTE_NAME}" ] || ! g rev-parse --verify --quiet "refs/remotes/${BASE_REF}" >/dev/null; then
+fi
+if [ "${REMOTE_CHECK:-0}" != "1" ]; then
+  # 鮮度未確認のまま pull を推奨しない（ローカルの追跡 ref が古いと実際の遅れ・競合を過小評価する）
+  echo "  remote freshness: NOT CHECKED (set REMOTE_CHECK=1 or run git fetch)"
+  VERDICT_DEFERRED=1
+else
+  if [ -z "${REMOTE_NAME}" ]; then
     echo "error: REMOTE_CHECK=1 requires BASE_REF to be a remote-tracking ref (<remote>/<branch>)" >&2
     exit 2
   fi
@@ -198,6 +216,9 @@ for sub in ${SUBS[@]+"${SUBS[@]}"}; do
   if [ -n "${head_link}" ] && [ -n "${base_link}" ] && [ "${head_link}" != "${base_link}" ]; then
     medium "submodule ${sub} gitlink changes upstream; run submodule update after pull"
   fi
+  if [ -z "${head_link}" ] && [ -n "${base_link}" ]; then
+    medium "submodule ${sub} is added upstream; run submodule update --init after pull"
+  fi
   # 未初期化の submodule は空ディレクトリで、git が親リポへ解決してしまうため toplevel 一致で判定する
   sub_top="$(git -C "${REPO}/${sub}" rev-parse --show-toplevel 2>/dev/null || true)"
   if [ "${sub_top}" != "${REPO_TOP}/${sub}" ]; then
@@ -253,9 +274,14 @@ echo "  linked worktrees: $(g worktree list --porcelain | grep -c '^worktree ' |
 echo "== Risk verdict =="
 echo "  HIGH=${HIGH} MEDIUM=${MEDIUM} INFO=${INFO}"
 if [ "${VERDICT_DEFERRED}" -eq 1 ]; then
-  echo "  recommendation: DEFERRED; ${BASE_REF} freshness is not confirmed (stale or ls-remote failed); run git fetch, then re-run this check"
+  echo "  recommendation: DEFERRED; ${BASE_REF} freshness is not confirmed (not checked, stale or ls-remote failed); run git fetch, then re-run with REMOTE_CHECK=1"
 elif [ "${HIGH}" -eq 0 ] && [ "${AHEAD}" -eq 0 ]; then
-  echo "  recommendation: git pull --ff-only, then submodule update / make hooks as flagged above"
+  # 比較した BASE_REF と取り込み先を一致させるため、upstream 任せの引数なし pull ではなく取り込み先を明示する
+  if [ -n "${REMOTE_NAME}" ]; then
+    echo "  recommendation: git pull --ff-only ${REMOTE_NAME} ${REMOTE_BRANCH}, then submodule update / make hooks as flagged above"
+  else
+    echo "  recommendation: git merge --ff-only ${BASE_REF}, then submodule update / make hooks as flagged above"
+  fi
 else
   echo "  recommendation: do NOT pull yet; resolve the HIGH items individually"
 fi

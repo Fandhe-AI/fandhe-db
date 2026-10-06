@@ -215,7 +215,7 @@ expect "S14 stale deferred" "${OUT}" "recommendation: DEFERRED"
 refute "S14 stale no pull recommendation" "${OUT}" "recommendation: git pull"
 "${GITC[@]}" -C "${d}/c" fetch -q origin
 run "${d}" REMOTE_CHECK=1
-expect "S14 fresh recommends pull" "${OUT}" "recommendation: git pull --ff-only"
+expect "S14 fresh recommends explicit pull" "${OUT}" "recommendation: git pull --ff-only origin main"
 "${GITC[@]}" -C "${d}/c" remote set-url origin "${d}/does-not-exist.git"
 run "${d}" REMOTE_CHECK=1
 expect "S14 ls-remote failure deferred" "${OUT}" "recommendation: DEFERRED"
@@ -260,6 +260,33 @@ run "${d}" REMOTE_CHECK=1 BASE_REF=other/main
 expect "S17 other remote queried (fresh)" "${OUT}" "local other/main is up to date"
 run "${d}" REMOTE_CHECK=1 BASE_REF=HEAD
 expect_rc "S17 non-remote BASE_REF rejected" 2
+
+# S18: REMOTE_CHECK 未指定（鮮度未確認）では pull を推奨せず保留する
+d="$(setup s18)"; upstream_commit "${d}" b.txt b
+run "${d}"
+expect "S18 unchecked deferred" "${OUT}" "recommendation: DEFERRED"
+expect "S18 unchecked notice" "${OUT}" "remote freshness: NOT CHECKED"
+refute "S18 unchecked no pull recommendation" "${OUT}" "recommendation: git pull"
+
+# S19: 上流で新規追加される submodule（HEAD に gitlink が無い）を MEDIUM として報告する
+d="$(setup s19)"
+"${GITC[@]}" init -q "${d}/sub"
+echo 1 >"${d}/sub/f"
+"${GITC[@]}" -C "${d}/sub" add -A
+"${GITC[@]}" -C "${d}/sub" commit -q -m one
+"${GITC[@]}" -C "${d}/up" submodule add -q "${d}/sub" docs/spec 2>/dev/null
+"${GITC[@]}" -C "${d}/up" commit -q -m "add sub"
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+run "${d}" REMOTE_CHECK=1
+expect "S19 added submodule MEDIUM" "${OUT}" "submodule docs/spec is added upstream; run submodule update --init after pull"
+
+# S20: BASE_REF が別 remote でも推奨 pull は比較した remote / branch を明示する
+d="$(setup s20)"; upstream_commit "${d}" b.txt b
+"${GITC[@]}" -C "${d}/c" remote add other "${d}/origin.git"
+"${GITC[@]}" -C "${d}/c" fetch -q other
+run "${d}" REMOTE_CHECK=1 BASE_REF=other/main
+expect "S20 pull names compared remote/branch" "${OUT}" "recommendation: git pull --ff-only other main"
 
 if [ "${FAILS}" -ne 0 ]; then
   echo "${FAILS} check(s) failed"
