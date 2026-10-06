@@ -4532,7 +4532,7 @@ fn resolve_foreign_key_target(
         key.len() == resolved.parent_columns.len()
             && key.iter().all(|k| resolved.parent_columns.contains(k))
     };
-    let is_unique_target = parent.primary_key().is_some_and(&same_set)
+    let is_unique_target = parent.primary_key().is_some_and(same_set)
         || parent
             .unique_constraints()
             .iter()
