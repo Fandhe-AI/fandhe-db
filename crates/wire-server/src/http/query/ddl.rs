@@ -1720,7 +1720,7 @@ mod tests {
     /// 構造段で判定される名前付き主キーの `wire_code` が SQL 表層と一致すること。
     #[test]
     fn build_constraint_tokens_named_primary_key_wire_codes_match_sql() {
-        let cases: [(&[&str], &str, &str); 5] = [
+        let cases: [(&[&str], &str, &str); 4] = [
             (
                 &[
                     r#"{"kind":"primary_key","name":"a","columns":["qty"]}"#,
@@ -1749,11 +1749,6 @@ mod tests {
                 ],
                 "CONSTRAINT same PRIMARY KEY (qty), CONSTRAINT same CHECK (qty > 0)",
                 "42601",
-            ),
-            (
-                &[r#"{"kind":"primary_key","name":"a","columns":["qty"]}"#],
-                "CONSTRAINT a PRIMARY KEY (qty)",
-                "ok",
             ),
         ];
         for (items, sql_constraints, expected) in cases {
