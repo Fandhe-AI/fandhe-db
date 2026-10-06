@@ -1116,8 +1116,9 @@ pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
             ty: FieldType::Object(&DDL_REFERENCES_SCHEMA),
             nullable: false,
         },
-        // `kind == "check"` 専用（Issue #1199・NOSQL-13・TABLE-16）。制約名。
-        // 型のみ宣言し、`kind` との整合は [`super::ddl`] が判定する。
+        // `check`（Issue #1199）・`primary_key`（Issue #1437）で使用する制約名
+        // （NOSQL-13・TABLE-16・TABLE-22）。`unique`／`foreign_key` への指定は
+        // [`super::ddl`] が拒否する。型のみ宣言し、`kind` との整合は ddl 側が判定する。
         FieldSpec {
             key: "name",
             presence: Presence::Optional,

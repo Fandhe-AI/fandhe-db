@@ -128,9 +128,13 @@ SQL と NoSQL の同一宣言が同一のカタログ表現になることは、
 - 表制約としてのみ生成するため既定名は `<table>_check` 系（SQL の列制約形の
   `<table>_<col>_check` とは既定名だけが異なる。意図した差分）。
 - fail-closed の拒否（すべて `42601`）: check への `columns`／`references`、
-  pk/unique/foreign_key への `name`／`predicate`、`predicate` の欠落・空配列、
+  pk/unique/foreign_key への `predicate`、unique/foreign_key への `name`、`predicate` の欠落・空配列、
   `in` と `or` グループ、語彙外の `op`、RLS 述語名の列、`prefix` と非文字列、
   真偽値と `eq` 以外。葉が 256 件を超える場合は確保前に `54000`。
+- `primary_key` の `name`（Issue #1437・NOSQL-13・TABLE-22）は
+  `CONSTRAINT <ident> PRIMARY KEY (...)` へ写し、SQL 表層と同じカタログ表現にする。
+  名前は `ident_token` と engine の制約名検証の二段で検証し、重複宣言（`42P16`）・
+  名前衝突・名前付き `(id)` 単独（`42601`）は engine に一本化する（wire は先回り判定しない）。
 - 違反した書き込み（insert／update）は engine の単一検査点が `23514`（HTTP 409）で
   拒否する。応答には制約名のみを含む。
 - `DdlError::FeatureNotSupported` と `CHECK_CONSTRAINT_UNAVAILABLE_MESSAGE` は
