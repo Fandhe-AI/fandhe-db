@@ -567,6 +567,14 @@ fn execute_inner_scan_statement(
         .filter(|p| !predicate_contains_subquery(p))
         .cloned()
         .collect();
+    // 先行サブクエリの遅延対象エラーで解決が打ち切られても、後続サブクエリの静的エラーを
+    // 検出できるよう、サブクエリを含む述語の控えも持つ。
+    let subquery_preds: Vec<WherePredicate> = validated
+        .where_predicates
+        .iter()
+        .filter(|p| predicate_contains_subquery(p))
+        .cloned()
+        .collect();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
     validated.where_predicates = match resolve_where_predicates(
@@ -587,6 +595,18 @@ fn execute_inner_scan_statement(
             // 返す（可視データで契約が変わらないよう、サブクエリを含まない述語は
             // 束縛検証を完了させる）。
             if intent == InnerScanIntent::ScalarValue {
+                if is_deferrable_runtime_error(&e) {
+                    if let Some(static_err) = first_static_error_in_subquery_predicates(
+                        &subquery_preds,
+                        &chain,
+                        read_txn,
+                        ctx,
+                        lookup,
+                        udfs,
+                    ) {
+                        return Err(static_err);
+                    }
+                }
                 validated.where_predicates = static_preds;
                 let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
                 *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
@@ -659,6 +679,14 @@ fn execute_inner_aggregate_statement(
         .filter(|p| !predicate_contains_subquery(p))
         .cloned()
         .collect();
+    // 先行サブクエリの遅延対象エラーで解決が打ち切られても、後続サブクエリの静的エラーを
+    // 検出できるよう、サブクエリを含む述語の控えも持つ。
+    let subquery_preds: Vec<WherePredicate> = validated
+        .where_predicates
+        .iter()
+        .filter(|p| predicate_contains_subquery(p))
+        .cloned()
+        .collect();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
     chain.push(&inner_schema);
     validated.where_predicates = match resolve_where_predicates(
@@ -674,6 +702,18 @@ fn execute_inner_aggregate_statement(
         Ok(p) => p,
         Err(e) => {
             // スキャン側と同じ理由で、入れ子 WHERE の失敗時も投影メタデータを確定する。
+            if is_deferrable_runtime_error(&e) {
+                if let Some(static_err) = first_static_error_in_subquery_predicates(
+                    &subquery_preds,
+                    &chain,
+                    read_txn,
+                    ctx,
+                    lookup,
+                    udfs,
+                ) {
+                    return Err(static_err);
+                }
+            }
             validated.where_predicates = static_preds;
             let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
             *meta_sink = Some(super::describe::aggregate_columns(&bound, &inner_schema)?);
@@ -692,6 +732,47 @@ fn execute_inner_aggregate_statement(
         None,
         None,
     )
+}
+
+/// 外側の行数が判明するまで遅延してよい実行時エラーか（入れ子スカラーサブクエリの
+/// `21000`、または静的な `22000` 以外の式評価データ例外 `22xxx`）。
+/// [`resolve_scalar_projection_items`] と内側クエリの失敗時静的検証から呼ばれる。
+fn is_deferrable_runtime_error(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::CardinalityViolation)
+        || (e.wire_code().starts_with("22") && e.wire_code() != "22000")
+}
+
+/// 先行サブクエリが遅延対象エラーで解決を打ち切った後に、サブクエリを含む各述語を
+/// 個別に解決し直して、遅延対象でない（静的・構造的な）エラーを最初の 1 件返す。
+/// 遅延対象エラーと成功は無視する。過去の予算消費に影響されないよう、プローブ用に
+/// 予算を初期値で独立に確保する（エラー経路専用。通常経路では呼ばれない）。
+fn first_static_error_in_subquery_predicates(
+    subquery_preds: &[WherePredicate],
+    chain: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+) -> Option<SqlSurfaceError> {
+    let mut budget = MAX_SUBQUERY_EXECUTIONS;
+    let mut in_value_budget = MAX_SUBQUERY_IN_VALUES;
+    for pred in subquery_preds {
+        if let Err(e) = resolve_where_predicates(
+            vec![pred.clone()],
+            chain,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            &mut budget,
+            &mut in_value_budget,
+        ) {
+            if !is_deferrable_runtime_error(&e) {
+                return Some(e);
+            }
+        }
+    }
+    None
 }
 
 /// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
@@ -1186,10 +1267,7 @@ pub(crate) fn resolve_scalar_projection_items(
             // サブクエリ自身の 2 行以上は `multi_row` で扱うため、ここへ届く `21000` は
             // 入れ子由来のみ）も、`22xxx` と同じく外側の行数が判明するまで遅延する
             // （Issue #1432。SQL-29・ERR-6）。`meta_sink` 未確定なら従来どおり即返す。
-            Err(e)
-                if matches!(e, SqlSurfaceError::CardinalityViolation)
-                    || (e.wire_code().starts_with("22") && e.wire_code() != "22000") =>
-            {
+            Err(e) if is_deferrable_runtime_error(&e) => {
                 let inner_meta = match meta_sink.as_deref() {
                     Some([m]) => m.clone(),
                     _ => return Err(e),

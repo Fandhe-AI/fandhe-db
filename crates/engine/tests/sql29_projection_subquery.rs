@@ -434,6 +434,34 @@ fn projection_subquery_static_errors_win_over_deferred_cardinality() {
     assert_eq!(code(&core, &ctx, &outer_static), "22000");
 }
 
+/// 先行サブクエリが 21000 でも、後続サブクエリの静的エラー（未知テーブル・未知列）は
+/// 外側 0 行で必ず返る（Issue #1432 codex-review P1）。Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_later_static_error_wins_over_earlier_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let bad_table = "qty = (SELECT qty FROM no_such_table LIMIT 1)";
+    let bad_col = format!("qty = (SELECT nope FROM {REFS} LIMIT 1)");
+    for bad in [bad_table.to_string(), bad_col] {
+        let inners = [
+            format!("(SELECT name FROM {REFS} WHERE {multi} AND {bad} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {multi} AND {bad})"),
+        ];
+        for inner in &inners {
+            let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+            let c = code(&core, &ctx, &none);
+            assert_ne!(c, "21000", "{inner}");
+            let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+            assert_eq!(code(&core, &ctx, &some), c, "{inner}");
+        }
+    }
+}
+
 /// 他テナントの行数は 21000 の有無に影響しない（RLS-10 (b)）。
 #[test]
 fn projection_subquery_nested_cardinality_is_tenant_isolated() {
