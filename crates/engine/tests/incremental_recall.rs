@@ -212,7 +212,7 @@ fn documents_schema() -> TableSchema {
 }
 
 /// 埋め込み呼び出し回数・入力テキスト総数を数える `Embedder` ラッパー（柱 1: カウント
-/// 判定用。TASK-281）。`HashingEmbedder` へ委譲しつつ、呼び出し側から見える副作用
+/// 判定用。Issue #281）。`HashingEmbedder` へ委譲しつつ、呼び出し側から見える副作用
 /// （原子カウンタの増加）だけを追加する。`incremental.rs::embed_and_write_phase` は
 /// ファイル 1 件につき `embed_batch` を 1 回、そのファイルの全チャンク本文をまとめて
 /// 呼ぶ契約のため、単一ファイル挿入で `calls == 1` かつ `texts` が

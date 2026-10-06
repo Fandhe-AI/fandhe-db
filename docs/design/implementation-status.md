@@ -760,6 +760,15 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **静的エラー優先の検証**: 入れ子 WHERE が遅延対象エラーで打ち切られたときは、残りのサブクエリ述語（`OR` の分岐・`NOT`・`EXISTS` の内側を含む）を内側の実行なしに静的検証する（`static_validate_subquery_predicates`）。実行回数予算を消費しないため、予算枯渇で後続の静的エラーが見落とされない。実行経路の予算（16 回）は不変。
 - **対象外**: トップレベル WHERE 値位置の `21000`（走査前に解決するため即時のまま）。拡張クエリプロトコルはサブクエリを含む文を Bind で `42601` とする既存設計のため `21000` に到達せず、その契約（`42601`・Sync 後の回復）をテストで固定するに留める。
 
+## Issue #1327: spec リポ側のマージ・整合性確認
+
+- **確認日**: 2026-10-06。
+- **ポインタ整合**: 本リポ `main` の `docs/spec` gitlink は `16136c84`、spec リポ `main`（`git ls-remote` で取得）も `16136c84` で一致。`dd640e7d..16136c84` は spec PR #31〜#34 で、本リポ側の追随は #1368・#1443 で取り込み済み。
+- **ID 突合**: 本リポの `crates/`・`docs/design/`・README・AGENTS.md・CLAUDE.md に現れるビヘイビア ID はすべて spec 側に実在。TASK ID は `TASK-281` の 1 件のみ spec に存在せず、導入コミット（PR #296・Closes #281）の文脈から `Issue #281` の誤記と判断し、`crates/engine/tests/incremental_recall.rs` の doc コメントを `Issue #281` 表記へ訂正した。
+- **メイン worktree の `M docs/spec`**: submodule 実チェックアウト（`f18bb6ac`）が gitlink（`dd640e7d`）より古い stale checkout で、更新ではない。コミットしてはならない。解消（`git submodule update`）はグローバル状態を変えるため本 Issue では行わない。
+- **申し送り**: メイン worktree の遅れ・一時ファイルの整理は #1329・#1330・#1333 の担当。spec 側に残る remote-tracking ref `origin/docs/sync-phase1-task-status` は remote に存在しない残骸で、prune は行っていない。
+- **再現**: `git ls-tree HEAD docs/spec` と `git ls-remote <spec リポ> refs/heads/main` の SHA 比較、および `git grep -hoE '\bTASK-[0-9]+\b'` の出力と spec の `05-tasks.md` の突合。
+
 ## Issue #1326: 破壊的変更 2 件（#1215・#1224）の spec 側反映の確認
 
 - **確認結果**: 2 件とも private spec 側へ反映済み。ポインタのみ記載する（private spec 由来の記述は削除し、ビヘイビア ID のポインタのみ残置）。
@@ -776,3 +785,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **ポインタ更新の履歴**（PR 番号のみ）: #951 → #1059 → #1142 → #1144 → #1161 → #1208（`dd640e7d`）→ #1368（`9d8b71ac`）→ #1443（`16136c84`）。本記録の時点で main が記録するポインタは `16136c84` で、`f18bb6ac` の取り込み内容（TASK-228 の分解記録・親 Issue #941 は CLOSED）は反映済みである。
 - **本 Issue でのポインタ操作**: なし。ポインタの更新・巻き戻し、およびメイン作業ツリーの submodule 作業コピーの修正は行っていない（作業コピーのずれの扱いは #1329、breaking change と spec の対応確認は #1326、spec 側の整合確認は #1327 の担当）。
 - **後続 Issue への引き継ぎ**: #1326 は #1215・#1224 の breaking change を、ポインタ `16136c84` 時点の `docs/spec/04-behavior/` 配下（`records/` を含む）のビヘイビア ID と照合する。
+
+## Issue #1331: 実装・テスト・レビュー面の残課題の集約
+
+- **調査**: main の CI・週次 schedule（bench・recall）の状況、CI から実行されないテスト、実装記録の「対象外」の残り、CLAUDE.md・README の書き漏れ。
+- **成果物**: [remaining-issues-audit-2026-10.md](remaining-issues-audit-2026-10.md)（2026-10-06・`origin/main` `1b3d517e` 時点）。失敗中の CI・定期ワークフローは無かった。
+- **是正した書き漏れ**: CLAUDE.md の構成ツリー（`detect-features.yml`・`update-external.yml`・`simd-codegen-check`・主要スクリプト・ルート直下の項目）と README のタスクランナー表（ガード系・クロス確認・`make test-eval`）。
+- **対象外**: Python テストの make・CI への接続、裸の `#[ignore]` への理由付与、#1454 の成果物の反映（未マージ）、未解消の対象外項目の実装。Issue は起票していない。
+- **性質**: ドキュメントのみの変更。コード・依存・CI・Makefile は不変。
