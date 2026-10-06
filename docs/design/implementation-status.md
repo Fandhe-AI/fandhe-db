@@ -766,6 +766,16 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **評価結果の要点**: 実測の遅れは 129 コミット（起票時の 69 から増加）、ahead=0 で fast-forward 可能、HIGH=0。追随作業は submodule の更新のみ。
 - **性質**: fetch・pull 等は実行せず、private submodule のコミット件名は出力しない。`make ci`・CI には含めない。一時ログの整理は #1330、ドキュメント更新漏れの集約は #1331 の担当。
 
+## Issue #1326: 破壊的変更 2 件（#1215・#1224）の spec 側反映の確認
+
+- **確認結果**: 2 件とも private spec 側へ反映済み。ポインタのみ記載する（private spec 由来の記述は削除し、ビヘイビア ID のポインタのみ残置）。
+- **対応ビヘイビア ID と本リポの PR**:
+  - ERR-6（`22012` の行）・SQL-26: PR #1215（Issue #1163）
+  - TABLE-16: PR #1224（Issue #1169）・PR #1215（Issue #1163）
+  - TABLE-5: PR #1224（Issue #1169）
+- **補足**: #1224 の `!` は Rust API の破壊的変更（`ValidatedAlterTableAddColumn` のフィールド追加等）によるもので、ビヘイビア定義の対象外。
+- **追跡先**: spec リポ側の課題は #1327、ローカル checkout の `docs/spec` の追従は #1329・#1333 の管轄。
+
 ## Issue #1325: spec サブモジュール更新内容の確認
 
 - **結論**: メイン作業ツリーの `git status` に出ていた `M docs/spec` は新しい spec 更新ではない。submodule の作業コピーが `f18bb6ac`（spec #22・#951 で取り込み済み）のまま残り、記録済みポインタより古い状態だった。`f18bb6ac` は `dd640e7d`（spec #30・#1208 で設定）の祖先であり、更新の向きは「`dd640e7d` → `f18bb6ac`」ではなく逆（遅れ）である。
