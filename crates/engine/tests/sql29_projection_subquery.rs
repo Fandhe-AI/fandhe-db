@@ -625,3 +625,36 @@ fn id_in_subquery_matches_ids_beyond_2_pow_53() {
         vec![big2]
     );
 }
+
+/// 入れ子 WHERE の比較・IN の対象列が未知列／型不一致なら、内側が 2 行以上でも静的エラーが
+/// 21000 に隠れず、外側 0 行でも返る（Issue #1432 codex-review P1）。Scan 形・集計形を通す。
+#[test]
+fn projection_subquery_static_target_error_wins_over_multi_row_inner() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let preds = [
+        format!("nope = (SELECT qty FROM {REFS} LIMIT 10)"),
+        format!("nope IN (SELECT qty FROM {REFS} LIMIT 10)"),
+        format!("name = (SELECT qty FROM {REFS} LIMIT 10)"),
+        format!("name IN (SELECT qty FROM {REFS} LIMIT 10)"),
+    ];
+    for pred in &preds {
+        let inners = [
+            format!("(SELECT name FROM {REFS} WHERE {pred} LIMIT 1)"),
+            format!("(SELECT COUNT(*) FROM {REFS} WHERE {pred})"),
+            // 先行する 21000 の述語があっても、後続の対象列エラーは隠れない。
+            format!("(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) AND {pred} LIMIT 1)"),
+        ];
+        for inner in &inners {
+            let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+            let c = code(&core, &ctx, &none);
+            assert_eq!(c, "22000", "{inner}");
+            let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+            assert_eq!(code(&core, &ctx, &some), c, "{inner}");
+        }
+    }
+}
