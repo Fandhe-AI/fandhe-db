@@ -759,3 +759,9 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: 入れ子由来の `21000` は外側の結果が 0 行なら発生せず、1 行以上なら返る（#1404 で対象外としていた非対称の解消）。静的エラー優先・自テナント可視行のみで判定・fail-closed・依存は不変。wire 経由は簡易クエリで `21000` の ErrorResponse と接続回復を固定。
 - **静的エラー優先の検証**: 入れ子 WHERE が遅延対象エラーで打ち切られたときは、残りのサブクエリ述語（`OR` の分岐・`NOT`・`EXISTS` の内側を含む）を内側の実行なしに静的検証する（`static_validate_subquery_predicates`）。実行回数予算を消費しないため、予算枯渇で後続の静的エラーが見落とされない。実行経路の予算（16 回）は不変。
 - **対象外**: トップレベル WHERE 値位置の `21000`（走査前に解決するため即時のまま）。拡張クエリプロトコルはサブクエリを含む文を Bind で `42601` とする既存設計のため `21000` に到達せず、その契約（`42601`・Sync 後の回復）をテストで固定するに留める。
+
+## Issue #1329: メイン worktree の遅れの把握と pull 前リスク評価
+
+- **追加物**: `scripts/check_worktree_lag.sh`（読み取り専用の診断。`make worktree-lag-check`）と `scripts/tests/check_worktree_lag_test.sh`（セルフテスト。`make worktree-lag-check-selftest`）。評価観点・推奨 pull 手順・評価スナップショットは [main-worktree-lag-assessment.md](main-worktree-lag-assessment.md)。
+- **評価結果の要点**: 実測の遅れは 129 コミット（起票時の 69 から増加）、ahead=0 で fast-forward 可能、HIGH=0。追随作業は submodule の更新のみ。
+- **性質**: fetch・pull 等は実行せず、private submodule のコミット件名は出力しない。`make ci`・CI には含めない。一時ログの整理は #1330、ドキュメント更新漏れの集約は #1331 の担当。
