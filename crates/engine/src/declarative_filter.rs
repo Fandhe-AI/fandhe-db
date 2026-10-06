@@ -453,9 +453,9 @@ impl CompareOp {
 /// `WherePredicate::Compare`／`Equality` から構築する）。`Number` は
 /// `NUMERIC` 列専用の裸数値リテラル形（`col > 1.5`）を表す
 /// [`DeclarativeFilter::compare_numeric_literal`] 専用の variant で、
-/// **Rust API 直接呼び出し限定**（TABLE-13・TASK-199、Issue #891・レーン B は
-/// 文字列リテラル形のみを対象とするため、SQL 表層からは未結線。裸数値
-/// リテラル形の SQL 構文追加はレーン A・別 Issue の対象）。
+/// Rust API に加え、SQL 表層では `sql::parser` の束縛段が NUMERIC 列 × 裸の数値
+/// リテラルの単純比較をこの variant へ振り替える（TABLE-13・TASK-199、Issue #891・
+/// Issue #1430。値の解釈は文字列リテラル形と同じ経路）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompareLiteral {
     Text(String),

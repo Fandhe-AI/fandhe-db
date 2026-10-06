@@ -823,10 +823,6 @@ fn create_table_check_constraint_malformed_forms_are_42601() {
             r#"{"kind":"check","predicate":[{"column":"visible","op":"eq","value":true}]}"#,
         ),
         (
-            "negative number",
-            r#"{"kind":"check","predicate":[{"column":"a","op":"gt","value":-1}]}"#,
-        ),
-        (
             "exponent number",
             r#"{"kind":"check","predicate":[{"column":"a","op":"gt","value":1e3}]}"#,
         ),
@@ -856,6 +852,22 @@ fn create_table_check_constraint_malformed_forms_are_42601() {
             "case {label}: got {resp:?}"
         );
     }
+}
+
+/// Issue #1430・SQL-24: SQL 表層が負の数値リテラルを受理するようになったため、
+/// 負数の CHECK 述語は（従来の `42601` から）受理される。指数表記は引き続き拒否される
+/// （上の malformed ケース）。
+#[test]
+fn create_table_check_constraint_negative_number_is_accepted() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let body = r#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"integer"}],"constraints":[{"kind":"check","predicate":[{"column":"a","op":"gt","value":-1}]}]}"#;
+    let resp = query(&session, body.as_bytes());
+    assert_eq!(
+        resp.body,
+        br#"{"ok":true}"#.to_vec(),
+        "negative CHECK literal should be accepted: {resp:?}"
+    );
 }
 
 #[test]

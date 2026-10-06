@@ -4522,11 +4522,11 @@ impl<'a> Parser<'a> {
             self.tokens.get(kw_idx),
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN")
         ) && matches!(self.tokens.get(kw_idx + 1), Some(Token::Punct('(')))
-            && matches!(self.tokens.get(kw_idx + 2), Some(Token::Number(_)));
+            && self.signed_number_at(kw_idx + 2);
         let is_between = matches!(
             self.tokens.get(kw_idx),
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("BETWEEN")
-        ) && matches!(self.tokens.get(kw_idx + 1), Some(Token::Number(_)));
+        ) && self.signed_number_at(kw_idx + 1);
         if !is_in && !is_between {
             return Ok(None);
         }
@@ -4534,21 +4534,13 @@ impl<'a> Parser<'a> {
             self.pos = kw_idx + 2; // `(` まで消費する
             let mut values: Vec<String> = Vec::new();
             loop {
-                match self.advance() {
-                    Some(Token::Number(n)) => {
-                        if values.len() >= MAX_IN_LIST_ITEMS {
-                            return Err(SqlSurfaceError::payload_too_large(format!(
-                                "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
-                            )));
-                        }
-                        values.push(n.clone());
-                    }
-                    other => {
-                        return Err(SqlSurfaceError::unsupported(format!(
-                            "IN list elements must all be numeric literals, got {other:?}"
-                        )))
-                    }
+                if values.len() >= MAX_IN_LIST_ITEMS {
+                    return Err(SqlSurfaceError::payload_too_large(format!(
+                        "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                    )));
                 }
+                let n = self.expect_signed_number("IN list elements")?;
+                values.push(n);
                 match self.peek() {
                     Some(Token::Punct(',')) => {
                         self.advance();
@@ -4575,14 +4567,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             self.pos = kw_idx + 1; // `BETWEEN` を消費する
-            let low = match self.advance() {
-                Some(Token::Number(n)) => n.clone(),
-                other => {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "BETWEEN bounds must be numeric literals, got {other:?}"
-                    )))
-                }
-            };
+            let low = self.expect_signed_number("BETWEEN bounds")?;
             match self.advance() {
                 Some(Token::Keyword(Keyword::And)) => {}
                 other => {
@@ -4591,14 +4576,7 @@ impl<'a> Parser<'a> {
                     )))
                 }
             }
-            let high = match self.advance() {
-                Some(Token::Number(n)) => n.clone(),
-                other => {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "BETWEEN bounds must be numeric literals, got {other:?}"
-                    )))
-                }
-            };
+            let high = self.expect_signed_number("BETWEEN bounds")?;
             vec![
                 self.numeric_comparison(&col, BinOp::Ge, low)?,
                 self.numeric_comparison(&col, BinOp::Le, high)?,
@@ -4608,6 +4586,31 @@ impl<'a> Parser<'a> {
             Ok(Some(negate_conjunction(preds, &mut self.expr_node_budget)?))
         } else {
             Ok(Some(preds))
+        }
+    }
+
+    /// `tokens[idx..]` の先頭が符号なし数値、または `-` + 数値のペアか（Issue #1430）。
+    fn signed_number_at(&self, idx: usize) -> bool {
+        match self.tokens.get(idx) {
+            Some(Token::Number(_)) => true,
+            Some(Token::Punct('-')) => matches!(self.tokens.get(idx + 1), Some(Token::Number(_))),
+            _ => false,
+        }
+    }
+
+    /// 数値リテラル（任意で前置 `-`）を 1 つ消費し、負なら `-` を前置した文字列で返す。
+    /// 数値リスト形（`IN`／`BETWEEN`）の構文段から呼ばれる。`what` はエラー文言用で
+    /// リテラル本文は含めない（Issue #1430・SQL-24）。
+    fn expect_signed_number(&mut self, what: &str) -> Result<String, SqlSurfaceError> {
+        let negative = matches!(self.peek(), Some(Token::Punct('-')));
+        if negative {
+            self.advance();
+        }
+        match self.advance() {
+            Some(Token::Number(n)) => Ok(if negative { format!("-{n}") } else { n.clone() }),
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "{what} must be numeric literals, got {other:?}"
+            ))),
         }
     }
 
@@ -5150,6 +5153,21 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.consume_expr_node()?;
                 Ok(Expr::Number(n))
+            }
+            // Issue #1430・SQL-24: 負の数値リテラル（字句ペア `-` + Number を 1 ノードの
+            // 数値へ畳む）。`-col`・`-(expr)`・`- -1` は一般の単項マイナスとして受理せず、
+            // 下の既定分岐で従来どおり `42601` のままとする（fail-closed）。
+            Some(Token::Punct('-'))
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
+            {
+                self.advance();
+                let Some(Token::Number(n)) = self.advance().cloned() else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expected numeric literal after '-'",
+                    ));
+                };
+                self.consume_expr_node()?;
+                Ok(Expr::Number(format!("-{n}")))
             }
             // Issue #919・SQL-26: 文字列リテラルを式項として受理する。値は字句段で
             // 既にクォート解除済み（`Token::StringLiteral`）。PostgreSQL の
@@ -12792,11 +12810,65 @@ mod tests {
             "id IN (1, NULL)",
             "id IN (1, $1)",
             "id IN (1,)",
-            "id IN (-1)",
+            "id IN (-1, 'a')",
+            "id IN (- -1)",
+            "id BETWEEN - AND 3",
             "id BETWEEN 1 AND '3'",
             "id BETWEEN 1 OR 3",
             "id BETWEEN SYMMETRIC 1 AND 3",
         ] {
+            let sql = format!(
+                "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            );
+            assert_eq!(where_err(&sql).wire_code(), "42601", "{cond}");
+        }
+    }
+
+    /// Issue #1430・SQL-24: 負の数値リテラルは比較・`IN`・`BETWEEN` で受理され、
+    /// `-` + 数値の字句ペアが 1 つの `Expr::Number("-n")` に畳まれる。
+    #[test]
+    fn accepts_negative_numeric_literals() {
+        let neg = |n: &str| Expr::Number(format!("-{n}"));
+        let cmp = |op, col: &str, rhs: Expr| {
+            WherePredicate::Expression(Expr::Binary {
+                op,
+                lhs: Box::new(Expr::Ident(col.to_string())),
+                rhs: Box::new(rhs),
+            })
+        };
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE n = -1 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![cmp(BinOp::Eq, "n", neg("1"))]
+        );
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE n < - 1.5 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![cmp(BinOp::Lt, "n", neg("1.5"))]
+        );
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE n IN (-1, 2) ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![WherePredicate::Or(vec![
+                vec![cmp(BinOp::Eq, "n", neg("1"))],
+                vec![cmp(BinOp::Eq, "n", Expr::Number("2".to_string()))],
+            ])]
+        );
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE n BETWEEN -2 AND -1 \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![cmp(BinOp::Ge, "n", neg("2")), cmp(BinOp::Le, "n", neg("1"))]
+        );
+    }
+
+    #[test]
+    fn rejects_general_unary_minus_forms() {
+        for cond in ["n = - -1", "n = -n", "n = -(1)", "n = -'1'"] {
             let sql = format!(
                 "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
             );

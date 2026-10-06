@@ -861,7 +861,7 @@ fn malformed_and_unsupported_forms_stay_rejected() {
     for (clause, code) in [
         ("id IN (1, 'a')", "42601"),
         ("id IN (1, NULL)", "42601"),
-        ("id IN (-1)", "42601"),
+        ("id IN (-1, 'a')", "42601"),
         ("id BETWEEN 1 AND '3'", "42601"),
         // `NOT IN (SELECT ...)`／`NOT EXISTS (SELECT ...)` は Issue #1191 で受理に
         // なった（`tests/sql29_subquery.rs`）。ここで拒否するのは `visible()` の否定。

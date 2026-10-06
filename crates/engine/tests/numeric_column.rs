@@ -702,20 +702,23 @@ fn sum_avg_min_max_where_and_expr_reject_numeric_column() {
     )
     .expect("insert should succeed");
 
-    // WHERE 述語の裸の数値リテラル形（引用符なし `price = 1.00`）は対象外の
-    // まま（Issue #891・レーン B は文字列リテラル形 `price = '1.00'` のみを
-    // 受理する。裸の数値リテラル形は式評価経路〔`Expr::Binary`〕へ
-    // フォールバックし、NUMERIC 列は式内で参照不能として `22000` になる）。
-    // 文字列リテラル形の受理は `tests/scalar_types_predicates.rs` を参照。
-    // なお SUM/AVG/MIN/MAX(price) は Issue #892 で受理された
-    // （`sum_avg_min_max_on_numeric_column_succeed_after_issue_892` 参照）。
-    let err = core
+    // WHERE 述語の裸の数値リテラル形（引用符なし `price = 1.00`）は Issue #1430 で
+    // 受理され、文字列リテラル形 `price = '1.00'` と同じ行集合を返す
+    // （詳細は `tests/sql24_numeric_literal_compare.rs`）。
+    let bare = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE price = 1.00 LIMIT 10"),
         )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+        .expect("bare numeric literal compare should be accepted");
+    let quoted = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE price = '1.00' LIMIT 10"),
+        )
+        .expect("quoted literal compare should be accepted");
+    assert_eq!(bare.rows.len(), 1);
+    assert_eq!(bare.rows.len(), quoted.rows.len());
 
     // 式中の NUMERIC 列参照は対象外（Issue #891）。
     let err = core

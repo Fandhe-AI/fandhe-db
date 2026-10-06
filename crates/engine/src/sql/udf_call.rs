@@ -82,7 +82,7 @@ pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
     // あれば、同じ整数として exactness 判定の対象に含める。
     // Issue #1183: NoSQL の `filter`（JSON の `NegInt`）は負数の生テキスト
     // （`-9007199254740993` 等）をそのまま渡すため、先頭の `-` を除いた絶対値にも
-    // 同じ exactness 判定を適用する（SQL 表層は単項マイナスが無く影響しない）。
+    // 同じ exactness 判定を適用する（負の数値リテラルは構文段で `-n` の文字列へ畳まれて渡る。Issue #1430）。
     let abs_raw = match raw.strip_prefix('-') {
         Some(unsigned) if !unsigned.is_empty() => unsigned,
         _ => raw,

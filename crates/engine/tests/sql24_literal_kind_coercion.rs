@@ -406,7 +406,13 @@ fn operatorless_type_combinations_are_42883() {
         }
     }
     // NUMERIC 列 × 数値リテラルは本 Issue の対象外（従来の拒否を維持）。
-    assert_eq!(code(&core, &alice, "price = 1"), "22000");
+    // Issue #1430: 裸の数値リテラル形は受理され文字列リテラル形と同じ結果になる
+    // （詳細は `tests/sql24_numeric_literal_compare.rs`）。算術を含む形は従来どおり `22000`。
+    assert_eq!(
+        ids(&core, &alice, "price = 1"),
+        ids(&core, &alice, "price = '1'")
+    );
+    assert_eq!(code(&core, &alice, "price = 1 + 1"), "22000");
 }
 
 #[test]

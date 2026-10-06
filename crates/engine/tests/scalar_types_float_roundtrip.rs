@@ -370,20 +370,21 @@ fn sum_aggregate_on_real_column_succeeds_after_issue_892() {
     );
 }
 
-/// `id = -1` の応答コードは REAL/DOUBLE 追加の前後で変わらない（既存契約の
-/// 非退行確認）。
+/// `id = -1` は Issue #1430 の負の数値リテラル受理により受理され、0 行を返す
+/// （PostgreSQL 互換。panic・`22003` にならない。SQL-24 ポインタ）。
 #[test]
-fn negative_id_pseudo_column_rejection_is_unchanged() {
+fn negative_id_pseudo_column_is_accepted_and_matches_nothing() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
 
-    let err = core
-        .execute_sql(&alice, &format!("SELECT id FROM {TABLE} WHERE id = -1"))
-        .expect_err("negative id literal must still be rejected");
-    // 既存の型不一致・構文不正のいずれかの応答であればよい（本 Issue はこの
-    // 応答コード自体を変えないことのみを確認する）。
-    assert_ne!(err.wire_code(), "22003");
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE id = -1 LIMIT 10"),
+        )
+        .expect("negative id literal is accepted after Issue #1430");
+    assert!(result.rows.is_empty());
 }
 
 // --- UPDATE / RLS -------------------------------------------------------

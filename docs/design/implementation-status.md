@@ -694,3 +694,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: 3 op の `filter` が SQL の `SELECT ... WHERE col IN (...)` と同じ結果集合を返す。型不一致は `42601`、葉数・要素数の上限超過は `54000`。#1410 の既知の差分のうち search 系の項は解消した。RLS・テナント境界・fail-closed・依存は不変。
 - **分類変更**: BOOLEAN／VECTOR 列への配列・オブジェクト要素の `in` は検索系で `42601` から engine の `22000` に変わり、述語形 DML・SQL 表層と揃う。
 - **対象外**: `FilterError::CompositeEqNotSupportedForPredicateDml` の削除（公開 enum の破壊的変更）、ARRAY／JSON 列の範囲比較・`prefix`・`like`。
+
+## Issue #1430: NUMERIC 列と数値リテラルの比較と負の数値リテラルを受理する
+
+- **対象ビヘイビア**: SQL-24（関連: ERR-2・RECOVER-10）。
+- **変更箇所**: `crates/engine/src/sql/allowlist.rs`（`parse_primary_expr` に `-` + 数値の字句ペアを 1 つの負の数値リテラルへ畳む分岐、`IN`／`BETWEEN` の数値リスト形の符号対応）、`sql/parser.rs`（WHERE 文脈で NUMERIC 列 × 裸の数値リテラルの単純比較を `compare_numeric_literal` の宣言的フィルタへ振り替える束縛処理）、`recovery/content_hash.rs`（f64 で表せない整数リテラル用のフォールバックタグ 11）、テスト（`tests/sql24_numeric_literal_compare.rs` 新規ほか既存テストの更新）。
+- **性質**: NUMERIC 列の `=`・範囲比較・`IN`・`BETWEEN`（`NOT` 付き含む）が文字列リテラル形と同じ値・同じ `wire_code` になる（`numeric::parse_literal_exact` を共有）。負の数値リテラルは全数値型の比較・`IN`・`BETWEEN` で受理され、`- -1`・`-col`・`-(1)`・`-'x'` は従来どおり `42601`。`id = -1` は受理され 0 行を返す。振り替え後は `TypedCompare` のため NUMERIC 用の二次索引経路がそのまま使われる。RLS・テナント境界・fail-closed・依存は不変。
+- **対象外**: CHECK 本体での NUMERIC × 裸の数値リテラル（`22000` のまま）、算術・関数呼び出し・列同士・逆向きの文字列リテラル、NoSQL（HTTP）`filter`、`<>`／`!=`、単項プラス、一般の単項マイナス、f64 で同値になる NUMERIC リテラル同士が content hash で衝突する既知の制限。
