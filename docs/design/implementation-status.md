@@ -766,3 +766,11 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **ポインタ更新の履歴**（PR 番号のみ）: #951 → #1059 → #1142 → #1144 → #1161 → #1208（`dd640e7d`）→ #1368（`9d8b71ac`）→ #1443（`16136c84`）。本記録の時点で main が記録するポインタは `16136c84` で、`f18bb6ac` の取り込み内容（TASK-228 の分解記録・親 Issue #941 は CLOSED）は反映済みである。
 - **本 Issue でのポインタ操作**: なし。ポインタの更新・巻き戻し、およびメイン作業ツリーの submodule 作業コピーの修正は行っていない（作業コピーのずれの扱いは #1329、breaking change と spec の対応確認は #1326、spec 側の整合確認は #1327 の担当）。
 - **後続 Issue への引き継ぎ**: #1326 は #1215・#1224 の breaking change を、ポインタ `16136c84` 時点の `docs/spec/04-behavior/` 配下（`records/` を含む）のビヘイビア ID と照合する。
+
+## Issue #1331: 実装・テスト・レビュー面の残課題の集約
+
+- **調査**: main の CI・週次 schedule（bench・recall）の状況、CI から実行されないテスト、実装記録の「対象外」の残り、CLAUDE.md・README の書き漏れ。
+- **成果物**: [remaining-issues-audit-2026-10.md](remaining-issues-audit-2026-10.md)（2026-10-06・`origin/main` `1b3d517e` 時点）。失敗中の CI・定期ワークフローは無かった。
+- **是正した書き漏れ**: CLAUDE.md の構成ツリー（`detect-features.yml`・`update-external.yml`・`simd-codegen-check`・主要スクリプト・ルート直下の項目）と README のタスクランナー表（ガード系・クロス確認・`make test-eval`）。
+- **対象外**: Python テストの make・CI への接続、裸の `#[ignore]` への理由付与、#1454 の成果物の反映（未マージ）、未解消の対象外項目の実装。Issue は起票していない。
+- **性質**: ドキュメントのみの変更。コード・依存・CI・Makefile は不変。
