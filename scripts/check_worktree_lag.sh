@@ -23,7 +23,7 @@ if [ ! -d "${REPO}" ] || ! git -C "${REPO}" rev-parse --git-dir >/dev/null 2>&1;
   echo "error: REPO is not a git worktree" >&2
   exit 2
 fi
-g() { git -C "${REPO}" "$@"; }
+g() { git -C "${REPO}" -c core.quotepath=off "$@"; }
 REPO_TOP="$(g rev-parse --show-toplevel)"
 
 if ! BASE_SHA="$(g rev-parse --verify --quiet "${BASE_REF}^{commit}")"; then
@@ -42,7 +42,11 @@ info() { INFO=$((INFO + 1)); echo "  [INFO] $*"; }
 # 取り込む側の変更（HEAD と BASE の 2 点差分）
 INCOMING="$(g diff --name-only "${HEAD_SHA}" "${BASE_SHA}" --)"
 INCOMING_ADDED="$(g diff --name-only --diff-filter=A "${HEAD_SHA}" "${BASE_SHA}" --)"
-has_incoming() { printf '%s\n' "${INCOMING}" | grep -Eq "$1"; }
+# 注意: pipefail 下では `printf | grep -q` が grep の早期終了で SIGPIPE となり偽陰性になる
+# （入力が pipe バッファを超える大量変更時）。here-string で入力を渡して回避する。
+has_incoming() { grep -Eq "$1" <<<"${INCOMING}"; }
+# submodule（gitlink）のパス一覧。状態は Submodules 節で評価するため Tracked changes からは除外する
+SUBS="$(g ls-tree -r HEAD | awk '$1 == "160000" { print $4 }')"
 
 echo "== Summary =="
 read -r BEHIND AHEAD < <(g rev-list --left-right --count "${BASE_SHA}...${HEAD_SHA}")
@@ -68,18 +72,24 @@ if [ "${REMOTE_CHECK:-0}" = "1" ]; then
 fi
 
 echo "== Tracked changes =="
-TRACKED="$(g status --porcelain=v1 --untracked-files=no | grep -v '^.. docs/spec$' || true)"
-if [ -z "${TRACKED}" ]; then
+# -z 出力: rename は "XY new\0old\0" の 2 トークンになり、特殊文字パスもクォートされない
+HAS_TRACKED=0
+while IFS= read -r -d '' entry; do
+  xy="${entry:0:2}"
+  path="${entry:3}"
+  case "${xy}" in
+    R* | C* | *R | *C) IFS= read -r -d '' _orig || true ;;
+  esac
+  if grep -Fxq -- "${path}" <<<"${SUBS}"; then continue; fi
+  HAS_TRACKED=1
+  if grep -Fxq -- "${path}" <<<"${INCOMING}"; then
+    high "locally modified file also changed upstream: ${path}"
+  else
+    info "locally modified file (not touched upstream): ${path}"
+  fi
+done < <(g status --porcelain=v1 -z --untracked-files=no)
+if [ "${HAS_TRACKED}" -eq 0 ]; then
   echo "  none (excluding submodule gitlink state)"
-else
-  while IFS= read -r line; do
-    path="${line:3}"
-    if printf '%s\n' "${INCOMING}" | grep -Fxq -- "${path}"; then
-      high "locally modified file also changed upstream: ${path}"
-    else
-      info "locally modified file (not touched upstream): ${path}"
-    fi
-  done <<<"${TRACKED}"
 fi
 
 echo "== Untracked collisions =="
@@ -88,7 +98,7 @@ if [ -z "${UNTRACKED}" ]; then
   echo "  none"
 else
   while IFS= read -r path; do
-    if printf '%s\n' "${INCOMING_ADDED}" | grep -Fxq -- "${path}"; then
+    if grep -Fxq -- "${path}" <<<"${INCOMING_ADDED}"; then
       high "untracked file collides with a path added upstream (pull would abort): ${path}"
     else
       info "untracked file (no collision): ${path}"
@@ -97,7 +107,6 @@ else
 fi
 
 echo "== Submodules =="
-SUBS="$(g ls-tree -r HEAD | awk '$1 == "160000" { print $4 }')"
 if [ -z "${SUBS}" ]; then
   echo "  none"
 fi

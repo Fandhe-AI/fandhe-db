@@ -131,6 +131,33 @@ expect "S7 submodule behind INFO" "${OUT}" "behind HEAD gitlink"
 refute "S7 no subject leak (1)" "${OUT}" "SECRET-SUBJECT-ONE"
 refute "S7 no subject leak (2)" "${OUT}" "SECRET-SUBJECT-TWO"
 
+# S8: 取り込む側の変更が pipe バッファ（約 64KB）を超えても先頭付近の一致を見逃さない（SIGPIPE 偽陰性の回帰）
+d="$(setup s8)"
+mkdir -p "${d}/up/bulk"
+for i in $(seq 1 20000); do : >"${d}/up/bulk/file_${i}.txt"; done
+echo new >"${d}/up/a.txt"
+echo lock1 >"${d}/up/Cargo.lock"
+echo "x: 1" >"${d}/up/lefthook.yml"
+echo added >"${d}/up/zz_added.txt"
+"${GITC[@]}" -C "${d}/up" add -A
+"${GITC[@]}" -C "${d}/up" commit -q -m "bulk"
+"${GITC[@]}" -C "${d}/up" push -q origin HEAD:main
+"${GITC[@]}" -C "${d}/c" fetch -q origin
+echo local >"${d}/c/a.txt"
+echo mine >"${d}/c/zz_added.txt"
+run "${d}" STRICT=1
+expect "S8 same-file HIGH (large list)" "${OUT}" "locally modified file also changed upstream: a.txt"
+expect "S8 untracked collision HIGH (large list)" "${OUT}" "untracked file collides with a path added upstream (pull would abort): zz_added.txt"
+expect "S8 Cargo.lock category (large list)" "${OUT}" "Cargo.lock changes"
+expect "S8 lefthook category (large list)" "${OUT}" "lefthook.yml changes"
+expect_rc "S8 STRICT exit 1" 1
+
+# S9: staged rename の新パスが取り込む側の変更と一致する場合も検出する
+d="$(setup s9)"; upstream_commit "${d}" b.txt b
+"${GITC[@]}" -C "${d}/c" mv a.txt b.txt
+run "${d}"
+expect "S9 rename new path HIGH" "${OUT}" "locally modified file also changed upstream: b.txt"
+
 if [ "${FAILS}" -ne 0 ]; then
   echo "${FAILS} check(s) failed"
   exit 1
