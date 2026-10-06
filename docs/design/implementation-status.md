@@ -708,3 +708,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **変更箇所**: `crates/engine/src/sql/lexer.rs`（`!=` を `<>` と同じ 2 つの `Punct` へ字句化。`!` 単独は拒否のまま）、`sql/allowlist.rs`（`<col> <> '<lit>'` を `Not(Equality)` へ desugar）、`sql/params.rs`（Prepared の Describe 用ダミーフラグ序数が `<> '<lit>'` を実リテラルとして数える）、`sql/parser.rs`（疑似列 `id` を数値書き換えの対象へ追加、BOOLEAN 列 × 文字列の範囲比較・`IN`・`BETWEEN` を `BoolEquality`／`IsNull`／常に偽の `Or` へ書き換える束縛処理）。
 - **性質**: 新しい AST／トークン variant は無く、既存形への desugar のみ。(a) `<>`／`!=` は `NOT col = 'x'` と同じ結果・同じ `wire_code`。(b) `id` × 文字列は数値リテラル形と同じ結果（`id = 'abc'` は `22P02`、2^53 超の厳密表現範囲外は数値リテラル形と同じ `22003`）。実カラム `id` があればそちらが優先。(c) BOOLEAN は `false < true` の順序で、NULL 行は除外。解釈できない文字列は `22P02`（メッセージにリテラルを含めない）。
 - **対象外**: CHECK 本体での BOOLEAN 範囲・`IN`・`BETWEEN`（従来どおり拒否）、裸の数値リテラルとの `<>`、JOIN の修飾名・逆向きの文字列リテラル、NoSQL（HTTP）`filter`。空白を挟んだ `< >` も `<>` として受理される既存の寛容さは据え置き。
+
+## Issue #1432: 投影位置スカラーサブクエリ内の入れ子 WHERE スカラーサブクエリの 21000 を外側の行数に合わせる
+
+- **対象ビヘイビア**: SQL-29・ERR-6（関連: ERR-4・RLS-10 (b)・TASK-213）。
+- **変更箇所**: `crates/engine/src/sql/subquery.rs`（`resolve_scalar_projection_items` の遅延条件へ `SqlSurfaceError::CardinalityViolation` を追加。`22xxx` と同じく束縛成功後〔`meta_sink` 確定済み〕に限る）、テスト（`crates/engine/tests/sql29_projection_subquery.rs`・新規 `crates/wire-server/tests/wire_sql29_scalar_subquery.rs`）、`docs/design/sql-subquery.md`。
+- **性質**: 入れ子由来の `21000` は外側の結果が 0 行なら発生せず、1 行以上なら返る（#1404 で対象外としていた非対称の解消）。静的エラー優先・自テナント可視行のみで判定・fail-closed・依存は不変。wire 経由は簡易クエリで `21000` の ErrorResponse と接続回復を固定。
+- **対象外**: トップレベル WHERE 値位置の `21000`（走査前に解決するため即時のまま）。拡張クエリプロトコルはサブクエリを含む文を Bind で `42601` とする既存設計のため `21000` に到達せず、その契約（`42601`・Sync 後の回復）をテストで固定するに留める。

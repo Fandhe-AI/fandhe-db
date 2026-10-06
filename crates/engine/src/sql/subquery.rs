@@ -31,6 +31,7 @@
 //! [`resolve_scalar_projection_items`] が内側を実行して列メタデータと値（0 行は NULL）へ
 //! 解決し、[`merge_scalar_projection_items`] が外側の走査結果へ SELECT リスト上の位置で
 //! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `21000`。
+//! 内側 WHERE に入れ子のスカラーサブクエリの `21000` も同様に外側の行数判明まで遅延する（Issue #1432）。
 //!
 //! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
 //! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
@@ -1181,9 +1182,14 @@ pub(crate) fn resolve_scalar_projection_items(
             // 外側の行数が判明するまで遅延する。束縛前に失敗した静的エラー（`meta_sink` が
             // 未確定。`22P02` 等の bind 時エラーを含む）と `22000` は即返す。列メタデータは
             // 実行とは独立に束縛結果から確定済みのため、外側の行数で列型は変わらない。
-            // `21000`（行数違反）は `22` で始まらないためここでも即返す（外側の行数を待たない。
-            // 従来の `22000` と同じ評価順序を保つ。Issue #1404）。
-            Err(e) if e.wire_code().starts_with("22") && e.wire_code() != "22000" => {
+            // 内側 WHERE に入れ子になったスカラーサブクエリの行数違反（`21000`。投影位置
+            // サブクエリ自身の 2 行以上は `multi_row` で扱うため、ここへ届く `21000` は
+            // 入れ子由来のみ）も、`22xxx` と同じく外側の行数が判明するまで遅延する
+            // （Issue #1432。SQL-29・ERR-6）。`meta_sink` 未確定なら従来どおり即返す。
+            Err(e)
+                if matches!(e, SqlSurfaceError::CardinalityViolation)
+                    || (e.wire_code().starts_with("22") && e.wire_code() != "22000") =>
+            {
                 let inner_meta = match meta_sink.as_deref() {
                     Some([m]) => m.clone(),
                     _ => return Err(e),

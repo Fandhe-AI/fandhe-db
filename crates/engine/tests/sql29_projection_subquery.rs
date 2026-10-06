@@ -370,6 +370,91 @@ fn projection_subquery_static_errors_win_over_deferred_runtime_error() {
     assert_eq!(code(&core, &ctx, &outer_static), "22000");
 }
 
+/// 入れ子 WHERE のスカラーサブクエリが 2 行以上を返す `21000` も、外側 0 行なら発生せず、
+/// 外側に行があれば返る（Issue #1432・SQL-29・ERR-6）。Scan 形・集計形・深さ 2 を通す。
+#[test]
+fn projection_subquery_nested_where_cardinality_violation_is_deferred() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("(SELECT qty FROM {REFS} LIMIT 10)");
+    let inners = [
+        format!("(SELECT name FROM {REFS} WHERE qty = {multi} LIMIT 1)"),
+        format!("(SELECT COUNT(*) FROM {REFS} WHERE qty = {multi})"),
+        format!(
+            "(SELECT name FROM {REFS} WHERE qty IN (SELECT qty FROM {REFS} WHERE qty = {multi} LIMIT 10) LIMIT 1)"
+        ),
+    ];
+    for inner in &inners {
+        let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+        assert!(run(&core, &ctx, &none).rows.is_empty(), "{inner}");
+        let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+        assert_eq!(code(&core, &ctx, &some), "21000", "{inner}");
+    }
+}
+
+/// 遅延した `21000` でも、外側 0 行の結果の列メタデータは遅延なしの場合と同じ。
+#[test]
+fn projection_subquery_deferred_cardinality_keeps_column_meta() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let deferred = format!(
+        "SELECT name, (SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) LIMIT 1) AS v FROM {ITEMS} WHERE qty > 999 LIMIT 100"
+    );
+    let plain = format!(
+        "SELECT name, (SELECT name FROM {REFS} WHERE qty = 1 LIMIT 1) AS v FROM {ITEMS} WHERE qty > 999 LIMIT 100"
+    );
+    let a = run(&core, &ctx, &deferred);
+    let b = run(&core, &ctx, &plain);
+    assert_eq!(a.columns, b.columns);
+}
+
+/// 静的エラー（内側の未知列・外側の未知列）は、21000 が遅延対象でも外側 0 行で必ず返る。
+#[test]
+fn projection_subquery_static_errors_win_over_deferred_cardinality() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx);
+    ins(&core, &ctx, REFS, 5, "r1", Some(1));
+    ins(&core, &ctx, REFS, 6, "r2", Some(2));
+    let multi = format!("qty = (SELECT qty FROM {REFS} LIMIT 10)");
+    let inner_static = format!("(SELECT name FROM {REFS} WHERE nope = 1 AND {multi} LIMIT 1)");
+    let q = format!("SELECT name, {inner_static} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &q), "22000");
+    let inner = format!("(SELECT name FROM {REFS} WHERE {multi} LIMIT 1)");
+    let outer_static = format!("SELECT nope, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert_eq!(code(&core, &ctx, &outer_static), "22000");
+}
+
+/// 他テナントの行数は 21000 の有無に影響しない（RLS-10 (b)）。
+#[test]
+fn projection_subquery_nested_cardinality_is_tenant_isolated() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let a = ctx_for("tenant-a");
+    let b = ctx_for("tenant-b");
+    seed(&core, &a);
+    seed(&core, &b);
+    for id in 10..13 {
+        ins(&core, &b, REFS, id, "rb", Some(id as i64));
+    }
+    let inner =
+        format!("(SELECT name FROM {REFS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 10) LIMIT 1)");
+    let some = format!("SELECT name, {inner} FROM {ITEMS} LIMIT 100");
+    let none = format!("SELECT name, {inner} FROM {ITEMS} WHERE qty > 999 LIMIT 100");
+    assert!(!run(&core, &a, &some).rows.is_empty());
+    assert_eq!(code(&core, &b, &some), "21000");
+    assert!(run(&core, &b, &none).rows.is_empty());
+}
+
 #[test]
 fn projection_subquery_alias_of_id_keeps_numeric_type() {
     let (core, path) = new_core();
