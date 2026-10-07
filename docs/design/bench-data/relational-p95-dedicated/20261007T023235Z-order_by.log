@@ -1,0 +1,18 @@
+cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine
+    Finished `bench` profile [optimized] target(s) in 0.04s
+     Running benches/relational_p95_bench.rs (target/release/deps/relational_p95_bench-b9c714e333c68b27)
+env: os=macos arch=aarch64 logical_cpus=16 isa=Neon loadavg=unavailable
+relational_p95_bench: group=order_by rounds=5 rows=100000 dedicated_env_attested=true (informational only; see docs/design/relational-p95-bench.md)
+relational_p95: group=order_by arm=order_single round=1 p95=34.886ms median=30.248ms loadavg=n/a
+relational_p95: group=order_by arm=order_multi round=1 p95=35.597ms median=31.061ms loadavg=n/a
+relational_p95: group=order_by arm=order_multi round=2 p95=35.484ms median=31.066ms loadavg=n/a
+relational_p95: group=order_by arm=order_single round=2 p95=34.381ms median=30.355ms loadavg=n/a
+relational_p95: group=order_by arm=order_single round=3 p95=34.795ms median=30.326ms loadavg=n/a
+relational_p95: group=order_by arm=order_multi round=3 p95=34.888ms median=31.081ms loadavg=n/a
+relational_p95: group=order_by arm=order_multi round=4 p95=35.708ms median=31.152ms loadavg=n/a
+relational_p95: group=order_by arm=order_single round=4 p95=34.594ms median=30.465ms loadavg=n/a
+relational_p95: group=order_by arm=order_single round=5 p95=35.166ms median=30.626ms loadavg=n/a
+relational_p95: group=order_by arm=order_multi round=5 p95=35.232ms median=31.140ms loadavg=n/a
+relational_p95: group=order_by arm=order_single rows=100000 scale=full min_of_n=34.381ms median=34.795ms max=35.166ms run_to_run_band=2.3%
+relational_p95: group=order_by arm=order_multi rows=100000 scale=full min_of_n=34.888ms median=35.484ms max=35.708ms run_to_run_band=2.4%
+threshold_judgement: dedicated environment attested; compare min_of_n against the spec criteria manually

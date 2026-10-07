@@ -1,0 +1,12 @@
+cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine
+    Finished `bench` profile [optimized] target(s) in 0.04s
+     Running benches/relational_p95_bench.rs (target/release/deps/relational_p95_bench-b9c714e333c68b27)
+env: os=macos arch=aarch64 logical_cpus=16 isa=Neon loadavg=unavailable
+relational_p95_bench: group=join rounds=5 rows=100000 dedicated_env_attested=true (informational only; see docs/design/relational-p95-bench.md)
+relational_p95: group=join arm=join_inner round=1 p95=4.172ms median=4.095ms loadavg=n/a
+relational_p95: group=join arm=join_inner round=2 p95=4.141ms median=4.072ms loadavg=n/a
+relational_p95: group=join arm=join_inner round=3 p95=4.131ms median=4.071ms loadavg=n/a
+relational_p95: group=join arm=join_inner round=4 p95=4.210ms median=4.073ms loadavg=n/a
+relational_p95: group=join arm=join_inner round=5 p95=4.163ms median=4.078ms loadavg=n/a
+relational_p95: group=join arm=join_inner rows=10000 scale=full min_of_n=4.131ms median=4.163ms max=4.210ms run_to_run_band=1.9%
+threshold_judgement: dedicated environment attested; compare min_of_n against the spec criteria manually

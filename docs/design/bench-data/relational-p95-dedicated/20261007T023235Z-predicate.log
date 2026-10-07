@@ -1,0 +1,246 @@
+cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine
+    Finished `bench` profile [optimized] target(s) in 0.04s
+     Running benches/relational_p95_bench.rs (target/release/deps/relational_p95_bench-b9c714e333c68b27)
+env: os=macos arch=aarch64 logical_cpus=16 isa=Neon loadavg=unavailable
+relational_p95_bench: group=predicate rounds=5 rows=100000 dedicated_env_attested=true (informational only; see docs/design/relational-p95-bench.md)
+path arm=pred_eq scalar_plan=index_equality d_index_scans=1 d_trusted_mask_scans=1 d_plain_scan_fallbacks=0 d_full_rebuild_copies=0
+path arm=pred_or2 scalar_plan=index_in_list d_index_scans=1 d_trusted_mask_scans=1 d_plain_scan_fallbacks=0 d_full_rebuild_copies=0
+path arm=pred_in2 scalar_plan=index_in_list d_index_scans=1 d_trusted_mask_scans=1 d_plain_scan_fallbacks=0 d_full_rebuild_copies=0
+path arm=pred_or_same scalar_plan=index_in_list d_index_scans=1 d_trusted_mask_scans=1 d_plain_scan_fallbacks=0 d_full_rebuild_copies=0
+path arm=pred_in8 scalar_plan=index_in_list d_index_scans=1 d_trusted_mask_scans=1 d_plain_scan_fallbacks=0 d_full_rebuild_copies=0
+relational_p95: group=predicate arm=pred_eq round=1 p95=0.379ms median=0.343ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or2 round=1 p95=0.651ms median=0.608ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=1 p95=0.372ms median=0.344ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in2 round=1 p95=0.651ms median=0.601ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=1 p95=0.378ms median=0.345ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or_same round=1 p95=0.376ms median=0.343ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=1 p95=0.385ms median=0.346ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in8 round=1 p95=2.040ms median=1.888ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=2 p95=0.371ms median=0.345ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in2 round=2 p95=0.637ms median=0.600ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=2 p95=0.378ms median=0.348ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or_same round=2 p95=0.381ms median=0.349ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=2 p95=0.378ms median=0.345ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in8 round=2 p95=2.139ms median=1.888ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=2 p95=0.376ms median=0.346ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or2 round=2 p95=0.648ms median=0.605ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=3 p95=0.373ms median=0.346ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or_same round=3 p95=0.378ms median=0.349ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=3 p95=0.380ms median=0.347ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in8 round=3 p95=2.082ms median=1.917ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=3 p95=0.375ms median=0.343ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or2 round=3 p95=0.647ms median=0.604ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=3 p95=0.378ms median=0.346ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in2 round=3 p95=0.660ms median=0.601ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=4 p95=0.374ms median=0.346ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in8 round=4 p95=2.062ms median=1.879ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=4 p95=0.368ms median=0.342ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or2 round=4 p95=0.653ms median=0.600ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=4 p95=0.377ms median=0.344ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in2 round=4 p95=0.679ms median=0.611ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=4 p95=0.375ms median=0.342ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or_same round=4 p95=0.382ms median=0.342ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=5 p95=0.374ms median=0.342ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or2 round=5 p95=0.655ms median=0.604ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=5 p95=0.378ms median=0.345ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in2 round=5 p95=0.656ms median=0.604ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=5 p95=0.375ms median=0.346ms loadavg=n/a
+relational_p95: group=predicate arm=pred_or_same round=5 p95=0.396ms median=0.357ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq round=5 p95=0.375ms median=0.347ms loadavg=n/a
+relational_p95: group=predicate arm=pred_in8 round=5 p95=2.084ms median=1.914ms loadavg=n/a
+relational_p95: group=predicate arm=pred_eq rows=100000 scale=full min_of_n=0.371ms median=0.374ms max=0.379ms run_to_run_band=2.2%
+relational_p95: group=predicate arm=pred_or2 rows=100000 scale=full min_of_n=0.647ms median=0.651ms max=0.655ms run_to_run_band=1.2% ratio_vs_pred_eq=1.724 ref_paired=0.375ms
+relational_p95: group=predicate arm=pred_in2 rows=100000 scale=full min_of_n=0.637ms median=0.656ms max=0.679ms run_to_run_band=6.6% ratio_vs_pred_eq=1.717 ref_paired=0.371ms
+relational_p95: group=predicate arm=pred_or_same rows=100000 scale=full min_of_n=0.376ms median=0.381ms max=0.396ms run_to_run_band=5.5% ratio_vs_pred_eq=0.995 ref_paired=0.378ms
+relational_p95: group=predicate arm=pred_in8 rows=100000 scale=full min_of_n=2.040ms median=2.082ms max=2.139ms run_to_run_band=4.8% ratio_vs_pred_eq=5.299 ref_paired=0.385ms
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_candidate_resolve round=1 median=0.208us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_candidate_resolve round=2 median=0.208us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_candidate_resolve round=3 median=0.250us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_candidate_resolve round=4 median=0.209us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_candidate_resolve round=5 median=0.209us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_search_subset round=1 median=244.167us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_search_subset round=2 median=244.833us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_search_subset round=3 median=242.750us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_search_subset round=4 median=242.542us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=idx_search_subset round=5 median=243.125us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=e2e round=1 median=343.000us k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=e2e round=2 median=343.500us k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=e2e round=3 median=342.500us k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=e2e round=4 median=344.958us k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=current stage=e2e round=5 median=347.000us k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_scalar_eval round=1 median=3131.708us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_scalar_eval round=2 median=3041.709us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_scalar_eval round=3 median=3122.334us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_scalar_eval round=4 median=3138.292us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_scalar_eval round=5 median=3027.500us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_copy round=1 median=5434.917us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_copy round=2 median=5243.708us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_copy round=3 median=5194.958us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_copy round=4 median=5206.000us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_copy round=5 median=5269.083us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_search round=1 median=120.084us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_search round=2 median=124.708us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_search round=3 median=125.792us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_search round=4 median=123.416us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_eq path=plain_scan_ref stage=plain_search round=5 median=126.125us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_candidate_resolve round=1 median=85.000us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_candidate_resolve round=2 median=85.083us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_candidate_resolve round=3 median=85.250us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_candidate_resolve round=4 median=82.500us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_candidate_resolve round=5 median=85.250us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_search_subset round=1 median=358.125us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_search_subset round=2 median=359.084us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_search_subset round=3 median=359.334us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_search_subset round=4 median=352.334us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=idx_search_subset round=5 median=352.833us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=e2e round=1 median=606.542us k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=e2e round=2 median=630.625us k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=e2e round=3 median=613.958us k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=e2e round=4 median=622.042us k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=current stage=e2e round=5 median=611.375us k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_scalar_eval round=1 median=3485.208us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_scalar_eval round=2 median=3603.375us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_scalar_eval round=3 median=3469.542us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_scalar_eval round=4 median=3547.250us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_scalar_eval round=5 median=3464.208us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_copy round=1 median=7250.000us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_copy round=2 median=7239.375us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_copy round=3 median=7317.250us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_copy round=4 median=7284.042us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_copy round=5 median=7298.958us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_search round=1 median=174.667us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_search round=2 median=165.750us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_search round=3 median=174.625us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_search round=4 median=171.583us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_search round=5 median=170.041us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_candidate_resolve round=1 median=81.000us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_candidate_resolve round=2 median=78.833us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_candidate_resolve round=3 median=84.875us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_candidate_resolve round=4 median=83.917us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_candidate_resolve round=5 median=84.791us candidates=12500 values=2
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_search_subset round=1 median=358.750us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_search_subset round=2 median=366.333us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_search_subset round=3 median=352.917us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_search_subset round=4 median=360.000us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=idx_search_subset round=5 median=363.958us scanned_rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=e2e round=1 median=628.250us k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=e2e round=2 median=640.667us k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=e2e round=3 median=616.417us k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=e2e round=4 median=604.875us k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=current stage=e2e round=5 median=607.208us k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_scalar_eval round=1 median=3479.250us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_scalar_eval round=2 median=3485.125us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_scalar_eval round=3 median=3377.916us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_scalar_eval round=4 median=3451.792us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_scalar_eval round=5 median=3448.042us evaluated_rows=100000 matched=12500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_copy round=1 median=7580.167us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_copy round=2 median=7158.708us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_copy round=3 median=7064.542us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_copy round=4 median=7183.583us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_copy round=5 median=7215.084us matched=12500 copied_bytes=38687500
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_search round=1 median=170.917us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_search round=2 median=181.292us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_search round=3 median=181.083us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_search round=4 median=178.000us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_search round=5 median=178.333us rows=12500 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_candidate_resolve round=1 median=0.209us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_candidate_resolve round=2 median=0.209us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_candidate_resolve round=3 median=0.209us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_candidate_resolve round=4 median=0.209us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_candidate_resolve round=5 median=0.208us candidates=6250 values=1
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_search_subset round=1 median=243.625us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_search_subset round=2 median=241.125us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_search_subset round=3 median=248.167us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_search_subset round=4 median=250.417us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=idx_search_subset round=5 median=243.416us scanned_rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=e2e round=1 median=357.709us k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=e2e round=2 median=337.833us k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=e2e round=3 median=366.750us k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=e2e round=4 median=346.208us k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=current stage=e2e round=5 median=342.250us k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_scalar_eval round=1 median=3452.500us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_scalar_eval round=2 median=3459.375us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_scalar_eval round=3 median=3424.667us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_scalar_eval round=4 median=3506.334us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_scalar_eval round=5 median=3429.708us evaluated_rows=100000 matched=6250
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_copy round=1 median=5606.750us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_copy round=2 median=5725.292us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_copy round=3 median=5632.125us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_copy round=4 median=5698.083us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_copy round=5 median=5732.750us matched=6250 copied_bytes=19343750
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_search round=1 median=127.542us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_search round=2 median=124.250us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_search round=3 median=121.917us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_search round=4 median=125.500us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_search round=5 median=124.708us rows=6250 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_candidate_resolve round=1 median=348.458us candidates=50000 values=8
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_candidate_resolve round=2 median=338.750us candidates=50000 values=8
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_candidate_resolve round=3 median=345.292us candidates=50000 values=8
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_candidate_resolve round=4 median=331.125us candidates=50000 values=8
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_candidate_resolve round=5 median=337.875us candidates=50000 values=8
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_search_subset round=1 median=892.292us scanned_rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_search_subset round=2 median=881.125us scanned_rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_search_subset round=3 median=859.833us scanned_rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_search_subset round=4 median=882.750us scanned_rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=idx_search_subset round=5 median=909.334us scanned_rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=e2e round=1 median=1898.791us k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=e2e round=2 median=1917.666us k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=e2e round=3 median=2058.333us k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=e2e round=4 median=1906.167us k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=current stage=e2e round=5 median=1926.667us k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_scalar_eval round=1 median=4292.792us evaluated_rows=100000 matched=50000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_scalar_eval round=2 median=4305.834us evaluated_rows=100000 matched=50000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_scalar_eval round=3 median=4303.625us evaluated_rows=100000 matched=50000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_scalar_eval round=4 median=4345.208us evaluated_rows=100000 matched=50000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_scalar_eval round=5 median=4262.250us evaluated_rows=100000 matched=50000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_copy round=1 median=18180.625us matched=50000 copied_bytes=154750000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_copy round=2 median=16751.708us matched=50000 copied_bytes=154750000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_copy round=3 median=16629.209us matched=50000 copied_bytes=154750000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_copy round=4 median=16682.625us matched=50000 copied_bytes=154750000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_copy round=5 median=16698.042us matched=50000 copied_bytes=154750000
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_search round=1 median=649.083us rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_search round=2 median=627.334us rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_search round=3 median=630.750us rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_search round=4 median=636.333us rows=50000 k=10
+relational_p95: stage_round group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_search round=5 median=635.375us rows=50000 k=10
+relational_p95: stage_summary group=predicate arm=pred_eq path=current stage=idx_candidate_resolve samples=100 median=0.209us q1=0.208us q3=0.250us min=0.166us candidates=6250 values=1
+relational_p95: stage_summary group=predicate arm=pred_eq path=current stage=idx_search_subset samples=100 median=243.583us q1=240.750us q3=247.541us min=231.750us scanned_rows=6250 k=10
+relational_p95: stage_summary group=predicate arm=pred_eq path=current stage=e2e samples=100 median=345.291us q1=337.917us q3=357.416us min=324.291us k=10
+relational_p95: stage_summary group=predicate arm=pred_eq path=plain_scan_ref stage=plain_scalar_eval samples=100 median=3088.166us q1=3041.709us q3=3137.333us min=2921.584us evaluated_rows=100000 matched=6250
+relational_p95: stage_summary group=predicate arm=pred_eq path=plain_scan_ref stage=plain_copy samples=100 median=5253.291us q1=5197.375us q3=5368.916us min=5058.000us matched=6250 copied_bytes=19343750
+relational_p95: stage_summary group=predicate arm=pred_eq path=plain_scan_ref stage=plain_search samples=100 median=124.209us q1=120.750us q3=128.959us min=112.041us rows=6250 k=10
+relational_p95: stage_summary group=predicate arm=pred_or2 path=current stage=idx_candidate_resolve samples=100 median=85.125us q1=81.667us q3=85.334us min=76.292us candidates=12500 values=2
+relational_p95: stage_summary group=predicate arm=pred_or2 path=current stage=idx_search_subset samples=100 median=358.125us q1=351.042us q3=363.666us min=343.334us scanned_rows=12500 k=10
+relational_p95: stage_summary group=predicate arm=pred_or2 path=current stage=e2e samples=100 median=618.083us q1=600.334us q3=646.209us min=579.958us k=10
+relational_p95: stage_summary group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_scalar_eval samples=100 median=3499.958us q1=3475.666us q3=3551.750us min=3442.375us evaluated_rows=100000 matched=12500
+relational_p95: stage_summary group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_copy samples=100 median=7286.459us q1=7210.208us q3=7436.083us min=7076.000us matched=12500 copied_bytes=38687500
+relational_p95: stage_summary group=predicate arm=pred_or2 path=plain_scan_ref stage=plain_search samples=100 median=171.667us q1=166.084us q3=179.667us min=153.792us rows=12500 k=10
+relational_p95: stage_summary group=predicate arm=pred_in2 path=current stage=idx_candidate_resolve samples=100 median=83.708us q1=78.375us q3=85.084us min=75.875us candidates=12500 values=2
+relational_p95: stage_summary group=predicate arm=pred_in2 path=current stage=idx_search_subset samples=100 median=360.667us q1=355.500us q3=369.958us min=343.792us scanned_rows=12500 k=10
+relational_p95: stage_summary group=predicate arm=pred_in2 path=current stage=e2e samples=100 median=616.208us q1=602.458us q3=640.667us min=571.250us k=10
+relational_p95: stage_summary group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_scalar_eval samples=100 median=3457.875us q1=3435.458us q3=3481.666us min=3362.166us evaluated_rows=100000 matched=12500
+relational_p95: stage_summary group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_copy samples=100 median=7191.250us q1=7133.291us q3=7314.708us min=6740.584us matched=12500 copied_bytes=38687500
+relational_p95: stage_summary group=predicate arm=pred_in2 path=plain_scan_ref stage=plain_search samples=100 median=180.166us q1=173.250us q3=188.208us min=158.542us rows=12500 k=10
+relational_p95: stage_summary group=predicate arm=pred_or_same path=current stage=idx_candidate_resolve samples=100 median=0.209us q1=0.208us q3=0.250us min=0.167us candidates=6250 values=1
+relational_p95: stage_summary group=predicate arm=pred_or_same path=current stage=idx_search_subset samples=100 median=245.542us q1=240.708us q3=259.292us min=215.500us scanned_rows=6250 k=10
+relational_p95: stage_summary group=predicate arm=pred_or_same path=current stage=e2e samples=100 median=348.708us q1=340.375us q3=364.167us min=330.042us k=10
+relational_p95: stage_summary group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_scalar_eval samples=100 median=3442.625us q1=3428.334us q3=3479.792us min=3399.125us evaluated_rows=100000 matched=6250
+relational_p95: stage_summary group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_copy samples=100 median=5690.959us q1=5635.792us q3=5732.750us min=5452.333us matched=6250 copied_bytes=19343750
+relational_p95: stage_summary group=predicate arm=pred_or_same path=plain_scan_ref stage=plain_search samples=100 median=124.792us q1=121.833us q3=129.333us min=113.625us rows=6250 k=10
+relational_p95: stage_summary group=predicate arm=pred_in8 path=current stage=idx_candidate_resolve samples=100 median=339.333us q1=332.792us q3=348.083us min=304.167us candidates=50000 values=8
+relational_p95: stage_summary group=predicate arm=pred_in8 path=current stage=idx_search_subset samples=100 median=892.292us q1=848.958us q3=923.334us min=817.500us scanned_rows=50000 k=10
+relational_p95: stage_summary group=predicate arm=pred_in8 path=current stage=e2e samples=100 median=1936.666us q1=1850.167us q3=2037.208us min=1666.667us k=10
+relational_p95: stage_summary group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_scalar_eval samples=100 median=4300.166us q1=4276.375us q3=4315.333us min=4207.666us evaluated_rows=100000 matched=50000
+relational_p95: stage_summary group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_copy samples=100 median=16791.458us q1=16624.917us q3=17143.458us min=16186.542us matched=50000 copied_bytes=154750000
+relational_p95: stage_summary group=predicate arm=pred_in8 path=plain_scan_ref stage=plain_search samples=100 median=636.333us q1=616.042us q3=649.083us min=583.292us rows=50000 k=10
+relational_p95: stage_diff group=predicate arm=pred_eq path=current residual_median=101.499us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_eq path=plain_scan_ref c_median=2165.125us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_or2 path=current residual_median=174.833us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_or2 path=plain_scan_ref c_median=3786.501us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_in2 path=current residual_median=171.833us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_in2 path=plain_scan_ref c_median=3733.375us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_or_same path=current residual_median=102.957us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_or_same path=plain_scan_ref c_median=2248.334us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_in8 path=current residual_median=705.041us (median-based; n/a when inverted by noise)
+relational_p95: stage_diff group=predicate arm=pred_in8 path=plain_scan_ref c_median=12491.292us (median-based; n/a when inverted by noise)
+threshold_judgement: dedicated environment attested; compare min_of_n against the spec criteria manually
