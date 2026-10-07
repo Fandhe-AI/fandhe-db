@@ -29,6 +29,15 @@ use std::time::Duration;
 use wire_server::auth::UserStore;
 use wire_server::limits::ConnectionLimiter;
 
+/// プロセス内単調増加の連番を払い出す。一時ディレクトリ名へ時刻・pid と併せて
+/// 埋め込み、名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、
+/// 同一プロセス内で並列実行されるテスト同士が時刻だけでは衝突し
+/// `create_dir` が `AlreadyExists` で失敗しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const TEST_SCRAM_MOCK_KEY_SECRET: &[u8] = b"wire-scram-psql-interop-test-mock-key-secret!!";
 
 /// `PLUS` 提示有効・無効 × `channel_binding` 設定 3 通りに対して実測済みの
@@ -50,12 +59,13 @@ enum Expected {
 
 fn write_scram_user_store_file(username: &str, password: &[u8]) -> fixture_guard::UserStoreFile {
     let dir = std::env::temp_dir().join(format!(
-        "wire-server-psql-interop-{}-{}",
+        "wire-server-psql-interop-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&dir).expect("create unique fixture dir");
     let path = dir.join("users.txt");

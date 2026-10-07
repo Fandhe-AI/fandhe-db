@@ -8,6 +8,14 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+
+/// プロセス内単調増加の連番を払い出す。一時パス名へ時刻・pid と併せて埋め込み、
+/// 名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、同一
+/// プロセス内で並列実行されるテスト同士が時刻だけでは衝突しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 use wire_server::tls::pem::{
     self, CertificateLoadError, FileLoadError, LegacyKeyFormat, PemError, TlsFileError,
 };
@@ -30,12 +38,13 @@ fn hex_decode(hex: &str) -> Vec<u8> {
 /// 既存の `crates/wire-server/tests/common/mod.rs` と同じ方式）。
 fn unique_temp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "tls-pem-pkcs8-e2e-{label}-{}-{}",
+        "tls-pem-pkcs8-e2e-{label}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        next_fixture_seq()
     ))
 }
 

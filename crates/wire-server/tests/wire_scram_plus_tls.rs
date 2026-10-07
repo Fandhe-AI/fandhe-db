@@ -27,6 +27,15 @@ use wire_server::tls::ed25519::SigningKey;
 use wire_server::tls::server_handshake::TlsServerConfig;
 use wire_server::tls::x509::ServerCertificateChain;
 
+/// プロセス内単調増加の連番を払い出す。一時ディレクトリ名へ時刻・pid と併せて
+/// 埋め込み、名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、
+/// 同一プロセス内で並列実行されるテスト同士が時刻だけでは衝突し
+/// `create_dir` が `AlreadyExists` で失敗しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 
 fn write_ssl_request(stream: &mut TcpStream) {
@@ -211,12 +220,13 @@ fn write_scram_user_store_file(password: &[u8]) -> fixture_guard::UserStoreFile 
     // `tests/wire_scram_auth.rs::write_scram_user_store_file` と同型
     // （SCRAM 検証子を持つユーザーストアを直接書く、本ファイル専用の実装）。
     let dir = std::env::temp_dir().join(format!(
-        "wire-server-wire-scram-plus-tls-{}-{}",
+        "wire-server-wire-scram-plus-tls-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&dir).expect("create unique fixture dir");
     let path = dir.join("users.txt");

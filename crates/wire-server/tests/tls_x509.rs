@@ -9,6 +9,14 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+/// プロセス内単調増加の連番を払い出す。一時パス名へ時刻・pid と併せて埋め込み、
+/// 名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、同一
+/// プロセス内で並列実行されるテスト同士が時刻だけでは衝突しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 use wire_server::tls::handshake::Certificate as HandshakeCertificate;
 use wire_server::tls::pem;
 use wire_server::tls::x509::{
@@ -17,12 +25,13 @@ use wire_server::tls::x509::{
 
 fn unique_temp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "tls-x509-e2e-{label}-{}-{}",
+        "tls-x509-e2e-{label}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        next_fixture_seq()
     ))
 }
 
