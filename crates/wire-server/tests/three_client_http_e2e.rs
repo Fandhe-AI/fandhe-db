@@ -189,6 +189,15 @@ use engine::policy::PolicyContext;
 use engine::row_codec::Value;
 use engine::storage::{Storage, Visibility};
 
+/// プロセス内単調増加の連番を払い出す。一時ディレクトリ名へ時刻・pid と併せて
+/// 埋め込み、名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、
+/// 同一プロセス内で並列実行されるテスト同士が時刻だけでは衝突し
+/// `create_dir` が `AlreadyExists` で失敗しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 環境変数 `CURL_BIN` で上書きできるツール解決。未指定時は `PATH` 上の
 /// `curl` を使う（`three_client_e2e.rs::resolve_tool` と同型）。ツール自体の
 /// 存在確認はしない（`Command::spawn` の失敗として顕在化させ、呼び出し元が
@@ -1387,13 +1396,14 @@ fn run_session_search_close_scenario(client: HttpClient) {
     // urllib／fetch は使わないが、`HttpClient::post` のシグネチャ統一のため
     // 引数として受け取る。
     let out_dir = std::env::temp_dir().join(format!(
-        "wire-server-three-client-http-e2e-{}-out-{}-{}",
+        "wire-server-three-client-http-e2e-{}-out-{}-{}-{}",
         client.label(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&out_dir).expect("create client output dir");
     let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
@@ -1607,13 +1617,14 @@ fn run_sql_nosql_parity_scenario(client: HttpClient) {
     let (nosql_server, nosql_port) = spawn_nosql_server(&users_path_str, &db_path_str);
 
     let out_dir = std::env::temp_dir().join(format!(
-        "wire-server-three-client-http-e2e-parity-{}-out-{}-{}",
+        "wire-server-three-client-http-e2e-parity-{}-out-{}-{}-{}",
         client.label(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&out_dir).expect("create client output dir");
     let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
@@ -2560,13 +2571,14 @@ fn run_sql_nosql_dml_parity_scenario(client: HttpClient) {
     let users_path_str = users_path.to_str().expect("utf-8 users path").to_string();
 
     let out_dir = std::env::temp_dir().join(format!(
-        "wire-server-three-client-http-e2e-dml-{}-out-{}-{}",
+        "wire-server-three-client-http-e2e-dml-{}-out-{}-{}-{}",
         client.label(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&out_dir).expect("create client output dir");
     let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
@@ -3117,13 +3129,14 @@ fn run_phase7_write_parity_scenario(client: HttpClient) {
     let users_path_str = users_path.to_str().expect("utf-8 users path").to_string();
 
     let out_dir = std::env::temp_dir().join(format!(
-        "wire-server-three-client-http-e2e-ddl-{}-out-{}-{}",
+        "wire-server-three-client-http-e2e-ddl-{}-out-{}-{}-{}",
         client.label(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&out_dir).expect("create client output dir");
     let _out_dir_guard = CurlOutDirGuard(out_dir.clone());
@@ -3417,13 +3430,14 @@ fn run_fk_referential_action_parity_scenario(client: HttpClient) {
     let users_path_str = users_path.to_str().expect("utf-8 users path").to_string();
 
     let out_dir = std::env::temp_dir().join(format!(
-        "wire-server-three-client-http-e2e-fk-{}-out-{}-{}",
+        "wire-server-three-client-http-e2e-fk-{}-out-{}-{}-{}",
         client.label(),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&out_dir).expect("create client output dir");
     let _out_dir_guard = CurlOutDirGuard(out_dir.clone());

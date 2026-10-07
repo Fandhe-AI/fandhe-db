@@ -17,6 +17,14 @@ use wire_server::result_encoder::{
     ResultFormats,
 };
 
+/// プロセス内単調増加の連番を払い出す。一時パス名へ時刻・pid と併せて埋め込み、
+/// 名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、同一
+/// プロセス内で並列実行されるテスト同士が時刻だけでは衝突しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn i32_at(msg: &[u8], idx: usize) -> i32 {
     let bytes: [u8; 4] = msg
         .get(idx..idx + 4)
@@ -167,12 +175,13 @@ fn enum_column_binary_request_is_rejected_as_feature_not_supported() {
     // 型登録だけ行う（`ColumnMeta::Scalar { ty }` の判定は型定義の中身
     // 〔語彙〕を一切参照しないため、これで十分）。
     let path = std::env::temp_dir().join(format!(
-        "wire14-binary-format-enum-{}-{}.redb",
+        "wire14-binary-format-enum-{}-{}-{}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     let storage = engine::storage::Storage::open(&path).expect("open throwaway storage");
     let def = storage

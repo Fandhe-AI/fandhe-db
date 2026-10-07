@@ -56,6 +56,15 @@ use wire_server::limits::ConnectionLimiter;
 use wire_server::tls::server_handshake::TlsServerConfig;
 use wire_server::tls_opt::TlsMode;
 
+/// プロセス内単調増加の連番を払い出す。一時ディレクトリ名へ時刻・pid と併せて
+/// 埋め込み、名前を一意にする。macOS の `SystemTime` はマイクロ秒分解能のため、
+/// 同一プロセス内で並列実行されるテスト同士が時刻だけでは衝突し
+/// `create_dir` が `AlreadyExists` で失敗しうる（Issue #1463）。
+fn next_fixture_seq() -> u64 {
+    static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[path = "common/tls_client.rs"]
 mod tls_client;
 
@@ -282,12 +291,13 @@ impl Drop for FixtureDirGuard {
 #[test]
 fn tls_session_query_close_round_trip_completes_over_tls() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-{}-{}",
+        "wire-server-http10-tls-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -358,12 +368,13 @@ fn tls_session_query_close_round_trip_completes_over_tls() {
 #[test]
 fn plaintext_http_is_closed_without_response_when_tls_required() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r2-{}-{}",
+        "wire-server-http10-tls-r2-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -404,12 +415,13 @@ fn plaintext_http_is_closed_without_response_when_tls_required() {
 #[test]
 fn allow_mode_accepts_both_plaintext_and_tls() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r3-{}-{}",
+        "wire-server-http10-tls-r3-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -464,12 +476,13 @@ fn allow_mode_accepts_both_plaintext_and_tls() {
 #[test]
 fn malformed_client_hello_does_not_crash_or_affect_later_connections() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r4-{}-{}",
+        "wire-server-http10-tls-r4-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -541,12 +554,13 @@ fn wait_for_permit_active(limiter: &ConnectionLimiter) {
 #[test]
 fn allow_mode_still_returns_503_for_plaintext_over_capacity() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r5-{}-{}",
+        "wire-server-http10-tls-r5-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -601,12 +615,13 @@ fn allow_mode_still_returns_503_for_plaintext_over_capacity() {
 #[test]
 fn require_mode_closes_over_capacity_connection_without_response() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r6-{}-{}",
+        "wire-server-http10-tls-r6-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -646,12 +661,13 @@ fn require_mode_closes_over_capacity_connection_without_response() {
 #[test]
 fn allow_mode_returns_503_over_tls_for_tls_over_capacity() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r8-{}-{}",
+        "wire-server-http10-tls-r8-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
@@ -701,12 +717,13 @@ fn allow_mode_returns_503_over_tls_for_tls_over_capacity() {
 #[test]
 fn tls_trickle_within_one_record_is_bounded_by_absolute_read_deadline() {
     let fixture_dir = std::env::temp_dir().join(format!(
-        "wire-server-http10-tls-r7-{}-{}",
+        "wire-server-http10-tls-r7-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        next_fixture_seq()
     ));
     std::fs::create_dir(&fixture_dir).expect("create fixture dir");
     let _fixture_guard = FixtureDirGuard(fixture_dir.clone());
