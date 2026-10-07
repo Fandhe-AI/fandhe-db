@@ -1,7 +1,7 @@
 # 述語・順序・結合の p95 計測ベンチ
 
 - ステータス: Accepted（計測入口の追加と、共有環境での参考値の記録）
-- 対応: Issue #1204（親 #1206）、専有環境での再測定手順は Issue #1320、専有環境での再測定結果は Issue #1321
+- 対応: Issue #1204（親 #1206）、専有環境での再測定手順は Issue #1320、本規模・専有申告ありの参考計測は Issue #1321（CPU 共有があり確定判定には使わない）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-24・SQL-25・SQL-28、RLS-10（spec 本文は転記しない）
 
 ## 目的
@@ -96,7 +96,7 @@ BENCH_RELATIONAL_P95_ROWS=5000 make bench-relational-p95
 
 ## スコープ外と申し送り
 
-- 専有環境での再測定と spec 閾値の確定判定 → 実施済み（Issue #1321。下記「専有環境での再測定結果（Issue #1321）」。判定対象の全 arm が pass）
+- 専有環境での再測定と spec 閾値の確定判定（オーナー作業。未了）。Issue #1321 で本規模・専有申告ありの計測を行ったが、GUI 常駐プロセスと CPU を共有していたため参考値に留めた（下記「本規模・専有申告ありの計測結果（Issue #1321。参考値）」）
 - `bench.yml` への配線（本ベンチは手動実行専用）
 - 3 テーブル以上の結合と、結合でのスカラー `ORDER BY`／`OR`／`IN`
 - `OFFSET`・`DISTINCT`・集計文の `ORDER BY` 形の p95
@@ -290,14 +290,14 @@ BENCH_RELATIONAL_P95_GROUP=predicate BENCH_RELATIONAL_P95_ROWS=20000 make bench-
   （amortized 成長に伴う再確保・ページ確保の費用が選択率とともに増える）
 - 選択率が低い（6.25%）arm では F が全体の主役だが、選択率が高い arm（`pred_in8` の 50%）では c が F の約 16 倍になり支配的になる。
   改善案 C（複製しない経路）は一致件数が多い述語ほど効く。改善案 B（索引の和集合）は F と c の両方を削る。
-  異なる列にまたがる OR のように PlainScan が残る形では F が残るため、C 単独の効果は c の分に限られる。優先度の確定は専有環境の再測定（オーナー作業）で行う（本規模・専有環境の内訳は「専有環境での再測定結果（Issue #1321）」に記録済み。要否の判断は #1322）
+  異なる列にまたがる OR のように PlainScan が残る形では F が残るため、C 単独の効果は c の分に限られる。優先度の確定は専有環境の再測定（オーナー作業）で行う（本規模の内訳は「本規模・専有申告ありの計測結果（Issue #1321。参考値）」に参考値として記録済み。要否の判断は #1322）
 - 現 HEAD の索引経路（`current`）では、`idx_search_subset`（距離計算）と SQL 表層の固定費（`residual`）が大半を占め、候補解決は `pred_in8` でも約 60 us に収まる
 - 上記の差・比率は共有環境の median 同士で、Q1〜Q3 の幅が広い段（`pred_in2` の F など）はノイズを含む。専有環境の再測定までは傾向としてのみ扱う
 
 ## 専有環境での再測定（Issue #1320）
 
 SQL-24・SQL-25・SQL-28・SQL-2 の数値基準（ポインタ）の確定判定に使う、専有環境での再測定手順と記録の雛形である。
-実行と判定はオーナーが行う（本節は手順書であり、本規模の実測値は含まない。実測値と判定は「専有環境での再測定結果（Issue #1321）」節）。
+実行と判定はオーナーが行う（本節は手順書であり、本規模の実測値は含まない。本規模の参考値は「本規模・専有申告ありの計測結果（Issue #1321。参考値）」節）。
 絶対閾値の確定判定が専有環境でのみ可能である理由は [benchmark-judgement-policy](./benchmark-judgement-policy.md) §5 を参照する。
 前例は [c1-p95-dedicated-env-reverification](./c1-p95-dedicated-env-reverification.md)。
 
@@ -488,14 +488,16 @@ arm 別 p95（単位 ms）。`BENCH_RELATIONAL_P95_ROUNDS` を 5 より大きく
 
 確認できていないこと: macOS 経路（`sysctl`／`pmset` の手順と loadavg の表示）、perf 手順（§5）、本規模での所要時間・メモリ使用量。
 
-## 専有環境での再測定結果（Issue #1321）
+## 本規模・専有申告ありの計測結果（Issue #1321。参考値）
 
 SQL-24・SQL-25・SQL-28・SQL-2 ポインタ。「専有環境での再測定（Issue #1320）」節の §1〜§4 の手順で本規模（既定行数・既定 5 ラウンド）を測り、
 §6 の雛形で記録した。§5（perf）は行っていない。生ログは
 [bench-data/relational-p95-dedicated/](./bench-data/relational-p95-dedicated/)（`20261007T023235Z-{predicate,order_by,join}.log`）にある。
 3 グループとも終了コード 0 で、各ログの最終行は `threshold_judgement: dedicated environment attested; compare min_of_n against the spec criteria manually` だった。
 
-**結果: 判定対象の 6 arm はすべて pass**（最大は `order_multi` の `min_of_n` 34.888 ms・`median` 35.484 ms。基準 100 ms 以下）。
+**本節の値は参考値であり、spec 閾値の確定判定には使わない。** `BENCH_DEDICATED_ENV=1` はオーナーの承認のもとで申告したが、計測中は GUI 常駐プロセス（下記「同時実行プロセスの確認結果」）と CPU を共有しており、[benchmark-judgement-policy](./benchmark-judgement-policy.md) §2 の専有環境（他プロセスと CPU/IO リソースを共有しない環境）の定義を満たさない。ベンチ出力の `attested` は自己申告を反映した表示にすぎない。確定判定は、CPU/IO を共有しない状態での再測定（オーナー作業）で行う。
+
+**結果（参考）: 判定対象の 6 arm はすべて `min_of_n`・`median` とも基準（100 ms 以下）以内だった**（最大は `order_multi` の `min_of_n` 34.888 ms・`median` 35.484 ms）。
 
 環境記録:
 
@@ -548,16 +550,16 @@ arm 別 p95（単位 ms）。`pred_eq` はラウンド内で各候補 arm の直
 | `pred_or2` | 12,500 | 3,499.958（3,475.666〜3,551.750） | 7,286.459（7,210.208〜7,436.083） | 3,786.501 | 171.667（166.084〜179.667） | 38,687,500 |
 | `pred_in8` | 50,000 | 4,300.166（4,276.375〜4,315.333） | 16,791.458（16,624.917〜17,143.458） | 12,491.292 | 636.333（616.042〜649.083） | 154,750,000 |
 
-判定（各グループの `threshold_judgement:` 行: predicate = `dedicated environment attested; compare min_of_n against the spec criteria manually`／order_by = 同左／join = 同左）:
+基準との比較（参考。確定判定ではない。各グループの `threshold_judgement:` 行: predicate = `dedicated environment attested; compare min_of_n against the spec criteria manually`／order_by = 同左／join = 同左）:
 
-| arm | 対応 ID | 基準 | `min_of_n` | `median` | 判定（pass・fail・要再測定・対象外） | 備考 |
+| arm | 対応 ID | 基準 | `min_of_n` | `median` | 基準との比較（参考） | 備考 |
 | --- | ------- | ---- | ---------- | -------- | ------------------------------------ | ---- |
-| `pred_or2` | SQL-24 | 100 ms 以下 | 0.647 ms | 0.651 ms | pass | 経路は `index_in_list`（`path arm=` 行。PlainScan fallback 0） |
-| `pred_in8` | SQL-24 | 100 ms 以下 | 2.040 ms | 2.082 ms | pass | 経路は `index_in_list` |
-| `pred_eq` | SQL-2 | 100 ms 以下 | 0.371 ms | 0.374 ms | pass | 参照 arm。経路は `index_equality` |
-| `order_single` | SQL-25 | 100 ms 以下 | 34.381 ms | 34.795 ms | pass | - |
-| `order_multi` | SQL-25 | 100 ms 以下 | 34.888 ms | 35.484 ms | pass | - |
-| `join_inner` | SQL-28 | 100 ms 以下 | 4.131 ms | 4.163 ms | pass | 各 10,000 行 |
+| `pred_or2` | SQL-24 | 100 ms 以下 | 0.647 ms | 0.651 ms | 基準以内 | 経路は `index_in_list`（`path arm=` 行。PlainScan fallback 0） |
+| `pred_in8` | SQL-24 | 100 ms 以下 | 2.040 ms | 2.082 ms | 基準以内 | 経路は `index_in_list` |
+| `pred_eq` | SQL-2 | 100 ms 以下 | 0.371 ms | 0.374 ms | 基準以内 | 参照 arm。経路は `index_equality` |
+| `order_single` | SQL-25 | 100 ms 以下 | 34.381 ms | 34.795 ms | 基準以内 | - |
+| `order_multi` | SQL-25 | 100 ms 以下 | 34.888 ms | 35.484 ms | 基準以内 | - |
+| `join_inner` | SQL-28 | 100 ms 以下 | 4.131 ms | 4.163 ms | 基準以内 | 各 10,000 行 |
 | `pred_in2` | 診断用（#1275） | - | 0.637 ms | 0.656 ms | 対象外 | 参考 |
 | `pred_or_same` | 診断用（#1275） | - | 0.376 ms | 0.381 ms | 対象外 | 参考 |
 
@@ -574,4 +576,4 @@ arm 別 p95（単位 ms）。`pred_eq` はラウンド内で各候補 arm の直
 - F と c は `plain_scan_ref`（#1275 時点の PlainScan 経路の反実仮想）の値で、現 HEAD の `pred_or2`・`pred_in8` の e2e には含まれない。現 HEAD の e2e では `idx_search_subset`（距離計算）が最大の段で、次が SQL 表層の固定費（`residual`）である
 - c ÷ F は一致件数とともに増える（6,250 件で 0.65〜0.70、12,500 件で 1.08、50,000 件で 2.90）。縮小規模・共有環境の参考値（`pred_in8` で約 16）より比は小さいが、選択率が高い arm ほど c が支配的という傾向は同じである
 
-判定後の申し送り: 本結果（とくに上の段の構成比と F・c の内訳）は #1322（改善案 B・C の要否判断）の判断材料とする。Issue の起票は行っていない（オーナー判断）。
+申し送り: spec 閾値の確定判定は、CPU/IO を共有しない状態での再測定（オーナー作業）として残る。本結果（とくに上の段の構成比と F・c の内訳）は参考値として #1322（改善案 B・C の要否判断）の材料にできる。Issue の起票は行っていない（オーナー判断）。
