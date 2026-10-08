@@ -27,7 +27,7 @@
 //!
 //! `D`（detail）フィールド（`RECOVER-5` (3)・commit 後 panic 時の `state=
 //! may_be_committed` 相当の情報）の wire 形式は ERR-5（2026-09-14 確定・
-//! `vector-db-spec#15`。ポインタ: TASK-153）により確定し、[`encode_with_detail`]
+//! `fandhe-db-spec#15`。ポインタ: TASK-153）により確定し、[`encode_with_detail`]
 //! で追加できるようになった。通常応答（[`encode`]）は従来どおり `S`/`C`/`M` の
 //! 3 フィールドのみで `D` を付けない契約を維持する。`crate::simple_query::
 //! build_emergency_response_bytes`（緊急応答チャネル）は本モジュールの

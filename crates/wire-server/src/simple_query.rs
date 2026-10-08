@@ -941,7 +941,7 @@ fn respond_command_complete_with<S: WireStream>(
 /// commit 成功後の panic を「サイレントな接続断」ではなく同期的な ErrorResponse
 /// として観測でき（RECOVER-6 が防ぐ範囲）、`D` フィールドにより「commit は
 /// 成功しているかもしれない」という状態情報も併せて受け取れる（ERR-5・
-/// 2026-09-14 確定・`vector-db-spec#15`。`crate::error_response` モジュール
+/// 2026-09-14 確定・`fandhe-db-spec#15`。`crate::error_response` モジュール
 /// ドキュメント参照）。
 ///
 /// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約

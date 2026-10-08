@@ -696,7 +696,7 @@ impl RerankRecallResult {
             .saturating_sub(self.baseline_hits20)
     }
 
-    /// SEARCH-7（vector-db-spec#7）の相対基準と同じ定義（`rerank_recall.rs::
+    /// SEARCH-7（fandhe-db-spec#7）の相対基準と同じ定義（`rerank_recall.rs::
     /// RerankRecallResult::improvement_ratio` と同一ロジック）。改善余地が
     /// コーパス全体理論上限 `ceil20` の 1% 未満なら `None`（分母 0 近傍の不安定化を
     /// 避ける fail-closed 対策）。

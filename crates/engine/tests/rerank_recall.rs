@@ -37,7 +37,7 @@
 //!   ブロッキング条件とする閾値ゲート。改善幅（[`RerankRecallResult::
 //!   improvement_ratio`]＝候補プール上限に対する相対比率
 //!   `(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`）は
-//!   SEARCH-7 改訂（2026-08-31・vector-db-spec#8）により実コーパス評価まで
+//!   SEARCH-7 改訂（2026-08-31・fandhe-db-spec#8）により実コーパス評価まで
 //!   informational（非ブロッキング）へ降格した——Issue #330・#333・#337 で
 //!   字句一致方式・クロスエンコーダ方式の 2 方式 × 2 fixture の全実測が
 //!   improvement_ratio 0.222・0 で下限未達であり、原因が合成 fixture 側の
@@ -384,7 +384,7 @@ impl RerankRecallResult {
     /// 全体理論上限 `ceil20` の 1%（`< 0.01 × ceil20`）未満の場合は、構造的にほぼ
     /// 改善不可能な状況であり相対比率の分母が 0 に近づき不安定になるため `None` を
     /// 返す（fail-closed の分母 0 対策を兼ねる）。この値は SEARCH-7 改訂
-    /// （2026-08-31・vector-db-spec#8）により実コーパス評価まで informational
+    /// （2026-08-31・fandhe-db-spec#8）により実コーパス評価まで informational
     /// （非ブロッキング。層 B ゲートの判定には使わない）。層 A・層 B いずれも実測値の
     /// ログ出力にのみ使う。
     fn improvement_ratio(&self) -> Option<f64> {
@@ -753,7 +753,7 @@ fn rerank_recall_large_scale_regression() {
     // 構造的上限（`docs/design/rerank-recall-regression.md`「Issue #330」節参照）
     // まで改善幅を引き上げた（after 389 ≥ baseline 387。採用比率の実測は同節参照）。
     //
-    // 同 Issue #330（vector-db-spec#7 改訂・SEARCH-7）でゲート側の基準を絶対差
+    // 同 Issue #330（fandhe-db-spec#7 改訂・SEARCH-7）でゲート側の基準を絶対差
     // （after − baseline）から候補プール上限に対する相対比率
     // （[`RerankRecallResult::improvement_ratio`]。分母 `pool_ceiling_hits20 −
     // baseline_hits20` が構造的な改善余地を表す）へ再定義した。字句信号の構造的
@@ -1036,7 +1036,7 @@ mod verbose_gate_tests {
 /// `RERANK_RECALL_MIN_R20_LARGE`（絶対下限）以上、かつ非劣化
 /// （`after_hits20 >= baseline_hits20`）を保つことを確認する閾値ゲート。
 /// baseline からの改善幅（[`RerankRecallResult::improvement_ratio`]）は
-/// SEARCH-7 改訂（2026-08-31・vector-db-spec#8）により実コーパス評価まで
+/// SEARCH-7 改訂（2026-08-31・fandhe-db-spec#8）により実コーパス評価まで
 /// informational（非ブロッキング）へ降格した——2 方式（字句一致・クロス
 /// エンコーダ）× 2 fixture の全実測が下限未達で、原因が合成 fixture 側の構造要因と
 /// 判明したため（`docs/design/rerank-recall-regression.md`「SEARCH-7 改訂
@@ -1112,7 +1112,7 @@ fn rerank_recall_large_scale_threshold_gate() {
     );
 
     // 改善幅は informational（非ブロッキング。SEARCH-7 改訂 2026-08-31・
-    // vector-db-spec#8）。判定に使わない実測値のため `verbose`／`GITHUB_ACTIONS` の
+    // fandhe-db-spec#8）。判定に使わない実測値のため `verbose`／`GITHUB_ACTIONS` の
     // 有無にかかわらず常時出力する（閾値近傍の詳細出力を絞る `render_gate_line` の
     // verbose ゲートとは別扱い。codex-review P1・PR #340: informational な
     // improvement_ratio の実測値が通常 CI 実行〔`GITHUB_ACTIONS` 下で
