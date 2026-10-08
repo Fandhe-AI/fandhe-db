@@ -212,7 +212,7 @@ collect_env_cpu_lines() {
 cd "${REPO_ROOT}"
 
 echo "building knn_profile_bench (release, once)"
-cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run
+cargo bench --bench knn_profile_bench -p fandhe-db-engine --no-run
 
 log_noise() {
   local log="$1"
@@ -245,7 +245,7 @@ run_hot_only() {
     BENCH_KNN_PROFILE_ENGINE="${engine}" \
     BENCH_KNN_PROFILE_SCALE="${scale}" \
     BENCH_KNN_PROFILE_DIM="${dim}" \
-    cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine >>"${log}" 2>&1
+    cargo bench --bench knn_profile_bench -p fandhe-db-engine >>"${log}" 2>&1
 }
 
 for point in "${AB_POINTS_ARR[@]}"; do
@@ -279,7 +279,7 @@ for point in "${AB_MEMORY_POINTS_ARR[@]}"; do
         BENCH_KNN_PROFILE_ENGINE="${engine}" \
         BENCH_KNN_PROFILE_SCALE="${scale}" \
         BENCH_KNN_PROFILE_DIM="${dim}" \
-        cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine >>"${log}" 2>&1
+        cargo bench --bench knn_profile_bench -p fandhe-db-engine >>"${log}" 2>&1
     done
   done
 done

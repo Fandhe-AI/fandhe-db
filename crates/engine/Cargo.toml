@@ -6,7 +6,7 @@
 # ため org 接頭辞付きの名前で公開する。ライブラリ名は下記 `[lib] name = "engine"` で
 # 据え置き、ソース内の `use engine::...`・`cargo test`/`bench` の `--test`/`--bench` 名は
 # 不変。`-p`/`--package` で指定するパッケージ名だけが変わる。
-name = "fandhe-vector-db-engine"
+name = "fandhe-db-engine"
 version = "0.2.0"
 edition.workspace = true
 license.workspace = true
@@ -29,7 +29,7 @@ redb = "=4.2.0"
 # `contrast_bench.rs` から対照エンジン（総当たり厳密最近傍）として呼び出すことのみで、
 # `src/` 配下（ライブラリ公開面）は本依存に一切依存しない。`optional = true` ＋
 # 下記 `contrast-bench` feature 限定とし、`wire-server` バイナリはリンクしない
-# （`cargo tree -p fandhe-vector-db-wire-server` に出現しないことを CI 外の手元確認で担保）。
+# （`cargo tree -p fandhe-db-wire-server` に出現しないことを CI 外の手元確認で担保）。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 usearch = { version = "=2.26.2", optional = true }
 
@@ -73,7 +73,7 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
 #     最小分。`esaxx_fast`／`progressbar`〔BPE 学習・進捗表示用〕は推論専用の
 #     本用途では不要なため含めない）
 # いずれも optional・下記 `cross-encoder` feature の背後に限定し、`wire-server` は
-# リンクしない（`cargo tree -p fandhe-vector-db-wire-server` に出現しないことを確認済み）。
+# リンクしない（`cargo tree -p fandhe-db-wire-server` に出現しないことを確認済み）。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "load-dynamic",

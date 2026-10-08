@@ -802,7 +802,7 @@ mod tests {
     // 手動で記録する参考値を出力する。採否の根拠にはしない
     // （`docs/design/benchmark-judgement-policy.md` 参照）。
     //
-    // 実行: cargo test -p fandhe-vector-db-wire-server --release \
+    // 実行: cargo test -p fandhe-db-wire-server --release \
     //   aes128_gcm_throughput_reference -- --ignored --nocapture
     #[test]
     #[ignore]

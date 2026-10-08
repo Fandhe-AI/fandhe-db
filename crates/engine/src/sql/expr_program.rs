@@ -1179,7 +1179,7 @@ mod tests {
     /// （再帰ツリーウォーク vs 平坦ステップ列の線形実行）を同一プロセス内で
     /// 直接比較する。両実装は本 PR で並存する（`udf_call::eval` は参照実装として
     /// 残置）ため、この比較は「Issue #353 が変えた部分」の前後差を厳密に表す。
-    /// `cargo test -p fandhe-vector-db-engine --lib sql::expr_program -- --ignored --nocapture`
+    /// `cargo test -p fandhe-db-engine --lib sql::expr_program -- --ignored --nocapture`
     /// で手動実行し、実測値を `docs/design/expr-step-compilation.md` へ転記する
     /// （CI では実行しない。デフォルトでは無視される診断用ベンチのため）。
     #[test]

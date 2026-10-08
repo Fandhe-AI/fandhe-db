@@ -309,7 +309,7 @@ fn power_loss_scenario3_partial_writeback_is_either_consistent_or_rejected() {
 }
 
 // シナリオ 3 の拡張反復（ローカル実行用。CI では実行しない）。
-// `cargo test -p fandhe-vector-db-engine -- --ignored` で実行し、結果は
+// `cargo test -p fandhe-db-engine -- --ignored` で実行し、結果は
 // `docs/design/crash-tolerance-reverification.md` に記録する。
 #[test]
 #[ignore = "拡張反復のためローカル実行用（CI では #[ignore] を外さない）"]

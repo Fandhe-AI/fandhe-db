@@ -13,7 +13,7 @@
 //! （`--insecure`）を必須とする。
 //!
 //! CI には配線しない（curl 依存・`make ci` に含めない）。
-//! `cargo test -p fandhe-vector-db-wire-server --test http10_curl_interop -- --ignored --nocapture`
+//! `cargo test -p fandhe-db-wire-server --test http10_curl_interop -- --ignored --nocapture`
 //! で手動実行する（curl 8.18.0 / OpenSSL 3.5.5 で実測・完走を確認済み。
 //! OpenSSL 3.5 系は ClientHello の `key_share` 先頭に hybrid ML-KEM を
 //! 送るが、本サーバーの ClientHello 解析は複数 group から x25519 を探す

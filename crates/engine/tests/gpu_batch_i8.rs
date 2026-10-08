@@ -272,7 +272,7 @@ fn i8_backend_batch_search_is_deterministic_when_gpu_available() {
 /// 実行自体は `tests/gpu_batch.rs`・`tests/batch_fallback.rs`・
 /// `tests/gpu_scaling_accept.rs` が担うため、本テストはそれらのテストが
 /// 同一バイナリに存在することの索引としてのみ機能する（実 CI コマンドは
-/// `cargo test -p fandhe-vector-db-engine --all-features --test gpu_batch --test
+/// `cargo test -p fandhe-db-engine --all-features --test gpu_batch --test
 /// batch_fallback --test gpu_scaling_accept`。README・実装計画ポインタ）。
 #[test]
 fn existing_gpu_tests_are_run_via_separate_test_binaries_note() {

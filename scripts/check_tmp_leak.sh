@@ -17,8 +17,8 @@ set -euo pipefail
 if [ "${FULL:-0}" = "1" ]; then
   cargo test --workspace --all-features --no-run
 else
-  cargo test -p fandhe-vector-db-wire-server --no-run
-  cargo test -p fandhe-vector-db-engine --lib --no-run
+  cargo test -p fandhe-db-wire-server --no-run
+  cargo test -p fandhe-db-engine --lib --no-run
 fi
 
 LEAK_DIR="$(mktemp -d)"
@@ -29,7 +29,7 @@ if [ "${FULL:-0}" = "1" ]; then
 else
   # in-process + user store / throwaway DB / 子プロセス起動 / TLS フィクスチャ /
   # ガード自身の回帰テスト / wire-server の auth unit test / engine の temp_db。
-  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-vector-db-wire-server \
+  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server \
     --test wire1_simple_query \
     --test wire_auth \
     --test wire_framing \
@@ -38,8 +38,8 @@ else
     --test wire_fault_injection_cli \
     --test http10_tls_surface \
     --test tmp_fixture_cleanup
-  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-vector-db-wire-server --lib auth::
-  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-vector-db-engine --lib test_util
+  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server --lib auth::
+  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-engine --lib test_util
 fi
 
 # 外部ツール由来で除外が必要なエントリが出た場合のみ、理由コメント付きでここへ列挙する。

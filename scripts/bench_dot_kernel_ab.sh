@@ -11,7 +11,7 @@
 # 呼び出し元は人間の運用者（ベンチ本体が手動専用・CI 非配線のため `make`
 # ターゲットは設けない）。呼び出し先は `BEFORE_BIN`/`AFTER_BIN`（および任意の
 # `CAND_BINS`）として渡す `dot_kernel_bench` 実行ファイル（`cargo bench
-# --bench dot_kernel_bench -p fandhe-vector-db-engine --no-run` で得た成果物を退避したもの）。
+# --bench dot_kernel_bench -p fandhe-db-engine --no-run` で得た成果物を退避したもの）。
 # production コード（`crates/engine/src/`）・既存ベンチハーネスは一切変更しない。
 #
 # `dot_kernel_bench` は起動ごとに `DIMS=[100,128,384,768,1536]` ×

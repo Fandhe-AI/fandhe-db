@@ -2544,7 +2544,7 @@ mod tests {
     // 参照実装（旧・一括処理版 `for_insert_batch_encoded_reference`。バッチ全体を
     // `Vec` へ連結してからパディングする）の処理時間を、台帳ハッシュ対象と同オーダー
     // （1,000 行 × 約 0.5KB ≈ 500KB）の入力で手元比較するための手動専用テスト
-    // （CI 非配線・既定 ignore）。`cargo test --release -p fandhe-vector-db-engine --lib
+    // （CI 非配線・既定 ignore）。`cargo test --release -p fandhe-db-engine --lib
     // recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing
     // -- --ignored --nocapture` で実行する。
     //

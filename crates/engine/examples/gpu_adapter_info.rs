@@ -10,7 +10,7 @@
 //! 再現するための素材を出力する。デバイスは生成しない（シェーダ検証は行わず、
 //! 検証結果は同 doc に実測値として記録済み）。
 //!
-//! `cargo run -p fandhe-vector-db-engine --release --example gpu_adapter_info`（`make
+//! `cargo run -p fandhe-db-engine --release --example gpu_adapter_info`（`make
 //! gpu-adapter-info`）で実行する。`detect_features.rs`（Issue #468）と同じ
 //! 「手動専用・CI 非配線・出力を doc へ転記する運用」の位置づけで、
 //! GPU 非搭載環境では adapter 未検出をエラーとして明示し非 0 終了する

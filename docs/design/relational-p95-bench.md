@@ -397,7 +397,7 @@ p95 を記録する実行とは**別のセッション**で行う（perf の負�
 1. 現在値を控える: `cat /proc/sys/kernel/perf_event_paranoid`
 2. 一時的に緩める: `sudo sysctl kernel.perf_event_paranoid=1`
 3. シンボル付きでビルドする（Cargo.toml は変更せず環境変数で上書き）:
-   `CARGO_PROFILE_BENCH_DEBUG=line-tables-only cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine --no-run`。
+   `CARGO_PROFILE_BENCH_DEBUG=line-tables-only cargo bench --bench relational_p95_bench -p fandhe-db-engine --no-run`。
    出力される `target/release/deps/relational_p95_bench-<hash>` を使う
 4. 計測: `BENCH_RELATIONAL_P95_GROUP=predicate perf record -F 999 -g -o <出力先>/perf.data -- <バイナリ>`、続けて `perf report --stdio -i <出力先>/perf.data`
 5. 終了後、控えた値へ必ず戻す: `sudo sysctl kernel.perf_event_paranoid=<元の値>`
@@ -515,7 +515,7 @@ SQL-24・SQL-25・SQL-28・SQL-2 ポインタ。「専有環境での再測定�
 | `dedicated_env_attested`・rounds・rows | `true`（オーナーが専有機として用意し `BENCH_DEDICATED_ENV=1` の申告を承認）・5・100,000（`BENCH_RELATIONAL_P95_ROWS` は未設定。join は arm 行が `rows=10000 scale=full`） |
 | 各グループの loadavg（開始と終了。`sysctl -n vm.loadavg` の 1／5／15 分） | predicate 3.53/4.27/4.40 → 3.82/4.27/4.40、order_by 3.82/4.27/4.40 → 3.82/4.13/4.33、join 3.82/4.13/4.33 → 3.82/4.13/4.33 |
 | 同時実行プロセスの確認結果 | cargo・rustc・別のベンチ・ローカル LLM サーバは稼働なし。CPU 上位は GUI 常駐プロセス（WindowServer 約 38〜53%、ワークツリー管理アプリ 2〜19%、ブラウザ 8〜13%、`syspolicyd`・`trustd` が一時的に最大 9%）で、ほかにアイドルの対話エージェントセッションがあった。計測前の loadavg は 1 分値で 3.5〜7.3（作業用 worktree の作成とビルドの直後が高く、落ち着いてから開始）。この状態をオーナーが確認したうえで専有の申告を承認した |
-| 設定を一時変更した場合の内容と復元の確認 | 変更なし。計測前にベンチバイナリを別工程で事前ビルドし（`cargo bench --bench relational_p95_bench -p fandhe-vector-db-engine --no-run`）、各グループの `make` ではビルドが走らない（`Finished ... in 0.04s`）ことをログで確認した |
+| 設定を一時変更した場合の内容と復元の確認 | 変更なし。計測前にベンチバイナリを別工程で事前ビルドし（`cargo bench --bench relational_p95_bench -p fandhe-db-engine --no-run`）、各グループの `make` ではビルドが走らない（`Finished ... in 0.04s`）ことをログで確認した |
 
 arm 別 p95（単位 ms）。`pred_eq` はラウンド内で各候補 arm の直前に参照として測るため 1 ラウンドに 4 行あり、round 列には各ラウンドの最初の行を入れた（要約行の `min_of_n`・`median`・`max` はこの 5 値と一致する）。残りの行は `ref_paired` の分母に使われる:
 

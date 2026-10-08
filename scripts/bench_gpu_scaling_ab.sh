@@ -8,7 +8,7 @@
 # 呼び出し元は人間の運用者（`make` 経由のターゲットは設けない。ベンチそのものが
 # 手動専用・CI 非配線のため）。呼び出し先は `BEFORE_BIN`/`AFTER_BIN` として渡す
 # 2 つの `gpu_scaling_bench` 実行ファイル（`cargo bench --bench gpu_scaling_bench
-# -p fandhe-vector-db-engine --no-run --message-format=json` で得た成果物を退避したもの）。
+# -p fandhe-db-engine --no-run --message-format=json` で得た成果物を退避したもの）。
 # production コード（`crates/engine/src/`）・既存ベンチハーネスは一切変更しない。
 #
 # 使い方:

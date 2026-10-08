@@ -7,7 +7,7 @@
 private spec（`docs/spec`）の内容はここでは参照・転記しない。数値基準（warmup・
 反復回数）は本ハーネス独自の実装既定値（`crates/engine/examples/feature_bench.rs`
 の WARMUP=5・ITERS=50 に合わせてある）。Cargo 依存は増やしていない
-（`cargo build --release -p fandhe-vector-db-wire-server` の既存バイナリをそのまま子プロセス
+（`cargo build --release -p fandhe-db-wire-server` の既存バイナリをそのまま子プロセス
 起動するだけ）。
 
 ## 前提
@@ -23,7 +23,7 @@ private spec（`docs/spec`）の内容はここでは参照・転記しない。
   `latest`／メジャータグは計測ごとに `docker image ls --digests` で digest を記録する
 - Python venv（`requirements.txt` を `pip install -r` 済み。`pymongo==4.18.1`・
   `redis==8.1.0` が必要。Elasticsearch は標準ライブラリのみ）
-- `target/release/wire-server`（`cargo build --release -p fandhe-vector-db-wire-server` でビルド済み）
+- `target/release/wire-server`（`cargo build --release -p fandhe-db-wire-server` でビルド済み）
 - `crates/engine/examples/seed_docs.rs`（別 agent 生成）等で作成した
   `docs25k.redb`・`docs25k.jsonl`・`queries200.jsonl`
 
@@ -34,7 +34,7 @@ python -m venv /path/to/venv
 source /path/to/venv/bin/activate
 pip install -r scripts/crossdb_bench/requirements.txt
 
-cargo build --release -p fandhe-vector-db-wire-server
+cargo build --release -p fandhe-db-wire-server
 ```
 
 ## コンテナの起動・停止
@@ -114,14 +114,14 @@ CROSSDB_SELF_BINARY=/tmp/wt-before/target-before/release/wire-server \
 `--search-engine`（Issue #656）・`--hnsw-*` 探索パラメータ opt-in（Issue #657）が
 wire-server の CLI へ入ったことで、self（wire-server 経由）でも `--config hnsw`
 （`--search-engine hnsw`）を計測できる。**事前に `crossdb_plan_probe` example の
-ビルドが必要**（`cargo build --release -p fandhe-vector-db-engine --example crossdb_plan_probe`）。
+ビルドが必要**（`cargo build --release -p fandhe-db-engine --example crossdb_plan_probe`）。
 `--search-engine` を持たない旧バイナリを `CROSSDB_SELF_BINARY` で指定すると
 未知引数として起動失敗するが、これは意図した fail-closed の挙動である
 （exact 構成の結果を ANN 経路と誤認させないため、緩めない）。
 
 ```bash
-cargo build --release -p fandhe-vector-db-wire-server
-cargo build --release -p fandhe-vector-db-engine --example crossdb_plan_probe
+cargo build --release -p fandhe-db-wire-server
+cargo build --release -p fandhe-db-engine --example crossdb_plan_probe
 
 python scripts/crossdb_bench/run.py --db self --config hnsw \
   --rows-file "$S/docs25k.redb" --queries-file "$S/queries200.jsonl"
@@ -357,9 +357,9 @@ dim=768／1536 が Issue #365（dot カーネル多アキュムレータ化検�
 `-d<dim>` サフィックス付き fixture を生成して計測できる。
 
 ```bash
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+cargo run --release -p fandhe-db-engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p fandhe-db-engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p fandhe-db-engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
 
 python scripts/crossdb_bench/run.py --db self --config exact \
   --rows-file "$S/docs25k-d768.redb" --queries-file "$S/queries200-d768.jsonl" \

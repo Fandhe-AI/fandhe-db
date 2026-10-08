@@ -22,7 +22,7 @@
 //! 変更せずに済むようにする。
 //!
 //! 再現・診断手順: 衝突やクリーンアップ失敗が疑われる場合は
-//! `TMPDIR=$(mktemp -d) cargo test -p fandhe-vector-db-engine -- --test-threads=1 --nocapture` で
+//! `TMPDIR=$(mktemp -d) cargo test -p fandhe-db-engine -- --test-threads=1 --nocapture` で
 //! 一時ディレクトリを固定・並列度を落として再現を試みる。生成失敗時は panic
 //! メッセージに、削除失敗時は `eprintln!` に [`describe_temp_dir_state`] の出力
 //! （実体パス・書込可否・残骸件数）が含まれる。

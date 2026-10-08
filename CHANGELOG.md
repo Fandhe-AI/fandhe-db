@@ -1,7 +1,7 @@
 # Changelog
 
-`crates/engine`（`fandhe-vector-db-engine`）・`crates/wire-server`
-（`fandhe-vector-db-wire-server`）の公開 API に影響する変更を記録する。
+`crates/engine`（`fandhe-db-engine`）・`crates/wire-server`
+（`fandhe-db-wire-server`）の公開 API に影響する変更を記録する。
 両クレートは同一バージョンで同期して公開する（`crates/wire-server/Cargo.toml`
 の `engine` path 依存が完全固定バージョンで参照するため）。
 
@@ -9,6 +9,12 @@
 
 ### Breaking Changes
 
+- crate 名を `fandhe-vector-db-engine` / `fandhe-vector-db-wire-server` から
+  `fandhe-db-engine` / `fandhe-db-wire-server` へ変更した（プロジェクト名を
+  vector-db から fandhe-db へ改めたため）。0.2.0 は新しい crate 名での初公開版となる。
+  旧 crate 名の 0.1.0 は crates.io に残すが、以後は更新しない。移行は `Cargo.toml` の
+  依存名を新しい crate 名へ置き換える（lib 名 `engine` / `wire_server` は不変のため
+  `use` 文の変更は不要）。
 - `engine::sql::allowlist::ValidatedInsert` の公開フィールド
   `pub values: Vec<InsertLiteral>` を `pub rows: Vec<Vec<InsertLiteral>>` へ
   変更した。単一行 INSERT は `rows.len() == 1` として同じ内容を保持するため、

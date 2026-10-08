@@ -993,7 +993,7 @@ ADR `docs/design/partitioned-dml.md`。
 - コマンドタグの観測経路: psql は `-q` なしの stdout、psycopg は `cur.statusmessage`、node `pg`
   は `result.command`／`result.rowCount`。後 2 者は `WIRE_PRINT_COMMAND_TAG=1`（`"1"` のみ受理、
   他は fail-closed。未指定は挙動不変）でスクリプトが 1 行出力する。ドライバ本体は無改造。
-- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-vector-db-wire-server
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-db-wire-server
   --features fault-injection --test three_client_e2e three_clients_run_partitioned_dml --
   --ignored --nocapture --test-threads=1` の `[e2e-record]` 行を PR 本文へ転記する。行は固定
   ラベルと観測値のみで、ユーザー名・資格情報・テナント id を含まないことをテストが assert する。
@@ -1089,7 +1089,7 @@ API へ返却行と `CommandComplete` タグを届けることを確認する層
   出力し 3 クライアントで `INSERT 0 n` に完全一致させる（`WIRE_PRINT_COMMAND_TAG=1`。oid が整数でなければ
   2 語形式のまま出し、期待値不一致で fail-closed）。
 - 決定性: 固定の seed（`rdocs`・非ベクトル・NULL なし）・固定の文順。投影は明示列 `id, n, lang`。
-- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-vector-db-wire-server
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-db-wire-server
   --features fault-injection --test three_client_e2e three_clients_receive_returning --
   --ignored --nocapture --test-threads=1` の `[e2e-record]` 行を PR 本文へ転記する。
   実測（psql 18.6・psycopg 3.3.6・node v24.13.0 + pg 8.23.0）: 3 クライアントとも全タグ・
@@ -1123,7 +1123,7 @@ API へ返却行と `CommandComplete` タグを届けることを確認する層
   `client.end()`。psycopg は `with psycopg.connect(...)` の正常終了が `COMMIT` を送るため、
   `psycopg_client.py` に opt-in の `WIRE_ABANDON_OPEN_TRANSACTION=1`（本体 SQL の後にプロセスを
   即時終了。語彙は `"1"` のみで他は fail-closed）を追加した。
-- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-vector-db-wire-server
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-db-wire-server
   --features fault-injection --test three_client_e2e three_clients_confirm_explicit_transaction --
   --ignored --nocapture` の `[e2e-record]` 行（クライアント版を含む。資格情報・テナント id・SQL 本文は
   出力しない）を PR 本文へ転記する。

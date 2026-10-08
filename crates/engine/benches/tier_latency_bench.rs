@@ -148,7 +148,7 @@ fn print_help() {
 }
 
 /// 引数に `--help`／`-h` が含まれるかを判定する。`cargo bench --bench
-/// tier_latency_bench -p fandhe-vector-db-engine -- --help` はハーネス無効（`harness = false`）の
+/// tier_latency_bench -p fandhe-db-engine -- --help` はハーネス無効（`harness = false`）の
 /// ため cargo 標準の help 傍受は効かず、本関数で明示的に処理する。
 fn help_requested() -> bool {
     std::env::args()

@@ -1,7 +1,7 @@
 //! `engine::storage::Storage` の複数次元テーブル実測ハーネス（TASK-91、
 //! 対象ビヘイビア: TABLE-2）。
 //!
-//! `cargo test` の対象には含めない手動実行専用ツール（`cargo run -p fandhe-vector-db-engine --release
+//! `cargo test` の対象には含めない手動実行専用ツール（`cargo run -p fandhe-db-engine --release
 //! --example multi_dim_bench` で実行する）。時間依存の測定値を CI のアサーションに
 //! 混ぜない方針（.claude/rules/coding-rust.md）のため、`tests/multi_dim_tables.rs`
 //! （正しさの回帰テスト・CI 常時実行）とはファイルを分離している

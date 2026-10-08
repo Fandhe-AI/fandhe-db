@@ -1378,13 +1378,13 @@ real_check() {
   rm -f "${deps_dir}"/engine-*.s
 
   # `.s` を削除しても、cargo のフィンガープリントが「最新」と判断すれば
-  # rustc は再起動されず `.s` が再生成されない（F2）。`cargo clean -p fandhe-vector-db-engine`
+  # rustc は再起動されず `.s` が再生成されない（F2）。`cargo clean -p fandhe-db-engine`
   # で engine crate のビルド成果物（依存クレートは残す）だけを無効化し、
   # 毎回確実に `--emit asm` が再実行されるようにする。
-  CARGO_TARGET_DIR="${build_target_dir}" cargo clean -p fandhe-vector-db-engine --release \
+  CARGO_TARGET_DIR="${build_target_dir}" cargo clean -p fandhe-db-engine --release \
     "${cargo_target_flag[@]}" >/dev/null 2>&1 || true
 
-  if ! CARGO_TARGET_DIR="${build_target_dir}" cargo rustc -p fandhe-vector-db-engine --release --lib \
+  if ! CARGO_TARGET_DIR="${build_target_dir}" cargo rustc -p fandhe-db-engine --release --lib \
       "${cargo_target_flag[@]}" -- --emit asm; then
     echo "ERROR: cargo rustc --emit asm failed" >&2
     return 1

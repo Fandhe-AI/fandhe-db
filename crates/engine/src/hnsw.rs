@@ -1392,7 +1392,7 @@ impl HnswSearchScratch {
     /// `Some(true)` は [`VisitedKind::Sparse`]、`Some(false)` は
     /// [`VisitedKind::Dense`]、`None` は層 0 探索まで到達しなかった呼び出し
     /// （早期 return）を表す。`bench-internals` 未指定ビルド（`wire-server`・
-    /// 既定の `cargo build -p fandhe-vector-db-engine`）には結線されない。
+    /// 既定の `cargo build -p fandhe-db-engine`）には結線されない。
     #[cfg(feature = "bench-internals")]
     pub fn last_visited_kind_is_sparse(&self) -> Option<bool> {
         self.last_visited_kind

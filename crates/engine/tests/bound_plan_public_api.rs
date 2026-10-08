@@ -13,7 +13,7 @@
 //! production 変更対象外だが、束縛済みエントリが SQL 経路とキャッシュ配線
 //! （`VisibleBitmapCache`／`SqlArenaCache`／`ScalarIndexCache`）を共有するようになった
 //! ことが wire 経由の既存回帰を壊していないことは、本ファイルとは別に
-//! `cargo test -p fandhe-vector-db-wire-server --test wire_scan --test wire_aggregate`
+//! `cargo test -p fandhe-db-wire-server --test wire_scan --test wire_aggregate`
 //! を実行して確認する（PR 本文に pass 件数を記録する）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};

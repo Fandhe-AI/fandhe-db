@@ -78,7 +78,7 @@ case "${WIRE_SERVER_BIN}" in
   /*) : ;;
   *) WIRE_SERVER_BIN="$(pwd)/${WIRE_SERVER_BIN}" ;;
 esac
-[ -x "${WIRE_SERVER_BIN}" ] || die "wire-server binary not found: ${WIRE_SERVER_BIN} (run: cargo build --release -p fandhe-vector-db-wire-server)"
+[ -x "${WIRE_SERVER_BIN}" ] || die "wire-server binary not found: ${WIRE_SERVER_BIN} (run: cargo build --release -p fandhe-db-wire-server)"
 export CROSSDB_SELF_BINARY="${WIRE_SERVER_BIN}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"

@@ -6,8 +6,8 @@ name: release
 # 「publish（`mode: publish` のときのみ。GitHub Environment `crates-io-release` の
 # 承認ゲートを通す）」の 2 ジョブで実行する。既定モードは dry-run-only（安全側）。
 #
-# 公開対象は workspace の 2 クレート（`crates/engine` = fandhe-vector-db-engine、
-# `crates/wire-server` = fandhe-vector-db-wire-server）。crate 入力を choice 型に
+# 公開対象は workspace の 2 クレート（`crates/engine` = fandhe-db-engine、
+# `crates/wire-server` = fandhe-db-wire-server）。crate 入力を choice 型に
 # 固定することで、任意文字列のシェル注入・存在しないパッケージ指定を構造的に排除する
 # （fail-closed）。`all` は `cargo publish --workspace` による依存順の一括公開
 # （engine → wire-server。cargo が sparse index 反映待ちを含めて順序解決する）。
@@ -35,10 +35,10 @@ on:
         description: "公開対象クレート（all は --workspace による依存順の一括公開）"
         type: choice
         required: true
-        default: fandhe-vector-db-engine
+        default: fandhe-db-engine
         options:
-          - fandhe-vector-db-engine
-          - fandhe-vector-db-wire-server
+          - fandhe-db-engine
+          - fandhe-db-wire-server
           - all
       version:
         description: "公開しようとするバージョン（例: 0.1.0）。対象クレートの Cargo.toml の version と完全一致する必要がある"
@@ -122,7 +122,7 @@ jobs:
           echo "RELEASE_PACKAGES=${PACKAGES}" >> "${GITHUB_ENV}"
 
       - name: "guard: Cargo.toml バージョン一致の検証"
-        # cargo pkgid の出力（例: path+file:///.../crates/engine#fandhe-vector-db-engine@0.1.0）
+        # cargo pkgid の出力（例: path+file:///.../crates/engine#fandhe-db-engine@0.1.0）
         # からバージョンを抽出し、入力 version と完全一致しなければ公開を止める。
         # `all` のときは全対象パッケージが同一バージョンであることを要求する。
         run: |
