@@ -54,7 +54,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make test-default-build` | 既定ビルド（feature `fault-injection` 無効）専用の回帰テスト（`ci` に含む）。`make test` は `--all-features` のため対象外のテストをピンポイント実行 |
 | `make crash-test` / `make crash-test-interrupt` / `make crash-test-cross-table` / `make crash-test-unique-index` / `make crash-test-partitioned-dml` / `make tmp-leak-check` / `make core-api-check` / `make sort-determinism-check` / `make simd-codegen-check` | `ci` に含まれるガード系（クラッシュ耐性・テスト一時領域の残置検出・コア API 差分・ソート非決定性・SIMD 生成コード検査）。個別実行や詳細は `make help` を参照 |
-| `make check-cross` / `make simd-codegen-check-cross` | aarch64 クロスコンパイル確認（`ci.yml` の cross-check ジョブから実行。`ci` には含めない） |
+| `make check-cross` / `make simd-codegen-check-cross` | aarch64 クロスコンパイル確認（`ci.yml` の cross-check ジョブから実行。`ci` には含めない）。beta toolchain での週次先行検知は `toolchain-canary.yml` |
 | `make test-eval` | `scripts/eval` のユニットテスト（要 `python3`。CI には未配線） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
 | `make bench-simd` / `make bench-c1` / `make recall-regression` / `make precision-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行。`precision-regression` は目標値未確定のため `recall.yml` へ未接続。詳細は下記「`precision` 評価ハーネス」参照） |

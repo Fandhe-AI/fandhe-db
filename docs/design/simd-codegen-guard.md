@@ -315,3 +315,17 @@ fail: 関数名は `dot_i8_neon_dotprod` だが実体はスカラー逐次 wrapp
 
 検査パターンの変更・対象モジュールの追加（将来 `f16.rs` 等の新設カーネルへの
 拡張）は、`scripts/check_simd_codegen.sh` の修正と本 ADR の更新をセットで行う。
+
+### toolchain 追従の早期検知（Issue #1477）
+
+`rust-toolchain.toml` は stable 追従のため、runner image 更新による rustc 切替で本ガードが
+PR と無関係に失敗しうる（Issue #1475）。次の 2 点で原因特定と先行検知を行う。
+
+- `ci.yml` の `simd-codegen-check`・`cross-check` は `make` の前に `rustc -vV`／`cargo -vV` をログへ出す。
+- `.github/workflows/toolchain-canary.yml` が beta で同検査（x86_64・aarch64）を週次実行する
+  （schedule＋workflow_dispatch。PR ゲート外で、必須チェックではない）。
+
+失敗時は `rustc -vV` の release と LLVM version を直前の成功 run と比較し、ガードの検出が
+期待どおりか、検査側の追随修正が要るかを判断する。検査パターンを弱めて通すことはしない（§4）。
+ローカル再現: `RUSTUP_TOOLCHAIN=beta make simd-codegen-check`（要 `rustup toolchain install beta`。
+aarch64 は `make simd-codegen-check-cross`）。§7 の CI 時間・キャッシュの件とは独立。
