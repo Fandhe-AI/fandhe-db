@@ -12499,7 +12499,7 @@ mod tests {
     #[test]
     fn internal_error_client_message_does_not_leak_detail() {
         let err = SqlSurfaceError::Internal {
-            detail: "redb I/O error: disk quota exceeded at /var/lib/vector-db/data.redb"
+            detail: "redb I/O error: disk quota exceeded at /var/lib/fandhe-db/data.redb"
                 .to_string(),
         };
         assert_eq!(err.wire_code(), "XX000");

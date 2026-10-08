@@ -396,7 +396,7 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "vector-db-engine-txn-{label}-{}-{seq}.redb",
+            "fandhe-db-engine-txn-{label}-{}-{seq}.redb",
             std::process::id()
         ));
         path

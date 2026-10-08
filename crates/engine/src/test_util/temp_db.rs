@@ -71,7 +71,7 @@ fn validate_label(label: &str) {
     );
 }
 
-/// `temp_dir()` 配下に残った `vector-db-` 接頭辞のエントリを数え、生成・削除の失敗時に
+/// `temp_dir()` 配下に残った `fandhe-db-` 接頭辞のエントリを数え、生成・削除の失敗時に
 /// panic メッセージ／`eprintln!` へ埋め込む診断情報を組み立てる（発生時診断。実行中の
 /// 正常経路では呼ばれない＝ログ過多にならない）。
 pub(crate) fn describe_temp_dir_state() -> String {
@@ -87,7 +87,7 @@ pub(crate) fn describe_temp_dir_state() -> String {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !name.starts_with("vector-db-") {
+            if !name.starts_with("fandhe-db-") {
                 continue;
             }
             count += 1;
@@ -100,13 +100,13 @@ pub(crate) fn describe_temp_dir_state() -> String {
         }
     }
     format!(
-        "temp_dir={} writable={writable} leftover_vector_db_entries={count} sample=[{sample}]",
+        "temp_dir={} writable={writable} leftover_fandhe_db_entries={count} sample=[{sample}]",
         dir.display()
     )
 }
 
 /// テストごとに一意な DB ファイルパスを払い出す（`Storage::open` 等に渡す前提。
-/// ファイル自体は作成しない）。名前は `vector-db-{crate}-{label}-{pid}-{salt}-{seq}.redb`
+/// ファイル自体は作成しない）。名前は `fandhe-db-{crate}-{label}-{pid}-{salt}-{seq}.redb`
 /// の形式で、`crate` は呼び出し元クレート（`env!("CARGO_CRATE_NAME")`。unit test では
 /// `engine`、結合テストでは各テストバイナリ名に展開される）。
 pub fn unique_db_path(label: &str) -> PathBuf {
@@ -114,7 +114,7 @@ pub fn unique_db_path(label: &str) -> PathBuf {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "vector-db-{}-{label}-{}-{:x}-{seq}.redb",
+        "fandhe-db-{}-{label}-{}-{:x}-{seq}.redb",
         env!("CARGO_CRATE_NAME"),
         std::process::id(),
         process_salt(),
@@ -194,7 +194,7 @@ impl TempDir {
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "vector-db-{}-{label}-{}-{:x}-{seq}-dir",
+                "fandhe-db-{}-{label}-{}-{:x}-{seq}-dir",
                 env!("CARGO_CRATE_NAME"),
                 std::process::id(),
                 process_salt(),
