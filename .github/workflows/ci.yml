@@ -292,6 +292,12 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
+      # Issue #1477・#1475: image 更新で rustc が切り替わった際の原因特定のため、
+      # 後続の make が失敗しても必ず toolchain（release・LLVM version）をログへ残す。
+      - name: Record Rust toolchain version
+        run: |
+          rustc -vV
+          cargo -vV
       - name: Run simd-codegen-check
         run: make simd-codegen-check
 
@@ -323,6 +329,12 @@ jobs:
         run: rustup show
       - name: Add aarch64-unknown-linux-gnu target
         run: rustup target add aarch64-unknown-linux-gnu
+      # Issue #1477・#1475: image 更新で rustc が切り替わった際の原因特定のため、
+      # 後続の make が失敗しても必ず toolchain（release・LLVM version）をログへ残す。
+      - name: Record Rust toolchain version
+        run: |
+          rustc -vV
+          cargo -vV
       - name: Run check-cross
         run: make check-cross
       - name: Run simd-codegen-check-cross
