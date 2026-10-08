@@ -6,7 +6,7 @@
 //! engine 側の判定順・境界は `crates/engine/tests/copy_from.rs` が確定オラクル
 //! のため、本ファイルは「上限超過が `54000` の ErrorResponse になり、行が 1 件も
 //! 残らず（副作用ゼロ）、接続が維持される」ことを CopyData／CopyDone のフレーミング
-//! 越しに固定する。`BatchLimits` は環境変数（`VECTOR_DB_BATCH_MAX_*`）由来の既定値
+//! 越しに固定する。`BatchLimits` は環境変数（`FANDHE_DB_BATCH_MAX_*`）由来の既定値
 //! の揺らぎを避けるため 4 項目すべてを明示する。
 
 #[path = "common/mod.rs"]

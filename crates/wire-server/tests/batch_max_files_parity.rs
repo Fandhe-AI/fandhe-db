@@ -3,7 +3,7 @@
 //!
 //! 上限値は `wire_server::dml_limits_opt::resolve_batch_limits`（main.rs が CLI
 //! 引数から呼ぶのと同じ関数）の出力をそのまま `EngineCore::with_batch_limits`
-//! へ渡して作るため、環境変数 `VECTOR_DB_BATCH_MAX_FILES` には依存しない
+//! へ渡して作るため、環境変数 `FANDHE_DB_BATCH_MAX_FILES` には依存しない
 //! （ただし `base` に `BatchLimits::default()` を使うので `max_batch_chunks` 等は
 //! 既定に従う）。
 //!

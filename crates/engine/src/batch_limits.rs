@@ -29,7 +29,7 @@
 /// 一括投入 4 上限の設定値。既定値は [`Default`] 実装を参照。
 ///
 /// `max_files_per_batch` の優先順位は「wire-server の CLI `--batch-max-files`
-/// 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64」（Issue #1166）。
+/// 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES` > 既定 64」（Issue #1166）。
 /// 値は `1..=`[`MAX_BATCH_MAX_FILES`] に限定され、この範囲では
 /// `batch_raw_sql_len_budget` の飽和演算がオーバーフローしない。
 ///
@@ -100,7 +100,7 @@ impl std::error::Error for MaxFilesPerBatchOutOfRange {}
 
 /// `max_files_per_batch` の設定値を `1..=`[`MAX_BATCH_MAX_FILES`] で検証する
 /// 単一情報源。wire-server の CLI フラグ `--batch-max-files` と環境変数
-/// `VECTOR_DB_BATCH_MAX_FILES` の両経路から使われる（優先順位は
+/// `FANDHE_DB_BATCH_MAX_FILES` の両経路から使われる（優先順位は
 /// CLI 明示 > 環境変数 > 既定）。
 pub fn validate_max_files_per_batch(value: usize) -> Result<usize, MaxFilesPerBatchOutOfRange> {
     if (1..=MAX_BATCH_MAX_FILES).contains(&value) {
@@ -118,19 +118,48 @@ fn parse_env_max_files(raw: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_MAX_FILES_PER_BATCH)
 }
 
+/// 改名前（プロジェクト名 vector-db 時代）の環境変数名と、その後継名の対応表。
+/// 旧名は読まない（値を一切適用しない）。wire-server の起動経路が
+/// [`legacy_batch_env_vars_set`] の結果を警告として stderr へ出すための単一情報源。
+pub const LEGACY_BATCH_ENV_VARS: [(&str, &str); 3] = [
+    ("VECTOR_DB_BATCH_MAX_FILES", "FANDHE_DB_BATCH_MAX_FILES"),
+    (
+        "VECTOR_DB_BATCH_MAX_TOTAL_BYTES",
+        "FANDHE_DB_BATCH_MAX_TOTAL_BYTES",
+    ),
+    ("VECTOR_DB_BATCH_MAX_CHUNKS", "FANDHE_DB_BATCH_MAX_CHUNKS"),
+];
+
+/// `is_set` が真を返す旧名を `(旧名, 新名)` で列挙する純関数。環境の参照を
+/// 注入できるようにして単体テストをプロセス環境から切り離す。
+fn legacy_batch_env_vars_where(is_set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    LEGACY_BATCH_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|(old, _)| is_set(old))
+        .collect()
+}
+
+/// 現在のプロセス環境に設定されている旧名の一覧を返す。値は読まず存在のみを
+/// 見る（警告に設定値を含めないため。非 UTF-8 値でも検出する）。wire-server の
+/// 起動時に呼ばれ、1 変数 1 行の警告を出す。engine 自身は出力しない。
+pub fn legacy_batch_env_vars_set() -> Vec<(&'static str, &'static str)> {
+    legacy_batch_env_vars_where(|name| std::env::var_os(name).is_some())
+}
+
 impl Default for BatchLimits {
     fn default() -> Self {
         Self {
             max_files_per_batch: parse_env_max_files(
-                std::env::var("VECTOR_DB_BATCH_MAX_FILES").ok().as_deref(),
+                std::env::var("FANDHE_DB_BATCH_MAX_FILES").ok().as_deref(),
             ),
             max_file_body_bytes: crate::chunking::MAX_INPUT_BYTES,
             max_batch_total_bytes: env_usize_or(
-                "VECTOR_DB_BATCH_MAX_TOTAL_BYTES",
+                "FANDHE_DB_BATCH_MAX_TOTAL_BYTES",
                 crate::incremental::MAX_INDEX_TOTAL_BYTES,
             ),
             max_batch_chunks: env_usize_or(
-                "VECTOR_DB_BATCH_MAX_CHUNKS",
+                "FANDHE_DB_BATCH_MAX_CHUNKS",
                 crate::incremental::MAX_CHUNKS_PER_FILE,
             ),
         }
@@ -468,6 +497,18 @@ mod tests {
             max_batch_total_bytes: 30,
             max_batch_chunks: 5,
         }
+    }
+
+    #[test]
+    fn legacy_env_detection_lists_only_set_old_names() {
+        let set = ["VECTOR_DB_BATCH_MAX_CHUNKS", "FANDHE_DB_BATCH_MAX_FILES"];
+        let found = legacy_batch_env_vars_where(|n| set.contains(&n));
+        assert_eq!(
+            found,
+            vec![("VECTOR_DB_BATCH_MAX_CHUNKS", "FANDHE_DB_BATCH_MAX_CHUNKS")]
+        );
+        assert!(legacy_batch_env_vars_where(|_| false).is_empty());
+        assert_eq!(legacy_batch_env_vars_where(|_| true).len(), 3);
     }
 
     #[test]

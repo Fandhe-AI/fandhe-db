@@ -524,7 +524,7 @@ Accepted と、15 節の提案値のオーナー確認後」。後者は 2026-10
   `--partitioned-dml-max-interrupted-records`）。範囲外・非数値・多重指定は起動時に fail-closed で拒否する。
   根拠: `--max-dml-affected-rows`・`--max-insert-rows`（`predicate-dml-exec.md` §6）と同じ流儀で、
   セッション・テナント単位の設定は持たない。環境変数は設けない（`batch_limits` の
-  `VECTOR_DB_BATCH_MAX_FILES` は既存互換のためのもので、新しい上限には広げない）。
+  `FANDHE_DB_BATCH_MAX_FILES` は既存互換のためのもので、新しい上限には広げない）。
 - 文の `CHUNK <n>` で指定できるのはチャンク幅だけとし、範囲は `1..=サーバー設定のチャンク幅`
   （小さくする方向だけ）にする。走査予算・writer 保持時間・同時実行数・記録数は文から変えられない。
   根拠: 資源上限をテナントが文で緩められないようにする（8.2 節）。

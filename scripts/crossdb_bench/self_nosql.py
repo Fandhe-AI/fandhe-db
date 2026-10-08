@@ -220,7 +220,7 @@ _EXPLAIN_REASON = (
 # 持たない。
 _INGEST_BULK_REASON = (
     "op: insert の rows 配列は 1 要求あたり既定上限 64 行"
-    "（INDEX-4 ①。VECTOR_DB_BATCH_MAX_FILES で上書き可能）であり、"
+    "（INDEX-4 ①。FANDHE_DB_BATCH_MAX_FILES で上書き可能）であり、"
     "feature_bench.rs の ingest_bulk（ファイル形一括投入）に相当する規模の"
     "意味論を持たない（crates/wire-server/docs/nosql-api.md「insert」節）"
 )

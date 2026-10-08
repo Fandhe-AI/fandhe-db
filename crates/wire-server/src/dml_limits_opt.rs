@@ -1,7 +1,7 @@
 //! `wire-server` バイナリ（`main.rs`）が起動時に受け取る `--max-dml-affected-rows`・
 //! `--max-insert-rows` opt-in CLI 引数のパーサ（Issue #997）。あわせて
 //! `--batch-max-files`（Issue #1166。`batch_limits.max_files_per_batch`。
-//! 優先順位は CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64）の
+//! 優先順位は CLI 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES` > 既定 64）の
 //! 解決 [`resolve_batch_limits`] も本モジュールが担う。
 //!
 //! オーナー判断の改訂（2026-09-27、前回のオーナー判断を置き換え）: 汎用 RDB
@@ -36,7 +36,7 @@ pub const MAX_AFFECTED_ROWS_FLAG: &str = "--max-dml-affected-rows";
 pub const MAX_INSERT_ROWS_FLAG: &str = "--max-insert-rows";
 
 /// `batch_limits.max_files_per_batch` を設定する CLI フラグ名（Issue #1166）。
-/// 環境変数 `VECTOR_DB_BATCH_MAX_FILES` と 1 対 1 に対応し、優先順位は
+/// 環境変数 `FANDHE_DB_BATCH_MAX_FILES` と 1 対 1 に対応し、優先順位は
 /// CLI 明示 > 環境変数 > 既定 64。
 pub const BATCH_MAX_FILES_FLAG: &str = "--batch-max-files";
 
@@ -259,12 +259,12 @@ pub fn insert_rows_cap_warning(
     if files_cap < limit.get() {
         remedies.push(format!(
             "batch_limits.max_files_per_batch ({files_cap}; set {BATCH_MAX_FILES_FLAG} \
-             or the VECTOR_DB_BATCH_MAX_FILES environment variable to raise it)"
+             or the FANDHE_DB_BATCH_MAX_FILES environment variable to raise it)"
         ));
     }
     if chunks_cap < limit.get() {
         remedies.push(format!(
-            "batch_limits.max_batch_chunks ({chunks_cap}; set the VECTOR_DB_BATCH_MAX_CHUNKS \
+            "batch_limits.max_batch_chunks ({chunks_cap}; set the FANDHE_DB_BATCH_MAX_CHUNKS \
              environment variable to raise it)"
         ));
     }
@@ -562,7 +562,7 @@ mod tests {
         assert!(warning.contains("100"), "unexpected: {warning}");
         assert!(warning.contains("64"), "unexpected: {warning}");
         assert!(
-            warning.contains("VECTOR_DB_BATCH_MAX_FILES"),
+            warning.contains("FANDHE_DB_BATCH_MAX_FILES"),
             "unexpected: {warning}"
         );
         assert!(
@@ -585,7 +585,7 @@ mod tests {
         let warning = insert_rows_cap_warning(&limits, &batch_limits).expect("warning expected");
         assert!(warning.contains("4096"), "unexpected: {warning}");
         assert!(
-            warning.contains("VECTOR_DB_BATCH_MAX_CHUNKS"),
+            warning.contains("FANDHE_DB_BATCH_MAX_CHUNKS"),
             "unexpected: {warning}"
         );
     }
@@ -607,11 +607,11 @@ mod tests {
             "unexpected: {warning}"
         );
         assert!(
-            warning.contains("VECTOR_DB_BATCH_MAX_FILES"),
+            warning.contains("FANDHE_DB_BATCH_MAX_FILES"),
             "unexpected: {warning}"
         );
         assert!(
-            warning.contains("VECTOR_DB_BATCH_MAX_CHUNKS"),
+            warning.contains("FANDHE_DB_BATCH_MAX_CHUNKS"),
             "unexpected: {warning}"
         );
     }
