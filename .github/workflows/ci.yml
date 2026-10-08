@@ -68,7 +68,7 @@ jobs:
       # test ジョブだけで約 5 分をビルドに費やしていた。cache-key-prefix は
       # 他リポジトリと同じ既定値 `rust-base-ci` との衝突回避のため本リポ名にする
       cache: true
-      cache-key-prefix: vector-db
+      cache-key-prefix: fandhe-db
 
   # --------------------------------------------------
   # test-default-build（既定ビルド専用の回帰テスト。Issue #710・#715）
