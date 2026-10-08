@@ -429,15 +429,15 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   応答は「不在時」と同一——TABLE-12・RLS-9）
 - `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
   `rows.len()` を INDEX-4 の件数上限相当として判定。起動時 CLI
-  `--batch-max-files`〔優先〕または環境変数 `VECTOR_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
+  `--batch-max-files`〔優先〕または環境変数 `FANDHE_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
 - 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
   各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
   積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
-  `VECTOR_DB_BATCH_MAX_TOTAL_BYTES`（未設定時は
+  `FANDHE_DB_BATCH_MAX_TOTAL_BYTES`（未設定時は
   `incremental::MAX_INDEX_TOTAL_BYTES`）を超えると `54000`
 - 行数は上記の件数上限（①）とは別枠でチャンク数上限（④。
   `batch_limits::validate_chunk_total`。1 行＝1 チャンク換算。既定は
-  `incremental::MAX_CHUNKS_PER_FILE`、環境変数 `VECTOR_DB_BATCH_MAX_CHUNKS` で
+  `incremental::MAX_CHUNKS_PER_FILE`、環境変数 `FANDHE_DB_BATCH_MAX_CHUNKS` で
   上書き可能）でも判定され、超過は同じく `54000`
 
 検証コード: `crates/wire-server/tests/nosql2_search.rs`・

@@ -15,6 +15,11 @@
   旧 crate 名の 0.1.0 は crates.io に残すが、以後は更新しない。移行は `Cargo.toml` の
   依存名を新しい crate 名へ置き換える（lib 名 `engine` / `wire_server` は不変のため
   `use` 文の変更は不要）。
+- バッチ上限の環境変数を `VECTOR_DB_BATCH_MAX_FILES` / `VECTOR_DB_BATCH_MAX_TOTAL_BYTES` /
+  `VECTOR_DB_BATCH_MAX_CHUNKS` から `FANDHE_DB_BATCH_MAX_FILES` /
+  `FANDHE_DB_BATCH_MAX_TOTAL_BYTES` / `FANDHE_DB_BATCH_MAX_CHUNKS` へ改名した。旧名は
+  読まれず（設定しても既定の上限が適用される）、設定されていれば起動時に stderr へ
+  警告が出る。移行は環境変数名を新名へ置き換える。
 - `engine::sql::allowlist::ValidatedInsert` の公開フィールド
   `pub values: Vec<InsertLiteral>` を `pub rows: Vec<Vec<InsertLiteral>>` へ
   変更した。単一行 INSERT は `rows.len() == 1` として同じ内容を保持するため、

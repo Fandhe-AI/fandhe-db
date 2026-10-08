@@ -945,7 +945,7 @@ fn copy_to_stdout_projects_boolean_array_bytea_enum_columns() {
 // Issue #1178・INDEX-4 ②（1 行あたり本文サイズ）・④（生成チャンク数）の境界。
 // ①③ は上のテストが固定済み。②④ が CopyDone（`finish`）を待たず `feed` 中に
 // 拒否され、副作用が残らないことを固定する。`BatchLimits` は環境変数
-// （`VECTOR_DB_BATCH_MAX_*`）由来の既定値の揺らぎを避けるため 4 項目すべて明示する。
+// （`FANDHE_DB_BATCH_MAX_*`）由来の既定値の揺らぎを避けるため 4 項目すべて明示する。
 // ---------------------------------------------------------------------
 
 /// 上限を明示注入した `EngineCore` を作る。

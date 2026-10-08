@@ -128,7 +128,7 @@
 //! 別上限 `batch_limits.max_files_per_batch`（既定 64。Issue #860）も通るため、
 //! `--max-insert-rows` を明示指定した値・または未指定時の既定（上限なし）が
 //! 64 超であっても、`--batch-max-files`（下記）または環境変数
-//! `VECTOR_DB_BATCH_MAX_FILES` を併せて引き上げない限り複数行 `VALUES` は
+//! `FANDHE_DB_BATCH_MAX_FILES` を併せて引き上げない限り複数行 `VALUES` は
 //! 64 行超で `54000` のまま。`--max-insert-rows` を明示指定してこの実効上限
 //! を超える場合のみ起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
 //! `wire_server::dml_limits_opt::insert_rows_cap_warning`）。
@@ -136,7 +136,7 @@
 //! `--batch-max-files <N>`（Issue #1166）: `batch_limits.max_files_per_batch`
 //! （SQL 複数行 `VALUES`・NoSQL `insert rows[]`・ファイル形バッチ・COPY FROM が
 //! 共有する 1 バッチ件数上限）をプロセス全体に対して起動時に設定する。
-//! 優先順位は **CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64**。
+//! 優先順位は **CLI 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES` > 既定 64**。
 //! 指定可能範囲は `1`〜`1,000,000`
 //! （`engine::batch_limits::MAX_BATCH_MAX_FILES`）。範囲外・非数値・値欠落・
 //! 2 回目以降の重複指定は fail-closed で起動エラー。解決は
@@ -982,7 +982,7 @@ fn run_server(args: &[String]) -> ExitCode {
 
     // Issue #1166: `--batch-max-files` を bind・ユーザーストア読込より前に
     // 解決する（fail-closed）。`BatchLimits::default()` が環境変数
-    // `VECTOR_DB_BATCH_MAX_FILES`・既定を解決済みで、CLI 明示があれば上書きする
+    // `FANDHE_DB_BATCH_MAX_FILES`・既定を解決済みで、CLI 明示があれば上書きする
     // （CLI > 環境変数 > 既定）。この値を `with_batch_limits` と警告判定の両方へ
     // 渡し、engine の実効値と警告の判定値を一致させる。
     let batch_limits = match wire_server::dml_limits_opt::resolve_batch_limits(
@@ -995,6 +995,13 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // 改名前の環境変数 `VECTOR_DB_BATCH_MAX_*` は読まれない（既定の上限に戻り、
+    // より厳しい側＝fail-closed へ倒れる）ため、設定されていれば移行を促す警告を
+    // 1 変数 1 行で出す。起動は止めず、警告に設定値は含めない。
+    for (old, new) in engine::batch_limits::legacy_batch_env_vars_set() {
+        engine::log_stderr!("warning: {old} is no longer read; use {new}");
+    }
 
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
     // 同時実行数・中断記録数の上限）を

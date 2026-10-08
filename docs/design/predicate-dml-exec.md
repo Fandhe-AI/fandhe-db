@@ -260,9 +260,9 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   multi_row_insert_respects_configured_higher_insert_row_limit`・
   `multi_row_insert_default_has_no_row_count_cap` 参照）。`max_files_per_batch`
   は Issue #1166 で CLI フラグ `--batch-max-files`（範囲 `1..=1,000,000`。優先
-  順位は CLI 明示 > 環境変数 `VECTOR_DB_BATCH_MAX_FILES` > 既定 64）からも設定
+  順位は CLI 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES` > 既定 64）からも設定
   できる。複数行 `VALUES` は `max_batch_chunks`（既定 4096。環境変数
-  `VECTOR_DB_BATCH_MAX_CHUNKS`）の判定も受けるため、実効行数上限は
+  `FANDHE_DB_BATCH_MAX_CHUNKS`）の判定も受けるため、実効行数上限は
   `min(max_files_per_batch, max_batch_chunks)` になる。`--max-insert-rows` を
   明示指定し、その値がこの実効上限を超える場合、CLI
   の引き上げが黙って無効化される事故を防ぐため、`wire_server::dml_limits_opt::
