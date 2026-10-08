@@ -1,7 +1,7 @@
 //! engine の一通りの機能（SQL 表層・ベクトル検索・RLS）を通しで実行し、
 //! レイテンシとリソース利用状況を計測して JSON を stdout へ出力するベンチマーク。
 //!
-//! `cargo run --release -p fandhe-vector-db-engine --example feature_bench` で実行する。依存追加は
+//! `cargo run --release -p fandhe-db-engine --example feature_bench` で実行する。依存追加は
 //! せず std のみで計測する（`/proc/self/status`・`/proc/self/stat` を読む簡易実装。
 //! Linux 以外では該当欄が 0 のまま出力される）。
 //!

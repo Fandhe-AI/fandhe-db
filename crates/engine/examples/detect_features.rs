@@ -9,7 +9,7 @@
 //! するための素材（コンパイル時 `cfg!(target_feature)` 列・マクロ結果列・
 //! macOS では `sysctl` による相互検証列）を表として出力する。
 //!
-//! `cargo run -p fandhe-vector-db-engine --release --example detect_features`（`make
+//! `cargo run -p fandhe-db-engine --release --example detect_features`（`make
 //! detect-features`）で実行し、出力を
 //! `docs/design/chip-kernel-guidelines.md` の該当節へ転記する運用とする。
 //!

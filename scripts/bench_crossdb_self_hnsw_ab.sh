@@ -75,10 +75,10 @@ case "${WIRE_SERVER_BIN}" in
   /*) : ;;
   *) WIRE_SERVER_BIN="$(pwd)/${WIRE_SERVER_BIN}" ;;
 esac
-[ -x "${WIRE_SERVER_BIN}" ] || die "wire-server binary not found: ${WIRE_SERVER_BIN} (run: cargo build --release -p fandhe-vector-db-wire-server)"
+[ -x "${WIRE_SERVER_BIN}" ] || die "wire-server binary not found: ${WIRE_SERVER_BIN} (run: cargo build --release -p fandhe-db-wire-server)"
 export CROSSDB_SELF_BINARY="${WIRE_SERVER_BIN}"
 PROBE_BIN="${CROSSDB_PLAN_PROBE_BINARY:-${REPO_ROOT}/target/release/examples/crossdb_plan_probe}"
-[ -x "${PROBE_BIN}" ] || die "crossdb_plan_probe binary not found: ${PROBE_BIN} (run: cargo build --release -p fandhe-vector-db-engine --example crossdb_plan_probe)"
+[ -x "${PROBE_BIN}" ] || die "crossdb_plan_probe binary not found: ${PROBE_BIN} (run: cargo build --release -p fandhe-db-engine --example crossdb_plan_probe)"
 
 ROWS_REDB="${CROSSDB_DIR}/docs25k.redb"
 QUERIES_FILE="${CROSSDB_DIR}/queries200.jsonl"

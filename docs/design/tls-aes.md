@@ -120,7 +120,7 @@ lane 0 だけを使うラッパーとし、コードパスを 1 本にまとめ�
 `aes.rs::tests::aes128_throughput_reference` を追加した。実行方法:
 
 ```sh
-cargo test -p fandhe-vector-db-wire-server --release \
+cargo test -p fandhe-db-wire-server --release \
   aes128_throughput_reference -- --ignored --nocapture
 ```
 

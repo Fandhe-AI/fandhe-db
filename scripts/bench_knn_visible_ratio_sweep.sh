@@ -114,7 +114,7 @@ mkdir -p "${OUT_DIR}"
 } >"${OUT_DIR}/env.txt"
 
 echo "building knn_profile_bench (release, once)"
-(cd "${REPO_ROOT}" && cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run)
+(cd "${REPO_ROOT}" && cargo bench --bench knn_profile_bench -p fandhe-db-engine --no-run)
 
 DEFAULT_CANDIDATE_SET="default"
 CANDIDATE_SET="${SWEEP_CANDIDATES:-${DEFAULT_CANDIDATE_SET}}"
@@ -196,7 +196,7 @@ run_one() {
     BENCH_KNN_PROFILE_FULL_SCAN_RATIO="${FULL_SCAN_RATIO}" \
     BENCH_KNN_PROFILE_SPARSE_VISITED_MAX="${SPARSE_VISITED_MAX}" \
     BENCH_KNN_PROFILE_ACORN_MAX_VISIBLE_RATIO="${ACORN_MAX_VISIBLE_RATIO}" \
-    cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine >>"${log}" 2>&1
+    cargo bench --bench knn_profile_bench -p fandhe-db-engine >>"${log}" 2>&1
 }
 
 cd "${REPO_ROOT}"

@@ -68,7 +68,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 ### wire-server の起動（TASK-73）
 
 ```bash
-cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> \
+cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> \
   [--bind 127.0.0.1:5432] [--surface sql|nosql] \
   [--search-engine default|hnsw|hnsw_f16|hnsw_i8] \
   [--hnsw-full-scan-ratio <num>/<den>] \
@@ -489,7 +489,7 @@ gh secret set BENCH_MAX_CONTRAST_RATIO --env bench-gate
 
 未設定のまま実行すると `crates/engine/benches/simd_bench.rs`／`batch_bench.rs`／`contrast_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-`simd_bench.rs` の標準出力は各判定（p95_latency・topk_consistency・diagnostic_ab）の pass/fail と非数値の状態のみで、median・p95・recall_min・診断 A/B の a_median/b_median/median_ratio 等の実測値は出力しません（AGENTS.md P0。`contrast_bench.rs`〔CORE-5〕と同方針。Issue #277）。実測値がローカルで必要な場合は `cargo bench --bench simd_bench -p fandhe-vector-db-engine -- --verbose` で出力できますが、`GITHUB_ACTIONS` が設定された環境（CI）では `--verbose` は fail-closed で拒否されます（public ログへの実測値混入防止）。実測値は非公開の記録先へ保存し、public 資産（コード・PR・Issue 等）へ転記しないでください。
+`simd_bench.rs` の標準出力は各判定（p95_latency・topk_consistency・diagnostic_ab）の pass/fail と非数値の状態のみで、median・p95・recall_min・診断 A/B の a_median/b_median/median_ratio 等の実測値は出力しません（AGENTS.md P0。`contrast_bench.rs`〔CORE-5〕と同方針。Issue #277）。実測値がローカルで必要な場合は `cargo bench --bench simd_bench -p fandhe-db-engine -- --verbose` で出力できますが、`GITHUB_ACTIONS` が設定された環境（CI）では `--verbose` は fail-closed で拒否されます（public ログへの実測値混入防止）。実測値は非公開の記録先へ保存し、public 資産（コード・PR・Issue 等）へ転記しないでください。
 
 CORE-5（対照エンジンとの p95 レイテンシ比較。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）は usearch の総当たり `exact_search`（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176。クレート採用と公開境界はオーナー承認済み〔2026-08-26〕）。`contrast_bench.rs` が被検（`ParallelSearchProvider`）と対照エンジンを同一データ・同一クエリで interleaved A/B 実行し、両者の p95 レイテンシ比率（被検/対照）が `BENCH_MAX_CONTRAST_RATIO` 以下であることを判定します。CORE-3/CORE-4（`simd_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。閾値の具体値は spec が SSOT のため本リポジトリには記載せず、bench の標準出力にも出しません。`contrast-bench` feature は `make lint`／`make test`（lefthook pre-push 含む）が `--all-features` で実行するため、`make bench-contrast` に限らずこれらのローカル実行・CI でも usearch の C++ ビルドが走ります。C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに C++17 コンパイラがない環境では `make lint`／`make test`／`make ci` が失敗します）。
 
@@ -549,7 +549,7 @@ perf 系 ADR・Issue が個別に定めてきた計測規約（交互実行・�
 > [!IMPORTANT]
 > `.github/workflows/bench.yml` に `bench-tier` ジョブは**置きません**。GitHub ホステッド runner には常駐 Ollama が無く、self-hosted runner の使用は ai-review の codex / review ジョブに限る組織承認済み例外の範囲外（AGENTS.md「CI・ワークフローの改変（P1）」。self-hosted 経路は過去の指摘により撤去済み）のため、CI 上のどの設定（opt-in の有無）でも実測を成功させる経路が存在しません（PR #269 Codex 指摘）。実測は本節の手順により GitHub Actions 外の承認済み計測環境で運用者が直接実行してください。これが TASK-116 受け入れ基準実測の正式な入口です。
 
-常駐 Ollama を持つ環境で `make bench-tier` を実行してください。必要な opt-in・接続・閾値 env の一覧（変数名と用途のみ。値は含みません）は `cargo bench --bench tier_latency_bench -p fandhe-vector-db-engine -- --help` で表示されます。未設定・不正値のまま opt-in（`BENCH_TIER` 設定）した場合は fail-closed で不足している env 名を含む明示エラーとして表示されます。値そのもの・p95 上限は spec 由来のため本リポジトリには記載しません。
+常駐 Ollama を持つ環境で `make bench-tier` を実行してください。必要な opt-in・接続・閾値 env の一覧（変数名と用途のみ。値は含みません）は `cargo bench --bench tier_latency_bench -p fandhe-db-engine -- --help` で表示されます。未設定・不正値のまま opt-in（`BENCH_TIER` 設定）した場合は fail-closed で不足している env 名を含む明示エラーとして表示されます。値そのもの・p95 上限は spec 由来のため本リポジトリには記載しません。
 
 常駐 Ollama の応答形式は非決定的で、`PlanError::InvalidResponse`（LLM 不正応答）が試行中に発生することがあります（Issue #316）。本ベンチはこれを除外対象として扱い、規定の有効サンプル数に達するまで追加試行で埋め合わせます（`Timeout`／`Unavailable` 等は従来どおり致命エラーとして即座に非ゼロ終了します）。段ごとの除外数上限は任意 env `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS`（未設定時は本リポ既定値、固定上限値 1000 を超える値は fail-closed で拒否）で調整でき、上限を超えた場合は該当段名を含む非ゼロ終了メッセージとともに判定未到達のまま終了します。標準出力には各段の試行回数・除外回数（`attempts=… invalid_responses=…`）を記録します（p95 上限は引き続き非出力）。詳細は `docs/design/tier-latency-acceptance.md`「不正応答試行の扱い」節を参照してください。
 
@@ -651,7 +651,7 @@ before/after の実行順に沿ってファイル名付きで一覧表示でき�
 前後比較の実測結果は `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #547」
 節を参照してください。
 
-`cargo run --release -p fandhe-vector-db-engine --example feature_bench` は SQL 表層・ベクトル
+`cargo run --release -p fandhe-db-engine --example feature_bench` は SQL 表層・ベクトル
 検索・RLS を含む 13 フェーズ（`ingest`・`hybrid_rrf`・`vector_knn` 等）を
 横断的に計測し JSON を stdout へ出力します（依存追加なし・std のみ。
 `BENCH_FEATURE_ENGINE`／`BENCH_FEATURE_SCALE` による ANN opt-in・規模上書きは
@@ -748,8 +748,8 @@ make rerank-cross-encoder-eval
 
 - Docker
 - Python venv: `pip install -r scripts/crossdb_bench/requirements.txt`
-- `cargo build --release -p fandhe-vector-db-wire-server`
-- fixture 生成: `cargo run --release -p fandhe-vector-db-engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`（dim=768 は `docs25k-d768.redb` のように `-d<dim>` 付きファイル名で生成し `seed`／`queries` の第 2 引数〔dim〕を 768 にする。下記「実行」参照）
+- `cargo build --release -p fandhe-db-wire-server`
+- fixture 生成: `cargo run --release -p fandhe-db-engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`（dim=768 は `docs25k-d768.redb` のように `-d<dim>` 付きファイル名で生成し `seed`／`queries` の第 2 引数〔dim〕を 768 にする。下記「実行」参照）
 
 **実行**:
 
@@ -764,9 +764,9 @@ make bench-crossdb
 ```bash
 # dim=768 の fixture を生成してから計測する例（Issue #466）
 S=$CROSSDB_DIR
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
-cargo run --release -p fandhe-vector-db-engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+cargo run --release -p fandhe-db-engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p fandhe-db-engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p fandhe-db-engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
 CROSSDB_DIM=768 make bench-crossdb
 ```
 
@@ -963,10 +963,10 @@ let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
 - `BENCH_FEATURE_DIM` / `BENCH_KNN_PROFILE_DIM`（Issue #466）: 正整数・既定 128・上限 4,096。dim=768／1536 が Issue #365 で採否の判別変数と判明したため、横断 SQL ベンチ側にも dim を可変にする規模点を用意したもの。未知値・0・上限超過は fail-closed で拒否
 
 ```bash
-BENCH_FEATURE_ENGINE=hnsw cargo run --release -p fandhe-vector-db-engine --example feature_bench
-BENCH_FEATURE_ENGINE=hnsw BENCH_FEATURE_SCALE=4 cargo run --release -p fandhe-vector-db-engine --example feature_bench  # 100,000 行
+BENCH_FEATURE_ENGINE=hnsw cargo run --release -p fandhe-db-engine --example feature_bench
+BENCH_FEATURE_ENGINE=hnsw BENCH_FEATURE_SCALE=4 cargo run --release -p fandhe-db-engine --example feature_bench  # 100,000 行
 BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
-BENCH_FEATURE_DIM=768 cargo run --release -p fandhe-vector-db-engine --example feature_bench
+BENCH_FEATURE_DIM=768 cargo run --release -p fandhe-db-engine --example feature_bench
 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
@@ -1016,7 +1016,7 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
 評価ハーネスです。設計判断の記録は `docs/design/precision-eval-regression.md`
 を参照してください（指標の定義・実測値・パラメータ感度は spec 側で管理します）。
 
-- 層 A（`cargo test -p fandhe-vector-db-engine --test precision_eval`。`make ci` 対象）: 決定的コーパス
+- 層 A（`cargo test -p fandhe-db-engine --test precision_eval`。`make ci` 対象）: 決定的コーパス
   上で評価を通しで実行し、構造不変条件と測定の決定性のみを検査します（指標の実測値は
   アサートも出力もしません。品質の回帰判定は層 B が担います）。
 - 層 B（`make precision-regression`）: 閾値ゲートのみを実行し、指標名と pass/fail
@@ -1044,16 +1044,16 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
 
 ### crates.io への公開（`.github/workflows/release.yml`）
 
-公開名は `fandhe-vector-db-engine`（`crates/engine`）・`fandhe-vector-db-wire-server`
+公開名は `fandhe-db-engine`（`crates/engine`）・`fandhe-db-wire-server`
 （`crates/wire-server`）。ライブラリ名 `engine`・バイナリ名 `wire-server` は据え置きのため、
 ソース内の `use engine::...`・`target/release/wire-server` は不変で、`cargo` の
-`-p`/`--package` に渡す名前だけが公開名になる（例: `cargo test -p fandhe-vector-db-engine`）。
+`-p`/`--package` に渡す名前だけが公開名になる（例: `cargo test -p fandhe-db-engine`）。
 
 公開は `release` workflow の `workflow_dispatch` からのみ行う（タグ push 起点は不採用）。
 
 | 入力 | 値 |
 | ---- | -- |
-| `crate` | `fandhe-vector-db-engine` / `fandhe-vector-db-wire-server` / `all`（`--workspace` で engine → wire-server の依存順に一括公開。初回公開はこれを使う） |
+| `crate` | `fandhe-db-engine` / `fandhe-db-wire-server` / `all`（`--workspace` で engine → wire-server の依存順に一括公開。初回公開はこれを使う） |
 | `version` | 公開するバージョン。対象クレートの `Cargo.toml` と完全一致が必須 |
 | `mode` | `dry-run-only`（既定。ガード群 + `cargo publish --dry-run` のみ） / `publish`（実公開） |
 

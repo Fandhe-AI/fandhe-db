@@ -9,7 +9,7 @@
 # TASK-127 CORE-5（Issue #176）で `usearch` を `contrast-bench` feature 限定の
 # optional 依存として追加した。既定 feature 集合のみを対象にすると当該依存が
 # advisories/licenses/sources/bans の監査から漏れるため、optional 依存を含む
-# 全 feature を監査対象にする（fail-closed。`cargo tree -p fandhe-vector-db-engine --features
+# 全 feature を監査対象にする（fail-closed。`cargo tree -p fandhe-db-engine --features
 # contrast-bench` で実際に解決される依存集合と一致させる）。
 all-features = true
 

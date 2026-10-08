@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${REPO_ROOT}/target/release/examples/crash_tool"
 
 echo "building crash_tool (release)"
-if ! (cd "${REPO_ROOT}" && cargo build --release -p fandhe-vector-db-engine --example crash_tool); then
+if ! (cd "${REPO_ROOT}" && cargo build --release -p fandhe-db-engine --example crash_tool); then
   echo "ERROR: failed to build crash_tool" >&2
   exit 1
 fi

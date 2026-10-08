@@ -229,8 +229,8 @@ PKCS#8 DER/PEM 生成（`ed25519_pkcs8_der`／`ed25519_pkcs8_pem`。RFC 8032
   クライアント切断（Terminate の有無を問わず）が panic・エラー終了・応答送出
   なしに静かに終わることを固定。
 
-`cargo fmt --all -- --check`・`cargo clippy -p fandhe-vector-db-wire-server
---all-targets -- -D warnings`・`cargo test -p fandhe-vector-db-wire-server`
+`cargo fmt --all -- --check`・`cargo clippy -p fandhe-db-wire-server
+--all-targets -- -D warnings`・`cargo test -p fandhe-db-wire-server`
 （lib 1259 件・全結合テストファイル）はすべて green。
 
 ## 対象外（後続 sub-issue）

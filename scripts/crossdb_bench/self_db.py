@@ -187,7 +187,7 @@ class SelfServer:
         if not os.path.exists(self.binary):
             raise FileNotFoundError(
                 f"wire-server binary not found: {self.binary}"
-                "（`cargo build --release -p fandhe-vector-db-wire-server` を先に実行）"
+                "（`cargo build --release -p fandhe-db-wire-server` を先に実行）"
             )
         # 起動前にポートが既に LISTEN していれば別プロセス（前回の残骸等）であり、
         # そのまま進むと wait_for_port が成功して別サーバーを計測してしまうため拒否する。

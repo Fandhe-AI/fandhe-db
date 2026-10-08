@@ -3,7 +3,7 @@ name: Detect features (Apple Silicon)
 # Issue #468 の実機検証用 workflow。GitHub ホステッド Apple Silicon runner
 # （`macos-latest`。AGENTS.md「CI・ワークフローの改変」の runner 方針の範囲内で
 # GitHub ホステッドのみを使用）上で `crates/engine/examples/detect_features.rs`
-# （`make detect-features`）と `cargo test -p fandhe-vector-db-engine --test isa` を実行し、
+# （`make detect-features`）と `cargo test -p fandhe-db-engine --test isa` を実行し、
 # `is_aarch64_feature_detected!` マクロが Apple Silicon 上で実際にどう振る舞うかを
 # CI ログへ記録する。
 #
@@ -163,11 +163,11 @@ jobs:
           {
             echo "### detect_features 出力"
             echo '```'
-            cargo run -p fandhe-vector-db-engine --example detect_features
+            cargo run -p fandhe-db-engine --example detect_features
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # isa.rs の Neon 実行時検出（`is_aarch64_feature_detected!("neon")`）が
       # 実機で肯定側に倒れることを直接検証する（tests/isa.rs 参照）
       - name: Run isa tests
-        run: cargo test -p fandhe-vector-db-engine --test isa -- --nocapture
+        run: cargo test -p fandhe-db-engine --test isa -- --nocapture

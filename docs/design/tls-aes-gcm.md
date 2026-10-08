@@ -154,7 +154,7 @@ best-effort にゼロ化する（内包する `Aes128` 自身も Drop でラウ�
 実行方法:
 
 ```sh
-cargo test -p fandhe-vector-db-wire-server --release \
+cargo test -p fandhe-db-wire-server --release \
   aes128_gcm_throughput_reference -- --ignored --nocapture
 ```
 

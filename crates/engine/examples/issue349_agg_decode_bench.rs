@@ -1,6 +1,6 @@
 //! Issue #349（集計・`GROUP BY` の行デコードをスクラッチ再利用方式へ統一）の
 //! 前後比較専用の手動実行ハーネス（`multi_dim_bench.rs`・`concurrent_write_bench.rs`
-//! と同じく `cargo test` の対象には含めない。`cargo run -p fandhe-vector-db-engine --release --example
+//! と同じく `cargo test` の対象には含めない。`cargo run -p fandhe-db-engine --release --example
 //! issue349_agg_decode_bench` で実行する）。時間依存の測定値を CI のアサーションに
 //! 混ぜない方針（`.claude/rules/coding-rust.md`）のため、`tests/sql_aggregate.rs`・
 //! `tests/sql_group_by.rs`（正しさの回帰テスト・CI 常時実行）とはファイルを

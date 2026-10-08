@@ -449,7 +449,7 @@ fn write_user_store_file_generates_unique_fixture_dirs() {
 /// `WIRE_AUTH_STRESS_THREADS`（既定 4）・`WIRE_AUTH_STRESS_ITERATIONS`（既定 10）。
 ///
 /// debug ビルドでは Argon2id が遅く既定パラメータでは重いため、`--release` 推奨:
-/// `cargo test --release -p fandhe-vector-db-wire-server --test wire_auth -- --ignored --nocapture`
+/// `cargo test --release -p fandhe-db-wire-server --test wire_auth -- --ignored --nocapture`
 #[test]
 #[ignore = "opt-in stress harness for Issue #172; run explicitly with --release --ignored"]
 fn wire_auth_stress_parallel_successful_auth() {

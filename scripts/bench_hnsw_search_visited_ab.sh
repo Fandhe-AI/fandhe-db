@@ -66,7 +66,7 @@ mkdir -p "${OUT_DIR}"
 
 echo "building hnsw_search_bench (release, once, --features bench-internals)"
 (cd "${REPO_ROOT}" && BENCH_HNSW_SEARCH_COMMIT="$(git rev-parse HEAD)" \
-  cargo bench --bench hnsw_search_bench -p fandhe-vector-db-engine --features bench-internals --no-run)
+  cargo bench --bench hnsw_search_bench -p fandhe-db-engine --features bench-internals --no-run)
 
 # arm ごとの env 設定を解決する（$1=arm 名。case 全分岐で明示設定し、親
 # シェルからの export 値が意図せず引き継がれる事故を防ぐ）。
@@ -93,7 +93,7 @@ run_one() {
     BENCH_HNSW_SEARCH_SPARSE_VISITED_MAX="${SPARSE_VISITED_MAX}" \
     BENCH_HNSW_SEARCH_COMMIT="$(cd "${REPO_ROOT}" && git rev-parse HEAD)" \
     BENCH_DEDICATED_ENV="${BENCH_DEDICATED_ENV:-}" \
-    cargo bench --bench hnsw_search_bench -p fandhe-vector-db-engine --features bench-internals >>"${log}" 2>&1
+    cargo bench --bench hnsw_search_bench -p fandhe-db-engine --features bench-internals >>"${log}" 2>&1
 }
 
 cd "${REPO_ROOT}"

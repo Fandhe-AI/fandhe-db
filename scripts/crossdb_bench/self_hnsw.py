@@ -225,7 +225,7 @@ def probe_binary_path() -> str:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"crossdb_plan_probe binary not found: {path}"
-            "（`cargo build --release -p fandhe-vector-db-engine --example crossdb_plan_probe` を先に実行）"
+            "（`cargo build --release -p fandhe-db-engine --example crossdb_plan_probe` を先に実行）"
         )
     return path
 

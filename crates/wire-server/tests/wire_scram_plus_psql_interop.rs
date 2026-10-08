@@ -12,7 +12,7 @@
 //! 決定に使う。
 //!
 //! CI には配線しない（psql 依存・`make ci` に含めない）。
-//! `cargo test -p fandhe-vector-db-wire-server --test wire_scram_plus_psql_interop -- --ignored --nocapture`
+//! `cargo test -p fandhe-db-wire-server --test wire_scram_plus_psql_interop -- --ignored --nocapture`
 //! で手動実行する。
 
 #[path = "common/tls_client.rs"]

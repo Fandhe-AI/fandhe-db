@@ -8,7 +8,7 @@
 //! で常時（`make ci`）回帰保護する契約と同じバイト列を、実クライアント経由で
 //! 追加検証する。ローカル・Docker 開発コンテナには `psql`／`psycopg`／`pg` が
 //! 導入されていないため `#[ignore]` とし、`make e2e-three-client`
-//! （`cargo test -p fandhe-vector-db-wire-server --test three_client_e2e -- --ignored`）から
+//! （`cargo test -p fandhe-db-wire-server --test three_client_e2e -- --ignored`）から
 //! 明示的に実行する（CI の必須チェックには含めない。psql・psycopg・pg の並
 //! 導入をローカル環境へ強制すると `make ci` 自体が壊れるため。ADR:
 //! `docs/design/three-client-e2e-harness.md`）。

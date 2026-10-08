@@ -19,7 +19,7 @@
 //! `bench-internals` 限定）に依存する [`sparse_refetch_schedule`] とその import・
 //! 依存テストのみを同 feature の背後に個別に置き、コーパス生成・SQL 文組み立て・
 //! tokenize 複製・`refuse_under_github_actions` 等の時間非依存テストは
-//! `cargo test -p fandhe-vector-db-engine`（feature 無指定）でも実行される（1 巡目の対応では
+//! `cargo test -p fandhe-db-engine`（feature 無指定）でも実行される（1 巡目の対応では
 //! ファイル全体を `#![cfg(...)]` で覆っていたため、これらの既存テストまで既定
 //! feature で 0 件になっていた）。
 

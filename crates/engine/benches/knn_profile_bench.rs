@@ -72,7 +72,7 @@
 //!
 //! [`dot_wrapper`] は `engine::isa::current().dot(a, b)` を呼ぶだけの
 //! `#[inline(never)]` の薄いラッパーで、production コードは無変更のまま
-//! `cargo bench --bench knn_profile_bench -p fandhe-vector-db-engine --no-run` でビルドしたバイナリを
+//! `cargo bench --bench knn_profile_bench -p fandhe-db-engine --no-run` でビルドしたバイナリを
 //! `objdump -d` で逆アセンブルする手動手順の入口にする（`docs/design/
 //! knn-stage-profile.md`「`dot_lanes` の実アセンブリ確認」節に手順・結果を記録する）。
 //!

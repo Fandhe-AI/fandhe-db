@@ -2,7 +2,7 @@
 //! ポインタ: `docs/spec/05-tasks.md` TASK-151・`docs/spec/04-behavior/extensions.md`
 //! EXT-2・`docs/spec/06-roadmap.md` MS-6）。
 //!
-//! `cargo test` の対象には含めない手動実行専用ツール（`cargo run -p fandhe-vector-db-engine --release
+//! `cargo test` の対象には含めない手動実行専用ツール（`cargo run -p fandhe-db-engine --release
 //! --example high_dim_bench` で実行する）。時間依存の測定値を CI のアサーションに
 //! 混ぜない方針（.claude/rules/coding-rust.md）のため、`tests/extensions.rs` の
 //! `ext2_2000_dim_*`（正しさの回帰テスト・CI 常時実行）とはファイルを分離している

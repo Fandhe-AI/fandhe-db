@@ -132,7 +132,7 @@ concurrent_process_count() {
 cd "${REPO_ROOT}"
 
 echo "building ingest_profile_bench (release, once)"
-cargo bench --bench ingest_profile_bench -p fandhe-vector-db-engine --no-run
+cargo bench --bench ingest_profile_bench -p fandhe-db-engine --no-run
 
 echo "wire-server binary (unused by this driver — engine bench only; docs 側で明記)"
 
@@ -152,7 +152,7 @@ run_arm() {
   BENCH_INGEST_PROFILE_MODE=single \
     BENCH_INGEST_PROFILE_STATEMENTS="${STATEMENTS}" \
     BENCH_INGEST_PROFILE_DURABILITY="${arm}" \
-    cargo bench --bench ingest_profile_bench -p fandhe-vector-db-engine >>"${log}" 2>&1
+    cargo bench --bench ingest_profile_bench -p fandhe-db-engine >>"${log}" 2>&1
 }
 
 for pair in $(seq 1 "${AB_PAIRS}"); do

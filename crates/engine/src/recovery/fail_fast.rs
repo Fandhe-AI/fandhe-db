@@ -226,7 +226,7 @@ mod tests {
     /// 実際の子プロセスエントリはこの 1 関数に集約する（`--exact` で名指しする
     /// テスト関数名を固定するため。分岐は `CHILD_MODE_ENV` の値で行う）。
     /// 環境変数が未設定の通常の `cargo test` 実行では即座に return する
-    /// no-op であり、通常の `cargo test -p fandhe-vector-db-engine` の結果には影響しない。
+    /// no-op であり、通常の `cargo test -p fandhe-db-engine` の結果には影響しない。
     #[test]
     fn run_child_dispatch() {
         run_child_if_requested();

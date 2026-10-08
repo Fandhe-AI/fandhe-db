@@ -149,7 +149,7 @@ fn wire_bulk_select_spanning_response_buffer_cap_delivers_all_rows() {
 
 /// `crossdb-bench.md` の `bulk_knn_k1000`（`id`+`body`・k=1000）相当の wire 段
 /// レイテンシを手動計測するための `#[ignore]` テスト（Issue #481 受け入れ条件
-/// (a)）。`cargo test --release -p fandhe-vector-db-wire-server --test wire_bulk_response -- \
+/// (a)）。`cargo test --release -p fandhe-db-wire-server --test wire_bulk_response -- \
 /// --ignored --nocapture wire_bulk_select_latency_measurement` で実行する。
 /// CI では実行しない（本 doc の数値は共有開発環境の参考値であり、専有環境
 /// 再実測はオーナー作業という本リポの既存方針 `docs/design/

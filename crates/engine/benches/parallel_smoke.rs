@@ -3,7 +3,7 @@
 //! 提供するのみで、数値基準の回帰テスト化・CI 定期実行は TASK-127 の範囲）。
 //! CORE-5（対照エンジン比較）は `contrast_bench.rs`（TASK-127・Issue #176）で判定する。
 //!
-//! `cargo bench --bench parallel_smoke -p fandhe-vector-db-engine` で手動実行する（`make ci` の対象外。
+//! `cargo bench --bench parallel_smoke -p fandhe-db-engine` で手動実行する（`make ci` の対象外。
 //! `Cargo.toml` 側 `harness = false` / `test = false` は `benches/measurement.rs` と
 //! 同一方針。時間依存の測定値を CI アサーションへ混ぜない）。
 //!

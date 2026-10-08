@@ -7,13 +7,13 @@
 # crates.io 公開名（`.github/workflows/release.yml`）。engine と同じ org 接頭辞。
 # バイナリ名は下記 `[[bin]] name = "wire-server"` で据え置き（`target/release/wire-server`・
 # ベンチスクリプトの `target.name == "wire-server"` 照合は不変）。
-name = "fandhe-vector-db-wire-server"
+name = "fandhe-db-wire-server"
 version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
-description = "PostgreSQL wire protocol v3 compatible server for the fandhe vector-db engine"
+description = "PostgreSQL wire protocol v3 compatible server for the fandhe-db engine"
 
 [lib]
 name = "wire_server"
@@ -27,7 +27,7 @@ path = "src/main.rs"
 # ワークスペース内クレートへの path 依存。crates.io 公開（`cargo publish`）時は path が
 # 剥がされ `version` で解決されるため完全固定の version を併記する。`package =` で
 # パッケージ名（crates.io 公開名）と `engine::` のソース内参照名を分離する。
-engine = { package = "fandhe-vector-db-engine", path = "../engine", version = "=0.2.0" }
+engine = { package = "fandhe-db-engine", path = "../engine", version = "=0.2.0" }
 
 [features]
 # Issue #705: テスト専用の commit 後 panic 注入（`--fault-inject

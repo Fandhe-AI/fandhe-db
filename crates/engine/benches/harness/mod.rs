@@ -59,7 +59,7 @@ pub mod hybrid_latency;
 // 大半（コーパス生成・SQL 文組み立て・tokenize 複製・fail-closed 判定等）は
 // `engine::hybrid::sparse_refetch_observed`（非既定 feature `bench-internals`
 // 限定・`crates/engine/src/hybrid.rs` 参照）に依存しない時間非依存の複製
-// ロジックであり、既定 feature の `cargo test -p fandhe-vector-db-engine` でも検証すべき対象
+// ロジックであり、既定 feature の `cargo test -p fandhe-db-engine` でも検証すべき対象
 // のため、モジュール自体は無条件でコンパイルする。`sparse_refetch_observed`
 // に依存する関数（`sparse_refetch_schedule`）のみモジュール内で個別に
 // `#[cfg(feature = "bench-internals")]` を付ける。
