@@ -1338,7 +1338,7 @@ fn init_gpu_context() -> Result<GpuContext, String> {
     let shader_f16_requested = adapter.features().contains(wgpu::Features::SHADER_F16);
     let device_descriptor =
         |features: wgpu::Features, limits: wgpu::Limits| wgpu::DeviceDescriptor {
-            label: Some("vector-db batch backend"),
+            label: Some("fandhe-db batch backend"),
             required_features: features,
             required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::default(),

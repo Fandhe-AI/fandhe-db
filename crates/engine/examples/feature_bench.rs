@@ -719,7 +719,7 @@ fn main() {
 
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
-        "vector-db-feature-bench-{}-{:x}.redb",
+        "fandhe-db-feature-bench-{}-{:x}.redb",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

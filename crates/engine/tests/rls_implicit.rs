@@ -406,7 +406,7 @@ fn rls6_disallowed_sql_forms_rejected() {
 
     for sql in [
         "SET search_path = tenant_b",
-        "SELECT set_config('vector_db.tenant', 'tenant-b', false)",
+        "SELECT set_config('fandhe_db.tenant', 'tenant-b', false)",
         format!("SELECT * FROM docs ORDER BY embedding <=> '{q}' LIMIT 10; SELECT 1").as_str(),
     ] {
         let err = core.execute_sql(&ctx, sql).expect_err("should be rejected");

@@ -66,5 +66,5 @@ fn describe_temp_dir_state_reports_the_temp_dir_path_without_panicking() {
         "description must mention the temp_dir() path: {description}"
     );
     assert!(description.contains("writable="));
-    assert!(description.contains("leftover_vector_db_entries="));
+    assert!(description.contains("leftover_fandhe_db_entries="));
 }

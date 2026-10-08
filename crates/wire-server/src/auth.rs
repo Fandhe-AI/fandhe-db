@@ -452,6 +452,7 @@ impl UserStore {
 /// の生バイト列）にドメインタグを付けて SHA-256 するのみで、ユーザーストアの
 /// 内容（ServerKey・行順）を一切参照しない。同じ秘密ファイルを使い続ける限り
 /// ストア更新・プロセス再起動をまたいで安定する（存在オラクル対策）。
+// プロジェクト名変更（vector-db → fandhe-db）後も値を固定する。存在秘匿のダミー応答の決定性に使う識別子でありブランド名ではないため、変更すると決定性契約が変わる。
 fn derive_scram_mock_key(secret: &[u8]) -> [u8; scram::KEY_LEN] {
     let mut input = Vec::with_capacity(32 + secret.len());
     input.extend_from_slice(b"vector-db/scram/mock-key/v2");

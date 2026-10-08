@@ -447,6 +447,7 @@ pub fn encode_row_reimpl_into_slice(
 }
 
 /// `recovery::content_hash.rs::DOMAIN_TAG` の独立コピー。
+// プロジェクト名変更（vector-db → fandhe-db）後も値を固定する。永続化済みデータの整合性検証に使う識別子でありブランド名ではないため、変更すると既存 redb の recovery が不整合判定される。
 const CONTENT_HASH_DOMAIN_TAG: &[u8] = b"vector-db/op_ledger/content_hash/v1";
 /// `recovery::content_hash.rs::OpTag::InsertBatch` の独立コピー。
 const CONTENT_HASH_OP_TAG_INSERT_BATCH: u8 = 2;

@@ -233,7 +233,7 @@ mod tests {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "vector-db-wire-server-query-gate-{label}-{}-{seq}.redb",
+            "fandhe-db-wire-server-query-gate-{label}-{}-{seq}.redb",
             std::process::id()
         ));
         path

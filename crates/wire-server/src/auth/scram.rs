@@ -529,6 +529,7 @@ pub fn verify_client_final(
 /// `mock_key` から導出した固定値で、`verify_client_final` の全計算経路
 /// （XOR・`H(ClientKey)`・`constant_time_eq`）を必ず最後まで実行させる目的
 /// のみに使う（proof が既知の SaltedPassword に対応しない限り一致しない）。
+/// プロジェクト名変更（vector-db → fandhe-db）後も値を固定する。存在秘匿のダミー応答の決定性に使う識別子でありブランド名ではないため、変更すると決定性契約が変わる。
 pub fn mock_verifier(mock_key: &[u8; KEY_LEN], username: &str, iterations: u32) -> ScramVerifier {
     let mut salt_input = Vec::with_capacity(32 + username.len());
     salt_input.extend_from_slice(b"vector-db/scram/mock-salt/v1");

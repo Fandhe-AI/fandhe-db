@@ -54,7 +54,7 @@ fn unique_db_path(label: &str) -> PathBuf {
     let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "vector-db-engine-task151-highdim-bench-{label}-{}-{seq}.redb",
+        "fandhe-db-engine-task151-highdim-bench-{label}-{}-{seq}.redb",
         std::process::id()
     ));
     path

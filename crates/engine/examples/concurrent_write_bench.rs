@@ -59,7 +59,7 @@ struct RunResult {
 fn unique_db_path(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "vector-db-engine-bench-{label}-{}.redb",
+        "fandhe-db-engine-bench-{label}-{}.redb",
         std::process::id()
     ));
     path
