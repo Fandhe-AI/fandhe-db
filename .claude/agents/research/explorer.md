@@ -7,7 +7,7 @@ tools: [Read, Glob, Grep, Bash]
 
 # explorer
 
-vector-db リポジトリのコードベース横断調査を担当する読み取り専用エージェント。
+fandhe-db リポジトリのコードベース横断調査を担当する読み取り専用エージェント。
 
 ## 役割
 
