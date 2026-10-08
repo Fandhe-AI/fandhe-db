@@ -805,3 +805,158 @@ BEFORE_BIN=/path/to/bin/before AFTER_BIN=/path/to/bin/after \
   （自動運転モードのため本 Issue では Issue 起票を行っていない）
 - 共有 QEMU 環境（本開発環境）での実測は本節のとおり参考値・採否根拠に
   しない（`benchmark-judgement-policy.md` §5）
+
+## Issue #1476 追記: black_box 導入による性能影響の計測
+
+Issue #1478（親 #1474・codegen 退行 #1475 の修正）は `dot_lanes_multi_acc` に
+2 点を入れた。(a) wide アキュムレータを `[f32; WIDE]` から
+`[[f32; LANES]; DOT_ACCUMULATORS]` へ変更し、(b) 逐次和の直前に
+`core::hint::black_box(wide)` を 1 回挟んだ（ループ脱出時のみ作用）。いずれも
+要素ごとの FMA 順序・逐次和の順序は不変（ビット同一）。本節は、`black_box` が dim>=768
+の dot 1 回ごとに足す固定コスト（アキュムレータ全体のメモリ往復）が許容範囲かを
+A/B 計測した記録である（ポインタ: CORE-14）。判定は
+`benchmark-judgement-policy.md` に従う。
+
+### 結論
+
+- **退行なし**。`black_box` の追加コストは rustc 1.98.1（#1478 以前から codegen が clean な版）で
+  arena_scale の 1 dot あたり約 0.6〜0.7 ns（dim768／1536 とも約 1〜2%）に収まり、固定 ±5% 帯内。
+- rustc 1.99.0 では、`black_box` を除いた構造のみの版（`nobb`）は修正前（`before`）と
+  同じく遅く（`after` の約 3.1 倍）、aarch64 の生成コード検査も fail する。**`black_box` は
+  退行修正の本体であり、代替構造の検討は不要**（受け入れ条件 2 は「退行なし・代替不要」で閉じる）。
+- production コード・テスト・依存は変更していない（docs のみ）。
+
+### 計測方式
+
+- arm: `before`＝`dc888f6`（#1478 の親。平坦 `[f32; WIDE]`・`black_box` なし）・
+  `after`＝`4c39bf0`（#1478）・`nobb`＝`after` から `let wide = core::hint::black_box(wide);`
+  の 1 行だけを除いた使い捨てビルド（コミットしない）。`black_box` 単独の寄与は
+  `after` 対 `nobb`、修正全体の効果は `after` 対 `before` で読む
+- rustc は `1.98.1` と `1.99.0` の 2 種。同一 rustc・同一 `Cargo.lock`・`--release`・
+  arm ごとに別 `CARGO_TARGET_DIR`
+- 層 A: `scripts/bench_dot_kernel_ab.sh`（7 ペア・`before → after → before → nobb` 輪番。
+  `before` は 1 周で 2 回走るため 14 サンプル）。`nobb` 対 `after` は 2 arm 実行も別に 1 回（7 ペア）取った
+- 層 B（検索スループット）: `crates/engine/examples/feature_bench`（`BENCH_FEATURE_DIM=768`・
+  25,000 行・50 iters）の `before`／`after` を 5 ペア交互実行し、各 phase の `p50_us` を比較。
+  `bench-chip` の `feature_768` は子プロセスが `-p engine`（改名前のパッケージ名）を呼ぶため
+  現状は起動できず、同一の example を直接実行した
+- 判定: ratio が固定 ±5% 帯と参照区間の実測帯の両方を超え、min と median が同方向のときのみ有意
+
+### 環境
+
+- CPU: Apple M4 Max（aarch64・ネイティブ）・16 コア。`isa::current().isa()` = `Neon`
+- rustc: `1.99.0 (b940084d7 2026-09-28)`・`1.98.1 (48a229cea 2026-09-01)`
+- 負荷: 共有・非専有（`BENCH_DEDICATED_ENV` 未設定）。他ジョブが並走しており loadavg は
+  約 7〜46（16 論理 CPU）。**参考値**（policy §5）。詳細は env.txt
+- 生データ（`docs/design/bench-data/dot-kernel-multi-acc-ab/` 配下）:
+  `20261008T120835Z-1476-env.txt`・`-1476-rustc1.99.0-3arm-summary.tsv`・
+  `-1476-rustc1.99.0-nobb-vs-after-summary.tsv`・`-1476-rustc1.98.1-3arm-summary.tsv`・
+  `-1476-rustc1.99.0-layerB-feature768.tsv`・`-1476-rustc1.98.1-layerB-feature768.tsv`
+
+### 層 A: rustc 1.98.1（clean な版。`black_box` の純コスト）
+
+min-of-7 の ms（`label=current`）と比率。参照区間は dim100／128（`multi_acc` を通らない）の
+run 間幅。cache_resident は 21 行・約 0.15 ms と短く外れ値で幅が 0.79 まで広がるため、
+判定は固定 ±5% 帯と median の併用で行う。
+
+| 区間 | before | nobb | after | after/before (min/median) | after/nobb (min/median) |
+| --- | --- | --- | --- | --- | --- |
+| arena_scale dim768 | 1.042 | 1.041 | 1.059 | 1.016 / 1.006 | 1.017 / 1.007 |
+| arena_scale dim1536 | 2.150 | 2.155 | 2.170 | 1.009 / 1.022 | 1.007 / 1.015 |
+| cache_resident dim768 | 0.155 | 0.156 | 0.158 | 1.019 / 1.025 | 1.013 / 1.025 |
+| cache_resident dim1536 | 0.143 | 0.153 | 0.155 | 1.084 / 1.016 | 1.013 / 1.006 |
+| block4 B 行 arena dim768 | 1.049 | 1.053 | 1.076 | 1.026 / 1.023 | 1.022 / 1.017 |
+| block4 B 行 cache dim768 | 0.147 | 0.149 | 0.153 | 1.041 / 1.033 | 1.027 / 1.026 |
+
+arena_scale の参照帯は 0.056。arena の全行が固定 ±5% 帯内で `Unchanged` 相当。
+cache_resident dim1536 の `after/before` min 1.084 は固定帯を超えるが、median 1.016・
+`after/nobb` 1.013・参照帯 0.79 のため有意としない（`before` の min が外れ値的に低い）。
+arena dim768／1536 の絶対差は 0.018／0.015 ms ÷ 25,000 行 ≒ 0.7／0.6 ns/dot。
+
+### 層 A: rustc 1.99.0（退行が出た版）
+
+| 区間 | before | nobb | after | after/before (min/median) | after/nobb (min/median) |
+| --- | --- | --- | --- | --- | --- |
+| arena_scale dim768 | 3.371 | 3.393 | 1.083 | 0.321 / 0.325 | 0.319 / 0.329 |
+| arena_scale dim1536 | 7.135 | 7.231 | 2.232 | 0.313 / 0.312 | 0.309 / 0.322 |
+| cache_resident dim768 | 0.552 | 0.556 | 0.158 | 0.286 / 0.288 | 0.284 / 0.288 |
+| cache_resident dim1536 | 0.559 | 0.562 | 0.155 | 0.277 / 0.280 | 0.276 / 0.290 |
+| block4 B 行 arena dim768 | 3.373 | 3.413 | 1.088 | 0.323 / 0.339 | 0.319 / 0.336 |
+| block4 B 行 cache dim768 | 0.525 | 0.525 | 0.153 | 0.291 / 0.307 | 0.291 / 0.307 |
+
+2 arm 実行（`nobb` 対 `after`）でも `after/nobb` は arena dim768 0.324／dim1536 0.308、
+cache dim768 0.285／dim1536 0.281 で 3 arm 実行と一致した。`nobb` は `before` と
+同等（0.97〜1.03 倍）であり、構造変更だけでは 1.99.0 の退行は直らず、`black_box` が効いている。
+この版では 3 arm 実行中の loadavg が最大 46 まで上がったが、比が約 0.3 と大きく、
+2 arm 実行でも再現するため、判定（`Improved`）には影響しない。
+
+### 層 B: `feature_bench`（dim768・25,000 行）の phase 別 p50（µs）
+
+5 ペア・min／median。`ratio` は after/before。「自帯」は対象 phase 自身の各 side の run 間
+`(max-min)/min` の大きい方（参考値）。「参照帯」は変更を含まない非ベクトル phase
+（`point_where`・`where_compound`・`agg_count`・`agg_multi`・`group_by_having`・`rls_isolation`）の
+同式の帯の最大値で、policy §4 の実測帯として判定に使う。
+
+| rustc | phase | before min/median | after min/median | ratio_min / ratio_median | 自帯 | 参照帯 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1.98.1 | vector_knn | 706 / 723 | 700 / 715 | 0.992 / 0.989 | 0.086 | 0.237 |
+| 1.98.1 | hybrid_rrf | 8268 / 8418 | 8349 / 8444 | 1.010 / 1.003 | 0.030 | 0.237 |
+| 1.98.1 | mode_recall | 721 / 731 | 691 / 722 | 0.958 / 0.988 | 0.137 | 0.237 |
+| 1.99.0 | vector_knn | 827 / 832 | 683 / 684 | 0.826 / 0.822 | 0.056 | 0.152 |
+| 1.99.0 | hybrid_rrf | 8856 / 8944 | 7983 / 8275 | 0.901 / 0.925 | 0.047 | 0.152 |
+| 1.99.0 | mode_recall | 820 / 864 | 673 / 693 | 0.821 / 0.802 | 0.094 | 0.152 |
+
+参照帯の内訳（最大値を採った phase）は 1.98.1 が `point_where` 0.237、1.99.0 が `where_compound`
+0.152（`agg_multi` 0.134・`point_where` 0.130 が続く）。
+
+判定（固定 ±5% 帯・参照帯の両方を超え、min と median が同方向のときのみ有意）:
+
+- 1.98.1: 3 phase とも改善・悪化率が参照帯 0.237 以内で `Neutral`。
+- 1.99.0 `hybrid_rrf`: 改善率が min 9.9%・median 7.5% で参照帯 0.152 以内のため `Neutral`。
+- 1.99.0 `vector_knn`（改善 17.4%／17.8%）・`mode_recall`（17.9%／19.8%）: 参照帯を僅かに超えるが、
+  非ベクトル対照の `point_where` も 0.84 倍（15.9% 短縮）と同程度に動いており、各 pair で `before` を
+  先に走らせる順序と負荷の逓減が交絡しうる。層 B からは有意な改善を主張せず `Inconclusive`
+  （`Neutral` 寄り）とし、`black_box` が `after` を `before` より遅くしていないことの確認にのみ使う。
+  1.99.0 の退行と `black_box` による解消の根拠は層 A（ratio 約 0.3、対照の揺れより一桁大きい）と
+  生成コード検査である。
+
+### 生成コード検査
+
+`scripts/check_simd_codegen.sh`（`--target aarch64-unknown-linux-gnu`／`x86_64-unknown-linux-gnu`・
+rustc 1.98.1／1.99.0 の 4 組）の結果:
+
+| arm | 1.98.1 aarch64 | 1.98.1 x86_64 | 1.99.0 aarch64 | 1.99.0 x86_64 |
+| --- | --- | --- | --- | --- |
+| before | pass | pass | **fail**（#1475 の退行） | pass |
+| nobb | pass | pass | **fail**（要素ごと挿入が残る） | pass |
+| after | pass | pass | pass | pass |
+
+`nobb` が 1.99.0 aarch64 で fail することが、`black_box` を外す代替が成立しない直接の根拠である。
+
+x86_64（`dot_avx2_fma`）の静的比較: `after` は `nobb`／`before` が持つ `vinsertf128`・`vblendps`・
+スカラー `vfmadd231ss` を持たず、`vmovups` が 3 個多い（`black_box` に由来するアキュムレータの
+退避と再読込。ループ外）。ループ内は `vfmadd231ps` 12 個で不変。
+
+### 限界・申し送り
+
+- **x86_64（AVX2／AVX-512）の実測は未実施**。本機は arm64 で、Rosetta 経由の実行は絶対値・比率とも
+  信頼できないため行っていない。生成コードの静的比較のみ。オーナー実機（Intel／AMD）での実測を申し送る。
+  再現は下記テンプレート
+- 共有・非専有環境の参考値（policy §5）。cache_resident は短時間で外れ値の影響が大きい。専有環境での
+  再測定は未実施
+- 層 B は `feature_bench` の dim768 のみ。`bench-chip` ドライバの `-p engine`（改名前のパッケージ名）は
+  別件として未対応（本 Issue の対象外）
+- `black_box` の影響を rustc 1.99.0 より新しい版で見る場合は #1477（stable 追従での再発検知）で扱う
+
+### 再現手順（rustc 版・arm を差し替える）
+
+```sh
+# arm ごとにソースを git archive で書き出し、nobb は isa.rs の black_box 1 行だけ消す
+cargo +<rustc> bench --bench dot_kernel_bench -p fandhe-db-engine --no-run   # CARGO_TARGET_DIR は arm ごと
+# 実行ファイル（.d を除く最新）を退避してから
+BEFORE_BIN=/path/before AFTER_BIN=/path/after CAND_BINS="nobb=/path/nobb" \
+  scripts/bench_dot_kernel_ab.sh 7
+# nobb 対 after の 2 arm: BEFORE_BIN=/path/nobb AFTER_BIN=/path/after
+# 層 B: cargo +<rustc> build --release -p fandhe-db-engine --example feature_bench
+#       BENCH_FEATURE_DIM=768 target/release/examples/feature_bench を before/after 交互に 5 回以上
+```

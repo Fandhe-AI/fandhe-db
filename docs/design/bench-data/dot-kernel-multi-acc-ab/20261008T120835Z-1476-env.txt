@@ -1,0 +1,22 @@
+Issue #1476 (parent #1474): black_box cost measurement for dot_lanes_multi_acc
+CPU model: Apple M4 Max (aarch64, native; not QEMU)
+Cores: 16 physical / 16 logical
+OS: macOS (Darwin, arm64)
+isa::current().isa(): Neon
+BENCH_DEDICATED_ENV: unset (shared environment; other jobs ran concurrently)
+rustc A: 1.99.0 (b940084d7 2026-09-28)  -- version where the lane-insert regression (#1475) appeared
+rustc B: 1.98.1 (48a229cea 2026-09-01)  -- clean codegen before/after #1478
+Same Cargo.lock, --release, separate CARGO_TARGET_DIR per arm.
+before commit: dc888f6ea146d3078153d64a6848f5c8cf044431 (= parent of #1478; flat [f32; WIDE], no black_box)
+after  commit: 4c39bf0b6ce5315609a1959e4f5270e98b7c519f (#1478; [[f32; LANES]; N] + black_box)
+nobb   build : after + removal of the single line `let wide = core::hint::black_box(wide);` in isa.rs (local, not committed)
+Layer A: scripts/bench_dot_kernel_ab.sh, 7 pairs (3-arm round robin before->after->before->nobb ...; 2-arm nobb vs after run separately)
+Layer B: crates/engine/examples/feature_bench (BENCH_FEATURE_DIM=768, 25,000 rows, 50 iters), 5 alternating pairs, before first in each pair
+  (chip_bench driver not usable: its child command still uses `-p engine`, which no longer exists after the package rename)
+loadavg (1min) snapshots, 16 logical CPUs:
+  layer A rustc 1.99.0 3-arm : start 15.59, end 46.26
+  layer A rustc 1.99.0 2-arm : start 39.99, end 26.91
+  layer A rustc 1.98.1 3-arm : start 26.91, end 15.39
+  layer B rustc 1.99.0       : 15.06 -> 7.36 (decreasing over the 10 runs)
+  layer B rustc 1.98.1       : 8.07 -> 6.78
+Classification: shared / non-dedicated reference values (benchmark-judgement-policy.md section 5)
