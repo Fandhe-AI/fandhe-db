@@ -3,7 +3,7 @@
 ## 前提
 
 - 本リポジトリは **public**
-- 仕様・ビヘイビア定義の SSOT は **private** リポジトリ [vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec)（`docs/spec` submodule）にあり、**意図的に非公開を維持**する
+- 仕様・ビヘイビア定義の SSOT は **private** リポジトリ [fandhe-db-spec](https://github.com/Fandhe-AI/fandhe-db-spec)（`docs/spec` submodule）にあり、**意図的に非公開を維持**する
 
 ## 禁止事項（AGENTS.md P0 準拠）
 
