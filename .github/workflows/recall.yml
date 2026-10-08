@@ -242,7 +242,7 @@ jobs:
         # `Run recall-regression` step と同じ environment `recall-gate`
         # （job の `environment:` 参照）の Actions secrets から注入する（Issue #286）。
         # baseline からの改善幅（`RERANK_RECALL_MIN_R20_IMPROVEMENT`）は SEARCH-7
-        # 改訂（2026-08-31・vector-db-spec#8）により実コーパス評価まで
+        # 改訂（2026-08-31・fandhe-db-spec#8）により実コーパス評価まで
         # informational（非ブロッキング）へ降格したため、本 workflow からは注入
         # しない（`crates/engine/tests/rerank_recall.rs` が実測値のログ出力のみ
         # 行う。理由・実測総括は `docs/design/rerank-recall-regression.md`
