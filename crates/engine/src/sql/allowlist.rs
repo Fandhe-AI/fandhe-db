@@ -1753,7 +1753,7 @@ pub enum Statement {
     /// ランキング段・取得モード（`recall`／`precision`）の適用対象を持たない。
     /// `FROM` 単一テーブルのカタログ存在確認を通過済み。契約の詳細は
     /// `docs/design/wide-retrieval-scan.md`（spec ビヘイビア ID は SQL-15・
-    /// TASK-170 として付与済み〔vector-db-spec#12〕。確定化は TASK-170 が担う）参照。
+    /// TASK-170 として付与済み〔fandhe-db-spec#12〕。確定化は TASK-170 が担う）参照。
     ///
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
     /// `match` はワイルドカードアームの追加が必要（`Aggregate`・`Explain` 追加時と
