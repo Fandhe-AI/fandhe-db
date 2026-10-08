@@ -1,0 +1,65 @@
+# beta toolchain カナリア（Issue #1477）
+#
+# rust-toolchain.toml は stable 追従のため、runner image 更新で rustc が切り替わると
+# scripts/check_simd_codegen.sh（SIMD カーネルの生成アセンブリ検査）が PR と無関係に
+# 突然失敗しうる（Issue #1475）。次期 stable になる beta で週次に同検査を先行実行し、
+# 退行を PR の外で早期検知する。ci.yml の simd-codegen-check（x86_64）と cross-check
+# （aarch64）の検査内容と同一で、toolchain だけが異なる。
+#
+# - PR ゲートには入れない（pull_request・push トリガなし。必須チェック登録も不要）。
+#   beta 側の退行で無関係な PR をブロックしないため、検知専用とする。
+# - schedule は default branch でのみ動く。初回はマージ後に workflow_dispatch で確認する。
+# - toolchain の切替は RUSTUP_TOOLCHAIN（rustup 優先順位は +toolchain > 環境変数 >
+#   rust-toolchain.toml）。スクリプト・Makefile は変更しない。検査パターンは弱めない
+#   （変更は scripts/check_simd_codegen.sh のレビュー経由のみ。simd-codegen-guard.md 参照）。
+# - 失敗通知は GitHub 標準の失敗メールに依存する（Issue 自動起票は権限拡大のため行わない）。
+# - 第三者 action は ci.yml と同一 SHA 固定（AGENTS.md「CI・ワークフローの改変（P1）」）。
+name: Toolchain canary
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simd-codegen-check-beta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: beta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            make_target: simd-codegen-check
+          - arch: aarch64
+            rust_target: aarch64-unknown-linux-gnu
+            make_target: simd-codegen-check-cross
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install beta toolchain
+        run: rustup toolchain install beta --profile minimal --no-self-update
+      - name: Add target
+        run: rustup target add ${{ matrix.rust_target }} --toolchain beta
+      - name: Record Rust toolchain version
+        run: |
+          rustc -vV
+          cargo -vV
+      # RUSTUP_TOOLCHAIN が効かず stable で動いた場合の偽 green を防ぐ（fail-closed）
+      - name: Assert beta toolchain is active
+        run: |
+          rustc -vV | grep -Eq '^release: .*-beta' || { echo "beta toolchain is not active" >&2; exit 1; }
+      - name: Run ${{ matrix.make_target }}
+        run: make ${{ matrix.make_target }}
