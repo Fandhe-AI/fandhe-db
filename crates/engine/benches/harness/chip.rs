@@ -136,6 +136,28 @@ impl Workload {
         }
     }
 
+    /// 子プロセスの `cargo` へ渡す argv（固定値のみ・シェル不使用）。
+    /// `chip_bench.rs::run_workload` から呼ばれる。`package` は呼び出し側が
+    /// `env!("CARGO_PKG_NAME")` で渡す（パッケージ名を直書きすると改名時に
+    /// `package ID specification` 不一致で起動に失敗するため。Issue #1482）。
+    pub fn cargo_args(self, package: &str) -> Vec<String> {
+        let parts: Vec<&str> = match self {
+            Workload::DotKernel => vec!["bench", "--bench", "dot_kernel_bench", "-p", package],
+            Workload::KnnProfile => vec!["bench", "--bench", "knn_profile_bench", "-p", package],
+            Workload::Feature128 | Workload::Feature768 => {
+                vec![
+                    "run",
+                    "--release",
+                    "-p",
+                    package,
+                    "--example",
+                    "feature_bench",
+                ]
+            }
+        };
+        parts.into_iter().map(String::from).collect()
+    }
+
     /// このワークロードが子プロセスへ追加で設定する env（`feature_bench` の
     /// `BENCH_FEATURE_DIM`。dim 以外の `BENCH_*` 系 env は親環境から継承する
     /// 契約——README 参照）。
