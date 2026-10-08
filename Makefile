@@ -1,4 +1,4 @@
-# vector-db の開発タスクランナー。
+# fandhe-db の開発タスクランナー。
 #
 # `make setup` 一発で開発環境（サブモジュール・rustup・lefthook）を構築し、
 # `make ci` で CI（.github/workflows/ci.yml）と同等のチェックをローカル実行する。
@@ -55,7 +55,7 @@ rustup: ## rustup（cargo）を未導入の場合のみ導入する
 		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; \
 	fi
 
-# docs/spec（vector-db-spec）は private リポジトリのため、アクセス権のない環境では
+# docs/spec（fandhe-db-spec）は private リポジトリのため、アクセス権のない環境では
 # 取得に失敗する。実装コードのビルド・テストは docs/spec 抜きでも成立させる方針
 # （README「開発環境構築」）のため、失敗しても setup 全体は止めない。
 .PHONY: submodule

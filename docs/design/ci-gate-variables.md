@@ -127,7 +127,7 @@ strict モード時、`DEGRADED` を含め未設定の変数を検出した時�
 として全 8 secrets の値を確定・設定する**（下記「設定手順」参照）。`DEGRADED` の
 副検査を他 7 secrets の回帰検知から独立させたい場合（別 job・非 strict 経路への
 分離等）は本 ADR のスコープ外とし、別 Issue で扱う。`RERANK_RECALL_MIN_R20_
-IMPROVEMENT` は SEARCH-7 改訂（2026-08-31・vector-db-spec#8）で判定から除外
+IMPROVEMENT` は SEARCH-7 改訂（2026-08-31・fandhe-db-spec#8）で判定から除外
 された（`recall.yml` は不読・`rerank_recall.rs` は同名変数を参照しない）ため
 この一覧・strict モードの必須条件からは対象外である。過去に設定していた場合は
 リポジトリ管理者が `gh secret delete RERANK_RECALL_MIN_R20_IMPROVEMENT --env
@@ -211,8 +211,8 @@ Environment `bench-gate` への移行後は速やかに削除する（repo レ�
 
 設定後は必ず以下を確認する:
 
-1. `gh api repos/Fandhe-AI/vector-db/environments/bench-gate/deployment-branch-policies`
-   / `gh api repos/Fandhe-AI/vector-db/environments/recall-gate/deployment-branch-policies`
+1. `gh api repos/Fandhe-AI/fandhe-db/environments/bench-gate/deployment-branch-policies`
+   / `gh api repos/Fandhe-AI/fandhe-db/environments/recall-gate/deployment-branch-policies`
    で branch policy が `main` のみに制限されたままであること
    （`hybrid-recall-regression.md` の実行境界設計を参照）
 2. `gh workflow run bench.yml --ref main` / `gh workflow run recall.yml --ref main`

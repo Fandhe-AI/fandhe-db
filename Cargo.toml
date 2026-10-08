@@ -1,4 +1,4 @@
-# vector-db workspace（TASK-66: 基盤・工程管理）。
+# fandhe-db workspace（TASK-66: 基盤・工程管理）。
 #
 # `engine`（コアロジック・検索カーネル・認証・RLS・redb 永続化）と
 # `wire-server`（pg wire v3 自作実装のバイナリ）の 2 クレート構成
@@ -13,7 +13,7 @@ members = ["crates/engine", "crates/wire-server"]
 # `edition = "..."` 形式をこのファイルから読むため、この位置・形式を維持すること。
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Fandhe-AI/vector-db"
+repository = "https://github.com/Fandhe-AI/fandhe-db"
 # crates.io 公開は `.github/workflows/release.yml`（workflow_dispatch・environment
 # `crates-io-release` の承認ゲート）からのみ行う。
 publish = true

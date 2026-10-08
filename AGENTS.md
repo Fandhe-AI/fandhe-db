@@ -9,7 +9,7 @@ Fandhe-AI/actions の reusable workflow を `@latest` で呼び出す wrapper）
 
 本リポジトリは Rust 製ローカルファースト vector 特化クエリ DB の**実装リポジトリ（public）**
 である。仕様・ビヘイビア定義の唯一の正（SSOT）は private リポジトリ
-[vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec)（`docs/spec` submodule）にあり、
+[fandhe-db-spec](https://github.com/Fandhe-AI/fandhe-db-spec)（`docs/spec` submodule）にあり、
 本書は仕様の再掲ではなく**レビュー判定基準**に絞る。
 
 ## 優先度の定義
@@ -22,7 +22,7 @@ Fandhe-AI/actions の reusable workflow を `@latest` で呼び出す wrapper）
 
 ## 1. セキュリティ観点
 
-- **private spec 内容の漏えい（P0）**: `docs/spec`（vector-db-spec）は意図的に非公開である。
+- **private spec 内容の漏えい（P0）**: `docs/spec`（fandhe-db-spec）は意図的に非公開である。
   spec 本文の長文引用・ファイルコピー・非公開の内部判断の転記を public な本リポジトリ
   （コード・コメント・ドキュメント・PR 本文）へ持ち込まない。公開してよい境界は
   **本リポジトリの `README.md`「実装方針（要点）」で既にオーナーが公開済みの要点**までとし、
@@ -54,7 +54,7 @@ Fandhe-AI/actions の reusable workflow を `@latest` で呼び出す wrapper）
   未達原因の分析（fixture・コーパス構造の要因分析を含む）、それに伴う fixture 設計判断・
   Issue 差し戻し経緯、およびオーナー承認済み spec 改訂の事実と理由の要約は、public 資産
   （コード・コメント・ドキュメント・Issue・PR）へ記載してよい（spec 側記録:
-  `docs/spec/04-behavior/search.md` SEARCH-7 の公開境界注記・vector-db-spec#9）。
+  `docs/spec/04-behavior/search.md` SEARCH-7 の公開境界注記・fandhe-db-spec#9）。
   spec 本文の長文引用・上記以外の非公開の設計議論の転記は引き続き P0 である
 - **秘密情報の混入（P0）**: 実トークン・実 API キー・接続資格情報をコード・テスト・
   fixture・ドキュメントに書かない（例示はダミー値・パターン表記に限る）。`.env` 等の
@@ -105,7 +105,7 @@ private spec からの新規開示ではない。詳細の正（SSOT）は spec 
 - **spec（SSOT）との整合（P1）**: ビヘイビア・エラー契約（SQLSTATE 風 `wire_code`）・
   クエリカタログ（C1〜C5 が MVP、C6/C7 は拡張）に関わる実装は spec の該当定義
   （TASK / ビヘイビア ID）を PR で参照する。spec と食い違う挙動を「実装の都合」で
-  導入しない（spec 側の変更が必要なら vector-db-spec へ提起する）
+  導入しない（spec 側の変更が必要なら fandhe-db-spec へ提起する）
 - **wire プロトコルの自作方針（P1）**: 接続プロトコルは自作実装であり、`pgwire` 等の
   外部プロトコルライブラリへの依存を持ち込まない（依存最小方針）
 - **設計思想との整合（P2）**: 「正解を含むデータ群を広く返す」（LLM コンテキスト用途）が

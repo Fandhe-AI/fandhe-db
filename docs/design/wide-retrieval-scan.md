@@ -1,11 +1,11 @@
 # ADR: 広域取得モード（ソートなしのフィルタ取得）を SQL 表層へ追加する（Issue #454）
 
 - ステータス: Implemented（spec 側ビヘイビア ID は SQL-15・TASK-170 として付与
-  済み〔vector-db-spec#12・spec main `84eb7ef4d2e2e1d3cb35bd95e13e60bec10e88c6`・
+  済み〔fandhe-db-spec#12・spec main `84eb7ef4d2e2e1d3cb35bd95e13e60bec10e88c6`・
   2026-09-07〕。オーナー判断〔2026-09-07〕による本 ADR の先行公開経緯・ID 差し
   替えの経緯は下記「spec 側への申し送り」参照。SQL-15 自体の確定化〔本リポ側
   の受け入れ確認・wire 経由 3 クライアント実測〕は TASK-170 が担う）
-- 対応: Issue #454・spec 側 SQL-15・TASK-170（vector-db-spec#12）
+- 対応: Issue #454・spec 側 SQL-15・TASK-170（fandhe-db-spec#12）
 - 関連ポインタ: SQL-15・TASK-170・TASK-161・TASK-162・SQL-12・SEARCH-9（取得
   モード `recall`／`precision` との関係）・RLS-8（TASK-138。全読み取り経路への
   RLS 一般化）・TABLE-12（キー/ヘッダ tenant 整合検査）。spec 本文は転記しない
@@ -145,9 +145,9 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 
 spec 側でモード定義・構文・返却契約（件数上限・順序保証の有無・RLS 適用）を
 ビヘイビア ID として新設する作業は private spec リポ
-[vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec) 側で実施され、
+[fandhe-db-spec](https://github.com/Fandhe-AI/fandhe-db-spec) 側で実施され、
 SQL-15（`04-behavior/sql-surface.md`）・TASK-170（`05-tasks.md`）として main へ
-マージ済み（vector-db-spec#12・spec main
+マージ済み（fandhe-db-spec#12・spec main
 `84eb7ef4d2e2e1d3cb35bd95e13e60bec10e88c6`・2026-09-07）。本 ADR・関連コード内
 ポインタは確定済みの ID（SQL-15・TASK-170）へ差し替え済み。SQL-15 自体の確定化
 （本リポ側の受け入れ確認・wire 経由 3 クライアント実測）は TASK-170 が担う。
@@ -157,5 +157,5 @@ SQL-15（`04-behavior/sql-surface.md`）・TASK-170（`05-tasks.md`）として 
 spec 側ビヘイビア ID の確定を待つと本 PR（#562）の統合が長期に滞留するため、
 オーナー判断（2026-09-07）により本 ADR の契約を spec 側 ID 新設を待たず本リポの
 実装既定値として先行公開し、本 PR をマージした。その後 spec 側で SQL-15・
-TASK-170 が新設・main へマージされたため（vector-db-spec#12）、本 ADR・関連
+TASK-170 が新設・main へマージされたため（fandhe-db-spec#12）、本 ADR・関連
 コード内ポインタ・コミット/PR 参照を確定済みの ID へ差し替えた。
