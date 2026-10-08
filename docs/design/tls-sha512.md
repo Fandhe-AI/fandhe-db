@@ -104,7 +104,7 @@ SHA-512」・§6.3「SHA-384 and SHA-512 Initialization」）から取得した�
 `a` × 1,000,000）の期待値も同じ RFC 6234 §8.5（`TEST1`／`TEST2_2`／
 `TEST3`）に記載の値を転記している。RFC 6234 は SHA-2 ファミリー・
 HMAC-SHA・HKDF の公開仕様であり、本リポの private spec
-（vector-db-spec）とは無関係の一次資料である。
+（fandhe-db-spec）とは無関係の一次資料である。
 
 ## テスト一覧
 

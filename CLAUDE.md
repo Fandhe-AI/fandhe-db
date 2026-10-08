@@ -4,7 +4,7 @@
 
 Rust 製のローカルファースト・vector 特化クエリ DB の実装リポジトリ。「正解を含むデータ群を広く返す」ことを設計思想とし、LLM のコンテキストとして渡す用途に最適化する。
 
-- **本リポは public**。仕様・ビヘイビア定義の SSOT は private リポ [vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec)（`docs/spec` submodule）。**spec 本文を public 資産へ転記しない**（[spec-confidentiality](.claude/rules/spec-confidentiality.md)）
+- **本リポは public**。仕様・ビヘイビア定義の SSOT は private リポ [fandhe-db-spec](https://github.com/Fandhe-AI/fandhe-db-spec)（`docs/spec` submodule）。**spec 本文を public 資産へ転記しない**（[spec-confidentiality](.claude/rules/spec-confidentiality.md)）
 - 接続プロトコル: PostgreSQL wire プロトコル v3 互換の自作実装（外部プロトコルライブラリ非依存）
 - クレート構成: `engine`（コアロジック）＋ `wire-server`（lib+bin）の workspace（`crates/`）
 - 永続化: `redb` ベース / 安全性: RLS 相当のテナント境界・fail-closed のエラー契約（`wire_code`）
@@ -14,7 +14,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 ## Repository Structure
 
 ```text
-vector-db/
+fandhe-db/
 ├── CLAUDE.md / AGENTS.md          # Claude 運用方針 / レビュー観点集（ai-review の基準）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
 ├── Makefile                       # タスクランナー（make setup / make ci / docker-*）
@@ -29,7 +29,7 @@ vector-db/
 ├── .agents/skills/                # `.claude/skills/*` のシンボリックリンク先の実体
 ├── docs/
 │   ├── design/                    # 設計ドキュメント（ADR 形式・public）
-│   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
+│   └── spec/                      # fandhe-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-interrupt + crash-test-cross-table + crash-test-unique-index + crash-test-partitioned-dml（Issue #1131 の分割実行 DML crash 耐性）+ tmp-leak-check（Issue #1303 のテスト一時領域残置検出）+ test-default-build（既定ビルド専用回帰テスト）+ core-api-check + sort-determinism-check + simd-codegen-check（Issue #467 の SIMD 生成コード検査）+ cross-check（aarch64 クロスコンパイル確認）の CI
 │   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 で usearch 接続済み・既定ゲート）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は GPU 搭載環境向けの Issue #178 opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）+ TASK-83 SQL 表層 C1 p95 専有環境再測定（Conditional Go 条件7・workflow_dispatch 限定）

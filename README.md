@@ -1,23 +1,23 @@
-# vector-db
+# fandhe-db
 
 Rust 製のローカルファースト・vector 特化クエリ DB の実装リポジトリです。「正解を含むデータ群を広く返す」広域検索（`recall` モード・既定）を設計思想の中心（差別化ポイント）とし、LLM のコンテキストとして渡す用途に最適化します。「正確なデータ 1 件のピンポイント抽出」（`precision` モード）への切り替えも提供します。
 
 ## 位置づけ
 
 - **本リポジトリは public** です（rust-ai-library と同一方針）
-- **仕様・ビヘイビア定義**: [vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec)（`docs/spec` に submodule 参照。**private リポジトリとして意図的に非公開を維持**する方針であり、アクセス権のない環境からは submodule を解決できません）
+- **仕様・ビヘイビア定義**: [fandhe-db-spec](https://github.com/Fandhe-AI/fandhe-db-spec)（`docs/spec` に submodule 参照。**private リポジトリとして意図的に非公開を維持**する方針であり、アクセス権のない環境からは submodule を解決できません）
 - Web API・MCP サーバーはいずれも別プロダクトとして本リポジトリのスコープ外です
 
 ## ステータス
 
-実装は未着手です（ロードマップの着手判定待ち）。タスク定義は spec リポの [`05-tasks.md`](https://github.com/Fandhe-AI/vector-db-spec/blob/main/05-tasks.md)（TASK-66〜165・100 件）、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/vector-db-spec/blob/main/06-roadmap.md)（MS-1〜6）を参照してください。
+実装は未着手です（ロードマップの着手判定待ち）。タスク定義は spec リポの [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-db-spec/blob/main/05-tasks.md)（TASK-66〜165・100 件）、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-db-spec/blob/main/06-roadmap.md)（MS-1〜6）を参照してください。
 
 ## 実装方針（要点）
 
 - **接続プロトコル**: PostgreSQL wire プロトコル v3 互換の**自作実装**（`pgwire` 等の外部ライブラリへ可能な限り依存しない）。psql・psycopg・node pg が無改造で接続可能なことを PoC-8 で実測済み
 - **クエリ表層**: 標準クエリカタログ C1〜C5 を MVP とする vector 特化 SQL（C6 集計・C7 結合は拡張扱い）。LLM クエリプランニングは専用構文 `USING PLAN(...)` で SQL に露出
 - **検索モード**: `recall`（広域・既定）／`precision`（ピンポイント抽出）の切り替えを提供。切替手段・実行契約の詳細は spec のビヘイビア定義（SQL-12・SEARCH-9/10・PLAN-11・TASK-161〜165）を参照
-- **広域取得（ソートなしのフィルタ取得）**: `ORDER BY`／`USING PLAN` を伴わない `SELECT ... [WHERE ...] LIMIT n` を SQL 表層へ追加（`Statement::Scan`。Issue #454）。ランキング段・取得モードを持たず、可視かつ `WHERE` を満たす行を先頭から `LIMIT` 件返す（順序保証なし・早期終了）。契約の詳細（spec 側では SQL-15・TASK-170 として付与済み〔vector-db-spec#12〕。受け入れ確認・確定化は TASK-170 が担う。閾値等は実装既定値）は [`docs/design/wide-retrieval-scan.md`](docs/design/wide-retrieval-scan.md) を参照
+- **広域取得（ソートなしのフィルタ取得）**: `ORDER BY`／`USING PLAN` を伴わない `SELECT ... [WHERE ...] LIMIT n` を SQL 表層へ追加（`Statement::Scan`。Issue #454）。ランキング段・取得モードを持たず、可視かつ `WHERE` を満たす行を先頭から `LIMIT` 件返す（順序保証なし・早期終了）。契約の詳細（spec 側では SQL-15・TASK-170 として付与済み〔fandhe-db-spec#12〕。受け入れ確認・確定化は TASK-170 が担う。閾値等は実装既定値）は [`docs/design/wide-retrieval-scan.md`](docs/design/wide-retrieval-scan.md) を参照
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
 - **永続化**: `redb` ベース（単一ライタ・スナップショット読み取り。並行書き込み検証は MS-1 の TASK-144）
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
@@ -32,17 +32,17 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 `scripts/bench_dot_kernel_ab.sh`（`dot_kernel_bench` の before/after 交互 min-of-N 実行ドライバ）で Issue #519 が本環境（共有 QEMU）の参考値を実測済み（詳細:
 `docs/design/dot-kernel-multi-accumulator.md`「Issue #519 追記」節）。Phase 4（チップ最適カーネル群 #459）通しの着手前 SHA/適用後 SHA 前後比較・チップ別最速判定は [`docs/design/phase4-chip-before-after.md`](docs/design/phase4-chip-before-after.md)（Issue #530。`scripts/bench_chip_ab.sh`・`make bench-chip-ab` で本開発環境〔共有 QEMU〕参考値を実測済み。Apple M／AMD Zen／Intel 実機での実測はオーナー申し送り）
 
-詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
+詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/fandhe-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
 ## 開発環境構築
 
 ```bash
-git clone git@github.com:Fandhe-AI/vector-db.git
-cd vector-db
+git clone git@github.com:Fandhe-AI/fandhe-db.git
+cd fandhe-db
 make setup   # サブモジュール → rustup → lefthook（git hooks）を一括構築
 ```
 
-`docs/spec`（`vector-db-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで継続します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
+`docs/spec`（`fandhe-db-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで継続します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
 ### タスクランナー（Makefile）
 
@@ -1062,6 +1062,13 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
 secret の設定はオーナー作業（初回 run で Environment が自動作成された場合は保護ルールが空の
 ため必ず手動で追加する）。`wire-server` 単体の dry-run は engine の公開版が crates.io に
 無い間は依存解決で失敗するため、初回は `all` を使う。
+
+## 旧名からの移行
+
+本プロジェクトは 2026-10-08 に vector-db から fandhe-db へ改名しました（経緯と新旧対応は [`docs/design/rename-to-fandhe-db.md`](docs/design/rename-to-fandhe-db.md)）。
+
+- **crate 名**: 旧 `fandhe-vector-db-engine` / `fandhe-vector-db-wire-server` は新名 `fandhe-db-engine` / `fandhe-db-wire-server` に変わりました。旧名の 0.1.0 は crates.io に残りますが更新しません（yank もしません）。0.2.0 以降は新名で公開します
+- **GitHub リポジトリ**: `Fandhe-AI/vector-db` は `Fandhe-AI/fandhe-db` へ改名しました。旧 URL はリダイレクトされますが、既存の clone は `git remote set-url origin git@github.com:Fandhe-AI/fandhe-db.git` で更新してください
 
 ## ライセンス
 

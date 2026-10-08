@@ -729,7 +729,7 @@ RLS-11・TASK-195 を新設し、RLS-7・RLS-9 は改訂注記付きで残置（
 Issue #974（PR #980）・親 Issue #972（Phase 0）・ルート Issue #860。
 private spec 記録:
 `docs/spec/04-behavior/records/rdbms-parity-decision-2026-09-22.md`
-（ポインタのみ）。spec 側リビジョンは vector-db-spec #21・本リポの
+（ポインタのみ）。spec 側リビジョンは fandhe-db-spec #21・本リポの
 submodule 追随は PR #951。
 
 **5. 検証の所在**: `crates/engine/tests/rls11_read_your_writes.rs`

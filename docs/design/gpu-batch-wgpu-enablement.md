@@ -132,7 +132,7 @@ dispatch・チャンク分割）から縮小した。挙動の正しさ・
 - GPU バッファ（スコア/リードバック/クエリ）の呼び出し間再利用（CORE-15 の
   プール方針を GPU ステージングへ拡張）は行っておらず、呼び出しごとに
   確保・解放する
-- `VECTOR_DB_TEST_REQUIRE_GPU` strict モード・`make test-gpu` ターゲットは
+- `FANDHE_DB_TEST_REQUIRE_GPU` strict モード・`make test-gpu` ターゲットは
   未実装。結合テスト（`tests/gpu_batch.rs`）は GPU の有無を実行時に判定し、
   利用不能な環境では該当分岐を `eprintln!` で報告して早期 return する
 

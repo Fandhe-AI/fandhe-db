@@ -1,4 +1,4 @@
-# vector-db の開発コンテナ。
+# fandhe-db の開発コンテナ。
 #
 # 環境非依存の開発・検証用（make docker-shell / docker-ci から利用。compose.yaml 参照）。
 # `make ci` の lint-docs 系（markdownlint / editorconfig-checker / commitlint は npx、

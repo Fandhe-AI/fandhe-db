@@ -818,3 +818,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 - **性質**: ドキュメントのみの変更。コード・依存・CI・Makefile は不変。
 
 **Issue #1322（docs(design): 再測定の結果から OR 述語の改善案 B・C の要否を判断する。SQL-24・SQL-2・SQL-29 ポインタ。詳細は `docs/design/relational-p95-bench.md`「改善案 B・C の要否判断」）**: docs のみ。#1321 の参考値（確定判定は未了）に基づく暫定判断として、B は現時点で不要（保留・再検討条件つき）、C は SQL-24 の達成には不要だが費用対効果が高い任意の改善として推奨（B より先）と記録した。C の実装 Issue 案（C-1〜C-3）を示したが、起票はしていない（オーナー判断）。コード・依存の変更なし。**対象外**: 確定判定の再測定、Issue の起票、C の実装。
+
+**プロジェクト名の変更（vector-db → fandhe-db。2026-10-08。ADR: [rename-to-fandhe-db.md](rename-to-fandhe-db.md)）**: docs 側の表記を fandhe-db へ揃えた（README・CLAUDE.md・AGENTS.md・`Cargo.toml` の `repository`・Makefile／Dockerfile／クレート入口のコメント・`docs/design/` の現状記述）。lib 名・bin 名・submodule パス・永続化 domain tag・履歴記録・Issue／PR の URL は変更しない（理由は ADR 参照）。**対象外**: 環境変数の改名（別 PR）、CI ワークフロー・`.claude/`・コード内ポインタの追随。コード・依存の変更なし。

@@ -214,7 +214,7 @@ overlap が同点の候補グループ内でも、ソートの安定性により
 ゲート定義は、この「原理的に到達不能な範囲」を分母に含めてしまうため、暫定
 リランカー（字句一致方式）の効果を過小評価する。
 
-そこでオーナー承認済みの spec 改訂（vector-db-spec#7）に合わせ、`recall.yml` の
+そこでオーナー承認済みの spec 改訂（fandhe-db-spec#7）に合わせ、`recall.yml` の
 `RERANK_RECALL_MIN_R20_IMPROVEMENT` ゲートの判定基準を以下へ再定義した
 （`crates/engine/tests/rerank_recall.rs::RerankRecallResult::improvement_ratio`）:
 
@@ -521,7 +521,7 @@ variant 数が少なく表層語の偶発的重複が生じやすいこと、ド
 これを最終報告として Issue #330 へ差し戻した。
 
 **spec 改訂**: 上記の実測・分析結果を受け、オーナー承認済みの spec 改訂
-（vector-db-spec#8・2026-08-31）により、SEARCH-7 の改善幅相対基準
+（fandhe-db-spec#8・2026-08-31）により、SEARCH-7 の改善幅相対基準
 （improvement_ratio ≥ 下限）は実コーパス評価まで informational（非ブロッキング・
 実測値の記録と報告のみ必須）へ降格された。ブロッキング判定は非劣化
 （`after_hits20 >= baseline_hits20`）と絶対下限（`RERANK_RECALL_MIN_R20_LARGE`）
