@@ -1021,7 +1021,14 @@ fn dot_f16_neon_fp16(a_bits: &[u16], b: &[f32]) -> f32 {
 /// `#[target_feature]` の恩恵（AVX2+FMA・AVX-512 命令の生成）を失う。
 ///
 /// 縮約は `dot_lanes` と同じ「固定順・逐次和」（`wide` の和 → `narrow` の和 →
-/// 端数和、の順で加算する。段階的な畳み込みや `as_chunks` の入れ子は使わない）。
+/// 端数和、の順で加算する。段階的な畳み込みは使わない）。`wide` は
+/// `[[f32; LANES]; DOT_ACCUMULATORS]` で持ち、`WIDE` チャンクを `LANES` 単位へ
+/// `as_chunks` で分けてアキュムレータごとに FMA する（要素ごとの演算順は平坦配列版と
+/// 同一）。平坦 `[f32; WIDE]` だと rustc 1.99 の LLVM が 1 要素ずれた SLP を選び
+/// ループ毎にレーン挿入が出るため、ベクトル境界を型で固定している。末尾の逐次和の前に
+/// `black_box` を挟むのも同じ理由（逐次スカラー和がアキュムレータをスカラー化・
+/// 再ベクトル化する誘因になるのを断ち、ループ内は `fmla v.4s` のみにする。
+/// ループ脱出時に 1 回だけ作用し、値は変えない）。
 /// 添字アクセス（`[]` による単一要素アクセス）は使わず `zip`／イテレータのみで書く
 /// （.claude/rules/coding-rust.md）。`narrow` の縮約と端数（`a_rem`／`b_rem`）の
 /// 処理は [`dot_lanes`] と同じ [`reduce_lanes`] を経由させ、`PADDED_TAIL`
@@ -1039,13 +1046,21 @@ fn dot_lanes_multi_acc<const LANES: usize, const WIDE: usize, const PADDED_TAIL:
     let a = &a[..len];
     let b = &b[..len];
 
-    let mut wide = [0f32; WIDE];
+    // アキュムレータは LANES 幅のベクトル単位（`[[f32; LANES]; DOT_ACCUMULATORS]`）で持つ。
+    // 平坦な `[f32; WIDE]` を要素ごとに回す形だと、rustc 1.99 の LLVM が 1 要素ずれた
+    // SLP ベクトル化を選びループ毎にレーン挿入（`mov v.s[k]`）で組み直すため、
+    // 各アキュムレータを LANES 単位の chunk で FMA してベクトル境界を固定する。
+    let mut wide = [[0f32; LANES]; DOT_ACCUMULATORS];
     let (a_wide_chunks, a_wide_rem) = a.as_chunks::<WIDE>();
     let (b_wide_chunks, b_wide_rem) = b.as_chunks::<WIDE>();
 
     for (a_chunk, b_chunk) in a_wide_chunks.iter().zip(b_wide_chunks.iter()) {
-        for (acc, (x, y)) in wide.iter_mut().zip(a_chunk.iter().zip(b_chunk.iter())) {
-            *acc = x.mul_add(*y, *acc);
+        let (a_parts, _) = a_chunk.as_chunks::<LANES>();
+        let (b_parts, _) = b_chunk.as_chunks::<LANES>();
+        for (acc, (a_part, b_part)) in wide.iter_mut().zip(a_parts.iter().zip(b_parts.iter())) {
+            for (lane, (x, y)) in acc.iter_mut().zip(a_part.iter().zip(b_part.iter())) {
+                *lane = x.mul_add(*y, *lane);
+            }
         }
     }
 
@@ -1059,7 +1074,8 @@ fn dot_lanes_multi_acc<const LANES: usize, const WIDE: usize, const PADDED_TAIL:
         }
     }
 
-    let wide_sum: f32 = wide.iter().sum();
+    let wide = core::hint::black_box(wide);
+    let wide_sum: f32 = wide.iter().flatten().sum();
     wide_sum + reduce_lanes::<LANES, PADDED_TAIL>(narrow, a_rem, b_rem)
 }
 
