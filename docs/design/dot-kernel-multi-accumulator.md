@@ -838,8 +838,8 @@ A/B 計測した記録である（ポインタ: CORE-14）。判定は
   `before` は 1 周で 2 回走るため 14 サンプル）。`nobb` 対 `after` は 2 arm 実行も別に 1 回（7 ペア）取った
 - 層 B（検索スループット）: `crates/engine/examples/feature_bench`（`BENCH_FEATURE_DIM=768`・
   25,000 行・50 iters）の `before`／`after` を 5 ペア交互実行し、各 phase の `p50_us` を比較。
-  `bench-chip` の `feature_768` は子プロセスが `-p engine`（改名前のパッケージ名）を呼ぶため
-  現状は起動できず、同一の example を直接実行した
+  `bench-chip` の `feature_768` は当時、子プロセスが `-p engine`（改名前のパッケージ名）を呼ぶため
+  起動できず、同一の example を直接実行した（Issue #1482 で解消済み）
 - 判定: ratio が固定 ±5% 帯と参照区間の実測帯の両方を超え、min と median が同方向のときのみ有意
 
 ### 環境
@@ -945,7 +945,7 @@ x86_64（`dot_avx2_fma`）の静的比較: `after` は `nobb`／`before` が持�
 - 共有・非専有環境の参考値（policy §5）。cache_resident は短時間で外れ値の影響が大きい。専有環境での
   再測定は未実施
 - 層 B は `feature_bench` の dim768 のみ。`bench-chip` ドライバの `-p engine`（改名前のパッケージ名）は
-  別件として未対応（本 Issue の対象外）
+  別件として未対応だったが、Issue #1482 で `env!("CARGO_PKG_NAME")` 経由に修正済み
 - `black_box` の影響を rustc 1.99.0 より新しい版で見る場合は #1477（stable 追従での再発検知）で扱う
 
 ### 再現手順（rustc 版・arm を差し替える）

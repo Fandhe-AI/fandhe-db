@@ -98,30 +98,8 @@ struct RunOutcome {
 fn run_workload(workload: Workload) -> Result<RunOutcome, String> {
     let cargo = cargo_bin();
     let root = workspace_root();
-    let mut cmd = match workload {
-        Workload::DotKernel => {
-            let mut c = Command::new(&cargo);
-            c.args(["bench", "--bench", "dot_kernel_bench", "-p", "engine"]);
-            c
-        }
-        Workload::KnnProfile => {
-            let mut c = Command::new(&cargo);
-            c.args(["bench", "--bench", "knn_profile_bench", "-p", "engine"]);
-            c
-        }
-        Workload::Feature128 | Workload::Feature768 => {
-            let mut c = Command::new(&cargo);
-            c.args([
-                "run",
-                "--release",
-                "-p",
-                "engine",
-                "--example",
-                "feature_bench",
-            ]);
-            c
-        }
-    };
+    let mut cmd = Command::new(&cargo);
+    cmd.args(workload.cargo_args(env!("CARGO_PKG_NAME")));
     cmd.current_dir(&root);
     for (k, v) in workload.extra_env() {
         cmd.env(k, v);

@@ -373,3 +373,33 @@ fn json_escape_output_round_trips_through_parse_json() {
     let value = parse_json(&wrapped).unwrap();
     assert_eq!(value.as_str(), Some(original));
 }
+
+// --- Workload::cargo_args（Issue #1482: 子プロセスのパッケージ名） ---
+
+/// 子プロセス argv の `-p` が現行パッケージ名（`CARGO_PKG_NAME`）を指し、
+/// 改名前の `engine` 単独要素を含まず、bench/example 名が維持されること。
+#[test]
+fn workload_cargo_args_use_current_package_name() {
+    let pkg = env!("CARGO_PKG_NAME");
+    assert_eq!(pkg, "fandhe-db-engine");
+    for w in parse_workloads(None).unwrap() {
+        let args = w.cargo_args(pkg);
+        let p = args.iter().position(|a| a == "-p").expect("-p present");
+        assert_eq!(args.get(p + 1).map(String::as_str), Some(pkg));
+        assert!(!args.iter().any(|a| a == "engine"));
+    }
+    assert_eq!(
+        Workload::DotKernel.cargo_args(pkg),
+        ["bench", "--bench", "dot_kernel_bench", "-p", pkg]
+    );
+    assert_eq!(
+        Workload::KnnProfile.cargo_args(pkg),
+        ["bench", "--bench", "knn_profile_bench", "-p", pkg]
+    );
+    for w in [Workload::Feature128, Workload::Feature768] {
+        assert_eq!(
+            w.cargo_args(pkg),
+            ["run", "--release", "-p", pkg, "--example", "feature_bench"]
+        );
+    }
+}
