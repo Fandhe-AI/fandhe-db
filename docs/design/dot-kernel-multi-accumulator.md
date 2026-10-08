@@ -892,22 +892,33 @@ cache dim768 0.285／dim1536 0.281 で 3 arm 実行と一致した。`nobb` は 
 
 ### 層 B: `feature_bench`（dim768・25,000 行）の phase 別 p50（µs）
 
-5 ペア・min／median。`ratio` は after/before。帯は各 side の run 間 `(max-min)/min` の大きい方。
-非ベクトル phase（`agg_count` 等）は対照。
+5 ペア・min／median。`ratio` は after/before。「自帯」は対象 phase 自身の各 side の run 間
+`(max-min)/min` の大きい方（参考値）。「参照帯」は変更を含まない非ベクトル phase
+（`point_where`・`where_compound`・`agg_count`・`agg_multi`・`group_by_having`・`rls_isolation`）の
+同式の帯の最大値で、policy §4 の実測帯として判定に使う。
 
-| rustc | phase | before min/median | after min/median | ratio_min / ratio_median | 帯 |
-| --- | --- | --- | --- | --- | --- |
-| 1.98.1 | vector_knn | 706 / 723 | 700 / 715 | 0.992 / 0.989 | 0.086 |
-| 1.98.1 | hybrid_rrf | 8268 / 8418 | 8349 / 8444 | 1.010 / 1.003 | 0.030 |
-| 1.98.1 | mode_recall | 721 / 731 | 691 / 722 | 0.958 / 0.988 | 0.137 |
-| 1.99.0 | vector_knn | 827 / 832 | 683 / 684 | 0.826 / 0.822 | 0.056 |
-| 1.99.0 | hybrid_rrf | 8856 / 8944 | 7983 / 8275 | 0.901 / 0.925 | 0.047 |
-| 1.99.0 | mode_recall | 820 / 864 | 673 / 693 | 0.821 / 0.802 | 0.094 |
+| rustc | phase | before min/median | after min/median | ratio_min / ratio_median | 自帯 | 参照帯 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1.98.1 | vector_knn | 706 / 723 | 700 / 715 | 0.992 / 0.989 | 0.086 | 0.237 |
+| 1.98.1 | hybrid_rrf | 8268 / 8418 | 8349 / 8444 | 1.010 / 1.003 | 0.030 | 0.237 |
+| 1.98.1 | mode_recall | 721 / 731 | 691 / 722 | 0.958 / 0.988 | 0.137 | 0.237 |
+| 1.99.0 | vector_knn | 827 / 832 | 683 / 684 | 0.826 / 0.822 | 0.056 | 0.152 |
+| 1.99.0 | hybrid_rrf | 8856 / 8944 | 7983 / 8275 | 0.901 / 0.925 | 0.047 | 0.152 |
+| 1.99.0 | mode_recall | 820 / 864 | 673 / 693 | 0.821 / 0.802 | 0.094 | 0.152 |
 
-1.98.1 では検索系 phase が全て帯内（`Unchanged`）。1.99.0 では `before` の退行が `after` で
-解消し、`vector_knn` が約 18% 短縮した。1.99.0 の非ベクトル対照 `point_where` も 0.84 倍
-（帯 0.13）と動いており、各 pair で `before` を先に走らせる順序と負荷の逓減が交絡しうるため、
-層 B の 18% は上限の目安として読む。結論（`after` が `before` より遅くない）は変わらない。
+参照帯の内訳（最大値を採った phase）は 1.98.1 が `point_where` 0.237、1.99.0 が `where_compound`
+0.152（`agg_multi` 0.134・`point_where` 0.130 が続く）。
+
+判定（固定 ±5% 帯・参照帯の両方を超え、min と median が同方向のときのみ有意）:
+
+- 1.98.1: 3 phase とも改善・悪化率が参照帯 0.237 以内で `Neutral`。
+- 1.99.0 `hybrid_rrf`: 改善率が min 9.9%・median 7.5% で参照帯 0.152 以内のため `Neutral`。
+- 1.99.0 `vector_knn`（改善 17.4%／17.8%）・`mode_recall`（17.9%／19.8%）: 参照帯を僅かに超えるが、
+  非ベクトル対照の `point_where` も 0.84 倍（15.9% 短縮）と同程度に動いており、各 pair で `before` を
+  先に走らせる順序と負荷の逓減が交絡しうる。層 B からは有意な改善を主張せず `Inconclusive`
+  （`Neutral` 寄り）とし、`black_box` が `after` を `before` より遅くしていないことの確認にのみ使う。
+  1.99.0 の退行と `black_box` による解消の根拠は層 A（ratio 約 0.3、対照の揺れより一桁大きい）と
+  生成コード検査である。
 
 ### 生成コード検査
 
