@@ -231,7 +231,7 @@ doc・`crates/wire-server/docs/nosql-api.md`「転送路の共通規則」節）
 | `where_compound_count` | `filter[].op` が `eq`／`prefix` のみで範囲比較演算子が無く `id > 100` を表現できない |
 | `udf_call` | 宣言的 UDF 呼び出しに対応する `op` が許可リスト（4 値）に無い |
 | `explain` | `vector` 指定検索への `explain:true` は `42601` で拒否される契約（`plan` 検索の `EXPLAIN` は LLM プランナー未接続のため対象外） |
-| `ingest_bulk` | `op: insert` の `rows` 配列は 1 要求あたり既定上限 64 行（INDEX-4 ①）であり、ファイル形一括投入に相当する規模の意味論を持たない |
+| `ingest_bulk` | COPY 相当のストリーミング一括投入 op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当（1 要求あたり既定上限 64 行・INDEX-4 ①・要求ごとに commit）で、SQL 表層の COPY 計測と同形の分割投入は未実装 |
 
 `group_by_having` は NoSQL の `aggregate`（`group_by`／`having`）に `ORDER BY`／
 `LIMIT` 相当のフィールドが無いため、`self_db.py` の `... ORDER BY n DESC
@@ -402,7 +402,7 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 
 | フェーズ | 内容 |
 | -------- | ---- |
-| `ingest_bulk` | 一括投入（COPY 相当。self は wire に COPY が無いため常に unsupported） |
+| `ingest_bulk` | 一括投入（COPY 相当。self は `COPY ... FROM STDIN`〔CSV〕を専用テーブル `docs_bulk` へ 64 行ずつの複数 COPY で投入し COPY ごとに commit する。tenant／visibility は接続テナントの tenant-a／private 固定で、pgvector が含める索引作成に相当する処理は計測区間に無い。`self_copy.py` 参照） |
 | `ingest_single_stmt` | 単文 INSERT ループでの投入（self は行形 INSERT + `USING OPERATION_ID`） |
 | `vector_knn` | フィルタなし KNN（Top-10） |
 | `vector_knn_where` / `point_where` | `lang = 'ja'` フィルタ付き KNN（同形のため統合） |
@@ -520,9 +520,8 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 - **Redis**: `mode_recall`/`mode_precision`・`udf_call`（集計は `FT.AGGREGATE`、
   hybrid は `FT.HYBRID`、EXPLAIN は `FT.EXPLAIN` で計測する）。
 - **MongoDB（Atlas local）**: `mode_recall`/`mode_precision`・`udf_call`。
-- **self**: `ingest_bulk`（wire プロトコルに COPY 相当が無く、SQL 表層は
-  単文 INSERT のみ受理する。`EngineCore::execute_insert_sql_batch` は
-  Rust API であり wire 未露出）。
+- **self**: `ingest_bulk` は SQL 表層では `COPY ... FROM STDIN`（TASK-220・WIRE-17）で
+  計測する（`self_copy.py`）。docs jsonl が見つからない場合のみ unsupported を記録する。
 
 ## ファイル構成
 
