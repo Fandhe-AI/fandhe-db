@@ -20,7 +20,13 @@ gitlink 更新 push・workflow_dispatch）から実行される。ローカル�
   更新しない（冪等）。マーカーが壊れている issue は書き換えずエラーとして数え、
   最後に非 0 終了する
 - 書き込み間隔（`--write-interval`）と 403/429/5xx のバックオフ再試行で二次レート
-  制限に配慮し、1 回の実行の書き込み上限（`--max-writes`）に達したら残件数を出して
+  制限に配慮する。待機は必ず「最新本文の GET」より前に置き、GET → upsert → PATCH の
+  間には挟まない。PATCH は同じ payload を再送せず、再試行時は最新本文・状態を
+  取り直して upsert をやり直す（`sync_issue` 参照）。
+- 受容済み残留リスク: GitHub の issue 更新 API には条件付き更新（ETag/If-Match に
+  よる楽観ロック）が無いため、GET 直後〜PATCH までの 1 往復分の間にマーカー外が
+  手動編集されると、その編集は上書きされうる（窓は待機を含まない往復時間のみ）
+- 1 回の実行の書き込み上限（`--max-writes`）に達したら残件数を出して
   正常終了する（冪等なので次回実行が続きを処理する）
 - ログには issue 番号・ID・件数・HTTP ステータスのみを出す（応答本文・spec の他の
   内容は出さない）
@@ -68,9 +74,14 @@ class MarkerError(ValueError):
 class ApiError(RuntimeError):
     """GitHub API 呼び出しの失敗（ステータスのみ保持し、応答本文は保持しない）。"""
 
-    def __init__(self, status: int | None, what: str) -> None:
+    def __init__(
+        self, status: int | None, what: str, retryable: bool = False, delay: float = 0.0
+    ) -> None:
         super().__init__(f"{what}: status={status}")
         self.status = status
+        # retry=False で呼んだ request が失敗したとき、呼び出し側が再試行するための情報
+        self.retryable = retryable
+        self.delay = delay
 
 
 # --------------------------------------------------
@@ -245,11 +256,22 @@ class GitHubClient:
         self._sleep = sleep
 
     def request(
-        self, method: str, url: str, payload: dict[str, object] | None = None
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, object] | None = None,
+        retry: bool = True,
     ) -> tuple[object, dict[str, str]]:
-        """JSON を送受信する。再試行可能な失敗はバックオフして再試行する。"""
+        """JSON を送受信する。
+
+        retry=True（GET 等の冪等な読み取り向け）は再試行可能な失敗をバックオフして
+        再試行する。retry=False（本文 PATCH 向け）は 1 回だけ送り、失敗時は
+        ApiError の retryable／delay に再試行可否と待ち秒数を載せて呼び出し側へ返す
+        （古い本文から作った payload を待機後に再送しないため）。
+        """
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        for attempt in range(self._max_attempts):
+        attempts = self._max_attempts if retry else 1
+        for attempt in range(attempts):
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Accept", "application/vnd.github+json")
             req.add_header("Authorization", f"Bearer {self._token}")
@@ -273,9 +295,12 @@ class GitHubClient:
                     hint = ""
             except (urllib.error.URLError, TimeoutError, ConnectionError):
                 status, headers, hint = None, {}, ""
-            if not is_retryable(status, headers, hint) or attempt + 1 >= self._max_attempts:
-                raise ApiError(status, f"{method} failed")
+            retryable = is_retryable(status, headers, hint)
             delay = retry_delay(attempt, headers, time.time(), self._backoff_cap)
+            if not retry:
+                raise ApiError(status, f"{method} failed", retryable, delay)
+            if not retryable or attempt + 1 >= attempts:
+                raise ApiError(status, f"{method} failed")
             print(f"retry: {method} status={status} wait={delay:.0f}s", flush=True)
             self._sleep(delay)
         raise ApiError(None, f"{method} failed")  # 到達しない（ループ内で return/raise）
@@ -307,12 +332,54 @@ def list_open_issue_bodies(client: GitHubClient, repo: str) -> dict[int, str | N
     return result
 
 
+def sync_issue(
+    client: GitHubClient,
+    url: str,
+    ids: list[str],
+    sleep: Callable[[float], None] = time.sleep,
+    max_attempts: int = 5,
+) -> str:
+    """1 issue の節を同期する。戻り値は "updated" / "unchanged" / "not-open"。
+
+    各試行で最新本文・状態を GET し、その本文から upsert した payload を直ちに PATCH
+    する（GET と PATCH の間に待機を挟まない）。PATCH が再試行可能な理由で失敗した
+    場合は同じ payload を再送せず、待機後に GET からやり直す（待機中の手動編集・
+    close を取り込む）。残る GET→PATCH 間の競合はモジュール docstring の受容済み
+    残留リスクを参照。MarkerError・ApiError は呼び出し側へ送出する。
+    """
+    for attempt in range(max_attempts):
+        issue, _ = client.request("GET", url)
+        if not isinstance(issue, dict) or issue.get("state") != "open":
+            return "not-open"
+        body = issue.get("body")
+        if body is not None and not isinstance(body, str):
+            raise ApiError(None, "unexpected issue body")
+        new_body = upsert_section(body, ids)
+        if new_body == (body or ""):
+            return "unchanged"
+        try:
+            client.request("PATCH", url, {"body": new_body}, retry=False)
+        except ApiError as exc:
+            if not exc.retryable or attempt + 1 >= max_attempts:
+                raise
+            print(f"retry: PATCH status={exc.status} wait={exc.delay:.0f}s (refetch)",
+                  flush=True)
+            sleep(exc.delay)
+            continue
+        return "updated"
+    raise ApiError(None, "PATCH failed")  # 到達しない（ループ内で return/raise）
+
+
 # --------------------------------------------------
 # エントリポイント
 # --------------------------------------------------
 
 
-def run(args: argparse.Namespace, client: GitHubClient) -> int:
+def run(
+    args: argparse.Namespace,
+    client: GitHubClient,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
     """同期本体。戻り値は終了コード（0: 成功・1: 一部失敗）。"""
     mapping = load_map(args.map)
     print(f"map: {len(mapping)} issues", flush=True)
@@ -347,23 +414,20 @@ def run(args: argparse.Namespace, client: GitHubClient) -> int:
                   flush=True)
             break
         url = f"{API_BASE}/repos/{args.repo}/issues/{number}"
+        # 書き込み間隔の待機は最新本文の GET より前に置く（GET→PATCH 間に挟むと、
+        # 待機中の手動編集を古い本文で上書きしうるため）
+        if updated:
+            sleep(args.write_interval)
         try:
-            # 一覧取得から時間が経つため、書き込み直前に最新本文・状態を取り直して
-            # 手動編集との競合で他の本文を巻き戻さないようにする
-            issue, _ = client.request("GET", url)
-            if not isinstance(issue, dict) or issue.get("state") != "open":
+            # 一覧取得から時間が経つため、sync_issue が書き込み直前に最新本文・状態を
+            # 取り直す
+            outcome = sync_issue(client, url, mapping[number], sleep)
+            if outcome == "not-open":
                 print(f"skip: #{number} no longer open", flush=True)
                 continue
-            body = issue.get("body")
-            if body is not None and not isinstance(body, str):
-                raise ApiError(None, "unexpected issue body")
-            new_body = upsert_section(body, mapping[number])
-            if new_body == (body or ""):
+            if outcome == "unchanged":
                 print(f"skip: #{number} already up to date", flush=True)
                 continue
-            if updated:
-                time.sleep(args.write_interval)
-            client.request("PATCH", url, {"body": new_body})
         except MarkerError:
             print(f"error: #{number} malformed markers (left unchanged)", flush=True)
             errors += 1

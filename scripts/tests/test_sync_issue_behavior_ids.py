@@ -1,15 +1,21 @@
 """`sync_issue_behavior_ids.py` の純関数（対応表検証・本文 upsert・ページング・
-再試行判定）の単体テスト。GitHub API への実通信は対象外。
+再試行判定）と書き込み手順（待機は GET より前・PATCH 再試行は最新本文の再取得から）
+の単体テスト。GitHub API への実通信は対象外（偽クライアント・urlopen 差し替え）。
 `python3 -m unittest discover scripts/tests`（`make scripts-test`）で実行する。
 """
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+import urllib.error
+from contextlib import redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -192,6 +198,167 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(sync.retry_delay(0, {}, 0.0, 600.0), 60.0)
         self.assertEqual(sync.retry_delay(2, {}, 0.0, 600.0), 240.0)
         self.assertEqual(sync.retry_delay(5, {}, 0.0, 600.0), 600.0)
+
+
+class FakeClient:
+    """issue 本文・状態を持つ偽 GitHub クライアント。呼び出し順を events に記録する。
+
+    patch_failures で PATCH を指定回数だけ失敗させ、on_patch_failure で失敗直後に
+    「待機中の手動編集・close」を模擬する。
+    """
+
+    def __init__(self, issues: dict[int, dict[str, object]], events: list[str]) -> None:
+        self.issues = issues
+        self.events = events
+        self.patch_failures: list[sync.ApiError] = []
+        self.on_patch_failure = None
+        self.patched: list[tuple[int, str]] = []
+
+    @staticmethod
+    def _number(url: str) -> int:
+        return int(url.rsplit("/", 1)[1])
+
+    def request(self, method, url, payload=None, retry=True):
+        if "?state=open" in url:
+            self.events.append("LIST")
+            items = [{"number": n, "body": i["body"]} for n, i in self.issues.items()
+                     if i["state"] == "open"]
+            return items, {}
+        number = self._number(url)
+        if method == "GET":
+            self.events.append(f"GET#{number}")
+            issue = self.issues[number]
+            return {"state": issue["state"], "body": issue["body"]}, {}
+        assert method == "PATCH"
+        # PATCH は呼び出し側で再試行するため、クライアント内再試行を無効化していること
+        assert retry is False
+        self.events.append(f"PATCH#{number}")
+        if self.patch_failures:
+            exc = self.patch_failures.pop(0)
+            if self.on_patch_failure:
+                self.on_patch_failure(number)
+            raise exc
+        self.issues[number]["body"] = payload["body"]
+        self.patched.append((number, payload["body"]))
+        return {}, {}
+
+
+class SyncIssueTests(unittest.TestCase):
+    URL = "https://api.github.com/repos/o/r/issues/5"
+
+    def setUp(self) -> None:
+        self.events: list[str] = []
+        self.client = FakeClient({5: {"state": "open", "body": "v1"}}, self.events)
+
+    def _sleep(self, seconds: float) -> None:
+        self.events.append(f"SLEEP{seconds:g}")
+
+    def test_retry_refetches_and_rebuilds_payload_from_latest_body(self) -> None:
+        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True, 60.0)]
+
+        def edit_during_wait(number: int) -> None:
+            self.client.issues[number]["body"] = "v2 手動編集"
+
+        self.client.on_patch_failure = edit_during_wait
+        with redirect_stdout(io.StringIO()):
+            got = sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
+        self.assertEqual(got, "updated")
+        self.assertEqual(self.events, ["GET#5", "PATCH#5", "SLEEP60", "GET#5", "PATCH#5"])
+        # 再送 payload は待機中の手動編集を含む最新本文から作られる（古い v1 ではない）
+        self.assertEqual(self.client.patched,
+                         [(5, sync.upsert_section("v2 手動編集", ["SQL-1"]))])
+
+    def test_retry_stops_when_issue_closed_during_wait(self) -> None:
+        self.client.patch_failures = [sync.ApiError(502, "PATCH failed", True, 60.0)]
+
+        def close_during_wait(number: int) -> None:
+            self.client.issues[number]["state"] = "closed"
+
+        self.client.on_patch_failure = close_during_wait
+        with redirect_stdout(io.StringIO()):
+            got = sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
+        self.assertEqual(got, "not-open")
+        self.assertEqual(self.client.patched, [])
+        self.assertEqual(self.events, ["GET#5", "PATCH#5", "SLEEP60", "GET#5"])
+
+    def test_retry_skips_when_body_already_synced(self) -> None:
+        # PATCH が実は反映済み（応答だけ失われた）でも再取得で冪等に終わる
+        self.client.patch_failures = [sync.ApiError(None, "PATCH failed", True, 60.0)]
+
+        def applied_anyway(number: int) -> None:
+            self.client.issues[number]["body"] = sync.upsert_section("v1", ["SQL-1"])
+
+        self.client.on_patch_failure = applied_anyway
+        with redirect_stdout(io.StringIO()):
+            got = sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
+        self.assertEqual(got, "unchanged")
+
+    def test_non_retryable_patch_failure_is_raised_without_retry(self) -> None:
+        self.client.patch_failures = [sync.ApiError(422, "PATCH failed", False, 60.0)]
+        with self.assertRaises(sync.ApiError):
+            sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
+        self.assertEqual(self.events, ["GET#5", "PATCH#5"])
+
+    def test_gives_up_after_max_attempts(self) -> None:
+        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True, 1.0)] * 3
+        with redirect_stdout(io.StringIO()), self.assertRaises(sync.ApiError):
+            sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep, max_attempts=3)
+        self.assertEqual(self.events.count("PATCH#5"), 3)
+        self.assertEqual(self.events.count("GET#5"), 3)
+
+
+class RunWriteOrderTests(unittest.TestCase):
+    def test_write_interval_sleep_precedes_get(self) -> None:
+        events: list[str] = []
+        client = FakeClient({1: {"state": "open", "body": "a"},
+                             2: {"state": "open", "body": "b"},
+                             3: {"state": "open", "body": "c"}}, events)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "map.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(_map({"1": ["SQL-1"], "2": ["SQL-2"], "3": ["SQL-3"]}), f)
+            args = argparse.Namespace(map=path, repo="o/r", dry_run=False,
+                                      max_writes=10, write_interval=2.5)
+            with redirect_stdout(io.StringIO()):
+                code = sync.run(args, client, lambda s: events.append(f"SLEEP{s:g}"))
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["LIST",
+                                  "GET#1", "PATCH#1",
+                                  "SLEEP2.5", "GET#2", "PATCH#2",
+                                  "SLEEP2.5", "GET#3", "PATCH#3"])
+        # GET と PATCH の間に待機が挟まらない
+        for i, event in enumerate(events):
+            if event.startswith("GET#"):
+                self.assertTrue(events[i + 1].startswith("PATCH#"))
+
+
+class ClientRetryModeTests(unittest.TestCase):
+    def _http_error(self) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError("https://api.github.com/x", 429, "Too Many Requests",
+                                      {"Retry-After": "7"}, io.BytesIO(b""))
+
+    def test_patch_mode_sends_once_and_reports_retry_info(self) -> None:
+        sleeps: list[float] = []
+        client = sync.GitHubClient("t", sleep=sleeps.append)
+        with mock.patch.object(sync.urllib.request, "urlopen",
+                               side_effect=self._http_error()) as urlopen:
+            with self.assertRaises(sync.ApiError) as ctx:
+                client.request("PATCH", "https://api.github.com/x", {"body": "b"},
+                               retry=False)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(sleeps, [])
+        self.assertTrue(ctx.exception.retryable)
+        self.assertEqual(ctx.exception.delay, 7.0)
+
+    def test_get_mode_retries_inside_client(self) -> None:
+        sleeps: list[float] = []
+        client = sync.GitHubClient("t", max_attempts=3, sleep=sleeps.append)
+        with mock.patch.object(sync.urllib.request, "urlopen",
+                               side_effect=[self._http_error() for _ in range(3)]) as urlopen:
+            with redirect_stdout(io.StringIO()), self.assertRaises(sync.ApiError):
+                client.request("GET", "https://api.github.com/x")
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleeps, [7.0, 7.0])
 
 
 if __name__ == "__main__":
