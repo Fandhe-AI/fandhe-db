@@ -842,7 +842,17 @@ pub fn decode_bind_values(
                     )
                 })?
             }
-            Token::Keyword(_) | Token::Punct(_) | Token::DistanceOp | Token::Le | Token::Ge => 0,
+            Token::Keyword(_)
+            | Token::Punct(_)
+            | Token::DistanceOp
+            | Token::Le
+            | Token::Ge
+            | Token::Arrow
+            | Token::ArrowText
+            | Token::HashArrow
+            | Token::HashArrowText
+            | Token::TypeCast
+            | Token::Concat => 0,
         };
         total = total.checked_add(len).ok_or_else(|| {
             SqlSurfaceError::payload_too_large("substituted parameter payload size overflowed")

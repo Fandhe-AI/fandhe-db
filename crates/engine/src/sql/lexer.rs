@@ -48,6 +48,19 @@ pub enum Token {
     /// `*` は SELECT リストの `*` と式内の乗算の両方を表す。文脈による使い分けは
     /// `allowlist::Parser` の管轄）。
     Punct(char),
+    /// `->`（SQL-42・Issue #1520: 多文字演算子の字句化）。構文段（`sql::allowlist`）は
+    /// 本トークンを受理せず `42601` で拒否する（fail-closed）。以下 5 つの多文字演算子も同様。
+    Arrow,
+    /// `->>`（最長一致で `->` より優先。SQL-42・Issue #1520）。
+    ArrowText,
+    /// `#>`（SQL-42・Issue #1520）。
+    HashArrow,
+    /// `#>>`（最長一致で `#>` より優先。SQL-42・Issue #1520）。
+    HashArrowText,
+    /// `::`（SQL-42・Issue #1520）。
+    TypeCast,
+    /// `||`（SQL-42・Issue #1520）。
+    Concat,
     /// `<=>`（密ベクトル距離演算子）
     DistanceOp,
     /// `<=`（TASK-79・SQL-9: 式述語の比較演算子）。
@@ -123,6 +136,7 @@ fn keyword_from_str(s: &str) -> Option<Keyword> {
 /// 同じ字句解析・許可リストを再度通す）。
 ///
 /// 規則: トークンを半角スペース 1 つで連結する（隣接する `-` が `--` コメントに、
+/// `Punct('-')`＋`Punct('>')` が `->` に（SQL-42）、
 /// `<` と `=` が `<=` に化けるのを防ぐ）。`Keyword` は大文字、`StringLiteral` は
 /// `'` の二重化で囲む。`Token::Param` は DDL では Parse 時点で拒否済みのため
 /// `None`（fail-closed）。
@@ -152,6 +166,12 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::DistanceOp => out.push_str("<=>"),
             Token::Le => out.push_str("<="),
             Token::Ge => out.push_str(">="),
+            Token::Arrow => out.push_str("->"),
+            Token::ArrowText => out.push_str("->>"),
+            Token::HashArrow => out.push_str("#>"),
+            Token::HashArrowText => out.push_str("#>>"),
+            Token::TypeCast => out.push_str("::"),
+            Token::Concat => out.push_str("||"),
             Token::QualifiedIdent { qualifier, name } => {
                 out.push_str(qualifier);
                 out.push('.');
@@ -245,10 +265,58 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             });
         }
 
+        // 多文字演算子（SQL-42・Issue #1520）。`--` コメントは上で先に消費済みのため
+        // ここへ来る `-` は演算子。最長一致は `->>` → `->` → `-`。空白を挟んだ
+        // `- >` は従来どおり 2 トークン。`<->` は `<` と `->` に分かれる（構文段は
+        // 変更前後とも 42601 で拒否）。
         if c == '-' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '>'))) {
+                lookahead.next();
+                if matches!(lookahead.peek(), Some(&(_, '>'))) {
+                    lookahead.next();
+                    tokens.push(Token::ArrowText);
+                } else {
+                    tokens.push(Token::Arrow);
+                }
+                chars = lookahead;
+                continue;
+            }
             tokens.push(Token::Punct('-'));
             chars.next();
             continue;
+        }
+        // `#>>` → `#>`。`#` 単独は従来どおり未対応文字として拒否（扱いは #1521）。
+        if c == '#' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '>'))) {
+                lookahead.next();
+                if matches!(lookahead.peek(), Some(&(_, '>'))) {
+                    lookahead.next();
+                    tokens.push(Token::HashArrowText);
+                } else {
+                    tokens.push(Token::HashArrow);
+                }
+                chars = lookahead;
+                continue;
+            }
+        }
+        // `::`・`||`。単独の `:`・`|` は未対応文字として拒否する。
+        if c == ':' || c == '|' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, d)) if d == c) {
+                lookahead.next();
+                tokens.push(if c == ':' {
+                    Token::TypeCast
+                } else {
+                    Token::Concat
+                });
+                chars = lookahead;
+                continue;
+            }
         }
         if c == '/' {
             tokens.push(Token::Punct('/'));
@@ -1018,6 +1086,64 @@ mod tests {
     #[test]
     fn rejects_unterminated_string_literal() {
         assert!(tokenize("'abc").is_err());
+    }
+
+    /// SQL-42・Issue #1520: 多文字演算子の字句化（最長一致・境界）。
+    #[test]
+    fn multichar_operators_lex_as_single_tokens() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        assert_eq!(toks("a -> b"), vec![a(), Arrow, b()]);
+        assert_eq!(toks("a ->> b"), vec![a(), ArrowText, b()]);
+        assert_eq!(toks("a #> b"), vec![a(), HashArrow, b()]);
+        assert_eq!(toks("a #>> b"), vec![a(), HashArrowText, b()]);
+        assert_eq!(toks("a::b"), vec![a(), TypeCast, b()]);
+        assert_eq!(toks("a || b"), vec![a(), Concat, b()]);
+        assert_eq!(toks("a->>b"), vec![a(), ArrowText, b()]);
+        assert_eq!(toks("a->b"), vec![a(), Arrow, b()]);
+        assert_eq!(toks("a#>>b"), vec![a(), HashArrowText, b()]);
+        assert_eq!(toks("a#>b"), vec![a(), HashArrow, b()]);
+        assert_eq!(toks("->>>"), vec![ArrowText, Punct('>')]);
+        assert_eq!(toks("#>>>"), vec![HashArrowText, Punct('>')]);
+        assert_eq!(toks("a<->b"), vec![a(), Punct('<'), Arrow, b()]);
+        assert_eq!(
+            toks("1::int"),
+            vec![Number("1".into()), TypeCast, ident("int")]
+        );
+        assert_eq!(
+            tokenize_with_params("$1::int").expect("tokenize"),
+            vec![Param(1), TypeCast, ident("int")]
+        );
+    }
+
+    /// SQL-42・Issue #1520: 空白・コメント・文字列・単独文字の境界は従来どおり。
+    #[test]
+    fn multichar_operator_boundaries_keep_legacy_behavior() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        assert_eq!(toks("a - > b"), vec![a(), Punct('-'), Punct('>'), b()]);
+        assert_eq!(toks("a - >b"), vec![a(), Punct('-'), Punct('>'), b()]);
+        assert_eq!(toks("a - -> b"), vec![a(), Punct('-'), Arrow, b()]);
+        assert_eq!(toks("a-->b"), vec![a()]);
+        assert_eq!(toks("a /*->*/ b"), vec![a(), b()]);
+        assert_eq!(toks("a->/*c*/>b"), vec![a(), Arrow, Punct('>'), b()]);
+        for lit in ["a->b", "x||y", "::", "#>>"] {
+            assert_eq!(toks(&format!("'{lit}'")), vec![StringLiteral(lit.into())]);
+        }
+        for bad in ["a # b", "a : b", "a | b", "a:::b", "a|||b"] {
+            assert!(tokenize(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    /// SQL-42・Issue #1520: 新トークンの描画 → 再字句化で同一列に戻る（最小ケース）。
+    #[test]
+    fn render_tokens_round_trips_multichar_operators() {
+        let sql = "a -> b ->> c #> d #>> e :: f || g - > h";
+        let tokens = tokenize(sql).expect("tokenize");
+        let rendered = render_tokens(&tokens).expect("render");
+        assert_eq!(tokenize(&rendered).expect("re-tokenize"), tokens);
     }
 
     fn toks(sql: &str) -> Vec<Token> {

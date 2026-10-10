@@ -13518,6 +13518,21 @@ mod tests {
         assert_eq!(err.wire_code(), "42601", "sql={sql:?} err={err:?}");
     }
 
+    /// SQL-42・Issue #1520: lexer が多文字演算子を単一トークン化しても、構文段は
+    /// 受理しない（fail-closed）。変更前後で 42601 は同じで、受理が広がらないための回帰柵。
+    #[test]
+    fn rejects_multichar_operator_tokens_as_syntax_error() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE lang->'k' = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE lang::text = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE lang || 'a' = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
     #[test]
     fn rejects_cte() {
         assert_rejected_as_syntax_error(
