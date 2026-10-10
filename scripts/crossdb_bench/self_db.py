@@ -44,6 +44,7 @@ import time
 
 import psycopg
 
+import self_copy
 import self_durability
 import self_hnsw
 from common import (
@@ -52,6 +53,7 @@ from common import (
     TENANT_VISIBLE,
     build_meta,
     env_port,
+    load_jsonl,
     measure,
     sql_escape_literal,
     unsupported,
@@ -328,7 +330,7 @@ _HNSW_ARGS_ENV = "CROSSDB_SELF_HNSW_ARGS"
 _ANN_PROBE_ENV = "CROSSDB_SELF_ANN_PROBE"
 
 
-def run(args, queries: list[dict]) -> dict:
+def run(args, queries: list[dict], docs_file: str | None = None) -> dict:
     """self（wire-server）の全フェーズを実行する。
 
     `args.rows_file` は self の場合 redb ファイルパスを指す（他 DB モジュールの
@@ -336,10 +338,14 @@ def run(args, queries: list[dict]) -> dict:
     ——wire-server は既存 redb をそのまま開くため再投入しない）。
 
     `args.config`: `exact`（既定エンジン）は起動引数・フェーズ・結果キーを
-    従来どおりビット同一に保つ。`hnsw`（`--search-engine hnsw` opt-in。
+    従来どおり（`--ddl-allowed-users bench` の固定追加を除き）ビット同一に保つ。`hnsw`（`--search-engine hnsw` opt-in。
     Issue #656・#657・#658）は probe テーブル投入・loopback planner スタブ
     起動・`EXPLAIN` による非 vacuous 確認（`ann_probe`）・`hnsw_index_warm`
     単発計時を追加する（モジュール docstring 参照）。
+
+    `docs_file`: `ingest_bulk`（COPY FROM STDIN）で投入する docs jsonl
+    （`run.py` が `resolve_docs_file` で解決して渡す）。省略・不在の場合は
+    `ingest_bulk` のみ unsupported として記録する（他フェーズには影響しない）。
     """
     if args.config not in ("exact", "hnsw"):
         raise ValueError(f"self supports --config exact or hnsw (got {args.config!r})")
@@ -411,6 +417,12 @@ def run(args, queries: list[dict]) -> dict:
         durability_token = self_durability.durability_source()
         extra_args += self_durability.durability_extra_args(durability_token)
 
+        # `ingest_bulk` が投入専用テーブルを `CREATE TABLE` するための DDL 権限
+        # （SQL-23・TASK-203）。計測ユーザー `bench` にのみ付与する。DDL の既定拒否は
+        # 他フェーズの検査対象ではなく、権限は起動時固定の構成値のため他フェーズの
+        # クエリ経路・結果には影響しない。
+        extra_args += ["--ddl-allowed-users", USER_A]
+
         server = SelfServer(db_path=work_db, workdir=workdir, extra_args=extra_args)
         server.start()
         # arm 取り違え防止（fail-closed。起動ログの警告行有無と要求した
@@ -423,6 +435,7 @@ def run(args, queries: list[dict]) -> dict:
             run_ann_probe=run_ann_probe,
             hnsw_args=hnsw_args,
             durability_token=durability_token,
+            docs_file=docs_file,
         )
     finally:
         if server is not None:
@@ -439,6 +452,7 @@ def _run_phases(
     run_ann_probe: bool = False,
     hnsw_args: list[str] | None = None,
     durability_token: str | None = None,
+    docs_file: str | None = None,
 ) -> dict:
     """起動済み wire-server に対して全フェーズを実行する（`run` から呼ばれる）。
 
@@ -758,11 +772,22 @@ def _run_phases(
                 f"EXPLAIN は `USING PLAN(...)` 文にのみ対応（許可リスト拒否を実機確認）: {e!r}"
             )
 
-        # --- ingest_bulk: wire は COPY 相当の一括投入プロトコルを持たない ---
-        phases["ingest_bulk"] = unsupported(
-            "wire プロトコルに COPY 相当が無く、SQL 表層は単文 INSERT のみ受理する"
-            "（`EngineCore::execute_insert_sql_batch` は Rust API であり wire 未露出）"
-        )
+        # --- ingest_bulk: fixture の全 docs を COPY FROM STDIN（CSV）で投入する ---
+        # TASK-220・WIRE-17（`docs/design/wire-copy-protocol.md`）。1 回の COPY は
+        # INDEX-4 ① の既定 64 行までのため複数 COPY に分割する（詳細・pgvector との
+        # 計測区間の差は `self_copy` のモジュール docstring と結果の `note`）。
+        # 投入先は専用テーブル `docs_bulk`（fixture の `docs` は不変）。
+        if docs_file is None or not os.path.exists(docs_file):
+            phases["ingest_bulk"] = unsupported(
+                f"投入元の docs jsonl が見つからない（docs_file={docs_file!r}）"
+            )
+        else:
+            bulk_docs = load_jsonl(docs_file)
+            phases["ingest_bulk"] = self_copy.ingest_bulk(
+                conn_a,
+                bulk_docs,
+                len(bulk_docs[0]["embedding"]) if bulk_docs else DIM,
+            )
 
         # --- ingest_single_stmt: 行形 INSERT を 1,000 行単文で送る ---
         # 投入ベクトルの次元はクエリ fixture（`queries200.jsonl`）の embedding から
