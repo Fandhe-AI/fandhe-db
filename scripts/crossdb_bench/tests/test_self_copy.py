@@ -31,6 +31,16 @@ class CopyRowsFromEnvTests(unittest.TestCase):
         self.assertEqual(self_copy.copy_rows_from_env("1"), 1)
         self.assertEqual(self_copy.copy_rows_from_env(" 25000 "), 25000)
         self.assertEqual(self_copy.copy_rows_from_env("1000000"), 1_000_000)
+        # Rust の usize 解析と同じく先頭の `+` は受理する。
+        self.assertEqual(self_copy.copy_rows_from_env("+128"), 128)
+
+    def test_rejects_forms_the_server_rejects(self) -> None:
+        # Python の int() は受理するがサーバー（Rust の parse::<usize>）は拒否する形。
+        for raw in ("1_000", "\uff11\uff12\uff18", "-0", "+", "12 8", "0x40", "\x1c128"):
+            self.assertEqual(self_copy.copy_rows_from_env(raw), 64, repr(raw))
+
+    def test_trims_rust_whitespace(self) -> None:
+        self.assertEqual(self_copy.copy_rows_from_env("\u3000128\n"), 128)
 
 
 class ChunkedTests(unittest.TestCase):

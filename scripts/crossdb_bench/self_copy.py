@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Iterable, Iterator
 
@@ -55,15 +56,27 @@ _ROWS_ENV = "FANDHE_DB_BATCH_MAX_FILES"
 COLUMNS = ("id", "embedding", "lang", "topic", "body")
 
 
+# Rust の `str::trim` が除く空白（Unicode の White_Space）。Python の `str.strip()` は
+# これに加えて U+001C〜U+001F も除くため、サーバーと揃えるよう明示する。
+_RUST_WHITESPACE = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+# Rust の `usize::from_str` が受理する形（任意の `+` と ASCII の十進数字のみ）。
+# Python の `int()` が受理する `_` 区切り・全角数字・符号 `-` は受理しない。
+_USIZE_LITERAL = re.compile(r"\+?[0-9]+")
+
+
 def copy_rows_from_env(raw: str | None) -> int:
-    """1 COPY あたりの行数を決める。サーバーの `parse_env_max_files` と同じ規則
-    （未設定・非数値・範囲外は既定 64 へ倒す）で、サーバーに渡る環境変数と食い違わない。"""
+    """1 COPY あたりの行数を決める。サーバーの `parse_env_max_files`（`trim` 後に
+    `parse::<usize>()`）と同じ規則（未設定・非数値・範囲外は既定 64 へ倒す）で解析し、
+    サーバーに渡る環境変数と食い違わない（食い違うと COPY が 54000 で失敗する）。"""
     if raw is None:
         return DEFAULT_COPY_ROWS
-    try:
-        value = int(raw.strip())
-    except ValueError:
+    text = raw.strip(_RUST_WHITESPACE)
+    if not _USIZE_LITERAL.fullmatch(text):
         return DEFAULT_COPY_ROWS
+    value = int(text)
     if 1 <= value <= MAX_COPY_ROWS:
         return value
     return DEFAULT_COPY_ROWS
