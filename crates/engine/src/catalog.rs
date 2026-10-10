@@ -165,10 +165,6 @@ pub(crate) fn index_catalog_generation_in_txn(read_txn: &redb::ReadTransaction) 
     }
 }
 
-/// 索引宣言 1 件が持てる列数の上限（[`MAX_COLUMN_COUNT`] と同値。本リポの実装
-/// 既定値）。
-const MAX_INDEX_DEF_COLUMNS: usize = MAX_COLUMN_COUNT;
-
 /// 索引種別（TASK-206・INDEX-7、Issue #908）。`Scalar` はスカラー列（1 列以上）への
 /// 宣言、`Hnsw` は単一の `VECTOR` 列に対する ANN 索引の宣言を表す。疎索引（BM25）は
 /// 宣言の対象外（hybrid 実行のたびに自動構築する既存契約のまま）。
@@ -271,7 +267,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
     }
     let mut columns: Vec<String> = Vec::new();
     for c in columns_csv.split(',') {
-        if columns.len() >= MAX_INDEX_DEF_COLUMNS {
+        if columns.len() >= MAX_COLUMN_COUNT {
             return Err(CatalogError::CorruptSchema(format!(
                 "index column count exceeds limit for index {name}"
             )));
@@ -298,7 +294,7 @@ fn decode_index_def(name: &str, bytes: &[u8]) -> Result<IndexDef> {
 
 /// 列名リストの中で最初に重複した列名を返す（[`Storage::create_index`] の入力検証と
 /// [`decode_index_def`] の破損検出が共有する。要素数は呼び出し元が
-/// [`MAX_INDEX_DEF_COLUMNS`] 以下に制限済み）。
+/// [`MAX_COLUMN_COUNT`] 以下に制限済み）。
 fn first_duplicate_column(columns: &[String]) -> Option<&str> {
     let mut seen = std::collections::HashSet::new();
     columns
@@ -1041,8 +1037,10 @@ const _: () = assert!(
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-/// `pub(crate)`: [`crate::sql::explain::ExplainShape`]（Issue #1066）が
-/// `metadata_filters` 参照列のビットセット長をこの値と同期させるため参照する。
+/// 列数上限の唯一の定義（Issue #1518）。`pub(crate)` なのは、SQL 構文段
+/// （`sql::allowlist` の INSERT・COPY・CREATE TABLE・CREATE INDEX の列リスト上限）と
+/// EXPLAIN のビットセット長（`sql::explain`・Issue #1066）がこの値から導出・直接参照
+/// するため。別名定数やリテラルの 256 を新設しない。
 pub(crate) const MAX_COLUMN_COUNT: usize = 256;
 
 /// `PRIMARY KEY` に宣言できる列数の上限（TABLE-16・TASK-204、Issue #903）。
@@ -8742,9 +8740,9 @@ impl Storage {
                 "index must reference at least one column".to_string(),
             ));
         }
-        if def.columns.len() > MAX_INDEX_DEF_COLUMNS {
+        if def.columns.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(format!(
-                "index column count {} exceeds limit {MAX_INDEX_DEF_COLUMNS}",
+                "index column count {} exceeds limit {MAX_COLUMN_COUNT}",
                 def.columns.len()
             )));
         }

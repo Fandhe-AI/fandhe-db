@@ -195,13 +195,13 @@ fn normalize_index_names(mut names: Vec<String>) -> Vec<String> {
 /// ScalarIndexTargetOwned`]）と突き合わせて `scalar_plan:` 表示を補正する
 /// （[`crate::sql::scalar_index::scalar_plan_under_target`]）ために使う。
 /// `Copy`（`ExplainShape` 自体が `Copy` の契約を保つため）な固定長ビット集合
-/// （`[u64; 4]` で 256 ビット）で表現し、無制限 `Vec` 確保を避ける
+/// （`[u64; FILTER_COLS_WORDS]`。`catalog::MAX_COLUMN_COUNT` 列分）で表現し、無制限 `Vec` 確保を避ける
 /// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」）。
 /// 上限は [`crate::declarative_filter::MAX_METADATA_FILTERS`]
-/// （`catalog::MAX_COLUMN_COUNT` と同値・256）に揃える。
+/// （いずれも `catalog::MAX_COLUMN_COUNT` と同値）に揃える。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FilterColumnSet {
-    bits: [u64; 4],
+    bits: [u64; FILTER_COLS_WORDS],
     /// `column_index` が [`Self::CAPACITY`] 以上で表現できなかった要素が
     /// 1 件でもあったか。`true` の場合、`sql::scalar_index::
     /// scalar_plan_under_target` は「解決不能」として fail-closed に
@@ -211,19 +211,22 @@ struct FilterColumnSet {
 }
 
 impl FilterColumnSet {
-    /// `catalog::MAX_COLUMN_COUNT`（256・`declarative_filter::MAX_METADATA_FILTERS`
-    /// と同値）に揃えたビット集合の容量。
-    const CAPACITY: usize = 256;
+    /// `catalog::MAX_COLUMN_COUNT` をそのまま容量とする（別リテラルを持たない）。
+    const CAPACITY: usize = crate::catalog::MAX_COLUMN_COUNT;
 
     fn empty() -> Self {
         Self {
-            bits: [0; 4],
+            bits: [0; FILTER_COLS_WORDS],
             overflow: false,
         }
     }
 
     fn insert(&mut self, column_index: usize) {
-        let Some(word) = self.bits.get_mut(column_index / 64) else {
+        // 語数ではなく `CAPACITY` 基準で判定し、`set_filter_col_bit` と揃える（fail-closed）。
+        let Some(word) = (column_index < Self::CAPACITY)
+            .then(|| self.bits.get_mut(column_index / 64))
+            .flatten()
+        else {
             self.overflow = true;
             return;
         };
@@ -245,7 +248,7 @@ impl FilterColumnSet {
 
     /// [`crate::sql::scalar_index::scalar_plan_under_target`] の
     /// `metadata_filter_columns` 引数が要求する形（列添字。解決不能は
-    /// `None`）へ変換する。要素数はたかだか [`Self::CAPACITY`]（256）件で
+    /// `None`）へ変換する。要素数はたかだか [`Self::CAPACITY`] 件で
     /// 固定長のため無制限確保にはならない。[`Self::overflow`] が立っている
     /// 場合は実際の列添字を復元できないため、単一の `None` を返し
     /// `scalar_plan_under_target` に fail-closed な降格を促す。
@@ -299,10 +302,9 @@ pub struct ExplainShape {
     filter_columns: FilterColumnSet,
 }
 
-/// [`ExplainShape::filter_cols`] の語数（`u64` × 4 = 256 列分）。
-/// [`crate::catalog::MAX_COLUMN_COUNT`] と同期させる（下記 `const _` で
-/// コンパイル時に強制する）。
-const FILTER_COLS_WORDS: usize = 4;
+/// [`ExplainShape::filter_cols`] の語数。[`crate::catalog::MAX_COLUMN_COUNT`] から
+/// 導出する（上限を変えても自動追従する）。下記 `const _` は導出式の健全性確認。
+const FILTER_COLS_WORDS: usize = crate::catalog::MAX_COLUMN_COUNT.div_ceil(64);
 
 const _: () = assert!(
     FILTER_COLS_WORDS * 64 >= crate::catalog::MAX_COLUMN_COUNT,
