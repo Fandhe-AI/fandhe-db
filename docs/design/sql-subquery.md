@@ -105,7 +105,7 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 - 内側の可視結果行数: `core::MAX_SEARCH_K`（10,000）超過は `54000`
   （内側 `LIMIT` の範囲検証とは独立の追加防御）。
 - `IN (SELECT ...)` の distinct 値数: `sql::subquery::MAX_SUBQUERY_IN_VALUES`
-  （`core::MAX_SEARCH_K` と同じ 10,000。Issue #1165 で旧 256 葉上限〔PR #1103
+  （10,000。`core::MAX_SEARCH_K` と同値の独立定数、Issue #1517。Issue #1165 で旧 256 葉上限〔PR #1103
   codex-review 指摘対応で導入〕から集合照合方式へ見直して引き上げ。文全体で共有する
   `&mut usize` 予算で検査し、超過は `54000`。distinct 化の後・チャンク構築の**前**に
   distinct 値数を `checked_sub` で一括消費する）。予算は内側の**行**単位ではなく
