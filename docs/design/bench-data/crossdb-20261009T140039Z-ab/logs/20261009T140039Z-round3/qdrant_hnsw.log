@@ -1,2 +1,0 @@
-I1009 23:10:58.938521 196960408 ev_poll_posix.cc:587] FD from fork parent still in poll list: fd(8, generation: 1)
-wrote: /Users/nancy/crossdb-20261009/results/20261009T140039Z-round3/qdrant_hnsw.json
