@@ -55,6 +55,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make test-default-build` | 既定ビルド（feature `fault-injection` 無効）専用の回帰テスト（`ci` に含む）。`make test` は `--all-features` のため対象外のテストをピンポイント実行 |
 | `make crash-test` / `make crash-test-interrupt` / `make crash-test-cross-table` / `make crash-test-unique-index` / `make crash-test-partitioned-dml` / `make tmp-leak-check` / `make core-api-check` / `make sort-determinism-check` / `make simd-codegen-check` | `ci` に含まれるガード系（クラッシュ耐性・テスト一時領域の残置検出・コア API 差分・ソート非決定性・SIMD 生成コード検査）。個別実行や詳細は `make help` を参照 |
 | `make check-cross` / `make simd-codegen-check-cross` | aarch64 クロスコンパイル確認（`ci.yml` の cross-check ジョブから実行。`ci` には含めない）。beta toolchain での週次先行検知は `toolchain-canary.yml` |
+| `make scripts-test` | `scripts/tests` 配下の Python 補助スクリプトの単体テスト（要 `python3`・標準ライブラリのみ。`ci` に含む） |
 | `make test-eval` | `scripts/eval` のユニットテスト（要 `python3`。CI には未配線） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
 | `make bench-simd` / `make bench-c1` / `make recall-regression` / `make precision-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行。`precision-regression` は目標値未確定のため `recall.yml` へ未接続。詳細は下記「`precision` 評価ハーネス」参照） |
@@ -1062,6 +1063,17 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
 secret の設定はオーナー作業（初回 run で Environment が自動作成された場合は保護ルールが空の
 ため必ず手動で追加する）。`wire-server` 単体の dry-run は engine の公開版が crates.io に
 無い間は依存解決で失敗するため、初回は `all` を使う。
+
+### issue 本文のビヘイビア ID 節の同期（`.github/workflows/sync-issue-behavior-ids.yml`）
+
+spec 側の issue→ビヘイビア ID 対応表（`docs/spec/04-behavior/records/pg-parity-issue-behavior-ids.json`）を
+`scripts/sync_issue_behavior_ids.py` が読み、open issue 本文のマーカー
+`<!-- behavior-ids:start -->` 〜 `<!-- behavior-ids:end -->` の節だけを ID のポインタで上書きする
+（マーカー外は変更しない・内容が同じなら更新しない）。main への `docs/spec` 更新 push で自動実行され、
+`workflow_dispatch` は既定 `dry_run: true`（差分件数のみ出力）。secret `SUBMODULE_PAT` が必須。
+1 回の実行の書き込みは 300 件までのため、ログに `write cap reached` が出たら 1 時間以上空けて
+`dry_run: false` で再実行する。ローカル確認は
+`GH_TOKEN=$(gh auth token) python3 scripts/sync_issue_behavior_ids.py --map <JSON> --repo Fandhe-AI/fandhe-db --dry-run`。
 
 ## 旧名からの移行
 
