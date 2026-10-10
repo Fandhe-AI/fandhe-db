@@ -59,6 +59,8 @@ MAP_POINTER = "docs/spec/04-behavior/records/pg-parity-issue-behavior-ids.json"
 MAX_MAP_BYTES = 4 * 1024 * 1024
 API_BASE = "https://api.github.com"
 USER_AGENT = "fandhe-db-sync-issue-behavior-ids"
+# retry_delay が参照するレート制限ヘッダ（ApiError に載せて呼び出し側へ渡す対象）
+RETRY_HEADER_KEYS = ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset")
 # open issue 一覧のページ数上限（per_page=100。無限ページングの防御）
 MAX_LIST_PAGES = 100
 
@@ -75,13 +77,19 @@ class ApiError(RuntimeError):
     """GitHub API 呼び出しの失敗（ステータスのみ保持し、応答本文は保持しない）。"""
 
     def __init__(
-        self, status: int | None, what: str, retryable: bool = False, delay: float = 0.0
+        self,
+        status: int | None,
+        what: str,
+        retryable: bool = False,
+        retry_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(f"{what}: status={status}")
         self.status = status
-        # retry=False で呼んだ request が失敗したとき、呼び出し側が再試行するための情報
+        # retry=False で呼んだ request が失敗したとき、呼び出し側が再試行するための情報。
+        # 待ち秒数は呼び出し側が自分の試行回数で retry_delay を計算する（指数バックオフ
+        # を効かせるため）。保持するのは待機計算に使うレート制限ヘッダのみ
         self.retryable = retryable
-        self.delay = delay
+        self.retry_headers = retry_headers or {}
 
 
 # --------------------------------------------------
@@ -266,8 +274,8 @@ class GitHubClient:
 
         retry=True（GET 等の冪等な読み取り向け）は再試行可能な失敗をバックオフして
         再試行する。retry=False（本文 PATCH 向け）は 1 回だけ送り、失敗時は
-        ApiError の retryable／delay に再試行可否と待ち秒数を載せて呼び出し側へ返す
-        （古い本文から作った payload を待機後に再送しないため）。
+        ApiError の retryable／retry_headers に再試行可否と待機計算用ヘッダを載せて
+        呼び出し側へ返す（古い本文から作った payload を待機後に再送しないため）。
         """
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         attempts = self._max_attempts if retry else 1
@@ -296,11 +304,12 @@ class GitHubClient:
             except (urllib.error.URLError, TimeoutError, ConnectionError):
                 status, headers, hint = None, {}, ""
             retryable = is_retryable(status, headers, hint)
-            delay = retry_delay(attempt, headers, time.time(), self._backoff_cap)
             if not retry:
-                raise ApiError(status, f"{method} failed", retryable, delay)
+                kept = {k: v for k, v in headers.items() if k in RETRY_HEADER_KEYS}
+                raise ApiError(status, f"{method} failed", retryable, kept)
             if not retryable or attempt + 1 >= attempts:
                 raise ApiError(status, f"{method} failed")
+            delay = retry_delay(attempt, headers, time.time(), self._backoff_cap)
             print(f"retry: {method} status={status} wait={delay:.0f}s", flush=True)
             self._sleep(delay)
         raise ApiError(None, f"{method} failed")  # 到達しない（ループ内で return/raise）
@@ -338,14 +347,17 @@ def sync_issue(
     ids: list[str],
     sleep: Callable[[float], None] = time.sleep,
     max_attempts: int = 5,
+    backoff_cap: float = 600.0,
+    now: Callable[[], float] = time.time,
 ) -> str:
     """1 issue の節を同期する。戻り値は "updated" / "unchanged" / "not-open"。
 
     各試行で最新本文・状態を GET し、その本文から upsert した payload を直ちに PATCH
     する（GET と PATCH の間に待機を挟まない）。PATCH が再試行可能な理由で失敗した
     場合は同じ payload を再送せず、待機後に GET からやり直す（待機中の手動編集・
-    close を取り込む）。残る GET→PATCH 間の競合はモジュール docstring の受容済み
-    残留リスクを参照。MarkerError・ApiError は呼び出し側へ送出する。
+    close を取り込む）。待機は本関数の試行回数で retry_delay を計算し、Retry-After 等が
+    無い連続失敗では 60/120/240… 秒と指数的に伸ばす。残る GET→PATCH 間の競合は
+    モジュール docstring の受容済み残留リスクを参照。MarkerError・ApiError は呼び出し側へ送出する。
     """
     for attempt in range(max_attempts):
         issue, _ = client.request("GET", url)
@@ -362,9 +374,10 @@ def sync_issue(
         except ApiError as exc:
             if not exc.retryable or attempt + 1 >= max_attempts:
                 raise
-            print(f"retry: PATCH status={exc.status} wait={exc.delay:.0f}s (refetch)",
+            delay = retry_delay(attempt, exc.retry_headers, now(), backoff_cap)
+            print(f"retry: PATCH status={exc.status} wait={delay:.0f}s (refetch)",
                   flush=True)
-            sleep(exc.delay)
+            sleep(delay)
             continue
         return "updated"
     raise ApiError(None, "PATCH failed")  # 到達しない（ループ内で return/raise）

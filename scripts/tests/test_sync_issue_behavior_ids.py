@@ -254,7 +254,7 @@ class SyncIssueTests(unittest.TestCase):
         self.events.append(f"SLEEP{seconds:g}")
 
     def test_retry_refetches_and_rebuilds_payload_from_latest_body(self) -> None:
-        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True, 60.0)]
+        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True)]
 
         def edit_during_wait(number: int) -> None:
             self.client.issues[number]["body"] = "v2 手動編集"
@@ -269,7 +269,7 @@ class SyncIssueTests(unittest.TestCase):
                          [(5, sync.upsert_section("v2 手動編集", ["SQL-1"]))])
 
     def test_retry_stops_when_issue_closed_during_wait(self) -> None:
-        self.client.patch_failures = [sync.ApiError(502, "PATCH failed", True, 60.0)]
+        self.client.patch_failures = [sync.ApiError(502, "PATCH failed", True)]
 
         def close_during_wait(number: int) -> None:
             self.client.issues[number]["state"] = "closed"
@@ -283,7 +283,7 @@ class SyncIssueTests(unittest.TestCase):
 
     def test_retry_skips_when_body_already_synced(self) -> None:
         # PATCH が実は反映済み（応答だけ失われた）でも再取得で冪等に終わる
-        self.client.patch_failures = [sync.ApiError(None, "PATCH failed", True, 60.0)]
+        self.client.patch_failures = [sync.ApiError(None, "PATCH failed", True)]
 
         def applied_anyway(number: int) -> None:
             self.client.issues[number]["body"] = sync.upsert_section("v1", ["SQL-1"])
@@ -294,17 +294,43 @@ class SyncIssueTests(unittest.TestCase):
         self.assertEqual(got, "unchanged")
 
     def test_non_retryable_patch_failure_is_raised_without_retry(self) -> None:
-        self.client.patch_failures = [sync.ApiError(422, "PATCH failed", False, 60.0)]
+        self.client.patch_failures = [sync.ApiError(422, "PATCH failed", False)]
         with self.assertRaises(sync.ApiError):
             sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
         self.assertEqual(self.events, ["GET#5", "PATCH#5"])
 
     def test_gives_up_after_max_attempts(self) -> None:
-        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True, 1.0)] * 3
+        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True)] * 3
         with redirect_stdout(io.StringIO()), self.assertRaises(sync.ApiError):
             sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep, max_attempts=3)
         self.assertEqual(self.events.count("PATCH#5"), 3)
         self.assertEqual(self.events.count("GET#5"), 3)
+
+    def test_patch_backoff_grows_without_rate_limit_headers(self) -> None:
+        # Retry-After・x-ratelimit-reset の無い連続失敗では sync_issue の試行回数で
+        # 指数バックオフ（60/120/240/480）する
+        self.client.patch_failures = [sync.ApiError(503, "PATCH failed", True)] * 4
+        with redirect_stdout(io.StringIO()):
+            got = sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
+        self.assertEqual(got, "updated")
+        self.assertEqual([e for e in self.events if e.startswith("SLEEP")],
+                         ["SLEEP60", "SLEEP120", "SLEEP240", "SLEEP480"])
+
+    def test_patch_backoff_is_capped(self) -> None:
+        self.client.patch_failures = [sync.ApiError(429, "PATCH failed", True)] * 5
+        with redirect_stdout(io.StringIO()):
+            got = sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep,
+                                  max_attempts=6, backoff_cap=300.0)
+        self.assertEqual(got, "updated")
+        self.assertEqual([e for e in self.events if e.startswith("SLEEP")],
+                         ["SLEEP60", "SLEEP120", "SLEEP240", "SLEEP300", "SLEEP300"])
+
+    def test_patch_backoff_honors_retry_after(self) -> None:
+        self.client.patch_failures = [
+            sync.ApiError(403, "PATCH failed", True, {"retry-after": "30"})]
+        with redirect_stdout(io.StringIO()):
+            sync.sync_issue(self.client, self.URL, ["SQL-1"], self._sleep)
+        self.assertEqual([e for e in self.events if e.startswith("SLEEP")], ["SLEEP30"])
 
 
 class RunWriteOrderTests(unittest.TestCase):
@@ -348,7 +374,7 @@ class ClientRetryModeTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(sleeps, [])
         self.assertTrue(ctx.exception.retryable)
-        self.assertEqual(ctx.exception.delay, 7.0)
+        self.assertEqual(ctx.exception.retry_headers, {"retry-after": "7"})
 
     def test_get_mode_retries_inside_client(self) -> None:
         sleeps: list[float] = []
