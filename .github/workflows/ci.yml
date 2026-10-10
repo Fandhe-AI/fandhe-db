@@ -271,6 +271,26 @@ jobs:
         run: make sort-determinism-check
 
   # --------------------------------------------------
+  # scripts-test（scripts/ 配下の Python 補助スクリプトの単体テスト）
+  # --------------------------------------------------
+  # `python3 -m unittest discover scripts/tests`（Makefile の scripts-test）を実行する。
+  # issue 本文のビヘイビア ID 節を同期する scripts/sync_issue_behavior_ids.py
+  # （.github/workflows/sync-issue-behavior-ids.yml から実行）の純関数テストを含む。
+  # 標準ライブラリのみで Rust toolchain は不要なため checkout のみで完結する。
+  # core-api-check と同様の理由で独立ジョブとし、第三者 action は同一 SHA 固定を使う。
+  # branch protection の必須チェックへ追加する運用は他ジョブと同様ユーザー作業（PR 本文参照）。
+  scripts-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Run scripts-test
+        run: make scripts-test
+
+  # --------------------------------------------------
   # simd-codegen-check（SIMD カーネル生成コード検査。Issue #467・TASK-156 関連）
   # --------------------------------------------------
   # `isa.rs` の `#[target_feature]` カーネルが `as_chunks` からの要素ごと構築

@@ -1,0 +1,117 @@
+name: Sync issue behavior IDs
+
+# spec（private submodule `docs/spec`）の issue→ビヘイビア ID 対応表
+# （`04-behavior/records/pg-parity-issue-behavior-ids.json`）を読み、本リポの open issue
+# 本文のマーカー節（`<!-- behavior-ids:start -->` 〜 `<!-- behavior-ids:end -->`）を
+# `scripts/sync_issue_behavior_ids.py` で upsert する。節に書くのは ID と spec
+# ディレクトリへのポインタのみ（.claude/rules/spec-confidentiality.md）。
+#
+# トリガー:
+# - main への push のうち `docs/spec`（submodule の gitlink）が変わったとき
+#   （update-external の submodule 同期 PR のマージ時）
+# - workflow_dispatch（入力 dry_run。既定 true＝差分件数のみ出力して書き込まない）
+# `pull_request` は意図的に設定しない（SUBMODULE_PAT と `issues: write` を PR 側の
+# untrusted なコードへ渡さない。recall.yml の冒頭コメントと同じ理由）。
+# workflow_dispatch は任意の ref を選んで起動できるため、job を
+# `github.ref == 'refs/heads/main'` に限定し、checkout も `ref: main` で固定する
+# （recall.yml と同一の二重固定。別ブランチで本 YAML 自体を書き換えて dispatch する
+# write 権限者の経路は recall.yml と同じく受容済み残留リスク）。
+#
+# spec の取得方式: private submodule 全体は clone しない。checkout した main の
+# gitlink SHA（`git rev-parse HEAD:docs/spec`）を求め、SUBMODULE_PAT で対応表 1 ファイル
+# だけを contents API から `$RUNNER_TEMP` へ取得する（workspace に spec を展開しない）。
+# SUBMODULE_PAT 未登録時は取得前に fail-closed で止める（update-external と同じ流儀）。
+# PAT は取得 step のみに渡し、issue の書き込みは job の GITHUB_TOKEN（`issues: write`）で行う。
+#
+# ログ: スクリプトは issue 番号・ID・件数・HTTP ステータスのみを出力する。対応表や
+# spec の内容を cat・diff で出力する step は置かない。
+#
+# レート制限: GITHUB_TOKEN は 1 時間あたりのリクエスト数に上限があり、issue 更新は
+# 二次レート制限の対象になるため、1 回の実行の書き込みを MAX_WRITES 件に抑える。
+# 冪等なので、残件がある場合（ログの `write cap reached`）は 1 時間以上空けて
+# workflow_dispatch（dry_run=false）で再実行すれば続きが処理される。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/spec
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '差分件数のみ出力し issue を更新しない'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # 書き込み途中のキャンセルで中途半端な状態を作らないよう、後続は待機させる
+  group: sync-issue-behavior-ids
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    # public 化に伴う組織 runner 方針により GitHub ホステッドランナーを使う
+    runs-on: ubuntu-latest
+    # ハングしたジョブの無期限実行を防ぐ。書き込み上限 × 間隔＋バックオフ待ちを見込む
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    env:
+      SPEC_REPO: Fandhe-AI/fandhe-db-spec
+      SPEC_MAP_PATH: 04-behavior/records/pg-parity-issue-behavior-ids.json
+      MAX_WRITES: '300'
+    steps:
+      - name: Require SUBMODULE_PAT
+        env:
+          SUBMODULE_PAT: ${{ secrets.SUBMODULE_PAT }}
+        run: |
+          if [ -z "${SUBMODULE_PAT}" ]; then
+            echo "::error::secret SUBMODULE_PAT is not set (required to read the private spec)"
+            exit 1
+          fi
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          ref: main
+          submodules: false
+          persist-credentials: false
+      - name: Fetch behavior ID map from spec
+        env:
+          GH_TOKEN: ${{ secrets.SUBMODULE_PAT }}
+        run: |
+          set -euo pipefail
+          spec_sha="$(git rev-parse HEAD:docs/spec)"
+          if ! printf '%s' "${spec_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::docs/spec gitlink not found"
+            exit 1
+          fi
+          echo "spec gitlink: ${spec_sha}"
+          # 応答本文はファイルへのみ書き、ログへは出さない
+          gh api \
+            -H 'Accept: application/vnd.github.raw' \
+            "repos/${SPEC_REPO}/contents/${SPEC_MAP_PATH}?ref=${spec_sha}" \
+            > "${RUNNER_TEMP}/issue-behavior-ids.json" 2>/dev/null \
+            || { echo "::error::failed to fetch the map from the spec"; exit 1; }
+      - name: Sync issue bodies
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # push 起動では inputs が空のため false（書き込みあり）として扱う
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--map "${RUNNER_TEMP}/issue-behavior-ids.json" --repo "${GITHUB_REPOSITORY}"
+                --max-writes "${MAX_WRITES}")
+          if [ "${DRY_RUN}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/sync_issue_behavior_ids.py "${args[@]}"
+      - name: Remove fetched map
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/issue-behavior-ids.json"
