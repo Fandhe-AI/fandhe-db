@@ -273,7 +273,7 @@ def main() -> int:
     if args.db == "self":
         import self_db
 
-        result = self_db.run(args, queries)
+        result = self_db.run(args, queries, docs_file=resolve_docs_file(args))
     elif args.db == "self_nosql":
         import self_nosql
 

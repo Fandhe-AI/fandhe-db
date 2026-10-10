@@ -214,15 +214,15 @@ _EXPLAIN_REASON = (
     "crates/wire-server/docs/nosql-api.md「explain」節）"
 )
 
-# `ingest_bulk`: `op: insert` は `rows` 配列を持つが、1 要求あたりの行数上限は
-# 既定 64（INDEX-4 ①。`nosql-api.md`「insert」節）であり、feature_bench.rs の
-# `ingest_bulk`（ファイル形・数千チャンク規模の一括投入）に相当する意味論は
-# 持たない。
+# `ingest_bulk`: NoSQL（HTTP）表層には COPY FROM STDIN 相当のストリーミング一括投入
+# op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当で、1 要求あたり既定
+# 64 行（INDEX-4 ①）・要求ごとに commit する。SQL 表層（`self_db`）の COPY 計測
+# （64 行ずつの複数 COPY）と同形の計測は本アダプタでは未実装のため unsupported とする。
 _INGEST_BULK_REASON = (
-    "op: insert の rows 配列は 1 要求あたり既定上限 64 行"
-    "（INDEX-4 ①。FANDHE_DB_BATCH_MAX_FILES で上書き可能）であり、"
-    "feature_bench.rs の ingest_bulk（ファイル形一括投入）に相当する規模の"
-    "意味論を持たない（crates/wire-server/docs/nosql-api.md「insert」節）"
+    "NoSQL 表層に COPY 相当のストリーミング一括投入 op が無い。op: insert の rows 配列は"
+    "複数行 INSERT 相当（1 要求あたり既定上限 64 行〔INDEX-4 ①。FANDHE_DB_BATCH_MAX_FILES "
+    "で上書き可〕・要求ごとに commit）で、SQL 表層の COPY 計測と同形の rows 分割投入は"
+    "本アダプタでは未実装（crates/wire-server/docs/nosql-api.md「insert」節）"
 )
 
 
@@ -476,7 +476,7 @@ def _run_phases(
     # --- explain（vector 指定検索への explain:true は構造的に拒否される） ---
     phases["explain"] = unsupported(_EXPLAIN_REASON)
 
-    # --- ingest_bulk（insert の rows 上限が feature_bench 規模のバルクに満たない） ---
+    # --- ingest_bulk（COPY 相当の op が無く、rows 分割投入は未実装） ---
     phases["ingest_bulk"] = unsupported(_INGEST_BULK_REASON)
 
     # --- ingest_single_stmt: 行形 insert を 1 要求 1 行で 1,000 回送る ---
