@@ -3334,10 +3334,11 @@ pub fn check_dml_affected_rows_with_limit(
 pub const MIN_DML_ROW_LIMIT: usize = 1;
 
 /// [`DmlLimits`] を明示設定する場合に取れる範囲の上限（Issue #997・オーナー
-/// 判断 2026-09-27）。総走査行数上限 [`crate::tenant::MAX_SCANNED_ROWS`] と同値を
-/// 採用し、DML の 1 文あたり上限が走査上限を超えて無意味に大きくなることを防ぐ
-/// （値のドリフト防止のため定数を再利用し、独立したリテラルを持たない）。
-pub const MAX_DML_ROW_LIMIT: usize = crate::tenant::MAX_SCANNED_ROWS;
+/// 判断 2026-09-27）。総走査行数上限 [`crate::tenant::MAX_SCANNED_ROWS`] と同値
+/// （1,000,000）を採用し、DML の 1 文あたり上限が走査上限を超えて無意味に大きく
+/// なることを防ぐ。走査上限を個別に設定可能にしても DML 範囲上限が連動しない
+/// よう、参照ではなく独立したリテラル定数とする（Issue #1517）。
+pub const MAX_DML_ROW_LIMIT: usize = 1_000_000;
 
 /// [`validate_dml_row_limit`] が範囲外の値を検出した際のエラー。`Display` には
 /// 入力値と許容範囲のみを含める（テナント・行内容に触れない。fail-closed）。
@@ -8337,6 +8338,14 @@ mod tests {
         // 上限は総走査行数上限（`tenant::MAX_SCANNED_ROWS`）と同値であること
         // （オーナー判断 2026-09-27）を固定し、値のドリフトを検知する。
         assert_eq!(MAX_DML_ROW_LIMIT, crate::tenant::MAX_SCANNED_ROWS);
+    }
+
+    /// Issue #1517: 他定数を参照しない独立定数としての現行値を固定する
+    /// （SQL-34・SQL-46）。値を変える場合は設定化 Issue（#1549／#1555 等）で
+    /// 意図的に変更すること。
+    #[test]
+    fn max_dml_row_limit_is_fixed_at_current_default() {
+        assert_eq!(MAX_DML_ROW_LIMIT, 1_000_000);
     }
 
     // --- bind_insert_form: 形判別（TASK-120・INDEX-1, INDEX-2） -----------------

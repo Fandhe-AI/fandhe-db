@@ -75,10 +75,11 @@ fn env_usize_or(var_name: &str, fallback: usize) -> usize {
 pub const DEFAULT_MAX_FILES_PER_BATCH: usize = 64;
 
 /// `max_files_per_batch` に設定できる上限。`--max-insert-rows` と範囲を揃える
-/// ため既存公開定数 [`crate::sql::parser::MAX_DML_ROW_LIMIT`] を再利用する
-/// （新たな定数値を導入しない）。`batch_raw_sql_len_budget` の予算が際限なく
-/// 大きくならないための DoS 上限でもある（Issue #1166）。
-pub const MAX_BATCH_MAX_FILES: usize = crate::sql::parser::MAX_DML_ROW_LIMIT;
+/// ため [`crate::sql::parser::MAX_DML_ROW_LIMIT`] と同値（1,000,000）とするが、
+/// 参照ではなく独立したリテラル定数とする（Issue #1517）。
+/// `batch_raw_sql_len_budget` の予算が際限なく大きくならないための DoS 上限
+/// でもある（Issue #1166）。
+pub const MAX_BATCH_MAX_FILES: usize = 1_000_000;
 
 /// [`validate_max_files_per_batch`] の範囲外エラー。`Display` は値と範囲のみを含む。
 #[derive(Debug, PartialEq, Eq)]
@@ -489,6 +490,14 @@ pub(crate) fn check_running_total(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1517: 他定数を参照しない独立定数としての現行値を固定する
+    /// （SQL-34・SQL-46）。値を変える場合は設定化 Issue（#1549／#1555 等）で
+    /// 意図的に変更すること。
+    #[test]
+    fn max_batch_max_files_is_fixed_at_current_default() {
+        assert_eq!(MAX_BATCH_MAX_FILES, 1_000_000);
+    }
 
     fn limits() -> BatchLimits {
         BatchLimits {

@@ -101,7 +101,11 @@ pub(crate) const MAX_SUBQUERY_EXECUTIONS: usize = 16;
 /// 「分岐数 × O(log 256)」で有界。内側 1 回の可視行数は既に
 /// [`crate::core::MAX_SEARCH_K`] で頭打ちのため、単一の `IN` サブクエリは
 /// この上限に到達しない（複数の `IN` の distinct 合計のみが上限に効く）。
-pub(crate) const MAX_SUBQUERY_IN_VALUES: usize = crate::core::MAX_SEARCH_K;
+///
+/// 現行の既定値では `MAX_SEARCH_K` と同値（10,000）だが、参照ではなく独立した
+/// リテラル定数とする。検索 k 上限を設定可能にしても本予算が連動しないようにする
+/// ため（Issue #1517・SQL-34・SQL-46）。
+pub(crate) const MAX_SUBQUERY_IN_VALUES: usize = 10_000;
 
 /// 整数列に対する `NOT IN` の 1 サイトあたり distinct 値数の上限。値ごとに
 /// `col < v OR col > v`（式ノード 6 個）を連言で並べるため、束縛の式ノード予算
@@ -1945,6 +1949,14 @@ fn resolve_exists_subquery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1517: 他定数を参照しない独立定数としての現行値を固定する
+    /// （SQL-34・SQL-46）。値を変える場合は設定化 Issue（#1549／#1555 等）で
+    /// 意図的に変更すること。
+    #[test]
+    fn max_subquery_in_values_is_fixed_at_current_default() {
+        assert_eq!(MAX_SUBQUERY_IN_VALUES, 10_000);
+    }
     use crate::catalog::ColumnDef;
     use crate::storage::{encode_row, RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
