@@ -751,25 +751,24 @@ def _run_phases(
             )
 
         # --- explain ---
-        # 実機確認: `EXPLAIN` は `SELECT ... USING PLAN(...)` 文にのみ対応する
-        # （`crates/engine/src/sql/allowlist.rs`
-        # "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements"）。
-        # 素の `ORDER BY embedding <=> '...'` に対する `EXPLAIN` は許可リストで
-        # 拒否される。`USING PLAN` は LLM プランナー注入（`--planner-endpoint`
-        # 等）が無いと fail-closed で拒否されるため、本ベンチでは同注入を
-        # 行っておらず EXPLAIN フェーズは fail-closed に unsupported とする。
-        try:
+        # 素の `ORDER BY embedding <=> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
+        # 検索 SELECT）は engine の `sql::explain` で受理される。pgvector と同じく
+        # 計測し、出力の先頭行を記録する。許可リストで拒否される版（`42601`）のみ
+        # unsupported とし、接続断・タイムアウト等の実行障害は再送出して計測全体を
+        # 失敗させる（unsupported へ丸めると仕様変更に気づけない。codex-review P1）。
+        def explain(qv):
             with conn_a.cursor() as cur:
-                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10")
-            phases["explain"] = unsupported("到達しないはずの分岐（EXPLAIN が成功した）")
+                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10")
+                return [r[0] for r in cur.fetchall()]
+
+        try:
+            stats, last = measure(explain, query_vecs)
+            phases["explain"] = {**stats, "sample_output": last}
         except Exception as e:  # noqa: BLE001 - 許可リスト構文拒否のみ unsupported とする
-            # 接続断・タイムアウト等の実行障害を unsupported へ丸めない
-            # （codex-review P1）。許可リスト拒否（`42601`）と確認できない例外は
-            # 再送出して計測全体を失敗させる。
             if not _is_allowlist_syntax_rejection(e):
                 raise
             phases["explain"] = unsupported(
-                f"EXPLAIN は `USING PLAN(...)` 文にのみ対応（許可リスト拒否を実機確認）: {e!r}"
+                f"EXPLAIN は許可リストで拒否された（`42601`）: {e!r}"
             )
 
         # --- ingest_bulk: fixture の全 docs を COPY FROM STDIN（CSV）で投入する ---
