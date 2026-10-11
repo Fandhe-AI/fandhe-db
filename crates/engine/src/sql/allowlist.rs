@@ -9019,7 +9019,10 @@ impl<'a> Parser<'a> {
     /// SQL-20・TASK-193 由来の字句を JOIN の列参照解決へ再利用する）。
     fn parse_join_colref(&mut self) -> Result<ColumnRef, SqlSurfaceError> {
         match self.advance() {
-            Some(Token::Ident(name)) => Ok(ColumnRef::unqualified(name.clone())),
+            // 引用付き `"true"`／`"false"` は列名（従来経路。Issue #1526・PR #2297 指摘）。
+            Some(Token::Ident(name)) | Some(Token::QuotedBoolWord(name)) => {
+                Ok(ColumnRef::unqualified(name.clone()))
+            }
             Some(Token::QualifiedIdent { qualifier, name }) => {
                 Ok(ColumnRef::qualified(qualifier.clone(), name.clone()))
             }

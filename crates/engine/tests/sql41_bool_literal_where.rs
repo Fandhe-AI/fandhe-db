@@ -373,3 +373,38 @@ fn sql41_quoted_bool_words_remain_usable_identifiers() {
         vec![1]
     );
 }
+
+/// PR #2297 再指摘: JOIN の WHERE でも引用付き `"true"`／`"false"` の裸参照は列参照として
+/// 受理される（片方のテーブルだけが当該列を持つ場合。従来有効だった経路の互換維持）。
+#[test]
+fn sql41_join_where_quoted_bool_words_remain_column_refs() {
+    let path = unique_db_path("sql41-quoted-bool-join");
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE TABLE ja (embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN, \"false\" BOOLEAN)",
+        "CREATE TABLE jb (embedding VECTOR(2) NOT NULL)",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    }
+    let run = |sql: &str| {
+        core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"))
+    };
+    run("INSERT INTO ja (id, embedding, \"true\", \"false\") VALUES (1, '[0.1,0.1]', true, false) USING OPERATION_ID 'j-1'");
+    run("INSERT INTO ja (id, embedding, \"true\", \"false\") VALUES (2, '[0.2,0.1]', false, true) USING OPERATION_ID 'j-2'");
+    run("INSERT INTO jb (id, embedding) VALUES (1, '[0.1,0.1]') USING OPERATION_ID 'j-3'");
+    run("INSERT INTO jb (id, embedding) VALUES (2, '[0.2,0.1]') USING OPERATION_ID 'j-4'");
+    for pred in ["\"true\"", "\"false\""] {
+        let sql = format!("SELECT ja.id FROM ja JOIN jb ON ja.id = jb.id WHERE {pred} LIMIT 10");
+        let result = core
+            .execute_sql(&ctx, &sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+        assert_eq!(result.rows.len(), 1, "{sql}");
+    }
+}
