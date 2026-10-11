@@ -3404,6 +3404,12 @@ struct Parser<'a> {
     /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
     /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
     allow_null_literal: bool,
+    /// 単項マイナス（`-<primary>`）を `0 - <primary>` へ脱糖して受理してよい文脈かどうか
+    /// （Issue #1538・SQL-42）。単一テーブル SELECT の投影項目（[`Self::parse_select_item`]
+    /// の式モード）の解析中だけ `true` にする。`parse_primary_expr` は WHERE・CHECK 本体・
+    /// UDF 本体・ORDER BY 式キーと共有されており、それらの一般単項マイナスは従来どおり
+    /// `42601` で拒否する契約（fail-closed）を保つため、既定は `false`。
+    allow_unary_minus: bool,
     /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
     /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
@@ -3458,6 +3464,7 @@ impl<'a> Parser<'a> {
             subquery_ctx: None,
             case_nesting: 0,
             allow_null_literal: false,
+            allow_unary_minus: false,
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
@@ -3685,51 +3692,95 @@ impl<'a> Parser<'a> {
         Ok(Projection::Items(items))
     }
 
-    /// SELECT リストの 1 項目。次のトークンが `ident '('` なら式項目（関数呼び出し。
-    /// 続けて `AS <alias>` を任意で受理する）、それ以外は従来どおり裸の列名として
-    /// 受理する。
+    /// SELECT リストの 1 項目。`parse_select_list`／`parse_select_list_with_windows` から
+    /// 呼ばれ、束縛は `sql::parser::bind_projection` → `udf_call::bind_expr` が担う。
+    /// 先頭トークンで分岐する（Issue #1538・SQL-42）。`CASE WHEN`・関数呼び出し
+    /// （`ident '('`）・数値・`(`・`-`、および `ident` 直後の `+ - * /` は式項目として
+    /// 既存の式文法へ委譲し（任意で `AS <alias>`）、それ以外は従来どおり裸の列名とする。
+    /// 文字列リテラル始まり・`NULL` 等は式トリガーに含めない（従来どおり `42601`）。
+    /// 関数始まりは頭を従来と同じ深さで読み、直後が算術演算子のときだけ中置式へ継続する
+    /// ため、`MAX_EXPR_DEPTH` 境界の既存入力の挙動は変わらない。
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
-        if let Some(Token::Ident(name)) = self.peek() {
-            let name = name.clone();
-            // `CASE`（対象ビヘイビア: SQL-26。Issue #921）は `ident '('` 形では
-            // なく頂点に来るため、次が `'('` かに加えて大小無視で照合する。ただし
-            // `WHEN` を伴わない `CASE` は式ではなく既存の列名 `case` の参照
-            // （`SELECT case FROM t` 等）でありうるため、`DISTINCT`／`LIKE` と
-            // 同じ文脈的キーワードの判定方針（1 トークン先読み）で「次が `WHEN`
-            // であるときのみ」式として扱う（codex-review 指摘対応: 先読み無しでは
-            // 既存の列名 `case` の SELECT が構文エラー化する破壊的変更になる）。
-            // `NULL` は後続トークンによる曖昧性解消ができない（`SELECT null FROM t`
-            // は「列 `null` の参照」と「NULL リテラルの投影」のどちらも構文上
-            // 同一の形になる）ため、列名としての後方互換を優先し、ここでは式
-            // トリガーに含めない（`NULL` リテラルは `CASE`／`COALESCE`／`NULLIF`
-            // の内側など `parse_primary_expr` 経由の文脈では従来どおり使える）。
-            let starts_case =
-                name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
-            let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
-            let is_extract_syntax = starts_call && name.eq_ignore_ascii_case("extract");
-            if starts_case || starts_call {
-                let expr = if starts_case {
-                    self.parse_value_expr(0)?
-                } else {
+        let mut is_extract_syntax = false;
+        let expr = match self.peek().cloned() {
+            Some(Token::Ident(name)) => {
+                // `WHEN` を伴わない `CASE` は既存の列名 `case` でありうるため 1 トークン
+                // 先読みする。`NULL` は列名との曖昧性を解消できないので式トリガーにしない。
+                let starts_case =
+                    name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
+                let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+                let next_is_op = matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                );
+                if starts_case {
+                    self.parse_projection_infix(0)?
+                } else if starts_call {
+                    is_extract_syntax = name.eq_ignore_ascii_case("extract");
                     self.advance();
-                    self.parse_call_expr(name, 0)?
-                };
-                let alias = if self.peek_ident_matches("AS") {
-                    self.advance();
-                    Some(self.expect_ident()?)
-                } else if is_extract_syntax
-                    && matches!(&expr, Expr::Call { name, .. } if name == "date_part")
-                {
-                    // Issue #1188: EXTRACT 構文は `date_part` へ脱糖されるが、PostgreSQL 互換の
-                    // 既定列名は `extract`（明示の `date_part(...)` は `date_part` のまま）。
-                    Some("extract".to_string())
+                    // 関数の引数内の単項マイナスも、先頭が関数でない場合（`1+abs(-n)`・
+                    // `(abs(-n)+1)`）と同じ契約にそろえる。エラー時も必ず元の値へ戻す。
+                    let prev = self.allow_unary_minus;
+                    self.allow_unary_minus = true;
+                    let head = self.parse_call_expr(name, 0);
+                    self.allow_unary_minus = prev;
+                    let head = head?;
+                    if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                        // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
+                        self.allow_unary_minus = true;
+                        let r = self
+                            .parse_mul_rest(head, 1)
+                            .and_then(|m| self.parse_add_rest(m, 0));
+                        self.allow_unary_minus = prev;
+                        r?
+                    } else {
+                        head
+                    }
+                } else if next_is_op {
+                    self.parse_projection_infix(0)?
                 } else {
-                    None
-                };
-                return Ok(SelectItem::Expr { expr, alias });
+                    return Ok(SelectItem::Column(self.expect_ident()?));
+                }
             }
+            Some(Token::Punct('(' | '-')) | Some(Token::Number(_)) => {
+                self.parse_projection_infix(0)?
+            }
+            _ => return Ok(SelectItem::Column(self.expect_ident()?)),
+        };
+        let has_alias = self.peek_ident_matches("AS");
+        // `(n)` ≡ `n`: 別名なしの括弧付き裸識別子は列項目へ戻す（`Projection::Columns` を保つ）。
+        // 列への別名は別 Issue の担当のため fail-closed で拒否する。
+        if let Expr::Ident(name) = &expr {
+            if has_alias {
+                return Err(SqlSurfaceError::unsupported(
+                    "column alias is not supported for a parenthesized column",
+                ));
+            }
+            return Ok(SelectItem::Column(name.clone()));
         }
-        Ok(SelectItem::Column(self.expect_ident()?))
+        let alias = if has_alias {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else if is_extract_syntax
+            && matches!(&expr, Expr::Call { name, .. } if name == "date_part")
+        {
+            // Issue #1188: EXTRACT 構文は `date_part` へ脱糖されるが、PostgreSQL 互換の
+            // 既定列名は `extract`（明示の `date_part(...)` は `date_part` のまま）。
+            Some("extract".to_string())
+        } else {
+            None
+        };
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    /// 投影項目の式モード解析。[`Self::allow_unary_minus`] を解析中だけ立て、エラー時も
+    /// 必ず元の値へ戻す（WHERE 等の単項マイナス拒否契約へ漏らさない）。
+    fn parse_projection_infix(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let prev = self.allow_unary_minus;
+        self.allow_unary_minus = true;
+        let r = self.parse_value_expr(depth);
+        self.allow_unary_minus = prev;
+        r
     }
 
     /// SQL-30・TASK-214（Issue #930）: 広域取得（`ParsedSelect::Scan`）専用の SELECT
@@ -5281,7 +5332,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_add_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        let mut lhs = self.parse_mul_expr(depth + 1)?;
+        let lhs = self.parse_mul_expr(depth + 1)?;
+        self.parse_add_rest(lhs, depth)
+    }
+
+    /// 加減算ループ（`+ -`）。左辺を解析済みの状態から継続できるよう分離している。
+    /// [`Self::parse_add_expr`] と、先頭の関数呼び出しを先に読み終えた投影項目
+    /// （[`Self::parse_select_item`]。深さ会計を従来から変えないため）から呼ばれる。
+    fn parse_add_rest(&mut self, mut lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('+')) => BinOp::Add,
@@ -5301,7 +5359,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_mul_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        let mut lhs = self.parse_primary_expr(depth + 1)?;
+        let lhs = self.parse_primary_expr(depth + 1)?;
+        self.parse_mul_rest(lhs, depth)
+    }
+
+    /// 乗除算ループ（`* /`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
+    fn parse_mul_rest(&mut self, mut lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         loop {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
@@ -5369,6 +5432,21 @@ impl<'a> Parser<'a> {
                 };
                 self.consume_expr_node()?;
                 Ok(Expr::Number(format!("-{n}")))
+            }
+            // Issue #1538・SQL-42: 投影項目の式モード限定の一般単項マイナス。新しい `Expr`
+            // variant を増やさず `0 - operand` へ脱糖する（VECTOR・DATE は `bind_binary` の
+            // 型規則で `42804` に倒れる）。operand は primary のため `-n*2` は `(-n)*2`。
+            // `0` リテラルと `Binary` の 2 ノードを課金し、ノード予算を迂回させない。
+            Some(Token::Punct('-')) if self.allow_unary_minus => {
+                self.advance();
+                let operand = self.parse_primary_expr(depth + 1)?;
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(Expr::Binary {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::Number("0".to_string())),
+                    rhs: Box::new(operand),
+                })
             }
             // Issue #919・SQL-26: 文字列リテラルを式項として受理する。値は字句段で
             // 既にクォート解除済み（`Token::StringLiteral`）。PostgreSQL の
@@ -18709,6 +18787,141 @@ mod tests {
             Projection::Items(items) => items.clone(),
             other => panic!("expected Projection::Items, got {other:?}"),
         }
+    }
+
+    /// Issue #1538・SQL-42: 投影項目の中置式の AST 形・既存投影の不変・拒否形。
+    fn scan_items(select_list: &str) -> Result<ValidatedStatement, SqlSurfaceError> {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(
+            &format!(
+                "SELECT {select_list} FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            ),
+            &lookup,
+        )
+    }
+
+    fn first_expr(select_list: &str) -> Expr {
+        let stmt = scan_items(select_list).expect("accepted");
+        match select_expr_items(&stmt).remove(0) {
+            SelectItem::Expr { expr, .. } => expr,
+            other => panic!("expected Expr item, got {other:?}"),
+        }
+    }
+
+    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::Binary {
+            op,
+            lhs: Box::new(l),
+            rhs: Box::new(r),
+        }
+    }
+
+    fn num(n: &str) -> Expr {
+        Expr::Number(n.to_string())
+    }
+
+    fn ident(n: &str) -> Expr {
+        Expr::Ident(n.to_string())
+    }
+
+    #[test]
+    fn projection_infix_ast_shapes() {
+        assert_eq!(
+            first_expr("n+1*2"),
+            bin(BinOp::Add, ident("n"), bin(BinOp::Mul, num("1"), num("2")))
+        );
+        assert_eq!(
+            first_expr("(n+1)*2"),
+            bin(BinOp::Mul, bin(BinOp::Add, ident("n"), num("1")), num("2"))
+        );
+        assert_eq!(
+            first_expr("n-1-1"),
+            bin(BinOp::Sub, bin(BinOp::Sub, ident("n"), num("1")), num("1"))
+        );
+        assert_eq!(
+            first_expr("-n*2"),
+            bin(BinOp::Mul, bin(BinOp::Sub, num("0"), ident("n")), num("2"))
+        );
+        assert_eq!(
+            first_expr("- -n"),
+            bin(BinOp::Sub, num("0"), bin(BinOp::Sub, num("0"), ident("n")))
+        );
+        assert!(matches!(
+            first_expr("abs(n)+1"),
+            Expr::Binary { op: BinOp::Add, .. }
+        ));
+        assert!(matches!(
+            first_expr("CASE WHEN n > 1 THEN 1 ELSE 0 END * 2"),
+            Expr::Binary { op: BinOp::Mul, .. }
+        ));
+    }
+
+    #[test]
+    fn projection_infix_keeps_existing_projections() {
+        let stmt = scan_items("n, lang").expect("accepted");
+        assert!(matches!(stmt.projection, Projection::Columns(_)));
+        let stmt = scan_items("(n)").expect("accepted");
+        assert!(matches!(&stmt.projection, Projection::Columns(c) if c == &["n".to_string()]));
+        assert!(matches!(first_expr("abs(n)"), Expr::Call { .. }));
+        for col in ["case", "null"] {
+            let stmt = scan_items(col).expect("accepted");
+            assert!(matches!(stmt.projection, Projection::Columns(_)), "{col}");
+        }
+        // EXTRACT の既定別名は頂点が date_part のときだけ付く。
+        let stmt = scan_items("extract(year FROM at)").expect("accepted");
+        assert!(matches!(
+            select_expr_items(&stmt).remove(0),
+            SelectItem::Expr { alias: Some(a), .. } if a == "extract"
+        ));
+        let stmt = scan_items("extract(year FROM at) + 1").expect("accepted");
+        assert!(matches!(
+            select_expr_items(&stmt).remove(0),
+            SelectItem::Expr { alias: None, .. }
+        ));
+    }
+
+    /// 先頭が関数でも、引数内の単項マイナスの受理可否が `1+abs(-n)`・括弧付きと一致する。
+    #[test]
+    fn projection_leading_call_accepts_unary_minus_in_args() {
+        let a = first_expr("abs(-n)+1");
+        let b = first_expr("(abs(-n)+1)");
+        assert_eq!(a, b);
+        let c = first_expr("1+abs(-n)");
+        assert_eq!(
+            c,
+            bin(
+                BinOp::Add,
+                num("1"),
+                match &a {
+                    Expr::Binary { lhs, .. } => (**lhs).clone(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            )
+        );
+        assert!(scan_items("abs(-n)").is_ok());
+        // 解析後は元の契約へ戻る（WHERE 側の単項マイナス拒否は別経路）。
+        assert!(scan_items("abs(n)+1").is_ok());
+    }
+
+    #[test]
+    fn projection_infix_rejections() {
+        for list in ["(n) AS x", "n % 2", "'a' + n", "n +", "(n"] {
+            let r = scan_items(list);
+            assert_eq!(r.expect_err(list).wire_code(), "42601", "{list}");
+        }
+    }
+
+    /// 関数始まりの深さ会計が変わらないこと（受理上限と超過時 `54000`）。
+    #[test]
+    fn projection_function_nesting_depth_boundary_is_stable() {
+        let nest = |k: usize| format!("{}n{}", "abs(".repeat(k), ")".repeat(k));
+        let max_ok = (1..60)
+            .take_while(|k| scan_items(&nest(*k)).is_ok())
+            .last()
+            .expect("some depth accepted");
+        assert_eq!(max_ok, 10);
+        let err = scan_items(&nest(max_ok + 1)).expect_err("over limit");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
