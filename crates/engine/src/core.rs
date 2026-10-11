@@ -3324,12 +3324,21 @@ impl EngineCore {
         // INSERT／UPDATE／CREATE／ALTER（`WITH` 先頭の DML 含む）の許可リスト検証だけ
         // （Issue #1524）。それ以外の文種は従来どおり `Ident` として扱う（識別子位置の
         // `"null"` を受理し続けるため）。
+        // `EXPLAIN UPDATE ...` も実行時の UPDATE と同じ検証（`expect_literal`）へ渡すため、
+        // 対象が UPDATE のときは先頭が `EXPLAIN` でも保持する（EXPLAIN と実行でエラー契約を
+        // 食い違わせない）。
         let literal_sensitive_head = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
                 if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH"]
                     .iter()
                     .any(|kw| name.eq_ignore_ascii_case(kw))
+        ) || matches!(
+            (tokens.first(), tokens.get(1)),
+            (
+                Some(crate::sql::lexer::Token::Ident(head)),
+                Some(crate::sql::lexer::Token::Ident(second)),
+            ) if head.eq_ignore_ascii_case("EXPLAIN") && second.eq_ignore_ascii_case("UPDATE")
         );
         let tokens = if literal_sensitive_head {
             tokens

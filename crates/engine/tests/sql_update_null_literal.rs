@@ -373,3 +373,29 @@ fn same_operation_id_with_different_null_assignment_is_content_mismatch() {
     );
     assert!(is_text(&cell_of(&core, "alice", "u", 1), "u1"));
 }
+
+/// `EXPLAIN UPDATE ... PARTITIONED` でも引用付き `"NULL"` は NULL 定数として受理せず
+/// `42601`（実行時の UPDATE と同じ契約。Issue #1524 レビュー指摘）。引用なしの `NULL` は
+/// 従来どおり EXPLAIN を受理する。
+#[test]
+fn explain_partitioned_update_distinguishes_quoted_null() {
+    let (core, _g) = setup("upd-null-explain");
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "EXPLAIN UPDATE docs SET lang = \"NULL\" WHERE id > 0 \
+             USING OPERATION_ID 'ex-q' PARTITIONED",
+        ),
+        "42601"
+    );
+    assert!(matches!(
+        ok(
+            &core,
+            "alice",
+            "EXPLAIN UPDATE docs SET lang = NULL WHERE id > 0 \
+             USING OPERATION_ID 'ex-n' PARTITIONED",
+        ),
+        SqlOutcome::Explain(_)
+    ));
+}
