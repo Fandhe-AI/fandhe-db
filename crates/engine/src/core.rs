@@ -3076,8 +3076,11 @@ impl EngineCore {
             // Issue #1192（TABLE-18）: 評価後射影形ビューへの参照も本文（`Scan`／
             // `Aggregate`／`Join`）がセッション UDF レジストリを参照しうる束縛
             // 経路を通るため、同じくセッションを要する実行本体へ委譲する。
+            // SQL-43（Issue #1531）: `FROM` なし定数式 SELECT もセッション UDF
+            // レジストリを参照しうるため、同じくセッション付き実行本体へ委譲する。
             stmt @ (crate::sql::allowlist::Statement::Join(_)
-            | crate::sql::allowlist::Statement::BufferedView(_)) => {
+            | crate::sql::allowlist::Statement::BufferedView(_)
+            | crate::sql::allowlist::Statement::ConstSelect(_)) => {
                 let mut session = crate::sql::mode::SessionState::default();
                 match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
@@ -4402,6 +4405,7 @@ impl EngineCore {
                 | Statement::Explain(_)
                 | Statement::Join(_)
                 | Statement::BufferedView(_)
+                | Statement::ConstSelect(_)
                 | Statement::SetOperation(_)),
             ) => self.read_only_in_active_txn(ctx, session, txn, stmt.clone()),
             // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
@@ -4630,6 +4634,11 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::Statement;
 
+        // SQL-43（Issue #1531）: 定数式 SELECT はテーブルを読まないため、dirty
+        // テーブルの有無に関わらず autocommit と同じ実行本体へ直接委譲する。
+        if matches!(stmt, Statement::ConstSelect(_)) {
+            return self.execute_validated_in_session(ctx, session, stmt);
+        }
         let dirty = txn.dirty_tables()?;
         if dirty.is_empty() {
             return self.execute_validated_in_session(ctx, session, stmt);
@@ -4654,11 +4663,11 @@ impl EngineCore {
             | Statement::BufferedView(_) => {
                 self.execute_read_statement(ctx, session, stmt, write_txn)
             }
-            Statement::SetSearchMode { .. } | Statement::CreateFunction { .. } => {
-                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "unexpected statement in transactional read path".to_string(),
-                })
-            }
+            Statement::SetSearchMode { .. }
+            | Statement::CreateFunction { .. }
+            | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "unexpected statement in transactional read path".to_string(),
+            }),
         }
     }
 
@@ -4927,6 +4936,12 @@ impl EngineCore {
                         detail: "internal error".to_string(),
                     }),
                 }
+            }
+            // SQL-43（Issue #1531）: `FROM` なし定数式 SELECT。評価は行わず束縛結果の
+            // 列だけを返す（ストレージにも触れない）。
+            ParsedSql::Statement(Statement::ConstSelect(validated)) => {
+                let bound = crate::sql::const_select::bind(validated, session.udfs())?;
+                Ok(Some(bound.columns()))
             }
             ParsedSql::Statement(Statement::Select(validated)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
@@ -5311,6 +5326,13 @@ impl EngineCore {
                     crate::sql::allowlist::Statement::BufferedView(validated),
                     &read_txn,
                 )
+            }
+            // SQL-43（Issue #1531）: `FROM` なし定数式 SELECT。テーブル・スナップ
+            // ショットに触れず、`PolicyContext` を要する本入口からのみ到達する。
+            // `execute_read_statement` には渡さない（読み取り源を持たない）。
+            crate::sql::allowlist::Statement::ConstSelect(validated) => {
+                let result = crate::sql::const_select::run(&validated, session.udfs())?;
+                Ok(crate::sql::SqlOutcome::Query(result))
             }
         }
     }
