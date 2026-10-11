@@ -297,14 +297,14 @@ fn create_table_rejects_unknown_type() {
     let mut session = granted_session();
     let err = core
         // スカラー型・配列・ENUM は受理する（Issue #1348）ため、未知の型名の代表として
-        // 未登録の識別子を使う（ENUM 型名候補として実行段で存在確認され `42601`）。
+        // 未登録の識別子を使う（ENUM 型名候補として実行段で存在確認され `42704`。Issue #2306）。
         .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a no_such_type)")
         .expect_err("unknown type must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "42704");
     let err = core
         .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a no_such_type[])")
         .expect_err("unknown array element type must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "42704");
 }
 
 #[test]

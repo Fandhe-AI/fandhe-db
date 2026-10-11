@@ -111,8 +111,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::NotNullViolation
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL の対象不在（`42704`）・
         // 参照列不在（`42703`）。ERR-4 の射影規則（ERR-6 新設行は 400）に従う。
-        // NoSQL 表層の `op` 語彙に索引 DDL が無く構造的に到達しないが、
-        // `ErrorClass` の網羅性のため射影を定める。
+        // 索引 DDL は NoSQL 表層の `op` 語彙に無いが、`42704` は未登録 ENUM 型名
+        // （`create_table`／`alter_table`。Issue #2306）から到達可能。`42703` は
+        // 到達しないが `ErrorClass` の網羅性のため射影を定める。
         | ErrorClass::UndefinedObject
         | ErrorClass::UndefinedColumn
         // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は

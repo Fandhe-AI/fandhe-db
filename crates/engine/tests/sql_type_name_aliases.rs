@@ -112,7 +112,7 @@ fn alias_declared_columns_round_trip_values() {
 }
 
 /// 未確定型（`INT2`／`SMALLINT`・`VARCHAR`／`CHARACTER VARYING`・`CHAR`／`CHARACTER`）は
-/// `0A000` で拒否し、真に未知の型名・`DOUBLE` 単独は従来どおり `42601`（Issue #2303。
+/// `0A000` で拒否し、真に未知の型名・`DOUBLE` 単独は `42704`（Issue #2303・#2306。
 /// ポインタ: TABLE-29・TABLE-30・TABLE-31）。拒否後はテーブルが作られない。
 #[test]
 fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
@@ -133,10 +133,10 @@ fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
         assert_eq!(err(&core, &mut s, sql).wire_code(), "0A000", "{sql}");
     }
     for sql in ["CREATE TABLE t (a DOUBLE)", "CREATE TABLE t (a INT16)"] {
-        assert_eq!(err(&core, &mut s, sql).wire_code(), "42601", "{sql}");
+        assert_eq!(err(&core, &mut s, sql).wire_code(), "42704", "{sql}");
     }
     let unknown = err(&core, &mut s, "CREATE TABLE t (a INT16)").to_string();
-    assert!(unknown.contains("unknown type name"), "{unknown}");
+    assert!(unknown.contains("type does not exist"), "{unknown}");
     drop(core);
     let storage = Storage::open(&path).expect("reopen");
     assert!(
@@ -321,4 +321,85 @@ fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
     );
     drop(core);
     assert!(matches!(column_type(&path, "t", "a"), ColumnType::Integer));
+}
+fn run_as(
+    tenant: &str,
+    core: &EngineCore,
+    s: &mut SessionState,
+    sql: &str,
+) -> Result<SqlOutcome, SqlSurfaceError> {
+    let c = PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant");
+    core.execute_sql_in_session(&c, s, sql)
+}
+
+/// 型名解決表に無く ENUM としても未登録の型名は `42704` で拒否し、副作用を残さない
+/// （Issue #2306。ポインタ: TABLE-29）。`DOUBLE` 単独も同じ分類。
+#[test]
+fn undefined_type_names_are_rejected_with_42704_without_side_effects() {
+    let (path, _g, core) = open("ta-undefined-type");
+    let mut s = allowed();
+    for sql in [
+        "CREATE TABLE t (a DOUBLE)",
+        "CREATE TABLE t (a double)",
+        "CREATE TABLE t (a DOUBLE FLOAT)",
+        "CREATE TABLE t (a INT16)",
+        "CREATE TABLE t (a int16)",
+        "CREATE TABLE t (a no_such_enum)",
+        "CREATE TABLE t (a no_such_enum[])",
+        "CREATE TABLE t (a no_such_enum[3])",
+    ] {
+        assert_eq!(err(&core, &mut s, sql).wire_code(), "42704", "{sql}");
+    }
+    run(&core, &mut s, "CREATE TABLE t (a INTEGER)").expect("create t");
+    for sql in [
+        "ALTER TABLE t ADD COLUMN c INT16",
+        "ALTER TABLE t ADD COLUMN c DOUBLE",
+        "ALTER TABLE t ALTER COLUMN a TYPE INT16",
+        "ALTER TABLE t ALTER COLUMN a TYPE DOUBLE",
+    ] {
+        assert_eq!(err(&core, &mut s, sql).wire_code(), "42704", "{sql}");
+    }
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    let t = storage.get_table_schema("t").expect("schema t");
+    assert_eq!(t.columns.len(), 1, "rejected DDL must not add columns");
+    assert!(matches!(t.columns[0].ty, ColumnType::Integer));
+}
+
+/// 定義済み ENUM の列は従来どおり作成でき、型名は大文字小文字を区別して解決される。
+#[test]
+fn defined_enum_column_still_resolves_case_sensitively() {
+    let (_p, _g, core) = open("ta-defined-enum");
+    let mut s = allowed();
+    run(&core, &mut s, "CREATE TYPE mood AS ENUM ('a')").expect("create type");
+    run(&core, &mut s, "CREATE TABLE t (m mood)").expect("scalar enum column");
+    run(&core, &mut s, "CREATE TABLE u (m mood[])").expect("array enum column");
+    assert_eq!(
+        err(&core, &mut s, "CREATE TABLE v (m Mood)").wire_code(),
+        "42704"
+    );
+}
+
+/// 未定義型の応答はテナントと既存 ENUM 型の有無によらず同一で、指定した型名以外
+/// （既存型名・ラベル・テーブル名・テナント名）を含まない。
+#[test]
+fn undefined_type_error_is_identical_across_tenants_and_leaks_nothing() {
+    let (_p, _g, core) = open("ta-undefined-leak");
+    let mut s = allowed();
+    let sql = "CREATE TABLE t (a undefined_t)";
+    let before = err(&core, &mut s, sql);
+    run(&core, &mut s, "CREATE TYPE mood AS ENUM ('secret_label')").expect("create type");
+    run(&core, &mut s, "CREATE TABLE dep_table (m mood)").expect("dependent table");
+    let alice = run_as("alice", &core, &mut s, sql).expect_err("alice");
+    let bob = run_as("bob", &core, &mut s, sql).expect_err("bob");
+    for e in [&alice, &bob] {
+        assert_eq!(e.wire_code(), before.wire_code());
+        assert_eq!(e.to_string(), before.to_string());
+        let msg = e.to_string();
+        assert!(msg.contains("undefined_t"), "{msg}");
+        for secret in ["mood", "secret_label", "dep_table", "alice", "bob"] {
+            assert!(!msg.contains(secret), "{msg}");
+        }
+    }
 }

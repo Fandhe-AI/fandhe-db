@@ -93,8 +93,8 @@ pub(crate) fn execute_create_table(
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
     // ENUM 列（構文段は未解決マーカー）を登録済みの型定義へ差し替える。型の存在確認は
     // DDL 権限ゲート（`core.rs` の `require_ddl_permission`）の後のここでのみ行い、
-    // 未登録は `ADD COLUMN` と同じ `42601`。解決から `create_table` までの間に
-    // `DROP TYPE` が割り込んだ場合も `create_table` 側の `TypeNotFound` を `42601` へ写す。
+    // 未登録は `ADD COLUMN` と同じ `42704`（Issue #2306）。解決から `create_table` までの間に
+    // `DROP TYPE` が割り込んだ場合も `create_table` 側の `TypeNotFound` を `42704` へ写す。
     for alias in &validated.alias_type_names {
         reject_alias_enum_collision(storage, alias)?;
     }
@@ -169,10 +169,8 @@ pub(crate) fn execute_create_table(
         // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         // ENUM 列が参照する型が解決後〜書き込みトランザクションまでの間に削除された
-        // 場合（Issue #1348）。事前解決の未登録と同じ `42601` に揃える。
-        CatalogError::TypeNotFound(name) => SqlSurfaceError::UnsupportedSyntax {
-            detail: format!("unknown type name: {name}"),
-        },
+        // 場合（Issue #1348）。事前解決の未登録と同じ `42704` に揃える（Issue #2306）。
+        CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedType { name },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::ColumnAlreadyExists(_)
@@ -901,8 +899,8 @@ fn resolve_column_type(
     }
 }
 
-/// ENUM 型名を `Storage::get_enum_type` で解決する。未登録は `42601`
-/// （`unknown type name`。`ADD COLUMN`・`CREATE TABLE` 共通）。
+/// ENUM 型名を `Storage::get_enum_type` で解決する。未登録は `42704`
+/// （`type does not exist`。Issue #2306。`ADD COLUMN`・`CREATE TABLE` 共通）。
 /// 型名エイリアス（`INT4`・`INT8`・`FLOAT4`・`FLOAT8`。Issue #1528）と同じ綴りの ENUM 型が
 /// 既に登録されている場合に `42601` で拒否する。エイリアス導入前は同綴りが ENUM 型名
 /// として解決されていたため、組み込み型へ黙って解決し直すと既存の参照意図と食い違う
@@ -925,8 +923,8 @@ fn resolve_enum_type(
     name: &str,
 ) -> Result<std::sync::Arc<crate::catalog::EnumTypeDef>, SqlSurfaceError> {
     storage.get_enum_type(name).map_err(|e| match e {
-        CatalogError::TypeNotFound(_) => SqlSurfaceError::UnsupportedSyntax {
-            detail: format!("unknown type name: {name}"),
+        CatalogError::TypeNotFound(_) => SqlSurfaceError::UndefinedType {
+            name: name.to_string(),
         },
         other => map_add_column_error(other),
     })
@@ -1057,9 +1055,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::payload_too_large(format!("too many columns: {count}"))
         }
         CatalogError::Invalid(detail) => SqlSurfaceError::UnsupportedSyntax { detail },
-        CatalogError::TypeNotFound(name) => SqlSurfaceError::UnsupportedSyntax {
-            detail: format!("unknown type name: {name}"),
-        },
+        CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedType { name },
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
@@ -1358,6 +1354,14 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 未登録の型名は解決前後（race を含む）とも `42704` に写す（Issue #2306）。
+    #[test]
+    fn missing_type_maps_to_42704() {
+        let e = map_add_column_error(CatalogError::TypeNotFound("t".to_string()));
+        assert_eq!(e.wire_code(), "42704");
+        assert_eq!(e.to_string(), "type does not exist: t");
+    }
 
     /// 型 DDL のエラー写像（Issue #1194）。
     #[test]
