@@ -201,7 +201,8 @@ fn reparse_buffered_body(
     lookup: &impl TableLookup,
     body_sql: &str,
 ) -> Result<Statement, SqlSurfaceError> {
-    let tokens = super::lexer::tokenize(body_sql).map_err(|_| corrupt_view_error())?;
+    let tokens =
+        super::lexer::tokenize_stored_view_body(body_sql).map_err(|_| corrupt_view_error())?;
     let depth = lookup
         .buffered_depth()
         .checked_add(1)

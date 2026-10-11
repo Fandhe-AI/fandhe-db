@@ -519,3 +519,102 @@ fn sql41_legacy_stored_view_body_keeps_bare_true_as_column_predicate() {
     let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
     assert_eq!(ids, vec![1]);
 }
+
+/// 列 `"true"` を持つ vdocs を作る（id=1 が真・id=2 が偽・id=3 が NULL を後で投入する）。
+fn bool_column_storage(name: &str) -> (Storage, std::path::PathBuf) {
+    let path = unique_db_path(name);
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "vdocs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("true", ColumnType::Boolean, true),
+            ],
+        ))
+        .expect("create table");
+    (storage, path)
+}
+
+fn seed_bool_column(core: &EngineCore, ctx: &PolicyContext) {
+    for (id, v) in [(1, "true"), (2, "false"), (3, "NULL")] {
+        core.execute_sql_in_session(
+            ctx,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO vdocs (id, embedding, \"true\") VALUES ({id}, '[0.{id},0.1]', {v}) \
+                 USING OPERATION_ID 'v-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+}
+
+fn ids_of(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
+    let result = core
+        .execute_sql(ctx, sql)
+        .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// PR #2297 指摘: 旧版が保存した評価後射影形（`LIMIT` 付き）のビュー本文も列述語のまま。
+#[test]
+fn sql41_legacy_buffered_view_body_keeps_bare_true_as_column_predicate() {
+    let (storage, path) = bool_column_storage("sql41-legacy-buffered-view");
+    let _guard = CleanupGuard(path);
+    storage
+        .create_view("vv", "vdocs", "SELECT id FROM vdocs WHERE true LIMIT 10")
+        .expect("legacy buffered body");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    seed_bool_column(&core, &ctx);
+    assert_eq!(ids_of(&core, &ctx, "SELECT id FROM vv LIMIT 10"), vec![1]);
+}
+
+/// PR #2297 指摘: CTE 本文内の `WHERE "true"` は閉じ括弧の外側が `SELECT` でも列述語。
+#[test]
+fn sql41_cte_inner_quoted_bool_word_stays_column_predicate() {
+    let (storage, path) = bool_column_storage("sql41-cte-quoted-bool");
+    let _guard = CleanupGuard(path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    seed_bool_column(&core, &ctx);
+    assert_eq!(
+        ids_of(
+            &core,
+            &ctx,
+            "WITH q AS (SELECT id FROM vdocs WHERE \"true\") SELECT id FROM q LIMIT 10"
+        ),
+        vec![1]
+    );
+}
+
+/// PR #2297 指摘: `CREATE VIEW ... WHERE FALSE`／`TRUE` は真偽リテラルとして保存・再解析される
+/// （旧列述語互換の昇格で列参照へ化けない）。
+#[test]
+fn sql41_view_with_bool_literal_roundtrips_as_literal() {
+    let (storage, path) = bool_column_storage("sql41-view-literal");
+    let _guard = CleanupGuard(path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE VIEW vf AS SELECT id FROM vdocs WHERE FALSE ORDER BY id LIMIT 10",
+        "CREATE VIEW vt AS SELECT id FROM vdocs WHERE TRUE ORDER BY id LIMIT 10",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    }
+    seed_bool_column(&core, &ctx);
+    assert_eq!(
+        ids_of(&core, &ctx, "SELECT id FROM vf LIMIT 10"),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids_of(&core, &ctx, "SELECT id FROM vt LIMIT 10"),
+        vec![1, 2, 3]
+    );
+}

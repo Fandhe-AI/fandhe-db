@@ -8490,8 +8490,15 @@ pub(crate) fn validate_create_view_tokens(
                 .ok_or_else(|| SqlSurfaceError::unsupported("view body has no source relation"))?;
             // 検証済みトークン列そのものを正規化描画して永続化する
             // （AST からの再描画による丸め・形状取りこぼしを避ける）。
-            let sql = super::lexer::render_tokens(strip_trailing_semicolons(body_tokens))
+            let stripped = strip_trailing_semicolons(body_tokens);
+            let mut sql = super::lexer::render_tokens(stripped)
                 .ok_or_else(|| SqlSurfaceError::unsupported("view body is not supported"))?;
+            // 述語葉位置に未引用の `true`／`false`（真偽リテラル）が残る本文には、旧版が
+            // 列参照として未引用で保存した本文と区別するマーカーを付ける（Issue #1526・
+            // PR #2297 指摘。読み出し側は `lexer::tokenize_stored_view_body`）。
+            if super::lexer::stored_body_needs_bool_literal_marker(stripped) {
+                sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
+            }
             (base, sql)
         }
     };
