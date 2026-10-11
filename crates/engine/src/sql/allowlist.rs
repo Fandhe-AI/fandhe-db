@@ -14464,6 +14464,43 @@ mod tests {
         }
     }
 
+    /// 引用付き `"NULL"` は NULL 定数として受理しない（Issue #1524 レビュー指摘。
+    /// UPDATE SET・DO UPDATE SET・DEFAULT・INSERT VALUES のいずれも `42601`）。
+    #[test]
+    fn quoted_null_is_not_a_null_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'op-q-1'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
+             lang = \"null\" USING OPERATION_ID 'op-q-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, \"NULL\") USING OPERATION_ID 'op-q-3'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let tokens = crate::sql::lexer::tokenize("DEFAULT \"NULL\"").expect("tokenize");
+        assert_eq!(
+            Parser::new(&tokens)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42601"
+        );
+    }
+
     /// `DEFAULT NULL` は受理して既定値なし（`default: None`）へ正規化し、重複 `DEFAULT`
     /// は順序を問わず `42601`（Issue #1524・SQL-41）。
     #[test]

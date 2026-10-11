@@ -91,6 +91,10 @@ pub enum Token {
     /// 限られる。`sql::allowlist::Parser`（許可リスト構造検証）はこの variant を
     /// 一切知らない設計（置換後のトークン列のみを見る）。
     Param(u16),
+    /// 二重引用符で囲まれた `NULL`（大小無視。Issue #1524 レビュー指摘）。裸の `NULL` と
+    /// 区別するための専用トークンで、構文段は NULL 定数としては受理せず、識別子位置でも
+    /// 受理しない（`42601`。fail-closed）。`SET lang = "NULL"` が NULL 更新に化けるのを防ぐ。
+    QuotedNull(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +180,11 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 out.push_str(qualifier);
                 out.push('.');
                 out.push_str(name);
+            }
+            Token::QuotedNull(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
             }
             Token::Param(_) => return None,
         }
@@ -348,7 +357,11 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
                     byte_offset: offset,
                 });
             }
-            tokens.push(Token::Ident(content.to_string()));
+            if content.eq_ignore_ascii_case("NULL") {
+                tokens.push(Token::QuotedNull(content.to_string()));
+            } else {
+                tokens.push(Token::Ident(content.to_string()));
+            }
             advance_to(&mut chars, end);
             continue;
         }
@@ -1215,6 +1228,20 @@ mod tests {
         let base = "*".repeat(MAX_TOKEN_COUNT);
         assert!(tokenize(&format!("{base}/* c */")).is_ok());
         assert!(tokenize(&format!("{base}-- c")).is_ok());
+    }
+
+    /// 引用付き `NULL` は裸の `NULL`（`Ident`）と区別される専用トークンになる
+    /// （Issue #1524 レビュー指摘）。
+    #[test]
+    fn quoted_null_is_distinct_from_bare_null() {
+        assert_eq!(
+            tokenize("\"NULL\" \"null\" NULL").expect("tokenize"),
+            vec![
+                Token::QuotedNull("NULL".to_string()),
+                Token::QuotedNull("null".to_string()),
+                Token::Ident("NULL".to_string()),
+            ]
+        );
     }
 
     #[test]

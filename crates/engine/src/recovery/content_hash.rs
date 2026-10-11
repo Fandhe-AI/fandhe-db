@@ -916,11 +916,15 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 /// 呼び出しで 1 行分の SET 句しか扱わないため複数行の境界問題は生じないが、
 /// SET 句の列**数**（`Value::Null` 除外後）を先頭にプレフィクスすることで、
 /// [`push_named_scalar_columns`] の「末尾まで連結するだけ」の形式が列挙順・列数の
-/// いずれについても一意に復元できる状態を維持する。なお `SET col = NULL` は
-/// Issue #1524（SQL-41）で SQL 表層から到達するようになったが、本関数は `Value::Null`
-/// 列を除外するため `SET a='x', b=NULL` と `SET a='x'` は同じ hash になる。この
-/// 区別は Issue #1525 の範囲で、本 Issue ではロジックを変えない（[`for_typed_insert_batch`] の行ごとの列数プレフィクスと
-/// 同じ設計）。
+/// いずれについても一意に復元できる状態を維持する。
+///
+/// `SET col = NULL`（Issue #1524・SQL-41 で SQL 表層から到達）は非 NULL 列のあとに
+/// 「NULL 列数（u32 LE）＋各列名」の trailer として連結する（Codex レビュー指摘）。
+/// これにより `SET a='x'` と `SET a='x', b=NULL`、`SET b=NULL` と `SET c=NULL` が別 hash に
+/// なり、同一 `operation_id` での内容違いの再送が RECOVER-10 の内容不一致（`22023`）
+/// になる。NULL 列が 1 つも無い場合は trailer を付けず従来とビット同一（既存台帳エントリ
+/// との互換）。NULL 列を含む旧エントリ（NULL を除外してハッシュ済み）は fail-closed に
+/// 不一致として扱う。
 pub(crate) fn for_update_columns(
     id: u64,
     columns: &[(&str, &Value)],
@@ -936,6 +940,20 @@ pub(crate) fn for_update_columns(
     })?;
     b.push_raw(&non_null_columns.to_le_bytes());
     push_named_scalar_columns(&mut b, columns)?;
+    let null_names: Vec<&str> = columns
+        .iter()
+        .filter(|(_, value)| matches!(value, Value::Null))
+        .map(|(name, _)| *name)
+        .collect();
+    if !null_names.is_empty() {
+        let null_count = u32::try_from(null_names.len()).map_err(|_| {
+            StorageError::Codec("content hash update column count too large".to_string())
+        })?;
+        b.push_raw(&null_count.to_le_bytes());
+        for name in null_names {
+            b.push_bytes(name.as_bytes())?;
+        }
+    }
     Ok(b.finish())
 }
 
@@ -2529,17 +2547,21 @@ mod tests {
     // 還元される事故）が起きないことを固定する（`for_typed_insert_batch_rejects_row_boundary_reinterpretation`
     // と同種の回帰テスト）。
     #[test]
-    fn for_update_columns_null_valued_columns_are_excluded_from_the_count_prefix() {
-        let non_null = Value::Text("x".to_string());
+    fn for_update_columns_null_assignments_change_the_hash() {
+        let x = Value::Text("x".to_string());
         let null = Value::Null;
-        let with_null: [(&str, &Value); 2] = [("a", &non_null), ("b", &null)];
-        let without_null: [(&str, &Value); 1] = [("a", &non_null)];
-        // NULL 列は push_named_scalar_columns が除外するため、列数プレフィクス・
-        // ハッシュ入力とも NULL 列を含まない形と一致する。
-        assert_eq!(
-            for_update_columns(1, &with_null).expect("hash"),
-            for_update_columns(1, &without_null).expect("hash")
-        );
+        let a_only: [(&str, &Value); 1] = [("a", &x)];
+        let a_b_null: [(&str, &Value); 2] = [("a", &x), ("b", &null)];
+        let a_c_null: [(&str, &Value); 2] = [("a", &x), ("c", &null)];
+        let b_null: [(&str, &Value); 1] = [("b", &null)];
+        let c_null: [(&str, &Value); 1] = [("c", &null)];
+        let h = |c: &[(&str, &Value)]| for_update_columns(1, c).expect("hash");
+        // Issue #1524 レビュー指摘: NULL 割当の有無・列名がハッシュに反映される。
+        assert_ne!(h(&a_only), h(&a_b_null));
+        assert_ne!(h(&a_b_null), h(&a_c_null));
+        assert_ne!(h(&b_null), h(&c_null));
+        assert_ne!(h(&b_null), h(&[]));
+        assert_eq!(h(&a_b_null), h(&a_b_null));
     }
 
     // Issue #399 受け入れ 2: ストリーミング版（本番経路 `for_insert_batch_encoded`）と
