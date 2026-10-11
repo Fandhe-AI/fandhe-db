@@ -53,6 +53,8 @@ fn expected_types() -> Vec<(&'static str, i32, i16)> {
         ("price", 1700, -1),
         ("tags", 25, -1),
         ("mood", 25, -1),
+        // 長さなし VARCHAR は OID 1043・typlen -1（型修飾子は常に -1。Issue #2305）。
+        ("vc", 1043, -1),
     ]
 }
 
@@ -102,6 +104,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ),
                 ColumnDef::new("tags", ColumnType::Array(tags), false),
                 ColumnDef::new("mood", ColumnType::Enum(mood), false),
+                ColumnDef::new("vc", ColumnType::Varchar, false),
             ],
         ))
         .expect("create table");
@@ -137,6 +140,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 Some("b".to_string()),
             ])),
             Value::Enum("happy".to_string()),
+            Value::Text("varchar-val".to_string()),
         ],
         &op_id,
     )
@@ -146,7 +150,7 @@ fn new_core_typed_probe() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-const SELECT_ALL: &str = "SELECT id, embedding, flag, n, b, r, d, day, ts, blob, uid, doc, docb, price, tags, mood FROM typed_probe LIMIT 10";
+const SELECT_ALL: &str = "SELECT id, embedding, flag, n, b, r, d, day, ts, blob, uid, doc, docb, price, tags, mood, vc FROM typed_probe LIMIT 10";
 
 /// 受入基準 1〜3: 新規スカラー型が PostgreSQL 組み込み OID・typlen で公告され、
 /// 既存の `id`（`numeric`）・`VECTOR`（`text`）の公告は不変であることを、
@@ -205,6 +209,7 @@ fn data_row_text_values_are_unchanged_by_new_oid_announcements() {
         "price",
         "tags",
         "mood",
+        "vc",
     ];
     assert_eq!(row.len(), names.len());
     let by_name = |name: &str| -> Option<String> {
@@ -232,6 +237,7 @@ fn data_row_text_values_are_unchanged_by_new_oid_announcements() {
     assert_eq!(by_name("price").as_deref(), Some("123.45"));
     assert_eq!(by_name("tags").as_deref(), Some("{a,b}"));
     assert_eq!(by_name("mood").as_deref(), Some("happy"));
+    assert_eq!(by_name("vc").as_deref(), Some("varchar-val"));
 
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);

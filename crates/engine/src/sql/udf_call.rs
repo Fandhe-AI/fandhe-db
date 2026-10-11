@@ -1780,7 +1780,7 @@ fn bind_expr_in(
                     // 使えるようにする。値は行コンテキスト（`eval_with_scalars` の
                     // `row_scalars`）から解決し、nullable 列の実 NULL は
                     // `ExprValue::Null` として伝播する（AC1・AC2）。
-                    ColumnType::Text => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
+                    ColumnType::Text | ColumnType::Varchar => Ok((BoundExpr::TextColumnRef { index }, ExprType::Text)),
                     // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: 数値 4 型
                     // （INTEGER／BIGINT／REAL／DOUBLE）の列参照を `WHERE`／投影／
                     // `CHECK` で共通に解禁する（#1075 の CHECK 専用 opt-in を撤廃）。
@@ -1899,6 +1899,7 @@ fn bind_expr_in(
 fn column_type_label(ty: &ColumnType) -> &'static str {
     match ty {
         ColumnType::Text => "text",
+        ColumnType::Varchar => "character varying",
         ColumnType::Vector(_) => "vector",
         ColumnType::Integer => "integer",
         ColumnType::BigInt => "bigint",

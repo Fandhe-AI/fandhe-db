@@ -1362,6 +1362,8 @@ fn reject_unsupported_predicate_dml_conjunction(
 fn dictionary_required_columns(
     schema: &crate::catalog::TableSchema,
 ) -> Result<(usize, usize), String> {
+    // `path`／`body` は documents テーブルの構造契約（TASK-109・PLAN-5）のため TEXT 限定。
+    // VARCHAR は意図的に非対象（Issue #2305）。
     let path_idx = schema
         .columns
         .iter()

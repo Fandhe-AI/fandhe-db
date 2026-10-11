@@ -711,6 +711,7 @@ fn declare_between(
         // `col BETWEEN 'a' AND 'b'` と同じく engine の「BETWEEN 非対応列」判定
         // （`22000`）へ委譲する。
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Enum(_)
         | ColumnType::Boolean
         | ColumnType::Vector(_)
@@ -786,7 +787,7 @@ fn declare_eq(
         }));
     }
     match ty {
-        ColumnType::Text => match value {
+        ColumnType::Text | ColumnType::Varchar => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Leaf(DeclarativeFilter::equals(
                 column,
                 s.as_str(),
@@ -943,7 +944,7 @@ fn declare_range(
         }
         // Issue #1183: TEXT の範囲比較は式レーン（TEXT×TEXT のバイト順比較。
         // SQL の `lang < 'b'` の束縛結果と同一）へ渡す。
-        ColumnType::Text => match value {
+        ColumnType::Text | ColumnType::Varchar => match value {
             JsonValue::String(s) => Ok(DeclarativePredicate::Expr(Expr::Binary {
                 op: bin_op_for(cmp),
                 lhs: Box::new(Expr::Ident(column.to_string())),
@@ -1009,7 +1010,7 @@ fn declare_in(
     items: &[JsonValue],
 ) -> Result<DeclarativePredicate, FilterError> {
     match ty {
-        ColumnType::Text | ColumnType::Enum(_) => {
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 match item {

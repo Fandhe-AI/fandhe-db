@@ -63,7 +63,8 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "UUID",
     "NUMERIC",
     "DECIMAL",
-    // 定める ID が未確定で `0A000` 拒否する型名（Issue #2303。TABLE-30・TABLE-31）。
+    // 定める ID が未確定、または長さ指定付きで `0A000` 拒否する型名（Issue #2303・#2305。
+    // 長さなし `VARCHAR`／`CHARACTER VARYING` は受理する。TABLE-30・TABLE-31）。
     // 解決表（`ddl_column_type::TYPE_NAME_TABLE`）の全行を載せる契約。
     "INT2",
     "SMALLINT",

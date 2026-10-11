@@ -341,6 +341,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
         ColumnMeta::Computed { .. } => "text",
         ColumnMeta::Scalar { ty, .. } => match ty {
             ColumnType::Text => "text",
+            ColumnType::Varchar => "varchar",
             ColumnType::Vector(_) => "vector",
             ColumnType::Integer => "integer",
             ColumnType::BigInt => "bigint",
