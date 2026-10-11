@@ -1502,7 +1502,7 @@ pub(crate) fn expr_result_column_type(
         });
     }
     if let Expr::Number(raw) = expr {
-        if let Some((_, kind)) = classify_integer_literal(raw) {
+        if let Some((_, kind)) = classify_projection_integer_literal(raw) {
             return Some(match kind {
                 NumericKind::Int8 => ColumnType::BigInt,
                 _ => ColumnType::Integer,
@@ -1540,6 +1540,15 @@ pub(crate) fn classify_integer_literal(raw: &str) -> Option<(i64, NumericKind)> 
         NumericKind::Int8
     };
     Some((v, kind))
+}
+
+/// 投影の型付き算術・結果型で使う整数リテラル分類。[`classify_integer_literal`] に加え、
+/// 投影の評価値は f64 で運ばれ 2^53 を超える整数を厳密に保てないため、|v| > 2^53 の
+/// リテラルは整数扱いにせず従来どおり倍精度（`None`）へ落とす（丸めて誤値を返さない。
+/// 既知の PG 差分として文書化。Issue #1539）。
+fn classify_projection_integer_literal(raw: &str) -> Option<(i64, NumericKind)> {
+    let (v, kind) = classify_integer_literal(raw)?;
+    (v.unsigned_abs() <= TYPED_INT_EXACT_MAX as u64).then_some((v, kind))
 }
 
 /// 列参照を持たない文脈（`FROM` なし定数式 SELECT。SQL-43・Issue #1531）で式を束縛する。
@@ -2037,7 +2046,7 @@ fn bind_expr_in(
 /// スキーマから、入れ子の型付き算術はそのノードの種別から決める。O(1)。
 fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<NumericKind> {
     if let Expr::Number(raw) = expr {
-        return classify_integer_literal(raw).map(|(_, k)| k);
+        return classify_projection_integer_literal(raw).map(|(_, k)| k);
     }
     match bound {
         BoundExpr::ColumnRef { index } => {
@@ -2058,7 +2067,9 @@ fn numeric_kind(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> Option<Num
 }
 
 /// 二項算術の結果種別（PostgreSQL の演算子解決に合わせる）。`None` は倍精度
-/// （既存の [`BoundExpr::Binary`] で束縛する）。
+/// （既存の [`BoundExpr::Binary`] で束縛する）。`real + integer` は PostgreSQL でも
+/// 暗黙キャスト候補のうち numeric カテゴリの優先型 float8 が選ばれ
+/// `double precision` になるため、`(Float4, Int*)` は意図的に `None`（倍精度）とする。
 fn combine_numeric_kind(l: Option<NumericKind>, r: Option<NumericKind>) -> Option<NumericKind> {
     use NumericKind::{Float4, Int4, Int8};
     match (l?, r?) {

@@ -224,6 +224,40 @@ fn integer_literal_projection_follows_literal_size() {
     );
 }
 
+/// 2^53 超の整数リテラルは f64 で厳密に運べないため 22003 で拒否する
+/// （丸めた誤値や XX000 にしない）。2^53 ちょうどは BIGINT。`real + integer` は
+/// PostgreSQL と同じく倍精度。
+#[test]
+fn integer_literal_beyond_2_pow_53_is_rejected_with_22003() {
+    let (core, ctx, _g) = setup();
+    assert_type(
+        &core,
+        &ctx,
+        "SELECT 9007199254740992 FROM t LIMIT 1",
+        ColumnType::BigInt,
+    );
+    for sql in [
+        "SELECT 9007199254740993 FROM t LIMIT 1",
+        "SELECT 9223372036854775807 FROM t LIMIT 1",
+        "SELECT b + 9007199254740993 FROM t LIMIT 1",
+    ] {
+        // 束縛段が 22003 で拒否する（丸めた誤値も XX000 も返さない）。
+        assert_eq!(code(&core, &ctx, sql), "22003", "{sql}");
+    }
+    assert_type(
+        &core,
+        &ctx,
+        "SELECT r + n FROM t LIMIT 1",
+        ColumnType::Double,
+    );
+    assert_type(
+        &core,
+        &ctx,
+        "SELECT r + 1 FROM t LIMIT 1",
+        ColumnType::Double,
+    );
+}
+
 #[test]
 fn integer_division_truncates_toward_zero_per_node() {
     let (core, ctx, _g) = setup();
