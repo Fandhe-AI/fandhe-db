@@ -1,12 +1,15 @@
 # Git hooks 定義（lefthook）。`make hooks`（lefthook install）で導入する。
 #
-# 方針（.claude/rules/conventional-commits.md・security.md。Fandhe-AI/rust-ai-library と同一）:
+# 方針（.claude/rules/git-hooks.md・conventional-commits.md・security.md）:
+# - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（TASK-66 の workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
 # - 開発速度を優先し、CI（.github/workflows/ci.yml の rust-ci 等）が PR ごとに実行する
 #   重いチェック（clippy・test）はフックで実行しない（pre-push は置かない）。push 前に
 #   手元で確かめたい場合は `make ci`（CI と同等のチェック）を任意で実行する
+# - GitHub Actions（ci.yml の rust-ci・lint-docs 等）で実行する検査はフックで重複実行しない
+#   （例外は rustfmt-check のみ。理由と計測値は .claude/rules/git-hooks.md）
 # - フックに残すのは 1 秒未満で終わり、手元で止める意味があるものに限る:
 #   secrets-guard（資格情報をリモートへ送る前に止める。CI では手遅れ）・rustfmt-check・
 #   conventional-commits（中間コミットは PR refs に残るため、作成時点で形式を揃える）
@@ -35,16 +38,30 @@ pre-commit:
     # 拡張子 `.env` は旧パターンの検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
-        # 末尾の `grep -q .` は「拒否パターンに一致し、かつ許可リストに一致しない行が
-        # 実在するか」の判定（BSD grep は空入力への `-qv` が 0 を返すため `-qv` は使わない）
+        # プロセス起動回数をファイル数に比例させないため、awk 1 本で全パスを判定する
+        # （ファイルごとに printf + grep × 3 を起動する旧実装は --all-files（約 3,000
+        # ファイル）で約 11.8 秒かかった。2026-10-11 計測）。拒否パターンに一致し、かつ
+        # 許可リストに一致しないパスが 1 件でもあれば拒否する。
+        # grep パイプラインでは「一致なし」（終了状態 1）とエラー（2 以上）を区別できず
+        # fail-open になるため、awk の終了状態で判定する。awk 自体が失敗した場合は
+        # 判定できていないパスが残るため fail-closed で拒否する。
+        # 正規表現は awk -v ではなく ENVIRON で渡す（-v はバックスラッシュをエスケープとして
+        # 解釈し `\.` が崩れるため）。BSD awk は UTF-8 ロケールで不正なマルチバイト列に
+        # 当たると異常終了するため LC_ALL=C で照合する（パターンは ASCII のみ）。
+        # Fandhe-AI/fandhe-browser・fandhe-container と同型の実装
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        for f in {staged_files}; do
-          if printf '%s\n' "$f" | grep -E "$re" | grep -vE "$re_ok" | grep -q .; then
+        if ! hits=$(printf '%s\n' {staged_files} \
+          | LC_ALL=C RE="$re" RE_OK="$re_ok" awk '$0 ~ ENVIRON["RE"] && $0 !~ ENVIRON["RE_OK"]'); then
+          echo "NG: ファイル名の判定に失敗したため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        if [ -n "$hits" ]; then
+          printf '%s\n' "$hits" | while IFS= read -r f; do
             echo "NG: 秘密情報ファイルがステージされています: $f" >&2
-            exit 1
-          fi
-        done
+          done
+          exit 1
+        fi
 
 commit-msg:
   jobs:
