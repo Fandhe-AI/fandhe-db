@@ -16,11 +16,14 @@ CREATE TABLE <table> (<col> TEXT [NOT NULL] [DEFAULT <literal>] | <col> VECTOR(<
 
 - `NOT NULL`・`DEFAULT <literal>` は列型の直後に、順序自由・各々最大 1 回まで
   受理する。重複指定（`NOT NULL NOT NULL`・`DEFAULT` 2 回）は `42601`。
-- `<literal>` は既存の `INSERT ... VALUES` 要素パーサー
+- `<literal>` は共通のリテラルパーサー
   （`sql::allowlist::Parser::expect_literal`）をそのまま再利用する（第 2 の
   リテラル文法を作らない）。`NULL` キーワードはこのパーサーが受理しないため、
   `DEFAULT NULL` は構造的に `42601` になる（TABLE-16: 明示 `NULL` は
-  `DEFAULT` の対象外という契約と整合）。
+  `DEFAULT` の対象外という契約と整合）。`INSERT ... VALUES` の要素だけは
+  専用ヘルパ `expect_insert_value` が `NULL` を先に処理してから
+  `expect_literal` へ委譲する（Issue #1523）ため、`expect_literal` 本体には
+  `NULL` 分岐を足さない。
 - `TEXT` 列: `DEFAULT` は文字列リテラルのみ受理する（数値・真偽値リテラルは
   型不一致として `42601`）。
 - `VECTOR` 列: `NOT NULL` の明示指定は受理するが冗長（元から
@@ -190,8 +193,9 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 - （Issue #1169 で実装済み）`ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...` の受理と、
   既存行への読み出し時の `DEFAULT` 補完（TABLE-5・TABLE-16）。
 - `ALTER COLUMN SET/DROP DEFAULT`・`SET/DROP NOT NULL`。
-- SQL `VALUES` 内の `NULL` リテラルと `DEFAULT` キーワード（`INSERT INTO t
-  (...) VALUES (DEFAULT, ...)` 形）。
+- （Issue #1523 で実装済み）SQL `VALUES` 内の `NULL` リテラル。
+- SQL `VALUES` 内の `DEFAULT` キーワード（`INSERT INTO t (...) VALUES
+  (DEFAULT, ...)` 形）。
 - NoSQL 表層の DDL op（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`FOREIGN KEY` は
   Issue #903・#905・#906・#907 で実装済み）。
 - `CREATE TABLE` の型拡張（`TEXT`／`VECTOR` 以外。TABLE-13／14）。

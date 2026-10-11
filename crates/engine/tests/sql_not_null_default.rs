@@ -189,10 +189,9 @@ fn insert_omitting_default_column_applies_the_declared_default_value() {
 #[test]
 fn copy_with_explicit_null_marker_does_not_apply_default_and_is_rejected_for_non_nullable_column() {
     // TABLE-16 の確定契約: 明示的な `NULL` には `DEFAULT` を適用しない。
-    // `INSERT ... VALUES` の要素パーサーは `NULL` トークンを受理しない
-    // （`sql::allowlist::InsertLiteral::Null` のドキュメンテーションコメント
-    // 参照）ため、SQL 表層で明示 `NULL` を経由できる経路である `COPY` の
-    // テキスト形式 `\N` マーカーで検証する（`sql::copy::bind_copy_record`）。
+    // ここでは `COPY` のテキスト形式 `\N` マーカー経路を検証する
+    // （`sql::copy::bind_copy_record`。`INSERT ... VALUES` の `NULL` は
+    // Issue #1523 で受理され、`sql_insert_null_literal.rs` が検証する）。
     // 非 nullable 列であれば `23502`（NotNullViolation）で拒否される。
     let (core, path) = new_core("not-null-default-copy-explicit-null");
     let _guard = CleanupGuard(path);
