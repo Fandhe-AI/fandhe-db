@@ -618,3 +618,65 @@ fn sql41_view_with_bool_literal_roundtrips_as_literal() {
         vec![1, 2, 3]
     );
 }
+
+/// PR #2297 指摘（Bugbot）: 恒偽の単純ビュー（`LIMIT`／`ORDER BY` なし）も `CREATE VIEW` が受理され、
+/// ビュー経由の SELECT は 0 行を返す。`WHERE TRUE` 側は従来どおり全行。
+#[test]
+fn sql41_simple_view_with_constant_false_is_accepted_and_returns_no_rows() {
+    let (storage, path) = bool_column_storage("sql41-simple-false-view");
+    let _guard = CleanupGuard(path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE VIEW v1 AS SELECT id FROM vdocs WHERE FALSE",
+        "CREATE VIEW v2 AS SELECT id FROM vdocs WHERE TRUE AND FALSE",
+        "CREATE VIEW v3 AS SELECT id FROM vdocs WHERE NOT TRUE",
+        "CREATE VIEW v4 AS SELECT * FROM vdocs WHERE FALSE",
+        "CREATE VIEW vt AS SELECT id FROM vdocs WHERE TRUE",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    }
+    seed_bool_column(&core, &ctx);
+    for v in ["v1", "v2", "v3", "v4"] {
+        assert_eq!(
+            ids_of(&core, &ctx, &format!("SELECT id FROM {v} LIMIT 10")),
+            Vec::<u64>::new(),
+            "{v}"
+        );
+    }
+    assert_eq!(
+        ids_of(&core, &ctx, "SELECT id FROM vt LIMIT 10"),
+        vec![1, 2, 3]
+    );
+}
+
+/// 恒偽の単純ビューは保存（描画）・再起動後の再読込（再解析）を経ても恒偽のまま
+/// （旧列述語互換の昇格で列参照 `"false"` へ化けない）。
+#[test]
+fn sql41_simple_view_with_constant_false_survives_restart() {
+    let (storage, path) = bool_column_storage("sql41-simple-false-restart");
+    let _guard = CleanupGuard(path.clone());
+    {
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let ctx = ctx_for("tenant-a");
+        let mut ddl = SessionState::default();
+        ddl.allow_ddl();
+        core.execute_sql_in_session(
+            &ctx,
+            &mut ddl,
+            "CREATE VIEW vf AS SELECT id FROM vdocs WHERE FALSE",
+        )
+        .expect("create view");
+        seed_bool_column(&core, &ctx);
+    }
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    assert_eq!(
+        ids_of(&core, &ctx, "SELECT id FROM vf LIMIT 10"),
+        Vec::<u64>::new()
+    );
+}

@@ -7813,6 +7813,10 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
                     "view body WHERE predicate form is not supported",
                 ));
             }
+            // Issue #1526・SQL-41 ポインタ: 恒偽（`WHERE FALSE`・`AND FALSE`・`NOT TRUE` が
+            // 畳まれた分岐 0 個の `Or`）は列を参照せず、単純ビューとして受理しても
+            // 公開列・テナント境界の検査面を広げない。保存時は `FALSE` として描画し再解析で戻る。
+            WherePredicate::Or(branches) if branches.is_empty() => {}
             WherePredicate::Or(_) => {
                 // TASK-208・SQL-24（Issue #912）の対象は SQL-19 の書き込み文と
                 // 読み取り SELECT で、TABLE-18 のビュー定義文本体は含まない
@@ -8402,7 +8406,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::Between { .. }
         | WherePredicate::IsNull { .. }
         | WherePredicate::Not(_) => String::new(),
-        // `parse_view_body` が Or も拒否するため現時点では到達しない。将来の
+        // 分岐 0 個の恒偽は `FALSE` で描画する（`()` は再解析できない。Issue #1526）。
+        WherePredicate::Or(branches) if branches.is_empty() => "FALSE".to_string(),
+        // 非空の `Or` は `parse_view_body` が拒否するため現時点では到達しない。将来の
         // ビュー本体 OR 解禁（別 Issue）に備え、往復可能な形で網羅描画だけ
         // 先に用意しておく（TASK-208・Issue #912）。
         WherePredicate::Or(branches) => {
@@ -8480,7 +8486,14 @@ pub(crate) fn validate_create_view_tokens(
         ViewBodyCheck::Structural,
     )? {
         ViewBodyKind::Simple(body) => {
-            let sql = render_view_body(&body);
+            let mut sql = render_view_body(&body);
+            // 恒偽（`FALSE` で描画される分岐 0 個の `Or`）が残る本文には、複雑形と同じく
+            // マーカーを付け、旧版の列参照保存形式として再解析されるのを防ぐ（Issue #1526）。
+            let rendered_tokens = super::lexer::tokenize(&sql)
+                .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
+            if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
+                sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
+            }
             (body.table_name, sql)
         }
         ViewBodyKind::Buffered { relations, .. } => {
