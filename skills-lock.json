@@ -113,7 +113,7 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/make/SKILL.md",
-      "computedHash": "21beead4b74e0e0c5126b13a2d28e2598491216850786026ebd7f9c757638e71"
+      "computedHash": "1f31950974ee19d19907e4c508a1b052d3aa104c4831cad582a24fd3fa8df733"
     },
     "nvidia-cuda": {
       "source": "Fandhe-AI/agent-reference-skills",
