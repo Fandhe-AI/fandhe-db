@@ -422,7 +422,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
             i > start
                 && i < end
                 && matches!(prev1, Some(Token::Punct('=')))
-                && matches!(prev2, Some(Token::Ident(_)))
+                && matches!(prev2, Some(Token::Ident(_) | Token::QuotedNull(_)))
         });
 
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
@@ -655,7 +655,7 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         }
         if let Some((start, end)) = where_bounds {
             if i > start && i < end && matches!(prev1, Some(Token::Punct('='))) {
-                if let Some(Token::Ident(col)) = prev2 {
+                if let Some(Token::Ident(col) | Token::QuotedNull(col)) = prev2 {
                     slot.push(ParamPosition::WhereColumn(col.clone()));
                     continue;
                 }

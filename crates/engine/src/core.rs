@@ -3197,7 +3197,7 @@ impl EngineCore {
         &self,
         sql: &str,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        let tokens = crate::sql::lexer::tokenize(sql)?;
+        let tokens = crate::sql::lexer::tokenize_marked(sql)?;
         self.parse_tokens(tokens)
     }
 
@@ -3320,6 +3320,22 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // 引用付き `NULL`（`Token::QuotedNull`）を値位置で区別する必要があるのは
+        // INSERT／UPDATE／CREATE／ALTER（`WITH` 先頭の DML 含む）の許可リスト検証だけ
+        // （Issue #1524）。それ以外の文種は従来どおり `Ident` として扱う（識別子位置の
+        // `"null"` を受理し続けるため）。
+        let literal_sensitive_head = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name))
+                if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH"]
+                    .iter()
+                    .any(|kw| name.eq_ignore_ascii_case(kw))
+        );
+        let tokens = if literal_sensitive_head {
+            tokens
+        } else {
+            crate::sql::lexer::demote_quoted_null(tokens)
+        };
         let txn_control_head = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
@@ -4133,7 +4149,7 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let tokens = crate::sql::lexer::tokenize(sql)?;
+        let tokens = crate::sql::lexer::tokenize_marked(sql)?;
         let parsed = self.parse_tokens(tokens)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
     }
