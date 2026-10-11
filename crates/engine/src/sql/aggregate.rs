@@ -2464,6 +2464,10 @@ pub(crate) fn aggregate_projection_columns(
                         .and_then(aggregate_item_result_type),
                 })
             }
+            // 集計式項目（Issue #1541）: 束縛時に確定した結果列型をそのまま公告する。
+            crate::sql::parser::ProjectionColumn::Expr {
+                name, result_ty, ..
+            } => Ok(crate::sql::exec::computed_column_meta(name, result_ty)),
         })
         .collect()
 }
@@ -2489,10 +2493,21 @@ fn finish_aggregate_result(
     for accumulator in accumulators {
         cells.push(accumulator.finish()?);
     }
-    // 単一行集計では `projection` が `items` と 1 対 1（`GROUP BY` キー列なし）。
+    // 集計式項目（Issue #1541）が無ければ `projection` は `items` と 1 対 1（`GROUP BY`
+    // キー列なし）でセルをそのまま返す。式項目があれば内部集計項目を除いた出力列順で
+    // 組み立て直し、式をグループ確定後（ここ）に評価する。
     // 列メタは実行経路・Describe・GROUP BY 経路が共有する
     // `aggregate_projection_columns` で組み立てる（Issue #1173）。
     let columns = aggregate_projection_columns(bound, schema)?;
+    let cells = if bound
+        .projection
+        .iter()
+        .any(|c| matches!(c, crate::sql::parser::ProjectionColumn::Expr { .. }))
+    {
+        crate::sql::group_by::project_ungrouped_row(bound, schema, &cells)?
+    } else {
+        cells
+    };
 
     Ok(QueryResult {
         columns,

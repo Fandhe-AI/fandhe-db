@@ -75,9 +75,8 @@
 use std::collections::HashSet;
 
 use super::allowlist::{
-    AggregateArg, AggregateSelectItem, CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp,
-    SelectItem, SqlSurfaceError, Statement, TableLookup, ValidatedAggregate, ValidatedScan,
-    WherePredicate,
+    CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp, SelectItem, SqlSurfaceError,
+    Statement, TableLookup, ValidatedAggregate, ValidatedScan, WherePredicate,
 };
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
@@ -330,16 +329,7 @@ fn scan_referenced_columns(validated: &ValidatedScan) -> HashSet<String> {
 fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<String> {
     let mut cols = HashSet::new();
     for item in &validated.items {
-        match item {
-            AggregateSelectItem::Aggregate(agg) => {
-                if let AggregateArg::Expr(expr) = &agg.arg {
-                    super::parser::collect_expr_idents(expr, &mut cols);
-                }
-            }
-            AggregateSelectItem::GroupKey { column, .. } => {
-                cols.insert(column.clone());
-            }
-        }
+        item.collect_referenced_idents(&mut cols);
     }
     if let Some(group_by) = &validated.group_by {
         cols.extend(group_by.columns.iter().cloned());
