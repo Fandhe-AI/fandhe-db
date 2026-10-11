@@ -37,6 +37,8 @@ struct Scope {
     end: usize,
     /// 直近の外側スコープの添字。
     parent: Option<usize>,
+    /// 外側スコープの個数（収集時に確定し、祖先走査による O(n^2) を避ける）。
+    depth: usize,
     /// 書き換え対象の区間（投影・FROM 参照以降〜終端語の手前）と FROM 参照。
     /// `None` は不透明スコープ（書き換えない）。
     info: Option<ScopeInfo>,
@@ -109,6 +111,13 @@ pub(crate) fn normalize_single_table_qualifiers(
                             .any(|t| matches!(t, Token::Keyword(Keyword::Where)))
                     })
                     && quoted_bool_word_in_leaf_position(tokens, i);
+                // `x.null` も同様に、`COALESCE`／`NULLIF`／`CASE` の引数位置で `Ident("null")` が
+                // `Expr::Null` に解釈され列検証を素通りするため、fail-closed で拒否する。
+                if name.eq_ignore_ascii_case("null") {
+                    return Err(SqlSurfaceError::unsupported(
+                        "qualified null column reference is not supported",
+                    ));
+                }
                 if is_bool_word && !leaf {
                     return Err(SqlSurfaceError::unsupported(
                         "qualified boolean-word column reference is only supported as a WHERE predicate",
@@ -177,6 +186,7 @@ fn collect_scopes(tokens: &[Token]) -> Vec<Scope> {
             start: 0,
             end: tokens.len(),
             parent: None,
+            depth: 0,
             info: None,
         });
         scope_stack.push(0);
@@ -193,6 +203,7 @@ fn collect_scopes(tokens: &[Token]) -> Vec<Scope> {
                         start: i + 1,
                         end: tokens.len(),
                         parent: scope_stack.last().copied(),
+                        depth: scope_stack.len(),
                         info: None,
                     });
                     scope_stack.push(idx);
@@ -215,19 +226,10 @@ fn collect_scopes(tokens: &[Token]) -> Vec<Scope> {
     scopes
 }
 
-fn scope_depth(scopes: &[Scope], mut idx: usize) -> usize {
-    let mut d = 0usize;
-    while let Some(p) = scopes.get(idx).and_then(|s| s.parent) {
-        d += 1;
-        idx = p;
-    }
-    d
-}
-
 /// スコープの FROM 参照と書き換え区間を求める。不透明なら `None`。
 fn scope_info(tokens: &[Token], scopes: &[Scope], idx: usize) -> Option<ScopeInfo> {
     let scope = scopes.get(idx)?;
-    if scope_depth(scopes, idx) > MAX_SUBQUERY_DEPTH {
+    if scope.depth > MAX_SUBQUERY_DEPTH {
         return None;
     }
     let (start, end) = (scope.start, scope.end);
@@ -425,6 +427,29 @@ mod tests {
             let toks = tokenize(sql).expect("lex");
             assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
         }
+    }
+
+    #[test]
+    fn qualified_null_column_is_rejected() {
+        for sql in [
+            "SELECT COALESCE(x.null, 1) FROM docs x LIMIT 10",
+            "SELECT id FROM docs x WHERE x.null = 1 LIMIT 10",
+        ] {
+            let toks = tokenize(sql).expect("lex");
+            assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn deep_nesting_does_not_walk_ancestors() {
+        let n = MAX_SUBQUERY_DEPTH + 50;
+        let sql = format!(
+            "{}SELECT x.id FROM docs x{} LIMIT 1",
+            "SELECT id FROM docs WHERE id IN (".repeat(n),
+            ")".repeat(n)
+        );
+        let toks = tokenize(&sql).expect("lex");
+        let _ = normalize_single_table_qualifiers(&toks);
     }
 
     #[test]
