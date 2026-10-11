@@ -75,8 +75,8 @@ feature を廃止した経緯（`crates/engine/Cargo.toml` コメント参照）
 迂回 API の露出が理由だったが、本 feature は bench 専用の依存有効化のみで安全境界に
 触れない。
 
-**CI への影響**: lefthook・CI は `cargo clippy`/`cargo test` を `--all-features` で
-実行するため、`contrast-bench` feature は PR ごとの `make ci`・CI で常時有効化され
+**CI への影響**: CI（と任意の `make ci`）は `cargo clippy`/`cargo test` を `--all-features` で
+実行するため、`contrast-bench` feature は PR ごとの CI・`make ci` で常時有効化され
 usearch の C++ ビルドが走る（GitHub ホステッド `ubuntu-latest` には g++ が同梱済み。
 初回 1〜3 分、以降はビルドキャッシュ次第）。ローカル実行にも C++17 コンパイラが必要
 になる（README「回帰ベンチの Environment `bench-gate` secrets」に明記）。`deny.toml` は
