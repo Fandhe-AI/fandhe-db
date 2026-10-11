@@ -45,6 +45,10 @@
 //! 数値パラメータは検証済み整数の 10 進化のみ。配列の要素数上限・VECTOR 要素の
 //! 拒否・ENUM 型名の解決は engine が担い、wire 側に複製しない。
 //! 型と無関係なパラメータの混入は黙って無視せず `42601`（fail-closed）。
+//! SQL の型名エイリアス（`int4`・`int8`・`float4`・`float8` 等。Issue #1529・
+//! TABLE-29）は NoSQL の固定語彙に含めず `42601` で拒否する。`enum_type` の予約型
+//! 判定は engine の `sql::allowlist::is_column_type_keyword` と共有し、エイリアス語が
+//! ENUM 型名として黙って組み込み型へ解決されないようにする。
 //!
 //! ## `alter_table.drop_column`（Issue #1167）
 //!
@@ -742,28 +746,12 @@ fn column_type_tokens(v: &Validated<'_>) -> Result<(Vec<Token>, bool), DdlError>
     Ok((tokens, false))
 }
 
-/// `enum_type` が予約型キーワード（大小無視）と一致するかを判定する
-/// （`sql::ddl_column_type::parse_column_type_name` が同じ語をすべて予約型
-/// として読むため、ENUM 型名候補として別型に解釈されるのを防ぐ）。
+/// `enum_type` が予約型キーワード（大小無視）と一致するかを判定する。
+/// 語彙は engine の `sql::allowlist::is_column_type_keyword` が単一情報源で、
+/// 型名エイリアス（`INT`・`INT8` 等。Issue #1529・TABLE-29）が ENUM 型名として
+/// 黙って組み込み型に解決されるのを防ぐ（fail-closed）。
 fn is_reserved_type_keyword(raw: &str) -> bool {
-    const RESERVED: [&str; 15] = [
-        "TEXT",
-        "INTEGER",
-        "BIGINT",
-        "REAL",
-        "DOUBLE",
-        "BOOLEAN",
-        "DATE",
-        "TIMESTAMP",
-        "BYTEA",
-        "JSON",
-        "JSONB",
-        "UUID",
-        "VECTOR",
-        "NUMERIC",
-        "DECIMAL",
-    ];
-    RESERVED.iter().any(|kw| raw.eq_ignore_ascii_case(kw))
+    engine::sql::allowlist::is_column_type_keyword(raw)
 }
 
 /// `alter_table.add_column` を SQL の `ALTER TABLE ... ADD COLUMN` と同一の
@@ -1391,6 +1379,9 @@ mod tests {
         assert!(is_reserved_type_keyword("VECTOR"));
         assert!(is_reserved_type_keyword("Numeric"));
         assert!(!is_reserved_type_keyword("mood"));
+        for alias in ["int", "INT4", "int8", "Float4", "float8"] {
+            assert!(is_reserved_type_keyword(alias), "{alias}");
+        }
     }
 
     #[test]

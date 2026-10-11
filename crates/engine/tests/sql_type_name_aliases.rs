@@ -162,3 +162,80 @@ fn create_type_rejects_names_that_alias_builtin_column_types() {
         );
     }
 }
+
+fn column_type(path: &std::path::Path, table: &str, col: &str) -> ColumnType {
+    let storage = Storage::open(path).expect("reopen");
+    let schema = storage.get_table_schema(table).expect("schema");
+    schema
+        .columns
+        .iter()
+        .find(|c| c.name == col)
+        .expect("column")
+        .ty
+        .clone()
+}
+
+/// `ALTER COLUMN ... TYPE <別名>` が正規名と同じ拡張変換として通る（Issue #1529・TABLE-29）。
+#[test]
+fn alter_column_type_accepts_aliases_like_canonical_names() {
+    let (path, _g, core) = open("ta-alter-type");
+    let mut s = allowed();
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE t (embedding VECTOR(2) NOT NULL, a INT, b INTEGER, c FLOAT4, d REAL)",
+    )
+    .expect("create");
+    run(
+        &core,
+        &mut s,
+        "INSERT INTO t (id, embedding, a, b, c, d) VALUES (1, '[0.1,0.2]', 7, 8, 1.5, 2.5) \
+         USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert");
+    run(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT8").expect("alias int8");
+    run(&core, &mut s, "ALTER TABLE t ALTER COLUMN b TYPE int8").expect("lowercase alias");
+    run(&core, &mut s, "ALTER TABLE t ALTER COLUMN c TYPE FLOAT8").expect("alias float8");
+    run(
+        &core,
+        &mut s,
+        "ALTER TABLE t ALTER COLUMN d TYPE DOUBLE PRECISION",
+    )
+    .expect("canonical");
+    let result = core
+        .execute_sql(&ctx(), "SELECT id, a, b FROM t LIMIT 10")
+        .expect("select");
+    assert_eq!(result.rows.len(), 1);
+    drop(core);
+    assert!(matches!(column_type(&path, "t", "a"), ColumnType::BigInt));
+    assert!(matches!(column_type(&path, "t", "b"), ColumnType::BigInt));
+    assert!(matches!(column_type(&path, "t", "c"), ColumnType::Double));
+    assert!(matches!(column_type(&path, "t", "d"), ColumnType::Double));
+}
+
+/// 同一型・未登録型・権限なしの扱いが正規名と一致し、スキーマ不変である。
+#[test]
+fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
+    let (path, _g, core) = open("ta-alter-type-fail");
+    let mut s = allowed();
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE t (embedding VECTOR(2) NOT NULL, a INT)",
+    )
+    .expect("create");
+    let canon = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INTEGER").wire_code();
+    let alias = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT4").wire_code();
+    assert_eq!(canon, alias);
+    assert_eq!(
+        err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT2").wire_code(),
+        "42601"
+    );
+    let mut denied = SessionState::default();
+    assert_eq!(
+        err(&core, &mut denied, "ALTER TABLE t ALTER COLUMN a TYPE INT8").wire_code(),
+        "42501"
+    );
+    drop(core);
+    assert!(matches!(column_type(&path, "t", "a"), ColumnType::Integer));
+}

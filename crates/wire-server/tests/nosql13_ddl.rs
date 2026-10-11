@@ -1185,6 +1185,37 @@ fn alter_table_add_column_reserved_enum_type_keyword_is_42601() {
     assert_eq!(http_common::wire_code_of(&resp), "42601", "got: {resp:?}");
 }
 
+/// 型名エイリアス（Issue #1529・TABLE-29）は NoSQL の `type` 語彙に含まれず、
+/// `enum_type` にも予約型として渡せない（黙って組み込み型の列になるのを防ぐ）。
+/// 拒否時はテーブルが作られない。
+#[test]
+fn type_name_aliases_are_rejected_in_type_and_enum_type_without_side_effects() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let mut cases = Vec::new();
+    for alias in ["int", "int4", "int8", "float4", "float8"] {
+        cases.push(format!(
+            r#"{{"op":"create_table","table":"docs","columns":[{{"name":"a","type":"{alias}"}}]}}"#
+        ));
+        cases.push(format!(
+            r#"{{"op":"create_table","table":"docs","columns":[{{"name":"a","type":"enum","enum_type":"{alias}"}}]}}"#
+        ));
+        cases.push(format!(
+            r#"{{"op":"create_table","table":"docs","columns":[{{"name":"a","type":"array","element_type":"enum","enum_type":"{alias}","max_len":3}}]}}"#
+        ));
+    }
+    for body in &cases {
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "42601",
+            "body={body} got: {resp:?}"
+        );
+    }
+    let scan = query(&session, br#"{"op":"scan","table":"docs","limit":1}"#);
+    assert_eq!(http_common::wire_code_of(&scan), "42P01", "got: {scan:?}");
+}
+
 // --- drop_table --------------------------------------------------------
 
 #[test]
