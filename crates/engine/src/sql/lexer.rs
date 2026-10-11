@@ -39,6 +39,11 @@
 pub enum Token {
     Keyword(Keyword),
     Ident(String),
+    /// 二重引用符付きで書かれた `true`／`false`（大小無視。Issue #1526）。未引用の
+    /// 真偽リテラルと区別するためだけの variant で、WHERE の葉位置では従来どおり
+    /// BOOLEAN 列の識別子として扱う（`sql::allowlist` の `try_parse_structural_leaf`）。
+    /// それ以外の引用識別子は従来どおり [`Token::Ident`]。
+    QuotedBoolWord(String),
     StringLiteral(String),
     Number(String),
     /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]`（TASK-79・SQL-9 で `+ - / > <` を追加。
@@ -157,6 +162,11 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 Keyword::Limit => "LIMIT",
             }),
             Token::Ident(s) | Token::Number(s) => out.push_str(s),
+            Token::QuotedBoolWord(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
             Token::StringLiteral(s) => {
                 out.push('\'');
                 out.push_str(&s.replace('\'', "''"));
@@ -348,7 +358,11 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
                     byte_offset: offset,
                 });
             }
-            tokens.push(Token::Ident(content.to_string()));
+            if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
+                tokens.push(Token::QuotedBoolWord(content.to_string()));
+            } else {
+                tokens.push(Token::Ident(content.to_string()));
+            }
             advance_to(&mut chars, end);
             continue;
         }

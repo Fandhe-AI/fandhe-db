@@ -4697,7 +4697,13 @@ impl<'a> Parser<'a> {
         extra_close_paren: bool,
         set_operators: bool,
     ) -> Result<Option<WherePredicate>, SqlSurfaceError> {
-        let Some(Token::Ident(name)) = self.peek().cloned() else {
+        // 引用付き `"true"`／`"false"` は列名（従来経路）。未引用の真偽リテラルは
+        // `try_parse_const_bool_leaf` が先に畳むため、ここへ来る `true`／`false`
+        // は引用付きか、畳み込み対象外の文脈（CHECK 本体・`TRUE = x` 等）だけ。
+        let Some(name) = (match self.peek() {
+            Some(Token::Ident(n)) | Some(Token::QuotedBoolWord(n)) => Some(n.clone()),
+            _ => None,
+        }) else {
             return Ok(None);
         };
         if name.eq_ignore_ascii_case("EXISTS")
@@ -12882,6 +12888,22 @@ mod tests {
             where_of("NOT (lang = 'x' OR TRUE)"),
             vec![WherePredicate::Not(Box::new(eq)), falsum]
         );
+    }
+
+    /// Issue #1526・PR #2297 指摘: 二重引用符付き `"true"`／`"false"` は定数へ畳まず、
+    /// 従来どおり BOOLEAN 列の裸参照として扱う。
+    #[test]
+    fn quoted_bool_word_stays_column_reference() {
+        let col = |c: &str| WherePredicate::BoolColumn {
+            column: c.to_string(),
+        };
+        assert_eq!(where_of("\"true\""), vec![col("true")]);
+        assert_eq!(where_of("\"FALSE\""), vec![col("FALSE")]);
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "en".to_string(),
+        };
+        assert_eq!(where_of("lang = 'en' AND \"true\""), vec![eq, col("true")]);
     }
 
     /// Issue #1184: `NOT ( ... )` は De Morgan で葉まで押し下げられ、`Not` が

@@ -834,7 +834,10 @@ pub fn decode_bind_values(
                     .map(|s| s.len())
                     .unwrap_or(0)
             }
-            Token::Ident(s) | Token::StringLiteral(s) | Token::Number(s) => s.len(),
+            Token::Ident(s)
+            | Token::QuotedBoolWord(s)
+            | Token::StringLiteral(s)
+            | Token::Number(s) => s.len(),
             Token::QualifiedIdent { qualifier, name } => {
                 qualifier.len().checked_add(name.len()).ok_or_else(|| {
                     SqlSurfaceError::payload_too_large(
