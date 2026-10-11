@@ -4412,8 +4412,10 @@ impl<'a> Parser<'a> {
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let predicates: Vec<WherePredicate> = if let Some(leaf) =
-            self.try_parse_numeric_list_leaf()?
+            self.try_parse_const_bool_leaf(extra_close_paren, set_operators)
         {
+            leaf
+        } else if let Some(leaf) = self.try_parse_numeric_list_leaf()? {
             leaf
         } else if let Some(leaf) =
             self.try_parse_structural_leaf(extra_close_paren, set_operators)?
@@ -4433,7 +4435,13 @@ impl<'a> Parser<'a> {
                     "NOT ( ... ) grouping is not supported",
                 ));
             }
-            if let Some(inner) = self.try_parse_numeric_list_leaf()? {
+            if let Some(inner) = self.try_parse_const_bool_leaf(extra_close_paren, set_operators) {
+                if negate_odd {
+                    negate_conjunction(inner, &mut self.expr_node_budget)?
+                } else {
+                    inner
+                }
+            } else if let Some(inner) = self.try_parse_numeric_list_leaf()? {
                 if negate_odd {
                     negate_conjunction(inner, &mut self.expr_node_budget)?
                 } else {
@@ -4506,6 +4514,47 @@ impl<'a> Parser<'a> {
             )));
         }
         Ok(predicates)
+    }
+
+    /// 述語の葉位置にある真偽リテラル `TRUE`／`FALSE` を定数として畳み込む
+    /// （SQL-41 のポインタ。Issue #1526）。`sql::parser` の WHERE 束縛へ渡る前の
+    /// 構文段で消し、`WherePredicate` に新 variant を足さない（網羅 match と
+    /// content hash の互換を保つ）。`TRUE` は述語なし（空の連言＝真）、`FALSE` は
+    /// 分岐 0 個の `Or`（恒偽。`sql::subquery` の EXISTS 解決と同じ表現）を返す。
+    /// 直後が述語境界トークンのときだけ消費する（`TRUE = x` 等は従来経路へ流す）。
+    /// CHECK 本体では常に `None`（従来どおり BOOLEAN 列の裸参照として扱う）。
+    /// 先読みは 1 トークンで後戻りしない。
+    fn try_parse_const_bool_leaf(
+        &mut self,
+        extra_close_paren: bool,
+        set_operators: bool,
+    ) -> Option<Vec<WherePredicate>> {
+        if self.in_check_body {
+            return None;
+        }
+        let Some(Token::Ident(w)) = self.peek() else {
+            return None;
+        };
+        let value = if w.eq_ignore_ascii_case("TRUE") {
+            true
+        } else if w.eq_ignore_ascii_case("FALSE") {
+            false
+        } else {
+            return None;
+        };
+        if !is_where_predicate_boundary_token(
+            self.tokens.get(self.pos.saturating_add(1)),
+            extra_close_paren,
+            set_operators,
+        ) {
+            return None;
+        }
+        self.advance();
+        Some(if value {
+            Vec::new()
+        } else {
+            vec![WherePredicate::Or(Vec::new())]
+        })
     }
 
     /// `<値式> <比較演算子> <値式>`（式述語。頂点は必ず比較の [`Expr::Binary`]）。
@@ -4689,7 +4738,13 @@ impl<'a> Parser<'a> {
         extra_close_paren: bool,
         set_operators: bool,
     ) -> Result<Option<WherePredicate>, SqlSurfaceError> {
-        let Some(Token::Ident(name)) = self.peek().cloned() else {
+        // 引用付き `"true"`／`"false"` は列名（従来経路）。未引用の真偽リテラルは
+        // `try_parse_const_bool_leaf` が先に畳むため、ここへ来る `true`／`false`
+        // は引用付きか、畳み込み対象外の文脈（CHECK 本体・`TRUE = x` 等）だけ。
+        let Some(name) = (match self.peek() {
+            Some(Token::Ident(n)) | Some(Token::QuotedBoolWord(n)) => Some(n.clone()),
+            _ => None,
+        }) else {
             return Ok(None);
         };
         if name.eq_ignore_ascii_case("EXISTS")
@@ -7762,6 +7817,10 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
                     "view body WHERE predicate form is not supported",
                 ));
             }
+            // Issue #1526・SQL-41 ポインタ: 恒偽（`WHERE FALSE`・`AND FALSE`・`NOT TRUE` が
+            // 畳まれた分岐 0 個の `Or`）は列を参照せず、単純ビューとして受理しても
+            // 公開列・テナント境界の検査面を広げない。保存時は `FALSE` として描画し再解析で戻る。
+            WherePredicate::Or(branches) if branches.is_empty() => {}
             WherePredicate::Or(_) => {
                 // TASK-208・SQL-24（Issue #912）の対象は SQL-19 の書き込み文と
                 // 読み取り SELECT で、TABLE-18 のビュー定義文本体は含まない
@@ -8289,12 +8348,26 @@ fn escape_string_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// 列名をビュー正規化 SQL 用に描画する。`true`／`false` と大小無視で一致する列名は
+/// 引用付きで出力し、再解析時に真偽リテラル（Issue #1526）へ化けて意味が変わるのを防ぐ。
+fn render_column_name(column: &str) -> String {
+    if column.eq_ignore_ascii_case("true") || column.eq_ignore_ascii_case("false") {
+        format!("\"{column}\"")
+    } else {
+        column.to_string()
+    }
+}
+
 /// [`WherePredicate`] のうち [`parse_view_body`] が受理する形状のみを描画する
 /// （`PredicateCall`／`Expression` は到達しない）。
 fn render_where_predicate(pred: &WherePredicate) -> String {
     match pred {
         WherePredicate::Equality { column, value } => {
-            format!("{column} = '{}'", escape_string_literal(value))
+            format!(
+                "{} = '{}'",
+                render_column_name(column),
+                escape_string_literal(value)
+            )
         }
         // `pattern` は LIKE の生パターン全般（SQL-24・TASK-208、Issue #914 で
         // 前方一致限定から拡張）をそのまま無加工で保持する（`Parser::
@@ -8302,12 +8375,20 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // `declarative_filter::DeclarativeFilter::like` の責務で、ここでは
         // 追加のワイルドカードを付与しない。
         WherePredicate::Prefix { column, pattern } => {
-            format!("{column} LIKE '{}'", escape_string_literal(pattern))
+            format!(
+                "{} LIKE '{}'",
+                render_column_name(column),
+                escape_string_literal(pattern)
+            )
         }
         WherePredicate::BoolEquality { column, value } => {
-            format!("{column} = {}", if *value { "true" } else { "false" })
+            format!(
+                "{} = {}",
+                render_column_name(column),
+                if *value { "true" } else { "false" }
+            )
         }
-        WherePredicate::BoolColumn { column } => column.clone(),
+        WherePredicate::BoolColumn { column } => render_column_name(column),
         WherePredicate::Compare { column, op, value } => {
             let op_str = match op {
                 CompareOp::Lt => "<",
@@ -8315,7 +8396,11 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
                 CompareOp::Gt => ">",
                 CompareOp::Ge => ">=",
             };
-            format!("{column} {op_str} '{}'", escape_string_literal(value))
+            format!(
+                "{} {op_str} '{}'",
+                render_column_name(column),
+                escape_string_literal(value)
+            )
         }
         // `parse_view_body` が構造的に拒否するため到達しない
         // （`render_view_body` は常に [`parse_view_body`] の出力のみを描画する）。
@@ -8325,7 +8410,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::Between { .. }
         | WherePredicate::IsNull { .. }
         | WherePredicate::Not(_) => String::new(),
-        // `parse_view_body` が Or も拒否するため現時点では到達しない。将来の
+        // 分岐 0 個の恒偽は `FALSE` で描画する（`()` は再解析できない。Issue #1526）。
+        WherePredicate::Or(branches) if branches.is_empty() => "FALSE".to_string(),
+        // 非空の `Or` は `parse_view_body` が拒否するため現時点では到達しない。将来の
         // ビュー本体 OR 解禁（別 Issue）に備え、往復可能な形で網羅描画だけ
         // 先に用意しておく（TASK-208・Issue #912）。
         WherePredicate::Or(branches) => {
@@ -8403,7 +8490,14 @@ pub(crate) fn validate_create_view_tokens(
         ViewBodyCheck::Structural,
     )? {
         ViewBodyKind::Simple(body) => {
-            let sql = render_view_body(&body);
+            let mut sql = render_view_body(&body);
+            // 恒偽（`FALSE` で描画される分岐 0 個の `Or`）が残る本文には、複雑形と同じく
+            // マーカーを付け、旧版の列参照保存形式として再解析されるのを防ぐ（Issue #1526）。
+            let rendered_tokens = super::lexer::tokenize(&sql)
+                .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
+            if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
+                sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
+            }
             (body.table_name, sql)
         }
         ViewBodyKind::Buffered { relations, .. } => {
@@ -8413,8 +8507,15 @@ pub(crate) fn validate_create_view_tokens(
                 .ok_or_else(|| SqlSurfaceError::unsupported("view body has no source relation"))?;
             // 検証済みトークン列そのものを正規化描画して永続化する
             // （AST からの再描画による丸め・形状取りこぼしを避ける）。
-            let sql = super::lexer::render_tokens(strip_trailing_semicolons(body_tokens))
+            let stripped = strip_trailing_semicolons(body_tokens);
+            let mut sql = super::lexer::render_tokens(stripped)
                 .ok_or_else(|| SqlSurfaceError::unsupported("view body is not supported"))?;
+            // 述語葉位置に未引用の `true`／`false`（真偽リテラル）が残る本文には、旧版が
+            // 列参照として未引用で保存した本文と区別するマーカーを付ける（Issue #1526・
+            // PR #2297 指摘。読み出し側は `lexer::tokenize_stored_view_body`）。
+            if super::lexer::stored_body_needs_bool_literal_marker(stripped) {
+                sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
+            }
             (base, sql)
         }
     };
@@ -8984,7 +9085,10 @@ impl<'a> Parser<'a> {
     /// SQL-20・TASK-193 由来の字句を JOIN の列参照解決へ再利用する）。
     fn parse_join_colref(&mut self) -> Result<ColumnRef, SqlSurfaceError> {
         match self.advance() {
-            Some(Token::Ident(name)) => Ok(ColumnRef::unqualified(name.clone())),
+            // 引用付き `"true"`／`"false"` は列名（従来経路。Issue #1526・PR #2297 指摘）。
+            Some(Token::Ident(name)) | Some(Token::QuotedBoolWord(name)) => {
+                Ok(ColumnRef::unqualified(name.clone()))
+            }
             Some(Token::QualifiedIdent { qualifier, name }) => {
                 Ok(ColumnRef::qualified(qualifier.clone(), name.clone()))
             }
@@ -12861,6 +12965,54 @@ mod tests {
         where_predicates_of(&format!(
             "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
         ))
+    }
+
+    /// Issue #1526・SQL-41: 真偽リテラルは構文段で定数へ畳まれる（TRUE＝述語なし、
+    /// FALSE＝分岐 0 個の `Or`）。兄弟の述語は削らない（列検証を省略しない）。
+    #[test]
+    fn bool_literal_leaf_folds_to_constants() {
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "x".to_string(),
+        };
+        let falsum = WherePredicate::Or(Vec::new());
+        assert_eq!(where_of("TRUE"), Vec::<WherePredicate>::new());
+        assert_eq!(where_of("False"), vec![falsum.clone()]);
+        assert_eq!(where_of("lang = 'x' AND TRUE"), vec![eq.clone()]);
+        assert_eq!(
+            where_of("lang = 'x' AND FALSE"),
+            vec![eq.clone(), falsum.clone()]
+        );
+        assert_eq!(
+            where_of("lang = 'x' OR TRUE"),
+            vec![WherePredicate::Or(vec![vec![eq.clone()], vec![]])]
+        );
+        assert_eq!(where_of("NOT TRUE"), vec![falsum.clone()]);
+        assert_eq!(where_of("NOT FALSE"), Vec::<WherePredicate>::new());
+        assert_eq!(where_of("NOT NOT TRUE"), Vec::<WherePredicate>::new());
+        assert_eq!(where_of("NOT (TRUE)"), vec![falsum.clone()]);
+        assert_eq!(where_of("(TRUE)"), Vec::<WherePredicate>::new());
+        // 兄弟は削らない: ¬(a ∨ ⊤) = ¬a ∧ ⊥。
+        assert_eq!(
+            where_of("NOT (lang = 'x' OR TRUE)"),
+            vec![WherePredicate::Not(Box::new(eq)), falsum]
+        );
+    }
+
+    /// Issue #1526・PR #2297 指摘: 二重引用符付き `"true"`／`"false"` は定数へ畳まず、
+    /// 従来どおり BOOLEAN 列の裸参照として扱う。
+    #[test]
+    fn quoted_bool_word_stays_column_reference() {
+        let col = |c: &str| WherePredicate::BoolColumn {
+            column: c.to_string(),
+        };
+        assert_eq!(where_of("\"true\""), vec![col("true")]);
+        assert_eq!(where_of("\"FALSE\""), vec![col("FALSE")]);
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "en".to_string(),
+        };
+        assert_eq!(where_of("lang = 'en' AND \"true\""), vec![eq, col("true")]);
     }
 
     /// Issue #1184: `NOT ( ... )` は De Morgan で葉まで押し下げられ、`Not` が

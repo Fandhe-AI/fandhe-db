@@ -2267,7 +2267,7 @@ struct ViewBodyShape {
 /// [`ViewBodyShape`] を本文から導出する。字句・構造検証に失敗した本文は
 /// `CatalogError::Invalid`。
 fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
-    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| {
+    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| {
         CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
     })?;
     let kind = classify_view_body(&tokens, &StructuralOnlyLookup, ViewBodyCheck::Structural)
@@ -2656,7 +2656,7 @@ fn exposed_columns_of_view(
         let Some(def) = defs.get(view) else {
             return Ok(ViewExposure::Unrelated);
         };
-        let tokens = crate::sql::lexer::tokenize(&def.body_sql)
+        let tokens = crate::sql::lexer::tokenize_stored_view_body(&def.body_sql)
             .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
         let parsed = parse_view_body(&tokens)
             .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
@@ -8655,7 +8655,8 @@ impl Storage {
                         catalog_table: &catalog_table,
                         views_table: &views_table,
                     };
-                    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| invalid())?;
+                    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
+                        .map_err(|_| invalid())?;
                     classify_view_body(&tokens, &lookup, ViewBodyCheck::Resolved).map_err(|e| {
                         match e {
                             // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
@@ -8666,7 +8667,8 @@ impl Storage {
                         }
                     })?;
                 } else {
-                    let tokens = crate::sql::lexer::tokenize(body_sql).map_err(|_| invalid())?;
+                    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
+                        .map_err(|_| invalid())?;
                     let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
                     crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
                         .map_err(|_| invalid())?;

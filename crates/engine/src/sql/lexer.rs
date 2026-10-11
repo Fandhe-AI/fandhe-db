@@ -39,6 +39,11 @@
 pub enum Token {
     Keyword(Keyword),
     Ident(String),
+    /// 二重引用符付きで書かれた `true`／`false`（大小無視。Issue #1526）。未引用の
+    /// 真偽リテラルと区別するためだけの variant で、WHERE の葉位置では従来どおり
+    /// BOOLEAN 列の識別子として扱う（`sql::allowlist` の `try_parse_structural_leaf`）。
+    /// それ以外の引用識別子は従来どおり [`Token::Ident`]。
+    QuotedBoolWord(String),
     StringLiteral(String),
     Number(String),
     /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]` `%` `#`（`%`・単独 `#` は
@@ -165,6 +170,11 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 Keyword::Limit => "LIMIT",
             }),
             Token::Ident(s) | Token::Number(s) => out.push_str(s),
+            Token::QuotedBoolWord(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
             Token::StringLiteral(s) => {
                 out.push('\'');
                 out.push_str(&s.replace('\'', "''"));
@@ -211,6 +221,149 @@ pub const MAX_INPUT_LEN: usize = 1_048_576;
 /// 1 文で許容するトークン数上限。無制限 `Vec` 確保を避けるための防御的上限
 /// （security.md「不安全な設計｜無制限リソース確保」対応）。
 pub const MAX_TOKEN_COUNT: usize = 20_000;
+
+/// `QuotedBoolWord` を、WHERE の述語葉位置（直前が `WHERE`／`AND`／`OR`／`NOT`／それらに
+/// 続く `(`、直後が述語境界）以外では従来どおり `Ident` へ戻す（Issue #1526・PR #2297 指摘）。
+/// 引用付き `"true"`／`"false"` を列名として使う既存の全経路（DDL・投影・値式・INSERT・
+/// パラメータ束縛・等価比較）は `Ident` のみを前提にしているため、未引用リテラルとの区別が
+/// 必要な葉位置にだけ専用トークンを残し、互換性の影響範囲を最小化する。
+/// 境界の判定は `sql::allowlist` の述語境界判定の上位集合（`)` と集合演算子を常に含む）で、
+/// 取り違えても葉解析側が引用付き語を列参照として扱うため fail-closed を保つ。
+fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
+    let mut seen_where = false;
+    for i in 0..tokens.len() {
+        if matches!(tokens.get(i), Some(Token::Keyword(Keyword::Where))) {
+            seen_where = true;
+            continue;
+        }
+        if !matches!(tokens.get(i), Some(Token::QuotedBoolWord(_))) {
+            continue;
+        }
+        if !(seen_where && quoted_bool_word_in_leaf_position(tokens, i)) {
+            if let Some(Token::QuotedBoolWord(s)) = tokens.get(i).cloned() {
+                if let Some(slot) = tokens.get_mut(i) {
+                    *slot = Token::Ident(s);
+                }
+            }
+        }
+    }
+}
+
+/// 新版が書く永続化ビュー本文の先頭マーカー（ブロックコメント。字句解析では空白扱い）。
+/// 本文に「WHERE 述語葉位置の未引用 `true`／`false`」が残る場合だけ付与し（Issue #1526・
+/// PR #2297 指摘）、旧版が列参照として未引用で保存した本文（マーカーなし）と、新版が
+/// 真偽リテラルとして保存した本文（マーカーあり）を保存形式の段階で区別する。
+pub(crate) const STORED_BODY_BOOL_LITERAL_MARKER: &str = "/*fandhe:bool-literal*/ ";
+
+/// 永続化ビュー本文を再解析用にトークン化する（Issue #1526・PR #2297 指摘）。
+/// 旧版は WHERE 述語葉位置の列参照 `"true"`／`"false"` を引用なしで保存した（単純形・
+/// 評価後射影形の双方）。マーカーなしの本文はこの旧形式として扱い、述語葉位置の未引用
+/// `true`／`false` を `QuotedBoolWord`（列述語）へ戻す。マーカー付きの本文（新版が保存した、
+/// 未引用が真偽リテラルを意味する形式）は戻さない。`= true` のような値位置は対象外。
+/// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
+pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
+    let mut tokens = tokenize(input)?;
+    if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
+        return Ok(tokens);
+    }
+    for i in bare_bool_leaf_positions(&tokens) {
+        if let Some(slot) = tokens.get_mut(i) {
+            if let Token::Ident(w) = slot {
+                let word = std::mem::take(w);
+                *slot = Token::QuotedBoolWord(word);
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+/// 新版が保存する本文に [`STORED_BODY_BOOL_LITERAL_MARKER`] が必要か（述語葉位置に未引用の
+/// `true`／`false` が残るか）。`sql::allowlist` の `CREATE VIEW` 保存本文生成から呼ばれる。
+pub(crate) fn stored_body_needs_bool_literal_marker(tokens: &[Token]) -> bool {
+    !bare_bool_leaf_positions(tokens).is_empty()
+}
+
+/// WHERE 以降で述語葉位置にある未引用 `true`／`false`（`Ident`）のトークン位置を返す。
+fn bare_bool_leaf_positions(tokens: &[Token]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut seen_where = false;
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Keyword(Keyword::Where) => seen_where = true,
+            Token::Ident(w)
+                if seen_where
+                    && (w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
+                    && quoted_bool_word_in_leaf_position(tokens, i) =>
+            {
+                out.push(i);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// [`demote_unneeded_quoted_bool_words`] の位置判定（`tokens[i]` が真偽語）。
+fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
+    // 直前: 連続する `(` を数えつつ読み戻し、先頭が WHERE／AND／OR／NOT かを見る。
+    // この `(` 群（opens 個）が葉自身を包む述語グループで、直後の最初の opens 個の `)` が
+    // それに対応する。それを超える `)` は外側の構造（CTE・サブクエリ）を閉じる境界であり、
+    // 葉は位置として有効（PR #2297 指摘: 括弧がグループかクエリ境界かの区別）。
+    let mut opens: usize = 0;
+    let mut j = i;
+    let lead_ok = loop {
+        if j == 0 {
+            break false;
+        }
+        j -= 1;
+        match tokens.get(j) {
+            Some(Token::Punct('(')) => opens = opens.saturating_add(1),
+            Some(Token::Keyword(Keyword::Where | Keyword::And)) => break true,
+            Some(Token::Ident(w)) => {
+                break w.eq_ignore_ascii_case("OR") || w.eq_ignore_ascii_case("NOT");
+            }
+            _ => break false,
+        }
+    };
+    if !lead_ok {
+        return false;
+    }
+    let mut k = i;
+    let mut closed: usize = 0;
+    loop {
+        k = match k.checked_add(1) {
+            Some(n) => n,
+            None => return false,
+        };
+        if !matches!(tokens.get(k), Some(Token::Punct(')'))) {
+            break;
+        }
+        closed = closed.saturating_add(1);
+        if closed > opens {
+            // 葉のグループを超えて閉じる `)` はクエリ境界（CTE・サブクエリの終端）。
+            return true;
+        }
+    }
+    match tokens.get(k) {
+        None => true,
+        Some(Token::Punct(';')) => true,
+        Some(Token::Keyword(Keyword::And | Keyword::Order | Keyword::Limit)) => true,
+        Some(Token::Ident(w)) => [
+            "USING",
+            "HINT",
+            "RETURNING",
+            "GROUP",
+            "HAVING",
+            "OR",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ]
+        .iter()
+        .any(|k| w.eq_ignore_ascii_case(k)),
+        _ => false,
+    }
+}
 
 /// SQL テキストをトークン列へ変換する。`unwrap`/`expect`/添字アクセスを使わず、
 /// `chars()` イテレータの先読み（`Peekable`）のみで走査する。`$n` プレースホルダ
@@ -386,7 +539,9 @@ fn tokenize_impl(
                     byte_offset: offset,
                 });
             }
-            if mark_quoted_null && content.eq_ignore_ascii_case("NULL") {
+            if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
+                tokens.push(Token::QuotedBoolWord(content.to_string()));
+            } else if mark_quoted_null && content.eq_ignore_ascii_case("NULL") {
                 tokens.push(Token::QuotedNull(content.to_string()));
             } else {
                 tokens.push(Token::Ident(content.to_string()));
@@ -549,6 +704,7 @@ fn tokenize_impl(
         });
     }
 
+    demote_unneeded_quoted_bool_words(&mut tokens);
     Ok(tokens)
 }
 
@@ -1639,5 +1795,84 @@ mod tests {
                 Token::Punct(']')
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod quoted_bool_word_tests {
+    use super::*;
+
+    /// PR #2297 指摘: 旧版が未引用で保存した葉位置の `true`／`false` は列参照へ戻し、
+    /// 値位置（`= true`）は戻さない。
+    #[test]
+    fn stored_view_body_restores_legacy_bare_bool_columns() {
+        let kinds = |sql: &str| -> Vec<bool> {
+            tokenize_stored_view_body(sql)
+                .expect("tokenize")
+                .iter()
+                .filter(|t| matches!(t, Token::QuotedBoolWord(_) | Token::Ident(_)))
+                .map(|t| matches!(t, Token::QuotedBoolWord(_)))
+                .collect()
+        };
+        for word in ["true", "false", "TRUE"] {
+            let toks = tokenize_stored_view_body(&format!("SELECT id FROM t WHERE {word}"))
+                .expect("tokenize");
+            assert!(
+                matches!(toks.last(), Some(Token::QuotedBoolWord(_))),
+                "{word}"
+            );
+        }
+        // `flag = true` の `true` は値位置のため Ident のまま。
+        assert!(!kinds("SELECT id FROM t WHERE flag = true")
+            .iter()
+            .any(|q| *q));
+    }
+
+    fn quoted_count(sql: &str) -> usize {
+        tokenize(sql)
+            .expect("tokenize")
+            .iter()
+            .filter(|t| matches!(t, Token::QuotedBoolWord(_)))
+            .count()
+    }
+
+    /// Issue #1526・PR #2297: WHERE の葉位置以外の引用付き `"true"` は従来どおり `Ident`。
+    #[test]
+    fn quoted_bool_word_is_ident_outside_where_leaf() {
+        assert_eq!(quoted_count("CREATE TABLE t (\"true\" BOOLEAN)"), 0);
+        assert_eq!(quoted_count("SELECT \"true\" FROM t"), 0);
+        assert_eq!(quoted_count("SELECT id FROM t WHERE \"true\" = true"), 0);
+        assert_eq!(quoted_count("SELECT id FROM t WHERE f(\"true\")"), 0);
+        assert_eq!(
+            quoted_count("SELECT id FROM t WHERE a = 1 ORDER BY \"true\""),
+            0
+        );
+        assert_eq!(quoted_count("SELECT id FROM t WHERE \"true\""), 1);
+        assert_eq!(
+            quoted_count("SELECT id FROM t WHERE a = 'x' AND (\"false\") OR x"),
+            1
+        );
+        // CTE・サブクエリ本文末尾の述語葉は、閉じ括弧の外側が `SELECT` 等でも葉位置のまま。
+        assert_eq!(
+            quoted_count("WITH q AS (SELECT id FROM t WHERE \"true\") SELECT id FROM q LIMIT 10"),
+            1
+        );
+        // 葉自身を包む括弧グループの外側が比較演算子なら値式。
+        assert_eq!(quoted_count("SELECT id FROM t WHERE (\"true\") > 0"), 0);
+    }
+
+    /// マーカー付き本文は未引用語を昇格しない（新版の真偽リテラル）。マーカーなしは旧列述語。
+    #[test]
+    fn stored_body_marker_distinguishes_literal_from_legacy_column() {
+        let body = "SELECT id FROM t WHERE false";
+        let legacy = tokenize_stored_view_body(body).expect("tokenize");
+        assert!(matches!(legacy.last(), Some(Token::QuotedBoolWord(_))));
+        let marked = format!("{STORED_BODY_BOOL_LITERAL_MARKER}{body}");
+        let new = tokenize_stored_view_body(&marked).expect("tokenize");
+        assert!(matches!(new.last(), Some(Token::Ident(_))));
+        assert!(stored_body_needs_bool_literal_marker(&new));
+        assert!(!stored_body_needs_bool_literal_marker(
+            &tokenize("SELECT id FROM t WHERE flag = true").expect("tokenize")
+        ));
     }
 }
