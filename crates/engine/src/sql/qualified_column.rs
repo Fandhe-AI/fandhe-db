@@ -97,8 +97,10 @@ pub(crate) fn normalize_single_table_qualifiers(
             let buf = out.get_or_insert_with(|| tokens.to_vec());
             if let Some(slot) = buf.get_mut(i) {
                 // `x.true`／`x.false` は列参照であり真偽リテラルではない。WHERE の述語葉位置では
-                // 未引用 `Ident` だと定数畳み込みされるため、引用付き相当の `QuotedBoolWord` を
-                // 使う（PR #2309 指摘）。それ以外の位置は従来どおり `Ident`。
+                // 引用付き相当の `QuotedBoolWord` にして列述語として扱う（PR #2309 指摘）。
+                // それ以外の位置（比較右辺・投影・ORDER BY 等）で `Ident("true")` に落とすと
+                // 後段が真偽リテラル扱い（`flag = x.true` が定数比較化）するため、fail-closed で
+                // 明示拒否する（列比較は未対応）。
                 let is_bool_word =
                     name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false");
                 let leaf = is_bool_word
@@ -107,6 +109,11 @@ pub(crate) fn normalize_single_table_qualifiers(
                             .any(|t| matches!(t, Token::Keyword(Keyword::Where)))
                     })
                     && quoted_bool_word_in_leaf_position(tokens, i);
+                if is_bool_word && !leaf {
+                    return Err(SqlSurfaceError::unsupported(
+                        "qualified boolean-word column reference is only supported as a WHERE predicate",
+                    ));
+                }
                 *slot = if leaf {
                     Token::QuotedBoolWord(name.clone())
                 } else {
@@ -408,11 +415,16 @@ mod tests {
                 "{w}"
             );
         }
-        let toks = tokenize("SELECT x.true FROM docs x LIMIT 1").expect("lex");
-        let n = normalize_single_table_qualifiers(&toks).expect("ok");
-        assert!(n
-            .iter()
-            .any(|t| matches!(t, Token::Ident(s) if s == "true")));
+        // 葉以外（比較右辺・投影・ORDER BY）は誤解釈を避けるため拒否する。
+        for sql in [
+            "SELECT id FROM docs x WHERE flag = x.true LIMIT 10",
+            "SELECT id FROM docs x WHERE flag = x.false LIMIT 10",
+            "SELECT x.true FROM docs x LIMIT 1",
+            "SELECT id FROM docs x ORDER BY x.false LIMIT 1",
+        ] {
+            let toks = tokenize(sql).expect("lex");
+            assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
+        }
     }
 
     #[test]
