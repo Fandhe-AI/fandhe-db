@@ -518,6 +518,7 @@ pub(crate) fn bind_integer_literal(
             },
         },
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Vector(_)
         | ColumnType::Real
         | ColumnType::Double
@@ -627,6 +628,7 @@ pub(crate) fn bind_datetime_literal(
             }
         },
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Vector(_)
@@ -969,6 +971,7 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .find_map(|(idx, c)| match &c.ty {
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
+            | ColumnType::Varchar
             | ColumnType::Integer
             | ColumnType::BigInt
             | ColumnType::Real
@@ -1017,7 +1020,7 @@ pub(crate) fn text_column_index(
                 .get(idx)
                 .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
             match &column.ty {
-                ColumnType::Text => Ok(idx),
+                ColumnType::Text | ColumnType::Varchar => Ok(idx),
                 ColumnType::Vector(_)
                 | ColumnType::Integer
                 | ColumnType::BigInt
@@ -1639,7 +1642,7 @@ fn text_range_compare_as_expr(
     let is_text = schema
         .columns
         .iter()
-        .any(|c| &c.name == column && matches!(c.ty, ColumnType::Text));
+        .any(|c| &c.name == column && c.ty.is_text_like());
     if !is_text {
         return None;
     }
@@ -2730,11 +2733,11 @@ fn bind_insert_row(
                     "column {name:?} expects a vector literal, got a non-vector literal"
                 )))
             }
-            (ColumnType::Text, InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
             (
-                ColumnType::Text,
+                ColumnType::Text | ColumnType::Varchar,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -2937,6 +2940,7 @@ pub(crate) fn bind_json_literal(
             crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
         }
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Vector(_)
@@ -3139,11 +3143,11 @@ fn bind_set_assignments(
                     "column {name:?} is a VECTOR column and cannot be set to NULL"
                 )))
             }
-            (ColumnType::Text, InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
             (
-                ColumnType::Text,
+                ColumnType::Text | ColumnType::Varchar,
                 InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_),
             ) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
@@ -4262,7 +4266,7 @@ fn bind_upsert_assignments(
                 let src_column = schema.columns.get(src_idx).ok_or_else(|| {
                     SqlSurfaceError::invalid_input(format!("unknown column: {src}"))
                 })?;
-                if src_column.ty != column.ty {
+                if !src_column.ty.same_value_domain(&column.ty) {
                     return Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} and EXCLUDED.{src} have mismatched types"
                     )));
@@ -4282,10 +4286,10 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a vector literal, got a non-vector literal"
                         )))
                     }
-                    (ColumnType::Text, InsertLiteral::String(s)) => {
+                    (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                         crate::row_codec::Value::Text(s.clone())
                     }
-                    (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
+                    (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
                         return Err(SqlSurfaceError::invalid_input(format!(
                             "column {name:?} expects a text literal, got a non-text literal"
                         )))
@@ -4449,6 +4453,8 @@ fn bind_file_insert(
         .iter()
         .position(|c| c.name == "body")
         .ok_or_else(|| SqlSurfaceError::invalid_input("table has no body column"))?;
+    // ファイル形式 INSERT の `path`／`body` は documents テーブルの構造契約（TASK-109・PLAN-5）
+    // のため TEXT 限定。VARCHAR は意図的に非対象（Issue #2305）。
     match schema.columns.get(path_column_index) {
         Some(c) if matches!(c.ty, ColumnType::Text) => {}
         _ => return Err(SqlSurfaceError::invalid_input("path column must be Text")),
@@ -4475,10 +4481,10 @@ fn bind_file_insert(
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
         let value = match (&column.ty, literal) {
-            (ColumnType::Text, InsertLiteral::String(s)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::String(s)) => {
                 crate::row_codec::Value::Text(s.clone())
             }
-            (ColumnType::Text, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Number(_) | InsertLiteral::Bool(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a non-text literal"
                 )))
@@ -4486,7 +4492,7 @@ fn bind_file_insert(
             // `InsertLiteral::Vector`（Issue #896 レビュー指摘・PR #1038）は
             // NoSQL 表層専用であり、ファイル形 `INSERT` の VALUES 構文からは
             // 構築されない到達不能パス（match の網羅性のためだけの分岐）。
-            (ColumnType::Text, InsertLiteral::Vector(_)) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Vector(_)) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?} expects a text literal, got a vector literal"
                 )))
@@ -4495,10 +4501,10 @@ fn bind_file_insert(
             // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
             // 網羅性のためだけの分岐）。到達した場合も明示 NULL の確定契約
             // （TABLE-16。nullable なら NULL・非 nullable なら `23502`）へ倒す。
-            (ColumnType::Text, InsertLiteral::Null) if column.nullable => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Null) if column.nullable => {
                 crate::row_codec::Value::Null
             }
-            (ColumnType::Text, InsertLiteral::Null) => {
+            (ColumnType::Text | ColumnType::Varchar, InsertLiteral::Null) => {
                 return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
@@ -5362,12 +5368,15 @@ fn resolve_aggregate_input(
                 .find(|(_, c)| &c.name == name)
             {
                 return match (&column.ty, func) {
-                    (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
-                        Err(SqlSurfaceError::undefined_function(format!(
-                            "column {name:?} is TEXT and cannot be used with SUM/AVG"
-                        )))
+                    (
+                        ColumnType::Text | ColumnType::Varchar,
+                        AggregateFunc::Sum | AggregateFunc::Avg,
+                    ) => Err(SqlSurfaceError::undefined_function(format!(
+                        "column {name:?} is TEXT and cannot be used with SUM/AVG"
+                    ))),
+                    (ColumnType::Text | ColumnType::Varchar, _) => {
+                        Ok(AggregateInput::TextColumn(index))
                     }
-                    (ColumnType::Text, _) => Ok(AggregateInput::TextColumn(index)),
                     (ColumnType::Vector(_), AggregateFunc::Count) => {
                         Ok(AggregateInput::VectorColumnPresence)
                     }
@@ -5561,7 +5570,7 @@ fn resolve_count_distinct_input(
                 .find(|(_, c)| &c.name == name)
             {
                 return match &column.ty {
-                    ColumnType::Text => Ok(AggregateInput::TextColumn(index)),
+                    ColumnType::Text | ColumnType::Varchar => Ok(AggregateInput::TextColumn(index)),
                     ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
                     ))),
@@ -5882,7 +5891,7 @@ pub(crate) struct BoundOrderKey {
 /// SQL-25 (c) で `VECTOR` への `DISTINCT` を `22000` とするのと同じ判断）。
 fn resolve_order_kind(ty: &ColumnType) -> Option<OrderKind> {
     match ty {
-        ColumnType::Text => Some(OrderKind::Bytes),
+        ColumnType::Text | ColumnType::Varchar => Some(OrderKind::Bytes),
         ColumnType::Integer | ColumnType::BigInt | ColumnType::Date | ColumnType::Timestamp => {
             Some(OrderKind::SignedInt)
         }
@@ -6202,7 +6211,7 @@ fn resolve_window_key(name: &str, schema: &TableSchema) -> Result<WindowKeyRef, 
         .find(|(_, c)| c.name == name)
     {
         let kind = match &column.ty {
-            ColumnType::Text => WindowKeyKind::Text,
+            ColumnType::Text | ColumnType::Varchar => WindowKeyKind::Text,
             ColumnType::Integer => WindowKeyKind::Integer,
             ColumnType::BigInt => WindowKeyKind::BigInt,
             ColumnType::Real => WindowKeyKind::Real,

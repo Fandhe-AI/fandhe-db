@@ -501,7 +501,7 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
             ColumnMeta::Id => int_kind(effective_oid),
             ColumnMeta::Computed { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
-                ColumnType::Text => text_like(),
+                ColumnType::Text | ColumnType::Varchar => text_like(),
                 ColumnType::Integer | ColumnType::BigInt => int_kind(effective_oid),
                 ColumnType::Real => only(700, BinaryParam::Float4),
                 ColumnType::Double => only(701, BinaryParam::Float8),

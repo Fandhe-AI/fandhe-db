@@ -222,6 +222,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                     match &column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
                         ColumnType::Text
+                        | ColumnType::Varchar
                         | ColumnType::Integer
                         | ColumnType::BigInt
                         | ColumnType::Real
@@ -652,7 +653,7 @@ fn build_projected_cells(
                             )?));
                         }
                     }
-                    ColumnType::Text => match scanned.get(*index) {
+                    ColumnType::Text | ColumnType::Varchar => match scanned.get(*index) {
                         Some(Some(row_codec::ScalarRef::Text(t))) => cells.push(Cell::Text(
                             try_alloc_text_for_budget(t, byte_budget, max_result_bytes)?,
                         )),

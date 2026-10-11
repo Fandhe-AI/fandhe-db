@@ -18,6 +18,8 @@
 //!   同一であり、`numeric` として公告することで値域制限なく全 `u64` 値を
 //!   そのまま送出できる
 //! - `ColumnMeta::Scalar{ty: Text}` → `text`（OID 25, typlen -1）
+//! - `ColumnMeta::Scalar{ty: Varchar}` → `varchar`（OID 1043, typlen -1。型修飾子は
+//!   常に -1。TABLE-31・Issue #2305）
 //! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式。
 //!   `VECTOR` 独自のバイナリ表現は定義しないため引き続き text 固定・受入基準 3）
 //! - `ColumnMeta::Scalar{ty: Boolean}` → `bool`（OID 16, typlen 1。値は `t`/`f`。
@@ -324,6 +326,10 @@ wire_type_enum! {
         /// 専用 OID を持たない型はすべてここへ写像する（WIRE-13・TASK-200・
         /// Issue #895 の据え置き判断）。
         Text,
+        /// `ColumnMeta::Scalar{ty: Varchar}`（長さなし `VARCHAR`／`CHARACTER VARYING`。
+        /// TABLE-31・Issue #2305）。値表現は `Text` と同一（UTF-8 恒等のバイナリ送出を含む）で、
+        /// 公告する OID（1043）と型名（`varchar`）だけが異なる。
+        Varchar,
         /// `ColumnMeta::Scalar{ty: Integer}`（`INTEGER`。TABLE-13・TASK-196・
         /// Issue #881・#903 レビュー指摘）。`i32` 全域を表現する。
         Int4,
@@ -371,6 +377,7 @@ impl WireType {
         match self {
             WireType::Numeric => 1700,
             WireType::Text => 25,
+            WireType::Varchar => 1043,
             WireType::Int4 => 23,
             WireType::Int8 => 20,
             WireType::Bool => 16,
@@ -390,6 +397,7 @@ impl WireType {
         match self {
             WireType::Numeric
             | WireType::Text
+            | WireType::Varchar
             | WireType::Bytea
             | WireType::Json
             | WireType::Jsonb => -1,
@@ -406,6 +414,7 @@ impl WireType {
         match self {
             WireType::Numeric => "numeric",
             WireType::Text => "text",
+            WireType::Varchar => "varchar",
             WireType::Int4 => "int4",
             WireType::Int8 => "int8",
             WireType::Bool => "bool",
@@ -444,7 +453,7 @@ impl WireType {
             // `Computed` は公告が text でも本来の値がベクトル／実行時型で
             // あるため、型そのものの対応可否とは別に列種別で判定する
             // （[`column_binary_support`] 参照）。
-            WireType::Text => true,
+            WireType::Text | WireType::Varchar => true,
             // 数値・真偽値・bytea・uuid は PostgreSQL の send 形式（ネット
             // ワークバイトオーダー）でバイナリ対応する（WIRE-14・TASK-218・
             // Issue #1172）。DataRow への結線は `encode_binary_cell`。
@@ -488,6 +497,7 @@ fn scalar_type_binary_support(ty: &engine::catalog::ColumnType) -> bool {
     use engine::catalog::ColumnType;
     match ty {
         ColumnType::Text
+        | ColumnType::Varchar
         | ColumnType::Integer
         | ColumnType::BigInt
         | ColumnType::Boolean
@@ -545,6 +555,7 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
         // ドキュメント参照）。`ARRAY`・`ENUM` は専用 OID を持たない据え置き
         // 判断のため引き続き `text` を公告する。`VECTOR` も同様。
         engine::catalog::ColumnType::Text => WireType::Text,
+        engine::catalog::ColumnType::Varchar => WireType::Varchar,
         engine::catalog::ColumnType::Vector(_) => WireType::Text,
         engine::catalog::ColumnType::Boolean => WireType::Bool,
         engine::catalog::ColumnType::Integer => WireType::Int4,
@@ -930,7 +941,9 @@ fn encode_binary_cell(
         }
     };
     match (wire_type, cell) {
-        (WireType::Text, Cell::Text(s)) => push_len_prefixed(out, binary::text(s)),
+        (WireType::Text | WireType::Varchar, Cell::Text(s)) => {
+            push_len_prefixed(out, binary::text(s))
+        }
         (WireType::Int4, Cell::SignedInteger(v)) => {
             let v = i32::try_from(*v).map_err(|_| EncodeError)?;
             push_fixed(out, wire_type, &binary::int4(v))
@@ -1279,6 +1292,7 @@ mod tests {
             (Some(ColumnType::Double), 701, 8),
             (Some(ColumnType::Boolean), 16, 1),
             (Some(ColumnType::Text), 25, -1),
+            (Some(ColumnType::Varchar), 1043, -1),
             (Some(ColumnType::Date), 1082, 4),
             (Some(ColumnType::Timestamp), 1114, 8),
             (
@@ -2181,16 +2195,16 @@ mod tests {
         assert_eq!(sorted_names.len(), names.len(), "型名が重複している");
     }
 
-    /// `WireType::ALL` の要素数が [`WireType`] の variant 数（13）と一致する
+    /// `WireType::ALL` の要素数が [`WireType`] の variant 数（14）と一致する
     /// ことを固定する（実測値の回帰検知が目的。`ALL` 自体は
     /// [`wire_type_enum!`] マクロが enum 定義と同一の variant トークン列から
     /// 生成するため、`ALL` への追加漏れは PR #1037 codex-review 指摘の是正で
-    /// 構造的に発生し得なくなった。このテストは「13 個という現在の想定数」
+    /// 構造的に発生し得なくなった。このテストは「14 個という現在の想定数」
     /// が変わったことを検知する回帰テストであり、`ALL` の網羅性そのものの
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 13);
+        assert_eq!(WireType::ALL.len(), 14);
     }
 
     /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
@@ -2199,9 +2213,10 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 13] = [
+        let expected: [(WireType, i32, i16, &str); 14] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
+            (WireType::Varchar, 1043, -1, "varchar"),
             (WireType::Int4, 23, 4, "int4"),
             (WireType::Int8, 20, 8, "int8"),
             (WireType::Bool, 16, 1, "bool"),
@@ -2222,10 +2237,10 @@ mod tests {
     }
 
     /// 未知の OID は fail-closed に `None` を返す（`0`・負値・PostgreSQL の
-    /// 他の組み込み型〔`varchar` = 1043〕・`i32::MAX` を確認）。
+    /// 他の組み込み型〔`bpchar` = 1042〕・`i32::MAX` を確認）。
     #[test]
     fn from_oid_unknown_is_none() {
-        for oid in [0, -1, 1043, i32::MAX] {
+        for oid in [0, -1, 1042, i32::MAX] {
             assert_eq!(WireType::from_oid(oid), None, "oid={oid}");
         }
     }
@@ -2602,6 +2617,20 @@ mod tests {
         assert_eq!(out, b"KEEP");
     }
 
+    /// `Varchar` 列のバイナリ送出は `Text` と同一バイト列（UTF-8 恒等。Issue #2305）。
+    #[test]
+    fn varchar_binary_encoding_matches_text() {
+        use engine::catalog::ColumnType as T;
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        one_computed_binary(T::Text, Cell::Text("héllo".to_string()), &mut a).unwrap();
+        one_computed_binary(T::Varchar, Cell::Text("héllo".to_string()), &mut b).unwrap();
+        assert_eq!(a, b);
+        let mut out = b"KEEP".to_vec();
+        assert!(one_computed_binary(T::Varchar, Cell::SignedInteger(1), &mut out).is_err());
+        assert_eq!(out, b"KEEP");
+    }
+
     #[test]
     fn binary_typed_mixed_formats_apply_per_column() {
         use engine::catalog::ColumnType as T;
@@ -2660,6 +2689,7 @@ mod tests {
             let expected = matches!(
                 t,
                 WireType::Text
+                    | WireType::Varchar
                     | WireType::Int4
                     | WireType::Int8
                     | WireType::Bool

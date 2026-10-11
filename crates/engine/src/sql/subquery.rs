@@ -994,7 +994,9 @@ impl SubqueryValueFamily {
 /// 列型から値族を判定する。対応外（`VECTOR`・配列・JSON 等）は `None`。
 fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
     match ty {
-        ColumnType::Text | ColumnType::Enum(_) => Some(SubqueryValueFamily::Text),
+        ColumnType::Text | ColumnType::Varchar | ColumnType::Enum(_) => {
+            Some(SubqueryValueFamily::Text)
+        }
         ColumnType::Boolean => Some(SubqueryValueFamily::Boolean),
         ColumnType::Date => Some(SubqueryValueFamily::Date),
         ColumnType::Timestamp => Some(SubqueryValueFamily::Timestamp),
