@@ -43,9 +43,9 @@ pub(crate) fn projected_columns(
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
-            ProjectedColumn::Computed { name, ty, .. } => {
-                crate::sql::exec::computed_column_meta(name, *ty)
-            }
+            ProjectedColumn::Computed {
+                name, result_ty, ..
+            } => crate::sql::exec::computed_column_meta(name, result_ty),
         })
         .collect()
 }

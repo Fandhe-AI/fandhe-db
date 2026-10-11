@@ -45,6 +45,11 @@ const MAX_ARRAY_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// **Issue #1173 で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant に
 /// 束縛済み式の静的型 `ty` を追加した（結果列メタの型 OID の根拠）。
+///
+/// **Issue #1539（SQL-42）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant に
+/// 結果列型 `result_ty`（`Integer`／`BigInt`／`Real` など。`None` は型を公告できない
+/// VECTOR）を追加した。`ty` は評価器の静的型のまま、RowDescription の型 OID とセル
+/// 表現は `result_ty` から決める（式投影の整数算術を PostgreSQL と同じ int4／int8 にする）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectedColumn {
     Id,
@@ -57,6 +62,7 @@ pub enum ProjectedColumn {
         name: String,
         expr: crate::sql::udf_call::BoundExpr,
         ty: crate::sql::udf_call::ExprType,
+        result_ty: Option<crate::catalog::ColumnType>,
     },
 }
 
@@ -1274,9 +1280,13 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
         Expr::Case { .. } => "case".to_string(),
         Expr::Coalesce(_) => "coalesce".to_string(),
         Expr::NullIf(..) => "nullif".to_string(),
-        _ => "expr".to_string(),
+        // PostgreSQL の既定列名（Issue #1539・SQL-42。従来は `expr`）。
+        _ => ANONYMOUS_COLUMN_NAME.to_string(),
     }
 }
+
+/// 別名・既定名を持たない式項目の列名（PostgreSQL 互換。`sql::const_select` と共有）。
+pub(crate) const ANONYMOUS_COLUMN_NAME: &str = "?column?";
 
 /// SELECT リストの許可形状（[`Projection`]）を束縛する共通ヘルパー（TASK-77・
 /// SQL-5 で `bind_in_session` から切り出した。`USING PLAN` 経路（`sql::using_plan`）も
@@ -1350,13 +1360,18 @@ pub fn bind_projection(
                         )));
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let (bound, ty) =
-                            crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                        let (bound, ty, result_ty) = crate::sql::udf_call::bind_projection_expr(
+                            expr,
+                            schema,
+                            udfs,
+                            node_budget,
+                        )?;
                         let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
                         cols.push(ProjectedColumn::Computed {
                             name,
                             expr: bound,
                             ty,
+                            result_ty,
                         });
                     }
                 }

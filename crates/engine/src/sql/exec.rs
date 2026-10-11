@@ -260,27 +260,53 @@ pub enum ColumnMeta {
     },
 }
 
-/// 束縛済み式の静的型から式列の [`ColumnMeta`] を作る（Issue #1173）。
+/// 式列の [`ColumnMeta`] を作る（Issue #1173・#1539）。
 ///
 /// 通常 SELECT 投影（`execute_statement`）・スキャン投影（`sql::scan`）・
-/// Describe（`sql::describe::projected_columns`）が共有する唯一の写像。式列の
-/// 実行時セルは `Cell::Float`（`Scalar`）・`Cell::Bool`・`Cell::Text`・
-/// `Cell::Date`・`Cell::Timestamp` になるため、それぞれ `DOUBLE PRECISION`・
-/// `BOOLEAN`・`TEXT`・`DATE`・`TIMESTAMP` として公告する。`Vector` 式は
-/// 静的な `ColumnType` を持たない（`VECTOR(N)` の次元が式から決まらない）ため
-/// `None`（wire では text フォールバック）にする。
-pub(crate) fn computed_column_meta(name: &str, ty: udf_call::ExprType) -> ColumnMeta {
-    let ty = match ty {
-        udf_call::ExprType::Scalar => Some(ColumnType::Double),
-        udf_call::ExprType::Bool => Some(ColumnType::Boolean),
-        udf_call::ExprType::Text => Some(ColumnType::Text),
-        udf_call::ExprType::Date => Some(ColumnType::Date),
-        udf_call::ExprType::Timestamp => Some(ColumnType::Timestamp),
-        udf_call::ExprType::Vector => None,
-    };
+/// Describe（`sql::describe::projected_columns`）が共有する唯一の写像。型は束縛時に
+/// 確定した結果列型 `result_ty`（[`crate::sql::udf_call::expr_result_column_type`]。
+/// 整数算術は `Integer`／`BigInt`、単精度は `Real`、それ以外は `Double`・`Boolean`・
+/// `Text`・`Date`・`Timestamp`）をそのまま公告する。`None`（`Vector` 式）は静的な
+/// `ColumnType` を持たない（`VECTOR(N)` の次元が式から決まらない）ため wire では text
+/// フォールバックになる。実行時セルは [`scalar_cell_for`] が同じ `result_ty` から作る。
+pub(crate) fn computed_column_meta(name: &str, result_ty: &Option<ColumnType>) -> ColumnMeta {
     ColumnMeta::Computed {
         name: name.to_string(),
-        ty,
+        ty: result_ty.clone(),
+    }
+}
+
+/// 式のスカラー評価値（f64）を結果列型に合わせたセルへ変換する（Issue #1539・SQL-42）。
+/// `Integer`／`BigInt` は整数値を `Cell::SignedInteger` に、それ以外は従来どおり
+/// `Cell::Float`。整数列型で値が整数でない・範囲外なのは束縛段の不変条件違反なので
+/// `Internal`（fail-closed。panic しない）。通常 SELECT・スキャン・`FROM` なし SELECT の
+/// 3 経路が共有する。
+pub(crate) fn scalar_cell_for(
+    v: f64,
+    result_ty: Option<&ColumnType>,
+) -> Result<Cell, SqlSurfaceError> {
+    const EXACT_MAX: f64 = 9_007_199_254_740_992.0; // 2^53
+    let invariant = |detail: &str| SqlSurfaceError::Internal {
+        detail: detail.to_string(),
+    };
+    match result_ty {
+        Some(ColumnType::Integer) => {
+            if v.is_finite() && v.fract() == 0.0 && v.abs() <= f64::from(i32::MAX) + 1.0 {
+                let i = i32::try_from(v as i64)
+                    .map_err(|_| invariant("integer projection value is out of range"))?;
+                Ok(Cell::SignedInteger(i64::from(i)))
+            } else {
+                Err(invariant("integer projection value is not an int4"))
+            }
+        }
+        Some(ColumnType::BigInt) => {
+            if v.is_finite() && v.fract() == 0.0 && v.abs() <= EXACT_MAX {
+                Ok(Cell::SignedInteger(v as i64))
+            } else {
+                Err(invariant("bigint projection value is not an exact int8"))
+            }
+        }
+        _ => Ok(Cell::Float(v)),
     }
 }
 
@@ -2537,7 +2563,9 @@ pub(crate) fn execute_statement_with_cache(
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColumnType::Text),
             },
-            ProjectedColumn::Computed { name, ty, .. } => computed_column_meta(name, *ty),
+            ProjectedColumn::Computed {
+                name, result_ty, ..
+            } => computed_column_meta(name, result_ty),
         })
         .collect();
 
@@ -3265,7 +3293,7 @@ fn project_rows(
                         },
                     }
                 }
-                ProjectedColumn::Computed { .. } => {
+                ProjectedColumn::Computed { result_ty, .. } => {
                     // TASK-79（SQL-9）: 結果列位置の式項目。候補選択と同一スナップショット
                     // の `id`・embedding で評価する（投影段は再取得を行わない既存契約と
                     // 同方針）。評価エラーはクエリ全体の失敗として fail-closed に伝播する
@@ -3280,7 +3308,9 @@ fn project_rows(
                                 .to_string(),
                         })?;
                     match program.eval(id, embedding, &row_scalars, &mut expr_scratch)? {
-                        udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        udf_call::ExprValue::Scalar(v) => {
+                            cells.push(scalar_cell_for(v, result_ty.as_ref())?)
+                        }
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
                             // だけになった（確保ゼロ）ため、応答行として行データより

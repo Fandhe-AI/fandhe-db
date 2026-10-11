@@ -830,7 +830,7 @@ fn build_projected_cells(
                     },
                 }
             }
-            ProjectedColumn::Computed { .. } => {
+            ProjectedColumn::Computed { result_ty, .. } => {
                 let program = computed_programs
                     .get(col_idx)
                     .and_then(|p| p.as_ref())
@@ -851,7 +851,9 @@ fn build_projected_cells(
                     &[]
                 };
                 match program.eval(id, embedding_for_eval, scanned, proj_expr_scratch)? {
-                    ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                    ExprValue::Scalar(v) => {
+                        cells.push(crate::sql::exec::scalar_cell_for(v, result_ty.as_ref())?)
+                    }
                     ExprValue::Vector(v) => {
                         // codex-review P1 指摘対応: `Computed` 列のベクトル
                         // 結果も `VECTOR` 列直接投影と同じ累計予算
@@ -1021,9 +1023,9 @@ pub(crate) fn execute_scan_with_budget(
                     ty: column.ty.clone(),
                 }
             }
-            ProjectedColumn::Computed { name, ty, .. } => {
-                crate::sql::exec::computed_column_meta(name, *ty)
-            }
+            ProjectedColumn::Computed {
+                name, result_ty, ..
+            } => crate::sql::exec::computed_column_meta(name, result_ty),
         });
     }
 
@@ -2521,6 +2523,7 @@ mod tests {
                         args: vec![udf_call::BoundExpr::VectorRef],
                     },
                     ty: udf_call::ExprType::Scalar,
+                    result_ty: Some(ColumnType::Double),
                 },
             ],
             metadata_filters: Vec::new(),
@@ -2737,6 +2740,7 @@ mod tests {
                     name: "n".to_string(),
                     expr,
                     ty: udf_call::ExprType::Scalar,
+                    result_ty: Some(ColumnType::Double),
                 },
             ],
             metadata_filters: Vec::new(),
@@ -2794,6 +2798,7 @@ mod tests {
                     name: "v".to_string(),
                     expr,
                     ty: udf_call::ExprType::Vector,
+                    result_ty: None,
                 },
             ],
             metadata_filters: Vec::new(),
