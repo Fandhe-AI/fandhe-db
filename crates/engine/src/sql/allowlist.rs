@@ -10,7 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
-use crate::catalog::{ColumnDef, ColumnType};
+use crate::catalog::{ColumnDef, ColumnType, MAX_COLUMN_COUNT};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
@@ -32,27 +32,11 @@ use crate::sql::where_negation::negate_conjunction;
 /// （TASK-152・ERR-2）。
 const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 
-/// INSERT の列リスト・VALUES リストがそれぞれ持てる要素数の上限（SQL-10、TASK-80）。
-/// 無制限 `Vec` 確保を避ける（`.claude/rules/security.md`「不安全な設計｜無制限
-/// リソース確保（DoS）」対応）。`catalog::MAX_COLUMN_COUNT` と同値を採用する。
-const MAX_INSERT_COLUMNS: usize = 256;
-
-/// `CREATE INDEX` の列リストが持てる要素数の上限（TASK-206・INDEX-7、Issue #908）。
-/// `MAX_INSERT_COLUMNS` と同値を採用する（無制限 `Vec` 確保を避ける。
-/// `.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応）。
-pub(crate) const MAX_INDEX_DDL_COLUMNS: usize = 256;
-
 /// サブクエリ（`IN (SELECT ...)`・`EXISTS (SELECT ...)`）のネスト深さ上限
 /// （Issue #927・SQL-29 (a)・TASK-213。実装既定値）。`Parser::subquery_ctx` の
 /// 深さがこれを超える箇所を構文解析段で `54000` へ落とし、`sql::subquery` の
 /// 解決（再帰的な内側実行）がスタック・実行コストとも定数段に収まるようにする。
 pub(crate) const MAX_SUBQUERY_DEPTH: usize = 4;
-
-/// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）の列リストが持てる列数の上限。
-/// `catalog::MAX_COLUMN_COUNT` と同値を採用する（`MAX_INSERT_COLUMNS` と同じ
-/// 「無制限 `Vec` 確保を避ける」設計方針。列を `Vec` へ push する**前**に判定し、
-/// アロケーション前の上限検証（`.claude/rules/security.md`）を満たす）。
-const MAX_CREATE_TABLE_COLUMNS: usize = 256;
 
 /// `CREATE TABLE` の列定義が受理する列型キーワード（[`Parser::parse_create_table_column`]
 /// が照合する語と一致させる契約。型を追加する際はここも同時に拡張する）。
@@ -100,7 +84,7 @@ const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 /// 定数。Issue #945）と二重定義しないよう、同じ値をそちらから参照する。
 pub(crate) const MAX_IN_LIST_ITEMS: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS;
 
-/// UPDATE の SET 句が持てる代入要素数の上限（SQL-17、TASK-191）。`MAX_INSERT_COLUMNS`
+/// UPDATE の SET 句が持てる代入要素数の上限（SQL-17、TASK-191）。`MAX_COLUMN_COUNT`
 /// とは独立した定数にする（UPDATE は部分更新であり INSERT の列数上限とは意味論が
 /// 異なるため、将来どちらかだけを見直す際に互いへ波及しないようにする）。無制限
 /// `Vec` 確保を避ける（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
@@ -5897,7 +5881,7 @@ impl<'a> Parser<'a> {
         let mut columns = vec![self.expect_ident()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            if columns.len() >= MAX_INSERT_COLUMNS {
+            if columns.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many INSERT columns"));
             }
             columns.push(self.expect_ident()?);
@@ -6059,7 +6043,7 @@ impl<'a> Parser<'a> {
         let mut values = vec![self.expect_literal()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            if values.len() >= MAX_INSERT_COLUMNS {
+            if values.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many INSERT values"));
             }
             values.push(self.expect_literal()?);
@@ -6589,7 +6573,7 @@ impl<'a> Parser<'a> {
     /// `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]`（SQL-23・
     /// TASK-85、Issue #899）の許可形状。カタログ照会は行わない（`sql::ddl`
     /// モジュールドキュメント・[`ValidatedCreateTable`] 参照）。列数の上限判定
-    /// （`MAX_CREATE_TABLE_COLUMNS`）は、列定義 1 個を実際にパースする直前に
+    /// （`MAX_COLUMN_COUNT`）は、列定義 1 個を実際にパースする直前に
     /// 「既に確定した列数」だけで行う。表制約（`PRIMARY KEY (...)`・
     /// `UNIQUE (...)`）は列を追加しないため判定の対象外で、制約が列リスト中の
     /// どこ（先頭・中間・末尾）にあっても判定結果が変わらない（位置非依存）。
@@ -6737,7 +6721,7 @@ impl<'a> Parser<'a> {
             } else {
                 // 列定義を 1 つ確定させる前に、確定済みの列数だけで上限を判定する
                 // （位置非依存。`parse_create_table` のドキュメント参照）。
-                if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
+                if columns.len() >= MAX_COLUMN_COUNT {
                     return Err(SqlSurfaceError::payload_too_large(
                         "too many columns in CREATE TABLE",
                     ));
@@ -8480,7 +8464,7 @@ pub(crate) fn validate_create_index_tokens(
     let mut columns = vec![parse_index_column(&mut p)?];
     while matches!(p.peek(), Some(Token::Punct(','))) {
         p.advance();
-        if columns.len() >= MAX_INDEX_DDL_COLUMNS {
+        if columns.len() >= MAX_COLUMN_COUNT {
             return Err(SqlSurfaceError::payload_too_large("too many index columns"));
         }
         columns.push(parse_index_column(&mut p)?);
@@ -12048,7 +12032,7 @@ fn validate_copy_from_tokens(
     let mut columns = vec![p.expect_ident()?];
     while matches!(p.peek(), Some(Token::Punct(','))) {
         p.advance();
-        if columns.len() >= MAX_INSERT_COLUMNS {
+        if columns.len() >= MAX_COLUMN_COUNT {
             return Err(SqlSurfaceError::unsupported("too many COPY columns"));
         }
         columns.push(p.expect_ident()?);
@@ -15414,10 +15398,8 @@ mod tests {
     #[test]
     fn rejects_insert_exceeding_max_columns() {
         let lookup = catalog_with(&["documents"]);
-        let cols: Vec<String> = (0..MAX_INSERT_COLUMNS + 1)
-            .map(|i| format!("c{i}"))
-            .collect();
-        let vals: Vec<String> = (0..MAX_INSERT_COLUMNS + 1).map(|i| i.to_string()).collect();
+        let cols: Vec<String> = (0..MAX_COLUMN_COUNT + 1).map(|i| format!("c{i}")).collect();
+        let vals: Vec<String> = (0..MAX_COLUMN_COUNT + 1).map(|i| i.to_string()).collect();
         let sql = format!(
             "INSERT INTO documents ({}) VALUES ({}) USING OPERATION_ID 'op-0001'",
             cols.join(", "),
@@ -17432,21 +17414,21 @@ mod tests {
         assert_eq!(stmt.operation_id, None);
     }
 
-    /// PR #1044 レビュー時の境界値誤検知（ちょうど `MAX_CREATE_TABLE_COLUMNS`
+    /// PR #1044 レビュー時の境界値誤検知（ちょうど `MAX_COLUMN_COUNT`
     /// 列の `CREATE TABLE` が off-by-one で誤って `54000` 拒否されるという
     /// 懸念）に対する回帰テスト。ちょうど上限数の列は受理される。
     #[test]
     fn create_table_accepts_exactly_max_columns() {
-        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+        let cols: Vec<String> = (0..MAX_COLUMN_COUNT)
             .map(|i| format!("c{i} TEXT"))
             .collect();
         let sql = format!("CREATE TABLE t ({})", cols.join(", "));
         let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
         let result = validate_create_table_tokens(&tokens);
         match &result {
-            Ok(v) => assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS),
+            Ok(v) => assert_eq!(v.columns.len(), MAX_COLUMN_COUNT),
             Err(e) => {
-                panic!("expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns, got err: {e:?}")
+                panic!("expected ok for exactly {MAX_COLUMN_COUNT} columns, got err: {e:?}")
             }
         }
     }
@@ -17455,7 +17437,7 @@ mod tests {
     /// （上記回帰テストと対の境界値検証）。
     #[test]
     fn create_table_rejects_max_columns_plus_one() {
-        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS + 1)
+        let cols: Vec<String> = (0..MAX_COLUMN_COUNT + 1)
             .map(|i| format!("c{i} TEXT"))
             .collect();
         let sql = format!("CREATE TABLE t ({})", cols.join(", "));
@@ -17473,7 +17455,7 @@ mod tests {
     /// 場合と対称な挙動になることを固定する）。
     #[test]
     fn create_table_accepts_trailing_primary_key_constraint_at_max_columns() {
-        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+        let cols: Vec<String> = (0..MAX_COLUMN_COUNT)
             .map(|i| format!("c{i} TEXT"))
             .collect();
         let sql = format!("CREATE TABLE t ({}, PRIMARY KEY (c0))", cols.join(", "));
@@ -17481,11 +17463,11 @@ mod tests {
         let result = validate_create_table_tokens(&tokens);
         match &result {
             Ok(v) => {
-                assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+                assert_eq!(v.columns.len(), MAX_COLUMN_COUNT);
                 assert_eq!(v.primary_key, Some(vec!["c0".to_string()]));
             }
             Err(e) => panic!(
-                "expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns with trailing PRIMARY KEY, got err: {e:?}"
+                "expected ok for exactly {MAX_COLUMN_COUNT} columns with trailing PRIMARY KEY, got err: {e:?}"
             ),
         }
     }
@@ -17500,8 +17482,8 @@ mod tests {
     /// TABLE-16・TASK-204、Issue #905）。
     #[test]
     fn create_table_accepts_max_columns_with_unique_table_constraint_anywhere() {
-        let head = text_columns(0..MAX_CREATE_TABLE_COLUMNS / 2).join(", ");
-        let tail = text_columns(MAX_CREATE_TABLE_COLUMNS / 2..MAX_CREATE_TABLE_COLUMNS).join(", ");
+        let head = text_columns(0..MAX_COLUMN_COUNT / 2).join(", ");
+        let tail = text_columns(MAX_COLUMN_COUNT / 2..MAX_COLUMN_COUNT).join(", ");
         for sql in [
             format!("CREATE TABLE t (UNIQUE (c0), {head}, {tail})"),
             format!("CREATE TABLE t ({head}, UNIQUE (c0, c1), {tail})"),
@@ -17511,7 +17493,7 @@ mod tests {
             let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
             let v = validate_create_table_tokens(&tokens)
                 .unwrap_or_else(|e| panic!("expected ok for max columns + UNIQUE, got: {e:?}"));
-            assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+            assert_eq!(v.columns.len(), MAX_COLUMN_COUNT);
             assert!(!v.unique_constraints.is_empty());
         }
     }
@@ -17522,7 +17504,7 @@ mod tests {
     /// 先読みに依存した旧判定をすり抜けて 257 列を受理していた）。
     #[test]
     fn create_table_rejects_excess_column_regardless_of_unique_constraint_position() {
-        let max = MAX_CREATE_TABLE_COLUMNS;
+        let max = MAX_COLUMN_COUNT;
         let all = text_columns(0..max).join(", ");
         let head = text_columns(0..max / 2).join(", ");
         let tail = text_columns(max / 2..max).join(", ");
@@ -17963,7 +17945,7 @@ mod tests {
     /// 影響しない（ちょうど上限数の列の前後に CHECK があっても受理する）。
     #[test]
     fn create_table_check_does_not_affect_column_limit() {
-        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+        let cols: Vec<String> = (0..MAX_COLUMN_COUNT)
             .map(|i| format!("c{i} TEXT"))
             .collect();
         let sql = format!(
@@ -17971,7 +17953,7 @@ mod tests {
             cols.join(", ")
         );
         let v = parse_create_table_ok(&sql);
-        assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+        assert_eq!(v.columns.len(), MAX_COLUMN_COUNT);
         assert_eq!(v.checks.len(), 2);
     }
 
