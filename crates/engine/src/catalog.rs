@@ -1038,11 +1038,13 @@ const _: () = assert!(
 
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-/// 列数上限の唯一の定義（Issue #1518）。`pub(crate)` なのは、SQL 構文段
+/// 列数上限の唯一の定義（Issue #1518）。SQL 構文段
 /// （`sql::allowlist` の INSERT・COPY・CREATE TABLE・CREATE INDEX の列リスト上限）と
 /// EXPLAIN のビットセット長（`sql::explain`・Issue #1066）がこの値から導出・直接参照
-/// するため。別名定数やリテラルの 256 を新設しない。
-pub(crate) const MAX_COLUMN_COUNT: usize = 256;
+/// する。別名定数やリテラルの 256 を新設しない。`pub` なのは起動時設定
+/// （[`crate::schema_limits`]・Issue #1548）の範囲検証と結合テストが参照するため
+/// （設定できるのはこの値以下への引き下げだけ）。
+pub const MAX_COLUMN_COUNT: usize = 256;
 
 /// `PRIMARY KEY` に宣言できる列数の上限（TABLE-16・TASK-204、Issue #903）。
 /// PostgreSQL の索引キー列数慣習（32）に合わせた本リポの実装既定値。デコード時、
@@ -2876,6 +2878,18 @@ impl ArrayType {
 
     pub fn elem(&self) -> ArrayElemType {
         self.elem
+    }
+
+    /// 要素型・語彙を保ったまま要素数上限だけを差し替えた配列型を返す（Issue #1548。
+    /// 起動時設定 `--max-array-elements` で `[]` 省略列の上限を組み直す実行段用）。
+    /// 範囲外（`1..=MAX_ARRAY_ELEMENTS` 外）は [`Self::new`] と同じく `Err`。
+    pub fn with_max_len(&self, max_len: u32) -> Result<Self> {
+        Self::check_max_len(max_len)?;
+        Ok(Self {
+            elem: self.elem,
+            max_len,
+            enum_def: self.enum_def.clone(),
+        })
     }
 
     pub fn max_len(&self) -> u32 {
@@ -7294,7 +7308,23 @@ impl Storage {
     ///   存在しない）。将来導入する場合は補完専用の値を分離する必要がある
     ///
     /// 対象テーブル不存在・列名重複も `Err`。
-    pub fn alter_table_add_column(&self, table_name: &str, mut column: ColumnDef) -> Result<()> {
+    pub fn alter_table_add_column(&self, table_name: &str, column: ColumnDef) -> Result<()> {
+        self.alter_table_add_column_with_limit(table_name, column, MAX_COLUMN_COUNT)
+    }
+
+    /// [`Self::alter_table_add_column`] の列数上限を引数化した版（Issue #1548。起動時設定
+    /// `--max-table-columns` の注入点）。物理スロット数（生存列＋墓標）が
+    /// `max_columns.min(MAX_COLUMN_COUNT)` 以上なら、write txn 内で
+    /// [`CatalogError::TooManyColumns`] を返す（並行 ADD COLUMN による TOCTOU を避ける）。
+    /// 上限は定義が増える本操作にだけ効かせ、decode・`validate_schema` には入れない
+    /// （既存テーブルが設定値を超える列数を持っていても読み出せるようにする）。
+    pub fn alter_table_add_column_with_limit(
+        &self,
+        table_name: &str,
+        mut column: ColumnDef,
+        max_columns: usize,
+    ) -> Result<()> {
+        let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_identifier(table_name)?;
         validate_column(&column)?;
         if crate::row_codec::validate_column_default(&column).is_err() {
@@ -7362,7 +7392,7 @@ impl Storage {
             // 合算して判定する）。
             // 上限超過は `Invalid` と区別した `TooManyColumns` で返す（Issue #900。
             // SQL 表層 `ALTER TABLE ADD COLUMN` が `54000` へ写像するため）。
-            if schema.physical_slot_count() >= MAX_COLUMN_COUNT {
+            if schema.physical_slot_count() >= max_columns {
                 return Err(CatalogError::TooManyColumns {
                     count: schema.physical_slot_count().saturating_add(1),
                 });

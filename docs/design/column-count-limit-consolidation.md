@@ -34,5 +34,6 @@
 
 ## 対象外
 
-- 上限 256 自体の引き上げ
+- 上限 256 自体の引き上げ（Issue #1548 は「下げる方向だけ」を起動時に設定可能にした。
+  [schema-limits-cli.md](schema-limits-cli.md) 参照）
 - `crates/engine/tests/` の結合テスト中のリテラル（`pub(crate)` を参照できないため）
