@@ -63,10 +63,8 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 | `VECTOR` 次元 | `1..=65536` | `42601`（`catalog::validate_schema` へ委譲） |
 | 同一文内の列名重複 | — | `42701` |
 
-列数の上限（`sql::allowlist::MAX_CREATE_TABLE_COLUMNS`）は `catalog::
-MAX_COLUMN_COUNT` と同値を採用し、`MAX_INSERT_COLUMNS` と同じ「値を複製し
-コメントで対応関係を明示する」既存流儀に従う（`catalog` モジュールの可視性を
-変えない）。
+列数の上限は `catalog::MAX_COLUMN_COUNT` を直接参照する（Issue #1518 で allowlist の重複定数を統合済み。
+詳細は [column-count-limit-consolidation.md](column-count-limit-consolidation.md)）。
 
 `VECTOR` の次元は構文解析段階で `Token::Number`（文字列）を `u32` へ checked に
 parse し、オーバーフロー・小数点混入は `UnsupportedSyntax`（`42601`）へ落ちる
