@@ -18,7 +18,7 @@ fandhe-db/
 ├── CLAUDE.md / AGENTS.md          # Claude 運用方針 / レビュー観点集（ai-review の基準）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
 ├── Makefile                       # タスクランナー（make setup / make ci / docker-*）
-├── lefthook.yml                   # git hooks（rustfmt・secrets-guard・Conventional Commits・clippy/test）
+├── lefthook.yml                   # git hooks（rustfmt・secrets-guard・Conventional Commits。clippy/test は CI のみ）
 ├── Dockerfile / compose.yaml      # 環境非依存の開発コンテナ（make docker-ci）
 ├── deny.toml                      # cargo-deny 設定（make deny で有効化済み）
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
@@ -113,7 +113,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み。`make lint`／`make test`（lefthook pre-push 含む）は `--all-features` で実行するため `contrast-bench` feature 経由で usearch（optional 依存）の C++ ビルドが走る。**C++17 コンパイラが必須**（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに無い場合 `make lint`／`make test`／`make ci` が失敗する。詳細は README「回帰ベンチの Environment `bench-gate` secrets」節）
+- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築する。clippy・test は PR ごとの CI（必須チェック）が担い、git hooks では実行しない（開発速度のため。lefthook は 1 秒未満の整形・秘密情報・コミット形式の検査のみ）。手元で確かめたい場合は任意で `make ci`（CI と同等のチェック）を実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み。`make lint`／`make test` は `--all-features` で実行するため `contrast-bench` feature 経由で usearch（optional 依存）の C++ ビルドが走る。**C++17 コンパイラが必須**（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに無い場合 `make lint`／`make test`／`make ci` が失敗する。詳細は README「回帰ベンチの Environment `bench-gate` secrets」節）
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: commitlint で検証。`--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋AGENTS.md P0 観点（spec 漏えい・テナント境界・wire 入力検証）を確認

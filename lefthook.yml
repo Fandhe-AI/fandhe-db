@@ -4,7 +4,12 @@
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（TASK-66 の workspace 作成予定）の間、cargo 系ジョブはスキップする
 #   （Makefile の HAS_CARGO 判定と同一方針）
-# - 重いチェック（clippy・test）は pre-push に置き、pre-commit は整形チェックのみで軽量に保つ
+# - 開発速度を優先し、CI（.github/workflows/ci.yml の rust-ci 等）が PR ごとに実行する
+#   重いチェック（clippy・test）はフックで実行しない（pre-push は置かない）。push 前に
+#   手元で確かめたい場合は `make ci`（CI と同等のチェック）を任意で実行する
+# - フックに残すのは 1 秒未満で終わり、手元で止める意味があるものに限る:
+#   secrets-guard（資格情報をリモートへ送る前に止める。CI では手遅れ）・rustfmt-check・
+#   conventional-commits（中間コミットは PR refs に残るため、作成時点で形式を揃える）
 
 pre-commit:
   parallel: true
@@ -57,22 +62,4 @@ commit-msg:
           echo "NG: Conventional Commits 形式ではありません: $msg" >&2
           echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
           exit 1
-        fi
-
-pre-push:
-  jobs:
-    # clippy・test は CI と同一条件（Cargo.toml 未追加ならスキップ）
-    - name: clippy
-      run: |
-        if [ -f Cargo.toml ]; then
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-        else
-          echo "skip: Cargo.toml 未追加"
-        fi
-    - name: test
-      run: |
-        if [ -f Cargo.toml ]; then
-          cargo test --workspace --all-features
-        else
-          echo "skip: Cargo.toml 未追加"
         fi
