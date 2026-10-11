@@ -65,6 +65,16 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "DECIMAL",
 ];
 
+/// `raw` が `CREATE TABLE` の列型キーワード（型名エイリアス `INT`・`INT4`・`INT8`・
+/// `FLOAT4`・`FLOAT8` を含む。大小無視）かを判定する（Issue #1529・TABLE-29）。
+/// `CHECK` 制約名の衝突判定と、wire-server の NoSQL DDL が `enum_type` に予約型名を
+/// 渡させないためのガードの双方から呼ばれ、語彙のドリフトを防ぐ単一情報源となる。
+pub fn is_column_type_keyword(raw: &str) -> bool {
+    CREATE_TABLE_COLUMN_TYPE_KEYWORDS
+        .iter()
+        .any(|kw| raw.eq_ignore_ascii_case(kw))
+}
+
 /// `PRIMARY KEY (<col>[, <col>]*)` に宣言できる列数の上限（TABLE-16・
 /// TASK-204、Issue #903）。`catalog::validate_schema` が同じ上限
 /// （[`crate::catalog::MAX_PRIMARY_KEY_COLUMNS`]）で再検証するため、単一の
@@ -6896,10 +6906,7 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident()?;
         crate::catalog::validate_identifier(&name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid constraint name: {e}")))?;
-        if CREATE_TABLE_COLUMN_TYPE_KEYWORDS
-            .iter()
-            .any(|kw| name.eq_ignore_ascii_case(kw))
-        {
+        if is_column_type_keyword(&name) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "constraint name {name:?} collides with a column type keyword"
             )));
@@ -6948,10 +6955,7 @@ impl<'a> Parser<'a> {
             crate::catalog::validate_identifier(&n).map_err(|e| {
                 SqlSurfaceError::unsupported(format!("invalid constraint name: {e}"))
             })?;
-            if CREATE_TABLE_COLUMN_TYPE_KEYWORDS
-                .iter()
-                .any(|kw| n.eq_ignore_ascii_case(kw))
-            {
+            if is_column_type_keyword(&n) {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "constraint name {n:?} collides with a column type keyword"
                 )));
@@ -12479,6 +12483,23 @@ pub(crate) fn validate_update_form_tokens(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// 列型キーワード判定は型名エイリアスを含む 20 語を大小無視で認識する
+    /// （Issue #1529・TABLE-29）。
+    #[test]
+    fn column_type_keyword_covers_aliases_case_insensitively() {
+        for kw in CREATE_TABLE_COLUMN_TYPE_KEYWORDS {
+            assert!(is_column_type_keyword(kw), "{kw}");
+            assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
+        }
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 20);
+        for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int"] {
+            assert!(is_column_type_keyword(ok), "{ok}");
+        }
+        for ng in ["mood", "int2", "varchar", ""] {
+            assert!(!is_column_type_keyword(ng), "{ng}");
+        }
+    }
 
     /// `ALTER TABLE ... ADD PRIMARY KEY` の構文受理・拒否（Issue #1196・TABLE-22 (a)(d)）。
     #[test]
