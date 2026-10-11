@@ -174,7 +174,6 @@ fn rejects_runtime_and_type_errors() {
 fn unsupported_forms_stay_rejected() {
     let (core, ctx, _g) = setup();
     for sql in [
-        "SELECT (n) AS x FROM t LIMIT 10",
         "SELECT n % 2 FROM t LIMIT 10",
         "SELECT 'a' + n FROM t LIMIT 10",
         "SELECT n + FROM t LIMIT 10",

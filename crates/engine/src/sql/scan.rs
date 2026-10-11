@@ -257,7 +257,7 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                     has_scalar_reference = true;
                 }
             }
-            ProjectedColumn::Id => {}
+            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {}
         }
     }
     if !bound.metadata_filters.is_empty() {
@@ -624,7 +624,9 @@ fn build_projected_cells(
         })?;
     for (col_idx, col) in bound.projection.iter().enumerate() {
         match col {
-            ProjectedColumn::Id => cells.push(Cell::Integer(id)),
+            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
+                cells.push(Cell::Integer(id))
+            }
             ProjectedColumn::Column { index, .. } => {
                 let column =
                     schema
@@ -1010,6 +1012,7 @@ pub(crate) fn execute_scan_with_budget(
     for col in &bound.projection {
         columns.push(match col {
             ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::AliasedId { name } => crate::sql::exec::aliased_id_column_meta(name),
             ProjectedColumn::Column { index, name } => {
                 let column =
                     schema
@@ -1049,7 +1052,9 @@ pub(crate) fn execute_scan_with_budget(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Computed { expr, .. } => Some(ExprProgram::compile(expr)),
-            ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Column { .. } => None,
         })
         .collect();
 

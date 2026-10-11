@@ -276,6 +276,20 @@ pub(crate) fn computed_column_meta(name: &str, result_ty: &Option<ColumnType>) -
     }
 }
 
+/// 別名付き疑似列 `id`（`ProjectedColumn::AliasedId`。Issue #1540・SQL-42）の結果列メタ。
+/// `ColumnMeta::Id` は名前を持てないため、numeric 静的型の `Computed` に載せ替えて別名を
+/// 公告する（wire 上の型 OID は `Id` と同じ numeric。JOIN 経路の `meta_with_alias` と
+/// 同じ写像。通常 SELECT・スキャン・Describe が共有する）。
+pub(crate) fn aliased_id_column_meta(name: &str) -> ColumnMeta {
+    ColumnMeta::Computed {
+        name: name.to_string(),
+        ty: Some(ColumnType::Numeric {
+            precision: 20,
+            scale: 0,
+        }),
+    }
+}
+
 /// 式のスカラー評価値（f64）を結果列型に合わせたセルへ変換する（Issue #1539・SQL-42）。
 /// `Integer`／`BigInt` は整数値を `Cell::SignedInteger` に、それ以外は従来どおり
 /// `Cell::Float`。整数列型で値が整数でない・範囲外なのは束縛段の不変条件違反なので
@@ -944,7 +958,9 @@ pub(crate) fn execute_statement_with_cache(
             // （`BoundExpr::TextColumnRef`）を持ちうるため、その列だけは下で
             // 個別に追加する（この `filter_map` 自体は単一列版のみを返せるため
             // `None` のまま素通しし、複数列を返せる下のループへ委ねる）。
-            ProjectedColumn::Id | ProjectedColumn::Computed { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
     for col in &bound.projection {
@@ -2555,6 +2571,7 @@ pub(crate) fn execute_statement_with_cache(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::AliasedId { name } => crate::sql::exec::aliased_id_column_meta(name),
             ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
                 name: name.clone(),
                 ty: schema
@@ -2864,7 +2881,9 @@ fn project_rows(
             ProjectedColumn::Computed { expr, .. } => {
                 Some(crate::sql::expr_program::ExprProgram::compile(expr))
             }
-            ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
+            ProjectedColumn::Id
+            | ProjectedColumn::AliasedId { .. }
+            | ProjectedColumn::Column { .. } => None,
         })
         .collect();
     let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
@@ -2973,7 +2992,9 @@ fn project_rows(
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
             match col {
-                ProjectedColumn::Id => cells.push(Cell::Integer(id)),
+                ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
+                    cells.push(Cell::Integer(id))
+                }
                 ProjectedColumn::Column { index, .. } => {
                     let column =
                         schema
