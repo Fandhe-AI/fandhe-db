@@ -1135,7 +1135,21 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
 /// 同名の ENUM を作ると列型が黙って組み込み型に解決される。[`RESERVED_TYPE_NAMES`]
 /// へ足すと既存カタログの `ALTER TYPE ... ADD VALUE`（再エンコード時に検証）が
 /// 退行するため、新規作成時のみ拒否する。大文字小文字を区別しない。
-const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &["int4", "int8", "float4", "float8"];
+///
+/// Issue #2303: 未確定型（`0A000` 拒否。TABLE-30・TABLE-31 ポインタ）の綴りも同じ理由で
+/// 加える。同名 ENUM を作っても以後どの DDL からも参照できず、後続で受理へ切り替えた際に
+/// 黙って組み込み型へ解決されるため。
+const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
+    "int4",
+    "int8",
+    "float4",
+    "float8",
+    "int2",
+    "smallint",
+    "varchar",
+    "char",
+    "character",
+];
 
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
 /// それ以外はすべて fail-closed な明示的な拒否理由を持つ。

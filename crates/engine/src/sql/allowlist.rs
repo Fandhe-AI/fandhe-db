@@ -63,10 +63,18 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "UUID",
     "NUMERIC",
     "DECIMAL",
+    // 定める ID が未確定で `0A000` 拒否する型名（Issue #2303。TABLE-30・TABLE-31）。
+    // 解決表（`ddl_column_type::TYPE_NAME_TABLE`）の全行を載せる契約。
+    "INT2",
+    "SMALLINT",
+    "VARCHAR",
+    "CHAR",
+    "CHARACTER",
 ];
 
-/// `raw` が `CREATE TABLE` の列型キーワード（型名エイリアス `INT`・`INT4`・`INT8`・
-/// `FLOAT4`・`FLOAT8` を含む。大小無視）かを判定する（Issue #1529・TABLE-29）。
+/// `raw` が `CREATE TABLE` の列型キーワードかを判定する（Issue #1529・TABLE-29）。
+/// 大小無視で、型名エイリアス `INT`・`INT4`・`INT8`・`FLOAT4`・`FLOAT8` と
+/// 未確定型 `INT2`・`SMALLINT`・`VARCHAR`・`CHAR`・`CHARACTER` を含む。
 /// `CHECK` 制約名の衝突判定と、wire-server の NoSQL DDL が `enum_type` に予約型名を
 /// 渡させないためのガードの双方から呼ばれ、語彙のドリフトを防ぐ単一情報源となる。
 pub fn is_column_type_keyword(raw: &str) -> bool {
@@ -12786,7 +12794,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// 列型キーワード判定は型名エイリアスを含む 20 語を大小無視で認識する
+    /// 列型キーワード判定は型名エイリアスと未確定型を含む 25 語を大小無視で認識する
     /// （Issue #1529・TABLE-29）。
     #[test]
     fn column_type_keyword_covers_aliases_case_insensitively() {
@@ -12794,11 +12802,11 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 20);
-        for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int"] {
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 25);
+        for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }
-        for ng in ["mood", "int2", "varchar", ""] {
+        for ng in ["mood", "int16", ""] {
             assert!(!is_column_type_keyword(ng), "{ng}");
         }
     }
