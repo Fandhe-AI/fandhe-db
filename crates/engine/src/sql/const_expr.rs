@@ -14,8 +14,8 @@
 
 use crate::sql::allowlist::{InsertLiteral, SqlSurfaceError};
 use crate::sql::udf_call::{
-    bind_const_expr, eval, first_non_builtin_call, BoundExpr, Expr, ExprValue, UdfRegistry,
-    MAX_EXPR_NODES,
+    bind_const_expr, eval, first_non_builtin_call, BinOp, BoundExpr, Expr, ExprType, ExprValue,
+    UdfRegistry, MAX_EXPR_NODES,
 };
 
 /// f64 が整数を正確に表現できる上限（2^53）。
@@ -178,7 +178,134 @@ fn check_node_value(expr: &Expr, enabled: bool) -> Result<(), SqlSurfaceError> {
     Ok(())
 }
 
-/// 算術・比較の直接オペランドに裸の `NULL` を持つ二項演算を `NULL` へ畳む
+/// 型付き `NULL` の型 `ty` を表す束縛可能な式（評価結果は常に `NULL`）。`NULL` へ畳んだ
+/// 演算結果の型情報を保持し、`COALESCE`／`CASE` の兄弟枝との型突き合わせ（`42804`）を
+/// 保つ。Bool は `NULLIF` が受理しないため分岐なしの `CASE` で表す。
+fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
+    let twin = |e: Expr| Expr::NullIf(Box::new(e.clone()), Box::new(e));
+    Ok(match ty {
+        ExprType::Scalar => twin(Expr::Number("0".to_string())),
+        ExprType::Text => twin(Expr::String(String::new())),
+        ExprType::Date => twin(Expr::DateLiteral(0)),
+        ExprType::Timestamp => twin(Expr::TimestampLiteral(0)),
+        ExprType::Bool => Expr::Case {
+            whens: vec![(
+                Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Number("1".to_string())),
+                    rhs: Box::new(Expr::Number("0".to_string())),
+                },
+                Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Number("1".to_string())),
+                    rhs: Box::new(Expr::Number("1".to_string())),
+                },
+            )],
+            else_result: None,
+        },
+        ExprType::Vector => {
+            return Err(SqlSurfaceError::datatype_mismatch(
+                "a vector-typed NULL is not allowed in a constant expression",
+            ))
+        }
+    })
+}
+
+/// `e` が `NULL` 定数なら `Some(型)`（裸の `NULL` は `Some(None)`、[`typed_null`] の
+/// 生成物は `Some(Some(型))`）。それ以外は `None`。
+fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
+    match e {
+        Expr::Null => Some(None),
+        Expr::NullIf(a, b) if a == b => match &**a {
+            Expr::Number(n) if n == "0" => Some(Some(ExprType::Scalar)),
+            Expr::String(s) if s.is_empty() => Some(Some(ExprType::Text)),
+            Expr::DateLiteral(0) => Some(Some(ExprType::Date)),
+            Expr::TimestampLiteral(0) => Some(Some(ExprType::Timestamp)),
+            _ => None,
+        },
+        Expr::Case { whens, else_result } if else_result.is_none() && whens.len() == 1 => {
+            if *e == typed_null(ExprType::Bool).ok()? {
+                Some(Some(ExprType::Bool))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 型 `ty` のプレースホルダ（探査式用。評価はしない）。
+fn placeholder(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
+    Ok(match ty {
+        ExprType::Scalar => Expr::Number("0".to_string()),
+        ExprType::Text => Expr::String(String::new()),
+        ExprType::Date => Expr::DateLiteral(0),
+        ExprType::Timestamp => Expr::TimestampLiteral(0),
+        ExprType::Bool | ExprType::Vector => {
+            return Err(SqlSurfaceError::datatype_mismatch(
+                "unsupported operand type for NULL in a constant expression",
+            ))
+        }
+    })
+}
+
+/// `NULL` オペランドの型候補（`NULL` 側の位置に置いて束縛を試す順序。算術で曖昧な
+/// `NULL + 1` は PostgreSQL と同様に Scalar を優先する）。
+const NULL_OPERAND_CANDIDATES: [ExprType; 4] = [
+    ExprType::Scalar,
+    ExprType::Text,
+    ExprType::Date,
+    ExprType::Timestamp,
+];
+
+/// `NULL` を含む二項演算を、演算子の型規則に従って型付き `NULL` へ畳む。
+/// `NULL` 側のオペランド位置を保ったまま型候補を順に置き換えた探査式を束縛し
+/// （非 `NULL` 側は式そのものを使うため、その側の束縛エラーも fail-closed に伝播する）、
+/// 最初に束縛できた組の結果型を採る。1 つも束縛できなければ最初のエラーを返す。
+fn fold_null_binary(
+    op: BinOp,
+    l: &Expr,
+    r: &Expr,
+    ln: Option<Option<ExprType>>,
+    rn: Option<Option<ExprType>>,
+) -> Result<Expr, SqlSurfaceError> {
+    let side_options = |e: &Expr, k: Option<Option<ExprType>>| -> Vec<Option<Expr>> {
+        match k {
+            None => vec![Some(e.clone())],
+            Some(Some(t)) => vec![placeholder(t).ok()],
+            Some(None) => NULL_OPERAND_CANDIDATES
+                .iter()
+                .map(|t| placeholder(*t).ok())
+                .collect(),
+        }
+    };
+    let mut first_err: Option<SqlSurfaceError> = None;
+    for lo in side_options(l, ln) {
+        for ro in side_options(r, rn) {
+            let (Some(lhs), Some(rhs)) = (lo.clone(), ro) else {
+                continue;
+            };
+            let probe = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+            let registry = UdfRegistry::default();
+            let mut budget = MAX_EXPR_NODES;
+            match bind_const_expr(&probe, &registry, &mut budget) {
+                Ok((_, ty)) => return typed_null(ty),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| {
+        SqlSurfaceError::datatype_mismatch("NULL operand type cannot be resolved")
+    }))
+}
+
+/// 算術・比較の直接オペランドに `NULL` を持つ二項演算を型付き `NULL` へ畳む
 /// （3 値論理の NULL 伝播。束縛器は型を決められない裸の `NULL` を `0A000` で
 /// 拒否するため、束縛前に定数として確定させる）。CASE／COALESCE／NULLIF 内の
 /// `NULL` は束縛器が扱うのでそのまま残す。
@@ -187,29 +314,16 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
         Expr::Binary { op, lhs, rhs } => {
             let l = propagate_null(lhs)?;
             let r = propagate_null(rhs)?;
-            if matches!(l, Expr::Null) || matches!(r, Expr::Null) {
-                // NULL で消去する前に、反対側オペランドの束縛と演算子との型整合を検証する
-                // （`NULL + upper(1)` が NULL として受理されないよう、裸の NULL 側を反対側の
-                // 複製で置き換えた探査式を束縛して fail-closed にする。評価はしない）。
-                if !(matches!(l, Expr::Null) && matches!(r, Expr::Null)) {
-                    let probe = Expr::Binary {
-                        op: *op,
-                        lhs: Box::new(if matches!(l, Expr::Null) {
-                            r.clone()
-                        } else {
-                            l.clone()
-                        }),
-                        rhs: Box::new(if matches!(r, Expr::Null) {
-                            l.clone()
-                        } else {
-                            r.clone()
-                        }),
-                    };
-                    let registry = UdfRegistry::default();
-                    let mut budget = MAX_EXPR_NODES;
-                    bind_const_expr(&probe, &registry, &mut budget)?;
+            let (ln, rn) = (null_kind(&l), null_kind(&r));
+            if ln.is_some() || rn.is_some() {
+                // 消去される非 NULL 側の中間精度も、消去前にここで検査する。
+                if ln.is_none() {
+                    check_intermediate_precision(&l)?;
                 }
-                Expr::Null
+                if rn.is_none() {
+                    check_intermediate_precision(&r)?;
+                }
+                fold_null_binary(*op, &l, &r, ln, rn)?
             } else {
                 Expr::Binary {
                     op: *op,
@@ -250,8 +364,10 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
             "only built-in functions are allowed in a constant expression",
         ));
     }
-    check_intermediate_precision(expr)?;
+    // NULL 伝播（型付き NULL への畳み込み）後の式で精度検査と最終評価を行い、
+    // 短絡判定と評価結果を一致させる（NULL を含む先頭引数で後続の検査が省かれない）。
     let propagated = propagate_null(expr)?;
+    check_intermediate_precision(&propagated)?;
     if matches!(propagated, Expr::Null) {
         return Ok(InsertLiteral::Null);
     }
@@ -299,7 +415,6 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::udf_call::BinOp;
 
     fn num(s: &str) -> Expr {
         Expr::Number(s.to_string())
@@ -448,5 +563,77 @@ mod tests {
             fold_const_literal(&bin(BinOp::Add, Expr::Null, num("1"))).unwrap(),
             InsertLiteral::Null
         );
+    }
+
+    #[test]
+    fn coalesce_with_null_first_arg_still_checks_later_precision() {
+        let big = bin(
+            BinOp::Sub,
+            bin(BinOp::Add, num("9007199254740992"), num("1")),
+            num("9007199254740992"),
+        );
+        let e = Expr::Coalesce(vec![bin(BinOp::Add, Expr::Null, num("1")), big]);
+        assert!(matches!(
+            fold_const_literal(&e),
+            Err(SqlSurfaceError::NumericOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn folded_null_keeps_operand_type() {
+        let nul_plus_1 = || bin(BinOp::Add, Expr::Null, num("1"));
+        assert!(matches!(
+            fold_const_literal(&Expr::Coalesce(vec![
+                nul_plus_1(),
+                Expr::String("x".into())
+            ])),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        ));
+        let case = Expr::Case {
+            whens: vec![(bin(BinOp::Eq, num("1"), num("1")), nul_plus_1())],
+            else_result: Some(Box::new(Expr::String("x".into()))),
+        };
+        assert!(matches!(
+            fold_const_literal(&case),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        ));
+        assert_eq!(
+            fold_const_literal(&Expr::Coalesce(vec![nul_plus_1(), Expr::Null])).unwrap(),
+            InsertLiteral::Null
+        );
+        assert_eq!(
+            fold_const_literal(&Expr::Coalesce(vec![nul_plus_1(), num("5")])).unwrap(),
+            InsertLiteral::Number("5".into())
+        );
+    }
+
+    #[test]
+    fn null_probe_respects_operand_position() {
+        let d = || Expr::DateLiteral(0);
+        // DATE + NULL は DATE（日数 NULL）として受理、NULL - DATE は DATE - DATE として受理される。
+        assert_eq!(
+            fold_const_literal(&bin(BinOp::Add, d(), Expr::Null)).unwrap(),
+            InsertLiteral::Null
+        );
+        assert_eq!(
+            fold_const_literal(&bin(BinOp::Sub, Expr::Null, d())).unwrap(),
+            InsertLiteral::Null
+        );
+        // NULL - DATE の結果は Scalar 型（日数差）。
+        assert!(matches!(
+            fold_const_literal(&Expr::Coalesce(vec![
+                bin(BinOp::Sub, Expr::Null, d()),
+                Expr::String("x".into())
+            ])),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        ));
+        // DATE + NULL の結果は DATE 型。
+        assert!(matches!(
+            fold_const_literal(&Expr::Coalesce(vec![
+                bin(BinOp::Add, d(), Expr::Null),
+                num("1")
+            ])),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        ));
     }
 }
