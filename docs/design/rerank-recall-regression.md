@@ -333,7 +333,7 @@ bans licenses sources`（`[graph] all-features = true` により `cross-encoder`
 - ロード時にモデルの入力名（`input_ids`/`attention_mask`/`token_type_ids`）を
   検査し、想定外の構成は構築時に fail-closed で拒否する
 - 単体テスト（`ORT_DYLIB_PATH` 未設定・モデル/トークナイザファイル不在の環境。
-  `--all-features` の `make test`/`make ci`・pre-push フックの既定経路）で
+  `--all-features` の `make test`/`make ci`・CI の既定経路）で
   panic せず `Err` を返すことを固定した
 
 **opt-in 実測ハーネス**: `crates/engine/tests/rerank_cross_encoder_recall.rs`
