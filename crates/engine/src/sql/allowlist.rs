@@ -3339,6 +3339,13 @@ struct Parser<'a> {
     /// 単一の構文検証エントリポイントに限定し、他の `Parser::new` 呼び出しには
     /// 影響を与えない）。
     max_insert_rows: Option<std::num::NonZeroUsize>,
+    /// 単一テーブル SELECT 系（通常・集計・DISTINCT）が `FROM <table> [[AS] alias]` を
+    /// 読んだ直後に設定する FROM 参照（Issue #1534・SQL-44 ポインタ、親 #1533）。
+    /// `Some` の間、WHERE 葉の先頭が修飾列参照ならその修飾子を公開名と照合し、
+    /// 不一致は `42P01` で拒否する。`None`（既定。DML 述語・CHECK・VIEW 本体・CTE 本体・
+    /// 集合演算の枝）では挙動を一切変えない。別名は parse 時に確定する情報であり、
+    /// 実行系は実テーブル名のみで動く（別名は `ParsedShape` 等へ持ち込まない）。
+    from_ref: Option<TableRef>,
 }
 
 impl<'a> Parser<'a> {
@@ -3370,6 +3377,7 @@ impl<'a> Parser<'a> {
             allow_null_literal: false,
             in_check_body: false,
             max_insert_rows: None,
+            from_ref: None,
         }
     }
 
@@ -4411,6 +4419,14 @@ impl<'a> Parser<'a> {
         set_operators: bool,
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        // Issue #1534・SQL-44 ポインタ: 単一テーブル FROM の公開名（別名があれば別名）に
+        // 一致しない修飾子は `42P01`。一致する修飾列参照の受理は #1535 が本フックを
+        // 「修飾子を剥がして非修飾列として処理」へ差し替えるまで従来どおり `42601`。
+        if let (Some(from_ref), Some(Token::QualifiedIdent { qualifier, .. })) =
+            (self.from_ref.as_ref(), self.peek())
+        {
+            from_ref.ensure_qualifier(qualifier)?;
+        }
         let predicates: Vec<WherePredicate> = if let Some(leaf) =
             self.try_parse_const_bool_leaf(extra_close_paren, set_operators)
         {
@@ -8977,6 +8993,12 @@ fn is_join_reserved_word(w: &str) -> bool {
         .any(|r| w.eq_ignore_ascii_case(r))
 }
 
+/// 単一テーブル FROM の暗黙別名にできない語（JOIN 予約語 + 集合演算子。Issue #1534）。
+/// JOIN 側の受理範囲を変えないよう [`is_join_reserved_word`] とは別関数にする。
+fn is_single_table_reserved_word(w: &str) -> bool {
+    is_join_reserved_word(w) || is_set_operator_ident(w)
+}
+
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
 /// §2.2・#926）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
 /// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
@@ -9043,6 +9065,54 @@ fn is_join_keyword_at(tokens: &[Token], i: usize) -> bool {
 /// JOIN 文脈専用の `Parser` ヘルパー（Issue #925）。既存の `impl<'a> Parser<'a>`
 /// 本体とは別ブロックに分離し、JOIN 追加による差分を局所化する。
 impl<'a> Parser<'a> {
+    /// 別名部 `[[AS] <alias_ident>]` の共有実装（JOIN 関係と単一テーブル FROM。
+    /// Issue #1534）。`is_reserved` が真の語は暗黙別名にせず、`AS` 後に来た場合は
+    /// `42601`。`what` はエラー文言の文脈名。
+    fn parse_relation_alias(
+        &mut self,
+        is_reserved: fn(&str) -> bool,
+        what: &str,
+    ) -> Result<Option<String>, SqlSurfaceError> {
+        if self.peek_ident_matches("AS") {
+            self.advance();
+            let name = self.expect_ident()?;
+            if is_reserved(&name) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "reserved word cannot be used as a {what} alias: {name}"
+                )));
+            }
+            crate::catalog::validate_identifier(&name)
+                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid {what} alias: {e}")))?;
+            Ok(Some(name))
+        } else if let Some(Token::Ident(name)) = self.peek() {
+            if is_reserved(name) {
+                Ok(None)
+            } else {
+                let name = name.clone();
+                self.advance();
+                crate::catalog::validate_identifier(&name).map_err(|e| {
+                    SqlSurfaceError::unsupported(format!("invalid {what} alias: {e}"))
+                })?;
+                Ok(Some(name))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 単一テーブル SELECT 系の `FROM <table> [[AS] alias]`（Issue #1534・SQL-44
+    /// ポインタ、親 #1533）。実テーブル名を返し、`self.from_ref` を設定する（WHERE 葉の
+    /// 修飾子検査用）。予約語は JOIN 用に加えて集合演算子を別名にしない。
+    fn parse_from_table_ref(&mut self) -> Result<String, SqlSurfaceError> {
+        let table = self.expect_ident()?;
+        let alias = self.parse_relation_alias(is_single_table_reserved_word, "FROM")?;
+        self.from_ref = Some(match alias {
+            Some(a) => TableRef::with_alias(table.clone(), a),
+            None => TableRef::new(table.clone()),
+        });
+        Ok(table)
+    }
+
     /// `rel := <table_ident> [[AS] <alias_ident>]`。別名は予約文脈語
     /// （[`JOIN_RESERVED_ALIAS_WORDS`]）を大小無視で拒否する（`ON`・`WHERE` 等を
     /// 別名として誤って消費しない）。
@@ -9050,31 +9120,7 @@ impl<'a> Parser<'a> {
         let table = self.expect_ident()?;
         crate::catalog::validate_identifier(&table)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
-        let alias = if self.peek_ident_matches("AS") {
-            self.advance();
-            let name = self.expect_ident()?;
-            if is_join_reserved_word(&name) {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "reserved word cannot be used as a JOIN alias: {name}"
-                )));
-            }
-            crate::catalog::validate_identifier(&name)
-                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid JOIN alias: {e}")))?;
-            Some(name)
-        } else if let Some(Token::Ident(name)) = self.peek() {
-            if is_join_reserved_word(name) {
-                None
-            } else {
-                let name = name.clone();
-                self.advance();
-                crate::catalog::validate_identifier(&name).map_err(|e| {
-                    SqlSurfaceError::unsupported(format!("invalid JOIN alias: {e}"))
-                })?;
-                Some(name)
-            }
-        } else {
-            None
-        };
+        let alias = self.parse_relation_alias(is_join_reserved_word, "JOIN")?;
         Ok(match alias {
             Some(a) => TableRef::with_alias(table, a),
             None => TableRef::new(table),
@@ -10242,7 +10288,7 @@ fn parse_select_shape(
         ));
     }
     p.expect_keyword(Keyword::From)?;
-    let table_name = p.expect_ident()?;
+    let table_name = p.parse_from_table_ref()?;
 
     let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
         p.advance();
@@ -10522,7 +10568,7 @@ fn parse_aggregate_shape(
         ));
     }
     p.expect_keyword(Keyword::From)?;
-    let table_name = p.expect_ident()?;
+    let table_name = p.parse_from_table_ref()?;
 
     let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
         p.advance();
@@ -10650,7 +10696,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         break;
     }
     p.expect_keyword(Keyword::From)?;
-    let table_name = p.expect_ident()?;
+    let table_name = p.parse_from_table_ref()?;
 
     let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
         p.advance();
