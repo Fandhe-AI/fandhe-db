@@ -46,8 +46,13 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "TEXT",
     "VECTOR",
     "INTEGER",
+    "INT",
+    "INT4",
     "BIGINT",
+    "INT8",
     "REAL",
+    "FLOAT4",
+    "FLOAT8",
     "DOUBLE",
     "BOOLEAN",
     "DATE",
@@ -18135,6 +18140,9 @@ mod tests {
             "CREATE TABLE t (body TEXT, constraint TEXT CHECK (body = 'a'))",
             "CREATE TABLE t (body TEXT, CONSTRAINT vector CHECK (body = 'a'))",
             "CREATE TABLE t (body TEXT CONSTRAINT Text CHECK (body = 'a'))",
+            // 型名エイリアス（Issue #1528）も列型キーワードとして衝突を検出する。
+            "CREATE TABLE t (body TEXT, CONSTRAINT int8 CHECK (body = 'a'))",
+            "CREATE TABLE t (body TEXT, CONSTRAINT Float4 CHECK (body = 'a'))",
         ] {
             assert_eq!(parse_create_table_err(sql).wire_code(), "42601", "{sql}");
         }

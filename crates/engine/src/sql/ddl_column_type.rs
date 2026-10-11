@@ -155,7 +155,7 @@ pub enum SqlColumnTypeName {
     Integer,
     BigInt,
     Real,
-    /// `DOUBLE PRECISION`（2 語）。
+    /// `DOUBLE PRECISION`（2 語）または別名 `FLOAT8`。
     Double,
     Boolean,
     Date,
@@ -219,6 +219,12 @@ pub(crate) fn parse_column_type_name(
 }
 
 /// 配列サフィックスを除いた基本型名 1 個の解析（[`parse_column_type_name`] の下請け）。
+///
+/// 型名 → 列型の対応表はここに一本化されており、`CREATE TABLE`・`ADD COLUMN`・
+/// `ALTER COLUMN TYPE`・配列要素が共有する（ポインタ: TABLE-29・TABLE-31、Issue #1528）。
+/// PostgreSQL の別名（`INT`・`INT4`・`INT8`・`FLOAT4`・`FLOAT8`）は既存の列型へ写し、
+/// 新しい型タグは作らない。`DOUBLE` 単独と `VARCHAR`・`CHAR`・`INT2` は意図して登録せず、
+/// 従来どおり ENUM 型名候補へ落として実行段で拒否する（fail-closed）。
 fn parse_base_type_name(
     tokens: &[Token],
     pos: &mut usize,
@@ -226,9 +232,10 @@ fn parse_base_type_name(
     let name = expect_ident(tokens, pos)?;
     match name.to_ascii_uppercase().as_str() {
         "TEXT" => Ok(SqlColumnTypeName::Text),
-        "INTEGER" => Ok(SqlColumnTypeName::Integer),
-        "BIGINT" => Ok(SqlColumnTypeName::BigInt),
-        "REAL" => Ok(SqlColumnTypeName::Real),
+        "INTEGER" | "INT" | "INT4" => Ok(SqlColumnTypeName::Integer),
+        "BIGINT" | "INT8" => Ok(SqlColumnTypeName::BigInt),
+        "REAL" | "FLOAT4" => Ok(SqlColumnTypeName::Real),
+        "FLOAT8" => Ok(SqlColumnTypeName::Double),
         "DOUBLE" => {
             expect_contextual_keyword(tokens, pos, "PRECISION")?;
             Ok(SqlColumnTypeName::Double)
@@ -362,8 +369,17 @@ mod tests {
             ("TEXT", SqlColumnTypeName::Text),
             ("text", SqlColumnTypeName::Text),
             ("INTEGER", SqlColumnTypeName::Integer),
+            ("INT", SqlColumnTypeName::Integer),
+            ("int", SqlColumnTypeName::Integer),
+            ("Int4", SqlColumnTypeName::Integer),
             ("BIGINT", SqlColumnTypeName::BigInt),
+            ("INT8", SqlColumnTypeName::BigInt),
+            ("int8", SqlColumnTypeName::BigInt),
             ("REAL", SqlColumnTypeName::Real),
+            ("FLOAT4", SqlColumnTypeName::Real),
+            ("float4", SqlColumnTypeName::Real),
+            ("FLOAT8", SqlColumnTypeName::Double),
+            ("Float8", SqlColumnTypeName::Double),
             ("BOOLEAN", SqlColumnTypeName::Boolean),
             ("DATE", SqlColumnTypeName::Date),
             ("TIMESTAMP", SqlColumnTypeName::Timestamp),
@@ -374,6 +390,37 @@ mod tests {
         ] {
             let (ty, _) = parse_type(raw).unwrap_or_else(|e| panic!("{raw:?} rejected: {e}"));
             assert_eq!(ty, expected, "for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn aliases_never_fall_through_to_enum() {
+        for raw in ["INT", "INT4", "INT8", "FLOAT4", "FLOAT8"] {
+            let (ty, consumed) = parse_type(raw).expect("valid");
+            assert!(!matches!(ty, SqlColumnTypeName::Enum(_)), "for {raw:?}");
+            assert_eq!(consumed, 1, "for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn alias_array_elements_resolve() {
+        let (ty, _) = parse_type("INT4[]").expect("valid");
+        assert!(matches!(
+            ty,
+            SqlColumnTypeName::Array { ref elem, .. } if **elem == SqlColumnTypeName::Integer
+        ));
+        let (ty, _) = parse_type("INT8[3]").expect("valid");
+        assert!(matches!(
+            ty,
+            SqlColumnTypeName::Array { ref elem, max_len: Some(3) } if **elem == SqlColumnTypeName::BigInt
+        ));
+    }
+
+    #[test]
+    fn unregistered_names_stay_enum_candidates() {
+        for raw in ["INT2", "VARCHAR", "CHAR"] {
+            let (ty, _) = parse_type(raw).expect("valid");
+            assert_eq!(ty, SqlColumnTypeName::Enum(raw.to_string()), "for {raw:?}");
         }
     }
 
