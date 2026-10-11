@@ -1129,6 +1129,14 @@ const RESERVED_TYPE_NAMES: &[&str] = &[
     "array",
 ];
 
+/// 作成経路（[`Storage::create_enum_type`]）だけで追加予約する型名エイリアス
+/// （Issue #1528。TABLE-29・TABLE-31 ポインタ）。`CREATE TABLE` の型名解決
+/// （`sql::ddl_column_type::parse_base_type_name`）が組み込み型へ写す語なので、
+/// 同名の ENUM を作ると列型が黙って組み込み型に解決される。[`RESERVED_TYPE_NAMES`]
+/// へ足すと既存カタログの `ALTER TYPE ... ADD VALUE`（再エンコード時に検証）が
+/// 退行するため、新規作成時のみ拒否する。大文字小文字を区別しない。
+const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &["int4", "int8", "float4", "float8"];
+
 /// カタログ層の公開エラー型。`redb` 操作由来のエラーは `Backend` に一本化し、
 /// それ以外はすべて fail-closed な明示的な拒否理由を持つ。
 ///
@@ -8444,6 +8452,11 @@ impl Storage {
     /// 呼ばれる。同名の型が既に存在する場合は上書きせず
     /// `Err(CatalogError::TypeAlreadyExists)`。
     pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
+        if CREATE_ONLY_RESERVED_TYPE_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(CatalogError::Invalid(format!(
+                "enum type name collides with a built-in type alias: {name:?}"
+            )));
+        }
         let encoded = encode_enum_type_def(name, &labels)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
