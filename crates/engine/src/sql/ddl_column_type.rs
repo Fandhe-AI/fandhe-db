@@ -246,45 +246,136 @@ pub(crate) fn alias_spelling(ty: &SqlColumnTypeName) -> Option<&str> {
     }
 }
 
+/// 型名解決表の 1 行の扱い（[`TYPE_NAME_TABLE`]。Issue #2303）。
+///
+/// 正規名・別名を区別せず同じ表に並べ、行ごとに「受理する形」か「ID が未確定のため
+/// `0A000` で拒否する」かを持たせる。後続 Issue（#2304〜#2306）は行の追加・扱いの
+/// 切り替えだけで済む。`match` はワイルドカードなしで網羅し、種別を足したときに
+/// コンパイラが追従漏れを検出する。
+#[derive(Debug, Clone, Copy)]
+enum TypeNameKind {
+    /// 綴りを保持せず写す（`INT` を含む。構文木は従来どおり plain）。
+    Direct(fn() -> SqlColumnTypeName),
+    /// 綴りを保持する別名（実行段が同名 ENUM との衝突検出に使う。Issue #1528）。
+    Alias(fn() -> SqlColumnTypeName),
+    /// `DOUBLE PRECISION`（2 語必須。`DOUBLE` 単独は構文段 `42601`）。
+    DoublePrecision,
+    /// `VECTOR(N)`。
+    Vector,
+    /// `NUMERIC(p,s)`／`DECIMAL(p,s)`。
+    Numeric,
+    /// 定める ID が未確定のため受理しない型。`canonical` は正規名で、綴りに依らず
+    /// 同一の `0A000` メッセージを組み立てるために使う（Issue #2303）。
+    Unsettled { canonical: &'static str },
+    /// `CHARACTER [VARYING]` の先頭語。直後の `VARYING` で正規名が分かれるが、
+    /// どちらも未確定のため `0A000` で拒否する。
+    UnsettledCharacter,
+}
+
+/// 型名解決表。先頭語（大小無視）で引く。表に無い識別子は ENUM 型名候補
+/// （`42704` 化は #2306）。ポインタ: TABLE-29・TABLE-30・TABLE-31。
+/// 全行の先頭語は `allowlist::CREATE_TABLE_COLUMN_TYPE_KEYWORDS` にも載せる契約
+/// （単体テストがドリフトを検出する）。
+const TYPE_NAME_TABLE: &[(&str, TypeNameKind)] = &[
+    ("TEXT", TypeNameKind::Direct(|| SqlColumnTypeName::Text)),
+    (
+        "INTEGER",
+        TypeNameKind::Direct(|| SqlColumnTypeName::Integer),
+    ),
+    ("INT", TypeNameKind::Direct(|| SqlColumnTypeName::Integer)),
+    ("INT4", TypeNameKind::Alias(|| SqlColumnTypeName::Integer)),
+    ("BIGINT", TypeNameKind::Direct(|| SqlColumnTypeName::BigInt)),
+    ("INT8", TypeNameKind::Alias(|| SqlColumnTypeName::BigInt)),
+    ("REAL", TypeNameKind::Direct(|| SqlColumnTypeName::Real)),
+    ("FLOAT4", TypeNameKind::Alias(|| SqlColumnTypeName::Real)),
+    ("FLOAT8", TypeNameKind::Alias(|| SqlColumnTypeName::Double)),
+    ("DOUBLE", TypeNameKind::DoublePrecision),
+    (
+        "BOOLEAN",
+        TypeNameKind::Direct(|| SqlColumnTypeName::Boolean),
+    ),
+    ("DATE", TypeNameKind::Direct(|| SqlColumnTypeName::Date)),
+    (
+        "TIMESTAMP",
+        TypeNameKind::Direct(|| SqlColumnTypeName::Timestamp),
+    ),
+    ("BYTEA", TypeNameKind::Direct(|| SqlColumnTypeName::Bytea)),
+    ("JSON", TypeNameKind::Direct(|| SqlColumnTypeName::Json)),
+    ("JSONB", TypeNameKind::Direct(|| SqlColumnTypeName::Jsonb)),
+    ("UUID", TypeNameKind::Direct(|| SqlColumnTypeName::Uuid)),
+    ("VECTOR", TypeNameKind::Vector),
+    ("NUMERIC", TypeNameKind::Numeric),
+    ("DECIMAL", TypeNameKind::Numeric),
+    (
+        "INT2",
+        TypeNameKind::Unsettled {
+            canonical: "smallint",
+        },
+    ),
+    (
+        "SMALLINT",
+        TypeNameKind::Unsettled {
+            canonical: "smallint",
+        },
+    ),
+    (
+        "VARCHAR",
+        TypeNameKind::Unsettled {
+            canonical: "character varying",
+        },
+    ),
+    (
+        "CHAR",
+        TypeNameKind::Unsettled {
+            canonical: "character",
+        },
+    ),
+    ("CHARACTER", TypeNameKind::UnsettledCharacter),
+];
+
+/// 未確定型の `0A000`。メッセージは正規名のみで組み立て、綴り（別名）に依らず同一にする。
+fn unsettled_type_error(canonical: &str) -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: format!("type {canonical} is not supported yet"),
+    }
+}
+
 /// 配列サフィックスを除いた基本型名 1 個の解析（[`parse_column_type_name`] の下請け）。
 ///
-/// 型名 → 列型の対応表はここに一本化されており、`CREATE TABLE`・`ADD COLUMN`・
-/// `ALTER COLUMN TYPE`・配列要素が共有する（ポインタ: TABLE-29・TABLE-31、Issue #1528）。
-/// PostgreSQL の別名（`INT`・`INT4`・`INT8`・`FLOAT4`・`FLOAT8`）は既存の列型へ写し、
-/// 新しい型タグは作らない。`DOUBLE` 単独と `VARCHAR`・`CHAR`・`INT2` は意図して登録せず、
-/// 従来どおり ENUM 型名候補へ落として実行段で拒否する（fail-closed）。
+/// 型名 → 列型の対応は [`TYPE_NAME_TABLE`] に一本化されており、`CREATE TABLE`・
+/// `ADD COLUMN`・`ALTER COLUMN TYPE`・配列要素が共有する（ポインタ: TABLE-29・
+/// TABLE-30・TABLE-31、Issue #1528・#2303）。未確定型（`INT2`／`SMALLINT`・`VARCHAR`／
+/// `CHARACTER VARYING`・`CHAR`／`CHARACTER`）はカタログを参照しない静的判定で、構文段で
+/// 両綴りとも同一の `0A000` を返す（書き込みトランザクション開始前のため副作用なし）。
+/// `DOUBLE` 単独は従来どおり構文段 `42601`。
 fn parse_base_type_name(
     tokens: &[Token],
     pos: &mut usize,
 ) -> Result<SqlColumnTypeName, SqlSurfaceError> {
     let name = expect_ident(tokens, pos)?;
-    match name.to_ascii_uppercase().as_str() {
-        "TEXT" => Ok(SqlColumnTypeName::Text),
-        "INTEGER" | "INT" => Ok(SqlColumnTypeName::Integer),
-        "BIGINT" => Ok(SqlColumnTypeName::BigInt),
-        "REAL" => Ok(SqlColumnTypeName::Real),
-        "INT4" => Ok(alias_type(name, SqlColumnTypeName::Integer)),
-        "INT8" => Ok(alias_type(name, SqlColumnTypeName::BigInt)),
-        "FLOAT4" => Ok(alias_type(name, SqlColumnTypeName::Real)),
-        "FLOAT8" => Ok(alias_type(name, SqlColumnTypeName::Double)),
-        "DOUBLE" => {
+    let Some((_, kind)) = TYPE_NAME_TABLE
+        .iter()
+        .find(|(word, _)| name.eq_ignore_ascii_case(word))
+    else {
+        // 表に無い識別子は ENUM 型名候補として構文上は受理する（原文の大文字小文字
+        // をそのまま保持する。ENUM 型名は `catalog::validate_identifier` の
+        // 識別子規則に従うため大文字小文字を区別する）。
+        return Ok(SqlColumnTypeName::Enum(name));
+    };
+    match kind {
+        TypeNameKind::Direct(make) => Ok(make()),
+        TypeNameKind::Alias(make) => Ok(alias_type(name, make())),
+        TypeNameKind::DoublePrecision => {
             expect_contextual_keyword(tokens, pos, "PRECISION")?;
             Ok(SqlColumnTypeName::Double)
         }
-        "BOOLEAN" => Ok(SqlColumnTypeName::Boolean),
-        "DATE" => Ok(SqlColumnTypeName::Date),
-        "TIMESTAMP" => Ok(SqlColumnTypeName::Timestamp),
-        "BYTEA" => Ok(SqlColumnTypeName::Bytea),
-        "JSON" => Ok(SqlColumnTypeName::Json),
-        "JSONB" => Ok(SqlColumnTypeName::Jsonb),
-        "UUID" => Ok(SqlColumnTypeName::Uuid),
-        "VECTOR" => {
+        TypeNameKind::Vector => {
             expect_punct(tokens, pos, '(')?;
             let dim = expect_strict_u32(tokens, pos)?;
             expect_punct(tokens, pos, ')')?;
             Ok(SqlColumnTypeName::Vector(dim))
         }
-        "NUMERIC" | "DECIMAL" => {
+        TypeNameKind::Numeric => {
             expect_punct(tokens, pos, '(')?;
             let precision = expect_strict_u8(tokens, pos)?;
             expect_punct(tokens, pos, ',')?;
@@ -292,10 +383,18 @@ fn parse_base_type_name(
             expect_punct(tokens, pos, ')')?;
             Ok(SqlColumnTypeName::Numeric { precision, scale })
         }
-        // 未知の識別子は ENUM 型名候補として構文上は受理する（原文の大文字小文字
-        // をそのまま保持する。ENUM 型名は `catalog::validate_identifier` の
-        // 識別子規則に従うため大文字小文字を区別する）。
-        _ => Ok(SqlColumnTypeName::Enum(name)),
+        TypeNameKind::Unsettled { canonical } => Err(unsettled_type_error(canonical)),
+        TypeNameKind::UnsettledCharacter => {
+            let varying = matches!(
+                tokens.get(*pos),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("VARYING")
+            );
+            Err(unsettled_type_error(if varying {
+                "character varying"
+            } else {
+                "character"
+            }))
+        }
     }
 }
 
@@ -472,10 +571,55 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_names_stay_enum_candidates() {
-        for raw in ["INT2", "VARCHAR", "CHAR"] {
+    fn unsettled_type_names_are_rejected_with_0a000_in_both_spellings() {
+        for raw in [
+            "INT2",
+            "int2",
+            "SMALLINT",
+            "smallint",
+            "VARCHAR",
+            "VARCHAR(10)",
+            "CHARACTER VARYING",
+            "character varying(10)",
+            "CHAR",
+            "CHAR(1)",
+            "CHARACTER",
+            "CHARACTER(3)",
+            "INT2[]",
+            "SMALLINT[3]",
+        ] {
+            let e = parse_type(raw).expect_err(raw);
+            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+        }
+        for (a, b) in [
+            ("INT2", "SMALLINT"),
+            ("VARCHAR(10)", "CHARACTER VARYING(10)"),
+            ("CHAR(1)", "CHARACTER(1)"),
+        ] {
+            let (ea, eb) = (parse_type(a).unwrap_err(), parse_type(b).unwrap_err());
+            assert_eq!(ea.wire_code(), eb.wire_code());
+            assert_eq!(ea.to_string(), eb.to_string(), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn truly_unknown_names_stay_enum_candidates() {
+        for raw in ["INT16", "mood", "MoodEnum"] {
             let (ty, _) = parse_type(raw).expect("valid");
             assert_eq!(ty, SqlColumnTypeName::Enum(raw.to_string()), "for {raw:?}");
+        }
+    }
+
+    /// 解決表の全行の先頭語が予約語リストに載っている（二重管理のドリフト検出）。
+    #[test]
+    fn type_name_table_words_are_column_type_keywords_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for (word, _) in TYPE_NAME_TABLE {
+            assert!(
+                crate::sql::allowlist::is_column_type_keyword(word),
+                "{word} missing from CREATE_TABLE_COLUMN_TYPE_KEYWORDS"
+            );
+            assert!(seen.insert(*word), "duplicate row {word}");
         }
     }
 
