@@ -49,7 +49,9 @@ use crate::sql::allowlist::{
     ValidatedCreateTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
     ValidatedDropTable, ValidatedDropType, ValidatedDropView,
 };
-use crate::sql::ddl_column_type::{to_static_column_type, SqlColumnTypeName, StaticColumnType};
+use crate::sql::ddl_column_type::{
+    alias_spelling, to_static_column_type, SqlColumnTypeName, StaticColumnType,
+};
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
@@ -93,6 +95,9 @@ pub(crate) fn execute_create_table(
     // DDL 権限ゲート（`core.rs` の `require_ddl_permission`）の後のここでのみ行い、
     // 未登録は `ADD COLUMN` と同じ `42601`。解決から `create_table` までの間に
     // `DROP TYPE` が割り込んだ場合も `create_table` 側の `TypeNotFound` を `42601` へ写す。
+    for alias in &validated.alias_type_names {
+        reject_alias_enum_collision(storage, alias)?;
+    }
     let mut columns = validated.columns.clone();
     for column in &mut columns {
         if let ColumnType::Enum(def) = &column.ty {
@@ -877,6 +882,9 @@ fn resolve_column_type(
             detail: "ALTER TABLE ADD COLUMN does not support VECTOR columns yet".to_string(),
         });
     }
+    if let Some(alias) = alias_spelling(ty) {
+        reject_alias_enum_collision(storage, alias)?;
+    }
     match to_static_column_type(ty)? {
         StaticColumnType::Resolved(t) => Ok(t),
         StaticColumnType::EnumCandidate(name) => {
@@ -895,6 +903,23 @@ fn resolve_column_type(
 
 /// ENUM 型名を `Storage::get_enum_type` で解決する。未登録は `42601`
 /// （`unknown type name`。`ADD COLUMN`・`CREATE TABLE` 共通）。
+/// 型名エイリアス（`INT4`・`INT8`・`FLOAT4`・`FLOAT8`。Issue #1528）と同じ綴りの ENUM 型が
+/// 既に登録されている場合に `42601` で拒否する。エイリアス導入前は同綴りが ENUM 型名
+/// として解決されていたため、組み込み型へ黙って解決し直すと既存の参照意図と食い違う
+/// （fail-closed）。`CREATE TABLE`・`ADD COLUMN`・`ALTER COLUMN TYPE` が共有する。
+pub(crate) fn reject_alias_enum_collision(
+    storage: &Storage,
+    alias: &str,
+) -> Result<(), SqlSurfaceError> {
+    match storage.get_enum_type(alias) {
+        Ok(_) => Err(SqlSurfaceError::UnsupportedSyntax {
+            detail: format!("type name {alias} collides with an existing enum type"),
+        }),
+        Err(CatalogError::TypeNotFound(_)) => Ok(()),
+        Err(other) => Err(map_add_column_error(other)),
+    }
+}
+
 fn resolve_enum_type(
     storage: &Storage,
     name: &str,
@@ -1380,6 +1405,19 @@ mod tests {
         assert_eq!(err.wire_code(), "55P03");
     }
 
+    /// 型名エイリアスと同綴りの ENUM 型が登録済みなら `42601` で拒否し、未登録なら通す
+    /// （Issue #1528。判定は綴り非依存のため任意の ENUM 名で検証する）。
+    #[test]
+    fn alias_enum_collision_is_rejected_only_when_enum_exists() {
+        let (storage, _guard) = tmp_storage("alias-enum-collision");
+        assert!(reject_alias_enum_collision(&storage, "mood").is_ok());
+        storage
+            .create_enum_type("mood", vec!["a".to_string()])
+            .expect("create enum");
+        let e = reject_alias_enum_collision(&storage, "mood").expect_err("collision");
+        assert_eq!(e.wire_code(), "42601");
+    }
+
     /// テーブルとして存在しない名前は、ビューなら `42809`、どちらでもなければ
     /// `42P01`（`execute_alter_table_add_column` の事前確認・書き込み txn 内の
     /// 再確認〔競合でテーブルが消えた場合〕の双方が共有する判定。Issue #900）。
@@ -1388,6 +1426,7 @@ mod tests {
         let (storage, _guard) = tmp_storage("undefined-or-view");
         let validated = ValidatedCreateTable {
             primary_key_name: None,
+            alias_type_names: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -1542,6 +1581,7 @@ mod tests {
         let (storage, _guard) = tmp_storage("succeeds");
         let validated = ValidatedCreateTable {
             primary_key_name: None,
+            alias_type_names: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new(
@@ -1566,6 +1606,7 @@ mod tests {
         let (storage, _guard) = tmp_storage("duplicate-name");
         let validated = ValidatedCreateTable {
             primary_key_name: None,
+            alias_type_names: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![crate::catalog::ColumnDef::new(
                 "body",
@@ -1589,6 +1630,7 @@ mod tests {
         let (storage, _guard) = tmp_storage("two-vector");
         let validated = ValidatedCreateTable {
             primary_key_name: None,
+            alias_type_names: Vec::new(),
             table_name: "docs".to_string(),
             columns: vec![
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),
