@@ -46,8 +46,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::ScalarRef;
 
 use super::allowlist::{
-    AggregateArg, AggregateSelectItem, BufferedOuter, BufferedRows, Projection, ScalarOrderKey,
-    ScanOrderKey, SqlSurfaceError, ValidatedAggregate, ValidatedBufferedView, ValidatedScan,
+    AggregateArg, BufferedOuter, BufferedRows, Projection, ScalarOrderKey, ScanOrderKey,
+    SqlSurfaceError, ValidatedAggregate, ValidatedBufferedView, ValidatedScan,
 };
 use super::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use super::expr_program::StackValue;
@@ -295,16 +295,7 @@ fn plan_aggregate(
     let mut idents = HashSet::new();
     super::parser::collect_where_predicate_idents(&agg.where_predicates, &mut idents);
     for item in &agg.items {
-        match item {
-            AggregateSelectItem::Aggregate(a) => {
-                if let AggregateArg::Expr(e) = &a.arg {
-                    super::parser::collect_expr_idents(e, &mut idents);
-                }
-            }
-            AggregateSelectItem::GroupKey { column, .. } => {
-                idents.insert(column.clone());
-            }
-        }
+        item.collect_referenced_idents(&mut idents);
     }
     if let Some(gb) = &agg.group_by {
         for c in &gb.columns {
@@ -865,7 +856,9 @@ fn reorder(rows: Vec<ResultRow>, idx: &[usize]) -> Result<Vec<ResultRow>, SqlSur
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::allowlist::{AggregateFunc, AggregateItem, Statement, WherePredicate};
+    use crate::sql::allowlist::{
+        AggregateFunc, AggregateItem, AggregateSelectItem, Statement, WherePredicate,
+    };
     use crate::sql::udf_call::{BinOp, Expr};
 
     fn text_col(name: &str) -> ColumnMeta {

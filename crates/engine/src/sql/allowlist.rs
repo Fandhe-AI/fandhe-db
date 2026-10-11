@@ -2371,6 +2371,100 @@ pub enum AggregateSelectItem {
         column: String,
         alias: Option<String>,
     },
+    /// 集計結果を葉とする算術式の投影項目（Issue #1541・SQL-42 (5) のポインタ。
+    /// `sum(n)+1`・`count(*)*2` など）。`expr` 中の集計関数呼び出しは `aggregates`
+    /// （出現順）へ抽出済みで、式木側には利用者が識別子として書けない内部名
+    /// （[`aggregate_placeholder`]）の `Expr::Ident` が代わりに置かれる。これにより
+    /// 公開 AST の式型 [`Expr`] を拡張せず、集計経路に変更を閉じ込める。式中の
+    /// 残りの裸識別子は `GROUP BY` 列と同名であることを [`parse_aggregate_shape`] が
+    /// 検査済み（不一致・`GROUP BY` なしは `42601`）。評価はグループ確定後
+    /// （`sql::group_by` の投影段）に行う。`alias` 省略時の列名は `?column?`。
+    Expr {
+        expr: Expr,
+        aggregates: Vec<AggregateItem>,
+        alias: Option<String>,
+    },
+}
+
+/// 集計式項目（[`AggregateSelectItem::Expr`]）内で集計呼び出しの代わりに置く内部名の接頭辞。
+/// 先頭の制御文字は字句解析器が受理する識別子（`[A-Za-z_][A-Za-z0-9_]*`。二重引用符形も同じ
+/// 制約）では生成できないため、利用者の列名・`GROUP BY` 列名・別名と衝突・すり替えが起きない。
+const AGG_PLACEHOLDER_PREFIX: &str = "\u{1}agg";
+
+/// `j` 番目の集計呼び出しの内部名（[`AggregateSelectItem::Expr`]）。
+pub(crate) fn aggregate_placeholder(j: usize) -> String {
+    format!("{AGG_PLACEHOLDER_PREFIX}{j}")
+}
+
+/// 内部名から集計呼び出しの添字を取り出す。内部名でなければ `None`。
+pub(crate) fn aggregate_placeholder_index(name: &str) -> Option<usize> {
+    name.strip_prefix(AGG_PLACEHOLDER_PREFIX)?.parse().ok()
+}
+
+/// 集計式項目の式中の裸識別子（内部名を除く。名前順）。
+pub(crate) fn expr_bare_idents(expr: &Expr) -> Vec<String> {
+    let mut idents = std::collections::HashSet::new();
+    super::parser::collect_expr_idents(expr, &mut idents);
+    let mut v: Vec<String> = idents
+        .into_iter()
+        .filter(|n| aggregate_placeholder_index(n).is_none())
+        .collect();
+    v.sort();
+    v
+}
+
+impl AggregateSelectItem {
+    /// この項目が参照する表の列名を `out` へ集める（ビューの公開列検査・相関参照検査・
+    /// 評価後射影形ビューの参照列収集が共有する単一実装）。集計式項目は、式中の裸識別子
+    /// （内部名を除く）と各集計呼び出しの引数の識別子を必ず含める（列の公開範囲検査から
+    /// 漏れると非公開列を式経由で参照できてしまうため。security.md「アクセス制御の不備」）。
+    pub(crate) fn collect_referenced_idents(&self, out: &mut std::collections::HashSet<String>) {
+        let agg_args = |agg: &AggregateItem, out: &mut std::collections::HashSet<String>| {
+            if let AggregateArg::Expr(e) = &agg.arg {
+                super::parser::collect_expr_idents(e, out);
+            }
+        };
+        match self {
+            AggregateSelectItem::GroupKey { column, .. } => {
+                out.insert(column.clone());
+            }
+            AggregateSelectItem::Aggregate(agg) => agg_args(agg, out),
+            AggregateSelectItem::Expr {
+                expr, aggregates, ..
+            } => {
+                for agg in aggregates {
+                    agg_args(agg, out);
+                }
+                out.extend(expr_bare_idents(expr));
+            }
+        }
+    }
+
+    /// SELECT リスト上の実効名（`HAVING`／`ORDER BY` の参照名・出力列名）。集計式項目は
+    /// 別名、なければ PostgreSQL の既定列名 `?column?`。
+    pub(crate) fn effective_name(&self) -> String {
+        match self {
+            AggregateSelectItem::GroupKey { column, alias } => {
+                alias.clone().unwrap_or_else(|| column.clone())
+            }
+            AggregateSelectItem::Aggregate(agg) => agg
+                .alias
+                .clone()
+                .unwrap_or_else(|| agg.func.default_alias().to_string()),
+            AggregateSelectItem::Expr { alias, .. } => {
+                alias.clone().unwrap_or_else(|| "?column?".to_string())
+            }
+        }
+    }
+
+    /// この項目が占める集計項目枠数（[`MAX_AGGREGATE_ITEMS`] の判定用。保守的に
+    /// 項目自身 1 ＋式中の集計呼び出し数で数える）。
+    fn slot_count(&self) -> usize {
+        match self {
+            AggregateSelectItem::Expr { aggregates, .. } => 1usize.saturating_add(aggregates.len()),
+            _ => 1,
+        }
+    }
 }
 
 /// `HAVING` 述語 1 つ（TASK-167・SQL-14）。左辺は SELECT リストに現れる集計項目の
@@ -3435,6 +3529,20 @@ struct Parser<'a> {
     /// `true` の間は単一テーブル FROM の別名を `42601` で拒否する（集合演算の枝が
     /// 既存の SELECT／集計パーサーを再利用するため、別名を枝へ持ち込ませない。Issue #1534）。
     reject_from_alias: bool,
+    /// 集計 SELECT リストで集計結果どうし・定数との算術式項目（[`AggregateSelectItem::Expr`]。
+    /// Issue #1541）を受理してよい文脈かどうか。トップレベル文（サブクエリ深さ 0）の
+    /// [`parse_aggregate_shape`] だけが `true` にする。CTE 本体・集合演算の枝・
+    /// サブクエリ内部・ビュー本体は既定の `false` のまま従来どおり `42601` で拒否する
+    /// （それらの経路は式項目の評価・列公開範囲検査を持たないため fail-closed）。
+    allow_aggregate_expr_items: bool,
+    /// 集計式項目の式モード解析中に、式の途中に現れた集計関数呼び出しを溜める先。
+    /// `Some` の間だけ [`Self::parse_call_expr`] が集計関数名を受理し、内部名の
+    /// `Expr::Ident` に置き換えて返す。`None`（既定）では従来どおり `42601`
+    /// （WHERE・CHECK・UDF 本体・集計引数内の入れ子集計など）。
+    agg_calls: Option<Vec<AggregateItem>>,
+    /// SELECT リストで既に確定した項目が占める集計項目枠数（[`AggregateSelectItem::slot_count`]
+    /// の合計）。式中の集計呼び出しを溜める前に [`MAX_AGGREGATE_ITEMS`] を検査するための基点。
+    agg_slots_used: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -3469,6 +3577,9 @@ impl<'a> Parser<'a> {
             max_insert_rows: None,
             from_ref: None,
             reject_from_alias: false,
+            allow_aggregate_expr_items: false,
+            agg_calls: None,
+            agg_slots_used: 0,
         }
     }
 
@@ -4048,7 +4159,26 @@ impl<'a> Parser<'a> {
     /// では `42601`（SQL-25 (c) の対象は `COUNT` のみ）。
     fn parse_aggregate_item(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
-        let func = AggregateFunc::from_name(&name).ok_or_else(|| {
+        let mut item = self.parse_aggregate_call_after_name(&name)?;
+        item.alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(item)
+    }
+
+    /// 集計関数名を読み終えた位置（次が `'('`）から `'(' [DISTINCT] ('*' | <expr>) ')'` までを
+    /// 読む（`AS` 別名は読まない。[`Self::parse_aggregate_item`] が別名を足し、集計式項目
+    /// 〔Issue #1541〕は式中の呼び出しとして別名なしで使う）。引数の解析中は集計呼び出しの
+    /// 収集と単項マイナス拡張を無効にし、引数文法を従来と完全に同一に保つ（入れ子集計
+    /// `sum(count(*))` は従来どおり `42601`）。
+    fn parse_aggregate_call_after_name(
+        &mut self,
+        name: &str,
+    ) -> Result<AggregateItem, SqlSurfaceError> {
+        let func = AggregateFunc::from_name(name).ok_or_else(|| {
             SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
         })?;
         self.expect_punct('(')?;
@@ -4086,22 +4216,98 @@ impl<'a> Parser<'a> {
                     "aggregate function requires exactly one argument",
                 ));
             }
-            let expr = self.parse_value_expr(0)?;
-            AggregateArg::Expr(expr)
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = false;
+            let parsed = self.parse_value_expr(0);
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            AggregateArg::Expr(parsed?)
         };
         self.expect_punct(')')?;
+        Ok(AggregateItem {
+            func,
+            arg,
+            alias: None,
+            distinct,
+        })
+    }
+
+    /// 式モード解析中（[`Self::agg_calls`] が `Some`）に現れた集計関数呼び出しを読み、
+    /// 内部名の `Expr::Ident` に置き換える（Issue #1541）。項目枠数は集計呼び出しを溜める
+    /// **前**に検査する（1 項目へ多数の集計を詰めてアキュムレータを無制限に確保させる
+    /// DoS の防止。超過は `54000`）。
+    fn parse_embedded_aggregate_call(&mut self, name: &str) -> Result<Expr, SqlSurfaceError> {
+        let used = self
+            .agg_slots_used
+            .saturating_add(self.agg_calls.as_ref().map_or(0, Vec::len));
+        check_aggregate_item_count(used.saturating_add(2))?;
+        let item = self.parse_aggregate_call_after_name(name)?;
+        self.consume_expr_node()?;
+        let calls = self
+            .agg_calls
+            .as_mut()
+            .ok_or_else(|| SqlSurfaceError::unsupported("aggregate call is not allowed here"))?;
+        let j = calls.len();
+        calls.push(item);
+        Ok(Expr::Ident(aggregate_placeholder(j)))
+    }
+
+    /// 集計式項目（[`AggregateSelectItem::Expr`]）を読む。`head` は式の先頭にある集計呼び出し
+    /// （読み済み。`None` なら先頭から式として読む）。式文法は投影項目の式モードと同じ
+    /// （`add → mul → primary` ＋ 単項マイナス）で、式中の集計関数呼び出しは
+    /// [`Self::parse_embedded_aggregate_call`] が収集する。集計呼び出しを 1 つも含まない
+    /// 式（`g * 2` 等）は本 Issue の対象外として `42601`。
+    fn parse_aggregate_expr_item(
+        &mut self,
+        head: Option<AggregateItem>,
+    ) -> Result<AggregateSelectItem, SqlSurfaceError> {
+        let saved_calls = self.agg_calls.take();
+        let saved_minus = self.allow_unary_minus;
+        self.agg_calls = Some(Vec::new());
+        self.allow_unary_minus = true;
+        let parsed = self.parse_aggregate_expr_body(head);
+        let calls = self.agg_calls.take();
+        self.agg_calls = saved_calls;
+        self.allow_unary_minus = saved_minus;
+        let expr = parsed?;
+        let aggregates = calls.unwrap_or_default();
+        if aggregates.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "arithmetic expression in aggregate SELECT list requires an aggregate function call",
+            ));
+        }
         let alias = if self.peek_ident_matches("AS") {
             self.advance();
             Some(self.expect_ident()?)
         } else {
             None
         };
-        Ok(AggregateItem {
-            func,
-            arg,
+        Ok(AggregateSelectItem::Expr {
+            expr,
+            aggregates,
             alias,
-            distinct,
         })
+    }
+
+    fn parse_aggregate_expr_body(
+        &mut self,
+        head: Option<AggregateItem>,
+    ) -> Result<Expr, SqlSurfaceError> {
+        match head {
+            Some(item) => {
+                check_aggregate_item_count(self.agg_slots_used.saturating_add(2))?;
+                self.consume_expr_node()?;
+                if let Some(calls) = self.agg_calls.as_mut() {
+                    calls.push(item);
+                }
+                let lhs = Expr::Ident(aggregate_placeholder(0));
+                // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
+                let mul = self.parse_mul_rest(lhs, 1)?;
+                self.parse_add_rest(mul, 0)
+            }
+            None => self.parse_value_expr(0),
+        }
     }
 
     /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
@@ -4116,7 +4322,32 @@ impl<'a> Parser<'a> {
             if is_aggregate_function_name(name)
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
             {
-                return Ok(AggregateSelectItem::Aggregate(self.parse_aggregate_item()?));
+                if !self.allow_aggregate_expr_items {
+                    return Ok(AggregateSelectItem::Aggregate(self.parse_aggregate_item()?));
+                }
+                // Issue #1541: 集計呼び出しの直後が算術演算子なら集計式項目、それ以外は
+                // 従来の集計項目（AST・既定列名は不変）。
+                let name = self.expect_ident()?;
+                let mut head = self.parse_aggregate_call_after_name(&name)?;
+                if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                    return self.parse_aggregate_expr_item(Some(head));
+                }
+                head.alias = if self.peek_ident_matches("AS") {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                return Ok(AggregateSelectItem::Aggregate(head));
+            }
+            // 裸識別子の直後が算術演算子（`g + sum(n)` 等）は式モード。
+            if self.allow_aggregate_expr_items
+                && matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                )
+            {
+                return self.parse_aggregate_expr_item(None);
             }
         }
         let column = self.expect_ident()?;
@@ -5685,6 +5916,10 @@ impl<'a> Parser<'a> {
             return self.parse_nullif_expr(depth);
         }
         if is_aggregate_function_name(&name) {
+            // Issue #1541: 集計式項目の式モード中だけ、式の途中の集計呼び出しを受理する。
+            if self.agg_calls.is_some() {
+                return self.parse_embedded_aggregate_call(&name);
+            }
             return Err(SqlSurfaceError::unsupported(format!(
                 "aggregate function {name} is only allowed as a top-level SELECT item"
             )));
@@ -8429,12 +8664,17 @@ fn check_body_aggregate(
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
     for item in &v.items {
-        if let AggregateSelectItem::Aggregate(agg) = item {
-            if let AggregateArg::Expr(e) = &agg.arg {
-                if !matches!(e, Expr::Ident(_)) {
-                    return Err(body_form_unsupported());
+        match item {
+            AggregateSelectItem::Aggregate(agg) => {
+                if let AggregateArg::Expr(e) = &agg.arg {
+                    if !matches!(e, Expr::Ident(_)) {
+                        return Err(body_form_unsupported());
+                    }
                 }
             }
+            // Issue #1541: 集計式項目はビュー本体には含めさせない（fail-closed）。
+            AggregateSelectItem::Expr { .. } => return Err(body_form_unsupported()),
+            AggregateSelectItem::GroupKey { .. } => {}
         }
     }
     push_relation(out, &v.table_name);
@@ -10037,7 +10277,7 @@ fn parse_set_branch(
     let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
         if looks_like_aggregate_select(slice) {
-            let shape = parse_aggregate_shape(slice, None, true)?;
+            let shape = parse_aggregate_shape(slice, None, true, false)?;
             p.pos = branch_end;
             return build_set_aggregate_branch(shape, lookup);
         }
@@ -10232,7 +10472,7 @@ fn parse_set_limited_branch(
     lookup: &impl TableLookup,
 ) -> Result<SetTree, SqlSurfaceError> {
     if looks_like_aggregate_select(slice) {
-        let shape = parse_aggregate_shape(slice, None, true)?;
+        let shape = parse_aggregate_shape(slice, None, true, false)?;
         return build_set_aggregate_branch(shape, lookup);
     }
     let shape = match parse_select_shape(slice, None, true)? {
@@ -10768,9 +11008,12 @@ fn parse_aggregate_shape(
     tokens: &[Token],
     subquery_ctx: Option<usize>,
     reject_from_alias: bool,
+    allow_expr_items: bool,
 ) -> Result<ParsedAggregateShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.reject_from_alias = reject_from_alias;
+    // Issue #1541: 集計式項目はトップレベル文だけが受理する（呼び出し元が判定して渡す）。
+    p.allow_aggregate_expr_items = allow_expr_items;
     if let Some(depth) = subquery_ctx {
         p = p.with_subquery_ctx(depth);
     }
@@ -10778,7 +11021,10 @@ fn parse_aggregate_shape(
     p.expect_keyword(Keyword::Select)?;
     let mut items = vec![p.parse_aggregate_select_item()?];
     while matches!(p.peek(), Some(Token::Punct(','))) {
-        if items.len() >= MAX_AGGREGATE_ITEMS {
+        // 項目枠数（集計式項目は式中の集計呼び出しぶんも数える。Issue #1541）で上限を
+        // 判定する。式中の集計呼び出しの収集前検査は `parse_embedded_aggregate_call`。
+        p.agg_slots_used = items.iter().map(AggregateSelectItem::slot_count).sum();
+        if p.agg_slots_used >= MAX_AGGREGATE_ITEMS {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many aggregate items",
             ));
@@ -10786,13 +11032,16 @@ fn parse_aggregate_shape(
         p.advance();
         items.push(p.parse_aggregate_select_item()?);
     }
+    check_aggregate_item_count(items.iter().map(AggregateSelectItem::slot_count).sum())?;
     // SELECT リストに集計項目が 1 つも無い（`GroupKey` のみ、いわゆる
     // `SELECT DISTINCT` 相当）形は許可しない（TASK-167・SQL-14 の受理形は集計
-    // 結果を持つ行のみを対象とする）。
-    if !items
-        .iter()
-        .any(|i| matches!(i, AggregateSelectItem::Aggregate(_)))
-    {
+    // 結果を持つ行のみを対象とする）。集計式項目は構文上 1 つ以上の集計呼び出しを持つ。
+    if !items.iter().any(|i| {
+        matches!(
+            i,
+            AggregateSelectItem::Aggregate(_) | AggregateSelectItem::Expr { .. }
+        )
+    }) {
         return Err(SqlSurfaceError::unsupported(
             "aggregate SELECT list requires at least one aggregate item",
         ));
@@ -10816,12 +11065,26 @@ fn parse_aggregate_shape(
         // `GroupKey` 項目（下の `else` 分岐）はいずれも許可リスト外として
         // `42601` に落とす。
         for item in &items {
-            if let AggregateSelectItem::GroupKey { column: c, .. } = item {
-                if !columns.contains(c) {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "SELECT list bare identifier {c:?} does not match any GROUP BY column {columns:?}"
-                    )));
+            match item {
+                AggregateSelectItem::GroupKey { column: c, .. } => {
+                    if !columns.contains(c) {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "SELECT list bare identifier {c:?} does not match any GROUP BY column {columns:?}"
+                        )));
+                    }
                 }
+                // Issue #1541: 集計式項目の集計の外の裸識別子も `GroupKey` と同じ規則
+                // （`GROUP BY` 列と同名であること）。SQL-14 の拒否契約（42601）を維持する。
+                AggregateSelectItem::Expr { expr, .. } => {
+                    for c in expr_bare_idents(expr) {
+                        if !columns.contains(&c) {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "SELECT list expression column {c:?} outside an aggregate does not match any GROUP BY column {columns:?}"
+                            )));
+                        }
+                    }
+                }
+                AggregateSelectItem::Aggregate(_) => {}
             }
         }
         let (having, having_exprs) = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
@@ -10860,6 +11123,14 @@ fn parse_aggregate_shape(
             .iter()
             .any(|i| matches!(i, AggregateSelectItem::GroupKey { .. }))
         {
+            return Err(SqlSurfaceError::unsupported(
+                "bare column reference in aggregate SELECT list requires GROUP BY",
+            ));
+        }
+        if items.iter().any(|i| match i {
+            AggregateSelectItem::Expr { expr, .. } => !expr_bare_idents(expr).is_empty(),
+            _ => false,
+        }) {
             return Err(SqlSurfaceError::unsupported(
                 "bare column reference in aggregate SELECT list requires GROUP BY",
             ));
@@ -11209,14 +11480,23 @@ fn aggregate_statement_from_resolved(
 ) -> Result<Statement, SqlSurfaceError> {
     if let super::view::Resolved::Buffered { view_name, body } = resolved {
         for item in &items {
-            if let AggregateSelectItem::Aggregate(agg) = item {
-                if let AggregateArg::Expr(e) = &agg.arg {
-                    if !matches!(e, Expr::Ident(_)) {
-                        return Err(SqlSurfaceError::unsupported(
-                            "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
-                        ));
+            match item {
+                AggregateSelectItem::Aggregate(agg) => {
+                    if let AggregateArg::Expr(e) = &agg.arg {
+                        if !matches!(e, Expr::Ident(_)) {
+                            return Err(SqlSurfaceError::unsupported(
+                                "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                            ));
+                        }
                     }
                 }
+                // Issue #1541: 評価後射影形ビューへの外側集計では集計式項目を評価しない（fail-closed）。
+                AggregateSelectItem::Expr { .. } => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                    ));
+                }
+                AggregateSelectItem::GroupKey { .. } => {}
             }
         }
         where_predicates
@@ -11373,7 +11653,7 @@ fn validate_sql_tokens_impl(
             let main = if is_distinct_modifier(main_tokens, 1) {
                 MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
             } else if main_is_aggregate_select {
-                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None, false)?)
+                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None, false, false)?)
             } else {
                 match parse_select_shape(main_tokens, None, false)? {
                     ParsedSelect::Scan(shape) => MainShape::Scan(shape),
@@ -11692,7 +11972,12 @@ fn validate_select_statement(
         );
     }
     if is_aggregate_select {
-        let shape = parse_aggregate_shape(tokens, subquery_ctx, false)?;
+        let shape = parse_aggregate_shape(
+            tokens,
+            subquery_ctx,
+            false,
+            subquery_ctx.is_none_or(|d| d == 0),
+        )?;
         let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
         return aggregate_statement_from_resolved(
             shape.table_name,
@@ -16784,7 +17069,96 @@ mod tests {
             AggregateSelectItem::GroupKey { .. } => {
                 panic!("expected an aggregate item, got a GroupKey item")
             }
+            AggregateSelectItem::Expr { .. } => {
+                panic!("expected an aggregate item, got an expression item")
+            }
         }
+    }
+
+    /// Issue #1541（SQL-42 (5) のポインタ）: 集計呼び出しの直後の算術演算子で集計式項目になり、
+    /// 式中の集計呼び出しは内部名へ置換されて `aggregates` に出現順で抽出される。
+    #[test]
+    fn aggregate_arithmetic_item_extracts_calls_into_placeholders() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT sum(n)+1, count(*)*2 AS c, max(a)-min(a) FROM documents",
+            &lookup,
+        );
+        assert_eq!(agg.items().len(), 3);
+        match &agg.items()[0] {
+            AggregateSelectItem::Expr {
+                expr,
+                aggregates,
+                alias,
+            } => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(aggregates[0].func, AggregateFunc::Sum);
+                assert_eq!(*alias, None);
+                assert!(matches!(
+                    expr,
+                    Expr::Binary { op: BinOp::Add, lhs, .. }
+                        if matches!(&**lhs, Expr::Ident(n) if aggregate_placeholder_index(n) == Some(0))
+                ));
+            }
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+        match &agg.items()[1] {
+            AggregateSelectItem::Expr { alias, .. } => assert_eq!(alias.as_deref(), Some("c")),
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+        match &agg.items()[2] {
+            AggregateSelectItem::Expr { aggregates, .. } => {
+                let funcs: Vec<_> = aggregates.iter().map(|a| a.func).collect();
+                assert_eq!(funcs, vec![AggregateFunc::Max, AggregateFunc::Min]);
+            }
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+    }
+
+    /// 従来形（集計単独・別名付き・`GROUP BY` 列）の AST は集計式項目の追加で変わらない。
+    #[test]
+    fn aggregate_arithmetic_keeps_plain_item_shapes() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate("SELECT sum(n) AS s, count(*) FROM documents", &lookup);
+        assert!(agg
+            .items()
+            .iter()
+            .all(|i| matches!(i, AggregateSelectItem::Aggregate(_))));
+        assert_eq!(expect_agg_item(&agg.items()[0]).alias.as_deref(), Some("s"));
+        let agg = expect_aggregate(
+            "SELECT lang, count(*) FROM documents GROUP BY lang",
+            &lookup,
+        );
+        assert!(matches!(
+            agg.items()[0],
+            AggregateSelectItem::GroupKey { .. }
+        ));
+    }
+
+    /// 集計式項目でも `GROUP BY` 外の列・`GROUP BY` なしの裸列・入れ子集計は `42601`、
+    /// 1 項目への過剰な集計詰め込みは `54000`。内部名は利用者の識別子と衝突しない。
+    #[test]
+    fn aggregate_arithmetic_rejections_and_limits() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT sum(n)+m FROM documents",
+            "SELECT lang, sum(n)+m FROM documents GROUP BY lang",
+            "SELECT sum(count(*))+1 FROM documents",
+            "SELECT lang+lang FROM documents GROUP BY lang",
+            "SELECT sum(n)+1 FROM documents WHERE count(*) > 1",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let many = vec!["count(*)"; 40].join("+");
+        let err = validate_sql(&format!("SELECT {many} FROM documents"), &lookup)
+            .expect_err("too many aggregate calls");
+        assert_eq!(err.wire_code(), "54000");
+        let lexed = crate::sql::lexer::tokenize("SELECT \"\u{1}agg0\" FROM documents");
+        assert!(
+            lexed.is_err(),
+            "placeholder-like identifiers cannot be written"
+        );
     }
 
     #[test]

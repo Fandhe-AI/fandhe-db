@@ -2011,58 +2011,9 @@ fn finish_groups(
         crate::sql::aggregate::aggregate_projection_columns(bound, schema)?;
 
     let mut rows = Vec::with_capacity(finished.len());
+    let mut project_scratch: Vec<StackValue> = Vec::new();
     for (key, cells, _) in finished {
-        let mut row_cells = Vec::with_capacity(bound.projection.len());
-        for col in &bound.projection {
-            let cell =
-                match col {
-                    // `key_index` は束縛段が `column_indices`（＝ `key.0`）の範囲内で
-                    // あることを保証済みの内部添字だが、`.get()` で明示的に扱い
-                    // 範囲外は fail-closed に `accumulator_bug`（`XX000`）へ落とす
-                    // （`.claude/rules/coding-rust.md`）。
-                    ProjectionColumn::GroupKey { key_index, .. } => match key.0.get(*key_index) {
-                        Some(Some(value)) => {
-                            // 列型（疑似列 `id` は `None`）から出力セルを復元する
-                            // （Issue #1185。`sql::scan` の同型列の投影と同じ variant）。
-                            let target =
-                                group_by.keys.get(*key_index).map(|k| k.target).ok_or_else(
-                                    || accumulator_bug("projection key_index has no bound key"),
-                                )?;
-                            let ty = match target {
-                                BoundOrderTarget::Id => None,
-                                // `GROUP BY` キーは式キーを持たない（Issue #1188 は広域取得の
-                                // `ORDER BY` 専用）。到達は束縛の不変条件違反のみ。
-                                BoundOrderTarget::Expr(_) => {
-                                    return Err(accumulator_bug(
-                                        "group key must not be an expression key",
-                                    ))
-                                }
-                                BoundOrderTarget::Column(index) => Some(
-                                    &schema
-                                        .columns
-                                        .get(index)
-                                        .ok_or_else(|| {
-                                            accumulator_bug("group key column index out of range")
-                                        })?
-                                        .ty,
-                                ),
-                            };
-                            order_value_to_cell(value, ty)?
-                        }
-                        Some(None) => Cell::Null,
-                        None => {
-                            return Err(accumulator_bug(
-                                "projection key_index out of bounds for GROUP BY key",
-                            ))
-                        }
-                    },
-                    ProjectionColumn::Aggregate { item_index, .. } => cells
-                        .get(*item_index)
-                        .cloned()
-                        .ok_or_else(|| accumulator_bug("projection item_index out of bounds"))?,
-                };
-            row_cells.push(cell);
-        }
+        let row_cells = project_row(bound, schema, &key, &cells, &mut project_scratch)?;
         rows.push(ResultRow {
             id: 0,
             score: 0.0,
@@ -2071,6 +2022,148 @@ fn finish_groups(
     }
 
     Ok(QueryResult { columns, rows })
+}
+
+/// 確定済みグループ 1 件（`GROUP BY` なしは単一行）の出力セルを `bound.projection` の列順で
+/// 組み立てる（PROJECT 段の唯一の実装。[`finish_groups`]・`sql::aggregate` の単一行集計・
+/// [`GroupedRowAccumulator`] が共有する）。式列（[`ProjectionColumn::Expr`]。Issue #1541）は
+/// グループ出力行ビュー（`GROUP BY` キー→集計項目の順。HAVING／ORDER BY の式と同じ添字系列）を
+/// 行スカラーとして評価する。呼び出しは `OFFSET`／`LIMIT` 適用後の出力行に限り、式の評価
+/// エラー（`22003`／`22012` 等）は可視行から作られたグループの値のみから生じるため
+/// そのまま fail-closed で返す。
+fn project_row(
+    bound: &BoundAggregate,
+    schema: &TableSchema,
+    key: &GroupKey,
+    cells: &[Cell],
+    scratch: &mut Vec<StackValue>,
+) -> Result<Vec<Cell>, SqlSurfaceError> {
+    let group_keys: &[crate::sql::parser::BoundOrderKey] = bound
+        .group_by
+        .as_ref()
+        .map(|g| g.keys.as_slice())
+        .unwrap_or(&[]);
+    // 式列が参照する行ビュー列のマスク（全式列の和）。式列が無ければ行ビューは作らない。
+    let mut union_mask: Option<Vec<bool>> = None;
+    for col in &bound.projection {
+        if let ProjectionColumn::Expr { mask, .. } = col {
+            let acc = union_mask.get_or_insert_with(Vec::new);
+            if acc.len() < mask.len() {
+                acc.resize(mask.len(), false);
+            }
+            for (slot, wanted) in acc.iter_mut().zip(mask) {
+                *slot |= *wanted;
+            }
+        }
+    }
+    let key_cells: Vec<Cell> = match &union_mask {
+        Some(mask) => group_key_cells(group_keys, mask, schema, key)?,
+        None => Vec::new(),
+    };
+    let scalars: Option<Vec<Option<row_codec::ScalarRef<'_>>>> = match &union_mask {
+        Some(mask) => Some(group_row_scalars(&key_cells, cells, mask)?),
+        None => None,
+    };
+
+    let mut row_cells = Vec::with_capacity(bound.projection.len());
+    for col in &bound.projection {
+        let cell = match col {
+            // `key_index` は束縛段が `column_indices`（＝ `key.0`）の範囲内で
+            // あることを保証済みの内部添字だが、`.get()` で明示的に扱い
+            // 範囲外は fail-closed に `accumulator_bug`（`XX000`）へ落とす
+            // （`.claude/rules/coding-rust.md`）。
+            ProjectionColumn::GroupKey { key_index, .. } => match key.0.get(*key_index) {
+                Some(Some(value)) => {
+                    // 列型（疑似列 `id` は `None`）から出力セルを復元する
+                    // （Issue #1185。`sql::scan` の同型列の投影と同じ variant）。
+                    let target = group_keys
+                        .get(*key_index)
+                        .map(|k| k.target)
+                        .ok_or_else(|| accumulator_bug("projection key_index has no bound key"))?;
+                    let ty = match target {
+                        BoundOrderTarget::Id => None,
+                        // `GROUP BY` キーは式キーを持たない（Issue #1188 は広域取得の
+                        // `ORDER BY` 専用）。到達は束縛の不変条件違反のみ。
+                        BoundOrderTarget::Expr(_) => {
+                            return Err(accumulator_bug("group key must not be an expression key"))
+                        }
+                        BoundOrderTarget::Column(index) => Some(
+                            &schema
+                                .columns
+                                .get(index)
+                                .ok_or_else(|| {
+                                    accumulator_bug("group key column index out of range")
+                                })?
+                                .ty,
+                        ),
+                    };
+                    order_value_to_cell(value, ty)?
+                }
+                Some(None) => Cell::Null,
+                None => {
+                    return Err(accumulator_bug(
+                        "projection key_index out of bounds for GROUP BY key",
+                    ))
+                }
+            },
+            ProjectionColumn::Aggregate { item_index, .. } => cells
+                .get(*item_index)
+                .cloned()
+                .ok_or_else(|| accumulator_bug("projection item_index out of bounds"))?,
+            ProjectionColumn::Expr {
+                program, result_ty, ..
+            } => {
+                let row_scalars = scalars
+                    .as_ref()
+                    .ok_or_else(|| accumulator_bug("projection expression without a row view"))?;
+                let value = program.eval(0, &[], row_scalars, scratch)?;
+                expr_value_to_cell(value, result_ty.as_ref())?
+            }
+        };
+        row_cells.push(cell);
+    }
+    Ok(row_cells)
+}
+
+/// `GROUP BY` なしの単一行集計の出力セルを組み立てる（[`project_row`] の空キー版。
+/// `sql::aggregate::finish_aggregate_result` と [`GroupedRowAccumulator::finish`] が使う）。
+pub(crate) fn project_ungrouped_row(
+    bound: &BoundAggregate,
+    schema: &TableSchema,
+    cells: &[Cell],
+) -> Result<Vec<Cell>, SqlSurfaceError> {
+    if bound
+        .projection
+        .iter()
+        .any(|c| matches!(c, ProjectionColumn::GroupKey { .. }))
+    {
+        return Err(accumulator_bug("group key projected without GROUP BY"));
+    }
+    let mut scratch: Vec<StackValue> = Vec::new();
+    project_row(bound, schema, &GroupKey(Vec::new()), cells, &mut scratch)
+}
+
+/// 式の評価値を出力セルへ変換する（Issue #1541）。`Scalar` は束縛時に確定した結果列型に
+/// 合わせて `Integer`／`BigInt` は整数セル、それ以外は浮動小数セル
+/// （[`crate::sql::exec::scalar_cell_for`]。通常 SELECT・スキャンと同じ写像）。
+/// 集計結果由来の式がベクトルを返すことは束縛上ありえないため `Vector` は fail-closed。
+fn expr_value_to_cell(
+    value: ExprValue<'_>,
+    result_ty: Option<&crate::catalog::ColumnType>,
+) -> Result<Cell, SqlSurfaceError> {
+    Ok(match value {
+        ExprValue::Scalar(v) => crate::sql::exec::scalar_cell_for(v, result_ty)?,
+        ExprValue::Bool(b) => Cell::Bool(b),
+        ExprValue::Text(t) => Cell::Text(t.into_owned()),
+        ExprValue::Date(d) => Cell::Date(d),
+        ExprValue::Timestamp(t) => Cell::Timestamp(t),
+        ExprValue::Null => Cell::Null,
+        ExprValue::Vector(_) => {
+            return Err(accumulator_bug(
+                "aggregate projection expression produced a vector",
+            ))
+        }
+    })
 }
 
 /// 評価済みの行（セル由来の `scanned`）を 1 行ずつ受け取って集計する実行器
@@ -2244,19 +2337,7 @@ impl<'a> GroupedRowAccumulator<'a> {
                 cells.push(acc.finish()?);
             }
             let columns = crate::sql::aggregate::aggregate_projection_columns(bound, schema)?;
-            let mut row_cells = Vec::with_capacity(bound.projection.len());
-            for col in &bound.projection {
-                match col {
-                    ProjectionColumn::Aggregate { item_index, .. } => {
-                        row_cells.push(cells.get(*item_index).cloned().ok_or_else(|| {
-                            accumulator_bug("projection item_index out of bounds")
-                        })?)
-                    }
-                    ProjectionColumn::GroupKey { .. } => {
-                        return Err(accumulator_bug("group key projected without GROUP BY"))
-                    }
-                }
-            }
+            let row_cells = project_ungrouped_row(bound, schema, &cells)?;
             return Ok(QueryResult {
                 columns,
                 rows: vec![ResultRow {
@@ -2333,12 +2414,43 @@ fn eval_group_row_exprs(
     scratch: &mut Vec<StackValue>,
     charge: &mut OrderKeyCharge<'_>,
 ) -> Result<(bool, Vec<Option<OrderValue>>), SqlSurfaceError> {
-    let nkeys = group_by.keys.len();
-    // キー成分は出力セルと同じ復元規則（`order_value_to_cell`）で `Cell` 化してから
-    // 行スカラーへ写す（`ENUM` はラベル文字列・疑似列 `id` は `Cell::Integer`）。
-    let mut key_cells: Vec<Cell> = Vec::with_capacity(nkeys);
-    for (i, bound_key) in group_by.keys.iter().enumerate() {
-        let wanted = group_by.group_row_mask.get(i).copied().unwrap_or(false);
+    let key_cells = group_key_cells(&group_by.keys, &group_by.group_row_mask, schema, key)?;
+    let scalars = group_row_scalars(&key_cells, cells, &group_by.group_row_mask)?;
+
+    for program in &group_by.having_exprs {
+        match program.eval(0, &[], &scalars, scratch)? {
+            ExprValue::Bool(true) => {}
+            ExprValue::Bool(false) | ExprValue::Null => return Ok((false, Vec::new())),
+            _ => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "HAVING expression did not evaluate to a boolean",
+                ))
+            }
+        }
+    }
+    let mut order_values = Vec::with_capacity(group_by.order_exprs.len());
+    for (program, kind) in &group_by.order_exprs {
+        let value = program.eval(0, &[], &scalars, scratch)?;
+        // 所有値化（TEXT の複製）の前に、式キーの保持分を結果予算へ課金する。
+        charge.charge(&value)?;
+        order_values.push(expr_value_to_order_value(&value, *kind)?);
+    }
+    Ok((true, order_values))
+}
+
+/// 行ビューのキー成分を出力セルと同じ復元規則（`order_value_to_cell`）で `Cell` 化する
+/// （`ENUM` はラベル文字列・疑似列 `id` は `Cell::Integer`）。`mask` が偽のキー列は値化せず
+/// `Cell::Null` にする。[`eval_group_row_exprs`]（HAVING／ORDER BY の式）と [`project_row`]
+/// （投影式。Issue #1541）が共有する。
+fn group_key_cells(
+    keys: &[crate::sql::parser::BoundOrderKey],
+    mask: &[bool],
+    schema: &TableSchema,
+    key: &GroupKey,
+) -> Result<Vec<Cell>, SqlSurfaceError> {
+    let mut key_cells: Vec<Cell> = Vec::with_capacity(keys.len());
+    for (i, bound_key) in keys.iter().enumerate() {
+        let wanted = mask.get(i).copied().unwrap_or(false);
         let component = key.0.get(i).and_then(Option::as_ref);
         let cell = match (wanted, component) {
             (true, Some(value)) => {
@@ -2361,10 +2473,21 @@ fn eval_group_row_exprs(
         };
         key_cells.push(cell);
     }
-    let mut scalars: Vec<Option<row_codec::ScalarRef<'_>>> =
+    Ok(key_cells)
+}
+
+/// グループ出力行ビュー（`keys`→集計項目の順。束縛側 `sql::parser::group_row_schema` と同じ
+/// 添字系列）の行スカラーを作る。`mask` が偽の列は値化しない（`None`）。
+fn group_row_scalars<'a>(
+    key_cells: &'a [Cell],
+    cells: &'a [Cell],
+    mask: &[bool],
+) -> Result<Vec<Option<row_codec::ScalarRef<'a>>>, SqlSurfaceError> {
+    let nkeys = key_cells.len();
+    let mut scalars: Vec<Option<row_codec::ScalarRef<'a>>> =
         Vec::with_capacity(nkeys.saturating_add(cells.len()));
     for (i, cell) in key_cells.iter().enumerate() {
-        if group_by.group_row_mask.get(i).copied().unwrap_or(false) {
+        if mask.get(i).copied().unwrap_or(false) {
             scalars.push(cell_to_scalar_ref(cell)?);
         } else {
             scalars.push(None);
@@ -2372,32 +2495,13 @@ fn eval_group_row_exprs(
     }
     for (j, cell) in cells.iter().enumerate() {
         let idx = nkeys.saturating_add(j);
-        if group_by.group_row_mask.get(idx).copied().unwrap_or(false) {
+        if mask.get(idx).copied().unwrap_or(false) {
             scalars.push(cell_to_scalar_ref(cell)?);
         } else {
             scalars.push(None);
         }
     }
-
-    for program in &group_by.having_exprs {
-        match program.eval(0, &[], &scalars, scratch)? {
-            ExprValue::Bool(true) => {}
-            ExprValue::Bool(false) | ExprValue::Null => return Ok((false, Vec::new())),
-            _ => {
-                return Err(SqlSurfaceError::invalid_input(
-                    "HAVING expression did not evaluate to a boolean",
-                ))
-            }
-        }
-    }
-    let mut order_values = Vec::with_capacity(group_by.order_exprs.len());
-    for (program, kind) in &group_by.order_exprs {
-        let value = program.eval(0, &[], &scalars, scratch)?;
-        // 所有値化（TEXT の複製）の前に、式キーの保持分を結果予算へ課金する。
-        charge.charge(&value)?;
-        order_values.push(expr_value_to_order_value(&value, *kind)?);
-    }
-    Ok((true, order_values))
+    Ok(scalars)
 }
 
 /// 集計・キーの出力セルを、式評価用の行スカラー（[`row_codec::ScalarRef`]）へ写す
