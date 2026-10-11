@@ -209,6 +209,72 @@ pub const MAX_INPUT_LEN: usize = 1_048_576;
 /// （security.md「不安全な設計｜無制限リソース確保」対応）。
 pub const MAX_TOKEN_COUNT: usize = 20_000;
 
+/// `QuotedBoolWord` を、WHERE の述語葉位置（直前が `WHERE`／`AND`／`OR`／`NOT`／それらに
+/// 続く `(`、直後が述語境界）以外では従来どおり `Ident` へ戻す（Issue #1526・PR #2297 指摘）。
+/// 引用付き `"true"`／`"false"` を列名として使う既存の全経路（DDL・投影・値式・INSERT・
+/// パラメータ束縛・等価比較）は `Ident` のみを前提にしているため、未引用リテラルとの区別が
+/// 必要な葉位置にだけ専用トークンを残し、互換性の影響範囲を最小化する。
+/// 境界の判定は `sql::allowlist` の述語境界判定の上位集合（`)` と集合演算子を常に含む）で、
+/// 取り違えても葉解析側が引用付き語を列参照として扱うため fail-closed を保つ。
+fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
+    let mut seen_where = false;
+    for i in 0..tokens.len() {
+        if matches!(tokens.get(i), Some(Token::Keyword(Keyword::Where))) {
+            seen_where = true;
+            continue;
+        }
+        if !matches!(tokens.get(i), Some(Token::QuotedBoolWord(_))) {
+            continue;
+        }
+        if !(seen_where && quoted_bool_word_in_leaf_position(tokens, i)) {
+            if let Some(Token::QuotedBoolWord(s)) = tokens.get(i).cloned() {
+                if let Some(slot) = tokens.get_mut(i) {
+                    *slot = Token::Ident(s);
+                }
+            }
+        }
+    }
+}
+
+/// [`demote_unneeded_quoted_bool_words`] の位置判定（`tokens[i]` が `QuotedBoolWord`）。
+fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
+    let next_ok = match i.checked_add(1).and_then(|n| tokens.get(n)) {
+        None => true,
+        Some(Token::Punct(';' | ')')) => true,
+        Some(Token::Keyword(Keyword::And | Keyword::Order | Keyword::Limit)) => true,
+        Some(Token::Ident(w)) => [
+            "USING",
+            "HINT",
+            "RETURNING",
+            "GROUP",
+            "HAVING",
+            "OR",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+        ]
+        .iter()
+        .any(|k| w.eq_ignore_ascii_case(k)),
+        _ => false,
+    };
+    if !next_ok {
+        return false;
+    }
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        match tokens.get(j) {
+            Some(Token::Punct('(')) => continue,
+            Some(Token::Keyword(Keyword::Where | Keyword::And)) => return true,
+            Some(Token::Ident(w)) => {
+                return w.eq_ignore_ascii_case("OR") || w.eq_ignore_ascii_case("NOT");
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// SQL テキストをトークン列へ変換する。`unwrap`/`expect`/添字アクセスを使わず、
 /// `chars()` イテレータの先読み（`Peekable`）のみで走査する。`$n` プレースホルダ
 /// （Issue #935・WIRE-12）は常に「未対応文字」として拒否する（[`tokenize_with_params`]
@@ -518,6 +584,7 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
         });
     }
 
+    demote_unneeded_quoted_bool_words(&mut tokens);
     Ok(tokens)
 }
 
@@ -1522,6 +1589,37 @@ mod tests {
                 Token::Number("3".to_string()),
                 Token::Punct(']')
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod quoted_bool_word_tests {
+    use super::*;
+
+    fn quoted_count(sql: &str) -> usize {
+        tokenize(sql)
+            .expect("tokenize")
+            .iter()
+            .filter(|t| matches!(t, Token::QuotedBoolWord(_)))
+            .count()
+    }
+
+    /// Issue #1526・PR #2297: WHERE の葉位置以外の引用付き `"true"` は従来どおり `Ident`。
+    #[test]
+    fn quoted_bool_word_is_ident_outside_where_leaf() {
+        assert_eq!(quoted_count("CREATE TABLE t (\"true\" BOOLEAN)"), 0);
+        assert_eq!(quoted_count("SELECT \"true\" FROM t"), 0);
+        assert_eq!(quoted_count("SELECT id FROM t WHERE \"true\" = true"), 0);
+        assert_eq!(quoted_count("SELECT id FROM t WHERE f(\"true\")"), 0);
+        assert_eq!(
+            quoted_count("SELECT id FROM t WHERE a = 1 ORDER BY \"true\""),
+            0
+        );
+        assert_eq!(quoted_count("SELECT id FROM t WHERE \"true\""), 1);
+        assert_eq!(
+            quoted_count("SELECT id FROM t WHERE a = 'x' AND (\"false\") OR x"),
+            1
         );
     }
 }

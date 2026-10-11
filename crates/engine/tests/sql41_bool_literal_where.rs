@@ -313,3 +313,63 @@ fn sql41_explain_does_not_panic() {
         );
     }
 }
+
+/// PR #2297 指摘: 引用付き `"true"`／`"false"` を列名として使う DDL・INSERT・投影・
+/// WHERE の各経路が従来どおり通る（WHERE の裸参照は列参照のまま）。
+#[test]
+fn sql41_quoted_bool_words_remain_usable_identifiers() {
+    let path = unique_db_path("sql41-quoted-bool-ident");
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let run = |sql: &str| {
+        core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"))
+    };
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut ddl,
+        "CREATE TABLE qdocs (embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN, \"false\" BOOLEAN)",
+    )
+    .expect("quoted bool-word column names are valid DDL identifiers");
+    run(
+        "INSERT INTO qdocs (id, embedding, \"true\", \"false\") VALUES (1, '[0.1,0.1]', true, false) \
+         USING OPERATION_ID 'q-1'",
+    );
+    run(
+        "INSERT INTO qdocs (id, embedding, \"true\", \"false\") VALUES (2, '[0.2,0.1]', false, true) \
+         USING OPERATION_ID 'q-2'",
+    );
+    let ids = |sql: &str| -> Vec<u64> {
+        let mut v: Vec<u64> = core
+            .execute_sql(&ctx, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"))
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(ids("SELECT \"true\" FROM qdocs LIMIT 10"), vec![1, 2]);
+    assert_eq!(ids("SELECT id FROM qdocs WHERE \"true\" LIMIT 10"), vec![1]);
+    assert_eq!(
+        ids("SELECT id FROM qdocs WHERE \"false\" LIMIT 10"),
+        vec![2]
+    );
+    assert_eq!(
+        ids("SELECT id FROM qdocs WHERE \"true\" = true LIMIT 10"),
+        vec![1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM qdocs WHERE NOT \"true\" LIMIT 10"),
+        vec![2]
+    );
+    assert_eq!(
+        ids("SELECT id FROM qdocs WHERE (\"true\") AND TRUE LIMIT 10"),
+        vec![1]
+    );
+}
