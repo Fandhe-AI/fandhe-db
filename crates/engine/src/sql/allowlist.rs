@@ -2512,6 +2512,8 @@ struct ParsedCreateTableColumn {
     references: Option<ParsedReferences>,
     /// 列制約 `CONSTRAINT <name> REFERENCES ...` の明示名（TABLE-22。Issue #1428）。
     references_name: Option<String>,
+    /// 列型に現れた型名エイリアスの原文の綴り（Issue #1528）。
+    alias_type_name: Option<String>,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -2795,6 +2797,9 @@ pub struct ValidatedCreateTable {
     /// 主キー構成列（[`Self::primary_key`] が `Some` の場合）は列制約・表制約の
     /// いずれで宣言されても `nullable = false` へ書き換え済み。
     pub columns: Vec<ColumnDef>,
+    /// 列型に現れた型名エイリアス（`INT4` 等。配列要素を含む）の原文の綴り（宣言順。
+    /// Issue #1528）。実行段が既存の同綴り ENUM 型との衝突を拒否するために使う。
+    pub alias_type_names: Vec<String>,
     /// `PRIMARY KEY` 宣言列名（宣言順。TABLE-16・TASK-204、Issue #903）。
     /// 未宣言（`id` 暗黙主キーのまま）は `None`。`PRIMARY KEY (id)`（`id` 単独）
     /// は暗黙主キーの明示宣言として受理したうえで `None` へ正規化する
@@ -6631,6 +6636,7 @@ impl<'a> Parser<'a> {
 
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
+        let mut alias_type_names: Vec<String> = Vec::new();
         // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
         // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
         // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
@@ -6805,6 +6811,7 @@ impl<'a> Parser<'a> {
                     }
                     foreign_keys.push(fk);
                 }
+                alias_type_names.extend(parsed.alias_type_name);
                 columns.push(parsed.column);
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -6874,6 +6881,7 @@ impl<'a> Parser<'a> {
         Ok(ValidatedCreateTable {
             table_name,
             columns,
+            alias_type_names,
             primary_key,
             unique_constraints,
             checks,
@@ -7033,6 +7041,8 @@ impl<'a> Parser<'a> {
         // カタログを参照しない）ため、ENUM 候補は未解決マーカーのまま運ぶ。
         let type_name =
             crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
+        let alias_type_name =
+            crate::sql::ddl_column_type::alias_spelling(&type_name).map(str::to_string);
         let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
@@ -7161,6 +7171,7 @@ impl<'a> Parser<'a> {
             checks,
             references,
             references_name,
+            alias_type_name,
         })
     }
 

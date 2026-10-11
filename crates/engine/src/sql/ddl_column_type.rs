@@ -73,6 +73,7 @@ pub(crate) fn to_static_column_type(
             scale: *scale,
         },
         SqlColumnTypeName::Vector(dim) => ColumnType::Vector(*dim),
+        SqlColumnTypeName::Alias { target, .. } => return to_static_column_type(target),
         SqlColumnTypeName::Enum(name) => return Ok(StaticColumnType::EnumCandidate(name.clone())),
         SqlColumnTypeName::Array { elem, max_len } => {
             let max_len = max_len.unwrap_or(MAX_ARRAY_ELEMENTS);
@@ -175,6 +176,14 @@ pub enum SqlColumnTypeName {
         precision: u8,
         scale: u8,
     },
+    /// 型名エイリアス `INT4`・`INT8`・`FLOAT4`・`FLOAT8`（Issue #1528）。`target` は写し先の
+    /// 組み込み型で、`name` は原文の綴り。作成経路は同名 ENUM の新規作成を拒否するが、
+    /// 本変更前から同名 ENUM が存在し得るため、実行段が `name` で既存 ENUM との衝突を
+    /// 検出して拒否する（組み込み型へ黙って解決しない。fail-closed）。
+    Alias {
+        name: String,
+        target: Box<SqlColumnTypeName>,
+    },
     /// 上記いずれの予約型名にも一致しなかった識別子。ENUM 型名の候補として
     /// 実行段が `Storage::get_enum_type` で存在確認・語彙解決する。
     Enum(String),
@@ -218,6 +227,25 @@ pub(crate) fn parse_column_type_name(
     })
 }
 
+/// 型名エイリアスの構文木を組み立てる（[`parse_base_type_name`] の下請け）。
+fn alias_type(name: String, target: SqlColumnTypeName) -> SqlColumnTypeName {
+    SqlColumnTypeName::Alias {
+        name,
+        target: Box::new(target),
+    }
+}
+
+/// 型名（配列要素を含む）に現れる型名エイリアスの原文の綴りを返す。実行段が既存 ENUM
+/// との衝突検出に使う（Issue #1528。`sql::ddl` の `CREATE TABLE`・`ADD COLUMN`・
+/// `ALTER COLUMN TYPE` から呼ばれる）。
+pub(crate) fn alias_spelling(ty: &SqlColumnTypeName) -> Option<&str> {
+    match ty {
+        SqlColumnTypeName::Alias { name, .. } => Some(name.as_str()),
+        SqlColumnTypeName::Array { elem, .. } => alias_spelling(elem),
+        _ => None,
+    }
+}
+
 /// 配列サフィックスを除いた基本型名 1 個の解析（[`parse_column_type_name`] の下請け）。
 ///
 /// 型名 → 列型の対応表はここに一本化されており、`CREATE TABLE`・`ADD COLUMN`・
@@ -232,10 +260,13 @@ fn parse_base_type_name(
     let name = expect_ident(tokens, pos)?;
     match name.to_ascii_uppercase().as_str() {
         "TEXT" => Ok(SqlColumnTypeName::Text),
-        "INTEGER" | "INT" | "INT4" => Ok(SqlColumnTypeName::Integer),
-        "BIGINT" | "INT8" => Ok(SqlColumnTypeName::BigInt),
-        "REAL" | "FLOAT4" => Ok(SqlColumnTypeName::Real),
-        "FLOAT8" => Ok(SqlColumnTypeName::Double),
+        "INTEGER" | "INT" => Ok(SqlColumnTypeName::Integer),
+        "BIGINT" => Ok(SqlColumnTypeName::BigInt),
+        "REAL" => Ok(SqlColumnTypeName::Real),
+        "INT4" => Ok(alias_type(name, SqlColumnTypeName::Integer)),
+        "INT8" => Ok(alias_type(name, SqlColumnTypeName::BigInt)),
+        "FLOAT4" => Ok(alias_type(name, SqlColumnTypeName::Real)),
+        "FLOAT8" => Ok(alias_type(name, SqlColumnTypeName::Double)),
         "DOUBLE" => {
             expect_contextual_keyword(tokens, pos, "PRECISION")?;
             Ok(SqlColumnTypeName::Double)
@@ -371,15 +402,36 @@ mod tests {
             ("INTEGER", SqlColumnTypeName::Integer),
             ("INT", SqlColumnTypeName::Integer),
             ("int", SqlColumnTypeName::Integer),
-            ("Int4", SqlColumnTypeName::Integer),
+            (
+                "Int4",
+                alias_type("Int4".to_string(), SqlColumnTypeName::Integer),
+            ),
             ("BIGINT", SqlColumnTypeName::BigInt),
-            ("INT8", SqlColumnTypeName::BigInt),
-            ("int8", SqlColumnTypeName::BigInt),
+            (
+                "INT8",
+                alias_type("INT8".to_string(), SqlColumnTypeName::BigInt),
+            ),
+            (
+                "int8",
+                alias_type("int8".to_string(), SqlColumnTypeName::BigInt),
+            ),
             ("REAL", SqlColumnTypeName::Real),
-            ("FLOAT4", SqlColumnTypeName::Real),
-            ("float4", SqlColumnTypeName::Real),
-            ("FLOAT8", SqlColumnTypeName::Double),
-            ("Float8", SqlColumnTypeName::Double),
+            (
+                "FLOAT4",
+                alias_type("FLOAT4".to_string(), SqlColumnTypeName::Real),
+            ),
+            (
+                "float4",
+                alias_type("float4".to_string(), SqlColumnTypeName::Real),
+            ),
+            (
+                "FLOAT8",
+                alias_type("FLOAT8".to_string(), SqlColumnTypeName::Double),
+            ),
+            (
+                "Float8",
+                alias_type("Float8".to_string(), SqlColumnTypeName::Double),
+            ),
             ("BOOLEAN", SqlColumnTypeName::Boolean),
             ("DATE", SqlColumnTypeName::Date),
             ("TIMESTAMP", SqlColumnTypeName::Timestamp),
@@ -395,6 +447,9 @@ mod tests {
 
     #[test]
     fn aliases_never_fall_through_to_enum() {
+        // 実行段の衝突検出に使う綴りを保持する（Issue #1528）。
+        let (ty, _) = parse_type("Int4").expect("valid");
+        assert_eq!(alias_spelling(&ty), Some("Int4"));
         for raw in ["INT", "INT4", "INT8", "FLOAT4", "FLOAT8"] {
             let (ty, consumed) = parse_type(raw).expect("valid");
             assert!(!matches!(ty, SqlColumnTypeName::Enum(_)), "for {raw:?}");
@@ -407,12 +462,12 @@ mod tests {
         let (ty, _) = parse_type("INT4[]").expect("valid");
         assert!(matches!(
             ty,
-            SqlColumnTypeName::Array { ref elem, .. } if **elem == SqlColumnTypeName::Integer
+            SqlColumnTypeName::Array { ref elem, .. } if alias_spelling(elem) == Some("INT4")
         ));
         let (ty, _) = parse_type("INT8[3]").expect("valid");
         assert!(matches!(
             ty,
-            SqlColumnTypeName::Array { ref elem, max_len: Some(3) } if **elem == SqlColumnTypeName::BigInt
+            SqlColumnTypeName::Array { ref elem, max_len: Some(3) } if alias_spelling(elem) == Some("INT8")
         ));
     }
 
