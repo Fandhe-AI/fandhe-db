@@ -4497,8 +4497,10 @@ impl<'a> Parser<'a> {
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         // Issue #1534・SQL-44 ポインタ: 単一テーブル FROM の公開名（別名があれば別名）に
-        // 一致しない修飾子は `42P01`。一致する修飾列参照の受理は #1535 が本フックを
-        // 「修飾子を剥がして非修飾列として処理」へ差し替えるまで従来どおり `42601`。
+        // 一致しない修飾子は `42P01`。通常 SELECT 系は #1535 の `sql::qualified_column`
+        // 正規化がパース前に修飾子を解消するため、本フックは正規化を適用しない経路
+        // （集合演算の枝等）と、正規化が書き換えない位置（関数名形等）の残りの規則として
+        // 働く。照合規則の実体は `TableRef::ensure_qualifier` 一本（ここに新規ロジックを足さない）。
         if let (Some(from_ref), Some(Token::QualifiedIdent { qualifier, .. })) =
             (self.from_ref.as_ref(), self.peek())
         {
@@ -9031,7 +9033,7 @@ const MAX_SET_OP_BRANCHES: usize = 16;
 /// `UNION`／`INTERSECT`/`EXCEPT` は [`Keyword`] 化しない（`lexer` モジュール
 /// ドキュメントと同じ理由。既存の列名・テーブル名としての用法を壊さないため）。
 /// 大文字小文字を区別せず [`Token::Ident`] を照合する。
-fn is_set_operator_ident(name: &str) -> bool {
+pub(super) fn is_set_operator_ident(name: &str) -> bool {
     name.eq_ignore_ascii_case("UNION")
         || name.eq_ignore_ascii_case("INTERSECT")
         || name.eq_ignore_ascii_case("EXCEPT")
@@ -9048,7 +9050,7 @@ fn is_set_operator_ident(name: &str) -> bool {
 /// 呼び出し）の呼び出し括弧まで集合演算の枝開始と誤検出し、UDF 呼び出しが
 /// 集合演算枝の解析経路（`Computed` 投影項目を拒否する）に誤って回されてしまう
 /// （Issue #929 最終レビュー指摘の回帰）。
-fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
+pub(super) fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
     let branch_starts_at = |idx: usize| -> bool {
         match tokens.get(idx) {
             Some(Token::Keyword(Keyword::Select)) => true,
@@ -9112,6 +9114,17 @@ fn is_single_table_reserved_word(w: &str) -> bool {
     is_join_reserved_word(w) || is_set_operator_ident(w)
 }
 
+/// `FROM` 直後のトークン列から `<table> [[AS] alias]` を試し解析し、`TableRef` と
+/// 消費トークン数を返す（解析不能なら `None`）。`sql::qualified_column` が修飾列参照の
+/// 正規化前に FROM の公開名を先読みするための入口で、別名・予約語の規則を
+/// [`Parser::parse_from_table_ref`]（Issue #1534）に一本化する（第 2 の実装を持たない）。
+pub(super) fn probe_from_table_ref(tokens: &[Token]) -> Option<(TableRef, usize)> {
+    let mut p = Parser::new(tokens);
+    p.parse_from_table_ref().ok()?;
+    let consumed = p.pos;
+    p.from_ref.take().map(|r| (r, consumed))
+}
+
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
 /// §2.2・#926）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
 /// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
@@ -9139,7 +9152,7 @@ pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
 
 /// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] JOIN...` の並びかどうかを
 /// 判定する（[`looks_like_join`] 参照）。
-fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
+pub(super) fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
     if !matches!(tokens.get(idx), Some(Token::Ident(_))) {
         return false;
     }
@@ -11224,7 +11237,10 @@ fn validate_sql_tokens_impl(
         _ if is_with_statement => {
             let mut p = Parser::new(tokens);
             let ctes = p.parse_with_clause()?;
-            let main_tokens = p.remaining();
+            // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
+            let main_normalized =
+                super::qualified_column::normalize_single_table_qualifiers(p.remaining())?;
+            let main_tokens: &[Token] = &main_normalized;
 
             if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
                 return Err(SqlSurfaceError::unsupported(
@@ -11513,6 +11529,11 @@ fn validate_select_statement(
         let validated = p.parse_const_select()?;
         return Ok(Statement::ConstSelect(validated));
     }
+    // Issue #1535・SQL-44 ポインタ: 単一テーブル FROM の公開名で修飾された列参照
+    // （`t.col`）を非修飾へ 1 対 1 で正規化する。以降の先読み・パースはすべて
+    // 正規化後のトークン列を見る（`sql::qualified_column` 参照）。
+    let normalized = super::qualified_column::normalize_single_table_qualifiers(tokens)?;
+    let tokens: &[Token] = &normalized;
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
