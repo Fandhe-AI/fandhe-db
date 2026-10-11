@@ -154,7 +154,9 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
 fn eval_node(expr: &Expr) -> Option<ExprValue<'static>> {
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let (bound, _ty) = bind_const_expr(expr, &registry, &mut budget).ok()?;
+    // 裸の NULL を含む式は型付き NULL へ畳んでから束縛し、短絡判定に使えるようにする。
+    let folded = propagate_null(expr).ok()?;
+    let (bound, _ty) = bind_const_expr(&folded, &registry, &mut budget).ok()?;
     eval(&bound, 0, &[]).ok()
 }
 
@@ -316,13 +318,6 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
             let r = propagate_null(rhs)?;
             let (ln, rn) = (null_kind(&l), null_kind(&r));
             if ln.is_some() || rn.is_some() {
-                // 消去される非 NULL 側の中間精度も、消去前にここで検査する。
-                if ln.is_none() {
-                    check_intermediate_precision(&l)?;
-                }
-                if rn.is_none() {
-                    check_intermediate_precision(&r)?;
-                }
                 fold_null_binary(*op, &l, &r, ln, rn)?
             } else {
                 Expr::Binary {
@@ -364,10 +359,11 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
             "only built-in functions are allowed in a constant expression",
         ));
     }
-    // NULL 伝播（型付き NULL への畳み込み）後の式で精度検査と最終評価を行い、
-    // 短絡判定と評価結果を一致させる（NULL を含む先頭引数で後続の検査が省かれない）。
+    // 最終評価は NULL 伝播（型付き NULL への畳み込み）後の式で行う。
+    // 精度検査は NULL 畳み込み前の元の式に対し短絡評価で選ばれた枝だけで行う
+    // （畳み込みは型検証専用。未評価枝の精度欠落を 22003 にしない）。
+    check_intermediate_precision(expr)?;
     let propagated = propagate_null(expr)?;
-    check_intermediate_precision(&propagated)?;
     if matches!(propagated, Expr::Null) {
         return Ok(InsertLiteral::Null);
     }
@@ -635,5 +631,32 @@ mod tests {
             ])),
             Err(SqlSurfaceError::DatatypeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn unevaluated_branch_null_precision_is_not_checked() {
+        let big = || {
+            bin(
+                BinOp::Add,
+                Expr::Null,
+                call("power", vec![num("2"), num("54")]),
+            )
+        };
+        // COALESCE は先頭引数で確定し、後続の NULL 演算内の精度欠落を検査しない。
+        assert_eq!(
+            fold_const_literal(&Expr::Coalesce(vec![num("1"), big()])).unwrap(),
+            InsertLiteral::Number("1".into())
+        );
+        // CASE も選ばれない ELSE 枝は検査しない。
+        assert_eq!(
+            fold_const_literal(&Expr::Case {
+                whens: vec![(bin(BinOp::Eq, num("1"), num("1")), num("1"))],
+                else_result: Some(Box::new(big())),
+            })
+            .unwrap(),
+            InsertLiteral::Number("1".into())
+        );
+        // 評価される枝では従来どおり 22003。
+        assert!(fold_const_literal(&Expr::Coalesce(vec![Expr::Null, big()])).is_err());
     }
 }
