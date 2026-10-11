@@ -38,16 +38,26 @@ pre-commit:
     # 拡張子 `.env` は旧パターンの検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
-        # プロセス起動回数をファイル数に比例させないため、全ファイル名を 1 回の
-        # grep パイプラインで判定する（ファイルごとに printf + grep × 3 を起動する旧実装は
-        # --all-files（約 3,000 ファイル）で約 11.8 秒かかった。2026-10-11 計測）。
-        # 拒否パターンに一致し、かつ許可リストに一致しない行が 1 行でもあれば拒否する
-        # （grep の「一致なし」の終了コード 1 は正常扱いにし、出力の有無で判定する）
+        # プロセス起動回数をファイル数に比例させないため、awk 1 本で全パスを判定する
+        # （ファイルごとに printf + grep × 3 を起動する旧実装は --all-files（約 3,000
+        # ファイル）で約 11.8 秒かかった。2026-10-11 計測）。拒否パターンに一致し、かつ
+        # 許可リストに一致しないパスが 1 件でもあれば拒否する。
+        # grep パイプラインでは「一致なし」（終了状態 1）とエラー（2 以上）を区別できず
+        # fail-open になるため、awk の終了状態で判定する。awk 自体が失敗した場合は
+        # 判定できていないパスが残るため fail-closed で拒否する。
+        # 正規表現は awk -v ではなく ENVIRON で渡す（-v はバックスラッシュをエスケープとして
+        # 解釈し `\.` が崩れるため）。BSD awk は UTF-8 ロケールで不正なマルチバイト列に
+        # 当たると異常終了するため LC_ALL=C で照合する（パターンは ASCII のみ）。
+        # Fandhe-AI/fandhe-browser・fandhe-container と同型の実装
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         re_ok='\.(example|sample|template|pub)$'
-        bad="$(printf '%s\n' {staged_files} | grep -E "$re" | grep -vE "$re_ok")"
-        if [ -n "$bad" ]; then
-          printf '%s\n' "$bad" | while IFS= read -r f; do
+        if ! hits=$(printf '%s\n' {staged_files} \
+          | LC_ALL=C RE="$re" RE_OK="$re_ok" awk '$0 ~ ENVIRON["RE"] && $0 !~ ENVIRON["RE_OK"]'); then
+          echo "NG: ファイル名の判定に失敗したため秘密情報の検査を完了できません" >&2
+          exit 1
+        fi
+        if [ -n "$hits" ]; then
+          printf '%s\n' "$hits" | while IFS= read -r f; do
             echo "NG: 秘密情報ファイルがステージされています: $f" >&2
           done
           exit 1

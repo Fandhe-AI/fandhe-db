@@ -64,9 +64,11 @@ paths:
 - `pre-commit` の `parallel: true` を維持する（直列化しない）
 - `{staged_files}` と `glob` / `exclude` で対象を絞る
 - staged ファイル数・diff 行数に比例してプロセスを起動するループ（ファイルごとに `grep` を起動する等）は
-  書かない。全件を 1 回のパイプラインで判定する（secrets-guard はこの形に置き換えて
+  書かない。全件を 1 回の処理で判定する（secrets-guard は awk 1 本の判定に置き換えて
   `--all-files` で約 11.8 秒 → 0.03 秒になった。2026-10-11 計測）
 - 検査の高速化・書き換えでは検出範囲と fail-closed（判定できない場合は拒否する側に倒す）を維持する
+  - `grep` は「一致なし」（終了状態 1）とエラー（2 以上）を区別できる形で使う。`grep` パイプラインの出力の有無だけで
+    判定すると、`grep` の失敗が「該当なし」になり fail-open になる（secrets-guard は awk の終了状態で判定している）
 - cargo 系ジョブは `Cargo.toml`・ツールの有無を判定してスキップできるようにする（既存の rustfmt-check と同方針）
 - 条件付き実行が必要な場合は lefthook の `skip` / `only` を使ってよい
   （`.claude/skills/lefthook/references/examples/skip.md`）
