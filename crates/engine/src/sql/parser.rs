@@ -4890,6 +4890,26 @@ pub(crate) enum ProjectionColumn {
     GroupKey { key_index: usize, name: String },
     /// `items[item_index]` の集計結果。
     Aggregate { item_index: usize, name: String },
+    /// 集計結果を葉とする算術式の投影項目（Issue #1541・SQL-42 (5) のポインタ）。`program` は
+    /// 「グループ出力行ビュー」（`GROUP BY` キー〔`keys`〕→ 集計項目〔`items`。式中の集計呼び出し
+    /// 用の内部項目を含む〕の順の列。HAVING／ORDER BY の式と同じ添字系列）を行スカラーとして
+    /// 評価する投影モードのステップ列。`result_ty` は RowDescription に公告する結果列型
+    /// （`ColumnMeta::Computed`）、`mask` は評価前に値化する行ビュー列（未参照の列の変換
+    /// エラーで無関係な式が失敗しないようにする）。`name` は別名、省略時は `?column?`。
+    Expr {
+        program: crate::sql::expr_program::ExprProgram,
+        name: String,
+        result_ty: Option<ColumnType>,
+        mask: Vec<bool>,
+    },
+}
+
+/// 集計式項目の内部集計（式中の集計呼び出し）に付ける項目名。利用者が書ける識別子では
+/// ありえない先頭の制御文字を含むため、`HAVING`／`ORDER BY` の名前解決
+/// （[`resolve_group_reference`]）が可視項目と取り違えたり曖昧エラー（`42702`）を誘発したり
+/// しない（Issue #1541）。
+fn hidden_aggregate_name(item_index: usize) -> String {
+    format!("\u{1}hidden{item_index}")
 }
 
 /// HAVING 述語 1 つを束縛した形（TASK-167・SQL-14）。`item_index` は
@@ -5709,6 +5729,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // （`group_by_columns` の添字）に付けられたエイリアスかを保持するため
     // `Vec<(usize, String)>` にする）。
     let mut group_key_aliases: Vec<(usize, String)> = Vec::new();
+    // 集計式項目（Issue #1541）。`GROUP BY` キー確定後に束縛するため位置と材料を保持する。
+    struct PendingProjectionExpr<'a> {
+        position: usize,
+        expr: &'a Expr,
+        hidden_items: Vec<usize>,
+        name: String,
+    }
+    let mut pending_exprs: Vec<PendingProjectionExpr<'_>> = Vec::new();
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
@@ -5759,6 +5787,42 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 }
                 projection.push(ProjectionColumn::GroupKey { key_index, name });
             }
+            // Issue #1541: 集計式項目。式中の集計呼び出しは、可視項目と同じ入力解決を通した
+            // 内部集計項目として `items` へ積む（WHERE／RLS を適用する走査・アキュムレータを
+            // 共有し、別経路を作らない）。式本体は `GROUP BY` キーの解決後（下）に束縛する。
+            AggregateSelectItem::Expr {
+                expr,
+                aggregates,
+                alias,
+            } => {
+                let mut hidden = Vec::with_capacity(aggregates.len());
+                for agg in aggregates {
+                    let input = if agg.distinct {
+                        resolve_count_distinct_input(&agg.arg, schema, udfs, &mut node_budget)?
+                    } else {
+                        resolve_aggregate_input(agg.func, &agg.arg, schema, udfs, &mut node_budget)?
+                    };
+                    let item_index = items.len();
+                    items.push(BoundAggregateItem {
+                        func: agg.func,
+                        input,
+                        name: hidden_aggregate_name(item_index),
+                        distinct: agg.distinct,
+                    });
+                    hidden.push(item_index);
+                }
+                pending_exprs.push(PendingProjectionExpr {
+                    position: projection.len(),
+                    expr,
+                    hidden_items: hidden,
+                    name: alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                });
+                // 式の束縛後に差し替える一時項目（差し替え漏れは下で `Internal`）。
+                projection.push(ProjectionColumn::Aggregate {
+                    item_index: usize::MAX,
+                    name: String::new(),
+                });
+            }
         }
     }
 
@@ -5783,6 +5847,33 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         )?),
     };
 
+    // Issue #1541: 集計式項目を投影モードで束縛する（`GROUP BY` キー列は束縛済みの
+    // `group_by.keys`。`GROUP BY` なしは空）。
+    if !pending_exprs.is_empty() {
+        let keys: &[BoundOrderKey] = group_by.as_ref().map(|g| g.keys.as_slice()).unwrap_or(&[]);
+        for pending in pending_exprs {
+            let (program, result_ty, mask) = bind_aggregate_projection_expr(
+                pending.expr,
+                &pending.hidden_items,
+                group_by_columns,
+                keys,
+                schema,
+                &items,
+                udfs,
+                &mut node_budget,
+            )?;
+            let slot = projection.get_mut(pending.position).ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug("projection expression slot out of bounds")
+            })?;
+            *slot = ProjectionColumn::Expr {
+                program,
+                name: pending.name,
+                result_ty,
+                mask,
+            };
+        }
+    }
+
     // Issue #353: `BoundStatement` と同じく `expr_filters` を束縛時に 1 回だけ
     // ステップ列コンパイルする。
     let expr_filter_programs = expr_filters
@@ -5801,6 +5892,64 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         projection,
         group_by,
     })
+}
+
+/// 集計式項目 1 つ（[`ProjectionColumn::Expr`]）を束縛する（Issue #1541・SQL-42 (5)）。
+/// 式中の識別子は構文段が「集計呼び出しの内部名」か「`GROUP BY` 列名」に限定済みで、
+/// それぞれ行ビューの合成列（`__ga<j>`／`__gk<i>`）へ置換してから投影モード
+/// （[`crate::sql::udf_call::bind_projection_expr`]）で束縛する。HAVING／ORDER BY 用の
+/// [`resolve_group_reference`] は集計項目の実効名も解決してしまう（`SELECT sum(n) AS s, s+1`
+/// が通ってしまう）ため使わない。どちらにも当たらない識別子は構文段の不変条件違反として
+/// `Internal`（fail-closed）。行ビューの列型は結果型に精密な型を使い
+/// （`MIN/MAX(int4)` → `Integer` 等）、PostgreSQL と同じ整数・単精度・倍精度の結果型を得る。
+#[allow(clippy::too_many_arguments)]
+fn bind_aggregate_projection_expr(
+    expr: &Expr,
+    hidden_items: &[usize],
+    group_by_columns: &[String],
+    keys: &[BoundOrderKey],
+    schema: &TableSchema,
+    items: &[BoundAggregateItem],
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<
+    (
+        crate::sql::expr_program::ExprProgram,
+        Option<ColumnType>,
+        Vec<bool>,
+    ),
+    SqlSurfaceError,
+> {
+    let resolve = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
+        if let Some(j) = crate::sql::allowlist::aggregate_placeholder_index(name) {
+            return hidden_items
+                .get(j)
+                .map(|idx| OrderTarget::Aggregate(*idx))
+                .ok_or_else(|| {
+                    crate::sql::aggregate::accumulator_bug("aggregate placeholder out of range")
+                });
+        }
+        group_by_columns
+            .iter()
+            .position(|c| c == name)
+            .map(OrderTarget::GroupKey)
+            .ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug(
+                    "aggregate expression column does not match a GROUP BY column",
+                )
+            })
+    };
+    let rewritten = rewrite_group_row_idents(expr, &resolve)?;
+    let view_schema = group_row_schema(schema, keys, items, true);
+    let (bound, _ty, result_ty) =
+        crate::sql::udf_call::bind_projection_expr(&rewritten, &view_schema, udfs, node_budget)?;
+    let mut mask = vec![false; keys.len().saturating_add(items.len())];
+    crate::sql::udf_call::mark_referenced_scalar_columns(&bound, &mut mask);
+    Ok((
+        crate::sql::expr_program::ExprProgram::compile(&bound),
+        result_ty,
+        mask,
+    ))
 }
 
 /// 束縛済みの広域取得（ソートなしのフィルタ取得）`SELECT` 文（Issue #454）。
@@ -6754,7 +6903,7 @@ fn bind_group_by_clause(
     // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。未知は `22000`・曖昧は `42702`）で
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
-    let view_schema = group_row_schema(schema, &keys, items);
+    let view_schema = group_row_schema(schema, &keys, items, false);
     let mut group_row_mask = vec![false; keys.len().saturating_add(items.len())];
     let mut having_exprs = Vec::with_capacity(clause.having_exprs.len());
     for pred in &clause.having_exprs {
@@ -6862,6 +7011,18 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     }
 }
 
+/// 投影式（Issue #1541）が参照する行ビューの集計列型。実セルの型と 1 対 1 の
+/// [`crate::sql::aggregate::aggregate_result_type`] をそのまま使う。ただし `NUMERIC`
+/// （`SUM/MIN/MAX` の疑似列 `id` を含む）と型を決められない組み合わせは `BYTEA` にし、
+/// 束縛が「式で使えない列」として `22000` で拒否する（`NUMERIC` の算術を `f64` で黙って
+/// 近似しない。fail-closed）。
+fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
+    match crate::sql::aggregate::aggregate_result_type(item.func, &item.input) {
+        Some(ColumnType::Numeric { .. }) | None => ColumnType::Bytea,
+        Some(ty) => ty,
+    }
+}
+
 /// グループ出力行ビューの合成スキーマ（Issue #1188・SQL-26）。列は `GROUP BY` キー
 /// （`__gk<i>`）→ 集計項目（`__ga<j>`）の順で、`HAVING`／`ORDER BY` の式束縛
 /// （[`crate::sql::udf_call::bind_expr`]）と実行時の行スカラービュー
@@ -6872,13 +7033,16 @@ fn group_row_schema(
     schema: &TableSchema,
     keys: &[BoundOrderKey],
     items: &[BoundAggregateItem],
+    precise: bool,
 ) -> TableSchema {
     let mut columns = Vec::with_capacity(keys.len().saturating_add(items.len()));
     for (i, key) in keys.iter().enumerate() {
         let ty = match key.target {
             BoundOrderTarget::Column(index) => match schema.columns.get(index).map(|c| &c.ty) {
-                Some(ColumnType::Integer | ColumnType::BigInt) => ColumnType::BigInt,
-                Some(ColumnType::Real | ColumnType::Double) => ColumnType::Double,
+                // `precise`（投影式。Issue #1541）は整数・単精度の列型を保ち、PostgreSQL と
+                // 同じ結果型の算術（`g + 1` → int4 等）を得る。
+                Some(ColumnType::Integer | ColumnType::BigInt) if !precise => ColumnType::BigInt,
+                Some(ColumnType::Real | ColumnType::Double) if !precise => ColumnType::Double,
                 Some(ColumnType::Enum(_)) => ColumnType::Text,
                 Some(other) => other.clone(),
                 None => ColumnType::Bytea,
@@ -6889,11 +7053,12 @@ fn group_row_schema(
         columns.push(ColumnDef::new(format!("__gk{i}"), ty, true));
     }
     for (j, item) in items.iter().enumerate() {
-        columns.push(ColumnDef::new(
-            format!("__ga{j}"),
-            aggregate_result_column_type(item),
-            true,
-        ));
+        let ty = if precise {
+            projection_row_column_type(item)
+        } else {
+            aggregate_result_column_type(item)
+        };
+        columns.push(ColumnDef::new(format!("__ga{j}"), ty, true));
     }
     TableSchema::new("__group_row", columns)
 }
