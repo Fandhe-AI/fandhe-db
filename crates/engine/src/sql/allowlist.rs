@@ -3718,10 +3718,15 @@ impl<'a> Parser<'a> {
                 } else if starts_call {
                     is_extract_syntax = name.eq_ignore_ascii_case("extract");
                     self.advance();
-                    let head = self.parse_call_expr(name, 0)?;
+                    // 関数の引数内の単項マイナスも、先頭が関数でない場合（`1+abs(-n)`・
+                    // `(abs(-n)+1)`）と同じ契約にそろえる。エラー時も必ず元の値へ戻す。
+                    let prev = self.allow_unary_minus;
+                    self.allow_unary_minus = true;
+                    let head = self.parse_call_expr(name, 0);
+                    self.allow_unary_minus = prev;
+                    let head = head?;
                     if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
                         // `parse_value_expr(0)` と同じ段位（add=0・mul=1・primary=2）で継続する。
-                        let prev = self.allow_unary_minus;
                         self.allow_unary_minus = true;
                         let r = self
                             .parse_mul_rest(head, 1)
@@ -18873,6 +18878,29 @@ mod tests {
             select_expr_items(&stmt).remove(0),
             SelectItem::Expr { alias: None, .. }
         ));
+    }
+
+    /// 先頭が関数でも、引数内の単項マイナスの受理可否が `1+abs(-n)`・括弧付きと一致する。
+    #[test]
+    fn projection_leading_call_accepts_unary_minus_in_args() {
+        let a = first_expr("abs(-n)+1");
+        let b = first_expr("(abs(-n)+1)");
+        assert_eq!(a, b);
+        let c = first_expr("1+abs(-n)");
+        assert_eq!(
+            c,
+            bin(
+                BinOp::Add,
+                num("1"),
+                match &a {
+                    Expr::Binary { lhs, .. } => (**lhs).clone(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            )
+        );
+        assert!(scan_items("abs(-n)").is_ok());
+        // 解析後は元の契約へ戻る（WHERE 側の単項マイナス拒否は別経路）。
+        assert!(scan_items("abs(n)+1").is_ok());
     }
 
     #[test]
