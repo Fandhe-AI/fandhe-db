@@ -13714,6 +13714,22 @@ mod tests {
         );
     }
 
+    /// SQL-42・Issue #1521: lexer が `%`／単独 `#` を字句化しても、構文段は受理しない
+    /// （fail-closed）。変更前後で 42601 は同じ。
+    #[test]
+    fn rejects_percent_and_hash_tokens_as_syntax_error() {
+        for sql in [
+            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE n # 1 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents ORDER BY n % 2 LIMIT 5",
+            "SELECT * FROM documents WHERE lang = 'ja' %",
+            "SELECT * FROM documents WHERE lang = 'ja' #",
+        ] {
+            assert_rejected_as_syntax_error(sql);
+        }
+    }
+
     #[test]
     fn rejects_cte() {
         assert_rejected_as_syntax_error(
