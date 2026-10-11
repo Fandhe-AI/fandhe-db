@@ -262,6 +262,7 @@ pub mod rerank;
 pub mod rls;
 pub mod row_codec;
 pub mod scalar_float;
+pub mod schema_limits;
 pub mod scoring_boost;
 pub mod search_engine;
 pub mod sparse;

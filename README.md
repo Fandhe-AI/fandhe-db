@@ -83,6 +83,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--durability immediate|none] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
+  [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
   [--partitioned-dml-chunk-rows <1-1000000>] [--partitioned-dml-scan-budget <1-1000000>] \
   [--partitioned-dml-max-hold-ms <100-5000>] \
   [--partitioned-dml-max-jobs-per-tenant <1-64>] [--partitioned-dml-max-jobs <1-64>] \
@@ -311,6 +312,17 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 2 回目以降の重複指定は fail-closed で起動エラーです。環境変数側も同じ範囲
 検証を通り、範囲外（上限超過を含む）は既定 64 へ倒れます（従来は 0・非数値のみ
 既定へ倒れ、上限はありませんでした）。
+
+`--max-table-columns <N>`（既定 256・範囲 `1`〜`256`）・`--max-array-elements <N>`（既定 1,024・
+範囲 `1`〜`1,024`）・`--max-enum-labels <N>`（既定 256・範囲 `1`〜`256`）（Issue #1548・SQL-46）は、
+1 テーブルの列数・配列列 1 個の要素数・ENUM 型 1 個のラベル数の上限を、プロセス全体に対して起動時に
+**下げる方向だけ**設定します（未指定は現行のハード上限と同じ値で、挙動は変わりません）。設定値は
+`CREATE TABLE`・`ALTER TABLE ... ADD COLUMN`・`ALTER COLUMN ... TYPE`・`CREATE TYPE ... AS ENUM` の
+新しい定義にだけ効き、すでに作成済みのテーブル・型の読み出しや書き込みには影響しません（上限を
+下げて再起動しても既存データは読めます）。超過時の SQLSTATE は従来と同じで、列数・ラベル数は `54000`、
+配列の `[N]` 宣言は `42601` です。`<型>[]`（要素数省略）は設定値を要素数上限にします。範囲外・非数値・
+値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。上限を引き上げることはできません
+（詳細: [docs/design/schema-limits-cli.md](docs/design/schema-limits-cli.md)）。
 
 `--auth-method`（Issue #940・WIRE-18・TASK-222）は SQL 表層の SASL 認証方式を
 選ぶ opt-in CLI 引数です。`--search-engine`／`--durability` と同型の「プロセス
