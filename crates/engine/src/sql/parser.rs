@@ -2842,10 +2842,8 @@ fn bind_insert_row(
                 )))
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
-            // `INSERT ... VALUES` 構文からは構築されない（`sql::allowlist` の
-            // VALUES リテラルパーサーは `NULL` トークンを生成しない）が、NoSQL
-            // 表層 `insert` op（Issue #904 D5）が JSON `null` を本 variant として
-            // 渡すため到達する。TABLE-16 の確定契約: 明示 `NULL` には `DEFAULT`
+            // `INSERT ... VALUES`（Issue #1523・SQL-41）と、NoSQL 表層 `insert` op
+            // （Issue #904 D5。JSON `null`）の両方から到達する。TABLE-16 の確定契約: 明示 `NULL` には `DEFAULT`
             // を適用せず、nullable 列は `Value::Null`、非 nullable 列は
             // `NotNullViolation`（`23502`）へ倒す（省略時の `DEFAULT` 補完とは
             // 独立の経路。下の省略列補完ループ参照）。
@@ -7514,6 +7512,37 @@ mod tests {
         bind_insert(&stmt, &docs_schema())
     }
 
+    /// 明示 `NULL`（Issue #1523・SQL-41）は nullable 列で `Value::Null` になり、
+    /// 列を省略した文と束縛結果・行エンコードが一致する。
+    #[test]
+    fn bind_insert_explicit_null_matches_omitted_column() {
+        let explicit = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body, lang) VALUES (1, '[0.1,0.2,0.3]', 'hello', NULL) USING OPERATION_ID 'op-n1'",
+        )
+        .expect("explicit NULL into nullable column");
+        let omitted = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-n1'",
+        )
+        .expect("omitted nullable column");
+        assert_eq!(explicit.values, omitted.values);
+        assert_eq!(explicit.values.last(), Some(&crate::row_codec::Value::Null));
+    }
+
+    /// 非 nullable 列への明示 `NULL` は `23502`、`id` 疑似列への `NULL` は `22000`。
+    #[test]
+    fn bind_insert_explicit_null_rejected_for_not_null_and_id() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', NULL) USING OPERATION_ID 'op-n2'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "23502");
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (NULL, '[0.1,0.2,0.3]', 'b') USING OPERATION_ID 'op-n3'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
     #[test]
     fn binds_insert_with_all_columns() {
         let bound = bind_insert_sql(
@@ -9283,9 +9312,8 @@ mod tests {
         // NULL を含む対象キーは NULLS DISTINCT のため重複判定の対象外。`c` を
         // 列リストから省略する（`nullable` かつ `DEFAULT` 無し。
         // `fill_omitted_columns` が暗黙 `Value::Null` を補う）ことで NULL を
-        // 作る（SQL テキストの `INSERT ... VALUES` は明示 `NULL` リテラルの
-        // 構文を持たない。`InsertLiteral::Null` のドキュメンテーションコメント
-        // 参照）。
+        // 作る（明示 `NULL` リテラルでも同じ `Value::Null` になる。Issue #1523・
+        // `InsertLiteral::Null` のドキュメンテーションコメント参照）。
         let schema = unique_target_schema();
         let bound = bind_upsert_sql(
             "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'p'), (2, 'y', 'p') \

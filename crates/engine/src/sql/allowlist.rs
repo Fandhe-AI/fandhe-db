@@ -2538,13 +2538,12 @@ pub enum InsertLiteral {
     /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
     Bool(bool),
     /// SQL `NULL`（明示的な NULL 指定。Issue #889 レビュー指摘・PR #1014）。
-    /// SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・構文規則が
-    /// 無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを生成
-    /// しない）、SQL テキストの `INSERT ... VALUES` 構文からも構築されない
-    /// （VALUES 要素パーサーが `NULL` トークンを受理しない）。本 variant は
-    /// NoSQL 表層 `update`／`insert` op（`wire-server::http::query::update::
-    /// map_set_assignments`・`insert::bind_row`。TABLE-16・TASK-204、
-    /// Issue #904 D5）が JSON `null` から構築する。
+    /// SQL テキストでは `INSERT ... VALUES` の要素からのみ構築される
+    /// （Issue #1523・SQL-41。`Parser::expect_insert_value`）。`UPDATE ... SET`・
+    /// `ON CONFLICT ... DO UPDATE SET`・`DEFAULT` では引き続き構築されない
+    /// （`42601`）。NoSQL 表層 `update`／`insert` op（`wire-server::http::query::
+    /// update::map_set_assignments`・`insert::bind_row`。TABLE-16・TASK-204、
+    /// Issue #904 D5）も JSON `null` から構築する。
     ///
     /// 明示的な `NULL` には `DEFAULT` を適用しない契約（TABLE-16）のため、
     /// 「省略」（`DEFAULT` 適用対象。`sql::parser::fill_omitted_columns`）とは
@@ -5803,8 +5802,10 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
-    /// 括弧・`NULL` キーワード等は許可リスト外）。
+    /// リテラル 1 要素（文字列・数値・`true`/`false`・符号付き数値のみ。関数呼び出し・
+    /// 括弧等は許可リスト外）。本関数自体は `NULL` を受理しない（`DEFAULT NULL` を
+    /// `42601` で拒否する TABLE-16 の契約を維持するため。INSERT の VALUES だけは
+    /// [`Self::expect_insert_value`] が `NULL` を先に処理する）。
     /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）の負数リテラルを
     /// 受理するため、`-` の直後に `Number` トークンが続く形（`parse_having` の
     /// 単項マイナス処理と同じ規範。空白を挟む形も許容）だけを単項マイナスとして
@@ -5857,6 +5858,22 @@ impl<'a> Parser<'a> {
                 "expected literal value, got {other:?}"
             ))),
         }
+    }
+
+    /// INSERT の VALUES 要素 1 つを解析する（Issue #1523・SQL-41）。文法は
+    /// [`Self::expect_literal`] の文法に大小無視の `NULL` を加えたもの。
+    /// `expect_literal` 本体を拡張しないのは、同関数を直接呼ぶ `DEFAULT NULL`
+    /// （TABLE-16 の契約で `42601`）や UPDATE／UPSERT の SET を受理側に
+    /// 巻き込まないため。この位置では従来 `Token::Ident` を `true`/`false` 以外
+    /// すべて拒否していたので純粋な追加（Issue #883 の Bool と同じ判断）。
+    /// 束縛（`sql::parser::bind_insert_row`）が nullable 列なら `Value::Null`、
+    /// 非 nullable 列なら `23502` に解決する。
+    fn expect_insert_value(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("NULL")) {
+            self.advance();
+            return Ok(InsertLiteral::Null);
+        }
+        self.expect_literal()
     }
 
     /// `INSERT INTO <table> (<col>[, <col>]*)
@@ -6040,13 +6057,13 @@ impl<'a> Parser<'a> {
         columns: &[String],
     ) -> Result<Vec<InsertLiteral>, SqlSurfaceError> {
         self.expect_punct('(')?;
-        let mut values = vec![self.expect_literal()?];
+        let mut values = vec![self.expect_insert_value()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if values.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many INSERT values"));
             }
-            values.push(self.expect_literal()?);
+            values.push(self.expect_insert_value()?);
         }
         self.expect_punct(')')?;
 
@@ -14345,6 +14362,73 @@ mod tests {
                 action: OnConflictAction::DoNothing,
             })
         );
+    }
+
+    /// INSERT の VALUES は `NULL`（大小無視）を `InsertLiteral::Null` として受理する
+    /// （Issue #1523・SQL-41）。
+    #[test]
+    fn insert_values_accept_null_literal() {
+        let lookup = catalog_with(&["documents"]);
+        for kw in ["NULL", "null", "Null"] {
+            let sql = format!(
+                "INSERT INTO documents (id, embedding, lang) VALUES (1, {kw}, 'x'), (2, 'y', {kw}) \
+                 USING OPERATION_ID 'op-null-1'"
+            );
+            let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect(&sql);
+            assert_eq!(stmt.rows.len(), 2);
+            assert_eq!(stmt.rows[0][1], InsertLiteral::Null);
+            assert_eq!(stmt.rows[1][2], InsertLiteral::Null);
+        }
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, NULL) ON CONFLICT (id) DO NOTHING \
+             USING OPERATION_ID 'op-null-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("NULL with ON CONFLICT DO NOTHING");
+        assert_eq!(stmt.rows[0][1], InsertLiteral::Null);
+    }
+
+    /// `NULL` 以外の識別子・符号付き `NULL`・列数不一致は従来どおり拒否する。
+    #[test]
+    fn insert_values_reject_non_null_identifiers_and_signed_null() {
+        let lookup = catalog_with(&["documents"]);
+        for lit in ["foo", "-NULL", "+NULL"] {
+            let sql = format!(
+                "INSERT INTO documents (id, lang) VALUES (1, {lit}) USING OPERATION_ID 'op-null-3'"
+            );
+            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (NULL) USING OPERATION_ID 'op-null-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// UPDATE SET・UPSERT の DO UPDATE SET・`DEFAULT` では `NULL` を受理しない
+    /// （Issue #1523 のスコープ外。TABLE-16 の `DEFAULT NULL` 拒否契約を含む）。
+    #[test]
+    fn null_literal_stays_rejected_outside_insert_values() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = NULL WHERE id = 1 USING OPERATION_ID 'op-null-5'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
+             lang = NULL USING OPERATION_ID 'op-null-6'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
