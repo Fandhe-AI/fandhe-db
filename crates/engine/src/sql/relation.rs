@@ -67,6 +67,26 @@ impl TableRef {
     pub fn exposed_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.table)
     }
+
+    /// 修飾子 `qualifier` がこの参照の公開名（[`Self::exposed_name`]）と一致するか。
+    /// JOIN の [`BindingScope::resolve`] と単一テーブル FROM の修飾子検査
+    /// （`sql::allowlist` の `Parser::from_ref`。Issue #1534・SQL-44 ポインタ）が
+    /// 共有する唯一の照合規則（大小文字は区別する）。
+    pub fn matches_qualifier(&self, qualifier: &str) -> bool {
+        self.exposed_name() == qualifier
+    }
+
+    /// 修飾子が公開名に一致しなければ `42P01`（[`SqlSurfaceError::undefined_table`]）で
+    /// 拒否する。カタログを照会せず入力された修飾子だけを返すため、別テーブルの
+    /// 実在を示すオラクルにならない（fail-closed）。別名指定後に元のテーブル名で
+    /// 修飾した場合も同じく拒否される（PostgreSQL 準拠）。
+    pub fn ensure_qualifier(&self, qualifier: &str) -> Result<(), SqlSurfaceError> {
+        if self.matches_qualifier(qualifier) {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::undefined_table(qualifier))
+        }
+    }
 }
 
 /// SELECT リスト・WHERE 句などが参照する列（修飾子は任意）。字句層の
@@ -212,7 +232,7 @@ impl<'a> BindingScope<'a> {
                 let position = self
                     .relations
                     .iter()
-                    .position(|(r, _)| r.exposed_name() == qualifier)
+                    .position(|(r, _)| r.matches_qualifier(qualifier))
                     .ok_or_else(|| SqlSurfaceError::undefined_table(qualifier))?;
                 let (_, schema) = &self.relations[position];
                 self.resolve_in_relation(position, schema, column.name())
@@ -357,6 +377,30 @@ mod tests {
             .resolve(&ColumnRef::qualified("nope", "x"))
             .unwrap_err();
         assert_eq!(err.error_class().wire_code(), "42P01");
+    }
+
+    #[test]
+    fn ensure_qualifier_matches_exposed_name_only() {
+        let plain = TableRef::new("t");
+        assert!(plain.ensure_qualifier("t").is_ok());
+        assert_eq!(
+            plain
+                .ensure_qualifier("u")
+                .unwrap_err()
+                .error_class()
+                .wire_code(),
+            "42P01"
+        );
+        let aliased = TableRef::with_alias("t", "x");
+        assert!(aliased.ensure_qualifier("x").is_ok());
+        assert_eq!(
+            aliased
+                .ensure_qualifier("t")
+                .unwrap_err()
+                .error_class()
+                .wire_code(),
+            "42P01"
+        );
     }
 
     #[test]
