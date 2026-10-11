@@ -57,10 +57,10 @@ USER dev
 WORKDIR /work
 
 # make deny（deny.toml。Cargo.toml 追加後に有効化）がクリーンなコンテナでも即実行
-# できるよう、cargo-deny をイメージビルド時に導入しておく（Makefile の deny ターゲット
+# できるよう、cargo-deny をイメージビルド時に導入しておく（scripts/deny.sh（make deny）
 # 自体も未導入なら自動導入する自己修復を持つが、初回 docker-ci でのネットワーク依存を
 # 避けるためここで先行導入する。dev ユーザーの CARGO_HOME 配下にインストールされる。
-# バージョンは Makefile の CARGO_DENY_VERSION と同期させる）。
+# バージョンは scripts/lib.sh の CARGO_DENY_VERSION と同期させる）。
 RUN cargo install cargo-deny@0.20.2 --locked
 
 CMD ["bash"]

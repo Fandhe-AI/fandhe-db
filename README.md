@@ -46,6 +46,8 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ### タスクランナー（Makefile）
 
+`Makefile` は薄い入口で、複数行・条件分岐を伴う処理の実体は `scripts/` 配下の bash スクリプトにあります（Make を使わない場合の直接コマンド一覧は `scripts/help.sh`、`make help` でターゲット一覧を表示）。編集方針は [`.claude/rules/makefile.md`](.claude/rules/makefile.md)（make skill: `.claude/skills/make`）を参照してください。
+
 | コマンド | 内容 |
 | -------- | ---- |
 | `make setup` | 開発環境の一括構築（submodule → rustup → lefthook） |

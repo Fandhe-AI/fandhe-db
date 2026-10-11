@@ -1,3 +1,4 @@
+# ジョブ追加・変更時は .claude/rules/github-actions.md に従うこと。
 name: CI
 
 on:
@@ -8,11 +9,17 @@ on:
 permissions:
   contents: read
 
+env:
+  # 生の steps を持つ独立ジョブ（reusable workflow の外）の cargo ビルドで増分コンパイル用の
+  # 中間ファイルを作らない（CI は毎回クリーンビルドで再利用されないため時間・ディスクの無駄）
+  CARGO_INCREMENTAL: "0"
+
 concurrency:
   # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
   # 別 PR が同一グループになり、互いの CI を cancel し合う。PR #4 codex P2 指摘）
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PR のみ古い run を cancel する。main への push は連続マージでも各コミットの結果を残す
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # --------------------------------------------------

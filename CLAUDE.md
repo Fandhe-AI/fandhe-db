@@ -17,7 +17,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 fandhe-db/
 ├── CLAUDE.md / AGENTS.md          # Claude 運用方針 / レビュー観点集（ai-review の基準）
 ├── README.md                      # 概要・実装方針（要点）・開発環境構築
-├── Makefile                       # タスクランナー（make setup / make ci / docker-*）
+├── Makefile                       # タスクランナー（薄い入口。処理は scripts/ に置く。make setup / make ci / docker-*。編集は makefile.md に従う）
 ├── lefthook.yml                   # git hooks（rustfmt・secrets-guard・Conventional Commits。clippy/test は CI のみ）
 ├── Dockerfile / compose.yaml      # 環境非依存の開発コンテナ（make docker-ci）
 ├── deny.toml                      # cargo-deny 設定（make deny で有効化済み）
@@ -31,7 +31,7 @@ fandhe-db/
 │   ├── design/                    # 設計ドキュメント（ADR 形式・public）
 │   └── spec/                      # fandhe-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
-│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-interrupt + crash-test-cross-table + crash-test-unique-index + crash-test-partitioned-dml（Issue #1131 の分割実行 DML crash 耐性）+ tmp-leak-check（Issue #1303 のテスト一時領域残置検出）+ test-default-build（既定ビルド専用回帰テスト）+ core-api-check + sort-determinism-check + scripts-test（scripts/tests の Python 単体テスト）+ simd-codegen-check（Issue #467 の SIMD 生成コード検査）+ cross-check（aarch64 クロスコンパイル確認）の CI
+│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-interrupt + crash-test-cross-table + crash-test-unique-index + crash-test-partitioned-dml（Issue #1131 の分割実行 DML crash 耐性）+ tmp-leak-check（Issue #1303 のテスト一時領域残置検出）+ test-default-build（既定ビルド専用回帰テスト）+ core-api-check + sort-determinism-check + scripts-test（scripts/tests の Python 単体テスト）+ simd-codegen-check（Issue #467 の SIMD 生成コード検査）+ cross-check（aarch64 クロスコンパイル確認）の CI（編集は github-actions.md に従う）
 │   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 で usearch 接続済み・既定ゲート）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は GPU 搭載環境向けの Issue #178 opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）+ TASK-83 SQL 表層 C1 p95 専有環境再測定（Conditional Go 条件7・workflow_dispatch 限定）
 │   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
 │   ├── toolchain-canary.yml       # Issue #1477 beta toolchain での simd-codegen-check（x86_64・aarch64）週次先行検知（schedule + workflow_dispatch。PR ゲート外）
@@ -46,7 +46,7 @@ fandhe-db/
 │   ├── skills/                    # npx skills add 導入スキル
 │   ├── workflows/                 # implement-issue-tree.js (相対 symlink)
 │   └── settings.json              # SessionStart / PostToolUse hooks
-├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_interrupt.sh・crash_test_cross_table.sh・crash_test_unique_index.sh・crash_test_partitioned_dml.sh・check_tmp_leak.sh・check_core_api.sh・check_sort_determinism.sh・check_simd_codegen.sh・sync_issue_behavior_ids.py 等。make 経由で実行）
+├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_interrupt.sh・crash_test_cross_table.sh・crash_test_unique_index.sh・crash_test_partitioned_dml.sh・check_tmp_leak.sh・check_core_api.sh・check_sort_determinism.sh・check_simd_codegen.sh・sync_issue_behavior_ids.py 等。make 経由で実行。Makefile の複数行処理の実体〔setup.sh・lint_docs.sh・deny.sh 等〕と共有ヘルパー lib.sh、Make 非依存の一覧 help.sh を含む）
 ├── Cargo.toml                     # workspace 定義（members: crates/engine, crates/wire-server）
 └── crates/                        # engine（lib）/ wire-server（lib+bin）workspace
 ```
@@ -103,6 +103,8 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [spec-confidentiality.md](.claude/rules/spec-confidentiality.md) | **リポ固有・P0**: private spec のポインタ表記運用 |
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: 依存最小・`=x.y.z` 固定・ユーザー承認制 |
 | [git-hooks.md](.claude/rules/git-hooks.md) | lefthook の編集方針（時間予算・CI と重複する検査を置かない・例外の rustfmt-check） |
+| [makefile.md](.claude/rules/makefile.md) | Makefile を薄い入口に保つ方針・ターゲット追加手順・scripts/ の規約（`Makefile`・`scripts/**`） |
+| [github-actions.md](.claude/rules/github-actions.md) | runner 方針・必須チェック名・発火条件・ジョブ追加チェックリスト（`.github/workflows/**`） |
 
 ## Current Skills
 
@@ -110,6 +112,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 - **ワークフロー系**: create-commit / create-pr / create-issue / create-issue-tree / create-plan / implement-issue / implement-issue-tree / implement-review / implement-review-pr / update-issue-tree / update-docs / comment-code
 - **メンテ系**: init-claude / update-claude / contribute-skill / sync-skills-lock / setup-repo-guards
+- **Makefile 系**: make（Makefile を薄い入口にし scripts/ へ処理を置く方針。詳細は [makefile.md](.claude/rules/makefile.md)）
 - **リファレンス系**: rust / github-docs / commitlint / lefthook / editorconfig / nvidia-cuda / amd-rocm / apple-silicon
 
 ## Conventions

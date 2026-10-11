@@ -1,0 +1,3 @@
+# shellcheck の設定。scripts/*.sh が `source lib.sh` で参照する相対パスを解決する
+source-path=SCRIPTDIR
+external-sources=true
