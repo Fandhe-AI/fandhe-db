@@ -4,7 +4,7 @@
 //! 型名 → 列型の対応表は `sql::ddl_column_type` に一本化されている。ここでは
 //! `EngineCore::execute_sql_in_session`（字句解析 → 構文検証 → DDL 権限ゲート →
 //! 型解決 → `Storage` 反映）の production 経路で、別名が正規名と同じ列型として
-//! 永続化されること、未登録の型名が従来の `42601` のまま副作用なく拒否されること、
+//! 永続化されること、未確定型が両綴りとも同一の `0A000` で副作用なく拒否されること、
 //! 権限ゲートが型解決より先であること（`42501`）を固定する。
 
 use engine::catalog::ColumnType;
@@ -111,22 +111,30 @@ fn alias_declared_columns_round_trip_values() {
     assert_eq!(result.rows.len(), 1);
 }
 
+/// 未確定型（`INT2`／`SMALLINT`・`VARCHAR`／`CHARACTER VARYING`・`CHAR`／`CHARACTER`）は
+/// `0A000` で拒否し、真に未知の型名・`DOUBLE` 単独は従来どおり `42601`（Issue #2303。
+/// ポインタ: TABLE-29・TABLE-30・TABLE-31）。拒否後はテーブルが作られない。
 #[test]
-fn unregistered_type_names_keep_their_rejection_without_side_effects() {
-    let (path, _g, core) = open("ta-unregistered");
+fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
+    let (path, _g, core) = open("ta-unsettled");
     let mut s = allowed();
     for sql in [
         "CREATE TABLE t (a INT2)",
         "CREATE TABLE t (a int2)",
+        "CREATE TABLE t (a SMALLINT)",
         "CREATE TABLE t (a VARCHAR)",
         "CREATE TABLE t (a VARCHAR(10))",
+        "CREATE TABLE t (a CHARACTER VARYING(10))",
         "CREATE TABLE t (a CHAR)",
         "CREATE TABLE t (a CHAR(1))",
-        "CREATE TABLE t (a DOUBLE)",
+        "CREATE TABLE t (a CHARACTER(1))",
     ] {
+        assert_eq!(err(&core, &mut s, sql).wire_code(), "0A000", "{sql}");
+    }
+    for sql in ["CREATE TABLE t (a DOUBLE)", "CREATE TABLE t (a INT16)"] {
         assert_eq!(err(&core, &mut s, sql).wire_code(), "42601", "{sql}");
     }
-    let unknown = err(&core, &mut s, "CREATE TABLE t (a INT2)").to_string();
+    let unknown = err(&core, &mut s, "CREATE TABLE t (a INT16)").to_string();
     assert!(unknown.contains("unknown type name"), "{unknown}");
     drop(core);
     let storage = Storage::open(&path).expect("reopen");
@@ -136,12 +144,55 @@ fn unregistered_type_names_keep_their_rejection_without_side_effects() {
     );
 }
 
+/// 同一型の両綴りが CREATE TABLE・ADD COLUMN・ALTER COLUMN TYPE の全経路で
+/// 同じ `wire_code` とメッセージになり、拒否後にスキーマが変わらない。
 #[test]
-fn ddl_permission_gate_precedes_alias_resolution() {
+fn unsettled_spellings_match_on_every_ddl_path_and_leave_schema() {
+    let (path, _g, core) = open("ta-unsettled-paths");
+    let mut s = allowed();
+    run(&core, &mut s, "CREATE TABLE t (a INT)").expect("create");
+    let pairs = [
+        ("INT2", "SMALLINT"),
+        ("VARCHAR(10)", "CHARACTER VARYING(10)"),
+        ("CHAR(1)", "CHARACTER(1)"),
+    ];
+    for (x, y) in pairs {
+        let paths: [fn(&str) -> String; 3] = [
+            |t| format!("CREATE TABLE u (a {t})"),
+            |t| format!("ALTER TABLE t ADD COLUMN b {t}"),
+            |t| format!("ALTER TABLE t ALTER COLUMN a TYPE {t}"),
+        ];
+        for mk in paths {
+            let ex = err(&core, &mut s, &mk(x));
+            let ey = err(&core, &mut s, &mk(y));
+            assert_eq!(ex.wire_code(), "0A000", "{}", mk(x));
+            assert_eq!(ey.wire_code(), "0A000", "{}", mk(y));
+            assert_eq!(ex.to_string(), ey.to_string(), "{x} vs {y}");
+        }
+    }
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    assert!(storage.get_table_schema("u").is_err());
+    let schema = storage.get_table_schema("t").expect("schema");
+    assert!(schema.columns.iter().all(|c| c.name != "b"));
+    let a = schema.columns.iter().find(|c| c.name == "a").expect("a");
+    assert!(matches!(a.ty, ColumnType::Integer));
+}
+
+/// 未確定型の `0A000` は構文段（カタログ非参照）で決まるため、DDL 権限の有無で同じ
+/// コードになる。実行段で解決される型（別名・ENUM 候補）は従来どおり権限ゲートが先
+/// （`42501`）。Issue #2303 による判定順序の契約変更の明文化。
+#[test]
+fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
     let (_p, _g, core) = open("ta-permission");
     let mut denied = SessionState::default();
-    for sql in ["CREATE TABLE t (a INT4)", "CREATE TABLE t (a INT2)"] {
+    for sql in ["CREATE TABLE t (a INT4)", "CREATE TABLE t (a mood)"] {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "42501", "{sql}");
+    }
+    let mut ok = allowed();
+    for sql in ["CREATE TABLE t (a INT2)", "CREATE TABLE t (a SMALLINT)"] {
+        assert_eq!(err(&core, &mut denied, sql).wire_code(), "0A000", "{sql}");
+        assert_eq!(err(&core, &mut ok, sql).wire_code(), "0A000", "{sql}");
     }
 }
 
@@ -149,13 +200,33 @@ fn ddl_permission_gate_precedes_alias_resolution() {
 fn create_type_rejects_names_that_alias_builtin_column_types() {
     let (path, _g, core) = open("ta-enum-collision");
     let mut s = allowed();
-    for name in ["int4", "INT8", "Float4", "float8"] {
+    for name in [
+        "int4",
+        "INT8",
+        "Float4",
+        "float8",
+        "int2",
+        "SMALLINT",
+        "varchar",
+        "Char",
+        "character",
+    ] {
         let sql = format!("CREATE TYPE {name} AS ENUM ('a')");
         let _ = err(&core, &mut s, &sql);
     }
     drop(core);
     let storage = Storage::open(&path).expect("reopen");
-    for name in ["int4", "int8", "float4", "float8"] {
+    for name in [
+        "int4",
+        "int8",
+        "float4",
+        "float8",
+        "int2",
+        "smallint",
+        "varchar",
+        "char",
+        "character",
+    ] {
         assert!(
             storage.get_enum_type(name).is_err(),
             "enum type {name} must not be created"
@@ -213,7 +284,7 @@ fn alter_column_type_accepts_aliases_like_canonical_names() {
     assert!(matches!(column_type(&path, "t", "d"), ColumnType::Double));
 }
 
-/// 同一型・未登録型・権限なしの扱いが正規名と一致し、スキーマ不変である。
+/// 同一型・未確定型・権限なしの扱いが正規名と一致し、スキーマ不変である。
 #[test]
 fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
     let (path, _g, core) = open("ta-alter-type-fail");
@@ -227,10 +298,10 @@ fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
     let canon = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INTEGER").wire_code();
     let alias = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT4").wire_code();
     assert_eq!(canon, alias);
-    assert_eq!(
-        err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT2").wire_code(),
-        "42601"
-    );
+    for ty in ["INT2", "SMALLINT", "VARCHAR(10)"] {
+        let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
+        assert_eq!(err(&core, &mut s, &sql).wire_code(), "0A000", "{sql}");
+    }
     let mut denied = SessionState::default();
     assert_eq!(
         err(&core, &mut denied, "ALTER TABLE t ALTER COLUMN a TYPE INT8").wire_code(),
