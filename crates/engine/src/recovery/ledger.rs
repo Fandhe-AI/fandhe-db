@@ -277,6 +277,12 @@ pub(crate) fn record_in_txn(
 /// （keep-first 契約は変えない。「新方式のハッシュを計算できる場合は必ずそれを
 /// 保存する」という不変条件を保ち、正規化方式の変遷を後続の呼び出しへ持ち越さない）。
 ///
+/// 注意（Issue #1525）: 新旧レイアウトが一部の入力で同一バイト列になる変更
+/// （`for_update_columns` の NULL 列込み化）には `legacy_hashes` を使えない。旧 hash を
+/// 受理すると「NULL を含まない文で記録済みの `operation_id` に NULL 入りの別内容を再送
+/// しても `23505`」になり、変更が塞いだ衝突が再発する（fail-open）ため、その変更では
+/// 旧エントリの再送を `22023` に倒す側（fail-closed）を採る。
+///
 /// 台帳エントリが無い場合、分割実行ジョブ表（Issue #1127・
 /// [`crate::recovery::partitioned_job`]）も引く。同じ `operation_id` のジョブが
 /// 実行中・中断・取り消し済み（`Running`／`Cancelled`）なら内容不一致

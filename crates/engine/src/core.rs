@@ -3736,13 +3736,13 @@ impl EngineCore {
         // 検証済みの `table_name` を使う）。
         let where_table: Option<String> = match tokens.first() {
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
-                Some(Token::Ident(name)) => Some(name.clone()),
+                Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
                 _ => None,
             },
             // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
             // 引く `FROM` は括弧深さ 0 の最初のものに限る。
             _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
-                Some(Token::Ident(name)) => Some(name.clone()),
+                Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
                 _ => None,
             }),
         };

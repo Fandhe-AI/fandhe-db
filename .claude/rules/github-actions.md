@@ -91,30 +91,58 @@ gh run view <run-id> --json jobs --jq '.jobs[] | "\(.name)\t\((.completedAt|from
 
 ### 前提（上限と予算）
 
-- リポジトリの Actions キャッシュ上限は **10 GB**。超えると古いものから LRU で追い出され、7 日間アクセスの無いエントリも削除される
-- Org の Actions 予算は **$10（超過時停止）**。10 GB を超える分は 1 GB あたり月 $0.07 の課金になるため、上限は引き上げず
-  **10 GB の中でヒット率を最大化する**（重複保存を作らない・効かないキャッシュを持たない）
+- リポジトリの Actions キャッシュ上限は **10 GB**（Org 設定も 10 GB）。超えると最終アクセスの古いものから LRU で追い出され、
+  7 日間アクセスの無いエントリも削除される
+- Org の Actions 予算は **$0（超過不可）**。10 GB を超える上限は使えない（上げても 10 GB を超えた時点でキャッシュが読み取り専用になる）。
+  **10 GB の中でヒット率を最大化する**（重複保存を作らない・効かないキャッシュを持たない）。上限・予算の変更はユーザー判断
+- 現状（2026-10-11）: 約 2.6 GB・11 件。すべて `rust-ci` の cargo レジストリ・`target`・cargo-deny 本体（GitHub ホステッドの ubuntu runner）
 
 ### 本リポで触れる範囲
 
 - キャッシュを持つのは reusable の `rust-ci`（`Fandhe-AI/actions` の `rust-base-ci.yml`）だけ。独立ジョブはキャッシュを持たない（上のチェックリスト 6）
-- キー設計・restore-keys・保存条件・保存前 prune は**共有側で決まる**。本リポの `ci.yml` から変えられるのは `cache`（`true`）と
-  `cache-key-prefix`（`fandhe-db`）だけ。キーや保存条件を変えたいときは、本リポに独自の `actions/cache` を足さず共有側へ PR を出す
-- 共有側の改善（キーに `rustc -vV` のハッシュを入れる・キーの入力をルートの `Cargo.lock` に絞る・restore / save の分割と
-  `cache-save` 入力の追加）は [Fandhe-AI/actions#165](https://github.com/Fandhe-AI/actions/pull/165) で対応中。
-  マージ後は `@latest` 経由で自動的に反映される。`cache-save` が入ったら、`rust-ci` の `with:` に
-  `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡して main push だけが保存するようにする（入力の既定値が main のみ保存に変わった場合は不要）
+- キー設計・restore-keys・保存前 prune は**共有側で決まる**。本リポの `ci.yml` から変えられるのは `cache`（`true`）・
+  `cache-key-prefix`（`fandhe-db`）・`cache-save` だけ。キーや保存条件を変えたいときは、本リポに独自の `actions/cache` を足さず共有側へ PR を出す
+- 共有側の改善（キーに rustc の版を入れる・キーの入力をルートの `Cargo.lock` に絞る・restore / save の分割と
+  `cache-save` 入力の追加）は [Fandhe-AI/actions#165](https://github.com/Fandhe-AI/actions/pull/165) で対応済み（2026-10-11 マージ、`@latest` に反映）
+- **保存は main の push だけ**: `rust-ci` の `with:` に `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡し済み。
+  PR は restore のみで、main の blob に exact hit するか restore-keys で部分復元する（PR の 2 回目以降の push も自分の保存は使えない）。
+  `ci.yml` は `push: branches: [main]` でも走り、key が変わったとき（ルートの `Cargo.lock` か rustc の版の変更）に main で保存される
+- 本リポに新しくキャッシュを足す場合（他のワークフロー・独立ジョブ）も保存は main の push だけにする。`actions/cache` なら
+  restore は全イベントで `actions/cache/restore`（`id: <id>`）、保存は `actions/cache/save` に
+  `if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.<id>.outputs.cache-hit != 'true'` と
+  `key: ${{ steps.<id>.outputs.cache-primary-key }}` を付ける。`Swatinem/rust-cache` なら `save-if: ${{ github.ref == 'refs/heads/main' }}`。
+  `actions/setup-node` の `cache:` のような一体型は PR でも保存する点に注意する
 
-### 現行キーの既知の問題（2026-10-11 時点・共有側の修正待ち）
+### キャッシュを追加・変更するときの指針
 
-現行キーは `fandhe-db-Linux-{fmt|clippy-v3|test-v3|deny}-<hashFiles('**/Cargo.lock')>`。
+- **入れる前・残す前に効果を測る**: 復元にも時間がかかる。ジョブログで依存の再ビルド数（`Compiling` / `Checking` 行）・`downloaded` 件数・
+  復元の秒数を見て、節約が復元時間を上回ることを確かめる。self-hosted runner ではツールチェーン・パッケージストア・`CARGO_TARGET_DIR` が
+  ジョブをまたいで残り、GitHub のキャッシュが無意味になることがある（他リポジトリの実例: mirror-ui は pnpm キャッシュの復元に
+  1 ジョブ平均 75 秒かけて `downloaded 0` だったため撤去、team-hub は `Swatinem/rust-cache` が保存する `./target` と runner の
+  `CARGO_TARGET_DIR` が食い違い registry しか保存されていなかったため撤去）。本リポで self-hosted を使うジョブにはキャッシュを付けない
+- **キーの設計**: 中身のハッシュ（lockfile 等）をキーにし、`github.sha`・`run_id` など毎回変わる値は入れない。
+  `hashFiles('**/Cargo.lock')` のような再帰 glob は使わず、ビルド対象に本当に入るルートの lockfile を指定する（下表の 2 行目の事故）。
+  `target/` のようなビルド成果物を入れるならキーにツールチェーンの版（`rustc -vV` の release・commit-hash）を入れる（下表の 1 行目の事故）。
+  restore-keys で前方一致の部分復元を効かせ、キーが変わっても cold にしない
+- **サイズを抑える**: 1 世代の合計が 10 GB に余裕をもって収まるようにする。`rust-ci` は共有側が `CARGO_INCREMENTAL=0` と
+  保存前の workspace メンバー成果物の prune を行う（`ci.yml` の独立ジョブも `CARGO_INCREMENTAL=0`）。キャッシュ種別を増やすときは
+  1 件のサイズ × 種別 × OS × キーが変わる頻度（1 日あたり）× 7 日で見積もる
+- **追い出されても hit する設計を保つ**: 上限に達しても、毎回読まれる main の最新キャッシュは LRU の最後まで残る。キーの切り替えで
+  古い世代が追い出されても新しい世代が保存済みならミスにならない。この状態を保てていれば上限を上げる必要はない
+- **PR 本文に書く**: ワークフローにキャッシュを追加・変更する PR では、効果の計測・保存を main に限ったこと・キーの設計・
+  サイズの見積もりを確認したことを PR 本文に書く
 
-| 問題 | 影響 |
-| ---- | ---- |
-| キーに rustc の識別が無い（`rust-toolchain.toml` は `channel = "stable"`） | runner イメージの更新で rustc が変わっても旧 rustc の blob に exact hit し続ける。exact hit では保存し直されないため、`Cargo.lock` が変わるまで clippy / test が依存を毎回全再ビルドする |
-| `**/Cargo.lock` が `.agents/skills/make/samples/projects/*/Cargo.lock`（`.claude/skills/make` symlink 経由も）を拾う | ビルドに関係しないスキル同期 PR だけでキーが変わる |
-| PR からも保存する | `Cargo.lock`（上記サンプル含む）を変える PR ごとに main と同内容の blob（約 0.9 GB）が `refs/pull/<N>/merge` に重複保存される |
-| fmt ジョブにも target を含むキャッシュがある | `cargo fmt` は保存対象のパスを作らないため毎回 miss し、保存時に "Path Validation Error" の警告が出る（無害） |
+### 旧キーの既知の問題と対応（2026-10-11）
+
+[#165](https://github.com/Fandhe-AI/actions/pull/165) 以前のキーは `fandhe-db-Linux-{fmt|clippy-v3|test-v3|deny}-<hashFiles('**/Cargo.lock')>`。#165 以降は
+`fandhe-db-Linux-{clippy|test}-v4-<rustc の release>-<commit-hash 先頭 12 桁>-<hashFiles('Cargo.lock')>`・`fandhe-db-Linux-{fmt|deny}-<hashFiles('Cargo.lock')>`。
+
+| 問題 | 影響 | 対応 |
+| ---- | ---- | ---- |
+| キーに rustc の識別が無い（`rust-toolchain.toml` は `channel = "stable"`） | runner イメージの更新で rustc が変わっても旧 rustc の blob に exact hit し続ける。exact hit では保存し直されないため、`Cargo.lock` が変わるまで clippy / test が依存を毎回全再ビルドする | #165 で clippy / test のキーに rustc の版を追加 |
+| `**/Cargo.lock` が `.agents/skills/make/samples/projects/*/Cargo.lock`（`.claude/skills/make` symlink 経由も）を拾う | ビルドに関係しないスキル同期 PR だけでキーが変わる | #165 でルートの `Cargo.lock` のみに変更 |
+| PR からも保存する | `Cargo.lock`（上記サンプル含む）を変える PR ごとに main と同内容の blob（約 0.9 GB）が `refs/pull/<N>/merge` に重複保存される | `cache-save` で main のみ保存に変更済み |
+| fmt ジョブにも target を含むキャッシュがある | `cargo fmt` は保存対象のパスを作らないため毎回 miss し、保存時に "Path Validation Error" の警告が出る（無害） | 共有側で fmt のキャッシュを外す（[Fandhe-AI/actions#166](https://github.com/Fandhe-AI/actions/pull/166) で対応中） |
 
 ### 実測（2026-10-11）
 
@@ -127,11 +155,13 @@ gh run view <run-id> --json jobs --jq '.jobs[] | "\(.name)\t\((.completedAt|from
 
 - 経緯: runner イメージ 20260927 では依存の再ビルドは 2 件だったが、20261004 への更新後は main のキャッシュ（10-08 作成）に exact hit したまま
   毎回 135 件を再ビルドしていた。旧キャッシュを削除し、新しいイメージで main のキャッシュを作り直した後は 2 件に戻った
-- 変更後も PR スコープ（#2288・#2290）に main と同一キーの blob が 5 件（約 1.3 GB）残っている。main のみ保存にすればこの重複は作られなくなる
+- 変更後も PR スコープ（#2288・#2290）に main と同一キーの blob が 5 件（約 1.3 GB）残っている。`cache-save` を main のみにした以降の PR は
+  保存しないため、この重複は作られなくなる（7 日で消える）
 
 ### runner イメージ更新後に再ビルドが増えたとき
 
-共有側のキーに rustc の識別が入るまでは、次の手順で古い main キャッシュを手動で削除する。
+[Fandhe-AI/actions#165](https://github.com/Fandhe-AI/actions/pull/165) で clippy / test のキーに rustc の版が入ったため、通常は rustc の更新で新しいキーに切り替わり、この手順は不要。
+それでも exact hit なのに再ビルドが多い場合（rustc 以外の runner イメージの変化など）は、次の手順で古い main キャッシュを手動で削除する。
 
 1. 症状の確認: `rust-ci / cargo clippy` のログが `Cache restored from key: <primary key と同じキー>`（exact hit）なのに、
    `Compiling` / `Checking` 行が数件ではなく 100 件超になっている。runner イメージは `Set up job` の `Runner Image` 節の `Version` で分かる
@@ -142,4 +172,6 @@ gh run view <run-id> --json jobs --jq '.jobs[] | "\(.name)\t\((.completedAt|from
    PR は main のキャッシュを読むため、main で作り直されるまでは再ビルドが続く
 
 ログの取得は `gh run view <run-id> --log --job <job-id>` でジョブ単位に絞る（REST API の上限は Org 内で共有）。
-使用量は `gh api repos/Fandhe-AI/fandhe-db/actions/cache/usage` で確認できる。
+使用量は `gh api repos/Fandhe-AI/fandhe-db/actions/cache/usage`、一覧（key・サイズ・ref）は `gh cache list -R Fandhe-AI/fandhe-db -L 100` で確認できる。
+ヒットの判定はジョブログの `Cache restored from key:`（primary key と一致なら exact、それ以外は restore-keys の部分復元）・
+`Cache not found`（miss）・`Cache saved with key:`（保存）で行う。キャッシュは共有状態なので、削除は読むジョブが無いことを確かめてから行う。

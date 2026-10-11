@@ -164,6 +164,20 @@ update_rejects_non_integer_where_id_matching_sql_lexer_parity`）:
 振り分け vs 束縛段のパース失敗）で拒否することを確認し、上記のとおり
 修正した。
 
+## `null` を含む `set` と `content_hash`（Issue #1525）
+
+JSON `null` は TEXT／ENUM 以外の列で `InsertLiteral::Null` に写像され、SQL の
+`SET col = NULL` と同じ `Value::Null` として `for_update_columns` に届く。同関数は
+NULL 列も列数・本体に含めるため、SQL・NoSQL をまたいでも同一内容なら `23505`、
+NULL の有無や `'NULL'` 文字列との違いは `22023` になる
+（`crates/wire-server/tests/nosql12_update_delete.rs::cross_surface_set_null_resend_*`）。
+
+互換性: 旧レイアウト（NULL 除外）で記録された NULL 入り update のエントリは、
+`legacy_hashes` では救わない。NULL を含まない入力では新旧が同一バイト列のため、
+旧 hash を受理すると内容違いの再送が `23505` になる（本 Issue が塞ぐ衝突の再発）。
+したがってアップグレード前に NoSQL の `null` 入り update で記録された
+`operation_id` の再送は `22023`（fail-closed）になる。NULL を含まない文の hash は不変。
+
 ## 複数列 `set` の宣言順と `content_hash`（Issue #876 レビュー指摘の是正）
 
 `engine::json` は JSON オブジェクトを `BTreeMap<String, JsonValue>`（キーの

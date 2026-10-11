@@ -897,9 +897,23 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 /// 入力はクライアント要求由来の内容のみ（DB の現在状態＝マージ後の行内容には
 /// 依存しない。本モジュールドキュメント「正規化の方針」参照）: `id` と、SET 句に
 /// 書かれた（列名, 値）ペア列を**呼び出し元が渡した順のまま**（本関数自身は
-/// 並べ替えない）連結する。列の位置ではなく名前で連結する理由・`Value::Null` 列の
-/// 扱いは [`push_named_scalar_columns`] と共有する（`ALTER TABLE ADD COLUMN`
-/// 耐性）。
+/// 並べ替えない）連結する。列の位置ではなく名前で連結する理由は
+/// [`push_named_scalar_columns`] と共有する（`ALTER TABLE ADD COLUMN` 耐性）。
+///
+/// `Value::Null` 列の扱い（Issue #1525・SQL-41・RECOVER-10）: INSERT 系と異なり
+/// UPDATE の SET では「列を書かない＝値を保持」と「`SET col = NULL`＝値を消す」で
+/// 意味が違うため、NULL 列も列数プレフィクスと本体（列名＋タグ 0）の双方に含める。
+/// これにより `SET a='x', b=NULL` と `SET a='x'`、`SET b=NULL` と `SET b='NULL'`
+/// （Text タグ 1）がそれぞれ別 hash になり、同一 `operation_id` での内容違い再送を
+/// `23505`（適用済み）と誤判定せず `22023` へ倒す（fail-closed）。NULL を含まない
+/// 入力のバイト列は変更前と完全に同一（golden テストで固定）。
+///
+/// 旧レイアウト（NULL 除外）で記録済みの台帳エントリ（NoSQL `update` の JSON `null`
+/// 経由でのみ生成されうる）に対して `legacy_hashes` は**意図して使わない**。NULL を
+/// 含まない入力では新旧レイアウトが同一バイト列のため、旧 hash を受理すると
+/// 「`SET a='x'` で記録済みの operation_id に `SET a='x', b=NULL` を再送すると
+/// `23505`」という本 Issue が塞ぐ衝突そのものが再発する。アップグレード前に記録された
+/// NULL 入り NoSQL update の再送は `22023` になる（fail-closed・クライアントに可視）。
 ///
 /// 呼び出し元 `tenant::update_row_columns_unchecked` は表層をまたいだ再送の
 /// 判定を安定させるため、以降の台帳記録・照合にはスキーマの列 index 順へ
@@ -913,46 +927,23 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 /// 単体契約は変えていない。
 ///
 /// 行境界の曖昧性回避（[`for_typed_insert_batch`] と同じ理由）: 本関数は 1 回の
-/// 呼び出しで 1 行分の SET 句しか扱わないため複数行の境界問題は生じないが、
-/// SET 句の列**数**（`Value::Null` 除外後）を先頭にプレフィクスすることで、
-/// [`push_named_scalar_columns`] の「末尾まで連結するだけ」の形式が列挙順・列数の
-/// いずれについても一意に復元できる状態を維持する。
-///
-/// `SET col = NULL`（Issue #1524・SQL-41 で SQL 表層から到達）は非 NULL 列のあとに
-/// 「NULL 列数（u32 LE）＋各列名」の trailer として連結する（Codex レビュー指摘）。
-/// これにより `SET a='x'` と `SET a='x', b=NULL`、`SET b=NULL` と `SET c=NULL` が別 hash に
-/// なり、同一 `operation_id` での内容違いの再送が RECOVER-10 の内容不一致（`22023`）
-/// になる。NULL 列が 1 つも無い場合は trailer を付けず従来とビット同一（既存台帳エントリ
-/// との互換）。NULL 列を含む旧エントリ（NULL を除外してハッシュ済み）は fail-closed に
-/// 不一致として扱う。
+/// 呼び出しで 1 行分の SET 句しか扱わないが、SET 句の列**数**（NULL 列を含む全列数）を
+/// 先頭にプレフィクスすることで、列挙順・列数のいずれについても一意に復元できる。
 pub(crate) fn for_update_columns(
     id: u64,
     columns: &[(&str, &Value)],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::UpdateColumns);
     b.push_u64(id);
-    let non_null_columns = columns
-        .iter()
-        .filter(|(_, value)| !matches!(value, Value::Null))
-        .count();
-    let non_null_columns = u32::try_from(non_null_columns).map_err(|_| {
+    let column_count = u32::try_from(columns.len()).map_err(|_| {
         StorageError::Codec("content hash update column count too large".to_string())
     })?;
-    b.push_raw(&non_null_columns.to_le_bytes());
-    push_named_scalar_columns(&mut b, columns)?;
-    let null_names: Vec<&str> = columns
-        .iter()
-        .filter(|(_, value)| matches!(value, Value::Null))
-        .map(|(name, _)| *name)
-        .collect();
-    if !null_names.is_empty() {
-        let null_count = u32::try_from(null_names.len()).map_err(|_| {
-            StorageError::Codec("content hash update column count too large".to_string())
-        })?;
-        b.push_raw(&null_count.to_le_bytes());
-        for name in null_names {
-            b.push_bytes(name.as_bytes())?;
-        }
+    b.push_raw(&column_count.to_le_bytes());
+    // NULL 列を除外しない専用ループ（`push_named_scalar_columns` は INSERT 系の
+    // 契約のため変更しない）。
+    for (name, value) in columns {
+        b.push_bytes(name.as_bytes())?;
+        push_value(&mut b, value)?;
     }
     Ok(b.finish())
 }
@@ -2061,6 +2052,23 @@ mod tests {
         assert_eq!(h_before, h_after);
     }
 
+    // Issue #1525: INSERT 系の NULL 除外は意図した設計（明示 NULL と列省略は格納結果が
+    // 同じ）。ただし文字列 `'NULL'`（Text タグ）とは区別される。
+    #[test]
+    fn for_typed_insert_null_is_omitted_but_distinct_from_text_null() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let null = Value::Null;
+        let text = Value::Text("NULL".to_string());
+        let explicit_null: [(&str, &Value); 1] = [("note", &null)];
+        let text_null: [(&str, &Value); 1] = [("note", &text)];
+        let omitted = for_typed_insert(7, Visibility::Public, &embedding, &[]).expect("hash");
+        let h_null =
+            for_typed_insert(7, Visibility::Public, &embedding, &explicit_null).expect("hash");
+        let h_text = for_typed_insert(7, Visibility::Public, &embedding, &text_null).expect("hash");
+        assert_eq!(omitted, h_null);
+        assert_ne!(h_null, h_text);
+    }
+
     // 一方、実際に異なる値が入れば当然ハッシュも変わる（区別できないほど鈍化
     // していないことの確認）。
     // TABLE-13・Issue #882 計画 F9: Real=5／Double=6 のタグ割り当てを固定する
@@ -2543,25 +2551,93 @@ mod tests {
         assert_ne!(h_update_columns, h_insert);
     }
 
-    // 列数プレフィクスにより、列境界の再解釈（異なる列数・並びが同一バイト列へ
-    // 還元される事故）が起きないことを固定する（`for_typed_insert_batch_rejects_row_boundary_reinterpretation`
-    // と同種の回帰テスト）。
+    // Issue #1525（SQL-41・RECOVER-10）: UPDATE の SET では「列を書かない＝値を保持」と
+    // 「NULL＝値を消す」で意味が違うため、NULL 列は列数・本体の双方に含める。
+    // 旧契約（NULL 列を除外して列省略と同一 hash）を反転した意図的な契約変更であり、
+    // アサーションの弱体化ではない。
     #[test]
-    fn for_update_columns_null_assignments_change_the_hash() {
+    fn for_update_columns_null_column_differs_from_omitted_column() {
+        let non_null = Value::Text("x".to_string());
+        let null = Value::Null;
+        let with_null: [(&str, &Value); 2] = [("a", &non_null), ("b", &null)];
+        let without_null: [(&str, &Value); 1] = [("a", &non_null)];
+        assert_ne!(
+            for_update_columns(1, &with_null).expect("hash"),
+            for_update_columns(1, &without_null).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_null_differs_from_text_null_literal() {
+        let null = Value::Null;
+        let text = Value::Text("NULL".to_string());
+        let c_null: [(&str, &Value); 1] = [("b", &null)];
+        let c_text: [(&str, &Value); 1] = [("b", &text)];
+        assert_ne!(
+            for_update_columns(1, &c_null).expect("hash"),
+            for_update_columns(1, &c_text).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_with_null_is_deterministic() {
         let x = Value::Text("x".to_string());
         let null = Value::Null;
-        let a_only: [(&str, &Value); 1] = [("a", &x)];
-        let a_b_null: [(&str, &Value); 2] = [("a", &x), ("b", &null)];
-        let a_c_null: [(&str, &Value); 2] = [("a", &x), ("c", &null)];
-        let b_null: [(&str, &Value); 1] = [("b", &null)];
-        let c_null: [(&str, &Value); 1] = [("c", &null)];
-        let h = |c: &[(&str, &Value)]| for_update_columns(1, c).expect("hash");
-        // Issue #1524 レビュー指摘: NULL 割当の有無・列名がハッシュに反映される。
-        assert_ne!(h(&a_only), h(&a_b_null));
-        assert_ne!(h(&a_b_null), h(&a_c_null));
-        assert_ne!(h(&b_null), h(&c_null));
-        assert_ne!(h(&b_null), h(&[]));
-        assert_eq!(h(&a_b_null), h(&a_b_null));
+        let cols: [(&str, &Value); 2] = [("a", &x), ("b", &null)];
+        assert_eq!(
+            for_update_columns(1, &cols).expect("hash"),
+            for_update_columns(1, &cols).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_null_position_is_part_of_the_hash() {
+        let x = Value::Text("x".to_string());
+        let null = Value::Null;
+        let a_null: [(&str, &Value); 2] = [("a", &null), ("b", &x)];
+        let b_null: [(&str, &Value); 2] = [("a", &x), ("b", &null)];
+        assert_ne!(
+            for_update_columns(1, &a_null).expect("hash"),
+            for_update_columns(1, &b_null).expect("hash")
+        );
+    }
+
+    #[test]
+    fn for_update_columns_empty_differs_from_single_null() {
+        let null = Value::Null;
+        let c_null: [(&str, &Value); 1] = [("b", &null)];
+        assert_ne!(
+            for_update_columns(1, &[]).expect("hash"),
+            for_update_columns(1, &c_null).expect("hash")
+        );
+    }
+
+    /// golden 固定（Issue #1525）: NULL を含まない入力のレイアウトが NULL 込み化の
+    /// 前後でバイト単位に不変であることを固定する。値は変更前の実装から採取した
+    /// ままで、ずれた場合は永続化済み台帳エントリとの互換性を壊したことを意味する。
+    #[test]
+    fn for_update_columns_null_free_layout_is_golden() {
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let x = Value::Text("x".to_string());
+        let n = Value::BigInt(42);
+        let v = Value::Vector(vec![1.0, 2.5]);
+        let one: [(&str, &Value); 1] = [("a", &x)];
+        let two: [(&str, &Value); 2] = [("a", &x), ("n", &n)];
+        let vec_cols: [(&str, &Value); 2] = [("a", &x), ("v", &v)];
+        assert_eq!(
+            to_hex(for_update_columns(1, &one).expect("hash").as_bytes()),
+            "21182981f7794e52c4794fae6440eb6d942aa8ecdbd458d863f02db528aaab84"
+        );
+        assert_eq!(
+            to_hex(for_update_columns(7, &two).expect("hash").as_bytes()),
+            "09f7061a7c9f64e15577bcb58cca9d2be3bda7103ee8800a5b1fd040d5f71aa7"
+        );
+        assert_eq!(
+            to_hex(for_update_columns(3, &vec_cols).expect("hash").as_bytes()),
+            "f7b2ee1f790be8849a79364620b1da02a77a81fb331760966ba579f9deca62ab"
+        );
     }
 
     // Issue #399 受け入れ 2: ストリーミング版（本番経路 `for_insert_batch_encoded`）と
