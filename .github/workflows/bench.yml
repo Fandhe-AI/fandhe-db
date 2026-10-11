@@ -1,3 +1,4 @@
+# ジョブ追加・変更時は .claude/rules/github-actions.md に従うこと。
 name: Bench
 
 # TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の実行。crates/engine/benches/simd_bench.rs
