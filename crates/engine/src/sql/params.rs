@@ -55,6 +55,8 @@
 //! 値は SQL テキストにも字句解析器にも戻らず、検証済みの値から直接トークンを
 //! 組み立てるため、値経由のインジェクション経路は構造的に存在しない。
 
+use std::collections::HashMap;
+
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::lexer::{self, Token};
 
@@ -325,39 +327,49 @@ fn values_region_bounds(tokens: &[Token]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// `VALUES` 節の行グループを前向きに走査し、`tokens[i]`（`$n`）が「行の括弧の
-/// 直下（深さちょうど 1）にある要素単独の位置」であれば行内の列序数を返す
-/// （Issue #1543・SQL-45 のポインタ）。式の内側（`upper($1)`・`1 + $1`・`(($1))`）は
-/// 深さまたは前後トークンで外れて `None` になり `42601` で拒否される（式内 `$n` は
-/// 別 Issue の担当）。位置判定と型推論の双方が本関数を共有する。
-fn values_row_param_slot(tokens: &[Token], start: usize, end: usize, i: usize) -> Option<usize> {
+/// `VALUES` 節の行グループを 1 パスで前向きに走査し、「行の括弧の直下（深さ
+/// ちょうど 1）にある要素単独の `$n`」のトークン添字から行内の列序数への表を
+/// 返す（Issue #1543・SQL-45 のポインタ）。式の内側（`upper($1)`・`1 + $1`・
+/// `(($1))`）は深さまたは前後トークンで外れて表に載らず `42601` で拒否される
+/// （式内 `$n` は別 Issue の担当）。位置判定と型推論の双方が本表を 1 度だけ
+/// 構築して共有する（`$n` ごとの再走査による二次時間の CPU 増幅を避ける）。
+/// 行の並びが途中で崩れた場合は、それまでに閉じた行の分だけを返す（fail-closed）。
+fn values_param_slots(tokens: &[Token], start: usize, end: usize) -> HashMap<usize, usize> {
+    let mut table: HashMap<usize, usize> = HashMap::new();
     let end = end.min(tokens.len());
-    let mut pos = start.checked_add(1)?;
+    let Some(mut pos) = start.checked_add(1) else {
+        return table;
+    };
     loop {
-        if !matches!(tokens.get(pos), Some(Token::Punct('('))) || pos >= end {
-            return None;
+        if pos >= end || !matches!(tokens.get(pos), Some(Token::Punct('('))) {
+            return table;
         }
-        let row_open = pos;
         let mut depth: usize = 0;
         let mut commas: usize = 0;
-        let mut k = row_open;
-        let mut found: Option<usize> = None;
+        let mut k = pos;
+        let mut found: Vec<(usize, usize)> = Vec::new();
         let row_close = loop {
             if k >= end {
-                return None;
+                return table;
             }
-            match tokens.get(k)? {
+            let Some(tok) = tokens.get(k) else {
+                return table;
+            };
+            match tok {
                 Token::Punct('(') | Token::Punct('[') => depth += 1,
                 Token::Punct(')') | Token::Punct(']') => {
-                    depth = depth.checked_sub(1)?;
+                    let Some(d) = depth.checked_sub(1) else {
+                        return table;
+                    };
+                    depth = d;
                     if depth == 0 {
                         break k;
                     }
                 }
                 Token::Punct(',') if depth == 1 => commas += 1,
-                Token::Param(_) if k == i && depth == 1 => {
+                Token::Param(_) if depth == 1 => {
                     let prev_ok = matches!(
-                        tokens.get(k.wrapping_sub(1)),
+                        k.checked_sub(1).and_then(|j| tokens.get(j)),
                         Some(Token::Punct('(')) | Some(Token::Punct(','))
                     );
                     let next_ok = matches!(
@@ -365,23 +377,21 @@ fn values_row_param_slot(tokens: &[Token], start: usize, end: usize, i: usize) -
                         Some(Token::Punct(')')) | Some(Token::Punct(','))
                     );
                     if prev_ok && next_ok {
-                        found = Some(commas);
+                        found.push((k, commas));
                     }
                 }
                 _ => {}
             }
             k += 1;
         };
-        if i > row_open && i < row_close {
-            return found;
-        }
+        table.extend(found);
         // 次の行（`, (`）へ進む。それ以外で行の並びは終わり。
         if matches!(tokens.get(row_close + 1), Some(Token::Punct(',')))
             && matches!(tokens.get(row_close + 2), Some(Token::Punct('(')))
         {
             pos = row_close + 2;
         } else {
-            return None;
+            return table;
         }
     }
 }
@@ -460,6 +470,12 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         None => (None, None),
     };
 
+    // VALUES 領域は 1 パスで表を作り、`$n` ごとに再走査しない（二次時間防止）。
+    let values_slots = match values_region {
+        Some(start) => values_param_slots(tokens, start, values_region_end.unwrap_or(tokens.len())),
+        None => HashMap::new(),
+    };
+
     let mut max_index: u16 = 0;
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
@@ -494,10 +510,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         });
 
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
-        let is_insert_value = values_region.is_some_and(|start| {
-            let end = values_region_end.unwrap_or(tokens.len());
-            values_row_param_slot(tokens, start, end, i).is_some()
-        });
+        let is_insert_value = values_slots.contains_key(&i);
 
         if !(is_distance
             || is_using_plan
@@ -679,7 +692,10 @@ fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
 pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<Vec<ParamPosition>> {
     let mut out: Vec<Vec<ParamPosition>> = vec![Vec::new(); usize::from(param_count)];
     let where_bounds = where_region(tokens);
-    let values_bounds = values_region_bounds(tokens);
+    let values_slots = match values_region_bounds(tokens) {
+        Some((start, end)) => values_param_slots(tokens, start, end),
+        None => HashMap::new(),
+    };
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
         let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
@@ -691,11 +707,9 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
             slot.push(ParamPosition::Vector);
             continue;
         }
-        if let Some((start, end)) = values_bounds {
-            if let Some(commas) = values_row_param_slot(tokens, start, end, i) {
-                slot.push(ParamPosition::InsertValue(commas));
-                continue;
-            }
+        if let Some(commas) = values_slots.get(&i) {
+            slot.push(ParamPosition::InsertValue(*commas));
+            continue;
         }
         if let Some((start, end)) = where_bounds {
             if i > start && i < end && matches!(prev1, Some(Token::Punct('='))) {

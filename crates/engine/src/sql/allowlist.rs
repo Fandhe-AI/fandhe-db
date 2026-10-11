@@ -6065,10 +6065,14 @@ impl<'a> Parser<'a> {
         crate::sql::const_expr::fold_const_literal(&parsed?)
     }
 
-    /// リテラル 1 要素（INSERT VALUES・列 DEFAULT は定数式を受理する入口 `expect_literal_or_const_expr` 経由、Issue #1543。文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
+    /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
     /// 数値のみ。関数呼び出し・括弧等は許可リスト外）。INSERT の VALUES 要素・
     /// `UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`・列制約 `DEFAULT` の
-    /// 値位置から呼ばれる単一の入口（Issue #1523・#1524・SQL-41）。`NULL` は
+    /// 値位置から呼ばれる単一の入口（Issue #1523・#1524・SQL-41）。
+    ///
+    /// INSERT VALUES・列 `DEFAULT` は定数式を受理する
+    /// [`Self::expect_literal_or_const_expr`] 経由（Issue #1543）で、本関数は
+    /// 平易なリテラルの解析を担う。`NULL` は
     /// `InsertLiteral::Null` を返し、nullable 判定（`23502`）は束縛段
     /// （`sql::parser` の `bind_*`）が担う。`DEFAULT NULL` だけは呼び出し元
     /// （[`Parser::parse_column_constraints`]）が「既定値なし」へ正規化する。
