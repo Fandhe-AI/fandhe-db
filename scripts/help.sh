@@ -12,7 +12,8 @@ fi
 
 cat <<'EOF'
 このリポジトリの操作と、Make を使わずに直接実行する方法
-（`make <target>` は下記の直接コマンドを呼ぶだけの薄い入口。同名の環境変数・引数はそのまま渡る）:
+（`make <target>` は下記の直接コマンドを呼ぶだけの薄い入口。同名の環境変数・引数はそのまま渡る。
+  `$` 行が複数ある項目は上から順に実行する）:
 
   setup
       開発環境を一括構築する
@@ -40,7 +41,10 @@ cat <<'EOF'
       $ scripts/lint_docs.sh commits
   lint-docs
       ドキュメント／設定ファイル系 lint を一括実行する
-      $ make lint-md && make lint-yaml && make lint-editorconfig && make lint-commits
+      $ scripts/lint_docs.sh md
+      $ scripts/lint_docs.sh yaml
+      $ scripts/lint_docs.sh editorconfig
+      $ scripts/lint_docs.sh commits
   fmt
       cargo fmt --all で整形する
       $ cargo fmt --all
@@ -112,7 +116,25 @@ cat <<'EOF'
       $ scripts/tests/check_worktree_lag_test.sh
   ci
       CI（ci.yml）と同等のチェックを一括実行する
-      $ make lint-docs && make fmt-check && make lint && make test && make test-default-build && make crash-test && make crash-test-interrupt && make crash-test-cross-table && make crash-test-unique-index && make crash-test-partitioned-dml && make tmp-leak-check && make core-api-check && make sort-determinism-check && make scripts-test && make simd-codegen-check && make deny
+      $ scripts/lint_docs.sh md
+      $ scripts/lint_docs.sh yaml
+      $ scripts/lint_docs.sh editorconfig
+      $ scripts/lint_docs.sh commits
+      $ cargo fmt --all --check
+      $ cargo clippy --workspace --all-targets --all-features -- -D warnings
+      $ cargo test --workspace --all-features
+      $ cargo test -p fandhe-db-wire-server --test wire_fault_injection_cli
+      $ scripts/crash_test.sh
+      $ scripts/crash_test_interrupt.sh
+      $ scripts/crash_test_cross_table.sh
+      $ scripts/crash_test_unique_index.sh
+      $ scripts/crash_test_partitioned_dml.sh
+      $ scripts/check_tmp_leak.sh
+      $ scripts/core_api_check.sh
+      $ scripts/sort_determinism_check.sh
+      $ python3 -m unittest discover scripts/tests
+      $ scripts/simd_codegen_check.sh
+      $ scripts/deny.sh
   bench-simd
       性能・Recall 受け入れ基準の回帰ベンチ（TASK-127）
       $ cargo bench --bench simd_bench -p fandhe-db-engine
