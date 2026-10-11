@@ -5325,7 +5325,9 @@ impl<'a> Parser<'a> {
             // の後方互換を優先し、下の一般識別子分岐へフォールスルーして列参照
             // （`Expr::Ident`）として扱う。
             Some(Token::Ident(name))
-                if name.eq_ignore_ascii_case("NULL") && self.allow_null_literal =>
+                if name.eq_ignore_ascii_case("NULL")
+                    && self.allow_null_literal
+                    && !self.quoted_null.contains(&self.pos) =>
             {
                 self.advance();
                 self.consume_expr_node()?;
@@ -6060,7 +6062,9 @@ impl<'a> Parser<'a> {
         }
         let saved = self.expr_node_budget;
         self.expr_node_budget = MAX_EXPR_NODES;
-        let parsed = self.parse_value_expr(0);
+        // 定数式では NULL を既定で有効化する（引用された "null" は quoted_null で
+        // 列参照のまま区別される）。
+        let parsed = self.parse_value_expr_with_null_context(0, true);
         self.expr_node_budget = saved;
         crate::sql::const_expr::fold_const_literal(&parsed?)
     }
@@ -15051,6 +15055,24 @@ mod tests {
             assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
         }
         assert_eq!(parse("DEFAULT n + 1").unwrap_err().wire_code(), "42703");
+        // NULL は定数式の内部でも受理する（算術では NULL 伝播）。引用された "null" は
+        // 列参照のまま 42703。
+        assert_eq!(parse("DEFAULT (NULL)").unwrap().default, None);
+        assert_eq!(parse("DEFAULT NULL + 1").unwrap().default, None);
+        let marked = crate::sql::lexer::tokenize_marked("DEFAULT (\"null\")").expect("tokenize");
+        assert_eq!(
+            Parser::new(&marked)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            parse("DEFAULT 9007199254740992 + 1 - 9007199254740992")
+                .unwrap_err()
+                .wire_code(),
+            "22003"
+        );
 
         let lookup = catalog_with(&["documents"]);
         let ok = validate_insert(
@@ -15067,6 +15089,15 @@ mod tests {
                 InsertLiteral::String("A".into())
             ]
         );
+        let nulls = validate_insert(
+            "INSERT INTO documents (id, body) VALUES (1, (NULL)), (2, NULL + 1) \
+             USING OPERATION_ID 'op-ce-null'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap();
+        assert_eq!(nulls.rows[0][1], InsertLiteral::Null);
+        assert_eq!(nulls.rows[1][1], InsertLiteral::Null);
         let many = format!(
             "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-ce-2'",
             vec!["(1+1)"; 600].join(", ")
