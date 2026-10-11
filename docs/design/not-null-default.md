@@ -209,6 +209,8 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
 - （Issue #1524 で実装済み）`UPDATE ... SET`・`DO UPDATE SET`・`DEFAULT` の `NULL`。
   VECTOR 列への NULL（`SET` は `22000`・`DO UPDATE SET` は `23502` で不揃い）の整理と
   nullable 化は TABLE-26（TASK-252）の範囲。
+- （Issue #1525 で実装済み）NULL を含む単一行 UPDATE の `content_hash`（NULL 列を
+  列数・本体に含める）。詳細は [update-single-row.md](update-single-row.md)。
 - SQL `VALUES` 内の `DEFAULT` キーワード（`INSERT INTO t (...) VALUES
   (DEFAULT, ...)` 形）。
 - NoSQL 表層の DDL op（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`FOREIGN KEY` は

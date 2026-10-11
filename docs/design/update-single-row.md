@@ -107,6 +107,12 @@ SET 句の（列名, 値）ペアを**宣言順のまま**（呼び出し元は�
 
 - 同一文の再送（0 行更新後を含む）→ `23505`
 - SET 値の違い・`id` の違い・SET 句の列宣言順の違い → `22023`
+- NULL 列を含む SET（`SET b = NULL`。Issue #1525・SQL-41）: NULL 列も列数と本体
+  （列名＋Null タグ）に含めるため、`SET a='x', b=NULL` と `SET a='x'`（列省略）、
+  `SET b=NULL` と `SET b='NULL'`（Text）は別 hash で、同一 `operation_id` の再送は
+  `22023`。NULL を含まない入力のバイト列は変更前と同一（golden テストで固定）。
+  INSERT 系が NULL を除外するのは「明示 NULL と列省略の格納結果が同じ」ためで、
+  UPDATE では意味が違うので別扱い
 - 同一 `operation_id` を INSERT で使った後に UPDATE で再利用 → `22023`
   （`OpTag::Insert`／`OpTag::UpdateColumns` の分離により実質的な内容一致でも
   必ず内容不一致として拒否される）
