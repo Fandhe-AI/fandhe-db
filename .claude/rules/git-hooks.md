@@ -19,7 +19,7 @@ paths:
 | -------- | ---- |
 | `make ci` | CI（`ci.yml`）と同等のチェックを一括実行（C++17 コンパイラ必須。CLAUDE.md の Conventions 参照） |
 | `make fmt-check` | `cargo fmt --check` のみ |
-| `make lint` | `cargo clippy -D warnings` のみ |
+| `make lint` | `cargo clippy -D warnings` のみ（`--all-features` のため同じく C++17 コンパイラ必須） |
 | `make lint-docs` | markdownlint・yamllint・editorconfig-checker・commitlint |
 
 ## 時間予算
