@@ -263,7 +263,7 @@ fn parse_base_type_name(
 
 fn expect_ident(tokens: &[Token], pos: &mut usize) -> Result<String, SqlSurfaceError> {
     match tokens.get(*pos) {
-        Some(Token::Ident(s)) => {
+        Some(Token::Ident(s) | Token::QuotedNull(s)) => {
             *pos += 1;
             Ok(s.clone())
         }

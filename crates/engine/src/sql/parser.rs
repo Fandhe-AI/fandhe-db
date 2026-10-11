@@ -2842,10 +2842,8 @@ fn bind_insert_row(
                 )))
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
-            // `INSERT ... VALUES` 構文からは構築されない（`sql::allowlist` の
-            // VALUES リテラルパーサーは `NULL` トークンを生成しない）が、NoSQL
-            // 表層 `insert` op（Issue #904 D5）が JSON `null` を本 variant として
-            // 渡すため到達する。TABLE-16 の確定契約: 明示 `NULL` には `DEFAULT`
+            // `INSERT ... VALUES`（Issue #1523・SQL-41）と、NoSQL 表層 `insert` op
+            // （Issue #904 D5。JSON `null`）の両方から到達する。TABLE-16 の確定契約: 明示 `NULL` には `DEFAULT`
             // を適用せず、nullable 列は `Value::Null`、非 nullable 列は
             // `NotNullViolation`（`23502`）へ倒す（省略時の `DEFAULT` 補完とは
             // 独立の経路。下の省略列補完ループ参照）。
@@ -3253,10 +3251,11 @@ fn bind_set_assignments(
             // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
             // レビュー指摘・PR #1014）。`column.nullable` を確認したうえで
             // `Value::Null` へ写像し、非 nullable 列は fail-closed に拒否する。
-            // NoSQL 表層 `update` op（`wire-server::http::query::update::
-            // map_set_assignments`）の JSON 列 `null` 分岐が現状唯一の
-            // 構築元だが、SQL 表層 `UPDATE ... SET` 経由（将来 `NULL`
-            // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
+            // 構築元は NoSQL 表層 `update` op（`wire-server::http::query::update::
+            // map_set_assignments`）の JSON 列 `null` 分岐と、SQL 表層
+            // `UPDATE ... SET col = NULL`（Issue #1524・SQL-41）の 2 系統で、同じ
+            // 扱いを共有する。束縛はスキーマだけを見る判定で対象行の探索・RLS 可視性
+            // より前に終わるため、`23502` は対象行の有無で分かれない。
             (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
             (_, InsertLiteral::Null) => {
                 return Err(SqlSurfaceError::not_null_violation(name.clone()))
@@ -4366,10 +4365,10 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a text literal for its enum type"
                         )))
                     }
-                    // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
-                    // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
-                    // されない到達不能パス（match の網羅性のためだけの分岐）。
-                    // 到達した場合も明示 NULL の確定契約（TABLE-16）へ倒す。
+                    // `InsertLiteral::Null` は `ON CONFLICT ... DO UPDATE SET col = NULL`
+                    // （Issue #1524・SQL-41）から到達する。明示 NULL の確定契約
+                    // （TABLE-16）に従い、nullable 列は `Value::Null`、それ以外は
+                    // `23502`（VECTOR 列も現状 non-nullable のためここで `23502`）。
                     (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
                     (_, InsertLiteral::Null) => {
                         return Err(SqlSurfaceError::not_null_violation(name.clone()))
@@ -7514,6 +7513,37 @@ mod tests {
         bind_insert(&stmt, &docs_schema())
     }
 
+    /// 明示 `NULL`（Issue #1523・SQL-41）は nullable 列で `Value::Null` になり、
+    /// 列を省略した文と束縛結果・行エンコードが一致する。
+    #[test]
+    fn bind_insert_explicit_null_matches_omitted_column() {
+        let explicit = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body, lang) VALUES (1, '[0.1,0.2,0.3]', 'hello', NULL) USING OPERATION_ID 'op-n1'",
+        )
+        .expect("explicit NULL into nullable column");
+        let omitted = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-n1'",
+        )
+        .expect("omitted nullable column");
+        assert_eq!(explicit.values, omitted.values);
+        assert_eq!(explicit.values.last(), Some(&crate::row_codec::Value::Null));
+    }
+
+    /// 非 nullable 列への明示 `NULL` は `23502`、`id` 疑似列への `NULL` は `22000`。
+    #[test]
+    fn bind_insert_explicit_null_rejected_for_not_null_and_id() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', NULL) USING OPERATION_ID 'op-n2'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "23502");
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (NULL, '[0.1,0.2,0.3]', 'b') USING OPERATION_ID 'op-n3'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
     #[test]
     fn binds_insert_with_all_columns() {
         let bound = bind_insert_sql(
@@ -7919,6 +7949,49 @@ mod tests {
             bound.assignments,
             vec![(2, crate::row_codec::Value::Text("en".to_string()))]
         );
+    }
+
+    /// `SET <col> = NULL`（Issue #1524・SQL-41）: nullable 列は `Value::Null`、
+    /// 非 nullable 列は `23502`、VECTOR 列は現行どおり `22000`（TABLE-26 の対象外）。
+    #[test]
+    fn binds_update_set_null_by_column_nullability() {
+        let bound = bind_update_sql(
+            "UPDATE documents SET lang = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("nullable column accepts NULL");
+        assert_eq!(bound.assignments, vec![(2, crate::row_codec::Value::Null)]);
+        let err = bind_update_sql(
+            "UPDATE documents SET body = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "23502");
+        let err = bind_update_sql(
+            "UPDATE documents SET embedding = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// 述語形・分割実行が共有する束縛でも同じ検査が効く（Issue #1524）。
+    #[test]
+    fn bind_update_form_predicate_arm_set_null_by_column_nullability() {
+        match bind_update_form_sql(
+            "UPDATE documents SET lang = NULL WHERE body = 'x' USING OPERATION_ID 'op-0001'",
+        )
+        .expect("nullable column accepts NULL")
+        {
+            BoundUpdateForm::Predicate(p) => {
+                assert_eq!(p.assignments(), &[(2, crate::row_codec::Value::Null)]);
+            }
+            BoundUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+        let err = match bind_update_form_sql(
+            "UPDATE documents SET body = NULL WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("NOT NULL column must reject NULL"),
+        };
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]
@@ -9283,9 +9356,8 @@ mod tests {
         // NULL を含む対象キーは NULLS DISTINCT のため重複判定の対象外。`c` を
         // 列リストから省略する（`nullable` かつ `DEFAULT` 無し。
         // `fill_omitted_columns` が暗黙 `Value::Null` を補う）ことで NULL を
-        // 作る（SQL テキストの `INSERT ... VALUES` は明示 `NULL` リテラルの
-        // 構文を持たない。`InsertLiteral::Null` のドキュメンテーションコメント
-        // 参照）。
+        // 作る（明示 `NULL` リテラルでも同じ `Value::Null` になる。Issue #1523・
+        // `InsertLiteral::Null` のドキュメンテーションコメント参照）。
         let schema = unique_target_schema();
         let bound = bind_upsert_sql(
             "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'p'), (2, 'y', 'p') \

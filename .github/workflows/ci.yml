@@ -1,3 +1,4 @@
+# ジョブ追加・変更時は .claude/rules/github-actions.md に従うこと。
 name: CI
 
 on:
@@ -8,11 +9,17 @@ on:
 permissions:
   contents: read
 
+env:
+  # 生の steps を持つ独立ジョブ（reusable workflow の外）の cargo ビルドで増分コンパイル用の
+  # 中間ファイルを作らない（CI は毎回クリーンビルドで再利用されないため時間・ディスクの無駄）
+  CARGO_INCREMENTAL: "0"
+
 concurrency:
   # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
   # 別 PR が同一グループになり、互いの CI を cancel し合う。PR #4 codex P2 指摘）
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PR のみ古い run を cancel する。main への push は連続マージでも各コミットの結果を残す
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # --------------------------------------------------
@@ -62,13 +69,18 @@ jobs:
       # make deny（Makefile の deny ターゲット）と同一のチェック集合
       deny-checks: advisories bans licenses sources
       # cargo レジストリ・target の cache（reusable 側のオプトイン入力。
-      # `actions/cache`・key は `**/Cargo.lock` のハッシュ）。ホステッド runner は毎回
+      # key はルートの `Cargo.lock` のハッシュ。clippy / test は rustc の版も含む）。ホステッド runner は毎回
       # まっさらなため、無効のままだと clippy／test／deny の各ジョブが `--all-features`
       # の依存（usearch の C++ ビルド・ort・tokenizers・wgpu）を毎回フルビルドし、
       # test ジョブだけで約 5 分をビルドに費やしていた。cache-key-prefix は
       # 他リポジトリと同じ既定値 `rust-base-ci` との衝突回避のため本リポ名にする
       cache: true
       cache-key-prefix: fandhe-db
+      # cache の保存は main への push だけにし、PR は restore のみにする
+      # （Fandhe-AI/actions#165 の入力）。PR ごとに main と同内容の blob が
+      # `refs/pull/<N>/merge` に重複保存され上限 10 GB を圧迫するのを防ぐ
+      # （.claude/rules/github-actions.md「キャッシュ方針」）。本 workflow は push（main）でも走る
+      cache-save: ${{ github.ref == 'refs/heads/main' }}
 
   # --------------------------------------------------
   # test-default-build（既定ビルド専用の回帰テスト。Issue #710・#715）

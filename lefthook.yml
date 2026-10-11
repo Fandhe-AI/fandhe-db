@@ -4,7 +4,7 @@
 # - フックの追加・変更時は .claude/rules/git-hooks.md の方針（時間予算・CI との役割分担）に従う
 # - --no-verify によるスキップは禁止
 # - Cargo.toml 未追加（TASK-66 の workspace 作成予定）の間、cargo 系ジョブはスキップする
-#   （Makefile の HAS_CARGO 判定と同一方針）
+#   （workspace 追加済みの現在は常に有効。Makefile 側のスキップ判定は廃止済み）
 # - 開発速度を優先し、CI（.github/workflows/ci.yml の rust-ci 等）が PR ごとに実行する
 #   重いチェック（clippy・test）はフックで実行しない（pre-push は置かない）。push 前に
 #   手元で確かめたい場合は `make ci`（CI と同等のチェック）を任意で実行する

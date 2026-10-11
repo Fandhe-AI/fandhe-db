@@ -2983,6 +2983,13 @@ pub(crate) fn update_row_columns_capturing_unchecked(
             // SET は宣言順・スキーマ列順が一致するため `legacy_hash` は常に
             // `content_hash` と等しくなるが、`record_in_txn_accepting` 呼び出し自体は
             // 統一して行い分岐を増やさない。
+            //
+            // `SET col = NULL`（`Value::Null`）の列も宣言順・スキーマ列順どちらの
+            // ビューにも含めて渡す（Issue #1525・SQL-41・RECOVER-10。`for_update_columns`
+            // は NULL 列を列数・本体に含めるため、列省略や `'NULL'` 文字列と別 hash になる）。
+            // NULL 除外の旧レイアウト用 legacy hash は意図して渡さない（NULL を含まない
+            // 入力では新旧が同一バイト列で、渡すと内容違いの再送が `23505` に化けるため。
+            // 詳細は `for_update_columns` のドキュメント）。
             let content_hash = content_hash::for_update_columns(id, &named_columns)?;
             let legacy_hash = content_hash::for_update_columns(id, &declared_order_columns)?;
             ledger::record_in_txn_accepting(

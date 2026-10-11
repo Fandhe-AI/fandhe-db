@@ -2479,6 +2479,7 @@ impl ValidatedScan {
 /// `UNIQUE`〔Issue #905〕。TABLE-16・TASK-204）の構文木。列型ごとの適用可否
 /// （`DEFAULT` の型整合・`VECTOR` への `DEFAULT`／`UNIQUE` 禁止等）は呼び出し元
 /// （`Parser::parse_create_table_column`）が判定する。
+#[derive(Debug)]
 struct ColumnConstraints {
     not_null: bool,
     default: Option<InsertLiteral>,
@@ -2538,13 +2539,12 @@ pub enum InsertLiteral {
     /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
     Bool(bool),
     /// SQL `NULL`（明示的な NULL 指定。Issue #889 レビュー指摘・PR #1014）。
-    /// SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・構文規則が
-    /// 無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを生成
-    /// しない）、SQL テキストの `INSERT ... VALUES` 構文からも構築されない
-    /// （VALUES 要素パーサーが `NULL` トークンを受理しない）。本 variant は
-    /// NoSQL 表層 `update`／`insert` op（`wire-server::http::query::update::
-    /// map_set_assignments`・`insert::bind_row`。TABLE-16・TASK-204、
-    /// Issue #904 D5）が JSON `null` から構築する。
+    /// SQL テキストでは `INSERT ... VALUES` の要素・`UPDATE ... SET`・
+    /// `ON CONFLICT ... DO UPDATE SET` の値位置から構築される（Issue #1523・
+    /// #1524・SQL-41。`Parser::expect_literal`）。`DEFAULT NULL` は構文段で
+    /// 「既定値なし」へ正規化され、この値は `DEFAULT` には残らない。NoSQL 表層 `update`／`insert` op（`wire-server::http::query::
+    /// update::map_set_assignments`・`insert::bind_row`。TABLE-16・TASK-204、
+    /// Issue #904 D5）も JSON `null` から構築する。
     ///
     /// 明示的な `NULL` には `DEFAULT` を適用しない契約（TABLE-16）のため、
     /// 「省略」（`DEFAULT` 適用対象。`sql::parser::fill_omitted_columns`）とは
@@ -3264,7 +3264,10 @@ pub struct ValidatedDropTable {
 /// 再帰下降だが文法の深さは定数（statement → select_list/where/order_by の 1 階層）で、
 /// 深いネストによるスタック消費は発生しない。
 struct Parser<'a> {
-    tokens: &'a [Token],
+    /// `Token::QuotedNull` を `Ident` へ戻したトークン列（識別子位置は従来どおり `Ident`）。
+    tokens: std::borrow::Cow<'a, [Token]>,
+    /// 元が引用付き `NULL` だったトークン位置（値位置でだけ NULL 定数として扱わないため。Issue #1524）。
+    quoted_null: Vec<usize>,
     pos: usize,
     /// 式ノード（`Expr::Number` / `Ident` / `Binary` / `Call`）の残り生成可能数。
     /// `parse_add_expr` / `parse_mul_expr` の左結合ループは `depth` を増やさず
@@ -3320,8 +3323,26 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
+        let mut quoted_null = Vec::new();
+        let tokens = if tokens.iter().any(|t| matches!(t, Token::QuotedNull(_))) {
+            let demoted = tokens
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match t {
+                    Token::QuotedNull(s) => {
+                        quoted_null.push(i);
+                        Token::Ident(s.clone())
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            std::borrow::Cow::Owned(demoted)
+        } else {
+            std::borrow::Cow::Borrowed(tokens)
+        };
         Self {
             tokens,
+            quoted_null,
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
             subquery_ctx: None,
@@ -3760,7 +3781,7 @@ impl<'a> Parser<'a> {
         } else {
             // `DISTINCT` は本 Issue のスコープ外（`COUNT(DISTINCT ...) OVER (...)`
             // は非対応。§計画 2「対象外」）。
-            if is_distinct_modifier(self.tokens, self.pos) {
+            if is_distinct_modifier(&self.tokens, self.pos) {
                 return Err(SqlSurfaceError::unsupported(
                     "DISTINCT is not supported inside a window aggregate function",
                 ));
@@ -3872,7 +3893,7 @@ impl<'a> Parser<'a> {
         // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
         // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
         // でない場合は消費しない）。
-        let distinct = if is_distinct_modifier(self.tokens, self.pos) {
+        let distinct = if is_distinct_modifier(&self.tokens, self.pos) {
             self.advance();
             true
         } else {
@@ -5803,8 +5824,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
-    /// 括弧・`NULL` キーワード等は許可リスト外）。
+    /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
+    /// 数値のみ。関数呼び出し・括弧等は許可リスト外）。INSERT の VALUES 要素・
+    /// `UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`・列制約 `DEFAULT` の
+    /// 値位置から呼ばれる単一の入口（Issue #1523・#1524・SQL-41）。`NULL` は
+    /// `InsertLiteral::Null` を返し、nullable 判定（`23502`）は束縛段
+    /// （`sql::parser` の `bind_*`）が担う。`DEFAULT NULL` だけは呼び出し元
+    /// （[`Parser::parse_column_constraints`]）が「既定値なし」へ正規化する。
+    /// `-NULL`／`+NULL` は符号の直後が `Number` でないため従来どおり `42601`。
     /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）の負数リテラルを
     /// 受理するため、`-` の直後に `Number` トークンが続く形（`parse_having` の
     /// 単項マイナス処理と同じ規範。空白を挟む形も許容）だけを単項マイナスとして
@@ -5816,6 +5843,12 @@ impl<'a> Parser<'a> {
         // （`-1.5` 等）も同じ規範で受理する（`HAVING` 述語〔約 L1359〕と同じ
         // `['-'] <Number>` の文法を先読みで判定）。`Number` 以外（文字列・
         // ベクトルリテラル）の直前の `-` は許可リスト外のまま拒否する。
+        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("NULL"))
+            && !self.quoted_null.contains(&self.pos)
+        {
+            self.advance();
+            return Ok(InsertLiteral::Null);
+        }
         if matches!(self.peek(), Some(Token::Punct('-'))) {
             self.advance();
             return match self.advance() {
@@ -6424,7 +6457,7 @@ impl<'a> Parser<'a> {
                 // `sql::allowlist::Parser` の内部状態（`tokens`／`pos`）を共有する
                 // 独立実装（`sql::ddl_column_type` モジュールドキュメント参照）。
                 let column_type = crate::sql::ddl_column_type::parse_column_type_name(
-                    self.tokens,
+                    &self.tokens,
                     &mut self.pos,
                 )?;
                 // 列制約（Issue #1169）。`UNIQUE` は追加列では受け付けない（`ALTER
@@ -6437,7 +6470,8 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 // `DEFAULT` を欠く `NOT NULL` は行の有無にかかわらず `42601` で拒否する
-                // （TABLE-16）。カタログ・行を参照しない構造判定のため、存在オラクル・
+                // （TABLE-16）。`NOT NULL DEFAULT NULL` は既定値なしに正規化されるため
+                // ここで同じく拒否される（Issue #1524・fail-closed）。カタログ・行を参照しない構造判定のため、存在オラクル・
                 // 他テナント行の有無の判別手段にならない。
                 if constraints.not_null && constraints.default.is_none() {
                     return Err(SqlSurfaceError::unsupported(
@@ -6560,7 +6594,7 @@ impl<'a> Parser<'a> {
             reject_reserved_alter_column_name(&column_name)?;
             self.expect_contextual_keyword("TYPE")?;
             let column_type =
-                crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+                crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
             return Ok(ParsedAlterTableShape::AlterColumnType {
                 table_name,
                 column_name,
@@ -6993,7 +7027,7 @@ impl<'a> Parser<'a> {
         // 読む。ENUM 型名の存在確認は DDL 権限ゲートの後の実行段が行う（構文段は
         // カタログを参照しない）ため、ENUM 候補は未解決マーカーのまま運ぶ。
         let type_name =
-            crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+            crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
         let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
@@ -7471,14 +7505,15 @@ impl<'a> Parser<'a> {
     /// `CREATE TABLE` の列定義に続く列制約（`NOT NULL`／`DEFAULT <literal>`
     /// 〔Issue #904〕・`UNIQUE`〔Issue #905〕。TABLE-16・TASK-204）を、順序自由・
     /// 各々最大 1 回まで受理する。
-    /// それぞれの重複指定は `42601`。列型ごとの適用可否（`VECTOR` への
-    /// `DEFAULT` 禁止等）は呼び出し元（[`Parser::parse_create_table_column`]）が
-    /// 判定する。`DEFAULT NULL` は `expect_literal` が `NULL` トークンを
-    /// リテラルとして受理しないため、構造的に `42601` で拒否される
-    /// （TABLE-16: 明示 `NULL` は `DEFAULT` の対象外）。
+    /// それぞれの重複指定は `42601`（`DEFAULT NULL DEFAULT 'x'` も重複）。列型ごとの
+    /// 適用可否（`VECTOR` への非 NULL `DEFAULT` 禁止等）は呼び出し元
+    /// （[`Parser::parse_create_table_column`]）が判定する。`DEFAULT NULL` は受理し、
+    /// `default: None`（既定値なし）へ正規化する（Issue #1524・SQL-41）。
     fn parse_column_constraints(&mut self) -> Result<ColumnConstraints, SqlSurfaceError> {
         let mut not_null = false;
         let mut default: Option<InsertLiteral> = None;
+        // `DEFAULT NULL` は `default` を `None` のまま残すため、重複検出は専用フラグで行う。
+        let mut seen_default = false;
         let mut unique = false;
         let mut unique_name: Option<String> = None;
         loop {
@@ -7517,10 +7552,17 @@ impl<'a> Parser<'a> {
             }
             if self.peek_ident_matches("DEFAULT") {
                 self.advance();
-                if default.is_some() {
+                if seen_default {
                     return Err(SqlSurfaceError::unsupported("duplicate DEFAULT constraint"));
                 }
-                default = Some(self.expect_literal()?);
+                seen_default = true;
+                // `DEFAULT NULL` は既定値の宣言なしと同義（PostgreSQL も NULL 定数の
+                // 既定値は保存しない）。以降の束縛・カタログ・fast default は
+                // `InsertLiteral::Null` を受け取らない（Issue #1524・SQL-41）。
+                match self.expect_literal()? {
+                    InsertLiteral::Null => {}
+                    lit => default = Some(lit),
+                }
                 continue;
             }
             break;
@@ -7546,7 +7588,7 @@ impl<'a> Parser<'a> {
     /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。`CREATE VIEW <name> AS <body>` の `<body>` 部分を
     /// [`parse_view_body`] へ独立した文として渡すために使う。
-    fn remaining(&self) -> &'a [Token] {
+    fn remaining(&self) -> &[Token] {
         match self.tokens.get(self.pos..) {
             Some(rest) => rest,
             None => &[],
@@ -7556,7 +7598,7 @@ impl<'a> Parser<'a> {
     /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
     /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
-    fn parse_create_view(&mut self) -> Result<(String, &'a [Token]), SqlSurfaceError> {
+    fn parse_create_view(&mut self) -> Result<(String, &[Token]), SqlSurfaceError> {
         self.expect_ident_matching("CREATE")?;
         self.expect_ident_matching("VIEW")?;
         let name = self.expect_ident()?;
@@ -9596,7 +9638,7 @@ fn parse_set_branch(
     // 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため枝には含めない）
     // までのスライスを既存の集計形状パーサーへ渡す。
     let branch_start = p.pos;
-    let branch_end = set_branch_end(p.tokens, branch_start);
+    let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
         if looks_like_aggregate_select(slice) {
             let shape = parse_aggregate_shape(slice, None)?;
@@ -9916,7 +9958,7 @@ fn parse_set_primary(
         // 枝内に `ORDER BY`／`LIMIT`／`OFFSET` を持つ場合は、枝自身の句として解析する
         // （括弧なしの末尾句は集合演算全体に掛かるため対象外）。それ以外は従来どおり
         // 入れ子の集合演算式として再帰する。
-        if let Some(close_idx) = set_paren_close(p.tokens, p.pos) {
+        if let Some(close_idx) = set_paren_close(&p.tokens, p.pos) {
             if let Some(inner) = p.tokens.get(p.pos..close_idx) {
                 if is_limited_single_select(inner) {
                     *branch_count = branch_count.checked_add(1).ok_or_else(|| {
@@ -11607,7 +11649,7 @@ pub fn validate_insert_with_limit(
     mode: LedgerMode,
     max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_insert_tokens_with_limit(&tokens, lookup, mode, max_insert_rows)
 }
 
@@ -11779,7 +11821,7 @@ fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurface
 /// `VECTOR` 列の `0A000` 拒否を含む）は権限ゲート通過後の実行段
 /// （`sql::ddl::execute_alter_table_add_column`）が担う。
 pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTable, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_alter_table_tokens(&tokens)
 }
 
@@ -12294,7 +12336,7 @@ pub fn validate_update(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdate, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_update_tokens(&tokens, lookup, mode)
 }
 
@@ -12373,7 +12415,7 @@ pub fn validate_update_form(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_update_form_tokens(&tokens, lookup, mode)
 }
 
@@ -14361,6 +14403,203 @@ mod tests {
                 action: OnConflictAction::DoNothing,
             })
         );
+    }
+
+    /// INSERT の VALUES は `NULL`（大小無視）を `InsertLiteral::Null` として受理する
+    /// （Issue #1523・SQL-41）。
+    #[test]
+    fn insert_values_accept_null_literal() {
+        let lookup = catalog_with(&["documents"]);
+        for kw in ["NULL", "null", "Null"] {
+            let sql = format!(
+                "INSERT INTO documents (id, embedding, lang) VALUES (1, {kw}, 'x'), (2, 'y', {kw}) \
+                 USING OPERATION_ID 'op-null-1'"
+            );
+            let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect(&sql);
+            assert_eq!(stmt.rows.len(), 2);
+            assert_eq!(stmt.rows[0][1], InsertLiteral::Null);
+            assert_eq!(stmt.rows[1][2], InsertLiteral::Null);
+        }
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, NULL) ON CONFLICT (id) DO NOTHING \
+             USING OPERATION_ID 'op-null-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("NULL with ON CONFLICT DO NOTHING");
+        assert_eq!(stmt.rows[0][1], InsertLiteral::Null);
+    }
+
+    /// `NULL` 以外の識別子・符号付き `NULL`・列数不一致は従来どおり拒否する。
+    #[test]
+    fn insert_values_reject_non_null_identifiers_and_signed_null() {
+        let lookup = catalog_with(&["documents"]);
+        for lit in ["foo", "-NULL", "+NULL"] {
+            let sql = format!(
+                "INSERT INTO documents (id, lang) VALUES (1, {lit}) USING OPERATION_ID 'op-null-3'"
+            );
+            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (NULL) USING OPERATION_ID 'op-null-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// UPDATE SET・UPSERT の DO UPDATE SET で `NULL` を `InsertLiteral::Null` として
+    /// 受理する（Issue #1524・SQL-41）。大小無視。
+    #[test]
+    fn null_literal_is_accepted_in_update_set_and_do_update_set() {
+        let lookup = catalog_with(&["documents"]);
+        for kw in ["NULL", "null", "Null"] {
+            let sql = format!(
+                "UPDATE documents SET lang = {kw} WHERE id = 1 USING OPERATION_ID 'op-null-5'"
+            );
+            let stmt = validate_update(&sql, &lookup, LedgerMode::Ledgered).expect("SET NULL");
+            assert_eq!(
+                stmt.assignments,
+                vec![("lang".to_string(), InsertLiteral::Null)]
+            );
+        }
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
+             lang = NULL USING OPERATION_ID 'op-null-6'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("DO UPDATE SET NULL");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: vec!["id".to_string()],
+                action: OnConflictAction::DoUpdate(vec![(
+                    "lang".to_string(),
+                    UpsertValue::Literal(InsertLiteral::Null)
+                )]),
+            })
+        );
+    }
+
+    /// SET・DO UPDATE SET の `-NULL`／`+NULL`／`NULL` 以外の識別子は `42601`。
+    #[test]
+    fn set_rejects_signed_null_and_other_identifiers() {
+        let lookup = catalog_with(&["documents"]);
+        for lit in ["-NULL", "+NULL", "foo"] {
+            let sql = format!(
+                "UPDATE documents SET lang = {lit} WHERE id = 1 USING OPERATION_ID 'op-null-7'"
+            );
+            let err = validate_update(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+            let sql = format!(
+                "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE \
+                 SET lang = {lit} USING OPERATION_ID 'op-null-8'"
+            );
+            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 引用付き `"NULL"` は NULL 定数として受理しない（Issue #1524 レビュー指摘。
+    /// UPDATE SET・DO UPDATE SET・DEFAULT・INSERT VALUES のいずれも `42601`）。
+    #[test]
+    fn quoted_null_is_not_a_null_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'op-q-1'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
+             lang = \"null\" USING OPERATION_ID 'op-q-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, \"NULL\") USING OPERATION_ID 'op-q-3'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let tokens = crate::sql::lexer::tokenize_marked("DEFAULT \"NULL\"").expect("tokenize");
+        assert_eq!(
+            Parser::new(&tokens)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42601"
+        );
+    }
+
+    /// 識別子位置の引用付き `"null"`／`"NULL"` は従来どおり識別子として受理する
+    /// （Issue #1524 レビュー指摘。値位置のみ NULL 定数を拒否する）。
+    #[test]
+    fn quoted_null_is_still_accepted_as_identifier() {
+        let lookup = catalog_with(&["documents", "null", "NULL"]);
+        for sql in [
+            "SELECT * FROM \"null\" ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT * FROM \"NULL\" ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT \"null\" FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT \"NULL\" FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT * FROM documents WHERE \"null\" = 'x' ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_marked(sql).expect("tokenize");
+            let tokens = crate::sql::lexer::demote_quoted_null(tokens);
+            validate_sql_tokens(&tokens, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        // 許可リストの Parser は引用付き NULL を含む生トークン列でも識別子位置を受理する。
+        let lookup = catalog_with(&["documents", "null"]);
+        let tokens = crate::sql::lexer::tokenize_marked(
+            "SELECT * FROM \"null\" ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+        )
+        .expect("tokenize");
+        validate_sql_tokens(&tokens, &lookup).expect("quoted null table name");
+        let stmt = validate_update(
+            "UPDATE \"null\" SET \"null\" = 'x' WHERE id = 1 USING OPERATION_ID 'op-q-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("quoted null table and column names in UPDATE");
+        assert_eq!(
+            stmt.assignments,
+            vec![("null".to_string(), InsertLiteral::String("x".to_string()))]
+        );
+    }
+    /// `DEFAULT NULL` は受理して既定値なし（`default: None`）へ正規化し、重複 `DEFAULT`
+    /// は順序を問わず `42601`（Issue #1524・SQL-41）。
+    #[test]
+    fn default_null_is_normalized_to_no_default() {
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_column_constraints()
+        };
+        let c = parse("DEFAULT NULL").expect("DEFAULT NULL");
+        assert_eq!(c.default, None);
+        assert!(!c.not_null);
+        let c = parse("NOT NULL DEFAULT null").expect("NOT NULL DEFAULT NULL");
+        assert_eq!(c.default, None);
+        assert!(c.not_null);
+        let c = parse("DEFAULT 'x'").expect("DEFAULT literal");
+        assert_eq!(c.default, Some(InsertLiteral::String("x".to_string())));
+        for sql in [
+            "DEFAULT NULL DEFAULT 'x'",
+            "DEFAULT 'x' DEFAULT NULL",
+            "DEFAULT NULL DEFAULT NULL",
+        ] {
+            assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
+        }
+        for sql in ["DEFAULT -NULL", "DEFAULT foo"] {
+            assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]

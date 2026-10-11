@@ -668,6 +668,73 @@ fn describe_prepared_rejects_real_invalid_vector_literal_alongside_unrelated_dol
 // いた。ダミー値へ置換された位置に限り語彙照合を省略し、実リテラル・Bind 後の
 // 不正値検出はいずれも従来どおり機能することを固定する。
 
+/// 引用付き `"null"` を名前に持つ ENUM 列・テーブルを用意する（Issue #1524 レビュー指摘の回帰用）。
+fn new_core_with_quoted_null_names(path: &std::path::Path) -> EngineCore {
+    let storage = Storage::open(path).expect("open storage");
+    let mood = storage
+        .create_enum_type("mood", vec!["happy".to_string(), "sad".to_string()])
+        .expect("create enum type");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("null", ColumnType::Enum(mood), true),
+            ],
+        ))
+        .expect("create table");
+    storage
+        .create_table(&TableSchema::new(
+            "null",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+}
+
+/// ENUM 列 `"null"` への `WHERE "null" = $1` は Describe 時点でダミー値の語彙照合を省略する。
+#[test]
+fn describe_prepared_quoted_null_enum_column_equality_succeeds_before_bind() {
+    let path = unique_db_path("prepared-quoted-null-enum-col");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_quoted_null_names(&path);
+    let session = SessionState::default();
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM documents WHERE \"null\" = $1 LIMIT 5")
+        .expect("parse_sql_prepared");
+    core.describe_prepared_in_session(&session, &prepared)
+        .expect("describe must not reject the dummy value for a quoted-null ENUM column");
+}
+
+/// テーブル名 `"null"` でも FROM／UPDATE のスキーマ取得でパラメータ型が列型に解決される。
+#[test]
+fn param_types_resolve_quoted_null_table_name() {
+    use engine::sql::exec::ColumnMeta;
+    use engine::sql::params::PreparedParamType;
+
+    let path = unique_db_path("prepared-quoted-null-table");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_quoted_null_names(&path);
+    let expected = vec![PreparedParamType::Column(ColumnMeta::Scalar {
+        name: "lang".to_string(),
+        ty: ColumnType::Text,
+    })];
+    for sql in [
+        "SELECT id FROM \"null\" WHERE lang = $1 LIMIT 5",
+        "UPDATE \"null\" SET lang = 'x' WHERE lang = $1 USING OPERATION_ID 'op-qn-1'",
+    ] {
+        let types = core
+            .parse_sql_prepared(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+            .param_types()
+            .to_vec();
+        assert_eq!(types, expected, "{sql}");
+    }
+}
+
 #[test]
 fn describe_prepared_enum_where_equality_with_dollar_param_succeeds_before_bind() {
     let path = unique_db_path("prepared-describe-enum-dollar-param");
