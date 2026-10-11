@@ -302,7 +302,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8459）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8607）。
     // Issue #1436（連鎖本文の式述語の保留・再検証。`catalog.rs` に行が追加）で追随（旧: 8670）。
-    ("catalog.rs", 8693),
+    ("catalog.rs", 8695),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -359,7 +359,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1411（評価後射影形ビューの連鎖・DAG 深さ。`catalog.rs` に行が追加）で追随（旧: 8492）。
     // Issue #1427（CHECK 参照列の拡大変換受理。`catalog.rs` に行が追加）で追随（旧: 8640）。
     // Issue #1436（同上）で追随（旧: 8703）。
-    ("catalog.rs", 8726),
+    ("catalog.rs", 8728),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
