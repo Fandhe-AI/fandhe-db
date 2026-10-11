@@ -6028,7 +6028,44 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// リテラル 1 要素（文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
+    /// `INSERT ... VALUES` の要素と列制約 `DEFAULT` の値位置の入口（Issue #1543・
+    /// SQL-45 のポインタ）。平易なリテラルは [`Self::expect_literal`] と同一の結果を
+    /// 返し、列参照を含まない式（算術・組み込み関数・CASE／COALESCE／NULLIF・
+    /// `DATE '...'` 等）は構文解析後に `sql::const_expr::fold_const_literal` で
+    /// [`InsertLiteral`] へ畳み込む。`UPDATE ... SET`／UPSERT の `SET` は本入口を
+    /// 使わず `expect_literal` のまま（別 Issue の担当）。
+    ///
+    /// 式は要素ごとに木が破棄されるため、ノード予算は要素単位で
+    /// [`MAX_EXPR_NODES`] へ戻す（文ごとの共有予算では多行 VALUES が偽の `54000` に
+    /// なる）。文全体の大きさは字句解析の入力長上限が抑える。
+    fn expect_literal_or_const_expr(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        let is_expr_start = match self.peek() {
+            Some(Token::Punct('(')) => true,
+            Some(Token::Ident(s)) => {
+                let plain_keyword = !self.quoted_null.contains(&self.pos)
+                    && (s.eq_ignore_ascii_case("true")
+                        || s.eq_ignore_ascii_case("false")
+                        || s.eq_ignore_ascii_case("null"));
+                !plain_keyword
+            }
+            _ => false,
+        };
+        if !is_expr_start {
+            let start = self.pos;
+            let lit = self.expect_literal()?;
+            if !matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                return Ok(lit);
+            }
+            self.pos = start;
+        }
+        let saved = self.expr_node_budget;
+        self.expr_node_budget = MAX_EXPR_NODES;
+        let parsed = self.parse_value_expr(0);
+        self.expr_node_budget = saved;
+        crate::sql::const_expr::fold_const_literal(&parsed?)
+    }
+
+    /// リテラル 1 要素（INSERT VALUES・列 DEFAULT は定数式を受理する入口 `expect_literal_or_const_expr` 経由、Issue #1543。文字列・数値・`true`/`false`・大小無視の `NULL`・符号付き
     /// 数値のみ。関数呼び出し・括弧等は許可リスト外）。INSERT の VALUES 要素・
     /// `UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`・列制約 `DEFAULT` の
     /// 値位置から呼ばれる単一の入口（Issue #1523・#1524・SQL-41）。`NULL` は
@@ -6277,13 +6314,13 @@ impl<'a> Parser<'a> {
         columns: &[String],
     ) -> Result<Vec<InsertLiteral>, SqlSurfaceError> {
         self.expect_punct('(')?;
-        let mut values = vec![self.expect_literal()?];
+        let mut values = vec![self.expect_literal_or_const_expr()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if values.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many INSERT values"));
             }
-            values.push(self.expect_literal()?);
+            values.push(self.expect_literal_or_const_expr()?);
         }
         self.expect_punct(')')?;
 
@@ -7763,7 +7800,7 @@ impl<'a> Parser<'a> {
                 // `DEFAULT NULL` は既定値の宣言なしと同義（PostgreSQL も NULL 定数の
                 // 既定値は保存しない）。以降の束縛・カタログ・fast default は
                 // `InsertLiteral::Null` を受け取らない（Issue #1524・SQL-41）。
-                match self.expect_literal()? {
+                match self.expect_literal_or_const_expr()? {
                     InsertLiteral::Null => {}
                     lit => default = Some(lit),
                 }
@@ -14808,12 +14845,13 @@ mod tests {
     #[test]
     fn insert_values_reject_non_null_identifiers_and_signed_null() {
         let lookup = catalog_with(&["documents"]);
-        for lit in ["foo", "-NULL", "+NULL"] {
+        // 裸の識別子は列参照として 42703（Issue #1543・SQL-45 のポインタ）。
+        for (lit, code) in [("foo", "42703"), ("-NULL", "42601"), ("+NULL", "42601")] {
             let sql = format!(
                 "INSERT INTO documents (id, lang) VALUES (1, {lit}) USING OPERATION_ID 'op-null-3'"
             );
             let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601", "{sql}");
+            assert_eq!(err.wire_code(), code, "{sql}");
         }
         let err = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (NULL) USING OPERATION_ID 'op-null-4'",
@@ -14903,14 +14941,14 @@ mod tests {
             LedgerMode::Ledgered,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        assert_eq!(err.wire_code(), "42703");
         let tokens = crate::sql::lexer::tokenize_marked("DEFAULT \"NULL\"").expect("tokenize");
         assert_eq!(
             Parser::new(&tokens)
                 .parse_column_constraints()
                 .unwrap_err()
                 .wire_code(),
-            "42601"
+            "42703"
         );
     }
 
@@ -14971,9 +15009,80 @@ mod tests {
         ] {
             assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
         }
-        for sql in ["DEFAULT -NULL", "DEFAULT foo"] {
+        assert_eq!(parse("DEFAULT -NULL").unwrap_err().wire_code(), "42601");
+        // 列参照は 42703（Issue #1543・SQL-45 のポインタ）。
+        assert_eq!(parse("DEFAULT foo").unwrap_err().wire_code(), "42703");
+    }
+
+    /// `DEFAULT` と VALUES の定数式（Issue #1543・SQL-45 のポインタ）。
+    #[test]
+    fn const_expr_default_and_values() {
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            Parser::new(&tokens).parse_column_constraints()
+        };
+        let c = parse("DEFAULT 1+1").unwrap();
+        assert_eq!(c.default, Some(InsertLiteral::Number("2".to_string())));
+        let c = parse("DEFAULT upper('a') NOT NULL UNIQUE").unwrap();
+        assert_eq!(c.default, Some(InsertLiteral::String("A".to_string())));
+        assert!(c.not_null && c.unique);
+        assert_eq!(parse("DEFAULT NULLIF(1,1)").unwrap().default, None);
+        assert_eq!(
+            parse("DEFAULT -5").unwrap().default,
+            Some(InsertLiteral::Number("-5".into()))
+        );
+        assert_eq!(
+            parse("DEFAULT +1").unwrap().default,
+            Some(InsertLiteral::Number("+1".into()))
+        );
+        assert_eq!(
+            parse("DEFAULT true").unwrap().default,
+            Some(InsertLiteral::Bool(true))
+        );
+        for sql in [
+            "DEFAULT CURRENT_TIMESTAMP",
+            "DEFAULT now()",
+            "DEFAULT -(1+2)",
+        ] {
             assert_eq!(parse(sql).unwrap_err().wire_code(), "42601", "{sql}");
         }
+        assert_eq!(parse("DEFAULT n + 1").unwrap_err().wire_code(), "42703");
+
+        let lookup = catalog_with(&["documents"]);
+        let ok = validate_insert(
+            "INSERT INTO documents (id, body) VALUES (1+1, upper('a')), (3, 'x') \
+             USING OPERATION_ID 'op-ce-1'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap();
+        assert_eq!(
+            ok.rows[0],
+            vec![
+                InsertLiteral::Number("2".into()),
+                InsertLiteral::String("A".into())
+            ]
+        );
+        let many = format!(
+            "INSERT INTO documents (id) VALUES {} USING OPERATION_ID 'op-ce-2'",
+            vec!["(1+1)"; 600].join(", ")
+        );
+        validate_insert(&many, &lookup, LedgerMode::Ledgered).unwrap();
+        let err = validate_insert(
+            "INSERT INTO documents (id, body) VALUES (1, n) USING OPERATION_ID 'op-ce-3'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42703");
+        // UPDATE SET は式を受理しない（別 Issue の担当）。
+        let err = validate_update(
+            "UPDATE documents SET body = 1+1 WHERE id = 1 USING OPERATION_ID 'op-ce-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]

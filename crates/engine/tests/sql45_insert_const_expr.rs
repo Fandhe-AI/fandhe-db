@@ -1,0 +1,147 @@
+//! `INSERT ... VALUES` と列 `DEFAULT` の定数式受理（SQL-45・Issue #1543）の結合テスト。
+//!
+//! 構文段で畳み込まれたリテラルが既存の束縛・格納経路を通ることを、実 `Storage` で
+//! 端到端に固定する。`sql_insert_null_literal.rs` と同じ流儀（`unique_db_path`／
+//! `CleanupGuard`）。ポインタ: `docs/design/implementation-status.md`。
+
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::sql::exec::Cell;
+use engine::sql::mode::SessionState;
+use engine::sql::SqlOutcome;
+use engine::storage::{Storage, Visibility};
+
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
+
+fn ctx() -> PolicyContext {
+    PolicyContext::with_visibilities("alice", [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn setup(label: &str) -> (EngineCore, std::path::PathBuf, SessionState) {
+    let path = unique_db_path(label);
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), n INTEGER, t TEXT, \
+         d INTEGER DEFAULT 1+1, s TEXT DEFAULT upper('ab'))",
+    )
+    .expect("create table with constant-expression defaults");
+    (core, path, session)
+}
+
+const VEC: &str = "'[0.1,0.2,0.3,0.4]'";
+
+fn insert(core: &EngineCore, cols: &str, vals: &str, op: &str) -> Result<(), String> {
+    core.execute_insert_sql(
+        &ctx(),
+        &format!("INSERT INTO docs ({cols}) VALUES {vals} USING OPERATION_ID '{op}'"),
+    )
+    .map(|_| ())
+    .map_err(|e| e.wire_code().to_string())
+}
+
+fn select(core: &EngineCore, session: &mut SessionState, sql: &str) -> Vec<Vec<Cell>> {
+    match core
+        .execute_sql_in_session(&ctx(), session, sql)
+        .expect("select ok")
+    {
+        SqlOutcome::Query(r) => r.rows.into_iter().map(|row| row.cells).collect(),
+        _ => panic!("expected Query outcome"),
+    }
+}
+
+fn dbg(c: &Cell) -> String {
+    format!("{c:?}")
+}
+
+#[test]
+fn values_accept_constant_expressions() {
+    let (core, path, mut session) = setup("sql45-values");
+    let _guard = CleanupGuard(path);
+    insert(
+        &core,
+        "id, embedding, n, t",
+        &format!("(1, {VEC}, 1+1, upper('a'))"),
+        "op-1",
+    )
+    .expect("constant expressions");
+    let rows = select(&core, &mut session, "SELECT n, t FROM docs LIMIT 10");
+    assert_eq!(rows.len(), 1);
+    assert!(dbg(&rows[0][0]).contains('2'), "{:?}", rows[0][0]);
+    assert!(dbg(&rows[0][1]).contains('A'), "{:?}", rows[0][1]);
+}
+
+#[test]
+fn defaults_accept_constant_expressions() {
+    let (core, path, mut session) = setup("sql45-default");
+    let _guard = CleanupGuard(path);
+    insert(&core, "id, embedding", &format!("(1, {VEC})"), "op-1").expect("omit defaults");
+    let rows = select(&core, &mut session, "SELECT d, s FROM docs LIMIT 10");
+    assert_eq!(rows.len(), 1);
+    assert!(dbg(&rows[0][0]).contains('2'), "{:?}", rows[0][0]);
+    assert!(dbg(&rows[0][1]).contains("AB"), "{:?}", rows[0][1]);
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut session,
+        "ALTER TABLE docs ADD COLUMN e INTEGER DEFAULT 2*3",
+    )
+    .expect("alter add column with constant default");
+    let rows = select(&core, &mut session, "SELECT e FROM docs LIMIT 10");
+    assert!(dbg(&rows[0][0]).contains('6'), "{:?}", rows[0][0]);
+}
+
+#[test]
+fn column_references_and_boundaries_are_rejected() {
+    let (core, path, mut session) = setup("sql45-reject");
+    let _guard = CleanupGuard(path);
+    let cols = "id, embedding, n";
+    assert_eq!(
+        insert(&core, cols, &format!("(1, {VEC}, n)"), "op-1").unwrap_err(),
+        "42703"
+    );
+    assert_eq!(
+        insert(&core, cols, &format!("(1, {VEC}, id + 1)"), "op-2").unwrap_err(),
+        "42703"
+    );
+    assert_eq!(
+        insert(&core, cols, &format!("(1, {VEC}, 1/0)"), "op-3").unwrap_err(),
+        "22012"
+    );
+    assert_eq!(
+        insert(&core, cols, &format!("(1, {VEC}, 2147483647+1)"), "op-4").unwrap_err(),
+        "22003"
+    );
+    // 多行の一部が失敗したら全体を拒否する。
+    assert!(insert(
+        &core,
+        cols,
+        &format!("(1, {VEC}, 1+1), (2, {VEC}, n)"),
+        "op-5"
+    )
+    .is_err());
+    assert!(select(&core, &mut session, "SELECT n FROM docs LIMIT 10").is_empty());
+    let err = core
+        .execute_sql_in_session(
+            &ctx(),
+            &mut session,
+            "CREATE TABLE bad (embedding VECTOR(4), n INTEGER DEFAULT n + 1)",
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "42703");
+    let err = core
+        .execute_sql_in_session(
+            &ctx(),
+            &mut session,
+            "CREATE TABLE bad2 (embedding VECTOR(4), n TIMESTAMP DEFAULT now())",
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "42601");
+}

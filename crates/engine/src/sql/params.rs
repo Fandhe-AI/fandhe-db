@@ -22,7 +22,8 @@
 //!    `LIKE`・式比較・BOOLEAN 列条件・`SET`／`ON CONFLICT ... SET` の同型文字列は
 //!    対象外——`WHERE` 節の外側にはこのパターンを一切適用しない）
 //! 5. `INSERT ... VALUES ($1, $2, ...)`（複数行含む。`VALUES` 節内の `(`/`,` と
-//!    `,`/`)` に挟まれた位置のみ）
+//!    `,`/`)` に挟まれた位置のみ。行の括弧の直下＝深さ 1 の要素単独位置に限る。
+//!    `upper($1)`・`1 + $1` 等の式の内側は Issue #1546 の担当で `42601`）
 //!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `UPDATE ... SET a = $n`・`ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
@@ -324,6 +325,67 @@ fn values_region_bounds(tokens: &[Token]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// `VALUES` 節の行グループを前向きに走査し、`tokens[i]`（`$n`）が「行の括弧の
+/// 直下（深さちょうど 1）にある要素単独の位置」であれば行内の列序数を返す
+/// （Issue #1543・SQL-45 のポインタ）。式の内側（`upper($1)`・`1 + $1`・`(($1))`）は
+/// 深さまたは前後トークンで外れて `None` になり `42601` で拒否される（式内 `$n` は
+/// 別 Issue の担当）。位置判定と型推論の双方が本関数を共有する。
+fn values_row_param_slot(tokens: &[Token], start: usize, end: usize, i: usize) -> Option<usize> {
+    let end = end.min(tokens.len());
+    let mut pos = start.checked_add(1)?;
+    loop {
+        if !matches!(tokens.get(pos), Some(Token::Punct('('))) || pos >= end {
+            return None;
+        }
+        let row_open = pos;
+        let mut depth: usize = 0;
+        let mut commas: usize = 0;
+        let mut k = row_open;
+        let mut found: Option<usize> = None;
+        let row_close = loop {
+            if k >= end {
+                return None;
+            }
+            match tokens.get(k)? {
+                Token::Punct('(') | Token::Punct('[') => depth += 1,
+                Token::Punct(')') | Token::Punct(']') => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        break k;
+                    }
+                }
+                Token::Punct(',') if depth == 1 => commas += 1,
+                Token::Param(_) if k == i && depth == 1 => {
+                    let prev_ok = matches!(
+                        tokens.get(k.wrapping_sub(1)),
+                        Some(Token::Punct('(')) | Some(Token::Punct(','))
+                    );
+                    let next_ok = matches!(
+                        tokens.get(k + 1),
+                        Some(Token::Punct(')')) | Some(Token::Punct(','))
+                    );
+                    if prev_ok && next_ok {
+                        found = Some(commas);
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        };
+        if i > row_open && i < row_close {
+            return found;
+        }
+        // 次の行（`, (`）へ進む。それ以外で行の並びは終わり。
+        if matches!(tokens.get(row_close + 1), Some(Token::Punct(',')))
+            && matches!(tokens.get(row_close + 2), Some(Token::Punct('(')))
+        {
+            pos = row_close + 2;
+        } else {
+            return None;
+        }
+    }
+}
+
 /// `tokens` 中の `Token::Param` がすべて許可位置に収まっていることを検証し、
 /// 文が要求するパラメータ数（最大の `$n` 番号。1 始まり。`$n` が 1 つも
 /// 無ければ 0）を返す。
@@ -434,10 +496,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
         let is_insert_value = values_region.is_some_and(|start| {
             let end = values_region_end.unwrap_or(tokens.len());
-            i > start
-                && i < end
-                && matches!(prev1, Some(Token::Punct('(')) | Some(Token::Punct(',')))
-                && matches!(next1, Some(Token::Punct(')')) | Some(Token::Punct(',')))
+            values_row_param_slot(tokens, start, end, i).is_some()
         });
 
         if !(is_distance
@@ -628,33 +687,12 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         };
         let prev1 = i.checked_sub(1).and_then(|j| tokens.get(j));
         let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
-        let next1 = tokens.get(i + 1);
         if matches!(prev1, Some(Token::DistanceOp)) {
             slot.push(ParamPosition::Vector);
             continue;
         }
         if let Some((start, end)) = values_bounds {
-            if i > start
-                && i < end
-                && matches!(prev1, Some(Token::Punct('(')) | Some(Token::Punct(',')))
-                && matches!(next1, Some(Token::Punct(')')) | Some(Token::Punct(',')))
-            {
-                // 行内 ordinal: 直前の `(` までの、括弧・角括弧の深さ 0 の `,` の数。
-                let mut depth: i32 = 0;
-                let mut commas: usize = 0;
-                for t in tokens.get(start + 1..i).unwrap_or(&[]).iter().rev() {
-                    match t {
-                        Token::Punct(')') | Token::Punct(']') => depth += 1,
-                        Token::Punct('(') | Token::Punct('[') => {
-                            if depth == 0 {
-                                break;
-                            }
-                            depth -= 1;
-                        }
-                        Token::Punct(',') if depth == 0 => commas += 1,
-                        _ => {}
-                    }
-                }
+            if let Some(commas) = values_row_param_slot(tokens, start, end, i) {
                 slot.push(ParamPosition::InsertValue(commas));
                 continue;
             }
@@ -1104,6 +1142,30 @@ mod tests {
         assert_eq!(
             positions("SELECT * FROM documents WHERE lang = $1 LIMIT 5").unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn rejects_param_inside_insert_values_expression() {
+        for sql in [
+            "INSERT INTO t (id, a) VALUES (1, upper($1)) USING OPERATION_ID 'op-1'",
+            "INSERT INTO t (id, a) VALUES (1, round(1, $1)) USING OPERATION_ID 'op-1'",
+            "INSERT INTO t (id, a) VALUES (1, ($1)) USING OPERATION_ID 'op-1'",
+            "INSERT INTO t (id, a) VALUES (1, 1 + $1) USING OPERATION_ID 'op-1'",
+            "INSERT INTO t (id, a) VALUES (1, 1), (2, ($1)) USING OPERATION_ID 'op-1'",
+        ] {
+            assert!(positions(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn insert_values_ordinals_with_expression_siblings() {
+        assert_eq!(
+            positions(
+                "INSERT INTO t (id, a, b) VALUES ($1, 1+1, upper('a')), (2, $2, 'x') USING OPERATION_ID 'op-1'"
+            )
+            .unwrap(),
+            2
         );
     }
 
