@@ -96,6 +96,12 @@ pub enum Token {
     /// 限られる。`sql::allowlist::Parser`（許可リスト構造検証）はこの variant を
     /// 一切知らない設計（置換後のトークン列のみを見る）。
     Param(u16),
+    /// 二重引用符で囲まれた `NULL`（大小無視。Issue #1524 レビュー指摘）。裸の `NULL` と
+    /// 区別するための専用トークンで、[`tokenize_marked`]／[`tokenize_with_params`] のみが
+    /// 生成する。許可リストの `Parser` は構築時にこれを `Ident` へ戻して識別子位置
+    /// （テーブル名・列名等）では従来どおり受理し、値位置（`expect_literal`）でだけ
+    /// NULL 定数として受理せず `42601` で拒否する（`SET lang = "NULL"` が NULL 更新に化けるのを防ぐ）。
+    QuotedNull(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +192,11 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 out.push_str(qualifier);
                 out.push('.');
                 out.push_str(name);
+            }
+            Token::QuotedNull(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
             }
             Token::Param(_) => return None,
         }
@@ -281,7 +292,28 @@ fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
 /// のみが受理する。両者は [`tokenize_impl`] を共有し、この関数の既存の受理・拒否
 /// 契約は一切変えない）。
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, false)
+    tokenize_impl(input, false, false)
+}
+
+/// [`tokenize`] と同一だが、二重引用符付き `NULL` を [`Token::QuotedNull`] として返す版
+/// （Issue #1524）。値位置で裸の `NULL` と引用付き `"NULL"` を区別する必要がある
+/// INSERT／UPDATE／CREATE TABLE／ALTER TABLE の許可リスト検証経路だけが使う。
+/// 返したトークン列を許可リストの `Parser` 以外へ渡す場合は [`demote_quoted_null`] で
+/// `Ident` へ戻す（識別子位置では従来どおり `Ident` として扱うため）。
+pub fn tokenize_marked(input: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_impl(input, false, true)
+}
+
+/// [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。`tokenize` の
+/// 出力と同一になる）。値位置の区別が不要な文種（SELECT・DDL 制御等）へ渡す前に使う。
+pub fn demote_quoted_null(tokens: Vec<Token>) -> Vec<Token> {
+    tokens
+        .into_iter()
+        .map(|t| match t {
+            Token::QuotedNull(s) => Token::Ident(s),
+            other => other,
+        })
+        .collect()
 }
 
 /// [`tokenize`] の `$n` プレースホルダ対応版（Issue #935・WIRE-12・TASK-217）。
@@ -289,13 +321,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 /// プロトコル・許可リスト構造検証（`sql::allowlist`）は引き続き [`tokenize`]
 /// （`$` を拒否する既定の字句解析）を使う。
 pub fn tokenize_with_params(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, true)
+    tokenize_impl(input, true, true)
 }
 
 /// [`tokenize`]／[`tokenize_with_params`] が共有する走査本体。`allow_params` が
 /// `false` の場合の受理・拒否契約は本分割の前と完全に同一（`$` は下の「未対応
 /// 文字」へフォールスルーする）。
-fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError> {
+fn tokenize_impl(
+    input: &str,
+    allow_params: bool,
+    mark_quoted_null: bool,
+) -> Result<Vec<Token>, LexError> {
     if input.len() > MAX_INPUT_LEN {
         return Err(LexError {
             message: format!("input too large: {} bytes", input.len()),
@@ -426,6 +462,8 @@ fn tokenize_impl(input: &str, allow_params: bool) -> Result<Vec<Token>, LexError
             }
             if content.eq_ignore_ascii_case("true") || content.eq_ignore_ascii_case("false") {
                 tokens.push(Token::QuotedBoolWord(content.to_string()));
+            } else if mark_quoted_null && content.eq_ignore_ascii_case("NULL") {
+                tokens.push(Token::QuotedNull(content.to_string()));
             } else {
                 tokens.push(Token::Ident(content.to_string()));
             }
@@ -1296,6 +1334,33 @@ mod tests {
         let base = "*".repeat(MAX_TOKEN_COUNT);
         assert!(tokenize(&format!("{base}/* c */")).is_ok());
         assert!(tokenize(&format!("{base}-- c")).is_ok());
+    }
+
+    /// 引用付き `NULL` は裸の `NULL`（`Ident`）と区別される専用トークンになる
+    /// （Issue #1524 レビュー指摘）。
+    #[test]
+    fn quoted_null_is_distinct_from_bare_null() {
+        assert_eq!(
+            tokenize_marked("\"NULL\" \"null\" NULL").expect("tokenize"),
+            vec![
+                Token::QuotedNull("NULL".to_string()),
+                Token::QuotedNull("null".to_string()),
+                Token::Ident("NULL".to_string()),
+            ]
+        );
+        // 既定の `tokenize` は従来どおり `Ident`（後方互換。識別子位置の "null"）。
+        assert_eq!(
+            tokenize("\"NULL\" \"null\" NULL").expect("tokenize"),
+            vec![
+                Token::Ident("NULL".to_string()),
+                Token::Ident("null".to_string()),
+                Token::Ident("NULL".to_string()),
+            ]
+        );
+        assert_eq!(
+            demote_quoted_null(tokenize_marked("\"NULL\"").expect("tokenize")),
+            vec![Token::Ident("NULL".to_string())]
+        );
     }
 
     #[test]

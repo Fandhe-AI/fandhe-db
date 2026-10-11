@@ -336,15 +336,66 @@ fn rls_other_tenant_row_is_untouched_and_error_is_row_independent() {
     assert_eq!(codes, vec!["23502", "23502", "23502"]);
 }
 
-/// 二重引用符識別子 `"NULL"` の扱いは lexer の既知事項で、本 Issue では変更しない。
-/// 結果の成否にかかわらず他の行を壊さないことだけを固定する。
+/// 二重引用符識別子 `"NULL"` は NULL 定数として受理しない（Issue #1524 レビュー指摘）。
+/// `42601` で拒否され、対象行を含むどの行も変化しない。
 #[test]
-fn quoted_null_identifier_does_not_corrupt_other_rows() {
+fn quoted_null_identifier_is_rejected_and_row_unchanged() {
     let (core, _g) = setup("upd-null-quoted");
-    let _ = run(
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "UPDATE docs SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'q1'",
+        ),
+        "42601"
+    );
+    assert!(is_text(&cell_of(&core, "alice", "lang", 1), "ja"));
+    assert!(is_text(&cell_of(&core, "alice", "lang", 2), "ja"));
+}
+
+/// 同一 `operation_id` で NULL 割当だけが異なる単一行 UPDATE は内容不一致（`22023`）になる
+/// （RECOVER-10。Issue #1524 レビュー指摘: NULL 列が内容照合ハッシュから脱落しない）。
+#[test]
+fn same_operation_id_with_different_null_assignment_is_content_mismatch() {
+    let (core, _g) = setup("upd-null-hash");
+    ok(
         &core,
         "alice",
-        "UPDATE docs SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'q1'",
+        "UPDATE docs SET lang = 'x' WHERE id = 1 USING OPERATION_ID 'h1'",
     );
-    assert!(is_text(&cell_of(&core, "alice", "lang", 2), "ja"));
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "UPDATE docs SET lang = 'x', u = NULL WHERE id = 1 USING OPERATION_ID 'h1'",
+        ),
+        "22023"
+    );
+    assert!(is_text(&cell_of(&core, "alice", "u", 1), "u1"));
+}
+
+/// `EXPLAIN UPDATE ... PARTITIONED` でも引用付き `"NULL"` は NULL 定数として受理せず
+/// `42601`（実行時の UPDATE と同じ契約。Issue #1524 レビュー指摘）。引用なしの `NULL` は
+/// 従来どおり EXPLAIN を受理する。
+#[test]
+fn explain_partitioned_update_distinguishes_quoted_null() {
+    let (core, _g) = setup("upd-null-explain");
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "EXPLAIN UPDATE docs SET lang = \"NULL\" WHERE id > 0 \
+             USING OPERATION_ID 'ex-q' PARTITIONED",
+        ),
+        "42601"
+    );
+    assert!(matches!(
+        ok(
+            &core,
+            "alice",
+            "EXPLAIN UPDATE docs SET lang = NULL WHERE id > 0 \
+             USING OPERATION_ID 'ex-n' PARTITIONED",
+        ),
+        SqlOutcome::Explain(_)
+    ));
 }

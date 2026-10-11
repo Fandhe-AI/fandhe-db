@@ -136,12 +136,18 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
         "GROUP" => matches!(next1, Some(Token::Keyword(crate::sql::lexer::Keyword::By))),
         // `HAVING <ident> <cmp> ...`（`Parser::parse_having`）。UDF 呼び出し
         // `having(...)` は直後が `(` になり `Ident` に一致しない。
-        "HAVING" => matches!(next1, Some(Token::Ident(_))) && is_comparison_operator(next2),
+        "HAVING" => {
+            matches!(next1, Some(Token::Ident(_) | Token::QuotedNull(_)))
+                && is_comparison_operator(next2)
+        }
         // `RETURNING <投影>`（`Parser::parse_returning_clause`。`*` または
         // 列名の列挙のみを受理し関数呼び出し項目は拒否する）。UDF 呼び出し
         // `returning(...)` は直後が `(` になり、列名としての比較
         // `returning = $1` は直後が `=` になるため、いずれも一致しない。
-        "RETURNING" => matches!(next1, Some(Token::Ident(_) | Token::Punct('*'))),
+        "RETURNING" => matches!(
+            next1,
+            Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct('*'))
+        ),
         // `USING OPERATION_ID $n` / `USING PLAN(...)`（`Parser` がこの 2 語の
         // みを文脈的キーワードとして照合する）。UDF 呼び出し `using(...)` は
         // 直後が `(` になり `OPERATION_ID`／`PLAN` に一致しない。
@@ -237,7 +243,7 @@ pub(crate) fn where_equality_literal_is_param_typed(
     let mut flags = Vec::new();
     let mut i = start + 1;
     while i < end {
-        if matches!(tokens.get(i), Some(Token::Ident(_)))
+        if matches!(tokens.get(i), Some(Token::Ident(_) | Token::QuotedNull(_)))
             && matches!(tokens.get(i + 1), Some(Token::Punct('=')))
         {
             match tokens.get(i + 2) {
@@ -260,7 +266,7 @@ pub(crate) fn where_equality_literal_is_param_typed(
         // `Not(Equality)` になり `equality_ordinal` を進めるため、実リテラルの
         // フラグ `false` を積んで序数を揃える。`<> $n` は許可位置ではない
         // （`validate_param_positions` が拒否する）ので Param 側は数えない。
-        if matches!(tokens.get(i), Some(Token::Ident(_)))
+        if matches!(tokens.get(i), Some(Token::Ident(_) | Token::QuotedNull(_)))
             && matches!(tokens.get(i + 1), Some(Token::Punct('<')))
             && matches!(tokens.get(i + 2), Some(Token::Punct('>')))
             && matches!(tokens.get(i + 3), Some(Token::StringLiteral(_)))
@@ -422,7 +428,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
             i > start
                 && i < end
                 && matches!(prev1, Some(Token::Punct('=')))
-                && matches!(prev2, Some(Token::Ident(_)))
+                && matches!(prev2, Some(Token::Ident(_) | Token::QuotedNull(_)))
         });
 
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
@@ -655,7 +661,7 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         }
         if let Some((start, end)) = where_bounds {
             if i > start && i < end && matches!(prev1, Some(Token::Punct('='))) {
-                if let Some(Token::Ident(col)) = prev2 {
+                if let Some(Token::Ident(col) | Token::QuotedNull(col)) = prev2 {
                     slot.push(ParamPosition::WhereColumn(col.clone()));
                     continue;
                 }
@@ -835,6 +841,7 @@ pub fn decode_bind_values(
                     .unwrap_or(0)
             }
             Token::Ident(s)
+            | Token::QuotedNull(s)
             | Token::QuotedBoolWord(s)
             | Token::StringLiteral(s)
             | Token::Number(s) => s.len(),
@@ -1016,6 +1023,35 @@ mod tests {
     // PR #1012 Cursor Bugbot 指摘の回帰: `where_equality_literal_is_param` は
     // `WHERE` 等価述語（パターン 4）の値が `$n` 由来か実リテラルかを出現順で
     // 正しく判定しなければならない。
+    // Issue #1524 レビュー指摘: 引用付き `"null"`／`"NULL"` の列名は `Ident` と同じ識別子として
+    // 等価述語の走査・句境界判定に数える（`Token::QuotedNull` を読み飛ばさない）。
+    #[test]
+    fn quoted_null_column_is_counted_in_where_equality_flags() {
+        let tokens = tokenize_with_params(
+            "SELECT * FROM documents WHERE \"null\" <> 'x' AND \"NULL\" = $1 AND \"null\" = 'y' LIMIT 5",
+        )
+        .expect("tokenize_with_params should succeed");
+        assert!(tokens.iter().any(|t| matches!(t, Token::QuotedNull(_))));
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![false, true, false]
+        );
+    }
+
+    #[test]
+    fn quoted_null_after_returning_or_having_is_a_clause_boundary() {
+        for tail in ["RETURNING \"NULL\"", "HAVING \"null\" = 'x'"] {
+            let sql = format!("UPDATE t SET a = 'x' WHERE b = $1 {tail}");
+            let tokens = tokenize_with_params(&sql).expect("tokenize");
+            let (start, end) = where_region(&tokens).expect("where region");
+            assert!(end > start && end < tokens.len(), "{sql}: end={end}");
+            assert!(
+                matches!(&tokens[end], Token::Ident(n) if n.eq_ignore_ascii_case(tail.split(' ').next().unwrap())),
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn where_equality_literal_is_param_detects_dollar_param() {
         let tokens = tokenize_with_params("SELECT * FROM documents WHERE mood = $1 LIMIT 5")
