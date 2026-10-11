@@ -118,6 +118,14 @@ pub(crate) fn normalize_single_table_qualifiers(
                         "qualified null column reference is not supported",
                     ));
                 }
+                // `x.distinct`／`x.not` 等は Ident へ落とすと後段が構文語（DISTINCT 修飾子・
+                // NOT 述語等）として再解釈し、列の存在検証なしで受理される（PR #2309 指摘・P1）。
+                // 構文語と衝突する名前の修飾列参照は fail-closed で拒否する（引用識別子は対象外）。
+                if is_syntax_word(name) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "qualified column reference named like a SQL keyword is not supported",
+                    ));
+                }
                 if is_bool_word && !leaf {
                     return Err(SqlSurfaceError::unsupported(
                         "qualified boolean-word column reference is only supported as a WHERE predicate",
@@ -150,6 +158,49 @@ pub(crate) fn normalize_single_table_qualifiers(
         Some(v) => Cow::Owned(v),
         None => Cow::Borrowed(tokens),
     })
+}
+
+/// 後段パーサが `Ident` を構文語として消費しうる語か（修飾列名の再解釈防止用）。
+fn is_syntax_word(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "distinct",
+        "all",
+        "not",
+        "and",
+        "or",
+        "is",
+        "in",
+        "between",
+        "like",
+        "ilike",
+        "as",
+        "asc",
+        "desc",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "group",
+        "having",
+        "over",
+        "using",
+        "offset",
+        "with",
+        "union",
+        "intersect",
+        "except",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "natural",
+        "fetch",
+        "for",
+        "on",
+    ];
+    WORDS.iter().any(|w| name.eq_ignore_ascii_case(w))
 }
 
 fn in_range(r: (usize, usize), i: usize) -> bool {
@@ -423,6 +474,19 @@ mod tests {
             "SELECT id FROM docs x WHERE flag = x.false LIMIT 10",
             "SELECT x.true FROM docs x LIMIT 1",
             "SELECT id FROM docs x ORDER BY x.false LIMIT 1",
+        ] {
+            let toks = tokenize(sql).expect("lex");
+            assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn qualified_syntax_word_columns_are_rejected() {
+        for sql in [
+            "SELECT x.distinct id FROM docs x LIMIT 10",
+            "SELECT id FROM docs x WHERE x.not TRUE LIMIT 10",
+            "SELECT id FROM docs x WHERE x.not = 1 LIMIT 10",
+            "SELECT x.all FROM docs x LIMIT 10",
         ] {
             let toks = tokenize(sql).expect("lex");
             assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
