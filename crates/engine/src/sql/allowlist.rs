@@ -9042,7 +9042,7 @@ pub(super) fn is_set_operator_ident(name: &str) -> bool {
 /// 呼び出し）の呼び出し括弧まで集合演算の枝開始と誤検出し、UDF 呼び出しが
 /// 集合演算枝の解析経路（`Computed` 投影項目を拒否する）に誤って回されてしまう
 /// （Issue #929 最終レビュー指摘の回帰）。
-fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
+pub(super) fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
     let branch_starts_at = |idx: usize| -> bool {
         match tokens.get(idx) {
             Some(Token::Keyword(Keyword::Select)) => true,

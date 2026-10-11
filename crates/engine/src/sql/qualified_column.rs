@@ -23,10 +23,10 @@
 use std::borrow::Cow;
 
 use crate::sql::allowlist::{
-    from_clause_starts_join, is_set_operator_ident, probe_from_table_ref, SqlSurfaceError,
-    MAX_SUBQUERY_DEPTH,
+    from_clause_starts_join, is_set_operator_ident, probe_from_table_ref,
+    set_operator_is_followed_by_branch, SqlSurfaceError, MAX_SUBQUERY_DEPTH,
 };
-use crate::sql::lexer::{Keyword, Token};
+use crate::sql::lexer::{quoted_bool_word_in_leaf_position, Keyword, Token};
 use crate::sql::relation::TableRef;
 
 /// `( SELECT ... )` または先頭 `SELECT` 1 つ分の解析スコープ。
@@ -96,7 +96,22 @@ pub(crate) fn normalize_single_table_qualifiers(
         if info.from_ref.matches_qualifier(qualifier) {
             let buf = out.get_or_insert_with(|| tokens.to_vec());
             if let Some(slot) = buf.get_mut(i) {
-                *slot = Token::Ident(name.clone());
+                // `x.true`／`x.false` は列参照であり真偽リテラルではない。WHERE の述語葉位置では
+                // 未引用 `Ident` だと定数畳み込みされるため、引用付き相当の `QuotedBoolWord` を
+                // 使う（PR #2309 指摘）。それ以外の位置は従来どおり `Ident`。
+                let is_bool_word =
+                    name.eq_ignore_ascii_case("true") || name.eq_ignore_ascii_case("false");
+                let leaf = is_bool_word
+                    && tokens.get(..i).is_some_and(|h| {
+                        h.iter()
+                            .any(|t| matches!(t, Token::Keyword(Keyword::Where)))
+                    })
+                    && quoted_bool_word_in_leaf_position(tokens, i);
+                *slot = if leaf {
+                    Token::QuotedBoolWord(name.clone())
+                } else {
+                    Token::Ident(name.clone())
+                };
             }
             continue;
         }
@@ -220,7 +235,13 @@ fn scope_info(tokens: &[Token], scopes: &[Scope], idx: usize) -> Option<ScopeInf
             Token::Keyword(Keyword::From) if depth == 0 && from_idx.is_none() => {
                 from_idx = Some(i);
             }
-            Token::Ident(w) if depth == 0 && is_set_operator_ident(w) => return None,
+            Token::Ident(w)
+                if depth == 0
+                    && is_set_operator_ident(w)
+                    && set_operator_is_followed_by_branch(body, i) =>
+            {
+                return None;
+            }
             _ => {}
         }
     }
@@ -372,6 +393,42 @@ mod tests {
         assert!(has_qualified("SELECT x.id FROM docs x, langs y LIMIT 1"));
         assert!(has_qualified(
             "SELECT * FROM docs OUTER JOIN langs ON docs.id = langs.id LIMIT 1"
+        ));
+    }
+
+    #[test]
+    fn bool_word_columns_stay_columns_in_where_leaf() {
+        for w in ["true", "false"] {
+            let toks =
+                tokenize(&format!("SELECT id FROM docs x WHERE x.{w} LIMIT 1")).expect("lex");
+            let n = normalize_single_table_qualifiers(&toks).expect("ok");
+            assert!(
+                n.iter()
+                    .any(|t| matches!(t, Token::QuotedBoolWord(s) if s == w)),
+                "{w}"
+            );
+        }
+        let toks = tokenize("SELECT x.true FROM docs x LIMIT 1").expect("lex");
+        let n = normalize_single_table_qualifiers(&toks).expect("ok");
+        assert!(n
+            .iter()
+            .any(|t| matches!(t, Token::Ident(s) if s == "true")));
+    }
+
+    #[test]
+    fn set_operator_words_as_names_do_not_make_scope_opaque() {
+        for w in ["union", "intersect", "except"] {
+            assert_eq!(code(&format!("SELECT x.id FROM {w} x LIMIT 10")), "ok");
+            assert_eq!(
+                code(&format!("SELECT x.id FROM docs x WHERE {w} = 1 LIMIT 10")),
+                "ok"
+            );
+            assert!(!has_qualified(&format!(
+                "SELECT x.id FROM docs x WHERE {w} = 1 LIMIT 10"
+            )));
+        }
+        assert!(has_qualified(
+            "SELECT x.id FROM docs x UNION SELECT id FROM docs LIMIT 1"
         ));
     }
 
