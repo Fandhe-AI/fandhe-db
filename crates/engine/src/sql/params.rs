@@ -303,9 +303,36 @@ fn values_region_bounds(tokens: &[Token]) -> Option<(usize, usize)> {
     if !ident_eq_ignore_case(tokens.first(), "INSERT") {
         return None;
     }
-    let start = tokens.iter().position(|t| match t {
-        Token::Ident(name) => name.eq_ignore_ascii_case("VALUES"),
-        _ => false,
+    // 句キーワードとしての VALUES は「括弧深さ 0・直後が `(`・直前が `INTO`／`AS`／`.`
+    // でない」ものに限る。`values` という名前の表（`INTO values (...)`・`s.values`）や
+    // 列（列リスト内は深さ 1）を識別子として読み飛ばす。
+    let mut depth: usize = 0;
+    let start = tokens.iter().enumerate().find_map(|(idx, t)| match t {
+        Token::Punct('(') | Token::Punct('[') => {
+            depth = depth.saturating_add(1);
+            None
+        }
+        Token::Punct(')') | Token::Punct(']') => {
+            depth = depth.saturating_sub(1);
+            None
+        }
+        Token::Ident(name)
+            if depth == 0
+                && name.eq_ignore_ascii_case("VALUES")
+                && matches!(tokens.get(idx + 1), Some(Token::Punct('(')))
+                && !matches!(
+                    idx.checked_sub(1).and_then(|j| tokens.get(j)),
+                    Some(Token::Punct('.'))
+                )
+                && !ident_eq_ignore_case(
+                    idx.checked_sub(1).and_then(|j| tokens.get(j)),
+                    "INTO",
+                )
+                && !ident_eq_ignore_case(idx.checked_sub(1).and_then(|j| tokens.get(j)), "AS") =>
+        {
+            Some(idx)
+        }
+        _ => None,
     })?;
     let end = tokens
         .iter()
@@ -978,6 +1005,18 @@ mod tests {
         let tokens = tokenize_with_params(sql).expect("tokenize should succeed");
         let n = validate_param_positions(&tokens).expect("positions should validate");
         infer_param_positions(&tokens, n)
+    }
+
+    #[test]
+    fn values_named_identifiers_are_not_clause_keyword() {
+        // 列名・表名が `values` でも、句キーワードの VALUES を正しく選ぶ。
+        for sql in [
+            "INSERT INTO t (id, values) VALUES (1, $1) USING OPERATION_ID 'o'",
+            "INSERT INTO values (id, a) VALUES (1, $1) USING OPERATION_ID 'o'",
+            "INSERT INTO s.values (id, a) VALUES (1, $1) USING OPERATION_ID 'o'",
+        ] {
+            assert_eq!(positions(sql).expect(sql), 1, "{sql}");
+        }
     }
 
     #[test]

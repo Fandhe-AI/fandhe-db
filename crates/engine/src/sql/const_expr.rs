@@ -104,9 +104,9 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::Ident(_)
         | Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_) => Ok(()),
-        Expr::Call { args, .. } | Expr::Coalesce(args) => {
+        Expr::Call { args, .. } => {
             args.iter().try_for_each(check_intermediate_precision)?;
-            check_node_value(expr, matches!(expr, Expr::Call { .. }))
+            check_node_value(expr, true)
         }
         Expr::Binary { lhs, rhs, .. } => {
             check_intermediate_precision(lhs)?;
@@ -117,10 +117,30 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
             check_intermediate_precision(lhs)?;
             check_intermediate_precision(rhs)
         }
+        // COALESCE は短絡評価（`udf_call::eval` と同じ）に沿い、評価される引数
+        // （最初の非 NULL まで）だけを検査する。未評価引数の巨大値で偽陽性にしない。
+        Expr::Coalesce(args) => {
+            for a in args {
+                if matches!(a, Expr::Null) {
+                    continue;
+                }
+                check_intermediate_precision(a)?;
+                if !matches!(eval_node(a), Some(ExprValue::Null)) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        // CASE も短絡評価に沿い、条件を順に評価して選ばれる分岐だけを検査する。
+        // 条件が評価不能なら以降は最終評価側に報告させる。
         Expr::Case { whens, else_result } => {
             for (c, r) in whens {
                 check_intermediate_precision(c)?;
-                check_intermediate_precision(r)?;
+                match eval_node(c) {
+                    Some(ExprValue::Bool(true)) => return check_intermediate_precision(r),
+                    Some(ExprValue::Bool(false) | ExprValue::Null) => {}
+                    _ => return Ok(()),
+                }
             }
             match else_result {
                 Some(e) => check_intermediate_precision(e),
@@ -128,6 +148,14 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
             }
         }
     }
+}
+
+/// 1 ノードを束縛・評価する（束縛・評価不能は `None`。短絡判定専用）。
+fn eval_node(expr: &Expr) -> Option<ExprValue<'static>> {
+    let registry = UdfRegistry::default();
+    let mut budget = MAX_EXPR_NODES;
+    let (bound, _ty) = bind_const_expr(expr, &registry, &mut budget).ok()?;
+    eval(&bound, 0, &[]).ok()
 }
 
 /// 1 ノードを単独評価し、スカラ結果が 2^53 以上なら `22003`（評価不能は無視）。
@@ -154,12 +182,33 @@ fn check_node_value(expr: &Expr, enabled: bool) -> Result<(), SqlSurfaceError> {
 /// （3 値論理の NULL 伝播。束縛器は型を決められない裸の `NULL` を `0A000` で
 /// 拒否するため、束縛前に定数として確定させる）。CASE／COALESCE／NULLIF 内の
 /// `NULL` は束縛器が扱うのでそのまま残す。
-fn propagate_null(expr: &Expr) -> Expr {
-    match expr {
+fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
+    Ok(match expr {
         Expr::Binary { op, lhs, rhs } => {
-            let l = propagate_null(lhs);
-            let r = propagate_null(rhs);
+            let l = propagate_null(lhs)?;
+            let r = propagate_null(rhs)?;
             if matches!(l, Expr::Null) || matches!(r, Expr::Null) {
+                // NULL で消去する前に、反対側オペランドの束縛と演算子との型整合を検証する
+                // （`NULL + upper(1)` が NULL として受理されないよう、裸の NULL 側を反対側の
+                // 複製で置き換えた探査式を束縛して fail-closed にする。評価はしない）。
+                if !(matches!(l, Expr::Null) && matches!(r, Expr::Null)) {
+                    let probe = Expr::Binary {
+                        op: *op,
+                        lhs: Box::new(if matches!(l, Expr::Null) {
+                            r.clone()
+                        } else {
+                            l.clone()
+                        }),
+                        rhs: Box::new(if matches!(r, Expr::Null) {
+                            l.clone()
+                        } else {
+                            r.clone()
+                        }),
+                    };
+                    let registry = UdfRegistry::default();
+                    let mut budget = MAX_EXPR_NODES;
+                    bind_const_expr(&probe, &registry, &mut budget)?;
+                }
                 Expr::Null
             } else {
                 Expr::Binary {
@@ -171,21 +220,26 @@ fn propagate_null(expr: &Expr) -> Expr {
         }
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
-            args: args.iter().map(propagate_null).collect(),
+            args: args.iter().map(propagate_null).collect::<Result<_, _>>()?,
         },
-        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(propagate_null).collect()),
+        Expr::Coalesce(args) => {
+            Expr::Coalesce(args.iter().map(propagate_null).collect::<Result<_, _>>()?)
+        }
         Expr::NullIf(l, r) => {
-            Expr::NullIf(Box::new(propagate_null(l)), Box::new(propagate_null(r)))
+            Expr::NullIf(Box::new(propagate_null(l)?), Box::new(propagate_null(r)?))
         }
         Expr::Case { whens, else_result } => Expr::Case {
             whens: whens
                 .iter()
-                .map(|(c, r)| (propagate_null(c), propagate_null(r)))
-                .collect(),
-            else_result: else_result.as_ref().map(|e| Box::new(propagate_null(e))),
+                .map(|(c, r)| Ok((propagate_null(c)?, propagate_null(r)?)))
+                .collect::<Result<_, SqlSurfaceError>>()?,
+            else_result: match else_result {
+                Some(e) => Some(Box::new(propagate_null(e)?)),
+                None => None,
+            },
         },
         other => other.clone(),
-    }
+    })
 }
 
 /// 列参照を含まない式を評価して [`InsertLiteral`] へ畳み込む。
@@ -197,7 +251,7 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
         ));
     }
     check_intermediate_precision(expr)?;
-    let propagated = propagate_null(expr);
+    let propagated = propagate_null(expr)?;
     if matches!(propagated, Expr::Null) {
         return Ok(InsertLiteral::Null);
     }
@@ -359,5 +413,40 @@ mod tests {
             Err(SqlSurfaceError::NumericOutOfRange { .. })
         ));
         assert!(fold_const_literal(&bin(BinOp::Add, Expr::String("a".into()), num("1"))).is_err());
+    }
+
+    #[test]
+    fn unselected_branches_do_not_trigger_precision_error() {
+        let p54 = || call("power", vec![num("2"), num("54")]);
+        let case = Expr::Case {
+            whens: vec![(bin(BinOp::Eq, num("1"), num("1")), num("1"))],
+            else_result: Some(Box::new(p54())),
+        };
+        assert_eq!(
+            fold_const_literal(&case).unwrap(),
+            InsertLiteral::Number("1".into())
+        );
+        assert_eq!(
+            fold_const_literal(&Expr::Coalesce(vec![num("1"), p54()])).unwrap(),
+            InsertLiteral::Number("1".into())
+        );
+        // 選ばれる分岐は従来どおり検査する。
+        assert!(matches!(
+            fold_const_literal(&Expr::Coalesce(vec![Expr::Null, p54()])),
+            Err(SqlSurfaceError::NumericOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn null_operand_still_validates_other_side() {
+        let bad = call("upper", vec![num("1")]);
+        assert!(fold_const_literal(&bin(BinOp::Add, Expr::Null, bad)).is_err());
+        assert!(
+            fold_const_literal(&bin(BinOp::Add, Expr::String("a".into()), Expr::Null)).is_err()
+        );
+        assert_eq!(
+            fold_const_literal(&bin(BinOp::Add, Expr::Null, num("1"))).unwrap(),
+            InsertLiteral::Null
+        );
     }
 }
