@@ -3251,10 +3251,11 @@ fn bind_set_assignments(
             // 明示的な SQL `NULL`（`ColumnType::Vector` を除く。Issue #889
             // レビュー指摘・PR #1014）。`column.nullable` を確認したうえで
             // `Value::Null` へ写像し、非 nullable 列は fail-closed に拒否する。
-            // NoSQL 表層 `update` op（`wire-server::http::query::update::
-            // map_set_assignments`）の JSON 列 `null` 分岐が現状唯一の
-            // 構築元だが、SQL 表層 `UPDATE ... SET` 経由（将来 `NULL`
-            // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
+            // 構築元は NoSQL 表層 `update` op（`wire-server::http::query::update::
+            // map_set_assignments`）の JSON 列 `null` 分岐と、SQL 表層
+            // `UPDATE ... SET col = NULL`（Issue #1524・SQL-41）の 2 系統で、同じ
+            // 扱いを共有する。束縛はスキーマだけを見る判定で対象行の探索・RLS 可視性
+            // より前に終わるため、`23502` は対象行の有無で分かれない。
             (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
             (_, InsertLiteral::Null) => {
                 return Err(SqlSurfaceError::not_null_violation(name.clone()))
@@ -4364,10 +4365,10 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a text literal for its enum type"
                         )))
                     }
-                    // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
-                    // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
-                    // されない到達不能パス（match の網羅性のためだけの分岐）。
-                    // 到達した場合も明示 NULL の確定契約（TABLE-16）へ倒す。
+                    // `InsertLiteral::Null` は `ON CONFLICT ... DO UPDATE SET col = NULL`
+                    // （Issue #1524・SQL-41）から到達する。明示 NULL の確定契約
+                    // （TABLE-16）に従い、nullable 列は `Value::Null`、それ以外は
+                    // `23502`（VECTOR 列も現状 non-nullable のためここで `23502`）。
                     (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
                     (_, InsertLiteral::Null) => {
                         return Err(SqlSurfaceError::not_null_violation(name.clone()))
@@ -7948,6 +7949,49 @@ mod tests {
             bound.assignments,
             vec![(2, crate::row_codec::Value::Text("en".to_string()))]
         );
+    }
+
+    /// `SET <col> = NULL`（Issue #1524・SQL-41）: nullable 列は `Value::Null`、
+    /// 非 nullable 列は `23502`、VECTOR 列は現行どおり `22000`（TABLE-26 の対象外）。
+    #[test]
+    fn binds_update_set_null_by_column_nullability() {
+        let bound = bind_update_sql(
+            "UPDATE documents SET lang = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .expect("nullable column accepts NULL");
+        assert_eq!(bound.assignments, vec![(2, crate::row_codec::Value::Null)]);
+        let err = bind_update_sql(
+            "UPDATE documents SET body = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "23502");
+        let err = bind_update_sql(
+            "UPDATE documents SET embedding = NULL WHERE id = 1 USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// 述語形・分割実行が共有する束縛でも同じ検査が効く（Issue #1524）。
+    #[test]
+    fn bind_update_form_predicate_arm_set_null_by_column_nullability() {
+        match bind_update_form_sql(
+            "UPDATE documents SET lang = NULL WHERE body = 'x' USING OPERATION_ID 'op-0001'",
+        )
+        .expect("nullable column accepts NULL")
+        {
+            BoundUpdateForm::Predicate(p) => {
+                assert_eq!(p.assignments(), &[(2, crate::row_codec::Value::Null)]);
+            }
+            BoundUpdateForm::Single(_) => panic!("expected Predicate variant"),
+        }
+        let err = match bind_update_form_sql(
+            "UPDATE documents SET body = NULL WHERE lang = 'ja' USING OPERATION_ID 'op-0001'",
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("NOT NULL column must reject NULL"),
+        };
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]

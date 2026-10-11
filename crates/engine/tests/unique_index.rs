@@ -324,10 +324,9 @@ fn on_conflict_do_update_targeting_a_unique_column_keeps_the_index_consistent() 
 /// レビュー指摘・PR #1123）。stale なエントリが残っていると、後続の
 /// 別行 INSERT が旧キー値を使った時点で誤って `23505` を返す。
 ///
-/// SQL の `UPDATE ... SET <col> = NULL` は許可リスト外（`NULL` リテラルは
-/// `CASE`／`COALESCE`／`NULLIF` の引数以外の式位置では受理しない）ため、
-/// 行全体置換 UPDATE（[`RowInput`] 経由。`update_row_without_vector_column.rs`
-/// と同じ流儀）で一意キー列を NULL にする。
+/// 本テストは行全体置換 UPDATE（[`RowInput`] 経由。`update_row_without_vector_column.rs`
+/// と同じ流儀）で一意キー列を NULL にする。SQL の `UPDATE ... SET <col> = NULL`
+/// （Issue #1524・SQL-41 で受理）経由の同等確認は `sql_update_null_literal.rs` にある。
 #[test]
 fn key_freed_by_updating_it_to_null_can_be_reused_by_a_later_committed_insert() {
     let (core, path) = new_core("uniq-index-update-to-null-reuse");

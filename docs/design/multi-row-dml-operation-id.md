@@ -141,9 +141,9 @@ content_hash.rs` への追加は #871 の担当であり、本 ADR は入力レ�
    `push_bytes(リテラル生文字列)`。列名は束縛（`bind_set_assignments`）と
    同じ**大文字小文字を区別したまま**連結する（`c.name == name` の厳密
    一致と揃える）。`push_named_scalar_columns`（`Value::Null` を除外する
-   実装）はここでは再利用しない——`InsertLiteral` に `Null` 相当の値は
-   現状存在しないが、将来 `SET col = NULL` が追加されたときに黙って
-   脱落させない前方ガードとして、割当を無条件に列挙する。`InsertLiteral::
+   実装）はここでは再利用しない——`SET col = NULL` は Issue #1524
+   （SQL-41）で SQL 表層から到達するようになり、`Null` はタグ 4 で黙って
+   脱落させず割当を無条件に列挙する。`InsertLiteral::
    Number` は現状 `bind_set_assignments`（`TEXT`／`VECTOR` いずれの列型も
    `Number` 変種を拒否する）により意味論検証では必ず拒否されるが、
    ハッシュはこれより前の `Validated` 形から計算する（5.1 節）ため

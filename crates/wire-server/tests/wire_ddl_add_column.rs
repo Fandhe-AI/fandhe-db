@@ -290,10 +290,9 @@ fn wire_malformed_syntax_is_rejected_with_42601() {
     for sql in [
         "ALTER TABLE docs ADD note TEXT",
         "ALTER TABLE docs ADD COLUMN IF NOT EXISTS note TEXT",
-        // 列制約のうち `UNIQUE`／`DEFAULT NULL`／リテラル種別不一致は引き続き拒否する
-        // （`NOT NULL`／`DEFAULT <literal>` は Issue #1169 で受理）。
+        // 列制約のうち `UNIQUE`／リテラル種別不一致は引き続き拒否する
+        // （`NOT NULL`／`DEFAULT <literal>` は Issue #1169、`DEFAULT NULL` は Issue #1524 で受理）。
         "ALTER TABLE docs ADD COLUMN note TEXT UNIQUE",
-        "ALTER TABLE docs ADD COLUMN note TEXT DEFAULT NULL",
         "ALTER TABLE docs ADD COLUMN note TEXT DEFAULT 1",
         // `DROP COLUMN embedding` は VECTOR 列保護（Issue #1167 以降）で 42601。
         "ALTER TABLE docs DROP COLUMN embedding",

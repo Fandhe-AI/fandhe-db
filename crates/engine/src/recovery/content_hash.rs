@@ -914,10 +914,12 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 ///
 /// 行境界の曖昧性回避（[`for_typed_insert_batch`] と同じ理由）: 本関数は 1 回の
 /// 呼び出しで 1 行分の SET 句しか扱わないため複数行の境界問題は生じないが、
-/// SET 句の列**数**（`Value::Null` 除外後）を先頭にプレフィクスすることで、将来
-/// `SET col = NULL` を許容する変更が入った場合でも [`push_named_scalar_columns`]
-/// の「末尾まで連結するだけ」の形式が列挙順・列数のいずれについても一意に復元
-/// できる状態を維持する（[`for_typed_insert_batch`] の行ごとの列数プレフィクスと
+/// SET 句の列**数**（`Value::Null` 除外後）を先頭にプレフィクスすることで、
+/// [`push_named_scalar_columns`] の「末尾まで連結するだけ」の形式が列挙順・列数の
+/// いずれについても一意に復元できる状態を維持する。なお `SET col = NULL` は
+/// Issue #1524（SQL-41）で SQL 表層から到達するようになったが、本関数は `Value::Null`
+/// 列を除外するため `SET a='x', b=NULL` と `SET a='x'` は同じ hash になる。この
+/// 区別は Issue #1525 の範囲で、本 Issue ではロジックを変えない（[`for_typed_insert_batch`] の行ごとの列数プレフィクスと
 /// 同じ設計）。
 pub(crate) fn for_update_columns(
     id: u64,
@@ -1217,8 +1219,8 @@ enum DmlVectorRepr {
 /// → 各要素につき `push_bytes(列名)`・リテラル種別タグ（`String`＝1・`Number`＝2）・
 /// `push_bytes(リテラル生文字列)`。列名は宣言どおりの大文字小文字のまま連結する
 /// （`bind_set_assignments` の厳密一致と揃える）。`push_named_scalar_columns`
-/// （`Value::Null` を除外する実装）は再利用しない——将来 `SET col = NULL` が
-/// 追加されたときに黙って脱落させない前方ガード（ADR §4.3 参照）。
+/// （`Value::Null` を除外する実装）は再利用しない——`SET col = NULL`（Issue #1524 で
+/// SQL 表層から到達）を黙って脱落させないためのガード（ADR §4.3 参照）。
 ///
 /// `repr == Canonical` かつ対象列がスキーマ上 `VECTOR(dim)` の場合、
 /// `InsertLiteral::String` は生テキストのままハッシュせず
@@ -1278,10 +1280,9 @@ fn push_dml_assignments(
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘・PR #1014。
             // `bind_set_assignments` が nullable 列向けに追加した SQL `NULL`
-            // 表現）。述語つき `UPDATE ... WHERE`（本関数の呼び出し元）は
-            // 現状 NoSQL 表層から到達しない（`filter` 形は Issue #871 実行結線
-            // 対象だが NULL 対応は本 Issue のスコープ外）ため実質未到達だが、
-            // 上部コメントが予告する前方ガードとしてタグ 4 を割り当てる。
+            // 表現）。述語つき `UPDATE ... WHERE`・分割実行（本関数の呼び出し元）は
+            // Issue #1524（SQL-41）で `SET col = NULL` が SQL 表層から到達するため、
+            // NULL を区別する決定的なタグ 4 を割り当てる。
             InsertLiteral::Null => {
                 b.push_u8(4);
             }
