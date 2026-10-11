@@ -102,6 +102,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | [out-of-scope-tracking.md](.claude/rules/out-of-scope-tracking.md) | スコープ外事項の Issue 追跡フロー |
 | [spec-confidentiality.md](.claude/rules/spec-confidentiality.md) | **リポ固有・P0**: private spec のポインタ表記運用 |
 | [dependency-policy.md](.claude/rules/dependency-policy.md) | **リポ固有**: 依存最小・`=x.y.z` 固定・ユーザー承認制 |
+| [git-hooks.md](.claude/rules/git-hooks.md) | lefthook の編集方針（時間予算・CI と重複する検査を置かない・例外の rustfmt-check） |
 
 ## Current Skills
 
@@ -113,7 +114,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築する。clippy・test は PR ごとの CI（必須チェック）が担い、git hooks では実行しない（開発速度のため。lefthook は 1 秒未満の整形・秘密情報・コミット形式の検査のみ）。手元で確かめたい場合は任意で `make ci`（CI と同等のチェック）を実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み。`make lint`／`make test` は `--all-features` で実行するため `contrast-bench` feature 経由で usearch（optional 依存）の C++ ビルドが走る。**C++17 コンパイラが必須**（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに無い場合 `make lint`／`make test`／`make ci` が失敗する。詳細は README「回帰ベンチの Environment `bench-gate` secrets」節）
+- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築する。clippy・test は PR ごとの CI（必須チェック）が担い、git hooks では実行しない（開発速度のため。lefthook は 1 秒未満の整形・秘密情報・コミット形式の検査のみ。編集方針は [git-hooks](.claude/rules/git-hooks.md)）。手元で確かめたい場合は任意で `make ci`（CI と同等のチェック）を実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み。`make lint`／`make test` は `--all-features` で実行するため `contrast-bench` feature 経由で usearch（optional 依存）の C++ ビルドが走る。**C++17 コンパイラが必須**（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに無い場合 `make lint`／`make test`／`make ci` が失敗する。詳細は README「回帰ベンチの Environment `bench-gate` secrets」節）
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: commitlint で検証。`--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋AGENTS.md P0 観点（spec 漏えい・テナント境界・wire 入力検証）を確認
