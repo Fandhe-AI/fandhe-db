@@ -41,7 +41,9 @@ pub enum Token {
     Ident(String),
     StringLiteral(String),
     Number(String),
-    /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]`（TASK-79・SQL-9 で `+ - / > <` を追加。
+    /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<` `[` `]` `%` `#`（`%`・単独 `#` は
+    /// SQL-42・Issue #1521 で字句化のみ追加。構文段（`sql::allowlist`）は受理せず
+    /// `42601` で拒否する＝fail-closed。TASK-79・SQL-9 で `+ - / > <` を追加。
     /// `[`／`]` は配列型の列宣言 `<型>[N]`（SQL-23・TABLE-14。Issue #1348）専用で、
     /// 構文上の受理位置は `sql::ddl_column_type` の型名解析に限る（それ以外の位置に
     /// 現れた場合は各パーサーが `42601` で拒否する）。
@@ -323,7 +325,7 @@ fn tokenize_impl(
             chars.next();
             continue;
         }
-        // `#>>` → `#>`。`#` 単独は従来どおり未対応文字として拒否（扱いは #1521）。
+        // `#>>` → `#>` → `#`（単独は後段の単一文字 Punct 分岐へ落ちる。SQL-42・Issue #1521）の最長一致。
         if c == '#' {
             let mut lookahead = chars.clone();
             lookahead.next();
@@ -460,7 +462,10 @@ fn tokenize_impl(
             continue;
         }
 
-        if matches!(c, '(' | ')' | ',' | '*' | '=' | ';' | '+' | '[' | ']') {
+        if matches!(
+            c,
+            '(' | ')' | ',' | '*' | '=' | ';' | '+' | '[' | ']' | '%' | '#'
+        ) {
             tokens.push(Token::Punct(c));
             chars.next();
             continue;
@@ -1172,7 +1177,8 @@ mod tests {
         for lit in ["a->b", "x||y", "::", "#>>"] {
             assert_eq!(toks(&format!("'{lit}'")), vec![StringLiteral(lit.into())]);
         }
-        for bad in ["a # b", "a : b", "a | b", "a:::b", "a|||b"] {
+        assert_eq!(toks("a # b"), vec![a(), Punct('#'), b()]);
+        for bad in ["a : b", "a | b", "a:::b", "a|||b"] {
             assert!(tokenize(bad).is_err(), "{bad} should be rejected");
         }
     }
@@ -1184,6 +1190,63 @@ mod tests {
         let tokens = tokenize(sql).expect("tokenize");
         let rendered = render_tokens(&tokens).expect("render");
         assert_eq!(tokenize(&rendered).expect("re-tokenize"), tokens);
+    }
+
+    /// SQL-42・Issue #1521: `%`・単独 `#` は `Punct` として字句化し、`#>`／`#>>` の
+    /// 最長一致・コメント境界・リテラル内は従来どおり。
+    #[test]
+    fn percent_and_lone_hash_lex_as_punct() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        assert_eq!(toks("a % b"), vec![a(), Punct('%'), b()]);
+        assert_eq!(toks("a%b"), vec![a(), Punct('%'), b()]);
+        assert_eq!(
+            toks("5%2"),
+            vec![Number("5".into()), Punct('%'), Number("2".into())]
+        );
+        assert_eq!(toks("%%"), vec![Punct('%'), Punct('%')]);
+        assert_eq!(toks("#"), vec![Punct('#')]);
+        assert_eq!(toks("# >"), vec![Punct('#'), Punct('>')]);
+        assert_eq!(toks("#>"), vec![HashArrow]);
+        assert_eq!(toks("#>>"), vec![HashArrowText]);
+        assert_eq!(toks("a %-- x"), vec![a(), Punct('%')]);
+        assert_eq!(toks("a % /* % */ b"), vec![a(), Punct('%'), b()]);
+        for lit in ["%", "a%b", "#"] {
+            assert_eq!(toks(&format!("'{lit}'")), vec![StringLiteral(lit.into())]);
+        }
+        assert_eq!(
+            tokenize_with_params("$1 % 2").expect("tokenize"),
+            vec![Param(1), Punct('%'), Number("2".into())]
+        );
+    }
+
+    /// SQL-42・Issue #1521: `%`・`#` を含む列の描画 → 再字句化の往復。`#` + `>` の
+    /// 2 Punct が `#>` に化けない（空白区切り）ことも固定する。
+    #[test]
+    fn render_tokens_round_trips_percent_and_hash() {
+        for sql in [
+            "a % b",
+            "a%b",
+            "a % - 1",
+            "a # b",
+            "# >",
+            "#>",
+            "#>>",
+            "%%",
+            "a % 'x%y'",
+            "a % -- c\n b",
+        ] {
+            let tokens = tokenize(sql).expect("tokenize");
+            let rendered = render_tokens(&tokens).expect("render");
+            assert_eq!(tokenize(&rendered).expect("re-tokenize"), tokens, "{sql}");
+        }
+        let split = tokenize("# >").expect("tokenize");
+        assert_eq!(split, vec![Token::Punct('#'), Token::Punct('>')]);
+        assert_ne!(
+            tokenize(&render_tokens(&split).expect("render")).expect("re-tokenize"),
+            vec![Token::HashArrow]
+        );
     }
 
     fn toks(sql: &str) -> Vec<Token> {
