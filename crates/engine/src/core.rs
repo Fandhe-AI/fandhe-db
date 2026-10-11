@@ -3197,7 +3197,7 @@ impl EngineCore {
         &self,
         sql: &str,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        let tokens = crate::sql::lexer::tokenize(sql)?;
+        let tokens = crate::sql::lexer::tokenize_marked(sql)?;
         self.parse_tokens(tokens)
     }
 
@@ -3320,6 +3320,31 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // 引用付き `NULL`（`Token::QuotedNull`）を値位置で区別する必要があるのは
+        // INSERT／UPDATE／CREATE／ALTER（`WITH` 先頭の DML 含む）の許可リスト検証だけ
+        // （Issue #1524）。それ以外の文種は従来どおり `Ident` として扱う（識別子位置の
+        // `"null"` を受理し続けるため）。
+        // `EXPLAIN UPDATE ...` も実行時の UPDATE と同じ検証（`expect_literal`）へ渡すため、
+        // 対象が UPDATE のときは先頭が `EXPLAIN` でも保持する（EXPLAIN と実行でエラー契約を
+        // 食い違わせない）。
+        let literal_sensitive_head = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name))
+                if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH"]
+                    .iter()
+                    .any(|kw| name.eq_ignore_ascii_case(kw))
+        ) || matches!(
+            (tokens.first(), tokens.get(1)),
+            (
+                Some(crate::sql::lexer::Token::Ident(head)),
+                Some(crate::sql::lexer::Token::Ident(second)),
+            ) if head.eq_ignore_ascii_case("EXPLAIN") && second.eq_ignore_ascii_case("UPDATE")
+        );
+        let tokens = if literal_sensitive_head {
+            tokens
+        } else {
+            crate::sql::lexer::demote_quoted_null(tokens)
+        };
         let txn_control_head = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
@@ -3720,13 +3745,13 @@ impl EngineCore {
         // 検証済みの `table_name` を使う）。
         let where_table: Option<String> = match tokens.first() {
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
-                Some(Token::Ident(name)) => Some(name.clone()),
+                Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
                 _ => None,
             },
             // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
             // 引く `FROM` は括弧深さ 0 の最初のものに限る。
             _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
-                Some(Token::Ident(name)) => Some(name.clone()),
+                Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
                 _ => None,
             }),
         };
@@ -4133,7 +4158,7 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let tokens = crate::sql::lexer::tokenize(sql)?;
+        let tokens = crate::sql::lexer::tokenize_marked(sql)?;
         let parsed = self.parse_tokens(tokens)?;
         self.execute_parsed_in_session(ctx, session, &parsed)
     }

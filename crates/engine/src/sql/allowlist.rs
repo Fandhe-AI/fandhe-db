@@ -3264,7 +3264,10 @@ pub struct ValidatedDropTable {
 /// 再帰下降だが文法の深さは定数（statement → select_list/where/order_by の 1 階層）で、
 /// 深いネストによるスタック消費は発生しない。
 struct Parser<'a> {
-    tokens: &'a [Token],
+    /// `Token::QuotedNull` を `Ident` へ戻したトークン列（識別子位置は従来どおり `Ident`）。
+    tokens: std::borrow::Cow<'a, [Token]>,
+    /// 元が引用付き `NULL` だったトークン位置（値位置でだけ NULL 定数として扱わないため。Issue #1524）。
+    quoted_null: Vec<usize>,
     pos: usize,
     /// 式ノード（`Expr::Number` / `Ident` / `Binary` / `Call`）の残り生成可能数。
     /// `parse_add_expr` / `parse_mul_expr` の左結合ループは `depth` を増やさず
@@ -3320,8 +3323,26 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
+        let mut quoted_null = Vec::new();
+        let tokens = if tokens.iter().any(|t| matches!(t, Token::QuotedNull(_))) {
+            let demoted = tokens
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match t {
+                    Token::QuotedNull(s) => {
+                        quoted_null.push(i);
+                        Token::Ident(s.clone())
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            std::borrow::Cow::Owned(demoted)
+        } else {
+            std::borrow::Cow::Borrowed(tokens)
+        };
         Self {
             tokens,
+            quoted_null,
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
             subquery_ctx: None,
@@ -3760,7 +3781,7 @@ impl<'a> Parser<'a> {
         } else {
             // `DISTINCT` は本 Issue のスコープ外（`COUNT(DISTINCT ...) OVER (...)`
             // は非対応。§計画 2「対象外」）。
-            if is_distinct_modifier(self.tokens, self.pos) {
+            if is_distinct_modifier(&self.tokens, self.pos) {
                 return Err(SqlSurfaceError::unsupported(
                     "DISTINCT is not supported inside a window aggregate function",
                 ));
@@ -3872,7 +3893,7 @@ impl<'a> Parser<'a> {
         // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
         // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
         // でない場合は消費しない）。
-        let distinct = if is_distinct_modifier(self.tokens, self.pos) {
+        let distinct = if is_distinct_modifier(&self.tokens, self.pos) {
             self.advance();
             true
         } else {
@@ -5822,7 +5843,9 @@ impl<'a> Parser<'a> {
         // （`-1.5` 等）も同じ規範で受理する（`HAVING` 述語〔約 L1359〕と同じ
         // `['-'] <Number>` の文法を先読みで判定）。`Number` 以外（文字列・
         // ベクトルリテラル）の直前の `-` は許可リスト外のまま拒否する。
-        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("NULL")) {
+        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("NULL"))
+            && !self.quoted_null.contains(&self.pos)
+        {
             self.advance();
             return Ok(InsertLiteral::Null);
         }
@@ -6434,7 +6457,7 @@ impl<'a> Parser<'a> {
                 // `sql::allowlist::Parser` の内部状態（`tokens`／`pos`）を共有する
                 // 独立実装（`sql::ddl_column_type` モジュールドキュメント参照）。
                 let column_type = crate::sql::ddl_column_type::parse_column_type_name(
-                    self.tokens,
+                    &self.tokens,
                     &mut self.pos,
                 )?;
                 // 列制約（Issue #1169）。`UNIQUE` は追加列では受け付けない（`ALTER
@@ -6571,7 +6594,7 @@ impl<'a> Parser<'a> {
             reject_reserved_alter_column_name(&column_name)?;
             self.expect_contextual_keyword("TYPE")?;
             let column_type =
-                crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+                crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
             return Ok(ParsedAlterTableShape::AlterColumnType {
                 table_name,
                 column_name,
@@ -7004,7 +7027,7 @@ impl<'a> Parser<'a> {
         // 読む。ENUM 型名の存在確認は DDL 権限ゲートの後の実行段が行う（構文段は
         // カタログを参照しない）ため、ENUM 候補は未解決マーカーのまま運ぶ。
         let type_name =
-            crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+            crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
         let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
@@ -7565,7 +7588,7 @@ impl<'a> Parser<'a> {
     /// 現在位置から末尾までの未消費トークン列（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。`CREATE VIEW <name> AS <body>` の `<body>` 部分を
     /// [`parse_view_body`] へ独立した文として渡すために使う。
-    fn remaining(&self) -> &'a [Token] {
+    fn remaining(&self) -> &[Token] {
         match self.tokens.get(self.pos..) {
             Some(rest) => rest,
             None => &[],
@@ -7575,7 +7598,7 @@ impl<'a> Parser<'a> {
     /// `CREATE VIEW <name> AS <body> [;]`（TABLE-18・SQL-23・TASK-205、
     /// Issue #909）。`CREATE OR REPLACE`・`IF NOT EXISTS`・`TEMP`／
     /// `MATERIALIZED`・列別名リスト `v (a, b)` はいずれも構造的に受理しない。
-    fn parse_create_view(&mut self) -> Result<(String, &'a [Token]), SqlSurfaceError> {
+    fn parse_create_view(&mut self) -> Result<(String, &[Token]), SqlSurfaceError> {
         self.expect_ident_matching("CREATE")?;
         self.expect_ident_matching("VIEW")?;
         let name = self.expect_ident()?;
@@ -9615,7 +9638,7 @@ fn parse_set_branch(
     // 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため枝には含めない）
     // までのスライスを既存の集計形状パーサーへ渡す。
     let branch_start = p.pos;
-    let branch_end = set_branch_end(p.tokens, branch_start);
+    let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
         if looks_like_aggregate_select(slice) {
             let shape = parse_aggregate_shape(slice, None)?;
@@ -9935,7 +9958,7 @@ fn parse_set_primary(
         // 枝内に `ORDER BY`／`LIMIT`／`OFFSET` を持つ場合は、枝自身の句として解析する
         // （括弧なしの末尾句は集合演算全体に掛かるため対象外）。それ以外は従来どおり
         // 入れ子の集合演算式として再帰する。
-        if let Some(close_idx) = set_paren_close(p.tokens, p.pos) {
+        if let Some(close_idx) = set_paren_close(&p.tokens, p.pos) {
             if let Some(inner) = p.tokens.get(p.pos..close_idx) {
                 if is_limited_single_select(inner) {
                     *branch_count = branch_count.checked_add(1).ok_or_else(|| {
@@ -11626,7 +11649,7 @@ pub fn validate_insert_with_limit(
     mode: LedgerMode,
     max_insert_rows: Option<std::num::NonZeroUsize>,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_insert_tokens_with_limit(&tokens, lookup, mode, max_insert_rows)
 }
 
@@ -11798,7 +11821,7 @@ fn reject_reserved_alter_column_name(column_name: &str) -> Result<(), SqlSurface
 /// `VECTOR` 列の `0A000` 拒否を含む）は権限ゲート通過後の実行段
 /// （`sql::ddl::execute_alter_table_add_column`）が担う。
 pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTable, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_alter_table_tokens(&tokens)
 }
 
@@ -12313,7 +12336,7 @@ pub fn validate_update(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdate, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_update_tokens(&tokens, lookup, mode)
 }
 
@@ -12392,7 +12415,7 @@ pub fn validate_update_form(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     validate_update_form_tokens(&tokens, lookup, mode)
 }
 
@@ -14464,6 +14487,77 @@ mod tests {
         }
     }
 
+    /// 引用付き `"NULL"` は NULL 定数として受理しない（Issue #1524 レビュー指摘。
+    /// UPDATE SET・DO UPDATE SET・DEFAULT・INSERT VALUES のいずれも `42601`）。
+    #[test]
+    fn quoted_null_is_not_a_null_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_update(
+            "UPDATE documents SET lang = \"NULL\" WHERE id = 1 USING OPERATION_ID 'op-q-1'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
+             lang = \"null\" USING OPERATION_ID 'op-q-2'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_insert(
+            "INSERT INTO documents (id, lang) VALUES (1, \"NULL\") USING OPERATION_ID 'op-q-3'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+        let tokens = crate::sql::lexer::tokenize_marked("DEFAULT \"NULL\"").expect("tokenize");
+        assert_eq!(
+            Parser::new(&tokens)
+                .parse_column_constraints()
+                .unwrap_err()
+                .wire_code(),
+            "42601"
+        );
+    }
+
+    /// 識別子位置の引用付き `"null"`／`"NULL"` は従来どおり識別子として受理する
+    /// （Issue #1524 レビュー指摘。値位置のみ NULL 定数を拒否する）。
+    #[test]
+    fn quoted_null_is_still_accepted_as_identifier() {
+        let lookup = catalog_with(&["documents", "null", "NULL"]);
+        for sql in [
+            "SELECT * FROM \"null\" ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT * FROM \"NULL\" ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT \"null\" FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT \"NULL\" FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+            "SELECT * FROM documents WHERE \"null\" = 'x' ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_marked(sql).expect("tokenize");
+            let tokens = crate::sql::lexer::demote_quoted_null(tokens);
+            validate_sql_tokens(&tokens, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        // 許可リストの Parser は引用付き NULL を含む生トークン列でも識別子位置を受理する。
+        let lookup = catalog_with(&["documents", "null"]);
+        let tokens = crate::sql::lexer::tokenize_marked(
+            "SELECT * FROM \"null\" ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
+        )
+        .expect("tokenize");
+        validate_sql_tokens(&tokens, &lookup).expect("quoted null table name");
+        let stmt = validate_update(
+            "UPDATE \"null\" SET \"null\" = 'x' WHERE id = 1 USING OPERATION_ID 'op-q-4'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("quoted null table and column names in UPDATE");
+        assert_eq!(
+            stmt.assignments,
+            vec![("null".to_string(), InsertLiteral::String("x".to_string()))]
+        );
+    }
     /// `DEFAULT NULL` は受理して既定値なし（`default: None`）へ正規化し、重複 `DEFAULT`
     /// は順序を問わず `42601`（Issue #1524・SQL-41）。
     #[test]
