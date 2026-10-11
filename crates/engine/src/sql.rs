@@ -189,6 +189,7 @@ pub mod params;
 pub mod parser;
 pub mod partitioned;
 pub mod plan;
+pub(crate) mod qualified_column;
 pub mod relation;
 pub mod relation_snapshot;
 pub mod returning;
