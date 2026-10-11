@@ -121,7 +121,7 @@ pub(crate) fn normalize_single_table_qualifiers(
                 // `x.distinct`／`x.not` 等は Ident へ落とすと後段が構文語（DISTINCT 修飾子・
                 // NOT 述語等）として再解釈し、列の存在検証なしで受理される（PR #2309 指摘・P1）。
                 // 構文語と衝突する名前の修飾列参照は fail-closed で拒否する（引用識別子は対象外）。
-                if is_syntax_word(name) {
+                if is_syntax_word(name) || is_contextual_syntax_use(tokens, i, name) {
                     return Err(SqlSurfaceError::unsupported(
                         "qualified column reference named like a SQL keyword is not supported",
                     ));
@@ -158,6 +158,20 @@ pub(crate) fn normalize_single_table_qualifiers(
         Some(v) => Cow::Owned(v),
         None => Cow::Borrowed(tokens),
     })
+}
+
+/// 直後のトークンにより `DATE '...'`／`TIMESTAMP '...'` の型付きリテラル、または
+/// window 句の `PARTITION BY` として再解釈される位置か（PR #2309 指摘・P1）。
+/// `x.date` を通常の列参照として使う場合（直後が文字列リテラルでない）は拒否しない。
+fn is_contextual_syntax_use(tokens: &[Token], i: usize, name: &str) -> bool {
+    let next = tokens.get(i.wrapping_add(1));
+    if name.eq_ignore_ascii_case("date") || name.eq_ignore_ascii_case("timestamp") {
+        return matches!(next, Some(Token::StringLiteral(_)));
+    }
+    if name.eq_ignore_ascii_case("partition") {
+        return matches!(next, Some(Token::Keyword(Keyword::By)));
+    }
+    false
 }
 
 /// 後段パーサが `Ident` を構文語として消費しうる語か（修飾列名の再解釈防止用）。
@@ -490,6 +504,26 @@ mod tests {
         ] {
             let toks = tokenize(sql).expect("lex");
             assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn qualified_contextual_syntax_columns_are_rejected_only_in_syntax_position() {
+        for sql in [
+            "SELECT COALESCE(x.date '2026-01-01', DATE '2026-01-02') FROM docs x LIMIT 10",
+            "SELECT COALESCE(x.timestamp '2026-01-01', 1) FROM docs x LIMIT 10",
+            "SELECT ROW_NUMBER() OVER (x.partition BY x.lang) FROM docs x LIMIT 10",
+        ] {
+            let toks = tokenize(sql).expect("lex");
+            assert!(normalize_single_table_qualifiers(&toks).is_err(), "{sql}");
+        }
+        // 通常の列参照としての x.date／x.partition は受理する。
+        for sql in [
+            "SELECT x.date FROM docs x WHERE x.date = 1 LIMIT 10",
+            "SELECT x.partition FROM docs x ORDER BY x.partition LIMIT 10",
+        ] {
+            let toks = tokenize(sql).expect("lex");
+            assert!(normalize_single_table_qualifiers(&toks).is_ok(), "{sql}");
         }
     }
 
