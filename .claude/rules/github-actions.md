@@ -98,23 +98,25 @@ gh run view <run-id> --json jobs --jq '.jobs[] | "\(.name)\t\((.completedAt|from
 ### 本リポで触れる範囲
 
 - キャッシュを持つのは reusable の `rust-ci`（`Fandhe-AI/actions` の `rust-base-ci.yml`）だけ。独立ジョブはキャッシュを持たない（上のチェックリスト 6）
-- キー設計・restore-keys・保存条件・保存前 prune は**共有側で決まる**。本リポの `ci.yml` から変えられるのは `cache`（`true`）と
-  `cache-key-prefix`（`fandhe-db`）だけ。キーや保存条件を変えたいときは、本リポに独自の `actions/cache` を足さず共有側へ PR を出す
-- 共有側の改善（キーに `rustc -vV` のハッシュを入れる・キーの入力をルートの `Cargo.lock` に絞る・restore / save の分割と
-  `cache-save` 入力の追加）は [Fandhe-AI/actions#165](https://github.com/Fandhe-AI/actions/pull/165) で対応中。
-  マージ後は `@latest` 経由で自動的に反映される。`cache-save` が入ったら、`rust-ci` の `with:` に
-  `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡して main push だけが保存するようにする（入力の既定値が main のみ保存に変わった場合は不要）
+- キー設計・restore-keys・保存前 prune は**共有側で決まる**。本リポの `ci.yml` から変えられるのは `cache`（`true`）・
+  `cache-key-prefix`（`fandhe-db`）・`cache-save` だけ。キーや保存条件を変えたいときは、本リポに独自の `actions/cache` を足さず共有側へ PR を出す
+- 共有側の改善（キーに rustc の版を入れる・キーの入力をルートの `Cargo.lock` に絞る・restore / save の分割と
+  `cache-save` 入力の追加）は [Fandhe-AI/actions#165](https://github.com/Fandhe-AI/actions/pull/165) で対応済み（2026-10-11 マージ、`@latest` に反映）
+- **保存は main の push だけ**: `rust-ci` の `with:` に `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡し済み。
+  PR は restore のみで、main の blob に exact hit するか restore-keys で部分復元する（PR の 2 回目以降の push も自分の保存は使えない）。
+  `ci.yml` は `push: branches: [main]` でも走り、key が変わったとき（ルートの `Cargo.lock` か rustc の版の変更）に main で保存される
 
-### 現行キーの既知の問題（2026-10-11 時点・共有側の修正待ち）
+### 旧キーの既知の問題と対応（2026-10-11）
 
-現行キーは `fandhe-db-Linux-{fmt|clippy-v3|test-v3|deny}-<hashFiles('**/Cargo.lock')>`。
+[#165](https://github.com/Fandhe-AI/actions/pull/165) 以前のキーは `fandhe-db-Linux-{fmt|clippy-v3|test-v3|deny}-<hashFiles('**/Cargo.lock')>`。#165 以降は
+`fandhe-db-Linux-{clippy|test}-v4-<rustc の release>-<commit-hash 先頭 12 桁>-<hashFiles('Cargo.lock')>`・`fandhe-db-Linux-{fmt|deny}-<hashFiles('Cargo.lock')>`。
 
-| 問題 | 影響 |
-| ---- | ---- |
-| キーに rustc の識別が無い（`rust-toolchain.toml` は `channel = "stable"`） | runner イメージの更新で rustc が変わっても旧 rustc の blob に exact hit し続ける。exact hit では保存し直されないため、`Cargo.lock` が変わるまで clippy / test が依存を毎回全再ビルドする |
-| `**/Cargo.lock` が `.agents/skills/make/samples/projects/*/Cargo.lock`（`.claude/skills/make` symlink 経由も）を拾う | ビルドに関係しないスキル同期 PR だけでキーが変わる |
-| PR からも保存する | `Cargo.lock`（上記サンプル含む）を変える PR ごとに main と同内容の blob（約 0.9 GB）が `refs/pull/<N>/merge` に重複保存される |
-| fmt ジョブにも target を含むキャッシュがある | `cargo fmt` は保存対象のパスを作らないため毎回 miss し、保存時に "Path Validation Error" の警告が出る（無害） |
+| 問題 | 影響 | 対応 |
+| ---- | ---- | ---- |
+| キーに rustc の識別が無い（`rust-toolchain.toml` は `channel = "stable"`） | runner イメージの更新で rustc が変わっても旧 rustc の blob に exact hit し続ける。exact hit では保存し直されないため、`Cargo.lock` が変わるまで clippy / test が依存を毎回全再ビルドする | #165 で clippy / test のキーに rustc の版を追加 |
+| `**/Cargo.lock` が `.agents/skills/make/samples/projects/*/Cargo.lock`（`.claude/skills/make` symlink 経由も）を拾う | ビルドに関係しないスキル同期 PR だけでキーが変わる | #165 でルートの `Cargo.lock` のみに変更 |
+| PR からも保存する | `Cargo.lock`（上記サンプル含む）を変える PR ごとに main と同内容の blob（約 0.9 GB）が `refs/pull/<N>/merge` に重複保存される | `cache-save` で main のみ保存に変更済み |
+| fmt ジョブにも target を含むキャッシュがある | `cargo fmt` は保存対象のパスを作らないため毎回 miss し、保存時に "Path Validation Error" の警告が出る（無害） | 共有側で fmt のキャッシュを外す（[Fandhe-AI/actions#166](https://github.com/Fandhe-AI/actions/pull/166) で対応中） |
 
 ### 実測（2026-10-11）
 
