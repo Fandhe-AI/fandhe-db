@@ -3342,10 +3342,14 @@ struct Parser<'a> {
     /// 単一テーブル SELECT 系（通常・集計・DISTINCT）が `FROM <table> [[AS] alias]` を
     /// 読んだ直後に設定する FROM 参照（Issue #1534・SQL-44 ポインタ、親 #1533）。
     /// `Some` の間、WHERE 葉の先頭が修飾列参照ならその修飾子を公開名と照合し、
-    /// 不一致は `42P01` で拒否する。`None`（既定。DML 述語・CHECK・VIEW 本体・CTE 本体・
-    /// 集合演算の枝）では挙動を一切変えない。別名は parse 時に確定する情報であり、
+    /// 不一致は `42P01` で拒否する。`None`（既定。DML 述語・CHECK・VIEW 本体・CTE 本体）では
+    /// 挙動を一切変えない。集合演算の枝の集計・LIMIT 付き枝も既存パーサー経由で `Some` に
+    /// なるが、別名は `reject_from_alias` で `42601` 拒否する。別名は parse 時に確定する情報であり、
     /// 実行系は実テーブル名のみで動く（別名は `ParsedShape` 等へ持ち込まない）。
     from_ref: Option<TableRef>,
+    /// `true` の間は単一テーブル FROM の別名を `42601` で拒否する（集合演算の枝が
+    /// 既存の SELECT／集計パーサーを再利用するため、別名を枝へ持ち込ませない。Issue #1534）。
+    reject_from_alias: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -3378,6 +3382,7 @@ impl<'a> Parser<'a> {
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
+            reject_from_alias: false,
         }
     }
 
@@ -9106,6 +9111,11 @@ impl<'a> Parser<'a> {
     fn parse_from_table_ref(&mut self) -> Result<String, SqlSurfaceError> {
         let table = self.expect_ident()?;
         let alias = self.parse_relation_alias(is_single_table_reserved_word, "FROM")?;
+        if alias.is_some() && self.reject_from_alias {
+            return Err(SqlSurfaceError::unsupported(
+                "table alias is not supported inside a set operation branch",
+            ));
+        }
         self.from_ref = Some(match alias {
             Some(a) => TableRef::with_alias(table.clone(), a),
             None => TableRef::new(table.clone()),
@@ -9811,7 +9821,7 @@ fn parse_set_branch(
     let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
         if looks_like_aggregate_select(slice) {
-            let shape = parse_aggregate_shape(slice, None)?;
+            let shape = parse_aggregate_shape(slice, None, true)?;
             p.pos = branch_end;
             return build_set_aggregate_branch(shape, lookup);
         }
@@ -10006,10 +10016,10 @@ fn parse_set_limited_branch(
     lookup: &impl TableLookup,
 ) -> Result<SetTree, SqlSurfaceError> {
     if looks_like_aggregate_select(slice) {
-        let shape = parse_aggregate_shape(slice, None)?;
+        let shape = parse_aggregate_shape(slice, None, true)?;
         return build_set_aggregate_branch(shape, lookup);
     }
-    let shape = match parse_select_shape(slice, None)? {
+    let shape = match parse_select_shape(slice, None, true)? {
         ParsedSelect::Scan(shape) => shape,
         ParsedSelect::Search(_) => {
             return Err(SqlSurfaceError::unsupported(
@@ -10268,8 +10278,10 @@ fn parse_set_operation(
 fn parse_select_shape(
     tokens: &[Token],
     subquery_ctx: Option<usize>,
+    reject_from_alias: bool,
 ) -> Result<ParsedSelect, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
+    p.reject_from_alias = reject_from_alias;
     if let Some(depth) = subquery_ctx {
         p = p.with_subquery_ctx(depth);
     }
@@ -10539,8 +10551,10 @@ struct ParsedAggregateShape {
 fn parse_aggregate_shape(
     tokens: &[Token],
     subquery_ctx: Option<usize>,
+    reject_from_alias: bool,
 ) -> Result<ParsedAggregateShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
+    p.reject_from_alias = reject_from_alias;
     if let Some(depth) = subquery_ctx {
         p = p.with_subquery_ctx(depth);
     }
@@ -11140,9 +11154,9 @@ fn validate_sql_tokens_impl(
             let main = if is_distinct_modifier(main_tokens, 1) {
                 MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
             } else if main_is_aggregate_select {
-                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None)?)
+                MainShape::Aggregate(parse_aggregate_shape(main_tokens, None, false)?)
             } else {
-                match parse_select_shape(main_tokens, None)? {
+                match parse_select_shape(main_tokens, None, false)? {
                     ParsedSelect::Scan(shape) => MainShape::Scan(shape),
                     ParsedSelect::Search(_) => {
                         return Err(SqlSurfaceError::unsupported(
@@ -11441,7 +11455,7 @@ fn validate_select_statement(
         );
     }
     if is_aggregate_select {
-        let shape = parse_aggregate_shape(tokens, subquery_ctx)?;
+        let shape = parse_aggregate_shape(tokens, subquery_ctx, false)?;
         let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
         return aggregate_statement_from_resolved(
             shape.table_name,
@@ -11451,7 +11465,7 @@ fn validate_select_statement(
             shape.group_by,
         );
     }
-    match parse_select_shape(tokens, subquery_ctx)? {
+    match parse_select_shape(tokens, subquery_ctx, false)? {
         ParsedSelect::Search(shape) => {
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {

@@ -208,6 +208,20 @@ fn sql44_reserved_or_invalid_alias_is_rejected() {
     }
 }
 
+/// 集合演算の枝（集計・LIMIT 付き枝を含む）では FROM 別名を受理せず `42601`。
+#[test]
+fn sql44_alias_is_rejected_inside_set_operation_branches() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT COUNT(*) FROM docs AS x UNION SELECT COUNT(*) FROM docs",
+        "SELECT COUNT(*) FROM docs UNION SELECT COUNT(*) FROM docs x",
+        "(SELECT id FROM docs AS x LIMIT 1) UNION (SELECT id FROM docs LIMIT 1)",
+        "SELECT id FROM docs AS x UNION SELECT id FROM docs",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42601", "{sql}");
+    }
+}
+
 #[test]
 fn sql44_following_clauses_are_not_taken_as_alias() {
     let (core, ctx, _g) = setup();
