@@ -3,7 +3,7 @@
 //! 結合テスト。実 `Storage`＋`CpuScalarProvider` を `EngineCore::execute_sql` 経由で使い、
 //! 通常 SELECT・集計・DISTINCT・ORDER BY・サブクエリ・テナント境界を固定する。
 //! 修飾列の受理（`t.col`。Issue #1535）は投影・WHERE・ORDER BY・GROUP BY・HAVING で
-//! 非修飾の同義文と同一結果になることを固定する。`t.*` は #1536 の担当。
+//! 非修飾の同義文と同一結果になることを固定する。`t.*` は `sql44_qualified_star.rs`（Issue #1536）で固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
