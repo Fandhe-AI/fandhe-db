@@ -1263,7 +1263,7 @@ fn bind_ranking(
 /// 関数呼び出し名を使う（`Expr::Call` 以外が頂点の式は SELECT リストの構文上
 /// 現れない＝`allowlist::Parser::parse_select_item` は必ず `ident '(' ... ')'` から
 /// 式項目を作るため `name` は常に取得できる）。
-fn default_expr_alias(expr: &Expr) -> String {
+pub(crate) fn default_expr_alias(expr: &Expr) -> String {
     match expr {
         Expr::Call { name, .. } => name.clone(),
         // PostgreSQL にならった既定エイリアス（対象ビヘイビア: SQL-26。

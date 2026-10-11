@@ -1786,6 +1786,70 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
     /// `match` はワイルドカードアームの追加が必要（`Join` 追加時と同じ運用）。
     BufferedView(ValidatedBufferedView),
+    /// `FROM` なしの定数式 `SELECT <式>[ AS <別名>][, ...]`（SQL-43・Issue #1531）。
+    /// ドライバ・ORM の接続確認クエリ（`SELECT 1` 等）を通すための経路で、テーブル・
+    /// 列を一切参照しない。束縛・実行本体は `sql::const_select` が担い、セッション
+    /// UDF レジストリを参照しうるためセッション付き入口（`core.rs`）からのみ実行できる。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
+    /// `match` はアームの追加が必要（`BufferedView` 追加時と同じ運用）。
+    ConstSelect(ValidatedConstSelect),
+}
+
+/// `FROM` なし定数式 SELECT の項目数上限（SQL-43）。1 文あたりの束縛・評価コストを
+/// 有界にするための DoS 対策で、`MAX_EXPR_NODES` と同程度の桁に揃えた。アロケーション
+/// より前に検査する。
+pub(crate) const MAX_CONST_SELECT_ITEMS: usize = 1024;
+
+/// `FROM` なし定数式 SELECT（[`Statement::ConstSelect`]。SQL-43・Issue #1531）の
+/// 構文検証済み形。列参照・集計の禁止は束縛段（`sql::const_select::bind`）が担う。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ValidatedConstSelect {
+    pub(crate) items: Vec<ConstSelectItem>,
+}
+
+impl ValidatedConstSelect {
+    /// 投影項目（出現順）。
+    pub fn items(&self) -> &[ConstSelectItem] {
+        &self.items
+    }
+}
+
+/// [`ValidatedConstSelect`] の 1 項目（式と任意の `AS` 別名）。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ConstSelectItem {
+    pub(crate) expr: Expr,
+    pub(crate) alias: Option<String>,
+}
+
+impl ConstSelectItem {
+    /// 項目の式。
+    pub fn expr(&self) -> &Expr {
+        &self.expr
+    }
+
+    /// `AS` で明示された別名。
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+}
+
+/// `tokens`（先頭は `SELECT`）に、括弧の深さ 0 の `FROM` が無ければ真（SQL-43）。
+/// 括弧内の `FROM`（サブクエリ等）は深さ > 0 のため数えない。深さの計算は
+/// `saturating` 演算（untrusted 入力で巻き戻らない）。
+fn is_from_less_select(tokens: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    for tok in tokens {
+        match tok {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(Keyword::From) if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// 評価後射影形ビュー参照（[`Statement::BufferedView`]。Issue #1192・Issue #1360・
@@ -5883,6 +5947,42 @@ impl<'a> Parser<'a> {
             SqlSurfaceError::unsupported(format!("invalid HINT ORDER permutation: {e:?}"))
         })?;
         Ok(Some(order))
+    }
+
+    /// `SELECT <式>[ AS <別名>][, ...][;]`（`FROM` なし。SQL-43・Issue #1531）を解析する。
+    /// `SELECT *`・`WHERE`／`LIMIT` 等の余剰トークン・空リスト・末尾カンマはすべて
+    /// `42601`（fail-closed）。列参照・集計の拒否は束縛段の責務（構文木だけでは
+    /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
+    fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
+        self.expect_keyword(Keyword::Select)?;
+        if matches!(self.peek(), Some(Token::Punct('*'))) {
+            return Err(SqlSurfaceError::unsupported(
+                "SELECT * requires a FROM clause",
+            ));
+        }
+        let mut items: Vec<ConstSelectItem> = Vec::new();
+        loop {
+            if items.len() >= MAX_CONST_SELECT_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many items in the SELECT list",
+                ));
+            }
+            let expr = self.parse_value_expr(0)?;
+            let alias = if self.peek_ident_matches("AS") {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            items.push(ConstSelectItem { expr, alias });
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_end_of_statement()?;
+        Ok(ValidatedConstSelect { items })
     }
 
     /// 省略可能な単一末尾セミコロンの後に余剰トークンがあれば複数 statement と
@@ -11270,6 +11370,12 @@ fn validate_sql_tokens_impl(
                         "EXPLAIN is not supported for a view with an aggregate/LIMIT body",
                     ));
                 }
+                // SQL-43（Issue #1531）: `FROM` なし SELECT は `EXPLAIN` の対象外。
+                Statement::ConstSelect(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "EXPLAIN is not supported for a SELECT without FROM",
+                    ));
+                }
                 // `validate_select_statement` は `SELECT` 先頭のトークン列に
                 // 対して常に `Select`／`Aggregate`／`Scan` のいずれかを返す
                 // （関数ドキュメント参照）。到達は同関数の契約違反時のみの
@@ -11332,6 +11438,13 @@ fn validate_select_statement(
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
 ) -> Result<Statement, SqlSurfaceError> {
+    // SQL-43（Issue #1531）: 括弧の深さ 0 に `FROM` が無い `SELECT` は定数式 SELECT。
+    // 既存形（`FROM` あり）では常に偽で、以降の振り分けに一切影響しない。
+    if is_from_less_select(tokens) {
+        let mut p = Parser::new(tokens);
+        let validated = p.parse_const_select()?;
+        return Ok(Statement::ConstSelect(validated));
+    }
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
@@ -11531,6 +11644,10 @@ pub fn validate_statement(
         )),
         Statement::BufferedView(_) => Err(SqlSurfaceError::unsupported(
             "view read is not a search query statement (use a session-aware entry point)",
+        )),
+        // SQL-43（Issue #1531）: 定数式 SELECT も `ValidatedStatement` を持たない。
+        Statement::ConstSelect(_) => Err(SqlSurfaceError::unsupported(
+            "FROM-less SELECT is not a search query statement (use a session-aware entry point)",
         )),
     }
 }

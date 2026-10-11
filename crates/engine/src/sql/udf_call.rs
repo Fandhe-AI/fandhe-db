@@ -1429,6 +1429,24 @@ pub fn bind_expr(
     bind_expr_in(expr, &mut env, node_budget)
 }
 
+/// 列参照を持たない文脈（`FROM` なし定数式 SELECT。SQL-43・Issue #1531）で式を束縛する。
+/// スキーマなしの [`BindEnv`] で [`bind_expr_in`] を呼ぶ薄いラッパーで、`sql::const_select`
+/// から呼ばれる。列参照は呼び出し元が事前に拒否する前提だが、万一残っても
+/// スキーマ未解決として束縛段が拒否する（fail-closed）。
+pub(crate) fn bind_const_expr(
+    expr: &Expr,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: None,
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+    };
+    bind_expr_in(expr, &mut env, node_budget)
+}
+
 /// [`BindEnv::case_nesting`] を 1 段進め、[`MAX_CASE_NESTING`] を超えないか検査する
 /// （`bind_case`／`bind_coalesce`／`bind_nullif` が共有する。対象ビヘイビア:
 /// SQL-26。Issue #921）。呼び出し元は対応する `exit_case_nesting` を必ず対で呼ぶ

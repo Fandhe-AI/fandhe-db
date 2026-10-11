@@ -22,6 +22,8 @@
 //! 下位モジュール:
 //! - [`lexer`][]: untrusted な SQL テキストの自作トークナイザ
 //! - [`allowlist`][]: 許可リスト検証本体・`SqlSurfaceError`。`HINT ORDER(...)` の構造検証も含む（TASK-76）
+//! - [`const_select`][]: `FROM` なし定数式 `SELECT`（SQL-43・Issue #1531）の束縛・実行。
+//!   テーブル・ストレージに触れず 1 行を返す（接続確認クエリ用）
 //! - [`parser`][]: 許可リスト通過後の束縛（列名・型照合、ベクトルリテラル解析。TASK-75）
 //! - [`plan`][]: `HINT ORDER(...)` の評価順序規則（RLS は暗黙事前フィルタ＋
 //!   [`crate::rls::RlsSafetyNet`]（TASK-136）による最終安全網の二重適用を維持し、
@@ -149,6 +151,7 @@ mod aggregate_embedding_decode_tests;
 pub mod allowlist;
 pub(crate) mod arena_cache;
 pub(crate) mod check_constraint;
+pub mod const_select;
 pub mod copy;
 pub(crate) mod cte;
 pub mod cursor;
