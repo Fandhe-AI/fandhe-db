@@ -114,8 +114,9 @@ impl BinaryFormatError {
     /// 意図的な拒否として `0A000`（`FeatureNotSupported`）に写像する。
     ///
     /// PostgreSQL 本体は不正な format code 値を `22023` で返すが、本リポの
-    /// `ErrorClass::OperationIdContentMismatch` は `22023` を専有しており
-    /// 意味が異なるため、`ErrorClass` を増やさず本モジュールの fail-closed
+    /// `22023` は ERR-3 の `ErrorClass::OperationIdContentMismatch` と型名引数範囲外の
+    /// `ErrorClass::InvalidParameterValue`（Issue #2304）が用いており、format code
+    /// 不正とは意味が異なるため、本モジュールの fail-closed
     /// 方針（構文違反は `08P01`）に寄せる（設計判断の詳細は
     /// `docs/design/wire-binary-format.md` 参照）。
     pub const fn error_class(self) -> ErrorClass {

@@ -55,6 +55,9 @@ const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &[
     "FLOAT8",
     "DOUBLE",
     "BOOLEAN",
+    // 型名の別名（Issue #2304。TABLE-29）。`FLOAT` は先頭語のみ（`(p)` は解決表側）。
+    "BOOL",
+    "FLOAT",
     "DATE",
     "TIMESTAMP",
     "BYTEA",
@@ -473,6 +476,11 @@ pub enum SqlSurfaceError {
     /// ことは `tests/error_format_err3.rs` で検証する。fail-closed:
     /// commit 済み確定の根拠にしない）。
     OperationIdContentMismatch,
+    /// 型名の引数が範囲外（`22023`。Issue #2304・TABLE-29。`FLOAT(p)` の精度 `p` が
+    /// `1..=53` の外）。構文段で値を埋め込まない固定文言（`detail`）をそのまま返す。
+    /// `wire_code` は ERR-3 の [`SqlSurfaceError::OperationIdContentMismatch`] と共有するが、
+    /// `code` ラベル（`INVALID_PARAMETER_VALUE`）と文言で区別する。
+    InvalidParameterValue { detail: &'static str },
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// スカラー／ベクトル算術式評価（SQL-26）の非有限値化（Issue #1163）にも使う。
@@ -961,6 +969,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
+            SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::DatetimeFieldOverflow { .. } => ErrorClass::DatetimeFieldOverflow,
             SqlSurfaceError::InvalidDatetimeFormat { .. } => ErrorClass::InvalidDatetimeFormat,
             SqlSurfaceError::InvalidTextRepresentation { .. } => {
@@ -1055,6 +1064,8 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
             }
+            // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
+            SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
             SqlSurfaceError::DatetimeFieldOverflow { detail } => {
                 write!(f, "datetime field overflow: {detail}")
             }
@@ -12773,7 +12784,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// 列型キーワード判定は型名エイリアスと未確定型を含む 25 語を大小無視で認識する
+    /// 列型キーワード判定は型名エイリアスと未確定型を含む 27 語を大小無視で認識する
     /// （Issue #1529・TABLE-29）。
     #[test]
     fn column_type_keyword_covers_aliases_case_insensitively() {
@@ -12781,7 +12792,7 @@ mod tests {
             assert!(is_column_type_keyword(kw), "{kw}");
             assert!(is_column_type_keyword(&kw.to_ascii_lowercase()), "{kw}");
         }
-        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 25);
+        assert_eq!(CREATE_TABLE_COLUMN_TYPE_KEYWORDS.len(), 27);
         for ok in ["Int4", "iNt8", "float4", "FLOAT8", "int", "int2", "varchar"] {
             assert!(is_column_type_keyword(ok), "{ok}");
         }

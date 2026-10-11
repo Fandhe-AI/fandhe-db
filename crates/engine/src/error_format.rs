@@ -80,18 +80,19 @@ macro_rules! define_error_classes {
 /// ラベル（[`ErrorClass::label`]）でのみ区別する。本モジュール下部の
 /// `wire_codes_are_pairwise_distinct_except_shared_wire_codes`
 /// テストがこの集合に載っていない `wire_code` の重複だけを偶発的な乖離として
-/// 検出する。共有は 2 組: `23502`（`MissingOperationId` / `NotNullViolation`）と
+/// 検出する。共有は 3 組: `23502`（`MissingOperationId` / `NotNullViolation`）と
 /// `23505`（`UniqueViolation` / `DuplicateOperationId`。台帳由来の重複を行制約
-/// 由来と `code` ラベルで区別する。Issue #1180・RECOVER-12・ERR-6）。
+/// 由来と `code` ラベルで区別する。Issue #1180・RECOVER-12・ERR-6）と`22023`（`OperationIdContentMismatch` /
+/// `InvalidParameterValue`。Issue #2304）。
 ///
 /// 本体は `#[cfg(test)]` の単体テストからのみ参照される（`pub(crate)` のため
 /// integration test crate からは到達できない）。通常ビルドでは未参照のため
 /// `dead_code` を明示的に許容する。
 #[allow(dead_code)]
-pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505"];
+pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 46;
+    count = 47;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -323,16 +324,24 @@ define_error_classes! {
     /// Issue #1404・SQL-29・ERR-6）。判定は自テナントの可視行だけで決まる。
     /// [`crate::sql::allowlist::SqlSurfaceError::CardinalityViolation`] の写像。
     CardinalityViolation => ("21000", "CARDINALITY_VIOLATION"),
+    /// 構文上受理された型名の引数が範囲外（`22023`。Issue #2304・TABLE-29。`FLOAT(p)` の
+    /// 精度 `p` が `1..=53` の外）。`wire_code` は
+    /// [`ErrorClass::OperationIdContentMismatch`] と共有し `code` ラベルと文言で区別する
+    /// （[`SHARED_WIRE_CODES`]・ERR-6）。**宣言順の制約**: [`ErrorClass::from_wire_code`] は
+    /// 宣言順で最初に一致した分類を返すため、`22023` の逆引きが ERR-3 の分類を返し続けるよう
+    /// 必ず `OperationIdContentMismatch` より後に宣言する。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidParameterValue`] の写像。
+    InvalidParameterValue => ("22023", "INVALID_PARAMETER_VALUE"),
 }
 
 impl ErrorClass {
     /// `wire_code` からの逆引き。未知のコードは `None`（fail-closed。呼び出し元が
     /// 未知コードを既定分類へ丸めて誤った意味論を持たせることを防ぐ）。
     ///
-    /// [`SHARED_WIRE_CODES`] に載る `wire_code`（`23502`・`23505`）は複数分類が
+    /// [`SHARED_WIRE_CODES`] に載る `wire_code`（`23502`・`23505`・`22023`）は複数分類が
     /// 共有するため、本関数は [`ErrorClass::ALL`] の宣言順で最初に一致した分類
     /// （`23502` は [`ErrorClass::MissingOperationId`]、`23505` は
-    /// [`ErrorClass::UniqueViolation`]）を返す。この関数は
+    /// [`ErrorClass::UniqueViolation`]、`22023` は [`ErrorClass::OperationIdContentMismatch`]）を返す。この関数は
     /// HTTP ステータス射影の往復確認（同じ `wire_code` は同じステータスへ写像
     /// される）にのみ使われ、応答本文の `code` ラベルは各エラー型の
     /// `error_class()` が直接返す分類から得るため、共有コードの逆引きが
