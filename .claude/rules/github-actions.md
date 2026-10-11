@@ -86,3 +86,60 @@ gh run view <run-id> --json jobs --jq '.jobs[] | "\(.name)\t\((.completedAt|from
 | `sync-issue-behavior-ids.yml` | push(main)・手動 | 73（push）・1118（手動） | |
 | `release.yml` | 手動 | 139 / 279 | |
 | `toolchain-canary.yml` | schedule | 未計測（実行履歴なし） | |
+
+## キャッシュ方針
+
+### 前提（上限と予算）
+
+- リポジトリの Actions キャッシュ上限は **10 GB**。超えると古いものから LRU で追い出され、7 日間アクセスの無いエントリも削除される
+- Org の Actions 予算は **$10（超過時停止）**。10 GB を超える分は 1 GB あたり月 $0.07 の課金になるため、上限は引き上げず
+  **10 GB の中でヒット率を最大化する**（重複保存を作らない・効かないキャッシュを持たない）
+
+### 本リポで触れる範囲
+
+- キャッシュを持つのは reusable の `rust-ci`（`Fandhe-AI/actions` の `rust-base-ci.yml`）だけ。独立ジョブはキャッシュを持たない（上のチェックリスト 6）
+- キー設計・restore-keys・保存条件・保存前 prune は**共有側で決まる**。本リポの `ci.yml` から変えられるのは `cache`（`true`）と
+  `cache-key-prefix`（`fandhe-db`）だけ。キーや保存条件を変えたいときは、本リポに独自の `actions/cache` を足さず共有側へ PR を出す
+- 共有側の改善（キーに `rustc -vV` のハッシュを入れる・キーの入力をルートの `Cargo.lock` に絞る・restore / save の分割と
+  `cache-save` 入力の追加）は [Fandhe-AI/actions#165](https://github.com/Fandhe-AI/actions/pull/165) で対応中。
+  マージ後は `@latest` 経由で自動的に反映される。`cache-save` が入ったら、`rust-ci` の `with:` に
+  `cache-save: ${{ github.ref == 'refs/heads/main' }}` を渡して main push だけが保存するようにする（入力の既定値が main のみ保存に変わった場合は不要）
+
+### 現行キーの既知の問題（2026-10-11 時点・共有側の修正待ち）
+
+現行キーは `fandhe-db-Linux-{fmt|clippy-v3|test-v3|deny}-<hashFiles('**/Cargo.lock')>`。
+
+| 問題 | 影響 |
+| ---- | ---- |
+| キーに rustc の識別が無い（`rust-toolchain.toml` は `channel = "stable"`） | runner イメージの更新で rustc が変わっても旧 rustc の blob に exact hit し続ける。exact hit では保存し直されないため、`Cargo.lock` が変わるまで clippy / test が依存を毎回全再ビルドする |
+| `**/Cargo.lock` が `.agents/skills/make/samples/projects/*/Cargo.lock`（`.claude/skills/make` symlink 経由も）を拾う | ビルドに関係しないスキル同期 PR だけでキーが変わる |
+| PR からも保存する | `Cargo.lock`（上記サンプル含む）を変える PR ごとに main と同内容の blob（約 0.9 GB）が `refs/pull/<N>/merge` に重複保存される |
+| fmt ジョブにも target を含むキャッシュがある | `cargo fmt` は保存対象のパスを作らないため毎回 miss し、保存時に "Path Validation Error" の警告が出る（無害） |
+
+### 実測（2026-10-11）
+
+| 項目 | 変更前 | 変更後 |
+| ---- | ------ | ------ |
+| キャッシュ使用量 | 21 件・約 4.4 GB（旧 prefix `vector-db-*` 9 件・`fandhe-db-*` の PR スコープ 9 件を含む） | 8 件・2.24 GB（旧 prefix・旧 rustc の main キャッシュ・古い PR スコープを削除） |
+| clippy / test が再ビルドした依存（`Compiling` / `Checking` 行） | 135 | 2 |
+| `rust-ci / cargo clippy` ジョブ時間 | 3.9〜4.9 分（4 run） | 1.4 分 |
+| `rust-ci / cargo test` ジョブ時間 | 12.2〜17.6 分（4 run） | 14.7 分（ばらつきの範囲内。workspace メンバーの optimized ビルドが支配的） |
+
+- 経緯: runner イメージ 20260927 では依存の再ビルドは 2 件だったが、20261004 への更新後は main のキャッシュ（10-08 作成）に exact hit したまま
+  毎回 135 件を再ビルドしていた。旧キャッシュを削除し、新しいイメージで main のキャッシュを作り直した後は 2 件に戻った
+- 変更後も PR スコープ（#2288・#2290）に main と同一キーの blob が 5 件（約 1.3 GB）残っている。main のみ保存にすればこの重複は作られなくなる
+
+### runner イメージ更新後に再ビルドが増えたとき
+
+共有側のキーに rustc の識別が入るまでは、次の手順で古い main キャッシュを手動で削除する。
+
+1. 症状の確認: `rust-ci / cargo clippy` のログが `Cache restored from key: <primary key と同じキー>`（exact hit）なのに、
+   `Compiling` / `Checking` 行が数件ではなく 100 件超になっている。runner イメージは `Set up job` の `Runner Image` 節の `Version` で分かる
+2. 一覧: `gh cache list -R Fandhe-AI/fandhe-db --ref refs/heads/main --sort created_at --limit 50`（作成日時がイメージ更新より前のものが対象）
+3. 削除: `gh cache delete <cache-id> -R Fandhe-AI/fandhe-db`（キー指定なら `gh cache delete <key> --ref refs/heads/main -R Fandhe-AI/fandhe-db`）。
+   PR スコープの残骸は `gh cache delete --all --ref refs/pull/<N>/merge -R Fandhe-AI/fandhe-db` で消せる
+4. 次の main push の CI が restore-keys で部分復元（または miss）→ 依存を 1 回再ビルド → 新しいキャッシュを保存する。
+   PR は main のキャッシュを読むため、main で作り直されるまでは再ビルドが続く
+
+ログの取得は `gh run view <run-id> --log --job <job-id>` でジョブ単位に絞る（REST API の上限は Org 内で共有）。
+使用量は `gh api repos/Fandhe-AI/fandhe-db/actions/cache/usage` で確認できる。
