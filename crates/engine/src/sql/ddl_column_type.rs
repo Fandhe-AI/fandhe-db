@@ -397,6 +397,7 @@ fn parse_base_type_name(
         }
     }
 }
+
 fn expect_ident(tokens: &[Token], pos: &mut usize) -> Result<String, SqlSurfaceError> {
     match tokens.get(*pos) {
         Some(Token::Ident(s) | Token::QuotedNull(s)) => {
@@ -621,6 +622,7 @@ mod tests {
             assert!(seen.insert(*word), "duplicate row {word}");
         }
     }
+
     #[test]
     fn accepts_double_precision_two_words() {
         let (ty, consumed) = parse_type("DOUBLE PRECISION").expect("valid");
