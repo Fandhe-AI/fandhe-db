@@ -138,6 +138,8 @@ const RESULT_CELL_FIXED_BYTES: usize = 8;
 struct ResultBudget {
     max_result_bytes: usize,
     per_group_bytes: usize,
+    /// グループ数の上限（Issue #1550。既定は [`MAX_GROUPS`]。起動時設定で下げられる）。
+    max_groups: usize,
 }
 
 impl ResultBudget {
@@ -146,7 +148,11 @@ impl ResultBudget {
     /// `key_count`（SQL-25 (d) で複数列に一般化）個＋集計項目ごとの
     /// アキュムレータを保持し、結果は投影列数ぶんのセルになるため、両者の
     /// 大きい方で見積もる（`key_count == 1` では従来と同じ見積り値になる）。
-    fn new(bound: &BoundAggregate, max_result_bytes: usize) -> Result<Self, SqlSurfaceError> {
+    fn new(
+        bound: &BoundAggregate,
+        max_result_bytes: usize,
+        max_groups: usize,
+    ) -> Result<Self, SqlSurfaceError> {
         let key_count = bound.group_by.as_ref().map(|g| g.keys.len()).unwrap_or(1);
         let cells = bound
             .projection
@@ -161,6 +167,7 @@ impl ResultBudget {
         Ok(Self {
             max_result_bytes,
             per_group_bytes,
+            max_groups,
         })
     }
 
@@ -404,6 +411,22 @@ fn key_component_budget_bytes(value: Option<&ScalarKeyRef<'_>>) -> usize {
     }
 }
 
+/// 起動時設定の `GROUP BY` 列数上限（Issue #1550）を超える場合に `54000` で拒否する。
+/// 走査・アロケーションより前に呼ぶ（データに依存しない判定）。ハード上限（
+/// [`MAX_GROUP_BY_COLUMNS`]）は構文段・束縛段・固定長スタック配列で別途維持される。
+fn check_configured_column_count(
+    key_count: usize,
+    group_limits: crate::group_by_limits::GroupByLimits,
+) -> Result<(), SqlSurfaceError> {
+    let max = group_limits.max_group_by_columns();
+    if key_count > max {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "GROUP BY column count {key_count} exceeds limit {max}"
+        )));
+    }
+    Ok(())
+}
+
 /// グループ表への新規グループキー追加前に有界性を検査する（[`MAX_GROUPS`]・
 /// [`MAX_GROUP_KEY_TOTAL_BYTES`]）。呼び出し元が「このキーは表に存在しない」ことを
 /// 確認済みの場合にのみ呼ぶ（既存キーの更新では追加コストが発生しないため呼ばない）。
@@ -421,7 +444,7 @@ fn check_new_group_budget(
     total_text_accumulator_bytes: usize,
     budget: &ResultBudget,
 ) -> Result<(), SqlSurfaceError> {
-    if current_group_count >= MAX_GROUPS {
+    if current_group_count >= budget.max_groups {
         return Err(SqlSurfaceError::payload_too_large(
             "GROUP BY result exceeds the allowed number of groups",
         ));
@@ -1265,6 +1288,7 @@ pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggre
 /// （ヘッダのみで可視性判定 → 可視行のみヘッダのオフセットを引き継いで本体デコード
 /// → `WHERE` → 可視性再検査）を独立して踏襲する（責務分離のためモジュールを分けた
 /// ことによる意図的な複製。変更する際は両モジュールの規約を揃えること）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_grouped_aggregate(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -1286,11 +1310,15 @@ pub(crate) fn execute_grouped_aggregate(
     // 「Issue #475」節参照）。
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    // Issue #1550: `GROUP BY` の列数・グループ数の起動時設定。列数は走査より前に
+    // （データに依存せず）判定し、グループ数は [`ResultBudget`] 経由で新規グループ追加時に判定する。
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let group_by = bound
         .group_by
         .as_ref()
         .ok_or_else(|| accumulator_bug("execute_grouped_aggregate called without a GROUP BY"))?;
+    check_configured_column_count(group_by.keys.len(), group_limits)?;
 
     let expected_dim = schema.vector_dim();
 
@@ -1333,7 +1361,7 @@ pub(crate) fn execute_grouped_aggregate(
     let mut total_text_accumulator_bytes: usize = 0;
     // PR #1049 レビュー指摘 codex P1 対応: 生成中の結果全体に対する予算判定器
     // （[`ResultBudget`]）。索引経路・全走査経路の双方が共有する。
-    let budget = ResultBudget::new(bound, max_result_bytes)?;
+    let budget = ResultBudget::new(bound, max_result_bytes, group_limits.max_groups())?;
     // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
     // （全グループ・全項目の合計）で 1 つ。索引経路が
     // `is_text_accumulator_budget_error` で全走査へ退避する際は呼び出し先
@@ -2194,7 +2222,11 @@ impl<'a> GroupedRowAccumulator<'a> {
         bound: &'a BoundAggregate,
         schema: &'a TableSchema,
         max_result_bytes: usize,
+        group_limits: crate::group_by_limits::GroupByLimits,
     ) -> Result<Self, SqlSurfaceError> {
+        if let Some(group_by) = bound.group_by.as_ref() {
+            check_configured_column_count(group_by.keys.len(), group_limits)?;
+        }
         let single = if bound.group_by.is_none() {
             Some(new_accumulators(&bound.items)?)
         } else {
@@ -2203,7 +2235,7 @@ impl<'a> GroupedRowAccumulator<'a> {
         Ok(Self {
             bound,
             schema,
-            budget: ResultBudget::new(bound, max_result_bytes)?,
+            budget: ResultBudget::new(bound, max_result_bytes, group_limits.max_groups())?,
             groups: BTreeMap::new(),
             single,
             total_key_bytes: 0,
@@ -2679,6 +2711,7 @@ mod tests {
             crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect("grouped aggregate with OFFSET should succeed");
 
@@ -2728,6 +2761,7 @@ mod tests {
             crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
@@ -2848,14 +2882,24 @@ mod tests {
             crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect("default budget should succeed");
 
         // 同じデータ・同じクエリでも、呼び出し元が極端に小さい予算を渡せば
         // 行生成中に打ち切られる（`sql::cursor::CursorStatement::Declare` の
         // 内側実行が `MAX_CURSOR_BYTES_PER_SESSION` を渡す経路の回帰）。
-        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 1, None, None)
-            .expect_err("tiny caller-supplied budget must reject before default cap");
+        let err = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            1,
+            None,
+            None,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect_err("tiny caller-supplied budget must reject before default cap");
         assert_eq!(err.wire_code(), "54000");
     }
 
@@ -2915,12 +2959,30 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = bound_count_star_grouped_by_lang();
 
-        let ok = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 102, None, None)
-            .expect("estimate exactly at the budget must succeed");
+        let ok = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            102,
+            None,
+            None,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect("estimate exactly at the budget must succeed");
         assert_eq!(ok.rows.len(), 3);
 
-        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, 101, None, None)
-            .expect_err("adding the third group must exceed the budget");
+        let err = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            101,
+            None,
+            None,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect_err("adding the third group must exceed the budget");
         assert_eq!(err.wire_code(), "54000");
         // グループ追加時の超過は索引経路から全走査へのフォールバック対象
         // （走査順依存の TEXT 超過）として分類しない（Cursor Bugbot Medium 対応）。
@@ -2941,7 +3003,12 @@ mod tests {
     #[test]
     fn result_budget_counts_groups_keys_and_text_state() {
         let bound = bound_count_star_grouped_by_lang();
-        let budget = ResultBudget::new(&bound, 100).expect("budget");
+        let budget = ResultBudget::new(
+            &bound,
+            100,
+            crate::group_by_limits::GroupByLimits::default().max_groups(),
+        )
+        .expect("budget");
         assert_eq!(budget.per_group_bytes, 32);
         let d = RESULT_BUDGET_EXCEEDED_DETAIL;
         budget.check(3, 4, 0, d).expect("3*32+4 = 100 fits");
@@ -2997,6 +3064,7 @@ mod tests {
     #[test]
     fn order_key_charge_rejects_text_keys_exceeding_result_budget() {
         let budget = ResultBudget {
+            max_groups: MAX_GROUPS,
             max_result_bytes: 1_000,
             per_group_bytes: 16,
         };
@@ -3151,6 +3219,7 @@ mod tests {
             crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
@@ -3226,6 +3295,7 @@ mod tests {
             crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect("grouped COUNT(<UUID column>) should succeed");
 

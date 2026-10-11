@@ -639,10 +639,11 @@ fn order_val<'a>(cell: &'a Cell, class: &CmpClass) -> Result<Option<CmpVal<'a>>,
 pub(crate) fn apply_outer(
     result: QueryResult,
     plan: &OuterPlan,
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     match &plan.kind {
         OuterKind::Rows(rows) => apply_rows(result, rows, &plan.columns),
-        OuterKind::Aggregate(agg) => apply_aggregate(result, agg),
+        OuterKind::Aggregate(agg) => apply_aggregate(result, agg, group_limits),
     }
 }
 
@@ -721,11 +722,13 @@ fn apply_rows(
 fn apply_aggregate(
     result: QueryResult,
     plan: &AggregatePlan,
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let mut acc = super::group_by::GroupedRowAccumulator::new(
         &plan.bound,
         &plan.schema,
         super::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+        group_limits,
     )?;
     let mut scratch: Vec<StackValue> = Vec::new();
     for row in &result.rows {
@@ -917,7 +920,7 @@ mod tests {
 
     fn run(r: QueryResult, v: &ValidatedBufferedView) -> Result<QueryResult, SqlSurfaceError> {
         let plan = plan_outer(&r.columns, v, &UdfRegistry::default())?;
-        apply_outer(r, &plan)
+        apply_outer(r, &plan, crate::group_by_limits::GroupByLimits::default())
     }
 
     /// `count >= n`（整数の比較はパーサーが式述語として生成する）。

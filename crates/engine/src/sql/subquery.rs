@@ -137,6 +137,7 @@ pub(crate) fn resolve_where_predicates(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -153,6 +154,7 @@ pub(crate) fn resolve_where_predicates(
                         ctx,
                         lookup,
                         udfs,
+                        group_limits,
                         budget,
                         in_value_budget,
                     )?);
@@ -174,6 +176,7 @@ pub(crate) fn resolve_where_predicates(
                     ctx,
                     lookup,
                     udfs,
+                    group_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -190,6 +193,7 @@ pub(crate) fn resolve_where_predicates(
                     ctx,
                     lookup,
                     udfs,
+                    group_limits,
                     budget,
                     in_value_budget,
                 )?;
@@ -219,6 +223,7 @@ pub(crate) fn resolve_where_predicates(
                     ctx,
                     lookup,
                     udfs,
+                    group_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -241,6 +246,7 @@ pub(crate) fn resolve_where_predicates(
                         ctx,
                         lookup,
                         udfs,
+                        group_limits,
                         budget,
                         in_value_budget,
                     )?);
@@ -259,6 +265,7 @@ pub(crate) fn resolve_where_predicates(
                         ctx,
                         lookup,
                         udfs,
+                        group_limits,
                         budget,
                         in_value_budget,
                     )?;
@@ -396,6 +403,7 @@ fn execute_inner_query(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
@@ -409,6 +417,7 @@ fn execute_inner_query(
         ctx,
         lookup,
         udfs,
+        group_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -429,6 +438,7 @@ fn execute_inner_query_with_meta(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -450,6 +460,7 @@ fn execute_inner_query_with_meta(
             ctx,
             lookup,
             udfs,
+            group_limits,
             budget,
             in_value_budget,
             meta_sink,
@@ -464,6 +475,7 @@ fn execute_inner_query_with_meta(
             ctx,
             lookup,
             udfs,
+            group_limits,
             budget,
             in_value_budget,
             meta_sink,
@@ -586,6 +598,7 @@ fn execute_inner_scan_statement(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -606,6 +619,7 @@ fn execute_inner_scan_statement(
         ctx,
         lookup,
         udfs,
+        group_limits,
         budget,
         in_value_budget,
     ) {
@@ -677,6 +691,7 @@ fn execute_inner_aggregate_statement(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -693,6 +708,7 @@ fn execute_inner_aggregate_statement(
         ctx,
         lookup,
         udfs,
+        group_limits,
         budget,
         in_value_budget,
     ) {
@@ -716,7 +732,7 @@ fn execute_inner_aggregate_statement(
     };
     let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
     *meta_sink = Some(super::describe::aggregate_columns(&bound, &inner_schema)?);
-    super::aggregate::execute_aggregate_with_cache(
+    super::aggregate::execute_aggregate_with_group_limits(
         read_txn,
         ctx,
         &inner_schema,
@@ -725,6 +741,7 @@ fn execute_inner_aggregate_statement(
         None,
         None,
         None,
+        group_limits,
     )
 }
 
@@ -1076,6 +1093,7 @@ fn resolve_in_subquery(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -1089,6 +1107,7 @@ fn resolve_in_subquery(
         ctx,
         lookup,
         udfs,
+        group_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -1422,6 +1441,7 @@ pub(crate) fn resolve_scalar_projection_items(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
@@ -1437,6 +1457,7 @@ pub(crate) fn resolve_scalar_projection_items(
             ctx,
             lookup,
             udfs,
+            group_limits,
             budget,
             in_value_budget,
             &mut meta_sink,
@@ -1691,6 +1712,7 @@ fn resolve_scalar_compare(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<WherePredicate, SqlSurfaceError> {
@@ -1704,6 +1726,7 @@ fn resolve_scalar_compare(
         ctx,
         lookup,
         udfs,
+        group_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -1921,6 +1944,7 @@ fn resolve_exists_subquery(
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<bool, SqlSurfaceError> {
@@ -1933,6 +1957,7 @@ fn resolve_exists_subquery(
         ctx,
         lookup,
         udfs,
+        group_limits,
         budget,
         in_value_budget,
     )?;
@@ -2071,6 +2096,7 @@ mod tests {
             &ctx,
             &storage,
             &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
             &mut budget,
             &mut in_value_budget,
         )
@@ -2124,6 +2150,7 @@ mod tests {
             &ctx,
             &storage,
             &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
             &mut budget,
             &mut in_value_budget,
         )

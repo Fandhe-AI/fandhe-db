@@ -245,6 +245,7 @@ pub mod embedding;
 pub mod error_format;
 pub(crate) mod f16;
 pub mod gpu_batch;
+pub mod group_by_limits;
 pub mod hnsw;
 pub mod hybrid;
 pub mod incremental;

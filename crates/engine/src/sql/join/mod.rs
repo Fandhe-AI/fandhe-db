@@ -71,6 +71,9 @@ pub(crate) struct JoinLimits {
     pub(crate) budget_cap: usize,
     /// 集計形のグループ数上限（既定は `sql::group_by::MAX_GROUPS`。超過は `54000`）。
     pub(crate) max_groups: usize,
+    /// 集計形の `GROUP BY` キー列数上限（Issue #1550。既定は
+    /// `sql::allowlist::MAX_GROUP_BY_COLUMNS`。超過は実行段で `54000`）。
+    pub(crate) max_group_by_columns: usize,
 }
 
 impl Default for JoinLimits {
@@ -80,6 +83,7 @@ impl Default for JoinLimits {
             max_output_rows: MAX_JOIN_OUTPUT_ROWS,
             budget_cap: crate::arena::MAX_ARENA_TOTAL_BYTES,
             max_groups: crate::sql::group_by::MAX_GROUPS,
+            max_group_by_columns: crate::sql::allowlist::MAX_GROUP_BY_COLUMNS,
         }
     }
 }
@@ -200,6 +204,8 @@ pub(crate) fn execute(
     schemas: &HashMap<String, TableSchema>,
     validated: &ValidatedJoin,
     udfs: &UdfRegistry,
+    // Issue #1550: 集計形の `GROUP BY` 列数・グループ数の起動時設定（`EngineCore` 保持）。
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_with_limits(
         read_txn,
@@ -207,7 +213,11 @@ pub(crate) fn execute(
         schemas,
         validated,
         udfs,
-        &JoinLimits::default(),
+        &JoinLimits {
+            max_groups: group_limits.max_groups(),
+            max_group_by_columns: group_limits.max_group_by_columns(),
+            ..JoinLimits::default()
+        },
     )
 }
 
@@ -227,6 +237,16 @@ pub(crate) fn execute_with_limits(
     // 同じ判断順序）。
     let bound = bind_side_scans(&plan, udfs, limits.max_input_rows.saturating_add(1))?;
     let (limit, offset) = validate_limit_offset(validated)?;
+    // Issue #1550: 起動時設定の `GROUP BY` 列数上限。データに依存しない判定なので走査より前に行う。
+    if let Shape::Aggregate(agg) = &plan.shape {
+        if agg.keys.len() > limits.max_group_by_columns {
+            return Err(SqlSurfaceError::payload_too_large(format!(
+                "GROUP BY column count {} exceeds limit {}",
+                agg.keys.len(),
+                limits.max_group_by_columns
+            )));
+        }
+    }
 
     let mut budget = JoinBudget::new(limits.budget_cap);
 
@@ -664,8 +684,15 @@ mod tests {
         schemas.insert("r".to_string(), schema("r"));
         let udfs = UdfRegistry::default();
 
-        let result = execute(&read_txn, &ctx, &schemas, &validated, &udfs)
-            .expect("small rows must fit the default budget");
+        let result = execute(
+            &read_txn,
+            &ctx,
+            &schemas,
+            &validated,
+            &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect("small rows must fit the default budget");
         assert_eq!(result.rows.len(), 1);
     }
 
@@ -798,8 +825,15 @@ mod tests {
         schemas.insert("r".to_string(), right_schema);
         let udfs = UdfRegistry::default();
 
-        let result = execute(&read_txn, &ctx, &schemas, &validated, &udfs)
-            .expect("join on real id/xx columns should succeed");
+        let result = execute(
+            &read_txn,
+            &ctx,
+            &schemas,
+            &validated,
+            &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect("join on real id/xx columns should succeed");
         assert_eq!(
             result.rows.len(),
             1,
@@ -944,8 +978,15 @@ mod tests {
         schemas.insert("r".to_string(), schema("r"));
         let udfs = UdfRegistry::default();
 
-        let result = execute(&read_txn, &ctx, &schemas, &validated, &udfs)
-            .expect("LEFT JOIN with a predicate on the missing side should succeed");
+        let result = execute(
+            &read_txn,
+            &ctx,
+            &schemas,
+            &validated,
+            &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect("LEFT JOIN with a predicate on the missing side should succeed");
         assert_eq!(
             result.rows.len(),
             1,
@@ -1066,7 +1107,15 @@ mod tests {
             ),
             JoinKind::Full,
         );
-        let result = execute(&read_txn, &ctx, &schemas, &validated, &udfs).expect("full join");
+        let result = execute(
+            &read_txn,
+            &ctx,
+            &schemas,
+            &validated,
+            &udfs,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect("full join");
         let rendered: Vec<String> = result
             .rows
             .iter()

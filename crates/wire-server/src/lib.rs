@@ -133,6 +133,7 @@ pub mod extended_query;
 #[cfg(feature = "fault-injection")]
 pub mod fault_injection;
 pub mod framing;
+pub mod group_by_limits_opt;
 pub mod handshake;
 pub mod hnsw_scope_opt;
 pub mod http;
