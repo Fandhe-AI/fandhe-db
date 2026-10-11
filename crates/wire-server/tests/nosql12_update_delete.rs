@@ -1132,3 +1132,80 @@ fn predicate_update_and_delete_with_new_operators_apply_and_reject_forms() {
         "{resp:?}"
     );
 }
+// --- NULL を含む SET の表層またぎ再送（Issue #1525・SQL-41・RECOVER-10） -------
+//
+// NULL 列も content_hash の列数・本体に含める契約のため、SQL の `SET n = NULL` と
+// NoSQL の `{"set":{"n":null}}` は同一 hash になって `23505`、NULL 列を含まない別の
+// set は `22023` に倒れる。TEXT／ENUM 列の JSON null は NoSQL では拒否されるので、
+// BIGINT 列 `n` を持つ専用スキーマを使う。
+
+fn new_core_with_n() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("nosql12-update-null-n");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(3), false),
+            ColumnDef::new("lang", ColumnType::Text, true),
+            ColumnDef::new("n", ColumnType::BigInt, true),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+fn update_null_body(op_id: &str) -> Vec<u8> {
+    format!(
+        r#"{{"op":"update","table":"docs","set":{{"n":null}},"where":{{"id":1}},"operation_id":"{op_id}"}}"#
+    )
+    .into_bytes()
+}
+
+#[test]
+fn cross_surface_set_null_resend_sql_then_nosql() {
+    let (core, _guard) = new_core_with_n();
+    let (both, mut sql) = spawn_both(core);
+    query(&both, &insert_body(1, "ja", "n12-seed-null1"));
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET n = NULL WHERE id = 1 USING OPERATION_ID 'n12-null1'",
+    );
+    let tag = common::read_command_complete(&mut sql);
+    assert_eq!(tag, "UPDATE 1");
+    common::read_ready_for_query(&mut sql);
+
+    // 同一内容（NULL 込み）は適用済み。
+    let resp = query(&both, &update_null_body("n12-null1"));
+    assert_eq!(resp.status, 409, "resp={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23505");
+
+    // NULL 列を含まない別の set は内容違い。
+    let other = br#"{"op":"update","table":"docs","set":{"lang":"en"},"where":{"id":1},"operation_id":"n12-null1"}"#;
+    let resp = query(&both, other);
+    assert_eq!(http_common::wire_code_of(&resp), "22023", "resp={resp:?}");
+}
+
+#[test]
+fn cross_surface_set_null_resend_nosql_then_sql() {
+    let (core, _guard) = new_core_with_n();
+    let (both, mut sql) = spawn_both(core);
+    query(&both, &insert_body(1, "ja", "n12-seed-null2"));
+    let resp = query(&both, &update_null_body("n12-null2"));
+    assert_eq!(resp.status, 200, "resp={resp:?}");
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET n = NULL WHERE id = 1 USING OPERATION_ID 'n12-null2'",
+    );
+    common::expect_error_response_with_sqlstate(&mut sql, "23505");
+    common::read_ready_for_query(&mut sql);
+
+    common::send_simple_query(
+        &mut sql,
+        "UPDATE docs SET n = 5 WHERE id = 1 USING OPERATION_ID 'n12-null2'",
+    );
+    common::expect_error_response_with_sqlstate(&mut sql, "22023");
+    common::read_ready_for_query(&mut sql);
+}
