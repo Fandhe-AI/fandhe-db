@@ -59,6 +59,18 @@ impl BoundOrGroup {
         Self { branches }
     }
 
+    /// 行や列に依らず常に真になる群か（SQL-41・Issue #1526）。空の分岐（`OR TRUE`
+    /// の畳み込み結果）を 1 つでも持てば真。分岐 0 個の群（`FALSE`）は恒偽なので偽。
+    /// `sql::parser` の述語形 UPDATE／DELETE が「恒真＝無条件 DML」を拒否するために
+    /// 呼ぶ。再帰の深さは構文段の `MAX_WHERE_GROUP_DEPTH` で有界。
+    pub(crate) fn is_trivially_true(&self) -> bool {
+        self.branches.iter().any(|b| {
+            b.metadata_filters.is_empty()
+                && b.expr_filters.is_empty()
+                && b.or_groups.iter().all(BoundOrGroup::is_trivially_true)
+        })
+    }
+
     /// `row_codec::scan_scalar_columns`（またはマスク版）が返した `scanned` と
     /// 行コンテキスト（`id`・`embedding`・`dim`）に対して本 OR 群を評価する。
     /// `scratch` は呼び出し元が行ループの外で 1 回だけ確保したスクラッチ
@@ -481,5 +493,22 @@ mod tests {
         assert_eq!(folded_values(&ok).map(|v| v.len()), Some(256));
         let over = BoundOrGroup::new(vec![in_text(0, &refs), eq(0, "zzz"), eq(0, "yyy")]);
         assert!(over.as_same_column_text_in().is_none());
+    }
+
+    /// Issue #1526・SQL-41: 恒真判定は空分岐の有無で決まり、分岐 0 個（恒偽）は偽。
+    #[test]
+    fn trivially_true_detection() {
+        let empty = || BoundConjunction::new(vec![], vec![], vec![]);
+        assert!(BoundOrGroup::new(vec![eq(0, "a"), empty()]).is_trivially_true());
+        assert!(!BoundOrGroup::new(vec![]).is_trivially_true());
+        assert!(!BoundOrGroup::new(vec![eq(0, "a"), eq(0, "b")]).is_trivially_true());
+        let nested = BoundConjunction::new(
+            vec![],
+            vec![],
+            vec![BoundOrGroup::new(vec![eq(0, "a"), empty()])],
+        );
+        assert!(BoundOrGroup::new(vec![nested]).is_trivially_true());
+        let nested_false = BoundConjunction::new(vec![], vec![], vec![BoundOrGroup::new(vec![])]);
+        assert!(!BoundOrGroup::new(vec![nested_false]).is_trivially_true());
     }
 }

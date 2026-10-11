@@ -16,6 +16,7 @@
 //!
 //! | 入力 | 結果 |
 //! | ---- | ---- |
+//! | 空の連言（恒真。`TRUE` 畳み込み） | `[Or([])]`（恒偽。逆に `Or([])` の否定は空の連言） |
 //! | 連言 `[p]` | `¬p` |
 //! | 連言 `[p1..pn]`（n≥2） | `[Or([¬p1], ..., [¬pn])]` |
 //! | `Or(branches)` | 各分岐の否定を連結（AND） |
@@ -77,10 +78,10 @@ pub(crate) fn negate_conjunction(
     budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
     let mut iter = preds.into_iter();
+    // 空の連言は恒真（`WHERE TRUE` の畳み込み結果。SQL-41・Issue #1526）。定数は
+    // NULL にならないため、その否定は恒偽（分岐 0 個の `Or`）で三値論理でも厳密。
     let Some(first) = iter.next() else {
-        return Err(SqlSurfaceError::unsupported(
-            "NOT must be followed by a predicate",
-        ));
+        return Ok(vec![WherePredicate::Or(Vec::new())]);
     };
     let Some(second) = iter.next() else {
         return negate_one(first, budget);
@@ -318,5 +319,14 @@ mod tests {
             assert_eq!(negate_conjunction(vec![p(a)], &mut b).unwrap(), vec![p(n)]);
             assert_eq!(negate_conjunction(vec![p(n)], &mut b).unwrap(), vec![p(a)]);
         }
+    }
+
+    /// Issue #1526・SQL-41: 空の連言（恒真）の否定は恒偽、逆も成り立つ。
+    #[test]
+    fn empty_conjunction_negates_to_false_and_back() {
+        let mut b = 100;
+        let falsum = vec![WherePredicate::Or(Vec::new())];
+        assert_eq!(negate_conjunction(vec![], &mut b).unwrap(), falsum);
+        assert_eq!(negate_conjunction(falsum, &mut b).unwrap(), vec![]);
     }
 }

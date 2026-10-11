@@ -2446,7 +2446,15 @@ pub fn bind_predicate_delete(
     // `42601` で拒否する。台帳照合・書き込みトランザクション開始より前の束縛段
     // なので副作用ゼロ。`or_filters` を含めるのは `WHERE a OR b` を誤拒否しない
     // ため（Issue #912）。
-    if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
+    // Issue #1526・SQL-41: `TRUE` 畳み込みで恒真になる形（`WHERE TRUE`・
+    // `... OR TRUE` 等）も無条件 DML と同じく拒否する（fail-closed。`FALSE` は恒偽で
+    // 0 行影響のため受理する）。
+    if metadata_filters.is_empty()
+        && expr_filters.is_empty()
+        && or_filters
+            .iter()
+            .all(crate::sql::where_tree::BoundOrGroup::is_trivially_true)
+    {
         return Err(SqlSurfaceError::unsupported(
             "predicate-form DELETE WHERE clause must contain at least one non-visible() predicate (unconditional DELETE is not supported; use TRUNCATE for whole-table operations)",
         ));
@@ -3809,7 +3817,15 @@ pub(crate) fn bind_predicate_update(
     // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
     // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
     // 回帰になるため、判定漏れとして修正する）。
-    if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
+    // Issue #1526・SQL-41: `TRUE` 畳み込みで恒真になる形（`WHERE TRUE`・
+    // `... OR TRUE` 等）も無条件 DML と同じく拒否する（fail-closed。`FALSE` は恒偽で
+    // 0 行影響のため受理する）。
+    if metadata_filters.is_empty()
+        && expr_filters.is_empty()
+        && or_filters
+            .iter()
+            .all(crate::sql::where_tree::BoundOrGroup::is_trivially_true)
+    {
         return Err(SqlSurfaceError::unsupported(
             "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
         ));

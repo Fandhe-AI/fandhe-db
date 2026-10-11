@@ -4371,8 +4371,10 @@ impl<'a> Parser<'a> {
         leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let predicates: Vec<WherePredicate> = if let Some(leaf) =
-            self.try_parse_numeric_list_leaf()?
+            self.try_parse_const_bool_leaf(extra_close_paren, set_operators)
         {
+            leaf
+        } else if let Some(leaf) = self.try_parse_numeric_list_leaf()? {
             leaf
         } else if let Some(leaf) =
             self.try_parse_structural_leaf(extra_close_paren, set_operators)?
@@ -4392,7 +4394,13 @@ impl<'a> Parser<'a> {
                     "NOT ( ... ) grouping is not supported",
                 ));
             }
-            if let Some(inner) = self.try_parse_numeric_list_leaf()? {
+            if let Some(inner) = self.try_parse_const_bool_leaf(extra_close_paren, set_operators) {
+                if negate_odd {
+                    negate_conjunction(inner, &mut self.expr_node_budget)?
+                } else {
+                    inner
+                }
+            } else if let Some(inner) = self.try_parse_numeric_list_leaf()? {
                 if negate_odd {
                     negate_conjunction(inner, &mut self.expr_node_budget)?
                 } else {
@@ -4465,6 +4473,47 @@ impl<'a> Parser<'a> {
             )));
         }
         Ok(predicates)
+    }
+
+    /// 述語の葉位置にある真偽リテラル `TRUE`／`FALSE` を定数として畳み込む
+    /// （SQL-41 のポインタ。Issue #1526）。`sql::parser` の WHERE 束縛へ渡る前の
+    /// 構文段で消し、`WherePredicate` に新 variant を足さない（網羅 match と
+    /// content hash の互換を保つ）。`TRUE` は述語なし（空の連言＝真）、`FALSE` は
+    /// 分岐 0 個の `Or`（恒偽。`sql::subquery` の EXISTS 解決と同じ表現）を返す。
+    /// 直後が述語境界トークンのときだけ消費する（`TRUE = x` 等は従来経路へ流す）。
+    /// CHECK 本体では常に `None`（従来どおり BOOLEAN 列の裸参照として扱う）。
+    /// 先読みは 1 トークンで後戻りしない。
+    fn try_parse_const_bool_leaf(
+        &mut self,
+        extra_close_paren: bool,
+        set_operators: bool,
+    ) -> Option<Vec<WherePredicate>> {
+        if self.in_check_body {
+            return None;
+        }
+        let Some(Token::Ident(w)) = self.peek() else {
+            return None;
+        };
+        let value = if w.eq_ignore_ascii_case("TRUE") {
+            true
+        } else if w.eq_ignore_ascii_case("FALSE") {
+            false
+        } else {
+            return None;
+        };
+        if !is_where_predicate_boundary_token(
+            self.tokens.get(self.pos.saturating_add(1)),
+            extra_close_paren,
+            set_operators,
+        ) {
+            return None;
+        }
+        self.advance();
+        Some(if value {
+            Vec::new()
+        } else {
+            vec![WherePredicate::Or(Vec::new())]
+        })
     }
 
     /// `<値式> <比較演算子> <値式>`（式述語。頂点は必ず比較の [`Expr::Binary`]）。
@@ -12801,6 +12850,38 @@ mod tests {
         where_predicates_of(&format!(
             "SELECT * FROM documents WHERE {cond} ORDER BY embedding <=> '[0.1]' LIMIT 5"
         ))
+    }
+
+    /// Issue #1526・SQL-41: 真偽リテラルは構文段で定数へ畳まれる（TRUE＝述語なし、
+    /// FALSE＝分岐 0 個の `Or`）。兄弟の述語は削らない（列検証を省略しない）。
+    #[test]
+    fn bool_literal_leaf_folds_to_constants() {
+        let eq = WherePredicate::Equality {
+            column: "lang".to_string(),
+            value: "x".to_string(),
+        };
+        let falsum = WherePredicate::Or(Vec::new());
+        assert_eq!(where_of("TRUE"), Vec::<WherePredicate>::new());
+        assert_eq!(where_of("False"), vec![falsum.clone()]);
+        assert_eq!(where_of("lang = 'x' AND TRUE"), vec![eq.clone()]);
+        assert_eq!(
+            where_of("lang = 'x' AND FALSE"),
+            vec![eq.clone(), falsum.clone()]
+        );
+        assert_eq!(
+            where_of("lang = 'x' OR TRUE"),
+            vec![WherePredicate::Or(vec![vec![eq.clone()], vec![]])]
+        );
+        assert_eq!(where_of("NOT TRUE"), vec![falsum.clone()]);
+        assert_eq!(where_of("NOT FALSE"), Vec::<WherePredicate>::new());
+        assert_eq!(where_of("NOT NOT TRUE"), Vec::<WherePredicate>::new());
+        assert_eq!(where_of("NOT (TRUE)"), vec![falsum.clone()]);
+        assert_eq!(where_of("(TRUE)"), Vec::<WherePredicate>::new());
+        // 兄弟は削らない: ¬(a ∨ ⊤) = ¬a ∧ ⊥。
+        assert_eq!(
+            where_of("NOT (lang = 'x' OR TRUE)"),
+            vec![WherePredicate::Not(Box::new(eq)), falsum]
+        );
     }
 
     /// Issue #1184: `NOT ( ... )` は De Morgan で葉まで押し下げられ、`Not` が
