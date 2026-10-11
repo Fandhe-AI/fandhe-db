@@ -144,3 +144,21 @@ fn ddl_permission_gate_precedes_alias_resolution() {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "42501", "{sql}");
     }
 }
+
+#[test]
+fn create_type_rejects_names_that_alias_builtin_column_types() {
+    let (path, _g, core) = open("ta-enum-collision");
+    let mut s = allowed();
+    for name in ["int4", "INT8", "Float4", "float8"] {
+        let sql = format!("CREATE TYPE {name} AS ENUM ('a')");
+        let _ = err(&core, &mut s, &sql);
+    }
+    drop(core);
+    let storage = Storage::open(&path).expect("reopen");
+    for name in ["int4", "int8", "float4", "float8"] {
+        assert!(
+            storage.get_enum_type(name).is_err(),
+            "enum type {name} must not be created"
+        );
+    }
+}
