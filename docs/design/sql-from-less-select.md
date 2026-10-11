@@ -1,7 +1,7 @@
 # FROM なし SELECT（定数式 SELECT）
 
 - 対象: SQL-43（ポインタ表記のみ）・Issue #1531（親 #1530。wire 層の確認は #1532）
-- 状態: engine 実装済み
+- 状態: engine 実装済み・wire（simple／extended）確認済み（Issue #1532）
 
 ## 背景
 
@@ -29,4 +29,18 @@
 ## 対象外（後続）
 
 `FROM` なしの `WHERE`／`LIMIT`／`HAVING`、`$n` パラメータ、裸の `NULL`／`TRUE`／`FALSE`、
-`AS` なし別名、整数同士の算術を整数型で返すこと、wire 層の確認（#1532）。
+`AS` なし別名、整数同士の算術を整数型で返すこと。
+
+## wire 層の確認（Issue #1532）
+
+wire-server は汎用経路のまま ConstSelect を通し、本番コードの変更は不要だった。
+`crates/wire-server/tests/wire_sql43_from_less_select.rs`（層 A）で固定している。
+
+| 項目 | 確認内容 |
+| ---- | -------- |
+| simple | `SELECT 1` は `?column?`・OID 23・typlen 4・text `1`・タグ `SELECT 1`。複数文・明示トランザクション（ReadyForQuery `T`）も通る |
+| extended | Parse → Describe(S) → Sync と Bind（全列 binary）→ Describe(P) → Execute → Sync を確認。binary は int4 の 4 バイト。無名 statement の text 結果も通る |
+| Describe 整合 | statement／portal／simple の列名・OID・typlen が一致（portal は format 欄のみ 1） |
+| 拒否 | `SELECT *`・列参照・`SELECT $1` は `42601`。extended は Sync で回復する |
+
+`SELECT $1` を `42P18` で返すかは、ERR-6 への行追加が前提のためオーナー判断待ち（現状は既存の `42601` を維持）。
