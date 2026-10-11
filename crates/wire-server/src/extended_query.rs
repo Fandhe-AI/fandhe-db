@@ -499,7 +499,7 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
         PreparedParamType::Column(meta) => match meta {
             // `id` は宣言 0（実効 1700=NUMERIC）をバイナリ非対応とする。
             ColumnMeta::Id => int_kind(effective_oid),
-            ColumnMeta::Computed { .. } => BinaryParam::Unsupported,
+            ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
                 ColumnType::Text | ColumnType::Varchar => text_like(),
                 ColumnType::Integer | ColumnType::BigInt => int_kind(effective_oid),

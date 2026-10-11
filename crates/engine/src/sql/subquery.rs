@@ -1015,7 +1015,7 @@ fn family_of_type(ty: &ColumnType) -> Option<SubqueryValueFamily> {
 /// 束縛時に確定した静的型（Issue #1173）があればそれ、無ければ `None`。
 fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
     match meta {
-        ColumnMeta::Id => Some(SubqueryValueFamily::Integer),
+        ColumnMeta::Id | ColumnMeta::AliasedId { .. } => Some(SubqueryValueFamily::Integer),
         ColumnMeta::Scalar { ty, .. } => family_of_type(ty),
         ColumnMeta::Computed { ty: Some(ty), .. } => family_of_type(ty),
         ColumnMeta::Computed { ty: None, .. } => None,
@@ -1525,13 +1525,9 @@ fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnM
             name: alias.clone(),
             ty: ty.clone(),
         },
-        (ColumnMeta::Id, Some(alias)) => ColumnMeta::Computed {
-            name: alias.clone(),
-            ty: Some(crate::catalog::ColumnType::Numeric {
-                precision: 20,
-                scale: 0,
-            }),
-        },
+        (ColumnMeta::Id | ColumnMeta::AliasedId { .. }, Some(alias)) => {
+            crate::sql::exec::aliased_id_column_meta(alias)
+        }
     }
 }
 

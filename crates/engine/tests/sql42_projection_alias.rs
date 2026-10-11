@@ -54,7 +54,9 @@ fn col_names(r: &QueryResult) -> Vec<String> {
         .iter()
         .map(|c| match c {
             ColumnMeta::Id => "id".to_string(),
-            ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name.clone(),
+            ColumnMeta::Scalar { name, .. }
+            | ColumnMeta::Computed { name, .. }
+            | ColumnMeta::AliasedId { name } => name.clone(),
         })
         .collect()
 }
@@ -103,7 +105,7 @@ fn id_alias_and_expr_alias_mix() {
     let (core, ctx, _g) = setup();
     let r = run(&core, &ctx, "SELECT id AS i, n+1 AS m FROM t LIMIT 10");
     assert_eq!(col_names(&r), vec!["i", "m"]);
-    assert!(matches!(r.columns[0], ColumnMeta::Computed { .. }));
+    assert!(matches!(r.columns[0], ColumnMeta::AliasedId { .. }));
     let mut rows: Vec<_> = r.rows.iter().collect();
     rows.sort_by_key(|row| row.id);
     let n = [3i64, 1, 2];
@@ -371,4 +373,36 @@ fn aliased_columns_inside_subqueries() {
             other => panic!("{aliased}: divergent outcomes {other:?}"),
         }
     }
+}
+
+/// 別名付き疑似列 `id` を内側投影にしても、別名なしと同じ整数族として `IN`・スカラー比較が
+/// 通る（codex-review P1 指摘対応。別名で値や型の扱いを変えない）。
+#[test]
+fn aliased_id_keeps_integer_family_in_subqueries() {
+    let (core, ctx, _g) = setup();
+    let plain_in = run(
+        &core,
+        &ctx,
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE n = 1 LIMIT 10) LIMIT 10",
+    );
+    let aliased_in = run(
+        &core,
+        &ctx,
+        "SELECT id FROM t WHERE id IN (SELECT id AS i FROM t WHERE n = 1 LIMIT 10) LIMIT 10",
+    );
+    assert_eq!(ids(&aliased_in), ids(&plain_in));
+    assert_eq!(ids(&aliased_in), vec![2]);
+
+    let plain_eq = run(
+        &core,
+        &ctx,
+        "SELECT id FROM t WHERE id = (SELECT id FROM t WHERE n = 1 LIMIT 10) LIMIT 10",
+    );
+    let aliased_eq = run(
+        &core,
+        &ctx,
+        "SELECT id FROM t WHERE id = (SELECT id AS i FROM t WHERE n = 1 LIMIT 10) LIMIT 10",
+    );
+    assert_eq!(ids(&aliased_eq), ids(&plain_eq));
+    assert_eq!(ids(&aliased_eq), vec![2]);
 }

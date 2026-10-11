@@ -246,6 +246,12 @@ pub enum Cell {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnMeta {
     Id,
+    /// 別名付き疑似列 `id`（Issue #1540・SQL-42 の査読対応）。wire 上の型は `Id` と同じ
+    /// numeric で公告するが、サブクエリの値族判定では別名なしの `Id` と同じ整数族として
+    /// 扱うため、`Computed { Numeric }` とは別 variant で由来を保持する。
+    AliasedId {
+        name: String,
+    },
     Scalar {
         name: String,
         ty: ColumnType,
@@ -276,17 +282,19 @@ pub(crate) fn computed_column_meta(name: &str, result_ty: &Option<ColumnType>) -
     }
 }
 
+/// [`ColumnMeta::AliasedId`] が wire 上・型比較で公告する静的型（疑似列 `id` と同じ numeric）。
+pub(crate) static ALIASED_ID_TYPE: ColumnType = ColumnType::Numeric {
+    precision: 20,
+    scale: 0,
+};
+
 /// 別名付き疑似列 `id`（`ProjectedColumn::AliasedId`。Issue #1540・SQL-42）の結果列メタ。
-/// `ColumnMeta::Id` は名前を持てないため、numeric 静的型の `Computed` に載せ替えて別名を
-/// 公告する（wire 上の型 OID は `Id` と同じ numeric。JOIN 経路の `meta_with_alias` と
-/// 同じ写像。通常 SELECT・スキャン・Describe が共有する）。
+/// `ColumnMeta::Id` は名前を持てないため、専用の [`ColumnMeta::AliasedId`] で別名を公告する
+/// （wire 上の型 OID は `Id` と同じ numeric。サブクエリの値族判定では整数族を維持する。
+/// JOIN 経路の `meta_with_alias` と同じ写像。通常 SELECT・スキャン・Describe が共有する）。
 pub(crate) fn aliased_id_column_meta(name: &str) -> ColumnMeta {
-    ColumnMeta::Computed {
+    ColumnMeta::AliasedId {
         name: name.to_string(),
-        ty: Some(ColumnType::Numeric {
-            precision: 20,
-            scale: 0,
-        }),
     }
 }
 

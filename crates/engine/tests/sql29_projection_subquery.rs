@@ -76,7 +76,9 @@ fn code(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> String {
 fn col_name(meta: &ColumnMeta) -> String {
     match meta {
         ColumnMeta::Id => "id".to_string(),
-        ColumnMeta::Scalar { name, .. } | ColumnMeta::Computed { name, .. } => name.clone(),
+        ColumnMeta::Scalar { name, .. }
+        | ColumnMeta::Computed { name, .. }
+        | ColumnMeta::AliasedId { name } => name.clone(),
     }
 }
 
@@ -521,12 +523,8 @@ fn projection_subquery_alias_of_id_keeps_numeric_type() {
     let r = run(&core, &ctx, &q);
     assert_eq!(
         r.columns[1],
-        ColumnMeta::Computed {
+        ColumnMeta::AliasedId {
             name: "ref_id".to_string(),
-            ty: Some(ColumnType::Numeric {
-                precision: 20,
-                scale: 0
-            }),
         }
     );
 }
