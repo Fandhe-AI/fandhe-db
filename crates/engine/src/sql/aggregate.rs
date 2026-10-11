@@ -1,6 +1,6 @@
 //! 集計 SELECT（`GROUP BY` なし・単一行結果、TASK-166・SQL-13）の実行本体。
 //! `GROUP BY` ありの複数行実行は [`crate::sql::group_by::execute_grouped_aggregate`]
-//! （TASK-167・SQL-14）が担い、[`execute_aggregate_with_cache`] は
+//! （TASK-167・SQL-14）が担い、[`execute_aggregate_with_group_limits`] は
 //! `BoundAggregate::group_by` の有無で振り分けるだけの薄い分岐を持つ。
 //! [`execute_aggregate`] は engine クレート外向けの公開ラッパー（TASK-186・
 //! NOSQL-4・NOSQL-5）で `execute_aggregate_with_cache` へキャッシュ `None` で
@@ -414,7 +414,7 @@ pub(crate) fn select_decode_tier(
 }
 
 /// `EXPLAIN`（Issue #922・SQL-27）の集計文向け `scalar_plan`／`access_path` を
-/// 決定する。executor（本ファイルの [`execute_aggregate_with_cache`]・
+/// 決定する。executor（本ファイルの [`execute_aggregate_with_group_limits`]・
 /// [`crate::sql::group_by::execute_grouped_aggregate`]）の実行時ゲートと
 /// **同じ判定式**（[`select_decode_tier`]・
 /// [`crate::sql::scalar_plan::classify_scalar_plan`]・[`crate::sql::
@@ -1868,7 +1868,7 @@ pub(crate) fn storage_internal(e: impl Into<StorageError>) -> SqlSurfaceError {
 /// いずれも `pub(crate)` のため crate 外から構築不能で、本関数はすべてに `None`
 /// を渡しキャッシュ最適化を経由しない新規走査のみの経路として動作する）。crate
 /// 内部のキャッシュ経路（`core.rs::EngineCore::execute_sql_in_session` の
-/// `Statement::Aggregate` アーム）は引き続き [`execute_aggregate_with_cache`] を
+/// `Statement::Aggregate` アーム）は引き続き [`execute_aggregate_with_group_limits`] を
 /// 直接呼ぶ。
 pub fn execute_aggregate(
     read_txn: &impl crate::storage::read_source::ReadSource,
@@ -1876,7 +1876,7 @@ pub fn execute_aggregate(
     schema: &TableSchema,
     bound: &BoundAggregate,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    execute_aggregate_with_cache(
+    execute_aggregate_with_group_limits(
         read_txn,
         ctx,
         schema,
@@ -1885,6 +1885,34 @@ pub fn execute_aggregate(
         None,
         None,
         None,
+        crate::group_by_limits::GroupByLimits::default(),
+    )
+}
+
+/// [`execute_aggregate_with_group_limits`] を `GROUP BY` 上限の既定値（ハード上限＝現行挙動）で
+/// 呼ぶテスト用ラッパー（Issue #1550。生産経路は設定値を渡す本体を直接呼ぶ）。
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_aggregate_with_cache(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundAggregate,
+    max_result_bytes: usize,
+    visible_cache: Option<crate::sql::visible_cache::VisibleCacheAccess<'_>>,
+    arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
+    scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+) -> Result<QueryResult, SqlSurfaceError> {
+    execute_aggregate_with_group_limits(
+        read_txn,
+        ctx,
+        schema,
+        bound,
+        max_result_bytes,
+        visible_cache,
+        arena_cache,
+        scalar_cache,
+        crate::group_by_limits::GroupByLimits::default(),
     )
 }
 
@@ -1908,7 +1936,7 @@ pub fn execute_aggregate(
 /// への分岐）・`DimAndScalar`/`Embedding` tier はこのキャッシュの対象外
 /// （詳細・スコープ判断は `docs/design/visible-bitmap-cache.md` 参照）。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_aggregate_with_cache(
+pub(crate) fn execute_aggregate_with_group_limits(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
@@ -1932,6 +1960,9 @@ pub(crate) fn execute_aggregate_with_cache(
     // そのまま引き継ぐ（列挙形・候補走査形の判断はそちら側の責務）。
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
+    // Issue #1550: `GROUP BY` の列数・グループ数の起動時設定（`EngineCore` が保持）。
+    // `GROUP BY` ありの分岐でだけ [`crate::sql::group_by::execute_grouped_aggregate`] へ渡す。
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
     // Issue #1179）ではテーブル世代キーのキャッシュを一切使わない（未 commit の
@@ -1955,6 +1986,7 @@ pub(crate) fn execute_aggregate_with_cache(
             max_result_bytes,
             arena_cache,
             scalar_cache,
+            group_limits,
         );
     }
 
@@ -2581,7 +2613,7 @@ fn try_scalar_index_aggregate(
     arena_access: &crate::sql::arena_cache::ArenaCacheAccess<'_>,
     scalar_access: &crate::sql::scalar_index::ScalarCacheAccess<'_>,
     // PR #1049 レビュー指摘 P0 対応: [`observe_candidate_slots`] へそのまま渡す
-    // 結果バイト予算（[`execute_aggregate_with_cache`] ドキュメント参照）。
+    // 結果バイト予算（[`execute_aggregate_with_group_limits`] ドキュメント参照）。
     max_result_bytes: usize,
 ) -> Result<Option<QueryResult>, SqlSurfaceError> {
     // Cursor Bugbot Medium 指摘（PR #603）: キャッシュ照会・再利用ロジックを

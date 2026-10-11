@@ -1142,6 +1142,10 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_schema_limits`] のみ（起動時 1 回）。定義が増える DDL の
     /// 実行段（`sql::ddl`）にだけ効き、永続化済みデータの読み出しには効かない。
     schema_limits: crate::schema_limits::SchemaLimits,
+    /// `GROUP BY` の列数・グループ数の上限（Issue #1550）。差し替えは
+    /// [`Self::with_group_by_limits`] のみ（起動時 1 回）。集計の実行段
+    /// （単一表・集合演算枝・サブクエリ内側・ビュー外側・JOIN）にだけ効く。
+    group_by_limits: crate::group_by_limits::GroupByLimits,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -2046,6 +2050,7 @@ impl EngineCore {
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dml_limits: crate::sql::parser::DmlLimits::default(),
             schema_limits: crate::schema_limits::SchemaLimits::default(),
+            group_by_limits: crate::group_by_limits::GroupByLimits::default(),
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2268,6 +2273,20 @@ impl EngineCore {
     /// 現在のスキーマ定義系 3 上限（Issue #1548）。
     pub fn schema_limits(&self) -> crate::schema_limits::SchemaLimits {
         self.schema_limits
+    }
+
+    /// `GROUP BY` の列数・グループ数上限（[`crate::group_by_limits::GroupByLimits`]）を
+    /// 差し替えたビルダーを返す（Issue #1550）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-group-by-columns`・`--max-groups`）からのみ呼ぶ。未呼び出しなら
+    /// ハード上限と同値の既定（現行挙動）。
+    pub fn with_group_by_limits(mut self, limits: crate::group_by_limits::GroupByLimits) -> Self {
+        self.group_by_limits = limits;
+        self
+    }
+
+    /// 現在の `GROUP BY` 上限（Issue #1550）。
+    pub fn group_by_limits(&self) -> crate::group_by_limits::GroupByLimits {
+        self.group_by_limits
     }
 
     /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
@@ -5413,6 +5432,7 @@ impl EngineCore {
                     ctx,
                     &self.storage,
                     session.udfs(),
+                    self.group_by_limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -5439,6 +5459,7 @@ impl EngineCore {
                     ctx,
                     &self.storage,
                     session.udfs(),
+                    self.group_by_limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -5456,6 +5477,7 @@ impl EngineCore {
                     ctx,
                     &self.storage,
                     session.udfs(),
+                    self.group_by_limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -5477,14 +5499,21 @@ impl EngineCore {
                     &validated.tree,
                     session.udfs(),
                     validated.limit,
+                    self.group_by_limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             crate::sql::allowlist::Statement::Join(validated) => {
                 let table_names = crate::sql::join::collect_join_tables(&validated);
                 let schemas = table_schemas_in(read_txn, &table_names)?;
-                let result =
-                    crate::sql::join::execute(read_txn, ctx, &schemas, &validated, session.udfs())?;
+                let result = crate::sql::join::execute(
+                    read_txn,
+                    ctx,
+                    &schemas,
+                    &validated,
+                    session.udfs(),
+                    self.group_by_limits,
+                )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // Issue #1192（TABLE-18・RLS-10 (b)）: 評価後射影形ビュー。本文
@@ -5505,7 +5534,11 @@ impl EngineCore {
                             &validated,
                             session.udfs(),
                         )?;
-                        let processed = crate::sql::view_buffered::apply_outer(result, &plan)?;
+                        let processed = crate::sql::view_buffered::apply_outer(
+                            result,
+                            &plan,
+                            self.group_by_limits,
+                        )?;
                         Ok(crate::sql::SqlOutcome::Query(processed))
                     }
                     _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -5923,7 +5956,7 @@ impl EngineCore {
         bound: &crate::sql::parser::BoundAggregate,
         max_result_bytes: usize,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
-        crate::sql::aggregate::execute_aggregate_with_cache(
+        crate::sql::aggregate::execute_aggregate_with_group_limits(
             read_txn,
             ctx,
             schema,
@@ -5942,6 +5975,7 @@ impl EngineCore {
                 cache: &self.scalar_index_cache,
                 declarations_enabled: self.hnsw_state.is_some(),
             }),
+            self.group_by_limits,
         )
     }
 

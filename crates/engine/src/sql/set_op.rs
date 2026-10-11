@@ -461,10 +461,11 @@ fn eval_aggregate_branch(
     schema: &TableSchema,
     branch: &SetAggregateBranch,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut SetOpBudget,
 ) -> Result<EvalOutcome, SqlSurfaceError> {
     let bound = crate::sql::parser::bind_aggregate(&branch.0, schema, udfs)?;
-    let result = crate::sql::aggregate::execute_aggregate_with_cache(
+    let result = crate::sql::aggregate::execute_aggregate_with_group_limits(
         read_txn,
         ctx,
         schema,
@@ -473,6 +474,7 @@ fn eval_aggregate_branch(
         None,
         None,
         None,
+        group_limits,
     )?;
     if result.rows.len() > MAX_SET_OP_ROWS {
         return Err(SqlSurfaceError::payload_too_large(
@@ -554,6 +556,7 @@ fn eval_tree(
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
     udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
     budget: &mut SetOpBudget,
 ) -> Result<EvalOutcome, SqlSurfaceError> {
     match tree {
@@ -582,11 +585,11 @@ fn eval_tree(
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "schema missing for set operation branch table".to_string(),
                     })?;
-            eval_aggregate_branch(read_txn, ctx, schema, branch, udfs, budget)
+            eval_aggregate_branch(read_txn, ctx, schema, branch, udfs, group_limits, budget)
         }
         SetTree::Op { op, left, right } => {
-            let l = eval_tree(read_txn, ctx, schemas, left, udfs, budget)?;
-            let r = eval_tree(read_txn, ctx, schemas, right, udfs, budget)?;
+            let l = eval_tree(read_txn, ctx, schemas, left, udfs, group_limits, budget)?;
+            let r = eval_tree(read_txn, ctx, schemas, right, udfs, group_limits, budget)?;
 
             let rows = match op {
                 SetOperator::UnionAll => {
@@ -676,6 +679,8 @@ pub(crate) fn execute(
     tree: &SetTree,
     udfs: &UdfRegistry,
     limit: Option<u32>,
+    // Issue #1550: 集計形の枝へ渡す `GROUP BY` の列数・グループ数上限（`EngineCore` 保持）。
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     execute_with_budget(
         read_txn,
@@ -685,6 +690,7 @@ pub(crate) fn execute(
         udfs,
         limit,
         crate::arena::MAX_ARENA_TOTAL_BYTES,
+        group_limits,
     )
 }
 
@@ -693,6 +699,7 @@ pub(crate) fn execute(
 /// （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）を渡すだけの薄いラッパーで、
 /// 小さい上限を注入できる回帰テスト（本モジュール内の `tests`）専用に分離して
 /// いる（`sql::scan::execute_scan`／`execute_scan_with_budget` と同じ設計判断）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_budget(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -701,6 +708,7 @@ pub(crate) fn execute_with_budget(
     udfs: &UdfRegistry,
     limit: Option<u32>,
     budget_cap: usize,
+    group_limits: crate::group_by_limits::GroupByLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=MAX_SEARCH_K`）を
     // 全枝の走査・合成より前に行う（[`describe_columns`] と同じ検証を共有し、
@@ -718,7 +726,15 @@ pub(crate) fn execute_with_budget(
     // 行数・バイト上限エラー（`54000`）が `42804` に先行し得た。
     validate_tree_types(schemas, tree, udfs)?;
     let mut budget = SetOpBudget::new(budget_cap);
-    let outcome = eval_tree(read_txn, ctx, schemas, tree, udfs, &mut budget)?;
+    let outcome = eval_tree(
+        read_txn,
+        ctx,
+        schemas,
+        tree,
+        udfs,
+        group_limits,
+        &mut budget,
+    )?;
     // §2.4: 上限判定（`MAX_SET_OP_ROWS`）は全体 `LIMIT` による切り詰めより前に
     // 完結している（`eval_tree` が既に検証済み）。
     let rows = match validated_limit {
@@ -899,6 +915,7 @@ mod tests {
             &udfs,
             None,
             small_cap,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect_err("combined branch bytes must exceed the injected shared budget");
         assert_eq!(err.wire_code(), "54000");
@@ -938,6 +955,7 @@ mod tests {
             &udfs,
             None,
             generous_cap,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect("combined branch bytes must fit the generous injected budget");
         assert_eq!(result.rows.len(), 2);
@@ -984,6 +1002,7 @@ mod tests {
             &udfs,
             None,
             cap_without_row_key_room,
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect_err("row key generation must be charged against the shared budget");
         assert_eq!(err.wire_code(), "54000");
@@ -1006,8 +1025,16 @@ mod tests {
         let schemas: HashMap<String, TableSchema> = HashMap::new();
         let udfs = UdfRegistry::default();
 
-        let err = execute(&read_txn, &tenant_ctx, &schemas, &tree, &udfs, Some(0))
-            .expect_err("LIMIT 0 must be rejected before any branch is scanned");
+        let err = execute(
+            &read_txn,
+            &tenant_ctx,
+            &schemas,
+            &tree,
+            &udfs,
+            Some(0),
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect_err("LIMIT 0 must be rejected before any branch is scanned");
         assert_eq!(err.wire_code(), "22000");
 
         let err = execute(
@@ -1017,6 +1044,7 @@ mod tests {
             &tree,
             &udfs,
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
+            crate::group_by_limits::GroupByLimits::default(),
         )
         .expect_err("LIMIT over MAX_SEARCH_K must be rejected before any branch is scanned");
         assert_eq!(err.wire_code(), "22000");
@@ -1097,8 +1125,17 @@ mod tests {
         schemas.insert("b".to_string(), int_schema("b"));
         let udfs = UdfRegistry::default();
 
-        let err = execute_with_budget(&read_txn, &tenant_ctx, &schemas, &tree, &udfs, None, 0)
-            .expect_err("type mismatch must be rejected even with a zero-byte budget");
+        let err = execute_with_budget(
+            &read_txn,
+            &tenant_ctx,
+            &schemas,
+            &tree,
+            &udfs,
+            None,
+            0,
+            crate::group_by_limits::GroupByLimits::default(),
+        )
+        .expect_err("type mismatch must be rejected even with a zero-byte budget");
         assert_eq!(err.wire_code(), "42804");
     }
 
