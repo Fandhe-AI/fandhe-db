@@ -453,5 +453,5 @@ nosql13_ddl.rs`・`crates/wire-server/tests/err4_http_projection.rs` の
 - NoSQL `references` への `MATCH {SIMPLE|FULL}`・`[NOT] DEFERRABLE`・
   `INITIALLY {DEFERRED|IMMEDIATE}` の露出（Issue #1148 のスコープ外。
   `on_delete`／`on_update` の宣言自体は解消済み）
-- `UPDATE ... SET col = NULL`（SQL 表層に `NULL` リテラルの構文が無く、`MATCH FULL`
-  を `UPDATE` 経由で NULL 混在にする経路は現状テスト不能）
+- `UPDATE ... SET col = NULL` 経由の `MATCH FULL` 検証（SQL 表層の `NULL` リテラルは
+  Issue #1524 で受理済み。この経路での `MATCH FULL` テストは未追加）

@@ -19,8 +19,10 @@ ALTER TABLE <table> ADD COLUMN <column> <type>
   無視して照合する。
 - 列制約は `NOT NULL`・`DEFAULT <literal>` のみを順不同・各 1 回まで受理する（Issue #1169。
   `CREATE TABLE` と同じ `parse_column_constraints` を共有）。`UNIQUE`・`PRIMARY KEY`・
-  `CHECK`・`REFERENCES`・`DEFAULT NULL` は構文として受理しない（`42601`）。制約を持たない
-  追加列は従来どおり nullable（TABLE-5）。
+  `CHECK`・`REFERENCES` は構文として受理しない（`42601`）。`DEFAULT NULL` は既定値なしと
+  同義で受理する（Issue #1524・SQL-41。既存行の読み出し値は NULL）が、`NOT NULL DEFAULT NULL`
+  は既定値なしの `NOT NULL` と同じで `42601`。制約を持たない追加列は従来どおり nullable
+  （TABLE-5）。
 - 既存行は書き換えない（TABLE-5。O(1)・既存行のバイト列不変）。`DEFAULT` 付きで追加した列は、
   行バッファ末尾で欠落している既存行を読み出し時に既定値で補う
   （`row_codec::scan_scalar_columns_validated`。PostgreSQL の fast default 相当）。補完値は

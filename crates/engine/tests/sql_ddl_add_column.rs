@@ -461,7 +461,6 @@ fn malformed_syntax_variants_are_rejected_with_42601() {
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT, ADD COLUMN note2 TEXT"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT UNIQUE"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT PRIMARY KEY"),
-        format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT NULL"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT NOT NULL NOT NULL"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 'a' DEFAULT 'b'"),
         format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT DEFAULT 1"),
@@ -759,6 +758,27 @@ fn add_column(core: &EngineCore, decl: &str) -> Result<SqlOutcome, SqlSurfaceErr
         &mut session,
         &format!("ALTER TABLE {TABLE} ADD COLUMN {decl}"),
     )
+}
+
+/// `DEFAULT NULL` は既定値なしと同義で受理し、既存行の読み出し値は NULL
+/// （SQL-41・Issue #1524）。`NOT NULL DEFAULT NULL` は既定値なしの NOT NULL と同じ
+/// 扱いで行の有無にかかわらず `42601`（fail-closed）。
+#[test]
+fn default_null_is_accepted_as_no_default_and_not_null_default_null_is_rejected() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    insert_row(&core, &owner, 1, 1);
+
+    add_column(&core, "note TEXT DEFAULT NULL").expect("ADD COLUMN DEFAULT NULL");
+    assert!(matches!(
+        one_cell(&core, &owner, &format!("SELECT note FROM {TABLE} LIMIT 10")),
+        Cell::Null
+    ));
+
+    let err = add_column(&core, "note2 TEXT NOT NULL DEFAULT NULL").expect_err("rejected");
+    assert_eq!(err.wire_code(), "42601");
+    assert!(!column_exists(&core, &owner, TABLE, "note2"));
 }
 
 #[test]

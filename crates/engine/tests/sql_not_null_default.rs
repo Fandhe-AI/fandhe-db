@@ -326,22 +326,56 @@ fn default_on_vector_column_is_rejected() {
 }
 
 #[test]
-fn default_null_literal_is_rejected_as_a_syntax_error() {
-    // `DEFAULT NULL` は `expect_literal` が `NULL` トークンを受理しないため、
-    // 構造的に構文エラーになる（TABLE-16: 明示 NULL は DEFAULT の対象外）。
+fn default_null_literal_is_accepted_as_no_default() {
+    // `DEFAULT NULL` は既定値なしと同義として受理する（SQL-41・Issue #1524）。
     let (core, path) = new_core("not-null-default-default-null");
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
 
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT NULL, \
+         req TEXT NOT NULL DEFAULT NULL)",
+    )
+    .expect("DEFAULT NULL must be accepted");
+
+    // 列を省略した INSERT は NULL になる（nullable 列）。NOT NULL DEFAULT NULL の
+    // 列は既定値なしと同じなので省略すると 23502。
     let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, embedding) VALUES (1, '[0.1,0.2,0.3,0.4]') \
+             USING OPERATION_ID 'op-1'",
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "23502");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, req) VALUES (1, '[0.1,0.2,0.3,0.4]', 'r') \
+         USING OPERATION_ID 'op-2'",
+    )
+    .expect("omitting nullable DEFAULT NULL column");
+    let outcome = core
         .execute_sql_in_session(
             &alice,
             &mut session,
-            "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT NULL)",
+            "SELECT id FROM docs WHERE lang IS NULL LIMIT 10",
         )
-        .expect_err("DEFAULT NULL must be a syntax error");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("select ok");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected Query outcome");
+    };
+    assert_eq!(result.rows.len(), 1);
+
+    // VECTOR 列の `DEFAULT NULL` も既定値なしとして受理する（non-nullable のまま）。
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs2 (embedding VECTOR(4) DEFAULT NULL)",
+    )
+    .expect("VECTOR DEFAULT NULL is accepted as no default");
 }
 
 #[test]

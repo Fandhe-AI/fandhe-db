@@ -18,12 +18,24 @@ CREATE TABLE <table> (<col> TEXT [NOT NULL] [DEFAULT <literal>] | <col> VECTOR(<
   受理する。重複指定（`NOT NULL NOT NULL`・`DEFAULT` 2 回）は `42601`。
 - `<literal>` は共通のリテラルパーサー
   （`sql::allowlist::Parser::expect_literal`）をそのまま再利用する（第 2 の
-  リテラル文法を作らない）。`NULL` キーワードはこのパーサーが受理しないため、
-  `DEFAULT NULL` は構造的に `42601` になる（TABLE-16: 明示 `NULL` は
-  `DEFAULT` の対象外という契約と整合）。`INSERT ... VALUES` の要素だけは
-  専用ヘルパ `expect_insert_value` が `NULL` を先に処理してから
-  `expect_literal` へ委譲する（Issue #1523）ため、`expect_literal` 本体には
-  `NULL` 分岐を足さない。
+  リテラル文法を作らない）。`expect_literal` は大小無視の `NULL` を
+  `InsertLiteral::Null` として受理する単一の入口で、`INSERT ... VALUES` の要素
+  （Issue #1523）・`UPDATE ... SET`・`ON CONFLICT ... DO UPDATE SET`
+  （Issue #1524）・`DEFAULT` が共有する（SQL-41）。`DEFAULT NULL` は既定値の宣言
+  なしと同義とし、`parse_column_constraints` が `default: None` へ正規化する
+  （重複 `DEFAULT` の検出は専用フラグで行うため `DEFAULT NULL DEFAULT 'x'` も
+  `42601`）。したがって `NOT NULL DEFAULT NULL` の列は省略 INSERT で `23502`、
+  `VECTOR(N) DEFAULT NULL` は省略時と同じ扱い（non-nullable のまま）になる。
+  `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT NULL` は既定値なしの `NOT NULL` と
+  同じなので従来どおり `42601`（fail-closed）。`-NULL`／`+NULL` は `42601`。
+- `UPDATE ... SET col = NULL`（単一行形・述語形・分割実行）と
+  `DO UPDATE SET col = NULL` は束縛（`bind_set_assignments`／
+  `bind_upsert_assignments`）が nullable 列なら `Value::Null`、そうでなければ
+  `23502` に解決する。束縛はスキーマだけを見る判定で対象行の探索・RLS 可視性より
+  前に終わるため、`23502` は対象行の有無で分かれない。PostgreSQL は NOT NULL 検査を
+  行ごとに実行時に行い一致行 0 件なら `UPDATE 0` になるが、本実装は束縛時に拒否する
+  （NoSQL 表層と同じ既存契約。既知の差異）。分割実行も束縛が分割実行器より前の
+  ため、拒否時は chunk の部分 commit もジョブ登録も起きない。
 - `TEXT` 列: `DEFAULT` は文字列リテラルのみ受理する（数値・真偽値リテラルは
   型不一致として `42601`）。
 - `VECTOR` 列: `NOT NULL` の明示指定は受理するが冗長（元から
@@ -194,6 +206,11 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   既存行への読み出し時の `DEFAULT` 補完（TABLE-5・TABLE-16）。
 - `ALTER COLUMN SET/DROP DEFAULT`・`SET/DROP NOT NULL`。
 - （Issue #1523 で実装済み）SQL `VALUES` 内の `NULL` リテラル。
+- （Issue #1524 で実装済み）`UPDATE ... SET`・`DO UPDATE SET`・`DEFAULT` の `NULL`。
+  VECTOR 列への NULL（`SET` は `22000`・`DO UPDATE SET` は `23502` で不揃い）の整理と
+  nullable 化は TABLE-26（TASK-252）の範囲。
+- （Issue #1525 で実装済み）NULL を含む単一行 UPDATE の `content_hash`（NULL 列を
+  列数・本体に含める）。詳細は [update-single-row.md](update-single-row.md)。
 - SQL `VALUES` 内の `DEFAULT` キーワード（`INSERT INTO t (...) VALUES
   (DEFAULT, ...)` 形）。
 - NoSQL 表層の DDL op（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`FOREIGN KEY` は
