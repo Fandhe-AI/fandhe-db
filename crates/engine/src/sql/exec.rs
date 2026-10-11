@@ -5142,6 +5142,12 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::ReferentialActionLimitExceeded) => {
             SqlSurfaceError::payload_too_large("referential action limit exceeded")
         }
+        // ファイル形 INSERT の置換前走査が総走査行数上限（`--max-scanned-rows`。
+        // Issue #1549）を超えた場合。述語形 DML と同じ固定文言の `54000` へ写像する
+        // （設定値・他テナントの存在情報を含めない）。
+        IncrementalError::Write(TenantWriteError::TooManyRowsScanned { .. }) => {
+            SqlSurfaceError::payload_too_large("too many rows scanned")
+        }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),
         },

@@ -181,19 +181,27 @@ pub fn visible_rows(
     table: &str,
     ctx: &PolicyContext,
 ) -> Result<Vec<Row>, TenantError> {
-    visible_rows_with_scan_limit(storage, table, ctx, MAX_SCANNED_ROWS)
+    visible_rows_with_scan_limit(
+        storage,
+        table,
+        ctx,
+        crate::scan_limits::ScanLimits::default(),
+    )
 }
 
 /// [`visible_rows`] の総走査行数上限を呼び出し元が指定する版（Issue #1549）。
 /// `core.rs` の辞書スナップショット構築が `EngineCore::scan_limits`（起動時 CLI
-/// `--max-scanned-rows`）を渡す。`max_scanned_rows` は `scan_limits` の検証済み値
-/// （ハード上限 [`MAX_SCANNED_ROWS`] 以下）を想定し、それ以外の挙動は [`visible_rows`] と同一。
+/// `--max-scanned-rows`）を渡す。上限は [`crate::scan_limits::ScanLimits`] 型で受け、
+/// ハード上限 [`MAX_SCANNED_ROWS`] 以下であることを型で保証する（生の `usize` だと
+/// `usize::MAX` でハード上限を迂回できるため。設計 D1「下げる方向だけ」）。
+/// それ以外の挙動は [`visible_rows`] と同一。
 pub fn visible_rows_with_scan_limit(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
-    max_scanned_rows: usize,
+    scan_limits: crate::scan_limits::ScanLimits,
 ) -> Result<Vec<Row>, TenantError> {
+    let max_scanned_rows = scan_limits.max_scanned_rows();
     let mut out = Vec::new();
     // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
     // 再開位置を表現できず、テナントをまたぐ走査で行を取りこぼす。
@@ -4761,9 +4769,11 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     let raw = v.value();
                     scanned_count = scanned_count.saturating_add(1);
                     if scanned_count > max_scanned_rows {
-                        return Err(TenantWriteError::Storage(StorageError::Codec(format!(
-                            "too many rows scanned for replace: max {max_scanned_rows}"
-                        ))));
+                        // 置換前走査の上限超過は `Storage(Codec)`（`XX000` へ丸められる）
+                        // ではなく専用 variant で返し、SQL 表層で `54000` へ写像させる。
+                        return Err(TenantWriteError::TooManyRowsScanned {
+                            max: max_scanned_rows,
+                        });
                     }
                     // embedding は比較に不要なため、metadata（スカラー列ペイロード）のみを
                     // 借用で取り出す（`decode_row` は行ごとに `Vec<f32>` を確保するため、
@@ -5133,8 +5143,14 @@ mod tests {
 
         // Issue #1549: 走査行数上限を呼び出し元が指定できる。総走査 3 行（全テナント）に
         // 対し、上限ちょうど（3）は成功し、下回る（2）は設定値入りで拒否される。
-        assert!(visible_rows_with_scan_limit(&storage, "docs", &ctx, 3).is_ok());
-        match visible_rows_with_scan_limit(&storage, "docs", &ctx, 2) {
+        use crate::scan_limits::ScanLimits;
+        assert!(visible_rows_with_scan_limit(&storage, "docs", &ctx, ScanLimits::new(3)).is_ok());
+        // 範囲外（usize::MAX）はハード上限へ飽和し、ハード上限を迂回できない。
+        assert_eq!(
+            ScanLimits::new(usize::MAX).max_scanned_rows(),
+            MAX_SCANNED_ROWS
+        );
+        match visible_rows_with_scan_limit(&storage, "docs", &ctx, ScanLimits::new(2)) {
             Err(TenantError::TooManyRowsScanned { max }) => assert_eq!(max, 2),
             other => panic!("expected TooManyRowsScanned, got {other:?}"),
         }

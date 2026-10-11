@@ -190,3 +190,47 @@ fn other_tenant_rows_do_not_count_toward_the_limit() {
     run(&core, &alice, &update_sql("op-tenant-u")).expect("alice update within limit");
     assert_eq!(count_star(&core, &bob), (N * 3) as u64);
 }
+/// ファイル形 INSERT の置換前走査が上限を超えた場合も、述語形 DML と同じ固定文言の
+/// `54000` になる（`XX000` へ丸められない。codex-review P1 指摘・PR #2316）。
+/// 上限 1 で自テナント行が 2 件ある状態の 3 件目の投入が再現条件。
+#[test]
+fn file_insert_replace_scan_over_limit_is_54000() {
+    use engine::chunking::ChunkingConfig;
+    use engine::embedding::HashingEmbedder;
+    use engine::incremental::IncrementalConfig;
+
+    let path = unique_db_path("scan-limits-file-insert");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(16).expect("valid dim")))
+        .with_incremental_config(IncrementalConfig {
+            chunking: ChunkingConfig {
+                lines_per_chunk: 10,
+                max_markdown_section_chars: None,
+            },
+            ..IncrementalConfig::default()
+        })
+        .with_scan_limits(ScanLimits::new(1));
+    let alice = ctx_for("alice");
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    core.execute_sql_in_session(
+        &alice,
+        &mut ddl,
+        "CREATE TABLE docs (embedding VECTOR(16), path TEXT, body TEXT)",
+    )
+    .expect("create table");
+    let insert = |p: &str, op: &str| {
+        core.execute_insert_sql(
+            &alice,
+            &format!(
+                "INSERT INTO docs (path, body) VALUES ('{p}', 'hello') USING OPERATION_ID '{op}'"
+            ),
+        )
+    };
+    insert("a.md", "op-a").expect("first file: scans 0 rows");
+    insert("b.md", "op-b").expect("second file: scans 1 row (== limit)");
+    let err = insert("c.md", "op-c").expect_err("third file: scans 2 rows (> limit)");
+    assert_eq!(err.wire_code(), "54000");
+}

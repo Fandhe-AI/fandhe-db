@@ -2474,7 +2474,7 @@ impl EngineCore {
                 &self.storage,
                 table,
                 ctx,
-                self.scan_limits.max_scanned_rows(),
+                self.scan_limits,
             )
             .map_err(|e| match e {
                 crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
