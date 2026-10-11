@@ -479,3 +479,43 @@ fn sql41_view_roundtrip_keeps_quoted_bool_word_column_predicate() {
     let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
     assert_eq!(ids, vec![1]);
 }
+
+/// PR #2297 指摘（互換性）: 旧版が列参照 `"true"` を未引用の `WHERE true` で永続化したビューは、
+/// 現行版の参照時再解析でも恒真化せず列述語のまま（`"true"` が真の行だけが残る）。
+/// 旧保存形式は公開 API の `Storage::create_view` で直接再現する。
+#[test]
+fn sql41_legacy_stored_view_body_keeps_bare_true_as_column_predicate() {
+    let path = unique_db_path("sql41-legacy-bool-view");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage
+        .create_table(&TableSchema::new(
+            "vdocs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("true", ColumnType::Boolean, true),
+            ],
+        ))
+        .expect("create table");
+    storage
+        .create_view("vv", "vdocs", "SELECT id FROM vdocs WHERE true")
+        .expect("legacy view body");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    for (id, v) in [(1, "true"), (2, "false")] {
+        core.execute_sql_in_session(
+            &ctx,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO vdocs (id, embedding, \"true\") VALUES ({id}, '[0.{id},0.1]', {v}) \
+                 USING OPERATION_ID 'v-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let result = core
+        .execute_sql(&ctx, "SELECT id FROM vv LIMIT 10")
+        .expect("view select");
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1]);
+}

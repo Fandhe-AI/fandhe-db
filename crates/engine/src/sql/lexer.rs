@@ -247,6 +247,40 @@ fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
     }
 }
 
+/// 永続化済みビュー本文（単純形）を再解析用にトークン化する（Issue #1526・PR #2297 指摘）。
+/// 旧版は WHERE 葉位置の列参照 `"true"`／`"false"` を引用なしの `true`／`false` で保存した。
+/// 現行の描画は引用を保つため、保存本文に現れる WHERE 葉位置の未引用 `true`／`false` は
+/// 旧版が書いた列参照だけ（真偽リテラルは描画時に畳まれ本文に残らない）。これを
+/// `QuotedBoolWord` へ戻して列述語の意味を保つ。`= true` のような値位置は葉位置ではないため
+/// 対象外。呼び出し元は `sql::view`（参照時）とカタログのビュー公開列検査。
+pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
+    let mut tokens = tokenize(input)?;
+    let mut seen_where = false;
+    for i in 0..tokens.len() {
+        if matches!(tokens.get(i), Some(Token::Keyword(Keyword::Where))) {
+            seen_where = true;
+            continue;
+        }
+        if !seen_where {
+            continue;
+        }
+        let word = match tokens.get(i) {
+            Some(Token::Ident(w))
+                if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false") =>
+            {
+                w.clone()
+            }
+            _ => continue,
+        };
+        if quoted_bool_word_in_leaf_position(&tokens, i) {
+            if let Some(slot) = tokens.get_mut(i) {
+                *slot = Token::QuotedBoolWord(word);
+            }
+        }
+    }
+    Ok(tokens)
+}
+
 /// [`demote_unneeded_quoted_bool_words`] の位置判定（`tokens[i]` が `QuotedBoolWord`）。
 fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
     // 直後の連続する `)` を読み飛ばし、その外側の語が述語境界かで判定する。
@@ -1674,6 +1708,32 @@ mod tests {
 #[cfg(test)]
 mod quoted_bool_word_tests {
     use super::*;
+
+    /// PR #2297 指摘: 旧版が未引用で保存した葉位置の `true`／`false` は列参照へ戻し、
+    /// 値位置（`= true`）は戻さない。
+    #[test]
+    fn stored_view_body_restores_legacy_bare_bool_columns() {
+        let kinds = |sql: &str| -> Vec<bool> {
+            tokenize_stored_view_body(sql)
+                .expect("tokenize")
+                .iter()
+                .filter(|t| matches!(t, Token::QuotedBoolWord(_) | Token::Ident(_)))
+                .map(|t| matches!(t, Token::QuotedBoolWord(_)))
+                .collect()
+        };
+        for word in ["true", "false", "TRUE"] {
+            let toks = tokenize_stored_view_body(&format!("SELECT id FROM t WHERE {word}"))
+                .expect("tokenize");
+            assert!(
+                matches!(toks.last(), Some(Token::QuotedBoolWord(_))),
+                "{word}"
+            );
+        }
+        // `flag = true` の `true` は値位置のため Ident のまま。
+        assert!(!kinds("SELECT id FROM t WHERE flag = true")
+            .iter()
+            .any(|q| *q));
+    }
 
     fn quoted_count(sql: &str) -> usize {
         tokenize(sql)

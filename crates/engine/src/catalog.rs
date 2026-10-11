@@ -2648,7 +2648,7 @@ fn exposed_columns_of_view(
         let Some(def) = defs.get(view) else {
             return Ok(ViewExposure::Unrelated);
         };
-        let tokens = crate::sql::lexer::tokenize(&def.body_sql)
+        let tokens = crate::sql::lexer::tokenize_stored_view_body(&def.body_sql)
             .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
         let parsed = parse_view_body(&tokens)
             .map_err(|_| CatalogError::CorruptSchema("stored view body is invalid".to_string()))?;
