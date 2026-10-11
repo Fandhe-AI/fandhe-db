@@ -8324,12 +8324,26 @@ fn escape_string_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// 列名をビュー正規化 SQL 用に描画する。`true`／`false` と大小無視で一致する列名は
+/// 引用付きで出力し、再解析時に真偽リテラル（Issue #1526）へ化けて意味が変わるのを防ぐ。
+fn render_column_name(column: &str) -> String {
+    if column.eq_ignore_ascii_case("true") || column.eq_ignore_ascii_case("false") {
+        format!("\"{column}\"")
+    } else {
+        column.to_string()
+    }
+}
+
 /// [`WherePredicate`] のうち [`parse_view_body`] が受理する形状のみを描画する
 /// （`PredicateCall`／`Expression` は到達しない）。
 fn render_where_predicate(pred: &WherePredicate) -> String {
     match pred {
         WherePredicate::Equality { column, value } => {
-            format!("{column} = '{}'", escape_string_literal(value))
+            format!(
+                "{} = '{}'",
+                render_column_name(column),
+                escape_string_literal(value)
+            )
         }
         // `pattern` は LIKE の生パターン全般（SQL-24・TASK-208、Issue #914 で
         // 前方一致限定から拡張）をそのまま無加工で保持する（`Parser::
@@ -8337,12 +8351,20 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // `declarative_filter::DeclarativeFilter::like` の責務で、ここでは
         // 追加のワイルドカードを付与しない。
         WherePredicate::Prefix { column, pattern } => {
-            format!("{column} LIKE '{}'", escape_string_literal(pattern))
+            format!(
+                "{} LIKE '{}'",
+                render_column_name(column),
+                escape_string_literal(pattern)
+            )
         }
         WherePredicate::BoolEquality { column, value } => {
-            format!("{column} = {}", if *value { "true" } else { "false" })
+            format!(
+                "{} = {}",
+                render_column_name(column),
+                if *value { "true" } else { "false" }
+            )
         }
-        WherePredicate::BoolColumn { column } => column.clone(),
+        WherePredicate::BoolColumn { column } => render_column_name(column),
         WherePredicate::Compare { column, op, value } => {
             let op_str = match op {
                 CompareOp::Lt => "<",
@@ -8350,7 +8372,11 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
                 CompareOp::Gt => ">",
                 CompareOp::Ge => ">=",
             };
-            format!("{column} {op_str} '{}'", escape_string_literal(value))
+            format!(
+                "{} {op_str} '{}'",
+                render_column_name(column),
+                escape_string_literal(value)
+            )
         }
         // `parse_view_body` が構造的に拒否するため到達しない
         // （`render_view_body` は常に [`parse_view_body`] の出力のみを描画する）。

@@ -408,3 +408,74 @@ fn sql41_join_where_quoted_bool_words_remain_column_refs() {
         assert_eq!(result.rows.len(), 1, "{sql}");
     }
 }
+/// PR #2297 指摘: 括弧付きの引用付き `"true"` が比較の左辺（値式）になる場合も、
+/// 従来どおり数値列の列参照として受理される。
+#[test]
+fn sql41_parenthesized_quoted_bool_word_value_expr_remains_column_ref() {
+    let path = unique_db_path("sql41-quoted-bool-paren-value");
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut ddl,
+        "CREATE TABLE ndocs (embedding VECTOR(2) NOT NULL, \"true\" INTEGER)",
+    )
+    .expect("create table");
+    for (id, v) in [(1, 5), (2, 0)] {
+        core.execute_sql_in_session(
+            &ctx,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO ndocs (id, embedding, \"true\") VALUES ({id}, '[0.{id},0.1]', {v}) \
+                 USING OPERATION_ID 'n-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let sql = "SELECT id FROM ndocs WHERE (\"true\") > 0 LIMIT 10";
+    let result = core
+        .execute_sql(&ctx, sql)
+        .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1]);
+}
+
+/// PR #2297 指摘: 引用付き `"true"` 列の裸参照を含むビュー定義は、保存された正規化 SQL の
+/// 再解析後も列述語のまま（`"true"` が真の行だけが残る）。
+#[test]
+fn sql41_view_roundtrip_keeps_quoted_bool_word_column_predicate() {
+    let path = unique_db_path("sql41-quoted-bool-view");
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE TABLE vdocs (embedding VECTOR(2) NOT NULL, \"true\" BOOLEAN)",
+        "CREATE VIEW vv AS SELECT id FROM vdocs WHERE \"true\"",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    }
+    for (id, v) in [(1, "true"), (2, "false")] {
+        core.execute_sql_in_session(
+            &ctx,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO vdocs (id, embedding, \"true\") VALUES ({id}, '[0.{id},0.1]', {v}) \
+                 USING OPERATION_ID 'v-{id}'"
+            ),
+        )
+        .expect("insert");
+    }
+    let result = core
+        .execute_sql(&ctx, "SELECT id FROM vv LIMIT 10")
+        .expect("view select");
+    let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1]);
+}

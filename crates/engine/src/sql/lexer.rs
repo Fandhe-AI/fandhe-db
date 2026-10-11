@@ -249,9 +249,22 @@ fn demote_unneeded_quoted_bool_words(tokens: &mut [Token]) {
 
 /// [`demote_unneeded_quoted_bool_words`] の位置判定（`tokens[i]` が `QuotedBoolWord`）。
 fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> bool {
-    let next_ok = match i.checked_add(1).and_then(|n| tokens.get(n)) {
+    // 直後の連続する `)` を読み飛ばし、その外側の語が述語境界かで判定する。
+    // `("true") > 0` のように閉じ括弧の外側が比較演算子等なら値式であり、列参照の
+    // `Ident` へ戻す（値式解析は `QuotedBoolWord` を受理しないため）。
+    let mut k = i;
+    loop {
+        k = match k.checked_add(1) {
+            Some(n) => n,
+            None => return false,
+        };
+        if !matches!(tokens.get(k), Some(Token::Punct(')'))) {
+            break;
+        }
+    }
+    let next_ok = match tokens.get(k) {
         None => true,
-        Some(Token::Punct(';' | ')')) => true,
+        Some(Token::Punct(';')) => true,
         Some(Token::Keyword(Keyword::And | Keyword::Order | Keyword::Limit)) => true,
         Some(Token::Ident(w)) => [
             "USING",
