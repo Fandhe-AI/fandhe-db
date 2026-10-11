@@ -1138,6 +1138,10 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_dml_limits`] のみ。`crate::sql::parser::DmlLimits`
     /// モジュールドキュメント参照。
     dml_limits: crate::sql::parser::DmlLimits,
+    /// スキーマ定義系 3 上限（列数・配列要素数・ENUM ラベル数。Issue #1548）。
+    /// 差し替えは [`Self::with_schema_limits`] のみ（起動時 1 回）。定義が増える DDL の
+    /// 実行段（`sql::ddl`）にだけ効き、永続化済みデータの読み出しには効かない。
+    schema_limits: crate::schema_limits::SchemaLimits,
     /// 述語形 UPDATE／DELETE の分割実行（Issue #1128・ADR `docs/design/partitioned-dml.md`
     /// §15.2）のチャンク幅・走査予算・writer 保持時間。差し替えは
     /// [`Self::with_partitioned_dml_limits`] のみ（起動時に 1 回）。
@@ -2041,6 +2045,7 @@ impl EngineCore {
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dml_limits: crate::sql::parser::DmlLimits::default(),
+            schema_limits: crate::schema_limits::SchemaLimits::default(),
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
@@ -2249,6 +2254,20 @@ impl EngineCore {
     pub fn with_dml_limits(mut self, limits: crate::sql::parser::DmlLimits) -> Self {
         self.dml_limits = limits;
         self
+    }
+
+    /// スキーマ定義系 3 上限（[`crate::schema_limits::SchemaLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #1548）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-table-columns`・`--max-array-elements`・`--max-enum-labels`）から
+    /// のみ呼ぶ。未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_schema_limits(mut self, limits: crate::schema_limits::SchemaLimits) -> Self {
+        self.schema_limits = limits;
+        self
+    }
+
+    /// 現在のスキーマ定義系 3 上限（Issue #1548）。
+    pub fn schema_limits(&self) -> crate::schema_limits::SchemaLimits {
+        self.schema_limits
     }
 
     /// 分割実行 DML の設定（[`crate::sql::parser::PartitionedDmlLimits`]）を差し替えた
@@ -4046,7 +4065,11 @@ impl EngineCore {
             // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
             ParsedSql::CreateTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                let outcome = crate::sql::ddl::execute_create_table(&self.storage, stmt)?;
+                let outcome = crate::sql::ddl::execute_create_table(
+                    &self.storage,
+                    stmt,
+                    &self.schema_limits,
+                )?;
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
             }
             // SQL-23・TASK-202（Issue #900）: `DropTable`／`CreateTable` と同じ
@@ -4057,7 +4080,8 @@ impl EngineCore {
             // 境界）は `Storage::alter_table_add_column` が取らないため未使用。
             ParsedSql::AlterTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                let outcome = crate::sql::ddl::execute_alter_table(&self.storage, stmt)?;
+                let outcome =
+                    crate::sql::ddl::execute_alter_table(&self.storage, stmt, &self.schema_limits)?;
                 Ok(crate::sql::SqlOutcome::AlterTable(outcome))
             }
             // TABLE-18・SQL-23・TASK-205（Issue #909）: `DropTable` と同じ判定
@@ -4093,7 +4117,8 @@ impl EngineCore {
             // `ctx` は取らない。権限の無い主体には型の有無を問わず常に `42501`。
             ParsedSql::CreateType(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                let outcome = crate::sql::ddl::execute_create_type(&self.storage, stmt)?;
+                let outcome =
+                    crate::sql::ddl::execute_create_type(&self.storage, stmt, &self.schema_limits)?;
                 Ok(crate::sql::SqlOutcome::CreateType(outcome))
             }
             ParsedSql::DropType(stmt) => {

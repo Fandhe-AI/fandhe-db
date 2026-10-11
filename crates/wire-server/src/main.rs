@@ -109,6 +109,17 @@
 //! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
 //! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
+//! `--max-table-columns`／`--max-array-elements`／`--max-enum-labels`（Issue #1548。
+//! SQL-46）: 1 テーブルの列数（`1`〜`256`）・配列列 1 個の要素数（`1`〜`1024`）・
+//! ENUM 型 1 個のラベル数（`1`〜`256`）の上限を、プロセス全体に対して起動時に
+//! **下げる方向だけ**設定できる opt-in 注入点（未指定は現行のハード上限と同値＝
+//! 挙動不変）。設定値は定義が増える DDL（`CREATE TABLE`・`ADD COLUMN`・
+//! `CREATE TYPE`）にだけ効き、永続化済みスキーマの読み出しには効かない。
+//! 範囲外・非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::schema_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_schema_limits` へ 1 回だけ注入する
+//! （`docs/design/schema-limits-cli.md`）。
+//!
 //! `--max-dml-affected-rows`／`--max-insert-rows`（Issue #997。オーナー判断の
 //! 改訂・2026-09-27。前回のオーナー判断を置き換え）: 述語形 `UPDATE`／
 //! `DELETE` の 1 文あたり影響行数上限・複数行 `VALUES` の 1 文あたり行数上限
@@ -305,6 +316,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut batch_max_files_raw: Option<String> = None;
+    let mut max_table_columns_raw: Option<String> = None;
+    let mut max_array_elements_raw: Option<String> = None;
+    let mut max_enum_labels_raw: Option<String> = None;
     let mut partitioned_chunk_rows_raw: Option<String> = None;
     let mut partitioned_scan_budget_raw: Option<String> = None;
     let mut partitioned_max_hold_ms_raw: Option<String> = None;
@@ -580,6 +594,66 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 batch_max_files_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::schema_limits_opt::MAX_TABLE_COLUMNS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::schema_limits_opt::MAX_TABLE_COLUMNS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1548: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_table_columns_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::schema_limits_opt::MAX_TABLE_COLUMNS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_table_columns_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::schema_limits_opt::MAX_ARRAY_ELEMENTS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::schema_limits_opt::MAX_ARRAY_ELEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1548: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_array_elements_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::schema_limits_opt::MAX_ARRAY_ELEMENTS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_array_elements_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::schema_limits_opt::MAX_ENUM_LABELS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::schema_limits_opt::MAX_ENUM_LABELS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1548: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_enum_labels_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::schema_limits_opt::MAX_ENUM_LABELS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_enum_labels_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::dml_limits_opt::PARTITIONED_CHUNK_ROWS_FLAG => {
@@ -1003,6 +1077,23 @@ fn run_server(args: &[String]) -> ExitCode {
         engine::log_stderr!("warning: {old} is no longer read; use {new}");
     }
 
+    // Issue #1548: スキーマ定義系 3 上限（列数・配列要素数・ENUM ラベル数）を bind・
+    // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ
+    // 進まず起動エラー）。未指定は `SchemaLimits::default()`＝ハード上限＝現行挙動。
+    let schema_limits = match wire_server::schema_limits_opt::resolve(
+        wire_server::schema_limits_opt::SchemaLimitsRawFlags {
+            max_table_columns: max_table_columns_raw.as_deref(),
+            max_array_elements: max_array_elements_raw.as_deref(),
+            max_enum_labels: max_enum_labels_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid schema limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1128・#1129: 分割実行 DML の設定（チャンク幅・走査予算・writer 保持時間・
     // 同時実行数・中断記録数の上限）を
     // bind・ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は
@@ -1402,6 +1493,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Option` 分岐は不要——`with_dml_limits` は `DmlLimits::default()` を渡しても
     // 既存挙動とビット同一）。
     core = core.with_dml_limits(dml_limits);
+    // Issue #1548: 未指定でも常に呼ぶ（`schema_limits` は既定まで解決済み。既定は
+    // ハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_schema_limits(schema_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。
     core = core.with_partitioned_dml_limits(partitioned_dml_limits);
     // Issue #1166: 未指定でも常に呼ぶ（`batch_limits` は既定・環境変数まで

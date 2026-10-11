@@ -2597,6 +2597,8 @@ struct ParsedCreateTableColumn {
     references_name: Option<String>,
     /// 列型に現れた型名エイリアスの原文の綴り（Issue #1528）。
     alias_type_name: Option<String>,
+    /// 配列型で要素数 `[N]` が省略された（`<型>[]`）場合 true（Issue #1548）。
+    array_len_defaulted: bool,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -2883,6 +2885,10 @@ pub struct ValidatedCreateTable {
     /// 列型に現れた型名エイリアス（`INT4` 等。配列要素を含む）の原文の綴り（宣言順。
     /// Issue #1528）。実行段が既存の同綴り ENUM 型との衝突を拒否するために使う。
     pub alias_type_names: Vec<String>,
+    /// 要素数 `[N]` を省略した配列列（`<型>[]`）の列名（宣言順。Issue #1548）。構文段は
+    /// 省略時に `MAX_ARRAY_ELEMENTS` を埋めるため、実行段（`sql::ddl::execute_create_table`）
+    /// が起動時設定 `--max-array-elements` で要素数上限を組み直すための補助情報。
+    pub array_len_defaulted: Vec<String>,
     /// `PRIMARY KEY` 宣言列名（宣言順。TABLE-16・TASK-204、Issue #903）。
     /// 未宣言（`id` 暗黙主キーのまま）は `None`。`PRIMARY KEY (id)`（`id` 単独）
     /// は暗黙主キーの明示宣言として受理したうえで `None` へ正規化する
@@ -6907,6 +6913,7 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut alias_type_names: Vec<String> = Vec::new();
+        let mut array_len_defaulted: Vec<String> = Vec::new();
         // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
         // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
         // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
@@ -7082,6 +7089,9 @@ impl<'a> Parser<'a> {
                     foreign_keys.push(fk);
                 }
                 alias_type_names.extend(parsed.alias_type_name);
+                if parsed.array_len_defaulted {
+                    array_len_defaulted.push(parsed.column.name.clone());
+                }
                 columns.push(parsed.column);
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -7152,6 +7162,7 @@ impl<'a> Parser<'a> {
             table_name,
             columns,
             alias_type_names,
+            array_len_defaulted,
             primary_key,
             unique_constraints,
             checks,
@@ -7307,6 +7318,10 @@ impl<'a> Parser<'a> {
             crate::sql::ddl_column_type::parse_column_type_name(&self.tokens, &mut self.pos)?;
         let alias_type_name =
             crate::sql::ddl_column_type::alias_spelling(&type_name).map(str::to_string);
+        let array_len_defaulted = matches!(
+            type_name,
+            crate::sql::ddl_column_type::SqlColumnTypeName::Array { max_len: None, .. }
+        );
         let static_ty = crate::sql::ddl_column_type::to_static_column_type(&type_name)?;
         let ty = match static_ty {
             StaticColumnType::Resolved(t) => t,
@@ -7436,6 +7451,7 @@ impl<'a> Parser<'a> {
             references,
             references_name,
             alias_type_name,
+            array_len_defaulted,
         })
     }
 

@@ -55,6 +55,19 @@ pub(crate) enum StaticColumnType {
 pub(crate) fn to_static_column_type(
     ty: &SqlColumnTypeName,
 ) -> Result<StaticColumnType, SqlSurfaceError> {
+    to_static_column_type_with_array_default(ty, MAX_ARRAY_ELEMENTS)
+}
+
+/// [`to_static_column_type`] の `[]`（要素数省略）の既定要素数を引数化した版
+/// （Issue #1548）。実行段（`sql::ddl`）が起動時設定 `--max-array-elements`
+/// （`schema_limits::SchemaLimits::max_array_elements`）を渡す。明示 `[N]` は
+/// 本関数では従来どおり `1..=MAX_ARRAY_ELEMENTS` だけを検証し、設定値との比較は
+/// 呼び出し元（`sql::ddl`）が行う。既定値がハード上限なら
+/// [`to_static_column_type`] と同一結果。
+pub(crate) fn to_static_column_type_with_array_default(
+    ty: &SqlColumnTypeName,
+    default_max_len: u32,
+) -> Result<StaticColumnType, SqlSurfaceError> {
     let resolved = match ty {
         SqlColumnTypeName::Text => ColumnType::Text,
         SqlColumnTypeName::Varchar => ColumnType::Varchar,
@@ -74,11 +87,13 @@ pub(crate) fn to_static_column_type(
             scale: *scale,
         },
         SqlColumnTypeName::Vector(dim) => ColumnType::Vector(*dim),
-        SqlColumnTypeName::Alias { target, .. } => return to_static_column_type(target),
+        SqlColumnTypeName::Alias { target, .. } => {
+            return to_static_column_type_with_array_default(target, default_max_len)
+        }
         SqlColumnTypeName::Enum(name) => return Ok(StaticColumnType::EnumCandidate(name.clone())),
         SqlColumnTypeName::Array { elem, max_len } => {
-            let max_len = max_len.unwrap_or(MAX_ARRAY_ELEMENTS);
-            let elem_ty = match to_static_column_type(elem)? {
+            let max_len = max_len.unwrap_or(default_max_len);
+            let elem_ty = match to_static_column_type_with_array_default(elem, default_max_len)? {
                 StaticColumnType::Resolved(t) => t,
                 StaticColumnType::EnumCandidate(name) => {
                     // 上限の範囲だけは型名の存在確認より先に検証する（実行段の

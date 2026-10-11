@@ -140,6 +140,7 @@ pub mod limits;
 pub mod protocol_dispatch;
 pub(crate) mod response_buffer;
 pub mod result_encoder;
+pub mod schema_limits_opt;
 pub mod search_engine_opt;
 pub mod server;
 pub mod simple_query;
