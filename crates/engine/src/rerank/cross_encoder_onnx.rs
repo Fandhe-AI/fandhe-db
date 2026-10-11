@@ -18,7 +18,7 @@
 //! [`CrossEncoderError::Backend`] を返して **`ort::` の他 API を一切呼ばずに**
 //! 打ち切る。設定済みの場合のみ `ort::init_from`（`Result` を返す明示ロード API）で
 //! dylib を確定させてから `Session` を構築するため、`ORT_DYLIB_PATH` 未設定環境
-//! （`--all-features` の `make test`/`make ci`・pre-push フックがモデル・dylib なしで
+//! （`--all-features` の `make test`/`make ci`・CI がモデル・dylib なしで
 //! 走る既定経路を含む）でも本モジュールの呼び出しは panic せず `Err` を返す。
 
 use std::env;
